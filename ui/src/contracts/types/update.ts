@@ -73,8 +73,22 @@ export type PopupAction =
   | 'manualDownload'
   | 'close';
 
+export type CoreAdmissionKind = 'Missing' | 'Mismatch' | 'Changed' | 'UnsupportedExactObject' | 'UnsupportedCapability' | 'LoaderPolicy' | 'Busy' | 'Unknown' | 'Io';
+
+/** Current-app offline data recovery, not execution admission or a connection. */
+export type CoreRecoveryState = 'ready' | 'restored' | 'notNeeded' | 'stopRequired'
+  | 'helperRequired' | 'reinstallRequired' | 'unavailable' | 'pending';
+
 /** `core_get_version_info` 的返回。 */
 export interface CoreVersionInfo {
+  admission?: {
+    state: 'admitted' | 'rejected';
+    kind?: CoreAdmissionKind;
+    recovery: 'none' | 'reinstallCurrentApp';
+    coreId?: string;
+    sourceCommit?: string;
+    policySha256?: string;
+  };
   /**
    * 对安装包里的内核文件执行 `version` 读到的版本；读不到时为空串（不回落到清单声明的版本）。
    * 它不是「正在运行的内核」的版本：经提权助手运行时执行的是助手目录里的副本。

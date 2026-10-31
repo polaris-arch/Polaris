@@ -84,6 +84,16 @@ const HELPER_IS_VPN_SERVICE = {
 } as const;
 
 /**
+ * 受管助手安装内容诊断只存在于桌面：移动端启动 mobile.html，更新页使用自己的 UpdatePage；
+ * 后端同时拒绝 Android/iOS Helper 支持，current_platform 也不产生移动端 selectedCore。
+ * 两颗复制按钮都只投影 selectedCore 安装身份，不是通用 libbox 运行诊断。
+ */
+const NO_MOBILE_HELPER_INSTALLATION = {
+  file: 'src-tauri/src/runtime/helper.rs',
+  mustContain: 'Platform::Android | Platform::Ios | Platform::Other => false,',
+} as const;
+
+/**
  * 系统代理这个对象在 Android 上不存在：`config-engine` 只在**非** android/ios 时才发 mixed inbound。
  * 「清理系统代理残留」「去首页切换接管方式」两条共用它。终端代理环境变量那一整块（含两颗复制）
  * 2026-09-25 起不再挂它，改按 `adjudicated-out` 锚 [`TERMINAL_ENV_ADJUDICATED`]（主因是安全裁定）。
@@ -300,10 +310,10 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '重装当前版本（修复损坏安装）。**2026-09-13（批 15）接上**：`update_check(includeCurrent:true)` → ' +
         '`reinstallTarget` 选**当前版本**的资产 → 同一个 `updateApi.download` → 交系统安装器。' +
         '桌面那颗的 `data-tip`（「只重新下载并校验当前安装包」）在移动端是常驻第二行（IA §4.12，' +
-        '触屏没有 hover）。三条早退（真有新版 / 通道最新版与已装版本对不上 / 那个 release 没有可下载的' +
+        '触屏没有 hover）。三条早退（结果是普通升级 / 通道中未找到已装版本 / 那个 release 没有可下载的' +
         '资产）折成同一句 `settings.update.reinstallUnavailable`，与桌面共用那条键。' +
-        '🔴 后端那一臂的顺序承重：`includeCurrent` 必须排在 Android 的「只比版本」兜底**之前**，' +
-        '否则这条腿在 Android 上永远拿不到目标（`app_update.rs` 那两条 match 臂上写着为什么）。',
+        '后端按 `includeCurrent` 独立查找已装版本；Android 的「只比版本」兜底仅限普通更新检查，' +
+        '当前版本缺少资产时不得换成其他版本。',
     },
     {
       id: 'AppUpdateCard.tsx|k:common.retry',
@@ -567,7 +577,18 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '密码取消。2026-09-06 批 5 接上：移动端就地行内编辑，取消即收起该行，与保存同一跳。',
     },
 
+    {
+      id: 'CoreInfoCard.tsx|k:helper.copyDiagnostics',
+      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_HELPER_INSTALLATION },
+      note: '复制助手选定安装内容的 CoreID/providerFingerprint/state；CoreInfoCard 的唯一生产调用方为桌面 SettingsUpdate，移动端设置路由使用独立 UpdatePage/AboutPage，未渲染该卡。后端 current_platform 仅允许四个桌面 target，移动端无 selectedCore；不是将通用内核诊断记为缺席。',
+    },
+
     /* ── 提权助手页（移动端没有 helper 进程这个对象）───────────────────────── */
+    {
+      id: 'SettingsHelper.tsx|k:helper.copyDiagnostics',
+      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_HELPER_INSTALLATION },
+      note: '仅复制桌面助手服务状态与选定安装内容白名单；移动端没有提权助手页，也没有该独立服务或选定安装副本，隧道与授权来自 VpnService。它不代表 mobile libbox 的运行诊断能力。',
+    },
     {
       id: 'SettingsHelper.tsx|k:helper.stopAndUpgradeAction',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
@@ -983,7 +1004,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '内核只读信息卡（随包内核自报版本 / 清单声明版本 / 补丁集标识）。移动端的落点是关于页那一行里的 ' +
         '`sing-box <版本>`（`version_get_info` 的 `coreVersion`）；清单声明版本与补丁集标识这两格移动端' +
         '不显示 —— Android 上内核是随 APK 链进应用进程的 libbox，没有独立的内核文件，也没有助手目录里的' +
-        '副本，补丁集标识在移动端恒为空。',
+        '副本，补丁集标识在移动端恒为空。新增的助手选定安装身份与复制诊断仅桌面可达，复制动作另在 actions 面按真实 Helper 平台判定登记；不声称这部分已经移植。',
     },
     {
       id: 'ListEditor',
@@ -1015,6 +1036,17 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '复制图标（这一屏只有终端环境变量块用它）。随上一块同判（2026-09-25 改判）；单独登记是因为块面按组件名成条，它哪天被别处复用时这条会自己变成僵尸、当场红。',
     },
     /* ── 桌面「多 VPN 兼容」批（2026-09-12 合入 main）新加的两块只读报告 ───────────── */
+    {
+      id: 'CoexUnconfirmedContext',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: '桌面 COEX 报告的五项固定 Unknown 摘要，复用同一平台采集边界；没有新增移动端接口或归属结论。',
+    },
     {
       id: 'CoexWindowsSources',
       disposition: {
@@ -1138,7 +1170,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     'hc-daemon-desc', 'hc-daemon-name', 'helper-card', 'inbound-cidr-list', 'inbound-lin-warn',
     'ipv6-swt', 'le-bypass', 'mac-filter-list', 'mac-filter-mode', 'main-session-via-proxy-swt',
     'mgmt-block', 'mixed-port-input', 'neighbor-domain-list', 'race-doh-count', 'race-ups',
-    'res-auto-swt', 'set-graphics', 'set-hwaccel', 'set-lan-gateway', 'set-mac-filter',
+    'res-auto-swt', 'set-graphics', 'set-hwaccel', 'set-lan-gateway', 'set-mac-filter', 'set-strict-route',
     'set-window-effects', 'speed-test-concurrency-input', 'speed-test-metered-seg',
     'speed-test-url-input', 'term-env', 'tun-anchor-tx', 'tun-mtu',
     'tun-nat-type', 'webrtc-note', 'webrtc-row', 'webrtc-seg',

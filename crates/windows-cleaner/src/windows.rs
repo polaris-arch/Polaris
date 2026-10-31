@@ -33,6 +33,11 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
+pub(crate) mod install;
+mod sweep;
+pub use install::{launch_install, run_install_worker};
+pub use sweep::sweep_installed_cores;
+
 fn error(what: &str) -> io::Error {
     io::Error::other(what)
 }
@@ -246,6 +251,9 @@ fn child(
     let mut ios: IO_STATUS_BLOCK = unsafe { zeroed() };
     let desired = READ_CONTROL
         | FILE_READ_ATTRIBUTES
+        // LIST_DIRECTORY is the read-data access bit, deliberately retained for
+        // every directory. Attributes-only handles have NOT established an
+        // ancestor rename barrier (C's 2026-10-29 negative observation).
         | FILE_LIST_DIRECTORY
         | SYNCHRONIZE
         | if delete { DELETE } else { 0 };
@@ -426,10 +434,18 @@ struct Object {
     identity: Identity,
 }
 fn plan(file: File, depth: usize, all: &mut Vec<Object>) -> io::Result<()> {
+    plan_with_caller(file, depth, all, None)
+}
+fn plan_with_caller(
+    file: File,
+    depth: usize,
+    all: &mut Vec<Object>,
+    caller: Option<&str>,
+) -> io::Result<()> {
     if depth >= 64 || all.len() >= 4096 {
         return Err(error("cleanup tree limit"));
     }
-    security(&file, None, false)?;
+    security(&file, caller, false)?;
     let i = identity(&file)?;
     let is_dir = info(&file)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
     let children = if is_dir { entries(&file)? } else { Vec::new() };
@@ -437,7 +453,7 @@ fn plan(file: File, depth: usize, all: &mut Vec<Object>) -> io::Result<()> {
     all.push(Object { file, identity: i });
     for name in children {
         let file = child(&all[index].file, &name, true, false, null_mut())?;
-        plan(file, depth + 1, all)?;
+        plan_with_caller(file, depth + 1, all, caller)?;
     }
     Ok(())
 }

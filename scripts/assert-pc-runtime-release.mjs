@@ -72,7 +72,7 @@ const readRepository = (relative) => readFileSync(join(root, relative));
 // packages, source/tag/tree, producer, complete committed index and source policy.
 // Replacing it, even with another structurally valid release, requires review.
 // Actual runtime, signatures, artifact receipts and promotion remain DAG checks.
-const reviewedFormalContractSha256 = '66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f';
+const reviewedFormalContractSha256 = '9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf';
 function assertReviewedFormalConsumer(manifest) {
   requireGraph(manifest.desktopRelease && canonical(Object.keys(manifest.desktopRelease).sort())
     === canonical(['schema', 'contractPath', 'contractSha256', 'version', 'tag', 'tagObject',

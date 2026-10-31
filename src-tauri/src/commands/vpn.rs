@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use polaris_singbox_grpc::{daemon, Endpoint, SingBoxApiClient};
+use polaris_singbox_grpc::{daemon, SingBoxApiClient};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::State;
@@ -23,7 +23,7 @@ async fn connect_for(
     state: &State<'_, AppRuntime>,
     server_id: &str,
 ) -> Result<(SingBoxApiClient, String), ApiResponse<()>> {
-    let (port, secret, endpoint_tag) =
+    let (port, _secret, endpoint_tag) =
         state
             .proxy()
             .management_target_for(server_id)
@@ -33,7 +33,9 @@ async fn connect_for(
                     ERR_UNAVAILABLE,
                 )
             })?;
-    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret)
+    let client = state
+        .proxy()
+        .current_management_client(port)
         .await
         .map_err(|error| {
             ApiResponse::err_with_code(format!("management api connect failed: {error}"), ERR_API)

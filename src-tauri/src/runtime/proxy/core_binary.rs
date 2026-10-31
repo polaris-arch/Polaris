@@ -56,7 +56,7 @@ pub(crate) fn bundle_resource_candidates(
 }
 
 /// [`bundle_resource_candidates`] 的**前缀腿**：随包资源目录本身（不含平台子目录与文件名）。
-fn bundle_resource_roots(
+pub(crate) fn bundle_resource_roots(
     exe_dir: Option<&std::path::Path>,
     dev_manifest_dir: Option<&std::path::Path>,
 ) -> Vec<PathBuf> {
@@ -103,13 +103,13 @@ fn bundle_resource_roots(
     prefixes
 }
 
-/// 开发树的 crate 根（`CARGO_MANIFEST_DIR`）。**release 构建里恒为 `None`**。
+/// 开发树的 crate 根（`CARGO_MANIFEST_DIR`）。**Formal release 构建里恒为 `None`**。
 ///
 /// # 为什么是 `#[cfg]` 而不是 `cfg!()`
 ///
 /// `cfg!(debug_assertions)` 是**运行期**布尔，两条腿都会被编译 ⇒ `env!("CARGO_MANIFEST_DIR")`
 /// 那个字面量照样进 `.rodata`。2026-08-30 对发行产物实测：`strip = "symbols"` 之后仍有
-/// **143 处** `/home/sway/Code/polaris` 字样，其中开发者仓库路径正是这么泄出去的
+/// **143 处** `/home/fixture-user/Code/polaris` 字样，其中开发者仓库路径正是这么泄出去的
 /// （余下来自 `btls-sys` 编译 BoringSSL 时 C 编译器写进去的 `__FILE__`）。
 /// `#[cfg]` 是**编译期**分叉，release 那条腿里根本没有这个 `env!`。
 ///
@@ -117,13 +117,13 @@ fn bundle_resource_roots(
 ///
 /// `cargo run` / `cargo test` 时二进制在 `target/debug/`，随包资源并不在 exe 旁边，
 /// 只能靠 `<crate 根>/../resources` 找到。测试构建 `debug_assertions` 恒开，故取材面不变。
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "local-development-selection"))]
 pub(crate) fn dev_manifest_dir() -> Option<&'static std::path::Path> {
     Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
-/// [`dev_manifest_dir`] 的 release 腿：没有开发树，也**不留下那个字面量**。
-#[cfg(not(debug_assertions))]
+/// [`dev_manifest_dir`] 的 Formal release 腿：没有开发树，也**不留下那个字面量**。
+#[cfg(not(any(debug_assertions, feature = "local-development-selection")))]
 pub(crate) fn dev_manifest_dir() -> Option<&'static std::path::Path> {
     None
 }
@@ -143,17 +143,18 @@ fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
     Ok(None)
 }
 
-/// Captured by the existing verified resolver. This is an invalidation token
-/// for ledger reads, not an alternative resolver or launch admission.
+/// Candidate-selection invalidation token for ledger reads. File execution
+/// still requires the query's retained admitted owner and exact purpose.
 #[derive(Clone, Debug)]
 pub(super) struct CoreSelectionObservation {
     path: PathBuf,
     origin: SelectionOrigin,
-    bundle: Option<crate::runtime::core_identity::BundleObservation>,
+    bundle: Option<std::sync::Arc<crate::runtime::core_identity::AdmittedPayload>>,
 }
 #[derive(Clone, Debug)]
 enum SelectionOrigin {
     Bundled(Vec<PathBuf>),
+    Recovered,
     #[cfg(test)]
     Fixture,
 }
@@ -165,7 +166,20 @@ impl CoreSelectionObservation {
     }
     pub(super) fn is_current(&self) -> bool {
         let selected = match &self.origin {
+            SelectionOrigin::Recovered => {
+                crate::runtime::core_identity::user_store::current_candidate()
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(self.path.as_path())
+            }
             SelectionOrigin::Bundled(candidates) => {
+                if !matches!(
+                    crate::runtime::core_identity::user_store::current_candidate(),
+                    Ok(None)
+                ) {
+                    return false;
+                }
                 #[cfg(any(debug_assertions, test))]
                 if !matches!(dev_core_binary_override(), Ok(None)) {
                     return false;
@@ -232,25 +246,76 @@ fn resolve_bundled_core_binary() -> Result<PathBuf, String> {
         &platform_dirs,
         filename,
     );
-    if let Some(core) = first_existing_bundle_candidate(&candidates) {
-        let bundle = crate::runtime::core_identity::verify_bundled(&core)?;
-        if let Ok(mut selected) = VERIFIED_SELECTION.lock() {
-            *selected = Some(CoreSelectionObservation {
-                path: core.clone(),
-                origin: SelectionOrigin::Bundled(candidates),
-                bundle: Some(bundle),
-            });
-        }
-        return Ok(core);
+    let mut selection = candidate_observation(candidates)?;
+    let bundle = crate::runtime::core_identity::verify_bundled(&selection.path)?;
+    selection.bundle = Some(bundle);
+    let core = selection.path.clone();
+    if let Ok(mut selected) = VERIFIED_SELECTION.lock() {
+        *selected = Some(selection);
     }
-    Err(format!(
-        "未找到 sing-box 二进制（尝试过：{}）。开发态请先跑 `node scripts/fetch-core.mjs`。",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" | ")
-    ))
+    Ok(core)
+}
+
+/// Restoration source lookup grants no execution authority. The existing stage
+/// transaction independently rehashes every member and the selected Helper.
+pub(crate) fn resolve_core_candidate() -> Result<PathBuf, String> {
+    resolve_core_candidate_observation().map(|selection| selection.path)
+}
+
+/// Candidate selection is data only: the consumer admits its own purpose.
+pub(super) fn resolve_core_candidate_observation() -> Result<CoreSelectionObservation, String> {
+    #[cfg(any(debug_assertions, test))]
+    {
+        dev_core_binary_override()?;
+    }
+    let filename = if cfg!(windows) {
+        "sing-box.exe"
+    } else {
+        "sing-box"
+    };
+    let dirs = core_platform_dirs(std::env::consts::OS, std::env::consts::ARCH);
+    let dirs = crate::runtime::core_identity::selected_payload_dirs(&dirs)?;
+    let refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    let exe = std::env::current_exe().ok();
+    let candidates = bundle_resource_candidates(
+        exe.as_deref().and_then(Path::parent),
+        dev_manifest_dir(),
+        &refs,
+        filename,
+    );
+    let selection = candidate_observation(candidates)?;
+    if let Ok(mut selected) = VERIFIED_SELECTION.lock() {
+        *selected = Some(selection.clone());
+    }
+    Ok(selection)
+}
+
+pub(super) fn candidate_observation(
+    candidates: Vec<PathBuf>,
+) -> Result<CoreSelectionObservation, String> {
+    candidate_with_recovery(
+        candidates,
+        crate::runtime::core_identity::user_store::current_candidate(),
+    )
+}
+fn candidate_with_recovery(
+    candidates: Vec<PathBuf>,
+    recovered: Result<Option<PathBuf>, String>,
+) -> Result<CoreSelectionObservation, String> {
+    if let Some(path) = recovered? {
+        return Ok(CoreSelectionObservation {
+            path,
+            origin: SelectionOrigin::Recovered,
+            bundle: None,
+        });
+    }
+    let path = first_existing_bundle_candidate(&candidates).ok_or_else(||
+        "CORE_ADMISSION_Missing: selected packaged payload missing; recovery=ReinstallCurrentApp".to_string())?;
+    Ok(CoreSelectionObservation {
+        path,
+        origin: SelectionOrigin::Bundled(candidates),
+        bundle: None,
+    })
 }
 
 /// 内核文件是否可执行（Unix：任一可执行位；其它平台没有这个概念，恒 `Ok`）。
@@ -311,4 +376,46 @@ pub(crate) fn resolve_dashboard_serve_dir(config_dir: &std::path::Path) -> Optio
     .find(|c| c.is_file())
     .and_then(|c| c.parent())
     .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(all(test, unix))]
+mod recovery_source_tests {
+    use super::*;
+    use crate::runtime::core_identity::{user_store, RecoveryFixture};
+    #[test]
+    fn default_selection_reopens_exact_recovery_receipt_and_never_hides_damaged_slot_with_bundle() {
+        let f = RecoveryFixture::new("linux");
+        let bundle = f.root.join("original-bundle-core");
+        std::fs::write(&bundle, b"bundle").unwrap();
+        let data = || {
+            user_store::selected_at(&f.config, &f.selected)
+                .map(|v| v.map(|v| v.directory.join("sing-box")))
+        };
+        assert_eq!(
+            candidate_with_recovery(vec![bundle.clone()], data())
+                .unwrap()
+                .path,
+            bundle
+        );
+        let stage = f.stage().unwrap();
+        user_store::install(&f.config, &stage).unwrap();
+        let restored = candidate_with_recovery(vec![bundle.clone()], data())
+            .unwrap()
+            .path;
+        assert_ne!(restored, bundle);
+        assert_eq!(
+            candidate_with_recovery(vec![bundle.clone()], data())
+                .unwrap()
+                .path,
+            restored
+        );
+        let receipt = f
+            .config
+            .join(user_store::USER_STORE)
+            .join("manifests")
+            .join(format!("{}.json", stage.manifest.id));
+        std::fs::remove_file(receipt).unwrap();
+        assert!(candidate_with_recovery(vec![bundle.clone()], data()).is_err());
+        assert!(bundle.exists());
+    }
 }

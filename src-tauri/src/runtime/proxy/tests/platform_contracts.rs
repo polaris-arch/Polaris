@@ -66,7 +66,7 @@ fn bundle_candidates_include_macos_up_layout() {
 #[test]
 fn bundle_candidates_include_windows_nsis_up_layout() {
     use std::path::Path;
-    let exe_dir = Path::new(r"C:\Users\doveh\AppData\Local\Polaris");
+    let exe_dir = Path::new(r"C:\Users\fixture-user-3\AppData\Local\Polaris");
     let manifest = Path::new("/dev/polaris/src-tauri");
     let c = bundle_resource_candidates(
         Some(exe_dir),
@@ -82,7 +82,7 @@ fn bundle_candidates_include_windows_nsis_up_layout() {
             .contains("/_up_/resources/win/polaris-helper.exe")
             && p.to_string_lossy()
                 .replace('\\', "/")
-                .starts_with("C:/Users/doveh/AppData/Local/Polaris/_up_")),
+                .starts_with("C:/Users/fixture-user-3/AppData/Local/Polaris/_up_")),
         "缺 Windows NSIS `_up_` 装机布局候选 → 装机态核/helper恒找不到；候选={c:?}"
     );
 }

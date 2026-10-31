@@ -475,13 +475,8 @@ pub async fn logs_clear(state: State<'_, AppRuntime>) -> Result<ApiResponse<u64>
         Ok(boundary) => boundary,
         Err(error) => return Ok(ApiResponse::err(error)),
     };
-    if let Some((port, secret)) = state.proxy().management_endpoint() {
-        match polaris_singbox_grpc::SingBoxApiClient::connect(
-            polaris_singbox_grpc::Endpoint::new("127.0.0.1", port),
-            secret,
-        )
-        .await
-        {
+    if let Some((port, _secret)) = state.proxy().management_endpoint() {
+        match state.proxy().current_management_client(port).await {
             Ok(c) => {
                 if let Err(e) = c.clear_logs().await {
                     log::debug!("清空核侧日志环失败（本地已清，不阻断）：{e}");
@@ -567,16 +562,11 @@ pub fn logs_set_diagnostic(enabled: bool) -> ApiResponse<bool> {
 /// 一份「用来给别人做根因判断」的报告头部，比在 UI 上说危害更大。
 /// 两条腿共用一个取值点，才谈得上不会再次分叉。
 async fn read_runtime_log_level(state: &State<'_, AppRuntime>) -> Result<String, &'static str> {
-    let (port, secret) = state
+    let (port, _secret) = state
         .proxy()
         .management_endpoint()
         .ok_or(REASON_NOT_RUNNING)?;
-    let client = match polaris_singbox_grpc::SingBoxApiClient::connect(
-        polaris_singbox_grpc::Endpoint::new("127.0.0.1", port),
-        secret,
-    )
-    .await
-    {
+    let client = match state.proxy().current_management_client(port).await {
         Ok(c) => c,
         Err(e) => {
             log::debug!("读核日志级别：管理 API 连接失败：{e}");

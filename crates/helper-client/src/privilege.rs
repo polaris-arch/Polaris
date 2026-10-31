@@ -142,78 +142,13 @@ pub fn pkexec_escalation(script_path: &str) -> Escalation {
     }
 }
 
-/// 构造 Windows UAC PowerShell 提权 argv（移植自 `PlatformPrivilegeService.ts:482` 的 Start-Process -Verb RunAs）。
-///
-/// 对应 Polaris：`Start-Process` 经 `powershell -Command` 以 `-Verb RunAs` 触发 UAC。
-pub fn uac_escalation(script_path: &str) -> Result<Escalation, ClientError> {
-    // PowerShell -File 执行脚本（含空格路径用单引号包裹）
-    //
-    // # 🔴 `-ExecutionPolicy Bypass` 不可省
-    //
-    // `powershell.exe -File <x>.ps1` 受执行策略约束，而 **Restricted 是 Windows 客户端 SKU 的出厂
-    // 默认**（Server 2012 R2+ 才是 RemoteSigned）⇒ 不带这个 flag，脚本在**未改过策略的机器上一行
-    // 都跑不了**。外层的 `-Command` 不受策略约束，所以只有内层需要。
-    //
-    // 同仓另一条同手法的腿一直带着它：`src-tauri/nsis-hooks.nsh:134`（卸载钩子，外层内层都带），
-    // 被移植的上游 上游 `src/main/services/WindowsServiceHelper.ts` 同样带 —— 本处属移植时丢失，
-    // 不是刻意取舍。
-    //
-    // # 退出码：`-PassThru` 回传，读不到时必须失败
-    //
-    // `Start-Process -Wait` 本身不透传子进程退出码，外层 `-Command` 在 cmdlet 正常收尾时恒退 0
-    // ⇒ 脚本内部 `throw`（Copy-Item 退避耗尽 / New-Service 1072 重试耗尽 / sc delete 失败）
-    // 全部被谎报成 `EscalationOutcome::Success`，而卸载腿据此 `clear_token()`，把 app 侧 token
-    // 删掉、SYSTEM 服务还在跑 ⇒ 之后恒鉴权失败且「修复」也修不回来。
-    //
-    // `$p.HasExited` 守卫的用意：`-Verb RunAs` 是跨提权会话起进程，只有拿到已退出的进程对象时才有
-    // 可证明的成功/失败。读不到 `ExitCode`、`Start-Process` 非终止错误或 UAC 根本没拉起脚本时若回落 0，
-    // 上层会把「旧 helper 原封不动」谎报为安装成功。故外层启用 Stop、显式 `-ErrorAction Stop`，任何
-    // 无法证明内层脚本 exit 0 的形态都 fail-closed 为 1。
-    // 两层 PowerShell 都钉到 GetSystemDirectoryW 返回的系统目录。外层若走 PATH/当前目录，攻击者
-    // 无需管理员权限便能放置同名 exe；内层若走 PATH，则攻击者会在用户确认预期中的 UAC 后获提升。
-    #[cfg(windows)]
-    let powershell = crate::windows_system::powershell_executable()?;
-    // 跨平台纯逻辑测试用稳定的 Windows 绝对路径；生产 Windows 构建永远走上面的 OS API。
-    #[cfg(not(windows))]
-    let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned();
-    // Start-Process joins ArgumentList elements into a native command line.
-    // PowerShell's single quotes delimit strings but do not survive that join;
-    // retain literal double quotes around the -File path for profiles with spaces.
-    let argv = vec![
-        powershell.clone(),
-        "-NoProfile".to_owned(),
-        "-Command".to_owned(),
-        format!(
-            "$ErrorActionPreference = 'Stop'; \
-             try {{ \
-               $p = Start-Process -FilePath '{powershell}' \
-                 -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{path}\"' \
-                 -Verb RunAs -Wait -PassThru -ErrorAction Stop; \
-               if ($p -and $p.HasExited) {{ exit $p.ExitCode }}; \
-               [Console]::Error.WriteLine('elevated process exit code unavailable'); exit 1 \
-             }} catch {{ \
-               $exception = $_.Exception; $cancelled = $false; \
-               while ($null -ne $exception) {{ \
-                 if ($exception.NativeErrorCode -eq {uac_cancel_code} -or $exception.HResult -eq -2147023673) {{ \
-                   $cancelled = $true; break \
-                 }}; \
-                 $exception = $exception.InnerException \
-               }}; \
-               if ($cancelled) {{ \
-                 [Console]::Error.WriteLine('{uac_cancel_marker}'); exit {uac_cancel_code} \
-               }}; \
-               [Console]::Error.WriteLine($_.Exception.Message); exit 1 \
-             }}",
-            path = script_path.replace('\'', "''"),
-            powershell = powershell.replace('\'', "''"),
-            uac_cancel_code = UAC_CANCELLED_CODE,
-            uac_cancel_marker = UAC_CANCELLED_MARKER,
-        ),
-    ];
-    Ok(Escalation {
-        method: PrivilegeMethod::Uac,
-        argv,
-    })
+/// Script elevation on Windows has been retired. The manager invokes the
+/// bundled pinned native cleaner directly; this compatibility API deliberately
+/// refuses scripts, without trying a different host/payload/policy.
+pub fn uac_escalation(_script_path: &str) -> Result<Escalation, ClientError> {
+    Err(ClientError::Connect(
+        "Windows script elevation is unavailable; native maintenance required".into(),
+    ))
 }
 
 /// 判定退出码是否为「用户取消授权」（对齐 Polaris 三套 runXxxScript 的取消判定）。

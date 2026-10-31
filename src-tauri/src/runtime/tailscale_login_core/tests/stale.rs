@@ -191,6 +191,8 @@ struct FakeProcesses {
     signals: Mutex<Vec<(u32, Signal)>>,
     /// pid → owner; a pid that is absent runs as this user ([`ME`]).
     owners: HashMap<u32, Option<u32>>,
+    owner_states: Mutex<HashMap<u32, Vec<Option<u32>>>>,
+    me: Option<u32>,
 }
 
 const ME: u32 = 1000;
@@ -201,11 +203,28 @@ impl FakeProcesses {
             scans: Mutex::new(scans),
             signals: Mutex::new(Vec::new()),
             owners: HashMap::new(),
+            owner_states: Mutex::new(HashMap::new()),
+            me: Some(ME),
         }
     }
     fn owned(mut self, pid: u32, owner: Option<u32>) -> Self {
         self.owners.insert(pid, owner);
         self
+    }
+    fn owner_states(mut self, pid: u32, states: Vec<Option<u32>>) -> Self {
+        assert!(!states.is_empty());
+        self.owner_states.get_mut().unwrap().insert(pid, states);
+        self
+    }
+    fn owner(&self, pid: u32) -> Option<u32> {
+        let mut states = self.owner_states.lock().unwrap();
+        if let Some(states) = states.get_mut(&pid) {
+            if states.len() > 1 {
+                return states.remove(0);
+            }
+            return states[0];
+        }
+        self.owners.get(&pid).copied().unwrap_or(Some(ME))
     }
     fn scan(&self) -> Vec<CoreProcess> {
         let mut scans = self.scans.lock().unwrap();
@@ -216,16 +235,25 @@ impl FakeProcesses {
         }
     }
     async fn sweep(&self, inflight: &[u32]) -> Result<usize, String> {
+        self.sweep_for(Path::new(BINARY), Path::new(CONFIG_DIR), inflight)
+            .await
+    }
+    async fn sweep_for(
+        &self,
+        binary: &Path,
+        config_dir: &Path,
+        inflight: &[u32],
+    ) -> Result<usize, String> {
         sweep_stale_login_cores(
             &StaleSweepIo {
                 scan: &|| self.scan(),
-                owner: &|pid| self.owners.get(&pid).copied().unwrap_or(Some(ME)),
+                owner: &|pid| self.owner(pid),
                 signal: &|pid, signal| self.signals.lock().unwrap().push((pid, signal)),
             },
-            Some(ME),
+            self.me,
             Duration::ZERO,
-            Path::new(BINARY),
-            Path::new(CONFIG_DIR),
+            binary,
+            config_dir,
             inflight,
         )
         .await
@@ -303,7 +331,7 @@ fn only_a_process_of_this_user_with_a_readable_owner_is_ours() {
 }
 
 #[tokio::test]
-async fn another_users_same_shaped_core_is_neither_signalled_nor_a_reason_to_refuse() {
+async fn matching_unknown_or_foreign_owners_block_without_signalling_any_target() {
     // pid 10 is root's, pid 11's owner cannot be read; neither ever exits. pid 12 is ours.
     let processes = FakeProcesses::new(vec![
         vec![login_core(10), login_core(11), login_core(12)],
@@ -311,11 +339,17 @@ async fn another_users_same_shaped_core_is_neither_signalled_nor_a_reason_to_ref
     ])
     .owned(10, Some(0))
     .owned(11, None);
-    assert_eq!(processes.sweep(&[]).await, Ok(1));
-    assert_eq!(processes.signals(), vec![(12, Signal::Sigterm)]);
+    assert_eq!(
+        processes.sweep(&[]).await,
+        Err(STALE_LOGIN_CORE_ALIVE.into())
+    );
+    assert!(processes.signals().is_empty());
 
     let foreign_only = FakeProcesses::new(vec![vec![login_core(10)]]).owned(10, Some(0));
-    assert_eq!(foreign_only.sweep(&[]).await, Ok(0));
+    assert_eq!(
+        foreign_only.sweep(&[]).await,
+        Err(STALE_LOGIN_CORE_ALIVE.into())
+    );
     assert!(foreign_only.signals().is_empty());
 }
 
@@ -566,6 +600,17 @@ impl WindowsProcesses {
         inflight: &[u32],
         grace: Duration,
     ) -> Result<usize, String> {
+        self.sweep_in(binary, Path::new(CONFIG_DIR), inflight, grace)
+            .await
+    }
+
+    async fn sweep_in(
+        &self,
+        binary: &Path,
+        config_dir: &Path,
+        inflight: &[u32],
+        grace: Duration,
+    ) -> Result<usize, String> {
         sweep_windows_stale_login_cores(
             &WindowsStaleSweepIo {
                 scan: &|| self.scan(),
@@ -574,7 +619,7 @@ impl WindowsProcesses {
             },
             grace,
             binary,
-            Path::new(CONFIG_DIR),
+            config_dir,
             inflight,
         )
         .await
@@ -586,7 +631,7 @@ impl WindowsProcesses {
 }
 
 #[tokio::test]
-async fn windows_sweep_admits_only_proven_same_user_and_excludes_live_registered_pids() {
+async fn windows_unretired_non_targets_block_even_with_selected_and_registered_cores() {
     let mut unknown = held_login_core(windows_test_pid(21), "unknown");
     unknown.owner = ProcessOwner::Unknown;
     let mut other = held_login_core(windows_test_pid(22), "other");
@@ -607,16 +652,14 @@ async fn windows_sweep_admits_only_proven_same_user_and_excludes_live_registered
         processes
             .sweep(&[windows_test_pid(24)], Duration::ZERO)
             .await,
-        Ok(1)
+        Err(STALE_LOGIN_CORE_ALIVE.into())
     );
-    assert_eq!(processes.ends(), vec!["ours"]);
+    assert!(processes.ends().is_empty());
     assert_eq!(processes.scans.load(Ordering::SeqCst), 1);
-    assert!(processes
-        .observed
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|birth| birth == "ours"));
+    assert_eq!(
+        *processes.observed.lock().unwrap(),
+        vec!["unknown", "other", "system"]
+    );
 }
 
 #[tokio::test]
@@ -629,9 +672,12 @@ async fn windows_unknown_other_and_system_only_are_not_a_global_owner_receipt() 
         let mut process = held_login_core(windows_test_pid(20), "unselected");
         process.owner = owner;
         let processes = WindowsProcesses::new(vec![process]);
-        assert_eq!(processes.sweep(&[], Duration::ZERO).await, Ok(0));
+        assert_eq!(
+            processes.sweep(&[], Duration::ZERO).await,
+            Err(STALE_LOGIN_CORE_ALIVE.into())
+        );
         assert!(processes.ends().is_empty());
-        assert!(processes.observed.lock().unwrap().is_empty());
+        assert_eq!(*processes.observed.lock().unwrap(), vec!["unselected"]);
     }
 }
 
@@ -868,12 +914,15 @@ async fn dropping_a_windows_sweep_cannot_send_a_late_retry() {
 struct WindowsRegistrySweeper {
     processes: Arc<WindowsProcesses>,
     grace: Duration,
+    config_dir: PathBuf,
 }
 
 #[async_trait]
 impl StaleLoginCoreSweeper for WindowsRegistrySweeper {
     async fn sweep(&self, binary: &Path, inflight: &[u32]) -> Result<usize, String> {
-        self.processes.sweep_for(binary, inflight, self.grace).await
+        self.processes
+            .sweep_in(binary, &self.config_dir, inflight, self.grace)
+            .await
     }
 }
 
@@ -888,7 +937,11 @@ fn reg_with_windows_sweeper(
         true,
         Duration::from_secs(60),
     )
-    .with_stale_login_sweeper(Arc::new(WindowsRegistrySweeper { processes, grace }));
+    .with_stale_login_sweeper(Arc::new(WindowsRegistrySweeper {
+        processes,
+        grace,
+        config_dir: PathBuf::from(CONFIG_DIR),
+    }));
     (registry, spawner)
 }
 
@@ -1049,4 +1102,271 @@ fn windows_production_sweep_is_wired_to_original_holds_not_uid_or_pid_signals() 
     assert!(!compact.contains("process_owner_uid"));
     assert!(!compact.contains("send_signal"));
     assert!(!compact.contains("pid_alive"));
+}
+
+struct UnixRegistrySweeper {
+    processes: Arc<FakeProcesses>,
+    config_dir: PathBuf,
+}
+
+#[async_trait]
+impl StaleLoginCoreSweeper for UnixRegistrySweeper {
+    async fn sweep(&self, binary: &Path, inflight: &[u32]) -> Result<usize, String> {
+        self.processes
+            .sweep_for(binary, &self.config_dir, inflight)
+            .await
+    }
+}
+
+struct SweepAdmissionChecker(Arc<AtomicUsize>);
+
+#[async_trait]
+impl ConfigChecker for SweepAdmissionChecker {
+    async fn check(&self, _binary: &Path, _config: &Path) -> Result<(), String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn artifact_sweep_registry(
+    sweeper: Arc<dyn StaleLoginCoreSweeper>,
+) -> (LoginCoreRegistry, Arc<FakeSpawner>, Arc<AtomicUsize>) {
+    let spawner = fake_spawner(vec![], false, false);
+    let checks = Arc::new(AtomicUsize::new(0));
+    let registry = LoginCoreRegistry::with_deps(
+        spawner.clone(),
+        Arc::new(SweepAdmissionChecker(checks.clone())),
+        fake_subscriber(false),
+        Arc::new(|| Ok(PathBuf::from(BINARY))),
+        Duration::from_secs(60),
+    )
+    .with_stale_login_sweeper(sweeper);
+    (registry, spawner, checks)
+}
+
+fn old_writer_artifacts(user_data: &Path) -> (CoreProcess, PathBuf, PathBuf) {
+    let config = user_data.join("tailscale-login-ts1-900.json");
+    let cache = login_cache_path(&config);
+    std::fs::write(&config, b"old-config-secret").unwrap();
+    std::fs::write(&cache, b"old-cache-identity").unwrap();
+    let mut process = held_login_core(windows_test_pid(20), "old-writer");
+    // The real artifact directory has native syntax. Its program must use the same
+    // syntax, so Windows selects this writer instead of rejecting a POSIX program.
+    process.cmdline[0] = user_data
+        .join(Path::new(BINARY).file_name().unwrap())
+        .to_str()
+        .unwrap()
+        .to_owned();
+    process.cmdline[3] = config.to_str().unwrap().to_owned();
+    assert!(
+        is_stale_login_core(&process, Path::new(BINARY), user_data),
+        "the old writer fixture must match its actual artifact directory"
+    );
+    (process, config, cache)
+}
+
+async fn assert_artifact_admission_refused(
+    registry: &LoginCoreRegistry,
+    spawner: &FakeSpawner,
+    checks: &AtomicUsize,
+    user_data: &Path,
+    config: &Path,
+    cache: &Path,
+) {
+    let outcome = registry
+        .start_login(
+            &ts_server("ts1", "myts"),
+            user_data,
+            false,
+            None,
+            0,
+            Arc::new(FakeEmitter::default()),
+        )
+        .await;
+    match outcome {
+        StartLoginOutcome::Failed(reason) => assert_eq!(reason, STALE_LOGIN_CORE_ALIVE),
+        _ => panic!("an unretired old writer must refuse login before check/spawn"),
+    }
+    assert_eq!(checks.load(Ordering::SeqCst), 0);
+    assert_eq!(spawner.count.load(Ordering::SeqCst), 0);
+    assert!(!registry.shared.contains("ts1"));
+    assert_eq!(login_configs(user_data), vec![config.to_owned()]);
+    assert_eq!(std::fs::read(config).unwrap(), b"old-config-secret");
+    assert_eq!(std::fs::read(cache).unwrap(), b"old-cache-identity");
+    assert_eq!(std::fs::read_dir(user_data).unwrap().count(), 2);
+    let error = registry
+        .logout("ts1", &|| false, None, |_| {
+            panic!("an unretired old writer must also fence logout mutation")
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+    assert_eq!(error.to_string(), STALE_LOGIN_CORE_ALIVE);
+    assert_eq!(std::fs::read(config).unwrap(), b"old-config-secret");
+    assert_eq!(std::fs::read(cache).unwrap(), b"old-cache-identity");
+}
+
+#[tokio::test]
+async fn unix_uncertain_owners_fence_the_real_artifact_sweep_before_check_or_spawn() {
+    // Initial unknown/foreign owner and unknown current uid must send no signal. Losing
+    // ownership after TERM/KILL must preserve artifacts and must not send a later signal.
+    for (owners, me, signals) in [
+        (vec![None], Some(ME), vec![]),
+        (vec![Some(0)], Some(ME), vec![]),
+        (vec![Some(ME)], None, vec![]),
+        (vec![None], None, vec![]),
+        (vec![Some(ME), None], Some(ME), vec![Signal::Sigterm]),
+        (
+            vec![Some(ME), Some(ME), None],
+            Some(ME),
+            vec![Signal::Sigterm, Signal::Sigkill],
+        ),
+        (vec![Some(ME), Some(0)], Some(ME), vec![Signal::Sigterm]),
+    ] {
+        let user_data = temp_ud();
+        let (process, config, cache) = old_writer_artifacts(&user_data);
+        let pid = process.pid;
+        let mut processes = FakeProcesses::new(vec![vec![process]]).owner_states(pid, owners);
+        processes.me = me;
+        let processes = Arc::new(processes);
+        let (registry, spawner, checks) = artifact_sweep_registry(Arc::new(UnixRegistrySweeper {
+            processes: processes.clone(),
+            config_dir: user_data.clone(),
+        }));
+        assert_artifact_admission_refused(
+            &registry, &spawner, &checks, &user_data, &config, &cache,
+        )
+        .await;
+        assert_eq!(
+            processes.signals(),
+            signals
+                .into_iter()
+                .map(|signal| (pid, signal))
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(user_data).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn windows_non_targets_and_unknown_exit_fence_the_real_artifact_sweep() {
+    for (owner, states, ends) in [
+        (ProcessOwner::Unknown, vec![Some(true)], vec![]),
+        (ProcessOwner::Unknown, vec![None], vec![]),
+        (ProcessOwner::Other, vec![Some(true)], vec![]),
+        (ProcessOwner::Other, vec![None], vec![]),
+        (ProcessOwner::Elevated, vec![Some(true)], vec![]),
+        (ProcessOwner::Elevated, vec![None], vec![]),
+        (ProcessOwner::SameUser, vec![None], vec![]),
+        (
+            ProcessOwner::SameUser,
+            vec![Some(true), None],
+            vec!["old-writer"],
+        ),
+        (
+            ProcessOwner::SameUser,
+            vec![Some(true), Some(true), None],
+            vec!["old-writer", "old-writer"],
+        ),
+    ] {
+        let user_data = temp_ud();
+        let (mut process, config, cache) = old_writer_artifacts(&user_data);
+        process.owner = owner;
+        let processes =
+            Arc::new(WindowsProcesses::new(vec![process]).observed_as("old-writer", states));
+        let (registry, spawner, checks) =
+            artifact_sweep_registry(Arc::new(WindowsRegistrySweeper {
+                processes: processes.clone(),
+                grace: Duration::ZERO,
+                config_dir: user_data.clone(),
+            }));
+        assert_artifact_admission_refused(
+            &registry, &spawner, &checks, &user_data, &config, &cache,
+        )
+        .await;
+        assert_eq!(processes.ends(), ends);
+        std::fs::remove_dir_all(user_data).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn proven_gone_writers_allow_the_real_config_and_cache_sweep() {
+    // Exercise both actual sweep implementations. A foreign/unknown Windows birth can
+    // authorize no termination, but its original-handle exit observation still allows cleanup.
+    for owner in [
+        None,
+        Some(ProcessOwner::SameUser),
+        Some(ProcessOwner::Unknown),
+        Some(ProcessOwner::Other),
+        Some(ProcessOwner::Elevated),
+    ] {
+        let user_data = temp_ud();
+        let (mut process, config, cache) = old_writer_artifacts(&user_data);
+        let sweeper: Arc<dyn StaleLoginCoreSweeper> = if let Some(owner) = owner {
+            process.owner = owner;
+            Arc::new(WindowsRegistrySweeper {
+                processes: Arc::new(
+                    WindowsProcesses::new(vec![process])
+                        .observed_as("old-writer", vec![Some(false)]),
+                ),
+                grace: Duration::ZERO,
+                config_dir: user_data.clone(),
+            })
+        } else {
+            Arc::new(UnixRegistrySweeper {
+                processes: Arc::new(FakeProcesses::new(vec![vec![process], vec![]])),
+                config_dir: user_data.clone(),
+            })
+        };
+        let (registry, spawner, checks) = artifact_sweep_registry(sweeper);
+        started(&registry, &user_data, &ts_server("ts1", "myts")).await;
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.count.load(Ordering::SeqCst), 1);
+        assert!(!config.exists());
+        assert!(!cache.exists());
+        assert_eq!(login_configs(&user_data).len(), 1);
+        registry.cancel_login("ts1").await.unwrap();
+        std::fs::remove_dir_all(user_data).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unrelated_unknown_owners_do_not_block_private_artifact_cleanup() {
+    let mut unrelated = login_core(10);
+    unrelated.cmdline[3] = "/elsewhere/tailscale-login-ts1-3.json".into();
+    let unix = FakeProcesses::new(vec![vec![unrelated.clone()]]).owned(10, None);
+    assert_eq!(unix.sweep(&[]).await, Ok(0));
+    assert!(unix.signals().is_empty());
+    unrelated.owner = ProcessOwner::Unknown;
+    let windows = WindowsProcesses::new(vec![unrelated]);
+    assert_eq!(windows.sweep(&[], Duration::ZERO).await, Ok(0));
+    assert!(windows.ends().is_empty());
+    assert!(windows.observed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_new_matching_writer_during_escalation_is_not_an_exited_original() {
+    for after_kill in [false, true] {
+        for owner in [Some(ME), None] {
+            let scans = if after_kill {
+                vec![
+                    vec![login_core(10)],
+                    vec![login_core(10)],
+                    vec![login_core(11)],
+                ]
+            } else {
+                vec![vec![login_core(10)], vec![login_core(11)]]
+            };
+            let processes = FakeProcesses::new(scans).owned(11, owner);
+            assert_eq!(
+                processes.sweep(&[]).await,
+                Err(STALE_LOGIN_CORE_ALIVE.into())
+            );
+            let mut signals = vec![(10, Signal::Sigterm)];
+            if after_kill {
+                signals.push((10, Signal::Sigkill));
+            }
+            assert_eq!(processes.signals(), signals);
+        }
+    }
 }

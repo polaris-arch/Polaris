@@ -4,6 +4,7 @@
     "resources": [
       "core-manifest.json",
       "../resources/mac-arm64/",
+      "../resources/core-recovery/mac-arm64/",
       "../resources/dashboard/",
       "../THIRD-PARTY-LICENSES.md",
       "../NOTICE",

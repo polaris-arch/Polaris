@@ -55,7 +55,7 @@ pub struct TailscaleLoginConfig {
     /// 1.14 管理 API（恒一条）：瞬态核据此暴露 `SubscribeTailscaleStatus` —— 登录 URL 与登录成功
     /// 判据的**唯一**来源（见模块头）。
     pub services: Vec<Value>,
-    /// libbox always creates a cache with its platform logger; isolate it from the main cache.db.
+    /// libbox always creates a cache with its platform logger; the caller owns its isolated file.
     pub experimental: Value,
 }
 
@@ -69,11 +69,14 @@ pub struct TailscaleLoginConfig {
 /// controlUrl/hostname 等身份字段从 tailscaleSettings 透传（与 buildTailscaleEndpoint 同语义），但只透传
 /// 登录相关的少量字段——瞬态核只为拿 URL + 落 state，不承载路由/出口。
 ///
+/// `cache_path` must name this attempt's privately prepared file, independent of the lazy
+/// Tailscale state directory and the main cache.db. The host retains it until confirmed close.
 /// 上游 `buildTailscaleLoginConfig`。`user_data` 由调用方注入（state_directory = tailscale_state_dir）。
 pub fn build_tailscale_login_config(
     server: &ServerConfig,
     user_data: &Path,
     api: &TailscaleLoginApiService,
+    cache_path: &Path,
 ) -> Result<TailscaleLoginConfig, crate::tailscale_state::InvalidTailscaleStateId> {
     let ts = server.tailscale_settings.as_ref();
     let mut endpoint = Map::new();
@@ -150,7 +153,7 @@ pub fn build_tailscale_login_config(
         dns,
         services,
         experimental: serde_json::json!({
-            "cache_file": { "enabled": true, "path": state_dir.join(format!("login-cache-{}.db", api.port)).to_string_lossy() }
+            "cache_file": { "enabled": true, "path": cache_path.to_string_lossy() }
         }),
     })
 }

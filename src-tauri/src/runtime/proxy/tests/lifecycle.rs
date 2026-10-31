@@ -2175,6 +2175,81 @@ fn owned_stop_request(rt: &ProxyRuntime) -> ExpectedCoreStopRequest {
 }
 
 #[tokio::test]
+async fn user_data_recovery_cold_stop_confirms_restore_without_opening_public_zero() {
+    let (rt, _dir, _) = test_runtime_recording();
+    let dns = install_dns_recovery_fixture(&rt);
+    dns.fail_restore.store(false, Ordering::SeqCst);
+    let request = owned_stop_request(&rt);
+    assert_eq!(request.expected_main_generation, 0);
+    assert!(rt.stop_expected(request.clone()).await.is_err());
+    assert_eq!(rt.core_generation(), 0);
+    assert_eq!(
+        rt.stop_for_user_data_recovery(request).await.unwrap(),
+        ExpectedCoreStopResult::Stopped {
+            expected_main_generation: 0,
+            stop_main_generation: 1,
+        }
+    );
+    assert!(!dns.marker.exists());
+    assert!(!rt.status().running);
+}
+
+#[tokio::test]
+async fn user_data_recovery_stale_cold_request_never_stops_a_successor() {
+    let (rt, _dir, _) = test_runtime_recording();
+    let dns = install_dns_recovery_fixture(&rt);
+    let writes = dns.writes.load(Ordering::SeqCst);
+    let request = owned_stop_request(&rt);
+    let state_gate = rt.mesh.tailscale_state_gate().await;
+    let stopping = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.stop_for_user_data_recovery(request).await })
+    };
+    for _ in 0..10_000 {
+        if rt.switch_serial.try_lock().is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(rt.switch_serial.try_lock().is_err());
+    let successor = rt.bump_generation();
+    mark_running(&rt);
+    drop(state_gate);
+    assert_eq!(
+        stopping.await.unwrap().unwrap(),
+        ExpectedCoreStopResult::Changed
+    );
+    assert_eq!(rt.core_generation(), successor);
+    assert!(rt.status().running);
+    assert_eq!(dns.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+}
+
+#[tokio::test]
+async fn user_data_recovery_requires_the_real_restore_receipt() {
+    let (rt, _dir, _) = test_runtime_recording();
+    let dns = install_dns_recovery_fixture(&rt);
+    assert!(rt
+        .stop_for_user_data_recovery(owned_stop_request(&rt))
+        .await
+        .is_err());
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+}
+
+#[tokio::test]
+async fn user_data_recovery_does_not_stop_an_active_core() {
+    let (rt, _dir, _) = test_runtime_recording();
+    mark_running(&rt);
+    let generation = rt.core_generation();
+    assert!(rt
+        .stop_for_user_data_recovery(owned_stop_request(&rt))
+        .await
+        .is_err());
+    assert_eq!(rt.core_generation(), generation);
+    assert!(rt.status().running);
+}
+
+#[tokio::test]
 async fn owned_stop_dns_failure_never_returns_stopped_and_same_marker_recovers_on_retry() {
     let (rt, _dir, _) = test_runtime_recording();
     rt.bump_generation();
@@ -2699,5 +2774,288 @@ async fn malformed_config_is_rejected_before_claim_stop_or_proxy_cleanup() {
         assert_eq!(rt.status().pid, pid);
         assert!(rt.status().running);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_helper_initial_local_stop_keeps_public_zero_rejected_and_claims_real_generation() {
+    let (rt, _dir, _) = test_runtime_recording();
+    assert_eq!(rt.core_generation(), 0);
+    let dns = install_dns_recovery_fixture(&rt);
+    dns.fail_restore.store(false, Ordering::SeqCst);
+    let writes = dns.writes.load(Ordering::SeqCst);
+    let request = owned_stop_request(&rt);
+    assert_eq!(request.expected_main_generation, 0);
+    assert!(rt.stop_expected(request.clone()).await.is_err());
+    assert_eq!(rt.core_generation(), 0);
+    assert_eq!(dns.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+    assert_eq!(
+        rt.stop_expected_for_linux_helper_maintenance(request)
+            .await
+            .unwrap()
+            .outcome(),
+        ExpectedCoreStopResult::Stopped {
+            expected_main_generation: 0,
+            stop_main_generation: 1
+        }
+    );
+    assert_eq!(rt.core_generation(), 1);
+    assert!(!dns.marker.exists());
+    // This receipt synchronizes only this App. It is no proof about a legacy
+    // daemon/user session: native journal/baseline/network checks remain mandatory.
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_helper_zero_waiting_cas_never_stops_or_restores_a_new_generation() {
+    let (rt, _dir, _) = test_runtime_recording();
+    let dns = install_dns_recovery_fixture(&rt);
+    let writes = dns.writes.load(Ordering::SeqCst);
+    let request = owned_stop_request(&rt);
+    let state_gate = rt.mesh.tailscale_state_gate().await;
+    let stopping = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            rt.stop_expected_for_linux_helper_maintenance(request)
+                .await
+                .map(|boundary| boundary.outcome())
+        })
+    };
+    for _ in 0..10_000 {
+        if rt.switch_serial.try_lock().is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(rt.switch_serial.try_lock().is_err());
+    let successor = rt.bump_generation();
+    drop(state_gate);
+    assert_eq!(
+        stopping.await.unwrap().unwrap(),
+        ExpectedCoreStopResult::Changed
+    );
+    assert_eq!(rt.core_generation(), successor);
+    assert_eq!(dns.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_helper_nonzero_uses_public_owned_stop_and_propagates_real_restore_error() {
+    let (rt, _dir, _) = test_runtime_recording();
+    rt.bump_generation();
+    let dns = install_dns_recovery_fixture(&rt);
+    assert!(rt
+        .stop_expected_for_linux_helper_maintenance(owned_stop_request(&rt))
+        .await
+        .is_err());
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+    dns.fail_restore.store(false, Ordering::SeqCst);
+    let request = owned_stop_request(&rt);
+    let before = request.expected_main_generation;
+    assert_eq!(
+        rt.stop_expected_for_linux_helper_maintenance(request)
+            .await
+            .unwrap()
+            .outcome(),
+        ExpectedCoreStopResult::Stopped {
+            expected_main_generation: before,
+            stop_main_generation: before + 1
+        }
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn linux_helper_initial_entry_cannot_authorize_mac_or_windows() {
+    let (rt, _dir) = test_runtime();
+    let request = owned_stop_request(&rt);
+    let generation = rt.core_generation();
+    assert!(rt
+        .stop_expected_for_linux_helper_maintenance(request)
+        .await
+        .is_err());
+    assert_eq!(rt.core_generation(), generation);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_helper_boundary_keeps_new_physical_launch_waiting_until_maintenance_releases_it() {
+    let (rt, _dir, _) = test_runtime_recording();
+    let boundary = rt
+        .stop_expected_for_linux_helper_maintenance(owned_stop_request(&rt))
+        .await
+        .unwrap();
+    assert_eq!(
+        boundary.outcome(),
+        ExpectedCoreStopResult::Stopped {
+            expected_main_generation: 0,
+            stop_main_generation: 1
+        }
+    );
+    assert!(rt.switch_serial.try_lock().is_err());
+    let successor = rt.bump_generation();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let worker = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            let _gate = rt.mesh.tailscale_state_gate().await;
+            entered.send(rt.core_generation()).unwrap();
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !worker.is_finished(),
+        "new Start cannot cross the existing physical state gate"
+    );
+    drop(boundary);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap(),
+        successor
+    );
+    worker.await.unwrap();
+    assert_eq!(
+        rt.core_generation(),
+        successor,
+        "release never stops the successor"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn linux_helper_owned_task_keeps_boundary_when_its_ipc_waiter_is_dropped() {
+    let (rt, _dir, _) = test_runtime_recording();
+    let request = owned_stop_request(&rt);
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, waiting) = tokio::sync::oneshot::channel();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let worker = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            let boundary = rt
+                .stop_expected_for_linux_helper_maintenance(request)
+                .await
+                .unwrap();
+            let stop_watchdog = AtomicBool::new(false);
+            let mut watchdog = tokio::spawn(async move {
+                waiting.await.unwrap();
+                0usize
+            });
+            entered.send(()).unwrap();
+            let timely = crate::commands::helper::join_linux_watchdog_to_terminal(
+                &stop_watchdog,
+                &mut watchdog,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !timely,
+                "the reporting budget expired, but the actual worker was joined"
+            );
+            drop(boundary);
+            done.send(()).unwrap();
+        })
+    };
+    ready.await.unwrap();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    drop(worker); // Same detached ownership as the real command's spawned body.
+    assert!(rt.switch_serial.try_lock().is_err());
+    let successor = rt.bump_generation();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), finished)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rt.switch_serial.try_lock().is_ok());
+    assert_eq!(rt.core_generation(), successor);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn linux_helper_watchdog_timeout_retains_real_gates_through_every_terminal() {
+    for outcome in ["success", "body-error", "panic", "cancelled"] {
+        let (rt, _dir, _) = test_runtime_recording();
+        let request = owned_stop_request(&rt);
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let owner = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move {
+                let boundary = rt
+                    .stop_expected_for_linux_helper_maintenance(request)
+                    .await
+                    .unwrap();
+                let body_result = if outcome == "body-error" {
+                    Err("body failed")
+                } else {
+                    Ok(())
+                };
+                let done = AtomicBool::new(false);
+                let mut watchdog = tokio::spawn(async move {
+                    waiting.await.unwrap();
+                    assert_ne!(outcome, "panic", "controlled watchdog panic");
+                    0usize
+                });
+                entered.send(watchdog.abort_handle()).unwrap();
+                let terminal = crate::commands::helper::join_linux_watchdog_to_terminal(
+                    &done,
+                    &mut watchdog,
+                    Duration::from_secs(1),
+                )
+                .await;
+                assert!(done.load(Ordering::SeqCst));
+                assert!(watchdog.is_finished());
+                drop(boundary);
+                (terminal, body_result)
+            })
+        };
+        let controlled_abort = ready.await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(!owner.is_finished());
+        assert!(rt.switch_serial.try_lock().is_err());
+        let state_waiter = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move {
+                let _gate = rt.mesh.tailscale_state_gate().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!state_waiter.is_finished());
+        let successor = rt.bump_generation();
+        if outcome == "cancelled" {
+            // Test-only cancellation of a channel-waiting worker. The actual
+            // joined error, not this request, must release the boundary.
+            controlled_abort.abort();
+        } else {
+            release.send(()).unwrap();
+        }
+        let (terminal, body_result) = owner.await.unwrap();
+        match outcome {
+            "panic" => assert!(terminal.unwrap_err().is_panic()),
+            "cancelled" => assert!(terminal.unwrap_err().is_cancelled()),
+            "body-error" => {
+                assert!(!terminal.unwrap());
+                assert!(body_result.is_err());
+            }
+            _ => {
+                assert!(!terminal.unwrap());
+                assert!(body_result.is_ok());
+            }
+        }
+        state_waiter.await.unwrap();
+        assert!(rt.switch_serial.try_lock().is_ok());
+        assert_eq!(
+            rt.core_generation(),
+            successor,
+            "joining never stops a successor"
+        );
     }
 }

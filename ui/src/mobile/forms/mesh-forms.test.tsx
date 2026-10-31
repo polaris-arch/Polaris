@@ -30,6 +30,8 @@
  * 规格函数的返回值（本体）× 面板渲染出来的 HTML（生产在用它）。
  */
 
+// Register the oracle's actual-close/join hook while Vitest collects this file.
+import { cssChain, measure } from '@/styles/css-oracle.test-support';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { readFileSync } from 'node:fs';
@@ -582,7 +584,37 @@ describe('② 真渲染：三张表的字段在移动端画得出来', () => {
     expect(html(<TsSettingsPanel instanceId="i3" serverId="ts-1" />), '空 store 下没画空态').toContain(
       tr('ts.noNode'),
     );
+    expect(html(<TsSettingsPanel instanceId="i3" serverId="ts-1" />)).not.toContain('data-ts-coexistence');
   });
+
+  it('TS coexistence guidance stays visible with routing and help closed, without mixing two accounts', async () => {
+    const css = (await cssChain('mobile')).map(item => item.css);
+    const first = tsNode();
+    const second = { ...tsNode(), id: 'ts-2', name: 'Second tailnet', tailscaleSettings: {
+      hostname: 'second-tailnet', reverseMesh: true, authKey: 'SECOND-ACCOUNT-DO-NOT-LEAK',
+    } };
+    useAppStore.setState({ servers: [{ ...first, tailscaleSettings: {
+      ...first.tailscaleSettings, reverseMesh: true,
+    } }, second] });
+    mirrorLiveStateIntoSsrSnapshot();
+    const markup = html(<TsSettingsPanel instanceId="i3" serverId="ts-2" />);
+    expect(markup).toContain('value="second-tailnet"');
+    expect(markup).not.toContain('value="sway-phone"');
+    expect(markup).not.toContain('AUTH-KEY-DO-NOT-LEAK');
+    expect(markup).not.toContain('SECOND-ACCOUNT-DO-NOT-LEAK');
+    expect(markup).not.toMatch(/class="m-form-btn primary"[^>]*disabled/);
+    const boundary = '[data-ts-coexistence] .m-info-summary';
+    const help = '[data-ts-coexistence] button[aria-haspopup="dialog"][aria-expanded="false"]';
+    const actual = await measure({ css, html: markup, viewport: { width: 390, height: 844 } }, [
+      { select: boundary, props: ['display', 'visibility'] },
+      { select: help, props: ['display', 'visibility'] },
+    ]);
+    expect(actual.count(boundary)).toBe(1);
+    expect(actual.get(boundary, 'visibility')).toBe('visible');
+    expect(actual.rect(boundary).height).toBeGreaterThan(0);
+    expect(actual.count(help)).toBe(1);
+    expect(actual.rect(help).height).toBeGreaterThan(0);
+  }, 30_000);
 
 });
 

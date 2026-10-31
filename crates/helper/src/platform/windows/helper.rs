@@ -41,6 +41,8 @@ struct ChildState {
     /// 当前 child sing-box 的 pid（None = 无 child）。
     pid: Option<u32>,
     closing: bool,
+    // SCM/listener shutdown cannot be undone by an accepted upgrade cancel.
+    shutting_down: bool,
     native: Option<NativeCustody>,
     terminal: std::collections::VecDeque<(
         polaris_helper_proto::HelperBirthTarget,
@@ -321,7 +323,7 @@ where
             }
             return Err(std::io::Error::other("fixture selected id differs"));
         }
-        crate::pinned_core::verify(&self.derived_core_dir(), id).map(Arc::new)
+        crate::pinned_core::verify(&self.derived_core_dir(), id)
     }
 
     /// token 常量时间比对（Go helper.go:169）。[`Self::handle`] 与 [`Self::handle_frame`] 共用。
@@ -394,7 +396,8 @@ where
                 let Ok(mut state) = self.child_mu.lock() else {
                     return native_busy();
                 };
-                if state.pid.is_some()
+                if state.shutting_down
+                    || state.pid.is_some()
                     || state.native.is_some()
                     || !self.proc.native_custody_empty()
                 {
@@ -633,7 +636,8 @@ where
         let Ok(native_state) = self.child_mu.lock() else {
             return native_busy();
         };
-        if native_state.closing
+        if native_state.shutting_down
+            || native_state.closing
             || native_state.native.is_some()
             || !self.proc.native_custody_empty()
         {
@@ -731,12 +735,15 @@ where
         let dns_result = self.dns_admission.close();
         let core_result = match self.child_mu.lock() {
             Ok(mut state) => {
+                state.shutting_down = true;
                 state.closing = true;
                 Ok(())
             }
             Err(poison) => {
                 // Recover only to fence admission, never to mint an empty or stopped receipt.
-                poison.into_inner().closing = true;
+                let mut state = poison.into_inner();
+                state.shutting_down = true;
+                state.closing = true;
                 Err("helper child custody lock poisoned".into())
             }
         };

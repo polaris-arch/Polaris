@@ -108,7 +108,7 @@ impl UninstallOps for RecordingOps {
 struct FakeHelper {
     supported: bool,
     installed: bool,
-    result: Result<(), String>,
+    result: Result<HelperRemovalEffect, String>,
     calls: AtomicUsize,
 }
 impl FakeHelper {
@@ -116,7 +116,7 @@ impl FakeHelper {
         Self {
             supported: true,
             installed: true,
-            result: Ok(()),
+            result: Ok(HelperRemovalEffect::Removed),
             calls: AtomicUsize::new(0),
         }
     }
@@ -128,7 +128,7 @@ impl HelperUninstallOps for FakeHelper {
     fn installed(&self) -> bool {
         self.installed
     }
-    fn uninstall(&self) -> Result<(), String> {
+    fn uninstall(&self) -> Result<HelperRemovalEffect, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.result.clone()
     }
@@ -468,7 +468,7 @@ fn windows_leg_reports_launch_not_deletion() {
     );
     assert_eq!(seen.lock().unwrap().len(), 1, "必须真去拉 uninstaller");
     match out {
-        StepOutcome::Done { detail } => {
+        StepOutcome::Done { detail, .. } => {
             assert!(detail.contains("已启动"), "{detail}");
             assert!(
                 detail.contains("不代表已删除"),
@@ -575,7 +575,7 @@ fn config_leg_deletes_the_copy_and_reports_the_path() {
         appimage: None,
     };
     match ops.remove_user_config() {
-        StepOutcome::Done { detail } => {
+        StepOutcome::Done { detail, .. } => {
             assert!(detail.contains(&dir.display().to_string()), "{detail}");
         }
         other => panic!("实得 {other:?}"),
@@ -663,7 +663,7 @@ fn mac_leg_deletes_a_copied_app_bundle() {
         appimage: None,
     };
     match ops.remove_app() {
-        StepOutcome::Done { detail } => assert!(detail.contains("Polaris.app"), "{detail}"),
+        StepOutcome::Done { detail, .. } => assert!(detail.contains("Polaris.app"), "{detail}"),
         other => panic!("实得 {other:?}"),
     }
     assert!(!bundle.exists(), "副本 .app 应已删除");
@@ -706,12 +706,15 @@ fn helper_leg_three_states() {
         .uninstall_helper()
     };
 
-    // 未安装 → 跳过，且**不该白弹一次提权框**。
+    // 未安装 → 未核定受保护数据，不声称已删除；**不白弹一次提权框**。
     let not_installed = FakeHelper {
         installed: false,
         ..FakeHelper::ready()
     };
-    assert!(matches!(mk(&not_installed), StepOutcome::Skipped { .. }));
+    assert!(matches!(
+        mk(&not_installed),
+        StepOutcome::Unsupported { .. }
+    ));
     assert_eq!(
         not_installed.calls.load(Ordering::SeqCst),
         0,
@@ -738,7 +741,7 @@ fn helper_leg_three_states() {
     // 成功 → 报告必须点名受保护目录（用户得知道到底删了哪儿）。
     let ok = FakeHelper::ready();
     match mk(&ok) {
-        StepOutcome::Done { detail } => {
+        StepOutcome::Done { detail, .. } => {
             assert!(detail.contains("/fake/protected/core"), "{detail}");
         }
         other => panic!("实得 {other:?}"),
@@ -1138,5 +1141,57 @@ fn inspection_errors_fail_closed_and_halt_later_removal_steps() {
                 ));
             }
         }
+    }
+}
+
+#[test]
+fn typed_retirement_preserves_core_fixture_and_full_report_never_claims_complete() {
+    let scratch = Scratch::new("retired-helper-scope");
+    let protected = scratch.path().join("protected-core");
+    std::fs::write(&protected, b"retained protected core").unwrap();
+    let helper = FakeHelper {
+        result: Ok(HelperRemovalEffect::RetiredDataPreserved),
+        ..FakeHelper::ready()
+    };
+    let auto = FakeAutostart::off();
+    let system = SystemUninstallOps {
+        helper: &helper,
+        autostart: &auto,
+        os: "macos",
+        config_dir: scratch.path().join(CONFIG_DIR_LEAF),
+        cache_updates_dir: None,
+        bundle_identifier: "com.polaris.fixture".into(),
+        exe: None,
+        appimage: None,
+    };
+    let helper_outcome = system.uninstall_helper();
+    let StepOutcome::Done {
+        helper_removal: Some(HelperRemovalEffect::RetiredDataPreserved),
+        detail,
+    } = &helper_outcome
+    else {
+        panic!("{helper_outcome:?}")
+    };
+    assert!(detail.contains("仍保留") && detail.contains("未执行删除"));
+    assert_eq!(
+        std::fs::read(protected).unwrap(),
+        b"retained protected core"
+    );
+    let mut ops = RecordingOps::all_ok();
+    ops.helper = helper_outcome;
+    let report = run_uninstall(&ops, StepOutcome::skipped("no core"));
+    assert_eq!(report.verdict, UninstallVerdict::Incomplete);
+    let json = serde_json::to_value(report).unwrap();
+    assert_eq!(json["verdict"], "incomplete");
+    assert_eq!(
+        json["steps"][2]["outcome"]["helperRemoval"],
+        "retiredDataPreserved"
+    );
+    for failure in ["cancelled", "cleanup unknown"] {
+        let mut ops = RecordingOps::all_ok();
+        ops.helper = StepOutcome::failed(failure);
+        let report = run_uninstall(&ops, StepOutcome::skipped("no core"));
+        assert_eq!(report.verdict, UninstallVerdict::Failed);
+        assert!(!ops.calls().contains(&UninstallStep::UserConfig));
     }
 }

@@ -1,4 +1,5 @@
-//! 门：应用侧的内核路径只来自安装包 —— 不得重新长出「换一个内核」的入口。
+//! 门：来源只限当前安装包的 compiled identity 及其受信恢复数据副本。
+//! 不得重新长出任意上传、外部路径或在线换核的入口；恢复数据不是执行许可。
 //!
 //! # 守的是什么
 //!
@@ -365,7 +366,7 @@ fn no_setting_points_at_a_core_binary() {
     assert!(
         offenders.is_empty(),
         "用户配置里出现了指向内核文件 / 目录的键：\n{}\n\n\
-         应用只从安装包解析内核。设置里一旦能填内核的位置，任何一份配置（导入的备份、\
+         应用只选择当前安装包身份或其受信恢复数据。设置里一旦能填内核的位置，任何一份配置（导入的备份、\
          被改写的 config.json）都能让应用去执行一个与它不配套的内核。",
         offenders.join("\n")
     );
@@ -510,7 +511,7 @@ fn release_core_resolution_has_exactly_one_leg() {
 /// 应用 crate 里**能拿到内核路径**的位置：`(文件, 标识, 次数, 用途)`。
 ///
 /// 两类标识：
-/// - `resolve_core_binary`：内核路径的唯一解析函数。起核、起核前 `check`、测速临时核、Tailscale
+/// - `resolve_core_binary`：执行入口的共同解析门。起核、起核前 `check`、测速临时核、Tailscale
 ///   登录核、管理员安装暂存，全部经它拿路径；
 /// - 内核文件名：`core_filename()` / `core_filename_for()` 的调用，以及字面量 `"sing-box"` /
 ///   `"sing-box.exe"`。不经解析函数而自己定位一个内核文件，绕不开文件名。
@@ -527,31 +528,49 @@ const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
         "runtime/core_identity.rs",
         "\"sing-box\"",
         2,
-        "Compiled selection whitelist and private installation stage retirement",
+        "Compiled selection binding, selected data and verified installer permission",
     ),
     (
         "runtime/core_identity.rs",
         "\"sing-box.exe\"",
         1,
-        "Compiled Windows core member is resolved only within the bundle payload",
+        "Compiled selection data binding on Windows, not an execution provider",
+    ),
+    (
+        "runtime/core_identity/recovery.rs",
+        "\"sing-box\"",
+        1,
+        "Strict compiled-member archive stage, not renderer-supplied payload",
+    ),
+    (
+        "runtime/core_identity/recovery.rs",
+        "\"sing-box.exe\"",
+        1,
+        "Same strict compiled-member archive stage on Windows",
+    ),
+    (
+        "runtime/core_identity/user_store.rs",
+        "\"sing-box\"",
+        1,
+        "Exact compiled-ID persisted data; purpose/platform admission remains separate",
+    ),
+    (
+        "runtime/core_identity/user_store.rs",
+        "\"sing-box.exe\"",
+        1,
+        "Same exact compiled-ID data candidate on Windows",
+    ),
+    (
+        "runtime/core_identity/user_store/windows_native_tests.rs",
+        "\"sing-box.exe\"",
+        2,
+        "Only cfg(all(test, windows)) actual data fixture; module guard checked below",
     ),
     (
         "commands/proxy.rs",
         "resolve_core_binary",
         2,
         "节点探测与规则正则准入的 check 均使用 resolve_core_binary 给出的随包核",
-    ),
-    (
-        "lib.rs",
-        "resolve_core_binary",
-        1,
-        "把随包核路径注入版本读取",
-    ),
-    (
-        "runtime/helper.rs",
-        "resolve_core_binary",
-        1,
-        "管理员内容安装的随包来源",
     ),
     (
         "runtime/proxy.rs",
@@ -606,6 +625,17 @@ fn core_path_has_one_source() {
         "\"sing-box.exe\"",
     ];
     let files = app_crate_code();
+    // Scan this exact fixture rather than broadly skipping *_tests.rs. Removing
+    // its test-only module cfg must make the source gate fail.
+    let (_, user_store) = files
+        .iter()
+        .find(|(rel, _)| rel == "runtime/core_identity/user_store.rs")
+        .expect("selected data source missing");
+    let compact: String = user_store.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("#[cfg(all(test,windows))]modwindows_native_tests;"),
+        "Windows fixture must remain guarded by cfg(all(test, windows))"
+    );
     assert!(
         files.len() >= 120,
         "只扫到 {} 个文件 —— 取材面塌了",
@@ -659,7 +689,7 @@ fn core_path_has_one_source() {
         found, registered,
         "\n内核路径来源的出现点与登记表不一致（左：源码实测；右：登记）。\n\
          新增出现点：先确认它拿到的是 `resolve_core_binary` 给的随包核路径，再登记用途；\n\
-         不经解析函数自己定位内核文件的，不许加。"
+         任意外部路径、上传或在线换核来源不许登记。"
     );
 }
 
@@ -706,7 +736,7 @@ fn legacy_cleanup_runs_once_before_any_core_start() {
         "core_paths::init_base_dir(",
         "core_paths::remove_legacy_core_state(",
         "AppRuntime::new(",
-        "runtime::proxy::resolve_core_binary()",
+        "runtime::core_identity::acquire(",
         "startup_tasks::spawn(",
     ];
     let positions: Vec<usize> = sequence.iter().map(|needle| position(needle)).collect();

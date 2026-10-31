@@ -316,10 +316,15 @@ pub fn build_proxy_outbound(
                 ob.network = s.network.clone();
                 if version == 4 {
                     if let Some(mode) = &s.obfs_mode {
-                        if mode != "none" {
+                        if !mode.is_empty() && mode != "none" {
                             ob.obfs_mode = Some(mode.clone());
-                            ob.obfs_host =
-                                Some(s.obfs_host.clone().unwrap_or_else(|| "bing.com".into()));
+                            // Keep HTTP's existing default. TLS without an explicit
+                            // host delegates to the selected Core's own default.
+                            ob.obfs_host = if mode == "tls" {
+                                s.obfs_host.clone().filter(|host| !host.is_empty())
+                            } else {
+                                Some(s.obfs_host.clone().unwrap_or_else(|| "bing.com".into()))
+                            };
                         }
                     }
                 } else {
@@ -574,7 +579,11 @@ pub fn build_proxy_outbound(
 
     // TLS（非 naive）。
     // security 是 SecurityMode 枚举 → 大小写变体在反序列化边界已归一，此处不可能漏判。
-    if server.protocol != Protocol::Naive
+    // Trojan 的显式 None 来自节点编辑器；省略 security 仍保留默认 TLS。
+    let plaintext_trojan = server.protocol == Protocol::Trojan
+        && matches!(server.security.as_ref(), Some(SecurityMode::None));
+    if !plaintext_trojan
+        && server.protocol != Protocol::Naive
         && (server.security.as_ref().is_some_and(SecurityMode::is_tls)
             || server.tls_settings.is_some()
             || TLS_PROTOCOLS.contains(&protocol.as_str()))

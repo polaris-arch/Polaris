@@ -732,3 +732,32 @@ describe('Fold 必须是受控 details —— 结构前提', () => {
     }
   });
 });
+
+
+describe('strict-route platform consequences remain in the visible row', () => {
+  const row = (os: string, enabled: boolean) => {
+    dataOs.value = os;
+    const html = render({ proxyModeType: 'tun', tunConfig: { mtu: 9000, autoRoute: true, strictRoute: enabled } }, SettingsTun);
+    const start = html.indexOf('id="set-strict-route"');
+    expect(start).toBeGreaterThan(0);
+    const next = html.indexOf('<div class="set-row"', start);
+    return html.slice(start, next === -1 ? undefined : next);
+  };
+  it('shows the macOS unsupported consequence outside tooltip attributes with the actual switch disabled', () => {
+    try {
+      const html = row('mac', true);
+      expect(html.replace(/(?:data-tip|aria-label)="[^"]*"/g, '')).toContain('settings.tun.strictRouteMacInert');
+      expect(html).toContain('aria-disabled="true"');
+      expect(html).toContain('tabindex="-1"');
+      expect(html).not.toContain('settings.tun.strictRouteWindowsRisk');
+    } finally { dataOs.value = 'mac'; }
+  });
+  it('shows Windows IPv6/DNS risk only when enabled, and never labels Linux unsupported', () => {
+    try {
+      expect(row('win', true).replace(/(?:data-tip|aria-label)="[^"]*"/g, '')).toContain('settings.tun.strictRouteWindowsRisk');
+      expect(row('win', false)).not.toContain('settings.tun.strictRouteWindowsRisk');
+      expect(row('lin', true)).not.toContain('settings.tun.strictRouteMacInert');
+      expect(row('lin', true)).not.toContain('settings.tun.strictRouteWindowsRisk');
+    } finally { dataOs.value = 'mac'; }
+  });
+});

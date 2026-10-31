@@ -7,8 +7,8 @@ mod rule_pattern_admission_tests;
 /// 跑 `.exe`，按已用 Linux 等价场景（含冒号目录名）验证过的分隔符规律手工拼的字符串。
 mod probe_diagnostic_tests;
 
-/// [`run_probe_check`](super::run_probe_check) 的真子进程接线门：探针只在 unix 有
-/// （理由见 [`crate::test_support::write_sleeping_probe`]）。
+/// Strict App admission and verdict mapping; genuine native lifecycle positives
+/// use supervisor's private admitted fixture and the same central custody.
 #[cfg(unix)]
 mod probe_check_process;
 

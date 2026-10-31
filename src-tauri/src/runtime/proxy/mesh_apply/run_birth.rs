@@ -3,14 +3,14 @@
 //! permit can be issued yet. A fact snapshot is never a spawn or StopLease.
 
 use super::preflight::{ExactStartReadiness, VerifiedExactStart};
+#[cfg(test)]
+use crate::runtime::core_child::Child;
 use crate::runtime::proxy::process_supervision::RunIdentity;
 #[cfg(test)]
 use crate::runtime::proxy::process_supervision::{DirectCoreRun, DirectRunOrigin};
 use polaris_config_engine::user_config::mesh_route_state::{
     MeshDesiredRun, MeshRouteState, MeshTransactionPhase,
 };
-#[cfg(test)]
-use tokio::process::Child;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManagedBirthError {

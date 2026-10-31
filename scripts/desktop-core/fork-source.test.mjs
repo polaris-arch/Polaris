@@ -272,12 +272,18 @@ test('desktop Go pin reads the selected desktop manifest, rejects mobile role an
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test('actual seven workflow Go pin commands reject wrong source bytes, mobile role and missing pin', () => {
-  const commands = ['desktop-core', 'package', 'release-risk'].flatMap((name) =>
-    readFileSync(join(repo, '.github/workflows', `${name}.yml`), 'utf8').split('\n')
+test('actual five workflow Go pin commands reject wrong source bytes, mobile role and missing pin', () => {
+  const commands = ['desktop-core', 'package', 'release-risk'].flatMap((name) => {
+    const source = readFileSync(join(repo, '.github/workflows', `${name}.yml`), 'utf8');
+    const jobs = source.slice(source.indexOf('\njobs:\n')).split(/\n(?= {2}[a-z][a-z0-9_-]*:\n)/).slice(1);
+    return jobs.flatMap((block) => block.split('\n')
       .filter((line) => line.includes('run: node') && line.includes('version='))
-      .map((line) => line.trim().slice('run: '.length)));
-  assert.equal(commands.length, 7);
+      .map((line) => ({ job: `${name}/${block.match(/^ {2}([^:]+):/)[1]}`, command: line.trim().slice('run: '.length) })));
+  });
+  // Device-only jobs are retired; every remaining source producer/consumer still runs the full rejection matrix.
+  assert.deepEqual(commands.map(({ job }) => job), [
+    'desktop-core/produce', 'desktop-core/assemble', 'package/package', 'package/core_wire', 'release-risk/preflight',
+  ]);
   const f = fixture();
   try {
     copyFileSync(join(repo, 'scripts/desktop-core/source-graph.mjs'), join(f.root, 'scripts/desktop-core/source-graph.mjs'));
@@ -286,7 +292,7 @@ test('actual seven workflow Go pin commands reject wrong source bytes, mobile ro
     const output = join(f.root, 'github-output');
     const runCommands = (accepted, message) => {
       write(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify(f.manifest));
-      for (const command of commands) {
+      for (const { command } of commands) {
         write(output, '');
         const result = spawnSync('bash', ['-c', command], {
           cwd: f.root, encoding: 'utf8', env: { ...process.env, GITHUB_OUTPUT: output },

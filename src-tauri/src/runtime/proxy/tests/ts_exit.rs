@@ -1,5 +1,28 @@
 use super::*;
 
+// Original edge/cache tests now establish the same actual emitted writer
+// context as startup, rather than passing a naked tag map around admission.
+fn admit_ts_relay_fixture(rt: &Arc<ProxyRuntime>, tags: &BTreeMap<String, String>) -> u64 {
+    if let Some(context) = rt
+        .tailnet_context()
+        .filter(|context| context.tag_to_id() == *tags && !context.suspended)
+    {
+        return context.token;
+    }
+    let raw = serde_json::json!({ "servers": tags.iter().map(|(tag, id)| serde_json::json!({ "id": id, "name": tag, "protocol": "tailscale", "tailscaleSettings": {} })).collect::<Vec<_>>(), "selectedServerId": "__direct__", "proxyMode": "smart", "proxyModeType": "manual" });
+    let config = serde_json::from_value(raw.clone()).unwrap();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let generated =
+        polaris_config_engine::builder::generate_sing_box_config(&config, &BTreeMap::new(), &deps)
+            .unwrap();
+    let bindings = rt.tailnet_bindings(&raw, &generated);
+    let _publication = rt.gate.lock_generation_publication();
+    rt.activate_tailnet_context(rt.gate.generation(), bindings);
+    let context = rt.tailnet_context().unwrap();
+    assert_eq!(context.tag_to_id(), *tags);
+    context.token
+}
+
 fn save_ts_runtime_fixture(rt: &Arc<ProxyRuntime>, config: &Value) {
     rt.config.save_full(config).expect("save cfg");
     *rt.current_config.write().unwrap() = Some(rt.config.current().expect("normalized R"));
@@ -65,7 +88,12 @@ async fn ts_status_frame_updates_cache_and_emits_per_registered_endpoint() {
             },
         ],
     };
-    rt.apply_ts_status_frame(&update, &tag_to_id, rt.gate.generation());
+    rt.apply_ts_status_frame(
+        &update,
+        &tag_to_id,
+        rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
+    );
 
     // 缓存：只留在册端点，可经 tailscale_status_snapshot 读回（非恒空）。
     let snap = rt.mesh.tailscale_status_snapshot(true);
@@ -314,14 +342,24 @@ async fn ts_tunnel_ready_invalidates_unlock_and_refreshes_exit_ip_once() {
     };
 
     // 帧①登录中 → 未就绪，不触发。
-    rt.apply_ts_status_frame(&frame("NeedsLogin"), &tag_to_id, rt.gate.generation());
+    rt.apply_ts_status_frame(
+        &frame("NeedsLogin"),
+        &tag_to_id,
+        rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
+    );
     assert!(
         refreshes.lock().unwrap().is_empty(),
         "隧道未就绪就重探 = 探到让位期的直连出口，把它当成 TS 出口显示"
     );
 
     // 帧②跃迁 Running → 隧道就绪，出口 IP 换掉 ⇒ 两条腿都必须动。
-    rt.apply_ts_status_frame(&frame("Running"), &tag_to_id, rt.gate.generation());
+    rt.apply_ts_status_frame(
+        &frame("Running"),
+        &tag_to_id,
+        rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
+    );
     assert_eq!(
         *refreshes.lock().unwrap(),
         vec![true],
@@ -334,8 +372,18 @@ async fn ts_tunnel_ready_invalidates_unlock_and_refreshes_exit_ip_once() {
     );
 
     // 帧③稳态 Running → 一次都不许再触发（relay 每秒量级推帧）。
-    rt.apply_ts_status_frame(&frame("Running"), &tag_to_id, rt.gate.generation());
-    rt.apply_ts_status_frame(&frame("Running"), &tag_to_id, rt.gate.generation());
+    rt.apply_ts_status_frame(
+        &frame("Running"),
+        &tag_to_id,
+        rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
+    );
+    rt.apply_ts_status_frame(
+        &frame("Running"),
+        &tag_to_id,
+        rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
+    );
     assert_eq!(
         refreshes.lock().unwrap().len(),
         1,
@@ -354,6 +402,7 @@ async fn ts_tunnel_ready_invalidates_unlock_and_refreshes_exit_ip_once() {
         &daemon::TailscaleStatusUpdate { endpoints: vec![] },
         &tag_to_id,
         rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
     );
     assert_eq!(
         refreshes.lock().unwrap().len(),
@@ -365,7 +414,12 @@ async fn ts_tunnel_ready_invalidates_unlock_and_refreshes_exit_ip_once() {
     // 这是**有意**的：中间那一帧意味着 relay 眼里这条隧道确实不在了，回来即「此刻起经 TS 出口走」，
     // 与首帧即 Running 同性质。它不构成轮询——复位需要一次真正的「端点消失」帧，稳态 Running 帧
     // （帧③）一次都不会复位。
-    rt.apply_ts_status_frame(&frame("Running"), &tag_to_id, rt.gate.generation());
+    rt.apply_ts_status_frame(
+        &frame("Running"),
+        &tag_to_id,
+        rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
+    );
     assert_eq!(
         *refreshes.lock().unwrap(),
         vec![true, true],
@@ -1156,7 +1210,12 @@ async fn ts_status_frame_drives_the_exit_block_reconcile() {
         }],
     };
 
-    rt.apply_ts_status_frame(&update, &tag_to_id, rt.gate.generation());
+    rt.apply_ts_status_frame(
+        &update,
+        &tag_to_id,
+        rt.gate.generation(),
+        admit_ts_relay_fixture(&rt, &tag_to_id),
+    );
 
     assert_eq!(
         *marks.lock().unwrap(),

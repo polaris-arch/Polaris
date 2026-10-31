@@ -358,7 +358,7 @@ fn every_protocol_is_filed_under_exactly_one_routing_class() {
     }
 }
 
-/// 上一条门里 `Mesh` 那一档的外部判据：**组网协议必须真有网段来源**。
+/// 上一条门里 `Mesh` 那一档的外部判据：网段必须来自配置或发现，不凭协议名补默认广段。
 ///
 /// 判据取 `endpoint_forced_route_cidrs` 的实际产出而不是读它的源码分支 —— 后者是复刻，会漂移。
 /// 反向也钉：普通出站协议即使填了 `meshRoutes` 也不该产出网段（那个字段只对 endpoint 腿有意义）。
@@ -368,11 +368,11 @@ fn mesh_protocols_actually_have_a_cidr_source() {
         endpoint_forced_route_cidrs, ObservedTailnetAddresses,
     };
 
-    // 本门问的是「声明为组网协议的，拿不拿得出网段」，与运行期观测面无关 —— 给空观测，
-    // 走的就是各协议的配置期来源（WG=allowedIPs / TS=bootstrap 默认两段 / 非组网=空）。
+    // 组网能力不等于冷启动已经知道地址：只认配置 CIDR 或实际发现的 host。
+    // 未配置、未发现的 TS 等待发现，不凭协议名接管官方广段。
     let no_observation = ObservedTailnetAddresses::new();
     use polaris_config_engine::user_config::server_config::{
-        is_mesh_protocol, ServerConfig, WireGuardSettings,
+        is_mesh_protocol, ServerConfig, TailscaleSettings, WireGuardSettings,
     };
 
     // WireGuard 的段来自 allowedIPs。
@@ -385,30 +385,68 @@ fn mesh_protocols_actually_have_a_cidr_source() {
         })),
         ..Default::default()
     };
-    assert!(
-        is_mesh_protocol(Protocol::Wireguard)
-            && !endpoint_forced_route_cidrs(&wg, &no_observation).is_empty(),
-        "WireGuard 声明为组网协议却拿不出网段 —— 判据与实现脱节"
+    assert!(is_mesh_protocol(Protocol::Wireguard));
+    assert_eq!(
+        endpoint_forced_route_cidrs(&wg, &no_observation),
+        vec!["10.0.0.0/24".to_string()]
     );
 
-    // Tailscale 无观测时回落 bootstrap 默认两段，连设置都不用填。
-    // （有观测时语义是「观测段取代默认段 + MagicDNS 两条恒发」，见 `ObservedTailnetAddresses`
-    //   的「# 语义」一节 —— 那条轴由 config-engine 自己的门管，不在本门射程。）
     let ts = ServerConfig {
         id: "ts".into(),
         protocol: Protocol::Tailscale,
         ..Default::default()
     };
-    assert!(
-        is_mesh_protocol(Protocol::Tailscale)
-            && !endpoint_forced_route_cidrs(&ts, &no_observation).is_empty(),
-        "Tailscale 声明为组网协议却拿不出网段"
+    assert!(is_mesh_protocol(Protocol::Tailscale));
+    assert!(endpoint_forced_route_cidrs(&ts, &no_observation).is_empty());
+
+    // 显式声明可在冷启动使用；全隧道意图仍不能混进具体段。
+    let configured = ServerConfig {
+        tailscale_settings: Some(Box::new(TailscaleSettings {
+            routes: vec!["192.0.2.0/24".into(), "0.0.0.0/0".into(), "::/0".into()],
+            ..Default::default()
+        })),
+        ..ts.clone()
+    };
+    assert_eq!(
+        endpoint_forced_route_cidrs(&configured, &no_observation),
+        vec!["192.0.2.0/24".to_string()]
+    );
+
+    // 发现只给实际 host 和既有 MagicDNS 窄地址，不扩成整个 CGNAT/ULA 网段。
+    let observed = ObservedTailnetAddresses::from([(
+        ts.id.clone(),
+        vec!["100.86.1.2".into(), "fd7a:115c:a1e0::2".into()],
+    )]);
+    let mut actual = endpoint_forced_route_cidrs(&ts, &observed);
+    actual.sort();
+    let mut expected = vec![
+        "100.86.1.2/32".to_string(),
+        "fd7a:115c:a1e0::2/128".to_string(),
+        "100.100.100.100/32".to_string(),
+        "fd7a:115c:a1e0::53/128".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(actual, expected);
+    let mut configured_and_observed = endpoint_forced_route_cidrs(&configured, &observed);
+    configured_and_observed.sort();
+    expected.push("192.0.2.0/24".to_string());
+    expected.sort();
+    assert_eq!(configured_and_observed, expected);
+    let invalid = ObservedTailnetAddresses::from([(
+        ts.id.clone(),
+        vec!["not-an-ip".into(), "999.1.2.3".into()],
+    )]);
+    assert!(endpoint_forced_route_cidrs(&ts, &invalid).is_empty());
+    assert_eq!(
+        endpoint_forced_route_cidrs(&configured, &invalid),
+        vec!["192.0.2.0/24".to_string()]
     );
 
     // 反向：普通出站协议没有这套概念。
     let vless = ServerConfig {
         id: "v".into(),
         protocol: Protocol::Vless,
+        mesh_routes: vec!["192.0.2.0/24".into()],
         ..Default::default()
     };
     assert!(endpoint_forced_route_cidrs(&vless, &no_observation).is_empty());

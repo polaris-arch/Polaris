@@ -6,6 +6,9 @@
 
 use super::code;
 use super::core_binary::resolve_dashboard_serve_dir;
+use crate::runtime::core_execution::TokioSpawner;
+#[cfg(not(test))]
+use polaris_core_supervisor::SingBoxSpawner;
 // `resolve_core_binary` 只被 `core_binary_for_start` 的 `cfg(not(test))` 腿消费（单测态那腿刻意
 // deny-by-default，不回落解析器）⇒ 不 gate 即测试编译单元的 `unused_imports`。
 #[cfg(not(test))]
@@ -79,9 +82,8 @@ use polaris_core_supervisor::port_bookkeeping::{
 use polaris_core_supervisor::{
     core_ready_budget_ms, core_startup_estimate_ms, decide_peel, run_config_check,
     wait_for_core_ready, CoreReadyDeps, CoreReadyOutcome, KernelRejection, PeelStep, PortAllocator,
-    PortExclusions, RejectedArray, SingBoxSpawner, SpawnRequest, StdioPolicy, TokioSpawner,
-    WaitForCoreReadyOptions, CORE_STARTUP_PER_NAIVE_MS, INVALID_REASON_KERNEL_REJECTED,
-    PEEL_TIME_BUDGET,
+    PortExclusions, RejectedArray, StdioPolicy, WaitForCoreReadyOptions, CORE_STARTUP_PER_NAIVE_MS,
+    INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
 };
 use polaris_helper_proto::Platform;
 use polaris_platform_events::NetworkChangeImpact;
@@ -780,7 +782,7 @@ impl ProxyRuntime {
         generated: &SingBoxConfig,
         generation: u64,
         deadline: std::time::Instant,
-    ) -> Result<super::runtime_config::RuntimePairing, String> {
+    ) -> Result<(super::runtime_config::RuntimePairing, Arc<SingBoxApiClient>), String> {
         use super::runtime_config::{observe_runtime_pairing, RuntimePairingError};
         let failure = || "CORE_BUNDLE_MISMATCH: 配套内核运行协议或实例未确认".to_owned();
         let service = generated
@@ -794,7 +796,7 @@ impl ProxyRuntime {
             .filter(|secret| !secret.is_empty())
             .ok_or_else(failure)?;
         let admission = async {
-            let client = SingBoxApiClient::connect(
+            let client = SingBoxApiClient::connect_captured(
                 ManagementEndpoint::new("127.0.0.1", service.listen_port),
                 secret.to_owned(),
             )
@@ -809,7 +811,7 @@ impl ProxyRuntime {
                     .await
                     .map_err(|_| failure())?;
                 match observe_runtime_pairing(&capabilities) {
-                    Ok(pairing) => return Ok(pairing),
+                    Ok(pairing) => return Ok((pairing, Arc::new(client))),
                     Err(RuntimePairingError::Starting) => {
                         sleep_unless_superseded_on(
                             &self.gate,
@@ -1156,8 +1158,10 @@ impl ProxyRuntime {
         &self,
         producer: Option<&Arc<super::mesh_apply::owner_proof::ProducerCell>>,
         birth_generation: u64,
-        factory_call: impl FnOnce()
-            -> Result<tokio::process::Child, polaris_core_supervisor::SpawnError>,
+        factory_call: impl FnOnce() -> Result<
+            crate::runtime::core_child::Child,
+            polaris_core_supervisor::SpawnError,
+        >,
         main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
         before_factory: impl FnOnce(),
     ) -> Result<Option<(u32, super::process_supervision::RunIdentity)>, StartError> {
@@ -1268,6 +1272,13 @@ impl ProxyRuntime {
         if self.gate.generation() != my_gen {
             log::info!("起核入口即被接管（世代 {my_gen}）→ 让位");
             return Ok(self.status());
+        }
+        {
+            let _publication = self.gate.lock_generation_publication();
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
+            }
+            self.revoke_tailnet_context();
         }
         // Snapshot under normal_start before any desktop/check/Child/live lock.
         // This is the recorded final admission, not the watch's requested generation.
@@ -1405,7 +1416,9 @@ impl ProxyRuntime {
         //     观测集（盘上文件即持久层）+ 配置期已知段；首次运行无观测 ⇒ 官方默认两段，
         //     **不写空文件**（空 rule-set 会让该节点整段 tailnet 不可路由）。见 `tailnet_rules`。
         //     这一趟同时把盘上的观测面读回内存，供下面 `generate_deps` 注入 TUN 排除面。
-        self.write_tailnet_rule_files(&user_config).await;
+        self.write_tailnet_rule_files_for_generation(&user_config, &config, my_gen)
+            .await
+            .map_err(StartError::from)?;
 
         // ── 内置 geo 规则集播种（调用点 2/2：**每次起核前**；对齐 上游 `ProxyManager.ts:6375`）──
         // 与上面的 writeCustomRuleFiles 同理，**必须在 generate 之前**：route builder 按
@@ -1569,9 +1582,7 @@ impl ProxyRuntime {
             let startup_cli_proof = if let Ok(path) = &binary_res {
                 // The gate below reuses this observation. Keep the same proof
                 // across every await; a later menu refresh cannot substitute it.
-                crate::runtime::tls_fingerprints::probe_cli_observation(path)
-                    .await
-                    .ok()
+                self.startup_cli_observation(path).await.ok()
             } else {
                 None
             };
@@ -2037,8 +2048,9 @@ impl ProxyRuntime {
                 let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
                 let sink_handoff = Arc::clone(&handoff);
                 let sink_fatal = Arc::clone(&fatal_slot);
-                let mut req = SpawnRequest::new(
+                let mut req = crate::runtime::core_execution::run_request(
                     &binary,
+                    crate::runtime::core_identity::ExecPurpose::RunMain,
                     &config_path,
                     StdioPolicy::drain(move |stdout, stderr| {
                         pipe_to_log(
@@ -2054,7 +2066,8 @@ impl ProxyRuntime {
                             Some(sink_handoff),
                         );
                     }),
-                );
+                )
+                .map_err(|e| e.to_string())?;
                 // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
                 req.extra_args = vec!["--disable-color".to_string()];
                 // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
@@ -2082,7 +2095,9 @@ impl ProxyRuntime {
                                 ),
                             });
                         }
-                        TokioSpawner::new().spawn(req).map(|spawned| spawned.child)
+                        TokioSpawner::new()
+                            .spawn(req)
+                            .map(|spawned| spawned.child.into())
                     },
                     main_claim_token.clone(),
                     || main_reservation.arm_external_start(),
@@ -2352,7 +2367,7 @@ impl ProxyRuntime {
         // TCP readiness is not protocol admission. Query the authenticated API
         // of this exact start before publishing any running/baseline state. This
         // consumes the remaining existing ready budget, never a fresh retry budget.
-        let runtime_pairing = match self
+        let (runtime_pairing, runtime_api_control) = match self
             .confirm_startup_runtime_pairing(&singbox_config, my_gen, ready_deadline)
             .await
         {
@@ -2397,14 +2412,7 @@ impl ProxyRuntime {
         {
             Ok(interface) => interface,
             Err(msg) => {
-                // grace（数秒）内可能被接管：先复查世代，被接管则静默让位（不 kill、不 set_error，同 Dead/Timeout 腿）。
-                if self.gate.generation() != my_gen {
-                    log::info!("TUN 出口 post-flight 期被接管（世代 {my_gen}）→ 让位，不闸");
-                    return Ok(self.status());
-                }
-                self.kill_core_and_release_main(ts_gate).await?;
-                self.set_error(&msg, code::TUN_ROUTE_NOT_CAPTURED);
-                return Err(StartError::coded(msg, code::TUN_ROUTE_NOT_CAPTURED));
+                return self.reject_tun_route_start(my_gen, ts_gate, msg).await;
             }
         };
         let tun_route_ms = t_tun_route.elapsed().as_millis();
@@ -2460,21 +2468,7 @@ impl ProxyRuntime {
         let ready_tls = if !via_helper {
             self.direct_tls_snapshot(my_gen)
         } else {
-            #[cfg(target_os = "linux")]
-            {
-                match self.tls_ready_binary_for_pid(pid, true) {
-                    Some(actual) => self.tls_fingerprint_capabilities_for(Some(&actual)).await,
-                    None => crate::runtime::tls_fingerprints::Snapshot::unavailable(
-                        "Loaded core image is unavailable",
-                    ),
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                crate::runtime::tls_fingerprints::Snapshot::unavailable(
-                    "Helper loaded-image byte proof is unavailable",
-                )
-            }
+            self.tls_fingerprint_capabilities_for(Some(&binary)).await
         };
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let ready_tls = self.tls_fingerprint_capabilities_for(None).await;
@@ -2499,27 +2493,36 @@ impl ProxyRuntime {
                 &deps,
             ));
         }
-        self.capture_runtime_config_baseline(
-            my_gen,
-            deps.clone(),
-            singbox_config.clone(),
-            user_config.clone(),
-            runtime_pairing,
-        );
-        self.commit_coex_current_config(config.clone());
-        // The final endpoint set was claimed before native/libbox startup. Keep that claim
-        // continuously through readiness; releasing and re-reserving here opens a takeover gap.
-        if let Ok(mut snap) = self.startup_snapshot.write() {
-            *snap = Some(config.clone());
-        }
-        // 核刚按磁盘配置生成并起来 ⇒ 一切「保存但没进核」的欠账在这一刻结清。
-        // 清点必须与 `startup_snapshot` 同刻：这两者一起定义了「运行核吃进去的是什么」。
-        self.restart_deferred.store(false, Ordering::SeqCst);
-        if let Ok(mut g) = self.status.write() {
-            *g = new_status.clone();
-        }
-        if let Some(ready_at_ms) = new_status.start_time {
-            self.publish_mesh_route_run(mesh_route_prepared, ready_at_ms);
+        {
+            let tailnet_bindings = self.tailnet_bindings(&config, &singbox_config);
+            let _publication = self.gate.lock_generation_publication();
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
+            }
+            self.capture_runtime_config_baseline(
+                my_gen,
+                deps.clone(),
+                singbox_config.clone(),
+                user_config.clone(),
+                runtime_pairing,
+            );
+            self.bind_runtime_api_control(my_gen, runtime_api_control);
+            self.commit_coex_current_config(config.clone());
+            // The final endpoint set was claimed before native/libbox startup. Keep that claim
+            // continuously through readiness; releasing and re-reserving here opens a takeover gap.
+            if let Ok(mut snap) = self.startup_snapshot.write() {
+                *snap = Some(config.clone());
+            }
+            // 核刚按磁盘配置生成并起来 ⇒ 一切「保存但没进核」的欠账在这一刻结清。
+            // 清点必须与 `startup_snapshot` 同刻：这两者一起定义了「运行核吃进去的是什么」。
+            self.restart_deferred.store(false, Ordering::SeqCst);
+            if let Ok(mut g) = self.status.write() {
+                *g = new_status.clone();
+            }
+            self.activate_tailnet_context(my_gen, tailnet_bindings);
+            if let Some(ready_at_ms) = new_status.start_time {
+                self.publish_mesh_route_run(mesh_route_prepared, ready_at_ms);
+            }
         }
         // A1：systemProxy 模式把 OS 系统代理指向本地 mixed 入站（127.0.0.1:mixedPort），否则流量不经核
         // = 表现「选直连也没启动」。放在**核已就绪之后**：核未就绪就设代理会把流量导向尚未服务的端口。
@@ -2600,7 +2603,11 @@ impl ProxyRuntime {
             self.spawn_tailscale_status_relay(
                 my_gen,
                 api_port,
-                Arc::clone(endpoint_tag_to_id.as_ref().expect("endpoint map exists")),
+                Arc::new(
+                    self.tailnet_context()
+                        .map(|context| context.tag_to_id())
+                        .unwrap_or_default(),
+                ),
             );
         }
         // rc.2 原生端点状态：只为实际存在的协议挂对应流。tag 逆映射与 Tailscale 共用同一份运行配置
@@ -2825,6 +2832,23 @@ impl ProxyRuntime {
         Ok(new_status)
     }
 
+    /// The post-Ready route-failure transaction. Local helper retirement must
+    /// remain retryable by ordinary Stop/desktop exit after this path returns.
+    pub(super) async fn reject_tun_route_start(
+        self: &Arc<Self>,
+        my_gen: u64,
+        ts_gate: &tokio::sync::MutexGuard<'_, ()>,
+        message: String,
+    ) -> Result<ProxyStatus, StartError> {
+        if self.gate.generation() != my_gen {
+            log::info!("TUN 出口 post-flight 期被接管（世代 {my_gen}）→ 让位，不闸");
+            return Ok(self.status());
+        }
+        self.kill_core_and_release_main(ts_gate).await?;
+        self.set_error(&message, code::TUN_ROUTE_NOT_CAPTURED);
+        Err(StartError::coded(message, code::TUN_ROUTE_NOT_CAPTURED))
+    }
+
     /// **C6-5**：经提权 helper 起 root/SYSTEM 受管核（TUN 路由）。移植自 上游 `startViaHelper`。
     ///
     /// 返回 `Ok(Some(pid))` = 已起（daemon 报告受管核 pid）；`Ok(None)` = 起核前被接管 → 让位；
@@ -2914,8 +2938,10 @@ impl ProxyRuntime {
                     .into());
             }
             polaris_core_supervisor::with_check_admission(|| {
-                let attempt =
-                    self.register_helper_start_backend_with_main(main_reservation.claim_token())?;
+                let attempt = self.register_helper_start_backend_in_generation(
+                    main_reservation.claim_token(),
+                    my_gen,
+                )?;
                 main_reservation.arm_external_start();
                 Ok::<_, String>(attempt)
             })
@@ -2940,15 +2966,28 @@ impl ProxyRuntime {
         // HelperClient::send 是同步阻塞 IPC → 挪出 async worker 线程。
         // **不传 bin**：helper 单方面决定跑哪个二进制（见 `HelperRuntime::start_core` 文档），
         // 传了也只会被丢掉——正是本缺陷的成因。
-        let started = tokio::task::spawn_blocking(move || {
+        let start_worker = tokio::task::spawn_blocking(move || {
             let _helper_call_lease = helper_call_lease;
             let mut completion = completion;
             let result = helper.start_core(&config_path, &log_path, fwd, ppid);
             completion.publish(&result)?;
             result
-        })
-        .await
-        .map_err(|e| format!("helper 起核任务 join 失败：{e}"))?;
+        });
+        // Retain observation of this original task even when its async waiter is
+        // cancelled. Merely publishing a PID is not proof that its producer returned.
+        if !self
+            .child
+            .lock()
+            .map_err(|_| "child lock poisoned".to_owned())?
+            .bind_helper_start_worker(&attempt, start_worker.abort_handle())
+        {
+            return Err("helper Start worker binding changed; custody retained"
+                .to_owned()
+                .into());
+        }
+        let started = start_worker
+            .await
+            .map_err(|e| format!("helper 起核任务 join 失败：{e}"))?;
         let target = match started {
             Ok(HelperStartResult::Started(pid)) => HelperStopTarget::Legacy(pid),
             Ok(HelperStartResult::BirthStarted(target)) => HelperStopTarget::Birth(target),
@@ -3639,10 +3678,10 @@ impl ProxyRuntime {
                     .await;
             }
         }
-        let Some((port, secret)) = self.management_endpoint() else {
+        if self.management_endpoint().is_none() {
             return false;
-        };
-        let api = Self::management_api_at(port, secret).await;
+        }
+        let api = self.management_api().await;
         self.publish_rule_content(update, generation, intent, &api)
             .await
     }
@@ -3971,18 +4010,10 @@ impl ProxyRuntime {
             netenv_dhcp_suppressed: self.netenv_dhcp_suppressed.load(Ordering::SeqCst),
             // canary 探针口由起核腿按轮分配后覆写（`resolve_network_canary_port`）；本装配体不分配端口。
             network_canary_port: None,
-            // A-0b：运行期观测到的 tailnet 地址（`serverId` → 裸地址）。真值源是
-            // `ProxyRuntime::observed_tailnet`，由两条腿写：STATUS 帧（`sync_tailnet_rule_files`）
-            // 与**本次起核前**刚跑过的 `write_tailnet_rule_files`（把盘上文件的主机位条目读回，
-            // 那是跨进程重启唯一的持久层）。
-            //
-            // **这个字段是 TUN 排除面唯一的入口**：`builder::inbounds` 的 `engaged_mesh` 只吃这个
-            // map、不看 tailnet 文件（文件只服务块 0c 的规则发射）。少了这一行，自建 tailnet 的
-            // `32.0.0.x` 仍会被 TUN 的「连入来源排除」减法当成普通用户声明段处理 —— 那正是
-            // 2026-09-11 那次事故里用户的原始症状，只修规则发射治不了。
-            //
-            // 空 map 仍是合法值（没有 TS 节点 / 首次运行且核还没报过帧）⇒ 产出与 A-0a 之前逐字节相同。
-            observed_tailnet_addresses: self.observed_tailnet_snapshot(),
+            // Both startup and saved-D previews project planning hosts against
+            // this target authority/known logical identity. Legacy disk hosts
+            // remain weak LastKnown; this input is not membership or a TUN ACK.
+            observed_tailnet_addresses: self.observed_tailnet_for_config(config),
             log: config_log,
             on_degraded: config_on_degraded,
         }
@@ -4102,7 +4133,7 @@ impl ProxyRuntime {
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let cli_observation = match binary {
-            Some(path) => crate::runtime::tls_fingerprints::probe_cli_observation(path).await,
+            Some(path) => self.startup_cli_observation(path).await,
             None => Err(Box::new(
                 crate::runtime::tls_fingerprints::Snapshot::unavailable("No selected core binary"),
             )),
@@ -4181,9 +4212,7 @@ impl ProxyRuntime {
             }
             checks_run += 1;
             let verdict = match binary {
-                Some(bin) => run_config_check(bin, config_path)
-                    .await
-                    .map_err(|error| error.to_string())?,
+                Some(bin) => self.startup_config_check(bin, config_path).await?,
                 // 只有 Android 走得到这里（上面的 failOpen 早退挡住了其余平台）。传的是**内存里
                 // 那一份字符串**，与刚写下去的盘上那份是同一个 `json` 变量 —— 两者不可能漂。
                 None => super::android_bridge::check_config(&json).await,
@@ -4281,6 +4310,48 @@ impl ProxyRuntime {
                 }
             }
         }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    async fn startup_cli_observation(
+        &self,
+        binary: &Path,
+    ) -> Result<
+        crate::runtime::tls_fingerprints::CliObservation,
+        Box<crate::runtime::tls_fingerprints::Snapshot>,
+    > {
+        #[cfg(test)]
+        if self.has_business_kernel_check_fixture(binary) {
+            // Data-only observations cannot issue PreparedExecution or enter
+            // the real native query factory.
+            return Ok(crate::runtime::tls_fingerprints::cache_fixture_observation(
+                binary,
+            ));
+        }
+        crate::runtime::tls_fingerprints::probe_cli_observation(binary).await
+    }
+
+    pub(super) async fn startup_config_check(
+        &self,
+        binary: &Path,
+        config: &Path,
+    ) -> Result<polaris_core_supervisor::ConfigCheckVerdict, String> {
+        #[cfg(test)]
+        if let Some(verdict) = self.business_kernel_check_result(binary, config) {
+            return verdict;
+        }
+        // The default in every build still requires the sole real admission
+        // factory. A mock verdict is neither a Prepared nor a native birth.
+        run_config_check(
+            crate::runtime::core_identity::prepare(
+                binary,
+                crate::runtime::core_identity::ExecPurpose::CheckConfig,
+            )
+            .map_err(|error| error.to_string())?,
+            config,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 
     async fn settle_kernel_validation_admission(

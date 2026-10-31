@@ -453,3 +453,100 @@ async fn dns_failure_denies_exit_ready_and_preserves_full_removal_material_until
     assert!(!removal.config.exists());
     assert!(!dns.marker.exists());
 }
+
+/// Ordinary exit closes this App's owners, not all clients of the shared helper.
+/// Main uses real helper terminal replay; unrelated owner drains are fixtures.
+#[cfg(target_os = "linux")]
+struct HelperTerminalExitPorts {
+    proxy: Arc<crate::runtime::proxy::ProxyRuntime>,
+    other: FakePorts,
+}
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl ExitPorts for HelperTerminalExitPorts {
+    fn identity(&self) -> RuntimeIdentity {
+        [Arc::as_ptr(&self.proxy) as usize, 0]
+    }
+    fn fence_main(&self) -> Result<(), String> {
+        self.other.fence(0, "main-fence")?;
+        self.proxy.begin_shutdown()
+    }
+    fn fence_login(&self) -> Result<(), String> {
+        self.other.fence(1, "login-fence")
+    }
+    fn fence_temp(&self) -> Result<(), String> {
+        self.other.fence(2, "temp-fence")
+    }
+    fn fence_check(&self) -> Result<(), String> {
+        self.other.fence(3, "check-fence")
+    }
+    async fn drain_main(&self) -> Result<(), String> {
+        self.proxy.shutdown_for_exit().await?;
+        self.other.drain(0, "main-drain").await
+    }
+    async fn drain_login(&self) -> Result<(), String> {
+        self.other.drain(1, "login-drain").await
+    }
+    async fn drain_temp(&self) -> Result<(), String> {
+        self.other.drain(2, "temp-drain").await
+    }
+    async fn drain_check(&self) -> Result<(), String> {
+        self.other.drain(3, "check-drain").await
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn helper_local_terminal_allows_normal_quit_only_after_all_app_drains() {
+    use crate::runtime::proxy::tests::helper_terminal_exit_fixture;
+    for rollback in [false, true] {
+        let (proxy, _dir, frames) = helper_terminal_exit_fixture(rollback).await;
+        let ports = HelperTerminalExitPorts {
+            proxy,
+            other: FakePorts::new(),
+        };
+        let state = ExitCleanupState::default();
+        for owner in 1..4 {
+            ports.other.results.lock().unwrap()[owner] =
+                Err("original owner remains pending".into());
+            assert!(state.prepare(&ports, Duration::from_secs(5)).await.is_err());
+            assert!(matches!(*state.phase.lock().await, ExitPhase::Pending));
+            assert_eq!(
+                frames.lock().unwrap().len(),
+                1,
+                "terminal replay must not send a second IPC"
+            );
+            ports.other.results.lock().unwrap()[owner] = Ok(());
+        }
+        let ready = state.prepare(&ports, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(frames.lock().unwrap().len(), 1);
+        let committed = AtomicBool::new(false);
+        ready
+            .commit(ports.identity(), || committed.store(true, Ordering::SeqCst))
+            .unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn helper_terminal_cannot_bypass_confirmed_dns_restoration() {
+    use crate::runtime::proxy::tests::{
+        helper_terminal_exit_fixture, install_dns_recovery_fixture,
+    };
+    let (proxy, _dir, frames) = helper_terminal_exit_fixture(true).await;
+    let dns = install_dns_recovery_fixture(&proxy);
+    let ports = HelperTerminalExitPorts {
+        proxy,
+        other: FakePorts::new(),
+    };
+    let state = ExitCleanupState::default();
+    assert!(state.prepare(&ports, Duration::from_secs(5)).await.is_err());
+    assert!(matches!(*state.phase.lock().await, ExitPhase::Pending));
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+    assert_eq!(frames.lock().unwrap().len(), 1);
+    dns.fail_restore.store(false, Ordering::SeqCst);
+    assert!(state.prepare(&ports, Duration::from_secs(5)).await.is_ok());
+    assert!(!dns.marker.exists());
+    assert_eq!(frames.lock().unwrap().len(), 1);
+}

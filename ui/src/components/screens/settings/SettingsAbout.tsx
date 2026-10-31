@@ -26,6 +26,7 @@ import { Phead, CardSub, Button } from './Primitives';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { invoke } from '@/ipc/ipc-client';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
+import { uninstallPresentation } from './uninstall-presentation';
 
 /** 本页唯一的原地二次确认项（原型 :5185 `uninstallApp`）。 */
 const UNINSTALL_KEY = 'uninstall-app';
@@ -56,12 +57,6 @@ const KIND_META: Record<UninstallOutcomeKind, { key: string; tone: string }> = {
   failed: { key: 'settings.about.uninstallKindFailed', tone: 'hsl(var(--err))' },
   notAttempted: { key: 'settings.about.uninstallKindNotAttempted', tone: 'hsl(var(--warn))' },
 };
-
-const VERDICT_META = {
-  complete: { key: 'settings.about.uninstallVerdictComplete', tone: 'hsl(var(--ok))' },
-  incomplete: { key: 'settings.about.uninstallVerdictIncomplete', tone: 'hsl(var(--warn))' },
-  failed: { key: 'settings.about.uninstallVerdictFailed', tone: 'hsl(var(--err))' },
-} as const;
 
 /** 仓库根的 LICENSE（MIT，Polaris 本体）与 NOTICE（第三方组件及其许可）。 */
 const LICENSE_URL = 'https://github.com/polaris-arch/Polaris/blob/main/LICENSE';
@@ -128,8 +123,9 @@ export default function SettingsAbout() {
         try {
           const r = await appApi.uninstallAll();
           setReport(r);
-          const title = t(VERDICT_META[r.verdict].key);
-          if (r.verdict === 'complete') {
+          const presentation = uninstallPresentation(r);
+          const title = t(presentation.key);
+          if (presentation.mayExitAsComplete) {
             toast.success(title);
             // 卸载干净之后**主动退出**（陈先生 2026-07-29 真机报：卸完窗口还在，要手动退，不合理）。
             // 只在 `complete` 退：其余 verdict 的逐项报告正是留给用户看「哪几项没删掉」的，
@@ -258,8 +254,8 @@ export default function SettingsAbout() {
 
         {report && (
           <div style={{ marginTop: 14 }} data-testid="uninstall-report">
-            <b style={{ fontSize: 13, color: VERDICT_META[report.verdict].tone }}>
-              {t(VERDICT_META[report.verdict].key)}
+            <b style={{ fontSize: 13, color: uninstallPresentation(report).tone }}>
+              {t(uninstallPresentation(report).key)}
             </b>
             <ul style={{ margin: '8px 0 0', padding: 0, listStyle: 'none' }}>
               {/* 按后端返回的数组序渲染 —— 那就是因果执行序，前端不重排、不筛掉任何一项。

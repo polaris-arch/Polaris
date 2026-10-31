@@ -684,7 +684,7 @@ async fn native_child(h: &Harness, name: &str) -> PcCustodiedChild {
     booked
         .dispatch_native(
             &TokioLoginCoreSpawner,
-            SpawnRequest::new(native_fixture(name), path, StdioPolicy::Discard),
+            SpawnRequest::unadmitted_intent(native_fixture(name), path, StdioPolicy::Discard),
             prepared,
         )
         .await
@@ -1662,7 +1662,7 @@ async fn cancelled_bound_native_factory_stays_quarantined_until_actual_return_an
     let mut child = booked
         .dispatch_native(
             &TokioLoginCoreSpawner,
-            SpawnRequest::new(
+            SpawnRequest::unadmitted_intent(
                 native_fixture("exit-success.sh"),
                 path,
                 StdioPolicy::Discard,

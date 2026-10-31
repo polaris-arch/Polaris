@@ -652,6 +652,22 @@ fn shutdown_waits_for_start_publication_and_then_fences_replacement() {
     h.reap_child_on_exit().unwrap();
     assert!(ops.native_custody_empty());
     assert!(h.child_mu.lock().unwrap().closing);
+    assert!(native_wire(&h, Request::CancelHelperUpgrade, true)
+        .line
+        .starts_with("ERR "));
+    let request = pinned_start(
+        &h,
+        StartParams {
+            cfg: r"C:\Users\polaris\config\c.json".into(),
+            log: String::new(),
+            fwd: true,
+            parent_pid: None,
+        },
+    );
+    assert!(matches!(
+        wire_start_result(native_wire(&h, request, false)),
+        NativeBirthStart::NotAdmittedUnknown { .. }
+    ));
     assert_eq!(ops.snapshot().start_calls, 1);
 }
 
@@ -876,11 +892,99 @@ fn windows_native_config_uses_verified_object_without_path_reopen() {
         .split("fn spawn_tracked(")
         .nth(1)
         .unwrap()
-        .split("fn ensure_job")
+        .split("fn take_managed_handle")
         .next()
         .unwrap();
-    assert!(spawn.contains("cmd.args([\"run\", \"-c\", \"stdin\"])"));
-    assert!(spawn.contains("Stdio::from(file)"));
-    assert!(spawn.contains("current_dir"));
+    assert!(spawn.contains("execution.spawn_windows_main(file, Path::new(&cwd))?"));
+    assert!(spawn.contains("_execution_custody: execution_custody"));
+    assert!(!spawn.contains("cmd.spawn()"));
     assert!(!spawn.contains("cmd.args([\"run\", \"-c\", cfg])"));
+}
+
+fn native_wire(
+    h: &WinHelper<StaticTokenStore, MockProcOps, MockNetTableOps>,
+    request: Request,
+    administrator: bool,
+) -> FrameReply {
+    let mut peer = h.test_context.as_ref().unwrap().peer.clone();
+    peer.administrator = administrator;
+    let raw = String::from_utf8(polaris_helper_proto::codec::encode(
+        Platform::Win,
+        "real-token",
+        &request,
+    ))
+    .unwrap();
+    h.handle_frame_from_peer(&raw, Some(&peer))
+}
+fn wire_start_result(reply: FrameReply) -> NativeBirthStart {
+    // FrameReply includes the transport newline; match HelperClient::request.
+    match Response::parse(reply.line.trim()) {
+        Response::Ok(ResponseKind::PinnedStart {
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Native(start),
+            ..
+        }) => start,
+        other => panic!("unexpected wire start: {other:?}"),
+    }
+}
+#[test]
+fn decoded_cancel_after_shutdown_empty_or_drained_never_reopens_native_start() {
+    for occupied in [false, true] {
+        let ops = MockProcOps::new();
+        let h = make_helper(ops.clone(), MockNetTableOps::new());
+        let old = occupied.then(|| start(&h, true));
+        h.begin_shutdown().unwrap();
+        ops.set_native_stop(NativeChildPoll::Exited);
+        h.reap_child_on_exit().unwrap();
+        if let Some(target) = old {
+            assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });
+        }
+        assert!(native_wire(&h, Request::CancelHelperUpgrade, true)
+            .line
+            .starts_with("ERR "));
+        let request = pinned_start(
+            &h,
+            StartParams {
+                cfg: r"C:\Users\polaris\config\c.json".into(),
+                log: String::new(),
+                fwd: true,
+                parent_pid: None,
+            },
+        );
+        assert!(matches!(
+            wire_start_result(native_wire(&h, request, false)),
+            NativeBirthStart::NotAdmittedUnknown { .. }
+        ));
+        assert_eq!(ops.snapshot().start_calls, usize::from(occupied));
+        assert!(ops.native_custody_empty());
+        assert!(h.child_mu.lock().unwrap().shutting_down);
+    }
+}
+#[test]
+fn decoded_prepare_cancel_release_only_the_upgrade_admission() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    assert!(!native_wire(&h, Request::PrepareHelperUpgrade, true)
+        .line
+        .starts_with("ERR "));
+    let request = pinned_start(
+        &h,
+        StartParams {
+            cfg: r"C:\Users\polaris\config\c.json".into(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
+    );
+    assert!(matches!(
+        wire_start_result(native_wire(&h, request.clone(), false)),
+        NativeBirthStart::NotAdmittedUnknown { .. }
+    ));
+    assert!(!native_wire(&h, Request::CancelHelperUpgrade, true)
+        .line
+        .starts_with("ERR "));
+    assert!(matches!(
+        wire_start_result(native_wire(&h, request, false)),
+        NativeBirthStart::Started { .. }
+    ));
+    assert_eq!(ops.snapshot().start_calls, 1);
 }

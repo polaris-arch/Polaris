@@ -36,95 +36,25 @@ pub const TAILNET_CGNAT: &str = "100.64.0.0/10";
 /// Tailscale v6 tailnet 段（ULA 前缀）。上游 `TAILNET_ULA_V6`。
 pub const TAILNET_ULA_V6: &str = "fd7a:115c:a1e0::/48";
 
-/// Tailscale MagicDNS 解析器地址（v4，业界俗称 quad100），主机位 CIDR。
-///
-/// # ⚠️ 它与上面那两条常量**处置不同**，改之前先读完这一段
-///
-/// 上面的 [`TAILNET_CGNAT`] / [`TAILNET_ULA_V6`] 会被运行期观测**取代**（见
-/// [`ObservedTailnetAddresses`] 的「# 语义」一节），本常量与 [`TAILNET_MAGICDNS_V6`] **不会**。
-/// 分界不是「哪条更重要」，是**这两类东西的性质不同**：
-///
-/// - `100.64.0.0/10` / `fd7a:115c:a1e0::/48` 是**控制面配置**：headscale 的 `prefixes.v4` 可自定义，
-///   2026-09-11 实测样本就发成了 `32.0.0.0/24`。观测值是同一个东西的更准确版本 ⇒ 该取代。
-/// - `100.100.100.100` / `fd7a:115c:a1e0::53` 是 MagicDNS 的**服务地址**，任何 tailnet 都是这两个，
-///   不随控制面变。而且它**不是 peer** ⇒ 永远不会出现在 netmap 里 ⇒ 观测面**永远抓不到它**。
-///   于是「用观测取代默认段」这条规则一旦套到它头上，等价于把它删掉。
-///
-/// # 为什么非发不可（不是"本仓用不着"）
-///
-/// Polaris 自己的 tailnet 按名解析走 `builder::dns` 注入的 `type:"tailscale"` DNS server，
-/// 由 endpoint 内部 netstack 解析、**不经** `route.rules` —— 这条只覆盖 Polaris 自己发起的解析。
-/// 漏掉的是**应用或用户直接寻址 quad100**：TUN 模式下那个包进 TUN → 查 `route.rules` → 没有规则
-/// 把它送去 TS endpoint → 落 `final`。现场取证脚本里的
-/// `dig +time=3 +tries=1 @100.100.100.100 <peer>`（用途是绕过系统解析器直接问 MagicDNS，
-/// 通而 `dscacheutil` 不通 ⇒ 判定是 DNS 接管问题）走的正是这条路径 —— 而它恰恰是用来诊断 Polaris 的。
-///
-/// # 多 tailnet 下的二义性：接受，不是回归
-///
-/// 两个 tailnet 并存时这个地址只能归先声明者 —— 那是**固有的**（一个地址只能有一个出口），
-/// 并集时代也一样。不因此就把单节点用户（绝大多数情形）的覆盖一并砍掉。
-///
-/// # 无观测那一格为什么不重复发
-///
-/// bootstrap 腿发的 [`TAILNET_CGNAT`] / [`TAILNET_ULA_V6`] **本就包含**这两个地址，再发一遍只会让
-/// 降级腿的产出不再与观测面出现之前逐字节相同。这条包含关系是**被门钉住的事实、不是此处的假设**：
-/// `tests/tailnet_observed_address_force_route_gate.rs` 的
-/// `magicdns_addresses_are_contained_by_the_default_segments` 用 `cidr_contains` 真算一遍 ——
-/// 哪天有人改窄了默认段，红的是那道门，不是用户的 MagicDNS。
+/// Tailscale MagicDNS 服务地址（v4，quad100），不是可由 netmap 发现的 peer。
+/// 仅在该节点有合法 host 规划输入时保留这两个既有服务地址；冷态不为它们猜测官方大段。
+/// 多 tailnet 的共享服务地址仍按既有发射顺序处理，不代表消除了地址冲突。
 pub const TAILNET_MAGICDNS_V4: &str = "100.100.100.100/32";
 
 /// Tailscale MagicDNS 解析器地址（v6），主机位 CIDR。处置理由见 [`TAILNET_MAGICDNS_V4`]。
 pub const TAILNET_MAGICDNS_V6: &str = "fd7a:115c:a1e0::53/128";
 
-/// serverId → **运行期观测到**的该节点 tailnet 地址（self + 全部 peer 的 v4/v6，裸地址不带掩码）。
+/// serverId → 调用方提供的 tailnet 裸 host 地址（self 与全部 peer，含已发现的离线 peer）。
 ///
-/// # 为什么非有不可（2026-09-11 用真控制面实测确认的真缺陷）
+/// # 语义
 ///
-/// [`TAILNET_CGNAT`] / [`TAILNET_ULA_V6`] 是**上游官方控制面的默认前缀**，不是协议常量：
-/// headscale 的 `prefixes.v4` 可自定义，实测某自建 tailnet 把地址发成 `32.0.0.28` / `32.0.0.29`
-/// （v6 仍是默认 `fd7a:115c:a1e0::/48`）。此时按硬编码常量发出的 v4 force-route 规则**一条也命中不了**：
-/// TUN 的 `auto_route`（`0.0.0.0/1` + `128.0.0.0/1`）照样把 `32.0.0.x` 吞进来 → 进 sing-box 路由 →
-/// 没有任何规则把它送去 tailscale endpoint → 落到 `final`。而 `32.0.0.0/8` 是 IANA 分配给 AT&T 的
-/// **真实公网段**，落 final 不是"退化成直连"那么轻——它去的是别人的地址空间。
+/// canonical 只合并合法 host（v4 `/32`、v6 `/128`）、原有 MagicDNS 服务地址和显式 routes。
+/// 无合法 host、无显式 routes 时允许真正空集：单/多节点、官方/自建均不隐式占用
+/// [`TAILNET_CGNAT`] 或 [`TAILNET_ULA_V6`]。用户显式声明同字面广段仍须保留。
 ///
-/// # 语义：有观测则**取代**默认段（2026-09-11 改；原为并集）
-///
-/// - 该节点**有**可用观测段 ⇒ 只发观测段（`/32`、`/128`）+ 用户 `routes`，**不发**那两条默认常量；
-/// - 该节点**没有**观测段（从未连过 / status 流没来 / 首次运行）⇒ 发默认两段作 bootstrap。
-///
-/// # 为什么改掉并集：它在多节点下会造出真实错路由
-///
-/// 两个 TS 节点即便各自 tailnet 完全不相交（实测样本：自建 headscale `32.0.0.0/24` vs 官方
-/// `100.64.0.0/10`），那两条默认常量仍然**字面相同** ⇒ `builder::route` 块 0c 的跨节点
-/// 「首声明者占有」把后声明者的那两条吸收掉 ⇒ 先声明的 headscale 节点把整个 `100.64.0.0/10`
-/// 拿走，官方 tailnet 那个节点自己的地址被送去别人那儿。并集在单节点上零成本，在多节点上是错路由。
-///
-/// # 取代为什么安全：「有观测」那一侧的清单是完备的
-///
-/// 观测值来自 netmap，而 netmap 含该 tailnet **全部** peer（在线离线都在 —— `online: bool`
-/// 这个字段的存在即证）。落盘侧（`src-tauri` 的 `observed_addresses_of_event`）取的是
-/// self ∪ `details.user_groups[].peers[]` ∪ 顶层 `peers[]` 的并集。所以「有观测」时默认段只会
-/// 带来跨节点撞段，不带来覆盖。
-///
-/// 降级方向仍然安全：观测通道坏掉 ⇒ 观测为空 ⇒ 回落默认段 ⇒ 与本改动之前逐字节相同。
-///
-/// # 取代**不适用**于 MagicDNS 的两个服务地址
-///
-/// [`TAILNET_MAGICDNS_V4`] / [`TAILNET_MAGICDNS_V6`] 不随控制面变、也永远不会出现在 netmap 里，
-/// 故有观测腿把它们**补回来**，不让取代把它们连坐删掉。分界与完整理由见 [`TAILNET_MAGICDNS_V4`]。
-///
-/// # 如实登记的覆盖面损失（不是遗漏，是这条语义的直接代价）
-///
-/// 默认段里**不是 peer 地址、也不是上面那两个服务地址**的那部分，有观测时不再被 force-route
-/// 覆盖 —— 具体就是 4via6 合成地址（`fd7a:115c:a1e0:b1a::/64` 那一族）。它随对端 site 配置而生，
-/// 配置期与 netmap 都不可知，本仓不为它保留整条 `/48`（保留就退回并集、把撞段问题带回来）。
-/// 需要它的用户走 `tailscale.routes` 显式声明。**登记为限制，本批不修。**
-///
-/// # 空值是合法值，不是"没接线"
-///
-/// 空 map ⟺ 本轮没有任何运行期观测（A-0b 的落盘/观测腿未跑、或该节点还没连上控制面）⇒
-/// 行为与观测面存在之前**逐字节相同**。所有构造点都必须显式给出这个空值（结构体字段无默认值，
-/// 编译器会逼着每个构造点表态），不许靠"省略即旧行为"蒙混。
+/// 本类型只承载规划输入，不证明其 freshness、成员身份、Bound/Ready 或内核 reload ACK。
+/// App 侧经目标绑定过滤的 weak LastKnown 可继续参与 warm/TUN 规划；冷策略不清这些输入。
+/// 4via6 等不在已发现 host 中的地址仍需显式 routes，不据此推断整条 `/48` 可达。
 pub type ObservedTailnetAddresses = BTreeMap<String, Vec<String>>;
 
 /// tailnet rule-set 文件名/tag 前缀。读取侧（`builder::route` 块 0c）与落盘侧（A-0b）共用，
@@ -157,16 +87,9 @@ fn observed_tailnet_route_cidrs(addrs: Option<&Vec<String>>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 该节点本轮**有没有可用的运行期观测段** —— 即它发的是观测段还是默认两段。
-///
-/// 判据取**解析之后**的结果，不取「`observed` 里有没有这个 key」：观测通道抓回来的是运行期
-/// 字符串、不由本 crate 校验，一份全是非法字面量的地址表会被 `observed_tailnet_route_cidrs`
-/// （私有，故此处不做 intra-doc 链接：公开文档链私有项会被 CI 的 `rustdoc::private_intra_doc_links`
-/// 判红）过滤成空 —— 若按 key 判，这种节点会既不发观测段（没有）也不发默认段（以为有观测），
-/// 整段 tailnet 静默不可路由。
-///
-/// 非 Tailscale 协议恒 `false`：观测面只进 Tailscale 那一支（并进 WG 的 `allowed_ips` 会让对端
-/// 没有路由的段被宣称可达 ⇒ 黑洞），故它的段集与观测面无关 —— 即便 map 的 key 撞上了它的 id。
+/// 输入表中该 TS 节点是否有至少一个合法 host（解析后判定，全非法与空值同属无 host）。
+/// 本谓词只服务规划/排序，不把 weak LastKnown 升级为 fresh Observed 或成员证明。
+/// 非 TS 恒 false，即便其 id 与输入 key 相同，也不能把 TS 地址混入 WG cryptokey 路由。
 #[must_use]
 pub fn has_observed_tailnet_cidrs(
     server: &ServerConfig,
@@ -181,7 +104,7 @@ pub fn has_observed_tailnet_cidrs(
 /// # 为什么必须有这个顺序
 ///
 /// sing-box 的 `route.rules` 是**按规则顺序 first-match**，不是最长前缀匹配。有观测的节点发
-/// `/32`、无观测的节点发 `100.64.0.0/10` —— 两者**字面不同** ⇒ 跨节点去重（`claimed_cidrs`）
+/// `/32`、另一节点可能显式声明 `100.64.0.0/10` —— 两者**字面不同** ⇒ 跨节点去重（`claimed_cidrs`）
 /// 一条都拦不下，两条规则都会发出去。此时 `/10` 若排在前面，它把 `/32` 那条的流量整个吃掉，
 /// 而产物里那条 `/32` 明明还在、逐条看一切正常。
 ///
@@ -229,9 +152,7 @@ pub fn has_catch_all(cidrs: &[String]) -> bool {
 ///
 /// 非组网协议 → `[]`。
 ///
-/// `observed`：运行期观测到的 tailnet 地址（见 [`ObservedTailnetAddresses`]）。空 map、或该节点
-/// 一条都解析不出来（见 [`has_observed_tailnet_cidrs`]）= 无观测 ⇒ 回落默认两段，
-/// 产出与观测面存在之前逐字节相同。
+/// `observed` 为调用方过滤后的 host 规划输入；空/全非法输入只保留显式 routes。
 pub fn endpoint_forced_route_cidrs(
     server: &ServerConfig,
     observed: &ObservedTailnetAddresses,
@@ -254,35 +175,13 @@ pub fn endpoint_forced_route_cidrs(
                 .as_ref()
                 .map(|t| t.routes.clone())
                 .unwrap_or_default();
-            // 有观测 ⇒ 观测段**取代**默认两段；无观测 ⇒ 默认两段作 bootstrap。
-            //
-            // 取代的理由（并集会让两个不相交 tailnet 的默认段字面撞车、后声明者被吸收）、取代为
-            // 什么安全（netmap 含全部 peer ⇒ 有观测时清单完备）、以及登记在案的覆盖面损失
-            // （quad100 / 4via6），全部写在 [`ObservedTailnetAddresses`] 的「# 语义」一节 ——
-            // 那是这条语义的单一真值，此处不复述，免得两份说明哪天分家。
-            //
-            // 判空走 `observed_cidrs.is_empty()` 而不是 `observed.get(..).is_some()`：观测通道抓
-            // 回来的地址不由本 crate 校验，一份全是非法字面量的表会被过滤成空 —— 按 key 判会让
-            // 这种节点既没有观测段、也不发默认段，整段 tailnet 静默不可路由。
-            let observed_cidrs = observed_tailnet_route_cidrs(observed.get(&server.id));
-            let mut raw = if observed_cidrs.is_empty() {
-                // bootstrap 腿：默认两段。**不额外追加 MagicDNS 两条** —— 它们本就落在这两段之内
-                // （包含关系由门 `magicdns_addresses_are_contained_by_the_default_segments` 钉住，
-                // 不是此处的假设），重复发只会让降级腿的产出不再与观测面出现之前逐字节相同。
-                vec![TAILNET_CGNAT.to_string(), TAILNET_ULA_V6.to_string()]
-            } else {
-                // 有观测腿：观测段取代默认两段，但 MagicDNS 两条必须**补回来**。
-                // 它们不是 peer、永远不会进 netmap ⇒ 观测面抓不到 ⇒ 被取代掉就等于删掉，
-                // 而删掉的后果是应用/用户直接寻址 quad100 的包落 `final`。
-                // 完整理由（含为什么它与那两条会漂移的前缀不是一类）见 [`TAILNET_MAGICDNS_V4`]。
-                //
-                // 发射顺序上它自动落在**有观测那一批**（排序键只看节点有无观测、不看段的形态），
-                // 于是它排在无观测节点的 `100.64.0.0/10` 之前 —— 正是精确地址该在的位置。
-                let mut v = observed_cidrs;
-                v.push(TAILNET_MAGICDNS_V4.to_string());
-                v.push(TAILNET_MAGICDNS_V6.to_string());
-                v
-            };
+            // strict-all：未知地址等待发现，不用官方控制面的配置前缀作隐式 seed。
+            let mut raw = observed_tailnet_route_cidrs(observed.get(&server.id));
+            if !raw.is_empty() {
+                // MagicDNS 服务地址政策保持不变：有合法 host 时补齐，不据此扩大到官方大段。
+                raw.push(TAILNET_MAGICDNS_V4.to_string());
+                raw.push(TAILNET_MAGICDNS_V6.to_string());
+            }
             raw.extend(strip_catch_all(&routes));
             raw
         }
@@ -636,13 +535,9 @@ pub struct ServerForceRoute {
     /// 本轮该节点**有没有可用的运行期观测段**（取 [`has_observed_tailnet_cidrs`]，与发射端块 0c
     /// 的排序键同一个谓词，不是第二份判断）。
     ///
-    /// 两个用途，缺一不可：
-    ///  - **语义位**：真 ⇒ 本节点发的是观测段（`/32`、`/128`）；假 ⇒ 发的是 [`TAILNET_CGNAT`] /
-    ///    [`TAILNET_ULA_V6`] 两条默认常量。两个无观测节点的段**必然完全重合**，那不是
-    ///    「同一个 tailnet」的证据，只是两份一样的猜测；少了这一位，消费方会把「还没连上」
-    ///    读成「账号撞车」。
-    ///  - **顺序位**：真的那些节点在 [`EndpointForceRouteReport::servers`] 与产物 `route.rules`
-    ///    里都排在假的那些之前（理由见 [`force_route_emission_order_key`]）。
+    /// 输入 host 可与显式 routes 同时存在；false 时仅剩声明（也可为空）。
+    /// 两个未知节点不再必然冲突，实际相同声明/host 仍按既有 first-match 语义解释。
+    /// 此位是既有规划/排序投影，不证明 freshness 或 Bound/Ready。
     pub has_observation: bool,
     /// 本节点**实际发射**的具体段（只有 [`ForceRouteLeg::Inline`] 腿非空）。
     pub emitted: Vec<String>,

@@ -136,6 +136,21 @@ pub struct ExpectedCoreStopRequest {
     pub expected_selection_intent_generation: u64,
 }
 
+/// Only internal Linux maintenance retains these existing async gates through
+/// its privileged body. Public owned Stop drops this boundary before returning.
+/// A later Start may claim a generation, but cannot physically launch under the
+/// held state gate. This is local App synchronization, not daemon ownership.
+pub(crate) struct ExpectedStopBoundary<'a> {
+    result: ExpectedCoreStopResult,
+    _switch: tokio::sync::MutexGuard<'a, ()>,
+    _state_gate: tokio::sync::MutexGuard<'a, ()>,
+}
+impl ExpectedStopBoundary<'_> {
+    pub(crate) fn outcome(&self) -> ExpectedCoreStopResult {
+        self.result.clone()
+    }
+}
+
 /// Minted by the saved-writer/selection comparison; contains no external publication.
 pub(super) struct OwnedStopClaim {
     pub(super) generation: u64,
@@ -579,6 +594,7 @@ impl ProxyRuntime {
     )]
     pub(super) fn bump_generation(&self) -> u64 {
         let g = self.gate.bump_generation();
+        self.revoke_tailnet_before_generation(g);
         self.coex.invalidate_generation(g);
         self.gen_changed.notify_waiters();
         g
@@ -591,6 +607,7 @@ impl ProxyRuntime {
     ) -> Option<u64> {
         let generation = self.gate.claim_generation(expected, kind);
         if let Some(generation) = generation {
+            self.revoke_tailnet_before_generation(generation);
             self.coex.claim(generation, kind == LifecycleKind::Start);
             self.gen_changed.notify_waiters();
         }
@@ -924,7 +941,23 @@ impl ProxyRuntime {
                         || direct_slot.has_helper_start()
                         || (self.core_via_helper.load(Ordering::SeqCst) && !via_helper)
                     {
-                        return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
+                        let mut error = StartError::direct_slot_occupied();
+                        if self.core_via_helper.load(Ordering::SeqCst) && !via_helper {
+                            if let Ok(pid) = self.pid.lock() {
+                                if direct_slot
+                                    .locally_closed_helper_attempt(
+                                        &self.child,
+                                        &self.pid,
+                                        *pid,
+                                        self.gate.generation(),
+                                    )
+                                    .is_some()
+                                {
+                                    error = StartError::helper_runtime_restart_required();
+                                }
+                            }
+                        }
+                        return StartLeg::Finished(Err(error), None);
                     }
                     let claim_generation = || {
                         self.claim_generation(
@@ -1185,7 +1218,56 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         expected: ExpectedCoreStopRequest,
     ) -> Result<ExpectedCoreStopResult, String> {
-        if expected.expected_main_generation == 0
+        self.stop_expected_inner(expected, false)
+            .await
+            .map(|boundary| boundary.outcome())
+    }
+
+    /// Internal current-user data recovery may observe a truly cold App.
+    /// Keep its generation-zero compare inside the existing atomic Stop claim:
+    /// an unconditional bootstrap Stop could instead cancel a successor Start.
+    /// This is not a wire token, privileged-store proof or execution authority.
+    pub(crate) async fn stop_for_user_data_recovery(
+        self: &Arc<Self>,
+        expected: ExpectedCoreStopRequest,
+    ) -> Result<ExpectedCoreStopResult, String> {
+        let status = self.status();
+        if status.running || status.starting || status.pid != 0 {
+            return Err("core recovery requires an already idle App".into());
+        }
+        self.stop_expected_inner(expected, true)
+            .await
+            .map(|boundary| boundary.outcome())
+    }
+
+    /// Internal Linux maintenance synchronizes the real initial App generation
+    /// through the same selector/state/claim boundary. Generation zero is never
+    /// a wire token, old-helper ownership proof or global release receipt. The
+    /// caller's fixed native dispatcher must separately prove its journal,
+    /// responsible-user baseline and actual service/network closure.
+    pub(crate) async fn stop_expected_for_linux_helper_maintenance(
+        self: &Arc<Self>,
+        expected: ExpectedCoreStopRequest,
+    ) -> Result<ExpectedStopBoundary<'_>, String> {
+        #[cfg(target_os = "linux")]
+        {
+            let allow_initial_local = expected.expected_main_generation == 0;
+            self.stop_expected_inner(expected, allow_initial_local)
+                .await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected;
+            Err("initial helper maintenance synchronization requires Linux".into())
+        }
+    }
+
+    async fn stop_expected_inner(
+        self: &Arc<Self>,
+        expected: ExpectedCoreStopRequest,
+        allow_initial_local: bool,
+    ) -> Result<ExpectedStopBoundary<'_>, String> {
+        if (expected.expected_main_generation == 0 && !allow_initial_local)
             || expected.expected_main_generation > 9_007_199_254_740_991
             || expected.expected_selection_intent_generation > 9_007_199_254_740_991
         {
@@ -1197,12 +1279,20 @@ impl ProxyRuntime {
         let _switch = self.switch_serial.lock().await;
         let state_gate = self.mesh.tailscale_state_gate().await;
         let Some(claim) = self.claim_owned_stop_memory(&expected)? else {
-            return Ok(ExpectedCoreStopResult::Changed);
+            return Ok(ExpectedStopBoundary {
+                result: ExpectedCoreStopResult::Changed,
+                _switch,
+                _state_gate: state_gate,
+            });
         };
         let generation = claim.generation;
         self.publish_owned_stop_claim(claim);
         if self.gate.generation() != generation {
-            return Ok(ExpectedCoreStopResult::Changed);
+            return Ok(ExpectedStopBoundary {
+                result: ExpectedCoreStopResult::Changed,
+                _switch,
+                _state_gate: state_gate,
+            });
         }
         #[cfg(target_os = "ios")]
         tauri_plugin_polaris_ios::revoke_pending_start_through(
@@ -1211,13 +1301,25 @@ impl ProxyRuntime {
         )
         .await?;
         if self.gate.generation() != generation {
-            return Ok(ExpectedCoreStopResult::Changed);
+            return Ok(ExpectedStopBoundary {
+                result: ExpectedCoreStopResult::Changed,
+                _switch,
+                _state_gate: state_gate,
+            });
         }
         if self.stop_inner_under_gate(generation, &state_gate).await? != Some(generation) {
-            return Ok(ExpectedCoreStopResult::Changed);
+            return Ok(ExpectedStopBoundary {
+                result: ExpectedCoreStopResult::Changed,
+                _switch,
+                _state_gate: state_gate,
+            });
         }
         if self.gate.generation() != generation {
-            return Ok(ExpectedCoreStopResult::Changed);
+            return Ok(ExpectedStopBoundary {
+                result: ExpectedCoreStopResult::Changed,
+                _switch,
+                _state_gate: state_gate,
+            });
         }
         self.restore_system_takeover_confirmed().await?;
         let still_selected = self
@@ -1232,12 +1334,20 @@ impl ProxyRuntime {
             })
             .map_err(|error| error.to_string())?;
         if !still_selected {
-            return Ok(ExpectedCoreStopResult::Changed);
+            return Ok(ExpectedStopBoundary {
+                result: ExpectedCoreStopResult::Changed,
+                _switch,
+                _state_gate: state_gate,
+            });
         }
         self.process_deferred_config_deletions_under_gate(&state_gate);
-        Ok(ExpectedCoreStopResult::Stopped {
-            expected_main_generation: expected.expected_main_generation,
-            stop_main_generation: generation,
+        Ok(ExpectedStopBoundary {
+            result: ExpectedCoreStopResult::Stopped {
+                expected_main_generation: expected.expected_main_generation,
+                stop_main_generation: generation,
+            },
+            _switch,
+            _state_gate: state_gate,
         })
     }
 
@@ -2220,6 +2330,8 @@ impl ProxyRuntime {
     ///
     /// 事件发不出（emitter 未接线 / 无窗口）绝不打断状态落值 —— 诊断通道不该反噬它诊断的东西。
     pub(super) fn set_error(&self, msg: &str, error_code: &str) {
+        let _publication = self.gate.lock_generation_publication();
+        self.revoke_tailnet_context();
         if let Ok(mut route) = self.mesh_route_run.write() {
             *route = None;
         }

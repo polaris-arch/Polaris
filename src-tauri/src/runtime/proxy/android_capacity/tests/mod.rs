@@ -32,3 +32,11 @@ fn typed_spawn_source_survives_but_same_raw_message_does_not_classify() {
     };
     assert_eq!(CapacityClosed::from_spawn(&raw), None);
 }
+
+#[test]
+fn execution_admission_is_never_android_capacity() {
+    let error = polaris_core_supervisor::SpawnError::Admission(
+        polaris_core_supervisor::admitted_payload::AdmissionError::unsupported_exact_object(),
+    );
+    assert_eq!(CapacityClosed::from_spawn(&error), None);
+}

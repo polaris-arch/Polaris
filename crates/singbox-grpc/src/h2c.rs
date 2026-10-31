@@ -10,8 +10,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tonic::transport::Channel;
 use tower_service::Service;
@@ -45,7 +49,10 @@ pub(crate) fn connect_h2c_with(
     // tonic 0.14：from_shared 接收 Into<Bytes>（字符串即可）。h2c = `http://` scheme（明文）。
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{target}"))?
         // 关键：用自定义 TCP 连接器覆盖默认 TLS 连接器；tonic 内部跑 h2 明文握手（prior knowledge）。
-        .connect_with_connector_lazy(TcpConnector { dial });
+        .connect_with_connector_lazy(TcpConnector {
+            dial,
+            capture: None,
+        });
     Ok(endpoint)
 }
 
@@ -58,10 +65,11 @@ pub(crate) fn connect_h2c_with(
 #[derive(Clone)]
 struct TcpConnector {
     dial: Dialer,
+    capture: Option<Arc<CapturedTransport>>,
 }
 
 impl Service<http::Uri> for TcpConnector {
-    type Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>;
+    type Response = hyper_util::rt::TokioIo<TrackedTcp>;
     type Error = std::io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -72,6 +80,7 @@ impl Service<http::Uri> for TcpConnector {
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
         let dial = Arc::clone(&self.dial);
+        let capture = self.capture.clone();
         Box::pin(async move {
             let host = uri
                 .host()
@@ -81,6 +90,12 @@ impl Service<http::Uri> for TcpConnector {
             let host = host.trim_start_matches('[').trim_end_matches(']');
             let addr = format!("{host}:{port}");
 
+            if let Some(c) = &capture {
+                if c.connected.load(Ordering::Acquire) {
+                    c.close();
+                    return Err(io("captured API transport cannot reconnect"));
+                }
+            }
             debug!("h2c：TCP 拨号 {addr}");
             let limit = crate::CONNECT_TIMEOUT;
             let tcp = match tokio::time::timeout(limit, dial(host.to_owned(), port)).await {
@@ -93,8 +108,96 @@ impl Service<http::Uri> for TcpConnector {
                 }
             };
             // TokioIo 适配 tokio AsyncRead/Write → hyper rt::Read/Write（tonic 要求）。
-            Ok(hyper_util::rt::TokioIo::new(tcp))
+            if let Some(c) = &capture {
+                if c.connected.swap(true, Ordering::AcqRel) {
+                    c.close();
+                    return Err(io("captured API transport already owns a connection"));
+                }
+            }
+            Ok(hyper_util::rt::TokioIo::new(TrackedTcp { tcp, capture }))
         })
+    }
+}
+
+// Connection custody is not peer authentication by itself. It preserves the
+// caller's already trusted bootstrap transport and never reinterprets a later
+// same-address listener as that original owner.
+pub(crate) struct CapturedTransport {
+    connected: AtomicBool,
+    closed: AtomicBool,
+    on_close: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+impl CapturedTransport {
+    pub(crate) fn live(&self) -> bool {
+        self.connected.load(Ordering::Acquire) && !self.closed.load(Ordering::Acquire)
+    }
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let callback = self
+                .on_close
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if let Some(callback) = callback {
+                callback()
+            }
+        }
+    }
+    pub(crate) fn on_closed(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+        *self.on_close.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback.clone());
+        if self.closed.load(Ordering::Acquire) {
+            callback()
+        }
+    }
+}
+pub(crate) fn connect_captured(
+    target: &str,
+) -> Result<(Channel, Arc<CapturedTransport>), tonic::transport::Error> {
+    let capture = Arc::new(CapturedTransport {
+        connected: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+        on_close: Mutex::new(None),
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{target}"))?
+        .connect_with_connector_lazy(TcpConnector {
+            dial: Arc::new(|host, port| Box::pin(TcpStream::connect((host, port)))),
+            capture: Some(capture.clone()),
+        });
+    Ok((channel, capture))
+}
+struct TrackedTcp {
+    tcp: TcpStream,
+    capture: Option<Arc<CapturedTransport>>,
+}
+impl Drop for TrackedTcp {
+    fn drop(&mut self) {
+        if let Some(c) = &self.capture {
+            c.close()
+        }
+    }
+}
+impl AsyncRead for TrackedTcp {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for TrackedTcp {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.tcp).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_shutdown(cx)
     }
 }
 

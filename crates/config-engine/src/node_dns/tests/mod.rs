@@ -267,3 +267,75 @@ fn decoy_diagnostics_are_bounded_and_never_echo_override_content() {
         });
     }
 }
+
+#[test]
+fn dot_is_a_native_tls_candidate_with_unchanged_policy_and_no_sidecar() {
+    let config = UserConfig {
+        dns_config: Some(UserDnsConfig {
+            node_resolver_pool: Some(vec![
+                "dot4".into(),
+                "dot6".into(),
+                "udp".into(),
+                "system".into(),
+            ]),
+            node_resolver_custom: Some(vec![
+                CustomDnsUpstream {
+                    id: "dot4".into(),
+                    spec: "tls://1.1.1.1".into(),
+                },
+                CustomDnsUpstream {
+                    id: "dot6".into(),
+                    spec: "tls://[2001:db8::1]:8853".into(),
+                },
+                CustomDnsUpstream {
+                    id: "udp".into(),
+                    spec: "udp://9.9.9.9:5353".into(),
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut dns = generated("linux", None);
+    dns.servers
+        .retain(|s| !s.tag.starts_with("dns-node-native-"));
+    dns.rules
+        .as_mut()
+        .unwrap()
+        .retain(|r| r.resolver_policy.as_deref() != Some(POLICY));
+    append_policy(&config, "android", None, &mut dns, |_, _| {});
+    let candidates: Vec<_> = dns
+        .servers
+        .iter()
+        .filter(|s| s.tag.starts_with("dns-node-native-"))
+        .collect();
+    assert_eq!(candidates.len(), 3); // Android TUN excludes system.
+    assert_eq!(candidates[0].type_field.as_deref(), Some("tls"));
+    assert_eq!(candidates[0].server_port, Some(853));
+    assert_eq!(candidates[1].server.as_deref(), Some("2001:db8::1"));
+    assert_eq!(candidates[1].server_port, Some(8853));
+    assert_eq!(candidates[2].type_field.as_deref(), Some("udp"));
+    for candidate in candidates {
+        assert!(
+            candidate.path.is_none()
+                && candidate.domain_resolver.is_none()
+                && candidate.detour.is_none()
+        );
+        let value = serde_json::to_value(candidate).unwrap();
+        assert!(value.get("tls").is_none()); // Native TLS defaults, never insecure/SNI/CA override.
+    }
+    let evaluations: Vec<_> = dns
+        .rules
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.resolver_policy.as_deref() == Some(POLICY) && r.action.as_deref() == Some("evaluate")
+        })
+        .collect();
+    assert_eq!(evaluations.len(), 3);
+    assert!(evaluations
+        .iter()
+        .all(|r| r.timeout.as_deref() == Some("1500ms")));
+    assert_eq!(serde_json::to_value(resolver()).unwrap()["timeout"], "2s");
+}

@@ -66,6 +66,7 @@
  * 退出码：0 = 全部不变量成立；1 = 有违反（逐条打印）；2 = 用法错误（缺必填参数）。
  */
 
+import { rejectLocalDistribution, rejectLocalExecutables } from './desktop-core/local-development.mjs';
 import { readFileSync, existsSync, lstatSync, realpathSync, statSync, readdirSync, openSync, readSync, closeSync } from 'fs';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -74,7 +75,7 @@ import { fileURLToPath } from 'url';
 import { macOpenGuideViolations } from './lib/macos-open-guide.mjs';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
 import { verifyCronetPayload } from './lib/cronet-payload.mjs';
-import { nsisCoreSweepViolations } from './lib/nsis-core-sweep.mjs';
+import { nsisCoreSweepViolations, nativeSweepViolations } from './lib/nsis-core-sweep.mjs';
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
 import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
@@ -233,6 +234,25 @@ function coreDirOf(entry, platforms) {
   const m = /^\.\.\/resources\/([^/]+)(?:\/|$)/.exec(String(entry).replace(/\\/g, '/'));
   if (!m) return null;
   return platforms.includes(m[1]) ? m[1] : null;
+}
+
+// The recovery carrier is platform data, not a common-resource exemption or a
+// directory-wide allowance in the payload inventory below.
+function checkPlatformResourceEntries(confName, res, baseResources, p, platforms, requireRecovery) {
+  const recovery = `../resources/core-recovery/${p}/`;
+  for (const common of baseResources) {
+    if (/^\.\.\/resources\/core-recovery(?:\/|$)/.test(String(common).replace(/\\/g, '/'))) {
+      fail(`tauri.conf.json: base bundle.resources 不得含平台恢复目录 '${common}'`);
+    }
+  }
+  if (requireRecovery && res.filter(entry => entry === recovery).length !== 1) {
+    fail(`src-tauri/${confName}: 本平台恢复目录 '${recovery}' 应恰有 1 份`);
+  }
+  for (const entry of res) {
+    if (baseResources.includes(entry) || coreDirOf(entry, platforms) === p || entry === recovery) continue;
+    fail(`src-tauri/${confName}: bundle.resources 含未登记条目 ${JSON.stringify(entry)} —— `
+      + `只允许 base 公共资源、本平台内核及精确恢复目录 '${recovery}'；其他平台或恢复子项不能借此前缀放行`);
+  }
 }
 
 // ───────────────────── workflow matrix 解析（不变量 D 用）─────────────────────
@@ -543,20 +563,12 @@ function checkConfs() {
     // per-platform conf 的 `bundle.resources` 各加一条 `"../ui/src/"`，`confs` 模式仍 **rc=0**，
     // 整份 `ui/src`（含 194 个测试文件）随四个安装包出货，全链零转红。
     //
-    // 登记表 = base 公共资源 ∪ **本平台**内核条目。后者不写死成 `../resources/<p>/` 一种形态：
+    // 登记表 = base 公共资源 ∪ **本平台**内核条目 ∪ 精确本平台恢复目录。
+    // 内核条目不写死成 `../resources/<p>/` 一种形态：
     // 不变量 B 已明确「同平台多条 / 文件粒度条目」是合法的（`coreDirOf` 认前缀），这里必须同口径，
-    // 否则本条会把 B 认可的合法形态判红。跨平台内核条目由 B 拦，落到这里也一样红（双保险）。
-    for (const entry of res) {
-      if (baseResources.includes(entry)) continue;
-      if (coreDirOf(entry, platforms) === p) continue;
-      fail(
-        `src-tauri/${confName}: bundle.resources 含未登记条目 ${JSON.stringify(entry)} —— ` +
-          `per-platform conf 的唯一职责是「base 公共资源 + 本平台内核」，多出来的条目会被 bundler ` +
-          `**整目录递归**铺进这个平台的安装包（源码 / 测试 / 文档都能这样进包，且现有 A/B/C/D 一条都不会红）。\n` +
-          `  登记表：base 公共资源 ${JSON.stringify(baseResources)} ∪ 本平台内核（前缀 '../resources/${p}/'）\n` +
-          `  要新增公共资源：先加进 src-tauri/tauri.conf.json 的 bundle.resources（不变量 A 会要求四份 conf 同步）`
-      );
-    }
+    // 否则本条会把 B 认可的合法形态判红。恢复目录只允许唯一完整 subtree，
+    // 不把内核文件粒度规则泛化到恢复前缀；正式来源不得遗漏/重复恢复映射。
+    checkPlatformResourceEntries(confName, res, baseResources, p, platforms, hasDesktopRelease(manifest));
 
     // 不变量 C：引用的目录必须真实存在（conf 写对了但目录没 fetch 也要红）。
     for (const entry of res) {
@@ -1074,38 +1086,22 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
     }
   }
 
-  // ── ⑥ 便携腿（另一条腿）：portable zip 与 tauri bundler 各铺各的，改 conf **不会**惠及便携。
-  //     2026-09-04 实测：便携 zip 连 THIRD-PARTY-LICENSES.md 都没有，三份许可文本一份不带。
-  const stage = workflow === null ? null : workflowStepBody(workflow, 'Build Windows portable zip');
-  const verify = workflow === null ? null : workflowStepBody(workflow, 'Verify portable zip contents');
-  if (workflow === null) {
-    // workflow 读不到本身已在 checkConfs 判红，这里不重复报，但便携腿这一半确实没验到，不能进 ok 行。
-  } else if (stage === null) {
-    fail("package.yml: 找不到 step 'Build Windows portable zip' —— 便携腿的许可文本无从断言");
-  } else {
-    const lines = stage.split('\n').map(stripYamlComment);
-    for (const name of LICENSE_BASENAMES) {
-      const hits = lines.filter((l) => l.includes(`Copy-Item ${name} $staging/`)).length;
-      if (hits !== 1) {
-        fail(
-          `package.yml 'Build Windows portable zip': 应恰有 1 条 \`Copy-Item ${name} $staging/\`，实为 ${hits} 条 —— ` +
-            `便携 zip 与安装器是两条独立的腿，bundle.resources 只惠及后者；便携用户拿到二进制却没有许可文本`
-        );
-      }
-    }
-  }
+  // ── ⑥ Windows portable has an independent producer. Follow its real
+  // mandatory Python action and complete source-map/actual-ZIP consumer, rather
+  // than requiring removed PowerShell step names or literal copy statements.
   if (workflow !== null) {
-    if (verify === null) {
-      fail("package.yml: 找不到 step 'Verify portable zip contents' —— 便携 zip 的开箱验缺席（改了打包脚本却没人核验产物）");
-    } else {
-      for (const name of LICENSE_BASENAMES) {
-        if (!verify.includes(`"${name}"`)) {
-          fail(
-            `package.yml 'Verify portable zip contents': 开箱验没有核对 "${name}" —— ` +
-              `只验打包脚本文本不验产物，正是这条腿此前漏掉三份许可文本的形态`
-          );
-        }
+    try {
+      const result = JSON.parse(execFileSync(process.platform === 'win32' ? 'python' : 'python3',
+        [join(ROOT, 'scripts/windows-package-integrity.py'), 'contract'],
+        { cwd: ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }));
+      if (result.schema !== 'polaris-windows-package-contract-v1'
+          || JSON.stringify(result.legalFiles) !== JSON.stringify(LICENSE_BASENAMES)
+          || result.actualZipComparison !== 'exact(actual, expected)'
+          || JSON.stringify(result.ordinaryWindowsCommands) !== JSON.stringify(['prepare', 'assemble'])) {
+        throw new Error('actual Windows configuration/producer/ZIP contract result differs');
       }
+    } catch (error) {
+      fail(`Windows portable 配置/许可/实际ZIP全集链未闭合：${error.stderr?.toString().trim() || error.message}`);
     }
   }
 
@@ -1114,7 +1110,7 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
     note(
       `许可文本分发链：${LICENSE_BASENAMES.join(' / ')} 在 base + ${platforms.length} 份平台 conf 里各恰 1 条；` +
         `NOTICE 的 sing-box 版本与 tag 链接 = core-manifest v${manifest.bundledCoreVersion}，版权行与 LICENSE 逐字一致，` +
-        `mere-aggregation 作为**未经检验的立场**并附 GNU FAQ 出处；Windows portable zip 三份都拷入并开箱核验` +
+        `mere-aggregation 作为**未经检验的立场**并附 GNU FAQ 出处；Windows 普通 assemble 已接完整 source-map 与实际ZIP全集/SHA/size门` +
         `${workflow === null ? '（⚠️ workflow 读不到，便携腿这一半未验）' : ''}`
     );
   }
@@ -1525,7 +1521,10 @@ function checkWindowsInstallerHooks(base) {
   for (const violation of nsisCoreSweepViolations(source)) {
     fail(`nsis-hooks.nsh 内核清扫门：${violation}`);
   }
-  // 卸载腿的提权清理：脚本随命令行进入提权进程（不落盘）、删除前逐项校验、退出码被消费。
+  for (const violation of nativeSweepViolations(readFileSync(join(ROOT, 'crates/windows-cleaner/src/windows/sweep.rs'), 'utf8'))) {
+    fail(`Windows native sweep source gate: ${violation}`);
+  }
+  // Fixed native POSTUNINSTALL remains a separate narrow UAC cleanup operation.
   // 判据本体与它的反向对照在 `lib/nsis-helper-cleanup.mjs` / `nsis-helper-cleanup.test.mjs`。
   for (const violation of nsisHelperCleanupViolations(source)) {
     fail(`nsis-hooks.nsh 提权清理门：${violation}`);
@@ -2020,6 +2019,7 @@ function checkPayload(label, root) {
       continue;
     }
 
+    rejectLocalExecutables(walk2(scope.dir, [], 0, 24));
     for (const family of payloadFamilies) {
       const all = walk(scope.dir, family.names);
       const seen = new Map();
@@ -2484,6 +2484,15 @@ function checkAssets(label, dir, namesOnly = false) {
   const paths = walk2(abs, [], 0, 24);
   const names = paths.map((p) => basename(p));
   const pathOf = (n) => paths.find((p) => basename(p) === n);
+  if (!namesOnly) for (const path of paths.filter(p => /\.(?:exe|zip|dmg|deb|AppImage|apk)$/.test(p))) {
+    try {
+      const checked = JSON.parse(execFileSync(process.platform === 'win32' ? 'python' : 'python3',
+        [join(ROOT, 'scripts/final-package-receipt.py'), '--reject-local-selection', path],
+        { encoding: 'utf8', stdio: ['ignore','pipe','pipe'], maxBuffer: 1024 * 1024, timeout: 200000 }));
+      if (!Number.isSafeInteger(checked.artifactBytes) || checked.artifactBytes !== statSync(path).size || !/^[a-f0-9]{64}$/.test(checked.artifactSha256) || checked.artifactSha256 !== createHash('sha256').update(readFileSync(path)).digest('hex')) throw new Error('Inspected artifact object differs from distribution bytes');
+    } catch (error) { fail(`Formal asset object check failed: ${path}: ${error.stderr?.toString() || error.message}`); }
+  }
+
   // Pin version, spelling and inventory together; old-name copies and unregistered assets fail closed.
   const version = JSON.parse(readFileSync(join(SRC_TAURI, 'tauri.conf.json'), 'utf8')).version;
   const expected = assetNames(version, label);
@@ -2684,14 +2693,23 @@ function checkAssets(label, dir, namesOnly = false) {
   if (label === 'release' || label === 'release-all') checkSha256Sums(names, pathOf, namesOnly);
 }
 
+// NTFS inode values can exceed Number's safe integer range. A lossy identity
+// must fail closed rather than aliasing a different ancestor directory.
+function inventoryDirectoryKey(identity) {
+  if (typeof identity.dev !== 'bigint' || typeof identity.ino !== 'bigint') {
+    throw new InputError('inventory exact bigint directory identity required');
+  }
+  return `${identity.dev}:${identity.ino}`;
+}
+
 /** Full inventory walk: fail closed on incomplete traversal. Dirent avoids a stat
  * for ordinary files; only directories and symlinks require identity/type lookup.
  * Ancestor inode identities detect loops without hiding distinct alias paths.
  */
 function walk2(dir, out = [], depth = 0, maxDepth = 8, ancestors = new Set()) {
   if (depth > maxDepth) throw new InputError(`inventory depth limit ${maxDepth} exceeded: ${dir}`);
-  const identity = statSync(dir);
-  const key = `${identity.dev}:${identity.ino}`;
+  const identity = statSync(dir, { bigint: true });
+  const key = inventoryDirectoryKey(identity);
   const canonical = realpathSync(dir);
   if (ancestors.has(key) || ancestors.has(canonical)) throw new InputError(`inventory symlink cycle: ${dir}`);
   ancestors.add(key);
@@ -2699,7 +2717,7 @@ function walk2(dir, out = [], depth = 0, maxDepth = 8, ancestors = new Set()) {
   try {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, e.name);
-      const st = e.isSymbolicLink() ? statSync(full) : e;
+      const st = e.isSymbolicLink() ? statSync(full, { bigint: true }) : e;
       if (st.isDirectory()) walk2(full, out, depth + 1, maxDepth, ancestors);
       else if (st.isFile()) out.push(full);
       else throw new InputError(`inventory unsupported member: ${full}`);
@@ -2991,6 +3009,19 @@ function payloadAllowRules(label, coreDir, srsCount, releaseContract, temporary 
     min: 1, max: 1,
     why: 'Committed temporary default carrier receipt: exact source/App/run and actual helper/cleaner bytes, verified with the compiled core manifest before and after packaging.',
   });
+  if (releaseContract && !temporary) {
+    const recovery = `_up_/resources/core-recovery/${coreDir}/`;
+    for (const [id, name, why] of [
+      ['core-recovery-archive', releaseContract.platforms[coreDir].archive.name,
+        '编译选择同源的原始压缩恢复载体；独立于可变运行副本，只在显式恢复时校验解包。'],
+      ['core-recovery-inventory', 'inventory.json',
+        '原合同绑定的恢复成员尺寸数据；构建时编译选择读取，不增加第二份摘要 allowlist。'],
+    ]) rules.push({
+      id, re: new RegExp(`^${reQuote(recovery + name)}$`), min: 1, max: 1,
+      releaseMember: true, // Downloaded exact inputs: require counts in --static too.
+      why,
+    });
+  }
   // Legal/source/provenance bytes retain their original reviewed archive paths.
   // Temporary archives use direct members; historical releases keep core-release/.
   // Neither branch grants a directory-wide exemption for arbitrary files.
@@ -3117,6 +3148,7 @@ function checkInventory(label, { root, isStatic }) {
       }
       // 全枚举（复用 walk2；深度给足 —— deb 的 dashboard/assets 在 bundle/deb 下第 10 层）
       const all = walk2(scope.dir, [], 0, 24);
+      rejectLocalExecutables(all);
       if (all.length === 0) {
         fail(`inventory 模式：${scope.dir} 下一个文件都没有 —— 空树不该判绿（白名单门在空目录上恒成立，那是假绿）`);
         continue;
@@ -3257,6 +3289,7 @@ function argOf(flag) {
 }
 
 const mode = process.argv[2];
+rejectLocalDistribution(ROOT);
 try {
   runMode();
 } catch (e) {

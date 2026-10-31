@@ -9,6 +9,14 @@ pub const SUPPORT_PARENT: &str = r"C:\ProgramData";
 pub const SUPPORT_LEAF: &str = "Polaris";
 pub const IMAGE_NAME: &str = "polaris-cleaner.exe";
 
+pub mod install;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstallOutcome {
+    Completed(i32),
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Success,
@@ -42,10 +50,12 @@ impl Outcome {
 
 /// Only these roles are accepted. Paths, service names, PIDs and commands
 /// cannot cross this boundary, including after elevation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     Launcher,
     Worker,
+    InstallWorker(std::path::PathBuf),
+    SweepInstalledCores,
 }
 
 pub fn role(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<Role> {
@@ -53,6 +63,17 @@ pub fn role(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<Role> 
     let role = match args.next()?.to_str()? {
         "--launch" => Role::Launcher,
         "--worker" => Role::Worker,
+        "--sweep-installed-cores" => Role::SweepInstalledCores,
+        "--install-worker" => {
+            if args.next()?.to_str()? != "--request" {
+                return None;
+            }
+            let path = std::path::PathBuf::from(args.next()?);
+            if !path.is_absolute() || path.file_name()?.to_str()? != "install-request.json" {
+                return None;
+            }
+            Role::InstallWorker(path)
+        }
         _ => return None,
     };
     args.next().is_none().then_some(role)
@@ -114,6 +135,8 @@ mod service;
 mod windows;
 #[cfg(windows)]
 pub use windows::{launch_bundle, launch_current, run_worker};
+#[cfg(windows)]
+pub use windows::{launch_install, run_install_worker, sweep_installed_cores};
 
 #[cfg(test)]
 mod tests;

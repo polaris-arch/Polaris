@@ -54,22 +54,30 @@ enum Kind {
     Copy,
 }
 
-/// 既有命中的逐文件登记：`(文件, 判据, 数量, 为什么它不是「落替身再执行」)`。
+/// 既有命中的逐文件登记：`(文件, 判据, 数量, 不执行或仅 Windows 执行的具体理由)`。
 const REGISTERED: &[(&str, Kind, usize, &str)] = &[
-    ("crates/helper-client/src/manager/tests/mod.rs", Kind::Shebang, 2,
-     "Golden Linux installer/uninstaller generated script prefixes are asserted as strings only; these assertions neither create nor execute an executable stand-in."),
+    ("crates/helper-client/src/manager/tests/mod.rs", Kind::Shebang, 3,
+     "Three complete Linux producer parity cases retain their shared sh/bash prefix assertions; the additional explicit legacy envelope prefix is also an inert string assertion. Actual script custody/mode/held-unlink checks remain unchanged and none executes a stand-in."),
+    ("crates/windows-cleaner/src/windows/install/tests/mod.rs", Kind::Copy, 1,
+     "Copies registration.rollback data for the real installation snapshot/restore assertions. This backup is read/hash/security checked and restored as registration data, never executed."),
+    ("crates/windows-cleaner/src/windows/sweep/tests/mod.rs", Kind::Copy, 1,
+     "The parent windows module is cfg(windows): copies the current test PE, then actually executes each copy as an owned inert waiter. fs::copy has returned and closed its write handle before Command::spawn; Windows has no Unix fork/write-fd inheritance window. This is a Windows-only execution exception, not a never-executed data fixture."),
     ("src-tauri/src/runtime/proxy/mesh_apply/artifact/tests/mod.rs", Kind::ExecBit, 1,
         "FIFO replacement fixture sets only its private directory to 0700 before exercising the lstat/open boundary; no executable file is created"),
-    ("src-tauri/src/runtime/core_identity/tests/mod.rs", Kind::ExecBit, 1,
-        "FIFO fixture directory mode 0700 permits private traversal; no executable file is written"),
-    ("crates/helper/src/user_control/tests/mod.rs", Kind::ExecBit, 1,
-        "Only the private users/<identity> directory gets mode 0700; registration bytes stay nonexecutable and are only snapshotted/restored"),
+    ("src-tauri/src/runtime/core_identity/tests/mod.rs", Kind::ExecBit, 5,
+        "Four owned fixture directories (compiled maintenance, bundle observation, special sidecar, inert maintenance) use 0700. One copied compiled helper is sealed 0700 and only read/hash-checked by maintenance_utility_from, never executed; ordinary dummy members stay 0600."),
+    ("src-tauri/src/runtime/core_identity/tests/mod.rs", Kind::Copy, 1,
+        "Copies the actual compiled helper into a private source directory only for maintenance pin/hash admission and substituted-byte rejection; this copied path is never executed."),
+    ("crates/helper/src/user_control/tests/mod.rs", Kind::ExecBit, 6,
+        "Two registration fixtures each seal only owned root/users/caller directories to 0700/0755/0700. Positive and intentionally unsafe registration-file cases keep their own nonexecutable modes; no file execution."),
     ("crates/helper/src/pinned_core/tests/mod.rs", Kind::ExecBit, 1,
         "Private root/source directories for inert content status fixtures"),
     ("crates/helper/src/core_objects/tests/mod.rs", Kind::ExecBit, 1,
         "PayloadDir owner/permission rejection fixture; directory traversal only"),
-    ("crates/helper/src/platform/windows/helper/tests/mod.rs", Kind::ExecBit, 1,
-        "Private directory for held inert core/sidecar objects; no execution"),
+    ("crates/helper/src/platform/windows/helper/tests/mod.rs", Kind::ExecBit, 2,
+        "Own temporary root and payload subdirectory use 0700 on Unix; held inert core/sidecar fixture files use 0600 and are never executed."),
+    ("crates/helper/src/core_store/lock_diagnostics/tests/mod.rs", Kind::ExecBit, 1,
+        "Only the owned temporary CoreStore root uses 0700 for lock custody diagnostics; no executable file is created."),
     ("crates/helper/src/platform/macos/native_birth/tests/mod.rs", Kind::ExecBit, 1,
         "Private directory for a hashed inert content-id lease fixture"),
     ("crates/helper/src/core_store/tests/mod.rs", Kind::ExecBit, 1,
@@ -97,8 +105,8 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "crates/helper/src/platform/linux/handler/tests/mod.rs",
         Kind::ExecBit,
-        1,
-        "仅设置源目录的遍历权限",
+        2,
+        "Only the owned temporary root and its core subdirectory use 0700 for private traversal; auth and inert core/sidecar files use 0600, with no execution.",
     ),
     (
         "crates/core-supervisor/src/config_gate/check_custody/tests/mod.rs",
@@ -333,7 +341,8 @@ fn test_code_drops_executables_only_through_the_shared_helper() {
         problems.is_empty(),
         "测试代码里出现了绕过 `{HELPER}` 的可执行文件落盘写法。写出文件、加执行位、随即执行，\
          会在别的测试线程正好 fork 时撞上 Text file busy（偶发，单跑不现）。\n\
-         要执行的替身改走 `{HELPER}`；确实从不执行的，在本门的 REGISTERED 里登记数量与理由：\n  {}",
+         Unix 要执行的替身改走 `{HELPER}`；不执行的数据夹具或有据的 Windows-only 执行例外，\
+         在本门的 REGISTERED 里精确登记数量、平台范围与理由：\n  {}",
         problems.join("\n  ")
     );
 }
@@ -448,6 +457,28 @@ fn the_scan_surface_and_the_helper_are_what_the_gate_assumes() {
             );
         }
     }
+
+    // The new executing-copy exception is valid only on the actual Windows
+    // module chain. A future cfg widening cannot inherit this registration.
+    let lib = polaris_source_probe::repo_file!("crates/windows-cleaner/src/lib.rs");
+    let windows_only = |source: &str| {
+        let code = polaris_source_probe::mask_comments_and_strings(source);
+        code.split_whitespace()
+            .collect::<String>()
+            .contains("#[cfg(windows)]modwindows;")
+    };
+    assert!(windows_only(&lib));
+    assert!(!windows_only(
+        &lib.replace("#[cfg(windows)]\nmod windows;", "mod windows;")
+    ));
+    assert!(!windows_only(&lib.replace(
+        "#[cfg(windows)]\nmod windows;",
+        "#[cfg(any(windows, test))]\nmod windows;"
+    )));
+    let windows = polaris_source_probe::repo_file!("crates/windows-cleaner/src/windows.rs");
+    let code = polaris_source_probe::mask_comments_and_strings(&windows);
+    let compact: String = code.split_whitespace().collect();
+    assert!(compact.contains("pub(crate)modinstall;") && compact.contains("modsweep;"));
 }
 
 fn sample(source: &str) -> Vec<(String, String)> {

@@ -1,7 +1,7 @@
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 import { autoSelectTarget } from '@/domain/auto-select-target';
 import { MeasurementLabel } from '../MeasurementLabel';
-import { Fragment, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react';
+import { Fragment, useMemo, useState, type ReactElement, type ReactNode } from 'react';
 import type { SubscriptionConfig } from '@/contracts/types';
 import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
 import { revealSiblingGroup, useRevealAfterCommit } from '@/components/reveal';
@@ -21,10 +21,20 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
 }): ReactElement {
   const groups = useMemo(() => groupServersBySubscription(rows.map(row => row.server), [...subscriptions]), [rows, subscriptions]);
   const selectedId = rows.find(row => row.isCurrent)?.server.id;
-  const initialGroups = defaultOpenGroupIds(groups, selectedId);
-  const defaultKey = [...initialGroups].join('\u0000');
-  const [openGroups, setOpenGroups] = useState(() => initialGroups);
-  useEffect(() => { setOpenGroups(new Set(defaultKey ? defaultKey.split('\u0000') : [])); }, [defaultKey]);
+  const defaultOpen = defaultOpenGroupIds(groups, selectedId);
+  // The picker unmounts on close. Within this opening, publications must not
+  // overwrite user choices; only newly arriving groups receive a default.
+  const [openGroups, setOpenGroups] = useState<Map<string, boolean>>(
+    () => new Map(groups.map(group => [group.id, defaultOpen.has(group.id)])),
+  );
+  if (groups.some(group => !openGroups.has(group.id))) {
+    const next = new Map(openGroups);
+    for (const group of groups) {
+      if (!next.has(group.id)) next.set(group.id, defaultOpen.has(group.id));
+    }
+    // As in NodeMenu, reconcile before committing interactive children.
+    setOpenGroups(next);
+  }
   const byId = new Map(rows.map(row => [row.server.id, row]));
   const needle = query.trim().toLowerCase();
   const shown = groups.map(group => {
@@ -39,13 +49,13 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
   if (shown.length === 0) return <>{autoSelectControls}<p className="h-empty">{t('mobileHome.noMatchingNode')}</p></>;
   return <>{autoSelectControls}<ul className="h-picklist">
     {shown.map(group => {
-      const open = !!needle || openGroups.has(group.id);
+      const open = !!needle || !!openGroups.get(group.id);
       const label = group.isManual ? t('nodes.tab.manual') : group.isMesh ? t('nodes.tab.mesh') : group.name;
       return <Fragment key={group.id}>
         <li className="h-pick-group-marker"><button type="button" className="h-pick-group" data-group-id={group.id} aria-expanded={open} disabled={!!needle}
           onClick={event => {
             const header = event.currentTarget.parentElement!;
-            setOpenGroups(previous => { const next = new Set(previous); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; });
+            setOpenGroups(previous => { const next = new Map(previous); next.set(group.id, !previous.get(group.id)); return next; });
             scheduleReveal(open ? null : () => revealSiblingGroup(header));
           }}>
           <svg className={`h-pick-group-chevron${open ? ' open' : ''}`} viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden><path d="m9 6 6 6-6 6" /></svg>

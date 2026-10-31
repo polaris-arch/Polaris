@@ -137,7 +137,7 @@ export function useAppUpdate(includePrerelease: boolean) {
     }
   }
 
-  /** 显式重新下载当前通道的当前版本；若实际已有新版，只展示新版，不替用户自动下载另一个目标。 */
+  /** 显式重新下载当前通道中的已安装版本；独立于普通新版检查，只下载后端确认的当前版本目标。 */
   async function reinstallCurrent() {
     setUs('checking');
     setDownloadIntegrity('unknown');

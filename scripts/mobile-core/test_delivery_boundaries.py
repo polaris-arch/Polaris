@@ -1,5 +1,4 @@
 """Local regression fixtures; no Cargo, Xcode, VM/App or remote operations."""
-import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -11,8 +10,6 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 import fork_input
 import consume
 import apple_rust
-spec=importlib.util.spec_from_file_location('scenario',Path(__file__).resolve().parents[1]/'vm-acceptance/scenario.py')
-scenario=importlib.util.module_from_spec(spec);spec.loader.exec_module(scenario)
 class Boundaries(unittest.TestCase):
  def test_git_overrides_cannot_mask_actual_dirty_root(self):
   with tempfile.TemporaryDirectory() as tmp:
@@ -41,16 +38,4 @@ class Boundaries(unittest.TestCase):
    with patch.object(apple_rust.os,'open',side_effect=race):
     with self.assertRaises(FileExistsError):apple_rust.copy_exclusive_stage(source,stage)
    self.assertEqual(target.read_bytes(),b'keep');stage.unlink();apple_rust.copy_exclusive_stage(source,stage);self.assertEqual(stage.read_bytes(),source.read_bytes())
- def test_vm_finite_names_fresh_runs_and_no_old_evidence_deletion(self):
-  with tempfile.TemporaryDirectory() as tmp:
-   root=Path(tmp)/'evidence'
-   for name in ['../other','.','..','/tmp/out','plain-broken/child','unknown']:
-    with self.assertRaises(ValueError):scenario.prepare_output(name,root)
-    self.assertFalse(root.exists())
-   first=Path(scenario.prepare_output('plain-broken',root));(first/'keep').write_text('old evidence')
-   second=Path(scenario.prepare_output('plain-broken',root));self.assertNotEqual(first,second);self.assertEqual(first.name,'plain-broken');self.assertTrue((first/'keep').exists())
-   redirected=Path(tmp)/'link';redirected.symlink_to(root)
-   with self.assertRaises(ValueError):scenario.prepare_output('plain-broken',redirected)
-   root.chmod(0o777)
-   with self.assertRaises(ValueError):scenario.prepare_output('plain-broken',root)
 if __name__=='__main__':unittest.main()

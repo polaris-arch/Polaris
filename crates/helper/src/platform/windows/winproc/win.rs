@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
@@ -54,15 +54,9 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 struct RetainedParent {
@@ -139,15 +133,12 @@ struct ManagedChild {
     term_requested: bool,
     kill_requested: bool,
     log_custody: Option<polaris_log_budget::PipeLogCustody>,
+    _execution_custody: polaris_core_supervisor::admitted_payload::WindowsChildCustody,
 }
 
 /// Windows FFI 生产实现（对应 Go `winproc.go` 全部原语）。
 #[derive(Debug)]
 pub struct WinProcOps {
-    /// 常驻 Job Object 句柄（`winproc.go:71` `hJob`）。
-    /// 惰性创建（ensure_job），所有 child assign 进去 → helper 死则内核连坐杀 child。
-    /// Mutex 保证 ensure_job 的「已建则直接返回」幂等性（`winproc.go:75-78`）。
-    job: std::sync::Mutex<Option<HANDLE>>,
     /// 当前受管核的进程句柄 + 身份（D2/D3，见 [`ManagedChild`]）。收割时取出并关闭。
     managed: std::sync::Mutex<Option<ManagedChild>>,
 }
@@ -155,7 +146,6 @@ pub struct WinProcOps {
 impl Default for WinProcOps {
     fn default() -> Self {
         Self {
-            job: std::sync::Mutex::new(None),
             managed: std::sync::Mutex::new(None),
         }
     }
@@ -164,27 +154,9 @@ impl Default for WinProcOps {
 impl WinProcOps {
     #[must_use]
     pub fn new() -> Self {
-        let ops = Self::default();
-        // Job Object 与核心内容无关，helper 服务启动时即可准备。start 路径仍会调用 ensure_job，
-        // 因而此处瞬时失败不会丢掉后续重试机会；正常冷启则不再让用户请求承担创建成本。
-        let _ = ops.ensure_job();
-        ops
+        Self::default()
     }
 }
-
-// SAFETY: WinProcOps 的两把句柄（job 的裸 HANDLE、受管核的 OwnedHandle）都是内核对象句柄，
-// 跨线程共享安全（Windows 句柄本身线程无关）。各自的 Mutex 串行化访问，满足 Send + Sync。
-// 手写 impl 只为裸 HANDLE 那把（`*mut c_void` 非 Send/Sync）；OwnedHandle 本就是 Send + Sync。
-#[allow(
-    unsafe_code,
-    reason = "the mutexes serialize access to the thread-independent job and child HANDLEs"
-)]
-unsafe impl Send for WinProcOps {}
-#[allow(
-    unsafe_code,
-    reason = "the mutexes serialize access to the thread-independent job and child HANDLEs"
-)]
-unsafe impl Sync for WinProcOps {}
 
 /// Lifetime ends only after CreateProcess has inherited the exact file and
 /// opened original CWD. Prefix handles deny rename while resolving descendants.
@@ -388,6 +360,12 @@ impl WinProcOps {
         birth: HelperBirthToken,
         config: ConfinedConfig,
     ) -> std::io::Result<CoreStart> {
+        use polaris_core_supervisor::admitted_payload::{
+            admit_selected, ExecPurpose, UntrustedPayload,
+        };
+        let execution =
+            admit_selected(UntrustedPayload::bundled(singbox_bin), ExecPurpose::RunMain)?
+                .prepare(ExecPurpose::RunMain)?;
         let mut custody = self
             .managed
             .lock()
@@ -397,40 +375,14 @@ impl WinProcOps {
                 "previous managed HANDLE custody still retained",
             ));
         }
-        // SCM inherits machine-owned environment. Pass only the system roots
-        // and trusted executable directories; never inherit DLL/path overrides.
-        let system_root = std::env::var_os("SystemRoot")
-            .ok_or_else(|| std::io::Error::other("native SystemRoot unavailable"))?;
-        let system_root = std::path::PathBuf::from(system_root);
-        if !system_root.is_absolute() {
-            return Err(std::io::Error::other("invalid native SystemRoot"));
-        }
-        let core_directory = std::path::Path::new(singbox_bin)
-            .parent()
-            .ok_or_else(|| std::io::Error::other("missing core directory"))?;
-        let path =
-            std::env::join_paths([core_directory.to_path_buf(), system_root.join("System32")])
-                .map_err(std::io::Error::other)?;
         let total_started = Instant::now();
         // Compatibility timing field: LAN listening does not manage the host router.
         let forwarding_ms = 0;
-        // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
-        // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
-        let mut cmd = std::process::Command::new(singbox_bin);
-        cmd.env_clear()
-            .env("SystemRoot", &system_root)
-            .env("PATH", path);
         // The pinned fork already supports -c stdin. Pass the verified file
         // object itself: child never reopens a mutable privileged path. Original
         // App config can still be atomically replaced for a future Start.
         // Bytes remain same-account mutable; this is not a frozen snapshot.
         let ConfinedConfig { file, _directories } = config;
-        cmd.args(["run", "-c", "stdin"])
-            .stdin(std::process::Stdio::from(file));
-        if !log_path.is_empty() {
-            cmd.stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-        }
         // SYSTEM helper 必须在 spawn 前固定日志对象。每级目录 handle 都拒绝 reparse 且不共享
         // DELETE，直到 current/.1 两个 file object 都打开；之后轮转只操作这两个 handle。
         // 安全打开失败只关闭日志能力，pipe 仍会被排空，不阻断核心启动。
@@ -445,33 +397,19 @@ impl WinProcOps {
                 }
             }
         };
-        // CWD = 配置文件所在目录（= 用户可写 config 目录）。**不设的后果不是噪音，是写错地方**：
-        // helper 是 SCM 服务，进程 CWD 恒为 `C:\Windows\System32`，child 不设就继承它，而 sing-box
-        // 对配置里的**相对**路径按 CWD 解析。1.14.0-beta.15 起 tailscale endpoint 的
-        // `taildrop_directory` 默认值就是相对的 `Taildrop`，且在 initialize 阶段无条件 `MkdirAll(0700)`
-        // ⇒ 目录建在 System32 里，tailnet peer 发来的文件也落在那；helper 跑在 SYSTEM 下，这个 mkdir
-        // 还会**成功**，于是没有任何报错。另一条更老的同型：`services[].dashboard` 省略 `path` 时的
-        // 联网下载兜底目录 `dashboard`。
-        //
-        // App 直起（`runtime/proxy.rs`）、Linux helper（`platform/linux/server.rs`）、macOS helper
-        // （`platform/macos/server.rs`）三条腿早就设了，本腿是漏的那条 —— 同一根因下做对的三条腿，
-        // 正是「这不是有意取舍」的证据。取父目录的方式与 Linux 腿同（配置文件的所在目录），只是不能用
-        // `std::path`（见 `logic::filepath_dir`）。取不到父目录（裸文件名）→ 不设，保持旧行为。
-        if let Some(cwd) = filepath_dir(cfg) {
-            cmd.current_dir(cwd);
-        }
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        // Preserve the registered configuration CWD for relative data paths;
+        // native loader selection and the cleared environment are factory-owned.
+        let cwd =
+            filepath_dir(cfg).ok_or_else(|| std::io::Error::other("configuration CWD required"))?;
         let process_started = Instant::now();
-        let mut child = cmd.spawn()?;
+        // The factory fixes the admitted image, argv, cleared environment,
+        // physical guards and fail-stop job before the first instruction.
+        let child = execution.spawn_windows_main(file, Path::new(&cwd))?;
         let process_ms = crate::elapsed_ms(process_started);
-        let pid = child.id();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        // D2/D3：**不再 drop child**。把 std 的 Child 拆成裸句柄自行持有 —— drop 会关闭父侧进程
-        // 句柄，而句柄一关，核退出后这个 PID 立刻可被系统复用（见 `ManagedChild` 文档）。
-        // SAFETY: `into_raw_handle` 转移所有权且不关闭句柄；此处立刻用 OwnedHandle 接管，
-        // 关闭时机唯一（收割后 drop）。stdout/stderr 已在上面取走，不受影响。
-        let handle = unsafe { OwnedHandle::from_raw_handle(child.into_raw_handle()) };
+        let (pid, handle, stdout, stderr, execution_custody) = child.into_parts();
+        let stdout = Some(stdout);
+        let stderr = Some(stderr);
+        // Keep the original native process HANDLE and its factory custody together.
         // 身份从**这个句柄**读一次并缓存：句柄在手 ⇒ 读到的必是刚起的这个进程；
         // 之后 status 每次直接回缓存值，既不重复 FFI，也不会在核退出后读到复用者的数据。
         let identity = ManagedIdentity {
@@ -488,13 +426,10 @@ impl WinProcOps {
             term_requested: false,
             kill_requested: false,
             log_custody: None,
+            _execution_custody: execution_custody,
         });
-        // ensureJob + assignToJob（winproc.go:40-47）：best-effort 防孤儿安全网。失败不阻断 start。
-        let job_started = Instant::now();
-        if let Some(h_job) = self.ensure_job() {
-            self.assign_to_job(h_job, pid);
-        }
-        let job_ms = crate::elapsed_ms(job_started);
+        // Native job membership was mandatory and atomic inside the factory.
+        let job_ms = 0;
 
         // Initialize this birth's Fresh log session before releasing admission. Keep
         // its revocation capability beside the HANDLE so no delayed writer can affect
@@ -526,61 +461,6 @@ impl WinProcOps {
                 total_ms: crate::elapsed_ms(total_started),
             },
         })
-    }
-
-    /// ensureJob（`winproc.go:75-96`）：惰性创建常驻 job 并设 KILL_ON_JOB_CLOSE。幂等。
-    fn ensure_job(&self) -> Option<HANDLE> {
-        let mut guard = self
-            .job
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(h) = *guard {
-            return Some(h);
-        }
-        // SAFETY: CreateJobObjectW(NULL, NULL) 创建匿名 job（无名、默认安全描述符），线程安全。
-        // 失败返回 NULL。句柄由本结构持有到进程退出（内核自动关闭 → KILL_ON_JOB_CLOSE 生效）。
-        let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if h.is_null() {
-            return None;
-        }
-        // SAFETY: SetInformationJobObject 设置 extended limit。info 在本栈帧存活期间调用有效。
-        // JOBOBJECT_EXTENDED_LIMIT_INFORMATION 按 Win32 布局（#[repr(C)] 由 windows-sys 保证）。
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: 同上。失败 → 关句柄返 None（不泄漏）。
-        let ok = unsafe {
-            SetInformationJobObject(
-                h,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if ok == 0 {
-            // SAFETY: 关闭未成功的 job 句柄，避免泄漏。
-            unsafe { CloseHandle(h) };
-            return None;
-        }
-        *guard = Some(h);
-        Some(h)
-    }
-
-    /// assignToJob（`winproc.go:105-115`）：把 child pid assign 进常驻 job。best-effort。
-    fn assign_to_job(&self, h_job: HANDLE, pid: u32) {
-        if h_job.is_null() || pid == 0 {
-            return;
-        }
-        // SAFETY: OpenProcess 取 child 句柄。PID 复用安全：调用点在 Start 成功后立即执行，
-        // child 必活、pid 必指向本 child（Go winproc.go:102-103 同款论证）。失败返 NULL，无害。
-        let h = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, pid) };
-        if h.is_null() {
-            return;
-        }
-        // SAFETY: AssignProcessToJobObject 把 h 进程 assign 进 h_job。best-effort：失败无害。随后关句柄。
-        unsafe {
-            let _ = AssignProcessToJobObject(h_job, h);
-            CloseHandle(h);
-        }
     }
 
     /// 取出（并从槽里摘除）`pid` 的受管句柄；`pid` 不是手里那个 → `None`，不动槽。
@@ -1600,7 +1480,7 @@ fn read_ace(path: &str, dacl: *mut ACL, index: u32) -> coreacl::Ace {
     unsafe_code,
     reason = "converts one borrowed SID and frees the string it allocates"
 )]
-fn sid_to_string(psid: PSID) -> Option<String> {
+pub(crate) fn sid_to_string(psid: PSID) -> Option<String> {
     let mut out: *mut u16 = std::ptr::null_mut();
     // SAFETY: psid 指向调用方持有的有效 SID（sd 内部）。成功时 out 取得 LocalAlloc 所有权。
     let ok = unsafe { ConvertSidToStringSidW(psid, &mut out) };

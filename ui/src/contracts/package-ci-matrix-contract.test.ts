@@ -630,7 +630,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // 判据挂在第一次 release mutation 上（桌面草稿 job）；门未过时连草稿都不写。
     // 2026-10-07：needs 多了 core_wire —— wire 契约从打包腿内的一步变成并行 job，
     // 「契约不成立就没有安装包」变成「契约不成立就写不进草稿」，判据必须在这里接回（见下）。
-    expect(release).toContain("needs: [setup, ci, ui, package, core_wire, linux_package_acceptance, linux_tun_package_acceptance]");
+    expect(release).toContain("needs: [setup, ci, ui, package, core_wire]");
     expect(release).toContain(
       "needs.ci.result == 'success' || needs.ci.result == 'skipped'",
     );
@@ -675,19 +675,19 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // 完整真值表（含取消态）在 scripts/desktop-core-ci-wiring.test.mjs 里按表达式求值。
     for (const [name, block] of [['package', pkgJob], ['core_wire', executable(jobBlock(pkg, 'core_wire'))]] as const) {
       const condition = foldedJobIf(block, name);
-      const prefix = 'inputs.linux_auth_preflight_only != true && (';
-      expect(condition.startsWith(prefix) && condition.endsWith(')'), `${name} 必须先排除只读预检`).toBe(true);
+      const prefix = '(';
+      expect(condition.startsWith(prefix) && condition.endsWith(')'), `${name} 保留正常取消与来源绑定条件`).toBe(true);
       const ordinary = condition.slice(prefix.length, -1);
       expect(ordinary).toBe("!cancelled() && needs.setup.result == 'success' && (needs.desktop_core.result == 'success' || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))");
       expect(condition, `${name} 的 if 里出现了 always() —— 它对取消免疫`).not.toContain('always()');
-      for (const preflight of [false, '', true]) for (const cancelled of [false, true]) {
+      for (const cancelled of [false, true]) {
         for (const setup of ['success', 'failure', 'cancelled', 'skipped']) {
           for (const core of ['success', 'failure', 'cancelled', 'skipped']) for (const artifact of ['', 'bound-artifact']) {
-            const context = { inputs: { linux_auth_preflight_only: preflight, core_bundle_artifact: artifact },
+            const context = { inputs: { core_bundle_artifact: artifact },
               needs: { setup: { result: setup }, desktop_core: { result: core } }, cancelled: () => cancelled };
-            const expected = preflight !== true && !cancelled && setup === 'success' &&
+            const expected = !cancelled && setup === 'success' &&
               (core === 'success' || (core === 'skipped' && artifact !== ''));
-            expect(runInNewContext(condition, context), `${name}: ${JSON.stringify({ preflight, cancelled, setup, core, artifact })}`).toBe(expected);
+            expect(runInNewContext(condition, context), `${name}: ${JSON.stringify({ cancelled, setup, core, artifact })}`).toBe(expected);
           }
         }
       }
@@ -821,7 +821,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
     expect(android).toContain('secrets: inherit');
 
-    expect(release).toContain('needs: [release_desktop, android_release, linux_package_acceptance, linux_tun_package_acceptance]');
+    expect(release).toContain('needs: [release_desktop, android_release]');
     expect(release).toContain("needs.release_desktop.result == 'success'");
     expect(release).toContain("needs.android_release.result == 'success'");
     expect(release).not.toContain("needs.android_release.result != 'failure'");
@@ -1200,7 +1200,7 @@ print(json.dumps({'valid':bare and not replacement and bound,
       android.slice(android.indexOf("          row=''"), android.indexOf('          done < <')),
       desktop.slice(desktop.indexOf('          raw_all=')),
       combined.slice(combined.indexOf('          raw="$(mktemp)"')),
-      promote.slice(promote.indexOf('          raw="$(mktemp)"'), promote.indexOf('          node scripts/package-acceptance/transport.mjs release-check')),
+      promote.slice(promote.indexOf('          raw="$(mktemp)"'), promote.indexOf('          gh release edit')),
     ] as const;
     const guard = guards[index];
     const sha = 'a'.repeat(64);

@@ -48,7 +48,8 @@ mod lan_gateway;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
-mod runtime_config;
+pub(crate) use management_api::ApiReadbackBinding;
+pub(crate) mod runtime_config;
 // S4 journal, artifact, and guarded CAS contract. The managed coordinator is
 // deliberately not wired until core ownership and platform receipts exist.
 pub(crate) mod coex_observer;
@@ -81,8 +82,8 @@ mod tunnel_conflict;
 mod unlock_refresh;
 
 pub(crate) use core_binary::{
-    bundle_resource_candidates, dev_manifest_dir, first_existing_bundle_candidate,
-    resolve_core_binary,
+    bundle_resource_candidates, bundle_resource_roots, dev_manifest_dir,
+    first_existing_bundle_candidate, resolve_core_binary, resolve_core_candidate,
 };
 // B9 跟随面：`resolve_dashboard_serve_dir` 的**唯一**消费者是 `start_inner`，本批随它进
 // `startup.rs`（改走 `super::core_binary::` 直取）⇒ façade 侧再导出零命中。§B.3 把它列进「必须
@@ -428,6 +429,10 @@ pub mod code {
     pub const HELPER_CORE_MISMATCH: &str = "HELPER_CORE_MISMATCH";
     /// Another content id/user or pending native custody occupies the helper.
     pub const HELPER_CORE_OCCUPIED: &str = "HELPER_CORE_OCCUPIED";
+    /// This runtime retains its Helper backend fence after an exact local Stop.
+    /// Only a request switching to direct execution needs a normal App restart;
+    /// another Helper birth still follows the existing Helper admission rules.
+    pub const HELPER_RUNTIME_RESTART_REQUIRED: &str = "HELPER_RUNTIME_RESTART_REQUIRED";
     /// The package payload does not match its compiled content identity.
     pub const LAN_GATEWAY_FORWARDING_REQUIRED: &str = "LAN_GATEWAY_FORWARDING_REQUIRED";
     pub const LAN_GATEWAY_FORWARDING_UNCONFIRMED: &str = "LAN_GATEWAY_FORWARDING_UNCONFIRMED";
@@ -615,6 +620,15 @@ impl StartError {
         let mut error = Self::coded(
             "direct Child slot is occupied; the previous core still owns custody",
             code::STARTUP_FAILED,
+        );
+        error.admission_denied = true;
+        error
+    }
+
+    fn helper_runtime_restart_required() -> Self {
+        let mut error = Self::coded(
+            "Helper 本次内核已停止；当前运行时保留后端隔离，请正常重启应用后使用本地模式",
+            code::HELPER_RUNTIME_RESTART_REQUIRED,
         );
         error.admission_denied = true;
         error
@@ -1594,19 +1608,9 @@ pub struct ProxyRuntime {
     rule_content_publication: Mutex<Option<startup::RuleContentPublication>>,
     #[cfg(test)]
     rule_content_api_stub: Mutex<Option<Arc<dyn startup::RuleContentApi>>>,
-    /// **A-0b：运行期观测到的 tailnet 地址**（`serverId` → 裸地址，不带掩码）。
-    ///
-    /// 唯一写入点是 `tailnet_rules` 域的两条腿：STATUS 帧（
-    /// [`sync_tailnet_rule_files`](Self::sync_tailnet_rule_files)）与起核前从盘上读回
-    /// （[`write_tailnet_rule_files`](Self::write_tailnet_rule_files)）；唯一读出点是
-    /// [`observed_tailnet_snapshot`](Self::observed_tailnet_snapshot) → `generate_deps` 的
-    /// `GenerateConfigDeps::observed_tailnet_addresses`。
-    ///
-    /// **停核不清**（与 `mesh.ts_status` 末帧缓存**刻意相反**）：那份缓存是「核此刻报的状态」，
-    /// 核没跑就该诚实空；这份是「这个 tailnet 用的是哪些地址」，核停了它也没变。清掉的代价是
-    /// 下次起核的 TUN 排除面（`builder::inbounds` 的 `engaged_mesh` 只吃这个 map，不读文件）
-    /// 看不见观测地址 —— 那正是 2026-09-11 那次事故里用户的原始症状。
-    observed_tailnet: RwLock<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Active emitted TS writer authority is separate from weak/retained planning hosts.
+    /// Stop revokes writing without dropping compatible next-start/TUN history.
+    tailnet_routes: Mutex<tailnet_rules::TailnetRouteState>,
     /// 只读路由审计：仅存本轮实际生成的 CIDR/文件基线，不存凭据或整份 sing-box config。
     mesh_route_run: RwLock<Option<MeshRouteRunEvidence>>,
     /// 本进程 tailnet 文件成功写入/失败尝试的单调代；变更后不再宣称 startupReady。
@@ -1726,6 +1730,9 @@ pub struct ProxyRuntime {
     /// 耦合做成 flaky 源。故改用 per-runtime 覆盖 —— 作用域随实例，绝不外溢到别的测试。
     #[cfg(test)]
     core_binary_override: Mutex<Option<PathBuf>>,
+    /// Per-instance business verdict only; no execution credential or native checker.
+    #[cfg(test)]
+    business_kernel_check_fixture: Mutex<Option<tests::BusinessKernelCheckFixture>>,
     /// Explicit metadata-only admission fixture. Native checks always use shared custody.
     #[cfg(test)]
     metadata_validation_admission:
@@ -1870,7 +1877,7 @@ impl ProxyRuntime {
             rule_content_publication: Mutex::new(None),
             #[cfg(test)]
             rule_content_api_stub: Mutex::new(None),
-            observed_tailnet: RwLock::new(std::collections::BTreeMap::new()),
+            tailnet_routes: Mutex::new(tailnet_rules::TailnetRouteState::default()),
             mesh_route_run: RwLock::new(None),
             tailnet_file_write_epoch: AtomicU64::new(0),
             network_epoch: AtomicU64::new(0),
@@ -1907,6 +1914,8 @@ impl ProxyRuntime {
             core_binary_resolution_calls: AtomicU32::new(0),
             #[cfg(test)]
             core_binary_override: Mutex::new(None),
+            #[cfg(test)]
+            business_kernel_check_fixture: Mutex::new(None),
             #[cfg(test)]
             metadata_validation_admission: Mutex::new(None),
             #[cfg(test)]
@@ -2037,14 +2046,11 @@ impl ProxyRuntime {
                         .direct_tls_snapshot(self.core_generation())
                         .binary_sha256;
                 }
-                #[cfg(target_os = "linux")]
-                {
-                    let image = std::path::PathBuf::from(format!("/proc/{}/exe", status.pid));
-                    let cached = crate::runtime::tls_fingerprints::cached_cli(&image)?;
-                    return cached.snapshot.binary_sha256;
-                }
-                #[cfg(not(target_os = "linux"))]
-                return None; // A helper-reported pathname alone cannot identify loaded bytes.
+                let captured = self.captured_core_sha256.lock().ok()?;
+                return captured
+                    .as_ref()
+                    .filter(|(generation, _)| *generation == self.core_generation())
+                    .map(|(_, digest)| digest.clone());
             }
             let observed = self.captured_temp_cli_source.lock().ok()?;
             let (source, cli) = observed.as_ref()?;
@@ -2196,12 +2202,18 @@ impl ProxyRuntime {
         k: usize,
         member_tag: &str,
     ) -> bool {
+        use crate::runtime::management_api::GrpcManagementApi;
         prerequisite::select_ticket_probe(
             ticket,
             k,
             member_tag,
             || self.check_ready_main(ticket).is_ok(),
-            Self::management_api_at,
+            |port, _secret| async move {
+                match self.current_management_client(port).await {
+                    Ok(client) => GrpcManagementApi::new(client),
+                    Err(_) => GrpcManagementApi::not_ready(),
+                }
+            },
         )
         .await
     }

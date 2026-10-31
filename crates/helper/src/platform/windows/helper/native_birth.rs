@@ -213,7 +213,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                     });
                 }
             };
-            if state.closing {
+            if state.shutting_down || state.closing {
                 return start_response(NativeBirthStart::NotAdmittedUnknown {
                     target: state.native.as_ref().map(|c| c.target),
                 });

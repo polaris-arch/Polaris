@@ -11,8 +11,9 @@ import { canonical, digest, requireGraph as demand } from './source-graph.mjs';
 import { hasDesktopRelease, loadReleaseContract, portableCanonical, regularPath, RELEASE_TARGETS,
   verifyPackagedRelease } from './release-consumer.mjs';
 import { releaseGateContext } from './release-native-gates.mjs';
+import { RECOVERY_RESOURCE } from './recovery.mjs';
 
-const DIRECTORIES = ['.release-receipts', ...Object.keys(RELEASE_TARGETS)].sort();
+const DIRECTORIES = ['.release-receipts', RECOVERY_RESOURCE, ...Object.keys(RELEASE_TARGETS)].sort();
 const HANDOFF_ROOT = 'core-wire-inputs';
 const same = (a, b, message) => demand(canonical(a) === canonical(b), message);
 const present = (path) => { try { lstatSync(path); return true; } catch (e) { if (e.code === 'ENOENT') return false; throw e; } };
@@ -69,6 +70,9 @@ function inventory(resources, host = process.platform, declared = [], strict = t
   regularPath(resources, true);
   if (strict) same(readdirSync(resources).sort(), DIRECTORIES, 'Wire handoff directory inventory differs');
   else demand(DIRECTORIES.every((name) => present(join(resources, name))), 'Missing wire inputs');
+  regularPath(join(resources, RECOVERY_RESOURCE), true);
+  same(readdirSync(join(resources, RECOVERY_RESOURCE)).sort(), Object.keys(RELEASE_TARGETS).sort(),
+    'Wire recovery platform inventory differs');
   const files = [];
   function walk(path, relative) {
     const st = lstatSync(path); demand(!st.isSymbolicLink(), 'Linked wire handoff input');
@@ -172,7 +176,7 @@ export function createCoreWireHandoff(root, manifest, bundle, candidate, options
   const contract = loadReleaseContract(root, manifest); verify(root, manifest, run, options.host ?? process.platform);
   demand(!present(bundle), 'Wire handoff output already exists'); regularPath(dirname(bundle), true);
   const source = join(root, 'resources'), scratch = join(bundle, 'resources');
-  // Only the five checked resource directories are transferred, never other
+  // Only the six checked resource directories are transferred, never other
   // tracked assets or a previous-attempt carrier/approval record.
   const stage = join(bundle, 'resources'); mkdirSync(bundle, { mode: 0o700 }); mkdirSync(stage, { mode: 0o700 });
   try {
@@ -254,7 +258,10 @@ export function packCoreWireHandoff(bundle, destination) {
   mkdirSync(destination, { mode: 0o700 });
   try {
     const name = 'core-wire-inputs.tar.gz', path = join(destination, name);
-    execFileSync('tar', ['-czf', path, '-C', dirname(bundle), HANDOFF_ROOT]);
+    // BSD tar otherwise injects AppleDouble metadata outside the pinned member
+    // set. Transport only the checked bytes/modes; never relax strict extraction.
+    execFileSync('tar', ['-czf', path, '-C', dirname(bundle), HANDOFF_ROOT],
+      { env: { ...process.env, COPYFILE_DISABLE: '1' } });
     const raw = readFileSync(path);
     demand(raw.length > 0 && raw.length <= 512 * 1024 * 1024, 'Wire archive size limit');
     const pin = { root: HANDOFF_ROOT, archive: { name, bytes: raw.length, sha256: digest(raw), members, memberModes } };

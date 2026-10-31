@@ -24,6 +24,7 @@ await i18nReady;
  i18n.addResourceBundle('zh-CN','translation',zhCN,true,true);
 await i18n.changeLanguage('zh-CN');
 const node={id:'ts-1',name:'Synthetic TS',protocol:'tailscale',address:'',port:0,tailscaleSettings:{hostname:'synthetic'}};
+const other={...node,id:'other',name:'Synthetic Other',tailscaleSettings:{hostname:'synthetic-other'}};
 const mode=new URLSearchParams(location.search).get('mode');
 let state=mode!=='custom';
 const control=window.__tsLogoutTest={
@@ -33,6 +34,7 @@ const control=window.__tsLogoutTest={
   openSettings:()=>useMobileFormStore.getState().open({kind:'ts-settings',serverId:'ts-1'}),
   state:()=>state,
   selected:()=>useAppStore.getState().selectedServerId,
+  selection:()=>{const state=useAppStore.getState();return {selected:state.selectedServerId,persisted:state.config.selectedServerId,ids:state.config.servers.map(server=>server.id)};},
   started:[],
   logouts:0,
   authorize:()=>{
@@ -50,14 +52,20 @@ api.server.tailscaleGetStatus=async()=>{
   return {connected:true,statuses:[],mainCoreHold};
 };
 api.server.tailscaleStateExists=async()=>({'ts-1':state});
-api.server.tailscaleLogout=async()=>{control.logouts++;if(!['success','held','unknown','other','stale','legacy','starting','restarted'].includes(mode))throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
-api.server.tailscaleLoginPrepare=async()=>{};
+api.server.tailscaleLogout=async(serverId)=>{if(serverId!==node.id)throw Error('unexpected fixture logout target');control.logouts++;if(!['success','held','unknown','other','stale','legacy','starting','restarted'].includes(mode))throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
+api.server.tailscaleLoginPrepare=async(serverId)=>{if(serverId!==node.id)throw Error('unexpected fixture prepare target');};
 api.server.tailscaleLoginProgress=async()=>null;
 api.server.tailscaleLoginCancel=async()=>{};
-api.server.tailscaleLogin=async(server)=>{control.started.push(server);return {started:true};};
-api.server.update=async(server)=>{useAppStore.setState({servers:[server],config:{servers:[server],subscriptions:[]}});};
+api.server.tailscaleLogin=async(server)=>{if(server.id!==node.id)throw Error('unexpected fixture login target');control.started.push(server);return {started:true};};
+api.server.update=async(server)=>{
+  if(server.id!==node.id)throw Error('unexpected fixture update target');
+  const config=useAppStore.getState().config;
+  // Publish the complete authoritative config, retaining the unrelated selection.
+  useAppStore.setState({config:{...config,servers:config.servers.map(current=>current.id===server.id?server:current)}});
+};
 api.proxy.getStatus=async()=>mode==='restarted'?{running:false,starting:false,mainGeneration:8}:({running:true,starting:mode==='starting',pid:321,startTime:1,mainGeneration:7});
-useAppStore.setState({servers:[node],config:{servers:[node],subscriptions:[]},selectedServerId:mode==='success'||mode==='custom'||mode==='held'||mode==='unknown'?'other':'ts-1',loadConfig:async()=>{}});
+const selectedServerId=mode==='success'||mode==='custom'||mode==='held'||mode==='unknown'?'other':'ts-1';
+useAppStore.setState({config:{servers:[node,other],subscriptions:[],selectedServerId},loadConfig:async()=>{}});
 useMobileFormStore.getState().open({kind:'ts-settings',serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><MobileFormHost/></main>);
 `;
@@ -172,6 +180,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('TS logout second conf
     try {
       await page.goto(origin + '/__ts-logout?mode=success');
       const settings = page.getByRole('dialog', { name: 'Tailscale 设置' });
+      await settings.waitFor();
+      expect(await page.evaluate(() => (window as any).__tsLogoutTest.selection()))
+        .toEqual({ selected: 'other', persisted: 'other', ids: ['ts-1', 'other'] });
       await settings.getByRole('button', { name: '退出登录' }).click();
       await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
       // No running proxy holds the node: one confirmation, one backend call, no second notice.
@@ -184,6 +195,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('TS logout second conf
       const login = page.getByRole('dialog', { name: '连接 Tailscale' });
       await login.getByRole('button', { name: '打开登录页' }).click();
       await page.waitForFunction(() => (window as any).__tsLogoutTest.started.length === 1);
+      expect(await page.evaluate(() => (window as any).__tsLogoutTest.started.map((server: { id: string }) => server.id)))
+        .toEqual(['ts-1']);
       expect(await page.evaluate(() => ({ selected: (window as any).__tsLogoutTest.selected(),
         control: (window as any).__tsLogoutTest.started[0].tailscaleSettings.controlUrl })))
         .toEqual({ selected: 'other', control: undefined });
@@ -199,11 +212,16 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('TS logout second conf
     try {
       await page.goto(origin + '/__ts-logout?mode=custom');
       const settings = page.getByRole('dialog', { name: 'Tailscale 设置' });
+      await settings.waitFor();
+      expect(await page.evaluate(() => (window as any).__tsLogoutTest.selection()))
+        .toEqual({ selected: 'other', persisted: 'other', ids: ['ts-1', 'other'] });
       await settings.getByRole('button', { name: '登录', exact: true }).click();
       const login = page.getByRole('dialog', { name: '连接 Tailscale' });
       await login.getByRole('textbox', { name: '控制服务器 URL' }).fill('https://headscale.example');
       await login.getByRole('button', { name: '打开登录页' }).click();
       await page.waitForFunction(() => (window as any).__tsLogoutTest.started.length === 1);
+      expect(await page.evaluate(() => (window as any).__tsLogoutTest.started.map((server: { id: string }) => server.id)))
+        .toEqual(['ts-1']);
       expect(await page.evaluate(() => (window as any).__tsLogoutTest.started[0].tailscaleSettings.controlUrl))
         .toBe('https://headscale.example');
       expect(await page.evaluate(() => (window as any).__tsLogoutTest.selected())).toBe('other');

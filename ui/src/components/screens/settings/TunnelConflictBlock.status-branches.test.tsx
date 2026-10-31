@@ -29,6 +29,8 @@
  * 换成 `report.conflicts?.length === 0 ? … : 列表`（不带 `??`）：三态落进「列表」分支 ⇒
  * 各自那句解释消失 ⇒ 正面断言转红。两种写法都红，正是这门要的。
  */
+// Register the oracle's actual-close/join hook while Vitest collects this file.
+import { cssChain, measure } from '@/styles/css-oracle.test-support';
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -190,6 +192,27 @@ describe('判据 3 —— 未探测 ≠ 无冲突（逐态断言，中英双语�
 });
 
 describe('守卫自检：四态真的走的是四条不同的分支', () => {
+  it('macOS keeps unavailable, unprobed, unsupported, failed and conflicting results visible without opening help', async () => {
+    const css = (await cssChain('desktop')).map(item => item.css);
+    const reports = [null, NOT_PROBED, UNSUPPORTED, PROBE_FAILED, PROBED_CONFLICT];
+    const status = '[data-tun-status] .set-block > :is(.card-sub, .plat-warn, .cidr-eff-list)';
+    const help = '[data-tun-status] .info-i[role="img"][tabindex="0"][aria-label][data-tip]';
+    const actual = await measure({ css,
+      html: reports.map((report, i) => `<section data-tun-status="${i}">${render(report, 'zh-CN')}</section>`).join(''),
+      rootAttrs: { 'data-os': 'mac' },
+    }, [
+      { select: status, props: ['display', 'visibility'], many: 'all' },
+      { select: help, props: ['display', 'visibility'], many: 'all' },
+    ]);
+    // Four distinct unavailable/error states plus the conflict warning and its concrete range list.
+    expect(actual.count(status)).toBe(6);
+    expect(actual.getAll(status, 'display').every(display => display !== 'none')).toBe(true);
+    expect(actual.getAll(status, 'visibility')).toEqual(Array(6).fill('visible'));
+    expect(actual.rectAll(status).every(rect => rect.height > 0)).toBe(true);
+    expect(actual.count(help)).toBe(reports.length);
+    expect(actual.rectAll(help).every(rect => rect.height > 0)).toBe(true);
+  }, 30_000);
+
   it('四态两两渲染结果互不相同（塌成一句空话时本条转红）', () => {
     const bodies = [
       NOT_PROBED,

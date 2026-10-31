@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn spawn_request_argv_is_run_c_config_plus_extras() {
     // 对齐 Polaris 直接 spawn：`['run', '-c', configPath]`（:4790）。
-    let req = SpawnRequest::new(
+    let req = SpawnRequest::unadmitted_intent(
         "/usr/local/bin/sing-box",
         "/tmp/cfg.json",
         StdioPolicy::Discard,
@@ -22,7 +22,8 @@ fn spawn_request_argv_is_run_c_config_plus_extras() {
 
 #[test]
 fn spawn_request_argv_appends_extra_args() {
-    let mut req = SpawnRequest::new("/bin/sing-box", "/tmp/c.json", StdioPolicy::Discard);
+    let mut req =
+        SpawnRequest::unadmitted_intent("/bin/sing-box", "/tmp/c.json", StdioPolicy::Discard);
     req.extra_args = vec!["--debug".to_string(), "--legacy".to_string()];
     assert_eq!(
         req.argv(),
@@ -37,24 +38,21 @@ fn spawn_request_argv_appends_extra_args() {
 }
 
 #[tokio::test]
-async fn tokio_spawner_returns_spawn_error_for_missing_binary() {
-    // ENOENT → SpawnError::Spawn（上层据此判 retry）。
-    let spawner = TokioSpawner::new();
-    let req = SpawnRequest::new(
+async fn tokio_spawner_refuses_unadmitted_intent_even_for_a_named_binary() {
+    let request = SpawnRequest::unadmitted_intent(
         "/nonexistent/sing-box-xyz",
         "/tmp/c.json",
         StdioPolicy::Discard,
     );
-    let r = spawner.spawn(req);
-    assert!(r.is_err());
-    match r {
-        Err(SpawnError::Spawn { bin, source }) => {
-            assert_eq!(bin, PathBuf::from("/nonexistent/sing-box-xyz"));
-            // io::Error kind 应为 NotFound。
-            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-        }
-        other => panic!("expected SpawnError::Spawn, got {other:?}"),
-    }
+    assert!(matches!(
+        TokioSpawner::new().spawn(request),
+        Err(SpawnError::Admission(
+            crate::admitted_payload::AdmissionError {
+                kind: crate::admitted_payload::AdmissionErrorKind::Unknown,
+                ..
+            }
+        ))
+    ));
 }
 
 #[test]
@@ -67,3 +65,6 @@ fn spawned_child_pid_api_is_callable() {
     // 引用以避免未用警告；不构造真实 Child（pid 语义由集成测试覆盖）。
     let _ = takes_spawned as fn(&SpawnedChild) -> Option<u32>;
 }
+
+#[cfg(target_os = "linux")]
+mod process;

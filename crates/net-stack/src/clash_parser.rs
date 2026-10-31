@@ -1466,7 +1466,7 @@ fn map_node(
             }
             Protocol::Snell => {
                 // mihomo snell：psk + version(缺省 1) + obfs-opts{mode,host}。
-                // sing-box 官方仅 v4/v6、混淆仅 http——超出（v1-3 / obfs tls）跳过（防假节点）。
+                // 固定核支持 v4 HTTP/TLS obfs；v1-3 和 v6 active obfs 仍跳过。
                 let psk = m.get("psk").and_then(str);
                 let psk = match psk {
                     Some(p) if !p.trim().is_empty() => p,
@@ -1510,22 +1510,38 @@ fn map_node(
                     userkey: None,
                 };
                 let obfs_opts = m.get("obfs-opts").unwrap_or(&Value::Null);
-                let obfs_mode = obfs_opts
-                    .get("mode")
-                    .and_then(|v| str(v).map(|s| s.to_ascii_lowercase()));
-                if let Some(obfs_mode) = obfs_mode {
-                    if obfs_mode != "none" {
-                        if version_val == 4 && obfs_mode == "http" {
-                            snell.obfs_mode = Some("http".to_string());
-                            if let Some(host) = obfs_opts.get("host").and_then(str) {
-                                snell.obfs_host = Some(host);
-                            }
-                        } else {
-                            return Ok(NodeOutcome::Skip {
-                                reason: format!("snell-obfs:{obfs_mode}"),
-                            });
-                        }
+                if !obfs_opts.is_null() && !obfs_opts.is_mapping() {
+                    return Ok(NodeOutcome::Skip {
+                        reason: "snell-obfs:invalid-options".into(),
+                    });
+                }
+                let obfs_mode = match obfs_opts.get("mode") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(mode)) => Some(mode.to_ascii_lowercase()),
+                    _ => {
+                        return Ok(NodeOutcome::Skip {
+                            reason: "snell-obfs:invalid-mode".into(),
+                        })
                     }
+                };
+                if let Some(mode) = obfs_mode.filter(|mode| !mode.is_empty() && mode != "none") {
+                    if version_val != 4 || !matches!(mode.as_str(), "http" | "tls") {
+                        return Ok(NodeOutcome::Skip {
+                            reason: format!("snell-obfs:{mode}"),
+                        });
+                    }
+                    snell.obfs_host = match obfs_opts.get("host") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(host)) => {
+                            Some(host.clone()).filter(|host| !host.is_empty())
+                        }
+                        _ => {
+                            return Ok(NodeOutcome::Skip {
+                                reason: "snell-obfs:invalid-host".into(),
+                            })
+                        }
+                    };
+                    snell.obfs_mode = Some(mode);
                 }
                 config.snell_settings = Some(Box::new(snell));
             }

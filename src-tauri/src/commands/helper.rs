@@ -38,10 +38,9 @@ const HELPER_MUTATION_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// 不决定「看门狗死不死」。
 const WATCHDOG_JOIN_BUDGET: Duration = Duration::from_secs(20);
 
-/// 上游 `HELPER_GET_STATUS`：helper 安装/就绪/版本状态（真探测，W20 后带恢复腿）。
+/// 上游 `HELPER_GET_STATUS`：只读 helper 安装/就绪/版本探测，不启动或修复服务。
 ///
-/// **必须异步跑**：W20 恢复腿让「已装但停着」的探测先拉服务再复核（典型 3-5s，起即崩/管道不绑时
-/// 更久）。同步命令在主线程执行，这个量级会冻 UI——与 install/uninstall 同口径挂 spawn_blocking。
+/// 文件与 IPC 探测仍由 spawn_blocking 承担，避免阻塞 UI worker。
 #[tauri::command]
 pub async fn helper_get_status(
     state: State<'_, AppRuntime>,
@@ -73,21 +72,34 @@ pub async fn helper_install(
     // Reject forged explicit-mode requests before the guard can stop any local proxy.
     if !mode.supported_on(helper.platform()) {
         return Ok(ApiResponse::ok(HelperActionResult {
+            recovery: None,
             success: false,
+            uninstall_effect: None,
             execution_diagnostic: None,
             error_code: Some(HelperActionErrorCode::Unsupported),
-            diagnostic: Some(
-                "explicit helper stop-and-upgrade is supported only on macOS".to_owned(),
-            ),
+            diagnostic: Some("explicit helper stop-and-upgrade requires macOS or Linux".to_owned()),
             status: helper.status(),
         }));
+    }
+    if mode == HelperInstallMode::StopAndUpgrade && helper.linux_legacy_maintenance_needed() {
+        let outcome = with_linux_legacy_mutation_guard(&state, move |original| async move {
+            tokio::task::spawn_blocking(move || {
+                helper.install_with_linux_original_proxy(mode, original)
+            })
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await;
+        return Ok(ApiResponse::ok(linux_legacy_reply(&state, outcome)));
     }
     let proxy_status = state.proxy().status();
     if mode == HelperInstallMode::Ordinary
         && helper_install_blocked_by_proxy(proxy_status.running, proxy_status.started_via_helper)
     {
         return Ok(ApiResponse::ok(HelperActionResult {
+            recovery: None,
             success: false,
+            uninstall_effect: None,
             execution_diagnostic: None,
             error_code: Some(HelperActionErrorCode::ProxyRunning),
             diagnostic: Some("stop the helper-managed proxy before upgrading helper".to_owned()),
@@ -115,6 +127,277 @@ const fn helper_install_blocked_by_proxy(running: bool, started_via_helper: bool
         decide_uninstall_preflight(running, started_via_helper),
         UninstallPreflight::StopCoreFirst
     )
+}
+
+fn linux_legacy_reply(
+    state: &AppRuntime,
+    outcome: Result<HelperActionResult, String>,
+) -> HelperActionResult {
+    outcome.unwrap_or_else(|error| HelperActionResult {
+        recovery: None,
+        success: false,
+        uninstall_effect: None,
+        execution_diagnostic: None,
+        error_code: Some(HelperActionErrorCode::InstallerFailed),
+        diagnostic: Some(format!("LINUX_LEGACY_RECOVERY_REQUIRED: {error}")),
+        status: state.helper.status(),
+    })
+}
+
+fn linux_proxy_original(directory: &std::path::Path) -> Result<Option<[String; 10]>, String> {
+    use polaris_system_integration::proxy::{ProxyMarker, ProxyMarkerRead};
+    let path = directory.join(polaris_system_integration::PROXY_MARKER_FILENAME);
+    let marker = ProxyMarker::new(
+        polaris_system_integration::StdMarkerFs,
+        path.to_string_lossy().into_owned(),
+    );
+    let marker = match marker.read_checked() {
+        ProxyMarkerRead::CurrentValidated(marker) => marker,
+        // This supplies no release authority. Only an existing root-private,
+        // same-action journal may provide the missing baseline on recovery.
+        ProxyMarkerRead::Missing => return Ok(None),
+        _ => {
+            // A new App's empty session or missing/legacy marker cannot establish
+            // the previous responsible user's complete restoration baseline.
+            return Err("responsible-user exact proxy baseline is unknown".into());
+        }
+    };
+    let original = marker
+        .exact_original
+        .and_then(|value| value.linux_gsettings)
+        .ok_or("responsible-user complete Linux proxy baseline is unavailable")?;
+    let values = linux_proxy_values(original);
+    let home = linux_user_session_domain(directory)?;
+    Ok(Some([
+        values[0].clone(),
+        values[1].clone(),
+        values[2].clone(),
+        values[3].clone(),
+        values[4].clone(),
+        values[5].clone(),
+        values[6].clone(),
+        values[7].clone(),
+        values[8].clone(),
+        home,
+    ]))
+}
+
+fn linux_user_session_domain(directory: &std::path::Path) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::symlink_metadata(directory)
+            .map_err(|e| e.to_string())?
+            .uid();
+        let home = std::env::var("HOME").map_err(|_| "responsible HOME is unknown")?;
+        if !std::path::Path::new(&home).is_absolute() {
+            return Err("responsible HOME is not absolute".into());
+        }
+        let runtime = format!("/run/user/{uid}");
+        for (key, expected) in [
+            ("XDG_CONFIG_HOME", format!("{home}/.config")),
+            ("XDG_RUNTIME_DIR", runtime.clone()),
+            ("DCONF_PROFILE", "user".into()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={runtime}/bus"),
+            ),
+        ] {
+            if std::env::var_os(key).is_some_and(|actual| actual != std::ffi::OsStr::new(&expected))
+            {
+                return Err(
+                    "responsible gsettings session domain is unsupported or unknown".into(),
+                );
+            }
+        }
+        // Root additionally binds this captured HOME to its actual native user
+        // lookup; an empty/new session and custom profile are never guessed.
+        Ok(home)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        Err("Linux responsible-user session required".into())
+    }
+}
+
+fn linux_proxy_values(
+    value: polaris_system_integration::proxy::LinuxGSettingsSnapshot,
+) -> [String; 9] {
+    [
+        value.http_host,
+        value.http_port,
+        value.http_enabled,
+        value.https_host,
+        value.https_port,
+        value.socks_host,
+        value.socks_port,
+        value.ignore_hosts,
+        value.mode,
+    ]
+}
+
+fn linux_proxy_restored(original: &[String; 10]) -> Result<(), String> {
+    use polaris_system_integration::proxy_ops::{SystemProxyOps, SystemProxyOpsImpl};
+    let actual = SystemProxyOpsImpl::new(polaris_system_integration::StdCommandRunner)
+        .capture_transaction_snapshot()
+        .map_err(|error| error.to_string())?
+        .linux_gsettings
+        .ok_or("actual responsible-user Linux proxy readback is unavailable")?;
+    if linux_proxy_values(actual).as_slice() != &original[..9] {
+        return Err("actual responsible-user proxy differs from captured baseline".into());
+    }
+    Ok(())
+}
+
+fn linux_stop_context_unchanged(
+    proxy: &crate::runtime::proxy::ProxyRuntime,
+    generation: u64,
+    selected: &Option<String>,
+    intent: u64,
+) -> bool {
+    proxy.status_with_owned_stop_context().is_ok_and(|status| {
+        !status.running
+            && !status.starting
+            && status.main_generation == generation
+            && status.owned_stop_context.is_some_and(|context| {
+                context.selected_server_id == *selected
+                    && context.selection_intent_generation == intent
+            })
+    })
+}
+
+fn linux_confirmed_stop_generation(
+    expected: u64,
+    result: Result<crate::runtime::proxy::ExpectedCoreStopResult, String>,
+) -> Result<u64, String> {
+    use crate::runtime::proxy::ExpectedCoreStopResult;
+    match result? {
+        ExpectedCoreStopResult::Stopped {
+            expected_main_generation,
+            stop_main_generation,
+        } if expected_main_generation == expected
+            && stop_main_generation > expected
+            && stop_main_generation <= 9_007_199_254_740_991 =>
+        {
+            Ok(stop_main_generation)
+        }
+        ExpectedCoreStopResult::Stopped { .. } => {
+            Err("owned stop receipt differs from captured generation".into())
+        }
+        ExpectedCoreStopResult::Changed => Err("owned run changed before normal release".into()),
+    }
+}
+
+fn observe_linux_owner(valid: &AtomicBool, unchanged: bool) {
+    if !unchanged {
+        valid.store(false, Ordering::SeqCst);
+    }
+}
+
+struct LinuxWatchdogLifetime(Arc<AtomicBool>);
+impl Drop for LinuxWatchdogLifetime {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Legacy maintenance has a stricter owner gate than ordinary operations.
+/// No plain Stop may replace the captured comparison, and no later generation
+/// is stopped by its watchdog. Root independently rereads the responsible user
+/// and fixed network namespace; this baseline is never a caller "Good" bit.
+async fn with_linux_legacy_mutation_guard<F, Fut>(
+    state: &AppRuntime,
+    body: F,
+) -> Result<HelperActionResult, String>
+where
+    F: FnOnce(Option<[String; 10]>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<HelperActionResult, String>> + Send + 'static,
+{
+    use crate::runtime::proxy::ExpectedCoreStopRequest;
+    let proxy = state.proxy.clone();
+    let directory = state.config.dir().to_owned();
+    // Dropping the IPC waiter detaches this task; it cannot release the local
+    // launch gates while the owned blocking privileged transaction is still live.
+    tauri::async_runtime::spawn(async move {
+        let captured = proxy
+            .status_with_owned_stop_context()
+            .map_err(|e| e.to_string())?;
+        let context = captured
+            .owned_stop_context
+            .ok_or("owned stop context is unavailable")?;
+        let original = tokio::task::spawn_blocking(move || linux_proxy_original(&directory))
+            .await
+            .map_err(|error| error.to_string())??;
+        let request = ExpectedCoreStopRequest {
+            expected_main_generation: captured.main_generation,
+            expected_selected_server_id: context.selected_server_id.clone(),
+            expected_selection_intent_generation: context.selection_intent_generation,
+        };
+        let maintenance_boundary = proxy
+            .stop_expected_for_linux_helper_maintenance(request)
+            .await?;
+        let generation = linux_confirmed_stop_generation(
+            captured.main_generation,
+            Ok(maintenance_boundary.outcome()),
+        )?;
+        if let Some(readback) = original.clone() {
+            tokio::task::spawn_blocking(move || linux_proxy_restored(&readback))
+                .await
+                .map_err(|error| error.to_string())??;
+        }
+        proxy.register_helper_backend()?;
+        let selected = context.selected_server_id;
+        let intent = context.selection_intent_generation;
+        if !linux_stop_context_unchanged(&proxy, generation, &selected, intent) {
+            return Err("owned run changed before administrator admission".into());
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let valid = Arc::new(AtomicBool::new(true));
+        let completed = Arc::new(AtomicBool::new(false));
+        let _watchdog_lifetime = LinuxWatchdogLifetime(done.clone());
+        let mut watchdog = {
+            let (done, valid, completed, proxy) = (
+                done.clone(),
+                valid.clone(),
+                completed.clone(),
+                proxy.clone(),
+            );
+            tauri::async_runtime::spawn(async move {
+                while !done.load(Ordering::SeqCst) {
+                    observe_linux_owner(
+                        &valid,
+                        linux_stop_context_unchanged(&proxy, generation, &selected, intent),
+                    );
+                    tokio::time::sleep(HELPER_MUTATION_RECHECK_INTERVAL).await;
+                }
+                // The final read closes changes during the last sleep. Sticky
+                // invalidation cannot be reset by returning to the same selection.
+                observe_linux_owner(
+                    &valid,
+                    linux_stop_context_unchanged(&proxy, generation, &selected, intent),
+                );
+                completed.store(true, Ordering::SeqCst);
+                0usize
+            })
+        };
+        let outcome = body(original).await;
+        let joined = join_linux_watchdog_to_terminal(&done, &mut watchdog, WATCHDOG_JOIN_BUDGET)
+            .await
+            .map_err(|error| format!("maintenance watchdog terminal failed: {error}"))?;
+        if !joined {
+            return Err("maintenance watchdog reporting budget expired; its terminal result was joined before releasing the launch boundary".into());
+        }
+        if !completed.load(Ordering::SeqCst) || !valid.load(Ordering::SeqCst) {
+            return Err(
+                "maintenance watchdog did not confirm the captured owner remained released".into(),
+            );
+        }
+        drop(maintenance_boundary);
+        outcome
+    })
+    .await
+    .map_err(|error| format!("Linux maintenance task failed: {error}"))?
 }
 
 /// 上游 `HELPER_UNINSTALL`：卸载 helper（**先零提权停核**，再弹一次提权框卸载）。
@@ -145,6 +428,17 @@ pub async fn helper_uninstall(
     state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<HelperActionResult>, ()> {
     let helper = state.helper.clone();
+    if helper.linux_legacy_maintenance_needed() {
+        let outcome = with_linux_legacy_mutation_guard(&state, move |original| async move {
+            tokio::task::spawn_blocking(move || {
+                helper.uninstall_with_linux_original_proxy(original)
+            })
+            .await
+            .map_err(|error| error.to_string())
+        })
+        .await;
+        return Ok(ApiResponse::ok(linux_legacy_reply(&state, outcome)));
+    }
     // 停核腿的结果在这条腿上**故意忽略**：helper 单卸载停不掉也继续卸（真值表见
     // `uninstall_preflight_stop` 文档）。完全卸载腿读同一个值并中止 —— 政策不同，机制同一份。
     let outcome = with_helper_service_mutation_core_guard(&state, |_stop| async move {
@@ -232,6 +526,26 @@ where
         );
     }
     out
+}
+
+/// Linux maintenance retains its existing launch boundary through the actual
+/// terminal result. The budget decides the eventual result, never ownership.
+/// After it expires, done prevents new iterations and this same owned task keeps
+/// the same handle and gates while the in-flight final read cooperates. Dropping
+/// the IPC waiter cannot cancel this detached owner. No abort or new monitor.
+pub(crate) async fn join_linux_watchdog_to_terminal<F, T, E>(
+    done: &AtomicBool,
+    handle: &mut F,
+    budget: Duration,
+) -> Result<bool, E>
+where
+    F: std::future::Future<Output = Result<T, E>> + Unpin,
+{
+    done.store(true, Ordering::SeqCst);
+    match tokio::time::timeout(budget, &mut *handle).await {
+        Ok(terminal) => terminal.map(|_| true),
+        Err(_) => handle.await.map(|_| false),
+    }
 }
 
 /// 协作式收停看门狗：置位 `done` → **等它自己退出**，最多等 `budget`。

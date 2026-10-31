@@ -1801,6 +1801,40 @@ fn public_start_arms_network_settle_before_any_await() {
     assert!(arm < first_await, "稳定门必须先于 start 的第一个 await");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn business_checker_consumes_actual_input_but_cannot_issue_a_native_credential() {
+    use polaris_core_supervisor::{SingBoxSpawner, SpawnRequest, StdioPolicy};
+    let (rt, dir) = test_runtime();
+    assert!(rt.business_kernel_check_fixture.lock().unwrap().is_none());
+    let binary = write_fake_dying_core(&rt, &dir);
+    let config = dir.join("actual-business-config.json");
+    std::fs::write(&config, b"{\"outbounds\":[]}").unwrap();
+    assert!(matches!(
+        rt.startup_config_check(&binary, &config).await.unwrap(),
+        polaris_core_supervisor::ConfigCheckVerdict::Accepted
+    ));
+    assert!(rt
+        .startup_config_check(&binary, &dir.join("missing-config"))
+        .await
+        .is_err());
+    let other = dir.join("not-registered-core");
+    crate::test_support::write_executable_stand_in(&other, "#!/bin/sh\nexit 0\n");
+    assert!(rt.startup_config_check(&other, &config).await.is_err());
+    assert!(crate::runtime::core_identity::prepare(
+        &binary,
+        crate::runtime::core_identity::ExecPurpose::CheckConfig
+    )
+    .is_err());
+    let request = SpawnRequest::unadmitted_intent(&binary, &config, StdioPolicy::Discard);
+    assert!(
+        polaris_core_supervisor::TokioSpawner::new()
+            .spawn(request)
+            .is_err(),
+        "a business checker observation cannot cross the real native factory"
+    );
+}
+
 /// ① **退避期取消 → 就地退场**（本任务的主门；直接对应「点了立刻停 vs 静默等 35s」）。
 ///
 /// 非 TUN 预算 = 3 次尝试、退避 2s→4s。本测在第 1 次退避（2s）中途点停止，断言起核腿在
@@ -1815,7 +1849,7 @@ fn public_start_arms_network_settle_before_any_await() {
 async fn cancelling_start_interrupts_backoff_and_settles_clean() {
     let (rt, dir) = test_runtime();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
-    *rt.core_binary_override.lock().unwrap() = Some(write_fake_dying_core(&dir));
+    *rt.core_binary_override.lock().unwrap() = Some(write_fake_dying_core(&rt, &dir));
 
     let cfg = local_only_config(free_port());
     let rt2 = Arc::clone(&rt);
@@ -1876,7 +1910,7 @@ async fn cancelling_start_interrupts_backoff_and_settles_clean() {
 async fn cancelling_start_during_readiness_wait_reaps_the_real_process() {
     let (rt, dir) = test_runtime();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
-    let fake = write_fake_hanging_core(&dir);
+    let fake = write_fake_hanging_core(&rt, &dir);
     *rt.core_binary_override.lock().unwrap() = Some(fake.clone());
 
     let cfg = local_only_config(free_port());
@@ -1934,7 +1968,7 @@ async fn cancelling_start_during_readiness_wait_reaps_the_real_process() {
 async fn uncancelled_start_still_burns_the_whole_retry_budget() {
     let (rt, dir) = test_runtime();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
-    *rt.core_binary_override.lock().unwrap() = Some(write_fake_dying_core(&dir));
+    *rt.core_binary_override.lock().unwrap() = Some(write_fake_dying_core(&rt, &dir));
 
     let t0 = std::time::Instant::now();
     let r = rt.start(local_only_config(free_port())).await;
@@ -3548,19 +3582,19 @@ fn background_attestation_only_commits_to_the_same_running_generation_and_pid() 
 #[tokio::test]
 async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_structure_change() {
     let dir = fresh_test_dir();
-    let (binary, counter) = write_fake_accepting_core(&dir);
+    let rt = test_runtime_in(dir.clone());
+    let (binary, counter) = write_fake_accepting_core(&rt, &dir);
     let cfg = gate_two_node_config();
     let user_config: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
     let path = dir.join("gate-cache.json");
 
-    let rt = test_runtime_in(dir.clone());
     let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let mut peeled = BTreeMap::new();
     let first = rt
         .generate_and_gate(&user_config, &deps, &path, Some(&binary), &mut peeled)
         .await
         .unwrap();
-    assert_eq!(first.checks_run, 1, "首次必须真跑 check");
+    assert_eq!(first.checks_run, 1, "首次必须调用 checker");
     assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
 
     let second = rt
@@ -3573,6 +3607,7 @@ async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_str
     drop(rt);
 
     let restarted = test_runtime_in(dir.clone());
+    install_counting_business_checker(&restarted, &binary, &counter);
     let restarted_deps = restarted.generate_deps(0, 0, 0, None, &[], &cfg, false);
     let after_restart = restarted
         .generate_and_gate(
@@ -3663,7 +3698,7 @@ async fn kernel_rejected_node_is_regenerated_out_and_reported_through_the_existi
         .expect("BAD 节点应在生成的 outbounds 里");
 
     // ② 真闸门腿：假核第一次 check 点名 BAD 的下标。
-    let fake = write_fake_checking_core(&dir, bad_index);
+    let fake = write_fake_checking_core(&rt, &dir, bad_index);
     let mut peeled = BTreeMap::new();
     let gated = rt
         .generate_and_gate(&user_config, &deps, &path, Some(&fake), &mut peeled)
@@ -3723,7 +3758,7 @@ async fn kernel_rejecting_the_selected_node_yields_blocked_not_a_silent_exit_swi
         .position(|o| o.tag == "KEEP")
         .expect("KEEP 节点应在生成的 outbounds 里");
 
-    let fake = write_fake_checking_core(&dir, keep_index);
+    let fake = write_fake_checking_core(&rt, &dir, keep_index);
     let mut peeled = BTreeMap::new();
     let gated = rt
         .generate_and_gate(&user_config, &deps, &path, Some(&fake), &mut peeled)
@@ -3821,7 +3856,7 @@ async fn peeling_reshuffles_duplicate_name_tags_so_the_gate_hands_back_the_peele
         .iter()
         .position(|o| o.tag == "HK")
         .expect("HK 应在生成的 outbounds 里");
-    let fake = write_fake_checking_core(&dir, a_index);
+    let fake = write_fake_checking_core(&rt, &dir, a_index);
     let mut peeled = BTreeMap::new();
     let gated = rt
         .generate_and_gate(&user_config, &deps, &path, Some(&fake), &mut peeled)
@@ -3879,7 +3914,7 @@ async fn retry_leg_keeps_reporting_nodes_peeled_by_an_earlier_leg() {
     let path = dir.join("gate-retry.json");
 
     // 假核：marker 已存在 ⇒ 本次 check 一律 rc=0（= 上一腿已把坏节点剥干净的现场）。
-    let fake = write_fake_checking_core(&dir, 0);
+    let fake = write_fake_checking_core(&rt, &dir, 0);
     std::fs::write(dir.join("gate-check-seen"), b"1").unwrap();
 
     // 第 1 腿的产物：一条已剥记录。
@@ -4144,7 +4179,7 @@ fn selected_content_preflight_rechecks_current_daemon_before_start_custody() {
     let status = body.find("helper.require_selected_core()").unwrap();
     for mutation in [
         "self.lease_legacy_start()",
-        "self.register_helper_start_backend_with_main(",
+        "self.register_helper_start_backend_in_generation(",
         "helper.start_core(",
     ] {
         assert!(
@@ -4484,10 +4519,16 @@ fn the_management_secret_has_a_single_reader() {
             "从原始配置 JSON 取这个键的单点。",
         ),
         (
-            "runtime/proxy/runtime_config.rs",
+            "runtime/proxy/prerequisite.rs",
             1,
             0,
-            "structural_runtime_change compares opaque old/new values; it does not grant management credentials to clients.",
+            "Ready API test fixture writes its selected snapshot; production Ready captures credentials through the existing management secret reader.",
+        ),
+        (
+            "runtime/proxy/runtime_config/api_handoff.rs",
+            1,
+            0,
+            "The API-only saved projection compares the opaque secret field as one bounded configuration change; clients retain the verified carrier.",
         ),
         (
             "runtime/proxy/startup.rs",
@@ -4645,15 +4686,18 @@ fn decoy_override_read_diagnostics_distinguish_absent_invalid_and_valid_files() 
 #[tokio::test]
 async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement() {
     use crate::runtime::proxy::startup::validate_startup_cli_proof;
-    use crate::runtime::tls_fingerprints::{cached_cli, probe_cli, probe_cli_observation};
+    use crate::runtime::tls_fingerprints::{cache_fixture_observation, cached_cli};
     let (_rt, dir) = test_runtime();
     let binary = dir.join("startup-proof");
     std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
-    let proof = probe_cli_observation(&binary).await.unwrap();
+    let proof = cache_fixture_observation(&binary);
     for index in 0..4 {
         let other = dir.join(format!("startup-cache-pressure-{index}"));
         std::fs::write(&other, b"#!/bin/sh\n").unwrap();
-        assert!(probe_cli(&other).await.binary_sha256.is_some());
+        assert!(cache_fixture_observation(&other)
+            .snapshot
+            .binary_sha256
+            .is_some());
     }
     assert!(
         cached_cli(&binary).is_none(),
@@ -4684,13 +4728,12 @@ async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement
 #[tokio::test]
 async fn direct_startup_requires_present_current_hashed_file_proof() {
     use crate::runtime::proxy::startup::require_direct_startup_cli_proof;
-    use crate::runtime::tls_fingerprints::probe_cli_observation;
+    use crate::runtime::tls_fingerprints::cache_fixture_observation;
     let (_rt, dir) = test_runtime();
     let binary = dir.join("direct-proof");
-    // ProbeFile::Native recognizes a script without executing it. This is a
-    // real retained file observation, not a production missing-proof exemption.
+    // Explicit App business observation; this fixture cannot authorize native execution.
     std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
-    let proof = probe_cli_observation(&binary).await.unwrap();
+    let proof = cache_fixture_observation(&binary);
     assert!(proof.snapshot.document.is_none());
     assert!(require_direct_startup_cli_proof(&binary, Some(&proof)).is_ok());
     assert!(require_direct_startup_cli_proof(&binary, None).is_err());
@@ -4708,11 +4751,11 @@ async fn direct_startup_requires_present_current_hashed_file_proof() {
 #[tokio::test]
 async fn direct_startup_capture_rejects_missing_changed_and_poisoned_proof() {
     use crate::runtime::proxy::process_supervision::RunIdentity;
-    use crate::runtime::tls_fingerprints::probe_cli_observation;
+    use crate::runtime::tls_fingerprints::cache_fixture_observation;
     let (rt, dir) = test_runtime();
     let binary = dir.join("direct-capture");
     std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
-    let proof = probe_cli_observation(&binary).await.unwrap();
+    let proof = cache_fixture_observation(&binary);
     let generation = rt.core_generation();
     let identity = RunIdentity::new();
     assert!(rt
@@ -4759,7 +4802,7 @@ fn direct_startup_proof_rejection_preserves_actual_birth_cleanup() {
     let factory = factory.split_once("if direct_spawn.is_err()").unwrap().0;
     assert!(
         factory.find("require_direct_startup_cli_proof(").unwrap()
-            < factory.find("TokioSpawner::new().spawn(req)").unwrap()
+            < factory.find(".spawn(req)").unwrap()
     );
     assert!(factory.contains("direct_proof_rejected.set(true)"));
     let success = start

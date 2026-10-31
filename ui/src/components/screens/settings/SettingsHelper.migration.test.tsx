@@ -95,7 +95,7 @@ it('mount, refresh, and ordinary upgradeDeferred never select or auto-start migr
   expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
   expect(useDialogStore.getState().stack).toHaveLength(0);
 });
-it.each(['win', 'lin', undefined])('hides the explicit action on %s even after upgradeDeferred', async platform => {
+it.each(['win', undefined])('hides the explicit action on %s even after upgradeDeferred', async platform => {
   h.platform = platform; await deferred();
   expect(button('helper.stopAndUpgradeAction')).toBeUndefined();
   expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
@@ -186,3 +186,70 @@ it('classified install failure remains in the global toast after settings unmoun
 });
 
 afterEach(() => { h.cleanup?.(); h.cleanup = null; clearHelperInstallFeedback(); });
+
+it('Linux requires its scoped forward-only confirmation and never silently retries ordinary mode', async () => {
+  h.platform = 'lin'; await deferred();
+  expect(button('helper.stopAndUpgradeAction')).toBeDefined();
+  click('helper.stopAndUpgradeAction');
+  const prompt = confirmation();
+  expect(prompt).toMatchObject({ title: 'helper.linuxStopAndUpgradeTitle', message: 'helper.linuxStopAndUpgradeWarning', danger: true });
+  vi.mocked(helperApi.install).mockResolvedValue({ success: false, errorCode: 'installerFailed', status: absent } as never);
+  prompt.onConfirm(); prompt.onConfirm();
+  await vi.waitFor(() => expect(h.state[3]).toBe('installerFailed'));
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[], ['stopAndUpgrade']]);
+  const feedback = nodes(render()).find(node => node.type === FeedbackNotice);
+  expect(feedback?.props.hint).toBe('helper.linuxForwardOnlyRecovery');
+  h.refresh!(); await Promise.resolve();
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[], ['stopAndUpgrade']]);
+});
+it('Linux cancellation and a changed platform revoke saved confirmation authority', async () => {
+  h.platform = 'lin'; await deferred(); click('helper.stopAndUpgradeAction');
+  const prompt = confirmation(); useDialogStore.getState().closeAll(); prompt.onCancel?.(); prompt.onConfirm();
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
+  click('helper.stopAndUpgradeAction'); const changed = confirmation(); h.platform = 'win'; changed.onConfirm();
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
+});
+it('a Mac confirmation cannot authorize the different Linux forward-only maintenance scope', async () => {
+  await deferred(); click('helper.stopAndUpgradeAction');
+  const prompt = confirmation(); h.platform = 'lin'; prompt.onConfirm();
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
+  expect(useDialogStore.getState().stack).toHaveLength(0);
+});
+
+it.each([
+  { name: 'unsupported platform', status: { ...absent, supported: false }, state: 'unsupported', cleanupPending: false },
+  ...['UnsupportedExactObject', 'UnsupportedCapability', 'Busy'].map(admission => ({
+    name: admission, status: { ...absent, selectedCore: { admission } }, state: 'admission-unavailable', cleanupPending: false,
+  })),
+  { name: 'unsupported admission behind cleanup debt', status: { ...absent, selectedCore: { admission: 'UnsupportedExactObject' } }, state: 'cleanup-pending', cleanupPending: true },
+])('latest $name readback revokes both saved migration entry and confirmation', async ({ status, state, cleanupPending }) => {
+  await deferred();
+  const oldEntry = button('helper.stopAndUpgradeAction')!.props.onClick as () => void;
+  click('helper.stopAndUpgradeAction');
+  const stale = confirmation();
+
+  h.refs[0].current = cleanupPending;
+  vi.mocked(helperApi.getStatus).mockResolvedValue(status as never);
+  h.refresh!();
+  await vi.waitFor(() => expect(h.state[1]).toBe(state));
+  expect(button('helper.stopAndUpgradeAction')).toBeUndefined();
+  expect(useDialogStore.getState().stack).toHaveLength(0);
+  oldEntry();
+  stale.onConfirm();
+  expect(useDialogStore.getState().stack).toHaveLength(0);
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
+
+  // A later usable readback may offer a new explicit confirmation, but never
+  // revives the previously revoked callback or initiates migration by itself.
+  vi.mocked(helperApi.getStatus).mockResolvedValue(absent as never);
+  h.refresh!();
+  await vi.waitFor(() => expect(h.state[1]).toBe(cleanupPending ? 'cleanup-pending' : 'none'));
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
+  click('helper.stopAndUpgradeAction');
+  stale.onConfirm();
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
+  vi.mocked(helperApi.install).mockResolvedValue({ success: true, status: absent } as never);
+  confirmation().onConfirm();
+  await vi.waitFor(() => expect(h.state[2]).toBe(false));
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[], ['stopAndUpgrade']]);
+});

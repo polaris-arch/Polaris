@@ -13,5 +13,10 @@ describe('Windows five-source settings projection', () => {
     expect(html).toContain(en.settings.coex.windowsHint); expect(html).toContain(en.settings.coex.unknown);
     expect(html).not.toContain(en.settings.coex.sourceUnavailable); expect(html).not.toContain('12025550123');
     expect(html).not.toContain('<ol'); expect(html).not.toContain('class="good"');
+    expect(html).toContain(en.settings.coex.unconfirmedSummary);
+    expect(html.match(/data-coex-unconfirmed/g)).toHaveLength(1);
+    for (const unknown of [snapshot.classification, ...Object.values(snapshot.context)]) expect(html).toContain(unknown.reason);
+    // Context uncertainty is consolidated; each independent native source remains collapsed.
+    expect(html.slice(0, html.indexOf('data-coex-source='))).toContain('data-coex-unconfirmed');
   });
 });

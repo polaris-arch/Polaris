@@ -191,10 +191,8 @@ export function checkAppUpdateViaIpc(options: {
  * 「重装当前版本」（修复损坏安装）的解析腿：返回**当前版本**那份可下载清单。
  *
  * 三条早退，一条都不许省：
- *  · `hasUpdate` 为真 ⇒ **不替用户去下另一个目标**（逐字同桌面 `reinstallCurrent` 的取向：
- *    真有新版时只展示新版，让用户自己决定装哪个）；
- *  · `isCurrentVersion` 不为真 ⇒ 这个通道的最新 release 与已装版本对不上（比它旧或比它新），
- *    继续下去就是一次**静默降级**；
+ *  · `hasUpdate` 为真 ⇒ 这是一份普通更新结果，不能当作当前版本重装目标；
+ *  · `isCurrentVersion` 不为真 ⇒ 后端未在当前通道中确认已安装版本，不得替换成其他版本；
  *  · 清单不可下载（三个资产字段任一为空）⇒ 这一档没有对象，见 [`appUpdateDownloadTarget`]。
  *
  * `null` 的三种成因对用户是同一句话（`settings.update.reinstallUnavailable`，五语齐，

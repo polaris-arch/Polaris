@@ -21,6 +21,7 @@ repository.workspace = true
 # 实证：cargo tree --target <triple> 三平台交叉核对，见交付报告。
 
 [dependencies]
+polaris-core-supervisor = { path = "../core-supervisor", default-features = false }
 polaris-helper-proto = { path = "../helper-proto" }
 polaris-helper-client = { path = "../helper-client" }
 polaris-log-budget = { path = "../log-budget" }
@@ -124,3 +125,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "polaris-helper"
 path = "src/bin/main.rs"
+
+[features]
+default = ["formal-selection"]
+formal-selection = ["polaris-core-supervisor/formal-selection"]
+local-development-selection = ["polaris-core-supervisor/local-development-selection"]

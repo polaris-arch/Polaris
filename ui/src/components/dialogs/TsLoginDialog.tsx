@@ -48,7 +48,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
   // 不带 = 新建（Tailscale 不再是单例，没有 id 时不猜、直接走新建路径——不回落 `.find(协议)`，
   // 否则多节点时会把登录写进任意一个既有节点，重犯 node-edit-routing 那条缺陷）。
   const savedServer = useRef<ServerConfig | undefined>(undefined);
-  const activeRequest = useRef<{ serverId: string; attemptId: string } | null>(null);
+  const activeRequest = useRef<{ serverId: string; attemptId: string; revision: number } | null>(null);
   const editRevision = useRef(0);
   const [saved, setSaved] = useState(Boolean(serverId));
   const existingTs = servers.find((s) => s.id === (serverId ?? savedServer.current?.id)) ?? savedServer.current;
@@ -100,7 +100,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
   // 就不会去用 `auth_key`，于是「填了新 key、提交成功、身份一动不动」。
   const [hasState, setHasState] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [pendingRequest, setPendingRequest] = useState<{ serverId: string; attemptId: string } | null>(null);
+  const [pendingRequest, setPendingRequest] = useState<{ serverId: string; attemptId: string; revision: number } | null>(null);
   const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
     pendingRequest ? s.attempts[pendingRequest.serverId] : undefined,
     pendingRequest,
@@ -142,6 +142,28 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, [pendingRequest?.serverId, pendingRequest?.attemptId, t]);
+
+  // The native authorized receipt is terminal for this exact request. Transient
+  // logins publish it only after their original child and stdio/config tail close;
+  // normal-main observers publish it after authorization, without stopping main.
+  useEffect(() => {
+    if (!saved || !pendingRequest || progress?.phase !== 'authorized' || !alive()) return;
+    const request = activeRequest.current;
+    const current = useTailscaleLoginProgressStore.getState().attempts[pendingRequest.serverId];
+    if (request?.serverId !== pendingRequest.serverId || request.attemptId !== pendingRequest.attemptId
+      || current?.serverId !== pendingRequest.serverId || current.attemptId !== pendingRequest.attemptId
+      || current.phase !== 'authorized') return;
+    // Detach before closing: unmount must not send cancel for a completed login,
+    // and a late start receipt cannot complete a successor dialog or attempt.
+    activeRequest.current = null;
+    setPendingRequest(null);
+    setSubmitting(false);
+    setTailscaleAuthUrl(request.serverId, null);
+    setTailscaleLoginInitiated(request.serverId, false);
+    toast.success(t('ts.authorizationComplete'));
+    if (editRevision.current === request.revision) closeInstance(instanceId);
+  }, [saved, pendingRequest, progress?.phase, instanceId, closeInstance,
+    setTailscaleAuthUrl, setTailscaleLoginInitiated, t]);
 
   const discardPendingLogin = () => {
     const request = activeRequest.current;
@@ -264,7 +286,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
     });
 
     discardPendingLogin();
-    const request = { serverId: server.id, attemptId: crypto.randomUUID() };
+    const request = { serverId: server.id, attemptId: crypto.randomUUID(), revision: submissionRevision };
     activeRequest.current = request;
     useTailscaleLoginProgressStore.getState().begin(server.id, request.attemptId);
     setPendingRequest(request);
@@ -496,7 +518,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
           <div className="fld">
             <label className="fld-l fld-l-info" htmlFor="ts-authkey">
               <span>{t('ts.authKeyLabel')}</span>
-              <InfoIcon tip={t('ts.authkeyHint')} />
+              <InfoIcon tip={`${t('ts.authkeyHint')} ${t('ts.authKeyEphemeralHint')}`} />
             </label>
             <input
               id="ts-authkey"
@@ -524,9 +546,6 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
                 ? 'ts.retainedAuthKeyHint' : 'ts.retainedAuthKeyAuthorityHint')}
             </div>}
             {errKey && <div className="err-line">{t('ts.errKey')}</div>}
-            <div className="card-sub" style={{ marginTop: 6 }}>
-              {t('ts.authKeyEphemeralHint')}
-            </div>
             {hasState && (
               <div className="card-sub" style={{ marginTop: 6 }}>
                 {t('ts.authKeySwitchLogoutNote')}

@@ -28,8 +28,10 @@
 //! （`src/bin/argv_probe.rs`）当「核」，三平台同跑；放集成测试是因为取探针路径的
 //! `CARGO_BIN_EXE_<name>` 只在集成测试期由 cargo 注入。
 
+use crate::admitted_payload::{AdmissionError, AdmittedPayload, PreparedExecution};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Child;
 
 /// 子进程一条输出流的装箱读端。
@@ -107,22 +109,9 @@ impl std::fmt::Debug for StdioPolicy {
 /// };
 /// ```
 ///
-/// **正向对照**（上面两条若是因为别的原因编不过——路径写错、crate 名写错——这一条会跟着一起红，
-/// 而它必须绿）：把那一格补上就编得过。
-///
-/// ```
-/// use polaris_core_supervisor::{SpawnRequest, StdioPolicy};
-/// let _ = SpawnRequest::new("/usr/local/bin/sing-box", "/tmp/cfg.json", StdioPolicy::Discard);
-/// let _ = SpawnRequest {
-///     binary: "/usr/local/bin/sing-box".into(),
-///     config: "/tmp/cfg.json".into(),
-///     extra_args: Vec::new(),
-///     working_dir: None,
-///     stdio: StdioPolicy::drain(|_stdout, _stderr| {}),
-/// };
-/// ```
 pub struct SpawnRequest {
-    /// sing-box 二进制绝对路径。
+    execution: Option<PreparedExecution>,
+    /// Diagnostic path only; the factory uses the private admitted execution.
     pub binary: PathBuf,
     /// 配置文件绝对路径。
     pub config: PathBuf,
@@ -156,8 +145,32 @@ impl std::fmt::Debug for SpawnRequest {
 
 impl SpawnRequest {
     /// 构造默认请求：`sing-box run -c <config>`，两条输出流按 `stdio` 处置。
-    pub fn new(binary: impl Into<PathBuf>, config: impl Into<PathBuf>, stdio: StdioPolicy) -> Self {
+    pub fn new(
+        execution: PreparedExecution,
+        config: impl Into<PathBuf>,
+        stdio: StdioPolicy,
+    ) -> Self {
         Self {
+            binary: execution.diagnostic_path().to_path_buf(),
+            execution: Some(execution),
+            config: config.into(),
+            extra_args: Vec::new(),
+            working_dir: None,
+            stdio,
+        }
+    }
+
+    /// Business-intent data for injected mock spawners. This never contains
+    /// execution authority, including in test builds; TokioSpawner always
+    /// refuses it before entering the native factory.
+    #[doc(hidden)]
+    pub fn unadmitted_intent(
+        binary: impl Into<PathBuf>,
+        config: impl Into<PathBuf>,
+        stdio: StdioPolicy,
+    ) -> Self {
+        Self {
+            execution: None,
             binary: binary.into(),
             config: config.into(),
             extra_args: Vec::new(),
@@ -178,23 +191,11 @@ impl SpawnRequest {
     }
 }
 
-/// spawn 出的子进程句柄（tokio::process::Child 包装）。
-///
-/// **由 [`TokioSpawner::spawn`] 保证**（不是类型层的不变式）：经它拿到的 `SpawnedChild`，两条管道
-/// 已经交出去了 —— `child.stdout` 与 `child.stderr` 恒为 `None`（`Discard` 策略下压根没开管道，
-/// `Drain` 策略下读端在返回之前就交给了请求里的回调）。走这条路的调用方对 child 只剩生命周期职责
-/// （`wait` / `start_kill` / 收割），没有「还得记得去读管道」这半件事。
-///
-/// **措辞是「由构造它的那个函数保证」而不是「不变式」，因为类型上不成立**：`child` 字段是 `pub`、
-/// 本结构体没有私有构造器，工作区内任何人都可以从一个裸 `Command` 造一个带着活管道的
-/// `SpawnedChild`。真正在类型上兜住的是**请求那一侧**（[`SpawnRequest::stdio`] 必填，见
-/// [`StdioPolicy`]）；这一侧靠的是「全仓只有 `TokioSpawner` 构造它」，而那件事由源码级守卫门
-/// `src-tauri/tests/subprocess_stdio_discipline.rs` 守（`SpawnedChild` 是它类型面词表里的一项，
-/// 任何生产文件提到它而不登记就当场红）。
-///
-/// 把字段改私有能把这句话变回真正的不变式，但那会波及全部消费点，不在收口这一批的射程内。
+/// Native Child together with its admitted lifetime owner. The raw Tokio Child
+/// remains private inside CustodiedChild; extracting this field transfers the
+/// same owner. Stdio has already been passed to the required drainage policy.
 pub struct SpawnedChild {
-    pub child: Child,
+    pub child: CustodiedChild,
 }
 
 impl std::fmt::Debug for SpawnedChild {
@@ -215,6 +216,8 @@ impl SpawnedChild {
 /// spawn 错误（对应 NodeJS spawn ENOENT/EACCES → 上层 retry 链）。
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
     /// 二进制不存在 / 无执行权限（ENOENT/EACCES）。
     #[error("sing-box spawn 失败（{bin:?}）: {source}")]
     Spawn {
@@ -263,6 +266,7 @@ impl SingBoxSpawner for TokioSpawner {
         let argv = req.argv();
         let SpawnRequest {
             binary,
+            execution,
             working_dir,
             stdio,
             ..
@@ -273,7 +277,20 @@ impl SingBoxSpawner for TokioSpawner {
             StdioPolicy::Discard => (Stdio::null(), Stdio::null()),
             StdioPolicy::Drain(_) => (Stdio::piped(), Stdio::piped()),
         };
-        let mut cmd = tokio::process::Command::new(&binary);
+        let execution = execution.ok_or_else(|| {
+            SpawnError::Admission(AdmissionError::new(
+                crate::admitted_payload::AdmissionErrorKind::Unknown,
+                "request has no admitted execution owner",
+            ))
+        })?;
+        if !execution.purpose().is_run() {
+            return Err(SpawnError::Admission(AdmissionError::new(
+                crate::admitted_payload::AdmissionErrorKind::UnsupportedCapability,
+                "check/query plan cannot authorize Run",
+            )));
+        }
+        let mut cmd = execution.command().map_err(SpawnError::Admission)?;
+        let owner = execution.payload();
         // windowsHide 等价。**原注释「tokio::process 在 Windows 默认不显示控制台窗口」是错的**：
         // tokio 只把 `creation_flags` 透传给 std（tokio-1.53.1 `src/process/mod.rs:675-677`），
         // 自身零默认。宿主是 GUI 子系统进程（`windows_subsystem = "windows"`）⇒ 起 console 程序
@@ -309,10 +326,15 @@ impl SingBoxSpawner for TokioSpawner {
         // **在返回之前**把两个读端交出去。放在这里而不是交给调用方，是本次收口的全部内容：
         // 管道从此不会带着「还没人读」的状态离开 spawner，起核到就绪那一整段窗口里也不会有
         // 「已经在写、还没人读」的空档。
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // Install the lifetime owner before calling user drainage code. A
+        // synchronous Drain panic still leaves an owned Child to reap.
+        let child = CustodiedChild::admitted(child, Arc::clone(&owner), execution.lease_owner());
         if let StdioPolicy::Drain(sink) = stdio {
             sink(
-                boxed_stream(child.stdout.take()),
-                boxed_stream(child.stderr.take()),
+                boxed_stream(stdout, Arc::clone(&owner)),
+                boxed_stream(stderr, owner),
             );
         }
         Ok(SpawnedChild { child })
@@ -324,12 +346,135 @@ impl SingBoxSpawner for TokioSpawner {
 /// `None` 在这条路径上到不了：上面刚给这一路设过 `Stdio::piped()`，tokio 必然填好对应字段。真到了
 /// 这里也不 panic —— 这是起核关键路径，为一个理论上不存在的状态崩掉整个起核不划算；给空流之后
 /// 排空侧读到 EOF 正常收尾，而缺的那条流本来也没有内容。
-fn boxed_stream(stream: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>) -> ChildStream {
+fn boxed_stream(
+    stream: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    owner: Arc<AdmittedPayload>,
+) -> ChildStream {
     match stream {
-        Some(s) => Box::new(s),
+        Some(s) => Box::new(OwnedStream {
+            stream: s,
+            _owner: owner,
+        }),
         None => Box::new(tokio::io::empty()),
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// No mutable raw Child access: replacing or extracting it would discard its
+/// protected cohort. Methods preserve existing native wait/cancellation behavior.
+/// Raw Child mutation/extraction cannot detach the admitted lifetime owner.
+///
+/// ```compile_fail
+/// use polaris_core_supervisor::CustodiedChild;
+/// fn raw<T:std::ops::DerefMut<Target=tokio::process::Child>>() {}
+/// raw::<CustodiedChild>();
+/// ```
+/// ```compile_fail
+/// use polaris_core_supervisor::CustodiedChild;
+/// fn detach(child:CustodiedChild)->tokio::process::Child { child.into_inner() }
+/// ```
+pub struct CustodiedChild {
+    child: Option<Child>,
+    owner: Option<Arc<AdmittedPayload>>,
+    lease_owner: Option<Arc<dyn Send + Sync>>,
+}
+impl std::fmt::Debug for CustodiedChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustodiedChild")
+            .field("pid", &self.id())
+            .finish()
+    }
+}
+impl CustodiedChild {
+    fn admitted(
+        child: Child,
+        owner: Arc<AdmittedPayload>,
+        lease_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            owner: Some(owner),
+            lease_owner,
+        }
+    }
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(Child::id)
+    }
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let result = self.child.as_mut().expect("retained child").try_wait();
+        if matches!(result, Ok(Some(_))) {
+            self.lease_owner.take();
+        }
+        result
+    }
+    pub fn start_kill(&mut self) -> std::io::Result<()> {
+        self.child.as_mut().expect("retained child").start_kill()
+    }
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let result = self.child.as_mut().expect("retained child").wait().await;
+        if result.is_ok() {
+            self.lease_owner.take();
+        }
+        result
+    }
+    pub async fn kill(&mut self) -> std::io::Result<()> {
+        let result = self.child.as_mut().expect("retained child").kill().await;
+        if result.is_ok() {
+            self.lease_owner.take();
+        }
+        result
+    }
+    pub fn streams_drained(&self) -> bool {
+        self.child
+            .as_ref()
+            .is_some_and(|c| c.stdout.is_none() && c.stderr.is_none())
+    }
+    #[cfg(windows)]
+    pub fn raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        self.child.as_ref().and_then(Child::raw_handle)
+    }
+}
+impl Drop for CustodiedChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let owner = self.owner.take();
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let mut owner =
+                crate::admitted_payload::ReapOwner::new(owner).with_lease(self.lease_owner.take());
+            runtime.spawn(async move {
+                if child.wait().await.is_ok() {
+                    owner.reaped();
+                }
+            });
+        } else {
+            // No executor can establish a terminal wait. Preserve the physical
+            // owners until process exit rather than falsely releasing custody.
+            if let Some(owner) = owner {
+                std::mem::forget(owner);
+            }
+            if let Some(lease) = self.lease_owner.take() {
+                std::mem::forget(lease);
+            }
+        }
+    }
+}
+struct OwnedStream<R> {
+    stream: R,
+    _owner: Arc<AdmittedPayload>,
+}
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for OwnedStream<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}

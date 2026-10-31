@@ -168,6 +168,8 @@ fn modeled_pin_policy_matches_protocol_emission_and_import_warning() {
     use crate::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
     for (protocol, security, emitted) in [
         (Protocol::Trojan, None, true),
+        (Protocol::Trojan, Some(SecurityMode::Tls), true),
+        (Protocol::Trojan, Some(SecurityMode::None), false),
         (Protocol::Vless, Some(SecurityMode::Reality), false),
         (Protocol::Naive, None, false),
         (Protocol::Tor, None, false),

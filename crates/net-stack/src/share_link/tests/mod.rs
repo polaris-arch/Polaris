@@ -456,9 +456,21 @@ fn snell_capability_gate_rejects_out_of_range() {
 
 #[test]
 fn snell_obfs_capability_gate() {
-    // v4 tls 混淆（Surge 旧形态）/ v6 带 obfs：sing-box snell 无对应能力 → 拒。
-    assert!(parse_err("snell://pw@s.com:443?version=4&obfs=tls#n").contains("obfs 不受支持"));
-    assert!(parse_err("snell://pw@s.com:443?version=6&obfs=http#n").contains("obfs 不受支持"));
+    // v4 TLS is supported; unknown modes and v6 active obfs still reject.
+    assert_eq!(
+        parse_ok("snell://pw@s.com:443?version=4&obfs=tls#n")
+            .snell_settings
+            .unwrap()
+            .obfs_mode
+            .as_deref(),
+        Some("tls")
+    );
+    for (version, mode) in [(4, "unknown"), (6, "http"), (6, "tls")] {
+        assert!(parse_err(&format!(
+            "snell://pw@s.com:443?version={version}&obfs={mode}#n"
+        ))
+        .contains("obfs 不受支持"));
+    }
     // obfs=none / 缺省 → 不设混淆，不拒。
     assert!(parse_ok("snell://pw@s.com:443?version=4&obfs=none#n")
         .snell_settings
@@ -1848,4 +1860,44 @@ fn vision_transport_import_retains_original_nodes_and_safe_warnings() {
     assert!(
         polaris_config_engine::builder::outbound::validate_vision_transport(&restored[1]).is_ok()
     );
+}
+
+#[test]
+fn snell_tls_aliases_credentials_and_host_roundtrip() {
+    for alias in ["obfs", "obfs-mode"] {
+        for version in ["", "version=4&", "v=4&"] {
+            for (query, host) in [
+                ("", None),
+                ("&obfs-host=", None),
+                ("&obfs-host=Cover.Example", Some("Cover.Example")),
+            ] {
+                let c = parse_ok(&format!("snell://part1%3Apart2%2Bsecret@s.example:443?{version}{alias}=TLS{query}#named"));
+                assert_eq!(c.password.as_deref(), Some("part1:part2+secret"));
+                let sn = c.snell_settings.as_deref().unwrap();
+                assert_eq!(sn.version, 4);
+                assert_eq!(sn.obfs_mode.as_deref(), Some("tls"));
+                assert_eq!(sn.obfs_host.as_deref(), host);
+                let again = parse_ok(&encode_share_url(&c).unwrap());
+                assert_eq!(again.snell_settings, c.snell_settings);
+                assert_eq!(again.password, c.password);
+                assert_eq!(again.name, c.name);
+            }
+        }
+    }
+    for mode in ["", "none"] {
+        let c = parse_ok(&format!(
+            "snell://pw@s.example:443?obfs={mode}&obfs-host=inactive.example"
+        ));
+        let sn = c.snell_settings.as_deref().unwrap();
+        assert!(sn.obfs_mode.is_none() && sn.obfs_host.is_none());
+    }
+    for mode in ["default", "unshaped", "unsafe-raw"] {
+        let c = parse_ok(&format!("snell://pw@s.example:443?v=6&mode={mode}&reuse=1&network=udp&userkey=key&obfs-host=inactive.example"));
+        let sn = c.snell_settings.as_deref().unwrap();
+        assert_eq!(sn.mode.as_deref(), (mode != "default").then_some(mode));
+        assert!(sn.obfs_mode.is_none() && sn.obfs_host.is_none());
+        assert_eq!(sn.reuse, Some(true));
+        assert_eq!(sn.network.as_deref(), Some("udp"));
+        assert_eq!(sn.userkey.as_deref(), Some("key"));
+    }
 }

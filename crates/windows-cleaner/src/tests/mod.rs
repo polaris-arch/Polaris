@@ -12,6 +12,13 @@ fn roles_are_closed() {
     for (args, expected) in [
         (vec!["--launch"], Some(Role::Launcher)),
         (vec!["--worker"], Some(Role::Worker)),
+        (
+            vec!["--sweep-installed-cores"],
+            Some(Role::SweepInstalledCores),
+        ),
+        (vec!["--sweep-installed-cores", "--pid", "1"], None),
+        (vec!["--install-worker"], None),
+        (vec!["--install-worker", "--command", "any"], None),
         (vec![], None),
         (vec!["--worker", "C:\\other"], None),
         (vec!["--service", "Other"], None),
@@ -90,4 +97,28 @@ fn unknown_exit_does_not_become_success() {
     assert_eq!(Outcome::from_code(3), Outcome::Partial);
     assert_eq!(Outcome::from_code(20), Outcome::Cancelled);
     assert_eq!(Outcome::from_code(259), Outcome::LaunchFailed);
+}
+
+#[cfg(windows)]
+#[test]
+fn install_role_requires_exact_data_file() {
+    let args = [
+        "--install-worker",
+        "--request",
+        r"C:\Users\user\install-request.json",
+    ];
+    assert!(matches!(
+        role(args.into_iter().map(Into::into)),
+        Some(Role::InstallWorker(_))
+    ));
+    for path in ["relative/install-request.json", r"C:\x\different.json"] {
+        assert_eq!(
+            role(
+                ["--install-worker", "--request", path]
+                    .into_iter()
+                    .map(Into::into)
+            ),
+            None
+        );
+    }
 }

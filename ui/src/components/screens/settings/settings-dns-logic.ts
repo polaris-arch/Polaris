@@ -6,12 +6,41 @@
  */
 import { isIpLiteral as isStrictIpLiteral } from '@/domain/ip-cidr';
 import type { CustomDnsUpstream, DnsConfig } from '@/contracts/types';
+import type { ListEntryBinding, ListEntryCommitResult, ListEntrySource } from '@/domain/list-entries';
 
 export const MAX_DOH_RACE_UPSTREAMS = 3;
 
-/** URL authority is case insensitive; path/query are protocol data and remain exact. */
+/** Same explicit edge set as the native node parser: Unicode White_Space + BOM. */
+export function trimNodeDnsSpec(spec: string): string {
+  return spec.replace(/^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+$/gu, '');
+}
+
+/** Node upstream identity follows the native planner, without URL path normalization. */
+function nodeUpstream(spec: string): { key: string; tier: 1 | 2 } | null {
+  const value = trimNodeDnsSpec(spec);
+  const authority = value.includes('://') ? value.slice(value.indexOf('://') + 3).split('/')[0] : value;
+  // Validate raw authority before IP helpers trim it or WHATWG URL cleans it.
+  if (/[\s\x00-\x1f\x7f-\x9f]/u.test(authority)) return null;
+  const url = /^(https|tls|udp):\/\/(\[[^\]]+\]|[^:/?#]+)(?::([0-9]+))?(\/[^]*)?$/.exec(value);
+  const protocol = url?.[1] ?? 'udp';
+  if (url?.[2].startsWith('[') && !url[2].includes(':')) return null;
+  const host = stripBrackets(url?.[2] ?? value);
+  if (!isStrictIpLiteral(host) || (url && protocol === 'tls' && url[4] !== undefined)) return null;
+  if (!url && value.includes('://')) return null;
+  const port = url?.[3] ?? (protocol === 'https' ? '443' : protocol === 'tls' ? '853' : '53');
+  if (!isValidPort(port)) return null;
+  try {
+    const ip = new URL(`http://${host.includes(':') ? `[${host}]` : host}/`).hostname;
+    const path = protocol === 'https' ? (!url?.[4] || url[4] === '/' ? '/dns-query' : url[4]) : '';
+    return { key: `${protocol}:${ip}:${Number(port)}:${path}`, tier: protocol === 'udp' ? 2 : 1 };
+  } catch { return null; }
+}
+
+/** URL authority is case insensitive; path/query remain exact protocol data. */
 export function dnsUpstreamIdentity(spec: string): string {
-  const value = spec.trim();
+  const node = nodeUpstream(spec);
+  if (node) return node.key;
+  const value = trimNodeDnsSpec(spec);
   try {
     const url = new URL(value);
     url.hostname = url.hostname.toLowerCase();
@@ -19,53 +48,154 @@ export function dnsUpstreamIdentity(spec: string): string {
   } catch { return value.toLowerCase(); }
 }
 
-/** 启用池变更：system 属兜底层不计额度；Tier1 达上限时拒绝第 4 个。 */
-export function nextRacePool(pool: readonly string[], id: string, on: boolean): string[] {
+export function isBuiltinNodeResolverId(id: string): boolean {
+  return id === 'ali' || id === 'dnspod' || id === 'system';
+}
+
+function selectedNodeUpstream(id: string, custom: readonly CustomDnsUpstream[]) {
+  if (!id) return null;
+  if (id === 'system') return { key: 'system', tier: 2 as const };
+  if (id === 'ali') return nodeUpstream('https://223.5.5.5/dns-query');
+  if (id === 'dnspod') return nodeUpstream('https://1.12.12.12/dns-query');
+  const item = custom.find((entry) => entry.id === id);
+  return item ? nodeUpstream(item.spec) : null;
+}
+
+export function nodeResolverTier1Count(pool: readonly string[], custom: readonly CustomDnsUpstream[]): number {
+  return new Set(pool.flatMap((id) => {
+    const upstream = selectedNodeUpstream(id, custom);
+    return upstream?.tier === 1 ? [upstream.key] : [];
+  })).size;
+}
+
+/** Equivalent encrypted entries and Tier2 consume no additional encrypted quota. */
+export function canEnableRaceUpstream(pool: readonly string[], id: string, custom: readonly CustomDnsUpstream[]): boolean {
+  if (!selectedNodeUpstream(id, custom)) return false;
+  const before = nodeResolverTier1Count(pool, custom);
+  const after = nodeResolverTier1Count([...pool, id], custom);
+  return after <= MAX_DOH_RACE_UPSTREAMS || after <= before;
+}
+
+/** Inventory is separate from enabled IDs; disabling also works for legacy invalid entries. */
+export function nextRacePool(pool: readonly string[], id: string, on: boolean, custom: readonly CustomDnsUpstream[] = []): string[] {
   const set = new Set(pool);
-  if (!on) {
-    set.delete(id);
-    return [...set];
-  }
-  if (id !== 'system' && !set.has(id)) {
-    const tier1Count = [...set].filter((value) => value !== 'system').length;
-    if (tier1Count >= MAX_DOH_RACE_UPSTREAMS) return [...set];
-  }
-  set.add(id);
+  if (!on) set.delete(id);
+  else if (canEnableRaceUpstream(pool, id, custom)) set.add(id);
   return [...set];
 }
 
-/**
- * 字符串编辑器没有实体 id，故在提交时做稳定对账：同值优先保 id，原位编辑其次保 id，新行才铸 id。
- * 新增项只进入配置库存，不自动进入启用池。
- */
-export function reconcileCustomUpstreams(
+/** Existing IDs come directly from editor rows; undefined marks an added row. */
+export interface NodeResolverInventoryRow { id?: string; spec: string }
+
+export type NodeResolverInventoryEdit =
+  | { ok: true; custom: CustomDnsUpstream[]; pool: string[]; editor?: ListEntryCommitResult }
+  | { ok: false; error: 'invalid' | 'quota' };
+
+interface InventoryContinuation {
+  custom: readonly CustomDnsUpstream[];
+  pool: readonly string[];
+  selection: readonly ({ source: string } | { literal: string })[];
+}
+function inventoryContinuation(value: unknown, previous: readonly CustomDnsUpstream[], pool: readonly string[]): InventoryContinuation | undefined {
+  if (!value || typeof value !== 'object' || !('custom' in value) || !Array.isArray(value.custom)
+    || !('pool' in value) || !Array.isArray(value.pool) || !('selection' in value) || !Array.isArray(value.selection)) return undefined;
+  if (value.custom.length !== previous.length || !value.custom.every((row, index) => row?.id === previous[index].id && row?.spec === previous[index].spec)
+    || value.pool.length !== pool.length || !value.pool.every((id, index) => id === pool[index])
+    || !value.selection.every((token) => token && (typeof token.source === 'string' || typeof token.literal === 'string'))) return undefined;
+  return value as InventoryContinuation;
+}
+
+/** Pure inventory/selection transaction. Row provenance survives until after
+ * canonical merging, so an explicit deletion can never be mistaken for editing. */
+export function editNodeResolverInventory(
   previous: readonly CustomDnsUpstream[],
-  specs: readonly string[],
-  createId: () => string
-): CustomDnsUpstream[] {
-  const used = new Set<string>();
-  const seenSpecs = new Set<string>();
-  // 后续仍以原值出现的条目先保留其 id；否则在列表头插入新项会“偷走”下一行的启用身份。
-  const incomingSpecs = new Set(specs.map((spec) => dnsUpstreamIdentity(spec)).filter(Boolean));
-  const reserved = new Set(
-    previous.filter((item) => incomingSpecs.has(dnsUpstreamIdentity(item.spec))).map((item) => item.id)
-  );
-  const next: CustomDnsUpstream[] = [];
-  for (let index = 0; index < specs.length; index += 1) {
-    const spec = specs[index].trim();
-    const specKey = dnsUpstreamIdentity(spec);
-    if (!spec || seenSpecs.has(specKey)) continue;
-    seenSpecs.add(specKey);
-    const exact = previous.find((item) => !used.has(item.id) && dnsUpstreamIdentity(item.spec) === specKey);
-    const samePosition = previous[index];
-    const samePositionAvailable = samePosition && !used.has(samePosition.id) && !reserved.has(samePosition.id);
-    const remaining = previous.find((item) => !used.has(item.id) && !reserved.has(item.id));
-    const id = exact?.id ??
-      (samePositionAvailable ? samePosition.id : remaining?.id ?? createId());
-    used.add(id);
-    next.push({ id, spec });
+  pool: readonly string[],
+  rows: readonly NodeResolverInventoryRow[],
+  createId: () => string,
+  editorInput?: { sources: readonly ListEntrySource[]; context?: unknown },
+): NodeResolverInventoryEdit {
+  if (editorInput && (editorInput.sources.length !== rows.length || new Set(editorInput.sources.map((source) => source.key)).size !== rows.length)) return { ok: false, error: 'invalid' };
+  const bindings: ListEntryBinding[] = [];
+  const custom: CustomDnsUpstream[] = [];
+  const representatives = new Map<string, string>();
+  const sourceIds = new Set<string>();
+  const selectedIds = new Map<string, string>();
+  const previousIds = new Set(previous.map((item) => item.id));
+  for (const [index, row] of rows.entries()) {
+    const binding: ListEntryBinding = { key: editorInput?.sources[index].key ?? '', primary: false };
+    bindings.push(binding);
+    if (row.id !== undefined) {
+      if (!previousIds.has(row.id) || sourceIds.has(row.id)) return { ok: false, error: 'invalid' };
+      sourceIds.add(row.id);
+    }
+    const spec = trimNodeDnsSpec(row.spec);
+    if (!spec) continue;
+    // A custom row with a builtin ID is stored but never used as an endpoint;
+    // do not merge an effective custom endpoint into this shadowed ID.
+    if (row.id !== undefined && isBuiltinNodeResolverId(row.id)) {
+      custom.push({ id: row.id, spec });
+      binding.id = row.id; binding.primary = true;
+      continue;
+    }
+    const key = dnsUpstreamIdentity(spec);
+    const representative = representatives.get(key);
+    if (representative !== undefined) {
+      if (row.id !== undefined) selectedIds.set(row.id, representative);
+      binding.id = representative;
+      continue;
+    }
+    const id = row.id ?? createId();
+    if (row.id === undefined && (previousIds.has(id) || isBuiltinNodeResolverId(id) || custom.some((item) => item.id === id))) return { ok: false, error: 'invalid' };
+    representatives.set(key, id);
+    if (row.id !== undefined) selectedIds.set(row.id, id);
+    custom.push({ id, spec });
+    binding.id = id; binding.primary = true;
   }
-  return next;
+  let selection: InventoryContinuation['selection'] = [];
+  let nextPool = [...new Set(pool.flatMap((id) => {
+    if (isBuiltinNodeResolverId(id) || !previousIds.has(id)) return [id];
+    const representative = selectedIds.get(id);
+    return representative === undefined ? [] : [representative];
+  }))];
+  if (editorInput) {
+    const continuation = inventoryContinuation(editorInput.context, previous, pool);
+    if (continuation) {
+      const originToSource = new Map<string, string>();
+      for (const source of editorInput.sources) {
+        for (const origin of source.origins) {
+          if (originToSource.has(origin)) return { ok: false, error: 'invalid' };
+          originToSource.set(origin, source.key);
+        }
+      }
+      selection = continuation.selection.flatMap<InventoryContinuation['selection'][number]>((token) => {
+        if ('literal' in token) return [token];
+        const source = originToSource.get(token.source);
+        return source === undefined ? [] : [{ source }];
+      });
+    } else {
+      selection = pool.flatMap<InventoryContinuation['selection'][number]>((id) => {
+        if (isBuiltinNodeResolverId(id) || !previousIds.has(id)) return [{ literal: id }];
+        const index = rows.findIndex((row) => row.id === id);
+        return index < 0 ? [] : [{ source: editorInput.sources[index].key }];
+      });
+    }
+    const bySource = new Map(bindings.map((binding) => [binding.key, binding.id]));
+    selection = selection.filter((token) => 'literal' in token || bySource.get(token.source) !== undefined);
+    nextPool = [...new Set(selection.map((token) => 'literal' in token ? token.literal : bySource.get(token.source)!))];
+  }
+  // Builtin IDs shadow custom inventory in the native lookup as well.
+  const effectiveCustomSelected = (id: string, ids: readonly string[]) => !isBuiltinNodeResolverId(id) && ids.includes(id);
+  if (custom.some((item) => !nodeUpstream(item.spec) && (
+    effectiveCustomSelected(item.id, nextPool) ||
+    !previous.some((old) => old.id === item.id && trimNodeDnsSpec(old.spec) === item.spec && !effectiveCustomSelected(old.id, pool))
+  ))) return { ok: false, error: 'invalid' };
+  if (nodeResolverTier1Count(nextPool, custom) > MAX_DOH_RACE_UPSTREAMS) return { ok: false, error: 'quota' };
+  if (!editorInput) return { ok: true, custom, pool: nextPool };
+  return { ok: true, custom, pool: nextPool, editor: {
+    acceptedRows: custom.map((item) => ({ value: item.spec, id: item.id })), acceptedSources: bindings,
+    context: { custom: custom.map((item) => ({ ...item })), pool: [...nextPool], selection } satisfies InventoryContinuation,
+    contextKey: JSON.stringify(nextPool),
+  } };
 }
 
 export interface ParsedDnsServer {
@@ -177,11 +307,9 @@ export function fakeIpTogglePatch(next: boolean): Partial<DnsConfig> {
 
 /** 自定义节点解析上游只能是 IP 形态；空行代表尚未输入。 */
 export function isPureIpDnsSpec(spec: string): boolean {
-  const s = spec.trim();
+  const s = trimNodeDnsSpec(spec);
   if (!s) return true;
-  if (/^tls:/i.test(s)) return false; // Node pre-resolution supports HTTPS/UDP, not DoT.
-  const parsed = parseDnsServerSpec(s);
-  return parsed ? isStrictIpLiteral(parsed.server) : false;
+  return nodeUpstream(s) !== null;
 }
 
 export const DNS_FALLBACK = {

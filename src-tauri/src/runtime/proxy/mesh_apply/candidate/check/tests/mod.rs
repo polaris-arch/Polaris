@@ -479,7 +479,7 @@ mod linux_tests {
     fn historical_alpha125_retains_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 9);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 10);
         let replacement = &REVIEWED_CHECK_IDENTITIES[7];
         assert_eq!(
             replacement.source_commit,
@@ -554,10 +554,10 @@ mod linux_tests {
     }
 
     #[test]
-    fn alpha126_requires_its_exact_source_contract_and_actual_elf() {
+    fn historical_alpha126_requires_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 9);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 10);
         let replacement = &REVIEWED_CHECK_IDENTITIES[8];
         assert_eq!(
             replacement.source_commit,
@@ -571,17 +571,6 @@ mod linux_tests {
         assert_eq!(
             reviewed_compiled_profile(replacement.source_commit, contract),
             Ok(LinuxCheckProfile::BFCDF96)
-        );
-        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
-        assert_eq!(
-            polaris_updater::verify::sha256_hex(binding.as_bytes()),
-            contract
-        );
-        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
-        assert_eq!(binding["sourceCommit"], replacement.source_commit);
-        assert_eq!(
-            binding["platforms"]["linux"]["core"]["sha256"],
-            replacement.binary_sha256
         );
         assert_eq!(
             LinuxCheckProfile::BFCDF96.binary_sha256(),
@@ -643,6 +632,97 @@ mod linux_tests {
     }
 
     #[test]
+    fn alpha127_requires_its_exact_source_contract_and_actual_elf() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 10);
+        let replacement = &REVIEWED_CHECK_IDENTITIES[9];
+        assert_eq!(
+            replacement.source_commit,
+            "3155c9151f553967aabcee93f09e51084fc89899"
+        );
+        let contract = replacement.contract_sha256.unwrap();
+        assert_eq!(
+            contract,
+            "9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf"
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, contract),
+            Ok(LinuxCheckProfile::E3155C9)
+        );
+        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
+        assert_eq!(
+            polaris_updater::verify::sha256_hex(binding.as_bytes()),
+            contract
+        );
+        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+        assert_eq!(binding["sourceCommit"], replacement.source_commit);
+        assert_eq!(
+            binding["platforms"]["linux"]["core"]["sha256"],
+            replacement.binary_sha256
+        );
+        assert_eq!(
+            LinuxCheckProfile::E3155C9.binary_sha256(),
+            "1188baf18f7e4d9d4daabcf01633d72a2174ccb95ed71847d5032d857ad6679b"
+        );
+        assert_eq!(
+            LinuxCheckProfile::E3155C9.input_profile(),
+            LinuxInputProfile::E3155C9
+        );
+        assert!(matches!(
+            LinuxCheckProfile::E3155C9.input_profile(),
+            LinuxInputProfile::PlainTcpCheckV1(_)
+        ));
+        assert!(LinuxCheckProfile::E3155C9
+            .execution_profile()
+            .contains("3155c9:runtime-evidence-pending"));
+        for digest in [
+            "",
+            "unknown",
+            replacement.binary_sha256,
+            REVIEWED_CHECK_IDENTITIES[1].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[2].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[3].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[4].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[5].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[6].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[7].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[8].contract_sha256.unwrap(),
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(replacement.source_commit, digest),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        for source in [
+            "",
+            "unknown",
+            REVIEWED_CHECK_IDENTITIES[0].source_commit,
+            REVIEWED_CHECK_IDENTITIES[1].source_commit,
+            REVIEWED_CHECK_IDENTITIES[2].source_commit,
+            REVIEWED_CHECK_IDENTITIES[3].source_commit,
+            REVIEWED_CHECK_IDENTITIES[4].source_commit,
+            REVIEWED_CHECK_IDENTITIES[5].source_commit,
+            REVIEWED_CHECK_IDENTITIES[6].source_commit,
+            REVIEWED_CHECK_IDENTITIES[7].source_commit,
+            REVIEWED_CHECK_IDENTITIES[8].source_commit,
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(source, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&replacement.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+
+    #[test]
     fn candidate_test_selection_requires_exact_opt_in_or_reviewed_compiled_identity() {
         use super::super::select_test_core;
         use std::ffi::OsStr;
@@ -662,6 +742,7 @@ mod linux_tests {
             LinuxCheckProfile::E0CFA24,
             LinuxCheckProfile::E332935,
             LinuxCheckProfile::BFCDF96,
+            LinuxCheckProfile::E3155C9,
         ] {
             for required in [false, true] {
                 assert_eq!(
@@ -684,6 +765,10 @@ mod linux_tests {
                 "c002",
                 "a4d085",
                 "0cfa24",
+                "3155c9",
+                "3155c9151f553967aabcee93f09e51084fc89899",
+                "9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf",
+                "1188baf18f7e4d9d4daabcf01633d72a2174ccb95ed71847d5032d857ad6679b",
                 "bfcdf96",
                 "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
                 "66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f",
@@ -762,6 +847,7 @@ mod linux_tests {
             LinuxCheckProfile::E0CFA24,
             LinuxCheckProfile::E332935,
             LinuxCheckProfile::BFCDF96,
+            LinuxCheckProfile::E3155C9,
         ] {
             for path in [dir.join("missing"), wrong.clone(), link.clone()] {
                 assert!(matches!(
@@ -800,6 +886,24 @@ mod linux_tests {
             (LinuxCheckProfile::E332935, LinuxCheckProfile::E0CFA24),
             (LinuxCheckProfile::E0CFA24, LinuxCheckProfile::E332935),
             (LinuxCheckProfile::E332935, LinuxCheckProfile::C6C0D8),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::B609),
+            (LinuxCheckProfile::B609, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::FE182),
+            (LinuxCheckProfile::FE182, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::C002),
+            (LinuxCheckProfile::C002, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::A4D085),
+            (LinuxCheckProfile::A4D085, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::E814DA),
+            (LinuxCheckProfile::E814DA, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::C6C0D8),
+            (LinuxCheckProfile::C6C0D8, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::E0CFA24),
+            (LinuxCheckProfile::E0CFA24, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::E332935),
+            (LinuxCheckProfile::E332935, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::BFCDF96),
+            (LinuxCheckProfile::BFCDF96, LinuxCheckProfile::E3155C9),
             (LinuxCheckProfile::C6C0D8, LinuxCheckProfile::E332935),
         ] {
             let (dir, runtime, snapshot, input, plan) = fixture();
@@ -1075,7 +1179,7 @@ mod linux_tests {
     }
 
     #[tokio::test]
-    async fn timeout_reaps_without_publishing_any_artifact() {
+    async fn unadmitted_file_pin_cannot_reach_timeout_or_publish_artifact() {
         let Some((binary_path, profile)) = selected_core_for_test() else {
             return;
         };
@@ -1086,7 +1190,7 @@ mod linux_tests {
                 .unwrap();
         assert_eq!(
             linux::run_check(binary, config, Duration::ZERO).await,
-            Err(CandidateCheckError::TimedOut)
+            Err(CandidateCheckError::Unsupported)
         );
         assert!(!dir.join("mesh-routes").exists());
     }
@@ -1106,6 +1210,7 @@ mod linux_tests {
             LinuxCheckProfile::E0CFA24,
             LinuxCheckProfile::E332935,
             LinuxCheckProfile::BFCDF96,
+            LinuxCheckProfile::E3155C9,
         ] {
             if substituted != profile {
                 assert!(matches!(
@@ -1117,7 +1222,7 @@ mod linux_tests {
     }
 
     #[tokio::test]
-    async fn sealed_binary_execution_survives_source_path_replacement_but_identity_detects_it() {
+    async fn old_file_pin_never_authorizes_execution_even_after_source_replacement() {
         let Some((binary_path, profile)) = selected_core_for_test() else {
             return;
         };
@@ -1146,7 +1251,7 @@ mod linux_tests {
                 .unwrap();
         assert_eq!(
             linux::run_check(binary, config, Duration::from_secs(8)).await,
-            Ok(())
+            Err(CandidateCheckError::Unsupported)
         );
         let after = FileSnapshot::path(&source).unwrap();
         assert!(!before.same_snapshot(&after));
@@ -1157,7 +1262,7 @@ mod linux_tests {
     }
 
     #[tokio::test]
-    async fn closed_standard_descriptors_still_execute_the_sealed_binary() {
+    async fn closed_standard_descriptors_do_not_turn_old_file_pin_into_authority() {
         let child_marker = std::env::var_os("POLARIS_CLOSED_STD_CHILD_MARKER");
         let Some((binary_path, profile)) = selected_core_for_test() else {
             assert!(
@@ -1209,22 +1314,24 @@ mod linux_tests {
                 )
                 .map_err(|e| format!("sealed config: {e:?}"))?;
                 writeln!(diagnostic, "sealed inputs ready").map_err(|e| e.to_string())?;
-                linux::run_check(binary, config, Duration::from_secs(8))
-                    .await
-                    .map_err(|e| format!("sealed check: {e:?}"))?;
-                writeln!(diagnostic, "sealed check succeeded").map_err(|e| e.to_string())?;
+                assert_eq!(
+                    linux::run_check(binary, config, Duration::from_secs(8)).await,
+                    Err(CandidateCheckError::Unsupported)
+                );
+                writeln!(diagnostic, "old file pin refused before factory")
+                    .map_err(|e| e.to_string())?;
                 Ok(())
             }
             .await;
             saved.restore().unwrap();
             writeln!(diagnostic, "result: {checked:?}").unwrap();
             checked.unwrap();
-            fs::write(marker, b"checked with 0/1/2 closed").unwrap();
+            fs::write(marker, b"refused with 0/1/2 closed").unwrap();
             return;
         }
         let dir = TestDir::new("polaris-check-closed-std-");
         let marker = dir.join("checked");
-        let test_name = "runtime::proxy::mesh_apply::candidate::check::tests::linux_tests::closed_standard_descriptors_still_execute_the_sealed_binary";
+        let test_name = "runtime::proxy::mesh_apply::candidate::check::tests::linux_tests::closed_standard_descriptors_do_not_turn_old_file_pin_into_authority";
         let mut child = ReapedChild(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
@@ -1266,7 +1373,7 @@ mod linux_tests {
         assert!(!timed_out && status.success(),
             "closed-stdio child status={} timed_out={timed_out}; {diagnostic}; stdout={}; stderr={}",
             status, String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
-        assert_eq!(fs::read(marker).unwrap(), b"checked with 0/1/2 closed");
+        assert_eq!(fs::read(marker).unwrap(), b"refused with 0/1/2 closed");
     }
 
     fn sealed_fixture_binary(path: &str) -> fs::File {
@@ -1302,56 +1409,14 @@ mod linux_tests {
     }
 
     #[tokio::test]
-    async fn caller_cancellation_before_and_after_spawn_leaves_no_child() {
-        let dir = TestDir::new("polaris-check-cancel-");
-        let marker = dir.join("should-not-exist");
-        let binary = sealed_fixture_binary("/bin/sh");
-        let mut before =
-            tokio::process::Command::new(format!("/proc/self/fd/{}", binary.as_raw_fd()));
-        before.arg("-c").arg("touch \"$1\"").arg("sh").arg(&marker);
+    async fn raw_sealed_lifecycle_fixture_is_unadmitted_not_a_public_executor() {
+        let binary = sealed_fixture_binary("/bin/true");
         let config = linux::sealed_config(b"{}").unwrap();
-        let (notifier, notified) = tokio::sync::oneshot::channel();
-        let never_polled = linux::supervise(
-            before,
-            binary,
-            config,
-            Duration::from_secs(8),
-            Some(notifier),
+        assert_eq!(
+            linux::run_check(binary, config, Duration::from_secs(8)).await,
+            Err(CandidateCheckError::Unsupported)
         );
-        drop(never_polled);
-        assert!(notified.await.is_err());
-        assert!(!marker.exists());
-
-        let binary = sealed_fixture_binary("/bin/sleep");
-        let mut after =
-            tokio::process::Command::new(format!("/proc/self/fd/{}", binary.as_raw_fd()));
-        // Rust coreutils is a multicall ELF on this host; preserve the original
-        // sleep fixture's argv0. This never alters the strict production profile.
-        after.as_std_mut().arg0("sleep");
-        after
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let config = linux::sealed_config(b"{}").unwrap();
-        let (notifier, notified) = tokio::sync::oneshot::channel();
-        let caller = tokio::spawn(linux::supervise(
-            after,
-            binary,
-            config,
-            Duration::from_secs(8),
-            Some(notifier),
-        ));
-        let pid = notified.await.unwrap();
-        assert!(PathBuf::from(format!("/proc/{pid}")).exists());
-        caller.abort();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while PathBuf::from(format!("/proc/{pid}")).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("cancelled child must be killed and reaped");
-        assert!(caller.await.unwrap_err().is_cancelled());
+        // Positive native cancellation/FD0/owner tests now live inside the
+        // supervisor's private policy factory, not a public File constructor.
     }
 }

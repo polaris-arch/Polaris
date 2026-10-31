@@ -1,6 +1,6 @@
 use super::*;
 
-fn spawn_crash_test_child() -> tokio::process::Child {
+fn spawn_crash_test_child() -> crate::runtime::core_child::Child {
     let mut cmd = if cfg!(windows) {
         let mut cmd = tokio::process::Command::new("powershell");
         cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
@@ -10,7 +10,10 @@ fn spawn_crash_test_child() -> tokio::process::Child {
         cmd.arg("30");
         cmd
     };
-    cmd.kill_on_drop(true).spawn().expect("spawn stand-in")
+    cmd.kill_on_drop(true)
+        .spawn()
+        .expect("spawn stand-in")
+        .into()
 }
 
 fn crash_event_for_test(rt: &Arc<ProxyRuntime>, generation: u64) -> CrashEvent {

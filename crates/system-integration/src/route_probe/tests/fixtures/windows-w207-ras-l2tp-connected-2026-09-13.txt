@@ -1,5 +1,5 @@
 ════════════════════════════════════════════════════════════════════════
-Polaris route_probe 真机抓取（Windows）
+Polaris route_probe 保形脱敏衍生样本（Windows）
 
 读这份样本、准备照着写解析器的人，先看这三条：
 
@@ -21,16 +21,16 @@ Polaris route_probe 真机抓取（Windows）
 @@@GET_NETADAPTER 必须带 InterfaceType（IANA ifType）：131 = IF_TYPE_TUNNEL，6 = 以太网。
 隧道名单只能靠它判 —— 这台机器上实测 Teredo / IP-HTTPS / 6to4 三个隧道全是 131，
 两块以太网卡是 6。两条看着可行的土办法都必错：「描述列为空」恰好圈中 Teredo/IP-HTTPS/6to4，
-但 Tailscale 的 wintun **有**描述；「没有 MAC」会把内核调试适配器一起圈进来，而 wintun **自带** MAC。
+但 Tailscale 的 wintun **有**描述；「没有 F14」会把内核调试适配器一起圈进来，而 wintun **自带** F14。
 ComponentID / NdisPhysicalMedium 一并带上作交叉判据。
 
-落库：把本文件原样放进
+落库：先脱敏身份字段，再保留格式放进
   polaris/crates/system-integration/src/route_probe/tests/fixtures/
 不要手工规整（行尾空格、对齐、空行、CRLF 都是证据）。
 ════════════════════════════════════════════════════════════════════════
 @@@META
 platform=windows
-host=sway
+host=win1
 label=ras-l2tp-visibility
 date=2026-09-13 13:51:74 +08:00
 script=polaris-collect-routes-windows.ps1
@@ -55,34 +55,34 @@ IPv4 Route Table
 ===========================================================================
 Active Routes:
 Network Destination        Netmask          Gateway       Interface  Metric
-          0.0.0.0          0.0.0.0     192.168.10.1   192.168.10.207   4241
-          0.0.0.0          0.0.0.0         On-link        10.55.0.10     26
-       10.55.0.10  255.255.255.255         On-link        10.55.0.10    281
+          0.0.0.0          0.0.0.0     192.168.50.4   192.168.50.244   4241
+          0.0.0.0          0.0.0.0         On-link        10.55.0.27     26
+       10.55.0.27  255.255.255.255         On-link        10.55.0.27    281
         127.0.0.0        255.0.0.0         On-link         127.0.0.1  10036
         127.0.0.1  255.255.255.255         On-link         127.0.0.1  10036
   127.255.255.255  255.255.255.255         On-link         127.0.0.1  10036
-      169.254.0.0      255.255.0.0         On-link    169.254.83.107   4486
-   169.254.83.107  255.255.255.255         On-link    169.254.83.107   4486
-  169.254.255.255  255.255.255.255         On-link    169.254.83.107   4486
-     172.22.240.0    255.255.240.0         On-link      172.22.240.1   9481
-     172.22.240.1  255.255.255.255         On-link      172.22.240.1   9481
-   172.22.255.255  255.255.255.255         On-link      172.22.240.1   9481
-     192.168.10.0    255.255.255.0         On-link    192.168.10.207   4496
-   192.168.10.185  255.255.255.255         On-link    192.168.10.207   4241
-   192.168.10.207  255.255.255.255         On-link    192.168.10.207   4496
-   192.168.10.255  255.255.255.255         On-link    192.168.10.207   4496
+      169.254.0.0      255.255.0.0         On-link    169.254.10.144   4486
+   169.254.10.144  255.255.255.255         On-link    169.254.10.144   4486
+  169.254.255.255  255.255.255.255         On-link    169.254.10.144   4486
+     172.23.240.0    255.255.240.0         On-link      172.23.240.4   9481
+     172.23.240.4  255.255.255.255         On-link      172.23.240.4   9481
+   172.23.255.255  255.255.255.255         On-link      172.23.240.4   9481
+     192.168.50.0    255.255.255.0         On-link    192.168.50.244   4496
+   192.168.50.222  255.255.255.255         On-link    192.168.50.244   4241
+   192.168.50.244  255.255.255.255         On-link    192.168.50.244   4496
+   192.168.50.255  255.255.255.255         On-link    192.168.50.244   4496
         224.0.0.0        240.0.0.0         On-link         127.0.0.1  10036
-        224.0.0.0        240.0.0.0         On-link    192.168.10.207   4496
-        224.0.0.0        240.0.0.0         On-link      172.22.240.1   9481
-        224.0.0.0        240.0.0.0         On-link        10.55.0.10     26
+        224.0.0.0        240.0.0.0         On-link    192.168.50.244   4496
+        224.0.0.0        240.0.0.0         On-link      172.23.240.4   9481
+        224.0.0.0        240.0.0.0         On-link        10.55.0.27     26
   255.255.255.255  255.255.255.255         On-link         127.0.0.1  10036
-  255.255.255.255  255.255.255.255         On-link    192.168.10.207   4496
-  255.255.255.255  255.255.255.255         On-link      172.22.240.1   9481
-  255.255.255.255  255.255.255.255         On-link        10.55.0.10    281
+  255.255.255.255  255.255.255.255         On-link    192.168.50.244   4496
+  255.255.255.255  255.255.255.255         On-link      172.23.240.4   9481
+  255.255.255.255  255.255.255.255         On-link        10.55.0.27    281
 ===========================================================================
 Persistent Routes:
   Network Address          Netmask  Gateway Address  Metric
-          0.0.0.0          0.0.0.0     192.168.10.1       1
+          0.0.0.0          0.0.0.0     192.168.50.4       1
 ===========================================================================
 @@@ROUTE_PRINT_6
 ===========================================================================
@@ -188,21 +188,21 @@ DestinationPrefix  InterfaceAlias              InterfaceIndex NextHop      Route
 255.255.255.255/32 OpenVPN TAP-Windows6                     3 0.0.0.0              256 ActiveStore
 169.254.0.0/16     Tailscale                                7 0.0.0.0              256 ActiveStore
 169.254.255.255/32 Tailscale                                7 0.0.0.0              256 ActiveStore
-169.254.83.107/32  Tailscale                                7 0.0.0.0              256 ActiveStore
-0.0.0.0/0          以太网                                      8 192.168.10.1           1 ActiveStore
-192.168.10.0/24    以太网                                      8 0.0.0.0              256 ActiveStore
-192.168.10.185/32  以太网                                      8 0.0.0.0                1 ActiveStore
-192.168.10.207/32  以太网                                      8 0.0.0.0              256 ActiveStore
-192.168.10.255/32  以太网                                      8 0.0.0.0              256 ActiveStore
+169.254.10.144/32  Tailscale                                7 0.0.0.0              256 ActiveStore
+0.0.0.0/0          以太网                                      8 192.168.50.4           1 ActiveStore
+192.168.50.0/24    以太网                                      8 0.0.0.0              256 ActiveStore
+192.168.50.222/32  以太网                                      8 0.0.0.0                1 ActiveStore
+192.168.50.244/32  以太网                                      8 0.0.0.0              256 ActiveStore
+192.168.50.255/32  以太网                                      8 0.0.0.0              256 ActiveStore
 224.0.0.0/4        以太网                                      8 0.0.0.0              256 ActiveStore
 255.255.255.255/32 以太网                                      8 0.0.0.0              256 ActiveStore
-172.22.240.0/20    vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
-172.22.240.1/32    vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
-172.22.255.255/32  vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+172.23.240.0/20    vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+172.23.240.4/32    vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
+172.23.255.255/32  vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
 224.0.0.0/4        vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
 255.255.255.255/32 vEthernet (Default Switch)              25 0.0.0.0              256 ActiveStore
 0.0.0.0/0          PolarisProbeL2TP                        35 0.0.0.0                1 ActiveStore
-10.55.0.10/32      PolarisProbeL2TP                        35 0.0.0.0              256 ActiveStore
+10.55.0.27/32      PolarisProbeL2TP                        35 0.0.0.0              256 ActiveStore
 224.0.0.0/4        PolarisProbeL2TP                        35 0.0.0.0                1 ActiveStore
 255.255.255.255/32 PolarisProbeL2TP                        35 0.0.0.0              256 ActiveStore
 
@@ -250,11 +250,11 @@ IPAddress                               PrefixLength AddressFamily InterfaceAlia
 ---------                               ------------ ------------- --------------              --------------
 127.0.0.1                                          8          IPv4 Loopback Pseudo-Interface 1              1
 ::1                                              128          IPv6 Loopback Pseudo-Interface 1              1
-169.254.59.38                                     16          IPv4 OpenVPN TAP-Windows6                     3
+169.254.76.55                                     16          IPv4 OpenVPN TAP-Windows6                     3
 fe80::042f:65e0:22cd:b6c3%3                       64          IPv6 OpenVPN TAP-Windows6                     3
-169.254.83.107                                    16          IPv4 Tailscale                                7
+169.254.10.144                                    16          IPv4 Tailscale                                7
 fe80::e0f0:5ebb:ee26:2479%7                       64          IPv6 Tailscale                                7
-192.168.10.207                                    24          IPv4 以太网                                      8
+192.168.50.244                                    24          IPv4 以太网                                      8
 530d:ebd9:89bf:95d8:43be:99b4:ba0f:0c98          128          IPv6 以太网                                      8
 530d:ebd9:89bf:95d8:cd4d:928b:0ec2:d413           64          IPv6 以太网                                      8
 16f7:9c0:d0e5:569d:47cb:939e:c4d:1bdf             64          IPv6 以太网                                      8
@@ -264,9 +264,9 @@ fe80::8578:0cf5:9048:f4a2%8                       64          IPv6 以太网    
 8db8:e8a1:92da:9f6b:4dd0:180b:be64:7b73           64          IPv6 以太网                                      8
 8db8:e8a1:92da:9f6b::2bb                         128          IPv6 以太网                                      8
 8db8:e8a1:92da:9f6b:43be:99b4:ba0f:0c98          128          IPv6 以太网                                      8
-172.22.240.1                                      20          IPv4 vEthernet (Default Switch)              25
+172.23.240.4                                      20          IPv4 vEthernet (Default Switch)              25
 fe80::d84e:b2fe:810:d72f%25                       64          IPv6 vEthernet (Default Switch)              25
-10.55.0.10                                        32          IPv4 PolarisProbeL2TP                        35
+10.55.0.27                                        32          IPv4 PolarisProbeL2TP                        35
 fe80::3dc9:e6d4:60c9:c888%35                      64          IPv6 PolarisProbeL2TP                        35
 
 
@@ -285,7 +285,7 @@ Idx     Met         MTU          State                Name
 
 Windows IP Configuration
 
-   Host Name . . . . . . . . . . . . : Sway
+   Host Name . . . . . . . . . . . . : win1
    Primary Dns Suffix  . . . . . . . : 
    Node Type . . . . . . . . . . . . : Hybrid
    IP Routing Enabled. . . . . . . . : No
@@ -299,12 +299,12 @@ PPP adapter PolarisProbeL2TP:
    DHCP Enabled. . . . . . . . . . . : No
    Autoconfiguration Enabled . . . . : Yes
    Link-local IPv6 Address . . . . . : fe80::3dc9:e6d4:60c9:c888%35(Preferred) 
-   IPv4 Address. . . . . . . . . . . : 10.55.0.10(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 10.55.0.27(Preferred) 
    Subnet Mask . . . . . . . . . . . : 255.255.255.255
    Default Gateway . . . . . . . . . : 0.0.0.0
    DHCPv6 IAID . . . . . . . . . . . : 599532561
    DHCPv6 Client DUID. . . . . . . . : 84-e6-e6-84-4a-a4-a6-13-81-51-90-51-98-95
-   DNS Servers . . . . . . . . . . . : 10.55.0.1
+   DNS Servers . . . . . . . . . . . : 10.55.0.4
    NetBIOS over Tcpip. . . . . . . . : Enabled
 
 Unknown adapter Tailscale:
@@ -315,7 +315,7 @@ Unknown adapter Tailscale:
    DHCP Enabled. . . . . . . . . . . : No
    Autoconfiguration Enabled . . . . : Yes
    Link-local IPv6 Address . . . . . : fe80::e0f0:5ebb:ee26:2479%7(Preferred) 
-   Autoconfiguration IPv4 Address. . : 169.254.83.107(Preferred) 
+   Autoconfiguration IPv4 Address. . : 169.254.10.144(Preferred) 
    Subnet Mask . . . . . . . . . . . : 255.255.0.0
    Default Gateway . . . . . . . . . : 
    NetBIOS over Tcpip. . . . . . . . : Enabled
@@ -340,14 +340,14 @@ Ethernet adapter ��̫��:
    Temporary IPv6 Address. . . . . . : 8db8:e8a1:92da:9f6b:43be:99b4:ba0f:0c98(Preferred) 
    Temporary IPv6 Address. . . . . . : 16f7:9c0:d0e5:569d:43be:99b4:ba0f:0c98(Preferred) 
    Link-local IPv6 Address . . . . . : fe80::8578:0cf5:9048:f4a2%8(Preferred) 
-   IPv4 Address. . . . . . . . . . . : 192.168.10.207(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 192.168.50.244(Preferred) 
    Subnet Mask . . . . . . . . . . . : 255.255.255.0
    Default Gateway . . . . . . . . . : fe80::fff:1f0b:6e3c:e05a%8
-                                       192.168.10.1
+                                       192.168.50.4
    DHCPv6 IAID . . . . . . . . . . . : 112993297
    DHCPv6 Client DUID. . . . . . . . : 84-e6-e6-84-4a-a4-a6-13-81-51-90-51-98-95
    DNS Servers . . . . . . . . . . . : 8db8:e8a1:92da:9f6b::9
-                                       192.168.10.1
+                                       192.168.50.4
                                        8db8:e8a1:92da:9f6b::9
    NetBIOS over Tcpip. . . . . . . . : Enabled
 
@@ -368,7 +368,7 @@ Ethernet adapter vEthernet (Default Switch):
    DHCP Enabled. . . . . . . . . . . : No
    Autoconfiguration Enabled . . . . : Yes
    Link-local IPv6 Address . . . . . : fe80::d84e:b2fe:810:d72f%25(Preferred) 
-   IPv4 Address. . . . . . . . . . . : 172.22.240.1(Preferred) 
+   IPv4 Address. . . . . . . . . . . : 172.23.240.4(Preferred) 
    Subnet Mask . . . . . . . . . . . : 255.255.240.0
    Default Gateway . . . . . . . . . : 
    DHCPv6 IAID . . . . . . . . . . . : 419435869
@@ -378,7 +378,7 @@ Ethernet adapter vEthernet (Default Switch):
 
 Name             ServerAddress  TunnelType ConnectionStatus SplitTunneling
 ----             -------------  ---------- ---------------- --------------
-PolarisProbeL2TP 192.168.10.185 L2tp       Connected                 False
+PolarisProbeL2TP 192.168.50.222 L2tp       Connected                 False
 
 
 @@@GET_VPNCONNECTION_ALLUSER

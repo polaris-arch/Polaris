@@ -39,6 +39,7 @@
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
+import { InfoIcon } from '@/components/InfoIcon';
 
 import type {
   TunnelConflictKind,
@@ -80,8 +81,10 @@ export interface TunnelConflictBlockProps {
 export function TunnelConflictBlock({ report }: TunnelConflictBlockProps) {
   const { t } = useTranslation();
   return (
-    <SetBlock header={t('settings.tun.tunnelConflictBlock')}>
-      <div className="card-sub">{t('settings.tun.tunnelConflictHint')}</div>
+    <SetBlock header={<span className="sr-title">
+      <span>{t('settings.tun.tunnelConflictBlock')}</span>
+      <InfoIcon tip={t('settings.tun.tunnelConflictHint')} />
+    </span>}>
       {report === null ? (
         <div className="card-sub">{t('settings.tun.tunnelConflictUnavailable')}</div>
       ) : report.status === 'notProbed' ? (

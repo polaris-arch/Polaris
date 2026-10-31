@@ -126,6 +126,7 @@ impl std::error::Error for TempCoreCleanupUnknown {}
 
 fn spawn_cleanup_unknown(error: &SpawnError) -> Option<String> {
     match error {
+        SpawnError::Admission(_) => None,
         SpawnError::Spawn { source, .. } => {
             let error = source.get_ref()?;
             error
@@ -2597,6 +2598,8 @@ pub struct TempCoreDeps {
     pub probe_port: Arc<dyn Fn(u16) -> bool + Send + Sync>,
     /// 核日志级别（跟随用户配置；诊断态调高时临时核一并抬级，便于复现）。
     pub log_level: String,
+    /// Simultaneous measurements; smaller saved limits never raise the safety ceiling.
+    measurement_concurrency: usize,
     /// 就绪等待上限的**覆写**：`None` = 生产口径，按本批规模现算
     /// （[`temp_core_ready_timeout_ms`]）；`Some(ms)` 只给测试用，免得 gate 空等一个真实超时。
     ///
@@ -2633,6 +2636,7 @@ impl TempCoreDeps {
                 .is_ok()
             }),
             log_level,
+            measurement_concurrency: TEMP_CORE_CONCURRENCY,
             ready_timeout_override_ms: None,
             cancel: SpeedTestCancel::default(),
         }
@@ -2642,6 +2646,13 @@ impl TempCoreDeps {
     #[must_use]
     pub fn with_expected_core_sha256(mut self, digest: Option<String>) -> Self {
         self.expected_core_sha256 = digest;
+        self
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[must_use]
+    pub fn with_measurement_concurrency(mut self, concurrency: usize) -> Self {
+        self.measurement_concurrency = concurrency.clamp(1, TEMP_CORE_CONCURRENCY);
         self
     }
 
@@ -3187,14 +3198,19 @@ impl TempCoreSession {
         //
         // fire-and-forget：排空任务的生命周期由**流的 EOF** 决定（核被 `terminate()` 收掉 → 管道
         // 关闭 → 任务自然结束），不需要句柄；它也**不是任何判据的来源**，纯诊断出口。
-        let mut req = SpawnRequest::new(
+        let execution_request = crate::runtime::core_execution::run_request(
             &binary,
+            crate::runtime::core_identity::ExecPurpose::RunSpeedtest,
             &config_path,
             StdioPolicy::drain(|stdout, stderr| {
                 pipe_to_log(stdout, SPEEDTEST_CORE_TARGET, None, None);
                 pipe_to_log(stderr, SPEEDTEST_CORE_TARGET, None, None);
             }),
         );
+        let mut req = match execution_request {
+            Ok(req) => req,
+            Err(error) => return BatchOutcome::CleanupUnknown(error.to_string()),
+        };
         // 核输出进日志 sink（非 TTY）；不加 flag 会混入 ANSI 转义。CWD 设可写 config 目录，
         // 理由同主核 spawner（GUI 从 launchd 拉起时父进程 CWD=`/` 只读）。
         req.extra_args = vec!["--disable-color".to_string()];
@@ -3427,7 +3443,7 @@ impl TempCoreSession {
             let measures = drive_temp_core_measures(
                 nodes,
                 ports,
-                TEMP_CORE_CONCURRENCY,
+                deps.measurement_concurrency,
                 superseded,
                 &mut watch,
                 measure,

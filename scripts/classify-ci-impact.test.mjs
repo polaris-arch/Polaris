@@ -377,6 +377,28 @@ test('平台资源目录只选择对应腿，dashboard 走四平台', () => {
   }
 });
 
+test('independent recovery archives and inventory require the matching package and kernel gates', () => {
+  for (const [platform, leg, archive] of [
+    ['linux', 'linux', 'payload.tar.gz'],
+    ['win', 'windows', 'payload.zip'],
+    ['mac-arm64', 'macos-arm64', 'payload.tar.gz'],
+    ['mac-x64', 'macos-x64', 'payload.tar.gz'],
+  ]) {
+    for (const member of [archive, 'inventory.json']) {
+      const path = 'resources/core-recovery/' + platform + '/' + member;
+      assert.deepEqual(compact([path]), {
+        kernel: true, platforms: [leg], preflight: true, hasPackage: true,
+      }, path);
+      assert.deepEqual(classifyImpact([path]).unregisteredScopes, []);
+    }
+  }
+  for (const path of ['resources/core-recovery/layout.json', 'resources/core-recovery/unknown/inventory.json']) {
+    assert.deepEqual(compact([path]), {
+      kernel: true, platforms: [...ALL_PACKAGE_PLATFORMS], preflight: true, hasPackage: true,
+    }, path);
+  }
+});
+
 test('resources 根下的散文件不进任何包，也不进自曝表', () => {
   // 四份 conf 的 bundle.resources 只列 data/ 、dashboard/ 与本平台目录，根下文件不在包里。
   assert.deepEqual(compact(['resources/.gitkeep']), {
@@ -504,16 +526,16 @@ test('Android lifecycle observations are explicitly registered for APK validatio
   assert.equal(classifyImpact([path]).android, true);
 });
 
-// Imported siblings affect the same real packaged Linux acceptance as the CLI entries.
-test('Linux package acceptance directory cannot silently lose its package signal', () => {
+// External device tooling does not participate in the product packaging graph.
+test('Retired device tooling paths do not select product package legs', () => {
   for (const leaf of [
     'transport.mjs', 'tun-transport.mjs', 'linux.py', 'linux_tun.py',
     'root_controller.py', 'tun.py', 'future/owned-module.py',
   ]) {
     const impact = classifyImpact([`scripts/package-acceptance/${leaf}`]);
-    assert.deepEqual(impact.platforms, ['linux']);
-    assert.equal(impact.hasPackage, true);
-    assert.equal(impact.preflight, true);
+    assert.deepEqual(impact.platforms, []);
+    assert.equal(impact.hasPackage, false);
+    assert.equal(impact.preflight, false);
     assert.equal(impact.kernel, false);
     assert.equal(impact.android, false);
   }

@@ -132,7 +132,8 @@ fn pool_selector_uses_ticket_transport_and_keeps_legacy_path_without_ticket() {
         "    pub(crate) async fn probe_select_slot_bound(",
     );
     assert!(bound.contains("prerequisite::select_ticket_probe("));
-    assert!(bound.contains("Self::management_api_at"));
+    assert!(bound.contains("self.current_management_client(port)"));
+    assert!(!bound.contains("Self::management_api_at"));
     assert!(!bound.contains("self.management_api()"));
     let transport = crate::commands::guard_scan::impl_method_body(
         &crate_code("runtime/proxy/management_api.rs"),
@@ -6286,11 +6287,11 @@ fn production_entries_wire_the_readback() {
     // 手动测速的池腿与回退腿各开一条；端点经运行时按票据裁定。
     assert!(manual.contains(
         "letopen_readback=||{Readback::open(BINDING_READBACK,\
-         proxy.readback_endpoint(ticket.as_ref()),proxy.speed_binding_context(),\
+         proxy.readback_binding(ticket.as_ref()),proxy.speed_binding_context(),\
          WatchedInbounds::ProbePool,)};"
     ));
     assert!(manual.contains(
-        "letreadback=Readback::open(BINDING_READBACK,proxy.readback_endpoint(ticket.as_ref()),\
+        "letreadback=Readback::open(BINDING_READBACK,proxy.readback_binding(ticket.as_ref()),\
          proxy.speed_binding_context(),WatchedInbounds::One(local_proxy.inbound.tag()),);"
     ));
     assert!(manual.contains("&mutdone,&open_readback,)"));
@@ -6344,7 +6345,7 @@ fn production_entries_wire_the_readback() {
         assert_eq!(
             occurrences(
                 body,
-                "Readback::open(BINDING_READBACK,proxy.management_endpoint(),\
+                "Readback::open(BINDING_READBACK,proxy.readback_binding(None),\
                  proxy.speed_binding_context(),WatchedInbounds::ProbePool,)"
             ),
             1,
@@ -6743,7 +6744,14 @@ async fn opening_the_readback_never_fails_the_round() {
     for endpoint in [None, Some((unbound, "secret".to_string()))] {
         let readback = Readback::open(
             ReadbackMode::Observe,
-            endpoint.clone(),
+            endpoint
+                .as_ref()
+                .map(|(port, secret)| crate::runtime::proxy::ApiReadbackBinding {
+                    port: *port,
+                    secret: secret.clone(),
+                    epoch: None,
+                    control: None,
+                }),
             SpeedBindingContext::default(),
             WatchedInbounds::ProbePool,
         );
@@ -6782,7 +6790,12 @@ async fn opening_the_readback_never_fails_the_round() {
     }
     let off = Readback::open(
         ReadbackMode::Off,
-        Some((unbound, String::new())),
+        Some(crate::runtime::proxy::ApiReadbackBinding {
+            port: unbound,
+            secret: String::new(),
+            epoch: None,
+            control: None,
+        }),
         SpeedBindingContext::default(),
         WatchedInbounds::ProbePool,
     );

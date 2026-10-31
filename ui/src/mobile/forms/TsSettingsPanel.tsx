@@ -70,6 +70,7 @@ import { useMobileFormStore } from './form-store';
 import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout, tsNodeHoldByRunningCore } from '@/components/dialogs/ts-logout-flow';
 import { hasTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
 import { useConfirmTwice } from '@/lib/confirm-twice';
+import { MobileInfo } from '../MobileInfo';
 
 /** 分组的呈现顺序与标题键（分区本身来自 `groupTsFields`）。 */
 const TS_GROUPS: ReadonlyArray<readonly [TsFormGroup, string]> = [
@@ -454,6 +455,11 @@ export function TsSettingsPanel({
         <p className="m-form-hint">{t('ts.noNode')}</p>
       ) : (
         <>
+          <div className="m-form-hint" data-ts-coexistence>
+            <MobileInfo title={t('ts.settingsTitle')}
+              summary={t('ts.systemInstanceBoundary')}
+              details={t('ts.userspaceCoexistenceHint')} />
+          </div>
           <div className="m-form-row">
             <label className="m-form-label" htmlFor="mts-settings-name">
               {t('ts.nodeName')}<span className="m-form-req" aria-hidden>*</span>

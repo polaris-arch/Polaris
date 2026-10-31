@@ -11,12 +11,12 @@
 #![cfg(windows)]
 
 use std::io::BufRead;
-use std::os::windows::io::{AsHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use polaris_core_supervisor::job_object::{process_job, KillOnCloseJob};
+use polaris_core_supervisor::job_object::KillOnCloseJob;
 use polaris_core_supervisor::{
     scan_running_cores, stale_pids, CoreProcess, ProcessOwner, SingBoxSpawner, SpawnRequest,
     StdioPolicy, TokioSpawner,
@@ -134,26 +134,25 @@ fn closing_the_job_ends_its_processes_and_only_those() {
 ///
 /// **牙**：删掉 `TokioSpawner::spawn` 里的纳入调用 ⇒ `contains` 为假，本条转红。
 #[tokio::test]
-async fn the_spawner_enrolls_every_core_in_the_process_job() {
-    let mut spawned = TokioSpawner::new()
-        .spawn(SpawnRequest::new(PROBE, "--sleep", StdioPolicy::Discard))
-        .expect("spawn 探针应成功");
-    let job = process_job().expect("本进程的作业应能建出");
-    let raw = spawned.child.raw_handle().expect("子进程句柄");
-    // SAFETY: 句柄由 `spawned.child` 持有，下面用完之前它不会被收割。
-    let handle = unsafe { BorrowedHandle::borrow_raw(raw) };
-    assert!(
-        job.contains(handle).expect("查询归属"),
-        "经 spawner 起的进程必须在本进程的作业里"
+async fn the_spawner_refuses_unadmitted_windows_intent_before_native_birth() {
+    let result = TokioSpawner::new().spawn(SpawnRequest::unadmitted_intent(
+        PROBE,
+        "--sleep",
+        StdioPolicy::Discard,
+    ));
+    assert!(matches!(
+        result,
+        Err(polaris_core_supervisor::SpawnError::Admission(_))
+    ));
+    let error = polaris_core_supervisor::admitted_payload::admit_selected(
+        polaris_core_supervisor::admitted_payload::UntrustedPayload::bundled(PROBE),
+        polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.kind,
+        polaris_core_supervisor::admitted_payload::AdmissionErrorKind::UnsupportedExactObject
     );
-    // 反向对照：同一个作业并不包含随手起的别的进程（`contains` 不是恒真）。
-    let mut plain = sleeper();
-    assert!(!job.contains(plain.as_handle()).expect("查询归属"));
-    let _ = plain.kill();
-    let _ = plain.wait();
-    // 正常停核照旧走 Child，与作业无关。
-    spawned.child.start_kill().expect("结束探针");
-    let _ = spawned.child.wait().await;
 }
 
 /// 起一个冒充主程序的探针，读回它起的子进程的 pid。
@@ -230,11 +229,22 @@ impl Drop for Tree {
     }
 }
 
-fn spawn_core_shaped(binary: &Path, config: &Path) -> polaris_core_supervisor::SpawnedChild {
-    let mut request = SpawnRequest::new(binary, config, StdioPolicy::Discard);
-    // 探针按这个参数常驻；对判据而言它只是 `run -c <配置>` 之后的尾随参数。
-    request.extra_args = vec!["--sleep".to_owned()];
-    TokioSpawner::new().spawn(request).expect("起核形状的探针")
+struct ScanFixtureChild {
+    child: tokio::process::Child,
+}
+// Native scanner fixture only: it is not a core admitted by the product factory.
+fn spawn_core_shaped(binary: &Path, config: &Path) -> ScanFixtureChild {
+    let child = tokio::process::Command::new(binary)
+        .arg("run")
+        .arg("-c")
+        .arg(config)
+        .arg("--sleep")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    ScanFixtureChild { child }
 }
 
 /// 🔴 孤儿清扫的扫描侧：真实进程的命令行读得出来、切得对，且同一判据只选中本 app 形状的那个。
@@ -255,8 +265,8 @@ async fn the_scan_reads_real_command_lines_and_selects_only_our_shape() {
 
     let mut ours = spawn_core_shaped(&binary, &ours_config);
     let mut foreign = spawn_core_shaped(&binary, &foreign_config);
-    let ours_pid = ours.pid().expect("pid");
-    let foreign_pid = foreign.pid().expect("pid");
+    let ours_pid = ours.child.id().expect("pid");
+    let foreign_pid = foreign.child.id().expect("pid");
 
     let scanned = scan_running_cores();
     let argv_of = |pid: u32| {

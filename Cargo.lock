@@ -1204,6 +1204,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3209,6 +3219,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tokio",
  "tokio-rustls",
+ "tonic-prost",
  "uuid",
  "window-vibrancy 0.8.0",
  "windows-sys 0.61.2",
@@ -3232,9 +3243,13 @@ dependencies = [
 name = "polaris-core-supervisor"
 version = "1.0.0"
 dependencies = [
+ "find-msvc-tools",
  "log",
  "nix",
+ "polaris-helper-proto",
+ "polaris-source-probe",
  "rustix",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
@@ -3250,6 +3265,7 @@ dependencies = [
  "log",
  "nix",
  "plist",
+ "polaris-core-supervisor",
  "polaris-helper-client",
  "polaris-helper-proto",
  "polaris-log-budget",
@@ -3441,20 +3457,29 @@ dependencies = [
 name = "polaris-updater"
 version = "1.0.0"
 dependencies = [
+ "flate2",
  "hex",
  "polaris-helper-proto",
  "polaris-source-probe",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
+ "zip",
 ]
 
 [[package]]
 name = "polaris-windows-cleaner"
 version = "1.0.0"
 dependencies = [
+ "hex",
+ "polaris-helper-proto",
+ "polaris-source-probe",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "windows-sys 0.61.2",
 ]
@@ -4672,6 +4697,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5593,6 +5628,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typeid"
@@ -6786,6 +6827,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "typed-path",
 ]
 
 [[package]]

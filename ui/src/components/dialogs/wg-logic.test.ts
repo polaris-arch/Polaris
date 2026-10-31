@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { parseWgQuickConf } from '@/domain/wg-quick';
+import { parseNumberField } from './field-spec';
 import {
   splitCsv,
   emptyWgDraft,
@@ -456,4 +457,31 @@ it('never mixes fields from a second wg-quick peer into the first peer', () => {
   expect(parsed?.settings.preSharedKey).toBeUndefined();
   expect(parsed?.settings.allowedIPs).toBeUndefined();
   expect(parseWgQuickConf(header + '\n[Peer]\nPublicKey = first-public' + second)).toBeNull();
+});
+
+
+describe('WireGuard optional numeric edit contract', () => {
+  const base: ServerConfig = {
+    id: 'wg-edit', name: 'WG', protocol: 'wireguard', address: 'wg.example', port: 51820,
+    wireguardSettings: {
+      privateKey: 'p', peerPublicKey: 'q', localAddress: ['10.0.0.2/32'],
+      mtu: 1420, persistentKeepalive: 30, workers: 4, reserved: [1, 2, 3],
+    },
+  };
+  it.each([undefined, '', '   '])('clearing optional values removes imported keys: %s', (empty) => {
+    const parsed = parseNumberField(empty ?? '');
+    const saved = buildWgServer('WG', { ...draftFromServer(base), mtu: parsed, persistentKeepalive: parsed }, base);
+    expect(saved.wireguardSettings).not.toHaveProperty('mtu');
+    expect(saved.wireguardSettings).not.toHaveProperty('persistentKeepalive');
+    expect(saved.wireguardSettings?.workers).toBe(4);
+    expect(saved.wireguardSettings?.reserved).toEqual([1, 2, 3]);
+    expect(base.wireguardSettings?.mtu).toBe(1420);
+  });
+  it('preserves explicit zero and accepts subsequent edits', () => {
+    const draft = draftFromServer(base);
+    expect(buildWgServer('WG', { ...draft, mtu: 0, persistentKeepalive: 0 }, base).wireguardSettings)
+      .toMatchObject({ mtu: 0, persistentKeepalive: 0 });
+    expect(buildWgServer('WG', { ...draft, mtu: 1380, persistentKeepalive: 25 }, base).wireguardSettings)
+      .toMatchObject({ mtu: 1380, persistentKeepalive: 25 });
+  });
 });

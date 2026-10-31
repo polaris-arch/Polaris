@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+use polaris_singbox_grpc::ClientError;
 use polaris_singbox_grpc::{
     Endpoint, ReconnectConfig, SingBoxApiClient, TaildropOutgoingFile, TaildropSendUpdate,
     UNARY_DEADLINE,
@@ -75,8 +76,14 @@ struct MockState {
     taildrop_cancel_calls: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
     /// `SendTaildropFiles` 收到的完整客户端帧（验 start/chunk/fileDone 顺序与 locator）。
     taildrop_send_messages: Arc<std::sync::Mutex<Vec<daemon::TaildropSendClientMessage>>>,
+    taildrop_opening_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    taildrop_opening_entered: tokio::sync::Notify,
+    taildrop_opening_canceled: tokio::sync::Notify,
+    taildrop_send_workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// `DownloadTaildropFile` 回放的字节（首帧带 size，其后逐块 data）。
     taildrop_download_body: Arc<std::sync::Mutex<Vec<u8>>>,
+    taildrop_download_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    taildrop_download_workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     openconnect_submissions: Arc<std::sync::Mutex<Vec<daemon::OpenConnectAuthResponseSubmission>>>,
     openconnect_cancels: Arc<std::sync::Mutex<Vec<daemon::OpenConnectAuthChallengeCancel>>>,
     openvpn_submissions: Arc<std::sync::Mutex<Vec<daemon::OpenVpnChallengeSubmission>>>,
@@ -314,21 +321,45 @@ impl StartedService for MockService {
         check_auth(&req, &self.secret)?;
         let mut input = req.into_inner();
         let seen = self.state.taildrop_send_messages.clone();
+        let first = input
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("missing Start"))?;
+        if !matches!(
+            first.message.as_ref(),
+            Some(daemon::taildrop_send_client_message::Message::Start(_))
+        ) {
+            return Err(Status::invalid_argument("expected Start"));
+        }
+        seen.lock().unwrap().push(first);
+        let gate = self.state.taildrop_opening_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            self.state.taildrop_opening_entered.notify_one();
+            tokio::select! {
+                permit = gate.acquire() => { permit.map_err(|_| Status::cancelled("opening closed"))?.forget(); },
+                _ = input.message() => {
+                    self.state.taildrop_opening_canceled.notify_one();
+                    return Err(Status::cancelled("opening request canceled"));
+                }
+            }
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let mut file_index = 0i32;
             let mut sent_bytes = 0i64;
+            let mut received_bytes = 0i64;
             while let Ok(Some(frame)) = input.message().await {
                 seen.lock().unwrap().push(frame.clone());
                 match frame.message {
                     Some(daemon::taildrop_send_client_message::Message::Start(_)) => {}
                     Some(daemon::taildrop_send_client_message::Message::Chunk(chunk)) => {
                         sent_bytes += chunk.data.len() as i64;
+                        received_bytes += chunk.data.len() as i64;
                         let _ = tx
                             .send(Ok(daemon::TaildropSendServerMessage {
                                 message: Some(
                                     daemon::taildrop_send_server_message::Message::ReceivedBytes(
-                                        chunk.data.len() as i64,
+                                        received_bytes,
                                     ),
                                 ),
                             }))
@@ -368,6 +399,11 @@ impl StartedService for MockService {
                 }
             }
         });
+        self.state
+            .taildrop_send_workers
+            .lock()
+            .unwrap()
+            .push(worker);
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -380,7 +416,8 @@ impl StartedService for MockService {
         check_auth(&req, &self.secret)?;
         let body = self.state.taildrop_download_body.lock().unwrap().clone();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tokio::spawn(async move {
+        let gate = self.state.taildrop_download_gate.lock().unwrap().clone();
+        let worker = tokio::spawn(async move {
             // 复现真核形状：**首帧只带 size**（总字节，data 空），其后逐块 data。
             let _ = tx
                 .send(Ok(daemon::DownloadTaildropFileChunk {
@@ -388,6 +425,12 @@ impl StartedService for MockService {
                     data: Vec::new(),
                 }))
                 .await;
+            if let Some(gate) = gate {
+                tokio::select! {
+                    permit = gate.acquire() => { if let Ok(permit) = permit { permit.forget(); } },
+                    _ = tx.closed() => return,
+                }
+            }
             for chunk in body.chunks(4) {
                 let _ = tx
                     .send(Ok(daemon::DownloadTaildropFileChunk {
@@ -397,6 +440,11 @@ impl StartedService for MockService {
                     .await;
             }
         });
+        self.state
+            .taildrop_download_workers
+            .lock()
+            .unwrap()
+            .push(worker);
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -1371,49 +1419,52 @@ fn canned_inbox(tag: &str) -> daemon::TaildropInbox {
 /// HTTP/2 背压卡死，因此公开 API 也刻意拆成 input/output 两半。
 #[tokio::test]
 async fn taildrop_send_streams_multiple_files_and_decodes_progress() {
-    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let (addr, state, shutdown, server) = spawn_owned_taildrop_server().await;
     let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
         .await
         .unwrap();
-    let session = client
-        .start_taildrop_send(
-            "ts-node",
-            "nodeid:peer-1",
-            vec![
-                TaildropOutgoingFile {
-                    name: "a.txt".into(),
-                    size: 3,
-                },
-                TaildropOutgoingFile {
-                    name: "b.bin".into(),
-                    size: 2,
-                },
-            ],
-        )
-        .await
-        .unwrap();
-    let (input, mut output) = session.into_parts();
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let session = client
+            .start_taildrop_send(
+                "ts-node",
+                "nodeid:peer-1",
+                vec![
+                    TaildropOutgoingFile {
+                        name: "a.txt".into(),
+                        size: 3,
+                    },
+                    TaildropOutgoingFile {
+                        name: "b.bin".into(),
+                        size: 2,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let (input, mut output) = session.into_parts();
 
-    let send = async move {
-        input.send_chunk(b"abc".to_vec()).await.unwrap();
-        input.finish_file().await.unwrap();
-        input.send_chunk(vec![7, 8]).await.unwrap();
-        input.finish_file().await.unwrap();
-        // drop(input) = 正常请求 EOF；核据此收尾并关闭响应流。
-        drop(input);
-    };
-    let receive = async move {
-        let mut updates = Vec::new();
-        while let Some(update) = output.next_update().await.unwrap() {
-            updates.push(update);
-        }
+        let send = async move {
+            input.send_chunk(b"abc".to_vec()).await.unwrap();
+            input.finish_file().await.unwrap();
+            input.send_chunk(vec![7, 8]).await.unwrap();
+            input.finish_file().await.unwrap();
+            // drop(input) = 正常请求 EOF；核据此收尾并关闭响应流。
+            drop(input);
+        };
+        let receive = async move {
+            let mut updates = Vec::new();
+            while let Some(update) = output.next_update().await.unwrap() {
+                updates.push(update);
+            }
+            updates
+        };
+        let ((), updates) = tokio::join!(send, receive);
         updates
-    };
-    let ((), updates) = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::join!(send, receive)
     })
-    .await
-    .expect("双向发送应及时结束");
+    .await;
+    drop(client);
+    finish_owned_taildrop_server(shutdown, server, &state).await;
+    let updates = result.expect("opening 与双向发送应在原两秒预算内结束");
 
     let seen = state.taildrop_send_messages.lock().unwrap().clone();
     assert_eq!(seen.len(), 5, "start + 每文件 chunk/fileDone");
@@ -1980,4 +2031,345 @@ async fn url_test_preserves_tag_auth_and_acceptance_only_contract() {
         other => panic!("expected authentication failure, got {other:?}"),
     }
     assert_eq!(state.url_test_calls.lock().unwrap().len(), 1);
+}
+
+async fn spawn_owned_taildrop_server() -> (
+    SocketAddr,
+    Arc<MockState>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(MockState::default());
+    let service = MockService {
+        secret: SECRET.into(),
+        state: state.clone(),
+        status_frames: Arc::new(AtomicU64::new(0)),
+        ts_status_frames: Arc::new(AtomicU64::new(0)),
+    };
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .serve_with_incoming_shutdown(
+                StartedServiceServer::new(service),
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    (addr, state, shutdown, server)
+}
+
+async fn finish_owned_taildrop_server(
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    mut server: tokio::task::JoinHandle<()>,
+    state: &MockState,
+) {
+    let _ = shutdown.send(());
+    let joined = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+    let server_ok = match joined {
+        Ok(result) => result.is_ok(),
+        Err(_) => {
+            server.abort();
+            let _ = server.await;
+            false
+        }
+    };
+    let mut workers = std::mem::take(&mut *state.taildrop_send_workers.lock().unwrap());
+    workers.extend(std::mem::take(
+        &mut *state.taildrop_download_workers.lock().unwrap(),
+    ));
+    let mut workers_ok = true;
+    for mut worker in workers {
+        match tokio::time::timeout(Duration::from_secs(2), &mut worker).await {
+            Ok(result) => workers_ok &= result.is_ok(),
+            Err(_) => {
+                worker.abort();
+                let _ = worker.await;
+                workers_ok = false;
+            }
+        }
+    }
+    assert!(
+        server_ok && workers_ok,
+        "owned transport and workers must reach terminal join"
+    );
+}
+
+#[tokio::test]
+async fn taildrop_cancel_during_initial_headers_drops_the_real_opening_request() {
+    let (addr, state, shutdown, server) = spawn_owned_taildrop_server().await;
+    *state.taildrop_opening_gate.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut opening = Box::pin(client.start_taildrop_send("ts-node", "peer", vec![TaildropOutgoingFile {name:"same.bin".into(), size:65537}]));
+        tokio::select! {
+            unexpected = &mut opening => panic!("opening completed before headers were released: {}", unexpected.is_ok()),
+            () = state.taildrop_opening_entered.notified() => {}
+        }
+        assert_eq!(state.taildrop_send_messages.lock().unwrap().len(), 1);
+        drop(opening);
+        state.taildrop_opening_canceled.notified().await;
+        assert!(state.taildrop_send_workers.lock().unwrap().is_empty());
+    }).await;
+    drop(client);
+    finish_owned_taildrop_server(shutdown, server, &state).await;
+    result.expect("cancel must join opening without chunks, fake progress or a larger deadline");
+}
+
+#[tokio::test]
+async fn taildrop_large_multifile_input_remains_bounded_and_acknowledgements_cumulative() {
+    let (addr, state, shutdown, server) = spawn_owned_taildrop_server().await;
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let payloads = [vec![3; 1024 * 1024 + 65537], vec![7; 65539]];
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let session = client
+            .start_taildrop_send(
+                "ts-node",
+                "peer",
+                payloads
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| TaildropOutgoingFile {
+                        name: format!("{i}.bin"),
+                        size: p.len() as i64,
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let (input, mut output) = session.into_parts();
+        let send = async {
+            for payload in &payloads {
+                for chunk in payload.chunks(64 * 1024) {
+                    input.send_chunk(chunk.to_vec()).await.unwrap();
+                }
+                input.finish_file().await.unwrap();
+            }
+            drop(input);
+        };
+        let receive = async {
+            let mut ack = 0;
+            let mut completed = Vec::new();
+            while let Some(update) = output.next_update().await.unwrap() {
+                match update {
+                    TaildropSendUpdate::ReceivedBytes(next) => {
+                        assert!(next > ack);
+                        ack = next;
+                    }
+                    TaildropSendUpdate::Progress {
+                        file_index,
+                        sent_bytes,
+                        file_completed: true,
+                    } => completed.push((file_index, sent_bytes)),
+                    _ => {}
+                }
+            }
+            (ack, completed)
+        };
+        let ((), summary) = tokio::join!(send, receive);
+        summary
+    })
+    .await;
+    drop(client);
+    finish_owned_taildrop_server(shutdown, server, &state).await;
+    let (ack, completed) =
+        result.expect("opening plus bounded duplex transfer uses the original two-second budget");
+    assert_eq!(ack, payloads.iter().map(|p| p.len() as i64).sum::<i64>());
+    assert_eq!(
+        completed,
+        vec![(0, payloads[0].len() as i64), (1, payloads[1].len() as i64)]
+    );
+    let seen = state.taildrop_send_messages.lock().unwrap();
+    let mut actual = vec![Vec::new()];
+    for message in seen.iter() {
+        match &message.message {
+            Some(daemon::taildrop_send_client_message::Message::Chunk(chunk)) => {
+                assert!(chunk.data.len() <= 64 * 1024);
+                actual.last_mut().unwrap().extend_from_slice(&chunk.data);
+            }
+            Some(daemon::taildrop_send_client_message::Message::FileDone(_)) => {
+                actual.push(Vec::new())
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(&actual[..2], &payloads);
+    assert!(actual[2].is_empty());
+}
+
+#[tokio::test]
+async fn taildrop_drop_during_send_joins_request_worker_without_file_done() {
+    let (addr, state, shutdown, server) = spawn_owned_taildrop_server().await;
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let session = client
+            .start_taildrop_send(
+                "ts-node",
+                "peer",
+                vec![TaildropOutgoingFile {
+                    name: "same.bin".into(),
+                    size: 65537,
+                }],
+            )
+            .await
+            .unwrap();
+        let (input, mut output) = session.into_parts();
+        input.send_chunk(vec![9; 17]).await.unwrap();
+        assert_eq!(
+            output.next_update().await.unwrap(),
+            Some(TaildropSendUpdate::ReceivedBytes(17))
+        );
+        drop(input);
+        drop(output);
+    })
+    .await;
+    drop(client);
+    finish_owned_taildrop_server(shutdown, server, &state).await;
+    result.expect("dropping an active duplex session must join its owned worker");
+    let seen = state.taildrop_send_messages.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(
+        seen[0].message,
+        Some(daemon::taildrop_send_client_message::Message::Start(_))
+    ));
+    assert!(
+        matches!(&seen[1].message, Some(daemon::taildrop_send_client_message::Message::Chunk(chunk)) if chunk.data == vec![9;17])
+    );
+    assert!(!seen.iter().any(|frame| matches!(
+        frame.message,
+        Some(daemon::taildrop_send_client_message::Message::FileDone(_))
+    )));
+}
+
+struct TestEpochLease {
+    closed: tokio::sync::watch::Receiver<bool>,
+    retained: Arc<AtomicU64>,
+}
+impl Drop for TestEpochLease {
+    fn drop(&mut self) {
+        self.retained.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl polaris_singbox_grpc::ApiClientLifetime for TestEpochLease {
+    fn cancelled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let mut closed = self.closed.clone();
+        Box::pin(async move {
+            while !*closed.borrow() {
+                if closed.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
+fn epoch_lease() -> (
+    TestEpochLease,
+    tokio::sync::watch::Sender<bool>,
+    Arc<AtomicU64>,
+) {
+    let (close, closed) = tokio::sync::watch::channel(false);
+    let retained = Arc::new(AtomicU64::new(1));
+    (
+        TestEpochLease {
+            closed,
+            retained: retained.clone(),
+        },
+        close,
+        retained,
+    )
+}
+
+#[tokio::test]
+async fn epoch_cancels_real_download_stall_and_escaped_stream_retains_lease_until_unwound() {
+    let (addr, state, shutdown, server) = spawn_owned_taildrop_server().await;
+    *state.taildrop_download_body.lock().unwrap() = b"unchanged-file".to_vec();
+    *state.taildrop_download_gate.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    let (lease, close, retained) = epoch_lease();
+    let client =
+        SingBoxApiClient::connect_captured(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+            .await
+            .unwrap()
+            .retain_lifetime(lease);
+    let mut stream = client
+        .download_taildrop_file("ts-node", "file")
+        .await
+        .unwrap();
+    assert!(stream.message().await.unwrap().unwrap().data.is_empty());
+    drop(client);
+    assert_eq!(retained.load(Ordering::SeqCst), 1);
+    {
+        let stalled = stream.message();
+        tokio::pin!(stalled);
+        assert!(futures_util::poll!(&mut stalled).is_pending());
+        close.send(true).unwrap();
+        assert!(
+            matches!(stalled.await, Err(ClientError::Status(s)) if s.code() == tonic::Code::Cancelled)
+        );
+    }
+    drop(stream);
+    assert_eq!(retained.load(Ordering::SeqCst), 0);
+    finish_owned_taildrop_server(shutdown, server, &state).await;
+}
+
+#[tokio::test]
+async fn epoch_cancels_real_taildrop_opening_and_joins_original_handler() {
+    let (addr, state, shutdown, server) = spawn_owned_taildrop_server().await;
+    *state.taildrop_opening_gate.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    let (lease, close, retained) = epoch_lease();
+    let client =
+        SingBoxApiClient::connect_captured(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+            .await
+            .unwrap()
+            .retain_lifetime(lease);
+    let work =
+        tokio::spawn(async move { client.start_taildrop_send("ts-node", "peer", vec![]).await });
+    state.taildrop_opening_entered.notified().await;
+    close.send(true).unwrap();
+    assert!(
+        matches!(work.await.unwrap(), Err(ClientError::Status(s)) if s.code() == tonic::Code::Cancelled)
+    );
+    state.taildrop_opening_canceled.notified().await;
+    assert_eq!(retained.load(Ordering::SeqCst), 0);
+    finish_owned_taildrop_server(shutdown, server, &state).await;
+}
+
+#[tokio::test]
+async fn epoch_cancels_both_halves_after_taildrop_session_escapes_client() {
+    let (addr, state, shutdown, server) = spawn_owned_taildrop_server().await;
+    let (lease, close, retained) = epoch_lease();
+    let client =
+        SingBoxApiClient::connect_captured(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+            .await
+            .unwrap()
+            .retain_lifetime(lease);
+    let (input, mut output) = client
+        .start_taildrop_send("ts-node", "peer", vec![])
+        .await
+        .unwrap()
+        .into_parts();
+    drop(client);
+    assert_eq!(retained.load(Ordering::SeqCst), 1);
+    close.send(true).unwrap();
+    assert!(
+        matches!(input.send_chunk(vec![1]).await, Err(ClientError::Status(s)) if s.code() == tonic::Code::Cancelled)
+    );
+    assert!(
+        matches!(output.next_update().await, Err(ClientError::Status(s)) if s.code() == tonic::Code::Cancelled)
+    );
+    drop(input);
+    assert_eq!(retained.load(Ordering::SeqCst), 1);
+    drop(output);
+    assert_eq!(retained.load(Ordering::SeqCst), 0);
+    finish_owned_taildrop_server(shutdown, server, &state).await;
 }

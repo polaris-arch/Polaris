@@ -53,8 +53,9 @@ pub(super) fn stale_login_config_names<'a>(
         .collect()
 }
 
-/// Remove leftover login configs. The caller holds the state gate, so a config written by a
-/// login that is not yet registered cannot exist. Returns how many files were removed.
+/// Remove leftover login configs after the process sweep admitted cleanup. The state gate
+/// excludes this registry's unregistered writers; the sweep must also exclude old hosts'
+/// matching writers, including those whose owner cannot be established.
 pub(super) fn sweep_stale_login_configs(dir: &Path, live: &[PathBuf]) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         log::debug!(target: super::LOGIN_CORE_LOG_TARGET, "登录临时配置清扫：配置目录不可读，未执行");
@@ -66,8 +67,10 @@ pub(super) fn sweep_stale_login_configs(dir: &Path, live: &[PathBuf]) -> usize {
         .collect();
     let mut removed = 0;
     for name in stale_login_config_names(names.iter().map(String::as_str), dir, live) {
+        // An exact old config names its same-epoch cache companion. Remove the cache first;
+        // no JSON-supplied path or wildcard can expand this cleanup into user TS state.
         // `remove_file` unlinks a symlink itself and refuses a directory.
-        match std::fs::remove_file(dir.join(name)) {
+        match super::remove_login_artifacts(&dir.join(name), true) {
             Ok(()) => removed += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => log::warn!(
@@ -120,8 +123,8 @@ pub(super) fn stale_login_core_pids(
         .collect()
 }
 
-/// A leftover is this user's own process. One that another user started is neither ended nor
-/// a reason to refuse; an owner that cannot be read is treated the same way.
+/// Only a proven same-user leftover may be signalled. A matching private config still in
+/// use by any other or unreadable owner must instead block admission and artifact cleanup.
 #[cfg(any(not(windows), test))]
 pub(super) fn owned_by_this_user(owner: Option<u32>, me: Option<u32>) -> bool {
     matches!((owner, me), (Some(owner), Some(me)) if owner == me)
@@ -147,27 +150,34 @@ pub(super) async fn sweep_stale_login_cores(
     inflight: &[u32],
 ) -> Result<usize, String> {
     let (scan, signal) = (io.scan, io.signal);
-    let select = || -> Vec<u32> {
-        stale_login_core_pids(&scan(), binary, config_dir, inflight)
-            .into_iter()
-            .filter(|pid| owned_by_this_user((io.owner)(*pid), me))
-            .collect()
+    let select = || -> Result<Vec<u32>, String> {
+        let candidates = stale_login_core_pids(&scan(), binary, config_dir, inflight);
+        if candidates
+            .iter()
+            .any(|pid| !owned_by_this_user((io.owner)(*pid), me))
+        {
+            return Err(STALE_LOGIN_CORE_ALIVE.into());
+        }
+        Ok(candidates)
     };
-    let victims = select();
+    let victims = select()?;
     if victims.is_empty() {
         return Ok(0);
     }
-    let remaining = || -> Vec<u32> {
-        select()
-            .into_iter()
-            .filter(|pid| victims.contains(pid))
-            .collect()
+    let remaining = || -> Result<Vec<u32>, String> {
+        let candidates = select()?;
+        // A new matching writer cannot be treated as an exited original or signalled as
+        // one. It still prevents the following config/cache sweep from taking its files.
+        if candidates.iter().any(|pid| !victims.contains(pid)) {
+            return Err(STALE_LOGIN_CORE_ALIVE.into());
+        }
+        Ok(candidates)
     };
     for pid in &victims {
         signal(*pid, Signal::Sigterm);
     }
     tokio::time::sleep(grace).await;
-    let stubborn = remaining();
+    let stubborn = remaining()?;
     if stubborn.is_empty() {
         return Ok(victims.len());
     }
@@ -175,7 +185,7 @@ pub(super) async fn sweep_stale_login_cores(
         signal(*pid, Signal::Sigkill);
     }
     tokio::time::sleep(grace).await;
-    if remaining().is_empty() {
+    if remaining()?.is_empty() {
         Ok(victims.len())
     } else {
         Err(STALE_LOGIN_CORE_ALIVE.into())
@@ -193,7 +203,8 @@ pub(super) struct WindowsStaleSweepIo<'a> {
 
 /// End only exact login-shaped leftovers whose token SID was proven equal to ours. Unlike
 /// the main-core sweep, SYSTEM is not admitted merely because it is elevated. An unreadable
-/// owner is skipped, not reclassified as foreign or turned into a global no-owner receipt.
+/// owner is never termination authority. Matching non-targets must have an original-handle
+/// exit observation before admission can proceed to delete their config/cache artifacts.
 ///
 /// Targets are frozen once. Both termination attempts and the exit observations refer to
 /// those original objects, even if a pid is later reused for the same command line. The
@@ -210,6 +221,7 @@ pub(super) async fn sweep_windows_stale_login_cores(
     let mut unknown = 0;
     let mut other = 0;
     let mut elevated = 0;
+    let mut blocked = false;
     for process in (io.scan)() {
         if process.pid == 0
             || process.pid == std::process::id()
@@ -219,18 +231,27 @@ pub(super) async fn sweep_windows_stale_login_cores(
             continue;
         }
         match process.owner {
-            ProcessOwner::SameUser => pending.push(process),
+            ProcessOwner::SameUser => {
+                pending.push(process);
+                continue;
+            }
             ProcessOwner::Unknown => unknown += 1,
             ProcessOwner::Other => other += 1,
             ProcessOwner::Elevated => elevated += 1,
         }
+        // Query the held original even for a non-target, but never request termination.
+        // Missing custody or a live foreign owner is not evidence that its files are free.
+        blocked |= (io.running)(&process) != Some(false);
     }
     // Non-target handles have already been dropped. Never print argv, SID or config secrets.
     if unknown + other + elevated > 0 {
         log::warn!(
             target: super::LOGIN_CORE_LOG_TARGET,
-            "登录临时核清扫：跳过属主未知 {unknown}、其他用户 {other}、SYSTEM {elevated} 个同形进程；未证明它们已退出"
+            "登录临时核清扫：不终止属主未知 {unknown}、其他用户 {other}、SYSTEM {elevated} 个同形进程；同私有配置需原句柄退出确认"
         );
+    }
+    if blocked {
+        return Err(STALE_LOGIN_CORE_ALIVE.into());
     }
     let selected = pending.len();
     for _ in 0..2 {
@@ -269,7 +290,8 @@ pub(super) async fn sweep_windows_stale_login_cores(
 #[async_trait]
 pub trait StaleLoginCoreSweeper: Send + Sync {
     /// `inflight` are this registry's registered children. Returns how many leftovers ended.
-    /// Success concerns only selected, proven same-user targets; it is not global NoOwner.
+    /// Success excludes unretired exact private-config matches, including non-target owners;
+    /// it is not global NoOwner for unrelated argv or directories.
     async fn sweep(&self, binary: &Path, inflight: &[u32]) -> Result<usize, String>;
 }
 

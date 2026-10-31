@@ -130,7 +130,7 @@ pub fn tun_exclusion_preview(state: State<'_, AppRuntime>) -> ApiResponse<Value>
         Err(e) => return ApiResponse::err(format!("{e}")),
     };
     let user_config: polaris_config_engine::user_config::UserConfig =
-        match serde_json::from_value(cfg) {
+        match serde_json::from_value(cfg.clone()) {
             Ok(c) => c,
             Err(e) => {
                 return ApiResponse::err_with_code(
@@ -143,12 +143,9 @@ pub fn tun_exclusion_preview(state: State<'_, AppRuntime>) -> ApiResponse<Value>
         &user_config,
         crate::runtime::proxy::platform_contracts::platform_tag(),
         crate::runtime::proxy::platform_contracts::enumerate_own_lan_cidrs(),
-        // A-0b：运行期观测到的 tailnet 地址，取**起核时喂 `GenerateConfigDeps` 的同一份快照**
-        // （`ProxyRuntime::observed_tailnet_snapshot`）。传空会让本预览重新变成"另一份计算" ——
-        // 自建控制面（headscale `prefixes.v4` 可自定义）分到的地址进 `engaged_mesh` 后会把
-        // 与之相交的用户声明段整条剔除，预览看不见观测面就会**多显示**那些其实没生效的段，
-        // 而那正是本命令要终结的那类谎（见 `tun_exclusion_preview` 模块头注）。
-        state.proxy().observed_tailnet_snapshot(),
+        // Filter against saved D, not a naked ID snapshot from running R.
+        // Compatible LastKnown planning is preserved without certifying membership.
+        state.proxy().observed_tailnet_for_config(&cfg),
     );
     match serde_json::to_value(&preview) {
         Ok(v) => ApiResponse::ok(v),
@@ -247,7 +244,7 @@ pub fn endpoint_force_route_report(state: State<'_, AppRuntime>) -> ApiResponse<
         Err(e) => return ApiResponse::err(format!("{e}")),
     };
     let user_config: polaris_config_engine::user_config::UserConfig =
-        match serde_json::from_value(cfg) {
+        match serde_json::from_value(cfg.clone()) {
             Ok(c) => c,
             Err(e) => {
                 return ApiResponse::err_with_code(
@@ -266,10 +263,8 @@ pub fn endpoint_force_route_report(state: State<'_, AppRuntime>) -> ApiResponse<
         .join(polaris_config_engine::builder::endpoint_routes::TAILNET_RULES_DIR_NAME);
     let report = polaris_config_engine::builder::endpoint_routes::endpoint_force_route_report(
         &user_config,
-        // A-0b：与起核时喂 `GenerateConfigDeps` 的**同一份快照**（同 `tun_exclusion_preview`
-        // 那条腿的理由）。传空就等于报告又变回了另一份计算：自建控制面的真实前缀看不见，
-        // 两个节点会被一律读成「段完全重合」。
-        &state.proxy().observed_tailnet_snapshot(),
+        // Use the same target-bound planning projection as startup/TUN preview.
+        &state.proxy().observed_tailnet_for_config(&cfg),
         &tailnet_rules_dir.to_string_lossy(),
     );
     match serde_json::to_value(&report) {

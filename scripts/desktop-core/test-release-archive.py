@@ -139,14 +139,19 @@ class WireHandoffBoundary(unittest.TestCase):
         return self.directory / (str(self.serial) + '-' + name)
 
     def files(self, counts=None, index='polaris-upstream-native-assets.json'):
-        counts = counts or dict.fromkeys(self.platforms, 1)
+        # Counts remain the complete per-platform file budget, now including
+        # its two independent recovery data resources rather than enlarging it.
+        counts = counts or dict.fromkeys(self.platforms, 3)
         receipts = self.root + '/resources/.release-receipts/'
         files = {self.root + '/handoff.json': (b'inert handoff', 0o600),
                  receipts + 'public-readback.json': (b'inert readback', 0o600),
                  receipts + index: (b'inert index', 0o600)}
         files.update({receipts + key + '.json': (b'inert receipt', 0o600) for key in self.platforms})
         for key in self.platforms:
-            for number in range(counts[key]):
+            recovery = self.root + '/resources/core-recovery/' + key + '/'
+            files[recovery + 'inventory.json'] = (b'inert inventory', 0o644)
+            files[recovery + ('native.zip' if key == 'win' else 'native.tar.gz')] = (b'inert original archive', 0o644)
+            for number in range(counts[key] - 2):
                 name = ('sing-box.exe' if key == 'win' else 'sing-box') if number == 0 else (
                     'core-release/licenses/license-%04d.txt' % number)
                 files[self.root + '/resources/' + key + '/' + name] = (b'inert', 0o755 if number == 0 else 0o644)
@@ -203,7 +208,7 @@ class WireHandoffBoundary(unittest.TestCase):
         self.assertEqual(len(files), 3081)
         self.assertGreater(len(files) + len(self.parents(files)), 2048)
         archive, record = self.archive(files)
-        self.assertEqual(module.wire_inventory(record, self.root, self.parents(files)), 8202)
+        self.assertEqual(module.wire_inventory(record, self.root, self.parents(files)), 8203)
         native = self.fresh('native-rejected')
         with self.assertRaisesRegex(ValueError, 'member inventory limit'):
             module.extract(str(archive), str(native), record, self.root)
@@ -236,20 +241,22 @@ class WireHandoffBoundary(unittest.TestCase):
         self.assertFalse(destination.exists())
 
     def test_one_platform_cannot_borrow_file_or_implicit_directory_budget(self):
-        files = self.files({'linux': 1024, 'win': 1, 'mac-x64': 1, 'mac-arm64': 1})
+        files = self.files({'linux': 1024, 'win': 3, 'mac-x64': 3, 'mac-arm64': 3})
         prefix = self.root + '/resources/linux/'
         linux = [name for name in files if name.startswith(prefix)]
         values = [files.pop(name) for name in linux]
-        # One platform root + 1023 child directories + 1024 files = 2048.
+        # Runtime root + 1021 child dirs + 1022 runtime files + recovery root
+        # and two recovery files = 2047. One deeper runtime parent reaches2048.
         files[prefix + 'sing-box'] = values[0]
         for number, value in enumerate(values[1:]):
             files[prefix + 'd%04d/file' % number] = value
-        self.assertEqual(module.wire_inventory(self.record(files), self.root), 8202)
+        files[prefix + 'd0000/deeper/file'] = files.pop(prefix + 'd0000/file')
+        self.assertEqual(module.wire_inventory(self.record(files), self.root), 8203)
         files[prefix + 'last/file'] = files.pop(prefix + 'sing-box')
         archive, record = self.archive(files, directories=[])
         self.rejected(archive, record, 'wire group entry limit')
         # Fewer than 4103 total files is insufficient: Linux alone has 1025.
-        files = self.files({'linux': 1025, 'win': 1, 'mac-x64': 1, 'mac-arm64': 1})
+        files = self.files({'linux': 1025, 'win': 3, 'mac-x64': 3, 'mac-arm64': 3})
         self.assertLess(len(files), 4103)
         archive, record = self.archive(files)
         self.rejected(archive, record, 'wire platform member inventory limit')
@@ -257,7 +264,7 @@ class WireHandoffBoundary(unittest.TestCase):
     def test_closed_control_and_four_platform_inventory(self):
         for index in ['polaris-box-assets.json', 'polaris-upstream-native-assets.json']:
             files = self.files(index=index)
-            self.assertEqual(module.wire_inventory(self.record(files), self.root, self.parents(files)), 8202)
+            self.assertEqual(module.wire_inventory(self.record(files), self.root, self.parents(files)), 8203)
         for mutation in ['unknown-platform', 'unknown-control', 'dual-index', 'missing-platform', 'missing-receipt', 'missing-handoff']:
             with self.subTest(mutation=mutation):
                 files = self.files()
@@ -273,6 +280,26 @@ class WireHandoffBoundary(unittest.TestCase):
                     del files[self.root + '/resources/.release-receipts/win.json']
                 else:
                     del files[self.root + '/handoff.json']
+                archive, record = self.archive(files)
+                self.rejected(archive, record)
+
+    def test_recovery_is_mandatory_closed_and_charged_to_its_own_platform(self):
+        prefix = self.root + '/resources/core-recovery/'
+        archive_name = prefix + 'linux/native.tar.gz'
+        self.assertEqual(module.wire_group(archive_name, False), 'linux')
+        self.assertEqual(module.wire_group(prefix + 'win', True), 'win')
+        for mutation in ['missing-archive', 'missing-inventory', 'legacy-no-recovery',
+                         'nested-archive', 'unknown-platform', 'extra-archive', 'wrong-format']:
+            with self.subTest(mutation=mutation):
+                files = self.files()
+                if mutation == 'missing-archive': del files[archive_name]
+                elif mutation == 'missing-inventory': del files[prefix + 'linux/inventory.json']
+                elif mutation == 'legacy-no-recovery':
+                    files = {name: data for name, data in files.items() if not name.startswith(prefix)}
+                elif mutation == 'nested-archive': files[prefix + 'linux/nested/native.tar.gz'] = files.pop(archive_name)
+                elif mutation == 'unknown-platform': files[prefix + 'other/native.tar.gz'] = (b'inert', 0o644)
+                elif mutation == 'extra-archive': files[prefix + 'linux/another.tar.gz'] = (b'inert', 0o644)
+                else: files[prefix + 'linux/native.zip'] = files.pop(archive_name)
                 archive, record = self.archive(files)
                 self.rejected(archive, record)
 
@@ -381,7 +408,7 @@ class WireHandoffBoundary(unittest.TestCase):
             with self.subTest(directories=changed):
                 with self.assertRaisesRegex(ValueError, 'wire directory inventory differs'):
                     module.wire_inventory(record, self.root, changed)
-        over = self.files({'linux': 1025, 'win': 1, 'mac-x64': 1, 'mac-arm64': 1})
+        over = self.files({'linux': 1025, 'win': 3, 'mac-x64': 3, 'mac-arm64': 3})
         result = self.cli(['--check-wire-handoff'], {'root': self.root, 'archive': self.record(over),
                           'directories': self.parents(over), 'memberBytes': self.member_bytes(over)})
         self.assertNotEqual(result.returncode, 0)
@@ -390,9 +417,9 @@ class WireHandoffBoundary(unittest.TestCase):
     def test_producer_byte_budget_metadata_exact_boundaries_without_payload_allocation(self):
         # Metadata-only planning proof: these sizes do not describe the inert
         # fixture bytes, and do not prove an archive of this size can be extracted.
-        files = self.files({'linux': 6, 'win': 1, 'mac-x64': 1, 'mac-arm64': 1})
+        files = self.files({'linux': 6, 'win': 3, 'mac-x64': 3, 'mac-arm64': 3})
         record, directories = self.record(files), self.parents(files)
-        names = [name for name in files if name.startswith(self.root + '/resources/linux/')]
+        names = [name for name in files if module.wire_group(name, False) == 'linux']
         member_limit, expanded_limit = 200 * 1024 * 1024, 1024 ** 3
         single = dict.fromkeys(files, 0)
         single[names[0]] = member_limit
@@ -403,16 +430,16 @@ class WireHandoffBoundary(unittest.TestCase):
         for name, sizes in [('zero', dict.fromkeys(files, 0)), ('member', single), ('total', total)]:
             with self.subTest(boundary=name):
                 before = list(self.directory.iterdir())
-                self.assertEqual(module.wire_inventory(record, self.root, directories, member_bytes=sizes), 8202)
+                self.assertEqual(module.wire_inventory(record, self.root, directories, member_bytes=sizes), 8203)
                 result = self.cli(['--check-wire-handoff'], {'root': self.root, 'archive': record,
                                   'directories': directories, 'memberBytes': sizes})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(list(self.directory.iterdir()), before, 'metadata precheck performed archive I/O')
 
     def test_producer_byte_budget_metadata_overflow_and_malformed_sizes_fail_closed(self):
-        files = self.files({'linux': 6, 'win': 1, 'mac-x64': 1, 'mac-arm64': 1})
+        files = self.files({'linux': 6, 'win': 3, 'mac-x64': 3, 'mac-arm64': 3})
         record, directories = self.record(files), self.parents(files)
-        names = [name for name in files if name.startswith(self.root + '/resources/linux/')]
+        names = [name for name in files if module.wire_group(name, False) == 'linux']
         member_limit, expanded_limit = 200 * 1024 * 1024, 1024 ** 3
         sizes = self.member_bytes(files)
         over_total = dict.fromkeys(files, 0)

@@ -428,3 +428,71 @@ fn missing_disabled_state_is_distinct_from_explicit_false_and_true() {
     }
     assert!(parse_disabled_state("disabled services = {\n", label).is_err());
 }
+
+// Structure captured from successful macOS 27.2 print-disabled system stdout.
+// Unrelated service labels are anonymized; indentation, ordering, all 44 states,
+// initial blank line, target position and final newline are preserved.
+#[test]
+fn macos_27_disabled_fixture_reports_explicit_enabled_and_disabled() {
+    let label = "com.polaris.helper";
+    let enabled =
+        polaris_source_probe::crate_file!("src/mac_migration_launchd/print-disabled-macos-27.txt");
+    assert_eq!(enabled.lines().count(), 47);
+    assert_eq!(
+        enabled.lines().filter(|line| line.contains(" => ")).count(),
+        44
+    );
+    assert_eq!(parse_disabled_state(&enabled, label).unwrap(), Some(false));
+    assert!(!parse_disabled_print(&enabled, label).unwrap());
+    let disabled = enabled.replace(
+        "\t\t\"com.polaris.helper\" => enabled\n",
+        "\t\t\"com.polaris.helper\" => disabled\n",
+    );
+    assert_ne!(disabled, enabled);
+    assert_eq!(parse_disabled_state(&disabled, label).unwrap(), Some(true));
+    assert!(parse_disabled_print(&disabled, label).unwrap());
+}
+
+#[test]
+fn macos_27_disabled_fixture_rejects_incomplete_ambiguous_or_mixed_grammar() {
+    let label = "com.polaris.helper";
+    let good =
+        polaris_source_probe::crate_file!("src/mac_migration_launchd/print-disabled-macos-27.txt");
+    let target = "\t\t\"com.polaris.helper\" => enabled\n";
+    assert!(good.contains(target));
+    for bad in [
+        good.trim_start_matches('\n').to_owned(),
+        good.replace("\tdisabled services = {", "disabled services = {"),
+        good.replace("\t\t\"", "\t\""),
+        good.replace("\t}\n", "}\n"),
+        good.replace(" => enabled", " => true"),
+        good.replace(" => disabled", " => false"),
+        good.replace(target, "\t\t\"com.polaris.helper\" => unknown\n"),
+        good.replace(target, "\t\t\t\"com.polaris.helper\" => enabled\n"),
+        good.replace(target, &format!("{target}{target}")),
+        good.replace("org.example.fixture.service-001", label),
+        good.replace("\t}\n", ""),
+        good.trim_end().to_owned(),
+        format!("{good}\n"),
+        format!("{good}}}\n"),
+        good.replace('\n', "\r\n"),
+        format!("{good}\0"),
+    ] {
+        assert!(parse_disabled_state(&bad, label).is_err());
+        assert!(parse_disabled_print(&bad, label).is_err());
+    }
+}
+
+#[test]
+fn macos_27_disabled_fixture_omission_is_not_a_disable_receipt() {
+    let label = "com.polaris.helper";
+    let good =
+        polaris_source_probe::crate_file!("src/mac_migration_launchd/print-disabled-macos-27.txt");
+    let missing = good.replace("\t\t\"com.polaris.helper\" => enabled\n", "");
+    assert_ne!(missing, good);
+    assert_eq!(parse_disabled_state(&missing, label).unwrap(), None);
+    assert!(parse_disabled_print(&missing, label).is_err());
+    let legacy_with_native_token =
+        format!("disabled services = {{\n\t\"{label}\" => enabled\n}}\n");
+    assert!(parse_disabled_state(&legacy_with_native_token, label).is_err());
+}

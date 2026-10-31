@@ -131,7 +131,7 @@ pub fn decode_request<I: Iterator<Item = String>>(
         }
         polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH => {
             let mut args = Vec::new();
-            for field in ["id", "cfg", "log", "fwd"] {
+            for field in ["execution", "id", "cfg", "log", "fwd"] {
                 args.push(required_line(lines, field)?);
             }
             if let Some(parent) = checked_line(lines, None)? {
@@ -451,7 +451,7 @@ mod sys {
         native: Arc<NativeCustody>,
     }
 
-    struct OwnedNativeChild(std::process::Child);
+    struct OwnedNativeChild(polaris_core_supervisor::admitted_payload::StdCustodiedChild);
     impl NativeChild for OwnedNativeChild {
         fn try_wait(&mut self) -> std::io::Result<bool> {
             self.0.try_wait().map(|status| status.is_some())
@@ -508,8 +508,11 @@ mod sys {
             conf_dir: &str,
             uid: u32,
         ) -> Result<NativeBirthStart, SpawnError> {
+            let execution = core
+                .prepare(polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain)
+                .map_err(|error| SpawnError::Failed(error.to_string()))?;
             let id = polaris_helper_proto::core_manifest::CoreId::parse(&core.manifest.id)
-                .map_err(|_| SpawnError::Failed("core-invalid".into()))?;
+                .map_err(|error| SpawnError::Failed(error.to_string()))?;
             if let Err(not_admitted) = self.native.admit_pinned(uid, &id) {
                 return Ok(not_admitted);
             }
@@ -527,18 +530,6 @@ mod sys {
             let forwarding_ms = 0;
             let process_started = Instant::now();
             prepare_cache_for_user(conf_dir).map_err(SpawnError::Failed)?;
-            let mut command = std::process::Command::new(core.directory.join("sing-box"));
-            command
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-            command.arg("run").arg("-c").arg(&params.cfg);
-            if !conf_dir.is_empty() {
-                command.current_dir(conf_dir);
-            }
-            if !params.log.is_empty() {
-                command.stdout(std::process::Stdio::piped());
-                command.stderr(std::process::Stdio::piped());
-            }
             let log_files = if params.log.is_empty() {
                 None
             } else {
@@ -554,15 +545,22 @@ mod sys {
             };
             #[cfg(all(test, target_os = "macos"))]
             crate::core_store::observe_test_spawn("mac-native-core", "before-spawn", None);
-            let mut child = command
-                .spawn()
+            let mut child = execution
+                .spawn_macos_root_helper_main(
+                    Path::new(&params.cfg),
+                    Path::new(conf_dir),
+                    log_files.is_some(),
+                    core.execution_lease()
+                        .map_err(|error| SpawnError::Failed(error.to_string()))?,
+                    Arc::clone(&core) as Arc<dyn Send + Sync>,
+                )
                 .map_err(|error| SpawnError::Failed(error.to_string()))?;
             let target = HelperBirthTarget {
                 pid: std::num::NonZeroU32::new(child.id()).expect("native Child has nonzero PID"),
                 birth: birth_token,
             };
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
+            let stdout = child.take_stdout();
+            let stderr = child.take_stderr();
             // No background thread, parent probe or cancellation point before custody publication.
             let birth = self
                 .native
@@ -679,8 +677,8 @@ mod sys {
                 return Err(SpawnError::Failed("config-or-log-path-denied".into()));
             }
             let core = crate::pinned_core::verify(Path::new(&self.config.core_dir), &params.id)
-                .map_err(|_| SpawnError::Failed("core-invalid".into()))?;
-            self.do_native_spawn(&params.common, Arc::new(core), conf, uid)
+                .map_err(|error| SpawnError::Failed(crate::pinned_core::status_reason(&error)))?;
+            self.do_native_spawn(&params.common, core, conf, uid)
         }
         fn native_caller_allowed(
             &self,

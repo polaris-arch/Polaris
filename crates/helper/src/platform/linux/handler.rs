@@ -816,7 +816,7 @@ where
     }
     #[cfg(not(test))]
     let _ = deps;
-    crate::pinned_core::verify(root, id).map(Arc::new)
+    crate::pinned_core::verify(root, id)
 }
 
 /// The only executable admission route: a strict selected-id frame and a
@@ -846,7 +846,7 @@ fn handle_start<P, S, D, SD>(
         return;
     }
     let mut lines = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..5 {
         match conn.read_line_strict() {
             Ok(Some(line)) => lines.push(line),
             _ => {

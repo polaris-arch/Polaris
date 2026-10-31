@@ -26,6 +26,70 @@ fn body(source: &str, marker: &str) -> String {
     }
     panic!("production hook body unclosed")
 }
+// Inspect the bounded success branch, not adjacency between its first two
+// calls. Every statement is direct, so nested/false branches and early returns
+// cannot satisfy reachability via a comment, string or arbitrary contains hit.
+fn successful_generation_claim(source: &str) -> bool {
+    let claim = body(source, "fn claim_generation(");
+    if !claim.starts_with("{letgeneration=self.gate.claim_generation(expected,kind);ifletSome(generation)=generation{")
+        || !claim.ends_with("}generation}")
+    { return false; }
+    let success = body(&claim, "ifletSome(generation)=generation");
+    let statements: Vec<_> = success[1..success.len() - 1]
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .collect();
+    statements
+        == [
+            "self.revoke_tailnet_before_generation(generation)",
+            "self.coex.claim(generation,kind==LifecycleKind::Start)",
+            "self.gen_changed.notify_waiters()",
+        ]
+}
+
+#[test]
+fn generation_claim_guard_rejects_unreachable_wrong_owner_and_text_only_calls() {
+    let original = source("runtime/proxy/lifecycle.rs");
+    assert!(successful_generation_claim(&original));
+    for (from, to) in [
+        (
+            "self.coex.claim(generation, kind == LifecycleKind::Start);",
+            "self.coex.claim(generation + 1, kind == LifecycleKind::Start);",
+        ),
+        (
+            "self.coex.claim(generation, kind == LifecycleKind::Start);",
+            "if false { self.coex.claim(generation, kind == LifecycleKind::Start); }",
+        ),
+        (
+            "self.coex.claim(generation, kind == LifecycleKind::Start);",
+            "return generation; self.coex.claim(generation, kind == LifecycleKind::Start);",
+        ),
+        (
+            "self.coex.claim(generation, kind == LifecycleKind::Start);",
+            "// self.coex.claim(generation, kind == LifecycleKind::Start);",
+        ),
+        (
+            "self.coex.claim(generation, kind == LifecycleKind::Start);",
+            "let text = \"self.coex.claim(generation, kind == LifecycleKind::Start);\";",
+        ),
+        (
+            "if let Some(generation) = generation {",
+            "if let Some(other_generation) = generation {",
+        ),
+        ("self.revoke_tailnet_before_generation(generation);", ""),
+        (
+            "self.coex.claim(generation, kind == LifecycleKind::Start);",
+            "if true {} else { self.coex.claim(generation, kind == LifecycleKind::Start); }",
+        ),
+    ] {
+        assert!(original.contains(from), "mutation anchor missing: {from}");
+        assert!(
+            !successful_generation_claim(&original.replace(from, to)),
+            "{to}"
+        );
+    }
+}
+
 #[test]
 fn original_sources_invalidate_before_debounce() {
     let monitor = source("runtime/proxy/network_monitor.rs");
@@ -44,10 +108,7 @@ fn original_sources_invalidate_before_debounce() {
 #[test]
 fn successful_claims_ready_failure_and_crash_hooks_remain_reachable() {
     let lifecycle = source("runtime/proxy/lifecycle.rs");
-    let claim = body(&lifecycle, "fn claim_generation(");
-    assert!(claim.contains(
-        "ifletSome(generation)=generation{self.coex.claim(generation,kind==LifecycleKind::Start)"
-    ));
+    assert!(successful_generation_claim(&lifecycle));
     let debounced = body(&lifecycle, "fn claim_debounced_restart(");
     assert!(
         debounced

@@ -43,12 +43,51 @@ fn wg_forced_route_strips_catch_all() {
 }
 
 #[test]
-fn ts_forced_route_includes_tailnet() {
+fn cold_ts_routes_are_only_explicit_declarations() {
     let s = ts_server("t1", None, &["192.168.10.0/24"]);
-    let cidrs = endpoint_forced_route_cidrs(&s, &ObservedTailnetAddresses::new());
-    assert!(cidrs.contains(&TAILNET_CGNAT.to_string()));
-    assert!(cidrs.contains(&TAILNET_ULA_V6.to_string()));
-    assert!(cidrs.contains(&"192.168.10.0/24".to_string()));
+    assert_eq!(
+        endpoint_forced_route_cidrs(&s, &ObservedTailnetAddresses::new()),
+        vec!["192.168.10.0/24".to_string()]
+    );
+    assert!(endpoint_forced_route_cidrs(
+        &ts_server("unknown", None, &[]),
+        &ObservedTailnetAddresses::new()
+    )
+    .is_empty());
+}
+
+#[test]
+fn explicit_official_prefixes_survive_discovery_and_do_not_revive_after_removal() {
+    let mut node = ts_server("ts", None, &[TAILNET_CGNAT, TAILNET_ULA_V6]);
+    let mut hosts = ObservedTailnetAddresses::new();
+    hosts.insert(
+        "ts".into(),
+        vec!["100.80.1.2".into(), "fd7a:115c:a1e0::2".into()],
+    );
+    for input in [&ObservedTailnetAddresses::new(), &hosts] {
+        let routes = endpoint_forced_route_cidrs(&node, input);
+        assert!(routes.iter().any(|c| c == TAILNET_CGNAT));
+        assert!(routes.iter().any(|c| c == TAILNET_ULA_V6));
+    }
+    node.tailscale_settings.as_mut().unwrap().routes.clear();
+    let routes = endpoint_forced_route_cidrs(&node, &hosts);
+    assert!(routes.iter().any(|c| c == "100.80.1.2/32"));
+    assert!(routes.iter().any(|c| c == "fd7a:115c:a1e0::2/128"));
+    assert!(!routes
+        .iter()
+        .any(|c| c == TAILNET_CGNAT || c == TAILNET_ULA_V6));
+    assert!(!mesh_node_carries_full_tunnel(&node));
+}
+
+#[test]
+fn invalid_host_input_does_not_restore_an_implicit_prefix() {
+    let node = ts_server("unknown", None, &[]);
+    let hosts = ObservedTailnetAddresses::from([(
+        "unknown".into(),
+        vec!["not-an-ip".into(), "999.1.2.3".into(), "".into()],
+    )]);
+    assert!(endpoint_forced_route_cidrs(&node, &hosts).is_empty());
+    assert!(!has_observed_tailnet_cidrs(&node, &hosts));
 }
 
 #[test]
@@ -513,7 +552,7 @@ fn selector_fallback_tracks_tailscale_control_url_gate() {
     use crate::user_config::app_config::UserConfig;
 
     let mut tailscale = ts_server("ts", None, &[]);
-    tailscale.tailscale_settings.as_mut().unwrap().control_url = Some("https://100.64.0.1".into());
+    tailscale.tailscale_settings.as_mut().unwrap().control_url = Some("https://100.064.0.1".into());
     let mut config = UserConfig {
         servers: vec![tailscale, ss("fallback", "2.2.2.2")],
         selected_server_id: Some("ts".into()),
@@ -523,18 +562,28 @@ fn selector_fallback_tracks_tailscale_control_url_gate() {
         selector_default_may_fall_back(&config),
         "非法 control_url 会让选中 Tailscale 在发射期被剔除"
     );
-    assert!(referenced_server_ids(&config).contains("fallback"));
-
-    config.servers[0]
-        .tailscale_settings
-        .as_mut()
-        .unwrap()
-        .control_url = Some("https://control.example.com".into());
-    assert!(!selector_default_may_fall_back(&config));
     assert_eq!(
         referenced_server_ids(&config),
-        BTreeSet::from(["ts".to_string()])
+        BTreeSet::from(["ts".to_string(), "fallback".to_string()])
     );
+
+    for control_url in [
+        "https://100.64.0.1",
+        "https://[fd7a:115c:a1e0::1]",
+        "https://control.example.com",
+    ] {
+        config.servers[0]
+            .tailscale_settings
+            .as_mut()
+            .unwrap()
+            .control_url = Some(control_url.into());
+        assert!(!selector_default_may_fall_back(&config), "{control_url}");
+        assert_eq!(
+            referenced_server_ids(&config),
+            BTreeSet::from(["ts".to_string()]),
+            "{control_url}"
+        );
+    }
 }
 
 /// 【直连哨兵不触发全纳入】`__direct__` ⇒ default 恒 = `direct` 出站，没有节点承载

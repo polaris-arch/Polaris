@@ -29,7 +29,7 @@ pub struct ReviewedPlainTcpCheckIdentity {
     binary_sha256: &'static str,
 }
 
-const REVIEWED_PLAIN_TCP_CHECK_IDENTITIES: [ReviewedPlainTcpCheckIdentity; 9] = [
+const REVIEWED_PLAIN_TCP_CHECK_IDENTITIES: [ReviewedPlainTcpCheckIdentity; 10] = [
     ReviewedPlainTcpCheckIdentity {
         binary_sha256: PINNED_B609_LINUX_X86_64_SHA256,
     },
@@ -69,6 +69,11 @@ const REVIEWED_PLAIN_TCP_CHECK_IDENTITIES: [ReviewedPlainTcpCheckIdentity; 9] = 
     ReviewedPlainTcpCheckIdentity {
         binary_sha256: "9089e0a78616d714eeb63d052dff8505a8b21ed9ba24285ed7444067cde69988",
     },
+    // Exact alpha.12.7 public package ELF identity. This admits the same
+    // check-only semantics; fresh sealed execution remains a separate gate.
+    ReviewedPlainTcpCheckIdentity {
+        binary_sha256: "1188baf18f7e4d9d4daabcf01633d72a2174ccb95ed71847d5032d857ad6679b",
+    },
 ];
 
 /// One fixed check-only semantic profile with separately reviewed byte identity.
@@ -90,6 +95,7 @@ impl LinuxInputProfile {
     pub const E0CFA24: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[6]);
     pub const E332935: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[7]);
     pub const BFCDF96: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[8]);
+    pub const E3155C9: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[9]);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

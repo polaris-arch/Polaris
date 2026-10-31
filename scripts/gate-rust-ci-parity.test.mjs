@@ -124,7 +124,7 @@ const GATES = [
 ];
 
 function loadStripped() {
-  const ciRaw = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
+  const ciRaw = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   const shRaw = readFileSync(join(ROOT, 'scripts/gate-rust.sh'), 'utf8');
   const controlledRaw = readFileSync(join(ROOT, 'scripts/run-native-dns-controlled-tests.mjs'), 'utf8');
   return { ci: stripComments(ciRaw), sh: stripComments(shRaw), controlled: controlledRaw };
@@ -159,6 +159,9 @@ const CI_ONLY_LOOPBACK_STEP = 'Run exact real App to paired kernel HOT loopback 
 const CI_ONLY_SUBSCRIPTION_STEP = 'Verify native subscription JSON URI and UA preservation';
 const CI_ONLY_BOOTSTRAP_STEP = 'Verify native helper bootstrap descriptor primitives';
 const CI_ONLY_COMPILE_STEP = 'Compile native consumer test binaries without execution';
+// This gate needs actual Windows producers and their compiled pin. Local
+// gate-rust.sh does not mirror that prerequisite chain; never label it MIRRORED.
+const CI_ONLY_WINDOWS_INSTALLER_STEP = 'Windows installer cleanup fixtures (native Rust producer)';
 const CANDIDATE_BUILD_STEP = 'Build actual candidate helper bytes and freeze the separate App identity';
 const CANDIDATE_RUNTIME_STEP = 'Run exact controlled App lifecycle hot-switch and stats tests';
 const MIRRORED_BUT_NOT_VERBATIM = [
@@ -409,7 +412,7 @@ function assertCargoStepCoverage(ci) {
   }
   assert.ok(cargoSteps.length > 0, '一个跑 cargo 的步骤都没抠到 —— 取材面是空的，本断言恒真');
 
-  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP]);
+  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP, CI_ONLY_WINDOWS_INSTALLER_STEP]);
   const orphans = cargoSteps.filter((n) => !covered.has(n));
   assert.deepEqual(
     orphans,
@@ -419,7 +422,7 @@ function assertCargoStepCoverage(ci) {
       '要么（多行 shell 块，抠不出单行）加进 MIRRORED_BUT_NOT_VERBATIM 并为它补一条针对性对拍。'
   );
 
-  const stale = [...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP].filter((n) => !cargoSteps.includes(n));
+  const stale = [...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP, CI_ONLY_WINDOWS_INSTALLER_STEP].filter((n) => !cargoSteps.includes(n));
   assert.deepEqual(stale, [], `非逐字镜像名单里有 ci.yml 已经没有的步骤（名单陈旧）：${JSON.stringify(stale)}`);
 }
 
@@ -431,6 +434,7 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
     assert.throws(() => assertCargoStepCoverage(added), /Unregistered native gate/);
   }
   assert.throws(() => assertCargoStepCoverage(ci.replace('run: node scripts/runtime-config-loopback.mjs run', 'run: echo omitted')), /名单陈旧/);
+  assert.throws(() => assertCargoStepCoverage(ci.replace(extractCiStepBlock(ci, CI_ONLY_WINDOWS_INSTALLER_STEP), '')), /名单陈旧/);
 });
 
 for (const gate of GATES) {
@@ -678,4 +682,69 @@ test('subscription native gate preserves exact JSON URI edit ownership uTLS and 
     const block = extractCiStepBlock(ci, CI_ONLY_SUBSCRIPTION_STEP);
     assert.throws(() => assertSubscriptionNative(ci.replace(block, block.replace(original, 'omitted'))), { name: 'AssertionError' });
   }
+});
+
+
+function assertWindowsMaintenanceConsumer(ci) {
+  const native = extractCiStepBlock(ci, CI_ONLY_WINDOWS_INSTALLER_STEP);
+  assert.equal(native.match(/^\s*if: (.+)$/m)?.[1],
+    "needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'Windows')");
+  assert.match(native, /shell: bash/);
+  assert.doesNotMatch(native, /continue-on-error|\|\| true|--ignored|--no-run|SIGNED_INERT|POLARIS_C05_POLICY_VALIDATION|powershell|ExecutionPolicy/);
+  const run = native.split('        run: |\n')[1]?.split('\n').map(line => line.trim()).filter(Boolean);
+  assert.deepEqual(run, [
+    'set -euo pipefail',
+    'node scripts/prepare-core-identity.mjs --platform=win --directory="$POLARIS_CORE_CARRIER_DIR" --mode=verify',
+    'cargo test --locked -p polaris-windows-cleaner --lib -- --nocapture 2>&1 | tee native-dns-ci-evidence/c05-native-fixtures.log',
+    'export POLARIS_C05_NATIVE_LOG="$PWD/native-dns-ci-evidence/c05-native-fixtures.log"',
+    'node --test scripts/nsis-core-sweep.test.mjs scripts/nsis-helper-cleanup.test.mjs',
+  ]);
+  const build = extractCiStepBlock(ci, CANDIDATE_BUILD_STEP);
+  assert.equal(build.match(/^\s*if: (.+)$/m)?.[1],
+    "${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}");
+  const phases = [
+    'cargo build --locked -p polaris-helper --bin polaris-helper',
+    'cp target/debug/polaris-helper.exe native-dns-ci-evidence/polaris-helper.exe',
+    'POLARIS_WINDOWS_INSTALL_ANCHOR="$(node scripts/prepare-core-identity.mjs --platform=win',
+    'export POLARIS_WINDOWS_INSTALL_ANCHOR',
+    'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner',
+    'node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM"',
+  ].map(marker => { const at = build.indexOf(marker); assert(at >= 0, marker); return at; });
+  assert(phases.every((at, i) => i === 0 || phases[i - 1] < at));
+  assert(build.includes('--mode=maintenance-anchor --helper-binary=native-dns-ci-evidence/polaris-helper.exe'));
+  assert(!build.includes('export POLARIS_WINDOWS_INSTALL_ANCHOR="$('), 'assignment must propagate the child status');
+  const before = ci.indexOf('- name: Verify all candidate payloads and compiled identity before workspace build');
+  const workspace = ci.indexOf('id: workspace_tests');
+  const consumer = ci.indexOf(`- name: ${CI_ONLY_WINDOWS_INSTALLER_STEP}`);
+  assert(ci.indexOf(`- name: ${CANDIDATE_BUILD_STEP}`) < before && before < workspace && workspace < consumer);
+  assert(!ci.includes('Windows installer cleanup fixtures (native PowerShell)'));
+}
+test('native maintenance consumer is after full producer admission, not the old early PS step', () => {
+  const { ci } = loadStripped();
+  assertWindowsMaintenanceConsumer(ci);
+  const native = extractCiStepBlock(ci, CI_ONLY_WINDOWS_INSTALLER_STEP);
+  for (const [from, to] of [
+    ["runner.os == 'Windows'", "runner.os == 'Linux'"],
+    ['--mode=verify', '--mode=prepare'],
+    ['--locked -p polaris-windows-cleaner --lib -- --nocapture', '-p polaris-helper --lib -- --nocapture'],
+    ['--lib -- --nocapture', '--lib -- --no-run'],
+    ['c05-native-fixtures.log', 'old-fixture.log'],
+    ['export POLARIS_C05_NATIVE_LOG=', 'export OMITTED_LOG='],
+    ['scripts/nsis-helper-cleanup.test.mjs', 'scripts/omitted.test.mjs'],
+    ['shell: bash', 'continue-on-error: true\n        shell: bash'],
+    ['set -euo pipefail', 'set -eu'],
+  ]) {
+    assert(native.includes(from));
+    assert.throws(() => assertWindowsMaintenanceConsumer(ci.replace(native, native.replaceAll(from, to))));
+  }
+  const build = extractCiStepBlock(ci, CANDIDATE_BUILD_STEP);
+  for (const from of [
+    'cp target/debug/polaris-helper.exe native-dns-ci-evidence/polaris-helper.exe',
+    '--mode=maintenance-anchor --helper-binary=native-dns-ci-evidence/polaris-helper.exe',
+    'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner',
+    'node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM"',
+  ]) assert.throws(() => assertWindowsMaintenanceConsumer(ci.replace(build, build.replace(from, 'OMITTED'))));
+  const moved = ci.replace(native, '').replace(`      - name: ${CANDIDATE_BUILD_STEP}`,
+    native + `\n      - name: ${CANDIDATE_BUILD_STEP}`);
+  assert.throws(() => assertWindowsMaintenanceConsumer(moved), 'consumer must follow the same producer admission');
 });

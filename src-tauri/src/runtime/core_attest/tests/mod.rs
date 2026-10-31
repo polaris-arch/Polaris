@@ -26,9 +26,9 @@ fn attest_same_version_across_paths_passes() {
 }
 
 #[test]
-fn attest_p101_ground_truth_is_alarm() {
+fn attest_fixture_version_mismatch_is_alarm() {
     let got = attest_core_binary(
-        &p("/Users/sway/Library/Application Support/com.polaris.app/polaris/core_update/sing-box"),
+        &p("/Users/fixture-user/Library/Application Support/com.polaris.app/polaris/core_update/sing-box"),
         Some(&p("/Library/Application Support/Polaris/core/sing-box")),
         "sing-box version 1.14.0-beta.3",
         "sing-box version 1.14.0-alpha.45",

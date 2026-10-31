@@ -5,6 +5,11 @@ use crate::{
     response::{LinuxBirthStart, NativeBirthStart},
 };
 
+/// Fixed non-secret execution-semantics discriminator in the existing pinned
+/// Start payload. Its non-CoreId shape makes the unchanged v2 decoder reject
+/// before any native birth, even if a daemon changes after the Version probe.
+pub const PINNED_EXECUTION_DISCRIMINATOR: &str = "polaris-exact-exec-v3";
+
 /// Identity is supplied by native IPC credentials, never by request arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallerIdentity {
@@ -50,8 +55,12 @@ pub struct PinnedStartParams {
 }
 
 impl PinnedStartParams {
-    /// `id/cfg/log/fwd/[parentPid]`, with no aliases, duplicate or trailing lines.
+    /// `v3-marker/id/cfg/log/fwd/[parentPid]`, with no legacy fallback.
     pub fn parse(lines: &[String]) -> Option<Self> {
+        let (marker, lines) = lines.split_first()?;
+        if marker != PINNED_EXECUTION_DISCRIMINATOR {
+            return None;
+        }
         if !(4..=5).contains(&lines.len()) {
             return None;
         }

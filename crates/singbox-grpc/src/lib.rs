@@ -40,7 +40,9 @@ pub mod daemon {
 mod h2c;
 mod reconnect;
 mod runtime_config;
-pub use runtime_config::{RuntimeConfigError, RUNTIME_CONFIG_MAX_MESSAGE_BYTES};
+pub use runtime_config::{
+    ApiHandoffMetadata, RuntimeConfigError, RuntimeStatusEnvelope, RUNTIME_CONFIG_MAX_MESSAGE_BYTES,
+};
 
 // vendored proto ⇄ 真核 wire 契约对拍器。**同一份文件被多处 `include!`**：
 // `build.rs`（release 硬门，对拍随包核）、`tests/` 下的 wire 测试（开发机 + 无核的机制自验）、
@@ -143,12 +145,36 @@ impl Endpoint {
 /// 构造时建立一条 h2c（或 TLS）长连接的 lazy channel；所有 unary/stream 调用复用该 channel。
 /// Bearer secret 经 per-call metadata 注入（h2c 下 grpc-js call credentials 不可用，Rust 侧同理——
 /// 走 per-request metadata 而非 channel-level creds，对齐 上游 `authMetadata`）。
+#[derive(Clone)]
 pub struct SingBoxApiClient {
     channel: Channel,
+    capture: Option<std::sync::Arc<h2c::CapturedTransport>>,
+    _retained_lifetime: Option<std::sync::Arc<dyn ApiClientLifetime>>,
     /// 原始 target（`host:port`，IPv6 已方括号包裹）；流订阅重连用（h2c::connect_h2c 会自加 http://）。
     target: String,
     secret: Option<String>,
     authorization: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+/// A caller-owned API epoch. Cancellation drops the actual RPC/stream future;
+/// the lease remains retained until its client and escaped streams have unwound.
+pub trait ApiClientLifetime: Send + Sync {
+    fn cancelled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
+async fn in_api_lifetime<T>(
+    lifetime: &Option<std::sync::Arc<dyn ApiClientLifetime>>,
+    call: impl std::future::Future<Output = Result<T, ClientError>>,
+) -> Result<T, ClientError> {
+    if let Some(lifetime) = lifetime {
+        tokio::select! {
+            biased;
+            _ = lifetime.cancelled() => Err(ClientError::Status(tonic::Status::cancelled("management API epoch sealed"))),
+            result = call => result,
+        }
+    } else {
+        call.await
+    }
 }
 
 /// 把一次 unary 调用收在 [`UNARY_DEADLINE`] 之内，从发起起算。
@@ -182,9 +208,37 @@ impl SingBoxApiClient {
         endpoint: Endpoint,
         secret: impl Into<String>,
     ) -> Result<Self, ClientError> {
+        Self::connect_inner(endpoint, secret.into(), false).await
+    }
+    /// Preserve one already trusted control transport. A successful TCP capture
+    /// can never be replaced by a later listener occupying the same address.
+    pub async fn connect_captured(
+        endpoint: Endpoint,
+        secret: impl Into<String>,
+    ) -> Result<Self, ClientError> {
+        Self::connect_inner(endpoint, secret.into(), true).await
+    }
+    pub fn captured_transport_live(&self) -> bool {
+        self.capture.as_ref().is_some_and(|c| c.live())
+    }
+    pub fn on_captured_transport_closed(&self, callback: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if let Some(c) = &self.capture {
+            c.on_closed(callback)
+        }
+    }
+    /// Retain the caller's existing resource lease, not an authentication claim.
+    pub fn retain_lifetime(mut self, guard: impl ApiClientLifetime + 'static) -> Self {
+        self._retained_lifetime = Some(std::sync::Arc::new(guard));
+        self
+    }
+    async fn connect_inner(
+        endpoint: Endpoint,
+        secret: String,
+        captured: bool,
+    ) -> Result<Self, ClientError> {
         let target = endpoint.target();
         let secret = {
-            let s = secret.into();
+            let s = secret;
             if s.is_empty() {
                 None
             } else {
@@ -202,13 +256,27 @@ impl SingBoxApiClient {
             .metadata()
             .get("authorization")
             .cloned();
-        let channel = h2c::connect_h2c(&target).await?;
+        let (channel, capture) = if captured {
+            let (channel, capture) = h2c::connect_captured(&target)?;
+            (channel, Some(capture))
+        } else {
+            (h2c::connect_h2c(&target).await?, None)
+        };
         Ok(Self {
             channel,
+            capture,
+            _retained_lifetime: None,
             target,
             secret,
             authorization,
         })
+    }
+
+    async fn unary<T>(
+        &self,
+        call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+    ) -> Result<T, ClientError> {
+        in_api_lifetime(&self._retained_lifetime, within_unary_deadline(call)).await
     }
 
     /// 注入 Bearer metadata 的请求包装。secret 空则原样返回（免认证）。
@@ -239,7 +307,7 @@ impl SingBoxApiClient {
             outbound_tag: member_tag.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.select_outbound(req)).await?;
+        self.unary(c.select_outbound(req)).await?;
         Ok(())
     }
 
@@ -251,7 +319,7 @@ impl SingBoxApiClient {
             outbound_tag: outbound_tag.into(),
         }));
         request.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(client.url_test(request)).await?;
+        self.unary(client.url_test(request)).await?;
         Ok(())
     }
 
@@ -260,7 +328,11 @@ impl SingBoxApiClient {
     pub async fn open_groups(&self) -> Result<tonic::Streaming<daemon::Groups>, ClientError> {
         let mut client = self.client();
         let request = self.with_auth(Request::new(daemon::Empty {}));
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, client.subscribe_groups(request)).await {
+        match in_api_lifetime(&self._retained_lifetime, async {
+            Ok(tokio::time::timeout(SNAPSHOT_TIMEOUT, client.subscribe_groups(request)).await)
+        })
+        .await?
+        {
             Ok(stream) => Ok(stream?.into_inner()),
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
@@ -277,7 +349,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::ClashMode { mode: mode.into() }));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.set_clash_mode(req)).await?;
+        self.unary(c.set_clash_mode(req)).await?;
         Ok(())
     }
 
@@ -285,9 +357,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        Ok(within_unary_deadline(c.get_clash_mode_status(req))
-            .await?
-            .into_inner())
+        Ok(self.unary(c.get_clash_mode_status(req)).await?.into_inner())
     }
 
     /// Read active rule-set state from this authenticated core instance.
@@ -298,9 +368,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::RuleSetStatusRequest { tags }));
         req.set_timeout(UNARY_DEADLINE);
-        Ok(within_unary_deadline(c.get_rule_set_status(req))
-            .await?
-            .into_inner())
+        Ok(self.unary(c.get_rule_set_status(req)).await?.into_inner())
     }
 
     /// Tailscale：热重设出口节点（不重启核）。按 `endpoint_tag` 定位具体 tailscale 端点，
@@ -317,7 +385,7 @@ impl SingBoxApiClient {
             stable_id: stable_id.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.set_tailscale_exit_node(req)).await?;
+        self.unary(c.set_tailscale_exit_node(req)).await?;
         Ok(())
     }
 
@@ -329,7 +397,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(submission));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.submit_open_connect_auth_response(req)).await?;
+        self.unary(c.submit_open_connect_auth_response(req)).await?;
         Ok(())
     }
 
@@ -341,7 +409,8 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(cancel));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.cancel_open_connect_auth_challenge(req)).await?;
+        self.unary(c.cancel_open_connect_auth_challenge(req))
+            .await?;
         Ok(())
     }
 
@@ -353,7 +422,8 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(submission));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.submit_open_vpn_challenge_response(req)).await?;
+        self.unary(c.submit_open_vpn_challenge_response(req))
+            .await?;
         Ok(())
     }
 
@@ -365,7 +435,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(cancel));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.cancel_open_vpn_challenge(req)).await?;
+        self.unary(c.cancel_open_vpn_challenge(req)).await?;
         Ok(())
     }
 
@@ -376,7 +446,7 @@ impl SingBoxApiClient {
             id: id.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.close_connection(req)).await?;
+        self.unary(c.close_connection(req)).await?;
         Ok(())
     }
 
@@ -390,7 +460,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.close_all_connections(req)).await?;
+        self.unary(c.close_all_connections(req)).await?;
         Ok(())
     }
 
@@ -415,9 +485,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        let resp = within_unary_deadline(c.get_default_log_level(req))
-            .await?
-            .into_inner();
+        let resp = self.unary(c.get_default_log_level(req)).await?.into_inner();
         // prost 对未知枚举值回落 default(=PANIC)，那会把「上游加了新级别」伪装成「核在 panic 级」。
         // 故用 try_from 自己判：识别不出就报错，由调用方呈现成「未知」——不猜。
         daemon::LogLevel::try_from(resp.level).map_err(|_| {
@@ -455,7 +523,11 @@ impl SingBoxApiClient {
             )
         };
         // deadline 必须裹住「建流 + 首帧」整体：核 wedged 时 subscribe 本身就可能永不返回。
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await {
+        match in_api_lifetime(&self._retained_lifetime, async {
+            Ok(tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await)
+        })
+        .await?
+        {
             Ok(r) => r,
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
@@ -478,7 +550,11 @@ impl SingBoxApiClient {
         let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
             interval: interval_ns,
         }));
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, c.subscribe_connections(req)).await {
+        match in_api_lifetime(&self._retained_lifetime, async {
+            Ok(tokio::time::timeout(SNAPSHOT_TIMEOUT, c.subscribe_connections(req)).await)
+        })
+        .await?
+        {
             Ok(stream) => Ok(stream?.into_inner()),
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
@@ -522,7 +598,11 @@ impl SingBoxApiClient {
         };
         // deadline 必须裹住「建流 + 首帧」整体：服务端的 `waitForStarted` 会在核尚未 STARTED 时
         // 一直挂着，没有这层超时就是永久挂起（同 `first_connection_snapshot` 的理由）。
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await {
+        match in_api_lifetime(&self._retained_lifetime, async {
+            Ok(tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await)
+        })
+        .await?
+        {
             Ok(r) => r,
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
@@ -580,7 +660,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.clear_logs(req)).await?;
+        self.unary(c.clear_logs(req)).await?;
         Ok(())
     }
 
@@ -666,7 +746,11 @@ impl SingBoxApiClient {
             Ok::<_, ClientError>(first.unwrap_or_default())
         };
         // deadline 裹住「建流 + 首帧」整体：服务端 `waitForStarted` 在核尚未 STARTED 时会一直挂着。
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await {
+        match in_api_lifetime(&self._retained_lifetime, async {
+            Ok(tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await)
+        })
+        .await?
+        {
             Ok(r) => r,
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
@@ -683,7 +767,7 @@ impl SingBoxApiClient {
             endpoint_tag: endpoint_tag.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.mark_taildrop_inbox_read(req)).await?;
+        self.unary(c.mark_taildrop_inbox_read(req)).await?;
         Ok(())
     }
 
@@ -699,7 +783,7 @@ impl SingBoxApiClient {
             name: name.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.delete_taildrop_file(req)).await?;
+        self.unary(c.delete_taildrop_file(req)).await?;
         Ok(())
     }
 
@@ -720,7 +804,7 @@ impl SingBoxApiClient {
             name: name.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        within_unary_deadline(c.cancel_taildrop_receiving(req)).await?;
+        self.unary(c.cancel_taildrop_receiving(req)).await?;
         Ok(())
     }
 
@@ -742,7 +826,14 @@ impl SingBoxApiClient {
             endpoint_tag: endpoint_tag.into(),
             name: name.into(),
         }));
-        Ok(c.download_taildrop_file(req).await?.into_inner())
+        let stream = in_api_lifetime(&self._retained_lifetime, async {
+            Ok(c.download_taildrop_file(req).await?.into_inner())
+        })
+        .await?;
+        Ok(TaildropDownload {
+            stream,
+            lifetime: self._retained_lifetime.clone(),
+        })
     }
 
     /// 启动一次 Taildrop 多文件发送。
@@ -780,10 +871,19 @@ impl SingBoxApiClient {
         let req = self.with_auth(Request::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )));
-        let responses = c.send_taildrop_files(req).await?.into_inner();
+        let responses = in_api_lifetime(&self._retained_lifetime, async {
+            Ok(c.send_taildrop_files(req).await?.into_inner())
+        })
+        .await?;
         Ok(TaildropSendSession {
-            input: TaildropSendInput { tx },
-            output: TaildropSendOutput { responses },
+            input: TaildropSendInput {
+                tx,
+                lifetime: self._retained_lifetime.clone(),
+            },
+            output: TaildropSendOutput {
+                responses,
+                lifetime: self._retained_lifetime.clone(),
+            },
         })
     }
 }
@@ -793,7 +893,22 @@ impl SingBoxApiClient {
 /// 起别名而不是让调用方去裸写 `tonic::Streaming<…>`：**src-tauri 不依赖 tonic** —— 传输层封装在本
 /// crate 是既定分层，为了写一个类型名就往上层加 tonic 依赖，等于把这层封装打穿。
 /// 消费只需 `stream.message().await`（`Streaming` 的固有方法，不必 import 任何 trait）。
-pub type TaildropDownload = tonic::Streaming<daemon::DownloadTaildropFileChunk>;
+pub struct TaildropDownload {
+    stream: tonic::Streaming<daemon::DownloadTaildropFileChunk>,
+    lifetime: Option<std::sync::Arc<dyn ApiClientLifetime>>,
+}
+impl std::fmt::Debug for TaildropDownload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaildropDownload").finish_non_exhaustive()
+    }
+}
+impl TaildropDownload {
+    pub async fn message(
+        &mut self,
+    ) -> Result<Option<daemon::DownloadTaildropFileChunk>, ClientError> {
+        in_api_lifetime(&self.lifetime, async { Ok(self.stream.message().await?) }).await
+    }
+}
 
 /// 一次 Taildrop 发送声明里的文件元数据。文件内容随后按声明顺序写入 [`TaildropSendInput`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,29 +933,36 @@ impl TaildropSendSession {
 /// Taildrop 发送请求流。按文件顺序发送若干 chunk，再发送一次 `finish_file`。
 pub struct TaildropSendInput {
     tx: tokio::sync::mpsc::Sender<daemon::TaildropSendClientMessage>,
+    lifetime: Option<std::sync::Arc<dyn ApiClientLifetime>>,
 }
 
 impl TaildropSendInput {
     pub async fn send_chunk(&self, data: Vec<u8>) -> Result<(), ClientError> {
-        self.tx
-            .send(daemon::TaildropSendClientMessage {
-                message: Some(daemon::taildrop_send_client_message::Message::Chunk(
-                    daemon::TaildropFileChunk { data },
-                )),
-            })
-            .await
-            .map_err(|_| ClientError::RequestStreamClosed)
+        in_api_lifetime(&self.lifetime, async {
+            self.tx
+                .send(daemon::TaildropSendClientMessage {
+                    message: Some(daemon::taildrop_send_client_message::Message::Chunk(
+                        daemon::TaildropFileChunk { data },
+                    )),
+                })
+                .await
+                .map_err(|_| ClientError::RequestStreamClosed)
+        })
+        .await
     }
 
     pub async fn finish_file(&self) -> Result<(), ClientError> {
-        self.tx
-            .send(daemon::TaildropSendClientMessage {
-                message: Some(daemon::taildrop_send_client_message::Message::FileDone(
-                    daemon::TaildropFileDone {},
-                )),
-            })
-            .await
-            .map_err(|_| ClientError::RequestStreamClosed)
+        in_api_lifetime(&self.lifetime, async {
+            self.tx
+                .send(daemon::TaildropSendClientMessage {
+                    message: Some(daemon::taildrop_send_client_message::Message::FileDone(
+                        daemon::TaildropFileDone {},
+                    )),
+                })
+                .await
+                .map_err(|_| ClientError::RequestStreamClosed)
+        })
+        .await
     }
 }
 
@@ -858,12 +980,17 @@ pub enum TaildropSendUpdate {
 /// Taildrop 发送响应流。必须与 [`TaildropSendInput`] 并发消费，避免双向流背压互锁。
 pub struct TaildropSendOutput {
     responses: tonic::Streaming<daemon::TaildropSendServerMessage>,
+    lifetime: Option<std::sync::Arc<dyn ApiClientLifetime>>,
 }
 
 impl TaildropSendOutput {
     pub async fn next_update(&mut self) -> Result<Option<TaildropSendUpdate>, ClientError> {
         loop {
-            let Some(frame) = self.responses.message().await? else {
+            let Some(frame) = in_api_lifetime(&self.lifetime, async {
+                Ok(self.responses.message().await?)
+            })
+            .await?
+            else {
                 return Ok(None);
             };
             match frame.message {

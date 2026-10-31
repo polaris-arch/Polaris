@@ -19,15 +19,20 @@ const surfaces = [
 ];
 beforeAll(async () => { await i18nReady; await i18n.changeLanguage('en-US'); });
 
-it('renders actual backend versions/default and all three precedence labels on both surfaces', () => {
+it('renders one planned value/source and keeps backend metadata in the surface information control', () => {
   for (const { Hint, className } of surfaces) {
     for (const source of ['default', 'global', 'subscription'] as const) {
       const effectiveUserAgent = source === 'default' ? info.defaultUserAgent : `${source}/opaque`;
       const html = renderToStaticMarkup(<Hint id="ua-info"
         model={{ status: 'ready', info: { ...info, source, effectiveUserAgent }, refresh: vi.fn() }} />);
-      for (const expected of [info.appVersion, info.coreVersion, info.defaultUserAgent, effectiveUserAgent, className]) {
-        expect(html).toContain(expected);
+      for (const expected of [effectiveUserAgent, className]) expect(html).toContain(expected);
+      if (Hint === SubscriptionUserAgentHint) {
+        for (const metadata of [info.appVersion, info.coreVersion, info.defaultUserAgent]) expect(html).toContain(metadata);
+      } else {
+        expect(html).not.toContain(info.appVersion);
+        expect(html).toContain('aria-haspopup="dialog"');
       }
+      expect(html.match(/<bdi class="mono">/g)).toHaveLength(1);
       const key = source === 'subscription' ? 'sub.uaEffectiveCustom' : source === 'global' ? 'sub.uaEffectiveGlobal' : 'sub.uaEffectiveDefault';
       expect(html).toContain(i18n.t(key));
       expect(html).not.toContain('unknown');
@@ -57,7 +62,13 @@ it('cold/busy effective state retains known versions/default but never claims a 
   for (const { Hint, retryClassName } of surfaces) {
     const html = renderToStaticMarkup(<Hint id="ua-info"
       model={{ status: 'ready', info: unavailable, refresh: vi.fn() }} />);
-    for (const known of [info.appVersion, info.coreVersion, info.defaultUserAgent]) expect(html).toContain(known);
+    if (Hint === SubscriptionUserAgentHint) {
+      for (const known of [info.appVersion, info.coreVersion, info.defaultUserAgent]) expect(html).toContain(known);
+    } else {
+      expect(html).not.toContain(info.appVersion);
+      expect(html).toContain('aria-haspopup="dialog"');
+    }
+    expect(html).not.toContain('<bdi class="mono">');
     expect(html).toContain(i18n.t('sub.uaEffectiveReadFailed'));
     expect(html).not.toContain(i18n.t('sub.uaEffectiveDefault'));
     expect(html).not.toContain(i18n.t('sub.uaEffectiveGlobal'));

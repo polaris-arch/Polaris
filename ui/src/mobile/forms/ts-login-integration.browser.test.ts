@@ -41,7 +41,7 @@ bus('vpn', ['onOpenVpnStatus']);
 bus('subscription', ['onUpdateProgress','onAutoUpdate']);
 bus('config', ['onEnterPrivacyMode','onExitPrivacyMode']);
 bus('ipInfo', ['onUpdated']);
-bus('server', ['onTaildropTaskUpdated']);
+api.server.onTaildropTaskUpdated = async fn => on('onTaildropTaskUpdated')(fn);
 for (const name of ['onProgress','onUpdated','onInvalidated']) unlockApi[name] = on(name);
 api.proxy.getPendingChanges = async () => ({ added: [], modified: [], removed: [], restartDeferred: false });
 api.vpn.getStatus = async () => ({ connected: false, openConnect: [], openVpn: [] });
@@ -58,7 +58,20 @@ api.server.tailscaleStateExists = async () => {
 const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode, mainStarts: 0, mainStops: 0, progressQueries: [], receipts: {}, refreshes: 0, backendSaved: null, request: null };
 api.proxy.start = async () => { test.mainStarts++; };
 api.proxy.stop = async () => { test.mainStops++; };
-if (heldDesktop) api.proxy.getStatus = async () => test.mainStops === 0 ? { running: true, starting: false, pid: 9, startTime: 5 } : { running: false };
+if (heldDesktop) {
+  const context = { selectedServerId: null, selectionIntentGeneration: 3 };
+  test.expectedStops = [];
+  api.proxy.getStatus = async () => test.mainStops === 0
+    ? { running: true, starting: false, pid: 9, startTime: 5, mainGeneration: 7, ownedStopContext: context }
+    : { running: false, starting: false, mainGeneration: 8, ownedStopContext: context };
+  api.proxy.stopExpected = async expected => {
+    if (expected.expectedMainGeneration !== 7 || expected.expectedSelectedServerId !== null
+      || expected.expectedSelectionIntentGeneration !== 3) throw Error('UNEXPECTED_FIXTURE_STOP_OWNER');
+    test.expectedStops.push(expected);
+    test.mainStops++;
+    return { kind: 'stopped', expectedMainGeneration: 7, stopMainGeneration: 8 };
+  };
+}
 // A stopped proxy is positive proof that nothing holds the node: no notice in these modes.
 if (mode === 'android-switch' || mode === 'ios-settings') api.proxy.getStatus = async () => ({ running: false, starting: false });
 if (mode?.startsWith('android-switch-') || mode?.startsWith('android-stop-retained')) api.proxy.getStatus = async () => mode?.endsWith('-restarted') ? { running: false, starting: false, mainGeneration: 8 } : ({ running: true, starting: mode?.endsWith('-starting'), pid: 9, startTime: 5, mainGeneration: 7 });
@@ -130,11 +143,13 @@ api.server.tailscaleLogin = async (node, request) => {
 const server = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: mode?.includes('retained') ? { retainedAuthKeyAvailable: !mode.includes('mismatch'), tailscaleCredentialRevision: 'revision-A' }
   : mode?.includes('active-credential') ? { authKey: 'synthetic-active', tailscaleCredentialRevision: 'revision-A' } : {} };
 useStagedConfigStore.setState({ entries: [], enabled: true });
-useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
+useAppStore.setState({ servers: [server], selectedServerId: null, config: { servers: [server], subscriptions: [], selectedServerId: null },
   refreshProxyStatus: async () => {}, loadConfig: async () => {
     test.refreshes++;
-    if (test.backendSaved) useAppStore.setState({ servers: [test.backendSaved], config: { servers: [test.backendSaved], subscriptions: [] } });
+    if (test.backendSaved) useAppStore.setState({ servers: [test.backendSaved], selectedServerId: null, config: { servers: [test.backendSaved], subscriptions: [], selectedServerId: null } });
   } });
+// The real config synchronizer also needs the same explicit selection context.
+api.config.get = async () => useAppStore.getState().config;
 api.server.update = async next => {
   test.saves++;
   (test.updates ||= []).push(next);
@@ -144,11 +159,11 @@ api.server.update = async next => {
     delete next.tailscaleCredentialIntent; delete next.tailscaleSettings.authKey;
   }
   if (mode === 'delayed-save') await new Promise(resolve => { test.releaseSave = resolve; });
-  useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [] } });
+  useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [], selectedServerId: null } });
 };
 if (mode?.includes('settings-staged')) useAppStore.setState({ proxyStatus: { running: true } });
 test.staged = () => useStagedConfigStore.getState().entries;
-test.setRevision = revision => { const current = useAppStore.getState().servers[0]; const next = { ...current, tailscaleSettings: { ...current.tailscaleSettings, tailscaleCredentialRevision: revision } }; useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [] } }); };
+test.setRevision = revision => { const current = useAppStore.getState().servers[0]; const next = { ...current, tailscaleSettings: { ...current.tailscaleSettings, tailscaleCredentialRevision: revision } }; useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [], selectedServerId: null } }); };
 const off = startMobileAppWiring(key => key);
 test.emit = (name, payload) => { for (const fn of listeners.get(name) || []) fn(payload); };
 test.attempt = () => useTailscaleLoginProgressStore.getState().attempts['ts-1'];
@@ -156,6 +171,9 @@ test.begin = id => useTailscaleLoginProgressStore.getState().begin('ts-1', id);
 test.authUrl = () => useAppStore.getState().tailscaleAuthUrls['ts-1'];
 test.initiated = () => useAppStore.getState().tailscaleLoginInitiated['ts-1'];
 test.stop = off;
+test.forms = () => useMobileFormStore.getState().stack.map(({instanceId,kind}) => ({instanceId,kind}));
+test.closeForms = () => useMobileFormStore.getState().closeAll();
+test.reopen = () => useMobileFormStore.getState().open({kind:'ts-login',serverId:'ts-1'});
 test.topConfirm = () => { const entry = (heldDesktop ? useDialogStore : useMobileFormStore).getState().stack.at(-1); return entry?.kind === 'confirm' ? entry.payload : null; };
 function Host() {
   const stack = useMobileFormStore(s => s.stack);
@@ -171,7 +189,10 @@ createRoot(document.getElementById('root')).render(<main className="mobile-root"
 const desktopEntry = entry.replace(
   "import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';",
   "import { TsLoginDialog as TsLoginPanel } from '/src/components/dialogs/TsLoginDialog';\nimport { TsSettingsDialog as DesktopSettings } from '/src/components/dialogs/TsSettingsDialog';\nimport '/src/styles/index.css';",
-).replace("if (mode === 'ios-settings' || mode?.includes('credential-settings')) return <MobileFormHost />;", "if (mode?.includes('credential-settings')) return <DesktopSettings serverId=\"ts-1\" />; if (mode === 'ios-settings') return <MobileFormHost />;");
+).replace("import { useMobileFormStore } from '/src/mobile/forms/form-store';", '')
+  .replace("import { ConfirmPanel } from '/src/mobile/forms/ConfirmPanel';", "import { ConfirmDialog as ConfirmPanel } from '/src/components/dialogs/ConfirmDialog';")
+  .replace('(heldDesktop ? useDialogStore : useMobileFormStore)', 'useDialogStore')
+  .replaceAll('useMobileFormStore', 'useDialogStore').replace("if (mode === 'ios-settings' || mode?.includes('credential-settings')) return <MobileFormHost />;", "if (mode?.includes('credential-settings')) return <DesktopSettings serverId=\"ts-1\" />; if (mode === 'ios-settings') return <MobileFormHost />;");
 
 let server: ViteDevServer;
 let browser: Browser;
@@ -525,6 +546,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
         const t = (window as any).__tsTest;
         return { logouts: t.logouts, mainStops: t.mainStops, mainStarts: t.mainStarts, replace: t.request.replaceIdentity };
       })).toEqual({ logouts: 1, mainStops: 1, mainStarts: 0, replace: true });
+      expect(await page.evaluate(() => (window as any).__tsTest.expectedStops)).toEqual([{
+        expectedMainGeneration: 7, expectedSelectedServerId: null, expectedSelectionIntentGeneration: 3,
+      }]);
     } finally { await page.close(); }
   }, 30_000);
 
@@ -545,6 +569,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
         const t = (window as any).__tsTest;
         return { mainStops: t.mainStops, mainStarts: t.mainStarts };
       })).toEqual({ mainStops: 1, mainStarts: 0 });
+      expect(await page.evaluate(() => (window as any).__tsTest.expectedStops)).toEqual([{
+        expectedMainGeneration: 7, expectedSelectedServerId: null, expectedSelectionIntentGeneration: 3,
+      }]);
     } finally { await page.close(); }
   }, 30_000);
 
@@ -1008,6 +1035,164 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
     } finally { await page.close(); }
   }, 30_000);
+  it('desktop closes only after the exact local terminal receipt, with one success and no cancel', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      // started and a browser URL are handoff/pending facts, not native completion.
+      await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'awaitingAuth', url: 'https://login.example/auth' });
+      });
+      await page.locator('#ts-auth-url').waitFor();
+      expect(await page.locator('.entry-form-dlg').count()).toBe(1);
+      expect(await page.getByText('在浏览器完成授权后请返回 Polaris。本机确认完成后会自动关闭此窗口；提前关闭会取消尚未完成的授权。').count()).toBe(1);
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await page.waitForFunction(() => (window as any).__tsTest.progressQueries.length > 0);
+      expect(await page.locator('.entry-form-dlg').count()).toBe(1);
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(0);
+      await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        const terminal = { ...t.startRequest, phase: 'authorized', url: null };
+        t.emit('onTailscaleLoginProgress', terminal);
+        t.emit('onTailscaleLoginProgress', terminal);
+      });
+      await page.locator('.entry-form-dlg').waitFor({ state: 'detached' });
+      await page.locator('.m-toast').filter({ hasText: '授权已完成' }).waitFor();
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(1);
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest;
+        return { cancels: t.cancels, stops: t.mainStops, logouts: t.logouts, active: t.initiated() === true, url: t.authUrl() ?? null }; })).toEqual({
+        cancels: [], stops: 0, logouts: 0, active: false, url: null,
+      });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop early authorization detaches before a late start response can send cancel', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop?mode=early-start`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseStart);
+      await page.evaluate(() => { const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null }); });
+      await page.locator('.entry-form-dlg').waitFor({ state: 'detached' });
+      await page.evaluate(async () => { (window as any).__tsTest.releaseStart();
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); });
+      expect(await page.locator('.entry-form-dlg').count()).toBe(0);
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(1);
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop main observation requires its bound authorized receipt and never stops the main core', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop?mode=main`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.attempt()?.phase === 'mainCore');
+      await page.evaluate(() => { const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', mainGeneration: 8, identityEpoch: 'epoch-A' });
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', mainGeneration: 7, identityEpoch: 'other-epoch' });
+        window.dispatchEvent(new Event('focus')); });
+      await page.waitForFunction(() => (window as any).__tsTest.progressQueries.length > 0);
+      expect(await page.locator('.entry-form-dlg').count()).toBe(1);
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(0);
+      // Event missed while the official browser was foreground: read the native
+      // request receipt on focus, not the aggregate logged-in status.
+      await page.evaluate(() => { const t = (window as any).__tsTest;
+        t.receipt = { ...t.startRequest, phase: 'authorized', mainGeneration: 7, identityEpoch: 'epoch-A', url: null };
+        window.dispatchEvent(new Event('focus')); });
+      await page.locator('.entry-form-dlg').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest;
+        return { cancels: t.cancels, stops: t.mainStops, starts: t.mainStarts }; })).toEqual({ cancels: [], stops: 0, starts: 0 });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop failure remains retryable and a stale authorized attempt cannot complete its successor', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop`);
+      const submit = page.locator('.entry-form-dlg .btn.flow');
+      await submit.click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      const old = await page.evaluate(() => (window as any).__tsTest.startRequest);
+      await page.evaluate(() => { const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'failed', reason: 'nativeRetirementUnknown', url: null }); });
+      await page.locator('.entry-form-dlg .dlg-err').waitFor();
+      expect(await page.locator('.entry-form-dlg').count()).toBe(1);
+      expect(await submit.isEnabled()).toBe(true);
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(0);
+      await submit.click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 2);
+      await page.evaluate(old => { const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...old, phase: 'authorized', url: null }); }, old);
+      expect(await page.locator('.entry-form-dlg').count()).toBe(1);
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(0);
+      await page.evaluate(() => { const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null }); });
+      await page.locator('.entry-form-dlg').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['cancel', 'leave'])('desktop %s revokes the pending request; late completion cannot close a new dialog', async action => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      const old = await page.evaluate(() => (window as any).__tsTest.startRequest);
+      if (action === 'cancel') await page.getByRole('button', { name: '取消', exact: true }).click();
+      else await page.evaluate(() => (window as any).__tsTest.closeForms());
+      await page.locator('.entry-form-dlg').waitFor({ state: 'detached' });
+      await page.waitForFunction(() => (window as any).__tsTest.cancels.length === 1);
+      await page.evaluate(old => { const t = (window as any).__tsTest;
+        t.reopen(); t.emit('onTailscaleLoginProgress', { ...old, phase: 'authorized', url: null }); }, old);
+      await page.locator('.entry-form-dlg').waitFor();
+      expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('cancelled');
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(0);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop closes the completed instance while preserving another open dialog', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      const first = await page.evaluate(() => (window as any).__tsTest.forms()[0].instanceId);
+      const second = await page.evaluate(() => (window as any).__tsTest.reopen());
+      expect(second).not.toBe(first);
+      await page.evaluate(() => { const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null }); });
+      await page.waitForFunction(second => (window as any).__tsTest.forms().length === 1
+        && (window as any).__tsTest.forms()[0].instanceId === second, second);
+      expect(await page.locator('.entry-form-dlg').count()).toBe(1);
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop preserves a newer draft after authorization and detaches before later unmount', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      await page.locator('#ts-login-control-url').fill('https://later-draft.example');
+      await page.evaluate(() => { const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', url: null }); });
+      await page.waitForFunction(() => document.querySelector<HTMLInputElement>('#ts-login-control-url')?.value === 'https://later-draft.example'
+        && document.querySelector<HTMLButtonElement>('.entry-form-dlg .btn.flow')?.disabled === false);
+      expect(await page.locator('.entry-form-dlg').count()).toBe(1);
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(1);
+      await page.evaluate(() => (window as any).__tsTest.closeForms());
+      await page.locator('.entry-form-dlg').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => (window as any).__tsTest.cancels)).toEqual([]);
+    } finally { await page.close(); }
+  }, 30_000);
+
   it('desktop same-node retry recovers B on focus and rejects a delayed A receipt', async () => {
     const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
     try {
@@ -1051,6 +1236,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
         window.dispatchEvent(new Event('focus'));
       });
       await page.waitForFunction(() => (window as any).__tsTest.attempt().phase === 'authorized');
+      await page.locator('.entry-form-dlg').waitFor({ state: 'detached' });
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(1);
       expect(await page.evaluate(() => (window as any).__tsTest.attempt().attemptId)).toBe(attemptB);
       expect(await page.evaluate(() => (window as any).__tsTest.mainStops)).toBe(0);
     } finally { await page.close(); }

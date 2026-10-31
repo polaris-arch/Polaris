@@ -1,6 +1,7 @@
 use super::*;
 
 mod direct_stop;
+pub(crate) mod helper_terminal;
 mod native_direct_stop;
 mod startup_observation;
 
@@ -104,7 +105,7 @@ fn android_target(run_id: &str) -> super::super::android_bridge::AndroidExactTar
     }
 }
 
-fn spawn_custody_stand_in() -> tokio::process::Child {
+fn spawn_custody_stand_in() -> crate::runtime::core_child::Child {
     let mut command = if cfg!(windows) {
         let mut command = tokio::process::Command::new("powershell");
         command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
@@ -118,6 +119,7 @@ fn spawn_custody_stand_in() -> tokio::process::Child {
         .kill_on_drop(true)
         .spawn()
         .expect("spawn local custody stand-in")
+        .into()
 }
 
 #[tokio::test]
@@ -312,6 +314,11 @@ async fn exact_helper_main_mismatch_retains_custody_then_retries_production_birt
         .unwrap_err()
         .contains("main claim birth changed"));
     assert!(rt.child.lock().unwrap().has_helper_start());
+    assert!(!rt
+        .child
+        .lock()
+        .unwrap()
+        .has_local_helper_terminal_for_test());
     assert!(!rt.child.lock().unwrap().helper_stop_inflight_for_test());
     assert_eq!(*rt.pid.lock().unwrap(), Some(pid));
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
@@ -335,6 +342,11 @@ async fn exact_helper_main_mismatch_retains_custody_then_retries_production_birt
     rt.kill_core_and_release_main(&gate).await.unwrap();
     assert!(!rt.mesh.main_owns_tailscale("helper-main-compare", true));
     assert!(!rt.child.lock().unwrap().has_helper_start());
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .has_local_helper_terminal_for_test());
     assert_eq!(*rt.pid.lock().unwrap(), None);
     assert!(
         rt.core_via_helper.load(Ordering::SeqCst),
@@ -1780,7 +1792,7 @@ async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_rep
             .unwrap()
             .running_for_test()
             .unwrap()
-            .try_wait_with(tokio::process::Child::try_wait),
+            .try_wait_with(crate::runtime::core_child::Child::try_wait),
         Ok(None)
     ));
 
@@ -1822,7 +1834,7 @@ async fn failed_stop_reservation_keeps_its_real_child_monitor_and_retires_on_rep
             .unwrap()
             .running_for_test()
             .unwrap()
-            .try_wait_with(tokio::process::Child::try_wait),
+            .try_wait_with(crate::runtime::core_child::Child::try_wait),
         Ok(None)
     ));
     rt.kill_core().await.unwrap();
@@ -2209,9 +2221,17 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
             crate::runtime::core_identity::current_platform().unwrap(),
         )
         .unwrap();
-        assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
+        assert!(sent[0].starts_with(&format!(
+            "start-pinned-birth-safe\n{}\n{}\n",
+            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+            id.as_str()
+        )));
         assert_eq!(sent[1], format!("stop-birth-safe\n{a_pid}\n{a_hex}\n"));
-        assert!(sent[2].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
+        assert!(sent[2].starts_with(&format!(
+            "start-pinned-birth-safe\n{}\n{}\n",
+            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+            id.as_str()
+        )));
     }
     b_process.start_kill().unwrap();
     b_process.wait().await.unwrap();
@@ -2262,7 +2282,11 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
         crate::runtime::core_identity::current_platform().unwrap(),
     )
     .unwrap();
-    assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
+    assert!(sent[0].starts_with(&format!(
+        "start-pinned-birth-safe\n{}\n{}\n",
+        polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+        id.as_str()
+    )));
     assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{hex}\n"));
 }
 
@@ -2318,7 +2342,11 @@ async fn unpinned_and_wrong_id_birth_receipts_are_rejected_and_exact_stopped() {
         assert!(rt.pid.lock().unwrap().is_none());
         let sent = frames.lock().unwrap();
         assert_eq!(sent.len(), 2);
-        assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", selected.as_str())));
+        assert!(sent[0].starts_with(&format!(
+            "start-pinned-birth-safe\n{}\n{}\n",
+            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+            selected.as_str()
+        )));
         assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{birth}\n"));
     }
 }
@@ -2465,6 +2493,11 @@ async fn cancelled_helper_start_worker_publishes_late_exact_birth() {
             .unwrap();
     });
     entered_rx.await.unwrap();
+    assert!(rt
+        .child
+        .lock()
+        .unwrap()
+        .bind_helper_start_worker(&attempt, late.abort_handle()));
     late.abort();
     let (lock, wake) = &*release;
     *lock.lock().unwrap() = true;

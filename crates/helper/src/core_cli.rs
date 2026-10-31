@@ -71,7 +71,16 @@ fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
-fn install(args: &InstallArgs) -> io::Result<String> {
+fn require_compiled_selection(manifest: &InstalledCoreManifest, platform: &str) -> io::Result<()> {
+    let selected =
+        polaris_core_supervisor::selected_core::selected_id(platform).map_err(io::Error::other)?;
+    if manifest.id != selected.as_str() {
+        return Err(invalid("installation differs from compiled selected core"));
+    }
+    Ok(())
+}
+
+pub(crate) fn install(args: &InstallArgs) -> io::Result<String> {
     if !privileged()? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -128,6 +137,7 @@ fn install(args: &InstallArgs) -> io::Result<String> {
     if manifest.core.platform != current_platform()? {
         return Err(invalid("core platform differs from installer"));
     }
+    require_compiled_selection(&manifest, current_platform()?)?;
     // Check the actual utility bytes, not its filename, a version string, or the
     // helper installed by another App. The staged manifest hash is mandatory here.
     let helper = manifest
@@ -233,6 +243,18 @@ fn privileged() -> io::Result<bool> {
 /// Invoke from the single-threaded executable entry before daemon/runtime startup;
 /// macOS migration probes require no concurrent spawn/exec during fd setup.
 pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = crate::linux_legacy_maintenance::run(args) {
+        return Some(result);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if args
+        .first()
+        .is_some_and(|verb| verb.starts_with("linux-legacy-"))
+    {
+        eprintln!("Linux legacy maintenance requires Linux");
+        return Some(std::process::ExitCode::FAILURE);
+    }
     #[cfg(target_os = "macos")]
     if let Some(result) = crate::mac_migration_guard::run(args) {
         return Some(result);

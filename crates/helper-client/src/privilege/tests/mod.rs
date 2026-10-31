@@ -51,48 +51,32 @@ fn pkexec_escalation_argv_structure() {
 
 #[test]
 fn uac_escalation_argv_structure() {
-    // 对照 PlatformPrivilegeService.ts:482: Start-Process -Verb RunAs
-    let esc = uac_escalation(r"C:\temp\install.ps1").unwrap();
-    assert_eq!(esc.method, PrivilegeMethod::Uac);
-    assert!(
-        esc.argv[0].ends_with(r"\WindowsPowerShell\v1.0\powershell.exe"),
-        "UAC 外层必须钉住系统 PowerShell 的绝对路径"
-    );
-    assert!(esc.argv[0].contains(r":\"), "UAC 外层不得回退 PATH 解析");
-    assert!(esc.argv.iter().any(|a| a.contains("Start-Process")));
-    assert!(esc.argv.iter().any(|a| a.contains("-Verb RunAs")));
-    assert!(esc.argv.iter().any(|a| a.contains(r"C:\temp\install.ps1")));
-
-    // The native ACL fixture uses this same child-only cleanup. Keep the real
-    // UAC executor ordered before process creation, without changing global env.
+    assert!(uac_escalation(r"C:\temp\install.ps1").is_err());
     let source = polaris_source_probe::crate_source!("privilege.rs");
     let source = polaris_source_probe::mask_comments(&source);
-    let anchor = "impl Executor for StdExecutor {";
-    assert_eq!(source.matches(anchor).count(), 1);
-    // Column-zero close bounds this top-level impl, not an indented method.
     let executor = source
-        .split_once(anchor)
+        .split_once("impl Executor for StdExecutor {")
         .unwrap()
         .1
         .split_once("\n}\n")
         .unwrap()
         .0;
     let construct = executor.find("Command::new(&argv[0])").unwrap();
-    let windows = executor.find("#[cfg(windows)]").unwrap();
     let isolate = executor.find("cmd.env_remove(\"PSModulePath\")").unwrap();
     let spawn = executor.find(".output()").unwrap();
-    assert!(construct < windows && windows < isolate && isolate < spawn);
+    assert!(construct < isolate && isolate < spawn);
     assert!(executor[isolate..spawn].contains("creation_flags(0x0800_0000)"));
     assert!(!executor.contains("std::env::remove_var"));
 }
 
 #[test]
 fn uac_script_path_preserves_native_quotes_and_powershell_literals() {
-    // Start-Process joins the array with spaces; the nested double quotes must
-    // survive PowerShell parsing so -File receives one complete native argument.
-    let esc = uac_escalation(r"C:\Users\O'Brien $home\App Data\安装.ps1").unwrap();
-    assert!(esc.argv[3].contains(r#"'-File','"C:\Users\O''Brien $home\App Data\安装.ps1"'"#));
-    assert!(esc.argv[3].contains("-Verb RunAs -Wait -PassThru -ErrorAction Stop"));
+    for path in [
+        r"C:\Users\O'Brien $home\App Data\安装.ps1",
+        r"C:\temp\install.ps1",
+    ] {
+        assert!(uac_escalation(path).is_err());
+    }
 }
 
 #[test]
@@ -169,7 +153,10 @@ fn uac_cancellation_uses_machine_marker_not_localized_text() {
 
 #[test]
 fn run_uac_escalation_keeps_cancelled_and_failure_distinct() {
-    let esc = uac_escalation(r"C:\temp\install.ps1").unwrap();
+    let esc = Escalation {
+        method: PrivilegeMethod::Uac,
+        argv: vec!["classifier-only".into()],
+    };
     let (cancelled, _) = executor_with(vec![("UAC_ERROR_CANCELLED_1223".to_owned(), 1223)]);
     assert_eq!(
         run_escalation(&esc, &cancelled).unwrap(),
@@ -321,83 +308,30 @@ fn exit_status_for(code: i32) -> ExitStatus {
 ///
 /// 判据落在**可执行形态**（ArgumentList 里的实参、退出码回传语句）上，不是「注释里提没提过」。
 #[test]
-fn uac_argv_bypasses_execution_policy_and_returns_the_exit_code() {
-    let esc =
-        uac_escalation(r"C:\Users\u\AppData\Roaming\x\ab-polaris-helper-install.ps1").unwrap();
-    assert_eq!(esc.method, PrivilegeMethod::Uac);
-    let cmd = &esc.argv[3];
-
-    assert!(
-        cmd.contains(&format!("-FilePath '{}'", esc.argv[0])),
-        "UAC 内层也必须使用与外层相同的系统 PowerShell 绝对路径"
-    );
-
-    // ① 执行策略：Restricted 是 Windows **客户端 SKU 的出厂默认**，不带 Bypass 则 `-File` 一行都跑不了。
-    assert!(
-        cmd.contains("'-ExecutionPolicy','Bypass'"),
-        "内层 ArgumentList 丢了 -ExecutionPolicy Bypass：出厂默认策略的机器上脚本不会执行\n{cmd}"
-    );
-    // 顺序也要对：必须在 '-File' 之前（PowerShell 的 flag 要在 -File 之前给，-File 之后的都算脚本参数）。
-    let ep = cmd.find("'-ExecutionPolicy'").expect("上一条已断言存在");
-    let file = cmd.find("'-File'").expect("-File 不见了");
-    assert!(
-        ep < file,
-        "-ExecutionPolicy 必须排在 -File 之前，否则会被当成脚本参数"
-    );
-
-    // ② 退出码回传：Start-Process -Wait 本身不透传子进程退出码。
-    assert!(
-        cmd.contains("-PassThru"),
-        "没有 -PassThru 就拿不到子进程对象"
-    );
-    assert!(
-        cmd.contains("exit $p.ExitCode"),
-        "拿到了 -PassThru 却不 exit 回去，等于没拿：脚本内 throw 仍会被谎报成功"
-    );
-    // 读不到 ExitCode / Start-Process 失败时必须 fail-closed；否则脚本根本没执行也会报成功。
-    assert!(cmd.contains("$p.HasExited"), "缺少 HasExited 守卫");
-    assert!(
-        cmd.contains("$ErrorActionPreference = 'Stop'"),
-        "外层缺少非终止错误升级，Start-Process 失败仍可能走到假成功"
-    );
-    assert!(
-        cmd.contains("-ErrorAction Stop"),
-        "Start-Process 必须把 UAC/拉起失败变成 catch 可见错误"
-    );
-    assert!(
-        cmd.contains("exit code unavailable')") && cmd.contains("exit 1"),
-        "读不到内层退出码必须失败，不能回落 0"
-    );
-    assert!(!cmd.contains("else { exit 0 }"), "禁止恢复无证据成功回落");
-
-    // 取消归类必须来自 Win32 机器字段，不得解析受系统语言影响的 Exception.Message。
-    assert!(cmd.contains("$exception.NativeErrorCode"));
-    assert!(cmd.contains("$exception.HResult"));
-    assert!(cmd.contains("$exception.InnerException"));
-    assert!(cmd.contains("-eq 1223"));
-    assert!(cmd.contains("-eq -2147023673"));
-    assert!(cmd.contains("UAC_ERROR_CANCELLED_1223"));
-    assert!(cmd.contains("exit 1223"));
-
-    // ③ PS 单引号保护字面量；内层双引号必须保留到 native argv，空格不能拆路径。
-    assert!(
-        cmd.contains(r#"'-File','"C:\Users\u\AppData\Roaming\x\ab-polaris-helper-install.ps1"'"#)
-    );
+fn windows_product_retires_policy_override_and_preserves_native_exit_custody() {
+    assert!(uac_escalation(r"C:\temp\install.ps1").is_err());
+    let source = polaris_source_probe::crate_source!("privilege.rs");
+    let source = polaris_source_probe::mask_comments(&source);
+    assert!(!source.contains("Start-Process"));
+    assert!(!source.contains("EncodedCommand"));
+    assert!(!source.contains("Bypass"));
+    let native = polaris_source_probe::repo_file!("crates/windows-cleaner/src/windows/install.rs");
+    for need in [
+        "ShellExecuteExW",
+        "SEE_MASK_NOCLOSEPROCESS",
+        "GetExitCodeProcess",
+        "ERROR_CANCELLED",
+        "WaitForSingleObject",
+        "image.check()",
+        "hash(&image.file)",
+    ] {
+        assert!(native.contains(need), "{need}");
+    }
+    assert!(!native.contains("TerminateProcess"));
 }
 
 /// 路径里的单引号不得击穿 PowerShell 字符串（`''` 是 PS 单引号串里的转义写法）。
 #[test]
 fn uac_argv_escapes_single_quotes_in_the_script_path() {
-    let esc = uac_escalation(r"C:\Users\o'brien\x.ps1").unwrap();
-    let cmd = &esc.argv[3];
-    assert!(
-        cmd.contains(r#"'-File','"C:\Users\o''brien\x.ps1"'"#),
-        "单引号未按 PS 规则加倍\n{cmd}"
-    );
-    // 反向：不得留下奇数个引号把命令拆断。
-    assert_eq!(
-        cmd.matches('\'').count() % 2,
-        0,
-        "引号总数为奇 → 命令被击穿"
-    );
+    assert!(uac_escalation(r"C:\Users\o'brien\x.ps1").is_err());
 }

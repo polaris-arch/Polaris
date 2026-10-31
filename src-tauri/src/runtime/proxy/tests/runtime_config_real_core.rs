@@ -599,8 +599,14 @@ impl Admission {
             binary
         };
         let binding_sha256 = formal.then(|| polaris_updater::sha256_hex(&raw_receipt));
-        let formal_bundle =
-            formal.then(|| crate::runtime::core_identity::verify_bundled(&binary).unwrap());
+        let formal_bundle = formal.then(|| {
+            let selected = crate::runtime::core_identity::selected_manifest("linux").unwrap();
+            crate::runtime::core_identity::verify_directory_observed(
+                binary.parent().unwrap(),
+                &selected,
+            )
+            .unwrap()
+        });
         let result = Self {
             receipt,
             receipt_path,
@@ -2035,18 +2041,29 @@ fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() 
     }
 }
 
-// Use the same production seed source as start(), restricted to this checkout.
+// Admit this checkout's real geo files as explicit test inputs in both profiles.
+// Production release lookup deliberately cannot fall back to the checkout.
 fn fixture_bundled_rules_dir() -> PathBuf {
-    let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+    use polaris_config_engine::user_config::builtin_geo_rulesets::{
+        builtin_geo_rulesets, is_valid_srs_bytes,
+    };
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../resources/data")
         .canonicalize()
-        .unwrap();
-    let actual = crate::runtime::geo_seed::resolve_bundled_data_dir()
-        .expect("admitted checkout must contain bundled rule sets")
-        .canonicalize()
-        .unwrap();
-    assert_eq!(actual, expected, "no alternate bundled rule source");
-    actual
+        .expect("checkout must contain the real bundled rules fixture");
+    assert!(bundled.is_dir(), "real bundled fixture must be a directory");
+    let entries = builtin_geo_rulesets();
+    assert_eq!(entries.len(), 28, "complete real geo fixture");
+    for entry in entries {
+        let bytes = regular(&bundled.join(&entry.file_name), 1024 * 1024);
+        assert!(bytes.len() >= 3);
+        assert!(
+            is_valid_srs_bytes(bytes[..3].try_into().unwrap()),
+            "{} must have actual SRS magic",
+            entry.tag
+        );
+    }
+    bundled
 }
 
 // The route writer externalizes the mirrored custom rule even for one domain.
@@ -2735,12 +2752,26 @@ async fn prepare_fixture_graph(rt: &ProxyRuntime, config: &Value) -> (Value, Val
     );
     rt.write_custom_rule_files(&serde_json::from_value(config.clone()).unwrap())
         .await;
-    let _ = fixture_bundled_rules_dir();
-    crate::runtime::geo_seed::seed_builtin_rule_sets_into(
-        rt.config.dir(),
-        "real HOT fixture preflight",
+    let bundled = fixture_bundled_rules_dir();
+    let rules = rt.config.dir().join("rules");
+    let report = crate::runtime::geo_seed::seed_builtin_rule_sets(
+        &bundled,
+        &rules,
         &crate::runtime::geo_seed::SeedOptions::default(),
     );
+    assert!(
+        report.still_missing.is_empty(),
+        "complete fixture seed: {report:?}"
+    );
+    for entry in polaris_config_engine::user_config::builtin_geo_rulesets::builtin_geo_rulesets() {
+        let expected = regular(&bundled.join(&entry.file_name), 1024 * 1024);
+        assert_eq!(
+            regular(&rules.join(&entry.file_name), expected.len() as u64),
+            expected,
+            "{} must seed exact real fixture bytes",
+            entry.tag
+        );
+    }
     let generated = generate_fixture_graph(rt, config);
     let checked = inspect_generated(rt, config, &generated);
     (generated, checked)

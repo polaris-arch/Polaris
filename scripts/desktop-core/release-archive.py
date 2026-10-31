@@ -36,12 +36,17 @@ def archive_name(name, directory, root):
 
 
 def wire_group(name, directory):
-    if directory and name in (WIRE_ROOT, WIRE_ROOT + '/resources', WIRE_ROOT + '/resources/.release-receipts'):
+    if directory and name in (WIRE_ROOT, WIRE_ROOT + '/resources', WIRE_ROOT + '/resources/.release-receipts',
+                              WIRE_ROOT + '/resources/core-recovery'):
         return 'control'
     if not directory and name == WIRE_ROOT + '/handoff.json':
         return 'control'
     parts = name.split('/')
     require(len(parts) >= 3 and parts[:2] == [WIRE_ROOT, 'resources'], 'wire archive group differs')
+    if parts[2] == 'core-recovery':
+        require(len(parts) >= 4 and parts[3] in WIRE_PLATFORMS
+                and (directory or len(parts) == 5), 'wire recovery group differs')
+        return parts[3]
     if parts[2] in WIRE_PLATFORMS and (directory or len(parts) > 3):
         return parts[2]
     require(not directory and len(parts) == 4 and parts[2] == '.release-receipts', 'wire archive group differs')
@@ -89,6 +94,17 @@ def wire_inventory(record, root, directories=None, member_bytes=None):
     require(fixed <= controls and len(controls) == 7 and len(controls & indices) == 1
             and controls <= fixed | indices, 'wire control inventory differs')
     require(all(0 < count <= 1024 for count in counts.values()), 'wire platform member inventory limit')
+    recovery = root + '/resources/core-recovery/'
+    for platform in WIRE_PLATFORMS:
+        require(any(name.startswith(root + '/resources/' + platform + '/') for name in expected),
+                'wire platform payload missing')
+        names = {name for name in expected if name.startswith(recovery + platform + '/')}
+        prefix = recovery + platform + '/'
+        archives = {name for name in names if name != prefix + 'inventory.json'}
+        require(len(names) == 2 and prefix + 'inventory.json' in names and len(archives) == 1
+                and all(name[len(prefix):].endswith('.zip' if platform == 'win' else '.tar.gz')
+                        and '/' not in name[len(prefix):] for name in archives),
+                'wire recovery inventory differs')
     require(not parents & set(expected), 'file/directory collision')
     aliases = {}
     for name in set(expected) | parents:
@@ -102,8 +118,8 @@ def wire_inventory(record, root, directories=None, member_bytes=None):
         for name in names:
             group = wire_group(name, directory)
             entries[group] += 1
-            require(entries[group] <= (10 if group == 'control' else 2048), 'wire group entry limit')
-    return 10 + len(WIRE_PLATFORMS) * 2048
+            require(entries[group] <= (11 if group == 'control' else 2048), 'wire group entry limit')
+    return 11 + len(WIRE_PLATFORMS) * 2048
 
 
 def extract(path, destination, record, root, target=None, *, wire_handoff=False):
@@ -129,7 +145,7 @@ def extract(path, destination, record, root, target=None, *, wire_handoff=False)
         if wire_handoff:
             group = wire_group(name, directory)
             groups[group] += 1
-            require(groups[group] <= (10 if group == 'control' else 2048), 'wire group entry limit')
+            require(groups[group] <= (11 if group == 'control' else 2048), 'wire group entry limit')
         require(name not in seen and name.lower() not in aliases, 'duplicate archive path')
         seen.add(name)
         aliases.add(name.lower())

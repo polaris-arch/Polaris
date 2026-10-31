@@ -96,7 +96,7 @@ const COMPARISON_FLOOR: usize = 20;
 /// `platform_variants_stay_in_sync_with_all` 与 [`variant_names_cover_every_variant`] 变红）；
 /// 新增平台**名字面量**时该红的是 `STRING_DISPATCH_REGISTRY` 里 `parse` 那条（语句原文变了）。
 ///
-/// B2b/B3 增加清单字符串解析、native identity/platform 与 response/platform 元组。
+/// B2b/B3 增加清单字符串解析与 response/platform 元组。
 /// 它们的 wildcard 拒绝未知输入或保留 Unknown，不能为新平台授予操作能力；
 /// 下表逐块绑定准确源码与理由，不按文件放行，不降低扫描范围或正面下限。
 const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
@@ -113,11 +113,6 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
     "crates/helper-proto/src/core_manifest.rs",
     "{ => Platform::Linux, => Platform::Win, | => Platform::Mac, _ => return Err( ), }",
     "Manifest parses a source-contract string, not a Platform value. Only four desktop rows are accepted; Android/iOS/unknown strings fail closed. The string registry below binds the exact accepted names.",
-),
-(
-    "crates/helper-client/src/manager.rs",
-    "{ (CallerIdentity::Unix(uid), Platform::Linux | Platform::Mac) if *uid == params.uid => {} (CallerIdentity::Windows(sid), Platform::Win) if CallerIdentity::windows(sid).is_some() => { } _ => { return Err(ManagerError::InvalidInstallation( , )) } }",
-    "The tuple also validates native identity kind and UID/SID. All mismatches, Android/iOS/Other and future platforms are rejected before privileged script creation; the wildcard does not grant installation on a new platform.",
 ),
 (
     "crates/helper/src/admin_probe.rs",
@@ -180,13 +175,19 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    ("crates/helper-client/src/manager.rs", "let script = if self.platform == Platform::Linux", 1,
+     "Linux uninstall carries the responsible-user baseline/config only into its finite dispatcher. Mac keeps retirement and Windows keeps the native cleaner; unsupported/mobile platforms are rejected before this site."),
+    ("src-tauri/src/runtime/helper.rs", "if self.platform != Platform::Linux", 1,
+     "Linux legacy routing returns false on every other platform; only the Linux compilation reads fixed Linux metadata. This is routing, never root receipt authority."),
+    ("src-tauri/src/runtime/helper.rs", "let outcome = if self.platform == Platform::Linux && original.is_some()", 1,
+     "Only Linux forwards a captured exact user baseline to its existing maintenance entry. Mac/Windows keep their previous result scope and unsupported/mobile platforms are already rejected."),
     ("src-tauri/src/runtime/helper.rs", "if platform != Platform::Linux", 1,
      "Only Linux installer stderr has the fixed diagnostic marker. Mac/Windows/Android/iOS/unknown return no Linux diagnostic; no authorization or cleanup success is inferred."),
     (
         "crates/helper-client/src/manager.rs",
-        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)",
+        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac | Platform::Linux)",
         1,
-        "Explicit stop-and-upgrade is macOS-only. Android/iOS/Other cannot obtain this desktop maintenance mode; ordinary requests still require existing platform admission.",
+        "Explicit stop-and-upgrade has separate Mac and finite Linux implementations. Windows/Android/iOS/Other cannot obtain this mode; ordinary admission remains unchanged.",
     ),
     (
         "crates/helper/src/mac_migration_guard.rs",
@@ -214,9 +215,9 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     ),
     (
         "src-tauri/src/runtime/helper.rs",
-        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)",
+        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac | Platform::Linux)",
         1,
-        "Explicit stop-and-upgrade is macOS-only. Android/iOS/Other cannot obtain this desktop maintenance mode; ordinary requests still require existing platform admission.",
+        "Explicit stop-and-upgrade has separate Mac and finite Linux implementations. Windows/Android/iOS/Other cannot obtain this mode; ordinary admission remains unchanged.",
     ),
     (
         "src-tauri/src/runtime/helper.rs",
@@ -270,14 +271,20 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     (
         "crates/helper-client/src/manager.rs",
         "if self.platform == Platform::Win",
-        1,
-        "只有 Windows 卸载走固定 native cleaner；Android/iOS/Other 不进此臂，runtime supported 已拒绝其桌面 helper 路径；未来平台不会借 Windows 提权清扫。",
+        2,
+        "两处分别为 native Windows 安装与卸载；安装在 mode.supported_on 和 owner 穷举校验之后，卸载在桌面 Platform 穷举准入之后。Android/iOS/Other 均已拒绝，不能落入 Windows 提权或 Unix 脚本路径。",
     ),
     (
         "crates/helper-client/src/manager.rs",
         "#[cfg(not(windows))] return Err(ManagerError::UnsupportedPlatform(Platform::Win))",
+        2,
+        "安装与卸载各一处：仅请求 Windows 操作却不在 Windows 编译目标时返回固定 Win 错误载荷。Android/iOS/Other 在各自上游穷举准入拒绝；未来非 Windows 编译目标不能获得 native cleaner 能力。",
+    ),
+    (
+        "crates/helper-client/src/manager.rs",
+        "if platform == Platform::Win && params .cleaner_sha256 .as_deref() .is_none_or(|hash| CoreId::parse(hash).is_err())",
         1,
-        "这是错误载荷的固定平台标签：非 Windows 编译目标不得执行 Windows cleaner；未来平台同样显式 Unsupported，不能获得 Windows 清扫能力。",
+        "Windows 安装额外要求真实编译 cleaner pin；Mac/Linux 不消费该 pin，继续原 helper/manifest/路径校验。Android/iOS/Other 虽不要求 Windows pin，仍由同函数后续 Platform 穷举 owner 校验拒绝，不获得任何安装能力。",
     ),
     (
         "src-tauri/src/runtime/helper.rs",
@@ -1526,6 +1533,10 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    ("crates/helper/src/linux_legacy_maintenance.rs", "require( selected.id == request.id && selected.core.platform == \"linux\" && selected.core.helper_sha256.as_deref() == Some(request.helper_sha.as_str()), \"selected manifest/pin differs\", )?", 1,
+     "The Linux-only sealed dispatcher admits only the exact selected Linux manifest and actual current utility hash. Mac/Windows/mobile/unknown manifests fail before Core installation and cannot acquire a Linux service activation destination."),
+    ("src-tauri/src/runtime/core_identity.rs", "if !matches!(platform, \"linux\" | \"mac-arm64\" | \"mac-x64\") || selected.platform != platform || !helper.is_absolute() || helper.file_name().and_then(|name| name.to_str()) != Some(\"polaris-helper\")", 1,
+     "Unix maintenance-helper source admission accepts only the exact selected Linux/macOS platform and absolute polaris-helper leaf. Unknown/new platforms, Android/iOS and Windows are rejected here before source access or executor admission. HelperRuntime::uninstall independently passes no Unix maintenance utility on Windows, preserving its existing Windows removal path rather than borrowing Unix admission."),
     ("src-tauri/src/runtime/proxy/lan_gateway.rs", "if platform != \"linux\"", 3,
      "Three early/final/shared checks inspect only emitted Linux MAC-filtered routed-LAN TUN prerequisites. Other platforms including Android/iOS and unknown skip Linux proc forwarding reads; they do not acquire router ownership or bypass their own TUN admission."),
     (
@@ -2862,6 +2873,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/commands/speedtest.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersWrongToday,
+        "Saved concurrency adds the binding helper and its call in the existing non-Android temporary-core path. Preserve that group's iOS debt and original four sites; these pure limit bindings do not add two iOS runtime failures or admit an independent iOS temporary core.",
+    ),
+    (
+        "src-tauri/src/commands/speedtest.rs",
         "target_os = \"android\"",
         6,
         IosSide::DiffersWrongToday,
@@ -3263,6 +3281,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
         21,
         IosSide::DiffersWrongToday,
         "21 处非 Android 测速持桌面 Child、PID kill/reap/config retirement；iOS 扩展不提供这些进程句柄，必须先有 iOS 瞬态实例桥与关闭凭据，登记债而不扩大 Android JNI 分支。",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersWrongToday,
+        "The saved-concurrency setter adds one site to the existing non-Android temporary-core group. Its clamp does not prove iOS process ownership or cleanup; preserve all historical debt subcounts and the iOS entry-point rejection.",
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",
@@ -3975,7 +4000,9 @@ fn independent_check_admission_excludes_ios_ne_but_retains_desktop_gate() {
             "{os} lost the check admission gate"
         );
     }
-    assert!(body[call..].contains("run_config_check(bin, config_path)"));
+    assert!(body[call..].contains("run_config_check("));
+    assert!(body[call..].contains("core_identity::prepare("));
+    assert!(body[call..].contains("ExecPurpose::CheckConfig"));
     assert!(code.contains("polaris_core_supervisor::settle_check_cleanup()"));
 }
 
@@ -4272,7 +4299,8 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
     ("DiffersRight", 337),
     ("DiffersUndecided", 26),
-    ("DiffersWrongToday", 142),
+    // Saved temporary-core concurrency adds three group members; no old debt is repaid.
+    ("DiffersWrongToday", 145),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
     // checked by eval_cfg for Android/iOS in both release/debug. No existing
     // verdict or debt site changes; this does not claim device validation.
@@ -4294,6 +4322,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/commands/misc/backup.rs",
         "not(target_os = \"android\")",
         1,
+    ),
+    (
+        "src-tauri/src/commands/speedtest.rs",
+        "not(target_os = \"android\")",
+        2,
     ),
     (
         "src-tauri/src/commands/speedtest.rs",
@@ -4354,6 +4387,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/runtime/proxy/startup.rs",
         "not(target_os = \"android\")",
         3,
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
+        1,
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",

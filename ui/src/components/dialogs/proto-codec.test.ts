@@ -212,7 +212,7 @@ const SAMPLES: Record<NodeProto, ServerConfig> = {
     protocol: 'openvpn-client',
     openvpnClientSettings: {
       server: 'example.com', server_port: 443, username: 'u', password: 'p',
-      network: 'tcp', cipher: 'AES-256-GCM', auth: 'SHA256', mtu: 1400,
+      network: 'tcp', data_ciphers: ['AES-256-GCM'], auth: 'SHA256', mtu: 1400,
       redirect_gateway: true,
       tls: { certificate: ['-----BEGIN CERTIFICATE-----', 'MIIB', '-----END CERTIFICATE-----'] },
     },
@@ -390,7 +390,8 @@ const KEY_ASSERTS: Record<NodeProto, (out: ServerConfig) => void> = {
   'openvpn-client': (o) => {
     expect(o.openvpnClientSettings?.username).toBe('u');
     expect(o.openvpnClientSettings?.network).toBe('tcp');
-    expect(o.openvpnClientSettings?.cipher).toBe('AES-256-GCM');
+    expect(o.openvpnClientSettings?.data_ciphers).toEqual(['AES-256-GCM']);
+    expect(o.openvpnClientSettings?.cipher).toBeUndefined();
     expect(o.openvpnClientSettings?.auth).toBe('SHA256');
     expect(o.openvpnClientSettings?.redirect_gateway).toBe(true);
     // PEM 逐行数组必须原样往返 —— 拼成单串或丢行都会让内核收不下
@@ -1931,6 +1932,107 @@ describe('snell：version 驱动 obfs（v4）/ mode（v6）互斥清空', () => 
   });
 });
 
+describe('snell imported obfs roundtrip', () => {
+  // Exercise supported v4 http/tls through the real shared form draft and codec.
+  const imported = (obfsMode: string, version = 4): ServerConfig => ({
+    ...SAMPLES.snell,
+    detour: 'fixture-detour',
+    bindInterface: 'fixture-interface',
+    snellSettings: {
+      version, obfsMode, obfsHost: 'imported.example',
+      reuse: true, network: 'udp', userkey: 'fixture-user-key',
+    },
+  }) as unknown as ServerConfig;
+  const save = (from: ServerConfig, patch: FormValues = {}) =>
+    protoCodec.snell.toConfig({ ...protoCodec.snell.fromConfig(from), ...patch }, from);
+  const serialized = (value: ServerConfig) => JSON.parse(JSON.stringify(value));
+
+  it.each(['http', 'tls'])('%s: unchanged imported v4 edit preserves explicit host and adjacent fields', (mode) => {
+    const from = imported(mode);
+    const before = structuredClone(from);
+    const saved = save(from);
+    expect(serialized(saved)).toEqual(from);
+    expect(protoCodec.snell.fromConfig(saved).obfsHost).toBe('imported.example');
+    expect(serialized(save(saved))).toEqual(serialized(saved));
+    expect(from).toEqual(before);
+  });
+
+  it.each(['http', 'tls'])('%s: explicit host replacement and clearing beat the imported value', (mode) => {
+    const from = imported(mode);
+    const draft = protoCodec.snell.fromConfig(from);
+    expect(allFields('snell').find(field => field.k === 'obfsHost')?.when?.(draft)).toBe(true);
+    expect(save(from, { obfsHost: 'edited.example' }).snellSettings?.obfsHost).toBe('edited.example');
+    const cleared = save(from, { obfsHost: '' });
+    expect(cleared.snellSettings?.obfsHost).toBeUndefined();
+    expect(serialized(cleared).snellSettings).not.toHaveProperty('obfsHost');
+    expect(cleared.snellSettings?.obfsMode).toBe(mode);
+    expect(from.snellSettings?.obfsHost).toBe('imported.example');
+  });
+
+  it.each(['http', 'tls'])('%s to none clears the now inactive host', (mode) => {
+    const saved = save(imported(mode), { obfsMode: 'none' });
+    expect(saved.snellSettings?.obfsMode).toBe('none');
+    expect(serialized(saved).snellSettings).not.toHaveProperty('obfsHost');
+    expect(saved.snellSettings).toMatchObject({ version: 4, reuse: true, network: 'udp', userkey: 'fixture-user-key' });
+  });
+
+  it.each(['default', 'unshaped', 'unsafe-raw'])('v6 %s retains its mode and clears stale v4 obfs fields', (mode) => {
+    const saved = save(imported('tls', 6), { mode });
+    expect(saved.snellSettings).toMatchObject({ version: 6, mode, reuse: true, network: 'udp', userkey: 'fixture-user-key' });
+    expect(serialized(saved).snellSettings).not.toHaveProperty('obfsMode');
+    expect(serialized(saved).snellSettings).not.toHaveProperty('obfsHost');
+  });
+
+  it.each(['http', 'tls'])('v6 to v4 %s uses the explicit host and clears v6 mode', (mode) => {
+    const from = { ...imported('none', 6), snellSettings: { ...imported('none', 6).snellSettings!, mode: 'unsafe-raw' as const } };
+    const saved = save(from, { version: '4', obfsMode: mode, obfsHost: 'v4.example' });
+    expect(saved.snellSettings).toMatchObject({ version: 4, obfsMode: mode, obfsHost: 'v4.example', reuse: true, network: 'udp', userkey: 'fixture-user-key' });
+    expect(serialized(saved).snellSettings).not.toHaveProperty('mode');
+  });
+
+  it('a new form renders TLS as a declared option without the imported-value fallback', () => {
+    const field = allFields('snell').find(field => field.k === 'obfsMode');
+    expect(field?.t).toBe('select');
+    if (!field) throw new Error('Snell obfs field is missing');
+    const draft = draftFromSpecs(allFields('snell'));
+    const html = renderToStaticMarkup(
+      createElement(FieldRenderer, { spec: field, value: draft.obfsMode, onChange: () => {} })
+    );
+    expect(/data-opts="([^"]*)"/.exec(html)?.[1].split('|')).toEqual(['none', 'http', 'tls']);
+  });
+
+  it.each(['none', 'http', 'tls'] as const)('new v4 %s uses the visible draft and only active host fields', (obfsMode) => {
+    const base: ServerConfig = { ...META, protocol: 'snell' };
+    const draft = {
+      ...draftFromSpecs(allFields('snell')),
+      pwd: 'new-fixture-psk', obfsMode, obfsHost: 'Cover.Example',
+    };
+    const saved = serialized(protoCodec.snell.toConfig(draft, base));
+    const expected: NonNullable<ServerConfig['snellSettings']> = {
+      version: 4, obfsMode, ...(obfsMode === 'none' ? {} : { obfsHost: 'Cover.Example' }),
+    };
+    expect(saved.snellSettings).toEqual(expected);
+    expect(saved.password).toBe('new-fixture-psk');
+    expect(base.snellSettings).toBeUndefined();
+  });
+
+  it.each(['http', 'tls'] as const)('%s empty host stays omitted for the core to supply its own behavior', (obfsMode) => {
+    const base: ServerConfig = { ...META, protocol: 'snell' };
+    const draft = { ...draftFromSpecs(allFields('snell')), obfsMode, obfsHost: '  ' };
+    const saved = serialized(protoCodec.snell.toConfig(draft, base));
+    expect(saved.snellSettings).toEqual({ version: 4, obfsMode });
+    expect(saved.snellSettings).not.toHaveProperty('obfsHost');
+  });
+
+  it('switching an imported HTTP form to TLS with an empty host does not inject its HTTP host', () => {
+    const from = imported('http');
+    const saved = serialized(save(from, { obfsMode: 'tls', obfsHost: '' }));
+    expect(saved.snellSettings.obfsMode).toBe('tls');
+    expect(saved.snellSettings).not.toHaveProperty('obfsHost');
+    expect(from.snellSettings?.obfsHost).toBe('imported.example');
+  });
+});
+
 describe('custom：JSON 校验（镜像后端 store/validate.rs#protocol_requirement_ok）', () => {
   const base: ServerConfig = { ...META, protocol: 'custom' };
 
@@ -2198,6 +2300,8 @@ const DUMMY: Record<string, FormValue> = {
 function filledDraft(proto: NodeProto, override: Record<string, FormValue> = {}): FormValues {
   const d = draftFromSpecs(allFields(proto));
   for (const f of allFields(proto)) {
+    // A default TLS form cannot fill the hidden, static-key-only legacy cipher control.
+    if (proto === 'openvpn-client' && f.when && !f.when(d)) continue;
     if (f.t === 'switch') d[f.k] = true;
     else if (f.t === 'number') d[f.k] = 1;
     else if (f.t === 'select') d[f.k] = f.options[0][0];
@@ -3060,7 +3164,7 @@ describe('透传袋删键不复活：openconnect / openvpn-client / hysteria / t
           drop_me: 'd', keep_me: 'k', flavor: 'x',
         },
       },
-      named: { username: 'u', network: 'tcp', cipher: 'AES-256-GCM', auth: 'SHA256', redirect_gateway: true },
+      named: { username: 'u', network: 'tcp', data_ciphers: ['AES-256-GCM'], auth: 'SHA256', redirect_gateway: true },
       hidden: { flavor: 'x' },
     },
     hysteria: {
@@ -3264,4 +3368,93 @@ describe('explicit uTLS edit intent', () => {
       }
     });
   }
+});
+
+
+describe('OpenVPN TLS cipher form contract', () => {
+  const codec = protoCodec['openvpn-client'];
+  const config = (extra: Record<string, unknown> = {}): ServerConfig => ({
+    ...SAMPLES['openvpn-client'],
+    openvpnClientSettings: {
+      username: 'u', password: 'p', tls: { certificate: ['CA'] },
+      ...extra,
+    },
+  });
+  it('collects TLS cipher choices into existing flattened keys, never legacy cipher', () => {
+    const base = config();
+    const draft = codec.fromConfig(base);
+    const saved = codec.toConfig({ ...draft, ovpnDataCiphers: 'AES-256-GCM, AES-128-GCM', ovpnDataCiphersFallback: 'AES-128-CBC' }, base);
+    expect(saved.openvpnClientSettings?.data_ciphers).toEqual(['AES-256-GCM', 'AES-128-GCM']);
+    expect(saved.openvpnClientSettings?.data_ciphers_fallback).toBe('AES-128-CBC');
+    expect(saved.openvpnClientSettings?.cipher).toBeUndefined();
+    expect(saved.openvpnClientSettings?.tls?.certificate).toEqual(['CA']);
+  });
+  it('keeps an incompatible imported TLS cipher discoverable and refuses silent conversion', () => {
+    const base = config({ cipher: 'AES-256-GCM' });
+    const draft = codec.fromConfig(base);
+    expect(draft.cipher).toBe('AES-256-GCM');
+    expect(() => codec.toConfig(draft, base)).toThrowError('openvpnTlsCipher');
+    expect(base.openvpnClientSettings?.cipher).toBe('AES-256-GCM');
+    const saved = codec.toConfig({ ...draft, cipher: '', ovpnDataCiphers: 'AES-256-GCM' }, base);
+    expect(saved.openvpnClientSettings?.cipher).toBeUndefined();
+    expect(saved.openvpnClientSettings?.data_ciphers).toEqual(['AES-256-GCM']);
+  });
+});
+
+describe('OpenVPN flattened cipher edit boundaries', () => {
+  const codec = protoCodec['openvpn-client'];
+  const config = (extra: Record<string, unknown> = {}): ServerConfig => ({
+    ...SAMPLES['openvpn-client'],
+    openvpnClientSettings: { username: 'u', password: 'p', tls: { certificate: ['CA'] }, untouched: 7, ...extra },
+  });
+  it.each(['AES-256-GCM', ['AES-256-GCM', 'AES-128-GCM']])('preserves imported data_ciphers shape without duplicate JSON authority: %j', (raw) => {
+    const base = config({ data_ciphers: raw, data_ciphers_fallback: 'AES-128-CBC' });
+    const draft = codec.fromConfig(base);
+    expect(draft.ovpnDataCiphersFallback).toBe('AES-128-CBC');
+    expect(JSON.parse(String(draft.extraJson))).toEqual({ untouched: 7 });
+    const saved = codec.toConfig(draft, base).openvpnClientSettings;
+    expect(saved?.data_ciphers).toEqual(raw);
+    expect(saved?.data_ciphers_fallback).toBe('AES-128-CBC');
+    expect(saved?.cipher).toBeUndefined();
+    expect(saved?.untouched).toBe(7);
+    const cleared = codec.toConfig({ ...draft, ovpnDataCiphers: ' ', ovpnDataCiphersFallback: '' }, base).openvpnClientSettings;
+    expect(cleared?.data_ciphers).toBeUndefined();
+    expect(cleared?.data_ciphers_fallback).toBeUndefined();
+  });
+  it('retains explicit static_key cipher without claiming that the save backend supports this mode', () => {
+    const base = config({ mode: 'static_key', cipher: 'AES-256-CBC', static_key: ['synthetic-static-key'] });
+    const saved = codec.toConfig(codec.fromConfig(base), base).openvpnClientSettings;
+    expect(saved?.mode).toBe('static_key');
+    expect(saved?.cipher).toBe('AES-256-CBC');
+    expect(saved?.static_key).toEqual(['synthetic-static-key']);
+    expect(saved?.tls).toBeUndefined();
+    expect(saved?.data_ciphers).toBeUndefined();
+  });
+  it.each([undefined, 'tls'])('does not let Extension settings bypass the TLS cipher error: %s', (mode) => {
+    const base = config();
+    const draft = { ...codec.fromConfig(base), extraJson: JSON.stringify({ mode, cipher: 'AES-256-GCM' }) };
+    try { codec.toConfig(draft, base); throw new Error('save unexpectedly succeeded'); }
+    catch (error) { expect(error).toMatchObject({ code: 'openvpnTlsCipher', field: 'extraJson' }); }
+  });
+  it('keeps manually entered valid flattened values, but rejects competing authorities', () => {
+    const base = config();
+    const draft = { ...codec.fromConfig(base), extraJson: JSON.stringify({ data_ciphers: ['AES-256-GCM'], data_ciphers_fallback: 'AES-128-CBC' }) };
+    expect(codec.toConfig(draft, base).openvpnClientSettings).toMatchObject({ data_ciphers: ['AES-256-GCM'], data_ciphers_fallback: 'AES-128-CBC' });
+    expect(() => codec.toConfig({ ...draft, ovpnDataCiphers: 'AES-128-GCM' }, base)).toThrowError('openvpnCipherListConflict');
+    expect(() => codec.toConfig({ ...draft, ovpnDataCiphersFallback: 'AES-256-CBC' }, base)).toThrowError('openvpnCipherListConflict');
+  });
+  it.each([
+    ['data_ciphers', 'ovpnDataCiphers', { invalid: true }],
+    ['data_ciphers', 'ovpnDataCiphers', ['AES-256-GCM', 4]],
+    ['data_ciphers_fallback', 'ovpnDataCiphersFallback', ['AES-256-CBC']],
+  ])('shows malformed imported %s and blocks unchanged save until explicitly cleared', (key, field, raw) => {
+    const base = config({ [String(key)]: raw });
+    const draft = codec.fromConfig(base);
+    expect(draft[String(field)]).toBe(JSON.stringify(raw));
+    try { codec.toConfig(draft, base); throw new Error('save unexpectedly succeeded'); }
+    catch (error) { expect(error).toMatchObject({ code: 'openvpnCipherValueInvalid', field }); }
+    expect(codec.toConfig({ ...draft, [String(field)]: '' }, base).openvpnClientSettings?.[String(key)]).toBeUndefined();
+    expect(() => codec.toConfig({ ...codec.fromConfig(config()), extraJson: JSON.stringify({ [String(key)]: raw }) }, config()))
+      .toThrowError('openvpnCipherValueInvalid');
+  });
 });

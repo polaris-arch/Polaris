@@ -18,11 +18,9 @@
 //!
 //! ## protoVersion 三平台统一演进（不移植 上游的三谱系）
 //!
-//! 上游的 9/5/1 是**三套独立 Go module 各自演进出的历史谱系**（mac 从 v1 加到 v9、win 加到 v5、
-//! linux 停在 v1），版本号唯一的作用是让新 client 认出「机器上装着的是哪一代旧 helper」。
-//! Polaris 是全新产品 + 全新 Rust helper：**世上不存在旧版 Polaris helper**，没有任何一代需要被认出，
-//! 抄那三个数字只会把别人的演进史当成自己的约束。故三平台始终共用同一个
-//! [`proto_version::CURRENT`]。
+//! 三平台共用一个 [`proto_version::CURRENT`]。旧 v2 只保证内容 id 与退役路径帧；
+//! v3 要求执行者自己的准入工厂，并在现有 pinned Start 参数中携带固定标记。
+//! Version 只作兼容性提示；实际 Start 必须在同一帧拒绝旧执行者，并核实当前对象。
 //!
 //! 平台差异不再靠版本号表达，而是由 [`Platform`] 承载（mac/win 有 token 行、linux 走 SO_PEERCRED；
 //! 命令集差异由 [`command`] 常量 + 各平台 handler 的 `case` 覆盖面表达）——本 crate 是三平台**共用**
@@ -174,7 +172,10 @@ pub mod proto_version {
     /// 唯一定义点：helper 侧的 `ping`/`version` 响应与 client 侧的握手期望都读它 → 结构上不可能分叉。
     /// v2 uses immutable content ids and rejects all runtime installation and
     /// executable-path/legacy birth Start frames before dispatch.
-    pub const CURRENT: u32 = 2;
+    /// v3 requires executor-owned selected admission and a strict v3 marker in
+    /// every pinned Start. Version is a compatibility hint, never object proof.
+    pub const MIN_TRUSTED_EXECUTION: u32 = 3;
+    pub const CURRENT: u32 = MIN_TRUSTED_EXECUTION;
 }
 
 /// 当前安装包内 app/helper 的共同构建身份。

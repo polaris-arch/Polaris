@@ -20,7 +20,7 @@
 //! 稳定 token（对照表见 `ui/src/domain/taildrop.ts` 的 `TAILDROP_ERROR_KEY`）。
 
 use polaris_singbox_grpc::{
-    Endpoint, SingBoxApiClient, TaildropDownload, TaildropOutgoingFile, TaildropSendInput,
+    SingBoxApiClient, TaildropDownload, TaildropOutgoingFile, TaildropSendInput,
     TaildropSendOutput, TaildropSendUpdate,
 };
 use serde::Serialize;
@@ -114,8 +114,10 @@ async fn connect_for(
     state: &State<'_, AppRuntime>,
     server_id: &str,
 ) -> Result<(SingBoxApiClient, String), (String, &'static str)> {
-    let (port, secret, tag) = management_target_for(state, server_id)?;
-    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret)
+    let (port, _secret, tag) = management_target_for(state, server_id)?;
+    let client = state
+        .proxy()
+        .current_management_client(port)
         .await
         .map_err(|e| (format!("management api connect failed: {e}"), ERR_API))?;
     Ok((client, tag))
@@ -485,8 +487,7 @@ async fn drain_taildrop_output(
 }
 
 struct ManagedTaildropSend {
-    port: u16,
-    secret: String,
+    client: SingBoxApiClient,
     endpoint_tag: String,
     peer_stable_id: String,
     declarations: Vec<TaildropOutgoingFile>,
@@ -499,10 +500,7 @@ async fn perform_managed_send(
     task_id: &str,
     sink: &BroadcastTaildropTaskSink,
 ) -> Result<(), SendFailure> {
-    let client =
-        SingBoxApiClient::connect(Endpoint::new("127.0.0.1", request.port), request.secret)
-            .await
-            .map_err(|e| (format!("management api connect failed: {e}"), ERR_API))?;
+    let client = request.client;
     let session = client
         .start_taildrop_send(
             request.endpoint_tag,
@@ -663,9 +661,18 @@ pub async fn taildrop_send(
         .map(|file| (file.name.clone(), file.size))
         .collect();
 
-    let (port, secret, endpoint_tag) = match management_target_for(&state, &server_id) {
+    let (port, _secret, endpoint_tag) = match management_target_for(&state, &server_id) {
         Ok(v) => v,
         Err((msg, code)) => return Ok(ApiResponse::err_with_code(msg, code)),
+    };
+    let client = match state.proxy().current_management_client(port).await {
+        Ok(client) => client,
+        Err(error) => {
+            return Ok(ApiResponse::err_with_code(
+                format!("management api connect failed: {error}"),
+                ERR_API,
+            ))
+        }
     };
     let started = match state
         .taildrop()
@@ -691,8 +698,7 @@ pub async fn taildrop_send(
     let runtime = std::sync::Arc::downgrade(state.taildrop());
     tauri::async_runtime::spawn(run_managed_send(
         ManagedTaildropSend {
-            port,
-            secret,
+            client,
             endpoint_tag,
             peer_stable_id,
             declarations,
@@ -841,6 +847,42 @@ pub struct TaildropSaveResult {
     pub bytes: Option<u64>,
 }
 
+// The native callback may remain pending indefinitely. It owns no API borrow,
+// file or stream. Resume only against this Core's unchanged emitted target,
+// obtaining the current confirmed API view after the user's selection.
+pub(crate) async fn connect_after_taildrop_dialog<Choice>(
+    proxy: &crate::runtime::proxy::ProxyRuntime,
+    server_id: &str,
+    generation: u64,
+    original_tag: &str,
+    choice: impl std::future::Future<Output = Option<Choice>>,
+) -> Result<Option<(Choice, SingBoxApiClient, String)>, (String, &'static str)> {
+    let Some(picked) = choice.await else {
+        return Ok(None);
+    };
+    let stale = || {
+        (
+            "Taildrop Core or endpoint changed while choosing a destination".to_owned(),
+            ERR_UNAVAILABLE,
+        )
+    };
+    if proxy.core_generation() != generation {
+        return Err(stale());
+    }
+    let (port, _, tag) = proxy.management_target_for(server_id).ok_or_else(stale)?;
+    if tag != original_tag {
+        return Err(stale());
+    }
+    let client = proxy
+        .current_management_client(port)
+        .await
+        .map_err(|e| (format!("management api connect failed: {e}"), ERR_API))?;
+    if proxy.core_generation() != generation {
+        return Err(stale());
+    }
+    Ok(Some((picked, client, tag)))
+}
+
 /// 取件：选一个保存位置，把收件箱里的该文件写过去。
 ///
 /// **保存框开在 Rust 侧**，与 `local_import_pick_file` 同一范式 —— 前端因此不需要
@@ -856,8 +898,9 @@ pub async fn taildrop_save(
     server_id: String,
     name: String,
 ) -> Result<ApiResponse<TaildropSaveResult>, ()> {
-    let (client, tag) = match connect_for(&state, &server_id).await {
-        Ok(v) => v,
+    let generation = state.proxy().core_generation();
+    let original_tag = match management_target_for(&state, &server_id) {
+        Ok((_, _, tag)) => tag,
         Err((msg, code)) => return Ok(ApiResponse::err_with_code(msg, code)),
     };
 
@@ -876,11 +919,23 @@ pub async fn taildrop_save(
         .save_file(move |p| {
             let _ = tx.send(p);
         });
-    let Some(picked) = rx.await.ok().flatten() else {
-        return Ok(ApiResponse::ok(TaildropSaveResult {
-            canceled: true,
-            ..Default::default()
-        }));
+    let (picked, client, tag) = match connect_after_taildrop_dialog(
+        state.proxy(),
+        &server_id,
+        generation,
+        &original_tag,
+        async { rx.await.ok().flatten() },
+    )
+    .await
+    {
+        Ok(Some(binding)) => binding,
+        Ok(None) => {
+            return Ok(ApiResponse::ok(TaildropSaveResult {
+                canceled: true,
+                ..Default::default()
+            }))
+        }
+        Err((msg, code)) => return Ok(ApiResponse::err_with_code(msg, code)),
     };
     let stream = match client.download_taildrop_file(tag, &name).await {
         Ok(s) => s,
@@ -891,6 +946,10 @@ pub async fn taildrop_save(
             ))
         }
     };
+
+    // The escaped stream retains its own lease. Local/SAF publication after
+    // download completion must not retain an idle management client.
+    drop(client);
 
     /* ── 两支落盘（2026-09-13 批 16 接上 URI 那一支）──────────────────────────────────
      *

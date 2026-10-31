@@ -4,11 +4,14 @@ use crate::core_store::{
 };
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 fn store() -> (tempfile::TempDir, CoreStore) {
+    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let uid = nix::unistd::Uid::effective().as_raw();
     let store = CoreStore::initialize(root.path(), OwnerPolicy { uid: Some(uid) }).unwrap();
     (root, store)
@@ -82,8 +85,6 @@ fn same_process_holder_and_parent_file_close_have_distinct_original_observations
         .any(|e| e.phase == "parent-file-closed" && e.fd == Some(fd)));
 }
 
-struct ChildCleanup(Option<i32>);
-
 // Direct OS stderr is retained for successful controls too. libtest captures
 // eprintln! on success, which otherwise hides the PID needed to distinguish
 // this exact diagnostic subprocess from an unrelated production spawn.
@@ -99,24 +100,6 @@ fn control_origin(phase: &str, child_pid: Option<u32>) {
         std::process::id()
     )
     .unwrap();
-}
-
-impl Drop for ChildCleanup {
-    fn drop(&mut self) {
-        // This guard owns the unreaped child. Even assertion failure releases
-        // the controlled barrier; no detached thread or external PID is killed.
-        let Some(raw) = self.0 else {
-            return;
-        };
-        let pid = nix::unistd::Pid::from_raw(raw);
-        if matches!(
-            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
-            Ok(nix::sys::wait::WaitStatus::StillAlive)
-        ) {
-            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-            let _ = nix::sys::wait::waitpid(pid, None);
-        }
-    }
 }
 
 #[test]
@@ -177,6 +160,7 @@ fn inherited_cloexec_description_remains_observable_after_parent_file_closes() {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(root.path().join(".core-store.lock"))
         .unwrap();
     owner.try_lock().unwrap();
@@ -337,7 +321,11 @@ fn native_retain_and_mutation_contention_keep_original_descriptor_snapshots() {
     holder.try_lock_shared().unwrap();
     let contender = open();
     let fd = contender.as_raw_fd();
-    for role in [LockRole::RetainExclusive, LockRole::StoreMutationExclusive] {
+    for role in [
+        LockRole::RepairExclusive,
+        LockRole::RetainExclusive,
+        LockRole::StoreMutationExclusive,
+    ] {
         let error = acquire_lock(&contender, role).unwrap_err();
         let snapshot = observed(&error);
         let failure = error
@@ -352,19 +340,32 @@ fn native_retain_and_mutation_contention_keep_original_descriptor_snapshots() {
             LockObservation::from_file(&contender).inode
         );
         assert_eq!(snapshot.pid, std::process::id());
+        // Observation must retain the separately opened original reader and
+        // contender, rather than mistaking the failing descriptor for its owner.
+        for original_fd in [holder.as_raw_fd(), fd] {
+            assert!(snapshot
+                .native
+                .peers
+                .iter()
+                .any(|peer| { peer.identity.pid == std::process::id() && peer.fd == original_fd }));
+        }
         assert!(snapshot
             .to_string()
             .contains("claim=descriptor-observation-only"));
         assert!(error.to_string().contains(role.name()));
     }
-    // The original shared holder remains alive throughout both observations.
+    // The original shared holder remains alive throughout all observations.
     // No explicit unlock, timer, descriptor flag mutation or retirement occurs.
     drop(holder);
 }
 
 #[test]
 fn non_native_errors_preserve_cause_without_a_holder_snapshot() {
-    for role in [LockRole::RetainExclusive, LockRole::StoreMutationExclusive] {
+    for role in [
+        LockRole::RepairExclusive,
+        LockRole::RetainExclusive,
+        LockRole::StoreMutationExclusive,
+    ] {
         for cause in [
             io::Error::from_raw_os_error(nix::libc::EACCES),
             io::Error::new(io::ErrorKind::WouldBlock, "wrapped-io-would-block"),

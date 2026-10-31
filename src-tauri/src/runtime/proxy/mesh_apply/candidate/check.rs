@@ -30,11 +30,11 @@ struct ReviewedCheckIdentity {
     binary_sha256: &'static str,
     #[cfg(target_os = "linux")]
     input_profile: LinuxInputProfile,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     memfd_name: &'static str,
 }
 
-static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
+static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 10] = [
     ReviewedCheckIdentity {
         source_commit: "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
         contract_sha256: None,
@@ -43,7 +43,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: PINNED_B609_LINUX_X86_64_SHA256,
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::B609,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-b609",
     },
     // The fe182 sealed-execution observation used a direct outbound only.
@@ -57,7 +57,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: PINNED_FE182_LINUX_X86_64_SHA256,
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::FE182,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-fe182",
     },
     // c002 package hashes, BuildInfo and static identity are verified, but no
@@ -72,7 +72,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: "b754ac8223b27f4c20b40ced82d9ad5d58fee8fb4c5bfa48c38566e805c570ae",
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::C002,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-c002",
     },
     // Exact a4d085 public archive and metadata are verified. Its compiled
@@ -86,7 +86,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: "2a7495faeb18d2666dfcc77f678057c35cc7a7bb36b03a8a16ff9ac6249b4db8",
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::A4D085,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-a4d085",
     },
     // Exact814 public package/source bytes are independently bound. This row
@@ -100,7 +100,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: "363261029cea32333adcdd67288b23e4ae4084efa96b7f2b157af6e9d39946ee",
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::E814DA,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-814da",
     },
     // Exact c6 producer bytes and final public contract are independently bound. This row
@@ -114,7 +114,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: "80e21e78875f2f1cbfb1356dd977d6043a7776179df61f57897a4d811eaa1eaf",
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::C6C0D8,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-c6c0d8",
     },
     // Exact 0cfa public source/contract and downloaded ELF bytes are verified.
@@ -128,7 +128,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: "7fde19e331e654280e134a89c26af5be706e4364e3003a74b7619c220d5a03aa",
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::E0CFA24,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-0cfa24",
     },
     // Exact S332935 source/contract and producer ELF identity, matched to
@@ -142,7 +142,7 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: "d34fd051f8e089610bf32e58a5cf95ac36411827e46845157777baba078893ad",
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::E332935,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-332935",
     },
     // Exact S6 bfcdf96 source/contract and producer ELF identity, matched to
@@ -156,8 +156,21 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 9] = [
         binary_sha256: "9089e0a78616d714eeb63d052dff8505a8b21ed9ba24285ed7444067cde69988",
         #[cfg(target_os = "linux")]
         input_profile: LinuxInputProfile::BFCDF96,
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-bfcdf96",
+    },
+    // Exact alpha.12.7 source/contract and public package ELF identity.
+    // This grants check admission only; fresh runtime evidence remains pending.
+    ReviewedCheckIdentity {
+        source_commit: "3155c9151f553967aabcee93f09e51084fc89899",
+        contract_sha256: Some("9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf"),
+        evidence_label: "linux-x86_64-3155c9:runtime-evidence-pending:env-empty:cwd-root:sealed-fd0:--disable-color check -c /proc/self/fd/0",
+        #[cfg(target_os = "linux")]
+        binary_sha256: "1188baf18f7e4d9d4daabcf01633d72a2174ccb95ed71847d5032d857ad6679b",
+        #[cfg(target_os = "linux")]
+        input_profile: LinuxInputProfile::E3155C9,
+        #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
+        memfd_name: "polaris-strict-check-3155c9",
     },
 ];
 
@@ -185,6 +198,8 @@ impl LinuxCheckProfile {
     pub(super) const E332935: Self = Self(&REVIEWED_CHECK_IDENTITIES[7]);
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     pub(super) const BFCDF96: Self = Self(&REVIEWED_CHECK_IDENTITIES[8]);
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    pub(super) const E3155C9: Self = Self(&REVIEWED_CHECK_IDENTITIES[9]);
 
     pub(super) const fn execution_profile(self) -> &'static str {
         self.0.evidence_label
@@ -336,17 +351,23 @@ mod linux {
     use crate::runtime::proxy::ProxyRuntime;
     use nix::fcntl::{fcntl, FcntlArg, SealFlag};
     use nix::sys::memfd::{memfd_create, MFdFlags};
+    #[cfg(test)]
     use nix::sys::stat::{fchmod, Mode};
-    use std::fs::{File, OpenOptions};
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::fs::File;
+    #[cfg(test)]
+    use std::fs::OpenOptions;
+    #[cfg(test)]
+    use std::io::Read;
+    use std::io::{Seek, SeekFrom, Write};
+    #[cfg(test)]
+    use std::os::fd::OwnedFd;
+    #[cfg(test)]
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
-    use std::process::Stdio;
     use std::time::Duration;
-    use tokio::process::Command;
     use tokio::sync::oneshot;
 
+    #[cfg(test)]
     const MAX_BINARY_BYTES: u64 = 96 * 1024 * 1024;
     const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
     const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
@@ -391,6 +412,7 @@ mod linux {
         Ok(file)
     }
 
+    #[cfg(test)]
     pub(super) fn sealed_binary(
         path: &Path,
         profile: LinuxCheckProfile,
@@ -398,6 +420,7 @@ mod linux {
         sealed_binary_with_stat_hook(path, profile, || {})
     }
 
+    #[cfg(test)]
     pub(super) fn sealed_binary_with_stat_hook(
         path: &Path,
         profile: LinuxCheckProfile,
@@ -458,40 +481,55 @@ mod linux {
         Ok((File::from(high_fd), opened))
     }
 
+    pub(super) enum CheckExecution {
+        Admitted(polaris_core_supervisor::admitted_payload::PreparedExecution),
+        #[cfg(test)]
+        Unadmitted,
+    }
+    impl From<polaris_core_supervisor::admitted_payload::PreparedExecution> for CheckExecution {
+        fn from(value: polaris_core_supervisor::admitted_payload::PreparedExecution) -> Self {
+            Self::Admitted(value)
+        }
+    }
+    #[cfg(test)]
+    impl From<File> for CheckExecution {
+        fn from(_: File) -> Self {
+            Self::Unadmitted
+        }
+    }
     pub(super) async fn run_check(
-        binary: File,
+        execution: impl Into<CheckExecution>,
         config: File,
         timeout: Duration,
     ) -> Result<(), CandidateCheckError> {
-        let binary_path = format!("/proc/self/fd/{}", binary.as_raw_fd());
-        let mut command = Command::new(binary_path);
-        command
-            .args(["--disable-color", "check", "-c", "/proc/self/fd/0"])
-            .env_clear()
-            .current_dir("/")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        supervise(command, binary, config, timeout, None).await
+        match execution.into() {
+            CheckExecution::Admitted(execution) => {
+                supervise(execution, config, timeout, None).await
+            }
+            #[cfg(test)]
+            CheckExecution::Unadmitted => Err(CandidateCheckError::Unsupported),
+        }
     }
-
-    /// The original central CheckCustody owns the Child and sealed files. The
-    /// optional notification is diagnostic only; it never grants readiness.
+    /// Same central native wait/cancellation custody, with a private fixed
+    /// CheckConfig command. Raw File/hash/profile data cannot authorize birth.
     pub(super) async fn supervise(
-        command: Command,
-        binary: File,
+        execution: polaris_core_supervisor::admitted_payload::PreparedExecution,
         config: File,
         timeout: Duration,
         spawned: Option<oneshot::Sender<u32>>,
     ) -> Result<(), CandidateCheckError> {
-        use polaris_core_supervisor::config_gate::{supervise_owned_sealed_check, RawCheck};
-        match supervise_owned_sealed_check(command, binary, config, timeout, spawned).await {
+        use polaris_core_supervisor::config_gate::{
+            supervise_owned_sealed_check, RawCheck, ValidationLifecycleError,
+        };
+        match supervise_owned_sealed_check(execution, config, timeout, spawned).await {
             Ok(RawCheck::Done { success: true, .. }) => Ok(()),
             Ok(RawCheck::Done { .. } | RawCheck::OutputFailed(_)) => {
                 Err(CandidateCheckError::CheckFailed)
             }
             Ok(RawCheck::TimedOut { .. }) => Err(CandidateCheckError::TimedOut),
-            Ok(RawCheck::SpawnFailed(_)) => Err(CandidateCheckError::Unsupported),
+            Ok(RawCheck::SpawnFailed(_)) | Err(ValidationLifecycleError::Admission(_)) => {
+                Err(CandidateCheckError::Unsupported)
+            }
             Err(_) => Err(CandidateCheckError::CleanupUncertain),
         }
     }
@@ -551,8 +589,22 @@ mod linux {
             return Err(CandidateCheckError::Unsupported);
         }
         let config = sealed_config(&closure.config_bytes)?;
-        let (binary, source_identity) = sealed_binary(binary_path, profile)?;
-        run_check(binary, config, timeout).await?;
+        let source_identity =
+            FileSnapshot::path(binary_path).map_err(|_| CandidateCheckError::Unsupported)?;
+        let payload = crate::runtime::core_identity::acquire_at(
+            binary_path,
+            polaris_core_supervisor::admitted_payload::ExecPurpose::CheckConfig,
+        )
+        .map_err(|_| CandidateCheckError::Unsupported)?;
+        if payload.binary_sha256() != profile.binary_sha256() {
+            return Err(CandidateCheckError::Unsupported);
+        }
+        let execution = crate::runtime::core_identity::prepare_admitted(
+            &payload,
+            polaris_core_supervisor::admitted_payload::ExecPurpose::CheckConfig,
+        )
+        .map_err(|_| CandidateCheckError::Unsupported)?;
+        run_check(execution, config, timeout).await?;
         let after =
             FileSnapshot::path(binary_path).map_err(|_| CandidateCheckError::Unsupported)?;
         if !source_identity.same_snapshot(&after) {

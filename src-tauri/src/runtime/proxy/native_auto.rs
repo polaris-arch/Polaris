@@ -6,7 +6,7 @@ use polaris_config_engine::user_config::{
     auto_select::{self as model, AutoSelectPin, AutoSelectTarget},
     UserConfig,
 };
-use polaris_singbox_grpc::{daemon::Group, Endpoint, ReconnectConfig, SingBoxApiClient};
+use polaris_singbox_grpc::{daemon::Group, ReconnectConfig};
 use polaris_switch_engine::ManagementApi;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -534,16 +534,13 @@ impl ProxyRuntime {
     /// This observes native events only. It never schedules a measurement/evaluation.
     pub(super) fn spawn_native_auto_relay(self: &Arc<Self>, generation: u64, api_port: u16) {
         let me = Arc::clone(self);
-        tokio::spawn(async move {
+        self.spawn_runtime_api_relay(async move {
             'reconnect: loop {
                 if me.core_generation() != generation || !me.core_running() {
                     return;
                 }
                 let mut revision = me.native_observation_revision();
-                if let Ok(client) = SingBoxApiClient::connect(
-                    Endpoint::new("127.0.0.1", api_port),
-                    me.clash_api_secret(),
-                )
+                if let Ok(client) = me.current_management_client(api_port)
                 .await
                 {
                     if let Ok(mut stream) = client.open_groups().await {
@@ -1513,10 +1510,10 @@ impl ProxyRuntime {
         if cancel.reason().is_some() {
             return BTreeMap::new();
         }
-        let Some((port, secret)) = self.management_endpoint() else {
+        let Some((port, _secret)) = self.management_endpoint() else {
             return results;
         };
-        let connected = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await;
+        let connected = self.current_management_client(port).await;
         if cancel.reason().is_some() {
             return BTreeMap::new();
         }

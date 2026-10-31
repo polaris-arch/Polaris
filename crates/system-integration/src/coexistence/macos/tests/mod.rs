@@ -378,7 +378,13 @@ fn provider_reads_actual_existing_rosters_and_retains_all_routes_without_selecti
         provider(fixture_inputs(FIXTURES[0])),
         Fact::Unknown(_)
     ));
-    for file in &FIXTURES[1..] {
+    // Each capture has its own sanitized en0 address; keep the oracle explicit.
+    for (file, expected_en0_ipv4, expected_prefix_len) in [
+        (FIXTURES[1], "192.168.10.142", 24),
+        (FIXTURES[2], "192.168.10.142", 24),
+        (FIXTURES[3], "192.168.50.179", 24),
+        (FIXTURES[4], "192.168.10.142", 24),
+    ] {
         let objects = object_rows(provider(fixture_inputs(file)));
         let rows: Vec<_> = [AddressFamily::V4, AddressFamily::V6]
             .into_iter()
@@ -421,9 +427,13 @@ fn provider_reads_actual_existing_rosters_and_retains_all_routes_without_selecti
         let Fact::Known(addresses) = &physical.addresses else {
             unreachable!()
         };
-        assert!(addresses.iter().any(
-            |a| a.address == "192.168.10.142".parse::<IpAddr>().unwrap() && a.prefix_len == 24
-        ));
+        assert!(
+            addresses.iter().any(
+                |a| a.address == expected_en0_ipv4.parse::<IpAddr>().unwrap()
+                    && a.prefix_len == expected_prefix_len
+            ),
+            "{file}: en0 missing captured {expected_en0_ipv4}/{expected_prefix_len}"
+        );
         assert!(!objects.iter().any(|o| o.interface == "member"));
         let inactive = objects.iter().find(|o| o.interface == "stf0").unwrap();
         assert_eq!(inactive.addresses, Fact::Known(vec![]));

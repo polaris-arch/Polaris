@@ -23,6 +23,7 @@ import { isValidMacAddress, isValidNeighborDomain } from '@/domain/neighbor';
 import { MTU_MAX, MTU_MIN, parseMtuInput } from '@/domain/tun-mtu';
 import { useNavStore } from '@/store/nav-store';
 import { Fold } from '@/components/Fold';
+import { InfoIcon } from '@/components/InfoIcon';
 import {
   Phead,
   SetBlock,
@@ -323,8 +324,11 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
             死开关严重一档，故走 disabled + tip（同 Switch 文档里「假可用」标记的既定范式），
             而不是留着让人拨。值本身照常存盘，只禁交互。 */}
         <SetRow
+          id="set-strict-route"
           label={t('settings.tun.strictRoute')}
           tip={t('settings.tun.strictRouteDesc')}
+          desc={platform === 'mac' ? t('settings.tun.strictRouteMacInert')
+            : platform === 'win' && tun.strictRoute ? t('settings.tun.strictRouteWindowsRisk') : undefined}
         >
           <Switch
             checked={tun.strictRoute}
@@ -503,8 +507,11 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
           界面上完全看不出来，用户只能靠试（2026-09-08 现场就栽在往 mac 的 bypassLANList
           里填 tailnet 网段上）。故此处**不解释规则、直接给结果**：后端跑真 builder，把交给
           内核的那一份读回来 —— 没有第二份计算可漂。 */}
-      <SetBlock header={t('settings.tun.effectiveExcludeBlock')}>
-        <div className="card-sub">{t('settings.tun.effectiveExcludeHint')}</div>
+      <SetBlock header={<span className="sr-title">
+        <span>{t('settings.tun.effectiveExcludeBlock')}</span>
+        <InfoIcon tip={t('settings.tun.effectiveExcludeHint')} />
+      </span>}>
+        <div className="card-sub">{t('settings.tun.effectiveExcludeScope')}</div>
         {preview === null ? (
           <div className="card-sub">{t('settings.tun.effectiveExcludeUnavailable')}</div>
         ) : !preview.tunActive ? (

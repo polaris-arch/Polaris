@@ -3,21 +3,21 @@
   "active": true,
   "AppAccepted": false,
   "sourceEvidence": {
-    "producerRunId": 40478887755,
+    "producerRunId": 40956987023,
     "producerRunAttempt": 1,
-    "originalIndexSha256": "5ddcb1b623492bc555d7fcc0bc17798ea16200df21d2207cfd9a228ffc340caa",
+    "originalIndexSha256": "6a1ccf4dc27e7a9e2216688a65aecb72bcdc0874e308aa2bb589cf5011eb1c52",
     "originalIndexPath": "scripts/desktop-core/release-asset-index.json",
     "originalProducerSourceArchive": {
-      "name": "sing-box-polaris-source-bfcdf96b244f63e0fe84736ee4a4edd58f6b209e.tar.gz",
-      "bytes": 19641899,
-      "sha256": "d56450cb7c87daa4685dd7c01cb64a7c78ccea550970aed3198ee3263137102b"
+      "name": "sing-box-polaris-source-3155c9151f553967aabcee93f09e51084fc89899.tar.gz",
+      "bytes": 20385876,
+      "sha256": "e807b39a298df39b1c97e304f2bee7798eb9d24973faaa2532a57f19788c5976"
     },
     "actualSourceArchive": {
       "transport": "github-commit-archive-v1",
-      "name": "sing-box-polaris-bfcdf96b244f63e0fe84736ee4a4edd58f6b209e.tar.gz",
-      "url": "https://github.com/polaris-arch/sing-box-polaris/archive/bfcdf96b244f63e0fe84736ee4a4edd58f6b209e.tar.gz",
-      "bytes": 19747580,
-      "sha256": "70d0bed894f62b557a37c5f3a9211ced21807e135f144138189663ff2fc73566"
+      "name": "sing-box-polaris-3155c9151f553967aabcee93f09e51084fc89899.tar.gz",
+      "url": "https://github.com/polaris-arch/sing-box-polaris/archive/3155c9151f553967aabcee93f09e51084fc89899.tar.gz",
+      "bytes": 20500341,
+      "sha256": "a765460d44fcc94d7d1ce0bb7ff03369cbea467fc4e1f98e1647c32b51a52d9e"
     },
     "historicalSourceEvidence": {
       "producerRunId": 40320061915,
@@ -109,15 +109,15 @@
   },
   "migrationRequirement": "whole task-table source completion, concentrated independent review and corresponding complete App download/unpack/load/carrier validation",
   "nextDelivery": {
-    "state": "published exact alpha.12.6 metadata and verified immutable source archive; public desktop download and App same-package acceptance pending",
-    "requestedTag": "v1.15.0-polaris-alpha.12.6",
-    "sourceCommit": "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
-    "sourceTree": "4c0fdb31d59967f41c808ea6b63f87ca9661c2cf",
-    "tagObject": "8a230c1d34cb4855b261944e2935ce36f9cd14de",
+    "state": "published exact alpha.12.7 metadata and verified immutable source archive; public desktop download and App same-package acceptance pending",
+    "requestedTag": "v1.15.0-polaris-alpha.12.7",
+    "sourceCommit": "3155c9151f553967aabcee93f09e51084fc89899",
+    "sourceTree": "457a8906cd3088578aa7e9d93185f07142178b5b",
+    "tagObject": "3f6ca510d99cd871e465b82b16e9ab069ec539d8",
     "sourcePolicy": {
       "schema": "polaris-reviewed-kernel-source-v3",
-      "sourceCommit": "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
-      "sourceTree": "4c0fdb31d59967f41c808ea6b63f87ca9661c2cf",
+      "sourceCommit": "3155c9151f553967aabcee93f09e51084fc89899",
+      "sourceTree": "457a8906cd3088578aa7e9d93185f07142178b5b",
       "goVersion": "1.27.2",
       "goModSha256": "d16c533c97de535cf38985a62a78993c1b755a8f723a78ea8a0d75d585d7201d",
       "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
@@ -147,8 +147,8 @@
         "github.com/sagernet/tailscale": {
           "version": "v1.102.1-sing-box-1.14-mod.5.0.20260925112514-35e61219dedd",
           "replacementPath": "./third_party/tailscale",
-          "replacementTree": "595e6f60e106780e60f55e20753da07b62ac0d7f",
-          "replacementFileCount": 1520
+          "replacementTree": "2a64a58e8626644ce4175afef637ff59ede9c7f3",
+          "replacementFileCount": 1521
         },
         "github.com/metacubex/utls": {
           "version": "v1.8.8",
@@ -202,17 +202,17 @@
     },
     "sourceArchive": {
       "transport": "github-commit-archive-v1",
-      "name": "sing-box-polaris-bfcdf96b244f63e0fe84736ee4a4edd58f6b209e.tar.gz",
-      "url": "https://github.com/polaris-arch/sing-box-polaris/archive/bfcdf96b244f63e0fe84736ee4a4edd58f6b209e.tar.gz",
-      "bytes": 19747580,
-      "sha256": "70d0bed894f62b557a37c5f3a9211ced21807e135f144138189663ff2fc73566"
+      "name": "sing-box-polaris-3155c9151f553967aabcee93f09e51084fc89899.tar.gz",
+      "url": "https://github.com/polaris-arch/sing-box-polaris/archive/3155c9151f553967aabcee93f09e51084fc89899.tar.gz",
+      "bytes": 20500341,
+      "sha256": "a765460d44fcc94d7d1ce0bb7ff03369cbea467fc4e1f98e1647c32b51a52d9e"
     },
     "activationEligible": true,
-    "producerRunId": 40478887755,
+    "producerRunId": 40956987023,
     "producerRunAttempt": 1,
-    "releaseId": 425664135,
-    "contractSha256": "66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f",
-    "originalIndexSha256": "5ddcb1b623492bc555d7fcc0bc17798ea16200df21d2207cfd9a228ffc340caa",
+    "releaseId": 428545497,
+    "contractSha256": "9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf",
+    "originalIndexSha256": "6a1ccf4dc27e7a9e2216688a65aecb72bcdc0874e308aa2bb589cf5011eb1c52",
     "mobileSourceContractPath": "scripts/mobile-core/source-contract.json",
     "mobileSourceContractSha256": "8acececd46ddbe2f12056a15b6009400044508f2c162781f86ef2b63fee01104",
     "required": [
@@ -238,19 +238,19 @@
   "selection": {
     "schema": "polaris-app-release-selection-v1",
     "contractPath": "scripts/desktop-core/release-contract.json",
-    "contractSha256": "66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f",
-    "version": "1.15.0-polaris-alpha.12.6",
-    "tag": "v1.15.0-polaris-alpha.12.6",
-    "tagObject": "8a230c1d34cb4855b261944e2935ce36f9cd14de",
-    "sourceCommit": "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
-    "sourceTree": "4c0fdb31d59967f41c808ea6b63f87ca9661c2cf",
-    "releaseId": 425664135,
+    "contractSha256": "9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf",
+    "version": "1.15.0-polaris-alpha.12.7",
+    "tag": "v1.15.0-polaris-alpha.12.7",
+    "tagObject": "3f6ca510d99cd871e465b82b16e9ab069ec539d8",
+    "sourceCommit": "3155c9151f553967aabcee93f09e51084fc89899",
+    "sourceTree": "457a8906cd3088578aa7e9d93185f07142178b5b",
+    "releaseId": 428545497,
     "librarySha256": {
       "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
       "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
     }
   },
-  "state": "alpha.12.6 public desktop identities and same immutable mobile source selected; source archive verified; public desktop download/native/carrier/mobile acceptance pending",
+  "state": "alpha.12.7 public desktop identities selected; mobile remains on its separate alpha.12.6 immutable source; source archive verified; public desktop download/native/carrier/mobile acceptance pending",
   "historicalTemporarySelection": {
     "schema": "polaris-app-temporary-desktop-selection-v1",
     "contractPath": "scripts/desktop-core/native-dns-candidate.json",

@@ -21,6 +21,8 @@
  * 只有首帧（`useEffect` 在 SSR 不跑 ⇒ 出口候选列表恒空、`connected` 恒 null），以及零 CSS、
  * 零交互 —— 「点两下真的清掉了」归 `ts-settings-logic.test.ts` 的纯逻辑判据与真机。
  */
+// Register the oracle's actual-close/join hook while Vitest collects this file.
+import { cssChain, measure } from '@/styles/css-oracle.test-support';
 import { describe, it, expect, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ServerConfig } from '@/contracts/types';
@@ -161,5 +163,48 @@ describe('TsSettingsDialog：按 serverId 寻址（不再是单例，不许自�
     expect(html).toContain('ts.noNode');
     expect(html).not.toContain('host-a');
     expect(html).not.toContain('host-b');
+    expect(html).not.toContain('data-ts-coexistence');
   });
+
+  it('keeps the System boundary visible when unlocked, without mixing two saved System accounts', async () => {
+    const css = (await cssChain('desktop')).map(item => item.css);
+    seed(twoNodes.map(node => ({ ...node, tailscaleSettings: {
+      ...node.tailscaleSettings, reverseMesh: true, authKey: SENTINEL,
+    } })));
+    const livePrivacy = useAppStore.getState().privacyMode;
+    const ssrPrivacy = useAppStore.getInitialState().privacyMode;
+    const renderPrivacy = (privacyMode: boolean) => {
+      useAppStore.setState({ privacyMode });
+      Object.assign(useAppStore.getInitialState(), { privacyMode });
+      return renderToStaticMarkup(<TsSettingsDialog instanceId="test-ts-settings" serverId="ts-b" />);
+    };
+    try {
+      const boundary = '[data-ts-coexistence] > span:first-child';
+      const help = '[data-ts-coexistence] .info-i[role="img"][tabindex="0"][aria-label][data-tip]';
+      const locked = await measure({ css, html: renderPrivacy(true), rootAttrs: { 'data-os': 'mac' } }, [
+        { select: boundary, props: ['visibility'] },
+      ]);
+      expect(locked.rect(boundary).height).toBe(0);
+      const markup = renderPrivacy(false);
+      expect(markup).toContain('value="host-b"');
+      expect(markup).not.toContain('value="host-a"');
+      expect(markup).not.toContain('SENTINEL');
+      expect(markup).toContain('>common.save</button>');
+      expect(markup).not.toMatch(/<button[^>]*class="btn flow"[^>]*disabled/);
+      // SSR does not run Modal's showModal() layout effect; supply its open state without CSS overrides.
+      const actual = await measure({ css, html: markup.replace(/<dialog\b/, '<dialog open'),
+        rootAttrs: { 'data-os': 'mac' } }, [
+        { select: boundary, props: ['display', 'visibility'] },
+        { select: help, props: ['display', 'visibility'] },
+      ]);
+      expect(actual.count(boundary)).toBe(1);
+      expect(actual.get(boundary, 'visibility')).toBe('visible');
+      expect(actual.rect(boundary).height).toBeGreaterThan(0);
+      expect(actual.count(help)).toBe(1);
+      expect(actual.rect(help).height).toBeGreaterThan(0);
+    } finally {
+      useAppStore.setState({ privacyMode: livePrivacy });
+      Object.assign(useAppStore.getInitialState(), { privacyMode: ssrPrivacy });
+    }
+  }, 30_000);
 });

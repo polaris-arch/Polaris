@@ -14,6 +14,26 @@ const MAX_FDS: usize = 512;
 const MAX_PEERS: usize = 32;
 const MAX_RACE_OBSERVATIONS: usize = 32;
 
+pub(super) struct ChildCleanup(pub(super) Option<i32>);
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        // This guard owns the unreaped child. Even assertion failure releases
+        // the controlled barrier; no detached thread or external PID is killed.
+        let Some(raw) = self.0 else {
+            return;
+        };
+        let pid = nix::unistd::Pid::from_raw(raw);
+        if matches!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Ok(nix::sys::wait::WaitStatus::StillAlive)
+        ) {
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::wait::waitpid(pid, None);
+        }
+    }
+}
+
 // One epoch for all threads in this test process. Initialization does not hold
 // a lock across any acquisition, spawn, observation or File close. PID remains
 // part of every record: this epoch does not establish cross-process ordering.
@@ -216,6 +236,24 @@ pub(super) struct Snapshot {
     events: Vec<ScopeEvent>,
     events_lost: u64,
     native: Native,
+}
+impl Snapshot {
+    // This is numeric descriptor observation only. Tests establish retained
+    // ownership separately using an exact-child ready/release handshake.
+    pub(super) fn child_descriptor_birth(&self, pid: u32, fd: i32) -> Option<[u64; 2]> {
+        self.native
+            .peers
+            .iter()
+            .find(|peer| {
+                peer.identity.pid == pid
+                    && pid != self.pid
+                    && peer.identity.ppid == self.pid
+                    && peer.fd == fd
+                    && peer.cloexec == Some(true)
+                    && peer.same_executable == Some(true)
+            })
+            .map(|peer| peer.identity.start)
+    }
 }
 impl fmt::Display for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

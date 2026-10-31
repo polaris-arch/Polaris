@@ -433,15 +433,28 @@ fn same_protocol_with_different_build_identity_does_not_force_a_helper_replaceme
 }
 
 #[test]
-fn upgradeable_window_is_empty_while_min_usable_equals_current() {
-    // 旧测 `status_upgradeable_when_proto_between_min_and_expected` 靠 上游的 MIN_USABLE(4)
-    // < EXPECTED(9) 撑出一个「够用但偏旧」的窗口（v5 落在里面）。统一 v1 后 MIN_USABLE ==
-    // CURRENT ⇒ 窗口为空——这不是缺陷，是「Polaris 尚无第二代 helper」的事实。
-    // `CURRENT` 一旦 +1，窗口自动打开，届时本测该改回「窗口内的版本判 upgradeable」。
-    for v in 0..=(polaris_helper_proto::proto_version::CURRENT + 2) {
-        let ready = v >= MIN_USABLE_PROTO;
-        let upgradeable = ready && v < expected_proto();
-        assert!(!upgradeable, "v{v}：当前无更新代次，不该判可升级");
+fn old_v2_helper_is_not_runtime_ready_and_offers_real_upgrade() {
+    for version in [0, 1, 2] {
+        let paths = InstallPaths::mac();
+        let mut sysops = MockSysOps::default();
+        sysops.exists_paths.insert(paths.binary.clone());
+        sysops
+            .exists_paths
+            .insert(paths.descriptor.expect("mac descriptor"));
+        let (manager, _dir) = manager_with_token(Platform::Mac, sysops);
+        let connector = MockConnector {
+            streams: Arc::new(Mutex::new(vec![MockStream::with_response(
+                format!("OK pong uid=0 v{version}\n").into_bytes(),
+            )])),
+        };
+        let status = manager.compute_status_with_client(&HelperClient::new(
+            Box::new(connector),
+            Platform::Mac,
+            "TOK",
+        ));
+        assert!(!status.ready);
+        assert!(status.upgradeable);
+        assert!(status.needs_repair);
     }
 }
 
@@ -690,10 +703,12 @@ fn install_params(script_dir: PathBuf, src: PathBuf) -> InstallParams {
         if windows { "sing-box.exe" } else { "sing-box" }
     ));
     InstallParams {
+        linux_legacy_original_proxy: None,
         manifest_path,
         manifest_sha256: "b".repeat(64),
         core_id: polaris_helper_proto::core_manifest::CoreId::parse(&"c".repeat(64)).unwrap(),
         helper_sha256: "a".repeat(64),
+        cleaner_sha256: windows.then(|| "d".repeat(64)),
         helper_version: "1.0.0".into(),
         user_identity: if windows {
             polaris_helper_proto::core_protocol::CallerIdentity::windows("S-1-5-21-1-2-3-1000")
@@ -879,6 +894,24 @@ fn windows_script() -> String {
 
 #[test]
 fn windows_seals_helper_manifest_and_cleaner_before_any_service_mutation() {
+    fn scoped_mutation_precedes_stop(script: &str) -> bool {
+        let Some((_, replacement)) = script.split_once("function Begin-ServiceReplacement {\n")
+        else {
+            return false;
+        };
+        let Some((body, _)) = replacement.split_once("\n}\n") else {
+            return false;
+        };
+        let (Some(revalidate), Some(mutate), Some(stop)) = (
+            body.find("else { Assert-CurrentProductService }"),
+            body.find("\n  $script:mutated = $true\n"),
+            body.find("\n  Stop-ServiceChecked"),
+        ) else {
+            return false;
+        };
+        revalidate < mutate && mutate < stop && !body.contains("\n  $mutated = $true\n")
+    }
+
     let script = windows_script();
     let helper = script.find("Check-Hash $utility '").unwrap();
     let manifest = script.find("Check-Hash $manifest '").unwrap();
@@ -887,9 +920,22 @@ fn windows_seals_helper_manifest_and_cleaner_before_any_service_mutation() {
         .unwrap();
     let execute = script.find("Invoke-Utility @('core-install'").unwrap();
     let admit = script.find("Invoke-Utility @('prepare-upgrade'").unwrap();
-    let mutate = script.find("$mutated = $true").unwrap();
+    let mutate = script.find("\n  Begin-ServiceReplacement\n").unwrap();
+    let register = script.find("Invoke-Utility @('register-user'").unwrap();
     assert!(helper < execute && manifest < execute && cleaner < execute);
-    assert!(execute < admit && admit < mutate);
+    assert!(execute < admit && admit < mutate && mutate < register);
+    assert!(scoped_mutation_precedes_stop(&script));
+    assert!(!scoped_mutation_precedes_stop(&script.replacen(
+        "$script:mutated = $true",
+        "$mutated = $true",
+        1,
+    )));
+    assert!(!scoped_mutation_precedes_stop(&script.replacen(
+        "$script:mutated = $true\n  Stop-ServiceChecked",
+        "Stop-ServiceChecked\n  $script:mutated = $true",
+        1,
+    )));
+    assert!(script.contains("    if ($mutated) {\n      Stop-CandidateServiceForRollback"));
     assert!(script.contains("$selection.id -cne '"));
     assert!(script.contains("--source-owner', $identity"));
     assert!(!script.contains(".seed.new"));
@@ -924,7 +970,7 @@ fn windows_replaces_the_entire_dacl_with_numeric_privileged_owners() {
 }
 
 #[test]
-fn windows_checks_native_exits_and_rolls_back_exact_old_service_command() {
+fn windows_checks_native_exits_and_preserves_existing_service_identity() {
     let script = windows_script();
     for guard in [
         "SCM stop",
@@ -938,7 +984,9 @@ fn windows_checks_native_exits_and_rolls_back_exact_old_service_command() {
     }
     assert!(script.contains("actions= restart/5000/restart/5000/restart/5000"));
     assert!(script.contains("(A;;RP;;;IU)"));
-    assert!(script.contains("$old.PathName -StartupType $startType"));
+    assert!(script.contains("$policy.Command -cne $binPath"));
+    assert!(!script.contains("-BinaryPathName $old.PathName"));
+    assert!(script.contains("Restore-PreviousService"));
     assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
     assert!(script.contains("$keepRecovery = $true"));
     assert!(script.contains("finally { if ($null -ne $lock) { $lock.Dispose() } }"));
@@ -1110,22 +1158,16 @@ fn install_mac_selects_osascript() {
 }
 
 #[test]
-fn install_win_selects_uac() {
-    let src = PathBuf::from(r"C:\app\helper.exe");
-    let (m, _d) = install_manager(Platform::Win, &src);
-    let script_dir = tempfile::tempdir().unwrap();
-    let params = install_params(script_dir.path().to_path_buf(), src);
-    let (exec, calls, _) = capturing((String::new(), 0));
-    m.install(&params, &exec).unwrap();
-    let executable = calls.lock().unwrap()[0][0].clone();
-    assert!(
-        executable.ends_with(r"\WindowsPowerShell\v1.0\powershell.exe"),
-        "Windows 安装提权必须钉住系统 PowerShell: {executable}"
-    );
-    assert!(
-        executable.contains(r":\"),
-        "Windows 安装提权不得走 PATH/当前目录解析: {executable}"
-    );
+fn install_win_selects_native_pinned_maintenance() {
+    let source = polaris_source_probe::crate_source!("manager.rs");
+    let native = source
+        .split_once("if self.platform == Platform::Win {")
+        .unwrap()
+        .1;
+    assert!(native.contains("polaris_windows_cleaner::launch_install(request)"));
+    assert!(native.contains("cleaner_sha256: params.cleaner_sha256"));
+    assert!(native.contains("InstallOutcome::Cancelled"));
+    assert!(native.contains("InstallOutcome::Completed(code)"));
 }
 
 #[test]
@@ -1231,7 +1273,7 @@ fn wait_until_ready_returns_ready_when_proto_ok() {
 }
 
 #[test]
-fn wait_until_ready_does_not_accept_same_proto_old_build() {
+fn wait_until_ready_accepts_compatible_proto_with_a_different_build() {
     let paths = InstallPaths::mac();
     let mut sysops = MockSysOps::default();
     sysops.exists_paths.insert(paths.binary.clone());
@@ -1245,17 +1287,14 @@ fn wait_until_ready_does_not_accept_same_proto_old_build() {
     )
     .into_bytes();
     let connector = MockConnector {
-        streams: Arc::new(Mutex::new(vec![
-            MockStream::with_response(old),
-            MockStream::with_response(current_pong_wire()),
-        ])),
+        streams: Arc::new(Mutex::new(vec![MockStream::with_response(old)])),
     };
     let client = HelperClient::new(Box::new(connector), Platform::Mac, "TOK");
-    let status = m.wait_until_ready(&client, 2, Duration::from_millis(1));
+    let status = m.wait_until_ready(&client, 1, Duration::from_millis(1));
     assert!(status.ready);
     assert!(
         !status.upgradeable,
-        "必须等到当前随包 build，旧 build 的 ready 不算安装完成"
+        "兼容协议的 Helper 不因诊断 build 不同而被替换"
     );
 }
 
@@ -1781,9 +1820,9 @@ fn explicit_migration_rejects_other_platforms_before_validation_token_or_elevati
         assert!(InstallMode::Ordinary.supported_on(platform));
         assert_eq!(
             InstallMode::StopAndUpgrade.supported_on(platform),
-            platform == Platform::Mac
+            matches!(platform, Platform::Mac | Platform::Linux)
         );
-        if platform == Platform::Mac {
+        if matches!(platform, Platform::Mac | Platform::Linux) {
             continue;
         }
         let stage = tempfile::tempdir().unwrap();
@@ -1888,9 +1927,7 @@ fn maintenance_identity_requires_absolute_source_and_actual_hash() {
 fn windows_registration_is_transactional_and_follows_admission_and_stop() {
     let script = windows_script();
     let admission = script.find("Invoke-Utility @('prepare-upgrade'").unwrap();
-    let stop = script
-        .find("  Stop-ServiceChecked\n  Delete-ServiceChecked")
-        .unwrap();
+    let stop = script.find("  Begin-ServiceReplacement").unwrap();
     let registration = script.find("Invoke-Utility @('register-user'").unwrap();
     let snapshot = script
         .find("$registrationSnapshot = @{ Path = $registration;")
@@ -1899,9 +1936,7 @@ fn windows_registration_is_transactional_and_follows_admission_and_stop() {
     let restore = script
         .find("Restore-Registration $registrationSnapshot")
         .unwrap();
-    let restart = script
-        .find("New-Service -Name $service -BinaryPathName $old.PathName")
-        .unwrap();
+    let restart = script.rfind("      Restore-PreviousService").unwrap();
     assert!(restore < restart);
     assert!(script.contains("$keepHelper -and $wasRunning -and $sameRegistration"));
     assert!(script.contains("$registrationChanged = $true"));
@@ -1952,44 +1987,24 @@ fn windows_registration_rollback_proves_atomic_bytes_and_original_security() {
 
 /// Runs the real restore function against synthetic files only. The existing
 /// Windows workspace test job executes this; no service, UAC or global ACL calls.
-#[cfg(windows)]
 #[test]
 fn windows_registration_rollback_native_fixture_faults() {
-    let script = windows_script();
-    let start = script
-        .find("# Preserve registration security exactly;")
-        .unwrap();
-    let end = script[start..]
-        .find("function Stop-ServiceChecked")
-        .unwrap()
-        + start;
-    let harness = polaris_source_probe::crate_file!("src/manager/tests/registration-rollback.ps1")
-        .replace(
-            "# PRODUCTION_REGISTRATION_ROLLBACK_FUNCTIONS",
-            &script[start..end],
-        );
-    let fixture = tempfile::tempdir().unwrap();
-    let path = fixture.path().join("registration rollback fixture.ps1");
-    let mut bytes = vec![0xef, 0xbb, 0xbf];
-    bytes.extend_from_slice(harness.as_bytes());
-    std::fs::write(&path, bytes).unwrap();
-    let output =
-        std::process::Command::new(crate::windows_system::powershell_executable().unwrap())
-            // CI is pwsh -> cargo -> this process -> Windows PowerShell. As in
-            // StdExecutor, discard only the child module-path inheritance so
-            // its own Windows PowerShell modules supply the real ACL cmdlets.
-            .env_remove("PSModulePath")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&path)
-            .output()
-            .expect("run Windows registration rollback fixture harness");
-    assert!(
-        output.status.success(),
-        "fixture failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Passed 8 native fixture cases."));
+    let native =
+        polaris_source_probe::repo_file!("crates/windows-cleaner/src/windows/install/tests/mod.rs");
+    assert!(native.contains("fn original_8_registration_cases_use_real_native_restore"));
+    assert!(native.contains("restore_snapshot_with_policy"));
+    for case in [
+        "present",
+        "missing-destination",
+        "original-absent",
+        "tampered-backup",
+        "blocked-replacement",
+        "invalid-security",
+        "parent-is-file",
+        "reparse-parent",
+    ] {
+        assert!(native.contains(case), "{case}");
+    }
 }
 
 #[test]
@@ -2127,7 +2142,7 @@ fn retained_windows_helper_requires_framing_before_service_or_registration_chang
     assert!(source.contains(".Hash.ToLowerInvariant() -cne '{helper_hash}'"));
 }
 
-/// Both fixtures are complete outputs from the real split Unix producers, with
+/// Three fixtures are complete outputs from the real split Unix producers, with
 /// synthetic values only. Never execute these administrator script bytes.
 #[test]
 fn linux_script_producer_matches_package_acceptance_fixtures() {
@@ -2156,13 +2171,28 @@ fn linux_script_producer_matches_package_acceptance_fixtures() {
         helper_sha256: "a".repeat(64),
     };
     let uninstall = uninstall_unix::build_linux_uninstall_script(&paths, &utility);
-    let fixtures =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/package-acceptance/fixtures");
-    for (kind, bytes) in [
-        ("install", install.as_bytes()),
-        ("uninstall", uninstall.as_bytes()),
+    let mut legacy_params = params.clone();
+    legacy_params.linux_legacy_original_proxy = Some([
+        "'127.0.0.1'".to_owned(),
+        "3128".to_owned(),
+        "false".to_owned(),
+        "''".to_owned(),
+        "0".to_owned(),
+        "''".to_owned(),
+        "0".to_owned(),
+        "['localhost', '127.0.0.0/8']".to_owned(),
+        "'none'".to_owned(),
+        "/home/producer-user".to_owned(),
+    ]);
+    let legacy =
+        install_unix::build_linux_legacy_install_script(&paths, &legacy_params, &"e".repeat(64));
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/linux-installer");
+    for (fixture, kind, bytes) in [
+        ("install", "install", install.as_bytes()),
+        ("uninstall", "uninstall", uninstall.as_bytes()),
+        ("legacy-upgrade", "install", legacy.as_bytes()),
     ] {
-        let expected = std::fs::read(fixtures.join(format!("linux-helper-{kind}.sh"))).unwrap();
+        let expected = std::fs::read(fixtures.join(format!("linux-helper-{fixture}.sh"))).unwrap();
         assert_eq!(
             bytes,
             expected.as_slice(),
@@ -2200,4 +2230,128 @@ fn linux_script_producer_matches_package_acceptance_fixtures() {
             assert!(!path.exists());
         }
     }
+}
+
+/// Compile the native SCM reader and run the real policy/transaction functions
+/// against inert SCM ops and temporary files; never query/mutate real services.
+#[test]
+fn windows_existing_service_identity_and_rollback_native_inert_fixture() {
+    let native =
+        polaris_source_probe::repo_file!("crates/windows-cleaner/src/install/tests/mod.rs");
+    assert!(native.contains("original_17_inert_scm_cases_use_production_transaction"));
+    assert!(native.contains("original_20_recovery_cases_use_production_catch_and_finish"));
+    assert!(native.contains("run(&mut f)"));
+    let manager = polaris_source_probe::crate_source!("manager.rs");
+    assert!(manager.contains("#[cfg(test)]\nmod install_windows;"));
+}
+
+#[test]
+fn typed_maintenance_scope_preserves_mac_retirement_linux_removal_and_failures() {
+    for platform in [Platform::Mac, Platform::Linux] {
+        let dir = tempfile::tempdir().unwrap();
+        let utility = maintenance_fixture(dir.path());
+        let manager = HelperManager::new(
+            platform,
+            dir.path().join("token"),
+            Box::new(MockSysOps::default()),
+        );
+        let (executor, calls, _) = capturing((String::new(), 0));
+        let result = manager
+            .uninstall_with_maintenance_outcome(dir.path(), Some(&utility), &executor)
+            .unwrap();
+        assert_eq!(
+            result,
+            if platform == Platform::Mac {
+                MaintenanceOutcome::RetiredDataPreserved
+            } else {
+                MaintenanceOutcome::Removed
+            }
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let cancellation = if platform == Platform::Mac {
+            (1, "User canceled (-128)")
+        } else {
+            (126, "cancelled")
+        };
+        let (executor, _, _) = capturing((cancellation.1.into(), cancellation.0));
+        assert_eq!(
+            manager
+                .uninstall_with_maintenance_outcome(dir.path(), Some(&utility), &executor)
+                .unwrap(),
+            MaintenanceOutcome::Cancelled
+        );
+        for (code, expected) in [
+            (126, MaintenanceOutcome::Cancelled),
+            (
+                88,
+                MaintenanceOutcome::Failed {
+                    stderr: "unknown cleanup".into(),
+                    code: 88,
+                },
+            ),
+        ] {
+            let (executor, _, _) = capturing(("unknown cleanup".into(), code));
+            let result = manager
+                .uninstall_with_maintenance_outcome(dir.path(), Some(&utility), &executor)
+                .unwrap();
+            // macOS cancellation is AppleScript -128, not Linux pkexec 126.
+            if platform == Platform::Linux {
+                assert_eq!(result, expected)
+            } else {
+                assert!(matches!(result, MaintenanceOutcome::Failed { .. }));
+            }
+        }
+    }
+    assert_eq!(
+        maintenance_outcome(Platform::Win, EscalationOutcome::Success),
+        MaintenanceOutcome::Removed
+    );
+    assert_eq!(
+        maintenance_outcome(Platform::Win, EscalationOutcome::Cancelled),
+        MaintenanceOutcome::Cancelled
+    );
+}
+
+#[test]
+fn linux_explicit_forward_only_producer_never_creates_an_ordinary_fallback_after_native_failure() {
+    let params = install_params(
+        PathBuf::from("/inert/config"),
+        PathBuf::from("/inert/stage/polaris-helper"),
+    );
+    let script = install_unix::build_linux_legacy_install_script(
+        &InstallPaths::linux(),
+        &params,
+        &"e".repeat(64),
+    );
+    assert!(script.starts_with("#!/bin/sh\nset -eu\n"));
+    let legacy = script
+        .split("  legacy)\n")
+        .nth(1)
+        .unwrap()
+        .split("  ordinary)")
+        .next()
+        .unwrap();
+    assert!(legacy.contains("admin linux-legacy-install"));
+    assert!(!legacy.contains("||"));
+    assert!(!legacy.contains("restart"));
+    assert!(legacy.contains("exit 0;;"));
+    let preflight = script.split("CLASS=$(admin").next().unwrap();
+    assert!(!preflight.contains("secure_dir '/usr/local/lib/polaris'"));
+    assert!(!preflight.contains("secure_dir \"$COREDIR\""));
+    assert!(preflight.contains("secure_dir \"$SUPPORT\""));
+    assert!(preflight.contains("exec 9>>\"$LOCK\""));
+    assert!(preflight.contains(": > \"$BOOT/original-proxy\""));
+}
+
+#[test]
+fn linux_ownmask_routing_hint_never_performs_implicit_legacy_recovery() {
+    let params = install_params(
+        PathBuf::from("/inert/config"),
+        PathBuf::from("/inert/stage/polaris-helper"),
+    );
+    let script = install_unix::build_linux_install_script(&InstallPaths::linux(), &params, "token");
+    assert!(script.contains("[ -L \"$DESCRIPTOR\" ]"));
+    assert!(script.contains("readlink -- \"$DESCRIPTOR\""));
+    assert!(script.contains("HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY"));
+    assert!(!script.contains("linux-legacy-install"));
 }

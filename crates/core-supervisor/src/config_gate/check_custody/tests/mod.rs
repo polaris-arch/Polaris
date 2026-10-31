@@ -7,9 +7,9 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU8, AtomicUsize};
 
-    struct Fixture(PathBuf, PathBuf);
+    pub(super) struct Fixture(pub(super) PathBuf, PathBuf);
     impl Fixture {
-        fn new(script: &str) -> Self {
+        pub(super) fn new(script: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "polaris-check-custody-{}-{}",
                 std::process::id(),
@@ -179,6 +179,14 @@ mod unix {
         assert!(
             first_poll.is_pending(),
             "expected pending custody check, got {first_poll:?}"
+        );
+        assert!(
+            pause_producers(&custody, true).is_err(),
+            "idle reset cutoff must refuse the actual live Check"
+        );
+        assert!(
+            custody.state.lock().unwrap().pause.is_none(),
+            "busy cutoff must leave original admission unchanged"
         );
         let (request, snapshot) = {
             let state = custody.state.lock().unwrap();
@@ -974,7 +982,10 @@ mod unix {
     }
 
     #[cfg(target_os = "linux")]
-    fn owned_fixture(program: &str, args: &[&str]) -> (tokio::process::Command, File, File) {
+    pub(super) fn owned_fixture(
+        program: &str,
+        args: &[&str],
+    ) -> (tokio::process::Command, File, File) {
         use nix::fcntl::{fcntl, FcntlArg, SealFlag};
         use nix::sys::memfd::{memfd_create, MFdFlags};
         use std::io::Write;
@@ -1240,6 +1251,8 @@ mod unix {
 
 mod bounded_capture {
     use super::super::*;
+    #[cfg(target_os = "linux")]
+    use super::unix::owned_fixture;
 
     #[tokio::test]
     async fn regular_validation_retention_is_bounded_but_both_streams_are_drained() {
@@ -1261,5 +1274,163 @@ mod bounded_capture {
             matches!(output.result(true), RawCheck::OutputFailed(_)),
             "truncation cannot become a successful validation"
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_validation_caller_budgets_keep_success_and_native_timeout_distinct() {
+        // App callers independently map RawCheck. Their old shell inputs must
+        // not be promoted into PreparedExecution to exercise this lifecycle.
+        // Use the existing crate-private admitted cohort and the same custody.
+        for timeout in [
+            crate::config_gate::CONFIG_CHECK_TIMEOUT,
+            Duration::from_secs(8),
+        ] {
+            let custody = Arc::new(CheckCustody::default());
+            let payload = crate::admitted_payload::fixture(
+                b"#!/bin/sh\nv=$(cat /proc/self/fd/0)\n[ \"$v\" = '{\"owned-check-fixture\":true}' ] || exit 7\nprintf 'accepted'\nprintf 'captured' >&2\n",
+                vec![ExecPurpose::CheckConfig],
+            );
+            let (_, _, config) = owned_fixture("/bin/true", &[]);
+            let success = supervise_admitted_sealed_check(
+                custody.clone(),
+                payload.prepare(ExecPurpose::CheckConfig).unwrap(),
+                config,
+                timeout,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(success, RawCheck::Done { success: true, ref stdout, ref stderr }
+                if stdout.is_empty() && stderr.is_empty()),
+                // Sealed checks discard both streams by contract. The script's
+                // real fd0 comparison and native exit prove the input/success;
+                // regular validation's bounded capture has its own test above.
+                "{success:?}"
+            );
+            assert!(custody.state.lock().unwrap().runs.is_empty());
+
+            let f = super::unix::Fixture::new("exit 0");
+            let lease_path = f.0.join("live-check.lease");
+            let lease = Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&lease_path)
+                    .unwrap(),
+            );
+            lease.try_lock_shared().unwrap();
+            let weak = Arc::downgrade(&lease);
+            let payload = crate::admitted_payload::fixture(
+                b"#!/bin/sh\nexec /bin/sleep 30\n",
+                vec![ExecPurpose::CheckConfig],
+            );
+            let execution = payload
+                .prepare(ExecPurpose::CheckConfig)
+                .unwrap()
+                .with_store_lease(lease)
+                .unwrap();
+            let (_, _, config) = owned_fixture("/bin/true", &[]);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let caller = tokio::spawn(supervise_admitted_sealed_check(
+                custody.clone(),
+                execution,
+                config,
+                timeout,
+                Some(tx),
+            ));
+            assert!(rx.await.unwrap() > 0, "actual original native birth");
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lease_path)
+                .unwrap();
+            assert!(matches!(
+                probe.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            assert!(weak.upgrade().is_some());
+            assert!(
+                matches!(caller.await.unwrap().unwrap(), RawCheck::TimedOut { after_secs }
+                if after_secs == timeout.as_secs_f32())
+            );
+            // No timeout/kill ACK is substituted for native wait: custody has
+            // fully retired the same request, its sealed input and lease owner.
+            assert!(custody.state.lock().unwrap().runs.is_empty());
+            assert!(weak.upgrade().is_none());
+            probe.try_lock().unwrap();
+            probe.unlock().unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_sealed_config_uses_fixed_check_argv_fd0_and_original_cohort() {
+        let payload=crate::admitted_payload::fixture(b"#!/bin/sh\n[ \"$1\" = --disable-color ] && [ \"$2\" = check ] && [ \"$3\" = -c ] && [ \"$4\" = /proc/self/fd/0 ] || exit 7\nv=$(cat /proc/self/fd/0)\n[ \"$v\" = '{\"owned-check-fixture\":true}' ]\n",vec![ExecPurpose::CheckConfig]);
+        let custody = Arc::new(CheckCustody::default());
+        let (_, _, config) = owned_fixture("/bin/true", &[]);
+        let result = supervise_admitted_sealed_check(
+            custody.clone(),
+            payload.prepare(ExecPurpose::CheckConfig).unwrap(),
+            config,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, RawCheck::Done { success: true, .. }));
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        assert!(payload.is_current());
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn opaque_sealed_check_cancellation_keeps_same_owner_until_native_reap() {
+        let custody = Arc::new(CheckCustody::default());
+        let payload = crate::admitted_payload::fixture(
+            b"#!/bin/sh\nexec /bin/sleep 30\n",
+            vec![ExecPurpose::CheckConfig],
+        );
+        let weak = Arc::downgrade(&payload);
+        let (_, _, config) = owned_fixture("/bin/true", &[]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let never_polled = supervise_admitted_sealed_check(
+            custody.clone(),
+            payload.prepare(ExecPurpose::CheckConfig).unwrap(),
+            config,
+            Duration::from_secs(8),
+            Some(tx),
+        );
+        drop(never_polled);
+        assert!(rx.await.is_err());
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        let (_, _, config) = owned_fixture("/bin/true", &[]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let future = supervise_admitted_sealed_check(
+            custody.clone(),
+            payload.prepare(ExecPurpose::CheckConfig).unwrap(),
+            config,
+            Duration::from_secs(8),
+            Some(tx),
+        );
+        drop(payload);
+        let caller = tokio::spawn(future);
+        let pid = rx.await.unwrap();
+        assert!(pid > 0);
+        assert!(weak.upgrade().is_some());
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                custody.settle_debts().await.unwrap();
+                if custody.state.lock().unwrap().runs.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same original native Child must retire");
+        assert!(weak.upgrade().is_none());
     }
 }

@@ -60,8 +60,9 @@ pub use check_custody::run_tls_fingerprint_query;
 pub use check_custody::supervise_owned_sealed_check;
 pub use check_custody::{
     assert_check_admission, assert_check_producer_registration, begin_check_shutdown,
-    pause_check_producers, settle_check_cleanup, shutdown_checks_for_exit, with_check_admission,
-    with_check_producer_registration, AdmissionPause, CheckProducerView, ValidationLifecycleError,
+    pause_check_producers, pause_idle_check_producers, settle_check_cleanup,
+    shutdown_checks_for_exit, with_check_admission, with_check_producer_registration,
+    AdmissionPause, CheckProducerView, ValidationLifecycleError,
 };
 
 /// 单次 `sing-box check` 的超时。
@@ -377,10 +378,10 @@ fn match_array_segment(s: &str) -> Option<KernelRejection> {
 ///
 /// `stdin` 置 null：`check` 不读标准输入，不置 null 会在无终端的 GUI 进程树里挂住。
 pub async fn run_config_check(
-    binary: &Path,
+    execution: crate::admitted_payload::PreparedExecution,
     config_path: &Path,
 ) -> Result<ConfigCheckVerdict, ValidationLifecycleError> {
-    run_config_check_within(binary, config_path, CONFIG_CHECK_TIMEOUT).await
+    run_config_check_within(execution, config_path, CONFIG_CHECK_TIMEOUT).await
 }
 
 /// [`run_config_check`] 的可注入超时版本 —— **只为让超时腿可测**。
@@ -388,12 +389,12 @@ pub async fn run_config_check(
 /// 生产恒走 [`CONFIG_CHECK_TIMEOUT`]；测试传 100ms 配上探针的 400ms 睡眠，就能在毫秒级里
 /// 既验判决、又验「超时之后子进程真的被杀掉」。没有这个参数的话，唯一的测法是让测试真等 5 秒。
 pub async fn run_config_check_within(
-    binary: &Path,
+    execution: crate::admitted_payload::PreparedExecution,
     config_path: &Path,
     timeout: Duration,
 ) -> Result<ConfigCheckVerdict, ValidationLifecycleError> {
     Ok(decide_verdict(
-        run_check_raw(binary, config_path, timeout).await?,
+        run_check_raw(execution, config_path, timeout).await?,
     ))
 }
 
@@ -404,11 +405,11 @@ pub async fn run_config_check_within(
 /// 历史 kill_on_drop 只能提出关闭请求，不能替代持久 custody 和原生 wait。
 /// 私有配置副本只保护输入文件寿命，不隔离配置引用的持久状态或平台资源。
 pub async fn run_check_raw(
-    binary: &Path,
+    execution: crate::admitted_payload::PreparedExecution,
     config_path: &Path,
     timeout: Duration,
 ) -> Result<RawCheck, ValidationLifecycleError> {
-    check_custody::run_native_check(binary, config_path, timeout).await
+    check_custody::run_native_check(execution, config_path, timeout).await
 }
 
 /// [`run_check_raw`] 的产物 —— 把「子进程跑成什么样」从 tokio 类型里剥出来。

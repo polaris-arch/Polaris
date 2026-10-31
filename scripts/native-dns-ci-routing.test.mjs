@@ -412,10 +412,10 @@ test('actual helper bytes and isolated candidate identity are frozen before the 
   assert.ok(identity.includes('--directory="$POLARIS_CORE_CARRIER_DIR"'));
   assert.ok(identity.includes('cp "target/debug/$helper" "$POLARIS_CORE_CARRIER_DIR/$helper"'));
   assert.ok(identity.includes('cp target/debug/polaris-cleaner.exe "$POLARIS_CORE_CARRIER_DIR/polaris-cleaner.exe"'));
-  assert.ok(identity.indexOf('codesign --verify --strict') < identity.indexOf('node scripts/prepare-core-identity.mjs'));
+  assert.ok(identity.indexOf('codesign --verify --strict') < identity.indexOf('node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM"'));
   assert.ok(nodeScript('Activate admitted native DNS test inputs for the actual host').includes("temporaryDefault ? 'resources' : 'resources/.native-dns-app'"));
   assert.ok(identity.indexOf('export POLARIS_BUILD_ID=') < identity.indexOf('cargo build --locked'));
-  assert.ok(identity.indexOf('node scripts/prepare-core-identity.mjs') < identity.indexOf('appendFileSync(process.env.GITHUB_ENV'));
+  assert.ok(identity.indexOf('node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM"') < identity.indexOf('appendFileSync(process.env.GITHUB_ENV'));
   assert.ok(workflow.indexOf('id: native_dns_identity') < workflow.indexOf('id: workspace_build'));
   assert.ok(workflow.indexOf('id: native_dns_before') < workflow.indexOf('id: workspace_build'));
   assert.ok(workflow.indexOf('id: native_dns_after') > workflow.indexOf('id: native_dns_app_runtime'));
@@ -1104,4 +1104,31 @@ test('reusable caller defaults preserve full CI, explicit modes fail closed acro
     assert.ok(workflow.includes(before));
     assert.throws(() => reusableLoopbackModeContract(workflow.replaceAll(before, after)));
   }
+});
+
+
+test('C05 native producer anchor and actual fixture consumers follow helper build and full pin', () => {
+  const identity = step('Build actual candidate helper bytes and freeze the separate App identity');
+  const helper = identity.indexOf('cargo build --locked -p polaris-helper --bin polaris-helper');
+  const anchor = identity.indexOf('--mode=maintenance-anchor');
+  const cleaner = identity.indexOf('cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner');
+  const pin = identity.indexOf('node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM"');
+  assert.ok(helper >= 0 && helper < anchor && anchor < cleaner && cleaner < pin);
+  const consumer = workflow.indexOf('      - name: Windows installer cleanup fixtures (native Rust producer)');
+  assert.ok(consumer > workflow.indexOf('id: workspace_tests'));
+  const native = step('Windows installer cleanup fixtures (native Rust producer)');
+  assert.ok(native.indexOf('--mode=verify') < native.indexOf('cargo test --locked -p polaris-windows-cleaner'));
+  assert.ok(native.indexOf('cargo test --locked -p polaris-windows-cleaner') < native.indexOf('node --test scripts/nsis-core-sweep.test.mjs'));
+  assert.ok(native.includes('POLARIS_C05_NATIVE_LOG='));
+  assert.ok(!native.includes('continue-on-error'));
+});
+
+
+test('external policy matrix never adds signature input to normal native transaction fixtures', () => {
+  const native=step('Windows installer cleanup fixtures (native Rust producer)');
+  assert.ok(!native.includes('windows-c05-policy-compatibility'));
+  assert.ok(!native.includes('SIGNED_INERT'));
+  const external=step('Windows PowerShell policy compatibility (separate external gate)');
+  assert.ok(external.includes('POLARIS_C05_POLICY_VALIDATION'));
+  assert.ok(external.includes('node --test scripts/windows-c05-policy-compatibility.test.mjs'));
 });

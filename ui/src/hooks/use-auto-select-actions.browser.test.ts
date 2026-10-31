@@ -31,6 +31,7 @@ import { useAppStore } from '/src/store/app-store';
 import { configReadGeneration } from '/src/lib/config-read-generation';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { api } from '/src/ipc';
+import { applyFakeIpTunEntry } from '/src/components/screens/home/fakeip-tun-entry';
 import { IPC_CHANNELS as C } from '/src/domain/ipc-channels';
 import { setToastImpl } from '/src/lib/error-handler';
 import i18n, { i18nReady } from '/src/i18n';
@@ -48,9 +49,9 @@ let id=0;const handlers=new Map(),listeners=[];
 let proxyState={running:false,starting:false};
 const ipSnapshot={direct:{ip:'198.51.100.1'},proxy:{ip:'203.0.113.1'}};
 const jobs=[],readJobs=[];let app;
-const f=window.__actions={calls:[],reads:0,jobs,readJobs,messages:[],readFail:false,hold:false,
+const f=window.__actions={calls:[],proxyCalls:[],reads:0,jobs,readJobs,messages:[],readFail:false,hold:false,
  state:()=>structuredClone(useAppStore.getState().config),saved:()=>structuredClone(disk),
- cleanReads:0,statusReads:0,ipReads:0,liveReads:0,liveJobs:[],ipJobs:[],patchJobs:[],hides:[],notifications:[],focusEvents:0,
+ cleanReads:0,statusReads:0,ipReads:0,liveReads:0,liveJobs:[],ipJobs:[],patchJobs:[],takeoverJobs:[],hides:[],notifications:[],focusEvents:0,
  configListeners:()=>listeners.filter(l=>l.event===C.EVENT_CONFIG_CHANGED).length,
  nativeConfigSignal(){for(const l of [...listeners])if(l.event===C.EVENT_CONFIG_CHANGED)handlers.get(l.handler)?.({payload:{}});},
  setProxy(value){proxyState={...proxyState,...value};},
@@ -69,6 +70,9 @@ const f=window.__actions={calls:[],reads:0,jobs,readJobs,messages:[],readFail:fa
   queueMicrotask(()=>{f.newGeneration=advance?configReadGeneration.beginRead():configReadGeneration.current();resolve();});
  });});},
  finishPatch(index=0){const job=f.patchJobs[index];disk={...disk,...job.patch};job.resolve({success:true,data:structuredClone(disk)});},
+ // Dedicated takeover writes edit the latest saved config and broadcast it,
+ // matching config_set_takeover's {config,corrected} response contract.
+ finishTakeover(index=0){const job=f.takeoverJobs[index];const result=applyFakeIpTunEntry({...disk,proxyModeType:job.mode});disk=result.config;f.nativeConfigSignal();job.resolve({success:true,data:{config:structuredClone(disk),corrected:result.corrected}});},
  proxySignal(running){proxyState={running,starting:false};for(const l of [...listeners])if(l.event===(running?C.EVENT_PROXY_STARTED:C.EVENT_PROXY_STOPPED))handlers.get(l.handler)?.({payload:{}});},
  stageOnly(){useStagedConfigStore.setState({enabled:true});useStagedConfigStore.getState().stage({id:'server:staged-only',kind:'server',label:'Local draft',entityPath:['servers','staged-only'],nextValue:{id:'staged-only',name:'Local draft',protocol:'socks',address:'draft.invalid',port:1}});},
  staged:()=>useStagedConfigStore.getState().entries,
@@ -101,10 +105,13 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:surface==='tray'?'tra
   if(cmd==='plugin:event|listen'){const key=++id;listeners.push({id:key,event:args.event,handler:args.handler});return Promise.resolve(key);}
   if(cmd==='plugin:event|unlisten'){const at=listeners.findIndex(l=>l.id===args.eventId);if(at>=0)listeners.splice(at,1);return Promise.resolve();}
   if([C.AUTO_SELECT_ENABLE,C.AUTO_SELECT_DISABLE,C.AUTO_SELECT_SWITCH_NOW,C.SERVER_SWITCH].includes(cmd)){f.calls.push({cmd,args});return new Promise(resolve=>{jobs.push({cmd,args,resolve});if(!f.hold)f.finish(jobs.length-1);});}
+  if(cmd===C.PROXY_START||cmd===C.PROXY_STOP){f.proxyCalls.push(cmd);if(params.has('proxyError'))return Promise.resolve({success:false,error:'synthetic private diagnostic: HELPER_RUNTIME_RESTART_REQUIRED 请重启 /private/fixture-only',code:params.get('proxyError')||undefined});}
   if(cmd===C.TRAY_HIDE){f.hides.push(args);return Promise.resolve({success:true,data:null});}
   if(cmd==='plugin:notification|is_permission_granted')return Promise.resolve(true);
   if(cmd==='plugin:notification|notify'){f.notifications.push(args);return Promise.resolve();}
   if(cmd===C.CONFIG_PATCH)return new Promise(resolve=>{f.patchJobs.push({patch:args.patch,resolve});if(!f.holdPatch)f.finishPatch(f.patchJobs.length-1);});
+  if(cmd===C.CONFIG_SET_TAKEOVER)return new Promise(resolve=>{f.takeoverJobs.push({mode:args.mode,resolve});if(!f.holdTakeover)f.finishTakeover(f.takeoverJobs.length-1);});
+  if(cmd===C.SERVER_IDENTITY_CONFLICTS)return Promise.resolve({success:true,data:{version:'fixture-config-version',groups:[]}});
   if(cmd===C.CONFIG_GET){f.reads++;if(f.delayNextRead){f.delayNextRead=false;const captured=structuredClone(disk);return new Promise(resolve=>{const release=()=>resolve({success:true,data:captured});f.releaseRead=release;readJobs.push({captured,release});});}return f.readFail?Promise.reject(Error('saved readback failed')):Promise.resolve({success:true,data:structuredClone(disk)});}
   if(cmd===C.AUTO_SELECT_STATUS)return Promise.resolve({success:true,data:structuredClone(status)});
   if(cmd===C.PROXY_GET_STATUS){f.statusReads++;return Promise.resolve({success:true,data:structuredClone(proxyState)});}
@@ -122,7 +129,7 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:surface==='tray'?'tra
 if(surface==='tray'){${trayBlurDismissScript}}
 window.addEventListener('focus',()=>f.focusEvents++);
 window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener(event,key){const at=listeners.findIndex(l=>l.id===key);if(at>=0)listeners.splice(at,1);}};
-setToastImpl({success:text=>f.messages.push(['success',text]),info:text=>f.messages.push(['info',text]),warning:text=>f.messages.push(['warning',text]),error:text=>f.messages.push(['error',text])});
+setToastImpl({success:text=>f.messages.push(['success',text]),info:text=>f.messages.push(['info',text]),warning:text=>f.messages.push(['warning',text]),error:(text,description)=>f.messages.push(['error',text,...(description===undefined?[]:[description])])});
 api.config.meshRouteReport=async()=>null;
 useStagedConfigStore.setState({enabled:false,hydrated:surface!=='tray',entries:[],baseline:surface==='tray'?null:disk});
 useAppStore.setState({config:structuredClone(disk),servers:disk.servers,selectedServerId:disk.selectedServerId,proxyStatus:{running:false,starting:false},invalidNodes:[]});
@@ -143,6 +150,10 @@ async function open(surface: typeof surfaces[number], auto = false) {
   if(surface==='desktop-home')await page.locator('#node-trigger').click();
   if(surface==='mobile-home')await page.locator('[data-write-control="switch-node"], [data-home-action="switch-node"]').first().click();
   if(surface==='tray')await page.getByText('全部节点',{exact:true}).click();
+  // Stopped Auto has no confirmed actual node, so nodes screens may correctly
+  // start on All. Navigate to the real subscription tab before group actions.
+  if(surface==='desktop-nodes')await page.locator('[data-act="sub-tab"][data-v="sub-a"]').click();
+  if(surface==='mobile-nodes')await page.locator('.mn-seg').filter({has:page.getByText('Subscription A',{exact:true})}).click();
   if(!await controls(page).count() && ['desktop-home','mobile-home','tray'].includes(surface)) {
     const group=page.getByText('Subscription A',{exact:true});if(await group.count())await group.first().click();
   }
@@ -158,6 +169,33 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
   browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH});
  },30000);
  afterAll(async()=>{await browser?.close();await server?.close();});
+ for (const [code, expected] of [
+  ['HELPER_RUNTIME_RESTART_REQUIRED', '本次切换到本地运行需要重启 Polaris。请正常退出并重新打开应用，再尝试本地运行。'],
+  ['STARTUP_FAILED', 'sing-box 启动失败，请检查服务器配置'],
+  ['FUTURE_UNKNOWN_ERROR', 'sing-box 启动失败，请检查服务器配置'],
+  ['', 'sing-box 启动失败，请检查服务器配置'],
+ ] as const) {
+  it(`desktop-home helper restart projection: ${code || 'missing code'}`, async () => {
+   const page = await browser.newPage({ viewport: { width: 1100, height: 844 } });
+   try {
+    await page.goto(`${origin}/__actions?surface=desktop-home&proxyError=${code}`);
+    await page.locator('#connect-btn').click();
+    await expect.poll(() => page.evaluate(() => (window as any).__actions.messages)).toEqual([
+     ['error', '连接失败', expected],
+    ]);
+    const observed = await page.evaluate(() => { const f = (window as any).__actions;
+     return { proxyCalls: f.proxyCalls, writes: f.calls, notifications: f.notifications, messages: f.messages }; });
+    expect(observed.proxyCalls).toEqual(['proxy_start']);
+    expect(observed.writes).toEqual([]);
+    expect(observed.notifications).toEqual([]);
+    expect(JSON.stringify(observed.messages)).not.toContain('synthetic private diagnostic');
+    expect(JSON.stringify(observed.messages)).not.toContain('/private/fixture-only');
+    // The existing error button remains a start/retry; this projection performs no relaunch/reset/stop.
+    expect(await page.locator('#connect-btn').isEnabled()).toBe(true);
+    expect(await page.locator('#connect-btn').getAttribute('class')).toContain('err');
+   } finally { await page.close(); }
+  });
+ }
  for(const surface of surfaces){
   it(`${surface}: Auto choice preserves real nodes and has no separate mode switch`,async()=>{
     const page=await open(surface);try{
@@ -368,18 +406,74 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
  for(const [dismiss,reopen] of [[false,false],[true,false],[true,true]] as const)it(`warm tray FakeIP correction feedback owns its interaction, dismiss=${dismiss} reopen=${reopen}`,async()=>{
   const page=await open('tray');try{
    await page.locator('.tray-back').click();
-   await page.evaluate(()=>{const f=(window as any).__actions;f.holdPatch=true;f.changeDisk({desktopNotifications:true,dnsConfig:{enableFakeIp:false,fakeIpTunAutoEnable:true}});f.nativeConfigSignal();});
+   await page.evaluate(()=>{const f=(window as any).__actions;f.holdTakeover=true;f.changeDisk({desktopNotifications:true,dnsConfig:{enableFakeIp:false,fakeIpTunAutoEnable:true}});f.nativeConfigSignal();});
    await expect.poll(async()=>(await state(page)).config.desktopNotifications).toBe(true);
    await page.getByRole('button',{name:'TUN 模式',exact:true}).click();
-   await expect.poll(()=>page.evaluate(()=>(window as any).__actions.patchJobs.length)).toBe(1);
-   await page.evaluate(async({dismiss,reopen})=>{const f=(window as any).__actions;if(dismiss)window.dispatchEvent(new Event('blur'));if(reopen)(window as any).__actions.nativeShow();await f.checkpoint();f.finishPatch();await f.checkpoint();},{dismiss,reopen});
+   await expect.poll(()=>page.evaluate(()=>(window as any).__actions.takeoverJobs.length)).toBe(1);
+   expect(await page.evaluate(()=>(window as any).__actions.takeoverJobs.map((job:any)=>job.mode))).toEqual(['tun']);
+   await page.evaluate(async({dismiss,reopen})=>{const f=(window as any).__actions;if(dismiss)window.dispatchEvent(new Event('blur'));if(reopen)(window as any).__actions.nativeShow();await f.checkpoint();f.finishTakeover();await f.checkpoint();},{dismiss,reopen});
    await expect.poll(async()=>(await state(page)).config.dnsConfig.enableFakeIp).toBe(true);
    expect(await page.locator('.tray-note').count()).toBe(dismiss?0:1);
    expect(await page.evaluate(()=>(window as any).__actions.notifications.length)).toBe(dismiss?0:1);
    expect(await page.evaluate(()=>(window as any).__actions.hides)).toEqual(dismiss?[{reason:'blur'}]:[]);
-   expect(await page.evaluate(()=>(window as any).__actions.patchJobs.length)).toBe(1);
+   expect(await page.evaluate(()=>(window as any).__actions.takeoverJobs.length)).toBe(1);
   }finally{await page.close();}
  });
+
+ // Exercise visible interactions, not the state representation used to retain
+ // group choices. Config publications must preserve both open and closed groups.
+ for(const surface of ['mobile-home','tray'] as const) {
+  const groupHeader=(page:Page,label:string)=>page.locator(surface==='tray'?'.tray-group-h':'[data-group-id]')
+    .filter({has:page.getByText(label,{exact:true})});
+  it(`${surface}: group choices survive config refresh and seed newly arriving groups`,async()=>{
+   const page=await open(surface);try{
+    const a=groupHeader(page,'Subscription A'),b=groupHeader(page,'Subscription B');
+    await a.click();await b.click();
+    for(const selectedServerId of ['node-b','node-a']) {
+     await page.evaluate(async selectedServerId=>{const f=(window as any).__actions;f.publish({selectedServerId});await f.checkpoint();},selectedServerId);
+     expect(await a.getAttribute('aria-expanded')).toBe('false');
+     expect(await b.getAttribute('aria-expanded')).toBe('true');
+     expect(await controls(page).count()).toBe(0);
+    }
+    await page.evaluate(async()=>{const f=(window as any).__actions,saved=f.saved();
+     f.publish({selectedServerId:'node-c',servers:[...saved.servers,{id:'node-c',name:'Fixture c',protocol:'socks',address:'fixture.invalid',port:1,subscriptionId:'sub-c'}],
+      subscriptions:[...saved.subscriptions,{id:'sub-c',name:'Subscription C',url:'https://fixture.invalid'}]});await f.checkpoint();
+    });
+    expect(await a.getAttribute('aria-expanded')).toBe('false');
+    expect(await b.getAttribute('aria-expanded')).toBe('true');
+    await expect.poll(()=>groupHeader(page,'Subscription C').getAttribute('aria-expanded')).toBe('true');
+    expect(await page.locator('[data-auto-select-controls][data-auto-select-subscription="sub-c"]').count()).toBe(1);
+    expect((await state(page)).calls).toHaveLength(0);
+   }finally{await page.close();}
+  });
+  it(`${surface}: a new picker opening restores current group defaults`,async()=>{
+   const page=await open(surface);try{
+    const a=groupHeader(page,'Subscription A'),b=groupHeader(page,'Subscription B');
+    await a.click();await b.click();
+    const reopen=async()=>{
+     if(surface==='tray') {
+      await page.evaluate(async()=>{const f=(window as any).__actions;window.dispatchEvent(new Event('blur'));await f.checkpoint();f.nativeShow();await f.checkpoint();});
+      await expect.poll(()=>page.locator('.tray-back').count()).toBe(0);
+      await page.getByText('全部节点',{exact:true}).click();
+     } else {
+      await page.locator('.h-sheethead').getByRole('button',{name:'关闭',exact:true}).click();
+      expect(await page.locator('.h-picklist').count()).toBe(0);
+      await page.locator('[data-write-control="switch-node"], [data-home-action="switch-node"]').first().click();
+     }
+    };
+    await reopen();
+    await expect.poll(()=>a.getAttribute('aria-expanded')).toBe('true');
+    expect(await b.getAttribute('aria-expanded')).toBe('false');
+    // A later opening uses current saved truth, not the first opening's seed.
+    await page.evaluate(async()=>{const f=(window as any).__actions;f.publish({selectedServerId:'node-b'});await f.checkpoint();});
+    await reopen();
+    await expect.poll(()=>b.getAttribute('aria-expanded')).toBe('true');
+    expect(await a.getAttribute('aria-expanded')).toBe('false');
+    expect((await state(page)).calls).toHaveLength(0);
+    if(surface==='tray')expect(await page.evaluate(()=>(window as any).__actions.hides)).toEqual([{reason:'blur'},{reason:'blur'}]);
+   }finally{await page.close();}
+  });
+ }
 
  for(const receipt of ['pending','applied'] as const)for(const advance of [false,true])it(`tray accepted ${receipt} selection checks its new publication generation, interleave=${advance}`,async()=>{
   const page=await open('tray');try{

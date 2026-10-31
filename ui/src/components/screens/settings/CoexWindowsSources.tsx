@@ -37,6 +37,29 @@ function Source<T>({ id, label, value, show, t }: { id: string; label: string; v
     </>}
   </details>;
 }
+/** Both snapshot schemas explicitly leave these five context fields Unknown. */
+export function CoexUnconfirmedContext({ snapshot, t }: {
+  snapshot: Pick<CoexWindowsSnapshot, 'classification' | 'context'>;
+  t: Text;
+}) {
+  return (
+    <div className="card-sub" data-coex-unconfirmed>
+      <span>{t('settings.coex.unconfirmedSummary')}</span>
+      <details onToggle={revealOnToggle}>
+        <summary>{t('settings.coex.reason')}</summary>
+        {([
+          [t('settings.coex.classification'), snapshot.classification],
+          [t('settings.coex.phase'), snapshot.context.observationPhase],
+          [t('settings.coex.ownInterfaces'), snapshot.context.ownInterfaces],
+          [t('settings.coex.criteria'), snapshot.context.criteria],
+          [t('settings.coex.history'), snapshot.context.repairHistory],
+        ] as const).map(([label, value]) => <div key={label}>
+          <b>{label}: </b>{t('settings.coex.unknown')} · <span className="mono">{value.reason}</span>
+        </div>)}
+      </details>
+    </div>
+  );
+}
 export function CoexWindowsSources({ snapshot, t }: { snapshot: CoexWindowsSnapshot; t: Text }) {
   const text = (v: string | number) => <span className="mono">{v}</span>;
   const ref = (v: WindowsReference) => <>
@@ -57,8 +80,7 @@ export function CoexWindowsSources({ snapshot, t }: { snapshot: CoexWindowsSnaps
     <Field label={t('settings.coex.observation')} value={snapshot.observation} t={t} show={(v) => <>{t('settings.coex.elapsed')}: {v.elapsedMillis} · {t('settings.coex.atomic')}: {t('settings.coex.false')}</>} />
     <Field label={t('settings.coex.cleanup')} value={snapshot.commandCleanup} t={t} show={() => null} />
     <Field label={t('settings.coex.interfaces')} value={snapshot.objects} t={t} show={() => null} />
-    <Field label={t('settings.coex.classification')} value={snapshot.classification} t={t} show={() => null} />
-    {Object.entries(snapshot.context).map(([key, value]) => <Field key={key} label={t(`settings.coex.${({ observationPhase: 'phase', ownInterfaces: 'ownInterfaces', criteria: 'criteria', repairHistory: 'history' })[key as keyof typeof snapshot.context]}`)} value={value} t={t} show={() => null} />)}
+    <CoexUnconfirmedContext snapshot={snapshot} t={t} />
     <Source id="adapters" label={t('settings.coex.adaptersSource')} value={snapshot.sources.adapters} t={t} show={(v) => <>{ref(v.interface)}<Field label={t('settings.coex.ifType')} value={v.ifType} show={text} t={t} /><Field label={t('settings.coex.description')} value={v.description} show={text} t={t} /></>} />
     <Source id="addresses" label={t('settings.coex.addressesSource')} value={snapshot.sources.addresses} t={t} show={(v) => <>{ref(v.interface)}<div className="mono">{v.family} · {v.address}</div><Field label={t('settings.coex.prefixLength')} value={v.prefixLen} show={text} t={t} /><Field label={t('settings.coex.scopeId')} value={v.scopeId} show={text} t={t} /></>} />
     <Source id="routes4" label={t('settings.coex.routes4Source')} value={snapshot.sources.routes4} t={t} show={route} />

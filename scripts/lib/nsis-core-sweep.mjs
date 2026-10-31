@@ -1,247 +1,117 @@
-// NSIS 钩子「结束本安装目录内的内核进程」：脚本真值、等价实现与静态判据。
-//
-// 守的是四件事，任何一件坏掉在构建期与安装器产物里都**看不出来**（NSIS 宏体是纯文本展开，
-// 写进去的 PowerShell 更是到用户机器上才第一次被解释）：
-//
-//   1. 判据是**完整映像路径**，不是进程名 —— 用户可能自己另跑着一份 sing-box；
-//   2. 顺序是「主程序先退出 → 再结束内核 → 最后才动文件」—— 主程序还活着时结束内核，
-//      崩溃自恢复会把它重新拉起来，等于没结束；
-//   3. 安装与卸载两条腿都接了 —— 只接一条时另一条照旧留半截；
-//   4. 钩子里实际写出去的 PowerShell 与本文件持有的那一份**逐字相同** —— 样例表断言的是本文件的
-//      等价实现，两边不同源的话样例全绿也说明不了钩子。
-//
-// 同源的做法：PowerShell 脚本的唯一真值是下面的 `NSIS_SWEEP_PS_LINES`；`nsis-hooks.nsh` 里那串
-// `FileWrite` 必须与 `renderNsisFileWrites()` 的输出逐行相同。路径判据另有一份 JS 等价实现
-// （`sweepRootOf` / `isInstalledCore`），算子与 PowerShell 侧逐一对应（`NSIS_SWEEP_OPERATORS`），
-// 由 `nsis-core-sweep.test.mjs` 的样例表驱动；同一张表在 Windows 上还会喂给钩子文本本身真执行。
-//
-// 由 `verify-packaging.mjs confs` 对真文件调用；`nsis-core-sweep.test.mjs` 拿真文件做绿基线、
-// 逐条变异做反向对照。
-
+// Native producer contract for both NSIS PRE consumers. JS is the offline
+// path oracle; actual Windows predicates/handles execute in the Rust fixture.
 import { win32 } from 'node:path';
-
-export const NSIS_APP_CHECK =
-  '!insertmacro CheckIfAppIsRunning "$INSTDIR\\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"';
+export const NSIS_APP_CHECK = '!insertmacro CheckIfAppIsRunning "$INSTDIR\\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"';
 export const NSIS_SWEEP_MACRO = 'PolarisStopInstalledCores';
 export const NSIS_SWEEP_CALL = `!insertmacro ${NSIS_SWEEP_MACRO}`;
-
-/** 两条必须先结束内核再动文件的钩子。 */
 export const NSIS_SWEEP_HOOKS = ['NSIS_HOOK_PREINSTALL', 'NSIS_HOOK_PREUNINSTALL'];
-
-/**
- * 内核在安装目录下只可能运行于这两个相对位置（真值：`runtime/proxy/core_binary.rs` 的候选表在
- * Windows 上落到 `<exe 目录>\_up_\resources\win\` 与 `<exe 目录>\resources\win\`）。
- * 判据是「前缀 = 安装目录」**且**「余下部分恰为其中之一」：只用前缀的话，用户把应用装进一个公共
- * 父目录（如直接装到 `D:\Tools`）时，同目录下别的软件自带的 sing-box 也会落进射程。
- */
 export const NSIS_SWEEP_TAILS = ['_up_\\resources\\win\\sing-box.exe', 'resources\\win\\sing-box.exe'];
-
-/**
- * 钩子在目标机器上写出并执行的 PowerShell 脚本，一行一项（真值；不含行尾）。
- *
- * 约束：只能是可打印 ASCII（NSIS 的 `FileWrite` 按 ANSI 代码页落盘，非 ASCII 会随机器代码页变形），
- * 不能含反引号（NSIS 侧用反引号做字符串定界），渲染后单行不超过 NSIS 的 1024 字符串上限。
- * 前三个函数是纯路径判据，不碰进程；测试靠「第一行 `try {` 之前」切出它们单独执行。
- */
-export const NSIS_SWEEP_PS_LINES = [
-  String.raw`$ErrorActionPreference = 'Stop'`,
-  String.raw`$sep = '\'`,
-  String.raw`$ext = '\\?\'`,
-  `$tails = @(${NSIS_SWEEP_TAILS.map((tail) => `'${tail}'`).join(', ')})`,
-  String.raw`function PolarisFullPath([string]$p) {`,
-  String.raw`  if ($p.StartsWith($ext + 'UNC' + $sep, [System.StringComparison]::OrdinalIgnoreCase)) { $p = $sep + $sep + $p.Substring(8) } elseif ($p.StartsWith($ext, [System.StringComparison]::Ordinal)) { $p = $p.Substring(4) }`,
-  String.raw`  return [System.IO.Path]::GetFullPath($p)`,
-  String.raw`}`,
-  String.raw`function PolarisSweepRoot([string]$dir) {`,
-  String.raw`  $full = (PolarisFullPath $dir).TrimEnd($sep)`,
-  String.raw`  if ($full -eq [System.IO.Path]::GetPathRoot($full + $sep).TrimEnd($sep)) { return $null }`,
-  String.raw`  return $full + $sep`,
-  String.raw`}`,
-  String.raw`function PolarisIsInstalledCore([string]$root, [string]$image) {`,
-  String.raw`  $full = PolarisFullPath $image`,
-  String.raw`  if (-not $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }`,
-  String.raw`  $tail = $full.Substring($root.Length)`,
-  String.raw`  foreach ($t in $tails) { if ([string]::Equals($tail, $t, [System.StringComparison]::OrdinalIgnoreCase)) { return $true } }`,
-  String.raw`  return $false`,
-  String.raw`}`,
-  String.raw`try {`,
-  String.raw`  Add-Type -TypeDefinition @'`,
-  String.raw`using System;`,
-  String.raw`using System.Text;`,
-  String.raw`using System.ComponentModel;`,
-  String.raw`using System.Runtime.InteropServices;`,
-  String.raw`using Microsoft.Win32.SafeHandles;`,
-  String.raw`public sealed class PolarisOwnedProcess : IDisposable {`,
-  String.raw`  readonly SafeProcessHandle handle;`,
-  String.raw`  [DllImport("kernel32.dll", SetLastError=true)] static extern SafeProcessHandle OpenProcess(uint access, bool inherit, int pid);`,
-  String.raw`  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessTimes(SafeProcessHandle h, out long created, out long exited, out long kernel, out long user);`,
-  String.raw`  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool QueryFullProcessImageName(SafeProcessHandle h, uint flags, StringBuilder path, ref uint size);`,
-  String.raw`  [DllImport("kernel32.dll", EntryPoint="TerminateProcess", SetLastError=true)] static extern bool StopOwned(SafeProcessHandle h, uint code);`,
-  String.raw`  [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(SafeProcessHandle h, uint ms);`,
-  String.raw`  public PolarisOwnedProcess(int pid) {`,
-  String.raw`    handle = OpenProcess(0x00101001, false, pid);`,
-  String.raw`    if (handle.IsInvalid) { handle.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }`,
-  String.raw`  }`,
-  String.raw`  public IntPtr Handle { get { return handle.DangerousGetHandle(); } }`,
-  String.raw`  public DateTime StartTime { get { long c,e,k,u; if (!GetProcessTimes(handle,out c,out e,out k,out u)) throw new Win32Exception(Marshal.GetLastWin32Error()); return DateTime.FromFileTimeUtc(c); } }`,
-  String.raw`  public string Image { get { uint size=32768; var path=new StringBuilder((int)size); if (!QueryFullProcessImageName(handle,0,path,ref size)) throw new Win32Exception(Marshal.GetLastWin32Error()); return path.ToString(); } }`,
-  String.raw`  public void Kill() { if (!StopOwned(handle,1)) throw new Win32Exception(Marshal.GetLastWin32Error()); }`,
-  String.raw`  public bool WaitForExit(int ms) { uint r=WaitForSingleObject(handle,(uint)ms); if (r==0) return true; if (r==258) return false; throw new Win32Exception(Marshal.GetLastWin32Error()); }`,
-  String.raw`  public void Dispose() { handle.Dispose(); }`,
-  String.raw`}`,
-  String.raw`'@`,
-  String.raw`  $root = PolarisSweepRoot $env:POLARIS_SWEEP_ROOT`,
-  String.raw`  if (-not $root) { exit 3 }`,
-  String.raw`  $left = 0`,
-  String.raw`  foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'sing-box.exe'")) {`,
-  String.raw`    try {`,
-  String.raw`      if (-not $p.ExecutablePath) { continue }`,
-  String.raw`      if (-not (PolarisIsInstalledCore $root $p.ExecutablePath)) { continue }`,
-  String.raw`    } catch { continue }`,
-  String.raw`    $proc = $null`,
-  String.raw`    try {`,
-  String.raw`      $proc = New-Object PolarisOwnedProcess ([int]$p.ProcessId)`,
-  String.raw`      $null = $proc.Handle`,
-  String.raw`      if (-not (PolarisIsInstalledCore $root $proc.Image)) { continue }`,
-  String.raw`      $born = $proc.StartTime.Ticks`,
-  String.raw`      $listed = $p.CreationDate.ToUniversalTime().Ticks`,
-  String.raw`      if (($born - ($born % 10)) -ne ($listed - ($listed % 10))) { continue }`,
-  String.raw`      $proc.Kill()`,
-  String.raw`      if (-not $proc.WaitForExit(5000)) { $left++ }`,
-  String.raw`    } catch {`,
-  String.raw`      if (Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue) { $left++ }`,
-  String.raw`    } finally { if ($null -ne $proc) { $proc.Dispose() } }`,
-  String.raw`  }`,
-  String.raw`  if ($left -gt 0) { exit 2 }`,
-  String.raw`  exit 0`,
-  String.raw`} catch { exit 1 }`,
+export const NSIS_SWEEP_LINES = [
+  'InitPluginsDir', 'StrCpy $R6 $OUTDIR', 'SetOutPath "$PLUGINSDIR"',
+  'File /oname=polaris-cleaner.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"',
+  'SetOutPath $R6',
+  `nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\\polaris-cleaner.exe" --sweep-installed-cores'`,
 ];
-
-/** 纯路径判据那一段（三个函数与它们用到的常量）：真值里第一行 `try {` 之前的全部行。 */
-export function sweepPredicateLines(psLines = NSIS_SWEEP_PS_LINES) {
-  const main = psLines.indexOf('try {');
-  return main < 0 ? [] : psLines.slice(0, main);
-}
-
-/** 把脚本行渲染成 NSIS 源里的 `FileWrite` 行（`$` 写成 `$$`，行尾 CRLF）。 */
-export function renderNsisFileWrites(psLines = NSIS_SWEEP_PS_LINES) {
-  return psLines.map((line) => `FileWrite $R6 \`${line.replaceAll('$', '$$$$')}$\\r$\\n\``);
-}
-
-/**
- * 路径判据的算子表：每个算子在 PowerShell 真值里必须逐字出现的片段（`ps`），以及 JS 等价实现里
- * 同名的开关（把 `id` 放进 `off` 即关掉该算子）。测试对每个算子断言两件事：片段在钩子文本里；
- * 关掉它之后样例表里至少有一条的结论会变 —— 即 JS 这边确实实现了它，样例也确实盯着它。
- */
 export const NSIS_SWEEP_OPERATORS = [
-  {
-    id: 'strip-extended-prefix',
-    ps: [String.raw`{ $p = $sep + $sep + $p.Substring(8) } elseif ($p.StartsWith($ext, [System.StringComparison]::Ordinal)) { $p = $p.Substring(4) }`],
-    why: String.raw`规范化前先去掉 \\?\ 与 \\?\UNC\ 前缀`,
-  },
-  {
-    id: 'full-path',
-    ps: ['return [System.IO.Path]::GetFullPath($p)'],
-    why: '路径必须规范化（斜杠方向、重复分隔符、. 与 .. 段）',
-  },
-  {
-    id: 'trim-trailing-separators',
-    ps: ['$full = (PolarisFullPath $dir).TrimEnd($sep)'],
-    why: '安装目录尾部的分隔符必须先去掉',
-  },
-  {
-    id: 'separator-after-prefix',
-    ps: ['return $full + $sep'],
-    why: '前缀后必须紧跟一个分隔符（否则 `…\\Polaris` 会匹配到 `…\\Polaris2\\`）',
-  },
-  {
-    id: 'volume-root-skip',
-    ps: ['if ($full -eq [System.IO.Path]::GetPathRoot($full + $sep).TrimEnd($sep)) { return $null }', 'if (-not $root) { exit 3 }'],
-    why: '安装目录是卷根（盘符根或 UNC 共享根）时整条跳过',
-  },
-  {
-    id: 'ignore-case',
-    ps: [
-      'if (-not $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }',
-      '[string]::Equals($tail, $t, [System.StringComparison]::OrdinalIgnoreCase)',
-    ],
-    why: '前缀与余下部分的比较都不分大小写',
-  },
-  {
-    id: 'tail-allowlist',
-    ps: ['$tail = $full.Substring($root.Length)', 'foreach ($t in $tails) { if ([string]::Equals($tail, $t,'],
-    why: '前缀之后余下的部分必须恰为内核的已知相对位置之一',
-  },
-];
-
-/** 脚本真值里除路径判据外还必须逐字出现的片段（进程侧）。 */
-export const NSIS_SWEEP_PS_REQUIRED = [
-  ['$root = PolarisSweepRoot $env:POLARIS_SWEEP_ROOT', '清扫根必须取自环境变量并经判据函数规范化'],
-  ['Get-CimInstance -ClassName Win32_Process', '映像路径必须经 WMI 取（32 位 PowerShell 读不了 64 位进程的模块表）'],
-  [`-Filter "Name = 'sing-box.exe'"`, '枚举面必须限定为映像名 sing-box.exe'],
-  ['if (-not $p.ExecutablePath) { continue }', '取不到映像路径的进程必须跳过'],
-  ['if (-not (PolarisIsInstalledCore $root $p.ExecutablePath)) { continue }', '只结束通过路径判据的进程'],
-  ['$null = $proc.Handle', '结束前必须先持有进程句柄（此后 PID 不会被复用）'],
-  ['if (-not (PolarisIsInstalledCore $root $proc.Image)) { continue }', '实际终止句柄的映像必须再次匹配安装目录'],
-  ['if (($born - ($born % 10)) -ne ($listed - ($listed % 10))) { continue }', 'CIM 只有微秒精度；仅允许同一微秒的出生身份'],
-  ['return DateTime.FromFileTimeUtc(c);', '出生时间必须从被持有的同一个句柄读取'],
-  ['if (!QueryFullProcessImageName(handle,0,path,ref size))', '映像必须从被持有的同一个句柄读取'],
-  ['if (!StopOwned(handle,1))', '终止必须作用于已验证的同一个句柄'],
-  ['$proc.Kill()', '缺结束动作'],
-  ['$proc.WaitForExit(5000)', '结束后必须等进程真的退出（映像占用在退出后才释放）'],
-  ['} catch { exit 1 }', '任何未预料的错误都必须以非零退出码收场，而不是抛给安装器'],
-];
-
-/** 这些片段在脚本真值里的先后顺序不可换（前者必须先于后者）。 */
-const PS_ORDER = [
-  ['PolarisIsInstalledCore $root $p.ExecutablePath', '$proc.Kill()', '路径判据排在结束动作之后'],
-  ['$null = $proc.Handle', '$born = $proc.StartTime.Ticks', '启动时间在取得句柄之前核对（核对与结束之间又留出了 PID 复用窗口）'],
-  ['$born = $proc.StartTime.Ticks', '$proc.Kill()', '启动时间核对排在结束动作之后'],
-  ['PolarisIsInstalledCore $root $proc.Image', '$proc.Kill()', '实际句柄映像核对排在结束动作之后'],
-  ['if (($born - ($born % 10))', '$proc.Kill()', '精确出生身份核对排在结束动作之后'],
-];
-
-/** 宏体里除 `FileWrite` 外必须逐字出现的 NSIS 行（整行相等）。 */
-export const NSIS_SWEEP_REQUIRED = [
-  ['StrCpy $R9 "$INSTDIR"', '清扫根必须取自 $INSTDIR'],
-  [
-    `System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'`,
-    '清扫根必须经环境变量交给脚本（不进脚本文本与命令行）',
-  ],
-  ['FileOpen $R6 "$PLUGINSDIR\\polaris-stop-installed-cores.ps1" w', '脚本必须写进安装器的私有临时目录'],
-  [
-    'nsExec::Exec /TIMEOUT=30000 `"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\\polaris-stop-installed-cores.ps1"`',
-    '执行方式必须是：System32 绝对路径的 PowerShell、无窗口（nsExec）、30 秒上界、不读 profile、不等输入、带 Bypass',
-  ],
-];
-
-/** 按进程名结束、或绕开路径判据的形态。出现在代码面任何位置都算越界。 */
-export const NSIS_SWEEP_FORBIDDEN = [
-  [/taskkill/i, 'taskkill（按映像名或 PID 树结束，无路径判据）'],
-  [/Stop-Process/i, 'Stop-Process（脱离上面那条路径判据的第二个结束口）'],
-  [/nsis_tauri_utils::Kill/i, 'nsis_tauri_utils::KillProcess*（按进程名结束）'],
-  // 不加词边界、不分大小写：`\bTerminate\b` 匹不到 `TerminateProcess` / `NtTerminateProcess`，
-  // 也匹不到 `wmic process … call terminate`。
-  [/terminate/i, 'Terminate / TerminateProcess（第二个结束口）'],
-];
-
-/**
- * 宏体内这些指令的先后顺序不可换（前者的最后一次出现必须先于后者的第一次出现），且两端都必须存在。
- * 顺序错了脚本文本一个字都不差、同源判据照样绿：`FileOpen` 排在 `InitPluginsDir` 之前时
- * `$PLUGINSDIR` 还是空串，脚本落到别处；`nsExec` 排在 `FileClose` 之前时执行的是没写完、仍被
- * 安装器占着的文件。
- */
-export const NSIS_SWEEP_ORDER = [
-  [/^InitPluginsDir$/, /^FileOpen\b/, 'InitPluginsDir 必须先于 FileOpen（否则 $PLUGINSDIR 还没有建立）'],
-  [/^FileOpen\b/, /^FileWrite\b/, 'FileOpen 必须先于全部 FileWrite'],
-  [/^FileWrite\b/, /^FileClose\b/, 'FileClose 必须排在全部 FileWrite 之后'],
-  [/^FileClose\b/, /^nsExec::/, 'FileClose 必须先于 nsExec（否则执行的是没写完、仍被占用的脚本）'],
-];
-
-/** 宏体内出现即意味着「清扫失败会打断安装/卸载」的指令。 */
-const BLOCKING = /^(Abort|Quit|MessageBox)\b/;
-
-// ───────────────────────── 路径判据的 JS 等价实现 ─────────────────────────
+  ['strip-extended-prefix', 'path.starts_with(&ext)'],
+  ['full-path', 'GetFullPathNameW'],
+  ['trim-trailing-separators', 'while full.last() == Some(&92)'],
+  ['separator-after-prefix', 'full.push(92)'],
+  ['volume-root-skip', 'return Ok(None)'],
+  ['ignore-case', 'CompareStringOrdinal'],
+  ['tail-allowlist', 'TAILS.iter()'],
+].map(([id, rust]) => ({ id, rust }));
+export function nsisMacroLines(source,name) {
+  const lines=source.replace(/\r\n/g,'\n').split('\n');
+  const start=lines.findIndex(line=>new RegExp(`^!macro ${name}(?:\\s|$)`).test(line.trim()));
+  if(start<0)return null;
+  const end=lines.slice(start+1).findIndex(line=>line.trim()==='!macroend');
+  return end<0?null:lines.slice(start+1,start+1+end);
+}
+export const nsisCodeLines=lines=>lines.map(line=>line.trim()).filter(line=>line&&!line.startsWith(';')&&!line.startsWith('#'));
+export function nativeSweepViolations(source) {
+  const code=source.replace(/\/\/[^\n]*/g,'').replace(/\/\*[\s\S]*?\*\//g,'');
+  const compact=code.replace(/\s+/g,'');
+  const required=[...NSIS_SWEEP_OPERATORS.map(row=>row.rust),
+    'PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE',
+    'born == observed.birth', 'installed(root, &image)', 'process_image(process.0)',
+    'GetProcessTimes', 'TerminateProcess(process.0, 1)', 'WaitForSingleObject(process.0, 5000)',
+    'CreateToolhelp32Snapshot', 'sing-box.exe', ...NSIS_SWEEP_TAILS];
+  const failures=required.filter(needle=>!compact.includes(needle.replace(/\s+/g,''))).map(needle=>`missing native sweep contract: ${needle}`);
+  const kill=compact.indexOf('TerminateProcess(process.0,1)');
+  for(const before of ['process_image(process.0)','born==observed.birth','installed(root,&image)'])
+    if(compact.indexOf(before)<0||compact.indexOf(before)>kill)failures.push(`identity must precede terminate: ${before}`);
+  if((compact.match(/returnOk\(None\)/g)??[]).length!==2)failures.push('both volume-root branches required');
+  if((compact.match(/CompareStringOrdinal/g)??[]).length!==2)failures.push('native ordinal import/call required');
+  if((compact.match(/process_image\(process\.0\)/g)??[]).length!==2)failures.push('both observed and reopened images required');
+  if((compact.match(/TerminateProcess\(/g)??[]).length!==1)failures.push('exactly one handle termination site required');
+  if(/taskkill|Stop-Process|powershell|EncodedCommand|ShellExecuteExW|DeleteService|GetProcessById/.test(code))failures.push('forbidden alternate sweep executor');
+  return failures;
+}
+export function nsisCoreSweepViolations(source) {
+  const failures=[];const macro=nsisMacroLines(source,NSIS_SWEEP_MACRO);
+  if(!macro)return ['missing native sweep macro'];
+  // This fixed canonical macro has no block-comment syntax. Reject both raw
+  // delimiters, even in comments/literals, before line filtering: stripping or
+  // ignoring a prefix could hide an executable opcode on this or a later line.
+  // This constrains macro source only; runtime $INSTDIR data is never scanned.
+  if (macro.some(line => /\/\*|\*\//.test(line)))
+    failures.push('sweep macro source must not contain block-comment delimiters');
+  const body=nsisCodeLines(macro);
+  const at=body.indexOf(NSIS_SWEEP_LINES[0]);
+  if(at<0||NSIS_SWEEP_LINES.some((line,i)=>body[at+i]!==line))failures.push('embedded native sweep block differs');
+  for(const line of ['ReadEnvStr $R9 "POLARIS_SWEEP_ROOT"','Push $R9','StrCpy $R9 "$INSTDIR"',
+    `System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'`,'Pop $R9','${If} $R4 != 0','DetailPrint "$R8 ($R4)"'])
+    if(!body.includes(line))failures.push(`missing sweep handoff: ${line}`);
+  // The caller's R9 and the previous environment value occupy distinct stack
+  // slots. One remaining Push/Pop must not mask deletion of the other.
+  const sameLines = (actual, expected) => actual.length === expected.length
+    && expected.every((line, index) => actual[index] === line);
+  // NSIS command lookup is case-insensitive. Collect every stack instruction,
+  // including all Exch forms, before checking the fixed sequence below; no
+  // exchange or extra Push/Pop may hide between handoff and restore operations.
+  const stack = body.filter(line => /^(Push|Pop|Exch)\b/i.test(line))
+    .map(line => line.replace(/\s*;.*$/, ''));
+  if (!sameLines(stack, ['Push $R4', 'Push $R6', 'Push $R8', 'Push $R9', 'Push $R9',
+    'Pop $R4', 'Pop $R9', 'Pop $R9', 'Pop $R8', 'Pop $R6', 'Pop $R4']))
+    failures.push('sweep must have exactly the caller/environment/result stack operations');
+  const setter = `System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'`;
+  const save = ['ReadEnvStr $R9 "POLARIS_SWEEP_ROOT"', 'Push $R9', 'StrCpy $R9 "$INSTDIR"', setter];
+  const saved = body.indexOf(save[0]), executed = body.indexOf(NSIS_SWEEP_LINES.at(-1));
+  if (!sameLines(body.slice(0, 4), ['Push $R4', 'Push $R6', 'Push $R8', 'Push $R9'])
+      || !sameLines(body.slice(-4), ['Pop $R9', 'Pop $R8', 'Pop $R6', 'Pop $R4']))
+    failures.push('caller registers must be saved and restored in stack order');
+  if (body.filter(line => line === 'Push $R9').length !== 2
+      || body.filter(line => line === 'Pop $R9').length !== 2)
+    failures.push('caller R9 and previous environment need separate balanced stack slots');
+  if (saved < 0 || !sameLines(body.slice(saved, saved + save.length), save)
+      || body.filter(line => line === save[0]).length !== 1
+      || body.filter(line => line === save[2]).length !== 1
+      || saved + save.length > body.indexOf(NSIS_SWEEP_LINES[0]))
+    failures.push('previous environment must be saved before literal path handoff and delivery');
+  if (body.filter(line => line.includes('SetEnvironmentVariable')).length !== 2
+      || body.filter(line => line === setter).length !== 2
+      || executed < 0 || !/^Pop \$R4(?:\s*;.*)?$/.test(body[executed + 1] ?? '')
+      || !sameLines(body.slice(executed + 2, executed + 4), ['Pop $R9', setter])
+      || body[executed + 4] !== '${If} $R4 != 0')
+    failures.push('native result and previous environment must be restored before warning/continuation');
+  const exec=body.filter(line=>/nsExec::|ExecWait|ExecShell/.test(line));
+  if(exec.length!==1||exec[0]!==NSIS_SWEEP_LINES.at(-1))failures.push('sweep must have one exact native executor');
+  for(const line of body){
+    if(line.includes('$INSTDIR')&&line!=='StrCpy $R9 "$INSTDIR"')failures.push('installation path must be literal environment data');
+    if(/powershell|EncodedCommand|ExecutionPolicy|FileWrite|FileOpen|Abort|Quit|MessageBox|--worker|--launch/i.test(line))failures.push('forbidden sweep operation');
+  }
+  const all=nsisCodeLines(source.split('\n'));
+  if(all.some(line=>/taskkill|Stop-Process|nsis_tauri_utils::Kill|TerminateProcess/i.test(line)))failures.push('alternate termination site');
+  for(const name of NSIS_SWEEP_HOOKS){const hook=nsisMacroLines(source,name);if(!hook){failures.push(`missing ${name}`);continue;}
+    const lines=nsisCodeLines(hook),app=lines.indexOf(NSIS_APP_CHECK),sweep=lines.indexOf(NSIS_SWEEP_CALL);
+    if(app<0||sweep<0||app>sweep)failures.push(`${name}: app check must precede native sweep`);
+    if(lines.filter(line=>line===NSIS_SWEEP_CALL).length!==1)failures.push(`${name}: sweep must occur once`);
+    const file=lines.findIndex(line=>/^(RMDir|Delete|File|Rename|CopyFiles)\b/.test(line));
+    if(file>=0&&file<sweep)failures.push(`${name}: files touched before sweep`);
+  }
+  return failures;
+}
 
 const SEP = '\\';
 const NONE = new Set();
@@ -318,148 +188,4 @@ export function sweepVerdict(instdir, image, off = NONE) {
   } catch {
     return 'keep';
   }
-}
-
-// ───────────────────────── 静态判据 ─────────────────────────
-
-const isComment = (line) => /^\s*[;#]/.test(line);
-
-/** 取一个 NSIS 宏的本体行（保留注释行）；缺失或未闭合返回 null。 */
-export function nsisMacroLines(source, name) {
-  const lines = source.split('\n');
-  const start = lines.findIndex((line) => new RegExp(`^!macro ${name}(?:\\s|$)`).test(line.trim()));
-  if (start < 0) return null;
-  const endOffset = lines.slice(start + 1).findIndex((line) => line.trim() === '!macroend');
-  return endOffset < 0 ? null : lines.slice(start + 1, start + 1 + endOffset);
-}
-
-/** 代码面：去掉整行注释与空行，逐行去首尾空白。 */
-export const nsisCodeLines = (lines) => lines.filter((line) => !isComment(line)).map((line) => line.trim()).filter(Boolean);
-const codeOf = nsisCodeLines;
-
-/** 钩子里「动安装目录文件」的指令：出现在清扫之前即顺序错误。 */
-const TOUCHES_FILES = /^(RMDir|Delete|File|Rename|CopyFiles)\b/;
-
-/** 脚本真值自身的约束（与钩子文件无关）。 */
-export function sweepScriptViolations(psLines = NSIS_SWEEP_PS_LINES) {
-  const out = [];
-  const text = psLines.join('\n');
-  psLines.forEach((line, index) => {
-    if (!/^[\x20-\x7e]*$/.test(line)) out.push(`脚本第 ${index + 1} 行含非 ASCII 或控制字符（FileWrite 按 ANSI 代码页落盘）`);
-    if (line.includes('`')) out.push(`脚本第 ${index + 1} 行含反引号（NSIS 侧用它做字符串定界）`);
-    if (/\$[{(]/.test(line)) out.push(`脚本第 ${index + 1} 行含 \${ 或 \$(（渲染进 NSIS 源后会被当成编译期常量或语言串引用）`);
-    if (line.replaceAll('$', '$$$$').length > 900) out.push(`脚本第 ${index + 1} 行渲染后过长（NSIS 字符串上限 1024）`);
-  });
-  for (const operator of NSIS_SWEEP_OPERATORS) {
-    for (const needle of operator.ps) {
-      if (!text.includes(needle)) out.push(`脚本真值：${operator.why} —— 缺 ${JSON.stringify(needle)}`);
-    }
-  }
-  for (const [needle, why] of NSIS_SWEEP_PS_REQUIRED) {
-    if (!text.includes(needle)) out.push(`脚本真值：${why} —— 缺 ${JSON.stringify(needle)}`);
-  }
-  for (const [first, second, why] of PS_ORDER) {
-    const a = psLines.findIndex((line) => line.includes(first));
-    const b = psLines.findIndex((line) => line.includes(second));
-    if (a >= 0 && b >= 0 && a >= b) out.push(`脚本真值：${why}`);
-  }
-  const kills = psLines.filter((line) => /\.Kill\(/.test(line)).length;
-  if (kills !== 1) out.push(`脚本真值：结束动作应恰好 1 处，实为 ${kills} 处`);
-  if (sweepPredicateLines(psLines).some((line) => /Kill|Get-CimInstance|Get-Process|GetProcessById/.test(line))) {
-    out.push('脚本真值：路径判据那一段（第一行 `try {` 之前）不得碰进程 —— 测试会单独执行这一段');
-  }
-  return out;
-}
-
-/**
- * @param {string} rawSource `nsis-hooks.nsh` 全文
- * @param {string[]} psLines 脚本真值（缺省即本文件导出的那一份；测试用它做「两边一起改」的变异）
- * @returns {string[]} 违规清单；空 = 判据成立
- */
-export function nsisCoreSweepViolations(rawSource, psLines = NSIS_SWEEP_PS_LINES) {
-  const source = rawSource.replace(/\r\n/g, '\n');
-  const out = [];
-  const allCode = codeOf(source.split('\n'));
-
-  // ── 取材面自检：剥注释不能把代码剥没。
-  if (!allCode.some((line) => line.startsWith('!macro '))) {
-    return ['取材面为空：代码面里一个 `!macro` 都没有（文件不对，或注释剥离把代码也剥掉了）'];
-  }
-
-  out.push(...sweepScriptViolations(psLines));
-
-  // ── 宏体：写出去的脚本与真值逐行相同，外加 NSIS 侧的交付与执行方式。
-  const macro = nsisMacroLines(source, NSIS_SWEEP_MACRO);
-  if (macro === null) {
-    out.push(`缺宏 ${NSIS_SWEEP_MACRO}（或未闭合）`);
-  } else {
-    const body = codeOf(macro);
-    const written = body.filter((line) => line.startsWith('FileWrite '));
-    const expected = renderNsisFileWrites(psLines);
-    if (written.length !== expected.length) {
-      out.push(`${NSIS_SWEEP_MACRO}：写出的脚本应为 ${expected.length} 行，实为 ${written.length} 行 —— 与脚本真值不一致`);
-    }
-    for (let i = 0; i < Math.min(written.length, expected.length); i += 1) {
-      if (written[i] !== expected[i]) {
-        out.push(
-          `${NSIS_SWEEP_MACRO}：写出的脚本第 ${i + 1} 行与脚本真值不一致 —— 应为 ${JSON.stringify(expected[i])}，实为 ${JSON.stringify(written[i])}`
-        );
-        break;
-      }
-    }
-    for (const [needle, why] of NSIS_SWEEP_REQUIRED) {
-      if (!body.includes(needle)) out.push(`${NSIS_SWEEP_MACRO}：${why} —— 缺 ${JSON.stringify(needle)}`);
-    }
-    // 安装目录只许以「拷进寄存器」这一种形态出现：拼进脚本文本或命令行就把路径里的引号、`$`、
-    // 分号交给了 PowerShell 或命令行解析。
-    const instdirUses = body.filter((line) => line.includes('$INSTDIR'));
-    if (instdirUses.some((line) => line !== 'StrCpy $R9 "$INSTDIR"')) {
-      out.push(`${NSIS_SWEEP_MACRO}：$INSTDIR 只许经 StrCpy 进寄存器再走环境变量，实为 ${JSON.stringify(instdirUses)}`);
-    }
-    const blocking = body.find((line) => BLOCKING.test(line));
-    if (blocking) out.push(`${NSIS_SWEEP_MACRO}：清扫失败不得打断安装/卸载 —— 出现 ${JSON.stringify(blocking)}`);
-    for (const [first, second, why] of NSIS_SWEEP_ORDER) {
-      const lastFirst = body.findLastIndex((line) => first.test(line));
-      const firstSecond = body.findIndex((line) => second.test(line));
-      if (lastFirst < 0 || firstSecond < 0 || lastFirst > firstSecond) out.push(`${NSIS_SWEEP_MACRO}：${why}`);
-    }
-    for (const [pattern, what] of [[/^FileOpen\b/, 'FileOpen'], [/^FileClose\b/, 'FileClose'], [/^nsExec::/, 'nsExec']]) {
-      const count = body.filter((line) => pattern.test(line)).length;
-      if (count !== 1) out.push(`${NSIS_SWEEP_MACRO}：${what} 应恰好 1 处，实为 ${count} 处`);
-    }
-  }
-
-  // ── 全文件代码面：不得有第二个结束口，也不得有按名字结束的形态。
-  const killsEverywhere = allCode.filter((line) => /\.Kill\(/.test(line)).length;
-  if (killsEverywhere > 1) out.push(`代码面里 .Kill( 共 ${killsEverywhere} 处，只允许 ${NSIS_SWEEP_MACRO} 里那 1 处`);
-  for (const [pattern, what] of NSIS_SWEEP_FORBIDDEN) {
-    const hit = allCode.find((line) => pattern.test(line) && !(what.includes('Terminate') && renderNsisFileWrites().includes(line) && line.includes('EntryPoint="TerminateProcess"')));
-    if (hit) out.push(`代码面出现 ${what}：${hit}`);
-  }
-
-  // ── 两条钩子：接线与顺序。
-  for (const hook of NSIS_SWEEP_HOOKS) {
-    const lines = nsisMacroLines(source, hook);
-    if (lines === null) {
-      out.push(`缺 ${hook}（该路径上仍在运行的内核会占住安装目录里的文件）`);
-      continue;
-    }
-    const body = codeOf(lines);
-    const app = body.indexOf(NSIS_APP_CHECK);
-    const sweep = body.indexOf(NSIS_SWEEP_CALL);
-    if (sweep < 0) {
-      out.push(`${hook}：未展开 ${NSIS_SWEEP_MACRO}`);
-      continue;
-    }
-    if (app < 0) {
-      out.push(`${hook}：清扫前必须先逐字展开模板的主程序检查 ${JSON.stringify(NSIS_APP_CHECK)}`);
-    } else if (app > sweep) {
-      out.push(`${hook}：主程序检查排在清扫之后（主程序还活着时结束内核，崩溃自恢复会把它重新拉起来）`);
-    }
-    const firstFileOp = body.findIndex((line) => TOUCHES_FILES.test(line));
-    if (firstFileOp >= 0 && firstFileOp < sweep) {
-      out.push(`${hook}：${JSON.stringify(body[firstFileOp])} 排在清扫之前（动文件时内核还占着它）`);
-    }
-  }
-  return out;
 }

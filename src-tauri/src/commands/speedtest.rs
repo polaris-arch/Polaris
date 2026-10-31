@@ -761,24 +761,25 @@ impl Readback {
     /// `watched` 是本腿的测量连接会经过的入站：别的入站上的连接不进对账。
     fn open(
         mode: ReadbackMode,
-        endpoint: Option<(u16, String)>,
+        endpoint: Option<crate::runtime::proxy::ApiReadbackBinding>,
         context: SpeedBindingContext,
         watched: WatchedInbounds,
     ) -> Self {
         if mode == ReadbackMode::Off {
             return Self::new(mode, Arc::new(NoWitness), context);
         }
-        let witness = StreamWitness::spawn(async move {
-            let (port, secret) = endpoint.ok_or_else(|| "管理端点未就绪".to_string())?;
-            SingBoxApiClient::connection_events_at(
-                Endpoint::new("127.0.0.1", port),
-                secret,
-                witness::CONNECTION_EVENTS_INTERVAL_NS,
-            )
-            .await
-            .map(|frames| witness::record_stream(frames, watched))
-            .map_err(|error| error.to_string())
-        });
+        let epoch = endpoint.as_ref().and_then(|binding| binding.epoch.clone());
+        let witness = StreamWitness::spawn_in_api_epoch(
+            async move {
+                let binding = endpoint.ok_or_else(|| "管理端点未就绪".to_string())?;
+                binding
+                    .open_events(witness::CONNECTION_EVENTS_INTERVAL_NS)
+                    .await
+                    .map(|frames| witness::record_stream(frames, watched))
+                    .map_err(|error| error.to_string())
+            },
+            epoch,
+        );
         Self::new(mode, Arc::new(witness), context)
     }
 
@@ -2089,6 +2090,16 @@ fn requested_server_configs(config: &Value, requested: &[String]) -> Vec<ServerC
         .collect()
 }
 
+/// Bind the saved limit without changing the temporary core's safety ceiling.
+#[cfg(not(target_os = "android"))]
+pub(crate) fn bind_temp_core_concurrency(
+    deps: TempCoreDeps,
+    config: &Value,
+    platform: Platform,
+) -> TempCoreDeps {
+    deps.with_measurement_concurrency(configured_concurrency(config, platform))
+}
+
 /// **临时核测速腿**（主核未运行；对齐 上游 `SpeedTestService.testServersViaProxy`，`:388-620`）。
 ///
 /// 编排：请求集 → typed 节点（保序）→ [`crate::runtime::speedtest::plan_temp_core_with_utls_policy`] 裁掉临时核结构性测不了的（tailscale / naive 缺
@@ -2256,6 +2267,8 @@ async fn run_temp_core_speed_test(
         exclusions,
         temp_core_log_level(config, privacy_mode),
     );
+    #[cfg(not(target_os = "android"))]
+    let deps = bind_temp_core_concurrency(deps, config, Platform::current());
     let deps = deps
         .with_cancel(cancel.clone())
         .with_expected_core_sha256(temp_core_sha256.clone());
@@ -2622,7 +2635,7 @@ pub async fn server_speed_test(
         let open_readback = || {
             Readback::open(
                 BINDING_READBACK,
-                proxy.readback_endpoint(ticket.as_ref()),
+                proxy.readback_binding(ticket.as_ref()),
                 proxy.speed_binding_context(),
                 WatchedInbounds::ProbePool,
             )
@@ -2788,7 +2801,7 @@ pub async fn server_speed_test(
     };
     let readback = Readback::open(
         BINDING_READBACK,
-        proxy.readback_endpoint(ticket.as_ref()),
+        proxy.readback_binding(ticket.as_ref()),
         proxy.speed_binding_context(),
         WatchedInbounds::One(local_proxy.inbound.tag()),
     );
@@ -3327,7 +3340,7 @@ pub(crate) async fn probe_runtime_candidates(
     let run_id = next_speed_test_run_id(&SPEED_TEST_RUN_SEQUENCE).unwrap_or_default();
     let readback = Readback::open(
         BINDING_READBACK,
-        proxy.management_endpoint(),
+        proxy.readback_binding(None),
         proxy.speed_binding_context(),
         WatchedInbounds::ProbePool,
     );
@@ -3793,7 +3806,7 @@ pub(crate) async fn run_scheduled_round(
             .get_or_init(|| {
                 Readback::open(
                     BINDING_READBACK,
-                    proxy.management_endpoint(),
+                    proxy.readback_binding(None),
                     proxy.speed_binding_context(),
                     WatchedInbounds::ProbePool,
                 )
@@ -4568,7 +4581,7 @@ pub(crate) fn spawn_warm_rtt_probe(
     let app = app.clone();
     let proxy = Arc::clone(&app.state::<AppRuntime>().proxy);
     // 读回的取材同样在 await 之前：管理端点与选中节点的 tag 属于开测那一刻的主核。
-    let endpoint = proxy.management_endpoint();
+    let endpoint = proxy.readback_binding(None);
     let binding_context = proxy.speed_binding_context();
     let selected_tag = proxy
         .management_target_for(&active_id)

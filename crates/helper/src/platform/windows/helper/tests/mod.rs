@@ -16,6 +16,7 @@ fn native_fixture() -> TestNativeContext {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let mut files = Vec::new();
@@ -23,7 +24,13 @@ fn native_fixture() -> TestNativeContext {
         ("sing-box.exe", b"inert-core-fixture".as_slice()),
         ("libcronet.dll", b"inert-library-fixture".as_slice()),
     ] {
-        std::fs::write(payload.join(name), raw).unwrap();
+        let path = payload.join(name);
+        std::fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         files.push(CoreFile {
             name: name.into(),
             bytes: raw.len() as u64,

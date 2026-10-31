@@ -15,32 +15,64 @@ fn android_uses_extracted_apk_assets_under_app_data() {
     assert!(kotlin.contains("ASSET_DIR = \"_up_/resources/data\""));
 }
 
-/// 随包目录解析必须在**当前仓库布局**下命中 `resources/data`（开发态第 ④ 候选）。
-/// 这条不测，`seed_builtin_rule_sets_into` 会一路静默 early-return（「解析不到就跳过」），
-/// T1 等于没做——而且日志只有一行 warn，极易被当噪音忽略。
+/// 用生产参数化候选显式验证开发态仓库定位，同时禁止发行态借仓库资源假绿。
+/// 两种测试构型都保留这些断言，不要求 release 的运行时 resolver 开启开发回退。
 #[test]
+#[cfg(not(target_os = "android"))]
 fn resolves_repo_resources_data_dir() {
-    let dir = super::super::resolve_bundled_data_dir().expect("开发态应解析到 resources/data");
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo = manifest.join("..").join("resources").join("data");
+    let dir = super::super::resolve_data_candidates(super::super::bundled_data_candidates_for(
+        None,
+        Some(manifest),
+        false,
+    ))
+    .expect("显式开发态候选应解析到 resources/data");
+    assert_eq!(dir, repo, "开发态必须解析到当前仓库的真实资源目录");
     assert!(dir.is_dir(), "{} 应是目录", dir.display());
     assert!(
         dir.join("geosite-cn.srs").is_file(),
         "{} 下应有随包 geosite-cn.srs",
         dir.display()
     );
+    let release = super::super::bundled_data_candidates_for(None, Some(manifest), true);
+    assert!(
+        !release.contains(&repo),
+        "release 不得保留真实存在的开发树候选"
+    );
+    assert!(
+        super::super::resolve_data_candidates(release).is_none(),
+        "没有随包候选时，release 不得从源码仓制造资源命中"
+    );
+    assert_eq!(
+        super::super::bundled_data_candidates().contains(&repo),
+        cfg!(debug_assertions),
+        "当前构型的生产候选必须遵守 debug 保留 / release 排除源码仓的策略"
+    );
 }
 
-/// **随包资源完整性门**（本批最贴近根因的一条）：拿**真实** `resources/data` 播种到临时目录，
-/// `still_missing` 必须为空 —— 即每个 `builtin_geo_rulesets()` 条目都有一份魔数有效的出厂副本。
-///
-/// 原始缺陷正是「`resources/data` 零 `.srs` 随包」，而此前全仓**没有任何门**盯着这件事：金样把
-/// 文件存在性 stub 成恒真，于是「出厂就少文件」这条腿完全在射程外。本用例是它的守门人——
-/// 谁再往 `builtin_geo_rulesets()` 加 tag 却忘了补 `.srs`，这里立刻转红，不必等真机全量直连。
+/// **随包资源完整性门**：把仓库中真实的全部 28 份 SRS 明确作为播种输入。
+/// 资源完整性不依赖测试二进制的运行时资源布局，更不借 release 仓库回退。
+/// 谁往内置表加 tag 却忘补真实文件，still_missing / 魔数 / 落盘字节必须报错。
 #[test]
 fn real_bundled_resources_cover_every_builtin_tag() {
-    let bundled = super::super::resolve_bundled_data_dir().expect("开发态应解析到 resources/data");
-    let runtime =
-        std::env::temp_dir().join(format!("polaris-geoseed-realbundle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&runtime);
+    let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("resources")
+        .join("data");
+    let root = super::tmp_root("realbundle");
+    let runtime = root.join("rules");
+    let builtins = builtin_geo_rulesets();
+    assert_eq!(builtins.len(), 28, "随包资源门必须覆盖完整 28 项内置表");
+    for rule in &builtins {
+        let source = bundled.join(&rule.file_name);
+        assert!(source.is_file(), "{} 必须是真实随包文件", source.display());
+        assert!(
+            super::super::is_valid_srs_file(&source),
+            "{} 的真实随包副本必须有有效 SRS 魔数",
+            rule.tag
+        );
+    }
 
     let report = super::super::seed_builtin_rule_sets(&bundled, &runtime, &SeedOptions::default());
 
@@ -51,7 +83,26 @@ fn real_bundled_resources_cover_every_builtin_tag() {
         report.still_missing
     );
     assert!(!report.seeded.is_empty(), "空目录首播不该零落盘");
-    let _ = std::fs::remove_dir_all(&runtime);
+    assert_eq!(
+        report.seeded.len(),
+        builtins.len(),
+        "完整内置表必须全部落盘"
+    );
+    for rule in &builtins {
+        let dest = runtime.join(&rule.file_name);
+        assert!(
+            super::super::is_valid_srs_file(&dest),
+            "{} 落盘后魔数有效",
+            rule.tag
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("读真实播种副本"),
+            std::fs::read(bundled.join(&rule.file_name)).expect("读真实随包文件"),
+            "{} 播种字节必须与真实随包副本一致",
+            rule.tag
+        );
+    }
+    std::fs::remove_dir_all(root).expect("清理本测试私有临时目录");
 }
 
 /// **R1：release 构建必须剔除源码仓候选**（`CARGO_MANIFEST_DIR/../resources/data`）。
@@ -62,6 +113,7 @@ fn real_bundled_resources_cover_every_builtin_tag() {
 ///
 /// 变异锁：把 `filter_repo_candidate` 的 `if is_release` 改成 `if false` → 转红。
 #[test]
+#[cfg(not(target_os = "android"))]
 fn drops_repo_candidate_only_in_release() {
     use std::path::PathBuf;
     let manifest = std::path::Path::new("/opt/build/polaris/src-tauri");

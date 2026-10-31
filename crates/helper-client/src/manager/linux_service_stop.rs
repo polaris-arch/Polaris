@@ -123,6 +123,13 @@ linux_service_closed() {
   # Recheck the effective configuration and hierarchy after the stop job. The
   # pre-stop snapshot cannot authorize removal if unit properties have changed.
   linux_validate_service || return 1
+  linux_cohort_closed
+}
+linux_cohort_closed() {
+  # Shared by the strict regular-unit validator and the finite legacy ownmask
+  # dispatcher. A caller must validate its actual unit/mask before entering.
+  # Never weaken the namespace/view proof when the canonical name is a mask.
+  linux_cgroup_view || return 1
   INSTALL_STAGE=service-closure
   STATE=$(linux_service_property ActiveState) || return 1
   PID=$(linux_service_property MainPID) || return 1

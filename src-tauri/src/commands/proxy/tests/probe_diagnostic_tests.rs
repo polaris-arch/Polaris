@@ -108,14 +108,14 @@ fn decode_class_json_syntax_error_has_no_keypath() {
     );
 }
 
-/// 构造：Windows 盘符路径（`C:\Users\...`）——冒号后紧跟反斜杠，不是空格，故不会被
+/// 构造：Windows 盘符路径（`C:\Users\fixture-user\AppData\Local\Temp\probe-1.json`）中的冒号不会被
 /// `split_once(": ")` 误当成「文件路径与后续内容」的分隔符。真机验证过等价场景（Linux 下
 /// 目录名本身含冒号 `weird:dir/`，输出为 `decode config at .../weird:dir/t12.json:
 /// outbounds[0].bogus_field: json: unknown field "bogus_field"`，切分结果与本用例同构）——
 /// 本机不能跑 `sing-box.exe` 才退而按已验证的分隔符规律构造，非拍脑袋编。
 #[test]
 fn decode_class_file_path_with_windows_drive_colon_does_not_break_split() {
-    let raw = r#"FATAL[0000] decode config at C:\Users\sway\AppData\Local\Temp\probe-1.json: outbounds[0].bogus_field: json: unknown field "bogus_field""#;
+    let raw = r#"FATAL[0000] decode config at C:\Users\fixture-user\AppData\Local\Temp\probe-1.json: outbounds[0].bogus_field: json: unknown field "bogus_field""#;
     let diag = parse_probe_diagnostic(raw);
     assert_eq!(
         diag.path.as_deref(),

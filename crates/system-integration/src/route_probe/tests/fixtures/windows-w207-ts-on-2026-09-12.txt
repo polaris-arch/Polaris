@@ -1,5 +1,5 @@
 ════════════════════════════════════════════════════════════════════════
-Polaris route_probe 真机抓取（Windows）
+Polaris route_probe 保形脱敏衍生样本（Windows）
 
 读这份样本、准备照着写解析器的人，先看这三条：
 
@@ -21,16 +21,16 @@ Polaris route_probe 真机抓取（Windows）
 @@@GET_NETADAPTER 必须带 InterfaceType（IANA ifType）：131 = IF_TYPE_TUNNEL，6 = 以太网。
 隧道名单只能靠它判 —— 这台机器上实测 Teredo / IP-HTTPS / 6to4 三个隧道全是 131，
 两块以太网卡是 6。两条看着可行的土办法都必错：「描述列为空」恰好圈中 Teredo/IP-HTTPS/6to4，
-但 Tailscale 的 wintun **有**描述；「没有 MAC」会把内核调试适配器一起圈进来，而 wintun **自带** MAC。
+但 Tailscale 的 wintun **有**描述；「没有 F14」会把内核调试适配器一起圈进来，而 wintun **自带** F14。
 ComponentID / NdisPhysicalMedium 一并带上作交叉判据。
 
-落库：把本文件原样放进
+落库：先脱敏身份字段，再保留格式放进
   polaris/crates/system-integration/src/route_probe/tests/fixtures/
 不要手工规整（行尾空格、对齐、空行、CRLF 都是证据）。
 ════════════════════════════════════════════════════════════════════════
 @@@META
 platform=windows
-host=sway
+host=win1
 label=ts-on
 date=2026-09-12 79:db:ed +08:00
 script=polaris-collect-routes-windows.ps1
@@ -52,7 +52,7 @@ IPv4 路由表
 ===========================================================================
 活动路由:
 网络目标        网络掩码          网关       接口   跃点数
-          0.0.0.0          0.0.0.0     192.168.10.1   192.168.10.207     16
+          0.0.0.0          0.0.0.0     192.168.50.4   192.168.50.244     16
          32.0.0.1  255.255.255.255  100.100.100.100        32.0.0.31      5
          32.0.0.2  255.255.255.255  100.100.100.100        32.0.0.31      5
          32.0.0.3  255.255.255.255  100.100.100.100        32.0.0.31      5
@@ -83,17 +83,17 @@ IPv4 路由表
         127.0.0.0        255.0.0.0            在链路上         127.0.0.1   5811
         127.0.0.1  255.255.255.255            在链路上         127.0.0.1   5811
   127.255.255.255  255.255.255.255            在链路上         127.0.0.1   5811
-     192.168.10.0    255.255.255.0            在链路上    192.168.10.207    271
-   192.168.10.207  255.255.255.255            在链路上    192.168.10.207    271
-   192.168.10.255  255.255.255.255            在链路上    192.168.10.207    271
+     192.168.50.0    255.255.255.0            在链路上    192.168.50.244    271
+   192.168.50.244  255.255.255.255            在链路上    192.168.50.244    271
+   192.168.50.255  255.255.255.255            在链路上    192.168.50.244    271
         224.0.0.0        240.0.0.0            在链路上         127.0.0.1   5811
-        224.0.0.0        240.0.0.0            在链路上    192.168.10.207    271
+        224.0.0.0        240.0.0.0            在链路上    192.168.50.244    271
   255.255.255.255  255.255.255.255            在链路上         127.0.0.1   5811
-  255.255.255.255  255.255.255.255            在链路上    192.168.10.207    271
+  255.255.255.255  255.255.255.255            在链路上    192.168.50.244    271
 ===========================================================================
 永久路由:
   网络地址          网络掩码  网关地址  跃点数
-          0.0.0.0          0.0.0.0     192.168.10.1       1
+          0.0.0.0          0.0.0.0     192.168.50.4       1
 ===========================================================================
 @@@ROUTE_PRINT_6
 ===========================================================================
@@ -195,10 +195,10 @@ DestinationPrefix  InterfaceAlias              InterfaceIndex NextHop         Ro
 127.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
 224.0.0.0/4        Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
 255.255.255.255/32 Loopback Pseudo-Interface 1              1 0.0.0.0                 256 ActiveStore
-0.0.0.0/0          以太网                                      8 192.168.10.1              1 ActiveStore
-192.168.10.0/24    以太网                                      8 0.0.0.0                 256 ActiveStore
-192.168.10.207/32  以太网                                      8 0.0.0.0                 256 ActiveStore
-192.168.10.255/32  以太网                                      8 0.0.0.0                 256 ActiveStore
+0.0.0.0/0          以太网                                      8 192.168.50.4              1 ActiveStore
+192.168.50.0/24    以太网                                      8 0.0.0.0                 256 ActiveStore
+192.168.50.244/32  以太网                                      8 0.0.0.0                 256 ActiveStore
+192.168.50.255/32  以太网                                      8 0.0.0.0                 256 ActiveStore
 224.0.0.0/4        以太网                                      8 0.0.0.0                 256 ActiveStore
 255.255.255.255/32 以太网                                      8 0.0.0.0                 256 ActiveStore
 100.100.100.100/32 Tailscale                               22 0.0.0.0                   0 ActiveStore
@@ -279,7 +279,7 @@ IPAddress                               PrefixLength AddressFamily InterfaceAlia
 ---------                               ------------ ------------- --------------              --------------
 127.0.0.1                                          8          IPv4 Loopback Pseudo-Interface 1              1
 ::1                                              128          IPv6 Loopback Pseudo-Interface 1              1
-192.168.10.207                                    24          IPv4 以太网                                      8
+192.168.50.244                                    24          IPv4 以太网                                      8
 9757:a50f:cf73:9c4e::965                         128          IPv6 以太网                                      8
 aded:14a8:b9be:ee8b:3b16:5d2f:a812:3f6c          128          IPv6 以太网                                      8
 9757:a50f:cf73:9c4e:c140:1f55:b504:e61d          128          IPv6 以太网                                      8
@@ -316,7 +316,7 @@ Idx     Met         MTU          鐘舵€?               鍚嶇О
 
 Windows IP 配置
 
-   主机名  . . . . . . . . . . . . . : Sway
+   主机名  . . . . . . . . . . . . . : win1
    主 DNS 后缀 . . . . . . . . . . . : 
    节点类型  . . . . . . . . . . . . : 混合
    IP 路由已启用 . . . . . . . . . . : 否
@@ -324,7 +324,7 @@ Windows IP 配置
 
 未知适配器 Tailscale:
 
-   连接特定的 DNS 后缀 . . . . . . . : hs.net
+   连接特定的 DNS 后缀 . . . . . . . : f2.f02
    描述. . . . . . . . . . . . . . . : Tailscale Tunnel
    物理地址. . . . . . . . . . . . . : 
    DHCP 已启用 . . . . . . . . . . . : 否
@@ -338,8 +338,8 @@ Windows IP 配置
                                        100.100.100.100
    TCPIP 上的 NetBIOS  . . . . . . . : 已启用
    连接特定的 DNS 后缀搜索列表:
-                                       hs.net
-                                       lan
+                                       f2.f02
+                                       f03
 
 以太网适配器 以太网:
 
@@ -373,41 +373,41 @@ Windows IP 配置
    临时 IPv6 地址. . . . . . . . . . : d114:342:b8da:6d8e:84a4:db75:7352:84a9(受到抨击) 
    临时 IPv6 地址. . . . . . . . . . : d114:342:b8da:6d8e:3b16:5d2f:a812:3f6c(首选) 
    本地链接 IPv6 地址. . . . . . . . : fe80::3463:e45e:6a9c:9334%8(首选) 
-   IPv4 地址 . . . . . . . . . . . . : 192.168.10.207(首选) 
+   IPv4 地址 . . . . . . . . . . . . : 192.168.50.244(首选) 
    子网掩码  . . . . . . . . . . . . : 255.255.255.0
    默认网关. . . . . . . . . . . . . : fe80::7fd:1819:1bc5:9967%8
-                                       192.168.10.1
+                                       192.168.50.4
    DHCPv6 IAID . . . . . . . . . . . : 112993297
    DHCPv6 客户端 DUID  . . . . . . . : 00-1a-1a-00-29-7a-19-32-5b-88-e5-88-98-95
    DNS 服务器  . . . . . . . . . . . : aded:14a8:b9be:ee8b::1
-                                       192.168.10.1
+                                       192.168.50.4
                                        aded:14a8:b9be:ee8b::1
                                        9757:a50f:cf73:9c4e::1
    TCPIP 上的 NetBIOS  . . . . . . . : 已启用
 @@@TAILSCALE
-32.0.0.31           sway              youzhen.lin     windows  -                                                    
-fd7a:115c:a1e0::5   aliyun-hb         fengsen.deng    linux    offline, last seen 34d ago                           
-fd7a:115c:a1e0::4   aneya-pad         tagged-devices  android  offline, last seen 8d ago                            
-fd7a:115c:a1e0::f   ipad-pro          fengsen.deng    iOS      offline, last seen 92d ago                           
-fd7a:115c:a1e0::1   iphone15-pro-max  tagged-devices  iOS      -                                                    
-fd7a:115c:a1e0::e   lml9pn690         fengsen.deng    macOS    idle; offers exit node                               
-fd7a:115c:a1e0::32  localhost         tagged-devices  android  offline, last seen 104d ago                          
-fd7a:115c:a1e0::1   mac-m4            tagged-devices  macOS    offline, last seen 3d ago                            
-fd7a:115c:a1e0::7   mac-studio        tagged-devices  macOS    idle; offers exit node                               
-fd7a:115c:a1e0::5   mac               fengsen.deng    macOS    offline, last seen 79d ago                           
-fd7a:115c:a1e0::2e  macbookpro        youzhen.lin     macOS    -                                                    
-fd7a:115c:a1e0::8   macmini           fengsen.deng    macOS    -                                                    
-fd7a:115c:a1e0::db  nuc               tagged-devices  macOS    -                                                    
-fd7a:115c:a1e0::88  polaris-acct-a    youzhen.lin     linux    offline, last seen 1d ago                            
-fd7a:115c:a1e0::6a  polaris-acct-b    youzhen.lin     linux    offline, last seen 1d ago                            
-fd7a:115c:a1e0::20  polaris-probe-a   youzhen.lin     linux    offline, last seen 1d ago                            
-fd7a:115c:a1e0::8b  polaris-probe-b   youzhen.lin     linux    offline, last seen 1d ago                            
-fd7a:115c:a1e0::d3  swaymacbook-pro   youzhen.lin     macOS    -                                                    
-fd7a:115c:a1e0::3f  tlt-testmac-mini  youzhen.lin     macOS    -                                                    
-fd7a:115c:a1e0::1   tlt               youzhen.lin     macOS    -                                                    
-fd7a:115c:a1e0::dc  tlt02mac-mini     youzhen.lin     macOS    -                                                    
-fd7a:115c:a1e0::1   x300u             tagged-devices  android  offline, last seen 72d ago                           
-fd7a:115c:a1e0::2   xfold6            tagged-devices  android  offline, last seen 2h ago                            
-fd7a:115c:a1e0::e5  xiaomi14          fengsen.deng    android  offline, last seen 158d ago                          
-fd7a:115c:a1e0::2   xmn-router        fengsen.deng    linux    idle; offers exit node; offline, last seen 567d ago  
-fd7a:115c:a1e0::d9  yee-pad           tagged-devices  android  offline, last seen 6d ago                            
+32.0.0.31           win1              f000004.f04     windows  -                                                    
+fd7a:115c:a1e0::5   f00005-f5         f000006.f006    linux    offline, last seen 34d ago                           
+fd7a:115c:a1e0::4   f0007-f07         tagged-devices  android  offline, last seen 8d ago                            
+fd7a:115c:a1e0::f   f008-f08          f000006.f006    iOS      offline, last seen 92d ago                           
+fd7a:115c:a1e0::1   fixture9-f09-f09  tagged-devices  iOS      -                                                    
+fd7a:115c:a1e0::e   fixture10         f000006.f006    macOS    idle; offers exit node                               
+fd7a:115c:a1e0::32  fixture11         tagged-devices  android  offline, last seen 104d ago                          
+fd7a:115c:a1e0::1   f12-f2            tagged-devices  macOS    offline, last seen 3d ago                            
+fd7a:115c:a1e0::7   f13-f00013        tagged-devices  macOS    idle; offers exit node                               
+fd7a:115c:a1e0::5   f14               f000006.f006    macOS    offline, last seen 79d ago                           
+fd7a:115c:a1e0::2e  fixture015        f000004.f04     macOS    -                                                    
+fd7a:115c:a1e0::8   f000016           f000006.f006    macOS    -                                                    
+fd7a:115c:a1e0::db  f17               tagged-devices  macOS    -                                                    
+fd7a:115c:a1e0::88  f000018-f018-r    f000004.f04     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::6a  f000019-f019-s    f000004.f04     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::20  f000021-f0021-u   f000004.f04     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::8b  f000022-f0022-v   f000004.f04     linux    offline, last seen 1d ago                            
+fd7a:115c:a1e0::d3  fixture0023-f23   f000004.f04     macOS    -                                                    
+fd7a:115c:a1e0::3f  f24-f000024-f024  f000004.f04     macOS    -                                                    
+fd7a:115c:a1e0::1   f25               f000004.f04     macOS    -                                                    
+fd7a:115c:a1e0::dc  f0000026-f026     f000004.f04     macOS    -                                                    
+fd7a:115c:a1e0::1   f0027             tagged-devices  android  offline, last seen 72d ago                           
+fd7a:115c:a1e0::2   f00028            tagged-devices  android  offline, last seen 2h ago                            
+fd7a:115c:a1e0::e5  f0000029          f000006.f006    android  offline, last seen 158d ago                          
+fd7a:115c:a1e0::2   f30-f00030        f000006.f006    linux    idle; offers exit node; offline, last seen 567d ago  
+fd7a:115c:a1e0::d9  f31-f31           tagged-devices  android  offline, last seen 6d ago                            

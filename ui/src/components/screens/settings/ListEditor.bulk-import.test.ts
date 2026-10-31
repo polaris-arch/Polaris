@@ -7,6 +7,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { parseBulkEntries } from './ListEditor';
+import { importListEntryRows, listEntryRows } from '@/domain/list-entries';
+import { dnsUpstreamIdentity, editNodeResolverInventory } from './settings-dns-logic';
 
 describe('parseBulkEntries —— 真批量导入的解析与合并', () => {
   it('换行与逗号都是分隔符，条目去空白', () => {
@@ -64,4 +66,24 @@ it('DNS bulk identity preserves URL path/query case without changing generic lis
   expect(parseBulkEntries('A\na', [])).toEqual(['A']);
   const lines = ['https://DNS.EXAMPLE:443/A?X=Y', 'https://dns.example/A?X=Y', 'https://dns.example/a?X=Y', 'https://dns.example/A?X=y'];
   expect(parseBulkEntries(lines.join('\n'), [], undefined, dnsUpstreamIdentity)).toEqual([lines[0], lines[2], lines[3]]);
+});
+
+describe('identified bulk import preserves existing row provenance', () => {
+  it('keeps raw old duplicates and their IDs; only appended entries have no persisted ID', () => {
+    const rows = listEntryRows(['tls://1.1.1.1', ' tls://1.1.1.1:853 '], ['a', 'b']);
+    const result = importListEntryRows('tls://1.1.1.1:853\nudp://9.9.9.9', rows, undefined, dnsUpstreamIdentity);
+    expect(result.slice(0, 2)).toEqual(rows);
+    expect(result[0]).toBe(rows[0]);
+    expect(result[1]).toBe(rows[1]);
+    expect(result[2]).toMatchObject({ value: 'udp://9.9.9.9', id: undefined });
+    expect(new Set(result.map(row => row.key)).size).toBe(3);
+    const previous = rows.map(row => ({ id: row.id!, spec: row.value }));
+    expect(editNodeResolverInventory(previous, ['b'], result.map(row => ({ id: row.id, spec: row.value })), () => 'new')).toEqual({ ok: true, custom: [previous[0], { id: 'new', spec: 'udp://9.9.9.9' }], pool: ['a'] });
+    expect(rows[1].value).toBe(' tls://1.1.1.1:853 ');
+  });
+  it('retains legacy plain import/max behavior and does not allocate IDs', () => {
+    const existing = listEntryRows(['a', '']);
+    expect(importListEntryRows('A,b,c', existing, 3).map(row => row.value)).toEqual(parseBulkEntries('A,b,c', ['a', ''], 3));
+    expect(importListEntryRows('b', existing).every(row => row.id === undefined)).toBe(true);
+  });
 });

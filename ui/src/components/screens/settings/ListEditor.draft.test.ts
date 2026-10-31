@@ -26,7 +26,9 @@
  */
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { nextDraft, sameEntries } from './ListEditor';
+import { nextDraft, sameEntries, type ListEditorProps } from './ListEditor';
+import { editNodeResolverInventory } from './settings-dns-logic';
+import { listEntryRow, listEntryRows, listEntrySources, nextListEntryDraft, listEntryAcceptance, sameListEntryRows, type ListEntryRow } from '@/domain/list-entries';
 
 describe('sameEntries', () => {
   it('长度/顺序/内容任一不同即不相同', () => {
@@ -103,9 +105,222 @@ describe('接线：行输入打字不得碰父级，blur 才提交', () => {
   // 变异对照：把任一处的 `draft` 换回 `value` → 本条转红。
   it('删除 / 添加 / 批量导入都基于 draft，不基于 value', () => {
     expect(SRC).toContain('commit(draft.filter((_, i) => i !== idx))');
-    expect(SRC).toContain("commit([...draft, ''])");
-    expect(SRC).toContain('parseBulkEntries(importDraft, [...draft], max, entryIdentity)');
+    expect(SRC).toContain("commit([...draft, listEntryRow('')])");
+    expect(SRC).toContain('importListEntryRows(importDraft, draft, max, entryIdentity)');
     // 渲染也必须走草稿，否则打字看不见（草稿变了但画的是 value）。
     expect(SRC).toContain('{draft.map((entry, idx) => (');
+  });
+});
+
+describe('identified editor acceptance composed with real inventory transactions', () => {
+  const one = 'tls://1.1.1.1';
+  const nine = 'tls://9.9.9.9';
+  const eight = 'tls://8.8.8.8';
+  const seedRows = () => listEntryRows([one, nine], ['a', 'b']);
+  const inventory = (rows: readonly ListEntryRow[]) => rows.map(row => ({ id: row.id!, spec: row.value }));
+  function transactions() {
+    let minted = 0;
+    function save(previous: ReturnType<typeof inventory>, pool: readonly string[], rows: readonly ListEntryRow[], context?: unknown) {
+      const result = editNodeResolverInventory(previous, pool, rows.map(row => ({ id: row.id, spec: row.value })), () => `new-${++minted}`, { sources: listEntrySources(rows), context });
+      if (!result.ok) throw new Error(`unexpected ${result.error}`);
+      const receipt = listEntryAcceptance(result.editor, rows);
+      if (!receipt) throw new Error('missing complete synchronous receipt');
+      return { ...result, receipt, incoming: listEntryRows(result.custom.map(row => row.spec), result.custom.map(row => row.id)) };
+    }
+    return { save, minted: () => minted };
+  }
+
+  it('preserves every old string-only dirty-draft transition without opting in', () => {
+    for (const [current, seed, incoming] of [
+      [['a'], ['a'], ['b']], [['dirty'], ['a'], ['b']],
+      [[], [], ['new']], [['dirty'], ['a'], []], [['a'], ['a'], ['a']],
+    ]) {
+      const actual = nextListEntryDraft(listEntryRows(current), listEntryRows(seed), listEntryRows(incoming));
+      expect(actual.map(row => row.value)).toEqual(nextDraft(current, seed, incoming));
+      expect(actual.every(row => row.id === undefined)).toBe(true);
+    }
+  });
+
+  it.each([[], ['a'], ['b'], ['b', 'ali', 'a']].map(pool => ({ pool })))('rebases a retired alias and preserves selected source order: $pool', ({ pool }) => {
+    const tx = transactions();
+    const seed = seedRows();
+    const submitted = seed.map(row => row.id === 'b' ? { ...row, value: one } : row);
+    const first = tx.save(inventory(seed), pool, submitted);
+    const newer = submitted.map(row => row.id === 'b' ? { ...row, value: eight } : row);
+    // Old/unrelated props cannot acknowledge this transaction.
+    expect(nextListEntryDraft(newer, seed, seed, first.receipt)).toBe(newer);
+    const unrelated = listEntryRows(['udp://8.8.4.4'], ['other']);
+    expect(nextListEntryDraft(newer, seed, unrelated, first.receipt)).toBe(newer);
+    const rebased = nextListEntryDraft(newer, seed, first.incoming, first.receipt);
+    expect(rebased.map(row => [row.value, row.id, row.key])).toEqual([
+      [one, 'a', seed[0].key], [eight, undefined, seed[1].key],
+    ]);
+    const second = tx.save(first.custom, first.pool, rebased, first.receipt.context);
+    expect(second.custom).toEqual([{ id: 'a', spec: one }, { id: 'new-1', spec: eight }]);
+    expect(second.pool).toEqual(pool.map(id => id === 'b' ? 'new-1' : id));
+    expect(editNodeResolverInventory(first.custom, first.pool, newer.map(row => ({ id: row.id, spec: row.value })), () => 'bad')).toEqual({ ok: false, error: 'invalid' });
+    const finalDraft = nextListEntryDraft(rebased, first.incoming, second.incoming, second.receipt);
+    const reload = tx.save(second.custom, second.pool, finalDraft, second.receipt.context);
+    expect(reload.custom).toEqual(second.custom);
+    expect(reload.pool).toEqual(second.pool);
+    expect(tx.minted()).toBe(1);
+  });
+
+  it.each(['a', 'both'])('keeps the unchanged alias endpoint when the primary is edited: %s', edited => {
+    const tx = transactions(); const seed = seedRows();
+    const submitted = seed.map(row => ({ ...row, value: one }));
+    const first = tx.save(inventory(seed), ['a', 'b'], submitted);
+    const newer = submitted.map(row => row.id === 'a' ? { ...row, value: eight } : edited === 'both' ? { ...row, value: nine } : row);
+    const rebased = nextListEntryDraft(newer, seed, first.incoming, first.receipt);
+    expect(rebased.map(row => row.value)).toEqual([eight, edited === 'both' ? nine : one]);
+    expect(rebased.map(row => row.key)).toEqual(seed.map(row => row.key));
+    expect(new Set(rebased.map(row => row.id)).size).toBe(2);
+    const second = tx.save(first.custom, first.pool, rebased, first.receipt.context);
+    expect(second.pool.map(id => second.custom.find(row => row.id === id)!.spec)).toEqual([eight, edited === 'both' ? nine : one]);
+    expect(second.custom).toHaveLength(2);
+  });
+
+  it('adopts a newly minted ID despite later editing without minting it again', () => {
+    const tx = transactions(); const seed = listEntryRows([one], ['a']);
+    const added = [...seed, listEntryRow(nine)];
+    const first = tx.save(inventory(seed), ['a'], added);
+    const newer = added.map((row, index) => index === 1 ? { ...row, value: eight } : row);
+    const rebased = nextListEntryDraft(newer, seed, first.incoming, first.receipt);
+    expect(rebased[1]).toMatchObject({ value: eight, id: 'new-1', key: added[1].key });
+    const second = tx.save(first.custom, first.pool, rebased, first.receipt.context);
+    expect(second.custom[1]).toEqual({ id: 'new-1', spec: eight });
+    expect(tx.minted()).toBe(1);
+  });
+
+  it.each(['a', 'b', 'all'].flatMap(removed => [[], ['a'], ['b'], ['a', 'b']].map(pool => ({ removed, pool }))))('does not resurrect removed sources or transfer their selection: $removed / $pool', ({ removed, pool }) => {
+    const tx = transactions(); const seed = seedRows();
+    const submitted = seed.map(row => ({ ...row, value: one }));
+    const first = tx.save(inventory(seed), pool, submitted);
+    const newer = submitted.filter(row => removed !== 'all' && row.id !== removed);
+    const rebased = nextListEntryDraft(newer, seed, first.incoming, first.receipt);
+    const second = tx.save(first.custom, first.pool, rebased, first.receipt.context);
+    expect(second.custom).toHaveLength(removed === 'all' ? 0 : 1);
+    expect(second.pool).toEqual(pool.some(id => removed !== 'all' && id !== removed) ? ['a'] : []);
+    expect(rebased.map(row => row.key)).toEqual(newer.map(row => row.key));
+  });
+
+  it('preserves reorder, dirty fork, post-submit additions and original pool order together', () => {
+    const tx = transactions(); const seed = seedRows();
+    const submitted = seed.map(row => ({ ...row, value: one }));
+    const first = tx.save(inventory(seed), ['a', 'b'], submitted);
+    const extra = listEntryRow('udp://8.8.4.4');
+    const newer = [{ ...submitted[1], value: eight }, extra, submitted[0]];
+    const rebased = nextListEntryDraft(newer, seed, first.incoming, first.receipt);
+    expect(rebased.map(row => row.key)).toEqual(newer.map(row => row.key));
+    const second = tx.save(first.custom, first.pool, rebased, first.receipt.context);
+    expect(second.custom.map(row => row.spec)).toEqual([eight, 'udp://8.8.4.4', one]);
+    expect(second.pool.map(id => second.custom.find(row => row.id === id)!.spec)).toEqual([one, eight]);
+  });
+
+  it('carries selection through a fully collapsed alias into another real edit', () => {
+    const tx = transactions(); const seed = seedRows();
+    const submitted = seed.map(row => ({ ...row, value: one }));
+    const first = tx.save(inventory(seed), ['b'], submitted);
+    const collapsed = nextListEntryDraft(submitted, seed, first.incoming, first.receipt);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].origins).toEqual(seed.map(row => row.key));
+    const second = tx.save(first.custom, first.pool, [{ ...collapsed[0], value: eight }], first.receipt.context);
+    expect(second.pool).toEqual(['a']);
+    expect(second.custom).toEqual([{ id: 'a', spec: eight }]);
+  });
+
+  it('a later receipt survives earlier props, and the next real save uses its identities and selection', () => {
+    const tx = transactions(); const seed = seedRows();
+    const submitted = seed.map(row => ({ ...row, value: one }));
+    const older = tx.save(inventory(seed), ['b'], submitted);
+    const newerSubmit = submitted.map(row => row.id === 'a' ? { ...row, value: eight } : row);
+    const latest = tx.save(inventory(seed), ['b'], newerSubmit);
+    const dirty = newerSubmit.map(row => row.id === 'b' ? { ...row, value: nine } : row);
+    expect(nextListEntryDraft(dirty, seed, older.incoming, latest.receipt)).toBe(dirty);
+    const rebased = nextListEntryDraft(dirty, older.incoming, latest.incoming, latest.receipt);
+    const next = tx.save(latest.custom, latest.pool, rebased, latest.receipt.context);
+    expect(next.custom).toEqual([{ id: 'a', spec: eight }, { id: 'b', spec: nine }]);
+    expect(next.pool).toEqual(['b']);
+  });
+
+  it('ignores a stale selection context after an explicit pool change and keeps quota atomic', () => {
+    const tx = transactions(); const seed = seedRows();
+    const submitted = seed.map(row => ({ ...row, value: one }));
+    const first = tx.save(inventory(seed), ['b'], submitted);
+    const newer = submitted.map(row => row.id === 'b' ? { ...row, value: eight } : row);
+    const rebased = nextListEntryDraft(newer, seed, first.incoming, first.receipt);
+    expect(tx.save(first.custom, ['a', 'ali'], rebased, first.receipt.context).pool).toEqual(['a', 'ali']);
+    const enabled = tx.save(inventory(seed), ['ali', 'dnspod', 'a', 'b'], submitted);
+    const before = JSON.stringify(enabled);
+    const split = nextListEntryDraft(newer, seed, enabled.incoming, enabled.receipt);
+    expect(editNodeResolverInventory(enabled.custom, enabled.pool, split.map(row => ({ id: row.id, spec: row.value })), () => 'fork', { sources: listEntrySources(split), context: enabled.receipt.context })).toEqual({ ok: false, error: 'quota' });
+    expect(JSON.stringify(enabled)).toBe(before);
+  });
+
+  it('the identified transaction keeps builtin-first malformed-inventory and invalid-selected guards', () => {
+    const tx = transactions();
+    const previous = [{ id: 'ali', spec: 'tls://resolver.example' }, { id: 'bad', spec: 'tls://other.example' }];
+    const rows = [...listEntryRows(previous.map(row => row.spec), previous.map(row => row.id)), listEntryRow('udp://8.8.4.4')];
+    const accepted = tx.save(previous, ['ali'], rows);
+    expect(accepted.pool).toEqual(['ali']);
+    expect(accepted.custom.slice(0, 2)).toEqual(previous);
+    expect(editNodeResolverInventory(previous, ['bad'], rows.map(row => ({ id: row.id, spec: row.value })), () => 'new', { sources: listEntrySources(rows) })).toEqual({ ok: false, error: 'invalid' });
+  });
+
+  it('Add blank → fill duplicate → blur → same-seed adoption closes only the nonblank alias', () => {
+    const tx = transactions(); const seed = listEntryRows([one], ['a']);
+    const added = [...seed, listEntryRow('')];
+    const blank = tx.save(inventory(seed), ['a'], added);
+    const editable = nextListEntryDraft(added, seed, seed, blank.receipt);
+    expect(editable.map(row => row.value)).toEqual([one, '']);
+    expect(editable[1].key).toBe(added[1].key);
+    const filled = editable.map((row, index) => index === 1 ? { ...row, value: one } : row);
+    const duplicate = tx.save(blank.custom, blank.pool, filled, blank.receipt.context);
+    expect(sameListEntryRows(duplicate.incoming, seed)).toBe(true);
+    const adopted = nextListEntryDraft(filled, seed, seed, duplicate.receipt);
+    expect(adopted.map(row => [row.value, row.id])).toEqual([[one, 'a']]);
+    expect(adopted[0].key).toBe(seed[0].key);
+    expect(tx.save(duplicate.custom, duplicate.pool, adopted, duplicate.receipt.context).pool).toEqual(['a']);
+    expect(tx.minted()).toBe(0);
+  });
+
+  it('keeps a new value typed into an actual blank while its no-op receipt arrives', () => {
+    const tx = transactions(); const seed = listEntryRows([one], ['a']);
+    const added = [...seed, listEntryRow('')];
+    const first = tx.save(inventory(seed), ['a'], added);
+    const newer = added.map((row, index) => index === 1 ? { ...row, value: nine } : row);
+    const rebased = nextListEntryDraft(newer, seed, seed, first.receipt);
+    expect(tx.save(first.custom, first.pool, rebased, first.receipt.context).custom[1].spec).toBe(nine);
+  });
+
+  it('rejects incomplete/malformed receipts and preserves legacy void/async contracts', () => {
+    const legacy: ListEditorProps['onChange'] = (_next: string[]) => undefined;
+    const asyncLegacy: ListEditorProps['onChange'] = async (_next: string[]) => undefined;
+    const rows = listEntryRows(['value']); const sources = listEntrySources(rows);
+    for (const result of [legacy(['value'], [undefined], sources), asyncLegacy(['value'], [undefined], sources), false,
+      { acceptedRows: [] }, { acceptedRows: [], acceptedSources: [] },
+      { acceptedRows: [], acceptedSources: [{ key: rows[0].key, id: 'missing', primary: true }] }]) {
+      expect(listEntryAcceptance(result, rows)).toBeUndefined();
+    }
+  });
+
+  it('both editors wire source bindings, same-seed adoption and external selection invalidation identically', () => {
+    for (const path of ['./ListEditor.tsx', '../../../mobile/settings/SettingsChrome.tsx']) {
+      const source = readFileSync(new URL(path, import.meta.url), 'utf8');
+      expect(source).toContain('next.map((row) => row.id), listEntrySources(next), continuationRef.current');
+      expect(source).toContain('{ ...row, value: next }');
+      expect(source).toContain('if (entryIds === undefined) return;');
+      expect(source).toContain('listEntryAcceptance(result, submitted)');
+      expect(source).toContain('if (!accepted) return;');
+      expect(source).toContain('sameListEntryRows(accepted.canonical, incoming)');
+      expect(source).toContain('nextListEntryDraft(cur, incoming, incoming, accepted)');
+      expect(source).toContain('nextListEntryDraft(cur, seed, incoming, accepted)');
+      expect(source).toContain('accepted.contextKey === entryContextKey ? accepted.context : undefined');
+      expect(source).toContain('contextKeyRef.current !== entryContextKey');
+      expect(source).toContain('accepted.contextKey !== entryContextKey');
+      expect(source).toMatch(/key=\{entryIds === undefined \? (?:idx|index) : entry.key\}/);
+      expect(source).not.toContain('await onChange');
+      expect(source).not.toContain('.then(');
+    }
   });
 });

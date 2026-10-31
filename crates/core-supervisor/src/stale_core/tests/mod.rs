@@ -252,9 +252,10 @@ fn stale_pids_selects_only_our_cores_excluding_managed() {
 
 // ─── macOS `ps` 腿（真机卡死链的扫描侧）────────────────────────────────────────────
 
-const MAC_CONFIG_DIR: &str = "/Users/sway/Library/Application Support/com.polaris.app/polaris";
-/// 真机现场那条命令行（程序路径与配置目录都含空格，逐字取自现场的 `pgrep` 输出）。
-const MAC_PS_LINE: &str = "  6439   501 /Library/Application Support/Polaris/core/sing-box run -c /Users/sway/Library/Application Support/com.polaris.app/polaris/singbox-runtime.json";
+const MAC_CONFIG_DIR: &str =
+    "/Users/fixture-user/Library/Application Support/com.polaris.app/polaris";
+/// 现场格式的合成命令行（程序路径与配置目录都含空格，用户目录已通用化）。
+const MAC_PS_LINE: &str = "  6439   501 /Library/Application Support/Polaris/core/sing-box run -c /Users/fixture-user/Library/Application Support/com.polaris.app/polaris/singbox-runtime.json";
 
 fn mac_ours(process: &CoreProcess) -> bool {
     is_our_core(process, CORE, Path::new(MAC_CONFIG_DIR))

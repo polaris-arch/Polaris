@@ -565,7 +565,7 @@ async fn pc_child_requires_native_wait_even_when_pid_is_absent_and_repeated_clos
         .spawn()
         .unwrap();
     let mut child = TokioLoginCoreChild {
-        child: Some(child),
+        child: Some(child.into()),
         reaped: false,
         wait_identity_lost: false,
         native_attachment: None,
@@ -604,7 +604,7 @@ async fn dropping_native_close_future_keeps_the_child_and_never_mints_an_exit_re
         .unwrap();
     assert_eq!(ready.trim(), "ready");
     let mut child = TokioLoginCoreChild {
-        child: Some(process),
+        child: Some(process.into()),
         reaped: false,
         wait_identity_lost: false,
         native_attachment: None,
@@ -636,7 +636,7 @@ async fn native_echild_is_an_error_and_permanently_quarantines_the_numeric_wait_
         .unwrap();
     let pid = process.id().unwrap();
     let mut child = TokioLoginCoreChild {
-        child: Some(process),
+        child: Some(process.into()),
         reaped: false,
         wait_identity_lost: false,
         native_attachment: None,
@@ -678,7 +678,7 @@ async fn ordinary_tokio_factory_drains_both_streams_without_a_temp_native_fact()
         .unwrap()
         .join("crates/core-supervisor/src/config_gate/check_custody/tests/fixtures/exit-seven.sh");
     let (drained, drainage) = tokio::sync::oneshot::channel();
-    let req = SpawnRequest::new(
+    let req = SpawnRequest::unadmitted_intent(
         binary,
         PathBuf::from("owned-stand-in-unused-config.json"),
         StdioPolicy::drain(move |mut stdout, mut stderr| {
@@ -1042,7 +1042,7 @@ async fn native_login_fixture(
     let native = prepared.bind_login(&shared.identity, 23).unwrap();
     let drain = LoginStdioDrain::new();
     let original_drain = drain.clone();
-    let req = SpawnRequest::new(
+    let req = SpawnRequest::unadmitted_intent(
         binary,
         &config,
         StdioPolicy::drain(move |stdout, stderr| {
@@ -1212,7 +1212,7 @@ async fn login_native_issuer_rejects_foreign_registry_birth_role_scope_status_an
     let temp_birth = Arc::new(());
     let prepared = TokioLoginCoreSpawner.prepare_temp_native_birth().unwrap();
     let temp = prepared.bind(&temp_owner, &temp_birth).unwrap();
-    let req = SpawnRequest::new(
+    let req = SpawnRequest::unadmitted_intent(
         binary,
         PathBuf::from("unused-owned-config"),
         StdioPolicy::drain(|stdout, stderr| {

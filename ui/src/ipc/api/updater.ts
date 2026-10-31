@@ -1,6 +1,6 @@
 import { invoke, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { CoreVersionInfo } from '../../contracts/types/update';
+import type { CoreVersionInfo, CoreRecoveryState } from '../../contracts/types/update';
 
 export interface VersionInfo {
   debugReportAvailable?: boolean;
@@ -276,7 +276,7 @@ export const updateApi = {
 };
 
 // ============================================================================
-// coreApi —— 内核（sing-box）只读信息
+// coreApi —— 只读信息与当前可信随包数据恢复；不接受来源或路径
 // ============================================================================
 
 export const coreApi = {
@@ -287,5 +287,11 @@ export const coreApi = {
   },
   async getVersionInfo(): Promise<CoreVersionInfo> {
     return invoke(IPC_CHANNELS.CORE_GET_VERSION_INFO);
+  },
+  async checkOfflineRecovery(): Promise<CoreRecoveryState> {
+    return invoke(IPC_CHANNELS.CORE_CHECK_OFFLINE_RECOVERY);
+  },
+  async restoreBundledData(): Promise<CoreRecoveryState> {
+    return invoke(IPC_CHANNELS.CORE_RESTORE_BUNDLED_DATA);
   },
 };

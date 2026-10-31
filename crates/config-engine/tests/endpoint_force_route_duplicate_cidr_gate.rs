@@ -42,7 +42,12 @@ use polaris_config_engine::user_config::server_config::{
 };
 use support::kernel_gate::{default_platform, outbound_deps_for};
 
-fn ts_node(id: &str, routes: Vec<String>) -> ServerConfig {
+fn ts_node(id: &str, mut routes: Vec<String>) -> ServerConfig {
+    // 重叠测试显式声明广段，不再借用已删除的隐式 cold seed。
+    routes.extend([
+        "100.64.0.0/10".to_string(),
+        "fd7a:115c:a1e0::/48".to_string(),
+    ]);
     ServerConfig {
         id: id.into(),
         name: id.into(),

@@ -77,7 +77,7 @@ const WINDOWS_FIXTURE_TS_ON: &str = "windows-w207-ts-on-2026-09-12.txt";
 /// 它把「TAP-Windows / OpenVPN 那族驱动报什么 ifType」从**推测**（此前登记的疑值 `6`）
 /// 变成**实测**：`OpenVPN TAP-Windows6` 的 `InterfaceType` 逐字是 **`53`**
 /// （`ComponentID` = `root\tap0901`、`DriverDescription` = `TAP-Windows Adapter V9`、
-/// `Status` = `Up`、`10.8.0.2`）—— 也就是说现有白名单 `{131, 53}` **本来就覆盖它**，
+/// `Status` = `Up`、`10.8.0.5`）—— 也就是说现有白名单 `{131, 53}` **本来就覆盖它**，
 /// 不需要改判据；该改的是那条写错了的登记。
 const WINDOWS_FIXTURE_TAP: &str = "windows-w207-ovpn-tun-connected-2026-09-13.txt";
 
@@ -751,7 +751,7 @@ enum NameStyle {
 ///  - 名字不许是一个 **IP 字面量** —— 那是 `route print -4` 的 `Interface`（本地 IP）列漏出来了。
 ///
 /// 这两条对三个平台都开。也就是说这次改动在「对照表没做 / 做错了」这个维度上**比原来更强**，
-/// 不是拿宽松换绿：原来的「不含空白」对 `8` 和 `192.168.10.207` 这两个错答案是全绿的。
+/// 不是拿宽松换绿：原来的「不含空白」对 `8` 和 `192.168.50.244` 这两个错答案是全绿的。
 fn assert_interface_name_shape(name: &str, style: NameStyle, file: &str, id: &str) {
     assert!(
         !name.is_empty(),
@@ -1165,7 +1165,7 @@ fn the_captures_pin_iftype_53_for_wintun_and_tap_windows6() {
     assert_eq!(on.cell(on_wintun, "InterfaceType"), "53");
     assert_eq!(on.cell(on_wintun, "Status"), "Up");
 
-    // 🔴 同一条性质在 TAP 那族上的输入：`Up`（已连、`10.8.0.2`）与 `Disconnected` 两份抓取里
+    // 🔴 同一条性质在 TAP 那族上的输入：`Up`（已连、`10.8.0.5`）与 `Disconnected` 两份抓取里
     // 它都报 `53`。ifType 是**驱动属性**，不随链路状态漂 —— 只有一份 `Up` 的抓取时这句是推理。
     let down = cut_adapter_table(&section(
         &read_fixture(WINDOWS_FIXTURE_HYPERV),
@@ -2128,7 +2128,7 @@ fn windows_routes_of(file: &str, section_id: &str) -> Vec<RouteEntry> {
 /// 🔴 **判据 3**：路由解析出的接口名是**真名**，不是本地 IP、不是接口索引。
 ///
 /// 这是 Windows 与 mac/Linux 最大的一处不对称：两张路由表的「接口」列分别是本地 IP
-/// 与接口索引，**都不是名字**。没有对照表这一步，结果里出现的会是 `192.168.10.207` 和 `8`。
+/// 与接口索引，**都不是名字**。没有对照表这一步，结果里出现的会是 `192.168.50.244` 和 `8`。
 #[test]
 fn windows_routes_carry_real_interface_names_not_ips_or_indexes() {
     let v4 = windows_routes("ROUTE_PRINT_4");
@@ -2141,9 +2141,9 @@ fn windows_routes_carry_real_interface_names_not_ips_or_indexes() {
         })
     };
 
-    // v4：`Interface` 列逐字是 `192.168.10.207` / `127.0.0.1` —— 翻成了别名。
+    // v4：`Interface` 列逐字是 `192.168.50.244` / `127.0.0.1` —— 翻成了别名。
     assert!(
-        has(&v4, "192.168.10.0/24", "以太网"),
+        has(&v4, "192.168.50.0/24", "以太网"),
         "v4 的本地 IP 没被翻成接口别名：{v4:?}"
     );
     assert!(
@@ -2209,8 +2209,8 @@ fn windows_routes_carry_real_interface_names_not_ips_or_indexes() {
 /// 🔴 **判据 2**：解析**不依赖表头字面量**。
 ///
 /// 两路证据：
-///  1. `synthetic/windows-w207-route-print-en-headers.txt` —— 同一份抓取，本地化表头逐条
-///     换成 en-US，**路由数据行一个字节没动**。解析结果必须逐条相同。
+///  1. `synthetic/windows-w207-route-print-en-headers.txt` —— 同版脱敏来源，本地化表头逐条
+///     换成 en-US，**相对脱敏来源的数据行不变**。解析结果必须逐条相同。
 ///  2. 同一份 zh-CN 抓取，把那几行表头就地换成方块字符（既不是中文也不是英文）。
 ///     还相同 ⇒ 解析器压根没读过表头，而不是「中英文两套都认」。
 ///
@@ -2242,6 +2242,28 @@ fn route_print_parsing_does_not_depend_on_localized_headers() {
         // 正向对照先行：两份**确实不同**，且差异确实落在表头上。少了这条，
         // 「结果相同」可能只是因为我拿了同一份输入比自己。
         assert_ne!(zh, en, "@@@{id}：合成样本与真样本逐字相同 —— 表头没被换过");
+        // 数据来自同版脱敏来源；表头/本地化标签是唯一允许的派生差异。
+        let mut derived = zh.clone();
+        derived = derived.replace(
+            "网络目标        网络掩码          网关       接口   跃点数",
+            "Network Destination        Netmask          Gateway       Interface  Metric",
+        );
+        derived = derived.replace(
+            "网络地址          网络掩码  网关地址  跃点数",
+            "Network Address          Netmask  Gateway Address  Metric",
+        );
+        derived = derived.replace(
+            "接口跃点数网络目标                网关",
+            "If Metric Network Destination      Gateway",
+        );
+        derived = derived.replace("接口列表", "Interface List");
+        derived = derived.replace("活动路由", "Active Routes");
+        derived = derived.replace("在链路上", "On-link");
+        derived = derived.replace("永久路由", "Persistent Routes");
+        derived = derived.replace("路由表", "Route Table");
+        derived = derived.replace("无", "None");
+        assert_eq!(en, derived, "@@@{id}：英文派生物包含表头/标签之外的变化");
+
         assert!(
             zh.contains("活动路由:") && en.contains("Active Routes:"),
             "@@@{id}：合成样本不是「中文表头换成英文」那种差异"
@@ -2364,7 +2386,7 @@ fn interface_table_covers_the_loopback_index_absent_from_get_netadapter() {
         "索引 1 不在对照表里 —— 只拿 Get-NetAdapter 建表就是这个下场"
     );
     assert_eq!(names.by_index(8), Some("以太网"));
-    assert_eq!(names.by_ip("192.168.10.207"), Some("以太网"));
+    assert_eq!(names.by_ip("192.168.50.244"), Some("以太网"));
     assert_eq!(
         names.by_ip("127.0.0.1"),
         Some("Loopback Pseudo-Interface 1")
@@ -2413,17 +2435,17 @@ fn the_persistent_routes_table_is_not_mistaken_for_active_routes() {
     let body = "===========================================================================\n\
                 活动路由:\n\
                 网络目标        网络掩码          网关       接口   跃点数\n\
-                     192.168.10.0    255.255.255.0            在链路上    192.168.10.207    271\n\
+                     192.168.50.0    255.255.255.0            在链路上    192.168.50.244    271\n\
                 ===========================================================================\n\
                 永久路由:\n\
                   网络地址          网络掩码  网关地址  跃点数\n\
-                       10.9.0.0    255.255.0.0     192.168.10.1       1\n\
+                       10.9.0.0    255.255.0.0     192.168.50.4       1\n\
                 ===========================================================================\n";
     let entries = parse_route_print_routes(body, &windows_names()).expect("应解析得动");
     assert_eq!(
         entries,
         vec![RouteEntry {
-            prefix: "192.168.10.0/24".into(),
+            prefix: "192.168.50.0/24".into(),
             interface: "以太网".into()
         }],
         "永久路由表里那条被当成了活动路由（它只有 4 列、没有接口列，硬解只能张冠李戴）"
@@ -3189,7 +3211,7 @@ struct RouteGetRecord {
     /// `### padded=` —— 真正喂给 `route -n get` 的那一份。
     ///
     /// 🔴 **v4 必须先补零到四段**：macOS 的 `route -n get` 对 classful 缩写**误解析** ——
-    /// `route -n get 192.168.10` 问到的是 `192.168.0.10`，`169.254` 问到的是 `169.0.0.254`
+    /// `route -n get 192.168.50` 问到的是 `192.168.0.10`，`169.254` 问到的是 `169.0.0.254`
     /// （它把缩写当成「省掉的是中间几段」，而 `netstat` 打印的语义是「省掉的是尾部零字节」）。
     /// 不补零的话第二读数会静悄悄地问了另一批地址，然后与第一读数对不上 —— 而红出来的会是
     /// 「解析器错了」，方向全反。
@@ -3315,9 +3337,9 @@ fn route_get_prefix(rec: &RouteGetRecord) -> Option<String> {
 ///
 ///  1. **`route -n get` 没有 `interface:` 行**：`255.255.255.255/32` 回的是 `route: bad address`。
 ///     跳过，但名单钉死 —— 悄悄长出第二条就是解析器开始丢东西了。
-///  2. **本机自己的地址回 `lo0`**：`route -n get 192.168.10.142` 回 `lo0`，而同一台机器的
-///     netstat 表里 `192.168.10.142/32` 是 `en0`。这**不是**矛盾：BSD 把本机地址的主机路由
-///     装在环回上，dump 里那两条（`192.168.10.142` → `lo0` 与 `192.168.10.142/32` → `en0`）
+///  2. **本机自己的地址回 `lo0`**：`route -n get 192.168.50.179` 回 `lo0`，而同一台机器的
+///     netstat 表里 `192.168.50.179/32` 是 `en0`。这**不是**矛盾：BSD 把本机地址的主机路由
+///     装在环回上，dump 里那两条（`192.168.50.179` → `lo0` 与 `192.168.50.179/32` → `en0`）
 ///     **都在**，规范化之后落到同一条前缀上 ⇒ 第一读数的集合是 `{en0, lo0}`，子集规则天然
 ///     容得下。这里不写特判分支，而是**断言这个形态真的出现过** —— 写成特判的话它会退化成
 ///     一条没有输入的死代码。
@@ -3386,7 +3408,7 @@ fn macos_netstat_reading_agrees_with_the_independent_route_get_reading() {
             .unwrap_or_else(|| panic!("第二读数认不出这条记录的目的地：{rec:?}"));
         // 🔴 补零那一步真的做对了：补出来的四段地址，必须与内核回显里那个地址逐字一致。
         // 这是 macOS `route -n get` 对 classful 缩写误解析那条真机事实的**收据** ——
-        // 没补零的话 `192.168.10` 会被问成 `192.168.0.10`，`padded` 与内核回显对不上。
+        // 没补零的话 `192.168.50` 会被问成 `192.168.0.10`，`padded` 与内核回显对不上。
         if rec.padded != rec.dest {
             let addr = prefix.split('/').next().unwrap_or_default().to_string();
             assert_eq!(
@@ -3421,9 +3443,9 @@ fn macos_netstat_reading_agrees_with_the_independent_route_get_reading() {
         "跳过名单没被走全 —— `Destination` 那条是采集脚本 awk 把列头当数据取的噪声，\
          它要是不在了，说明脚本修好了而这条跳过规则已经过期"
     );
-    // classful 缩写那批确实进了对比（`127` / `169.254` / `192.168.10` 三条各是一种长度）。
+    // classful 缩写那批确实进了对比（`127` / `169.254` / `192.168.50` 三条各是一种长度）。
     let padded_dests: BTreeSet<&str> = padded_differs.iter().map(|(d, _, _)| *d).collect();
-    for want in ["127", "169.254", "192.168.10"] {
+    for want in ["127", "169.254", "192.168.50"] {
         assert!(
             padded_dests.contains(want),
             "classful 缩写 `{want}` 没进第二读数 —— 补零那条收据没有输入：{padded_dests:?}"
@@ -3567,7 +3589,7 @@ fn macos_netstat_reading_agrees_with_the_independent_route_get_reading() {
     // ── 🔴 正向对照②：三条容忍规则里的 lo0 那条，形态真的出现了 ──
     assert_eq!(
         first
-            .get("192.168.10.142/32")
+            .get("192.168.50.179/32")
             .map(|a| a.iter().cloned().collect::<Vec<_>>()),
         Some(vec!["en0".to_string(), "lo0".to_string()]),
         "「本机地址的主机路由同时出现在 lo0 与物理口上」这个形态不在了 —— \
@@ -3575,7 +3597,7 @@ fn macos_netstat_reading_agrees_with_the_independent_route_get_reading() {
     );
     assert_eq!(
         second
-            .get("192.168.10.142/32")
+            .get("192.168.50.179/32")
             .map(|a| a.iter().cloned().collect::<Vec<_>>()),
         Some(vec!["en0".to_string(), "lo0".to_string()]),
         "第二读数对本机地址的回答变了"
@@ -3617,4 +3639,53 @@ fn macos_netstat_reading_agrees_with_the_independent_route_get_reading() {
         caught,
         "把第二读数的 utun11 改成 en0 之后子集判据仍然没红 —— 这道门咬不住接口那一列"
     );
+}
+
+/// C08 只约束本批七份 Windows 衍生物，不替其余素材声明完整匿名化。
+#[test]
+fn privacy_derivatives_join_the_same_synthetic_host_across_metadata_and_status() {
+    use std::net::IpAddr;
+    for file in [
+        WINDOWS_FIXTURE,
+        WINDOWS_FIXTURE_WINTUN,
+        WINDOWS_FIXTURE_TS_ON,
+        WINDOWS_FIXTURE_TAP,
+        WINDOWS_FIXTURE_HYPERV,
+        WINDOWS_FIXTURE_RAS,
+        WINDOWS_FIXTURE_VIRT,
+    ] {
+        let raw = read_fixture(file);
+        let meta = section(&raw, "META");
+        let host = meta.lines().find_map(|line| line.strip_prefix("host="));
+        assert_eq!(host, Some("win1"), "{file}：META 主机身份不是本批合成标识");
+        let ipconfig = section(&raw, "IPCONFIG");
+        let displayed_host = ipconfig.lines().find_map(|line| {
+            if line.contains("主机名") || line.contains("Host Name") {
+                line.split_once(':').map(|(_, value)| value.trim())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            displayed_host.map(str::to_ascii_lowercase),
+            host.map(str::to_ascii_lowercase),
+            "{file}：META 与 ipconfig 主机身份没有联动"
+        );
+        for row in section(&raw, "TAILSCALE").lines() {
+            let fields: Vec<_> = row.split_whitespace().collect();
+            if fields.len() < 3 || fields[0].parse::<IpAddr>().is_err() {
+                continue;
+            }
+            assert!(
+                fields[1].eq_ignore_ascii_case("win1")
+                    || (fields[1].starts_with('f') || fields[1].starts_with('F')),
+                "{file}：status 节点标签不是合成标识"
+            );
+            assert!(
+                (fields[2].starts_with('f') || fields[2].starts_with('F'))
+                    || fields[2] == "tagged-devices",
+                "{file}：status 用户标签不是合成标识或标准设备角色"
+            );
+        }
+    }
 }

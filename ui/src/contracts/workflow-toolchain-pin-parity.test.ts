@@ -45,20 +45,18 @@ const ALL_WORKFLOWS = ['ci.yml', 'ui.yml', 'package.yml', 'release-risk.yml'] as
  *   · ci.yml 1 → 3：串行单 job 拆成 lint / cross / test 三个并行 job；
  *   · package.yml 3 → 4：新增 core_wire job（wire 契约从每条打包腿各跑一次收成只跑一次）。
  */
-// Strict native Package setup also checks out the exact candidate and uses Node 26
-// to validate its published contract before admitting the matrix.
+// Pin the complete managed Node job list, not just a total that can hide a missing producer.
+// Package device-only acceptance jobs are retired; normal setup/package/core-wire/release jobs remain.
 const NODE_JOBS = [
-  ['ci.yml', 7], ['ui.yml', 1], ['package.yml', 7], ['release-risk.yml', 3],
+  ['ci.yml', ['cheap_format', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']],
+  ['ui.yml', ['test']],
+  ['package.yml', ['setup', 'package', 'core_wire', 'release_desktop', 'release']],
+  ['release-risk.yml', ['pc_runtime_release_policy', 'classify', 'preflight']],
 ] as const;
-// cheap_format owns Node 26 for exact candidate and input-mode admission;
-// the reusable candidate call has no local checkout or Node steps. Windows native acceptance
-// leg adds an exact kernel checkout and uses Go, not a second Node installation.
-// The manual-only launcher diagnostic independently checks out the same two sources
-// and now owns Node 26 for exact loopback-input admission before kernel validation.
-// Source/mock and opt-in real loopback jobs each own a checkout and Node setup.
-const CHECKOUT_COUNTS = { 'ci.yml': 9, 'ui.yml': 1, 'package.yml': 7, 'release-risk.yml': 3 } as const;
+// CI test and launcher jobs also checkout an exact kernel source, without a second Node installation.
+const CHECKOUT_COUNTS = { 'ci.yml': 9, 'ui.yml': 1, 'package.yml': 5, 'release-risk.yml': 3 } as const;
 const CHECKOUT_TOTAL = Object.values(CHECKOUT_COUNTS).reduce((sum, count) => sum + count, 0);
-const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, count]) => sum + count, 0);
+const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, jobs]) => sum + jobs.length, 0);
 
 /** 每个 workflow 里 NASM 内联副本的份数（见文件头「NASM」条）。 */
 const NASM_COPIES = { 'ci.yml': 2, 'package.yml': 1 } as const;
@@ -104,8 +102,17 @@ describe('CI 工具链钉扎守门', () => {
     expect(packageJson.engines?.node).toBe('>=24');
 
     // 各桌面 source producer、草稿与汇总保有独立 checkout / Node；不能以总数相等掩盖某腿缺失。
-    for (const [workflow, count] of NODE_JOBS) {
+    for (const [workflow, jobs] of NODE_JOBS) {
       const source = read(workflow);
+      const count = jobs.length;
+      const blocks = source.slice(source.indexOf('\njobs:\n')).split(/\n(?= {2}[a-z][a-z0-9_-]*:\n)/).slice(1);
+      const nodeJobs = blocks.filter((block) => /^\s+(?:-\s+)?uses: actions\/setup-node@/m.test(block));
+      expect(nodeJobs.map((block) => block.match(/^ {2}([^:]+):/)![1]), workflow).toEqual(jobs);
+      for (const block of nodeJobs) {
+        expect(block.match(/actions\/setup-node@v7/g) ?? [], workflow).toHaveLength(1);
+        expect([...block.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), workflow)
+          .toEqual(['26']);
+      }
       expect(source.match(/actions\/checkout@v7/g) ?? [], workflow).toHaveLength(CHECKOUT_COUNTS[workflow]);
       expect(source.match(/actions\/setup-node@v7/g) ?? [], workflow).toHaveLength(count);
       expect([...source.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), workflow)

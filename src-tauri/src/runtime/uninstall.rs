@@ -42,9 +42,9 @@
 //! [rm]: https://developer.apple.com/documentation/foundation/nsuserdefaults/removepersistentdomain(forname:)
 //!
 //! 受保护目录里的 root 内核**没有独立步骤**，因为它没有独立的删除通道：`crates/helper-proto`
-//! 里根本不存在「删内核 / 删受保护目录」这个 IPC 动词（只有 `InstallCore`），三平台的清除一律
-//! 由 `helper-client` 那把 root 卸载脚本顺手做掉（mac `rm -rf /Library/Application Support/Polaris`、
-//! linux `rm -rf /usr/local/lib/polaris` 等、win `Remove-Item -Recurse C:\ProgramData\Polaris`）。
+//! 里根本不存在「删内核 / 删受保护目录」这个 IPC 动词（只有 `InstallCore`）。
+//! `helper-client` 返回实际维护范围：mac 安全退役保留内核/数据，Linux/Windows
+//! 确认删除受管内容；安全锁、审计和 Unknown/部分失败不能当作“全删”。
 //! 故它作为第 1 步的**子结果**如实呈现（带真实路径），而不是伪造成一个「已删除」的独立条目。
 
 #![forbid(unsafe_code)]
@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::runtime::helper::UninstallPreflight;
+use crate::runtime::helper::{HelperRemovalEffect, UninstallPreflight};
 use crate::runtime::update_install::mac_app_bundle_from_exe;
 
 /// 用户配置目录的**固定叶名**——白名单判定的锚（`<app_config_dir>/polaris`，见 `lib.rs::init_base_dir`）。
@@ -77,7 +77,7 @@ pub enum UninstallStep {
     StopCore,
     /// 取消开机自启注册（OS 级登录项，**在配置目录之外**）。
     Autostart,
-    /// 卸载提权 helper —— 其 root 脚本同时清掉受保护目录中的内核。
+    /// 卸载提权 helper —— 平台维护的结果另行说明内核/数据清除或保留范围。
     Helper,
     /// 删用户配置目录（含订阅 / 规则 / 可写内核 / 日志 / 图标缓存）。
     UserConfig,
@@ -127,8 +127,12 @@ impl UninstallStep {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum StepOutcome {
     /// 真做了且成功。`detail` 必须说清**动了哪个路径**。
-    Done { detail: String },
-    /// 本来就没有可做的（helper 没装 / 配置目录不存在）——不算失败，也不算成功。
+    Done {
+        detail: String,
+        #[serde(rename = "helperRemoval", skip_serializing_if = "Option::is_none")]
+        helper_removal: Option<HelperRemovalEffect>,
+    },
+    /// 本来就没有可做的（如配置目录不存在）——不算失败，也不算成功。
     Skipped { detail: String },
     /// 本平台/本安装形态**做不到**。如实标注，绝不冒充 `Done`。
     Unsupported { detail: String },
@@ -143,6 +147,7 @@ impl StepOutcome {
     pub fn done(detail: impl Into<String>) -> Self {
         Self::Done {
             detail: detail.into(),
+            helper_removal: None,
         }
     }
     /// 无事可做。
@@ -204,7 +209,7 @@ pub struct UninstallReport {
 /// 纯判定：逐项结果 → 整体判定。
 ///
 /// 顺序不可换：`Failed`/`NotAttempted` 压过 `Unsupported`，`Unsupported` 压过全绿。
-/// **`Skipped` 不降级** —— helper 本就没装，不该把一次干净的卸载判成「不完整」。
+/// **`Skipped` 不降级**；helper 缺席而受保护数据未核定时必须返回 `Unsupported`。
 #[must_use]
 pub fn verdict_of(steps: &[StepReport]) -> UninstallVerdict {
     if steps.iter().any(|s| {
@@ -215,10 +220,16 @@ pub fn verdict_of(steps: &[StepReport]) -> UninstallVerdict {
     }) {
         return UninstallVerdict::Failed;
     }
-    if steps
-        .iter()
-        .any(|s| matches!(s.outcome, StepOutcome::Unsupported { .. }))
-    {
+    if steps.iter().any(|s| {
+        matches!(
+            s.outcome,
+            StepOutcome::Unsupported { .. }
+                | StepOutcome::Done {
+                    helper_removal: Some(HelperRemovalEffect::RetiredDataPreserved),
+                    ..
+                }
+        )
+    }) {
         return UninstallVerdict::Incomplete;
     }
     UninstallVerdict::Complete
@@ -700,7 +711,7 @@ pub trait HelperUninstallOps {
     /// 是否已安装；Windows 不能据 SCM 缺失推断支持目录无残留。
     fn installed(&self) -> bool;
     /// 真卸载（弹一次提权框）。
-    fn uninstall(&self) -> Result<(), String>;
+    fn uninstall(&self) -> Result<HelperRemovalEffect, String>;
     /// 本平台受保护目录中被一并清掉的内核路径（进报告，让用户知道到底删了哪儿）。
     fn protected_core_dir(&self) -> String;
 }
@@ -844,17 +855,27 @@ impl<H: HelperUninstallOps, A: AutostartOps> UninstallOps for SystemUninstallOps
             return StepOutcome::unsupported("当前平台没有提权助手实现");
         }
         if self.os != "windows" && !self.helper.installed() {
-            return StepOutcome::skipped(
-                "提权助手未安装，无需卸载（受保护目录中也不会有受管内核）",
-            );
+            return StepOutcome::unsupported(format!(
+                "提权助手未安装；受保护内核与历史退役数据未确认清除，未执行删除（{}）",
+                self.helper.protected_core_dir()
+            ));
         }
         // On Windows the fixed native cleaner is the authoritative absence /
         // cleanup check. Missing or old helper must not bypass residual cleanup.
         match self.helper.uninstall() {
-            Ok(()) => StepOutcome::done(format!(
-                "已卸载提权助手，并一并清除受保护目录中的内核（{}）",
-                self.helper.protected_core_dir()
-            )),
+            Ok(effect) => StepOutcome::Done {
+                detail: match effect {
+                    HelperRemovalEffect::Removed => format!(
+                        "已卸载提权助手并清除受管内核（{}）；安全锁与审计证据按平台策略保留",
+                        self.helper.protected_core_dir()
+                    ),
+                    HelperRemovalEffect::RetiredDataPreserved => format!(
+                        "已安全退役提权助手；受保护内核与数据仍保留，未执行删除（{}）",
+                        self.helper.protected_core_dir()
+                    ),
+                },
+                helper_removal: Some(effect),
+            },
             Err(e) => StepOutcome::failed(e),
         }
     }

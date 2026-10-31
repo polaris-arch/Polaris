@@ -288,7 +288,7 @@ impl TaildropRuntime {
         });
     }
 
-    /// `receivedBytes` 是核每次吃进请求 chunk 的**增量**（不是累计值）。
+    /// `receivedBytes` 是整个发送流跨文件的累计字节数；重复或逆序回执不增加计数。
     pub fn record_acknowledged<S: TaildropTaskEventSink + ?Sized>(
         &self,
         task_id: &str,
@@ -296,11 +296,10 @@ impl TaildropRuntime {
         sink: &S,
     ) {
         self.mutate_active(task_id, sink, |snapshot| {
-            let delta = u64::try_from(acknowledged_bytes).unwrap_or(0);
-            snapshot.acknowledged_bytes = snapshot
-                .acknowledged_bytes
-                .saturating_add(delta)
+            let received = u64::try_from(acknowledged_bytes)
+                .unwrap_or(0)
                 .min(snapshot.total_bytes);
+            snapshot.acknowledged_bytes = snapshot.acknowledged_bytes.max(received);
         });
     }
 

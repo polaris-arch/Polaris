@@ -5,7 +5,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[build-dependencies]
+polaris-helper-proto = { path = "../helper-proto" }
+serde_json.workspace = true
+sha2 = "0.11"
+
 [dependencies]
+polaris-helper-proto = { path = "../helper-proto" }
+serde_json.workspace = true
+sha2 = "0.11"
 tokio = { version = "1", features = ["process", "rt", "net", "sync", "time", "macros", "io-util"] }
 thiserror = "2"
 log = "0.4"
@@ -14,7 +22,9 @@ log = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", features = ["fs"] }
 rustix = { version = "1.1.4", features = ["fs", "process", "event"] }
-sha2 = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31.3", features = ["fs"] }
 
 # Windows 进程接口：作业对象（直起的核随主程序一起结束）与孤儿清扫的进程枚举 / 命令行读取。
 # 与 helper / src-tauri 同一个 windows-sys 版本；仅 cfg(windows) 参与编译。
@@ -22,6 +32,12 @@ sha2 = "0.11"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
@@ -29,7 +45,17 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+polaris-source-probe = { version = "1.0.0", path = "../source-probe" }
 tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "net", "sync", "time", "macros", "io-util", "test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.31.3", features = ["process"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+find-msvc-tools = "=0.1.9"
+
+[features]
+default = ["formal-selection"]
+formal-selection = []
+local-development-selection = []
+installed-development-selection = ["local-development-selection"]

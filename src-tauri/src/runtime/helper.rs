@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod recovery_consumer;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -31,8 +33,8 @@ use polaris_helper_client::PipeConnector;
 use polaris_helper_client::UnixConnector;
 use polaris_helper_client::{
     read_token, EscalationOutcome, HelperClient, HelperManager, HelperStatus, InstallParams,
-    InstallPaths, MaintenanceUtility, ManagerError, StdExecutor, StdSysOps, SysOps,
-    READY_POLL_ATTEMPTS, READY_POLL_DELAY,
+    InstallPaths, MaintenanceOutcome, MaintenanceUtility, ManagerError, StdExecutor, StdSysOps,
+    SysOps, READY_POLL_ATTEMPTS, READY_POLL_DELAY,
 };
 use polaris_helper_proto::{
     FlushDns, HelperBirthTarget, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns,
@@ -156,6 +158,8 @@ pub struct SelectedCoreSnapshot {
     pub version: String,
     pub provider_fingerprint: String,
     pub state: SelectedCoreState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -165,6 +169,40 @@ pub enum SelectedCoreState {
     Absent,
     Invalid,
     Unavailable,
+}
+
+fn project_selected_core_status(
+    status: &mut HelperStatusSnapshot,
+    result: Result<polaris_helper_proto::core_protocol::CoreStatus, String>,
+) -> (SelectedCoreState, Option<String>) {
+    use polaris_core_supervisor::admitted_payload::AdmissionErrorKind;
+    use polaris_helper_proto::core_protocol::CoreStatus;
+    match result {
+        Ok(CoreStatus::Present { .. }) => (SelectedCoreState::Present, None),
+        Ok(CoreStatus::Absent { .. }) => {
+            status.ready = false;
+            status.upgradeable = true;
+            (SelectedCoreState::Absent, None)
+        }
+        Ok(CoreStatus::Invalid { reason, .. }) => {
+            status.ready = false;
+            let kind = AdmissionErrorKind::from_status_token(&reason);
+            if kind.is_some_and(|k| !k.is_payload_damage()) {
+                (
+                    SelectedCoreState::Unavailable,
+                    kind.map(|k| format!("{k:?}")),
+                )
+            } else {
+                status.needs_repair = true;
+                (SelectedCoreState::Invalid, kind.map(|k| format!("{k:?}")))
+            }
+        }
+        Err(_) => {
+            status.ready = false;
+            status.needs_repair = true;
+            (SelectedCoreState::Unavailable, None)
+        }
+    }
 }
 
 /// Helper 动作的稳定失败码。前端按码本地化，`diagnostic` 不得直接展示。
@@ -186,6 +224,7 @@ pub enum HelperActionErrorCode {
     InstallerFailed,
     UpgradeDeferred,
     Failed,
+    RecoveryRequired,
 }
 
 /// Explicit installation intent. Omitted IPC mode remains the non-disruptive ordinary path.
@@ -199,7 +238,7 @@ pub enum HelperInstallMode {
 
 impl HelperInstallMode {
     pub const fn supported_on(self, platform: Platform) -> bool {
-        matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)
+        matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac | Platform::Linux)
     }
 
     fn manager_mode(self) -> polaris_helper_client::manager::InstallMode {
@@ -433,6 +472,13 @@ fn helper_execution_diagnostic(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HelperRemovalEffect {
+    Removed,
+    RetiredDataPreserved,
+}
+
 /// install/uninstall 结果信封（前端 `helperApi.install/uninstall` 期望
 /// `{ success, errorCode?, diagnostic?, status }`）。
 ///
@@ -440,8 +486,19 @@ fn helper_execution_diagnostic(
 /// + 稳定码。**外层仍是 `ApiResponse::ok`**（IPC 层不失败——用户取消提权是正常流程，非命令错误）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CoreRecoveryReport {
+    pub user: crate::runtime::core_identity::user_store::UserRecoveryState,
+    pub helper_complete: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HelperActionResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<CoreRecoveryReport>,
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uninstall_effect: Option<HelperRemovalEffect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_diagnostic: Option<HelperExecutionDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -689,10 +746,11 @@ impl crate::runtime::uninstall::HelperUninstallOps for HelperRuntime {
         self.status().installed
     }
 
-    fn uninstall(&self) -> Result<(), String> {
+    fn uninstall(&self) -> Result<HelperRemovalEffect, String> {
         let r = HelperRuntime::uninstall(self);
         if r.success {
-            Ok(())
+            r.uninstall_effect
+                .ok_or_else(|| "helper cleanup scope is unconfirmed".to_owned())
         } else {
             // 提权三态里「用户取消」也落这里 —— 它对完全卸载就是一次失败（用户没授权 ⇒ 什么都没删），
             // 必须让 fail-fast 拦下后面的删除，而不是当成「跳过」继续删配置和应用本体。
@@ -734,6 +792,7 @@ impl Connector for NeverConnect {
 #[derive(Default)]
 struct CoreMutationFences {
     ever_mutated: bool,
+    recovery_active: bool,
     slots: Vec<Weak<Mutex<DirectCoreSlot>>>,
 }
 
@@ -770,6 +829,63 @@ pub struct HelperRuntime {
     test_connector: Option<Arc<dyn Connector + Sync>>,
 }
 
+struct RecoveryReservation<'a> {
+    helper: &'a HelperRuntime,
+    slots: Vec<Arc<Mutex<DirectCoreSlot>>>,
+    released: bool,
+}
+impl RecoveryReservation<'_> {
+    fn release(&mut self) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        let mut registry = self
+            .helper
+            .core_mutation_fences
+            .lock()
+            .map_err(|_| "recovery registry poisoned")?;
+        for slot in &self.slots {
+            slot.lock()
+                .map_err(|_| "original recovery slot poisoned")?
+                .release_recovery_reservation();
+        }
+        registry.recovery_active = false;
+        self.released = true;
+        Ok(())
+    }
+}
+impl Drop for RecoveryReservation<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            log::error!("CORE_RECOVERY_BUSY: original reservation remains unknown: {error}");
+        }
+    }
+}
+struct RecoveryCheckPause(Option<polaris_core_supervisor::config_gate::AdmissionPause>);
+impl RecoveryCheckPause {
+    fn acquire() -> Result<Self, String> {
+        polaris_core_supervisor::config_gate::pause_idle_check_producers()
+            .map(|pause| Self(Some(pause)))
+            .map_err(|_| "CORE_RECOVERY_BUSY: validation or cleanup still owns work".into())
+    }
+    fn release(&mut self) -> Result<(), String> {
+        if let Some(pause) = &self.0 {
+            pause
+                .surrender()
+                .map_err(|_| "original validation admission remains unknown")?;
+        }
+        self.0.take();
+        Ok(())
+    }
+}
+impl Drop for RecoveryCheckPause {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            log::error!("CORE_RECOVERY_BUSY: cannot reopen original validation admission: {error}");
+        }
+    }
+}
+
 impl HelperRuntime {
     pub fn new(dir: PathBuf) -> Self {
         let platform = Platform::current();
@@ -796,6 +912,9 @@ impl HelperRuntime {
             .core_mutation_fences
             .lock()
             .map_err(|_| "helper core fence registry poisoned".to_string())?;
+        if registry.recovery_active {
+            return Err("CORE_RECOVERY_BUSY: explicit recovery owns admission".into());
+        }
         registry.slots.retain(|slot| slot.strong_count() > 0);
         if registry.ever_mutated {
             let live = slot
@@ -817,6 +936,9 @@ impl HelperRuntime {
             .core_mutation_fences
             .lock()
             .map_err(|_| "helper core fence registry poisoned".to_string())?;
+        if registry.recovery_active {
+            return Err("CORE_RECOVERY_BUSY: explicit recovery owns admission".into());
+        }
         registry.ever_mutated = true;
         let mut index = 0;
         while index < registry.slots.len() {
@@ -830,6 +952,42 @@ impl HelperRuntime {
             index += 1;
         }
         Ok(())
+    }
+
+    fn reserve_recovery(&self) -> Result<RecoveryReservation<'_>, String> {
+        let mut registry = self
+            .core_mutation_fences
+            .lock()
+            .map_err(|_| "CORE_RECOVERY_BUSY: registry unknown")?;
+        if registry.recovery_active {
+            return Err("CORE_RECOVERY_BUSY: recovery already active".into());
+        }
+        let mut slots: Vec<Arc<Mutex<DirectCoreSlot>>> = Vec::new();
+        for weak in &registry.slots {
+            let Some(slot) = weak.upgrade() else {
+                continue;
+            };
+            let result = slot
+                .lock()
+                .map_err(|_| "CORE_RECOVERY_BUSY: Child custody unknown".to_string())
+                .and_then(|mut s| s.reserve_for_recovery());
+            if let Err(error) = result {
+                for held in &slots {
+                    if let Ok(mut s) = held.lock() {
+                        s.release_recovery_reservation();
+                    }
+                }
+                return Err(error);
+            }
+            slots.push(slot);
+        }
+        registry.ever_mutated = true;
+        registry.recovery_active = true;
+        Ok(RecoveryReservation {
+            helper: self,
+            slots,
+            released: false,
+        })
     }
 
     #[cfg(test)]
@@ -1055,35 +1213,26 @@ impl HelperRuntime {
             status.needs_repair = true;
             return;
         };
-        let state = if !status.ready {
-            SelectedCoreState::Unavailable
+        let (state, admission) = if let Err(error) =
+            polaris_core_supervisor::admitted_payload::check_selected_capability(
+                crate::runtime::core_identity::ExecPurpose::RunMain,
+            ) {
+            status.ready = false;
+            (
+                SelectedCoreState::Unavailable,
+                Some(format!("{:?}", error.kind)),
+            )
+        } else if !status.ready {
+            (SelectedCoreState::Unavailable, None)
         } else {
-            match self.core_status() {
-                Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. }) => {
-                    SelectedCoreState::Present
-                }
-                Ok(polaris_helper_proto::core_protocol::CoreStatus::Absent { .. }) => {
-                    status.ready = false;
-                    status.upgradeable = true;
-                    SelectedCoreState::Absent
-                }
-                Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid { .. }) => {
-                    status.ready = false;
-                    status.needs_repair = true;
-                    SelectedCoreState::Invalid
-                }
-                Err(_) => {
-                    status.ready = false;
-                    status.needs_repair = true;
-                    SelectedCoreState::Unavailable
-                }
-            }
+            project_selected_core_status(status, self.core_status())
         };
         status.selected_core = Some(SelectedCoreSnapshot {
             id: id.as_str().into(),
             version: manifest.version,
             provider_fingerprint: manifest.provider_fingerprint,
             state,
+            admission,
         });
     }
 
@@ -1094,7 +1243,9 @@ impl HelperRuntime {
         diagnostic: impl Into<String>,
     ) -> HelperActionResult {
         HelperActionResult {
+            recovery: None,
             success: false,
+            uninstall_effect: None,
             execution_diagnostic: None,
             error_code: Some(code),
             diagnostic: Some(diagnostic.into()),
@@ -1111,25 +1262,106 @@ impl HelperRuntime {
         self.install_with_mode(HelperInstallMode::Ordinary)
     }
 
+    /// Routing only: root independently repeats actual object/receipt admission.
+    pub(crate) fn linux_legacy_maintenance_needed(&self) -> bool {
+        if self.platform != Platform::Linux {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::read_dir("/var/lib/polaris") {
+                Ok(mut entries) => {
+                    if entries.any(|entry| {
+                        entry
+                            .map(|e| {
+                                let name = e.file_name();
+                                let name = name.to_string_lossy();
+                                name.starts_with("helper-upgrade.")
+                                    || name.starts_with("helper-admission.")
+                            })
+                            .unwrap_or(true)
+                    }) {
+                        return true;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return true,
+            }
+            let paths = polaris_helper_client::manager::InstallPaths::linux();
+            if let Some(unit) = paths.descriptor.as_ref() {
+                if std::fs::symlink_metadata(unit).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return true;
+                }
+            }
+            match std::fs::symlink_metadata("/usr/local/lib/polaris") {
+                Ok(m) if m.is_dir() && m.uid() == 0 && m.mode() & 0o7777 == 0o755 => {
+                    if !paths.binary.try_exists().unwrap_or(true) {
+                        return false;
+                    }
+                    let record = std::fs::read("/var/lib/polaris/helper-installed.json")
+                        .ok()
+                        .and_then(|raw| {
+                            polaris_helper_proto::core_manifest::InstalledHelperRecord::parse(&raw)
+                                .ok()
+                        });
+                    let selected = crate::runtime::core_identity::current_platform()
+                        .ok()
+                        .and_then(|platform| {
+                            crate::runtime::core_identity::selected_manifest(platform).ok()
+                        })
+                        .and_then(|manifest| manifest.helper_sha256);
+                    record.is_none_or(|record| selected.as_deref() != Some(record.sha256.as_str()))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                _ => true,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+
     /// StopAndUpgrade requires explicit confirmation covering all sessions managed by this helper.
     #[must_use]
     pub fn install_with_mode(&self, mode: HelperInstallMode) -> HelperActionResult {
+        self.install_with_linux_original_proxy(mode, None)
+    }
+
+    pub(crate) fn install_with_linux_original_proxy(
+        &self,
+        mode: HelperInstallMode,
+        original: Option<[String; 10]>,
+    ) -> HelperActionResult {
         if !mode.supported_on(self.platform) {
             return self.action_failed(
                 HelperActionErrorCode::Unsupported,
-                "explicit helper stop-and-upgrade is supported only on macOS",
+                "explicit helper stop-and-upgrade requires macOS or Linux",
             );
         }
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
         }
-        let (params, _stage) = match self.install_params() {
+        let mut checks = match RecoveryCheckPause::acquire() {
+            Ok(guard) => guard,
+            Err(e) => return self.action_failed(HelperActionErrorCode::ProxyRunning, e),
+        };
+        let mut reservation = match self.reserve_recovery() {
+            Ok(guard) => guard,
+            Err(e) => return self.action_failed(HelperActionErrorCode::ProxyRunning, e),
+        };
+        let (mut params, stage) = match self.install_params() {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("helper install assets unavailable: {e}");
                 return self.action_failed(
                     if e.starts_with("CORE_BUNDLE_MISMATCH:") {
                         HelperActionErrorCode::BundleMismatch
+                    } else if e.starts_with("CORE_RECOVERY_CANCELLED:") {
+                        HelperActionErrorCode::Cancelled
+                    } else if e.starts_with("CORE_RECOVERY_IO:") {
+                        HelperActionErrorCode::Failed
                     } else {
                         HelperActionErrorCode::MissingAsset
                     },
@@ -1137,12 +1369,23 @@ impl HelperRuntime {
                 );
             }
         };
-        if let Err(error) = self.register_core_mutation() {
-            log::warn!("helper install mutation preflight failed: {error}");
-            return self.action_failed(HelperActionErrorCode::Failed, error);
-        }
+        params.linux_legacy_original_proxy = original;
+        let user_recovery =
+            match crate::runtime::core_identity::user_store::install(&self.dir, &stage) {
+                Ok(state) => state,
+                Err(error) => {
+                    let mut result =
+                        self.action_failed(HelperActionErrorCode::RecoveryRequired, error);
+                    result.recovery = Some(CoreRecoveryReport {
+                        user: crate::runtime::core_identity::user_store::UserRecoveryState::Pending,
+                        helper_complete: false,
+                    });
+                    return result;
+                }
+            };
         let manager = self.manager();
-        match manager.install_with_mode(&params, &StdExecutor, mode.manager_mode()) {
+        let mut result = match manager.install_with_mode(&params, &StdExecutor, mode.manager_mode())
+        {
             Ok(EscalationOutcome::Success) => {
                 // Service readiness and this App's installed content id are
                 // separate receipts, including when a newer helper is retained.
@@ -1156,7 +1399,9 @@ impl HelperRuntime {
                 self.apply_selected_core_status(&mut status);
                 if helper_install_reached_expected_build(&status) {
                     HelperActionResult {
+                        recovery: None,
                         success: true,
+                        uninstall_effect: None,
                         execution_diagnostic: None,
                         error_code: None,
                         diagnostic: None,
@@ -1164,7 +1409,9 @@ impl HelperRuntime {
                     }
                 } else {
                     HelperActionResult {
+                        recovery: None,
                         success: false,
+                        uninstall_effect: None,
                         execution_diagnostic: None,
                         error_code: Some(HelperActionErrorCode::NotReady),
                         diagnostic: Some(
@@ -1196,7 +1443,20 @@ impl HelperRuntime {
                     "helper install operation failed",
                 )
             }
+        };
+        let helper_complete = result.success;
+        if let Err(error) = reservation.release().and_then(|_| checks.release()) {
+            result.success = false;
+            result.error_code = Some(HelperActionErrorCode::RecoveryRequired);
+            result.diagnostic = Some(format!(
+                "CORE_RECOVERY_REQUIRED: admission cleanup unknown: {error}"
+            ));
         }
+        result.recovery = Some(CoreRecoveryReport {
+            user: user_recovery,
+            helper_complete,
+        });
+        result
     }
 
     /// 卸载 helper（上游 `helper:uninstall`）——真流程：HelperManager.uninstall（bootout/删描述符/删二进制/
@@ -1207,6 +1467,13 @@ impl HelperRuntime {
     /// [`uninstall_preflight_stop`] 完成 —— 直接调本方法会跳过那道闸。
     #[must_use]
     pub fn uninstall(&self) -> HelperActionResult {
+        self.uninstall_with_linux_original_proxy(None)
+    }
+
+    pub(crate) fn uninstall_with_linux_original_proxy(
+        &self,
+        original: Option<[String; 10]>,
+    ) -> HelperActionResult {
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
         }
@@ -1220,23 +1487,56 @@ impl HelperRuntime {
             match maintenance_utility() {
                 Ok(utility) => Some(utility),
                 Err(error) => {
-                    return self.action_failed(HelperActionErrorCode::MissingAsset, error)
+                    return self.action_failed(
+                        if error.starts_with("CORE_BUNDLE_MISMATCH:") {
+                            HelperActionErrorCode::BundleMismatch
+                        } else {
+                            HelperActionErrorCode::MissingAsset
+                        },
+                        error,
+                    );
                 }
             }
         };
-        match manager.uninstall_with_maintenance(&self.dir, utility.as_ref(), &StdExecutor) {
-            Ok(EscalationOutcome::Success) => HelperActionResult {
+        let outcome = if self.platform == Platform::Linux && original.is_some() {
+            manager
+                .uninstall_with_linux_original_proxy(
+                    &self.dir,
+                    utility.as_ref(),
+                    original.as_ref(),
+                    &StdExecutor,
+                )
+                .map(|value| match value {
+                    EscalationOutcome::Success => MaintenanceOutcome::Removed,
+                    EscalationOutcome::Cancelled => MaintenanceOutcome::Cancelled,
+                    EscalationOutcome::Failed { stderr, code } => {
+                        MaintenanceOutcome::Failed { stderr, code }
+                    }
+                })
+        } else {
+            manager.uninstall_with_maintenance_outcome(&self.dir, utility.as_ref(), &StdExecutor)
+        };
+        match outcome {
+            Ok(
+                outcome @ (MaintenanceOutcome::Removed | MaintenanceOutcome::RetiredDataPreserved),
+            ) => HelperActionResult {
+                recovery: None,
                 success: true,
+                uninstall_effect: Some(if outcome == MaintenanceOutcome::RetiredDataPreserved {
+                    HelperRemovalEffect::RetiredDataPreserved
+                } else {
+                    HelperRemovalEffect::Removed
+                }),
                 execution_diagnostic: None,
                 error_code: None,
                 diagnostic: None,
                 status: self.status(),
             },
-            Ok(EscalationOutcome::Cancelled) => self.action_failed(
+            Ok(MaintenanceOutcome::Cancelled) => self.action_failed(
                 HelperActionErrorCode::Cancelled,
                 "administrator authorization cancelled",
             ),
-            Ok(EscalationOutcome::Failed { stderr, code }) => {
+            Ok(MaintenanceOutcome::Failed { stderr, code }) => {
                 log::warn!("helper uninstall command failed (exit {code}): {stderr}");
                 let mut result = self.action_failed(
                     uninstall_failure_code(self.platform, code),
@@ -1260,16 +1560,13 @@ impl HelperRuntime {
     fn install_params(
         &self,
     ) -> Result<(InstallParams, crate::runtime::core_identity::InstallStage), String> {
-        let src_binary = resolve_helper_binary()?;
-        // 三平台同构：安装脚本用它**播种**受保护核目录（仅在目标缺失时）。名叫 bundled 实为
-        // `resolve_core_binary()` = **现役核**（即随包核；debug / test 构型可被开发态超驰替换），如实登记在
-        // `InstallParams::bundled_core` 的字段文档里。
-        // win 的 `--singbox` 不再从这里取：P4 起由 `InstallPaths::win().core_dir` 派生受保护路径。
-        let bundled_core = crate::runtime::proxy::resolve_core_binary()?;
-        let stage = crate::runtime::core_identity::stage_installation(
-            &bundled_core,
+        let src_binary = resolve_recovery_helper_binary()?;
+        // Explicit repair reads the independent compiled archive. It never
+        // copies a damaged expanded core or chooses a runtime override/cache.
+        let stage = crate::runtime::core_identity::stage_recovery_installation(
             &src_binary,
             &self.dir,
+            &std::sync::atomic::AtomicBool::new(false),
         )?;
         #[cfg(windows)]
         let user_identity = polaris_helper::platform::windows::native_caller::current_user()
@@ -1291,6 +1588,7 @@ impl HelperRuntime {
                 .map_err(|error| error.to_string())?,
         );
         let params = InstallParams {
+            linux_legacy_original_proxy: None,
             manifest_path,
             manifest_sha256,
             core_id: polaris_helper_proto::core_manifest::CoreId::parse(&stage.manifest.id)
@@ -1301,6 +1599,7 @@ impl HelperRuntime {
                 .helper_sha256
                 .clone()
                 .ok_or("actual installer hash unavailable")?,
+            cleaner_sha256: stage.manifest.core.cleaner_sha256.clone(),
             helper_version: env!("CARGO_PKG_VERSION").into(),
             user_identity,
             src_binary: stage.directory.join(helper_name),
@@ -1327,7 +1626,10 @@ impl HelperRuntime {
             polaris_helper_proto::core_protocol::CoreStatus::Absent { .. } => {
                 Err("HELPER_CORE_ABSENT: 提权助手尚未安装本版本配套内核，请更新提权助手".into())
             }
-            polaris_helper_proto::core_protocol::CoreStatus::Invalid { .. } => {
+            polaris_helper_proto::core_protocol::CoreStatus::Invalid { reason, .. } => {
+                if let Some(kind)=polaris_core_supervisor::admitted_payload::AdmissionErrorKind::from_status_token(&reason).filter(|k|!k.is_payload_damage()) {
+                    return Err(format!("CORE_ADMISSION_{kind:?}: helper rejected the selected execution capability"));
+                }
                 Err("HELPER_CORE_INVALID: 配套内核校验失败，请重新安装提权助手".into())
             }
         }
@@ -1363,7 +1665,7 @@ impl HelperRuntime {
             Platform::Linux => Request::LinuxStartPinned(params),
             Platform::Mac | Platform::Win => Request::NativeStartPinned(params),
             Platform::Other | Platform::Android | Platform::Ios => {
-                return Err("pinned desktop helper unavailable on this platform".into())
+                return Err("pinned desktop helper unavailable on this platform".into());
             }
         };
         let received = client
@@ -1397,7 +1699,7 @@ impl HelperRuntime {
                     self.platform,
                     "pinned 起核",
                     &error,
-                ))
+                ));
             }
             _ => return Err("HELPER_CORE_MISMATCH: helper omitted pinned receipt".into()),
         };
@@ -2364,21 +2666,12 @@ fn current_uid() -> u32 {
 }
 
 fn maintenance_utility() -> Result<MaintenanceUtility, String> {
+    let platform = crate::runtime::core_identity::current_platform()?;
+    // The helper has its own compiled byte pin. Maintenance never verifies or
+    // requires a core payload that may already have been removed.
+    let selected = crate::runtime::core_identity::selected_manifest(platform)?;
     let src_binary = resolve_helper_binary()?;
-    let file = std::fs::File::open(&src_binary).map_err(|e| e.to_string())?;
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Err("bundled maintenance utility is not a regular nonempty file".into());
-    }
-    let helper_sha256 = polaris_updater::verify::sha256_reader_hex(std::io::Read::take(
-        file,
-        metadata.len().saturating_add(1),
-    ))
-    .map_err(|e| e.to_string())?;
-    Ok(MaintenanceUtility {
-        src_binary,
-        helper_sha256,
-    })
+    crate::runtime::core_identity::maintenance_utility_from(&src_binary, platform, &selected)
 }
 
 /// 解析 bundled `polaris-helper` 二进制（镜像 [`resolve_core_binary`](crate::runtime::proxy::resolve_core_binary)
@@ -2393,6 +2686,41 @@ fn maintenance_utility() -> Result<MaintenanceUtility, String> {
 /// 逃生门再指一次只会多一个入口、不多一分能力。
 /// 判据不过 ⇒ 记 `ENV_PATH_UNTRUSTED` 并回落兜底腿，**绝不静默**。
 /// 开发态（debug / test）逃生门仍是原样的第一优先级 —— helper 的本地迭代靠它装自编产物。
+fn recovery_helper_from_roots(roots: &[PathBuf], platform: &str) -> Result<PathBuf, String> {
+    let name = if platform == "win" {
+        "polaris-helper.exe"
+    } else {
+        "polaris-helper"
+    };
+    for root in roots {
+        let runtime = root.join(platform);
+        let recovery = root.join("core-recovery").join(platform);
+        // The first actual package owns this explicit attempt. Missing/bad
+        // members there cannot trigger a legacy/cache/other-root retry.
+        for candidate in [&runtime, &recovery] {
+            match std::fs::symlink_metadata(candidate) {
+                Ok(_) => return Ok(runtime.join(name)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(_) => return Err("CORE_BUNDLE_MISMATCH: current package namespace unavailable; reinstall trusted current app".into()),
+            }
+        }
+    }
+    Err(
+        "CORE_BUNDLE_MISMATCH: no current package recovery source; reinstall trusted current app"
+            .into(),
+    )
+}
+fn resolve_recovery_helper_binary() -> Result<PathBuf, String> {
+    let platform = crate::runtime::core_identity::current_platform()?;
+    let exe = std::env::current_exe()
+        .map_err(|_| "CORE_BUNDLE_MISMATCH: current app location unavailable")?;
+    let roots = crate::runtime::proxy::bundle_resource_roots(
+        exe.parent(),
+        crate::runtime::proxy::dev_manifest_dir(),
+    );
+    recovery_helper_from_roots(&roots, platform)
+}
+
 pub(super) fn resolve_helper_binary() -> Result<PathBuf, String> {
     let filename = if cfg!(windows) {
         "polaris-helper.exe"
@@ -2444,6 +2772,24 @@ fn query_core_status(
     id: &polaris_helper_proto::core_manifest::CoreId,
 ) -> Result<polaris_helper_proto::core_protocol::CoreStatus, String> {
     use polaris_helper_proto::core_protocol::CoreStatus;
+    // Read-only hint for recovery UX. A later daemon may differ; actual Start
+    // still carries the mandatory v3 marker and the executor admits its objects.
+    match client.send_with_timeout(&Request::Version, Duration::from_secs(5)) {
+        Ok(Response::Ok(ResponseKind::Version { proto_version }))
+            if proto_version >= polaris_helper_proto::proto_version::MIN_TRUSTED_EXECUTION => {}
+        Ok(Response::Ok(ResponseKind::Version { .. })) => return Ok(CoreStatus::Invalid {
+            id: id.clone(),
+            reason:
+                polaris_core_supervisor::admitted_payload::AdmissionErrorKind::UnsupportedCapability
+                    .status_token()
+                    .into(),
+        }),
+        _ => {
+            return Err(
+                "CORE_ADMISSION_Unknown: helper execution protocol could not be observed".into(),
+            )
+        }
+    }
     match client.send_with_timeout(
         &Request::CoreStatus { id: id.clone() },
         Duration::from_secs(5),

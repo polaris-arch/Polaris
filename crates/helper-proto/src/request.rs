@@ -335,6 +335,7 @@ impl Request {
         match self {
             Self::CoreStatus { id } => out.push(id.as_str().to_owned()),
             Self::LinuxStartPinned(params) | Self::NativeStartPinned(params) => {
+                out.push(crate::core_protocol::PINNED_EXECUTION_DISCRIMINATOR.to_owned());
                 out.push(params.id.as_str().to_owned());
                 push_start_args(&params.common, out);
             }

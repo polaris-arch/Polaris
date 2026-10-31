@@ -97,9 +97,14 @@ fn empty_tier1_falls_back_to_defaults() {
 }
 
 #[test]
-fn custom_domain_and_dot_specs_are_rejected() {
+fn custom_domain_specs_are_rejected_but_dot_is_supported() {
     assert!(parse_custom_upstream(&custom("d", "https://dns.google/dns-query")).is_none());
-    assert!(parse_custom_upstream(&custom("d", "tls://1.1.1.1:853")).is_none());
+    assert_eq!(
+        parse_custom_upstream(&custom("d", "tls://1.1.1.1:853"))
+            .unwrap()
+            .kind,
+        UpstreamKind::Dot
+    );
     assert!(parse_custom_upstream(&custom("", "https://1.1.1.1/dns-query")).is_none());
     assert!(parse_custom_upstream(&custom("d", "")).is_none());
     assert!(!is_valid_custom_upstream_spec(
@@ -336,7 +341,7 @@ fn plan_consumes_custom_pool_entry_end_to_end() {
 #[test]
 fn explicit_unsupported_selection_fails_generation_validation_without_hydration_changes() {
     let mut dns = DnsConfig {
-        node_resolver_custom: Some(vec![custom("tls", "tls://1.1.1.1")]),
+        node_resolver_custom: Some(vec![custom("tls", "tls://resolver.example")]),
         node_resolver_pool: Some(ids(&["tls"])),
         ..Default::default()
     };
@@ -357,4 +362,147 @@ fn explicit_unsupported_selection_fails_generation_validation_without_hydration_
     assert!(validate_selected_upstreams(None).is_ok());
     assert!(validate_selected_upstreams(Some(&DnsConfig::default())).is_ok());
     assert!(!is_valid_custom_upstream_spec("https://[:::]/dns-query"));
+}
+
+#[test]
+fn dot_normalizes_ip_ports_and_keeps_protocol_identity_and_tiers() {
+    let custom = vec![
+        custom("dot", "tls://[2001:0DB8:0:0:0:0:0:1]"),
+        custom("equivalent", "tls://[2001:db8::1]:0853"),
+        custom("https", "https://[2001:db8::1]:853/Query?Token=A"),
+        custom("udp", "udp://[2001:db8::1]:853"),
+        custom("third", "tls://1.1.1.1:8853"),
+        custom("fourth", "tls://9.9.9.9"),
+    ];
+    let plan = resolve_upstreams(
+        &ids(&[
+            "dot",
+            "equivalent",
+            "https",
+            "udp",
+            "third",
+            "fourth",
+            "system",
+        ]),
+        &custom,
+    );
+    assert_eq!(
+        plan.tier1.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+        vec!["dot", "https", "third"]
+    );
+    assert_eq!(plan.tier2.len(), 2);
+    assert_eq!(plan.tier1[0].kind, UpstreamKind::Dot);
+    assert_eq!(plan.tier1[0].ip.as_deref(), Some("2001:db8::1"));
+    assert_eq!(plan.tier1[0].port, Some(853));
+    assert!(plan.tier1[0].path.is_none());
+    assert_eq!(plan.tier1[1].path.as_deref(), Some("/Query?Token=A"));
+    assert_eq!(plan.tier1[2].port, Some(8853));
+    assert_ne!(
+        upstream_canonical_key(&plan.tier1[0]),
+        upstream_canonical_key(&plan.tier1[1])
+    );
+}
+
+#[test]
+fn node_specs_reject_non_ip_authority_options_and_invalid_ports() {
+    for spec in [
+        "tls://resolver.example",
+        "tls://1.1.1.1:0",
+        "tls://1.1.1.1:65536",
+        "tls://1.1.1.1/path",
+        "tls://1.1.1.1?server_name=x",
+        "tls://user@1.1.1.1",
+        "tls://[::1]extra",
+        "tls://[::1]:",
+        "tls://[1.1.1.1]",
+        "tls://[:::]",
+        "tls://01.2.3.4",
+    ] {
+        assert!(
+            parse_custom_upstream(&custom("bad", spec)).is_none(),
+            "{spec}"
+        );
+    }
+    for spec in ["tls://1.1.1.1", "tls://1.1.1.1:65535", "tls://[::1]:1"] {
+        assert!(is_valid_custom_upstream_spec(spec), "{spec}");
+    }
+}
+
+#[test]
+fn raw_authority_rejects_whitespace_control_before_any_normalization() {
+    for scheme in ["https", "tls", "udp"] {
+        for authority in [
+            "1.1.1.1\t:853",
+            "1.1.1.1\n:853",
+            "1.1.1.1\r:853",
+            "1.1.1.1 :853",
+            "1.1.1.1\u{00a0}:853",
+            "1.1.1.1\u{007f}:853",
+            "1.1.1.1\u{0085}:853",
+            "[2001:db8::1\t]:853",
+            "1.1.1.1:8\t53",
+        ] {
+            let path = if scheme == "https" {
+                "/Query?Token=A%20B"
+            } else {
+                ""
+            };
+            let spec = format!("{scheme}://{authority}{path}");
+            assert!(
+                parse_custom_upstream(&custom("bad", &spec)).is_none(),
+                "{spec:?}"
+            );
+        }
+        let path = if scheme == "https" {
+            "/Query?Token=A%20B"
+        } else {
+            ""
+        };
+        let spec = format!(" \t{scheme}://1.1.1.1:853{path} \r\n");
+        let parsed = parse_custom_upstream(&custom("good", &spec)).unwrap();
+        assert_eq!(parsed.ip.as_deref(), Some("1.1.1.1"));
+        if scheme == "https" {
+            assert_eq!(parsed.path.as_deref(), Some("/Query?Token=A%20B"));
+        }
+    }
+}
+
+#[test]
+fn node_unicode_edge_set_is_shared_with_inventory_and_toggle_admission() {
+    for edge in [
+        "\u{9}", "\u{a}", "\u{b}", "\u{c}", "\u{d}", "\u{20}", "\u{85}", "\u{a0}", "\u{1680}",
+        "\u{2000}", "\u{2001}", "\u{2002}", "\u{2003}", "\u{2004}", "\u{2005}", "\u{2006}",
+        "\u{2007}", "\u{2008}", "\u{2009}", "\u{200a}", "\u{2028}", "\u{2029}", "\u{202f}",
+        "\u{205f}", "\u{3000}", "\u{feff}",
+    ] {
+        for source in [
+            "https://1.1.1.1/Query?Token=A%20B",
+            "tls://1.1.1.1",
+            "udp://1.1.1.1",
+            "1.1.1.1",
+            "[2001:db8::1]",
+        ] {
+            for spec in [
+                format!("{edge}{source}"),
+                format!("{source}{edge}"),
+                format!("{edge}{source}{edge}"),
+            ] {
+                let inventory = vec![custom("saved", &spec)];
+                let dns = DnsConfig {
+                    node_resolver_custom: Some(inventory.clone()),
+                    node_resolver_pool: Some(ids(&["saved"])),
+                    ..Default::default()
+                };
+                assert!(validate_selected_upstreams(Some(&dns)).is_ok(), "{spec:?}");
+                let parsed = parse_custom_upstream(&inventory[0]).unwrap();
+                if source.starts_with("https") {
+                    assert_eq!(parsed.path.as_deref(), Some("/Query?Token=A%20B"));
+                }
+            }
+        }
+    }
+    for scheme in ["https", "tls", "udp"] {
+        let spec = format!("{scheme}://1.1.1.1\u{feff}:853");
+        assert!(parse_custom_upstream(&custom("bad", &spec)).is_none());
+    }
 }

@@ -363,7 +363,119 @@ fn explicit_helper_install_validates_platform_before_stopping_and_preserves_ordi
     );
     assert!(body.contains("helper.install_with_mode(mode)"));
     assert!(
-        !body.contains("HelperInstallMode::StopAndUpgrade"),
+        !body.contains("unwrap_or(HelperInstallMode::StopAndUpgrade)"),
         "the command must not invent disruptive intent"
     );
+    assert!(
+        body.contains(
+            "mode == HelperInstallMode::StopAndUpgrade && helper.linux_legacy_maintenance_needed()"
+        ),
+        "Linux initial synchronization belongs only to an explicit legacy maintenance request"
+    );
+}
+
+#[test]
+fn linux_legacy_stop_receipts_consume_stopped_changed_error_and_exact_generation() {
+    use crate::runtime::proxy::ExpectedCoreStopResult;
+    let stopped = |expected_main_generation, stop_main_generation| {
+        Ok(ExpectedCoreStopResult::Stopped {
+            expected_main_generation,
+            stop_main_generation,
+        })
+    };
+    assert_eq!(
+        linux_confirmed_stop_generation(7, stopped(7, 8)).unwrap(),
+        8
+    );
+    assert_eq!(
+        linux_confirmed_stop_generation(0, stopped(0, 1)).unwrap(),
+        1
+    );
+    assert!(linux_confirmed_stop_generation(7, Ok(ExpectedCoreStopResult::Changed)).is_err());
+    assert!(linux_confirmed_stop_generation(7, Err("normal restore failed".into())).is_err());
+    assert!(linux_confirmed_stop_generation(7, stopped(6, 8)).is_err());
+    assert!(linux_confirmed_stop_generation(7, stopped(7, 7)).is_err());
+    assert!(linux_confirmed_stop_generation(7, stopped(7, 9_007_199_254_740_992)).is_err());
+}
+
+#[test]
+fn linux_legacy_watchdog_invalidation_is_sticky_and_cancellation_is_cooperative() {
+    let valid = AtomicBool::new(true);
+    observe_linux_owner(&valid, true);
+    assert!(valid.load(Ordering::SeqCst));
+    observe_linux_owner(&valid, false);
+    observe_linux_owner(&valid, true);
+    assert!(!valid.load(Ordering::SeqCst));
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let _lifetime = LinuxWatchdogLifetime(done.clone());
+        assert!(!done.load(Ordering::SeqCst));
+    }
+    assert!(done.load(Ordering::SeqCst));
+}
+
+#[test]
+fn linux_legacy_guard_keeps_real_release_unknowns_before_any_root_body() {
+    let source = crate_code("commands/helper.rs");
+    let guard = source
+        .split("async fn with_linux_legacy_mutation_guard<F, Fut>(")
+        .nth(1)
+        .unwrap();
+    let guard = guard
+        .split("pub async fn helper_uninstall(")
+        .next()
+        .unwrap();
+    assert!(
+        guard.find("status_with_owned_stop_context()").unwrap()
+            < guard
+                .find("stop_expected_for_linux_helper_maintenance(request)")
+                .unwrap()
+    );
+    assert!(
+        guard
+            .find("stop_expected_for_linux_helper_maintenance(request)")
+            .unwrap()
+            < guard.find("body(original).await").unwrap()
+    );
+    assert!(
+        guard.find("linux_proxy_restored(&readback)").unwrap()
+            < guard.find("body(original).await").unwrap()
+    );
+    assert!(guard.contains("completed.load(Ordering::SeqCst)"));
+    assert!(guard.contains("tauri::async_runtime::spawn(async move"));
+    assert!(
+        guard.find("let maintenance_boundary =").unwrap()
+            < guard.find("body(original).await").unwrap()
+    );
+    assert!(
+        guard.find("body(original).await").unwrap()
+            < guard.find("drop(maintenance_boundary)").unwrap()
+    );
+    assert!(
+        guard.find("join_linux_watchdog_to_terminal").unwrap()
+            < guard.find("drop(maintenance_boundary)").unwrap()
+    );
+    assert!(guard.contains("valid.load(Ordering::SeqCst)"));
+    assert!(!guard.contains("proxy.stop().await"));
+    assert!(source.contains("ProxyMarkerRead::Missing => return Ok(None)"));
+    assert!(source.contains("responsible gsettings session domain is unsupported or unknown"));
+}
+
+#[tokio::test]
+async fn strict_linux_watchdog_join_consumes_real_in_budget_success_and_panic_handles() {
+    let done = AtomicBool::new(false);
+    let mut success = tokio::spawn(async { 0usize });
+    assert!(
+        join_linux_watchdog_to_terminal(&done, &mut success, WATCHDOG_JOIN_BUDGET)
+            .await
+            .unwrap()
+    );
+    assert!(done.load(Ordering::SeqCst));
+    assert!(success.is_finished());
+    let mut panicking = tokio::spawn(async {
+        panic!("controlled watchdog failure");
+    });
+    let result = join_linux_watchdog_to_terminal(&done, &mut panicking, WATCHDOG_JOIN_BUDGET).await;
+    assert!(result.unwrap_err().is_panic());
+    assert!(panicking.is_finished());
 }

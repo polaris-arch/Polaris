@@ -7,6 +7,7 @@
  * 哪一句」，映射错了整块 UI 就会文不对题。
  */
 import { describe, expect, it } from 'vitest';
+import { draftFromSpecs } from './field-spec';
 import {
   describeProbeResult,
   allFields,
@@ -144,5 +145,43 @@ describe('nodeFieldGroup：保存被拒时定位出错字段所在分组', () =>
 
   it('该协议没有此字段 → null（不乱切页）', () => {
     expect(nodeFieldGroup('vless', 'derpServers')).toBeNull();
+  });
+});
+
+
+describe('Snell v4 obfs controls', () => {
+  const fields = allFields('snell');
+  const field = (key: string) => {
+    const found = fields.find((candidate) => candidate.k === key);
+    if (!found) throw new Error(`Missing Snell field: ${key}`);
+    return found;
+  };
+
+  it('a new form starts with no obfs and offers enabled TLS without an imported value', () => {
+    const draft = draftFromSpecs(fields);
+    expect(draft.version).toBe('4');
+    expect(draft.obfsMode).toBe('none');
+    expect(draft.obfsHost).toBe('');
+    const mode = field('obfsMode');
+    expect(mode.t).toBe('select');
+    if (mode.t !== 'select') throw new Error('Snell obfs must be selectable');
+    expect(mode.options.find(([value]) => value === 'tls')?.[2]).not.toBe(true);
+    expect(mode.options.some(([value]) => value === 'tls')).toBe(true);
+    expect(field('obfsMode').when?.(draft)).toBe(true);
+    expect(field('mode').when?.(draft)).toBe(false);
+  });
+
+  it.each([
+    ['none', false], ['http', true], ['tls', true], ['future', false],
+  ] as const)('v4 %s: host visibility matches the active obfs mode', (obfsMode, visible) => {
+    const draft = { ...draftFromSpecs(fields), obfsMode };
+    expect(field('obfsHost').when?.(draft)).toBe(visible);
+  });
+
+  it.each(['none', 'http', 'tls'] as const)('v6 hides stale %s obfs controls', (obfsMode) => {
+    const draft = { ...draftFromSpecs(fields), version: '6', obfsMode, obfsHost: 'stale.example' };
+    expect(field('obfsMode').when?.(draft)).toBe(false);
+    expect(field('obfsHost').when?.(draft)).toBe(false);
+    expect(field('mode').when?.(draft)).toBe(true);
   });
 });

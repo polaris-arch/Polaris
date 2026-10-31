@@ -10,7 +10,8 @@
  *
  * # 判据同源纪律
  *
- * 判据本体是内核行为（见 Rust 侧头注：`endpoint.go:195` 的无条件类型断言）。两份实现同步靠
+ * 当前 selected Polaris 内核为所有 Tailscale 控制面创建 resolver wrapper，IP host 不再触发旧断言。
+ * 本模块允许四段 IPv4 / 方括号 IPv6（含 v4-mapped），保留原有其他 URL / zone 格式边界。两份实现同步靠
  * `contracts/control-url-parity.test.ts` —— 它**把 Rust 单测里的 URL 语料表读进来**当真值跑本模块，
  * 不是抄一份镜像常量。Rust 侧改了判据而这边没跟 ⇒ 那道门红。
  */
@@ -23,12 +24,28 @@ export type ControlUrlReject = 'control-url-ip' | 'control-url-scheme' | 'contro
 /**
  * host 是否 IP 字面量。
  *
- * **zone id 必须先截断**：`fe80::1%eth0` 在内核那边被 Go `netip` 判为 IP（实测 panic）；
- * 不截断这里会漏判成域名 = fail-open，正是这道门要防的事。
+ * 这里只分类未获本策略支持的 IP 写法，保留原来的稳定拒绝 token。
+ * zone 仍不在本批支持范围，先截断可防止把它误当成普通域名。
  */
 function isIpHost(host: string): boolean {
   const h = stripBrackets(host).split('%')[0] ?? '';
   return isIpLiteral(h);
+}
+
+/** Go netip 接受的四段 IPv4；公共 IP 谓词还服务于 DNS 表单，刻意容许前导零，不能改它。 */
+function isCanonicalIpv4(host: string): boolean {
+  const parts = host.split('.');
+  return parts.length === 4 && parts.every((part) => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+}
+
+/** 固定的本地 URL 解析只校验括号内 IPv6，不规范化用户 URL，也不扩大 URI-zone 支持。 */
+function isSupportedIpv6Host(host: string): boolean {
+  if (host.includes('%')) return false;
+  try {
+    return new URL(`http://[${host}]/`).hostname.startsWith('[');
+  } catch {
+    return false;
+  }
 }
 
 /** 端口后缀（`:8080`）。空端口（`host:`）不算。 */
@@ -49,7 +66,7 @@ function isHostnameLike(host: string): boolean {
 /**
  * Tailscale `control_url` 校验：`null` = 可用，非 null = **必须拦在保存/下发之前**。
  *
- * 空串 / 全空白 → `null`（没填 = 用官方 controlplane，内核走恒安全的 else 分支）。
+ * 空串 / 全空白 → `null`（没填 = 用官方 controlplane）。可用只指本地格式策略，不证明可达性。
  */
 export function controlUrlReject(raw: string | null | undefined): ControlUrlReject | null {
   const s = (raw ?? '').trim();
@@ -68,13 +85,14 @@ export function controlUrlReject(raw: string | null | undefined): ControlUrlReje
   const at = authority.lastIndexOf('@');
   const hostport = at >= 0 ? authority.slice(at + 1) : authority;
 
-  // 方括号形式：内核只接受 IPv6 —— 是 IP 就 panic，不是 IP 就 `parse control URL` FATAL。
+  // 只新增正确的方括号 IPv6；括号 IPv4 / 畸形 IPv6 / zone 继续拒绝。
   if (hostport.startsWith('[')) {
     const end = hostport.indexOf(']');
     if (end < 0) return 'control-url-invalid';
     const inner = hostport.slice(1, end);
     const after = hostport.slice(end + 1);
     if (after !== '' && !isPortSuffix(after)) return 'control-url-invalid';
+    if (isSupportedIpv6Host(inner)) return null;
     return isIpHost(inner) ? 'control-url-ip' : 'control-url-invalid';
   }
 
@@ -87,7 +105,7 @@ export function controlUrlReject(raw: string | null | undefined): ControlUrlReje
   }
 
   if (host === '') return 'control-url-invalid';
-  if (isIpHost(host)) return 'control-url-ip';
+  if (isIpHost(host)) return isCanonicalIpv4(host) ? null : 'control-url-ip';
   if (!isHostnameLike(host)) return 'control-url-invalid';
   return null;
 }

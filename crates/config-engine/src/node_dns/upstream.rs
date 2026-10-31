@@ -4,7 +4,7 @@
 //! - 内置上游单一真值（`ali` / `dnspod` / `system`），IP 取自 [`DOH_ALIDNS_IP`] / [`DOH_DNSPOD_IP`]，
 //!   单测同时保留独立引导 DNS 的内置地址一致性护栏。
 //! - 自定义上游**强制纯 IP**（`parse_dns_server_spec().is_domain` 拒绝）：零 bootstrap + 直连放行确定。
-//! - Tier1（加密 DoH）抢跑、上限 3；Tier2（明文 UDP / system）兜底，不占额度、不与 Tier1 抢跑。
+//! - Tier1（加密 DoH / DoT）抢跑、上限 3；Tier2（明文 UDP / system）兜底，不占额度、不与 Tier1 抢跑。
 //! - canonical 去重：内置与等价自定义合并（**先去重再数上限**，否则重复项会挤掉真上游）。
 
 #![forbid(unsafe_code)]
@@ -29,8 +29,10 @@ pub const DEFAULT_SINGLE_ID: &str = "ali";
 /// 上游解析方式。上游 `ResolveUpstream.kind`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamKind {
-    /// DoH（https，POST application/dns-message）/ DoT（tls，见 [`ResolveUpstream::dot`]）。
+    /// DoH（https，POST application/dns-message）。
     Doh,
+    /// 原生 DoT（TLS，IP 身份验证）。
+    Dot,
     /// 明文 UDP:53。
     Udp,
     /// 系统解析器（无 IP，走 OS resolver）。
@@ -43,14 +45,11 @@ pub struct ResolveUpstream {
     /// `ali` / `dnspod` / `system` 或自定义 id。
     pub id: String,
     pub kind: UpstreamKind,
-    /// 纯 IP（doh/udp 有；system 无）。
+    /// 纯 IP（doh/dot/udp 有；system 无）。
     pub ip: Option<String>,
     pub port: Option<u16>,
     /// 仅 DoH(https) 有。
     pub path: Option<String>,
-    /// `kind == Doh` 下是否为 DoT(tls)。**当前恒 false**：DoT 二期，[`parse_custom_upstream`] 直接拒
-    /// `tls://`（见该函数注释：接受但永远 FAIL 比拒绝更糟）。
-    pub dot: bool,
     /// 1 = 抢跑（加密）；2 = 兜底（明文 UDP / system）。
     pub tier: u8,
 }
@@ -65,7 +64,6 @@ pub fn builtin_upstream(id: &str) -> Option<ResolveUpstream> {
             ip: Some(DOH_ALIDNS_IP.into()),
             port: Some(443),
             path: Some("/dns-query".into()),
-            dot: false,
             tier: 1,
         }),
         "dnspod" => Some(ResolveUpstream {
@@ -74,7 +72,6 @@ pub fn builtin_upstream(id: &str) -> Option<ResolveUpstream> {
             ip: Some(DOH_DNSPOD_IP.into()),
             port: Some(443),
             path: Some("/dns-query".into()),
-            dot: false,
             tier: 1,
         }),
         "system" => Some(ResolveUpstream {
@@ -83,52 +80,91 @@ pub fn builtin_upstream(id: &str) -> Option<ResolveUpstream> {
             ip: None,
             port: None,
             path: None,
-            dot: false,
             tier: 2,
         }),
         _ => None,
     }
 }
 
-/// 自定义上游 spec → [`ResolveUpstream`]；**强制纯 IP**，非法 / 域名 / `tls://` → `None`。
-/// 上游 `parseCustomUpstream`。
-///
-/// - `https://` → Tier1 加密抢跑；`udp://` / 裸 IP → Tier2 明文兜底。
-/// - `tls://`（DoT）二期未实现：查询侧对 `dot` 直接 Err（永远 FAIL）。**此处拒绝**，避免 UI 接受
-///   `tls://` 上游、用户以为生效却静默全 FAIL。待 DoT 落地后改回 `dot: type == Tls`。
+// Keep this explicit edge set in sync with UI trimNodeDnsSpec, independent of
+// the JavaScript/Rust standard libraries' differing BOM/NEL trim behavior.
+fn node_spec_whitespace(c: char) -> bool {
+    matches!(c, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{0085}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
+}
+
+/// 自定义上游必须是纯 IP；HTTPS / TLS 为 Tier1，UDP 为 Tier2。
+/// 不接受凭据、SNI、CA、TLS 路径或 authority 尾串。通用 DNS 地址模型保持不变。
 #[must_use]
 pub fn parse_custom_upstream(c: &CustomDnsUpstream) -> Option<ResolveUpstream> {
     if c.id.is_empty() || c.spec.is_empty() {
         return None;
     }
-    let p = parse_dns_server_spec(Some(&c.spec))?;
-    if p.is_domain || p.server.parse::<std::net::IpAddr>().is_err() {
-        return None; // 纯 IP 强制
+    let spec = c.spec.trim_matches(node_spec_whitespace);
+    let authority = spec
+        .split_once("://")
+        .map_or(spec, |(_, rest)| rest.split('/').next().unwrap_or(""));
+    if authority
+        .chars()
+        .any(|c| node_spec_whitespace(c) || c.is_control())
+    {
+        return None;
     }
+    let p = parse_dns_server_spec(Some(spec))?;
+    let ip = p.server.parse::<std::net::IpAddr>().ok()?;
+    if p.is_domain {
+        return None;
+    }
+    if let Some((scheme, rest)) = spec.split_once("://") {
+        let authority = rest.split('/').next()?;
+        if scheme == "tls" && rest.contains('/') {
+            return None;
+        }
+        let host = if ip.is_ipv6() {
+            format!("[{}]", p.server)
+        } else {
+            p.server.clone()
+        };
+        let suffix = authority.strip_prefix(&host)?;
+        if !suffix.is_empty() {
+            let port = suffix.strip_prefix(':')?;
+            if port.is_empty()
+                || !port.bytes().all(|b| b.is_ascii_digit())
+                || port.parse::<u16>().ok()? != p.port
+            {
+                return None;
+            }
+        }
+    }
+    let ip = ip.to_string();
     match p.server_type {
         DnsServerType::Udp => Some(ResolveUpstream {
             id: c.id.clone(),
             kind: UpstreamKind::Udp,
-            ip: Some(p.server),
+            ip: Some(ip),
             port: Some(p.port),
             path: None,
-            dot: false,
             tier: 2,
         }),
-        DnsServerType::Tls => None, // DoT 二期，见函数文档
+        DnsServerType::Tls => Some(ResolveUpstream {
+            id: c.id.clone(),
+            kind: UpstreamKind::Dot,
+            ip: Some(ip),
+            port: Some(p.port),
+            path: None,
+            tier: 1,
+        }),
         DnsServerType::Https => Some(ResolveUpstream {
             id: c.id.clone(),
             kind: UpstreamKind::Doh,
-            ip: Some(p.server),
+            ip: Some(ip),
             port: Some(p.port),
             path: Some(p.path.unwrap_or_else(|| "/dns-query".into())),
-            dot: false,
             tier: 1,
         }),
     }
 }
 
-/// UI 校验：自定义 spec 是否合法（纯 IP DoH / UDP）。上游 `isValidCustomUpstreamSpec`。
+/// UI 校验：自定义 spec 是否合法（纯 IP DoH / DoT / UDP）。上游 `isValidCustomUpstreamSpec`。
 #[must_use]
 pub fn is_valid_custom_upstream_spec(spec: &str) -> bool {
     parse_custom_upstream(&CustomDnsUpstream {
@@ -147,6 +183,7 @@ pub fn upstream_canonical_key(u: &ResolveUpstream) -> String {
     }
     let kind = match u.kind {
         UpstreamKind::Doh => "doh",
+        UpstreamKind::Dot => "dot",
         UpstreamKind::Udp => "udp",
         UpstreamKind::System => "system",
     };
@@ -240,7 +277,7 @@ pub fn validate_selected_upstreams(dns: Option<&DnsConfig>) -> Result<(), String
     for id in dns.node_resolver_pool.as_deref().unwrap_or(&[]) {
         if lookup_upstream(id, custom).is_none() {
             // No user-controlled resolver ID or URL in the error.
-            return Err("NODE_RESOLVER_UNSUPPORTED: Select an IP-based HTTPS or UDP node resolver in DNS settings".into());
+            return Err("NODE_RESOLVER_UNSUPPORTED: Select an IP-based HTTPS, TLS or UDP node resolver in DNS settings".into());
         }
     }
     Ok(())

@@ -190,6 +190,7 @@ const SPAWNER_TYPE_FORMS: &[&str] = &[
 const SPAWNER_TYPE_HOME: &[&str] = &[
     "crates/core-supervisor/src/lib.rs",
     "crates/core-supervisor/src/spawner.rs",
+    "src-tauri/src/runtime/core_execution.rs",
 ];
 
 /// Android 测速复用 `LoginCoreSpawner` trait，但用进程内 libbox instance；没有子进程管道。
@@ -198,7 +199,11 @@ const IN_PROCESS_SPAWNER: &str = "src-tauri/src/runtime/speedtest/android.rs";
 
 /// 构造一个 spawn 请求的形态。**两种写法都要盖住**：构造函数与结构体字面量 —— 字段全 `pub`，
 /// 绕开构造函数直接写字面量一样编得过（少写 `stdio` 那一格才编不过）。
-const REQUEST_FORMS: &[&str] = &["SpawnRequest::new(", "SpawnRequest {"];
+const REQUEST_FORMS: &[&str] = &[
+    "SpawnRequest::new(",
+    "SpawnRequest {",
+    "core_execution::run_request(",
+];
 
 /// 选择「开管道 + 排空」这条分支的形态（构造函数与枚举变体两种写法）。
 const POLICY_DRAIN_FORM: &str = "StdioPolicy::drain(";
@@ -241,6 +246,12 @@ struct PipedSite {
 /// **不在表里 = 违规**。新增一处 `Stdio::piped()` 必须在这里补一行，并同时写出它的排空形态——
 /// 写不出来说明这条腿还没想清楚谁来读它。
 const PIPED_SITES: &[PipedSite] = &[
+    PipedSite {
+        file: "crates/helper/src/linux_legacy_maintenance.rs",
+        anchor: "fn utility(",
+        kind: SiteKind::Sink,
+        drain_forms: &["capture("],
+    },
     // ── crates/core-supervisor ──
     PipedSite {
         file: "crates/core-supervisor/src/config_gate/check_custody.rs",
@@ -265,6 +276,14 @@ const PIPED_SITES: &[PipedSite] = &[
         kind: SiteKind::Sink,
         drain_forms: &["capture("],
     },
+    PipedSite {
+        file: "crates/windows-cleaner/src/windows/install.rs",
+        anchor: "fn utility(",
+        kind: SiteKind::Sink,
+        // The private UtilityChild immediately owns the actual Child. The
+        // exact dual-reader, error and Drop closure is pinned below.
+        drain_forms: &["capture("],
+    },
     // ── crates/helper（特权守护进程 / 服务；卡死后果比 app 侧重）──
     PipedSite {
         file: "crates/helper/src/platform/linux/resolved_dns.rs",
@@ -274,10 +293,10 @@ const PIPED_SITES: &[PipedSite] = &[
         drain_forms: &["drain("],
     },
     PipedSite {
-        file: "crates/helper/src/platform/linux/server.rs",
-        anchor: "fn spawn_verified(",
-        kind: SiteKind::Sink,
-        drain_forms: &["spawn_pipe_loggers_with_file"],
+        file: "crates/core-supervisor/src/admitted_payload.rs",
+        anchor: "pub fn spawn_linux_helper_run(",
+        kind: SiteKind::Producer,
+        drain_forms: &[],
     },
     PipedSite {
         file: "crates/helper/src/platform/macos/exec.rs",
@@ -462,7 +481,16 @@ struct Passthrough {
 /// 项必须真盖住至少一处取管道的地方，留着它反而会让本门恒红（实测过一次，正是它把红报出来的）。
 ///
 /// 机制保留：下一个真要透传的人得落进这套规则里，而不是自己新起一张没有过期检查的表。
-const PIPE_PASSTHROUGH: [Passthrough; 0] = [];
+const PIPE_PASSTHROUGH: [Passthrough; 2] = [
+    Passthrough {file:"crates/core-supervisor/src/admitted_payload.rs",anchor:"impl StdCustodiedChild {",reason:"Private native Child transfers both readers with admitted cohort and Helper lease owners; exact dual-stream contract checked below"},
+    Passthrough {file:"crates/helper/src/platform/linux/server.rs",anchor:"fn spawn_verified(",reason:"Receives both owned readers and hands them to the existing bounded pipe loggers before publishing Child custody; exact contract checked below"},
+];
+
+// These are sinks owned by the one private RAII type, not pipe passthroughs
+// or exemptions. They cannot open another child, and receive coverage only
+// while their exact success/error/Drop custody contract still holds.
+const UTILITY_PIPE_OWNER: &str = "crates/windows-cleaner/src/windows/install.rs";
+const UTILITY_PIPE_CUSTODY: &[&str] = &["fn capture(", "impl Drop for UtilityChild<'_> {"];
 
 // ════════════════════════════════════════════════════════════════════════════
 // 豁免
@@ -798,6 +826,16 @@ fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, us
     }
     for pass in PIPE_PASSTHROUGH.iter().filter(|p| p.file == rel) {
         out.push(block_range(file_of(index, rel), pass.anchor));
+    }
+    if rel == UTILITY_PIPE_OWNER {
+        let owner = file_of(index, rel);
+        assert!(
+            utility_pipe_custody_is_complete(owner),
+            "UtilityChild lost its real dual-reader/terminal-wait/Drop custody"
+        );
+        for anchor in UTILITY_PIPE_CUSTODY {
+            out.push(block_range(owner, anchor));
+        }
     }
     out
 }
@@ -2176,4 +2214,144 @@ fn legacy_observer_starts_both_bounded_readers_before_waiting_and_joins_them() {
         run,
         &reader.replace(".read_to_end(", ".ignore(")
     ));
+}
+
+fn utility_pipe_custody_is_complete(owner: &Scanned) -> bool {
+    let compact = |anchor| {
+        block_of(owner, anchor)
+            .split_whitespace()
+            .collect::<String>()
+    };
+    let spawn = compact("fn utility(");
+    let capture = compact("fn capture(");
+    let wait = compact("fn await_exit(");
+    let join = compact("fn join_readers(");
+    let stop = compact("fn stop_and_collect(");
+    let drop = compact("impl Drop for UtilityChild<'_> {");
+    let threads = compact("impl ReaderThreads for NativeReaderThreads {");
+    let reader = compact("fn read_utility_pipe(");
+    let Some(first_wait) = capture.find("self.await_exit()") else {
+        return false;
+    };
+    for (index, stream) in [(0, "stdout"), (1, "stderr")] {
+        let take = format!("let{stream}=self.child.{stream}.take().ok_or_else(");
+        let handoff = format!(
+            "self.readers[{index}]=Some(threads.spawn(,Box::new(move||read_utility_pipe({stream})),)?);"
+        );
+        let (Some(taken), Some(started)) = (capture.find(&take), capture.find(&handoff)) else {
+            return false;
+        };
+        if taken >= started
+            || started >= first_wait
+            || capture.matches(&format!(".child.{stream}.take()")).count() != 2
+            || drop.matches(&format!(".child.{stream}.take()")).count() != 1
+        {
+            return false;
+        }
+    }
+    spawn.contains(".stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;")
+        && spawn.contains("letmutowned=UtilityChild::new(child,&self.unknown_child);let(exit,bytes)=owned.capture(&mutNativeReaderThreads)?;")
+        && threads.contains("std::thread::Builder::new().name(name.into()).spawn(job)")
+        && capture.contains("ifletErr(cause)=setup{self.child.stdout.take();self.child.stderr.take();self.stop_and_collect();returnErr(cause);}")
+        && capture.contains("letexit=self.await_exit();let[output,errors]=self.join_readers();")
+        && capture.contains("letoutput=output?;let_=errors?;Ok((exit,output))")
+        && wait.contains("loop{matchself.child.wait(){Ok(exit)=>{self.terminal=true;returnexit;}")
+        && wait.contains("Err(_)=>{self.uncertain.set(true);std::thread::sleep(Duration::from_millis(250));}")
+        && join.contains("for(index,slot)inself.readers.iter_mut().enumerate(){ifletSome(reader)=slot.take(){results[index]=reader.join().unwrap_or_else(")
+        && join.contains("self.joined+=1;")
+        && stop.contains("self.uncertain.set(true);let_=self.child.kill();self.await_exit();let_=self.join_readers();")
+        && drop.contains("if!self.terminal{self.child.stdout.take();self.child.stderr.take();self.stop_and_collect();}else{let_=self.join_readers();}")
+        && reader.contains("letmutchunk=[0u8;4096];")
+        && reader.contains("loop{letn=pipe.read(&mutchunk)?;ifn==0{break;}ifbytes.len()+n<=65536{bytes.extend_from_slice(&chunk[..n]);}else{overflow=true;}}")
+        && reader.contains("ifoverflow{returnErr(error());}Ok(bytes)")
+        && reader.matches("return").count() == 1
+        && reader.matches("break").count() == 1
+        && [capture.as_str(), drop.as_str()].iter().all(|body| {
+            !body.contains(PIPED_FORM)
+                && CHILD_CREATION_FORMS.iter().all(|form| !body.contains(form))
+        })
+}
+
+#[test]
+fn utility_child_preserves_both_readers_and_actual_child_on_all_terminal_paths() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(&index, UTILITY_PIPE_OWNER);
+    assert!(utility_pipe_custody_is_complete(owner));
+    // Both startup failures, ordinary completion and early Drop have real
+    // Windows inert-child tests. These source mutations also bind registration
+    // to that exact owner instead of granting generic credit for a method name.
+    for broken in [
+        owner.masked.replace("owned.capture(", "owned.ignore("),
+        owner
+            .masked
+            .replace("read_utility_pipe(stdout)", "ignore(stdout)"),
+        owner
+            .masked
+            .replace("read_utility_pipe(stderr)", "ignore(stderr)"),
+        owner.masked.replace("self.stop_and_collect();", ""),
+        owner
+            .masked
+            .replace("self.child.wait()", "self.child.try_wait()"),
+        owner.masked.replace(".join()", ".detach()"),
+        owner.masked.replace("if !self.terminal", "if false"),
+        owner
+            .masked
+            .replace("overflow = true;", "return Err(error());"),
+    ] {
+        let changed = Scanned {
+            rel: owner.rel.clone(),
+            masked: broken,
+        };
+        assert!(!utility_pipe_custody_is_complete(&changed));
+    }
+}
+
+#[test]
+fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(&index, "crates/core-supervisor/src/admitted_payload.rs");
+    let factory = block_of(owner, "pub fn spawn_linux_helper_run(");
+    for needle in [
+        "stdout(std::process::Stdio::piped())",
+        "stderr(std::process::Stdio::piped())",
+        "command.spawn()",
+        "lease_owner",
+    ] {
+        assert!(
+            factory.contains(needle),
+            "missing Helper factory contract: {needle}"
+        );
+    }
+    let readers = block_of(owner, "impl StdCustodiedChild {");
+    for needle in [
+        ".stdout.take()",
+        ".stderr.take()",
+        "_owner:",
+        "_lease_owner:",
+    ] {
+        assert!(
+            readers.contains(needle),
+            "missing owned reader contract: {needle}"
+        );
+    }
+    let helper = file_of(&index, "crates/helper/src/platform/linux/server.rs");
+    let spawn = block_of(helper, "fn spawn_verified(");
+    for needle in [
+        "spawn_linux_helper_run(",
+        "child.take_stdout()",
+        "child.take_stderr()",
+        "spawn_pipe_loggers_with_file(",
+        "ChildSlot::from_admitted_child(child, handle.clone())",
+    ] {
+        assert!(
+            spawn.contains(needle),
+            "missing native Helper consumer: {needle}"
+        );
+    }
+    assert!(
+        spawn.find("child.take_stderr()").unwrap()
+            < spawn.find("ChildSlot::from_admitted_child").unwrap()
+    );
 }

@@ -3,7 +3,8 @@ import { hasTemporaryDesktop, loadTemporaryDesktopSelection, verifyCandidatePayl
 // Ordinary CI retrieves four exact-candidate native artifacts; only the reviewed
 // validation-v2 envelope may preserve three explicitly pinned original origins.
 import { execFileSync } from 'node:child_process';
-import { hasDesktopRelease, verifyPackagedRelease } from './release-consumer.mjs';
+import { hasDesktopRelease, loadReleaseContract, verifyPackagedRelease } from './release-consumer.mjs';
+import { RECOVERY_RESOURCE, verifyRecoveryResource } from './recovery.mjs';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync,
   writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -118,7 +119,15 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
 
 export function verifyPackagedSource(root, manifest, key, binary, run, host = process.platform) {
   if (hasTemporaryDesktop(manifest)) { loadTemporaryDesktopSelection(root, manifest); return verifyCandidatePayload(root, key, binary, run); }
-  if (hasDesktopRelease(manifest)) return verifyPackagedRelease(root, manifest, key, binary, run, host);
+  if (hasDesktopRelease(manifest)) {
+    const receipt = verifyPackagedRelease(root, manifest, key, binary, run, host);
+    // Packaging must prove the carrier's independent copy, not silently borrow
+    // the source checkout's good archive when a final resource was omitted.
+    verifyRecoveryResource(join(dirname(dirname(binary)), RECOVERY_RESOURCE, key),
+      loadReleaseContract(root, manifest).platforms[key], key,
+      manifest.desktopRelease.contractSha256, dirname(binary));
+    return receipt;
+  }
   const spec = validateSourcePins(manifest, key, false);
   const receipt = readJson(join(root, 'resources/.source-receipts', `${key}.json`));
   const inventory = readJson(join(root, 'resources/.source-receipts/bundle.json'));

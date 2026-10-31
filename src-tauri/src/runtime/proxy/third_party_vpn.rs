@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use polaris_singbox_grpc::{Endpoint, ReconnectConfig, SingBoxApiClient};
+use polaris_singbox_grpc::ReconnectConfig;
 
 use crate::runtime::vpn_status::{decode_openconnect_status, decode_openvpn_status};
 
@@ -59,13 +59,8 @@ impl ProxyRuntime {
         tag_to_id: Arc<BTreeMap<String, String>>,
     ) {
         let me = Arc::clone(self);
-        tokio::spawn(async move {
-            let client = match SingBoxApiClient::connect(
-                Endpoint::new("127.0.0.1", api_port),
-                me.clash_api_secret(),
-            )
-            .await
-            {
+        self.spawn_runtime_api_relay(async move {
+            let client = match me.current_management_client(api_port).await {
                 Ok(client) => client,
                 Err(error) => {
                     log::warn!(
@@ -121,13 +116,8 @@ impl ProxyRuntime {
         tag_to_id: Arc<BTreeMap<String, String>>,
     ) {
         let me = Arc::clone(self);
-        tokio::spawn(async move {
-            let client = match SingBoxApiClient::connect(
-                Endpoint::new("127.0.0.1", api_port),
-                me.clash_api_secret(),
-            )
-            .await
-            {
+        self.spawn_runtime_api_relay(async move {
+            let client = match me.current_management_client(api_port).await {
                 Ok(client) => client,
                 Err(error) => {
                     log::warn!(

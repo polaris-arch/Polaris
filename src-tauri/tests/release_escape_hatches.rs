@@ -153,7 +153,8 @@ const ALLOWED: &[Entry] = &[
     },
 ];
 
-/// 「校验后采纳」清单：release 里读得到，但取到的**路径必须先过可信来源判据**才被采纳。
+/// 「校验后采纳」清单：release 里读得到，但输入必须先满足其用途的来源或作用范围判据。
+/// 作用范围校验不能被表述为任意输入的来源认证。
 ///
 /// 每条必须回答三个问题：**它喂给谁**、**由哪个函数校验**、**判据不通过时怎么办**。
 /// 回答不了的不许进这张表 —— 「加了个检查」不是论证。
@@ -174,6 +175,10 @@ const VALIDATED: &[Validated] = &[Validated {
                  不通过时怎么办：不采纳，记 `ENV_PATH_UNTRUSTED` 并回落随包 helper 兜底腿；\
                  兜底腿也找不到就是既有的「二进制缺失」早返（**不触发提权**）。\
                  debug / test 构型同样不受影响：helper 的本地迭代仍靠它装自编产物。",
+}, Validated {
+    name: "POLARIS_SWEEP_ROOT",
+    validator: "sweep_root(",
+    reason: "NSIS 的固定 PRE producer 临时覆盖为 $INSTDIR，运行后恢复旧值；读取值经 sweep_root 做 full-path 规范化并拒绝 drive/UNC share 根。失败返回 1/3，不进入进程枚举。它只选择该根下两个精确 installed-relative sing-box.exe 映像：原 HANDLE 重核 image 与 birth 后才 TerminateProcess 并真实 wait，沿用当前 token，不提权、不执行 ROOT 下代码。最大作用是终止调用者已有权限控制、且满足这两条路径和原对象重核的进程。这个校验不认证任意 ROOT 的所有权、发行哈希或 NSIS 来源，也不把 PID/同名进程视为授权；完整接线由 sweep_environment_is_a_bounded_current_token_selector 守住。",
 }];
 
 /// 临时清单：**已知违规**，下一批修。
@@ -204,6 +209,23 @@ const PENDING_TRUST_GATE: &[Entry] = &[];
 /// 「常量间接读取」这条路堵死；代价是它也会扫到 shell heredoc 定界符、编译期常量名这类
 /// **同形但非读取**的串。每条同样要求恰好命中一次 —— 那个串一旦消失，条目必须跟着走。
 const TEXT_ONLY: &[Entry] = &[
+    Entry {
+        name: "POLARIS_CORE_STORE_LEASE_FD",
+        reason: "App Linux/Mac admitted_payload producers overwrite the child environment with a dedicated inherited descriptor of the held store occupancy lease. Core consumes the selector in its own process and validates/retains the same open-file-description; this Rust workspace never reads it as ambient input. It grants no payload admission. Exact producer ownership and negative mutations are checked separately below; changing it to a Rust env::var read remains red.",
+    },
+    Entry {
+        name: "POLARIS_CRONET_LIBRARY_FD",
+        reason: "Linux ProtectedMembers::command writes a child-specific CLOEXEC duplicate of its already validated sealed sidecar after env_clear; the Core loader in the separate Core source consumes and validates it. No Rust ambient read or arbitrary path selector exists here. Exact child binding is checked below, and a new env::var read cannot use this text-only registration.",
+    },
+    Entry {
+        name: "POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1",
+        reason: "A cfg(local-development-selection) byte marker retained by selection_lane/black_box and rejected in actual Formal package members by final-package-receipt.py. It is neither an environment read nor runtime execution authority; exact cfg/constant/consumer and negative mutations are checked below.",
+    },
+
+    Entry {
+        name: "POLARIS_WINDOWS_INSTALL_ANCHOR",
+        reason: "crates/windows-cleaner/src/main.rs 的 option_env! 编译期锚，仅 BIN 的 InstallWorker 分支传给安装验证器；运行期环境不能替换它，Helper 依赖的 LIB 不读取这个环境键。缺失时原安装合同拒绝，不是运行期逃生门。",
+    },
     Entry {
         name: "POLARIS_DIAGNOSTICS",
         reason: "Generated maintenance shell diagnostic selector, set to 1 by the fixed Linux DIAGNOSTICS prelude before transactions. Shell reads only gate failure-marker emission, never admission, cleanup success or exit status; Mac has no Linux diagnostic function, and an inherited value can at most attempt that ignored diagnostic call. Not a Rust environment-driven release escape hatch.",
@@ -1366,6 +1388,38 @@ fn core_path_env_override_is_dev_only() {
 #[test]
 fn production_polaris_names_are_all_accounted_for() {
     let scan = scan();
+    assert_production_polaris_names_accounted_for(&scan);
+}
+
+fn assert_production_polaris_names_accounted_for(scan: &Scan) {
+    // These child outputs / compile marker have exact source owners, not a
+    // repository-wide exemption for any indirect read using the same name.
+    for (name, expected) in [
+        (
+            "POLARIS_CORE_STORE_LEASE_FD",
+            &[
+                "crates/core-supervisor/src/admitted_payload/linux.rs",
+                "crates/core-supervisor/src/admitted_payload/macos.rs",
+            ][..],
+        ),
+        (
+            "POLARIS_CRONET_LIBRARY_FD",
+            &["crates/core-supervisor/src/admitted_payload/linux.rs"][..],
+        ),
+        (
+            "POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1",
+            &["crates/core-supervisor/src/selected_core.rs"][..],
+        ),
+    ] {
+        let sites = scan.names.get(name).cloned().unwrap_or_default();
+        let mut owners: Vec<_> = sites
+            .iter()
+            .map(|site| site.rsplit_once(':').expect("scan emits file:line").0)
+            .collect();
+        owners.sort_unstable();
+        assert_eq!(owners, expected,
+            "TEXT_ONLY scoped occurrences for `{name}` changed: {sites:?}; each reviewed owner must occur exactly once");
+    }
     let claimed: BTreeSet<&str> = registry()
         .iter()
         .map(|(_, name, _)| *name)
@@ -1409,7 +1463,106 @@ fn production_polaris_names_are_all_accounted_for() {
     }
 }
 
-/// 🔴 开发树锚点（`env!("CARGO_MANIFEST_DIR")`）不得进发行产物。
+#[test]
+fn text_only_scoped_names_reject_indirect_reads_duplicates_and_wrong_owners() {
+    // Use the same full production scan and decision as the live gate. Only
+    // one controlled source input changes; no constant-argument parser is added.
+    struct SourceFixture(PathBuf);
+    impl Drop for SourceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let fixture = SourceFixture(std::env::temp_dir().join(format!(
+        "polaris-text-owner-{}-{}.rs", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    )));
+    let moved = SourceFixture(fixture.0.with_extension("moved.rs"));
+    let baseline = scan();
+    assert_production_polaris_names_accounted_for(&baseline);
+    for (name, owner) in [
+        (
+            "POLARIS_CORE_STORE_LEASE_FD",
+            "crates/core-supervisor/src/admitted_payload/linux.rs",
+        ),
+        (
+            "POLARIS_CRONET_LIBRARY_FD",
+            "crates/core-supervisor/src/admitted_payload/linux.rs",
+        ),
+        (
+            "POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1",
+            "crates/core-supervisor/src/selected_core.rs",
+        ),
+    ] {
+        let original = std::fs::read_to_string(workspace_root().join(owner)).unwrap();
+        for mode in ["const-read", "literal-read", "duplicate", "wrong-owner"] {
+            let mut files = scan_surface();
+            let (rel, raw) = match mode {
+                "const-read" => (
+                    "src-tauri/src/runtime/owner_probe.rs",
+                    format!(
+                        "const K: &str = \"{name}\"; fn observed() {{ let _ = std::env::var(K); }}"
+                    ),
+                ),
+                "literal-read" => (
+                    "src-tauri/src/runtime/owner_probe.rs",
+                    format!("fn observed() {{ let _ = std::env::var(\"{name}\"); }}"),
+                ),
+                "duplicate" => {
+                    files.retain(|file| file.rel != owner);
+                    (
+                        owner,
+                        format!("{original}\nconst EXTRA: &str = \"{name}\";\n"),
+                    )
+                }
+                "wrong-owner" => {
+                    files.retain(|file| file.rel != owner);
+                    std::fs::write(&moved.0, original.replace(name, "RELOCATED_TEXT_NAME"))
+                        .unwrap();
+                    files.push(SourceFile {
+                        rel: owner.to_owned(),
+                        path: moved.0.clone(),
+                        in_tests_dir: false,
+                        release_off_file: false,
+                    });
+                    (
+                        "src-tauri/src/runtime/owner_probe.rs",
+                        format!("const MOVED: &str = \"{name}\";"),
+                    )
+                }
+                _ => unreachable!(),
+            };
+            std::fs::write(&fixture.0, raw).unwrap();
+            files.push(SourceFile {
+                rel: rel.to_owned(),
+                path: fixture.0.clone(),
+                in_tests_dir: false,
+                release_off_file: false,
+            });
+            let result = scan_files(files);
+            if mode == "const-read" {
+                assert!(
+                    !result.hits.iter().any(|hit| hit.file == rel),
+                    "the nonliteral read must exercise the name detector, not a new parser"
+                );
+            }
+            let error =
+                std::panic::catch_unwind(|| assert_production_polaris_names_accounted_for(&result))
+                    .expect_err(&format!("{name}/{mode} escaped the complete name gate"));
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(
+                message.contains("TEXT_ONLY scoped occurrences") && message.contains(name),
+                "wrong rejection for {name}/{mode}: {message}"
+            );
+        }
+    }
+}
+
+/// 🔴 开发树锚点（`env!("CARGO_MANIFEST_DIR")`）不得进 Formal 发行产物。
 ///
 /// # 守的是什么
 ///
@@ -1417,7 +1570,7 @@ fn production_polaris_names_are_all_accounted_for() {
 /// 两层后果：
 ///
 /// 1. **信息泄露**：发行二进制里明晃晃写着开发者的目录结构。2026-08-30 对 `strip = "symbols"`
-///    之后的产物实测：仍有 143 处 `/home/sway/Code/polaris` 字样。
+///    之后的产物实测：仍有 143 处 `/home/fixture-user/Code/polaris` 字样。
 /// 2. **语义错误**：这些调用点把它当成「随包资源根的开发态候选」喂给
 ///    `bundle_resource_candidates`。在用户机上那条路径不存在，只是白扫一遍；但在**打包机**上
 ///    它真实存在 —— `geo_seed` 的头注已经记下过这个坑：源码仓候选会让「随包 `.srs` 一个都没有」
@@ -1432,8 +1585,70 @@ fn production_polaris_names_are_all_accounted_for() {
 /// **必须是 `#[cfg]` 不是 `cfg!()`**：后者两条腿都编译，字面量照样进 `.rodata` —— 那正是
 /// 这批修复前的形态。本门只认属性，看不见 `cfg!()`，所以它抓的就是「字面量在不在产物里」。
 ///
-/// **变异探针**：把 `runtime/proxy.rs` 的 `dev_manifest_dir()` 上那对 `#[cfg(debug_assertions)]`
-/// / `#[cfg(not(debug_assertions))]` 去掉、合成一个无 cfg 的函数 ⇒ 本条转红并点名它。
+/// The one explicit LocalDevelopmentSelection compile leg is matched below by
+/// exact file, full function and sole anchor; other feature predicates stay unknown.
+/// Removing that cfg or adding another anchor remains a failure.
+// This sole reviewed Local lane deliberately carries its build-tree resource root,
+// including optimized Local builds. Formal builds cannot compile this exact leg.
+// Keep the whole item and its sole anchor bound, rather than exempting a file or feature.
+fn local_development_manifest_anchor(rel: &str, raw: &str, at: usize) -> bool {
+    if rel != "src-tauri/src/runtime/proxy/core_binary.rs" {
+        return false;
+    }
+    let literal = polaris_source_probe::mask_comments(raw);
+    let compact: String = literal.chars().filter(|c| !c.is_whitespace()).collect();
+    let expected = "#[cfg(any(debug_assertions,feature=\"local-development-selection\"))]pub(crate)fndev_manifest_dir()->Option<&'staticstd::path::Path>{Some(std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")))}";
+    let anchor_at = literal[..at]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .len();
+    let mut matches = compact.match_indices(expected);
+    let Some((start, _)) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none() && (start..start + expected.len()).contains(&anchor_at)
+}
+
+#[test]
+fn local_development_manifest_anchor_requires_its_exact_compile_leg() {
+    let rel = "src-tauri/src/runtime/proxy/core_binary.rs";
+    let good = "#[cfg(any(debug_assertions, feature = \"local-development-selection\"))] pub(crate) fn dev_manifest_dir() -> Option<&'static std::path::Path> { Some(std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"))) }";
+    let at = good.find("env!(").unwrap();
+    assert!(local_development_manifest_anchor(rel, good, at));
+    assert!(!local_development_manifest_anchor(
+        "src-tauri/src/other.rs",
+        good,
+        at
+    ));
+    for bad in [
+        good.replace(
+            "#[cfg(any(debug_assertions, feature = \"local-development-selection\"))]",
+            "",
+        ),
+        good.replace("local-development-selection", "another-feature"),
+        good.replace("dev_manifest_dir", "another_manifest_dir"),
+        good.replace("Some(std::path", "return Some(std::path"),
+    ] {
+        assert!(!local_development_manifest_anchor(
+            rel,
+            &bad,
+            bad.find("env!(").unwrap()
+        ));
+    }
+    let extra = format!("{good} fn leak() {{ env!(\"CARGO_MANIFEST_DIR\") }}");
+    assert!(!local_development_manifest_anchor(
+        rel,
+        &extra,
+        extra.rfind("env!(").unwrap()
+    ));
+    // Do not make all Local cfgs invisible to the environment-read scanner.
+    assert_eq!(
+        release_reachability("feature = \"local-development-selection\""),
+        Tri::Unknown
+    );
+}
+
 #[test]
 fn dev_tree_anchor_is_debug_only() {
     const ANCHOR: &str = "env!(\"CARGO_MANIFEST_DIR\")";
@@ -1482,7 +1697,9 @@ fn dev_tree_anchor_is_debug_only() {
                 continue;
             }
             seen += 1;
-            if !regions.iter().any(|(a, b)| *a <= at && at <= *b) {
+            if !regions.iter().any(|(a, b)| *a <= at && at <= *b)
+                && !local_development_manifest_anchor(&file.rel, &raw, at)
+            {
                 bad.push(format!("  {}:{}", file.rel, line_of(&masked, at)));
             }
         }
@@ -1510,7 +1727,7 @@ fn dev_tree_anchor_is_debug_only() {
     assert!(
         bad.is_empty(),
         "\n{} 处 `{ANCHOR}` 不在「release 侧不编译」的 `#[cfg(..)]` 之下 —— \
-         构建机绝对路径会编进发行产物：\n{}\n\
+         构建机绝对路径可能编进 Formal 发行产物：\n{}\n\
          修法：走 `runtime::proxy::dev_manifest_dir()`（`#[cfg]` 分叉，release 腿里没有这个 `env!`）。\n",
         bad.len(),
         bad.join("\n")
@@ -2230,6 +2447,126 @@ fn frozen_lease_inputs_are_explicit_child_environment() {
     }
 }
 
+// These names are outputs in this Rust workspace. Core consumes and validates
+// them in a different process; text registration is not a Core runtime exemption.
+fn child_descriptor_binding(source: &str, key: &str, descriptor: &str, before: &[&str]) -> bool {
+    let literals = polaris_source_probe::mask_comments(source);
+    if literals.matches(key).count() != 1 {
+        return false;
+    }
+    let at = literals.find(key).unwrap();
+    let masked = polaris_source_probe::mask_comments_and_strings(source);
+    let Some(body) = enclosing_fn_body(&masked, at) else {
+        return false;
+    };
+    let start = body.as_ptr() as usize - masked.as_ptr() as usize;
+    let compact: String = literals[start..start + body.len()]
+        .split_whitespace()
+        .collect();
+    let binding = format!(".env(\"{key}\",{descriptor}.to_string())");
+    let Some(write) = compact.find(&binding) else {
+        return false;
+    };
+    before.iter().all(|token| compact[..write].contains(token))
+        && compact[write..].contains("pre_exec(move||")
+        && compact[write..].contains("F_SETFD,0)")
+}
+
+#[test]
+fn child_descriptor_names_are_exact_owned_outputs_not_ambient_read_exemptions() {
+    for (path, key, descriptor, required) in [
+        (
+            "crates/core-supervisor/src/admitted_payload/linux.rs",
+            "POLARIS_CRONET_LIBRARY_FD",
+            "lib_fd",
+            &[
+                "self.members[self.sidecar].sealed",
+                "fcntl_dupfd_cloexec(",
+                "cmd.env_clear()",
+            ] as &[&str],
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload/linux.rs",
+            "POLARIS_CORE_STORE_LEASE_FD",
+            "fd",
+            &[
+                "metadata.is_file()",
+                "metadata.len()!=0",
+                "metadata.nlink()!=1",
+                "FD_CLOEXEC",
+                "fcntl_dupfd_cloexec(lease,3)",
+            ] as &[&str],
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload/macos.rs",
+            "POLARIS_CORE_STORE_LEASE_FD",
+            "fd",
+            &[
+                "shared_occupancy(fresh.file)",
+                "m.uid()!=0",
+                "FD_CLOEXEC",
+                "expected.unchanged()?",
+                "owner.try_clone()?",
+            ] as &[&str],
+        ),
+    ] {
+        let raw = polaris_source_probe::repo_file!(path);
+        assert!(
+            child_descriptor_binding(&raw, key, descriptor, required),
+            "{path}: {key}"
+        );
+        for broken in [
+            raw.replace(&format!(".env(\"{key}\""), ".env(\"UNBOUND_OUTPUT\""),
+            raw.replace("pre_exec(move ||", "unused_callback(move ||"),
+            raw.replace("F_SETFD, 0", "F_SETFD, 1"),
+            raw.replace(required[0], "omitted_owner_check"),
+        ] {
+            assert!(
+                !child_descriptor_binding(&broken, key, descriptor, required),
+                "{path}: {key}"
+            );
+        }
+        // The same name used as an ambient input remains visible to the exact
+        // scanner call/literal extraction and is absent from the read registry.
+        let input = format!("fn ambient() {{ std::env::var(\"{key}\"); }}");
+        let masked = polaris_source_probe::mask_comments_and_strings(&input);
+        let at = masked.find("env::var(").unwrap();
+        assert_eq!(
+            literal_arg(&input, at + "env::var(".len()).as_deref(),
+            Some(key)
+        );
+        assert!(!registry().iter().any(|(_, name, _)| *name == key));
+    }
+}
+
+#[test]
+fn local_selection_marker_is_compiled_lane_data_and_formal_carriers_reject_it() {
+    let raw = polaris_source_probe::repo_file!("crates/core-supervisor/src/selected_core.rs");
+    let literal = polaris_source_probe::mask_comments(&raw);
+    let compact: String = literal.split_whitespace().collect();
+    let declaration = "#[cfg(feature=\"local-development-selection\")]pubconstLOCAL_DEVELOPMENT_BINARY_MARKER:&[u8]=b\"POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1\";";
+    assert_eq!(compact.matches(declaration).count(), 1);
+    assert!(compact.contains("std::hint::black_box(LOCAL_DEVELOPMENT_BINARY_MARKER)"));
+    assert!(compact.contains("#[cfg(all(feature=\"formal-selection\",feature=\"local-development-selection\"))]compile_error!("));
+    for broken in [
+        compact.replace(
+            "#[cfg(feature=\"local-development-selection\")]pubconst",
+            "pubconst",
+        ),
+        compact.replace("POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1", "OTHER_MARKER"),
+    ] {
+        assert!(!broken.contains(declaration));
+    }
+    let package = polaris_source_probe::repo_file!("scripts/final-package-receipt.py");
+    assert!(package.contains("marker = b'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1'"));
+    assert!(package.contains("require(marker not in data,"));
+    let core = polaris_source_probe::repo_file!("src-tauri/src/runtime/proxy/core_binary.rs");
+    let core: String = polaris_source_probe::mask_comments(&core)
+        .split_whitespace()
+        .collect();
+    assert!(core.contains("#[cfg(not(any(debug_assertions,feature=\"local-development-selection\")))]pub(crate)fndev_manifest_dir()->Option<&'staticstd::path::Path>{None}"));
+}
+
 fn unix_descriptor_delimiters_are_complete(source: &str) -> bool {
     source
         .matches("cat > \"$TXDIR/descriptor\" <<'POLARIS_DESCRIPTOR_EOF'")
@@ -2294,4 +2631,144 @@ fn current_unix_descriptor_delimiter_is_live_in_both_branches_and_retired_names_
         assert!(!observed.names.contains_key(old));
         assert!(!TEXT_ONLY.iter().any(|entry| entry.name == old));
     }
+}
+
+fn sweep_selector_contract_is_complete(source: &str, nsis: &str) -> bool {
+    let masked = polaris_source_probe::mask_comments_and_strings(source);
+    let literals = polaris_source_probe::mask_comments(source);
+    let literal_compact: String = literals.split_whitespace().collect();
+    let body = |needle: &str| {
+        masked
+            .find(needle)
+            .and_then(|at| enclosing_fn_body(&masked, at))
+            .map(|part| part.split_whitespace().collect::<String>())
+    };
+    let (Some(read), Some(normalize), Some(root), Some(installed), Some(sweep)) = (
+        body("std::env::var_os("),
+        body("GetFullPathNameW("),
+        body("let mut full = full_path(path)?;"),
+        body("TAILS.iter()"),
+        body("TerminateProcess("),
+    ) else {
+        return false;
+    };
+    if literal_compact
+        .matches("std::env::var_os(\"POLARIS_SWEEP_ROOT\")")
+        .count()
+        != 1
+        || !literal_compact.contains(
+            r#"constTAILS:[&str;2]=[r"_up_\resources\win\sing-box.exe",r"resources\win\sing-box.exe",];"#,
+        )
+        || !read.contains("letSome(path)=std::env::var_os()else{return3;};")
+        || !read.contains("letroot=matchsweep_root(&path){Ok(Some(root))=>root,Ok(None)=>return3,Err(_)=>return1,};")
+        || !read.contains("matchobservations(){Ok(items)=>sweep(&root,items),Err(_)=>1,}")
+        || !normalize.contains("ifpath.is_empty()||path.contains(&0){returnErr(error());}")
+        || !normalize.contains("GetFullPathNameW(path.as_ptr(),out.len()asu32,out.as_mut_ptr(),null_mut(),)")
+        || !normalize.contains("ifn==0||nasusize>=out.len(){returnErr(error());}")
+        || !root.contains("iffull.len()==2&&full[1]==58{returnOk(None);}")
+        || !root.contains("iffull.starts_with(&[92,92])&&full[2..].split(|u|*u==92).filter(|p|!p.is_empty()).count()<=2{returnOk(None);}")
+        || root.matches("returnOk(None)").count() != 2
+        || !root.contains("full.push(92);Ok(Some(full))")
+        || !installed.contains("full.len()>=root.len()&&ordinal(&full[..root.len()],root)&&TAILS.iter().any(|tail|{")
+        || !installed.contains("ordinal(&full[root.len()..],&OsStr::new(tail).encode_wide().collect::<Vec<_>>(),)")
+        || !sweep.contains("if!installed(root,&observed.image){continue;}")
+        || !sweep.contains("OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE|PROCESS_TERMINATE,0,observed.pid,)")
+        || !sweep.contains("letprocess=OwnedHandle(raw);")
+        || !sweep.contains("letimage=process_image(process.0)?;letborn=birth(process.0)?;Ok(installed(root,&image)&&born==observed.birth&&ordinal(&full_path(&image)?,&full_path(&observed.image)?))")
+        || !sweep.contains("matchmatched{Ok(true)=>{}Ok(false)=>continue,Err(_)=>{left=true;continue;}}")
+        || !sweep.contains("ifunsafe{TerminateProcess(process.0,1)}==0||unsafe{WaitForSingleObject(process.0,5000)}!=WAIT_OBJECT_0{left=true;}")
+        || masked.matches("TerminateProcess(").count() != 1
+        || ["ShellExecute", "Command::", "taskkill", "Stop-Process"]
+            .iter()
+            .any(|forbidden| masked.contains(forbidden))
+    {
+        return false;
+    }
+    let Some(checked) = sweep.find("matchmatched{") else {
+        return false;
+    };
+    let Some(terminate) = sweep.find("TerminateProcess(process.0,1)") else {
+        return false;
+    };
+    if checked >= terminate {
+        return false;
+    }
+
+    // This is the real, fixed NSIS producer. It replaces ambient input for the
+    // one invocation and restores it afterwards; it is not an authority token.
+    let Some((_, macro_tail)) = nsis.split_once("!macro PolarisStopInstalledCores\n") else {
+        return false;
+    };
+    let Some((macro_body, _)) = macro_tail.split_once("!macroend") else {
+        return false;
+    };
+    let lines: Vec<&str> = macro_body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with(';'))
+        .collect();
+    let setter = r#"System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'"#;
+    let invoke = r#"nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\polaris-cleaner.exe" --sweep-installed-cores'"#;
+    let Some(exec) = lines.iter().position(|line| *line == invoke) else {
+        return false;
+    };
+    let handoff = [
+        r#"ReadEnvStr $R9 "POLARIS_SWEEP_ROOT""#,
+        "Push $R9",
+        r#"StrCpy $R9 "$INSTDIR""#,
+        setter,
+    ];
+    lines[..exec]
+        .windows(handoff.len())
+        .any(|part| part == handoff.as_slice())
+        && lines.iter().filter(|line| **line == invoke).count() == 1
+        && lines.iter().filter(|line| **line == setter).count() == 2
+        && lines
+            .get(exec + 1)
+            .is_some_and(|line| line.starts_with("Pop $R4"))
+        && lines.get(exec + 2) == Some(&"Pop $R9")
+        && lines.get(exec + 3) == Some(&setter)
+}
+
+#[test]
+fn sweep_environment_is_a_bounded_current_token_selector() {
+    let source = polaris_source_probe::repo_file!("crates/windows-cleaner/src/windows/sweep.rs");
+    let nsis = polaris_source_probe::repo_file!("src-tauri/nsis-hooks.nsh");
+    assert!(sweep_selector_contract_is_complete(&source, &nsis));
+    for broken in [
+        source.replace("match sweep_root(&path)", "match unchecked_root(&path)"),
+        source.replace("return 3;", "return 0;"),
+        source.replace("return Ok(None);", "return Ok(Some(full));"),
+        source.replace("TAILS.iter().any", "TAILS.iter().all"),
+        source.replace("born == observed.birth", "true"),
+        source.replace("installed(root, &image)", "true"),
+        source.replace(
+            "TerminateProcess(process.0, 1)",
+            "TerminateProcess(other, 1)",
+        ),
+        source.replace("WaitForSingleObject(process.0, 5000)", "WAIT_OBJECT_0"),
+    ] {
+        assert!(!sweep_selector_contract_is_complete(&broken, &nsis));
+    }
+    for broken in [
+        nsis.replace("StrCpy $R9 \"$INSTDIR\"", "StrCpy $R9 \"$TEMP\""),
+        nsis.replace("Pop $R9\n  System::Call", "System::Call"),
+        nsis.replace("--sweep-installed-cores'", "--worker'"),
+    ] {
+        assert!(!sweep_selector_contract_is_complete(&source, &broken));
+    }
+    let main = polaris_source_probe::repo_file!("crates/windows-cleaner/src/main.rs");
+    assert_eq!(
+        main.matches("option_env!(\"POLARIS_WINDOWS_INSTALL_ANCHOR\")")
+            .count(),
+        1
+    );
+    let observed = scan();
+    assert!(observed.release_reads().contains_key("POLARIS_SWEEP_ROOT"));
+    assert!(observed
+        .names
+        .contains_key("POLARIS_WINDOWS_INSTALL_ANCHOR"));
+    assert!(!observed
+        .release_reads()
+        .contains_key("POLARIS_WINDOWS_INSTALL_ANCHOR"));
 }

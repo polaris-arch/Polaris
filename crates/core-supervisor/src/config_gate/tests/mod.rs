@@ -332,3 +332,6 @@ fn libbox_verdict_separates_bridge_failure_from_kernel_rejection() {
         other => panic!("空消息应判 Unattributable，实得 {other:?}"),
     }
 }
+
+#[cfg(target_os = "linux")]
+mod process;

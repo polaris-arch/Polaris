@@ -49,7 +49,7 @@ async function closeFixturePages(browser: Browser | undefined, failed: boolean, 
         if (page.isClosed()) continue;
         try {
           const { mkdirSync, writeFileSync } = await import('node:fs');
-          const output = path.join(root, 'test-results', 'feedback');
+          const output = path.join(fixtureOutputRoot, 'feedback');
           mkdirSync(output, { recursive: true });
           const stem = 'failed-' + name.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 100) + '-' + index;
           const state = await page.evaluate(() => {
@@ -149,6 +149,9 @@ describe('browser fixture cleanup failure contract', () => {
 
 // The real UI consumers run against deferred, synthetic API receipts. No native mutation/network.
 const root = path.resolve(import.meta.dirname, '../../..');
+// CI keeps its existing test-results location; local isolated runs can keep all
+// synthetic evidence outside the checkout without touching user browser data.
+const fixtureOutputRoot = path.resolve(process.env.POLARIS_FIXTURE_OUTPUT_DIR || path.join(root, 'test-results'));
 const entry = `
 import React, { useState, useLayoutEffect } from 'react';
 import { flushSync } from 'react-dom';
@@ -1283,7 +1286,8 @@ if (helperBridge) {
   // helperApi, ipc-client's single unwrap and the actual confirmation dialog stay mounted.
   // This fixture neither installs nor talks to any native helper.
   const repair = { ...status, installed: true, needsRepair: true, version: 1, expectedProtocolVersion: 2,
-    expectedBuildId: 'fixture-current-app', selectedCore: { id: 'a'.repeat(64), version: 'fixture-core',
+    helperBuildId: 'fixture-helper-earlier', expectedBuildId: 'fixture-current-app',
+    installedSingboxPath: '/Users/synthetic-fixture/private/core', diagnostic: 'synthetic raw status detail', selectedCore: { id: 'a'.repeat(64), version: 'fixture-core',
       providerFingerprint: 'b'.repeat(64), state: 'unavailable' } };
   let observedStatus = repair;
   let pendingScreen = recovery === 'seed' || recovery === 'pending' ? 'helper-recovery' : null;
@@ -1316,6 +1320,11 @@ if (helperBridge) {
         await emit('event:trayOpenScreen', payload.screen);
         return { success: true };
       }
+      case 'core_get_version_info':
+        state.coreVersionReads = (state.coreVersionReads || 0) + 1;
+        return { success: true, data: { packagedVersion: 'fixture-packaged', bundledVersion: 'fixture-bundled', patchSet: 'c'.repeat(40) } };
+      case 'version_get_info': return { success: true, data: { appVersion: 'fixture-app', coreVersion: 'fixture-packaged', coreBaseline: 'fixture-bundled' } };
+      case 'update_get_progress': return { success: true, data: null };
       case 'helper_get_status':
         state.checks++;
         if (payload?.force === true) state.forcedChecks++;
@@ -1366,6 +1375,7 @@ if (helperBridge) {
   state.setPrivacy = locked => useAppStore.getState().setPrivacyMode(locked);
   state.leave = () => useNavStore.getState().navigate('logs');
   state.returnToHelper = () => useNavStore.getState().enterSettings('helper');
+  state.openCoreInfo = () => useNavStore.getState().enterSettings('update');
   state.captureConfirm = () => { const entry = useDialogStore.getState().stack.at(-1); if (entry?.kind !== 'confirm') throw new Error('Missing actual confirmation'); state.savedConfirm = entry.payload.onConfirm; };
 } else {
   helperApi.getStatus = async () => { state.checks++; return status; };
@@ -1433,7 +1443,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
 
   async function evidence(page: import('@playwright/test').Page, scenario: string, selector: string) {
     const { mkdirSync, writeFileSync } = await import('node:fs');
-    const output = path.join(root, 'test-results', 'feedback');
+    const output = path.join(fixtureOutputRoot, 'feedback');
     mkdirSync(output, { recursive: true });
     const stability = await page.locator(selector).evaluate(async el => {
       await document.fonts.ready;
@@ -1461,6 +1471,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     await page.screenshot({ path: path.join(output, scenario + '.png'), fullPage: true });
     writeFileSync(path.join(output, scenario + '.json'), JSON.stringify({ schema: 'polaris-feedback-visual-fixture-v1',
       sourceSha: process.env.GITHUB_SHA ?? 'local-unverified', scenario, viewport: page.viewportSize(),
+      browserVersion: browser.version(),
       presentation: await page.evaluate(() => ({ locale: document.documentElement.lang, direction: document.documentElement.dir, theme: document.documentElement.dataset.theme, rootFontSize: getComputedStyle(document.documentElement).fontSize })),
       fixtureOnly: true, stability, facts, visualVerdict: 'pending-human-review' }, null, 2));
   }
@@ -1551,7 +1562,37 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     await page.evaluate('window.__feedback.release()');
     await page.locator('[data-testid="helper-install-failure"]').waitFor();
     // The parent and typed envelope must both be real before asserting the main operation.
-    expect(await page.locator('[data-testid="helper-selected-core"]').textContent()).toContain('fixture-core');
+    const checks = page.locator('[data-testid="helper-checks"]');
+    expect(await checks.locator('dt').evaluateAll(rows => Object.fromEntries(rows.map(row => [row.textContent, row.nextElementSibling?.textContent])))).toEqual({
+      [zhCN.helper.checkInstallation]: zhCN.helper.checkYes,
+      [zhCN.helper.checkReady]: zhCN.helper.checkNo,
+      [zhCN.helper.checkLoaded]: zhCN.helper.checkUnknown,
+      [zhCN.helper.selectedCoreState]: zhCN.helper.coreState.unavailable,
+    });
+    expect(await checks.textContent()).toContain(zhCN.helper.checkScope);
+    expect(await page.locator('[data-sec="helper"]').innerText()).not.toContain('fixture-core');
+    const diagnostics = page.locator('[data-testid="helper-diagnostics"]');
+    expect(await diagnostics.getAttribute('open')).toBeNull();
+    expect(await diagnostics.locator('[data-testid="helper-checks"]').count()).toBe(1);
+    expect(await checks.isVisible()).toBe(false);
+    expect(await page.locator('[data-sec="helper"]').innerText()).not.toContain(zhCN.helper.checkScope);
+    expect(await page.locator('[data-testid="helper-install-failure"]').isVisible()).toBe(true);
+    expect(await diagnostics.locator('dd').first().isVisible()).toBe(false);
+    await diagnostics.locator('summary').click();
+    expect(await checks.isVisible()).toBe(true);
+    expect(await diagnostics.locator('dt').evaluateAll(rows => Object.fromEntries(rows.map(row => [row.textContent, row.nextElementSibling?.textContent])))).toEqual({
+      [zhCN.helper.checkInstallation]: zhCN.helper.checkYes,
+      [zhCN.helper.checkReady]: zhCN.helper.checkNo,
+      [zhCN.helper.checkLoaded]: zhCN.helper.checkUnknown,
+      [zhCN.helper.selectedCoreState]: zhCN.helper.coreState.unavailable,
+      [zhCN.helper.observedBuildId]: 'fixture-helper-earlier',
+      [zhCN.helper.expectedBuildId]: 'fixture-current-app',
+      [zhCN.helper.observedProtocol]: '1',
+      [zhCN.helper.expectedProtocol]: '2',
+      [zhCN.helper.selectedCoreId]: 'a'.repeat(64),
+      [zhCN.helper.selectedCoreProvider]: 'b'.repeat(64),
+    });
+    expect(await diagnostics.innerText()).toContain(zhCN.helper.providerFingerprintTip);
     const primary = repair.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true });
     await primary.waitFor({ state: 'visible' });
     expect(await repair.getByRole('button', { name: zhCN.helper.repairAction, exact: true }).count()).toBe(0);
@@ -1577,6 +1618,121 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     await page.waitForFunction(copy => document.querySelector('[data-testid="helper-install-failure"]')?.textContent?.includes(copy), zhCN.helper.actionError.cancelled);
     expect(await page.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary', 'stopAndUpgrade']);
+    await page.close();
+  });
+
+  for (const width of [640, 320]) it(`Helper diagnostics disclosure and copy spacing at ${width}px`, async () => {
+    const page = await browser.newPage({ locale: 'zh-CN', viewport: { width, height: 640 } });
+    await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
+    await page.addInitScript(() => {
+      (window as any).__fixtureDiagnosticCopies = [];
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        writeText: async (value: string) => { (window as any).__fixtureDiagnosticCopies.push(value); },
+      } });
+    });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    const helper = page.locator('[data-sec="helper"]');
+    const diagnostics = helper.locator('[data-testid="helper-diagnostics"]');
+    const checks = diagnostics.locator('[data-testid="helper-checks"]');
+    await checks.waitFor({ state: 'attached' });
+    expect(await diagnostics.getAttribute('open')).toBeNull();
+    expect(await checks.isVisible()).toBe(false);
+    expect(await helper.innerText()).not.toContain(zhCN.helper.checksTitle);
+    expect(await helper.innerText()).not.toContain(zhCN.helper.checkScope);
+    expect(await helper.getByRole('button', { name: zhCN.helper.repairAction, exact: true }).isVisible()).toBe(true);
+    await evidence(page, `helper-diagnostics-${width}-closed`, '[data-sec="helper"]');
+    await diagnostics.locator('summary').click();
+    expect(await checks.isVisible()).toBe(true);
+    expect(await checks.locator('dt').count()).toBe(4);
+    expect(await checks.innerText()).toContain(zhCN.helper.checkUnknown);
+    expect(await checks.innerText()).toContain(zhCN.helper.checkScope);
+    expect(await diagnostics.locator('details').count()).toBe(0);
+    const copy = diagnostics.getByRole('button', { name: zhCN.helper.copyDiagnostics, exact: true });
+    const geometry = await copy.evaluate((button, tip) => {
+      const disclosure = button.closest('details')!;
+      const paragraph = [...disclosure.querySelectorAll('p')].find(node => node.textContent === tip)!;
+      const actions = button.parentElement!;
+      const bounds = disclosure.getBoundingClientRect();
+      const buttonBounds = button.getBoundingClientRect();
+      return { topGap: actions.getBoundingClientRect().top - paragraph.getBoundingClientRect().bottom,
+        buttonFits: buttonBounds.left >= bounds.left && buttonBounds.right <= bounds.right + 1,
+        hashesFit: [...disclosure.querySelectorAll<HTMLElement>('dd.mono')].every(node => node.scrollWidth <= node.clientWidth + 1),
+        disclosureFits: disclosure.scrollWidth <= disclosure.clientWidth + 1 };
+    }, zhCN.helper.providerFingerprintTip);
+    expect(geometry.topGap).toBeGreaterThanOrEqual(12);
+    expect(geometry.buttonFits).toBe(true);
+    expect(geometry.hashesFit).toBe(true);
+    expect(geometry.disclosureFits).toBe(true);
+    await copy.click();
+    await page.waitForFunction('window.__fixtureDiagnosticCopies.length === 1');
+    expect(await page.evaluate('JSON.parse(window.__fixtureDiagnosticCopies[0]).selectedCore')).toEqual({
+      id: 'a'.repeat(64), providerFingerprint: 'b'.repeat(64), state: 'unavailable',
+    });
+    expect(await diagnostics.innerText()).toContain(zhCN.helper.diagnosticsCopied);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    await evidence(page, `helper-diagnostics-${width}-open`, '[data-testid="helper-diagnostics"]');
+    await diagnostics.locator('summary').click();
+    expect(await checks.isVisible()).toBe(false);
+    expect(await helper.innerText()).not.toContain(zhCN.helper.checkScope);
+    await page.close();
+  });
+
+  it('Helper raw status and CoreInfo keep service checks, versions and copied identities separate', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    // Synthetic clipboard sink in this disposable context: the real UI handler
+    // executes, but no system clipboard or existing browser profile is accessed.
+    await page.addInitScript(() => {
+      (window as any).__fixtureDiagnosticCopies = [];
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        writeText: async (value: string) => { (window as any).__fixtureDiagnosticCopies.push(value); },
+      } });
+    });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    await page.locator('[data-testid="helper-checks"]').waitFor({ state: 'attached' });
+    const helperDiagnostics = page.locator('[data-testid="helper-diagnostics"]');
+    expect(await helperDiagnostics.getAttribute('open')).toBeNull();
+    expect(await helperDiagnostics.locator('[data-testid="helper-checks"]').isVisible()).toBe(false);
+    await helperDiagnostics.locator('summary').click();
+    expect(await helperDiagnostics.locator('[data-testid="helper-checks"]').isVisible()).toBe(true);
+    expect(await helperDiagnostics.innerText()).toContain(zhCN.helper.checkScope);
+    await helperDiagnostics.getByRole('button', { name: zhCN.helper.copyDiagnostics, exact: true }).click();
+    await page.waitForFunction('window.__fixtureDiagnosticCopies.length === 1');
+    expect(await page.evaluate('JSON.parse(window.__fixtureDiagnosticCopies[0])')).toEqual({
+      helper: { supported: true, installed: true, ready: false, loaded: null, upgradeable: false, needsRepair: true,
+        backgroundDisabled: false, pathMismatch: false, version: 1, expectedProtocolVersion: 2,
+        helperBuildId: 'fixture-helper-earlier', expectedBuildId: 'fixture-current-app' },
+      selectedCore: { id: 'a'.repeat(64), providerFingerprint: 'b'.repeat(64), state: 'unavailable' },
+    });
+    expect(await helperDiagnostics.innerText()).toContain(zhCN.helper.diagnosticsCopied);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    await page.evaluate('window.__feedback.openCoreInfo()');
+    const card = page.locator('#core-info-card');
+    await card.waitFor();
+    await page.waitForFunction(() => document.querySelector('[data-core-info="selected-version"]')?.textContent === 'fixture-core');
+    await page.waitForFunction(() => document.querySelector('[data-core-info="packaged"]')?.textContent === 'fixture-packaged');
+    expect(await card.locator('[data-core-info="packaged"]').textContent()).toBe('fixture-packaged');
+    expect(await card.locator('[data-core-info="bundled"]').textContent()).toBe('fixture-bundled');
+    expect(await card.locator('[data-core-info="selected-version"]').textContent()).toBe('fixture-core');
+    expect(await card.locator('[data-core-info="installed-state"]').textContent()).toBe(zhCN.helper.coreState.unavailable);
+    expect(await card.innerText()).toContain(zhCN.helper.checkScope);
+    const coreDiagnostics = card.locator('[data-testid="core-diagnostics"]');
+    expect(await coreDiagnostics.getAttribute('open')).toBeNull();
+    expect(await coreDiagnostics.locator('[data-core-info="selected-id"]').isVisible()).toBe(false);
+    expect(await card.innerText()).not.toContain('a'.repeat(64));
+    expect(await card.innerText()).not.toContain('b'.repeat(64));
+    await coreDiagnostics.locator('summary').click();
+    expect(await coreDiagnostics.locator('[data-core-info="selected-id"]').textContent()).toBe('a'.repeat(64));
+    expect(await coreDiagnostics.locator('[data-core-info="provider"]').textContent()).toBe('b'.repeat(64));
+    expect(await coreDiagnostics.innerText()).toContain(zhCN.helper.providerFingerprintTip);
+    await coreDiagnostics.getByRole('button', { name: zhCN.helper.copyDiagnostics, exact: true }).click();
+    await page.waitForFunction('window.__fixtureDiagnosticCopies.length === 2');
+    expect(await page.evaluate('JSON.parse(window.__fixtureDiagnosticCopies[1])')).toEqual({
+      selectedCore: { id: 'a'.repeat(64), providerFingerprint: 'b'.repeat(64), state: 'unavailable' },
+    });
+    expect(await coreDiagnostics.innerText()).toContain(zhCN.helper.diagnosticsCopied);
+    expect(await page.evaluate('window.__feedback.coreVersionReads')).toBe(1);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
     await page.close();
   });
 
@@ -1617,6 +1773,14 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     await page.evaluate('window.__feedback.release(null)');
     await page.locator('[data-s="installed"]').waitFor();
+    const installed = page.locator('[data-s="installed"]');
+    expect(await installed.innerText()).toContain(zhCN.helper.statusInstalled);
+    // The retired ordinary-ready copy must stay absent after its locale key is removed.
+    expect(await installed.innerText()).not.toContain("辅助服务已就绪，可接收请求。下方分别列出服务与选定内核安装内容的检查结果。");
+    expect(await installed.getByRole('button', { name: zhCN.helper.recheck, exact: true }).isVisible()).toBe(true);
+    expect(await installed.getByRole('button', { name: zhCN.helper.uninstall, exact: true }).isVisible()).toBe(true);
+    expect(await page.locator('[data-testid="helper-diagnostics"]').getAttribute('open')).toBeNull();
+    await evidence(page, 'helper-installed-ready', '[data-sec="helper"]');
     expect(await page.evaluate('window.__feedback.forcedChecks')).toBeGreaterThanOrEqual(1);
     expect(await page.locator('[data-testid="helper-install-failure"]').count()).toBe(0);
     expect(await page.getByRole('dialog').count()).toBe(0);
@@ -1660,7 +1824,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     await page.close();
   });
 
-  it.each(['win', 'lin', 'unknown'])('Helper raw typed deferral on %s cannot select migration', async platform => {
+  it.each(['win', 'unknown'])('Helper raw typed deferral on %s cannot select migration', async platform => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&os=' + platform);
     const primary = page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true });
@@ -1672,6 +1836,39 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).count()).toBe(0);
     expect(await page.getByRole('dialog').count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.close();
+  });
+
+  it('Helper Linux typed deferral requires a fresh forward-only confirmation', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&os=lin');
+    const repair = page.locator('[data-s="needs-repair"]');
+    await repair.getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
+    await page.waitForFunction('typeof window.__feedback.release === "function"');
+    await page.evaluate('window.__feedback.release()');
+    await page.locator('[data-testid="helper-install-failure"]').waitFor();
+    const migration = repair.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true });
+    await migration.waitFor();
+    expect(await page.getByRole('dialog').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await migration.click();
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor();
+    expect(await dialog.textContent()).toContain(zhCN.helper.linuxStopAndUpgradeTitle);
+    expect(await dialog.textContent()).toContain(zhCN.helper.linuxStopAndUpgradeWarning);
+    await page.evaluate('window.__feedback.captureConfirm()');
+    await dialog.getByRole('button', { name: zhCN.common.cancel, exact: true }).click();
+    await page.evaluate('window.__feedback.savedConfirm()');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await migration.click();
+    await dialog.waitFor();
+    await dialog.getByRole('button', { name: zhCN.helper.stopAndUpgradeConfirm, exact: true }).click();
+    await page.waitForFunction('window.__feedback.installs === 2');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary', 'stopAndUpgrade']);
+    await page.evaluate('window.__feedback.release(null)');
+    await page.locator('[data-s="installed"]').waitFor();
+    expect(await page.getByRole('dialog').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
     await page.close();
   });
 

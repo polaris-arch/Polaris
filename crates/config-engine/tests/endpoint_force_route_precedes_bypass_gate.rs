@@ -430,7 +430,11 @@ fn ts_node(id: &str) -> ServerConfig {
         id: id.into(),
         name: id.into(),
         protocol: Protocol::Tailscale,
-        tailscale_settings: Some(Box::new(TailscaleSettings::default())),
+        // 本门验证实际声明的重叠/旁路，不为未知 tailnet 猜测官方前缀。
+        tailscale_settings: Some(Box::new(TailscaleSettings {
+            routes: vec!["100.64.0.0/10".into(), "fd7a:115c:a1e0::/48".into()],
+            ..Default::default()
+        })),
         ..Default::default()
     }
 }

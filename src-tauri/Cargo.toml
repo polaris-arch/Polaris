@@ -56,12 +56,12 @@ tauri-plugin-fs = "2"
 # 纯逻辑/trait crate；src-tauri 在 runtime/ 注入真实实现（tokio runtime / std::fs / 真 socket）。
 polaris-config-engine      = { path = "../crates/config-engine" }
 polaris-store              = { path = "../crates/store" }
-polaris-core-supervisor    = { path = "../crates/core-supervisor" }
+polaris-core-supervisor    = { path = "../crates/core-supervisor", default-features = false }
 polaris-net-stack          = { path = "../crates/net-stack" }
 # E2②：平台网络事件解析的纯逻辑下沉。无 C 依赖 ⇒ 落进 ci.yml 的跨目标 check 射程；
 # 跨 crate 的 pub 项不触发 dead_code ⇒ 删掉一批只为压 warning 的 `#[cfg(any(macos, linux, test))]`。
 polaris-platform-events    = { path = "../crates/platform-events" }
-polaris-switch-engine      = { path = "../crates/switch-engine" }
+polaris-switch-engine      = { path = "../crates/switch-engine", default-features = false }
 polaris-stats-engine       = { path = "../crates/stats-engine" }
 polaris-system-integration = { path = "../crates/system-integration" }
 polaris-helper-client      = { path = "../crates/helper-client" }
@@ -72,7 +72,7 @@ polaris-singbox-grpc       = { path = "../crates/singbox-grpc" }
 polaris-helper-proto       = { path = "../crates/helper-proto" }
 polaris-log-budget         = { path = "../crates/log-budget" }
 # 平台 helper（单 crate，内部按 target_os cfg 隔离三平台；B3 接线前仅挂名未 use）
-polaris-helper             = { path = "../crates/helper" }
+polaris-helper             = { path = "../crates/helper", default-features = false }
 # reqwest 的 "socks" feature：SOCKS5 代理支持，`HttpRuntime::via_local_socks_proxy` 打本机 sing-box
 # 的 **`update-in`**（`type:"socks"` 入站）必需 —— 只有它是 socks；`mixed-in` / `probe-*-in` 由
 # http 构造器 `via_local_proxy` 消费，不经本 feature。reqwest 0.13 里 `socks = []` —— 实现内置于
@@ -161,6 +161,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Reuse the workspace's existing protobuf codec for the real loopback readback
+# peer. No new package/version or production dependency is introduced.
+tonic-prost = "0.14"
 tauri = { version = "2", features = ["test"] }
 # test-utils = 取 polaris-updater 的跨 crate 测试替身（MockFs / MockFailOp）。
 # 只在 dev-dependency 上开：resolver = "2" 下 `cargo build --workspace` / 打包不会带上它。
@@ -171,3 +174,9 @@ tokio = { version = "1", features = ["test-util"] }
 # 源码级门的取材锚点（`test_support::{crate_source, module_source, ...}` 的实现）。dev-only：
 # 不进 lib/bin 依赖图，不进包。零第三方依赖（只用 std）⇒ Cargo.lock 与 THIRD-PARTY 均无新增。
 polaris-source-probe = { version = "1.0.0", path = "../crates/source-probe" }
+
+[features]
+default = ["formal-selection"]
+formal-selection = ["polaris-core-supervisor/formal-selection", "polaris-helper/formal-selection", "polaris-switch-engine/formal-selection"]
+local-development-selection = ["installed-development-selection", "polaris-core-supervisor/local-development-selection", "polaris-helper/local-development-selection", "polaris-switch-engine/local-development-selection"]
+installed-development-selection = ["polaris-core-supervisor/installed-development-selection"]

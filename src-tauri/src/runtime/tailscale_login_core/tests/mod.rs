@@ -8,6 +8,7 @@
 //! api 端口与 secret 的解析 / check-fail 不 spawn / spawn-fail 不留表项 / 双写守卫拦截。
 //! 真 spawn+控制面路径**不在此覆盖**（真机门槛，见模块头）。
 
+mod artifacts;
 mod attempt_lifecycle;
 mod capacity;
 /// 真子进程腿：探针只在 unix 有（理由见 [`crate::test_support::write_sleeping_probe`]）。
@@ -446,6 +447,20 @@ fn frame(tag: &str, backend_state: &str, auth_url: &str) -> daemon::TailscaleSta
 }
 
 // ── 测试脚手架 ──
+fn request(id: &str) -> LoginRequest {
+    LoginRequest {
+        attempt_id: id.into(),
+        mode: LoginMode::Browser,
+        replace_identity: false,
+        reuse_retained_auth_key: false,
+        expected_credential_revision: None,
+    }
+}
+
+fn offline() -> MainLoginSnapshot {
+    MainLoginSnapshot::default()
+}
+
 fn ts_server(id: &str, name: &str) -> ServerConfig {
     ServerConfig {
         id: id.to_string(),
@@ -517,7 +532,7 @@ fn login_configs(dir: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("tailscale-login-"))
+                .is_some_and(|n| super::stale::login_config_identity(n).is_some())
         })
         .collect()
 }
@@ -1335,14 +1350,44 @@ async fn failed_close_keeps_claim_and_config_until_successful_retry() {
     let ud = temp_ud();
     let _ = started(&reg, &ud, &ts_server("ts1", "myts")).await;
     let old = spawner.spawned.lock().unwrap()[0].clone();
+    let config = sole_login_config(&ud);
+    let cache = login_cache_path(&config);
+    let config_bytes = std::fs::read(&config).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
+    assert_eq!(
+        PathBuf::from(json["experimental"]["cache_file"]["path"].as_str().unwrap()),
+        cache
+    );
+    assert!(std::fs::read(&cache).unwrap().is_empty());
+    std::fs::write(&cache, b"private-login-cache").unwrap();
+    let main_cache = ud.join("cache.db");
+    assert_ne!(cache, main_cache);
+    std::fs::write(&main_cache, b"main-cache-sentinel").unwrap();
     old.close_failures.store(1, Ordering::SeqCst);
     assert!(reg.cancel_login("ts1").await.is_err());
     assert!(reg.shared.contains("ts1"));
     assert!(!old.terminated.load(Ordering::SeqCst));
-    assert_eq!(std::fs::read_dir(&ud).unwrap().count(), 1);
+    assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
+    assert_eq!(std::fs::read(&cache).unwrap(), b"private-login-cache");
+    assert_eq!(
+        std::fs::read_dir(&ud)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([config.clone(), cache.clone(), main_cache.clone()])
+    );
     assert!(reg.cancel_login("ts1").await.unwrap());
+    assert!(old.terminated.load(Ordering::SeqCst));
     assert!(!reg.shared.contains("ts1"));
-    assert_eq!(std::fs::read_dir(&ud).unwrap().count(), 0);
+    assert!(!config.exists() && !cache.exists());
+    assert_eq!(std::fs::read(&main_cache).unwrap(), b"main-cache-sentinel");
+    assert_eq!(
+        std::fs::read_dir(&ud)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>(),
+        vec![main_cache]
+    );
     std::fs::remove_dir_all(ud).unwrap();
 }
 

@@ -7,7 +7,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync,
   rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { digest } from './source-graph.mjs';
@@ -20,6 +20,7 @@ import { releaseGateContext, verifyNativeReleaseGate } from './release-native-ga
 import { validationContext } from './validation-origin.mjs';
 import { verifyPackagedSource } from './bundle.mjs';
 import { coreWireHandoffName, createCoreWireHandoff, importCoreWireHandoff, packCoreWireHandoff, unpackCoreWireHandoff } from './wire-input-handoff.mjs';
+import { verifyRecoveryResource } from './recovery.mjs';
 import { assertSourceFirstRelease } from '../assert-pc-runtime-release.mjs';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
 
@@ -114,6 +115,7 @@ function fixture(options = {}) {
       consumerAcceptance: 'pending', actualVersionOutput: `sing-box version ${version}\nRevision: ${commit}\n`, fixtureOnly: true };
     const coreBytes = coreFixture(key), sidecarBytes = t.sidecar ? cronetFixture(key) : null;
     if (options.coreMarker !== undefined) coreBytes[255] = options.coreMarker;
+    if (key === 'linux' && options.linuxMachine !== undefined) coreBytes.writeUInt16LE(options.linuxMachine, 18);
     const originalArchive = { name: rootName + t.suffix, bytes: 1, sha256: 'e'.repeat(64), members: {
       [`${rootName}/${t.core}`]: digest(coreBytes), ...(t.sidecar ? { [`${rootName}/${t.sidecar}`]: digest(sidecarBytes) } : {}) } };
     const finalPackageCronetSmoke = { os: t.os, arch: t.arch, go: raw.goVersion, gvisorCompiled: true,
@@ -191,7 +193,7 @@ else:
     }
     assert(['python3', 'python'].includes(command), 'Target execution prohibited'); return execFileSync(command, args, options);
   };
-  return { root, contract, manifest, transport, calls, read, run, base, publicRelease, inspections };
+  return { root, contract, manifest, transport, calls, read, run, base, publicRelease, inspections, blobCacheDir: false };
 }
 async function withFixture(fn, options) { const f = fixture(options); try { await fn(f); } finally { rmSync(f.root, { recursive: true, force: true }); } }
 function resources(f) {
@@ -215,10 +217,162 @@ test('all four release archives keep exact cores, colocated libraries, notices a
     assert(existsSync(join(dirname(path), 'core-release/LICENSE')));
     if (row.sidecar) assert.equal(inspectNativePayload(f.root, key, path, join(dirname(path), row.sidecar.member), f.run).schema, 'polaris-native-release-payload-input-v1');
   }
+  const localGate = join(f.root, 'scripts/desktop-core/local-development.mjs');
+  const gateBytes = readFileSync(localGate);
+  writeFileSync(localGate, Buffer.concat([gateBytes, Buffer.from('\n// changed rejection module\n')]));
+  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux',
+    join(f.root, 'resources/linux/sing-box'), f.run), /App adapter identity differs/);
+  writeFileSync(localGate, gateBytes);
   assert.equal(f.calls.filter((url) => url.includes('/releases/17')).length, 2);
   assert(f.calls.every((url) => !url.includes('proxy.golang.org') && !url.includes('raw.githubusercontent.com')));
   assert(!existsSync(join(f.root, 'resources/.source-receipts')));
 }));
+test('normal release consumption preserves each original compressed recovery archive independently', async () => withFixture(async f => {
+  const extractions = [];
+  const run = (command, args, options) => {
+    if (args[1]?.endsWith('release-archive.py') && args[3] !== '--source-legal-pins') {
+      assert.equal(command, PYTHON);
+      assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
+      assert.equal(options.encoding, 'utf8'); assert.equal(options.maxBuffer, 1024 * 1024);
+      const request = JSON.parse(options.input);
+      const key = Object.keys(RELEASE_TARGETS).find(key => f.contract.platforms[key].target === request.target);
+      assert.ok(key);
+      const row = f.contract.platforms[key];
+      assert.deepEqual(request, { archive: row.archive, root: row.archive.name.slice(0, -RELEASE_TARGETS[key].suffix.length), target: row.target });
+      extractions.push(key);
+    }
+    return f.run(command, args, options);
+  };
+  await consumeRelease(f.root, f.manifest, undefined, { ...f, run });
+  assert.deepEqual(extractions.sort(), Object.keys(RELEASE_TARGETS).sort());
+  for (const [key, row] of Object.entries(f.contract.platforms)) {
+    const directory = join(f.root, 'resources/core-recovery', key);
+    const archive = join(directory, row.archive.name);
+    assert.deepEqual(readFileSync(archive), f.transport.get(row.releaseAsset.url));
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(archive).mode & 0o7777, 0o644);
+    }
+    const inventory = verifyRecoveryResource(directory, row, key, f.manifest.desktopRelease.contractSha256, join(f.root, 'resources', key));
+    assert.equal(inventory.archive.sha256, row.archive.sha256);
+    assert.equal(inventory.archive.format, key === 'win' ? 'zip' : 'tar.gz');
+    assert.deepEqual(Object.keys(inventory.memberBytes).sort(), Object.keys(row.archive.members).sort());
+    assert.equal(inventory.memberBytes[Object.keys(row.archive.members).find(n => n.endsWith('/' + row.core.member))], row.core.bytes);
+    assert(!Object.hasOwn(inventory, 'members')); // Hash allowlist stays in the selected contract.
+    const runtime = join(f.root, 'resources', key, row.core.member);
+    const pinned = readFileSync(runtime); writeFileSync(runtime, Buffer.alloc(pinned.length));
+    assert.deepEqual(readFileSync(archive), f.transport.get(row.releaseAsset.url));
+    writeFileSync(runtime, pinned);
+    if (!row.sidecar) assert(!Object.keys(inventory.memberBytes).some(n => /libcronet\./.test(n)));
+  }
+}));
+
+test('cold archive failure returns through acquiring finally without retries or replacement', async () => {
+  for (const [key, failure] of [
+    ['linux', { code: 'ETIMEDOUT', status: null, signal: 'SIGKILL' }],
+    ['mac-arm64', { status: 7, signal: null }],
+  ]) await withFixture(async f => {
+    await consumeRelease(f.root, f.manifest, ['linux'], f);
+    const directory = join(f.root, 'resources');
+    write(join(directory, '.release-consumer-unrelated/sentinel'), 'another transaction is not ours');
+    const before = resources(f), entries = readdirSync(directory).sort();
+    const downloads = f.calls.filter(url => url === f.contract.platforms[key].releaseAsset.url).length;
+    let archiveCalls = 0, replacements = 0, ownedWork;
+    const run = (command, args, options) => {
+      if (args[1]?.endsWith('release-archive.py')) {
+        archiveCalls++;
+        assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
+        const journal = JSON.parse(readFileSync(join(directory, '.release-consumer.lock'), 'utf8'));
+        assert.equal(journal.phase, 'acquiring');
+        ownedWork = join(directory, journal.work); assert(existsSync(ownedWork));
+        throw Object.assign(Error(`never_log_cold_input ${options.input} ${f.root}`), failure,
+          { stderr: Buffer.from(`never_log_cold_stderr ${f.root}`) });
+      }
+      return f.run(command, args, options);
+    };
+    await assert.rejects(consumeRelease(f.root, f.manifest, [key], { ...f, run,
+      rename: () => { replacements++; assert.fail('acquiring failure must not replace'); } }), error => {
+      assert.match(error.message, /stage=native-archive-extraction; elapsedMs=\d+; timeoutMs=120000/);
+      assert(error.message.includes(`code=${failure.code ?? 'unknown'}`));
+      assert(error.message.includes(`status=${failure.status ?? 'unknown'}`));
+      assert(error.message.includes(`signal=${failure.signal ?? 'unknown'}`));
+      assert.doesNotMatch(String(error), /never_log_cold/);
+      assert(!String(error).includes(f.root)); assert.equal(error.cause, undefined);
+      return true;
+    });
+    assert.equal(archiveCalls, 1); assert.equal(replacements, 0);
+    assert.equal(f.calls.filter(url => url === f.contract.platforms[key].releaseAsset.url).length - downloads, 1);
+    assert(ownedWork); assert(!existsSync(ownedWork));
+    assert(!existsSync(join(directory, '.release-consumer.lock')));
+    assert.deepEqual(readdirSync(directory).sort(), entries);
+    assert.deepEqual(resources(f), before, 'old payloads, recovery archives, receipts and unrelated work survive');
+  });
+});
+test('real recovery producer publishes0644 data even when the acquired archive is group/world writable', async () => withFixture(async f => {
+  let observed = false;
+  const run = (command, args, options) => {
+    if (typeof args[1] === 'string' && args[1].endsWith('release-archive.py') && args[3]?.includes('unpacked-linux')) {
+      fs.chmodSync(args[2], 0o666); observed = true;
+    }
+    return f.run(command, args, options);
+  };
+  await consumeRelease(f.root, f.manifest, ['linux'], { ...f, run });
+  assert(observed, 'actual acquisition/extraction path was exercised');
+  const row = f.contract.platforms.linux, archive = join(f.root, 'resources/core-recovery/linux', row.archive.name);
+  assert.deepEqual(readFileSync(archive), f.transport.get(row.releaseAsset.url));
+  if (process.platform !== 'win32') assert.equal(fs.statSync(archive).mode & 0o7777, 0o644);
+}));
+test('production package verification rejects bad recovery bytes, sizes, extras and metadata', async () => withFixture(async f => {
+  await consumeRelease(f.root, f.manifest, ['linux'], f);
+  const row = f.contract.platforms.linux, directory = join(f.root, 'resources/core-recovery/linux');
+  const archive = join(directory, row.archive.name), original = readFileSync(archive);
+  const inventory = join(directory, 'inventory.json'), originalInventory = readFileSync(inventory);
+  const verify = () => verifyPackagedSource(f.root, f.manifest, 'linux', join(f.root, 'resources/linux/sing-box'), f.run);
+  const corrupt = Buffer.from(original); corrupt[0] ^= 1; writeFileSync(archive, corrupt);
+  assert.throws(verify, /Recovery compressed bytes differ/); writeFileSync(archive, original);
+  for (const mutate of [v => { v.contractSha256 = '0'.repeat(64); }, v => { v.memberBytes[Object.keys(v.memberBytes)[0]]++; }, v => { v.authority = true; }]) {
+    const value = JSON.parse(originalInventory); mutate(value); writeFileSync(inventory, JSON.stringify(value));
+    assert.throws(verify, /Recovery inventory differs/);
+  }
+  writeFileSync(inventory, originalInventory); writeFileSync(join(directory, 'extra'), 'unknown');
+  assert.throws(verify, /Extra\/missing recovery/); rmSync(join(directory, 'extra'));
+  rmSync(archive); assert.throws(verify, /Extra\/missing recovery/);
+}));
+test('recovery publication participates in the original rollback and preserves unselected platforms', async () => withFixture(async f => {
+  await consumeRelease(f.root, f.manifest, undefined, f); const original = resources(f);
+  const rename = (from, to) => {
+    if (from.replaceAll('\\', '/').endsWith('/stage/core-recovery')) throw Error('recovery publication rejected');
+    renameSync(from, to);
+  };
+  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, rename }), /recovery publication rejected/);
+  assert.deepEqual(resources(f), original);
+  await consumeRelease(f.root, f.manifest, ['linux'], f);
+  const current = resources(f);
+  for (const key of ['win', 'mac-x64', 'mac-arm64']) {
+    for (const [name, bytes] of Object.entries(original).filter(([name]) => name.startsWith('core-recovery/' + key + '/'))) assert.equal(current[name], bytes);
+  }
+}));
+test('final carrier verification checks its own recovery copy without borrowing the source checkout', async () => withFixture(async f => {
+  await consumeRelease(f.root, f.manifest, ['linux'], f);
+  const carrier = join(f.root, 'final/resources'), row = f.contract.platforms.linux;
+  const directory = join(carrier, 'core-recovery/linux');
+  cpSync(join(f.root, 'resources/linux'), join(carrier, 'linux'), { recursive: true });
+  cpSync(join(f.root, 'resources/core-recovery/linux'), directory, { recursive: true });
+  const verify = () => verifyPackagedSource(f.root, f.manifest, 'linux', join(carrier, 'linux/sing-box'), f.run);
+  assert.equal(verify().platform, 'linux');
+  const archive = join(directory, row.archive.name), original = readFileSync(archive);
+  const corrupt = Buffer.from(original); corrupt[0] ^= 1; write(archive, corrupt);
+  assert.throws(verify, /Recovery compressed bytes differ/); write(archive, original);
+  rmSync(join(directory, 'inventory.json'));
+  assert.throws(verify, /Extra\/missing recovery/);
+  assert.equal(readFileSync(join(f.root, 'resources/core-recovery/linux', row.archive.name)).equals(original), true);
+}));
+test('desktop bundle mappings carry only the matching independently preserved recovery namespace', () => {
+  for (const [key, config] of [['linux', 'linux'], ['win', 'windows'], ['mac-x64', 'macos-x64'], ['mac-arm64', 'macos-arm64']]) {
+    const resource = JSON.parse(readFileSync(join(repo, `src-tauri/tauri.${config}.conf.json`))).bundle.resources;
+    assert(resource.includes(`../resources/core-recovery/${key}/`));
+    assert.equal(resource.filter(n => n.includes('/core-recovery/')).length, 1);
+  }
+});
 test('unknown/duplicate/CLI-only architecture selection rejects without resources writes', async () => withFixture(async (f) => {
   for (const keys of [['linux', 'linux'], ['linux-arm64'], []]) await assert.rejects(consumeRelease(f.root, f.manifest, keys, f));
   assert.deepEqual(resources(f), {}); assert.equal(f.calls.length, 0);
@@ -389,7 +543,8 @@ test('actual inventory CLI admits precisely the release members and rejects miss
       : key === 'win' ? [carrier] : [join(carrier, 'macos/Polaris.app/Contents/Resources')];
     for (const scope of scopes) {
       cpSync(join(f.root, 'src-tauri/core-manifest.json'), join(scope, 'core-manifest.json'), { recursive: true });
-      for (const name of ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md', `resources/${key}`, 'resources/data', 'resources/dashboard']) {
+      for (const name of ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md', `resources/${key}`,
+        `resources/core-recovery/${key}`, 'resources/data', 'resources/dashboard']) {
         mkdirSync(dirname(join(scope, '_up_', name)), { recursive: true });
         cpSync(join(f.root, name), join(scope, '_up_', name), { recursive: true });
       }
@@ -433,9 +588,19 @@ test('Mac consumption and final bundle entry enforce strict native verification 
   }
   const receipts = await consumeRelease(f.root, f.manifest, [key], { ...f, host: 'darwin' });
   assert.deepEqual(receipts[key].macCodeSignature, { state: 'signed', cdHash: '4'.repeat(40) });
-  const carrier = join(f.root, 'signature-carrier'); cpSync(join(f.root, 'resources', key), carrier, { recursive: true });
-  const core = join(carrier, 'sing-box'), before = digest(readFileSync(core));
+  const carrier = join(f.root, 'signature-carrier'), runtime = join(carrier, key);
+  cpSync(join(f.root, 'resources', key), runtime, { recursive: true });
+  const recovery = join(carrier, 'core-recovery', key);
+  cpSync(join(f.root, 'resources/core-recovery', key), recovery, { recursive: true });
+  const core = join(runtime, 'sing-box'), before = digest(readFileSync(core));
   assert.equal(verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
+  const archive = join(recovery, f.contract.platforms[key].archive.name), archiveBytes = readFileSync(archive);
+  const corrupt = Buffer.from(archiveBytes); corrupt[0] ^= 1; write(archive, corrupt);
+  assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin'), /Recovery compressed bytes differ/);
+  write(archive, archiveBytes);
+  const inventory = join(recovery, 'inventory.json'), inventoryBytes = readFileSync(inventory); rmSync(inventory);
+  assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin'), /Extra\/missing recovery/);
+  write(inventory, inventoryBytes);
   for (const run of badRuns) assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, run, 'darwin'), /signature|CDHash/);
   const file = join(f.root, 'resources/.release-receipts', `${key}.json`), original = readFileSync(file);
   for (const signature of [undefined, { state: 'invalid', cdHash: '4'.repeat(40) }, { state: 'signed', cdHash: '5'.repeat(40) }, { state: 'unsigned', cdHash: null }]) {
@@ -984,7 +1149,7 @@ async function handoffFixture(f) {
   const before = resources(f), bundle = join(f.root, 'core-wire-inputs');
   const options = { env: handoffEnv, run: f.run, host: 'linux' };
   const name = createCoreWireHandoff(f.root, f.manifest, bundle, candidate, options);
-  for (const n of ['.release-receipts', ...Object.keys(RELEASE_TARGETS)]) rmSync(join(f.root, 'resources', n), { recursive: true });
+  for (const n of ['.release-receipts', 'core-recovery', ...Object.keys(RELEASE_TARGETS)]) rmSync(join(f.root, 'resources', n), { recursive: true });
   return { before, bundle, options, name };
 }
 test('same-attempt wire handoff runs complete resource verification without repeating public consumption', async () => withFixture(async (f) => {
@@ -1086,6 +1251,11 @@ test('handoff closes changed bytes, unsafe modes, links, extra members and chang
   fs.chmodSync(core, 0o777); failed(); fs.chmodSync(core, 0o755);
   const extra = join(h.bundle, 'resources/linux/extra'); write(extra, 'extra'); failed(); rmSync(extra);
   symlinkSync(core, extra); failed(); rmSync(extra);
+  const recovery = join(h.bundle, 'resources/core-recovery/linux');
+  const inventory = join(recovery, 'inventory.json'), inventoryBytes = readFileSync(inventory);
+  rmSync(inventory); failed(); write(inventory, inventoryBytes);
+  const unknownPlatform = join(h.bundle, 'resources/core-recovery/other'); mkdirSync(unknownPlatform);
+  failed(); rmSync(unknownPlatform, { recursive: true });
   const manifest = join(f.root, 'src-tauri/core-manifest.json'), raw = readFileSync(manifest);
   write(manifest, Buffer.concat([raw, Buffer.from(' ')])); failed(); write(manifest, raw);
 }));
@@ -1107,12 +1277,39 @@ test('final Mac core uses its complete explicit release receipt for both targets
   assert.equal(existsSync(join(f.root, 'resources/.source-receipts')), false);
   for (const key of ['mac-x64', 'mac-arm64']) {
     const stage = join(f.root, 'final-carrier', key); cpSync(join(f.root, 'resources', key), stage, { recursive: true });
+    cpSync(join(f.root, 'resources/core-recovery', key), join(dirname(stage), 'core-recovery', key), { recursive: true });
     const binary = join(stage, 'sing-box'), before = readFileSync(binary);
     const receipt = verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run);
     assert.equal(receipt.schema, 'polaris-app-release-consumption-v1');
     assert.deepEqual(receipt.producer, f.contract.platforms[key]); assert.deepEqual(readFileSync(binary), before);
     assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
   }
+}));
+test('final Mac recovery verifies delivered archive and inventory instead of intact build resources', async () => withFixture(async (f) => {
+  await consumeRelease(f.root, f.manifest, ['mac-x64', 'mac-arm64'], { ...f, host: 'darwin' });
+  for (const key of ['mac-x64', 'mac-arm64']) {
+    const resources = join(f.root, 'recovery-final', key, 'Contents/Resources/_up_/resources');
+    const payload = join(resources, key), recovery = join(resources, 'core-recovery', key);
+    cpSync(join(f.root, 'resources', key), payload, { recursive: true });
+    cpSync(join(f.root, 'resources/core-recovery', key), recovery, { recursive: true });
+    const binary = join(payload, 'sing-box');
+    assert.equal(verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run).platform, key);
+    const archive = join(recovery, f.contract.platforms[key].archive.name), original = readFileSync(archive);
+    const changed = Buffer.from(original); changed[changed.length - 1] ^= 1; write(archive, changed);
+    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Recovery compressed bytes differ/);
+    write(archive, original);
+    const inventory = join(recovery, 'inventory.json'), raw = readFileSync(inventory);
+    const altered = JSON.parse(raw); altered.platform = key === 'mac-arm64' ? 'mac-x64' : 'mac-arm64'; write(inventory, encode(altered));
+    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Recovery inventory differs/);
+    write(inventory, raw); rmSync(archive);
+    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Extra\/missing recovery/);
+    symlinkSync(join(f.root, 'resources/core-recovery', key, f.contract.platforms[key].archive.name), archive);
+    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Linked or non-regular recovery/);
+    rmSync(archive); write(archive, original);
+    assert.equal(verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run).platform, key);
+    assert.deepEqual(readFileSync(join(f.root, 'resources/core-recovery', key, f.contract.platforms[key].archive.name)), original);
+  }
+  assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
 }));
 test('Mac release selection rejects invalid or missing release receipts without using present legacy receipts', async () => withFixture(async (f) => {
   await consumeRelease(f.root, f.manifest, ['mac-arm64'], { ...f, host: 'darwin' });
@@ -1128,6 +1325,7 @@ test('Mac release selection rejects invalid or missing release receipts without 
 test('final Mac release verification closes changed CDHash, bytes, missing notice and added sidecar', async () => withFixture(async (f) => {
   await consumeRelease(f.root, f.manifest, ['mac-arm64'], { ...f, host: 'darwin' });
   const stage = join(f.root, 'final-carrier/mac-arm64'); cpSync(join(f.root, 'resources/mac-arm64'), stage, { recursive: true });
+  cpSync(join(f.root, 'resources/core-recovery/mac-arm64'), join(dirname(stage), 'core-recovery/mac-arm64'), { recursive: true });
   const binary = join(stage, 'sing-box'), raw = readFileSync(binary);
   write(binary, Buffer.alloc(raw.length)); assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run)); write(binary, raw);
   const wrong = (cmd, args, opts) => {
@@ -1153,13 +1351,22 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
     const env = { ...process.env, TMPDIR: alias };
     const mountSteps = [...workflow.matchAll(/            mnt=\$\(mktemp -d\)\n(?:            mnt=[^\n]+\n)?            hdiutil attach[^\n]+/g)];
     assert.equal(mountSteps.length, 2, 'Both writable and final read-only DMG mount steps must be exercised');
+    const ownedRoots = [];
+    const ownRoot = (path) => {
+      assert.match(basename(path), /^tmp\.[A-Za-z0-9]+$/, 'Only this mktemp invocation owns cleanup');
+      ownedRoots.push(path); return path;
+    };
+    try {
     for (const step of mountSteps) {
       const commands = step[0].slice(0, step[0].indexOf('            hdiutil'));
       const mount = execFileSync('/bin/bash', ['-e', '-u', '-o', 'pipefail', '-c', commands + '\nprintf "%s" "$mnt"'], { env, encoding: 'utf8' });
+      ownRoot(mount);
+      const mountAlias = join(f.root, `mount-alias-${ownedRoots.length}`); symlinkSync(mount, mountAlias, 'dir');
       assert.equal(mount, fs.realpathSync(mount), 'A freshly-created mount root still crosses the TMPDIR alias');
       for (const key of ['mac-x64', 'mac-arm64']) {
         const payload = join(mount, `${key}.app/Contents/Resources`, key);
         cpSync(join(f.root, 'resources', key), payload, { recursive: true });
+        cpSync(join(f.root, 'resources/core-recovery', key), join(dirname(payload), 'core-recovery', key), { recursive: true });
         const binary = join(payload, 'sing-box'), original = readFileSync(binary);
         assert.equal(verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run).platform, key);
         // Canonicalizing only the new temporary root does not admit a linked
@@ -1186,7 +1393,7 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
         };
         assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, linkedCore, noCoreInspection),
           { message: modeDiffers ? 'Final release core permissions differ' : `Non-regular release path: ${linkedCore}` });
-        const aliasBinary = join(alias, mount.slice(physical.length + 1), `${key}.app/Contents/Resources`, key, 'sing-box');
+        const aliasBinary = join(mountAlias, `${key}.app/Contents/Resources`, key, 'sing-box');
         assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, aliasBinary, f.run), /Linked release ancestor/);
         assert.deepEqual(readFileSync(binary), original);
       }
@@ -1194,8 +1401,10 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
     const writable = workflow.match(/            rw_dir=\$\(mktemp -d\)\n            rw_dir=[^\n]+\n            rw="\$rw_dir\/rw\.dmg"/);
     assert(writable, 'The writable DMG staging root must be exercised');
     const rw = execFileSync('/bin/bash', ['-e', '-u', '-o', 'pipefail', '-c', writable[0] + '\nprintf "%s" "$rw"'], { env, encoding: 'utf8' });
+    ownRoot(dirname(rw));
     assert.equal(dirname(rw), fs.realpathSync(dirname(rw)));
     assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
+    } finally { for (const path of ownedRoots) rmSync(path, { recursive: true }); }
   }));
 
 test('API redirects cannot forward the dedicated token and unknown authenticated denials never fall back', async () => {
@@ -1492,6 +1701,74 @@ test('NA02 unchanged bytes reject setuid/setgid/sticky on final core, sidecar an
 
 // Execute the existing source-proof call site with an injected child process.
 // No archive, native core, network, or full release fixture is executed here.
+function coldSourceCallFixture() {
+  const source = readFileSync(new URL('./release-consumer.mjs', import.meta.url), 'utf8');
+  const helper = source.indexOf('function runColdArchive('), helperEnd = source.indexOf('\nconst CONTRACT_PATH', helper);
+  const entry = source.indexOf('export async function consumeRelease(');
+  const start = source.indexOf("      runColdArchive(run, 'source-archive-validation'", entry);
+  const end = source.indexOf('\n    }', start);
+  assert.ok(helper >= 0 && helperEnd > helper && entry >= 0 && start > entry && end > start);
+  const timeout = Number(source.match(/const LOCAL_ARCHIVE_TIMEOUT_MS = ([0-9_]+);/)[1].replaceAll('_', ''));
+  const invoke = new Function('run', 'contract', 'before', 'sourceFile', 'join', 'dirname', 'fileURLToPath',
+    'moduleURL', 'LOCAL_ARCHIVE_TIMEOUT_MS', source.slice(helper, helperEnd)
+      + source.slice(start, end).replaceAll('import.meta.url', 'moduleURL'));
+  const f = sourceProofCallFixture();
+  const contract = { ...f.contract, platforms: {
+    linux: { sourceIdentity: f.row.sourceIdentity, buildGraph: { localReplacements: [{ module: 'inert-linux' }] } },
+    win: { buildGraph: { localReplacements: [{ module: 'inert-win' }] } },
+  } };
+  const sourceFile = join('inert', 'acquiring', contract.sourceArchive.name);
+  return { contract, before: f.snapshot, sourceFile, run(child) {
+    invoke(child, contract, f.snapshot, sourceFile, join, dirname, fileURLToPath,
+      new URL('./release-consumer.mjs', import.meta.url).href, timeout);
+  } };
+}
+
+test('cold source archive invocation preserves every proof input and bounds its actual child call', () => {
+  const f = coldSourceCallFixture();
+  let calls = 0;
+  f.run((command, args, options) => {
+    calls++;
+    assert.equal(command, PYTHON);
+    assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)), f.sourceFile, '--source-legal-pins']);
+    assert.deepEqual(options, { input: JSON.stringify({ sourceArchive: f.contract.sourceArchive,
+      sourceCommit: f.contract.sourceCommit, sourceTree: f.contract.sourceTree,
+      sourceGitlinks: f.before.sourceGitlinks,
+      legalFiles: f.contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })),
+      sourceIdentity: f.contract.platforms.linux.sourceIdentity,
+      buildReplacements: Object.values(f.contract.platforms).flatMap(row => row.buildGraph.localReplacements),
+      sourcePolicy: f.contract.sourcePolicy }), encoding: 'utf8', maxBuffer: 1024 * 1024,
+      timeout: 120_000, killSignal: 'SIGKILL' });
+    return '';
+  });
+  assert.equal(calls, 1);
+});
+
+test('cold source failure reports only bounded child facts and fixed progress, without retries', () => {
+  for (const buffer of [false, true]) {
+    const f = coldSourceCallFixture(); let calls = 0;
+    const secret = 'never_log_cold_source_request_or_token';
+    const stderr = `${secret}\nSOURCE_ARCHIVE_PROOF stage=stdin-read elapsed_ms=2\n`
+      + 'SOURCE_ARCHIVE_PROOF stage=archive-members-verified elapsed_ms=547\n'
+      + `SOURCE_ARCHIVE_PROOF stage=${secret} elapsed_ms=999\n${secret}`;
+    assert.throws(() => f.run((command, args, options) => {
+      calls++; assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
+      throw Object.assign(Error(`${secret} ${options.input} /private/build/path`),
+        { code: 'ETIMEDOUT', status: null, signal: 'SIGKILL', stderr: buffer ? Buffer.from(stderr) : stderr });
+    }), error => {
+      assert.match(error.message, /stage=source-archive-validation; elapsedMs=\d+; timeoutMs=120000; code=ETIMEDOUT; status=unknown; signal=SIGKILL; progress=archive-members-verified@547ms/);
+      assert.doesNotMatch(String(error), /never_log|private\/build|never_log_source_proof_input/);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+    assert.equal(calls, 1);
+  }
+  const f = coldSourceCallFixture();
+  assert.throws(() => f.run(() => { throw { code: 'never_log_code', status: 'never_log_status',
+    signal: 'never_log_signal', stderr: 'never_log_stderr' }; }),
+    /code=unknown; status=unknown; signal=unknown; progress=unknown/);
+});
+
 function sourceProofCallFixture() {
   const source = readFileSync(new URL('./release-consumer.mjs', import.meta.url), 'utf8');
   const entry = source.indexOf('export function verifyPackagedRelease(');
@@ -1558,3 +1835,237 @@ test('source archive reproof failures identify platform, archive, stage and elap
     }
   }
 });
+
+
+// Private raw-transport stores only; no new unit writes the host user's cache.
+async function withBlobCache(t, fn, options) {
+  const f = fixture(options), parent = mkdtempSync(join(tmpdir(), 'release-blob-cache-'));
+  t.after(() => { rmSync(f.root, { recursive: true, force: true }); rmSync(parent, { recursive: true, force: true }); });
+  f.blobCacheDir = join(fs.realpathSync(parent), 'store'); f.cacheReports = []; f.report = (line) => f.cacheReports.push(line);
+  // Ask the real consumer to initialize only, then deliberately stop at its
+  // first public read. No copied filesystem allowlist, payload or new trust API.
+  const admissionStop = Error('private cache admission observation only');
+  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: async () => { throw admissionStop; } }), error => error === admissionStop);
+  f.cacheSupported = f.cacheReports.includes('Release blob cache ready');
+  assert.equal(f.cacheReports.includes('Release blob cache unavailable'), !f.cacheSupported);
+  assert.equal(cacheBlobs(f).length, 0); f.cacheReports.length = 0;
+  await fn(f);
+}
+const cacheBlobs = (f) => existsSync(f.blobCacheDir) ? readdirSync(f.blobCacheDir).filter(name => name.endsWith('.blob')) : [];
+const blobPath = (f, key = 'linux') => join(f.blobCacheDir, f.contract.platforms[key].releaseAsset.sha256 + '.blob');
+async function warmBlobCache(f) {
+  await consumeRelease(f.root, f.manifest, ['linux'], f);
+  if (f.cacheSupported) assert.equal(digest(readFileSync(blobPath(f))), f.contract.platforms.linux.releaseAsset.sha256);
+}
+const payloadCalls = (f) => f.calls.filter((url) => Object.values(f.contract.platforms).some((row) => row.releaseAsset.url === url));
+
+test('raw cache cold and warm preserve all four actual payloads, inspections and two public snapshots', async t => withBlobCache(t, async f => {
+  const inspections = [], run = f.run;
+  f.run = (...args) => { if (args[0] === 'go' || args[1][1]?.endsWith('release-archive.py')) inspections.push(args); return run(...args); };
+  const cold = await consumeRelease(f.root, f.manifest, undefined, f), coldTree = resources(f), firstInspections = inspections.length;
+  const coldCalls = f.calls.length, coldPayloads = payloadCalls(f).length;
+  const warm = await consumeRelease(f.root, f.manifest, undefined, f);
+  assert.deepEqual(warm, cold); assert.deepEqual(resources(f), coldTree);
+  assert.equal(coldPayloads, 4); assert.equal(payloadCalls(f).length - coldPayloads, f.cacheSupported ? 0 : 4);
+  assert.equal(f.calls.slice(coldCalls).filter(url => url.startsWith(f.base)).length, 10);
+  assert.equal(f.calls.slice(coldCalls).filter(url => url === f.base + '/releases/17').length, 2);
+  assert.equal(inspections.length - firstInspections, firstInspections);
+  assert.equal(f.cacheReports.filter(x => x.endsWith(' hit')).length, f.cacheSupported ? 4 : 0);
+  for (const [key,row] of Object.entries(f.contract.platforms)) verifyPackagedRelease(f.root, f.manifest, key,
+    join(f.root, 'resources', key, row.core.member), f.run, 'linux');
+}));
+
+test('raw cache corrupt, truncated and another-platform bytes cannot impersonate a pinned archive', async t => withBlobCache(t, async f => {
+  await warmBlobCache(f);
+  if (!f.cacheSupported) { assert.equal(cacheBlobs(f).length, 0); return; }
+  const pin = f.contract.platforms.linux.releaseAsset, original = f.transport.get(pin.url);
+  for (const bad of [Buffer.alloc(original.length), original.subarray(0, original.length - 1), f.transport.get(f.contract.platforms.win.releaseAsset.url)]) {
+    writeFileSync(blobPath(f), bad); const count = payloadCalls(f).length;
+    await consumeRelease(f.root, f.manifest, ['linux'], f);
+    assert.equal(payloadCalls(f).length, count + 1); assert.deepEqual(readFileSync(blobPath(f)), original);
+    verifyPackagedRelease(f.root, f.manifest, 'linux', join(f.root, 'resources/linux/sing-box'), f.run);
+  }
+}));
+
+test('raw cache symlinks and linked or foreign-owned metadata are misses, never repaired by chmod', async t => withBlobCache(t, async f => {
+  await warmBlobCache(f);
+  if (!f.cacheSupported) { assert.equal(cacheBlobs(f).length, 0); return; }
+  const outside = join(dirname(f.blobCacheDir), 'outside'); writeFileSync(outside, 'do not overwrite');
+  rmSync(blobPath(f)); symlinkSync(outside, blobPath(f));
+  await consumeRelease(f.root, f.manifest, ['linux'], f);
+  assert.equal(readFileSync(outside, 'utf8'), 'do not overwrite'); assert(fs.lstatSync(blobPath(f)).isSymbolicLink());
+  rmSync(blobPath(f)); writeFileSync(blobPath(f), f.transport.get(f.contract.platforms.linux.releaseAsset.url), { mode: 0o600 });
+  const hardlink = join(dirname(f.blobCacheDir), 'linked'); fs.linkSync(blobPath(f), hardlink);
+  const count = payloadCalls(f).length; await consumeRelease(f.root, f.manifest, ['linux'], f);
+  assert.equal(payloadCalls(f).length, count + 1); assert.equal(fs.lstatSync(blobPath(f)).nlink, 2);
+  fs.unlinkSync(hardlink);
+  const original = fs.lstatSync, mode = original(f.blobCacheDir).mode;
+  fs.lstatSync = (path, ...args) => {
+    const st = original(path, ...args);
+    if (String(path) !== f.blobCacheDir) return st;
+    return Object.defineProperty(Object.create(st), 'uid', { value: process.getuid() + 1 });
+  }; syncBuiltinESMExports();
+  try { const n = payloadCalls(f).length; await consumeRelease(f.root, f.manifest, ['linux'], f); assert.equal(payloadCalls(f).length, n + 1); }
+  finally { fs.lstatSync = original; syncBuiltinESMExports(); }
+  assert.equal(fs.lstatSync(f.blobCacheDir).mode, mode);
+}));
+
+test('raw cache full byte or entry capacity and abandoned partial entries never delete unknown bytes', async t => withBlobCache(t, async f => {
+  if (!f.cacheSupported) { await consumeRelease(f.root, f.manifest, ['linux'], f); assert.equal(cacheBlobs(f).length, 0); return; }
+  mkdirSync(f.blobCacheDir, { mode: 0o700, recursive: true });
+  const names = ['0'.repeat(64) + '.blob', '1'.repeat(64) + '.blob'];
+  for (const name of names) { const fd = fs.openSync(join(f.blobCacheDir, name), 'wx', 0o600); try { fs.ftruncateSync(fd, 512 * 1024 * 1024); } finally { fs.closeSync(fd); } }
+  await consumeRelease(f.root, f.manifest, ['linux'], f);
+  assert.deepEqual(readdirSync(f.blobCacheDir).sort(), names); assert.equal(fs.statSync(join(f.blobCacheDir,names[0])).size, 512 * 1024 * 1024);
+  for (const name of names) rmSync(join(f.blobCacheDir,name));
+  for (let n = 0; n < 64; n++) writeFileSync(join(f.blobCacheDir, n.toString(16).padStart(64,'0') + '.blob'), '', { mode: 0o600 });
+  await consumeRelease(f.root, f.manifest, ['linux'], f); assert.equal(readdirSync(f.blobCacheDir).length,64); assert(!existsSync(blobPath(f)));
+  for (const name of readdirSync(f.blobCacheDir)) rmSync(join(f.blobCacheDir,name));
+  writeFileSync(join(f.blobCacheDir,'.pending'), 'unfinished-owner', { mode: 0o600 });
+  await consumeRelease(f.root, f.manifest, ['linux'], f); assert.equal(readFileSync(join(f.blobCacheDir,'.pending'),'utf8'),'unfinished-owner'); assert(!existsSync(blobPath(f)));
+  writeFileSync(join(f.blobCacheDir,'foreign-file'), 'foreign');
+  await consumeRelease(f.root, f.manifest, ['linux'], f); assert.equal(readFileSync(join(f.blobCacheDir,'foreign-file'),'utf8'),'foreign');
+}));
+
+test('raw cache read-only storage and publication failure cannot replace successful consumer results', async t => withBlobCache(t, async f => {
+  await warmBlobCache(f);
+  if (!f.cacheSupported) { assert.equal(cacheBlobs(f).length, 0); return; }
+  const core = readFileSync(join(f.root,'resources/linux/sing-box')), original = fs.renameSync;
+  fs.renameSync = (from,to) => { if (String(from) === join(f.blobCacheDir,'.pending')) throw Object.assign(new Error('cache publication denied'), {code:'EACCES'}); return original(from,to); };
+  syncBuiltinESMExports();
+  try {
+    rmSync(blobPath(f)); await consumeRelease(f.root,f.manifest,['linux'],f);
+    assert.deepEqual(readFileSync(join(f.root,'resources/linux/sing-box')),core); assert(!existsSync(join(f.blobCacheDir,'.pending'))); assert(!existsSync(blobPath(f)));
+  } finally { fs.renameSync=original; syncBuiltinESMExports(); }
+  await warmBlobCache(f); fs.chmodSync(f.blobCacheDir,0o500);
+  try { await consumeRelease(f.root,f.manifest,['linux'],f); assert.equal(fs.lstatSync(f.blobCacheDir).mode & 0o777,0o500); }
+  finally { fs.chmodSync(f.blobCacheDir,0o700); }
+  assert.deepEqual(readFileSync(join(f.root,'resources/linux/sing-box')),core);
+}));
+
+test('raw cache shared concurrent consumers and busy writer never publish partial transport or reuse receipts', async t => withBlobCache(t, async f => {
+  const other=mkdtempSync(join(tmpdir(),'release-cache-other-'));t.after(()=>rmSync(other,{recursive:true,force:true}));cpSync(f.root,other,{recursive:true});
+  const [first,second]=await Promise.all([consumeRelease(f.root,f.manifest,['linux'],f),consumeRelease(other,f.manifest,['linux'],f)]);
+  assert.deepEqual(first.linux.producer,second.linux.producer); assert.deepEqual(readFileSync(join(other,'resources/linux/sing-box')),readFileSync(join(f.root,'resources/linux/sing-box')));
+  if (!f.cacheSupported) { assert.equal(cacheBlobs(f).length, 0); return; }
+  assert.equal(digest(readFileSync(blobPath(f))),f.contract.platforms.linux.releaseAsset.sha256); assert(!existsSync(join(f.blobCacheDir,'.pending'))); assert(!existsSync(join(f.blobCacheDir,'.writer')));
+  // A distinct process holds the real same-filesystem write lock while this
+  // ordinary consumer is forced to use its complete original network path.
+  const child=childProcess.spawn(process.execPath,['--input-type=module','-e',`import {mkdirSync,rmdirSync} from 'node:fs';const p=process.argv[1];mkdirSync(p,{mode:0o700});process.stdout.write('ready\\n');process.stdin.resume();process.stdin.on('end',()=>{rmdirSync(p);});`,join(f.blobCacheDir,'.writer')],{stdio:['pipe','pipe','pipe'],timeout:10_000,killSignal:'SIGTERM'});
+  let error='';child.stderr.on('data',b=>{error+=b;});
+  const exited=new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',code=>code===0?resolve():reject(Error(error||`owner exit ${code}`)));});
+  try {
+    await new Promise((resolve,reject)=>{child.stdout.once('data',()=>resolve());child.once('error',reject);child.once('exit',code=>reject(Error(error||`owner exited before readiness: ${code}`)));});
+    const n=payloadCalls(f).length; await consumeRelease(f.root,f.manifest,['linux'],f);assert.equal(payloadCalls(f).length,n+1);
+  } finally {child.stdin.end();await exited;}
+  assert(!existsSync(join(f.blobCacheDir,'.writer'))); assert.equal(digest(readFileSync(blobPath(f))),f.contract.platforms.linux.releaseAsset.sha256);
+}));
+
+test('raw cache warm hits preserve fresh metadata/profile/transaction gates after independent cache reset', async t => withBlobCache(t, async f => {
+  await warmBlobCache(f); const installed=resources(f), originalRead=f.read, originalRun=f.run;
+  const denial=Error('ordinary public metadata denied'); await assert.rejects(consumeRelease(f.root,f.manifest,['linux'],{...f,read:async()=>{throw denial;}}),error=>error===denial);assert.deepEqual(resources(f),installed);
+  await assert.rejects(consumeRelease(f.root,f.manifest,['linux'],{...f,run:(command,args,options)=>command==='go' && args[0]==='version'?originalRun(command,args,options).replace('CGO_ENABLED=0','CGO_ENABLED=1'):originalRun(command,args,options)}),/BuildInfo|build settings/);assert.deepEqual(resources(f),installed);
+  let snapshots=0;
+  await assert.rejects(consumeRelease(f.root,f.manifest,['linux'],{...f,read:async url=>{
+    const bytes=await originalRead(url);
+    if(url===f.base+'/releases/17' && ++snapshots===2){const changed=JSON.parse(bytes);changed.assets[0].digest=null;return encode(changed);}return bytes;
+  }}),/identity changed/);assert.equal(snapshots,2);assert.deepEqual(resources(f),installed);
+  if(f.cacheSupported){
+    for(const mutation of ['replace','delete','permission','EIO','initial-EIO']){
+      const pin=f.contract.platforms.linux.releaseAsset, originalOpen=fs.openSync; let denied=mutation==='initial-EIO'; snapshots=0;const networkBefore=payloadCalls(f).length;
+      fs.openSync=(path,...args)=>{if(denied && String(path)===blobPath(f))throw Object.assign(Error('cache-only '+mutation),{code:mutation==='permission'?'EACCES':'EIO'});return originalOpen(path,...args);};
+      syncBuiltinESMExports();
+      try{
+        const receipt=await consumeRelease(f.root,f.manifest,['linux'],{...f,read:async url=>{
+          const bytes=await originalRead(url);
+          if(url===f.base+'/releases/17' && ++snapshots===2){
+            if(mutation==='replace')writeFileSync(blobPath(f),Buffer.alloc(pin.bytes));
+            else if(mutation==='delete')rmSync(blobPath(f));
+            else denied=true;
+          }
+          return bytes;
+        }});
+        assert.equal(snapshots,2);assert.deepEqual(resources(f),installed);
+        assert.equal(payloadCalls(f).length-networkBefore,mutation==='initial-EIO'?1:0);
+        assert.equal(receipt.linux.adapter.facts.candidate,candidate);
+        verifyPackagedRelease(f.root,f.manifest,'linux',join(f.root,'resources/linux/sing-box'),f.run);
+      }finally{fs.openSync=originalOpen;syncBuiltinESMExports();}
+      // Restore only this test's private inert transport for the next mutation.
+      writeFileSync(blobPath(f),f.transport.get(pin.url),{mode:0o600});
+    }
+  }
+  await assert.rejects(consumeRelease(f.root,f.manifest,['linux'],{...f,rename:(from,to)=>{if(from.endsWith('/stage/linux') || from.endsWith('\\stage\\linux'))throw Error('transaction rejected');return renameSync(from,to);}}),/transaction rejected/);assert.deepEqual(resources(f),installed);
+}));
+
+test('raw cache only receives a committed fully verified acquisition, never a cold rollback or bad actual ABI', async t => {
+  await withBlobCache(t,async f=>{
+    await assert.rejects(consumeRelease(f.root,f.manifest,['linux'],{...f,rename:()=>{throw Error('cold transaction rejected');}}),/cold transaction rejected/);
+    assert.deepEqual(resources(f),{}); if(f.cacheSupported)assert.deepEqual(readdirSync(f.blobCacheDir),[]);
+  });
+  await withBlobCache(t,async f=>{
+    if(f.cacheSupported){mkdirSync(f.blobCacheDir,{mode:0o700,recursive:true});writeFileSync(blobPath(f),f.transport.get(f.contract.platforms.linux.releaseAsset.url),{mode:0o600});}
+    const n=payloadCalls(f).length;await assert.rejects(consumeRelease(f.root,f.manifest,['linux'],f),/ELF|architecture|machine/);
+    assert.deepEqual(resources(f),{});assert.equal(payloadCalls(f).length-n,f.cacheSupported?0:1);
+  },{linuxMachine:183});
+});
+
+
+test('raw cache short writes stay unpublished and partial I/O failures retain the normal committed result', async t => {
+  for(const fail of [false,true])await withBlobCache(t,async f=>{
+    if(!f.cacheSupported){await consumeRelease(f.root,f.manifest,['linux'],f);assert.equal(cacheBlobs(f).length, 0);return;}
+    const original={openSync:fs.openSync,closeSync:fs.closeSync,writeSync:fs.writeSync}, pending=new Set();let writes=0;
+    fs.openSync=(path,...args)=>{const fd=original.openSync(path,...args);if(String(path)===join(f.blobCacheDir,'.pending'))pending.add(fd);return fd;};
+    fs.closeSync=fd=>{try{return original.closeSync(fd);}finally{pending.delete(fd);}};
+    fs.writeSync=(fd,buffer,offset,length,...args)=>{
+      if(!pending.has(fd))return original.writeSync(fd,buffer,offset,length,...args);
+      assert(!existsSync(blobPath(f)),'partial transport must not be published');writes++;
+      if(fail && writes===2)throw Object.assign(Error('inert partial cache write failure'),{code:'EIO'});
+      return original.writeSync(fd,buffer,offset,Math.min(length,17),...args);
+    };syncBuiltinESMExports();
+    try{await consumeRelease(f.root,f.manifest,['linux'],f);}
+    finally{Object.assign(fs,original);syncBuiltinESMExports();}
+    assert(writes>1);assert(!existsSync(join(f.blobCacheDir,'.pending')));assert.equal(existsSync(blobPath(f)),!fail);
+    if(!fail)assert.equal(digest(readFileSync(blobPath(f))),f.contract.platforms.linux.releaseAsset.sha256);
+    verifyPackagedRelease(f.root,f.manifest,'linux',join(f.root,'resources/linux/sing-box'),f.run);
+  });
+});
+
+
+test('raw cache unavailable filesystem or ancestry keeps normal acquisition and supported stores still hit', async t => withBlobCache(t,async f=>{
+  const original={statfsSync:fs.statfsSync,lstatSync:fs.lstatSync};
+  const canonicalParent=fs.realpathSync(dirname(f.blobCacheDir)), canonicalStore=join(canonicalParent,'store');
+  // The empty directory is test-owned even when actual cache admission declined.
+  mkdirSync(canonicalStore,{mode:0o700,recursive:true});
+  const storeDev=original.lstatSync(canonicalStore).dev;
+  assert.equal(typeof storeDev,'number');assert(Number.isSafeInteger(storeDev) && storeDev>=0);
+  const differentSystemDev=storeDev===0?1:0, adjacentSystemDev=storeDev===0?1:storeDev-1;
+  assert.notEqual(differentSystemDev,storeDev);assert.notEqual(adjacentSystemDev,storeDev);assert.equal(Math.abs(adjacentSystemDev-storeDev),1);
+  for(const fault of ['unknown-filesystem','unsafe-ancestor','adjacent-device']){
+    fs.statfsSync=(path,...args)=>{
+      const st=original.statfsSync(path,...args);
+      return ['unknown-filesystem','adjacent-device'].includes(fault) && String(path)===canonicalStore?Object.defineProperty(Object.create(st),'type',{value:-1}):st;
+    };
+    fs.lstatSync=(path,...args)=>{
+      const st=original.lstatSync(path,...args);
+      if(fault==='unsafe-ancestor' && String(path)===canonicalParent)return Object.defineProperty(Object.create(st),'mode',{value:st.mode|0o022});
+      if(['unknown-filesystem','adjacent-device'].includes(fault) && process.platform==='darwin' && String(path)==='/private/var/tmp'){
+        // Model an already different adjacent mount directly at the production
+        // OS read boundary. Never add one to the system tmp's original device.
+        const dev=fault==='adjacent-device'?adjacentSystemDev:differentSystemDev;assert.notEqual(dev,storeDev);
+        return Object.defineProperty(Object.create(st),'dev',{value:dev});
+      }
+      return st;
+    };syncBuiltinESMExports();
+    try{
+      f.cacheReports.length=0;const n=payloadCalls(f).length, at=f.calls.length;
+      await consumeRelease(f.root,f.manifest,['linux'],f);
+      assert.equal(payloadCalls(f).length,n+1);assert.equal(f.calls.slice(at).filter(url=>url===f.base+'/releases/17').length,2);
+      assert(f.cacheReports.includes('Release blob cache unavailable'));assert(!f.cacheReports.includes('Release blob cache hit'));assert.equal(cacheBlobs(f).length,0);
+      verifyPackagedRelease(f.root,f.manifest,'linux',join(f.root,'resources/linux/sing-box'),f.run);
+    }finally{Object.assign(fs,original);syncBuiltinESMExports();}
+  }
+  f.cacheReports.length=0;await consumeRelease(f.root,f.manifest,['linux'],f);
+  const n=payloadCalls(f).length;await consumeRelease(f.root,f.manifest,['linux'],f);
+  assert.equal(payloadCalls(f).length-n,f.cacheSupported?0:1);
+  assert.equal(f.cacheReports.includes('Release blob cache hit'),f.cacheSupported);
+}));

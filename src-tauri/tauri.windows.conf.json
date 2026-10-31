@@ -4,6 +4,7 @@
     "resources": [
       "core-manifest.json",
       "../resources/win/",
+      "../resources/core-recovery/win/",
       "../resources/dashboard/",
       "../THIRD-PARTY-LICENSES.md",
       "../NOTICE",

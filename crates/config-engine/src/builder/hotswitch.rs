@@ -26,7 +26,7 @@ use crate::user_config::app_config::UserConfig;
 use crate::user_config::dns_constants::{
     is_block_selection, is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
 };
-use crate::user_config::server_config::{is_mesh_node, ServerConfig};
+use crate::user_config::server_config::{is_mesh_node, Protocol, ServerConfig};
 
 // ============================================================================
 // 类型
@@ -126,35 +126,28 @@ impl HotSwitchPlan {
 
 /// 该节点是否「只在被选中时才发布其内网段」（force-route engaged 型组网节点）。
 ///
-/// 判据三项缺一不可，逐字同 2026-09 前 [`plan_hot_switch`] 内的同名局部闭包：
-/// 具备组网资格（[`is_mesh_node`]）× 不恒发段（`alwaysRouteSubnets=false`）× 确有段可发
-/// （[`endpoint_forced_route_cidrs`] 非空）。`None`（无选中 / 选中不在 servers）→ false。
+/// 具备组网资格且不恒发段。TS 冷态可暂时没有地址，但不因此变成无组网意图：
+/// 其已发现/weak LastKnown 规划输入不在 HotSwitchDeps 中，故仍保守退回重新生成。
+/// 非 TS 保持既有「确有段可发」判据。`None`（无选中 / 选中不在 servers）→ false。
 ///
 /// 唯一消费点是 [`plan_hot_switch`] 的 route 投影 guard：切到/离开这类节点 → 段规则增删 →
-/// 退回重启。表达的是**热切可行性**，不是「探测无意义」—— 三项判据里没有 `allow_internet`，
+/// 退回重启。表达的是**热切可行性**，不是「探测无意义」—— 判据里没有 `allow_internet`，
 /// 故一个 `allowInternet=true` 的 WireGuard 节点照样可能命中它，而那是承载公网的全隧道节点，
 /// 心跳探针探的就是用户在走的那条路。2026-09 曾被自动故障切换借去当「本世代整体停摆」的第二条
 /// 原因，等于把这类节点的心跳整条静音（探不到故障 → 不上报 → 三面静默）；已撤回，在此登记
 /// 以免再被同样地误用。这类节点切不过去的正确处置在 [`plan_hot_switch`]：心跳照跑、探到故障、
 /// 候选被本 guard 全部剔掉 → 由「需重启」上报腿告诉用户手动换。
 ///
-/// 由 [`plan_hot_switch`] 内的同名局部闭包提为模块级函数；语义未变（提取前后逐格对差见
-/// `sel_only_forces_subnets_matches_pre_extraction_formula`）。
 #[must_use]
 fn sel_only_forces_subnets(s: Option<&ServerConfig>) -> bool {
     match s {
         Some(srv) => {
             is_mesh_node(srv)
                 && !mesh_always_routes_subnets(srv)
-                // 观测面恒传空，且这里**可证明**与传真值等价：本谓词只问「段集非空」，而
-                // `endpoint_forced_route_cidrs` 对 Tailscale 的产出在**两侧都恒非空** ——
-                // 有观测时是「观测段 ∪ MagicDNS 两条」，无观测时是「默认两段」（2026-09-11
-                // 语义从并集改为取代之后仍然如此，见 `endpoint_routes::ObservedTailnetAddresses`
-                // 的「# 语义」一节）。且唯一会被观测面填充的协议是 Tailscale。故 `非空` 这件事
-                // 在有无观测面下同真。（HotSwitchDeps 亦无观测面入口，本批允许面不含它的
-                // src-tauri 构造点；即便有，也不该为一个恒等的判据加一条注入链。）
-                // 由 `sel_only_forces_subnets_is_insensitive_to_observed_addresses` 钉住。
-                && !endpoint_forced_route_cidrs(srv, &ObservedTailnetAddresses::new()).is_empty()
+                // 冷 TS 的 canonical 可空；不能用空集放行会改变 warm route/TUN 投影的热切。
+                && (srv.protocol == Protocol::Tailscale
+                    || !endpoint_forced_route_cidrs(srv, &ObservedTailnetAddresses::new())
+                        .is_empty())
         }
         None => false,
     }

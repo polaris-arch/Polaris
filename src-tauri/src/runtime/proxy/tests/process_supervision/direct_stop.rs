@@ -146,14 +146,17 @@ impl ScriptedIo {
 }
 
 impl DirectStopIo for ScriptedIo {
-    fn try_wait(&self, child: &mut tokio::process::Child) -> io::Result<Option<ExitStatus>> {
+    fn try_wait(
+        &self,
+        child: &mut crate::runtime::core_child::Child,
+    ) -> io::Result<Option<ExitStatus>> {
         if matches!(self.fault, Fault::TryWait) {
             return Err(io::Error::other("injected try_wait failure"));
         }
         child.try_wait()
     }
 
-    fn start_kill(&self, child: &mut tokio::process::Child) -> io::Result<()> {
+    fn start_kill(&self, child: &mut crate::runtime::core_child::Child) -> io::Result<()> {
         match self.fault {
             Fault::StartKill => Err(io::Error::other("injected start_kill failure")),
             Fault::NeverSignal => Ok(()),

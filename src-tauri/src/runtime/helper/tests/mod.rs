@@ -685,6 +685,7 @@ fn helper_install_success_requires_compatible_protocol_and_selected_content() {
             version: "1.15.0-alpha.12".into(),
             provider_fingerprint: "b".repeat(64),
             state: SelectedCoreState::Present,
+            admission: None,
         }),
         ready: true,
         upgradeable: false,
@@ -881,6 +882,7 @@ fn helper_action_error_codes_serialize_as_frontend_contract() {
         (HelperActionErrorCode::Unsupported, "unsupported"),
         (HelperActionErrorCode::MissingAsset, "missingAsset"),
         (HelperActionErrorCode::BundleMismatch, "bundleMismatch"),
+        (HelperActionErrorCode::RecoveryRequired, "recoveryRequired"),
         (HelperActionErrorCode::NotReady, "notReady"),
         (
             HelperActionErrorCode::InvalidInstallation,
@@ -1147,18 +1149,19 @@ fn core_status_has_only_an_id_frame_and_does_not_upload_source_bytes() {
     let reply = format!("OK core-present {} 1.15.0-alpha.12\n", id.as_str());
     let (client, connects, frames) = stop_test_client_with_frames(
         Platform::Win,
-        vec![polaris_helper_client::MockStream::with_response(
-            reply.into_bytes(),
-        )],
+        vec![
+            current_version_stream(),
+            polaris_helper_client::MockStream::with_response(reply.into_bytes()),
+        ],
     );
     assert!(matches!(
         query_core_status(&client, &id),
         Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. })
     ));
-    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    assert_eq!(connects.load(Ordering::SeqCst), 2);
     let frames = frames.lock().unwrap();
     assert_eq!(
-        frames[0].lines().collect::<Vec<_>>(),
+        frames[1].lines().collect::<Vec<_>>(),
         ["TOK", "core-status", id.as_str()]
     );
 }
@@ -1170,9 +1173,10 @@ fn absent_invalid_unknown_empty_and_wrong_id_never_attest_a_selected_core() {
         format!("OK core-absent {}\n", id.as_str()),
         format!("OK core-invalid {} hash-differs\n", id.as_str()),
     ] {
-        let (client, _) = stop_test_client(vec![polaris_helper_client::MockStream::with_response(
-            reply.into_bytes(),
-        )]);
+        let (client, _) = stop_test_client(vec![
+            current_version_stream(),
+            polaris_helper_client::MockStream::with_response(reply.into_bytes()),
+        ]);
         assert!(!matches!(
             query_core_status(&client, &id),
             Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. })
@@ -1183,9 +1187,10 @@ fn absent_invalid_unknown_empty_and_wrong_id_never_attest_a_selected_core() {
         String::new(),
         format!("OK core-present {} 1.0.0\n", "b".repeat(64)),
     ] {
-        let (client, _) = stop_test_client(vec![polaris_helper_client::MockStream::with_response(
-            reply.into_bytes(),
-        )]);
+        let (client, _) = stop_test_client(vec![
+            current_version_stream(),
+            polaris_helper_client::MockStream::with_response(reply.into_bytes()),
+        ]);
         assert!(query_core_status(&client, &id).is_err());
     }
 }
@@ -1236,6 +1241,7 @@ fn selected_core_status_projection_keeps_identity_and_native_state_read_only() {
             version: "1.15.0-alpha.12".into(),
             provider_fingerprint: "b".repeat(64),
             state: SelectedCoreState::Absent,
+            admission: None,
         }),
         supported: true,
         installed: true,
@@ -1399,9 +1405,9 @@ fn helper_install_mode_is_typed_and_defaults_to_ordinary() {
         assert!(HelperInstallMode::Ordinary.supported_on(platform));
         assert_eq!(
             HelperInstallMode::StopAndUpgrade.supported_on(platform),
-            platform == Platform::Mac
+            matches!(platform, Platform::Mac | Platform::Linux)
         );
-        if platform != Platform::Mac {
+        if !matches!(platform, Platform::Mac | Platform::Linux) {
             let dir = TestDir::new("polaris-helper-explicit-mode-");
             let runtime = HelperRuntime::with_platform_for_tests(dir.clone(), platform);
             let result = runtime.install_with_mode(HelperInstallMode::StopAndUpgrade);
@@ -1504,7 +1510,9 @@ fn execution_diagnostic_is_fixed_non_authoritative_and_bounded() {
 #[test]
 fn helper_execution_optional_field_does_not_change_legacy_action_json() {
     let result = HelperActionResult {
+        recovery: None,
         success: false,
+        uninstall_effect: None,
         execution_diagnostic: None,
         error_code: Some(HelperActionErrorCode::Cancelled),
         diagnostic: None,
@@ -1541,4 +1549,148 @@ fn installer_failure_stage_is_bounded_non_authorizing_and_preserves_recovery_unk
         .unwrap()
         .installer_failure
         .is_none());
+}
+
+#[test]
+fn linux_legacy_routing_is_not_receipt_authority_or_a_service_start() {
+    let source = crate::test_support::crate_code("runtime/helper.rs");
+    let routing = source
+        .split("fn linux_legacy_maintenance_needed(")
+        .nth(1)
+        .unwrap()
+        .split("pub fn install_with_mode(")
+        .next()
+        .unwrap();
+    assert!(routing.contains("helper-upgrade."));
+    assert!(routing.contains("helper-admission."));
+    assert!(routing.contains("selected_manifest(platform)"));
+    assert!(!routing.contains("manager.start("));
+    assert!(!routing.contains("restart"));
+    assert!(source.contains("params.linux_legacy_original_proxy = original"));
+    assert!(source.contains("uninstall_with_linux_original_proxy("));
+}
+
+#[test]
+fn typed_execution_unavailability_never_becomes_helper_damage_or_fake_repair() {
+    use polaris_core_supervisor::admitted_payload::AdmissionErrorKind as K;
+    use polaris_helper_proto::core_protocol::CoreStatus;
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    for kind in [
+        K::UnsupportedExactObject,
+        K::UnsupportedCapability,
+        K::LoaderPolicy,
+        K::Busy,
+        K::Unknown,
+        K::Io,
+    ] {
+        let mut status = HelperStatusSnapshot {
+            ready: true,
+            installed: true,
+            ..Default::default()
+        };
+        let (state, admission) = project_selected_core_status(
+            &mut status,
+            Ok(CoreStatus::Invalid {
+                id: id.clone(),
+                reason: kind.status_token().into(),
+            }),
+        );
+        assert_eq!(state, SelectedCoreState::Unavailable);
+        assert_eq!(admission, Some(format!("{kind:?}")));
+        assert!(!status.ready);
+        assert!(!status.needs_repair);
+        assert!(!status.upgradeable);
+    }
+    for kind in [K::Missing, K::Mismatch, K::Changed] {
+        let mut status = HelperStatusSnapshot {
+            ready: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            project_selected_core_status(
+                &mut status,
+                Ok(CoreStatus::Invalid {
+                    id: id.clone(),
+                    reason: kind.status_token().into()
+                })
+            )
+            .0,
+            SelectedCoreState::Invalid
+        );
+        assert!(status.needs_repair);
+    }
+}
+
+fn current_version_stream() -> polaris_helper_client::MockStream {
+    polaris_helper_client::MockStream::with_response(
+        format!("OK {}\n", polaris_helper_proto::proto_version::CURRENT).into_bytes(),
+    )
+}
+#[test]
+fn ordinary_status_checks_old_daemon_version_and_never_calls_its_core_status() {
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    let (client, connects, frames) = stop_test_client_with_frames(
+        Platform::Win,
+        vec![polaris_helper_client::MockStream::with_response(
+            b"OK 2\n".to_vec(),
+        )],
+    );
+    assert!(
+        matches!(query_core_status(&client,&id),Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid{reason,..}) if reason==polaris_core_supervisor::admitted_payload::AdmissionErrorKind::UnsupportedCapability.status_token())
+    );
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        frames.lock().unwrap()[0].lines().collect::<Vec<_>>(),
+        ["TOK", "version"]
+    );
+}
+
+#[test]
+fn recovery_reservation_fences_existing_and_new_child_slots_until_its_own_release() {
+    let (runtime, _dir) = runtime();
+    let slot = Arc::new(Mutex::new(DirectCoreSlot::default()));
+    runtime
+        .bind_core_mutation_fence(Arc::downgrade(&slot))
+        .unwrap();
+    let guard = runtime.reserve_recovery().unwrap();
+    assert!(runtime.register_core_mutation().is_err());
+    assert!(runtime.reserve_recovery().is_err());
+    let another = Arc::new(Mutex::new(DirectCoreSlot::default()));
+    assert!(runtime
+        .bind_core_mutation_fence(Arc::downgrade(&another))
+        .is_err());
+    drop(guard);
+    runtime
+        .bind_core_mutation_fence(Arc::downgrade(&another))
+        .unwrap();
+    runtime.reserve_recovery().unwrap();
+}
+#[test]
+fn recovery_source_does_not_skip_a_damaged_current_package_for_legacy_cache_bytes() {
+    let dir = TestDir::new("polaris-recovery-roots-");
+    let current = dir.join("current");
+    let legacy = dir.join("legacy");
+    std::fs::create_dir_all(current.join("core-recovery/linux")).unwrap();
+    std::fs::create_dir_all(legacy.join("linux")).unwrap();
+    std::fs::write(legacy.join("linux/polaris-helper"), b"would be fallback").unwrap();
+    assert_eq!(
+        recovery_helper_from_roots(&[current.clone(), legacy], "linux").unwrap(),
+        current.join("linux/polaris-helper")
+    );
+    assert!(!current.join("linux/polaris-helper").exists());
+}
+#[test]
+fn independent_recovery_target_receipt_never_relabels_helper_cancel_as_global_success() {
+    let (runtime, _dir) = runtime();
+    let mut result =
+        runtime.action_failed(HelperActionErrorCode::Cancelled, "authorization cancelled");
+    result.recovery = Some(CoreRecoveryReport {
+        user: crate::runtime::core_identity::user_store::UserRecoveryState::Installed,
+        helper_complete: false,
+    });
+    let wire = serde_json::to_value(result).unwrap();
+    assert_eq!(wire["success"], false);
+    assert_eq!(wire["errorCode"], "cancelled");
+    assert_eq!(wire["recovery"]["user"], "installed");
+    assert_eq!(wire["recovery"]["helperComplete"], false);
 }

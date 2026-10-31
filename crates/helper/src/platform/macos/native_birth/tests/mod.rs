@@ -378,6 +378,15 @@ fn pinned_admission_binds_owner_and_content_under_the_same_slot_lock() {
     // Immutable inert bytes are read and hashed on every host, never executed.
     let raw = b"inert-mac-core";
     std::fs::write(directory.path().join("sing-box"), raw).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            directory.path().join("sing-box"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     let core = CoreManifest {
         platform: "mac-x64".into(),
         version: "1.15.0-alpha.12".into(),
@@ -523,4 +532,196 @@ fn ordinary_startup_keeps_admission_open() {
     let custody = NativeCustody::with_upgrade_closed(false);
     assert!(!custody.active());
     assert_eq!(custody.admit(), Ok(()));
+}
+
+// Exercise the real wire decoder/dispatch against custody and inert native IO.
+struct WireServices {
+    custody: NativeCustody,
+    legacy: Mutex<Option<crate::platform::macos::handler::ChildHandle>>,
+    spawns: AtomicUsize,
+}
+impl crate::token::TokenStore for WireServices {
+    fn token_value(&self) -> String {
+        "wire-token".into()
+    }
+}
+impl crate::platform::macos::exec::CommandRunner for WireServices {
+    fn run(
+        &self,
+        _: Duration,
+        _: &str,
+        _: &[&str],
+    ) -> Result<(), crate::platform::macos::exec::RunError> {
+        panic!("no native command")
+    }
+    fn output(
+        &self,
+        _: Duration,
+        _: &str,
+        _: &[&str],
+    ) -> Result<Vec<u8>, crate::platform::macos::exec::RunError> {
+        panic!("no native command")
+    }
+    fn combined(
+        &self,
+        _: Duration,
+        _: &str,
+        _: &[&str],
+    ) -> Result<Vec<u8>, crate::platform::macos::exec::RunError> {
+        panic!("no native command")
+    }
+}
+impl crate::platform::macos::handler::MacServices for WireServices {
+    fn token_store(&self) -> &dyn crate::token::TokenStore {
+        self
+    }
+    fn runner(&self) -> &dyn crate::platform::macos::exec::CommandRunner {
+        self
+    }
+    fn child(&self) -> &Mutex<Option<crate::platform::macos::handler::ChildHandle>> {
+        &self.legacy
+    }
+    fn upgrade_admission(&self, close: bool) -> bool {
+        self.custody.upgrade_admission(close)
+    }
+    fn native_caller_allowed(
+        &self,
+        uid: Option<u32>,
+        id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    ) -> bool {
+        self.custody.caller_allowed(uid, id)
+    }
+    fn native_custody_active(&self) -> bool {
+        self.custody.active()
+    }
+    fn native_start_pinned(
+        &self,
+        p: &polaris_helper_proto::core_protocol::PinnedStartParams,
+        uid: u32,
+    ) -> Result<NativeBirthStart, crate::platform::macos::handler::SpawnError> {
+        if let Err(outcome) = self.custody.admit_pinned(uid, &p.id) {
+            return Ok(outcome);
+        }
+        self.spawns.fetch_add(1, Ordering::SeqCst);
+        let target = target(701, 7);
+        self.custody
+            .publish(target, Box::new(Child(Arc::new(Probe::default()))));
+        Ok(NativeBirthStart::Started {
+            target,
+            timing: None,
+            created: None,
+        })
+    }
+}
+fn wire(
+    services: &WireServices,
+    request: polaris_helper_proto::Request,
+    uid: u32,
+) -> polaris_helper_proto::Response {
+    let frame = polaris_helper_proto::codec::encode_frame(
+        polaris_helper_proto::Platform::Mac,
+        "wire-token",
+        &request,
+    );
+    let decoded =
+        crate::platform::macos::server::decode_request(&frame[1], &mut frame[2..].iter().cloned())
+            .unwrap();
+    crate::platform::macos::handler::dispatch_from_peer(
+        services,
+        &crate::platform::macos::handler::MacConfig::new("/inert/support", "/inert/core"),
+        &frame[0],
+        &decoded,
+        Some(uid),
+    )
+}
+fn wire_start() -> polaris_helper_proto::Request {
+    polaris_helper_proto::Request::NativeStartPinned(
+        polaris_helper_proto::core_protocol::PinnedStartParams {
+            id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
+            common: polaris_helper_proto::StartParams {
+                cfg: "/inert/config.json".into(),
+                log: String::new(),
+                fwd: true,
+                parent_pid: None,
+            },
+        },
+    )
+}
+#[test]
+fn queued_wire_cancel_cannot_reopen_shutdown_empty_drained_or_unpublished_birth() {
+    use polaris_helper_proto::{Request, Response};
+    for pending in [false, true] {
+        let services = WireServices {
+            custody: NativeCustody::default(),
+            legacy: Mutex::new(None),
+            spawns: AtomicUsize::new(0),
+        };
+        if pending {
+            services.custody.admit().unwrap();
+        }
+        services.custody.close_admission();
+        assert!(matches!(
+            wire(&services, Request::CancelHelperUpgrade, 0),
+            Response::Err(_)
+        ));
+        assert!(matches!(
+            wire(&services, wire_start(), 1000),
+            Response::Err(_)
+        ));
+        assert_eq!(services.spawns.load(Ordering::SeqCst), 0);
+        if pending {
+            let probe = Arc::new(Probe::default());
+            let old = services
+                .custody
+                .publish(target(702, 8), Box::new(Child(probe.clone())));
+            services.custody.drive(&old, Instant::now(), &|| Ok(()));
+            assert_eq!(probe.terms.load(Ordering::SeqCst), 1);
+            probe.exited.store(true, Ordering::SeqCst);
+            services.custody.drive(&old, Instant::now(), &|| Ok(()));
+            assert_eq!(
+                services.custody.stop(old.target),
+                NativeBirthStop::Stopped { target: old.target }
+            );
+        }
+        assert!(services.custody.shutdown_complete().unwrap());
+        assert!(matches!(
+            wire(&services, Request::CancelHelperUpgrade, 0),
+            Response::Err(_)
+        ));
+        assert!(matches!(
+            wire(&services, wire_start(), 1000),
+            Response::Err(_)
+        ));
+        assert_eq!(services.spawns.load(Ordering::SeqCst), 0);
+    }
+}
+#[test]
+fn ordinary_upgrade_and_migration_wire_cancel_still_release_upgrade_only_fence() {
+    use polaris_helper_proto::{Request, Response};
+    for migration in [false, true] {
+        let services = WireServices {
+            custody: NativeCustody::with_upgrade_closed(migration),
+            legacy: Mutex::new(None),
+            spawns: AtomicUsize::new(0),
+        };
+        if !migration {
+            assert!(matches!(
+                wire(&services, Request::PrepareHelperUpgrade, 0),
+                Response::Ok(_)
+            ));
+        }
+        assert!(matches!(
+            wire(&services, wire_start(), 1000),
+            Response::Err(_)
+        ));
+        assert!(matches!(
+            wire(&services, Request::CancelHelperUpgrade, 0),
+            Response::Ok(_)
+        ));
+        assert!(matches!(
+            wire(&services, wire_start(), 1000),
+            Response::Ok(_)
+        ));
+        assert_eq!(services.spawns.load(Ordering::SeqCst), 1);
+    }
 }

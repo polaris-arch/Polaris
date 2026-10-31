@@ -17,6 +17,7 @@ use tokio::process::Child;
 use tokio::task::JoinHandle;
 
 use super::RawCheck;
+use crate::admitted_payload::{AdmissionError, AdmittedPayload, ExecPurpose, PreparedExecution};
 
 const CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
@@ -24,6 +25,8 @@ static REGISTRY: OnceLock<Arc<CheckCustody>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationLifecycleError {
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
     #[error("validation admission is closing")]
     Closing,
     #[error("validation cleanup remains unconfirmed: {0}")]
@@ -391,7 +394,69 @@ struct CheckCompletion {
     worker_pending: AtomicBool,
 }
 
+enum CheckExecutable {
+    Admitted(PreparedExecution),
+    #[cfg(test)]
+    Fixture(PathBuf),
+}
+impl From<PreparedExecution> for CheckExecutable {
+    fn from(e: PreparedExecution) -> Self {
+        Self::Admitted(e)
+    }
+}
+#[cfg(test)]
+impl From<&Path> for CheckExecutable {
+    fn from(p: &Path) -> Self {
+        Self::Fixture(p.into())
+    }
+}
+#[cfg(test)]
+impl From<&PathBuf> for CheckExecutable {
+    fn from(p: &PathBuf) -> Self {
+        Self::Fixture(p.clone())
+    }
+}
+impl CheckExecutable {
+    fn owner(&self) -> Option<Arc<AdmittedPayload>> {
+        match self {
+            Self::Admitted(e) => Some(e.payload()),
+            #[cfg(test)]
+            Self::Fixture(_) => None,
+        }
+    }
+    fn lease_owner(&self) -> Option<Arc<dyn Send + Sync>> {
+        match self {
+            Self::Admitted(e) => e.lease_owner(),
+            #[cfg(test)]
+            Self::Fixture(_) => None,
+        }
+    }
+    fn command(&self, check: bool) -> Result<tokio::process::Command, ValidationLifecycleError> {
+        match self {
+            Self::Admitted(e) => {
+                let purpose = if check {
+                    ExecPurpose::CheckConfig
+                } else {
+                    ExecPurpose::TlsInventory
+                };
+                if e.purpose() != purpose {
+                    return Err(AdmissionError::new(
+                        crate::admitted_payload::AdmissionErrorKind::UnsupportedCapability,
+                        "execution purpose differs from validation command",
+                    )
+                    .into());
+                }
+                Ok(e.command()?)
+            }
+            #[cfg(test)]
+            Self::Fixture(path) => Ok(tokio::process::Command::new(path)),
+        }
+    }
+}
+
 struct CheckRun {
+    payload: Option<Arc<AdmittedPayload>>,
+    lease_owner: Option<Arc<dyn Send + Sync>>,
     completion: Arc<CheckCompletion>,
     request: CheckRequestRef,
     factory: NativeFactoryObservation,
@@ -524,6 +589,14 @@ impl CheckRun {
 
 impl Drop for CheckRun {
     fn drop(&mut self) {
+        if self.child.is_some() && self.native_terminal.is_none() {
+            if let Some(owner) = self.payload.take() {
+                std::mem::forget(owner);
+            }
+            if let Some(lease) = self.lease_owner.take() {
+                std::mem::forget(lease);
+            }
+        }
         #[cfg(unix)]
         if self.lost_wait_ownership {
             if let Some(child) = self.child.take() {
@@ -778,11 +851,13 @@ impl CheckCustody {
 
     fn spawn_mode(
         &self,
-        binary: &Path,
+        execution: impl Into<CheckExecutable>,
         config: Option<&Path>,
         io: Arc<dyn CheckIo>,
     ) -> Result<Result<(CheckRequestRef, Arc<OutputCapture>), String>, ValidationLifecycleError>
     {
+        let execution = execution.into();
+        let mut builder = execution.command(config.is_some())?;
         // Closing, copy, synchronous spawn and publication share one admission lock.
         // No cancel point can expose a born but unregistered Child.
         let mut state = self.state.lock().map_err(unknown)?;
@@ -820,6 +895,8 @@ impl CheckCustody {
             ..OutputCapture::default()
         });
         let run = CheckRun {
+            payload: execution.owner(),
+            lease_owner: execution.lease_owner(),
             completion: Arc::new(CheckCompletion::default()),
             request: request.clone(),
             factory: NativeFactoryObservation::PreFactory,
@@ -865,7 +942,6 @@ impl CheckCustody {
             }
         }
         let run = state.runs.get_mut(&id).expect("admitted validation run");
-        let mut builder = tokio::process::Command::new(binary);
         if config.is_some() {
             builder
                 .args(["--disable-color", "check", "-c"])
@@ -921,29 +997,45 @@ impl CheckCustody {
     }
 
     #[cfg(target_os = "linux")]
-    fn queue_owned_sealed(
+    fn queue_owned_sealed_with_owner(
         &self,
         mut command: tokio::process::Command,
         binary: File,
         mut config: File,
         io: Arc<dyn CheckIo>,
+        payload: Option<Arc<AdmittedPayload>>,
+        lease_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
         use std::io::{Seek, SeekFrom};
         use std::os::fd::AsRawFd;
         let mut state = self.state.lock().map_err(unknown)?;
         Self::admit(&state)?;
-        // These checks establish owned immutable inputs, not a pinned execution
-        // profile. The strict caller alone supplies its exact check argv and pin.
+        // Production command/owner are minted together inside PreparedExecution;
+        // only private unit fixtures may supply a raw command with no owner.
         let prepared = (|| -> io::Result<File> {
             validate_sealed_file(&binary)?;
             validate_sealed_file(&config)?;
+            use std::os::unix::fs::MetadataExt;
+            let program = command.as_std().get_program().to_string_lossy();
             if binary.as_raw_fd() < 3
-                || command.as_std().get_program()
-                    != std::ffi::OsStr::new(&format!("/proc/self/fd/{}", binary.as_raw_fd()))
+                || !program
+                    .strip_prefix("/proc/self/fd/")
+                    .is_some_and(|fd| fd.parse::<u32>().is_ok_and(|fd| fd >= 3))
             {
+                return Err(io::Error::other(
+                    "owned executable is not a private FD command",
+                ));
+            }
+            let source = std::fs::metadata(command.as_std().get_program())?;
+            let owned = binary.metadata()?;
+            if source.dev() != owned.dev() || source.ino() != owned.ino() {
                 return Err(io::Error::other(
                     "owned executable does not match check command",
                 ));
+            }
+            let input = config.metadata()?;
+            if !input.is_file() || input.len() == 0 || input.len() > 8 * 1024 * 1024 {
+                return Err(io::Error::other("bounded sealed config required"));
             }
             config.seek(SeekFrom::Start(0))?;
             rustix::io::fcntl_dupfd_cloexec(&config, 3)
@@ -954,8 +1046,10 @@ impl CheckCustody {
             Ok(stdin) => stdin,
             Err(error) => return Ok(Err(error.to_string())),
         };
+        if payload.is_none() {
+            command.env_clear();
+        }
         command
-            .env_clear()
             .current_dir("/")
             .stdin(std::process::Stdio::from(stdin))
             .stdout(std::process::Stdio::null())
@@ -970,6 +1064,8 @@ impl CheckCustody {
         state.runs.insert(
             id,
             CheckRun {
+                payload,
+                lease_owner,
                 completion: Arc::new(CheckCompletion {
                     terminal: AtomicBool::new(false),
                     worker_pending: AtomicBool::new(true),
@@ -1047,15 +1143,24 @@ impl CheckCustody {
     }
 
     #[cfg(target_os = "linux")]
-    async fn supervise_owned_sealed(
+    async fn supervise_owned_sealed_with_owner(
         self: &Arc<Self>,
         command: tokio::process::Command,
         binary: File,
         config: File,
         timeout: Duration,
         spawned: Option<tokio::sync::oneshot::Sender<u32>>,
+        payload: Option<Arc<AdmittedPayload>>,
+        lease_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<RawCheck, ValidationLifecycleError> {
-        let request = match self.queue_owned_sealed(command, binary, config, Arc::new(NativeIo))? {
+        let request = match self.queue_owned_sealed_with_owner(
+            command,
+            binary,
+            config,
+            Arc::new(NativeIo),
+            payload,
+            lease_owner,
+        )? {
             Ok(queued) => queued,
             Err(error) => return Ok(RawCheck::SpawnFailed(error)),
         };
@@ -1133,24 +1238,48 @@ impl CheckCustody {
             .map_err(|_| unknown("owned check coordinator did not return"))?
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    fn queue_owned_sealed(
+        &self,
+        command: tokio::process::Command,
+        binary: File,
+        config: File,
+        io: Arc<dyn CheckIo>,
+    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
+        self.queue_owned_sealed_with_owner(command, binary, config, io, None, None)
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    async fn supervise_owned_sealed(
+        self: &Arc<Self>,
+        command: tokio::process::Command,
+        binary: File,
+        config: File,
+        timeout: Duration,
+        spawned: Option<tokio::sync::oneshot::Sender<u32>>,
+    ) -> Result<RawCheck, ValidationLifecycleError> {
+        self.supervise_owned_sealed_with_owner(
+            command, binary, config, timeout, spawned, None, None,
+        )
+        .await
+    }
     async fn run(
         self: &Arc<Self>,
-        binary: &Path,
+        execution: impl Into<CheckExecutable>,
         config: &Path,
         timeout: Duration,
         io: Arc<dyn CheckIo>,
     ) -> Result<RawCheck, ValidationLifecycleError> {
-        self.run_mode(binary, Some(config), timeout, io).await
+        self.run_mode(execution, Some(config), timeout, io).await
     }
 
     async fn run_mode(
         self: &Arc<Self>,
-        binary: &Path,
+        execution: impl Into<CheckExecutable>,
         config: Option<&Path>,
         timeout: Duration,
         io: Arc<dyn CheckIo>,
     ) -> Result<RawCheck, ValidationLifecycleError> {
-        let (request, output) = match self.spawn_mode(binary, config, io)? {
+        let (request, output) = match self.spawn_mode(execution, config, io)? {
             Ok(started) => started,
             Err(error) => return Ok(RawCheck::SpawnFailed(error)),
         };
@@ -1201,17 +1330,42 @@ fn validate_sealed_file(file: &File) -> io::Result<()> {
 
 /// Retain a check's actual sealed executable/config in the existing validation
 /// custody. This returns only diagnostic RawCheck and local lifecycle errors;
-/// neither the command nor its optional PID notification grants a launch permit.
+/// neither its optional PID notification nor sealed config data grants Run.
+/// ```compile_fail
+/// use std::{fs::File,time::Duration};
+/// fn forge(binary:File,config:File) {
+///   let _ = polaris_core_supervisor::config_gate::supervise_owned_sealed_check(binary,config,Duration::ZERO,None);
+/// }
+/// ```
 #[cfg(target_os = "linux")]
 pub async fn supervise_owned_sealed_check(
-    command: tokio::process::Command,
-    binary: File,
+    execution: PreparedExecution,
     config: File,
     timeout: Duration,
     spawned: Option<tokio::sync::oneshot::Sender<u32>>,
 ) -> Result<RawCheck, ValidationLifecycleError> {
-    registry()
-        .supervise_owned_sealed(command, binary, config, timeout, spawned)
+    supervise_admitted_sealed_check(Arc::clone(registry()), execution, config, timeout, spawned)
+        .await
+}
+#[cfg(target_os = "linux")]
+async fn supervise_admitted_sealed_check(
+    custody: Arc<CheckCustody>,
+    execution: PreparedExecution,
+    config: File,
+    timeout: Duration,
+    spawned: Option<tokio::sync::oneshot::Sender<u32>>,
+) -> Result<RawCheck, ValidationLifecycleError> {
+    let (command, binary, payload) = execution.sealed_check_parts()?;
+    custody
+        .supervise_owned_sealed_with_owner(
+            command,
+            binary,
+            config,
+            timeout,
+            spawned,
+            Some(payload),
+            execution.lease_owner(),
+        )
         .await
 }
 
@@ -1305,13 +1459,26 @@ impl CheckProducerView {
 }
 
 pub fn pause_check_producers() -> Result<AdmissionPause, ValidationLifecycleError> {
-    let custody = registry();
+    pause_producers(registry(), false)
+}
+/// Reset needs an atomic idle cutoff, not a pause abandoned while original
+/// workers are still live. Busy returns without changing admission at all.
+pub fn pause_idle_check_producers() -> Result<AdmissionPause, ValidationLifecycleError> {
+    pause_producers(registry(), true)
+}
+fn pause_producers(
+    custody: &Arc<CheckCustody>,
+    require_idle: bool,
+) -> Result<AdmissionPause, ValidationLifecycleError> {
     let mut state = custody.state.try_lock().map_err(unknown)?;
     if state.closing {
         return Err(ValidationLifecycleError::Closing);
     }
     if state.pause.is_some() {
         return Err(unknown("PC producers already paused"));
+    }
+    if require_idle && (!state.runs.is_empty() || state.settling) {
+        return Err(unknown("validation owners or cleanup are still present"));
     }
     let identity = Arc::new(());
     let members = state
@@ -1350,24 +1517,24 @@ impl Drop for CheckBooking {
 }
 
 pub(super) async fn run_native_check(
-    binary: &Path,
+    execution: PreparedExecution,
     config: &Path,
     timeout: Duration,
 ) -> Result<RawCheck, ValidationLifecycleError> {
     registry().settle_debts().await?;
     registry()
-        .run(binary, config, timeout, Arc::new(NativeIo))
+        .run(execution, config, timeout, Arc::new(NativeIo))
         .await
 }
 
 /// Fixed read-only query, admitted and drained by the same exit custody as checks.
 pub async fn run_tls_fingerprint_query(
-    binary: &Path,
+    execution: PreparedExecution,
     timeout: Duration,
 ) -> Result<RawCheck, ValidationLifecycleError> {
     registry().settle_debts().await?;
     registry()
-        .run_mode(binary, None, timeout, Arc::new(NativeIo))
+        .run_mode(execution, None, timeout, Arc::new(NativeIo))
         .await
 }
 

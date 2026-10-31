@@ -120,3 +120,67 @@ fn local_import_ipc_no_pin_no_warning() {
     assert!(pin_warnings(&data).is_empty(), "{:?}", data["warnings"]);
     assert_eq!(node(&data, "TC")["protocol"], "tailcat");
 }
+
+#[test]
+fn local_import_snell_http_tls_all_formats_reach_the_owned_preview() {
+    for (mode,base64) in [("http","c25lbGw6Ly9wYXJ0MSUzQXBhcnQyJTJCc2VjcmV0QHMuZXhhbXBsZTo0NDM/b2Jmcz1odHRwJm9iZnMtaG9zdD1Db3Zlci5FeGFtcGxlI1NO"),("tls","c25lbGw6Ly9wYXJ0MSUzQXBhcnQyJTJCc2VjcmV0QHMuZXhhbXBsZTo0NDM/b2Jmcz10bHMmb2Jmcy1ob3N0PUNvdmVyLkV4YW1wbGUjU04=")] {
+        let uri=format!("snell://part1%3Apart2%2Bsecret@s.example:443?obfs={mode}&obfs-host=Cover.Example#SN");
+        let native=json!({"outbounds":[{"type":"snell","tag":"SN","server":"s.example",
+            "server_port":443,"version":4,"psk":"part1:part2+secret","obfs_mode":mode,"obfs_host":"Cover.Example"}]}).to_string();
+        let clash=json!({"proxies":[{"name":"SN","type":"snell","server":"s.example","port":443,
+            "version":4,"psk":"part1:part2+secret","obfs-opts":{"mode":mode,"host":"Cover.Example"}}]}).to_string();
+        let yaml=format!("proxies:\n  - {{name: SN, type: snell, server: s.example, port: 443, version: 4, psk: 'part1:part2+secret', obfs-opts: {{mode: {mode}, host: Cover.Example}}}}\n");
+        for text in [native,uri.clone(),format!("# list\n{uri}\n"),base64.to_owned(),clash,yaml] {
+            let response=parse_local_import_owned(text);
+            assert!(response.success,"{:?}",response.error);
+            let data=response.data.unwrap();
+            assert_eq!(data["stats"],json!({"imported":1,"unsupported":0,"skipped":0,"failed":0}));
+            assert_eq!(data["subscriptions"],json!([]));
+            let n=node(&data,"SN");
+            assert_eq!(n["protocol"],"snell");
+            assert_eq!(n["password"],"part1:part2+secret");
+            assert_eq!(n["snellSettings"]["version"],4);
+            assert_eq!(n["snellSettings"]["obfsMode"],mode);
+            assert_eq!(n["snellSettings"]["obfsHost"],"Cover.Example");
+            assert!(n.get("subscriptionId").is_none());
+            assert!(n.get("tlsSettings").is_none());
+        }
+    }
+}
+
+#[test]
+fn local_import_snell_mixed_bad_nodes_keep_exact_failure_counts_and_size_bound() {
+    let native = json!({"outbounds":[
+        {"type":"snell","tag":"SN","server":"s.example","server_port":443,"version":4,"psk":"pw","obfs_mode":"tls"},
+        {"type":"snell","tag":"bad","server":"s.example","server_port":443,"version":4,"psk":"pw","obfs_mode":"unknown"}
+    ]});
+    let data = run(&native);
+    assert_eq!(
+        data["stats"],
+        json!({"imported":1,"unsupported":0,"skipped":0,"failed":1})
+    );
+    assert_eq!(node(&data, "SN")["snellSettings"]["obfsMode"], "tls");
+    assert!(node(&data, "SN")["snellSettings"].get("obfsHost").is_none());
+    let response = parse_local_import_owned(
+        "snell://pw@s.example:443?obfs=tls#SN\nsnell://pw@s.example:443?version=6&obfs=tls#bad"
+            .into(),
+    );
+    assert!(response.success);
+    assert_eq!(
+        response.data.unwrap()["stats"],
+        json!({"imported":1,"unsupported":0,"skipped":0,"failed":1})
+    );
+    let clash = json!({"proxies":[
+        {"name":"SN","type":"snell","server":"s.example","port":443,"version":4,"psk":"pw","obfs-opts":{"mode":"tls","host":""}},
+        {"name":"bad","type":"snell","server":"s.example","port":443,"version":4,"psk":"pw","obfs-opts":{"mode":true}}
+    ]});
+    let data = run(&clash);
+    assert_eq!(
+        data["stats"],
+        json!({"imported":1,"unsupported":0,"skipped":1,"failed":0})
+    );
+    assert!(node(&data, "SN")["snellSettings"].get("obfsHost").is_none());
+    let oversized = parse_local_import_owned("x".repeat(10 * 1024 * 1024 + 1));
+    assert!(!oversized.success);
+    assert!(oversized.error.unwrap().contains("内容过大"));
+}

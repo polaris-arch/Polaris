@@ -197,12 +197,20 @@ for (const platform of ['linux', 'win', 'mac-x64', 'mac-arm64']) test(`frozen ${
   }
 });
 
-test('candidate preparation alone reads mutable build outputs; verification uses frozen receipt plus manifest', () => {
-  const prepare = readFileSync(join(root, 'scripts/prepare-core-identity.mjs'), 'utf8');
-  const start = prepare.indexOf("  if (mode === 'prepare' && temporaryDefault && !candidateMode) {");
-  const manual = prepare.indexOf("  } else if (mode === 'prepare') {", start);
-  const end = prepare.indexOf('  } else {', manual);
-  assert.ok(start >= 0 && manual > start && end > manual);
+function assertPreparationBranches(prepare) {
+  const branch = (needle, after = 0) => {
+    const at = prepare.indexOf('\n' + needle, after);
+    assert(at >= 0, `actual preparation branch missing: ${needle}`);
+    assert.equal(prepare.indexOf('\n' + needle, at + 1), -1, 'branch anchor must be unique');
+    return at + 1;
+  };
+  const maintenance = branch("  if (mode === 'maintenance-anchor') {");
+  const start = branch("  } else if (mode === 'prepare' && temporaryDefault && !candidateMode) {", maintenance);
+  const manual = branch("  } else if (mode === 'prepare') {", start);
+  const end = branch('  } else {', manual);
+  assert(maintenance < start && start < manual && manual < end);
+  const anchor = prepare.slice(maintenance, start);
+  assert.doesNotMatch(anchor, /freezeCandidateBuildOutput|writeSelectedCoreManifest|writeFileSync/);
   assert.ok(prepare.slice(start, manual).includes('actualCoreFile(join(directory, name))'));
   assert.doesNotMatch(prepare.slice(start, manual), /freezeCandidateBuildOutput|target\/debug/);
   assert.ok(prepare.slice(manual, end).includes('freezeCandidateBuildOutput(root, directory, name)'));
@@ -211,6 +219,20 @@ test('candidate preparation alone reads mutable build outputs; verification uses
   assert.ok(prepare.slice(end).includes('verifyCandidateAppCarrier(directory, source, platform)'));
   assert.ok(prepare.slice(end).includes('old.core.helperSha256'));
   assert.ok(prepare.slice(end).includes('old.core.cleanerSha256'));
+}
+test('candidate preparation alone reads mutable build outputs; verification uses frozen receipt plus manifest', () => {
+  const prepare = readFileSync(join(root, 'scripts/prepare-core-identity.mjs'), 'utf8');
+  assertPreparationBranches(prepare);
+  for (const required of [
+    'actualCoreFile(join(directory, name))',
+    'freezeCandidateBuildOutput(root, directory, name)',
+    'actualCoreFile(join(directory, name), expected)',
+    'verifyCandidateAppCarrier(directory, source, platform)',
+    'old.core.helperSha256', 'old.core.cleanerSha256',
+  ]) {
+    assert(prepare.includes(required));
+    assert.throws(() => assertPreparationBranches(prepare.replaceAll(required, 'OMITTED')));
+  }
 });
 
 
@@ -475,8 +497,10 @@ test('managed check labels follow admitted receipts when manual and committed de
   const verifier = readFileSync(join(root, 'scripts/desktop-core/managed-mesh-core.mjs'), 'utf8');
   assert.match(verifier, /verifyCandidatePayload\(root, key, core, run\);\s*const selection = managedCheckSelection\(receipt.context, manual\);\s*const output = run\(core, \['version'\]/);
   assert.match(verifier, /return \{ selection, platform: key/);
-  const closure = readFileSync(join(root, 'src-tauri/src/runtime/proxy/mesh_apply/closure/tests/mod.rs'), 'utf8');
-  assert.match(closure, /if candidate_selection.is_some\(\) \{\s*assert_eq!\(verified\["selection"\], "native-dns-candidate"\);/);
+  // Selection labels belong to this acquisition verifier and its context-bound
+  // receipts above. Rust's selected-core check independently requires compiled
+  // execution capability and typed staged receipts; it must refuse a legacy
+  // carrier before publication, not run it merely to obtain this CLI label.
 });
 test('temporary native gates reject source, attempt, platform, payload and acceptance relabels', () => {
   const f = temporaryGateFixture();
@@ -527,7 +551,7 @@ test('default fetch cannot invoke historical formal recovery', () => {
   assert.ok(fetch.indexOf('Temporary default cannot recover') < fetch.indexOf('recoverRelease(ROOT)'));
 });
 
-test('closed descriptor check preserves strict selected core, closure, completion and reap boundaries', () => {
+test('closed descriptor check preserves selected-core refusal, descriptor closure, completion and reap boundaries', () => {
   const file = readFileSync(join(root, 'src-tauri/src/runtime/proxy/mesh_apply/candidate/check/tests/mod.rs'), 'utf8');
   const body = file.slice(file.indexOf('async fn closed_standard_descriptors'), file.indexOf('fn sealed_fixture_binary'));
   function check(text) {
@@ -536,13 +560,13 @@ test('closed descriptor check preserves strict selected core, closure, completio
       'linux::sealed_binary(&binary_path, profile)', 'linux::sealed_config(',
       'linux::run_check(binary, config, Duration::from_secs(8))', 'saved.restore().unwrap()',
       'ReapedChild(', 'Duration::from_secs(20)', 'child.0.kill()', 'child.0.wait()',
-      '!timed_out && status.success()', 'fs::read(marker).unwrap(), b"checked with 0/1/2 closed"'])
+      '!timed_out && status.success()', 'fs::read(marker).unwrap(), b"refused with 0/1/2 closed"', 'Err(CandidateCheckError::Unsupported)', 'old file pin refused before factory'])
       assert.ok(text.includes(value), value);
     assert.doesNotMatch(text, /exec 0<&-|Command::new\("sh"\)/);
     assert.ok(text.indexOf('status.success()') < text.indexOf('fs::read(marker)'));
   }
   check(body);
   for (const value of ['nix::unistd::close(fd)', 'linux::run_check(binary, config, Duration::from_secs(8))',
-    'saved.restore().unwrap()', 'ReapedChild(', '!timed_out && status.success()', 'child_marker.is_none()'])
+    'saved.restore().unwrap()', 'ReapedChild(', '!timed_out && status.success()', 'child_marker.is_none()', 'Err(CandidateCheckError::Unsupported)', 'old file pin refused before factory'])
     assert.throws(() => check(body.replace(value, 'REMOVED')));
 });

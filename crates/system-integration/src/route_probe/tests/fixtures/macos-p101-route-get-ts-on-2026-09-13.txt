@@ -1,6 +1,6 @@
 @@@META
 platform=macos
-capture=route-n-get-crosscheck
+capture=privacy-derived route-get fixture
 stamp=2026-09-13 b4:a0:28 +0800
 os=26.6.2
 tailscale=
@@ -9,7 +9,7 @@ Routing tables
 
 Internet:
 Destination        Gateway            Flags               Netif Expire
-default            192.168.10.1       UGScg                 en0       
+default            192.168.50.4       UGScg                 en0       
 default            link#29            UCSIg              utun11       
 32.0.0.1/32        link#29            UCS                utun11       
 32.0.0.2/32        link#29            UCS                utun11       
@@ -42,55 +42,55 @@ default            link#29            UCSIg              utun11
 127                127.0.0.1          UCS                   lo0       
 127.0.0.1          127.0.0.1          UH                    lo0       
 169.254            link#14            UCS                   en0      !
-192.168.10         link#14            UCS                   en0      !
-192.168.10.1/32    link#14            UCS                   en0      !
-192.168.10.1       7:77:82:d8:a2:7d   UHLWIir               en0   1199
-192.168.10.99      b2:6:90:b8:45:18   UHLWI                 en0      !
-192.168.10.105     41:47:b0:34:1a:47  UHLWI                 en0   1110
-192.168.10.106     e:88:d8:83:a1:77   UHLWI                 en0   1197
-192.168.10.107     9d:03:26:e3:f2:40  UHLWI                 en0      !
-192.168.10.108     91:ac:47:18:50:0e  UHLWI                 en0   1169
-192.168.10.109     68:52:90:52:87:4c  UHLWIi                en0   1175
-192.168.10.111     90:f7:1a:df:77:cd  UHLWI                 en0   1162
-192.168.10.112     3d:e6:41:7b:03:a1  UHLWI                 en0   1186
-192.168.10.114     92:11:47:87:7a:bd  UHLWI                 en0   1172
-192.168.10.116     03:e9:ca:a0:b0:a6  UHLWI                 en0   1145
-192.168.10.119     82:aa:92:90:3a:b8  UHLWI                 en0   1180
-192.168.10.121     27:bb:89:1:66:92   UHLWI                 en0    239
-192.168.10.127     e3:da:77:5c:65:10  UHLWI                 en0    495
-192.168.10.131     03:f2:34:b1:bd:a9  UHLWI                 en0   1149
-192.168.10.133     2b:13:cd:77:65:0e  UHLWI                 en0   1152
-192.168.10.139     74:a0:06:77:74:98  UHLWI                 en0   1090
-192.168.10.141     e3:da:77:9d:b0:ea  UHLWI                 en0    496
-192.168.10.142/32  link#14            UCS                   en0      !
-192.168.10.142     9d:03:01:41:b8:1a  UHLWI                 lo0       
-192.168.10.143     03:f2:34:18:37:98  UHLWI                 en0   1150
-192.168.10.146     d2:78:e6:98:0:c6   UHLWI                 en0   1167
-192.168.10.147     e3:da:77:7b:6c:f7  UHLWI                 en0    495
-192.168.10.160     27:bb:89:ea:6:ab   UHLWI                 en0   1196
-192.168.10.186     51:82:ac:88:7c:8   UHLWI                 en0   1173
-192.168.10.188     08:e2:2d:37:01:7c  UHLWI                 en0   1188
-192.168.10.190     7:50:d2:1f:4:78    UHLWI                 en0    496
-192.168.10.191     e3:da:77:80:df:e4  UHLWI                 en0    495
-192.168.10.201     98:77:77:65:fb:53  UHLWI                 en0      !
-192.168.10.202     0e:58:9a:53:2b:2d  UHLWI                 en0   1196
-192.168.10.205     f7:31:ae:c9:f0:8   UHLWI                 en0    505
-192.168.10.206     a9:98:3d:40:e6:ac  UHLWI                 en0   1193
-192.168.10.207     e3:da:77:da:98:84  UHLWI                 en0   1191
-192.168.10.208     03:f2:34:74:c1:df  UHLWI                 en0   1152
-192.168.10.212     3d:e6:41:98:a6:df  UHLWI                 en0   1190
-192.168.10.213     3d:e6:41:a6:df:91  UHLWI                 en0   1178
-192.168.10.214     42:18:b0:c9:c6:47  UHLWI                 en0   1198
-192.168.10.215     24:39:80:cd:5:c9   UHLWI                 en0   1143
-192.168.10.216     1d:56:c9:1a:1b:77  UHLWI                 en0    493
-192.168.10.218     41:2d:8b:89:77:7b  UHLWIi                en0   1055
-192.168.10.222     18:17:06:97:91:08  UHLWI                 en0   1154
-192.168.10.229     0e:da:8b:e3:98:03  UHLWI                 en0    395
-192.168.10.231     27:bb:89:5:b2:72   UHLWI                 en0   1188
-192.168.10.235     c6:84:40:65:6c:87  UHLWI                 en0      !
-192.168.10.236     a4:c6:18:28:6:89   UHLWI                 en0   1170
-192.168.10.237     cd:88:cd:97:aa:91  UHLWI                 en0    831
-192.168.10.249     3d:e6:41:27:25:a3  UHLWI                 en0   1181
+192.168.50         link#14            UCS                   en0      !
+192.168.50.4/32    link#14            UCS                   en0      !
+192.168.50.4       7:77:82:d8:a2:7d   UHLWIir               en0   1199
+192.168.50.26      b2:6:90:b8:45:18   UHLWI                 en0      !
+192.168.50.142     41:47:b0:34:1a:47  UHLWI                 en0   1110
+192.168.50.143     e:88:d8:83:a1:77   UHLWI                 en0   1197
+192.168.50.144     9d:03:26:e3:f2:40  UHLWI                 en0      !
+192.168.50.145     91:ac:47:18:50:0e  UHLWI                 en0   1169
+192.168.50.146     68:52:90:52:87:4c  UHLWIi                en0   1175
+192.168.50.148     90:f7:1a:df:77:cd  UHLWI                 en0   1162
+192.168.50.149     3d:e6:41:7b:03:a1  UHLWI                 en0   1186
+192.168.50.151     92:11:47:87:7a:bd  UHLWI                 en0   1172
+192.168.50.153     03:e9:ca:a0:b0:a6  UHLWI                 en0   1145
+192.168.50.156     82:aa:92:90:3a:b8  UHLWI                 en0   1180
+192.168.50.158     27:bb:89:1:66:92   UHLWI                 en0    239
+192.168.50.164     e3:da:77:5c:65:10  UHLWI                 en0    495
+192.168.50.168     03:f2:34:b1:bd:a9  UHLWI                 en0   1149
+192.168.50.170     2b:13:cd:77:65:0e  UHLWI                 en0   1152
+192.168.50.176     74:a0:06:77:74:98  UHLWI                 en0   1090
+192.168.50.178     e3:da:77:9d:b0:ea  UHLWI                 en0    496
+192.168.50.179/32  link#14            UCS                   en0      !
+192.168.50.179     9d:03:01:41:b8:1a  UHLWI                 lo0       
+192.168.50.180     03:f2:34:18:37:98  UHLWI                 en0   1150
+192.168.50.183     d2:78:e6:98:0:c6   UHLWI                 en0   1167
+192.168.50.184     e3:da:77:7b:6c:f7  UHLWI                 en0    495
+192.168.50.197     27:bb:89:ea:6:ab   UHLWI                 en0   1196
+192.168.50.223     51:82:ac:88:7c:8   UHLWI                 en0   1173
+192.168.50.225     08:e2:2d:37:01:7c  UHLWI                 en0   1188
+192.168.50.227     7:50:d2:1f:4:78    UHLWI                 en0    496
+192.168.50.228     e3:da:77:80:df:e4  UHLWI                 en0    495
+192.168.50.238     98:77:77:65:fb:53  UHLWI                 en0      !
+192.168.50.239     0e:58:9a:53:2b:2d  UHLWI                 en0   1196
+192.168.50.242     f7:31:ae:c9:f0:8   UHLWI                 en0    505
+192.168.50.243     a9:98:3d:40:e6:ac  UHLWI                 en0   1193
+192.168.50.244     e3:da:77:da:98:84  UHLWI                 en0   1191
+192.168.50.245     03:f2:34:74:c1:df  UHLWI                 en0   1152
+192.168.50.249     3d:e6:41:98:a6:df  UHLWI                 en0   1190
+192.168.50.250     3d:e6:41:a6:df:91  UHLWI                 en0   1178
+192.168.50.251     42:18:b0:c9:c6:47  UHLWI                 en0   1198
+192.168.50.252     24:39:80:cd:5:c9   UHLWI                 en0   1143
+192.168.50.253     1d:56:c9:1a:1b:77  UHLWI                 en0    493
+192.168.50.100     41:2d:8b:89:77:7b  UHLWIi                en0   1055
+192.168.50.104     18:17:06:97:91:08  UHLWI                 en0   1154
+192.168.50.111     0e:da:8b:e3:98:03  UHLWI                 en0    395
+192.168.50.113     27:bb:89:5:b2:72   UHLWI                 en0   1188
+192.168.50.117     c6:84:40:65:6c:87  UHLWI                 en0      !
+192.168.50.118     a4:c6:18:28:6:89   UHLWI                 en0   1170
+192.168.50.119     cd:88:cd:97:aa:91  UHLWI                 en0    831
+192.168.50.131     3d:e6:41:27:25:a3  UHLWI                 en0   1181
 224.0.0/4          link#14            UmCS                  en0      !
 224.0.0/4          link#29            UmCSI              utun11       
 224.0.0.251        9:7:72:7:7:f9      UHmLWI                en0       
@@ -264,348 +264,348 @@ destination: 169.254.0.0
       flags: <UP,DONE,CLONING,STATIC>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500   -929432 
-### dest=192.168.10 padded=192.168.10.0
-   route to: 192.168.10.0
-destination: 192.168.10.0
+### dest=192.168.50 padded=192.168.50.0
+   route to: 192.168.50.0
+destination: 192.168.50.0
        mask: 255.255.255.0
   interface: en0
       flags: <UP,DONE,CLONING,STATIC>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500   -929432 
-### dest=192.168.10.1 padded=192.168.10.1
-   route to: 192.168.10.1
-destination: 192.168.10.1
+### dest=192.168.50.4 padded=192.168.50.4
+   route to: 192.168.50.4
+destination: 192.168.50.4
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF,ROUTER>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0       840        20        17         0      1500      1199 
-### dest=192.168.10.1/32 padded=192.168.10.1/32
-   route to: 192.168.10.1
-destination: 192.168.10.1
+### dest=192.168.50.4/32 padded=192.168.50.4/32
+   route to: 192.168.50.4
+destination: 192.168.50.4
        mask: 255.255.255.255
   interface: en0
       flags: <UP,DONE,CLONING,STATIC>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500   -929432 
-### dest=192.168.10.105 padded=192.168.10.105
-   route to: 192.168.10.105
-destination: 192.168.10.105
+### dest=192.168.50.142 padded=192.168.50.142
+   route to: 192.168.50.142
+destination: 192.168.50.142
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1110 
-### dest=192.168.10.106 padded=192.168.10.106
-   route to: 192.168.10.106
-destination: 192.168.10.106
+### dest=192.168.50.143 padded=192.168.50.143
+   route to: 192.168.50.143
+destination: 192.168.50.143
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1197 
-### dest=192.168.10.107 padded=192.168.10.107
-   route to: 192.168.10.107
-destination: 192.168.10.107
+### dest=192.168.50.144 padded=192.168.50.144
+   route to: 192.168.50.144
+destination: 192.168.50.144
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      -278 
-### dest=192.168.10.108 padded=192.168.10.108
-   route to: 192.168.10.108
-destination: 192.168.10.108
+### dest=192.168.50.145 padded=192.168.50.145
+   route to: 192.168.50.145
+destination: 192.168.50.145
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1169 
-### dest=192.168.10.109 padded=192.168.10.109
-   route to: 192.168.10.109
-destination: 192.168.10.109
+### dest=192.168.50.146 padded=192.168.50.146
+   route to: 192.168.50.146
+destination: 192.168.50.146
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0       420         0        28         0      1500      1175 
-### dest=192.168.10.111 padded=192.168.10.111
-   route to: 192.168.10.111
-destination: 192.168.10.111
+### dest=192.168.50.148 padded=192.168.50.148
+   route to: 192.168.50.148
+destination: 192.168.50.148
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1162 
-### dest=192.168.10.112 padded=192.168.10.112
-   route to: 192.168.10.112
-destination: 192.168.10.112
+### dest=192.168.50.149 padded=192.168.50.149
+   route to: 192.168.50.149
+destination: 192.168.50.149
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1186 
-### dest=192.168.10.114 padded=192.168.10.114
-   route to: 192.168.10.114
-destination: 192.168.10.114
+### dest=192.168.50.151 padded=192.168.50.151
+   route to: 192.168.50.151
+destination: 192.168.50.151
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1172 
-### dest=192.168.10.116 padded=192.168.10.116
-   route to: 192.168.10.116
-destination: 192.168.10.116
+### dest=192.168.50.153 padded=192.168.50.153
+   route to: 192.168.50.153
+destination: 192.168.50.153
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1145 
-### dest=192.168.10.119 padded=192.168.10.119
-   route to: 192.168.10.119
-destination: 192.168.10.119
+### dest=192.168.50.156 padded=192.168.50.156
+   route to: 192.168.50.156
+destination: 192.168.50.156
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1180 
-### dest=192.168.10.121 padded=192.168.10.121
-   route to: 192.168.10.121
-destination: 192.168.10.121
+### dest=192.168.50.158 padded=192.168.50.158
+   route to: 192.168.50.158
+destination: 192.168.50.158
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       239 
-### dest=192.168.10.127 padded=192.168.10.127
-   route to: 192.168.10.127
-destination: 192.168.10.127
+### dest=192.168.50.164 padded=192.168.50.164
+   route to: 192.168.50.164
+destination: 192.168.50.164
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       495 
-### dest=192.168.10.131 padded=192.168.10.131
-   route to: 192.168.10.131
-destination: 192.168.10.131
+### dest=192.168.50.168 padded=192.168.50.168
+   route to: 192.168.50.168
+destination: 192.168.50.168
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1149 
-### dest=192.168.10.133 padded=192.168.10.133
-   route to: 192.168.10.133
-destination: 192.168.10.133
+### dest=192.168.50.170 padded=192.168.50.170
+   route to: 192.168.50.170
+destination: 192.168.50.170
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1152 
-### dest=192.168.10.139 padded=192.168.10.139
-   route to: 192.168.10.139
-destination: 192.168.10.139
+### dest=192.168.50.176 padded=192.168.50.176
+   route to: 192.168.50.176
+destination: 192.168.50.176
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1090 
-### dest=192.168.10.141 padded=192.168.10.141
-   route to: 192.168.10.141
-destination: 192.168.10.141
+### dest=192.168.50.178 padded=192.168.50.178
+   route to: 192.168.50.178
+destination: 192.168.50.178
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       496 
-### dest=192.168.10.142 padded=192.168.10.142
-   route to: 192.168.10.142
-destination: 192.168.10.142
+### dest=192.168.50.179 padded=192.168.50.179
+   route to: 192.168.50.179
+destination: 192.168.50.179
   interface: lo0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,LOCAL,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0     16384         0 
-### dest=192.168.10.142/32 padded=192.168.10.142/32
-   route to: 192.168.10.142
-destination: 192.168.10.142
+### dest=192.168.50.179/32 padded=192.168.50.179/32
+   route to: 192.168.50.179
+destination: 192.168.50.179
        mask: 255.255.255.255
   interface: en0
       flags: <UP,DONE,CLONING,STATIC>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500   -929432 
-### dest=192.168.10.143 padded=192.168.10.143
-   route to: 192.168.10.143
-destination: 192.168.10.143
+### dest=192.168.50.180 padded=192.168.50.180
+   route to: 192.168.50.180
+destination: 192.168.50.180
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1150 
-### dest=192.168.10.146 padded=192.168.10.146
-   route to: 192.168.10.146
-destination: 192.168.10.146
+### dest=192.168.50.183 padded=192.168.50.183
+   route to: 192.168.50.183
+destination: 192.168.50.183
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1167 
-### dest=192.168.10.147 padded=192.168.10.147
-   route to: 192.168.10.147
-destination: 192.168.10.147
+### dest=192.168.50.184 padded=192.168.50.184
+   route to: 192.168.50.184
+destination: 192.168.50.184
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       495 
-### dest=192.168.10.160 padded=192.168.10.160
-   route to: 192.168.10.160
-destination: 192.168.10.160
+### dest=192.168.50.197 padded=192.168.50.197
+   route to: 192.168.50.197
+destination: 192.168.50.197
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1196 
-### dest=192.168.10.186 padded=192.168.10.186
-   route to: 192.168.10.186
-destination: 192.168.10.186
+### dest=192.168.50.223 padded=192.168.50.223
+   route to: 192.168.50.223
+destination: 192.168.50.223
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1173 
-### dest=192.168.10.188 padded=192.168.10.188
-   route to: 192.168.10.188
-destination: 192.168.10.188
+### dest=192.168.50.225 padded=192.168.50.225
+   route to: 192.168.50.225
+destination: 192.168.50.225
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1188 
-### dest=192.168.10.190 padded=192.168.10.190
-   route to: 192.168.10.190
-destination: 192.168.10.190
+### dest=192.168.50.227 padded=192.168.50.227
+   route to: 192.168.50.227
+destination: 192.168.50.227
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       496 
-### dest=192.168.10.191 padded=192.168.10.191
-   route to: 192.168.10.191
-destination: 192.168.10.191
+### dest=192.168.50.228 padded=192.168.50.228
+   route to: 192.168.50.228
+destination: 192.168.50.228
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       495 
-### dest=192.168.10.201 padded=192.168.10.201
-   route to: 192.168.10.201
-destination: 192.168.10.201
+### dest=192.168.50.238 padded=192.168.50.238
+   route to: 192.168.50.238
+destination: 192.168.50.238
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      -848 
-### dest=192.168.10.202 padded=192.168.10.202
-   route to: 192.168.10.202
-destination: 192.168.10.202
+### dest=192.168.50.239 padded=192.168.50.239
+   route to: 192.168.50.239
+destination: 192.168.50.239
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1196 
-### dest=192.168.10.205 padded=192.168.10.205
-   route to: 192.168.10.205
-destination: 192.168.10.205
+### dest=192.168.50.242 padded=192.168.50.242
+   route to: 192.168.50.242
+destination: 192.168.50.242
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       505 
-### dest=192.168.10.206 padded=192.168.10.206
-   route to: 192.168.10.206
-destination: 192.168.10.206
+### dest=192.168.50.243 padded=192.168.50.243
+   route to: 192.168.50.243
+destination: 192.168.50.243
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1193 
-### dest=192.168.10.207 padded=192.168.10.207
-   route to: 192.168.10.207
-destination: 192.168.10.207
+### dest=192.168.50.244 padded=192.168.50.244
+   route to: 192.168.50.244
+destination: 192.168.50.244
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1191 
-### dest=192.168.10.208 padded=192.168.10.208
-   route to: 192.168.10.208
-destination: 192.168.10.208
+### dest=192.168.50.245 padded=192.168.50.245
+   route to: 192.168.50.245
+destination: 192.168.50.245
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1152 
-### dest=192.168.10.212 padded=192.168.10.212
-   route to: 192.168.10.212
-destination: 192.168.10.212
+### dest=192.168.50.249 padded=192.168.50.249
+   route to: 192.168.50.249
+destination: 192.168.50.249
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1190 
-### dest=192.168.10.213 padded=192.168.10.213
-   route to: 192.168.10.213
-destination: 192.168.10.213
+### dest=192.168.50.250 padded=192.168.50.250
+   route to: 192.168.50.250
+destination: 192.168.50.250
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1178 
-### dest=192.168.10.214 padded=192.168.10.214
-   route to: 192.168.10.214
-destination: 192.168.10.214
+### dest=192.168.50.251 padded=192.168.50.251
+   route to: 192.168.50.251
+destination: 192.168.50.251
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1198 
-### dest=192.168.10.215 padded=192.168.10.215
-   route to: 192.168.10.215
-destination: 192.168.10.215
+### dest=192.168.50.252 padded=192.168.50.252
+   route to: 192.168.50.252
+destination: 192.168.50.252
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1143 
-### dest=192.168.10.216 padded=192.168.10.216
-   route to: 192.168.10.216
-destination: 192.168.10.216
+### dest=192.168.50.253 padded=192.168.50.253
+   route to: 192.168.50.253
+destination: 192.168.50.253
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       493 
-### dest=192.168.10.218 padded=192.168.10.218
-   route to: 192.168.10.218
-destination: 192.168.10.218
+### dest=192.168.50.100 padded=192.168.50.100
+   route to: 192.168.50.100
+destination: 192.168.50.100
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0  44404483        11         5         0      1500      1055 
-### dest=192.168.10.222 padded=192.168.10.222
-   route to: 192.168.10.222
-destination: 192.168.10.222
+### dest=192.168.50.104 padded=192.168.50.104
+   route to: 192.168.50.104
+destination: 192.168.50.104
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1154 
-### dest=192.168.10.229 padded=192.168.10.229
-   route to: 192.168.10.229
-destination: 192.168.10.229
+### dest=192.168.50.111 padded=192.168.50.111
+   route to: 192.168.50.111
+destination: 192.168.50.111
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       395 
-### dest=192.168.10.231 padded=192.168.10.231
-   route to: 192.168.10.231
-destination: 192.168.10.231
+### dest=192.168.50.113 padded=192.168.50.113
+   route to: 192.168.50.113
+destination: 192.168.50.113
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1188 
-### dest=192.168.10.235 padded=192.168.10.235
-   route to: 192.168.10.235
-destination: 192.168.10.235
+### dest=192.168.50.117 padded=192.168.50.117
+   route to: 192.168.50.117
+destination: 192.168.50.117
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500     -2380 
-### dest=192.168.10.236 padded=192.168.10.236
-   route to: 192.168.10.236
-destination: 192.168.10.236
+### dest=192.168.50.118 padded=192.168.50.118
+   route to: 192.168.50.118
+destination: 192.168.50.118
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1170 
-### dest=192.168.10.237 padded=192.168.10.237
-   route to: 192.168.10.237
-destination: 192.168.10.237
+### dest=192.168.50.119 padded=192.168.50.119
+   route to: 192.168.50.119
+destination: 192.168.50.119
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500       831 
-### dest=192.168.10.249 padded=192.168.10.249
-   route to: 192.168.10.249
-destination: 192.168.10.249
+### dest=192.168.50.131 padded=192.168.50.131
+   route to: 192.168.50.131
+destination: 192.168.50.131
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500      1181 
-### dest=192.168.10.99 padded=192.168.10.99
-   route to: 192.168.10.99
-destination: 192.168.10.99
+### dest=192.168.50.26 padded=192.168.50.26
+   route to: 192.168.50.26
+destination: 192.168.50.26
   interface: en0
       flags: <UP,HOST,DONE,LLINFO,WASCLONED,IFSCOPE,IFREF>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
@@ -853,7 +853,7 @@ destination: 32.0.0.9
    route to: default
 destination: default
        mask: default
-    gateway: 192.168.10.1
+    gateway: 192.168.50.4
   interface: en0
       flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
@@ -1757,7 +1757,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
 	ether 9d:03:01:41:b8:1a
 	inet6 fe80::28dc:52d6:e49a:aa41%en0 prefixlen 64 secured scopeid 0xe 
-	inet 192.168.10.142 netmask 0xffffff00 broadcast 192.168.10.255
+	inet 192.168.50.179 netmask 0xffffff00 broadcast 192.168.50.255
 	inet6 8db8:e8a1:92da:9f6b:d713:f8f3:8f10:0de7 prefixlen 64 autoconf secured 
 	inet6 530d:ebd9:89bf:95d8:264d:abcd:f6ce:8a36 prefixlen 64 autoconf secured 
 	inet6 8db8:e8a1:92da:9f6b:0b22:d71b:6570:f0cf prefixlen 64 deprecated autoconf temporary 

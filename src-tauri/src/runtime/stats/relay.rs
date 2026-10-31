@@ -440,7 +440,7 @@ pub(super) async fn run_connections_stream(
         if !stream_session_current(&proxy, port, generation) {
             continue;
         }
-        let Some(mut stream) = source::subscribe_connections(&config, port).await else {
+        let Some(mut stream) = source::subscribe_connections(&config, &proxy, port).await else {
             tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
             continue;
         };
@@ -777,7 +777,7 @@ pub(super) async fn run_stats_stream(
         if !stream_session_current(&proxy, port, generation) {
             continue;
         }
-        let Some(mut stream) = source::subscribe_status(&config, port).await else {
+        let Some(mut stream) = source::subscribe_status(&config, &proxy, port).await else {
             tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
             continue;
         };

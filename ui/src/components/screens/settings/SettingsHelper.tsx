@@ -14,6 +14,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { revealOnToggle } from '@/components/reveal';
 import { helperApi, type HelperActionErrorCode, type HelperInstallMode } from '@/ipc/api-client';
 import { useNavStore } from '@/store/nav-store';
 import { toast } from '@/lib/error-handler';
@@ -21,6 +22,7 @@ import type { HelperStatus } from '@/contracts/types/runtime';
 import { Phead, SetBlock, SetRow, Pill, Dot, Button, Spinner, FeedbackNotice } from './Primitives';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { helperActionErrorText } from '@/domain/action-error-text';
+import { coreAdmissionIsDamage, coreAdmissionMessageKey } from '@/domain/core-admission';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
 import { shellPlatformFromDataOs } from './settings-logic';
 import { beginHelperInstall, clearHelperInstallFeedback, completeHelperInstall, helperInstallSnapshot, subscribeHelperInstall } from './helper-install-session';
@@ -38,7 +40,8 @@ type HelperState =
   | 'installing'
   | 'needs-upgrade'
   | 'needs-btm'
-  | 'needs-repair';
+  | 'needs-repair'
+  | 'admission-unavailable';
 
 /**
  * `status === null` 必须自成一态（'checking'），**不能并进 'unsupported'**：
@@ -49,11 +52,12 @@ function deriveState(s: HelperStatus | null, cleanupPending = false): HelperStat
   if (!s) return 'checking';
   if (!s.supported) return 'unsupported';
   if (cleanupPending) return 'cleanup-pending';
+  if (s.selectedCore?.admission && !coreAdmissionIsDamage(s.selectedCore.admission)) return 'admission-unavailable';
   if (s.upgradeable) return 'needs-upgrade';
   // backgroundDisabled（macOS BTM 登录项被禁）比 needsRepair 更具体，需先判（contract: runtime.ts:167）。
   if (s.backgroundDisabled) return 'needs-btm';
   if (s.needsRepair) return 'needs-repair';
-  if (s.ready) return 'installed';
+  if (s.ready) return s.installed ? 'installed' : 'needs-repair';
   if (s.installed) return 'needs-repair';
   return 'none';
 }
@@ -66,11 +70,33 @@ export default function SettingsHelper() {
   const [state, setState] = useState<HelperState>('checking');
   const [busy, setBusy] = useState(helperInstallSnapshot().busy);
   const [installFailure, setInstallFailure] = useState<HelperActionErrorCode | null>(helperInstallSnapshot().failure);
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const [recoveryNotice, setRecoveryNotice] = useState<'partial' | 'unsupported' | 'pending' | null>(null);
   const cleanupPending = useRef(false);
   const installInFlight = useRef(false);
   const migrationConfirmation = useRef<string | null>(null);
+  const currentStatus = useRef<HelperStatus | null>(null);
   const { armed, confirmTwice } = useConfirmTwice();
   const confirmingUninstall = armed === UNINSTALL_KEY;
+
+  // Saved click/confirmation closures must consult the latest accepted
+  // readback, not the status captured when a dialog was opened.
+  function migrationAdmissionAvailable() {
+    // Cleanup debt is a presentation priority, not permission to bypass a
+    // newly observed admission refusal.
+    const latest = deriveState(currentStatus.current);
+    return latest !== 'checking' && latest !== 'unsupported' && latest !== 'admission-unavailable';
+  }
+
+  function publishStatus(s: HelperStatus) {
+    currentStatus.current = s;
+    setStatus(s);
+    setState(deriveState(s, cleanupPending.current));
+    if (!migrationAdmissionAvailable() && migrationConfirmation.current) {
+      useDialogStore.getState().closeInstance(migrationConfirmation.current);
+      migrationConfirmation.current = null;
+    }
+  }
 
   useEffect(() => {
     let alive = true;
@@ -80,8 +106,7 @@ export default function SettingsHelper() {
       const generation = ++readGeneration;
       void helperApi.getStatus(force).then((s) => {
         if (!alive || generation !== readGeneration) return;
-        setStatus(s);
-        setState(deriveState(s, cleanupPending.current));
+        publishStatus(s);
       }).catch((err) => {
         if (alive && generation === readGeneration) console.error('[SettingsHelper] getStatus failed:', err);
       });
@@ -125,6 +150,7 @@ export default function SettingsHelper() {
   }
 
   async function runInstall(mode?: HelperInstallMode) {
+    if (mode === 'stopAndUpgrade' && !migrationAdmissionAvailable()) return;
     if (installInFlight.current) return;
     const request = beginHelperInstall();
     if (request === null) return;
@@ -136,10 +162,13 @@ export default function SettingsHelper() {
     let failure: HelperActionErrorCode | null = 'failed';
     try {
       const r = mode === undefined ? await helperApi.install() : await helperApi.install(mode);
+      setRecoveryNotice(previous => !r.recovery ? (r.success ? null : previous)
+        : r.errorCode === 'recoveryRequired' || r.recovery.user === 'pending' ? 'pending'
+        : r.recovery.user === 'unsupported' ? 'unsupported'
+        : !r.recovery.helperComplete ? 'partial' : null);
       failure = r.success ? null : r.errorCode ?? 'failed';
       if (r.success) cleanupPending.current = false;
-      setStatus(r.status);
-      setState(deriveState(r.status, cleanupPending.current));
+      publishStatus(r.status);
       // W10：Rust 侧把所有失败（用户取消/脚本失败/二进制缺失）都装进 success:false 的 ok 应答——
       // 不在这里读出来，任何失败都是零反馈的「点击安装无反应」。信封不 reject，catch 永远等不到它。
       if (!r.success) {
@@ -156,14 +185,15 @@ export default function SettingsHelper() {
 
   // This is a separate explicit action. An ordinary install failure never selects it.
   function stopAndUpgrade() {
-    if (busy || installInFlight.current || helperInstallSnapshot().busy || shellPlatformFromDataOs() !== 'mac' || installFailure !== 'upgradeDeferred' || helperInstallSnapshot().failure !== 'upgradeDeferred') return;
+    if (!migrationAdmissionAvailable() || busy || installInFlight.current || helperInstallSnapshot().busy || !['mac', 'lin'].includes(shellPlatformFromDataOs() ?? '') || installFailure !== 'upgradeDeferred' || helperInstallSnapshot().failure !== 'upgradeDeferred') return;
+    const confirmedPlatform = shellPlatformFromDataOs();
     const dialogs = useDialogStore.getState();
     if (migrationConfirmation.current && dialogs.hasInstance(migrationConfirmation.current)) return;
     const instanceId = dialogs.open({
       kind: 'confirm',
       payload: {
-        title: t('helper.stopAndUpgradeTitle'),
-        message: t('helper.stopAndUpgradeWarning'),
+        title: t(confirmedPlatform === 'lin' ? 'helper.linuxStopAndUpgradeTitle' : 'helper.stopAndUpgradeTitle'),
+        message: t(confirmedPlatform === 'lin' ? 'helper.linuxStopAndUpgradeWarning' : 'helper.stopAndUpgradeWarning'),
         confirmLabel: t('helper.stopAndUpgradeConfirm'),
         danger: true,
         onCancel: () => {
@@ -173,7 +203,7 @@ export default function SettingsHelper() {
           if (migrationConfirmation.current !== instanceId || !useDialogStore.getState().hasInstance(instanceId)) return;
           useDialogStore.getState().closeInstance(instanceId);
           migrationConfirmation.current = null;
-          if (shellPlatformFromDataOs() !== 'mac' || installInFlight.current || helperInstallSnapshot().busy || helperInstallSnapshot().failure !== 'upgradeDeferred') return;
+          if (!migrationAdmissionAvailable() || shellPlatformFromDataOs() !== confirmedPlatform || !['mac', 'lin'].includes(confirmedPlatform ?? '') || installInFlight.current || helperInstallSnapshot().busy || helperInstallSnapshot().failure !== 'upgradeDeferred') return;
           void runInstall('stopAndUpgrade');
         },
       },
@@ -196,8 +226,7 @@ export default function SettingsHelper() {
           const r = await helperApi.uninstall();
           if (r.success) { cleanupPending.current = false; clearHelperInstallFeedback(); }
           else if (r.errorCode === 'partialCleanup') cleanupPending.current = true;
-          setStatus(r.status);
-          setState(deriveState(r.status, cleanupPending.current));
+          publishStatus(r.status);
           // W10 同族：卸载的失败/取消同样装在信封里，不读就是「点了没反应」。
           if (!r.success) {
             toast.error(t('helper.uninstallFail'), helperActionErrorText(r.errorCode, t));
@@ -217,8 +246,7 @@ export default function SettingsHelper() {
     setBusy(true);
     try {
       const s = await helperApi.getStatus(true);
-      setStatus(s);
-      setState(deriveState(s, cleanupPending.current));
+      publishStatus(s);
     } catch (err) {
       console.error('[SettingsHelper] recheck failed:', err);
       reportFailure(t('helper.statusCheckFail'));
@@ -242,9 +270,43 @@ export default function SettingsHelper() {
     }
   }
 
+  // These are observations about service readiness and selected installed content.
+  // The status API supplies no attestation of the currently running core identity.
+  const observedBoolean = (value: unknown) => typeof value === 'boolean' ? value : null;
+  const protocol = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const buildId = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9._+-]{1,96}$/.test(value) ? value : null;
+  const digest = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : null;
+  const coreState = status?.selectedCore?.state;
+  const observedCoreState = coreState === 'present' || coreState === 'absent' || coreState === 'invalid' || coreState === 'unavailable' ? coreState : null;
+  const diagnostics = status ? {
+    helper: {
+      supported: observedBoolean(status.supported), installed: observedBoolean(status.installed),
+      ready: observedBoolean(status.ready), loaded: observedBoolean(status.loaded),
+      upgradeable: observedBoolean(status.upgradeable), needsRepair: observedBoolean(status.needsRepair),
+      backgroundDisabled: observedBoolean(status.backgroundDisabled), pathMismatch: observedBoolean(status.pathMismatch),
+      version: protocol(status.version), expectedProtocolVersion: protocol(status.expectedProtocolVersion),
+      helperBuildId: buildId(status.helperBuildId), expectedBuildId: buildId(status.expectedBuildId),
+    },
+    selectedCore: status.selectedCore ? {
+      id: digest(status.selectedCore.id), providerFingerprint: digest(status.selectedCore.providerFingerprint),
+      state: observedCoreState,
+    } : null,
+  } : null;
+  const booleanText = (value: unknown) => t(value === true ? 'helper.checkYes' : value === false ? 'helper.checkNo' : 'helper.checkUnknown');
+  async function copyDiagnostics() {
+    if (!diagnostics) return;
+    setCopyState('idle');
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+      setCopyState('copied');
+    } catch {
+      setCopyState('failed');
+    }
+  }
+
   // A typed deferral changes the existing primary action in place. It never
   // retries ordinary install or selects migration without the explicit confirmation.
-  const migrationAvailable = shellPlatformFromDataOs() === 'mac' && installFailure === 'upgradeDeferred';
+  const migrationAvailable = migrationAdmissionAvailable() && ['mac', 'lin'].includes(shellPlatformFromDataOs() ?? '') && installFailure === 'upgradeDeferred';
 
   // A disappeared SCM service does not prove the protected support tree is clean.
   // Keep the same explicit-confirmation cleanup action in both recovery and none
@@ -286,15 +348,15 @@ export default function SettingsHelper() {
           {installFailure && (
             <div data-testid="helper-install-failure" className="helper-state">
               <FeedbackNotice title={t('helper.installFail')} detail={helperActionErrorText(installFailure, t)}
-                hint={t('helper.failureNextStep')} announce={false} actions={<>
+                hint={t(shellPlatformFromDataOs() === 'lin' ? 'helper.linuxForwardOnlyRecovery' : 'helper.failureNextStep')} announce={false} actions={<>
               {/* Recovery remains status-only. States already exposing recheck below
                   keep their single action; none/repair/upgrade failures need it here. */}
-              {!['checking', 'installed', 'cleanup-pending', 'needs-btm'].includes(state) && (
+              {!['checking', 'installed', 'cleanup-pending', 'needs-btm', 'admission-unavailable'].includes(state) && (
                 <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}>
                   <span>{t('helper.recheck')}</span>
                 </Button>
               )}
-              {shellPlatformFromDataOs() === 'mac' && installFailure === 'upgradeDeferred' && (
+              {migrationAvailable && (
                 <Button variant="ghost" size="sm" disabled={busy} onClick={stopAndUpgrade}>
                   {t('helper.stopAndUpgradeAction')}
                 </Button>
@@ -305,13 +367,16 @@ export default function SettingsHelper() {
               </>} />
             </div>
           )}
-          {status?.selectedCore && (
-            <dl className="card-sub" data-testid="helper-selected-core" style={{ overflowWrap: 'anywhere' }}>
-              <dt>{t('helper.selectedCoreVersion')}</dt><dd>{status.selectedCore.version}</dd>
-              <dt>{t('helper.selectedCoreId')}</dt><dd data-tip={status.selectedCore.id} tabIndex={0}>{status.selectedCore.id.slice(0, 16)}</dd>
-              <dt>{t('helper.selectedCoreProvider')}</dt><dd data-tip={status.selectedCore.providerFingerprint} tabIndex={0}>{status.selectedCore.providerFingerprint.slice(0, 16)}</dd>
-              <dt>{t('helper.selectedCoreState')}</dt><dd>{t(`helper.coreState.${status.selectedCore.state}`)}</dd>
-            </dl>
+          {state === 'admission-unavailable' && (
+            <div className="helper-state" data-s="admission-unavailable" role="status">
+              <p>{t(coreAdmissionMessageKey(status?.selectedCore?.admission))}</p>
+              {status?.selectedCore?.admission === 'UnsupportedCapability' && (
+                <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().setSettingsScreen('update')}>
+                  <span>{t('settings.about.checkUpdate')}</span>
+                </Button>
+              )}
+              <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}><span>{t('helper.recheck')}</span></Button>
+            </div>
           )}
           {state === 'checking' && (
             <div className="helper-state" data-s="checking">
@@ -349,17 +414,15 @@ export default function SettingsHelper() {
               <div className="hc-status">
                 <Dot variant={state === 'cleanup-pending' ? 'err' : 'ok'} />
                 <b>{t(state === 'cleanup-pending' ? 'helper.uninstallFail' : 'helper.statusInstalled')}</b>
-                {state === 'installed' && (
-                  <Pill variant="ok" style={{ marginLeft: 'auto' }}>
-                    {t('helper.protocolVersion', { version: status?.version ?? status?.expectedProtocolVersion ?? '—' })}
-                  </Pill>
-                )}
               </div>
-              <div className="card-sub">{t(state === 'cleanup-pending' ? 'helper.actionError.partialCleanup' : 'helper.installedDesc')}</div>
+              {state === 'cleanup-pending' && <div className="card-sub">{t('helper.actionError.partialCleanup')}</div>}
               <div style={{ display: 'flex', gap: 9, marginTop: 14, flexWrap: 'wrap' }}>
                 <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}>
                   <span>{t('helper.recheck')}</span>
                 </Button>
+                {state === 'installed' && <Button variant="ghost" size="sm" onClick={install} disabled={busy}>
+                  <span>{t('helper.restoreOfflineAction')}</span>
+                </Button>}
                 {uninstallButton}
               </div>
             </div>
@@ -408,14 +471,8 @@ export default function SettingsHelper() {
                 <Dot variant="err" style={{ background: 'hsl(var(--warn))' }} />
                 <b style={{ color: 'hsl(var(--warn))' }}>{t('helper.statusUpgradeable')}</b>
                 <Pill variant="warn" style={{ marginLeft: 'auto' }}>
-                  {status?.version != null && status.version < status.expectedProtocolVersion
-                    ? t('helper.protocolVersionBelow', {
-                        version: status.version,
-                        required: status.expectedProtocolVersion,
-                      })
-                    : status?.helperBuildId != null && status.helperBuildId !== status.expectedBuildId
-                      ? t('helper.buildVersionMismatch')
-                      : t(status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent' : 'helper.statusUpgradeable')}
+                  {t(status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent'
+                    : status?.version != null && status.version < status.expectedProtocolVersion ? 'helper.protocolUpgradeNeeded' : 'helper.statusUpgradeable')}
                 </Pill>
               </div>
               <div className="card-sub">{t('helper.upgradeDescCard')}</div>
@@ -462,7 +519,7 @@ export default function SettingsHelper() {
                 <Dot variant="err" />
                 <b style={{ color: 'hsl(var(--warn))' }}>{t('helper.statusNeedsRepair')}</b>
               </div>
-              <div className="card-sub">{t('helper.repairDesc')}</div>
+              <div className="card-sub">{t(status?.selectedCore?.admission && coreAdmissionIsDamage(status.selectedCore.admission) ? 'helper.coreAdmission.damaged' : 'helper.repairDesc')}</div>
               <div style={{ display: 'flex', gap: 9, marginTop: 14 }}>
                 <Button variant="flow" size="sm" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
                   <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : t('helper.repairAction')}</span>
@@ -470,6 +527,40 @@ export default function SettingsHelper() {
               </div>
             </div>
           )}
+          {recoveryNotice && <p role="status" className="card-sub" data-recovery-state={recoveryNotice}>
+            {t(recoveryNotice === 'partial' ? 'helper.recoveryPartial' : recoveryNotice === 'unsupported' ? 'helper.recoveryUserUnsupported' : 'helper.recoveryPending')}
+          </p>}
+          <details className="card-sub" data-testid="helper-diagnostics" style={{ marginTop: 16, minWidth: 0, overflowWrap: 'anywhere' }} onToggle={revealOnToggle}>
+            <summary>{t('helper.diagnosticsTitle')}</summary>
+            {status && (
+              <div data-testid="helper-checks" style={{ marginTop: 12 }}>
+                <b>{t('helper.checksTitle')}</b>
+                <dl>
+                  <dt>{t('helper.checkInstallation')}</dt><dd>{booleanText(status.installed)}</dd>
+                  <dt>{t('helper.checkReady')}</dt><dd>{booleanText(status.ready)}</dd>
+                  <dt>{t('helper.checkLoaded')}</dt><dd>{booleanText(status.loaded)}</dd>
+                  <dt>{t('helper.selectedCoreState')}</dt><dd>{observedCoreState ? t(`helper.coreState.${observedCoreState}`) : t('helper.checkUnknown')}</dd>
+                </dl>
+                <p>{t('helper.checkScope')}</p>
+              </div>
+            )}
+            <p>{t('helper.diagnosticsScope')}</p>
+            <dl style={{ overflowWrap: 'anywhere' }}>
+              <dt>{t('helper.observedBuildId')}</dt><dd className="mono">{diagnostics?.helper.helperBuildId ?? t('helper.checkUnknown')}</dd>
+              <dt>{t('helper.expectedBuildId')}</dt><dd className="mono">{diagnostics?.helper.expectedBuildId ?? t('helper.checkUnknown')}</dd>
+              <dt>{t('helper.observedProtocol')}</dt><dd>{diagnostics?.helper.version ?? t('helper.checkUnknown')}</dd>
+              <dt>{t('helper.expectedProtocol')}</dt><dd>{diagnostics?.helper.expectedProtocolVersion ?? t('helper.checkUnknown')}</dd>
+              <dt>{t('helper.selectedCoreId')}</dt><dd className="mono">{diagnostics?.selectedCore?.id ?? t('helper.checkUnknown')}</dd>
+              <dt>{t('helper.selectedCoreProvider')}</dt><dd className="mono">{diagnostics?.selectedCore?.providerFingerprint ?? t('helper.checkUnknown')}</dd>
+            </dl>
+            <p>{t('helper.providerFingerprintTip')}</p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, marginTop: 14 }}>
+              <Button variant="ghost" size="sm" onClick={copyDiagnostics} disabled={!diagnostics} style={{ maxWidth: '100%', whiteSpace: 'normal' }}>
+                <span>{t('helper.copyDiagnostics')}</span>
+              </Button>
+              {copyState !== 'idle' && <p role="status">{t(copyState === 'copied' ? 'helper.diagnosticsCopied' : 'helper.diagnosticsCopyFailed')}</p>}
+            </div>
+          </details>
         </div>
       </div>
 

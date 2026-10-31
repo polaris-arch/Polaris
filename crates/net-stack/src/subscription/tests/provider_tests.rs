@@ -855,3 +855,67 @@ fn extract_proxy_providers_detects_and_ignores() {
     // 非 clash → None。
     assert!(extract_proxy_providers("vless://u@h:443#n").is_none());
 }
+
+#[tokio::test]
+async fn snell_tls_http_provider_yaml_json_keep_origin_filters_namespace_and_limits() {
+    for mode in ["http", "tls"] {
+        let doc = serde_json::json!({"proxies":[
+            {"name":"keep-SN","type":"snell","server":"s.example","port":443,"psk":"part1:part2+secret",
+                "version":4,"obfs-opts":{"mode":mode,"host":"Cover.Example"}},
+            {"name":"drop-SN","type":"snell","server":"other.example","port":443,"psk":"pw",
+                "version":4,"obfs-opts":{"mode":mode}},
+            {"name":"bad-SN","type":"snell","server":"s.example","port":443,"psk":"pw",
+                "version":4,"obfs-opts":{"mode":"unknown"}}
+        ]});
+        for body in [doc.to_string(), serde_yaml::to_string(&doc).unwrap()] {
+            let responses = HashMap::from([("https://sn.example/sub".into(), Ok(body.clone()))]);
+            let providers = providers_yaml(
+                "sn:\n  type: http\n  url: https://sn.example/sub\n  filter: '^keep-'\n",
+            );
+            let r = resolve_proxy_providers(
+                &providers,
+                "sub",
+                "now",
+                8,
+                &mock_fetch(responses.clone()),
+                &mut id_gen(),
+            )
+            .await;
+            assert_eq!(r.servers.len(), 1, "{:?}", r.warnings);
+            assert!(!r.any_failed && r.failed_providers.is_empty() && r.fatal_error.is_none());
+            let node = &r.servers[0];
+            assert_eq!(node.provider_name.as_deref(), Some("sn"));
+            assert_eq!(node.subscription_id.as_deref(), Some("sub"));
+            assert_eq!(node.password.as_deref(), Some("part1:part2+secret"));
+            let sn = node.snell_settings.as_deref().unwrap();
+            assert_eq!(sn.obfs_mode.as_deref(), Some(mode));
+            assert_eq!(sn.obfs_host.as_deref(), Some("Cover.Example"));
+            assert!(node.tls_settings.is_none());
+            assert!(r.warnings.iter().any(|w| w.contains("snell-obfs:unknown")));
+            let limited = resolve_proxy_providers_controlled(
+                &providers,
+                "sub",
+                "now",
+                ProviderResolveLimits {
+                    max_nodes_per_provider: 2,
+                    ..Default::default()
+                },
+                &ProviderResolveControl::default(),
+                &mock_fetch(responses),
+                &mut id_gen(),
+            )
+            .await;
+            assert!(limited.servers.is_empty());
+            assert_eq!(
+                limited.fatal_error.as_ref().unwrap().kind,
+                ProviderFatalErrorKind::ParseLimit
+            );
+            assert!(limited
+                .fatal_error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("节点数超过上限"));
+        }
+    }
+}

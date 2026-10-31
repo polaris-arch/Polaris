@@ -325,15 +325,13 @@ fn no_new_console_program_spawn_escapes_the_suppression() {
 /// 让本门恒红。正向对照是「两处各恰好命中一次」；缺失、新增或失去 Linux 闭集条件都变红。
 #[test]
 fn only_one_production_site_spawns_sing_box_check() {
-    /// argv 里的子命令字面量（含引号）。
     const CHECK_ARG: &str = "\"check\"";
-    /// Windows 可达的常规 check 构造点，与仅 Linux x86_64 的 sealed-fd check 各一处。
     const HOME: &str = "crates/core-supervisor/src/config_gate/check_custody.rs";
-    const LINUX: &str = "src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs";
-
+    const LINUX: &str = "crates/core-supervisor/src/admitted_payload.rs";
+    const RELAY: &str = "src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs";
     let root = repo_root();
-    let mut sites: Vec<String> = Vec::new();
-    let mut scanned = 0usize;
+    let mut sites = Vec::new();
+    let mut scanned = 0;
     for dir in ["src-tauri/src", "crates"] {
         for entry in walk(&root.join(dir)) {
             let rel = entry
@@ -348,23 +346,16 @@ fn only_one_production_site_spawns_sing_box_check() {
             let prod = strip_comments(&std::fs::read_to_string(&entry).unwrap_or_default());
             for (i, line) in prod.lines().enumerate() {
                 if line.contains(CHECK_ARG) {
-                    sites.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                    sites.push((rel.clone(), i + 1, line.trim().to_string()));
                 }
             }
         }
     }
-    assert!(
-        scanned > 50,
-        "只扫到 {scanned} 个文件 —— 遍历坏了，绿没有信息量"
-    );
+    assert!(scanned > 50);
     assert_eq!(
         sites.len(),
         2,
-        "`sing-box check` 的构造点必须是 Windows 可达的 `{HOME}` 与仅 Linux x86_64 的 `{LINUX}` 各一处。\
-         缺任一处 = 针或遍历坏了；>2 = 又出现了一份各自漂的拷贝，\
-         而每一份拷贝都得自己记得超时与 `kill_on_drop` —— 折叠之前的三份里就有两份没记住。\
-         实际命中：\n{}",
-        sites.join("\n")
+        "normal and fixed sealed CheckConfig constructors only: {sites:?}"
     );
     for (file, argv) in [
         (HOME, ".args([\"--disable-color\", \"check\", \"-c\"])"),
@@ -376,67 +367,46 @@ fn only_one_production_site_spawns_sing_box_check() {
         assert_eq!(
             sites
                 .iter()
-                .filter(|site| site.starts_with(&format!("{file}:")) && site.ends_with(argv))
+                .filter(|(path, _, line)| path == file && line.ends_with(argv))
                 .count(),
             1,
-            "{file} 必须持有其唯一精确 check argv；其它构造点不受豁免：{sites:?}"
+            "{file}: {sites:?}"
         );
     }
-    let linux = strip_comments(&read(LINUX));
-    let module = braced_block(
-        &linux,
-        "#[cfg(all(target_os = \"linux\", target_arch = \"x86_64\"))]\nmod linux {",
-    );
-    let run = braced_block(module, "pub(super) async fn run_check(");
+    let owner = strip_comments(&read(LINUX));
+    let parts = braced_block(&owner, "pub(crate) fn sealed_check_parts(");
     for required in [
-        ".args([\"--disable-color\", \"check\", \"-c\", \"/proc/self/fd/0\"])",
-        "/proc/self/fd/",
-        ".env_clear()",
+        "self.purpose != ExecPurpose::CheckConfig",
+        "self.command()?",
         ".current_dir(\"/\")",
-        ".stdout(Stdio::null())",
-        ".stderr(Stdio::null())",
         ".kill_on_drop(true)",
-        "supervise(command, binary, config, timeout, None).await",
+        "binary_for_custody()?",
     ] {
         assert!(
-            run.contains(required),
-            "Linux-only protected check 失去严格构造条件：{required}"
+            parts.contains(required),
+            "opaque sealed check lost {required}"
         );
     }
-    // fd 0 的接线不在 `run_check` 里了：sealed config 的原子 CLOEXEC 复制与 `.stdin(…)` 随 Child 的
-    // 保管一起搬进了 CheckCustody 的入队处。沿「run_check → supervise → 入队」逐跳钉住，中间任何
-    // 一跳改道，上面那串 argv 里的 `/proc/self/fd/0` 就指向一个没人接的 fd。
-    let relay = braced_block(module, "pub(super) async fn supervise(");
-    assert!(
-        relay.contains(
-            "supervise_owned_sealed_check(command, binary, config, timeout, spawned).await"
-        ),
-        "Linux-only protected check 不再把命令与两份 sealed 输入交给 CheckCustody"
-    );
+    let app = strip_comments(&read(RELAY));
+    let relay = braced_block(&app, "pub(super) async fn supervise(");
+    assert!(relay.contains("supervise_owned_sealed_check(execution, config, timeout, spawned)"));
     let home = strip_comments(&read(HOME));
-    for (anchor, required) in [
-        (
-            "pub async fn supervise_owned_sealed_check(",
-            ".supervise_owned_sealed(command, binary, config, timeout, spawned)",
-        ),
-        (
-            "async fn supervise_owned_sealed(",
-            "self.queue_owned_sealed(command, binary, config, Arc::new(NativeIo))",
-        ),
-        ("fn queue_owned_sealed(", "validate_sealed_file(&binary)?"),
-        ("fn queue_owned_sealed(", "validate_sealed_file(&config)?"),
-        (
-            "fn queue_owned_sealed(",
-            "rustix::io::fcntl_dupfd_cloexec(&config, 3)",
-        ),
-        (
-            "fn queue_owned_sealed(",
-            ".stdin(std::process::Stdio::from(stdin))",
-        ),
+    let public = braced_block(&home, "pub async fn supervise_owned_sealed_check(");
+    assert!(public.contains("supervise_admitted_sealed_check("));
+    let private = braced_block(&home, "async fn supervise_admitted_sealed_check(");
+    assert!(private.contains("execution.sealed_check_parts()?"));
+    assert!(private.contains("Some(payload)"));
+    let queue = braced_block(&home, "fn queue_owned_sealed_with_owner(");
+    for required in [
+        "validate_sealed_file(&binary)?",
+        "validate_sealed_file(&config)?",
+        "rustix::io::fcntl_dupfd_cloexec(&config, 3)",
+        ".stdin(std::process::Stdio::from(stdin))",
+        "payload,",
     ] {
         assert!(
-            braced_block(&home, anchor).contains(required),
-            "Linux-only protected check 在 `{anchor}` 失去严格构造条件：{required}"
+            queue.contains(required),
+            "opaque check custody lost {required}"
         );
     }
 }

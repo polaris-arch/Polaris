@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { copyPackagingSource, writeFormalAssets } from './lib/formal-package-fixtures.test.mjs';
+import { fileURLToPath } from 'node:url';
 import { assetNames, assetMatches, verifyAbiNames, verifyAndroidDigests } from './release-assets.mjs';
 
 const expected = [
@@ -60,26 +62,29 @@ test('final manifest binds all three APKs to their fixed previously verified SHA
   }
   assert.throws(() => verifyAndroidDigests('1.0.0', { ...verified, 'extra.apk': 'a'.repeat(64) }, sums));
 });
-test('complete packaging gate rejects old names, stale versions, extra files, missing APK and stale sums', () => {
+test('Linux complete packaging gate rejects old names, stale versions, extra files, missing APK and stale sums', { skip: process.platform !== 'linux' }, () => {
   const directory = mkdtempSync(join(tmpdir(), 'polaris-release-contract-'));
   try {
-    for (const name of expected) writeFileSync(join(directory, name), `fixture asset: ${name}`);
-    const sums = expected.map((name) => `${digest(readFileSync(join(directory, name)))}  ${name}`).join('\n') + '\n';
-    writeFileSync(join(directory, 'SHA256SUMS'), sums);
-    const run = () => spawnSync(process.execPath, ['scripts/verify-packaging.mjs', 'assets', '--label', 'release-all', '--dir', directory], { encoding: 'utf8' });
+    const source=join(directory,'source');copyPackagingSource(fileURLToPath(new URL('../',import.meta.url)),source);
+    const assets=join(directory,'assets');mkdirSync(assets);
+    const env=writeFormalAssets(assets,expected);
+    const originals=new Map(expected.map(n=>[n,readFileSync(join(assets,n))]));
+    const sums = expected.map((name) => `${digest(readFileSync(join(assets, name)))}  ${name}`).join('\n') + '\n';
+    writeFileSync(join(assets, 'SHA256SUMS'), sums);
+    const run = () => spawnSync(process.execPath, [join(source,'scripts/verify-packaging.mjs'), 'assets', '--label', 'release-all', '--dir', assets], { encoding: 'utf8',env });
     const good = run();
     assert.equal(good.status, 0, good.stdout + good.stderr);
     for (const extra of ['polaris-portable-v1.0.0.zip', 'Polaris_0.9.0_x64-mac.dmg', 'extra.txt']) {
-      writeFileSync(join(directory, extra), 'extra');
+      writeFileSync(join(assets, extra), 'extra');
       assert.equal(run().status, 1, extra);
-      rmSync(join(directory, extra));
+      rmSync(join(assets, extra));
     }
     for (const name of expected.slice(6)) {
-      rmSync(join(directory, name));
+      rmSync(join(assets, name));
       assert.equal(run().status, 1, name);
-      writeFileSync(join(directory, name), `fixture asset: ${name}`);
+      writeFileSync(join(assets, name), originals.get(name));
     }
-    writeFileSync(join(directory, expected[8]), 'tampered APK bytes');
+    writeFileSync(join(assets, expected[8]), 'tampered APK bytes');
     assert.equal(run().status, 1);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

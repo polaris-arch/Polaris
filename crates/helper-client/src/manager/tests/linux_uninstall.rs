@@ -541,3 +541,39 @@ exit {original}
         }
     }
 }
+
+#[test]
+fn legacy_and_ordinary_producers_share_the_complete_cohort_body_without_relaxing_regular_units() {
+    let proof = crate::manager::LINUX_SERVICE_CLOSURE_FUNCTIONS;
+    assert!(proof.contains("linux_service_closed() {"));
+    assert!(proof.contains("linux_validate_service || return 1\n  linux_cohort_closed"));
+    let common = proof.split("linux_cohort_closed() {").nth(1).unwrap();
+    for required in [
+        "linux_cgroup_view || return 1",
+        "ActiveState",
+        "MainPID",
+        "ControlGroup",
+        "find \"$CGPARENT\" -mindepth 1 -maxdepth 1",
+        "cgroup.events",
+        "populated",
+        "POPULATED=unknown",
+    ] {
+        assert!(common.contains(required), "{required}");
+    }
+    for strict in [
+        "loaded)",
+        "[ -f \"$DESCRIPTOR\" ] && [ ! -L \"$DESCRIPTOR\" ]",
+        "DropInPaths",
+        "KillMode",
+        "Delegate",
+    ] {
+        assert!(
+            proof.contains(strict),
+            "ordinary regular-unit validator lost {strict}"
+        );
+    }
+    let removal = polaris_source_probe::crate_source!("manager/uninstall_unix.rs");
+    assert!(removal.contains("helper-retired.*"));
+    assert!(removal.contains("helper-legacy-tombstone"));
+    assert!(removal.contains("linux_legacy_wrapper("));
+}

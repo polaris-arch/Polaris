@@ -274,7 +274,7 @@ fn the_in_process_leg_sees_the_connected_ras_tunnel() {
         snapshot
             .foreign
             .iter()
-            .any(|r| r.interface == RAS_IFACE && r.prefix == "10.55.0.10/32"),
+            .any(|r| r.interface == RAS_IFACE && r.prefix == "10.55.0.27/32"),
         "RAS 隧道自身地址没进 foreign：{:?}",
         snapshot.foreign
     );

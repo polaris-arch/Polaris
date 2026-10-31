@@ -17,6 +17,13 @@ sha2 = "0.11"
 hex = "0.4"
 # thiserror = UpdaterError 枚举 derive（与 core-supervisor / helper / store 等一致）。
 thiserror = "2"
+# Offline recovery reads existing native release archives as data only.
+# Keep compression backends narrow; no external extractor or optional codecs.
+flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
+tar = { version = "=0.4.46", default-features = false }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
+# Private data-only recovery stages, also reused by existing filesystem tests.
+tempfile = "3"
 
 [features]
 # test-utils = 把 crate 内的**跨 crate 测试替身**（MockFs / MockFailOp）暴露给下游。
@@ -31,8 +38,6 @@ thiserror = "2"
 test-utils = []
 
 [dev-dependencies]
-# tempfile = mock UpdateFs 落盘 + 原子 rename 的 tmp 目录（与 helper dev-deps 同源）。
-tempfile = "3"
 # 源码级门的取材锚点（`polaris_source_probe::crate_source!` 等宏）。dev-only：
 # 不进 lib 依赖图，不进包。零第三方依赖（只用 std）⇒ Cargo.lock 与 THIRD-PARTY 均无新增。
 polaris-source-probe = { version = "1.0.0", path = "../source-probe" }

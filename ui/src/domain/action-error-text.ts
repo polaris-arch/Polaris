@@ -22,6 +22,7 @@ export function helperActionErrorText(
     case 'upgradeDeferred': return t('helper.actionError.upgradeDeferred');
     case 'installerFailed': return t('helper.actionError.installerFailed');
     case 'notReady': return t('helper.actionError.notReady');
+    case 'recoveryRequired': return t('helper.actionError.recoveryRequired');
     default: return t('helper.actionError.failed');
   }
 }

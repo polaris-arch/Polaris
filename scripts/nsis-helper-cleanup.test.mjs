@@ -11,9 +11,9 @@ const worker = readFileSync(`${root}crates/windows-cleaner/src/windows.rs`, 'utf
 const compact = worker.replace(/\s+/g, '');
 const policy = readFileSync(`${root}crates/windows-cleaner/src/lib.rs`, 'utf8');
 const failures = (s) => nsisHelperCleanupViolations(s);
-const mutateHook = (from, to) => {
-  const at = hook.indexOf('InitPluginsDir', hook.indexOf('!macro NSIS_HOOK_POSTUNINSTALL'));
-  return hook.slice(0, at) + hook.slice(at).replace(from, to);
+const mutateHook = (from, to, input = hook) => {
+  const at = input.indexOf('InitPluginsDir', input.indexOf('!macro NSIS_HOOK_POSTUNINSTALL'));
+  return input.slice(0, at) + input.slice(at).replace(from, to);
 };
 test('real embedded-native NSIS cleanup has no contract violations', () => assert.deepEqual(failures(hook), []));
 for (const line of HELPER_CLEANUP_LINES) {
@@ -38,7 +38,7 @@ test('embedded executable stays independent of the removed app directory', () =>
 });
 test('payload filename/role substitution is rejected', () => {
   for (const [from,to] of [['--launch','--worker'],['/oname=polaris-cleaner.exe','/oname=other.exe']]) {
-    assert.ok(failures(hook.replace(from,to)).length);
+    assert.ok(failures(mutateHook(from,to)).length);
   }
 });
 test('old privileged script/recursive deletion regressions are rejected', () => {
@@ -99,8 +99,8 @@ test('service absent plus an inaccessible protected tree still reaches native cl
   assert.ok(!body.includes('FileExists'));
   assert.ok(!body.includes('sc.exe'));
   for (const guard of ['${If} $R4 == 0', '${If} ${FileExists} "$R9\\*.*"']) {
-    const mutant = hook.replace('InitPluginsDir', `${guard}\nInitPluginsDir`)
-      .replace('SetOutPath $R6', 'SetOutPath $R6\n${EndIf}');
+    const mutant = mutateHook('SetOutPath $R6', 'SetOutPath $R6\n${EndIf}',
+      mutateHook('InitPluginsDir', `${guard}\nInitPluginsDir`));
     assert.ok(failures(mutant).length, guard);
   }
   assert.deepEqual(failures(hook), []);

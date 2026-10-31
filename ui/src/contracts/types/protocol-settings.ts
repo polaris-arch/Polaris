@@ -190,8 +190,8 @@ export type SnellVersion = 4 | 6;
 // obfs*（仅 v4）与 mode（仅 v6）互斥——表单按 version 条件渲染，提交时 normalize 清对侧字段防脏下发。
 export interface SnellSettings {
   version: SnellVersion; // 必填；决定 obfs（v4）/ mode（v6）分支
-  obfsMode?: 'none' | 'http'; // 仅 v4；默认 none（不下发 obfs_*）
-  obfsHost?: string; // 仅 v4 + obfsMode=http；默认 bing.com
+  obfsMode?: 'none' | 'http' | 'tls'; // 仅 v4；默认 none（不下发 obfs_*）
+  obfsHost?: string; // 仅 v4 http/tls；留空交内核处理（http 默认 bing.com）
   mode?: 'default' | 'unshaped' | 'unsafe-raw'; // 仅 v6；默认 default（不下发）
   reuse?: boolean; // 连接复用（v2 CONNECT）；默认 false
   network?: 'tcp' | 'udp'; // 省略 = both

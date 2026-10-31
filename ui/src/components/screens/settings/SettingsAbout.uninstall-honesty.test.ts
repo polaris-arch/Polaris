@@ -174,8 +174,8 @@ describe('卸载入口：后端接线状态 ⟺ 前端可用性、文案与结�
 
     // 「没抛异常」不等于卸载成功：外层信封恒 success:true，真值在 verdict。
     expect(
-      tsx.includes("r.verdict === 'complete'"),
-      '必须按 verdict 判成败，否则半成品会被显示成「已卸载」',
+      tsx.includes("presentation.mayExitAsComplete"),
+      '必须按报告范围投影判成败，否则保留数据的退役会被显示成「已卸载」',
     ).toBe(true);
 
     for (const loc of LOCALES) {

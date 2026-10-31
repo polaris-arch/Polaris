@@ -730,7 +730,7 @@ pub fn parse_macos_tunnel_interfaces(
 ///
 /// | 表 | 那一列是 | 抓到的样子 |
 /// |---|---|---|
-/// | `route print -4` | **本地 IP 地址** | `192.168.10.207` |
+/// | `route print -4` | **本地 IP 地址** | `192.168.50.244` |
 /// | `route print -6` | **接口索引**（整数） | `8` |
 ///
 /// 两者都要再查一张表才落得到名字上，而那张表只能从 `Get-NetIPAddress` / `Get-NetAdapter`
@@ -930,7 +930,7 @@ pub fn parse_get_netipaddress(stdout: &str) -> Result<WindowsInterfaceNames, Rou
     Ok(names)
 }
 
-/// `fe80::…%8` / `192.168.10.207` → 规范化的地址字面量（查表的键）。非地址返回 `None`。
+/// 合成格式例：`fe80::…%8` / `192.168.50.244` → 规范化的地址字面量（查表的键）。非地址返回 `None`。
 fn normalize_ip_key(raw: &str) -> Option<String> {
     let addr = raw.split('%').next().unwrap_or(raw);
     addr.parse::<IpAddr>().ok().map(|a| a.to_string())

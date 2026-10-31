@@ -61,7 +61,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('resource progress layou
    expect(await page.locator('.rc-status-item.warn').innerText()).toBe('更新失败');
    expect(await page.locator('.mr-error').innerText()).toContain('更新失败，请检查网络后重试。');
    expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBe(width);
-   if(process.env.POLARIS_RESOURCE_SCREENSHOTS==='1')await page.screenshot({path:'/home/sway/output/playwright/resource-progress-layout-theme-'+width+(scale===2?'-font2':'')+'.png'});
+   if(process.env.POLARIS_RESOURCE_SCREENSHOTS==='1')await page.screenshot({path:path.resolve(root,'test-results/resource-progress-layout-theme-'+width+(scale===2?'-font2':'')+'.png')});
    await page.close();
   }
  },30_000);

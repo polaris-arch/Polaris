@@ -16,7 +16,7 @@ import { MobileSelect as AppSelect } from '../MobileSelect';
  */
 
 import { useEffect, useId, useRef, useState, type CSSProperties, type ReactElement, type ReactNode } from 'react';
-import { nextDraft, parseBulkEntries, sameEntries } from '@/domain/list-entries';
+import { listEntryRow, listEntryRows, listEntrySources, sameListEntryRows, nextListEntryDraft, importListEntryRows, listEntryAcceptance, type ListEntryAcceptance, type ListEntrySource, type ListEntryRow } from '@/domain/list-entries';
 import { useWriteError } from './write-feedback';
 
 /* ── 尺度：几何 px（不随 Dynamic Type 缩放），排版 rem（随缩放）── 与 mobile.css 头注同一口径 ── */
@@ -438,6 +438,8 @@ export function MobileButton({
 export function MobileListEditor({
   id,
   value,
+  entryIds,
+  entryContextKey,
   onChange,
   placeholder,
   ariaLabel,
@@ -453,7 +455,10 @@ export function MobileListEditor({
 }: {
   id: string;
   value: readonly string[];
-  onChange: (next: string[]) => void;
+  entryIds?: readonly (string | undefined)[];
+  /** Invalidates transient selection provenance after an external selection change. */
+  entryContextKey?: string;
+  onChange: (next: string[], entryIds: readonly (string | undefined)[], sources: readonly ListEntrySource[], context?: unknown) => unknown;
   placeholder?: string;
   ariaLabel: string;
   addLabel: string;
@@ -467,34 +472,69 @@ export function MobileListEditor({
   entryIdentity?: (value: string) => string;
   onValidate?: (value: readonly string[]) => void;
 }): ReactElement {
-  const [draft, setDraft] = useState<readonly string[]>(value);
-  const seeded = useRef<readonly string[]>(value);
+  const incoming = listEntryRows(value, entryIds);
+  const [draft, setDraft] = useState<readonly ListEntryRow[]>(incoming);
+  const seeded = useRef<readonly ListEntryRow[]>(incoming);
+  const acceptedRef = useRef<ListEntryAcceptance | undefined>(undefined);
+  const continuationRef = useRef<unknown>(undefined);
+  const contextKeyRef = useRef(entryContextKey);
   useEffect(() => {
-    setDraft((cur) => nextDraft(cur, seeded.current, value));
-    seeded.current = value;
-  }, [value]);
+    const seed = seeded.current;
+    const accepted = acceptedRef.current;
+    const matching = accepted && sameListEntryRows(accepted.canonical, incoming);
+    setDraft((cur) => nextListEntryDraft(cur, seed, incoming, accepted));
+    if (accepted && matching) {
+      continuationRef.current = accepted.contextKey === entryContextKey ? accepted.context : undefined;
+      if (acceptedRef.current === accepted) acceptedRef.current = undefined;
+    } else if (contextKeyRef.current !== entryContextKey || !sameListEntryRows(seed, incoming)) {
+      continuationRef.current = undefined;
+      // Keep pending identity/selection bindings through older props. A pool
+      // different from the pending result invalidates its selection origins.
+      if (accepted && contextKeyRef.current !== entryContextKey && accepted.contextKey !== entryContextKey) {
+        acceptedRef.current = { ...accepted, context: undefined };
+      }
+    }
+    contextKeyRef.current = entryContextKey;
+    seeded.current = incoming;
+  }, [value, entryIds, entryContextKey]);
 
   const [importOpen, setImportOpen] = useState(false);
   const [importDraft, setImportDraft] = useState('');
 
-  /** 提交到父级。与 `value` 逐项相同就**不写** —— 免一次无谓落盘（同桌面那份）。 */
-  function commit(next: readonly string[]): void {
+  function accept(result: unknown, submitted: readonly ListEntryRow[]) {
+    if (entryIds === undefined) return; // Legacy void/async callbacks are unchanged.
+    const accepted = listEntryAcceptance(result, submitted);
+    if (!accepted) return; // A rejected newer commit cannot retire an older valid receipt.
+    if (sameListEntryRows(accepted.canonical, incoming)) {
+      setDraft((cur) => nextListEntryDraft(cur, incoming, incoming, accepted));
+      continuationRef.current = accepted.contextKey === entryContextKey ? accepted.context : undefined;
+      acceptedRef.current = undefined;
+    } else {
+      acceptedRef.current = accepted;
+    }
+  }
+
+  function commit(next: readonly ListEntryRow[]): void {
     setDraft(next);
-    onValidate?.(next);
-    if (!sameEntries(next, value)) onChange([...next]);
+    const values = next.map((row) => row.value);
+    onValidate?.(values);
+    if (!sameListEntryRows(next, incoming)) {
+      const result = onChange(values, next.map((row) => row.id), listEntrySources(next), continuationRef.current);
+      accept(result, next);
+    }
   }
 
   return (
     <div data-list-editor={id} style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' }}>
       {draft.length === 0 && <span style={ROW_DESC}>{emptyLabel}</span>}
       {draft.map((entry, index) => (
-        <div key={index} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div key={entryIds === undefined ? index : entry.key} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <MobileTextInput
             mono
-            value={entry}
+            value={entry.value}
             ariaLabel={ariaLabel}
             placeholder={placeholder}
-            onChange={(next) => setDraft((cur) => cur.map((s, i) => (i === index ? next : s)))}
+            onChange={(next) => setDraft((cur) => cur.map((row, i) => (i === index ? { ...row, value: next } : row)))}
             onCommit={() => commit(draft)}
           />
           <button
@@ -510,7 +550,7 @@ export function MobileListEditor({
         </div>
       ))}
       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-        <MobileButton onClick={() => commit([...draft, ''])}>{addLabel}</MobileButton>
+        <MobileButton onClick={() => commit([...draft, listEntryRow('')])}>{addLabel}</MobileButton>
         <MobileButton onClick={() => setImportOpen((v) => !v)}>{importLabel}</MobileButton>
       </div>
       {importOpen && (
@@ -528,7 +568,7 @@ export function MobileListEditor({
             <MobileButton
               tone="primary"
               onClick={() => {
-                commit(parseBulkEntries(importDraft, [...draft], undefined, entryIdentity));
+                commit(importListEntryRows(importDraft, draft, undefined, entryIdentity));
                 setImportDraft('');
                 setImportOpen(false);
               }}

@@ -10,17 +10,40 @@ pub enum ParseVersionError {
     Empty,
 }
 
-/// 解析出主版本段数组与 prerelease 段数组（build `+...` 直接丢弃，不参与比较）。
-///
-/// 移植自 `version.ts:compareSemver` 内部 `parse`。缺失或非数字主版本段按 0 计
-/// （上游 `parseInt(p, 10) || 0`）。
-fn parse_semver(v: &str) -> (Vec<u64>, Vec<String>) {
+/// 比较与 release 有效性检查共用的主版本 / prerelease / build 拆分入口。
+fn version_parts(v: &str) -> (&str, Option<&str>, Option<&str>) {
     let stripped = v.trim().trim_start_matches(['v', 'V']);
-    // build `+...` 丢弃（semver 规范：build metadata 不参与优先级）。
-    let no_build = stripped.split('+').next().unwrap_or_default();
-    let (main_str, pre_str) = no_build
+    let (no_build, build) = stripped
+        .split_once('+')
+        .map_or((stripped, None), |(version, build)| (version, Some(build)));
+    let (main, pre) = no_build
         .split_once('-')
-        .map_or((no_build, ""), |(m, p)| (m, p));
+        .map_or((no_build, None), |(main, pre)| (main, Some(pre)));
+    (main, pre, build)
+}
+
+/// Release 发现入口拒绝会被容错比较器丢失/改写的坏段；比较优先级仍只由 `compare_semver` 定义。
+/// 保留既有的数字主版本段数、前缀及前导零兼容性，不另造一套排序/版本解析规则。
+pub(crate) fn is_valid_release_version(v: &str) -> bool {
+    let (main, pre, build) = version_parts(v);
+    let valid_identifiers = |value: &str| {
+        value.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    };
+    main.split('.').all(|part| part.parse::<u64>().is_ok())
+        && pre.is_none_or(valid_identifiers)
+        && build.is_none_or(valid_identifiers)
+}
+
+/// 沿用 `version.ts:compareSemver` 的容错比较：不可解析的主版本段按 0 计。
+fn parse_semver(v: &str) -> (Vec<u64>, Vec<String>) {
+    // build metadata 不参与优先级；release 有效性检查也复用同一拆分入口。
+    let (main_str, pre, _) = version_parts(v);
+    let pre_str = pre.unwrap_or_default();
 
     let main: Vec<u64> = main_str
         .split('.')

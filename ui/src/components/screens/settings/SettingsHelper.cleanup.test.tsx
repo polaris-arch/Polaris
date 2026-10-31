@@ -55,7 +55,7 @@ function text(node: unknown): string {
 function click(label: string) {
   const button = nodes(render()).find((n) => typeof n.props.onClick === 'function' && text(n.props.children) === label);
   expect(button, label).toBeDefined();
-  expect(button!.props.disabled).toBe(false);
+  expect(button!.props.disabled ?? false).toBe(false);
   (button!.props.onClick as () => void)();
 }
 async function mounted(status = installed) {
@@ -136,4 +136,129 @@ it('failed status recovery retains the install cause and never retries installat
   expect(helperApi.uninstall).not.toHaveBeenCalled();
 });
 
-afterEach(() => { h.cleanup?.(); h.cleanup = null; clearHelperInstallFeedback(); });
+afterEach(() => { h.cleanup?.(); h.cleanup = null; clearHelperInstallFeedback(); vi.unstubAllGlobals(); });
+
+
+it('service checks describe installation and selected content; identities are folded and version belongs to the core page', async () => {
+  const status = { ...installed, loaded: null, selectedCore: {
+    id: 'a'.repeat(64), version: '1.15.0-alpha.12', providerFingerprint: 'b'.repeat(64), state: 'present',
+  } };
+  await mounted(status);
+  const tree = render();
+  const all = nodes(tree);
+  const checks = all.find(n => n.props['data-testid'] === 'helper-checks')!;
+  expect(text(checks)).toContain('helper.checkInstallationhelper.checkYes');
+  expect(text(checks)).toContain('helper.checkLoadedhelper.checkUnknown');
+  expect(text(checks)).toContain('helper.selectedCoreStatehelper.coreState.present');
+  expect(text(checks)).toContain('helper.checkScope');
+  const details = all.find(n => n.props['data-testid'] === 'helper-diagnostics')!;
+  expect(details.type).toBe('details');
+  expect(details.props.open).toBeUndefined();
+  expect(text(details)).toContain(status.selectedCore.id);
+  expect(text(details)).toContain(status.selectedCore.providerFingerprint);
+  expect(text(tree)).not.toContain(status.selectedCore.version);
+  expect(text(tree)).not.toContain('helper.selectedCoreVersion');
+  expect(all.filter(n => typeof n.props.onClick === 'function' && text(n.props.children) === 'helper.copyDiagnostics')).toHaveLength(1);
+});
+
+it('diagnostic copy uses explicit service and content fields, excludes sensitive properties, and preserves unknown protocol', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal('navigator', { clipboard: { writeText } });
+  await mounted({ ...installed, version: null, expectedProtocolVersion: 9, loaded: null,
+    helperBuildId: 'helper-source-123', expectedBuildId: 'expected-source-456',
+    installedSingboxPath: '/Users/private/core', diagnostic: 'raw log private', token: 'credential', subscription: 'https://private.invalid',
+    selectedCore: { id: 'a'.repeat(64), version: '1.15.0', providerFingerprint: 'b'.repeat(64), state: 'present', sourceId: 'do-not-mix' },
+  } as never);
+  click('helper.copyDiagnostics');
+  await vi.waitFor(() => expect(h.state[4]).toBe('copied'));
+  const copied = JSON.parse(writeText.mock.calls[0][0]);
+  expect(copied).toEqual({
+    helper: { supported: true, installed: true, ready: true, loaded: null, upgradeable: false, needsRepair: false,
+      backgroundDisabled: null, pathMismatch: null, version: null, expectedProtocolVersion: 9,
+      helperBuildId: 'helper-source-123', expectedBuildId: 'expected-source-456' },
+    selectedCore: { id: 'a'.repeat(64), providerFingerprint: 'b'.repeat(64), state: 'present' },
+  });
+  expect(writeText.mock.calls[0][0]).not.toMatch(/private|credential|do-not-mix/);
+  expect(text(render())).toContain('helper.diagnosticsCopied');
+  expect(helperApi.install).not.toHaveBeenCalled();
+  expect(helperApi.uninstall).not.toHaveBeenCalled();
+});
+
+it('malformed identity fields never copy raw paths or logs and unknown core state never becomes verified', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal('navigator', { clipboard: { writeText } });
+  await mounted({ ...installed, helperBuildId: '/Users/private/helper', expectedBuildId: 'raw log\nsecret',
+    version: -1, expectedProtocolVersion: Number.NaN,
+    selectedCore: { id: '/Users/private/core', providerFingerprint: 'raw log\nsecret', state: 'future' },
+  } as never);
+  const checks = nodes(render()).find(n => n.props['data-testid'] === 'helper-checks')!;
+  expect(text(checks)).toContain('helper.selectedCoreStatehelper.checkUnknown');
+  expect(text(render())).not.toMatch(/private|secret/);
+  click('helper.copyDiagnostics');
+  await vi.waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+  const copy = JSON.parse(writeText.mock.calls[0][0]);
+  expect(copy.helper).toMatchObject({ helperBuildId: null, expectedBuildId: null, version: null, expectedProtocolVersion: null });
+  expect(copy.selectedCore).toEqual({ id: null, providerFingerprint: null, state: null });
+});
+
+it('diagnostic clipboard failure is visible without leaking exception text or changing service state', async () => {
+  vi.stubGlobal('navigator', { clipboard: { writeText: vi.fn().mockRejectedValue(new Error('raw private failure')) } });
+  await mounted();
+  click('helper.copyDiagnostics');
+  await vi.waitFor(() => expect(h.state[4]).toBe('failed'));
+  expect(text(render())).toContain('helper.diagnosticsCopyFailed');
+  expect(text(render())).not.toContain('raw private failure');
+  expect(h.state[1]).toBe('installed');
+});
+
+
+it('a responding channel alone does not claim service files are installed', async () => {
+  vi.mocked(helperApi.getStatus).mockResolvedValue({ ...absent, ready: true } as never);
+  render(); h.cleanup = h.effect!();
+  await vi.waitFor(() => expect(h.state[1]).toBe('needs-repair'));
+  const checks = nodes(render()).find(n => n.props['data-testid'] === 'helper-checks')!;
+  expect(text(checks)).toContain('helper.checkInstallationhelper.checkNo');
+  expect(text(render())).not.toContain('helper.statusInstalled');
+});
+
+it.each(['UnsupportedExactObject','UnsupportedCapability','LoaderPolicy','Busy','Unknown','Io'] as const)('typed %s unavailability never offers ineffective repair', async admission => {
+  const selectedCore={id:'a'.repeat(64),providerFingerprint:'b'.repeat(64),version:'selected-friendly-version',state:'unavailable',admission};
+  vi.mocked(helperApi.getStatus).mockResolvedValue({...installed,ready:false,selectedCore} as never);
+  render();h.cleanup=h.effect!();
+  await vi.waitFor(()=>expect(h.state[1]).toBe('admission-unavailable'));
+  const tree=render();
+  expect(nodes(tree).some(n=>n.props['data-s']==='needs-repair')).toBe(false);
+  expect(nodes(tree).filter(n=>typeof n.props.onClick==='function').map(n=>text(n.props.children))).not.toContain('helper.repairAction');
+  expect(helperApi.install).not.toHaveBeenCalled();
+  if(admission==='UnsupportedCapability') {
+    click('settings.about.checkUpdate');
+    const {useNavStore}=await import('@/store/nav-store');
+    expect(useNavStore.getState().settingsScreen).toBe('update');
+  } else {
+    expect(nodes(tree).filter(n=>typeof n.props.onClick==='function').map(n=>text(n.props.children))).not.toContain('settings.about.checkUpdate');
+  }
+});
+
+it.each([
+  ['installed', false, 'cancelled', 'helper.recoveryPartial'],
+  ['unsupported', true, undefined, 'helper.recoveryUserUnsupported'],
+  ['pending', false, 'recoveryRequired', 'helper.recoveryPending'],
+] as const)('explicit offline restore reports user target %s independently from helper result', async (user, helperComplete, errorCode, message) => {
+  await mounted(installed);
+  vi.mocked(helperApi.install).mockResolvedValue({ success: helperComplete, status: installed, errorCode, recovery: { user, helperComplete } } as never);
+  click('helper.restoreOfflineAction');
+  await vi.waitFor(() => expect(helperApi.install).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(text(render())).toContain(message));
+  expect(helperApi.uninstall).not.toHaveBeenCalled();
+});
+
+it('later source rejection does not erase a previously reported independent user-target result', async () => {
+  await mounted(installed);
+  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, status: installed, errorCode: 'cancelled', recovery: { user: 'installed', helperComplete: false } } as never);
+  click('helper.restoreOfflineAction');
+  await vi.waitFor(() => expect(text(render())).toContain('helper.recoveryPartial'));
+  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, status: installed, errorCode: 'bundleMismatch' } as never);
+  click('helper.restoreOfflineAction');
+  await vi.waitFor(() => expect(helperApi.install).toHaveBeenCalledTimes(2));
+  expect(text(render())).toContain('helper.recoveryPartial');
+});

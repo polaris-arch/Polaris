@@ -850,28 +850,6 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     // Package acceptance modules use Python import identifiers and unittest test_* discovery.
     // Include the four simple-name siblings too so their exact CPython caches
     // are recognized without admitting caches of any unregistered source.
-    "scripts/package-acceptance/fixtures.py",
-    "scripts/package-acceptance/linux.py",
-    "scripts/package-acceptance/tooling.py",
-    "scripts/package-acceptance/tun.py",
-    "scripts/package-acceptance/diagnostic_scope.py",
-    "scripts/package-acceptance/helper_observation.py",
-    "scripts/package-acceptance/linux_tun.py",
-    "scripts/package-acceptance/root_controller.py",
-    "scripts/package-acceptance/test_diagnostic_scope.py",
-    "scripts/package-acceptance/test_fixtures.py",
-    "scripts/package-acceptance/test_helper_observation.py",
-    "scripts/package-acceptance/test_linux.py",
-    "scripts/package-acceptance/test_linux_tun.py",
-    "scripts/package-acceptance/test_root_controller.py",
-    "scripts/package-acceptance/test_tooling.py",
-    "scripts/package-acceptance/test_transport_archive.py",
-    "scripts/package-acceptance/test_tun.py",
-    "scripts/package-acceptance/transport_archive.py",
-    "scripts/package-acceptance/tun_fixtures.py",
-    // Shared VM evidence module: loaded by the regression suite and named in its
-    // own source-provenance inventory. Preserve that stable path, not a wildcard.
-    "scripts/vm-acceptance/evidence_guard.py",
     "scripts/mobile-core/test_producer.py",
     "scripts/mobile-core/apple_rust.py",
     "scripts/mobile-core/apple_tls_fingerprint.py",
@@ -926,7 +904,7 @@ fn is_registered_python_bytecode(rel: &str) -> bool {
 #[test]
 fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
     assert!(is_registered_python_bytecode(
-        "scripts/package-acceptance/__pycache__/test_linux.cpython-312.pyc"
+        "scripts/mobile-core/__pycache__/test_native_inputs.cpython-312.pyc"
     ));
     for path in [
         "scripts/package-acceptance/__pycache__/unregistered_module.py",
@@ -939,7 +917,7 @@ fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
     }
 
     assert!(registered_python_module(
-        "scripts/vm-acceptance/evidence_guard.py"
+        "scripts/mobile-core/test_source_policy.py"
     ));
     assert!(registered_python_module(
         "scripts/mobile-core/test_native_inputs.py"

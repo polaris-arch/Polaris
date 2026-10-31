@@ -1176,3 +1176,130 @@ fn import_finalization_validates_only_emitted_modeled_pins() {
 }
 
 mod import_parity;
+
+#[test]
+fn snell_v4_tls_yaml_json_and_invalid_shapes_have_explicit_accounting() {
+    use crate::singbox_import::ImportOrigin;
+    for mode in ["http", "tls"] {
+        for host in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("Cover.Example"),
+        ] {
+            let raw = serde_json::json!([{"name":"SN", "type":"snell", "server":"s.example",
+                "port":443,"psk":"part1:part2+secret","version":4,"obfs-opts":{"mode":mode,"host":host}}]);
+            let value: Value = serde_yaml::from_str(&raw.to_string()).unwrap();
+            for text in [raw.to_string(), serde_yaml::to_string(&value).unwrap()] {
+                let proxies: Value = serde_yaml::from_str(&text).unwrap();
+                for origin in [ImportOrigin::LocalFile, ImportOrigin::RemoteSubscription] {
+                    let r = parse_clash_proxies_with_origin(
+                        &proxies,
+                        "sub",
+                        "now",
+                        &mut new_uuid(),
+                        origin,
+                    );
+                    assert_eq!((r.servers.len(), r.skipped, r.failed), (1, 0, 0));
+                    let node = &r.servers[0];
+                    assert_eq!(node.password.as_deref(), Some("part1:part2+secret"));
+                    let sn = node.snell_settings.as_deref().unwrap();
+                    assert_eq!(sn.obfs_mode.as_deref(), Some(mode));
+                    assert_eq!(
+                        sn.obfs_host.as_deref(),
+                        host.as_str().filter(|h| !h.is_empty())
+                    );
+                    assert!(node.tls_settings.is_none());
+                }
+            }
+        }
+    }
+    for (patch, reason) in [
+        (serde_json::json!({"obfs-opts":true}), "invalid-options"),
+        (serde_json::json!({"obfs-opts":{"mode":7}}), "invalid-mode"),
+        (serde_json::json!({"obfs-opts":{"mode":"bogus"}}), "bogus"),
+        (
+            serde_json::json!({"obfs-opts":{"mode":"tls","host":7}}),
+            "invalid-host",
+        ),
+        (
+            serde_json::json!({"obfs-opts":{"mode":"http","host":[]}}),
+            "invalid-host",
+        ),
+        (
+            serde_json::json!({"version":6,"obfs-opts":{"mode":"http"}}),
+            "http",
+        ),
+        (
+            serde_json::json!({"version":6,"obfs-opts":{"mode":"tls"}}),
+            "tls",
+        ),
+    ] {
+        let mut raw = serde_json::json!({"name":"bad","type":"snell","server":"s.example",
+            "port":443,"psk":"pw","version":4});
+        raw.as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        let r = parse_one(&serde_json::json!([raw]).to_string());
+        assert_eq!((r.servers.len(), r.skipped, r.failed), (0, 1, 0));
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains(&format!("snell-obfs:{reason}"))),
+            "{:?}",
+            r.warnings
+        );
+    }
+}
+
+#[test]
+fn snell_clash_defaults_inactive_hosts_and_v6_modes_are_not_upgraded() {
+    for version in [None, Some(1), Some(2), Some(3), Some(5), Some(7)] {
+        let mut node = serde_json::json!({"name":"old","type":"snell","server":"s.example","port":443,"psk":"pw"});
+        if let Some(version) = version {
+            node["version"] = serde_json::json!(version);
+        }
+        let r = parse_one(&serde_json::json!([node]).to_string());
+        assert_eq!((r.servers.len(), r.skipped, r.failed), (0, 1, 0));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains(&format!("snell-v{}", version.unwrap_or(1)))));
+    }
+    for version in [serde_json::json!("bad"), serde_json::json!("")] {
+        let r = parse_one(
+            &serde_json::json!([{"name":"old","type":"snell","server":"s.example",
+            "port":443,"psk":"pw","version":version}])
+            .to_string(),
+        );
+        assert_eq!((r.servers.len(), r.skipped, r.failed), (0, 1, 0));
+    }
+    for version in [4, 6] {
+        for opts in [
+            serde_json::json!(null),
+            serde_json::json!({"host":"inactive.example"}),
+            serde_json::json!({"mode":"","host":7}),
+            serde_json::json!({"mode":"none","host":"inactive.example"}),
+        ] {
+            let r = parse_one(
+                &serde_json::json!([{"name":"SN","type":"snell","server":"s.example",
+                "port":443,"psk":"pw","version":version,"obfs-opts":opts}])
+                .to_string(),
+            );
+            let sn = r.servers[0].snell_settings.as_deref().unwrap();
+            assert_eq!(sn.version, version);
+            assert!(sn.obfs_mode.is_none() && sn.obfs_host.is_none());
+        }
+    }
+    for psk in [
+        serde_json::json!(null),
+        serde_json::json!(""),
+        serde_json::json!("  "),
+    ] {
+        let r = parse_one(
+            &serde_json::json!([{"name":"SN","type":"snell","server":"s.example",
+            "port":443,"psk":psk,"version":4}])
+            .to_string(),
+        );
+        assert_eq!((r.servers.len(), r.skipped, r.failed), (0, 0, 1));
+    }
+}

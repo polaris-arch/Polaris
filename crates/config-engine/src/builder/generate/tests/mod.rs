@@ -685,20 +685,19 @@ fn config_with_ts_control_url(control_url: &str) -> UserConfig {
 /// **拦截必须发生在「下发到核」之前** —— 这条钉的是发射面，不是谓词。
 ///
 /// `control_url.rs` 的单测只证明「谓词判得对」；就算谓词全绿，只要 `outbounds.rs` 里那段 gate
-/// 没接上，坏 endpoint 照样会进 `config.endpoints` 被写进磁盘配置、交给内核去 panic。
+/// 没接上，坏 endpoint 照样会进 `config.endpoints` 被写进磁盘配置。
 /// 故这里断言的是**最终产物**：endpoints 里不得出现该节点，且 `invalid_nodes` 要带对成因。
 ///
-/// **变异实测（真跑过）**：把 `outbounds.rs` 里 Tailscale 分支那段 `if let Some(reject) = …
-/// { … continue; }` 整段删掉 ⇒ 本测转红（endpoints 里冒出 `control_url` 为 IP 的 endpoint，
-/// 且 `invalid_nodes` 为空）。
 #[test]
-fn ip_literal_control_url_never_reaches_generated_endpoints() {
+fn unsupported_control_url_never_reaches_generated_endpoints() {
     for (url, want_token) in [
-        ("http://192.168.1.10:8080", "control-url-ip"),
-        ("https://127.0.0.1:39824", "control-url-ip"),
-        ("http://[fd7a:115c:a1e0::1]:8080", "control-url-ip"),
+        ("http://192.168.001.010:8080", "control-url-ip"),
+        ("http://[192.168.1.10]:8080", "control-url-ip"),
+        ("http://[fe80::1%25eth0]:8080", "control-url-ip"),
         ("hs.example.com", "control-url-scheme"),
         ("http://:8080", "control-url-invalid"),
+        ("http://[::1", "control-url-invalid"),
+        ("http://fd7a::1", "control-url-invalid"),
     ] {
         let cfg = config_with_ts_control_url(url);
         let out = generate_sing_box_config_with_report(&cfg, &BTreeMap::new(), &deps_default())
@@ -731,16 +730,17 @@ fn ip_literal_control_url_never_reaches_generated_endpoints() {
     }
 }
 
-/// **阴性对照**：域名形式的 `control_url` 必须照常下发。
+/// 规范 IP 与原有域名都必须实际到达生成产物，且不落 invalid_nodes。
 ///
 /// 没有这条，把 gate 写成「所有 Tailscale 节点一律剔除」也能让上面那条全绿 —— 那样的门
-/// 只是把 panic 换成了「Tailscale 永远用不了」。`localhost` 明确在**放行**侧（实测 check 通过）。
-///
-/// **变异实测（真跑过）**：把 `tailscale_control_url_reject` 改成恒 `Some(IpLiteral)`
-/// ⇒ 本测转红（endpoints 为空），而上面那条阳性测试仍全绿。
+/// 只是让 Tailscale 永远用不了。此处走真实生成入口，不代签新内核/native 联测。
 #[test]
-fn domain_control_url_still_reaches_generated_endpoints() {
+fn supported_ip_and_domain_control_urls_reach_generated_endpoints() {
     for url in [
+        "http://192.0.2.1:8080",
+        "https://127.0.0.1:39824",
+        "http://[2001:db8::1]:8080",
+        "http://[::ffff:192.0.2.1]:8080",
         "https://hs.example.com",
         "http://localhost:8080",
         "https://controlplane.tailscale.com",
@@ -757,6 +757,28 @@ fn domain_control_url_still_reaches_generated_endpoints() {
             !out.invalid_nodes.iter().any(|n| n.id == "ts1"),
             "合法 control_url={url} 被误记进 invalid_nodes"
         );
+    }
+}
+
+/// Selected TS exercises selector admission as well as endpoint emission;
+/// serialize/round-trip the user config before generation, retaining the literal URL.
+#[test]
+fn selected_ip_control_url_survives_config_round_trip_and_generation() {
+    for url in ["http://192.0.2.1:8080", "https://[2001:db8::1]:8443"] {
+        let mut cfg = config_with_ts_control_url(url);
+        cfg.selected_server_id = Some("ts1".into());
+        let saved = serde_json::to_value(&cfg).unwrap();
+        let restored: UserConfig = serde_json::from_value(saved).unwrap();
+        let out =
+            generate_sing_box_config_with_report(&restored, &BTreeMap::new(), &deps_default())
+                .expect("规范 IP 控制面的选中 TS 节点应能生成");
+        assert!(!out.invalid_nodes.iter().any(|node| node.id == "ts1"));
+        let emitted = serde_json::to_value(&out.config).unwrap();
+        assert!(emitted["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|endpoint| endpoint["control_url"].as_str() == Some(url)));
     }
 }
 

@@ -253,6 +253,7 @@ pub(crate) fn binary_digest(path: &Path) -> Result<String, String> {
 /// device/inode/ctime, not just mtime.
 #[derive(Clone, Debug)]
 pub(crate) struct CliObservation {
+    admission: CliAdmission,
     pub snapshot: Snapshot,
     path: std::path::PathBuf,
     file: std::sync::Arc<std::fs::File>,
@@ -261,6 +262,39 @@ pub(crate) struct CliObservation {
     retry_at: Option<std::time::Instant>,
     #[cfg(windows)]
     file_id: (u64, [u8; 16]),
+}
+
+#[derive(Clone, Debug)]
+enum CliAdmission {
+    Selected(std::sync::Arc<crate::runtime::core_identity::AdmittedPayload>),
+    // App business/custody fixtures carry observations only. They cannot
+    // create PreparedExecution or reach any real native query factory.
+    #[cfg(test)]
+    ObservationFixture,
+}
+impl CliAdmission {
+    fn current(&self) -> bool {
+        match self {
+            Self::Selected(payload) => payload.is_current(),
+            #[cfg(test)]
+            Self::ObservationFixture => true,
+        }
+    }
+    fn inventory_execution(
+        &self,
+    ) -> Result<crate::runtime::core_identity::PreparedExecution, String> {
+        match self {
+            Self::Selected(payload) => crate::runtime::core_identity::prepare_admitted(
+                payload,
+                crate::runtime::core_identity::ExecPurpose::TlsInventory,
+            )
+            .map_err(|e| e.to_string()),
+            #[cfg(test)]
+            Self::ObservationFixture => {
+                Err("Business observation fixture has no execution admission".into())
+            }
+        }
+    }
 }
 
 fn file_stamp(metadata: &std::fs::Metadata) -> String {
@@ -303,7 +337,8 @@ impl CliObservation {
         {
             return false;
         }
-        path == self.path
+        self.admission.current()
+            && path == self.path
             && self
                 .file
                 .metadata()
@@ -336,9 +371,40 @@ impl CliProbeCache {
             .find(|entry| entry.matches(path))
             .cloned()
     }
+    fn record(&self, entry: CliObservation) {
+        if let Ok(mut cache) = self.entries.lock() {
+            cache.retain(|old| old.path != entry.path);
+            if cache.len() >= 4 {
+                cache.remove(0);
+            }
+            cache.push(entry);
+        }
+    }
 }
 static CLI_CACHE: CliProbeCache = CliProbeCache::new();
 const TRANSIENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// App-only business fixture. It can populate a measurement/cache observation,
+/// but inventory_execution rejects it before the real native factory.
+#[cfg(test)]
+pub(crate) fn cache_fixture_observation(path: &Path) -> CliObservation {
+    let file = std::fs::File::open(path).unwrap();
+    let mut snapshot = Snapshot::unavailable("Business observation fixture");
+    snapshot.binary_sha256 = Some(binary_digest(path).unwrap());
+    snapshot.byte_identity_scope = "cli-executable".into();
+    let entry = CliObservation {
+        admission: CliAdmission::ObservationFixture,
+        snapshot,
+        path: path.into(),
+        stamp: file_stamp(&file.metadata().unwrap()),
+        #[cfg(windows)]
+        file_id: crate::windows_file_id::identity(&file).unwrap(),
+        file: std::sync::Arc::new(file),
+        retry_at: None,
+    };
+    CLI_CACHE.record(entry.clone());
+    entry
+}
 
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn cached_cli(path: &Path) -> Option<CliObservation> {
@@ -357,16 +423,19 @@ async fn open_observation(path: &Path) -> Result<CliObservation, String> {
         }
         let file = options.open(&path).map_err(|e| e.to_string())?;
         let stamp = file_stamp(&file.metadata().map_err(|e| e.to_string())?);
-        let digest = polaris_updater::verify::sha256_reader_hex(
-            file.try_clone().map_err(|e| e.to_string())?,
+        let admitted = crate::runtime::core_identity::acquire_at(
+            &path,
+            crate::runtime::core_identity::ExecPurpose::TlsInventory,
         )
         .map_err(|e| e.to_string())?;
+        let digest = admitted.binary_sha256().to_owned();
         let mut snapshot = Snapshot::unavailable("Core has no TLS capability report");
         snapshot.binary_sha256 = Some(digest);
         snapshot.byte_identity_scope = "cli-executable".into();
         #[cfg(windows)]
         let file_id = crate::windows_file_id::identity(&file).map_err(|e| e.to_string())?;
         let entry = CliObservation {
+            admission: CliAdmission::Selected(admitted),
             snapshot,
             path,
             file: std::sync::Arc::new(file),
@@ -474,13 +543,7 @@ impl CliProbeCache {
                 "Core changed during capability query",
             )));
         }
-        if let Ok(mut cache) = self.entries.lock() {
-            cache.retain(|old| old.path != path);
-            if cache.len() >= 4 {
-                cache.remove(0);
-            }
-            cache.push(entry.clone());
-        }
+        self.record(entry.clone());
         Ok(entry)
     }
 }
@@ -524,7 +587,7 @@ async fn query_observation(entry: &CliObservation) -> QueryObservation {
             .ok_or("Missing core digest")?;
         observed_digest = Some(before.clone());
         let result = polaris_core_supervisor::run_tls_fingerprint_query(
-            path,
+            entry.admission.inventory_execution()?,
             std::time::Duration::from_secs(5),
         )
         .await

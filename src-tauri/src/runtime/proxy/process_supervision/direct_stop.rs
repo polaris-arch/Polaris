@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use tokio::process::Child;
+use crate::runtime::core_child::Child;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 

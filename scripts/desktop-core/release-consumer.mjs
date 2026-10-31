@@ -1,15 +1,20 @@
 // Explicit release acquisition for build resources. Never executes target code.
+import { rejectLocalDistribution } from './local-development.mjs';
 import { hasTemporaryDesktop, loadTemporaryDesktopSelection, verifyCandidatePayload } from './native-dns-candidate.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
 import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync,
-  openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+  openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, constants, fstatSync,
+  opendirSync, readSync, realpathSync, rmdirSync, statfsSync, unlinkSync, writeSync } from 'node:fs';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature, verifyMacCodeSignatureReceipt,
   kernelRepositoryIdentity, releaseGoVersion, upstreamSourceGoVersion, requireGraph as demand } from './source-graph.mjs';
 import { isUpstreamRelease, isUpstreamRow, validateUpstreamContract, validateUpstreamRow, validateUpstreamIndex,
   upstreamMetadata, upstreamPayloadPins, contractPublicAssets, hasCommittedReleaseMaterials, validatePublishedUpstreamReadback, readUpstreamSourceEvidence } from './upstream-release.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
+import { RECOVERY_RESOURCE, stageRecoveryResource, verifyRecoveryResource } from './recovery.mjs';
 
 const REPO = 'polaris-arch/polaris-box';
 // v1 remains the historical archive/provenance contract. New upstream-layout
@@ -26,6 +31,26 @@ const POLICY = 'preserve measured original bytes; ad-hoc/not-signed observations
 // Local inspection must fail closed before the outer gate deadline; no retries or target execution.
 const LOCAL_METADATA_TIMEOUT_MS = 60_000;
 const LOCAL_ARCHIVE_TIMEOUT_MS = 120_000;
+// Cold acquisition stays inside consumeRelease's acquiring transaction. Child
+// failures must return to its finally, without logging input, paths or raw errors.
+function runColdArchive(run, stage, args, input) {
+  const started = performance.now();
+  try {
+    return run(process.platform === 'win32' ? 'python' : 'python3', args,
+      { input, encoding: 'utf8', maxBuffer: 1024 * 1024,
+        timeout: LOCAL_ARCHIVE_TIMEOUT_MS, killSignal: 'SIGKILL' });
+  } catch (error) {
+    const code = ['ETIMEDOUT', 'ENOBUFS', 'ENOENT', 'EACCES', 'EINTR', 'ENOMEM', 'ENOEXEC'].includes(error?.code) ? error.code : 'unknown';
+    const status = Number.isInteger(error?.status) && error.status >= 0 && error.status <= 255 ? error.status : 'unknown';
+    const signal = ['SIGKILL', 'SIGTERM', 'SIGABRT', 'SIGSEGV', 'SIGBUS', 'SIGINT', 'SIGPIPE', 'SIGHUP', 'SIGQUIT', 'SIGILL', 'SIGFPE', 'SIGXCPU', 'SIGXFSZ', 'SIGSYS'].includes(error?.signal) ? error.signal : 'unknown';
+    const stderr = typeof error?.stderr === 'string' ? error.stderr.slice(-4096)
+      : Buffer.isBuffer(error?.stderr) ? error.stderr.subarray(-4096).toString('utf8') : '';
+    const progress = [...stderr.matchAll(/^SOURCE_ARCHIVE_PROOF stage=(stdin-start|stdin-read|request-decoded|source-start|archive-hash-verified|archive-expanded|legal-inventory-verified|archive-members-verified|tree-verified|source-policy-verified|complete) elapsed_ms=([0-9]{1,12})\r?$/gm)].at(-1);
+    // No raw cause: Node's default error rendering would print its captured
+    // stderr, command and request even when the outer message is bounded.
+    throw new Error(`Release archive failed (stage=${stage}; elapsedMs=${Math.round(performance.now() - started)}; timeoutMs=${LOCAL_ARCHIVE_TIMEOUT_MS}; code=${code}; status=${status}; signal=${signal}; progress=${progress ? `${progress[1]}@${progress[2]}ms` : 'unknown'})`);
+  }
+}
 const CONTRACT_PATH = 'scripts/desktop-core/release-contract.json';
 const PENDING_CONTRACT_PATH = 'scripts/desktop-core/pending-release-contract.json';
 const PROVIDER_FILES = ['scripts/polaris_production_release.py', 'scripts/polaris_native_candidate.py',
@@ -37,7 +62,7 @@ export const RELEASE_TARGETS = Object.freeze({
   'mac-x64': { os: 'darwin', arch: 'amd64', core: 'sing-box', sidecar: null, suffix: '.tar.gz', cgo: '1' },
   'mac-arm64': { os: 'darwin', arch: 'arm64', core: 'sing-box', sidecar: null, suffix: '.tar.gz', cgo: '1' },
 });
-export const ADAPTER_FILES = ['scripts/desktop-core/native-dns-candidate.mjs', 'scripts/desktop-core/native-dns-candidate.json',
+export const ADAPTER_FILES = ['scripts/desktop-core/local-development.mjs', 'scripts/desktop-core/recovery.mjs', 'scripts/desktop-core/native-dns-candidate.mjs', 'scripts/desktop-core/native-dns-candidate.json',
   'scripts/desktop-core/native-dns-source-binding.json', 'scripts/desktop-core/validation-origin.mjs',
   'scripts/desktop-core/native-dns-gates.mjs',
   'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/release-archive.py', 'scripts/mobile-core/source_policy.py',
@@ -737,11 +762,11 @@ export function recoverRelease(root, options = {}) {
   const work = join(resources, journal.work); regularPath(work, true);
   if (journal.phase !== 'acquiring') {
     demand(['replacing', 'committed'].includes(journal.phase) && Array.isArray(journal.directories)
-      && journal.directories.length >= 2 && journal.directories.length <= 5
+      && journal.directories.length >= 2 && journal.directories.length <= 6
       && new Set(journal.directories.map((r) => r.key)).size === journal.directories.length
       && journal.directories.at(-1).key === '.release-receipts', 'Recovery directory inventory invalid');
     for (const row of journal.directories) {
-      demand((Object.hasOwn(RELEASE_TARGETS, row.key) || row.key === '.release-receipts')
+      demand((Object.hasOwn(RELEASE_TARGETS, row.key) || ['.release-receipts', RECOVERY_RESOURCE].includes(row.key))
         && hex(row.staged, 64) && (row.original === null || hex(row.original, 64)), 'Recovery fingerprint invalid');
       const dest = join(resources, row.key), backup = join(work, `old-${row.key}`);
       if (journal.phase === 'committed') {
@@ -778,7 +803,7 @@ function adapterIdentity(root, run) {
 function replaceDirectories(resources, work, keys, rename) {
   const completed = [];
   try {
-    for (const key of [...keys, '.release-receipts']) {
+    for (const key of [...keys, RECOVERY_RESOURCE, '.release-receipts']) {
       const dest = join(resources, key), backup = join(work, `old-${key}`), stage = join(work, 'stage', key);
       if (existsSync(dest)) { directoryTree(dest); rename(dest, backup); }
       completed.push({ dest, backup, installed: false });
@@ -793,6 +818,151 @@ function replaceDirectories(resources, work, keys, rename) {
     } catch (rollback) { throw new Error(`Release rollback failed; recovery retained at ${work}: ${rollback.message}`, { cause: error }); }
     throw error;
   }
+}
+
+// Raw transport only: no receipt, metadata, authority or validation result is cached.
+// Saturation stops new writes instead of deleting a blob another acquisition uses.
+const BLOB_CACHE_BYTES = 1024 * 1024 * 1024;
+const BLOB_CACHE_MEMBER_BYTES = 512 * 1024 * 1024; // Existing archive pin ceiling.
+const BLOB_CACHE_ENTRIES = 64;
+function releaseBlobCache(root, options) {
+  const report = (state) => { try { (options.report ?? console.error)(`Release blob cache ${state}`); } catch {} };
+  const disabled = { read: () => null, publish: () => {} };
+  // Injected transports are unit/private callers, unless they explicitly select
+  // their own cache. Every normal production entry uses the ordinary reader.
+  if (options.blobCacheDir === false || (options.read && options.blobCacheDir === undefined)) return disabled;
+  if (typeof process.getuid !== 'function' || !constants.O_NOFOLLOW) { report('unavailable'); return disabled; }
+  const uid = process.getuid(); let directory, owner;
+  const privateFile = (st) => st.isFile() && st.uid === uid && !(st.mode & 0o077) && st.nlink === 1;
+  const intactDirectory = () => {
+    const st = lstatSync(directory);
+    demand(st.isDirectory() && st.uid === uid && !(st.mode & 0o077)
+      && st.dev === owner.dev && st.ino === owner.ino, 'Blob cache directory changed');
+  };
+  try {
+    const parent = process.platform === 'darwin' ? join(homedir(), 'Library', 'Caches') : join(homedir(), '.cache');
+    const requested = options.blobCacheDir ?? join(parent, 'polaris-release-blobs-v1');
+    demand(typeof requested === 'string' && requested.length > 0, 'Invalid blob cache path');
+    // Do not create or chmod an unknown parent; the normal system cache parent
+    // must already exist. Canonicalize it before checking the complete ancestry.
+    directory = join(realpathSync(dirname(resolve(requested))), basename(resolve(requested)));
+    const source = realpathSync(root);
+    demand(directory !== source && !directory.startsWith(source + sep), 'Blob cache is inside source');
+    for (let at = dirname(directory);;) {
+      const st = lstatSync(at);
+      demand(st.isDirectory() && [0, uid].includes(st.uid)
+        && (!(st.mode & 0o022) || (st.uid === 0 && (st.mode & 0o1000))), 'Unsafe blob cache ancestor');
+      const parent = dirname(at); if (parent === at) break; at = parent;
+    }
+    try { mkdirSync(directory, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    owner = lstatSync(directory); intactDirectory();
+    // Avoid placing a transport store on an SMB/network home or source share.
+    // Unknown filesystems/platforms retain the ordinary download path.
+    const localLinux = new Set([0xef53, 0x9123683e, 0x58465342, 0x2fc12fc1, 0x01021994, 0x794c7630]);
+    demand(process.platform === 'linux' ? localLinux.has(statfsSync(directory).type)
+      : process.platform === 'darwin' && owner.dev === lstatSync('/private/var/tmp').dev,
+    'Blob cache filesystem is not a known local store');
+    demand(Number.isSafeInteger(owner.blksize) && owner.blksize >= 512 && owner.blksize <= 1024 * 1024,
+      'Blob cache allocation unit unavailable');
+  } catch { report('unavailable'); return disabled; }
+  report('ready');
+  const name = (pin) => {
+    demand(hex(pin.sha256, 64) && positive(pin.bytes) && pin.bytes <= BLOB_CACHE_MEMBER_BYTES, 'Invalid cached blob pin');
+    return `${pin.sha256}.blob`;
+  };
+  const read = (pin, returnBytes = true) => {
+    let fd;
+    try {
+      intactDirectory(); const path = join(directory, name(pin));
+      fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const before = fstatSync(fd);
+      demand(privateFile(before) && before.size === pin.bytes, 'Cached blob size/type differs');
+      const bytes = Buffer.alloc(returnBytes ? pin.bytes : Math.min(256 * 1024, pin.bytes));
+      const hash = createHash('sha256'); let offset = 0;
+      while (offset < pin.bytes) {
+        const at = returnBytes ? offset : 0;
+        const count = readSync(fd, bytes, at, Math.min(256 * 1024, pin.bytes - offset), offset);
+        demand(count > 0, 'Partial cached blob'); hash.update(bytes.subarray(at, at + count)); offset += count;
+      }
+      const after = fstatSync(fd);
+      demand(privateFile(after) && after.size === before.size && after.ino === before.ino && after.dev === before.dev
+        && after.mtimeMs === before.mtimeMs && after.ctimeMs === before.ctimeMs
+        && hash.digest('hex') === pin.sha256, 'Cached blob bytes changed');
+      intactDirectory(); return returnBytes ? bytes : true;
+    } catch { return null; } finally { if (fd !== undefined) try { closeSync(fd); } catch {} }
+  };
+  // A short atomic directory lock covers every cache read/write. Busy or stale
+  // ownership simply disables that operation; never steal another writer's lock.
+  const locked = (action) => {
+    const lock = join(directory, '.writer'); let acquired;
+    try {
+      intactDirectory(); mkdirSync(lock, { mode: 0o700 }); acquired = lstatSync(lock);
+      intactDirectory(); return action();
+    } catch { return null; } finally {
+      if (acquired) try {
+        intactDirectory(); const st = lstatSync(lock);
+        if (st.isDirectory() && st.dev === acquired.dev && st.ino === acquired.ino) rmdirSync(lock);
+      } catch {} // Cache I/O never replaces the normal consumer's result.
+    }
+  };
+  const inventory = () => {
+    const entries = []; let total = lstatSync(directory).blocks * 512 + lstatSync(join(directory, '.writer')).blocks * 512, count = 0;
+    const stream = opendirSync(directory);
+    try {
+      for (let row; (row = stream.readSync()) !== null;) {
+        demand(++count <= BLOB_CACHE_ENTRIES + 2, 'Blob cache entry bound');
+        if (row.name === '.writer') continue;
+        demand(/^[a-f0-9]{64}\.blob$/.test(row.name) || row.name === '.pending', 'Unknown blob cache entry');
+        const st = lstatSync(join(directory, row.name));
+        demand(privateFile(st) && st.size <= BLOB_CACHE_MEMBER_BYTES, 'Unsafe blob cache entry');
+        demand(Number.isSafeInteger(st.blocks) && st.blocks >= 0, 'Blob cache allocation unavailable');
+        total += Math.max(st.size, st.blocks * 512); entries.push({ name: row.name, bytes: st.size });
+      }
+    } finally { stream.closeSync(); }
+    demand(entries.length <= BLOB_CACHE_ENTRIES && total <= BLOB_CACHE_BYTES, 'Blob cache byte/entry bound');
+    return { entries, total };
+  };
+  return {
+    read(pin) {
+      const bytes = locked(() => { inventory(); return read(pin); });
+      report(bytes ? 'hit' : 'miss');
+      return bytes;
+    },
+    publish(blobs) {
+      for (const { pin, file } of blobs) {
+        const saved = locked(() => {
+          const { entries, total } = inventory(), target = name(pin), existing = entries.find((row) => row.name === target);
+          if (read(pin, false)) return true;
+          if (entries.some((row) => row.name === '.pending') || (!existing && entries.length >= BLOB_CACHE_ENTRIES)
+            || total + Math.ceil(pin.bytes / owner.blksize) * owner.blksize + 2 * owner.blksize > BLOB_CACHE_BYTES) return false;
+          let input, output, owned;
+          const temporary = join(directory, '.pending');
+          try {
+            input = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+            demand(fstatSync(input).isFile() && fstatSync(input).size === pin.bytes, 'Verified transport file differs');
+            output = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+            owned = fstatSync(output); const buffer = Buffer.alloc(256 * 1024), hash = createHash('sha256'); let size = 0;
+            for (;;) {
+              const count = readSync(input, buffer, 0, buffer.length, null); if (!count) break;
+              size += count; demand(size <= pin.bytes && size <= BLOB_CACHE_MEMBER_BYTES, 'Blob write bound');
+              hash.update(buffer.subarray(0, count)); let offset = 0;
+              while (offset < count) { const written = writeSync(output, buffer, offset, count - offset); demand(written > 0, 'Partial blob write'); offset += written; }
+            }
+            demand(size === pin.bytes && hash.digest('hex') === pin.sha256, 'Verified transport bytes changed');
+            fsyncSync(output); closeSync(output); output = undefined; intactDirectory();
+            renameSync(temporary, join(directory, target)); owned = undefined; return true;
+          } finally {
+            if (input !== undefined) closeSync(input); if (output !== undefined) closeSync(output);
+            if (owned) try {
+              intactDirectory(); const st = lstatSync(temporary);
+              if (st.dev === owned.dev && st.ino === owned.ino) unlinkSync(temporary);
+            } catch {}
+          }
+        });
+        report(saved ? 'stored' : 'write-skipped');
+      }
+    },
+  };
 }
 
 export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_TARGETS), options = {}) {
@@ -813,6 +983,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
   // returns stdout only; preserve the observer's status/stdout/stderr contract.
   const signatureRun = invoke === execFileSync ? withoutAPIToken(spawnSync) : run;
   const adapter = adapterIdentity(root, run);
+  const blobCache = releaseBlobCache(root, options), cacheWrites = [];
   const resources = join(root, 'resources'); mkdirSync(resources, { recursive: true }); regularPath(resources, true);
   const lock = join(resources, '.release-consumer.lock');
   // Exclusivity is the continuously present wx-created path, not an open
@@ -831,31 +1002,41 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     indexRows(index, contract);
     let sourceArchive;
     if (isUpstreamRelease(contract)) {
-      sourceArchive = await read(contract.sourceArchive.url, contract.sourceArchive.bytes, true);
+      sourceArchive = blobCache.read(contract.sourceArchive) ?? await read(contract.sourceArchive.url, contract.sourceArchive.bytes, true);
       demand(sourceArchive.length === contract.sourceArchive.bytes && digest(sourceArchive) === contract.sourceArchive.sha256, 'Downloaded complete source archive differs');
       // loadReleaseContract already checks legal content; send pins, then reprove tar bytes.
       const sourceFile = join(work, contract.sourceArchive.name); writeFileSync(sourceFile, sourceArchive, { flag: 'wx' });
-      run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), sourceFile, '--source-legal-pins'],
-        { input: JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
+      cacheWrites.push({ pin: contract.sourceArchive, file: sourceFile });
+      runColdArchive(run, 'source-archive-validation', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), sourceFile, '--source-legal-pins'],
+        JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
           sourceTree: contract.sourceTree, sourceGitlinks: before.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: contract.platforms.linux.sourceIdentity,
           buildReplacements: Object.values(contract.platforms).flatMap((r) => r.buildGraph.localReplacements),
-          ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
+          ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }));
     }
     const stage = join(work, 'stage'); mkdirSync(stage);
     const metadata = join(stage, '.release-receipts'); mkdirSync(metadata);
     const oldMetadata = join(resources, '.release-receipts');
     if (existsSync(oldMetadata)) { directoryTree(oldMetadata); cpSync(oldMetadata, metadata, { recursive: true }); }
+    const recovery = join(stage, RECOVERY_RESOURCE), oldRecovery = join(resources, RECOVERY_RESOURCE);
+    mkdirSync(recovery);
+    if (existsSync(oldRecovery)) { directoryTree(oldRecovery); cpSync(oldRecovery, recovery, { recursive: true }); }
     const receipts = {};
     for (const key of keys) {
       const row = contract.platforms[key], target = RELEASE_TARGETS[key];
       const archive = join(work, row.archive.name);
-      const bytes = await read(row.releaseAsset.url, row.releaseAsset.bytes, true);
+      const bytes = blobCache.read(row.releaseAsset) ?? await read(row.releaseAsset.url, row.releaseAsset.bytes, true);
       demand(bytes.length === row.releaseAsset.bytes && digest(bytes) === row.releaseAsset.sha256, 'Downloaded release archive SHA differs');
       writeFileSync(archive, bytes, { flag: 'wx' });
+      cacheWrites.push({ pin: row.releaseAsset, file: archive });
       const extracted = join(work, `unpacked-${key}`), rootName = validateRow(contract, key, row);
-      run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, extracted],
-        { input: JSON.stringify({ archive: row.archive, root: rootName, target: row.target }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      runColdArchive(run, 'native-archive-extraction', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, extracted],
+        JSON.stringify({ archive: row.archive, root: rootName, target: row.target }));
       const source = verifyExtracted(extracted, rootName, row, key, run, options.host ?? process.platform, signatureRun, contract);
+      // Preserve the exact published compression container in a separate
+      // resource namespace. It commits/rolls back with this same acquisition.
+      const recoveryTarget = join(recovery, key);
+      if (existsSync(recoveryTarget)) rmSync(recoveryTarget, { recursive: true });
+      stageRecoveryResource(recoveryTarget, row, key, manifest.desktopRelease.contractSha256, archive, source);
       const dest = join(stage, key); mkdirSync(dest);
       const existing = join(resources, key);
       if (existsSync(existing)) { directoryTree(existing); cpSync(existing, dest, { recursive: true }); }
@@ -881,7 +1062,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     const after = await publicSnapshot(contract, read); same(after, before, 'Release identity changed during acquisition');
     writeFileSync(join(metadata, 'public-readback.json'), JSON.stringify({ schema: 'polaris-app-release-readback-v1', contractSha256: manifest.desktopRelease.contractSha256, before, after }, null, 2) + '\n', { mode: 0o600 });
     writeFileSync(join(metadata, contract.assetIndex.name), index, { mode: 0o600 });
-    journal.phase = 'replacing'; journal.directories = [...keys, '.release-receipts'].map((key) => ({ key,
+    journal.phase = 'replacing'; journal.directories = [...keys, RECOVERY_RESOURCE, '.release-receipts'].map((key) => ({ key,
       original: existsSync(join(resources, key)) ? directoryFingerprint(join(resources, key)) : null,
       staged: directoryFingerprint(join(stage, key)) }));
     saveJournal(lock, work, journal);
@@ -889,6 +1070,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       replaceDirectories(resources, work, keys, options.rename ?? renameSync); replaced = true;
       journal.phase = 'committed'; saveJournal(lock, work, journal);
     } catch (e) { if (replaced || e.message.startsWith('Release rollback failed;')) preserve = true; throw e; }
+    blobCache.publish(cacheWrites);
     return receipts;
   } finally {
     if (!preserve) rmSync(lock);
@@ -897,6 +1079,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
 }
 
 export function verifyPackagedRelease(root, manifest, key, core, run = execFileSync, host = process.platform) {
+  rejectLocalDistribution(root, dirname(core));
   demand(Object.hasOwn(RELEASE_TARGETS, key), 'Unknown App target');
   demand(!existsSync(join(root, 'resources/.release-consumer.lock')), 'Release acquisition/recovery still pending');
   const contract = loadReleaseContract(root, manifest), row = contract.platforms[key];
@@ -934,6 +1117,8 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
       && (lstatSync(lib).mode & 0o7777) === (lstatSync(original).mode & 0o7777), 'Final release library permissions differ');
   } else demand(!readdirSync(dirname(core)).some((n) => /^libcronet\.(so|dll|dylib)$/.test(n)), 'Static carrier contains Cronet sidecar');
   const prefix = validateRow(contract, key, row) + '/';
+  verifyRecoveryResource(join(root, 'resources', RECOVERY_RESOURCE, key), row, key,
+    manifest.desktopRelease.contractSha256, dirname(source));
   const payloadPins = isUpstreamRelease(contract) ? upstreamPayloadPins(contract, row)
     : Object.fromEntries(Object.entries(row.archive.members).map(([name, hash]) => [name.slice(prefix.length), hash]));
   for (const [relative, sha256] of Object.entries(payloadPins)) {
@@ -970,7 +1155,15 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
 export function verifyMacPackagedCore(root, manifest, key, binary, run = execFileSync) {
   demand(key === 'mac-x64' || key === 'mac-arm64', 'Mac packaged core requires a Mac target');
   if (hasTemporaryDesktop(manifest)) { loadTemporaryDesktopSelection(root, manifest); return verifyCandidatePayload(root, key, binary, run); }
-  if (hasDesktopRelease(manifest)) return verifyPackagedRelease(root, manifest, key, binary, run, 'darwin');
+  if (hasDesktopRelease(manifest)) {
+    const receipt = verifyPackagedRelease(root, manifest, key, binary, run, 'darwin');
+    const contract = loadReleaseContract(root, manifest);
+    // A valid outer bundle seal can cover a damaged copy made before sealing.
+    // Reprove the delivered recovery bytes, not only the acquisition directory.
+    verifyRecoveryResource(join(dirname(dirname(binary)), RECOVERY_RESOURCE, key),
+      contract.platforms[key], key, manifest.desktopRelease.contractSha256, dirname(binary));
+    return receipt;
+  }
   const path = join(root, 'resources/.source-receipts', `${key}.json`); regularPath(path);
   const receipt = json(path); verifyMacCodeSignatureReceipt(binary, receipt, key, run === execFileSync ? undefined : run);
   return receipt;

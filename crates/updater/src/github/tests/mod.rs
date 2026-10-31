@@ -1,5 +1,7 @@
 use super::*;
 
+mod release_selection;
+
 fn asset(name: &str, size: u64) -> GithubAsset {
     GithubAsset {
         name: name.to_string(),
@@ -404,7 +406,7 @@ fn check_app_update_no_update_when_current_is_latest() {
 }
 
 #[test]
-fn resolve_current_app_release_returns_only_the_same_channel_latest() {
+fn resolve_current_app_release_requires_a_matching_version_and_asset() {
     let json = sample_releases_json();
     let current = resolve_current_app_release(
         &json,
@@ -428,7 +430,7 @@ fn resolve_current_app_release_returns_only_the_same_channel_latest() {
     .unwrap();
     assert_eq!(older, AppUpdateCheck::NoUpdate, "不得借重装入口降级");
 
-    let newer = resolve_current_app_release(
+    let missing_asset = resolve_current_app_release(
         &json,
         "0.1.0",
         false,
@@ -438,9 +440,9 @@ fn resolve_current_app_release_returns_only_the_same_channel_latest() {
     )
     .unwrap();
     assert_eq!(
-        newer,
+        missing_asset,
         AppUpdateCheck::NoUpdate,
-        "真正的新版本应走普通更新入口"
+        "当前版本没有安装包时不得改选其他版本的资产"
     );
 }
 

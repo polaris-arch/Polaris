@@ -1,67 +1,13 @@
-//! Tailscale `control_url` 前置校验 —— 内核 panic 的**唯一判据源**。
+//! Tailscale `control_url` 的本地格式策略，与前端 `domain/control-url.ts` 同步。
 //!
-//! # 为什么需要这道校验（上游机制，2026-07-31 实测 + 读源码确认）
+//! 已核验的 Polaris alpha.12.6 (`bfcdf96b...`) 的 legacy constructor 固定以
+//! `RemoteIsDomain: true, ResolverOnDetour: true` 创建 resolver wrapper；physical 路径使用
+//! runtime dialer，binding 则检查 `ResolveDialer` 断言。旧“IP host 必 panic”依据已不成立。
+//! resolver wrapper 将 IP destination 直接下放，不要求把控制面伪装成域名。
 //!
-//! sing-box `protocol/tailscale/endpoint.go::NewEndpoint` 里有一处**无条件类型断言**：
-//!
-//! ```text
-//! // v1.14.0-beta.3 endpoint.go:174-195
-//! var remoteIsDomain bool
-//! if options.ControlURL != "" {
-//!     controlURL, err := url.Parse(options.ControlURL)
-//!     if err != nil { return nil, E.Cause(err, "parse control URL") }
-//!     remoteIsDomain = M.ParseSocksaddr(controlURL.Hostname()).IsDomain()
-//! } else {
-//!     remoteIsDomain = true
-//! }
-//! outboundDialer, err := dialer.NewWithOptions(dialer.Options{
-//!     ..., RemoteIsDomain: remoteIsDomain, ResolverOnDetour: true, NewDialer: true,
-//! })
-//! dialerQueryOptions := outboundDialer.(dialer.ResolveDialer).QueryOptions()   // ← :195 断言
-//! ```
-//!
-//! 而 `common/dialer/dialer.go:65` 决定「拨号器要不要被包成 `ResolveDialer`」的那道门是：
-//!
-//! ```text
-//! if options.RemoteIsDomain && ( !hasDetour || options.ResolverOnDetour || <domain_resolver 非空> ) {
-//!     ... dialer = NewResolveDialer(...)   // 只有进了这里，断言才成立
-//! }
-//! ```
-//!
-//! `RemoteIsDomain` 是**合取式的第一项**：它为 false 时整个条件短路，右边三项（含
-//! `domain_resolver` 是否配了）一个都不会被求值。于是：
-//!
-//! - `control_url` 的 host 是**域名** → `remoteIsDomain = true` → 包成 `resolveDialer` → 断言成立；
-//! - `control_url` 的 host 是 **IP 字面量或为空** → `remoteIsDomain = false` → 拨号器停在
-//!   `*dialer.DefaultDialer`（有 detour 时是 `*dialer.DetourDialer`）→ **:195 断言直接 panic**：
-//!   `interface conversion: *dialer.DefaultDialer is not dialer.ResolveDialer: missing method QueryOptions`
-//!
-//! 这条合取顺序也解释了为什么**补 `domain_resolver` 治不好**（已实测证否）：它是被短路掉的那一项。
-//!
-//! # 判据 = 「host 不是域名」，比「host 是 IP」更宽
-//!
-//! `M.Socksaddr::IsDomain()` 在 host 为**空串**时同样返回 false。而 Go 的 `url.Parse` 对
-//! **不带 scheme** 的输入（`hs.example.com`、`not-a-url`）解析成功但 `Host` 为空 ⇒ 同样 panic。
-//! 也就是说少打一个 `https://` 与填 IP 是**同一个 panic**，且前者是远更常见的手滑。
-//!
-//! 本模块因此把三类都拦下：IP 字面量 / 缺 scheme / host 缺失或畸形。
-//!
-//! # 与上游判据的两处**刻意**偏严（下面的单测逐条钉住）
-//!
-//! 1. **前导零点分四段**（`192.168.001.010`）：Go `netip.ParseAddr` 拒前导零 ⇒ 上游当域名、不 panic。
-//!    但它也绝不可能解析成功（DNS 查 "192.168.001.010" 必 NXDOMAIN）——用户意图显然是 IP。
-//!    判成 [`ControlUrlReject::IpLiteral`] 让他拿到「要填域名」这句可行动的话，好过让核悄悄连不上。
-//! 2. **裸 IPv6 / 方括号里塞 IPv4**（`http://fd7a::1`、`http://[192.168.1.10]:8080`）：上游一个当域名放行、
-//!    一个 `parse control URL` 报错（FATAL 而非 panic）。两者都不是能用的地址，本模块一律拒。
-//!
-//! 偏严只会多拦「本来也不工作」的写法，不会拦住任何**能工作**的域名写法（阴性对照见单测
-//! `domain_forms_never_rejected`：`localhost` 明确归**合法**侧——上游 `IsDomain()` 判它是域名，
-//! 实测 `sing-box check` 通过）。
-//!
-//! # 射程自曝
-//!
-//! 判据来自 `sing-box check`（构造期）——`NewEndpoint` 在 check 与 run 里是同一条代码路径，故 panic 与否
-//! 两边一致；但**「不 panic」不等于「连得上」**：控制面可达性、证书、headscale 版本兼容一概不在本模块射程内。
+//! 本策略允许四段 IPv4、正确方括号 IPv6（含 v4-mapped）；前导零 IPv4、括号 IPv4、裸 IPv6、
+//! URI-zone 仍沿原拒绝边界。缺 scheme/host、畸形 URL 仍在生成前剔除，原域名/userinfo/scheme
+//! 处理不变。此处不改 DNS/SNI/CA，也不保证控制面可达、TLS 证书匹配或账户授权成功。
 
 #![forbid(unsafe_code)]
 
@@ -71,13 +17,13 @@ use crate::user_config::ip::{is_ip_literal, strip_brackets};
 /// 故枚举项的语义不得复用（要新增成因就加新项，别把旧项的含义改掉）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlUrlReject {
-    /// host 是 IP 字面量（v4 / v6 / 带 zone / 方括号形式）→ 内核 `endpoint.go:195` panic。
+    /// 未受本策略支持的 IP 写法；保留原稳定 token，规范 IPv4 / IPv6 不再返回它。
     IpLiteral,
-    /// 缺 `scheme://` → Go `url.Parse` 得到空 Host → 同一处 panic。
+    /// 缺合法的 `scheme://`。
     MissingScheme,
-    /// 有 scheme 但 host 为空（`http://`、`http://:8080`）→ 同一处 panic。
+    /// 有 scheme 但 host 为空（`http://`、`http://:8080`）。
     NoHost,
-    /// host 畸形（裸 IPv6、方括号不配平、内嵌空白等）→ 内核 `parse control URL` FATAL 或 panic。
+    /// host 畸形（裸 IPv6、方括号不配平、内嵌空白等）。
     Malformed,
 }
 
@@ -93,14 +39,8 @@ pub fn reject_token(reject: ControlUrlReject) -> &'static str {
     }
 }
 
-/// host 是否 IP 字面量（内核 `M.ParseSocksaddr(...).IsDomain() == false` 的 IP 那一半）。
-///
-/// 取**并集**而非只用一种解析：
-/// - `is_ip_literal` 是 上游 正则语义（容前导零），比 Go 宽 → 覆盖上面「偏严 #1」；
-/// - `IpAddr::from_str` 是严格语义，与 Go `netip.ParseAddr` 同口径 → 兜住正则写不下的 v6 边角。
-///
-/// **zone id 必须先截断**：`fe80::1%eth0` 在 Go 那边 `netip` 认 zone、判为 IP（实测 panic），
-/// Rust `IpAddr` 不认 zone 会解析失败 —— 不截断就会把它漏判成域名，那正是 fail-open。
+/// 分类原有不支持的 IP 写法，保留其拒绝 token；zone 不得漏成普通域名。
+/// 公共 IP 谓词刻意容许前导零/宽松 v6，真正放行须另经标准库严格解析。
 fn is_ip_host(host: &str) -> bool {
     let h = strip_brackets(host);
     let h = h.split('%').next().unwrap_or(h);
@@ -129,11 +69,10 @@ fn is_hostname_like(host: &str) -> bool {
 
 /// Tailscale `control_url` 的前置校验：`None` = 可下发，`Some(_)` = **必须拦在下发之前**。
 ///
-/// 空串 / 全空白 → `None`（用户没填 → 内核走 `remoteIsDomain = true` 的 else 分支，安全）。
+/// 空串 / 全空白 → `None`（用户没填 = 官方 controlplane）。
 pub fn tailscale_control_url_reject(raw: &str) -> Option<ControlUrlReject> {
     let s = raw.trim();
     if s.is_empty() {
-        // 未填 = 用官方 controlplane，内核 else 分支恒 remoteIsDomain=true → 不可能 panic。
         return None;
     }
     // 内嵌空白 → Go `url.Parse` 直接报错（实测 `parse control URL`），FATAL 掉整个核。
@@ -142,7 +81,7 @@ pub fn tailscale_control_url_reject(raw: &str) -> Option<ControlUrlReject> {
     }
 
     // scheme：必须有 `://`，且 scheme 本身合法（ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )）。
-    // 不限定 http/https —— 那是额外的产品意见，本模块只复刻内核的 panic 判据。
+    // 沿用原 scheme 语法，不在本批增加协议种类/连通性策略。
     let Some(pos) = s.find("://") else {
         return Some(ControlUrlReject::MissingScheme);
     };
@@ -163,8 +102,7 @@ pub fn tailscale_control_url_reject(raw: &str) -> Option<ControlUrlReject> {
         None => authority,
     };
 
-    // 方括号形式：内核只接受 IPv6 —— 是 IP 就 panic，不是 IP（如 `[192.168.1.10]`，Go 认 v4 不该带括号）
-    // 就 `parse control URL` FATAL。两条都得拦，前者给「别填 IP」的话更有用。
+    // 只新增严格方括号 IPv6。标准库拒 zone / 括号 IPv4 / 畸形压缩，维持原拒绝边界。
     if let Some(stripped) = hostport.strip_prefix('[') {
         let Some(end) = stripped.find(']') else {
             return Some(ControlUrlReject::Malformed);
@@ -173,6 +111,9 @@ pub fn tailscale_control_url_reject(raw: &str) -> Option<ControlUrlReject> {
         let after = &stripped[end + 1..];
         if !after.is_empty() && !is_port_suffix(after) {
             return Some(ControlUrlReject::Malformed);
+        }
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            return None;
         }
         return Some(if is_ip_host(inner) {
             ControlUrlReject::IpLiteral
@@ -192,7 +133,11 @@ pub fn tailscale_control_url_reject(raw: &str) -> Option<ControlUrlReject> {
         return Some(ControlUrlReject::NoHost);
     }
     if is_ip_host(host) {
-        return Some(ControlUrlReject::IpLiteral);
+        return if host.parse::<std::net::Ipv4Addr>().is_ok() {
+            None
+        } else {
+            Some(ControlUrlReject::IpLiteral)
+        };
     }
     if !is_hostname_like(host) {
         return Some(ControlUrlReject::Malformed);

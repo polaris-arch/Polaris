@@ -87,6 +87,11 @@ fn effective_rule_selector_targets(config: &UserConfig) -> BTreeMap<String, Opti
 /// `Some` means both sides parsed and the non-node difference is known. The old atomic marker
 /// remains a conservative fallback only when either side cannot be projected.
 fn non_node_runtime_debt(applied: &Value, disk: &Value) -> Option<bool> {
+    if super::tailnet_rules::tailnet_generation_identity(applied)
+        != super::tailnet_rules::tailnet_generation_identity(disk)
+    {
+        return Some(true);
+    }
     let applied: UserConfig = serde_json::from_value(applied.clone()).ok()?;
     let disk: UserConfig = serde_json::from_value(disk.clone()).ok()?;
     let no_servers = BTreeSet::new();

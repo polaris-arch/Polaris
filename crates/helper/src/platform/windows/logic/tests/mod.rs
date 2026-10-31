@@ -545,7 +545,14 @@ fn parse_request_start_full() {
     let id = "a".repeat(64);
     let r = parse_request(
         "start-native-pinned-birth-safe",
-        &[&id, "/c/cfg.json", "/l/log.txt", "1", "4242"],
+        &[
+            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+            &id,
+            "/c/cfg.json",
+            "/l/log.txt",
+            "1",
+            "4242",
+        ],
     )
     .unwrap();
     let Request::NativeStartPinned(p) = r else {
@@ -563,7 +570,13 @@ fn parse_request_start_without_ppid() {
     let id = "a".repeat(64);
     let r = parse_request(
         "start-native-pinned-birth-safe",
-        &[&id, "/c/cfg.json", "", "0"],
+        &[
+            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+            &id,
+            "/c/cfg.json",
+            "",
+            "0",
+        ],
     )
     .unwrap();
     let Request::NativeStartPinned(p) = r else {
@@ -708,4 +721,18 @@ fn lan_listening_has_no_native_host_router_writer() {
     assert!(source.contains("let forwarding_ms = 0;"));
     let ops = polaris_source_probe::crate_source!("platform/windows/ops.rs");
     assert!(!ops.contains("fn enable_ip_forwarding"));
+}
+
+#[test]
+fn pinned_native_start_refuses_legacy_wrong_or_duplicate_execution_marker() {
+    let id = "a".repeat(64);
+    let marker = polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR;
+    for args in [
+        vec![id.as_str(), "/cfg", "", "0"],
+        vec!["wrong-v3", id.as_str(), "/cfg", "", "0"],
+        vec![marker, marker, id.as_str(), "/cfg", "", "0"],
+        vec![marker, id.as_str(), "/cfg", "", "0", "42", "extra"],
+    ] {
+        assert!(parse_request("start-native-pinned-birth-safe", &args).is_none());
+    }
 }

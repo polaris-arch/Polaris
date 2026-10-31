@@ -328,3 +328,26 @@ describe('统一接入表单的信息架构', () => {
     }
   });
 });
+
+describe('OpenVPN supported TLS controls and legacy repair visibility', () => {
+  const visible = (draft: Record<string, string>) => allFields('openvpn-client')
+    .filter((field) => !field.when || field.when(draft)).map((field) => field.k);
+  it('offers TLS data choices by default, with no legacy cipher field on a new form', () => {
+    expect(visible({})).toEqual(expect.arrayContaining(['ovpnDataCiphers', 'ovpnDataCiphersFallback']));
+    expect(visible({})).not.toContain('cipher');
+    expect(visible({ extraJson: '{"mode":"tls"}' })).not.toContain('cipher');
+  });
+  it('keeps imported incompatible cipher visible for correction in both TLS and malformed JSON drafts', () => {
+    for (const extraJson of ['', '{"mode":"tls"}', 'invalid JSON']) {
+      expect(visible({ extraJson, cipher: 'AES-256-GCM' })).toEqual(expect.arrayContaining(['cipher', 'ovpnDataCiphers', 'ovpnDataCiphersFallback']));
+    }
+  });
+  it('distinguishes only an explicit static_key, without adding a mode or authentication option', () => {
+    expect(visible({ extraJson: '{"mode":"static_key"}' })).toContain('cipher');
+    expect(visible({ extraJson: '{"mode":"static_key"}' })).not.toContain('ovpnDataCiphers');
+    expect(visible({ extraJson: '{"mode":"static_key"}' })).not.toContain('ovpnDataCiphersFallback');
+    expect(allFields('openvpn-client').map((field) => field.k)).not.toContain('mode');
+    expect(nodeFormGroups('openvpn-client').find((group) => group.id === 'basic')?.fields.map((field) => field.k))
+      .toEqual(['user', 'pwd', 'ovpnCa', 'ovpnCert', 'ovpnKey']);
+  });
+});

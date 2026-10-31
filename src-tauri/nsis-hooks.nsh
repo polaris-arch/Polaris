@@ -202,55 +202,13 @@
 ; 规范化 = 去掉 `\\?\` / `\\?\UNC\` 前缀后过 `GetFullPath`（斜杠方向、重复分隔符、`.`/`..` 段）。
 ; `$INSTDIR` 是卷根（盘符根，或 UNC 共享根）时整条跳过。
 ;
-; 这段判据的三个函数（`PolarisFullPath` / `PolarisSweepRoot` / `PolarisIsInstalledCore`）与下面整段
-; 脚本的唯一真值在 `scripts/lib/nsis-core-sweep.mjs`：本文件里的 `FileWrite` 行必须与它逐字相同
-; （`verify-packaging.mjs confs` 与 `scripts/nsis-core-sweep.test.mjs` 都会比），**改脚本先改那边**。
-; 那里另有一份 JS 等价实现与样例表（空格、引号、`$`、反引号、分号、`%`、非 ASCII、尾部反斜杠、
-; 卷根、UNC、大小写、斜杠混用、`\\?\` 前缀、邻名目录等）；样例表在 Windows 上还会喂给这三个
-; 函数的原文真执行。
-;
-; 已知限制（判据不处理，失效方向都是「少结束」而不是「多结束」，届时由 NSIS 自己的写入失败框接手）：
-;   · 安装目录经符号链接 / 联接点 / `subst` 或映射盘访问时，系统报告的映像路径是解析后的真实
-;     路径，与 `$INSTDIR` 的字面前缀对不上；
-;   · 8.3 短路径：`GetFullPath` 只在路径真实存在时才展开短名，这一条没有在真机上验过；
-;   · 段尾带空格或句点的目录名。
-;
-; ── 进程侧 ──
-; 路径经 WMI `Win32_Process.ExecutablePath` 取，而不是 `Get-Process` 的 `.Path`：NSIS 安装器是
-; 32 位进程，`$SYSDIR` 在它眼里被重定向到 SysWOW64，拉起的是 32 位 PowerShell，读不了 64 位进程的
-; 模块表；WMI 由系统服务代查，不受此限。取不到路径的进程（别的用户的、权限更高的）一律跳过，
-; 不猜；单个进程的路径规范化出错也只跳过它自己。
-; 结束前先取得该进程的句柄（此后这个 PID 不会被复用），再按启动时间核对它就是枚举到的那一个
-; （枚举到取得句柄之间 PID 可能已被复用）—— PID 加启动时间唯一确定一个进程，映像路径与启动时间
-; 取自同一条 WMI 记录，所以不再另读一次映像路径（32 位进程也读不了）。然后最多等 5 秒确认它
-; 真的退出：映像文件的占用在进程退出后才释放。
-; `$INSTDIR` 经环境变量交给脚本，不拼进脚本文本或命令行：路径里的引号、空格、`$`、反引号、分号、
-; `%`、末尾反斜杠都不参与任何一层解析。脚本文本本身是纯 ASCII（`FileWrite` 按 ANSI 代码页落盘）。
-;
-; ── 执行环境与失败不阻断 ──
-; 经 `nsExec` 执行：无窗口，30 秒上界（超时即结束 PowerShell 并返回 `timeout`），退出码原样回到
-; `$R4`。PowerShell 取 `$SYSDIR` 下的绝对路径，带 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`。
-; 下列情形脚本跑不起来或中途退出，都只在安装日志里留一行，然后继续：
-;   · 组策略强制了执行策略（`Bypass` 被覆盖）、PowerShell 被禁用或被安全软件拦下 ⇒ `error` 或非零；
-;   · 受限语言模式（AppLocker / WDAC）：脚本里的 .NET 方法调用被拒 ⇒ 预期落进最外层 catch，退出码 1；
-;   · WMI 服务不可用或 `Get-CimInstance` 不存在（PowerShell 2.0）⇒ 退出码 1；卡住 ⇒ `timeout`；
-;   · 结束失败或 5 秒内没退出 ⇒ 退出码 2；安装目录是卷根 ⇒ 退出码 3。
-; 此时的表现与没有本宏时相同（安装侧由 NSIS 自己的写入失败框接手），不会更糟；反过来若在这里
-; 中止，一台 WMI 服务异常或管控严格的机器就再也装不上、卸不掉。
-;
-; 只能在 Windows 真机或安装器实际运行时确认的：`System::Call` 设的环境变量确实被 `nsExec` 的子进程
-; 继承；32 位 PowerShell 对 64 位内核取句柄、读启动时间、结束都成功；WMI 的 `CreationDate` 与
-; `Process.StartTime` 的差在 2 秒内；上面列的各种受限环境下的实际退出码；整段在 30 秒内跑完。
-;
-; ── 两种装机形态 ──
-;   · `currentUser`（当前形态）：安装器以发起用户身份运行，能看到并结束的只有该用户自己的进程
-;     —— 用户态内核正是该用户起的，够用。
-;   · `perMachine`（前瞻）：安装器已提权，能看到并结束任何用户会话里的进程；判据仍是映像路径在
-;     `$INSTDIR` 内，射程不因提权而变宽。本宏不读取也不执行安装目录里的任何文件，只按路径结束
-;     进程，不属于顶部那一节说的「提权动作消费用户可写输入」。
-;
-; 便携版不经过 NSIS，本宏管不到：用户手动把新 zip 解压覆盖到旧目录时，仍在运行的主程序与内核
-; 由资源管理器按「文件正在使用」逐个提示，跳过即留下新旧混装的目录。
+; Native predicate and original-process custody live in windows-cleaner/src/windows/sweep.rs.
+; Shared 55-case path data and seven-operator inverse guards live in scripts/lib/nsis-core-sweep.mjs.
+; The held process HANDLE's exact image and FILETIME birth are revalidated before TerminateProcess,
+; followed by a 5-second same-handle exit wait. No process-name/PID-only termination is allowed.
+; Each PRE extracts its own embedded GUI PE before invoking it with literal UTF16 environment data.
+; A 30-second nsExec timeout or any nonzero/error result warns and continues; this is not a cleanup receipt.
+; No PowerShell policy, UAC, SCM, ProgramData core or user configuration is changed by this role.
 !macro PolarisStopInstalledCores
   Push $R4
   Push $R6
@@ -265,88 +223,22 @@
     "در حال متوقف کردن فرایندهای هسته Polaris که از این پوشه نصب اجرا شده‌اند (در صورت وجود)..."
   DetailPrint "$R8"
 
+  ReadEnvStr $R9 "POLARIS_SWEEP_ROOT"
+  Push $R9
   StrCpy $R9 "$INSTDIR"
   System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'
 
   InitPluginsDir
-  ; 下面的 FileWrite 行由 `scripts/lib/nsis-core-sweep.mjs` 的脚本真值渲染（`$$` 输出字面 `$`，留给
-  ; PowerShell 展开），不要在这里手改。
-  FileOpen $R6 "$PLUGINSDIR\polaris-stop-installed-cores.ps1" w
-  FileWrite $R6 `$$ErrorActionPreference = 'Stop'$\r$\n`
-  FileWrite $R6 `$$sep = '\'$\r$\n`
-  FileWrite $R6 `$$ext = '\\?\'$\r$\n`
-  FileWrite $R6 `$$tails = @('_up_\resources\win\sing-box.exe', 'resources\win\sing-box.exe')$\r$\n`
-  FileWrite $R6 `function PolarisFullPath([string]$$p) {$\r$\n`
-  FileWrite $R6 `  if ($$p.StartsWith($$ext + 'UNC' + $$sep, [System.StringComparison]::OrdinalIgnoreCase)) { $$p = $$sep + $$sep + $$p.Substring(8) } elseif ($$p.StartsWith($$ext, [System.StringComparison]::Ordinal)) { $$p = $$p.Substring(4) }$\r$\n`
-  FileWrite $R6 `  return [System.IO.Path]::GetFullPath($$p)$\r$\n`
-  FileWrite $R6 `}$\r$\n`
-  FileWrite $R6 `function PolarisSweepRoot([string]$$dir) {$\r$\n`
-  FileWrite $R6 `  $$full = (PolarisFullPath $$dir).TrimEnd($$sep)$\r$\n`
-  FileWrite $R6 `  if ($$full -eq [System.IO.Path]::GetPathRoot($$full + $$sep).TrimEnd($$sep)) { return $$null }$\r$\n`
-  FileWrite $R6 `  return $$full + $$sep$\r$\n`
-  FileWrite $R6 `}$\r$\n`
-  FileWrite $R6 `function PolarisIsInstalledCore([string]$$root, [string]$$image) {$\r$\n`
-  FileWrite $R6 `  $$full = PolarisFullPath $$image$\r$\n`
-  FileWrite $R6 `  if (-not $$full.StartsWith($$root, [System.StringComparison]::OrdinalIgnoreCase)) { return $$false }$\r$\n`
-  FileWrite $R6 `  $$tail = $$full.Substring($$root.Length)$\r$\n`
-  FileWrite $R6 `  foreach ($$t in $$tails) { if ([string]::Equals($$tail, $$t, [System.StringComparison]::OrdinalIgnoreCase)) { return $$true } }$\r$\n`
-  FileWrite $R6 `  return $$false$\r$\n`
-  FileWrite $R6 `}$\r$\n`
-  FileWrite $R6 `try {$\r$\n`
-  FileWrite $R6 `  Add-Type -TypeDefinition @'$\r$\n`
-  FileWrite $R6 `using System;$\r$\n`
-  FileWrite $R6 `using System.Text;$\r$\n`
-  FileWrite $R6 `using System.ComponentModel;$\r$\n`
-  FileWrite $R6 `using System.Runtime.InteropServices;$\r$\n`
-  FileWrite $R6 `using Microsoft.Win32.SafeHandles;$\r$\n`
-  FileWrite $R6 `public sealed class PolarisOwnedProcess : IDisposable {$\r$\n`
-  FileWrite $R6 `  readonly SafeProcessHandle handle;$\r$\n`
-  FileWrite $R6 `  [DllImport("kernel32.dll", SetLastError=true)] static extern SafeProcessHandle OpenProcess(uint access, bool inherit, int pid);$\r$\n`
-  FileWrite $R6 `  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessTimes(SafeProcessHandle h, out long created, out long exited, out long kernel, out long user);$\r$\n`
-  FileWrite $R6 `  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool QueryFullProcessImageName(SafeProcessHandle h, uint flags, StringBuilder path, ref uint size);$\r$\n`
-  FileWrite $R6 `  [DllImport("kernel32.dll", EntryPoint="TerminateProcess", SetLastError=true)] static extern bool StopOwned(SafeProcessHandle h, uint code);$\r$\n`
-  FileWrite $R6 `  [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(SafeProcessHandle h, uint ms);$\r$\n`
-  FileWrite $R6 `  public PolarisOwnedProcess(int pid) {$\r$\n`
-  FileWrite $R6 `    handle = OpenProcess(0x00101001, false, pid);$\r$\n`
-  FileWrite $R6 `    if (handle.IsInvalid) { handle.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }$\r$\n`
-  FileWrite $R6 `  }$\r$\n`
-  FileWrite $R6 `  public IntPtr Handle { get { return handle.DangerousGetHandle(); } }$\r$\n`
-  FileWrite $R6 `  public DateTime StartTime { get { long c,e,k,u; if (!GetProcessTimes(handle,out c,out e,out k,out u)) throw new Win32Exception(Marshal.GetLastWin32Error()); return DateTime.FromFileTimeUtc(c); } }$\r$\n`
-  FileWrite $R6 `  public string Image { get { uint size=32768; var path=new StringBuilder((int)size); if (!QueryFullProcessImageName(handle,0,path,ref size)) throw new Win32Exception(Marshal.GetLastWin32Error()); return path.ToString(); } }$\r$\n`
-  FileWrite $R6 `  public void Kill() { if (!StopOwned(handle,1)) throw new Win32Exception(Marshal.GetLastWin32Error()); }$\r$\n`
-  FileWrite $R6 `  public bool WaitForExit(int ms) { uint r=WaitForSingleObject(handle,(uint)ms); if (r==0) return true; if (r==258) return false; throw new Win32Exception(Marshal.GetLastWin32Error()); }$\r$\n`
-  FileWrite $R6 `  public void Dispose() { handle.Dispose(); }$\r$\n`
-  FileWrite $R6 `}$\r$\n`
-  FileWrite $R6 `'@$\r$\n`
-  FileWrite $R6 `  $$root = PolarisSweepRoot $$env:POLARIS_SWEEP_ROOT$\r$\n`
-  FileWrite $R6 `  if (-not $$root) { exit 3 }$\r$\n`
-  FileWrite $R6 `  $$left = 0$\r$\n`
-  FileWrite $R6 `  foreach ($$p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'sing-box.exe'")) {$\r$\n`
-  FileWrite $R6 `    try {$\r$\n`
-  FileWrite $R6 `      if (-not $$p.ExecutablePath) { continue }$\r$\n`
-  FileWrite $R6 `      if (-not (PolarisIsInstalledCore $$root $$p.ExecutablePath)) { continue }$\r$\n`
-  FileWrite $R6 `    } catch { continue }$\r$\n`
-  FileWrite $R6 `    $$proc = $$null$\r$\n`
-  FileWrite $R6 `    try {$\r$\n`
-  FileWrite $R6 `      $$proc = New-Object PolarisOwnedProcess ([int]$$p.ProcessId)$\r$\n`
-  FileWrite $R6 `      $$null = $$proc.Handle$\r$\n`
-  FileWrite $R6 `      if (-not (PolarisIsInstalledCore $$root $$proc.Image)) { continue }$\r$\n`
-  FileWrite $R6 `      $$born = $$proc.StartTime.Ticks$\r$\n`
-  FileWrite $R6 `      $$listed = $$p.CreationDate.ToUniversalTime().Ticks$\r$\n`
-  FileWrite $R6 `      if (($$born - ($$born % 10)) -ne ($$listed - ($$listed % 10))) { continue }$\r$\n`
-  FileWrite $R6 `      $$proc.Kill()$\r$\n`
-  FileWrite $R6 `      if (-not $$proc.WaitForExit(5000)) { $$left++ }$\r$\n`
-  FileWrite $R6 `    } catch {$\r$\n`
-  FileWrite $R6 `      if (Get-Process -Id $$p.ProcessId -ErrorAction SilentlyContinue) { $$left++ }$\r$\n`
-  FileWrite $R6 `    } finally { if ($$null -ne $$proc) { $$proc.Dispose() } }$\r$\n`
-  FileWrite $R6 `  }$\r$\n`
-  FileWrite $R6 `  if ($$left -gt 0) { exit 2 }$\r$\n`
-  FileWrite $R6 `  exit 0$\r$\n`
-  FileWrite $R6 `} catch { exit 1 }$\r$\n`
-  FileClose $R6
-
-  nsExec::Exec /TIMEOUT=30000 `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\polaris-stop-installed-cores.ps1"`
-  Pop $R4 ; 0 = 没有或已全部结束；1 = 枚举失败或脚本被环境拒绝；2 = 有进程没能结束；3 = 安装目录是卷根；timeout / error = 脚本没跑完
+  ; Same producer payload is embedded independently in setup and uninstaller.
+  ; This PRE operation never elevates or invokes the ProgramData deletion role.
+  StrCpy $R6 $OUTDIR
+  SetOutPath "$PLUGINSDIR"
+  File /oname=polaris-cleaner.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"
+  SetOutPath $R6
+  nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\polaris-cleaner.exe" --sweep-installed-cores'
+  Pop $R4 ; native: 0 complete; 1 observation failed; 2 unconfirmed exit; 3 volume root; timeout/error remain unconfirmed
+  Pop $R9
+  System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'
   ${If} $R4 != 0
     !insertmacro PolarisSelectLang $R8 \
       "Could not confirm that all Polaris core processes from this folder have stopped; continuing." \

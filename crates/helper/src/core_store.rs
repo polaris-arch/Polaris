@@ -8,6 +8,7 @@ use crate::core_objects::PayloadDir;
 use polaris_helper_proto::core_manifest::{CoreId, InstalledCoreManifest};
 
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod recovery_transaction;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod lock_diagnostics;
@@ -175,7 +176,7 @@ fn lock_error(role: LockRole, observation: LockObservation, cause: TryLockError)
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     let holder_snapshot = if matches!(
         role,
-        LockRole::StoreMutationExclusive | LockRole::RetainExclusive
+        LockRole::StoreMutationExclusive | LockRole::RepairExclusive | LockRole::RetainExclusive
     ) && matches!(&cause, TryLockError::WouldBlock)
     {
         Some(lock_diagnostics::snapshot(&observation))
@@ -227,7 +228,7 @@ fn optional_lock_result(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnerPolicy {
     pub uid: Option<u32>,
 }
@@ -268,18 +269,182 @@ impl OwnerPolicy {
     }
 }
 
+// Public administrative OwnerPolicy remains unchanged. Only these explicit
+// Windows data constructors can mint a native current-process data scope.
+#[cfg(not(windows))]
+type StoreOwner = OwnerPolicy;
+#[cfg(windows)]
+#[derive(Clone)]
+struct StoreOwner {
+    uid: Option<u32>,
+    data: Option<std::sync::Arc<crate::platform::windows::user_data::CurrentUserData>>,
+}
+#[cfg(windows)]
+impl PartialEq for StoreOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.uid == other.uid
+            && match (&self.data, &other.data) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+#[cfg(windows)]
+impl Eq for StoreOwner {}
+#[cfg(windows)]
+impl From<OwnerPolicy> for StoreOwner {
+    fn from(owner: OwnerPolicy) -> Self {
+        Self {
+            uid: owner.uid,
+            data: None,
+        }
+    }
+}
+#[cfg(windows)]
+impl StoreOwner {
+    fn check(&self, path: &Path) -> io::Result<()> {
+        if let Some(data) = &self.data {
+            return data.check(path);
+        }
+        OwnerPolicy { uid: self.uid }.check(path)
+    }
+    fn stamp(&self, path: &Path) -> io::Result<String> {
+        if let Some(data) = &self.data {
+            return data.stamp(path);
+        }
+        object_stamp(path)
+    }
+    fn mode(&self, path: &Path, mode: u32) -> io::Result<()> {
+        if let Some(data) = &self.data {
+            return data.check(path);
+        }
+        private_mode(path, mode)
+    }
+    fn private_dir(&self, path: &Path) -> io::Result<()> {
+        if self.data.is_some() {
+            fs::create_dir(path)?;
+            self.check(path)
+        } else {
+            private_dir(path)
+        }
+    }
+    fn seal_dir(&self, path: &Path) -> io::Result<()> {
+        if self.data.is_some() {
+            self.check(path)
+        } else {
+            seal_dir(path)
+        }
+    }
+}
+#[cfg(not(windows))]
+impl OwnerPolicy {
+    fn stamp(self, path: &Path) -> io::Result<String> {
+        object_stamp(path)
+    }
+    fn mode(self, path: &Path, mode: u32) -> io::Result<()> {
+        private_mode(path, mode)
+    }
+    fn private_dir(self, path: &Path) -> io::Result<()> {
+        private_dir(path)
+    }
+    fn seal_dir(self, path: &Path) -> io::Result<()> {
+        seal_dir(path)
+    }
+}
+
 pub struct CoreStore {
     root: PathBuf,
     _root_object: PayloadDir,
-    owner: OwnerPolicy,
+    owner: StoreOwner,
 }
 pub struct VerifiedCore {
+    admitted: Option<std::sync::Arc<polaris_core_supervisor::admitted_payload::AdmittedPayload>>,
+    observation: Vec<(PathBuf, String)>,
+    owner: StoreOwner,
     pub manifest: InstalledCoreManifest,
     pub binary: File,
     pub sidecars: Vec<File>,
     pub directory: PathBuf,
-    _directory_object: PayloadDir,
-    _lease: File,
+    _directory_object: std::sync::Arc<PayloadDir>,
+    // A diagnostic cache never holds a store lock. Each actual Start receives
+    // a fresh shared open-file-description, retained by its native child too.
+    _lease: Option<File>,
+}
+fn object_stamp(path: &Path) -> io::Result<String> {
+    let m = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.ctime(),
+            m.ctime_nsec(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.mode(),
+            m.uid(),
+            m.gid()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!("{:?}", m))
+    }
+}
+impl VerifiedCore {
+    pub fn prepare(
+        &self,
+        purpose: polaris_core_supervisor::admitted_payload::ExecPurpose,
+    ) -> io::Result<polaris_core_supervisor::admitted_payload::PreparedExecution> {
+        if self._lease.is_none() {
+            return Err(invalid("diagnostic cache has no execution lease"));
+        }
+        self.admitted
+            .as_ref()
+            .ok_or_else(|| invalid("no compiled execution admission"))?
+            .prepare(purpose)
+            .map_err(Into::into)
+    }
+    fn copy_with_lease(&self, lease: Option<File>) -> io::Result<Self> {
+        Ok(Self {
+            admitted: self.admitted.clone(),
+            observation: self.observation.clone(),
+            owner: self.owner.clone(),
+            manifest: self.manifest.clone(),
+            binary: self.binary.try_clone()?,
+            sidecars: self
+                .sidecars
+                .iter()
+                .map(File::try_clone)
+                .collect::<io::Result<_>>()?,
+            directory: self.directory.clone(),
+            _directory_object: std::sync::Arc::clone(&self._directory_object),
+            _lease: lease,
+        })
+    }
+    pub(crate) fn diagnostic_cache(&self) -> io::Result<Self> {
+        self.copy_with_lease(None)
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn execution_lease(&self) -> io::Result<&File> {
+        self._lease
+            .as_ref()
+            .ok_or_else(|| invalid("execution lease absent"))
+    }
+    /// Lightweight data observation, never execution admission. The shared
+    /// version lease remains owned by this value until its final native user.
+    pub fn data_is_current(&self) -> bool {
+        self.observation.iter().all(|(p, s)| {
+            self.owner.check(p).is_ok() && self.owner.stamp(p).is_ok_and(|now| now == *s)
+        })
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        self.admitted.as_ref().is_some_and(|a| a.is_current()) && self.data_is_current()
+    }
 }
 impl std::fmt::Debug for VerifiedCore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -351,12 +516,15 @@ impl VerifiedCore {
             .try_lock_shared()
             .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(Self {
+            admitted: None,
+            observation: Vec::new(),
+            owner: OwnerPolicy { uid }.into(),
             manifest,
             binary: binary.ok_or_else(|| invalid("fixture core absent"))?,
             sidecars,
             directory: directory.into(),
-            _directory_object: objects,
-            _lease: lease,
+            _directory_object: std::sync::Arc::new(objects),
+            _lease: Some(lease),
         })
     }
 }
@@ -368,6 +536,44 @@ pub enum InstallOutcome {
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+fn store_admission_failure(error: io::Error) -> io::Error {
+    use polaris_core_supervisor::admitted_payload::{
+        AdmissionError, AdmissionErrorKind as K, ExecPurpose, RecoveryAction,
+    };
+    let structural = matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+    );
+    #[cfg(unix)]
+    let structural = structural
+        || matches!(
+            error.raw_os_error(),
+            Some(nix::libc::ELOOP) | Some(nix::libc::ENOTDIR)
+        );
+    let kind = if error.kind() == io::ErrorKind::WouldBlock {
+        K::Busy
+    } else if error.kind() == io::ErrorKind::NotFound {
+        K::Missing
+    } else if structural {
+        K::Mismatch
+    } else {
+        K::Io
+    };
+    AdmissionError {
+        kind,
+        purpose: Some(ExecPurpose::RunMain),
+        member: None,
+        recovery: if kind.is_payload_damage() {
+            RecoveryAction::RepairHelperInstallation
+        } else if kind == K::Busy {
+            RecoveryAction::RetryAfterStop
+        } else {
+            RecoveryAction::None
+        },
+        detail: error.to_string(),
+    }
+    .into()
 }
 fn private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir(path)?;
@@ -400,6 +606,117 @@ fn seal_dir(path: &Path) -> io::Result<()> {
 }
 
 impl CoreStore {
+    #[cfg(windows)]
+    fn execution_maintenance_guard(
+        &self,
+        id: &CoreId,
+    ) -> io::Result<Option<polaris_core_supervisor::admitted_payload::WindowsMaintenanceGuard>>
+    {
+        // Data-only stores never become execution slots. Their normal lease
+        // file and AlreadyPresent RW flush remain unchanged.
+        if self.owner.data.is_some() {
+            return Ok(None);
+        }
+        self.owner.check(&self.root.join("leases"))?;
+        polaris_core_supervisor::admitted_payload::WindowsMaintenanceGuard::for_store(
+            &self.root, id,
+        )
+    }
+    fn pending_repair_ids(&self) -> io::Result<Vec<CoreId>> {
+        let mut directory = PayloadDir::open(&self.root.join(".staging"), self.owner.uid)?;
+        let mut ids = Vec::new();
+        for entry in directory.entry_names(recovery_transaction::MAX_REPAIR_ENTRIES)? {
+            let name = entry
+                .to_str()
+                .ok_or_else(|| invalid("unrepresentable staging entry"))?;
+            if let Some(id) = name.strip_prefix("repair-") {
+                ids.push(CoreId::parse(id).map_err(invalid)?);
+            }
+        }
+        Ok(ids)
+    }
+    fn require_no_pending_repair(&self) -> io::Result<()> {
+        if !self.pending_repair_ids()?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "pending core repair must be resumed before retirement or migration",
+            ));
+        }
+        Ok(())
+    }
+    fn resume_pending_repair(
+        &self,
+        id: &CoreId,
+        mutation: &MutationLock,
+    ) -> io::Result<Option<InstallOutcome>> {
+        if !recovery_transaction::has_records(self, id)? {
+            return Ok(None);
+        }
+        // Never manufacture a replacement lock for an old or journaled object.
+        let lease = self.lease_file(id)?;
+        acquire_lock(&lease, LockRole::RepairExclusive)?;
+        #[cfg(windows)]
+        let _execution = self.execution_maintenance_guard(id)?;
+        self.resume_under_lease(id, mutation, &lease)
+    }
+    fn resume_under_lease(
+        &self,
+        id: &CoreId,
+        mutation: &MutationLock,
+        lease: &File,
+    ) -> io::Result<Option<InstallOutcome>> {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        match recovery_transaction::resume(self, id, mutation, lease, &cancel)
+            .map_err(io::Error::from)?
+        {
+            recovery_transaction::RepairOutcome::NoPendingJournal => Ok(None),
+            outcome => outcome.into_install_result().map(Some),
+        }
+    }
+    fn finish_retirement_barriers(
+        &self,
+        id: &CoreId,
+        mutation: &MutationLock,
+        lease: &File,
+    ) -> io::Result<()> {
+        if recovery_transaction::has_records(self, id)? {
+            if self.resume_under_lease(id, mutation, lease)?.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "core repair resumed; retry retirement selection",
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn lease_cached(
+        &self,
+        id: &CoreId,
+        cached: &VerifiedCore,
+    ) -> io::Result<VerifiedCore> {
+        use polaris_core_supervisor::admitted_payload::{
+            AdmissionError, AdmissionErrorKind, RecoveryAction,
+        };
+        let lease = self.lease_file(id).map_err(store_admission_failure)?;
+        acquire_lock(&lease, LockRole::StartShared).map_err(store_admission_failure)?;
+        // Recheck after taking the lease: a different process may have repaired
+        // the namespace between the diagnostic read and this Start request.
+        if cached.manifest.id != id.as_str()
+            || cached.owner != self.owner
+            || cached.directory != self.root.join("versions").join(id.as_str())
+            || !cached.is_current()
+        {
+            return Err(AdmissionError {
+                kind: AdmissionErrorKind::Changed,
+                purpose: Some(polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain),
+                member: None,
+                recovery: RecoveryAction::RepairHelperInstallation,
+                detail: "cached store namespace changed before Start".into(),
+            }
+            .into());
+        }
+        cached.copy_with_lease(Some(lease))
+    }
     /// Daemon startup only, before accepting any pinned or retired IPC. Preserve
     /// the entire flat cohort while any native mapping/reader is observed or
     /// cannot be ruled out. This never reclaims immutable version directories.
@@ -448,9 +765,20 @@ impl CoreStore {
         let path = dir.join(format!("{}.lock", id.as_str()));
         self.owner.check(&path)?;
         let (file, _) = objects.open_regular(&format!("{}.lock", id.as_str()))?;
+        #[cfg(windows)]
+        if let Some(data) = &self.owner.data {
+            data.stamp_named_held(&file, &path, false)?;
+        }
         Ok(file)
     }
     fn mutation_lock(&self) -> io::Result<MutationLock> {
+        crate::pinned_core::invalidate_unused();
+        self.lock_store_mutation()
+    }
+    // Cold private preparation serializes with publication, but is not a
+    // mutation of the selected data. Its caller may already hold the diagnostic
+    // cache mutex: never recursively invalidate that cache or retire a warm owner.
+    fn lock_store_mutation(&self) -> io::Result<MutationLock> {
         let path = self.root.join(".core-store.lock");
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -473,12 +801,43 @@ impl CoreStore {
             return Err(invalid("invalid store lock"));
         }
         #[cfg(windows)]
-        crate::platform::windows::winproc::seal_store_object(&path, false)?;
+        self.owner.mode(&path, 0o600)?;
         self.owner.check(&path)?;
         acquire_lock(&file, LockRole::StoreMutationExclusive)?;
         Ok(MutationLock::new(file))
     }
     pub fn open(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
+        Self::open_scoped(root, owner.into())
+    }
+    #[cfg(windows)]
+    pub fn open_current_user_data(root: &Path) -> io::Result<Self> {
+        let data = std::sync::Arc::new(crate::platform::windows::user_data::CurrentUserData::open(
+            root, false,
+        )?);
+        Self::open_scoped(
+            data.root(),
+            StoreOwner {
+                uid: None,
+                data: Some(data.clone()),
+            },
+        )
+    }
+    #[cfg(windows)]
+    pub fn initialize_current_user_data(root: &Path) -> io::Result<Self> {
+        let data = std::sync::Arc::new(crate::platform::windows::user_data::CurrentUserData::open(
+            root, true,
+        )?);
+        // Probe the actual barrier before any child publication or transaction.
+        data.barrier()?;
+        Self::initialize_scoped(
+            data.root(),
+            StoreOwner {
+                uid: None,
+                data: Some(data.clone()),
+            },
+        )
+    }
+    fn open_scoped(root: &Path, owner: StoreOwner) -> io::Result<Self> {
         owner.check(root)?;
         let object = PayloadDir::open(root, owner.uid)?;
         for name in ["versions", "manifests", ".staging", ".trash", "leases"] {
@@ -495,31 +854,184 @@ impl CoreStore {
 
     /// Administrative installer only. Runtime status/open never creates directories.
     pub fn initialize(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
+        Self::initialize_scoped(root, owner.into())
+    }
+    fn initialize_scoped(root: &Path, owner: StoreOwner) -> io::Result<Self> {
         owner.check(root)?;
         let _root = PayloadDir::open(root, owner.uid)?;
         for name in ["versions", "manifests", ".staging", ".trash", "leases"] {
             let child = root.join(name);
             match fs::create_dir(&child) {
                 Ok(()) => {
-                    private_mode(&child, 0o755)?;
+                    owner.mode(&child, 0o755)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
             owner.check(&child)?;
         }
-        Self::open(root, owner)
+        Self::open_scoped(root, owner)
+    }
+
+    /// Non-creating selected slot probe. Any partial slot or journal remains
+    /// selected damage/debt, never permission to fall back to package bytes.
+    pub fn has_selected_data(&self, id: &CoreId) -> io::Result<bool> {
+        self.require_no_pending_repair()?;
+        Ok(
+            object_present(&self.root.join("versions").join(id.as_str()))?
+                || object_present(
+                    &self
+                        .root
+                        .join("manifests")
+                        .join(format!("{}.json", id.as_str())),
+                )?
+                || object_present(
+                    &self
+                        .root
+                        .join("leases")
+                        .join(format!("{}.lock", id.as_str())),
+                )?,
+        )
+    }
+    /// Data only: exact receipt, held members and a new shared occupancy lease.
+    /// The caller must independently compare compiled selection and admit its
+    /// real purpose using the sole execution factory.
+    pub fn selected_data(&self, id: &CoreId) -> io::Result<VerifiedCore> {
+        self.require_no_pending_repair()?;
+        // This remains a data observation, not content/execution admission.
+        // Installation hashes under its lease; the execution factory owns
+        // purpose-specific content admission. Do not rescan payloads on each
+        // current-user metadata observation.
+        self.verify_objects(id, false)
+    }
+
+    /// Explicit cold data-recovery diagnosis, never execution admission.
+    /// None means no selected slot; Some(true) means only known member
+    /// absence/size/hash damage. Namespace, receipt, ACL and occupancy failures
+    /// remain errors. No path or executable owner escapes this observation.
+    pub fn selected_recovery_damage(
+        &self,
+        compiled: &polaris_helper_proto::core_manifest::CoreManifest,
+    ) -> io::Result<Option<bool>> {
+        recovery_transaction::selected_recovery_damage(self, compiled)
     }
 
     pub fn verify_for_start(&self, id: &CoreId) -> io::Result<VerifiedCore> {
+        #[cfg(windows)]
+        if self.owner.data.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "current-user data store does not grant execution",
+            ));
+        }
+        use polaris_core_supervisor::admitted_payload::UntrustedPayload;
+        #[cfg(not(target_os = "macos"))]
+        use polaris_core_supervisor::admitted_payload::{admit_selected, ExecPurpose};
+        #[cfg(target_os = "macos")]
+        let _mutation = self
+            .lock_store_mutation()
+            .map_err(store_admission_failure)?;
+        let mut core = self
+            .verify_objects(id, false)
+            .map_err(store_admission_failure)?;
+        let binary = core.directory.join(if cfg!(windows) {
+            "sing-box.exe"
+        } else {
+            "sing-box"
+        });
+        #[cfg(target_os = "macos")]
+        let admission = polaris_core_supervisor::admitted_payload::admit_macos_root_helper_main(
+            UntrustedPayload::bundled(binary),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let admission = admit_selected(UntrustedPayload::bundled(binary), ExecPurpose::RunMain);
+        let admitted = admission.map_err(|mut error| {
+            use polaris_core_supervisor::admitted_payload::{AdmissionErrorKind, RecoveryAction};
+            if matches!(
+                error.kind,
+                AdmissionErrorKind::Missing
+                    | AdmissionErrorKind::Mismatch
+                    | AdmissionErrorKind::Changed
+            ) {
+                error.recovery = RecoveryAction::RepairHelperInstallation;
+            }
+            io::Error::from(error)
+        })?;
+        if admitted.id() != id {
+            return Err(invalid("compiled core selection differs"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // A cold generation adds an owned child to the store root. Refresh
+            // only after rejecting changes to every selected data observation;
+            // otherwise our own mkdir would immediately stale the data cache.
+            core = self
+                .snapshot_after_private_preparation(id, core, &_mutation)
+                .map_err(store_admission_failure)?;
+            if !admitted.is_current() {
+                return Err(store_admission_failure(invalid(
+                    "private execution owner changed during data snapshot",
+                )));
+            }
+        }
+        core.admitted = Some(admitted);
+        Ok(core)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn snapshot_after_private_preparation(
+        &self,
+        id: &CoreId,
+        mut data: VerifiedCore,
+        mutation: &MutationLock,
+    ) -> io::Result<VerifiedCore> {
+        if mutation.owner_pid != std::process::id()
+            || data.manifest.id != id.as_str()
+            || data.observation.iter().any(|(path, before)| {
+                path != &self.root
+                    && (self.owner.check(path).is_err()
+                        || !object_stamp(path).is_ok_and(|now| now == *before))
+            })
+        {
+            return Err(invalid("selected data changed during private preparation"));
+        }
+        let lease = data
+            ._lease
+            .take()
+            .ok_or_else(|| invalid("preparation lease absent"))?;
+        // Transfer the same real shared lease without any unlocked interval.
+        // This is storage observation only and never returns an admission owner.
+        self.verify_objects_under_lease(id, false, lease)
+    }
+
+    // Installation/repair verifies bytes for storage, without granting execution
+    // authority or requiring a new loader policy before it can repair the store.
+    fn verify_objects(&self, id: &CoreId, hash: bool) -> io::Result<VerifiedCore> {
         let lease = self.lease_file(id)?;
         acquire_lock(&lease, LockRole::StartShared)?;
+        self.verify_objects_under_lease(id, hash, lease)
+    }
+    // Only internal callers already holding this exact occupancy lease use it;
+    // never reacquire a shared lock through a separately opened exclusive lease.
+    fn verify_objects_under_lease(
+        &self,
+        id: &CoreId,
+        hash: bool,
+        lease: File,
+    ) -> io::Result<VerifiedCore> {
         let manifests = self.root.join("manifests");
         self.owner.check(&manifests)?;
         let manifest_objects = PayloadDir::open(&manifests, self.owner.uid)?;
         let name = format!("{}.json", id.as_str());
         self.owner.check(&manifests.join(&name))?;
         let (file, length) = manifest_objects.open_regular(&name)?;
+        #[cfg(windows)]
+        let mut native_observations = Vec::new();
+        #[cfg(windows)]
+        if let Some(data) = &self.owner.data {
+            let path = manifests.join(&name);
+            native_observations.push((path.clone(), data.stamp_named_held(&file, &path, false)?));
+        }
         if length > 64 * 1024 {
             return Err(invalid("manifest too large"));
         }
@@ -557,11 +1069,21 @@ impl CoreStore {
         for expected in &manifest.core.files {
             self.owner.check(&directory.join(&expected.name))?;
             let (mut file, length) = objects.open_regular(&expected.name)?;
+            #[cfg(windows)]
+            if let Some(data) = &self.owner.data {
+                let path = directory.join(&expected.name);
+                native_observations
+                    .push((path.clone(), data.stamp_named_held(&file, &path, false)?));
+            }
             if length != expected.bytes {
                 return Err(invalid("payload size differs"));
             }
-            let hash = hash_reader(&mut file, expected.bytes)?;
-            if hash != expected.sha256 {
+            let actual_hash = if hash {
+                Some(hash_reader(&mut file, expected.bytes)?)
+            } else {
+                None
+            };
+            if actual_hash.is_some_and(|hash| hash != expected.sha256) {
                 return Err(invalid("payload hash differs"));
             }
             use std::io::{Seek, SeekFrom};
@@ -572,14 +1094,59 @@ impl CoreStore {
                 sidecars.push(file);
             }
         }
+        let mut paths = vec![
+            self.root.clone(),
+            self.root.join("versions"),
+            self.root.join("manifests"),
+            self.root.join("leases"),
+            directory.clone(),
+            manifests.join(&name),
+            self.root
+                .join("leases")
+                .join(format!("{}.lock", id.as_str())),
+        ];
+        paths.extend(manifest.core.files.iter().map(|f| directory.join(&f.name)));
+        let observation = paths
+            .into_iter()
+            .map(|p| Ok((p.clone(), self.owner.stamp(&p)?)))
+            .collect::<io::Result<Vec<_>>>()?;
+        #[cfg(windows)]
+        for held in &native_observations {
+            if !observation.contains(held) {
+                return Err(invalid(
+                    "opened recovery data differs from named observation",
+                ));
+            }
+        }
         Ok(VerifiedCore {
+            admitted: None,
+            observation,
+            owner: self.owner.clone(),
             manifest,
             binary: binary.ok_or_else(|| invalid("missing binary"))?,
             sidecars,
             directory,
-            _directory_object: objects,
-            _lease: lease,
+            _directory_object: std::sync::Arc::new(objects),
+            _lease: Some(lease),
         })
+    }
+
+    fn finish_install_publication(
+        &self,
+        id: &CoreId,
+        mutation: &MutationLock,
+        verified: &VerifiedCore,
+    ) -> io::Result<()> {
+        let lease = verified
+            ._lease
+            .as_ref()
+            .ok_or_else(|| invalid("publication occupancy owner absent"))?;
+        let mut publication = recovery_transaction::Publication::open(self, id, mutation, lease)?;
+        publication.finish(lease)?;
+        if !verified.data_is_current() {
+            return Err(invalid("published data changed during directory barriers"));
+        }
+        Ok(())
     }
 
     pub fn install(
@@ -615,58 +1182,41 @@ impl CoreStore {
     ) -> io::Result<InstallOutcome> {
         #[cfg(not(windows))]
         let _ = source_sid;
-        let _lock = self.mutation_lock()?;
+        #[cfg(windows)]
+        let source_sid = if let Some(data) = &self.owner.data {
+            data.guard()?;
+            data.barrier()?;
+            Some(data.sid())
+        } else {
+            source_sid
+        };
+        let mutation = self.mutation_lock()?;
         manifest
             .validate(crate::core_hash::sha256_hex)
             .map_err(invalid)?;
         let id = CoreId::parse(&manifest.id).map_err(invalid)?;
         let destination = self.root.join("versions").join(id.as_str());
+        let receipt = self
+            .root
+            .join("manifests")
+            .join(format!("{}.json", id.as_str()));
         if preserve_existing {
-            match fs::symlink_metadata(&destination) {
-                Ok(metadata) => {
-                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                        return Err(invalid("migration payload destination is not a directory"));
-                    }
-                    self.verify_for_start(&id).map_err(|_| {
-                        invalid("migration cannot replace an existing unverified payload")
-                    })?;
-                    return Ok(InstallOutcome::AlreadyPresent);
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    let receipt = self
-                        .root
-                        .join("manifests")
-                        .join(format!("{}.json", id.as_str()));
-                    match fs::symlink_metadata(receipt) {
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
-                        Ok(_) => {
-                            return Err(invalid("migration cannot replace an orphan manifest"))
-                        }
-                    }
-                }
-                Err(error) => return Err(error),
-            }
+            self.require_no_pending_repair()?;
         }
-        if destination.exists() {
-            if self
-                .root
-                .join("manifests")
-                .join(format!("{}.json", id.as_str()))
-                .exists()
-            {
-                if let Ok(_verified) = self.verify_for_start(&id) {
-                    // Reinstallation refreshes retention recency without changing
-                    // the immutable manifest bytes or an already running core.
-                    let receipt = self
-                        .root
-                        .join("manifests")
-                        .join(format!("{}.json", id.as_str()));
+        // Resumption precedes AlreadyPresent and any read/copy of new input.
+        // Its errors/outcomes return directly, never through fresh-install cleanup.
+        if let Some(outcome) = self.resume_pending_repair(&id, &mutation)? {
+            let verified = self.verify_objects(&id, true)?;
+            self.finish_install_publication(&id, &mutation, &verified)?;
+            return Ok(outcome);
+        }
+        let version_present = object_present(&destination)?;
+        let receipt_present = object_present(&receipt)?;
+        if version_present && receipt_present {
+            if let Ok(verified) = self.verify_objects(&id, true) {
+                if !preserve_existing {
                     let mut options = OpenOptions::new();
                     options.write(true);
-                    // PayloadDir is supported only on the desktop targets;
-                    // its Android/iOS constructor already returns Unsupported.
-                    // Keep no-follow on every supported Unix store target.
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     {
                         use std::os::unix::fs::OpenOptionsExt;
@@ -675,36 +1225,53 @@ impl CoreStore {
                     let file = options.open(&receipt)?;
                     self.owner.check(&receipt)?;
                     file.set_modified(std::time::SystemTime::now())?;
-                    return Ok(InstallOutcome::AlreadyPresent);
                 }
-                // Corrupt versions can be repaired only after excluding every
-                // verifier, running Child and lazy sidecar reader by native lease.
-                let lease = self.lease_file(&id)?;
-                acquire_lock(&lease, LockRole::RepairExclusive)?;
-                let receipt = self
-                    .root
-                    .join("manifests")
-                    .join(format!("{}.json", id.as_str()));
-                self.owner.check(&receipt)?;
-                fs::remove_file(receipt)?;
-                self.owner.check(&destination)?;
-                self.trash_version(&id, &destination)?;
-            }
-            if destination.exists() {
-                // An orphan with a lease can still be held after external damage;
-                // missing metadata must never override a busy native lease.
-                let lease = match self.lease_file(&id) {
-                    Ok(file) => Some(file),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(error),
-                };
-                if let Some(lease) = &lease {
-                    acquire_lock(lease, LockRole::OrphanExclusive)?;
-                }
-                self.owner.check(&destination)?;
-                self.trash_version(&id, &destination)?;
+                // Refresh observations after the normal last-use timestamp
+                // mutation, retaining the same already held occupancy lease.
+                let verified = self.verify_objects_under_lease(
+                    &id,
+                    true,
+                    verified
+                        ._lease
+                        .as_ref()
+                        .ok_or_else(|| invalid("publication lease absent"))?
+                        .try_clone()?,
+                )?;
+                // Also closes an earlier complete publication whose parent
+                // barrier failed. A read-only reopen alone is not durability.
+                self.finish_install_publication(&id, &mutation, &verified)?;
+                return Ok(InstallOutcome::AlreadyPresent);
             }
         }
+        if preserve_existing && (version_present || receipt_present) {
+            return Err(invalid(
+                "migration cannot replace an existing unverified payload or receipt",
+            ));
+        }
+        let lease_path = self
+            .root
+            .join("leases")
+            .join(format!("{}.lock", id.as_str()));
+        let repair_lease = if version_present || receipt_present || object_present(&lease_path)? {
+            let lease = self.lease_file(&id)?;
+            acquire_lock(
+                &lease,
+                if version_present && receipt_present {
+                    LockRole::RepairExclusive
+                } else {
+                    LockRole::OrphanExclusive
+                },
+            )?;
+            Some(lease)
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        let _execution = if repair_lease.is_some() {
+            self.execution_maintenance_guard(&id)?
+        } else {
+            None
+        };
         let sources = PayloadDir::open(source, source_uid)?;
         let mut stage = None;
         for _ in 0..128 {
@@ -713,7 +1280,7 @@ impl CoreStore {
                 std::process::id(),
                 STAGE_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
-            match private_dir(&path) {
+            match self.owner.private_dir(&path) {
                 Ok(()) => {
                     stage = Some(path);
                     break;
@@ -723,7 +1290,7 @@ impl CoreStore {
             }
         }
         let stage = stage.ok_or_else(|| invalid("staging namespace exhausted"))?;
-        let result = (|| {
+        let copied = (|| -> io::Result<()> {
             for expected in &manifest.core.files {
                 let (mut input, length) = sources.open_regular(&expected.name)?;
                 #[cfg(windows)]
@@ -765,9 +1332,8 @@ impl CoreStore {
                 if total != expected.bytes || hex::encode(hash.finalize()) != expected.sha256 {
                     return Err(invalid("source hash differs"));
                 }
-                output.sync_all()?;
                 #[cfg(windows)]
-                crate::platform::windows::winproc::seal_store_object(&path, true)?;
+                self.owner.mode(&path, 0o644)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -780,28 +1346,57 @@ impl CoreStore {
                         }),
                     )?;
                 }
+                output.sync_all()?;
             }
-            seal_dir(&stage)?;
-            // Mutation is serialized across processes by the held store file lock.
-            if destination.exists() {
+            self.owner.seal_dir(&stage)?;
+            Ok(())
+        })();
+        if let Err(error) = copied {
+            // Repair candidates and originals are retained for diagnosis. Only
+            // a wholly fresh legacy install can clean its own private draft.
+            if repair_lease.is_none() {
+                let _ = fs::remove_dir_all(&stage);
+            }
+            return Err(error);
+        }
+        if let Some(lease) = repair_lease.as_ref() {
+            let candidate = recovery_transaction::PreparedCandidate::open(self, manifest, &stage)?;
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let outcome =
+                recovery_transaction::replace(self, &id, candidate, &mutation, lease, &cancel)
+                    .map_err(io::Error::from)?
+                    .into_install_result()?;
+            let verified = self.verify_objects_under_lease(&id, true, lease.try_clone()?)?;
+            self.finish_install_publication(&id, &mutation, &verified)?;
+            return Ok(outcome);
+        }
+        // No prior selected objects exist. Create and hold the exact new lease
+        // before publishing any version, then retain partial objects on error.
+        // A later explicit retry uses the existing orphan/repair path; unknown
+        // replacements are never deleted by a legacy best-effort cleanup.
+        let result = (|| {
+            use recovery_transaction::{checkpoint, Point};
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let lease = options.open(&lease_path)?;
+            self.owner.mode(&lease_path, 0o600)?;
+            acquire_lock(&lease, LockRole::OrphanExclusive)?;
+            #[cfg(windows)]
+            let _execution = self.execution_maintenance_guard(&id)?;
+            lease.sync_all()?;
+            let mut publication =
+                recovery_transaction::Publication::open(self, &id, &mutation, &lease)?;
+            checkpoint(Point::FreshLeasePublished)?;
+            if object_present(&destination)? {
                 return Err(invalid("version concurrently installed"));
             }
             fs::rename(&stage, &destination)?;
-            let lease_path = self
-                .root
-                .join("leases")
-                .join(format!("{}.lock", id.as_str()));
-            if !lease_path.exists() {
-                let mut options = OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                options.open(&lease_path)?.sync_all()?;
-                private_mode(&lease_path, 0o600)?;
-            }
+            checkpoint(Point::FreshVersionPublished)?;
             let target = self
                 .root
                 .join("manifests")
@@ -827,35 +1422,26 @@ impl CoreStore {
             let mut file = options.open(&temporary)?;
             file.write_all(&raw)?;
             file.sync_all()?;
-            private_mode(&temporary, 0o644)?;
+            self.owner.mode(&temporary, 0o644)?;
             fs::rename(&temporary, &target)?;
-            self.verify_for_start(&id)?;
+            checkpoint(Point::FreshReceiptPublished)?;
+            let verified = self.verify_objects_under_lease(&id, true, lease.try_clone()?)?;
+            publication.finish(&lease)?;
+            if !verified.data_is_current() {
+                return Err(invalid("fresh publication namespace changed"));
+            }
             Ok(InstallOutcome::Installed)
         })();
-        if stage.exists() {
-            let _ = fs::remove_dir_all(&stage);
-        }
-        if result.is_err() {
-            let manifest_path = self
-                .root
-                .join("manifests")
-                .join(format!("{}.json", id.as_str()));
-            if !manifest_path.exists() && destination.exists() {
-                let _ = fs::remove_dir_all(&destination);
-            }
-            let _ = fs::remove_file(
-                self.root
-                    .join("manifests")
-                    .join(format!("{}.new", id.as_str())),
-            );
-        }
+        // Failure is not a rollback receipt. Retain the candidate/version,
+        // lease and receipt exactly as they stand for replay or diagnosis.
         result
     }
 
     /// Only orphan versions are eligible; callers supply every live slot id while
     /// holding their existing state lock. Retained manifests protect other App versions.
     pub fn gc(&self, live: &[CoreId]) -> io::Result<Vec<CoreId>> {
-        let _lock = self.mutation_lock()?;
+        let mutation = self.mutation_lock()?;
+        self.require_no_pending_repair()?;
         let mut removed = Vec::new();
         for entry in fs::read_dir(self.root.join("versions"))? {
             let entry = entry?;
@@ -879,6 +1465,13 @@ impl CoreStore {
             if !optional_lock_result(&lease, LockRole::GcExclusive, lease.try_lock())? {
                 continue;
             }
+            #[cfg(windows)]
+            let _execution = match self.execution_maintenance_guard(&id) {
+                Ok(guard) => guard,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            };
+            self.finish_retirement_barriers(&id, &mutation, &lease)?;
             self.trash_version(&id, &entry.path())?;
             removed.push(id);
         }
@@ -889,7 +1482,8 @@ impl CoreStore {
     /// A shared lease covers verification, spawn and lazy sidecar use; no PID
     /// observation or caller-provided empty live list can override that lease.
     pub fn retain_latest_three(&self, live: &[CoreId]) -> io::Result<Vec<CoreId>> {
-        let _lock = self.mutation_lock()?;
+        let mutation = self.mutation_lock()?;
+        self.require_no_pending_repair()?;
         let mut manifests = Vec::new();
         for entry in fs::read_dir(self.root.join("manifests"))? {
             let entry = entry?;
@@ -915,6 +1509,13 @@ impl CoreStore {
             if !optional_lock_result(&lease, LockRole::RetainExclusive, lease.try_lock())? {
                 continue;
             }
+            #[cfg(windows)]
+            let _execution = match self.execution_maintenance_guard(&id) {
+                Ok(guard) => guard,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            };
+            self.finish_retirement_barriers(&id, &mutation, &lease)?;
             // Removing the manifest first makes an interrupted cleanup ineligible
             // to start. GC can finish that orphan on a later administrative run.
             fs::remove_file(manifest)?;
@@ -927,6 +1528,7 @@ impl CoreStore {
     }
 
     fn trash_version(&self, id: &CoreId, version: &Path) -> io::Result<()> {
+        self.require_no_pending_repair()?;
         let destination = self.root.join(".trash").join(format!(
             "{}-{}-{}",
             id.as_str(),
@@ -935,6 +1537,14 @@ impl CoreStore {
         ));
         fs::rename(version, &destination)?;
         fs::remove_dir_all(destination)
+    }
+}
+
+fn object_present(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -980,3 +1590,7 @@ fn hash_reader(input: &mut File, expected_bytes: u64) -> io::Result<String> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "core_store/macos_private_preparation_tests.rs"]
+mod macos_private_preparation_tests;

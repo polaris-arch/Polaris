@@ -599,7 +599,8 @@ export function HomeScreen() {
         );
         return;
       }
-      if (code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID ||
+      if (code === ProxyErrorCode.HELPER_RUNTIME_RESTART_REQUIRED ||
+          code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID ||
           code === ProxyErrorCode.VISION_TRANSPORT_UNSUPPORTED ||
           code === ProxyErrorCode.LAN_GATEWAY_FORWARDING_REQUIRED ||
           code === ProxyErrorCode.LAN_GATEWAY_FORWARDING_UNCONFIRMED) {

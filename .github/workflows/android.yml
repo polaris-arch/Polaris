@@ -429,9 +429,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
-          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
-          echo "内核版本真值：v$v"
+          v="$(python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; print(load()['version'])")"
+          [ -n "$v" ] || { echo "::error::verified mobile source-contract version missing"; exit 1; }
+          echo "已验证移动 source-contract 选中版本：v$v"
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
@@ -1012,9 +1012,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
-          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
-          echo "内核版本真值：v$v"
+          v="$(python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; print(load()['version'])")"
+          [ -n "$v" ] || { echo "::error::verified mobile source-contract version missing"; exit 1; }
+          echo "已验证移动 source-contract 选中版本：v$v"
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══

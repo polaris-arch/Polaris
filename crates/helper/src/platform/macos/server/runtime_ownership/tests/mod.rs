@@ -68,3 +68,21 @@ fn static_links_hardlinks_and_ancestor_links_are_rejected_before_visiting() {
     symlink(&root, base.join("alias")).unwrap();
     assert!(open_directory(&base.join("alias")).is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn nested_config_uses_registered_root_for_cache_preparation_and_ownership_tail() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("profiles")).unwrap();
+    std::fs::write(root.join("profiles/current.json"), b"{}").unwrap();
+    prepare_cache(&root).unwrap();
+    assert!(root.join("cache.db").is_file());
+    assert!(!root.join("profiles/cache.db").exists());
+    let cache_inode = std::fs::metadata(root.join("cache.db")).unwrap().ino();
+    return_runtime_ownership(&root).unwrap();
+    let cache = std::fs::metadata(root.join("cache.db")).unwrap();
+    assert_eq!(cache.ino(), cache_inode);
+    assert_eq!(cache.uid(), nix::unistd::Uid::effective().as_raw());
+    assert!(!root.join("profiles/cache.db").exists());
+}

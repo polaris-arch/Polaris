@@ -95,7 +95,16 @@ fn selected_source_is_compiled_not_a_runtime_environment_override() {
         "win"
     )
     .is_err());
-    assert!(selected_source_commit("win").is_ok());
+    if polaris_core_supervisor::selected_core::selection_lane()
+        == polaris_core_supervisor::selected_core::SelectionLane::LocalDevelopment
+    {
+        assert!(
+            selected_source_commit("win").is_err(),
+            "local source selection is Linux-only"
+        );
+    } else {
+        assert!(selected_source_commit("win").is_ok());
+    }
 }
 
 #[test]
@@ -130,6 +139,26 @@ fn all_selected_desktop_rows_have_complete_content_identities() {
 
 #[test]
 fn candidate_compiled_identity_verifies_actual_carrier_without_a_runtime_override() {
+    if polaris_core_supervisor::selected_core::selection_lane()
+        == polaris_core_supervisor::selected_core::SelectionLane::LocalDevelopment
+    {
+        assert_eq!(COMPILED_VALIDATION_SOURCE, b"null");
+        assert_eq!(
+            selected_payload_dirs(&["old-formal-path"]).unwrap(),
+            vec![".local-development/linux"]
+        );
+        let core = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("resources/.local-development/linux/sing-box");
+        assert!(
+            verify_bundled(&core).is_ok(),
+            "the actual compiled local carrier must verify without an environment override"
+        );
+        assert!(selected_manifest("win").is_err());
+        assert!(selected_manifest("mac-arm64").is_err());
+        return;
+    }
     if COMPILED_VALIDATION_SOURCE == b"null" {
         assert_eq!(selected_payload_dirs(&["linux"]).unwrap(), vec!["linux"]);
         return;
@@ -160,9 +189,39 @@ fn candidate_compiled_identity_verifies_actual_carrier_without_a_runtime_overrid
     } else {
         "sing-box"
     };
-    assert!(verify_bundled(&carrier.join(name)).unwrap().is_current());
+    assert!(verify_directory_observed(&carrier, &selected)
+        .unwrap()
+        .is_current());
+    assert!(
+        verify_bundled(&carrier.join(name)).is_err(),
+        "old candidate bytes cannot claim the new loader capability"
+    );
     assert!(selected.helper_sha256.is_some());
     assert_eq!(selected.cleaner_sha256.is_some(), platform == "win");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Actual compiled selection + actual carrier bytes, with every core
+        // file absent from the maintenance source directory.
+        let private = std::env::temp_dir().join(format!(
+            "polaris-compiled-maintenance-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let helper = private.join("polaris-helper");
+        std::fs::copy(carrier.join("polaris-helper"), &helper).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let utility = maintenance_utility_from(&helper, platform, &selected).unwrap();
+        assert_eq!(Some(utility.helper_sha256), selected.helper_sha256);
+        assert!(selected
+            .files
+            .iter()
+            .all(|file| !private.join(&file.name).exists()));
+        std::fs::write(&helper, b"substituted source").unwrap();
+        assert!(maintenance_utility_from(&helper, platform, &selected).is_err());
+        std::fs::remove_dir_all(private).unwrap();
+    }
 }
 
 #[test]
@@ -172,11 +231,22 @@ fn validated_bundle_observation_detects_sidecar_replacement_without_rehashing() 
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut manifest = formal_manifest("linux").unwrap();
     assert_eq!(manifest.files.len(), 2);
     for file in &mut manifest.files {
         let bytes = b"original";
         std::fs::write(dir.join(&file.name), bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join(&file.name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         file.bytes = bytes.len() as u64;
         file.sha256 = polaris_updater::sha256_hex(bytes);
     }
@@ -189,6 +259,11 @@ fn validated_bundle_observation_detects_sidecar_replacement_without_rehashing() 
     let modified = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
     let replacement = dir.join("replacement");
     std::fs::write(&replacement, b"replaced").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     std::fs::OpenOptions::new()
         .write(true)
         .open(&replacement)
@@ -205,7 +280,7 @@ fn validated_bundle_observation_detects_sidecar_replacement_without_rehashing() 
 
 #[cfg(target_os = "linux")]
 fn linux_bundle_with_special_sidecar(symbolic_link: bool) -> (PathBuf, CoreManifest) {
-    use std::os::unix::fs::{symlink, DirBuilderExt};
+    use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
     let dir = std::fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!(
@@ -225,6 +300,7 @@ fn linux_bundle_with_special_sidecar(symbolic_link: bool) -> (PathBuf, CoreManif
     }
     let core = dir.join(&manifest.files[0].name);
     std::fs::write(&core, b"original").unwrap();
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(
         core.is_file(),
         "the normal bundled core candidate passes its existing file predicate"
@@ -233,6 +309,7 @@ fn linux_bundle_with_special_sidecar(symbolic_link: bool) -> (PathBuf, CoreManif
     if symbolic_link {
         let target = dir.join("regular-target");
         std::fs::write(&target, b"original").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&target, &sidecar).unwrap();
     } else {
         nix::unistd::mkfifo(
@@ -249,6 +326,13 @@ fn linux_bundle_with_special_sidecar(symbolic_link: bool) -> (PathBuf, CoreManif
 #[cfg(target_os = "linux")]
 fn rejects_linux_special_sidecar_without_blocking(symbolic_link: bool) {
     let (dir, manifest) = linux_bundle_with_special_sidecar(symbolic_link);
+    // The ordinary first member must pass custody before the special sidecar
+    // is rejected; permissive umasks must not make this a masked negative.
+    let payload = open_payload_directory(&dir).unwrap();
+    let (core, bytes) = payload.open_regular(&manifest.files[0].name).unwrap();
+    assert_eq!(bytes, 8);
+    drop(core);
+    drop(payload);
     let worker_dir = dir.clone();
     let sidecar = dir.join(&manifest.files[1].name);
     let (sent, received) = std::sync::mpsc::sync_channel(1);
@@ -284,4 +368,131 @@ fn linux_bundled_fifo_sidecar_without_writer_is_rejected_without_blocking() {
 #[test]
 fn linux_bundled_symlink_sidecar_is_rejected_before_capture_without_blocking() {
     rejects_linux_special_sidecar_without_blocking(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn maintenance_uses_selected_helper_pin_without_core_files_and_rejects_before_executor() {
+    use polaris_helper_client::{ClientError, Executor, HelperManager, MaintenanceOutcome, SysOps};
+    use polaris_helper_proto::Platform;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct NoSystem;
+    impl SysOps for NoSystem {
+        fn exists(&self, _: &Path) -> bool {
+            panic!("no system lookup")
+        }
+        fn start_service(&self, _: &str) -> Result<(), String> {
+            panic!("no service")
+        }
+        fn stop_service(&self, _: &str) -> Result<(), String> {
+            panic!("no service")
+        }
+        fn is_loaded(&self, _: &str) -> bool {
+            panic!("no service")
+        }
+        fn service_exists(&self, _: &str) -> bool {
+            panic!("no service")
+        }
+    }
+    struct InertExecutor(AtomicUsize);
+    impl Executor for InertExecutor {
+        fn execute(&self, _: &[String]) -> Result<(String, i32), ClientError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok((String::new(), 0))
+        }
+    }
+    let dir =
+        std::env::temp_dir().join(format!("polaris-maintenance-pin-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source = dir.join("polaris-helper");
+    let trusted = b"inert bundled helper bytes";
+    std::fs::write(&source, trusted).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut selected = formal_manifest("linux").unwrap();
+    selected.helper_sha256 = Some(polaris_updater::sha256_hex(trusted));
+    assert!(selected.files.iter().all(|f| !dir.join(&f.name).exists()));
+    let executor = InertExecutor(AtomicUsize::new(0));
+    let manager = HelperManager::new(Platform::Mac, dir.join("absent-token"), Box::new(NoSystem));
+    let attempt = |path: &Path,
+                   platform: &str,
+                   manifest: &CoreManifest|
+     -> Result<MaintenanceOutcome, String> {
+        let utility = maintenance_utility_from(path, platform, manifest)?;
+        manager
+            .uninstall_with_maintenance_outcome(&dir, Some(&utility), &executor)
+            .map_err(|e| format!("{e:?}"))
+    };
+    assert_eq!(
+        attempt(&source, "linux", &selected).unwrap(),
+        MaintenanceOutcome::RetiredDataPreserved
+    );
+    assert_eq!(executor.0.load(Ordering::SeqCst), 1);
+    let reject = |path: &Path, platform: &str, manifest: &CoreManifest| {
+        let before = executor.0.load(Ordering::SeqCst);
+        assert!(attempt(path, platform, manifest)
+            .unwrap_err()
+            .starts_with("CORE_BUNDLE_MISMATCH:"));
+        assert_eq!(
+            executor.0.load(Ordering::SeqCst),
+            before,
+            "no elevation for rejected source"
+        );
+    };
+    let mut missing = selected.clone();
+    missing.helper_sha256 = None;
+    reject(&source, "linux", &missing);
+    reject(&source, "mac-arm64", &selected);
+    reject(Path::new("polaris-helper"), "linux", &selected);
+    let wrong_name = dir.join("wrong-helper");
+    std::fs::write(&wrong_name, trusted).unwrap();
+    std::fs::set_permissions(&wrong_name, std::fs::Permissions::from_mode(0o600)).unwrap();
+    reject(&wrong_name, "linux", &selected);
+    std::fs::write(&source, b"substituted helper").unwrap();
+    reject(&source, "linux", &selected);
+    std::fs::remove_file(&source).unwrap();
+    symlink(&wrong_name, &source).unwrap();
+    reject(&source, "linux", &selected);
+    std::fs::remove_file(&source).unwrap();
+    std::fs::hard_link(&wrong_name, &source).unwrap();
+    reject(&source, "linux", &selected);
+    std::fs::remove_file(&source).unwrap();
+    let oversized = std::fs::File::create(&source).unwrap();
+    oversized.set_len(MAX_MAINTENANCE_HELPER_BYTES + 1).unwrap();
+    drop(oversized);
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Pin the sparse zero contents too: deleting the size fence would admit
+    // this source and reach the executor, rather than merely fail its digest.
+    let mut oversized_selection = selected.clone();
+    oversized_selection.helper_sha256 =
+        Some("da6ce8755151acd05195db67ebce3ee0fb5f4012e71e821cc5750f3304eaf41e".into());
+    reject(&source, "linux", &oversized_selection);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn recovery_selection_classifies_io_busy_and_damage_without_claiming_unsupported_can_be_repaired() {
+    use polaris_core_supervisor::admitted_payload::AdmissionErrorKind as K;
+    for (name, kind) in [
+        ("Changed", K::Changed),
+        ("Busy", K::Busy),
+        ("Io", K::Io),
+        ("Unknown", K::Unknown),
+    ] {
+        let error = selection_error(
+            format!("CORE_ADMISSION_{name}: selected recovery unavailable"),
+            ExecPurpose::CheckConfig,
+        );
+        assert_eq!(error.kind, kind);
+        assert_eq!(error.kind.is_payload_damage(), name == "Changed");
+    }
+    assert_eq!(
+        selection_error(
+            "CORE_RECOVERY_UNSUPPORTED: user ACL policy absent".into(),
+            ExecPurpose::RunMain
+        )
+        .kind,
+        K::UnsupportedExactObject
+    );
 }

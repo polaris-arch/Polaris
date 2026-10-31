@@ -207,6 +207,14 @@ test('wire wrapper writes no success record after command failure or input chang
   try {
     for (const name of sourceNames) { const path = join(root, name); mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, name); }
     for (const name of inputs) { const path = join(root, 'resources', name); mkdirSync(path, { recursive: true }); writeFileSync(join(path, name === 'win' ? 'sing-box.exe' : name === '.release-receipts' ? 'input' : 'sing-box'), name, { mode: 0o600 }); }
+    // This explicitly legacy wire-wrapper fixture still transports the complete
+    // registered recovery subtree; it does not select a formal release/policy.
+    for (const platform of inputs.filter(key => key !== '.release-receipts')) {
+      const directory = join(root, 'resources/core-recovery', platform);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, 'inert-archive.data'), 'inert compressed transport data', { mode: 0o600 });
+      writeFileSync(join(directory, 'inventory.json'), JSON.stringify({ fixture: 'legacy-wire-only', platform }), { mode: 0o600 });
+    }
     mkdirSync(join(root, 'src-tauri'));
     writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify({ coreArchiveSha256: Object.fromEntries(inputs.filter((key) => key !== '.release-receipts').map((key) => [key, 'f'.repeat(64)])) }));
     const path = join(root, 'result.json');
@@ -232,7 +240,8 @@ test('wire wrapper writes no success record after command failure or input chang
     assert.equal(existsSync(path), false);
     changed = false; runCoreWire(root, candidate, path, { env, run });
     assert.equal(calls, 3); const result = JSON.parse(readFileSync(path, 'utf8'));
-    assert.equal(result.context.attempt, '1'); assert.equal(result.files.length, 5);
+    assert.equal(result.context.attempt, '1'); assert.equal(result.files.length, 13);
+    assert.equal(result.files.filter(row => row.name.startsWith('core-recovery/')).length, 8);
     assert.throws(() => runCoreWire(root, candidate, path, { env, run }), /already exists/);
     assert.equal(calls, 3, 'existing result must never silently replace a command');
     // Real temporary directory metadata, no executable is ever started.
@@ -315,12 +324,15 @@ with tempfile.TemporaryDirectory(prefix='wire-outer-control-') as tmp:
 });
 
 // Exercise the actual workflow shell with inert command shims, never real Rust builds.
-function helperRunBlock(source = yaml('package')) {
-  const step = source.split('      - name: Build and stage privileged helper\n')[1]?.split('\n      - name:')[0];
+function producerRunBlock(source, name) {
+  const step = source.split(`      - name: ${name}\n`)[1]?.split('\n      - name:')[0];
   const run = step?.split('        run: |\n')[1]?.split('\n').filter((line) => line.startsWith('          '))
     .map((line) => line.slice(10)).join('\n');
   assert(run?.startsWith('set -euo pipefail'), 'helper step/run must exist and fail closed');
   return run;
+}
+function helperRunBlock(source = yaml('package')) {
+  return producerRunBlock(source, 'Build and stage privileged helper');
 }
 const helperPlatforms = [
   ['linux', 'x86_64-unknown-linux-gnu', 'Linux', 'linux', 'polaris-helper'],
@@ -328,44 +340,68 @@ const helperPlatforms = [
   ['macos-arm64', 'aarch64-apple-darwin', 'macOS', 'mac-arm64', 'polaris-helper'],
   ['macos-x64', 'x86_64-apple-darwin', 'macOS', 'mac-x64', 'polaris-helper'],
 ];
-function runHelperFixture(platform, { host = platform[1], source = helperRunBlock(), fail = '', missing = '' } = {}) {
+function runHelperFixture(platform, { host = platform[1], source = helperRunBlock(), fail = '', missing = '', failNodeMode = '' } = {}) {
   const [label, target, os] = platform;
   const directory = mkdtempSync(join(tmpdir(), 'polaris-helper-target-'));
   try {
     const binDir = join(directory, 'bin'), log = join(directory, 'calls.jsonl');
     mkdirSync(binDir); writeFileSync(log, '');
+    mkdirSync(join(directory, 'native-dns-ci-evidence'));
+    mkdirSync(join(directory, 'resources', resDirectory(label)), { recursive: true });
     const shim = `#!${process.execPath}
 const fs = require('node:fs'), path = require('node:path');
 const tool = path.basename(process.argv[1]), args = process.argv.slice(2);
-fs.appendFileSync(process.env.CALL_LOG, JSON.stringify({ tool, args, buildId: process.env.POLARIS_BUILD_ID }) + '\\n');
+fs.appendFileSync(process.env.CALL_LOG, JSON.stringify({ tool, args, buildId: process.env.POLARIS_BUILD_ID, anchor: process.env.POLARIS_WINDOWS_INSTALL_ANCHOR }) + '\\n');
 if (tool === process.env.FAIL_TOOL) process.exit(7);
+const nodeMode = args.includes('--mode=maintenance-anchor') ? 'maintenance-anchor'
+  : args[0] === 'scripts/prepare-core-identity.mjs' ? 'prepare'
+  : args[0] === '--input-type=module' ? 'identity-export' : '';
+if (tool === 'node' && nodeMode && nodeMode === process.env.FAIL_NODE_MODE) process.exit(7);
 if (tool === 'rustc') { process.stdout.write(process.env.RUSTC_OUTPUT); }
 if (tool === 'cargo') {
   const at = args.indexOf('--target'), target = at < 0 ? '' : args[at + 1];
   const binary = args[args.indexOf('--bin') + 1] + (process.env.FIXTURE_OS === 'Windows' ? '.exe' : '');
   if (binary !== process.env.MISSING_BINARY) {
-    const output = path.join('target', target, 'release', binary);
+    const output = path.join('target', target, args.includes('--release') ? 'release' : 'debug', binary);
     fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, 'inert ' + binary);
   }
 }
 if (tool === 'cp') fs.copyFileSync(args[0], args[1]);
+if (tool === 'node' && nodeMode === 'maintenance-anchor') process.stdout.write(JSON.stringify({core_id: 'c'.repeat(64), helper_sha256: 'd'.repeat(64)}));
+if (tool === 'node' && nodeMode === 'identity-export') {
+  // Execute the actual tiny inline producer with the real Node, not a second
+  // imitation of its final GITHUB_ENV write. All files remain in this fixture.
+  const result = require('node:child_process').spawnSync(process.execPath, args,
+    { input: fs.readFileSync(0), env: process.env, encoding: 'utf8' });
+  if (result.error) throw result.error;
+  process.stdout.write(result.stdout); process.stderr.write(result.stderr);
+  process.exit(result.status ?? 1);
+}
 `;
     for (const tool of ['rustc', 'cargo', 'cp', 'codesign', 'node']) writeFileSync(join(binDir, tool), shim, { mode: 0o755 });
     const rendered = source.replaceAll('${{ matrix.label }}', label)
       .replaceAll('${{ matrix.rust_target }}', target).replaceAll('${{ runner.os }}', os);
     assert.doesNotMatch(rendered, /\$\{\{/);
+    const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}`, CALL_LOG: log,
+      RUSTC_OUTPUT: host === null ? 'rustc fixture\n' : `rustc fixture\nhost: ${host}\n`,
+      FIXTURE_OS: os, FAIL_TOOL: fail, FAIL_NODE_MODE: failNodeMode, MISSING_BINARY: missing,
+      POLARIS_BUILD_ID: candidate, GITHUB_WORKSPACE: directory, GITHUB_ENV: join(directory, 'env'),
+      RUNNER_OS: os, CORE_CANDIDATE: candidate, POLARIS_NATIVE_DNS_CANDIDATE: '',
+      POLARIS_NATIVE_DNS_PLATFORM: resDirectory(label),
+      POLARIS_CORE_CARRIER_DIR: join(directory, 'resources', resDirectory(label)) };
+    delete env.POLARIS_WINDOWS_INSTALL_ANCHOR;
     const result = spawnSync('bash', ['-e', '-o', 'pipefail', '-c', rendered], {
       cwd: directory, encoding: 'utf8', timeout: 15000,
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, CALL_LOG: log,
-        RUSTC_OUTPUT: host === null ? 'rustc fixture\n' : `rustc fixture\nhost: ${host}\n`,
-        FIXTURE_OS: os, FAIL_TOOL: fail, MISSING_BINARY: missing,
-        POLARIS_BUILD_ID: candidate, GITHUB_WORKSPACE: directory, GITHUB_ENV: join(directory, 'env') },
+      env,
     });
     assert.ifError(result.error);
     return { status: result.status, stderr: result.stderr, stdout: result.stdout,
       calls: readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)),
       identity: existsSync(join(directory, 'env')) ? readFileSync(join(directory, 'env'), 'utf8') : '', directory };
   } finally { rmSync(directory, { recursive: true, force: true }); }
+}
+function resDirectory(label) {
+  return { linux: 'linux', windows: 'win', 'macos-arm64': 'mac-arm64', 'macos-x64': 'mac-x64' }[label] ?? 'unknown';
 }
 function assertHelperFixture(platform, options = {}) {
   const [label, target, os, res, binary] = platform;
@@ -378,6 +414,10 @@ function assertHelperFixture(platform, options = {}) {
     ...(label === 'windows' ? [['build', '--release', '-p', 'polaris-windows-cleaner', '--bin', 'polaris-cleaner']] : []),
   ]);
   assert(builds.every(({ buildId }) => buildId === candidate));
+  if(label==='windows') {
+    assert.equal(builds[0].anchor,undefined,'helper/library cannot embed cleaner anchor');
+    assert.deepEqual(JSON.parse(builds[1].anchor),{core_id:'c'.repeat(64),helper_sha256:'d'.repeat(64)});
+  }
   const output = mac ? `target/${target}/release` : 'target/release';
   assert.deepEqual(result.calls.filter(({ tool }) => tool === 'cp').map(({ args }) => args), [
     [`${output}/${binary}`, `resources/${res}/${binary}`],
@@ -385,12 +425,13 @@ function assertHelperFixture(platform, options = {}) {
   ]);
   const tools = result.calls.map(({ tool }) => tool);
   assert.deepEqual(tools, mac ? ['cargo', 'cp', 'codesign', 'codesign', 'node']
-    : label === 'windows' ? ['rustc', 'cargo', 'cp', 'cargo', 'cp', 'node'] : ['rustc', 'cargo', 'cp', 'node']);
+    : label === 'windows' ? ['rustc', 'cargo', 'cp', 'node', 'cargo', 'cp', 'node'] : ['rustc', 'cargo', 'cp', 'node']);
   assert.deepEqual(result.calls.filter(({ tool }) => tool === 'rustc').map(({ args }) => args), mac ? [] : [['-vV']]);
   if (!mac) assert(tools.indexOf('rustc') < tools.indexOf('cargo'));
   assert.equal(tools.at(-1), 'node', 'identity prepared only after every staged binary');
   assert.deepEqual(result.calls.at(-1).args, ['scripts/prepare-core-identity.mjs', `--platform=${res}`]);
-  assert.equal(result.identity, `POLARIS_CORE_IDENTITY_FILE=${result.directory}/resources/${res}/core-manifest.json\n`);
+  const anchorLine = label === 'windows' ? `POLARIS_WINDOWS_INSTALL_ANCHOR=${JSON.stringify({core_id: 'c'.repeat(64), helper_sha256: 'd'.repeat(64)})}\n` : '';
+  assert.equal(result.identity, anchorLine + `POLARIS_CORE_IDENTITY_FILE=${result.directory}/resources/${res}/core-manifest.json\n`);
   assert.deepEqual(result.calls.filter(({ tool }) => tool === 'codesign').map(({ args }) => args),
     mac ? Array.from({ length: 2 }, () => ['--verify', '--strict', `resources/${res}/${binary}`]) : []);
 }
@@ -425,16 +466,22 @@ test('helper host mismatch, absent host, unknown platform and failed staging sto
   for (const missing of ['polaris-helper.exe', 'polaris-cleaner.exe']) {
     const result = runHelperFixture(helperPlatforms[1], { missing });
     assert.notEqual(result.status, 0); assert.equal(result.identity, '');
-    assert(!result.calls.some(({ tool }) => tool === 'node'));
+    const nodes = result.calls.filter(({ tool }) => tool === 'node');
+    assert.deepEqual(nodes.map(({ args }) => args), missing === 'polaris-helper.exe' ? [] : [
+      ['scripts/prepare-core-identity.mjs', '--platform=win', '--mode=maintenance-anchor',
+        '--helper-binary=resources/win/polaris-helper.exe'],
+    ], 'only the verified pre-cleaner anchor may run before a cleaner-staging failure');
+    assert(!nodes.some(({ args }) => !args.includes('--mode=maintenance-anchor')),
+      'a failed stage must never publish full identity');
   }
 });
 
 test('helper target/path controls reject old split-target mode, host drift and incomplete cleaner staging', () => {
   const source = helperRunBlock();
   for (const [platform, before, after] of [
-    [helperPlatforms[0], 'target_args=()', 'target_args=(--target "${{ matrix.rust_target }}")'],
+    [helperPlatforms[0], 'set --\n', 'set -- --target "${{ matrix.rust_target }}"\n'],
     [helperPlatforms[1], 'output_dir=target/release', 'output_dir="target/${{ matrix.rust_target }}/release"'],
-    [helperPlatforms[3], 'target_args=(--target "${{ matrix.rust_target }}")', 'target_args=()'],
+    [helperPlatforms[3], 'set -- --target "${{ matrix.rust_target }}"', 'set --'],
     [helperPlatforms[1], 'cp "$output_dir/polaris-cleaner.exe" resources/win/polaris-cleaner.exe', ':'],
   ]) {
     const changed = source.replace(before, after); assert.notEqual(changed, source);
@@ -446,6 +493,61 @@ test('helper target/path controls reject old split-target mode, host drift and i
   const accepted = runHelperFixture(helperPlatforms[0], { host: 'wrong-triple', source: unchecked });
   assert.equal(accepted.status, 0); assert(accepted.calls.some(({ tool }) => tool === 'cargo'));
 });
+
+function assertAnchorFailureStopsProducer(source, ci, result = runHelperFixture(helperPlatforms[1], { source, failNodeMode: 'maintenance-anchor' })) {
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.calls.map(({ tool }) => tool), ci
+    ? ['cargo', 'cp', 'node'] : ['rustc', 'cargo', 'cp', 'node']);
+  assert.equal(result.calls.at(-1).tool, 'node', 'the requested failure must actually be reached');
+  assert(result.calls.at(-1).args.includes('--mode=maintenance-anchor'));
+  assert(!result.calls.some(({ tool, args }) => tool === 'cargo' && args.includes('polaris-cleaner')));
+  assert.equal(result.identity, '', 'failed anchor cannot publish a carrier or final identity');
+}
+test('both actual Windows producer shells stop at failed anchor before cleaner or full identity', () => {
+  const ci = producerRunBlock(yaml('ci'), 'Build actual candidate helper bytes and freeze the separate App identity');
+  for (const [source, isCI] of [[helperRunBlock(), false], [ci, true]]) {
+    const success = runHelperFixture(helperPlatforms[1], { source });
+    assert.equal(success.status, 0, success.stdout + success.stderr);
+    const builds = success.calls.filter(({ tool }) => tool === 'cargo');
+    assert.deepEqual(builds.map(({ args }) => args), [
+      ['build', ...(isCI ? ['--locked'] : ['--release']), '-p', 'polaris-helper', '--bin', 'polaris-helper'],
+      ['build', ...(isCI ? ['--locked'] : ['--release']), '-p', 'polaris-windows-cleaner', '--bin', 'polaris-cleaner'],
+    ]);
+    assert(builds.every(({ buildId }) => buildId === candidate));
+    assert.equal(builds[0].anchor, undefined);
+    assert.deepEqual(JSON.parse(builds[1].anchor), { core_id: 'c'.repeat(64), helper_sha256: 'd'.repeat(64) });
+    const full = success.calls.filter(({ tool, args }) => tool === 'node'
+      && args[0] === 'scripts/prepare-core-identity.mjs' && !args.includes('--mode=maintenance-anchor'));
+    assert.equal(full.length, 1, 'exactly one full preparation follows the actual cleaner build');
+    const selected = success.identity.split('\n').find(line => line.startsWith('POLARIS_CORE_IDENTITY_FILE='));
+    assert(selected, 'final identity path must actually be exported');
+    assert.equal(selected.slice('POLARIS_CORE_IDENTITY_FILE='.length).replaceAll('\\', '/'),
+      join(success.directory, 'resources', 'win', 'core-manifest.json').replaceAll('\\', '/'));
+    assertAnchorFailureStopsProducer(source, isCI);
+    // Positive oracle control: restoring the old export-command substitution
+    // must not masquerade as a failure at the requested anchor boundary.
+    const unchecked = source.replace(/(^[ \t]*)POLARIS_WINDOWS_INSTALL_ANCHOR=(.*)\n\1export POLARIS_WINDOWS_INSTALL_ANCHOR/m,
+      '$1export POLARIS_WINDOWS_INSTALL_ANCHOR=$2');
+    assert.notEqual(unchecked, source);
+    const leaked = runHelperFixture(helperPlatforms[1], { source: unchecked, failNodeMode: 'maintenance-anchor' });
+    assert.equal(leaked.status, 0, 'unchecked export control must really pass the failed child boundary');
+    assert(leaked.calls.some(({ tool, args }) => tool === 'cargo' && args.includes('polaris-cleaner')));
+    assert.throws(() => assertAnchorFailureStopsProducer(unchecked, isCI, leaked));
+    const rejected = runHelperFixture(helperPlatforms[1], { source, failNodeMode: 'prepare' });
+    assert.notEqual(rejected.status, 0);
+    assert.equal(rejected.calls.at(-1).tool, 'node');
+    assert(!rejected.calls.at(-1).args.includes('--mode=maintenance-anchor'));
+    assert(!rejected.identity.includes('POLARIS_CORE_IDENTITY_FILE='),
+      'an anchor-only GITHUB_ENV line is not a final installation identity');
+    if (isCI) {
+      const failedExport = runHelperFixture(helperPlatforms[1], { source, failNodeMode: 'identity-export' });
+      assert.notEqual(failedExport.status, 0);
+      assert.deepEqual(failedExport.calls.at(-1).args, ['--input-type=module', '-']);
+      assert(!failedExport.identity.includes('POLARIS_CORE_IDENTITY_FILE='));
+    }
+  }
+});
+
 
 function assertLauncherDiagnosticJob(source) {
   // These original fixture matrices need only JSON rendering/key presence;

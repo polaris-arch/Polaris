@@ -113,6 +113,7 @@ pub(crate) enum MainPrerequisiteError {
     TargetMissing,
     ReadyUnknown,
     UnsavedConfiguration,
+    ApiViewStale,
 }
 
 impl MainPrerequisiteError {
@@ -124,6 +125,7 @@ impl MainPrerequisiteError {
             Self::TargetMissing => "targetNotInMain",
             Self::ReadyUnknown => "readyUnknown",
             Self::UnsavedConfiguration => "unsavedConfiguration",
+            Self::ApiViewStale => "apiViewStale",
         }
     }
 }
@@ -138,13 +140,13 @@ impl std::fmt::Display for MainPrerequisiteError {
 }
 
 pub(super) struct ReadyMainCore {
-    generation: u64,
-    saved_digest: String,
+    pub(super) generation: u64,
+    pub(super) saved_digest: String,
     emission_digest: String,
     diagnostic_secret_keys: BTreeSet<String>,
     targets: BTreeMap<String, String>,
-    status: ProxyStatus,
-    api_secret: String,
+    pub(super) status: ProxyStatus,
+    pub(super) api_secret: String,
     probe_ports: Vec<u16>,
     local_http_proxy: Option<LocalHttpProxy>,
     committed: AtomicBool,
@@ -154,11 +156,27 @@ pub(super) struct ReadyMainCore {
     raw_config_digest: Option<String>,
 }
 
+impl ReadyMainCore {
+    pub(super) fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ReadyMainAPIView {
+    pub(super) port: u16,
+    pub(super) secret: String,
+    pub(super) saved_digest: String,
+    pub(super) epoch: Arc<super::runtime_config::api_handoff::ApiRelayEpoch>,
+    pub(super) active: Option<polaris_singbox_grpc::daemon::RuntimeIdentity>,
+}
+
 /// Producer-only fields; bools, events and cached status cannot mint this value.
 #[derive(Clone)]
 pub(crate) struct ReadyMainTicket {
     core: Arc<ReadyMainCore>,
     binding: ActionBinding,
+    pub(super) api_view: Option<ReadyMainAPIView>,
 }
 
 impl ReadyMainTicket {
@@ -166,11 +184,23 @@ impl ReadyMainTicket {
         self.core.generation
     }
     pub(crate) fn api_port(&self) -> u16 {
-        self.core.status.clash_api_port
+        self.api_view
+            .as_ref()
+            .map(|v| v.port)
+            .unwrap_or(self.core.status.clash_api_port)
     }
     pub(crate) fn api_secret(&self) -> &str {
-        &self.core.api_secret
+        self.api_view
+            .as_ref()
+            .map(|v| v.secret.as_str())
+            .unwrap_or(&self.core.api_secret)
     }
+    pub(crate) fn api_epoch_borrow(
+        &self,
+    ) -> Option<super::runtime_config::api_handoff::ApiRelayBorrow> {
+        self.api_view.as_ref().map(|view| view.epoch.borrow())
+    }
+
     pub(crate) fn start_time(&self) -> Option<u64> {
         self.core.status.start_time
     }
@@ -333,7 +363,7 @@ impl NormalStartClaim {
     }
 }
 
-fn digest(value: &Value) -> Result<String, MainPrerequisiteError> {
+pub(super) fn digest(value: &Value) -> Result<String, MainPrerequisiteError> {
     serde_json::to_vec(value)
         .map(|bytes| polaris_updater::sha256_hex(&bytes))
         .map_err(|_| MainPrerequisiteError::ReadyUnknown)
@@ -460,15 +490,28 @@ where
     {
         return false;
     }
-    let api = connect(ticket.api_port(), ticket.api_secret().to_owned()).await;
-    if !check() {
+    let borrow = ticket.api_epoch_borrow();
+    if borrow.as_ref().is_some_and(|b| b.is_closed()) {
         return false;
     }
-    let selected = api
-        .select_outbound(&format!("probe-selector-{slot}"), member_tag)
-        .await
-        .is_ok();
-    selected && check()
+    let work = async {
+        let api = connect(ticket.api_port(), ticket.api_secret().to_owned()).await;
+        if !check() {
+            return false;
+        }
+        let selected = api
+            .select_outbound(&format!("probe-selector-{slot}"), member_tag)
+            .await
+            .is_ok();
+        selected && check()
+    };
+    // Scoped cancellation unwinds the actual selector future before returning
+    // its epoch borrow. Production uses the captured carrier, never a lazy redial.
+    tokio::select! {
+        biased;
+        _ = super::runtime_config::api_handoff::relay_cancelled(&borrow) => false,
+        selected = work => selected,
+    }
 }
 
 fn check_binding(
@@ -482,7 +525,14 @@ fn check_binding(
     if generation != ticket.generation() || !running || busy {
         return Err(MainPrerequisiteError::Superseded);
     }
-    if saved_digest != ticket.binding.saved_digest || saved_digest != ticket.core.saved_digest {
+    if saved_digest != ticket.binding.saved_digest
+        || saved_digest
+            != ticket
+                .api_view
+                .as_ref()
+                .map(|v| v.saved_digest.as_str())
+                .unwrap_or(&ticket.core.saved_digest)
+    {
         return Err(MainPrerequisiteError::ConfigurationChanged);
     }
     if !ticket.core.committed.load(Ordering::SeqCst)
@@ -518,7 +568,7 @@ fn check_tailscale_logout_cold(
 
 #[async_trait]
 trait MainReadinessProbe: Sync {
-    async fn observe(&self, core: &ReadyMainCore) -> Result<(), MainPrerequisiteError>;
+    async fn observe(&self, ticket: &ReadyMainTicket) -> Result<(), MainPrerequisiteError>;
 }
 
 async fn validate_with_probe(
@@ -527,24 +577,44 @@ async fn validate_with_probe(
     check: impl Fn() -> Result<(), MainPrerequisiteError>,
 ) -> Result<(), MainPrerequisiteError> {
     check()?;
-    probe.observe(&ticket.core).await?;
+    probe.observe(ticket).await?;
     check()
 }
 
 #[async_trait]
 impl MainReadinessProbe for ProxyRuntime {
-    async fn observe(&self, core: &ReadyMainCore) -> Result<(), MainPrerequisiteError> {
+    async fn observe(&self, ticket: &ReadyMainTicket) -> Result<(), MainPrerequisiteError> {
         #[cfg(target_os = "ios")]
-        tauri_plugin_polaris_ios::refresh_ready_session(&core.ios_receipt)
+        tauri_plugin_polaris_ios::refresh_ready_session(&ticket.core.ios_receipt)
             .await
             .map_err(|_| MainPrerequisiteError::ReadyUnknown)?;
+        let api_borrow = ticket.api_epoch_borrow();
+        if api_borrow.as_ref().is_some_and(|borrow| borrow.is_closed()) {
+            return Err(MainPrerequisiteError::ApiViewStale);
+        }
         // A fresh actual unary RPC is required. TCP/channel construction alone grants nothing.
-        let client = polaris_singbox_grpc::SingBoxApiClient::connect(
-            polaris_singbox_grpc::Endpoint::new("127.0.0.1", core.status.clash_api_port),
-            core.api_secret.clone(),
-        )
-        .await
-        .map_err(|_| MainPrerequisiteError::ReadyUnknown)?;
+        let client = if ticket.api_view.is_some() {
+            self.current_management_client(ticket.api_port())
+                .await
+                .map_err(|_| MainPrerequisiteError::ApiViewStale)?
+        } else {
+            polaris_singbox_grpc::SingBoxApiClient::connect(
+                polaris_singbox_grpc::Endpoint::new("127.0.0.1", ticket.api_port()),
+                ticket.api_secret().to_owned(),
+            )
+            .await
+            .map_err(|_| MainPrerequisiteError::ReadyUnknown)?
+        };
+        if let Some(expected) = ticket.api_view.as_ref().and_then(|v| v.active.as_ref()) {
+            let caps = client
+                .get_runtime_capabilities()
+                .await
+                .map_err(|_| MainPrerequisiteError::ApiViewStale)?;
+            if caps.active.as_ref() != Some(expected) {
+                return Err(MainPrerequisiteError::ApiViewStale);
+            }
+            return Ok(());
+        }
         client
             .get_clash_mode_status()
             .await
@@ -707,7 +777,12 @@ impl ProxyRuntime {
         )
         .map_err(|_| "nativeRetirementUnknown")?
         .for_attempt(generation, attempt.clone());
-        let ticket = ReadyMainTicket { core, binding };
+        let api_view = self.api_view_for_ready_ticket(&core, &binding.saved_digest);
+        let ticket = ReadyMainTicket {
+            core,
+            binding,
+            api_view,
+        };
         self.check_ready_main(&ticket)
             .map_err(|error| error.code().to_owned())?;
         let tag = ticket.target_tag(id).ok_or("targetNotInMain")?.to_owned();
@@ -1160,8 +1235,73 @@ impl ProxyRuntime {
     ) -> (Arc<Self>, ReadyMainTicket, crate::test_support::TestDir) {
         let (runtime, directory) = tests::runtime();
         let (core, binding) = tests::ready_for(&runtime);
-        (runtime, ReadyMainTicket { core, binding }, directory)
+        (
+            runtime,
+            ReadyMainTicket {
+                core,
+                binding,
+                api_view: None,
+            },
+            directory,
+        )
     }
+    #[cfg(all(test, not(target_os = "ios")))]
+    pub(crate) fn ready_api_commit_fixture_for_test(
+        port: u16,
+        secret: String,
+    ) -> (Arc<Self>, ReadyMainTicket, crate::test_support::TestDir) {
+        let (runtime, directory) = tests::runtime();
+        // This fixture reaches the real config builder and deferred Taildrop
+        // consumer. Its selected local node and emitted topology must agree;
+        // an empty server table fails before either API-view assertion runs.
+        let before = runtime.config.current().unwrap();
+        let mut saved = before.clone();
+        saved["servers"] = serde_json::json!([{
+            "id":"taildrop-node", "name":"emitted-node", "protocol":"tailscale",
+            "tailscaleSettings":{}
+        }]);
+        saved["selectedServerId"] = serde_json::json!("taildrop-node");
+        saved["controlApiPort"] = serde_json::json!(port);
+        saved["clashApiSecret"] = serde_json::json!(secret);
+        runtime
+            .config
+            .save_full_deferred_cleanup(&before, &saved)
+            .unwrap();
+        let (original, binding) = tests::ready_for_at(&runtime, port, secret);
+        let typed: UserConfig = serde_json::from_value(saved.clone()).unwrap();
+        let deps = runtime.generate_deps(port, 0, 0, None, &[], &saved, false);
+        let generated = polaris_config_engine::builder::generate_sing_box_config(
+            &typed,
+            &BTreeMap::new(),
+            &deps,
+        )
+        .unwrap();
+        runtime
+            .capture_ready_main(
+                runtime.core_generation(),
+                &saved,
+                &typed,
+                &serde_json::to_value(&generated).unwrap(),
+                &original.status,
+            )
+            .unwrap();
+        let core = runtime.ready_main.read().unwrap().clone().unwrap();
+        assert_eq!(
+            core.targets.get("taildrop-node").map(String::as_str),
+            Some("emitted-node")
+        );
+        assert!(runtime.commit_ready_main(runtime.core_generation()));
+        (
+            runtime,
+            ReadyMainTicket {
+                core,
+                binding,
+                api_view: None,
+            },
+            directory,
+        )
+    }
+
     fn join_current_normal_start(
         &self,
         saved: &Value,
@@ -1732,7 +1872,12 @@ impl ProxyRuntime {
         };
         self.wait_ready_main_stable(&core, &binding, Duration::from_secs(90))
             .await?;
-        let ticket = ReadyMainTicket { core, binding };
+        let api_view = self.api_view_for_ready_ticket(&core, &binding.saved_digest);
+        let ticket = ReadyMainTicket {
+            core,
+            binding,
+            api_view,
+        };
         self.validate_ready_main(&ticket).await?;
         Ok(ticket)
     }
@@ -1785,7 +1930,12 @@ impl ProxyRuntime {
             return Ok(None);
         }
         let core = self.ready_main_for_generation(generation)?;
-        let ticket = ReadyMainTicket { core, binding };
+        let api_view = self.api_view_for_ready_ticket(&core, &binding.saved_digest);
+        let ticket = ReadyMainTicket {
+            core,
+            binding,
+            api_view,
+        };
         self.validate_ready_main(&ticket).await?;
         Ok(Some(ticket))
     }
@@ -1815,8 +1965,24 @@ impl ProxyRuntime {
             .map_err(|_| MainPrerequisiteError::ReadyUnknown)?
             .clone();
         let status = self.status();
-        if status.clash_api_port != ticket.api_port()
-            || status.start_time != ticket.start_time()
+        if self.core_generation() != ticket.generation()
+            || !status.running
+            || self.core_lifecycle_busy()
+        {
+            return Err(MainPrerequisiteError::Superseded);
+        }
+        if !self.api_ticket_view_is_current(
+            ticket.api_view.as_ref(),
+            ticket.generation(),
+            ticket.api_port(),
+            ticket.api_secret(),
+        ) {
+            return Err(MainPrerequisiteError::ApiViewStale);
+        }
+        if status.clash_api_port != ticket.api_port() {
+            return Err(MainPrerequisiteError::ApiViewStale);
+        }
+        if status.start_time != ticket.start_time()
             || self.local_http_proxy() != ticket.local_http_proxy()
             || self
                 .speed_probe_targets()
@@ -1927,8 +2093,24 @@ impl ProxyRuntime {
                             .as_ref()
                             .map(|s| s.probe_pool_ports.as_slice())
                             .unwrap_or_default();
-                        if status.clash_api_port != ticket.api_port()
-                            || status.start_time != ticket.start_time()
+                        if live.generation() != ticket.generation()
+                            || !status.running
+                            || live.is_busy()
+                        {
+                            return Err(MainPrerequisiteError::Superseded);
+                        }
+                        if !self.api_ticket_view_is_current(
+                            ticket.api_view.as_ref(),
+                            ticket.generation(),
+                            ticket.api_port(),
+                            ticket.api_secret(),
+                        ) {
+                            return Err(MainPrerequisiteError::ApiViewStale);
+                        }
+                        if status.clash_api_port != ticket.api_port() {
+                            return Err(MainPrerequisiteError::ApiViewStale);
+                        }
+                        if status.start_time != ticket.start_time()
                             || local_proxy != ticket.local_http_proxy()
                             || ports != ticket.probe_ports()
                         {

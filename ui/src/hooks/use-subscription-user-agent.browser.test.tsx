@@ -96,15 +96,30 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1').each(['desktop', 'mobi
   async function ready(page: Page, expected: string) {
     await page.waitForFunction(value => document.querySelector('#ua-info')?.textContent?.includes(value), expected);
   }
+  async function metadataText(page: Page) {
+    if (surface === 'desktop') return page.locator('#ua-info .info-i').getAttribute('aria-label');
+    const trigger = page.locator('#ua-info .m-info-trigger');
+    await trigger.click();
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor({ state: 'visible' });
+    const value = await dialog.textContent();
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'hidden' });
+    expect(await trigger.evaluate(node => document.activeElement === node)).toBe(true);
+    return value;
+  }
+
 
   it('shows actual default, global and custom values without filling the optional input; failure clears stale identity and retries', async () => {
     const page = await pageForTest();
     try {
       expect(await page.getByTestId('ua-input').inputValue()).toBe('');
       expect(await text(page)).toContain('Reading versions');
-      await reply(page, 0, INFO); await ready(page, INFO.appVersion);
-      expect(await text(page)).toContain(INFO.coreVersion);
+      await reply(page, 0, INFO); await ready(page, INFO.effectiveUserAgent!);
+      expect(await metadataText(page)).toContain(INFO.coreVersion);
       expect(await text(page)).toContain(INFO.defaultUserAgent);
+      expect(await page.locator('#ua-info bdi').count()).toBe(1);
+      expect(await text(page)).not.toContain(INFO.appVersion);
       expect(await page.getByTestId('ua-input').getAttribute('placeholder')).toBe(INFO.fallbackUserAgent);
       expect(await page.getByTestId('ua-input').inputValue()).toBe('');
       await page.evaluate(() => (window as unknown as TestWindow).__uaTest.global('global/2'));
@@ -136,11 +151,13 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1').each(['desktop', 'mobi
     try {
       await reply(page, 0, { ...INFO, effectiveStatus: 'unavailable', fallbackUserAgent: null,
         effectiveUserAgent: null, source: null });
-      await ready(page, 'Effective User-Agent unavailable');
-      expect(await text(page)).toContain(INFO.appVersion);
-      expect(await text(page)).toContain(INFO.coreVersion);
-      expect(await text(page)).toContain(INFO.defaultUserAgent);
-      expect(await text(page)).not.toContain('Effective User-Agent (app default)');
+      await ready(page, 'User-Agent preview unavailable');
+      const metadata = await metadataText(page);
+      expect(metadata).toContain(INFO.appVersion);
+      expect(metadata).toContain(INFO.coreVersion);
+      expect(metadata).toContain(INFO.defaultUserAgent);
+      expect(await page.locator('#ua-info bdi').count()).toBe(0);
+      expect(await text(page)).not.toContain('Planned User-Agent (app default)');
       expect(await page.getByTestId('ua-input').getAttribute('placeholder')).not.toBe(INFO.defaultUserAgent);
       expect(await page.getByTestId('ua-input').inputValue()).toBe('');
       await page.getByRole('button', { name: 'Retry', exact: true }).click(); await count(page, 2);
@@ -154,15 +171,18 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1').each(['desktop', 'mobi
   it('rejects older A→B→A replies and does not revive cached A while the latest read is pending', async () => {
     const page = await pageForTest();
     try {
-      await reply(page, 0, INFO); await ready(page, INFO.appVersion);
+      await reply(page, 0, INFO); await ready(page, INFO.effectiveUserAgent!);
       await page.getByTestId('ua-input').fill('A'); await count(page, 2);
       await page.getByTestId('ua-input').fill('B'); await count(page, 3);
       await page.getByTestId('ua-input').fill('A'); await count(page, 4);
       await reply(page, 1, { ...INFO, appVersion: 'stale-A' });
       await reply(page, 2, { ...INFO, appVersion: 'stale-B' });
       expect(await text(page)).not.toMatch(/stale-A|stale-B|app-real-port-fixture/);
+      expect(await page.locator('#ua-info .info-i, #ua-info .m-info-trigger').count()).toBe(0);
       await reply(page, 3, { ...INFO, appVersion: 'current-A', source: 'subscription', effectiveUserAgent: 'A' });
-      await ready(page, 'current-A');
+      await ready(page, 'Planned User-Agent (subscription setting): A');
+      expect(await metadataText(page)).toContain('current-A');
+      expect(await metadataText(page)).not.toMatch(/stale-A|stale-B/);
       expect(await page.getByTestId('ua-input').inputValue()).toBe('A');
     } finally { await page.close(); }
   }, 30_000);
@@ -177,6 +197,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1').each(['desktop', 'mobi
       await reply(page, 1, { ...INFO, coreVersion: 'unknown' }); await ready(page, 'Could not read versions');
       expect(await text(page)).not.toContain('unknown');
       expect(await text(page)).not.toContain(INFO.defaultUserAgent);
+      expect(await page.locator('#ua-info .info-i, #ua-info .m-info-trigger, #ua-info bdi').count()).toBe(0);
       await page.getByRole('button', { name: 'Retry', exact: true }).click(); await count(page, 3);
       await reply(page, 2, undefined); await ready(page, 'Could not read versions');
       expect(await text(page)).not.toContain(INFO.appVersion);

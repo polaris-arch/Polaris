@@ -123,3 +123,132 @@ fn file_count_is_bounded_before_any_task_enters_the_registry() {
     );
     assert!(runtime.snapshots(None).is_empty());
 }
+
+#[test]
+fn transport_readiness_changes_phase_without_inventing_progress_or_receipt() {
+    let runtime = TaildropRuntime::default();
+    let sink = RecordingSink::default();
+    let task = start(&runtime, "same.bin", 65537);
+    assert_eq!(task.snapshot.phase, TaildropTaskPhase::Connecting);
+    runtime.mark_sending(&task.snapshot.task_id, &sink);
+    let ready = runtime.snapshots(None).pop().unwrap();
+    assert_eq!(ready.phase, TaildropTaskPhase::Sending);
+    assert_eq!(ready.sent_bytes, 0);
+    assert_eq!(ready.acknowledged_bytes, 0);
+    assert_eq!(ready.files[0].sent_bytes, 0);
+    assert!(!ready.files[0].completed);
+}
+
+#[test]
+fn cancel_at_opening_or_resume_read_keeps_terminal_state_and_next_task_independent() {
+    for headers_received in [false, true] {
+        let runtime = TaildropRuntime::default();
+        let sink = RecordingSink::default();
+        let mut old = start(&runtime, "same.bin", 65537);
+        if headers_received {
+            runtime.mark_sending(&old.snapshot.task_id, &sink);
+        }
+        runtime.cancel(&old.snapshot.task_id, &sink).unwrap();
+        assert!(*old.cancel.borrow_and_update());
+        runtime.record_progress(&old.snapshot.task_id, 0, 17, false, &sink);
+        runtime.record_acknowledged(&old.snapshot.task_id, 17, &sink);
+        let canceling = runtime.snapshots(None).pop().unwrap();
+        assert_eq!(canceling.phase, TaildropTaskPhase::Canceling);
+        assert_eq!(canceling.sent_bytes, 0);
+        assert_eq!(canceling.acknowledged_bytes, 0);
+        runtime.canceled(&old.snapshot.task_id, &sink);
+        let canceled = runtime.snapshots(None).pop().unwrap();
+        runtime.mark_sending(&old.snapshot.task_id, &sink);
+        runtime.record_progress(&old.snapshot.task_id, 0, 65537, true, &sink);
+        runtime.record_acknowledged(&old.snapshot.task_id, 65537, &sink);
+        runtime.complete(&old.snapshot.task_id, &sink);
+        runtime.fail(&old.snapshot.task_id, "late-failure", &sink);
+        assert_eq!(runtime.snapshots(None).pop().unwrap(), canceled);
+        assert_eq!(canceled.phase, TaildropTaskPhase::Canceled);
+        assert!(!canceled.files[0].completed);
+        let next = start(&runtime, "same.bin", 65537);
+        assert_ne!(next.snapshot.task_id, old.snapshot.task_id);
+        assert!(!*next.cancel.borrow());
+        assert_eq!(next.snapshot.sent_bytes, 0);
+        assert_eq!(next.snapshot.acknowledged_bytes, 0);
+        assert_eq!(next.snapshot.phase, TaildropTaskPhase::Connecting);
+    }
+}
+
+#[test]
+fn acknowledgements_are_stream_cumulative_across_files_and_ignore_duplicate_or_stale_values() {
+    const MIB: u64 = 1024 * 1024;
+    let runtime = TaildropRuntime::default();
+    let sink = RecordingSink::default();
+    let task = runtime
+        .start_task(
+            "server-a".into(),
+            "peer-a".into(),
+            vec![
+                ("first.bin".into(), MIB + 3),
+                ("second.bin".into(), 2 * MIB + 7),
+            ],
+        )
+        .unwrap();
+    let id = &task.snapshot.task_id;
+    runtime.mark_sending(id, &sink);
+    runtime.record_acknowledged(id, MIB as i64, &sink);
+    assert_eq!(runtime.snapshots(None)[0].acknowledged_bytes, MIB);
+    runtime.record_progress(id, 0, (MIB + 3) as i64, true, &sink);
+    runtime.record_acknowledged(id, (2 * MIB) as i64, &sink);
+    let second_ack = runtime.snapshots(None).pop().unwrap();
+    assert_eq!(second_ack.acknowledged_bytes, 2 * MIB);
+    assert!(second_ack.files[0].completed);
+    assert!(!second_ack.files[1].completed);
+    for stale in [(2 * MIB) as i64, MIB as i64, 0, -1, i64::MIN] {
+        runtime.record_acknowledged(id, stale, &sink);
+        assert_eq!(
+            runtime.snapshots(None)[0],
+            second_ack,
+            "stale ACK changed snapshot/revision"
+        );
+    }
+    runtime.record_progress(id, 1, 17, false, &sink);
+    assert_eq!(runtime.snapshots(None)[0].acknowledged_bytes, 2 * MIB);
+    runtime.record_acknowledged(id, i64::MAX, &sink);
+    let clamped = runtime.snapshots(None).pop().unwrap();
+    assert_eq!(clamped.acknowledged_bytes, 3 * MIB + 10);
+    assert_eq!(clamped.phase, TaildropTaskPhase::Sending);
+    assert!(
+        !clamped.files[1].completed,
+        "ACK is not a completion receipt"
+    );
+    runtime.record_acknowledged(id, (2 * MIB) as i64, &sink);
+    assert_eq!(runtime.snapshots(None)[0], clamped);
+    runtime.complete(id, &sink);
+    let completed = runtime.snapshots(None).pop().unwrap();
+    assert_eq!(completed.phase, TaildropTaskPhase::Completed);
+    assert_eq!(completed.sent_bytes, completed.total_bytes);
+    assert_eq!(completed.acknowledged_bytes, completed.total_bytes);
+    assert!(completed.files.iter().all(|file| file.completed));
+    runtime.record_acknowledged(id, 0, &sink);
+    assert_eq!(runtime.snapshots(None)[0], completed);
+}
+
+#[test]
+fn cumulative_ack_during_cancel_or_after_terminal_cannot_mutate_revision() {
+    let runtime = TaildropRuntime::default();
+    let sink = RecordingSink::default();
+    let task = start(&runtime, "large.bin", 4 * 1024 * 1024);
+    let id = &task.snapshot.task_id;
+    runtime.record_acknowledged(id, 1024 * 1024, &sink);
+    runtime.cancel(id, &sink).unwrap();
+    let canceling = runtime.snapshots(None).pop().unwrap();
+    for received in [2 * 1024 * 1024, i64::MAX, -1] {
+        runtime.record_acknowledged(id, received, &sink);
+        assert_eq!(runtime.snapshots(None)[0], canceling);
+    }
+    runtime.canceled(id, &sink);
+    let canceled = runtime.snapshots(None).pop().unwrap();
+    for received in [2 * 1024 * 1024, i64::MAX, -1] {
+        runtime.record_acknowledged(id, received, &sink);
+        assert_eq!(runtime.snapshots(None)[0], canceled);
+    }
+    assert_eq!(canceled.acknowledged_bytes, 1024 * 1024);
+    assert_eq!(canceled.phase, TaildropTaskPhase::Canceled);
+}

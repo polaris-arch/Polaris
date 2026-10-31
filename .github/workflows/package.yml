@@ -41,34 +41,6 @@ on:
   # 单平台用于定位平台故障，发布仍必须 all。
   workflow_dispatch:
     inputs:
-      linux_auth_preflight_only:
-        description: 'Read-only exact-source runner group diagnostic in setup only; no credential authority'
-        type: boolean
-        default: false
-      linux_package_acceptance:
-        description: 'Run real unpacked Linux final packages on this exact reviewed branch (no branch publication)'
-        type: boolean
-        default: false
-      linux_tun_acceptance:
-        description: 'Explicit same-final-carrier TUN test on two disposable VMs; selected tests gate publication'
-        type: boolean
-        default: false
-      linux_tun_auth_mode:
-        description: 'Temporary password/group modes require separate exact-SHA approval; existing session remains default'
-        type: choice
-        default: existing-session
-        options:
-          - existing-session
-          - temporary-existing-runner-password
-          - temporary-existing-runner-password-and-sudo-group
-      linux_tun_credential_authorization:
-        description: 'Leave empty unless the exact selected password/relock or password/sudo-membership/relock/removal action was approved'
-        type: string
-        default: ''
-      linux_acceptance_candidate:
-        description: 'Explicit exact App SHA required for branch Linux package acceptance'
-        type: string
-        default: ''
       windows_system_candidate:
         description: 'Explicit exact final App SHA for existing hosted Windows SYSTEM checks; requires platform=all'
         type: string
@@ -192,18 +164,16 @@ jobs:
       include: ${{ steps.resolve.outputs.include }}
       full: ${{ steps.resolve.outputs.full }}
       candidate: ${{ steps.resolve.outputs.candidate }}
-      acceptance_enabled: ${{ steps.linux_acceptance_admission.outputs.enabled }}
-      acceptance_context: ${{ steps.linux_acceptance_admission.outputs.context }}
     steps:
       - uses: actions/checkout@v7
         id: checkout
-        if: inputs.linux_auth_preflight_only == true || (inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != '')
+        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v')
         with:
-          ref: ${{ inputs.linux_auth_preflight_only && github.sha || inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@v7
-        if: inputs.linux_auth_preflight_only != true && (inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != '')
+        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v')
         with:
           node-version: '26'
 
@@ -246,7 +216,7 @@ jobs:
       #     那段在原位时同理，Actions 先做 YAML 解析、注释在表达式求值前就被丢掉了。）
       - name: Resolve platform matrix
         id: resolve
-        if: inputs.linux_auth_preflight_only != true
+
         shell: bash
         env:
           # workflow_call 的 platforms JSON 优先；手动/单平台复用继续走 platform。tag push 两者都空，
@@ -267,14 +237,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$SYSTEM_CANDIDATE" ]; then
-            [[ "$SYSTEM_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
-            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
-            [ "$GITHUB_REPOSITORY" = polaris-arch/Polaris ]
-            [[ "$GITHUB_REF" = refs/heads/main || "$GITHUB_REF" = refs/heads/ci/governance ]]
-            [ "$SYSTEM_CANDIDATE" = "$GITHUB_SHA" ]
-            [ "$PLATFORM" = all ]
-            [ -z "$PLATFORMS_JSON" ]
-            [ "$VALIDATION_SKIP_QUALITY" != true ]
+            [[ "$SYSTEM_CANDIDATE" =~ ^[a-f0-9]{40}$ ]] || exit 1
+            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || exit 1
+            [ "$GITHUB_REPOSITORY" = polaris-arch/Polaris ] || exit 1
+            [[ "$GITHUB_REF" = refs/heads/main || "$GITHUB_REF" = refs/heads/ci/governance ]] || exit 1
+            [ "$SYSTEM_CANDIDATE" = "$GITHUB_SHA" ] || exit 1
+            [ "$PLATFORM" = all ] || exit 1
+            [ -z "$PLATFORMS_JSON" ] || exit 1
+            [ "$VALIDATION_SKIP_QUALITY" != true ] || exit 1
           fi
           if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
             node scripts/desktop-core/validation-origin.mjs "$CORE_CANDIDATE"
@@ -353,76 +323,11 @@ jobs:
 
       # Separate step scope: no legacy native-validation env is inherited from
       # the matrix resolver. Never erase a 0/1 flag to manufacture formal origin.
-      - name: Admit actual formal Linux package source
-        id: linux_acceptance_admission
-        if: inputs.linux_auth_preflight_only != true && (startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '')
-        env:
-          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
-          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
-          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
-          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
-          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
-          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
-        run: |
-          set -euo pipefail
-          context="$(node scripts/package-acceptance/transport.mjs admit)"
-          echo "context=$context" >> "$GITHUB_OUTPUT"
-          echo 'enabled=true' >> "$GITHUB_OUTPUT"
-
-      - name: Admit separately selected same-carrier TUN and credential authority
-        if: inputs.linux_auth_preflight_only != true && (inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != '')
-        env:
-          PACKAGE_TUN_REQUESTED: ${{ inputs.linux_tun_acceptance && 'true' || 'false' }}
-          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
-          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
-          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
-          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
-          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
-          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
-        run: node scripts/package-acceptance/tun-transport.mjs admit
-
-  # ══ 发布前置门：与打包并行跑，门不绿则不发布 ══
-  # 复用 ci.yml（workflow_call）跑**完整 3-OS** fmt+clippy+build+test，CI 不绿则 4 平台打包
-  # 一个都不起（needs 链）。
-  # [选 workflow_call：单一定义零重复、gate 跑在发布 commit 本体上、release/dispatch/tag 三种
-  #  触发都覆盖、依赖图同 run 内可见] /
-  # [不选 workflow_run：其事件上下文锚在默认分支，tag 关联要手工解 payload，release/dispatch
-  #  两条触发不被覆盖，且跨 run 的「对应关系」靠时间对齐不靠结构] /
-  # [不选 package.yml 内嵌轻量 pre-check job：只验 ubuntu 一腿，win/mac 的 test 失败拦不住发布
-  #  （打包腿只 build 不 test），发布质量口径反而降级]
-  # 单平台 dispatch / workflow_call 时跳过（2026-08-26）：`platform != all` 不发 release，
-  # 其正确性由调用侧已有 CI/UI 门承担；重复跑完整 3-OS 只增加等待。
-  # **发布路径不变**：tag push 走 `platform=all` ⇒ full=true
-  # ⇒ 本门照跑，不绿则 package 一条腿都不起。
-      - name: Read-only exact-source account group preflight
-        if: inputs.linux_auth_preflight_only == true
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -z "$(git status --porcelain --untracked-files=all)"
-          export PREFLIGHT_WORKTREE_CLEAN=true
-          export PREFLIGHT_CHECKOUT_SHA="$(git rev-parse HEAD)"
-          python3 -B scripts/package-acceptance/diagnostic_scope.py --auth-preflight-only
-
-      - name: Preserve bounded read-only preflight diagnostic
-        if: always() && inputs.linux_auth_preflight_only == true
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-auth-preflight-diagnostic
-          path: linux-auth-preflight-evidence/groups.json
-          if-no-files-found: error
-          retention-days: 7
-
-
   ci:
     name: ci gate
     needs: setup
     if: >-
-      inputs.linux_auth_preflight_only != true && (needs.setup.outputs.full == 'true'
+      (needs.setup.outputs.full == 'true'
       && inputs.skip_quality_gates != true)
     uses: ./.github/workflows/ci.yml
     with:
@@ -436,7 +341,7 @@ jobs:
     name: ui gate
     needs: setup
     if: >-
-      inputs.linux_auth_preflight_only != true && (needs.setup.outputs.full == 'true'
+      (needs.setup.outputs.full == 'true'
       && inputs.skip_quality_gates != true)
     uses: ./.github/workflows/ui.yml
     with:
@@ -448,7 +353,7 @@ jobs:
   desktop_core:
     name: four native source producers
     needs: setup
-    if: inputs.linux_auth_preflight_only != true && (inputs.core_bundle_artifact == '')
+    if: (inputs.core_bundle_artifact == '')
     permissions:
       contents: read
       actions: read
@@ -486,7 +391,7 @@ jobs:
     #    可达，而 tag ref 的并发组从不取消在途（见文件头 concurrency 段）。
     needs: [setup, desktop_core]
     if: >-
-      inputs.linux_auth_preflight_only != true && (!cancelled() && needs.setup.result == 'success'
+      (!cancelled() && needs.setup.result == 'success'
       && (needs.desktop_core.result == 'success'
         || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != '')))
     # W24：helper 与 app 分两次 cargo build，但必须共享同一份构建身份。放 job 级而非某一步，
@@ -1178,7 +1083,7 @@ jobs:
             macos-x64)   res_dir=mac-x64;    bin=polaris-helper ;;
             *) echo "::error::label '${{ matrix.label }}' 未登记 helper 落位目录（真值见 verify-packaging.mjs 的 LABEL_TO_CORE）"; exit 1 ;;
           esac
-          target_args=(--target "${{ matrix.rust_target }}")
+          set -- --target "${{ matrix.rust_target }}"
           output_dir="target/${{ matrix.rust_target }}/release"
           case "${{ matrix.label }}" in
             linux|windows)
@@ -1187,11 +1092,11 @@ jobs:
                 echo "::error::helper host '$host' differs from matrix target '${{ matrix.rust_target }}'"
                 exit 1
               fi
-              target_args=()
+              set --
               output_dir=target/release
               ;;
           esac
-          cargo build --release -p polaris-helper --bin polaris-helper "${target_args[@]}"
+          cargo build --release -p polaris-helper --bin polaris-helper "$@"
           src="$output_dir/$bin"
           [ -f "$src" ] || { echo "::error::helper 构建产物不存在：$src"; exit 1; }
           mkdir -p "resources/$res_dir"
@@ -1204,8 +1109,11 @@ jobs:
           fi
           ls -l "resources/$res_dir/$bin"
           if [ "${{ matrix.label }}" = windows ]; then
-            cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner "${target_args[@]}"
+            POLARIS_WINDOWS_INSTALL_ANCHOR="$(node scripts/prepare-core-identity.mjs --platform=win --mode=maintenance-anchor --helper-binary=resources/win/polaris-helper.exe)"
+            export POLARIS_WINDOWS_INSTALL_ANCHOR
+            cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner "$@"
             cp "$output_dir/polaris-cleaner.exe" resources/win/polaris-cleaner.exe
+            printf 'POLARIS_WINDOWS_INSTALL_ANCHOR=%s\n' "$POLARIS_WINDOWS_INSTALL_ANCHOR" >> "$GITHUB_ENV"
           fi
           # Freeze the actual staged (and on macOS signed) release helper bytes.
           # Temporary defaults keep this same resources/<platform> App carrier.
@@ -1221,6 +1129,15 @@ jobs:
       #
       # 每平台只打进本平台内核，靠 matrix.tauri_args 里的**显式 --config**实现（见 matrix 注释）；
       # 不依赖 Tauri 的按平台名隐式合并。紧随其后的两步断言分别守输入侧与输出侧。
+      # Isolate only this workflow's output namespaces; freeze the already
+      # prepared resources before Tauri. Old outputs are retained under an owner.
+      - name: Freeze Windows package inputs and isolate outputs
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python scripts/windows-package-integrity.py prepare
+          if ($LASTEXITCODE -ne 0) { throw 'Windows package input freeze failed' }
+
       - name: Build installers
         id: installers
         uses: tauri-apps/tauri-action@v1
@@ -1416,6 +1333,17 @@ jobs:
           # detach 偶发 "resource busy"（Spotlight/mds 刚扫过），一次重试足够；
           # 不重试的话整条腿会因为一次时序抖动红掉，而产物其实是好的。
           detach_retry() { hdiutil detach "$1" -quiet || { sleep 2; hdiutil detach "$1" -force -quiet; }; }
+          owned_mnt=""
+          cleanup_owned_mount() {
+            local cleanup_status=$?
+            trap - EXIT
+            if [ -n "$owned_mnt" ] && ! detach_retry "$owned_mnt"; then
+              echo "::error::Failed to detach owned guide mount: $owned_mnt" >&2
+              cleanup_status=1
+            fi
+            exit "$cleanup_status"
+          }
+          trap cleanup_owned_mount EXIT
           shopt -s nullglob
           embedded=0
           for dmg in "$bundle_dir"/*.dmg; do
@@ -1433,11 +1361,12 @@ jobs:
             mnt=$(mktemp -d)
             mnt=$(cd "$mnt" && pwd -P)
             hdiutil attach "$rw" -mountpoint "$mnt" -nobrowse -noverify -quiet
+            owned_mnt="$mnt"
             cp "$guide" "$mnt/$guide_name"
             # Tauri 先生成 Finder 的 .DS_Store，本步骤随后才把指南复制进去；只 cp 会让文件没有
             # Iloc（图标坐标），实际打开 DMG 时必须放大窗口或滚动才看得到。让 Finder 把指南
             # 固定到第二行中央，并立即回读坐标；窗口高度由 tauri.conf.json 的 macOS.dmg 真值给出。
-            positioned=$(osascript - "$mnt" "$guide_name" "$guide_x" "$guide_y" <<'APPLESCRIPT'
+            if ! positioned=$(osascript - "$mnt" "$guide_name" "$guide_x" "$guide_y" <<'APPLESCRIPT'
           on run argv
             set mountPath to item 1 of argv
             set guideName to item 2 of argv
@@ -1445,28 +1374,39 @@ jobs:
             set guideY to (item 4 of argv) as integer
             set targetFolder to POSIX file (mountPath & "/") as alias
             tell application "Finder"
-              open targetFolder
-              set targetWindow to container window of targetFolder
+              -- A new viewer belongs to this invocation; never adopt a user window or tab.
+              set targetWindow to make new Finder window to targetFolder
+              set targetWindowID to (get id of targetWindow)
+              set targetWindow to Finder window id targetWindowID
+              if not (exists targetWindow) then error "Owned guide window no longer exists" number -1728
+              if ((get target of targetWindow) as alias) is not targetFolder then error "Owned guide window target changed"
+              if not (get closeable of targetWindow) then error "Owned guide window is not closeable"
               set current view of targetWindow to icon view
               set arrangement of icon view options of targetWindow to not arranged
               set position of item guideName of targetFolder to {guideX, guideY}
               update targetFolder
               delay 2
               set guidePosition to position of item guideName of targetFolder
-              close targetWindow
+              -- Recheck after readback/delay, then close only the created viewer by its actual ID.
+              set closingWindow to Finder window id targetWindowID
+              if not (exists closingWindow) then error "Owned guide window no longer exists" number -1728
+              if ((get target of closingWindow) as alias) is not targetFolder then error "Owned guide window target changed"
+              if not (get closeable of closingWindow) then error "Owned guide window is not closeable"
+              close Finder window id targetWindowID
               return (item 1 of guidePosition as text) & "," & (item 2 of guidePosition as text)
             end tell
           end run
           APPLESCRIPT
-            )
+            ); then
+              echo "::error::$(basename "$dmg") Finder guide positioning/close failed"
+              exit 1
+            fi
             [ "$positioned" = "$guide_x,$guide_y" ] || {
-              detach_retry "$mnt"
               echo "::error::$(basename "$dmg") 的 $guide_name 图标坐标落位失败: $positioned"
               exit 1
             }
             apps=("$mnt"/*.app)
             [ "${#apps[@]}" -eq 1 ] || {
-              detach_retry "$mnt"
               echo "::error::$(basename "$dmg") 应恰含一个 app，实为 ${#apps[@]} 个"
               exit 1
             }
@@ -1479,6 +1419,7 @@ jobs:
             codesign --force --deep --sign - --timestamp=none "${apps[0]}"
             codesign --verify --deep --strict --verbose=2 "${apps[0]}"
             detach_retry "$mnt"
+            owned_mnt=""
             hdiutil convert "$rw" -format UDZO -o "$dmg" -ov -quiet
             rm -f "$rw"
             embedded=$((embedded + 1))
@@ -1501,15 +1442,26 @@ jobs:
           guide_y=330
           min_window_height=500
           detach_retry() { hdiutil detach "$1" -quiet || { sleep 2; hdiutil detach "$1" -force -quiet; }; }
+          owned_mnt=""
+          cleanup_owned_mount() {
+            local cleanup_status=$?
+            trap - EXIT
+            if [ -n "$owned_mnt" ] && ! detach_retry "$owned_mnt"; then
+              echo "::error::Failed to detach owned guide mount: $owned_mnt" >&2
+              cleanup_status=1
+            fi
+            exit "$cleanup_status"
+          }
+          trap cleanup_owned_mount EXIT
           shopt -s nullglob
           checked=0
           for dmg in "$bundle_dir"/*.dmg; do
             mnt=$(mktemp -d)
             mnt=$(cd "$mnt" && pwd -P)
             hdiutil attach "$dmg" -mountpoint "$mnt" -nobrowse -readonly -quiet
+            owned_mnt="$mnt"
             apps=("$mnt"/*.app)
             if [ "${#apps[@]}" -ne 1 ] || ! codesign --verify --deep --strict --verbose=2 "${apps[0]}"; then
-              hdiutil detach "$mnt" -quiet || true
               echo "::error::$(basename "$dmg") 内 app 未通过最终 bundle seal 严格校验"
               exit 1
             fi
@@ -1518,48 +1470,58 @@ jobs:
             # 同一步还断言镜像里的内核与源内核逐字节相同：上一步的 bundle 封印与 dmg 往返转换都排在
             # 封印前那次判定之后，只有这里看得到它们有没有改写内核。
             if ! bash scripts/macos-nested-code.sh verify "${apps[0]}" "$core_ref"; then
-              hdiutil detach "$mnt" -quiet || true
               echo "::error::$(basename "$dmg") 内 Contents/Resources 下的内核/helper 未通过逐个判定"
               exit 1
             fi
             if [ ! -f "$mnt/$guide_name" ]; then
-              hdiutil detach "$mnt" -quiet || true
               echo "::error::$(basename "$dmg") 里没有「$guide_name」—— 内附步骤静默失败了"
               exit 1
             fi
             # 不只验“文件存在”：最终只读镜像还必须保留可见坐标与足够的默认窗口高度。
             # 这正面覆盖“文件藏在首屏外，必须手动放大 DMG 窗口才能看到”的回归。
-            layout=$(osascript - "$mnt" "$guide_name" <<'APPLESCRIPT'
+            if ! layout=$(osascript - "$mnt" "$guide_name" <<'APPLESCRIPT'
           on run argv
             set mountPath to item 1 of argv
             set guideName to item 2 of argv
             set targetFolder to POSIX file (mountPath & "/") as alias
             tell application "Finder"
-              open targetFolder
-              set targetWindow to container window of targetFolder
+              -- A new viewer belongs to this invocation; never adopt a user window or tab.
+              set targetWindow to make new Finder window to targetFolder
+              set targetWindowID to (get id of targetWindow)
+              set targetWindow to Finder window id targetWindowID
+              if not (exists targetWindow) then error "Owned guide window no longer exists" number -1728
+              if ((get target of targetWindow) as alias) is not targetFolder then error "Owned guide window target changed"
+              if not (get closeable of targetWindow) then error "Owned guide window is not closeable"
               set guidePosition to position of item guideName of targetFolder
               set windowBounds to bounds of targetWindow
               set windowHeight to (item 4 of windowBounds) - (item 2 of windowBounds)
-              close targetWindow
+              -- Recheck after readback/delay, then close only the created viewer by its actual ID.
+              set closingWindow to Finder window id targetWindowID
+              if not (exists closingWindow) then error "Owned guide window no longer exists" number -1728
+              if ((get target of closingWindow) as alias) is not targetFolder then error "Owned guide window target changed"
+              if not (get closeable of closingWindow) then error "Owned guide window is not closeable"
+              close Finder window id targetWindowID
               return (item 1 of guidePosition as text) & "," & (item 2 of guidePosition as text) & ";" & (windowHeight as text)
             end tell
           end run
           APPLESCRIPT
-            )
+            ); then
+              echo "::error::$(basename "$dmg") Finder guide layout read/close failed"
+              exit 1
+            fi
             guide_position=${layout%%;*}
             window_height=${layout##*;}
             if [ "$guide_position" != "$guide_x,$guide_y" ] || [ "$window_height" -lt "$min_window_height" ]; then
-              hdiutil detach "$mnt" -quiet || true
               echo "::error::$(basename "$dmg") 的指南布局无效: position=$guide_position, windowHeight=$window_height"
               exit 1
             fi
             # Compare all five complete translations, not a single marker or command.
             if ! cmp -s packaging/macos-dmg-open-guide.txt "$mnt/$guide_name"; then
-              hdiutil detach "$mnt" -quiet || true
               echo "::error::$(basename "$dmg") first-open guide differs from the validated source"
               exit 1
             fi
             detach_retry "$mnt"
+            owned_mnt=""
             checked=$((checked + 1))
           done
           [ "$checked" -gt 0 ] || { echo "::error::没有 dmg 被开箱验证"; exit 1; }
@@ -1588,6 +1550,10 @@ jobs:
       # 本 job 的 dmg 必须恰好命中本架构、且不得出现另一架构 tag。改名步一旦失效即红。
       # 同一步还跑**体积门**（U2）：dmg 是 U1 那个缺陷的现场（52 MiB 撞 16 MiB 下载闸），
       # 这一腿的体积从此每次构建都自曝，不必等 tag 才发现。
+      - name: Prepare macOS final package reader
+        if: runner.os == 'macOS'
+        run: brew install sevenzip
+
       - name: Verify macOS update-asset naming and size contract
         if: runner.os == 'macOS'
         shell: bash
@@ -1603,101 +1569,21 @@ jobs:
       #
       # 仅发布一个 downloadBootstrapper 安装器；Polaris 不内嵌 WebView2 Runtime。
       # 缺 Runtime 的精简 / LTSC 系统需联网获取微软官方 Runtime。
-      - name: Stage Windows installer
+      - name: Verify final NSIS payload and build exact Windows portable zip
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
-          if (-not $setup) { throw "no *-setup.exe in target/release/bundle/nsis" }
-          New-Item -ItemType Directory -Force dist-win | Out-Null
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $name = "Polaris_${version}_x64-win-setup.exe"
-          Move-Item $setup.FullName "dist-win/$name"
-          Write-Host "installer -> dist-win/$name"
+          $ErrorActionPreference = 'Stop'
+          python scripts/windows-package-integrity.py assemble
+          if ($LASTEXITCODE -ne 0) { throw 'complete Windows carrier integrity failed' }
 
-      # ── Windows portable（§I-Q4，zip 解压即用）──
-      # Tauri 2 NSIS 无原生 portable；从 release exe + resources/ 打成 zip（解压即用，绕过安装器）。
-      # portable 需自带 resources（sing-box/cronet/dashboard）否则无核可起；resources 目录由 Tauri
-      # 打包器铺到 bundle 同级，但 portable 形态无安装器整合，故显式从源 resources/ 拷入。
-      #
-      # 🔴 **`portable.marker` 不是装饰**（2026-07-22，修 #72 形态错配本体）：
-      #    应用靠「exe 同级有没有这个文件」判自己是不是便携形态
-      #    （`src-tauri/src/commands/updater::is_portable_layout`），进而决定检查更新时
-      #    该拿 `Polaris_<版本>_x64-win-Portable.zip` 还是 NSIS 安装器。
-      #    此前判据读的是 `PORTABLE_EXECUTABLE_DIR` —— **electron-builder 便携目标特有**的注入
-      #    （它的便携版是自解压 stub，由 stub 设该变量）。本步打的是纯 zip、**没有任何 stub**
-      #    ⇒ 该 env 恒不存在 ⇒ 便携用户恒被判成安装态、被推安装器，装出与便携副本并存的
-      #    第二份程序（配置目录 / 自启项 / 内核资源各一套）。
-      #    漏掉这个文件 = 该缺陷原样复发，故下一步开包核验它确实在 zip 里（fail-closed）。
-      - name: Build Windows portable zip
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $exe = Get-ChildItem target/release/polaris.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { throw "no target/release/polaris.exe — portable zip cannot be built" }
-          $staging = "staging-portable"
-          New-Item -ItemType Directory -Force $staging | Out-Null
-          Copy-Item $exe.FullName $staging/
-          # 拷 Windows 平台所需资源：sing-box.exe + libcronet.dll + dashboard + data。
-          Copy-Item resources/win $staging/resources/win -Recurse -Force
-          Copy-Item resources/dashboard $staging/resources/dashboard -Recurse -Force
-          Copy-Item resources/data $staging/resources/data -Recurse -Force
-          # 🔴 许可文本：便携 zip 与 Tauri bundler 是**两条独立的腿**，`bundle.resources` 只惠及
-          #    安装器，改 conf 不会自动惠及这里（2026-09-04 实证：便携 zip 连
-          #    THIRD-PARTY-LICENSES.md 都没有）。缺 LICENSE = Polaris 违反自己的 MIT；
-          #    缺 NOTICE = zip 里那份 GPLv3 的 sing-box.exe 没有任何来源指引（GPLv3 §6）。
-          Copy-Item LICENSE $staging/
-          Copy-Item NOTICE $staging/
-          Copy-Item THIRD-PARTY-LICENSES.md $staging/
-          # 便携形态标记（内容是给用户看的「勿删」说明；判据只看文件在不在）。
-          Set-Content -Path "$staging/portable.marker" -Encoding utf8 -Value @(
-            "Polaris portable edition marker - DO NOT DELETE."
-            "Polaris 便携版标记文件，请勿删除。"
-            ""
-            "This file tells Polaris it is running as the portable (zip) edition, so that"
-            "'Check for updates' offers the portable zip instead of the NSIS installer."
-            "Deleting it makes Polaris think it was installed, and it will then offer an"
-            "installer that creates a SECOND, separate copy of the app."
-          )
-          # 打进 dist-win/ 而不是仓库根：便携 zip 是 updater 的 loose 形态**唯一候选**，
-          # 放进本 job 的资产目录后，它的命名与体积在**本 job**就被 assets 门量到；留在仓库根的话
-          # 那两条断言只有 tag 时的聚合口径量得到 —— 超限要等四条腿的构建成本全付完才发现。
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          Compress-Archive -Path "$staging/*" -DestinationPath "dist-win/Polaris_${version}_x64-win-Portable.zip" -Force
-
-      # 便携标记与许可文本必须真的在 zip 里 —— 开包核验**产物本身**，不是核验上一步的脚本文本。
-      # 缺 marker ⇒ 便携用户恒被推安装器（#72 形态错配本体复发）；缺许可文本 ⇒ 许可证违规。
-      # 故这里 throw 让整条腿硬失败，而不是让一个「看着成功、装出来错形态」的 zip 进 release。
-      - name: Verify portable zip contents
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          $zip = "dist-win/Polaris_${version}_x64-win-Portable.zip"
-          $probe = "portable-probe"
-          if (Test-Path $probe) { Remove-Item $probe -Recurse -Force }
-          Expand-Archive -Path $zip -DestinationPath $probe -Force
-          if (-not (Test-Path "$probe/portable.marker" -PathType Leaf)) {
-            throw "portable.marker missing from $zip - portable users would be offered the NSIS installer (#72 form mismatch)"
-          }
-          if (-not (Test-Path "$probe/polaris.exe" -PathType Leaf)) {
-            throw "polaris.exe missing from $zip"
-          }
-          # 许可文本：非 0 字节才算数（拷了个空文件与没拷在法律上等价）。
-          foreach ($lic in @("LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.md")) {
-            $p = Join-Path $probe $lic
-            if (-not (Test-Path $p -PathType Leaf)) {
-              throw "$lic missing from $zip - shipping binaries without it violates the MIT notice condition (LICENSE) / leaves the bundled GPLv3 sing-box with no source offer (NOTICE)"
-            }
-            if ((Get-Item $p).Length -eq 0) {
-              throw "$lic is 0 bytes inside $zip - an empty license text is the same as none"
-            }
-          }
-          Remove-Item $probe -Recurse -Force
-          Write-Host "portable zip contains polaris.exe + portable.marker + LICENSE/NOTICE/THIRD-PARTY-LICENSES.md"
+      - name: Preserve static Windows carrier inventories
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-static-carriers-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: windows-package-evidence/static-carriers.json
+          if-no-files-found: ignore
 
       # 产物命名 ↔ updater 选包规则的机器断言（与 github.rs::find_suitable_update_asset 同口径）：
       # dist-win/ 下「`.exe` 且名含 `win`」必须**恰好一个**且含 `setup`。
@@ -1774,29 +1660,6 @@ jobs:
       # Release transport and manual package recovery share the same seven-day window.
       # Both release_desktop and release consume these bytes; evidence has separate uploads.
       # Release assets are durable distribution copies. Do not auto-delete transport on upload.
-      # Freeze only after all Linux hardening/repacking and final naming.
-      # Producer legacy=0 is recorded, NOT relabeled as formal acceptance.
-      - name: Freeze final Linux carrier bytes and members
-        if: runner.os == 'Linux' && needs.setup.outputs.acceptance_enabled == 'true'
-        shell: bash
-        env:
-          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
-          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
-          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
-          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
-          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
-          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
-          PACKAGE_ACCEPTANCE_CONTEXT: ${{ needs.setup.outputs.acceptance_context }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          debs=(target/release/bundle/deb/*.deb)
-          images=(target/release/bundle/appimage/*.AppImage)
-          [ "${#debs[@]}" -eq 1 ] && [ "${#images[@]}" -eq 1 ]
-          node scripts/package-acceptance/transport.mjs freeze "${debs[0]}" "${images[0]}" linux-package-freeze.json
-
       - name: Upload artifacts
         id: package_artifact
         if: env.POLARIS_UPLOAD_ARTIFACTS == '1'
@@ -1813,347 +1676,11 @@ jobs:
           retention-days: 7
 
 
-      - name: Bind actual current-attempt package transport
-        if: runner.os == 'Linux' && needs.setup.outputs.acceptance_enabled == 'true'
-        env:
-          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
-          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
-          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
-          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
-          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
-          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
-          PACKAGE_ACCEPTANCE_CONTEXT: ${{ needs.setup.outputs.acceptance_context }}
-          PACKAGE_UPLOAD_OUTCOME: ${{ steps.package_artifact.outcome }}
-          PACKAGE_ARTIFACT_ID: ${{ steps.package_artifact.outputs.artifact-id }}
-          PACKAGE_ARTIFACT_DIGEST: ${{ steps.package_artifact.outputs.artifact-digest }}
-        run: node scripts/package-acceptance/transport.mjs seal linux-package-freeze.json linux-package-transport/transport.json
-
-      - name: Upload immutable Linux package transport index
-        if: runner.os == 'Linux' && needs.setup.outputs.acceptance_enabled == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-package-transport-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: linux-package-transport/transport.json
-          if-no-files-found: error
-          retention-days: 7
-
-  # Runs the exact uploaded deb/AppImage bytes: no App/core build or repack here.
-  # A consumer-only rerun cannot reuse an earlier attempt's transport index.
-  linux_package_acceptance:
-    name: real final Linux packages (non-root, non-TUN)
-    needs: [setup, package]
-    if: >-
-      inputs.linux_auth_preflight_only != true && (!cancelled() && needs.setup.outputs.acceptance_enabled == 'true'
-      && needs.setup.result == 'success' && needs.package.result == 'success')
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      artifact_id: ${{ steps.accepted.outputs.artifact-id }}
-      artifact_digest: ${{ steps.accepted.outputs.artifact-digest }}
-    env:
-      PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-      PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-      PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
-      PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
-      PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
-      PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
-      PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
-      PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
-    steps:
-      - uses: actions/checkout@v7
-        id: checkout
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '26'
-      - name: Require unchanged actual formal source
-        id: admission
-        run: node scripts/package-acceptance/transport.mjs admit
-      - name: Install native automation runtime (not sandbox workarounds)
-        id: native_tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb dbus-x11 squashfs-tools
-      - name: Install test-side tools only
-        id: test_tools
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          cargo install --root "$RUNNER_TEMP/polaris-package-automation" --version '=2.0.5' --locked tauri-driver
-          python3 -B scripts/package-acceptance/tooling.py prepare --root "$RUNNER_TEMP/polaris-package-automation" --output "$RUNNER_TEMP/polaris-package-automation/receipt.json"
-      - name: Install protoc (pinned URL + sha256)
-        id: protoc_install
-        run: node scripts/fetch-protoc.mjs
-      - name: Verify protoc toolchain
-        id: protoc
-        run: |
-          got="$(protoc --version)"
-          [ "$got" = "$PROTOC_EXPECT" ] || {
-            echo "::error::protoc differs from pinned toolchain"; exit 1;
-          }
-      - name: Read pinned source Go version
-        id: core-go
-        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-go@v6
-        id: core_go
-        with:
-          go-version: ${{ steps.core-go.outputs.version }}
-          cache: false
-      - name: Fetch original formal core receipts for comparison only
-        id: core_receipts
-        env:
-          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
-        run: node scripts/fetch-core.mjs --platform=linux
-      - name: Download exact final package transport and bytes
-        id: transport
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/package-acceptance/transport.mjs fetch linux-package-input linux-package-carriers
-      - name: Verify original final-package receipts
-        id: native_receipt
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t debs < <(find linux-package-carriers -type f -name '*.deb')
-          mapfile -t images < <(find linux-package-carriers -type f -name '*.AppImage')
-          [ "${#debs[@]}" -eq 1 ] && [ "${#images[@]}" -eq 1 ]
-          python3 -B scripts/final-package-receipt.py --platform linux --kind deb --artifact "${debs[0]}" --output linux-package-evidence/final-deb.json
-          python3 -B scripts/final-package-receipt.py --platform linux --kind AppImage --artifact "${images[0]}" --output linux-package-evidence/final-AppImage.json
-      - name: Build the small RPC test client (not App or core)
-        id: rpc_client
-        run: |
-          cargo test --locked -p polaris-singbox-grpc --example package_runtime_probe
-          cargo build --locked -p polaris-singbox-grpc --example package_runtime_probe
-      - name: Exercise real original Linux package entrypoints
-        id: runtime
-        run: python3 -B scripts/package-acceptance/linux.py run --transport linux-package-input/transport.json --packages linux-package-carriers --rpc-client target/debug/examples/package_runtime_probe --output linux-package-evidence/run.json
-      - name: Require every real case and normal cleanup before acceptance
-        id: verification
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/package-acceptance/transport.mjs accept linux-package-input/transport.json linux-package-evidence/run.json linux-package-evidence linux-package-accepted/accepted.json
-      - name: Upload exact successful Linux acceptance
-        id: accepted
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-package-accepted-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: linux-package-accepted/accepted.json
-          if-no-files-found: error
-          retention-days: 7
-      - name: Record bounded workflow diagnostic scope (not acceptance)
-        if: always()
-        env:
-          DIAGNOSTIC_CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
-          DIAGNOSTIC_ADMISSION_OUTCOME: ${{ steps.admission.outcome }}
-          DIAGNOSTIC_NATIVE_TOOLS_OUTCOME: ${{ steps.native_tools.outcome }}
-          DIAGNOSTIC_TEST_TOOLS_OUTCOME: ${{ steps.test_tools.outcome }}
-          DIAGNOSTIC_PROTOC_OUTCOME: ${{ steps.protoc.outcome }}
-          DIAGNOSTIC_CORE_GO_OUTCOME: ${{ steps.core_go.outcome }}
-          DIAGNOSTIC_CORE_RECEIPTS_OUTCOME: ${{ steps.core_receipts.outcome }}
-          DIAGNOSTIC_TRANSPORT_OUTCOME: ${{ steps.transport.outcome }}
-          DIAGNOSTIC_NATIVE_RECEIPT_OUTCOME: ${{ steps.native_receipt.outcome }}
-          DIAGNOSTIC_RPC_CLIENT_OUTCOME: ${{ steps.rpc_client.outcome }}
-          DIAGNOSTIC_RUNTIME_OUTCOME: ${{ steps.runtime.outcome }}
-          DIAGNOSTIC_VERIFICATION_OUTCOME: ${{ steps.verification.outcome }}
-        run: python3 -B scripts/package-acceptance/diagnostic_scope.py --lane plain --kind both
-      - name: Preserve bounded sanitized Linux evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-package-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          # Never upload private HOME, runtime JSON, tokens or raw App stdout.
-          path: |
-            linux-package-evidence/*.json
-            linux-package-evidence/*.png
-          if-no-files-found: error
-          retention-days: 7
-
-  linux_tun_package_acceptance:
-    name: real final Linux TUN (${{ matrix.kind }}, disposable VM)
-    needs: [setup, package]
-    if: >-
-      inputs.linux_auth_preflight_only != true && (!cancelled() && inputs.linux_tun_acceptance == true
-      && needs.setup.outputs.acceptance_enabled == 'true'
-      && needs.setup.result == 'success' && needs.package.result == 'success')
-    runs-on: ubuntu-22.04
-    timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      matrix:
-        kind: [deb, AppImage]
-    permissions:
-      contents: read
-      actions: read
-    env:
-      PACKAGE_TUN_REQUESTED: 'true'
-      PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-      PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-      PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
-      PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
-      PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
-      PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
-      PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
-      PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
-    steps:
-      - uses: actions/checkout@v7
-        id: checkout
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '26'
-      - name: Require unchanged actual formal source
-        id: admission
-        run: node scripts/package-acceptance/tun-transport.mjs admit
-      - name: Install native automation runtime (not sandbox workarounds)
-        id: native_tools
-        run: |
-          sudo apt-get update
-          # No sandbox/sysctl/AppArmor/polkit/sudo policy changes. Root tools
-          # are prefetched before the bounded TUN window can interrupt runner I/O.
-          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb dbus-x11 squashfs-tools policykit-1 tcpdump tshark nftables iproute2
-      - name: Install test-side tools only
-        id: test_tools
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-          cargo install --root "$RUNNER_TEMP/polaris-package-automation" --version '=2.0.5' --locked tauri-driver
-          python3 -B scripts/package-acceptance/tooling.py prepare --root "$RUNNER_TEMP/polaris-package-automation" --output "$RUNNER_TEMP/polaris-package-automation/receipt.json"
-      - name: Install protoc (pinned URL + sha256)
-        id: protoc_install
-        run: node scripts/fetch-protoc.mjs
-      - name: Verify protoc toolchain
-        id: protoc
-        run: |
-          got="$(protoc --version)"
-          [ "$got" = "$PROTOC_EXPECT" ] || {
-            echo "::error::protoc differs from pinned toolchain"; exit 1;
-          }
-      - name: Read pinned source Go version
-        id: core-go
-        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-go@v6
-        id: core_go
-        with:
-          go-version: ${{ steps.core-go.outputs.version }}
-          cache: false
-      - name: Fetch original formal core receipts for comparison only
-        id: core_receipts
-        env:
-          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
-        run: node scripts/fetch-core.mjs --platform=linux
-      - name: Download exact final package transport and bytes
-        id: transport
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/package-acceptance/transport.mjs fetch linux-package-input linux-package-carriers
-      - name: Verify original final-package receipt for this exact carrier
-        id: native_receipt
-        env:
-          TUN_CARRIER_KIND: ${{ matrix.kind }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t carriers < <(find linux-package-carriers -type f -name "*.$TUN_CARRIER_KIND")
-          [ "${#carriers[@]}" -eq 1 ]
-          python3 -B scripts/final-package-receipt.py --platform linux --kind "$TUN_CARRIER_KIND" --artifact "${carriers[0]}" --output linux-tun-evidence/final-native.json
-      - name: Bind actual source, artifact, carrier and original native receipt
-        id: binding
-        env:
-          TUN_CARRIER_KIND: ${{ matrix.kind }}
-        run: node scripts/package-acceptance/tun-transport.mjs prepare linux-package-input/transport.json linux-package-carriers linux-tun-evidence/final-native.json "$TUN_CARRIER_KIND" linux-tun-evidence/admitted.json
-      - name: Build the small RPC test client (not App or core)
-        id: rpc_client
-        run: |
-          cargo test --locked -p polaris-singbox-grpc --example package_runtime_probe
-          cargo build --locked -p polaris-singbox-grpc --example package_runtime_probe
-      - name: Real ordinary-UID GUI with bounded production helper and TUN
-        id: runtime
-        env:
-          TUN_CARRIER_KIND: ${{ matrix.kind }}
-        run: python3 -B scripts/package-acceptance/linux_tun.py run --admission linux-tun-evidence/admitted.json --transport linux-package-input/transport.json --packages linux-package-carriers --kind "$TUN_CARRIER_KIND" --rpc-client target/debug/examples/package_runtime_probe --output linux-tun-evidence/run.json
-      - name: Require every real TUN case, same bytes and normal restoration
-        id: verification
-        run: node scripts/package-acceptance/tun-transport.mjs finish linux-tun-evidence/admitted.json linux-package-carriers linux-tun-evidence/run.json linux-package-input/transport.json
-      - name: Upload same-run successful TUN evidence (not an independent release receipt)
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-package-tun-${{ matrix.kind }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            linux-tun-evidence/admitted.json
-            linux-tun-evidence/run.json
-          if-no-files-found: error
-          retention-days: 7
-      - name: Record bounded workflow diagnostic scope (not acceptance)
-        if: always()
-        env:
-          DIAGNOSTIC_CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
-          DIAGNOSTIC_ADMISSION_OUTCOME: ${{ steps.admission.outcome }}
-          DIAGNOSTIC_NATIVE_TOOLS_OUTCOME: ${{ steps.native_tools.outcome }}
-          DIAGNOSTIC_TEST_TOOLS_OUTCOME: ${{ steps.test_tools.outcome }}
-          DIAGNOSTIC_PROTOC_OUTCOME: ${{ steps.protoc.outcome }}
-          DIAGNOSTIC_CORE_GO_OUTCOME: ${{ steps.core_go.outcome }}
-          DIAGNOSTIC_CORE_RECEIPTS_OUTCOME: ${{ steps.core_receipts.outcome }}
-          DIAGNOSTIC_TRANSPORT_OUTCOME: ${{ steps.transport.outcome }}
-          DIAGNOSTIC_NATIVE_RECEIPT_OUTCOME: ${{ steps.native_receipt.outcome }}
-          DIAGNOSTIC_RPC_CLIENT_OUTCOME: ${{ steps.rpc_client.outcome }}
-          DIAGNOSTIC_RUNTIME_OUTCOME: ${{ steps.runtime.outcome }}
-          DIAGNOSTIC_VERIFICATION_OUTCOME: ${{ steps.verification.outcome }}
-          DIAGNOSTIC_BINDING_OUTCOME: ${{ steps.binding.outcome }}
-          TUN_CARRIER_KIND: ${{ matrix.kind }}
-        run: python3 -B scripts/package-acceptance/diagnostic_scope.py --lane tun --kind "$TUN_CARRIER_KIND"
-      - name: Preserve bounded sanitized TUN diagnostics after local recovery
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: linux-package-tun-diagnostics-${{ matrix.kind }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          # No private HOME/config, secret, raw pcap, PTY, root ledger or App stdout.
-          path: |
-            linux-tun-evidence/*.json
-            linux-tun-evidence/*.png
-          if-no-files-found: error
-          retention-days: 7
-
-  # ══ 四平台 wire 契约：与宿主平台无关，全 workflow 只跑一次（2026-10-07）══
-  #
-  # 此前 `Bundled core gRPC wire contract (all platforms)` 挂在每条打包腿上：四条腿各付一次
-  # `cargo test` 冷编（实测 linux 120s / windows 134s / macos-arm64 152s），量的却是同一件事。
-  #
-  # 判「与宿主无关」的依据（读实现得到，不是从名字推的）：
-  #   · 判据本体 `proto_wire_check::check_core_against_proto` 是对核二进制的**纯字节扫描**
-  #     （抠出 protoc-gen-go 嵌进 .rodata 的 FileDescriptorProto 与 vendored proto 对拍），
-  #     不启动任何核；`crates/singbox-grpc/proto_wire_check.rs` 与测试里没有 `cfg(target_os)`、
-  #     没有 `std::env::consts`、不起子进程 —— 同样的字节在任何宿主上给出同样的结论；
-  #   · 覆盖轴来自 `src-tauri/core-manifest.json`（四个平台全查），不来自宿主；
-  #   · 输入是本次 run 那一份四平台核 bundle：每条打包腿下到的是同一个 artifact，且
-  #     `fetch-core.mjs` 在落盘前逐份校验二进制与回执 ⇒ 四条腿盘上的四份核字节相同。
-  #   于是四条腿各跑一遍 = 同一函数、同一输入算四次。
-  #
-  # 没有因此丢掉的两件事：
-  #   · 「本腿盘上的核就是被对拍的那份」—— 每条打包腿的 `Build installers` 仍经 singbox-grpc
-  #     的 release build.rs（`assert_proto_matches_bundled_core`）对盘上每一份核各对拍一遍；
-  #   · 「缺平台必须红」（REQUIRE 语义）—— 本 job 保留 `POLARIS_REQUIRE_KERNEL_GATE=1`，且本 job
-  #     不受 `POLARIS_RUN_KERNEL_GATES` 控制（release-risk 复用时照跑）。
-  #
-  # 接线：`if` 与 package job 是同一套 bundle 可用性 allowlist（desktop_core 在复用 bundle 时是
-  # skipped，不显式写状态函数本 job 会被默认语义一并跳过）；`release_desktop` 把本 job 列进 needs
-  # 并要求 success ⇒ wire 契约不成立时安装包照样构建，但写不进 release 草稿。release-risk.yml 那侧
-  # 读的是整个复用调用的 result，本 job 红即那条腿红。
   core_wire:
     name: bundled core gRPC wire contract
     needs: [setup, desktop_core]
     if: >-
-      inputs.linux_auth_preflight_only != true && (!cancelled() && needs.setup.result == 'success'
+      (!cancelled() && needs.setup.result == 'success'
       && (needs.desktop_core.result == 'success'
         || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != '')))
     runs-on: ubuntu-22.04
@@ -2305,7 +1832,7 @@ jobs:
     # 2026-09-04：ci / ui 由 package 的 needs 移到这里 —— 打包与门并行开跑，**草稿写入仍必须等门**。
     # 2026-10-07：core_wire 同理列入 —— wire 契约从打包腿内的一步变成并行 job 后，「契约不成立
     # 就没有安装包」变成「契约不成立就写不进草稿」，判据必须在这里显式接回。
-    needs: [setup, ci, ui, package, core_wire, linux_package_acceptance, linux_tun_package_acceptance]
+    needs: [setup, ci, ui, package, core_wire]
     # 六条闸门，缺一不可：
     #   · `always()` —— **必需的，不是保险**：两门在单平台 dispatch、以及 release-risk.yml 以
     #     `skip_quality_gates: true` 复用本 workflow 时都是 `skipped`，而默认 needs 语义把 skipped
@@ -2325,13 +1852,12 @@ jobs:
     # `github.ref` 与 `needs` 在 **job 级** 都可用（不同于 matrix 级——见 package job 搬走的那段
     # github.workspace 教训：那是上下文**求值时机**问题，不是名字拼错）。
     if: >-
-      inputs.linux_auth_preflight_only != true && (always()
+      (always()
       && startsWith(github.ref, 'refs/tags/v')
       && needs.setup.outputs.full == 'true'
       && needs.package.result == 'success'
       && needs.core_wire.result == 'success'
-      && needs.linux_package_acceptance.result == 'success'
-      && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success')
+
       && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
       && (needs.ui.result == 'success' || needs.ui.result == 'skipped'))
     runs-on: ubuntu-22.04
@@ -2419,6 +1945,14 @@ jobs:
       # 聚合口径（--label release）≠ per-job 口径：per-job 断言「本 job 不得出现另一架构」，
       # 聚合侧两架构本就都在，故用独立分支断言「每架构恰一个」。
       # 本步是**唯一**能判 SHA256SUMS 内容的地方（它只在聚合侧存在），也是体积门的聚合口径。
+      - name: Prepare bounded final package readers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install sevenzip
+          echo "$(brew --prefix sevenzip)/bin" >> "$GITHUB_PATH"
+
       - name: Verify release asset naming, size and digest contract
         shell: bash
         # `--dir` 按仓库根解析（见下方 publish 步注释），故用 $GITHUB_WORKSPACE 显式锚定。
@@ -2429,19 +1963,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PACKAGE_TUN_REQUESTED: ${{ inputs.linux_tun_acceptance && 'true' || 'false' }}
-          PACKAGE_TUN_RESULT: ${{ needs.linux_tun_package_acceptance.result }}
-          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-          PACKAGE_ACCEPTANCE_RESULT: ${{ needs.linux_package_acceptance.result }}
-          PACKAGE_ACCEPTED_ARTIFACT_ID: ${{ needs.linux_package_acceptance.outputs.artifact_id }}
-          PACKAGE_ACCEPTED_ARTIFACT_DIGEST: ${{ needs.linux_package_acceptance.outputs.artifact_digest }}
         run: |
           set -euo pipefail
-          node scripts/package-acceptance/transport.mjs release-check linux-accepted-before-draft dist-release
-          if [ "$PACKAGE_TUN_REQUESTED" = true ]; then
-            node scripts/package-acceptance/tun-transport.mjs release-check linux-tun-before-draft dist-release
-          fi
           tag="${GITHUB_REF_NAME}"
 
           version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
@@ -2674,7 +2197,7 @@ jobs:
   # 第二段：桌面草稿已经落定后，才允许签名 APK job 对**同一个 tag 草稿**写入。
   # `secrets: inherit` 把仓库已配置的四项发布签名 secret 交给被调用 workflow；值不进入本文件。
   android_release:
-    if: inputs.linux_auth_preflight_only != true
+
     name: build + upload signed Android APK
     needs: release_desktop
     # reusable workflow 不能把 caller 的 GITHUB_TOKEN 从 read 自行抬到 write；写权限必须在调用点授予。
@@ -2691,13 +2214,12 @@ jobs:
   # 对真实 release 的资产集合 / state / digest 做双向精确对账。只有本 job 持有公开动作。
   release:
     name: verify combined release + promote public
-    needs: [release_desktop, android_release, linux_package_acceptance, linux_tun_package_acceptance]
+    needs: [release_desktop, android_release]
     if: >-
-      inputs.linux_auth_preflight_only != true && (always()
+      (always()
       && needs.release_desktop.result == 'success'
       && needs.android_release.result == 'success'
-      && needs.linux_package_acceptance.result == 'success'
-      && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success'))
+      )
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -2797,6 +2319,14 @@ jobs:
           chmod 644 SHA256SUMS
           cat SHA256SUMS
 
+      - name: Prepare bounded final package readers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install sevenzip
+          echo "$(brew --prefix sevenzip)/bin" >> "$GITHUB_PATH"
+
       - name: Verify complete release asset contract
         env:
           TAG: ${{ steps.release_identity.outputs.tag }}
@@ -2868,13 +2398,6 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PACKAGE_TUN_REQUESTED: ${{ inputs.linux_tun_acceptance && 'true' || 'false' }}
-          PACKAGE_TUN_RESULT: ${{ needs.linux_tun_package_acceptance.result }}
-          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
-          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
-          PACKAGE_ACCEPTANCE_RESULT: ${{ needs.linux_package_acceptance.result }}
-          PACKAGE_ACCEPTED_ARTIFACT_ID: ${{ needs.linux_package_acceptance.outputs.artifact_id }}
-          PACKAGE_ACCEPTED_ARTIFACT_DIGEST: ${{ needs.linux_package_acceptance.outputs.artifact_digest }}
           PACKAGE_CHECK_REMOTE: 'true'
           TAG: ${{ steps.release_identity.outputs.tag }}
           VERIFIED_ANDROID_APKS: ${{ needs.android_release.outputs.signed_apks }}
@@ -2915,9 +2438,5 @@ jobs:
           awk -F'\t' '{ print $1 "  " $3 }' "$raw" | sed 's/^sha256://' | LC_ALL=C sort -k2 > "$actual"
           diff -u "$expected" "$actual" || {
             echo "::error::公开紧前远端资产已被替换，拒绝公开"; exit 1; }
-          node scripts/package-acceptance/transport.mjs release-check linux-accepted-before-public dist-release
-          if [ "$PACKAGE_TUN_REQUESTED" = true ]; then
-            node scripts/package-acceptance/tun-transport.mjs release-check linux-tun-before-public dist-release
-          fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           echo "release $TAG 已转为公开"

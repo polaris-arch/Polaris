@@ -530,6 +530,85 @@ pub fn is_privileged_sid(sid: &str) -> bool {
     PRIVILEGED_SIDS.contains(&sid)
 }
 
+/// Separate data-only policy. `sid` must come from a held native process token;
+/// this predicate does not select a policy or grant execution admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserDataAclError {
+    Unavailable,
+    UnsupportedAce,
+    Untrusted,
+}
+
+#[cfg(test)]
+mod user_data_tests;
+
+pub fn judge_current_user_data(
+    sec: &ObjectSecurity,
+    sid: &str,
+    directory: bool,
+    ancestor: bool,
+) -> Result<(), UserDataAclError> {
+    judge_user_data_owner(sec, sid, directory, ancestor, false)
+}
+
+// Only native custody may select this for the actual system-volume root.
+// TrustedInstaller is an owner exception, never a new trusted ACE writer or
+// privileged executable/data-leaf owner. No wire value selects this policy.
+pub(crate) const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+pub(crate) fn judge_system_volume_data_ancestor(
+    sec: &ObjectSecurity,
+    sid: &str,
+) -> Result<(), UserDataAclError> {
+    judge_user_data_owner(sec, sid, true, true, true)
+}
+
+fn judge_user_data_owner(
+    sec: &ObjectSecurity,
+    sid: &str,
+    directory: bool,
+    ancestor: bool,
+    system_volume_ancestor: bool,
+) -> Result<(), UserDataAclError> {
+    if polaris_helper_proto::core_protocol::CallerIdentity::windows(sid).is_none() {
+        return Err(UserDataAclError::Unavailable);
+    }
+    let trusted = |value: &str| value == sid || is_privileged_sid(value);
+    let owner = sec
+        .owner_sid
+        .as_deref()
+        .ok_or(UserDataAclError::Unavailable)?;
+    if !trusted(owner) && !(system_volume_ancestor && owner == TRUSTED_INSTALLER_SID) {
+        return Err(UserDataAclError::Untrusted);
+    }
+    let aces = sec.dacl.as_ref().ok_or(UserDataAclError::Untrusted)?;
+    // Read-only access is not executable authority. Directory traversal is
+    // harmless; file execution is not part of this data scope's public grant.
+    let mut read = 0x0012_0089 | 0x8000_0000;
+    if directory {
+        read |= 0x20 | 0x2000_0000;
+    }
+    // An ancestor can permit adding unrelated names without permitting an
+    // existing held child to be replaced. DELETE_CHILD/DAC/OWNER/DELETE and
+    // generic writes are still rejected. Native custody must pin the chain.
+    if ancestor {
+        read |= 0x6;
+    }
+    for ace in aces {
+        if !ace.is_effective_on_object() {
+            continue;
+        }
+        match ace.kind {
+            AceKind::Unparsed(_) => return Err(UserDataAclError::UnsupportedAce),
+            AceKind::Allow if !trusted(&ace.sid) && ace.mask & !read != 0 => {
+                return Err(UserDataAclError::Untrusted);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// spec §3.4 要求放行的**目标态**夹具：owner=SYSTEM + `SYSTEM:(F)` + `Administrators:(F)`
 /// + `Users:(RX)`。
 ///

@@ -26,12 +26,11 @@ use polaris_updater::state::PopupPhase;
 // is a supported 32-bit build; 512 MiB fits it without weakening the limit.
 const _: () = assert!(APP_UPDATE_MAX_BYTES <= usize::MAX as u64);
 
-/// 单次 GitHub releases 响应体上限（16 MiB；= 上游 `MAX_GITHUB_JSON_BYTES`：被劫持/WAF 回灌 GB 级
-/// 响应会撞堆，流式超限即中断）。
+/// 完整 GitHub releases 列表上限：累计原始响应及聚合编码 JSON 各不超过 16 MiB；每页流式
+/// body cap 使用剩余预算，不能把此值按页数放大。
 pub(crate) const MAX_GITHUB_JSON_BYTES: usize = 16 * 1024 * 1024;
 
-/// GitHub API 拉取**逐跳**超时（连接 + 读取，每跳各算一次）；= 上游 `fetchReleases` 的 15s 兜底
-/// （防连接被静默吞永不 settle）。**注意它不是请求级上限**：`safe_redirect_fetch` 最多 5 跳，逐跳叠加。
+/// 完整 GitHub releases 拉取的总预算（15s），由所有页及每页的重定向共用同一个 deadline。
 pub(crate) const GITHUB_FETCH_TIMEOUT_MS: u64 = 15_000;
 
 /// 一帧 App 更新进度**及其随行事实**。
@@ -547,19 +546,46 @@ fn remember_portable_update(
 ///
 /// 两处各写一遍 `match` 的下场是：一处把 `NoUpdate` 折成 `hasUpdate:false`、另一处把解析失败
 /// 也折进去，而两处都各自「看起来对」。抽出来之后，「解析失败绝不伪装成已是最新」这条只写一遍。
-fn release_only_response(
+pub(super) fn release_only_response(
     body: &str,
     current: &str,
     include_pre: bool,
     skipped: Option<&str>,
+    include_current: bool,
 ) -> ApiResponse<Value> {
     match check_app_update_release_only(body, current, include_pre, skipped) {
-        Ok(AppUpdateCheck::Available(info)) => ApiResponse::ok(json!({
+        Ok(AppUpdateCheck::Available(info)) if !include_current => ApiResponse::ok(json!({
             "hasUpdate": true,
             "updateInfo": serde_json::to_value(&info).unwrap_or(Value::Null),
         })),
-        Ok(AppUpdateCheck::NoUpdate) => ApiResponse::ok(json!({ "hasUpdate": false })),
+        // 无安装包的平台不能履行当前版本重装；仍解析清单以保留错误出口。
+        Ok(_) => ApiResponse::ok(json!({ "hasUpdate": false })),
         Err(e) => ApiResponse::err(format!("failed to parse GitHub response: {e}")),
+    }
+}
+
+/// 同版本重装是显式目标选择，不先检查新版，也不在当前资产缺失时换成其他版本。
+pub(super) fn check_requested_app_release(
+    body: &str,
+    current: &str,
+    include_pre: bool,
+    include_current: bool,
+    skipped: Option<&str>,
+    target: (AssetPlatform, AssetArch, bool),
+) -> Result<AppUpdateCheck, polaris_updater::ManifestError> {
+    let (platform, arch, loose_form) = target;
+    if include_current {
+        resolve_current_app_release(body, current, include_pre, platform, arch, loose_form)
+    } else {
+        check_app_update(
+            body,
+            current,
+            include_pre,
+            skipped,
+            platform,
+            arch,
+            loose_form,
+        )
     }
 }
 
@@ -571,7 +597,7 @@ fn release_only_response(
 /// ✅ **检查侧已接线**：经 `runtime/http.rs` 的真实 client（`state.http()`）走**同一条**
 /// SSRF 安全路径 [`safe_redirect_fetch`](polaris_net_stack::safe_redirect::safe_redirect_fetch)（首 URL + 每跳 Location 都过 `assert_host_allowed`）拉
 /// `polaris-arch/Polaris` 的 releases → `polaris_updater::check_app_update` 纯逻辑转换（过滤 prerelease /
-/// 按 `published_at` 挑最新 / `compare_semver` 判新 / 平台架构资产选择 / skip 判定）→ 返
+/// 按语义版本挑最高 / `compare_semver` 判新 / 平台架构资产选择 / skip 判定）→ 返
 /// `{ hasUpdate, updateInfo? }`（`updateInfo` 字段与前端 `UpdateInfo` 契约逐字对齐）。
 ///
 /// **代理策略**：本批走 `state.http()`（`no_proxy` 直连 client）。proxy 未运行时直连是合法回退
@@ -646,17 +672,17 @@ pub async fn update_check(
             &current,
             include_pre,
             skipped.as_deref(),
+            include_current,
         ));
     };
 
-    let checked = check_app_update(
+    let checked = check_requested_app_release(
         &body,
         &current,
         include_pre,
+        include_current,
         skipped.as_deref(),
-        platform,
-        arch,
-        loose_form,
+        (platform, arch, loose_form),
     );
     match checked {
         Ok(AppUpdateCheck::Available(info)) => {
@@ -664,10 +690,14 @@ pub async fn update_check(
             if let Err(error) = state.updater().custody.select(info_v.clone()) {
                 return Ok(ApiResponse::err(error));
             }
-            Ok(ApiResponse::ok(json!({
-                "hasUpdate": true,
+            let mut response = json!({
+                "hasUpdate": !include_current,
                 "updateInfo": info_v,
-            })))
+            });
+            if include_current {
+                response["isCurrentVersion"] = json!(true);
+            }
+            Ok(ApiResponse::ok(response))
         }
         // ── Android：资产腿说「没有」时，再问一次「到底有没有新版本」───────────────────
         //
@@ -681,42 +711,17 @@ pub async fn update_check(
         // 那里选不到包是**异常**，该由打包门去红，不该在这里悄悄兜底成「有更新但下不了」。
         // Android 这一档是历史事实（旧 release 本来就没有 APK），不是异常。
         //
-        // 🔴 **排在 `include_current` 之后**：`includeCurrent` 是「重装当前版本」那条腿，
-        // 它要的是**当前版本**那份资产，不是「有没有更新」的答案。两条臂的守卫在 Android 上
-        // 会同时成立 —— 顺序写反，那条腿在 Android 上就永远拿不到目标（match 取第一条命中的臂），
-        // 而症状是一颗按下去报「这一档没有对象」的按钮。
+        // `includeCurrent` 已在 check_requested_app_release 中独立分派；当前版本缺资产时
+        // 如实返回不可用，不能再经此兜底替换成一个新版本。
         Ok(AppUpdateCheck::NoUpdate) if !include_current && platform == AssetPlatform::Android => {
             Ok(release_only_response(
                 &body,
                 &current,
                 include_pre,
                 skipped.as_deref(),
+                false,
             ))
         }
-        Ok(AppUpdateCheck::NoUpdate) if include_current => match resolve_current_app_release(
-            &body,
-            &current,
-            include_pre,
-            platform,
-            arch,
-            loose_form,
-        ) {
-            Ok(AppUpdateCheck::Available(info)) => {
-                let info_v = serde_json::to_value(&info).unwrap_or(Value::Null);
-                if let Err(error) = state.updater().custody.select(info_v.clone()) {
-                    return Ok(ApiResponse::err(error));
-                }
-                Ok(ApiResponse::ok(json!({
-                    "hasUpdate": false,
-                    "isCurrentVersion": true,
-                    "updateInfo": info_v,
-                })))
-            }
-            Ok(AppUpdateCheck::NoUpdate) => Ok(ApiResponse::ok(json!({ "hasUpdate": false }))),
-            Err(e) => Ok(ApiResponse::err(format!(
-                "failed to parse GitHub response: {e}"
-            ))),
-        },
         Ok(AppUpdateCheck::NoUpdate) => Ok(ApiResponse::ok(json!({ "hasUpdate": false }))),
         Err(e) => Ok(ApiResponse::err(format!(
             "failed to parse GitHub response: {e}"

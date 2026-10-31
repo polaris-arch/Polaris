@@ -140,9 +140,10 @@ pub fn modeled_cert_pins_are_emitted(
     protocol: crate::user_config::server_config::Protocol,
     security: Option<&crate::user_config::server_config::SecurityMode>,
 ) -> bool {
-    use crate::user_config::server_config::Protocol;
+    use crate::user_config::server_config::{Protocol, SecurityMode};
     match protocol {
         Protocol::MasqueClient => true,
+        Protocol::Trojan if matches!(security, Some(SecurityMode::None)) => false,
         Protocol::Naive
         | Protocol::Tor
         | Protocol::Tailcat

@@ -7,6 +7,8 @@
 # Node / 前端
 node_modules/
 ui/dist/
+# Synthetic layout/theme test outputs; maintained images remain tracked.
+/ui/test-results/resource-progress-layout-theme-*.png
 dist/
 dist-package/
 *.tsbuildinfo
@@ -84,3 +86,6 @@ src-tauri/gen/schemas/
 /scripts/acc01-local-acceptance-*/
 /scripts/mobile-core/android-consumption.json
 /scripts/mobile-core/android-consumption.json.tmp
+
+# Explicit local compiler lane: generated verified inputs, never release assets.
+/resources/.local-development/

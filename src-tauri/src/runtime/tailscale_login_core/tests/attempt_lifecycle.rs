@@ -68,18 +68,6 @@ impl LoginStatusSubscriber for BlockingSubscriber {
     }
 }
 
-fn request(id: &str) -> LoginRequest {
-    LoginRequest {
-        attempt_id: id.into(),
-        mode: LoginMode::Browser,
-        replace_identity: false,
-        reuse_retained_auth_key: false,
-        expected_credential_revision: None,
-    }
-}
-fn offline() -> MainLoginSnapshot {
-    MainLoginSnapshot::default()
-}
 async fn acquire(signal: &Semaphore) {
     tokio::time::timeout(Duration::from_secs(2), signal.acquire())
         .await
@@ -2763,6 +2751,7 @@ fn parked_record_is_not_transient_builder_input_without_explicit_resolution() {
             port: 9911,
             secret: "api-fixture".into(),
         },
+        Path::new("/fake/config/tailscale-login-ts1-1.cache.db"),
     )
     .unwrap();
     let emitted = login_config_to_json(&config).to_string();

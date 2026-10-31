@@ -66,9 +66,8 @@ function requireCandidateSources(candidate) {
   // function differs: `!cancelled()` (2026-10-07) lets a superseded run stop its
   // in-flight installer legs, whereas `always()` kept them running to the end.
   // Both disable default skip propagation, which is what this allowlist relies on.
-  // The authorization-only preflight must not enter this installer matrix.
   assert.doesNotMatch(candidate, /^      always\(\)/m, 'installer legs must stay cancellable');
-  assert.match(candidate, /^    if: >-\n      inputs\.linux_auth_preflight_only != true && \(!cancelled\(\) && needs\.setup\.result == 'success'\n      && \(needs\.desktop_core\.result == 'success'\n        \|\| \(needs\.desktop_core\.result == 'skipped' && inputs\.core_bundle_artifact != ''\)\)\)$/m);
+  assert.match(candidate, /^    if: >-\n      \(!cancelled\(\) && needs\.setup\.result == 'success'\n      && \(needs\.desktop_core\.result == 'success'\n        \|\| \(needs\.desktop_core\.result == 'skipped' && inputs\.core_bundle_artifact != ''\)\)\)$/m);
 }
 
 function requireRiskPolicy(yaml) {
@@ -288,7 +287,7 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
     const fixturePaths = [...inputPaths, 'scripts/assert-pc-runtime-release.mjs',
       'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/release-consumer.mjs',
       // release-consumer statically imports the upstream adapter even for legacy inputs.
-      'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json', 'scripts/desktop-core/native-dns-candidate.mjs',
+      'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/recovery.mjs', 'scripts/lib/polaris-version.json', 'scripts/desktop-core/native-dns-candidate.mjs',
       'scripts/lib/core-identity.mjs',
       'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs'];
     for (const path of fixturePaths) {
@@ -348,9 +347,6 @@ test('candidate matrix preserves strict source consumption and states unobserved
   const condition = candidate.match(/^    if: >-\n(?:      .*\n)+/m)?.[0];
   assert.ok(condition, 'candidate condition must be present for negative controls');
   for (const [before, after] of [
-    ['inputs.linux_auth_preflight_only != true && ', ''],
-    ['inputs.linux_auth_preflight_only != true', 'inputs.linux_auth_preflight_only == true'],
-    ['inputs.linux_auth_preflight_only != true && ', 'inputs.linux_auth_preflight_only != true || '],
     ['!cancelled()', 'always()'],
     ["needs.setup.result == 'success'", "needs.setup.result != 'failure'"],
     ["needs.desktop_core.result == 'success'", "needs.desktop_core.result != 'failure'"],
@@ -495,7 +491,7 @@ function formalPolicyFixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'formal-source-publication-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const paths = ['scripts/assert-pc-runtime-release.mjs', 'scripts/desktop-core/source-graph.mjs',
-    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json',
+    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/recovery.mjs', 'scripts/lib/polaris-version.json',
     'scripts/desktop-core/native-dns-candidate.mjs', 'scripts/lib/core-identity.mjs',
     'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs', manifestPath,
     'scripts/desktop-core/release-contract.json', 'scripts/desktop-core/release-asset-index.json'];

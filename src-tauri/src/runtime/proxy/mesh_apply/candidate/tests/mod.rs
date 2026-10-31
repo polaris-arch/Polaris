@@ -100,6 +100,56 @@ pub(super) fn fixture() -> (
     fixture_with(|_| {})
 }
 
+// Legacy disk hosts are weak planning input, without a current writer or frame.
+async fn import_weak_tailnet_fixture(
+    runtime: &Arc<ProxyRuntime>,
+    raw: &Value,
+    server_id: &str,
+    cidr: &str,
+) {
+    assert!(runtime.tailnet_context().is_none());
+    let root = runtime.tailnet_rules_dir();
+    fs::create_dir_all(&root).unwrap();
+    let name = polaris_config_engine::builder::endpoint_routes::tailnet_rule_file_base(server_id);
+    fs::write(
+        root.join(format!("{name}.json")),
+        serde_json::to_vec(&json!({"version":1,"rules":[{"ip_cidr":[cidr]}]})).unwrap(),
+    )
+    .unwrap();
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    runtime
+        .write_tailnet_rule_files_for_generation(&config, raw, runtime.gate.generation())
+        .await
+        .unwrap();
+    assert!(runtime.tailnet_context().is_none());
+    assert!(runtime
+        .fresh_tailnet_snapshot(runtime.gate.generation())
+        .is_empty());
+}
+
+// Use the real relay admission, not a second writer of private route history.
+fn observe_tailnet_fixture(runtime: &Arc<ProxyRuntime>, server_id: &str, host: &str) {
+    use polaris_singbox_grpc::daemon as dm;
+    let context = runtime.tailnet_context().unwrap();
+    let tags = context.tag_to_id();
+    let tag = tags
+        .iter()
+        .find_map(|(tag, id)| (id == server_id).then(|| tag.clone()))
+        .unwrap();
+    let update = dm::TailscaleStatusUpdate {
+        endpoints: vec![dm::TailscaleEndpointStatus {
+            endpoint_tag: tag,
+            backend_state: "Running".into(),
+            self_: Some(dm::TailscalePeer {
+                tailscale_i_ps: vec![host.into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+    };
+    assert!(runtime.apply_ts_status_frame(&update, &tags, context.generation, context.token));
+}
+
 #[test]
 fn stored_system_proxy_is_rejected_when_mobile_effective_mode_is_tun() {
     let (dir, mut runtime, snapshot, input, plan) = fixture();
@@ -387,19 +437,22 @@ fn pure_validator_rejects_changed_original_bytes_duplicate_rules_and_emission() 
     );
 }
 
-#[test]
-fn live_deps_changes_do_not_rebuild_candidate_and_fresh_snapshot_is_required() {
+#[tokio::test]
+async fn live_deps_changes_do_not_rebuild_candidate_and_fresh_snapshot_is_required() {
     use std::sync::atomic::Ordering;
     let (dir, runtime, snapshot, input, plan) = fixture();
     let candidate = generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan).unwrap();
     let original = candidate.materialized.closure.config_bytes.clone();
     let captured_deps = candidate.facts.deps_sha256.clone();
     runtime.netenv_dhcp_suppressed.store(true, Ordering::SeqCst);
-    runtime
-        .observed_tailnet
-        .write()
-        .unwrap()
-        .insert("new-live-owner".into(), vec!["100.64.1.2".into()]);
+    let previous_ts = json!({"servers":[{"id":"new-live-owner","name":"previous TS",
+        "protocol":"tailscale","tailscaleSettings":{}}],"selectedServerId":"__direct__",
+        "proxyMode":"smart","proxyModeType":"manual"});
+    import_weak_tailnet_fixture(&runtime, &previous_ts, "new-live-owner", "100.64.1.2/32").await;
+    assert_eq!(
+        runtime.observed_tailnet_snapshot()["new-live-owner"],
+        vec!["100.64.1.2"]
+    );
     assert_eq!(
         candidate.validate_same_candidate(
             &snapshot,
@@ -864,8 +917,8 @@ fn userspace_overlap_targets_and_dns_use_original_q_and_d1_algorithms() {
     );
 }
 
-#[test]
-fn userspace_unknown_epochs_resources_and_acl_never_strip_or_stop_old_config() {
+#[tokio::test]
+async fn userspace_unknown_epochs_resources_and_acl_never_strip_or_stop_old_config() {
     type RawMutation = fn(&mut Value);
     let cases: &[(&str, RawMutation)] = &[
         ("missing identity", |raw| {
@@ -915,16 +968,19 @@ fn userspace_unknown_epochs_resources_and_acl_never_strip_or_stop_old_config() {
         assert!(!dir.join("singbox-runtime.json").exists(), "{name}");
     }
     let (_dir, runtime, snapshot) = userspace_fixture_with(|_| {});
-    runtime
-        .observed_tailnet
-        .write()
-        .unwrap()
-        .insert("ts-a".into(), vec!["100.80.1.2".into()]);
+    import_weak_tailnet_fixture(&runtime, snapshot.raw(), "ts-a", "100.80.1.2/32").await;
+    assert_eq!(
+        runtime.observed_tailnet_snapshot()["ts-a"],
+        vec!["100.80.1.2"]
+    );
     assert!(matches!(
         generate_userspace_mesh_candidate(&runtime, &snapshot, "unbound-observation"),
         Err(CandidateError::SnapshotMismatch)
     ));
-    runtime.observed_tailnet.write().unwrap().clear();
+    // Independent odd-epoch leg starts without H; never erase retained history
+    // through a private-state bypass merely to reset this fixture.
+    let (_writing_dir, runtime, snapshot) = userspace_fixture_with(|_| {});
+    assert!(runtime.observed_tailnet_snapshot().is_empty());
     runtime
         .tailnet_file_write_epoch
         .store(1, std::sync::atomic::Ordering::SeqCst);
@@ -1026,19 +1082,46 @@ fn userspace_malformed_foreign_tailnet_file_cannot_supply_a_different_plan() {
     }
 }
 
-#[test]
-fn userspace_bound_observation_can_plan_but_memory_changes_are_not_live_owner_proof() {
+#[tokio::test]
+async fn userspace_bound_observation_can_plan_but_memory_changes_are_not_live_owner_proof() {
     let (_dir, runtime, snapshot) = userspace_fixture_with(|raw| {
         raw[STATE_KEY]["observations"] = json!([{"ownerRef":{"serverId":"ts-a","identityEpoch":"epoch-a"},
             "rawHosts":["100.80.1.2/32"],"advertisedRoutes":[],"source":"status","lastValidEvidence":"saved-bound-frame"}]);
     });
-    runtime
-        .observed_tailnet
-        .write()
-        .unwrap()
-        .insert("ts-a".into(), vec!["100.80.1.2".into()]);
+    // Admit the emitted writer for this saved epoch without creating source
+    // files, so a later frame isolates H changes from file/epoch evidence.
+    let config: UserConfig = serde_json::from_value(snapshot.raw().clone()).unwrap();
+    let deps = runtime.generate_deps(9090, 0, 0, None, &[], snapshot.raw(), false);
+    let generated =
+        polaris_config_engine::builder::generate_sing_box_config(&config, &BTreeMap::new(), &deps)
+            .unwrap();
+    {
+        let _publication = runtime.gate.lock_generation_publication();
+        runtime.activate_tailnet_context(
+            runtime.gate.generation(),
+            runtime.tailnet_bindings(snapshot.raw(), &generated),
+        );
+    }
+    assert!(!runtime.tailnet_rules_dir().exists());
+    let epoch = runtime
+        .tailnet_file_write_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let token = runtime.tailnet_context().unwrap().token;
+    let original_config = fs::read(runtime.config.dir().join("config.json")).unwrap();
+    let decoy = runtime.node_dns_decoy_override();
+    assert!(!runtime.status().running);
+    observe_tailnet_fixture(&runtime, "ts-a", "100.80.1.2");
+    assert_eq!(
+        runtime.observed_tailnet_snapshot()["ts-a"],
+        vec!["100.80.1.2"]
+    );
     let mut candidate =
         generate_userspace_mesh_candidate(&runtime, &snapshot, "bound-source").unwrap();
+    assert!(candidate.metadata().managed_launch_unsupported);
+    assert_eq!(
+        candidate.metadata().manifest,
+        ManifestPublication::Unpublished
+    );
     assert!(candidate
         .plan()
         .owner_routes
@@ -1048,11 +1131,22 @@ fn userspace_bound_observation_can_plan_but_memory_changes_are_not_live_owner_pr
         candidate.validate_source_inputs(&runtime, &snapshot),
         Ok(())
     );
-    runtime
-        .observed_tailnet
-        .write()
-        .unwrap()
-        .insert("ts-a".into(), vec!["100.80.1.3".into()]);
+    observe_tailnet_fixture(&runtime, "ts-a", "100.80.1.3");
+    assert!(runtime.observed_tailnet_snapshot()["ts-a"].contains(&"100.80.1.3".into()));
+    assert!(!runtime.tailnet_rules_dir().exists());
+    assert_eq!(
+        runtime
+            .tailnet_file_write_epoch
+            .load(std::sync::atomic::Ordering::SeqCst),
+        epoch
+    );
+    assert_eq!(runtime.tailnet_context().unwrap().token, token);
+    assert_eq!(
+        fs::read(runtime.config.dir().join("config.json")).unwrap(),
+        original_config
+    );
+    assert_eq!(runtime.node_dns_decoy_override(), decoy);
+    assert!(!runtime.status().running);
     assert_eq!(
         candidate.validate_source_inputs(&runtime, &snapshot),
         Err(CandidateError::SnapshotChanged)

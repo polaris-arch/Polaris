@@ -227,6 +227,7 @@ fn decoder_rejects_retired_start_and_content_frames() {
 fn decoder_admits_only_pinned_native_start_shape() {
     let id = "a".repeat(64);
     let mut frame = vec![
+        polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR.into(),
         id.clone(),
         "/caller/cfg".into(),
         "/caller/log".into(),
@@ -242,6 +243,7 @@ fn decoder_admits_only_pinned_native_start_shape() {
         Ok(Request::NativeStartPinned(_))
     ));
     let mut extra = vec![
+        polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR.into(),
         id,
         "/caller/cfg".into(),
         "".into(),
@@ -863,4 +865,25 @@ fn lan_listening_has_no_native_host_router_writer() {
         );
     }
     assert!(source.contains("let forwarding_ms = 0;"));
+}
+
+#[test]
+fn native_decoder_refuses_old_pinned_payload_and_wrong_v3_marker() {
+    let id = "a".repeat(64);
+    for args in [
+        vec![id.clone(), "/cfg".into(), "".into(), "0".into()],
+        vec![
+            "wrong-v3".into(),
+            id.clone(),
+            "/cfg".into(),
+            "".into(),
+            "0".into(),
+        ],
+    ] {
+        assert!(decode_request(
+            polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH,
+            &mut args.into_iter()
+        )
+        .is_err());
+    }
 }

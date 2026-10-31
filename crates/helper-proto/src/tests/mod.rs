@@ -12,11 +12,11 @@ use super::*;
 // 故三平台共用一个 `CURRENT`，下面两测锁的是**统一**而非互异。
 
 #[test]
-fn proto_version_is_unified_v2() {
+fn proto_version_is_unified_v3() {
     assert_eq!(
         proto_version::CURRENT,
-        2,
-        "immutable core ids and retired executable-path Start require protocol v2"
+        3,
+        "executor-owned admission and atomic old-daemon rejection require protocol v3"
     );
 }
 

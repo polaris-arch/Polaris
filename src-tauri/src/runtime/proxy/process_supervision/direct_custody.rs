@@ -3,10 +3,11 @@
 
 use std::io;
 use std::process::ExitStatus;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::runtime::core_child::Child;
 use crate::runtime::helper::HelperStopTarget;
 use crate::runtime::proxy::mesh_apply::owner_proof::{
     LocalNativeTerminal, NativeExited, ProducerCell, SealedNativeMembers,
@@ -14,7 +15,6 @@ use crate::runtime::proxy::mesh_apply::owner_proof::{
 use crate::runtime::proxy::process_supervision::{DirectCoreRun, DirectRunOrigin, RunIdentity};
 use polaris_core_supervisor::ChildObservation;
 use polaris_helper_proto::{HelperBirthTarget, StartNotAdmitted};
-use tokio::process::Child;
 
 #[cfg(test)]
 type ObservationWait = Box<dyn FnMut(&mut Child) -> io::Result<Option<ExitStatus>> + Send>;
@@ -22,7 +22,9 @@ type ObservationWait = Box<dyn FnMut(&mut Child) -> io::Result<Option<ExitStatus
 pub(crate) struct DirectCoreSlot {
     instance: Arc<SlotInstance>,
     backend: BackendFence,
+    recovery_reserved: bool,
     helper_start: Option<HelperStartAttempt>,
+    helper_terminal: Option<LocalHelperTerminal>,
     state: SlotState,
     last_unknown_log: Option<Instant>,
     #[cfg(test)]
@@ -34,7 +36,9 @@ impl Default for DirectCoreSlot {
         Self {
             instance: Arc::new(SlotInstance),
             backend: BackendFence::DirectOnly,
+            recovery_reserved: false,
             helper_start: None,
+            helper_terminal: None,
             state: SlotState::Empty,
             last_unknown_log: None,
             #[cfg(test)]
@@ -54,16 +58,55 @@ pub(super) enum BackendFence {
 /// A helper Start remains owned even when its async waiter disappears. Only
 /// an exact acknowledged Stop may retire the same opaque attempt.
 #[derive(Clone, Debug)]
-pub(in crate::runtime::proxy) struct HelperStartToken(Arc<()>);
+pub(in crate::runtime::proxy) struct HelperStartToken(Arc<()>, u64);
 
 impl HelperStartToken {
-    fn new() -> Self {
-        Self(Arc::new(()))
+    fn new(generation: u64) -> Self {
+        Self(Arc::new(()), generation)
     }
 
     pub(in crate::runtime::proxy) fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0) && self.1 == other.1
     }
+}
+
+#[derive(Clone)]
+struct HelperAttemptScope {
+    runtime: Weak<Mutex<DirectCoreSlot>>,
+    pid_custody: Weak<Mutex<Option<u32>>>,
+    slot: Arc<SlotInstance>,
+    generation: u64,
+}
+
+#[derive(Clone)]
+enum HelperStartWorker {
+    Unregistered,
+    // Observation only: this handle is never used to abort the original task.
+    Original(tokio::task::AbortHandle),
+    #[cfg(test)]
+    ReturnedFixture,
+}
+
+impl HelperStartWorker {
+    fn returned(&self) -> bool {
+        match self {
+            Self::Unregistered => false,
+            Self::Original(task) => task.is_finished(),
+            #[cfg(test)]
+            Self::ReturnedFixture => true,
+        }
+    }
+}
+
+/// One exact, already closed helper transaction. This grants neither direct
+/// admission nor global NoOwner. Retained under the original runtime's Child lock.
+pub(in crate::runtime::proxy) struct LocalHelperTerminal {
+    scope: HelperAttemptScope,
+    attempt: HelperStartToken,
+    target: HelperBirthTarget,
+    stop_nonce: HelperStopNonce,
+    _main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    start_worker: HelperStartWorker,
 }
 
 struct HelperStartAttempt {
@@ -71,6 +114,8 @@ struct HelperStartAttempt {
     main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
     phase: HelperStartPhase,
     stop_inflight: Option<HelperStopNonce>,
+    scope: HelperAttemptScope,
+    start_worker: HelperStartWorker,
 }
 
 /// Non-cloneable Stop booking identity. The permit owns this nonce until an
@@ -318,40 +363,141 @@ impl DirectCoreSlot {
     /// Must be called under the real Child mutex before a helper IPC can be
     /// queued. This fence is monotone even when that IPC is cancelled or fails.
     pub(in crate::runtime::proxy) fn touch_helper(&mut self) -> Result<(), SlotAdmissionError> {
-        if matches!(self.state, SlotState::Stopping(_)) {
+        if self.recovery_reserved || matches!(self.state, SlotState::Stopping(_)) {
             return Err(SlotAdmissionError::Busy);
         }
         self.backend = BackendFence::HelperTouched;
         Ok(())
     }
 
+    pub(crate) fn reserve_for_recovery(&mut self) -> Result<(), String> {
+        if self.recovery_reserved
+            || !matches!(self.state, SlotState::Empty)
+            || self.helper_start.is_some()
+        {
+            return Err(
+                "CORE_RECOVERY_BUSY: original Child/birth or cleanup is still owned".into(),
+            );
+        }
+        self.backend = BackendFence::HelperTouched;
+        self.recovery_reserved = true;
+        Ok(())
+    }
+    pub(crate) fn release_recovery_reservation(&mut self) {
+        self.recovery_reserved = false;
+    }
     pub(crate) fn touch_helper_for_registry(&mut self) -> Result<(), String> {
         self.touch_helper()
             .map_err(|error| format!("helper mutation rejected by Child custody: {error:?}"))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::proxy) fn begin_helper_start(
         &mut self,
     ) -> Result<HelperStartToken, SlotAdmissionError> {
         self.begin_helper_start_with_main(None)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::proxy) fn begin_helper_start_with_main(
         &mut self,
         main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<HelperStartToken, SlotAdmissionError> {
+        let token = self.begin_bound_helper_start(main_token, Weak::new(), Weak::new(), 0)?;
+        self.mark_helper_start_worker_returned_for_test(&token);
+        Ok(token)
+    }
+
+    pub(in crate::runtime::proxy) fn begin_bound_helper_start(
+        &mut self,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+        runtime: Weak<Mutex<DirectCoreSlot>>,
+        pid_custody: Weak<Mutex<Option<u32>>>,
+        generation: u64,
     ) -> Result<HelperStartToken, SlotAdmissionError> {
         self.touch_helper()?;
         if self.helper_start.is_some() {
             return Err(SlotAdmissionError::Busy);
         }
-        let token = HelperStartToken::new();
+        let token = HelperStartToken::new(generation);
+        // A newly admitted helper owner replaces only the previous closed transaction.
+        // Every old completion still has to match the new active opaque token.
+        self.helper_terminal = None;
         self.helper_start = Some(HelperStartAttempt {
             token: token.clone(),
             main_token,
             phase: HelperStartPhase::Inflight,
             stop_inflight: None,
+            scope: HelperAttemptScope {
+                runtime,
+                pid_custody,
+                slot: Arc::clone(&self.instance),
+                generation,
+            },
+            start_worker: HelperStartWorker::Unregistered,
         });
         Ok(token)
+    }
+
+    pub(in crate::runtime::proxy) fn bind_helper_start_worker(
+        &mut self,
+        token: &HelperStartToken,
+        worker: tokio::task::AbortHandle,
+    ) -> bool {
+        let Some(attempt) = &mut self.helper_start else {
+            return false;
+        };
+        if !attempt.token.same(token)
+            || matches!(attempt.start_worker, HelperStartWorker::Original(_))
+        {
+            return false;
+        }
+        attempt.start_worker = HelperStartWorker::Original(worker);
+        true
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn mark_helper_start_worker_returned_for_test(
+        &mut self,
+        token: &HelperStartToken,
+    ) {
+        let attempt = self.helper_start.as_mut().expect("helper fixture attempt");
+        assert!(attempt.token.same(token));
+        assert!(!matches!(
+            attempt.start_worker,
+            HelperStartWorker::Original(_)
+        ));
+        attempt.start_worker = HelperStartWorker::ReturnedFixture;
+    }
+
+    pub(in crate::runtime::proxy) fn locally_closed_helper_attempt(
+        &self,
+        runtime: &Arc<Mutex<DirectCoreSlot>>,
+        pid_custody: &Arc<Mutex<Option<u32>>>,
+        recorded_pid: Option<u32>,
+        current_generation: u64,
+    ) -> Option<HelperStartToken> {
+        let terminal = self.helper_terminal.as_ref()?;
+        if self.helper_start.is_some()
+            || !self.is_empty()
+            || recorded_pid.is_some()
+            || !Weak::ptr_eq(&terminal.scope.runtime, &Arc::downgrade(runtime))
+            || !Weak::ptr_eq(&terminal.scope.pid_custody, &Arc::downgrade(pid_custody))
+            || !Arc::ptr_eq(&terminal.scope.slot, &self.instance)
+            || terminal.scope.generation != terminal.attempt.1
+            || current_generation < terminal.scope.generation
+            || !terminal.start_worker.returned()
+        {
+            return None;
+        }
+        // The later Stop's generation is independent of this original birth generation.
+        // Its outer lifecycle claim and TS gate still govern every subsequent effect.
+        Some(terminal.attempt.clone())
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn has_local_helper_terminal_for_test(&self) -> bool {
+        self.helper_terminal.is_some()
     }
 
     /// Freeze the token from the actual backend custody before Stop takes or
@@ -477,7 +623,7 @@ impl DirectCoreSlot {
     ) -> Option<(HelperStartToken, HelperStopTarget, HelperStopNonce)> {
         let attempt = self.helper_start.as_mut()?;
         let target = attempt.phase.exact_stop_target()?;
-        if attempt.stop_inflight.is_some() {
+        if !attempt.start_worker.returned() || attempt.stop_inflight.is_some() {
             return None;
         }
         let nonce = HelperStopNonce::new();
@@ -495,6 +641,7 @@ impl DirectCoreSlot {
         };
         if !attempt.token.same(token)
             || attempt.phase.exact_stop_target() != Some(target)
+            || !attempt.start_worker.returned()
             || attempt.stop_inflight.is_some()
         {
             return None;
@@ -521,17 +668,77 @@ impl DirectCoreSlot {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime::proxy) fn confirm_helper_stop(
         &mut self,
         token: &HelperStartToken,
         target: HelperStopTarget,
         nonce: &HelperStopNonce,
     ) -> bool {
-        if !self.helper_stop_matches(token, target, nonce) {
+        let Some(terminal) = self.prepare_helper_terminal(token, target, nonce) else {
             return false;
-        }
-        self.helper_start = None;
+        };
+        self.commit_helper_terminal(terminal);
         true
+    }
+
+    pub(in crate::runtime::proxy) fn helper_attempt_scope_matches(
+        &self,
+        token: &HelperStartToken,
+        runtime: &Arc<Mutex<DirectCoreSlot>>,
+        pid_custody: &Arc<Mutex<Option<u32>>>,
+    ) -> bool {
+        self.helper_start.as_ref().is_some_and(|attempt| {
+            attempt.token.same(token)
+                && Weak::ptr_eq(&attempt.scope.runtime, &Arc::downgrade(runtime))
+                && Weak::ptr_eq(&attempt.scope.pid_custody, &Arc::downgrade(pid_custody))
+                && Arc::ptr_eq(&attempt.scope.slot, &self.instance)
+                && attempt.scope.generation == token.1
+        })
+    }
+
+    pub(in crate::runtime::proxy) fn prepare_helper_terminal(
+        &self,
+        token: &HelperStartToken,
+        target: HelperStopTarget,
+        nonce: &HelperStopNonce,
+    ) -> Option<LocalHelperTerminal> {
+        let HelperStopTarget::Birth(target) = target else {
+            return None;
+        };
+        if !self.helper_stop_matches(token, HelperStopTarget::Birth(target), nonce) {
+            return None;
+        }
+        let attempt = self.helper_start.as_ref()?;
+        if !attempt.start_worker.returned()
+            || !Arc::ptr_eq(&attempt.scope.slot, &self.instance)
+            || attempt.scope.generation != token.1
+        {
+            return None;
+        }
+        Some(LocalHelperTerminal {
+            scope: attempt.scope.clone(),
+            attempt: token.clone(),
+            target,
+            stop_nonce: HelperStopNonce(Arc::clone(&nonce.0)),
+            _main_token: attempt.main_token.clone(),
+            start_worker: attempt.start_worker.clone(),
+        })
+    }
+
+    pub(in crate::runtime::proxy) fn commit_helper_terminal(
+        &mut self,
+        terminal: LocalHelperTerminal,
+    ) {
+        assert!(self.helper_stop_matches(
+            &terminal.attempt,
+            HelperStopTarget::Birth(terminal.target),
+            &terminal.stop_nonce,
+        ));
+        // Prepared before registry release. Only infallible moves follow it;
+        // publish the retained terminal before discarding the active attempt.
+        self.helper_terminal = Some(terminal);
+        self.helper_start = None;
     }
 
     pub(in crate::runtime::proxy) fn helper_stop_matches(
@@ -814,7 +1021,7 @@ impl DirectCoreSlot {
     }
 
     pub(in crate::runtime::proxy) fn empty_for_install(&mut self) -> Option<EmptyDirectSlot<'_>> {
-        if self.is_empty() {
+        if self.is_empty() && !self.recovery_reserved {
             Some(EmptyDirectSlot { slot: self })
         } else {
             None
@@ -827,7 +1034,7 @@ impl DirectCoreSlot {
         &mut self,
         run: DirectCoreRun,
     ) -> Result<(), Box<DirectCoreRun>> {
-        if !self.is_empty() {
+        if !self.is_empty() || self.recovery_reserved {
             return Err(Box::new(run));
         }
         self.last_unknown_log = None;
@@ -1195,5 +1402,22 @@ impl DirectCoreSlot {
             SlotState::Stopping(custody) => Some(custody.run.child_for_test()),
             SlotState::Empty | SlotState::Running(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn recovery_reservation_uses_real_slot_and_pending_birth_state_not_pid_liveness() {
+        let mut slot = DirectCoreSlot::default();
+        slot.reserve_for_recovery().unwrap();
+        assert!(slot.empty_for_install().is_none());
+        assert!(slot.touch_helper().is_err());
+        assert!(slot.reserve_for_recovery().is_err());
+        slot.release_recovery_reservation();
+        assert!(slot.empty_for_install().is_some());
+        slot.begin_helper_start().unwrap();
+        assert!(slot.reserve_for_recovery().is_err());
     }
 }

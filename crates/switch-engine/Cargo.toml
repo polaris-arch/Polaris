@@ -9,7 +9,7 @@ repository.workspace = true
 # 消费 config-engine 的 planHotSwitch 产物（HotSwitchPlan / HotSwitchPut / HotSwitchKind）。
 polaris-config-engine = { path = "../config-engine" }
 # 复用 core-supervisor 的 LifecycleGate（lifecycle_depth 单飞 + 去抖 trailing 顺序门）。
-polaris-core-supervisor = { path = "../core-supervisor" }
+polaris-core-supervisor = { path = "../core-supervisor", default-features = false }
 # trait 内 async fn（ManagementApi / ConnectionsFeed 的异步签名）。
 async-trait = { workspace = true }
 # 精准断连：复用 runtime 的有界、无 spawn future stream。
@@ -21,3 +21,8 @@ thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "rt-multi-thread", "macros", "test-util"] }
+
+[features]
+default = ["formal-selection"]
+formal-selection = ["polaris-core-supervisor/formal-selection"]
+local-development-selection = ["polaris-core-supervisor/local-development-selection"]

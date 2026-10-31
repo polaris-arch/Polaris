@@ -258,3 +258,7 @@ impl AppRuntime {
 
 #[cfg(windows)]
 pub(crate) mod windows_directory;
+
+pub(crate) mod core_child;
+
+pub(crate) mod core_execution;

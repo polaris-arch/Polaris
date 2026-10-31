@@ -71,6 +71,8 @@ struct Slot {
     stopped: VecDeque<(HelperBirthTarget, Option<u32>)>,
     starting: bool,
     closing: bool,
+    // Daemon shutdown is monotonic; upgrade cancellation must never clear it.
+    shutting_down: bool,
 }
 
 #[derive(Default)]
@@ -108,7 +110,7 @@ impl NativeCustody {
         let Ok(mut slot) = self.slot.lock() else {
             return false;
         };
-        if slot.current.is_some() || slot.starting {
+        if slot.shutting_down || slot.current.is_some() || slot.starting {
             return false;
         }
         slot.closing = close;
@@ -125,7 +127,7 @@ impl NativeCustody {
         let Ok(slot) = self.slot.lock() else {
             return false;
         };
-        if slot.starting || slot.closing {
+        if slot.shutting_down || slot.starting || slot.closing {
             return false;
         }
         let Some(current) = &slot.current else {
@@ -157,7 +159,7 @@ impl NativeCustody {
 
     pub(super) fn active(&self) -> bool {
         self.slot.lock().map_or(true, |slot| {
-            slot.current.is_some() || slot.starting || slot.closing
+            slot.current.is_some() || slot.starting || slot.closing || slot.shutting_down
         })
     }
 
@@ -186,7 +188,7 @@ impl NativeCustody {
                     .map_err(|poison| NativeBirthStart::NotAdmittedUnknown {
                         target: poison.get_ref().current.as_ref().map(|birth| birth.target),
                     })?;
-            if slot.closing || slot.starting {
+            if slot.shutting_down || slot.closing || slot.starting {
                 return Err(NativeBirthStart::NotAdmittedUnknown {
                     target: slot.current.as_ref().map(|b| b.target),
                 });
@@ -248,7 +250,7 @@ impl NativeCustody {
                 term_deadline: None,
                 kill_sent: false,
             }),
-            stop_requested: AtomicBool::new(slot.closing),
+            stop_requested: AtomicBool::new(slot.closing || slot.shutting_down),
             core: OnceLock::new(),
         });
         slot.current = Some(Arc::clone(&birth));
@@ -342,6 +344,7 @@ impl NativeCustody {
     pub(super) fn close_admission(&self) {
         let current = {
             let mut slot = self.slot();
+            slot.shutting_down = true;
             slot.closing = true;
             slot.current.clone()
         };
@@ -356,7 +359,7 @@ impl NativeCustody {
             .slot
             .lock()
             .map_err(|_| "native custody slot unavailable".to_owned())?;
-        Ok(slot.closing && !slot.starting && slot.current.is_none())
+        Ok(slot.shutting_down && !slot.starting && slot.current.is_none())
     }
 
     /// One bounded native poll. A tail may block, but the registry still owns the Child and

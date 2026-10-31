@@ -7,6 +7,7 @@ use crate::platform::linux::state::{
     BirthAdmission, CoreHandle, CoreSpawner, ManagedChild, ReapBlockerState, SpawnedCore,
     StartAdmission, StopReap,
 };
+use polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR as EXEC_V3;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
@@ -303,7 +304,13 @@ fn setup_env() -> (tempfile::TempDir, PathBuf, PathBuf) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&core_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["sing-box", "libcronet.so"] {
+            std::fs::set_permissions(core_dir.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
     }
     (dir, auth, core_dir)
 }
@@ -405,7 +412,7 @@ fn exact_start_status_and_stop_keep_a_single_birth_identity() {
     let mut state = HandlerState::new();
     let sb = deps.test_core.as_ref().unwrap().manifest.id.clone();
     let cfg = cfg.to_string_lossy().into_owned();
-    let mut start = MockConn::new(vec![&sb, &cfg, "", "1", ""]);
+    let mut start = MockConn::new(vec![EXEC_V3, &sb, &cfg, "", "1", ""]);
     dispatch_locked(
         &mut state,
         &deps,
@@ -426,7 +433,7 @@ fn exact_start_status_and_stop_keep_a_single_birth_identity() {
         Some(target)
     );
 
-    let mut already = MockConn::new(vec![&sb, &cfg, "", "1", ""]);
+    let mut already = MockConn::new(vec![EXEC_V3, &sb, &cfg, "", "1", ""]);
     dispatch_locked(
         &mut state,
         &deps,
@@ -644,7 +651,7 @@ fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
         ..HandlerState::new()
     };
     let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
-    let mut conn = MockConn::new(vec![&id, "/cfg.json", "", "0", ""]);
+    let mut conn = MockConn::new(vec![EXEC_V3, &id, "/cfg.json", "", "0", ""]);
     dispatch_locked(
         &mut state,
         &deps,
@@ -689,7 +696,7 @@ fn hidden_legacy_custody_never_reports_exact_empty_or_spawns() {
     // 带尾文，与「不认识这条命令」的裸 `ERR unknown` 区分开（客户端据裸形判 helper 过旧）。
     assert_eq!(status.writes(), ["ERR unknown birth-custody-unidentified"]);
     let id = "a".repeat(64);
-    let mut start = MockConn::new(vec![&id, "/cfg.json", "", "0", ""]);
+    let mut start = MockConn::new(vec![EXEC_V3, &id, "/cfg.json", "", "0", ""]);
     dispatch_locked(
         &mut state,
         &deps,
@@ -728,6 +735,7 @@ fn exact_commands_reject_extra_lines_before_custody_changes() {
     );
     assert_eq!(status.writes(), ["ERR bad-args"]);
     let mut start = MockConn::new(vec![
+        EXEC_V3,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "/cfg.json",
         "",
@@ -1373,7 +1381,7 @@ fn start_failure_reports_err_start_and_resets_forward() {
     let mut state = HandlerState::new();
     let sb = deps.test_core.as_ref().unwrap().manifest.id.clone();
     let cfg_s = cfg.to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec![&sb, &cfg_s, "", "1", ""]);
+    let mut conn = MockConn::new(vec![EXEC_V3, &sb, &cfg_s, "", "1", ""]);
     // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
     // （非 root），而可信 authfile 必须 root 属主 + 无 group/other 位，非特权测试进程造不出；鉴权门本身
     // 由 unauthorized_uid_rejected_for_status / root_always_authorized 与 auth 模块判据测试独立覆盖。
@@ -1484,16 +1492,16 @@ fn resolved_dns_failure_keeps_structured_error_detail() {
 
 #[test]
 fn wire_forms_match_go_source() {
-    // v1 是 wire 断代真值；build 字段是尾部向后兼容扩展（旧 app 忽略）。
-    assert_eq!(PROTO_VERSION, 2);
+    // v3 requires the pinned execution discriminator; build remains diagnostic.
+    assert_eq!(PROTO_VERSION, 3);
     assert_eq!(
         Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(0))).to_wire_line(),
         format!(
-            "OK pong uid=0 v2 build={}",
+            "OK pong uid=0 v3 build={}",
             polaris_helper_proto::build_identity::current()
         )
     );
-    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 2");
+    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 3");
     assert_eq!("OK stopped", "OK stopped");
     assert_eq!("OK running 12345", "OK running 12345");
     assert_eq!("OK notrunning", "OK notrunning");
@@ -1548,11 +1556,11 @@ fn pinned_content_and_native_owner_are_checked_before_start_side_effects() {
     let cfg = cfg.to_string_lossy().into_owned();
     let mut state = HandlerState::new();
     let other_id = "b".repeat(64);
-    let mut bad = MockConn::new(vec![&other_id, &cfg, "", "1"]);
+    let mut bad = MockConn::new(vec![EXEC_V3, &other_id, &cfg, "", "1"]);
     dispatch_locked(&mut state, &deps, &cred, lcmd::START_PINNED_BIRTH, &mut bad);
     assert_eq!(bad.writes(), ["ERR core-invalid"]);
     std::fs::write(core_dir.join("libcronet.so"), b"changed-sidecar").unwrap();
-    let mut corrupt = MockConn::new(vec![&id, &cfg, "", "1"]);
+    let mut corrupt = MockConn::new(vec![EXEC_V3, &id, &cfg, "", "1"]);
     dispatch_locked(
         &mut state,
         &deps,
@@ -1564,7 +1572,7 @@ fn pinned_content_and_native_owner_are_checked_before_start_side_effects() {
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
     assert!(forwards.lock().unwrap().is_empty());
     std::fs::write(core_dir.join("libcronet.so"), b"inert-sidecar").unwrap();
-    let mut good = MockConn::new(vec![&id, &cfg, "", "1"]);
+    let mut good = MockConn::new(vec![EXEC_V3, &id, &cfg, "", "1"]);
     dispatch_locked(
         &mut state,
         &deps,
@@ -1584,7 +1592,7 @@ fn pinned_content_and_native_owner_are_checked_before_start_side_effects() {
     };
     for command in [lcmd::START_PINNED_BIRTH, lcmd::STATUS_BIRTH_SAFE] {
         let mut denied = MockConn::new(if command == lcmd::START_PINNED_BIRTH {
-            vec![&id, &cfg, "", "1"]
+            vec![EXEC_V3, &id, &cfg, "", "1"]
         } else {
             vec![]
         });
@@ -1623,7 +1631,7 @@ fn hidden_already_birth_cannot_be_relabeled_with_a_requested_core_id() {
     );
     let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
     let mut state = HandlerState::new();
-    let mut conn = MockConn::new(vec![&id, "/cfg.json", "", "1"]);
+    let mut conn = MockConn::new(vec![EXEC_V3, &id, "/cfg.json", "", "1"]);
     dispatch_locked(
         &mut state,
         &deps,
@@ -2039,7 +2047,7 @@ fn refused_dns_frame_retiring_only_a_reservation_does_not_block_the_next_start()
         let uid = nix::unistd::getuid().as_raw();
         let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
         let cfg = cfg.to_string_lossy().into_owned();
-        let mut next = MockConn::new(vec![&id, &cfg, "", "1", ""]);
+        let mut next = MockConn::new(vec![EXEC_V3, &id, &cfg, "", "1", ""]);
         dispatch_locked(
             &mut state,
             &deps,
@@ -2209,4 +2217,49 @@ fn freeport_listener_without_visible_pid_is_not_free() {
     let mut conn = MockConn::new(vec!["freeport", "9090"]);
     handle(&state, &deps, &mut conn);
     assert_eq!(conn.writes(), ["OK foreign unknown"]);
+}
+
+#[test]
+fn v3_dispatch_refuses_legacy_wrong_or_duplicate_marker_before_native_factory() {
+    let (_dir, auth, core_dir) = setup_env();
+    let uid = nix::unistd::getuid().as_raw();
+    let cred = PeerCred { uid, gid: uid };
+    let peer = StaticPeerCred::new(uid, uid);
+    let spawner = MockSpawner::succeeding(7777);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd = |_| {};
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    for args in [
+        vec![id.as_str(), "/cfg", "", "0"],
+        vec!["wrong-v3", id.as_str(), "/cfg", "", "0"],
+        vec![EXEC_V3, EXEC_V3, id.as_str(), "/cfg", "", "0"],
+        vec![EXEC_V3, id.as_str(), "/cfg", "", "0", "42", "extra"],
+    ] {
+        let mut state = HandlerState::new();
+        let mut conn = MockConn::new(args);
+        dispatch_locked(
+            &mut state,
+            &deps,
+            &cred,
+            lcmd::START_PINNED_BIRTH,
+            &mut conn,
+        );
+        assert_eq!(conn.writes(), ["ERR bad-args"]);
+        assert!(state.child.is_none());
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+        assert!(fp.killed.lock().unwrap().is_empty());
+        assert!(systemd.calls.lock().unwrap().is_empty());
+    }
 }

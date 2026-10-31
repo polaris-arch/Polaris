@@ -7,7 +7,8 @@
 //! | `core_get_version_info` | 内核信息（只读：随包内核自报版本、清单声明版本、补丁集标识） |
 //! | `app_uninstall_all` | 卸载编排，见 [`crate::runtime::uninstall`] |
 //!
-//! 内核没有任何写命令：应用内不提供检查、下载、上传、回滚或恢复出厂。
+//! 内核仅可显式恢复当前可信随包数据；不接受下载、上传、任意路径或其他版本。
+//! 数据恢复不授执行权限，也不自动重连或安装助手。
 //!
 //! # 未接线的命令返 `success:false` 而非 `{ok:false}`
 //!
@@ -29,6 +30,7 @@
 mod app_update;
 mod app_update_policy;
 mod core_info;
+mod core_recovery;
 mod shared;
 #[path = "updater/uninstall.rs"]
 mod uninstall_command;
@@ -39,6 +41,7 @@ pub use app_update::{
     update_request_install_permission, update_skip, version_get_info,
 };
 pub use core_info::core_get_version_info;
+pub use core_recovery::{core_check_offline_recovery, core_restore_bundled_data};
 pub use uninstall_command::app_uninstall_all;
 
 // 仅供同 crate 的启动任务复用。

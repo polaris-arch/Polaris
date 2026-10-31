@@ -542,6 +542,15 @@ fn map_singbox_outbound(
     };
     let mut s = new_server(id_gen, ob, protocol, server_addr, port, sub_id, now);
 
+    // Trojan 原生配置没有 TLS 即明文；非法形状不能被当作“关闭 TLS”。
+    if protocol == Protocol::Trojan
+        && ob
+            .get("tls")
+            .is_some_and(|tls| !tls.is_null() && !tls.is_object())
+    {
+        return MapOutcome::Fail;
+    }
+
     // 通用 TLS / 传输 / 多路复用（ssh 显式覆盖 security/network，见下）。
     apply_tls(&mut s, ob.get("tls"));
     if let Some(transport) = ob.get("transport").filter(|v| v.is_object()) {
@@ -565,6 +574,10 @@ fn map_singbox_outbound(
         }
         "trojan" => {
             s.password = Some(str_val(ob.get("password")).unwrap_or_default());
+            // 区别于用户模型省略 security 时的默认 TLS，保留原生 JSON 的明文语义。
+            if s.security.is_none() {
+                s.security = Some(SecurityMode::None);
+            }
         }
         // Hysteria **v1**（2026-08-11）：与 hy2 同名不同义的两处必须各写各的 ——
         // obfs 是裸口令串（不是 {type,password} 对象）、认证走 auth_str（不是 password）。
@@ -765,7 +778,7 @@ fn map_singbox_outbound(
             if version != Some(4) && version != Some(6) {
                 return MapOutcome::Fail; // 版本不受支持 → 跳过（validateConfig 会拒坏节点连累整份订阅）
             }
-            let Some(psk) = str_ne(ob.get("psk")) else {
+            let Some(psk) = str_ne(ob.get("psk")).filter(|psk| !psk.trim().is_empty()) else {
                 return MapOutcome::Fail; // 缺 psk
             };
             let version = version.unwrap();
@@ -773,10 +786,23 @@ fn map_singbox_outbound(
                 version,
                 ..Default::default()
             };
-            // obfs 仅 v4。
-            if version == 4 && str_ne(ob.get("obfs_mode")).as_deref() == Some("http") {
-                snell.obfs_mode = Some("http".to_string());
-                snell.obfs_host = str_ne(ob.get("obfs_host"));
+            // v4 supports HTTP/TLS obfs; malformed or unsupported active modes
+            // must fail instead of silently importing a different connection.
+            let obfs_mode = match ob.get("obfs_mode") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(mode)) => Some(mode.to_ascii_lowercase()),
+                _ => return MapOutcome::Fail,
+            };
+            if let Some(mode) = obfs_mode.filter(|mode| !mode.is_empty() && mode != "none") {
+                if version != 4 || !matches!(mode.as_str(), "http" | "tls") {
+                    return MapOutcome::Fail;
+                }
+                snell.obfs_host = match ob.get("obfs_host") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(host)) => Some(host.clone()).filter(|host| !host.is_empty()),
+                    _ => return MapOutcome::Fail,
+                };
+                snell.obfs_mode = Some(mode);
             }
             if version == 6 {
                 if let Some(m) = str_ne(ob.get("mode")) {

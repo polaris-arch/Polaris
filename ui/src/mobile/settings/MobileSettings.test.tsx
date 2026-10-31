@@ -46,10 +46,13 @@ import { SelectSheetPanel } from '../screens/rules/Primitives';
 import { BACKUP_CATEGORIES } from '@/domain/backup-categories';
 import {
   domesticPresets,
+  dnsUpstreamIdentity,
+  editNodeResolverInventory,
   needsFakeIpOffConfirm,
   remotePresets,
 } from '@/components/screens/settings/settings-dns-logic';
 import zhCN from '@/i18n/locales/zh-CN.json';
+import { importListEntryRows, listEntryRows, listEntrySources, listEntryAcceptance, nextListEntryDraft } from '@/domain/list-entries';
 
 import { crateRootSource, maskRustComments } from '@/contracts/rust-source.test-support';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
@@ -2673,17 +2676,101 @@ describe('⑫ter 连入来源排除：配置里在、界面上也看得见了（
     expect(src).toMatch(/filter\(\(s\)\s*=>\s*s\s*!==\s*''\)/);
   });
 
-  it('🔴 去重与草稿规则**不重写**：两端读同一份纯逻辑（`@/domain/list-entries`）', () => {
-    const chrome = SOURCES.find((f) => f.file === 'SettingsChrome.tsx')?.text ?? '';
-    expect(chrome, '移动端清单编辑器没有复用共享的纯逻辑').toContain(
-      "from '@/domain/list-entries'",
-    );
-    for (const fn of ['parseBulkEntries', 'nextDraft', 'sameEntries']) {
-      expect(chrome, `${fn} 没被用上 —— 大概率是又抄了一份`).toContain(fn);
+  /** Follow imported calls inside the actual editor, allowing import aliases.
+   * A helper name in a comment/import without a call does not satisfy this gate. */
+  function sharedEditorCalls(file: string, source: string, component: string): Set<string> {
+    const sf = ts.parseSourceFile(file, source);
+    const imported = new Map<string, string>();
+    for (const node of sf.statements) {
+      if (!ts.isImportDeclaration(node) || !ts.isStringLiteral(node.moduleSpecifier) ||
+          node.moduleSpecifier.text !== '@/domain/list-entries') continue;
+      const bindings = node.importClause?.namedBindings;
+      if (bindings && ts.isNamedImports(bindings)) {
+        for (const binding of bindings.elements) imported.set(binding.name.text, (binding.propertyName ?? binding.name).text);
+      }
     }
-    // 且它**没有** import 桌面那条组件链（契约 A1 的理由，也是不直接复用 ListEditor 的理由）。
+    const editor = sf.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === component);
+    const calls = new Set<string>();
+    const walk = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+        const name = imported.get(node.expression.text);
+        if (name) calls.add(name);
+      }
+      ts.forEachChild(node, walk);
+    };
+    if (editor) walk(editor);
+    return calls;
+  }
+
+  it('🔴 去重与草稿规则不重写：两端实际编辑器调用同一 identified 共享链', () => {
+    const mobileFile = join(HERE, 'SettingsChrome.tsx');
+    const mobileSource = readFileSync(mobileFile, 'utf8');
+    const desktopFile = join(UI_SRC, 'components/screens/settings/ListEditor.tsx');
+    for (const [file, source, component] of [
+      [mobileFile, mobileSource, 'MobileListEditor'],
+      [desktopFile, readFileSync(desktopFile, 'utf8'), 'ListEditor'],
+    ]) {
+      const calls = sharedEditorCalls(file, source, component);
+      for (const helper of ['importListEntryRows', 'nextListEntryDraft', 'listEntrySources']) {
+        expect(calls.has(helper), `${component} 没有实际调用共享 ${helper}`).toBe(true);
+      }
+    }
+    const chrome = stripComments(mobileSource);
+    // 保留移动端不能牵进桌面呈现链的原契约（A1）。
     expect(chrome).not.toContain('screens/settings/ListEditor');
     expect(chrome).not.toContain('screens/settings/Primitives');
+  });
+
+  it('反向对照：只留共享 import、拔掉真实导入调用会被接线门识别', () => {
+    const source = readFileSync(join(HERE, 'SettingsChrome.tsx'), 'utf8');
+    const unwired = source.replace('importListEntryRows(importDraft, draft, undefined, entryIdentity)', 'draft');
+    expect(unwired).not.toBe(source);
+    expect(sharedEditorCalls('synthetic-mobile-list-unwired.tsx', unwired, 'MobileListEditor').has('importListEntryRows')).toBe(false);
+  });
+
+  it('共享清单链保留普通导入的去重、空占位、max 与未提交编辑', () => {
+    const seed = listEntryRows(['Example.com', '']);
+    const imported = importListEntryRows('EXAMPLE.COM,new.example,overflow.example', seed, 3);
+    expect(imported.map(row => row.value)).toEqual(['Example.com', '', 'new.example']);
+    expect(imported[0]).toBe(seed[0]);
+    expect(imported[1]).toBe(seed[1]);
+    const dirty = imported.map((row, index) => index === 0 ? { ...row, value: 'edited.example' } : row);
+    expect(nextListEntryDraft(dirty, imported, listEntryRows(['remote.example']))).toBe(dirty);
+    expect(seed.map(row => row.value)).toEqual(['Example.com', '']);
+  });
+
+  it('共享 identified 链在去重后继续编辑仍保选中来源，真实删除不转选或回默认', () => {
+    const seed = listEntryRows(['tls://1.1.1.1', 'tls://9.9.9.9'], ['a', 'b']);
+    const previous = seed.map(row => ({ id: row.id!, spec: row.value }));
+    const edited = seed.map(row => row.id === 'b' ? { ...row, value: 'tls://1.1.1.1:853' } : row);
+    const submitted = importListEntryRows('tls://1.1.1.1,udp://8.8.4.4', edited, undefined, dnsUpstreamIdentity);
+    expect(submitted.map(row => row.id)).toEqual(['a', 'b', undefined]);
+    let allocated = 0;
+    const createId = () => `new-${++allocated}`;
+    const first = editNodeResolverInventory(previous, ['b'], submitted.map(row => ({ id: row.id, spec: row.value })), createId, { sources: listEntrySources(submitted) });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error(first.error);
+    expect(first.pool).toEqual(['a']);
+    expect(first.custom).toEqual([{ id: 'a', spec: 'tls://1.1.1.1' }, { id: 'new-1', spec: 'udp://8.8.4.4' }]);
+    const receipt = listEntryAcceptance(first.editor, submitted);
+    expect(receipt).toBeDefined();
+    if (!receipt) throw new Error('missing identified receipt');
+    const newer = submitted.map(row => row.id === 'b' ? { ...row, value: 'tls://8.8.8.8' } : row);
+    const incoming = listEntryRows(first.custom.map(row => row.spec), first.custom.map(row => row.id));
+    const rebased = nextListEntryDraft(newer, seed, incoming, receipt);
+    expect(rebased.map(row => row.key)).toEqual(submitted.map(row => row.key));
+    const second = editNodeResolverInventory(first.custom, first.pool, rebased.map(row => ({ id: row.id, spec: row.value })), createId, { sources: listEntrySources(rebased), context: receipt.context });
+    expect(second.ok).toBe(true);
+    if (!second.ok) throw new Error(second.error);
+    expect(second.pool).toEqual(['new-2']);
+    expect(second.custom.find(row => row.id === second.pool[0])?.spec).toBe('tls://8.8.8.8');
+    expect(allocated).toBe(2); // New UDP and the edited fork; the UDP ID is not reminted.
+    const saved = JSON.parse(JSON.stringify({ custom: second.custom, pool: second.pool }));
+    expect(editNodeResolverInventory(saved.custom, saved.pool, saved.custom, createId)).toEqual({ ok: true, ...saved });
+    const deleted = editNodeResolverInventory(saved.custom, saved.pool, saved.custom.filter((row: { id: string }) => row.id !== 'new-2'), createId);
+    expect(deleted.ok).toBe(true);
+    if (!deleted.ok) throw new Error(deleted.error);
+    expect(deleted.pool).toEqual([]);
   });
 
   it('🔴 两端都不许种幻影默认：缺席就画空表，不画一段并未生效的排除段', () => {
@@ -3836,12 +3923,15 @@ describe('⑱ 应用更新：检查 + 显示 + 打开发布页（W-19 / W-20）'
       at('let Some(platform) = platform else {') < at('release_only_response('),
       '只比版本那条腿没有挂在「不发包的平台」那一档上',
     ).toBe(true);
-    // 🔴 臂序承重：`includeCurrent`（重装当前版本）必须排在 Android 兜底**之前**，
-    //    否则那条腿在 Android 上永远拿不到目标（match 取第一条命中的臂）。
+    // 显式重装先独立查找当前版本；普通 Android 检查才允许走 release-only 兜底。
+    const dispatch = /fn check_requested_app_release\([\s\S]*?\n\}/.exec(rs)?.[0] ?? '';
+    expect(dispatch).toMatch(/if include_current\s*\{\s*resolve_current_app_release\(/);
+    expect(dispatch).toMatch(/\}\s*else\s*\{\s*check_app_update\(/);
+    expect(body).toMatch(/check_requested_app_release\(\s*&body,\s*&current,\s*include_pre,\s*include_current,/);
     expect(
-      at('if !include_current && platform == AssetPlatform::Android =>') <
-        at('if include_current => match resolve_current_app_release('),
-      '两条臂的守卫在 Android 上同时成立，顺序反了「重装当前版本」就没有对象了',
+      at('check_requested_app_release(') <
+        at('if !include_current && platform == AssetPlatform::Android =>'),
+      '重装当前版本必须在 Android 普通检查兜底之前独立分派，缺当前资产不能换成其他版本',
     ).toBe(true);
   });
 

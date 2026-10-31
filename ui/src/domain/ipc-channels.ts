@@ -239,6 +239,8 @@ export const IPC_CHANNELS = {
 
   // 内核只读信息
   CORE_GET_VERSION_INFO: 'core_get_version_info',
+  CORE_CHECK_OFFLINE_RECOVERY: 'core_check_offline_recovery',
+  CORE_RESTORE_BUNDLED_DATA: 'core_restore_bundled_data',
   APP_UNINSTALL_ALL: 'app_uninstall_all', // B6：完全卸载 Polaris（提权 helper / 受保护目录内核 / 用户配置 / 应用本体）
 
   // Shell 操作

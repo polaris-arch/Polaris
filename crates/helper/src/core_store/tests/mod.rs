@@ -1,7 +1,7 @@
 use super::*;
 use polaris_helper_proto::core_manifest::{CoreFile, CoreManifest};
 
-fn fixture(version: &str) -> (tempfile::TempDir, InstalledCoreManifest) {
+pub(super) fn fixture(version: &str) -> (tempfile::TempDir, InstalledCoreManifest) {
     let source = tempfile::tempdir().unwrap();
     private_mode(source.path(), 0o700).unwrap();
     let files: Vec<_> = [
@@ -10,7 +10,9 @@ fn fixture(version: &str) -> (tempfile::TempDir, InstalledCoreManifest) {
     ]
     .into_iter()
     .map(|(name, raw)| {
-        fs::write(source.path().join(name), &raw).unwrap();
+        let path = source.path().join(name);
+        fs::write(&path, &raw).unwrap();
+        private_mode(&path, 0o600).unwrap();
         CoreFile {
             name: name.into(),
             bytes: raw.len() as u64,
@@ -42,17 +44,30 @@ fn fixture(version: &str) -> (tempfile::TempDir, InstalledCoreManifest) {
     )
 }
 
-fn store() -> (tempfile::TempDir, CoreStore, u32) {
-    let root = tempfile::tempdir().unwrap();
-    private_mode(root.path(), 0o700).unwrap();
+pub(super) fn store() -> (tempfile::TempDir, CoreStore, u32) {
     let uid = nix::unistd::Uid::effective().as_raw();
-    let store = CoreStore::initialize(root.path(), OwnerPolicy { uid: Some(uid) }).unwrap();
+    let root = if uid == 0 {
+        #[cfg(target_os = "linux")]
+        let base = Path::new("/root");
+        #[cfg(target_os = "macos")]
+        let base = Path::new("/private/var/root");
+        tempfile::Builder::new()
+            .prefix("core-store-test-")
+            .tempdir_in(base)
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    private_mode(root.path(), 0o700).unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    let store = CoreStore::initialize(&canonical, OwnerPolicy { uid: Some(uid) }).unwrap();
     (root, store, uid)
 }
 
 #[test]
 fn runtime_open_is_read_only_and_does_not_invent_an_installation() {
     let root = tempfile::tempdir().unwrap();
+    private_mode(root.path(), 0o700).unwrap();
     let uid = nix::unistd::Uid::effective().as_raw();
     assert!(CoreStore::open(root.path(), OwnerPolicy { uid: Some(uid) }).is_err());
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
@@ -76,6 +91,24 @@ fn mismatched_source_never_becomes_an_eligible_version() {
 
 #[test]
 fn same_id_is_immutable_and_every_start_rechecks_contents() {
+    // Local File drop cannot exclude a descriptor inherited by another test's
+    // concurrent spawn. Create this fixture only after the exact child execs.
+    match exact_fixture_child_context(SAME_ID_EXACT_TEST)
+        .expect("valid exact same-id child protocol")
+    {
+        Some(context) => {
+            emit_exact_fixture_record(&context, "entry");
+            same_id_fixture_body();
+            emit_exact_fixture_record(&context, "complete");
+        }
+        None => {
+            run_exact_fixture_child(SAME_ID_EXACT_TEST, None, std::time::Duration::from_secs(30))
+                .expect("isolated same-id fixture completes once and is reaped")
+        }
+    }
+}
+
+fn same_id_fixture_body() {
     let (root, store, uid) = store();
     let (source, manifest) = fixture("1.0.0");
     assert_eq!(
@@ -91,7 +124,7 @@ fn same_id_is_immutable_and_every_start_rechecks_contents() {
         InstallOutcome::AlreadyPresent
     );
     let id = CoreId::parse(&manifest.id).unwrap();
-    let verified = store.verify_for_start(&id).unwrap();
+    let verified = store.verify_objects(&id, true).unwrap();
     assert_eq!(verified.manifest.id, manifest.id);
     fs::write(
         root.path()
@@ -101,7 +134,7 @@ fn same_id_is_immutable_and_every_start_rechecks_contents() {
         b"changed",
     )
     .unwrap();
-    assert!(store.verify_for_start(&id).is_err());
+    assert!(store.verify_objects(&id, true).is_err());
     // A damaged active version cannot be replaced beneath a held lazy-sidecar lease.
     assert!(store
         .install(&manifest, source.path(), Some(uid), None)
@@ -113,9 +146,166 @@ fn same_id_is_immutable_and_every_start_rechecks_contents() {
             .unwrap(),
         InstallOutcome::Installed
     );
-    assert!(store.verify_for_start(&id).is_ok());
+    assert!(store.verify_objects(&id, true).is_ok());
 }
 
+#[test]
+fn inherited_version_lease_blocks_repair_until_last_child_reference_closes() {
+    match exact_fixture_child_context(INHERITED_VERSION_LEASE_EXACT_TEST)
+        .expect("valid exact inherited-version-lease child protocol")
+    {
+        Some(context) => {
+            emit_exact_fixture_record(&context, "entry");
+            inherited_version_lease_fixture_body();
+            emit_exact_fixture_record(&context, "complete");
+        }
+        None => run_exact_fixture_child(
+            INHERITED_VERSION_LEASE_EXACT_TEST,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .expect("isolated inherited-version-lease fixture completes once and is reaped"),
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "isolated inherited version lease control; child only uses async-signal-safe syscalls"
+)]
+fn inherited_version_lease_fixture_body() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let (root, store, uid) = store();
+    let (source, manifest) = fixture("1.0.0");
+    assert_eq!(
+        store
+            .install(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::Installed
+    );
+    let id = CoreId::parse(&manifest.id).unwrap();
+    let verified = store.verify_objects(&id, true).unwrap();
+    let observation = LockObservation::from_file(verified._lease.as_ref().unwrap());
+    let lease_fd = verified._lease.as_ref().unwrap().as_raw_fd();
+    let device = observation.dev.unwrap();
+    let inode = observation.inode.unwrap();
+    lock_diagnostics::record("version-shared-acquired", &observation);
+    fs::write(
+        root.path()
+            .join("versions")
+            .join(&manifest.id)
+            .join("libcronet.so"),
+        b"changed",
+    )
+    .unwrap();
+
+    let (ready_read, ready_write) = nix::unistd::pipe().unwrap();
+    let (release_read, release_write) = nix::unistd::pipe().unwrap();
+    let ready_read_fd = ready_read.as_raw_fd();
+    let ready_write_fd = ready_write.as_raw_fd();
+    let release_read_fd = release_read.as_raw_fd();
+    let release_write_fd = release_write.as_raw_fd();
+    // SAFETY: libc::stat contains only numeric fields; initialize its child-side
+    // output buffer before fork, without acquiring any descriptor or lock.
+    let mut inherited_stat: nix::libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: this exact exec fixture has no other unit-test fixture. The child
+    // uses only preallocated scalars/buffers and the syscalls below, then _exit;
+    // it never allocates, formats, locks or invokes Rust Drop.
+    let pid = unsafe { nix::libc::fork() };
+    assert!(pid >= 0, "controlled version-lease fork failed");
+    if pid == 0 {
+        // SAFETY: every fd was opened before fork and remains live here. The
+        // inherited lease is never unlocked; _exit closes its last reference.
+        unsafe {
+            nix::libc::alarm(10);
+            if nix::libc::close(ready_read_fd) != 0 || nix::libc::close(release_write_fd) != 0 {
+                nix::libc::_exit(90);
+            }
+            let flags = nix::libc::fcntl(lease_fd, nix::libc::F_GETFD);
+            if flags < 0
+                || flags & nix::libc::FD_CLOEXEC == 0
+                || nix::libc::fstat(lease_fd, &mut inherited_stat) != 0
+                || inherited_stat.st_dev as u64 != device
+                || inherited_stat.st_ino as u64 != inode
+            {
+                nix::libc::_exit(91);
+            }
+            let ready = [1u8];
+            if nix::libc::write(ready_write_fd, ready.as_ptr().cast(), 1) != 1 {
+                nix::libc::_exit(92);
+            }
+            let mut release = [0u8];
+            if nix::libc::read(release_read_fd, release.as_mut_ptr().cast(), 1) != 1
+                || release != [1]
+            {
+                nix::libc::_exit(93);
+            }
+            nix::libc::_exit(0);
+        }
+    }
+    let mut cleanup = lock_diagnostics::ChildCleanup(Some(pid));
+    drop(ready_write);
+    drop(release_read);
+    let mut ready = File::from(ready_read);
+    let mut release = File::from(release_write);
+    let mut byte = [0u8];
+    ready.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [1], "child validated its exact inherited lease fd");
+    drop(verified);
+    lock_diagnostics::record("version-parent-file-closed", &observation);
+
+    // One real repair attempt while the known child remains behind the pipe.
+    // Accept only native RepairExclusive contention, never an unrelated error.
+    let error = store
+        .install(&manifest, source.path(), Some(uid), None)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    let failure = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<LockFailure>()
+        .unwrap();
+    assert!(matches!(failure.role, LockRole::RepairExclusive));
+    assert!(matches!(&failure.cause, TryLockError::WouldBlock));
+    assert_eq!(failure.observation.dev, Some(device));
+    assert_eq!(failure.observation.inode, Some(inode));
+    let snapshot = failure.holder_snapshot.as_ref().unwrap();
+    let birth = snapshot
+        .child_descriptor_birth(pid as u32, lease_fd)
+        .expect("same-inode inherited child descriptor and stable native birth");
+    assert!(birth[0] > 0);
+    writeln!(
+        io::stderr().lock(),
+        "VERSION_LEASE_CONTROL phase=parent-dropped child_pid={pid} child_birth={birth:?} inherited_fd={lease_fd} dev={device} inode={inode} {error}"
+    )
+    .unwrap();
+
+    release.write_all(&[1]).unwrap();
+    let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None).unwrap();
+    cleanup.0 = None; // Reaped before checking status; never signal a reused PID.
+    assert!(matches!(status, nix::sys::wait::WaitStatus::Exited(_, 0)));
+    assert_eq!(
+        store
+            .install(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::Installed
+    );
+    assert_eq!(
+        store.verify_objects(&id, true).unwrap().manifest.id,
+        manifest.id
+    );
+    writeln!(
+        io::stderr().lock(),
+        "VERSION_LEASE_CONTROL phase=child-reaped-repair-installed child_pid={pid} child_birth={birth:?} dev={device} inode={inode}"
+    )
+    .unwrap();
+}
+
+const SAME_ID_EXACT_TEST: &str =
+    "core_store::tests::same_id_is_immutable_and_every_start_rechecks_contents";
+const INHERITED_VERSION_LEASE_EXACT_TEST: &str =
+    "core_store::tests::inherited_version_lease_blocks_repair_until_last_child_reference_closes";
 const BUSY_LEASE_EXACT_TEST: &str =
     "core_store::tests::busy_leases_allow_new_install_but_prevent_retirement";
 const EXACT_FIXTURE_MARKER: &str = "POLARIS_BUSY_LEASE_EXACT_CHILD";
@@ -577,7 +767,7 @@ fn busy_lease_fixture_body(nonce: &str) {
                 leases.len(), started.elapsed().as_nanos()));
         leases.push(
             store
-                .verify_for_start(&CoreId::parse(&manifest.id).unwrap())
+                .verify_objects(&CoreId::parse(&manifest.id).unwrap(),true)
                 .unwrap_or_else(|error| panic!("busy-lease stage=outer-start-verify iteration={iteration} version={version} held_leases={} elapsed_ns={} error={error:?}",
                     leases.len(), started.elapsed().as_nanos())),
         );
@@ -597,7 +787,7 @@ fn busy_lease_fixture_body(nonce: &str) {
     // Mutation-scope unlock must never release these distinct runtime leases.
     let inherited_leases: Vec<File> = leases
         .iter()
-        .map(|core| core._lease.try_clone().unwrap())
+        .map(|core| core._lease.as_ref().unwrap().try_clone().unwrap())
         .collect();
     drop(leases);
     lock_diagnostics::lease_stage_origin(lock_diagnostics::LeaseStage::ClonesHeld, nonce);
@@ -715,6 +905,29 @@ fn exact_fixture_marker_and_completion_fail_closed() {
         records.replace(&nonce, &different_nonce),
     ] {
         assert!(verify_exact_fixture_completion(true, &wrong, &valid, 77).is_err());
+    }
+    // Each isolated fixture must bind its own test identity, not merely reuse
+    // another fixture's valid nonce and parent identity.
+    for test in [SAME_ID_EXACT_TEST, INHERITED_VERSION_LEASE_EXACT_TEST] {
+        let target_marker = format!("{EXACT_FIXTURE_PROTOCOL}|{test}|42|{nonce}");
+        let target_args = exact_fixture_args(test);
+        let target =
+            parse_exact_fixture_context(Some(&target_marker), Some(&nonce), test, &target_args, 42)
+                .unwrap()
+                .unwrap();
+        assert_eq!(target.test, test);
+        assert!(
+            parse_exact_fixture_context(Some(&marker), Some(&nonce), test, &target_args, 42,)
+                .is_err()
+        );
+        assert!(parse_exact_fixture_context(
+            Some(&target_marker),
+            Some(&nonce),
+            BUSY_LEASE_EXACT_TEST,
+            &args,
+            42,
+        )
+        .is_err());
     }
 }
 
@@ -1008,7 +1221,9 @@ fn flat_retirement_preserves_unknown_or_busy_cohorts_and_all_versioned_inputs() 
         .install(&manifest, source.path(), Some(uid), None)
         .unwrap();
     for name in ["sing-box", "libcronet.so"] {
-        fs::write(root.path().join(name), b"old-flat").unwrap();
+        let path = root.path().join(name);
+        fs::write(&path, b"old-flat").unwrap();
+        private_mode(&path, 0o600).unwrap();
     }
     for state in [
         crate::legacy_use::LegacyUse::Unknown,
@@ -1036,7 +1251,7 @@ fn flat_retirement_preserves_unknown_or_busy_cohorts_and_all_versioned_inputs() 
         2
     );
     let id = CoreId::parse(&manifest.id).unwrap();
-    assert!(store.verify_for_start(&id).is_ok());
+    assert!(store.verify_objects(&id, true).is_ok());
 }
 
 #[test]
@@ -1105,4 +1320,197 @@ fn migration_preserves_orphan_payload_without_manifest() {
         fs::read(version.join("sing-box")).unwrap(),
         b"original orphan"
     );
+}
+
+#[test]
+fn idle_diagnostic_cache_in_another_process_does_not_block_first_repair() {
+    const TEST: &str =
+        "core_store::tests::idle_diagnostic_cache_in_another_process_does_not_block_first_repair";
+    let context = match exact_fixture_child_context(TEST).unwrap() {
+        None => {
+            run_exact_fixture_child(TEST, None, std::time::Duration::from_secs(30)).unwrap();
+            return;
+        }
+        Some(context) => {
+            emit_exact_fixture_record(&context, "entry");
+            context
+        }
+    };
+    let (root, store, uid) = store();
+    let (source, manifest) = fixture("idle-cache");
+    store
+        .install(&manifest, source.path(), Some(uid), None)
+        .unwrap();
+    struct Daemon(std::process::Child);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut daemon = Daemon(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "core_store::tests::idle_storage_cache_daemon_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("POLARIS_TEST_IDLE_CACHE_ROOT", root.path())
+            .env("POLARIS_TEST_IDLE_CACHE_ID", &manifest.id)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !root.path().join("cache-ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "diagnostic daemon did not publish readiness"
+        );
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let id = CoreId::parse(&manifest.id).unwrap();
+    fs::write(
+        root.path()
+            .join("versions")
+            .join(id.as_str())
+            .join("libcronet.so"),
+        b"changed",
+    )
+    .unwrap();
+    // No second query/stop/invalidate is sent to the daemon before this first
+    // actual repair. Its successful storage cache remains strongly retained.
+    assert_eq!(
+        store
+            .install(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::Installed
+    );
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    fs::write(root.path().join("cache-release"), b"release").unwrap();
+    assert!(daemon.0.wait().unwrap().success());
+    assert!(store.verify_objects(&id, true).is_ok());
+    emit_exact_fixture_record(&context, "complete");
+}
+
+#[test]
+fn idle_storage_cache_daemon_fixture() {
+    let Some(root) = std::env::var_os("POLARIS_TEST_IDLE_CACHE_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let id = CoreId::parse(&std::env::var("POLARIS_TEST_IDLE_CACHE_ID").unwrap()).unwrap();
+    let owner = OwnerPolicy {
+        uid: Some(nix::unistd::Uid::effective().as_raw()),
+    };
+    let store = CoreStore::open(&root, owner).unwrap();
+    let core = store.verify_objects(&id, true).unwrap();
+    // This private storage fixture exercises the same diagnostic_entry step.
+    // It deliberately has no AdmittedPayload and cannot grant an execution.
+    crate::pinned_core::cache_storage_fixture(&root, &id, owner, core);
+    fs::write(root.join("cache-ready"), b"ready").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !root.join("cache-release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cache controller disappeared"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn removing_idle_cache_lease_cannot_unlock_a_live_or_unknown_owner() {
+    const TEST: &str =
+        "core_store::tests::removing_idle_cache_lease_cannot_unlock_a_live_or_unknown_owner";
+    let context = match exact_fixture_child_context(TEST).unwrap() {
+        None => {
+            run_exact_fixture_child(TEST, None, std::time::Duration::from_secs(30)).unwrap();
+            return;
+        }
+        Some(context) => {
+            emit_exact_fixture_record(&context, "entry");
+            context
+        }
+    };
+    let (_root, store, uid) = store();
+    let (source, manifest) = fixture("live-cache-owner");
+    store
+        .install(&manifest, source.path(), Some(uid), None)
+        .unwrap();
+    let id = CoreId::parse(&manifest.id).unwrap();
+    let live = store.verify_objects(&id, true).unwrap();
+    let diagnostic = live.diagnostic_cache().unwrap();
+    assert!(diagnostic._lease.is_none());
+    assert!(diagnostic
+        .prepare(polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain)
+        .is_err());
+    drop(diagnostic);
+    crate::pinned_core::invalidate_unused();
+    let candidate = store.lease_file(&id).unwrap();
+    assert!(matches!(
+        candidate.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ));
+    // Closing an idle cache never explicitly unlocks a shared description that
+    // can still belong to a Child/tail/debt owner.
+    let inherited = live._lease.as_ref().unwrap().try_clone().unwrap();
+    drop(live);
+    assert!(matches!(
+        candidate.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(inherited);
+    candidate.try_lock().unwrap();
+    emit_exact_fixture_record(&context, "complete");
+}
+
+#[test]
+fn helper_store_damage_and_environment_io_keep_distinct_recovery_routes() {
+    use polaris_core_supervisor::admitted_payload::{
+        AdmissionError, AdmissionErrorKind as K, RecoveryAction as R,
+    };
+    for (source, kind, recovery) in [
+        (
+            io::Error::from_raw_os_error(nix::libc::ELOOP),
+            K::Mismatch,
+            R::RepairHelperInstallation,
+        ),
+        (
+            io::Error::from_raw_os_error(nix::libc::ENOTDIR),
+            K::Mismatch,
+            R::RepairHelperInstallation,
+        ),
+        (
+            invalid("non-regular object"),
+            K::Mismatch,
+            R::RepairHelperInstallation,
+        ),
+        (
+            io::Error::from(io::ErrorKind::NotFound),
+            K::Missing,
+            R::RepairHelperInstallation,
+        ),
+        (
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            K::Io,
+            R::None,
+        ),
+        (
+            io::Error::from(io::ErrorKind::WouldBlock),
+            K::Busy,
+            R::RetryAfterStop,
+        ),
+    ] {
+        let mapped = store_admission_failure(source);
+        let typed = mapped
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<AdmissionError>()
+            .unwrap();
+        assert_eq!((typed.kind, typed.recovery), (kind, recovery));
+    }
 }

@@ -10,12 +10,12 @@
  *
  * # 为什么语料在 Rust 那边
  *
- * 因为那边的每一行都标着「实测 PANIC / 实测 FATAL」，是用真内核（`resources/linux/sing-box`，
- * 1.14.0-beta.3）逐条 `sing-box check` 出来的。真值只该有一处，另一处引用它。
+ * Rust 同时覆盖真实生成/身份校验入口，当前 selected Polaris 的 constructor 已与旧 panic 前提不同。
+ * 语料统一放在 Rust，前端读取；具体可达性仍需同源原生验收，不能把语料称为新内核实测。
  *
  * # 这门抓不到什么
  *
- * - **判据本身对不对**：它只保证两份实现一致。两份一起错，它全绿。那由 Rust 侧语料的实测标注负责。
+ * - **判据本身对不对**：它只保证两份实现一致。两份一起错，它全绿；仍需核真实 selected 内核机制。
  * - **运行期语义**：`sing-box check` 通过不等于 tsnet 真能用那个控制面（check 只 `New()` 不 `Start()`）。
  * - 前端的**调用点**是否真在保存前拦（那由 `TsSettingsDialog` 自身的用例守）。
  */
@@ -33,9 +33,12 @@ const RUST_MODULE = 'crates/config-engine/src/user_config/control_url';
 
 /** Rust 测试函数名 → 该函数里每条 URL 的期望判定（`null` = 应放行）。 */
 const EXPECTED_BY_FN: Readonly<Record<string, ControlUrlReject | null>> = {
-  ip_literal_forms_all_rejected: 'control-url-ip',
-  ipv6_forms_all_rejected: 'control-url-ip',
+  ipv4_control_urls_allowed: null,
+  ipv6_control_urls_allowed: null,
+  unsupported_ip_spellings_rejected: 'control-url-ip',
   missing_scheme_rejected: 'control-url-scheme',
+  empty_host_rejected: 'control-url-invalid',
+  malformed_host_rejected: 'control-url-invalid',
   domain_forms_never_rejected: null,
 };
 
@@ -80,8 +83,9 @@ function urlsIn(body: string): string[] {
     const code = stripLineComment(line);
     for (const m of code.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
       const raw = m[1] ?? '';
-      // 只要看起来像 URL / host 的行，跳过 assert 里的中文提示串。
-      if (raw !== '' && !/[一-鿿]/.test(raw)) out.push(raw.replace(/\\"/g, '"'));
+      // 保留含汉字的 IDN URL；不能因跳过中文断言提示，把合法域名语料也过滤掉。
+      const url = /^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(raw);
+      if (raw !== '' && (url || !/[一-鿿]/.test(raw))) out.push(raw.replace(/\\"/g, '"'));
     }
   }
   return out;
@@ -90,6 +94,11 @@ function urlsIn(body: string): string[] {
 const SRC = moduleSourceWithTests(RUST_MODULE);
 
 describe('control_url 判据跨语言对拍', () => {
+  it('语料抽取保留 IDN URL，仍剔除注释和断言诊断', () => {
+    expect(urlsIn('for url in ["https://用户.example.com"] { // "https://comment.invalid"\n' +
+      'assert_eq!(value, None, "合法域名被误伤");\n}')).toEqual(['https://用户.example.com']);
+  });
+
   it('Rust 语料表读得到（阳性对照：读空 ⇒ 下面每条断言都恒真）', () => {
     expect(SRC.length, 'Rust 源码读不到，路径可能变了').toBeGreaterThan(1000);
     for (const fn of Object.keys(EXPECTED_BY_FN)) {
@@ -113,9 +122,7 @@ describe('control_url 判据跨语言对拍', () => {
     });
   }
 
-  it('刻意偏严的两条也一致（核接受、我们拦）', () => {
-    // 与 Rust `intentionally_stricter_than_upstream` 同源；这两条**核实测通过**，
-    // 前端若放行就会与后端分叉（用户在弹窗里存得下去、下发时却被剔掉）。
+  it('原来的非规范 IP / 协议相对 URL 拒绝边界保持', () => {
     expect(controlUrlReject('http://192.168.001.010:8080')).toBe('control-url-ip');
     expect(controlUrlReject('//hs.example.com')).toBe('control-url-scheme');
   });

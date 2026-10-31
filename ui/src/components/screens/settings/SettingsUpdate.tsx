@@ -45,6 +45,7 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
   const [ghCustomMode, setGhCustomMode] = useState(false);
   const [coreInfo, setCoreInfo] = useState<CoreVersionInfo | null>(null);
   const [selectedCore, setSelectedCore] = useState<HelperStatus['selectedCore']>();
+  const [recoveryComplete, setRecoveryComplete] = useState(false);
   useEffect(() => {
     let cancelled = false;
     void coreApi
@@ -155,7 +156,12 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
       </SetBlock>
 
       <AppUpdateCard config={config} update={update} />
-      <CoreInfoCard info={coreInfo} selectedCore={selectedCore} />
+      <CoreInfoCard info={coreInfo} selectedCore={selectedCore} onRecovered={(result) => {
+        if (result === 'restored') setRecoveryComplete(true);
+        void coreApi.getVersionInfo().then(setCoreInfo).catch(() => setCoreInfo(null));
+        void helperApi.getStatus().then(status => setSelectedCore(status.selectedCore))
+          .catch(() => setSelectedCore(undefined));
+      }} recoveryComplete={recoveryComplete} />
 
       <Card pad style={{ marginBottom: 16 }}>
         <SetRow

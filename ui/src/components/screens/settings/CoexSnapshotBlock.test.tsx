@@ -1,3 +1,5 @@
+// Register the oracle's actual-close/join hook while Vitest collects this file.
+import { cssChain, measure } from '@/styles/css-oracle.test-support';
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -91,5 +93,32 @@ describe('COEX fact projection on the actual settings surface', () => {
     expect(html).toContain('snapshot worker busy'); expect(html).not.toContain(en.settings.coex.sourceUnavailable);
     expect(html).not.toContain(en.settings.coex.observedEmpty);
   });
+
+  it('keeps uncollected and Unknown facts visible while reasons and interface details are closed', async () => {
+    const css = (await cssChain('desktop')).map(item => item.css);
+    const unknownFacts = '[data-coex-facts] > .card-sub:has(> details:not([open]):not([data-coex-interface])) > span';
+    const help = '.info-i[role="img"][tabindex="0"][aria-label][data-tip]';
+    const actual = await measure({ css,
+      html: renderToStaticMarkup(<CoexSnapshotBlock />) + render(fixture(), null),
+      rootAttrs: { 'data-os': 'mac' },
+    }, [
+      { select: '[data-coex-snapshot] [role="status"]', props: ['display', 'visibility'] },
+      { select: unknownFacts, props: ['display', 'visibility'], many: 'all' },
+      { select: help, props: ['display', 'visibility'], many: 'all' },
+    ]);
+    expect(actual.rect('[data-coex-snapshot] [role="status"]').height).toBeGreaterThan(0);
+    // Cleanup and the combined ownership/conflict warning remain visible; all five original reasons stay available.
+    expect(actual.count(unknownFacts)).toBe(2);
+    expect(actual.getAll(unknownFacts, 'visibility')).toEqual(Array(2).fill('visible'));
+    expect(actual.rectAll(unknownFacts).every(rect => rect.height > 0)).toBe(true);
+    expect(actual.count(help)).toBe(2);
+    expect(actual.rectAll(help).every(rect => rect.height > 0)).toBe(true);
+    expect(collect).not.toHaveBeenCalled();
+    const html = render(fixture(), null);
+    expect(html).toContain(en.settings.coex.unconfirmedSummary);
+    for (const reason of [fixture().classification.reason, fixture().context.observationPhase.reason, fixture().context.ownInterfaces.reason, fixture().context.criteria.reason, fixture().context.repairHistory.reason]) {
+      expect(html).toContain(reason);
+    }
+  }, 30_000);
 
 });

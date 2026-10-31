@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import * as ts from '@/test/ts-compiler';
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@/ipc/ipc-client', () => ({ invoke }));
 import { needsHelperRecovery, revealHelperRecovery } from './helper-recovery';
@@ -53,7 +55,40 @@ describe('Helper recovery uses the existing cancellable main-window explanation'
     expect(source).toContain('data-testid="helper-install-failure"');
     expect(source).toContain('helperActionErrorText(installFailure, t)');
     expect(source).toContain("navigate('logs')");
-    expect(source).not.toContain('r.diagnostic');
+    // Inspect code nodes rather than text suffixes: localized string keys are
+    // data, while diagnostic property reads remain forbidden for any receiver.
+    function diagnosticReads(body: string, fileName = 'helper-diagnostic-probe.tsx'): string[] {
+      const file = ts.parseSourceFile(fileName, body);
+      const reads: string[] = [];
+      const literalName = (node: ts.Node | undefined): string | undefined => {
+        if (!node) return undefined;
+        if (ts.isParenthesizedExpression(node)) return literalName(node.expression);
+        return ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : undefined;
+      };
+      const visit = (node: ts.Node): void => {
+        if ((ts.isPropertyAccessExpression(node) && node.name.text === 'diagnostic')
+          || (ts.isElementAccessExpression(node) && literalName(node.argumentExpression) === 'diagnostic')
+          || (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)
+            && literalName(node.propertyName ?? node.name) === 'diagnostic')) reads.push(node.getText(file));
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+      return reads;
+    }
+    expect(diagnosticReads(`
+      const a = r.diagnostic;
+      const b = r ?. diagnostic;
+      const c = r [ 'diagnostic' ];
+      const d = r?.[ 'diagnostic' ];
+      const e = (r). diagnostic;
+      const { diagnostic: message } = r;
+    `)).toHaveLength(6);
+    expect(diagnosticReads(`
+      const label = 'r.diagnostic'; // r.diagnostic is not consumed here
+      const data = { diagnostic: 'definition only' };
+      const view = <p>{t('helper.diagnosticsTitle')}</p>;
+    `)).toEqual([]);
+    expect(diagnosticReads(source, fileURLToPath(new URL('../components/screens/settings/SettingsHelper.tsx', import.meta.url)))).toEqual([]);
   });
 });
 

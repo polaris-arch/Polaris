@@ -27,8 +27,11 @@ fn registration_transaction_restores_exact_bytes_and_absence() {
     let uid = nix::unistd::Uid::effective().as_raw();
     let caller = CallerIdentity::Unix(uid);
     let policy = || OwnerPolicy { uid: Some(uid) };
-    let directory = root.path().join("users").join(caller.key());
+    let users = root.path().join("users");
+    let directory = users.join(caller.key());
     std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&users, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     let record = directory.join("registration");
     let absent_backup = root.path().join("absent.backup");
@@ -60,8 +63,13 @@ fn registration_snapshot_rejects_linked_or_nonprivate_records() {
     let root = tempfile::tempdir().unwrap();
     let uid = nix::unistd::Uid::effective().as_raw();
     let caller = CallerIdentity::Unix(uid);
-    let directory = root.path().join("users").join(caller.key());
+    let users = root.path().join("users");
+    let directory = users.join(caller.key());
     std::fs::create_dir_all(&directory).unwrap();
+    // Keep the surrounding fixture trusted so each unsafe record is the cause.
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&users, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     let record = directory.join("registration");
     let backup = root.path().join("backup");
     symlink(root.path().join("missing"), &record).unwrap();

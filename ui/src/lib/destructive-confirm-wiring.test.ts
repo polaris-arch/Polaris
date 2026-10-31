@@ -173,11 +173,29 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     expect(uninstall).not.toContain("kind: 'confirm'");
     const migration = c.slice(c.indexOf('function stopAndUpgrade()'), c.indexOf('function uninstall()'));
     expect(migration).toContain("kind: 'confirm'");
-    expect(migration).toContain("message: t('helper.stopAndUpgradeWarning')");
+    expect(migration).toContain("!['mac', 'lin'].includes(shellPlatformFromDataOs() ?? '')");
+    expect(migration).toContain('!migrationAdmissionAvailable()');
+    expect(migration).toContain('const confirmedPlatform = shellPlatformFromDataOs()');
+    expect(migration).toMatch(
+      /title:\s*t\(confirmedPlatform === 'lin'\s*\?\s*'helper.linuxStopAndUpgradeTitle'\s*:\s*'helper.stopAndUpgradeTitle'\)/,
+    );
+    expect(migration).toMatch(
+      /message:\s*t\(confirmedPlatform === 'lin'\s*\?\s*'helper.linuxStopAndUpgradeWarning'\s*:\s*'helper.stopAndUpgradeWarning'\)/,
+    );
     expect(migration).toContain("confirmLabel: t('helper.stopAndUpgradeConfirm')");
     expect(migration).toContain('danger: true');
     expect(migration).not.toContain('confirmTwice(');
-    expect(migration).toContain("void runInstall('stopAndUpgrade')");
+    expect(migration).toContain('onConfirm: () => {');
+    const confirmedMigration = migration.match(/onConfirm:\s*\(\)\s*=>\s*\{([\s\S]*?)^\s*\},/m)?.[1] ?? '';
+    expect(confirmedMigration).toContain('shellPlatformFromDataOs() !== confirmedPlatform');
+    expect(confirmedMigration).toContain('!migrationAdmissionAvailable()');
+    expect(confirmedMigration).toContain("!['mac', 'lin'].includes(confirmedPlatform ?? '')");
+    expect(confirmedMigration).toContain("helperInstallSnapshot().failure !== 'upgradeDeferred'");
+    expect(confirmedMigration).toContain("void runInstall('stopAndUpgrade')");
+    expect(c).toContain("const migrationAvailable = migrationAdmissionAvailable() && ['mac', 'lin'].includes(shellPlatformFromDataOs() ?? '') && installFailure === 'upgradeDeferred'");
+    expect(c).toContain('const latest = deriveState(currentStatus.current)');
+    expect(c).toContain("latest !== 'checking' && latest !== 'unsupported' && latest !== 'admission-unavailable'");
+    expect(c).toContain('onClick={migrationAvailable ? stopAndUpgrade : install}');
     // The prototype has only helper uninstall. The full-scope migration modal is
     // an intentional, separately registered action, never a change to that gate.
   });

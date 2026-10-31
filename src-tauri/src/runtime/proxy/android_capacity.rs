@@ -18,6 +18,7 @@ impl CapacityClosed {
 
     pub(crate) fn from_spawn(error: &polaris_core_supervisor::SpawnError) -> Option<Self> {
         match error {
+            polaris_core_supervisor::SpawnError::Admission(_) => None,
             polaris_core_supervisor::SpawnError::Spawn { source, .. } => {
                 source.get_ref()?.downcast_ref::<Self>().copied()
             }

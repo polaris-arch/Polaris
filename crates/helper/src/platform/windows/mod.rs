@@ -55,6 +55,8 @@ pub mod wintun;
 #[cfg(windows)]
 pub mod service;
 #[cfg(windows)]
+pub(crate) mod user_data;
+#[cfg(windows)]
 pub mod winproc;
 
 // 便利重导出：让 `platform::windows::WinHelper` 等无需钻模块路径。

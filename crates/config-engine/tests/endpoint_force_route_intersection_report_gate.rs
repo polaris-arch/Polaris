@@ -313,8 +313,11 @@ fn two_disjoint_tailnets_each_keep_their_own_coverage() {
 /// 声明顺序刻意把无观测的 `ts-bootstrap` 放在**前面** —— 若发射端没排序（照 `config.servers`
 /// 原序发），本条当场红。
 #[test]
-fn observed_nodes_are_emitted_before_bootstrap_nodes() {
-    let config = config_with(vec![ts_node("ts-bootstrap"), ts_node("ts-live")]);
+fn observed_nodes_keep_existing_priority_before_explicit_broad_declarations() {
+    let mut declared = ts_node("ts-bootstrap");
+    declared.tailscale_settings.as_mut().unwrap().routes =
+        vec![TAILNET_CGNAT.into(), "fd7a:115c:a1e0::/48".into()];
+    let config = config_with(vec![declared, ts_node("ts-live")]);
     let obs = observed(&[("ts-live", &["100.64.5.5"])]);
 
     // 前提①：两个节点确实都发了 inline 规则（否则「谁在前」无从谈起）。
@@ -330,7 +333,7 @@ fn observed_nodes_are_emitted_before_bootstrap_nodes() {
     let i_live = idx_of("ts-live");
     let i_boot = idx_of("ts-bootstrap");
 
-    // 前提②：两条规则的段确实是「观测 /32」对「默认 /10」这一格（否则测的是别的场景）。
+    // 前提②：两条规则的段确实是「观测 /32」对「显式 /10」这一格（否则测的是别的场景）。
     assert!(
         rules[i_live]
             .ip_cidr
@@ -346,7 +349,7 @@ fn observed_nodes_are_emitted_before_bootstrap_nodes() {
             .as_ref()
             .unwrap()
             .contains(&TAILNET_CGNAT.to_string()),
-        "ts-bootstrap 那条不是默认段：{:?}",
+        "ts-bootstrap 那条不是显式段：{:?}",
         rules[i_boot].ip_cidr
     );
 
@@ -396,7 +399,7 @@ fn observed_nodes_are_emitted_before_bootstrap_nodes() {
                 .iter()
                 .any(|c| c == keep),
             "MagicDNS 地址 {keep} 跑到了 ts-bootstrap（无观测、排在后面）那条规则里 —— \
-             bootstrap 腿本不该显式发它，靠 `/10` 的包含关系兜住即可"
+             此节点仅声明了广段，没有 host 输入，不应额外添加服务主机段"
         );
     }
 
@@ -414,11 +417,16 @@ fn observed_nodes_are_emitted_before_bootstrap_nodes() {
     );
 }
 
-/// 🔴 **判据 4-a**：两个 TS 节点都没有观测（段退回默认两段常量）⇒ 段完全重合 ⇒ 检出，
+/// 🔴 **判据 4-a**：两个 TS 节点都没有观测（用户显式声明同两段）⇒ 段完全重合 ⇒ 检出，
 /// 且说得出输掉的是谁、它零覆盖。
 #[test]
-fn two_tailscale_nodes_without_observation_collide_and_the_loser_is_named() {
-    let config = config_with(vec![ts_node("ts1"), ts_node("ts2")]);
+fn two_tailscale_nodes_with_identical_explicit_routes_name_the_loser() {
+    let mut nodes = vec![ts_node("ts1"), ts_node("ts2")];
+    for node in &mut nodes {
+        node.tailscale_settings.as_mut().unwrap().routes =
+            vec![TAILNET_CGNAT.into(), "fd7a:115c:a1e0::/48".into()];
+    }
+    let config = config_with(nodes);
     let obs = ObservedTailnetAddresses::new();
     let report = endpoint_force_route_report(&config, &obs, NO_TAILNET_DIR);
 
@@ -430,8 +438,8 @@ fn two_tailscale_nodes_without_observation_collide_and_the_loser_is_named() {
     let ts2 = entry(&report, "ts2");
     assert_eq!(ts2.coverage, ForceRouteCoverage::AbsorbedEmpty);
     assert!(ts2.emitted.is_empty());
-    // 这一位是本场景与「同一个 tailnet 的两个账号」的分界：段重合只是因为**两份一样的猜测**
-    // （TS 段集恒含两条硬编码默认常量），不是账号撞车的证据。消费方少了它必然把两者读混。
+    // 这一位是本场景与「同一个 tailnet 的两个账号」的分界：段重合只是因为**两份一样的显式声明**
+    // （用户主动声明相同广段），不是账号撞车的证据。消费方少了它必然把两者读混。
     assert!(!ts2.has_observation);
     assert!(!entry(&report, "ts1").has_observation);
     assert_eq!(
@@ -540,17 +548,41 @@ fn external_tailnet_rule_set_leg_is_covered_and_absorbs_nothing() {
     let tmp = tempfile::TempDir::new().expect("建临时目录");
     let dir = tmp.path().join("tailnet-rules");
     std::fs::create_dir_all(&dir).expect("建目录");
+    let file = dir.join(format!("{}.json", tailnet_rule_file_base("ts2")));
     std::fs::write(
-        dir.join(format!("{}.json", tailnet_rule_file_base("ts2"))),
+        &file,
         r#"{"version":1,"rules":[{"ip_cidr":["100.64.0.0/10"]}]}"#,
     )
     .expect("写 tailnet rule-set");
 
-    let config = config_with(vec![ts_node("ts1"), ts_node("ts2")]);
+    // Both legs explicitly request the same prefix; no cold default supplies it.
+    let mut servers = vec![ts_node("ts1"), ts_node("ts2")];
+    for server in &mut servers {
+        server.tailscale_settings.as_mut().unwrap().routes = vec![TAILNET_CGNAT.to_string()];
+    }
+    let config = config_with(servers);
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("read actual rule-set")).unwrap();
+    assert_eq!(actual["version"], 1);
+    assert_eq!(
+        actual["rules"][0]["ip_cidr"],
+        serde_json::json!(
+            config.servers[1]
+                .tailscale_settings
+                .as_ref()
+                .unwrap()
+                .routes
+        )
+    );
     let obs = ObservedTailnetAddresses::new();
     let report = endpoint_force_route_report(&config, &obs, &dir.display().to_string());
 
     let ts2 = entry(&report, "ts2");
+    assert_eq!(
+        entry(&report, "ts1").emitted,
+        vec![TAILNET_CGNAT.to_string()]
+    );
+    assert_eq!(ts2.external_rule_set_cidrs, vec![TAILNET_CGNAT.to_string()]);
     assert_eq!(ts2.leg, ForceRouteLeg::ExternalRuleSet);
     assert_eq!(
         ts2.coverage,

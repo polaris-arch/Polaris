@@ -1879,6 +1879,7 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
                 Arc::new(move |_| ready && Some(spawns.load(Ordering::SeqCst)) != fail_at)
             },
             log_level: "warn".to_string(),
+            measurement_concurrency: TEMP_CORE_CONCURRENCY,
             ready_timeout_override_ms: Some(400),
             cancel: SpeedTestCancel::default(),
         },
@@ -1927,6 +1928,73 @@ async fn temp_final_system_interface_guard_rejects_planner_bypass_before_spawn()
 
 fn cleanup(dir: &PathBuf) {
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn session_honors_saved_concurrency_without_raising_the_safe_default() {
+    use polaris_helper_proto::Platform;
+
+    for (config, count, expected_peak) in [
+        (Some(json!({ "speedTestConcurrency": 4 })), 9, 4),
+        (Some(json!({ "speedTestConcurrency": 8 })), 21, 8),
+        (Some(json!({ "speedTestConcurrency": 16 })), 24, 16),
+        (Some(json!({ "speedTestConcurrency": 32 })), 24, 16),
+        (Some(json!({ "speedTestConcurrency": 64 })), 24, 16),
+        (Some(json!({ "speedTestConcurrency": "auto" })), 24, 16),
+        (Some(json!({})), 24, 16),
+        (Some(json!({ "speedTestConcurrency": 0 })), 24, 16),
+        (Some(json!({ "speedTestConcurrency": 3 })), 24, 16),
+        (Some(json!({ "speedTestConcurrency": "4" })), 24, 16),
+        (None, 24, 16),
+    ] {
+        let nodes = n_nodes(count);
+        let ports = (0..count)
+            .map(|i| 20_001 + u16::try_from(i).unwrap())
+            .collect();
+        let mut h = harness(true, false, ports);
+        if let Some(config) = &config {
+            h.deps = crate::commands::speedtest::bind_temp_core_concurrency(
+                h.deps,
+                config,
+                Platform::Mac,
+            );
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (m_live, m_peak) = (Arc::clone(&live), Arc::clone(&peak));
+        let outcome = TempCoreSession::run(
+            &h.deps,
+            &nodes,
+            &|| false,
+            move |_| {
+                let (live, peak) = (Arc::clone(&m_live), Arc::clone(&m_peak));
+                async move {
+                    let active = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    Ok(50_u32)
+                }
+            },
+            &mut |_: &str, _: Value| {},
+        )
+        .await;
+        let TempCoreOutcome::Ran { results, outcome } = outcome else {
+            panic!("expected a completed mock session: {config:?}");
+        };
+        assert_eq!(outcome, "completed", "{config:?}");
+        assert_eq!(results.len(), count, "all targets must finish: {config:?}");
+        for node in &nodes {
+            assert_eq!(results.get(&node.id), Some(&Ok(50_u32)));
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), expected_peak, "{config:?}");
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(h.terminated.load(Ordering::SeqCst), 1);
+        assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+        cleanup(&h.dir);
+    }
 }
 
 /// 正常路径：起核 → 就绪 → 测完 → **杀核 + 删配置**。
@@ -4146,8 +4214,9 @@ impl ConfigChecker for EvictingCapabilityChecker {
             // Each invocation creates distinct paths even in a multi-batch round.
             let other = other.with_extension(uuid::Uuid::new_v4().to_string());
             std::fs::write(&other, b"#!/bin/sh\n").unwrap();
-            let snapshot = crate::runtime::tls_fingerprints::probe_cli(&other).await;
-            assert!(snapshot.binary_sha256.is_some());
+            // Cache-pressure inputs are observations, never native execution credentials.
+            let observation = crate::runtime::tls_fingerprints::cache_fixture_observation(&other);
+            assert!(observation.snapshot.binary_sha256.is_some());
         }
         assert!(
             crate::runtime::tls_fingerprints::cached_cli(binary).is_none(),
@@ -4174,6 +4243,15 @@ impl ConfigChecker for EvictingCapabilityChecker {
 #[tokio::test]
 async fn cache_eviction_does_not_hide_a_binary_replacement_during_check() {
     let mut h = harness(true, false, vec![20_001, 20_002, 20_003]);
+    let resolve = Arc::clone(&h.deps.resolve_binary);
+    h.deps.resolve_binary = Arc::new(move || {
+        let binary = resolve()?;
+        // Business observations never grant PreparedExecution. Seed every
+        // batch so the real pre-check lookup retains proof before eviction.
+        let observation = crate::runtime::tls_fingerprints::cache_fixture_observation(&binary);
+        assert!(observation.snapshot.binary_sha256.is_some());
+        Ok(binary)
+    });
     h.deps.checker = Arc::new(EvictingCapabilityChecker {
         replace_binary: true,
     });
@@ -4246,6 +4324,13 @@ async fn a_failed_middle_batch_still_bridges_the_silent_window() {
     // The live batch must retain its own file proof and still run all three batches.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        let resolve = Arc::clone(&h.deps.resolve_binary);
+        h.deps.resolve_binary = Arc::new(move || {
+            let binary = resolve()?;
+            let observation = crate::runtime::tls_fingerprints::cache_fixture_observation(&binary);
+            assert!(observation.snapshot.binary_sha256.is_some());
+            Ok(binary)
+        });
         h.deps.checker = Arc::new(EvictingCapabilityChecker {
             replace_binary: false,
         });

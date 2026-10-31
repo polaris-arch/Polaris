@@ -5,8 +5,9 @@ import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
 import { CoexSnapshotDecodeError, type CoexSnapshot, type Fact } from '@/contracts/coex-snapshot';
 import { SetBlock } from './Primitives';
-import { CoexWindowsSources } from './CoexWindowsSources';
+import { CoexUnconfirmedContext, CoexWindowsSources } from './CoexWindowsSources';
 import { revealOnToggle } from '@/components/reveal';
+import { InfoIcon } from '@/components/InfoIcon';
 
 type Text = (key: string) => string;
 type Pages = { addresses: number; routes: number; policyRules: number };
@@ -23,7 +24,7 @@ export function renderCoexFacts(
   paginate: (field: keyof Pages, page: number) => void = () => {},
 ): ReactNode {
   if (snapshot.schemaVersion === 2) return <CoexWindowsSources snapshot={snapshot} t={t} />;
-  const fact = <T,>(label: string, value: Fact<T>, show: (known: T) => ReactNode) => (
+  const fact = <T,>(label: ReactNode, value: Fact<T>, show: (known: T) => ReactNode) => (
     <div className="card-sub">
       <b>{label}: </b>
       {value.status === 'known' ? show(value.value) : <>
@@ -56,13 +57,11 @@ export function renderCoexFacts(
     {fact(t('settings.coex.observation'), snapshot.observation, (value) => <>
       {t('settings.coex.elapsed')}: {value.elapsedMillis} · {t('settings.coex.atomic')}: {boolean(value.atomic)}
     </>)}
-    {fact(t('settings.coex.cleanup'), snapshot.commandCleanup, () => t('settings.coex.noRetained'))}
-    <div className="card-sub">{t('settings.coex.cleanupHint')}</div>
-    {fact(t('settings.coex.classification'), snapshot.classification, () => null)}
-    {fact(t('settings.coex.phase'), snapshot.context.observationPhase, () => null)}
-    {fact(t('settings.coex.ownInterfaces'), snapshot.context.ownInterfaces, () => null)}
-    {fact(t('settings.coex.criteria'), snapshot.context.criteria, () => null)}
-    {fact(t('settings.coex.history'), snapshot.context.repairHistory, () => null)}
+    {fact(<span className="sr-title">
+      <span>{t('settings.coex.cleanup')}</span>
+      <InfoIcon tip={t('settings.coex.cleanupHint')} />
+    </span>, snapshot.commandCleanup, () => t('settings.coex.noRetained'))}
+    <CoexUnconfirmedContext snapshot={snapshot} t={t} />
     {fact(t('settings.coex.interfaces'), snapshot.objects, (objects) => <>
       <span>{t('settings.coex.total')}: {objects.length}</span>
       {objects.length === 0 && <div>{t('settings.coex.observedEmpty')}</div>}
@@ -172,8 +171,10 @@ export function CoexSnapshotBlock() {
   const snapshot = state?.report.status === 'known' ? state.report.value.snapshot : null;
   const loading = state?.activity === 'running' || state?.activity === 'runningWithPending';
   return <section data-coex-snapshot aria-label={t('settings.coex.title')} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
-    <SetBlock header={t('settings.coex.title')}>
-      <div className="card-sub">{t('settings.coex.hint')}</div>
+    <SetBlock header={<span className="sr-title">
+      <span>{t('settings.coex.title')}</span>
+      <InfoIcon tip={t('settings.coex.hint')} />
+    </span>}>
       <button type="button" className="btn ghost sm" onClick={() => { void collect(); }} disabled={!state && !error}>
         {loading ? t('settings.coex.loading') : error || snapshot?.schemaVersion === 2 ? t('settings.coex.retry') : t('settings.coex.collect')}
       </button>

@@ -15,7 +15,7 @@ use std::time::Duration;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::proxy_mode::ProxyMode;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
-use polaris_singbox_grpc::{Endpoint, ReconnectConfig, SingBoxApiClient};
+use polaris_singbox_grpc::ReconnectConfig;
 use serde_json::Value;
 
 use crate::runtime::tailscale_status::{
@@ -201,30 +201,69 @@ impl ProxyRuntime {
         update: &polaris_singbox_grpc::daemon::TailscaleStatusUpdate,
         tag_to_id: &BTreeMap<String, String>,
         my_gen: u64,
-    ) {
+        context_token: u64,
+    ) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        if update
+            .endpoints
+            .iter()
+            .filter(|endpoint| tag_to_id.contains_key(&endpoint.endpoint_tag))
+            .any(|endpoint| !seen.insert(&endpoint.endpoint_tag))
+        {
+            return false;
+        }
         let events = decode_tailscale_status(update, tag_to_id);
-        // 选中出口在**本帧之前**的 backendState —— 边沿判定的左值，必须在换缓存之前取。
+        let _publication = self.gate.lock_generation_publication();
+        let mut state = self
+            .tailnet_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(context) = state.active.clone().filter(|context| {
+            context.generation == my_gen
+                && context.token == context_token
+                && !context.suspended
+                && context.tag_to_id() == *tag_to_id
+        }) else {
+            return false;
+        };
         let selected_id = self.selected_server_id();
-        let before = selected_id
-            .as_deref()
-            .and_then(|id| self.mesh.selected_exit_backend_state(id));
-        // 缓存整体替换（每帧即全量）——供 `tailscale_get_status` 拉末帧。
-        self.mesh.update_ts_status(events.clone());
-        // A-0b：本帧观测到的 tailnet 地址 → 内存观测面 + 已挂载的 tailnet rule-set 文件（原子
-        // 替换触发 sing-box fswatch 热重载，零重启）。**这是真值源的运行中那条腿**：自建控制面
-        // （headscale `prefixes.v4` 可自定义）分到的地址不落在硬编码的 `100.64.0.0/10` 里，不接
-        // 这一条，那些地址的 force-route 规则一条流量都命中不了。
-        // 空帧（核刚起、netmap 未同步）不清空、文件不存在不创建、任何路径都不删 —— 见该方法文档。
-        self.sync_tailnet_rule_files(&events);
+        let mut capacity_refused = false;
+        let committed = self
+            .gate
+            .with_current_generation(my_gen, |_live| {
+                let before = selected_id
+                    .as_deref()
+                    .and_then(|id| self.mesh.selected_exit_backend_state(id));
+                let mut next = state.clone();
+                let identity_changed = self.learn_tailnet_identity(&mut next, &events);
+                let admitted = next.active.clone().unwrap_or_else(|| context.clone());
+                if let Err(error) = self.commit_tailnet_events(&mut next, &admitted, &events) {
+                    state.limited = true;
+                    capacity_refused = true;
+                    log::warn!("tailnet frame refused without publishing hosts or STATUS: {error}");
+                    return None;
+                }
+                *state = next;
+                self.mesh.update_ts_status(events.clone());
+                let after = selected_id
+                    .as_deref()
+                    .and_then(|id| self.mesh.selected_exit_backend_state(id));
+                Some((before, after, identity_changed))
+            })
+            .flatten();
+        if capacity_refused {
+            self.invalidate_tailnet_route_ack(my_gen, Some(context_token));
+        }
+        drop(state);
+        let Some((before, after, identity_changed)) = committed else {
+            return false;
+        };
         // 逐端点 emit（前端 `onTailscaleStatus` 逐条消费）。未接线 emitter（单测/setup 前）→ 静默跳过。
         if let Some(emitter) = self.error_emitter.get() {
             for ev in &events {
                 emitter.emit_tailscale_status(ev);
             }
         }
-        let after = selected_id
-            .as_deref()
-            .and_then(|id| self.mesh.selected_exit_backend_state(id));
         // 上游 触发点④「TS 隧道就绪」：**只在上升沿**触发，不是每帧（relay 每秒量级推帧，
         // 稳态 Running 帧若也触发就成了轮询——而本子系统的设计前提是纯事件驱动、无轮询）。
         if ts_exit_became_ready(before.as_deref(), after.as_deref()) {
@@ -237,7 +276,12 @@ impl ProxyRuntime {
         // R2：出口无效直判翻转对账（缓存已是本帧最新 → 据最新 peers/loggedIn 判 blocked 跨态）。
         // 与上面的「隧道就绪」上升沿正交：那条判 backendState（隧道通没通），这条判 exit_node 有没有
         // （通了也可能出口设备离线/未广告 ⇒ 公网出不去）。上游 同处也是两条并列（:7345-7346）。
+        drop(_publication);
+        if identity_changed {
+            self.restart_tailnet_relay_if_active(my_gen);
+        }
         self.reconcile_ts_exit_block(my_gen);
+        true
     }
 
     // ══════════════ R2：TS 出口无效直判【翻转对账】 + 出口恢复腿 ══════════════
@@ -572,13 +616,7 @@ impl ProxyRuntime {
             .ok()
             .and_then(|g| g.as_ref().and_then(|s| s.id_to_tag.get(sel_id).cloned()))
             .unwrap_or_else(|| server.name.clone());
-        let secret = self.clash_api_secret();
-        let client = match SingBoxApiClient::connect(
-            Endpoint::new("127.0.0.1", status.clash_api_port),
-            secret,
-        )
-        .await
-        {
+        let client = match self.current_management_client(status.clash_api_port).await {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("热重设 exit_node：连管理 API 失败 {e}");
@@ -617,6 +655,8 @@ impl ProxyRuntime {
     /// 「跨会话残留 `recovering=true`」在那之后不可达：Drop 在 panic 展开时同样执行，没有绕过它的退出路径。
     /// 上游侧本就只清 `lastTsExitBlock`，此处回归对齐。
     pub(super) fn reset_ts_exit_block_state(&self) {
+        let _publication = self.gate.lock_generation_publication();
+        self.revoke_tailnet_context();
         if let Ok(mut g) = self.last_ts_exit_block.lock() {
             *g = None;
         }
@@ -633,6 +673,23 @@ impl ProxyRuntime {
     /// → 丢掉旧流重订一条。核侧 `sendStatus()` 在挂 watcher 之前先跑，一次重订阅必然拿到此刻的真状态。
     /// 稳态（全 Running）**不重订**——那时无帧是正常的（没有变化就没有通知），churn 无意义。
     /// 阈值指数退避（15s → 30s → … → 5min 封顶）：真的卡在 `NeedsLogin` 时不至于每 15 秒空转一次。
+    pub(super) fn restart_tailnet_relay_if_active(self: &Arc<Self>, generation: u64) {
+        let Some(context) = self.tailnet_context().filter(|context| {
+            context.generation == generation && !context.suspended && !context.bindings.is_empty()
+        }) else {
+            return;
+        };
+        let port = self
+            .status
+            .read()
+            .ok()
+            .map(|status| status.clash_api_port)
+            .unwrap_or(0);
+        if port != 0 {
+            self.spawn_tailscale_status_relay(generation, port, Arc::new(context.tag_to_id()));
+        }
+    }
+
     pub(super) fn spawn_tailscale_status_relay(
         self: &Arc<Self>,
         my_gen: u64,
@@ -644,11 +701,17 @@ impl ProxyRuntime {
         /// 退避封顶：卡在 `NeedsLogin` 这类稳定非就绪态时，最慢 5 分钟才重订一次。
         const RESUBSCRIBE_IDLE_MAX_MS: u64 = 300_000;
 
+        let Some(context) = self
+            .tailnet_context()
+            .filter(|context| context.generation == my_gen && context.tag_to_id() == *tag_to_id)
+        else {
+            return;
+        };
+        let context_token = context.token;
         let me = Arc::clone(self);
-        tokio::spawn(async move {
-            let secret = me.clash_api_secret();
+        self.spawn_runtime_api_relay(async move {
             let client =
-                match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", api_port), secret).await
+                match me.current_management_client(api_port).await
                 {
                     Ok(c) => c,
                     Err(e) => {
@@ -671,12 +734,16 @@ impl ProxyRuntime {
             loop {
                 // 世代守卫：核被停/接管（stop/restart 先 bump 世代）→ 退场，drop stream 停订阅+重连
                 // （防对死端口无限重连、防旧核 relay 污染新核）。取帧前后各查一次。
-                if me.gate.generation() != my_gen {
+                if me.gate.generation() != my_gen || !me.tailnet_context().is_some_and(|context| context.token == context_token) {
                     log::info!(
                         "TS STATUS relay 退场（世代 {my_gen}→{}）：本代共收 {frames} 帧、重订阅 {resubscribes} 次，末态 {last_states:?}",
                         me.gate.generation()
                     );
                     return;
+                }
+                if me.tailnet_context().is_some_and(|context| context.suspended) {
+                    tokio::time::sleep(tick).await;
+                    continue;
                 }
                 match tokio::time::timeout(tick, stream.recv()).await {
                     Ok(Some(update)) => {
@@ -687,7 +754,10 @@ impl ProxyRuntime {
                         idle_ms = 0;
                         frames += 1;
                         log_ts_state_transitions(&update, &tag_to_id, &mut last_states);
-                        me.apply_ts_status_frame(&update, &tag_to_id, my_gen);
+                        if !me.apply_ts_status_frame(&update, &tag_to_id, my_gen, context_token) {
+                            if me.tailnet_context().is_some_and(|context| context.token == context_token && (context.suspended || me.tailnet_routes_limited())) { continue; }
+                            return;
+                        }
                         // A4 触发点①：每帧后对账登录期出口让位（读该帧刚写入缓存的选中出口 backendState）。
                         // 收帧世代已复查（上方），reconcile 内部 hotSwitch 走 management_api（核未起即 not_ready→false，
                         // 不改 flag），世代进一步接管由下一轮循环顶守卫退场。

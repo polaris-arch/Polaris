@@ -335,6 +335,30 @@ fn unix_ms() -> u64 {
 pub(crate) struct StreamWitness {
     shared: Arc<Shared>,
     task: Mutex<Option<JoinHandle<()>>>,
+    api_task: Option<Arc<crate::runtime::proxy::runtime_config::api_handoff::ApiRelayTask>>,
+}
+
+struct ApiWitnessExit {
+    shared: Arc<Shared>,
+    epoch:
+        Option<std::sync::Weak<crate::runtime::proxy::runtime_config::api_handoff::ApiRelayEpoch>>,
+}
+impl Drop for ApiWitnessExit {
+    fn drop(&mut self) {
+        if self
+            .epoch
+            .as_ref()
+            .and_then(|e| e.upgrade())
+            .is_some_and(|e| e.is_closed())
+        {
+            self.shared
+                .set_state(if self.shared.state() == WitnessState::Connecting {
+                    WitnessState::Failed
+                } else {
+                    WitnessState::Broken
+                });
+        }
+    }
 }
 
 impl StreamWitness {
@@ -358,6 +382,31 @@ impl StreamWitness {
         S: Stream<Item = Frame> + Send + Unpin + 'static,
         E: Display,
     {
+        Self::spawn_owned(open, now_ms, None)
+    }
+
+    pub(crate) fn spawn_in_api_epoch<Open, S, E>(
+        open: Open,
+        epoch: Option<Arc<crate::runtime::proxy::runtime_config::api_handoff::ApiRelayEpoch>>,
+    ) -> Self
+    where
+        Open: Future<Output = Result<S, E>> + Send + 'static,
+        S: Stream<Item = Frame> + Send + Unpin + 'static,
+        E: Display,
+    {
+        Self::spawn_owned(open, unix_ms, epoch)
+    }
+
+    fn spawn_owned<Open, S, E>(
+        open: Open,
+        now_ms: impl Fn() -> u64 + Send + Sync + 'static,
+        epoch: Option<Arc<crate::runtime::proxy::runtime_config::api_handoff::ApiRelayEpoch>>,
+    ) -> Self
+    where
+        Open: Future<Output = Result<S, E>> + Send + 'static,
+        S: Stream<Item = Frame> + Send + Unpin + 'static,
+        E: Display,
+    {
         let shared = Arc::new(Shared {
             table: Mutex::new(Table::default()),
             state: AtomicU8::new(WitnessState::Connecting.code()),
@@ -365,9 +414,14 @@ impl StreamWitness {
             max_wait_ms: AtomicU64::new(0),
             now_ms: Box::new(now_ms),
         });
-        let task = tokio::spawn({
+        let future = {
             let shared = Arc::clone(&shared);
+            let exit = ApiWitnessExit {
+                shared: shared.clone(),
+                epoch: epoch.as_ref().map(Arc::downgrade),
+            };
             async move {
+                let _exit = exit;
                 let mut stream = match open.await {
                     Ok(stream) => stream,
                     Err(error) => {
@@ -396,10 +450,16 @@ impl StreamWitness {
                 log::warn!("测速读回：连接事件流中途断开，其后结果的承载出站记为未验证");
                 shared.set_state(WitnessState::Broken);
             }
-        });
+        };
+        let (task, api_task) = if let Some(epoch) = epoch {
+            (None, epoch.spawn_owned(future))
+        } else {
+            (Some(tokio::spawn(future)), None)
+        };
         Self {
             shared,
-            task: Mutex::new(Some(task)),
+            task: Mutex::new(task),
+            api_task,
         }
     }
 
@@ -480,6 +540,9 @@ impl BindingWitness for StreamWitness {
 
     fn close(&self) -> Boxed<'_, ()> {
         Box::pin(async move {
+            if let Some(task) = &self.api_task {
+                task.close().await;
+            }
             if let Some(task) = self.take_task() {
                 task.abort();
                 // 等任务真正结束：它一结束，流对象随之析构。
@@ -497,6 +560,9 @@ impl BindingWitness for StreamWitness {
 
 impl Drop for StreamWitness {
     fn drop(&mut self) {
+        if let Some(task) = &self.api_task {
+            task.abort();
+        }
         if let Some(task) = self.take_task() {
             task.abort();
         }

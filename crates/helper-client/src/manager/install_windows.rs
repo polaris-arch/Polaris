@@ -1,5 +1,6 @@
-//! Root-sealed installation on Windows. No service mutation occurs until the
-//! native helper atomically admits replacement with an empty custody slot.
+//! Test-only historical producer: static correspondence and normal PowerShell
+//! compatibility input. Production installation is the native cleaner state
+//! machine; this module is cfg(test) and is never an execution fallback.
 use super::*;
 
 pub(super) fn build_win_install_script(
@@ -157,7 +158,10 @@ function Configure-Service {{
   & $sc failure $service reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
   Assert-NativeExit 'SCM recovery'
 }}
+{service_policy}
 $lock = $null
+$serviceCreateAttempted = $false
+$newServiceCreated = $false
 $failureStage = 81
 $exitCode = 0
 $registrationChanged = $false
@@ -170,6 +174,10 @@ $keepHelper = $false
 $keepRecovery = $false
 $coreOnlyReady = $false
 try {{
+  # Read and reject unsupported/unknown SCM state before any managed mutation.
+  $old = Get-ServiceDescription
+  Assert-SupportedExistingService $old
+  $wasRunning = $null -ne $old -and $old.State -eq 'Running'
   Secure-Directory $support $true
   $lockPath = Join-Path $support 'helper-install.lock'
   if (Test-Path -LiteralPath $lockPath) {{ Assert-Regular $lockPath }}
@@ -203,8 +211,6 @@ try {{
   $policy = Invoke-Utility @('helper-policy', '--binary', $helperDst, '--metadata', $record)
   if ($policy -ceq 'helper-policy retain') {{ $keepHelper = $true }}
   if (-not $keepHelper -and $policy -cne 'helper-policy replace' -and $policy -cne 'helper-policy replace-legacy') {{ throw 'invalid installed helper policy' }}
-  $old = Get-CimInstance -ClassName Win32_Service -Filter "Name='$service'" -ErrorAction Stop
-  $wasRunning = $null -ne $old -and $old.State -ne 'Stopped'
   # Never overwrite a newer retained helper, or report an unusable retained
   # service as successfully installed. This probe is read-only and its ordinary
   # custody request requires a native message boundary before any bytes are sent.
@@ -258,9 +264,7 @@ try {{
     $admitted = $true
   }}
   $failureStage = 85
-  $mutated = $true
-  Stop-ServiceChecked
-  Delete-ServiceChecked
+  Begin-ServiceReplacement
   # Registration cannot change until admission succeeded and SCM stop completed.
   # Include a partially failed registration in rollback as well.
   $failureStage = 83
@@ -281,8 +285,7 @@ try {{
   Check-Hash $cleanerDst $selection.core.cleanerSha256
   Invoke-Utility @('helper-record', '--binary', $helperDst, '--metadata', $record) | Out-Null
   }}
-  New-Service -Name $service -BinaryPathName $binPath -StartupType Automatic | Out-Null
-  Configure-Service
+  Register-ProductService
   & $sc start $service | Out-Null
   Assert-NativeExit 'SCM start'
   (Get-Service -Name $service).WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(15))
@@ -294,19 +297,13 @@ try {{
   $exitCode = $failureStage
   try {{
     if ($mutated) {{
-      Stop-ServiceChecked
-      Delete-ServiceChecked
+      Stop-CandidateServiceForRollback
       foreach ($snapshot in $snapshots) {{
         if ($snapshot.Present) {{ Copy-Item -LiteralPath $snapshot.Backup -Destination $snapshot.Path -Force; Seal-File $snapshot.Path }}
         elseif (Test-Path -LiteralPath $snapshot.Path) {{ Remove-Item -LiteralPath $snapshot.Path -Force }}
       }}
       if ($registrationChanged) {{ Restore-Registration $registrationSnapshot }}
-      if ($null -ne $old) {{
-        $startType = switch ($old.StartMode) {{ 'Disabled' {{ 'Disabled' }} 'Manual' {{ 'Manual' }} default {{ 'Automatic' }} }}
-        New-Service -Name $service -BinaryPathName $old.PathName -StartupType $startType | Out-Null
-        Configure-Service
-        if ($wasRunning) {{ & $sc start $service | Out-Null; Assert-NativeExit 'SCM rollback start' }}
-      }}
+      Restore-PreviousService
     }} elseif ($admitted) {{ Invoke-Utility @('cancel-upgrade', '--support', $support) | Out-Null }}
   }} catch {{
     $keepRecovery = $true
@@ -321,6 +318,7 @@ try {{
 }}
 exit $exitCode
 "#,
+        service_policy = include_str!("windows_service_policy.ps1"),
         support = ps_quote(WIN_SUPPORT_DIR),
         core = ps_quote(&paths.core_dir.to_string_lossy()),
         destination = ps_quote(&paths.binary.to_string_lossy()),

@@ -59,6 +59,9 @@
 
 #![forbid(unsafe_code)]
 
+use crate::runtime::core_execution::TokioSpawner;
+#[cfg(not(test))]
+use polaris_core_supervisor::SingBoxSpawner;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -82,8 +85,8 @@ use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
 use polaris_core_supervisor::{
-    run_check_raw, PortAllocator, PortExclusions, RawCheck, SingBoxSpawner, SpawnError,
-    SpawnRequest, StdioPolicy, TokioSpawner, CONFIG_CHECK_TIMEOUT,
+    run_check_raw, PortAllocator, PortExclusions, RawCheck, SpawnError, SpawnRequest, StdioPolicy,
+    CONFIG_CHECK_TIMEOUT,
 };
 use polaris_mesh::tailscale_login::{
     advance_login_state, build_tailscale_login_config, login_config_to_json, LoginEvent,
@@ -305,6 +308,11 @@ struct ReadyMainLogin<'a> {
 
 #[async_trait]
 trait MainLoginBinding: Send + Sync {
+    fn api_epoch_borrow(
+        &self,
+    ) -> Option<crate::runtime::proxy::runtime_config::api_handoff::ApiRelayBorrow> {
+        None
+    }
     async fn validate(&self) -> Result<(), String>;
     fn target_tag(&self, _server_id: &str) -> Option<&str> {
         None
@@ -313,6 +321,11 @@ trait MainLoginBinding: Send + Sync {
 
 #[async_trait]
 impl MainLoginBinding for ReadyMainLogin<'_> {
+    fn api_epoch_borrow(
+        &self,
+    ) -> Option<crate::runtime::proxy::runtime_config::api_handoff::ApiRelayBorrow> {
+        self.ticket.api_epoch_borrow()
+    }
     fn target_tag(&self, server_id: &str) -> Option<&str> {
         self.ticket.target_tag(server_id)
     }
@@ -364,7 +377,7 @@ type BinaryResolver = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 
 // ── 抽象 trait（生产真实现 / 测试 mock；这是「无真进程无网络单测」的关键）────────────────────────
 
-/// 瞬态登录核子进程抽象。生产用 `tokio::process::Child` 包装；测试用内存 duplex 假子进程，
+/// 瞬态登录核子进程抽象。生产用 `crate::runtime::core_child::Child` 包装；测试用内存 duplex 假子进程，
 /// 使整条编排（spawn/emit/register/timeout/cancel/reap）可在无真进程无网络下驱动。
 ///
 /// **这里没有取管道的方法**：两条流的去向在 [`SpawnRequest`] 的 [`StdioPolicy`] 里一次说清，
@@ -1083,11 +1096,11 @@ pub trait LoginStatusSubscriber: Send + Sync {
 
 // ── 生产实现 ────────────────────────────────────────────────────────────────────────────────
 
-/// `tokio::process::Child` 包装的生产子进程句柄。
+/// `crate::runtime::core_child::Child` 包装的生产子进程句柄。
 ///
 /// ## 为什么有 [`Drop`] 守卫（不是洁癖）
 ///
-/// `tokio::process::Child` 默认 `kill_on_drop == false`：句柄被丢弃时 tokio 只把它推进 orphan 队列
+/// `crate::runtime::core_child::Child` 默认 `kill_on_drop == false`：句柄被丢弃时 tokio 只把它推进 orphan 队列
 /// **等待收割**，子进程照常活着。而瞬态核（登录核 / 测速临时核）的 kill 全靠调用方显式
 /// [`terminate`](LoginCoreChild::terminate) —— 只要 future 在 `spawn` 与 `terminate` 之间被丢弃或
 /// panic 展开，就留下一个持续持有回环端口（测速临时核是 N 个）+ WG/WARP peer 会话的**孤儿
@@ -1100,7 +1113,7 @@ pub trait LoginStatusSubscriber: Send + Sync {
 ///
 /// `start_kill` 只作尽力请求（Drop 不能 await），不能形成退出事实。
 pub struct TokioLoginCoreChild {
-    child: Option<tokio::process::Child>,
+    child: Option<crate::runtime::core_child::Child>,
     /// Set only after this exact Child's native wait succeeds. Missing PID is not exit evidence.
     reaped: bool,
     /// ECHILD loses the Unix wait identity. A reused numeric PID can never repair this birth.
@@ -1131,7 +1144,9 @@ impl Drop for TokioLoginCoreChild {
 #[async_trait]
 impl LoginCoreChild for TokioLoginCoreChild {
     fn pid(&self) -> Option<u32> {
-        self.child.as_ref().and_then(tokio::process::Child::id)
+        self.child
+            .as_ref()
+            .and_then(crate::runtime::core_child::Child::id)
     }
     fn native_exit(&self) -> Option<NativeTransientExit> {
         self.native_exit
@@ -1275,7 +1290,7 @@ impl LoginCoreSpawner for TokioLoginCoreSpawner {
                 }
             };
             Ok(Box::new(TokioLoginCoreChild {
-                child: Some(spawned.child),
+                child: Some(spawned.child.into()),
                 reaped: false,
                 wait_identity_lost: false,
                 native_attachment: prepared.as_ref().map(PreparedTempNativeBirth::attach),
@@ -1456,32 +1471,46 @@ impl ConfigChecker for SingBoxConfigChecker {
     ) -> Result<(), ConfigCheckFailure> {
         // Validation's original Child and its private input snapshot stay in central custody
         // on cancellation/error. Lifecycle failure never becomes diagnostic availability.
-        match run_check_raw(binary, config_path, CONFIG_CHECK_TIMEOUT)
+        config_check_from_raw(
+            run_check_raw(
+                crate::runtime::core_identity::prepare(
+                    binary,
+                    crate::runtime::core_identity::ExecPurpose::CheckConfig,
+                )
+                .map_err(polaris_core_supervisor::ValidationLifecycleError::from)
+                .map_err(ConfigCheckFailure::Lifecycle)?,
+                config_path,
+                CONFIG_CHECK_TIMEOUT,
+            )
             .await
-            .map_err(ConfigCheckFailure::Lifecycle)?
-        {
-            RawCheck::Done { success: true, .. } => Ok(()),
-            RawCheck::Done { stderr, stdout, .. } => {
-                let detail = if stderr.trim().is_empty() {
-                    stdout.trim()
-                } else {
-                    stderr.trim()
-                };
-                Err(ConfigCheckFailure::Rejected(format!(
-                    "sing-box check 判定登录配置无效: {detail}"
-                )))
-            }
-            RawCheck::SpawnFailed(e) => Err(ConfigCheckFailure::Rejected(format!(
-                "sing-box check 启动失败: {e}"
-            ))),
-            RawCheck::OutputFailed(e) => Err(ConfigCheckFailure::Rejected(format!(
-                "sing-box check 输出读取失败: {e}"
-            ))),
-            // 折叠前不存在的一支：此前无超时 ⇒ 这条路径的表现是永不返回。
-            RawCheck::TimedOut { after_secs } => Err(ConfigCheckFailure::Rejected(format!(
-                "sing-box check 超时（>{after_secs}s）"
-            ))),
+            .map_err(ConfigCheckFailure::Lifecycle)?,
+        )
+    }
+}
+
+fn config_check_from_raw(raw: RawCheck) -> Result<(), ConfigCheckFailure> {
+    match raw {
+        RawCheck::Done { success: true, .. } => Ok(()),
+        RawCheck::Done { stderr, stdout, .. } => {
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            Err(ConfigCheckFailure::Rejected(format!(
+                "sing-box check 判定登录配置无效: {detail}"
+            )))
         }
+        RawCheck::SpawnFailed(e) => Err(ConfigCheckFailure::Rejected(format!(
+            "sing-box check 启动失败: {e}"
+        ))),
+        RawCheck::OutputFailed(e) => Err(ConfigCheckFailure::Rejected(format!(
+            "sing-box check 输出读取失败: {e}"
+        ))),
+        // 折叠前不存在的一支：此前无超时 ⇒ 这条路径的表现是永不返回。
+        RawCheck::TimedOut { after_secs } => Err(ConfigCheckFailure::Rejected(format!(
+            "sing-box check 超时（>{after_secs}s）"
+        ))),
     }
 }
 
@@ -4378,6 +4407,39 @@ impl LoginCoreRegistry {
         binding: Option<&dyn MainLoginBinding>,
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
+        let api_borrow = binding.and_then(|binding| binding.api_epoch_borrow());
+        let work = self.confirm_main_request_inner(
+            server,
+            request,
+            attempt,
+            main,
+            main_core,
+            saved_server,
+            binding,
+            emitter,
+        );
+        tokio::pin!(work);
+        tokio::select! {
+            outcome=&mut work=>outcome,
+            _=crate::runtime::proxy::runtime_config::api_handoff::relay_cancelled(&api_borrow)=>{
+                // Use the existing main-attempt cancellation and await its
+                // cleanup. The main Core and native lease remain owned/alive.
+                attempt.cancel();let _=work.await;
+                StartLoginOutcome::Failed("mainApiViewStale".into())
+            }
+        }
+    }
+    async fn confirm_main_request_inner(
+        &self,
+        server: &ServerConfig,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        main: &MainLoginSnapshot,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        binding: Option<&dyn MainLoginBinding>,
+        emitter: Arc<dyn AuthUrlEmitter>,
+    ) -> StartLoginOutcome {
         let tag = self
             .shared
             .main
@@ -4703,7 +4765,9 @@ impl LoginCoreRegistry {
         // 旧代 supervisor 的删除就会打在**新代**刚写好的那份上（它的 `terminate()` 有最长 5s 的
         // SIGTERM 宽限，删除随时可能晚于新核 spawn）。带代次后每份 config 只有一个主人。
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst);
-        let cfg = match build_tailscale_login_config(&server, user_data, &api) {
+        let config_path = login_config_path(user_data, &server.id, epoch);
+        let cache_path = login_cache_path(&config_path);
+        let cfg = match build_tailscale_login_config(&server, user_data, &api, &cache_path) {
             Ok(config) => config,
             Err(_) => return StartLoginOutcome::Failed("invalidNode".into()),
         };
@@ -4715,7 +4779,6 @@ impl LoginCoreRegistry {
         {
             return StartLoginOutcome::Failed("configWriteFailed".into());
         }
-        let config_path = login_config_path(user_data, &server.id, epoch);
         let bytes = match serde_json::to_vec_pretty(&json_cfg) {
             Ok(b) => b,
             Err(_) => return StartLoginOutcome::Failed("configWriteFailed".into()),
@@ -4739,6 +4802,14 @@ impl LoginCoreRegistry {
         // 从含 secret 的文件出现这一刻起，任何提前返回或 future 取消都必须清理；成功把路径
         // 移交 supervisor 后才解除。不能只在已知 Err 分支手写 remove，否则新增 await/return 会再漏。
         let mut config_guard = LoginConfigGuard::new(&config_path);
+        // Cache-file starts before the Tailscale endpoint can lazily create its state directory.
+        // Keep this cache beside the already-owned config instead of pre-creating TS state:
+        // doing that would change native legacy/physical directory selection on some hosts.
+        // Exclusive creation rejects old files, symlinks and hard links without touching them.
+        if write_login_config_secure(&cache_path, &[]).is_err() {
+            return StartLoginOutcome::Failed("configWriteFailed".into());
+        }
+        config_guard.claim_cache();
 
         // (e) sing-box check 先验配置形状（失败快退、不 spawn —— 这一段可单测）。
         #[cfg(target_os = "android")]
@@ -4858,8 +4929,9 @@ impl LoginCoreRegistry {
         };
         let drain = native.as_ref().map(|_| LoginStdioDrain::new());
         let log_drain = drain.clone().unwrap_or_else(LoginStdioDrain::new);
-        let mut req = SpawnRequest::new(
+        let execution_request = crate::runtime::core_execution::run_request(
             &binary,
+            crate::runtime::core_identity::ExecPurpose::RunLogin,
             &config_path,
             StdioPolicy::drain(move |stdout, stderr| {
                 let stdout = LoginDrainReader::new(stdout, log_drain.clone(), 0);
@@ -4881,6 +4953,10 @@ impl LoginCoreRegistry {
                 log_drain.install([out, err]);
             }),
         );
+        let mut req = match execution_request {
+            Ok(req) => req,
+            Err(error) => return StartLoginOutcome::Failed(error.to_string()),
+        };
         req.extra_args = vec!["--disable-color".to_string()];
         req.working_dir = Some(user_data.to_path_buf());
         if self.closing.load(Ordering::SeqCst) {
@@ -5199,7 +5275,7 @@ async fn finish_login_tail(
         ctx.shared
             .retire_login_tail(&ctx.server_id, ctx.epoch, &native, fact)
     } else {
-        remove_login_config(&ctx.config_path);
+        remove_login_config_confirmed(&ctx.config_path)?;
         ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
         Ok(())
     }
@@ -5401,24 +5477,33 @@ async fn supervise(
     ctx.attempt.finish();
 }
 
-/// 删掉本次登录写盘的临时 config（内含一次性管理 API secret）。best-effort：
-/// 已被 kill-on-relogin 的新一代覆写、或早被删掉，都不是问题——本函数只保证「核死了就不留凭据」。
+/// Remove this epoch's cache only after no-child/close proof, then its secret-bearing config.
+/// Retain the config on cache cleanup failure so custody and stale recovery keep the pair.
 fn remove_login_config_confirmed(path: &Path) -> Result<(), String> {
+    remove_login_artifacts(path, true).map_err(|_| "登录核配置或缓存清理未确认".into())
+}
+
+fn remove_login_artifacts(path: &Path, cache_owned: bool) -> std::io::Result<()> {
+    if cache_owned {
+        remove_login_file(&login_cache_path(path))?;
+    }
+    remove_login_file(path)
+}
+
+fn remove_login_file(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err("登录核配置清理未确认".into()),
+        Err(error) => Err(error),
     }
 }
 
-fn remove_login_config(path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            log::warn!(
-                "删除瞬态登录核临时配置失败（内含一次性 secret）{}：{e}",
-                path.display()
-            );
-        }
+fn remove_login_config(path: &Path, cache_owned: bool) {
+    if let Err(error) = remove_login_artifacts(path, cache_owned) {
+        log::warn!(
+            "删除瞬态登录核临时配置或缓存失败（保留配置供重试）{}：{error}",
+            path.display()
+        );
     }
 }
 
@@ -5460,11 +5545,20 @@ fn write_login_config_secure(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 struct LoginConfigGuard<'a> {
     path: &'a Path,
     armed: bool,
+    cache_owned: bool,
 }
 
 impl<'a> LoginConfigGuard<'a> {
     fn new(path: &'a Path) -> Self {
-        Self { path, armed: true }
+        Self {
+            path,
+            armed: true,
+            cache_owned: false,
+        }
+    }
+
+    fn claim_cache(&mut self) {
+        self.cache_owned = true;
     }
 
     fn disarm(&mut self) {
@@ -5475,7 +5569,7 @@ impl<'a> LoginConfigGuard<'a> {
 impl Drop for LoginConfigGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            remove_login_config(self.path);
+            remove_login_config(self.path, self.cache_owned);
         }
     }
 }
@@ -5532,6 +5626,12 @@ fn login_config_path(user_data: &Path, server_id: &str, epoch: u64) -> PathBuf {
         "tailscale-login-{}-{epoch}.json",
         sanitize_id(server_id)
     ))
+}
+
+/// Same directory and epoch as its exclusively created config; no arbitrary path is read back
+/// from JSON during cleanup. The bundled cache uses bbolt, so there are no SQLite sidecars.
+fn login_cache_path(config_path: &Path) -> PathBuf {
+    config_path.with_extension("cache.db")
 }
 
 /// server id → 安全文件名片段（防路径穿越；非字母数字/-/_ 归一为 `_`）。

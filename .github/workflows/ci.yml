@@ -1049,10 +1049,6 @@ jobs:
           NODE
 
       # 判据与逐条理由见 lint job 同名步上方那段。本 job 不装 rustfmt / clippy 组件（不跑那两条门）。
-      - name: Windows installer cleanup fixtures (native PowerShell)
-        if: needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'Windows')
-        run: node --test scripts/nsis-core-sweep.test.mjs scripts/nsis-helper-cleanup.test.mjs
-
       - name: Install Rust toolchain (preinstalled rustup)
         shell: bash
         run: |
@@ -1264,7 +1260,12 @@ jobs:
           export POLARIS_BUILD_ID="$CORE_CANDIDATE"
           cargo build --locked -p polaris-helper --bin polaris-helper 2>&1 | tee native-dns-ci-evidence/helper-build.log
           if [ "$RUNNER_OS" = Windows ]; then
+            # Independent single-link copy: Cargo target output can be hardlinked.
+            cp target/debug/polaris-helper.exe native-dns-ci-evidence/polaris-helper.exe
+            POLARIS_WINDOWS_INSTALL_ANCHOR="$(node scripts/prepare-core-identity.mjs --platform=win --directory="$POLARIS_CORE_CARRIER_DIR" --mode=maintenance-anchor --helper-binary=native-dns-ci-evidence/polaris-helper.exe)"
+            export POLARIS_WINDOWS_INSTALL_ANCHOR
             cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner 2>&1 | tee native-dns-ci-evidence/cleaner-build.log
+            printf 'POLARIS_WINDOWS_INSTALL_ANCHOR=%s\n' "$POLARIS_WINDOWS_INSTALL_ANCHOR" >> "$GITHUB_ENV"
           fi
           if [ "${POLARIS_NATIVE_DNS_CANDIDATE:-}" != 1 ]; then
             helper=polaris-helper
@@ -1344,6 +1345,27 @@ jobs:
         # 实测连剥四层（checkout 保留名 → uninstall+dns → launchd → helper-client）才见底。
         # 加上它之后，一次 run 给出**全部**失败清单，代价只是失败时多跑几个 crate 的测试（秒级）。
         run: cargo test --workspace --no-fail-fast
+
+      - name: Windows installer cleanup fixtures (native Rust producer)
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'Windows')
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/prepare-core-identity.mjs --platform=win --directory="$POLARIS_CORE_CARRIER_DIR" --mode=verify
+          cargo test --locked -p polaris-windows-cleaner --lib -- --nocapture 2>&1 | tee native-dns-ci-evidence/c05-native-fixtures.log
+          export POLARIS_C05_NATIVE_LOG="$PWD/native-dns-ci-evidence/c05-native-fixtures.log"
+          node --test scripts/nsis-core-sweep.test.mjs scripts/nsis-helper-cleanup.test.mjs
+
+      # Separate external policy matrix: never a signature prerequisite for
+      # native17+20/8/55/3. This runner must already be naturally Restricted and
+      # have an independently supplied valid signed inert fixture; no setup here.
+      - name: Windows PowerShell policy compatibility (separate external gate)
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows' && env.POLARIS_C05_POLICY_VALIDATION == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export POLARIS_C05_NATIVE_LOG="$PWD/native-dns-ci-evidence/c05-native-fixtures.log"
+          node --test scripts/windows-c05-policy-compatibility.test.mjs
 
       - name: Verify native helper bootstrap descriptor primitives
         if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'macOS' || runner.os == 'Linux') && !cancelled() && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}

@@ -48,7 +48,12 @@ fn status_frame(id: &str, address: &str) -> TailscaleStatusEvent {
 #[tokio::test]
 async fn final_gate_inline_absorption_keeps_unemitted_request() {
     let (rt, dir) = test_runtime();
-    let (raw, config) = ts_config(&["ts-a", "ts-b"], false);
+    let (mut raw, _) = ts_config(&["ts-a", "ts-b"], false);
+    // Absorption requires two real, identical declarations, not unknown cold hosts.
+    for server in raw["servers"].as_array_mut().unwrap() {
+        server["tailscaleSettings"]["routes"] = serde_json::json!(["10.44.0.0/24"]);
+    }
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
     let core_path = dir.join("core.json");
     let mut peeled = BTreeMap::new();
@@ -99,6 +104,14 @@ async fn final_gate_inline_absorption_keeps_unemitted_request() {
     );
     assert_eq!(report.results[1].effective, Some(Vec::new()));
     assert!(!report.results[1].requested.is_empty());
+    assert_eq!(
+        report.results[1]
+            .requested
+            .iter()
+            .map(|entry| entry.cidr.as_str())
+            .collect::<Vec<_>>(),
+        vec!["10.44.0.0/24"]
+    );
     assert_eq!(report.results[1].blocked_by[0].server_id, "ts-a");
     assert_eq!(std::fs::read_to_string(&core_path).unwrap(), core_before);
 
@@ -134,14 +147,14 @@ async fn final_gate_inline_absorption_keeps_unemitted_request() {
 async fn final_gate_external_reads_retained_file_not_new_observation_projection() {
     let (rt, dir) = test_runtime();
     let (raw, config) = ts_config(&["ts-a"], true);
-    rt.write_tailnet_rule_files(&config).await;
-    rt.sync_tailnet_rule_files(&[status_frame("ts-a", "32.0.0.28")]);
+    super::tailnet_rules::prepare_tailnet_fixture(&rt, &config).await;
+    super::tailnet_rules::sync_fixture(&rt, &[status_frame("ts-a", "32.0.0.28")]);
     let rule_path = rt.tailnet_rules_dir().join(format!(
         "{}.json",
         polaris_config_engine::builder::endpoint_routes::tailnet_rule_file_base("ts-a")
     ));
     let rule_before = std::fs::read_to_string(&rule_path).unwrap();
-    assert!(rule_before.contains("100.64.0.0/10"));
+    assert!(!rule_before.contains("100.64.0.0/10"));
     assert!(rule_before.contains("32.0.0.28/32"));
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
     let core_path = dir.join("core.json");
@@ -184,9 +197,10 @@ async fn final_gate_external_reads_retained_file_not_new_observation_projection(
     let report = rt.mesh_route_report(Some("r-version".into()));
     assert_eq!(report.snapshot.scope, MeshRouteScope::Applied);
     assert_eq!(report.snapshot.dns_owner_server_id.as_deref(), Some("ts-a"));
-    assert!(report.results[0].requested.iter().any(|entry| {
-        entry.cidr == "100.64.0.0/10" && entry.source == MeshRouteSource::Retained
-    }));
+    assert!(!report.results[0]
+        .requested
+        .iter()
+        .any(|entry| entry.cidr == "100.64.0.0/10"));
     assert!(report.results[0].requested.iter().any(|entry| {
         entry.cidr == "32.0.0.28/32" && entry.source == MeshRouteSource::Observed
     }));
@@ -461,6 +475,7 @@ fn ready_evidence(
         core_config_path: core_path.to_string_lossy().into_owned(),
         core_config_sha256: Some(polaris_updater::verify::sha256_hex(b"{}")),
         write_epoch: rt.tailnet_file_write_epoch.load(Ordering::SeqCst),
+        tailnet_token: rt.tailnet_context().map(|context| context.token),
         run_generation: rt.gate.generation(),
         ready_at_ms: None,
         load_evidence: MeshRouteLoadEvidence::Unknown,
@@ -747,4 +762,442 @@ fn hot_receipt_proves_runtime_without_claiming_old_disk_artifact() {
         unknown.snapshot.load_evidence,
         MeshRouteLoadEvidence::RuntimeCommitted
     );
+}
+
+// V02/V14: read real external bytes and reuse the existing equal/containment
+// resolver. A cold broad A still shadows warm B: file writing cannot reorder R.
+#[test]
+fn external_file_order_equal_and_both_containment_directions_remain_honest() {
+    use polaris_config_engine::builder::endpoint_routes::MeshRouteRelation;
+    for (earlier, later, relation) in [
+        ("10.1.0.0/24", "10.1.0.0/24", MeshRouteRelation::Equal),
+        (
+            "10.1.0.0/16",
+            "10.1.2.0/24",
+            MeshRouteRelation::RequestedWithinEarlier,
+        ),
+        (
+            "10.1.2.0/24",
+            "10.1.0.0/16",
+            MeshRouteRelation::EarlierWithinRequested,
+        ),
+        (
+            "fd7a:115c:a1e0::/48",
+            "fd7a:115c:a1e0:1::/64",
+            MeshRouteRelation::RequestedWithinEarlier,
+        ),
+        (
+            "100.64.0.0/10",
+            "100.100.0.8/32",
+            MeshRouteRelation::RequestedWithinEarlier,
+        ),
+        (
+            "100.100.100.100/32",
+            "100.100.100.100/32",
+            MeshRouteRelation::Equal,
+        ),
+    ] {
+        let (rt, dir) = test_runtime();
+        let core = dir.join("config.json");
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        std::fs::write(&core, "{}").unwrap();
+        let first = super::super::tailnet_rules::tailnet_rule_file_json(&[earlier.into()]);
+        let second = super::super::tailnet_rules::tailnet_rule_file_json(&[later.into()]);
+        std::fs::write(&a, &first).unwrap();
+        std::fs::write(&b, &second).unwrap();
+        let mut evidence = ready_evidence(&rt, &core, &a, &first);
+        let mut candidate = candidate(&b);
+        candidate.candidate.server_id = "ts-b".into();
+        candidate.candidate.tag = "endpoint-ts-b".into();
+        candidate.candidate.configured_cidrs.clear();
+        evidence.candidates.push(candidate);
+        evidence.total_candidate_count = 2;
+        evidence
+            .file_baselines
+            .insert(b.to_string_lossy().into_owned(), second);
+        rt.publish_mesh_route_run(evidence, 7);
+        *rt.status.write().unwrap() = ProxyStatus {
+            running: true,
+            start_time: Some(7),
+            ..Default::default()
+        };
+        for version in [None, Some(String::new())] {
+            assert_eq!(
+                rt.mesh_route_report(version).snapshot.scope,
+                MeshRouteScope::PersistedUnknown
+            );
+        }
+        let report = rt.mesh_route_report(Some("r-version".into()));
+        assert_eq!(report.snapshot.scope, MeshRouteScope::Applied);
+        assert!(
+            report.results[1]
+                .blocked_by
+                .iter()
+                .any(|block| block.relation == relation),
+            "{earlier} before {later}"
+        );
+        assert!(report.results[1]
+            .requested
+            .iter()
+            .all(|cidr| cidr.source != MeshRouteSource::Observed));
+    }
+}
+
+#[tokio::test]
+async fn weak_legacy_remains_retained_and_new_context_cannot_reuse_reload_ack() {
+    let (rt, dir) = test_runtime();
+    let (raw, typed) = ts_config(&["ts-a"], false);
+    let path = rt.tailnet_rules_dir().join(format!(
+        "{}.json",
+        polaris_config_engine::builder::endpoint_routes::tailnet_rule_file_base("ts-a")
+    ));
+    std::fs::create_dir_all(rt.tailnet_rules_dir()).unwrap();
+    std::fs::write(
+        &path,
+        super::super::tailnet_rules::tailnet_rule_file_json(&["32.0.0.99/32".into()]),
+    )
+    .unwrap();
+    super::tailnet_rules::prepare_tailnet_fixture(&rt, &typed).await;
+    let core = dir.join("config.json");
+    std::fs::write(&core, "{}").unwrap();
+    let content = std::fs::read_to_string(&path).unwrap();
+    let evidence = ready_evidence(&rt, &core, &path, &content);
+    rt.publish_mesh_route_run(evidence, 7);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        start_time: Some(7),
+        ..Default::default()
+    };
+    let report = rt.mesh_route_report(None);
+    assert!(report.results[0]
+        .requested
+        .iter()
+        .any(|cidr| cidr.cidr == "32.0.0.99/32" && cidr.source == MeshRouteSource::Retained));
+    let mut different = raw;
+    different["servers"][0]["tailscaleSettings"]["controlUrl"] =
+        serde_json::json!("https://replacement.example");
+    let config = serde_json::from_value(different.clone()).unwrap();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &different, false);
+    let generated =
+        polaris_config_engine::builder::generate_sing_box_config(&config, &BTreeMap::new(), &deps)
+            .unwrap();
+    {
+        let _publication = rt.gate.lock_generation_publication();
+        rt.activate_tailnet_context(
+            rt.gate.generation(),
+            rt.tailnet_bindings(&different, &generated),
+        );
+    }
+    let report = rt.mesh_route_report(None);
+    assert_eq!(report.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_ne!(
+        report.snapshot.load_evidence,
+        MeshRouteLoadEvidence::StartupReady
+    );
+}
+
+#[tokio::test]
+async fn rejected_functional_overflow_is_unknown_and_cannot_regain_old_ack() {
+    use super::super::tailnet_rules::MAX_TAILNET_RULE_BYTES;
+    use polaris_config_engine::builder::endpoint_routes::tailnet_rule_file_base;
+    use polaris_singbox_grpc::daemon as dm;
+    let (rt, dir) = test_runtime();
+    let (_raw, config) = ts_config(&["ts-a"], false);
+    super::tailnet_rules::prepare_tailnet_fixture(&rt, &config).await;
+    let context = rt.tailnet_context().unwrap();
+    let path = rt
+        .tailnet_rules_dir()
+        .join(format!("{}.json", tailnet_rule_file_base("ts-a")));
+    let original = std::fs::read_to_string(&path).unwrap();
+    let core = dir.join("config.json");
+    std::fs::write(&core, "{}").unwrap();
+    rt.publish_mesh_route_run(ready_evidence(&rt, &core, &path, &original), 7);
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        start_time: Some(7),
+        ..Default::default()
+    };
+    assert_eq!(
+        rt.mesh_route_report(Some("r-version".into()))
+            .snapshot
+            .scope,
+        MeshRouteScope::Applied
+    );
+    let update = |ips: Vec<String>| dm::TailscaleStatusUpdate {
+        endpoints: vec![dm::TailscaleEndpointStatus {
+            endpoint_tag: context.tag_to_id().keys().next().unwrap().clone(),
+            self_: Some(dm::TailscalePeer {
+                tailscale_i_ps: ips,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+    };
+    assert!(!rt.apply_ts_status_frame(
+        &update(vec!["invalid".repeat(MAX_TAILNET_RULE_BYTES / 7 + 1)]),
+        &context.tag_to_id(),
+        context.generation,
+        context.token
+    ));
+    let limited = rt.mesh_route_report(Some("r-version".into()));
+    assert_eq!(
+        limited.snapshot.load_evidence,
+        MeshRouteLoadEvidence::Unknown
+    );
+    assert_eq!(limited.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert!(limited.snapshot.candidates[0]
+        .unknown_reasons
+        .contains(&MeshRouteUnknownReason::ResourceLimitExceeded));
+    assert!(rt.fresh_tailnet_snapshot(context.generation).is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert!(rt.apply_ts_status_frame(
+        &update(vec!["32.0.0.28".into()]),
+        &context.tag_to_id(),
+        context.generation,
+        context.token
+    ));
+    assert!(!rt.tailnet_routes_limited());
+    let recovered = rt.mesh_route_report(Some("r-version".into()));
+    assert_eq!(recovered.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    assert_ne!(
+        recovered.snapshot.load_evidence,
+        MeshRouteLoadEvidence::StartupReady
+    );
+}
+
+#[tokio::test]
+async fn overflow_same_bytes_recovery_revokes_ack_without_poll_and_preserves_new_run() {
+    use super::super::tailnet_rules::MAX_TAILNET_RULE_BYTES;
+    use polaris_config_engine::builder::endpoint_routes::tailnet_rule_file_base;
+    use polaris_singbox_grpc::daemon as dm;
+    for poll_between in [false, true] {
+        for canonical_overflow in [false, true] {
+            let (rt, dir) = test_runtime();
+            let (_raw, config) = ts_config(&["ts-a"], false);
+            super::tailnet_rules::prepare_tailnet_fixture(&rt, &config).await;
+            let context = rt.tailnet_context().unwrap();
+            let tags = context.tag_to_id();
+            let tag = tags.keys().next().unwrap().clone();
+            let update = |ips: Vec<String>| dm::TailscaleStatusUpdate {
+                endpoints: vec![dm::TailscaleEndpointStatus {
+                    endpoint_tag: tag.clone(),
+                    backend_state: "Running".into(),
+                    self_: Some(dm::TailscalePeer {
+                        tailscale_i_ps: ips,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+            };
+            let qualified = update(vec!["32.0.0.28".into()]);
+            assert!(rt.apply_ts_status_frame(&qualified, &tags, context.generation, context.token));
+            let path = rt
+                .tailnet_rules_dir()
+                .join(format!("{}.json", tailnet_rule_file_base("ts-a")));
+            let original = std::fs::read_to_string(&path).unwrap();
+            let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+            let core = dir.join("config.json");
+            std::fs::write(&core, "{}").unwrap();
+            rt.publish_mesh_route_run(ready_evidence(&rt, &core, &path, &original), 7);
+            *rt.status.write().unwrap() = ProxyStatus {
+                running: true,
+                start_time: Some(7),
+                ..Default::default()
+            };
+            assert_eq!(
+                rt.mesh_route_report(Some("r-version".into()))
+                    .snapshot
+                    .scope,
+                MeshRouteScope::Applied
+            );
+            let oversized = if canonical_overflow {
+                (0..60000)
+                    .map(|n| format!("10.{}.{}.{}", (n >> 16) & 255, (n >> 8) & 255, n & 255))
+                    .collect()
+            } else {
+                vec!["invalid".repeat(MAX_TAILNET_RULE_BYTES / 7 + 1)]
+            };
+            assert!(!rt.apply_ts_status_frame(
+                &update(oversized),
+                &tags,
+                context.generation,
+                context.token
+            ));
+            // Inspect stored evidence directly, never call the report getter in
+            // the no-poll leg until after same-byte recovery.
+            {
+                let slot = rt.mesh_route_run.read().unwrap();
+                let stored = slot.as_ref().unwrap();
+                assert_eq!(stored.load_evidence, MeshRouteLoadEvidence::Unknown);
+                assert!(!stored.eligible_for_ack);
+            }
+            if poll_between {
+                assert_eq!(
+                    rt.mesh_route_report(Some("r-version".into()))
+                        .snapshot
+                        .load_evidence,
+                    MeshRouteLoadEvidence::Unknown
+                );
+            }
+            assert!(rt.apply_ts_status_frame(&qualified, &tags, context.generation, context.token));
+            assert!(!rt.tailnet_routes_limited());
+            assert_eq!(rt.tailnet_context().unwrap().token, context.token);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+            let recovered = rt.mesh_route_report(Some("r-version".into()));
+            assert_eq!(recovered.snapshot.scope, MeshRouteScope::PersistedUnknown);
+            assert_eq!(
+                recovered.snapshot.load_evidence,
+                MeshRouteLoadEvidence::Unknown
+            );
+            // A newly supplied verified receipt may grant ACK; writer recovery
+            // alone was insufficient. This is the production publication seam.
+            rt.publish_mesh_route_runtime_receipt(ready_evidence(&rt, &core, &path, &original));
+            assert_eq!(
+                rt.mesh_route_report(Some("r-version".into()))
+                    .snapshot
+                    .load_evidence,
+                MeshRouteLoadEvidence::RuntimeCommitted
+            );
+            assert_eq!(
+                rt.mesh_route_report(Some("r-version".into()))
+                    .snapshot
+                    .scope,
+                MeshRouteScope::Applied
+            );
+            // New main generation has a new true context/Ready receipt. Neither
+            // the old frame nor the exact old-run invalidator may revoke it.
+            rt.bump_generation();
+            super::tailnet_rules::prepare_tailnet_fixture(&rt, &config).await;
+            let newer = rt.tailnet_context().unwrap();
+            let current = std::fs::read_to_string(&path).unwrap();
+            rt.publish_mesh_route_run(ready_evidence(&rt, &core, &path, &current), 8);
+            *rt.status.write().unwrap() = ProxyStatus {
+                running: true,
+                main_generation: newer.generation,
+                start_time: Some(8),
+                ..Default::default()
+            };
+            assert_eq!(
+                rt.mesh_route_report(Some("r-version".into()))
+                    .snapshot
+                    .scope,
+                MeshRouteScope::Applied
+            );
+            assert!(!rt.apply_ts_status_frame(
+                &update(vec!["invalid".repeat(MAX_TAILNET_RULE_BYTES / 7 + 1)]),
+                &tags,
+                context.generation,
+                context.token
+            ));
+            {
+                let _publication = rt.gate.lock_generation_publication();
+                rt.invalidate_tailnet_route_ack(context.generation, Some(context.token));
+            }
+            assert_eq!(
+                rt.mesh_route_report(Some("r-version".into()))
+                    .snapshot
+                    .scope,
+                MeshRouteScope::Applied
+            );
+            let slot = rt.mesh_route_run.read().unwrap();
+            assert_eq!(slot.as_ref().unwrap().run_generation, newer.generation);
+            assert!(slot.as_ref().unwrap().eligible_for_ack);
+        }
+    }
+}
+
+#[tokio::test]
+async fn preparation_and_defensive_activation_overflow_revoke_stored_ack_immediately() {
+    use polaris_config_engine::builder::endpoint_routes::tailnet_rule_file_base;
+    for activation in [false, true] {
+        let (rt, dir) = test_runtime();
+        let (raw, config) = ts_config(&["ts-a"], false);
+        super::tailnet_rules::prepare_tailnet_fixture(&rt, &config).await;
+        let context = rt.tailnet_context().unwrap();
+        let path = rt
+            .tailnet_rules_dir()
+            .join(format!("{}.json", tailnet_rule_file_base("ts-a")));
+        let original = std::fs::read_to_string(&path).unwrap();
+        let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+        let core = dir.join("config.json");
+        std::fs::write(&core, "{}").unwrap();
+        rt.publish_mesh_route_run(ready_evidence(&rt, &core, &path, &original), 7);
+        *rt.status.write().unwrap() = ProxyStatus {
+            running: true,
+            start_time: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            rt.mesh_route_report(Some("r-version".into()))
+                .snapshot
+                .scope,
+            MeshRouteScope::Applied
+        );
+        let mut oversized = raw.clone();
+        oversized["servers"][0]["tailscaleSettings"]["routes"] = serde_json::json!((0..60000)
+            .map(|n| format!("172.{}.{}.{}/32", (n >> 16) & 255, (n >> 8) & 255, n & 255))
+            .collect::<Vec<_>>());
+        let typed: UserConfig = serde_json::from_value(oversized.clone()).unwrap();
+        if activation {
+            let deps = rt.generate_deps(9090, 0, 0, None, &[], &oversized, false);
+            let generated = polaris_config_engine::builder::generate_sing_box_config(
+                &typed,
+                &BTreeMap::new(),
+                &deps,
+            )
+            .unwrap();
+            let _publication = rt.gate.lock_generation_publication();
+            rt.activate_tailnet_context(
+                context.generation,
+                rt.tailnet_bindings(&oversized, &generated),
+            );
+            assert!(rt.tailnet_context().is_none());
+        } else {
+            assert!(rt
+                .write_tailnet_rule_files_for_generation(&typed, &oversized, context.generation)
+                .await
+                .is_err());
+        }
+        {
+            let slot = rt.mesh_route_run.read().unwrap();
+            let stored = slot.as_ref().unwrap();
+            assert_eq!(stored.load_evidence, MeshRouteLoadEvidence::Unknown);
+            assert!(!stored.eligible_for_ack);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+        rt.publish_mesh_route_runtime_receipt(ready_evidence(&rt, &core, &path, &original));
+        {
+            let slot = rt.mesh_route_run.read().unwrap();
+            let stored = slot.as_ref().unwrap();
+            assert_eq!(stored.load_evidence, MeshRouteLoadEvidence::Unknown);
+            assert!(!stored.eligible_for_ack);
+        }
+        // Recover the same bytes without any report poll in between. Ordinary
+        // preparation retains its token; revoked activation needs a new writer.
+        super::tailnet_rules::prepare_tailnet_fixture(&rt, &config).await;
+        if !activation {
+            assert_eq!(rt.tailnet_context().unwrap().token, context.token);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+        let recovered = rt.mesh_route_report(Some("r-version".into()));
+        assert_ne!(
+            recovered.snapshot.load_evidence,
+            MeshRouteLoadEvidence::StartupReady
+        );
+        assert_ne!(
+            recovered.snapshot.load_evidence,
+            MeshRouteLoadEvidence::RuntimeCommitted
+        );
+        if !activation {
+            assert_eq!(
+                recovered.snapshot.load_evidence,
+                MeshRouteLoadEvidence::Unknown
+            );
+        }
+        assert_eq!(recovered.snapshot.scope, MeshRouteScope::PersistedUnknown);
+    }
 }

@@ -47,12 +47,12 @@
 
 use polaris_stats_engine::{SingBoxConnectionEvents, SingBoxStatus};
 
-use crate::runtime::proxy::ProxyStatus;
+#[cfg(not(target_os = "android"))]
+use crate::runtime::proxy::runtime_config::api_handoff::{relay_cancelled, ApiRelayBorrow};
+use crate::runtime::proxy::{ProxyRuntime, ProxyStatus};
 
 #[cfg(not(target_os = "android"))]
-use polaris_singbox_grpc::{
-    daemon, Endpoint, ReconnectConfig, ReconnectingStream, SingBoxApiClient,
-};
+use polaris_singbox_grpc::{daemon, ReconnectConfig, ReconnectingStream, SingBoxApiClient};
 
 use crate::runtime::config::ConfigManager;
 
@@ -173,8 +173,11 @@ pub(super) fn stream_label(port: u16) -> String {
 ///
 /// [`current_clash_api_secret`]: crate::runtime::management_api::current_clash_api_secret
 #[cfg(not(target_os = "android"))]
-fn read_clash_secret(config: &ConfigManager) -> String {
-    crate::runtime::management_api::current_clash_api_secret(config)
+async fn read_management_client(
+    proxy: &ProxyRuntime,
+    port: u16,
+) -> Result<SingBoxApiClient, polaris_singbox_grpc::ClientError> {
+    proxy.current_management_client(port).await
 }
 
 /// 连接事件长驻流（平台各自的传输，同一种帧）。
@@ -183,6 +186,8 @@ pub(super) struct ConnectionsStream {
     inner: ReconnectingStream<daemon::ConnectionEvents>,
     #[cfg(target_os = "android")]
     inner: android::Pump<SingBoxConnectionEvents>,
+    #[cfg(not(target_os = "android"))]
+    api_borrow: Option<ApiRelayBorrow>,
 }
 
 /// Transport-only timing metadata, never compared across clock domains.
@@ -213,6 +218,8 @@ pub(super) struct StatusStream {
     inner: ReconnectingStream<daemon::Status>,
     #[cfg(target_os = "android")]
     inner: android::Pump<StatusFrame>,
+    #[cfg(not(target_os = "android"))]
+    api_borrow: Option<ApiRelayBorrow>,
 }
 
 impl ConnectionsStream {
@@ -220,7 +227,7 @@ impl ConnectionsStream {
     pub(super) async fn recv(&mut self) -> Option<SingBoxConnectionEvents> {
         #[cfg(not(target_os = "android"))]
         {
-            let ev = self.inner.recv().await?;
+            let ev = tokio::select! {_ = relay_cancelled(&self.api_borrow)=>None, v=self.inner.recv()=>v}?;
             Some(super::relay::daemon_events_to_engine(&ev))
         }
         #[cfg(target_os = "android")]
@@ -235,7 +242,7 @@ impl StatusStream {
     pub(super) async fn recv(&mut self) -> Option<StatusFrame> {
         #[cfg(not(target_os = "android"))]
         {
-            let (st, reset) = self.inner.recv_with_reset().await?;
+            let (st, reset) = tokio::select! {_ = relay_cancelled(&self.api_borrow)=>None, v=self.inner.recv_with_reset()=>v}?;
             Some(StatusFrame {
                 status: super::relay::daemon_status_to_engine(&st),
                 observed_at_ms: None,
@@ -251,13 +258,17 @@ impl StatusStream {
 
 /// 订阅连接事件流。`None` = 这一轮建不起来（调用方退避一拍重试，与桌面既有腿同语义）。
 pub(super) async fn subscribe_connections(
-    config: &ConfigManager,
+    _config: &ConfigManager,
+    proxy: &ProxyRuntime,
     port: u16,
 ) -> Option<ConnectionsStream> {
     #[cfg(not(target_os = "android"))]
     {
-        let secret = read_clash_secret(config);
-        let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await
+        let api_borrow = proxy.runtime_api_relay_borrow();
+        if api_borrow.as_ref().is_some_and(|b| b.is_closed()) {
+            return None;
+        }
+        let client = match tokio::select! {_ = relay_cancelled(&api_borrow)=>return None, c=read_management_client(proxy,port)=>c}
         {
             Ok(c) => c,
             Err(e) => {
@@ -266,6 +277,7 @@ pub(super) async fn subscribe_connections(
             }
         };
         Some(ConnectionsStream {
+            api_borrow,
             inner: client.subscribe_connections(
                 super::CONNECTIONS_STREAM_INTERVAL_NS,
                 ReconnectConfig::default(),
@@ -274,7 +286,7 @@ pub(super) async fn subscribe_connections(
     }
     #[cfg(target_os = "android")]
     {
-        let _ = (config, port);
+        let _ = (_config, proxy, port);
         android::open_connections()
             .await
             .map(|inner| ConnectionsStream { inner })
@@ -282,11 +294,18 @@ pub(super) async fn subscribe_connections(
 }
 
 /// 订阅 Status 流。`None` 的语义同 [`subscribe_connections`]。
-pub(super) async fn subscribe_status(config: &ConfigManager, port: u16) -> Option<StatusStream> {
+pub(super) async fn subscribe_status(
+    _config: &ConfigManager,
+    proxy: &ProxyRuntime,
+    port: u16,
+) -> Option<StatusStream> {
     #[cfg(not(target_os = "android"))]
     {
-        let secret = read_clash_secret(config);
-        let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await
+        let api_borrow = proxy.runtime_api_relay_borrow();
+        if api_borrow.as_ref().is_some_and(|b| b.is_closed()) {
+            return None;
+        }
+        let client = match tokio::select! {_ = relay_cancelled(&api_borrow)=>return None, c=read_management_client(proxy,port)=>c}
         {
             Ok(c) => c,
             Err(e) => {
@@ -295,13 +314,14 @@ pub(super) async fn subscribe_status(config: &ConfigManager, port: u16) -> Optio
             }
         };
         Some(StatusStream {
+            api_borrow,
             inner: client
                 .subscribe_status(super::STATS_STREAM_INTERVAL_NS, ReconnectConfig::default()),
         })
     }
     #[cfg(target_os = "android")]
     {
-        let _ = (config, port);
+        let _ = (_config, proxy, port);
         android::open_status()
             .await
             .map(|inner| StatusStream { inner })

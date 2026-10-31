@@ -9,6 +9,8 @@ use tonic::Code;
 
 fn client_dialing_through(dial: Dialer) -> SingBoxApiClient {
     SingBoxApiClient {
+        capture: None,
+        _retained_lifetime: None,
         channel: connect_h2c_with("127.0.0.1:1", dial).unwrap(),
         target: "127.0.0.1:1".into(),
         secret: None,
@@ -150,7 +152,48 @@ async fn connector_preserves_host_and_port_for_ipv4_dns_and_ipv6() {
             assert_eq!(port, 1234);
             Box::pin(async { Err(io("observed test address")) })
         });
-        let mut connector = TcpConnector { dial };
+        let mut connector = TcpConnector {
+            dial,
+            capture: None,
+        };
         assert!(connector.call(uri.parse().unwrap()).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn captured_control_transport_never_reconnects_to_reused_address() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tower_service::Service;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let capture = Arc::new(CapturedTransport {
+        connected: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+        on_close: std::sync::Mutex::new(None),
+    });
+    let mut connector = TcpConnector {
+        capture: Some(capture.clone()),
+        dial: Arc::new(move |host, port| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(TcpStream::connect((host, port)))
+        }),
+    };
+    let uri = format!("http://127.0.0.1:{port}").parse().unwrap();
+    let connection = connector.call(uri).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    assert!(capture.live());
+    drop(connection);
+    assert!(!capture.live());
+    let closed = Arc::new(AtomicBool::new(false));
+    let seen = closed.clone();
+    capture.on_closed(Arc::new(move || seen.store(true, Ordering::Release)));
+    assert!(closed.load(Ordering::Acquire));
+    assert!(connector
+        .call(format!("http://127.0.0.1:{port}").parse().unwrap())
+        .await
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(server);
 }

@@ -106,6 +106,70 @@ fn ts_config_json() -> serde_json::Value {
     })
 }
 
+pub(super) async fn prepare_tailnet_fixture(rt: &Arc<ProxyRuntime>, config: &UserConfig) {
+    let raw = serde_json::to_value(config).unwrap();
+    rt.write_tailnet_rule_files_for_generation(config, &raw, rt.gate.generation())
+        .await
+        .unwrap();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let generated = generate_sing_box_config(config, &BTreeMap::new(), &deps).unwrap();
+    let bindings = rt.tailnet_bindings(&raw, &generated);
+    let _publication = rt.gate.lock_generation_publication();
+    rt.activate_tailnet_context(rt.gate.generation(), bindings);
+}
+
+pub(super) fn sync_fixture(rt: &Arc<ProxyRuntime>, events: &[TailscaleStatusEvent]) {
+    assert!(apply_fixture(rt, events));
+}
+
+fn apply_fixture(rt: &Arc<ProxyRuntime>, events: &[TailscaleStatusEvent]) -> bool {
+    use polaris_singbox_grpc::daemon as dm;
+    let context = rt
+        .tailnet_context()
+        .expect("real emitted context must be prepared");
+    let tags = context.tag_to_id();
+    let peer = |peer: &TailscaleStatusPeer| dm::TailscalePeer {
+        host_name: peer.host_name.clone(),
+        online: peer.online,
+        stable_id: peer.stable_id.clone().unwrap_or_default(),
+        tailscale_i_ps: peer.details.tailscale_ips.clone(),
+        ..Default::default()
+    };
+    let update = dm::TailscaleStatusUpdate {
+        endpoints: events
+            .iter()
+            .map(|event| dm::TailscaleEndpointStatus {
+                endpoint_tag: tags
+                    .iter()
+                    .find_map(|(tag, id)| (id == &event.server_id).then(|| tag.clone()))
+                    .unwrap_or_else(|| "unknown-tag".into()),
+                backend_state: event.backend_state.clone(),
+                self_: Some(dm::TailscalePeer {
+                    tailscale_i_ps: event.tailscale_ips.clone(),
+                    stable_id: event
+                        .details
+                        .self_peer
+                        .as_ref()
+                        .and_then(|peer| peer.stable_id.clone())
+                        .unwrap_or_default(),
+                    ..Default::default()
+                }),
+                user_groups: event
+                    .details
+                    .user_groups
+                    .iter()
+                    .map(|group| dm::TailscaleUserGroup {
+                        peers: group.peers.iter().map(&peer).collect(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect(),
+    };
+    rt.apply_ts_status_frame(&update, &tags, context.generation, context.token)
+}
+
 fn ts_user_config() -> UserConfig {
     serde_json::from_value(ts_config_json()).expect("测试 config 反序列化失败")
 }
@@ -157,24 +221,30 @@ async fn observed_frame_reaches_file_route_rules_and_tun_exclusion() {
     let (rt, _dir) = test_runtime();
     let config = ts_user_config();
 
-    // ── 起核前腿：首次运行、无已知集合 ⇒ 官方默认两段（**不是空文件**）。
-    rt.write_tailnet_rule_files(&config).await;
+    // 起核前无声明/观测：真正的空 rule-set，不猜官方控制面的大段。
+    prepare_tailnet_fixture(&rt, &config).await;
     let path = tailnet_file(&rt, "ts1");
     let first = std::fs::read_to_string(&path).expect("起核前腿必须落一个文件出来");
     let first_cidrs =
         parse_tailnet_rule_file_cidrs(&first).expect("落盘内容必须是可解析的 rule-set");
     assert_eq!(
         first_cidrs,
-        vec![TAILNET_CGNAT.to_string(), TAILNET_ULA_V6.to_string()],
-        "首次运行应落官方默认两段；空文件会让块 0c 走 rule_set 腿却一条段都不发 = 整段 tailnet 全断"
+        Vec::<String>::new(),
+        "cold negative knowledge must not synthesize official prefixes"
     );
+    let first_json: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first_json["version"], 1);
+    assert_eq!(first_json["rules"], serde_json::json!([]));
 
     // ── 运行中腿：一帧全量快照（self + 一台**离线** peer）。
-    rt.sync_tailnet_rule_files(&[frame(
-        "ts1",
-        &[OBSERVED_V4, OBSERVED_V6],
-        vec![peer("peer-a", &[OBSERVED_PEER_V4], false)],
-    )]);
+    sync_fixture(
+        &rt,
+        &[frame(
+            "ts1",
+            &[OBSERVED_V4, OBSERVED_V6],
+            vec![peer("peer-a", &[OBSERVED_PEER_V4], false)],
+        )],
+    );
     let after = std::fs::read_to_string(&path).expect("文件不得在热更里消失");
     let cidrs = parse_tailnet_rule_file_cidrs(&after).expect("热更后仍须是可解析的 rule-set");
     for expect in [
@@ -188,8 +258,8 @@ async fn observed_frame_reaches_file_route_rules_and_tun_exclusion() {
         );
     }
     assert!(
-        cidrs.contains(&TAILNET_CGNAT.to_string()) && cidrs.contains(&TAILNET_ULA_V6.to_string()),
-        "观测地址把官方默认段顶掉了 —— 语义必须是并集。实际：{cidrs:?}"
+        !cidrs.contains(&TAILNET_CGNAT.to_string()) && !cidrs.contains(&TAILNET_ULA_V6.to_string()),
+        "hot canonical must retire implicit broad while retaining explicit declarations: {cidrs:?}"
     );
 
     // ── 消费面 ①：真跑 generate（deps 取自生产装配 `generate_deps`，不是手拼）。
@@ -252,8 +322,8 @@ async fn observed_frame_reaches_file_route_rules_and_tun_exclusion() {
 async fn empty_frame_never_shrinks_the_file() {
     let (rt, _dir) = test_runtime();
     let config = ts_user_config();
-    rt.write_tailnet_rule_files(&config).await;
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4], vec![])]);
+    prepare_tailnet_fixture(&rt, &config).await;
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
     let path = tailnet_file(&rt, "ts1");
     let before = std::fs::read_to_string(&path).expect("热更后文件应在");
     assert!(
@@ -262,7 +332,7 @@ async fn empty_frame_never_shrinks_the_file() {
     );
 
     // 空帧：self 无地址、无 peer（真机上核刚起、netmap 未同步时就是这个形态）。
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &[], vec![])]);
     let after = std::fs::read_to_string(&path).expect("空帧不得让文件消失");
     assert_eq!(
         after, before,
@@ -270,7 +340,7 @@ async fn empty_frame_never_shrinks_the_file() {
     );
 
     // 全是非法字面量的帧同样什么都不做（写进 ip_cidr 会让核 netip.ParsePrefix 启动 FATAL）。
-    rt.sync_tailnet_rule_files(&[frame("ts1", &["not-an-ip", ""], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &["not-an-ip", ""], vec![])]);
     assert_eq!(
         std::fs::read_to_string(&path).expect("文件应在"),
         before,
@@ -288,20 +358,20 @@ async fn empty_frame_never_shrinks_the_file() {
 async fn running_sync_never_unlinks_a_mounted_file() {
     let (rt, _dir) = test_runtime();
     let config = ts_user_config();
-    rt.write_tailnet_rule_files(&config).await;
+    prepare_tailnet_fixture(&rt, &config).await;
     let path = tailnet_file(&rt, "ts1");
 
     // 依次走遍热更腿的每条早退：空帧 / 非法地址 / 同值 / 文件内容不可解析。
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &[], vec![])]);
     assert!(path.exists(), "空帧腿删了文件");
-    rt.sync_tailnet_rule_files(&[frame("ts1", &["bad"], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &["bad"], vec![])]);
     assert!(path.exists(), "非法地址腿删了文件");
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
     assert!(path.exists(), "首次并入删了文件");
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
     assert!(path.exists(), "同值腿删了文件");
     std::fs::write(&path, "{ not json").expect("写坏文件");
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
     assert!(
         path.exists(),
         "文件内容坏掉时热更腿删了它 —— 运行中删被挂载文件会致 sing-box reload 报错"
@@ -311,7 +381,7 @@ async fn running_sync_never_unlinks_a_mounted_file() {
     let src = module_code("runtime/proxy");
     let body = method_body(
         &src,
-        "    pub(super) fn sync_tailnet_rule_files(&self, events: &[TailscaleStatusEvent]) {",
+        "    pub(super) fn commit_tailnet_events(&self, state: &mut TailnetRouteState, context: &TailnetRouteContext, events: &[TailscaleStatusEvent]) -> Result<(), String> {",
     );
     assert!(
         !body.is_empty(),
@@ -331,7 +401,17 @@ async fn running_sync_never_unlinks_a_mounted_file() {
 #[test]
 fn running_sync_does_not_create_missing_files() {
     let (rt, _dir) = test_runtime();
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4], vec![])]);
+    // Admit the real generated endpoint without running file preparation.
+    let raw = ts_config_json();
+    let config = ts_user_config();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let generated = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+    {
+        let _publication = rt.gate.lock_generation_publication();
+        rt.activate_tailnet_context(rt.gate.generation(), rt.tailnet_bindings(&raw, &generated));
+    }
+    assert!(!tailnet_file(&rt, "ts1").exists());
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
     assert!(
         !tailnet_file(&rt, "ts1").exists(),
         "热更腿凭空造了一个缺默认段的 rule-set 文件"
@@ -359,8 +439,8 @@ async fn write_failure_falls_back_to_inline_without_fatal() {
     std::fs::create_dir_all(dir.parent().expect("configDir")).expect("建 configDir");
     std::fs::write(&dir, "占位：这不是目录").expect("把 tailnet-rules 占成文件");
 
-    rt.write_tailnet_rule_files(&config).await; // 不得 panic
-    rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4], vec![])]); // 不得 panic
+    prepare_tailnet_fixture(&rt, &config).await; // 不得 panic
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]); // 不得 panic
 
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json(), false);
     let cfg = generate_sing_box_config(&config, &BTreeMap::new(), &deps).expect("生成配置");
@@ -394,12 +474,8 @@ async fn write_failure_falls_back_to_inline_without_fatal() {
     );
 }
 
-/// 🔴 **bootstrap 腿的降级面** —— 上一条测的是「有观测」那半，这条补「从未连过」那半。
-///
-/// 两半必须分开测：`endpoint_forced_route_cidrs` 对 Tailscale 是**二选一**而非并集
-/// （有观测 ⇒ 观测段 + MagicDNS；无观测 ⇒ 默认两段），只测一半会让另一半的回归静默通过。
-/// 此前这条腿在 `src-tauri` 侧完全没有覆盖 —— 「有观测」那条测试同时断言了默认段在场，
-/// 于是看起来两件事都测了，实际一件都没锁住 bootstrap。
+/// 有观测时的 inline 回落与无观测时的 empty 回落必须分别覆盖。
+/// 保留这条失败路径：缺文件也不能把未知冷态升级为官方大段或空条件规则。
 #[tokio::test]
 async fn write_failure_on_a_node_without_observation_keeps_bootstrap() {
     let (rt, _dir) = test_runtime();
@@ -408,8 +484,8 @@ async fn write_failure_on_a_node_without_observation_keeps_bootstrap() {
     std::fs::create_dir_all(dir.parent().expect("configDir")).expect("建 configDir");
     std::fs::write(&dir, "占位：这不是目录").expect("把 tailnet-rules 占成文件");
 
-    rt.write_tailnet_rule_files(&config).await; // 不得 panic
-                                                // 刻意不喂任何 status 帧：这就是「节点从未连上过控制面」的形态。
+    prepare_tailnet_fixture(&rt, &config).await; // 不得 panic
+                                                 // 刻意不喂任何 status 帧：这就是「节点从未连上过控制面」的形态。
     assert!(
         rt.observed_tailnet_snapshot().is_empty(),
         "前置：本例的观测面必须是空的，否则测的不是 bootstrap 腿"
@@ -418,17 +494,17 @@ async fn write_failure_on_a_node_without_observation_keeps_bootstrap() {
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json(), false);
     let cfg = generate_sing_box_config(&config, &BTreeMap::new(), &deps).expect("生成配置");
     let route = cfg.route.as_ref().expect("没有 route 段");
-    let inline = route
-        .rules
-        .iter()
-        .find(|r| r.outbound.as_deref() == Some("ts1") && r.ip_cidr.is_some())
-        .expect("降级腿必须回落 inline force-route");
-    let cidrs = inline.ip_cidr.as_ref().expect("ip_cidr");
     assert!(
-        cidrs.contains(&TAILNET_CGNAT.to_string()) && cidrs.contains(&TAILNET_ULA_V6.to_string()),
-        "无观测节点必须发默认两段作 bootstrap —— 否则它在连上控制面之前整段 tailnet 不可路由。\
-         实际：{cidrs:?}"
+        !route
+            .rules
+            .iter()
+            .any(|r| r.outbound.as_deref() == Some("ts1") && r.ip_cidr.is_some()),
+        "missing file and unknown hosts must not create an inline force-route"
     );
+    assert!(route.rule_set.as_ref().is_none_or(|rules| !rules
+        .iter()
+        .any(|entry| entry.tag == tailnet_rule_file_base("ts1"))));
+    assert!(rt.fresh_tailnet_snapshot(rt.gate.generation()).is_empty());
 }
 
 // ══════════════ 持久层：盘上文件活过进程重启 ══════════════
@@ -444,15 +520,15 @@ async fn last_known_set_survives_a_process_restart() {
     let config = ts_user_config();
     {
         let rt = test_runtime_in(dir.clone());
-        rt.write_tailnet_rule_files(&config).await;
-        rt.sync_tailnet_rule_files(&[frame("ts1", &[OBSERVED_V4, OBSERVED_V6], vec![])]);
+        prepare_tailnet_fixture(&rt, &config).await;
+        sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4, OBSERVED_V6], vec![])]);
     }
     let restarted = test_runtime_in(dir.clone());
     assert!(
         restarted.observed_tailnet_snapshot().is_empty(),
         "前置：新实例的内存观测面本应是空的（否则下面的断言没有信息量）"
     );
-    restarted.write_tailnet_rule_files(&config).await;
+    prepare_tailnet_fixture(&restarted, &config).await;
     let observed = restarted.observed_tailnet_snapshot();
     assert!(
         observed
@@ -492,15 +568,19 @@ async fn corrupt_file_is_rewritten_before_start() {
     let path = tailnet_file(&rt, "ts1");
     std::fs::write(&path, "{ 这不是 JSON").expect("写坏文件");
 
-    rt.write_tailnet_rule_files(&config).await;
+    prepare_tailnet_fixture(&rt, &config).await;
 
     let cidrs = parse_tailnet_rule_file_cidrs(&std::fs::read_to_string(&path).expect("文件应在"))
         .expect("起核前腿必须把坏文件重写成可解析的 rule-set");
     assert_eq!(
         cidrs,
-        vec![TAILNET_CGNAT.to_string(), TAILNET_ULA_V6.to_string()],
+        Vec::<String>::new(),
         "坏文件应被按配置期段重写。实际：{cidrs:?}"
     );
+    let repaired: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(repaired["version"], 1);
+    assert_eq!(repaired["rules"], serde_json::json!([]));
 }
 
 // ══════════════ 接线门：start 路径真的会落盘 ══════════════
@@ -547,7 +627,7 @@ async fn relay_frame_wiring_drives_the_hot_update() {
     use polaris_singbox_grpc::daemon as dm;
     let (rt, _dir) = test_runtime();
     let config = ts_user_config();
-    rt.write_tailnet_rule_files(&config).await;
+    prepare_tailnet_fixture(&rt, &config).await;
     let path = tailnet_file(&rt, "ts1");
     assert!(
         !std::fs::read_to_string(&path)
@@ -556,10 +636,12 @@ async fn relay_frame_wiring_drives_the_hot_update() {
         "前置：此刻文件里还不该有观测地址（否则本门没有区分力）"
     );
 
-    let tag_to_id = BTreeMap::from([("ts1-tag".to_string(), "ts1".to_string())]);
+    let context = rt.tailnet_context().unwrap();
+    let tag_to_id = context.tag_to_id();
+    let actual_tag = tag_to_id.keys().next().unwrap().clone();
     let update = dm::TailscaleStatusUpdate {
         endpoints: vec![dm::TailscaleEndpointStatus {
-            endpoint_tag: "ts1-tag".into(),
+            endpoint_tag: actual_tag,
             backend_state: "Running".into(),
             self_: Some(dm::TailscalePeer {
                 host_name: "self".into(),
@@ -579,7 +661,7 @@ async fn relay_frame_wiring_drives_the_hot_update() {
             ..Default::default()
         }],
     };
-    rt.apply_ts_status_frame(&update, &tag_to_id, rt.gate.generation());
+    assert!(rt.apply_ts_status_frame(&update, &tag_to_id, rt.gate.generation(), context.token));
 
     let cidrs = parse_tailnet_rule_file_cidrs(&std::fs::read_to_string(&path).expect("文件应在"))
         .expect("可解析");
@@ -658,4 +740,734 @@ fn rule_file_parse_reads_every_rule_and_rejects_garbage() {
         parse_tailnet_rule_file_cidrs(r#"{"version":1,"rules":[{"domain":["a.com"]}]}"#),
         Some(vec![])
     );
+}
+
+// V01/V05: implicit provenance retires; explicit identical broad declarations
+// survive, and removing a declaration cannot resurrect it from current file bytes.
+#[tokio::test]
+async fn canonical_hot_recompute_preserves_only_current_explicit_broad() {
+    let (rt, _dir) = test_runtime();
+    let mut raw = ts_config_json();
+    raw["servers"][0]["tailscaleSettings"]["routes"] =
+        serde_json::json!([TAILNET_CGNAT, TAILNET_ULA_V6, "10.8.0.0/24"]);
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    prepare_tailnet_fixture(&rt, &config).await;
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    let path = tailnet_file(&rt, "ts1");
+    let cidrs = parse_tailnet_rule_file_cidrs(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(cidrs.contains(&TAILNET_CGNAT.into()) && cidrs.contains(&TAILNET_ULA_V6.into()));
+    let before = rt.tailnet_context().unwrap();
+    raw["servers"][0]["tailscaleSettings"]["routes"] = serde_json::json!([]);
+    let typed = serde_json::from_value(raw.clone()).unwrap();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let generated = generate_sing_box_config(&typed, &BTreeMap::new(), &deps).unwrap();
+    {
+        let _publication = rt.gate.lock_generation_publication();
+        assert!(
+            rt.activate_tailnet_context(before.generation, rt.tailnet_bindings(&raw, &generated))
+        );
+    }
+    let after = rt.tailnet_context().unwrap();
+    assert_ne!(before.token, after.token);
+    let cidrs = parse_tailnet_rule_file_cidrs(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(!cidrs.contains(&TAILNET_CGNAT.into()) && !cidrs.contains(&TAILNET_ULA_V6.into()));
+    assert!(!cidrs.contains(&"10.8.0.0/24".into()));
+    assert!(cidrs.contains(&format!("{OBSERVED_V4}/32")));
+}
+
+// V06/V08/V09/V15: unknown disk history remains usable by next-start/TUN,
+// but the first qualified current frame replaces it rather than certifying it.
+#[tokio::test]
+async fn weak_legacy_history_is_planning_only_and_first_frame_replaces_it() {
+    let (rt, _dir) = test_runtime();
+    let path = tailnet_file(&rt, "ts1");
+    std::fs::create_dir_all(rt.tailnet_rules_dir()).unwrap();
+    std::fs::write(
+        &path,
+        super::super::tailnet_rules::tailnet_rule_file_json(&["32.0.0.99/32".into()]),
+    )
+    .unwrap();
+    let config = ts_user_config();
+    prepare_tailnet_fixture(&rt, &config).await;
+    assert!(rt.fresh_tailnet_snapshot(rt.gate.generation()).is_empty());
+    assert_eq!(
+        rt.observed_tailnet_for_config(&ts_config_json())["ts1"],
+        vec!["32.0.0.99"]
+    );
+    let planned = tun_exclude_with(&config, rt.observed_tailnet_for_config(&ts_config_json()));
+    assert!(!planned.contains(&"32.0.0.0/24".into()));
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    assert_eq!(rt.observed_tailnet_snapshot()["ts1"], vec![OBSERVED_V4]);
+    assert!(!std::fs::read_to_string(path).unwrap().contains("32.0.0.99"));
+    let mut different = ts_config_json();
+    different["servers"][0]["tailscaleSettings"]["controlUrl"] =
+        serde_json::json!("https://other.example");
+    assert!(rt.observed_tailnet_for_config(&different).is_empty());
+    // No new persistent provenance is fabricated: disk-only data in a new
+    // process is weak again even though this process had a known authority.
+    assert!(!rt.fresh_tailnet_snapshot(rt.gate.generation()).is_empty());
+    rt.reset_ts_exit_block_state();
+    assert!(rt.fresh_tailnet_snapshot(rt.gate.generation()).is_empty());
+    assert_eq!(
+        rt.observed_tailnet_for_config(&ts_config_json())["ts1"],
+        vec![OBSERVED_V4]
+    );
+}
+
+// V03/V10/V11/V12/V18: stale/adversarial frames cannot mutate any sink.
+#[tokio::test]
+async fn stale_generation_token_and_duplicate_tag_have_zero_commits() {
+    use polaris_singbox_grpc::daemon as dm;
+    let (rt, _dir) = test_runtime();
+    prepare_tailnet_fixture(&rt, &ts_user_config()).await;
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    let context = rt.tailnet_context().unwrap();
+    let tags = context.tag_to_id();
+    let tag = tags.keys().next().unwrap().clone();
+    let endpoint = dm::TailscaleEndpointStatus {
+        endpoint_tag: tag,
+        self_: Some(dm::TailscalePeer {
+            tailscale_i_ps: vec!["32.0.0.77".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let update = dm::TailscaleStatusUpdate {
+        endpoints: vec![endpoint.clone()],
+    };
+    let path = tailnet_file(&rt, "ts1");
+    let bytes = std::fs::read(&path).unwrap();
+    let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+    let hosts = rt.observed_tailnet_snapshot();
+    let cache = rt.mesh.tailscale_status_snapshot(true).statuses;
+    assert!(!rt.apply_ts_status_frame(&update, &tags, context.generation, context.token + 1));
+    let duplicated = dm::TailscaleStatusUpdate {
+        endpoints: vec![endpoint.clone(), endpoint],
+    };
+    assert!(!rt.apply_ts_status_frame(&duplicated, &tags, context.generation, context.token));
+    rt.bump_generation();
+    assert!(!rt.apply_ts_status_frame(&update, &tags, context.generation, context.token));
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+    assert_eq!(rt.observed_tailnet_snapshot(), hosts);
+    assert_eq!(rt.mesh.tailscale_status_snapshot(true).statuses, cache);
+}
+
+#[tokio::test]
+async fn stale_prospective_start_cannot_write_or_import_legacy() {
+    let (rt, _dir) = test_runtime();
+    let generation = rt.gate.generation();
+    rt.bump_generation();
+    rt.write_tailnet_rule_files_for_generation(&ts_user_config(), &ts_config_json(), generation)
+        .await
+        .unwrap();
+    assert!(!rt.tailnet_rules_dir().exists());
+    assert!(rt.observed_tailnet_snapshot().is_empty());
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn known_authority_filters_previews_and_peeled_endpoints_have_no_writer() {
+    let (rt, _dir) = test_runtime();
+    prepare_tailnet_fixture(&rt, &ts_user_config()).await;
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    let mut raw = ts_config_json();
+    raw["servers"][0]["tailscaleSettings"]["controlUrl"] =
+        serde_json::json!("HTTPS://CONTROLPLANE.TAILSCALE.COM");
+    assert!(rt.observed_tailnet_for_config(&raw).contains_key("ts1"));
+    raw["servers"][0]["tailscaleSettings"]["controlUrl"] =
+        serde_json::json!("https://controlplane.tailscale.com/other");
+    assert!(rt.observed_tailnet_for_config(&raw).is_empty());
+    let typed = ts_user_config();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &ts_config_json(), false);
+    let mut generated = generate_sing_box_config(&typed, &BTreeMap::new(), &deps).unwrap();
+    generated.endpoints = None;
+    assert!(rt
+        .tailnet_bindings(&ts_config_json(), &generated)
+        .is_empty());
+    let mut collision = ts_config_json();
+    let duplicate = collision["servers"][0].clone();
+    collision["servers"].as_array_mut().unwrap().push(duplicate);
+    assert!(rt.tailnet_bindings(&collision, &generated).is_empty());
+    assert!(rt.observed_tailnet_for_config(&collision).is_empty());
+    let mut non_ts = ts_config_json();
+    non_ts["servers"][0]["protocol"] = serde_json::json!("wireguard");
+    assert!(rt.observed_tailnet_for_config(&non_ts).is_empty());
+}
+
+#[tokio::test]
+async fn logical_epoch_retirement_and_actual_stable_id_change_do_not_mix_hosts() {
+    let (rt, _dir) = test_runtime();
+    let mut raw = ts_config_json();
+    raw["meshRouteState"] = serde_json::json!({"schemaVersion":1,"localId":"local","revision":"1",
+        "identities":[{"serverId":"ts1","identityEpoch":"epoch-one","controlAuthority":"https://controlplane.tailscale.com","selfStableId":"self-one","bindingState":"bound","evidenceSource":"existing-ledger"}],
+        "observations":[],"reservations":[],"intent":{"revision":"1","desiredRun":"stopped"},"identityEffects":[]});
+    let typed = serde_json::from_value(raw.clone()).unwrap();
+    rt.write_tailnet_rule_files_for_generation(&typed, &raw, rt.gate.generation())
+        .await
+        .unwrap();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let generated = generate_sing_box_config(&typed, &BTreeMap::new(), &deps).unwrap();
+    {
+        let _publication = rt.gate.lock_generation_publication();
+        rt.activate_tailnet_context(rt.gate.generation(), rt.tailnet_bindings(&raw, &generated));
+    }
+    let mut event = frame("ts1", &[OBSERVED_V4], vec![]);
+    let mut own = peer("self", &[OBSERVED_V4], true);
+    own.stable_id = Some("self-one".into());
+    event.details.self_peer = Some(own);
+    sync_fixture(&rt, &[event.clone()]);
+    assert!(rt.observed_tailnet_for_config(&raw).contains_key("ts1"));
+    let mut changed_epoch = raw.clone();
+    changed_epoch["meshRouteState"]["identities"][0]["identityEpoch"] =
+        serde_json::json!("epoch-two");
+    assert!(rt.observed_tailnet_for_config(&changed_epoch).is_empty());
+    let mut retired = raw.clone();
+    retired["meshRouteState"]["identities"][0]["bindingState"] = serde_json::json!("retired");
+    assert!(rt.observed_tailnet_for_config(&retired).is_empty());
+    // Absent stable ID and an empty/invalid frame cannot invent logout.
+    let token = rt.tailnet_context().unwrap().token;
+    sync_fixture(&rt, &[frame("ts1", &[], vec![])]);
+    sync_fixture(&rt, &[frame("ts1", &["invalid"], vec![])]);
+    assert_eq!(rt.tailnet_context().unwrap().token, token);
+    assert!(rt.observed_tailnet_snapshot()["ts1"].contains(&OBSERVED_V4.into()));
+    event.tailscale_ips = vec!["32.0.0.77".into()];
+    event.details.self_peer.as_mut().unwrap().stable_id = Some("self-two".into());
+    sync_fixture(&rt, &[event]);
+    assert_ne!(rt.tailnet_context().unwrap().token, token);
+    assert_eq!(rt.observed_tailnet_snapshot()["ts1"], vec!["32.0.0.77"]);
+    assert!(rt.observed_tailnet_for_config(&raw).is_empty());
+}
+
+// Functional source admission has a byte budget, not the report's 4096-row cap.
+#[tokio::test]
+async fn functional_routes_above_report_cap_roundtrip_with_full_canonical_overhead() {
+    let dir = fresh_test_dir();
+    let rt = test_runtime_in(dir.clone());
+    let mut raw = ts_config_json();
+    raw["servers"][0]["tailscaleSettings"]["routes"] =
+        serde_json::json!(["172.20.0.0/16", "fd11:22::/48"]);
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    prepare_tailnet_fixture(&rt, &config).await;
+    for count in [4095usize, 4112] {
+        let mut event = frame("ts1", &[], vec![]);
+        event.tailscale_ips = vec!["invalid".into(); 4096];
+        event.tailscale_ips.extend(vec!["10.0.0.1".into(); 4096]);
+        let hosts: Vec<String> = (0..count)
+            .map(|n| format!("10.{}.{}.{}", (n >> 16) & 255, (n >> 8) & 255, n & 255))
+            .collect();
+        event.tailscale_ips.extend(hosts.iter().cloned());
+        sync_fixture(&rt, &[event]);
+        assert_eq!(rt.observed_tailnet_snapshot()["ts1"].len(), count);
+        assert_eq!(
+            rt.fresh_tailnet_snapshot(rt.gate.generation())["ts1"].len(),
+            count
+        );
+        let expected = polaris_config_engine::builder::endpoint_routes::endpoint_forced_route_cidrs(
+            &config.servers[0],
+            &rt.observed_tailnet_snapshot(),
+        );
+        assert_eq!(expected.len(), count + 4); // MagicDNS + explicit v4/v6 routes.
+        let content = std::fs::read_to_string(tailnet_file(&rt, "ts1")).unwrap();
+        assert_eq!(
+            content,
+            super::super::tailnet_rules::tailnet_rule_file_json(&expected)
+        );
+        assert_eq!(parse_tailnet_rule_file_cidrs(&content), Some(expected));
+        assert!(!rt.tailnet_routes_limited());
+    }
+    let before = std::fs::read(tailnet_file(&rt, "ts1")).unwrap();
+    let restarted = test_runtime_in(dir.to_path_buf());
+    prepare_tailnet_fixture(&restarted, &config).await;
+    let retained = restarted.observed_tailnet_snapshot();
+    assert!(retained["ts1"].len() > 4096);
+    assert!(restarted
+        .fresh_tailnet_snapshot(restarted.gate.generation())
+        .is_empty());
+    assert_eq!(
+        std::fs::read(tailnet_file(&restarted, "ts1")).unwrap(),
+        before
+    );
+    sync_fixture(&restarted, &[frame("ts1", &["10.1.1.1"], vec![])]);
+    assert_eq!(
+        restarted.observed_tailnet_snapshot()["ts1"],
+        vec!["10.1.1.1"]
+    );
+    assert!(!std::fs::read_to_string(tailnet_file(&restarted, "ts1"))
+        .unwrap()
+        .contains("10.0.0.0/32"));
+    assert_eq!(bare_addr_of_host_cidr("::1/32"), None);
+    assert_eq!(bare_addr_of_host_cidr("10.0.0.1/128"), None);
+    assert_eq!(bare_addr_of_host_cidr("not-an-ip/32"), None);
+    assert!(
+        parse_tailnet_rule_file_cidrs(r#"{"version":1,"rules":[{"ip_cidr":["invalid"]}]}"#)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn functional_overflow_rejects_complete_frame_before_any_sink_advances() {
+    use super::super::tailnet_rules::MAX_TAILNET_RULE_BYTES;
+    let (rt, _dir) = test_runtime();
+    prepare_tailnet_fixture(&rt, &ts_user_config()).await;
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    let bytes = std::fs::read(tailnet_file(&rt, "ts1")).unwrap();
+    let hosts = rt.observed_tailnet_snapshot();
+    let fresh = rt.fresh_tailnet_snapshot(rt.gate.generation());
+    let status = rt.mesh.tailscale_status_snapshot(true).statuses;
+    let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+    let token = rt.tailnet_context().unwrap().token;
+    for input_overflow in [false, true] {
+        let mut event = frame("ts1", &[], vec![]);
+        event.tailscale_ips = if input_overflow {
+            vec!["invalid".repeat(MAX_TAILNET_RULE_BYTES / 7 + 1)]
+        } else {
+            (0..60000)
+                .map(|n| format!("10.{}.{}.{}", (n >> 16) & 255, (n >> 8) & 255, n & 255))
+                .collect()
+        };
+        // A stable-ID learning token must also remain staged on rejection.
+        event.details.self_peer = Some(peer("self", &[], true));
+        event.details.self_peer.as_mut().unwrap().stable_id = Some("uncommitted-self".into());
+        assert!(!apply_fixture(&rt, &[event]));
+        assert!(rt.tailnet_routes_limited());
+        assert_eq!(rt.tailnet_context().unwrap().token, token);
+        assert_eq!(rt.observed_tailnet_snapshot(), hosts);
+        assert_eq!(rt.fresh_tailnet_snapshot(rt.gate.generation()), fresh);
+        assert_eq!(rt.mesh.tailscale_status_snapshot(true).statuses, status);
+        assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+        assert_eq!(std::fs::read(tailnet_file(&rt, "ts1")).unwrap(), bytes);
+    }
+    sync_fixture(&rt, &[frame("ts1", &[], vec![])]);
+    assert!(rt.tailnet_routes_limited()); // an empty frame cannot prove recovery.
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_PEER_V4], vec![])]);
+    assert!(!rt.tailnet_routes_limited());
+}
+
+#[tokio::test]
+async fn declaration_and_magicdns_byte_overflow_refuses_startup_before_import_or_write() {
+    use super::super::tailnet_rules::MAX_TAILNET_RULE_BYTES;
+    let (rt, _dir) = test_runtime();
+    prepare_tailnet_fixture(&rt, &ts_user_config()).await;
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    let hosts = rt.observed_tailnet_snapshot();
+    let bytes = std::fs::read(tailnet_file(&rt, "ts1")).unwrap();
+    let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+    let mut raw = ts_config_json();
+    raw["servers"][0]["tailscaleSettings"]["routes"] = serde_json::json!((0..60000)
+        .map(|n| format!("172.{}.{}.{}/32", (n >> 16) & 255, (n >> 8) & 255, n & 255))
+        .collect::<Vec<_>>());
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    let result = rt
+        .write_tailnet_rule_files_for_generation(&config, &raw, rt.gate.generation())
+        .await;
+    assert!(result.unwrap_err().contains("functional byte limit"));
+    assert_eq!(rt.observed_tailnet_snapshot(), hosts);
+    assert_eq!(std::fs::read(tailnet_file(&rt, "ts1")).unwrap(), bytes);
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+    let generated = generate_sing_box_config(
+        &config,
+        &BTreeMap::new(),
+        &rt.generate_deps(9090, 0, 0, None, &[], &raw, false),
+    )
+    .unwrap();
+    let bindings = rt.tailnet_bindings(&raw, &generated);
+    assert!(!rt.tailnet_bindings_within_limit(&bindings));
+    {
+        let _publication = rt.gate.lock_generation_publication();
+        rt.activate_tailnet_context(rt.gate.generation(), bindings);
+    }
+    assert!(rt.tailnet_context().is_none());
+    assert!(rt.tailnet_routes_limited());
+    assert_eq!(rt.observed_tailnet_snapshot(), hosts);
+    assert_eq!(std::fs::read(tailnet_file(&rt, "ts1")).unwrap(), bytes);
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+    let oversized = " ".repeat(MAX_TAILNET_RULE_BYTES + 1);
+    assert!(parse_tailnet_rule_file_cidrs(&oversized).is_none());
+}
+
+#[tokio::test]
+async fn known_retained_planning_is_not_promoted_to_current_observation() {
+    let (rt, _dir) = test_runtime();
+    let config = ts_user_config();
+    prepare_tailnet_fixture(&rt, &config).await;
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    rt.reset_ts_exit_block_state();
+    prepare_tailnet_fixture(&rt, &config).await;
+    assert!(rt.fresh_tailnet_snapshot(rt.gate.generation()).is_empty());
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_PEER_V4], vec![])]);
+    assert_eq!(
+        rt.fresh_tailnet_snapshot(rt.gate.generation())["ts1"],
+        vec![OBSERVED_PEER_V4]
+    );
+    assert!(rt.observed_tailnet_snapshot()["ts1"].contains(&OBSERVED_V4.into()));
+    assert!(rt.observed_tailnet_snapshot()["ts1"].contains(&OBSERVED_PEER_V4.into()));
+}
+
+fn identity_raw_fixture() -> serde_json::Value {
+    let mut raw = ts_config_json();
+    raw["meshRouteState"] = serde_json::json!({"schemaVersion":1,"localId":"local","revision":"1",
+        "identities":[{"serverId":"ts1","identityEpoch":"epoch-one","controlAuthority":"https://controlplane.tailscale.com","selfStableId":"self-one","bindingState":"bound","evidenceSource":"status"}],
+        "observations":[],"reservations":[],"intent":{"revision":"1","desiredRun":"stopped"},"identityEffects":[]});
+    raw
+}
+
+fn admit_tailnet_raw(
+    rt: &Arc<ProxyRuntime>,
+    raw: &serde_json::Value,
+) -> polaris_config_engine::singbox::SingBoxConfig {
+    let typed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    let deps = rt.generate_deps(9090, 0, 0, None, &[], raw, false);
+    let generated = generate_sing_box_config(&typed, &BTreeMap::new(), &deps).unwrap();
+    let _publication = rt.gate.lock_generation_publication();
+    rt.activate_tailnet_context(rt.gate.generation(), rt.tailnet_bindings(raw, &generated));
+    generated
+}
+
+#[tokio::test]
+async fn real_reconcile_retire_append_admits_only_successor_and_rejects_multiple_current() {
+    use polaris_config_engine::user_config::mesh_identity_reconcile::{
+        reconcile_identity_evidence, ReplacementIdentity, RetirementScopeSnapshot,
+    };
+    use polaris_config_engine::user_config::mesh_route_state::{
+        MeshOwnerRef, MeshRoutePolicy, MeshRouteState,
+    };
+    let (rt, _dir) = test_runtime();
+    let mut raw = identity_raw_fixture();
+    let typed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    rt.write_tailnet_rule_files_for_generation(&typed, &raw, rt.gate.generation())
+        .await
+        .unwrap();
+    admit_tailnet_raw(&rt, &raw);
+    sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+    let state: MeshRouteState = serde_json::from_value(raw["meshRouteState"].clone()).unwrap();
+    let policy: MeshRoutePolicy = serde_json::from_value(serde_json::json!({"schemaVersion":1,"candidateOrder":["ts1"],"assignments":[],"overrides":[],"migration":{"unknownPublicPool":"reject","builtinExceptionsVersion":1}})).unwrap();
+    let next = reconcile_identity_evidence(
+        &state,
+        &policy,
+        "ts1",
+        ReplacementIdentity {
+            epoch: "epoch-two",
+            control_authority: "HTTPS://CONTROLPLANE.TAILSCALE.COM",
+            self_stable_id: Some("self-two"),
+        },
+        Some(RetirementScopeSnapshot {
+            owner_ref: MeshOwnerRef {
+                server_id: "ts1".into(),
+                identity_epoch: "epoch-one".into(),
+            },
+            state_revision: &state.revision,
+            active_plan_id: None,
+            configured_cidrs: Some(&[]),
+            active_plan_owner_cidrs: Some(&[]),
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(next.identities.len(), 2);
+    assert_eq!(
+        next.identities[0].binding_state,
+        polaris_config_engine::user_config::mesh_route_state::MeshBindingState::Retired
+    );
+    raw["meshRouteState"] = serde_json::to_value(next).unwrap();
+    assert!(rt.observed_tailnet_for_config(&raw).is_empty());
+    let typed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    rt.write_tailnet_rule_files_for_generation(&typed, &raw, rt.gate.generation())
+        .await
+        .unwrap();
+    let generated = admit_tailnet_raw(&rt, &raw);
+    assert_eq!(rt.tailnet_bindings(&raw, &generated).len(), 1);
+    let mut successor = frame("ts1", &[OBSERVED_PEER_V4], vec![]);
+    successor.details.self_peer = Some(peer("self", &[], true));
+    successor.details.self_peer.as_mut().unwrap().stable_id = Some("self-two".into());
+    sync_fixture(&rt, &[successor]);
+    assert_eq!(
+        rt.observed_tailnet_snapshot()["ts1"],
+        vec![OBSERVED_PEER_V4]
+    );
+    assert!(!std::fs::read_to_string(tailnet_file(&rt, "ts1"))
+        .unwrap()
+        .contains(OBSERVED_V4));
+    let mut duplicate = raw["meshRouteState"]["identities"][1].clone();
+    duplicate["identityEpoch"] = serde_json::json!("epoch-three");
+    duplicate["bindingState"] = serde_json::json!("bound");
+    raw["meshRouteState"]["identities"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    assert!(rt.tailnet_bindings(&raw, &generated).is_empty());
+    assert!(rt.observed_tailnet_for_config(&raw).is_empty());
+    let old_file = std::fs::read(tailnet_file(&rt, "ts1")).unwrap();
+    let typed = serde_json::from_value(raw.clone()).unwrap();
+    assert!(rt
+        .write_tailnet_rule_files_for_generation(&typed, &raw, rt.gate.generation())
+        .await
+        .is_err());
+    assert_eq!(std::fs::read(tailnet_file(&rt, "ts1")).unwrap(), old_file);
+}
+
+#[tokio::test]
+async fn retired_and_retiring_known_history_cannot_return_through_builder_file_exists() {
+    for binding in ["retired", "retiring"] {
+        for file_present in [true, false] {
+            let (rt, _dir) = test_runtime();
+            let mut raw = identity_raw_fixture();
+            let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+            rt.write_tailnet_rule_files_for_generation(&config, &raw, rt.gate.generation())
+                .await
+                .unwrap();
+            admit_tailnet_raw(&rt, &raw);
+            sync_fixture(&rt, &[frame("ts1", &[OBSERVED_V4], vec![])]);
+            rt.reset_ts_exit_block_state();
+            let path = tailnet_file(&rt, "ts1");
+            if !file_present {
+                std::fs::remove_file(&path).unwrap();
+            }
+            raw["meshRouteState"]["identities"][0]["bindingState"] = serde_json::json!(binding);
+            let config = serde_json::from_value(raw.clone()).unwrap();
+            rt.write_tailnet_rule_files_for_generation(&config, &raw, rt.gate.generation())
+                .await
+                .unwrap();
+            assert!(rt.observed_tailnet_snapshot().is_empty());
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(!content.contains(OBSERVED_V4));
+            // Actual builder still registers by exists; the bytes it can read
+            // now contain only current declarations, genuinely empty here.
+            let generated = admit_tailnet_raw(&rt, &raw);
+            let json = serde_json::to_value(&generated).unwrap();
+            assert!(json["route"]["rule_set"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| {
+                    rule["path"]
+                        .as_str()
+                        .is_some_and(|rule_path| std::path::Path::new(rule_path) == path.as_path())
+                }));
+            assert!(rt.tailnet_bindings(&raw, &generated).is_empty());
+            assert_eq!(
+                parse_tailnet_rule_file_cidrs(&content),
+                Some(Vec::<String>::new())
+            );
+            let empty: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(empty["version"], 1);
+            assert_eq!(empty["rules"], serde_json::json!([]));
+            // No ledger metadata remains weak/unknown, rather than inferred logout.
+            let missing = ts_config_json();
+            assert_eq!(rt.tailnet_bindings(&missing, &generated).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn retired_source_that_cannot_be_replaced_or_removed_stops_preparation() {
+    let (rt, _dir) = test_runtime();
+    let mut raw = identity_raw_fixture();
+    raw["meshRouteState"]["identities"][0]["bindingState"] = serde_json::json!("retired");
+    let path = tailnet_file(&rt, "ts1");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("block-rename"), "fixture").unwrap();
+    let config = serde_json::from_value(raw.clone()).unwrap();
+    assert!(rt
+        .write_tailnet_rule_files_for_generation(&config, &raw, rt.gate.generation())
+        .await
+        .unwrap_err()
+        .contains("could not be replaced or removed"));
+    assert!(rt.observed_tailnet_snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn later_endpoint_overflow_cannot_partially_publish_earlier_endpoint() {
+    let (rt, _dir) = test_runtime();
+    let mut raw = ts_config_json();
+    let mut second = raw["servers"][0].clone();
+    second["id"] = serde_json::json!("ts2");
+    second["name"] = serde_json::json!("ts2");
+    raw["servers"].as_array_mut().unwrap().push(second);
+    let config: UserConfig = serde_json::from_value(raw).unwrap();
+    prepare_tailnet_fixture(&rt, &config).await;
+    sync_fixture(
+        &rt,
+        &[
+            frame("ts1", &[OBSERVED_V4], vec![]),
+            frame("ts2", &[OBSERVED_PEER_V4], vec![]),
+        ],
+    );
+    let before = ["ts1", "ts2"].map(|id| std::fs::read(tailnet_file(&rt, id)).unwrap());
+    let hosts = rt.observed_tailnet_snapshot();
+    let fresh = rt.fresh_tailnet_snapshot(rt.gate.generation());
+    let status = rt.mesh.tailscale_status_snapshot(true).statuses;
+    let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+    let mut overflowing = frame("ts2", &[], vec![]);
+    overflowing.tailscale_ips = (0..60000)
+        .map(|n| format!("10.{}.{}.{}", (n >> 16) & 255, (n >> 8) & 255, n & 255))
+        .collect();
+    assert!(!apply_fixture(
+        &rt,
+        &[frame("ts1", &["32.0.0.77"], vec![]), overflowing]
+    ));
+    assert_eq!(
+        ["ts1", "ts2"].map(|id| std::fs::read(tailnet_file(&rt, id)).unwrap()),
+        before
+    );
+    assert_eq!(rt.observed_tailnet_snapshot(), hosts);
+    assert_eq!(rt.fresh_tailnet_snapshot(rt.gate.generation()), fresh);
+    assert_eq!(rt.mesh.tailscale_status_snapshot(true).statuses, status);
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+    assert!(rt.tailnet_routes_limited());
+}
+
+#[tokio::test]
+async fn weak_binding_negative_knowledge_survives_stop_but_is_not_persisted_provenance() {
+    let dir = fresh_test_dir();
+    let rt = test_runtime_in(dir.clone());
+    let raw = identity_raw_fixture();
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    let path = tailnet_file(&rt, "ts1");
+    std::fs::create_dir_all(rt.tailnet_rules_dir()).unwrap();
+    std::fs::write(
+        &path,
+        super::super::tailnet_rules::tailnet_rule_file_json(&["32.0.0.99/32".into()]),
+    )
+    .unwrap();
+    rt.write_tailnet_rule_files_for_generation(&config, &raw, rt.gate.generation())
+        .await
+        .unwrap();
+    admit_tailnet_raw(&rt, &raw);
+    assert!(rt.fresh_tailnet_snapshot(rt.gate.generation()).is_empty());
+    rt.reset_ts_exit_block_state();
+    assert!(rt.tailnet_context().is_none());
+    assert!(rt.observed_tailnet_for_config(&raw)["ts1"].contains(&"32.0.0.99".into()));
+    let mut changed = raw.clone();
+    changed["meshRouteState"]["identities"][0]["identityEpoch"] = serde_json::json!("epoch-two");
+    assert!(rt.observed_tailnet_for_config(&changed).is_empty());
+    let next_config: UserConfig = serde_json::from_value(changed.clone()).unwrap();
+    {
+        // A new process has no old captured context. Legacy remains an unknown,
+        // weak planning hint under the existing compatibility policy.
+        let restarted = test_runtime_in(dir.to_path_buf());
+        restarted
+            .write_tailnet_rule_files_for_generation(
+                &next_config,
+                &changed,
+                restarted.gate.generation(),
+            )
+            .await
+            .unwrap();
+        admit_tailnet_raw(&restarted, &changed);
+        assert!(
+            restarted.observed_tailnet_for_config(&changed)["ts1"].contains(&"32.0.0.99".into())
+        );
+        assert!(restarted
+            .fresh_tailnet_snapshot(restarted.gate.generation())
+            .is_empty());
+    }
+    // The old process still knows its admitted C1 was incompatible. It may not
+    // clear that fact via Stop and then reimport the same weak on-disk hosts.
+    rt.write_tailnet_rule_files_for_generation(&next_config, &changed, rt.gate.generation())
+        .await
+        .unwrap();
+    assert!(rt.observed_tailnet_snapshot().is_empty());
+    assert!(!std::fs::read_to_string(path).unwrap().contains("32.0.0.99"));
+}
+
+#[tokio::test]
+async fn cold_empty_production_write_is_match_none_without_freshness_or_ready() {
+    let (rt, _dir) = test_runtime();
+    let raw = ts_config_json();
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    let generation = rt.gate.generation();
+    rt.write_tailnet_rule_files_for_generation(&config, &raw, generation)
+        .await
+        .unwrap();
+    let content = std::fs::read_to_string(tailnet_file(&rt, "ts1")).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(actual.as_object().unwrap().len(), 2);
+    assert_eq!(actual["version"], 1);
+    assert_eq!(actual["rules"], serde_json::json!([]));
+    assert_eq!(
+        parse_tailnet_rule_file_cidrs(&content),
+        Some(Vec::<String>::new())
+    );
+    assert!(rt.observed_tailnet_snapshot().is_empty());
+    assert!(rt.fresh_tailnet_snapshot(generation).is_empty());
+    assert!(rt.tailnet_context().is_none());
+    assert!(rt.mesh_route_run.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn explicit_nonempty_production_write_keeps_legacy_canonical_bytes() {
+    let (rt, _dir) = test_runtime();
+    let mut raw = ts_config_json();
+    let cidrs = vec![
+        TAILNET_CGNAT.to_string(),
+        TAILNET_ULA_V6.to_string(),
+        "10.8.0.0/24".into(),
+    ];
+    raw["servers"][0]["tailscaleSettings"]["routes"] = serde_json::json!(cidrs);
+    let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    rt.write_tailnet_rule_files_for_generation(&config, &raw, rt.gate.generation())
+        .await
+        .unwrap();
+    // Exact pre-change nonempty format, including key/array order and whitespace.
+    let legacy = serde_json::to_string_pretty(&serde_json::json!({
+        "version": 1,
+        "rules": [{ "ip_cidr": cidrs }],
+    }))
+    .unwrap();
+    let bytes = std::fs::read(tailnet_file(&rt, "ts1")).unwrap();
+    assert_eq!(bytes.as_slice(), legacy.as_bytes());
+    assert_eq!(parse_tailnet_rule_file_cidrs(&legacy), Some(cidrs));
+    assert!(rt.fresh_tailnet_snapshot(rt.gate.generation()).is_empty());
+}
+
+#[tokio::test]
+async fn production_generation_writes_empty_nonempty_empty_without_stale_publication() {
+    let (rt, _dir) = test_runtime();
+    let empty_raw = ts_config_json();
+    let empty_config: UserConfig = serde_json::from_value(empty_raw.clone()).unwrap();
+    let first_generation = rt.gate.generation();
+    rt.write_tailnet_rule_files_for_generation(&empty_config, &empty_raw, first_generation)
+        .await
+        .unwrap();
+    let path = tailnet_file(&rt, "ts1");
+    let empty_bytes = std::fs::read(&path).unwrap();
+    let mut nonempty_raw = empty_raw.clone();
+    nonempty_raw["servers"][0]["tailscaleSettings"]["routes"] = serde_json::json!(["10.8.0.0/24"]);
+    let nonempty_config: UserConfig = serde_json::from_value(nonempty_raw.clone()).unwrap();
+    rt.bump_generation();
+    let second_generation = rt.gate.generation();
+    let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+    rt.write_tailnet_rule_files_for_generation(&nonempty_config, &nonempty_raw, first_generation)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), empty_bytes);
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+    rt.write_tailnet_rule_files_for_generation(&nonempty_config, &nonempty_raw, second_generation)
+        .await
+        .unwrap();
+    let nonempty_bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        parse_tailnet_rule_file_cidrs(std::str::from_utf8(&nonempty_bytes).unwrap()),
+        Some(vec!["10.8.0.0/24".into()])
+    );
+    assert_ne!(nonempty_bytes, empty_bytes);
+    rt.bump_generation();
+    let third_generation = rt.gate.generation();
+    let epoch = rt.tailnet_file_write_epoch.load(Ordering::SeqCst);
+    rt.write_tailnet_rule_files_for_generation(&empty_config, &empty_raw, second_generation)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), nonempty_bytes);
+    assert_eq!(rt.tailnet_file_write_epoch.load(Ordering::SeqCst), epoch);
+    rt.write_tailnet_rule_files_for_generation(&empty_config, &empty_raw, third_generation)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), empty_bytes);
+    let value: serde_json::Value = serde_json::from_slice(&empty_bytes).unwrap();
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["rules"], serde_json::json!([]));
+    assert!(rt.observed_tailnet_snapshot().is_empty());
+    assert!(rt.fresh_tailnet_snapshot(third_generation).is_empty());
+    assert!(rt.mesh_route_run.read().unwrap().is_none());
 }

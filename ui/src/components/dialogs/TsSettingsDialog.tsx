@@ -463,6 +463,13 @@ function TsSettingsForm({ instanceId, node }: { instanceId: string; node?: Serve
         </div>
       )}
 
+      {node && (
+        <div className="card-sub form-inline-note" data-ts-coexistence>
+          <span>{t('ts.systemInstanceBoundary')}</span>{' '}
+          <InfoIcon tip={t('ts.userspaceCoexistenceHint')} />
+        </div>
+      )}
+
       <FormTabs
         id="ts-settings-form"
         ariaLabel={t('node.formGroup.aria')}

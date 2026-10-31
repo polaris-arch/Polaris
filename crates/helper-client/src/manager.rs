@@ -38,15 +38,9 @@ use std::time::Duration;
 /// Polaris 改名 com.polaris.helper。
 pub const SERVICE_LABEL: &str = "com.polaris.helper";
 
-/// 「功能齐全、不报需修复」的最低 protoVersion。
-///
-/// **不移植** 上游的 `MIN_USABLE = 4`：那个 4 只在 mac 谱系 9 代演进里有意义（v4 起 TUN 齐全）。
-/// Polaris 三平台统一 v1（见 `polaris_helper_proto` crate 文档），首发 helper 就带齐全部命令
-/// ⇒ 门槛 = [`polaris_helper_proto::proto_version::CURRENT`] 的起点 1。
-///
-/// ⚠️ 这是**最容易被漏掉的连带**：只把常量从 9/5/1 改成 1、却留着 `>= 4`，会让每一台机器的 helper
-/// 都判为 `ready=false / needs_repair=true` —— TUN 直接不可用。`min_usable_not_above_current` 锁死。
-pub const MIN_USABLE_PROTO: u32 = 2;
+/// Runtime readiness requires the executor-owned admission semantics. Stop and
+/// explicit administrator upgrade/cleanup remain available to older helpers.
+pub const MIN_USABLE_PROTO: u32 = polaris_helper_proto::proto_version::MIN_TRUSTED_EXECUTION;
 
 /// 三平台安装路径集合（移植自 Polaris 路径常量）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,7 +393,7 @@ impl HelperManager {
         let expected_proto = expected_proto();
         // B3: a newer compatible helper serves multiple App/core versions.
         // Build id remains diagnostic; App overlays its own core-status id proof.
-        let upgradeable = ready && proto_version < expected_proto;
+        let upgradeable = proto_version < expected_proto;
         HelperStatus {
             installed: true,
             ready,
@@ -515,7 +509,27 @@ pub enum InstallMode {
 impl InstallMode {
     #[must_use]
     pub const fn supported_on(self, platform: Platform) -> bool {
-        matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)
+        matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac | Platform::Linux)
+    }
+}
+
+/// Confirmed maintenance scope; a zero exit on macOS retires, never deletes data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceOutcome {
+    Removed,
+    RetiredDataPreserved,
+    Cancelled,
+    Failed { stderr: String, code: i32 },
+}
+
+fn maintenance_outcome(platform: Platform, outcome: EscalationOutcome) -> MaintenanceOutcome {
+    match outcome {
+        EscalationOutcome::Success if platform == Platform::Mac => {
+            MaintenanceOutcome::RetiredDataPreserved
+        }
+        EscalationOutcome::Success => MaintenanceOutcome::Removed,
+        EscalationOutcome::Cancelled => MaintenanceOutcome::Cancelled,
+        EscalationOutcome::Failed { stderr, code } => MaintenanceOutcome::Failed { stderr, code },
     }
 }
 
@@ -532,11 +546,18 @@ pub struct MaintenanceUtility {
 /// 各平台按需取用，无关字段忽略（移植锚点见各字段）。
 #[derive(Debug, Clone)]
 pub struct InstallParams {
+    /// Nine captured exact gsettings values plus the responsible HOME, never
+    /// a claim that restoration succeeded.
+    /// The Linux dispatcher reads every fixed key in that user's
+    /// actual session again; missing baseline rejects only legacy maintenance.
+    pub linux_legacy_original_proxy: Option<[String; 10]>,
     /// Complete private stage, frozen by the App before administrator approval.
     pub manifest_path: PathBuf,
     pub manifest_sha256: String,
     pub core_id: polaris_helper_proto::core_manifest::CoreId,
     pub helper_sha256: String,
+    /// Compiled App selection, never a digest supplied by a stage manifest.
+    pub cleaner_sha256: Option<String>,
     pub helper_version: String,
     pub user_identity: polaris_helper_proto::core_protocol::CallerIdentity,
     /// Private stage helper. Administrator scripts copy and hash it before execution.
@@ -588,6 +609,62 @@ impl HelperManager {
         }
         // ② token：复用或生成并写 app 侧（linux 无 token 语义，写了也无害；脚本不会用）。
         let token = self.prepare_token().map_err(ManagerError::TokenWrite)?;
+        if self.platform == Platform::Win {
+            #[cfg(windows)]
+            {
+                use polaris_windows_cleaner::{install::Request, InstallOutcome};
+                let original_sid = match &params.user_identity {
+                    polaris_helper_proto::core_protocol::CallerIdentity::Windows(sid) => {
+                        sid.clone()
+                    }
+                    _ => {
+                        return Err(ManagerError::InvalidInstallation(
+                            "native Windows caller required",
+                        ));
+                    }
+                };
+                let text = |path: &Path| {
+                    path.to_str()
+                        .map(str::to_owned)
+                        .ok_or(ManagerError::InvalidInstallation(
+                            "native installation path must be Unicode",
+                        ))
+                };
+                let request = Request {
+                    stage: text(
+                        params
+                            .src_binary
+                            .parent()
+                            .ok_or(ManagerError::InvalidInstallation("stage missing"))?,
+                    )?,
+                    original_sid,
+                    config: text(&params.conf_dir)?,
+                    core_id: params.core_id.as_str().into(),
+                    manifest_sha256: params.manifest_sha256.clone(),
+                    helper_sha256: params.helper_sha256.clone(),
+                    cleaner_sha256: params.cleaner_sha256.clone().ok_or(
+                        ManagerError::InvalidInstallation("compiled cleaner pin required"),
+                    )?,
+                    token,
+                    stage_identity: [0; 3],
+                    source_identities: vec![],
+                };
+                let outcome =
+                    polaris_windows_cleaner::launch_install(request).map_err(|error| {
+                        ManagerError::Escalation(crate::ClientError::Connect(error.to_string()))
+                    })?;
+                return Ok(match outcome {
+                    InstallOutcome::Cancelled => EscalationOutcome::Cancelled,
+                    InstallOutcome::Completed(0) => EscalationOutcome::Success,
+                    InstallOutcome::Completed(code) => EscalationOutcome::Failed {
+                        stderr: "native Windows installation did not complete".into(),
+                        code,
+                    },
+                });
+            }
+            #[cfg(not(windows))]
+            return Err(ManagerError::UnsupportedPlatform(Platform::Win));
+        }
         // ③ 生成 root 安装脚本。
         let script = self.build_install_script(params, &token, mode)?;
         // ④⑤ 落盘 + 提权 + 清理。
@@ -615,12 +692,33 @@ impl HelperManager {
         self.uninstall_with_maintenance(script_dir, None, executor)
     }
 
+    /// Preserve the platform maintenance scope through the App/report boundary.
+    pub fn uninstall_with_maintenance_outcome(
+        &self,
+        script_dir: &Path,
+        utility: Option<&MaintenanceUtility>,
+        executor: &dyn Executor,
+    ) -> Result<MaintenanceOutcome, ManagerError> {
+        self.uninstall_with_maintenance(script_dir, utility, executor)
+            .map(|outcome| maintenance_outcome(self.platform, outcome))
+    }
+
     /// Unix callers must provide the current bundled utility. Never invoke an
     /// unknown installed legacy helper as a maintenance command interpreter.
     pub fn uninstall_with_maintenance(
         &self,
         script_dir: &Path,
         utility: Option<&MaintenanceUtility>,
+        executor: &dyn Executor,
+    ) -> Result<EscalationOutcome, ManagerError> {
+        self.uninstall_with_linux_original_proxy(script_dir, utility, None, executor)
+    }
+
+    pub fn uninstall_with_linux_original_proxy(
+        &self,
+        script_dir: &Path,
+        utility: Option<&MaintenanceUtility>,
+        original: Option<&[String; 10]>,
         executor: &dyn Executor,
     ) -> Result<EscalationOutcome, ManagerError> {
         match self.platform {
@@ -655,7 +753,16 @@ impl HelperManager {
             "current bundled maintenance utility required",
         ))?;
         validate_maintenance_utility(utility)?;
-        let script = self.build_uninstall_script(utility);
+        let script = if self.platform == Platform::Linux {
+            uninstall_unix::build_linux_uninstall_script_with_original(
+                &self.paths,
+                utility,
+                original,
+                script_dir,
+            )
+        } else {
+            self.build_uninstall_script(utility)
+        };
         let outcome = self.run_privileged_script(
             script_dir,
             self.uninstall_script_name(),
@@ -729,9 +836,23 @@ impl HelperManager {
             // iOS 本处特有的那半句：脚本这个概念本身在 iOS 上没有承载物 —— 应用沙箱里没有可执行
             // 的 shell，写出来的 .sh 没有任何东西能跑它。
             Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
-                Ok(build_linux_install_script(&self.paths, params, token))
+                Ok(match mode {
+                    InstallMode::Ordinary => build_linux_install_script(&self.paths, params, token),
+                    InstallMode::StopAndUpgrade => {
+                        install_unix::build_linux_legacy_install_script(&self.paths, params, token)
+                    }
+                })
             }
-            Platform::Win => Ok(build_win_install_script(&self.paths, params, token)),
+            Platform::Win => {
+                #[cfg(test)]
+                {
+                    Ok(build_win_install_script(&self.paths, params, token))
+                }
+                #[cfg(not(test))]
+                {
+                    Err(ManagerError::UnsupportedPlatform(Platform::Win))
+                }
+            }
         }
     }
 
@@ -843,6 +964,16 @@ fn validate_install_params(platform: Platform, params: &InstallParams) -> Result
             "missing actual byte hashes",
         ));
     }
+    if platform == Platform::Win
+        && params
+            .cleaner_sha256
+            .as_deref()
+            .is_none_or(|hash| CoreId::parse(hash).is_err())
+    {
+        return Err(ManagerError::InvalidInstallation(
+            "compiled cleaner pin required",
+        ));
+    }
     let absolute = |path: &Path| {
         let raw = path.to_string_lossy();
         !raw.contains(['\0', '\n', '\r'])
@@ -888,15 +1019,19 @@ fn validate_install_params(platform: Platform, params: &InstallParams) -> Result
             "installation files must share one private stage",
         ));
     }
-    match (&params.user_identity, platform) {
-        (CallerIdentity::Unix(uid), Platform::Linux | Platform::Mac) if *uid == params.uid => {}
-        (CallerIdentity::Windows(sid), Platform::Win) if CallerIdentity::windows(sid).is_some() => {
+    let owner_matches = match platform {
+        Platform::Linux | Platform::Mac => {
+            matches!(&params.user_identity, CallerIdentity::Unix(uid) if *uid == params.uid)
         }
-        _ => {
-            return Err(ManagerError::InvalidInstallation(
-                "native source owner differs",
-            ))
+        Platform::Win => {
+            matches!(&params.user_identity, CallerIdentity::Windows(sid) if CallerIdentity::windows(sid).is_some())
         }
+        Platform::Android | Platform::Ios | Platform::Other => false,
+    };
+    if !owner_matches {
+        return Err(ManagerError::InvalidInstallation(
+            "native source owner differs",
+        ));
     }
     Ok(())
 }
@@ -1079,7 +1214,11 @@ fn render_mac_plist(
         program = xml_escape(program),
         support = xml_escape(support_dir),
         coredir = xml_escape(core_dir),
-        closed_argument = if upgrade_closed { "<string>--upgrade-closed</string>\n" } else { "" },
+        closed_argument = if upgrade_closed {
+            "<string>--upgrade-closed</string>\n"
+        } else {
+            ""
+        },
     )
 }
 
@@ -1133,6 +1272,16 @@ WantedBy=multi-user.target\n",
 }
 
 mod linux_service_stop;
+/// Fixed, shared hierarchy/namespace proof used by the sealed Linux dispatcher.
+/// Its consumer validates its journal-bound mask before invoking the common body.
+#[doc(hidden)]
+pub const LINUX_SERVICE_CLOSURE_FUNCTIONS: &str = linux_service_stop::FUNCTIONS;
+
+/// The same canonical unit bytes as the ordinary producer, without caller paths.
+#[doc(hidden)]
+pub fn linux_canonical_unit() -> String {
+    build_linux_unit(&InstallPaths::linux())
+}
 mod uninstall_unix;
 
 // ===== win 脚本（移植 WindowsServiceHelper.ts:429-517）=====
@@ -1144,7 +1293,9 @@ mod uninstall_unix;
 /// 旧文件、旧 binPath/start mode 与原运行态，避免覆盖升级把可用 helper 留成半安装态。
 /// `$ErrorActionPreference = Stop` 让失败以非零退出透出（提权 executor 归类 Failed；privilege.rs 的
 /// uac_escalation 无 上游的 flag-file 错误回写协议 —— 见报告 DESIGN-REVIEW）。
+#[cfg(test)]
 mod install_windows;
+#[cfg(test)]
 use install_windows::build_win_install_script;
 
 // ===== 默认 SysOps（生产实现，跨平台可编译）=====

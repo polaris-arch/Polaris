@@ -88,13 +88,43 @@ describe('W24：app/helper 共享出包构建身份', () => {
     ]);
   });
 
-  it('升级卡片区分 protocol 落后与同 protocol build 漂移，且不硬编码期望版本', () => {
+  it('共享构建身份仅供诊断，协议兼容与选定内容核验仍由后端决定', () => {
     const screen = read('ui/src/components/screens/settings/SettingsHelper.tsx');
-    expect(screen.includes('status.version < status.expectedProtocolVersion')).toBe(true);
-    expect(screen.includes("t('helper.buildVersionMismatch')")).toBe(true);
-    expect(screen).toContain('status?.helperBuildId != null && status.helperBuildId !== status.expectedBuildId');
+    const runtime = read('src-tauri/src/runtime/helper.rs');
+    const manager = read('crates/helper-client/src/manager.rs');
+    // Preserve the actual producer/consumer chain. A compatible helper with a
+    // different build remains usable; its build token must not become CoreID.
+    expect(runtime).toContain('helper_build_id: status.build_id.clone()');
+    expect(runtime).toContain('expected_build_id: polaris_helper_proto::build_identity::current().to_owned()');
+    // An old incompatible protocol must still offer a real upgrade. Requiring
+    // ready here would hide that action exactly when repair is needed. Native
+    // manager tests cover old-v2/current/foreign-build handshakes separately.
+    expect(manager).toContain('let ready = proto_version >= MIN_USABLE_PROTO;');
+    expect(manager).toContain('let upgradeable = proto_version < expected_proto;');
+    expect(manager).toContain('needs_repair: !ready');
+    expect(manager).not.toMatch(/let upgradeable\s*=\s*[^;]*build/);
+    expect(runtime).toContain('match self.core_status()');
+    expect(screen).toContain('helperBuildId: buildId(status.helperBuildId)');
+    expect(screen).toContain('expectedBuildId: buildId(status.expectedBuildId)');
+    expect(screen).toContain('providerFingerprint: digest(status.selectedCore.providerFingerprint)');
+    expect(screen).not.toContain('status.helperBuildId !== status.expectedBuildId');
+    expect(screen).not.toContain('helper.buildVersionMismatch');
+
+    // Numeric protocol evidence and both build tokens stay separately readable
+    // inside the folded diagnostics; missing observation has no expected-value fallback.
+    const diagnosticStart = screen.indexOf('<details className="card-sub" data-testid="helper-diagnostics"');
+    expect(diagnosticStart).toBeGreaterThan(0);
+    const diagnostics = screen.slice(diagnosticStart, screen.indexOf('</details>', diagnosticStart));
+    expect(diagnostics).toContain("t('helper.observedBuildId')");
+    expect(diagnostics).toContain('diagnostics?.helper.helperBuildId');
+    expect(diagnostics).toContain("t('helper.expectedBuildId')");
+    expect(diagnostics).toContain('diagnostics?.helper.expectedBuildId');
+    expect(diagnostics).toContain('diagnostics?.helper.version');
+    expect(diagnostics).toContain('diagnostics?.helper.expectedProtocolVersion');
+    expect(screen).toContain('version: protocol(status.version), expectedProtocolVersion: protocol(status.expectedProtocolVersion)');
+    expect(screen).toContain('status.version < status.expectedProtocolVersion');
     expect(screen).toContain("status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent'");
-    expect(screen.includes('required: status.expectedProtocolVersion')).toBe(true);
-    expect(screen.includes('required: 3'), 'shared protocol 已是 v1，UI 不得残留 v3 硬编码').toBe(false);
+    expect(screen).not.toContain('status?.version ?? status?.expectedProtocolVersion');
+    expect(screen).not.toMatch(/expectedProtocolVersion:\s*\d|protocolVersion[^\n]*version:\s*\d/);
   });
 });

@@ -134,10 +134,8 @@ async fn direct_capability_bytes_require_retained_run_and_replaced_files_do_not_
     let (rt, dir) = test_runtime();
     let path = dir.join("proof-core");
     std::fs::write(&path, b"unexecutable old-core identity fixture").unwrap();
-    // Even an old core with no report has a proven file digest.
-    let proof = crate::runtime::tls_fingerprints::probe_cli_observation(&path)
-        .await
-        .unwrap();
+    // Explicit business observation; the real native factory still requires admission.
+    let proof = crate::runtime::tls_fingerprints::cache_fixture_observation(&path);
     let snapshot = proof.snapshot.clone();
     let identity = install_observed_run(&rt);
     let generation = rt.core_generation();
@@ -172,19 +170,21 @@ async fn disconnected_measurements_invalidate_when_actual_selected_source_is_rep
     let path = dir.join("temp-proof-core");
     std::fs::write(&path, b"not executable A").unwrap();
     *rt.core_binary_override.lock().unwrap() = Some(path.clone());
+    crate::runtime::tls_fingerprints::cache_fixture_observation(&path);
     let (observed, proof) = rt.tls_fingerprint_capabilities_observed().await;
     assert!(proof.is_some());
     for index in 0..4 {
         let other = dir.join(format!("measurement-cache-pressure-{index}"));
         std::fs::write(&other, b"#!/bin/sh\n").unwrap();
-        assert!(crate::runtime::tls_fingerprints::probe_cli(&other)
-            .await
-            .binary_sha256
-            .is_some());
+        assert!(
+            crate::runtime::tls_fingerprints::cache_fixture_observation(&other)
+                .snapshot
+                .binary_sha256
+                .is_some()
+        );
     }
     assert!(crate::runtime::tls_fingerprints::cached_cli(&path).is_none());
-    // Acquisition uses the existing full resolver. Ledger reads must never
-    // re-enter it (production does core+sidecar content hashing there).
+    // Acquisition records candidate selection; ledger reads must not resolve again.
     assert_eq!(rt.core_binary_for_start().unwrap(), path);
     let resolution_calls = rt.core_binary_resolution_calls.load(Ordering::SeqCst);
     rt.remember_temp_core_sha256(observed.binary_sha256.clone(), proof);
@@ -212,4 +212,20 @@ async fn disconnected_measurements_invalidate_when_actual_selected_source_is_rep
         rt.core_binary_resolution_calls.load(Ordering::SeqCst),
         resolution_calls
     );
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[tokio::test]
+async fn desktop_startup_inventory_method_is_available_and_truthfully_unsupported() {
+    let (rt, dir) = test_runtime();
+    let binary = dir.join("unsupported-exact-core");
+    std::fs::write(&binary, b"foreign data").unwrap();
+    let snapshot = rt.tls_fingerprint_capabilities_for(Some(&binary)).await;
+    assert!(snapshot.document.is_none());
+    assert!(snapshot.binary_sha256.is_none());
+    assert!(snapshot
+        .unavailable_reason
+        .as_deref()
+        .unwrap()
+        .contains("UnsupportedExactObject"));
 }

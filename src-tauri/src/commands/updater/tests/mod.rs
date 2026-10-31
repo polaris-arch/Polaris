@@ -10,6 +10,9 @@ use polaris_updater::popup::{UpdateErr, UpdateErrCode};
 use polaris_updater::state::PopupPhase;
 use serde_json::{json, Value};
 
+mod release_pagination;
+mod release_selection;
+
 /// 本模块的**生产源码**（调用点守卫共用）。
 ///
 /// 原先是 `concat!(include_str!("shared.rs"), …)` 手列四个文件——那份清单与

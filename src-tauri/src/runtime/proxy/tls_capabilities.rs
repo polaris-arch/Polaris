@@ -1,6 +1,5 @@
 use super::ProxyRuntime;
 use crate::runtime::tls_fingerprints::Snapshot;
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
 use std::path::Path;
 
 impl ProxyRuntime {
@@ -88,25 +87,22 @@ impl ProxyRuntime {
                     ),
                 };
             }
-            // Linux /proc/<pid>/exe identifies the loaded image even after rename.
-            #[cfg(not(target_os = "linux"))]
-            if status.running {
-                return (
-                    Snapshot::unavailable("Helper loaded-image byte proof is unavailable"),
-                    None,
-                );
-            }
-            let binary = match self.tls_capability_binary() {
-                Ok(path) => path,
+            // Inventory is a separate selected-cohort query, not a claim about
+            // the running process's random TLS choice or a pathname credential.
+            let selection = match self.tls_capability_selection() {
+                Ok(selection) => selection,
                 Err(e) => return (Snapshot::unavailable(e), None),
             };
             let (snapshot, proof) =
-                match crate::runtime::tls_fingerprints::probe_cli_observation(&binary).await {
+                match crate::runtime::tls_fingerprints::probe_cli_observation(selection.path())
+                    .await
+                {
                     Ok(proof) => (proof.snapshot.clone(), Some(proof)),
                     Err(snapshot) => (*snapshot, None),
                 };
             let current = self.status();
-            if generation != self.core_generation()
+            if !selection.is_current()
+                || generation != self.core_generation()
                 || status.pid != current.pid
                 || status.running != current.running
             {
@@ -139,7 +135,6 @@ impl ProxyRuntime {
     }
 
     /// Startup supplies its exact binary, rather than a UI version probe path.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
     pub(super) async fn tls_fingerprint_capabilities_for(&self, binary: Option<&Path>) -> Snapshot {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {

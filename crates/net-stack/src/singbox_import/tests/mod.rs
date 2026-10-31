@@ -148,13 +148,78 @@ fn reality_without_public_key_falls_to_tls() {
 }
 
 #[test]
-fn tls_disabled_leaves_security_unset() {
+fn trojan_tls_disabled_preserves_explicit_none() {
     let out = parse(json!({ "outbounds": [{
             "type": "trojan", "server": "t.com", "server_port": 443, "password": "pw",
             "tls": { "enabled": false }
         }] }));
-    assert_eq!(out.servers[0].security, None, "tls.enabled:false → 不启用");
+    assert_eq!(out.servers[0].security, Some(SecurityMode::None));
     assert!(out.servers[0].tls_settings.is_none());
+}
+
+#[test]
+fn plaintext_trojan_native_import_and_generation_round_trip() {
+    use polaris_config_engine::builder::outbound::build_proxy_outbound;
+    use polaris_config_engine::singbox::DomainResolver;
+    for tls in [
+        None,
+        Some(Value::Null),
+        Some(json!({"enabled": false, "certificate_sha256": ["invalid-unused-pin"]})),
+    ] {
+        let mut raw = json!({
+            "type": "trojan", "server": "t.com", "server_port": 443, "password": "pw"
+        });
+        if let Some(tls) = tls {
+            raw["tls"] = tls;
+        }
+        let doc = json!({"outbounds": [raw]});
+        for imported in [parse(doc.clone()), parse_local(doc)] {
+            assert_eq!(imported.servers.len(), 1);
+            let node = &imported.servers[0];
+            assert_eq!(node.security, Some(SecurityMode::None));
+            assert!(node.tls_settings.is_none());
+            let exported = serde_json::to_value(
+                build_proxy_outbound(
+                    node,
+                    "plain-trojan",
+                    &DomainResolver::Tag("dns-bootstrap".into()),
+                    "arm64",
+                    "darwin",
+                )
+                .expect("plaintext Trojan with unused TLS pins"),
+            )
+            .unwrap();
+            assert!(exported.get("tls").is_none());
+            assert_eq!(exported["password"], "pw");
+            let again = parse_local(json!({"outbounds": [exported]}));
+            assert_eq!(again.servers.len(), 1);
+            assert_eq!(again.servers[0].security, Some(SecurityMode::None));
+        }
+    }
+}
+
+#[test]
+fn native_trojan_tls_stays_enabled_and_malformed_tls_is_rejected() {
+    for tls in [json!({}), json!({"enabled": true})] {
+        let doc = json!({"outbounds": [{
+            "type": "trojan", "server": "t.com", "server_port": 443,
+            "password": "pw", "tls": tls
+        }]});
+        for imported in [parse(doc.clone()), parse_local(doc)] {
+            assert_eq!(imported.servers.len(), 1);
+            assert_eq!(imported.servers[0].security, Some(SecurityMode::Tls));
+        }
+    }
+    for tls in [json!(false), json!(1), json!("tls")] {
+        let doc = json!({"outbounds": [{
+            "type": "trojan", "server": "t.com", "server_port": 443,
+            "password": "pw", "tls": tls
+        }]});
+        for imported in [parse(doc.clone()), parse_local(doc)] {
+            assert!(imported.servers.is_empty());
+            assert_eq!(imported.failed, 1);
+        }
+    }
 }
 
 #[test]
@@ -2360,5 +2425,161 @@ fn vision_extra_transports_are_retained_with_repairable_warning() {
             .warnings
             .iter()
             .all(|w| !w.contains("private.example") && !w.contains("private-uuid")));
+    }
+}
+
+#[test]
+fn snell_v4_http_tls_preserve_active_host_and_reject_lossy_shapes() {
+    for origin in [ImportOrigin::LocalFile, ImportOrigin::RemoteSubscription] {
+        for mode in ["http", "tls", "TLS"] {
+            let result = parse_with(
+                json!({"outbounds":[{
+                    "type":"snell", "server":"s.example", "server_port":443,
+                    "version":4, "psk":"part1:part2+secret", "obfs_mode":mode,
+                    "obfs_host":"Cover.Example", "reuse":true, "network":"udp", "userkey":"key"
+                }]}),
+                origin,
+            );
+            assert_eq!(
+                (result.servers.len(), result.failed, result.skipped),
+                (1, 0, 0)
+            );
+            let node = &result.servers[0];
+            assert_eq!(node.password.as_deref(), Some("part1:part2+secret"));
+            let sn = node.snell_settings.as_deref().unwrap();
+            assert_eq!(
+                sn.obfs_mode.as_deref(),
+                Some(mode.to_ascii_lowercase().as_str())
+            );
+            assert_eq!(sn.obfs_host.as_deref(), Some("Cover.Example"));
+            assert_eq!(sn.reuse, Some(true));
+            assert_eq!(sn.network.as_deref(), Some("udp"));
+            assert_eq!(sn.userkey.as_deref(), Some("key"));
+            assert!(node.tls_settings.is_none());
+        }
+        for patch in [
+            json!({"obfs_mode":"unknown"}),
+            json!({"obfs_mode":7}),
+            json!({"obfs_mode":{}}),
+            json!({"obfs_mode":"tls", "obfs_host":7}),
+            json!({"obfs_mode":"http", "obfs_host":[]}),
+            json!({"version":6, "obfs_mode":"tls"}),
+            json!({"version":6, "obfs_mode":"http"}),
+        ] {
+            let mut raw = json!({"type":"snell", "server":"s.example", "server_port":443,
+                "version":4, "psk":"secret"});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let result = parse_with(json!({"outbounds":[raw]}), origin);
+            assert!(result.servers.is_empty());
+            assert_eq!((result.failed, result.skipped), (1, 0));
+        }
+        for mode in [
+            None,
+            Some(json!(null)),
+            Some(json!("")),
+            Some(json!("none")),
+        ] {
+            let mut raw = json!({"type":"snell", "server":"s.example", "server_port":443,
+                "version":4, "psk":"secret", "obfs_host":"inactive.example"});
+            if let Some(mode) = mode {
+                raw["obfs_mode"] = mode;
+            }
+            let result = parse_with(json!({"outbounds":[raw]}), origin);
+            let sn = result.servers[0].snell_settings.as_deref().unwrap();
+            assert!(sn.obfs_mode.is_none() && sn.obfs_host.is_none());
+        }
+    }
+}
+
+#[test]
+fn snell_native_versions_psk_and_v6_neighbors_keep_their_existing_contract() {
+    for version in [
+        json!(null),
+        json!(1),
+        json!(2),
+        json!(3),
+        json!(5),
+        json!(7),
+        json!("bad"),
+    ] {
+        let r = parse(json!({"outbounds":[{"type":"snell", "server":"s.example",
+            "server_port":443, "version":version, "psk":"secret"}]}));
+        assert_eq!((r.servers.len(), r.failed), (0, 1));
+    }
+    for extra in [
+        json!({}),
+        json!({"psk":"pw"}),
+        json!({"version":4}),
+        json!({"version":4,"psk":""}),
+        json!({"version":4,"psk":"  "}),
+    ] {
+        let mut raw = json!({"type":"snell", "server":"s.example", "server_port":443});
+        raw.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = parse(json!({"outbounds":[raw]}));
+        assert_eq!((r.servers.len(), r.failed), (0, 1));
+    }
+    for mode in [None, Some("unshaped"), Some("unsafe-raw")] {
+        let r = parse(
+            json!({"outbounds":[{"type":"snell", "server":"s.example", "server_port":443,
+            "version":6, "psk":"pw", "mode":mode, "obfs_host":"inactive.example",
+            "reuse":true,"network":"udp","userkey":"key"}]}),
+        );
+        let sn = r.servers[0].snell_settings.as_deref().unwrap();
+        assert_eq!(sn.version, 6);
+        assert_eq!(sn.mode.as_deref(), mode);
+        assert!(sn.obfs_mode.is_none() && sn.obfs_host.is_none());
+        assert_eq!(sn.reuse, Some(true));
+        assert_eq!(sn.network.as_deref(), Some("udp"));
+        assert_eq!(sn.userkey.as_deref(), Some("key"));
+    }
+}
+
+#[test]
+fn snell_share_saved_config_builder_and_native_reimport_preserve_tls_semantics() {
+    use polaris_config_engine::{builder::outbound::build_proxy_outbound, singbox::DomainResolver};
+    for mode in ["http", "tls"] {
+        for host in [None, Some(""), Some("Cover.Example")] {
+            let r = parse(
+                json!({"outbounds":[{"type":"snell", "server":"s.example", "server_port":443,
+                "version":4,"psk":"part1:part2+secret","obfs_mode":mode,"obfs_host":host}]}),
+            );
+            let encoded = crate::share_link::encode_share_url(&r.servers[0]).unwrap();
+            let imported =
+                crate::share_link::parse_share_url(&encoded, &mut id_gen(), &mut |_| {}).unwrap();
+            let saved: ServerConfig =
+                serde_json::from_value(serde_json::to_value(imported).unwrap()).unwrap();
+            let outbound = serde_json::to_value(
+                build_proxy_outbound(
+                    &saved,
+                    "snell-roundtrip",
+                    &DomainResolver::Tag("dns-bootstrap".into()),
+                    "x64",
+                    "linux",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(outbound["obfs_mode"], mode);
+            assert_eq!(outbound["psk"], "part1:part2+secret");
+            assert!(outbound.get("tls").is_none());
+            let expected_host = host
+                .filter(|h| !h.is_empty())
+                .or((mode == "http").then_some("bing.com"));
+            assert_eq!(
+                outbound.get("obfs_host").and_then(Value::as_str),
+                expected_host
+            );
+            let again = parse(json!({"outbounds":[outbound]}));
+            assert_eq!(again.servers.len(), 1);
+            assert_eq!(again.servers[0].protocol, Protocol::Snell);
+            let sn = again.servers[0].snell_settings.as_deref().unwrap();
+            assert_eq!(sn.obfs_mode.as_deref(), Some(mode));
+            assert_eq!(sn.obfs_host.as_deref(), expected_host);
+            assert_eq!(again.servers[0].password, saved.password);
+        }
     }
 }

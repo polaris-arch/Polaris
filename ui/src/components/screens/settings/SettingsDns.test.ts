@@ -14,7 +14,6 @@ import {
   normalizeDnsTimeoutInput,
   nextRacePool,
   parseDnsServerSpec,
-  reconcileCustomUpstreams,
 } from './SettingsDns';
 import {
   dnsGroupReferences,
@@ -31,6 +30,12 @@ import {
   DNS_PRESET_CUSTOM,
   domesticPresets,
   remotePresets,
+  canEnableRaceUpstream,
+  editNodeResolverInventory,
+  dnsUpstreamIdentity,
+  isPureIpDnsSpec,
+  nodeResolverTier1Count,
+  trimNodeDnsSpec,
 } from './settings-dns-logic';
 import type { UserConfig } from '@/contracts/types';
 
@@ -139,34 +144,18 @@ describe('DNS 资源表单校验', () => {
 
 describe('DoH 配置库存与启用池解耦', () => {
   it('Tier1 最多启用 3 个，system 不占额度', () => {
-    expect(nextRacePool(['ali', 'dnspod', 'doh-a'], 'doh-b', true)).toEqual(['ali', 'dnspod', 'doh-a']);
-    expect(nextRacePool(['ali', 'dnspod', 'doh-a'], 'system', true)).toEqual(['ali', 'dnspod', 'doh-a', 'system']);
+    const custom = [{ id: 'doh-a', spec: 'https://8.8.8.8/q' }, { id: 'doh-b', spec: 'tls://1.1.1.1' }];
+    expect(nextRacePool(['ali', 'dnspod', 'doh-a'], 'doh-b', true, custom)).toEqual(['ali', 'dnspod', 'doh-a']);
+    expect(nextRacePool(['ali', 'dnspod', 'doh-a'], 'system', true, custom)).toEqual(['ali', 'dnspod', 'doh-a', 'system']);
     expect(nextRacePool(['ali', 'dnspod', 'doh-a'], 'dnspod', false)).toEqual(['ali', 'doh-a']);
   });
 
-  it('配置列表不限量；原项编辑/重排保 id，新项只进入库存', () => {
-    const previous = [
-      { id: 'a', spec: 'https://1.1.1.1/dns-query' },
-      { id: 'b', spec: 'https://8.8.8.8/dns-query' },
-    ];
-    let n = 0;
-    const next = reconcileCustomUpstreams(
-      previous,
-      ['https://8.8.8.8/dns-query', 'https://9.9.9.9/dns-query', 'tls://1.0.0.1:853'],
-      () => `new-${++n}`
-    );
-    expect(next).toEqual([
-      previous[1],
-      { id: 'a', spec: 'https://9.9.9.9/dns-query' },
-      { id: 'new-1', spec: 'tls://1.0.0.1:853' },
-    ]);
-
-    const inserted = reconcileCustomUpstreams(
-      previous,
-      ['https://9.9.9.9/dns-query', 'https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'],
-      () => 'new-head'
-    );
-    expect(inserted.map((item) => item.id)).toEqual(['new-head', 'a', 'b']);
+  it('explicit row IDs survive edits/reorder; added inventory stays disabled', () => {
+    const previous = [{ id: 'a', spec: 'https://1.1.1.1/dns-query' }, { id: 'b', spec: 'https://8.8.8.8/dns-query' }];
+    const result = editNodeResolverInventory(previous, ['a'], [previous[1], { id: 'a', spec: 'https://9.9.9.9/dns-query' }, { spec: 'tls://1.0.0.1:853' }], () => 'new-1');
+    expect(result).toEqual({ ok: true, custom: [previous[1], { id: 'a', spec: 'https://9.9.9.9/dns-query' }, { id: 'new-1', spec: 'tls://1.0.0.1:853' }], pool: ['a'] });
+    const inserted = editNodeResolverInventory(previous, [], [{ spec: 'https://9.9.9.9/dns-query' }, ...previous], () => 'new-head');
+    expect(inserted.ok && inserted.custom.map(item => item.id)).toEqual(['new-head', 'a', 'b']);
   });
 });
 
@@ -386,13 +375,135 @@ describe('DNS 上游预设表：内容门（共享面，改表必须同时过两
 
 
 describe('N1 case-sensitive DNS upstream identity', () => {
-  it('keeps URL path/query case distinct while reconciling equivalent authority to one ID', () => {
-    const previous = [{ id: 'keep', spec: 'https://DNS.EXAMPLE:443/Query?Token=A' }];
-    const next = reconcileCustomUpstreams(previous,
-      ['https://dns.example/Query?Token=A', 'https://dns.example/query?Token=A', 'https://dns.example/Query?Token=a'],
-      (() => { let id = 0; return () => `new-${++id}`; })());
-    expect(next).toHaveLength(3);
-    expect(next[0].id).toBe('keep');
-    expect(new Set(next.map(item => item.id)).size).toBe(3);
+  it('canonicalizes authority without changing path/query data', () => {
+    expect(dnsUpstreamIdentity('https://DNS.EXAMPLE:443/Query?Token=A')).toBe(dnsUpstreamIdentity('https://dns.example/Query?Token=A'));
+    expect(new Set(['https://dns.example/Query?Token=A', 'https://dns.example/query?Token=A', 'https://dns.example/Query?Token=a'].map(dnsUpstreamIdentity)).size).toBe(3);
+  });
+});
+
+describe('pure-IP native DoT inventory and encrypted quota', () => {
+  it.each(['tls://1.1.1.1', 'tls://1.1.1.1:65535', 'tls://[2001:0DB8::1]:853'])('admits %s', spec => {
+    expect(isPureIpDnsSpec(spec)).toBe(true);
+  });
+  it.each(['tls://resolver.example', 'tls://1.1.1.1:0', 'tls://1.1.1.1:65536', 'tls://1.1.1.1/path', 'tls://1.1.1.1?sni=x', 'tls://user@1.1.1.1', 'tls://[::1]tail', 'tls://[::1]:', 'tls://[1.1.1.1]', 'tls://[:::]'])('rejects %s', spec => {
+    expect(isPureIpDnsSpec(spec)).toBe(false);
+  });
+  it('deduplicates default ports and normalized IPs but preserves protocol/path/query data', () => {
+    expect(dnsUpstreamIdentity('tls://[2001:0db8:0:0:0:0:0:1]')).toBe(dnsUpstreamIdentity('tls://[2001:db8::1]:0853'));
+    expect(dnsUpstreamIdentity('tls://1.1.1.1')).toBe(dnsUpstreamIdentity('tls://1.1.1.1:853'));
+    expect(dnsUpstreamIdentity('tls://1.1.1.1:853')).not.toBe(dnsUpstreamIdentity('https://1.1.1.1:853/q'));
+    expect(dnsUpstreamIdentity('https://1.1.1.1/Query?Token=A')).not.toBe(dnsUpstreamIdentity('https://1.1.1.1/query?Token=A'));
+    expect(dnsUpstreamIdentity('https://1.1.1.1/q?Token=A')).not.toBe(dnsUpstreamIdentity('https://1.1.1.1/q?Token=a'));
+  });
+  it('shares the quota across DoH/DoT while UDP/system and equivalent entries are free', () => {
+    const custom = [
+      { id: 'dot', spec: 'tls://1.1.1.1' }, { id: 'dup', spec: 'tls://1.1.1.1:853' },
+      { id: 'udp', spec: 'udp://9.9.9.9:5353' }, { id: 'extra', spec: 'tls://8.8.8.8' },
+      { id: 'bad', spec: 'tls://resolver.example' },
+    ];
+    const pool = ['ali', 'dnspod', 'dot'];
+    expect(nodeResolverTier1Count(pool, custom)).toBe(3);
+    expect(canEnableRaceUpstream(pool, 'extra', custom)).toBe(false);
+    for (const id of ['dup', 'udp', 'system']) expect(canEnableRaceUpstream(pool, id, custom)).toBe(true);
+    expect(nextRacePool(pool, 'extra', true, custom)).toEqual(pool);
+    expect(nextRacePool(pool, 'udp', true, custom)).toEqual([...pool, 'udp']);
+    expect(nextRacePool(pool, 'bad', true, custom)).toEqual(pool);
+    expect(nextRacePool([...pool, 'bad'], 'bad', false, custom)).toEqual(pool);
+  });
+});
+
+describe('identified node resolver inventory save transaction', () => {
+  it('deletes the selected source without enabling pre-existing duplicate targets', () => {
+    const previous = [{ id: 'a', spec: 'tls://1.1.1.1' }, { id: 'b', spec: 'tls://9.9.9.9' }, { id: 'c', spec: 'tls://9.9.9.9:853' }];
+    expect(editNodeResolverInventory(previous, ['a'], previous.slice(1), () => 'new')).toEqual({ ok: true, custom: [previous[1]], pool: [] });
+  });
+  it.each([
+    ['tls://1.1.1.1', 'tls://1.1.1.1'],
+    [' tls://1.1.1.1 ', 'tls://1.1.1.1'],
+    ['tls://1.1.1.1', 'tls://1.1.1.1:853'],
+    ['tls://[2001:0db8::1]', 'tls://[2001:db8::1]:853'],
+  ])('preserves either explicitly edited duplicate row: %s / %s', (left, right) => {
+    const previous = [{ id: 'a', spec: left }, { id: 'b', spec: right }];
+    for (const selected of ['a', 'b']) {
+      const rows = previous.map(item => ({ ...item, spec: item.id === selected ? 'tls://9.9.9.9' : item.spec }));
+      const edited = editNodeResolverInventory(previous, [selected], rows, () => 'new');
+      expect(edited).toMatchObject({ ok: true, pool: [selected] });
+      if (!edited.ok) throw new Error('valid edit rejected');
+      expect(edited.custom.find(item => item.id === selected)?.spec).toBe('tls://9.9.9.9');
+      const saved = JSON.parse(JSON.stringify(edited));
+      expect(editNodeResolverInventory(saved.custom, saved.pool, saved.custom, () => 'new')).toEqual(edited);
+      const deleted = editNodeResolverInventory(previous, [selected], previous.filter(item => item.id !== selected), () => 'new');
+      expect(deleted).toMatchObject({ ok: true, pool: [] });
+    }
+  });
+  it('maps only surviving aliases and retains selected order through reorder and unrelated edits', () => {
+    const previous = [{ id: 'a', spec: 'https://1.1.1.1' }, { id: 'b', spec: 'https://1.1.1.1/dns-query' }, { id: 'u', spec: 'udp://9.9.9.9' }];
+    const result = editNodeResolverInventory(previous, ['a', 'u', 'b', 'ali'], [previous[2], previous[1], previous[0], { spec: 'udp://8.8.8.8' }], () => 'new');
+    expect(result).toEqual({ ok: true, custom: [previous[2], previous[1], { id: 'new', spec: 'udp://8.8.8.8' }], pool: ['b', 'u', 'ali'] });
+    const changed = editNodeResolverInventory(previous, ['b'], [previous[0], previous[1], { id: 'u', spec: 'udp://9.9.9.9:5353' }], () => 'new');
+    expect(changed).toMatchObject({ ok: true, pool: ['a'] });
+  });
+  it('explicit edits into earlier/later existing endpoints differ from deletion', () => {
+    const previous = [{ id: 'a', spec: 'tls://1.1.1.1' }, { id: 'b', spec: 'tls://9.9.9.9' }];
+    for (const selected of ['a', 'b']) {
+      const target = previous.find(item => item.id !== selected)!;
+      expect(editNodeResolverInventory(previous, [selected], previous.map(item => ({ ...item, spec: target.spec })), () => 'new')).toMatchObject({ ok: true, pool: ['a'] });
+      expect(editNodeResolverInventory(previous, [selected], [target], () => 'new')).toMatchObject({ ok: true, pool: [] });
+    }
+  });
+  it('validates the complete edited quota before save and never mutates old data on rejection', () => {
+    for (const spec of ['udp://9.9.9.9', 'tls://1.1.1.1:853']) {
+      const previous = [{ id: 'dot', spec: 'tls://1.1.1.1' }, { id: 'u', spec }];
+      const pool = ['ali', 'dnspod', 'dot', 'u'];
+      const before = JSON.stringify({ previous, pool });
+      const rows = [previous[0], { id: 'u', spec: 'tls://9.9.9.9' }];
+      expect(editNodeResolverInventory(previous, pool, rows, () => 'new')).toEqual({ ok: false, error: 'quota' });
+      expect(JSON.stringify({ previous, pool })).toBe(before);
+      expect(editNodeResolverInventory(previous, ['ali', 'dnspod', 'dot'], rows, () => 'new')).toMatchObject({ ok: true, pool: ['ali', 'dnspod', 'dot'] });
+      expect(editNodeResolverInventory(previous, pool, [previous[0]], () => 'new')).toMatchObject({ ok: true, pool: ['ali', 'dnspod', 'dot'] });
+    }
+  });
+  it('keeps free Tier2/equivalent edits and inactive malformed inventory editable', () => {
+    const previous = [{ id: 'dot', spec: 'tls://1.1.1.1' }, { id: 'u', spec: 'udp://9.9.9.9' }, { id: 'bad', spec: 'tls://resolver.example' }];
+    const pool = ['ali', 'dnspod', 'dot', 'u', 'system'];
+    expect(editNodeResolverInventory(previous, pool, [{ id: 'dot', spec: 'tls://1.1.1.1:853' }, previous[1], previous[2], { spec: 'tls://8.8.8.8' }], () => 'new')).toMatchObject({ ok: true, pool });
+    expect(editNodeResolverInventory(previous, [...pool, 'bad'], previous, () => 'new')).toEqual({ ok: false, error: 'invalid' });
+    expect(editNodeResolverInventory([], [], [{ spec: 'tls://resolver.example' }], () => 'new')).toEqual({ ok: false, error: 'invalid' });
+    expect(editNodeResolverInventory(previous, pool, [previous[0], previous[1], { id: 'bad', spec: 'tls://8.8.8.8' }], () => 'new')).toMatchObject({ ok: true, pool });
+  });
+  it('uses builtin-first effective lookup for shadowed malformed and valid custom rows', () => {
+    const shadowed = [{ id: 'ali', spec: 'tls://resolver.example' }];
+    expect(editNodeResolverInventory(shadowed, ['ali'], [...shadowed, { spec: 'udp://9.9.9.9' }], () => 'new')).toEqual({ ok: true, custom: [...shadowed, { id: 'new', spec: 'udp://9.9.9.9' }], pool: ['ali'] });
+    expect(editNodeResolverInventory(shadowed, ['ali'], [], () => 'new')).toEqual({ ok: true, custom: [], pool: ['ali'] });
+    const valid = [{ id: 'ali', spec: 'tls://1.1.1.1' }, { id: 'custom', spec: 'tls://1.1.1.1:853' }];
+    expect(editNodeResolverInventory(valid, ['custom', 'ali'], valid, () => 'new')).toEqual({ ok: true, custom: valid, pool: ['custom', 'ali'] });
+  });
+  it('rejects stale or duplicate supplied IDs rather than guessing a source row', () => {
+    const previous = [{ id: 'a', spec: 'tls://1.1.1.1' }];
+    expect(editNodeResolverInventory(previous, ['a'], [{ id: 'unknown', spec: previous[0].spec }], () => 'new')).toEqual({ ok: false, error: 'invalid' });
+    expect(editNodeResolverInventory(previous, ['a'], [previous[0], previous[0]], () => 'new')).toEqual({ ok: false, error: 'invalid' });
+  });
+});
+
+describe('raw node authority and common Unicode edge admission', () => {
+  it.each(['https', 'tls', 'udp'])('rejects internal whitespace/control in %s authority', scheme => {
+    for (const authority of ['1.1.1.1\t:853', '1.1.1.1\n:853', '1.1.1.1\r:853', '1.1.1.1 :853', '1.1.1.1\u00a0:853', '1.1.1.1\u007f:853', '1.1.1.1\u0085:853', '1.1.1.1\ufeff:853', '[2001:db8::1\t]:853', '1.1.1.1:8\t53']) {
+      const spec = `${scheme}://${authority}${scheme === 'https' ? '/Query?Token=A%20B' : ''}`;
+      expect(isPureIpDnsSpec(spec)).toBe(false);
+      expect(editNodeResolverInventory([], [], [{ spec }], () => 'new')).toEqual({ ok: false, error: 'invalid' });
+    }
+  });
+  it.each([0x9,0xa,0xb,0xc,0xd,0x20,0x85,0xa0,0x1680,0x2000,0x2001,0x2002,0x2003,0x2004,0x2005,0x2006,0x2007,0x2008,0x2009,0x200a,0x2028,0x2029,0x202f,0x205f,0x3000,0xfeff].map(value => String.fromCodePoint(value)))('normalizes the same edge set across saved inventory toggle/reload: %j', edge => {
+    for (const spec of ['https://1.1.1.1/Query?Token=A%20B', 'tls://1.1.1.1', 'udp://1.1.1.1', '1.1.1.1', '[2001:db8::1]']) {
+      for (const raw of [edge + spec, spec + edge, edge + spec + edge]) {
+        expect(trimNodeDnsSpec(raw)).toBe(spec);
+        expect(isPureIpDnsSpec(raw)).toBe(true);
+        const previous = [{ id: 'saved', spec: raw }];
+        const pool = nextRacePool([], 'saved', true, previous);
+        expect(pool).toEqual(['saved']); // Toggle keeps raw bytes; native accepts the same edges.
+        const result = editNodeResolverInventory(previous, pool, previous, () => 'new');
+        expect(result).toEqual({ ok: true, custom: [{ id: 'saved', spec }], pool });
+      }
+    }
   });
 });

@@ -2412,6 +2412,16 @@ impl ProxyRuntime {
             return ClassifiedSwitch::Unchanged;
         }
 
+        // A raw binding change can filter accepted planning hosts even when the
+        // typed norm and selector plan are equal. Save keeps R intact; explicit
+        // Apply must generate from the accepted baseline and retain its physical
+        // TUN restart-choice gate. Never let selector/no-op commit this debt.
+        if super::tailnet_rules::tailnet_generation_identity(&old_value)
+            != super::tailnet_rules::tailnet_generation_identity(new_config)
+        {
+            return ClassifiedSwitch::Fallback("Tailnet 生成身份待显式应用");
+        }
+
         // 腿 2：解析 + 规划。
         // 任一侧解析失败 → 保守重启（fail-closed）：热切换靠精确 diff，解析不出就无从判断，
         // 保持待应用并等待显式处理，不能把无法判定的变更当成无操作成功。

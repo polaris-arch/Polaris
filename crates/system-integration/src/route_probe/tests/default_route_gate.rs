@@ -4,7 +4,7 @@
 //!
 //! 2026-09-13 w207 实测：Windows 内置 L2TP 连上之后，承载接口 `PolarisProbeL2TP` 宣告
 //! `0.0.0.0/0` metric 1（一条抢全部出站流量的全隧道），而它在展示面上**几乎看不见** ——
-//! 过完噪声过滤，同一接口只剩一条 `10.55.0.10/32`。用户读到的是「某个隧道宣告了一个 /32」，
+//! 过完噪声过滤，同一接口只剩一条 `10.55.0.27/32`。用户读到的是「某个隧道宣告了一个 /32」，
 //! 真实情况是「它要了全部流量」。
 //!
 //! # 两条判据，方向相反，缺一条这道门就只剩一半
@@ -91,13 +91,13 @@ fn wire(routes: &[RouteEntry]) -> Vec<ForeignTunnelRoute> {
 ///
 /// 三组都**取自真机**，不是为了凑绿编的：`198.18.0.0/15` 是 Polaris 的默认 FakeIP 段、
 /// `32.0.0.0/24` + `fd7a:115c:a1e0::/48` 是 2026-09-11 自建 headscale 实测的 tailnet 段、
-/// `10.8.0.1/24` 覆盖 w207 那台上 OpenVPN 的 `10.8.0.0/24`。
+/// `10.8.0.4/24` 覆盖 w207 那台上 OpenVPN 的 `10.8.0.0/24`。
 /// 三组都**能在这批抓取上真的命中**，前三类的「逐条不变」才有内容可比。
 fn criteria_ranges() -> ([String; 2], [String; 2], [String; 1]) {
     (
         ["198.18.0.0/15".into(), "2001:2::/48".into()],
         ["32.0.0.0/24".into(), "fd7a:115c:a1e0::/48".into()],
-        ["10.8.0.1/24".into()],
+        ["10.8.0.4/24".into()],
     )
 }
 
@@ -258,7 +258,7 @@ fn the_w207_ras_l2tp_tunnel_is_judged_to_contend_for_the_default_route() {
     assert!(
         route_print
             .lines()
-            .any(|l| l.contains("0.0.0.0") && l.contains("10.55.0.10")),
+            .any(|l| l.contains("0.0.0.0") && l.contains("10.55.0.27")),
         "`@@@ROUTE_PRINT_4` 里没有 {RAS_IFACE} 的默认路由 —— 本门没有输入"
     );
     let get_netroute = fixture_section(WIN_RAS, "GET_NETROUTE_4");
@@ -471,7 +471,7 @@ fn macos_interface_scoped_default_routes_are_not_claims() {
 
 /// Linux 的默认路由行**逐字没有 `/0`**，族只能由调用方给 —— 两条腿各自规范成对的前缀。
 ///
-/// 正样本取自 VM185 那份真机抓取：v4 是 `default via 192.168.10.1 dev ens18 …`、
+/// 正样本取自 VM185 那份真机抓取：v4 是 `default via 192.168.50.4 dev ens18 …`、
 /// v6 是 `default nhid … via fe80::… dev ens18 …`，两条都落在 `ens18`（不是隧道）上。
 #[test]
 fn linux_default_routes_are_normalized_per_family() {

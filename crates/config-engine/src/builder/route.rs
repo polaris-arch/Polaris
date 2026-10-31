@@ -479,7 +479,8 @@ pub fn build_route_config_with_report(
             dns_direct_cidrs.push(c);
         }
     }
-    // :53=UDP / :443=DoH（恒）。DoT(:853) 二期未实现——无 DoT 上游，不为永不工作的协议开无用端口。
+    // Application bootstrap exceptions only. Native node DNS (including DoT
+    // on 853/custom ports) uses core physical-interface binding, not route bypasses.
     let mut dns_ports: Vec<u32> = vec![53, 443];
     if let Some((_, port)) = &custom_domestic_dns {
         dns_ports.push(u32::from(*port));
@@ -992,7 +993,7 @@ pub fn build_route_config_with_report(
             //
             // **存在性检查是硬门，不是优化**：`NewLocalRuleSet` 在起核时首次 `reloadFile` 失败即
             // 返回 error、整个核起不来。故与 custom_rules 同款——文件不在就一个字节都不注册，
-            // 回落下面的 inline 腿（产出与本腿存在之前逐字节相同）。
+            // 回落下面的 inline 腿（无声明/host 的冷 TS 不发 CIDR 规则）。
             //
             // 存在性用 `ext_rule_file_exists`（真 `existsSync` 等价）而不是 `deps.is_valid_srs_fn`：
             // 这是 headless **JSON source**、不含 `SRS` 魔数，用魔数判会让本腿 100% 不可达
@@ -1009,12 +1010,9 @@ pub fn build_route_config_with_report(
             // `endpoint_forced_route_cidrs` 重算，结算侧看不见文件里装了什么，故两个走本腿的
             // 节点之间真相交了也报不出来。
             //
-            // 盲区的**面积已被本批缩小**：「默认段与观测段的优先级」那个待决策项已经决策 ——
-            // 有观测的节点不再发默认两段（见 `endpoint_routes::ObservedTailnetAddresses` 的
-            // 「# 语义」一节），于是两个**都有观测**的 TS 节点，两份文件里装的是各自 tailnet 的
-            // 主机地址，不再必然相交。残留的是「两个节点都还没有观测」那一格：两份文件都装默认
-            // 两段 ⇒ 真相交、字面量层仍看不见。那一格由下面的发射顺序兜住方向（谁先声明谁在前），
-            // 不由结算兜住计数。
+            // strict-all 冷态可能生成真正空规则集；已有文件仍按外化腿引用，供后续原子更新。
+            // 外化内容的真实 equal/containment 诊断由宿主 readback resolver 处理，
+            // 这里既不臆测文件内容，也不据 canonical 为空撤掉其引用。
             //
             // 文件未落盘 → 回落 inline。**缺席是常态不是故障**（A-0b 的观测/落盘腿没跑、
             // 节点还没连上控制面都会缺），故此处不置降级标记、不 warn，与 custom_rules 的
@@ -1040,7 +1038,7 @@ pub fn build_route_config_with_report(
         // ── 第一步半：排成发射顺序（有观测的节点整体在前）──────────────────────────
         //
         // **这条顺序是必需的，不是整洁**：sing-box 的 `route.rules` 按规则顺序 first-match，
-        // 不做最长前缀匹配。有观测的节点发 `/32`、无观测的节点发 `100.64.0.0/10` —— 两者字面
+        // 不做最长前缀匹配。有 host 输入的节点可发 `/32`，另一节点可显式声明 `/10` —— 两者字面
         // 不同 ⇒ 下面那次跨节点去重一条都拦不下，两条规则都会发出去。此时 `/10` 若排在前面，
         // 它把 `/32` 那条的流量整个吃掉，而产物里那条 `/32` 明明还在、逐条看一切正常。
         //

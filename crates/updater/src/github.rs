@@ -1,10 +1,10 @@
 //! GitHub release JSON → 更新检查结果的**纯逻辑**转换 + 平台/架构资产选择 + 更新源常量。
 //!
-//! ## 移植来源（上游 TS → Rust 纯逻辑，逐字保留行为）
+//! ## 移植来源（上游 TS → Rust 纯逻辑）
 //!
 //! - `UpdateService.fetchReleases`（`UpdateService.ts:843`）+ `UpdateService.checkForUpdate`
-//!   （`:146-240`）：拉 `api.github.com/repos/{owner}/{repo}/releases` → 过滤 prerelease → 按
-//!   `published_at` 降序取最新 → 去 `v` 前缀 → `compareSemver` 判新 → `findSuitableAsset` 挑平台包
+//!   （`:146-240`）：拉 `api.github.com/repos/{owner}/{repo}/releases` → 过滤 prerelease →
+//!   本仓按版本优先选择 release → 去 `v` 前缀 → `compareSemver` 判新 → `findSuitableAsset` 挑平台包
 //!   → 组装 `UpdateInfo`。本模块把**除网络获取以外**的全部逻辑抽成纯函数 [`check_app_update`]
 //!   （吃已拉回的 JSON 字节，宿主注入 HTTP），可 mock 单测。
 //! - `update-asset.findSuitableUpdateAsset`（`update-asset.ts`，52 行）：App 安装包资产选择
@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::ManifestError;
-use crate::version::compare_semver;
+use crate::version::{compare_semver, is_valid_release_version};
 
 // ── 更新源仓库常量（单点定义，宿主不得自造第二份）────────────────────────────────
 
@@ -234,33 +234,41 @@ pub fn strip_v(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
-/// 挑更新目标 release：过滤 prerelease 后按 `published_at` **降序取最新**
-/// （= 上游 `validReleases.sort((a,b) => dateB - dateA)[0]`）。
+/// 过滤通道与坏版本后选择语义版本最高的 release；发布时间不能改变不同版本的优先级。
 ///
-/// `published_at` 为 RFC3339 UTC（固定宽度、恒带 `Z`），字典序 == 时间序，故直接比字符串等价于
-/// 上游的 `new Date(...).getTime()` 比较，且零依赖、无需日期解析。缺失 `published_at`（草稿等）
-/// 按空串处理（排到最旧，仅当它是唯一候选才被选中——对齐 上游 `new Date(null)=epoch0` 沉底）。
-fn select_update_release(
-    releases: &[GithubRelease],
+/// SemVer 等价时沿用 GitHub UTC 时间字符串合同，优先较新的 `published_at`（缺省最旧），
+/// 再按原始 tag 字典序取较大者；时间与 tag 都相同时保留响应中的第一条。
+/// 跳过版本与资产选择均在此后处理，不回落到旧版本。
+fn select_update_release<'a>(
+    releases: impl IntoIterator<Item = &'a GithubRelease>,
     include_prerelease: bool,
-) -> Option<&GithubRelease> {
+) -> Option<&'a GithubRelease> {
     releases
-        .iter()
+        .into_iter()
         .filter(|r| include_prerelease || !r.prerelease)
-        .max_by(|a, b| {
-            a.published_at
+        .filter(|r| is_valid_release_version(&r.tag_name))
+        .reduce(|selected, candidate| {
+            let order = compare_semver(&candidate.tag_name, &selected.tag_name).unwrap_or(0);
+            let tie_order = candidate
+                .published_at
                 .as_deref()
                 .unwrap_or("")
-                .cmp(b.published_at.as_deref().unwrap_or(""))
+                .cmp(selected.published_at.as_deref().unwrap_or(""))
+                .then_with(|| candidate.tag_name.cmp(&selected.tag_name));
+            if order > 0 || (order == 0 && tie_order.is_gt()) {
+                candidate
+            } else {
+                selected
+            }
         })
 }
 
 /// 检查 App 更新（移植 `UpdateService.checkForUpdate` 的纯逻辑部分）。
 ///
-/// 步骤（逐字对齐 `UpdateService.ts:151-212`）：
+/// 步骤（基于 `UpdateService.ts:151-212`，发现策略采用版本优先）：
 ///  1. 解析 releases JSON（网络获取由宿主注入，本函数只吃已拉回的字节 → 纯逻辑可单测）。
-///  2. 过滤 prerelease + 按 `published_at` 降序取最新（`select_update_release`）。
-///  3. 去 `v` 前缀 → `compare_semver > 0` 判新（空/不可解析按**无更新**处理，失败安全）。
+///  2. 过滤 prerelease + 按语义版本取最高版本（`select_update_release`）。
+///  3. 去 `v` 前缀 → `compare_semver > 0` 判新（空版本按**无更新**处理）。
 ///  4. 命中用户「跳过此版本」→ 无更新。
 ///  5. [`find_suitable_update_asset`] 挑平台/架构/形态资产；无适配 → 无更新。
 ///  6. 组装 [`AppUpdateInfo`]（`version` 保留原始 tag，对齐 上游）。
@@ -333,7 +341,7 @@ pub fn check_app_update_release_only(
     )
 }
 
-/// 两条检查腿共用的前四道闸：解析 → 取通道内最新 → 比版本 → 跳过此版本。
+/// 两条检查腿共用的前四道闸：解析 → 取通道内最高版本 → 比版本 → 跳过此版本。
 ///
 /// 抽出来是**为了让两条腿不可能漂**：这四件事里任何一件在某一条腿上写歪，
 /// 表现都是「一个平台提示更新、另一个平台不提示」，而两侧各自的单测都绿。
@@ -354,7 +362,7 @@ fn newer_release_then(
 
     let latest_version = strip_v(&release.tag_name);
 
-    // 必须比 current 新（compare_semver 对空串/不可解析报错 → 失败安全按无更新，绝不误报有更新）。
+    // 必须比 current 新；空版本比较失败时按无更新处理。
     let is_newer = compare_semver(latest_version, current_version)
         .map(|ord| ord > 0)
         .unwrap_or(false);
@@ -392,11 +400,11 @@ fn release_only_update_info(release: &GithubRelease) -> AppUpdateInfo {
     }
 }
 
-/// 解析所选通道的最新 release，并且仅在它与当前安装版本**完全相同**时返回安装清单。
+/// 在所选通道中独立查找与当前安装版本语义等价的 release，返回它的安装清单。
 ///
 /// 这是设置页“重新下载当前版本”的解析腿：下载、摘要校验与安装仍复用既有命令；这里仅放宽
-/// “必须更高版本”这一道发现策略。比当前版本旧或新都返回 [`AppUpdateCheck::NoUpdate`]，因此不会
-/// 借“重新安装”之名静默降级，也不会把真正的新版本伪装成同版本重装。
+/// “必须更高版本”这一道发现策略。其他版本不参与选择，因此更高或发布时间更晚的低版本
+/// 都不能遮住当前版本，也不会借“重新安装”之名静默升级或降级。
 pub fn resolve_current_app_release(
     releases_json: &str,
     current_version: &str,
@@ -408,15 +416,12 @@ pub fn resolve_current_app_release(
     let releases: Vec<GithubRelease> =
         serde_json::from_str(releases_json).map_err(|e| ManifestError::ParseJson(e.to_string()))?;
 
-    let Some(release) = select_update_release(&releases, include_prerelease) else {
+    let current_releases = releases
+        .iter()
+        .filter(|release| compare_semver(strip_v(&release.tag_name), current_version) == Ok(0));
+    let Some(release) = select_update_release(current_releases, include_prerelease) else {
         return Ok(AppUpdateCheck::NoUpdate);
     };
-    let is_current = compare_semver(strip_v(&release.tag_name), current_version)
-        .map(|ord| ord == 0)
-        .unwrap_or(false);
-    if !is_current {
-        return Ok(AppUpdateCheck::NoUpdate);
-    }
 
     Ok(app_update_info_for_release(
         release, platform, arch, loose_form,

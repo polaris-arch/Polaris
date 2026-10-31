@@ -62,7 +62,10 @@ export type ProtoCodecErrorCode =
   | 'certPinInvalid'
   | 'derpServerInvalid'
   | 'extraJsonInvalid'
-  | 'torArgsInvalid';
+  | 'torArgsInvalid'
+  | 'openvpnTlsCipher'
+  | 'openvpnCipherValueInvalid'
+  | 'openvpnCipherListConflict';
 
 /**
  * 编解码层只抛稳定错误码；面向用户的文案由 NodeDialog 按当前 locale 渲染。
@@ -647,6 +650,32 @@ const textToBag = (v: unknown, field: string): Record<string, unknown> => {
   return parsed as Record<string, unknown>;
 };
 
+// OpenVPN cipher fields remain flattened extension keys; do not model them for other protocols.
+const OPENVPN_CIPHER_KEYS = ['data_ciphers', 'data_ciphers_fallback'] as const;
+function openvpnCipherText(value: unknown, listable = true): string {
+  if (value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (listable && Array.isArray(value) && value.every((item) => typeof item === 'string')) return value.join(', ');
+  // Invalid imported values remain visible and must be corrected explicitly before saving.
+  return JSON.stringify(value);
+}
+function openvpnCipherValue(
+  value: FormValue, base: unknown, extra: Record<string, unknown>,
+  key: typeof OPENVPN_CIPHER_KEYS[number], field: string,
+): unknown {
+  const validate = (raw: unknown, errorField: string): unknown => {
+    if (typeof raw === 'string' || (key === 'data_ciphers' && Array.isArray(raw) && raw.every((item) => typeof item === 'string'))) return raw;
+    throw new ProtoCodecError('openvpnCipherValueInvalid', undefined, errorField);
+  };
+  if (Object.prototype.hasOwnProperty.call(extra, key)) {
+    if (str(value)) throw new ProtoCodecError('openvpnCipherListConflict', undefined, 'extraJson');
+    return validate(extra[key], 'extraJson');
+  }
+  // Preserve imported shapes when unchanged. Only data_ciphers accepts an array; fallback is a string.
+  if (base !== undefined && value === openvpnCipherText(base, key === 'data_ciphers')) return validate(base, field);
+  return key === 'data_ciphers' ? listFromText(value) : str(value);
+}
+
 export const protoCodec: Record<NodeProto, ProtoCodec> = {
   vless: {
     fromConfig(cfg) {
@@ -897,12 +926,14 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.ovpnKey = cfg.openvpnClientSettings?.tls?.client_key?.join('\n') ?? '';
       d.network = cfg.openvpnClientSettings?.network ?? '';
       d.cipher = cfg.openvpnClientSettings?.cipher ?? '';
+      d.ovpnDataCiphers = openvpnCipherText(cfg.openvpnClientSettings?.data_ciphers);
+      d.ovpnDataCiphersFallback = openvpnCipherText(cfg.openvpnClientSettings?.data_ciphers_fallback, false);
       d.ovpnAuth = cfg.openvpnClientSettings?.auth ?? '';
       d.mtu = cfg.openvpnClientSettings?.mtu;
       d.redirectGw = cfg.openvpnClientSettings?.redirect_gateway !== false;
       d.sysIface = cfg.openvpnClientSettings?.system === true;
       d.meshRoutes = (cfg.meshRoutes ?? []).join('\n');
-      d.extraJson = bagToText(bagOf(cfg.openvpnClientSettings));
+      d.extraJson = bagToText(bagOf(cfg.openvpnClientSettings, [...MODELED_SETTING_KEYS, ...OPENVPN_CIPHER_KEYS]));
       d.ovpnTlsExtraJson = bagToText(openvpnTlsBagOf(cfg.openvpnClientSettings?.tls));
       return d;
     },
@@ -912,6 +943,10 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         return t ? t.split(/\r?\n/).map((x) => x.trim()).filter(Boolean) : undefined;
       };
       const extra = textToBag(draft.extraJson, 'extraJson');
+      const cipher = draft.cipher === undefined ? base.openvpnClientSettings?.cipher : str(draft.cipher);
+      if (extra.mode !== 'static_key' && (cipher !== undefined || (extra.cipher !== undefined && extra.cipher !== ''))) {
+        throw new ProtoCodecError('openvpnTlsCipher', undefined, extra.cipher !== undefined ? 'extraJson' : 'cipher');
+      }
       return {
         ...base,
         meshRoutes: cidrLines(draft.meshRoutes),
@@ -923,7 +958,9 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           username: str(draft.user),
           password: credential(draft.pwd),
           network: str(draft.network),
-          cipher: str(draft.cipher),
+          cipher,
+          data_ciphers: openvpnCipherValue(draft.ovpnDataCiphers, base.openvpnClientSettings?.data_ciphers, extra, 'data_ciphers', 'ovpnDataCiphers'),
+          data_ciphers_fallback: openvpnCipherValue(draft.ovpnDataCiphersFallback, base.openvpnClientSettings?.data_ciphers_fallback, extra, 'data_ciphers_fallback', 'ovpnDataCiphersFallback'),
           auth: str(draft.ovpnAuth),
           mtu: num(draft.mtu),
           // 关闭时**显式写 false**，不留缺省：这个开关的关态正是「只走声明的内网段、其余直连」那个
@@ -1373,8 +1410,11 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           ...base.snellSettings,
           version,
           // obfs（v4）/ mode（v6）互斥——非当前分支的一侧提交时清空，防脏下发（node-spec.ts 文件头注释）。
-          obfsMode: version === 4 ? (str(draft.obfsMode) as 'none' | 'http' | undefined) : undefined,
-          obfsHost: version === 4 && draft.obfsMode === 'http' ? str(draft.obfsHost) : undefined,
+          obfsMode: version === 4 ? (str(draft.obfsMode) as 'none' | 'http' | 'tls' | undefined) : undefined,
+          // v4 http/tls retain explicit hosts; omission delegates to the core.
+          // none/v6 still clear the inactive host.
+          obfsHost: version === 4 && (draft.obfsMode === 'http' || draft.obfsMode === 'tls')
+            ? str(draft.obfsHost) : undefined,
           mode: version === 6 ? (str(draft.mode) as 'default' | 'unshaped' | 'unsafe-raw' | undefined) : undefined,
           reuse: draft.reuse === true ? true : undefined,
           network: str(draft.network) as 'tcp' | 'udp' | undefined,

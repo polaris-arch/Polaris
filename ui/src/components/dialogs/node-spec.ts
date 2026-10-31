@@ -11,7 +11,7 @@
  * 条件显隐（原型 `ndSyncCond` :3707）：安全层 sec 驱动 tls/reality 字段——
  *  - `whenTls`：sec ∈ {tls, reality} 时显（tls 字段在 reality 下也需要，如 SNI）；
  *  - `whenReality`：sec === reality 时显（Reality 公钥 / Short ID）。
- *  - `whenSnellV4`/`whenSnellV6`/`whenSnellObfsHttp`：Snell version 驱动 obfs（v4）/ mode（v6）互斥分支。
+ *  - `whenSnellV4`/`whenSnellV6`/`whenSnellObfsHost`：Snell version 驱动 obfs（v4）/ mode（v6）互斥分支。
  *
  * i18n：本表**只写键、不写 zh 缺省**（2026-08-07）。99 个 `node.field.*` 键已五语齐备（`0b0c186` 铺 95 条，本批拆标签再添 4 条 hint），
  * 再留一份 `zh:` 就是第二个真值源 —— 而它与 locale 谁在生效**在界面上看不出来**：`t(key, zh)` 只在
@@ -330,6 +330,13 @@ export const whenMuxAvail = (v: FormValues): boolean =>
   !String(v.flow ?? '').toLowerCase().includes('vision');
 export const whenMux = (v: FormValues): boolean => v.mux === true && whenMuxAvail(v);
 
+const whenOpenvpnStaticKey = (v: FormValues): boolean => {
+  try { return JSON.parse(String(v.extraJson || '{}'))?.mode === 'static_key'; }
+  catch { return false; } // Invalid JSON is reported by the existing save validation.
+};
+const whenOpenvpnTls = (v: FormValues): boolean => !whenOpenvpnStaticKey(v);
+const whenOpenvpnCipher = (v: FormValues): boolean => whenOpenvpnStaticKey(v) || String(v.cipher ?? '').trim() !== '';
+
 /**
  * 传输层参数三件套（vless / vmess / trojan 共用）—— **这三颗控件缺席时传输下拉是「选了就废」**：
  * 选 ws 后 `generate_transport_config` 落 `path: "/"`（`ws.and_then(path).unwrap_or("/")`），
@@ -481,7 +488,8 @@ const F_MUX: FieldSpec[] = [
 // Snell version 驱动的互斥分支谓词（obfs 系仅 v4 / mode 系仅 v6，sing-box check 实证互斥）。
 const whenSnellV4 = (v: FormValues): boolean => v.version === '4';
 const whenSnellV6 = (v: FormValues): boolean => v.version === '6';
-const whenSnellObfsHttp = (v: FormValues): boolean => v.version === '4' && v.obfsMode === 'http';
+const whenSnellObfsHost = (v: FormValues): boolean =>
+  v.version === '4' && (v.obfsMode === 'http' || v.obfsMode === 'tls');
 
 // Hysteria2 gecko obfs 的随机填充包长仅 gecko 有意义（salamander 忽略）——非 gecko 隐藏防误填脏下发。
 const whenObfsGecko = (v: FormValues): boolean => v.obfs === 'gecko';
@@ -740,8 +748,8 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       { t: 'text', k: 'pwd', label: 'node.field.psk', mono: true },
     ],
     adv: [
-      { t: 'select', k: 'obfsMode', label: 'node.field.obfsMode', options: [['none', 'none'], ['http', 'http']], when: whenSnellV4 },
-      { t: 'text', k: 'obfsHost', label: 'node.field.obfsHost', ph: 'bing.com', when: whenSnellObfsHttp, opt: true },
+      { t: 'select', k: 'obfsMode', label: 'node.field.obfsMode', options: [['none', 'none'], ['http', 'http'], ['tls', 'tls']], when: whenSnellV4 },
+      { t: 'text', k: 'obfsHost', label: 'node.field.obfsHost', ph: 'example.com', when: whenSnellObfsHost, opt: true },
       { t: 'select', k: 'mode', label: 'node.field.snellMode', options: [['default', 'default'], ['unshaped', 'unshaped'], ['unsafe-raw', 'unsafe-raw']], when: whenSnellV6 },
       { t: 'select', k: 'network', label: 'node.field.net', options: [['', 'tcp+udp'], ['tcp', 'TCP'], ['udp', 'UDP']] },
       { t: 'switch', k: 'reuse', label: 'node.field.reuse', hint: 'node.field.reuseHint' },
@@ -902,7 +910,9 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
         id: 'advanced',
         fields: [
           { t: 'select', k: 'network', label: 'node.field.net', options: [['', 'UDP (default)'], ['tcp', 'TCP'], ['udp', 'UDP']] },
-          { t: 'text', k: 'cipher', label: 'node.field.cipher', ph: 'AES-256-GCM', opt: true },
+          { t: 'text', k: 'ovpnDataCiphers', label: 'node.field.ovpnDataCiphers', ph: 'AES-256-GCM, AES-128-GCM', opt: true, when: whenOpenvpnTls },
+          { t: 'text', k: 'ovpnDataCiphersFallback', label: 'node.field.ovpnDataCiphersFallback', ph: 'AES-128-CBC', opt: true, when: whenOpenvpnTls },
+          { t: 'text', k: 'cipher', label: 'node.field.ovpnStaticCipher', hint: 'node.field.ovpnStaticCipherHint', ph: 'AES-256-CBC', opt: true, when: whenOpenvpnCipher },
           { t: 'text', k: 'ovpnAuth', label: 'node.field.ovpnAuth', ph: 'SHA256', opt: true },
           { t: 'number', k: 'mtu', label: 'node.field.mtu', opt: true },
           { t: 'textarea', k: 'ovpnTlsExtraJson', label: 'node.field.ovpnTlsExtraJson', hint: 'node.field.ovpnTlsExtraJsonHint', mono: true, rows: 4, opt: true },

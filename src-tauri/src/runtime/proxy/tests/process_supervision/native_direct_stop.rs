@@ -1,8 +1,8 @@
 use super::*;
 #[cfg(unix)]
-use crate::runtime::proxy::mesh_apply::owner_proof::{ATTACHED, FACTORY_ENTERED, RETIRED};
+use crate::runtime::core_execution::TokioSpawner;
 #[cfg(unix)]
-use polaris_core_supervisor::{SingBoxSpawner, TokioSpawner};
+use crate::runtime::proxy::mesh_apply::owner_proof::{ATTACHED, FACTORY_ENTERED, RETIRED};
 use std::future::{poll_fn, Future};
 use std::io;
 use std::process::ExitStatus;
@@ -37,13 +37,16 @@ impl NativeWaitIo {
 }
 
 impl DirectStopIo for NativeWaitIo {
-    fn try_wait(&self, child: &mut tokio::process::Child) -> io::Result<Option<ExitStatus>> {
+    fn try_wait(
+        &self,
+        child: &mut crate::runtime::core_child::Child,
+    ) -> io::Result<Option<ExitStatus>> {
         child.try_wait()
     }
 
     fn poll_wait(
         &self,
-        child: &mut tokio::process::Child,
+        child: &mut crate::runtime::core_child::Child,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<ExitStatus>> {
         let previous = self.waits.fetch_add(1, Ordering::SeqCst);
@@ -61,7 +64,7 @@ impl DirectStopIo for NativeWaitIo {
         }
     }
 
-    fn terminate(&self, child: &mut tokio::process::Child) -> io::Result<()> {
+    fn terminate(&self, child: &mut crate::runtime::core_child::Child) -> io::Result<()> {
         self.terms.fetch_add(1, Ordering::SeqCst);
         if matches!(self.fault, WaitFault::Native) {
             // A local sleep stand-in has no graceful shutdown work to exercise.
@@ -70,7 +73,7 @@ impl DirectStopIo for NativeWaitIo {
         Ok(())
     }
 
-    fn start_kill(&self, child: &mut tokio::process::Child) -> io::Result<()> {
+    fn start_kill(&self, child: &mut crate::runtime::core_child::Child) -> io::Result<()> {
         self.kills.fetch_add(1, Ordering::SeqCst);
         if self.kill_error {
             return Err(io::Error::other("injected owned Child kill failure"));
@@ -84,13 +87,14 @@ impl DirectStopIo for NativeWaitIo {
 
 async fn install_main_run(
     rt: &Arc<ProxyRuntime>,
-    child: tokio::process::Child,
+    child: impl Into<crate::runtime::core_child::Child>,
     recorded_pid: u32,
     server_id: &str,
 ) -> (
     RunIdentity,
     crate::runtime::tailscale_login_core::MainBirthToken,
 ) {
+    let child = child.into();
     let gate = rt.mesh.tailscale_state_gate().await;
     let state = rt.mesh.tailscale_state_dir(server_id).unwrap();
     let token = rt.mesh.mint_tailscale_main_birth();
@@ -148,7 +152,7 @@ fn native_fixture_request(
 ) -> polaris_core_supervisor::SpawnRequest {
     let binary = dir.join("native-child-fixture.sh");
     crate::test_support::write_executable_stand_in(&binary, "#!/bin/sh\nexec sleep 30\n");
-    polaris_core_supervisor::SpawnRequest::new(
+    polaris_core_supervisor::SpawnRequest::unadmitted_intent(
         binary,
         dir.join("ignored-native-fixture-config"),
         stdio,
@@ -985,7 +989,7 @@ async fn synchronous_drain_panic_retains_factory_entered_unknown_after_dispatch_
     // `true` exits immediately; the permitted stand-in never launches a core.
     // Resolved through PATH like the `sleep` custody stand-in: `/bin/true` does
     // not exist on macOS, where a failed spawn returns before Drain is invoked.
-    let request = polaris_core_supervisor::SpawnRequest::new(
+    let request = polaris_core_supervisor::SpawnRequest::unadmitted_intent(
         "true",
         "/unused-fixture-config",
         polaris_core_supervisor::StdioPolicy::drain(|_stdout, _stderr| {

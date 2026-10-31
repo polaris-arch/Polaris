@@ -16,13 +16,15 @@
 //!
 //! ## `unsafe_code` 政策
 //!
-//! crate 根是 `deny`（不是 `forbid`）：默认禁 unsafe，只有 Windows 进程接口的两个模块
+//! crate 根是 `deny`（不是 `forbid`）：默认禁 unsafe；Windows 进程接口的两个模块
 //! （`job_object`、`stale_core::windows`，均为 `cfg(windows)`）在具体 item 上局部放开，每处
 //! 带 `SAFETY` 说明。作业对象与进程命令行读取只有 Win32 / NT 接口可用，没有 std 途径。
-//! 与 `polaris-helper` 的做法相同；非 Windows 目标上本 crate 仍然零 unsafe。
+//! Linux 准入模块仅在 ACL 观察、child-only FD 配置和 Helper 降权 syscall 的窄函数放开；
+//! 所有分配发生于 fork 前，实际 std/Tokio exec 错误管道与原 Child custody 保留。
 
 #![deny(unsafe_code)]
 
+pub mod admitted_payload;
 /// 起核前的内核闸门：拿即将下发的 config 真跑 `sing-box check`，把内核点名拒收的节点剥掉。
 pub mod config_gate;
 pub mod crash_recovery;
@@ -33,7 +35,10 @@ pub mod job_object;
 pub mod lifecycle_gate;
 pub mod port_bookkeeping;
 pub mod process_killer;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod protected_install_path;
 pub mod readiness_gate;
+pub mod selected_core;
 pub mod spawner;
 pub mod stale_core;
 
@@ -61,8 +66,8 @@ pub use readiness_gate::{
     CORE_STARTUP_PER_NODE_US,
 };
 pub use spawner::{
-    ChildStream, SingBoxSpawner, SpawnError, SpawnRequest, SpawnedChild, StdioPolicy, StdioSink,
-    TokioSpawner,
+    ChildStream, CustodiedChild, SingBoxSpawner, SpawnError, SpawnRequest, SpawnedChild,
+    StdioPolicy, StdioSink, TokioSpawner,
 };
 pub use stale_core::{
     app_run_config_name, is_our_core, macos_ps, owner_from_uid, process_owner_uid,

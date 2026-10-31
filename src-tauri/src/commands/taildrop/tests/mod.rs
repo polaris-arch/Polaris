@@ -296,3 +296,80 @@ fn streamed_path_saves_use_exclusive_raii_staging() {
     assert!(!body.contains("with_extension"));
     assert!(code.contains(".create_new(true)"));
 }
+
+#[tokio::test]
+async fn cancellation_watch_joins_while_opening_and_on_owner_drop() {
+    for owner_drop in [false, true] {
+        let (sender, mut receiver) = tokio::sync::watch::channel(false);
+        let mut waiter = tokio::spawn(async move {
+            super::cancellation_requested(&mut receiver).await;
+        });
+        sender.send(false).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "false updates do not cancel an opening"
+        );
+        if owner_drop {
+            drop(sender);
+        } else {
+            sender.send(true).unwrap();
+        }
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
+        if joined.is_err() {
+            waiter.abort();
+            let _ = waiter.await;
+        }
+        joined.expect("opening cancellation must join").unwrap();
+    }
+    let (_sender, mut receiver) = tokio::sync::watch::channel(true);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        super::cancellation_requested(&mut receiver),
+    )
+    .await
+    .expect("a cancellation predating opening is immediately visible");
+}
+
+#[test]
+fn opening_cancellation_encloses_transfer_and_preserves_real_file_boundaries() {
+    let code = crate_code("commands/taildrop.rs");
+    let opening = top_level_fn_body(&code, "async fn perform_managed_send(");
+    let header = opening.find(".start_taildrop_send(").unwrap();
+    let sending = opening.find("runtime.mark_sending(task_id, sink)").unwrap();
+    let split = opening.find("session.into_parts()").unwrap();
+    assert!(header < sending && sending < split);
+    assert!(opening.contains("let send = write_taildrop_input(input, request.files);"));
+    assert!(
+        opening.contains("let receive = drain_taildrop_output(output, runtime, task_id, sink);")
+    );
+    assert!(opening.contains("tokio::select!"));
+    assert!(opening.contains("Ok(_) => receive.await"));
+    assert!(opening.contains("Ok(()) => send.await.map(drop)"));
+    assert_eq!(opening.matches("Err(error) => Err(error)").count(), 2);
+
+    let managed = top_level_fn_body(&code, "async fn run_managed_send(");
+    assert!(managed
+        .contains("let transfer = perform_managed_send(request, &runtime, &task_id, &sink);"));
+    assert!(managed.contains("tokio::pin!(transfer)"));
+    let biased = managed.find("biased;").unwrap();
+    let cancel = managed
+        .find("() = cancellation_requested(&mut cancel) => None")
+        .unwrap();
+    let transfer = managed
+        .find("result = &mut transfer => Some(result)")
+        .unwrap();
+    assert!(biased < cancel && cancel < transfer);
+    assert!(managed.contains("None => runtime.canceled(&task_id, &sink)"));
+
+    let writer = top_level_fn_body(&code, "async fn write_taildrop_input(");
+    assert!(code.contains("const SEND_CHUNK_SIZE: usize = 64 * 1024;"));
+    assert!(writer.contains("vec![0u8; SEND_CHUNK_SIZE]"));
+    assert!(writer.contains(".send_chunk(buffer[..read].to_vec())"));
+    assert!(
+        writer.find("if file_bytes != selected.size").unwrap()
+            < writer.find(".finish_file()").unwrap()
+    );
+    assert!(writer.contains("ERR_READ"));
+    assert!(writer.contains("Ok(total)"));
+}

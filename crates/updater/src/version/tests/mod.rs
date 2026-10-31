@@ -63,3 +63,52 @@ fn compare_semver_empty_errors() {
     assert_eq!(compare_semver("", "1.0.0"), Err(ParseVersionError::Empty));
     assert_eq!(compare_semver("1.0.0", ""), Err(ParseVersionError::Empty));
 }
+
+#[test]
+fn release_validation_rejects_lossy_or_malformed_parts_without_changing_legacy_comparison() {
+    for version in [
+        "",
+        "v",
+        "nightly",
+        "999.garbage",
+        "999..1",
+        "999.0.0-",
+        "999.0.0-alpha..1",
+        "999.0.0-alpha!",
+        "999.0.0+",
+        "999.0.0+build..1",
+        "999.0.0+build+other",
+        "18446744073709551616.0.0",
+    ] {
+        assert!(
+            !is_valid_release_version(version),
+            "bad release tag: {version}"
+        );
+    }
+    // Public callers retain the legacy coercion behavior; only release discovery rejects bad tags.
+    assert_eq!(compare_semver("999.garbage", "999.0"), Ok(0));
+    assert_eq!(compare_semver("999.0.0-", "999.0.0"), Ok(0));
+    assert_eq!(compare_semver("1.2.3+build+other", "1.2.3"), Ok(0));
+}
+
+#[test]
+fn release_validation_shares_prefix_segment_and_build_parsing_with_comparison() {
+    for version in [
+        "v1.2.3",
+        " V1.2.3 ",
+        "1.2",
+        "1.2.3.4",
+        "01.02.03",
+        "1.2.3-alpha.10+build-1.2",
+    ] {
+        assert!(
+            is_valid_release_version(version),
+            "supported release tag: {version}"
+        );
+    }
+    assert_eq!(
+        compare_semver("v1.2.3-alpha.10+build-1.2", "1.2.3-alpha.10+other"),
+        Ok(0)
+    );
+    assert_eq!(compare_semver("1.2.3+alpha.999", "1.2.3-alpha.10"), Ok(1));
+}

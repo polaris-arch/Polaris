@@ -133,13 +133,18 @@ secure_dir() {{
   [ "${{SECURITY%%:*}}" = 0 ] || {{ echo HELPER_INSTALL_DIRECTORY_OWNER_INVALID >&2; exit 1; }}
   MODE=${{SECURITY#*:}}
   case "$MODE" in ''|*[!0-7]*) echo HELPER_INSTALL_DIRECTORY_MODE_INVALID >&2; exit 1;; esac
-  [ "$((0$MODE & 022))" -eq 0 ] || {{ echo HELPER_INSTALL_DIRECTORY_WRITABLE >&2; exit 1; }}
+{writable_failure}
 {native_directory_check}}}
 "#,
         owner_mode = if mac {
             "stat -f '%u:%Lp' \"$1\""
         } else {
             "stat -c '%u:%a' \"$1\""
+        },
+        writable_failure = if mac {
+            "  [ \"$((0$MODE & 022))\" -eq 0 ] || { echo HELPER_INSTALL_DIRECTORY_WRITABLE >&2; exit 1; }"
+        } else {
+            "  [ \"$((0$MODE & 022))\" -eq 0 ] || {\n    if [ \"$1\" = /usr/local/lib/polaris ] && [ \"$MODE\" = 775 ]; then echo HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY >&2; fi\n    echo HELPER_INSTALL_DIRECTORY_WRITABLE >&2; exit 1;\n  }"
         },
         native_directory_check = if mac {
             "  \"$BOOT/helper\" validate-install-path --path \"$1\"\n"
@@ -307,7 +312,7 @@ INSTALL_STAGE=directories
 secure_dir {parent}
 secure_dir "$SUPPORT"
 secure_dir "$COREDIR"
-{lease_open}
+{legacy_mask_hint}{lease_open}
 LEASED=0
 TXDIR=''
 ADMITTED=0
@@ -515,6 +520,11 @@ rollback() {{
         bootstrap = bootstrap,
         require_closure = u8::from(!mac),
         secure_directories = secure_directory_functions(mac),
+        legacy_mask_hint = if mac {
+            ""
+        } else {
+            "if [ -L \"$DESCRIPTOR\" ] && [ \"$(readlink -- \"$DESCRIPTOR\")\" = /dev/null ]; then\n  echo HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY >&2\n  exit 1\nfi\nfor LEGACY_PENDING in \"$SUPPORT\"/helper-upgrade.*; do\n  if [ -e \"$LEGACY_PENDING/legacy-transaction\" ]; then\n    echo HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY >&2\n    exit 1\n  fi\ndone\n"
+        },
         lease_open = LEASE_OPEN,
         set_phase = SET_PHASE,
         dest = shell_quote(&program),
@@ -805,4 +815,87 @@ pub(super) fn build_mac_migration_script(
     token: &str,
 ) -> String {
     transaction(paths, params, token, true, true)
+}
+
+/// One fixed native dispatcher owns legacy root mutations. Ordinary and
+/// compatible-retain flows continue into their complete existing producer.
+pub(super) fn linux_legacy_wrapper(
+    source: &Path,
+    helper_sha256: &str,
+    operation: &str,
+    config: &Path,
+    original: Option<&[String; 10]>,
+    native_arguments: &str,
+    ordinary: &str,
+) -> String {
+    let baseline = original.map(|values| {
+        values
+            .iter()
+            .map(|value| shell_quote(value))
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    let baseline = baseline.map_or_else(
+        || ": > \"$BOOT/original-proxy\"\n".to_owned(),
+        |values| format!("printf '%s\\n' {values} > \"$BOOT/original-proxy\"\n"),
+    );
+    format!(
+        r#"#!/bin/sh
+set -eu
+{diagnostics}PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
+{bootstrap}admin() {{ "$BOOT/helper" "$@"; }}
+GROUP=root
+SUPPORT='/var/lib/polaris'
+{secure}secure_dir "$SUPPORT"
+secure_dir '/etc/systemd/system'
+{lease}{baseline}CLASS=$(admin linux-legacy-classify --operation {operation})
+case "$CLASS" in
+  legacy)
+    admin linux-legacy-{operation} --config {config} --original-file "$BOOT/original-proxy"{native_arguments}
+    exec 9>&-
+    exit 0;;
+  ordinary)
+    exec 9>&-
+    close_bootstrap
+    trap - EXIT HUP INT TERM;;
+  *) echo LINUX_LEGACY_RECOVERY_REQUIRED >&2; exit 75;;
+esac
+{ordinary}"#,
+        diagnostics = linux_service_stop::DIAGNOSTICS,
+        bootstrap = sealed_bootstrap(source, helper_sha256, false),
+        secure = secure_directory_functions(false),
+        lease = LEASE_OPEN,
+        config = shell_quote(&config.to_string_lossy()),
+    )
+}
+
+pub(super) fn build_linux_legacy_install_script(
+    paths: &InstallPaths,
+    params: &InstallParams,
+    token: &str,
+) -> String {
+    let original = build_linux_install_script(paths, params, token);
+    let arguments = format!(" --source {} --manifest {} --helper-sha {} --manifest-sha {} --id {} --token-file \"$BOOT/user-token\"",
+        shell_quote(&params.bundled_core.parent().expect("core stage parent").to_string_lossy()),
+        shell_quote(&params.manifest_path.to_string_lossy()), shell_quote(&params.helper_sha256),
+        shell_quote(&params.manifest_sha256), shell_quote(params.core_id.as_str()));
+    let wrapper = linux_legacy_wrapper(
+        &params.src_binary,
+        &params.helper_sha256,
+        "install",
+        &params.conf_dir,
+        params.linux_legacy_original_proxy.as_ref(),
+        &arguments,
+        &original,
+    );
+    // Token data remains in a root-private file, never in a helper argv.
+    wrapper.replace(
+        "CLASS=$(admin linux-legacy-classify",
+        &format!(
+            "printf '%s' {} > \"$BOOT/user-token\"\nCLASS=$(admin linux-legacy-classify",
+            shell_quote(token)
+        ),
+    )
 }

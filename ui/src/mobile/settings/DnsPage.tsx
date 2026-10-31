@@ -38,6 +38,7 @@
  *    常驻在页面上读起来像在问一个没人回答的问题。
  */
 
+import type { ListEntrySource } from '@/domain/list-entries';
 import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { DnsConfig, DnsPolicyAction, UserConfig } from '@/contracts/types';
@@ -63,12 +64,13 @@ import {
   DNS_PRESET_CUSTOM,
   domesticPresets,
   fakeIpTogglePatch,
-  MAX_DOH_RACE_UPSTREAMS,
+  canEnableRaceUpstream,
   nextRacePool,
   isPureIpDnsSpec,
   normalizeDnsTimeoutInput,
   parseDnsServerSpec,
-  reconcileCustomUpstreams,
+  editNodeResolverInventory,
+  isBuiltinNodeResolverId,
   remotePresets,
   type DnsUpstreamPreset,
 } from '@/components/screens/settings/settings-dns-logic';
@@ -216,42 +218,21 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
   const fakeIpFilterOn = config.fakeIpFilter !== false;
   const browserDohOn = config.blockBrowserDoh === true;
 
-  /*
-   * 竞速池（`nodeResolverPool`）与它的额度。三式逐条取自桌面 `SettingsDns.tsx:265-277`：
-   * `system` 属兜底层不占额度；自定义条目被删后残留在 pool 里的孤儿 id 既不计数也不下发。
-   *
-   * 🔴 自定义 DoH 在移动端不可编辑（清单要 `ListEditor`），但它**仍占额度**：桌面已经加满 3 条时，
-   * 这里必须把内置那两颗按「满额」禁掉并说明原因 —— 不禁的话 `nextRacePool` 原样返回，
-   * 用户拨了开关什么都不会发生，又是一颗「拨了不生效」的开关。
-   */
+  // Inventory and selected IDs stay separate; quota uses shared protocol identities.
   const racePool = dns.nodeResolverPool ?? ['ali', 'dnspod'];
-  const validRaceIds = new Set(['ali', 'dnspod', ...(dns.nodeResolverCustom ?? []).map((u) => u.id)]);
+  const customUpstreams = dns.nodeResolverCustom ?? [];
+  const validRaceIds = new Set(['ali', 'dnspod', ...customUpstreams.map((u) => u.id)]);
   const activeRacePool = racePool.filter((id) => id === 'system' || validRaceIds.has(id));
-  const raceQuotaFull =
-    new Set(activeRacePool.filter((id) => id !== 'system')).size >= MAX_DOH_RACE_UPSTREAMS;
 
-  /**
-   * 自定义 DoH 上游库存的写腿（`nodeResolverCustom` + `nodeResolverPool` 的孤儿清理）。
-   *
-   * 逐条同桌面 `SettingsDns.tsx#setCustomUpstreams`：
-   *  · **非法项只标红不落盘** —— 落盘等于让用户在看到错误提示的同时，坏配置已经触发了一次整核
-   *    重启评估；判据用共享的 `isPureIpDnsSpec`（自定义上游必须是纯 IP：它自己不能再要解析）；
-   *  · id 由 `reconcileCustomUpstreams` 生成并复用，**删掉一条时同步把 pool 里那个 id 摘掉**，
-   *    否则留下一个指向不存在上游的孤儿启用项，它既不计数也不下发，而界面上看不出来。
-   */
   const [invalidCustom, setInvalidCustom] = useState<string[]>([]);
-  function commitCustomUpstreams(next: string[]): void {
-    const rejected = next.filter((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec));
-    setInvalidCustom(rejected);
-    if (rejected.length > 0) return;
-    const current = dns.nodeResolverCustom ?? [];
-    const nextCustom = reconcileCustomUpstreams(current, next, () => `doh-${crypto.randomUUID()}`);
-    const nextIds = new Set(nextCustom.map((item) => item.id));
-    const previousIds = new Set(current.map((item) => item.id));
-    patchDns('race-custom-list', {
-      nodeResolverCustom: nextCustom,
-      nodeResolverPool: racePool.filter((id) => !previousIds.has(id) || nextIds.has(id)),
-    });
+  const [customInventoryError, setCustomInventoryError] = useState<'invalid' | 'quota' | null>(null);
+  function commitCustomUpstreams(next: string[], ids: readonly (string | undefined)[], sources: readonly ListEntrySource[], context?: unknown) {
+    const edit = editNodeResolverInventory(customUpstreams, racePool, next.map((spec, index) => ({ spec, id: ids[index] })), () => `doh-${crypto.randomUUID()}`, { sources, context });
+    setInvalidCustom(next.filter((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec)));
+    setCustomInventoryError(edit.ok ? null : edit.error);
+    if (!edit.ok) return false;
+    patchDns('race-custom-list', { nodeResolverCustom: edit.custom, nodeResolverPool: edit.pool });
+    return edit.editor;
   }
 
   /*
@@ -331,18 +312,17 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
     );
   }
 
-  /** 竞速池里的一个上游。`tier1` 决定它占不占那 3 个额度（`system` 不占）。 */
+  /** 竞速池里的一个上游。协议身份决定加密额度（UDP / system 不占）。 */
   function raceUpstreamRow(
     rowId: string,
     id: string,
     label: string,
     desc: string,
-    tier1: boolean,
   ): ReactElement {
     const on = activeRacePool.includes(id);
     const custom = dns.nodeResolverCustom?.find((item) => item.id === id);
     const unsupported = !!custom && !isPureIpDnsSpec(custom.spec);
-    const blocked = !on && (unsupported || (tier1 && raceQuotaFull));
+    const blocked = !on && (unsupported || !canEnableRaceUpstream(activeRacePool, id, customUpstreams));
     return (
       <SettingsRow
         id={rowId}
@@ -358,7 +338,7 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
             checked={on}
             disabled={blocked}
             ariaLabel={label}
-            onChange={(v) => { if (!v || !unsupported) patchDns(rowId, { nodeResolverPool: nextRacePool(activeRacePool, id, v) }); }}
+            onChange={(v) => { if (!v || !unsupported) patchDns(rowId, { nodeResolverPool: nextRacePool(activeRacePool, id, v, customUpstreams) }); }}
           />
         }
       />
@@ -529,8 +509,7 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
             }
           />
         )}
-        {/* race 开：竞速池的三个上游。桌面在这里还有一张自定义 DoH 的 `ListEditor`，本屏不移植 ——
-            但**开关不能跟着一起消失**：池是配置里活着的字段，看不见就改不了。 */}
+        {/* Both pages expose the same inventory and enabled upstream identities. */}
         {dns.resolveNodeDomainsAhead !== false && (
           <>
             {raceUpstreamRow(
@@ -538,35 +517,35 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
               'ali',
               `${t('settings.dns.brandAli')} DoH`,
               '223.5.5.5',
-              true,
             )}
-            {raceUpstreamRow('race-pool-dnspod', 'dnspod', 'DNSPod DoH', '1.12.12.12', true)}
+            {raceUpstreamRow('race-pool-dnspod', 'dnspod', 'DNSPod DoH', '1.12.12.12')}
             {raceUpstreamRow(
               'race-pool-system',
               'system',
               t('settings.advanced.nodeResolverSystem'),
               t('settings.dns.noQuotaTag'),
-              false,
             )}
-            {(dns.nodeResolverCustom ?? []).map((upstream) => (
+            {customUpstreams.filter((upstream) => !isBuiltinNodeResolverId(upstream.id)).map((upstream) => (
               <div key={upstream.id}>
-                {raceUpstreamRow(`race-custom-${upstream.id}`, upstream.id, upstream.spec, '', true)}
+                {raceUpstreamRow(`race-custom-${upstream.id}`, upstream.id, upstream.spec, '')}
               </div>
             ))}
             <SettingsNote id="race-upstreams-quota" title={t('settings.dns.raceStrategy')} summary={t('mobileHelp.raceUpstreams')}>{t('settings.dns.raceUpstreamsDesc')}</SettingsNote>
-            {/* 自定义 DoH 上游库存。桌面是一整块 `ListEditor`，这里是它的移动端对位
+            {/* 自定义 DNS 上游库存。桌面是一整块 `ListEditor`，这里是它的移动端对位
                 （`MobileListEditor`，去重与草稿规则读同一份 `@/domain/list-entries`）。
-                它**必须在场**：自定义条目照样占竞速额度，看不见就解释不了内置那两颗为什么被禁。 */}
+                它**必须在场**：加密自定义条目照样占竞速额度，看不见就解释不了内置那两颗为什么被禁。 */}
             <SettingsRow
               stacked
               id="race-custom-list"
-              problem={invalidCustom.length > 0 ? `${t('settings.advanced.dnsInvalid')}: ${invalidCustom.join(', ')}` : undefined}
+              problem={customInventoryError === 'quota' ? t('settings.dns.raceQuotaReached') : customInventoryError === 'invalid' ? t('settings.dns.customDohIpOnly') : invalidCustom.length > 0 ? `${t('settings.advanced.dnsInvalid')}: ${invalidCustom.join(', ')}` : undefined}
               label={t('settings.dns.addCustomDoh')}
               desc={t('settings.dns.raceCustomHint')}
               control={
                 <MobileListEditor
                   id="race-custom-entries"
-                  value={(dns.nodeResolverCustom ?? []).map((item) => item.spec)}
+                  value={customUpstreams.map((item) => item.spec)}
+                  entryIds={customUpstreams.map((item) => item.id)}
+                  entryContextKey={JSON.stringify(racePool)}
                   onChange={commitCustomUpstreams}
                   onValidate={(next) => setInvalidCustom(next.filter((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec)))}
                   entryIdentity={dnsUpstreamIdentity}

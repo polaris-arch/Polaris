@@ -119,18 +119,21 @@ fn malformed_or_future_schema_is_unknown_not_a_menu_inventory() {
 #[cfg(unix)]
 #[tokio::test]
 async fn actual_query_is_bounded_and_bound_to_exact_selected_file() {
-    use crate::test_support::write_executable_stand_in;
-    let dir = std::env::temp_dir().join(format!("polaris-tls-probe-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("polaris-tls-denial-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
-    let core = dir.join("core");
-    let raw = document().to_string();
-    write_executable_stand_in(&core, format!("#!/bin/sh\n[ \"$1 $2\" = 'tools tls-fingerprints' ] || exit 1\ncat <<'POLARIS_DOCUMENT'\n{raw}\nPOLARIS_DOCUMENT\n"));
-    let first = query_cli(&core).await;
-    assert!(first.document.is_some());
-    write_executable_stand_in(&core, "#!/bin/sh\nexit 1\n");
-    let old = query_cli(&core).await;
-    assert!(old.document.is_none());
-    assert_ne!(old.binary_sha256, first.binary_sha256);
+    let path = dir.join("sing-box");
+    let marker = dir.join("executed");
+    crate::test_support::write_executable_stand_in(
+        &path,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let snapshot = query_cli(&path).await;
+    assert!(snapshot.document.is_none());
+    assert!(snapshot.binary_sha256.is_none());
+    assert!(
+        !marker.exists(),
+        "a foreign same-named candidate must have zero query births"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -148,36 +151,22 @@ fn old_loaded_library_keeps_byte_identity_without_inventing_a_capability_report(
 
 #[tokio::test]
 async fn file_proof_rejects_atomic_replacement_even_with_equal_length_and_restored_mtime() {
-    let dir = std::env::temp_dir().join(format!("polaris-tls-identity-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("polaris-tls-replace-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
-    let path = dir.join("selected-core");
+    let path = dir.join("sing-box");
     std::fs::write(&path, b"original").unwrap();
-    let proof = open_observation(&path).await.unwrap();
-    let before = proof.snapshot.binary_sha256.clone();
+    assert!(open_observation(&path).await.is_err());
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let replacement = dir.join("replacement");
-    std::fs::write(&replacement, b"replaced").unwrap();
+    let other = dir.join("other");
+    std::fs::write(&other, b"replaced").unwrap();
     std::fs::OpenOptions::new()
         .write(true)
-        .open(&replacement)
+        .open(&other)
         .unwrap()
         .set_modified(modified)
         .unwrap();
-    std::fs::rename(&replacement, &path).unwrap();
-    assert!(
-        !proof.still_current(),
-        "a matching pathname/size/mtime does not identify the old bytes"
-    );
-    assert_ne!(
-        open_observation(&path)
-            .await
-            .unwrap()
-            .snapshot
-            .binary_sha256,
-        before
-    );
-    assert!(!proof.matches(&dir.join("another-selection")));
-    drop(proof);
+    std::fs::rename(other, &path).unwrap();
+    assert!(open_observation(&path).await.is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -185,46 +174,27 @@ async fn file_proof_rejects_atomic_replacement_even_with_equal_length_and_restor
 #[tokio::test]
 async fn transient_failure_retries_the_same_bytes_after_recovery_without_rehashing_or_spawning_on_every_read(
 ) {
-    use crate::test_support::write_executable_stand_in;
-    let dir = std::env::temp_dir().join(format!("polaris-tls-retry-{}", uuid::Uuid::new_v4()));
+    let dir =
+        std::env::temp_dir().join(format!("polaris-tls-cache-denial-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
-    let core = dir.join("core");
-    let raw = document().to_string();
-    write_executable_stand_in(&core, format!("#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\nprintf x >> attempts\n[ -f ready ] || exit 7\ncat <<'DOCUMENT'\n{raw}\nDOCUMENT\n"));
+    let path = dir.join("sing-box");
+    let marker = dir.join("attempts");
+    crate::test_support::write_executable_stand_in(
+        &path,
+        format!("#!/bin/sh\nprintf x >> '{}'\n", marker.display()),
+    );
     let cache = CliProbeCache::new();
-    let first = cache
-        .probe_at(&core, std::time::Instant::now(), ProbeFile::ScriptFixture)
-        .await;
-    assert!(first.document.is_none());
-    let original = cache.observed(&core).unwrap();
-    assert!(original.retry_at.is_some());
-    let repeated = cache
-        .probe_at(&core, std::time::Instant::now(), ProbeFile::ScriptFixture)
-        .await;
-    assert!(repeated.document.is_none());
-    assert_eq!(std::fs::read(dir.join("attempts")).unwrap(), b"x");
-    std::fs::write(dir.join("ready"), b"condition cleared").unwrap();
-    let after_cooldown = original.retry_at.unwrap() + std::time::Duration::from_millis(1);
-    let recovered = cache
-        .probe_at(&core, after_cooldown, ProbeFile::ScriptFixture)
-        .await;
+    for _ in 0..3 {
+        let snapshot = cache
+            .probe_at(&path, std::time::Instant::now(), ProbeFile::ScriptFixture)
+            .await;
+        assert!(snapshot.document.is_none());
+        assert!(cache.observed(&path).is_none());
+    }
     assert!(
-        recovered.document.is_some(),
-        "the actual supervised CLI query must succeed after recovery"
+        !marker.exists(),
+        "query retries may not bypass executable admission"
     );
-    assert_eq!(recovered.binary_sha256, first.binary_sha256);
-    let current = cache.observed(&core).unwrap();
-    assert!(
-        std::sync::Arc::ptr_eq(&original.file, &current.file),
-        "same retained file proof, no second full digest read"
-    );
-    assert!(current.retry_at.is_none());
-    let stable = cache
-        .probe_at(&core, after_cooldown, ProbeFile::ScriptFixture)
-        .await;
-    assert!(stable.document.is_some());
-    assert_eq!(std::fs::read(dir.join("attempts")).unwrap(), b"xx");
-    drop((cache, original, current));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -264,4 +234,22 @@ async fn missing_cli_observation_preserves_the_unavailable_snapshot() {
         "the boxed failure must retain the complete legacy Snapshot payload"
     );
     std::fs::remove_dir(dir).unwrap();
+}
+
+#[tokio::test]
+async fn app_business_observation_fixture_cannot_reach_the_native_query_factory() {
+    let dir = crate::test_support::TestDir::new("polaris-tls-business-observation-");
+    let path = dir.path().join("fixture-core");
+    let marker = dir.path().join("must-not-exist");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf spawned > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    let entry = cache_fixture_observation(&path);
+    assert!(entry.still_current());
+    assert!(entry.admission.inventory_execution().is_err());
+    let result = query_observation(&entry).await;
+    assert!(result.snapshot.document.is_none());
+    assert!(!marker.exists());
 }

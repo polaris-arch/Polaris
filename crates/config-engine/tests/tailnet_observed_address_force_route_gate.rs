@@ -20,7 +20,7 @@
 //! |---|---|
 //! | `builder::route` 块 0c（规则发射） | [`observed_v4_address_reaches_the_force_route_rule`] |
 //! | `builder::inbounds`（TUN 排除面 `engaged_mesh`） | [`observed_addresses_reach_the_tun_exclusion_face`] |
-//! | `builder::hotswitch`（热切资格） | 在 `hotswitch` 的单测里钉不敏感性（见那边的 `sel_only_forces_subnets_is_insensitive_to_observed_addresses`）——该谓词只问「段集非空」，TS 默认两段恒非空 ⇒ 有无观测同值，**可证明等价**，不是漏改 |
+//! | `builder::hotswitch`（热切资格） | 在 `hotswitch` 的单测里钉不敏感性（见那边的 `cold_tailscale_empty_routes_do_not_allow_warm_projection_hot_switch`）——该谓词只问「段集非空」，冷 TS 可空，仍保守保护不恒发段的 warm 投影 |
 //! | `builder::tunnel_conflict`（`ConflictInput::mesh_cidrs`） | 由 [`mesh_forced_route_cidrs`] 供段，本门的 [`observed_addresses_reach_mesh_cidrs_union`] 钉该供给面（该模块本身**在生产里还没有调用点**，只有单测，故只能钉到供给为止） |
 //!
 //! # 判据里为什么两层都要（函数层 + 生成产物层）
@@ -28,13 +28,11 @@
 //! 只测 [`endpoint_forced_route_cidrs`] 的返回值 = 测了方法体，测不出"生产路径真的在用它"；
 //! 只测生成产物 = 一条断言横跨太多环节，红了定位不到。两条成对交才既有牙又可定位。
 //!
-//! # 降级腿（本批的硬要求）
+//! # cold strict-all
 //!
-//! 观测面为空 + tailnet 文件不存在 ⇒ 产出必须与本批改动之前**逐字节相同**。本门钉住其
-//! **可自证的那一半**（两种"文件都不存在"的路径互为逐字节相等 + 产出里不含任何 `tailnet-` tag +
-//! inline 形状逐字节等于两条常量段）；"与改动前相同"的权威证据是仓内既有的冻结金样门
-//! `golden_config_snapshot.rs`（`fixtures/config-snapshot.json` 是上游冻结样本、本仓重生不了，
-//! 实测全文 `tailscale` 出现 0 次 ⇒ 本改动不该触碰它，它红就是改到了不该改的地方）。
+//! 单/多、官方/自建均只声索显式 routes 或合法 host；空集不得回到官方大段。
+//! 缺文件的 inline 腿可为空，已有外化路径仍保留供热更新。
+//! App 空集 serializer 与实际所选 Core 加载是独立联合验收，本门不冒充其结果。
 
 mod support;
 
@@ -161,8 +159,7 @@ fn observed_v4_address_reaches_the_force_route_rule() {
     // 吸收掉 ⇒ 先声明者把整个 `100.64.0.0/10` 拿走，后声明者自己的地址被送去别人那儿。
     // 完整理由见 `endpoint_routes::ObservedTailnetAddresses` 的「# 语义」一节。
     //
-    // 默认段并没有被删掉，只是移到了「无观测」那一格作 bootstrap ——
-    // 由 `without_observation_the_public_address_is_absent` 钉住。
+    // strict-all 冷态也不再猜测默认广段，显式同字面声明仍由单独测试保留。
     //
     // **但 MagicDNS 的两个服务地址必须补回来**：它们不随控制面变、也永远不会出现在 netmap 里
     // （不是 peer），被「取代」连坐删掉就等于让 `dig @100.100.100.100 <peer>` 这类直接寻址落
@@ -210,24 +207,16 @@ fn observed_v4_address_reaches_the_force_route_rule() {
     }
 }
 
-/// 🔴 **bootstrap 腿对 MagicDNS 的覆盖是算出来的，不是假设的。**
-///
-/// 有观测腿显式补发 [`TAILNET_MAGICDNS_V4`] / [`TAILNET_MAGICDNS_V6`]；无观测腿不补，理由是
-/// 默认两段**本就包含**它们。那句「本就包含」在 `endpoint_routes.rs` 里只是一行注释 ——
-/// 注释对执行没有强制力：哪天有人把 [`TAILNET_CGNAT`] 改窄（比如跟着某个控制面改成
-/// `100.64.0.0/16`），quad100 会在 bootstrap 腿上**静默失覆盖**，而所有既有断言照常绿。
-///
-/// 本门把那句话变成一次真计算。它红 = 要么改默认段、要么 bootstrap 腿也得显式补发。
+/// 显式官方广段仍覆盖 MagicDNS；没有 host 的冷态不额外建立服务地址声索。
 #[test]
-fn magicdns_addresses_are_contained_by_the_default_segments() {
+fn magicdns_addresses_are_contained_by_explicit_official_segments() {
     for (outer, inner) in [
         (TAILNET_CGNAT, TAILNET_MAGICDNS_V4),
         (TAILNET_ULA_V6, TAILNET_MAGICDNS_V6),
     ] {
         assert!(
             cidr_contains(outer, inner),
-            "{inner} 不在 {outer} 之内 —— 无观测（bootstrap）腿不显式补发 MagicDNS 地址的前提塌了，\
-             该腿上 quad100 已静默失覆盖"
+            "{inner} 不在 {outer} 之内 —— 显式官方广段与 MagicDNS 常量的包含关系改变了"
         );
     }
     // 正向对照：`cidr_contains` 不是恒真（否则上面两条没有信息量）。
@@ -236,39 +225,97 @@ fn magicdns_addresses_are_contained_by_the_default_segments() {
         "cidr_contains 恒真 —— 上面的包含断言没有区分力"
     );
 
-    // 与真实产出对拍：无观测腿确实**没有**把 MagicDNS 单独列出来（它靠包含关系兜着）。
+    // 无 host/声明时真正空集；MagicDNS 不成为冷态隐式 seed。
     let bare = endpoint_forced_route_cidrs(&ts_node("ts1"), &ObservedTailnetAddresses::new());
     assert!(
         !bare
             .iter()
             .any(|c| c == TAILNET_MAGICDNS_V4 || c == TAILNET_MAGICDNS_V6),
-        "无观测腿多发了 MagicDNS 条目 —— 降级腿的产出不再与观测面出现之前逐字节相同：{bare:?}"
+        "未知节点不应预先声索 MagicDNS 服务地址：{bare:?}"
     );
 }
 
-/// 反向对照：把观测注入拿掉 ⇒ 上面那条断言必须红（证明它不是恒真）。
-///
-/// 这条同时是**降级腿的一半**：无观测时 inline 形状必须逐字节等于两条常量段。
+/// 单/多节点和控制面种类都不能改变 strict-all；改变端点顺序也不造出 owner。
 #[test]
-fn without_observation_the_public_address_is_absent() {
-    let node = ts_node("ts1");
-    let cidrs = endpoint_forced_route_cidrs(&node, &ObservedTailnetAddresses::new());
-    assert_eq!(
-        cidrs,
-        vec![TAILNET_CGNAT.to_string(), TAILNET_ULA_V6.to_string()],
-        "无观测时的覆盖面必须逐字节等于两条官方常量段（= 本批改动之前的行为）"
-    );
+fn cold_single_and_multi_tailnets_claim_only_known_addresses() {
+    let official = ts_node("official");
+    let mut custom = ts_node("custom");
+    custom.tailscale_settings.as_mut().unwrap().control_url =
+        Some("https://control.example.com".into());
+    let unknown = ts_node("unknown");
+    let cases = [
+        vec![official.clone()],
+        vec![custom.clone()],
+        vec![official.clone(), ts_node("official-two")],
+        vec![official.clone(), custom.clone()],
+        vec![custom, official],
+        vec![unknown],
+    ];
+    for nodes in cases {
+        let config = config_with(nodes.clone());
+        let cfg = generate(
+            &config,
+            "/nonexistent/tailnet-rules",
+            ObservedTailnetAddresses::new(),
+        );
+        for node in &nodes {
+            assert!(endpoint_forced_route_cidrs(node, &ObservedTailnetAddresses::new()).is_empty());
+            assert!(inline_force_route(rules_of(&cfg), &node.id).is_none());
+            assert!(rule_set_force_route(rules_of(&cfg), &node.id).is_none());
+            assert!(cfg
+                .endpoints
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.tag == node.id));
+            assert!(
+                !polaris_config_engine::builder::endpoint_routes::mesh_node_carries_full_tunnel(
+                    node
+                )
+            );
+        }
+        let report = polaris_config_engine::builder::endpoint_routes::endpoint_force_route_report(
+            &config,
+            &ObservedTailnetAddresses::new(),
+            "/nonexistent/tailnet-rules",
+        );
+        assert!(
+            report.zero_coverage_server_ids.is_empty(),
+            "没有地址可声明不是被别人吸收"
+        );
+        assert_eq!(report.absorbed_count, 0);
+    }
+}
 
-    let cfg = generate(
-        &config_with(vec![node]),
+#[test]
+fn empty_cold_node_becomes_host_routed_without_becoming_an_exit_node() {
+    let mut config = config_with(vec![ts_node("ts1")]);
+    config.selected_server_id = Some("ts1".into());
+    let cold = generate(
+        &config,
         "/nonexistent/tailnet-rules",
         ObservedTailnetAddresses::new(),
     );
-    let rule = inline_force_route(rules_of(&cfg), "ts1").expect("ts1 没有 inline force-route 规则");
+    assert!(inline_force_route(rules_of(&cold), "ts1").is_none());
+    assert!(
+        polaris_config_engine::builder::route::mesh_selected_exit_falls_back_to_direct(&config)
+    );
+    let hosts = observed(&[("ts1", &[OBSERVED_V4, OBSERVED_V6])]);
+    let warm = generate(&config, "/nonexistent/tailnet-rules", hosts);
+    let cidrs = inline_force_route(rules_of(&warm), "ts1")
+        .unwrap()
+        .ip_cidr
+        .as_ref()
+        .unwrap();
+    assert!(cidrs.iter().any(|c| c == &format!("{OBSERVED_V4}/32")));
+    assert!(cidrs.iter().any(|c| c == &format!("{OBSERVED_V6}/128")));
+    assert!(!cidrs.iter().any(|c| c == "0.0.0.0/0" || c == "::/0"));
+    assert!(
+        polaris_config_engine::builder::route::mesh_selected_exit_falls_back_to_direct(&config)
+    );
     assert_eq!(
-        rule.ip_cidr.as_ref().unwrap(),
-        &vec![TAILNET_CGNAT.to_string(), TAILNET_ULA_V6.to_string()],
-        "无观测时块 0c 的产出必须与本批改动之前逐字节相同"
+        cold.route.as_ref().unwrap().final_outbound,
+        warm.route.as_ref().unwrap().final_outbound
     );
 }
 
@@ -402,62 +449,21 @@ fn observed_addresses_reach_the_tun_exclusion_face() {
     );
 }
 
-/// 🔴 **判据 5：TUN 排除面排的是「观测段」，不再是「默认段」**（2026-09-11 语义变更的直接腿）。
-///
-/// 上面那条只证明了「观测地址进得来」。本条证明的是另一半：默认段**出去了**。
-///
-/// 取材点选 `100.80.0.0/16` —— 它在默认段 `100.64.0.0/10` **之内**、却与观测到的
-/// `100.64.5.5/32` **不相交**。于是同一条用户声明在两侧走出相反的结局：
-///  - 无观测：组网段 = 默认两段 ⇒ `100.80.0.0/16 ⊂ 100.64.0.0/10` ⇒ 相交 ⇒ 整条被丢 + warn；
-///  - 有观测：组网段 = `100.64.5.5/32` ⇒ 不相交 ⇒ **原样保留**、不 warn。
-///
-/// 这也是并集语义的用户可见代价：并集时代，只要配置里有一个 TS 节点，用户填的任何一段
-/// CGNAT 地址都会被那条 `/10` 吞掉 —— 哪怕那个节点的 tailnet 根本不在 CGNAT 上。
+/// 冷态与不相交 host 不应吞掉用户排除；真正相交的 host 仍须告警并保护组网。
 #[test]
-fn tun_exclusion_face_follows_the_observed_prefix_not_the_default_one() {
+fn tun_exclusion_face_follows_known_hosts_instead_of_implicit_official_prefixes() {
     let config = tun_config_declaring("100.80.0.0/16");
-
-    // 供给面（先钉住成因，否则下面排除表的差异可能来自任何无关原因）。
     let servers = [ts_node("ts1")];
-    let obs = observed(&[("ts1", &["100.64.5.5"])]);
-    let with_union = mesh_forced_route_cidrs(&servers, &obs);
-    assert!(
-        with_union.contains(&"100.64.5.5/32".to_string()),
-        "组网段并集里没有观测地址：{with_union:?}"
-    );
-    assert!(
-        !with_union
-            .iter()
-            .any(|c| c == TAILNET_CGNAT || c == TAILNET_ULA_V6),
-        "有观测的节点仍把默认两段喂进了 TUN 排除面的减数：{with_union:?}"
-    );
-    let bare_union = mesh_forced_route_cidrs(&servers, &ObservedTailnetAddresses::new());
-    assert!(
-        bare_union.contains(&TAILNET_CGNAT.to_string()),
-        "无观测时默认段没进来 —— bootstrap 腿断了：{bare_union:?}"
-    );
-
-    // 对照组（无观测）：默认段把这条无关声明整条吞掉 + warn 响。
-    let (without, warned_without) = tun_exclude_of(&config, ObservedTailnetAddresses::new());
-    assert!(
-        !without.contains(&"100.80.0.0/16".to_string()),
-        "无观测时 100.80.0.0/16 本该被默认段 {TAILNET_CGNAT} 整条吞掉（本条是对照组，\
-         它绿才说明下面实验组的「留下来」是观测段带来的）。实际：{without:?}"
-    );
-    assert!(warned_without, "被组网优先丢弃却没有 warn —— 用户零线索");
-
-    // 实验组（有观测）：组网段只剩 `100.64.5.5/32`，与该声明不相交 ⇒ 原样保留、不 warn。
-    let (with, warned_with) = tun_exclude_of(&config, observed(&[("ts1", &["100.64.5.5"])]));
-    assert!(
-        with.contains(&"100.80.0.0/16".to_string()),
-        "有观测时 100.80.0.0/16 仍被丢弃 —— TUN 排除面还在拿默认段 {TAILNET_CGNAT} 当减数，\
-         用户填的段被一个根本不会发射的段架空。实际：{with:?}"
-    );
-    assert!(
-        !warned_with,
-        "该声明并没有被丢弃，却报了组网重叠 warn —— 诊断行与实际行为分叉。捕获：{:?}",
-        take_captured()
-    );
+    assert!(mesh_forced_route_cidrs(&servers, &ObservedTailnetAddresses::new()).is_empty());
+    let (cold, cold_warn) = tun_exclude_of(&config, ObservedTailnetAddresses::new());
+    assert!(cold.contains(&"100.80.0.0/16".to_string()));
+    assert!(!cold_warn);
+    let (disjoint, disjoint_warn) = tun_exclude_of(&config, observed(&[("ts1", &["100.64.5.5"])]));
+    assert!(disjoint.contains(&"100.80.0.0/16".to_string()));
+    assert!(!disjoint_warn);
+    let (overlap, overlap_warn) = tun_exclude_of(&config, observed(&[("ts1", &["100.80.1.2"])]));
+    assert!(!overlap.contains(&"100.80.0.0/16".to_string()));
+    assert!(overlap_warn);
 }
 
 // ============================================================================
@@ -489,13 +495,12 @@ fn observed_addresses_reach_mesh_cidrs_union() {
 // 外化腿（rule_set）与降级腿
 // ============================================================================
 
-/// 降级腿：tailnet 文件不存在 ⇒ 与本腿出现之前逐字节相同。
+/// 文件缺席的两种形态都保真正空 canonical，不恢复隐式 broad。
 ///
 /// 自证的那一半：两条"文件都不存在"的路径（存在但空的目录 / 压根不存在的目录）产出逐字节相等，
-/// 且产出里不含任何 `tailnet-` tag。与"改动前"的逐字节比对由冻结金样门
-/// `golden_config_snapshot.rs` 持有（见本文件头注）。
+/// 且产出里不含任何 `tailnet-` tag；非 TS 冻结金样仍独立保护。
 #[test]
-fn missing_tailnet_file_falls_back_to_inline_unchanged() {
+fn missing_tailnet_file_keeps_the_same_empty_cold_result() {
     let temp = TempDir::new().expect("建临时目录");
     let existing_but_empty = temp.path().display().to_string();
 
@@ -520,9 +525,9 @@ fn missing_tailnet_file_falls_back_to_inline_unchanged() {
         "文件不存在时产出里出现了 tailnet rule_set —— 降级腿没做干净。产出：{ja}"
     );
     assert!(
-        inline_force_route(rules_of(&a), "ts1").is_some()
+        inline_force_route(rules_of(&a), "ts1").is_none()
             && rule_set_force_route(rules_of(&a), "ts1").is_none(),
-        "文件不存在时必须只有 inline 腿"
+        "文件不存在且未知地址时不发 inline 或 rule_set 声索"
     );
 }
 
@@ -530,7 +535,7 @@ fn missing_tailnet_file_falls_back_to_inline_unchanged() {
 ///
 /// 同时钉两件事：
 ///  · 是 **per-node** 决定，不是全局开关（ts2 没有文件 ⇒ 照走 inline）；
-///  · 走外化腿的节点**不参与** `claimed_cidrs` 跨节点去重 ⇒ ts2 仍拿到完整的两条常量段。
+///  · 走外化腿的节点**不参与** `claimed_cidrs` 跨节点去重 ⇒ ts2 仍拿到其完整的两条显式声明。
 ///    这是预期（不同 tailnet 的地址空间本就不相交），也说明 `force_route_conflicts` 计数
 ///    不会因为本腿出现而多计/少计。
 #[test]
@@ -549,8 +554,11 @@ fn existing_tailnet_file_switches_to_local_rule_set() {
     )
     .expect("写 tailnet 文件");
 
+    let mut ts2 = ts_node("ts2");
+    ts2.tailscale_settings.as_mut().unwrap().routes =
+        vec![TAILNET_CGNAT.into(), TAILNET_ULA_V6.into()];
     let cfg = generate(
-        &config_with(vec![ts_node("ts1"), ts_node("ts2")]),
+        &config_with(vec![ts_node("ts1"), ts2]),
         &dir.display().to_string(),
         ObservedTailnetAddresses::new(),
     );
@@ -594,11 +602,46 @@ fn existing_tailnet_file_switches_to_local_rule_set() {
         "ts1 同时发了 inline 与 rule_set 两条规则 —— 两条都指向同一个 outbound，后一条是死规则"
     );
 
-    // ts2 没有文件 ⇒ 照走 inline，且拿到完整两段（证明 ts1 没有消耗 claimed_cidrs）。
+    // ts2 没有文件但显式声明两段 ⇒ 照走 inline，且拿到完整声明（证明 ts1 没有消耗 claimed_cidrs）。
     let ts2_inline = inline_force_route(rules, "ts2").expect("ts2 没有文件，应走 inline 腿");
     assert_eq!(
         ts2_inline.ip_cidr.as_ref().unwrap(),
         &vec![TAILNET_CGNAT.to_string(), TAILNET_ULA_V6.to_string()],
         "走外化腿的 ts1 不该参与 claimed_cidrs 去重，ts2 应仍拿到完整两段"
+    );
+}
+
+/// 空文件引用必须稳定，未来 host 更新复用同一路径；本条不启动或声称 Core 已加载。
+#[test]
+fn existing_empty_tailnet_file_remains_referenced_for_future_discovery() {
+    let temp = TempDir::new().unwrap();
+    let base = tailnet_rule_file_base("ts1");
+    let path = temp.path().join(format!("{base}.json"));
+    std::fs::write(&path, r#"{"version":1,"rules":[]}"#).unwrap();
+    let config = config_with(vec![ts_node("ts1")]);
+    let empty = generate(
+        &config,
+        temp.path().to_str().unwrap(),
+        ObservedTailnetAddresses::new(),
+    );
+    assert!(rule_set_force_route(rules_of(&empty), "ts1").is_some());
+    assert!(inline_force_route(rules_of(&empty), "ts1").is_none());
+    std::fs::write(
+        &path,
+        r#"{"version":1,"rules":[{"ip_cidr":["100.80.1.2/32"]}]}"#,
+    )
+    .unwrap();
+    let discovered = generate(
+        &config,
+        temp.path().to_str().unwrap(),
+        observed(&[("ts1", &["100.80.1.2"])]),
+    );
+    assert_eq!(
+        rule_set_force_route(rules_of(&empty), "ts1")
+            .unwrap()
+            .rule_set,
+        rule_set_force_route(rules_of(&discovered), "ts1")
+            .unwrap()
+            .rule_set
     );
 }

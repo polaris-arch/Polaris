@@ -1591,18 +1591,24 @@ fn dns_config_with_custom_pool(pool: &[&str], custom: &[(&str, &str)]) -> UserCo
 #[test]
 fn native_candidates_do_not_create_application_route_bypasses() {
     let config = dns_config_with_custom_pool(
-        &["ali", "my-doh", "my-udp"],
+        &["ali", "dot4", "dot6", "my-doh", "my-udp"],
         &[
+            ("dot4", "tls://1.0.0.1"),
+            ("dot6", "tls://[2001:db8::1]:8853"),
             ("my-doh", "https://9.9.9.9:8443/q"),
             ("my-udp", "udp://9.9.9.9:5353"),
         ],
     );
     let rc = build_route_config(&config, &empty_id_map(), &deps_default(&[]));
     assert_eq!(dns_direct_ports(&rc), vec![53, 443]);
-    assert!(!rc.rules.iter().any(|r| r
-        .ip_cidr
-        .as_ref()
-        .is_some_and(|c| c.contains(&"9.9.9.9/32".to_string()))));
+    // Native DNS dials use physical-interface binding for any port. App route
+    // bypasses would also exempt unrelated application traffic to these IPs.
+    for cidr in ["9.9.9.9/32", "1.0.0.1/32", "2001:db8::1/128"] {
+        assert!(!rc.rules.iter().any(|r| r
+            .ip_cidr
+            .as_ref()
+            .is_some_and(|c| c.contains(&cidr.to_string()))));
+    }
 }
 
 #[test]

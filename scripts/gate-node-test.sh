@@ -49,12 +49,11 @@ required_tests=(
   scripts/helper-installer-target-scope.test.mjs
   # 卸载钩子里唯一提权执行的那一段：脚本随命令行进入提权进程、删除前逐项校验、退出码被消费。
   scripts/nsis-helper-cleanup.test.mjs
+  scripts/windows-package-integrity.test.mjs
   scripts/release-assets.test.mjs
   scripts/mobile-source-unit.test.mjs
   scripts/apple-ci-impact.test.mjs
   scripts/ci-workflow-efficiency.test.mjs
-  scripts/package-acceptance.test.mjs
-  scripts/package-tun-acceptance.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {

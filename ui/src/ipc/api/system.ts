@@ -25,12 +25,18 @@ export type HelperActionErrorCode =
   | 'authorizationLaunchFailed'
   | 'installerFailed'
   | 'upgradeDeferred'
+  | 'recoveryRequired'
   | 'failed';
 
 /** Only an explicit user confirmation may select the disruptive macOS mode. */
 export type HelperInstallMode = 'ordinary' | 'stopAndUpgrade';
 
+export type HelperRemovalEffect = 'removed' | 'retiredDataPreserved';
+
 export interface HelperActionResult {
+  /** Independent data targets: success still describes Helper readiness. */
+  recovery?: { user: 'installed' | 'alreadyPresent' | 'unsupported' | 'pending'; helperComplete: boolean };
+  uninstallEffect?: HelperRemovalEffect;
   success: boolean;
   errorCode?: HelperActionErrorCode;
   /** 已泛化的诊断数据；不得直接作为用户文案。 */
@@ -246,7 +252,7 @@ export type UninstallOutcomeKind = 'done' | 'skipped' | 'unsupported' | 'failed'
 
 export interface UninstallStepReport {
   step: UninstallStep;
-  outcome: { kind: UninstallOutcomeKind; detail: string };
+  outcome: { kind: UninstallOutcomeKind; detail: string; helperRemoval?: HelperRemovalEffect };
 }
 
 /**

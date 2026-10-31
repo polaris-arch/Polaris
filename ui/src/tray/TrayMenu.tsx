@@ -183,7 +183,7 @@ export default function TrayMenu() {
   const [view, setView] = useState<'main' | 'nodes'>('main');
   // 「全部节点」二级视图里当前展开的分组（多组可同时展开，非手风琴互斥）。默认全折叠 ——
   // 浮层窗高按内容自适应，几十上百个节点平铺时整窗会拉成一条贴不下屏的长条；折叠后一屏就是分组目录。
-  const [openGroups, setOpenGroups] = useState<ReadonlySet<string>>(new Set());
+  const [openGroups, setOpenGroups] = useState<ReadonlyMap<string, boolean>>(new Map());
   // 本窗发起的在飞启停方向。**不是布尔 busy**：布尔只能表达"忙"，而忙的时候恰恰需要区分"正在启动
   // （可取消）"与"正在停止（不可操作）"——旧的 `busy` 一律置灰，等于把取消入口一起关掉了。
   const [pending, setPending] = useState<'start' | 'stop' | null>(null);
@@ -816,25 +816,30 @@ export default function TrayMenu() {
   const groupLabel = (g: ServerGroup) =>
     g.isManual ? t('tray.groupManual') : g.isMesh ? t('tray.groupMesh') : g.name;
 
-  /**
-   * 进入「全部节点」：**每次进入都重算展开集**（不是挂载时算一次）。同一代托盘窗在保温期内不重建，
-   * 选中节点会在浮层关着的期间被主窗/规则/自动切换改掉 —— 沿用上次的展开集就会展开错组。
-   * 判据委托 domain 单一真值（与应用分流策略菜单、规则弹窗目标出站同一条线）。
-   */
-  useEffect(() => {
-    if (view === 'nodes') setOpenGroups(defaultOpenGroupIds(groups, selectedId));
-  }, [groups, selectedId, view]);
+  // A nodes-view opening owns its expansion choices, as in NodeMenu. Accepted
+  // config/status publications may change the current exit or replace arrays;
+  // preserve known groups and seed only groups first seen in this opening.
+  const defaultOpen = defaultOpenGroupIds(groups, selectedId);
+  if (view === 'nodes' && groups.some(group => !openGroups.has(group.id))) {
+    const next = new Map(openGroups);
+    for (const group of groups) {
+      if (!next.has(group.id)) next.set(group.id, defaultOpen.has(group.id));
+    }
+    setOpenGroups(next);
+  }
   const openNodesView = () => {
-    setOpenGroups(defaultOpenGroupIds(groups, selectedId));
+    // Native show returns to main; entering nodes again is a fresh opening.
+    setOpenGroups(new Map(groups.map(group => [group.id, defaultOpen.has(group.id)])));
     setView('nodes');
   };
 
   const scheduleReveal = useRevealAfterCommit();
   const toggleGroup = (id: string) => {
-    const next = new Set(openGroups);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setOpenGroups(next);
+    setOpenGroups(previous => {
+      const next = new Map(previous);
+      next.set(id, !previous.get(id));
+      return next;
+    });
   };
 
   // 最近连接节点（MRU，原型 tray-mru L2917 移植）：当前节点置顶 + 历史（`config.recentServerIds`，
@@ -1186,7 +1191,7 @@ export default function TrayMenu() {
               const items = sortByLatency
                 ? sortServersByLatency(g.servers, (id) => latencies[id])
                 : g.servers;
-              const groupOpen = openGroups.has(g.id);
+              const groupOpen = !!openGroups.get(g.id);
               return (
                 <Fragment key={g.id}>
                   <button

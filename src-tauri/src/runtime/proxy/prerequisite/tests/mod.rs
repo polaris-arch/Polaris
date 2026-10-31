@@ -42,7 +42,11 @@ fn ticket() -> ReadyMainTicket {
         }),
         committed: AtomicBool::new(true),
     });
-    ReadyMainTicket { core, binding }
+    ReadyMainTicket {
+        core,
+        binding,
+        api_view: None,
+    }
 }
 
 #[test]
@@ -343,7 +347,7 @@ struct MockProbe {
 }
 #[async_trait]
 impl MainReadinessProbe for MockProbe {
-    async fn observe(&self, _core: &ReadyMainCore) -> Result<(), MainPrerequisiteError> {
+    async fn observe(&self, _ticket: &ReadyMainTicket) -> Result<(), MainPrerequisiteError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.supersede_during_io {
             self.current.store(false, Ordering::SeqCst);
@@ -471,6 +475,13 @@ pub(super) fn credential_runtime(
 }
 
 pub(super) fn ready_for(runtime: &ProxyRuntime) -> (Arc<ReadyMainCore>, ActionBinding) {
+    ready_for_at(runtime, 9876, String::new())
+}
+pub(super) fn ready_for_at(
+    runtime: &ProxyRuntime,
+    api_port: u16,
+    api_secret: String,
+) -> (Arc<ReadyMainCore>, ActionBinding) {
     let saved = runtime.config.current().unwrap();
     let binding = ActionBinding::new(
         NormalMainAction::ManualNetworkCheck,
@@ -482,7 +493,7 @@ pub(super) fn ready_for(runtime: &ProxyRuntime) -> (Arc<ReadyMainCore>, ActionBi
     .unwrap();
     let status = ProxyStatus {
         running: true,
-        clash_api_port: 9876,
+        clash_api_port: api_port,
         main_generation: runtime.core_generation(),
         ..ProxyStatus::default()
     };
@@ -493,7 +504,7 @@ pub(super) fn ready_for(runtime: &ProxyRuntime) -> (Arc<ReadyMainCore>, ActionBi
         diagnostic_secret_keys: BTreeSet::new(),
         targets: BTreeMap::new(),
         status: status.clone(),
-        api_secret: String::new(),
+        api_secret,
         probe_ports: vec![],
         local_http_proxy: None,
         committed: AtomicBool::new(true),
@@ -1431,4 +1442,100 @@ fn different_failure_config() -> Value {
     let mut config = post_admission_failure_config();
     config["selectedServerId"] = serde_json::json!("different-fixture");
     config
+}
+
+struct EpochPausedProbe {
+    api: crate::runtime::management_api::GrpcManagementApi,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    resume: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    returned: Arc<AtomicBool>,
+}
+struct ActualProbeTail(Arc<AtomicBool>);
+impl Drop for ActualProbeTail {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+#[async_trait]
+impl polaris_switch_engine::ManagementApi for EpochPausedProbe {
+    async fn select_outbound(
+        &self,
+        selector: &str,
+        member: &str,
+    ) -> Result<(), polaris_switch_engine::ManagementError> {
+        let _tail = ActualProbeTail(self.returned.clone());
+        let entered = self.entered.lock().unwrap().take().unwrap();
+        let resume = self.resume.lock().unwrap().take().unwrap();
+        let _ = entered.send(());
+        if resume.await.is_err() {
+            return Err(polaris_switch_engine::ManagementError::NotReady);
+        }
+        self.api.select_outbound(selector, member).await
+    }
+    async fn close_connection(
+        &self,
+        _: &str,
+    ) -> Result<(), polaris_switch_engine::ManagementError> {
+        panic!("no close")
+    }
+    async fn first_connection_snapshot(
+        &self,
+    ) -> Result<
+        Vec<polaris_switch_engine::ConnectionSnapshot>,
+        polaris_switch_engine::ManagementError,
+    > {
+        panic!("no readback")
+    }
+}
+
+#[tokio::test]
+async fn bound_selector_epoch_cancel_unwinds_actual_rpc_before_reused_tuple_can_receive_secret() {
+    use super::super::runtime_config::api_handoff::ApiRelayEpoch;
+    for successor_secret in ["rotated", "bound-secret"] {
+        let original = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = original.local_addr().unwrap();
+        let epoch = Arc::new(ApiRelayEpoch::default());
+        let mut ticket = ticket();
+        ticket.api_view = Some(ReadyMainAPIView {
+            port: address.port(),
+            secret: "bound-secret".into(),
+            saved_digest: ticket.binding.saved_digest.clone(),
+            epoch: epoch.clone(),
+            active: None,
+        });
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let returned = Arc::new(AtomicBool::new(false));
+        let tail = returned.clone();
+        let action = tokio::spawn(async move {
+            select_ticket_probe(
+                &ticket,
+                0,
+                "Second",
+                || true,
+                |port, secret| async move {
+                    EpochPausedProbe {
+                        api: ProxyRuntime::management_api_at(port, secret).await,
+                        entered: std::sync::Mutex::new(Some(entered)),
+                        resume: std::sync::Mutex::new(Some(resumed)),
+                        returned: tail,
+                    }
+                },
+            )
+            .await
+        });
+        ready.await.unwrap();
+        // This is the real production scoped RPC, paused after its last check.
+        assert!(epoch.seal_and_join().await.is_ok());
+        assert!(returned.load(Ordering::Acquire));
+        assert!(!action.await.unwrap());
+        drop(original);
+        let rival = tokio::net::TcpListener::bind(address).await.unwrap();
+        // Both a changed credential and a later cycle to the original secret
+        // retain the old epoch's rejection. No future survives to dial here.
+        assert!(resume.send(()).is_err(), "{successor_secret}");
+        let accept = rival.accept();
+        tokio::pin!(accept);
+        assert!(futures::poll!(&mut accept).is_pending());
+    }
 }

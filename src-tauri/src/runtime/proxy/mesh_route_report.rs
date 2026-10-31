@@ -21,7 +21,7 @@ use polaris_config_engine::user_config::server_config::is_mesh_node;
 use super::lifecycle::now_ms;
 use super::ProxyRuntime;
 
-const MAX_RULE_FILE_BYTES: usize = 1024 * 1024;
+const MAX_RULE_FILE_BYTES: usize = super::tailnet_rules::MAX_TAILNET_RULE_BYTES;
 const MAX_TOTAL_RULE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CORE_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
@@ -34,6 +34,7 @@ pub(super) struct MeshRouteRunEvidence {
     pub(super) core_config_path: String,
     pub(super) core_config_sha256: Option<String>,
     pub(super) write_epoch: u64,
+    pub(super) tailnet_token: Option<u64>,
     pub(super) run_generation: u64,
     pub(super) ready_at_ms: Option<u64>,
     pub(super) load_evidence: MeshRouteLoadEvidence,
@@ -338,7 +339,17 @@ impl ProxyRuntime {
                 }) {
                     Ok((content, cidrs)) => {
                         remaining_file_bytes -= content.len();
-                        let (configured, observed) = source_sets(&emitted.candidate);
+                        let mut actual = emitted.candidate.clone();
+                        actual.observed_hosts = self
+                            .fresh_tailnet_snapshot(run_generation)
+                            .get(&actual.server_id)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|host| {
+                                polaris_config_engine::builder::helpers::host_to_exclude_cidr(host)
+                            })
+                            .collect();
+                        let (configured, observed) = source_sets(&actual);
                         emitted.candidate.referenced_file = Some(MeshRouteFileSnapshot {
                             cidrs: Some(cidrs.clone()),
                             read_error: None,
@@ -352,7 +363,7 @@ impl ProxyRuntime {
                                     source: source_for_file_cidr(
                                         &configured,
                                         &observed,
-                                        !emitted.candidate.observed_hosts.is_empty(),
+                                        !actual.observed_hosts.is_empty(),
                                         cidr,
                                     ),
                                 })
@@ -387,6 +398,7 @@ impl ProxyRuntime {
             core_config_path: core_config_path.to_string_lossy().into_owned(),
             core_config_sha256,
             write_epoch: epoch_after,
+            tailnet_token: None,
             run_generation,
             ready_at_ms: None,
             load_evidence,
@@ -402,6 +414,11 @@ impl ProxyRuntime {
         mut evidence: MeshRouteRunEvidence,
         ready_at_ms: u64,
     ) {
+        evidence.tailnet_token = self
+            .tailnet_context()
+            .filter(|context| context.generation == evidence.run_generation && !context.suspended)
+            .map(|context| context.token);
+        let routes_limited = self.tailnet_routes_limited();
         let epoch = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
         let core_config_matches = evidence
             .core_config_sha256
@@ -417,7 +434,8 @@ impl ProxyRuntime {
             read_bounded(path, MAX_RULE_FILE_BYTES).as_deref() == Ok(baseline.as_str())
         });
         let epoch_after = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        if evidence.eligible_for_ack
+        if !routes_limited
+            && evidence.eligible_for_ack
             && self.gate.generation() == evidence.run_generation
             && epoch == epoch_after
             && epoch == evidence.write_epoch
@@ -435,6 +453,10 @@ impl ProxyRuntime {
         {
             evidence.load_evidence = MeshRouteLoadEvidence::FileWrittenUnacknowledged;
         }
+        if routes_limited {
+            evidence.load_evidence = MeshRouteLoadEvidence::Unknown;
+            evidence.eligible_for_ack = false;
+        }
         evidence.ready_at_ms = Some(ready_at_ms);
         if let Ok(mut slot) = self.mesh_route_run.write() {
             if self.gate.generation() != evidence.run_generation {
@@ -444,17 +466,47 @@ impl ProxyRuntime {
         }
     }
 
+    /// Called by a refused current writer while publication still excludes a
+    /// generation change, after releasing the inner gate. Recovery may clear
+    /// `limited`, but only a new real receipt may regrant ACK. Never make correctness depend on a poll.
+    /// This acquires no state/config/gate lock and cannot revoke a different run.
+    pub(super) fn invalidate_tailnet_route_ack(&self, generation: u64, token: Option<u64>) {
+        if let Ok(mut slot) = self.mesh_route_run.write() {
+            if let Some(current) = slot
+                .as_mut()
+                .filter(|run| run.run_generation == generation && run.tailnet_token == token)
+            {
+                current.load_evidence = MeshRouteLoadEvidence::Unknown;
+                current.eligible_for_ack = false;
+            }
+        }
+    }
+
     /// Caller has validated Plan/Apply identity and candidate digest. Recheck local
     /// source baselines without pretending the startup file was rewritten.
     pub(super) fn publish_mesh_route_runtime_receipt(&self, mut evidence: MeshRouteRunEvidence) {
+        let _publication = self.gate.lock_generation_publication();
+        if self
+            .tailnet_context()
+            .filter(|context| context.generation == evidence.run_generation && !context.suspended)
+            .map(|context| context.token)
+            != evidence.tailnet_token
+        {
+            return;
+        }
         let epoch = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        let stable = evidence.eligible_for_ack
+        let routes_limited = self.tailnet_routes_limited();
+        let stable = !routes_limited
+            && evidence.eligible_for_ack
             && epoch == evidence.write_epoch
             && epoch.is_multiple_of(2)
             && evidence.file_baselines.iter().all(|(path, baseline)| {
                 read_bounded(path, MAX_RULE_FILE_BYTES).as_deref() == Ok(baseline.as_str())
             });
-        evidence.load_evidence = if stable {
+        evidence.load_evidence = if routes_limited {
+            evidence.eligible_for_ack = false;
+            MeshRouteLoadEvidence::Unknown
+        } else if stable {
             MeshRouteLoadEvidence::RuntimeCommitted
         } else {
             MeshRouteLoadEvidence::FileWrittenUnacknowledged
@@ -541,8 +593,34 @@ impl ProxyRuntime {
         let before = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
         let mut file_failed = false;
         let mut file_changed = false;
+        let routes_limited = self.tailnet_routes_limited();
         let mut remaining_file_bytes = MAX_TOTAL_RULE_FILE_BYTES;
+        let current_context = self
+            .tailnet_context()
+            .filter(|context| context.generation == evidence.run_generation && !context.suspended);
+        let context_matches =
+            current_context.as_ref().map(|context| context.token) == evidence.tailnet_token;
+        let fresh = if context_matches {
+            self.fresh_tailnet_snapshot(evidence.run_generation)
+        } else {
+            BTreeMap::new()
+        };
         for item in &mut evidence.candidates {
+            if routes_limited {
+                item.candidate
+                    .unknown_reasons
+                    .push(MeshRouteUnknownReason::ResourceLimitExceeded);
+            }
+            // Candidate generation may have used weak/retained planning hosts.
+            // Only admitted current-context hosts may be labelled Observed.
+            item.candidate.observed_hosts = fresh
+                .get(&item.candidate.server_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|host| {
+                    polaris_config_engine::builder::helpers::host_to_exclude_cidr(host)
+                })
+                .collect();
             let Some(path) = item.external_path.as_deref() else {
                 continue;
             };
@@ -604,12 +682,14 @@ impl ProxyRuntime {
                 })
             })
         };
-        let observed_invalidation = if file_failed
+        let observed_invalidation = if routes_limited
+            || file_failed
             || core_config_read.is_none()
             || core_config_read.as_ref().is_some_and(Result::is_err)
         {
             Some(MeshRouteLoadEvidence::Unknown)
-        } else if file_changed
+        } else if !context_matches
+            || file_changed
             || core_config_read == Some(Ok(false))
             || before != after
             || !before.is_multiple_of(2)

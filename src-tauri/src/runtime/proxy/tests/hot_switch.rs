@@ -5649,11 +5649,11 @@ fn selected_server_present_truth_table() {
 /// 用函数头会把参数列表 `config: &Value` 一起切进来，下面的「参数用了几次」就恒多数一次。
 const DEPS_ASSEMBLY: &str = "    ) -> GenerateConfigDeps {";
 
-/// 装配体里**唯一**允许的裸 JSON 取值点（形参 `config` 的全部去向）。
+/// 装配体里登记的全部裸 JSON 取值点（形参 `config` 的全部去向）。
 ///
-/// 新增一个 `xxx_from_config(config)` 或直接写 `config.get("k")` → 下面的「用了恰好一次」转红，
+/// 新增一个 `xxx_from_config(config)` 或直接写 `config.get("k")` → 下方闭包计数转红，
 /// 逼改动者把新读法登记进本表，随后 [`raw_keys`] 会把它读的键一并纳入可见性判定。
-const RAW_CONFIG_READERS: &[&str] = &["fn log_axes_from_config("];
+const RAW_CONFIG_READERS: &[&str] = &["log_axes_from_config", "observed_tailnet_for_config"];
 
 /// 形参 `param` 在 `body` 里被当**标识符**用了几次（`self.config` 这类字段访问不计）。
 ///
@@ -5705,7 +5705,7 @@ fn every_generation_input_key_is_visible_to_norm() {
         "装配体切过头了（切到了下一个函数）—— 下面的断言正在扫一段不属于 generate_deps 的源码"
     );
 
-    // ① 通道封闭：形参 `config` 只许流向登记在册的读法，且**恰好一次**。
+    // ① 通道封闭：每个登记 reader 恰好接收一次 config，未知 reader 必须失败。
     assert_eq!(
         param_use_count(&deps, "config"),
         RAW_CONFIG_READERS.len(),
@@ -5713,7 +5713,7 @@ fn every_generation_input_key_is_visible_to_norm() {
              否则它读的键逃过本守卫 —— 那正是「第四类重启」的生成方式。当前体：\n{deps}"
     );
     for reader in RAW_CONFIG_READERS {
-        let name = reader.trim_start_matches("fn ").trim_end_matches('(');
+        let name = reader;
         assert!(
             deps.contains(&format!("{name}(config)")),
             "登记在册的读法 `{name}(config)` 在装配体里找不到 —— 表与代码已分叉"
@@ -5723,13 +5723,81 @@ fn every_generation_input_key_is_visible_to_norm() {
     // ② 登记在册的读法读了哪些键。
     let mut keys = std::collections::BTreeSet::new();
     for reader in RAW_CONFIG_READERS {
-        let body = crate::commands::guard_scan::top_level_fn_body(&src, reader);
-        let found = raw_keys(&body);
-        assert!(
-            !found.is_empty(),
-            "`{reader}` 里一个 `.get(\"…\")` 都没扫到 —— 取材器失配，本守卫已退化成恒真断言"
-        );
-        keys.extend(found);
+        match *reader {
+            "log_axes_from_config" => {
+                let body = crate::commands::guard_scan::top_level_fn_body(
+                    &src,
+                    "fn log_axes_from_config(",
+                );
+                let found = raw_keys(&body);
+                assert!(!found.is_empty(), "log reader extraction lost its keys");
+                keys.extend(found);
+            }
+            "observed_tailnet_for_config" => {
+                let tailnet = crate::test_support::crate_code("runtime/proxy/tailnet_rules.rs");
+                // This is an impl method: the top-level extractor would include
+                // later methods and could let an unrelated lookup satisfy the guard.
+                let method =
+                    method_body(&tailnet, "    pub(crate) fn observed_tailnet_for_config(");
+                let method = &method[method.find('{').unwrap() + 1..];
+                let compact: String = method.chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(!method.contains("fn "));
+                assert_eq!(
+                    param_use_count(method, "raw"),
+                    2,
+                    "unregistered raw reader/delegate"
+                );
+                assert!(compact.contains("from_value::<UserConfig>(raw.clone())"));
+                assert!(compact.contains("configured_identity(raw,server)"));
+                assert!(
+                    raw_keys(method).is_empty(),
+                    "new raw key must be registered"
+                );
+                assert!(UserConfig::FIELD_NAMES.contains(&"servers"));
+                keys.insert("servers".to_owned());
+                let identity = crate::commands::guard_scan::top_level_fn_body(
+                    &tailnet,
+                    "fn configured_identity(",
+                );
+                let identity = &identity[identity.find('{').unwrap() + 1..];
+                assert_eq!(
+                    param_use_count(identity, "raw"),
+                    1,
+                    "unregistered identity reader"
+                );
+                assert_eq!(
+                    raw_keys(identity),
+                    std::collections::BTreeSet::from(["meshRouteState".to_owned()])
+                );
+                // meshRouteState is intentionally not a persisted UserConfig
+                // field. Only its actual generation identity participates in the
+                // shared classifier and pending debt; no ledger-wide exemption.
+                let projection = crate::commands::guard_scan::top_level_fn_body(
+                    &tailnet,
+                    "fn tailnet_generation_identity(",
+                );
+                let projection_body = &projection[projection.find('{').unwrap() + 1..];
+                assert_eq!(
+                    param_use_count(projection_body, "raw"),
+                    2,
+                    "unregistered projection reader/delegate"
+                );
+                assert!(raw_keys(projection_body).is_empty());
+                assert!(projection.contains("configured_identity(raw, server)"));
+                assert!(projection.contains("from_value(raw.clone())"));
+                let classify = method_body(&src, "    pub(super) fn classify_switch(");
+                assert!(classify.contains("tailnet_generation_identity(&old_value)"));
+                assert!(classify.contains("tailnet_generation_identity(new_config)"));
+                let pending = crate::test_support::crate_code("runtime/proxy/pending_changes.rs");
+                let debt = crate::commands::guard_scan::top_level_fn_body(
+                    &pending,
+                    "fn non_node_runtime_debt(",
+                );
+                assert!(debt.contains("tailnet_generation_identity(applied)"));
+                assert!(debt.contains("tailnet_generation_identity(disk)"));
+            }
+            unknown => panic!("reader lacks a complete input closure: {unknown}"),
+        }
     }
 
     // ③ 可见性判定。
@@ -5748,6 +5816,201 @@ fn every_generation_input_key_is_visible_to_norm() {
              修法：把它加进 `UserConfig`（值可以是 `serde_json::Value` —— 本结构只需要「看得见变化」，\
              不需要解释它），或说明它为何根本不该影响生成、从而不必被生成侧读。"
     );
+}
+
+fn generation_identity_fixture() -> Value {
+    let mut config = polaris_store::store::default_config();
+    let identity = serde_json::json!({
+        "servers": [{"id":"ts", "name":"ts", "protocol":"tailscale",
+            "tailscaleSettings":{"controlUrl":"https://one.example"}}],
+        "selectedServerId":"__direct__", "proxyMode":"smart", "proxyModeType":"manual",
+        "meshRoutePolicy":{"schemaVersion":1,"candidateOrder":["ts"],"assignments":[],"overrides":[],
+            "migration":{"unknownPublicPool":"reject","builtinExceptionsVersion":1}},
+        "meshRouteState":{"schemaVersion":1,"localId":"local","revision":"1",
+            "identities":[{"serverId":"ts","identityEpoch":"epoch-one","controlAuthority":"https://one.example",
+                "selfStableId":"self-one","bindingState":"bound","evidenceSource":"status"}],
+            "observations":[],"reservations":[],"intent":{"revision":"1","desiredRun":"stopped"},"identityEffects":[]}
+    });
+    config
+        .as_object_mut()
+        .unwrap()
+        .extend(identity.as_object().unwrap().clone());
+    config
+}
+
+#[tokio::test]
+async fn generation_identity_is_shared_by_staged_save_pending_and_explicit_apply() {
+    use super::super::tailnet_rules::tailnet_generation_identity;
+    use polaris_config_engine::user_config::mesh_route_state::{MeshRoutePolicy, MeshRouteState};
+    for axis in [
+        "epoch",
+        "authority",
+        "stable",
+        "retired",
+        "same",
+        "unbound",
+        "revision",
+        "evidence",
+        "retired-history",
+    ] {
+        let (rt, _dir) = test_runtime();
+        let base = generation_identity_fixture();
+        let mut target = base.clone();
+        match axis {
+            "epoch" => {
+                target["meshRouteState"]["identities"][0]["identityEpoch"] =
+                    serde_json::json!("epoch-two")
+            }
+            "authority" => {
+                target["servers"][0]["tailscaleSettings"]["controlUrl"] =
+                    serde_json::json!("https://two.example");
+                target["meshRouteState"]["identities"][0]["controlAuthority"] =
+                    serde_json::json!("https://two.example");
+            }
+            "stable" => {
+                target["meshRouteState"]["identities"][0]["selfStableId"] =
+                    serde_json::json!("self-two")
+            }
+            "retired" => {
+                target["meshRouteState"]["identities"][0]["bindingState"] =
+                    serde_json::json!("retired")
+            }
+            "unbound" => {
+                target["meshRouteState"]["identities"][0]["bindingState"] =
+                    serde_json::json!("unbound")
+            }
+            "revision" => target["meshRouteState"]["revision"] = serde_json::json!("2"),
+            "evidence" => {
+                target["meshRouteState"]["identities"][0]["evidenceSource"] =
+                    serde_json::json!("retained")
+            }
+            "retired-history" => {
+                let mut retired = base["meshRouteState"]["identities"][0].clone();
+                retired["identityEpoch"] = serde_json::json!("old-retired");
+                retired["bindingState"] = serde_json::json!("retired");
+                target["meshRouteState"]["identities"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(retired);
+            }
+            "same" => {}
+            _ => unreachable!(),
+        }
+        let changed = matches!(axis, "epoch" | "authority" | "stable" | "retired");
+        assert_eq!(
+            tailnet_generation_identity(&base) != tailnet_generation_identity(&target),
+            changed,
+            "{axis}"
+        );
+
+        // Seed D through the existing real managed opt-in, not a UserConfig
+        // field, untrusted ledger save or private cache bypass. R is the prior
+        // accepted test-core snapshot; no process/service exists in this fixture.
+        let policy: MeshRoutePolicy =
+            serde_json::from_value(target["meshRoutePolicy"].clone()).unwrap();
+        let state: MeshRouteState =
+            serde_json::from_value(target["meshRouteState"].clone()).unwrap();
+        let mut legacy = target.clone();
+        legacy.as_object_mut().unwrap().remove("meshRoutePolicy");
+        legacy.as_object_mut().unwrap().remove("meshRouteState");
+        rt.config.save_full(&legacy).unwrap();
+        rt.config.prepare_mesh_route_enable("local").unwrap();
+        rt.config.commit_prepared_mesh_route(policy, state).unwrap();
+        let disk = rt.config.current().unwrap();
+        assert_eq!(
+            tailnet_generation_identity(&disk),
+            tailnet_generation_identity(&target)
+        );
+        let mut accepted = disk.clone();
+        accepted["servers"][0]["tailscaleSettings"]["controlUrl"] =
+            base["servers"][0]["tailscaleSettings"]["controlUrl"].clone();
+        accepted["meshRouteState"] = base["meshRouteState"].clone();
+        mark_running_with_snapshot(&rt, &accepted);
+        *rt.startup_snapshot.write().unwrap() = Some(accepted.clone());
+        let sink = Arc::new(TestPutSink::default());
+        *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+        let generation = rt.gate.generation();
+        let intent = rt.register_selector_intent();
+        let predicted = rt.classify_staged(&disk);
+        assert_eq!(predicted.pending_apply, changed, "staged {axis}");
+        assert!(
+            !predicted.restart_required,
+            "physical restart is decided by the generated Apply plan"
+        );
+        assert_eq!(
+            rt.pending_changes().pending_apply,
+            changed,
+            "pending {axis}"
+        );
+        if changed {
+            assert_eq!(predicted.decision, "defer", "{axis}");
+            assert!(matches!(
+                rt.classify_switch(&disk, false),
+                ClassifiedSwitch::Fallback(_)
+            ));
+            let before = rt.current_config_snapshot();
+            assert_eq!(
+                rt.switch_persisted_config_if_current(disk.clone(), true, intent, |_| {})
+                    .await,
+                Some(SwitchOutcome::Deferred)
+            );
+            assert_eq!(
+                rt.current_config_snapshot(),
+                before,
+                "save must retain R: {axis}"
+            );
+            assert!(rt.pending_changes().pending_apply);
+            // The real Apply entry refuses absent accepted runtime proof before
+            // any RPC. It must not manufacture NoOp/commit R or a restart token.
+            assert!(rt.runtime_config_baseline.read().unwrap().is_none());
+            let result = rt.apply_pending_transaction(None).await;
+            assert_eq!(result.status, "unconfirmed", "{axis}");
+            assert!(result.restart_confirmation.is_none());
+            assert_eq!(rt.current_config_snapshot(), before);
+            assert_eq!(
+                rt.startup_snapshot.read().unwrap().as_ref(),
+                Some(&accepted)
+            );
+            assert!(rt.pending_changes().pending_apply);
+        } else {
+            assert_eq!(
+                predicted.decision, "noOp",
+                "metadata/binding control: {axis}"
+            );
+            let saved = rt
+                .switch_persisted_config_if_current(disk.clone(), true, intent, |_| {})
+                .await;
+            assert!(
+                matches!(saved, Some(SwitchOutcome::NoOp | SwitchOutcome::Unchanged)),
+                "{axis}"
+            );
+            // D and the switch input stay raw; R uses the real privacy-free projection.
+            let mut expected_runtime = disk.clone();
+            crate::commands::config::strip_privacy_secrets(&mut expected_runtime);
+            assert_eq!(rt.current_config_snapshot(), Some(expected_runtime.clone()));
+            assert!(
+                !rt.pending_changes().pending_apply,
+                "metadata must not invent debt: {axis}"
+            );
+            assert!(rt.runtime_config_baseline.read().unwrap().is_none());
+            assert_eq!(
+                rt.apply_pending_transaction(None).await.status,
+                "unconfirmed"
+            );
+            assert_eq!(rt.current_config_snapshot(), Some(expected_runtime.clone()));
+            assert!(!rt.pending_changes().pending_apply);
+        }
+        assert!(
+            sink.calls().is_empty(),
+            "identity/ledger changes are not selector PUTs"
+        );
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        assert_eq!(
+            rt.gate.generation(),
+            generation,
+            "no implicit lifecycle claim"
+        );
+    }
 }
 
 /// 🔴 **第四类重启已消灭**（行为门，钉住上一条断言背后的那个事实）。

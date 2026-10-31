@@ -312,20 +312,16 @@ esac
     const finalStart = pkg.indexOf('\n  release:\n');
     expect(finalStart).toBeGreaterThan(0);
     const finalJob = executable(pkg.slice(finalStart));
-    expect(finalJob).toContain('needs: [release_desktop, android_release, linux_package_acceptance, linux_tun_package_acceptance]');
+    expect(finalJob).toContain('needs: [release_desktop, android_release]');
     const condition = /^    if: >-\n((?:      .*\n)+)/m.exec(finalJob);
     expect(condition).not.toBeNull();
     const expression = condition![1].split('\n').map(line => line.trim()).filter(Boolean).join(' ');
-    expect(expression).toBe("inputs.linux_auth_preflight_only != true && (always() && needs.release_desktop.result == 'success' && needs.android_release.result == 'success' && needs.linux_package_acceptance.result == 'success' && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success'))");
-    const success = { release_desktop: { result: 'success' }, android_release: { result: 'success' },
-      linux_package_acceptance: { result: 'success' }, linux_tun_package_acceptance: { result: 'success' } };
-    for (const preflight of [false, '', true]) for (const tun of [false, '', true]) {
-      for (const job of Object.keys(success)) for (const result of ['success', 'failure', 'cancelled', 'skipped']) {
-        const needs = { ...success, [job]: { result } };
-        const expected = preflight !== true && (result === 'success' || (job === 'linux_tun_package_acceptance' && tun !== true));
-        expect(runInNewContext(expression, { inputs: { linux_auth_preflight_only: preflight, linux_tun_acceptance: tun },
-          needs, always: () => true }), `${job}/${result}/preflight=${preflight}/tun=${tun}`).toBe(expected);
-      }
+    expect(expression).toBe("(always() && needs.release_desktop.result == 'success' && needs.android_release.result == 'success' )");
+    const success = { release_desktop: { result: 'success' }, android_release: { result: 'success' } };
+    for (const job of Object.keys(success)) for (const result of ['success', 'failure', 'cancelled', 'skipped']) {
+      const needs = { ...success, [job]: { result } };
+      expect(runInNewContext(expression, { needs, always: () => true }), `${job}/${result}`)
+        .toBe(result === 'success');
     }
     // 写 release 的命令只出现在这三个 job 里（package / core_wire 等构建腿一条都没有）。
     for (const name of ['setup', 'package', 'core_wire'] as const) {

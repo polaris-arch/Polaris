@@ -11,5 +11,5 @@ use super::*;
 #[test]
 fn proto_version_is_unified_current() {
     assert_eq!(PROTO_VERSION, polaris_helper_proto::proto_version::CURRENT);
-    assert_eq!(PROTO_VERSION, 2);
+    assert_eq!(PROTO_VERSION, 3);
 }

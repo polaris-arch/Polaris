@@ -276,6 +276,13 @@ trait ChildWaiter: Send {
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
 }
 
+impl ChildWaiter for polaris_core_supervisor::admitted_payload::StdCustodiedChild {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.try_wait()
+    }
+}
+
+#[cfg(test)]
 impl ChildWaiter for Child {
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         Child::try_wait(self)
@@ -311,6 +318,14 @@ enum ChildWaitOutcome {
 }
 
 impl ChildSlot {
+    fn from_admitted_child(
+        child: polaris_core_supervisor::admitted_payload::StdCustodiedChild,
+        handle: CoreHandle,
+    ) -> Arc<Self> {
+        debug_assert_eq!(child.id(), handle.pid);
+        Self::with_waiter(handle, Box::new(child))
+    }
+    #[cfg(test)]
     fn from_child(child: Child, handle: CoreHandle) -> Arc<Self> {
         debug_assert_eq!(child.id(), handle.pid);
         Self::with_waiter(handle, Box::new(child))
@@ -856,45 +871,34 @@ impl AmbientCapsSpawner {
             .map_err(|error| SpawnError::Spawn {
                 detail: format!("secure log path: {error}"),
             })?;
-        // Go: exec.Command(coreBin(), "run", "-c", cfg)（:431）。
-        // /proc/self/fd is resolved by exec while the verified original fd is
-        // still open. It is never a second open of a user-supplied executable.
-        use std::os::fd::AsRawFd;
-        let executable = core.as_ref().map_or_else(
-            || req.binary.clone(),
-            |core| PathBuf::from(format!("/proc/self/fd/{}", core.binary.as_raw_fd())),
-        );
-        let mut cmd = std::process::Command::new(executable);
-        if let Some(core) = &core {
-            cmd.env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("LD_LIBRARY_PATH", &core.directory);
-        }
-        cmd.arg("run").arg("-c").arg(&req.config);
-
-        // CWD = 配置文件所在目录（= 用户可写 config 目录）：helper daemon（systemd）CWD=`/`，spawn 的核继承 `/`
-        // → dashboard 下载兜底相对 mkdir `/dashboard` 只读失败噪音。设为可写目录即消。std 在 fork 后、pre_exec
-        // 降权闭包**之前** chdir（此刻仍 root，可 chdir 任意目录），降权后核 CWD = 用户目录，两不冲突。
-        // Polaris 生成的核配置其余路径全绝对，不受 CWD 影响。取不到父目录（极端形态）则不设，继承旧行为。
-        if let Some(cwd) = req.config.parent() {
-            cmd.current_dir(cwd);
-        }
-
-        // B3/W26：child 输出走 pipe → shared 有界 writer；直接继承一个 append fd 无法在运行期安全
-        // 轮转（rename 后 child 仍写旧 inode/handle），正是历史 `singbox.log` 无界增长的同型风险。
-        if pinned_log.is_some() {
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-        }
-
-        // Go :434-442：SysProcAttr{Credential{Uid,Gid,Groups}, AmbientCaps}。降权+ambient 经 pre_exec 装。
-        attach_privilege_drop(&mut cmd, req.uid, req.gid, req.groups.clone());
-
-        // Go :452：c.Start()。失败 → ERR start（转发态复位由 handler 负责，对照 :456）。
-        let process_started = std::time::Instant::now();
-        let mut child = cmd.spawn().map_err(|e| SpawnError::Spawn {
-            detail: e.to_string(),
+        let admitted = core.as_ref().ok_or_else(|| SpawnError::Spawn {
+            detail: "compiled pinned execution required".into(),
         })?;
+        let execution = admitted
+            .prepare(polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain)
+            .map_err(|error| SpawnError::Spawn {
+                detail: error.to_string(),
+            })?;
+        let process_started = std::time::Instant::now();
+        let mut child = execution
+            .spawn_linux_helper_run(
+                &req.config,
+                polaris_core_supervisor::admitted_payload::LinuxHelperIdentity {
+                    uid: req.uid,
+                    gid: req.gid,
+                    groups: req.groups.clone(),
+                },
+                pinned_log.is_some(),
+                admitted
+                    .execution_lease()
+                    .map_err(|error| SpawnError::Spawn {
+                        detail: error.to_string(),
+                    })?,
+                Arc::clone(admitted) as Arc<dyn Send + Sync>,
+            )
+            .map_err(|error| SpawnError::Spawn {
+                detail: error.to_string(),
+            })?;
         let pid = child.id();
         let process_ms = crate::elapsed_ms(process_started);
 
@@ -902,12 +906,12 @@ impl AmbientCapsSpawner {
         if let Some(log) = pinned_log {
             // 与 Windows 已验证形态一致：pipe 所有权先交后台，日志裁剪/轮转/open/fchown 不再阻塞
             // helper 回复。线程持有读端，child 不会在 writer 就绪前收到 broken pipe。
-            let stdout = child.stdout.take().map(|inner| PinnedReader {
+            let stdout = child.take_stdout().map(|inner| PinnedReader {
                 inner,
                 _directory: Arc::clone(&log.directory),
                 _tail: ReapTail::new(&self.reaps),
             });
-            let stderr = child.stderr.take().map(|inner| PinnedReader {
+            let stderr = child.take_stderr().map(|inner| PinnedReader {
                 inner,
                 _directory: Arc::clone(&log.directory),
                 _tail: ReapTail::new(&self.reaps),
@@ -950,7 +954,7 @@ impl AmbientCapsSpawner {
             Some(core) => handle.with_core(core, req.uid),
             None => handle,
         };
-        let slot = ChildSlot::from_child(child, handle.clone());
+        let slot = ChildSlot::from_admitted_child(child, handle.clone());
         self.slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1019,6 +1023,7 @@ impl AmbientCapsSpawner {
     unsafe_code,
     reason = "CommandExt::pre_exec is required to drop uid/gid before exec"
 )]
+#[cfg(test)]
 pub(super) fn attach_privilege_drop(
     cmd: &mut std::process::Command,
     uid: u32,
@@ -1047,6 +1052,7 @@ pub(super) fn attach_privilege_drop(
 /// 5. raise Inheritable + 6. raise Ambient（逐 cap；降权后 permitted 已留，加 inheritable 再抬 ambient）。
 ///
 /// 任一步失败即 `Err` → std 中止 execve → `c.spawn()` 返错 → handler 回 `ERR start`（fail-closed）。
+#[cfg(test)]
 fn apply_privilege_drop(
     uid: u32,
     gid: u32,

@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::runtime::core_child::Child;
 use polaris_core_supervisor::{scan_running_cores, stale_cores, CoreProcess, Signal, StaleCores};
-use tokio::process::Child;
 
 #[cfg(any(not(unix), test))]
 use polaris_helper_proto::Platform;
@@ -456,8 +456,8 @@ impl DirectCoreRun {
     }
 
     #[cfg(test)]
-    pub(super) fn new(child: Child) -> Self {
-        Self::with_identity(child, RunIdentity::new())
+    pub(super) fn new(child: impl Into<Child>) -> Self {
+        Self::with_identity(child.into(), RunIdentity::new())
     }
 
     pub(super) fn with_identity(child: Child, identity: RunIdentity) -> Self {
@@ -1003,9 +1003,24 @@ impl ProxyRuntime {
         self.register_helper_start_backend_with_main(None)
     }
 
+    #[cfg(test)]
     pub(super) fn register_helper_start_backend_with_main(
         &self,
         main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ) -> Result<HelperStartToken, String> {
+        let token =
+            self.register_helper_start_backend_in_generation(main_token, self.gate.generation())?;
+        self.child
+            .lock()
+            .unwrap()
+            .mark_helper_start_worker_returned_for_test(&token);
+        Ok(token)
+    }
+
+    pub(super) fn register_helper_start_backend_in_generation(
+        &self,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+        generation: u64,
     ) -> Result<HelperStartToken, String> {
         self.register_helper_backend()?;
         let mut child = self
@@ -1013,7 +1028,12 @@ impl ProxyRuntime {
             .lock()
             .map_err(|_| "child lock poisoned".to_string())?;
         let token = child
-            .begin_helper_start_with_main(main_token)
+            .begin_bound_helper_start(
+                main_token,
+                Arc::downgrade(&self.child),
+                Arc::downgrade(&self.pid),
+                generation,
+            )
             .map_err(|error| format!("helper IPC rejected by direct Child custody: {error:?}"))?;
         self.core_via_helper.store(true, Ordering::SeqCst);
         Ok(token)
@@ -1198,6 +1218,26 @@ impl ProxyRuntime {
         ts_gate: Option<&tokio::sync::MutexGuard<'_, ()>>,
     ) -> Result<HelperStartToken, String> {
         self.register_helper_backend()?;
+        {
+            let child = self
+                .child
+                .lock()
+                .map_err(|_| "child lock poisoned".to_owned())?;
+            let pid = self
+                .pid
+                .lock()
+                .map_err(|_| "pid lock poisoned".to_owned())?;
+            if let Some(attempt) = child.locally_closed_helper_attempt(
+                &self.child,
+                &self.pid,
+                *pid,
+                self.gate.generation(),
+            ) {
+                // Local, same-runtime idempotence only. No new IPC or claim release,
+                // and no change to the historical helper/direct admission fence.
+                return Ok(attempt);
+            }
+        }
         let (attempt, intended, nonce) = self
             .child
             .lock()
@@ -1298,6 +1338,7 @@ impl ProxyRuntime {
         let current = *g;
         if !child.helper_pid_bookkeeping_matches(permit.attempt(), permit.target(), current)
             || !child.helper_stop_matches(permit.attempt(), permit.target(), permit.nonce())
+            || !child.helper_attempt_scope_matches(permit.attempt(), &self.child, &self.pid)
         {
             log::warn!(
                 "helper 停核腿收口时发现受管 attempt/birth 记账已换人（{:?}→{current:?}）→ \
@@ -1306,12 +1347,17 @@ impl ProxyRuntime {
             );
             return Ok(false);
         }
+        let Some(terminal) =
+            child.prepare_helper_terminal(permit.attempt(), permit.target(), permit.nonce())
+        else {
+            return Ok(false);
+        };
         if let Some((_, Some(token))) = child.helper_main_claim_for_stop() {
             release_main(&token)?;
         }
         // Same locked attempt/nonce was checked above. No await or fallible
         // operation follows successful registry compare-remove.
-        assert!(child.confirm_helper_stop(permit.attempt(), permit.target(), permit.nonce()));
+        child.commit_helper_terminal(terminal);
         *g = None;
         // The exact ACK proves only that this helper birth was natively
         // reaped. It does not prove that helper-owned side effects or other
@@ -1767,6 +1813,7 @@ impl StaleCoreIo for NativeStaleCoreIo {
 ///   **P4 起该平台已有受保护核目录**（`C:\ProgramData\Polaris\core`），故本自证在 win 上不再是
 ///   「本就没价值」而是「这条腿还没接」——真正的 win 侧实跑映像来自 D2/D3 的 `status` 回传
 ///   `image=`（见 spec §3.1），不是本函数。
+#[cfg(test)]
 fn running_exe_path(pid: u32) -> Option<PathBuf> {
     // pid=0 = 调用方还没拿到真 pid（helper 未回传 / spawn 失败）→ 没有可观测对象。
     if pid == 0 {
@@ -1779,6 +1826,7 @@ fn running_exe_path(pid: u32) -> Option<PathBuf> {
 ///
 /// 同步 IPC，只在 [`running_exe_path`] 取不到时才调用（Windows 的 helper 腿）。通信/协议失败
 /// 一律 `None` —— 读不到就是读不到，自证据此判 `Unobservable`（只 warn），绝不冒充通过。
+#[cfg(test)]
 fn helper_reported_core_image(
     helper: Option<&crate::runtime::helper::HelperRuntime>,
     pid: u32,
@@ -1999,10 +2047,10 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     crate::runtime::windows_process::is_alive(pid)
 }
 
-// Capability menus must inspect the actual helper/direct image while connected,
-// and the same resolver used by startup while disconnected.
+// Inventory resolves selected candidate data, then admits TlsInventory only.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ProxyRuntime {
+    #[cfg(test)]
     pub(super) fn tls_ready_binary_for_pid(
         &self,
         pid: u32,
@@ -2022,14 +2070,18 @@ impl ProxyRuntime {
         })
     }
 
-    pub(crate) fn tls_capability_binary(&self) -> Result<std::path::PathBuf, String> {
-        let status = self.status();
-        if status.running {
-            return self
-                .tls_ready_binary_for_pid(status.pid, self.core_via_helper.load(Ordering::SeqCst))
-                .ok_or_else(|| "Running core image could not be observed".to_owned());
+    pub(super) fn tls_capability_selection(
+        &self,
+    ) -> Result<super::core_binary::CoreSelectionObservation, String> {
+        #[cfg(not(test))]
+        {
+            super::core_binary::resolve_core_candidate_observation()
         }
-        self.core_binary_for_start()
+        #[cfg(test)]
+        {
+            self.core_binary_for_start()
+                .map(super::core_binary::CoreSelectionObservation::fixture)
+        }
     }
 }
 

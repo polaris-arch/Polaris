@@ -23,7 +23,13 @@ export interface ListEditorProps {
    *  `domain/effective-config` 注入读出的冻结清单。放宽成 `readonly` 是向后兼容的：
    *  可变数组照样可传。 */
   value: readonly string[];
-  onChange: (next: string[]) => void;
+  /** Optional identities travel with rows through edits/deletions/imports.
+   * A synchronous canonical receipt accepts an identified transaction; void/async callers
+   * retain the existing draft semantics. No promise is awaited or applied. */
+  entryIds?: readonly (string | undefined)[];
+  /** Invalidates transient selection provenance after an external selection change. */
+  entryContextKey?: string;
+  onChange: (next: string[], entryIds: readonly (string | undefined)[], sources: readonly ListEntrySource[], context?: unknown) => unknown;
   placeholder?: string;
   ariaLabel?: string;
   /** 添加按钮文案 */
@@ -39,7 +45,7 @@ export interface ListEditorProps {
   className?: string;
   id?: string;
   /** 行尾附加控件（DNS 自定义上游的启用开关）；位于删除按钮之前。 */
-  renderRowEnd?: (entry: string, index: number) => ReactNode;
+  renderRowEnd?: (entry: string, index: number, entryId?: string) => ReactNode;
 }
 
 /*
@@ -47,12 +53,14 @@ export interface ListEditorProps {
  * `@/domain/list-entries` —— 移动端 TUN 页要用同一套去重与草稿规则，而本文件 import 桌面原语，
  * 移动端 import 不得。搬家的完整理由写在那边的头注上。这里 re-export，既有调用点与两份单测不动。
  */
-import { nextDraft, parseBulkEntries, sameEntries } from '@/domain/list-entries';
+import { nextDraft, parseBulkEntries, sameEntries, listEntryRow, listEntryRows, listEntrySources, sameListEntryRows, nextListEntryDraft, importListEntryRows, listEntryAcceptance, type ListEntryAcceptance, type ListEntrySource, type ListEntryRow } from '@/domain/list-entries';
 
 export { nextDraft, parseBulkEntries, sameEntries };
 
 export function ListEditor({
   value,
+  entryIds,
+  entryContextKey,
   onChange,
   placeholder,
   ariaLabel = 'Entry',
@@ -85,35 +93,69 @@ export function ListEditor({
    *
    * 分工：**打字只动草稿**；blur / Enter 提交。删除 / 添加 / 批量导入是**离散动作**，照旧立即提交，
    * 但一律基于**草稿**而非 `value` —— 基于后者会把另一行里还没提交的编辑一起丢掉。 */
-  const [draft, setDraft] = useState<readonly string[]>(value);
-  const seededRef = useRef<readonly string[]>(value);
+  const incoming = listEntryRows(value, entryIds);
+  const [draft, setDraft] = useState<readonly ListEntryRow[]>(incoming);
+  const seededRef = useRef<readonly ListEntryRow[]>(incoming);
+  const acceptedRef = useRef<ListEntryAcceptance | undefined>(undefined);
+  const continuationRef = useRef<unknown>(undefined);
+  const contextKeyRef = useRef(entryContextKey);
   useEffect(() => {
-    setDraft((cur) => nextDraft(cur, seededRef.current, value));
-    seededRef.current = value;
-  }, [value]);
+    const seed = seededRef.current;
+    const accepted = acceptedRef.current;
+    const matching = accepted && sameListEntryRows(accepted.canonical, incoming);
+    setDraft((cur) => nextListEntryDraft(cur, seed, incoming, accepted));
+    if (accepted && matching) {
+      continuationRef.current = accepted.contextKey === entryContextKey ? accepted.context : undefined;
+      if (acceptedRef.current === accepted) acceptedRef.current = undefined;
+    } else if (contextKeyRef.current !== entryContextKey || !sameListEntryRows(seed, incoming)) {
+      continuationRef.current = undefined;
+      // Keep pending identity/selection bindings through older props. A pool
+      // different from the pending result invalidates its selection origins.
+      if (accepted && contextKeyRef.current !== entryContextKey && accepted.contextKey !== entryContextKey) {
+        acceptedRef.current = { ...accepted, context: undefined };
+      }
+    }
+    contextKeyRef.current = entryContextKey;
+    seededRef.current = incoming;
+  }, [value, entryIds, entryContextKey]);
 
   const atCap = max !== undefined && draft.length >= max;
 
-  /** 提交到父级。与 `value` 逐项相同就**不写** —— 同 `commitDns` 的「无变化不写」，免一次无谓落盘。 */
-  function commit(next: readonly string[]) {
+  function accept(result: unknown, submitted: readonly ListEntryRow[]) {
+    if (entryIds === undefined) return; // Legacy void/async callbacks are unchanged.
+    const accepted = listEntryAcceptance(result, submitted);
+    if (!accepted) return; // A rejected newer commit cannot retire an older valid receipt.
+    if (sameListEntryRows(accepted.canonical, incoming)) {
+      setDraft((cur) => nextListEntryDraft(cur, incoming, incoming, accepted));
+      continuationRef.current = accepted.contextKey === entryContextKey ? accepted.context : undefined;
+      acceptedRef.current = undefined;
+    } else {
+      acceptedRef.current = accepted;
+    }
+  }
+
+  function commit(next: readonly ListEntryRow[]) {
     setDraft(next);
-    if (!sameEntries(next, value)) onChange([...next]);
+    if (!sameListEntryRows(next, incoming)) {
+      const result = onChange(next.map((row) => row.value), next.map((row) => row.id), listEntrySources(next), continuationRef.current);
+      accept(result, next);
+    }
   }
 
   /** 打字：**只动草稿**，绝不碰父级（这一行就是本次修复的全部要点）。 */
   function editRow(idx: number, next: string) {
-    setDraft((cur) => cur.map((s, i) => (i === idx ? next : s)));
+    setDraft((cur) => cur.map((row, i) => (i === idx ? { ...row, value: next } : row)));
   }
   function remove(idx: number) {
     commit(draft.filter((_, i) => i !== idx));
   }
   function add() {
     if (atCap) return;
-    commit([...draft, '']);
+    commit([...draft, listEntryRow('')]);
   }
 
   function applyImport() {
-    commit(parseBulkEntries(importDraft, [...draft], max, entryIdentity));
+    commit(importListEntryRows(importDraft, draft, max, entryIdentity));
     setImportDraft('');
     setImportOpen(false);
   }
@@ -122,10 +164,10 @@ export function ListEditor({
     <>
       <div id={id} className={className ? `cidr-list list-ed ${className}` : 'cidr-list list-ed'}>
         {draft.map((entry, idx) => (
-          <div key={idx} className="cidr-row">
+          <div key={entryIds === undefined ? idx : entry.key} className="cidr-row">
             {/* onChange 只动草稿；onBlur 提交，Enter 触发 blur 即提交（同 SettingsDns 的三个文本框）。 */}
             <TextInput
-              value={entry}
+              value={entry.value}
               onChange={(e) => editRow(idx, e.target.value)}
               onBlur={() => commit(draft)}
               onKeyDown={(e) => {
@@ -135,7 +177,7 @@ export function ListEditor({
               placeholder={placeholder}
               className={mono ? 'mono' : undefined}
             />
-            {renderRowEnd?.(entry, idx)}
+            {renderRowEnd?.(entry.value, idx, entry.id)}
             <button type="button" onClick={() => remove(idx)} aria-label={t('common.delete')} className="cidr-del">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
                 <path d="M5 5l14 14M19 5L5 19" />

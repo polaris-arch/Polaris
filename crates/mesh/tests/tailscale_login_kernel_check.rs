@@ -94,7 +94,8 @@ fn bundled_core_accepts_isolated_tailscale_login_config() {
             port: 19090,
             secret: "test-only-api-secret".into(),
         };
-        let generated = build_tailscale_login_config(&server, &dir.0, &api).unwrap();
+        let cache_path = dir.0.join(format!("login-{index}.cache.db"));
+        let generated = build_tailscale_login_config(&server, &dir.0, &api, &cache_path).unwrap();
         let value = login_config_to_json(&generated);
         assert_eq!(value["endpoints"][0]["tag"], TAILSCALE_LOGIN_ENDPOINT_TAG);
         assert_eq!(

@@ -657,7 +657,7 @@ fn parse_anytls(u: &Url, id_gen: &mut impl FnMut() -> String) -> Result<ServerCo
 /// snell://psk@address:port?version=4&obfs=http&obfs-host=..#name
 ///
 /// version 缺省 4；sing-box 官方 snell 仅支持 4/6（v1-3 为 Surge/mihomo 旧协议版本），
-/// 版本/混淆超出能力（如 obfs=tls）→ 整节点拒绝（入库也连不上，防假节点）。
+/// v4 支持 HTTP/TLS 混淆；v6 的 active obfs 或未知模式拒绝。
 fn parse_snell(u: &Url, id_gen: &mut impl FnMut() -> String) -> Result<ServerConfig, String> {
     // psk 含未编码 ':' 时 URL 引擎会拆成 username:password——两段拼回，避免 psk 静默截断成假节点。
     let raw_psk = match u.password() {
@@ -691,13 +691,13 @@ fn parse_snell(u: &Url, id_gen: &mut impl FnMut() -> String) -> Result<ServerCon
         .or_else(|| b.params.get("obfs-mode"))
         .map(|s| s.to_lowercase());
     if let Some(o) = obfs.as_deref().filter(|o| !o.is_empty() && *o != "none") {
-        if version == 4 && o == "http" {
-            snell.obfs_mode = Some("http".to_string());
+        if version == 4 && matches!(o, "http" | "tls") {
+            snell.obfs_mode = Some(o.to_string());
             if let Some(host) = b.params.get_ne("obfs-host") {
                 snell.obfs_host = Some(host);
             }
         } else {
-            // v4 tls 混淆（Surge 旧形态）/ v6 带 obfs：sing-box snell 无对应能力。
+            // v6 不接受 v4 obfs；未知模式也不能降级为无混淆。
             return Err(format!("Snell obfs 不受支持: {o}"));
         }
     }

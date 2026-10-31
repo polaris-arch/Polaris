@@ -14,6 +14,8 @@ use polaris_config_engine::user_config::UserConfig;
 use polaris_singbox_grpc::{daemon, Endpoint, RuntimeConfigError, SingBoxApiClient};
 use serde::Serialize;
 use serde_json::Value;
+pub(crate) mod api_handoff;
+use api_handoff::{ApiChannelHandoff, ApiEndpoint, ApiRelayEpoch};
 
 // The protocol is an authenticated observation of a previously byte/source-admitted
 // core. Its manifest digest is metadata, NOT a signature or substitute for that
@@ -210,9 +212,26 @@ fn unsupported_runtime_paths(capabilities: &daemon::RuntimeCapabilities) -> Vec<
         .collect()
 }
 
+fn tailnet_tun_projection_changed(accepted: &SingBoxConfig, candidate: &SingBoxConfig) -> bool {
+    let projection = |config: &SingBoxConfig| {
+        config
+            .inbounds
+            .iter()
+            .filter(|inbound| inbound.type_field == "tun")
+            .map(|inbound| inbound.route_exclude_address.clone())
+            .collect::<Vec<_>>()
+    };
+    projection(accepted) != projection(candidate)
+}
+
 #[derive(Clone)]
 pub(super) struct RuntimeConfigBaseline {
-    generation: u64,
+    management: Option<ApiEndpoint>,
+    control: Option<Arc<SingBoxApiClient>>,
+    api_epoch: Arc<ApiRelayEpoch>,
+    api_saved_projection: Option<api_handoff::ApiSavedProjection>,
+    pub(super) api_log_handoff: Option<super::core_log::CoreLogHandoff>,
+    pub(super) generation: u64,
     committed_transaction: Option<String>,
     pairing: RuntimePairing,
     physical_route_config: UserConfig,
@@ -296,6 +315,7 @@ struct RestartChoice {
 }
 #[derive(Clone)]
 struct PendingOperation {
+    api_handoff: Option<Arc<ApiChannelHandoff>>,
     pairing: RuntimePairing,
     desired: Value,
     deletion_scope: Vec<crate::runtime::config::DeferredConfigDeletion>,
@@ -311,6 +331,8 @@ struct PendingOperation {
     published: bool,
     binding_plan: polaris_platform_events::RuntimeBindingPlan,
     mesh_evidence: super::mesh_route_report::MeshRouteRunEvidence,
+    tailnet_suspended_token: Option<u64>,
+    tailnet_bindings: BTreeMap<String, super::tailnet_rules::TailnetRouteBinding>,
 }
 #[derive(Default)]
 pub(super) struct RuntimeConfigApplyState {
@@ -543,20 +565,13 @@ impl ProxyRuntime {
         let Some(baseline) = baseline.filter(|value| value.generation == generation) else {
             return Err(Box::new(RuntimeApplyResult::status("unconfirmed")));
         };
-        let Some(service) = baseline
-            .generated
-            .services
-            .as_ref()
-            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
-        else {
+        if baseline.management.is_none() {
             return Err(Box::new(RuntimeApplyResult::status("unconfirmed")));
-        };
-        let client = SingBoxApiClient::connect(
-            Endpoint::new("127.0.0.1", service.listen_port),
-            service.secret.clone().unwrap_or_default(),
-        )
-        .await
-        .map_err(|_| RuntimeApplyResult::status("unconfirmed"))?;
+        }
+        let client = self
+            .runtime_management_client(generation)
+            .await
+            .map_err(|_| RuntimeApplyResult::status("unconfirmed"))?;
         paired_runtime_capabilities(&client, &baseline.pairing).await?;
         if self.gate.generation() != generation || self.gate.is_busy() || !self.core_running() {
             return Err(Box::new(RuntimeApplyResult::status("conflict")));
@@ -618,6 +633,11 @@ impl ProxyRuntime {
     ) {
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
             *baseline = Some(RuntimeConfigBaseline {
+                management: ApiEndpoint::from_generated(&generated),
+                control: None,
+                api_epoch: Arc::default(),
+                api_saved_projection: None,
+                api_log_handoff: None,
                 generation,
                 committed_transaction: None,
                 pairing,
@@ -627,14 +647,22 @@ impl ProxyRuntime {
             });
         }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
+            if let Some(h) = state.pending.as_ref().and_then(|p| p.api_handoff.as_ref()) {
+                h.revoke();
+            }
             *state = RuntimeConfigApplyState::default();
         }
     }
     pub(super) fn clear_runtime_config_baseline(&self) {
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
-            *baseline = None;
+            if let Some(previous) = baseline.take() {
+                previous.api_epoch.invalidate();
+            }
         }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
+            if let Some(h) = state.pending.as_ref().and_then(|p| p.api_handoff.as_ref()) {
+                h.revoke();
+            }
             *state = RuntimeConfigApplyState::default();
         }
     }
@@ -725,51 +753,35 @@ impl ProxyRuntime {
         let Some(mut baseline) = baseline.filter(|s| s.generation == generation) else {
             return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
         };
-        // Authenticate against the accepted running service, never an edited D secret.
-        let Some(service) = baseline
-            .generated
-            .services
-            .as_ref()
-            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
-        else {
+        // The pinned management endpoint can advance independently from R after
+        // a committed but locally superseded candidate; only HMAC proof updates it.
+        let Some(endpoint) = baseline.management.as_ref() else {
             return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
         };
-        let port = service.listen_port;
-        let secret = service.secret.clone().unwrap_or_default();
-        let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await
+        let pending_before_client = self
+            .runtime_config_apply
+            .lock()
+            .ok()
+            .and_then(|s| s.pending.clone());
+        let mut client = if let Some(h) = pending_before_client
+            .as_ref()
+            .and_then(|p| p.api_handoff.as_ref())
+            .filter(|h| !h.confirmed())
         {
-            Ok(client) => client,
-            Err(_) => {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-            }
-        };
-        let capabilities = match paired_runtime_capabilities(&client, &baseline.pairing).await {
-            Ok(value) => value,
-            // Missing RPC/authentication/protocol/manifest/incarnation never grants
-            // a same-core restart token. The old baseline must not adopt this peer.
-            Err(result) => {
-                if let Ok(mut state) = self.runtime_config_apply.lock() {
-                    state.restart = None;
-                }
-                return self.remember_runtime_result(*result);
-            }
-        };
-        if self.gate.is_busy() || !self.selector_operation_is_current(generation, intent) {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
-        }
-        if !capabilities.connected_hot_enabled {
-            if self.current_config_snapshot().as_ref() == Some(&candidate) {
+            h.origin.clone()
+        } else if let Some(control) = baseline.control.clone() {
+            if !control.captured_transport_live() {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
             }
-            let result = self.restart_choice(
-                &candidate,
-                "structuralChange",
-                unsupported_runtime_paths(&capabilities),
-                generation,
-                intent,
-            );
-            return self.remember_runtime_result(result);
-        }
+            control
+        } else {
+            match endpoint.connect().await {
+                Ok(client) => Arc::new(client),
+                Err(_) => {
+                    return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
+                }
+            }
+        };
         // An ambiguous previous Apply is reconciled by its original transaction ID.
         // Never send it again or replace it with a newer candidate blindly.
         let pending = self
@@ -799,6 +811,42 @@ impl ProxyRuntime {
                     return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
                 }
             };
+        }
+        if baseline.management.is_some() {
+            match self.runtime_management_client(generation).await {
+                Ok(fresh) => client = fresh,
+                Err(_) => {
+                    return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
+                }
+            }
+        }
+
+        let capabilities = match paired_runtime_capabilities(&client, &baseline.pairing).await {
+            Ok(value) => value,
+            // Missing RPC/authentication/protocol/manifest/incarnation never grants
+            // a same-core restart token. The old baseline must not adopt this peer.
+            Err(result) => {
+                if let Ok(mut state) = self.runtime_config_apply.lock() {
+                    state.restart = None;
+                }
+                return self.remember_runtime_result(*result);
+            }
+        };
+        if self.gate.is_busy() || !self.selector_operation_is_current(generation, intent) {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        if !capabilities.connected_hot_enabled {
+            if self.current_config_snapshot().as_ref() == Some(&candidate) {
+                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            }
+            let result = self.restart_choice(
+                &candidate,
+                "structuralChange",
+                unsupported_runtime_paths(&capabilities),
+                generation,
+                intent,
+            );
+            return self.remember_runtime_result(result);
         }
         if !self.selector_operation_is_current(generation, intent) {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
@@ -830,7 +878,29 @@ impl ProxyRuntime {
         {
             return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
         }
+        let previous_raw = match self.current_config_snapshot() {
+            Some(value) => value,
+            None => return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
+        };
         let mut deps = baseline.deps.clone();
+        if let Some(endpoint) = baseline.management.as_ref() {
+            deps.tailscale_api_port = endpoint.port;
+        }
+        if let Ok(previous) = serde_json::from_value::<UserConfig>(previous_raw.clone()) {
+            let requested =
+                polaris_config_engine::user_config::proxy_ports::control_api_port(&typed);
+            if requested
+                != polaris_config_engine::user_config::proxy_ports::control_api_port(&previous)
+            {
+                deps.tailscale_api_port = requested;
+            }
+        }
+
+        deps.observed_tailnet_addresses = self.accepted_tailnet_for_config(
+            &previous_raw,
+            &candidate,
+            &baseline.deps.observed_tailnet_addresses,
+        );
         let (log_level, disable_log_file) = super::core_log::log_axes_from_config(&candidate);
         deps.log_level = log_level;
         deps.disable_log_file = disable_log_file;
@@ -909,6 +979,17 @@ impl ProxyRuntime {
             });
             return self.remember_runtime_result(result);
         }
+        if deps.observed_tailnet_addresses != baseline.deps.observed_tailnet_addresses
+            && tailnet_tun_projection_changed(&baseline.generated, &outcome.config)
+        {
+            return self.remember_runtime_result(self.restart_choice(
+                &candidate,
+                "structuralChange",
+                vec!["inbounds.tun.route_exclude_address".into()],
+                generation,
+                intent,
+            ));
+        }
         let network_canary = outcome.network_canary;
         let mut generated = outcome.config;
         generated.polaris_windows_directory = baseline.generated.polaris_windows_directory.clone();
@@ -928,17 +1009,14 @@ impl ProxyRuntime {
         // Compare with the current R projection, not startup defaults, which may
         // have diverged after explicit live selection. Snapshot paths are CAS-bound
         // by the kernel, including automatic URLTest winners.
-        let previous: UserConfig = match self
-            .current_config_snapshot()
-            .and_then(|v| serde_json::from_value(v).ok())
-        {
+        let previous: UserConfig = match serde_json::from_value(previous_raw).ok() {
             Some(value) => value,
             None => return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
         };
         let previous = match generate_sing_box_config_with_report_and_runtime_bindings(
             &previous,
             &BTreeMap::new(),
-            &deps,
+            &baseline.deps,
             &previous_bindings,
         )
         .ok()
@@ -981,6 +1059,15 @@ impl ProxyRuntime {
             generation,
             true,
         );
+        let tailnet_bindings = self.tailnet_bindings(&candidate, &generated);
+        if !self.tailnet_bindings_within_limit(&tailnet_bindings) {
+            let mut result = RuntimeApplyResult::status("rejected");
+            result.reasons.push(RuntimeApplyReason {
+                code: "RESOURCE_LIMIT_EXCEEDED",
+                path: "route.tailnet_source".into(),
+            });
+            return self.remember_runtime_result(result);
+        }
         // Omission inherits the kernel's immutable startup override snapshot.
         // Explicit empty options would erase platform projection on newer hosts.
         let overrides = None;
@@ -1037,7 +1124,62 @@ impl ProxyRuntime {
         {
             return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
         }
-        let pending = PendingOperation {
+        let target_api = ApiEndpoint::from_generated(&generated);
+        let api_handoff = if target_api != baseline.management {
+            if baseline
+                .control
+                .as_ref()
+                .is_none_or(|client| !client.captured_transport_live())
+            {
+                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            }
+            if !capabilities.fields.iter().any(|f| {
+                f.variant == "api-loopback-handoff-v1"
+                    && f.update_class == daemon::RuntimeUpdateClass::LocalReplace as i32
+            }) {
+                let result = self.restart_choice(
+                    &candidate,
+                    "structuralChange",
+                    vec!["services.api".into()],
+                    generation,
+                    intent,
+                );
+                return self.remember_runtime_result(result);
+            }
+            let Some(target) = target_api else {
+                return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
+            };
+            if target.host != "127.0.0.1" {
+                let result = self.restart_choice(
+                    &candidate,
+                    "structuralChange",
+                    vec!["services.api.listen".into()],
+                    generation,
+                    intent,
+                );
+                return self.remember_runtime_result(result);
+            }
+            let Some(projection) = self.api_saved_projection_for(&candidate, &baseline) else {
+                let result = self.restart_choice(
+                    &candidate,
+                    "structuralChange",
+                    vec!["services.api.recipe".into()],
+                    generation,
+                    intent,
+                );
+                return self.remember_runtime_result(result);
+            };
+            Some(Arc::new(ApiChannelHandoff::new(
+                client.clone(),
+                target,
+                baseline.api_epoch.clone(),
+                Some(projection),
+            )))
+        } else {
+            None
+        };
+        let mut pending = PendingOperation {
+            api_handoff,
             pairing: baseline.pairing.clone(),
             desired,
             deletion_scope,
@@ -1053,12 +1195,48 @@ impl ProxyRuntime {
             published: false,
             binding_plan,
             mesh_evidence,
+            tailnet_suspended_token: None,
+            tailnet_bindings,
         };
-        if let Ok(mut state) = self.runtime_config_apply.lock() {
+        // Pause a binding-changing writer BEFORE the RPC. Unknown completion
+        // keeps it paused; a verified unapplied rejection alone may resume it.
+        let mut tailnet_limited = false;
+        let admitted = self.selector_reconcile.with_intent_claim(|current_intent| {
+            let _publication = self.gate.lock_generation_publication();
+            if current_intent != intent
+                || self.gate.generation() != generation
+                || self.gate.is_busy()
+            {
+                return false;
+            }
+            // STATUS may have grown H during Plan. Check the final canonical
+            // source before pausing the writer and admitting the Apply RPC.
+            if !self.tailnet_bindings_within_limit(&pending.tailnet_bindings) {
+                tailnet_limited = true;
+                return false;
+            }
+            let Ok(mut state) = self.runtime_config_apply.lock() else {
+                return false;
+            };
+            pending.tailnet_suspended_token =
+                self.suspend_tailnet_context(&pending.tailnet_bindings);
             state.pending = Some(pending.clone());
             state.restart = None;
-        } else {
-            return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            true
+        });
+        if !admitted {
+            let mut result = RuntimeApplyResult::status(if tailnet_limited {
+                "rejected"
+            } else {
+                "conflict"
+            });
+            if tailnet_limited {
+                result.reasons.push(RuntimeApplyReason {
+                    code: "RESOURCE_LIMIT_EXCEEDED",
+                    path: "route.tailnet_source".into(),
+                });
+            }
+            return self.remember_runtime_result(result);
         }
         let result = client
             .apply_runtime_config(daemon::ApplyRuntimeConfigRequest {
@@ -1095,8 +1273,31 @@ impl ProxyRuntime {
         client: &SingBoxApiClient,
         pending: PendingOperation,
     ) -> RuntimeApplyResult {
-        if let Err(result) = paired_runtime_capabilities(client, &pending.pairing).await {
-            return *result;
+        if let Some(h) = pending.api_handoff.as_ref().filter(|h| !h.confirmed()) {
+            let known_committed = h.has_verifier().await;
+            if known_committed {
+                if let Err(error) = self.confirm_runtime_api_handoff(&pending).await {
+                    return *error;
+                }
+            }
+        }
+        let handoff_client = if let Some(h) = pending.api_handoff.as_ref() {
+            if h.confirmed() {
+                match self.runtime_management_client(pending.generation).await {
+                    Ok(client) => Some(client),
+                    Err(_) => return RuntimeApplyResult::status("unconfirmed"),
+                }
+            } else {
+                Some(h.origin.clone())
+            }
+        } else {
+            None
+        };
+        let client = handoff_client.as_deref().unwrap_or(client);
+        if pending.api_handoff.as_ref().is_none_or(|h| h.confirmed()) {
+            if let Err(result) = paired_runtime_capabilities(client, &pending.pairing).await {
+                return *result;
+            }
         }
         let Some(identity) = pending.plan.expected.as_ref() else {
             return RuntimeApplyResult::status("unconfirmed");
@@ -1145,6 +1346,13 @@ impl ProxyRuntime {
         pending: &PendingOperation,
         operation: daemon::RuntimeConfigOperation,
     ) -> Result<daemon::RuntimeConfigOperation, Box<RuntimeApplyResult>> {
+        if matches!(
+            daemon::RuntimeOperationState::try_from(operation.state),
+            Ok(daemon::RuntimeOperationState::Committed
+                | daemon::RuntimeOperationState::CommittedDurabilityPending)
+        ) {
+            self.confirm_runtime_api_handoff(pending).await?;
+        }
         if operation.persistence_mode != "app_authoritative_regeneration"
             || !operation.owner_reload_acknowledged
             || operation.durable
@@ -1161,31 +1369,17 @@ impl ProxyRuntime {
         }) else {
             return Ok(operation);
         };
-        let Some(service) = pending
-            .generated
-            .services
-            .as_ref()
-            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
-        else {
-            return Ok(operation);
+        let control = match self.runtime_management_client(pending.generation).await {
+            Ok(control) => control,
+            Err(_) => return Err(Box::new(RuntimeApplyResult::status("unconfirmed"))),
         };
-        let endpoint = (
-            service.listen_port,
-            service.secret.clone().unwrap_or_default(),
-        );
         let me = Arc::clone(self);
         let pending = pending.clone();
         let transaction = operation.transaction_id.clone();
         let control_revision = operation.control_revision;
         let handle = tokio::runtime::Handle::current();
         let acknowledged = tokio::task::spawn_blocking(move || {
-            let client = match handle.block_on(SingBoxApiClient::connect(
-                Endpoint::new("127.0.0.1", endpoint.0),
-                endpoint.1,
-            )) {
-                Ok(client) => client,
-                Err(_) => return Ok(None),
-            };
+            let client = control;
             handle.block_on(paired_runtime_capabilities(&client, &pending.pairing))?;
             Ok(me
                 .config
@@ -1253,11 +1447,30 @@ impl ProxyRuntime {
                 Ok(daemon::RuntimeOperationState::RejectedUnapplied
                     | daemon::RuntimeOperationState::AbortedUnapplied)
             ) {
-                if let Ok(mut state) = self.runtime_config_apply.lock() {
-                    state.pending = None;
+                if !identity_equal(operation.active.as_ref(), operation.before.as_ref())
+                    || operation.control_revision != pending.plan.expected_control_revision
+                {
+                    return RuntimeApplyResult::status("unconfirmed");
+                }
+                if let Some(h) = pending.api_handoff.as_ref() {
+                    h.revoke();
+                }
+                {
+                    let _publication = self.gate.lock_generation_publication();
+                    if self.gate.generation() == pending.generation {
+                        if let Some(token) = pending.tailnet_suspended_token {
+                            self.resume_tailnet_context(pending.generation, token);
+                        }
+                    }
+                    if let Ok(mut state) = self.runtime_config_apply.lock() {
+                        state.pending = None;
+                    }
                 }
                 return RuntimeApplyResult::status("rejected");
             }
+            return RuntimeApplyResult::status("unconfirmed");
+        }
+        if pending.api_handoff.as_ref().is_some_and(|h| !h.confirmed()) {
             return RuntimeApplyResult::status("unconfirmed");
         }
         let Some(active) = operation.active.as_ref() else {
@@ -1312,8 +1525,11 @@ impl ProxyRuntime {
             }
             return result;
         }
+        let mut committed_tailnet_token = None;
+        let mut tailnet_context_changed = false;
         let published = pending.published
             || self.selector_reconcile.with_intent_claim(|intent| {
+                let _publication = self.gate.lock_generation_publication();
                 if intent != pending.intent
                     || self.gate.generation() != pending.generation
                     || self.gate.is_busy()
@@ -1349,6 +1565,17 @@ impl ProxyRuntime {
                 ));
                 *startup = Some(pending.candidate.clone());
                 *baseline = Some(RuntimeConfigBaseline {
+                    management: baseline.as_ref().and_then(|b| b.management.clone()),
+                    control: baseline.as_ref().and_then(|b| b.control.clone()),
+                    api_epoch: baseline
+                        .as_ref()
+                        .map(|b| b.api_epoch.clone())
+                        .unwrap_or_default(),
+                    api_saved_projection: pending
+                        .api_handoff
+                        .as_ref()
+                        .and_then(|h| h.published_projection()),
+                    api_log_handoff: baseline.as_ref().and_then(|b| b.api_log_handoff.clone()),
                     generation: pending.generation,
                     committed_transaction: Some(pending.plan.transaction_id.clone()),
                     pairing: pending.pairing.clone(),
@@ -1358,16 +1585,24 @@ impl ProxyRuntime {
                 });
                 binding_state.plan = pending.binding_plan.clone();
                 binding_state.explicit_unavailable = Default::default();
+                tailnet_context_changed = self
+                    .activate_tailnet_context(pending.generation, pending.tailnet_bindings.clone());
+                committed_tailnet_token = self.tailnet_context().map(|context| context.token);
                 true
             });
         if !published {
             return RuntimeApplyResult::status("conflict");
         }
         if !pending.published {
+            if tailnet_context_changed {
+                self.restart_tailnet_relay_if_active(pending.generation);
+            }
             if !pending.plan.no_op {
                 self.arm_network_canary(pending.generation, pending.network_canary.clone());
             }
-            self.publish_mesh_route_runtime_receipt(pending.mesh_evidence.clone());
+            let mut evidence = pending.mesh_evidence.clone();
+            evidence.tailnet_token = committed_tailnet_token;
+            self.publish_mesh_route_runtime_receipt(evidence);
             self.spawn_runtime_retirement_reconcile(pending, &operation);
         }
         // The provider accepted reload bytes, but a newer durably saved D is
@@ -1455,17 +1690,6 @@ impl ProxyRuntime {
         if scope.is_empty() {
             return;
         }
-        let endpoint = pending
-            .generated
-            .services
-            .as_ref()
-            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
-            .map(|service| {
-                (
-                    service.listen_port,
-                    service.secret.clone().unwrap_or_default(),
-                )
-            });
         tokio::spawn(async move {
             let mut retirement = initial;
             loop {
@@ -1504,13 +1728,7 @@ impl ProxyRuntime {
                     _ = me.gen_changed.notified() => { if me.gate.generation() != generation { return; } }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                 }
-                let Some((port, secret)) = endpoint.as_ref() else {
-                    return;
-                };
-                let Ok(client) =
-                    SingBoxApiClient::connect(Endpoint::new("127.0.0.1", *port), secret.clone())
-                        .await
-                else {
+                let Ok(client) = me.runtime_management_client(generation).await else {
                     continue;
                 };
                 if paired_runtime_capabilities(&client, &pairing)
@@ -1578,19 +1796,7 @@ impl ProxyRuntime {
             else {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
             };
-            let Some(service) =
-                baseline.generated.services.as_ref().and_then(|services| {
-                    services.iter().find(|service| service.type_field == "api")
-                })
-            else {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
-            };
-            let client = SingBoxApiClient::connect(
-                Endpoint::new("127.0.0.1", service.listen_port),
-                service.secret.clone().unwrap_or_default(),
-            )
-            .await;
-            let Ok(client) = client else {
+            let Ok(client) = self.runtime_management_client(choice.generation).await else {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
             };
             if let Err(result) = paired_runtime_capabilities(&client, &baseline.pairing).await {
@@ -1752,25 +1958,18 @@ impl ProxyRuntime {
         {
             return RuntimeApplyResult::status("conflict");
         }
-        let baseline = self
-            .runtime_config_baseline
-            .read()
-            .ok()
-            .and_then(|value| value.clone());
-        let Some(service) = baseline
-            .as_ref()
-            .filter(|baseline| baseline.generation == pending.generation)
-            .and_then(|baseline| baseline.generated.services.as_ref())
-            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
-        else {
-            return RuntimeApplyResult::status("unconfirmed");
-        };
-        let Ok(client) = SingBoxApiClient::connect(
-            Endpoint::new("127.0.0.1", service.listen_port),
-            service.secret.clone().unwrap_or_default(),
-        )
-        .await
-        else {
+        if pending.api_handoff.as_ref().is_some_and(|h| !h.confirmed()) {
+            let observed = self
+                .reconcile_runtime_operation(
+                    &pending.api_handoff.as_ref().unwrap().origin,
+                    pending.clone(),
+                )
+                .await;
+            if !pending.api_handoff.as_ref().unwrap().confirmed() {
+                return observed;
+            }
+        }
+        let Ok(client) = self.runtime_management_client(pending.generation).await else {
             return RuntimeApplyResult::status("unconfirmed");
         };
         if let Err(result) = paired_runtime_capabilities(&client, &pending.pairing).await {
@@ -1889,26 +2088,13 @@ impl ProxyRuntime {
         {
             return RuntimeApplyResult::status("conflict");
         }
-        let baseline = self
-            .runtime_config_baseline
-            .read()
-            .ok()
-            .and_then(|value| value.clone());
-        let Some(service) = baseline
-            .as_ref()
-            .and_then(|baseline| baseline.generated.services.as_ref())
-            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
-        else {
+        if let Some(h) = pending.api_handoff.as_ref().filter(|h| !h.confirmed()) {
+            let client = h.origin.clone();
+            let result = self.reconcile_runtime_operation(&client, pending).await;
+            return self.remember_runtime_result(result);
+        }
+        let Ok(client) = self.runtime_management_client(pending.generation).await else {
             return RuntimeApplyResult::status("unconfirmed");
-        };
-        let client = match SingBoxApiClient::connect(
-            Endpoint::new("127.0.0.1", service.listen_port),
-            service.secret.clone().unwrap_or_default(),
-        )
-        .await
-        {
-            Ok(client) => client,
-            Err(_) => return RuntimeApplyResult::status("unconfirmed"),
         };
         let result = self.reconcile_runtime_operation(&client, pending).await;
         self.remember_runtime_result(result)
@@ -1933,7 +2119,6 @@ pub(super) fn structural_runtime_change(old: &Value, new: &Value) -> bool {
         "mixedPort",
         "httpPort",
         "allowLan",
-        "clashApiSecret",
         "singboxDashboard",
     ]
     .iter()

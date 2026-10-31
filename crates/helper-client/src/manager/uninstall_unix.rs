@@ -159,7 +159,7 @@ rm -rf "$INSTALLDIR" "$RUNTIMEDIR"
 for OBJECT in "$SUPPORT"/* "$SUPPORT"/.[!.]* "$SUPPORT"/..?*; do
   [ -e "$OBJECT" ] || [ -L "$OBJECT" ] || continue
   case "$OBJECT" in
-    "$LOCK"|"$TXDIR"|"$SUPPORT"/helper-upgrade.*|"$SUPPORT"/helper-admission.*) continue;;
+    "$LOCK"|"$TXDIR"|"$SUPPORT"/helper-upgrade.*|"$SUPPORT"/helper-admission.*|"$SUPPORT"/helper-retired.*|"$SUPPORT/helper-legacy-tombstone") continue;;
   esac
   rm -rf "$OBJECT"
 done
@@ -238,7 +238,7 @@ pub(super) fn build_mac_uninstall_script(
     )
 }
 
-pub(super) fn build_linux_uninstall_script(
+fn build_linux_ordinary_uninstall_script(
     paths: &InstallPaths,
     utility: &MaintenanceUtility,
 ) -> String {
@@ -250,6 +250,31 @@ pub(super) fn build_linux_uninstall_script(
         shell_quote(&install_dir.to_string_lossy()),
         shell_quote(&runtime_dir.to_string_lossy()),
         super::linux_service_stop::FUNCTIONS,
+    )
+}
+
+pub(super) fn build_linux_uninstall_script(
+    paths: &InstallPaths,
+    utility: &MaintenanceUtility,
+) -> String {
+    build_linux_uninstall_script_with_original(paths, utility, None, std::path::Path::new("/"))
+}
+
+pub(super) fn build_linux_uninstall_script_with_original(
+    paths: &InstallPaths,
+    utility: &MaintenanceUtility,
+    original: Option<&[String; 10]>,
+    config: &std::path::Path,
+) -> String {
+    let ordinary = build_linux_ordinary_uninstall_script(paths, utility);
+    super::install_unix::linux_legacy_wrapper(
+        &utility.src_binary,
+        &utility.helper_sha256,
+        "uninstall",
+        config,
+        original,
+        "",
+        &ordinary,
     )
 }
 

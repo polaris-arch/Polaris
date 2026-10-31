@@ -291,21 +291,34 @@ fn junction_is_refused_and_external_sentinel_is_intact() {
     let external = tempfile::tempdir().unwrap();
     std::fs::write(external.path().join("sentinel"), b"keep").unwrap();
     let junction = temp.path().join("junction");
-    std::fs::create_dir(&junction).unwrap();
+    create_junction(&junction, external.path()).unwrap();
+    assert!(child(
+        &parent(temp.path()),
+        OsStr::new("junction"),
+        true,
+        false,
+        null_mut()
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read(external.path().join("sentinel")).unwrap(),
+        b"keep"
+    );
+    std::fs::remove_dir(junction).unwrap();
+}
+
+// Shared native-only fixture helper. No shell or privilege change.
+pub(crate) fn create_junction(junction: &Path, target: &Path) -> io::Result<()> {
+    std::fs::create_dir(junction)?;
     let mount = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&junction)
-        .unwrap();
-    let substitute = format!(r"\??\{}", external.path().display())
+        .open(junction)?;
+    let substitute = format!(r"\??\{}", target.display())
         .encode_utf16()
         .collect::<Vec<_>>();
-    let print = external
-        .path()
-        .as_os_str()
-        .encode_wide()
-        .collect::<Vec<_>>();
+    let print = target.as_os_str().encode_wide().collect::<Vec<_>>();
     let path_bytes = (substitute.len() + print.len() + 2) * 2;
     let mut data = Vec::new();
     data.extend_from_slice(&0xa0000003u32.to_le_bytes());
@@ -339,20 +352,7 @@ fn junction_is_refused_and_external_sentinel_is_intact() {
             &mut returned,
             null_mut(),
         )
-    })
-    .unwrap();
+    })?;
     drop(mount);
-    assert!(child(
-        &parent(temp.path()),
-        OsStr::new("junction"),
-        true,
-        false,
-        null_mut()
-    )
-    .is_err());
-    assert_eq!(
-        std::fs::read(external.path().join("sentinel")).unwrap(),
-        b"keep"
-    );
-    std::fs::remove_dir(junction).unwrap();
+    Ok(())
 }

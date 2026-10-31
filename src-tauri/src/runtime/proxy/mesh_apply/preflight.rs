@@ -208,7 +208,13 @@ pub(crate) async fn stage_checked_with_core(
         plan,
         closure,
         generator_version,
-        move |config_path| async move { run_config_check(&binary_path, &config_path).await },
+        move |config_path| async move {
+            let execution = crate::runtime::core_identity::prepare(
+                &binary_path,
+                crate::runtime::core_identity::ExecPurpose::CheckConfig,
+            )?;
+            run_config_check(execution, &config_path).await
+        },
         || {
             if binary_digest(binary)? == before {
                 Ok(())

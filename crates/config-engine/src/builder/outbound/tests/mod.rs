@@ -163,6 +163,87 @@ fn trojan_default_alpn() {
 }
 
 #[test]
+fn trojan_explicit_none_omits_tls_even_with_stale_tls_settings() {
+    let mut s = server(Protocol::Trojan, "t.com");
+    s.password = Some("pw".into());
+    s.security = Some(SecurityMode::None);
+    // 编辑/导入遗留的 TLS 设置和无效 pin 不应使明文节点重新启用 TLS 或无法生成。
+    s.tls_settings = Some(
+        serde_json::from_value(serde_json::json!({
+            "serverName": "old.example", "certificateSha256": "invalid-unused-pin"
+        }))
+        .unwrap(),
+    );
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("plaintext Trojan does not consume stale TLS pins");
+    let json = serde_json::to_value(&ob).unwrap();
+    assert!(
+        json.get("tls").is_none(),
+        "explicit None must remain plaintext: {json}"
+    );
+    assert_eq!(json["type"], "trojan");
+    assert_eq!(json["password"], "pw");
+    assert!(!tls_pin::modeled_cert_pins_are_emitted(
+        s.protocol,
+        s.security.as_ref()
+    ));
+    tls_pin::drop_unemitted_cert_pins(std::slice::from_mut(&mut s));
+    assert!(s
+        .tls_settings
+        .as_ref()
+        .unwrap()
+        .certificate_sha256
+        .is_none());
+}
+
+#[test]
+fn trojan_default_and_explicit_tls_keep_certificate_validation() {
+    for security in [None, Some(SecurityMode::Tls)] {
+        let mut s = server(Protocol::Trojan, "t.com");
+        s.password = Some("pw".into());
+        s.security = security;
+        let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+            .expect("TLS Trojan");
+        let tls = ob.tls.unwrap();
+        assert!(tls.enabled);
+        assert_eq!(tls.insecure, Some(false));
+        assert_eq!(tls.server_name.as_deref(), Some("t.com"));
+        assert!(tls_pin::modeled_cert_pins_are_emitted(
+            s.protocol,
+            s.security.as_ref()
+        ));
+        s.tls_settings = Some(
+            serde_json::from_value(serde_json::json!({
+                "certificateSha256": "invalid-used-pin"
+            }))
+            .unwrap(),
+        );
+        assert!(
+            build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").is_err()
+        );
+    }
+}
+
+#[test]
+fn tls_required_protocols_keep_tls_with_none_security() {
+    for protocol in [
+        Protocol::Anytls,
+        Protocol::Hysteria2,
+        Protocol::Tuic,
+        Protocol::Hysteria,
+    ] {
+        let mut s = server(protocol, "tls.example");
+        s.security = Some(SecurityMode::None);
+        let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+            .expect("required TLS is unaffected by the Trojan selector");
+        assert!(
+            ob.tls.as_ref().is_some_and(|tls| tls.enabled),
+            "{protocol:?}"
+        );
+    }
+}
+
+#[test]
 fn shadowsocks_method_password() {
     let mut s = server(Protocol::Shadowsocks, "ss.com");
     s.shadowsocks_settings = Some(Box::new(ps::ShadowsocksSettings {
@@ -2021,5 +2102,50 @@ fn vision_transport_admission_preserves_supported_native_streams() {
         let ob = build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", "linux").unwrap();
         assert_eq!(ob.flow.as_deref(), Some("xtls-rprx-vision"));
         assert!(ob.transport.is_none());
+    }
+}
+
+#[test]
+fn snell_tls_empty_host_delegates_to_core_http_keeps_its_default() {
+    for mode in ["http", "tls", "none", ""] {
+        for host in [None, Some(""), Some("Cover.Example")] {
+            let mut node = server(Protocol::Snell, "s.example");
+            node.password = Some("part1:part2".into());
+            node.snell_settings = Some(Box::new(ps::SnellSettings {
+                version: 4,
+                obfs_mode: Some(mode.into()),
+                obfs_host: host.map(str::to_owned),
+                ..Default::default()
+            }));
+            let value = serde_json::to_value(
+                build_proxy_outbound(&node, "snell", &test_dial_resolver(), "x64", "linux")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["psk"], "part1:part2");
+            assert!(value.get("tls").is_none());
+            if matches!(mode, "http" | "tls") {
+                assert_eq!(value["obfs_mode"], mode);
+                let expected = if mode == "http" {
+                    Some(host.unwrap_or("bing.com"))
+                } else {
+                    host.filter(|h| !h.is_empty())
+                };
+                assert_eq!(
+                    value.get("obfs_host").and_then(serde_json::Value::as_str),
+                    expected
+                );
+            } else {
+                assert!(value.get("obfs_mode").is_none() && value.get("obfs_host").is_none());
+            }
+            node.snell_settings.as_mut().unwrap().version = 6;
+            let v6 = serde_json::to_value(
+                build_proxy_outbound(&node, "snell", &test_dial_resolver(), "x64", "linux")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v6["version"], 6);
+            assert!(v6.get("obfs_mode").is_none() && v6.get("obfs_host").is_none());
+        }
     }
 }

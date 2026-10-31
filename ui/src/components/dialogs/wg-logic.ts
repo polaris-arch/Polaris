@@ -270,8 +270,10 @@ export function buildWgServer(
   else delete settings.allowedIPs;
   const keep = parseNumberField(String(draft.persistentKeepalive ?? ''));
   if (keep !== undefined) settings.persistentKeepalive = keep;
+  else delete settings.persistentKeepalive;
   const mtu = parseNumberField(String(draft.mtu ?? ''));
   if (mtu !== undefined) settings.mtu = mtu;
+  else delete settings.mtu;
   const workers = parseNumberField(String(draft.workers ?? ''));
   if (workers !== undefined && workers > 0 && !workersInputInvalid(workers)) settings.workers = workers;
   else delete settings.workers;

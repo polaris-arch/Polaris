@@ -1,226 +1,181 @@
 //! B2b: compiled selected content identity, independent of a writable package manifest.
 use std::path::{Path, PathBuf};
 
-use polaris_helper_proto::core_manifest::{CoreFile, CoreId, CoreManifest};
+use polaris_helper_proto::core_manifest::{CoreId, CoreManifest};
 
-const RELEASE_CONTRACT: &str = include_str!("../../../scripts/desktop-core/release-contract.json");
-const COMPILED_INSTALLATION: &[u8] =
+pub(crate) use polaris_core_supervisor::selected_core::current_platform;
+mod recovery;
+pub(crate) mod user_store;
+pub(crate) use recovery::stage_recovery_installation;
+#[cfg(test)]
+pub(crate) use recovery::tests::Fixture as RecoveryFixture;
+const APP_INSTALLATION: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/selected-core-manifest.json"));
-
-const COMPILED_VALIDATION_SOURCE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/validation-core-source.json"));
-
-fn compiled_source(compiled: &[u8], platform: &str) -> Result<serde_json::Value, String> {
-    let selected: serde_json::Value =
-        serde_json::from_slice(compiled).map_err(|_| "invalid compiled validation source")?;
-    let manual = selected["schema"] == "polaris-native-dns-compiled-source-v1"
-        && selected["validationOnly"] == true;
-    let temporary = selected["schema"] == "polaris-native-dns-compiled-source-v2"
-        && selected["validationOnly"] == false
-        && selected["purpose"] == "temporary-default"
-        && selected["context"]["mode"] == "temporary-default";
-    if !(manual || temporary)
-        || selected["AppAccepted"] != false
-        || selected["publicationEligible"] != false
-        || !selected["platforms"]
-            .as_array()
-            .is_some_and(|platforms| platforms.iter().any(|value| value == platform))
+const APP_SOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/validation-core-source.json"));
+const APP_RECOVERY: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/selected-core-recovery-inventory.json"
+));
+const APP_DEVELOPMENT: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/local-development-selection.json"
+));
+const APP_DEVELOPMENT_CONTRACT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/local-development-contract.json"));
+fn check_compiled_selection() -> Result<(), String> {
+    if APP_DEVELOPMENT != polaris_core_supervisor::selected_core::COMPILED_DEVELOPMENT_SELECTION
+        || APP_DEVELOPMENT_CONTRACT
+            != polaris_core_supervisor::selected_core::COMPILED_DEVELOPMENT_CONTRACT
+        || APP_INSTALLATION != polaris_core_supervisor::selected_core::COMPILED_INSTALLATION
+        || APP_SOURCE != polaris_core_supervisor::selected_core::COMPILED_VALIDATION_SOURCE
+        || APP_RECOVERY != polaris_core_supervisor::selected_core::COMPILED_RECOVERY_INVENTORY
     {
-        return Err("compiled validation source selection differs".into());
+        return Err(
+            "CORE_BUNDLE_MISMATCH: App and execution gate compiled selections differ".into(),
+        );
     }
-    Ok(selected)
+    Ok(())
 }
-
-#[cfg(any(windows, test))]
-fn selected_source_from(compiled: &[u8], platform: &str) -> Result<String, String> {
-    let source = if compiled == b"null" {
-        let contract: serde_json::Value = serde_json::from_str(RELEASE_CONTRACT)
-            .map_err(|_| "invalid compiled source contract")?;
-        contract["platforms"][platform]["sourceCommit"].clone()
-    } else {
-        let selected = compiled_source(compiled, platform)?;
-        selected["sourceCommit"].clone()
-    };
-    let source = source.as_str().ok_or("missing compiled source identity")?;
-    if source.len() != 40
-        || !source
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("invalid compiled source identity".into());
-    }
-    Ok(source.to_owned())
+pub(crate) fn selected_manifest(platform: &str) -> Result<CoreManifest, String> {
+    check_compiled_selection()?;
+    polaris_core_supervisor::selected_core::selected_manifest(platform)
 }
-
+pub(crate) fn selected_id(platform: &str) -> Result<CoreId, String> {
+    check_compiled_selection()?;
+    polaris_core_supervisor::selected_core::selected_id(platform)
+}
+pub(crate) fn selected_payload_dirs(formal: &[&str]) -> Result<Vec<String>, String> {
+    check_compiled_selection()?;
+    polaris_core_supervisor::selected_core::selected_payload_dirs(formal)
+}
 #[cfg(any(windows, test))]
 pub(crate) fn selected_source_commit(platform: &str) -> Result<String, String> {
-    selected_source_from(COMPILED_VALIDATION_SOURCE, platform)
+    check_compiled_selection()?;
+    polaris_core_supervisor::selected_core::selected_source_commit(platform)
 }
+#[cfg(test)]
+pub(crate) use polaris_core_supervisor::selected_core::selected_check_source;
+#[cfg(test)]
+use polaris_core_supervisor::selected_core::{
+    formal_manifest, formal_provider_fingerprint, selected_source_from, COMPILED_INSTALLATION,
+    COMPILED_VALIDATION_SOURCE, RELEASE_CONTRACT,
+};
 
-/// Private check-only admission consumes compiled identity, never an environment
-/// digest. Missing/analysis-only installation identities cannot select a profile.
-#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-pub(crate) fn selected_check_source(platform: &str) -> Result<(String, String), String> {
-    let selected = selected_manifest(platform)?;
-    let source = selected_source_commit(platform)?;
-    let contract_sha256 = if COMPILED_VALIDATION_SOURCE == b"null" {
-        polaris_updater::sha256_hex(RELEASE_CONTRACT.as_bytes())
+pub(crate) use polaris_core_supervisor::admitted_payload::{
+    AdmissionError, AdmittedPayload, ExecPurpose, PreparedExecution,
+};
+pub(crate) fn acquire_at(
+    binary: &Path,
+    purpose: ExecPurpose,
+) -> Result<std::sync::Arc<AdmittedPayload>, AdmissionError> {
+    check_compiled_selection().map_err(|detail| AdmissionError {
+        kind: polaris_core_supervisor::admitted_payload::AdmissionErrorKind::Mismatch,
+        purpose: Some(purpose),
+        member: None,
+        recovery: polaris_core_supervisor::admitted_payload::RecoveryAction::ReinstallCurrentApp,
+        detail,
+    })?;
+    // Keep the data lease during admission. The cached protected cohort itself
+    // retains no store lease; each real operation below reacquires its own.
+    let _data = selected_operation_data(binary, purpose)?;
+    polaris_core_supervisor::admitted_payload::admit_selected(
+        polaris_core_supervisor::admitted_payload::UntrustedPayload::bundled(binary),
+        purpose,
+    )
+}
+pub(crate) fn prepare(
+    binary: &Path,
+    purpose: ExecPurpose,
+) -> Result<PreparedExecution, AdmissionError> {
+    let payload = acquire_at(binary, purpose)?;
+    prepare_admitted(&payload, purpose)
+}
+pub(crate) fn selection_error(detail: String, purpose: ExecPurpose) -> AdmissionError {
+    use polaris_core_supervisor::admitted_payload::{AdmissionErrorKind as K, RecoveryAction as R};
+    let kind = [
+        ("Missing", K::Missing),
+        ("Mismatch", K::Mismatch),
+        ("Changed", K::Changed),
+        ("Busy", K::Busy),
+        ("Unknown", K::Unknown),
+        ("Io", K::Io),
+    ]
+    .into_iter()
+    .find_map(|(name, kind)| {
+        detail
+            .starts_with(&format!("CORE_ADMISSION_{name}:"))
+            .then_some(kind)
+    })
+    .unwrap_or(if detail.starts_with("CORE_RECOVERY_UNSUPPORTED:") {
+        K::UnsupportedExactObject
     } else {
-        let compiled = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
-        let digest = compiled["bindingSha256"]
-            .as_str()
-            .ok_or("missing compiled check contract")?;
-        if digest != selected.provider_fingerprint {
-            return Err("compiled check contract differs".into());
-        }
-        digest.to_owned()
-    };
-    if contract_sha256.len() != 64
-        || !contract_sha256
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err("invalid compiled check contract".into());
-    }
-    Ok((source, contract_sha256))
-}
-
-/// Candidate builds resolve the complete verified carrier for both core and
-/// helper. Runtime environment cannot switch this compiled choice or fall back
-/// to an old formal carrier. Dashboard/data resource lookup is unchanged.
-pub(crate) fn selected_payload_dirs(formal: &[&str]) -> Result<Vec<String>, String> {
-    if COMPILED_VALIDATION_SOURCE == b"null" {
-        return Ok(formal.iter().map(|value| (*value).to_owned()).collect());
-    }
-    let platform = current_platform()?;
-    let selected = selected_manifest(platform)?;
-    if selected.helper_sha256.is_none() || (platform == "win" && selected.cleaner_sha256.is_none())
-    {
-        return Err("CORE_BUNDLE_MISMATCH: candidate carrier is incomplete".into());
-    }
-    let source = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
-    Ok(vec![
-        if source["schema"] == "polaris-native-dns-compiled-source-v2" {
-            platform.to_owned()
+        K::Unknown
+    });
+    AdmissionError {
+        kind,
+        purpose: Some(purpose),
+        member: None,
+        recovery: if kind.is_payload_damage() {
+            R::ReinstallCurrentApp
+        } else if kind == K::Busy || kind == K::Unknown {
+            R::RetryAfterStop
         } else {
-            format!(".native-dns-app/{platform}")
+            R::None
         },
-    ])
+        detail,
+    }
 }
-
-pub(crate) fn selected_manifest(platform: &str) -> Result<CoreManifest, String> {
-    if COMPILED_INSTALLATION != b"null" {
-        let selected = polaris_helper_proto::core_manifest::InstalledCoreManifest::parse(
-            COMPILED_INSTALLATION,
-            polaris_updater::sha256_hex,
-        )
-        .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid compiled installation identity")?;
-        if selected.core.platform != platform {
-            return Err("CORE_BUNDLE_MISMATCH: compiled platform differs".into());
-        }
-        if COMPILED_VALIDATION_SOURCE != b"null" {
-            let source = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
-            if source["bindingSha256"].as_str() != Some(selected.core.provider_fingerprint.as_str())
-            {
-                return Err("CORE_BUNDLE_MISMATCH: compiled provider differs".into());
-            }
+fn selected_operation_data(
+    binary: &Path,
+    purpose: ExecPurpose,
+) -> Result<Option<polaris_helper::core_store::VerifiedCore>, AdmissionError> {
+    let reject = |detail: String| AdmissionError {
+        kind: polaris_core_supervisor::admitted_payload::AdmissionErrorKind::Changed,
+        purpose: Some(purpose),
+        member: None,
+        recovery:
+            polaris_core_supervisor::admitted_payload::RecoveryAction::RepairHelperInstallation,
+        detail,
+    };
+    let data = user_store::current_data().map_err(|detail| selection_error(detail, purpose))?;
+    if let Some(data) = &data {
+        let expected = data.directory.join(if cfg!(windows) {
+            "sing-box.exe"
         } else {
-            let expected = formal_manifest(platform)?;
-            let selected_id = selected
-                .core
-                .id(polaris_updater::sha256_hex)
-                .map_err(|_| "invalid selected formal id")?;
-            let expected_id = expected
-                .id(polaris_updater::sha256_hex)
-                .map_err(|_| "invalid expected formal id")?;
-            if selected_id != expected_id {
-                return Err("CORE_BUNDLE_MISMATCH: compiled formal selection differs".into());
-            }
+            "sing-box"
+        });
+        if binary != expected {
+            return Err(reject("recovery source selection changed".into()));
         }
-        return Ok(selected.core);
     }
-    if COMPILED_VALIDATION_SOURCE != b"null" {
-        return Err("CORE_BUNDLE_MISMATCH: candidate installation identity missing".into());
-    }
-    formal_manifest(platform)
+    Ok(data)
 }
-
-fn formal_manifest(platform: &str) -> Result<CoreManifest, String> {
-    let contract: serde_json::Value = serde_json::from_str(RELEASE_CONTRACT)
-        .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid compiled identity")?;
-    let row = &contract["platforms"][platform];
-    let read_file = |value: &serde_json::Value| -> Result<CoreFile, String> {
-        Ok(CoreFile {
-            name: value["member"]
-                .as_str()
-                .ok_or("CORE_BUNDLE_MISMATCH: missing member")?
-                .to_string(),
-            bytes: value["bytes"]
-                .as_u64()
-                .ok_or("CORE_BUNDLE_MISMATCH: missing size")?,
-            sha256: value["sha256"]
-                .as_str()
-                .ok_or("CORE_BUNDLE_MISMATCH: missing hash")?
-                .to_string(),
-        })
-    };
-    let mut files = vec![read_file(&row["core"])?];
-    if !row["sidecar"].is_null() {
-        files.push(read_file(&row["sidecar"])?);
-    }
-    let manifest = CoreManifest {
-        platform: platform.to_string(),
-        version: contract["version"]
-            .as_str()
-            .ok_or("CORE_BUNDLE_MISMATCH: missing version")?
-            .to_string(),
-        provider_fingerprint: formal_provider_fingerprint(RELEASE_CONTRACT, &contract, row)?,
-        files,
-        helper_sha256: None,
-        cleaner_sha256: None,
-    };
-    manifest
-        .validate()
-        .map_err(|reason| format!("CORE_BUNDLE_MISMATCH: {reason}"))?;
-    Ok(manifest)
-}
-
-fn formal_provider_fingerprint(
-    raw: &str,
-    contract: &serde_json::Value,
-    row: &serde_json::Value,
-) -> Result<String, String> {
-    if contract["schema"] == "polaris-upstream-native-release-consumer-v1" {
-        if row.get("providerFingerprint").is_some() || row.get("providerIdentity").is_some() {
-            return Err("CORE_BUNDLE_MISMATCH: unverified upstream producer identity".into());
+pub(crate) fn prepare_admitted(
+    payload: &std::sync::Arc<AdmittedPayload>,
+    purpose: ExecPurpose,
+) -> Result<PreparedExecution, AdmissionError> {
+    let data = selected_operation_data(payload.diagnostic_path(), purpose)?;
+    let execution = payload.prepare(purpose)?;
+    if let Some(data) = data {
+        #[cfg(target_os = "linux")]
+        {
+            let lease = data.execution_lease()?.try_clone()?;
+            return execution.with_store_lease(std::sync::Arc::new(lease));
         }
-        let mut bytes = b"polaris-upstream-native-installation-v1\0".to_vec();
-        bytes.extend_from_slice(raw.as_bytes());
-        Ok(polaris_updater::sha256_hex(&bytes))
-    } else {
-        row["providerFingerprint"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| "CORE_BUNDLE_MISMATCH: missing provider".into())
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = data;
+            return Err(AdmissionError::unsupported_exact_object());
+        }
     }
+    Ok(execution)
+}
+pub(crate) fn acquire(purpose: ExecPurpose) -> Result<std::sync::Arc<AdmittedPayload>, String> {
+    let binary = crate::runtime::proxy::resolve_core_candidate()?;
+    acquire_at(&binary, purpose).map_err(|e| e.to_string())
 }
 
-pub(crate) fn selected_id(platform: &str) -> Result<CoreId, String> {
-    selected_manifest(platform)?
-        .id(polaris_updater::sha256_hex)
-        .map_err(|reason| format!("CORE_BUNDLE_MISMATCH: {reason}"))
-}
-
-pub(crate) fn current_platform() -> Result<&'static str, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Ok("linux"),
-        ("windows", "x86_64") => Ok("win"),
-        ("macos", "x86_64") => Ok("mac-x64"),
-        ("macos", "aarch64") => Ok("mac-arm64"),
-        _ => Err("CORE_BUNDLE_MISMATCH: no desktop selected identity".into()),
-    }
-}
-
+#[derive(Debug)]
 pub(crate) struct InstallStage {
     pub(crate) directory: PathBuf,
     pub(crate) manifest: polaris_helper_proto::core_manifest::InstalledCoreManifest,
@@ -237,12 +192,12 @@ pub(crate) fn stage_installation(
     binary: &Path,
     helper: &Path,
     config: &Path,
+    selected: &CoreManifest,
 ) -> Result<InstallStage, String> {
     use polaris_helper_proto::core_manifest::InstalledCoreManifest;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Write};
-    let platform = current_platform()?;
-    let selected = selected_manifest(platform)?;
+    let platform = selected.platform.as_str();
     let expected_helper = selected
         .helper_sha256
         .as_deref()
@@ -292,33 +247,13 @@ pub(crate) fn stage_installation(
             .id(polaris_updater::sha256_hex)
             .map_err(|error| error.to_string())?
             .as_str()
-        || manifest.core != selected
+        || manifest.core != *selected
     {
         return Err("CORE_BUNDLE_MISMATCH: installation selection differs".into());
     }
-    let parent = config.join("helper-install-stage");
-    fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
-    if fs::symlink_metadata(&parent)
-        .map_err(|error| error.to_string())?
-        .file_type()
-        .is_symlink()
-    {
-        return Err("invalid helper staging directory".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
-    }
+    let parent = recovery::private_stage_parent(config)?;
     let directory = parent.join(uuid::Uuid::new_v4().to_string());
-    fs::create_dir(&directory).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
-    }
+    recovery::create_private_directory(&directory)?;
     let stage = InstallStage {
         directory,
         manifest,
@@ -352,11 +287,14 @@ pub(crate) fn stage_installation(
             return Err("CORE_BUNDLE_MISMATCH: installation file size differs".into());
         }
         let path = stage.directory.join(name);
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| error.to_string())?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&path).map_err(|error| error.to_string())?;
         let copied = std::io::copy(&mut input.take(bytes + 1), &mut output)
             .map_err(|error| error.to_string())?;
         output.flush().map_err(|error| error.to_string())?;
@@ -393,9 +331,14 @@ pub(crate) fn stage_installation(
         .manifest
         .to_json()
         .map_err(|error| error.to_string())?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
         .open(stage.directory.join("core-manifest.json"))
         .map_err(|error| error.to_string())?;
     output.write_all(&raw).map_err(|error| error.to_string())?;
@@ -417,6 +360,47 @@ fn open_payload_directory(dir: &Path) -> Result<polaris_helper::core_objects::Pa
     let owner = None;
     polaris_helper::core_objects::PayloadDir::open(dir, owner)
         .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid payload directory".to_owned())
+}
+
+// A maintenance tool is intentionally independent of all core files and
+// sidecars. Verify the exact open object against compiled selection metadata;
+// the existing privileged sealed copy checks this SAME expected pin again.
+pub(crate) const MAX_MAINTENANCE_HELPER_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) fn maintenance_utility_from(
+    helper: &Path,
+    platform: &str,
+    selected: &CoreManifest,
+) -> Result<polaris_helper_client::MaintenanceUtility, String> {
+    let reject = || "CORE_BUNDLE_MISMATCH: untrusted maintenance helper".to_owned();
+    if !matches!(platform, "linux" | "mac-arm64" | "mac-x64")
+        || selected.platform != platform
+        || !helper.is_absolute()
+        || helper.file_name().and_then(|name| name.to_str()) != Some("polaris-helper")
+    {
+        return Err(reject());
+    }
+    selected.validate().map_err(|_| reject())?;
+    let pin = selected.helper_sha256.as_deref().ok_or_else(reject)?;
+    if CoreId::parse(pin).is_err() {
+        return Err(reject());
+    }
+    let directory = helper.parent().ok_or_else(reject)?;
+    let objects = open_payload_directory(directory)?;
+    let (file, bytes) = objects
+        .open_regular("polaris-helper")
+        .map_err(|_| reject())?;
+    if bytes == 0 || bytes > MAX_MAINTENANCE_HELPER_BYTES {
+        return Err(reject());
+    }
+    let digest = polaris_updater::verify::sha256_reader_hex(std::io::Read::take(file, bytes + 1))
+        .map_err(|_| reject())?;
+    if digest != pin {
+        return Err(reject());
+    }
+    Ok(polaris_helper_client::MaintenanceUtility {
+        src_binary: helper.to_path_buf(),
+        helper_sha256: pin.to_owned(),
+    })
 }
 
 /// Hash the same open regular object, not a path reopened after validation.
@@ -446,10 +430,12 @@ pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<()
 
 /// A prior full content verification may be reused only as a lightweight
 /// invalidation observation, never as permission to launch/install a payload.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct BundleObservation {
     files: Vec<BundleFileObservation>,
 }
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct BundleFileObservation {
     path: PathBuf,
@@ -458,6 +444,7 @@ struct BundleFileObservation {
     #[cfg(windows)]
     identity: (u64, [u8; 16]),
 }
+#[cfg(test)]
 fn bundle_file_stamp(metadata: &std::fs::Metadata) -> String {
     #[cfg(unix)]
     {
@@ -491,6 +478,7 @@ fn bundle_file_stamp(metadata: &std::fs::Metadata) -> String {
         format!("{:?}", metadata)
     }
 }
+#[cfg(test)]
 impl BundleObservation {
     fn capture(dir: &Path, manifest: &CoreManifest) -> Result<Self, String> {
         // Linux has a real bundled sidecar. Never open it by a blocking path
@@ -564,6 +552,7 @@ impl BundleObservation {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn verify_directory_observed(
     dir: &Path,
     manifest: &CoreManifest,
@@ -582,25 +571,8 @@ pub(crate) fn verify_directory_observed(
     Ok(observation)
 }
 
-pub(crate) fn verify_bundled(core: &Path) -> Result<BundleObservation, String> {
-    let dir = core
-        .parent()
-        .ok_or("CORE_BUNDLE_MISMATCH: missing directory")?;
-    let platform = dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("CORE_BUNDLE_MISMATCH: unknown platform")?;
-    let manifest = selected_manifest(platform)?;
-    if core.file_name().and_then(|name| name.to_str())
-        != manifest
-            .files
-            .iter()
-            .find(|file| file.name == "sing-box" || file.name == "sing-box.exe")
-            .map(|file| file.name.as_str())
-    {
-        return Err("CORE_BUNDLE_MISMATCH: unexpected binary name".into());
-    }
-    verify_directory_observed(dir, &manifest)
+pub(crate) fn verify_bundled(core: &Path) -> Result<std::sync::Arc<AdmittedPayload>, String> {
+    acquire_at(core, ExecPurpose::CheckConfig).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

@@ -21,10 +21,15 @@ fn api() -> TailscaleLoginApiService {
     }
 }
 
+fn cache_path() -> &'static Path {
+    Path::new("/ud/tailscale-login-ts1-1.cache.db")
+}
+
 #[test]
 fn login_config_minimal_endpoint_state_dir_and_direct() {
     let server = ts_server(TailscaleSettings::default());
-    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+    let cfg =
+        build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path()).unwrap();
     assert_eq!(cfg.log["level"], "info");
     assert_eq!(cfg.log["timestamp"], true);
     assert_eq!(cfg.endpoints.len(), 1);
@@ -88,7 +93,8 @@ fn transient_ingress_reject_survives_renames_and_user_policy() {
             server.name = name.into();
             server.mesh_inbound_policy = policy;
             let value = login_config_to_json(
-                &build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap(),
+                &build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path())
+                    .unwrap(),
             );
             assert_eq!(value["endpoints"][0]["tag"], TAILSCALE_LOGIN_ENDPOINT_TAG);
             assert_eq!(value["endpoints"][0]["auth_key"], "fixture-key");
@@ -113,7 +119,7 @@ fn transient_ingress_reject_survives_renames_and_user_policy() {
             assert!(value["experimental"]["cache_file"]["path"]
                 .as_str()
                 .unwrap()
-                .ends_with("login-cache-51234.db"));
+                .ends_with("tailscale-login-ts1-1.cache.db"));
             assert_eq!(value["services"][0]["type"], "api");
             assert_eq!(value["services"][0]["listen"], "127.0.0.1");
             assert_eq!(value["services"][0]["listen_port"], 51234);
@@ -127,7 +133,7 @@ fn login_config_rejects_an_escaping_state_id() {
     let mut server = ts_server(TailscaleSettings::default());
     server.id = "../victim".to_string();
     assert_eq!(
-        build_tailscale_login_config(&server, Path::new("/ud"), &api()),
+        build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path()),
         Err(crate::tailscale_state::InvalidTailscaleStateId)
     );
 }
@@ -143,7 +149,8 @@ fn login_config_passes_login_related_fields_only() {
         ..Default::default()
     };
     let server = ts_server(ts);
-    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+    let cfg =
+        build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path()).unwrap();
     let ep = cfg.endpoints[0].as_object().unwrap();
     assert_eq!(ep["control_url"], "https://headscale.example"); // trim
     assert_eq!(ep["hostname"], "node-1");
@@ -155,7 +162,8 @@ fn login_config_passes_login_related_fields_only() {
 #[test]
 fn login_config_injects_management_service_with_listen_and_secret() {
     let server = ts_server(TailscaleSettings::default());
-    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+    let cfg =
+        build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path()).unwrap();
     assert_eq!(cfg.services.len(), 1);
     let svc = cfg.services[0].as_object().unwrap();
     assert_eq!(svc["type"], "api");
@@ -171,7 +179,7 @@ fn login_config_api_empty_secret_omits_secret_field() {
         port: 51234,
         secret: "   ".to_string(),
     };
-    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api).unwrap();
+    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api, cache_path()).unwrap();
     let svc = cfg.services[0].as_object().unwrap();
     assert!(svc.get("secret").is_none());
 }
@@ -182,7 +190,8 @@ fn login_config_api_empty_secret_omits_secret_field() {
 #[test]
 fn login_config_to_json_always_carries_management_service() {
     let server = ts_server(TailscaleSettings::default());
-    let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+    let cfg =
+        build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path()).unwrap();
     let json = login_config_to_json(&cfg);
     assert!(json.get("log").is_some());
     assert!(json.get("endpoints").is_some());
@@ -296,7 +305,8 @@ fn login_config_passes_nonempty_auth_key_for_official_and_custom_control() {
             control_url: control.clone(),
             ..Default::default()
         });
-        let cfg = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+        let cfg =
+            build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path()).unwrap();
         assert_eq!(cfg.endpoints[0]["auth_key"], "tskey-auth-fixture");
         assert_eq!(
             cfg.endpoints[0].get("control_url").and_then(Value::as_str),
@@ -308,7 +318,7 @@ fn login_config_passes_nonempty_auth_key_for_official_and_custom_control() {
         ..Default::default()
     });
     assert!(
-        build_tailscale_login_config(&server, Path::new("/ud"), &api())
+        build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path())
             .unwrap()
             .endpoints[0]
             .get("auth_key")
@@ -319,30 +329,26 @@ fn login_config_passes_nonempty_auth_key_for_official_and_custom_control() {
 #[test]
 fn login_cache_is_separate_from_main_cache_and_other_attempts() {
     let server = ts_server(TailscaleSettings::default());
-    let a = build_tailscale_login_config(&server, Path::new("/ud"), &api()).unwrap();
+    let a = build_tailscale_login_config(&server, Path::new("/ud"), &api(), cache_path()).unwrap();
     let b = build_tailscale_login_config(
         &server,
         Path::new("/ud"),
-        &TailscaleLoginApiService {
-            port: 51235,
-            ..api()
-        },
+        &api(),
+        Path::new("/ud/tailscale-login-ts1-2.cache.db"),
     )
     .unwrap();
     assert_ne!(
         a.experimental["cache_file"]["path"],
         b.experimental["cache_file"]["path"]
     );
-    let expected = Path::new("/ud")
-        .join("tailscale")
-        .join("ts1")
-        .join("login-cache-51234.db");
     assert_eq!(
         Path::new(
             login_config_to_json(&a)["experimental"]["cache_file"]["path"]
                 .as_str()
                 .unwrap()
         ),
-        expected.as_path()
+        cache_path()
     );
+    assert!(!cache_path().starts_with(Path::new("/ud").join("tailscale")));
+    assert_ne!(cache_path(), Path::new("/ud").join("cache.db"));
 }

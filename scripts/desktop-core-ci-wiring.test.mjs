@@ -103,7 +103,7 @@ function bundles(source) {
 // throws here. always() keeps an in-flight installer leg alive after its run is
 // cancelled (GitHub re-evaluates `if` on cancellation), which is what made a
 // superseded Release Risk run hold its concurrency group to the end.
-function jobAllows(source, name, setup, core, provided, runCancelled = false, linuxAuthPreflightOnly = false) {
+function jobAllows(source, name, setup, core, provided, runCancelled = false) {
   const block = /    if: >-\n((?:      .*\n)+)/.exec(job(source, name));
   assert.ok(block, `${name} needs explicit reusable-source skip allowlist`);
   const expression = block[1].split('\n').map((line) => line.trim()).join(' ');
@@ -111,11 +111,10 @@ function jobAllows(source, name, setup, core, provided, runCancelled = false, li
   // Only immutable status/input dictionaries are supplied; no workflow is run.
   return Boolean(Function('needs', 'inputs', 'cancelled', `return (${expression});`)(
     { setup: { result: setup }, desktop_core: { result: core } },
-    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '',
-      linux_auth_preflight_only: linuxAuthPreflightOnly }, () => runCancelled));
+    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '' }, () => runCancelled));
 }
 function checkAllowlist(source) {
-  assert.match(job(source, 'desktop_core'), /^    if: inputs\.linux_auth_preflight_only != true && \(inputs\.core_bundle_artifact == ''\)$/m);
+  assert.match(job(source, 'desktop_core'), /^    if: \(inputs\.core_bundle_artifact == ''\)$/m);
   // Installer legs and the single wire job share one allowlist.
   for (const name of ['package', 'core_wire']) {
     for (const [setup, core, provided, allowed] of [
@@ -127,8 +126,6 @@ function checkAllowlist(source) {
       assert.equal(jobAllows(source, name, setup, core, provided), allowed, `${name}: ${setup}/${core}/provided=${provided}`);
       // A cancelled run stops the job on every row, including the two allowed ones.
       assert.equal(jobAllows(source, name, setup, core, provided, true), false, `${name}: cancelled run ${setup}/${core}/provided=${provided}`);
-      assert.equal(jobAllows(source, name, setup, core, provided, false, true), false,
-        `${name}: auth-preflight-only ${setup}/${core}/provided=${provided}`);
     }
   }
 }
@@ -252,19 +249,6 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
 
 test('Package reuses the provided bundle without a second producer and rejects failed or cancelled source jobs', () => {
   checkAllowlist(files.package);
-  // Auth-preflight-only runs must never start producers, installers or wire consumers.
-  for (const name of ['desktop_core', 'package', 'core_wire']) {
-    const before = job(files.package, name);
-    for (const [guard, replacement] of [
-      ['inputs.linux_auth_preflight_only != true && ', ''],
-      ['inputs.linux_auth_preflight_only != true', 'inputs.linux_auth_preflight_only == true'],
-      ['inputs.linux_auth_preflight_only != true && ', 'inputs.linux_auth_preflight_only != true || '],
-    ]) {
-      const after = before.replace(guard, replacement);
-      assert.notEqual(after, before, `${name}: mutation must reach the actual preflight guard`);
-      assert.throws(() => checkAllowlist(files.package.replace(before, after)), `${name}: weakened preflight guard`);
-    }
-  }
   assert.throws(() => checkAllowlist(files.package.replace("needs.desktop_core.result == 'success'", "needs.desktop_core.result != 'failure'")));
   assert.throws(() => checkAllowlist(files.package.replaceAll(" && inputs.core_bundle_artifact != ''", '')));
   // Each job is held to the allowlist on its own: weakening only one of the two must fail.
@@ -336,4 +320,25 @@ test('upstream directory test recipe reads exact selected source flags without i
   check(branch);
   for (const marker of ['loadReleaseContract(process.cwd()', '(Get-Item -LiteralPath $flagsPath).LinkType', "sharedFlagsPath='release/LDFLAGS'"])
     assert.throws(() => check(branch.replace(marker, 'REMOVED')));
+});
+
+
+test('Windows maintenance anchor is bin-only and does not create a helper self-hash cycle', () => {
+  const main = readFileSync(join(root, 'crates/windows-cleaner/src/main.rs'), 'utf8');
+  const lib = readFileSync(join(root, 'crates/windows-cleaner/src/lib.rs'), 'utf8');
+  const installer = readFileSync(join(root, 'crates/windows-cleaner/src/windows/install.rs'), 'utf8');
+  const prepare = readFileSync(join(root, 'scripts/prepare-core-identity.mjs'), 'utf8');
+  assert.ok(main.includes('option_env!("POLARIS_WINDOWS_INSTALL_ANCHOR")'));
+  assert.ok(!lib.includes('option_env!'));
+  assert.ok(installer.includes('anchor.admits(&request)'));
+  assert.ok(!installer.includes('std::env::var("POLARIS_WINDOWS_INSTALL_ANCHOR")'));
+  assert.ok(prepare.includes('verifiedCandidateSource(root)'));
+  assert.ok(prepare.includes('verifyPackagedRelease(root, input, platform'));
+  assert.ok(prepare.includes("actualCoreFile(resolve(flags.get('helper-binary')))"));
+  const block = files.package.slice(files.package.indexOf('      - name: Build and stage privileged helper'));
+  const helper = block.indexOf('cargo build --release -p polaris-helper');
+  const anchor = block.indexOf('--mode=maintenance-anchor');
+  const cleaner = block.indexOf('cargo build --release -p polaris-windows-cleaner');
+  const full = block.indexOf('node scripts/prepare-core-identity.mjs --platform="$res_dir"');
+  assert.ok(helper >= 0 && helper < anchor && anchor < cleaner && cleaner < full);
 });

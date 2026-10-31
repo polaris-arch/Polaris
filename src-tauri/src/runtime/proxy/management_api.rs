@@ -8,12 +8,69 @@ use std::collections::BTreeMap;
 use polaris_config_engine::builder::build_id_to_tag_map;
 use polaris_config_engine::builder::helpers::ServerLike;
 use polaris_config_engine::user_config::app_config::UserConfig;
-use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
+use polaris_singbox_grpc::{ClientError, Endpoint, SingBoxApiClient};
 use serde_json::Value;
 
 use crate::runtime::management_api::{current_clash_api_secret, GrpcManagementApi};
 
 use super::ProxyRuntime;
+
+pub(crate) struct ApiReadbackBinding {
+    pub(crate) port: u16,
+    pub(crate) secret: String,
+    pub(crate) epoch: Option<std::sync::Arc<super::runtime_config::api_handoff::ApiRelayEpoch>>,
+    // No borrower is cached here: an idle binding cannot hold seal_and_join
+    // hostage. The actual opening/receive worker acquires and retains it.
+    pub(crate) control: Option<std::sync::Arc<SingBoxApiClient>>,
+}
+
+impl ApiReadbackBinding {
+    pub(crate) async fn open_events(
+        self,
+        interval: i64,
+    ) -> Result<
+        impl futures::Stream<
+                Item = Result<
+                    polaris_singbox_grpc::daemon::ConnectionEvents,
+                    polaris_singbox_grpc::tonic::Status,
+                >,
+            > + Send,
+        ClientError,
+    > {
+        let invalid = || {
+            ClientError::Status(polaris_singbox_grpc::tonic::Status::failed_precondition(
+                "readback carrier unavailable",
+            ))
+        };
+        let client = match (self.epoch, self.control) {
+            (Some(epoch), Some(control)) => {
+                let lease = epoch.borrow();
+                if lease.is_closed() || !control.captured_transport_live() {
+                    return Err(invalid());
+                }
+                control.as_ref().clone().retain_lifetime(lease)
+            }
+            (None, None) => {
+                SingBoxApiClient::connect(Endpoint::new("127.0.0.1", self.port), self.secret)
+                    .await?
+            }
+            _ => return Err(invalid()),
+        };
+        let frames = client.connection_events_once(interval).await?;
+        // Keep the exact client/borrow with the stream, including while a
+        // message is pending. The epoch owns and joins the enclosing worker.
+        Ok(futures::stream::unfold(
+            (client, frames),
+            |(client, mut frames)| async move {
+                match frames.message().await {
+                    Ok(Some(frame)) => Some((Ok(frame), (client, frames))),
+                    Ok(None) => None,
+                    Err(error) => Some((Err(error), (client, frames))),
+                }
+            },
+        ))
+    }
+}
 
 impl ProxyRuntime {
     /// 建管理 API 客户端（h2c gRPC）。核未起 / 端口未解析 / 连不上 → `not_ready()`（→ 退回重启）。
@@ -25,8 +82,39 @@ impl ProxyRuntime {
         if !status.running || status.clash_api_port == 0 {
             return GrpcManagementApi::not_ready();
         }
-        let secret = self.clash_api_secret();
-        Self::management_api_at(status.clash_api_port, secret).await
+        match self.current_management_client(status.clash_api_port).await {
+            Ok(client) => GrpcManagementApi::new(client),
+            Err(_) => GrpcManagementApi::not_ready(),
+        }
+    }
+
+    // Port and credential are one captured running-baseline value. A stale
+    // caller must fail before sending a new credential to a retired tuple.
+    pub(crate) async fn current_management_client(
+        &self,
+        expected_port: u16,
+    ) -> Result<SingBoxApiClient, ClientError> {
+        let invalid = || {
+            ClientError::Status(polaris_singbox_grpc::tonic::Status::failed_precondition(
+                "management endpoint/epoch changed",
+            ))
+        };
+        match self
+            .managed_api_call(expected_port)
+            .map_err(|_| invalid())?
+        {
+            Some((control, lease)) => Ok(control.as_ref().clone().retain_lifetime(lease)),
+            None => {
+                if expected_port == 0 {
+                    return Err(invalid());
+                }
+                SingBoxApiClient::connect(
+                    Endpoint::new("127.0.0.1", expected_port),
+                    current_clash_api_secret(&self.config),
+                )
+                .await
+            }
+        }
     }
 
     /// Bind the ordinary transport to the producer's endpoint before any action I/O.
@@ -50,8 +138,19 @@ impl ProxyRuntime {
     /// 同一个端点。
     pub(crate) fn management_endpoint(&self) -> Option<(u16, String)> {
         let status = self.status();
-        (status.running && status.clash_api_port != 0)
-            .then(|| (status.clash_api_port, self.clash_api_secret()))
+        if !status.running || status.clash_api_port == 0 {
+            return None;
+        }
+        if let Some((_, port, secret)) = self.verified_runtime_api_endpoint() {
+            return Some((port, secret));
+        }
+        if self.runtime_api_baseline_present() {
+            return None;
+        }
+        Some((
+            status.clash_api_port,
+            current_clash_api_secret(&self.config),
+        ))
     }
 
     /// 一轮测速的读回流要连的管理端点：持票据的运行用票据里的那一个（与它的探针换选同一个），
@@ -60,9 +159,33 @@ impl ProxyRuntime {
         &self,
         ticket: Option<&super::ReadyMainTicket>,
     ) -> Option<(u16, String)> {
+        self.readback_binding(ticket)
+            .map(|binding| (binding.port, binding.secret))
+    }
+    pub(crate) fn readback_binding(
+        &self,
+        ticket: Option<&super::ReadyMainTicket>,
+    ) -> Option<ApiReadbackBinding> {
+        match self.managed_readback_binding(ticket) {
+            Ok(Some(binding)) => return Some(binding),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
         match ticket {
-            Some(ticket) => Some((ticket.api_port(), ticket.api_secret().to_owned())),
-            None => self.management_endpoint(),
+            Some(ticket) => Some(ApiReadbackBinding {
+                port: ticket.api_port(),
+                secret: ticket.api_secret().to_owned(),
+                epoch: None,
+                control: None,
+            }),
+            None => self
+                .management_endpoint()
+                .map(|(port, secret)| ApiReadbackBinding {
+                    port,
+                    secret,
+                    epoch: None,
+                    control: None,
+                }),
         }
     }
 
@@ -72,6 +195,9 @@ impl ProxyRuntime {
     /// `probe_select_slot → hot_switch_selector → management_api → 本方法` —— 测速一轮调 N 次，
     /// 所有热切节点的路径也都经过这里。
     pub(super) fn clash_api_secret(&self) -> String {
+        if let Some((_, _, secret)) = self.verified_runtime_api_endpoint() {
+            return secret;
+        }
         current_clash_api_secret(&self.config)
     }
 
@@ -96,7 +222,8 @@ impl ProxyRuntime {
             .read()
             .ok()
             .and_then(|g| g.as_ref().and_then(|s| s.id_to_tag.get(server_id).cloned()))?;
-        Some((status.clash_api_port, self.clash_api_secret(), tag))
+        self.management_endpoint()
+            .map(|(port, secret)| (port, secret, tag))
     }
 
     /// 起核配置的 `endpointTag → serverId` 逆映射（`build_id_to_tag_map` 的逆）。
@@ -130,11 +257,13 @@ impl ProxyRuntime {
         if !s.running || s.clash_api_port == 0 {
             return serde_json::json!({ "ok": false, "url": "", "apiUrl": "", "secret": "" });
         }
-        let secret = self.clash_api_secret();
+        let Some((port, secret)) = self.management_endpoint() else {
+            return serde_json::json!({"ok":false,"url":"","apiUrl":"","secret":""});
+        };
         serde_json::json!({
             "ok": true,
-            "url": format!("http://127.0.0.1:{}/dashboard/", s.clash_api_port),
-            "apiUrl": format!("http://127.0.0.1:{}", s.clash_api_port),
+            "url": format!("http://127.0.0.1:{}/dashboard/", port),
+            "apiUrl": format!("http://127.0.0.1:{}", port),
             "secret": secret,
         })
     }

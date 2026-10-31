@@ -814,8 +814,8 @@ pub fn run() {
             // 把现役内核路径注入 UpdaterRuntime（版本读取的探测目标）。Android / iOS 的内核不是
             // 独立可执行文件，没有可探测的对象。
             #[cfg(desktop)]
-            match runtime::proxy::resolve_core_binary() {
-                Ok(core) => app_runtime.updater().with_core_binary(core),
+            match runtime::core_identity::acquire(runtime::core_identity::ExecPurpose::CheckConfig) {
+                Ok(core) => app_runtime.updater().with_core_binary(core.diagnostic_path().to_path_buf()),
                 Err(e) => log::warn!("未解析到随包内核，版本读取将报未知：{e}"),
             }
             // ── C1 启动期系统代理崩溃恢复 ──
@@ -1291,6 +1291,8 @@ pub fn run() {
             update_popup_action,
             update_popup_show,
             core_get_version_info,
+            core_check_offline_recovery,
+            core_restore_bundled_data,
             app_uninstall_all,
             // ── 窗口控制（window:* + app + renderer/fatal）──
             window_minimize,

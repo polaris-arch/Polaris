@@ -51,7 +51,11 @@ describe('Settings UI 使用统一组件与语义分组', () => {
   it('开关行只常驻简短名称，复杂说明统一进入信息提示', () => {
     const violations: string[] = [];
     for (const { name, source } of settingScreens) {
-      if (/<SetRow\b[^>]*\bdesc=\{[^}]+\}[^>]*>\s*(?:\{\/\*[\s\S]*?\*\/\}\s*)?<Switch/.test(source))
+      // The one platform warning row is covered by actual macOS/Windows/Linux render cases.
+      // All other switch rows still reject permanently expanded static explanations.
+      const copy = name === 'SettingsTun.tsx'
+        ? source.replace(/<SetRow\s+id="set-strict-route"[\s\S]*?<\/SetRow>/, '') : source;
+      if (/<SetRow\b[^>]*\bdesc=\{[^}]+\}[^>]*>\s*(?:\{\/\*[\s\S]*?\*\/\}\s*)?<Switch/.test(copy))
         violations.push(name);
     }
     expect(violations, '开关行仍永久铺开说明，应改用 SetRow tip').toEqual([]);
@@ -61,7 +65,7 @@ describe('Settings UI 使用统一组件与语义分组', () => {
     const allowedDescCounts: Record<string, number> = {
       'SettingsGeneral.tsx': 1, // 密码已设置/未设置
       'SettingsNetwork.tsx': 5, // WebRTC 模式、代理端口、网卡失败、测速并发上限及实际 TLS 指纹能力状态
-      'SettingsTun.tsx': 1, // IPv6 与 FakeIP 当前组合风险 + 修复动作
+      'SettingsTun.tsx': 2, // IPv6/FakeIP组合风险，以及严格路由的平台禁用/启用风险
     };
     for (const { name, source } of settingScreens) {
       const count = source.match(/\bdesc=/g)?.length ?? 0;

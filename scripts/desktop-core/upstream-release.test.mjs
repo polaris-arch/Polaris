@@ -5,8 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
 import { verifyNativeReleaseGate } from './release-native-gates.mjs';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, copyFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import fs, { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, copyFileSync } from 'node:fs';
+import { tmpdir, devNull } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nativeReleaseGoVersion } from '../native-payload-input.mjs';
@@ -913,6 +913,126 @@ else:
   }}),/identity changed/);
   // Failed acquisitions never replace the already installed, verified payload.
   verifyPackagedRelease(root,manifest,'linux',join(root,'resources/linux/sing-box'),run,'linux');
+  // Reuse this exact original source/archive fixture. Only Go inspection and
+  // full-tree subprocess remain its existing mocks; cache does not certify them.
+  const cacheParent=mkdtempSync(join(tmpdir(),'published-blob-cache-')), blobCacheDir=join(fs.realpathSync(cacheParent),'store');
+  t.after(()=>rmSync(cacheParent,{recursive:true,force:true}));
+  const reports=[], options={read,run,host:'linux',blobCacheDir,report:line=>reports.push(line)};
+  const admissionStop=Error('private upstream cache admission observation only');
+  await assert.rejects(consumeRelease(root,manifest,['linux'],{...options,read:async()=>{throw admissionStop;}}),error=>error===admissionStop);
+  const cacheSupported=reports.includes('Release blob cache ready');
+  assert.equal(reports.includes('Release blob cache unavailable'),!cacheSupported);reports.length=0;
+
+  const payloadURLs=[contract.sourceArchive.url,...Object.values(contract.platforms).map(row=>row.releaseAsset.url)];
+  const payloadCount=()=>calls.filter(url=>payloadURLs.includes(url)).length;
+  const sourceCount=()=>sourceChecks.length;
+  const bytesAt=()=>Object.fromEntries(Object.entries(contract.platforms).map(([key,row])=>[key,digest(readFileSync(join(root,'resources',key,row.core.member)))]));
+  await t.test('raw cache upstream cold/warm still reprove source and both public snapshots',async()=>{
+    const n=payloadCount(), checks=sourceCount();
+    const cold=await consumeRelease(root,manifest,undefined,options), coldBytes=bytesAt();
+    assert.equal(payloadCount()-n,5);assert.equal(sourceCount()-checks,1);
+    const at=calls.length, first=payloadCount(), priorChecks=sourceCount();
+    const warm=await consumeRelease(root,manifest,undefined,options);
+    assert.deepEqual(warm,cold);assert.deepEqual(bytesAt(),coldBytes);
+    assert.equal(payloadCount()-first,cacheSupported?0:5);assert.equal(sourceCount()-priorChecks,1);
+    assert.equal(calls.slice(at).filter(url=>url===publicURL).length,2);
+    assert.equal(calls.slice(at).filter(url=>url===treeURL).length,2);
+    assert.equal(reports.filter(line=>line.endsWith(' hit')).length,cacheSupported?5:0);
+    for(const key of Object.keys(contract.platforms))verifyPackagedRelease(root,manifest,key,join(root,'resources',key,contract.platforms[key].core.member),run,'linux');
+  });
+  await t.test('raw cache upstream hit still rejects complete-source failure and fresh source drift',async()=>{
+    const installed=bytesAt(), failure=Error('complete source tree validation rejected');
+    await assert.rejects(consumeRelease(root,manifest,['linux'],{...options,run:(command,args,settings)=>{
+      if(args[1]?.endsWith('release-archive.py') && settings.input && JSON.parse(settings.input).sourceArchive)throw failure;
+      return run(command,args,settings);
+    }}),error=>error===failure);assert.deepEqual(bytesAt(),installed);
+    let snapshots=0;
+    await assert.rejects(consumeRelease(root,manifest,['linux'],{...options,read:async url=>{
+      const bytes=await read(url);
+      if(url===treeURL && ++snapshots===2)return encode({sha:'0'.repeat(40),truncated:false,tree:[]});return bytes;
+    }}),/source tree|source observation|source.*differ|Source tree/i);
+    assert.equal(snapshots,2);assert.deepEqual(bytesAt(),installed);
+  });
+  await t.test('raw cache upstream bad source bytes fall back without storing failed downloads',async()=>{
+    if(!cacheSupported){await consumeRelease(root,manifest,['linux'],options);assert.equal(fs.existsSync(blobCacheDir)?fs.readdirSync(blobCacheDir).filter(name=>name.endsWith('.blob')).length:0,0);return;}
+    const pin=contract.sourceArchive, path=join(blobCacheDir,pin.sha256+'.blob'), original=transport.get(pin.url), before=bytesAt();
+    writeFileSync(path,Buffer.alloc(pin.bytes));transport.set(pin.url,Buffer.alloc(pin.bytes));
+    try{await assert.rejects(consumeRelease(root,manifest,['linux'],options),/complete source archive differs/);assert.deepEqual(bytesAt(),before);assert.deepEqual(readFileSync(path),Buffer.alloc(pin.bytes));}
+    finally{transport.set(pin.url,original);writeFileSync(path,original);}
+  });
+  await t.test('raw cache same Core regenerates receipts for two actual clean Git adapter commits',async()=>{
+    // The archive/source fixture stays identical. Use actual ordinary Git here,
+    // so the new adapter's HEAD and changed file closure are read by production.
+    const isolateGitEnvironment=(base)=>{
+      const env={...base};
+      // Repository/index/object selectors, injected -c configuration, identities,
+      // dates, templates and executable paths are all invocation-local here.
+      for(const key of Object.keys(env))if(/^GIT_/i.test(key))delete env[key];
+      const clean={...env,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:devNull,GIT_OPTIONAL_LOCKS:'0'};
+      // Plain-object child env keys must have no Windows case-insensitive alias.
+      assert.deepEqual(Object.keys(clean).filter(key=>/^GIT_/i.test(key)).sort(),['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_OPTIONAL_LOCKS']);
+      return clean;
+    };
+    const fixtureGit=(directory,args,settings={})=>execFileSync('git',[
+      '-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false',...args,
+    ],{...settings,cwd:directory,env:isolateGitEnvironment(settings.env??process.env),encoding:'utf8'});
+    const outside=mkdtempSync(join(tmpdir(),'cache-adapter-external-'));t.after(()=>rmSync(outside,{recursive:true,force:true}));
+    // Even the first controlled repository creation receives case-variant
+    // selectors. Every target here is inside this new private fixture only.
+    const initialEnvironment={...process.env,GIT_DIR:join(outside,'uppercase.git'),git_dir:join(outside,'lowercase.git'),
+      Git_Work_Tree:join(outside,'redirected-worktree'),git_index_file:join(outside,'redirected.index'),
+      Git_Config_Count:'1',git_config_key_0:'core.worktree',gIt_CoNfIg_VaLuE_0:outside,
+      Git_Author_Name:'Foreign setup author',git_committer_date:'2000-01-01T00:00:00Z'};
+    const setup=(...args)=>fixtureGit(outside,args,{env:initialEnvironment});
+    setup('init','--quiet');writeFileSync(join(outside,'sentinel'),'controlled external repository must not change\n');
+    setup('add','--','sentinel');setup('commit','--quiet','--message','test: controlled external repository');
+    assert(fs.existsSync(join(outside,'.git')));
+    for(const name of ['uppercase.git','lowercase.git','redirected-worktree','redirected.index'])assert(!fs.existsSync(join(outside,name)));
+    const outsideIndex=join(outside,'alternate.index');copyFileSync(join(outside,'.git/index'),outsideIndex);
+    const externalBytes=()=>{
+      const files={};const walk=(at,prefix='')=>{for(const name of fs.readdirSync(at)){const p=join(at,name),relative=prefix+name;const st=fs.lstatSync(p);if(st.isDirectory())walk(p,relative+'/');else files[relative]={bytes:readFileSync(p),mode:st.mode};}};
+      walk(outside);return files;
+    };
+    const externalBefore=externalBytes(),externalHEAD=fixtureGit(outside,['rev-parse','HEAD']).trim(),sessionEnvironment={...process.env};
+    const hostile={...process.env,GIT_DIR:join(outside,'.git'),GIT_WORK_TREE:outside,GIT_INDEX_FILE:outsideIndex,
+      GIT_COMMON_DIR:join(outside,'.git'),GIT_OBJECT_DIRECTORY:join(outside,'.git/objects'),GIT_ALTERNATE_OBJECT_DIRECTORIES:join(outside,'.git/objects'),
+      GIT_CONFIG_COUNT:'2',GIT_CONFIG_KEY_0:'core.worktree',GIT_CONFIG_VALUE_0:outside,GIT_CONFIG_KEY_1:'commit.gpgsign',GIT_CONFIG_VALUE_1:'true',
+      GIT_AUTHOR_NAME:'Foreign Author',GIT_AUTHOR_EMAIL:'foreign@example.invalid',GIT_AUTHOR_DATE:'2000-01-01T00:00:00Z',
+      GIT_COMMITTER_NAME:'Foreign Committer',GIT_COMMITTER_EMAIL:'committer@example.invalid',GIT_COMMITTER_DATE:'2000-01-01T00:00:00Z',GIT_TEMPLATE_DIR:outside,
+      git_dir:join(outside,'.git'),Git_Work_Tree:outside,git_index_file:outsideIndex,GiT_CoMmOn_DiR:join(outside,'.git'),
+      git_object_directory:join(outside,'.git/objects'),Git_Alternate_Object_Directories:join(outside,'.git/objects'),
+      git_config_count:'2',Git_Config_Key_0:'core.worktree',git_config_value_0:outside,Git_Config_Key_1:'commit.gpgsign',git_config_value_1:'true',
+      Git_Author_Name:'Foreign case author',git_author_email:'case@example.invalid',Git_Author_Date:'2000-01-01T00:00:00Z',
+      git_committer_name:'Foreign case committer',Git_Committer_Email:'case@example.invalid',git_committer_date:'2000-01-01T00:00:00Z',Git_Template_Dir:outside};
+    const git=(...args)=>fixtureGit(root,args,{env:hostile});
+    git('init','--quiet');git('config','core.autocrlf','false');
+    git('add','--',...ADAPTER_FILES,manifest.desktopRelease.contractPath,contract.assetIndex.path);
+    git('commit','--quiet','--message','test: record first cache adapter closure');
+    // Use the same complete environment isolation for production adapter reads,
+    // including any selector/config values in its supplied subprocess settings.
+    const actualRun=(command,args,settings)=>command==='git'?fixtureGit(root,args,{...settings,env:{...settings?.env,...hostile}}):run(command,args,settings);
+    const firstHEAD=git('rev-parse','HEAD').trim(), first=await consumeRelease(root,manifest,undefined,{...options,run:actualRun});
+    assert.equal(git('show','-s','--format=%an <%ae>|%cn <%ce>','HEAD').trim(),'Fixture <fixture@example.invalid>|Fixture <fixture@example.invalid>');
+    const beforeBytes=bytesAt(), previousPayloads=payloadCount(), previousChecks=sourceCount(), at=calls.length;
+    const changed=ADAPTER_FILES.find(name=>name==='scripts/prepare-core-identity.mjs'), path=join(root,changed);
+    writeFileSync(path,Buffer.concat([readFileSync(path),Buffer.from('\n// private cache test adapter generation\n')]));
+    git('add','--',changed);git('commit','--quiet','--message','test: record second cache adapter closure');
+    const nextHEAD=git('rev-parse','HEAD').trim();assert.notEqual(firstHEAD,nextHEAD);
+    const second=await consumeRelease(root,manifest,undefined,{...options,run:actualRun});
+    assert.deepEqual(bytesAt(),beforeBytes);assert.equal(payloadCount()-previousPayloads,cacheSupported?0:5);assert.equal(sourceCount()-previousChecks,1);
+    assert.equal(calls.slice(at).filter(url=>url===publicURL).length,2);assert.equal(calls.slice(at).filter(url=>url===treeURL).length,2);
+    for(const key of Object.keys(contract.platforms)){
+      assert.equal(first[key].adapter.facts.candidate,firstHEAD);assert.equal(second[key].adapter.facts.candidate,nextHEAD);
+      assert.notEqual(first[key].adapter.fingerprint,second[key].adapter.fingerprint);assert.notEqual(first[key].fingerprint,second[key].fingerprint);
+      assert.notEqual(first[key].adapter.facts.fileSha256[changed],second[key].adapter.facts.fileSha256[changed]);
+      assert.deepEqual(first[key].producer,second[key].producer);assert.deepEqual(first[key].releaseAsset,second[key].releaseAsset);
+      verifyPackagedRelease(root,manifest,key,join(root,'resources',key,contract.platforms[key].core.member),actualRun,'linux');
+    }
+    assert.equal(git('show','-s','--format=%an <%ae>|%cn <%ce>','HEAD').trim(),'Fixture <fixture@example.invalid>|Fixture <fixture@example.invalid>');
+    assert.equal(fixtureGit(outside,['rev-parse','HEAD']).trim(),externalHEAD);
+    assert.deepEqual(externalBytes(),externalBefore,'malicious Git selectors/config must not change any controlled external repo/index bytes');
+    assert.deepEqual({...process.env},sessionEnvironment,'fixture isolation must not mutate the parent environment');
+  });
 });
 
 

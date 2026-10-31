@@ -44,10 +44,10 @@ describe('doneSubject —— 「完成」必须说得出下的是哪一版、包
    * 这条钉的就是「目录不上屏」。
    */
   it('只取文件名，不带目录（尾截断会把唯一带信息的那一半吃掉）', () => {
-    const long = '/Users/sway/Library/Caches/com.polaris.app/updates/Polaris-1.2.0-mac-arm64.dmg';
+    const long = '/Users/fixture-user/Library/Caches/com.polaris.app/updates/Polaris-1.2.0-mac-arm64.dmg';
     expect(doneSubject('v1.2.0', long)).toBe('v1.2.0 · Polaris-1.2.0-mac-arm64.dmg');
     // Windows 反斜杠同样走这条渲染腿。
-    expect(doneSubject('v1.2.0', 'C:\\Users\\sway\\AppData\\Local\\updates\\Polaris_1.2.0_x64-setup.exe')).toBe(
+    expect(doneSubject('v1.2.0', 'C:\\Users\\fixture-user\\AppData\\Local\\updates\\Polaris_1.2.0_x64-setup.exe')).toBe(
       'v1.2.0 · Polaris_1.2.0_x64-setup.exe',
     );
   });

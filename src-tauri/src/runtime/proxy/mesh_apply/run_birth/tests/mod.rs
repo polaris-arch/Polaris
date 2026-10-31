@@ -7,7 +7,8 @@ async fn legacy_constructor_marks_legacy_and_synthetic_birth_attaches_facts() {
         tokio::process::Command::new("sleep")
             .arg("30")
             .spawn()
-            .unwrap(),
+            .unwrap()
+            .into(),
         RunIdentity::new(),
     );
     assert!(matches!(legacy.origin, DirectRunOrigin::Legacy));
@@ -32,7 +33,8 @@ async fn legacy_constructor_marks_legacy_and_synthetic_birth_attaches_facts() {
         tokio::process::Command::new("sleep")
             .arg("30")
             .spawn()
-            .unwrap(),
+            .unwrap()
+            .into(),
     );
     assert!(managed.identity.same_run(&identity));
     assert!(matches!(

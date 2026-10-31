@@ -1548,7 +1548,7 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
     ).toBe(false);
   });
 
-  it('重新下载只接受后端确认的当前版本，真正新版仍回到普通更新确认屏', async () => {
+  it('重新下载只接受后端确认的当前版本，意外的普通升级结果仍回到确认屏', async () => {
     const src = await readTsx();
     const start = src.indexOf('async function reinstallCurrent(');
     const end = src.indexOf('async function skipVersion(', start);

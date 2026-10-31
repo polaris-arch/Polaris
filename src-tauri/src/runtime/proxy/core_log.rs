@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use polaris_singbox_grpc::{Endpoint, ReconnectConfig, SingBoxApiClient};
+use polaris_singbox_grpc::ReconnectConfig;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -92,11 +92,16 @@ impl ProxyRuntime {
             );
             return;
         }
+        if let Ok(mut baseline) = self.runtime_config_baseline.write() {
+            if let Some(b) = baseline.as_mut().filter(|b| b.generation == my_gen) {
+                b.api_log_handoff = pipe_handoff.clone();
+            }
+        }
         let me = Arc::clone(self);
-        tokio::spawn(async move {
-            let secret = me.clash_api_secret();
+        self.spawn_runtime_api_relay(async move {
+            let _pipe_reset = ApiLogPipeReset(pipe_handoff.clone());
             let client =
-                match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", api_port), secret).await
+                match me.current_management_client(api_port).await
                 {
                     Ok(c) => c,
                     Err(e) => {
@@ -887,3 +892,13 @@ pub(super) fn log_axes_from_config(
 
 #[cfg(test)]
 mod tests;
+
+// API epoch cancellation must hand stderr back before the joined task returns.
+struct ApiLogPipeReset(Option<CoreLogHandoff>);
+impl Drop for ApiLogPipeReset {
+    fn drop(&mut self) {
+        if let Some(flag) = &self.0 {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
+}

@@ -324,8 +324,8 @@ fn plan_no_change_is_none() {
 
 // === planHotSwitch TUN 端到端 ===
 
-/// Windows 192.168.10.207 真机（2026-08-21）：本体 TUN + auto（实际 gVisor）下直接执行
-/// `SelectOutbound`，Hk01-L7 → Hk01 → Hk01-L7 两次读回正确，sing-box PID 恒为 10684。
+/// Windows TUN 回归场景：本体 TUN + auto（实际 gVisor）下直接执行
+/// `SelectOutbound`，合成 selector A → B → A 两次读回正确，原 Child 身份保持不变。
 /// selector 切换属于管理面操作，不依赖 TUN 栈；TUN 模式下不得触发平台式重启。
 /// （TUN stack 选项已随上游弃用整体移除，原先按四个栈值各跑一遍的循环收成单例。）
 #[test]
@@ -1037,29 +1037,14 @@ fn can_skip_add_node_without_selection_false() {
     assert!(!can_skip_restart_for_added_unreferenced(&a, &b, &snap));
 }
 
-// === sel_only_forces_subnets：闭包 → 模块级函数提取后的语义不变回归 ===
+// === 非 TS 保持旧判据；TS 冷态也必须保守保护 warm 投影 ===
 
-/// **提取前后结论必须逐格一致**。
-///
-/// 2026-09 把 [`plan_hot_switch`] 里的局部闭包 `sel_only_forces_subnets` 原样提成模块级函数
-/// （当时是为让自动故障切换的停摆判据复用同一份判据而提为 `pub`；那条复用已撤回、函数收回私有，
-/// 但提取本身保留 —— 它仍是 [`plan_hot_switch`] 里那道 route 投影 guard 的判据）。提取是纯搬运，
-/// 但「纯搬运」这件事得有人证：本测把提取前那三项合取**按当时的源码原样重写**成参照实现，喂同一批
-/// 输入逐格对差 —— 提取时若手滑改了任一项（漏 `!`、换成 `mesh_allows_internet`、把
-/// `endpoint_forced_route_cidrs` 换成 `mesh_routes`），对差立刻转红。
-///
-/// 输入面按三项合取的**每一项各自可翻转**来铺：组网资格（WG/TS/OVPN±meshRoutes/普通协议）×
-/// `alwaysRouteSubnets`（true/false/缺省）× 段（空/非空）。
-///
-/// 变异锁：改 `sel_only_forces_subnets` 的任一项 → 本测转红；
-/// 而把参照实现和被测实现**一起**改则由 `plan_switch_to_force_route_only_endpoint_none`
-/// 这条行为门兜住（那条断言热切规划仍退回重启）。
 #[test]
-fn sel_only_forces_subnets_matches_pre_extraction_formula() {
+fn sel_only_forces_subnets_preserves_non_ts_formula_and_cold_ts_guard() {
     use crate::user_config::protocol_settings::OpenvpnClientSettings;
     use crate::user_config::server_config::TailscaleSettings;
 
-    /// 提取**前**的判据，按 hotswitch.rs 里那个闭包的源码原样重写。
+    // 旧判据仅用于非 TS 对照；TS 的空集策略已获准改变。
     fn reference(s: Option<&ServerConfig>) -> bool {
         match s {
             Some(srv) => {
@@ -1121,7 +1106,7 @@ fn sel_only_forces_subnets_matches_pre_extraction_formula() {
         ("wg 关外网+仅选中发段", wg("wg4", Some(false), Some(false))),
         ("wg 仅选中发段但无段", wg_no_cidrs),
         ("warp(无段)", warp()),
-        // Tailscale：tailnet 两族段恒非空 ⇒ 第三项恒真，翻的是前两项。
+        // Tailscale：空 canonical 仍保护选择/规则目标的 warm 投影。
         ("ts 恒发段", ts(Some("e1"), Some(true))),
         ("ts 仅选中发段", ts(Some("e1"), Some(false))),
         ("ts 无 exit + 仅选中发段", ts(None, Some(false))),
@@ -1136,8 +1121,12 @@ fn sel_only_forces_subnets_matches_pre_extraction_formula() {
     for (label, server) in &matrix {
         assert_eq!(
             sel_only_forces_subnets(Some(server)),
-            reference(Some(server)),
-            "提取前后结论不一致：{label}"
+            if server.protocol == Protocol::Tailscale {
+                !mesh_always_routes_subnets(server)
+            } else {
+                reference(Some(server))
+            },
+            "非 TS 旧判据或 TS 冷态资格不一致：{label}"
         );
     }
     // `None`（无选中 / 选中不在 servers）两侧同判 false。
@@ -1157,79 +1146,60 @@ fn sel_only_forces_subnets_matches_pre_extraction_formula() {
     );
 }
 
-/// 🔴 钉住 [`sel_only_forces_subnets`] 对**运行期观测 tailnet 地址**的不敏感性
-/// （`hotswitch.rs` 里那段「恒传空且可证明等价」注释的判据）。
-///
-/// A-0a 给 `endpoint_forced_route_cidrs` 加了观测面入参，四个消费者里只有这一个恒传空。
-/// 传空之所以不是漏改，是因为本谓词的第三项只问「段集**非空**」，而观测地址只会**追加**、
-/// 且只对 Tailscale 生效 —— TS 的默认两段是常量、恒非空 ⇒ 有无观测，第三项同真 ⇒ 谓词同值。
-///
-/// **变异锁**：若哪天有人把 `endpoint_forced_route_cidrs` 的 Tailscale 分支改成「有观测就用
-/// 观测**替换**默认段」，空观测那一侧会变空、非空观测那一侧不变 ⇒ 下面的逐格相等立刻转红，
-/// 逼改动者回来重新判断这里到底还能不能传空。
+/// HotSwitchDeps 不携 hosts；冷集为空不能被当成该 TS 永无可路由地址。
 #[test]
-fn sel_only_forces_subnets_is_insensitive_to_observed_addresses() {
-    use crate::builder::endpoint_routes::ObservedTailnetAddresses;
+fn cold_tailscale_empty_routes_do_not_allow_warm_projection_hot_switch() {
     use crate::user_config::server_config::TailscaleSettings;
-
-    fn ts_node(id: &str, always: Option<bool>) -> ServerConfig {
-        ServerConfig {
-            id: id.into(),
-            name: id.into(),
-            protocol: Protocol::Tailscale,
-            tailscale_settings: Some(Box::new(TailscaleSettings {
-                exit_node: Some("e1".into()),
-                always_route_subnets: always,
-                ..Default::default()
-            })),
+    let mut old = base_config();
+    let ts = ServerConfig {
+        id: "cold-ts".into(),
+        name: "cold-ts".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::new(TailscaleSettings {
+            exit_node: Some("exit-peer".into()),
+            always_route_subnets: Some(false),
             ..Default::default()
-        }
-    }
-
-    let mut observed = ObservedTailnetAddresses::new();
-    observed.insert("ts-observed".into(), vec!["32.0.0.28".into()]);
-    let empty = ObservedTailnetAddresses::new();
-
-    // 同一批输入，观测面有/无两侧逐格对差：谓词唯一的可变项（段集非空）在两侧必须同真。
-    let matrix = [
-        (
-            "ts 仅选中发段 + 有观测",
-            ts_node("ts-observed", Some(false)),
-        ),
-        ("ts 仅选中发段 + 无观测", ts_node("ts-other", Some(false))),
-        ("ts 恒发段 + 有观测", ts_node("ts-observed", Some(true))),
-    ];
-    for (label, srv) in &matrix {
-        let with = endpoint_forced_route_cidrs(srv, &observed);
-        let without = endpoint_forced_route_cidrs(srv, &empty);
-        assert!(
-            !with.is_empty() && !without.is_empty(),
-            "{label}：TS 的默认两段恒非空，有无观测都不该出现空段集。with={with:?} without={without:?}"
-        );
-        // 正向对照：被观测点名的那个节点，两侧的**内容**确实不同 —— 证明上面的「同为非空」
-        // 不是因为观测面压根没生效（那样这条恒等就是平凡的、没有信息量）。
-        if srv.id == "ts-observed" {
-            assert_ne!(
-                with, without,
-                "{label}：观测面对该节点没起作用，本测退化成平凡断言"
-            );
-        }
-    }
-
-    // 谓词层：有观测的那个节点，判定值与「同形态但没被观测」的节点一致。
-    assert!(sel_only_forces_subnets(Some(&ts_node(
-        "ts-observed",
-        Some(false)
-    ))));
-    assert!(sel_only_forces_subnets(Some(&ts_node(
-        "ts-other",
-        Some(false)
-    ))));
-    // 反向对照：alwaysRouteSubnets=true ⇒ 第二项假 ⇒ 谓词假（证明它不是恒真）。
-    assert!(!sel_only_forces_subnets(Some(&ts_node(
-        "ts-observed",
-        Some(true)
-    ))));
+        })),
+        ..Default::default()
+    };
+    assert!(endpoint_forced_route_cidrs(&ts, &ObservedTailnetAddresses::new()).is_empty());
+    assert!(sel_only_forces_subnets(Some(&ts)));
+    let mut warm = ObservedTailnetAddresses::new();
+    warm.insert(
+        ts.id.clone(),
+        vec!["100.80.1.2".into(), "fd7a:115c:a1e0::2".into()],
+    );
+    assert!(!endpoint_forced_route_cidrs(&ts, &warm).is_empty());
+    old.servers.push(ts);
+    let mut deps = deps_with_tags();
+    deps.current_id_to_tag_map
+        .as_mut()
+        .unwrap()
+        .insert("cold-ts".into(), "cold-ts".into());
+    let mut selected = old.clone();
+    selected.selected_server_id = Some("cold-ts".into());
+    // 两端均允许公网，不能靠「无 exit」的另一个 guard 偶然拒绝本次热切。
+    assert_eq!(
+        plan_hot_switch(&old, &selected, &deps).kind,
+        HotSwitchKind::None
+    );
+    assert_eq!(
+        plan_hot_switch(&selected, &old, &deps).kind,
+        HotSwitchKind::None
+    );
+    selected
+        .servers
+        .last_mut()
+        .unwrap()
+        .tailscale_settings
+        .as_mut()
+        .unwrap()
+        .exit_node = None;
+    assert!(
+        !crate::builder::endpoint_routes::mesh_node_carries_full_tunnel(
+            selected.servers.last().unwrap()
+        )
+    );
 }
 
 #[test]

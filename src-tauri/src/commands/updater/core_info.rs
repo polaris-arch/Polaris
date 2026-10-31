@@ -32,11 +32,26 @@ pub async fn core_get_version_info(
     let read = tokio::task::spawn_blocking(move || {
         let state = app.state::<AppRuntime>();
         let u = state.updater();
-        core_version_info(
+        let mut info=core_version_info(
             &u.read_core_version_line(),
             u.bundled_core_version(),
             u.bundled_core_patch_set(),
-        )
+        );
+        // Admission diagnostics never run an unknown executable to ask its
+        // version. Recovery links use the existing verified App reinstall flow.
+        info["admission"]=if let Err(error)=polaris_core_supervisor::admitted_payload::check_selected_capability(crate::runtime::core_identity::ExecPurpose::CheckConfig) {
+            json!({"state":"rejected","kind":format!("{:?}",error.kind),"recovery":"none"})
+        } else {match crate::runtime::proxy::resolve_core_candidate() {
+            Ok(path)=>match crate::runtime::core_identity::acquire_at(&path,crate::runtime::core_identity::ExecPurpose::CheckConfig) {
+                Ok(payload)=>json!({"state":"admitted","coreId":payload.id().as_str(),"sourceCommit":payload.source_commit(),"policySha256":payload.policy_digest(),"recovery":"none"}),
+                Err(error)=>json!({"state":"rejected","kind":format!("{:?}",error.kind),"recovery":match error.recovery {polaris_core_supervisor::admitted_payload::RecoveryAction::ReinstallCurrentApp=>"reinstallCurrentApp",_=>"none"}}),
+            },
+            Err(error)=> {
+                let error=crate::runtime::core_identity::selection_error(error,crate::runtime::core_identity::ExecPurpose::CheckConfig);
+                json!({"state":"rejected","kind":format!("{:?}",error.kind),"recovery":if error.kind.is_payload_damage(){"reinstallCurrentApp"}else{"none"}})
+            },
+        }};
+        info
     })
     .await;
     Ok(match read {

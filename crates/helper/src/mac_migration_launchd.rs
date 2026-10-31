@@ -515,15 +515,22 @@ pub fn parse_disabled_state(text: &str, label: &str) -> io::Result<Option<bool>>
         return Err(invalid("invalid disabled target label"));
     }
     let lines = checked_lines(text)?;
-    if lines.first().copied() != Some("disabled services = {") || lines.last().copied() != Some("}")
-    {
+    // Two complete, finite display grammars. Do not trim arbitrary whitespace:
+    // indentation, the root and its closing delimiter remain authoritative.
+    let (tail, prefix, closing, disabled_value, enabled_value) = match lines.as_slice() {
+        ["disabled services = {", tail @ ..] => (tail, "\t", "}", "true", "false"),
+        ["", "\tdisabled services = {", tail @ ..] => (tail, "\t\t", "\t}", "disabled", "enabled"),
+        _ => return Err(invalid("invalid disabled-services root")),
+    };
+    if tail.last().copied() != Some(closing) {
         return Err(invalid("invalid disabled-services root"));
     }
+    let body = &tail[..tail.len() - 1];
     let mut seen = BTreeSet::new();
     let mut disabled = None;
-    for line in &lines[1..lines.len() - 1] {
+    for line in body {
         let (key, value) = line
-            .strip_prefix('\t')
+            .strip_prefix(prefix)
             .and_then(|line| line.split_once(" => "))
             .ok_or_else(|| invalid("invalid disabled-services entry"))?;
         let name = key
@@ -531,10 +538,12 @@ pub fn parse_disabled_state(text: &str, label: &str) -> io::Result<Option<bool>>
             .and_then(|key| key.strip_suffix('"'))
             .filter(|name| label_valid(name))
             .ok_or_else(|| invalid("invalid disabled-services label"))?;
-        let flag = match value {
-            "true" => true,
-            "false" => false,
-            _ => return Err(invalid("invalid disabled-services boolean")),
+        let flag = if value == disabled_value {
+            true
+        } else if value == enabled_value {
+            false
+        } else {
+            return Err(invalid("invalid disabled-services boolean"));
         };
         if !seen.insert(name) {
             return Err(invalid("duplicate disabled-services entry"));

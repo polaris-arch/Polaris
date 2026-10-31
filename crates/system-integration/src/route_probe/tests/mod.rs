@@ -1119,7 +1119,7 @@ fn windows_leg_on_the_logged_out_wintun_capture_sees_only_noise() {
             .collect::<Vec<_>>(),
         [
             ("169.254.0.0/16", "Tailscale"),
-            ("169.254.83.107/32", "Tailscale"),
+            ("169.254.10.144/32", "Tailscale"),
             ("169.254.255.255/32", "Tailscale"),
         ],
         "未登录态 wintun 上的三条自动路由与这份抓取对不上：{:?}",
@@ -1344,7 +1344,7 @@ fn own_tun_is_excluded_through_the_windows_leg() {
 /// [`ForeignTunnelSnapshot::default_routes`] 这条独立通道上 —— 两类事实，两个桶。
 ///
 /// 所以本条断言的是：① 那条默认路由**确实在抓取里**；② 它**不在** `foreign`、而在
-/// `default_routes` 里；③ 同一接口上**别的**网段进了 `foreign`（`10.55.0.10/32`）——
+/// `default_routes` 里；③ 同一接口上**别的**网段进了 `foreign`（`10.55.0.27/32`）——
 /// 缺了③，「这条隧道被看见了」就只剩名单那一半，路由那一半可能整条没接上。
 ///
 /// 判定那一半（它被判成 `DefaultRouteContended`）由 `default_route_gate` 承担，不在这里重复。
@@ -1369,7 +1369,7 @@ fn windows_leg_sees_the_connected_ras_tunnel() {
         .filter(|r| r.interface == RAS_IFACE)
         .collect();
     assert!(
-        on_ras.iter().any(|r| r.prefix == "10.55.0.10/32"),
+        on_ras.iter().any(|r| r.prefix == "10.55.0.27/32"),
         "`{RAS_IFACE}` 上那条隧道自身地址没进 foreign：{on_ras:?}"
     );
 
@@ -1378,7 +1378,7 @@ fn windows_leg_sees_the_connected_ras_tunnel() {
     assert!(
         raw_v4
             .lines()
-            .any(|l| l.contains("0.0.0.0") && l.contains("10.55.0.10")),
+            .any(|l| l.contains("0.0.0.0") && l.contains("10.55.0.27")),
         "抓取里没有 `{RAS_IFACE}` 的默认路由 —— 下面两条断言没有信息量"
     );
     assert!(

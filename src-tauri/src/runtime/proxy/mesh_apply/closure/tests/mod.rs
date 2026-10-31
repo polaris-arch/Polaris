@@ -749,66 +749,19 @@ async fn changed_binary_or_payload_after_check_cannot_publish_manifest() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn selected_core_check_accepts_only_the_staged_config_bytes() {
-    let bundled =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/linux/sing-box");
+async fn selected_core_check_enforces_compiled_admission_before_manifest_publication() {
     let binary = std::env::var_os("POLARIS_TEST_CORE")
         .map(std::path::PathBuf::from)
-        .unwrap_or(bundled);
-    if !binary.is_file() {
-        assert_ne!(
-            std::env::var("POLARIS_REQUIRE_KERNEL_GATE").as_deref(),
-            Ok("1"),
-            "selected core is required for this gate"
-        );
-        eprintln!("selected core absent; set POLARIS_TEST_CORE or fetch package core");
-        return;
-    }
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(repo.join("src-tauri/core-manifest.json")).unwrap())
-            .unwrap();
-    let candidate_selection = std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").map(|value| {
-        assert_eq!(value, "1", "explicit candidate mode required");
-        serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(repo.join("scripts/desktop-core/native-dns-candidate.json")).unwrap(),
-        )
-        .unwrap()
-    });
-    if let Some(selection) = candidate_selection
-        .as_ref()
-        .or_else(|| manifest.get("desktopTemporary"))
-        .or_else(|| manifest.get("desktopRelease"))
-    {
-        // Validate exact selected bytes/receipt/provider/BuildID before execution;
-        // the same gate then checks successful version and full Version/Revision.
-        let identity = std::process::Command::new("node")
-            .arg("scripts/desktop-core/managed-mesh-core.mjs")
-            .arg(&binary)
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        assert!(
-            identity.status.success(),
-            "selected managed core identity failed: {}",
-            String::from_utf8_lossy(&identity.stderr)
-        );
-        let verified: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
-        if candidate_selection.is_some() {
-            assert_eq!(verified["selection"], "native-dns-candidate");
-        }
-        assert_eq!(verified["sourceCommit"], selection["sourceCommit"]);
-        assert_eq!(verified["sourceTree"], selection["sourceTree"]);
-    } else {
-        // Preserve the separately selected legacy b609 fixture contract.
-        let version = std::process::Command::new(&binary)
-            .arg("version")
-            .output()
-            .unwrap();
-        assert!(version.status.success());
-        assert!(String::from_utf8_lossy(&version.stdout)
-            .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
-    }
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/linux/sing-box")
+        });
+    assert!(
+        binary.is_file(),
+        "normal producer must prepare the real selected carrier"
+    );
+    let capability = polaris_core_supervisor::admitted_payload::check_selected_capability(
+        polaris_core_supervisor::admitted_payload::ExecPurpose::CheckConfig,
+    );
     let (dir, input, plan, legacy, config, rules) = fixture();
     let expected = receipt(&input, &plan, &config, &rules);
     let closure = validate_closure(
@@ -821,18 +774,33 @@ async fn selected_core_check_accepts_only_the_staged_config_bytes() {
         rules,
     )
     .unwrap();
-    let checked = stage_checked_with_core(&plan, closure, "generator-1", &binary)
-        .await
-        .unwrap();
-    assert_eq!(checked.core_check().plan_digest, expected.plan_digest);
-    assert_eq!(checked.core_check().config_sha256, expected.config_sha256);
-    assert_eq!(
-        checked.core_check().manifest_ref,
-        checked.staged().manifest_ref
-    );
-    assert_eq!(checked.core_check().binary_sha256.len(), 64);
-    assert!(dir
+    let result = stage_checked_with_core(&plan, closure, "generator-1", &binary).await;
+    let manifest = dir
         .path()
-        .join("mesh-routes/plans/closure-plan/manifest.json")
-        .exists());
+        .join("mesh-routes/plans/closure-plan/manifest.json");
+    match capability {
+        Err(expected) => {
+            let Err(PreflightError::ValidationLifecycle(ValidationLifecycleError::Admission(
+                actual,
+            ))) = result
+            else {
+                panic!("a carrier lacking compiled execution policy must fail before check/publication");
+            };
+            assert_eq!(actual.kind, expected.kind);
+            assert!(!manifest.exists());
+        }
+        Ok(()) => {
+            // This branch requires a genuinely compiled capable carrier. The
+            // frozen legacy3155 contract does not claim this native positive.
+            let checked = result.unwrap();
+            assert_eq!(checked.core_check().plan_digest, expected.plan_digest);
+            assert_eq!(checked.core_check().config_sha256, expected.config_sha256);
+            assert_eq!(
+                checked.core_check().manifest_ref,
+                checked.staged().manifest_ref
+            );
+            assert_eq!(checked.core_check().binary_sha256.len(), 64);
+            assert!(manifest.exists());
+        }
+    }
 }

@@ -101,6 +101,7 @@ pub fn append_policy(
                 type_field: Some(
                     match candidate.kind {
                         UpstreamKind::Doh => "https",
+                        UpstreamKind::Dot => "tls",
                         UpstreamKind::Udp => "udp",
                         UpstreamKind::System => "local",
                     }

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use polaris_config_engine::user_config::ProxyModeType;
-use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
+
 use polaris_switch_engine::{ManagementApi, ManagementError};
 
 use crate::runtime::management_api::{close_live_connections, GrpcManagementApi};
@@ -124,8 +124,7 @@ impl ProxyRuntime {
         api_port: u16,
     ) -> FlushOutcome {
         self.flush_connections_with(mode, my_gen, || async move {
-            let secret = self.clash_api_secret();
-            SingBoxApiClient::connect(Endpoint::new("127.0.0.1", api_port), secret)
+            self.current_management_client(api_port)
                 .await
                 .map(GrpcManagementApi::new)
                 .map_err(|e| e.to_string())

@@ -280,7 +280,13 @@ def final_proof(root, key, artifact, kind, output):
 def extracted_final_proof(root, key, artifact, kind, output, context, before, signature, baseline, directory, evidence):
     with tempfile.TemporaryDirectory(prefix='polaris-final-payload-') as tmp:
         destination = Path(tmp) / 'payload'
-        if kind == 'zip': destination.mkdir(); extract_zip(artifact, destination)
+        if kind == 'zip':
+            # Same complete canonical inventory as the unconditional static gate.
+            integrity_spec = importlib.util.spec_from_file_location('windows_integrity', Path(__file__).with_name('windows-package-integrity.py'))
+            integrity = importlib.util.module_from_spec(integrity_spec)
+            integrity_spec.loader.exec_module(integrity)
+            integrity.verify_existing_zip(root, artifact)
+            destination.mkdir(); extract_zip(artifact, destination)
         elif kind == 'deb': subprocess.run(['dpkg-deb', '--extract', str(artifact), str(destination)], check=True, timeout=90)
         elif kind == 'AppImage': subprocess.run(['unsquashfs', '-no-progress', '-offset', str(squashfs_offset(artifact)), '-dest', str(destination), str(artifact)], check=True, timeout=90)
         else:
@@ -315,6 +321,187 @@ def extracted_final_proof(root, key, artifact, kind, output, context, before, si
     return result
 
 
+def reject_local_selection(artifact):
+    """Read actual compressed members; never execute/install or trust a lane label.
+
+    Reuse the Windows carrier reader's bounded child/namespace budgets. The
+    native-proof mode below retains its original context and execution gates.
+    """
+    import time, tarfile
+    spec = importlib.util.spec_from_file_location('selection_integrity', Path(__file__).with_name('windows-package-integrity.py'))
+    integrity = importlib.util.module_from_spec(spec); spec.loader.exec_module(integrity)
+    marker = b'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1'
+    deadline = time.monotonic() + integrity.EXTRACT_TIMEOUT
+    budget = {'bytes': 0}; checked = []
+    def remaining():
+        seconds = deadline - time.monotonic(); require(seconds > 0, 'formal asset inspection deadline exceeded'); return seconds
+    def role(name):
+        leaf = PurePosixPath(name).name
+        if leaf in ['polaris', 'Polaris', 'polaris.exe', 'Polaris.exe']: return 'app'
+        if leaf in ['polaris-helper', 'polaris-helper.exe']: return 'helper'
+        if artifact.suffix == '.apk' and leaf == 'libpolaris_lib.so': return 'app'
+        return None
+    def observe(name, emit, expected):
+        state = {'bytes': 0, 'tail': b''}; digest = hashlib.sha256()
+        def consume(block):
+            remaining(); state['bytes'] += len(block); budget['bytes'] += len(block)
+            require(state['bytes'] <= integrity.MAX_FILE and budget['bytes'] <= integrity.MAX_TOTAL, 'formal executable expansion budget exceeded')
+            data = state['tail'] + block
+            require(marker not in data, 'Formal package/publisher rejects a LocalDevelopmentSelection executable: ' + name)
+            state['tail'] = data[-len(marker)+1:]; digest.update(block)
+        emit(consume)
+        require(expected is None or state['bytes'] == expected, 'formal executable member size differs')
+        checked.append({'member': name, 'role': role(name), 'bytes': state['bytes'], 'sha256': digest.hexdigest()})
+    def paths(records):
+        integrity.validate_names([(name+'/' if row['kind']=='dir' else name, row['kind'] == 'dir') for name,row in records.items()])
+        require(sum(row.get('bytes', 0) for row in records.values()) <= integrity.MAX_TOTAL, 'formal archive expanded budget exceeded')
+        result = []
+        for name in records:
+            if not role(name) or records[name]['kind']=='dir': continue
+            target = name; visited = set()
+            while records[target]['kind'] == 'link':
+                require(target not in visited and len(visited) < 16, 'formal executable link cycle'); visited.add(target)
+                link = records[target]['target']; require(not link.startswith('/') and '\\' not in link, 'formal executable link escapes archive')
+                parts = list(PurePosixPath(target).parent.parts)
+                for part in link.split('/'):
+                    if part in ['', '.']: continue
+                    if part == '..': require(parts, 'formal executable link escapes archive'); parts.pop()
+                    else: parts.append(part)
+                target = '/'.join(parts); require(target in records, 'formal executable link target absent')
+            require(records[target]['kind'] == 'file', 'formal executable is not a regular member')
+            result.append((name,target,records[target].get('bytes')))
+        return result
+    def copy_stream(source, consume):
+        while True:
+            block = source.read(64*1024)
+            if not block: return
+            consume(block)
+    def record(records,name,row):
+        require(name not in records and len(records) < integrity.MAX_MEMBERS, 'formal archive duplicate/member count budget')
+        records[name] = row
+    def scan_zip(source):
+        with zipfile.ZipFile(source) as archive:
+            records = {}
+            integrity.validate_names([(m.orig_filename,m.is_dir()) for m in archive.infolist()])
+            for member in archive.infolist():
+                mode=member.external_attr >> 16
+                require(member.orig_filename == member.filename and '\0' not in member.filename and not stat.S_ISLNK(mode), 'formal ZIP alias/link')
+                require(stat.S_IFMT(mode) in [0,stat.S_IFREG,stat.S_IFDIR], 'formal ZIP nonregular member')
+                record(records, member.filename.rstrip('/'), {'kind':'dir' if member.is_dir() else 'file','bytes':member.file_size})
+            for name,target,size in paths(records):
+                def emit(consume,target=target):
+                    with archive.open(target) as stream: copy_stream(stream,consume)
+                observe(name,emit,size)
+    def scan_tar(source):
+        with tarfile.open(fileobj=source,mode='r:') as archive:
+            records = {}; originals = {}
+            for member in archive:
+                name = member.name.removeprefix('./').rstrip('/')
+                if name in ['', '.'] and member.isdir(): continue
+                kind = 'dir' if member.isdir() else 'link' if member.issym() or member.islnk() else 'file' if member.isfile() else None
+                require(kind is not None, 'formal tar nonregular member')
+                target = member.linkname
+                if member.islnk(): target = os.path.relpath(target, str(PurePosixPath(name).parent)).replace('\\','/')
+                record(records,name,{'kind':kind,'bytes':member.size,'target':target}); originals[name]=member
+            for name,target,size in paths(records):
+                def emit(consume,target=target):
+                    with archive.extractfile(originals[target]) as stream: copy_stream(stream,consume)
+                observe(name,emit,size)
+    def scan_squash(path):
+        offset = str(squashfs_offset(path))
+        listing = integrity.bounded_command(['unsquashfs','-lln','-no-progress','-offset',offset,str(path)],integrity.MAX_LISTING,timeout=remaining()).decode('utf-8')
+        records = {}
+        for line in listing.splitlines():
+            if not re.match(r'^[dl-][rwxstST-]{9}\s',line): continue
+            fields=line.split(None,5);require(len(fields)==6 and fields[2].isdecimal(),'formal SquashFS listing differs')
+            name=fields[5];require(name=='squashfs-root' or name.startswith('squashfs-root/'),'formal SquashFS root differs')
+            if name=='squashfs-root': continue
+            name=name[len('squashfs-root/'):];target=''
+            if line[0]=='l':name,target=name.split(' -> ',1)
+            record(records,name,{'kind':{'d':'dir','l':'link','-':'file'}[line[0]],'bytes':int(fields[2]),'target':target})
+        for name,target,size in paths(records):
+            observe(name,lambda consume,target=target:integrity.stream_child(['unsquashfs','-cat','-offset',offset,str(path),target],consume,integrity.MAX_FILE,timeout=remaining()),size)
+    def scan_sevenzip(path, temporary, depth=0):
+        tool,_version=integrity.find_sevenzip(timeout=min(30,remaining()))
+        listing=integrity.bounded_command([tool,'l','-slt','-sccUTF-8',str(path)],integrity.MAX_LISTING,timeout=remaining()).decode('utf-8-sig')
+        records={}
+        if 'Type = Nsis' in listing:
+            for name,size in integrity.nsis_listing(listing.replace('\r\n','\n')):record(records,name,{'kind':'file','bytes':size or 0,'unknownSize':size is None})
+        else:
+            require(any('Type = '+kind in listing for kind in ['Dmg','HFS','APFS']),'formal archive type is not supported')
+            spec=importlib.util.spec_from_file_location('dmg_selection',Path(__file__).with_name('desktop-core')/'dmg-selection.py')
+            dmg=importlib.util.module_from_spec(spec);spec.loader.exec_module(dmg)
+            def read_link(name,expected):
+                data=bytearray()
+                def consume(block):
+                    budget['bytes']+=len(block);require(budget['bytes']<=integrity.MAX_TOTAL,'formal link expansion budget exceeded');data.extend(block)
+                integrity.stream_child([tool,'x','-so','-spd','-sns-',str(path),name],consume,4096,timeout=remaining())
+                require(expected is None or len(data)==expected,'formal DMG link size differs')
+                return bytes(data)
+            records=dmg.member_records(listing,read_link,integrity.MAX_MEMBERS)
+        data_flags=[] if 'Type = Nsis' in listing else ['-sns-']
+        selected=paths(records)
+        if 'Type = Nsis' not in listing:dmg.require_executable_data(selected)
+        if not selected:
+            volumes=[(name,row)for name,row in records.items() if row['kind']=='file' and name.lower().endswith(('.hfs','.apfs','.img'))]
+            require(depth==0 and len(volumes)==1 and len([r for r in records.values()if r['kind']=='file'])==1,'formal archive contains no actual App/Helper')
+            name,row=volumes[0];volume=temporary/'volume.img'
+            with volume.open('xb') as output:
+                def consume(block):
+                    budget['bytes']+=len(block);require(budget['bytes']<=integrity.MAX_TOTAL,'formal volume expansion budget exceeded');output.write(block)
+                result=integrity.stream_child([tool,'x','-so','-spd',*data_flags,str(path),name],consume,integrity.MAX_TOTAL,timeout=remaining())
+            require(result['stdoutBytes']==row['bytes'],'formal volume bytes differ');scan_sevenzip(volume,temporary,depth+1)
+        else:
+            # Native HFS/APFS -so otherwise appends extended-attribute streams
+            # to the selected data fork. Preserve exact byte/size verification.
+            for name,target,size in selected:
+                if records[target].get('unknownSize'):size=None
+                observe(name,lambda consume,target=target:integrity.stream_child([tool,'x','-so','-spd',*data_flags,str(path),target],consume,integrity.MAX_FILE,timeout=remaining()),size)
+    artifact=integrity.regular(artifact) if os.name == 'nt' else regular(artifact)
+    before=artifact.stat();require(0<before.st_size<=integrity.MAX_FILE,'formal asset byte budget exceeded')
+    with artifact.open('rb') as source, tempfile.TemporaryDirectory(prefix='polaris-formal-selection-') as temporary_name:
+        opened=os.fstat(source.fileno());require((opened.st_dev,opened.st_ino)==(before.st_dev,before.st_ino),'formal asset replaced before open')
+        if os.name == 'nt':
+            require(integrity.app_object_identity(integrity.app_identity(opened)) ==
+                    integrity.app_object_identity(integrity.app_identity(before)),
+                    'formal asset replaced before open')
+        temporary=Path(temporary_name)
+        # Linux consumers open the retained object via proc, not its mutable name.
+        retained=Path('/proc')/str(os.getpid())/'fd'/str(source.fileno())
+        if not retained.exists():
+            retained=temporary/('carrier'+artifact.suffix)
+            with retained.open('xb') as output:
+                snapshot_bytes=0
+                def snapshot_block(block):
+                    nonlocal snapshot_bytes
+                    remaining()
+                    require(len(block)<=before.st_size-snapshot_bytes,'formal asset snapshot byte budget exceeded')
+                    output.write(block);snapshot_bytes+=len(block)
+                copy_stream(source,snapshot_block)
+            require(snapshot_bytes==before.st_size and retained.stat().st_size==before.st_size,'formal asset snapshot differs');source.seek(0)
+        if artifact.suffix in ['.zip','.apk']:scan_zip(source)
+        elif artifact.suffix=='.deb':
+            with tempfile.TemporaryFile(dir=temporary) as data:
+                integrity.stream_child(['dpkg-deb','--fsys-tarfile',str(retained)],data.write,integrity.MAX_TOTAL,timeout=remaining());data.seek(0);scan_tar(data)
+        elif artifact.suffix=='.AppImage':scan_squash(retained)
+        elif artifact.suffix in ['.exe','.dmg']:scan_sevenzip(retained,temporary)
+        else:raise ValueError('unknown formal asset container')
+        roles={row['role']for row in checked};require('app' in roles and (artifact.suffix=='.apk' or 'helper' in roles),'formal asset actual App/Helper members absent')
+        source.seek(0);artifact_digest=hashlib.sha256()
+        def hash_block(block):remaining();artifact_digest.update(block)
+        copy_stream(source,hash_block)
+        after=os.fstat(source.fileno());current=artifact.stat()
+        if os.name == 'nt':
+            # Windows stat/fstat expose different ctime and executable-bit
+            # projections. Compare every field within its original API view,
+            # after binding the common opened object facts above.
+            require(integrity.app_identity(after) == integrity.app_identity(opened) and
+                    integrity.app_identity(current) == integrity.app_identity(before),
+                    'formal asset changed during actual object check')
+        else:
+            require((after.st_size,after.st_mtime_ns,after.st_ctime_ns)==(before.st_size,before.st_mtime_ns,before.st_ctime_ns) and (current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns,current.st_ctime_ns)==(before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns),'formal asset changed during actual object check')
+    return {'artifact':str(artifact),'artifactBytes':before.st_size,'artifactSha256':artifact_digest.hexdigest(),'checkedExecutables':checked,'expandedExecutableBytes':budget['bytes']}
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--platform', choices=['linux', 'win'], required=True)
@@ -326,4 +513,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if len(os.sys.argv)==3 and os.sys.argv[1]=='--reject-local-selection':
+        print(json.dumps(reject_local_selection(Path(os.sys.argv[2])),sort_keys=True))
+    else: main()

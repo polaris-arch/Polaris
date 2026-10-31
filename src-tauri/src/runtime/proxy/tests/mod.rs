@@ -67,6 +67,8 @@ mod network_monitor;
 mod network_profile;
 mod platform_contracts;
 mod process_supervision;
+#[cfg(target_os = "linux")]
+pub(crate) use process_supervision::helper_terminal::helper_terminal_exit_fixture;
 mod recovery;
 mod route_replan;
 mod startup;
@@ -541,31 +543,107 @@ fn lifecycle_failure_fixture_passes_schema_and_gateway_but_fails_raw_validation(
     }
 }
 
-/// 假核落盘（0o755）。`run_body` 是收到 `run` 子命令时的 shell 体。
-///
-/// **`check` 必须单独短路**：起核腿在 spawn 之前先跑一次 `sing-box check`（内核闸门，见
-/// `generate_and_gate`），而真核的 `check` 是**快速返回**的静态校验、只有 `run` 才常驻。
-/// 假核若对所有 argv 一视同仁，`check` 会跟着 `run` 的语义走 —— 常驻型假核会把闸门吊死到超时
-/// （实测：`cancelling_start_during_readiness_wait_reaps_the_real_process` 因此拿不到 pid 而红），
-/// 立退型假核则让闸门收到一个假的「配置无效」。二者都不是被测行为，是假核没跟上真核的契约。
+/// Business-only validator dependency. No Prepared, native command or credential
+/// can be obtained from this per-runtime fixture; the real factory stays strict.
+pub(super) struct BusinessKernelCheckFixture {
+    binary: PathBuf,
+    check: Arc<
+        dyn Fn(&std::path::Path) -> Result<polaris_core_supervisor::ConfigCheckVerdict, String>
+            + Send
+            + Sync,
+    >,
+}
+impl ProxyRuntime {
+    pub(super) fn has_business_kernel_check_fixture(&self, binary: &std::path::Path) -> bool {
+        self.business_kernel_check_fixture
+            .lock()
+            .ok()
+            .is_some_and(|fixture| {
+                fixture
+                    .as_ref()
+                    .is_some_and(|fixture| fixture.binary == binary)
+            })
+    }
+    pub(super) fn business_kernel_check_result(
+        &self,
+        binary: &std::path::Path,
+        config: &std::path::Path,
+    ) -> Option<Result<polaris_core_supervisor::ConfigCheckVerdict, String>> {
+        let check = self
+            .business_kernel_check_fixture
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|fixture| fixture.binary == binary)
+            .map(|fixture| Arc::clone(&fixture.check))?;
+        Some(check(config))
+    }
+}
+fn install_business_kernel_checker(
+    rt: &ProxyRuntime,
+    binary: &std::path::Path,
+    check: impl Fn(&std::path::Path) -> Result<polaris_core_supervisor::ConfigCheckVerdict, String>
+        + Send
+        + Sync
+        + 'static,
+) {
+    *rt.business_kernel_check_fixture.lock().unwrap() = Some(BusinessKernelCheckFixture {
+        binary: binary.to_owned(),
+        check: Arc::new(move |config| {
+            // Consume the exact generated file supplied by the production
+            // orchestration; a missing/wrong input is not a mock success.
+            let bytes = std::fs::read(config).map_err(|e| e.to_string())?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if !value
+                .get("outbounds")
+                .is_some_and(serde_json::Value::is_array)
+            {
+                return Err("business checker requires the actual generated configuration".into());
+            }
+            check(config)
+        }),
+    });
+}
+fn install_counting_business_checker(
+    rt: &ProxyRuntime,
+    binary: &std::path::Path,
+    counter: &std::path::Path,
+) {
+    let counter = counter.to_owned();
+    install_business_kernel_checker(rt, binary, move |_| {
+        let count = std::fs::read_to_string(&counter)
+            .ok()
+            .map(|s| s.trim().parse::<u64>().unwrap())
+            .unwrap_or(0);
+        std::fs::write(&counter, format!("{}\n", count + 1)).map_err(|e| e.to_string())?;
+        Ok(polaris_core_supervisor::ConfigCheckVerdict::Accepted)
+    });
+}
+
+/// Run-only lifecycle stand-in. Check/peeling outcomes come from the explicit
+/// per-runtime business checker; actual admitted check custody is exercised in
+/// supervisor's crate-private fixture tests, never by admitting this script.
 #[cfg(unix)]
-fn write_fake_core(dir: &std::path::Path, name: &str, run_body: &str) -> PathBuf {
+fn write_fake_core(
+    rt: &ProxyRuntime,
+    dir: &std::path::Path,
+    name: &str,
+    run_body: &str,
+) -> PathBuf {
     let p = dir.join(name);
-    // 按**整条 argv** 找 `check`，不按位置：闸门发的是 `--disable-color check -c <path>`
-    // （`check` 在 `$2`），而 spawn 发的是 `run -c <path>`。写死 `$1` 会漏掉前者（实测：漏了就等于
-    // 假核对 check 走 run 的语义，常驻型假核把闸门吊到超时）。
-    crate::test_support::write_executable_stand_in(
-        &p,
-        format!("#!/bin/sh\ncase \" $* \" in *\" check \"*) exit 0;; esac\n{run_body}\n"),
-    );
+    crate::test_support::write_executable_stand_in(&p, format!("#!/bin/sh\n{run_body}\n"));
+    install_business_kernel_checker(rt, &p, |_| {
+        Ok(polaris_core_supervisor::ConfigCheckVerdict::Accepted)
+    });
     p
 }
 
 /// 假核（**立刻死**）：spawn 得起来、起来就退 → 就绪门判 Dead → `kill_core` → 退避重试。
 /// ＝真机 FATAL 循环的形状（把「跑 9s 后 FATAL」压成「立刻 FATAL」），不碰宿主网络。
 #[cfg(unix)]
-fn write_fake_dying_core(dir: &std::path::Path) -> PathBuf {
-    write_fake_core(dir, "fake-dying-sing-box", "exit 1")
+fn write_fake_dying_core(rt: &ProxyRuntime, dir: &std::path::Path) -> PathBuf {
+    write_fake_core(rt, dir, "fake-dying-sing-box", "exit 1")
 }
 
 /// 按**完整命令行**数在跑的假核实例数（`pgrep -f <唯一临时路径>`）。
@@ -585,9 +663,9 @@ fn fake_core_proc_count(path: &std::path::Path) -> usize {
 /// 假核（**活着但永不就绪**）：占住进程不退、绝不 bind 管理口 → 就绪门一直轮询。
 /// 用来验「取消发生在就绪等待期」时接管方是否真把它收割了（孤儿门要有真进程才有牙）。
 #[cfg(unix)]
-fn write_fake_hanging_core(dir: &std::path::Path) -> PathBuf {
+fn write_fake_hanging_core(rt: &ProxyRuntime, dir: &std::path::Path) -> PathBuf {
     // exec：让 sleep 顶替 shell 成为受管 pid，SIGTERM 直达（否则杀的是 shell、sleep 变孤儿）。
-    write_fake_core(dir, "fake-hanging-sing-box", "exec sleep 60")
+    write_fake_core(rt, dir, "fake-hanging-sing-box", "exec sleep 60")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1274,42 +1352,38 @@ fn flush_ready_runtime() -> (Arc<ProxyRuntime>, TestDir, u64) {
     (rt, dir, my_gen)
 }
 
-/// 假核（**闸门腿**）：第一次 `check` 吐一条点名 `outbounds[<idx>]` 的 FATAL 并 rc=1，
-/// 之后的 `check` 一律 rc=0（模拟「坏节点被剥掉后配置就合法了」）。`run` 直接退出（本门不 spawn）。
-///
-/// 「第一次 vs 之后」靠**落盘 marker** 记状态：闸门每轮都是一个**全新子进程**，进程内变量存不住。
+/// An explicit business checker rejects one generated outbound once, then
+/// accepts. Its durable marker preserves the retry/peeling oracle without
+/// promoting this Run stand-in into a native validation credential.
 #[cfg(unix)]
-fn write_fake_checking_core(dir: &std::path::Path, reject_index: usize) -> PathBuf {
-    let p = dir.join("fake-checking-sing-box");
-    let marker = dir.join("gate-check-seen").to_string_lossy().into_owned();
-    crate::test_support::write_executable_stand_in(
-        &p,
-        format!(
-            "#!/bin/sh\ncase \" $* \" in *\" check \"*)\n\
-                 if [ -f {marker} ]; then exit 0; fi\n\
-                 touch {marker}\n\
-                 echo 'FATAL[0000] decode config at cfg.json: outbounds[{reject_index}]: \
-                 unknown outbound type: zzz' >&2\n\
-                 exit 1;;\nesac\nexit 1\n"
-        ),
-    );
-    p
+fn write_fake_checking_core(
+    rt: &ProxyRuntime,
+    dir: &std::path::Path,
+    reject_index: usize,
+) -> PathBuf {
+    let binary = dir.join("fake-checking-sing-box");
+    crate::test_support::write_executable_stand_in(&binary, "#!/bin/sh\nexit 1\n");
+    let marker = dir.join("gate-check-seen");
+    install_business_kernel_checker(rt, &binary, move |_| {
+        if marker.exists() {
+            return Ok(polaris_core_supervisor::ConfigCheckVerdict::Accepted);
+        }
+        std::fs::write(&marker, b"1").map_err(|e| e.to_string())?;
+        let diagnostic = format!("FATAL[0000] decode config at cfg.json: outbounds[{reject_index}]: unknown outbound type: zzz");
+        Ok(polaris_core_supervisor::ConfigCheckVerdict::Rejected(
+            polaris_core_supervisor::parse_kernel_rejection(&diagnostic).unwrap(),
+        ))
+    });
+    binary
 }
 
-/// 恒接受 `check` 的假核，并把真实进程启动次数累计到文件。
+/// Business checker calls are counted on disk across runtime restarts; no check child is spawned.
 #[cfg(unix)]
-fn write_fake_accepting_core(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+fn write_fake_accepting_core(rt: &ProxyRuntime, dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let binary = dir.join("fake-accepting-sing-box");
     let counter = dir.join("gate-check-count");
-    crate::test_support::write_executable_stand_in(
-        &binary,
-        format!(
-            "#!/bin/sh\ncase \" $* \" in *\" check \"*)\n\
-                 n=0\n[ -f {counter} ] && n=$(sed -n '1p' {counter})\n\
-                 n=$((n + 1))\nprintf '%s\\n' \"$n\" > {counter}\nexit 0;;\nesac\nexit 1\n",
-            counter = counter.to_string_lossy()
-        ),
-    );
+    crate::test_support::write_executable_stand_in(&binary, "#!/bin/sh\nexit 1\n");
+    install_counting_business_checker(rt, &binary, &counter);
     (binary, counter)
 }
 
@@ -1403,4 +1477,26 @@ pub(crate) fn install_dns_recovery_fixture(rt: &ProxyRuntime) -> DnsRecoveryFixt
         original_marker,
         writes,
     }
+}
+
+#[test]
+fn inventory_candidate_selection_is_data_only_and_rejects_priority_namespace_changes() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = fresh_test_dir();
+    let preferred = dir.join("preferred");
+    let existing = dir.join("existing");
+    std::fs::write(&existing, b"foreign candidate data; not executable").unwrap();
+    let selection =
+        super::core_binary::candidate_observation(vec![preferred.clone(), existing.clone()])
+            .unwrap();
+    assert_eq!(selection.path(), existing);
+    assert!(selection.is_current());
+    // A data lookup neither needs CheckConfig nor admits these foreign bytes.
+    assert!(crate::runtime::core_identity::acquire_at(
+        selection.path(),
+        crate::runtime::core_identity::ExecPurpose::TlsInventory
+    )
+    .is_err());
+    std::fs::write(&preferred, b"higher-priority foreign data").unwrap();
+    assert!(!selection.is_current());
 }

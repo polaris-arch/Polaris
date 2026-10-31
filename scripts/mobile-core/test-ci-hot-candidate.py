@@ -80,11 +80,36 @@ def evaluate(expression, selected='', publish=False, success=True, outcome='succ
     return bool(eval(compile(tree, '<workflow route>', 'eval'), {'__builtins__': {}}, {}))
 
 
+# PKG-01 intentionally replaces only the unconsumed normal-lane diagnostic.
+# Restore its exact historical bytes for the existing full-lane digest, after
+# separately requiring the new verified source-contract consumer and gate.
+NORMAL_VERSION_COMMANDS = '''          v="$(python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; print(load()['version'])")"
+          [ -n "$v" ] || { echo "::error::verified mobile source-contract version missing"; exit 1; }
+          echo "已验证移动 source-contract 选中版本：v$v"
+'''
+LEGACY_VERSION_COMMANDS = '''          v="$(node -p "require('./src-tauri/core-manifest.json').bundledCoreVersion")"
+          [ -n "$v" ] || { echo "::error::core-manifest.json 里读不到 bundledCoreVersion"; exit 1; }
+          echo "内核版本真值：v$v"
+'''
+
+
+def restore_normal_version_diagnostic(block):
+    executable = [line for line in block.splitlines() if line.strip() and not line.lstrip().startswith('#')]
+    expected = ['      - name: Resolve bundled core version', '        if: ' + NORMAL,
+                '        id: core', '        shell: bash', '        run: |', '          set -euo pipefail',
+                *NORMAL_VERSION_COMMANDS.rstrip('\n').splitlines(), '          echo "version=$v" >> "$GITHUB_OUTPUT"']
+    if executable != expected or block.count(NORMAL_VERSION_COMMANDS) != 1:
+        raise AssertionError('normal diagnostic must load the validated mobile source-contract with its existing guard/output')
+    return block.replace(NORMAL_VERSION_COMMANDS, LEGACY_VERSION_COMMANDS)
+
+
 def projected_defaults(source, name):
     result = []
     for label, block in steps(source, name).items():
         if label in ADDED:
             continue
+        if label == 'Resolve bundled core version':
+            block = restore_normal_version_diagnostic(block)
         block = block.replace('        if: ' + NORMAL + '\n', '')
         block = block.replace(' && ' + NORMAL, '')
         if label == 'Read pinned libbox Go version':
@@ -695,6 +720,10 @@ class RoutingContracts(unittest.TestCase):
 
     def test_default_full_step_commands_conditions_and_paths_unchanged(self):
         for name, digest in DEFAULT_DIGESTS.items():
+            selected = steps(self.workflow, name)['Resolve bundled core version']
+            self.assertEqual(condition(selected), NORMAL)
+            self.assertNotIn('bundledCoreVersion', selected)
+            self.assertIn(LEGACY_VERSION_COMMANDS, restore_normal_version_diagnostic(selected))
             self.assertEqual(projected_defaults(self.workflow, name), digest, name)
 
     def test_candidate_exact_reachable_steps_and_default_inequivalence(self):
@@ -791,6 +820,16 @@ class RoutingContracts(unittest.TestCase):
         self.assertNotIn('artifactPins', self.source)
 
     def test_mutated_gate_and_default_command_are_detected(self):
+        for name in DEFAULT_DIGESTS:
+            original = steps(self.workflow, name)['Resolve bundled core version']
+            for changed in [original.replace("print(load()['version'])", "print('1.15.0-polaris-alpha.12.6')"),
+                            original.replace('from fork_input import load', 'from unrelated import load'),
+                            original.replace('        if: ' + NORMAL, '        if: false'),
+                            original.replace('exit 1;', 'exit 0;'),
+                            original.replace('echo "version=$v" >> "$GITHUB_OUTPUT"', 'echo "version=old" >> "$GITHUB_OUTPUT"')]:
+                self.assertNotEqual(changed, original)
+                with self.assertRaises(AssertionError):
+                    restore_normal_version_diagnostic(changed)
         changed = self.workflow.replace('        if: ' + NORMAL + '\n', '        if: false\n', 1)
         with self.assertRaises(AssertionError):
             self.assertEqual(projected_defaults(changed, 'release_check'), DEFAULT_DIGESTS['release_check'])

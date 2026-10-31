@@ -1,0 +1,96 @@
+      - name: Stage Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          if (-not $setup) { throw "no *-setup.exe in target/release/bundle/nsis" }
+          New-Item -ItemType Directory -Force dist-win | Out-Null
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $name = "Polaris_${version}_x64-win-setup.exe"
+          Move-Item $setup.FullName "dist-win/$name"
+          Write-Host "installer -> dist-win/$name"
+
+      # ── Windows portable（§I-Q4，zip 解压即用）──
+      # Tauri 2 NSIS 无原生 portable；从 release exe + resources/ 打成 zip（解压即用，绕过安装器）。
+      # portable 需自带 resources（sing-box/cronet/dashboard）否则无核可起；resources 目录由 Tauri
+      # 打包器铺到 bundle 同级，但 portable 形态无安装器整合，故显式从源 resources/ 拷入。
+      #
+      # 🔴 **`portable.marker` 不是装饰**（2026-07-22，修 #72 形态错配本体）：
+      #    应用靠「exe 同级有没有这个文件」判自己是不是便携形态
+      #    （`src-tauri/src/commands/updater::is_portable_layout`），进而决定检查更新时
+      #    该拿 `Polaris_<版本>_x64-win-Portable.zip` 还是 NSIS 安装器。
+      #    此前判据读的是 `PORTABLE_EXECUTABLE_DIR` —— **electron-builder 便携目标特有**的注入
+      #    （它的便携版是自解压 stub，由 stub 设该变量）。本步打的是纯 zip、**没有任何 stub**
+      #    ⇒ 该 env 恒不存在 ⇒ 便携用户恒被判成安装态、被推安装器，装出与便携副本并存的
+      #    第二份程序（配置目录 / 自启项 / 内核资源各一套）。
+      #    漏掉这个文件 = 该缺陷原样复发，故下一步开包核验它确实在 zip 里（fail-closed）。
+      - name: Build Windows portable zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem target/release/polaris.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "no target/release/polaris.exe — portable zip cannot be built" }
+          $staging = "staging-portable"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          Copy-Item $exe.FullName $staging/
+          # 拷 Windows 平台所需资源：sing-box.exe + libcronet.dll + dashboard + data。
+          Copy-Item resources/win $staging/resources/win -Recurse -Force
+          Copy-Item resources/dashboard $staging/resources/dashboard -Recurse -Force
+          Copy-Item resources/data $staging/resources/data -Recurse -Force
+          # 🔴 许可文本：便携 zip 与 Tauri bundler 是**两条独立的腿**，`bundle.resources` 只惠及
+          #    安装器，改 conf 不会自动惠及这里（2026-09-04 实证：便携 zip 连
+          #    THIRD-PARTY-LICENSES.md 都没有）。缺 LICENSE = Polaris 违反自己的 MIT；
+          #    缺 NOTICE = zip 里那份 GPLv3 的 sing-box.exe 没有任何来源指引（GPLv3 §6）。
+          Copy-Item LICENSE $staging/
+          Copy-Item NOTICE $staging/
+          Copy-Item THIRD-PARTY-LICENSES.md $staging/
+          # 便携形态标记（内容是给用户看的「勿删」说明；判据只看文件在不在）。
+          Set-Content -Path "$staging/portable.marker" -Encoding utf8 -Value @(
+            "Polaris portable edition marker - DO NOT DELETE."
+            "Polaris 便携版标记文件，请勿删除。"
+            ""
+            "This file tells Polaris it is running as the portable (zip) edition, so that"
+            "'Check for updates' offers the portable zip instead of the NSIS installer."
+            "Deleting it makes Polaris think it was installed, and it will then offer an"
+            "installer that creates a SECOND, separate copy of the app."
+          )
+          # 打进 dist-win/ 而不是仓库根：便携 zip 是 updater 的 loose 形态**唯一候选**，
+          # 放进本 job 的资产目录后，它的命名与体积在**本 job**就被 assets 门量到；留在仓库根的话
+          # 那两条断言只有 tag 时的聚合口径量得到 —— 超限要等四条腿的构建成本全付完才发现。
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          Compress-Archive -Path "$staging/*" -DestinationPath "dist-win/Polaris_${version}_x64-win-Portable.zip" -Force
+
+      # 便携标记与许可文本必须真的在 zip 里 —— 开包核验**产物本身**，不是核验上一步的脚本文本。
+      # 缺 marker ⇒ 便携用户恒被推安装器（#72 形态错配本体复发）；缺许可文本 ⇒ 许可证违规。
+      # 故这里 throw 让整条腿硬失败，而不是让一个「看着成功、装出来错形态」的 zip 进 release。
+      - name: Verify portable zip contents
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $zip = "dist-win/Polaris_${version}_x64-win-Portable.zip"
+          $probe = "portable-probe"
+          if (Test-Path $probe) { Remove-Item $probe -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $probe -Force
+          if (-not (Test-Path "$probe/portable.marker" -PathType Leaf)) {
+            throw "portable.marker missing from $zip - portable users would be offered the NSIS installer (#72 form mismatch)"
+          }
+          if (-not (Test-Path "$probe/polaris.exe" -PathType Leaf)) {
+            throw "polaris.exe missing from $zip"
+          }
+          # 许可文本：非 0 字节才算数（拷了个空文件与没拷在法律上等价）。
+          foreach ($lic in @("LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.md")) {
+            $p = Join-Path $probe $lic
+            if (-not (Test-Path $p -PathType Leaf)) {
+              throw "$lic missing from $zip - shipping binaries without it violates the MIT notice condition (LICENSE) / leaves the bundled GPLv3 sing-box with no source offer (NOTICE)"
+            }
+            if ((Get-Item $p).Length -eq 0) {
+              throw "$lic is 0 bytes inside $zip - an empty license text is the same as none"
+            }
+          }
+          Remove-Item $probe -Recurse -Force
+          Write-Host "portable zip contains polaris.exe + portable.marker + LICENSE/NOTICE/THIRD-PARTY-LICENSES.md"
+

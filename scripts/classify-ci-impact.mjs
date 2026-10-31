@@ -290,6 +290,27 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: ALL,
     why: '公开 release 消费的构建期原包、合同与 readback 收据；虽不直接入包，随核核验读取其绑定，变化必须触发四桌面打包门。',
   },
+  'resources/core-recovery/': {
+    kernel: true,
+    platforms: ALL,
+    why: '独立恢复原归档及其清单参与编译选择和随包资源；未知平台或共用布局变化保守要求真核门与四桌面包，不能按无影响放行。',
+  },
+  'resources/core-recovery/linux/': {
+    kernel: true, platforms: Object.freeze(['linux']),
+    why: 'Linux 独立恢复原归档与库存只进入 Linux carrier；必须核验该腿的选版字节与恢复资源集合。',
+  },
+  'resources/core-recovery/win/': {
+    kernel: true, platforms: Object.freeze(['windows']),
+    why: 'Windows 独立恢复 ZIP 与库存只进入 Windows carrier；不可漏掉原归档、清单或真实 sidecar。',
+  },
+  'resources/core-recovery/mac-arm64/': {
+    kernel: true, platforms: Object.freeze(['macos-arm64']),
+    why: 'Mac arm64 独立恢复原归档与库存仅进入该架构的签名 carrier。',
+  },
+  'resources/core-recovery/mac-x64/': {
+    kernel: true, platforms: Object.freeze(['macos-x64']),
+    why: 'Mac x64 独立恢复原归档与库存仅进入该架构的签名 carrier。',
+  },
   'resources/data/': {
     kernel: true,
     platforms: ALL,
@@ -936,6 +957,11 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     'Exact desktop-only cfg(test) readiness and retained CLI-instance fixtures exclude both Android and iOS. '
     + 'Host polaris lib tests cover these cases; Android target cargo check and APK builds do not compile this test module '
     + 'or attest mobile lifecycle behavior.',
+  'src-tauri/src/runtime/proxy/tests/process_supervision/helper_terminal.rs':
+    'Host cfg(test) Helper terminal custody/Stop/exit regressions are excluded from APK production. '
+    + 'The explicit not(Android/iOS) case selects desktop direct-start admission; additional Linux-only cases cover native exit seams. '
+    + 'Host polaris lib tests own these regressions; Android cargo check and APK builds do not compile test targets '
+    + 'or prove mobile lifecycle behavior. This source registration does not claim that App tests or device acceptance ran.',
   'src-tauri/src/runtime/proxy/tests/process_supervision.rs':
     '桌面-only helper attempt/lease 负例属于 cfg(test) 测试目标，不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
@@ -1183,6 +1209,10 @@ const SHARED_PACKAGE_PATHS = new Set([
   // 它挂了整条打包链就编不出 singbox-grpc。2026-08-30 前它不在任何表里 = 同一 fail-open。
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
+  'scripts/windows-package-integrity.py',
+  'scripts/windows-package-integrity.test.mjs',
+  'scripts/windows-package-integrity.test.py',
+  'scripts/fixtures/windows-package-legacy-steps.yml',
   // package.yml 的 macOS 腿真跑它（封印前与最终 dmg 开箱各一次，逐个验包内内核与 helper 的签名）；
   // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.sh 列为必需测试。
   'scripts/macos-bundler-diagnostics.sh',
@@ -1197,9 +1227,6 @@ const SHARED_PACKAGE_PATHS = new Set([
 ]);
 
 const LINUX_PACKAGE_PATHS = new Set(['scripts/postprocess-appimage.mjs']);
-// The Linux package acceptance orchestrators import sibling Python/Node modules.
-// Classify the whole owned directory, not just today's two workflow entry points.
-const LINUX_PACKAGE_PREFIXES = ['scripts/package-acceptance/'];
 
 function normalized(path) {
   return String(path).replaceAll('\\', '/').replace(/^\.\//, '').trim();
@@ -1324,7 +1351,7 @@ export function classifyImpact(rawPaths, { forceFull = false } = {}) {
       addAll();
       continue;
     }
-    if (LINUX_PACKAGE_PATHS.has(path) || startsWithAny(path, LINUX_PACKAGE_PREFIXES) || isUiBuildConfig(path)) {
+    if (LINUX_PACKAGE_PATHS.has(path) || isUiBuildConfig(path)) {
       platforms.add('linux');
       continue;
     }

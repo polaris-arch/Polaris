@@ -480,9 +480,8 @@ pub fn build_outbounds_with_runtime_bindings(
         // Tailscale endpoint。
         if server.protocol == Protocol::Tailscale {
             // ── control_url 下发前校验（fail-closed）──────────────────────────────────
-            // IP 形式的 control_url 会让内核在 `NewEndpoint` 里**直接 panic**（机制见
-            // `user_config::control_url` 头注），而 panic 在主起核腿只会归成「sing-box 启动期退出」，
-            // 用户拿不到任何可行动信息。故在**下发之前**剔掉该节点并记下成因 token。
+            // 当前 selected Polaris 支持规范 IPv4 / IPv6 控制面。这里只剔除共享 URL 格式策略
+            // 拒绝的节点，避免把坏 URL 下发后才发现错误，并记下稳定成因 token。
             //
             // 判据取 `server.tailscale_settings`（用户填的原值），不是 `build_tailscale_endpoint`
             // 的产物 —— 必须在构造之前判，否则坏值已经进了 `pending_endpoints`。
@@ -497,8 +496,7 @@ pub fn build_outbounds_with_runtime_bindings(
                 (deps.log)(
                     LogLevel::Warn,
                     &format!(
-                        "启动前配置校验：节点「{tag}」的 control_url 非法（{token}），已剔除 —— \
-                         该写法会让 sing-box 在初始化 tailscale endpoint 时 panic"
+                        "启动前配置校验：节点「{tag}」的 control_url 不符合格式策略（{token}），已剔除"
                     ),
                 );
                 continue;

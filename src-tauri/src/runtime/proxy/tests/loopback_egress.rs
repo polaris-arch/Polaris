@@ -290,6 +290,12 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
         None,
         "管理 API gRPC 传输的生产拨号器（带 secret 的管理口，不是代理入站）",
     ),
+    (
+        "crates/singbox-grpc/src/h2c.rs",
+        "connect_captured",
+        None,
+        "直连已验证 Core 管理口的单 carrier 拨号器；不是代理入站，Bearer 由原管理 client 持有；已捕获后禁止重拨",
+    ),
 ];
 
 /// 带凭据构造器（名字, 凭据实参下标）。

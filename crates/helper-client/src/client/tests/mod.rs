@@ -487,3 +487,111 @@ fn read_timeout_maps_to_timeout_error_but_other_io_errors_do_not() {
 }
 
 mod request_budget;
+
+#[test]
+fn daemon_replaced_from_v3_to_v2_between_connections_cannot_start_or_trigger_legacy_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ReplacedDaemon {
+        calls: Arc<AtomicUsize>,
+        births: Arc<AtomicUsize>,
+        platform: Platform,
+    }
+    struct OldStream {
+        first: bool,
+        births: Arc<AtomicUsize>,
+        platform: Platform,
+        reply: Vec<u8>,
+    }
+    impl Connector for ReplacedDaemon {
+        fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Ok(Box::new(OldStream {
+                first,
+                births: self.births.clone(),
+                platform: self.platform,
+                reply: Vec::new(),
+            }))
+        }
+    }
+    impl ConnectionStream for OldStream {
+        fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+            let frame = String::from_utf8_lossy(data);
+            let fields = frame.lines().collect::<Vec<_>>();
+            let offset = usize::from(self.platform.has_token_line());
+            if self.first {
+                assert_eq!(fields[offset], "version");
+                self.reply = b"OK 3\n".to_vec();
+            } else {
+                assert!(matches!(
+                    fields[offset],
+                    "start-pinned-birth-safe" | "start-native-pinned-birth-safe"
+                ));
+                let args = &fields[offset + 1..];
+                // Frozen v2 requires CoreId in its FIRST argument (the full
+                // unchanged decoder is also exercised in helper-proto tests).
+                if (4..=5).contains(&args.len())
+                    && polaris_helper_proto::core_manifest::CoreId::parse(args[0]).is_ok()
+                {
+                    self.births.fetch_add(1, Ordering::SeqCst);
+                }
+                assert_eq!(
+                    args[0],
+                    polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR
+                );
+                self.reply = b"ERR bad-args\n".to_vec();
+            }
+            Ok(())
+        }
+        fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+            buf.extend_from_slice(&self.reply);
+            Ok(self.reply.len())
+        }
+        fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    for platform in [Platform::Linux, Platform::Mac, Platform::Win] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let births = Arc::new(AtomicUsize::new(0));
+        let client = HelperClient::new(
+            Box::new(ReplacedDaemon {
+                calls: calls.clone(),
+                births: births.clone(),
+                platform,
+            }),
+            platform,
+            "TOK",
+        );
+        assert!(matches!(
+            client.send(&Request::Version),
+            Ok(Response::Ok(ResponseKind::Version { proto_version: 3 }))
+        ));
+        let params = polaris_helper_proto::core_protocol::PinnedStartParams {
+            id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
+            common: polaris_helper_proto::StartParams {
+                cfg: "/cfg".into(),
+                log: "".into(),
+                fwd: false,
+                parent_pid: None,
+            },
+        };
+        let request = if platform == Platform::Linux {
+            Request::LinuxStartPinned(params)
+        } else {
+            Request::NativeStartPinned(params)
+        };
+        let response = client.send_with_retry(
+            &request,
+            Duration::from_millis(500),
+            3,
+            Duration::from_millis(1),
+        );
+        assert!(matches!(response, Ok(Response::Err(_))));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "an explicit v2 rejection must never replay a legacy frame"
+        );
+        assert_eq!(births.load(Ordering::SeqCst), 0);
+    }
+}

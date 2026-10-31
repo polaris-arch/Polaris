@@ -19,7 +19,6 @@ use tauri::{AppHandle, Emitter, State};
 use polaris_config_engine::user_config::ProxyModeType;
 use polaris_core_supervisor::config_gate::ConfigCheckVerdict;
 use polaris_core_supervisor::{run_check_raw, RawCheck};
-use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 
 use crate::events::channel::EVENT_PROXY_STOPPED;
 use crate::response::{ok_void, ApiResponse};
@@ -459,25 +458,37 @@ async fn run_probe_check(
     binary: &std::path::Path,
     config_path: &std::path::Path,
 ) -> Result<ProbeCheck, polaris_core_supervisor::ValidationLifecycleError> {
-    Ok(
-        match run_check_raw(binary, config_path, PROBE_CHECK_TIMEOUT).await? {
-            // 超时 / spawn 失败（核缺失 / 无权限）→ failOpen
-            RawCheck::TimedOut { .. } | RawCheck::SpawnFailed(_) | RawCheck::OutputFailed(_) => {
-                ProbeCheck::Indeterminate
-            }
-            RawCheck::Done { success: true, .. } => ProbeCheck::Supported,
-            RawCheck::Done { stderr, stdout, .. } => {
-                // stderr 优先、为空才落回 stdout —— 与此前行为一致（sing-box 恒写 stderr，留 stdout 兜底
-                // 给理论上把日志导向 stdout 的变体 / 未来版本）。
-                let raw = if stderr.trim().is_empty() {
-                    stdout.as_str()
-                } else {
-                    stderr.as_str()
-                };
-                ProbeCheck::Unsupported(parse_probe_diagnostic(raw))
-            }
-        },
-    )
+    Ok(probe_check_from_raw(
+        run_check_raw(
+            crate::runtime::core_identity::prepare(
+                binary,
+                crate::runtime::core_identity::ExecPurpose::CheckConfig,
+            )?,
+            config_path,
+            PROBE_CHECK_TIMEOUT,
+        )
+        .await?,
+    ))
+}
+
+fn probe_check_from_raw(raw: RawCheck) -> ProbeCheck {
+    match raw {
+        // 超时 / spawn 失败（核缺失 / 无权限）→ failOpen
+        RawCheck::TimedOut { .. } | RawCheck::SpawnFailed(_) | RawCheck::OutputFailed(_) => {
+            ProbeCheck::Indeterminate
+        }
+        RawCheck::Done { success: true, .. } => ProbeCheck::Supported,
+        RawCheck::Done { stderr, stdout, .. } => {
+            // stderr 优先、为空才落回 stdout —— 与此前行为一致（sing-box 恒写 stderr，留 stdout 兜底
+            // 给理论上把日志导向 stdout 的变体 / 未来版本）。
+            let raw = if stderr.trim().is_empty() {
+                stdout.as_str()
+            } else {
+                stderr.as_str()
+            };
+            ProbeCheck::Unsupported(parse_probe_diagnostic(raw))
+        }
+    }
 }
 
 /// 剥离 ANSI CSI 转义序列（`ESC '[' … 终止字节`）。
@@ -760,10 +771,10 @@ pub async fn connections_close(
     id: String,
 ) -> Result<ApiResponse<Value>, ()> {
     // 端点取法的单点是 `ProxyRuntime::management_endpoint`；核未运行或端口未解析 → clean error。
-    let Some((port, secret)) = state.proxy().management_endpoint() else {
+    let Some((port, _secret)) = state.proxy().management_endpoint() else {
         return Ok(ApiResponse::err("核未运行"));
     };
-    let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await {
+    let client = match state.proxy().current_management_client(port).await {
         Ok(c) => c,
         Err(e) => return Ok(ApiResponse::err(format!("管理 API 连接失败: {e}"))),
     };
@@ -785,10 +796,10 @@ pub async fn connections_close(
 #[tauri::command]
 pub async fn connections_close_all(state: State<'_, AppRuntime>) -> Result<ApiResponse<Value>, ()> {
     // 端点取法的单点是 `ProxyRuntime::management_endpoint`；核未运行或端口未解析 → clean error。
-    let Some((port, secret)) = state.proxy().management_endpoint() else {
+    let Some((port, _secret)) = state.proxy().management_endpoint() else {
         return Ok(ApiResponse::err("核未运行"));
     };
-    let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await {
+    let client = match state.proxy().current_management_client(port).await {
         Ok(c) => c,
         Err(e) => return Ok(ApiResponse::err(format!("管理 API 连接失败: {e}"))),
     };

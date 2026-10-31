@@ -23,6 +23,12 @@ describe('proxyErrorCategory（错误码 → 分类）', () => {
     expect(proxyErrorCategory(code)).toBe(ErrorCategory.System);
   });
 
+  it.each([ProxyErrorCode.HELPER_RUNTIME_RESTART_REQUIRED, ProxyErrorCode.STARTUP_FAILED])(
+    '终态启动失败 %s 保持既有 Process 类', (code) => {
+      expect(proxyErrorCategory(code)).toBe(ErrorCategory.Process);
+    },
+  );
+
   it('未知码 / 非法值 → null（调用方据此回落字符串匹配）', () => {
     expect(proxyErrorCategory(ProxyErrorCode.UNKNOWN)).toBeNull();
     expect(proxyErrorCategory('ENOENT')).toBeNull();
