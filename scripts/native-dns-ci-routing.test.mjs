@@ -482,18 +482,79 @@ test('Windows separate producer uses the verified candidate and leaves existing 
 test('candidate real-core callers use default compiled-carrier resolution before instance admission', () => {
   const proxy = read('src-tauri/src/runtime/proxy/tests/mod.rs');
   const stats = read('src-tauri/src/runtime/stats/tests/real_core_tests.rs');
-  const require = proxy.slice(proxy.indexOf('pub(crate) fn require_core()'), proxy.indexOf('fn real_core_runtime()'));
+  const identity = read('src-tauri/src/runtime/core_identity.rs');
+  const selection = read('crates/core-supervisor/src/selected_core.rs');
+  const binary = read('src-tauri/src/runtime/proxy/core_binary.rs');
+  // These are fixed, top-level source-contract spans, not Rust execution or cfg analysis.
+  const body = (source, declaration) => {
+    assert.equal(source.split(declaration).length, 2, `one ${declaration}`);
+    const start = source.indexOf(declaration);
+    const end = source.indexOf('\n}\n', start);
+    assert.notEqual(end, -1, `closed ${declaration}`);
+    return source.slice(start, end + 3);
+  };
+  const ordered = (source, needles) => {
+    let previous = -1;
+    for (const needle of needles) {
+      assert.equal(source.split(needle).length, 2, `one ${needle}`);
+      const at = source.indexOf(needle);
+      assert.ok(at > previous, `${needle} must follow the preceding admission step`);
+      previous = at;
+    }
+  };
+  const require = body(proxy, 'pub(crate) fn require_core()');
   assert.ok(require.includes('candidate_real_core_selection('));
   assert.ok(require.includes('crate_file("core-manifest.json")'));
   assert.ok(require.includes('repo_file("scripts/desktop-core/release-contract.json")'));
   assert.doesNotMatch(require, /include_(?:str|bytes)!/);
   assert.ok(require.includes('std::env::var_os("POLARIS_SINGBOX_PATH")'));
-  assert.ok(require.includes('resolve_core_binary().expect('));
-  assert.ok(require.includes('../resources/.native-dns-app'));
+  assert.match(require, /candidate_real_core_selection\(\s*selected,\s*std::env::var_os\("POLARIS_SINGBOX_PATH"\)\.as_deref\(\),\s*\)/);
+  assert.match(body(proxy, 'fn candidate_real_core_selection('), /Some\(value\) if value == "1" && path_override\.is_none\(\) => Ok\(true\),/);
+  const assertCompiledCarrier = (caller, appIdentity, sharedSelection, resolver) => {
+    ordered(caller, ['candidate_real_core_selection(', '.expect("invalid real-core test selection")',
+      'resolve_core_binary().expect(', 'crate::runtime::core_identity::selected_payload_dirs(&formal_dirs)',
+      '.join("../resources")', '.join(directory)', 'assert_eq!(\n            path, expected,', 'return path;']);
+    assert.match(caller, /SelectionLane::LocalDevelopment\s*\{\s*assert_eq!\(compiled_dirs\.len\(\), 1,[\s\S]*?compiled_dirs\[0\]\.clone\(\)/);
+    assert.match(caller, /let expected = if explicit\.is_some\(\)\s*\{\s*format!\("\.native-dns-app\/\{platform\}"\)\s*\} else \{\s*platform\.to_owned\(\)\s*\}/);
+    assert.ok(caller.includes('compiled_dirs.contains(&expected)'));
+    assert.doesNotMatch(caller, /\.join\("\.\.\/resources\/\.native-dns-app"\)/);
+    ordered(body(appIdentity, 'pub(crate) fn selected_payload_dirs('), ['check_compiled_selection()?;',
+      'polaris_core_supervisor::selected_core::selected_payload_dirs(formal)']);
+    const dirs = body(sharedSelection, 'pub fn selected_payload_dirs(');
+    assert.doesNotMatch(dirs, /std::env::(?:var|var_os)|POLARIS_SINGBOX_PATH/);
+    assert.match(dirs, /development::manifest\(current_platform\(\)\?\)\?;\s*Ok\(vec!\["\.local-development\/linux"\.into\(\)\]\)/);
+    assert.match(dirs, /if COMPILED_VALIDATION_SOURCE == b"null" \{\s*return Ok\(_formal\.iter\(\)\.map\(\|value\| \(\*value\)\.to_owned\(\)\)\.collect\(\)\);/);
+    ordered(dirs, ['let source = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;',
+      'if source["schema"] == "polaris-native-dns-compiled-source-v2"', 'platform.to_owned()',
+      'format!(".native-dns-app/{platform}")']);
+    ordered(body(resolver, 'pub(crate) fn resolve_core_binary()'), ['dev_core_binary_override()?;', 'resolve_bundled_core_binary()']);
+    ordered(body(resolver, 'fn dev_core_binary_override()'), ['std::env::var_os("POLARIS_SINGBOX_PATH").is_some()', 'return Err(', 'Ok(None)']);
+    ordered(body(resolver, 'fn resolve_bundled_core_binary()'), ['crate::runtime::core_identity::selected_payload_dirs(&platform_dirs)?',
+      'bundle_resource_candidates(', 'candidate_observation(candidates)?',
+      'crate::runtime::core_identity::verify_bundled(&selection.path)?', 'Ok(core)']);
+  };
+  assertCompiledCarrier(require, identity, selection, binary);
+  // Each original real source is changed in one place; stale hidden paths, an
+  // unchecked delegate, environment selection and lost verification must fail.
+  for (const [slot, before, after] of [
+    [0, 'crate::runtime::core_identity::selected_payload_dirs(&formal_dirs)', 'unchecked_payload_dirs(&formal_dirs)'],
+    [0, '.join("../resources")', '.join("../resources/.native-dns-app")'],
+    [0, 'compiled_dirs.contains(&expected)', 'true'],
+    [1, 'check_compiled_selection()?;', ''],
+    [2, 'platform.to_owned()', 'format!(".native-dns-app/{platform}")'],
+    [2, 'let platform = current_platform()?;', 'let platform = std::env::var("POLARIS_SINGBOX_PATH")?;'],
+    [3, 'dev_core_binary_override()?;', ''],
+    [3, 'crate::runtime::core_identity::verify_bundled(&selection.path)?', 'unchecked_bundle(&selection.path)?'],
+  ]) {
+    const sources = [require, identity, selection, binary];
+    const span = slot === 1 ? body(sources[slot], 'pub(crate) fn selected_payload_dirs(') : sources[slot];
+    assert.ok(span.includes(before));
+    sources[slot] = sources[slot].replace(span, span.replace(before, after));
+    assert.throws(() => assertCompiledCarrier(...sources), assert.AssertionError);
+  }
   assert.match(require, /assert_eq!\(\s*path,\s*expected,/);
-  assert.ok(proxy.includes('rt.inject_real_core_for_test(core.clone())'));
-  assert.ok(stats.includes('let core = crate::runtime::proxy::tests::require_core();'));
-  assert.ok(stats.includes('proxy.inject_real_core_for_test(core)'));
+  ordered(body(proxy, 'fn real_core_runtime()'), ['let core = require_core();', 'rt.inject_real_core_for_test(core.clone())']);
+  ordered(stats, ['let core = crate::runtime::proxy::tests::require_core();', 'proxy.inject_real_core_for_test(core)']);
   assert.doesNotMatch(stats, /std::env::var\("POLARIS_SINGBOX_PATH"\)/);
   assert.ok(!nodeScript('Activate admitted native DNS test inputs for the actual host').includes('POLARIS_SINGBOX_PATH:'));
 });

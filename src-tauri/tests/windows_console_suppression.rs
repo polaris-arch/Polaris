@@ -157,9 +157,7 @@ fn strip_comments(src: &str) -> String {
 fn every_windows_reachable_spawn_suppresses_the_console() {
     let mut sources: BTreeMap<&str, String> = BTreeMap::new();
     for g in GUARDED {
-        let src = sources
-            .entry(g.file)
-            .or_insert_with(|| read(g.file));
+        let src = sources.entry(g.file).or_insert_with(|| read(g.file));
         assert_guarded_source(g, src);
     }
     assert_check_custody_suppression(&read(
@@ -267,7 +265,12 @@ fn assert_check_custody_suppression(source: &str) {
     assert_guarded_source(guard, source);
     let code = polaris_source_probe::mask_comments_and_strings(source);
     let spawn = braced_block(&code, "fn spawn_mode(");
-    assert_eq!(spawn.matches("Self::attach_child(run, &mut builder)").count(), 1);
+    assert_eq!(
+        spawn
+            .matches("Self::attach_child(run, &mut builder)")
+            .count(),
+        1
+    );
     assert!(spawn.contains("#[cfg(windows)]\n        builder.creation_flags(0x0800_0000);"));
     let factory = braced_block(&code, "fn attach_child(");
     assert_eq!(factory.matches("builder.spawn()").count(), 1);
@@ -276,7 +279,9 @@ fn assert_check_custody_suppression(source: &str) {
     assert!(command.contains("Self::Admitted(e)"));
     assert!(command.contains("if e.purpose() != purpose"));
     assert!(command.contains("Ok(e.command()?)"));
-    assert!(command.contains("#[cfg(test)]\n            Self::Fixture(path) => Ok(tokio::process::Command::new(path))"));
+    assert!(command.contains(
+        "#[cfg(test)]\n            Self::Fixture(path) => Ok(tokio::process::Command::new(path))"
+    ));
 }
 
 /// 已知会在 Windows 上执行的 console 程序名（字面量形态）。按**程序名反查**，与上面的清单互补：
@@ -660,24 +665,35 @@ fn version_probes_do_not_create_foreign_processes() {
 #[test]
 fn shared_runner_suppression_guard_rejects_missing_commented_or_late_flags() {
     for (file, flag, constructor, birth) in [
-        ("crates/system-integration/src/exec.rs", "builder.creation_flags(CREATE_NO_WINDOW);", "std::process::Command::new(", "builder.spawn()"),
-        ("crates/core-supervisor/src/config_gate/check_custody.rs", "builder.creation_flags(0x0800_0000);", "execution.command(config.is_some())?", "Self::attach_child(run, &mut builder)"),
+        (
+            "crates/system-integration/src/exec.rs",
+            "builder.creation_flags(CREATE_NO_WINDOW);",
+            "std::process::Command::new(",
+            "builder.spawn()",
+        ),
+        (
+            "crates/core-supervisor/src/config_gate/check_custody.rs",
+            "builder.creation_flags(0x0800_0000);",
+            "execution.command(config.is_some())?",
+            "Self::attach_child(run, &mut builder)",
+        ),
     ] {
-        let guard = GUARDED.iter().find(|g| g.file == file).expect("actual spawn owner must stay registered");
+        let guard = GUARDED
+            .iter()
+            .find(|g| g.file == file)
+            .expect("actual spawn owner must stay registered");
         let source = read(guard.file);
         assert_guarded_source(guard, &source);
         assert_eq!(source.matches(flag).count(), 1);
         for mutated in [
             source.replace(flag, ""),
             source.replace(flag, &format!("// {flag}")),
-            source.replace(flag, "").replace(birth, &format!("{birth}; {flag}")),
+            source
+                .replace(flag, "")
+                .replace(birth, &format!("{birth}; {flag}")),
             source.replace(constructor, "missing_constructor("),
         ] {
-            assert!(std::panic::catch_unwind(|| assert_guarded_source(
-                guard,
-                &mutated
-            ))
-            .is_err());
+            assert!(std::panic::catch_unwind(|| assert_guarded_source(guard, &mutated)).is_err());
         }
     }
 
@@ -686,20 +702,41 @@ fn shared_runner_suppression_guard_rejects_missing_commented_or_late_flags() {
     assert_eq!(source.matches(setter).count(), 1);
     // Each non-code form carries both the flag and fake function anchors.
     // The real code must survive harmless decoys and reject fake-only evidence.
-    let evidence = format!("{setter}\nfn spawn_mode(\nfn attach_child(\nfn command(&self, check: bool)");
+    let evidence =
+        format!("{setter}\nfn spawn_mode(\nfn attach_child(\nfn command(&self, check: bool)");
     for (anchor, renamed, decoy, fake_setter) in [
-        ("fn spawn_mode(", "fn unrelated_spawn_mode(", format!("/* {evidence} */"), format!("/* {setter} */")),
-        ("fn attach_child(", "fn unrelated_attach_child(", format!("let _ = \"{evidence}\";"), format!("let _ = \"{setter}\";")),
-        ("fn command(&self, check: bool)", "fn unrelated_command(&self, check: bool)", format!("let _ = r###\"{evidence}\"###;"), format!("let _ = r###\"{setter}\"###;")),
+        (
+            "fn spawn_mode(",
+            "fn unrelated_spawn_mode(",
+            format!("/* {evidence} */"),
+            format!("/* {setter} */"),
+        ),
+        (
+            "fn attach_child(",
+            "fn unrelated_attach_child(",
+            format!("let _ = \"{evidence}\";"),
+            format!("let _ = \"{setter}\";"),
+        ),
+        (
+            "fn command(&self, check: bool)",
+            "fn unrelated_command(&self, check: bool)",
+            format!("let _ = r###\"{evidence}\"###;"),
+            format!("let _ = r###\"{setter}\"###;"),
+        ),
     ] {
         let valid = source.replacen(setter, &format!("{setter}\n        {decoy}"), 1);
         assert_check_custody_suppression(&valid);
         let fake_flag = source.replacen(setter, &fake_setter, 1);
         assert!(std::panic::catch_unwind(|| assert_check_custody_suppression(&fake_flag)).is_err());
         assert_eq!(source.matches(anchor).count(), 1);
-        let fake_anchor = source.replacen(anchor, renamed, 1)
-            .replacen(setter, &format!("{setter}\n        {decoy}"), 1);
-        assert!(std::panic::catch_unwind(|| assert_check_custody_suppression(&fake_anchor)).is_err());
+        let fake_anchor = source.replacen(anchor, renamed, 1).replacen(
+            setter,
+            &format!("{setter}\n        {decoy}"),
+            1,
+        );
+        assert!(
+            std::panic::catch_unwind(|| assert_check_custody_suppression(&fake_anchor)).is_err()
+        );
     }
 }
 

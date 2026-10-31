@@ -528,17 +528,25 @@ fn the_scan_surface_and_the_helper_are_what_the_gate_assumes() {
 
     // The admitted fixture's disk bytes are inputs to sealed-object protection,
     // not executable path stand-ins. Pin that actual factory and Linux command.
-    let admitted = polaris_source_probe::repo_file!("crates/core-supervisor/src/admitted_payload.rs");
+    let admitted =
+        polaris_source_probe::repo_file!("crates/core-supervisor/src/admitted_payload.rs");
     assert!(windows_only(&admitted));
     assert!(admitted.contains("#[cfg(all(test, target_os = \"linux\"))]\npub(crate) fn fixture("));
     let admitted_code = polaris_source_probe::mask_comments_and_strings(&admitted);
     let anchor = "pub(crate) fn fixture(";
     assert_eq!(admitted_code.matches(anchor).count(), 1);
-    let fixture = admitted_code.split(anchor).nth(1).unwrap().split("\n}\n").next().unwrap();
+    let fixture = admitted_code
+        .split(anchor)
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
     assert!(fixture.contains("platform::protect_members(&candidate, &policy)"));
     assert!(fixture.contains("protected,"));
     assert!(!fixture.contains("Command::"));
-    let linux = polaris_source_probe::repo_file!("crates/core-supervisor/src/admitted_payload/linux.rs");
+    let linux =
+        polaris_source_probe::repo_file!("crates/core-supervisor/src/admitted_payload/linux.rs");
     let linux_code = polaris_source_probe::mask_comments_and_strings(&linux);
     let anchor = "pub(super) fn command(";
     assert_eq!(linux_code.matches(anchor).count(), 1);
