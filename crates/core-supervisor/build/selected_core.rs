@@ -1,6 +1,12 @@
 // Shared build-time selection. Both consumers execute this exact source; no
 // second version/provider table may authorize an execution.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+// The build consumer verifies the two complete document pins. The runtime
+// consumer of this same generated type validates every remaining field.
+#[expect(
+    dead_code,
+    reason = "build validates selection and contract document pins; runtime validates remaining generated fields"
+)]
 #[path = "../src/selected_core/development_config.rs"]
 mod development_configuration;
 fn repository_root() -> PathBuf {
@@ -422,10 +428,12 @@ fn embed_recovery_inventory() {
 }
 
 fn emit_local_development() {
-    assert!(
-        !cfg!(feature = "formal-selection"),
-        "selection features are mutually exclusive"
-    );
+    const {
+        assert!(
+            !(cfg!(feature = "local-development-selection") && cfg!(feature = "formal-selection")),
+            "selection features are mutually exclusive"
+        );
+    }
     assert_eq!(
         desktop_platform(),
         Some("linux"),

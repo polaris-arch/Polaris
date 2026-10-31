@@ -119,6 +119,7 @@ impl ProxyRuntime {
 
     /// Bind the ordinary transport to the producer's endpoint before any action I/O.
     /// This constructor never reads the current runtime's status or saved credentials.
+    #[cfg(all(test, not(target_os = "ios")))]
     pub(super) async fn management_api_at(port: u16, secret: String) -> GrpcManagementApi {
         if port == 0 {
             return GrpcManagementApi::not_ready();
@@ -155,6 +156,7 @@ impl ProxyRuntime {
 
     /// 一轮测速的读回流要连的管理端点：持票据的运行用票据里的那一个（与它的探针换选同一个），
     /// 其余用此刻运行核的那一个。票据在手时不读当前运行态：核换代后流不会跟到新核上。
+    #[cfg(all(test, not(target_os = "ios")))]
     pub(crate) fn readback_endpoint(
         &self,
         ticket: Option<&super::ReadyMainTicket>,
@@ -187,18 +189,6 @@ impl ProxyRuntime {
                     control: None,
                 }),
         }
-    }
-
-    /// 管理 API 的 Bearer secret（`clashApiSecret`，缺失/空 → 空串免认证）。热切换与 TS STATUS relay 共用。
-    ///
-    /// 取法单点在 [`current_clash_api_secret`]（走 `with_current` 投影，不 clone 整份配置）。调用链是
-    /// `probe_select_slot → hot_switch_selector → management_api → 本方法` —— 测速一轮调 N 次，
-    /// 所有热切节点的路径也都经过这里。
-    pub(super) fn clash_api_secret(&self) -> String {
-        if let Some((_, _, secret)) = self.verified_runtime_api_endpoint() {
-            return secret;
-        }
-        current_clash_api_secret(&self.config)
     }
 
     /// 某个节点在**当前运行核**里的管理 API 落点：`(端口, secret, 该节点的 endpoint tag)`。

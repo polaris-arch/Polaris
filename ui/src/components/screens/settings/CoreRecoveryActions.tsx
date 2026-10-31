@@ -12,6 +12,16 @@ export default function CoreRecoveryActions({ onRecovered }: { onRecovered?: (re
   const [busy, setBusy] = useState(false);
   const inFlight = useRef(false);
   const { armed, confirmTwice } = useConfirmTwice();
+  const resultLabels: Record<CoreRecoveryState, string> = {
+    ready: t('coreRecovery.ready'),
+    restored: t('coreRecovery.restored'),
+    notNeeded: t('coreRecovery.notNeeded'),
+    stopRequired: t('coreRecovery.stopRequired'),
+    helperRequired: t('coreRecovery.helperRequired'),
+    reinstallRequired: t('coreRecovery.reinstallRequired'),
+    unavailable: t('coreRecovery.unavailable'),
+    pending: t('coreRecovery.pending'),
+  };
 
   async function perform(apply: boolean) {
     if (inFlight.current) return;
@@ -33,7 +43,7 @@ export default function CoreRecoveryActions({ onRecovered }: { onRecovered?: (re
   }
 
   return <div data-core-recovery="current-app">
-    <p role="status" aria-live="polite">{t(busy ? 'coreRecovery.working' : result ? 'coreRecovery.' + result : 'coreRecovery.intro')}</p>
+    <p role="status" aria-live="polite">{busy ? t('coreRecovery.working') : result ? resultLabels[result] : t('coreRecovery.intro')}</p>
     {!busy && result === 'ready' && <Button
       variant="ghost" size="sm" className={armed === 'restore-core-data' ? 'confirming' : undefined}
       onClick={() => confirmTwice('restore-core-data', () => { void perform(true); })}

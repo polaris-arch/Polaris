@@ -13,7 +13,7 @@
 
 ---
 
-## 七个类别
+## 八个类别
 
 | 类别 | 为什么默认不跑 | 谁来跑 |
 |---|---|---|
@@ -22,6 +22,7 @@
 | **LiveHostState** | 会读或**改写宿主机的真实状态**（路由表 / 系统代理）。跑错机器会把开发机的网络配置改掉 | 专用测试机，人在场 |
 | **PrivateChildFixture** | 由父测试供给私有输入与身份，不能作为独立门运行 | 仅由父门以精确过滤器调用并收尾 |
 | **NativeWindowsInterop** | 需要原生 NTFS、固定来源与哈希的 App 测试产物及真实 Go producer | 专用 Windows 互操作 runner，使用精确测试名 |
+| **NativeWindowsCompilerFixture** | 既有 whole-PE 缓存/加载器实验需要原生 Windows 与 MSVC；自编译 EXE/DLL 从不获得生产 admission | 专用 Windows 编译器 fixture，逐名显式 opt-in |
 | **PrivilegedWindowsInterop** | 需要显式批准的一次性 SYSTEM 任务与普通用户 consumer | 经批准的专用 Windows runner，任务清理归 runner 负责 |
 | **NotAGate** | 根本不是测试，是打印工具（如逃生门清单）。用 `#[ignore]` 只是为了不进默认门 | 需要那份清单时随手跑 |
 
@@ -81,13 +82,15 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 
 ---
 
-## 完整清单（30 条）
+## 完整清单（32 条）
 
 `src-tauri/tests/ignored_tests_registry.rs` 的 `REGISTRY` 是真值源；本表由它逐条对应，
 **每个测试名都必须在本文档里逐字出现**（那道门会逐条核对，前缀兜底已被去掉——它会让 2/3 的条目失守）。
 
 | 测试 | 文件 | 类别 |
 |---|---|---|
+| `cached_sec_image_and_retained_writer_can_disagree_with_cold_hash_and_create_process` | `crates/core-supervisor/src/admitted_payload/windows/tests/mod.rs` | NativeWindowsCompilerFixture |
+| `held_exe_and_dll_do_not_close_late_dot_local_namespace_before_entry` | 同上 | NativeWindowsCompilerFixture |
 | `real_hot_dispatcher_apply_and_status` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
 | `real_hot_dispatcher_persistence_retry` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
 | `real_hot_public_rpc_contract` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
@@ -140,7 +143,7 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
 
 ## 平台差异：`ignored` 的数字是平台相关的
 
-源码登记共 30 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
+源码登记共 32 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门、两项 NativeWindowsCompilerFixture 各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
 
 
 ## NativeWindowsInterop 与 PrivilegedWindowsInterop 的执行边界
@@ -233,3 +236,15 @@ observations to `<test-name>.json` beside the runner receipt. Secrets and full
 generated configuration are not included. Only owned loopback listeners and
 owned temporary configuration files are used; no TUN, system proxy, host DNS,
 routes, firewall, helper/device installation or privileged core execution.
+
+### NativeWindowsCompilerFixture
+
+这两项既有 opt-in 使用 `POLARIS_NATIVE_MSVC_CL` 指定的现成 MSVC `cl` 绝对路径，
+编译仓内 `main.c` / `dependency.c` 到自有临时目录，直接观察缓存 SEC_IMAGE 与晚到 `.local`
+DLL 命名空间。它们不调用真实 sing-box、不连接网络、不操作系统服务；生产 admission 仍须明确拒绝。
+原生 Windows 专用环境逐名运行，不能用本机静态登记充当真实结果：
+
+```powershell
+cargo test -p polaris-core-supervisor --lib admitted_payload::windows::tests::cached_sec_image_and_retained_writer_can_disagree_with_cold_hash_and_create_process -- --ignored --exact --nocapture
+cargo test -p polaris-core-supervisor --lib admitted_payload::windows::tests::held_exe_and_dll_do_not_close_late_dot_local_namespace_before_entry -- --ignored --exact --nocapture
+```

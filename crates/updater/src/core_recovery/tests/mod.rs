@@ -509,7 +509,7 @@ fn unsafe_archive_names_and_extra_or_missing_members_never_escape_private_stage(
 
 #[test]
 fn tar_links_special_headers_duplicate_paths_and_gzip_trailing_streams_are_rejected() {
-    for kind in [b'1', b'2', b'3', b'6', b'x', b'L', b'S'] {
+    for kind in *b"1236xLS" {
         let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
         let mut header = tar::Header::new_ustar();
         header.set_path("native/core").unwrap();

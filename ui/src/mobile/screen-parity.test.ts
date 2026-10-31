@@ -866,7 +866,7 @@ function resolveAnchor(owner: string, anchor: Anchor): ResolvedAnchor {
  * 比较，以及 Android 侧的平台对象（`VpnService` / `@RequiresApi`）。故意**不**收「出现过
  * android / mobile / desktop 这些词」：那样随便一句提到 Android 的代码都能当依据。
  */
-const PLATFORM_TOKEN = /#\[cfg\(|cfg!\(|target_os|target_family|platform\s*[!=]==?|Platform::|VpnService|@RequiresApi/;
+const PLATFORM_TOKEN = /#\[cfg\(|cfg!\(|target_os|target_family|platform\s*[!=]==?|Platform::|VpnService|@RequiresApi|match\s*\(\s*std::env::consts::OS\s*,\s*std::env::consts::ARCH\s*\)/;
 
 /** 平台专属的源码树 —— 整棵树只为一个平台存在时，路径本身就是那条判定。 */
 const PLATFORM_PATH = /(?:^|\/)(?:android|ios|apple|windows|macos|linux)(?:\/|\.)/i;
@@ -1374,6 +1374,13 @@ describe('④ 锚：每一条豁免都被真的打开核对（不是形状检查
     ).toEqual([]);
   });
 
+  it('OS/architecture evidence must contain the actual match, not an OS label or an error string', () => {
+    expect(PLATFORM_TOKEN.test('match (std::env::consts::OS, std::env::consts::ARCH) {')).toBe(true);
+    for (const text of ['std::env::consts::OS', 'desktop selected identity', '_ => Err("no desktop selected identity")']) {
+      expect(PLATFORM_TOKEN.test(text)).toBe(false);
+    }
+  });
+
   it('`platform-absent` 的锚必须指向一条**平台判定**，不是一句写过的话', () => {
     // 复审 minor 的实测形态：三条锚全指着 `lib.rs` 里的中文注释 —— 给 Android 落一个 autostart 实现、
     // 把 `#[cfg(desktop)]` 删掉而注释原样留着，豁免继续成立。剥注释已经堵住「指注释」那一半，
@@ -1392,7 +1399,7 @@ describe('④ 锚：每一条豁免都被真的打开核对（不是形状检查
       expect(
         PLATFORM_TOKEN.test(anchor.mustContain) || PLATFORM_PATH.test(anchor.file),
         `${owner}：${anchor.file}:${resolved.hit} 这条锚的文本里没有平台判定` +
-          '（`#[cfg(` / `cfg!(` / `target_os` / `platform != "…"` / `VpnService`，也不在平台专属源码树里）——\n' +
+          '（`#[cfg(` / `cfg!(` / `target_os` / `platform != "…"` / OS/ARCH match / `VpnService`，也不在平台专属源码树里）——\n' +
           '「平台上没有这个对象」这句话得**把那条守卫引下来**，不能指着守卫附近的一行代码说。',
       ).toBe(true);
     }

@@ -545,13 +545,12 @@ fn lifecycle_failure_fixture_passes_schema_and_gateway_but_fails_raw_validation(
 
 /// Business-only validator dependency. No Prepared, native command or credential
 /// can be obtained from this per-runtime fixture; the real factory stays strict.
+type BusinessConfigCheck = dyn Fn(&std::path::Path) -> Result<polaris_core_supervisor::ConfigCheckVerdict, String>
+    + Send
+    + Sync;
 pub(super) struct BusinessKernelCheckFixture {
     binary: PathBuf,
-    check: Arc<
-        dyn Fn(&std::path::Path) -> Result<polaris_core_supervisor::ConfigCheckVerdict, String>
-            + Send
-            + Sync,
-    >,
+    check: Arc<BusinessConfigCheck>,
 }
 impl ProxyRuntime {
     pub(super) fn has_business_kernel_check_fixture(&self, binary: &std::path::Path) -> bool {
@@ -579,6 +578,7 @@ impl ProxyRuntime {
         Some(check(config))
     }
 }
+#[cfg(unix)]
 fn install_business_kernel_checker(
     rt: &ProxyRuntime,
     binary: &std::path::Path,
@@ -605,6 +605,7 @@ fn install_business_kernel_checker(
         }),
     });
 }
+#[cfg(unix)]
 fn install_counting_business_checker(
     rt: &ProxyRuntime,
     binary: &std::path::Path,
@@ -811,13 +812,36 @@ pub(crate) fn require_core() -> PathBuf {
         // No global test fallback is enabled and no runtime path is injected by env.
         let path = resolve_core_binary().expect("compiled candidate carrier must resolve");
         let platform = crate::runtime::core_identity::current_platform().unwrap();
-        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(if explicit.is_some() {
-                "../resources/.native-dns-app"
+        // The normal resolver has already verified this compiled carrier's
+        // content. Bind the fixture assertion to the same compiled directory
+        // selector, including LocalDevelopment; no environment path grants Run.
+        let formal_dirs = super::platform_contracts::core_platform_dirs(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        );
+        let compiled_dirs = crate::runtime::core_identity::selected_payload_dirs(&formal_dirs)
+            .expect("compiled test carrier directories");
+        let directory = if polaris_core_supervisor::selected_core::selection_lane()
+            == polaris_core_supervisor::selected_core::SelectionLane::LocalDevelopment
+        {
+            assert_eq!(compiled_dirs.len(), 1, "one compiled Local carrier");
+            compiled_dirs[0].clone()
+        } else {
+            // Keep the original Formal/native candidate location restriction.
+            let expected = if explicit.is_some() {
+                format!(".native-dns-app/{platform}")
             } else {
-                "../resources"
-            })
-            .join(platform)
+                platform.to_owned()
+            };
+            assert!(
+                compiled_dirs.contains(&expected),
+                "compiled Formal/native carrier differs"
+            );
+            expected
+        };
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../resources")
+            .join(directory)
             .join(if platform == "win" {
                 "sing-box.exe"
             } else {
@@ -850,11 +874,14 @@ pub(crate) fn require_core() -> PathBuf {
 
 /// Candidate tests resolve the compiled carrier; historical opt-in tests retain
 /// their explicit path override. Both keep the existing per-instance spawn gate.
-fn real_core_runtime() -> (Arc<ProxyRuntime>, TestDir, PathBuf) {
-    let core = require_core();
+/// Retain the same cleanup owner across carrier preflight and the whole test.
+/// A preflight unwind still fences this actual empty runtime before teardown.
+fn real_core_runtime() -> (Arc<ProxyRuntime>, TestDir, PathBuf, RealCoreCleanupGuard) {
     let (rt, dir) = test_runtime();
+    let cleanup = RealCoreCleanupGuard::new(&rt);
+    let core = require_core();
     rt.inject_real_core_for_test(core.clone());
-    (rt, dir, core)
+    (rt, dir, core, cleanup)
 }
 
 async fn lock_real_core_tests() -> tokio::sync::MutexGuard<'static, ()> {

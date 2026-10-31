@@ -54,7 +54,7 @@ import {
 import zhCN from '@/i18n/locales/zh-CN.json';
 import { importListEntryRows, listEntryRows, listEntrySources, listEntryAcceptance, nextListEntryDraft } from '@/domain/list-entries';
 
-import { crateRootSource, maskRustComments } from '@/contracts/rust-source.test-support';
+import { crateRootSource, maskRustComments, moduleSource, rustFunctionSource } from '@/contracts/rust-source.test-support';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import { AboutPage, narrowVersionInfo } from './AboutPage';
 import { BackupPage } from './BackupPage';
@@ -3936,20 +3936,92 @@ describe('⑱ 应用更新：检查 + 显示 + 打开发布页（W-19 / W-20）'
   });
 
   /*
-   * 第二条跨语言事实：应用内没有任何「更新 / 上传 / 回滚内核」的命令，Android 上也就不存在
-   * 「去查内核 release」这次请求。
+   * 第二条跨语言事实：不注册内核更新 / 上传 / 回滚命令。桌面两条恢复命令仅消费当前随包数据，
+   * Android/iOS 必须先被平台身份门拒绝，不能进入停机、数据恢复或网络路径。
    *
    * 前身的判据是「`core_update.rs` 这个文件不存在」—— 模块换个文件名回来仍绿。命令能不能被前端
    * 调到，取决于两张表：Rust 侧 `generate_handler![]` 的注册集，与前端 `IPC_CHANNELS` 的值集。
-   * 故改为直接问这两张表：名字里带 `core` 这一节的命令，各自**恰好只有** `core_get_version_info`
-   * （只读的版本信息）。按「节」匹配而不是按 `core_` 前缀：`update_core_check` 这类把 `core`
+   * 故核对两张表的精确集合，并在下面独立追踪两条恢复命令的真实早退闭包；不是只加名字豁免。
+   * 按「节」匹配而不是按 `core_` 前缀：`update_core_check` 这类把 `core`
    * 放在中间的名字同样在射程内。
    *
    * 射程边界（如实登记）：一条名字里完全不带 `core` 的命令（如 `kernel_swap`）不在本条判据内。
    */
-  it('🔴 跨语言：注册表与通道表里带 core 的命令恰好只有只读的 core_get_version_info', () => {
+  it('desktop recovery rejects mobile before stop/data work and exposes no source/path IPC arguments', () => {
+    const sources = {
+      command: moduleSource('src-tauri/src/commands/updater/core_recovery'),
+      consumer: moduleSource('src-tauri/src/runtime/helper/recovery_consumer'),
+      platform: moduleSource('crates/core-supervisor/src/selected_core'),
+      api: readFileSync(join(UI_SRC, 'ipc/api/updater.ts'), 'utf8'),
+    };
+    const compact = (text: string) => text.replace(/\s+/g, '');
+    const guarded = (input: typeof sources): boolean => {
+      const platform = compact(rustFunctionSource(input.platform, 'current_platform'));
+      const desktopArms = [
+        ['linux', 'x86_64', 'linux'], ['windows', 'x86_64', 'win'],
+        ['macos', 'x86_64', 'mac-x64'], ['macos', 'aarch64', 'mac-arm64'],
+      ].map(([os, arch, selected]) => `("${os}","${arch}")=>Ok("${selected}"),`).join('');
+      const expectedPlatform = `fn current_platform() -> Result<&'static str, String> {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+          ${desktopArms}
+          _ => Err("CORE_BUNDLE_MISMATCH: no desktop selected identity".into()),
+        }
+      }`;
+      if (platform !== compact(expectedPlatform)) return false;
+      const requirement = compact(rustFunctionSource(input.consumer, 'user_recovery_requirement'));
+      // Argument evaluation must fail before selected_manifest or any filesystem lookup.
+      if (!requirement.includes('{letselected=core_identity::selected_manifest(core_identity::current_platform().map_err(recovery_error)?,).map_err(recovery_error)?;')) return false;
+      const command = compact(rustFunctionSource(input.command, 'recovery_command'));
+      const firstGate = compact(`{
+        let probe_app = app.clone();
+        let before = tokio::task::spawn_blocking(move || {
+          let state = probe_app.state::<AppRuntime>();
+          user_recovery_requirement().and_then(|_| preflight(&state))
+        }).await.unwrap_or(Err(CoreRecoveryState::Unavailable));
+        if let Err(state) = before { return Ok(ApiResponse::ok(state)); }
+      `);
+      const gate = command.indexOf(firstGate);
+      if (gate < 0 || command.indexOf('ifapply{') < gate + firstGate.length
+        || command.indexOf('stop_for_user_data_recovery(') < gate + firstGate.length
+        || command.indexOf('recover_current_user_core(') < gate + firstGate.length) return false;
+      for (const [name, apply] of [['core_check_offline_recovery', false], ['core_restore_bundled_data', true]] as const) {
+        const delegate = compact(rustFunctionSource(input.command, name));
+        if (delegate !== `fn${name}(app:AppHandle,)->Result<ApiResponse<CoreRecoveryState>,()>{recovery_command(app,${apply}).await}`) return false;
+      }
+      const api = ts.parseSourceFile('updater.ts', input.api);
+      const declarations = api.statements.flatMap(statement => ts.isVariableStatement(statement)
+        ? [...statement.declarationList.declarations] : []);
+      const object = declarations.find(node => node.name.getText(api) === 'coreApi')?.initializer;
+      if (!object || !ts.isObjectLiteralExpression(object)) return false;
+      return [['checkOfflineRecovery', 'CORE_CHECK_OFFLINE_RECOVERY'], ['restoreBundledData', 'CORE_RESTORE_BUNDLED_DATA']].every(([name, channel]) => {
+        const method = object.properties.find((member): member is ts.MethodDeclaration =>
+          ts.isMethodDeclaration(member) && member.name.getText(api) === name);
+        if (!method || method.parameters.length !== 0
+          || method.body?.statements.length !== 1) return false;
+        const statement = method.body.statements[0]!;
+        if (!ts.isReturnStatement(statement) || !statement.expression || !ts.isCallExpression(statement.expression)) return false;
+        const call = statement.expression;
+        return call.expression.getText(api) === 'invoke' && call.arguments.length === 1
+          && call.arguments[0]!.getText(api) === `IPC_CHANNELS.${channel}`;
+      });
+    };
+    expect(guarded(sources)).toBe(true);
+    const mutations = [
+      { ...sources, platform: sources.platform.replace('("macos", "aarch64") => Ok("mac-arm64"),', '("macos", "aarch64") => Ok("mac-arm64"),\n("android", "aarch64") => Ok("mac-arm64"),') },
+      { ...sources, consumer: sources.consumer.replace('core_identity::current_platform().map_err(recovery_error)?', '"mac-arm64"') },
+      { ...sources, command: sources.command.replace('return Ok(ApiResponse::ok(state));', 'let _ = state;') },
+      { ...sources, command: sources.command.replace('recovery_command(app, false).await', 'recovery_command(app, true).await') },
+      { ...sources, api: sources.api.replace('invoke(IPC_CHANNELS.CORE_RESTORE_BUNDLED_DATA)', "invoke(IPC_CHANNELS.CORE_RESTORE_BUNDLED_DATA, { path: '/arbitrary' })") },
+    ];
+    for (const input of mutations) {
+      expect(input).not.toEqual(sources);
+      expect(guarded(input)).toBe(false);
+    }
+  });
+
+  it('🔴 跨语言：core 命令只含只读版本与受桌面身份门约束的两条数据恢复命令', () => {
     const CORE_SEGMENT = /(?:^|_)core(?:_|$)/;
-    const ALLOWED = ['core_get_version_info'];
+    const ALLOWED = ['core_check_offline_recovery', 'core_get_version_info', 'core_restore_bundled_data'];
     // ⓪ 自检：谓词认得出前缀形态与中缀形态，也不误伤无关名字。
     expect(CORE_SEGMENT.test('core_update_check')).toBe(true);
     expect(CORE_SEGMENT.test('update_core_check')).toBe(true);
@@ -3981,7 +4053,7 @@ describe('⑱ 应用更新：检查 + 显示 + 打开发布页（W-19 / W-20）'
     }
     expect(
       coreCommands(registered!),
-      'Rust 注册表里出现了 core_get_version_info 之外的内核命令 —— 应用内又有了动内核的入口；' +
+      'Rust 注册表里出现了已审版本/桌面数据恢复集合之外的内核命令；' +
         '若它是「检查内核更新」，Android 上那条零网络早退必须一并恢复并重新钉住',
     ).toEqual(ALLOWED);
 

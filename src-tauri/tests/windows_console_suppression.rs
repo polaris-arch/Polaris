@@ -99,19 +99,30 @@ const GUARDED: &[Guarded] = &[
         file: "crates/core-supervisor/src/spawner.rs",
         anchor: "impl SingBoxSpawner for TokioSpawner {",
         suppressor: "creation_flags(0x0800_0000)",
-        self_check: "Command::new(",
+        self_check: "execution.command()",
         // 这一条**不数行**（见 `Guarded::before`）：本方法体是全仓最会长注释的地方（三条核腿共用
         // 的起核入口），行数窗口的余量迟早被注释吃光，而顶红的原因与门守的属性无关。
         window: 0,
         before: Some(CREATION_FORMS),
     },
     Guarded {
-        file: "crates/core-supervisor/src/config_gate/check_custody.rs",
-        anchor: "fn spawn(",
-        suppressor: "creation_flags(0x0800_0000)",
-        self_check: "Command::new(",
+        file: "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",
+        anchor: "fn create_suspended(",
+        suppressor: "| CREATE_NO_WINDOW",
+        self_check: "CreateProcessW(",
         window: 0,
-        before: Some(&[".spawn()"]),
+        // Flags are an actual argument of this native call, before its
+        // environment/cwd arguments, not a separate Command builder.
+        before: Some(&["environment.as_ptr().cast()"]),
+    },
+    Guarded {
+        file: "crates/core-supervisor/src/config_gate/check_custody.rs",
+        // spawn is a Unix test-only relay; spawn_mode owns the actual builder.
+        anchor: "fn spawn_mode(",
+        suppressor: "creation_flags(0x0800_0000)",
+        self_check: "let mut builder = execution.command(config.is_some())?;",
+        window: 0,
+        before: Some(&["Self::attach_child(run, &mut builder)"]),
     },
     Guarded {
         file: "crates/helper-client/src/manager.rs",
@@ -148,12 +159,49 @@ fn every_windows_reachable_spawn_suppresses_the_console() {
     for g in GUARDED {
         let src = sources
             .entry(g.file)
-            .or_insert_with(|| strip_comments(&read(g.file)));
+            .or_insert_with(|| read(g.file));
         assert_guarded_source(g, src);
     }
+    assert_check_custody_suppression(&read(
+        "crates/core-supervisor/src/config_gate/check_custody.rs",
+    ));
+    let factory = strip_comments(&read("crates/core-supervisor/src/admitted_payload.rs"));
+    let anchor = "pub(crate) fn command(";
+    assert_eq!(factory.matches(anchor).count(), 1);
+    let body = factory
+        .split(anchor)
+        .nth(1)
+        .unwrap()
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    assert!(body.contains("self.payload.prepare(self.purpose)?"));
+    assert!(body.contains("self.payload.protected.command()"));
+    assert!(
+        body.find("self.payload.prepare(self.purpose)?").unwrap()
+            < body.find("self.payload.protected.command()").unwrap()
+    );
+    // Windows deliberately cannot borrow the Unix mutable command. Its real
+    // native issuer is guarded separately above rather than treating a missing
+    // constructor in TokioSpawner as a vacuous suppression success.
+    let windows = strip_comments(&read(
+        "crates/core-supervisor/src/admitted_payload/windows.rs",
+    ));
+    let command = windows
+        .split("pub(super) fn command(")
+        .nth(1)
+        .unwrap()
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    assert!(command.contains("Err(unavailable())"));
 }
 
 fn assert_guarded_source(g: &Guarded, src: &str) {
+    // Symbol-only proof: mask the entire physical source before anchor selection.
+    // Literal-bearing argv guards retain their own separate source face below.
+    let code = polaris_source_probe::mask_comments_and_strings(src);
+    let src = code.as_str();
     let at = src.find(g.anchor).unwrap_or_else(|| {
         panic!(
             "{}：锚点 `{}` 消失（改名/删除？）——门已失去判据，不是「通过」",
@@ -209,6 +257,26 @@ fn assert_guarded_source(g: &Guarded, src: &str) {
         g.anchor,
         g.suppressor
     );
+}
+
+fn assert_check_custody_suppression(source: &str) {
+    let guard = GUARDED
+        .iter()
+        .find(|g| g.file == "crates/core-supervisor/src/config_gate/check_custody.rs")
+        .expect("actual CheckCustody spawn owner must stay registered");
+    assert_guarded_source(guard, source);
+    let code = polaris_source_probe::mask_comments_and_strings(source);
+    let spawn = braced_block(&code, "fn spawn_mode(");
+    assert_eq!(spawn.matches("Self::attach_child(run, &mut builder)").count(), 1);
+    assert!(spawn.contains("#[cfg(windows)]\n        builder.creation_flags(0x0800_0000);"));
+    let factory = braced_block(&code, "fn attach_child(");
+    assert_eq!(factory.matches("builder.spawn()").count(), 1);
+    assert!(factory.contains("run.child = Some(child);"));
+    let command = braced_block(&code, "fn command(&self, check: bool)");
+    assert!(command.contains("Self::Admitted(e)"));
+    assert!(command.contains("if e.purpose() != purpose"));
+    assert!(command.contains("Ok(e.command()?)"));
+    assert!(command.contains("#[cfg(test)]\n            Self::Fixture(path) => Ok(tokio::process::Command::new(path))"));
 }
 
 /// 已知会在 Windows 上执行的 console 程序名（字面量形态）。按**程序名反查**，与上面的清单互补：
@@ -390,12 +458,11 @@ fn only_one_production_site_spawns_sing_box_check() {
     let app = strip_comments(&read(RELAY));
     let relay = braced_block(&app, "pub(super) async fn supervise(");
     assert!(relay.contains("supervise_owned_sealed_check(execution, config, timeout, spawned)"));
-    let home = strip_comments(&read(HOME));
+    let source = read(HOME);
+    let home = strip_comments(&source);
     let public = braced_block(&home, "pub async fn supervise_owned_sealed_check(");
     assert!(public.contains("supervise_admitted_sealed_check("));
-    let private = braced_block(&home, "async fn supervise_admitted_sealed_check(");
-    assert!(private.contains("execution.sealed_check_parts()?"));
-    assert!(private.contains("Some(payload)"));
+    assert_sealed_check_owner_custody(&source);
     let queue = braced_block(&home, "fn queue_owned_sealed_with_owner(");
     for required in [
         "validate_sealed_file(&binary)?",
@@ -407,6 +474,126 @@ fn only_one_production_site_spawns_sing_box_check() {
         assert!(
             queue.contains(required),
             "opaque check custody lost {required}"
+        );
+    }
+}
+
+/// Follow the real PreparedExecution reference through both retained owners,
+/// then the same Child wait/Unknown path. Literal decoys are not executable proof.
+fn assert_sealed_check_owner_custody(source: &str) {
+    let code = polaris_source_probe::mask_comments_and_strings(source);
+    let compact = |text: &str| text.split_whitespace().collect::<String>();
+    let block = |anchor| compact(braced_block(&code, anchor));
+    let private = block("async fn supervise_admitted_sealed_check(");
+    assert!(private.contains("let(command,binary,_)=execution.sealed_check_parts()?;"));
+    assert_eq!(private.matches(
+        "custody.supervise_owned_sealed_with_owner(command,binary,config,timeout,spawned,Some(&execution),)"
+    ).count(), 1, "the actual private call must transfer the same execution reference");
+    let inner = block("async fn supervise_owned_sealed_with_owner(");
+    assert!(inner.contains("execution:Option<&PreparedExecution>"));
+    assert_eq!(inner.matches(
+        "self.queue_owned_sealed_with_owner(command,binary,config,Arc::new(NativeIo),execution.map(PreparedExecution::payload),execution.and_then(PreparedExecution::lease_owner),)"
+    ).count(), 1, "queue must receive both owners from that reference before birth");
+    let queue = braced_block(&code, "fn queue_owned_sealed_with_owner(");
+    let retained = compact(braced_block(queue, "CheckRun {"));
+    assert!(retained.starts_with("CheckRun{payload,lease_owner,completion:"));
+    for required in ["_binary:binary", "_config:config", "command:Some(command)"] {
+        assert!(
+            retained.contains(required),
+            "owned sealed state lost {required}"
+        );
+    }
+    let fields = block("struct CheckRun {");
+    for required in [
+        "payload:Option<Arc<AdmittedPayload>>",
+        "lease_owner:Option<Arc<dynSend+Sync>>",
+    ] {
+        assert!(
+            fields.contains(required),
+            "strong owner storage lost {required}"
+        );
+    }
+    assert!(compact(&code).contains("implCheckIoforNativeIo{}"));
+    let native = block("fn poll_wait(&self, child: &mut Child, cx:");
+    assert!(native.contains("letwait=child.wait();"));
+    assert!(native.contains("wait.poll(cx)"));
+    let wait = block("async fn wait_exit(");
+    assert!(wait.contains("run.poll_exit(cx).map_err(unknown)"));
+    let poll = block("fn poll_exit(");
+    assert!(poll.contains("self.io.poll_wait(child,cx)"));
+    assert!(poll.contains("self.cache_native_exit(exit,NativeExitSource::PollWait)"));
+    let validate = block("fn validate_retirement(");
+    for required in [
+        "self.lost_wait_ownership",
+        "letSome(fact)=&self.native_exitedelse",
+        "NativeExitSource::PollWait|NativeExitSource::TryWait",
+        "returnErr(unknown(",
+    ] {
+        assert!(
+            validate.contains(required),
+            "native/Unknown validation lost {required}"
+        );
+    }
+    let retire = block("fn retire(&self, request: &CheckRequestRef)");
+    let validated = retire
+        .find("run.validate_retirement()")
+        .expect("validate same Child first");
+    let terminal = retire
+        .find("run.native_terminal=validated.map(")
+        .expect("bound native terminal");
+    let removed = retire
+        .find("state.runs.remove(&request.id)")
+        .expect("retire exact original row");
+    assert!(validated < terminal && terminal < removed);
+    assert!(retire.contains("Err(error)=>{run.debt=true;returnErr(error);}"));
+    let drop = block("impl Drop for CheckRun {");
+    assert!(drop.contains("ifself.child.is_some()&&self.native_terminal.is_none()"));
+    for required in [
+        "ifletSome(owner)=self.payload.take(){std::mem::forget(owner);}",
+        "ifletSome(lease)=self.lease_owner.take(){std::mem::forget(lease);}",
+    ] {
+        assert!(
+            drop.contains(required),
+            "unconfirmed child must retain {required}"
+        );
+    }
+}
+
+#[test]
+fn sealed_check_source_requires_reference_both_owners_and_native_retirement() {
+    let source = read("crates/core-supervisor/src/config_gate/check_custody.rs");
+    assert_sealed_check_owner_custody(&source);
+    for (before, after) in [
+        ("Some(&execution)", "None"),
+        ("execution.map(PreparedExecution::payload)", "None"),
+        ("execution.and_then(PreparedExecution::lease_owner)", "None"),
+        (
+            "                payload,\n                lease_owner,",
+            "                payload: None,\n                lease_owner,",
+        ),
+        (
+            "                payload,\n                lease_owner,",
+            "                payload,\n                lease_owner: None,",
+        ),
+        (
+            "\n    payload: Option<Arc<AdmittedPayload>>,",
+            "\n    payload: Option<std::sync::Weak<AdmittedPayload>>,",
+        ),
+        ("std::mem::forget(owner)", "drop(owner)"),
+        ("std::mem::forget(lease)", "drop(lease)"),
+        ("self.io.poll_wait(child, cx)", "fake_pid_probe(child, cx)"),
+        ("run.validate_retirement()", "Ok(None)"),
+    ] {
+        assert_eq!(
+            source.matches(before).count(),
+            1,
+            "negative fixture anchor drift: {before}"
+        );
+        let bad = source.replacen(before, after, 1);
+        assert_ne!(bad, source);
+        assert!(
+            std::panic::catch_unwind(|| assert_sealed_check_owner_custody(&bad)).is_err(),
+            "missing reference/extraction/retention/native wait must fail: {before}"
         );
     }
 }
@@ -472,27 +659,47 @@ fn version_probes_do_not_create_foreign_processes() {
 
 #[test]
 fn shared_runner_suppression_guard_rejects_missing_commented_or_late_flags() {
-    let guard = GUARDED
-        .iter()
-        .find(|g| g.file == "crates/system-integration/src/exec.rs")
-        .expect("shared version runner must stay in the guarded inventory");
-    let source = read(guard.file);
-    assert_guarded_source(guard, &strip_comments(&source));
-    let flag = "builder.creation_flags(CREATE_NO_WINDOW);";
-    assert_eq!(source.matches(flag).count(), 1);
-    for mutated in [
-        source.replace(flag, ""),
-        source.replace(flag, &format!("// {flag}")),
-        source
-            .replace(flag, "")
-            .replace("builder.spawn()", &format!("builder.spawn(); {flag}")),
-        source.replace("std::process::Command::new(", "missing_constructor("),
+    for (file, flag, constructor, birth) in [
+        ("crates/system-integration/src/exec.rs", "builder.creation_flags(CREATE_NO_WINDOW);", "std::process::Command::new(", "builder.spawn()"),
+        ("crates/core-supervisor/src/config_gate/check_custody.rs", "builder.creation_flags(0x0800_0000);", "execution.command(config.is_some())?", "Self::attach_child(run, &mut builder)"),
     ] {
-        assert!(std::panic::catch_unwind(|| assert_guarded_source(
-            guard,
-            &strip_comments(&mutated)
-        ))
-        .is_err());
+        let guard = GUARDED.iter().find(|g| g.file == file).expect("actual spawn owner must stay registered");
+        let source = read(guard.file);
+        assert_guarded_source(guard, &source);
+        assert_eq!(source.matches(flag).count(), 1);
+        for mutated in [
+            source.replace(flag, ""),
+            source.replace(flag, &format!("// {flag}")),
+            source.replace(flag, "").replace(birth, &format!("{birth}; {flag}")),
+            source.replace(constructor, "missing_constructor("),
+        ] {
+            assert!(std::panic::catch_unwind(|| assert_guarded_source(
+                guard,
+                &mutated
+            ))
+            .is_err());
+        }
+    }
+
+    let source = read("crates/core-supervisor/src/config_gate/check_custody.rs");
+    let setter = "#[cfg(windows)]\n        builder.creation_flags(0x0800_0000);";
+    assert_eq!(source.matches(setter).count(), 1);
+    // Each non-code form carries both the flag and fake function anchors.
+    // The real code must survive harmless decoys and reject fake-only evidence.
+    let evidence = format!("{setter}\nfn spawn_mode(\nfn attach_child(\nfn command(&self, check: bool)");
+    for (anchor, renamed, decoy, fake_setter) in [
+        ("fn spawn_mode(", "fn unrelated_spawn_mode(", format!("/* {evidence} */"), format!("/* {setter} */")),
+        ("fn attach_child(", "fn unrelated_attach_child(", format!("let _ = \"{evidence}\";"), format!("let _ = \"{setter}\";")),
+        ("fn command(&self, check: bool)", "fn unrelated_command(&self, check: bool)", format!("let _ = r###\"{evidence}\"###;"), format!("let _ = r###\"{setter}\"###;")),
+    ] {
+        let valid = source.replacen(setter, &format!("{setter}\n        {decoy}"), 1);
+        assert_check_custody_suppression(&valid);
+        let fake_flag = source.replacen(setter, &fake_setter, 1);
+        assert!(std::panic::catch_unwind(|| assert_check_custody_suppression(&fake_flag)).is_err());
+        assert_eq!(source.matches(anchor).count(), 1);
+        let fake_anchor = source.replacen(anchor, renamed, 1)
+            .replacen(setter, &format!("{setter}\n        {decoy}"), 1);
+        assert!(std::panic::catch_unwind(|| assert_check_custody_suppression(&fake_anchor)).is_err());
     }
 }
 

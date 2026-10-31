@@ -406,7 +406,7 @@ pub(crate) fn cache_fixture_observation(path: &Path) -> CliObservation {
     entry
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 pub(crate) fn cached_cli(path: &Path) -> Option<CliObservation> {
     CLI_CACHE.observed(path)
 }
@@ -573,7 +573,6 @@ fn unsupported_capability_command(stdout: &str, stderr: &str) -> bool {
         })
 }
 async fn query_observation(entry: &CliObservation) -> QueryObservation {
-    let path = entry.path();
     let mut observed_digest = None;
     let mut retryable = true;
     let result = async {

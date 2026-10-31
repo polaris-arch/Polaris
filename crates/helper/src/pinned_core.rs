@@ -18,7 +18,7 @@ fn diagnostic_entry(
     Ok((root.into(), id.clone(), owner, core))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn cache_storage_fixture(
     root: &Path,
     id: &CoreId,

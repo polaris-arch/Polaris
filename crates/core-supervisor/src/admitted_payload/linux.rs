@@ -71,7 +71,7 @@ fn acl(file: &File) -> Result<Vec<u8>, AdmissionError> {
     let length = unsafe {
         nix::libc::fgetxattr(
             file.as_raw_fd(),
-            b"system.posix_acl_access\0".as_ptr().cast(),
+            c"system.posix_acl_access".as_ptr(),
             bytes.as_mut_ptr().cast(),
             bytes.len(),
         )

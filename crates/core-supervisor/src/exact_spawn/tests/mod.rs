@@ -91,6 +91,7 @@ fn protected_images_are_sealed_and_profile_specific() {
         LinuxInputProfile::E332935,
         LinuxInputProfile::BFCDF96,
         LinuxInputProfile::E3155C9,
+        LinuxInputProfile::LOCAL402F,
     ] {
         assert_eq!(
             inputs.validate_protection(profile),
@@ -157,6 +158,7 @@ fn reject_scripts_rules_empty_and_oversized_inputs() {
         LinuxInputProfile::E332935,
         LinuxInputProfile::BFCDF96,
         LinuxInputProfile::E3155C9,
+        LinuxInputProfile::LOCAL402F,
     ] {
         assert!(matches!(
             prepare_linux_protected_inputs(binary.clone(), b"{}".to_vec(), &[], profile, vec![]),
@@ -289,7 +291,7 @@ fn alpha124_keeps_one_check_semantics_and_distinct_actual_bytes() {
 
 #[test]
 fn alpha125_keeps_one_check_semantics_and_distinct_actual_bytes() {
-    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 10);
+    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 11);
     let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::E332935 else {
         panic!("332935 must use the fixed PlainTcpCheckV1 semantics");
     };
@@ -312,7 +314,7 @@ fn alpha125_keeps_one_check_semantics_and_distinct_actual_bytes() {
 
 #[test]
 fn alpha126_keeps_one_check_semantics_and_distinct_actual_bytes() {
-    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 10);
+    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 11);
     let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::BFCDF96 else {
         panic!("bfcdf96 must use the fixed PlainTcpCheckV1 semantics");
     };
@@ -336,7 +338,7 @@ fn alpha126_keeps_one_check_semantics_and_distinct_actual_bytes() {
 
 #[test]
 fn alpha127_keeps_one_check_semantics_and_distinct_actual_bytes() {
-    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 10);
+    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 11);
     let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::E3155C9 else {
         panic!("3155c9 must use the fixed PlainTcpCheckV1 semantics");
     };
@@ -356,6 +358,25 @@ fn alpha127_keeps_one_check_semantics_and_distinct_actual_bytes() {
         LinuxInputProfile::BFCDF96,
     ] {
         assert_ne!(LinuxInputProfile::E3155C9, historical);
+    }
+}
+
+#[test]
+fn local402f_keeps_one_check_semantics_and_distinct_exact_bytes() {
+    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 11);
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::LOCAL402F else {
+        panic!("Local402f must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "ab13ed4f270574a6ab6e7a460a865522be6d4e54e677f448e3a99bc0808bf5da"
+    );
+    for historical in &REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[..10] {
+        assert_ne!(identity.binary_sha256, historical.binary_sha256);
+        assert_ne!(
+            LinuxInputProfile::LOCAL402F,
+            LinuxInputProfile::PlainTcpCheckV1(*historical)
+        );
     }
 }
 

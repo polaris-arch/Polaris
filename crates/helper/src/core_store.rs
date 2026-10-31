@@ -410,10 +410,14 @@ impl VerifiedCore {
             .map_err(Into::into)
     }
     fn copy_with_lease(&self, lease: Option<File>) -> io::Result<Self> {
+        #[cfg(windows)]
+        let owner = self.owner.clone();
+        #[cfg(not(windows))]
+        let owner = self.owner;
         Ok(Self {
             admitted: self.admitted.clone(),
             observation: self.observation.clone(),
-            owner: self.owner.clone(),
+            owner,
             manifest: self.manifest.clone(),
             binary: self.binary.try_clone()?,
             sidecars: self
@@ -515,10 +519,13 @@ impl VerifiedCore {
         lease
             .try_lock_shared()
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let owner = OwnerPolicy { uid };
+        #[cfg(windows)]
+        let owner = StoreOwner::from(owner);
         Ok(Self {
             admitted: None,
             observation: Vec::new(),
-            owner: OwnerPolicy { uid }.into(),
+            owner,
             manifest,
             binary: binary.ok_or_else(|| invalid("fixture core absent"))?,
             sidecars,
@@ -679,13 +686,13 @@ impl CoreStore {
         mutation: &MutationLock,
         lease: &File,
     ) -> io::Result<()> {
-        if recovery_transaction::has_records(self, id)? {
-            if self.resume_under_lease(id, mutation, lease)?.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "core repair resumed; retry retirement selection",
-                ));
-            }
+        if recovery_transaction::has_records(self, id)?
+            && self.resume_under_lease(id, mutation, lease)?.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "core repair resumed; retry retirement selection",
+            ));
         }
         Ok(())
     }
@@ -807,7 +814,9 @@ impl CoreStore {
         Ok(MutationLock::new(file))
     }
     pub fn open(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
-        Self::open_scoped(root, owner.into())
+        #[cfg(windows)]
+        let owner = StoreOwner::from(owner);
+        Self::open_scoped(root, owner)
     }
     #[cfg(windows)]
     pub fn open_current_user_data(root: &Path) -> io::Result<Self> {
@@ -854,7 +863,9 @@ impl CoreStore {
 
     /// Administrative installer only. Runtime status/open never creates directories.
     pub fn initialize(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
-        Self::initialize_scoped(root, owner.into())
+        #[cfg(windows)]
+        let owner = StoreOwner::from(owner);
+        Self::initialize_scoped(root, owner)
     }
     fn initialize_scoped(root: &Path, owner: StoreOwner) -> io::Result<Self> {
         owner.check(root)?;
@@ -1118,10 +1129,14 @@ impl CoreStore {
                 ));
             }
         }
+        #[cfg(windows)]
+        let owner = self.owner.clone();
+        #[cfg(not(windows))]
+        let owner = self.owner;
         Ok(VerifiedCore {
             admitted: None,
             observation,
-            owner: self.owner.clone(),
+            owner,
             manifest,
             binary: binary.ok_or_else(|| invalid("missing binary"))?,
             sidecars,

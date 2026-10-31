@@ -40,8 +40,6 @@ pub mod token;
 pub mod transport;
 #[cfg(windows)]
 mod windows_pipe;
-#[cfg(windows)]
-mod windows_system;
 
 // 顶层便利重导出：让 `polaris_helper_client::HelperClient` 无需钻模块路径（主进程主用类型）。
 pub use client::{ClientError, Connector, HelperClient};

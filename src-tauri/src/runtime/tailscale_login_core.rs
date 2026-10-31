@@ -1290,7 +1290,7 @@ impl LoginCoreSpawner for TokioLoginCoreSpawner {
                 }
             };
             Ok(Box::new(TokioLoginCoreChild {
-                child: Some(spawned.child.into()),
+                child: Some(spawned.child),
                 reaped: false,
                 wait_identity_lost: false,
                 native_attachment: prepared.as_ref().map(PreparedTempNativeBirth::attach),
@@ -4429,6 +4429,10 @@ impl LoginCoreRegistry {
             }
         }
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep request authority, the captured main snapshot, both live observers, the optional binding and emitter independent across relay cancellation."
+    )]
     async fn confirm_main_request_inner(
         &self,
         server: &ServerConfig,

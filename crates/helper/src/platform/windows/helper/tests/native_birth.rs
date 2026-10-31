@@ -379,51 +379,77 @@ fn native_stop_wire_rejects_missing_duplicate_and_extra_identity_lines() {
     }
 }
 
+// Bound each assertion to the actual function, not a stale following comment
+// or the rest of the impl (which legitimately contains background workers).
+fn native_function_body<'a>(source: &'a str, anchor: &str) -> &'a str {
+    let code = polaris_source_probe::mask_comments_and_strings(source);
+    assert_eq!(
+        code.matches(anchor).count(),
+        1,
+        "native function anchor drifted: {anchor}"
+    );
+    let start = code.find(anchor).unwrap();
+    let open = start + code[start..].find('{').unwrap();
+    let mut depth = 0usize;
+    let end = code.as_bytes()[open..]
+        .iter()
+        .position(|byte| {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })
+        .expect("closed native function body")
+        + open;
+    &source[open..=end]
+}
+
 #[test]
 fn native_windows_wait_source_cannot_upgrade_termination_ack_or_pid_probe_into_exit() {
     let source = polaris_source_probe::crate_source!("platform/windows/winproc/win.rs");
-    let wait = source
-        .split("fn native_wait(")
-        .nth(1)
-        .unwrap()
-        .split("fn handle_alive(")
-        .next()
-        .unwrap();
+    let wait = native_function_body(&source, "fn native_wait(");
     assert!(wait.contains("WaitForSingleObject(child.handle.as_raw_handle().cast()"));
     assert!(wait.contains("WAIT_OBJECT_0 =>"));
+    assert_eq!(wait.matches("child.exit_cached = true").count(), 1);
+    assert!(
+        wait.find("WAIT_OBJECT_0 =>").unwrap() < wait.find("child.exit_cached = true").unwrap()
+    );
     assert!(wait.contains("WAIT_TIMEOUT => NativeChildPoll::Running"));
+    assert!(wait.contains("_ => NativeChildPoll::Unknown"));
     assert!(!wait.contains("OpenProcess("));
-    let stop = source
-        .split("fn stop_native_child(")
-        .nth(1)
-        .unwrap()
-        .split("fn retire_native_child(")
-        .next()
-        .unwrap();
+    let stop = native_function_body(&source, "fn stop_native_child(");
     assert!(stop.contains("terminate_handle(child.handle.as_raw_handle().cast())"));
     assert!(stop.contains("native_wait(child, 2000)"));
     assert!(!stop.contains("take_managed_handle"));
     assert!(!stop.contains("terminate_pid_raw"));
-    let spawn = source
-        .split("fn spawn_tracked(")
-        .nth(1)
-        .unwrap()
-        .split("/// ensureJob")
-        .next()
-        .unwrap();
+    let compact: String = stop.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.ends_with("native_wait(child,2000)}"),
+        "termination acknowledgement still requires the retained HANDLE wait"
+    );
+    let spawn = native_function_body(&source, "fn spawn_tracked(");
     assert!(spawn.contains("spawn_pipe_loggers_with_preopened_files_custodied("));
     assert!(spawn.contains("spawn_pipe_drainers_custodied(stdout, stderr)"));
     assert!(
         !spawn.contains("std::thread::spawn"),
         "Fresh initialization cannot be delayed beyond admission"
     );
-    let retire = source
-        .split("fn retire_native_child(")
-        .nth(1)
-        .unwrap()
-        .split("fn reap_child(")
-        .next()
-        .unwrap();
+    assert!(
+        spawn.find("spawn_windows_main(").unwrap()
+            < spawn.find("*custody = Some(ManagedChild").unwrap()
+    );
+    assert!(
+        spawn.find("*custody = Some(ManagedChild").unwrap()
+            < spawn.find("let log_custody = if let Some(files)").unwrap()
+    );
+    assert!(
+        spawn.find(".log_custody = Some(log_custody)").unwrap()
+            < spawn.find("Ok(CoreStart").unwrap()
+    );
+    let retire = native_function_body(&source, "fn retire_native_child(");
+    assert!(retire.contains("c.birth == Some(target.birth) && c.exit_cached"));
     assert!(retire.find("log_custody.revoke()").unwrap() < retire.find("*guard = None").unwrap());
 }
 

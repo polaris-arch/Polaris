@@ -26,7 +26,7 @@ impl ProxyRuntime {
     /// `log.disabled=true`，而 sing-box 见到它直接返回 `NewNOPFactory()`（`log/log.go`）—— 整个日志
     /// 工厂变空实现，`SubscribeLog` 也就永久没有任何一帧。核日志 relay 据此决定压根不订阅。
     ///
-    /// 同 [`Self::clash_api_secret`] 走 `with_current` 投影而非 `current()`：只要一个布尔，
+    /// 同 [`crate::runtime::management_api::current_clash_api_secret`] 走 `with_current` 投影而非 `current()`：只要一个布尔，
     /// 不为它 clone 整份配置。
     fn log_file_disabled(&self) -> bool {
         self.config

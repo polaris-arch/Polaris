@@ -34,7 +34,7 @@ struct ReviewedCheckIdentity {
     memfd_name: &'static str,
 }
 
-static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 10] = [
+static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 11] = [
     ReviewedCheckIdentity {
         source_commit: "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
         contract_sha256: None,
@@ -172,6 +172,21 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 10] = [
         #[cfg(all(test,target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-3155c9",
     },
+    // Genuine Local402f/37ede source-bound producer proof qualifies these exact
+    // bytes for the same check semantics. Only the independently compiled Local
+    // selection can supply this source/contract pair; it is not Formal3155
+    // admission, a new execution purpose, or evidence of this App check passing.
+    ReviewedCheckIdentity {
+        source_commit: "402f855858cead86d2ded3134a3bc77dfb0e4e26",
+        contract_sha256: Some("9773e2d7626275e91c5ee1d5dcb9e8b1413600f36e01e87465babaf084c7d3a3"),
+        evidence_label: "linux-x86_64-local402f:app-check-evidence-pending:env-empty:cwd-root:sealed-fd0:--disable-color check -c /proc/self/fd/0",
+        #[cfg(target_os = "linux")]
+        binary_sha256: "ab13ed4f270574a6ab6e7a460a865522be6d4e54e677f448e3a99bc0808bf5da",
+        #[cfg(target_os = "linux")]
+        input_profile: LinuxInputProfile::LOCAL402F,
+        #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+        memfd_name: "polaris-strict-check-local402f",
+    },
 ];
 
 /// Check/preparation identity only. The private rows cannot be constructed from
@@ -200,6 +215,8 @@ impl LinuxCheckProfile {
     pub(super) const BFCDF96: Self = Self(&REVIEWED_CHECK_IDENTITIES[8]);
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     pub(super) const E3155C9: Self = Self(&REVIEWED_CHECK_IDENTITIES[9]);
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    pub(super) const LOCAL402F: Self = Self(&REVIEWED_CHECK_IDENTITIES[10]);
 
     pub(super) const fn execution_profile(self) -> &'static str {
         self.0.evidence_label

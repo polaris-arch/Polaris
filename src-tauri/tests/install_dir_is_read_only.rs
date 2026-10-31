@@ -35,7 +35,7 @@
 //! # 本门**不**声称什么（诚实边界）
 //!
 //! 它守的是「解析安装目录的函数自己不写」。把解析结果 `return` 出去、由**另一个**函数写进去，
-//! 本门看不见（那需要跨函数数据流）。真正兜住那一格的是登记表本身：14 条里每一条都写明了产物
+//! 本门看不见（那需要跨函数数据流）。真正兜住那一格的是登记表本身：每一条都写明了产物
 //! 交给谁、只读在哪一句上成立，新增入口必须在这里补一条同样的说明。
 
 use std::collections::BTreeSet;
@@ -70,7 +70,17 @@ const WRITE_FORMS: [&str; 14] = [
 ///
 /// 每条都必须命中至少一个探针；命中 0 次 ⇒ 它守的东西已经没了，条目本身会变成将来某个真违规的
 /// 免死金牌，故当场红。
-const REGISTRY: [(&str, &str, &str); 14] = [
+const REGISTRY: [(&str, &str, &str); 17] = [
+    (
+        "runtime/helper.rs",
+        "resolve_recovery_helper_binary",
+        "显式冷恢复只读取当前 App exe 与 bundle_resource_roots；第一实际 package 的 Helper 路径交给严格归档 stager，缺失/坏对象不回退其它来源。这里只解析与 stat，恢复落点由独立 user_store installer 写用户目录。",
+    ),
+    (
+        "runtime/proxy/core_binary.rs",
+        "resolve_core_candidate_observation",
+        "只读当前 App exe，拼随包候选并核 selected_at 的原恢复 receipt；坏 receipt/slot 明确拒绝，绝不重写安装目录或以 bundle 掩盖损坏用户数据。",
+    ),
     (
         "test_support.rs",
         "ran_in_isolated_worker",
@@ -128,6 +138,11 @@ const REGISTRY: [(&str, &str, &str); 14] = [
         "runtime/proxy/core_binary.rs",
         "first_existing_bundle_candidate",
         "候选表里取第一个真实存在的：只 stat，不创建。",
+    ),
+    (
+        "runtime/proxy/core_binary.rs",
+        "candidate_with_recovery",
+        "只选择已解析候选：recovered 错误原样拒绝，存在恢复候选则直接返回；否则 first_existing_bundle_candidate 仅 is_file 并返回数据 observation。执行由消费者独立 admission，恢复写入独立用户目录，不改写随包目录。",
     ),
     (
         "runtime/proxy/core_binary.rs",

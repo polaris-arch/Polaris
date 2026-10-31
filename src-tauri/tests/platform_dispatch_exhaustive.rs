@@ -1533,6 +1533,12 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    ("crates/core-supervisor/src/admitted_payload.rs", "if !matches!(platform, \"linux\" | \"win\" | \"mac-arm64\" | \"mac-x64\")", 1,
+     "SelectedPolicy::declaration has a closed four-desktop-row vocabulary. iOS/Android/new platforms reject before loader/purpose or physical admission; this does not authorize Windows or Mac execution."),
+    ("crates/core-supervisor/src/admitted_payload.rs", "if platform == \"linux\" && loader != \"linux-sealed-fd-v1\"", 1,
+     "The recognized Linux row additionally requires its exact sealed-fd loader. Other accepted rows retain their own platform admission; unknown/mobile rows have already failed the closed platform vocabulary."),
+    ("crates/core-supervisor/src/selected_core/development.rs", "if platform != \"linux\"", 1,
+     "The explicit compile-time local-development lane supports Linux only. Windows/Mac/mobile/unknown cannot consume local receipts or acquire Formal/purpose authority; the ordinary default lane is unchanged."),
     ("crates/helper/src/linux_legacy_maintenance.rs", "require( selected.id == request.id && selected.core.platform == \"linux\" && selected.core.helper_sha256.as_deref() == Some(request.helper_sha.as_str()), \"selected manifest/pin differs\", )?", 1,
      "The Linux-only sealed dispatcher admits only the exact selected Linux manifest and actual current utility hash. Mac/Windows/mobile/unknown manifests fail before Core installation and cannot acquire a Linux service activation destination."),
     ("src-tauri/src/runtime/core_identity.rs", "if !matches!(platform, \"linux\" | \"mac-arm64\" | \"mac-x64\") || selected.platform != platform || !helper.is_absolute() || helper.file_name().and_then(|name| name.to_str()) != Some(\"polaris-helper\")", 1,
@@ -2384,6 +2390,17 @@ enum IosSide {
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
     (
+        "src-tauri/src/runtime/proxy/management_api.rs",
+        "all(test, not(target_os = \"ios\"))",
+        2,
+        IosSide::WithAndroid,
+        "management_api_at and readback_endpoint are host-test adapters for captured endpoint/secret and ticket projections. With test=false both mobile release/debug exclude them; their test callers do not create an iOS native receipt or change production admission.",
+    ),
+    ("src-tauri/src/runtime/proxy/prerequisite.rs", "all(test, not(target_os = \"ios\"))", 1, IosSide::WithAndroid,
+     "ready_api_commit_fixture_for_test adds only an owned TestDir node/config/generated Ready fixture. test=false means both mobile release/debug exclude it; it cannot produce a platform native receipt."),
+    ("src-tauri/src/runtime/proxy/startup.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 1, IosSide::WithAndroid,
+     "startup_cli_observation owns the existing desktop CLI proof read; both mobile platforms keep their original bridge/capability paths and cannot obtain desktop Prepared execution from a test cache fixture."),
+    (
         "src-tauri/src/runtime/proxy/startup.rs",
         "not(any(target_os = \"android\", target_os = \"ios\"))",
         5,
@@ -2409,13 +2426,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         4,
         IosSide::WithAndroid,
         "Desktop CLI observation acquisition, snapshot selection, per-iteration retained-proof validation and the proof validator exclude both mobile platforms. Actual file replacement still fails; bounded-cache eviction does not invalidate retained evidence.",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
-        "any(target_os = \"linux\", target_os = \"android\", target_os = \"ios\")",
-        2,
-        IosSide::WithAndroid,
-        "The Path import and capabilities-for helper remain used by Linux and both mobile callers; macOS/Windows now consume retained CLI observations directly. Android and iOS both compile their native capability branch, not a desktop process proof.",
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",
@@ -2459,7 +2469,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "not(any(target_os = \"android\", target_os = \"ios\"))",
         1,
         IosSide::WithAndroid,
-        "tls_ready_binary_for_pid derives desktop retained Child/helper CLI identity. Neither mobile platform may use a pathname/PID as proof of a loaded native container.",
+        "tls_capability_selection resolves the desktop selected candidate before TlsInventory admission. Neither mobile platform may use a pathname/PID as proof of a loaded native container.",
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",
@@ -2817,10 +2827,10 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/stats/source.rs",
         "not(target_os = \"android\")",
-        12,
+        15,
         IosSide::DiffersWrongToday,
         "🔴 上一条的孪生侧，含 `use polaris_singbox_grpc::{…}` 这条**导入**。\
-         iOS 落这一侧 ⇒ 编译期就会把整套 gRPC 客户端拖进 iOS 编译单元。同上，本批不改。",
+         iOS 落这一侧 ⇒ 编译期就会把整套 gRPC 客户端拖进 iOS 编译单元。新增3点为 relay_cancelled/ApiRelayBorrow 导入及 ConnectionsStream/StatusStream 的 api_borrow 字段，保持同一传输和取消边界；不因此宣称 iOS 供数已实现。同上，本批不改。",
     ),
     (
         "src-tauri/src/runtime/stats/source.rs",
@@ -4000,9 +4010,29 @@ fn independent_check_admission_excludes_ios_ne_but_retains_desktop_gate() {
             "{os} lost the check admission gate"
         );
     }
-    assert!(body[call..].contains("run_config_check("));
-    assert!(body[call..].contains("core_identity::prepare("));
-    assert!(body[call..].contains("ExecPurpose::CheckConfig"));
+    assert!(body[call..].contains("self.startup_config_check(bin, config_path).await?"));
+    // Delegation keeps the real default path behind the sole admitted
+    // CheckConfig factory. Test-only data verdicts cannot issue execution.
+    let anchor = "pub(super) async fn startup_config_check(";
+    assert_eq!(code.matches(anchor).count(), 1);
+    let at = code.find(anchor).unwrap();
+    let open = at + code[at..].find('{').unwrap();
+    let end = balanced_end(&code, open).unwrap();
+    let check = &code[open + 1..end];
+    assert_eq!(check.matches("run_config_check(").count(), 1);
+    assert_eq!(
+        check
+            .matches("crate::runtime::core_identity::prepare(")
+            .count(),
+        1
+    );
+    assert!(check.contains("crate::runtime::core_identity::ExecPurpose::CheckConfig"));
+    assert!(
+        check.find("run_config_check(").unwrap()
+            < check
+                .find("crate::runtime::core_identity::prepare(")
+                .unwrap()
+    );
     assert!(code.contains("polaris_core_supervisor::settle_check_cleanup()"));
 }
 
@@ -4294,17 +4324,24 @@ fn cfg_axis_platform_dispatch_is_registered() {
 // individually registered WithAndroid. Shared status platform projection removed
 // one duplicate Android reconnect branch (the existing Undecided group 8 -> 7)
 // and added one non-Android no-op projection (Right). No surviving debt is reclassified.
+// Reconcile each actual source group, without changing any verdict:
+// stats/source.rs already registers 15 non-Android sites (12 legacy + the
+// ApiRelayBorrow import and two stream borrower fields); its named debt was 12.
+// Existing prerequisite/startup rows add two WithAndroid sites. Register the
+// two management test adapters and retire two absent TLS attributes (Path and
+// capabilities-for are now unconditional); those last changes cancel in count.
+// No existing iOS debt is repaid, and no iOS runtime evidence is claimed.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
     ("DiffersRight", 337),
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
-    ("DiffersWrongToday", 145),
+    ("DiffersWrongToday", 148),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
     // checked by eval_cfg for Android/iOS in both release/debug. No existing
     // verdict or debt site changes; this does not claim device validation.
-    ("WithAndroid", 135),
+    ("WithAndroid", 137),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -4436,7 +4473,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/stats/source.rs",
         "not(target_os = \"android\")",
-        12,
+        15,
     ),
     (
         "src-tauri/src/runtime/stats/source.rs",

@@ -26,6 +26,166 @@ use polaris_source_probe::{mask_comments, mask_comments_and_strings, repo_dir_fi
 
 const HELPER: &str = "crates/config-engine/tests/support/kernel_run.rs";
 
+// These two existing native fixtures accept core-shaped argv but cannot execute
+// a real Core: one owns a fixed printf shell body on Linux, one copies Cargo's
+// argv_probe PE on Windows. File/function/count and physical source stay exact.
+const INERT_RUNS: &[(&str, &str, &str)] = &[
+    (
+        "crates/core-supervisor/src/admitted_payload/tests/mod.rs",
+        "prepared_factory_executes_sealed_original_after_namespace_race",
+        "Linux test-only fixed printf script; one run-shaped argument call",
+    ),
+    (
+        "crates/core-supervisor/tests/windows_process.rs",
+        "spawn_core_shaped",
+        "Windows-only Cargo argv_probe PE copied into owned Tree; one run-shaped argument call",
+    ),
+];
+
+fn function_span(source: &str, name: &str) -> std::ops::RangeInclusive<usize> {
+    let code = mask_comments_and_strings(source);
+    let anchor = format!("fn {name}(");
+    assert_eq!(
+        code.matches(&anchor).count(),
+        1,
+        "inert fixture owner drift: {name}"
+    );
+    let start = code.find(&anchor).unwrap();
+    let open = start + code[start..].find('{').unwrap();
+    let mut depth = 0usize;
+    let end = code.as_bytes()[open..]
+        .iter()
+        .position(|byte| {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })
+        .expect("closed inert fixture owner")
+        + open;
+    start..=end
+}
+
+fn inert_run_lines(rel: &str, source: &str) -> Vec<usize> {
+    let mut allowed = Vec::new();
+    let code = mask_comments_and_strings(source);
+    let literals = mask_comments(source);
+    assert_eq!(
+        code.len(),
+        source.len(),
+        "inert code offsets must remain exact"
+    );
+    assert_eq!(
+        literals.len(),
+        source.len(),
+        "inert literal offsets must remain exact"
+    );
+    for (file, name, why) in INERT_RUNS.iter().filter(|(file, _, _)| *file == rel) {
+        assert!(!why.is_empty(), "{file}: missing platform/source reason");
+        let span = function_span(source, name);
+        let body = &code[span.clone()];
+        let body_literals = &literals[span.clone()];
+        if *name == "prepared_factory_executes_sealed_original_after_namespace_race" {
+            let binding = "let payload = fixture(";
+            assert_eq!(body.matches(binding).count(), 1);
+            let open = body.find(binding).unwrap() + binding.len() - 1;
+            let close = match_paren(body.as_bytes(), open).expect("closed actual fixture call");
+            let comma = open
+                + 1
+                + body[open + 1..close]
+                    .find(',')
+                    .expect("fixture first argument");
+            assert_eq!(
+                body_literals[open + 1..comma].trim(),
+                r##"b"#!/bin/sh\nprintf 'original:%s:%s:%s' \"$1\" \"$2\" \"$3\"\n""##,
+                "only the actual fixture first argument can prove inert source"
+            );
+            assert_eq!(
+                body[comma..close].split_whitespace().collect::<String>(),
+                ",vec![ExecPurpose::RunMain],"
+            );
+            let mut previous = open;
+            for wiring in [
+                "let execution = payload.prepare(ExecPurpose::RunMain).unwrap();",
+                "let mut command = execution.command().unwrap();",
+                "command.args(",
+            ] {
+                assert_eq!(
+                    body.matches(wiring).count(),
+                    1,
+                    "actual inert payload/command chain: {wiring}"
+                );
+                let at = body.find(wiring).unwrap();
+                assert!(
+                    at > previous,
+                    "inert source must precede its execution/command/run call"
+                );
+                previous = at;
+            }
+        } else {
+            assert!(code.contains("#![cfg(windows)]"));
+            let binding = "const PROBE: &str = env!(";
+            assert_eq!(
+                code.matches(binding).count(),
+                1,
+                "one actual Cargo probe declaration"
+            );
+            let open = code.find(binding).unwrap() + binding.len() - 1;
+            let close = match_paren(code.as_bytes(), open).expect("actual Cargo env macro");
+            assert_eq!(
+                literals[open + 1..close].trim(),
+                "\"CARGO_BIN_EXE_argv_probe\"",
+                "the actual PROBE initializer must name Cargo's inert argv_probe"
+            );
+            assert_eq!(code.matches("spawn_core_shaped(").count(), 3);
+            assert_eq!(
+                body.matches("tokio::process::Command::new(binary)").count(),
+                1
+            );
+            let caller = &code[function_span(
+                source,
+                "the_scan_reads_real_command_lines_and_selects_only_our_shape",
+            )];
+            assert_eq!(caller.matches("std::fs::copy(").count(), 1);
+            let mut previous = None;
+            for wiring in [
+                "std::fs::copy(PROBE, &binary)",
+                "spawn_core_shaped(&binary, &ours_config)",
+                "spawn_core_shaped(&binary, &foreign_config)",
+                "child.child.wait().await",
+            ] {
+                assert_eq!(
+                    caller.matches(wiring).count(),
+                    1,
+                    "actual inert PE source/caller: {wiring}"
+                );
+                let at = caller.find(wiring).unwrap();
+                assert!(
+                    previous.is_none_or(|old| at > old),
+                    "copy must precede both spawns and native wait"
+                );
+                previous = Some(at);
+            }
+        }
+        // An environment-selected Core cannot borrow either fixed fixture proof.
+        assert!(!literals.contains("POLARIS_SINGBOX_PATH"));
+        let sites = run_sites(&source[span.clone()]);
+        assert_eq!(
+            sites.len(),
+            1,
+            "{file}::{name}: exact inert run count changed"
+        );
+        allowed.extend(
+            sites
+                .into_iter()
+                .map(|line| line_of(source, *span.start()) + line - 1),
+        );
+    }
+    allowed
+}
+
 /// `open` 处是 `(`，返回配对的 `)` 偏移（输入须是已抹字面量/注释的纯代码面）。
 fn match_paren(code: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
@@ -103,10 +263,12 @@ fn every_kernel_run_in_test_sources_goes_through_the_helper() {
     let mut helper_sites = Vec::new();
     let mut bypasses = Vec::new();
     for (rel, src) in &face {
-        let sites = run_sites(src);
+        let mut sites = run_sites(src);
         if rel == HELPER {
             helper_sites = sites;
         } else {
+            let inert = inert_run_lines(rel, src);
+            sites.retain(|line| !inert.contains(line));
             bypasses.extend(sites.into_iter().map(|l| format!("  · {rel}:{l}")));
         }
     }
@@ -116,6 +278,17 @@ fn every_kernel_run_in_test_sources_goes_through_the_helper() {
         1,
         "{HELPER} 里应恰有 1 处拼 run 的调用（with_run），实测 {helper_sites:?}"
     );
+    let linux_owner = read_repo("crates/core-supervisor/src/admitted_payload.rs");
+    assert!(
+        linux_owner.contains("#[cfg(all(test, target_os = \"linux\"))]\npub(crate) fn fixture(")
+    );
+    assert!(linux_owner.contains("#[cfg(all(test, target_os = \"linux\"))]\nmod tests;"));
+    for (file, _, _) in INERT_RUNS {
+        assert!(
+            face.iter().any(|(rel, _)| rel == file),
+            "missing exact inert fixture file"
+        );
+    }
     assert!(
         bypasses.is_empty(),
         "测试源码里出现了绕过 kernel_run::with_run 的 `run` 子命令拼接 —— 本机禁起核（POLARIS_NO_KERNEL_RUN=1）\
@@ -416,4 +589,82 @@ c.args([
 d.arg(if paren(1) { "run" } else { "check" });
 "####;
     assert_eq!(run_sites(src), vec![10, 11, 12, 16]);
+    // An unknown file has no allowance, even with the same function name;
+    // adding a real run outside a registered body remains unregistered.
+    let rel = INERT_RUNS[0].0;
+    let actual = read_repo(rel);
+    let allowed = inert_run_lines(rel, &actual);
+    assert_eq!(allowed.len(), 1);
+    assert!(inert_run_lines("unregistered/tests/new.rs", &actual).is_empty());
+    let injected = format!("{actual}\nfn unregistered_core() {{ cmd.arg(\"run\"); }}\n");
+    let known = inert_run_lines(rel, &injected);
+    assert_eq!(
+        run_sites(&injected)
+            .iter()
+            .filter(|line| !known.contains(line))
+            .count(),
+        1
+    );
+    assert!(
+        std::panic::catch_unwind(|| inert_run_lines(
+            rel,
+            &actual.replace("let payload = fixture(", "let payload = real_core(")
+        ))
+        .is_err(),
+        "a real/foreign producer cannot reuse the fixture allowance"
+    );
+}
+
+#[test]
+fn inert_run_allowances_reject_comment_and_literal_source_substitutions() {
+    let (linux, owner, _) = INERT_RUNS[0];
+    let actual = read_repo(linux);
+    let fixed = r##"b"#!/bin/sh\nprintf 'original:%s:%s:%s' \"$1\" \"$2\" \"$3\"\n""##;
+    let changed = actual.replace(fixed, r##"b"#!/bin/sh\nexec foreign-core \"$@\"\n""##);
+    assert_ne!(changed, actual);
+    for bad in [
+        format!("/* {fixed} */\n{changed}"),
+        format!("const UNRELATED: &[u8] = {fixed};\n{changed}"),
+        actual.replace("let execution = payload.prepare(ExecPurpose::RunMain).unwrap();",
+            "/* let execution = payload.prepare(ExecPurpose::RunMain).unwrap(); */ let execution = foreign.prepare(ExecPurpose::RunMain).unwrap();"),
+        actual.replace("let mut command = execution.command().unwrap();",
+            "let _ = \"let mut command = execution.command().unwrap();\"; let mut command = foreign.command().unwrap();"),
+        format!("{actual}\n{}", &actual[function_span(&actual, owner)]),
+        format!("const DECOY: &str = r####\"{}\"####;\n{}",
+            &actual[function_span(&actual, owner)], actual.replace(&format!("fn {owner}("), "fn renamed_owner(")),
+    ] {
+        assert_ne!(bad, actual);
+        assert!(std::panic::catch_unwind(|| inert_run_lines(linux, &bad)).is_err(),
+            "comments/unrelated literals/duplicate functions cannot retain an inert allowance");
+    }
+    let windows = INERT_RUNS[1].0;
+    let actual = read_repo(windows);
+    assert_eq!(inert_run_lines(windows, &actual).len(), 1);
+    for (before, after) in [
+        (
+            "std::fs::copy(PROBE, &binary)",
+            "/* std::fs::copy(PROBE, &binary) */ std::fs::copy(FOREIGN, &binary)",
+        ),
+        (
+            "std::fs::copy(PROBE, &binary)",
+            "{ let _ = \"std::fs::copy(PROBE, &binary)\"; std::fs::copy(FOREIGN, &binary) }",
+        ),
+        (
+            "env!(\"CARGO_BIN_EXE_argv_probe\")",
+            "env!(\"CARGO_BIN_EXE_real_core\") /* env!(\"CARGO_BIN_EXE_argv_probe\") */",
+        ),
+        (
+            "tokio::process::Command::new(binary)",
+            "tokio::process::Command::new(foreign) /* tokio::process::Command::new(binary) */",
+        ),
+        (
+            "child.child.wait().await",
+            "pid_probe() /* child.child.wait().await */",
+        ),
+    ] {
+        let bad = actual.replace(before, after);
+        assert_ne!(bad, actual);
+        assert!(std::panic::catch_unwind(|| inert_run_lines(windows, &bad)).is_err(),
+            "only actual Cargo probe/copy/command/native-wait wiring can prove inert Windows source");
+    }
 }

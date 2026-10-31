@@ -6,7 +6,6 @@ use futures::StreamExt;
 use polaris_singbox_grpc::tonic::{self, codegen::http, Request, Response, Status};
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-use tonic::codegen::Service as _;
 
 struct PeerState {
     old_bearers: AtomicUsize,

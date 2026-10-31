@@ -1,7 +1,7 @@
 // Tiny local Git objects and a fake compiler prove contract wiring, never a kernel verdict.
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, desktopSourceManifest
   platformSourceIdentity, desktopSourceGoVersion, observeMacCodeSignature, validateMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt, validateForkNotice, sourceOwnedReplacements, validateBuildInfo, verifySourceOwnedCheckout, producerContext } from './source-graph.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
+const python = process.platform === 'win32' ? 'python' : 'python3';
 const candidate = 'c'.repeat(40);
 const forkURL = 'https://github.com/polaris-arch/sing-box-polaris';
 const upstreamURL = 'https://github.com/SagerNet/sing-box.git';
@@ -26,6 +27,7 @@ function fixture(owned = false) {
     const upstreamRepository = join(root, 'upstream-objects');
     mkdirSync(upstreamRepository);
     git(upstreamRepository, 'init', '--quiet');
+    git(upstreamRepository, 'config', 'core.autocrlf', 'false');
     write(join(upstreamRepository, 'go.mod'), owned ? 'module github.com/sagernet/sing-box\n\ngo 1.25.5\n' : 'module example.com/fork-fixture\n\ngo 1.25.5\n');
     write(join(upstreamRepository, 'go.sum'), '');
     // Match alpha.11: the shared default no longer includes gvisor.
@@ -38,6 +40,8 @@ function fixture(owned = false) {
     const upstreamCommit = git(upstreamRepository, 'rev-parse', 'HEAD');
     const repository = join(root, 'objects');
     git(root, 'clone', '--quiet', '--no-hardlinks', upstreamRepository, repository);
+    git(repository, 'config', 'core.autocrlf', 'false');
+    git(repository, 'reset', '--hard', '--quiet', 'HEAD');
     git(repository, 'tag', '-d', 'v1.0.0');
     write(join(repository, 'fork-fixture.txt'), 'synthetic reviewed desktop change\n');
     if (owned) {
@@ -68,7 +72,7 @@ function fixture(owned = false) {
     const provider = join(root, 'scripts/core-source-provision.py');
     mkdirSync(dirname(provider), { recursive: true });
     copyFileSync(join(repo, 'scripts/core-source-provision.py'), provider);
-    const receipt = JSON.parse(execFileSync('python3', ['-B', provider, '--manifest', sourcePath,
+    const receipt = JSON.parse(execFileSync(python, ['-B', provider, '--manifest', sourcePath,
       '--source', repository, '--checkout', join(root, 'initial-checkout')], { encoding: 'utf8', stdio: 'pipe' }));
     const spec = { sourceMode: 'fork-commit-v1', upstreamVersion: '1.0.0', graphScope: 'core-source-only',
       mainGoModSha256: receipt.mainGoModSha256, mainGoSumSha256: receipt.mainGoSumSha256, sourceManifestSha256: receipt.sourceManifestSha256,
@@ -116,7 +120,7 @@ function runner(f, key, mutate = {}) {
       return execFileSync(command, localArgs, { ...options, encoding: 'utf8', stdio: 'pipe' });
     }
     if (args[0]?.endsWith('core-source-provision.py')) {
-      return execFileSync('python3', ['-B', ...args], { ...options, encoding: 'utf8', stdio: 'pipe' });
+      return execFileSync(python, ['-B', ...args], { ...options, encoding: 'utf8', stdio: 'pipe' });
     }
     if (args[0] === 'env') return '/synthetic-go';
     if (args[0] === 'version' && args.length === 1) return 'go version go1.25.5 linux/amd64';
@@ -294,9 +298,19 @@ test('actual five workflow Go pin commands reject wrong source bytes, mobile rol
       write(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify(f.manifest));
       for (const { command } of commands) {
         write(output, '');
-        const result = spawnSync('bash', ['-c', command], {
-          cwd: f.root, encoding: 'utf8', env: { ...process.env, GITHUB_OUTPUT: output },
-        });
+        const options = { cwd: f.root, encoding: 'utf8', env: { ...process.env, GITHUB_OUTPUT: output } };
+        let result;
+        if (process.platform === 'win32') {
+          // Execute exactly the checked-in Node argv and append redirection;
+          // a WSL launcher named bash is not a native Windows shell dependency.
+          const match = /^node --input-type=module -e '([^']+)' >> "\$GITHUB_OUTPUT"$/.exec(command);
+          assert.ok(match, 'workflow Node argv/redirection must remain explicit');
+          const fd = openSync(output, 'a');
+          try { result = spawnSync(process.execPath, ['--input-type=module', '-e', match[1]],
+            { ...options, stdio: ['ignore', fd, 'pipe'] }); }
+          finally { closeSync(fd); }
+        } else result = spawnSync('bash', ['-c', command], options);
+        assert.ifError(result.error);
         if (accepted) {
           assert.equal(result.status, 0, result.stderr);
           assert.equal(readFileSync(output, 'utf8'), 'version=1.25.5\n');

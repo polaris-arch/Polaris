@@ -972,10 +972,17 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(run).toContain('require(process.returncode == 0,');
     // Parse the actual handler and binding; aliases/indentation do not decide
     // whether cleanup preserves and rethrows the primary exception.
+    // Keep the serialized request in an owned regular file: the synchronous
+    // probe must not depend on pipe EOF delivery. AST checks and mutations stay identical.
+    const policyFixture = mkdtempSync(join(tmpdir(), 'polaris-apple-policy-'));
+    onTestFinished(() => rmSync(policyFixture, { recursive: true, force: true }));
+    const policyRequest = join(policyFixture, 'request.json');
     const primaryPolicy = (mutation = '') => {
+      writeFileSync(policyRequest, JSON.stringify({ source: producer, mutation }));
       const result = spawnSync('python3', ['-c', `
 import ast,json,sys
-request=json.load(sys.stdin)
+with open(sys.argv[1],encoding='utf-8') as request_file:
+ request=json.load(request_file)
 tree=ast.parse(request['source'])
 function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run')
 # Select the lifecycle try itself, not the first exception handler in run.
@@ -1027,7 +1034,7 @@ replacement=any(isinstance(n,ast.Raise) and n.exc is not None for n in ast.walk(
 bound=len(notes)==1 and isinstance(notes[0].args[0],ast.Name) and notes[0].args[0].id==handler.name
 print(json.dumps({'valid':bare and not replacement and bound,
                  'bareReraise':bare,'replacementRaise':replacement,'noteBoundToPrimary':bound}))
-`], { input: JSON.stringify({ source: producer, mutation }), encoding: 'utf8' });
+`, policyRequest], { encoding: 'utf8', timeout: 5_000 });
       expect(result.status, result.stderr).toBe(0);
       return JSON.parse(result.stdout);
     };

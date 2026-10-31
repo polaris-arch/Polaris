@@ -56,6 +56,26 @@ enum Kind {
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 不执行或仅 Windows 执行的具体理由)`。
 const REGISTERED: &[(&str, Kind, usize, &str)] = &[
+    ("crates/core-supervisor/src/admitted_payload/macos/tests/mod.rs", Kind::ExecBit, 1,
+        "macOS-only Temp::new/impl Temp: DirBuilder.mode(0700) seals a private directory, never an executable file"),
+    ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", Kind::ExecBit, 1,
+        "Linux-only sealed_members_keep_required_access_after_helper_uid_drop_and_mode_change_invalidates chmods its existing sealed object0500. The separate permission-failure control uses mode0 and grants no execute bit. Each exact owner/count is checked below."),
+    ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", Kind::Shebang, 33,
+        "Linux-only admitted fixture inputs and stale-source replacement bytes: execution uses the protected sealed memfd, never the written source pathname. The existing fixture/command chain is checked below."),
+    ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", Kind::Copy, 1,
+        "replaced_parent_directory_cannot_issue_the_prior_cohort copies stale namespace members, then requires both currentness and prepare refusal; the replacements are never executed."),
+    ("crates/core-supervisor/src/config_gate/check_custody/tests/mod.rs", Kind::Shebang, 4,
+        "Two caller-budget inputs, one fixed-argv input and one cancellation input use the same private admitted Linux fixture; only its sealed memfd is executed, not a written path."),
+    ("crates/config-engine/tests/kernel_run_single_entry.rs", Kind::Shebang, 3,
+        "Exact source-literal assertions and their foreign-producer mutation: strings are compared as source, never written as executable files."),
+    ("crates/core-supervisor/src/admitted_payload/windows/tests/mod.rs", Kind::Copy, 4,
+        "Windows-only: one test-PE copy is mapped/observed without execution; case copies an inert compiled EXE/DLL and the late-local control copies a DLL. Opt-in native image tests execute only these owned PE fixtures after copy returns; no Unix fork/write-fd window or production admission."),
+    ("crates/core-supervisor/src/admitted_payload/windows/issuer/spawn/tests/mod.rs", Kind::Copy, 1,
+        "Windows-only native_case copies its compiled inert PE before create_suspended, then owns the job and waits for the actual process handle; copy has already closed its writer and grants no production admission."),
+    ("crates/updater/src/core_recovery/tests/mod.rs", Kind::Shebang, 1,
+        "mac_style_static_payload_has_no_invented_sidecar_and_no_execution archives inert payload bytes and asserts its execution marker remains absent; the staged payload is never executed."),
+    ("src-tauri/src/runtime/tls_fingerprints/tests/mod.rs", Kind::Shebang, 1,
+        "app_business_observation_fixture_cannot_reach_the_native_query_factory writes bytes without execute bits, requires inventory_execution refusal and no query document, and asserts its execution marker remains absent. The other two shebangs already use the shared writer."),
     ("crates/helper-client/src/manager/tests/mod.rs", Kind::Shebang, 3,
      "Three complete Linux producer parity cases retain their shared sh/bash prefix assertions; the additional explicit legacy envelope prefix is also an inert string assertion. Actual script custody/mode/held-unlink checks remain unchanged and none executes a stand-in."),
     ("crates/windows-cleaner/src/windows/install/tests/mod.rs", Kind::Copy, 1,
@@ -336,6 +356,32 @@ fn violations(files: &[(String, String)], registered: &[(&str, Kind, usize, &str
 #[test]
 fn test_code_drops_executables_only_through_the_shared_helper() {
     let files = scan_surface();
+    // These are metadata controls, not file writers. Bind the file totals to
+    // their exact owners so moving a chmod to an executable writer stays red.
+    for (file, anchor, expected_exec_bits) in [
+        ("crates/core-supervisor/src/admitted_payload/macos/tests/mod.rs", "impl Temp {", 1),
+        ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", "fn sealed_members_keep_required_access_after_helper_uid_drop_and_mode_change_invalidates(", 1),
+        ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", "fn permission_failure_remains_environment_io_without_a_reinstall_promise(", 0),
+    ] {
+        let source = &files.iter().find(|(rel, _)| rel == file).expect("exact permission-control file").1;
+        let syntax = polaris_source_probe::mask_comments_and_strings(source);
+        assert_eq!(syntax.matches(anchor).count(), 1);
+        let start = syntax.find(anchor).unwrap();
+        let open = start + syntax[start..].find('{').unwrap();
+        let mut depth = 0usize;
+        let end = syntax.as_bytes()[open..].iter().position(|byte| {
+            match byte { b'{' => depth += 1, b'}' => depth -= 1, _ => {} }
+            depth == 0
+        }).expect("closed permission-control body") + open;
+        assert_eq!(hits(&source[start..=end]).iter().filter(|(kind, _)| *kind == Kind::ExecBit).count(), expected_exec_bits, "{file}: {anchor}");
+        if anchor == "impl Temp {" {
+            assert!(source[start..=end].contains("std::fs::DirBuilder::new()"));
+            assert!(!syntax[start..=end].contains("Command::"));
+        } else {
+            assert!(!syntax[start..=end].contains(".spawn("));
+            assert!(!syntax[start..=end].contains(".output("));
+        }
+    }
     let problems = violations(&files, REGISTERED);
     assert!(
         problems.is_empty(),
@@ -479,6 +525,30 @@ fn the_scan_surface_and_the_helper_are_what_the_gate_assumes() {
     let code = polaris_source_probe::mask_comments_and_strings(&windows);
     let compact: String = code.split_whitespace().collect();
     assert!(compact.contains("pub(crate)modinstall;") && compact.contains("modsweep;"));
+
+    // The admitted fixture's disk bytes are inputs to sealed-object protection,
+    // not executable path stand-ins. Pin that actual factory and Linux command.
+    let admitted = polaris_source_probe::repo_file!("crates/core-supervisor/src/admitted_payload.rs");
+    assert!(windows_only(&admitted));
+    assert!(admitted.contains("#[cfg(all(test, target_os = \"linux\"))]\npub(crate) fn fixture("));
+    let admitted_code = polaris_source_probe::mask_comments_and_strings(&admitted);
+    let anchor = "pub(crate) fn fixture(";
+    assert_eq!(admitted_code.matches(anchor).count(), 1);
+    let fixture = admitted_code.split(anchor).nth(1).unwrap().split("\n}\n").next().unwrap();
+    assert!(fixture.contains("platform::protect_members(&candidate, &policy)"));
+    assert!(fixture.contains("protected,"));
+    assert!(!fixture.contains("Command::"));
+    let linux = polaris_source_probe::repo_file!("crates/core-supervisor/src/admitted_payload/linux.rs");
+    let linux_code = polaris_source_probe::mask_comments_and_strings(&linux);
+    let anchor = "pub(super) fn command(";
+    assert_eq!(linux_code.matches(anchor).count(), 1);
+    let start = linux_code.find(anchor).unwrap();
+    let end = start + linux_code[start..].find("\n    }\n").unwrap();
+    let command = &linux_code[start..end];
+    assert!(command.contains("fcntl_dupfd_cloexec(&self.members[self.binary].sealed, 3)"));
+    let literal = polaris_source_probe::mask_comments(&linux);
+    assert!(literal[start..end].contains("Command::new(format!(\"/proc/self/fd/{bin_fd}\"))"));
+    assert!(!command.contains("source.path"));
 }
 
 fn sample(source: &str) -> Vec<(String, String)> {
@@ -554,6 +624,7 @@ fn the_gate_accepts_legitimate_shapes_and_pins_registered_counts() {
     );
 }"##,
         "fn f() { set_permissions(p, Permissions::from_mode(0o644)); }",
+        "fn f() { set_permissions(p, Permissions::from_mode(0o0)); }",
         "fn f() { OpenOptions::new().mode(0o600).open(p); }",
         "fn f() { assert_eq!(meta.permissions().mode() & 0o777, 0o755); }",
         "// std::fs::copy(a, b); from_mode(0o755); \"#!/bin/sh\"\nfn f() {}",

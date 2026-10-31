@@ -1150,16 +1150,15 @@ impl CheckCustody {
         config: File,
         timeout: Duration,
         spawned: Option<tokio::sync::oneshot::Sender<u32>>,
-        payload: Option<Arc<AdmittedPayload>>,
-        lease_owner: Option<Arc<dyn Send + Sync>>,
+        execution: Option<&PreparedExecution>,
     ) -> Result<RawCheck, ValidationLifecycleError> {
         let request = match self.queue_owned_sealed_with_owner(
             command,
             binary,
             config,
             Arc::new(NativeIo),
-            payload,
-            lease_owner,
+            execution.map(PreparedExecution::payload),
+            execution.and_then(PreparedExecution::lease_owner),
         )? {
             Ok(queued) => queued,
             Err(error) => return Ok(RawCheck::SpawnFailed(error)),
@@ -1257,10 +1256,8 @@ impl CheckCustody {
         timeout: Duration,
         spawned: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> Result<RawCheck, ValidationLifecycleError> {
-        self.supervise_owned_sealed_with_owner(
-            command, binary, config, timeout, spawned, None, None,
-        )
-        .await
+        self.supervise_owned_sealed_with_owner(command, binary, config, timeout, spawned, None)
+            .await
     }
     async fn run(
         self: &Arc<Self>,
@@ -1355,7 +1352,7 @@ async fn supervise_admitted_sealed_check(
     timeout: Duration,
     spawned: Option<tokio::sync::oneshot::Sender<u32>>,
 ) -> Result<RawCheck, ValidationLifecycleError> {
-    let (command, binary, payload) = execution.sealed_check_parts()?;
+    let (command, binary, _) = execution.sealed_check_parts()?;
     custody
         .supervise_owned_sealed_with_owner(
             command,
@@ -1363,8 +1360,7 @@ async fn supervise_admitted_sealed_check(
             config,
             timeout,
             spawned,
-            Some(payload),
-            execution.lease_owner(),
+            Some(&execution),
         )
         .await
 }

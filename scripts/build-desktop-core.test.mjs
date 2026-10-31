@@ -184,6 +184,8 @@ test('frozen production inputs still require exact pins; force and old outputs c
       'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/validation-origin.mjs',
       'scripts/desktop-core/native-dns-gates.mjs',
       'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json',
+      'scripts/desktop-core/local-development.mjs',
+      'scripts/desktop-core/recovery.mjs',
       'scripts/desktop-core/release-native-gates.mjs', 'scripts/desktop-core/native-dns-candidate.mjs',
       'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs', 'scripts/lib/core-identity.mjs']) {
       write(join(f.root, path), readFileSync(join(repo, path)));
@@ -591,11 +593,15 @@ def repository(path, files):
     path.mkdir()
     git('init', '-q', cwd=path)
     git('config', 'core.autocrlf', 'false', cwd=path)
-    git('config', 'core.filemode', 'true', cwd=path)
+    git('config', 'core.filemode', 'false' if os.name == 'nt' else 'true', cwd=path)
     for name, (content, mode) in files.items():
         (path / name).write_text(content)
         (path / name).chmod(mode)
     git('add', '-A', cwd=path)
+    # NTFS chmod cannot express Git's executable bit. Establish the actual
+    # fixture index modes explicitly, rather than silently testing a no-op.
+    for name, (_, mode) in files.items():
+        git('update-index', '--chmod=+x' if mode & 0o111 else '--chmod=-x', name, cwd=path)
     git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@invalid', 'commit', '-qm', 'fixture', cwd=path)
     return git('rev-parse', 'HEAD', cwd=path)
 with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
@@ -613,6 +619,8 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
     (dependency / 'added.sh').write_text('added executable\n')
     (dependency / 'added.sh').chmod(0o755)
     git('add', '-A', cwd=dependency)
+    for name, executable in [('mode.sh', True), ('plain.sh', False), ('added.sh', True)]:
+        git('update-index', '--chmod=+x' if executable else '--chmod=-x', name, cwd=dependency)
     expected_tree = git('write-tree', cwd=dependency)
     patch = root / 'dependency.patch'
     patch.write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary', upstream], cwd=dependency))
@@ -714,7 +722,10 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
         assert 'fresh and empty' in str(error)
         assert (occupied / 'sentinel').read_text() == 'retain existing checkout'
         rejected['occupied'] = True
-    git('update-index', '--chmod=-x', 'polaris-dependencies/dependency/keep.sh', cwd=root / 'linux-dependency')
+    mode_path = 'polaris-dependencies/dependency/keep.sh'
+    assert git('ls-files', '-s', mode_path, cwd=root / 'linux-dependency').startswith('100755 ')
+    git('update-index', '--chmod=-x', mode_path, cwd=root / 'linux-dependency')
+    assert git('ls-files', '-s', mode_path, cwd=root / 'linux-dependency').startswith('100644 ')
     try:
         provider.verify_checkout(root / 'linux-dependency', linux)
         raise AssertionError('tampered index mode accepted')
@@ -730,7 +741,7 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
         '--source', str(main), '--checkout', str(root / 'invalid-cli-checkout')], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert cli.returncode != 0
     assert not (root / 'invalid-cli-checkout').exists()
-    cli_error = cli.stderr.decode()
+    cli_error = cli.stderr.decode().replace('\r\n', '\n')
     print(json.dumps({'lfManifestEqual': linux_plain == windows_plain,
         'sourceOnly': {key: linux_plain[key] for key in ('moduleGraph', 'moduleGraphSha256', 'moduleGraphQueries', 'dependencies', 'graphScope', 'sourceGraphState')},
         'sourceOnlyRawSums': [linux_plain['mainGoSumSha256'], windows_plain['mainGoSumSha256']],

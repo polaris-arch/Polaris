@@ -103,6 +103,12 @@ const NO_MIXED_INBOUND = {
   mustContain: 'Platform::Android | Platform::Ios => false,',
 } as const;
 
+/** 独立 CoreStore 数据只对应桌面 selectedCore；移动端的 libbox 不走此恢复通路。 */
+const NO_MOBILE_SELECTED_CORE_DATA = {
+  file: 'crates/core-supervisor/src/selected_core.rs',
+  mustContain: 'match (std::env::consts::OS, std::env::consts::ARCH) {',
+} as const;
+
 /*
  * 🔴 **这里刻意没有「应用内下载安装」的 platform-absent 常量**（2026-09-13 复审撤回）。
  *
@@ -406,7 +412,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'ListEditor.tsx|f:add',
       disposition: {
         kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/SettingsChrome.tsx', mustContain: "<MobileButton onClick={() => commit([...draft, ''])}>{addLabel}</MobileButton>" },
+        mobile: { file: 'ui/src/mobile/settings/SettingsChrome.tsx', mustContain: "<MobileButton onClick={() => commit([...draft, listEntryRow('')])}>{addLabel}</MobileButton>" },
       },
       note:
         '往清单里加一条。移动端的清单编辑器是 `MobileListEditor`（同屏 `SettingsChrome.tsx`，' +
@@ -436,10 +442,10 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'ListEditor.tsx|k:common.confirm',
       disposition: {
         kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/SettingsChrome.tsx', mustContain: 'commit(parseBulkEntries(importDraft, [...draft], undefined, entryIdentity));' },
+        mobile: { file: 'ui/src/mobile/settings/SettingsChrome.tsx', mustContain: 'commit(importListEntryRows(importDraft, draft, undefined, entryIdentity));' },
       },
       note:
-        '批量导入的确认。解析与去重走 `@/domain/list-entries` 的 `parseBulkEntries` —— ' +
+        '批量导入的确认。解析与去重走 `@/domain/list-entries` 的 `importListEntryRows` —— ' +
         '与桌面**同一个函数**，不是第二份实现。',
     },
     {
@@ -583,7 +589,36 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '复制助手选定安装内容的 CoreID/providerFingerprint/state；CoreInfoCard 的唯一生产调用方为桌面 SettingsUpdate，移动端设置路由使用独立 UpdatePage/AboutPage，未渲染该卡。后端 current_platform 仅允许四个桌面 target，移动端无 selectedCore；不是将通用内核诊断记为缺席。',
     },
 
+    {
+      id: 'CoreRecoveryActions.tsx|f:confirmTwice',
+      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
+      note: '二次确认只恢复当前桌面编译选定的数据，不更新内核或取得执行许可；移动端平台检查先行拒绝。',
+    },
+    {
+      id: 'CoreRecoveryActions.tsx|k:coreRecovery.check',
+      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
+      note: '检查桌面数据副本与随包恢复源；Android/iOS 无此 selectedCore，命令在数据访问和停机前返回。',
+    },
+    {
+      id: 'CoreRecoveryActions.tsx|k:coreRecovery.helper',
+      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
+      note: '当前桌面接管模式需要助手时转到助手页；不是移动端 VPN 授权入口，也不强制普通模式安装助手。',
+    },
+
     /* ── 提权助手页（移动端没有 helper 进程这个对象）───────────────────────── */
+    {
+      id: 'SettingsHelper.tsx|k:settings.about.checkUpdate',
+      disposition: { kind: 'reachable-elsewhere', mobile: {
+        file: 'ui/src/mobile/settings/UpdatePage.tsx',
+        mustContain: 'runAppUpdateCheck(checkAppUpdateViaIpc, config)',
+      } },
+      note: '桌面准入不支持时转到应用更新页；移动端可从自己的更新页检查应用更新，不将此动作当成内核更新。',
+    },
+    {
+      id: 'SettingsHelper.tsx|k:helper.restoreOfflineAction',
+      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_HELPER_INSTALLATION },
+      note: '恢复桌面助手管理的选定安装内容；移动端没有该独立提权服务或安装副本。',
+    },
     {
       id: 'SettingsHelper.tsx|k:helper.copyDiagnostics',
       disposition: { kind: 'platform-absent', evidence: NO_MOBILE_HELPER_INSTALLATION },
@@ -627,20 +662,25 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     {
       id: 'SettingsHelper.tsx|k:helper.recheck#2',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '重新检测的第二个渲染位（另一档状态下出现）。同一条腿，一并登记。',
+      note: '准入不可用时重新读取状态；重检本身不安装、提权或赋予执行许可。',
     },
     {
       id: 'SettingsHelper.tsx|k:helper.recheck#3',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '重新检测的第三个渲染位（另一档状态下出现）。同上，同一条腿。',
+      note: '检查中的显式状态重读入口；移动端授权状态由 vpnAuthStatus 呈现。',
     },
 
     {
       id: 'SettingsHelper.tsx|k:helper.recheck#4',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: 'BTM 禁用状态原有重检位置；与失败区恢复互斥，仍只调用状态查询，不安装或提权。',
+      note: '已安装或清理未完成时重新读取助手状态；不是触发恢复或卸载的按钮。',
     },
 
+    {
+      id: 'SettingsHelper.tsx|k:helper.recheck#5',
+      disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
+      note: 'macOS BTM 禁用后的状态重检，不安装或提权；移动端没有此后台服务对象。',
+    },
     {
       id: 'SettingsHelper.tsx|k:helper.btmCopyPath',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
@@ -993,6 +1033,11 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '「打开发布页」/「跳过此版本」）加下面一行更新通道。**三阶段里只少了下载与安装那两段**，' +
         '而那两段在这个平台上没有可下载的资产（逐颗处置见 actions 面 `k:settings.update.download` ' +
         '一族）—— 不是这张卡没移植。',
+    },
+    {
+      id: 'CoreRecoveryActions',
+      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
+      note: '桌面随包数据恢复区；移动端的 libbox 随 APK 安装，不存在该桌面独立数据槽。',
     },
     {
       id: 'CoreInfoCard',

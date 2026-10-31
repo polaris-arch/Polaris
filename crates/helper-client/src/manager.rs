@@ -1171,6 +1171,7 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// PowerShell 单引号字符串转义（`''` 转义单引号，移植 WindowsServiceHelper.ts:417）。
+#[cfg(test)]
 fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
 }

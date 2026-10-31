@@ -363,6 +363,7 @@ impl Drop for ApiWitnessExit {
 
 impl StreamWitness {
     /// 起后台任务。`open` 建流（建流本身不阻塞调用方）。
+    #[cfg(test)]
     pub(crate) fn spawn<Open, S, E>(open: Open) -> Self
     where
         Open: Future<Output = Result<S, E>> + Send + 'static,
@@ -373,6 +374,7 @@ impl StreamWitness {
     }
 
     /// [`spawn`](Self::spawn) 的本体：登记时刻用的墙钟可注入。
+    #[cfg(test)]
     pub(crate) fn spawn_with_clock<Open, S, E>(
         open: Open,
         now_ms: impl Fn() -> u64 + Send + Sync + 'static,

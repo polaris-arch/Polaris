@@ -74,6 +74,8 @@ enum Class {
     Restore,
     /// 不落盘：写的是运行态投影或生成期的内存副本。
     Projection,
+    /// Host-only fixture writes its own TestDir configuration, not a user choice.
+    TestFixture,
 }
 
 /// 一处登记：(类别, 所在函数, 说明)。
@@ -81,6 +83,14 @@ type Site = (Class, &'static str, &'static str);
 
 /// 登记表：文件 → 按出现顺序逐处的登记。
 const WRITES: &[(&str, &[Site])] = &[
+    (
+        "src-tauri/src/runtime/proxy/prerequisite.rs",
+        &[(
+            Class::TestFixture,
+            "ready_api_commit_fixture_for_test",
+            "cfg(all(test, not(iOS))) only: seed the owned tests::runtime/TestDir with a real taildrop node for the generated config and Ready commit fixture; no production writer or selection-intent authority.",
+        )],
+    ),
     (
         "src-tauri/src/runtime/proxy/native_auto.rs",
         &[
@@ -642,6 +652,14 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
                     write.line
                 ),
                 Class::User | Class::Restore | Class::Projection => {}
+                Class::TestFixture => {
+                    let bare = mask_comments(source);
+                    assert!(bare.contains(
+                        "#[cfg(all(test, not(target_os = \"ios\")))]\n    pub(crate) fn ready_api_commit_fixture_for_test("
+                    ));
+                    assert!(source.contains("let (runtime, directory) = tests::runtime();"));
+                    assert_eq!(*function, "ready_api_commit_fixture_for_test");
+                }
             }
         }
         assert_eq!(
@@ -679,6 +697,7 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
         Class::SystemTouchingIntent,
         Class::Restore,
         Class::Projection,
+        Class::TestFixture,
     ] {
         assert!(classes.contains(&class), "{class:?} 一条都没有");
     }

@@ -823,7 +823,7 @@ test('published consume, packaged verification and native gate work with every A
       + Object.entries(row.buildGraph.settings).map(([k,v]) => `\tbuild\t${k}=${v}\n`).join('');
     const members = Object.fromEntries(Object.entries(files).map(([name,b]) => [`${row.archive.root}/${name}`, b.toString('base64')]));
     const archive = join(root, row.archive.name);
-    execFileSync('python3', ['-c', `import base64,io,json,sys,tarfile,zipfile
+    execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-c', `import base64,io,json,sys,tarfile,zipfile
 members=json.load(sys.stdin)
 if sys.argv[1].endswith('.zip'):
  with zipfile.ZipFile(sys.argv[1],'w') as z:
@@ -941,11 +941,19 @@ else:
     for(const key of Object.keys(contract.platforms))verifyPackagedRelease(root,manifest,key,join(root,'resources',key,contract.platforms[key].core.member),run,'linux');
   });
   await t.test('raw cache upstream hit still rejects complete-source failure and fresh source drift',async()=>{
-    const installed=bytesAt(), failure=Error('complete source tree validation rejected');
+    const installed=bytesAt(), failure=Object.assign(Error('private complete source tree validation rejected'),{
+      code:'EACCES',status:7,stderr:'private archive request and child diagnostics must not escape',
+    });
     await assert.rejects(consumeRelease(root,manifest,['linux'],{...options,run:(command,args,settings)=>{
       if(args[1]?.endsWith('release-archive.py') && settings.input && JSON.parse(settings.input).sourceArchive)throw failure;
       return run(command,args,settings);
-    }}),error=>error===failure);assert.deepEqual(bytesAt(),installed);
+    }}),error=>{
+      assert.notEqual(error,failure);
+      assert.match(error.message,/^Release archive failed \(stage=source-archive-validation; elapsedMs=[0-9]+; timeoutMs=120000; code=EACCES; status=7; signal=unknown; progress=unknown\)$/);
+      assert.equal(error.cause,undefined);assert.equal(error.stderr,undefined);
+      assert.doesNotMatch(error.message,/private|request|diagnostics|complete source tree validation rejected/);
+      return true;
+    });assert.deepEqual(bytesAt(),installed);
     let snapshots=0;
     await assert.rejects(consumeRelease(root,manifest,['linux'],{...options,read:async url=>{
       const bytes=await read(url);
@@ -968,7 +976,7 @@ else:
       // Repository/index/object selectors, injected -c configuration, identities,
       // dates, templates and executable paths are all invocation-local here.
       for(const key of Object.keys(env))if(/^GIT_/i.test(key))delete env[key];
-      const clean={...env,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:devNull,GIT_OPTIONAL_LOCKS:'0'};
+      const clean={...env,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:process.platform==='win32'?'NUL':devNull,GIT_OPTIONAL_LOCKS:'0'};
       // Plain-object child env keys must have no Windows case-insensitive alias.
       assert.deepEqual(Object.keys(clean).filter(key=>/^GIT_/i.test(key)).sort(),['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','GIT_OPTIONAL_LOCKS']);
       return clean;

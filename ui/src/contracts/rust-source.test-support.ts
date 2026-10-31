@@ -76,6 +76,23 @@ export function moduleSource(relModule: string): string {
   return read(relModule, false, '生产');
 }
 
+/** First named function in the supplied scope; brace matching ignores comments and literals. */
+export function rustFunctionSource(source: string, name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`Invalid Rust function name: ${name}`);
+  const masked = maskRustCommentsAndStrings(source);
+  const declaration = new RegExp(`\\bfn\\s+${name}\\s*\\([^;{]*\\)[^;{]*\\{`).exec(masked);
+  if (!declaration) throw new Error(`Missing Rust function: ${name}`);
+  const opening = masked.indexOf('{', declaration.index);
+  let depth = 1;
+  for (let end = opening + 1; end < masked.length; end++) {
+    if (masked[end] === '{') depth++;
+    if (masked[end] === '}' && --depth === 0) {
+      return maskRustComments(source).slice(declaration.index, end + 1);
+    }
+  }
+  throw new Error(`Unclosed Rust function: ${name}`);
+}
+
 /**
  * 目录树 `relRoot`（仓库相对）下的全部**生产** `.rs` 文件（剔除任意层级的 `tests/`），已排序。
  *

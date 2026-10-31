@@ -48,11 +48,4 @@ impl Child {
             Self::Fixture(c) => c.kill().await,
         }
     }
-    #[cfg(windows)]
-    pub fn raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-        match self {
-            Self::Admitted(c) => c.raw_handle(),
-            Self::Fixture(c) => c.raw_handle(),
-        }
-    }
 }

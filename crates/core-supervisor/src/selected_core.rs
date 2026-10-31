@@ -16,7 +16,7 @@ pub fn selection_lane() -> SelectionLane {
     #[cfg(feature = "local-development-selection")]
     {
         std::hint::black_box(LOCAL_DEVELOPMENT_BINARY_MARKER);
-        return SelectionLane::LocalDevelopment;
+        SelectionLane::LocalDevelopment
     }
     #[cfg(not(feature = "local-development-selection"))]
     {
@@ -37,7 +37,7 @@ pub(crate) mod development;
 pub(crate) fn selected_contract() -> Result<&'static str, String> {
     #[cfg(feature = "local-development-selection")]
     {
-        return development::contract_raw();
+        development::contract_raw()
     }
     #[cfg(not(feature = "local-development-selection"))]
     {
@@ -47,7 +47,7 @@ pub(crate) fn selected_contract() -> Result<&'static str, String> {
 pub(crate) fn selected_pure_manifest(platform: &str) -> Result<CoreManifest, String> {
     #[cfg(feature = "local-development-selection")]
     {
-        return development::manifest(platform);
+        development::manifest(platform)
     }
     #[cfg(not(feature = "local-development-selection"))]
     {
@@ -80,6 +80,7 @@ pub fn selected_recovery_spec(platform: &str) -> Result<serde_json::Value, Strin
         selected_pure_manifest(platform)?,
     )
 }
+#[cfg(test)]
 fn recovery_spec_from_inventory(platform: &str, raw: &[u8]) -> Result<serde_json::Value, String> {
     recovery_spec_with_contract(platform, raw, RELEASE_CONTRACT, formal_manifest(platform)?)
 }
@@ -224,9 +225,12 @@ pub fn selected_source_from(compiled: &[u8], platform: &str) -> Result<String, S
 pub fn selected_source_commit(platform: &str) -> Result<String, String> {
     #[cfg(feature = "local-development-selection")]
     {
-        return development::source(platform);
+        development::source(platform)
     }
-    selected_source_from(COMPILED_VALIDATION_SOURCE, platform)
+    #[cfg(not(feature = "local-development-selection"))]
+    {
+        selected_source_from(COMPILED_VALIDATION_SOURCE, platform)
+    }
 }
 
 /// Private check-only admission consumes compiled identity, never an environment
@@ -259,30 +263,33 @@ pub fn selected_check_source(platform: &str) -> Result<(String, String), String>
 /// Candidate builds resolve the complete verified carrier for both core and
 /// helper. Runtime environment cannot switch this compiled choice or fall back
 /// to an old formal carrier. Dashboard/data resource lookup is unchanged.
-pub fn selected_payload_dirs(formal: &[&str]) -> Result<Vec<String>, String> {
+pub fn selected_payload_dirs(_formal: &[&str]) -> Result<Vec<String>, String> {
     #[cfg(feature = "local-development-selection")]
     {
         development::manifest(current_platform()?)?;
-        return Ok(vec![".local-development/linux".into()]);
+        Ok(vec![".local-development/linux".into()])
     }
-
-    if COMPILED_VALIDATION_SOURCE == b"null" {
-        return Ok(formal.iter().map(|value| (*value).to_owned()).collect());
-    }
-    let platform = current_platform()?;
-    let selected = selected_manifest(platform)?;
-    if selected.helper_sha256.is_none() || (platform == "win" && selected.cleaner_sha256.is_none())
+    #[cfg(not(feature = "local-development-selection"))]
     {
-        return Err("CORE_BUNDLE_MISMATCH: candidate carrier is incomplete".into());
+        if COMPILED_VALIDATION_SOURCE == b"null" {
+            return Ok(_formal.iter().map(|value| (*value).to_owned()).collect());
+        }
+        let platform = current_platform()?;
+        let selected = selected_manifest(platform)?;
+        if selected.helper_sha256.is_none()
+            || (platform == "win" && selected.cleaner_sha256.is_none())
+        {
+            return Err("CORE_BUNDLE_MISMATCH: candidate carrier is incomplete".into());
+        }
+        let source = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
+        Ok(vec![
+            if source["schema"] == "polaris-native-dns-compiled-source-v2" {
+                platform.to_owned()
+            } else {
+                format!(".native-dns-app/{platform}")
+            },
+        ])
     }
-    let source = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
-    Ok(vec![
-        if source["schema"] == "polaris-native-dns-compiled-source-v2" {
-            platform.to_owned()
-        } else {
-            format!(".native-dns-app/{platform}")
-        },
-    ])
 }
 
 pub fn selected_manifest(platform: &str) -> Result<CoreManifest, String> {
@@ -321,9 +328,12 @@ pub fn selected_manifest(platform: &str) -> Result<CoreManifest, String> {
     }
     #[cfg(feature = "installed-development-selection")]
     {
-        return Err("CORE_BUNDLE_MISMATCH: local App installation identity missing".into());
+        Err("CORE_BUNDLE_MISMATCH: local App installation identity missing".into())
     }
-    selected_pure_manifest(platform)
+    #[cfg(not(feature = "installed-development-selection"))]
+    {
+        selected_pure_manifest(platform)
+    }
 }
 
 pub fn formal_manifest(platform: &str) -> Result<CoreManifest, String> {
@@ -403,111 +413,4 @@ pub fn current_platform() -> Result<&'static str, String> {
 }
 
 #[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    fn inventory(platform: &str) -> serde_json::Value {
-        use serde_json::json;
-        let contract: serde_json::Value = serde_json::from_str(RELEASE_CONTRACT).unwrap();
-        let archive = &contract["platforms"][platform]["archive"];
-        let mut sizes = serde_json::Map::new();
-        // Non-payload sizes here are header fixtures, not archive verification.
-        // The non-executing decoder must still verify every actual byte/hash.
-        for name in archive["members"].as_object().unwrap().keys() {
-            sizes.insert(name.clone(), json!(1));
-        }
-        for file in formal_manifest(platform).unwrap().files {
-            sizes.insert(
-                format!("{}/{}", archive["root"].as_str().unwrap(), file.name),
-                json!(file.bytes),
-            );
-        }
-        json!({"schema":"polaris-core-recovery-inventory-v1","platform":platform,"contractSha256":sha256_hex(RELEASE_CONTRACT.as_bytes()),"archive":{"name":archive["name"],"format":if platform=="win" {"zip"}else{"tar.gz"},"bytes":archive["bytes"],"sha256":archive["sha256"],"root":archive["root"]},"memberBytes":sizes})
-    }
-    #[test]
-    fn compiled_lane_never_uses_validation_receipts_as_local_authority() {
-        #[cfg(feature = "formal-selection")]
-        {
-            assert_eq!(selection_lane(), SelectionLane::Formal);
-            assert_eq!(COMPILED_DEVELOPMENT_SELECTION, b"null");
-            assert_eq!(COMPILED_DEVELOPMENT_CONTRACT, b"null");
-        }
-        #[cfg(feature = "local-development-selection")]
-        {
-            assert_eq!(selection_lane(), SelectionLane::LocalDevelopment);
-            assert_eq!(COMPILED_VALIDATION_SOURCE, b"null");
-            let pure = selected_pure_manifest("linux").unwrap();
-            let source = selected_source_commit("linux").unwrap();
-            assert_ne!(source, selected_source_from(b"null", "linux").unwrap());
-            let mut installed = pure.clone();
-            installed.helper_sha256 = Some("f".repeat(64));
-            assert_eq!(
-                pure.id(sha256_hex).unwrap(),
-                installed.id(sha256_hex).unwrap()
-            );
-            assert!(selected_pure_manifest("win").is_err());
-            assert!(selected_pure_manifest("mac-arm64").is_err());
-            assert_eq!(selected_check_source("linux").unwrap().0, source);
-        }
-    }
-
-    #[test]
-    fn recovery_data_uses_the_one_compiled_hash_set_and_derives_core_id() {
-        for platform in ["linux", "win", "mac-x64", "mac-arm64"] {
-            let inventory = inventory(platform);
-            let spec =
-                recovery_spec_from_inventory(platform, &serde_json::to_vec(&inventory).unwrap())
-                    .unwrap();
-            assert_eq!(
-                spec["coreId"],
-                formal_manifest(platform)
-                    .unwrap()
-                    .id(sha256_hex)
-                    .unwrap()
-                    .as_str()
-            );
-            assert_eq!(
-                spec["payloadMembers"].as_array().unwrap().len(),
-                formal_manifest(platform).unwrap().files.len()
-            );
-            assert_eq!(
-                spec["members"].as_array().unwrap().len(),
-                inventory["memberBytes"].as_object().unwrap().len()
-            );
-        }
-    }
-    #[test]
-    fn wrong_or_extra_inventory_fields_cannot_select_another_archive_or_member() {
-        for path in [
-            vec!["platform"],
-            vec!["contractSha256"],
-            vec!["archive", "sha256"],
-            vec!["archive", "root"],
-            vec!["archive", "name"],
-            vec!["archive", "format"],
-            vec!["archive", "bytes"],
-        ] {
-            let mut bad = inventory("linux");
-            let mut value = &mut bad;
-            for part in path {
-                value = &mut value[part];
-            }
-            *value = serde_json::json!("foreign");
-            assert!(
-                recovery_spec_from_inventory("linux", &serde_json::to_vec(&bad).unwrap()).is_err()
-            );
-        }
-        let mut bad = inventory("linux");
-        bad["memberBytes"]["foreign/member"] = serde_json::json!(1);
-        assert!(recovery_spec_from_inventory("linux", &serde_json::to_vec(&bad).unwrap()).is_err());
-        let mut bad = inventory("linux");
-        let key = bad["memberBytes"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .find(|key| key.ends_with("/sing-box"))
-            .unwrap()
-            .clone();
-        bad["memberBytes"][key] = serde_json::json!(1);
-        assert!(recovery_spec_from_inventory("linux", &serde_json::to_vec(&bad).unwrap()).is_err());
-    }
-}
+mod tests;

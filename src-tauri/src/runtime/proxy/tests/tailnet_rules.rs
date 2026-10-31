@@ -379,10 +379,7 @@ async fn running_sync_never_unlinks_a_mounted_file() {
 
     // 源码面：热更腿里不存在任何 unlink。
     let src = module_code("runtime/proxy");
-    let body = method_body(
-        &src,
-        "    pub(super) fn commit_tailnet_events(&self, state: &mut TailnetRouteState, context: &TailnetRouteContext, events: &[TailscaleStatusEvent]) -> Result<(), String> {",
-    );
+    let body = method_body(&src, "    pub(super) fn commit_tailnet_events(");
     assert!(
         !body.is_empty(),
         "取材失败：`sync_tailnet_rule_files` 的签名行变了，本守卫已经在扫空字符串"

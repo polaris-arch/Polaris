@@ -403,7 +403,7 @@ fn decode32(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, part) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (i, part) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         out[i] = u8::from_str_radix(std::str::from_utf8(part).ok()?, 16).ok()?;
     }
     Some(out)

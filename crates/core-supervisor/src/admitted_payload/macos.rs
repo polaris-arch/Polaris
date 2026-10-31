@@ -317,7 +317,8 @@ fn validate_macho(file: &mut File) -> Result<(), AdmissionError> {
     for _ in 0..count {
         let id = u32_at(&commands, offset)?;
         let length = u32_at(&commands, offset + 4)? as usize;
-        if length < 8 || length % 8 != 0 || length > commands.len().saturating_sub(offset) {
+        if length < 8 || !length.is_multiple_of(8) || length > commands.len().saturating_sub(offset)
+        {
             return Err(rejected(
                 AdmissionErrorKind::LoaderPolicy,
                 "invalid Mach-O load command",

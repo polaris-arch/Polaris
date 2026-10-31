@@ -13,7 +13,6 @@ use polaris_config_engine::builder::endpoint_routes::{
     endpoint_forced_route_cidrs, tailnet_rule_file_base, ObservedTailnetAddresses,
     TAILNET_RULES_DIR_NAME,
 };
-use polaris_config_engine::builder::helpers::host_to_exclude_cidr;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::collections::dedupe_trim;
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
@@ -76,9 +75,7 @@ pub(super) fn parse_tailnet_rule_file_cidrs(content: &str) -> Option<Vec<String>
         let list = value.as_array()?;
         for cidr in list {
             let text = cidr.as_str()?;
-            if polaris_config_engine::user_config::cidr::normalize_cidr(text).is_none() {
-                return None;
-            }
+            polaris_config_engine::user_config::cidr::normalize_cidr(text)?;
             out.push(text.to_owned());
         }
     }
@@ -87,7 +84,7 @@ pub(super) fn parse_tailnet_rule_file_cidrs(content: &str) -> Option<Vec<String>
 
 /// 主机位 CIDR（`/32` / `/128`）→ 裸地址；其余（`100.64.0.0/10` 这类段）→ `None`。
 ///
-/// 这是 [`host_to_exclude_cidr`] 的逆向，只用于把盘上文件读回成观测面。**只认主机位**：
+/// 这是 [`polaris_config_engine::builder::helpers::host_to_exclude_cidr`] 的逆向，只用于把盘上文件读回成观测面。**只认主机位**：
 /// 配置期已知段（官方默认两段、用户 `routes`）由 [`endpoint_forced_route_cidrs`] 每次重算，
 /// 把它们也读回观测面会让用户删掉的 `routes` 永远删不掉。
 #[must_use]

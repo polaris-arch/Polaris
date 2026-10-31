@@ -286,6 +286,7 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
     // clearance. Only copies in this private fixture are modified.
     const fixturePaths = [...inputPaths, 'scripts/assert-pc-runtime-release.mjs',
       'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/release-consumer.mjs',
+      'scripts/desktop-core/local-development.mjs',
       // release-consumer statically imports the upstream adapter even for legacy inputs.
       'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/recovery.mjs', 'scripts/lib/polaris-version.json', 'scripts/desktop-core/native-dns-candidate.mjs',
       'scripts/lib/core-identity.mjs',
@@ -492,6 +493,7 @@ function formalPolicyFixture(t) {
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const paths = ['scripts/assert-pc-runtime-release.mjs', 'scripts/desktop-core/source-graph.mjs',
     'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/recovery.mjs', 'scripts/lib/polaris-version.json',
+    'scripts/desktop-core/local-development.mjs',
     'scripts/desktop-core/native-dns-candidate.mjs', 'scripts/lib/core-identity.mjs',
     'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs', manifestPath,
     'scripts/desktop-core/release-contract.json', 'scripts/desktop-core/release-asset-index.json'];

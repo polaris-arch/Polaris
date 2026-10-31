@@ -43,7 +43,9 @@ use std::io::{self, Read};
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus};
+#[cfg(test)]
+use std::process::Child;
+use std::process::ExitStatus;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -1014,61 +1016,6 @@ impl AmbientCapsSpawner {
             let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL));
         }
     }
-}
-
-/// 装 pre_exec 降权+ambient 拉核闭包（**唯一 unsafe 点** = `CommandExt::pre_exec`）。
-///
-/// 所有可分配的输入（gids/caps 列表）在 fork **前**于父进程算好，闭包本体只做 syscall。
-#[allow(
-    unsafe_code,
-    reason = "CommandExt::pre_exec is required to drop uid/gid before exec"
-)]
-#[cfg(test)]
-pub(super) fn attach_privilege_drop(
-    cmd: &mut std::process::Command,
-    uid: u32,
-    gid: u32,
-    groups: Vec<u32>,
-) {
-    use std::os::unix::process::CommandExt;
-    let gids: Vec<nix::unistd::Gid> = groups.into_iter().map(nix::unistd::Gid::from_raw).collect();
-    let caps = ambient_caps();
-    // SAFETY: pre_exec 闭包在 fork 后、execve 前于**子进程**运行，仅调 async-signal-safe 的 syscall
-    //   （set_keepcaps/setgroups/setgid/setuid + capset/prctl via caps crate），且 gids/caps 列表已在
-    //   fork 前于父进程分配 → 闭包本体不分配。每步失败即返 Err 中止 execve（**fail-closed**：setuid 失败
-    //   绝不以 root 拉核）。残留风险：caps crate 内部 capget 可能分配 —— 与「真降权拉核链」同属真机门
-    //   （DESIGN-REVIEW(preexec-async-signal-safety)），本机绝不跑。
-    unsafe {
-        cmd.pre_exec(move || apply_privilege_drop(uid, gid, &gids, &caps));
-    }
-}
-
-/// pre_exec 闭包本体：降权到对端登录用户 + raise ambient caps（全 safe wrapper，无 unsafe 块）。
-///
-/// 顺序对照 Go runtime 对 `SysProcAttr{Credential, AmbientCaps}` 的编排（keepcaps→降权→raise ambient）：
-/// 1. `set_keepcaps(true)`：permitted caps 跨 setuid 存活（Go AmbientCaps 非空时 PR_SET_KEEPCAPS）。
-/// 2. `setgroups`：补充组（须在 setuid 前、仍 root 时；空 = 清空，对齐 Go `Groups: nil`）。
-/// 3. `setgid` → 4. `setuid`：降权（drop 放最后）。
-/// 5. raise Inheritable + 6. raise Ambient（逐 cap；降权后 permitted 已留，加 inheritable 再抬 ambient）。
-///
-/// 任一步失败即 `Err` → std 中止 execve → `c.spawn()` 返错 → handler 回 `ERR start`（fail-closed）。
-#[cfg(test)]
-fn apply_privilege_drop(
-    uid: u32,
-    gid: u32,
-    groups: &[nix::unistd::Gid],
-    caps: &[caps::Capability],
-) -> std::io::Result<()> {
-    use nix::unistd::{setgid, setgroups, setuid, Gid, Uid};
-    caps::securebits::set_keepcaps(true).map_err(std::io::Error::other)?;
-    setgroups(groups).map_err(std::io::Error::other)?;
-    setgid(Gid::from_raw(gid)).map_err(std::io::Error::other)?;
-    setuid(Uid::from_raw(uid)).map_err(std::io::Error::other)?;
-    for &cap in caps {
-        caps::raise(None, caps::CapSet::Inheritable, cap).map_err(std::io::Error::other)?;
-        caps::raise(None, caps::CapSet::Ambient, cap).map_err(std::io::Error::other)?;
-    }
-    Ok(())
 }
 
 /// Remove only the birth whose native Child was actually reaped. The Child

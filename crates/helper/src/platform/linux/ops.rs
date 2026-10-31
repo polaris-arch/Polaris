@@ -22,7 +22,7 @@
 //!
 //! Go 源 `helper-linux/helper.go` 的命令集 = ping|version|status|start|stop|cleanup|freeport|install-core
 //! —— **无 route / tun / systemd 命令**：核 sing-tun 自建 TUN + 自装路由（CAP_NET_ADMIN 在 ambient set，
-//! 见 [`server::apply_privilege_drop`](crate::platform::linux::server)），helper 侧不碰路由。故本三组 trait
+//! 见 [`PreparedExecution::spawn_linux_helper_run`](polaris_core_supervisor::admitted_payload::PreparedExecution::spawn_linux_helper_run)），helper 侧不碰路由。故本三组 trait
 //! 是 Polaris 自有增强（range-expansion，[[polaris-code-audit]] §3.3）：**保留但不接 `handler` dispatch**
 //! （铁律：非缺陷不删自有）。价值待未来（手动 tuntap 模式 / helper 自管 systemd unit）兑现时接线。
 //! `SystemdOps` 仍在 [`HandlerDeps`](crate::platform::linux::handler::HandlerDeps) 里占位（同休眠），

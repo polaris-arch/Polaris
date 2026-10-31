@@ -215,7 +215,7 @@ impl SelectedPolicy {
             .id(sha256_hex)
             .map_err(|e| AdmissionError::new(AdmissionErrorKind::Mismatch, e))?;
         let contract: serde_json::Value = serde_json::from_str(
-            &selected_core::selected_contract()
+            selected_core::selected_contract()
                 .map_err(|e| AdmissionError::new(AdmissionErrorKind::Mismatch, e))?,
         )
         .map_err(|e| AdmissionError::new(AdmissionErrorKind::Mismatch, e.to_string()))?;
@@ -415,15 +415,17 @@ pub fn check_selected_capability(purpose: ExecPurpose) -> Result<(), AdmissionEr
     {
         let mut error = AdmissionError::unsupported_exact_object();
         error.purpose = Some(purpose);
-        return Err(error);
+        Err(error)
     }
     #[cfg(not(target_os = "macos"))]
-    SelectedPolicy::compiled()
-        .and_then(|p| p.allows(purpose))
-        .map_err(|mut e| {
-            e.purpose = Some(purpose);
-            e
-        })
+    {
+        SelectedPolicy::compiled()
+            .and_then(|p| p.allows(purpose))
+            .map_err(|mut e| {
+                e.purpose = Some(purpose);
+                e
+            })
+    }
 }
 pub fn invalidate_selected() {
     invalidate_slot(SLOT.get_or_init(Default::default));
@@ -473,15 +475,17 @@ pub fn admit_selected(
         let _ = input;
         let mut error = AdmissionError::unsupported_exact_object();
         error.purpose = Some(purpose);
-        return Err(error);
+        Err(error)
     }
     #[cfg(not(target_os = "macos"))]
-    admit_locked(
-        SLOT.get_or_init(Default::default),
-        input,
-        purpose,
-        SelectedPolicy::compiled,
-    )
+    {
+        admit_locked(
+            SLOT.get_or_init(Default::default),
+            input,
+            purpose,
+            SelectedPolicy::compiled,
+        )
+    }
 }
 /// The existing privileged Helper's RunMain entry. Input paths are still data:
 /// the provider requires actual root credentials, a protected CoreStore chain,
@@ -631,10 +635,12 @@ impl PreparedExecution {
     }
     pub(crate) fn command(&self) -> Result<tokio::process::Command, AdmissionError> {
         self.payload.prepare(self.purpose)?;
-        let mut command = self.payload.protected.command().map_err(|mut error| {
+        let command = self.payload.protected.command().map_err(|mut error| {
             error.purpose = Some(self.purpose);
             error
         })?;
+        #[cfg(target_os = "linux")]
+        let mut command = command;
         #[cfg(target_os = "linux")]
         if let Some(lease) = &self.store_lease {
             platform::attach_store_lease(command.as_std_mut(), lease)?;

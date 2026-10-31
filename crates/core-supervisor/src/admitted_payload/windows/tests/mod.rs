@@ -249,7 +249,7 @@ fn actual_child(exe: &Path, cwd: &Path, marker: &Path) -> (i32, String) {
 
 #[test]
 #[ignore = "explicit native whole-PE compiler fixture; no production admission or system actions"]
-fn cached_SEC_IMAGE_and_retained_writer_can_disagree_with_cold_hash_and_CreateProcess() {
+fn cached_sec_image_and_retained_writer_can_disagree_with_cold_hash_and_create_process() {
     for mapped in [false, true] {
         let (d, p) = case(if mapped {
             "cached-view"
@@ -295,7 +295,7 @@ fn cached_SEC_IMAGE_and_retained_writer_can_disagree_with_cold_hash_and_CreatePr
 
 #[test]
 #[ignore = "explicit native whole-PE compiler fixture; no production admission or system actions"]
-fn held_EXE_and_DLL_do_not_close_late_dot_local_namespace_before_entry() {
+fn held_exe_and_dll_do_not_close_late_dot_local_namespace_before_entry() {
     let (d, p) = case("late-local");
     let exe = observed_cold_file(&p).unwrap();
     let dll = observed_cold_file(&d.join("observer.dll")).unwrap();
@@ -463,3 +463,5 @@ mod native {
         )
     }
 }
+
+mod issuer_contract;

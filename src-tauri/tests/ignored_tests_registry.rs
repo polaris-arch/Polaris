@@ -58,6 +58,9 @@ enum Class {
     /// Cross-identity interoperability creates an explicitly approved, one-shot SYSTEM task.
     /// The privileged runner and its cleanup must own execution; ordinary tests cannot.
     PrivilegedWindowsInterop,
+    /// Existing opt-in whole-PE experiments require a native MSVC compiler;
+    /// inert EXE/DLL fixtures never gain production admission or system authority.
+    NativeWindowsCompilerFixture,
 }
 
 impl Class {
@@ -74,6 +77,7 @@ impl Class {
             Class::PrivateChildFixture => &["private child fixture"],
             Class::NativeWindowsInterop => &["pinned real Go test producer"],
             Class::PrivilegedWindowsInterop => &["explicit one-shot SYSTEM task runner"],
+            Class::NativeWindowsCompilerFixture => &["explicit native whole-PE compiler fixture"],
         }
     }
 
@@ -86,6 +90,7 @@ impl Class {
             Class::PrivateChildFixture => "PrivateChildFixture",
             Class::NativeWindowsInterop => "NativeWindowsInterop",
             Class::PrivilegedWindowsInterop => "PrivilegedWindowsInterop",
+            Class::NativeWindowsCompilerFixture => "NativeWindowsCompilerFixture",
         }
     }
 }
@@ -103,6 +108,16 @@ struct Entry {
 ///
 /// 平台专属的那三条也在表里 —— 本门数源码，与当前编译目标无关。
 const REGISTRY: &[Entry] = &[
+    Entry {
+        file: "crates/core-supervisor/src/admitted_payload/windows/tests/mod.rs",
+        test: "cached_sec_image_and_retained_writer_can_disagree_with_cold_hash_and_create_process",
+        class: Class::NativeWindowsCompilerFixture,
+    },
+    Entry {
+        file: "crates/core-supervisor/src/admitted_payload/windows/tests/mod.rs",
+        test: "held_exe_and_dll_do_not_close_late_dot_local_namespace_before_entry",
+        class: Class::NativeWindowsCompilerFixture,
+    },
     // ── RealCore：需要真实 sing-box ──
     Entry {
         file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
@@ -540,8 +555,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        30,
-        "默认不跑的测试数从 30 变成了 {} —— 这不是自动放行的事：\
+        32,
+        "默认不跑的测试数从 32 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );
@@ -593,6 +608,7 @@ fn class_matches_the_stated_reason() {
         Class::LiveHostState,
         Class::NotAGate,
         Class::PrivateChildFixture,
+        Class::NativeWindowsCompilerFixture,
     ] {
         assert!(
             per_class.get(class.name()).copied().unwrap_or(0) > 0,

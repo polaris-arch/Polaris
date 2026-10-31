@@ -5,9 +5,7 @@ mod linux_tests {
     use crate::test_support::TestDir;
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -479,7 +477,7 @@ mod linux_tests {
     fn historical_alpha125_retains_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 10);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
         let replacement = &REVIEWED_CHECK_IDENTITIES[7];
         assert_eq!(
             replacement.source_commit,
@@ -557,7 +555,7 @@ mod linux_tests {
     fn historical_alpha126_requires_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 10);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
         let replacement = &REVIEWED_CHECK_IDENTITIES[8];
         assert_eq!(
             replacement.source_commit,
@@ -635,7 +633,7 @@ mod linux_tests {
     fn alpha127_requires_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 10);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
         let replacement = &REVIEWED_CHECK_IDENTITIES[9];
         assert_eq!(
             replacement.source_commit,
@@ -718,6 +716,73 @@ mod linux_tests {
         );
         assert_eq!(
             reviewed_compiled_profile(replacement.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn local402f_requires_its_own_source_contract_and_exact_check_identity() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
+        let local = &REVIEWED_CHECK_IDENTITIES[10];
+        assert_eq!(
+            local.source_commit,
+            "402f855858cead86d2ded3134a3bc77dfb0e4e26"
+        );
+        let contract = local.contract_sha256.unwrap();
+        assert_eq!(
+            contract,
+            "9773e2d7626275e91c5ee1d5dcb9e8b1413600f36e01e87465babaf084c7d3a3"
+        );
+        assert_eq!(
+            reviewed_compiled_profile(local.source_commit, contract),
+            Ok(LinuxCheckProfile::LOCAL402F)
+        );
+        assert_eq!(
+            LinuxCheckProfile::LOCAL402F.binary_sha256(),
+            "ab13ed4f270574a6ab6e7a460a865522be6d4e54e677f448e3a99bc0808bf5da"
+        );
+        assert_eq!(
+            LinuxCheckProfile::LOCAL402F.input_profile(),
+            LinuxInputProfile::LOCAL402F
+        );
+        assert!(matches!(
+            LinuxCheckProfile::LOCAL402F.input_profile(),
+            LinuxInputProfile::PlainTcpCheckV1(_)
+        ));
+        assert!(LinuxCheckProfile::LOCAL402F
+            .execution_profile()
+            .contains("local402f:app-check-evidence-pending"));
+
+        // A Local contract is not interchangeable with a Formal source or any
+        // historical contract. In particular, 3155/9537 cannot borrow this proof.
+        for historical in &REVIEWED_CHECK_IDENTITIES[..10] {
+            assert_ne!(historical.binary_sha256, local.binary_sha256);
+            assert_eq!(
+                reviewed_compiled_profile(historical.source_commit, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+            if let Some(historical_contract) = historical.contract_sha256 {
+                assert_eq!(
+                    reviewed_compiled_profile(local.source_commit, historical_contract),
+                    Err(CandidateCheckError::Unsupported)
+                );
+            }
+        }
+        for digest in ["", "unknown", local.binary_sha256] {
+            assert_eq!(
+                reviewed_compiled_profile(local.source_commit, digest),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&local.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(local.source_commit, &contract.to_ascii_uppercase()),
             Err(CandidateCheckError::Unsupported)
         );
     }

@@ -305,23 +305,12 @@ const PIPED_SITES: &[PipedSite] = &[
         drain_forms: &["wait_with_output("],
     },
     PipedSite {
-        file: "crates/helper/src/platform/macos/server.rs",
-        anchor: "fn do_native_spawn(",
-        kind: SiteKind::Sink,
-        // 预开日志文件成功走 loggers，失败退化成纯 drainers —— 两条都是生产路径，故两个形态都要在。
-        drain_forms: &[
-            "spawn_pipe_loggers_with_preopened_files",
-            "spawn_pipe_drainers",
-        ],
-    },
-    PipedSite {
-        file: "crates/helper/src/platform/windows/winproc/win.rs",
-        anchor: "fn spawn_tracked(",
-        kind: SiteKind::Sink,
-        drain_forms: &[
-            "spawn_pipe_loggers_with_preopened_files",
-            "spawn_pipe_drainers",
-        ],
+        file: "crates/core-supervisor/src/admitted_payload/macos.rs",
+        anchor: "pub(super) fn configure_main_command(",
+        kind: SiteKind::Producer,
+        // The private factory owns spawn and OwnedReader handoff; its exact
+        // two-stream/lease/terminal chain is pinned with the consumers below.
+        drain_forms: &[],
     },
     // ── crates/system-integration ──
     PipedSite {
@@ -481,9 +470,11 @@ struct Passthrough {
 /// 项必须真盖住至少一处取管道的地方，留着它反而会让本门恒红（实测过一次，正是它把红报出来的）。
 ///
 /// 机制保留：下一个真要透传的人得落进这套规则里，而不是自己新起一张没有过期检查的表。
-const PIPE_PASSTHROUGH: [Passthrough; 2] = [
+const PIPE_PASSTHROUGH: [Passthrough; 4] = [
     Passthrough {file:"crates/core-supervisor/src/admitted_payload.rs",anchor:"impl StdCustodiedChild {",reason:"Private native Child transfers both readers with admitted cohort and Helper lease owners; exact dual-stream contract checked below"},
     Passthrough {file:"crates/helper/src/platform/linux/server.rs",anchor:"fn spawn_verified(",reason:"Receives both owned readers and hands them to the existing bounded pipe loggers before publishing Child custody; exact contract checked below"},
+    Passthrough {file:"crates/helper/src/platform/macos/server.rs",anchor:"fn do_native_spawn(",reason:"Consumes both factory-owned readers, publishes the actual Child, attaches synchronous Fresh log custody before workers; exact contract checked below"},
+    Passthrough {file:"crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",anchor:"pub(in super::super) fn spawn(",reason:"Transfers exact stdout/stderr File owners with the native process/job/cohort custody after suspended admission; WinProcOps takes both and attaches Fresh logger custody synchronously, exact contract checked below"},
 ];
 
 // These are sinks owned by the one private RAII type, not pipe passthroughs
@@ -817,6 +808,17 @@ fn offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
 
 /// 该文件里被登记覆盖的全部块区间（注册表 1 + 注册表 2 + 透传表）。
 fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, usize)> {
+    if matches!(
+        rel,
+        "crates/core-supervisor/src/admitted_payload/macos.rs"
+            | "crates/helper/src/platform/macos/server.rs"
+            | "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs"
+    ) {
+        assert!(
+            platform_factory_stdio_custody_is_complete(index),
+            "native platform factory/consumer lost its exact owned dual-stream custody"
+        );
+    }
     let mut out = Vec::new();
     for site in PIPED_SITES.iter().filter(|s| s.file == rel) {
         out.push(block_range(file_of(index, rel), site.anchor));
@@ -1323,6 +1325,12 @@ fn every_piped_site_is_registered_and_drains_before_it_waits() {
         }
 
         if site.kind == SiteKind::Producer {
+            if site.file == "crates/core-supervisor/src/admitted_payload/macos.rs" {
+                assert!(
+                    platform_factory_stdio_custody_is_complete(&index),
+                    "Mac pipe planning must retain the actual factory and both owned consumers"
+                );
+            }
             // 生产者自己不读，排空责任在注册表 2。本门对它**不再做进一步检查**：它的管道有没有被
             // 交到一个登记在册的消费者手里，由 G2 的文件集合对差与构造点覆盖两条腿负责。
             continue;
@@ -2307,6 +2315,131 @@ fn utility_child_preserves_both_readers_and_actual_child_on_all_terminal_paths()
     }
 }
 
+fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) -> bool {
+    let compact = |body: &str| {
+        body.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let payload = file_of(index, "crates/core-supervisor/src/admitted_payload.rs");
+    let mac = file_of(
+        index,
+        "crates/core-supervisor/src/admitted_payload/macos.rs",
+    );
+    let config = compact(block_of(mac, "pub(super) fn configure_main_command("));
+    if [
+        "stdout(std::process::Stdio::piped())",
+        "stderr(std::process::Stdio::piped())",
+    ]
+    .iter()
+    .any(|needle| config.matches(*needle).count() != 1)
+    {
+        return false;
+    }
+    let factory = compact(block_of(payload, "pub fn spawn_macos_root_helper_main("));
+    for needle in [
+        "macos::configure_main_command(&mutcommand,config,working_directory,pipe);",
+        "macos::attach_store_lease(&mutcommand,store_lease,&self.payload.protected.lease)?",
+        "letchild=command.spawn()?;",
+        "child:Some(child)",
+        "owner:Some(self.payload)",
+        "lease_owner:Some(lease_owner)",
+    ] {
+        if factory.matches(needle).count() != 1 {
+            return false;
+        }
+    }
+    let readers = compact(block_of(payload, "impl StdCustodiedChild {"));
+    for needle in [
+        "child.stdout.take().map(|reader|OwnedReader{",
+        "child.stderr.take().map(|reader|OwnedReader{",
+    ] {
+        if readers.matches(needle).count() != 1 {
+            return false;
+        }
+    }
+    if readers
+        .matches("_owner:Arc::clone(self.owner.as_ref().expect(")
+        .count()
+        != 2
+        || readers
+            .matches("_lease_owner:self.lease_owner.as_ref().cloned()")
+            .count()
+            != 2
+    {
+        return false;
+    }
+    let reader = compact(block_of(payload, "pub struct OwnedReader<R>"));
+    if !reader.contains("_lease_owner:Option<Arc<dynSend+Sync>>")
+        || !reader.contains("_owner:Arc<AdmittedPayload>")
+    {
+        return false;
+    }
+    let mac_helper = file_of(index, "crates/helper/src/platform/macos/server.rs");
+    let spawn = compact(block_of(mac_helper, "fn do_native_spawn("));
+    for needle in [
+        ".spawn_macos_root_helper_main(",
+        "letstdout=child.take_stdout();",
+        "letstderr=child.take_stderr();",
+        ".publish(target,Box::new(OwnedNativeChild(child)))",
+        "birth.attach_core(core,uid);",
+        "spawn_pipe_loggers_with_preopened_files_custodied(stdout,stderr,files,",
+        "spawn_pipe_drainers_custodied(stdout,stderr)",
+        "birth.attach_log_custody(log_custody);",
+    ] {
+        if spawn.matches(needle).count() != 1 {
+            return false;
+        }
+    }
+    if spawn.find("child.take_stderr()").unwrap() > spawn.find(".publish(").unwrap()
+        || spawn.find("birth.attach_log_custody(").unwrap()
+            > spawn.find("spawn_native_worker(").unwrap()
+    {
+        return false;
+    }
+    let issuer = file_of(
+        index,
+        "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",
+    );
+    let issue = compact(block_of(issuer, "pub(in super::super) fn spawn("));
+    for needle in [
+        "system_actor()?;",
+        "create_suspended(",
+        "ResumeThread(suspended.thread.as_raw_handle())",
+        "stdout:suspended.stdout.take().expect(",
+        "stderr:suspended.stderr.take().expect(",
+        "_job:suspended.job.take().expect(",
+        "cohort:Some(Arc::clone(owner))",
+    ] {
+        if issue.matches(needle).count() != 1 {
+            return false;
+        }
+    }
+    let windows = file_of(
+        index,
+        "crates/core-supervisor/src/admitted_payload/windows.rs",
+    );
+    let parts = compact(block_of(windows, "impl WindowsStartedChild {"));
+    if !parts.contains("(self.pid,self.process,self.stdout,self.stderr,self.custody,)") {
+        return false;
+    }
+    let win_helper = file_of(index, "crates/helper/src/platform/windows/winproc/win.rs");
+    let spawn = compact(block_of(win_helper, "fn spawn_tracked("));
+    for needle in [
+        ".spawn_windows_main(file,Path::new(&cwd))?",
+        "let(pid,handle,stdout,stderr,execution_custody)=child.into_parts();",
+        "_execution_custody:execution_custody",
+        "spawn_pipe_loggers_with_preopened_files_custodied(stdout,stderr,files,",
+        "spawn_pipe_drainers_custodied(stdout,stderr)",
+        ".log_custody=Some(log_custody)",
+    ] {
+        if spawn.matches(needle).count() != 1 {
+            return false;
+        }
+    }
+    spawn.find(".log_custody=Some(log_custody)").unwrap() < spawn.find("Ok(CoreStart").unwrap()
+}
+
 #[test]
 fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
     let surface = scan_surface();
@@ -2354,4 +2487,48 @@ fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
         spawn.find("child.take_stderr()").unwrap()
             < spawn.find("ChildSlot::from_admitted_child").unwrap()
     );
+    assert!(platform_factory_stdio_custody_is_complete(&index));
+    for (file, old, replacement) in [
+        (
+            "crates/core-supervisor/src/admitted_payload/macos.rs",
+            "stderr(std::process::Stdio::piped())",
+            "stdout(std::process::Stdio::piped())",
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload.rs",
+            "_lease_owner: self.lease_owner.as_ref().cloned()",
+            "_lease_owner: None",
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",
+            "stderr: suspended.stderr.take()",
+            "stderr: suspended.stdout.take()",
+        ),
+        (
+            "crates/helper/src/platform/macos/server.rs",
+            "birth.attach_log_custody(log_custody)",
+            "drop(log_custody)",
+        ),
+    ] {
+        let original = &file_of(&index, file).masked;
+        assert!(
+            original.contains(old),
+            "mutation must hit actual source: {file}: {old}"
+        );
+        let mutated: Vec<Scanned> = surface
+            .iter()
+            .map(|source| Scanned {
+                rel: source.rel.clone(),
+                masked: if source.rel == file {
+                    source.masked.replace(old, replacement)
+                } else {
+                    source.masked.clone()
+                },
+            })
+            .collect();
+        assert!(
+            !platform_factory_stdio_custody_is_complete(&surface_by_path(&mutated)),
+            "lost reader/lease/Fresh custody must remain red: {file}"
+        );
+    }
 }

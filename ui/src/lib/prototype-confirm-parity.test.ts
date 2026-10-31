@@ -234,6 +234,14 @@ interface ImplOnlyRow {
 }
 
 const IMPL_ONLY: readonly ImplOnlyRow[] = [
+  {
+    key: 'restore-core-data',
+    file: 'components/screens/settings/CoreRecoveryActions.tsx',
+    why:
+      '当前应用的桌面数据恢复是原型没有的新入口。它替换真实损坏的独立 Core 数据槽，' +
+      '成功提交后旧载荷会退休，界面没有撤销回原字节的入口，故要求两次明确点击。' +
+      '仅后端 Ready 时提供；不清用户配置、授权或日志，不授执行许可，也不自动重连或安装助手。',
+  },
   /*
    * 移动端「连接」屏的四处二次确认（F5，2026-09-04；主会话 2026-09-05 合并时登记）。
    *

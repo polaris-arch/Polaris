@@ -331,7 +331,9 @@ fn ordinary_access_acl(bytes: &[u8]) -> bool {
     bytes.len() == 28
         && bytes[..4] == 2u32.to_le_bytes()
         && bytes[4..]
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .zip([1u16, 4, 32])
             .all(|(entry, tag)| {
                 entry[..2] == tag.to_le_bytes()
@@ -802,7 +804,7 @@ impl Request {
             "invalid finite maintenance arguments",
         )?;
         let mut values = BTreeMap::new();
-        for (pair, key) in args[1..].chunks_exact(2).zip(expected) {
+        for (pair, key) in args[1..].as_chunks::<2>().0.iter().zip(expected) {
             require(
                 pair[0] == *key && !pair[1].contains(['\n', '\r', '\0']),
                 "invalid maintenance argument",

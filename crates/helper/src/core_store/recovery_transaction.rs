@@ -11,7 +11,9 @@ mod objects;
 #[cfg(test)]
 mod tests;
 
-use super::{invalid, private_mode, CoreStore, MutationLock};
+#[cfg(not(windows))]
+use super::private_mode;
+use super::{invalid, CoreStore, MutationLock};
 use journal::{Plan, MAX_PLAN};
 use objects::{Directory, Identity, Namespace, Regular};
 use polaris_helper_proto::core_manifest::{CoreId, InstalledCoreManifest};
@@ -114,6 +116,13 @@ pub(super) enum RecoveryState {
 pub(super) struct RepairError {
     pub cause: io::Error,
     pub recovery: RecoveryState,
+    #[cfg_attr(
+        any(not(test), windows),
+        expect(
+            dead_code,
+            reason = "The old io::Error adapter keeps recovery provenance; filesystem readers are Linux/Darwin tests, while current Windows parser-only tests do not consume this retained journal."
+        )
+    )]
     pub journal: Option<PathBuf>,
 }
 
@@ -144,6 +153,13 @@ impl From<RepairError> for io::Error {
 pub(super) enum RepairOutcome {
     NoPendingJournal,
     Installed {
+        #[cfg_attr(
+            any(not(test), windows),
+            expect(
+                dead_code,
+                reason = "The old Installed adapter stays opaque; retain the durable archive receipt. Filesystem readers are Linux/Darwin tests; current Windows parser-only tests do not consume this provenance."
+            )
+        )]
         receipt: PathBuf,
     },
     /// Active candidate and commit are verified. Old objects or journal cleanup
@@ -632,7 +648,7 @@ fn execute(
     cancel: &AtomicBool,
 ) -> Result<RepairOutcome, RepairError> {
     let path = journal_path(ns.store, &plan.selected);
-    let mut transaction = Transaction {
+    let transaction = Transaction {
         namespace: &mut ns,
         plan: &plan,
         path: &path,
@@ -796,10 +812,11 @@ impl Transaction<'_, '_> {
     ) -> io::Result<PathBuf> {
         let mut found = None;
         for path in paths {
-            if objects::exists(path)? && self.namespace.identity_at(path, directory)? == *expected {
-                if found.replace(path.clone()).is_some() {
-                    return Err(invalid("repair object appears in multiple slots"));
-                }
+            if objects::exists(path)?
+                && self.namespace.identity_at(path, directory)? == *expected
+                && found.replace(path.clone()).is_some()
+            {
+                return Err(invalid("repair object appears in multiple slots"));
             }
         }
         found.ok_or_else(|| invalid("repair object missing from owned slots"))

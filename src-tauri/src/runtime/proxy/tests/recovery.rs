@@ -881,7 +881,7 @@ fn diagnostic_two_axes_combine_independently_in_snapshot() {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
 async fn real_core_crash_triggers_auto_restart() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, dir, _core) = real_core_runtime();
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
     // 直接传 config 给 start（不经 save_full：其 validate 要求 tunConfig，而 manual+direct 用不到；
@@ -922,7 +922,7 @@ async fn real_core_crash_triggers_auto_restart() {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
 async fn real_core_crash_feeds_diagnostic_restart_axis() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, dir, _core) = real_core_runtime();
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
 
@@ -975,7 +975,7 @@ async fn real_core_crash_feeds_diagnostic_restart_axis() {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
 async fn real_core_intentional_stop_does_not_restart() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, dir, _core) = real_core_runtime();
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
     // 直接传 config 给 start（不经 save_full：其 validate 要求 tunConfig，而 manual+direct 用不到；
@@ -1012,7 +1012,7 @@ async fn real_core_intentional_stop_does_not_restart() {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门（含 2+5+15s 退避，耗时较长）"]
 async fn real_core_crash_loop_gives_up_without_infinite_restart() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, dir, _core) = real_core_runtime();
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
     // 直接传 config 给 start（不经 save_full：其 validate 要求 tunConfig，而 manual+direct 用不到；

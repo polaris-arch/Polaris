@@ -11,12 +11,15 @@ pub(super) fn checkpoint(point: Point) -> io::Result<()> {
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Reset;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for Reset {
     fn drop(&mut self) {
         FAULT.with(|fault| *fault.borrow_mut() = None);
     }
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fault(callback: impl FnMut(Point) -> io::Result<()> + 'static) -> Reset {
     FAULT.with(|fault| {
         assert!(fault.borrow().is_none());
@@ -24,6 +27,7 @@ fn fault(callback: impl FnMut(Point) -> io::Result<()> + 'static) -> Reset {
     });
     Reset
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fail_once(at: Point) -> Reset {
     let mut fired = false;
     fault(move |point| {

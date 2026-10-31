@@ -1,10 +1,13 @@
 //! One exact compiled-ID recovery slot. No active pointer, startup extraction,
 //! other-version search or executable authority is stored on disk.
 use super::{CoreManifest, InstallStage};
-use polaris_helper::core_store::{CoreStore, InstallOutcome, OwnerPolicy, VerifiedCore};
+#[cfg(not(windows))]
+use polaris_helper::core_store::OwnerPolicy;
+use polaris_helper::core_store::{CoreStore, InstallOutcome, VerifiedCore};
 use std::path::{Path, PathBuf};
 
 pub(crate) const USER_STORE: &str = "selected-core-recovery";
+#[cfg(not(windows))]
 fn owner() -> OwnerPolicy {
     #[cfg(unix)]
     {
@@ -176,6 +179,7 @@ pub(crate) fn recovery_damage_at(
 pub enum UserRecoveryState {
     Installed,
     AlreadyPresent,
+    #[cfg(windows)]
     Unsupported,
     Pending,
 }
@@ -207,10 +211,10 @@ pub(crate) fn install(config: &Path, stage: &InstallStage) -> Result<UserRecover
                 return Err(error("committed data changed"));
             }
             polaris_core_supervisor::admitted_payload::invalidate_selected();
-            return Ok(match outcome {
+            Ok(match outcome {
                 InstallOutcome::Installed => UserRecoveryState::Installed,
                 InstallOutcome::AlreadyPresent => UserRecoveryState::AlreadyPresent,
-            });
+            })
         }
         #[cfg(not(windows))]
         {

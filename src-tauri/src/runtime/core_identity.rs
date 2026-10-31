@@ -53,6 +53,7 @@ pub(crate) fn selected_source_commit(platform: &str) -> Result<String, String> {
     check_compiled_selection()?;
     polaris_core_supervisor::selected_core::selected_source_commit(platform)
 }
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[cfg(test)]
 pub(crate) use polaris_core_supervisor::selected_core::selected_check_source;
 #[cfg(test)]
@@ -195,7 +196,9 @@ pub(crate) fn stage_installation(
     selected: &CoreManifest,
 ) -> Result<InstallStage, String> {
     use polaris_helper_proto::core_manifest::InstalledCoreManifest;
-    use std::fs::{self, OpenOptions};
+    #[cfg(unix)]
+    use std::fs;
+    use std::fs::OpenOptions;
     use std::io::{Read, Write};
     let platform = selected.platform.as_str();
     let expected_helper = selected
@@ -208,7 +211,7 @@ pub(crate) fn stage_installation(
     if helper.parent() != Some(source) {
         return Err("CORE_BUNDLE_MISMATCH: helper belongs to another payload".into());
     }
-    verify_directory(source, &selected)?;
+    verify_directory(source, selected)?;
     let helper_name = if platform == "win" {
         "polaris-helper.exe"
     } else {

@@ -6,7 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { moduleSource, moduleSourceWithTests } from './rust-source.test-support';
+import { moduleSource, moduleSourceWithTests, rustFunctionSource } from './rust-source.test-support';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../');
 const read = (path: string) => readFileSync(resolve(ROOT, path), 'utf8');
@@ -41,25 +41,89 @@ describe('W26 bounded core-log wiring', () => {
       expect(source, module).not.toContain('polaris_log_budget::spawn_pipe_loggers(');
       expect(source, module).not.toContain('polaris_log_budget::spawn_pipe_loggers_with_preopened_files(');
       expect(source, module).not.toContain('polaris_log_budget::spawn_pipe_drainers(');
-      expect(source, module).toContain('std::process::Stdio::piped()');
     }
 
     // 返回的 writer custody 必须跟原 birth/HANDLE 一起持有；仅调用有界 API 不足以守住迟到写入。
     const macos = moduleSource('crates/helper/src/platform/macos/server');
     expect(macos).toContain('birth.attach_log_custody(log_custody);');
     const windows = moduleSource('crates/helper/src/platform/windows/winproc/win');
+    // Windows now creates native inherited pipes inside its execution factory.
+    const windowsExecution = moduleSource('crates/core-supervisor/src/admitted_payload/windows');
+    const windowsIssuer = moduleSource('crates/core-supervisor/src/admitted_payload/windows/issuer/spawn');
+    expect(rustFunctionSource(windowsIssuer, 'pipe')).toContain('CreatePipe(&mut r, &mut w, &sa, 0)');
+    const suspended = rustFunctionSource(windowsIssuer, 'create_suspended');
+    expect(suspended).toMatch(/let \(stdout, out_write\) = pipe\(\)\?;\s*let \(stderr, err_write\) = pipe\(\)\?;/);
+    expect(suspended).toContain('for f in [config, &out_write, &err_write]');
+    expect(suspended).toMatch(/dwFlags = STARTF_USESTDHANDLES;\s*startup.StartupInfo.hStdInput = handles\[0\];\s*startup.StartupInfo.hStdOutput = handles\[1\];\s*startup.StartupInfo.hStdError = handles\[2\];/);
+    expect(rustFunctionSource(windowsIssuer, 'spawn')).toMatch(/stdout: suspended.stdout.take\(\).expect\("stdout"\),\s*stderr: suspended.stderr.take\(\).expect\("stderr"\),/);
+    expect(rustFunctionSource(windowsExecution, 'spawn_windows_main')).toContain('issuer::spawn(&self.payload.protected.inner, config, cwd)');
+    expect(rustFunctionSource(windowsExecution, 'into_parts')).toMatch(/self.stdout,\s*self.stderr,\s*self.custody,/);
+    const tracked = rustFunctionSource(windows, 'spawn_tracked');
+    expect(tracked).toContain('let child = execution.spawn_windows_main(file, Path::new(&cwd))?;');
+    expect(tracked).toMatch(/let \(pid, handle, stdout, stderr, execution_custody\) = child.into_parts\(\);\s*let stdout = Some\(stdout\);\s*let stderr = Some\(stderr\);/);
+    expect(tracked).toMatch(/spawn_pipe_loggers_with_preopened_files_custodied\(\s*stdout,\s*stderr,/);
     expect(windows).toMatch(/custody\s*\.as_mut\(\)\s*\.expect\("published owned HANDLE"\)\s*\.log_custody = Some\(log_custody\);/);
     expect(windows).toContain('if log_custody.revoke().is_err()');
 
     const linux = read('crates/helper/src/platform/linux/server.rs');
     expect(linux).toContain('polaris_log_budget::spawn_pipe_loggers_with_file(');
-    expect(linux).toContain('std::process::Stdio::piped()');
+    const linuxFactory = rustFunctionSource(read('crates/core-supervisor/src/admitted_payload.rs'), 'spawn_linux_helper_run');
+    expect(linuxFactory).toMatch(/if pipe \{\s*command\s*\.stdout\(std::process::Stdio::piped\(\)\)\s*\.stderr\(std::process::Stdio::piped\(\)\);/);
+    const verified = rustFunctionSource(linux, 'spawn_verified');
+    expect(verified).toMatch(/let mut child = execution\s*\.spawn_linux_helper_run\([\s\S]*?pinned_log.is_some\(\),/);
+    for (const stream of ['stdout', 'stderr']) {
+      expect(verified).toContain(`let ${stream} = child.take_${stream}().map(|inner| PinnedReader {`);
+    }
+    expect(verified).toMatch(/spawn_pipe_loggers_with_file\(\s*stdout,\s*stderr,\s*&owned_log_path,/);
     expect(linux).toContain('std::os::unix::fs::fchown(file, Some(uid), Some(gid))');
 
     const budget = read('crates/log-budget/src/lib.rs');
     expect(budget).toContain('after_open(writer.as_ref().map(|opened| &opened.file))');
     expect(budget).toContain('PreopenedRotatingFile::open(files, generation_bytes, OpenMode::Fresh)');
     expect(budget).toContain('PipeLogCustody { writer: shared }');
+  });
+
+  it('Mac factory pipes reach the same custodied bounded sink without losing their owners', () => {
+    const sources = {
+      server: moduleSource('crates/helper/src/platform/macos/server'),
+      execution: read('crates/core-supervisor/src/admitted_payload.rs'),
+      command: moduleSource('crates/core-supervisor/src/admitted_payload/macos'),
+    };
+    const compact = (source: string) => source.replace(/\s+/g, '');
+    const wired = (input: typeof sources): boolean => {
+      const spawn = compact(rustFunctionSource(input.server, 'do_native_spawn'));
+      const factory = compact(rustFunctionSource(input.execution, 'spawn_macos_root_helper_main'));
+      const command = compact(rustFunctionSource(input.command, 'configure_main_command'));
+      const child = input.execution.slice(input.execution.indexOf('impl StdCustodiedChild {'));
+      return spawn.includes('letexecution=core.prepare(polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain)')
+        && /letmutchild=execution\.spawn_macos_root_helper_main\(Path::new\(&params.cfg\),Path::new\(conf_dir\),log_files.is_some\(\),/.test(spawn)
+        && spawn.includes('letstdout=child.take_stdout();')
+        && spawn.includes('letstderr=child.take_stderr();')
+        && spawn.includes('spawn_pipe_loggers_with_preopened_files_custodied(stdout,stderr,files,polaris_log_budget::DEFAULT_GENERATION_BYTES,)')
+        && spawn.includes('spawn_pipe_drainers_custodied(stdout,stderr)')
+        && spawn.includes('birth.attach_log_custody(log_custody);')
+        && factory.includes('macos::configure_main_command(&mutcommand,config,working_directory,pipe);')
+        && factory.includes('letchild=command.spawn()?;')
+        && factory.includes('child:Some(child)')
+        && /ifpipe\{command\.stdout\(std::process::Stdio::piped\(\)\)\.stderr\(std::process::Stdio::piped\(\)\);\}/.test(command)
+        && ['stdout', 'stderr'].every(stream => {
+          const take = compact(rustFunctionSource(child, `take_${stream}`));
+          return take.includes(`child.${stream}.take().map(|reader|OwnedReader{`)
+            && take.includes('_owner:Arc::clone(self.owner.as_ref().expect(')
+            && take.includes('_lease_owner:self.lease_owner.as_ref().cloned(),');
+        });
+    };
+    expect(wired(sources)).toBe(true);
+    const negatives = [
+      { ...sources, execution: sources.execution.replace('working_directory, pipe);', 'working_directory, false);') },
+      { ...sources, command: sources.command.replace('.stderr(std::process::Stdio::piped())', '.stderr(std::process::Stdio::null())') },
+      { ...sources, server: sources.server.replace('let stdout = child.take_stdout();', 'let stdout = None;') },
+      { ...sources, server: sources.server.replace('spawn_pipe_loggers_with_preopened_files_custodied(', 'spawn_pipe_loggers_with_preopened_files(') },
+    ];
+    for (const input of negatives) {
+      expect(input).not.toEqual(sources);
+      expect(wired(input)).toBe(false);
+    }
   });
 
   it('legacy log is surfaced and only archived/deleted after an explicit user action', () => {

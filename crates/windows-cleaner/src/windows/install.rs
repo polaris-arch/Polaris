@@ -176,10 +176,8 @@ impl Descriptor {
         if n == 65536 {
             return Err(error("security text too large"));
         }
-        Ok(
-            String::from_utf16(unsafe { std::slice::from_raw_parts(out, n) })
-                .map_err(|_| error("invalid security text"))?,
-        )
+        String::from_utf16(unsafe { std::slice::from_raw_parts(out, n) })
+            .map_err(|_| error("invalid security text"))
     }
 }
 // SAFETY: descriptor owns validated native memory; requested sections select
@@ -922,7 +920,7 @@ fn read_policy(service: SC_HANDLE) -> io::Result<Policy> {
     let f = config_buffer(service, Some(SERVICE_CONFIG_FAILURE_ACTIONS))?;
     let failure: SERVICE_FAILURE_ACTIONSW = f.value()?;
     if failure.cActions != 3
-        || (failure.lpsaActions as usize) % std::mem::align_of::<SC_ACTION>() != 0
+        || !(failure.lpsaActions as usize).is_multiple_of(std::mem::align_of::<SC_ACTION>())
         || !f.contains(failure.lpsaActions.cast(), 3 * size_of::<SC_ACTION>())
     {
         return Err(error("unsupported SCM recovery"));
@@ -1341,7 +1339,7 @@ impl FileTransaction {
                 .ok_or_else(|| error("managed parent missing"))?,
             self.caller(),
         )?;
-        if !entry_present(&path)? {
+        if !entry_present(path)? {
             std::fs::create_dir(path)?;
             apply_path_security(
                 path,

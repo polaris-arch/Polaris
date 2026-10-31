@@ -86,7 +86,6 @@ use polaris_config_engine::user_config::LogLevel;
 use polaris_core_supervisor::PortExclusions;
 use polaris_helper_proto::Platform;
 use polaris_net_stack::subscription::server_fingerprint;
-use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 
 use crate::events::channel::{
     EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,

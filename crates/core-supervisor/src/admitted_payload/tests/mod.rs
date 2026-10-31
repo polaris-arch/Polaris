@@ -817,7 +817,7 @@ fn permission_failure_remains_environment_io_without_a_reinstall_promise() {
         let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
         let member = payload.diagnostic_path().parent().unwrap().join(name);
         let original = std::fs::metadata(&member).unwrap().permissions();
-        std::fs::set_permissions(&member, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&member, std::fs::Permissions::from_mode(0o0)).unwrap();
         let result = platform::protect_members(&payload.candidate, &payload.policy);
         std::fs::set_permissions(&member, original).unwrap();
         let error = result.unwrap_err();

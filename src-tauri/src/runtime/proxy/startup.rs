@@ -2095,9 +2095,7 @@ impl ProxyRuntime {
                                 ),
                             });
                         }
-                        TokioSpawner::new()
-                            .spawn(req)
-                            .map(|spawned| spawned.child.into())
+                        TokioSpawner::new().spawn(req).map(|spawned| spawned.child)
                     },
                     main_claim_token.clone(),
                     || main_reservation.arm_external_start(),

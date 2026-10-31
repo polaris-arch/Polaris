@@ -4050,8 +4050,7 @@ async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
 async fn real_core_hot_switch_keeps_pid() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, dir, _core) = real_core_runtime();
-    let _cleanup = RealCoreCleanupGuard::new(&rt);
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
     // 两个节点各指到我们自己的本地监听器（127.0.0.1，随机空闲口）→ ③b 直接观测核拨了谁。
@@ -4267,8 +4266,7 @@ async fn real_core_hot_switch_keeps_pid() {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
 async fn real_core_auto_failover_attests_without_applying_saved_debt() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, dir, _core) = real_core_runtime();
-    let _cleanup = RealCoreCleanupGuard::new(&rt);
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
     let (pa, _hits_a) = counting_listener().await;
@@ -4412,8 +4410,7 @@ async fn controlled_http_request(mixed: u16, nonce: &str) -> String {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
 async fn real_core_hot_switch_failure_waits_for_explicit_restart_confirmation() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, dir, _core) = real_core_runtime();
-    let _cleanup = RealCoreCleanupGuard::new(&rt);
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
 
@@ -5503,40 +5500,166 @@ async fn spawn_runs_attestation_after_continuation() {
     );
 }
 
-/// 🔴 **`clash_api_secret` 必须投影读，不得整份深拷贝配置。**
+/// 管理客户端保留捕获的 carrier 与 lease；只有旧配置回退才投影读取 secret。
 ///
-/// # 为什么必须是源码型守卫
-///
-/// `current()` 与 `with_current()` 的返回值**逐字节相同** —— 差别只在「谁付整份 clone 的账」
-/// （`runtime/config.rs:181-196` 自陈）。任何行为断言都区分不出这两者，退回深拷贝**没有任何测试
-/// 会红**，而代价是：调用链 `probe_select_slot → hot_switch_selector → management_api → 本方法`
-/// 意味着**测速一轮 = N 次整份用户配置深拷贝**（含全部 `servers` 与规则），且所有热切节点的路径
-/// 都付这笔账。这正是「静默回退无人察觉」的形态，故补本条结构守卫。
-///
-/// **变异锁**：把 `with_current` 换回 `.current()` → 两条断言全红。
+/// 守卫跟随真实生产 getter，不再依赖已退役的独立 secret wrapper。
+/// 投影与整份 clone 的返回值相同，故以有边界、剥注释的函数体锁定取材路径。
 #[test]
 fn clash_api_secret_projects_instead_of_deep_copying_the_config() {
-    // 取法的单点已收到 `runtime/management_api.rs`；本方法只委托给它，守卫跟到取法所在处。
-    let delegate = method_body(
-        &module_code("runtime/proxy"),
-        "    pub(super) fn clash_api_secret(&self) -> String {",
-    );
+    // Locate in the code view first: a quoted/commented signature or brace must
+    // neither select a fake method nor truncate the real method's boundary.
+    let code_getter = |source: &str, head: &str| {
+        let code = polaris_source_probe::mask_comments_and_strings(source);
+        if head.starts_with("    ") {
+            method_body(&code, head)
+        } else {
+            crate::commands::guard_scan::top_level_fn_body(&code, head)
+        }
+    };
+    let source = crate::test_support::crate_code("runtime/proxy/management_api.rs");
+    let projection_source = crate::test_support::crate_code("runtime/management_api.rs");
+    let client_head = "    pub(crate) async fn current_management_client(";
+    let endpoint_head = "    pub(crate) fn management_endpoint(&self) -> Option<(u16, String)> {";
+    let projection_head = "pub(crate) fn current_clash_api_secret(";
+    let client = code_getter(&source, client_head);
+    let keeps_captured_client = |body: &str| {
+        body.contains(".managed_api_call(expected_port)")
+            && body.contains(".map_err(|_| invalid())?")
+            && body.contains(
+                "Some((control, lease)) => Ok(control.as_ref().clone().retain_lifetime(lease))",
+            )
+            && !body.contains(".config.current()")
+    };
     assert!(
-        delegate.contains("current_clash_api_secret(&self.config)"),
-        "运行时的 secret 必须经唯一的取法单点"
+        keeps_captured_client(&client),
+        "生产调用必须沿捕获的 carrier 借用 lease，过期或不匹配不能回落到另一份凭据"
     );
-    let body = crate::commands::guard_scan::top_level_fn_body(
-        &crate::test_support::crate_code("runtime/management_api.rs"),
-        "pub(crate) fn current_clash_api_secret(",
-    );
+    assert!(client.contains("current_clash_api_secret(&self.config)"));
+    let endpoint = code_getter(&source, endpoint_head);
+    let keeps_captured_endpoint = |body: &str| {
+        let capture = body.find("self.verified_runtime_api_endpoint()");
+        let retired = body.find("self.runtime_api_baseline_present()");
+        let fallback = body.find("current_clash_api_secret(&self.config)");
+        let refuses_retired = body
+            .split_once("if self.runtime_api_baseline_present() {")
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with("return None;"));
+        matches!((capture, retired, fallback), (Some(a), Some(b), Some(c)) if a < b && b < c)
+            && body.contains("return Some((port, secret));")
+            && refuses_retired
+            && !body.contains(".config.current()")
+    };
     assert!(
-        body.contains("with_current"),
+        keeps_captured_endpoint(&endpoint),
+        "端口与 secret 必须来自同一运行快照，存在失效基线时不能使用当前已保存配置"
+    );
+    let body = code_getter(&projection_source, projection_head);
+    let projects_secret = |body: &str| {
+        body.contains("config.with_current(clash_api_secret_in)") && !body.contains(".current()")
+    };
+    assert!(
+        projects_secret(&body),
         "必须走持锁投影：只取一个字符串字段，不 clone 整份配置"
     );
-    assert!(
-        !body.contains(".current()"),
-        "`current()` 恒 clone 整份用户配置（含全部 servers）—— 热切路径上按 N 次计费"
-    );
+
+    // 有限断链负控：去掉 carrier、lease、成对端点或投影，守卫必须拒绝。
+    assert!(!keeps_captured_client(&client.replace(
+        ".managed_api_call(expected_port)",
+        ".management_api()"
+    )));
+    assert!(!keeps_captured_client(
+        &client.replace(".retain_lifetime(lease)", "")
+    ));
+    assert!(!keeps_captured_endpoint(
+        &endpoint.replace("self.verified_runtime_api_endpoint()", "None")
+    ));
+    assert!(!keeps_captured_endpoint(
+        &endpoint.replace("self.runtime_api_baseline_present()", "false")
+    ));
+    assert!(!projects_secret(
+        &body.replace(".with_current(clash_api_secret_in)", ".current()")
+    ));
+
+    // The three real getters share only these finite lexical controls. Their
+    // strings contain no evidence required by the predicates above.
+    for (source, head, required, accepts) in [
+        (
+            source.as_str(),
+            client_head,
+            ".managed_api_call(expected_port)",
+            keeps_captured_client as fn(&str) -> bool,
+        ),
+        (
+            source.as_str(),
+            endpoint_head,
+            "self.verified_runtime_api_endpoint()",
+            keeps_captured_endpoint as fn(&str) -> bool,
+        ),
+        (
+            projection_source.as_str(),
+            projection_head,
+            "config.with_current(clash_api_secret_in)",
+            projects_secret as fn(&str) -> bool,
+        ),
+    ] {
+        // Raw text is used only to manufacture decoys. Real proof always goes
+        // through code_getter on the entire source, before selecting a body.
+        let (raw, close) = if head.starts_with("    ") {
+            (method_body(source, head), "\n    }\n")
+        } else {
+            (
+                crate::commands::guard_scan::top_level_fn_body(source, head),
+                "\n}\n",
+            )
+        };
+        // The top-level extractor includes the signature; method_body omits it.
+        let definition = if head.starts_with("    ") {
+            format!("{head}{raw}{close}")
+        } else {
+            format!("{raw}{close}")
+        };
+        assert_eq!(definition.matches(required).count(), 1);
+        let broken = definition.replacen(required, "missing_owner_call()", 1);
+        let open = definition.find('{').expect("real getter body") + 1;
+        let broken_open = broken.find('{').expect("broken getter body") + 1;
+        let line_comment = definition
+            .lines()
+            .map(|line| format!("// {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for decoy in [
+            format!("const DECOY: &str = {definition:?};\n"),
+            format!("const DECOY: &str = r###\"{definition}\"###;\n"),
+            format!("{line_comment}\n"),
+            format!("/* {definition} */\n"),
+            format!("/* outer /* {definition} */ end */\n"),
+        ] {
+            let valid = format!("{}\n{decoy}{}", &definition[..open], &definition[open..]);
+            assert!(
+                accepts(&code_getter(&valid, head)),
+                "non-code decoy must not hide the real getter"
+            );
+            let invalid = format!(
+                "{}\n{decoy}{}",
+                &broken[..broken_open],
+                &broken[broken_open..]
+            );
+            assert!(
+                !accepts(&code_getter(&invalid, head)),
+                "same-body non-code must not replace a real call"
+            );
+            let renamed = broken.replacen(head, &head.replacen("fn ", "fn unrelated_", 1), 1);
+            let fake_only = format!("{decoy}{renamed}");
+            assert!(
+                std::panic::catch_unwind(|| code_getter(&fake_only, head)).is_err(),
+                "a non-code function cannot select its own fake body"
+            );
+        }
+        let duplicate = format!("{definition}{definition}");
+        assert!(
+            std::panic::catch_unwind(|| code_getter(&duplicate, head)).is_err(),
+            "ambiguous real definitions must not select the first body"
+        );
+    }
 }
 
 // ══════════════ §15：测速 dirty 波前预筛的指纹开口 ══════════════

@@ -1,5 +1,5 @@
 //! 进程监管 owner：受管核的杀停（直起 / helper 两腿）、启动期 stale-core 清扫与 root 孤儿提权清扫、
-//! 起核后的内核二进制自证，以及 pid 层的观测原语（实跑 exe 路径 / 信号 / 探活 / 进程身份令牌）。
+//! 起核后的内核二进制自证，以及 pid 层的观测原语（信号 / 探活 / 进程身份令牌）。
 //!
 //! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs`），
 //! façade 必须 `pub(crate) use` 再导出（§B.3）。
@@ -1799,46 +1799,11 @@ impl StaleCoreIo for NativeStaleCoreIo {
     }
 }
 
-/// **观测腿**：内核记账里该 pid 正在执行的可执行文件路径（读不到 → `None`）。
-///
-/// 这是[内核自证](ProxyRuntime::attest_running_core_binary)的**事实来源**，其价值全在于它与
-/// 「app 请求了什么」完全独立 —— 问的是操作系统「这个进程实际是从哪个文件起来的」。
-///
-/// - **linux**：读 `/proc/<pid>/exe` 符号链接（内核直给，最硬的一手证据）。二进制在进程起来后被
-///   替换/删除时内核会给出 `<路径> (deleted)`，此处剥掉该后缀还原原路径（否则恒判不等 = 假告警）。
-/// - **macOS**：`ps -p <pid> -o comm=`（无 `/proc`；`comm` 给的是完整路径而非 16 字节的 `p_comm`
-///   短名——2026-07-31 在 p101 以普通用户查 root helper 实测得到完整 46 字符路径）。
-///   受保护核路径含空格，故 `comm=` 必须是**唯一**输出字段，整行即路径。
-/// - **windows**：返 `None`（无低成本 std 途径）。`None` ⇒ 判 `Unobservable` ⇒ 只 warn 不误报。
-///   **P4 起该平台已有受保护核目录**（`C:\ProgramData\Polaris\core`），故本自证在 win 上不再是
-///   「本就没价值」而是「这条腿还没接」——真正的 win 侧实跑映像来自 D2/D3 的 `status` 回传
-///   `image=`（见 spec §3.1），不是本函数。
-#[cfg(test)]
-fn running_exe_path(pid: u32) -> Option<PathBuf> {
-    // pid=0 = 调用方还没拿到真 pid（helper 未回传 / spawn 失败）→ 没有可观测对象。
-    if pid == 0 {
-        return None;
-    }
-    running_exe_path_impl(pid)
-}
-
-/// **第二观测腿**：helper `status` 回传的实跑映像（`image=`，D2）。
-///
-/// 同步 IPC，只在 [`running_exe_path`] 取不到时才调用（Windows 的 helper 腿）。通信/协议失败
-/// 一律 `None` —— 读不到就是读不到，自证据此判 `Unobservable`（只 warn），绝不冒充通过。
-#[cfg(test)]
-fn helper_reported_core_image(
-    helper: Option<&crate::runtime::helper::HelperRuntime>,
-    pid: u32,
-) -> Option<PathBuf> {
-    let status = helper?.managed_core_status().ok()?;
-    image_from_managed_status(&status, pid)
-}
-
 /// 纯判定：**只有 helper 手里的受管 pid 与本代 pid 相同**才采信它回传的 image。
 ///
 /// pid 对不上说明 helper 正管着另一个会话的核 —— 拿它的映像去和本代期望值对账，判等判不等都是
 /// 在回答另一个问题；那种结论比「没观测到」更坏，因为它看起来像事实。
+#[cfg(test)]
 pub(super) fn image_from_managed_status(
     status: &crate::runtime::helper::ManagedCoreStatus,
     want_pid: u32,
@@ -1856,35 +1821,6 @@ pub(super) fn image_from_managed_status(
         }
         _ => None,
     }
-}
-
-/// [`running_exe_path`] 的 linux 实现：`/proc/<pid>/exe` 符号链接（内核直给）。
-#[cfg(target_os = "linux")]
-fn running_exe_path_impl(pid: u32) -> Option<PathBuf> {
-    let loaded = PathBuf::from(format!("/proc/{pid}/exe"));
-    std::fs::read_link(&loaded).ok()?;
-    // Observe and execute the loaded object, never a mutable reconstructed pathname.
-    Some(loaded)
-}
-
-/// [`running_exe_path`] 的 macOS 实现：`ps -p <pid> -o comm=`（无 `/proc`）。
-#[cfg(target_os = "macos")]
-fn running_exe_path_impl(pid: u32) -> Option<PathBuf> {
-    let out = polaris_core_supervisor::macos_ps::command(&["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let line = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    // 进程已退出时 ps 可能成功但无输出 → 别把空串当成一个路径。
-    (!line.is_empty()).then(|| PathBuf::from(line))
-}
-
-/// [`running_exe_path`] 的其余平台实现：无低成本 std 途径 → 恒 `None`（判 `Unobservable`，不误报）。
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn running_exe_path_impl(_pid: u32) -> Option<PathBuf> {
-    None
 }
 
 /// 发信号给 pid（core-supervisor [`polaris_core_supervisor::ProcessKiller`] 的注入点）。
@@ -1959,21 +1895,21 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
 /// **不回答「是不是我那个」**。核死后 pid 被系统复用，探活恒真 ⇒ 崩溃自愈永不触发，
 /// 用户看到 `running: true` 而代理全断。直起腿不受影响（`child.try_wait()` 认的是句柄不是号码）。
 ///
-/// # 为什么不复用 [`running_exe_path`]
+/// # 为什么不用可执行文件路径判定进程身份
 ///
-/// 它在本场景最需要的两个平台上取不到材料：linux 的 `/proc/<pid>/exe` 对 root / setuid 降权后的
-/// 进程，普通用户读会 `EACCES`（helper 腿的核正是这两类）；windows 侧它恒 `None`。
+/// linux 的 `/proc/<pid>/exe` 对 root / setuid 降权后的进程，普通用户读会 `EACCES`
+/// （helper 腿的核正是这两类）；同一路径也不能区分复用同一个 pid 的两个进程。
 ///
 /// # 各平台取什么（性质相同：**活着期间恒定不变，换了进程必不同**）
 ///
 /// - **linux**：`/proc/<pid>/stat` 的 starttime（第 22 字段）。该文件**世界可读**，不受属主与
 ///   dumpable 影响 —— 正是 exe 那条路取不到时仍取得到的那一格。
-/// - **macos**：`ps -p <pid> -o lstart=`（跨用户可读，同 [`running_exe_path`] 的 mac 腿）。
+/// - **macos**：`ps -p <pid> -o lstart=`（跨用户可读的创建时间）。
 /// - **windows**：`OpenProcess + GetProcessTimes` 的创建时间。它比旧 `tasklist` 映像名更强（同名
 ///   进程复用 PID 也能识别），且不再为每次探活启动一个约 3.5s 的外部进程。
 /// - **其余平台**：`None` ⇒ 判 [`PidIdentity::Unobservable`]，只跳过、**绝不**据此报崩溃。
 pub(super) fn process_identity(pid: u32) -> Option<String> {
-    // pid=0 = 还没拿到真 pid → 没有可观测对象（同 `running_exe_path` 的口径）。
+    // pid=0 = 还没拿到真 pid → 没有可观测对象。
     if pid == 0 {
         return None;
     }
@@ -2032,8 +1968,7 @@ pub(super) enum PidIdentity {
 ///
 /// **「没观测到」绝不折成「不匹配」**：取不到材料（平台不支持 / 读失败 / 进程刚好在这一刻消失）
 /// 一律 [`PidIdentity::Unobservable`]。折成 `Mismatch` 会把一次读失败变成一次**假崩溃**，
-/// 而假崩溃的下游是自动重启 —— 本仓在 `running_exe_path` 那条自证腿上写过同一句：
-/// 没观测到 ≠ 观测到没问题。
+/// 而假崩溃的下游是自动重启，因此没观测到不能当作原进程已经退出。
 pub(super) fn pid_identity_verdict(baseline: Option<&str>, current: Option<&str>) -> PidIdentity {
     match (baseline, current) {
         (Some(a), Some(b)) if a == b => PidIdentity::Match,
@@ -2050,26 +1985,6 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
 // Inventory resolves selected candidate data, then admits TlsInventory only.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ProxyRuntime {
-    #[cfg(test)]
-    pub(super) fn tls_ready_binary_for_pid(
-        &self,
-        pid: u32,
-        via_helper: bool,
-    ) -> Option<std::path::PathBuf> {
-        #[cfg(target_os = "linux")]
-        {
-            let image = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
-            if image.is_file() {
-                return Some(image);
-            }
-        }
-        running_exe_path(pid).or_else(|| {
-            via_helper
-                .then(|| helper_reported_core_image(Some(self.helper.as_ref()), pid))
-                .flatten()
-        })
-    }
-
     pub(super) fn tls_capability_selection(
         &self,
     ) -> Result<super::core_binary::CoreSelectionObservation, String> {

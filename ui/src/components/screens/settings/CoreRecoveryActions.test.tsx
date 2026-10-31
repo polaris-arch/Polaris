@@ -51,6 +51,16 @@ beforeEach(() => {
   h.result = null; h.busy = false; h.inFlight.current = false; h.armed = null;
 });
 describe('current-app offline recovery consumer', () => {
+  it.each([
+    'ready', 'restored', 'notNeeded', 'stopRequired',
+    'helperRequired', 'reinstallRequired', 'unavailable', 'pending',
+  ] satisfies CoreRecoveryState[])('renders the status translation for %s without invoking recovery', state => {
+    h.result = state;
+    expect(nodes(tree()).find(node => node.props.role === 'status')?.props.children).toBe(`coreRecovery.${state}`);
+    expect(h.check).not.toHaveBeenCalled();
+    expect(h.restore).not.toHaveBeenCalled();
+  });
+
   it('offers only a cold check before the backend verifies a real recovery source', async () => {
     h.check.mockResolvedValue('ready');
     expect(html()).toContain('coreRecovery.check');

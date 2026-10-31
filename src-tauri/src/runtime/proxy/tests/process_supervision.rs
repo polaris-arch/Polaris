@@ -1549,7 +1549,7 @@ fn windows_sweep_ends_processes_by_held_handle_not_by_pid() {
 async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
     let _real_core_guard = lock_real_core_tests().await;
     use std::process::Stdio;
-    let (rt, dir, real_core) = real_core_runtime();
+    let (rt, dir, real_core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     // 清扫按这个目录认归属；孤儿的配置必须是它的直接子项。
     assert_eq!(rt.config.dir(), dir.as_path());

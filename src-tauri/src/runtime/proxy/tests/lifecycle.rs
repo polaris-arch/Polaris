@@ -1057,8 +1057,7 @@ async fn real_core_full_lifecycle() {
     // 前置断言：env 未设即失败（不静默跳过）。resolve_core_binary 读同一个 env，
     // 故此处**不 set/remove**——两个真机测试同进程跑，改动进程级 env 会互相踩（实测：
     // 先跑完的那个 remove 掉，后跑的 require_core 直接 panic）。
-    let (rt, dir, _core) = real_core_runtime();
-    let _cleanup = RealCoreCleanupGuard::new(&rt);
+    let (rt, dir, _core, _cleanup) = real_core_runtime();
     let mixed = free_port();
     // 装日志 sink：否则 log:: 全是 no-op，核的 stdout/stderr 无处可看（也顺带验证 logging.rs 接线）。
     crate::logging::init(&dir);
@@ -1231,8 +1230,7 @@ async fn real_core_full_lifecycle() {
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
 async fn real_core_lifecycle_race_start_then_immediate_stop() {
     let _real_core_guard = lock_real_core_tests().await;
-    let (rt, _dir, _core) = real_core_runtime();
-    let _cleanup = RealCoreCleanupGuard::new(&rt);
+    let (rt, _dir, _core, _cleanup) = real_core_runtime();
     // 孤儿基线：快速起停 3 轮后系统内 sing-box 进程数不得增长。
     let baseline = singbox_proc_count();
 
