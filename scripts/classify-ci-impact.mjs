@@ -592,20 +592,11 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + 'and their linked Rust cdylib; desktop tests cannot validate the packaged Android error adapter.',
   },
   'src-tauri/src/runtime/proxy.rs': {
-    why: 'Android Debug observer/probe modules and original Start-input ownership are wired by Android cfg in this module. '
+    why: 'Android production lifecycle, native input diagnostics and command routing are wired by Android cfg in this module. '
       + 'A fresh APK must compile and link these Rust cdylib branches; source registration does not attest runtime attribution.',
   },
-  'src-tauri/src/runtime/proxy/android_probe_loan.rs': {
-    why: 'Android Debug lends the original generation, birth, revision, digest and authenticated probe-input metadata through the native bridge. '
-      + 'APK Rust/JNI compilation verifies the typed adapter is packaged; actual ingress and UID attribution still require device evidence.',
-  },
-  'src-tauri/src/runtime/proxy/debug_pc_echo.rs': {
-    why: 'Android Debug validates the private authenticated PC-ready target against the original probe loan and erases its owned nonce. '
-      + 'This Android-only native admission code enters the APK Rust cdylib; dep-info and fresh APK compilation must cover it. '
-      + 'Source registration and compilation do not prove an installed package or live LAN witness.',
-  },
   'src-tauri/src/runtime/proxy/hot_switch.rs': {
-    why: 'Android Debug binds an accepted reload revision to the original probe owner in Android cfg branches. '
+    why: 'Android hot switching applies accepted reloads and preserves the production configuration lifecycle in Android cfg branches. '
       + 'These linked Rust inputs require a fresh APK; successful compilation does not prove runtime generation ownership.',
   },
   'src-tauri/src/runtime/speedtest.rs': {
@@ -902,14 +893,6 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     '原 cfg(test) Child/supervisor 回归在 ci.yml 的 host cargo test --workspace 核真实 mock close/retry 与保留 Entry/config 的负门，不随 APK 发布。'
     + 'Android cargo check -p polaris 未包含测试目标，APK 构建同样不编 test target；Android test cfg 的编译/运行缺口仍如实保留，'
     + 'host close fixture 不能签 JNI terminal、实际 native retirement 或设备验收。',
-  'src-tauri/src/commands/android_batch_qa.rs':
-    '单一 Debug Android 批次入口；android+debug_assertions 分支走已有预算 plugin 桥，其他构型零资源 disabled stub。'
-    + 'Android cargo check 守 cfg 类型，check-android-bridge A15 守 release guard/实际 BoxService 观察接线；'
-    + 'APK 构建不会执行 socket、SDK snapshot、OEM guardian 或独立 peer 验收。',
-  'src-tauri/src/commands/android_transient_close_qa.rs':
-    'ACC-01 临时内核关闭超时调试命令；仅 android+debug_assertions 调用现有 plugin 桥，release/desktop 为 disabled stub。'
-    + 'ci.yml 的 aarch64-linux-android cargo check 覆盖 Android debug cfg 类型；check-android-bridge.mjs A17 '
-    + '核对命令、实例发现与注入接线。APK release 构建不执行 debug 注入，也不能证明实际 8 秒让位或重启恢复。',
   'src-tauri/src/runtime/updater.rs':
     'Bundled-version display now delegates to runtime/core_version.rs; Android and iOS still report no desktop patch set. '
     + 'cargo check --target aarch64-linux-android -p polaris type-checks production parsing and admission, while host updater/tests exercises legacy '

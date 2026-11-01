@@ -1404,166 +1404,24 @@ a14SelfCheck();
   }
 }
 
-// A15: the finite QA command must stay debug-only and observe actual JNI/ACK sites.
+// Actual Android Start/Reload input observations and acknowledgements remain product diagnostics.
 {
-  const qa = kotlinCommands.get('debugBatchQa');
-  const body = qa?.body ?? '';
-  const guard = body.indexOf('if (!BuildConfig.DEBUG)');
-  const args = body.indexOf('invoke.parseArgs(DebugBatchQaArgs::class.java)');
-  const dispatch = body.indexOf('DebugBatchCommandExecutor.value.execute');
-  if (guard < 0 || args <= guard || dispatch <= args || !body.slice(guard, args).includes('return')) fail('A15 Debug batch release guard must precede executor/args/resource admission');
-  const admission = body.indexOf('DebugBatchQa.commandTask(activity, args.action, args.sessionId, args.plan');
-  if (admission <= args || dispatch <= admission || !body.includes('execute(task)') || body.includes('DebugBatchQa.command(activity'))
-    fail('A15 Batch command must capture its original session ticket before queueing');
-  const qaSource = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugBatchQa.kt'), 'utf8'));
-  const tick = kotlinFnBody(qaSource, 'guardTick') ?? '';
-  if (!tick.includes('DebugBatchGuard.abortReason(') || !tick.includes('previous?.bindingCurrent') ||
-      /bindingCurrent\(|MainKernelAttemptRegistry|getSystemService|\.readText\(|java\.io\./.test(tick))
-    fail('A15 Guardian deadline must use local/stamped metadata without synchronous registry/SDK/files');
-  const metadata = kotlinFnBody(qaSource, 'metadataReport') ?? '';
-  if (!metadata.includes('session.completeFor(reporter)') || !metadata.includes('CachedReadOnlyMetadata') ||
-      /bindingCurrent\(|snapshotBody\(|getSystemService|MainKernelAttemptRegistry|\.readText\(|java\.io\./.test(metadata))
-    fail('A15 Cleanup reporter must stay metadata-only and exclude only its exact ticket');
-  if (!qaSource.includes('original to checkNotNull(original.lease.commandBorn(action))') ||
-      !qaSource.includes('DebugBatchCommandTask(session.lease, ticket,') || !qaSource.includes('session.prepared && session.bindingCurrent()'))
-    fail('A15 Original session admission or provisional-before-arm verification missing');
   const box = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/BoxService.kt'), 'utf8'));
   if ((box.match(/observeNativeInput\(attempt, server, config,/g) ?? []).length !== 2 ||
-      !box.includes('Thread.holdsLock(attempt.operationLock)') || !box.includes('DebugAppliedInputs.witness.returned(token, current() && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt))')) fail('A15 Actual Start/Reload JNI input observation or operationLock binding missing');
+      !box.includes('Thread.holdsLock(attempt.operationLock)') || !box.includes('DebugAppliedInputs.witness.returned(token, current() && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt))')) fail('Actual Start/Reload JNI input observation or operationLock binding missing');
   const ack = box.indexOf('val accepted = VpnBridge.finishStart(null, attempt = attempt)');
-  if (ack < 0 || box.indexOf('DebugAppliedInputs.witness.acknowledge(attempt, it, accepted)', ack) < ack) fail('A15 Start witness must use actual finishStart acceptance');
+  if (ack < 0 || box.indexOf('DebugAppliedInputs.witness.acknowledge(attempt, it, accepted)', ack) < ack) fail('Start witness must use actual finishStart acceptance');
   const stop = box.indexOf('state = ServiceState.Stopping');
   const seal = box.indexOf('DebugAppliedInputs.witness.seal(attempt)', stop);
-  if (stop < 0 || seal < stop || seal > box.indexOf('attempt.revokeAndDetachTun()', stop)) fail('A15 Stop must seal the exact input observer before native cleanup');
-  const command = stripComments(readFileSync(join(RUST_SRC, 'commands/android_batch_qa.rs'), 'utf8'));
-  if (!command.includes('#[cfg(all(target_os = "android", debug_assertions))]') ||
-      !command.includes('#[cfg(not(all(target_os = "android", debug_assertions)))]') || !command.includes('Debug Android batch QA is disabled')) fail('A15 Rust release/non-Android disabled stub missing');
+  if (stop < 0 || seal < stop || seal > box.indexOf('attempt.revokeAndDetachTun()', stop)) fail('Stop must seal the exact input observer before native cleanup');
 }
 
-// A16: native Debug loan keeps exact Start/session credential and private sender admission.
+// Preserve the normal transient speedtest cleanup bound after retiring fault injection.
 {
-  const loanRust = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/android_probe_loan.rs'), 'utf8'));
-  const startRust = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/startup.rs'), 'utf8'));
-  const loanKt = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugCoreProbeLoan.kt'), 'utf8'));
-  const qa = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugBatchQa.kt'), 'utf8'));
-  const bridge = stripComments(readFileSync(join(RUST_SRC, 'runtime/proxy/android_bridge.rs'), 'utf8'));
-  const command = stripComments(readFileSync(join(RUST_SRC, 'commands/android_batch_qa.rs'), 'utf8'));
-  for (const [name, args, admission] of [
-    ['debugCoreProbeScope', 'DebugCoreProbeSessionArgs', 'DebugBatchQa.coreProbeScopeTask('],
-    ['debugCoreProbeLoan', 'DebugCoreProbeLoanEnvelopeArgs', 'DebugBatchQa.coreProbeLoanTask('],
-  ]) {
-    const body = kotlinCommands.get(name)?.body ?? '';
-    const guard = body.indexOf('if (!BuildConfig.DEBUG)');
-    const parse = body.indexOf(`invoke.parseArgs(${args}::class.java)`);
-    const admit = body.indexOf(admission);
-    const queue = body.indexOf('DebugBatchCommandExecutor.value.execute(task)');
-    if (guard < 0 || parse <= guard || admit <= parse || queue <= admit || !body.slice(guard, parse).includes('return'))
-      fail(`A16 ${name} must guard Release and admit its original ticket before queueing`);
-  }
-  const fields = ['bootNonce', 'sessionId', 'nonce', 'planSha256', 'apkSha256', 'expectedSourcePin', 'generation',
-    'runId', 'birthNonce', 'revision', 'configDigest', 'deadlineElapsed', 'probePort', 'ingressKind',
-    'pcReadyRequestId', 'expiresElapsed', 'password'];
-  const rustFields = rustStructs.get('DebugCoreProbeLoanPayload')?.wireFields ?? [];
-  const argsBody = /class DebugCoreProbeLoanArgs\s*\{([\s\S]*?)override fun toString/.exec(loanKt)?.[1] ?? '';
-  const ktFields = [...argsBody.matchAll(/(?:lateinit\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*:/g)].map(m => m[1]);
-  if ([rustFields, ktFields].some(actual => actual.length !== fields.length || fields.some(f => !actual.includes(f))))
-    fail('A16 native loan exact wire field set differs between Rust and Kotlin');
-  if (!/self\.record_android_probe_start\(\s*my_gen\s*,\s*&android_birth\s*,\s*&receipt\s*,\s*&gate_config_json\s*,?\s*\)/.test(startRust) ||
-      !startRust.includes('self.publish_android_probe_snapshot(') || !loanRust.includes('receipt.config_digest.clone()') ||
-      !loanRust.includes('with_current_generation(b.generation') || !loanRust.includes('s.android_probe_input.as_ref() != Some(b)') ||
-      /local_http_proxy\(|current_config|startup_snapshot|config\.current\(/.test(loanRust))
-    fail('A16 loan must bind actual Start receipt, publication and one current generation; no user-config/getter reconstruction');
-  const init = /pub\(crate\) fn init\(\)[\s\S]*?enum BridgeCallError/.exec(bridge)?.[0] ?? '';
-  if (!init || init.includes('invoke_handler') || /password|probe_port|DebugCoreProbeLoanArgs/.test(command))
-    fail('A16 credential loan must stay native-only; no JS plugin handler or public secret/port input');
-  const privateTask = kotlinFnBody(qa, 'privateProbeTask') ?? '';
-  const senderTask = kotlinFnBody(qa, 'coreProbeLoanTask') ?? '';
-  if (!privateTask.includes('original.lease.commandBorn("probe")') || !privateTask.includes('session.lease.publish(buffer)') ||
-      !privateTask.includes('DebugCoreProbeCredentialBuffer') || !loanKt.includes('witness.snapshotFor(owner, server)') ||
-      !loanKt.includes('synchronized(owner.operationLock)') ||
-      /java\.net\.|Socket\(|CONNECT|bindProcessToNetwork|\.protect\(/.test(loanKt))
-    fail('A16 loan must retain original queued credential, actual Main witness and no transport factory in the loan');
-  if (!senderTask.includes('it.requestId == args.pcReadyRequestId') ||
-      !senderTask.includes('it.current(SystemClock.elapsedRealtime())') ||
-      !senderTask.includes('loan.isCurrent(SystemClock.elapsedRealtime(), DebugCoreProbeLoan.currentInput())') ||
-      !senderTask.includes('DebugPcEchoSender.run(loan, ready, session.lease, channel, session::allowed)') ||
-      !loanRust.includes('loan.pc_ready_request_id = admitted.request_id().to_owned();') ||
-      !loanRust.includes('loan.expires_elapsed = loan.expires_elapsed.min(admitted.deadline_elapsed());'))
-    fail('A16 private sender must bind the admitted Ready request and deadline to the original current loan');
-  const box = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/BoxService.kt'), 'utf8'));
-  const nativeInput = kotlinFnBody(box, 'observeNativeInput') ?? '';
-  const invalidate = nativeInput.indexOf('DebugBatchQa.nativeInputChanged(attempt)');
-  const begin = nativeInput.indexOf('DebugAppliedInputs.witness.begin(');
-  const stop = box.indexOf('state = ServiceState.Stopping');
-  const stopRevoke = box.indexOf('DebugBatchQa.nativeInputChanged(attempt)', stop);
-  if (invalidate < 0 || begin <= invalidate || stopRevoke <= stop || stopRevoke >= box.indexOf('attempt.revokeAndDetachTun()', stop) ||
-      !qa.includes('original.lease.revokeProbeCredentials()') || !loanKt.includes('refreshInput(actual)'))
-    fail('A16 actual Start/Reload/Stop must fence credentials before input mutation; grant must refresh under operationLock');
-  const lease = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/DebugBatchLease.kt'), 'utf8'));
-  const seal = kotlinFnBody(lease, 'seal') ?? '';
-  const erase = seal.indexOf('credentials.forEach(::eraseProbeCredential)');
-  if (erase < 0 || erase >= seal.indexOf('owned.forEach(::closeHandle)') ||
-      !lease.includes('is DebugCoreProbeLoan -> value.erase()'))
-    fail('A16 session seal must erase known pure credential records before arbitrary original Close');
-}
-
-// A17: ACC-01 fault code is compiled only from the debug source set; hooks preserve real cleanup.
-{
-  const command = stripComments(readFileSync(join(RUST_SRC, 'commands/android_transient_close_qa.rs'), 'utf8'));
-  const plugin = kotlinCommands.get('debugTransientCloseTimeout')?.body ?? '';
-  const guard = plugin.indexOf('if (!BuildConfig.DEBUG)');
-  const parse = plugin.indexOf('invoke.parseArgs(DebugTransientCloseTimeoutArgs::class.java)');
-  if (guard < 0 || parse <= guard || !plugin.slice(guard, parse).includes('return') ||
-      !plugin.includes('DebugTransientCloseTimeout.process.arm(args.targetKind, args.instanceId, args.targetToken)') ||
-      !plugin.includes('armedUntilProcessRestart')) fail('A17 Release must reject before parsing/arming the exact transient target');
-  const discover = kotlinCommands.get('debugTransientCloseTargets')?.body ?? '';
-  const discoverGuard = discover.indexOf('if (!BuildConfig.DEBUG)');
-  const snapshot = discover.indexOf('DebugTransientCloseTimeout.process.currentTargets()');
-  if (discoverGuard < 0 || snapshot <= discoverGuard || !discover.slice(discoverGuard, snapshot).includes('return') ||
-      !discover.includes('targets.put(debugTransientCloseTarget(kind, id, token))') ||
-      !discover.includes('invoke.resolve(JSObject().put("targets", targets))'))
-    fail('A17 Target discovery must reject Release before reading a current registry snapshot');
-  if (!command.includes('#[cfg(all(target_os = "android", debug_assertions))]') ||
-      !command.includes('#[cfg(not(all(target_os = "android", debug_assertions)))]') ||
-      !command.includes('Debug transient close timeout is disabled') ||
-      !/matches!\(\s*target_kind\.as_str\(\),\s*"speedtest"\s*\|\s*"login"\s*\)/.test(command) || !command.includes('instance_id.len() > 256') ||
-      !command.includes('b.is_ascii_alphanumeric() || b"._:-".contains(&b)') ||
-      !command.includes('target_token.len() != 16') ||
-      !command.includes("b.is_ascii_digit() || (b'a'..=b'f').contains(&b)")) fail('A17 Rust finite debug profile or disabled stub missing');
-  const relative = 'java/com/polaris2/app/vpn/DebugTransientCloseTimeout.kt';
-  const debug = stripComments(readFileSync(join(KOTLIN_SRC, '../../debug', relative), 'utf8'));
-  const release = stripComments(readFileSync(join(KOTLIN_SRC, '../../release', relative), 'utf8'));
-  const currentTargets = kotlinFnBody(debug, 'currentTargets') ?? '';
-  if (!currentTargets.includes('Triple(key.first, key.second, target.token)') ||
-      !currentTargets.includes('.sortedWith(') ||
-      /running\[|\.(remove|clear|put)\(|armed\s*=|\.started\(|\.beforeClose\(|java\.io|config|password/.test(currentTargets) ||
-      !release.includes('fun currentTargets(): List<Triple<String, String, String>> = error("Debug transient close timeout is disabled")'))
-    fail('A17 Target discovery must be read-only minimum identity metadata and disabled in Release');
-  const arm = kotlinFnBody(debug, 'arm') ?? '';
-  const tokenCheck = arm.indexOf('check(target.token == token)');
-  if (!debug.includes('private val nextToken = AtomicLong(1)') ||
-      !debug.includes("nextToken.getAndUpdate { Math.incrementExact(it) }.toString(16).padStart(16, '0')") ||
-      tokenCheck < 0 || arm.indexOf('armed = target') <= tokenCheck)
-    fail('A17 Discovery token must identify one Target without reuse and stale tokens must not consume the arm');
-  if (!debug.includes('armed === this') || !debug.includes('running[key] === this') ||
-      !debug.includes('check(armed == null)') || !debug.includes('if (!closing)') ||
-      !debug.includes('processLifetime.await()') || !debug.includes('catch (_: InterruptedException) { continue }') ||
-      /fun\s+(reset|release|disarm)|\.countDown\(|java\.io|android\.content|AndroidNativeAdmission|config|password|auth_key/.test(debug))
-    fail('A17 Fault must retain one exact engine until process death without owner/receipt/config mutation');
-  if (!release.includes('fun started() = Unit') || !release.includes('fun beforeClose() = Unit') ||
-      !release.includes('error("Debug transient close timeout is disabled")') ||
-      /CountDownLatch|AtomicLong|mutableMapOf|var\s|java\.io|AndroidNativeAdmission/.test(release)) fail('A17 Release source must have no fault state or waiting implementation');
-  for (const [file, kind] of [['TransientSpeedtestHost.kt', 'speedtest'], ['TransientLoginHost.kt', 'login']]) {
-    const host = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn', file), 'utf8'));
-    if (!host.includes(`DebugTransientCloseTimeout.process.Target("${kind}", id)`) ||
-        !/closeService\s*=\s*\{\s*closeTimeout\.beforeClose\(\);\s*server\?\./.test(host) ||
-        !/original\.startOrReloadService\([\s\S]*?\}\s*closeTimeout\.started\(\)/.test(host))
-      fail(`A17 ${file} must register actual successful native Start and block inside real closeService cleanup`);
-  }
   const sessions = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/TransientSpeedtestSessions.kt'), 'utf8'));
   if (!sessions.includes('closeTimeoutMillis: Long = 8_000') ||
       !sessions.includes('previous.closed.get(closeTimeoutMillis, TimeUnit.MILLISECONDS)') ||
-      !sessions.includes('Android 临时测速 cleanupUnknown：主核启动已拒绝')) fail('A17 Existing 8-second speedtest main-admission path changed');
+      !sessions.includes('Android 临时测速 cleanupUnknown：主核启动已拒绝')) fail('Existing 8-second speedtest main-admission path changed');
 }
 
 // ════════════════════════════════════════════════════════════════════════════

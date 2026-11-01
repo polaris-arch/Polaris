@@ -34,7 +34,7 @@ test('native impact replays the exact e257 fixture-only diff without treating sk
   assert.match(result.reason, /full Release Risk Node and UI gates still required/);
   assert.deepEqual(result.paths, [nodeTestPath]);
   for (const path of ['scripts/fetch-protoc.test.mjs', 'scripts/capture-screenshots.test.mjs',
-    'scripts/macos-memory-sample.test.mjs']) {
+    'scripts/fetch-cronet.test.mjs']) {
     assert.equal(classifyNativeImpact(rawChange() + rawChange(path)).nativeRequired, false, path);
   }
 });

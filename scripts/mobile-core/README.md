@@ -128,7 +128,8 @@ The explicit planning entry is `bash scripts/plan-mobile-core.sh android` or
 paths. Planning does not resolve or download an SDK. The legacy Apple
 `ios-libbox.py build` entry, including `--historical` and `--component --phase
 assemble/publish`, is retired and refuses before reading source, policy or tools
-or creating output. Its `build-libbox-ios.sh` wrapper reaches the same refusal.
+or creating output. The unused `build-libbox-ios.sh` wrapper has been removed;
+use the normal mobile producer below.
 The existing historical `verify` / `check-inputs` and explicit C2/C3 diagnostic
 entries remain available within their original evidence scopes. Historical
 policies and raw receipts are never rewritten or relabeled; the verifier keeps

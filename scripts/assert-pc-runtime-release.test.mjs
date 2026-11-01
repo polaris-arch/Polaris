@@ -12,7 +12,7 @@ import { assertOwnershipChainAbsent, assertSourceFirstRelease, OWNERSHIP_CHAIN_P
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const script = join(root, 'scripts/assert-pc-runtime-release.mjs');
 const command = 'node scripts/assert-pc-runtime-release.mjs';
-const clearanceName = 'Require reviewed source-first release policy';
+const clearanceName = 'Require selected formal release source policy';
 const packageYaml = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
 const riskYaml = readFileSync(join(root, '.github/workflows/release-risk.yml'), 'utf8');
 
@@ -54,9 +54,8 @@ function requirePackagePolicy(yaml) {
   const candidate = job(yaml, 'package');
   requireCandidateSources(candidate);
   assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
-  assert.ok(candidate.includes('reviewed source-first release policy'));
-  assert.ok(candidate.includes('Native/device acceptance is NotObserved'));
-  assert.ok(candidate.includes('Exact/NoOwner remain Unknown and managed status is NotGranted'));
+  assert.ok(candidate.includes('selected source provenance'));
+  assert.ok(candidate.includes('does not authorize publication or establish native/device acceptance'));
   assert.ok(candidate.includes('uses: actions/upload-artifact@'));
 }
 
@@ -120,53 +119,24 @@ function manifestRead(mutate) {
   mutate(manifest);
   return fixtureRead(new Map([[manifestPath, Buffer.from(JSON.stringify(manifest))]]));
 }
-function requireUnobserved(policy, state = 'SOURCE_FIRST_RELEASE_ELIGIBLE') {
+function requireUnobserved(policy, state = 'FORMAL_CONSUMER_SOURCE_ELIGIBLE') {
   assert.equal(policy.policyState, state);
   assert.equal(policy.publicationRequirements, 'existing-signed-release-dag');
   assert.equal(policy.nativeAcceptance, 'NotObserved');
   assert.equal(policy.deviceAcceptance, 'NotObserved');
-  assert.equal(policy.Exact, 'Unknown');
-  assert.equal(policy.NoOwner, 'Unknown');
-  assert.equal(policy.managed, 'NotGranted');
 }
 
-test('only reviewed source inputs are eligible, without native or ownership clearance', () => {
-  const policy = assertSourceFirstRelease(fixtureRead());
-  requireUnobserved(policy);
-  assert.equal(policy.reviewedCandidate, '123259cb4ee0eef484368e34d8ea7211d39964b6');
-  assert.deepEqual(assertSourceFirstRelease(fixtureRead()), policy);
+test('historical source inputs cannot authorize publication, even with valid source bytes', () => {
+  assert.throws(() => assertSourceFirstRelease(fixtureRead()), /formal upstream release contract/);
   for (const path of inputPaths) {
-    assert.throws(() => assertSourceFirstRelease(fixtureRead(new Map([[path, undefined]]))), /missing source input/);
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(new Map([[path, undefined]]))));
     assert.throws(() => assertSourceFirstRelease(fixtureRead(new Map([[path,
-      Buffer.concat([inputs.get(path), Buffer.from('\nchanged-source')])]]))), undefined, path);
+      Buffer.concat([inputs.get(path), Buffer.from('\nchanged-source')])]]))));
   }
-  for (const mutate of [
-    (manifest) => { manifest.sourceBuild.sourceManifestSha256 = 'a'.repeat(64); },
-    (manifest) => { manifest.sourceBuild.provisionerSha256 = 'a'.repeat(64); },
-    (manifest) => { manifest.sourceBuild.sourceReceiptFingerprint = 'a'.repeat(64); },
-    (manifest) => { manifest.sourceBuild.moduleGraphSha256 = 'a'.repeat(64); },
-    (manifest) => { manifest.sourceBuild.mainGoModSha256 = 'a'.repeat(64); },
-    (manifest) => { manifest.sourceBuild.mainGoSumSha256 = 'a'.repeat(64); },
-    (manifest) => { manifest.sourceBuild.patchedSourceTree = 'a'.repeat(40); },
-    (manifest) => { manifest.sourceBuild.platforms.win.buildTree = 'a'.repeat(40); },
-    (manifest) => { manifest.sourceBuild.transportPins['golang.org/x/sys'] = 'v0.48.0'; },
-    (manifest) => { delete manifest.sourceBuild.platforms['mac-arm64']; },
-    ...['linux', 'win', 'mac-x64', 'mac-arm64'].map((key) => (manifest) => {
-      manifest.sourceBuild.platforms[key].patchedModules.allowedAbsent.push('example.com/absent');
-    }),
-    (manifest) => { manifest.windowsBuild.patchSha256 = 'a'.repeat(64); },
-    (manifest) => {
-      manifest.sourceBuild.version = manifest.sourceBuild.version.replace(/\d+$/, (suffix) => String(Number(suffix) + 1));
-    },
-    (manifest) => { manifest.clearance = 'approved'; },
-  ]) assert.throws(() => assertSourceFirstRelease(manifestRead(mutate)));
-
-  // These are historical output pins, not review authority for newly produced
-  // binaries. Actual all-four source bundle consumption remains mandatory.
-  requireUnobserved(assertSourceFirstRelease(manifestRead((manifest) => {
+  assert.throws(() => assertSourceFirstRelease(manifestRead(manifest => {
     manifest.windowsBuild.binarySha256 = null;
     for (const platform of Object.values(manifest.sourceBuild.platforms)) platform.binarySha256 = null;
-  })));
+  })), /formal upstream release contract/);
 });
 
 test('ownership chain inputs are rejected by name, not as a digest drift', () => {
@@ -183,9 +153,9 @@ test('ownership chain inputs are rejected by name, not as a digest drift', () =>
       [sourcePath, bytes], [manifestPath, Buffer.from(JSON.stringify(manifest))]]));
   };
   const patchBytes = (file) => retiredOwnershipFixtures.get(`scripts/libbox-patches/${file}`);
-  // Unchanged rebinding reaches the reviewed-input digest, so the helper is live.
+  // Self-consistent source rebinding still cannot authorize publication.
   assert.throws(() => assertSourceFirstRelease(withSource((changed) => { changed.goVersion = '1.25.6'; })),
-    /Source inputs differ from the reviewed release policy/);
+    /formal upstream release contract/);
   assert.deepEqual([...OWNERSHIP_CHAIN_PATCHES].sort(), ['nftables-owned-transactions.patch',
     'sing-tun-owned-native.patch', 'tun-owner-consumer.patch']);
   assert.throws(() => assertSourceFirstRelease(withSource((changed) => {
@@ -304,8 +274,8 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
     ]) {
       writeFileSync(join(fixture, 'scripts/core-source-provision.py'), inputs.get('scripts/core-source-provision.py'));
       const good = runPolicy([], env, join(fixture, 'scripts/assert-pc-runtime-release.mjs'));
-      assert.equal(good.status, 0, good.stderr);
-      requireUnobserved(JSON.parse(good.stdout));
+      assert.equal(good.status, 1, good.stderr);
+      assert.match(good.stderr, /formal upstream release contract/);
       writeFileSync(join(fixture, 'scripts/core-source-provision.py'), 'changed-source');
       const bad = runPolicy([], env, join(fixture, 'scripts/assert-pc-runtime-release.mjs'));
       assert.equal(bad.status, 1, JSON.stringify(env));
@@ -409,11 +379,11 @@ function desktopPolicyFixture() {
   return { manifest, source, changes };
 }
 
-test('new D source closure selects D bytes and remains publication-blocked pending actual reviewed pins', () => {
+test('legacy desktop source closure validates its bytes but cannot authorize publication', () => {
   const f = desktopPolicyFixture();
-  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /exact D release input closure not recorded/);
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /formal upstream release contract/);
   f.changes.set('scripts/desktop-core/source-manifest.json', JSON.stringify({ ...f.source, role: 'mobile' }));
-  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktop source SHA-256/);
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /Source SHA-256/);
   for (const invalid of [null, [], {}, f.manifest.sourceBuild]) {
     f.manifest.desktopSourceBuild = invalid;
     f.changes.set(manifestPath, JSON.stringify(f.manifest));
@@ -427,19 +397,19 @@ test('D source admission retains the complete mobile graph, source and provider 
     if (field === 'bundledCoreVersion') f.manifest.bundledCoreVersion = '9.9.9';
     else f.manifest.sourceBuild.transportPins['example.invalid/unreviewed'] = 'v1.0.0';
     f.changes.set(manifestPath, JSON.stringify(f.manifest));
-    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /not frozen|Mobile source inputs/);
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /not frozen|formal upstream release contract/);
   }
   const patch = source.patches[0];
-  for (const path of [sourcePath, `scripts/libbox-patches/${patch.file}`, 'scripts/libbox-ios-patches/source-manifest.json']) {
+  for (const path of [sourcePath, `scripts/libbox-patches/${patch.file}`]) {
     const f = desktopPolicyFixture(); f.changes.set(path, Buffer.from('unreviewed changed bytes'));
-    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /Reviewed mobile source SHA-256/);
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /Source SHA-256/);
   }
   const f = desktopPolicyFixture(); f.changes.set('scripts/core-source-provision.py', Buffer.from('changed provider'));
-  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktop provisioner SHA-256/);
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /Source SHA-256/);
 });
 
 
-test('actual production CLI admits only its selected reviewed source without claimed runtime clearance', () => {
+test('actual production CLI admits only the selected formal contract without runtime clearance', () => {
   const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
   for (const env of [{}, { POLARIS_SKIP_PC_RUNTIME_RELEASE_GATE: '1' },
     { POLARIS_ALLOW_PC_RUNTIME_RELEASE: '1', PC_RUNTIME_RELEASE_READY: 'true' },
@@ -449,33 +419,26 @@ test('actual production CLI admits only its selected reviewed source without cla
       assert.equal(result.status, 0, result.stderr);
       const policy = JSON.parse(result.stdout);
       requireUnobserved(policy, 'FORMAL_CONSUMER_SOURCE_ELIGIBLE');
-      assert.equal(policy.reviewedContractSha256, manifest.desktopRelease.contractSha256);
+      assert.equal(policy.contractSha256, manifest.desktopRelease.contractSha256);
       assert.equal(policy.sourceCommit, manifest.desktopRelease.sourceCommit);
     } else if (Object.hasOwn(manifest, 'desktopSourceBuild')) {
       assert.equal(result.status, 1, result.stderr);
-      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: (?:Temporary desktop default is not formal App release approval; packaged acceptance remains unobserved|Published release consumption does not inherit source-first formal App release approval|Desktop fork source review must be renewed: exact D release input closure not recorded|DNS source-owned release input closure\/signatures\/output pins not recorded)/);
+      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: (?:Temporary desktop default is not formal App release approval; packaged acceptance remains unobserved|Published release consumption does not inherit source-first formal App release approval|Desktop publication requires a formal upstream release contract|DNS source-owned release input closure\/signatures\/output pins not recorded)/);
     } else {
-      assert.equal(result.status, 0, result.stderr);
-      requireUnobserved(JSON.parse(result.stdout));
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /formal upstream release contract/);
     }
   }
 });
 
 test('source-owned schema readiness cannot authorize source-first DNS publication', () => {
-  const source = readFileSync(join(root, 'scripts/assert-pc-runtime-release.mjs'), 'utf8');
-  assert.match(source, /requireGraph\(!sourceOwnedReplacements\(spec\),\s*'DNS source-owned release input closure\/signatures\/output pins not recorded'\)/);
   const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
-  assert.equal(Object.hasOwn(manifest.desktopSourceBuild, 'sourceOwnedReplacements'), true);
-  assert.equal(JSON.parse(readFileSync(join(root, 'scripts/desktop-core/source-manifest.json'))).sourceCommit,
-    'aafc521b745e0d1a8f50a6a3f41169433f1c2194');
-  // The old source-owned input alone still cannot use the newly reviewed
-  // published consumer admission. Explicitly remove the active selection.
   delete manifest.desktopRelease;
-  assert.throws(() => assertSourceFirstRelease(path => path === manifestPath
-    ? Buffer.from(JSON.stringify(manifest)) : readFileSync(join(root, path))),
-  /DNS source-owned release input closure\/signatures\/output pins not recorded/);
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(new Map([
+    [manifestPath, Buffer.from(JSON.stringify(manifest))],
+    ['scripts/desktop-core/source-manifest.json', readFileSync(join(root, 'scripts/desktop-core/source-manifest.json'))],
+  ]))));
 });
-
 
 test('temporary desktop defaults cannot inherit formal publication approval or hide malformed selections', () => {
   for (const selection of [null, false, {}, { schema: 'polaris-app-temporary-desktop-selection-v1', publicationEligible: true }]) {
@@ -521,9 +484,9 @@ test('formal publication source admission uses the exact strict selected contrac
   assert.equal(result.status, 0, result.stderr);
   const policy = JSON.parse(result.stdout);
   requireUnobserved(policy, 'FORMAL_CONSUMER_SOURCE_ELIGIBLE');
-  assert.equal(policy.reviewedContractSha256, manifest.desktopRelease.contractSha256);
+  assert.equal(policy.contractSha256, manifest.desktopRelease.contractSha256);
   for (const key of ['sourceCommit', 'sourceTree', 'tagObject', 'releaseId']) assert.equal(policy[key], manifest.desktopRelease[key]);
-  assert.equal(Object.hasOwn(policy, 'reviewedSourceIncrement'), false, 'historical ownership proof is not transferred');
+  assert.equal(Object.hasOwn(policy, 'reviewedCandidate'), false, 'internal review identity is not a publication input');
   assert.equal(Object.hasOwn(policy, 'AppAccepted'), false, 'no new acceptance receipt is manufactured');
   for (const path of ['scripts/desktop-core/release-contract.json', 'scripts/desktop-core/release-asset-index.json']) {
     f.reset(); rmSync(join(f.directory, path));
@@ -558,26 +521,24 @@ test('formal source gate rejects malformed, mixed, aliased and historically rela
   }
 });
 
-test('structurally valid rebound formal contracts still require source review renewal', t => {
+test('formal contract rebinding still requires consistent committed producer and asset-index content', t => {
   const f = formalPolicyFixture(t), contractPath = 'scripts/desktop-core/release-contract.json';
   const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-  for (const producerChange of [false, true]) {
-    f.reset(); const manifest = JSON.parse(f.files.get(manifestPath));
-    const contract = JSON.parse(f.files.get(contractPath));
-    if (producerChange) {
-      const indexPath = 'scripts/desktop-core/release-asset-index.json';
-      const index = JSON.parse(f.files.get(indexPath));
-      contract.producer.runAttempt += 1; index.producer.runAttempt += 1;
-      const indexRaw = Buffer.from(JSON.stringify(index) + '\n');
-      contract.assetIndex.bytes = indexRaw.length; contract.assetIndex.sha256 = hash(indexRaw);
-      writeFileSync(join(f.directory, indexPath), indexRaw);
-    }
-    const raw = Buffer.from(JSON.stringify(contract) + '\n');
-    manifest.desktopRelease.contractSha256 = hash(raw);
-    writeFileSync(join(f.directory, contractPath), raw);
-    writeFileSync(join(f.directory, manifestPath), JSON.stringify(manifest));
-    const result = f.run({ POLARIS_SKIP_QUALITY_GATES: '1', POLARIS_NO_KERNEL_RUN: '1' });
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /Formal consumer source review must be renewed: exact reviewed contract differs/);
-  }
+  const manifest = JSON.parse(f.files.get(manifestPath));
+  const contract = JSON.parse(f.files.get(contractPath));
+  // Formatting is not an independent approval identity: the selected byte hash is authoritative.
+  const raw = Buffer.from(JSON.stringify(contract) + '\n');
+  manifest.desktopRelease.contractSha256 = hash(raw);
+  writeFileSync(join(f.directory, contractPath), raw);
+  writeFileSync(join(f.directory, manifestPath), JSON.stringify(manifest));
+  assert.equal(f.run({}).status, 0);
+  // Rebinding only the contract cannot hide changed producer facts from its pinned index.
+  contract.producer.runAttempt += 1;
+  const changed = Buffer.from(JSON.stringify(contract) + '\n');
+  manifest.desktopRelease.contractSha256 = hash(changed);
+  writeFileSync(join(f.directory, contractPath), changed);
+  writeFileSync(join(f.directory, manifestPath), JSON.stringify(manifest));
+  const result = f.run({ POLARIS_SKIP_QUALITY_GATES: '1', POLARIS_NO_KERNEL_RUN: '1' });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED/);
 });

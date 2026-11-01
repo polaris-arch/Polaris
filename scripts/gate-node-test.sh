@@ -32,9 +32,7 @@ required_tests=(
   # release 冒烟腿的产物级判据本体（scripts/assert-r8-evidence.mjs）的变异测试：它守的是
   # 「针被本仓自己的注释喂绿」与「configuration.txt 证明不了 keep 命中没命中」这两条真缺陷。
   scripts/assert-r8-evidence.test.mjs
-  # PC policy uses inert retired-name fixtures after the unsupported R producer lane
-  # was archived. Its current-graph and pre-artifact rejection tests stay mandatory;
-  # retiring the two old Python wrappers does not lower the 501-pass minimum.
+  # Publication source/contract rejection remains a mandatory product policy test.
   scripts/assert-pc-runtime-release.test.mjs
   # Desktop source graph predicates may not disappear from the host fixture gate.
   scripts/build-desktop-core.test.mjs
@@ -59,6 +57,8 @@ for file in "${required_tests[@]}"; do
   }
 done
 
+# Retired local tools remove exactly 36 CDP + 14 macOS sampler registrations
+# from the former 501 floor; all mandatory product test files remain required.
 # Stream TAP directly without retaining a second complete log in the shell.
 # pipefail keeps the runner exit status authoritative; the terminal count adds
 # coverage protection and never substitutes for successful test execution.
@@ -77,8 +77,8 @@ node --test --test-reporter=tap scripts/*.test.mjs | (
     echo '::error::gate-node-test: expected exactly one TAP pass summary' >&2
     exit 1
   fi
-  if [ "$passed" -lt 501 ]; then
-    echo "::error::gate-node-test: only $passed passes; mandatory minimum is 501" >&2
+  if [ "$passed" -lt 451 ]; then
+    echo "::error::gate-node-test: only $passed passes; mandatory minimum is 451" >&2
     exit 1
   fi
 )

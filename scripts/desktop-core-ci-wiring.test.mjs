@@ -275,8 +275,8 @@ test('new desktop source workflow and pure wiring contracts trigger all four des
   }
 });
 
-test('actual Android-only PC admission and speedtest files retain exact positive impact registration', () => {
-  for (const path of ['src-tauri/src/runtime/proxy/debug_pc_echo.rs', 'src-tauri/src/runtime/speedtest/android.rs']) {
+test('actual Android speedtest file retains exact positive impact registration', () => {
+  for (const path of ['src-tauri/src/runtime/speedtest/android.rs']) {
     assert.deepEqual(androidRegistrationOf(path), { key: path, table: 'ANDROID_IMPACT_SCOPES' });
     assert.equal(classifyImpact([path]).android, true, path);
     assert.ok(ANDROID_IMPACT_SCOPES[path].why.length > 50);

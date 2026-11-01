@@ -1655,7 +1655,7 @@ jobs:
       - name: Describe source-first desktop artifacts
         shell: bash
         run: |
-          printf '%s\n' 'Desktop artifacts use the reviewed source-first release policy. Native/device acceptance is NotObserved; Exact/NoOwner remain Unknown and managed status is NotGranted. Publication still requires the complete signed Release DAG.' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'Desktop artifacts retain their selected source provenance. Building candidate packages does not authorize publication or establish native/device acceptance. Publication still requires the complete signed Release DAG.' >> "$GITHUB_STEP_SUMMARY"
 
       # Release transport and manual package recovery share the same seven-day window.
       # Both release_desktop and release consume these bytes; evidence has separate uploads.
@@ -1875,7 +1875,7 @@ jobs:
         with:
           node-version: '26'
 
-      - name: Require reviewed source-first release policy
+      - name: Require selected formal release source policy
         run: node scripts/assert-pc-runtime-release.mjs
 
       # Validate before using the tag in an artifact glob; never admit glob metacharacters.
@@ -2231,7 +2231,7 @@ jobs:
         with:
           node-version: '26'
 
-      - name: Require reviewed source-first release policy
+      - name: Require selected formal release source policy
         run: node scripts/assert-pc-runtime-release.mjs
 
       # Validate before using the tag in an artifact glob; never admit glob metacharacters.

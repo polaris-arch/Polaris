@@ -119,29 +119,7 @@ fn embed_windows_manifest_for_msvc() {
 
 /// **桌面随包 dashboard 完整性断言（打包期硬门）**。
 ///
-/// 为什么从 `beforeBundleCommand` 搬到这里（2026-08-05，Windows 打包腿首次真跑时挂在那个 hook 上）：
-///
-/// Tauri 跑 hook 的 shell 是**按宿主平台**选的：Unix 走 `sh -c`，Windows 走 `cmd /C`。原 hook 是
-///   `if [ -f scripts/ensure-dashboard.sh ]; then sh …; else sh ../scripts/…; fi`
-/// —— 纯 sh 语法，在 linux/macOS 腿上成立，到 Windows 交给 `cmd` 必然 exit 1（实测 run
-/// 30983415697：`beforeBundleCommand … failed with exit code 1`，且它挂在**整条 Rust 编译之后**，
-/// 每验证一轮先烧 20 分钟 × 2x 计费）。
-///
-/// 那个 `if` 本身是为了绕开「hook 的 cwd 到底是仓库根还是 src-tauri」这个不确定性
-/// （2026-07-20 的实测结论在 CLI 2.11.4 上已不成立，见 `scripts/ensure-dashboard.sh` 头注）。
-///
-/// 搬到 build script 后两个不确定性一起消失：**没有 shell**（不必同时满足 sh 与 cmd 两套语法），
-/// **cwd 由 cargo 保证**（`CARGO_MANIFEST_DIR` 是编译期常量，与调用方 cwd 无关）。
-///
-/// [不选「per-platform conf 里给 Windows 覆盖一份 hook」：`verify-packaging.mjs` 的 conf 不变量
-///  明写四份 per-platform conf **顶层只准 `$schema` + `bundle`、`bundle` 下只准 `resources`**
-///  （变异 M10 实测过，防的是 `--config` 按 RFC 7396 覆盖 base 的 version/productName），
-///  加 `build.beforeBundleCommand` 会撞这道门，而门槛不为了让改动通过而放宽]
-/// [不选「hook 改成 `node scripts/…`」：打包机 mac 5.238 上 node **装了但不在 PATH 上** ——
-///  它在 `/opt/homebrew/bin`，而该目录不在 ssh 会话（含 `bash -lc` 登录 shell）的 PATH 里。
-///  见 `polaris-mac-deploy-recipe.md`「5.238 工具链状态（2026-07-20 订正）」：把这个现象误读成
-///  「没装 Node」曾造成两轮部署失败 + 一次白编译。hook 由 tauri-cli 在**它自己的进程环境**下拉起，
-///  拿到的就是那份缺目录的 PATH ⇒ `node` 仍会 not found。build script 不依赖任何解释器，绕开整类问题]
+/// 在 build script 中直接检查资源，避免平台 shell 和 hook 工作目录差异。
 ///
 /// 判据用 **非空**而不是「文件存在」：0 字节 / 404 HTML 占位文件打进包里，与没有它同一后果 ——
 /// 核只能回落联网下载面板（离线不可用；CWD 只读时还会刷 mkdir 报错）。

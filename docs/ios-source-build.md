@@ -32,7 +32,7 @@ python3 -B scripts/mobile-core/build_apple_app.py \
 
 真机安装须另行准备用户自己的 Apple开发签名身份、已注册设备和匹配的 profiles；主 App与 PacketTunnel使用同一 Team及共同App Group，并具备 Packet Tunnel entitlement。选择自己可注册的 Bundle ID，主 App与 Tauri identifier一致，扩展 ID 加 `.PacketTunnel`；修改 `src-tauri/gen/apple/project.yml` 后，在该文件所在目录运行 `xcodegen generate`，并核对两个 target。现有 `--signing-team` 只选择 Team，不能替代这些条件。实际设备授权、连接/停止、DNS/IPv4/IPv6 及后台生命周期需另验。不要提交证书、profiles 或构建产物。
 
-旧 `build-libbox-ios.sh` 与 `ios-libbox.py build`（包括 `--historical`）均已退休并拒绝生产构建。下方历史记录中的旧版本、旧命令和验收结论只属于当时，不是当前操作步骤，也不能替代当前源码、工具及产物核验。
+旧 shell 构建包装器已移除；`ios-libbox.py build`（包括 `--historical`）已退休并拒绝生产构建。下方历史记录中的旧版本、旧命令和验收结论只属于当时，不是当前操作步骤，也不能替代当前源码、工具及产物核验。
 
 
 <details>
@@ -96,7 +96,7 @@ Polaris 的 iOS 构建由使用者在自己的 Mac 上完成并自行签名。�
 VERSION=$(python3 -c 'import json; print(json.load(open("src-tauri/core-manifest.json"))["bundledCoreVersion"])')
 git clone --depth 1 --branch "v$VERSION" https://github.com/SagerNet/sing-box.git "$HOME/Code/sing-box-ios-v$VERSION"
 GOTOOLCHAIN=go1.25.5 go version
-bash scripts/build-libbox-ios.sh "$HOME/Code/sing-box-ios-v$VERSION" --historical
+# Historical builds are retired; verification below consumes an existing receipt.
 python3 scripts/ios-libbox.py verify --historical
 python3 scripts/ios-libbox-verify.test.py --historical
 ```
