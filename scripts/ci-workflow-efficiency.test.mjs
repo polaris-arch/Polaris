@@ -627,7 +627,7 @@ test('Node gate streams diagnostics and rejects runner failure, missing coverage
   const source = readFileSync(new URL('./gate-node-test.sh', import.meta.url), 'utf8');
   const required = [...source.matchAll(/^  (scripts\/[^\s]+\.test\.mjs)$/gm)].map(m => m[1]);
   const minimum = Number(/"\$passed" -lt (\d+)/.exec(source)?.[1]);
-  assert.equal(minimum, 451); assert(required.includes('scripts/ci-workflow-efficiency.test.mjs'));
+  assert.equal(minimum, 452); assert(required.includes('scripts/ci-workflow-efficiency.test.mjs'));
   const root = mkdtempSync(join(tmpdir(), 'node-gate-'));
   try {
     mkdirSync(join(root, 'scripts')); mkdirSync(join(root, 'bin'));

@@ -57,7 +57,7 @@ for file in "${required_tests[@]}"; do
   }
 done
 
-# Retired local tools remove exactly 36 CDP + 14 macOS sampler registrations
+# Retired local tools remove exactly 36 CDP + 13 macOS sampler registrations
 # from the former 501 floor; all mandatory product test files remain required.
 # Stream TAP directly without retaining a second complete log in the shell.
 # pipefail keeps the runner exit status authoritative; the terminal count adds
@@ -77,8 +77,8 @@ node --test --test-reporter=tap scripts/*.test.mjs | (
     echo '::error::gate-node-test: expected exactly one TAP pass summary' >&2
     exit 1
   fi
-  if [ "$passed" -lt 451 ]; then
-    echo "::error::gate-node-test: only $passed passes; mandatory minimum is 451" >&2
+  if [ "$passed" -lt 452 ]; then
+    echo "::error::gate-node-test: only $passed passes; mandatory minimum is 452" >&2
     exit 1
   fi
 )
