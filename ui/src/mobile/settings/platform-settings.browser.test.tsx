@@ -53,6 +53,11 @@ useAppStore.setState({ config: initial, servers: [], subscriptions: [],
 useAppPresetsStore.setState({ loaded: true, loading: false, failed: false,
   presets: [{ id: 'youtube', labelKey: 'youtube', emoji: '▶', category: 'video',
     geositeTags: ['youtube'], geoipTags: [], processNames: [] }] });
+if (query.get('page') === 'apps') control.inspectApps = () => {
+  const { loaded, loading, failed, presets } = useAppPresetsStore.getState();
+  return { language: i18n.language, loaded, loading, failed, presets,
+    appRules: useAppStore.getState().config?.appRules };
+};
 await runAppUpdateCheck(async () => ({ hasUpdate: true, updateInfo: { version: '9.8.7' } }), initial);
 function App() {
   const [config, setConfig] = useState(initial);
@@ -229,26 +234,63 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile platform setti
 
   it('iOS app rows retain all routing policies and describe domain/IP matching without VPN exclusion promises', async () => {
     const page = await browser.newPage();
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => { if (pageErrors.length < 12) pageErrors.push(error.message); });
+    page.on('console', message => {
+      if (message.type() === 'error' && pageErrors.length < 12) pageErrors.push(message.text());
+    });
+    const started = Date.now();
+    let stage = 'navigate to the iOS apps fixture';
+    const at = (next: string): void => {
+      stage = next;
+      // Leave time for the failure snapshot and page cleanup before Vitest's 5s deadline.
+      page.setDefaultTimeout(Math.max(1, Math.min(1_000, 3_500 - (Date.now() - started))));
+    };
+    page.setDefaultNavigationTimeout(1_500);
     try {
       await page.goto(origin + '/__platform-settings?os=ios&page=apps');
-      await page.getByRole('tab', { name: 'Apps', exact: true }).click();
+      at('select the Apps tab (its accessible name also includes the app count)');
+      const tabs = page.getByRole('tablist', { name: 'Routing', exact: true });
+      const appsTab = tabs.getByRole('tab').filter({ has: page.getByText('Apps', { exact: true }) });
+      await appsTab.waitFor();
+      expect(await appsTab.count()).toBe(1);
+      expect(await appsTab.locator('.mr-cnt').textContent()).toBe('1');
+      expect(await appsTab.getAttribute('aria-selected')).toBe('false');
+      await appsTab.click();
+      at('render the YouTube app card after selecting Apps');
       const card = page.locator('.rc-app-card').filter({ hasText: 'YouTube' });
       await card.waitFor();
+      expect(await appsTab.getAttribute('aria-selected')).toBe('true');
       expect(await card.count()).toBe(1);
+      at('read the YouTube card title and matching summary');
       expect(await card.locator('.mr-row-title').textContent()).toBe('YouTube');
       const matching = card.locator('.rc-app-match');
       expect(await matching.locator('summary').textContent()).toContain('Domain / IP only');
       expect(await matching.locator('summary').textContent()).not.toContain('VPN exclusion');
+      at('expand the YouTube matching details');
       await matching.locator('summary').click();
       expect(await matching.textContent()).toContain('iOS');
       expect(await matching.textContent()).not.toContain('A built-in preset with a package name can be excluded');
+      at('open the YouTube policy control');
       await card.getByRole('button', { name: 'YouTube · Policy', exact: true }).click();
+      at('render the YouTube policy dialog');
       const policies = page.getByRole('dialog', { name: 'YouTube', exact: true });
       await policies.waitFor();
       for (const name of ['Follow global', 'Direct', 'Block']) {
+        at('read policy option ' + name);
         expect(await policies.getByRole('option', { name, exact: true }).count()).toBe(1);
       }
+      at('verify the fixture Direct policy is selected');
       expect(await policies.getByRole('option', { name: 'Direct', exact: true }).getAttribute('aria-selected')).toBe('true');
+    } catch (error) {
+      const snapshot = await page.locator('body').evaluate(body => ({
+        platform: document.documentElement.dataset.mobileOs,
+        fixture: (window as any).__platformSettings?.inspectApps?.(),
+        html: body.innerHTML.slice(0, 16_000),
+      }), undefined, { timeout: 250 }).catch(snapshotError => ({ error: String(snapshotError) }));
+      const reason = error instanceof Error ? error.stack ?? error.message : String(error);
+      throw new Error('iOS app rows failed at: ' + stage + '\n' + reason
+        + '\nPage errors: ' + JSON.stringify(pageErrors) + '\nDOM/fixture: ' + JSON.stringify(snapshot));
     } finally { await page.close(); }
   });
 });

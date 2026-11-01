@@ -16,12 +16,12 @@ vi.mock('./Primitives', async (original) => {
   return {
     ...actual,
     SetRow: (props: ComponentProps<typeof actual.SetRow>) => {
-      if (props.label === 'settings.advanced.takeoverSystemDns') {
-        if (!isValidElement<SwitchProps>(props.children) || props.children.type !== actual.Switch) {
-          throw new Error('HOST_DNS_SWITCH_MISSING');
-        }
-        controls.push(props.children.props);
+      // Other rows contain browser portal editors, outside this switch's contract.
+      if (props.label !== 'settings.advanced.takeoverSystemDns') return null;
+      if (!isValidElement<SwitchProps>(props.children) || props.children.type !== actual.Switch) {
+        throw new Error('HOST_DNS_SWITCH_MISSING');
       }
+      controls.push(props.children.props);
       return <actual.SetRow {...props} />;
     },
   };

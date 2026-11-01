@@ -16,6 +16,42 @@ const row = (id?: number, message = `m${id ?? 'x'}`): LogRow =>
 
 const ids = (rows: LogRow[]) => rows.map((r) => r._id);
 
+/** Read an if condition inside an already bounded async branch, including nested calls. */
+function epochReturnGuard(branch: string): number {
+  for (const match of branch.matchAll(/\bif\s*\(/g)) {
+    let cursor = match.index! + match[0].length;
+    let termStart = cursor;
+    let depth = 1;
+    const terms: string[] = [];
+    while (cursor < branch.length && depth > 0) {
+      const character = branch[cursor];
+      if (character === '"' || character === "'" || character === '`') {
+        cursor++;
+        while (cursor < branch.length) {
+          if (branch[cursor] === '\\') { cursor += 2; continue; }
+          if (branch[cursor++] === character) break;
+        }
+        continue;
+      }
+      if (character === '(') depth++;
+      else if (character === ')') depth--;
+      else if (depth === 1 && branch.startsWith('||', cursor)) {
+        terms.push(branch.slice(termStart, cursor));
+        cursor += 2;
+        termStart = cursor;
+        continue;
+      }
+      cursor++;
+    }
+    if (depth !== 0) throw new Error('Unterminated read guard');
+    terms.push(branch.slice(termStart, cursor - 1));
+    if (!terms.some((term) => term.replace(/\s/g, '') === 'epoch!==logReadEpoch.current')) continue;
+    expect(branch.slice(cursor)).toMatch(/^\s*return\s*;/);
+    return match.index!;
+  }
+  throw new Error('Missing stale-read return guard');
+}
+
 describe('mergeHydration：水合必须合并，不得替换', () => {
   it('订阅腿先到的行不得被水合清掉（缺陷原状：整体替换 → 恒空）', () => {
     const streamed = [row(10), row(11)]; // 订阅腿先送到
@@ -105,6 +141,13 @@ describe('接线：LogsScreen 的水合腿真的换成了合并', () => {
 });
 
 describe('clear receipt and stale reads', () => {
+  it('reads nested guard calls without accepting a conditional or missing stale return', () => {
+    expect(epochReturnGuard('if (!alive || epoch !== logReadEpoch.current || !Array.isArray(batch)) return;')).toBe(0);
+    expect(epochReturnGuard('if (!check(inner(batch)) || epoch !== logReadEpoch.current) return;')).toBe(0);
+    expect(() => epochReturnGuard('if (!alive || epoch !== logReadEpoch.current) publish();')).toThrow();
+    expect(() => epochReturnGuard('if (!alive && epoch !== logReadEpoch.current) return;')).toThrow('Missing stale-read return guard');
+    expect(() => epochReturnGuard('if (check(!alive || epoch !== logReadEpoch.current)) return;')).toThrow('Missing stale-read return guard');
+  });
   it('preserves stream records allocated after native clear while removing old rows', async () => {
     const { retainAfterClear } = await import('./logs-buffer');
     expect(ids(retainAfterClear([row(40), row(41), row(42), row()], 42))).toEqual([42]);
@@ -127,8 +170,7 @@ describe('clear receipt and stale reads', () => {
       expect(get, path).toBeGreaterThan(-1);
       expect(hydrateCapture, path).toBeGreaterThan(-1);
       expect(hydratePublish, path).toBeGreaterThan(get);
-      expect(source.slice(hydrateCapture, hydratePublish), path)
-        .toMatch(/if\s*\([^)]*epoch !== logReadEpoch\.current[^)]*\)\s*return;/);
+      expect(epochReturnGuard(source.slice(hydrateCapture, hydratePublish)), path).toBeGreaterThan(-1);
 
       const search = source.indexOf('.search(');
       const searchEffect = source.lastIndexOf('useEffect(', search);
@@ -139,15 +181,13 @@ describe('clear receipt and stale reads', () => {
       expect(then, path).toBeGreaterThan(search);
       expect(caught, path).toBeGreaterThan(then);
       const searchResult = source.slice(then, caught);
-      const searchGuard = searchResult.indexOf('epoch !== logReadEpoch.current');
-      expect(searchResult, path).toMatch(/if\s*\([^)]*epoch !== logReadEpoch\.current[^)]*\)\s*return;/);
+      const searchGuard = epochReturnGuard(searchResult);
       expect(searchResult.indexOf(snapshotSetter + '('), path).toBeGreaterThan(searchGuard);
       if (snapshotSetter === 'setLogSnapshot') {
         // Mobile publishes a search failure too; a stale rejection must not
         // replace the state established by a later clear/retry.
         const failure = source.slice(caught, source.indexOf('}, SEARCH_DEBOUNCE_MS)', caught));
-        expect(failure).toMatch(/if\s*\([^)]*epoch !== logReadEpoch\.current[^)]*\)\s*return;/);
-        expect(failure.indexOf('setLogSearchFailed(true)')).toBeGreaterThan(failure.indexOf('epoch !== logReadEpoch.current'));
+        expect(failure.indexOf('setLogSearchFailed(true)')).toBeGreaterThan(epochReturnGuard(failure));
       }
 
       expect(source, path).toMatch(/logReadEpoch\.current \+= 1;\s*const boundary = await api\.logs\.clear\(\);\s*retainAfterClear\(\[\], boundary\);\s*logReadEpoch\.current \+= 1;/);
