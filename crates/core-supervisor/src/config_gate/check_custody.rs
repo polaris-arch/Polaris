@@ -373,7 +373,7 @@ enum CheckTail {
     },
     #[cfg(target_os = "macos")]
     MacRoot {
-        input: crate::admitted_payload::MacCheckInput,
+        input: Box<crate::admitted_payload::MacCheckInput>,
         output: Arc<OutputCapture>,
     },
     PathSnapshot {

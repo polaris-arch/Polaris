@@ -424,7 +424,10 @@ pub fn begin_macos_helper_check(
             native_exited: None,
             native_terminal: None,
             child: None,
-            tail: CheckTail::MacRoot { input, output },
+            tail: CheckTail::MacRoot {
+                input: Box::new(input),
+                output,
+            },
             exit: None,
             debt: true,
             lost_wait_ownership: false,
