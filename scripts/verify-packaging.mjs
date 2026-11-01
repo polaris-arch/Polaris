@@ -1086,22 +1086,21 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
     }
   }
 
-  // ── ⑥ Windows portable has an independent producer. Follow its real
-  // mandatory Python action and complete source-map/actual-ZIP consumer, rather
-  // than requiring removed PowerShell step names or literal copy statements.
+  // ── ⑥ Windows publication configuration. Source-shape/workflow audits belong
+  // to the existing tests; actual complete payload inventories belong to assets.
   if (workflow !== null) {
     try {
       const result = JSON.parse(execFileSync(process.platform === 'win32' ? 'python' : 'python3',
         [join(ROOT, 'scripts/windows-package-integrity.py'), 'contract'],
         { cwd: ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }));
-      if (result.schema !== 'polaris-windows-package-contract-v1'
+      if (result.schema !== 'polaris-windows-package-config-v1'
           || JSON.stringify(result.legalFiles) !== JSON.stringify(LICENSE_BASENAMES)
-          || result.actualZipComparison !== 'exact(actual, expected)'
-          || JSON.stringify(result.ordinaryWindowsCommands) !== JSON.stringify(['prepare', 'assemble'])) {
-        throw new Error('actual Windows configuration/producer/ZIP contract result differs');
+          || result.platform !== 'win' || !Array.isArray(result.resources)
+          || JSON.stringify(result.formats) !== JSON.stringify(['nsis', 'zip'])) {
+        throw new Error('actual Windows publication configuration differs');
       }
     } catch (error) {
-      fail(`Windows portable 配置/许可/实际ZIP全集链未闭合：${error.stderr?.toString().trim() || error.message}`);
+      fail(`Windows 发布配置/许可声明未闭合：${error.stderr?.toString().trim() || error.message}`);
     }
   }
 

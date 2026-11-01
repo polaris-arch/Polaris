@@ -4,12 +4,14 @@ No Windows installer, product executable, signature or installation is simulated
 as successful native acceptance.
 """
 import copy
+import ast
 from contextlib import contextmanager, redirect_stderr
 import importlib.util
 import hashlib
 import io
 import json
 import os
+import re
 from types import SimpleNamespace
 from pathlib import Path
 import shutil
@@ -28,6 +30,147 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('windows_integrity', ROOT / 'scripts/windows-package-integrity.py')
 w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
 
+
+def source_contract(root, *, source_text=None, workflow_text=None):
+    """Static confs consumer: actual workflow/config and actual function edges.
+
+    This reads no downloaded/native resources and executes no carrier/tool. The
+    fixture suite separately exercises these functions with real inert ZIP bytes.
+    Only eager function bodies count: a call hidden in a new if/loop/try does not
+    satisfy a mandatory pipeline edge.
+    """
+    require = w.require; io_path = w.io_path; regular = w.regular
+    require_legal_resources = w.require_legal_resources; PUBLIC_LEGAL_FILES = w.PUBLIC_LEGAL_FILES
+    require(PUBLIC_LEGAL_FILES == ('LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md'), 'legal file registry differs')
+    conf = json.loads(io_path(regular(root / 'src-tauri/tauri.windows.conf.json')).read_bytes())
+    require_legal_resources(conf['bundle']['resources'])
+    source_text = io_path(w.__file__).read_text(encoding='utf-8') if source_text is None else source_text
+    workflow_text = io_path(root / '.github/workflows/package.yml').read_text(encoding='utf-8') if workflow_text is None else workflow_text
+    module = ast.parse(source_text)
+    definitions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+    require(len(definitions) == sum(isinstance(node, ast.FunctionDef) for node in module.body), 'duplicate package action/function')
+    def transfers(node, kinds):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return False  # A nested scope does not transfer control in this body.
+        return isinstance(node, kinds) or any(transfers(child, kinds) for child in ast.iter_child_nodes(node))
+    def direct(nodes, *, loop_body=False):
+        for node in nodes:
+            yield node
+            if isinstance(node, ast.With):
+                # These existing stdlib contexts propagate failed verification;
+                # arbitrary contexts (notably suppress) cannot make a gate eager.
+                contexts = {'tempfile.TemporaryDirectory', 'zipfile.ZipFile', 'open', 'ExitStack', 'io_path(raw).open'}
+                if all(isinstance(item.context_expr, ast.Call)
+                       and ast.unparse(item.context_expr.func) in contexts for item in node.items):
+                    yield from direct(node.body, loop_body=loop_body)
+            exits = (ast.Return, ast.Break, ast.Continue) if loop_body else (ast.Return,)
+            if isinstance(node, (ast.Raise, ast.Return, ast.Break, ast.Continue)) or transfers(node, exits):
+                break  # Do not count calls after even a conditional early exit.
+    def expressions(node):
+        if node is None or isinstance(node, (ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp)):
+            return  # Deferred or iteration-dependent bodies are not mandatory.
+        if isinstance(node, ast.BoolOp):
+            yield from expressions(node.values[0])  # Only the first operand is unconditional.
+        elif isinstance(node, ast.IfExp):
+            yield from expressions(node.test)
+        elif isinstance(node, ast.Compare):
+            yield from expressions(node.left)
+            yield from expressions(node.comparators[0])  # Chained later comparisons short-circuit.
+        else:
+            if isinstance(node, ast.Call):
+                yield node
+            # Dict.keys/values and List/Tuple.elts are AST lists, not mapping
+            # methods. iter_child_nodes also skips None keys in dict unpacking.
+            for child in ast.iter_child_nodes(node):
+                yield from expressions(child)
+    def eager(nodes, *, loop_body=False):
+        for node in direct(nodes, loop_body=loop_body):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
+                yield from expressions(node.value)
+    def calls(name):
+        require(name in definitions, 'package contract function missing: ' + name)
+        definition = definitions[name]
+        require(not definition.decorator_list and not any(transfers(node, (ast.Yield, ast.YieldFrom)) for node in definition.body),
+                'mandatory package function must execute eagerly: ' + name)
+        return list(eager(definition.body))
+    required_edges = {
+        'contract': {'require_legal_resources'},
+        'source_inventory': {'require_legal_resources'},
+        'verified_sources': {'source_inventory'},
+        'prepare': {'verified_sources', 'find_sevenzip', 'cargo_context', 'directory_id'},
+        'load_state': {'verified_sources', 'cargo_context', 'directory_id'},
+        'produce': {'load_state', 'tauri_identity', 'run_tauri', 'cargo_app_identity', 'compiled_app', 'assemble_carriers'},
+        'capture': {'release_arguments', 'capture_context', 'cargo_output', 'release_event'},
+        'assemble': {'load_state', 'cargo_app_identity', 'compiled_app', 'exact', 'zip_inventory'},
+        'release_event': {'cargo_app_identity'},
+        'assemble_carriers': {'tauri_identity', 'verify_generated_script', 'nsis_inventory', 'carrier_inventory', 'build_portable', 'zip_inventory', 'cargo_app_identity'},
+        'verify_generated_script': {'cargo_app_identity'},
+        'verify_existing_zip': {'load_state', 'compiled_app', 'cargo_app_identity', 'zip_inventory'},
+        'tauri_identity': {'tauri_command'},
+        'build_portable': {'carrier_inventory', 'exact', 'zip_inventory'},
+        'zip_inventory': {'exact'},
+    }
+    for owner, targets in required_edges.items():
+        actual = {node.func.id for node in calls(owner) if isinstance(node.func, ast.Name)}
+        require(targets <= actual, 'mandatory package call missing from ' + owner + ': ' + str(sorted(targets - actual)))
+    build = definitions['build_portable']
+    source_loops = [node for node in direct(build.body) if isinstance(node, ast.For)
+                    and ast.dump(node.iter) == ast.dump(ast.parse("state['sources'].items()", mode='eval').body)]
+    require(len(source_loops) == 1, 'portable must copy the complete frozen source map once')
+    require(ast.dump(source_loops[0].target) == ast.dump(ast.parse('for name, source in (): pass').body[0].target),
+            'portable source-map name/source binding differs')
+    copy_calls = [node for node in eager(source_loops[0].body, loop_body=True) if isinstance(node.func, ast.Attribute)
+                  and isinstance(node.func.value, ast.Name) and node.func.value.id == 'shutil' and node.func.attr == 'copyfile']
+    require(len(copy_calls) == 1 and ast.dump(copy_calls[0]) == ast.dump(ast.parse('shutil.copyfile(io_path(regular(source)), io_path(path))', mode='eval').body),
+            'portable actual source-map copy differs')
+    zip_exact = [node for node in calls('zip_inventory') if isinstance(node.func, ast.Name) and node.func.id == 'exact']
+    require(len(zip_exact) == 1 and ast.dump(zip_exact[0]) == ast.dump(ast.parse('exact(actual, expected)', mode='eval').body),
+            'actual ZIP must compare the complete observed and expected member maps')
+    main = definitions.get('main')
+    require(main is not None, 'package action entrypoint missing')
+    dispatch = []
+    for node in calls('main'):
+        if not (isinstance(node.func, ast.Subscript) and isinstance(node.func.value, ast.Dict)
+                and ast.dump(node.func.slice) == ast.dump(ast.parse('args.action', mode='eval').body)
+                and len(node.args) == 1 and ast.dump(node.args[0]) == ast.dump(ast.parse('ROOT', mode='eval').body)
+                and not node.keywords):
+            continue
+        literal = node.func.value
+        if (all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in literal.keys)
+                and all(isinstance(value, ast.Name) for value in literal.values)):
+            mapping = {key.value: value.id for key, value in zip(literal.keys, literal.values)}
+            if len(mapping) == len(literal.keys):  # Reject duplicate action keys, not just their last value.
+                dispatch.append(mapping)
+    require(dispatch == [{'prepare': 'prepare', 'produce': 'produce', 'capture': 'capture', 'assemble': 'assemble', 'contract': 'contract'}],
+            'actual eager package action dispatch differs')
+    def step(name):
+        pattern = r'^      - name: ' + re.escape(name) + r'\n(.*?)(?=^      - (?:name:|uses:)|\Z)'
+        found = re.findall(pattern, workflow_text, re.MULTILINE | re.DOTALL)
+        require(len(found) == 1, 'unique actual Windows workflow step required: ' + name)
+        return found[0]
+    sequence = [('Freeze Windows package inputs and isolate outputs', 'prepare'),
+                ('Build Windows installers with first Cargo evidence', 'produce'),
+                ('Verify final NSIS payload and build exact Windows portable zip', 'assemble')]
+    positions = []
+    for name, action in sequence:
+        block = step(name)
+        executable = '\n'.join(line for line in block.splitlines() if line.strip() and not line.lstrip().startswith('#'))
+        require(re.findall(r'^        if: (.+)$', executable, re.MULTILINE) == ["runner.os == 'Windows'"],
+                'ordinary Windows package step must be mandatory: ' + name)
+        require('continue-on-error' not in executable and '||' not in executable, 'Windows package failure suppression')
+        command = 'python scripts/windows-package-integrity.py ' + action
+        lines = [line.strip() for line in executable.splitlines()]
+        require(lines.count(command) == 1, 'actual Windows package command missing: ' + command)
+        at = lines.index(command)
+        require(at + 1 < len(lines) and re.fullmatch(r"if \(\$LASTEXITCODE -ne 0\) \{ throw '[^']+' \}", lines[at + 1]),
+                'Windows package command must propagate its exit code')
+        positions.append(workflow_text.index('      - name: ' + name + '\n'))
+    build_at = workflow_text.index('      - name: Build installers\n')
+    assets_at = workflow_text.index('run: node scripts/verify-packaging.mjs assets --label windows --dir dist-win')
+    require(positions[0] < build_at < positions[1] < positions[2] < assets_at, 'freeze/build/actual-carrier/assets order differs')
+    return {'schema': 'polaris-windows-package-contract-v1', 'legalFiles': list(PUBLIC_LEGAL_FILES),
+            'ordinaryWindowsCommands': [action for _, action in sequence],
+            'actualZipComparison': 'exact(actual, expected)', 'requiredCallEdges': {name: sorted(edges) for name, edges in required_edges.items()}}
 
 class Integrity(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'native Windows stat/fstat projection required')
@@ -336,9 +479,11 @@ class Integrity(unittest.TestCase):
             root = Path(tmp); scripts = root / 'scripts'; scripts.mkdir()
             declaration = scripts / 'tauri-cli.version'; declaration.write_text(w.final.TAURI_CLI_VERSION + '\n')
             entry = str(root / 'official-tauri.cmd')
+            Path(entry).write_bytes(b'inert selected CLI identity, never executed')
             with patch.object(w.shutil, 'which', return_value=entry), \
                  patch.object(w.subprocess, 'check_output', return_value='tauri-cli ' + w.final.TAURI_CLI_VERSION + '\n') as probe:
-                self.assertEqual(w.tauri_identity(root), {'entry': entry, 'version': 'tauri-cli ' + w.final.TAURI_CLI_VERSION})
+                self.assertEqual(w.tauri_identity(root), {'entry': entry, 'version': 'tauri-cli ' + w.final.TAURI_CLI_VERSION,
+                                                       'tool': w.cargo_tool(entry)})
                 probe.assert_called_once_with([entry, '--version'], timeout=30, text=True)
             for output in ['tauri-cli 2.12.3', 'tauri-cli 2.12.1\nextra', '2.12.1']:
                 with self.subTest(output=output), patch.object(w.shutil, 'which', return_value=entry), \
@@ -465,9 +610,9 @@ class Integrity(unittest.TestCase):
             root = Path(tmp); self.fixture(root)
             workflow = (ROOT / '.github/workflows/package.yml').read_text(encoding='utf-8')
             source = Path(w.__file__).read_text(encoding='utf-8')
-            result = w.contract(root, source_text=source, workflow_text=workflow)
+            result = source_contract(root, source_text=source, workflow_text=workflow)
             self.assertEqual(result['legalFiles'], ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md'])
-            self.assertEqual(result['ordinaryWindowsCommands'], ['prepare', 'assemble'])
+            self.assertEqual(result['ordinaryWindowsCommands'], ['prepare', 'produce', 'assemble'])
             # Eager containers/first operands still perform the real check.
             gate = '    zip_inventory(destination, expected)\n'
             for eager_form in ['[zip_inventory(destination, expected)]',
@@ -476,16 +621,17 @@ class Integrity(unittest.TestCase):
                                'zip_inventory(destination, expected) and None']:
                 changed = source.replace(gate, '    ' + eager_form + '\n')
                 self.assertNotEqual(changed, source)
-                self.assertEqual(w.contract(root, source_text=changed, workflow_text=workflow), result)
+                self.assertEqual(source_contract(root, source_text=changed, workflow_text=workflow), result)
             mutations = [
-                source.replace('        assemble_carriers(root, state, app_path, app, source_path, source_identity)',
+                source + '\ndef assemble(root): pass\n',
+                source.replace('            assemble_carriers(root, state, app_path, app, path, identity)',
                                '        pass  # producer checks detached'),
-                source.replace('        app_path, app = compiled_app(root, staging=Path(stage), state=state)',
-                               "        app_path, app = None, b'unchecked'"),
+                source.replace('            app_path, app = compiled_app(root, staging=Path(stage), state=state)',
+                               "            app_path, app = None, b'unchecked'"),
                 source.replace('    cli = tauri_identity(root)', "    cli = {'entry': 'fake', 'version': 'unchecked'}"),
                 source.replace('    zip_inventory(destination, expected)\n', '    # actual final ZIP check removed\n'),
                 source.replace('        exact(actual, expected)\n', '        # full ZIP comparison removed\n'),
-                source.replace("    require_legal_resources(conf['bundle']['resources'])", "    # mandatory legal registration removed"),
+                source.replace("require_legal_resources(resources)", "None  # mandatory legal registration removed"),
                 source.replace('            shutil.copyfile(io_path(regular(source)), io_path(path))', '            pass  # source map no longer copied'),
                 source.replace('    build_portable(root, state, app, portable)', '    if False:\n        build_portable(root, state, app, portable)'),
                 source.replace("'assemble': assemble, 'contract': contract", "'assemble': contract, 'contract': contract"),
@@ -505,24 +651,24 @@ class Integrity(unittest.TestCase):
                                "for source, name in state['sources'].items():"),
                 source.replace("}[args.action](ROOT)", "}['contract'](ROOT)"),
                 source.replace("}[args.action](ROOT)", "}[args.action](None)"),
-                source.replace("'prepare': prepare, 'assemble': assemble, 'contract': contract}",
-                               "'prepare': prepare, 'assemble': assemble, 'contract': contract, **extra}"),
-                source.replace("'prepare': prepare, 'assemble': assemble, 'contract': contract}",
-                               "'prepare': prepare, 'assemble': assemble, 'contract': contract, 'prepare': prepare}"),
-                source.replace("result = {'prepare': prepare, 'assemble': assemble, 'contract': contract}[args.action](ROOT)",
-                               "unused = {'prepare': prepare, 'assemble': assemble, 'contract': contract}\n    result = contract(ROOT)"),
-                source.replace("result = {'prepare': prepare, 'assemble': assemble, 'contract': contract}[args.action](ROOT)",
-                               "result = False and {'prepare': prepare, 'assemble': assemble, 'contract': contract}[args.action](ROOT)"),
+                source.replace("'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}",
+                               "'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract, **extra}"),
+                source.replace("'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}",
+                               "'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract, 'prepare': prepare}"),
+                source.replace("result = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)",
+                               "unused = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}\n    result = contract(ROOT)"),
+                source.replace("result = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)",
+                               "result = False and {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)"),
             ]
             for changed in mutations:
                 self.assertNotEqual(changed, source)
-                with self.assertRaises(ValueError): w.contract(root, source_text=changed, workflow_text=workflow)
+                with self.assertRaises(ValueError): source_contract(root, source_text=changed, workflow_text=workflow)
             for changed in [workflow.replace('python scripts/windows-package-integrity.py assemble', 'python scripts/windows-package-integrity.py contract'),
                             workflow.replace("if: runner.os == 'Windows'\n        shell: pwsh\n        run: |\n          python scripts/windows-package-integrity.py prepare", "if: false\n        shell: pwsh\n        run: |\n          python scripts/windows-package-integrity.py prepare"),
                             workflow.replace("if ($LASTEXITCODE -ne 0) { throw 'complete Windows carrier integrity failed' }", "Write-Host 'ignored'"),
                             workflow.replace("if: runner.os == 'Windows'\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          python scripts/windows-package-integrity.py assemble", "if: inputs.native_validation == true\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          python scripts/windows-package-integrity.py assemble")]:
                 self.assertNotEqual(changed, workflow)
-                with self.assertRaises(ValueError): w.contract(root, source_text=source, workflow_text=changed)
+                with self.assertRaises(ValueError): source_contract(root, source_text=source, workflow_text=changed)
 
     def test_three_legal_members_cannot_disappear_from_config_or_actual_zip(self):
         for name in ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md']:
@@ -534,7 +680,7 @@ class Integrity(unittest.TestCase):
                 conf = root / 'src-tauri/tauri.windows.conf.json'; value = json.loads(conf.read_text())
                 value['bundle']['resources'].remove('../' + name); conf.write_text(json.dumps(value))
                 with self.assertRaises(ValueError): w.source_inventory(root)
-                with self.assertRaises(ValueError): w.contract(root, workflow_text=(ROOT / '.github/workflows/package.yml').read_text(encoding='utf-8'))
+                with self.assertRaises(ValueError): w.contract(root)
 
     def test_streamed_unknown_sizes_are_valid_but_literal_member_bytes_are_exact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -994,7 +1140,9 @@ class CargoContexts(unittest.TestCase):
                'target': copy.deepcopy(package['targets'][0]), 'executable': str(release / 'polaris.exe'),
                'filenames': [str(release / 'polaris.exe')], 'fresh': True,
                'profile': {'test': False, 'debug_assertions': False, 'opt_level': '3'}}
-        fixture = SimpleNamespace(metadata=metadata, artifact=row, calls=[], head='a' * 40, diff='', after_build=None)
+        fixture = SimpleNamespace(metadata=metadata, artifact=row, calls=[], head='a' * 40, diff='', after_build=None,
+                                  before_ready=None, after_capture=None, child_env={}, tauri_runs=0)
+        real_output = w.cargo_output
         def output(argv, cwd, **kwargs):
             fixture.calls.append((argv, cwd, kwargs))
             self.assertEqual(Path(argv[0]), Path(os.environ['CARGO']))
@@ -1003,8 +1151,32 @@ class CargoContexts(unittest.TestCase):
             if argv[1] == 'metadata': return json.dumps(metadata)
             self.assertEqual(argv[1], 'build')
             if fixture.after_build: fixture.after_build()
-            return '\n'.join(json.dumps(x) for x in [row, {'reason': 'build-finished', 'success': True}])
+            value = '\n'.join(json.dumps(x) for x in [row, {'reason': 'build-finished', 'success': True}])
+            # An actual inert child supplies the exclusive pipe, exit/birth and
+            # EOF facts. Its bytes are controlled compiler fixtures, not Cargo.
+            with Integrity.inert_reader(self, b'', {argv[-1]: value}) as (processes, commands), patch.object(sys, 'stdout', SimpleNamespace(buffer=io.BytesIO())):
+                result = real_output(argv, cwd, **kwargs)
+                self.assertEqual(len(processes), 1)
+                return result
+        def tauri(r, argv, env, ready, timeout):
+            self.assertEqual(r, root); self.assertGreater(timeout, 0); fixture.tauri_runs += 1
+            self.assertIn('--runner', argv)
+            self.assertEqual(Path(argv[argv.index('--runner') + 1]).read_bytes(), w.RUNNER_TEXT.encode('ascii'))
+            args = ['build', '--locked', '--offline', '--message-format=json', '--bins', '--features', 'tauri/custom-protocol', '--release']
+            if target: args.extend(['--target', target])
+            def notify():
+                if fixture.before_ready: fixture.before_ready()
+                ready()
+            with patch.dict(os.environ, env), patch.object(w, 'notify_capture_ready', side_effect=notify):
+                os.environ['TAURI_CONFIG'] = json.dumps(json.loads((root / 'src-tauri/tauri.windows.conf.json').read_text()), separators=(',', ':'))
+                os.environ.update(fixture.child_env)
+                w.capture(root, args)
+            if fixture.after_capture: fixture.after_capture()
+            return {'exitCode': 0, 'fixture': 'inert direct Cargo pipe; not a native Tauri or package positive'}
+        fake_tauri = root / 'inert-tauri.exe'; fake_tauri.write_bytes(b'inert Tauri routing identity')
         with patch.dict(os.environ), patch.object(w, 'cargo_output', side_effect=output), \
+             patch.object(w, 'run_tauri', side_effect=tauri), \
+             patch.object(w, 'tauri_identity', return_value={'entry': str(fake_tauri), 'version': 'tauri-cli 2.12.1'}), \
              patch.object(w, 'find_sevenzip', return_value=('7z', '26.05')), \
              patch.object(w, 'verified_sources', side_effect=w.source_inventory), \
              patch.object(w.subprocess, 'check_output', side_effect=lambda argv, **k: fixture.diff if 'diff' in argv else fixture.head + '\n'):
@@ -1042,11 +1214,15 @@ class CargoContexts(unittest.TestCase):
                                       + ''.join('File /a "/oname=' + name + '" "' + source + '"\n'
                                                 for name, source in state['sources'].items()) + 'SectionEnd\n')
                     self.assertEqual(w.verify_generated_script(root, state), w.facts(script))
-                    with patch.object(w, 'tauri_identity', return_value={'version': 'tauri-cli 2.12.1'}), \
-                         patch.object(w, 'nsis_inventory', side_effect=lambda r, t, a, expected, temp: expected):
+                    with patch.object(w, 'nsis_inventory', side_effect=lambda r, t, a, expected, temp: expected):
                         os.environ.pop('POLARIS_WINDOWS_PACKAGE_STATE')
                         with patch.object(w, 'ROOT', root), patch.object(sys, 'argv',
-                             ['windows-package-integrity.py', 'assemble', '--state', str(path)]): w.main()
+                             ['windows-package-integrity.py', 'produce', '--state', str(path)]): w.main()
+                    with patch.object(w, 'run_tauri', side_effect=AssertionError('assemble cannot build')), \
+                         patch.object(w, 'cargo_output', side_effect=AssertionError('readback cannot execute Cargo')):
+                        before = len(fixture.calls)
+                        w.assemble(root)
+                        self.assertEqual(len(fixture.calls), before)
                     receipt = json.loads((root / 'windows-package-evidence/static-carriers.json').read_bytes())
                     self.assertEqual(receipt['compiledAppInput']['sourcePath'], str(binary))
                     self.assertEqual(receipt['cargoContext'], state['cargo'])
@@ -1106,8 +1282,8 @@ class CargoContexts(unittest.TestCase):
                             metadata = copy.deepcopy(fixture.metadata)
                             if change in ('stable', 'stable-empty'):
                                 self.assertEqual(state['cargo']['environment'][name], os.environ[name])
-                                w.cargo_release_artifact(root, state)
-                                self.assertEqual(sum(argv[1] == 'build' for argv, _, _ in fixture.calls), 1)
+                                self.assertEqual(w.load_state(root), state)
+                                self.assertFalse(any(argv[1] == 'build' for argv, _, _ in fixture.calls))
                                 continue
                             if change.startswith('remove'): os.environ.pop(name)
                             elif change.endswith('empty'): os.environ[name] = ''
@@ -1124,8 +1300,7 @@ class CargoContexts(unittest.TestCase):
                             self.assertEqual(w.directory_id(path.parent), state['ownerIdentity'])
                             with self.assertRaisesRegex(ValueError, 'Cargo context changed'): w.load_state(root)
                             with self.assertRaisesRegex(ValueError, 'Cargo context changed'): w.assemble(root)
-                            with self.assertRaisesRegex(ValueError, 'Cargo context changed before release proof'):
-                                w.cargo_release_artifact(root, state)
+                            with self.assertRaisesRegex(ValueError, 'Cargo context changed'): w.produce(root)
                             self.assertFalse(any(argv[1] == 'build' for argv, _, _ in fixture.calls))
 
     def test_debug_foreign_or_changed_release_artifacts_rejected(self):
@@ -1143,12 +1318,85 @@ class CargoContexts(unittest.TestCase):
                     elif fault == 'source': fixture.artifact['target']['src_path'] = str(root / 'other.rs')
                     elif fault == 'late resource': fixture.after_build = lambda: (root / 'resources/win/polaris-helper.exe').write_bytes(b'changed')
                     elif fault == 'late head': fixture.after_build = lambda: setattr(fixture, 'head', 'b' * 40)
-                    with self.assertRaises(ValueError): w.cargo_release_artifact(root, state)
+                    with self.assertRaises(ValueError): w.produce(root)
 
     def test_cargo_query_real_bounded_child_explicit_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.assertEqual(w.cargo_output([sys.executable, '-c', 'import os;print(os.getcwd(),end="")'], root), str(root))
+
+    def test_first_producer_rejects_mutable_replay_missing_scope_and_child_input_drift(self):
+        for fault in ['missing first producer', 'old transcript', 'changed record', 'foreign child flags', 'foreign child config']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); _, app = self.fixture(root)
+                with self.cargo(root, root / 'target') as fixture:
+                    w.prepare(root); owner = next((root / 'target/release').glob('.polaris-package-*'))
+                    os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(owner / 'state.json')
+                    (root / 'target/release/polaris.exe').write_bytes(app)
+                    if fault == 'old transcript': (owner / 'first-cargo.jsonl').write_text('{}\n')
+                    elif fault == 'changed record':
+                        def corrupt():
+                            path = owner / 'capture.json'; data = json.loads(path.read_bytes())
+                            data['data']['artifact']['profile']['debug_assertions'] = True; path.write_text(json.dumps(data))
+                        fixture.before_ready = corrupt
+                    elif fault == 'foreign child flags': fixture.child_env['RUSTFLAGS'] = '--cfg=foreign_producer'
+                    elif fault == 'foreign child config': fixture.child_env['TAURI_CONFIG'] = '{}'
+                    if fault == 'missing first producer':
+                        with patch.object(w, 'run_tauri', return_value={'exitCode': 0}), self.assertRaises(ValueError): w.produce(root)
+                    else:
+                        with self.assertRaises(ValueError): w.produce(root)
+                    self.assertFalse((owner / 'produced.json').exists())
+                    self.assertFalse(any((root / 'dist-win').iterdir()))
+                    with self.assertRaises((OSError, ValueError)): w.assemble(root)
+                    if fault in ('old transcript', 'foreign child flags', 'foreign child config', 'missing first producer'):
+                        self.assertFalse(any(argv[1] == 'build' for argv, _, _ in fixture.calls))
+
+    def test_first_release_arguments_are_closed_and_not_an_arbitrary_runner(self):
+        state = {'cargo': {'target': None}}
+        normal = ['build', '--locked', '--offline', '--bins', '--release', '--message-format=json', '--features', 'tauri/custom-protocol']
+        w.release_arguments(state, normal)
+        for args in [normal + ['--release'], normal + ['--profile', 'debug'], normal + ['--no-default-features'],
+                     [x for x in normal if x != '--locked'], normal[:-1] + ['foreign'],
+                     normal + ['--target', 'aarch64-pc-windows-msvc'], ['metadata', *normal[1:]]]:
+            with self.subTest(args=args), self.assertRaises(ValueError): w.release_arguments(state, args)
+
+    def test_native_handle_transfer_pins_the_actual_file_after_capture_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'inert App.bin'; path.write_bytes(b'inert before patch')
+            module = str(Path(w.__file__).absolute())
+            program = ('import importlib.util,json,os,time,msvcrt;'
+                       f's=importlib.util.spec_from_file_location("w",{module!r});w=importlib.util.module_from_spec(s);s.loader.exec_module(w);'
+                       f'f=w.hold_app(w.Path({str(path)!r}));'
+                       'print(json.dumps([os.getpid(),w.process_birth(os.getpid()),msvcrt.get_osfhandle(f.fileno())]),flush=True);time.sleep(.5)')
+            with subprocess.Popen([sys.executable, '-B', '-u', '-c', program], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+                try:
+                    pid, birth, handle = json.loads(child.stdout.readline(4096))
+                    with w.duplicate_app(pid, birth, handle) as held:
+                        self.assertEqual(child.wait(timeout=5), 0)
+                        self.assertEqual(w.app_object_identity(w.app_identity(os.fstat(held.fileno()))),
+                                         w.app_object_identity(w.app_identity(path.stat())))
+                        path.write_bytes(b'inert normal in-place patch'); held.seek(0)
+                        self.assertEqual(held.read(), b'inert normal in-place patch')
+                        other = Path(tmp) / 'other'; other.write_bytes(b'replacement')
+                        with self.assertRaises(OSError): os.replace(other, path)
+                finally:
+                    if child.poll() is None: child.terminate(); child.wait()
+
+    def test_native_runner_paths_are_literal_and_exit_status_is_not_suppressed(self):
+        with tempfile.TemporaryDirectory(prefix='polaris-inert-') as tmp:
+            root = Path(tmp) / 'space 中文 & !'; root.mkdir()
+            runner = root / 'runner.cmd'; runner.write_bytes(w.RUNNER_TEXT.encode('ascii'))
+            script = root / 'entry 中文 & !%.py'; result = root / 'argv.json'
+            script.write_text('import json,os,sys\nfrom pathlib import Path\nPath(os.environ["RESULT"]).write_text(json.dumps(sys.argv[1:]))\nsys.exit(int(os.environ["STATUS"]))\n', encoding='utf-8')
+            state = str(root / 'state 中文 & !%.json')
+            env = dict(os.environ, POLARIS_PACKAGE_PYTHON=sys.executable, POLARIS_PACKAGE_SCRIPT=str(script),
+                       POLARIS_PACKAGE_STATE=state, RESULT=str(result), STATUS='0')
+            args = ['build', '--locked', '--offline', '--bins', '--features', 'tauri/custom-protocol', '--release', '--message-format=json']
+            for status in [0, 17]:
+                env['STATUS'] = str(status)
+                child = subprocess.run([str(runner), *args], env=env, cwd=root, capture_output=True, timeout=10)
+                self.assertEqual(child.returncode, status, child.stderr)
+                self.assertEqual(json.loads(result.read_bytes()), ['capture', '--state', state, '--', *args])
 
     def test_reparse_target_alias_foreign_state_and_debug_fallback_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

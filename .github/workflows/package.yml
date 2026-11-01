@@ -1139,6 +1139,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows package input freeze failed' }
 
       - name: Build installers
+        if: runner.os != 'Windows'
         id: installers
         uses: tauri-apps/tauri-action@v1
         env:
@@ -1151,6 +1152,13 @@ jobs:
           tauriScript: ${{ runner.os == 'macOS' && 'bash scripts/macos-bundler-diagnostics.sh' || 'tauri' }}
           args: ${{ matrix.tauri_args }}
           retryAttempts: 0
+
+      - name: Build Windows installers with first Cargo evidence
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python scripts/windows-package-integrity.py produce
+          if ($LASTEXITCODE -ne 0) { throw 'Windows first release producer failed' }
 
       # Save the original attempt's full output even when compilation/bundling
       # fails or is cancelled. The log lives outside the directory Tauri resets.
