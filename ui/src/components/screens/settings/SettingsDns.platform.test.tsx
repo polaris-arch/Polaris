@@ -1,24 +1,30 @@
-import { isValidElement, type ReactElement } from 'react';
+import { isValidElement, type ComponentProps } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { beforeEach, expect, it, vi } from 'vitest';
+import type { DnsConfig, UserConfig } from '@/contracts/types';
+import { DEMO_CONFIG } from '../../../../harness-fixture';
 
+type SwitchProps = ComponentProps<typeof import('./Primitives').Switch>;
 const platform = vi.hoisted(() => ({ value: undefined as string | undefined }));
+const controls = vi.hoisted((): SwitchProps[] => []);
 vi.mock('./settings-logic', async (original) => ({
   ...await original<typeof import('./settings-logic')>(),
   shellPlatformFromDataOs: () => platform.value,
 }));
-vi.mock('react', async (original) => {
-  const actual = await original<typeof import('react')>();
-  const hooks = {
-    useState: (value: unknown) => [value, vi.fn()],
-    useRef: (value: unknown) => ({ current: value }),
-    useEffect: () => {},
-    useCallback: (callback: unknown) => callback,
-    useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
-    useDebugValue: () => {},
+vi.mock('./Primitives', async (original) => {
+  const actual = await original<typeof import('./Primitives')>();
+  return {
+    ...actual,
+    SetRow: (props: ComponentProps<typeof actual.SetRow>) => {
+      if (props.label === 'settings.advanced.takeoverSystemDns') {
+        if (!isValidElement<SwitchProps>(props.children) || props.children.type !== actual.Switch) {
+          throw new Error('HOST_DNS_SWITCH_MISSING');
+        }
+        controls.push(props.children.props);
+      }
+      return <actual.SetRow {...props} />;
+    },
   };
-  // Zustand reads hooks through React's default export; keep real store snapshots.
-  const mockedReact = { ...actual, ...hooks };
-  return { ...mockedReact, default: mockedReact };
 });
 vi.mock('react-i18next', async (original) => ({
   ...await original<typeof import('react-i18next')>(),
@@ -26,25 +32,26 @@ vi.mock('react-i18next', async (original) => ({
 }));
 await (await import('@/i18n')).i18nReady;
 const { default: SettingsDns } = await import('./SettingsDns');
-const { SetRow, Switch } = await import('./Primitives');
 
-function nodes(node: unknown): ReactElement<Record<string, unknown>>[] {
-  if (Array.isArray(node)) return node.flatMap(nodes);
-  if (!isValidElement<Record<string, unknown>>(node)) return [];
-  return [node, ...nodes(node.props.children)];
-}
-beforeEach(() => { platform.value = undefined; });
+beforeEach(() => { platform.value = undefined; controls.length = 0; });
 it.each(['win', 'mac', 'lin', undefined])('system DNS takeover on %s preserves saved preference and gates the actual handler', (os) => {
   platform.value = os;
   const update = vi.fn(async () => {});
-  const screen = SettingsDns({ config: { dnsConfig: { takeoverSystemDns: true } } as never, update, section: 'runtime' });
-  const row = nodes(screen).find((node) => node.type === SetRow && node.props.label === 'settings.advanced.takeoverSystemDns');
-  expect(row).toBeDefined();
-  const control = nodes(row).find((node) => node.type === Switch)!;
-  expect(control.props.checked).toBe(true);
-  expect(control.props.disabled).toBe(os === 'win');
-  expect(control.props.tip).toBe(os === 'win' ? 'settings.dns.takeoverSystemDnsUnsupported' : undefined);
-  (control.props.onChange as (value: boolean) => void)(false);
+  const dns: DnsConfig = {
+    domesticDns: 'https://223.5.5.5/dns-query', foreignDns: 'https://1.1.1.1/dns-query',
+    enableFakeIp: true, takeoverSystemDns: true,
+  };
+  const config: UserConfig = { ...DEMO_CONFIG, dnsConfig: dns };
+  // A real renderer installs the dispatcher used by external Zustand modules too.
+  // Capture the real Switch's props while rendering the actual row and control.
+  renderToStaticMarkup(<SettingsDns config={config} update={update} section="runtime" />);
+  expect(controls).toHaveLength(1);
+  const [control] = controls;
+  if (!control) throw new Error('HOST_DNS_SWITCH_MISSING');
+  expect(control.checked).toBe(true);
+  expect(control.disabled).toBe(os === 'win');
+  expect(control.tip).toBe(os === 'win' ? 'settings.dns.takeoverSystemDnsUnsupported' : undefined);
+  control.onChange(false);
   if (os === 'win') expect(update).not.toHaveBeenCalled();
-  else expect(update).toHaveBeenCalledWith({ dnsConfig: { takeoverSystemDns: false } });
+  else expect(update).toHaveBeenCalledWith({ dnsConfig: { ...dns, takeoverSystemDns: false } });
 });

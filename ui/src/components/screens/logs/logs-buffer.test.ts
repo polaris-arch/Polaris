@@ -112,12 +112,48 @@ describe('clear receipt and stale reads', () => {
     expect(() => retainAfterClear([], -1)).toThrow('LOG_CLEAR_RECEIPT_INVALID');
   });
   it('both desktop and mobile retire held hydration/search and preserve post-clear buffers', () => {
-    for (const path of ['./LogsScreen.tsx', '../../../mobile/connections/MobileConnectionsScreen.tsx']) {
-      const source = readFileSync(fileURLToPath(new URL(path, import.meta.url)), 'utf8');
-      expect(source.match(/epoch !== logReadEpoch.current/g)).toHaveLength(2);
-      expect(source).toContain('const boundary = await api.logs.clear()');
-      expect(source).toContain('setLogs(previous => retainAfterClear(previous, boundary))');
-      expect(source).toContain('pendingRef.current = retainAfterClear(pendingRef.current, boundary)');
+    for (const [path, snapshotSetter] of [
+      ['./LogsScreen.tsx', 'setSearchSnapshot'],
+      ['../../../mobile/connections/MobileConnectionsScreen.tsx', 'setLogSnapshot'],
+    ]) {
+      const source = readFileSync(fileURLToPath(new URL(path, import.meta.url)), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/(^|[^:])\/\/.*$/gm, '$1');
+      // Pin each held read's guard before its own publication, rather than a
+      // whole-file count that mistakes an additional guarded failure for drift.
+      const get = source.indexOf('const batch = await api.logs.get(subscriptionId, MAX_BUFFERED_ROWS)');
+      const hydrateCapture = source.lastIndexOf('const epoch = logReadEpoch.current', get);
+      const hydratePublish = source.indexOf('const snapshot:', get);
+      expect(get, path).toBeGreaterThan(-1);
+      expect(hydrateCapture, path).toBeGreaterThan(-1);
+      expect(hydratePublish, path).toBeGreaterThan(get);
+      expect(source.slice(hydrateCapture, hydratePublish), path)
+        .toMatch(/if\s*\([^)]*epoch !== logReadEpoch\.current[^)]*\)\s*return;/);
+
+      const search = source.indexOf('.search(');
+      const searchEffect = source.lastIndexOf('useEffect(', search);
+      const then = source.indexOf('.then((batch) => {', search);
+      const caught = source.indexOf('.catch(', then);
+      expect(search, path).toBeGreaterThan(-1);
+      expect(source.slice(searchEffect, search), path).toContain('const epoch = logReadEpoch.current');
+      expect(then, path).toBeGreaterThan(search);
+      expect(caught, path).toBeGreaterThan(then);
+      const searchResult = source.slice(then, caught);
+      const searchGuard = searchResult.indexOf('epoch !== logReadEpoch.current');
+      expect(searchResult, path).toMatch(/if\s*\([^)]*epoch !== logReadEpoch\.current[^)]*\)\s*return;/);
+      expect(searchResult.indexOf(snapshotSetter + '('), path).toBeGreaterThan(searchGuard);
+      if (snapshotSetter === 'setLogSnapshot') {
+        // Mobile publishes a search failure too; a stale rejection must not
+        // replace the state established by a later clear/retry.
+        const failure = source.slice(caught, source.indexOf('}, SEARCH_DEBOUNCE_MS)', caught));
+        expect(failure).toMatch(/if\s*\([^)]*epoch !== logReadEpoch\.current[^)]*\)\s*return;/);
+        expect(failure.indexOf('setLogSearchFailed(true)')).toBeGreaterThan(failure.indexOf('epoch !== logReadEpoch.current'));
+      }
+
+      expect(source, path).toMatch(/logReadEpoch\.current \+= 1;\s*const boundary = await api\.logs\.clear\(\);\s*retainAfterClear\(\[\], boundary\);\s*logReadEpoch\.current \+= 1;/);
+      expect(source, path).toContain('setLogs(previous => retainAfterClear(previous, boundary))');
+      expect(source, path).toContain(`${snapshotSetter}(previous => previous ? { ...previous, rows: retainAfterClear(previous.rows, boundary) } : null)`);
+      expect(source, path).toContain('pendingRef.current = retainAfterClear(pendingRef.current, boundary)');
     }
   });
 });

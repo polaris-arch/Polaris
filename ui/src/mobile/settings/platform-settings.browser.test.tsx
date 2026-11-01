@@ -49,8 +49,10 @@ api.ruleResources.list = async () => [{ id: 'youtube-resource', name: 'geosite-y
 api.ruleResources.onProgress = () => () => {};
 useAppStore.setState({ config: initial, servers: [], subscriptions: [],
   mutateConfigEntities: async mutations => { control.mutations.push(...mutations); } });
+// Built-in labelKey is a suffix; appPresetLabel supplies the rules.apps. prefix.
 useAppPresetsStore.setState({ loaded: true, loading: false, failed: false,
-  presets: [{ id: 'youtube', labelKey: 'rules.apps.youtube', emoji: '▶', category: 'video', processNames: [] }] });
+  presets: [{ id: 'youtube', labelKey: 'youtube', emoji: '▶', category: 'video',
+    geositeTags: ['youtube'], geoipTags: [], processNames: [] }] });
 await runAppUpdateCheck(async () => ({ hasUpdate: true, updateInfo: { version: '9.8.7' } }), initial);
 function App() {
   const [config, setConfig] = useState(initial);
@@ -190,13 +192,14 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile platform setti
   it('iOS custom app keeps domain/IP resources and save while omitting the Android package picker', async () => {
     const page = await fixture('os=ios&page=app-add');
     try {
-      await page.getByText('youtube', { exact: true }).waitFor();
+      const form = page.getByRole('dialog', { name: 'Add Custom App', exact: true });
+      await form.getByText('youtube', { exact: true }).waitFor();
       expect(await page.evaluate(() => (window as any).__platformSettings.installedReads)).toBe(0);
       expect(await page.getByRole('listbox', { name: 'Match by app', exact: true }).count()).toBe(0);
       expect(await page.locator('.m-form-body').textContent()).toContain('iOS');
-      await page.locator('#maa-name').fill('iOS video');
-      await page.getByText('youtube', { exact: true }).click();
-      await page.locator('.m-form-foot .primary').click();
+      await form.locator('#maa-name').fill('iOS video');
+      await form.getByText('youtube', { exact: true }).click();
+      await form.getByRole('button', { name: 'Add Custom App', exact: true }).click();
       await page.waitForFunction(() => (window as any).__platformSettings.mutations.length === 1);
       const mutation = await page.evaluate(() => (window as any).__platformSettings.mutations[0]);
       expect(mutation.value.geositeTags).toEqual(['youtube']);
@@ -211,13 +214,14 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile platform setti
       await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
       await page.waitForFunction(() => (window as any).__platformSettings.authReads === 2);
       await page.goto(origin + '/__platform-settings?os=android&page=app-add');
-      const packages = page.getByRole('listbox', { name: 'Match by app', exact: true });
+      const form = page.getByRole('dialog', { name: 'Add Custom App', exact: true });
+      const packages = form.getByRole('listbox', { name: 'Match by app', exact: true });
       await packages.getByRole('option', { name: /Fixture app/ }).waitFor();
       expect(await page.evaluate(() => (window as any).__platformSettings.installedReads)).toBe(1);
       await packages.getByRole('option', { name: /Fixture app/ }).click();
-      await page.locator('#maa-name').fill('Android video');
-      await page.getByText('youtube', { exact: true }).click();
-      await page.locator('.m-form-foot .primary').click();
+      await form.locator('#maa-name').fill('Android video');
+      await form.getByText('youtube', { exact: true }).click();
+      await form.getByRole('button', { name: 'Add Custom App', exact: true }).click();
       await page.waitForFunction(() => (window as any).__platformSettings.mutations.length === 1);
       expect(await page.evaluate(() => (window as any).__platformSettings.mutations[0].value.packageNames)).toEqual(['fixture.app']);
     } finally { await page.close(); }
@@ -228,16 +232,23 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile platform setti
     try {
       await page.goto(origin + '/__platform-settings?os=ios&page=apps');
       await page.getByRole('tab', { name: 'Apps', exact: true }).click();
-      await page.locator('.rc-app-match').first().waitFor();
-      expect(await page.locator('.rc-app-match summary').first().textContent()).toContain('Domain / IP only');
-      expect(await page.locator('.rc-app-match summary').first().textContent()).not.toContain('VPN exclusion');
-      await page.locator('.rc-app-match summary').first().click();
-      expect(await page.locator('.rc-app-match').first().textContent()).toContain('iOS');
-      expect(await page.locator('.rc-app-match').first().textContent()).not.toContain('A built-in preset with a package name can be excluded');
-      await page.getByRole('button', { name: /YouTube.*Policy/ }).click();
+      const card = page.locator('.rc-app-card').filter({ hasText: 'YouTube' });
+      await card.waitFor();
+      expect(await card.count()).toBe(1);
+      expect(await card.locator('.mr-row-title').textContent()).toBe('YouTube');
+      const matching = card.locator('.rc-app-match');
+      expect(await matching.locator('summary').textContent()).toContain('Domain / IP only');
+      expect(await matching.locator('summary').textContent()).not.toContain('VPN exclusion');
+      await matching.locator('summary').click();
+      expect(await matching.textContent()).toContain('iOS');
+      expect(await matching.textContent()).not.toContain('A built-in preset with a package name can be excluded');
+      await card.getByRole('button', { name: 'YouTube · Policy', exact: true }).click();
+      const policies = page.getByRole('dialog', { name: 'YouTube', exact: true });
+      await policies.waitFor();
       for (const name of ['Follow global', 'Direct', 'Block']) {
-        expect(await page.getByRole('option', { name, exact: true }).count()).toBe(1);
+        expect(await policies.getByRole('option', { name, exact: true }).count()).toBe(1);
       }
+      expect(await policies.getByRole('option', { name: 'Direct', exact: true }).getAttribute('aria-selected')).toBe('true');
     } finally { await page.close(); }
   });
 });
