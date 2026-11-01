@@ -576,7 +576,7 @@ export function MobileConnectionsScreen(): ReactElement {
       alive = false;
       window.clearTimeout(timer);
     };
-  }, [segment, logSearchKey, logQuery, displayLevel, logSource, logStreamReady]);
+  }, [segment, logSearchKey, logQuery, displayLevel, logSource, logStreamReady, logStreamAttempt]);
 
   useEffect(() => {
     if (segment !== 'logs') return;

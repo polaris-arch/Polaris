@@ -4284,10 +4284,11 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     ("DiffersWrongToday", 148),
-    // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
-    // checked by eval_cfg for Android/iOS in both release/debug. No existing
-    // verdict or debt site changes; this does not claim device validation.
-    ("WithAndroid", 137),
+    // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1).
+    // TLS presentation adds five more: core_info (1 + 1), core_identity (2),
+    // and tls_capabilities (1). eval_cfg checks Android/iOS in release/debug.
+    // No existing verdict or debt site changes; no device validation is claimed.
+    ("WithAndroid", 142),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

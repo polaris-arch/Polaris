@@ -16,13 +16,18 @@ import '/src/styles/tokens.resolved.css';
 import '/src/mobile/mobile.css';
 import '/src/mobile/forms/forms.css';
 await i18nReady; await i18n.changeLanguage('en-US');
-const state = window.__mobileLogRecovery = { listeners: [], reads: [], searches: [], unsubscribed: [] };
+const state = window.__mobileLogRecovery = { listeners: [], reads: [], searches: [], unsubscribed: [],
+  immediateReady: false, immediateReconnectRows: null };
 api.logs.onReceivedBatchReady = callback => new Promise((resolve, reject) => {
   const listener = { callback, off: 0, resolve: () => resolve(() => listener.off++), reject };
   state.listeners.push(listener);
+  if (state.immediateReady) listener.resolve();
 });
-api.logs.get = id => new Promise((resolve, reject) => state.reads.push({ id, resolve, reject }));
-api.logs.search = query => new Promise((resolve, reject) => state.searches.push({ query, resolve, reject }));
+api.logs.get = id => new Promise((resolve, reject) => {
+  state.reads.push({ id, resolve, reject });
+  if (state.immediateReconnectRows !== null) resolve(state.immediateReconnectRows);
+});
+api.logs.search = (query, level, source) => new Promise((resolve, reject) => state.searches.push({ query, level, source, resolve, reject }));
 api.logs.unsubscribe = async id => { state.unsubscribed.push(id); };
 api.logs.diagnosticState = async () => false;
 api.logs.runtimeLevel = async () => ({ level: null, reason: 'notRunning' });
@@ -200,6 +205,42 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile log ownership 
       expect(await page.locator('[data-log-stream-error]').count()).toBe(0);
       await search.fill('');
       await page.getByText('original history', { exact: true }).waitFor();
+    } finally { await page.close(); }
+  });
+
+  it('retries the same query when listener readiness and hydration resolve immediately without an observable ready change', async () => {
+    const page = await fixture();
+    try {
+      await hydrate(page, 0, [row(1, 'retained history')]);
+      const search = page.locator('[data-conn-search] input');
+      await search.fill('instant');
+      await page.waitForFunction(() => (window as any).__mobileLogRecovery.searches.length === 1);
+      await page.evaluate(() => (window as any).__mobileLogRecovery.searches[0].reject(new Error('query failed')));
+      const error = page.locator('[data-log-stream-error]');
+      await error.waitFor();
+      expect(await page.locator('.mc-live').count()).toBe(1);
+      await page.evaluate(rows => {
+        const state = (window as any).__mobileLogRecovery;
+        state.immediateReady = true;
+        state.immediateReconnectRows = rows;
+      }, [row(1, 'retained history')]);
+      await error.getByRole('button', { name: 'Retry', exact: true }).click();
+      await page.waitForFunction(() => (window as any).__mobileLogRecovery.searches.length === 2);
+      expect(await search.inputValue()).toBe('instant');
+      expect(await page.evaluate(() => (window as any).__mobileLogRecovery.searches.map((request: any) => ({
+        query: request.query, level: request.level, source: request.source,
+      })))).toEqual([
+        { query: 'instant', level: 'info', source: 'all' },
+        { query: 'instant', level: 'info', source: 'all' },
+      ]);
+      expect(await page.evaluate(() => (window as any).__mobileLogRecovery.listeners.length)).toBe(2);
+      expect(await page.evaluate(() => (window as any).__mobileLogRecovery.listeners[0].off)).toBe(1);
+      await page.evaluate(rows => (window as any).__mobileLogRecovery.searches[1].resolve(rows), [row(2, 'instant recovered')]);
+      await page.getByText('instant recovered', { exact: true }).waitFor();
+      expect(await error.count()).toBe(0);
+      expect(await page.locator('.mc-live').count()).toBe(1);
+      await search.fill('');
+      await page.getByText('retained history', { exact: true }).waitFor();
     } finally { await page.close(); }
   });
 });
