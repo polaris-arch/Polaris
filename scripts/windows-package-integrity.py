@@ -439,7 +439,7 @@ def nsis_listing(text):
 
 
 def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MAX_STDERR, cwd=None,
-                 diagnostic_context=None, cargo_json=False, env=None):
+                 diagnostic_context=None, cargo_json=False, env=None, output_guard=None):
     """Bounded pipe transport. Diagnostics never authorize an artifact or descendants.
 
     Preserve the execution deadline and exact-Popen cleanup. In particular the
@@ -575,6 +575,7 @@ def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MA
         while len(ended) < 2:
             remaining = deadline - time.monotonic()
             require(remaining > 0, 'owned child output deadline exceeded')
+            if output_guard is not None: output_guard()
             try: label, block = messages.get(timeout=min(remaining, 0.05))
             except queue.Empty: continue
             require(label != 'reader-error', 'owned child pipe read failed: ' + str(block))
@@ -587,6 +588,7 @@ def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MA
                 if cargo_json: cargo_events(block); decoder.decode(block)
                 consume_stdout(block)
                 stdout_bytes += len(block); delivered_hash.update(block)
+        if output_guard is not None: output_guard()
         remaining = deadline - time.monotonic()
         require(remaining > 0, 'owned child exit deadline exceeded')
         try: code = wait_primary(remaining, 'exit')
@@ -668,7 +670,86 @@ def extract_nsis_member(tool, archive, name, path, allowed_bytes, budget, deadli
         raise
 
 
-def unpack_nsis(tool, archive, destination, allowed, *, budget=None, timeout=EXTRACT_TIMEOUT):
+def extract_nsis_bound_files(tool, archive, destination, records, expected, actual, budget, deadline):
+    """One named extraction into a fresh, pre-admitted private namespace.
+
+    No concatenated stdout order or inferred member framing is authoritative.
+    Unknown-size/content members have already been read by their literal name.
+    """
+    selected = {name: expected[name] for name, _ in records if name not in actual}
+    require(sum(row['bytes'] for row in selected.values()) <= MAX_TOTAL - budget['bytes'],
+            'NSIS aggregate byte limit exceeded')
+    if not selected: return
+    all_names = {name for name, _ in records}
+    directories = {'/'.join(name.split('/')[:i]) for name in all_names for i in range(1, len(name.split('/')))}
+    require(len(all_names) + len(directories) <= MAX_MEMBERS, 'NSIS extracted entry limit exceeded')
+    maxima = {}; charged = 0
+
+    def bounds():
+        nonlocal charged
+        pending = [destination]; seen = set()
+        while pending:
+            parent = pending.pop()
+            with os.scandir(io_path(parent)) as entries:
+                for entry in entries:
+                    path = parent / entry.name; name = path.relative_to(destination).as_posix()
+                    info = entry.stat(follow_symlinks=False)
+                    require(not stat.S_ISLNK(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x400,
+                            'NSIS extracted reparse or link')
+                    if stat.S_ISDIR(info.st_mode):
+                        require(name in directories, 'unregistered NSIS extracted directory'); pending.append(path)
+                    else:
+                        require(stat.S_ISREG(info.st_mode) and name in all_names,
+                                'unregistered NSIS extracted member')
+                        require(info.st_size <= expected[name]['bytes'] <= MAX_FILE, 'NSIS extracted member byte limit')
+                        if name in selected: maxima[name] = max(maxima.get(name, 0), info.st_size)
+                    seen.add(name)
+                    require(len(seen) <= MAX_MEMBERS, 'NSIS extracted entry limit exceeded')
+        observed = sum(maxima.values())
+        require(observed - charged <= MAX_TOTAL - budget['bytes'], 'NSIS aggregate byte limit exceeded')
+        budget['bytes'] += observed - charged; charged = observed
+
+    # A list file avoids Windows command-length limits without wildcard selection.
+    # Its contents are the already validated, exact logical names, one per line.
+    with tempfile.TemporaryDirectory(prefix='nsis-list-', dir=io_path(destination.parent)) as tmp, ExitStack() as held:
+        selector = Path(tmp) / 'members.txt'
+        with io_path(selector).open('xb') as output:
+            output.write(('\n'.join(selected) + '\n').encode('utf-8')); output.flush(); os.fsync(output.fileno())
+        if os.name == 'nt':
+            held.enter_context(hold_resource(selector))
+            held.enter_context(hold_resource(destination, directory=True))
+            for name in actual: held.enter_context(hold_resource(destination / name))
+        stream_child([tool, 'x', '-bd', '-y', '-spd', '-scsUTF-8', '-o' + str(io_path(destination)),
+                      '-i@' + str(io_path(selector)), '--', str(archive)],
+                     lambda block: None, MAX_LISTING, timeout=deadline - time.monotonic(), output_guard=bounds)
+        bounds()
+        # The tool has actually exited and both pipes joined. Pin actual opened
+        # output objects before hashing; ordinary single-link rules still apply.
+        for name in all_names:
+            path = regular(destination / name)
+            if os.name == 'nt': held.enter_context(hold_resource(path))
+            else: held.enter_context(io_path(path).open('rb'))
+        observed = tree(destination)
+        exact(observed, {name: expected[name] for name, _ in records})
+        actual.update(observed)
+
+
+def unpack_nsis(tool, archive, destination, allowed, *, budget=None, timeout=EXTRACT_TIMEOUT, expected=None):
+    deadline = time.monotonic() + timeout
+    archive = regular(archive)
+    with ExitStack() as held:
+        if os.name == 'nt': held.enter_context(hold_resource(archive))
+        else: held.enter_context(io_path(archive).open('rb'))
+        identity = app_identity(io_path(archive).stat()); original = facts(archive)
+        result = unpack_nsis_held(tool, archive, destination, allowed, budget=budget,
+                                  timeout=deadline - time.monotonic(), expected=expected)
+        require(app_identity(io_path(regular(archive)).stat()) == identity and facts(archive) == original,
+                'held NSIS archive changed')
+        require(time.monotonic() < deadline, 'NSIS shared extraction deadline exceeded')
+        return result
+
+
+def unpack_nsis_held(tool, archive, destination, allowed, *, budget, timeout, expected):
     # One deadline covers listing AND all member streams. A solid archive can
     # require repeated decoder work; no member gets a fresh 180s allowance.
     deadline = time.monotonic() + timeout
@@ -681,6 +762,15 @@ def unpack_nsis(tool, archive, destination, allowed, *, budget=None, timeout=EXT
         require(isinstance(allowed[name], int) and 0 <= allowed[name] <= MAX_FILE,
                 'invalid registered NSIS byte budget')
         require(size is None or size <= allowed[name], 'NSIS member exceeds registered size')
+    known = {} if expected is None else {name: dict(row) for name, row in expected.items()}
+    for name, row in known.items():
+        require(name in allowed and set(row) == {'bytes', 'sha256'}
+                and isinstance(row['bytes'], int) and 0 <= row['bytes'] <= allowed[name]
+                and isinstance(row['sha256'], str) and re.fullmatch('[0-9a-f]{64}', row['sha256']),
+                'invalid bound NSIS member facts')
+    for name, size in records:
+        require(name not in known or size is None or size == known[name]['bytes'],
+                'listed NSIS size differs from bound member')
     require(sum(size if size is not None else allowed[name] for name, size in records) <= MAX_TOTAL,
             'NSIS expanded budget exceeded')
     if budget is None: budget = {'bytes': 0}
@@ -688,10 +778,20 @@ def unpack_nsis(tool, archive, destination, allowed, *, budget=None, timeout=EXT
     io_path(destination).mkdir()
     actual = {}
     try:
-        for name, size in records:
-            value, _ = extract_nsis_member(tool, archive, name, destination / name, allowed[name], budget, deadline)
-            require(size is None or value['bytes'] == size, 'extracted NSIS size differs')
-            actual[name] = value
+        if expected is None:
+            for name, size in records:
+                value, _ = extract_nsis_member(tool, archive, name, destination / name, allowed[name], budget, deadline)
+                require(size is None or value['bytes'] == size, 'extracted NSIS size differs')
+                actual[name] = value
+        else:
+            # The uninstaller has no producer-side content hash. Read it by its
+            # literal name first; never infer its length/content from adjacent data.
+            for name, size in records:
+                if name not in known:
+                    value, _ = extract_nsis_member(tool, archive, name, destination / name, allowed[name], budget, deadline)
+                    require(size is None or value['bytes'] == size, 'extracted NSIS size differs')
+                    known[name] = value; actual[name] = value
+            extract_nsis_bound_files(tool, archive, destination, records, known, actual, budget, deadline)
         require(time.monotonic() < deadline, 'NSIS shared extraction deadline exceeded')
         exact(tree(destination), actual)
         return actual, listing
@@ -729,14 +829,16 @@ def nsis_inventory(root, tool, archive, expected, scratch):
     allowed = {name: row['bytes'] for name, row in {**expected, **auxiliary}.items()}
     allowed[uninstaller] = MAX_UNINSTALLER
     budget = {'bytes': 0}
-    actual, listing = unpack_nsis(tool, archive, scratch / 'installer', allowed, budget=budget)
+    actual, listing = unpack_nsis(tool, archive, scratch / 'installer', allowed, budget=budget,
+                                  expected={**expected, **auxiliary})
     require(set(actual) <= set(allowed) and uninstaller in actual, 'unregistered NSIS installer member')
     exact({name: row for name, row in actual.items() if name in expected}, expected)
     require(cleaner in actual, 'installer cleaner missing')
     for name in set(actual) & set(auxiliary):
         require(actual[name] == auxiliary[name], 'NSIS plugin differs from selected toolchain: ' + name)
     nested_allowed = {name: row['bytes'] for name, row in auxiliary.items()}
-    nested, nested_listing = unpack_nsis(tool, scratch / 'installer' / uninstaller, scratch / 'uninstaller', nested_allowed, budget=budget)
+    nested, nested_listing = unpack_nsis(tool, scratch / 'installer' / uninstaller, scratch / 'uninstaller', nested_allowed, budget=budget,
+                                         expected=auxiliary)
     require(cleaner in nested and set(nested) <= set(auxiliary) | {cleaner}, 'unregistered NSIS uninstaller member')
     require(nested[cleaner] == pinned_cleaner, 'embedded uninstall cleaner differs')
     for name in set(nested) & set(auxiliary):

@@ -586,12 +586,25 @@ class Integrity(unittest.TestCase):
                 with self.assertRaises(ValueError): w.verify_generated_script(root, state)
 
     @contextmanager
-    def inert_reader(self, listing, payloads, *, stderr_bytes=0, delay=0):
+    def inert_reader(self, listing, payloads, *, stderr_bytes=0, delay=0, extra_files=None):
         # Exercise real pipe threads, bounded parent writes, exits and joins.
         # These children emit controlled bytes; none is a 7z/NSIS implementation.
         popen = subprocess.Popen; children = []; commands = []
         def launch(argv, **kwargs):
             commands.append(argv)
+            if argv[1] == 'x' and '-so' not in argv:
+                destination = next(value[2:] for value in argv if value.startswith('-o'))
+                selector = next(value[3:] for value in argv if value.startswith('-i@'))
+                names = Path(selector).read_text(encoding='utf-8').splitlines()
+                rows = [(name, payloads[name]) for name in names] + list((extra_files or {}).items())
+                program = ('import os,sys,time\nfrom pathlib import Path\ntime.sleep(' + repr(delay) + ')\n'
+                           + 'root=Path(' + repr(destination) + ')\n'
+                           + 'for name,data in ' + repr(rows) + ':\n'
+                           + ' p=root/name;p.parent.mkdir(parents=True,exist_ok=True)\n'
+                           + ' if isinstance(data,dict):os.link(root/data["hardlink"],p)\n'
+                           + ' else:p.write_bytes(b"x"*data if isinstance(data,int)else data)\n'
+                           + 'sys.stdout.buffer.write(b"inert named extraction\\n");sys.stdout.buffer.flush()\n')
+                child = popen([sys.executable, '-u', '-c', program], **kwargs); children.append(child); return child
             payload = listing if argv[1] == 'l' else payloads[argv[-1]]
             if isinstance(payload, int):
                 producer = 'remaining=' + str(payload) + "\nwhile remaining:\n n=min(65536,remaining);sys.stdout.buffer.write(b'x'*n);sys.stdout.buffer.flush();remaining-=n\n"
@@ -714,6 +727,113 @@ class Integrity(unittest.TestCase):
                         w.unpack_nsis('inert-reader', archive, root / 'owned', {'polaris.exe': 3}, budget=budget)
                 self.assertFalse((root / 'owned').exists())
                 self.assertLessEqual(budget['bytes'], w.MAX_TOTAL)
+
+    def test_bound_solid_stream_reads_all_known_members_in_one_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+            payloads = {'empty': b'', 'large': b'x' * 70000, 'tail': b'xxx'}
+            expected = {name: w.byte_facts(data) for name, data in payloads.items()}
+            allowed = {name: row['bytes'] for name, row in expected.items()}
+            with self.inert_reader(self.listing(list(allowed.items())), {'empty': b'', 'large': 70000, 'tail': b'xxx'}) as (_, commands):
+                actual, _ = w.unpack_nsis('inert-reader', archive, root / 'owned', allowed, expected=expected)
+            self.assertEqual(actual, expected)
+            self.assertEqual([argv[-1] for argv in commands if argv[1] == 'x'], [str(archive)])
+            for name, data in payloads.items(): self.assertEqual((root / 'owned' / name).read_bytes(), data)
+
+    def test_bound_solid_unknown_member_is_first_read_by_literal_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+            known = {'App': w.byte_facts(b'App')}; budget = {'bytes': 0}
+            listing = self.listing([('uninstall.exe', None), ('App', None)])
+            with self.inert_reader(listing, {'uninstall.exe': b'UN', 'App': b'App'}) as (_, commands):
+                actual, _ = w.unpack_nsis('inert-reader', archive, root / 'owned',
+                                          {'uninstall.exe': 7, 'App': 3}, budget=budget, expected=known)
+            self.assertEqual(actual, {'uninstall.exe': w.byte_facts(b'UN'), **known})
+            self.assertEqual([argv[-1] for argv in commands if argv[1] == 'x'], ['uninstall.exe', str(archive)])
+            self.assertEqual(budget['bytes'], 5, 'literal unknown and named known bytes both count once')
+
+    def test_bound_named_hash_substitution_truncation_and_surplus_fail_closed(self):
+        expected = {'a': w.byte_facts(b'abc'), 'b': w.byte_facts(b'DEF')}
+        for label, payload in [('same-size corruption', {'a': b'abX', 'b': b'DEF'}),
+                               ('named substitution', {'a': b'DEF', 'b': b'abc'}),
+                               ('truncated', {'a': b'abc', 'b': b'DE'}),
+                               ('surplus', {'a': b'abc', 'b': b'DEFx'}),
+                               ('hardlink', {'a': b'abc', 'b': {'hardlink': 'a'}})]:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+                with self.inert_reader(self.listing([('a', 3), ('b', 3)]), payload):
+                    with self.assertRaises(ValueError):
+                        w.unpack_nsis('inert-reader', archive, root / 'owned', {'a': 3, 'b': 3}, expected=expected)
+                self.assertFalse((root / 'owned').exists())
+
+    def test_bound_solid_facts_and_listing_are_checked_before_extraction(self):
+        for expected, listed in [({'a': {'bytes': 3, 'sha256': 'bad'}}, 3),
+                                 ({'a': w.byte_facts(b'abc')}, 2),
+                                 ({'foreign': w.byte_facts(b'abc')}, 3)]:
+            with self.subTest(expected=expected, listed=listed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+                with self.inert_reader(self.listing([('a', listed)]), {'a': b'abc'}) as (_, commands):
+                    with self.assertRaises(ValueError):
+                        w.unpack_nsis('inert-reader', archive, root / 'owned', {'a': 3}, expected=expected)
+                self.assertEqual(len(commands), 1)
+                self.assertFalse((root / 'owned').exists())
+
+    def test_bound_named_extraction_rejects_unlisted_actual_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+            with self.inert_reader(self.listing([('a', 3)]), {'a': b'abc'}, extra_files={'foreign/file': b'no'}):
+                with self.assertRaisesRegex(ValueError, 'unregistered NSIS extracted'):
+                    w.unpack_nsis('inert-reader', archive, root / 'owned', {'a': 3},
+                                  expected={'a': w.byte_facts(b'abc')})
+            self.assertFalse((root / 'owned').exists())
+
+    def test_bound_named_archive_is_pinned_before_listing_and_rechecked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+            original = w.stream_child
+            def mutate(*args, **kwargs):
+                if args[0][1] == 'l':
+                    if os.name == 'nt':
+                        with self.assertRaises(PermissionError): archive.write_bytes(b'other')
+                    else: archive.write_bytes(b'other')
+                return original(*args, **kwargs)
+            with self.inert_reader(self.listing([('a', 3)]), {'a': b'abc'}), \
+                 patch.object(w, 'stream_child', side_effect=mutate):
+                if os.name == 'nt':
+                    actual, _ = w.unpack_nsis('inert-reader', archive, root / 'owned', {'a': 3},
+                                              expected={'a': w.byte_facts(b'abc')})
+                    self.assertEqual(actual, {'a': w.byte_facts(b'abc')})
+                else:
+                    with self.assertRaisesRegex(ValueError, 'held NSIS archive changed'):
+                        w.unpack_nsis('inert-reader', archive, root / 'owned', {'a': 3},
+                                      expected={'a': w.byte_facts(b'abc')})
+
+    def test_bound_named_unknown_and_known_bytes_keep_the_aggregate_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+            budget = {'bytes': w.MAX_TOTAL - 5}
+            with self.inert_reader(self.listing([('uninstall.exe', None), ('App', 3)]),
+                                   {'uninstall.exe': b'UNX', 'App': b'App'}) as (_, commands):
+                with self.assertRaisesRegex(ValueError, 'aggregate byte limit'):
+                    w.unpack_nsis('inert-reader', archive, root / 'owned', {'uninstall.exe': 3, 'App': 3},
+                                  budget=budget, expected={'App': w.byte_facts(b'App')})
+            self.assertLessEqual(budget['bytes'], w.MAX_TOTAL)
+            self.assertEqual(len(commands), 2, 'no whole stream may start after aggregate admission fails')
+            self.assertFalse((root / 'owned').exists())
+
+    def test_bound_solid_listing_literal_and_stream_share_the_same_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); archive = root / 'inert.exe'; archive.write_bytes(b'inert')
+            timeouts = []; original = w.stream_child
+            def stream(*args, **kwargs):
+                timeouts.append(kwargs['timeout']); return original(*args, **kwargs)
+            with self.inert_reader(self.listing([('uninstall.exe', None), ('App', 3)]),
+                                   {'uninstall.exe': b'U', 'App': b'App'}, delay=.03), \
+                 patch.object(w, 'stream_child', side_effect=stream):
+                w.unpack_nsis('inert-reader', archive, root / 'owned', {'uninstall.exe': 1, 'App': 3},
+                              expected={'App': w.byte_facts(b'App')}, timeout=5)
+            self.assertEqual(len(timeouts), 3)
+            self.assertTrue(all(a > b > 0 for a, b in zip(timeouts, timeouts[1:])))
 
     def test_unknown_size_outer_uninstaller_cannot_exceed_real_64MiB_cap(self):
         self.assertEqual(w.MAX_UNINSTALLER, 64 * 1024 ** 2)
