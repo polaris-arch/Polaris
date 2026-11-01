@@ -5,7 +5,7 @@ as successful native acceptance.
 """
 import copy
 import ast
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, ExitStack
 import importlib.util
 import hashlib
 import io
@@ -622,10 +622,13 @@ class Integrity(unittest.TestCase):
                 changed = source.replace(gate, '    ' + eager_form + '\n')
                 self.assertNotEqual(changed, source)
                 self.assertEqual(source_contract(root, source_text=changed, workflow_text=workflow), result)
+            producer_gates = [line for line in source.splitlines()
+                              if line.lstrip().startswith('assemble_carriers(root, state, app_path, app, path, identity')]
+            self.assertEqual(len(producer_gates), 1)
             mutations = [
                 source + '\ndef assemble(root): pass\n',
-                source.replace('            assemble_carriers(root, state, app_path, app, path, identity)',
-                               '        pass  # producer checks detached'),
+                source.replace(producer_gates[0], producer_gates[0][:len(producer_gates[0]) - len(producer_gates[0].lstrip())]
+                               + 'pass  # producer checks detached'),
                 source.replace('            app_path, app = compiled_app(root, staging=Path(stage), state=state)',
                                "            app_path, app = None, b'unchecked'"),
                 source.replace('    cli = tauri_identity(root)', "    cli = {'entry': 'fake', 'version': 'unchecked'}"),
@@ -660,9 +663,11 @@ class Integrity(unittest.TestCase):
                 source.replace("result = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)",
                                "result = False and {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)"),
             ]
-            for changed in mutations:
-                self.assertNotEqual(changed, source)
-                with self.assertRaises(ValueError): source_contract(root, source_text=changed, workflow_text=workflow)
+            for index, changed in enumerate(mutations):
+                with self.subTest(source_mutation=index):
+                    self.assertNotEqual(changed, source)
+                    ast.parse(changed)  # A syntax error is not evidence that a real gate rejects the control.
+                    with self.assertRaises(ValueError): source_contract(root, source_text=changed, workflow_text=workflow)
             for changed in [workflow.replace('python scripts/windows-package-integrity.py assemble', 'python scripts/windows-package-integrity.py contract'),
                             workflow.replace("if: runner.os == 'Windows'\n        shell: pwsh\n        run: |\n          python scripts/windows-package-integrity.py prepare", "if: false\n        shell: pwsh\n        run: |\n          python scripts/windows-package-integrity.py prepare"),
                             workflow.replace("if ($LASTEXITCODE -ne 0) { throw 'complete Windows carrier integrity failed' }", "Write-Host 'ignored'"),
@@ -1120,8 +1125,9 @@ class CargoContexts(unittest.TestCase):
 
     @contextmanager
     def cargo(self, root, directory, target=None):
-        # Only the Cargo metadata/artifact transport is controlled. All file
-        # IDs, hardlinks, state, inventories and ZIP reads use the real FS.
+        # Cargo/Tauri transport is controlled. Unix uses an explicit inert
+        # native-IO seam below; real Windows handle tests stay separate.
+        # All file IDs, hardlinks, state, inventories and ZIP reads use the FS.
         # These events do not claim that an App or installer has been built.
         (root / 'Cargo.toml').write_text('[workspace]\nmembers=["src-tauri"]\n')
         (root / 'Cargo.lock').write_text('version = 4\n')
@@ -1168,9 +1174,17 @@ class CargoContexts(unittest.TestCase):
                 if fixture.before_ready: fixture.before_ready()
                 ready()
             with patch.dict(os.environ, env), patch.object(w, 'notify_capture_ready', side_effect=notify):
-                os.environ['TAURI_CONFIG'] = json.dumps(json.loads((root / 'src-tauri/tauri.windows.conf.json').read_text()), separators=(',', ':'))
+                os.environ['TAURI_CONFIG'] = json.dumps(json.loads(Path(argv[argv.index('--config') + 1]).read_text()), separators=(',', ':'))
                 os.environ.update(fixture.child_env)
                 w.capture(root, args)
+            state = json.loads(Path(env['POLARIS_WINDOWS_PACKAGE_STATE']).read_bytes())
+            copies = json.loads((Path(state['owner']) / 'resource-copies.json').read_bytes())
+            script = release / 'nsis/x64/installer.nsi'; script.parent.mkdir(parents=True, exist_ok=True)
+            script.write_text('!define VERSION "1.0.0"\n!define MAINBINARYNAME "polaris"\n'
+                              + '!define MAINBINARYSRCPATH "' + str(release / 'polaris.exe') + '"\nSection Install\n'
+                              + 'File "${MAINBINARYSRCPATH}"\n'
+                              + ''.join('File /a "/oname=' + name + '" "' + row['path'] + '"\n'
+                                        for name, row in copies['members'].items()) + 'SectionEnd\n')
             if fixture.after_capture: fixture.after_capture()
             return {'exitCode': 0, 'fixture': 'inert direct Cargo pipe; not a native Tauri or package positive'}
         fake_tauri = root / 'inert-tauri.exe'; fake_tauri.write_bytes(b'inert Tauri routing identity')
@@ -1184,7 +1198,24 @@ class CargoContexts(unittest.TestCase):
                 os.environ.pop(key, None)
             os.environ.update(CARGO=str(tool), CARGO_TARGET_DIR=str(directory))
             if target: os.environ['POLARIS_WINDOWS_PACKAGE_TARGET'] = target
-            yield fixture
+            with ExitStack() as native:
+                if os.name != 'nt':
+                    # Test-only descriptors/birth labels, never Windows custody
+                    # or process-identity proof. The inert Popen still really
+                    # exits and supplies the exclusive pipe and EOF evidence.
+                    native.enter_context(patch.object(w, 'hold_app', side_effect=lambda path, **k: Path(path).open('rb')))
+                    @contextmanager
+                    def resource(path, **kwargs):
+                        value = Path(path).stat()
+                        yield (value.st_dev, value.st_ino)  # Inert Unix FS, not a Windows sharing proof.
+                    native.enter_context(patch.object(w, 'hold_resource', side_effect=resource))
+                    def duplicate(pid, birth, handle):
+                        self.assertEqual(pid, os.getpid()); self.assertEqual(birth, ['inert-test-birth', pid])
+                        return os.fdopen(os.dup(handle), 'rb')
+                    native.enter_context(patch.object(w, 'duplicate_app', side_effect=duplicate))
+                    native.enter_context(patch.object(w, 'process_birth', side_effect=lambda pid, held=None: ['inert-test-birth', pid]))
+                    native.enter_context(patch.dict(sys.modules, {'msvcrt': SimpleNamespace(get_osfhandle=lambda fd: fd)}))
+                yield fixture
 
     def test_default_and_external_native_release_whole_chain(self):
         for layout in ['default', 'external', 'native triple']:
@@ -1326,7 +1357,7 @@ class CargoContexts(unittest.TestCase):
             self.assertEqual(w.cargo_output([sys.executable, '-c', 'import os;print(os.getcwd(),end="")'], root), str(root))
 
     def test_first_producer_rejects_mutable_replay_missing_scope_and_child_input_drift(self):
-        for fault in ['missing first producer', 'old transcript', 'changed record', 'foreign child flags', 'foreign child config']:
+        for fault in ['missing first producer', 'old transcript', 'changed record', 'changed first snapshot', 'foreign child flags', 'foreign child config']:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp); _, app = self.fixture(root)
                 with self.cargo(root, root / 'target') as fixture:
@@ -1339,6 +1370,8 @@ class CargoContexts(unittest.TestCase):
                             path = owner / 'capture.json'; data = json.loads(path.read_bytes())
                             data['data']['artifact']['profile']['debug_assertions'] = True; path.write_text(json.dumps(data))
                         fixture.before_ready = corrupt
+                    elif fault == 'changed first snapshot':
+                        fixture.before_ready = lambda: (owner / 'first-app.bin').write_bytes(app.replace(b'inert App', b'rogue App'))
                     elif fault == 'foreign child flags': fixture.child_env['RUSTFLAGS'] = '--cfg=foreign_producer'
                     elif fault == 'foreign child config': fixture.child_env['TAURI_CONFIG'] = '{}'
                     if fault == 'missing first producer':
@@ -1351,6 +1384,100 @@ class CargoContexts(unittest.TestCase):
                     if fault in ('old transcript', 'foreign child flags', 'foreign child config', 'missing first producer'):
                         self.assertFalse(any(argv[1] == 'build' for argv, _, _ in fixture.calls))
 
+    def test_first_original_bytes_survive_only_the_normal_temporary_patch(self):
+        for mode in ['pristine', 'temporary patch restored', 'same inode same length bad write']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); _, app = self.fixture(root)
+                with self.cargo(root, root / 'target') as fixture:
+                    w.prepare(root)
+                    owner = next((root / 'target/release').glob('.polaris-package-*'))
+                    os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(owner / 'state.json')
+                    state = w.load_state(root); release = Path(state['cargo']['releaseDirectory'])
+                    binary = release / 'polaris.exe'; binary.write_bytes(app)
+                    inode = binary.stat().st_ino
+                    script = release / 'nsis/x64/installer.nsi'; script.parent.mkdir(parents=True)
+                    script.write_text('!define VERSION "1.0.0"\n!define MAINBINARYNAME "polaris"\n'
+                                      + '!define MAINBINARYSRCPATH "' + str(binary) + '"\nSection Install\n'
+                                      + 'File "${MAINBINARYSRCPATH}"\n'
+                                      + ''.join('File /a "/oname=' + name + '" "' + source + '"\n'
+                                                for name, source in state['sources'].items()) + 'SectionEnd\n')
+                    (release / 'bundle/nsis/Polaris_1.0.0_x64-setup.exe').write_bytes(b'inert container')
+                    def mutate():
+                        if mode == 'pristine': return
+                        if mode == 'temporary patch restored':
+                            binary.write_bytes(app.replace(w.final.BUNDLE_UNK, w.final.BUNDLE_NSS))
+                            self.assertEqual(binary.stat().st_ino, inode)
+                            binary.write_bytes(app)
+                        else:
+                            corrupt = app.replace(b'inert App', b'rogue App')
+                            self.assertNotEqual(corrupt, app); self.assertEqual(len(corrupt), len(app))
+                            binary.write_bytes(corrupt)
+                        self.assertEqual(binary.stat().st_ino, inode)
+                    fixture.after_capture = mutate
+                    # A coherent controlled container backend would accept the
+                    # current baseline. The original-byte guard must reject bad
+                    # writes before that backend or any publication is reached.
+                    with patch.object(w, 'nsis_inventory', side_effect=lambda r,t,a,expected,temp: expected) as container:
+                        if mode == 'same inode same length bad write':
+                            with self.assertRaisesRegex(ValueError, 'original-byte-mismatch'): w.produce(root)
+                            self.assertEqual(container.call_count, 0)
+                            self.assertFalse(any((root / 'dist-win').iterdir()))
+                            self.assertFalse((owner / 'produced.json').exists())
+                        else:
+                            w.produce(root)
+                            self.assertEqual(container.call_count, 1)
+                            receipt = json.loads((root / 'windows-package-evidence/static-carriers.json').read_bytes())
+                            self.assertEqual(receipt['cargoArtifact']['firstApp'], w.byte_facts(app))
+                            self.assertEqual(receipt['sourceApp'], w.byte_facts(app))
+                    self.assertEqual((owner / 'first-app.bin').read_bytes(), app)
+                    self.assertEqual(len([x for x,_,_ in fixture.calls if x[1] == 'build']), 1)
+
+    def test_native_resource_config_preserves_only_the_declared_logical_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); self.fixture(root)
+            with self.cargo(root, root / 'target'):
+                w.prepare(root); owner = next((root / 'target/release').glob('.polaris-package-*'))
+                os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(owner / 'state.json'); state = w.load_state(root)
+                original = json.loads((root / 'src-tauri/tauri.windows.conf.json').read_bytes())
+                with tempfile.TemporaryDirectory(prefix='r-') as tmp_stage, ExitStack() as owned:
+                    stage = Path(tmp_stage); copies = w.copy_resource_inputs(root, state, stage, owned)
+                    actual = w.native_windows_config(root, stage); mapping = actual['bundle']['resources']
+                    self.assertEqual(len(mapping), len(original['bundle']['resources']))
+                    self.assertEqual(set(mapping.values()), {x.replace('../', '_up_/', 1).rstrip('/') for x in original['bundle']['resources']})
+                    for index, entry in enumerate(original['bundle']['resources']):
+                        self.assertEqual(mapping[str(stage / str(index))], entry.replace('../', '_up_/', 1).rstrip('/'))
+                    self.assertEqual(set(copies['members']), set(state['sources']))
+                    for name, row in copies['members'].items():
+                        self.assertFalse(Path(row['path']).samefile(state['sources'][name]))
+                        self.assertLess(len(row['path']), 260)
+                        self.assertEqual(w.facts(row['path']), state['resources'][name])
+                        if os.name == 'nt':
+                            with self.assertRaises(OSError): Path(row['path']).write_bytes(b'foreign writer')
+                            replacement = stage / 'replacement'; replacement.write_bytes(b'foreign object')
+                            with self.assertRaises(OSError): os.replace(replacement, row['path'])
+                            replacement.unlink()
+                    self.assertEqual({k:v for k,v in actual['bundle'].items() if k != 'resources'},
+                                     {k:v for k,v in original['bundle'].items() if k != 'resources'})
+                    self.assertEqual({k:v for k,v in actual.items() if k != 'bundle'},
+                                     {k:v for k,v in original.items() if k != 'bundle'})
+
+    def test_derived_resources_reject_corruption_alias_extra_and_source_replacement(self):
+        for fault in ['bad hash', 'copy hardlink', 'extra member', 'source replacement']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory(prefix='r-') as tmp_stage:
+                root = Path(tmp); self.fixture(root)
+                with self.cargo(root, root / 'target'):
+                    w.prepare(root); owner = next((root / 'target/release').glob('.polaris-package-*'))
+                    os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(owner / 'state.json'); state = w.load_state(root)
+                    with ExitStack() as owned: copies = w.copy_resource_inputs(root, state, Path(tmp_stage), owned)
+                    name = 'core-manifest.json'; row = copies['members'][name]; path = Path(row['path'])
+                    if fault == 'bad hash': path.write_bytes(b'X' * path.stat().st_size)
+                    elif fault == 'copy hardlink': os.link(path, root / 'foreign-alias')
+                    elif fault == 'extra member': (Path(tmp_stage) / 'foreign.bin').write_bytes(b'foreign')
+                    else:
+                        source = Path(state['sources'][name]); other = root / 'replacement'
+                        other.write_bytes(source.read_bytes()); os.replace(other, source)
+                    with self.assertRaises(ValueError): w.verify_resource_copies(root, state, copies)
+
     def test_first_release_arguments_are_closed_and_not_an_arbitrary_runner(self):
         state = {'cargo': {'target': None}}
         normal = ['build', '--locked', '--offline', '--bins', '--release', '--message-format=json', '--features', 'tauri/custom-protocol']
@@ -1360,6 +1487,7 @@ class CargoContexts(unittest.TestCase):
                      normal + ['--target', 'aarch64-pc-windows-msvc'], ['metadata', *normal[1:]]]:
             with self.subTest(args=args), self.assertRaises(ValueError): w.release_arguments(state, args)
 
+    @unittest.skipUnless(os.name == 'nt', 'requires actual Windows process and file HANDLE transfer')
     def test_native_handle_transfer_pins_the_actual_file_after_capture_exits(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'inert App.bin'; path.write_bytes(b'inert before patch')
@@ -1382,6 +1510,7 @@ class CargoContexts(unittest.TestCase):
                 finally:
                     if child.poll() is None: child.terminate(); child.wait()
 
+    @unittest.skipUnless(os.name == 'nt', 'requires actual Windows CMD argument and exit handling')
     def test_native_runner_paths_are_literal_and_exit_status_is_not_suppressed(self):
         with tempfile.TemporaryDirectory(prefix='polaris-inert-') as tmp:
             root = Path(tmp) / 'space 中文 & !'; root.mkdir()

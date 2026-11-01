@@ -7,7 +7,7 @@ inputs before bundling and compares every final member with those same bytes.
 import argparse
 import codecs
 import ctypes
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import hashlib
 import hmac
 import importlib.util
@@ -763,7 +763,9 @@ def build_portable(root, state, app, destination):
     zip_inventory(destination, expected)
 
 
-def verify_generated_script(root, state):
+def verify_generated_script(root, state, *, sources=None):
+    sources = state['sources'] if sources is None else sources
+    require(set(sources) == set(state['sources']), 'NSIS source member set differs')
     script = regular(Path(state['cargo']['releaseDirectory']) / 'nsis/x64/installer.nsi')
     text = io_path(script).read_text(encoding='utf-8-sig')
     def define(name):
@@ -783,7 +785,7 @@ def verify_generated_script(root, state):
     for name, source in files:
         name = name.replace('\\', '/')
         require(name not in mapped and name in state['sources'], 'extra/duplicate NSIS File mapping: ' + name)
-        require(io_path(regular(source)).samefile(io_path(regular(state['sources'][name]))), 'NSIS File source differs: ' + name)
+        require(io_path(regular(source)).samefile(io_path(regular(sources[name]))), 'NSIS File source differs: ' + name)
         mapped[name] = facts(source)
     exact(mapped, state['resources'])
     require(len(re.findall(r'^\s*File\b', section, re.MULTILINE)) == len(files) + 1, 'unparsed NSIS File instruction')
@@ -879,6 +881,7 @@ def windows_api():
         ('WaitForSingleObject', wt.DWORD, [wt.HANDLE, wt.DWORD]),
         ('CreateFileW', wt.HANDLE, [wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.LPVOID, wt.DWORD, wt.DWORD, wt.HANDLE]),
         ('GetCurrentProcess', wt.HANDLE, []),
+        ('GetFileInformationByHandleEx', wt.BOOL, [wt.HANDLE, ctypes.c_int, wt.LPVOID, wt.DWORD]),
         ('DuplicateHandle', wt.BOOL, [wt.HANDLE, wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.HANDLE), wt.DWORD, wt.BOOL, wt.DWORD])]:
         function = getattr(api, name); function.restype = result; function.argtypes = args
     return api, wt
@@ -922,6 +925,28 @@ def duplicate_app(pid, birth, handle):
         except BaseException: api.CloseHandle(duplicate); raise
         return os.fdopen(fd, 'rb')
     finally: api.CloseHandle(process)
+
+
+@contextmanager
+def hold_resource(path, *, directory=False):
+    """Pin a derived resource object without CRT descriptor-count limits."""
+    path = cargo_directory(path) if directory else regular(path)
+    before = io_path(path).stat(); api, _ = windows_api()
+    handle = api.CreateFileW(str(io_path(path)), 0x80000000, 3 if directory else 1, None, 3,
+                             0x02200000 if directory else 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value: raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        class FileID(ctypes.Structure):
+            _fields_ = [('volume', ctypes.c_ulonglong), ('id', ctypes.c_ubyte * 16)]
+        value = FileID()
+        if not api.GetFileInformationByHandleEx(handle, 18, ctypes.byref(value), ctypes.sizeof(value)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        identity = (value.volume, int.from_bytes(value.id, 'little'))
+        after = io_path(cargo_directory(path) if directory else regular(path)).stat()
+        require(identity == (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino),
+                'derived resource handle/path identity differs')
+        yield identity
+    finally: api.CloseHandle(handle)
 
 
 def encoded(value):
@@ -985,8 +1010,14 @@ def capture_context(root, state, scope):
     actual = cargo_context(root, state['cargo']['target']); expected = json.loads(json.dumps(state['cargo']))
     # Pinned Tauri merges precisely this explicit Windows config into its child.
     # Freeze the parent independently; accept only the observed normal child value.
-    config = io_path(regular(root / 'src-tauri/tauri.windows.conf.json')).read_text(encoding='utf-8')
-    require(json.loads(os.environ['TAURI_CONFIG']) == json.loads(config), 'foreign Tauri child configuration')
+    config = regular(Path(state['owner']) / 'native-windows.conf.json')
+    proof = regular(Path(state['owner']) / 'resource-copies.json')
+    require(facts(proof) == scope['copies'], 'derived resource proof changed')
+    copies = json.loads(io_path(proof).read_bytes()); verify_resource_copies(root, state, copies)
+    expected_config = native_windows_config(root, Path(copies['root']))
+    require(facts(config) == scope['config'] and json.loads(io_path(config).read_bytes()) == expected_config,
+            'native Tauri input configuration changed')
+    require(json.loads(os.environ['TAURI_CONFIG']) == expected_config, 'foreign Tauri child configuration')
     expected['environment']['TAURI_CONFIG'] = os.environ['TAURI_CONFIG']
     require(actual == expected and os.environ.get('POLARIS_BUILD_ID', state['candidate']) == state['candidate'],
             'first producer effective Cargo context changed')
@@ -1031,8 +1062,16 @@ def capture(root, args=None):
     path, _ = cargo_app_identity(root, state)
     with hold_app(path) as held:
         require(app_object_identity(app_identity(os.fstat(held.fileno()))) == app_object_identity(identity), 'first Cargo App changed before custody')
+        before = app_identity(os.fstat(held.fileno()))
+        original = held.read(MAX_FILE + 1)
+        require(len(original) == before[4] <= MAX_FILE and app_identity(os.fstat(held.fileno())) == before
+                and cargo_app_identity(root, state)[1] == identity, 'first Cargo App changed during original snapshot')
+        with io_path(owner / 'first-app.bin').open('xb') as snapshot:
+            snapshot.write(original); snapshot.flush(); os.fsync(snapshot.fileno())
+        require(facts(owner / 'first-app.bin') == byte_facts(original), 'first Cargo snapshot differs')
         import msvcrt
         record = {'scope': scope, 'argv': argv, 'artifact': artifact, 'identity': list(identity),
+                  'firstApp': byte_facts(original),
                   'transport': transport, 'stdout': facts(raw), 'pid': os.getpid(), 'birth': process_birth(os.getpid()),
                   'handle': msvcrt.get_osfhandle(held.fileno()),
                   'childConfig': {'present': True, 'bytes': len(os.environ['TAURI_CONFIG'].encode('utf-8')),
@@ -1064,30 +1103,119 @@ def run_tauri(root, argv, env, ready, timeout):
                         diagnostic_context={'candidate': env.get('POLARIS_BUILD_ID')})
 
 
+def native_windows_config(root, resource_root):
+    """The same eight declared logical roles, with owned short source paths."""
+    config = json.loads(io_path(regular(root / 'src-tauri/tauri.windows.conf.json')).read_bytes())
+    resources = {}
+    for index, entry in enumerate(config['bundle']['resources']):
+        require(isinstance(entry, str) and not any(c in entry for c in '*?')
+                and (entry == 'core-manifest.json' or entry.startswith('../') and not entry[3:].startswith('../')),
+                'unreviewed native resource declaration')
+        source = Path(os.path.abspath(root / 'src-tauri' / entry))
+        require(source.is_relative_to(root), 'native resource escaped repository')
+        name = str(resource_root / str(index)); target = entry.replace('../', '_up_/', 1).rstrip('/')
+        require(name not in resources and target not in resources.values(), 'duplicate native resource declaration')
+        resources[name] = target
+    config['bundle']['resources'] = resources
+    return config
+
+
+def copy_resource_inputs(root, state, stage, owned):
+    config = native_windows_config(root, stage); copies = {'root': str(stage), 'directories': {}, 'members': {}}
+    # Parent namespace handles prevent replacement; directory writes remain
+    # possible for unrelated ordinary temporary files. Every copied file is
+    # separately held with neither WRITE nor DELETE sharing through Tauri.
+    for directory in reversed([stage, *stage.parents]):
+        copies['directories'][str(directory)] = list(owned.enter_context(hold_resource(directory, directory=True)))
+    for short, target in config['bundle']['resources'].items():
+        base = Path(short)
+        is_file = target in state['sources']
+        if not is_file: io_path(base).mkdir()
+        for name, source in state['sources'].items():
+            if name != target and not name.startswith(target + '/'): continue
+            destination = base if is_file else base / name[len(target) + 1:]
+            require(len(str(destination)) < 260, 'normal TEMP is too deep for the native NSIS resource input')
+            io_path(destination.parent).mkdir(parents=True, exist_ok=True)
+            before = app_identity(io_path(regular(source)).stat()); expected = state['resources'][name]
+            with hold_app(source, write_share=False) as stream, io_path(destination).open('xb') as output:
+                held = app_identity(os.fstat(stream.fileno())); digest = hashlib.sha256(); count = 0
+                require(app_object_identity(held) == app_object_identity(before), 'resource changed before copy')
+                while block := stream.read(min(1024 * 1024, expected['bytes'] + 1 - count)):
+                    count += len(block); require(count <= expected['bytes'], 'source resource grew during copy')
+                    digest.update(block); output.write(block)
+                output.flush(); os.fsync(output.fileno())
+                require(app_identity(os.fstat(stream.fileno())) == held and app_identity(io_path(regular(source)).stat()) == before
+                        and {'bytes': count, 'sha256': digest.hexdigest()} == expected, 'opened source bytes changed during copy')
+            copy_id = owned.enter_context(hold_resource(destination))
+            require(facts(destination) == expected, 'derived resource copy bytes differ')
+            copies['members'][name] = {'sourceID': list(before[:2]), 'path': str(destination), 'copyID': list(copy_id)}
+        if not is_file:
+            for current, _, _ in os.walk(io_path(base), followlinks=False):
+                directory = base / Path(current).relative_to(io_path(base))
+                copies['directories'][str(directory)] = list(owned.enter_context(hold_resource(directory, directory=True)))
+    verify_resource_copies(root, state, copies)
+    return copies
+
+
+def verify_resource_copies(root, state, copies):
+    stage = cargo_directory(copies['root']); config = native_windows_config(root, stage)
+    require(set(copies['members']) == set(state['sources']), 'derived resource member set differs')
+    directories = {stage, *stage.parents}
+    for short, target in config['bundle']['resources'].items():
+        if target not in state['sources']: directories.add(Path(short))
+    for row in copies['members'].values():
+        path = Path(row['path'])
+        require(path.is_relative_to(stage), 'derived resource escaped its owner')
+        directories.update(parent for parent in path.parents if parent.is_relative_to(stage))
+    require(set(copies['directories']) == {str(path) for path in directories}, 'derived resource directory set differs')
+    for directory, identity in copies['directories'].items():
+        require(list(directory_id(directory)) == identity, 'derived resource ancestor changed')
+    require(str(stage) in copies['directories'], 'derived resource root is not held')
+    expected_tree = {}
+    for name, source in state['sources'].items():
+        declaration = [(short, target) for short, target in config['bundle']['resources'].items()
+                       if name == target or name.startswith(target + '/')]
+        require(len(declaration) == 1, 'ambiguous derived resource role')
+        short, target = declaration[0]; path = Path(short) if name == target else Path(short) / name[len(target) + 1:]
+        row = copies['members'][name]; original = io_path(regular(source)).stat(); value = io_path(regular(path)).stat()
+        require(row == {'sourceID': [original.st_dev, original.st_ino], 'path': str(path), 'copyID': [value.st_dev, value.st_ino]}
+                and facts(path) == state['resources'][name], 'derived resource identity or bytes changed')
+        expected_tree[path.relative_to(stage).as_posix()] = state['resources'][name]
+    exact(tree(stage), expected_tree)
+
+
 def produce(root):
     state = load_state(root); cli = tauri_identity(root); owner = Path(state['owner'])
     require(not any(name in os.environ for name in (CAPTURE_ENV, 'POLARIS_PACKAGE_PYTHON', 'POLARIS_PACKAGE_SCRIPT', 'POLARIS_PACKAGE_STATE')),
             'nested or caller-selected capture scope')
-    require(not any(io_path(owner / name).exists() for name in ('runner.cmd', 'capture.json', 'capture-ack.json', 'first-cargo.jsonl', 'produced.json')),
+    require(not any(io_path(owner / name).exists() for name in ('runner.cmd', 'resource-copies.json', 'native-windows.conf.json', 'capture.json', 'capture-ack.json', 'first-cargo.jsonl', 'first-app.bin', 'produced.json')),
             'producer owner is single use; prepare a fresh owner after a known failure')
-    scope = {'parent': os.getpid(), 'parentBirth': process_birth(os.getpid()),
-             'statePath': os.environ['POLARIS_WINDOWS_PACKAGE_STATE'],
-             'stateFile': facts(os.environ['POLARIS_WINDOWS_PACKAGE_STATE']), 'script': facts(Path(__file__)),
-             'python': cargo_tool(os.sys.executable), 'deadline': time.monotonic() + 3600}
-    key = os.urandom(32); runner = owner / 'runner.cmd'
-    with io_path(runner).open('xb') as stream: stream.write(RUNNER_TEXT.encode('ascii'))
-    runner_facts = facts(runner)
-    env = dict(os.environ, **{CAPTURE_ENV: json.dumps({**scope, 'key': key.hex()}),
-               'POLARIS_PACKAGE_PYTHON': os.sys.executable, 'POLARIS_PACKAGE_SCRIPT': str(Path(__file__).absolute()),
-               'POLARIS_PACKAGE_STATE': os.environ['POLARIS_WINDOWS_PACKAGE_STATE']})
-    require(all(not any(char in env[name] for char in '\r\n\x00"') for name in
-                ('POLARIS_PACKAGE_PYTHON', 'POLARIS_PACKAGE_SCRIPT', 'POLARIS_PACKAGE_STATE')), 'unsafe native runner path')
-    require(not any(char in str(runner) for char in '%\r\n\x00"'), 'unsupported CMD runner path')
-    argv = [cli['entry'], 'build', '--config', 'src-tauri/tauri.windows.conf.json', '--bundles', 'nsis', '--runner', str(runner)]
-    if state['cargo']['target']: argv.extend(['--target', state['cargo']['target']])
-    argv.extend(['--', '--locked', '--offline', '--message-format=json'])
     with ExitStack() as owned:
-        for frozen in (runner, Path(__file__), Path(scope['statePath']), root / 'src-tauri/tauri.windows.conf.json'):
+        stage = Path(owned.enter_context(tempfile.TemporaryDirectory(prefix='r-')))
+        copies = copy_resource_inputs(root, state, stage, owned)
+        proof = owner / 'resource-copies.json'
+        with io_path(proof).open('xb') as stream:
+            stream.write(encoded(copies)); stream.flush(); os.fsync(stream.fileno())
+        config_path = owner / 'native-windows.conf.json'
+        with io_path(config_path).open('xb') as stream:
+            stream.write(encoded(native_windows_config(root, stage))); stream.flush(); os.fsync(stream.fileno())
+        scope = {'parent': os.getpid(), 'parentBirth': process_birth(os.getpid()),
+                 'statePath': os.environ['POLARIS_WINDOWS_PACKAGE_STATE'],
+                 'stateFile': facts(os.environ['POLARIS_WINDOWS_PACKAGE_STATE']), 'script': facts(Path(__file__)),
+                 'python': cargo_tool(os.sys.executable), 'config': facts(config_path), 'copies': facts(proof), 'deadline': time.monotonic() + 3600}
+        key = os.urandom(32); runner = owner / 'runner.cmd'
+        with io_path(runner).open('xb') as stream: stream.write(RUNNER_TEXT.encode('ascii'))
+        runner_facts = facts(runner)
+        env = dict(os.environ, **{CAPTURE_ENV: json.dumps({**scope, 'key': key.hex()}),
+                   'POLARIS_PACKAGE_PYTHON': os.sys.executable, 'POLARIS_PACKAGE_SCRIPT': str(Path(__file__).absolute()),
+                   'POLARIS_PACKAGE_STATE': os.environ['POLARIS_WINDOWS_PACKAGE_STATE']})
+        require(all(not any(char in env[name] for char in '\r\n\x00"') for name in
+                    ('POLARIS_PACKAGE_PYTHON', 'POLARIS_PACKAGE_SCRIPT', 'POLARIS_PACKAGE_STATE')), 'unsafe native runner path')
+        require(not any(char in str(runner) for char in '%\r\n\x00"'), 'unsupported CMD runner path')
+        argv = [cli['entry'], 'build', '--config', str(config_path), '--bundles', 'nsis', '--runner', str(runner)]
+        if state['cargo']['target']: argv.extend(['--target', state['cargo']['target']])
+        argv.extend(['--', '--locked', '--offline', '--message-format=json'])
+        for frozen in (proof, runner, Path(__file__), Path(scope['statePath']), config_path, root / 'src-tauri/tauri.windows.conf.json'):
             owned.enter_context(hold_app(frozen, write_share=False))
         observed = []
         def ready():
@@ -1098,6 +1226,10 @@ def produce(root):
             require(record['argv'][0] == state['cargo']['tool']['path'], 'foreign Cargo executable')
             row, identity = release_event(root, state, io_path(regular(owner / 'first-cargo.jsonl')).read_text(encoding='utf-8'))
             require(row == record['artifact'] and list(identity) == record['identity'], 'first artifact differs')
+            original = owned.enter_context(hold_app(owner / 'first-app.bin', write_share=False))
+            original_bytes = original.read(MAX_FILE + 1)
+            require(len(original_bytes) <= MAX_FILE and byte_facts(original_bytes) == record['firstApp'],
+                    'original-byte-mismatch: authenticated first snapshot differs')
             held = owned.enter_context(duplicate_app(record['pid'], record['birth'], record['handle']))
             require(app_object_identity(app_identity(os.fstat(held.fileno()))) == app_object_identity(identity), 'transferred App differs')
             observed.append((record, held))
@@ -1105,14 +1237,18 @@ def produce(root):
         run = run_tauri(root, argv, env, ready, scope['deadline'] - time.monotonic())
         require(len(observed) == 1 and run['exitCode'] == 0 and facts(runner) == runner_facts, 'Tauri did not finish one captured producer')
         record, held = observed[0]; require(load_state(root) == state and tauri_identity(root) == cli, 'producer inputs changed')
+        verify_resource_copies(root, state, copies)
         path, identity = cargo_app_identity(root, state)
         require(identity[:2] == tuple(record['identity'][:2]) and
                 app_object_identity(app_identity(os.fstat(held.fileno()))) == app_object_identity(identity), 'Tauri replaced the actual App')
         state['cargoArtifact'] = {'argv': record['argv'], 'artifact': record['artifact'], 'identity': list(identity),
-                                  'transport': record['transport'], 'childConfig': record['childConfig'], 'tauri': run}
+                                  'firstApp': record['firstApp'], 'transport': record['transport'],
+                                  'nativeResourceConfig': scope['config'], 'resourceCopies': copies, 'childConfig': record['childConfig'], 'tauri': run}
         with tempfile.TemporaryDirectory(prefix='compiled-app-', dir=io_path(owner)) as stage:
             app_path, app = compiled_app(root, staging=Path(stage), state=state)
-            assemble_carriers(root, state, app_path, app, path, identity)
+            require(byte_facts(app) == record['firstApp'], 'original-byte-mismatch: Tauri did not restore the first Cargo App')
+            assemble_carriers(root, state, app_path, app, path, identity, sources={name: row['path'] for name, row in copies['members'].items()})
+            verify_resource_copies(root, state, copies)
         # This is a completed publication's readback binding, never an input
         # from which another producer or compiler attestation can be created.
         receipt = root / 'windows-package-evidence/static-carriers.json'
@@ -1140,9 +1276,9 @@ def assemble(root):
     exact(zip_inventory(portable, carrier_inventory(state, app, 'zip')), receipt['portableObserved'])
 
 
-def assemble_carriers(root, state, app_path, app, source_path, source_identity):
+def assemble_carriers(root, state, app_path, app, source_path, source_identity, *, sources=None):
     cli = tauri_identity(root)
-    generated_script = verify_generated_script(root, state)
+    generated_script = verify_generated_script(root, state, sources=sources)
     raw = unique_installer(Path(state['cargo']['releaseDirectory']) / 'bundle/nsis', state['version'])
     artifact_before = facts(raw)
     with tempfile.TemporaryDirectory(prefix='nsis-', dir=io_path(state['owner'])) as tmp:
@@ -1157,6 +1293,8 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity):
     load_state(root)
     require(facts(app_path) == byte_facts(app), 'App changed during carrier inspection')
     require(cargo_app_identity(root, state)[1] == source_identity, 'Cargo App changed during carrier inspection')
+    require(byte_facts(compiled_app(root, state=state)[1]) == state['cargoArtifact']['firstApp']
+            and cargo_app_identity(root, state)[1] == source_identity, 'original-byte-mismatch during carrier inspection')
     evidence = root / 'windows-package-evidence'; io_path(evidence).mkdir(exist_ok=True)
     receipt = {'schema': 'polaris-windows-static-carriers-v1', 'candidate': state['candidate'],
                'ownedStage': {'path': state['owner'], 'retainedPreviousOutputBytes': state['retainedPreviousOutputBytes'],
