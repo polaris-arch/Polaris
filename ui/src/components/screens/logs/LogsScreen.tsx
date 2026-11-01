@@ -140,6 +140,8 @@ export function LogsScreen() {
   const toggleRedactLogs = useLogRedactStore((s) => s.toggleRedactLogs);
 
   const [logs, setLogs] = useState<LogRow[]>([]);
+  const logsRef = useRef(logs);
+  logsRef.current = logs;
   /** 核在跑的真实日志级别（`null` = 还没取回；轮询见下方 effect）。 */
   const [runtimeLevel, setRuntimeLevel] = useState<RuntimeLogLevel | null>(null);
   /** `null` = 尚未从后端进程态水合；boolean = 本次应用运行是否临时抬到 DEBUG。 */
@@ -302,10 +304,7 @@ export function LogsScreen() {
           return next.length > MAX_BUFFERED_ROWS ? next.slice(-MAX_BUFFERED_ROWS) : next;
         });
       } else {
-        pendingRef.current.push(...batch);
-        if (pendingRef.current.length > MAX_BUFFERED_ROWS) {
-          pendingRef.current = pendingRef.current.slice(-MAX_BUFFERED_ROWS);
-        }
+        pendingRef.current = mergeHydration(pendingRef.current, batch, MAX_BUFFERED_ROWS);
         setPendingCount(pendingRef.current.length);
       }
     };
@@ -331,7 +330,16 @@ export function LogsScreen() {
       const snapshot = batch.slice(-MAX_BUFFERED_ROWS);
       const top = maxLogId(snapshot);
       if (top !== null && top > lastIdRef.current) lastIdRef.current = top;
-      setLogs((prev) => mergeHydration(prev, snapshot, MAX_BUFFERED_ROWS));
+      if (followRef.current) {
+        setLogs((prev) => mergeHydration(prev, snapshot, MAX_BUFFERED_ROWS));
+      } else {
+        // Retry history can contain both frozen visible rows and live pending rows.
+        // Keep the visible snapshot frozen and count each pending native id once.
+        const shownIds = new Set(logsRef.current.map((row) => row._id).filter((id) => typeof id === 'number'));
+        const unseen = snapshot.filter((row) => typeof row._id !== 'number' || !shownIds.has(row._id));
+        pendingRef.current = mergeHydration(pendingRef.current, unseen, MAX_BUFFERED_ROWS);
+        setPendingCount(pendingRef.current.length);
+      }
     })()
       .catch((error) => {
         if (!alive) return;
@@ -740,10 +748,7 @@ export function LogsScreen() {
       const pending = pendingRef.current;
       pendingRef.current = [];
       setPendingCount(0);
-      setLogs((prev) => {
-        const merged = [...prev, ...pending];
-        return merged.length > MAX_BUFFERED_ROWS ? merged.slice(-MAX_BUFFERED_ROWS) : merged;
-      });
+      setLogs((prev) => mergeHydration(prev, pending, MAX_BUFFERED_ROWS));
     }
     followRef.current = true;
     setFollow(true);

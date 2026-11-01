@@ -113,7 +113,7 @@ export default function AppUpdateBanner() {
             .then(() => markAppVersionSkipped(version))
             .catch((e: unknown) => {
               console.error('[update] skip failed:', e);
-              toast.error(t('settings.update.skipFailedPlain'));
+              toast.error(t('mobileSettings.update.skipFailedPlain'));
             });
         }}
       >

@@ -133,7 +133,7 @@ const CI_ENTRIES = [
   { label: 'ci dispatch os=all', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'all' },
   { label: 'ci dispatch os=ubuntu-22.04', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'ubuntu-22.04' },
   { label: 'ci dispatch os=windows-2022', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'windows-2022' },
-  { label: 'ci dispatch os=macos-14', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'macos-14' },
+  { label: 'ci dispatch os=macos-15', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'macos-15' },
 ] as const;
 
 /**
@@ -159,7 +159,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       /github\.event_name == 'workflow_dispatch'\s*&& github\.event\.inputs\.os != ''\s*&& github\.event\.inputs\.os != 'all'/s,
     );
     expect(ci).toContain(`fromJSON(format('["{0}"]', github.event.inputs.os))`);
-    expect(ci).toContain(`fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')`);
+    expect(ci).toContain(`fromJSON('["ubuntu-22.04","windows-2022","macos-15"]')`);
 
     // 2026-10-07 拆成并行 job 后矩阵表达式有两份（lint / test）。上面三条 `toContain` 对「只改坏
     // 其中一份」是瞎的（另一份照样喂饱它们），故按 job 取出来逐字比，并把表达式真的求值一遍：
@@ -167,7 +167,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const lint = matrixOsExpression(executable(jobBlock(ci, 'lint')), 'lint');
     const test = matrixOsExpression(executable(jobBlock(ci, 'test')), 'test');
     expect(test, 'lint 与 test 两个矩阵 job 的 os 表达式不再逐字相同 —— 同一事件下两边跑的平台分家了').toBe(lint);
-    const all = ['ubuntu-22.04', 'windows-2022', 'macos-14'];
+    const all = ['ubuntu-22.04', 'windows-2022', 'macos-15'];
     const expected: Record<(typeof CI_ENTRIES)[number]['label'], string[]> = {
       'push main': ['ubuntu-22.04'],
       pull_request: all,
@@ -178,7 +178,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       'ci dispatch os=all': all,
       'ci dispatch os=ubuntu-22.04': ['ubuntu-22.04'],
       'ci dispatch os=windows-2022': ['windows-2022'],
-      'ci dispatch os=macos-14': ['macos-14'],
+      'ci dispatch os=macos-15': ['macos-15'],
     };
     for (const entry of CI_ENTRIES) {
       expect(evaluateActions(lint, entry), entry.label).toEqual(expected[entry.label]);
@@ -396,7 +396,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     type Selection = Partial<typeof defaults> & { runtime_config_loopback_input?: string };
     const conflicts: Selection[] = [{ windows_launcher_diagnostics: true }, { native_dns_candidate: 'a'.repeat(40) },
       { windows_system_candidate: 'a'.repeat(40) }, { windows_directory_mode: 'candidate' },
-      { windows_directory_candidate_source: 'a'.repeat(40) }, { os: 'windows-2022' }, { os: 'macos-14' },
+      { windows_directory_candidate_source: 'a'.repeat(40) }, { os: 'windows-2022' }, { os: 'macos-15' },
       { windows_launcher_diagnostics: true, windows_system_candidate: 'a'.repeat(40) }];
     // Compile each actual expression once; exhaustive truth tables should not
     // create thousands of VM contexts or depend on a relaxed test timeout.
@@ -514,7 +514,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
       for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
         for (const diagnostic of [false, true]) for (const system of ['', 'a'.repeat(40)])
-          for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-14'])
+          for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-15'])
             for (const nativeRequired of ['', 'true', 'false']) for (const formal of ['', 'true']) {
               const ordinary = event !== 'workflow_dispatch' || !diagnostic || system !== '';
               const native = ordinary && nativeRequired !== 'false';

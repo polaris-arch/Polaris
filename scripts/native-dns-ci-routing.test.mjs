@@ -123,7 +123,7 @@ const runtimeSourceDefaults = { runtime_config_loopback_input: 'diagnostic-sourc
 const runtimeSourceConflicts = [
   { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
   { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' },
-  { windows_directory_candidate_source: sha }, { os: 'windows-2022' }, { os: 'macos-14' },
+  { windows_directory_candidate_source: sha }, { os: 'windows-2022' }, { os: 'macos-15' },
   { windows_launcher_diagnostics: true, windows_system_candidate: sha },
 ];
 function ciJobSection(source, name) {
@@ -208,7 +208,7 @@ function runtimeSourceRoutingContract(source = workflow) {
   for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
     for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
       for (const diagnostic of [undefined, false, true])
-        for (const system of ['', sha]) for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-14'])
+        for (const system of ['', sha]) for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-15'])
           for (const nativeRequired of ['', 'true', 'unknown', 'false']) for (const formal of ['', 'true']) {
             const inputs = { ...runtimeSourceDefaults, runtime_config_source_only: sourceOnly,
               windows_launcher_diagnostics: diagnostic, windows_system_candidate: system, os };
@@ -774,7 +774,7 @@ test('final SYSTEM request fails before heavy work for wrong identity, platform 
     { env: { ...env, ...extra } }, () => head + '\n');
   run(); run({ GITHUB_REF: 'refs/heads/main', SYSTEM_OS: 'windows-2022' });
   for (const extra of [{ SYSTEM_CANDIDATE: 'b'.repeat(40) }, { SYSTEM_CANDIDATE: sha.toUpperCase() },
-    { SYSTEM_OS: 'macos-14' }, { SYSTEM_MODE: 'candidate' }, { SYSTEM_DIAGNOSTIC: 'true' },
+    { SYSTEM_OS: 'macos-15' }, { SYSTEM_MODE: 'candidate' }, { SYSTEM_DIAGNOSTIC: 'true' },
     { GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_REPOSITORY: 'other/Polaris' },
     { GITHUB_REF: 'refs/heads/unapproved' }, { GITHUB_REF: 'refs/tags/v1.0.0' }]) assert.throws(() => run(extra));
   assert.throws(() => run({}, 'b'.repeat(40)));
@@ -837,7 +837,7 @@ test('exact App compile-only admission is read-only, Ubuntu-only and rejects eve
   assert.deepEqual(compileAdmission().writes, [{ path: 'output', value: 'compile_only=true\n' }]);
   for (const candidate of ['', ' ', 'false', false, true, 'A'.repeat(40), 'b'.repeat(40), null])
     assert.throws(() => compileAdmission({ ...compileInputs, app_native_compile_candidate: candidate }));
-  const conflicts = [{ runtime_config_loopback_candidate: sha }, { runtime_config_loopback_candidate: ' ' }, { os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { os: 'other' },
+  const conflicts = [{ runtime_config_loopback_candidate: sha }, { runtime_config_loopback_candidate: ' ' }, { os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-15' }, { os: 'other' },
     { runtime_config_source_only: true }, { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
     { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
     { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' }];
@@ -950,7 +950,7 @@ const loopbackInputs = { ...runtimeSourceDefaults, runtime_config_loopback_candi
 const loopbackConflicts = [{ app_native_compile_candidate: sha }, { runtime_config_source_only: true },
   { native_dns_candidate: sha }, { windows_system_candidate: sha }, { windows_launcher_diagnostics: true },
   { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
-  { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { preserve_run: false },
+  { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-15' }, { preserve_run: false },
   { app_native_compile_candidate: ' ' }, { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' },
   { runtime_config_source_only: true, windows_launcher_diagnostics: true, app_native_compile_candidate: sha }];
 function loopbackAdmission(inputs = loopbackInputs, extra = {}) {

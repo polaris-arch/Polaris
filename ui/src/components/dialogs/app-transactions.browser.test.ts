@@ -775,6 +775,10 @@ if (mode === 'desktop-logs') {
   const failure = new URLSearchParams(location.search).get('failure');
   const row = id => ({_id: id, timestamp: '2026-01-01T00:00:00Z', level: 'info', source: 'app', message: 'Retained record ' + id});
   test.logRegistrations = 0; test.logReads = []; test.logUnsubscribed = []; test.logUnlistened = 0;
+  test.emitLogRows = ids => test.logFrame(ids.map(row));
+  if (failure === 'paused-get') {
+    Object.defineProperty(navigator, 'clipboard', {value: {writeText: async text => { test.copiedLogText = text; }}});
+  }
   api.logs.onReceivedBatchReady = async listener => {
     test.logRegistrations++;
     if (failure === 'listener' && test.logRegistrations === 1) throw new Error('synthetic registration failure');
@@ -783,6 +787,11 @@ if (mode === 'desktop-logs') {
   };
   api.logs.get = async token => {
     test.logReads.push(token);
+    if (failure === 'paused-get') {
+      if (test.logReads.length === 1) return new Promise((resolve, reject) => { test.logGet = {resolve, reject}; });
+      test.logFrame([row(1), row(2)]);
+      return [row(0), row(1), row(2)];
+    }
     if (failure === 'get' && test.logReads.length === 1) {
       test.logFrame([row(1)]);
       throw new Error('synthetic owner registration failure');
@@ -1702,7 +1711,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.locator('#app-update-banner').count()).toBe(1);
     await page.evaluate('window.__transactions.skip.reject(new Error("synthetic"))');
     await page.waitForFunction('window.__transactions.toasts.length === 1');
-    expect(await page.evaluate('window.__transactions.toasts[0].message')).toBe(enUS.settings.update.skipFailedPlain);
+    expect(await page.evaluate('window.__transactions.toasts[0].message')).toBe(enUS.mobileSettings.update.skipFailedPlain);
     expect(await page.locator('#app-update-banner').count()).toBe(1);
     await skip.click();
     await page.evaluate('window.__transactions.skip.resolve()');
@@ -1716,7 +1725,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.locator('#log-stream-error').waitFor();
     expect(await page.locator('.log-live').count()).toBe(0);
     if (failure === 'get') expect(await page.locator('.log-line').filter({hasText: 'Retained record 1'}).count()).toBe(1);
-    const readsBefore = await page.evaluate('window.__transactions.logReads.slice()');
+    const readsBefore = await page.evaluate<string[]>('window.__transactions.logReads.slice()');
     await page.getByRole('button', {name: enUS.common.retry, exact: true}).click();
     await page.locator('#log-stream-error').waitFor({state: 'detached'});
     await page.locator('.log-live').waitFor();
@@ -1724,11 +1733,50 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.locator('.log-line').filter({hasText: 'Retained record 1'}).count()).toBe(1);
     expect(await page.evaluate('window.__transactions.logRegistrations')).toBe(2);
     if (failure === 'get') {
-      const readsAfter = await page.evaluate('window.__transactions.logReads');
+      const readsAfter = await page.evaluate<string[]>('window.__transactions.logReads');
       expect(readsAfter[1]).not.toBe(readsBefore[0]);
       expect(await page.evaluate('window.__transactions.logUnsubscribed')).toContain(readsBefore[0]);
       expect(await page.evaluate('window.__transactions.logUnlistened')).toBe(1);
     }
+    await page.close();
+  }));
+  it('desktop logs keeps retry history pending while paused and resumes each native row only once', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({ locale: 'en-US' });
+    await openFixture(page, origin + '/__transactions?mode=desktop-logs&failure=paused-get');
+    await page.waitForFunction('!!window.__transactions.logGet');
+    await page.evaluate('window.__transactions.emitLogRows([0])');
+    await page.locator('.log-line').filter({hasText: 'Retained record 0'}).waitFor();
+    const follow = page.locator('.log-tb-actions button').filter({has: page.locator('#log-follow-state')});
+    await follow.click();
+    await page.evaluate('window.__transactions.emitLogRows([1])');
+    await page.waitForFunction('document.querySelector("#log-follow-state").parentElement.querySelector(".cnt")?.textContent === "1"');
+    expect(await page.locator('.log-line').count()).toBe(1);
+    await page.evaluate('window.__transactions.logGet.reject(new Error("synthetic owner registration failure"))');
+    await page.locator('#log-stream-error').waitFor();
+    const readsBefore = await page.evaluate<string[]>('window.__transactions.logReads.slice()');
+    await page.getByRole('button', {name: enUS.common.retry, exact: true}).click();
+    await page.locator('.log-live').waitFor();
+    expect(await page.locator('#log-stream-error').count()).toBe(0);
+    expect(await follow.getAttribute('aria-pressed')).toBe('false');
+    expect(await follow.locator('.cnt').textContent()).toBe('2');
+    expect(await page.locator('#log-count').textContent()).toBe('1');
+    expect(await page.locator('.log-line').allTextContents()).toEqual([expect.stringContaining('Retained record 0')]);
+    const readsAfter = await page.evaluate<string[]>('window.__transactions.logReads.slice()');
+    expect(readsAfter).toHaveLength(2);
+    expect(readsAfter[1]).not.toBe(readsBefore[0]);
+    expect(await page.evaluate('window.__transactions.logUnsubscribed')).toContain(readsBefore[0]);
+    expect(await page.evaluate('window.__transactions.logUnlistened')).toBe(1);
+    await page.getByRole('button', {name: enUS.logs.scrollToBottom, exact: true}).click();
+    await page.waitForFunction('document.querySelector("#log-count").textContent === "3"');
+    expect(await follow.locator('.cnt').count()).toBe(0);
+    expect(await follow.getAttribute('aria-pressed')).toBe('true');
+    for (const id of [0, 1, 2]) {
+      expect(await page.locator('.log-line').filter({hasText: 'Retained record ' + id}).count()).toBe(1);
+    }
+    await page.getByRole('button', {name: enUS.common.copy, exact: true}).click();
+    const copied = await page.evaluate<string>('window.__transactions.copiedLogText');
+    expect(copied.split('\n')).toHaveLength(3);
+    expect(copied.match(/Retained record 1/g)).toHaveLength(1);
     await page.close();
   }));
   it('desktop logs shows a failed direct level save and keeps the configured level', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {

@@ -187,7 +187,7 @@ jobs:
       # 两份 sing-box 内核（运行期 runtime/proxy::core_platform_dirs 按 env::consts::ARCH 只取一份），
       # 另一份是纯死重 ⇒ universal 包 ~213M，分架构后每包 ~108M。
       #
-      # mac 两个 job 都跑在 macos-14（arm64 runner）：x64 job 交叉编译到 x86_64-apple-darwin，
+      # mac 两个 job 都跑在 macos-15（arm64 runner）：x64 job 交叉编译到 x86_64-apple-darwin，
       # 与原先 universal 内部同时编两个 target 的做法同源，只是不再 lipo 合并。
       #
       # tauri_args：注入 --target（决定 target/<triple>/ 输出目录）+ **四平台一律显式 --config**。
@@ -266,8 +266,8 @@ jobs:
           all='[
             {"os":"ubuntu-22.04","rust_target":"x86_64-unknown-linux-gnu","label":"linux","tauri_args":"--config src-tauri/tauri.linux.conf.json"},
             {"os":"windows-2022","rust_target":"x86_64-pc-windows-msvc","label":"windows","tauri_args":"--config src-tauri/tauri.windows.conf.json"},
-            {"os":"macos-14","rust_target":"aarch64-apple-darwin","label":"macos-arm64","mac_arch_tag":"mac-arm64","tauri_args":"--target aarch64-apple-darwin --config src-tauri/tauri.macos-arm64.conf.json"},
-            {"os":"macos-14","rust_target":"x86_64-apple-darwin","rust_targets_extra":"x86_64-apple-darwin","label":"macos-x64","mac_arch_tag":"mac-x64","tauri_args":"--target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json"}
+            {"os":"macos-15","rust_target":"aarch64-apple-darwin","label":"macos-arm64","mac_arch_tag":"mac-arm64","tauri_args":"--target aarch64-apple-darwin --config src-tauri/tauri.macos-arm64.conf.json"},
+            {"os":"macos-15","rust_target":"x86_64-apple-darwin","rust_targets_extra":"x86_64-apple-darwin","label":"macos-x64","mac_arch_tag":"mac-x64","tauri_args":"--target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json"}
           ]'
           # 注：linux/windows/macos-arm64 三条**不带** rust_targets_extra 键，与原 YAML 逐字对齐 ——
           # 引用一个不存在的 matrix 键得到空串，和原来一样（rust-toolchain 的 targets: '' = 不装额外 target）。

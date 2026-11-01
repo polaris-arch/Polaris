@@ -123,7 +123,7 @@ on:
           - all
           - ubuntu-22.04
           - windows-2022
-          - macos-14
+          - macos-15
   # 供 package.yml 复用作发布前置门（与打包并行跑，门不绿则 release job 不起），零重复定义。
   workflow_call:
     inputs:
@@ -486,7 +486,7 @@ jobs:
               && fromJSON(format('["{0}"]', github.event.inputs.os))
               || ((github.event_name == 'push' && github.ref == 'refs/heads/main')
                   && fromJSON('["ubuntu-22.04"]')
-                  || fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')) }}
+                  || fromJSON('["ubuntu-22.04","windows-2022","macos-15"]')) }}
 
     steps:
       - uses: actions/checkout@v7
@@ -497,6 +497,27 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: '26'
+
+      - name: Native macOS disk-image sealing regression
+        id: native_macos_seal
+        if: runner.os == 'macOS'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/polaris-macos-seal
+        run: |
+          set -euo pipefail
+          mkdir -p "$TMPDIR"
+          node --test scripts/macos-open-guide.test.mjs 2>&1 | tee "$TMPDIR/native-seal.tap"
+
+      - name: Preserve failed native macOS sealing fixture
+        if: ${{ failure() && steps.native_macos_seal.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-macos-seal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/polaris-macos-seal/
+          if-no-files-found: error
+          retention-days: 3
 
       # ── 核 → Cronet go.mod 来源解析（2026-08-10 新增）──
       # 只 curl 一次 go.mod（~10KB），解析 linux/windows 的实际 require 版本并校验两个库的完整性 pin，不下载任何库。
@@ -509,7 +530,7 @@ jobs:
         run: node scripts/fetch-cronet.mjs --check-only
 
       # ── Rust toolchain（2026-08-17：不再经 dtolnay/rust-toolchain@stable）──
-      # 三个 runner 镜像都预装 rustup 1.29（ubuntu/windows 带 stable 1.97.1、macos-14 带 1.96.0），
+      # 三个平台沿用预装 rustup，再用下方命令显式选择本仓 stable，不依赖镜像预装 Rust 版本。
       # 而本仓 `ui.yml` 早已直接写 `rustup toolchain install stable --profile minimal --no-self-update`
       # —— 这里只是把同一条既有口径搬过来，代价是零，换掉一次 action tarball 拉取。
       #
@@ -701,7 +722,7 @@ jobs:
   # `runs-on: ubuntu-22.04`，步级的 Linux 条件随之去掉（在这里它恒真，留着只是噪声）。
   #
   # job 级 `if` 只为保住手动 dispatch 的单平台语义（见上方 `on.workflow_dispatch.inputs.os`）：
-  # 选了 windows-2022 / macos-14 时，原先这三步因 `runner.os != 'Linux'` 不跑，现在等价地整个
+  # 选了 windows-2022 / macos-15 时，原先这三步因 `runner.os != 'Linux'` 不跑，现在等价地整个
   # job 不起。其余一切入口（push / PR / merge queue / package.yml 的 workflow_call / dispatch 选
   # all 或 ubuntu-22.04）本条件恒真。`os != ''` 那一项与矩阵表达式同源：package.yml 的
   # workflow_dispatch 经 workflow_call 传进来的 payload 没有 `os`，空串必须落到「跑」这一侧。
@@ -1046,7 +1067,7 @@ jobs:
               && fromJSON(format('["{0}"]', github.event.inputs.os))
               || ((github.event_name == 'push' && github.ref == 'refs/heads/main')
                   && fromJSON('["ubuntu-22.04"]')
-                  || fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')) }}
+                  || fromJSON('["ubuntu-22.04","windows-2022","macos-15"]')) }}
 
     steps:
       - name: Set absolute release-consumer job deadline
