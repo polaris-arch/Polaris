@@ -128,7 +128,12 @@ fn native_publication_preserves_read_lease_and_flushes_only_changed_data_parents
     ]
     .into_iter()
     .map(|(name, bytes)| {
-        std::fs::write(source.join(name), bytes).unwrap();
+        use std::io::Write;
+        let mut file =
+            crate::core_store::create_current_user_data_file(&source.join(name)).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(winproc::file_owner(&file).unwrap(), process.sid);
         CoreFile {
             name: name.into(),
             bytes: bytes.len() as u64,
@@ -160,6 +165,34 @@ fn native_publication_preserves_read_lease_and_flushes_only_changed_data_parents
     );
     assert_eq!(first.unwrap(), InstallOutcome::Installed);
     let held = store.selected_data(&id).unwrap();
+    // Every publication object is made by the same data producer, including
+    // store children, payloads, locks and the durable manifest receipt.
+    for path in [
+        root.join("versions"),
+        root.join("manifests"),
+        root.join(".staging"),
+        root.join(".trash"),
+        root.join("leases"),
+        root.join(".core-store.lock"),
+        root.join("leases").join(format!("{}.lock", id.as_str())),
+        root.join("manifests").join(format!("{}.json", id.as_str())),
+        held.directory.clone(),
+        held.directory.join("sing-box.exe"),
+        held.directory.join("libcronet.dll"),
+    ] {
+        let file = open(
+            &path,
+            std::fs::symlink_metadata(&path).unwrap().is_dir(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            winproc::file_owner(&file).unwrap(),
+            process.sid,
+            "{}",
+            path.display()
+        );
+    }
     assert!(held.data_is_current());
     // Closing the publication's separate writable flush handle must not
     // release this independently held read-only shared occupancy lease.
@@ -195,6 +228,69 @@ fn native_publication_preserves_read_lease_and_flushes_only_changed_data_parents
         io::ErrorKind::PermissionDenied
     );
     println!("NATIVE_DATA_PUBLICATION closure=PASS inert_data_only=true fixture_retained=true");
+}
+#[test]
+fn new_data_producer_uses_token_user_and_never_reowns_existing_objects() {
+    use std::io::Write;
+    let (process, _, fixture) = private_profile_fixture();
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut size = 0;
+    // SAFETY: query only the actual held primary token into its exact native ABI.
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                process._token.as_raw_handle(),
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut size,
+            )
+        },
+        0
+    );
+    assert_eq!(size as usize, std::mem::size_of::<TOKEN_ELEVATION>());
+    let directory = fixture.join("new-source");
+    crate::core_store::create_current_user_data_directory(&directory).unwrap();
+    let file_path = directory.join("new-member");
+    let mut file = crate::core_store::create_current_user_data_file(&file_path).unwrap();
+    file.write_all(b"retained inert source").unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(winproc::file_owner(&file).unwrap(), process.sid);
+    let id = identity(&file).unwrap();
+    assert_eq!(
+        crate::core_store::create_current_user_data_file(&file_path)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        crate::core_store::create_current_user_data_directory(&directory)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(identity(&file).unwrap(), id);
+    assert_eq!(std::fs::read(&file_path).unwrap(), b"retained inert source");
+    let default = directory.join("native-default-owner");
+    std::fs::write(&default, b"do not reown this existing object").unwrap();
+    let default = open(&default, false, false).unwrap();
+    let before = security(&default).unwrap();
+    assert!(crate::core_store::create_current_user_data_file(
+        &directory.join("native-default-owner")
+    )
+    .is_err());
+    assert_eq!(security(&default).unwrap(), before);
+    let scope = CurrentUserData::open(&directory, false).unwrap();
+    assert!(scope
+        .create_file(&fixture.join("outside-source"), false)
+        .is_err());
+    assert!(!fixture.join("outside-source").exists());
+    assert!(std::fs::rename(&directory, fixture.join("replaced-source")).is_err());
+    let bounded = scope
+        .create_file(&scope.root().join("bounded-member"), false)
+        .unwrap();
+    assert_eq!(winproc::file_owner(&bounded).unwrap(), process.sid);
+    println!("NATIVE_DATA_CREATION TokenUser={} elevated={} default_owner={:?} explicit_owner={:?} existing_identity_retained=true", process.sid, elevation.TokenIsElevated != 0, before.owner_sid, security(&file).unwrap().owner_sid);
 }
 #[test]
 fn native_unreadable_descriptor_stays_unknown_without_ordinary_path_fallback() {

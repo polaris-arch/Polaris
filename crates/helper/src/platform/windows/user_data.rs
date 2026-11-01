@@ -14,6 +14,14 @@ use std::os::windows::{
     io::{AsRawHandle, FromRawHandle, OwnedHandle},
 };
 use std::path::{Component, Path, PathBuf, Prefix};
+use windows_sys::Wdk::{
+    Foundation::OBJECT_ATTRIBUTES,
+    Storage::FileSystem::{
+        NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FILE_WRITE_THROUGH,
+    },
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::{
     Foundation::*, Security::Authorization::*, Security::*, Storage::FileSystem::*,
     System::Threading::*,
@@ -368,6 +376,46 @@ impl CurrentUserData {
     pub(crate) fn sid(&self) -> &str {
         &self.process.sid
     }
+    // Pin every parent component before creating a new member. This neither
+    // follows a reparse parent nor repairs the owner/ACL of an existing name.
+    fn creation_parent(&self, path: &Path) -> io::Result<Vec<File>> {
+        self.guard()?;
+        self.member_path(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| changed("new data parent absent"))?;
+        let relative = parent
+            .strip_prefix(&self.root)
+            .map_err(|_| changed("new data parent outside scope"))?;
+        let mut at = self.root.clone();
+        let mut held = vec![open(&at, true, true)?];
+        self.check_held(&held[0], true)?;
+        for part in relative.components() {
+            at.push(part.as_os_str());
+            let file = open(&at, true, true)?;
+            self.check_held(&file, true)?;
+            held.push(file);
+        }
+        Ok(held)
+    }
+    pub(crate) fn create_directory(&self, path: &Path) -> io::Result<()> {
+        let parents = self.creation_parent(path)?;
+        let file = create_member(parents.last().unwrap(), path, self.sid(), true, false)?;
+        self.stamp_named_held(&file, path, true)?;
+        Ok(())
+    }
+    pub(crate) fn create_file(&self, path: &Path, write_through: bool) -> io::Result<File> {
+        let parents = self.creation_parent(path)?;
+        let file = create_member(
+            parents.last().unwrap(),
+            path,
+            self.sid(),
+            false,
+            write_through,
+        )?;
+        self.stamp_named_held(&file, path, false)?;
+        Ok(file)
+    }
     pub(crate) fn guard(&self) -> io::Result<()> {
         for anchor in &self.anchors {
             if identity(&anchor.file)? != anchor.id
@@ -480,6 +528,120 @@ impl CurrentUserData {
         }
         self.guard()
     }
+}
+
+// Public callers supply only a new leaf, never an owner or security policy.
+// Native parent custody and TokenUser are captured afresh; only CREATE_NEW is
+// permitted. Elevated tokens' default owner (often BA) is deliberately unused.
+pub(crate) fn create_current_user_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| changed("new data parent absent"))?;
+    let scope = CurrentUserData::open(parent, false)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| changed("new data leaf absent"))?;
+    scope.create_directory(&scope.root().join(leaf))
+}
+pub(crate) fn create_current_user_file(path: &Path) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| changed("new data parent absent"))?;
+    let scope = CurrentUserData::open(parent, false)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| changed("new data leaf absent"))?;
+    scope.create_file(&scope.root().join(leaf), false)
+}
+
+fn create_member(
+    parent: &File,
+    path: &Path,
+    sid: &str,
+    directory: bool,
+    write_through: bool,
+) -> io::Result<File> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| changed("new data leaf absent"))?;
+    let mut units: Vec<u16> = name.encode_wide().collect();
+    if units.is_empty() || units.iter().any(|u| [0, 47, 92, 58].contains(u)) {
+        return Err(changed("invalid new data leaf"));
+    }
+    let length = u16::try_from(units.len() * 2).map_err(|_| changed("new data leaf too long"))?;
+    let name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: units.as_mut_ptr(),
+    };
+    let inheritance = if directory { "OICI" } else { "" };
+    let sddl: Vec<u16> = format!(
+        "O:{sid}D:P(A;{inheritance};FA;;;{sid})(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)"
+    )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: native-captured SID, fixed SDDL, terminated input and owned output.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &name,
+        Attributes: 0x40 | 0x1000, // OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE
+        SecurityDescriptor: descriptor.cast(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut raw = std::ptr::null_mut();
+    let mut status = std::mem::MaybeUninit::<IO_STATUS_BLOCK>::uninit();
+    // SAFETY: held parent, one bounded relative leaf and owned descriptor remain
+    // live throughout CREATE_NEW. No existing object's security is modified.
+    let result = unsafe {
+        NtCreateFile(
+            &mut raw,
+            READ_CONTROL | FILE_GENERIC_READ | if directory { 0 } else { FILE_GENERIC_WRITE },
+            &attributes,
+            status.as_mut_ptr(),
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_OPEN_REPARSE_POINT
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | if directory {
+                    FILE_DIRECTORY_FILE
+                } else {
+                    FILE_NON_DIRECTORY_FILE
+                }
+                | if write_through { FILE_WRITE_THROUGH } else { 0 },
+            std::ptr::null(),
+            0,
+        )
+    };
+    // SAFETY: one LocalAlloc allocation returned by the conversion above.
+    unsafe { LocalFree(descriptor) };
+    if result < 0 {
+        // SAFETY: translates the returned native status without changing state.
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(result) } as i32,
+        ));
+    }
+    // SAFETY: successful NtCreateFile transfers exactly one owned file HANDLE.
+    let file = unsafe { File::from_raw_handle(raw) };
+    if winproc::file_owner(&file)? != sid {
+        return Err(changed("new data owner differs from TokenUser"));
+    }
+    Ok(file)
 }
 
 fn judge_anchor(

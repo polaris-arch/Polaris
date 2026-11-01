@@ -16,17 +16,25 @@ fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 pub(super) fn create_private_directory(path: &Path) -> Result<(), String> {
-    let builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    let mut builder = builder;
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        polaris_helper::core_store::create_current_user_data_directory(path)
+            .map_err(|_| "CORE_RECOVERY_IO: private staging unavailable".into())
     }
-    builder
-        .create(path)
-        .map_err(|_| "CORE_RECOVERY_IO: private staging unavailable".into())
+    #[cfg(not(windows))]
+    {
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(path)
+            .map_err(|_| "CORE_RECOVERY_IO: private staging unavailable".into())
+    }
 }
 pub(super) fn private_stage_parent(config: &Path) -> Result<PathBuf, String> {
     // Hold/open the existing app-owned root; never chmod a foreign/linked parent.

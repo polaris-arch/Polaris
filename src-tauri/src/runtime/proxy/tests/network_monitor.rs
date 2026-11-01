@@ -101,6 +101,47 @@ fn dns_takeover_switch_reads_three_states_from_raw_json() {
     assert_eq!(dns_takeover_enabled(&serde_json::json!({})), None);
 }
 
+#[test]
+fn host_dns_intent_compares_both_effective_modes_and_raw_switch_defaults() {
+    use super::super::dns_takeover::host_dns_takeover_changed;
+    let intent = |mode: &str, enabled: Value| {
+        serde_json::json!({
+            "proxyModeType": mode, "dnsConfig": {"takeoverSystemDns": enabled}
+        })
+    };
+    let enabled = intent("tun", true.into());
+    let disabled = intent("tun", false.into());
+    for platform in [Platform::Mac, Platform::Linux] {
+        assert!(host_dns_takeover_changed(platform, &enabled, &disabled));
+        assert!(host_dns_takeover_changed(platform, &disabled, &enabled));
+        for unchanged in [
+            serde_json::json!({"proxyModeType":"tun","dnsConfig":{}}),
+            intent("tun", Value::Null),
+            intent("tun", "false".into()),
+        ] {
+            assert!(!host_dns_takeover_changed(platform, &enabled, &unchanged));
+        }
+        let manual = intent("manual", true.into());
+        assert!(host_dns_takeover_changed(platform, &manual, &enabled));
+        assert!(host_dns_takeover_changed(platform, &enabled, &manual));
+        assert!(!host_dns_takeover_changed(platform, &manual, &disabled));
+        assert!(!host_dns_takeover_changed(
+            platform,
+            &manual,
+            &intent("manual", false.into())
+        ));
+    }
+    for platform in [
+        Platform::Win,
+        Platform::Android,
+        Platform::Ios,
+        Platform::Other,
+    ] {
+        assert!(!host_dns_takeover_changed(platform, &enabled, &disabled));
+        assert!(!host_dns_takeover_changed(platform, &disabled, &enabled));
+    }
+}
+
 /// **接线守卫**：起核尾的 DNS 接管门必须同时看 `is_tun` 与 `dns_takeover`，且 else 腿必须还原。
 ///
 /// 为何用源码扫描而非行为测试：`start_inner` 要真起核并改系统 DNS（真机门），不能在普通 gate

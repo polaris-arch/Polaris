@@ -17,7 +17,8 @@ vi.mock('react', async (original) => {
     useDebugValue: () => {},
   };
   // Zustand reads hooks through React's default export; keep real store snapshots.
-  return { ...actual, ...hooks, default: { ...actual.default, ...hooks } };
+  const mockedReact = { ...actual, ...hooks };
+  return { ...mockedReact, default: mockedReact };
 });
 vi.mock('react-i18next', async (original) => ({
   ...await original<typeof import('react-i18next')>(),

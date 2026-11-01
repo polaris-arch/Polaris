@@ -301,6 +301,10 @@ pub(crate) fn stage_installation(
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        #[cfg(windows)]
+        let mut output = polaris_helper::core_store::create_current_user_data_file(&path)
+            .map_err(|error| error.to_string())?;
+        #[cfg(not(windows))]
         let mut output = options.open(&path).map_err(|error| error.to_string())?;
         let copied = std::io::copy(&mut input.take(bytes + 1), &mut output)
             .map_err(|error| error.to_string())?;
@@ -345,6 +349,12 @@ pub(crate) fn stage_installation(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    #[cfg(windows)]
+    let mut output = polaris_helper::core_store::create_current_user_data_file(
+        &stage.directory.join("core-manifest.json"),
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(not(windows))]
     let mut output = options
         .open(stage.directory.join("core-manifest.json"))
         .map_err(|error| error.to_string())?;

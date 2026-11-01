@@ -11,6 +11,7 @@ use polaris_config_engine::builder::{
 };
 use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_config_engine::user_config::UserConfig;
+use polaris_helper_proto::Platform;
 use polaris_singbox_grpc::{daemon, Endpoint, RuntimeConfigError, SingBoxApiClient};
 use serde::Serialize;
 use serde_json::Value;
@@ -882,6 +883,19 @@ impl ProxyRuntime {
             Some(value) => value,
             None => return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
         };
+        if super::dns_takeover::host_dns_takeover_changed(
+            self.helper.platform(),
+            &previous_raw,
+            &candidate,
+        ) {
+            return self.remember_runtime_result(self.restart_choice(
+                &candidate,
+                "structuralChange",
+                vec!["dnsConfig.takeoverSystemDns".into()],
+                generation,
+                intent,
+            ));
+        }
         let mut deps = baseline.deps.clone();
         if let Some(endpoint) = baseline.management.as_ref() {
             deps.tailscale_api_port = endpoint.port;
@@ -2110,9 +2124,9 @@ impl ProxyRuntime {
     }
 }
 
-/// Preview only. Kernel Plan remains authoritative; presence of a TUN/cache
-/// field is never enough. These are changed physical host/service controls.
-pub(super) fn structural_runtime_change(old: &Value, new: &Value) -> bool {
+/// Preview of changed host/service controls, not mere TUN/cache presence.
+/// Core changes still use Kernel Plan; host DNS needs application-managed restart.
+pub(super) fn structural_runtime_change(old: &Value, new: &Value, platform: Platform) -> bool {
     [
         "proxyModeType",
         "tunConfig",
@@ -2123,6 +2137,7 @@ pub(super) fn structural_runtime_change(old: &Value, new: &Value) -> bool {
     ]
     .iter()
     .any(|key| old.get(*key) != new.get(*key))
+        || super::dns_takeover::host_dns_takeover_changed(platform, old, new)
 }
 
 #[cfg(test)]

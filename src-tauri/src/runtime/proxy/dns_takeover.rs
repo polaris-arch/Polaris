@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::{app_config::UserConfig, ProxyModeType};
 use polaris_helper_proto::Platform;
 use serde_json::Value;
 
@@ -332,7 +332,7 @@ impl ProxyRuntime {
 /// **为何从裸 JSON 读**：该字段不在 config-engine 的 `DnsConfig` 结构体里（前端契约
 /// `ui/src/contracts/types.ts:324` 有、Rust 侧无建模），与 `restartOnNodeChange` / `autoSwitchNode` /
 /// `meshLoginFallbackDirect` 同法 —— 不为一个纯运行期开关去改共享的配置结构体（那会波及 norm/生成/快照
-/// 四条链，而它一条都不该影响：接管与否不改 sing-box config 一个字节）。
+/// 四条链）。宿主接管效果由独立的有效意图比较进入待应用，不伪装成 Core DNS 字段。
 ///
 /// 返回**三态**而非 bool：调用方一律按 上游的 `!== false` 口径判（`Some(false)` 才算关），
 /// 缺省与非布尔都等价于「未显式关」。若在此折成 bool，`None`（缺省=开）与 `Some(true)` 的区别就没了，
@@ -342,6 +342,23 @@ pub(super) fn dns_takeover_enabled(config: &Value) -> Option<bool> {
         .get("dnsConfig")
         .and_then(|d| d.get("takeoverSystemDns"))
         .and_then(Value::as_bool)
+}
+
+/// Host DNS is outside typed Core configuration. Compare effective intent on
+/// both sides so save-only cannot accept an unapplied host effect as a NoOp.
+pub(super) fn host_dns_takeover_changed(platform: Platform, old: &Value, new: &Value) -> bool {
+    if !matches!(platform, Platform::Mac | Platform::Linux) {
+        return false;
+    }
+    let active = |config: &Value| {
+        let mode = config
+            .get("proxyModeType")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ProxyModeType>(value).ok())
+            .unwrap_or_default();
+        mode.effective_on(platform).is_tun() && dns_takeover_enabled(config) != Some(false)
+    };
+    active(old) != active(new)
 }
 
 /// 网络场景 auto 探测源要的运行期事实「macOS + TUN + 接管系统 DNS 生效」（spec §4.4）。

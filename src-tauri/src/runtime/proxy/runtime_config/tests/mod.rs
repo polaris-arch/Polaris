@@ -410,9 +410,132 @@ fn unchanged_tun_and_cache_are_not_restart_reasons() {
         json!({"tunConfig":{"mtu":1500},"cachePath":"same","dnsConfig":{"optimisticCache":false}});
     let mut next = old.clone();
     next["dnsConfig"]["optimisticCache"] = json!(true);
-    assert!(!structural_runtime_change(&old, &next));
+    assert!(!structural_runtime_change(&old, &next, Platform::Linux));
     next["tunConfig"]["mtu"] = json!(1400);
-    assert!(structural_runtime_change(&old, &next));
+    assert!(structural_runtime_change(&old, &next, Platform::Linux));
+}
+
+fn host_dns_restart_fixture() -> (
+    Arc<ProxyRuntime>,
+    crate::test_support::TestDir,
+    Value,
+    Value,
+) {
+    let (rt, dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+    let mut raw = serde_json::to_value(UserConfig::default()).unwrap();
+    raw["proxyModeType"] = "tun".into();
+    raw["dnsConfig"] = json!({"takeoverSystemDns":true});
+    rt.config.save_full(&raw).unwrap();
+    let running = rt.config.current().unwrap();
+    let generation = rt.bump_generation();
+    *rt.status.write().unwrap() = super::super::ProxyStatus {
+        running: true,
+        main_generation: generation,
+        ..Default::default()
+    };
+    *rt.current_config.write().unwrap() = Some(running.clone());
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let mut candidate = running.clone();
+    candidate["dnsConfig"]["takeoverSystemDns"] = false.into();
+    rt.config.save_full(&candidate).unwrap();
+    let candidate = rt.config.current().unwrap();
+    (rt, dir, running, candidate)
+}
+
+#[tokio::test]
+async fn host_dns_consent_and_failed_admission_do_not_accept_the_saved_host_effect() {
+    let (rt, _dir, running, candidate) = host_dns_restart_fixture();
+    let generation = rt.gate.generation();
+    let intent = rt.register_selector_intent();
+    let result = rt.restart_choice(
+        &candidate,
+        "structuralChange",
+        vec!["dnsConfig.takeoverSystemDns".into()],
+        generation,
+        intent,
+    );
+    assert_eq!(result.status, "restartRequired");
+    assert!(result.restart_confirmation.is_some());
+    assert_eq!(result.reasons[0].path, "dnsConfig.takeoverSystemDns");
+    // Declining confirmation sends no operation: D and its debt remain, R stays old.
+    assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
+    assert_eq!(rt.config.current().unwrap(), candidate);
+    assert!(rt.pending_changes().pending_apply);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+
+    let rejected = rt
+        .apply_pending_transaction(Some("wrong-token".into()))
+        .await;
+    assert_eq!(rejected.status, "conflict");
+    assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
+    assert!(rt.pending_changes().pending_apply);
+    // No admitted runtime baseline: the real Apply entry fails before any RPC/spawn.
+    let failed = rt.apply_pending_transaction(None).await;
+    assert_eq!(failed.status, "unconfirmed");
+    assert_eq!(rt.current_config_snapshot(), Some(running));
+    assert_eq!(rt.config.current().unwrap(), candidate);
+    assert!(rt.pending_changes().pending_apply);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[test]
+fn stale_host_dns_restart_choices_preserve_current_state_and_debt() {
+    for stale in ["disk", "running", "generation", "intent", "stopped", "busy"] {
+        let (rt, _dir, running, candidate) = host_dns_restart_fixture();
+        let result = rt.restart_choice(
+            &candidate,
+            "structuralChange",
+            vec!["dnsConfig.takeoverSystemDns".into()],
+            rt.gate.generation(),
+            rt.register_selector_intent(),
+        );
+        assert_eq!(result.status, "restartRequired");
+        let choice = rt
+            .runtime_config_apply
+            .lock()
+            .unwrap()
+            .restart
+            .take()
+            .unwrap();
+        match stale {
+            "disk" => {
+                let mut newer = candidate.clone();
+                newer["logLevel"] = "warn".into();
+                rt.config.save_full(&newer).unwrap();
+            }
+            "running" => {
+                let mut newer = running.clone();
+                newer["logLevel"] = "warn".into();
+                *rt.current_config.write().unwrap() = Some(newer);
+            }
+            "generation" => {
+                rt.bump_generation();
+            }
+            "intent" => {
+                rt.register_selector_intent();
+            }
+            "stopped" => {
+                rt.status.write().unwrap().running = false;
+            }
+            _ => {
+                rt.gate.begin();
+            }
+        }
+        let accepted = rt.current_config_snapshot();
+        let saved = rt.config.current().unwrap();
+        let result = rt.commit_confirmed_runtime_restart(choice);
+        assert_eq!(result.status, "conflict", "{stale}");
+        assert_eq!(rt.current_config_snapshot(), accepted, "{stale}");
+        assert_eq!(rt.config.current().unwrap(), saved, "{stale}");
+        assert!(rt.pending_changes().pending_apply, "{stale}");
+        assert!(
+            rt.pending_force_restart.read().unwrap().is_none(),
+            "{stale}"
+        );
+        if stale == "busy" {
+            rt.gate.end(polaris_core_supervisor::LifecycleKind::Start);
+        }
+    }
 }
 #[test]
 fn stale_intent_does_not_release_generic_persistence_debt() {

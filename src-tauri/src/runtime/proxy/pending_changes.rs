@@ -12,6 +12,7 @@ use polaris_config_engine::builder::orchestration::config_generation_norm;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::rule::RuleAction;
 use polaris_config_engine::user_config::ProxyMode;
+use polaris_helper_proto::Platform;
 use serde_json::Value;
 
 use crate::runtime::config::DeferredConfigDeletion;
@@ -84,9 +85,12 @@ fn effective_rule_selector_targets(config: &UserConfig) -> BTreeMap<String, Opti
     targets
 }
 
-/// `Some` means both sides parsed and the non-node difference is known. The old atomic marker
-/// remains a conservative fallback only when either side cannot be projected.
-fn non_node_runtime_debt(applied: &Value, disk: &Value) -> Option<bool> {
+/// `Some` means the host or typed non-node difference is known. The old atomic marker
+/// remains a conservative fallback only when neither projection can decide.
+fn non_node_runtime_debt(applied: &Value, disk: &Value, platform: Platform) -> Option<bool> {
+    if super::dns_takeover::host_dns_takeover_changed(platform, applied, disk) {
+        return Some(true);
+    }
     if super::tailnet_rules::tailnet_generation_identity(applied)
         != super::tailnet_rules::tailnet_generation_identity(disk)
     {
@@ -212,7 +216,7 @@ impl ProxyRuntime {
         });
         let non_node_pending = applied
             .as_ref()
-            .and_then(|runtime| non_node_runtime_debt(runtime, &current))
+            .and_then(|runtime| non_node_runtime_debt(runtime, &current, self.helper.platform()))
             .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
         let pending_apply = !added.is_empty()
             || !modified.is_empty()
@@ -221,7 +225,11 @@ impl ProxyRuntime {
             || selected_pending
             || self.has_uncommitted_rule_content();
         let restart_required = applied.as_ref().is_some_and(|runtime| {
-            super::runtime_config::structural_runtime_change(runtime, &current)
+            super::runtime_config::structural_runtime_change(
+                runtime,
+                &current,
+                self.helper.platform(),
+            )
         });
         PendingChangesSummary {
             pending_apply,

@@ -10,6 +10,17 @@ use polaris_helper_proto::core_manifest::{CoreId, InstalledCoreManifest};
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 mod recovery_transaction;
 
+/// Create a new private recovery-data object owned by the actual TokenUser.
+/// These producers never change an existing object's owner or grant execution.
+#[cfg(windows)]
+pub fn create_current_user_data_directory(path: &Path) -> io::Result<()> {
+    crate::platform::windows::user_data::create_current_user_directory(path)
+}
+#[cfg(windows)]
+pub fn create_current_user_data_file(path: &Path) -> io::Result<File> {
+    crate::platform::windows::user_data::create_current_user_file(path)
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod lock_diagnostics;
 // Store mutation authority ends with this scope, not with the last incidental
@@ -322,11 +333,22 @@ impl StoreOwner {
         private_mode(path, mode)
     }
     fn private_dir(&self, path: &Path) -> io::Result<()> {
-        if self.data.is_some() {
-            fs::create_dir(path)?;
-            self.check(path)
+        if let Some(data) = &self.data {
+            data.create_directory(path)
         } else {
             private_dir(path)
+        }
+    }
+    fn create_file(
+        &self,
+        path: &Path,
+        options: &OpenOptions,
+        write_through: bool,
+    ) -> io::Result<File> {
+        if let Some(data) = &self.data {
+            data.create_file(path, write_through)
+        } else {
+            options.open(path)
         }
     }
     fn seal_dir(&self, path: &Path) -> io::Result<()> {
@@ -339,6 +361,14 @@ impl StoreOwner {
 }
 #[cfg(not(windows))]
 impl OwnerPolicy {
+    fn create_file(
+        self,
+        path: &Path,
+        options: &OpenOptions,
+        _write_through: bool,
+    ) -> io::Result<File> {
+        options.open(path)
+    }
     fn stamp(self, path: &Path) -> io::Result<String> {
         object_stamp(path)
     }
@@ -803,6 +833,21 @@ impl CoreStore {
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             );
         }
+        #[cfg(windows)]
+        let file = if let Some(data) = &self.owner.data {
+            match data.create_file(&path, false) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // Existing locks are observed as-is, never re-owned. Do
+                    // not let the fallback recreate a concurrently lost name.
+                    options.create(false).open(&path)?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            options.open(&path)?
+        };
+        #[cfg(not(windows))]
         let file = options.open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(invalid("invalid store lock"));
@@ -810,6 +855,10 @@ impl CoreStore {
         #[cfg(windows)]
         self.owner.mode(&path, 0o600)?;
         self.owner.check(&path)?;
+        #[cfg(windows)]
+        if let Some(data) = &self.owner.data {
+            data.stamp_named_held(&file, &path, false)?;
+        }
         acquire_lock(&file, LockRole::StoreMutationExclusive)?;
         Ok(MutationLock::new(file))
     }
@@ -872,7 +921,15 @@ impl CoreStore {
         let _root = PayloadDir::open(root, owner.uid)?;
         for name in ["versions", "manifests", ".staging", ".trash", "leases"] {
             let child = root.join(name);
-            match fs::create_dir(&child) {
+            #[cfg(windows)]
+            let created = if owner.data.is_some() {
+                owner.private_dir(&child)
+            } else {
+                fs::create_dir(&child)
+            };
+            #[cfg(not(windows))]
+            let created = fs::create_dir(&child);
+            match created {
                 Ok(()) => {
                     owner.mode(&child, 0o755)?;
                 }
@@ -1325,7 +1382,7 @@ impl CoreStore {
                     use std::os::unix::fs::OpenOptionsExt;
                     options.mode(0o600);
                 }
-                let mut output = options.open(&path)?;
+                let mut output = self.owner.create_file(&path, &options, false)?;
                 let mut hash = sha2::Sha256::new();
                 use sha2::Digest;
                 let mut total = 0u64;
@@ -1398,7 +1455,7 @@ impl CoreStore {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let lease = options.open(&lease_path)?;
+            let lease = self.owner.create_file(&lease_path, &options, false)?;
             self.owner.mode(&lease_path, 0o600)?;
             acquire_lock(&lease, LockRole::OrphanExclusive)?;
             #[cfg(windows)]
@@ -1434,7 +1491,7 @@ impl CoreStore {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o644);
             }
-            let mut file = options.open(&temporary)?;
+            let mut file = self.owner.create_file(&temporary, &options, false)?;
             file.write_all(&raw)?;
             file.sync_all()?;
             self.owner.mode(&temporary, 0o644)?;

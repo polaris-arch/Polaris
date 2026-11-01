@@ -2408,6 +2408,26 @@ impl ProxyRuntime {
             return ClassifiedSwitch::Unchanged;
         }
 
+        // This host effect is deliberately absent from the typed Core norm.
+        // Never let NoOp or selector PUT accept it on behalf of a full Apply.
+        if super::dns_takeover::host_dns_takeover_changed(
+            self.helper.platform(),
+            &old_value,
+            new_config,
+        ) {
+            let Ok(new_cfg) = serde_json::from_value::<UserConfig>(new_config.clone()) else {
+                return ClassifiedSwitch::Fallback("配置解析失败");
+            };
+            return ClassifiedSwitch::Decided {
+                decision: if defer_restart {
+                    SwitchDecision::Defer
+                } else {
+                    SwitchDecision::Restart
+                },
+                new_cfg: Box::new(new_cfg),
+            };
+        }
+
         // A raw binding change can filter accepted planning hosts even when the
         // typed norm and selector plan are equal. Save keeps R intact; explicit
         // Apply must generate from the accepted baseline and retain its physical
@@ -2517,7 +2537,11 @@ impl ProxyRuntime {
                 SwitchDecision::Restart => {
                     let current = self.current_config_snapshot();
                     if current.as_ref().is_some_and(|old| {
-                        super::runtime_config::structural_runtime_change(old, candidate)
+                        super::runtime_config::structural_runtime_change(
+                            old,
+                            candidate,
+                            self.helper.platform(),
+                        )
                     }) {
                         "restart"
                     } else {

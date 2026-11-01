@@ -864,6 +864,7 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     + 'No Android ABI, bundled libbox, resources or updater/install flow changes; APK builds do not prove on-device TLS observation.',
   'src-tauri/src/runtime/core_identity.rs':
     'The TLS directory module and export are cfg(not(Android/iOS)); Android does not compile or consume that desktop catalog. '
+    + 'Explicit TokenUser ownership applies only to Windows recovery writes; the non-Windows creation path is unchanged. '
     + 'ci.yml cargo check --target aarch64-linux-android -p polaris covers the remaining production module surface. '
     + 'No Android asset, link input or JNI contract changes; native capabilities and device validation remain separate.',
   'src-tauri/src/runtime/core_version/tests/mod.rs':

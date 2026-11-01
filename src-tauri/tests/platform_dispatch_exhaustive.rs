@@ -432,6 +432,12 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/dns_takeover.rs",
+        "if !matches!(platform, Platform::Mac | Platform::Linux)",
+        1,
+        "host_dns_takeover_changed compares effective host DNS intent only on Mac/Linux. Android/iOS/Windows/Other take this early return and report no host takeover difference; their native/no-op DNS paths cannot inherit the Mac/Linux host effect. Mac/Linux still compare effective TUN plus the takeover flag on both old and new config.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/dns_takeover.rs",
         "if Platform::current() == Platform::Linux",
         4,
         "四处同形（set/restore/has_marker/reconcile 的 Linux resolved 分流）。Android → 走\
