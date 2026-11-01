@@ -4251,7 +4251,9 @@ fn cfg_axis_platform_dispatch_is_registered() {
 // capabilities-for are now unconditional); those last changes cancel in count.
 // No existing iOS debt is repaid, and no iOS runtime evidence is claimed.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
-    ("DiffersOnlyInDebug", 30),
+    // A175 retires 24 private runtime acceptance sites; six ordinary debug sites remain.
+    // This changes no surviving iOS verdict or debt site.
+    ("DiffersOnlyInDebug", 6),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
     ("DiffersRight", 337),
     ("DiffersUndecided", 26),
