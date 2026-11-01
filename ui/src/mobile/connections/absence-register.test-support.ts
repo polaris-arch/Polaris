@@ -210,6 +210,17 @@ export const CONNECTIONS_PARITY: ScreenParityRegister = {
 
     /* ── 日志段（桌面 `components/screens/logs/` 整屏折进本屏的 `logs` 段）──────── */
     {
+      id: 'LogsScreen.tsx|k:common.retry',
+      disposition: {
+        kind: 'ported',
+        mobile: {
+          file: 'ui/src/mobile/connections/MobileConnectionsScreen.tsx',
+          mustContain: 'onRetryLogs={() => setLogStreamAttempt((attempt) => attempt + 1)}',
+        },
+      },
+      note: '日志监听/水合失败显示 logs.streamFailed；仅搜索失败显示 errors.operationFailed，保持实时流就绪状态，不误报连接失败。两者均在日志段可重试；重试建立新的监听/原生 subscriptionId，旧所有者退订且旧回包无效，保持查询、现有日志与暂停状态，暂停时恢复快照只进入去重缓冲。',
+    },
+    {
       id: 'LogsScreen.tsx|k:logs.archiveLegacy',
       disposition: {
         kind: 'ported',
@@ -331,6 +342,9 @@ export const CONNECTIONS_PARITY: ScreenParityRegister = {
     'log-legacy-note',
     'log-privacy-note',
     'log-search',
+    // 桌面新增失败槽已逐项判为移植：移动 ConnectionsView 的 data-log-stream-error
+    // 由真实监听/水合/搜索失败触发，重试动作见上方 LogsScreen common.retry 条目。
+    'log-stream-error',
     'log-view',
     's-connections',
     's-logs',

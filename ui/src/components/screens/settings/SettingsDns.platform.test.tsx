@@ -6,12 +6,19 @@ vi.mock('./settings-logic', async (original) => ({
   ...await original<typeof import('./settings-logic')>(),
   shellPlatformFromDataOs: () => platform.value,
 }));
-vi.mock('react', async (original) => ({
-  ...await original<typeof import('react')>(),
-  useState: (value: unknown) => [value, vi.fn()],
-  useRef: (value: unknown) => ({ current: value }),
-  useEffect: () => {},
-}));
+vi.mock('react', async (original) => {
+  const actual = await original<typeof import('react')>();
+  const hooks = {
+    useState: (value: unknown) => [value, vi.fn()],
+    useRef: (value: unknown) => ({ current: value }),
+    useEffect: () => {},
+    useCallback: (callback: unknown) => callback,
+    useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
+    useDebugValue: () => {},
+  };
+  // Zustand reads hooks through React's default export; keep real store snapshots.
+  return { ...actual, ...hooks, default: { ...actual.default, ...hooks } };
+});
 vi.mock('react-i18next', async (original) => ({
   ...await original<typeof import('react-i18next')>(),
   useTranslation: () => ({ t: (key: string) => key }),

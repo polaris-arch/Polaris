@@ -324,7 +324,7 @@ export function LogsScreen() {
         void api.logs.unsubscribe(subscriptionId).catch(() => {});
         return;
       }
-      if (!Array.isArray(batch)) throw new Error('Invalid log snapshot');
+      if (!Array.isArray(batch)) throw new Error('LOG_SNAPSHOT_INVALID');
       setLogStreamReady(true);
       if (epoch !== logReadEpoch.current) return;
       const snapshot: LogRow[] = batch.slice(-MAX_BUFFERED_ROWS);

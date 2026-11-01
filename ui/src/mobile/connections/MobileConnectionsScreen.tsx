@@ -406,6 +406,9 @@ export function MobileConnectionsScreen(): ReactElement {
   const [logSearch, setLogSearch] = useState('');
   const [logSnapshot, setLogSnapshot] = useState<{ key: string; rows: LogRow[] } | null>(null);
   const [logStreamReady, setLogStreamReady] = useState(false);
+  const [logStreamFailed, setLogStreamFailed] = useState(false);
+  const [logSearchFailed, setLogSearchFailed] = useState(false);
+  const [logStreamAttempt, setLogStreamAttempt] = useState(0);
   const [logSource, setLogSource] = useState<LogSource>('all');
   const [follow, setFollow] = useState(true);
   const [pendingCount, setPendingCount] = useState(0);
@@ -415,6 +418,8 @@ export function MobileConnectionsScreen(): ReactElement {
 
   const followRef = useRef(follow);
   followRef.current = follow;
+  const logsRef = useRef(logs);
+  logsRef.current = logs;
   const pendingRef = useRef<LogRow[]>([]);
   const lastIdRef = useRef(-1);
   const logReadEpoch = useRef(0);
@@ -452,11 +457,14 @@ export function MobileConnectionsScreen(): ReactElement {
   useEffect(() => {
     if (segment !== 'logs') return;
     let alive = true;
+    setLogStreamReady(false);
+    setLogStreamFailed(false);
+    setLogSearchFailed(false);
     const subscriptionId = nextLogSubscriptionId();
     let off: (() => void) | null = null;
 
     const onBatch = (raw: LogRow[]) => {
-      if (!Array.isArray(raw) || raw.length === 0) return;
+      if (!alive || !Array.isArray(raw) || raw.length === 0) return;
       const batch = dedupe(raw);
       if (batch.length === 0) return;
       const criteria = logCriteriaRef.current;
@@ -481,10 +489,7 @@ export function MobileConnectionsScreen(): ReactElement {
           return next.length > MAX_BUFFERED_ROWS ? next.slice(-MAX_BUFFERED_ROWS) : next;
         });
       } else {
-        pendingRef.current.push(...batch);
-        if (pendingRef.current.length > MAX_BUFFERED_ROWS) {
-          pendingRef.current = pendingRef.current.slice(-MAX_BUFFERED_ROWS);
-        }
+        pendingRef.current = mergeHydration(pendingRef.current, batch, MAX_BUFFERED_ROWS);
         setPendingCount(pendingRef.current.length);
       }
     };
@@ -496,40 +501,56 @@ export function MobileConnectionsScreen(): ReactElement {
         off = null;
         return;
       }
-      setLogStreamReady(true);
       const epoch = logReadEpoch.current;
       const batch = await api.logs.get(subscriptionId, MAX_BUFFERED_ROWS);
       if (!alive) {
-        void api.logs.unsubscribe(subscriptionId);
+        void api.logs.unsubscribe(subscriptionId).catch(() => {});
         return;
       }
-      if (epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
-      const snapshot = batch.slice(-MAX_BUFFERED_ROWS);
+      if (!Array.isArray(batch)) throw new Error('LOG_SNAPSHOT_INVALID');
+      setLogStreamReady(true);
+      if (epoch !== logReadEpoch.current) return;
+      const snapshot: LogRow[] = batch.slice(-MAX_BUFFERED_ROWS);
       const top = maxLogId(snapshot);
       if (top !== null && top > lastIdRef.current) lastIdRef.current = top;
-      setLogs((prev) => mergeHydration(prev, snapshot, MAX_BUFFERED_ROWS));
+      if (followRef.current) {
+        setLogs((prev) => mergeHydration(prev, snapshot, MAX_BUFFERED_ROWS));
+      } else {
+        const shownIds = new Set(logsRef.current.map((row) => row._id).filter((id) => typeof id === 'number'));
+        const unseen = snapshot.filter((row) => typeof row._id !== 'number' || !shownIds.has(row._id));
+        pendingRef.current = mergeHydration(pendingRef.current, unseen, MAX_BUFFERED_ROWS);
+        setPendingCount(pendingRef.current.length);
+      }
     })().catch((err) => {
-      // 读腿失败没有用户动作可归因（不是「点了没反应」）；留控制台证据，不占用户的行内通道。
+      if (!alive) return;
+      alive = false;
       console.error('[mobile-connections] log hydrate failed:', err);
+      off?.();
+      off = null;
+      void api.logs.unsubscribe(subscriptionId).catch(() => {});
+      setLogStreamReady(false);
+      setLogStreamFailed(true);
     });
 
     return () => {
       alive = false;
       off?.();
       off = null;
-      void api.logs.unsubscribe(subscriptionId);
+      void api.logs.unsubscribe(subscriptionId).catch(() => {});
       setLogStreamReady(false);
     };
-  }, [segment, dedupe]);
+  }, [segment, dedupe, logStreamAttempt]);
 
   /* 非空查询走后端完整保留环；页面内存上限只约束 IPC / DOM。 */
   useEffect(() => {
     if (segment !== 'logs') return;
     if (!logQuery) {
       setLogSnapshot(null);
+      setLogSearchFailed(false);
       return;
     }
     if (!logStreamReady) return;
+    setLogSearchFailed(false);
     let alive = true;
     const key = logSearchKey;
     const epoch = logReadEpoch.current;
@@ -537,14 +558,18 @@ export function MobileConnectionsScreen(): ReactElement {
       void api.logs
         .search(logQuery, displayLevel, logSource, MAX_BUFFERED_ROWS)
         .then((batch) => {
-          if (!alive || epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
+          if (!alive || epoch !== logReadEpoch.current) return;
+          if (!Array.isArray(batch)) throw new Error('LOG_SEARCH_SNAPSHOT_INVALID');
           setLogSnapshot((prev) => ({
             key,
             rows: mergeHydration(prev?.key === key ? prev.rows : [], batch, MAX_BUFFERED_ROWS),
           }));
+          setLogSearchFailed(false);
         })
         .catch((err) => {
+          if (!alive || epoch !== logReadEpoch.current) return;
           console.error('[mobile-connections] log search failed:', err);
+          setLogSearchFailed(true);
         });
     }, SEARCH_DEBOUNCE_MS);
     return () => {
@@ -1595,6 +1620,10 @@ export function MobileConnectionsScreen(): ReactElement {
         setLogPage(next);
       }}
       logPrivacyNote={privacyMode}
+      logStreamReady={logStreamReady}
+      logStreamFailed={logStreamFailed}
+      logSearchFailed={logSearchFailed}
+      onRetryLogs={() => setLogStreamAttempt((attempt) => attempt + 1)}
       legacyNotice={legacyNotice}
       coreLevelNotice={coreLevelNotice}
       coreLevelHint={coreLevelHint}

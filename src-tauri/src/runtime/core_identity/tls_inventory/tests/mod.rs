@@ -277,7 +277,7 @@ fn compiled_directory_cache_does_not_acquire_execution_evidence() {
     assert!(value.get("identity").is_none());
     // The desktop IPC branch must not accidentally be rewired to the old
     // process-backed capability method while mobile still uses its native path.
-    let source = include_str!("../../../commands/updater/core_info.rs");
+    let source = include_str!("../../../../commands/updater/core_info.rs");
     let branch = source
         .split("if capabilities_only.unwrap_or(false) {")
         .nth(1)

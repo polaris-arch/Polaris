@@ -189,6 +189,17 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: "{ id: 'dns' as const, label: tr('mobileRules.seg.dns'), count: dnsRows.length }" } },
       note: '桌面 v2 FakeIP 的定位链接打开 DNS 规则；移动端同一编辑能力位于规则页 DNS 分段。登记的是实际目标能力，不声称移动设置页也有该快捷按钮；不新增 FakeIP 开关。',
     },
+    {
+      id: 'SettingsTun.tsx|f:tunnelConflictLoader',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'crates/system-integration/src/route_probe.rs',
+          mustContain: 'Platform::Android | Platform::Ios => Ok(TunnelProbeOutcome::Unsupported(self.platform))',
+        },
+      },
+      note: '手动回读外来隧道冲突快照。Android/iOS 的该探测 provider 恒返回 Unsupported，与下方 TunnelConflictBlock 同一平台边界；移动端依既有裁定既不显示该报告也不发查询，因此没有刷新这个无能力快照的按钮。此结论不涉及可刷新的组网路由证据，不能把 Unsupported 写成无冲突。',
+    },
     { id: 'AppUpdateCard.tsx|k:mobileSettings.update.openReleases', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/settings/UpdatePage.tsx', mustContain: 'openReleases' } }, note: 'Manual release-page navigation is available in both update surfaces.' },
     /* ── 应用更新卡（整卡的处置见 blocks 面 AppUpdateCard 一条）──────────────── */
     {
@@ -565,6 +576,17 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'SettingsGeneral.tsx|k:common.retry',
       disposition: { kind: 'reachable-elsewhere', mobile: { file: 'ui/src/mobile/settings/GeneralPage.tsx', mustContain: 'autoStartApi.getStatus().then(setAutoStart)' } },
       note: '桌面自启状态读取失败可原位重试；移动端重新进入通用页会重新读取执行侧状态，失败由该行明确显示。',
+    },
+    {
+      id: 'SettingsGeneral.tsx|k:common.retry#2',
+      disposition: {
+        kind: 'ported',
+        mobile: {
+          file: 'ui/src/mobile/settings/GeneralPage.tsx',
+          mustContain: 'onClick={() => setPasswordReadAttempt((attempt) => attempt + 1)}',
+        },
+      },
+      note: '隐私锁密码状态读取失败后的就地重试。移动端密码状态使用 boolean/null，失败保留未知与行内错误；重试递增 passwordReadAttempt，使 effect 重新调用 privacyApi.hasPassword，成功后才显示已设置或未设置，不以默认 false 假装读到结果。',
     },
     {
       id: 'SettingsGeneral.tsx|k:common.save',

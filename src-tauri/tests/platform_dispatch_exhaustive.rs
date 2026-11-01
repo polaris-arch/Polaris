@@ -175,6 +175,8 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    ("crates/helper-client/src/check_config.rs", "client: HelperClient::new( Box::new(crate::connector::MacRootConnector), Platform::Mac, token, )", 1,
+     "SystemMacCheckClient::system constructs only the fixed Mac root connector and is compiled exclusively on macOS. Android/iOS/Linux/Windows/unknown platforms cannot construct this issuer; the Platform::Mac argument does not admit another platform or supply an ordinary execution fallback."),
     ("crates/helper-client/src/check_config.rs", "if self.platform() != Platform::Mac", 2,
      "Closed Root Helper CheckConfig is Mac-only. Win/Linux/Android/iOS/Other return Unsupported before connecting; this branch grants no execution owner or ordinary fallback."),
     ("crates/helper-client/src/manager.rs", "let script = if self.platform == Platform::Linux", 1,
@@ -1535,6 +1537,8 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    ("src-tauri/src/runtime/core_identity/tls_inventory.rs", "\"linux\" => \"linux/amd64\", \"win\" => \"windows/amd64\", \"mac-x64\" => \"darwin/amd64\", \"mac-arm64\" => \"darwin/arm64\", _ => return Err(reject()),", 1,
+     "The compiled selected-support directory binds each of its four desktop rows to the exact target. Android/iOS/unknown platform strings reject rather than inherit a desktop target; the module is desktop-only, and this catalog mapping grants no execution or loaded-container evidence."),
     ("crates/core-supervisor/src/admitted_payload.rs", "if !matches!(platform, \"linux\" | \"win\" | \"mac-arm64\" | \"mac-x64\")", 1,
      "SelectedPolicy::declaration has a closed four-desktop-row vocabulary. iOS/Android/new platforms reject before loader/purpose or physical admission; this does not authorize Windows or Mac execution."),
     ("crates/core-supervisor/src/admitted_payload.rs", "if platform == \"linux\" && loader != \"linux-sealed-fd-v1\"", 1,
@@ -2386,6 +2390,27 @@ enum IosSide {
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
     (
+        "src-tauri/src/commands/updater/core_info.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        1,
+        IosSide::WithAndroid,
+        "The capabilities-only desktop IPC reads compiled expected TLS support without observing installed files or a process. Android and iOS both exclude that branch and retain their own native-container capability query.",
+    ),
+    (
+        "src-tauri/src/commands/updater/core_info.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "Both mobile capabilities-only IPC branches call the runtime native capability method. Android uses its libbox bridge and iOS uses PacketTunnel; neither substitutes the desktop selected-support directory for loaded-container evidence.",
+    ),
+    (
+        "src-tauri/src/runtime/core_identity.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        2,
+        IosSide::WithAndroid,
+        "The compiled TLS support module and its expected_tls_support re-export are desktop-only. Android and iOS both exclude this directory surface and retain their existing native observation paths; the directory does not admit an executable.",
+    ),
+    (
         "src-tauri/src/runtime/proxy/management_api.rs",
         "all(test, not(target_os = \"ios\"))",
         2,
@@ -2484,9 +2509,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/tls_capabilities.rs",
         "any(target_os = \"android\", target_os = \"ios\")",
-        1,
+        2,
         IosSide::WithAndroid,
-        "Both mobile temporary-capability callers query the current native container; neither treats an arbitrary CLI binary path as its loaded libbox.",
+        "The native-capability wrapper and the temporary-capability call site are both mobile-only. Android and iOS query their own current native container; neither treats an arbitrary CLI binary path or the desktop compiled support directory as its loaded libbox.",
     ),
     (
         "src-tauri/src/runtime/proxy/tls_capabilities.rs",

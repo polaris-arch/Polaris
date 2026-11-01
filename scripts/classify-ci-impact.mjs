@@ -858,6 +858,14 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/commands/updater/core_info.rs':
+    'Only desktop capabilities_only selects the compiled TLS directory; Android retains the loaded-native observation path. '
+    + 'ci.yml aarch64-linux-android cross check compiles the production Android command and its Rust observation consumer. '
+    + 'No Android ABI, bundled libbox, resources or updater/install flow changes; APK builds do not prove on-device TLS observation.',
+  'src-tauri/src/runtime/core_identity.rs':
+    'The TLS directory module and export are cfg(not(Android/iOS)); Android does not compile or consume that desktop catalog. '
+    + 'ci.yml cargo check --target aarch64-linux-android -p polaris covers the remaining production module surface. '
+    + 'No Android asset, link input or JNI contract changes; native capabilities and device validation remain separate.',
   'src-tauri/src/runtime/core_version/tests/mod.rs':
     'Host cfg(test) regressions cover the embedded mobile version contract, malformed input, and desktop admission/unknown mapping. '
     + 'ci.yml host cargo test --workspace executes these tests; Android cargo check -p polaris and APK builds do not compile test targets. '

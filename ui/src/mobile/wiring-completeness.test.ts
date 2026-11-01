@@ -931,6 +931,67 @@ const REPO_DIR = fileURLToPath(new URL('../../../', import.meta.url));
  */
 const DISPOSITIONS: readonly DispositionEntry[] = [
   {
+    id: 'i18n:mobileRules.customAppPackagesUnsupported@mobile/forms/AppAddPanel.tsx#1',
+    face: 'i18n',
+    kind: 'platform-absent',
+    evidence:
+      '这句仅在 iOS 的 Android 包选择区渲染：Android applicationId 枚举由 Android 原生桥提供，' +
+      '非 Android 分支明确拒绝；生成器在 iOS 选择 ProcessName 而非 PackageName。' +
+      '表单在 iOS 不调用该枚举，也不提供 Android 包选择控件，域名/IP 资源配置和保存入口保留。',
+    anchors: [
+      { file: 'src-tauri/src/runtime/proxy/android_bridge.rs', mustContain: '"已装应用枚举只有 Android 腿（桌面的对应物是进程名，见 system_list_processes）"' },
+      { file: 'crates/config-engine/src/builder/route.rs', mustContain: 'Platform::Ios => AppOwnerLeg::ProcessName,' },
+      { file: 'ui/src/mobile/forms/AppAddPanel.tsx', mustContain: "if (isIOS) return;\n    let alive = true;" },
+      { file: 'ui/src/mobile/forms/AppAddPanel.tsx', mustContain: "<p className=\"m-form-hint\">{tr('mobileRules.customAppPackagesUnsupported')}</p>" },
+    ],
+    reviewed: '2026-11-02',
+  },
+  {
+    id: 'i18n:mobileSettings.backup.systemBackupUnsupported@mobile/settings/BackupPage.tsx#1',
+    face: 'i18n',
+    kind: 'platform-absent',
+    evidence:
+      '所述对象是 Android BackupAgent/noBackupFilesDir 的运行期开关，并非通用手动备份。' +
+      '非 Android 的执行侧查询明确拒绝；iOS 分支只显示不适用说明，不挂载会读写该开关的 SystemBackupGroup。' +
+      'iOS 的分类导出、文件选择和恢复能力仍由同页独立入口提供，不在此处豁免。',
+    anchors: [
+      { file: 'src-tauri/src/runtime/proxy/android_bridge.rs', mustContain: 'Err("system backup toggle is not available on this platform".to_string())' },
+      { file: 'ui/src/mobile/settings/BackupPage.tsx', mustContain: "desc={t('mobileSettings.backup.systemBackupUnsupported')} />" },
+      { file: 'ui/src/mobile/settings/BackupPage.tsx', mustContain: ') : <SystemBackupGroup commit={commit} />}' },
+    ],
+    reviewed: '2026-11-02',
+  },
+  {
+    id: 'i18n:mobileSettings.general.autoStartUnsupported@mobile/settings/GeneralPage.tsx#1',
+    face: 'i18n',
+    kind: 'platform-absent',
+    evidence:
+      '这句仅说明 iOS 不提供 Android BootReceiver 的开机恢复连接开关。' +
+      'auto_start_set 对 mobile 且非 Android 的平台显式拒绝，界面在 iOS 不发该状态查询也不画开关；' +
+      'Android 的执行侧标记读写及应用启动后自动连接是其它独立路径，不能一起记成缺席。',
+    anchors: [
+      { file: 'src-tauri/src/commands/misc/autostart.rs', mustContain: '#[cfg(all(mobile, not(target_os = "android")))]\n    {\n        let _ = (app, enabled);\n        ApiResponse::err("autostart is not available on this platform".to_string())' },
+      { file: 'ui/src/mobile/settings/GeneralPage.tsx', mustContain: 'control={isIOS ? undefined : (' },
+      { file: 'ui/src/mobile/settings/GeneralPage.tsx', mustContain: 'if (isIOS) return;' },
+    ],
+    reviewed: '2026-11-02',
+  },
+  {
+    id: 'i18n:mobileSettings.general.bootConnectUnsupported@mobile/settings/GeneralPage.tsx#1',
+    face: 'i18n',
+    kind: 'platform-absent',
+    evidence:
+      '指向的是 Android 系统 VPN 列表及其 Always-on VPN 设置，不是泛称 iOS 不能建立 VPN。' +
+      '原生跳转桥只安装于 Android MainActivity，并发送 Settings.ACTION_VPN_SETTINGS；' +
+      'iOS 分支不渲染该跳转控件或 Android 手动路径，以说明行呈现此 Android 设置不适用。',
+    anchors: [
+      { file: 'src-tauri/gen/android/app/src/main/java/com/polaris2/app/MainActivity.kt', mustContain: 'Intent(Settings.ACTION_VPN_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)' },
+      { file: 'ui/src/mobile/settings/GeneralPage.tsx', mustContain: '{!isIOS && canJump ? (' },
+      { file: 'ui/src/mobile/settings/GeneralPage.tsx', mustContain: '{!isIOS && <SettingsNote id="boot-auto-connect-path">' },
+    ],
+    reviewed: '2026-11-02',
+  },
+  {
     id: 'control:mobile/forms/RuleFormPanel.tsx:const-true-disabled:4a3a57b1#1',
     face: 'control',
     kind: 'platform-absent',

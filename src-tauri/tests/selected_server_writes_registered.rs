@@ -304,7 +304,6 @@ const GENERIC: &[(&str, &str, &str)] = &[
 /// 原生源码目录而这里不动即红。
 const NATIVE_ROOTS: &[&str] = &[
     "crates/tauri-plugin-polaris-ios/ios",
-    "scripts/qa",
     "src-tauri/gen/android",
     "src-tauri/gen/apple",
 ];
