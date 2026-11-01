@@ -162,15 +162,16 @@ export function useAppUpdate(includePrerelease: boolean) {
   }
 
   async function skipVersion() {
-    if (updateInfo) {
-      try {
-        await updateApi.skip(updateInfo.version);
-      } catch (error) {
-        console.error('[update] skip failed:', error);
-      }
-      markAppVersionSkipped(updateInfo.version);
+    if (!updateInfo) return;
+    const version = updateInfo.version;
+    try {
+      await updateApi.skip(version);
+      markAppVersionSkipped(version);
+      setUs('idle');
+    } catch (error) {
+      console.error('[update] skip failed:', error);
+      toast.error(t('mobileSettings.update.skipFailedPlain'));
     }
-    setUs('idle');
   }
 
   async function downloadTarget(target: UpdateProgressManifest) {

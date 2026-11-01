@@ -253,7 +253,7 @@ export const updateApi = {
     return invoke(IPC_CHANNELS.UPDATE_REQUEST_INSTALL_PERMISSION);
   },
 
-  async skip(version: string): Promise<{ success: boolean }> {
+  async skip(version: string): Promise<void> {
     return invoke(IPC_CHANNELS.UPDATE_SKIP, { version });
   },
 

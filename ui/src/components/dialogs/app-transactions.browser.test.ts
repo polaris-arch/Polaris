@@ -533,6 +533,7 @@ const [
   { NodeMenu }, { SubFormPanel }, { default: PendingChangesBar }, { MobilePendingBar },
   { useNodeActions }, { NodesBatchBar }, { RulesScreen }, { MobileRulesScreen },
   { MobileNodesScreen }, { MobileConnectionsScreen }, { ResCatalogPanel }, { WarpPanel }, { TsSettingsPanel },
+  { default: ConnectionsScreen }, { default: AppUpdateBanner }, { default: LogsScreen }, { default: LockOverlay },
 ] = await Promise.all([
   mode === 'node-menu' ? import('/src/components/screens/home/NodeMenu') : { NodeMenu: undefined },
   mode === 'mobile-subscription-edit' ? import('/src/mobile/forms/SubFormPanel') : { SubFormPanel: undefined },
@@ -547,6 +548,10 @@ const [
   mode === 'resources' ? import('/src/mobile/forms/ResourceAddPanel') : { ResCatalogPanel: undefined },
   mode === 'mobile-warp' ? import('/src/mobile/forms/WarpPanel') : { WarpPanel: undefined },
   mode === 'mobile-ts' ? import('/src/mobile/forms/TsSettingsPanel') : { TsSettingsPanel: undefined },
+  mode === 'desktop-connections' ? import('/src/components/screens/connections/ConnectionsScreen') : { default: undefined },
+  mode === 'update-banner' ? import('/src/components/layout/AppUpdateBanner') : { default: undefined },
+  mode === 'desktop-logs' ? import('/src/components/screens/logs/LogsScreen') : { default: undefined },
+  mode === 'desktop-lock-overlay' ? import('/src/components/layout/LockOverlay') : { default: undefined },
 ]);
 await i18nReady;
 const initialGeneration = Number(new URLSearchParams(location.search).get('generation') ?? '10');
@@ -746,7 +751,7 @@ if (mode === 'mobile-nodes') {
   test.removeSub = id => useStagedConfigStore.getState().stage({ id: 'sub:' + id, kind: 'subscription', label: id, entityPath: ['subscriptions', id], nextValue: null });
   test.undoSub = id => useStagedConfigStore.getState().revert('sub:' + id);
 }
-if (mode === 'connections') {
+if (mode === 'connections' || mode === 'desktop-connections') {
   test.closeCalls = [];
   test.pending = {};
   api.stats.subscribe = async () => {};
@@ -757,6 +762,49 @@ if (mode === 'connections') {
   api.connections.closeAll = () => new Promise((resolve, reject) => { test.pending.all = { resolve, reject }; });
   test.sequence = 0;
   test.emit = (ids, reset = false) => test.frame({ reset, generation: 1, sequence: ++test.sequence, at: test.sequence * 1000, connections: ids.map(id => ({ id, chains: ['node'], rule: 'MATCH', metadata: { host: id + '.example', network: 'tcp', destinationIP: '198.51.100.7' }, upload: 100, download: 200, start: '2026-01-01T00:00:00Z' })) });
+}
+if (mode === 'desktop-connections' || mode === 'update-banner' || mode === 'desktop-logs') {
+  test.toasts = [];
+  setToastImpl(Object.fromEntries(['success','info','warning','error'].map(channel => [channel,(message, detail) => test.toasts.push({channel,message,detail})])));
+}
+if (mode === 'update-banner') {
+  api.update.check = async () => ({ hasUpdate: true, updateInfo: { version: '9.9.9' } });
+  api.update.skip = version => { test.skipVersion = version; return new Promise((resolve, reject) => { test.skip = { resolve, reject }; }); };
+}
+if (mode === 'desktop-logs') {
+  const failure = new URLSearchParams(location.search).get('failure');
+  const row = id => ({_id: id, timestamp: '2026-01-01T00:00:00Z', level: 'info', source: 'app', message: 'Retained record ' + id});
+  test.logRegistrations = 0; test.logReads = []; test.logUnsubscribed = []; test.logUnlistened = 0;
+  api.logs.onReceivedBatchReady = async listener => {
+    test.logRegistrations++;
+    if (failure === 'listener' && test.logRegistrations === 1) throw new Error('synthetic registration failure');
+    test.logFrame = listener;
+    return () => { test.logUnlistened++; };
+  };
+  api.logs.get = async token => {
+    test.logReads.push(token);
+    if (failure === 'get' && test.logReads.length === 1) {
+      test.logFrame([row(1)]);
+      throw new Error('synthetic owner registration failure');
+    }
+    return [row(1), row(2)];
+  };
+  api.logs.unsubscribe = async token => { test.logUnsubscribed.push(token); };
+  api.logs.diagnosticState = async () => false;
+  api.logs.runtimeLevel = async () => ({running: false, level: null});
+  api.logs.legacyInfo = async () => ({exists: false, bytes: 0, path: ''});
+  api.proxy.onLifecycle = () => () => {};
+  api.config.onChangedReady = async () => () => {};
+  useStagedConfigStore.setState({enabled: false});
+  useAppStore.setState({saveConfig: async () => { throw new Error('synthetic save failure'); }});
+}
+if (mode === 'desktop-lock-overlay') {
+  test.passwordReads = []; test.unlockCalls = [];
+  api.privacy.hasPassword = () => new Promise((resolve, reject) => { test.passwordReads.push({resolve, reject}); });
+  api.privacy.unlock = async password => { test.unlockCalls.push(password); return {ok: true}; };
+  api.config.setPrivacyMode = async value => { useAppStore.setState({privacyMode: value}); };
+  test.locked = value => flushSync(() => useAppStore.setState({privacyMode: value}));
+  useAppStore.setState({privacyMode: true});
 }
 if (mode === 'resources') {
   api.ruleResources.getCatalog = async () => ({ items: [{ id: 'builtin', name: 'builtin', path: 'builtin.srs', category: 'custom', bundled: true }] });
@@ -833,6 +881,10 @@ createRoot(document.getElementById('root')).render(<><DialogHost /><FixtureReady
   {mode === 'mobile-subscription-edit' && <MobileSubscriptionEdit />}
   {mode === 'mobile-nodes' && <main className="mobile-root"><MobileNodesScreen /></main>}
   {mode === 'connections' && <main className="mobile-root"><MobileConnectionsScreen /></main>}
+  {mode === 'desktop-connections' && <ConnectionsScreen />}
+  {mode === 'update-banner' && <AppUpdateBanner />}
+  {mode === 'desktop-logs' && <LogsScreen />}
+  {mode === 'desktop-lock-overlay' && <LockOverlay />}
   {mode === 'resources' && <main className="mobile-root"><ResCatalogPanel instanceId={resourceInstance} /></main>}
   {mode === 'mobile-warp' && <main className="mobile-root"><WarpPanel instanceId={meshInstance} edit /></main>}
   {mode === 'mobile-ts' && <main className="mobile-root"><TsSettingsPanel instanceId={meshInstance} serverId="ts" /></main>}
@@ -1608,6 +1660,128 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.locator('[data-conn-row="a"]').waitFor();
     expect(await page.locator('[data-conn-row="b"]').count()).toBe(kind === 'filtered' ? 0 : 1);
     expect(await page.locator('[data-write-error]').count()).toBeGreaterThan(0);
+    await page.close();
+  }));
+  it.for(['partial', 'reject', 'false', 'missing-count', 'success'])('desktop close-all follows real detail frames and reports its receipt: %s', async (outcome, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({ locale: 'en-US' });
+    await openFixture(page, origin + '/__transactions?mode=desktop-connections');
+    await page.getByRole('tab').nth(1).click();
+    await page.waitForFunction('typeof window.__transactions.frame === "function"');
+    await page.evaluate('window.__transactions.emit(["a", "b"], true)');
+    await page.locator('.conn-data-row').filter({ hasText: 'a.example' }).waitFor();
+    const closeAll = page.getByRole('button', { name: enUS.connections.closeAll, exact: true });
+    await closeAll.click();
+    await page.locator('.conn-toolbar .confirming').click();
+    await page.waitForFunction('!!window.__transactions.pending.all');
+    // b really disappears while the request is pending; a remains live. The UI
+    // must not suppress a, even if paused before the partial receipt arrives.
+    await page.evaluate('window.__transactions.emit(["a"], true)');
+    await page.locator('#conn-pause-btn').click();
+    if (outcome === 'reject') await page.evaluate('window.__transactions.pending.all.reject(new Error("synthetic"))');
+    else await page.evaluate((kind) => {
+      const fixture = (window as any).__transactions;
+      fixture.pending.all.resolve(kind === 'partial' ? {ok: true, closed: 1, failed: 1}
+        : kind === 'false' ? {ok: false}
+        : kind === 'missing-count' ? {ok: true}
+        : {ok: true, closed: 2, failed: 0});
+    }, outcome);
+    await page.waitForFunction('window.__transactions.toasts.length > 0');
+    expect(await page.locator('.conn-data-row').filter({ hasText: 'a.example' }).count()).toBe(1);
+    expect(await page.locator('.conn-data-row').filter({ hasText: 'b.example' }).count()).toBe(0);
+    expect(await page.evaluate('window.__transactions.toasts')).toEqual([{
+      channel: outcome === 'success' ? 'success' : 'error',
+      message: outcome === 'success' ? enUS.connections.closeAllDone : enUS.connections.closeFailed,
+    }]);
+    await page.close();
+  }));
+  it('update banner retains a rejected skip and only hides after native void success', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({ locale: 'en-US' });
+    await openFixture(page, origin + '/__transactions?mode=update-banner');
+    const skip = page.getByRole('button', { name: enUS.settings.update.bannerSkip, exact: true });
+    await skip.click();
+    expect(await page.locator('#app-update-banner').count()).toBe(1);
+    await page.evaluate('window.__transactions.skip.reject(new Error("synthetic"))');
+    await page.waitForFunction('window.__transactions.toasts.length === 1');
+    expect(await page.evaluate('window.__transactions.toasts[0].message')).toBe(enUS.settings.update.skipFailedPlain);
+    expect(await page.locator('#app-update-banner').count()).toBe(1);
+    await skip.click();
+    await page.evaluate('window.__transactions.skip.resolve()');
+    await page.locator('#app-update-banner').waitFor({ state: 'detached' });
+    expect(await page.evaluate('window.__transactions.skipVersion')).toBe('9.9.9');
+    await page.close();
+  }));
+  it.for(['listener', 'get'])('desktop logs exposes a retry after failed %s and preserves received rows', async (failure, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({ locale: 'en-US' });
+    await openFixture(page, origin + '/__transactions?mode=desktop-logs&failure=' + failure);
+    await page.locator('#log-stream-error').waitFor();
+    expect(await page.locator('.log-live').count()).toBe(0);
+    if (failure === 'get') expect(await page.locator('.log-line').filter({hasText: 'Retained record 1'}).count()).toBe(1);
+    const readsBefore = await page.evaluate('window.__transactions.logReads.slice()');
+    await page.getByRole('button', {name: enUS.common.retry, exact: true}).click();
+    await page.locator('#log-stream-error').waitFor({state: 'detached'});
+    await page.locator('.log-live').waitFor();
+    expect(await page.locator('.log-line').count()).toBe(2);
+    expect(await page.locator('.log-line').filter({hasText: 'Retained record 1'}).count()).toBe(1);
+    expect(await page.evaluate('window.__transactions.logRegistrations')).toBe(2);
+    if (failure === 'get') {
+      const readsAfter = await page.evaluate('window.__transactions.logReads');
+      expect(readsAfter[1]).not.toBe(readsBefore[0]);
+      expect(await page.evaluate('window.__transactions.logUnsubscribed')).toContain(readsBefore[0]);
+      expect(await page.evaluate('window.__transactions.logUnlistened')).toBe(1);
+    }
+    await page.close();
+  }));
+  it('desktop logs shows a failed direct level save and keeps the configured level', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({ locale: 'en-US' });
+    await openFixture(page, origin + '/__transactions?mode=desktop-logs');
+    const level = page.getByRole('button', {name: enUS.logs.levelAria, exact: true});
+    await level.click();
+    await page.getByRole('option', {name: 'DEBUG', exact: true}).click();
+    await page.waitForFunction('window.__transactions.toasts.length === 1');
+    expect(await page.evaluate('window.__transactions.toasts')).toEqual([{channel: 'error', message: enUS.common.saveFailed}]);
+    expect(await level.textContent()).toContain('INFO');
+    await page.close();
+  }));
+  it('desktop lock keeps failed password status locked until an explicit retry succeeds', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({locale: 'en-US'});
+    await openFixture(page, origin + '/__transactions?mode=desktop-lock-overlay');
+    await page.waitForFunction('window.__transactions.passwordReads.length === 1');
+    const unlock = page.getByRole('button', {name: enUS.privacy.unlock, exact: true});
+    expect(await unlock.isDisabled()).toBe(true);
+    await page.evaluate('window.__transactions.passwordReads[0].reject(new Error("synthetic"))');
+    await page.getByRole('button', {name: enUS.common.retry, exact: true}).waitFor();
+    expect(await page.locator('#lock-err').textContent()).toBe(enUS.privacy.passwordStatusFailed);
+    await page.locator('#lock-pw').dispatchEvent('keydown', {key: 'Enter', bubbles: true});
+    expect(await page.evaluate('window.__transactions.unlockCalls')).toEqual([]);
+    expect(await unlock.isDisabled()).toBe(true);
+    await page.getByRole('button', {name: enUS.common.retry, exact: true}).click();
+    await page.waitForFunction('window.__transactions.passwordReads.length === 2');
+    await page.evaluate('window.__transactions.passwordReads[1].resolve(false)');
+    await page.waitForFunction('!document.querySelector("#lock-pw").disabled');
+    await unlock.click();
+    await page.locator('#lock-overlay').waitFor({state: 'detached'});
+    expect(await page.evaluate('window.__transactions.unlockCalls')).toEqual(['']);
+    await page.close();
+  }));
+  it('desktop lock ignores password-status replies from an earlier lock cycle', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({locale: 'en-US'});
+    await openFixture(page, origin + '/__transactions?mode=desktop-lock-overlay');
+    await page.waitForFunction('window.__transactions.passwordReads.length === 1');
+    await page.evaluate('window.__transactions.locked(false)');
+    await page.locator('#lock-overlay').waitFor({state: 'detached'});
+    await page.evaluate('window.__transactions.locked(true)');
+    await page.waitForFunction('window.__transactions.passwordReads.length === 2');
+    await page.evaluate('window.__transactions.passwordReads[1].resolve(true)');
+    await page.waitForFunction('!document.querySelector("#lock-pw").disabled');
+    // The abandoned read claims no password, but must not change the new cycle.
+    await page.evaluate('window.__transactions.passwordReads[0].resolve(false)');
+    await page.getByRole('button', {name: enUS.privacy.unlock, exact: true}).click();
+    expect(await page.locator('#lock-err').textContent()).toBe(enUS.privacy.enterPassword);
+    expect(await page.evaluate('window.__transactions.unlockCalls')).toEqual([]);
+    await page.locator('#lock-pw').fill('synthetic-password');
+    await page.getByRole('button', {name: enUS.privacy.unlock, exact: true}).click();
+    await page.locator('#lock-overlay').waitFor({state: 'detached'});
+    expect(await page.evaluate('window.__transactions.unlockCalls')).toEqual(['synthetic-password']);
     await page.close();
   }));
   it.for(['route', 'dns', 'mobile-route', 'mobile-dns'])('staged %s toggle does not mutate disk and revert/reset restores visible value', async (mode, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {

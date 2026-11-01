@@ -30,6 +30,7 @@ import { updateApi } from '@/ipc/api-client';
 import { appUpdateIncludePrerelease } from '@/domain/app-update-channel';
 import { useEffectiveConfig } from '@/store/app-store';
 import { useNavStore } from '@/store/nav-store';
+import { toast } from '@/lib/error-handler';
 import { Button } from '../screens/settings/Primitives';
 import {
   appUpdateBannerState,
@@ -107,11 +108,13 @@ export default function AppUpdateBanner() {
         size="sm"
         onClick={() => {
           // 与设置页「跳过此版本」同一条后端命令（持久化 skippedVersion，跨会话生效），
-          // 外加本会话立刻隐藏 —— 否则点完按钮横幅还杵着，直到下次启动才消失。
-          void updateApi.skip(version).catch((e: unknown) => {
-            console.error('[update] skip failed:', e);
-          });
-          markAppVersionSkipped(version);
+          // 持久化成功后同步本会话隐藏；失败保留横幅，用户可以重试。
+          void updateApi.skip(version)
+            .then(() => markAppVersionSkipped(version))
+            .catch((e: unknown) => {
+              console.error('[update] skip failed:', e);
+              toast.error(t('settings.update.skipFailedPlain'));
+            });
         }}
       >
         <span>{t('settings.update.bannerSkip')}</span>

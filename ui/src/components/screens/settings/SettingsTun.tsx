@@ -145,32 +145,26 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
 
   /* 两份只读报告 —— 都不在前端另算一份，跑后端真判据读回来（同上面那条预览的理由）。
    *
-   * `null` 一律读作「还没拿到 / 读失败」，**绝不**折成「没有冲突」：外来隧道那条在
-   * macOS / Windows 上根本没有探测实现，把读不到画成一句「无冲突」会让用户排除掉真病因。
-   * 四态怎么显示见 `TunnelConflictBlock` 的文件头。
+   * `null` 一律读作「还没拿到 / 读失败」，**绝不**折成「没有冲突」。桌面三平台均有探测，
+   * 未支持平台仍由后端报告；展示按报告状态分支，不从平台名推断结论。
    *
    * 拉取时机：
-   *  - 外来隧道冲突：探测是**起核之后**的后台腿 ⇒ 跟着 `proxyRunning` 翻转重拉（同 DNS 接管报告）。
+   *  - 外来隧道冲突：跟着运行世代重拉；后台探测未提供完成事件，允许用户手动回读当前快照。
    *  - 组网路由证据：后端读取当前运行/持久化快照；已保存配置或核起停改变时重拉，
    *    不跟随每一帧 Tailscale 状态轮询，用户也可手动刷新。 */
   const proxyRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
   const proxyStartTime = useAppStore((s) => s.proxyStatus?.startTime);
-  const [tunnelConflicts, setTunnelConflicts] = useState<TunnelConflictReport | null>(null);
+  const [tunnelConflictState, setTunnelConflictState] = useState<ReportLoadState<TunnelConflictReport>>({
+    report: null, loading: true, error: false,
+  });
+  const tunnelConflictLoader = useMemo(() => createLatestReportLoader(
+    () => api.config.tunnelConflictReport(),
+    setTunnelConflictState,
+  ), []);
   useEffect(() => {
-    let cancelled = false;
-    api.config
-      .tunnelConflictReport()
-      .then((next) => {
-        if (!cancelled) setTunnelConflicts(next);
-      })
-      .catch(() => {
-        // 读不到就如实显示「读不到」（块内 null 分支），不冒充任何一种探测结论。
-        if (!cancelled) setTunnelConflicts(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [proxyRunning]);
+    tunnelConflictLoader.refresh();
+    return () => tunnelConflictLoader.invalidate();
+  }, [tunnelConflictLoader, proxyRunning, proxyStartTime]);
 
   // SettingsPage's `config` includes staged replay. Saved config only triggers refreshes and
   // resolves displayed names; the report's own R version and load evidence determine its scope.
@@ -542,7 +536,13 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
           ⚠️ force-route 规则并不只在 TUN 模式发射（route.rules 对任何入站都生效），它落在本页
           是因为形态与「生效排除面」同源（后端跑真判据读回来），不是因为它属于 TUN。 */}
       <CoexSnapshotBlock />
-      <TunnelConflictBlock report={tunnelConflicts} />
+      <div data-testid="tunnel-conflict-report">
+        <Button variant="ghost" size="sm" disabled={tunnelConflictState.loading}
+          onClick={() => tunnelConflictLoader.refresh()}>
+          {t(tunnelConflictState.loading ? 'common.loading' : 'common.refresh')}
+        </Button>
+        <TunnelConflictBlock report={tunnelConflictState.report} />
+      </div>
       <MeshRouteEvidenceBlock
         report={meshRouteState.report}
         loading={meshRouteState.loading}

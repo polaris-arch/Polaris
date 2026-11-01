@@ -270,7 +270,8 @@
     "diagnosticMode": "诊断模式",
     "diagnosticTipOff": "本次运行临时启用 DEBUG；重启应用后恢复。",
     "diagnosticTipOn": "诊断模式已开启；再次点击或重启应用后恢复。",
-    "diagnosticFailed": "切换诊断模式失败"
+    "diagnosticFailed": "切换诊断模式失败",
+    "streamFailed": "日志实时流连接失败。现有记录已保留，请重试。"
   },
   "notify": {
     "proxyError": {
@@ -737,7 +738,9 @@
       "privacyPasswordUnset": "未设置 · 任何人可解锁",
       "privacyPasswordChange": "修改密码",
       "privacyPasswordSetBtn": "设置密码",
-      "pageTitle": "通用"
+      "pageTitle": "通用",
+      "privacyPasswordUnknown": "尚未读到锁屏密码状态。",
+      "privacyPasswordReadFailed": "读不到锁屏密码状态，请重试。"
     },
     "restartApp": {
       "title": "需重启 Polaris 才能生效",
@@ -1376,7 +1379,8 @@
       "raceCustomHint": "上游必须使用纯 IP 地址。DoH 和 DoT 合计最多 3 个；UDP 不占加密竞速额度。",
       "raceCustomEmpty": "没有自定义上游",
       "fakeIpFilterEmpty": "无自定义例外；A/AAAA 查询可使用 FakeIP",
-      "browserDohEmpty": "清单为空，不会拦截任何端点"
+      "browserDohEmpty": "清单为空，不会拦截任何端点",
+      "takeoverSystemDnsUnsupported": "此平台不单独接管系统 DNS，此开关不生效。"
     }
   },
   "rules": {
@@ -1878,7 +1882,9 @@
     "subtitle": "输入密码解锁。代理仍在运行。",
     "unlock": "解锁",
     "enterPassword": "请输入密码",
-    "unlockFailed": "解锁没能完成，请稍后再试。"
+    "unlockFailed": "解锁没能完成，请稍后再试。",
+    "passwordStatusUnknown": "尚未读到锁屏密码状态。",
+    "passwordStatusFailed": "读不到锁屏密码状态，请重试。"
   },
   "appAdd": {
     "catCustom": "自定义…",
@@ -3016,7 +3022,10 @@
       "intro": "规则在「生效网络」里选中某个场景后，只在手机连着该网络时生效；离开后自动跳过，不用重新连接。",
       "reasonDhcpNoPermission": "手机上的应用没有权限直接向路由器询问（DHCP），请改用自动或系统 DNS",
       "listEmpty": "还没有填写"
-    }
+    },
+    "customAppPackagesUnsupported": "iOS 不支持按 Android 应用包名匹配，仍可按域名或 IP 配置此应用。",
+    "customAppMatchIos": "iOS 上只按此应用的域名或 IP 匹配；对应规则资源必须在位。进程名供桌面端使用，Android 包名在 iOS 不生效。",
+    "appRoutingMatchNoteIos": "iOS 应用分流按已知域名或 IP 匹配，需对应规则资源在位；不能按应用身份或 Android 包名识别，也不将应用排除出系统 VPN。"
   },
   "mobileSettings": {
     "saveFailedWithReason": "保存失败：{{reason}}",
@@ -3030,7 +3039,11 @@
       "bootConnectDesc": "由系统在开机或断线后恢复 VPN，也可阻止未通过 VPN 的流量。",
       "bootConnectPath": "系统设置 → 网络和互联网 → VPN → Polaris → 始终开启的 VPN",
       "bootConnectOpenFailed": "打不开系统设置页，请按上面的路径手动前往。",
-      "privacyLockFailed": "自动锁屏没能生效，界面仍是解锁状态。"
+      "privacyLockFailed": "自动锁屏没能生效，界面仍是解锁状态。",
+      "autoStartUnsupported": "iOS 不支持开机自动连接。",
+      "bootConnectUnsupported": "iOS 不提供 Android 的“始终开启的 VPN”设置。",
+      "privacyPasswordUnknown": "尚未读到锁屏密码状态。",
+      "privacyPasswordReadFailed": "读不到锁屏密码状态，请重试。"
     },
     "dns": {
       "fakeIpOffRisk": "在 TUN 模式下关掉它，节点会收到真实 IP 而不是域名；部分防滥用严格的机场会因此拒绝连接，这个风险客户端缓解不了。"
@@ -3046,7 +3059,9 @@
       "desc": "连接时会按需请求系统 VPN 授权。",
       "granted": "已授权",
       "denied": "未授权",
-      "unknown": "读不到"
+      "unknown": "读不到",
+      "unsupported": "不适用",
+      "unsupportedDesc": "此授权状态查询仅适用于 Android；iOS 连接时由系统管理 VPN 配置授权。"
     },
     "update": {
       "channelBlock": "应用更新",
@@ -3090,7 +3105,8 @@
       "systemBackupTitle": "允许系统备份应用数据",
       "systemBackupDesc": "默认关闭。打开后，Android 会把 Polaris 的应用数据（包括节点凭据和订阅）备份到你的 Google 账号，换机迁移时也会一并带到新设备。Google 云备份仅在 Android 9 及以上、且设备设置了锁屏（PIN、图案或密码）时才端到端加密。在新设备上恢复后，此开关仍为关闭，需要重新打开。上面的导出不受此开关影响。",
       "systemBackupReadFailed": "读不到系统备份开关的当前状态。",
-      "systemBackupReadFailedWithReason": "读不到系统备份开关的当前状态：{{reason}}"
+      "systemBackupReadFailedWithReason": "读不到系统备份开关的当前状态：{{reason}}",
+      "systemBackupUnsupported": "此系统备份开关仅适用于 Android；iOS 不适用。"
     },
     "about": {
       "licenseBlock": "许可",

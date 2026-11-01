@@ -5,7 +5,7 @@ import type { TlsFingerprintPresentation } from '@/domain/utls';
 const nativeInvoke = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<unknown>>());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: nativeInvoke }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
-const { coreApi } = await import('./updater');
+const { coreApi, updateApi } = await import('./updater');
 
 beforeEach(() => {
   nativeInvoke.mockReset();
@@ -32,4 +32,13 @@ it('keeps the legacy version probe outside capability presentation requests', as
   nativeInvoke.mockResolvedValue({ success: true, data: info });
   expect(await coreApi.getVersionInfo()).toEqual(info);
   expect(nativeInvoke).toHaveBeenCalledExactlyOnceWith(IPC_CHANNELS.CORE_GET_VERSION_INFO, {});
+});
+
+it('treats persisted update skips as a void command and preserves save errors', async () => {
+  nativeInvoke.mockResolvedValueOnce({ success: true });
+  await expect(updateApi.skip('v1.2.3')).resolves.toBeUndefined();
+  expect(nativeInvoke).toHaveBeenCalledExactlyOnceWith(IPC_CHANNELS.UPDATE_SKIP, { version: 'v1.2.3' });
+
+  nativeInvoke.mockResolvedValueOnce({ success: false, error: 'storage unavailable' });
+  await expect(updateApi.skip('v1.2.3')).rejects.toThrow('storage unavailable');
 });

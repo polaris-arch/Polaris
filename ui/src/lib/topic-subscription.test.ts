@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createTopicSubscription, type TopicPort } from './topic-subscription';
 
 /** 记录调用顺序的假 port；subscribe/unsubscribe 的 promise 由测试手动 resolve（模拟慢 IPC）。 */
@@ -124,5 +124,94 @@ describe('native listener readiness', () => {
     await Promise.resolve(); await Promise.resolve();
     sub.dispose();
     expect(f.calls).toEqual([]);
+  });
+});
+
+describe('bounded recovery after native failure', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('recovers a rejected subscribe once while keeping listener-before-producer order', async () => {
+    vi.useFakeTimers();
+    const f = fakePort();
+    let attempts = 0;
+    f.port.subscribe = () => {
+      f.calls.push('subscribe');
+      return ++attempts === 1 ? Promise.reject(new Error('transport')) : Promise.resolve();
+    };
+    const got: number[] = [];
+    const sub = createTopicSubscription(f.port, value => got.push(value));
+    sub.setWanted(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    f.emit(42);
+    expect(f.calls).toEqual(['listen', 'subscribe', 'subscribe']);
+    expect(got).toEqual([42]);
+    sub.dispose();
+    expect(f.calls.slice(-2)).toEqual(['unlisten', 'unsubscribe']);
+  });
+
+  it('stops automatic retries after one recovery attempt and permits renewed demand', async () => {
+    vi.useFakeTimers();
+    const f = fakePort();
+    f.port.subscribe = () => { f.calls.push('subscribe'); return Promise.reject(new Error('unavailable')); };
+    const sub = createTopicSubscription(f.port, () => {});
+    sub.setWanted(true);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.calls.filter(call => call === 'subscribe')).toHaveLength(2);
+    expect(vi.getTimerCount()).toBe(0);
+    sub.setWanted(false);
+    sub.setWanted(true);
+    expect(f.calls.filter(call => call === 'subscribe')).toHaveLength(3);
+    sub.dispose();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.calls.filter(call => call === 'subscribe')).toHaveLength(3);
+  });
+
+  it('cancels a scheduled retry on disposal and still releases attempted native ownership', async () => {
+    vi.useFakeTimers();
+    const f = fakePort();
+    f.port.subscribe = () => { f.calls.push('subscribe'); return Promise.reject(new Error('transport')); };
+    const sub = createTopicSubscription(f.port, () => {});
+    sub.setWanted(true);
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    sub.dispose();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.calls).toEqual(['listen', 'subscribe', 'unlisten', 'unsubscribe']);
+  });
+
+  it('ignores a stale rejected subscribe after a newer demand was accepted', async () => {
+    vi.useFakeTimers();
+    const f = fakePort();
+    let rejectOld!: (error: Error) => void;
+    let attempts = 0;
+    f.port.subscribe = () => {
+      f.calls.push('subscribe');
+      return ++attempts === 1 ? new Promise((_, reject) => { rejectOld = reject; }) : Promise.resolve();
+    };
+    const sub = createTopicSubscription(f.port, () => {});
+    sub.setWanted(true);
+    sub.setWanted(false);
+    sub.setWanted(true);
+    rejectOld(new Error('old transport'));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(attempts).toBe(2);
+    sub.dispose();
+  });
+
+  it('retries failed listener registration before subscribing, using the same finite budget', async () => {
+    vi.useFakeTimers();
+    const f = fakePort();
+    let registrations = 0;
+    f.port.onFrame = () => {
+      f.calls.push('listen');
+      return ++registrations === 1
+        ? Promise.reject(new Error('event transport'))
+        : Promise.resolve(() => f.calls.push('unlisten'));
+    };
+    const sub = createTopicSubscription(f.port, () => {});
+    sub.setWanted(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(f.calls).toEqual(['listen', 'listen', 'subscribe']);
+    sub.dispose();
   });
 });

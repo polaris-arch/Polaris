@@ -88,19 +88,21 @@ import type { MobileSettingsPageProps } from './settings-pages';
 export function GeneralPage({ config, update, commit }: MobileSettingsPageProps): ReactElement {
   const { t } = useTranslation();
   const autoPrivacyMode = !!config.autoPrivacyMode;
+  const isIOS = typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios';
   /* 「跳转项」还是「说明行」由桥定，且**在渲染期读一次**：桥由 `MainActivity` 在 document-start
      注入，本组件挂载时它该在就一定已经在（同 `MobileApp.hasBackNavBridge` 的那条论证）。 */
   const canJump = hasVpnSettingsBridge();
   /** 开机自动连接的执行侧真值。`null` = 还没读到（或读失败）。 */
   const [autoStart, setAutoStart] = useState<boolean | null>(null);
   useEffect(() => {
+    if (isIOS) return;
     commit('auto-start', autoStartApi.getStatus().then(setAutoStart), (err) =>
       failureText(t, err, {
         withReason: 'mobileSettings.general.autoStartReadFailedWithReason',
         plain: 'mobileSettings.general.autoStartReadFailed',
       }),
     );
-  }, [commit, t]);
+  }, [commit, t, isIOS]);
 
   return (
     <>
@@ -137,8 +139,8 @@ export function GeneralPage({ config, update, commit }: MobileSettingsPageProps)
         <SettingsRow
           id="auto-start"
           label={t('mobileSettings.general.autoStartTitle')}
-          desc={t('mobileSettings.general.autoStartDesc')}
-          control={
+          desc={t(isIOS ? 'mobileSettings.general.autoStartUnsupported' : 'mobileSettings.general.autoStartDesc')}
+          control={isIOS ? undefined : (
             <MobileSwitch
               checked={autoStart === true}
               disabled={autoStart === null}
@@ -152,10 +154,10 @@ export function GeneralPage({ config, update, commit }: MobileSettingsPageProps)
                 )
               }
             />
-          }
+          )}
         />
         {/* 裁定 #8：跳转项形态，绝不是 switch。桥不在时退化成不可点的说明行，见头注。 */}
-        {canJump ? (
+        {!isIOS && canJump ? (
           <SettingsPushRow
             id="boot-auto-connect"
             label={t('mobileSettings.general.bootConnectTitle')}
@@ -173,13 +175,13 @@ export function GeneralPage({ config, update, commit }: MobileSettingsPageProps)
           <SettingsRow
             id="boot-auto-connect"
             label={t('mobileSettings.general.bootConnectTitle')}
-            desc={t('mobileSettings.general.bootConnectDesc')}
+            desc={t(isIOS ? 'mobileSettings.general.bootConnectUnsupported' : 'mobileSettings.general.bootConnectDesc')}
           />
         )}
         {/* 常驻路径：跳转的落点只能到 VPN 列表页，剩下两跳由这一行承担（见头注）。 */}
-        <SettingsNote id="boot-auto-connect-path">
+        {!isIOS && <SettingsNote id="boot-auto-connect-path">
           {t('mobileSettings.general.bootConnectPath')}
-        </SettingsNote>
+        </SettingsNote>}
       </SettingsGroup>
 
       <SettingsGroup header={t('settings.general.groupPrivacy')}>
@@ -229,16 +231,25 @@ export function GeneralPage({ config, update, commit }: MobileSettingsPageProps)
  */
 function PrivacyPasswordRow({ commit }: { commit: MobileSettingsPageProps['commit'] }): ReactElement {
   const { t } = useTranslation();
-  const [hasPassword, setHasPassword] = useState(false);
+  const [hasPassword, setHasPassword] = useState<boolean | null>(null);
+  const [passwordReadFailed, setPasswordReadFailed] = useState(false);
+  const [passwordReadAttempt, setPasswordReadAttempt] = useState(0);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
 
   useEffect(() => {
-    void privacyApi
-      .hasPassword()
-      .then(setHasPassword)
-      .catch(() => undefined);
-  }, []);
+    let alive = true;
+    setHasPassword(null);
+    setPasswordReadFailed(false);
+    commit('privacy-password', privacyApi.hasPassword().then(
+      (value) => { if (alive) setHasPassword(value); },
+      (error: unknown) => {
+        if (alive) setPasswordReadFailed(true);
+        throw error;
+      },
+    ), () => t('mobileSettings.general.privacyPasswordReadFailed'), () => alive);
+    return () => { alive = false; };
+  }, [commit, t, passwordReadAttempt]);
 
   function save(): void {
     /* `setPassword` 返 `{success}`，而 `commit` 吃的是 `Promise<void>` —— 这一跳把「后端说没成」
@@ -260,12 +271,18 @@ function PrivacyPasswordRow({ commit }: { commit: MobileSettingsPageProps['commi
       id="privacy-password"
       label={t('settings.general.privacyPassword')}
       desc={
-        hasPassword
+        hasPassword === null
+          ? t('mobileSettings.general.privacyPasswordUnknown')
+          : hasPassword
           ? t('settings.general.privacyPasswordSet')
           : t('settings.general.privacyPasswordUnset')
       }
       control={
-        editing ? (
+        hasPassword === null ? (
+          <MobileButton disabled={!passwordReadFailed} onClick={() => setPasswordReadAttempt((attempt) => attempt + 1)}>
+            {t(passwordReadFailed ? 'common.retry' : 'common.loading')}
+          </MobileButton>
+        ) : editing ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' }}>
             <MobileTextInput
               type="password"

@@ -270,7 +270,8 @@
     "diagnosticMode": "Diagnostic mode",
     "diagnosticTipOff": "Temporarily enable DEBUG for this run; restarting the app restores the configured level.",
     "diagnosticTipOn": "Diagnostic mode is on; click again or restart the app to restore the configured level.",
-    "diagnosticFailed": "Failed to toggle diagnostic mode"
+    "diagnosticFailed": "Failed to toggle diagnostic mode",
+    "streamFailed": "The live log stream could not connect. Existing records are kept; retry to reconnect."
   },
   "notify": {
     "proxyError": {
@@ -737,7 +738,9 @@
       "privacyPasswordUnset": "Not set — anyone can unlock",
       "privacyPasswordChange": "Change password",
       "privacyPasswordSetBtn": "Set password",
-      "pageTitle": "General"
+      "pageTitle": "General",
+      "privacyPasswordUnknown": "The lock password status has not been read yet.",
+      "privacyPasswordReadFailed": "Could not read the lock password status. Please retry."
     },
     "restartApp": {
       "title": "Restart Polaris to apply",
@@ -1376,7 +1379,8 @@
       "raceCustomHint": "Use literal IP addresses. DoH and DoT share a limit of 3; UDP does not use the encrypted race quota.",
       "raceCustomEmpty": "No custom upstreams",
       "fakeIpFilterEmpty": "No custom exceptions; A/AAAA queries can use FakeIP",
-      "browserDohEmpty": "No endpoints listed; nothing is blocked"
+      "browserDohEmpty": "No endpoints listed; nothing is blocked",
+      "takeoverSystemDnsUnsupported": "This platform does not separately take over system DNS, so this switch has no effect."
     }
   },
   "rules": {
@@ -1878,7 +1882,9 @@
     "subtitle": "Enter your password to unlock. The proxy keeps running.",
     "unlock": "Unlock",
     "enterPassword": "Enter a password",
-    "unlockFailed": "The unlock attempt could not be completed. Try again."
+    "unlockFailed": "The unlock attempt could not be completed. Try again.",
+    "passwordStatusUnknown": "The lock password status has not been read yet.",
+    "passwordStatusFailed": "Could not read the lock password status. Please retry."
   },
   "appAdd": {
     "catCustom": "Custom…",
@@ -3016,7 +3022,10 @@
       "intro": "A rule limited to a profile applies only while this phone is on that network, and is skipped automatically when you leave. No reconnect needed.",
       "reasonDhcpNoPermission": "apps on a phone have no permission to ask the router directly (DHCP). Use Auto or System DNS",
       "listEmpty": "Nothing added yet"
-    }
+    },
+    "customAppPackagesUnsupported": "iOS cannot match Android app package names. You can still configure domains or IP addresses for this app.",
+    "customAppMatchIos": "On iOS, matching uses this app’s domains or IP addresses and requires the corresponding rule resources. Process names apply to desktop; Android package names have no effect on iOS.",
+    "appRoutingMatchNoteIos": "On iOS, app routing matches known domains or IP addresses and requires the corresponding rule resources. It cannot identify apps or Android package names, or exclude an app from the system VPN."
   },
   "mobileSettings": {
     "saveFailedWithReason": "Save failed: {{reason}}",
@@ -3030,7 +3039,11 @@
       "bootConnectDesc": "Android can restore the VPN after boot or a drop, and block traffic outside the VPN.",
       "bootConnectPath": "Settings → Network & internet → VPN → Polaris → Always-on VPN",
       "bootConnectOpenFailed": "The system settings page could not be opened — follow the path above.",
-      "privacyLockFailed": "The idle lock did not engage; the screen is still unlocked."
+      "privacyLockFailed": "The idle lock did not engage; the screen is still unlocked.",
+      "autoStartUnsupported": "iOS does not support connecting automatically after boot.",
+      "bootConnectUnsupported": "iOS does not provide Android’s Always-on VPN setting.",
+      "privacyPasswordUnknown": "The lock password status has not been read yet.",
+      "privacyPasswordReadFailed": "Could not read the lock password status. Please retry."
     },
     "dns": {
       "fakeIpOffRisk": "Turning this off under TUN makes nodes receive real IPs instead of domains; providers with strict anti-abuse rules may refuse the connection, and the client cannot mitigate that."
@@ -3046,7 +3059,9 @@
       "desc": "Polaris will request system VPN permission when you connect.",
       "granted": "Granted",
       "denied": "Not granted",
-      "unknown": "Unreadable"
+      "unknown": "Unreadable",
+      "unsupported": "Not applicable",
+      "unsupportedDesc": "This authorization status query is available only on Android. On iOS, the system manages VPN configuration permission when connecting."
     },
     "update": {
       "channelBlock": "App updates",
@@ -3090,7 +3105,8 @@
       "systemBackupTitle": "Allow system backup of app data",
       "systemBackupDesc": "Off by default. When on, Android backs up Polaris app data — including node credentials and subscriptions — to your Google account, and carries it to a new device during a device transfer. Google cloud backups are end-to-end encrypted only on Android 9 or later and only when the device has a screen lock (PIN, pattern or password). After a restore on a new device this switch is off again until you turn it back on. Export above is not affected by this switch.",
       "systemBackupReadFailed": "Could not read the current state of the system backup switch.",
-      "systemBackupReadFailedWithReason": "Could not read the current state of the system backup switch: {{reason}}"
+      "systemBackupReadFailedWithReason": "Could not read the current state of the system backup switch: {{reason}}",
+      "systemBackupUnsupported": "This system backup switch is available only on Android; it does not apply to iOS."
     },
     "about": {
       "licenseBlock": "Licensing",
