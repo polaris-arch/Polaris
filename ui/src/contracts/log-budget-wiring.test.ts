@@ -6,7 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import { moduleSource, moduleSourceWithTests, rustFunctionSource } from './rust-source.test-support';
+import { maskRustComments, moduleSource, moduleSourceWithTests, rustFunctionSource } from './rust-source.test-support';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../');
 const read = (path: string) => readFileSync(resolve(ROOT, path), 'utf8');
@@ -86,16 +86,19 @@ describe('W26 bounded core-log wiring', () => {
   it('Mac factory pipes reach the same custodied bounded sink without losing their owners', () => {
     const sources = {
       server: moduleSource('crates/helper/src/platform/macos/server'),
-      execution: read('crates/core-supervisor/src/admitted_payload.rs'),
+      execution: maskRustComments(read('crates/core-supervisor/src/admitted_payload.rs')),
       command: moduleSource('crates/core-supervisor/src/admitted_payload/macos'),
     };
     const compact = (source: string) => source.replace(/\s+/g, '');
     const wired = (input: typeof sources): boolean => {
-      const spawn = compact(rustFunctionSource(input.server, 'do_native_spawn'));
+      const admittedEntry = compact(rustFunctionSource(input.server, 'do_native_spawn'));
+      const spawn = compact(rustFunctionSource(input.server, 'do_native_spawn_admitted'));
       const factory = compact(rustFunctionSource(input.execution, 'spawn_macos_root_helper_main'));
       const command = compact(rustFunctionSource(input.command, 'configure_main_command'));
       const child = input.execution.slice(input.execution.indexOf('impl StdCustodiedChild {'));
-      return spawn.includes('letexecution=core.prepare(polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain)')
+      // The admission wrapper delegates to the same production spawn/pipe body.
+      return admittedEntry.includes('polaris_core_supervisor::config_gate::with_check_admission(||{self.do_native_spawn_admitted(params,core,conf_dir,uid)})')
+        && spawn.includes('letexecution=core.prepare(polaris_core_supervisor::admitted_payload::ExecPurpose::RunMain)')
         && /letmutchild=execution\.spawn_macos_root_helper_main\(Path::new\(&params.cfg\),Path::new\(conf_dir\),log_files.is_some\(\),/.test(spawn)
         && spawn.includes('letstdout=child.take_stdout();')
         && spawn.includes('letstderr=child.take_stderr();')
@@ -105,6 +108,8 @@ describe('W26 bounded core-log wiring', () => {
         && factory.includes('macos::configure_main_command(&mutcommand,config,working_directory,pipe);')
         && factory.includes('letchild=command.spawn()?;')
         && factory.includes('child:Some(child)')
+        && factory.includes('owner:Some(self.payload)')
+        && factory.includes('lease_owner:Some(lease_owner)')
         && /ifpipe\{command\.stdout\(std::process::Stdio::piped\(\)\)\.stderr\(std::process::Stdio::piped\(\)\);\}/.test(command)
         && ['stdout', 'stderr'].every(stream => {
           const take = compact(rustFunctionSource(child, `take_${stream}`));
@@ -114,7 +119,12 @@ describe('W26 bounded core-log wiring', () => {
         });
     };
     expect(wired(sources)).toBe(true);
+    const factorySource = rustFunctionSource(sources.execution, 'spawn_macos_root_helper_main');
     const negatives = [
+      { ...sources, server: sources.server.replace('self.do_native_spawn_admitted(params, core, conf_dir, uid)', 'self.do_native_spawn_without_admission(params, core, conf_dir, uid)') },
+      { ...sources, server: sources.server.replace('config_gate::with_check_admission(|| {', 'config_gate::without_check_admission(|| {') },
+      { ...sources, execution: sources.execution.replace(factorySource, factorySource.replace('owner: Some(self.payload),', 'owner: None,')) },
+      { ...sources, execution: sources.execution.replace(factorySource, factorySource.replace('lease_owner: Some(lease_owner),', 'lease_owner: None,')) },
       { ...sources, execution: sources.execution.replace('working_directory, pipe);', 'working_directory, false);') },
       { ...sources, command: sources.command.replace('.stderr(std::process::Stdio::piped())', '.stderr(std::process::Stdio::null())') },
       { ...sources, server: sources.server.replace('let stdout = child.take_stdout();', 'let stdout = None;') },

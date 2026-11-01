@@ -87,7 +87,9 @@ pub fn unhex(s: &str, limit: usize) -> Option<Vec<u8>> {
         _ => None,
     };
     s.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| Some((d(p[0])? << 4) | d(p[1])?))
         .collect()
 }

@@ -5,6 +5,10 @@ use polaris_helper_proto::core_manifest::{CoreId, CoreManifest};
 
 pub(crate) use polaris_core_supervisor::selected_core::current_platform;
 mod recovery;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod tls_inventory;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) use tls_inventory::expected_tls_support;
 pub(crate) mod user_store;
 pub(crate) use recovery::stage_recovery_installation;
 #[cfg(test)]

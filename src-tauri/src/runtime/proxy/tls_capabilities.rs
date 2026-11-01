@@ -46,6 +46,7 @@ impl ProxyRuntime {
         }
     }
 
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) async fn tls_fingerprint_capabilities(&self) -> Snapshot {
         self.tls_fingerprint_capabilities_observed().await.0
     }

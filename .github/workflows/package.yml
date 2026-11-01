@@ -1131,6 +1131,39 @@ jobs:
       # 不依赖 Tauri 的按平台名隐式合并。紧随其后的两步断言分别守输入侧与输出侧。
       # Isolate only this workflow's output namespaces; freeze the already
       # prepared resources before Tauri. Old outputs are retained under an owner.
+      # Helper/cache success does not supply the App-only dependency
+      # closure. Populate the locked native inputs before freezing a producer
+      # whose first actual Cargo build must remain entirely offline.
+      - name: Prefetch locked Windows App dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargo = (Get-Command cargo -CommandType Application).Source
+          if ($env:CARGO -and [IO.Path]::GetFullPath($env:CARGO) -ne $cargo) {
+            throw 'Windows prefetch Cargo differs from the normal producer Cargo'
+          }
+          $target = '${{ matrix.rust_target }}'
+          $cargoInfo = & $cargo -vV
+          if ($LASTEXITCODE -ne 0 -or $cargoInfo -notcontains "host: $target") {
+            throw 'Windows prefetch requires the actual native Cargo target'
+          }
+          if ($env:CARGO_BUILD_TARGET -and $env:CARGO_BUILD_TARGET -ne $target) {
+            throw 'Windows prefetch target differs from the producer target'
+          }
+          # Preserve the job's Cargo/Rustup homes and registry configuration;
+          # no clean environment, alternate cache or feature-disabled fallback.
+          Push-Location src-tauri
+          try {
+            & $cargo fetch --locked --target $target --manifest-path Cargo.toml
+            if ($LASTEXITCODE -ne 0) { throw 'Windows locked App input prefetch failed' }
+            & $cargo metadata --locked --offline --format-version=1 --manifest-path Cargo.toml --features tauri/custom-protocol --filter-platform $target > $null
+            if ($LASTEXITCODE -ne 0) { throw 'Windows offline App dependency closure is incomplete' }
+          } finally { Pop-Location }
+          # prepare freezes this same normal executable and inherited context;
+          # the private first-Cargo runner consumes the frozen executable path.
+          "CARGO=$cargo" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Freeze Windows package inputs and isolate outputs
         if: runner.os == 'Windows'
         shell: pwsh
@@ -1363,8 +1396,12 @@ jobs:
             rw_dir=$(cd "$rw_dir" && pwd -P)
             rw="$rw_dir/rw.dmg"
             hdiutil convert "$dmg" -format UDRW -o "$rw" -ov -quiet
-            # 现有大小 + 20MB 余量：引导只有几 KB，余量是给 HFS+ 元数据的。
-            need=$(( $(du -m "$rw" | cut -f1) + 20 ))
+            # 未签名的 x64 主程序封签时需要完整 Mach-O 的临时重写空间；仅留 20MiB 会让
+            # codesign 报 internal error。按镜像逻辑大小再留一份空间（已覆盖最大主程序），
+            # 外加 20MiB 元数据余量；不能用 du 的已分配块数把稀疏镜像缩到不足以封签。
+            image_bytes=$(stat -f %z "$rw")
+            [ "$image_bytes" -gt 0 ] || { echo "::error::Empty writable disk image: $rw"; exit 1; }
+            need=$(( ((image_bytes + 1048575) / 1048576) * 2 + 20 ))
             hdiutil resize -size "${need}m" "$rw" >/dev/null
             mnt=$(mktemp -d)
             mnt=$(cd "$mnt" && pwd -P)

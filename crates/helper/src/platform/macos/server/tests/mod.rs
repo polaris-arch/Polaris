@@ -937,5 +937,5 @@ fn check_chunk_decoder_and_dispatch_fail_closed_without_peer_or_platform_factory
         frame.bytes,
         polaris_helper_proto::codec::MAX_FRAME_BYTES + 1
     );
-    assert!(CHUNK_BYTES * 2 < MAX_WIRE_LINE_BYTES);
+    const { assert!(CHUNK_BYTES * 2 < MAX_WIRE_LINE_BYTES) };
 }

@@ -22,6 +22,9 @@ pub async fn core_get_version_info(
     capabilities_only: Option<bool>,
 ) -> Result<ApiResponse<Value>, ()> {
     if capabilities_only.unwrap_or(false) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let capabilities = crate::runtime::core_identity::expected_tls_support();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let capabilities = app
             .state::<AppRuntime>()
             .proxy
