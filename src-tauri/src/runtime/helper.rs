@@ -1149,6 +1149,73 @@ impl HelperRuntime {
         Ok(HelperClient::new(connector, self.platform, token))
     }
 
+    /// Mac ordinary processes never receive an execution owner. They transmit
+    /// bounded captured bytes to the installed Root Helper's closed Check route.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn check_config(
+        &self,
+        config: &Path,
+    ) -> Result<polaris_core_supervisor::RawCheck, String> {
+        use std::io::Read;
+        polaris_core_supervisor::admitted_payload::check_macos_root_helper_capability(
+            crate::runtime::core_identity::ExecPurpose::CheckConfig,
+        )
+        .map_err(|e| e.to_string())?;
+        let platform =
+            crate::runtime::core_identity::current_platform().map_err(|e| e.to_string())?;
+        let manifest = crate::runtime::core_identity::selected_manifest(platform)
+            .map_err(|e| e.to_string())?;
+        let id = manifest
+            .id(polaris_updater::sha256_hex)
+            .map_err(|e| e.to_string())?;
+        // Test-only generic transports must not become a production issuer or
+        // accidentally fall through to the real fixed system endpoint.
+        #[cfg(test)]
+        if self.never_connect || self.test_connector.is_some() {
+            return Err("generic test transport cannot issue Root Check completion".into());
+        }
+        let client = polaris_helper_client::check_config::SystemMacCheckClient::system(
+            read_token(&self.token_path()),
+        )?;
+        let path = config.to_path_buf();
+        let bytes = tokio::task::spawn_blocking(move || {
+            let fd = nix::fcntl::open(
+                path.as_path(),
+                nix::fcntl::OFlag::O_RDONLY
+                    | nix::fcntl::OFlag::O_NOFOLLOW
+                    | nix::fcntl::OFlag::O_NONBLOCK
+                    | nix::fcntl::OFlag::O_CLOEXEC,
+                nix::sys::stat::Mode::empty(),
+            )
+            .map_err(|e| e.to_string())?;
+            let file = std::fs::File::from(fd);
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file()
+                || metadata.len() == 0
+                || metadata.len() > polaris_helper_proto::check_config::MAX_CONFIG_BYTES as u64
+            {
+                return Err("CheckConfig requires a bounded regular captured configuration".into());
+            }
+            let mut bytes = Vec::new();
+            file.take((polaris_helper_proto::check_config::MAX_CONFIG_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.is_empty()
+                || bytes.len() > polaris_helper_proto::check_config::MAX_CONFIG_BYTES
+            {
+                return Err(
+                    "CheckConfig captured configuration exceeds the existing 8MiB boundary".into(),
+                );
+            }
+            Ok::<_, String>(bytes)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        polaris_core_supervisor::config_gate::run_macos_helper_check(client, id, bytes)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     #[cfg(unix)]
     fn connector(socket: &Path) -> Result<Box<dyn Connector>, String> {
         Ok(Box::new(UnixConnector::new(socket)))
@@ -2787,7 +2854,7 @@ fn query_core_status(
         _ => {
             return Err(
                 "CORE_ADMISSION_Unknown: helper execution protocol could not be observed".into(),
-            )
+            );
         }
     }
     match client.send_with_timeout(

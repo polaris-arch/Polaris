@@ -1,4 +1,4 @@
-//! Root Helper RunMain only. A read-only FD to an old data inode is not a
+//! Closed Root Helper CheckConfig/RunMain. A read-only FD to an old data inode is not a
 //! protection claim: each cold owner creates and hashes its own private inode.
 use super::*;
 use crate::protected_install_path::{no_extended_acl, ProtectedPath};
@@ -9,6 +9,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
+
+mod check_input;
+pub(crate) use check_input::{require_check_debt_absent, CheckSnapshot};
 
 const MAX_MEMBER: u64 = 96 * 1024 * 1024;
 const LOADER: &str = "macos-root-private-v1";
@@ -400,13 +403,13 @@ pub(super) fn protect_members(
     require_root()?;
     if !input.root_helper
         || policy.loader != LOADER
-        || policy.purposes != [ExecPurpose::RunMain]
+        || policy.purposes != [ExecPurpose::CheckConfig, ExecPurpose::RunMain]
         || policy.manifest.files.len() != 1
         || input.binary.file_name() != Some(std::ffi::OsStr::new("sing-box"))
     {
         return Err(rejected(
             AdmissionErrorKind::UnsupportedCapability,
-            "only compiled root Helper RunMain is admitted",
+            "only compiled root Helper CheckConfig/RunMain are admitted",
         ));
     }
     let directory = input
@@ -500,6 +503,16 @@ pub(super) fn protect_members(
     Ok(protected)
 }
 impl ProtectedMembers {
+    pub(super) fn check_snapshot(&self) -> Result<CheckSnapshot, AdmissionError> {
+        require_root()?;
+        self.generation.parent.unchanged()?;
+        CheckSnapshot::create(ProtectedPath::open(&self.generation.parent.path, true)?)
+    }
+    pub(super) fn check_debt_absent(&self) -> Result<(), AdmissionError> {
+        require_root()?;
+        self.generation.parent.unchanged()?;
+        require_check_debt_absent(&self.generation.parent.path)
+    }
     pub(super) fn is_current(&self) -> bool {
         // Metadata, namespace and protection only. No warm content hashing.
         self.binary.current()

@@ -389,6 +389,12 @@ where
             }
         }
         match req {
+            Request::MacCheck(_) => {
+                HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+                    polaris_helper_proto::ErrorCode::Unknown,
+                    "helper-check-unsupported",
+                )))
+            }
             Request::PrepareHelperUpgrade | Request::CancelHelperUpgrade => {
                 if !peer.is_some_and(|peer| peer.administrator) {
                     return HandleOutcome::AuthFailed;

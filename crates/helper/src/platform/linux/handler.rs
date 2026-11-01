@@ -325,6 +325,9 @@ fn dispatch_locked<P, S, D, SD>(
         return;
     }
     match command {
+        polaris_helper_proto::check_config::COMMAND => {
+            let _ = conn.write_line("ERR unknown helper-check-unsupported");
+        }
         cmd::PREPARE_HELPER_UPGRADE | cmd::CANCEL_HELPER_UPGRADE => {
             if cred.uid != 0 {
                 let _ = conn.write_line("ERR unauthorized");

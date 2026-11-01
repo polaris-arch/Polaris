@@ -427,8 +427,8 @@ fn only_one_production_site_spawns_sing_box_check() {
     assert!(scanned > 50);
     assert_eq!(
         sites.len(),
-        2,
-        "normal and fixed sealed CheckConfig constructors only: {sites:?}"
+        3,
+        "normal, fixed sealed and closed Mac Root CheckConfig constructors only: {sites:?}"
     );
     for (file, argv) in [
         (HOME, ".args([\"--disable-color\", \"check\", \"-c\"])"),
@@ -436,6 +436,7 @@ fn only_one_production_site_spawns_sing_box_check() {
             LINUX,
             ".args([\"--disable-color\", \"check\", \"-c\", \"/proc/self/fd/0\"])",
         ),
+        (LINUX, ".args([\"--disable-color\", \"check\", \"-c\"])"),
     ] {
         assert_eq!(
             sites
@@ -447,6 +448,7 @@ fn only_one_production_site_spawns_sing_box_check() {
         );
     }
     let owner = strip_comments(&read(LINUX));
+    assert_mac_root_check_factory(&read(LINUX));
     let parts = braced_block(&owner, "pub(crate) fn sealed_check_parts(");
     for required in [
         "self.purpose != ExecPurpose::CheckConfig",
@@ -552,7 +554,10 @@ fn assert_sealed_check_owner_custody(source: &str) {
     assert!(validated < terminal && terminal < removed);
     assert!(retire.contains("Err(error)=>{run.debt=true;returnErr(error);}"));
     let drop = block("impl Drop for CheckRun {");
-    assert!(drop.contains("ifself.child.is_some()&&self.native_terminal.is_none()"));
+    assert!(drop.contains("ifself.has_child()&&self.native_terminal.is_none()"));
+    let has_child = block("fn has_child(");
+    assert!(has_child.contains("self.child.is_some()"));
+    assert!(has_child.contains("self.mac_child.is_some()"));
     for required in [
         "ifletSome(owner)=self.payload.take(){std::mem::forget(owner);}",
         "ifletSome(lease)=self.lease_owner.take(){std::mem::forget(lease);}",
@@ -561,6 +566,49 @@ fn assert_sealed_check_owner_custody(source: &str) {
             drop.contains(required),
             "unconfirmed child must retain {required}"
         );
+    }
+}
+
+fn assert_mac_root_check_factory(source: &str) {
+    let raw = polaris_source_probe::mask_comments(source);
+    assert!(raw.contains("#[cfg(target_os = \"macos\")]\nimpl MacCheckInput {"));
+    let code = polaris_source_probe::mask_comments_and_strings(source);
+    let body = braced_block(&code, "impl MacCheckInput {")
+        .split_whitespace()
+        .collect::<String>();
+    for needle in [
+        "macos::require_root()?;",
+        "execution.purpose!=ExecPurpose::CheckConfig",
+        "!execution.payload.candidate.root_helper",
+        "Arc::ptr_eq(p,&execution.payload)",
+        "self.snapshot.path()?",
+        "macos::attach_store_lease(&mutcommand,&self.lease,&execution.payload.protected.lease,)?",
+        "letchild=command.spawn()?;",
+        "owner:Some(execution.payload)",
+    ] {
+        assert!(
+            body.contains(needle),
+            "closed Mac Check factory lost {needle}"
+        );
+    }
+}
+
+#[test]
+fn mac_check_factory_is_root_and_exact_purpose_not_a_literal_decoy() {
+    let source = read("crates/core-supervisor/src/admitted_payload.rs");
+    assert_mac_root_check_factory(&source);
+    for (old, new) in [
+        (
+            "execution.purpose != ExecPurpose::CheckConfig",
+            "execution.purpose != ExecPurpose::RunMain",
+        ),
+        ("owner: Some(execution.payload)", "owner: None"),
+    ] {
+        assert!(source.contains(old));
+        assert!(std::panic::catch_unwind(|| assert_mac_root_check_factory(
+            &source.replace(old, new)
+        ))
+        .is_err());
     }
 }
 

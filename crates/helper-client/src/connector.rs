@@ -65,15 +65,8 @@ impl UnixConnector {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
-}
 
-#[cfg(unix)]
-impl Connector for UnixConnector {
-    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
-        self.connect_until(Instant::now() + self.read_timeout)
-    }
-
-    fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
+    fn connect_stream_until(&self, deadline: Instant) -> Result<UnixConnStream, ClientError> {
         if self.read_timeout.is_zero() {
             return Err(ClientError::Io(io::ErrorKind::InvalidInput.into()));
         }
@@ -101,10 +94,52 @@ impl Connector for UnixConnector {
                 ClientError::Connect(format!("connect {}: {error}", self.socket_path.display()))
             }
         })?;
-        Ok(Box::new(UnixConnStream {
+        Ok(UnixConnStream {
             stream,
             read_timeout: self.read_timeout,
-        }))
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Connector for UnixConnector {
+    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        self.connect_until(Instant::now() + self.read_timeout)
+    }
+
+    fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        Ok(Box::new(self.connect_stream_until(deadline)?))
+    }
+}
+
+/// No caller-supplied path, stream, credential, environment override or callback.
+/// Only the closed Mac Check client can manufacture this connector internally.
+#[cfg(target_os = "macos")]
+pub(crate) struct MacRootConnector;
+
+#[cfg(target_os = "macos")]
+impl Connector for MacRootConnector {
+    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        self.connect_until(Instant::now() + READ_TIMEOUT)
+    }
+
+    fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        let connection = UnixConnector::new(crate::manager::InstallPaths::mac().socket)
+            .connect_stream_until(deadline)?;
+        // The actual connected FD is checked BEFORE any request/token is written.
+        // A user-owned proxy at even the fixed pathname cannot issue completion.
+        let (uid, _) = nix::unistd::getpeereid(&connection.stream).map_err(|e| {
+            ClientError::Connect(format!("Root Helper peer authentication failed: {e}"))
+        })?;
+        if !uid.is_root() {
+            return Err(ClientError::Connect(
+                "Root Helper peer UID is not root".into(),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        Ok(Box::new(connection))
     }
 }
 

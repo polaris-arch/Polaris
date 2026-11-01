@@ -6,7 +6,7 @@ import { MOBILE_FIELD_HINT_SUMMARIES } from './FormFields';
  *
  *  · **源码面**（① ~ ④）：`node-form-parity.test-support.ts` 从桌面 `NodeDialog.tsx` 的 AST 取能力指纹
  *    （共享判据 import / IPC 调用 / 文案键 / 协议分支），移动端 `NodeFormPanel.tsx` 同样取一遍，
- *    差集减登记表 = 债。那一面同时喂进 `wiring-completeness.test.ts` 的 B 面（`report-wiring.sh` 数它）。
+ *    差集减登记表 = 债。那一面同时喂进 `wiring-completeness.test.ts` 的 B 面（该门直接统计它）。
  *    它守得住「移动端有没有消费同一个能力」，守不住「消费了但没接对」。
  *  · **行为面**（⑤ ⑥）：把面板**真渲染**出来看字段在不在（逐协议、逐字段，含 MASQUE / Tailcat /
  *    TLS 证书固定），再抓住提交闭包**真提交**一次，看写出去的 `ServerConfig` 对不对
@@ -267,7 +267,7 @@ describe('③ 登记表纪律', () => {
   });
 });
 
-describe('④ 当下对差为空（逐条列出，便于直接定位；`report-wiring.sh` 数的是同一份）', () => {
+describe('④ 当下对差为空（逐条列出，便于直接定位；`wiring-completeness.test.ts` 数的是同一份）', () => {
   it('桌面节点编辑器的每条能力指纹，移动端都消费了或登记了等价物', () => {
     expect(nodeFormParityDebt().map((d) => d.id)).toEqual([]);
   });

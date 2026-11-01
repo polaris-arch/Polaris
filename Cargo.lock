@@ -3246,6 +3246,7 @@ dependencies = [
  "find-msvc-tools",
  "log",
  "nix",
+ "polaris-helper-client",
  "polaris-helper-proto",
  "polaris-source-probe",
  "rustix",
@@ -3287,6 +3288,7 @@ version = "1.0.0"
 dependencies = [
  "getrandom 0.4.3",
  "log",
+ "nix",
  "polaris-helper-proto",
  "polaris-source-probe",
  "polaris-windows-cleaner",

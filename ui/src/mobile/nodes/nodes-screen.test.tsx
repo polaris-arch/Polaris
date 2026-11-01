@@ -1367,7 +1367,7 @@ describe('⑥-c 添加 / 订阅更多 / 组网接入：桌面 ↔ 登记表 ↔ 
  * ⇒ 「接线层交给构造器的是什么」一条判据都没有。W-01 / W-02 / W-03 十五条 handler 里，
  * 此前只有 `onConnect` 被 ⑯-b 的「在场腿②」钉住。
  *
- * 实测两轮变异，各自 `tsc` rc=0 + 全量 vitest 全绿 + `report-wiring.sh` 逐字不变：
+ * 实测两轮变异，各自 `tsc` rc=0 + 全量 vitest 全绿 + 当时的接线报告逐字不变：
  *  ① `onManualAdd` / `onMeshJoin` / `onImport` 三条 `openMobileForm({…})` 换成 `() => undefined`
  *    （= 陈先生截图那三项点下去什么都不发生）；
  *  ② `onClone` / `onEdit` / `onDelete` 换成 `() => undefined`（克隆 / 编辑 / 删除全哑，

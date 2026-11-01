@@ -23,6 +23,14 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: OnceLock<Arc<CheckCustody>> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{
+    begin_macos_helper_check, macos_helper_check_request, request_macos_checks_shutdown,
+    run_macos_helper_check,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidationLifecycleError {
     #[error(transparent)]
@@ -112,6 +120,8 @@ struct OutputCapture {
 #[derive(Default)]
 struct CaptureTask {
     handle: Option<JoinHandle<Result<(), String>>>,
+    #[cfg(target_os = "macos")]
+    blocking: Option<std::thread::JoinHandle<Result<(), String>>>,
     completed: Option<Result<(), String>>,
 }
 
@@ -184,6 +194,28 @@ impl OutputCapture {
         // Concurrent run/Stop waiters must not overwrite a JoinHandle's waker.
         // Cancellation releases this gate without moving either owned handle.
         let _joining = self.join_gate.lock().await;
+        #[cfg(target_os = "macos")]
+        loop {
+            let pending = {
+                let mut tasks = self.tasks.lock().map_err(unknown)?;
+                let mut pending = false;
+                for task in tasks.iter_mut() {
+                    if task.blocking.as_ref().is_some_and(|h| h.is_finished()) {
+                        let h = task.blocking.take().expect("finished reader");
+                        task.completed = Some(
+                            h.join()
+                                .unwrap_or_else(|_| Err("Root Check reader panicked".into())),
+                        );
+                    }
+                    pending |= task.blocking.is_some();
+                }
+                pending
+            };
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         poll_fn(|cx| {
             let mut tasks = match self.tasks.lock() {
                 Ok(tasks) => tasks,
@@ -310,6 +342,8 @@ enum NativeFactoryObservation {
     Entered,
     ReturnedNoChild,
     Attached(ValidationNativeMembers),
+    #[cfg(target_os = "macos")]
+    RemoteHelperReturned,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -332,6 +366,16 @@ struct LocalValidationNativeTerminal {
 
 // The output policy comes from the concrete factory, never from absent pipes.
 enum CheckTail {
+    #[cfg(target_os = "macos")]
+    MacRemote {
+        cancel: Arc<AtomicBool>,
+        unknown: Arc<AtomicBool>,
+    },
+    #[cfg(target_os = "macos")]
+    MacRoot {
+        input: crate::admitted_payload::MacCheckInput,
+        output: Arc<OutputCapture>,
+    },
     PathSnapshot {
         created: bool,
         path: PathBuf,
@@ -352,7 +396,11 @@ struct NullCheckStdio;
 impl CheckTail {
     fn output(&self) -> Option<Arc<OutputCapture>> {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::MacRemote { .. } => None,
             Self::PathSnapshot { output, .. } => Some(Arc::clone(output)),
+            #[cfg(target_os = "macos")]
+            Self::MacRoot { output, .. } => Some(Arc::clone(output)),
             #[cfg(target_os = "linux")]
             Self::OwnedSealedInputs { .. } => None,
         }
@@ -360,14 +408,22 @@ impl CheckTail {
 
     fn validate_finished(&self) -> Result<(), ValidationLifecycleError> {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::MacRemote { .. } => Ok(()),
             Self::PathSnapshot { output, .. } => output.validate_finished(),
+            #[cfg(target_os = "macos")]
+            Self::MacRoot { output, .. } => output.validate_finished(),
             #[cfg(target_os = "linux")]
             Self::OwnedSealedInputs { .. } => Ok(()),
         }
     }
 
-    fn retire(&self) -> io::Result<()> {
+    fn retire(&mut self) -> io::Result<()> {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::MacRemote { .. } => Ok(()),
+            #[cfg(target_os = "macos")]
+            Self::MacRoot { input, .. } => input.retire().map_err(Into::into),
             Self::PathSnapshot { created: false, .. } => Ok(()),
             Self::PathSnapshot { path, .. } => match std::fs::remove_file(path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -381,6 +437,10 @@ impl CheckTail {
     #[cfg(all(test, unix))]
     fn path_snapshot(&self) -> &PathBuf {
         match self {
+            #[cfg(target_os = "macos")]
+            Self::MacRemote { .. } => panic!("remote Check has no local path"),
+            #[cfg(target_os = "macos")]
+            Self::MacRoot { .. } => panic!("Root Check has a private input owner"),
             Self::PathSnapshot { path, .. } => path,
             #[cfg(target_os = "linux")]
             Self::OwnedSealedInputs { .. } => panic!("sealed input has no path snapshot"),
@@ -455,6 +515,10 @@ impl CheckExecutable {
 }
 
 struct CheckRun {
+    #[cfg(target_os = "macos")]
+    mac: Option<macos::MacCheck>,
+    #[cfg(target_os = "macos")]
+    mac_child: Option<crate::admitted_payload::StdCustodiedChild>,
     payload: Option<Arc<AdmittedPayload>>,
     lease_owner: Option<Arc<dyn Send + Sync>>,
     completion: Arc<CheckCompletion>,
@@ -471,6 +535,13 @@ struct CheckRun {
 }
 
 impl CheckRun {
+    fn has_child(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.mac_child.is_some() {
+            return true;
+        }
+        self.child.is_some()
+    }
     fn cache_native_exit(
         &mut self,
         status: ExitStatus,
@@ -496,8 +567,14 @@ impl CheckRun {
             return Err(unknown("validation native ownership is unavailable"));
         }
         match &self.factory {
+            #[cfg(target_os = "macos")]
+            NativeFactoryObservation::RemoteHelperReturned
+                if !self.has_child() && matches!(self.tail, CheckTail::MacRemote { .. }) =>
+            {
+                Ok(None)
+            }
             NativeFactoryObservation::PreFactory | NativeFactoryObservation::ReturnedNoChild
-                if self.child.is_none() && self.exit.is_none() && self.native_exited.is_none() =>
+                if !self.has_child() && self.exit.is_none() && self.native_exited.is_none() =>
             {
                 Ok(None) // Own snapshot cleanup, never a native terminal.
             }
@@ -505,7 +582,7 @@ impl CheckRun {
                 let Some(fact) = &self.native_exited else {
                     return Err(unknown("same Child native exit has not been confirmed"));
                 };
-                if self.child.is_none()
+                if !self.has_child()
                     || !members.request.same(&self.request)
                     || !members.same(&fact.members)
                     || self.exit != Some(fact.status)
@@ -545,6 +622,28 @@ impl CheckRun {
         if self.lost_wait_ownership {
             return Poll::Ready(Err(io::Error::other("native wait ownership was lost")));
         }
+        #[cfg(target_os = "macos")]
+        if let Some(child) = self.mac_child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    return Poll::Ready(
+                        self.cache_native_exit(exit, NativeExitSource::TryWait)
+                            .map(|()| exit),
+                    );
+                }
+                Err(error) => {
+                    self.record_error(&error);
+                    return Poll::Ready(Err(error));
+                }
+                Ok(None) => {
+                    return self
+                        .mac
+                        .as_mut()
+                        .expect("Root Check metadata")
+                        .poll_tick(cx);
+                }
+            }
+        }
         let Some(child) = self.child.as_mut() else {
             return Poll::Ready(Err(io::Error::other("validation has no born Child")));
         };
@@ -563,11 +662,31 @@ impl CheckRun {
 
     fn request_close(&mut self) -> io::Result<()> {
         self.debt = true;
-        if self.exit.is_some() || self.child.is_none() {
+        #[cfg(target_os = "macos")]
+        if let CheckTail::MacRemote { cancel, .. } = &self.tail {
+            cancel.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(meta) = self.mac.as_mut() {
+            meta.request_cancel();
+        }
+        if self.exit.is_some() || !self.has_child() {
             return Ok(());
         }
         if self.lost_wait_ownership {
             return Err(io::Error::other("native wait ownership was lost"));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(child) = self.mac_child.as_mut() {
+            return match child.try_wait() {
+                Ok(Some(exit)) => self.cache_native_exit(exit, NativeExitSource::TryWait),
+                Ok(None) => child.kill(),
+                Err(error) => {
+                    self.record_error(&error);
+                    Err(error)
+                }
+            };
         }
         let result = self
             .io
@@ -589,12 +708,16 @@ impl CheckRun {
 
 impl Drop for CheckRun {
     fn drop(&mut self) {
-        if self.child.is_some() && self.native_terminal.is_none() {
+        if self.has_child() && self.native_terminal.is_none() {
             if let Some(owner) = self.payload.take() {
                 std::mem::forget(owner);
             }
             if let Some(lease) = self.lease_owner.take() {
                 std::mem::forget(lease);
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(child) = self.mac_child.take() {
+                std::mem::forget(child);
             }
         }
         #[cfg(unix)]
@@ -609,6 +732,8 @@ impl Drop for CheckRun {
 
 #[derive(Default)]
 struct CheckState {
+    #[cfg(target_os = "macos")]
+    mac_result: Option<macos::MacTerminal>,
     closing: bool,
     settling: bool,
     pause: Option<Arc<()>>,
@@ -720,6 +845,8 @@ impl CheckCustody {
                 return Err(error);
             }
         };
+        #[cfg(target_os = "macos")]
+        let mac_terminal = macos::terminal_before_retire(run)?;
         if let Err(error) = run.tail.retire() {
             run.debt = true;
             return Err(unknown(error));
@@ -732,6 +859,10 @@ impl CheckCustody {
         let completion = Arc::clone(&run.completion);
         // Drop the exact owned images before publishing their local terminal.
         state.runs.remove(&request.id);
+        #[cfg(target_os = "macos")]
+        if let Some(terminal) = mac_terminal {
+            state.mac_result = Some(terminal);
+        }
         completion.terminal.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -741,10 +872,34 @@ impl CheckCustody {
         request: &CheckRequestRef,
     ) -> Result<(), ValidationLifecycleError> {
         self.request_close(request)?;
+        #[cfg(target_os = "macos")]
+        if macos::is_remote(self, request)? {
+            return tokio::time::timeout(CLEANUP_BUDGET, async {
+                loop {
+                    {
+                        let mut s = self.state.lock().map_err(unknown)?;
+                        let Some(run) = self.run_mut(&mut s, request)? else {
+                            return Ok(());
+                        };
+                        if let CheckTail::MacRemote {
+                            unknown: failed, ..
+                        } = &run.tail
+                        {
+                            if failed.load(Ordering::SeqCst) {
+                                return Err(unknown("remote Helper Check cleanup remains Unknown"));
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| unknown("remote Helper Check cleanup timed out"))?;
+        }
         let born = {
             let mut state = self.state.lock().map_err(unknown)?;
             self.run_mut(&mut state, request)?
-                .is_some_and(|run| run.child.is_some())
+                .is_some_and(|run| run.has_child())
         };
         tokio::time::timeout(CLEANUP_BUDGET, async {
             if born {
@@ -895,6 +1050,10 @@ impl CheckCustody {
             ..OutputCapture::default()
         });
         let run = CheckRun {
+            #[cfg(target_os = "macos")]
+            mac: None,
+            #[cfg(target_os = "macos")]
+            mac_child: None,
             payload: execution.owner(),
             lease_owner: execution.lease_owner(),
             completion: Arc::new(CheckCompletion::default()),
@@ -928,6 +1087,10 @@ impl CheckCustody {
             let run = state.runs.get_mut(&id).expect("admitted validation run");
             match &mut run.tail {
                 CheckTail::PathSnapshot { created, .. } => *created = true,
+                #[cfg(target_os = "macos")]
+                CheckTail::MacRoot { .. } => unreachable!("ordinary factory has its own snapshot"),
+                #[cfg(target_os = "macos")]
+                CheckTail::MacRemote { .. } => unreachable!("ordinary factory is not remote"),
                 #[cfg(target_os = "linux")]
                 CheckTail::OwnedSealedInputs { .. } => {}
             }

@@ -572,9 +572,6 @@ describe('半真文案的事实门', () => {
     });
 
     it(`账本：移动端静音 toast 调用 = ${SILENT_TOAST_BASELINE}（宿主接上后归零）`, () => {
-      // marker：`scripts/wiring-verdict.mjs` 靠它证明**这一半门真的跑过**。
-      // 缺了它就退 2 —— 只跑主门而拿它的绿宣布「全部接线」，是这对门之间唯一那条缝。
-      console.log('HALF_TRUTH_FACTS=ok');
       const sites = toastInjectionSites();
       const { total, perFile } = silentToastCalls(sites, toastHostInstallSites());
       expect(

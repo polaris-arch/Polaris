@@ -64,6 +64,11 @@ pub use check_custody::{
     shutdown_checks_for_exit, with_check_admission, with_check_producer_registration,
     AdmissionPause, CheckProducerView, ValidationLifecycleError,
 };
+#[cfg(target_os = "macos")]
+pub use check_custody::{
+    begin_macos_helper_check, macos_helper_check_request, request_macos_checks_shutdown,
+    run_macos_helper_check,
+};
 
 /// 单次 `sing-box check` 的超时。
 ///
@@ -443,16 +448,16 @@ pub enum RawCheck {
 /// `Unavailable`（= 闸门无从判定 ⇒ 放行到 spawn，由内核自己报错）。分界线是失败模式是否静默 ——
 /// 本门失手的后果是内核照旧 FATAL，一个响亮的、已有 `CoreFatalSlot` 盯着的失败；
 /// 而 fail-closed 只会把「一个坏节点起不来」升级成「核临时读不到就一个节点都用不了」。
-fn decide_verdict(raw: RawCheck) -> ConfigCheckVerdict {
+pub fn decide_verdict(raw: RawCheck) -> ConfigCheckVerdict {
     let (success, stderr, stdout) = match raw {
         RawCheck::TimedOut { after_secs } => {
-            return ConfigCheckVerdict::Unavailable(format!("check 超时（>{after_secs}s）"))
+            return ConfigCheckVerdict::Unavailable(format!("check 超时（>{after_secs}s）"));
         }
         RawCheck::SpawnFailed(e) => {
-            return ConfigCheckVerdict::Unavailable(format!("check 启动失败: {e}"))
+            return ConfigCheckVerdict::Unavailable(format!("check 启动失败: {e}"));
         }
         RawCheck::OutputFailed(e) => {
-            return ConfigCheckVerdict::Unavailable(format!("check 输出读取失败: {e}"))
+            return ConfigCheckVerdict::Unavailable(format!("check 输出读取失败: {e}"));
         }
         RawCheck::Done {
             success,

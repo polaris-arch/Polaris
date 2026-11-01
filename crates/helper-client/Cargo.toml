@@ -18,6 +18,10 @@ log = "0.4"
 # Existing locked dependency, safe bounded Unix connect without detached workers.
 socket2 = "0.6"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Existing locked package; safe kernel peer-euid authentication before Check RPC.
+nix = { version = "0.31.3", features = ["socket", "user"] }
+
 [target.'cfg(windows)'.dependencies]
 polaris-windows-cleaner = { path = "../windows-cleaner" }
 # Overlapped pipe I/O owns its event and drains cancellation before release.

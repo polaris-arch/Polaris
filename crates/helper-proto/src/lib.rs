@@ -41,6 +41,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod check_config;
 pub mod codec;
 pub mod command;
 pub mod core_manifest;

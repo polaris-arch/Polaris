@@ -247,6 +247,12 @@ struct PipedSite {
 /// 写不出来说明这条腿还没想清楚谁来读它。
 const PIPED_SITES: &[PipedSite] = &[
     PipedSite {
+        file: "crates/core-supervisor/src/admitted_payload.rs",
+        anchor: "impl MacCheckInput {",
+        kind: SiteKind::Producer,
+        drain_forms: &[],
+    },
+    PipedSite {
         file: "crates/helper/src/linux_legacy_maintenance.rs",
         anchor: "fn utility(",
         kind: SiteKind::Sink,
@@ -470,11 +476,32 @@ struct Passthrough {
 /// 项必须真盖住至少一处取管道的地方，留着它反而会让本门恒红（实测过一次，正是它把红报出来的）。
 ///
 /// 机制保留：下一个真要透传的人得落进这套规则里，而不是自己新起一张没有过期检查的表。
-const PIPE_PASSTHROUGH: [Passthrough; 4] = [
-    Passthrough {file:"crates/core-supervisor/src/admitted_payload.rs",anchor:"impl StdCustodiedChild {",reason:"Private native Child transfers both readers with admitted cohort and Helper lease owners; exact dual-stream contract checked below"},
-    Passthrough {file:"crates/helper/src/platform/linux/server.rs",anchor:"fn spawn_verified(",reason:"Receives both owned readers and hands them to the existing bounded pipe loggers before publishing Child custody; exact contract checked below"},
-    Passthrough {file:"crates/helper/src/platform/macos/server.rs",anchor:"fn do_native_spawn(",reason:"Consumes both factory-owned readers, publishes the actual Child, attaches synchronous Fresh log custody before workers; exact contract checked below"},
-    Passthrough {file:"crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",anchor:"pub(in super::super) fn spawn(",reason:"Transfers exact stdout/stderr File owners with the native process/job/cohort custody after suspended admission; WinProcOps takes both and attaches Fresh logger custody synchronously, exact contract checked below"},
+const PIPE_PASSTHROUGH: [Passthrough; 5] = [
+    Passthrough {
+        file: "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
+        anchor: "pub fn macos_helper_check_request(",
+        reason: "Closed Root Check commits the opaque child into the existing registry before handing both OwnedReaders to bounded EOF threads; exact private factory/consumer/wait/join contract is checked below",
+    },
+    Passthrough {
+        file: "crates/core-supervisor/src/admitted_payload.rs",
+        anchor: "impl StdCustodiedChild {",
+        reason: "Private native Child transfers both readers with admitted cohort and Helper lease owners; exact dual-stream contract checked below",
+    },
+    Passthrough {
+        file: "crates/helper/src/platform/linux/server.rs",
+        anchor: "fn spawn_verified(",
+        reason: "Receives both owned readers and hands them to the existing bounded pipe loggers before publishing Child custody; exact contract checked below",
+    },
+    Passthrough {
+        file: "crates/helper/src/platform/macos/server.rs",
+        anchor: "fn do_native_spawn_admitted(",
+        reason: "Consumes both factory-owned readers, publishes the actual Child, attaches synchronous Fresh log custody before workers; exact contract checked below",
+    },
+    Passthrough {
+        file: "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",
+        anchor: "pub(in super::super) fn spawn(",
+        reason: "Transfers exact stdout/stderr File owners with the native process/job/cohort custody after suspended admission; WinProcOps takes both and attaches Fresh logger custody synchronously, exact contract checked below",
+    },
 ];
 
 // These are sinks owned by the one private RAII type, not pipe passthroughs
@@ -808,6 +835,16 @@ fn offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
 
 /// 该文件里被登记覆盖的全部块区间（注册表 1 + 注册表 2 + 透传表）。
 fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, usize)> {
+    if matches!(
+        rel,
+        "crates/core-supervisor/src/admitted_payload.rs"
+            | "crates/core-supervisor/src/config_gate/check_custody/macos.rs"
+    ) {
+        assert!(
+            mac_check_stdio_custody_is_complete(index),
+            "Root Check pipe/guard/actual-wait/join closure drift"
+        );
+    }
     if matches!(
         rel,
         "crates/core-supervisor/src/admitted_payload/macos.rs"
@@ -1325,6 +1362,9 @@ fn every_piped_site_is_registered_and_drains_before_it_waits() {
         }
 
         if site.kind == SiteKind::Producer {
+            if site.anchor == "impl MacCheckInput {" {
+                assert!(mac_check_stdio_custody_is_complete(&index));
+            }
             if site.file == "crates/core-supervisor/src/admitted_payload/macos.rs" {
                 assert!(
                     platform_factory_stdio_custody_is_complete(&index),
@@ -2315,6 +2355,148 @@ fn utility_child_preserves_both_readers_and_actual_child_on_all_terminal_paths()
     }
 }
 
+fn mac_check_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) -> bool {
+    let compact = |body: &str| {
+        body.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let factory = compact(block_of(
+        file_of(index, "crates/core-supervisor/src/admitted_payload.rs"),
+        "impl MacCheckInput {",
+    ));
+    for needle in [
+        "macos::require_root()?;",
+        "execution.purpose!=ExecPurpose::CheckConfig",
+        "Arc::ptr_eq(p,&execution.payload)",
+        "execution.payload.prepare(ExecPurpose::CheckConfig)?;",
+        "self.snapshot.path()?",
+        "macos::attach_store_lease(&mutcommand,&self.lease,&execution.payload.protected.lease,)?",
+        "letchild=command.spawn()?;",
+        "child:Some(child)",
+        "owner:Some(execution.payload)",
+        "lease_owner:Some(leaseasArc<dynSend+Sync>)",
+        "stdout(std::process::Stdio::piped())",
+        "stderr(std::process::Stdio::piped())",
+    ] {
+        if !factory.contains(needle) {
+            return false;
+        }
+    }
+    let remote = file_of(
+        index,
+        "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
+    );
+    let commit = compact(block_of(remote, "pub fn macos_helper_check_request("));
+    let mut previous = 0;
+    for needle in [
+        "letchild=input.spawn();",
+        "run.mac_child=Some(child)",
+        "letstdout=child.take_stdout();",
+        "letstderr=child.take_stderr();",
+        "output.read_root(stdout,false)",
+        "output.read_root(stderr,true)",
+    ] {
+        let Some(at) = commit.find(needle) else {
+            return false;
+        };
+        if at < previous {
+            return false;
+        }
+        previous = at;
+    }
+    let drain = compact(block_of(remote, "fn read_root<R:"));
+    for needle in [
+        "std::thread::Builder::new()",
+        "pipe.read(&mutbuffer)",
+        "Ok(0)=>break",
+        "OUTPUT_BYTES.saturating_sub(kept.len())",
+        "kept.extend_from_slice(&buffer[..n.min(remaining)])",
+        "overflow|=n>remaining",
+        "tasks[slot].blocking=Some(h)",
+    ] {
+        if !drain.contains(needle) {
+            return false;
+        }
+    }
+    let owner = file_of(
+        index,
+        "crates/core-supervisor/src/config_gate/check_custody.rs",
+    );
+    let wait = compact(block_of(owner, "fn poll_exit("));
+    if !wait.contains("self.mac_child.as_mut()")
+        || !wait.contains("child.try_wait()")
+        || !wait.contains("self.cache_native_exit(exit,NativeExitSource::TryWait)")
+    {
+        return false;
+    }
+    let joined = compact(block_of(owner, "async fn finished("));
+    if !joined.contains("task.blocking.as_ref().is_some_and(|h|h.is_finished())")
+        || !joined.contains("h.join()")
+    {
+        return false;
+    }
+    let retire = compact(block_of(owner, "fn retire(&self, request:"));
+    for needle in [
+        "run.validate_retirement()",
+        "run.tail.retire()",
+        "state.runs.remove(&request.id)",
+        "completion.terminal.store(true,Ordering::SeqCst)",
+    ] {
+        if !retire.contains(needle) {
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn root_check_guard_and_each_owned_stream_are_real_source_obligations() {
+    let surface = scan_surface();
+    assert!(mac_check_stdio_custody_is_complete(&surface_by_path(
+        &surface
+    )));
+    for (file, old, new) in [
+        (
+            "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
+            "output.read_root(stderr, true)",
+            "output.read_root(stdout, true)",
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload.rs",
+            "owner: Some(execution.payload)",
+            "owner: None",
+        ),
+        (
+            "crates/core-supervisor/src/config_gate/check_custody.rs",
+            "h.join()",
+            "drop(h)",
+        ),
+    ] {
+        assert!(
+            file_of(&surface_by_path(&surface), file)
+                .masked
+                .contains(old),
+            "negative control must mutate the actual bound source"
+        );
+        let mutated: Vec<Scanned> = surface
+            .iter()
+            .map(|s| Scanned {
+                rel: s.rel.clone(),
+                masked: if s.rel == file {
+                    s.masked.replace(old, new)
+                } else {
+                    s.masked.clone()
+                },
+            })
+            .collect();
+        assert!(
+            !mac_check_stdio_custody_is_complete(&surface_by_path(&mutated)),
+            "Root Check regression was not refused: {file}: {old}"
+        );
+    }
+}
+
 fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) -> bool {
     let compact = |body: &str| {
         body.chars()
@@ -2376,7 +2558,12 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
         return false;
     }
     let mac_helper = file_of(index, "crates/helper/src/platform/macos/server.rs");
-    let spawn = compact(block_of(mac_helper, "fn do_native_spawn("));
+    let gate = compact(block_of(mac_helper, "fn do_native_spawn("));
+    if !gate.contains("with_check_admission(||") || !gate.contains("self.do_native_spawn_admitted(")
+    {
+        return false;
+    }
+    let spawn = compact(block_of(mac_helper, "fn do_native_spawn_admitted("));
     for needle in [
         ".spawn_macos_root_helper_main(",
         "letstdout=child.take_stdout();",

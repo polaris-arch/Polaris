@@ -250,6 +250,7 @@ pub enum LinuxDns {
 /// [`ResponseKind::OkRaw`]（保留原文）——保证解析永不丢消息，便于协议演进期的诊断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseKind {
+    MacCheck(crate::check_config::CheckReply),
     HelperUpgradeAdmitted,
     HelperUpgradeCancelled,
     CoreStatus(crate::core_protocol::CoreStatus),
@@ -326,6 +327,9 @@ impl Response {
     /// - 其它 → [`Response::Ok`](ResponseKind::OkRaw)，token 为原文（永不丢消息，便于诊断畸形/未来协议响应）。
     #[must_use]
     pub fn parse(line: &str) -> Self {
+        if let Some(reply) = crate::check_config::CheckReply::parse(line) {
+            return Self::Ok(ResponseKind::MacCheck(reply));
+        }
         if let Some((birth_line, id)) = line.rsplit_once(" core=") {
             if let Ok(id) = crate::core_manifest::CoreId::parse(id) {
                 if birth_line.contains(" core=") {
@@ -416,6 +420,7 @@ impl Response {
 /// 把 [`ResponseKind`] 序列化为 `OK ...` wire 行（[`parse_ok`] 的反方向）。
 fn ok_kind_to_wire(kind: &ResponseKind) -> String {
     match kind {
+        ResponseKind::MacCheck(reply) => reply.to_wire(),
         ResponseKind::HelperUpgradeAdmitted => "OK helper-upgrade-admitted".into(),
         ResponseKind::HelperUpgradeCancelled => "OK helper-upgrade-cancelled".into(),
         ResponseKind::CoreStatus(status) => status.to_wire(),

@@ -33,7 +33,7 @@
  *    **那个兜底不存在**：`rules-screen.test.tsx:257` 的 `appsMarkup` 直接渲染 `AppsSegment`
  *    并把 `onPolicyPick` 打成 `() => {}` 桩，一个字都没读过容器那段 JSX。实测把容器改成
  *    `onPolicyPick={(appId) => void handleAppPolicyPick(appId, 'follow')}`（丢掉用户选的档位）：
- *    `tsc` / 全量 `vitest` / `gate-node-test.sh` / `report-wiring.sh` **一条不红**，而用户点「直连」
+ *    `tsc` / 全量 `vitest` / `gate-node-test.sh` / 当时的接线报告 **一条不红**，而用户点「直连」
  *    落库的是「跟随全局」。⇒ 现在那一格由本文件的**③ 容器 → 分段**那一组自己收：
  *    切出 `<AppsSegment` 那段 props，断言 `onPolicyPick` 逐字透传 `(appId, pick)` 两个形参。
  *  · 它不证明真机上 `addDisallowedApplication` 真的把应用踢出了隧道 —— 那归真机验收。

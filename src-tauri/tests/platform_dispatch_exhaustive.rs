@@ -175,6 +175,8 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    ("crates/helper-client/src/check_config.rs", "if self.platform() != Platform::Mac", 2,
+     "Closed Root Helper CheckConfig is Mac-only. Win/Linux/Android/iOS/Other return Unsupported before connecting; this branch grants no execution owner or ordinary fallback."),
     ("crates/helper-client/src/manager.rs", "let script = if self.platform == Platform::Linux", 1,
      "Linux uninstall carries the responsible-user baseline/config only into its finite dispatcher. Mac keeps retirement and Windows keeps the native cleaner; unsupported/mobile platforms are rejected before this site."),
     ("src-tauri/src/runtime/helper.rs", "if self.platform != Platform::Linux", 1,

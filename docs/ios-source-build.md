@@ -56,7 +56,7 @@ python3 -B scripts/mobile-core/build_apple_app.py \
 
 `ios-libbox.py build / verify / check-inputs` 默认都是 final。共同 preflight 只读比较共享 sourceCommit、Go 版本、完整有序 patch(file,sha256)、依赖来源，以及 source manifest/provider、source receipt fingerprint、module graph、GoMod/GoSum、patched tree/version 等共同 pins；它在 Darwin/tool/Git/临时 checkout/cache/patch/gomobile/输出操作或 Framework/receipt 消费之前拒绝。Apple provider/dependency adapter 与最终链接模块策略尚未实现，当前稳定报 `Apple final source inputs not migrated`。只复制九片清单甚至共同 pins 也不会放行。Apple tags、gomobile、SDK、deployment 与 linker 参数仍须独立冻结，不复制 Android 设置。
 
-两个 Xcode `Verify iOS Core` hook 保持无历史选项的默认 final 核验，因此已有六片 Framework 也不能通过当前工程的正常构建。`verify-ios-archive.py` 默认在打开 IPA 前同样拒绝未迁移的输入；外部 Framework receipt 本身不能证明它已静态链接入 IPA。
+当前 Xcode `Verify iOS Core` hook 使用 `scripts/mobile-core/consume.py verify-link`，消费固定的 `POLARIS_MOBILE_LINK_INPUT`、`POLARIS_MOBILE_LINK_INPUT_SHA256` 与 `POLARIS_MOBILE_SCRATCH`；正式组件生产入口是 `bash scripts/build-mobile-core.sh apple`。它不再调用本节的历史 verifier。`ios-libbox.py verify / check-inputs`、显式 C2/C3 诊断及 `verify-ios-archive.py` 仍按 [移动内核构建说明](../scripts/mobile-core/README.md) 保留原历史证据范围；外部 Framework receipt 本身不能证明它已静态链接入 IPA。
 
 `--historical` 仅用于受审六片复现与缓存核验。历史 manifest 与补丁 bytes 仍固定；旧 `build-only` receipt 只接受已核 producer `2c8dd8e6ad7a8b2c1906f3cf51f5a9787ebc077d7a04d110cd4b298a45f5657e` 和 shell `1768d8b0e0426ce5d036533fd6b85379e975dfb968739d69bdabea242923790e`，原 receipt 不改写。新历史构建的 receipt 标为 `historical-only` 并绑定新驱动哈希，始终不能作为 final 证据。历史归档检查仅输出 `structure-only`，不证明 source/linkage、签名或 VPN 流量。
 

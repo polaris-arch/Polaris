@@ -799,7 +799,7 @@
       "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "1ce46488102c0364412e1f9c237eab09415889397171ad1d1bcfbbcc9b69e684",
       "src-tauri/src/runtime/proxy.rs": "1cf5a04e2ac1bcca1f0a58bfdc64694e7324eb61d47c90eda40cc35c9687f0f9",
       "src-tauri/src/runtime/proxy/lifecycle.rs": "d1b139c288825f7b52a06928caafcca552fd55e77b4a81ab049990b15f5d88bf",
-      "src-tauri/src/runtime/proxy/startup.rs": "73880408f62e92922e966b02a26cf8d230037a97f157170080fe3d988e4394af",
+      "src-tauri/src/runtime/proxy/startup.rs": "0557f54df0afdbde869d47d181b5ddfd2741d4dfc3cf17e912475db71bffe2b5",
       "src-tauri/src/runtime/proxy/hot_switch.rs": "ce3cc4cf1dda2a4991c2c17da265c25cde14a3d64992b42eda366ec92d8b6a32",
       "src-tauri/src/runtime/proxy/recovery.rs": "4f9a9b11d902db65d472efdeea2a530114f6b95cee03fe661c5401cc8a61d659",
       "src-tauri/src/runtime/proxy/network_monitor.rs": "a69d5d92271f42172a63ff4739ec0d79615d3d538cc628cf0b38af7d16df1e71",

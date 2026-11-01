@@ -97,8 +97,8 @@
  *    把 `mobileSettings.backup.pickerPending` 那句话删掉、把两颗按钮也一起删掉，这道门会**变绿**，
  *    而备份导出依然没接。这是本门结构性的天花板，不是可以调参修好的疏漏。
  *    ⇒ 补这一格的是**另一道门**：`half-truth-facts.test.ts` 那种「断言那条能力今天确实在」的
- *      正面事实断言。本门与它是一对，缺任何一半都留着一条绕行路 —— 故 `scripts/report-wiring.sh`
- *      **两个文件一起跑**，rc=0 要求两边同时绿（第一版只跑本文件，实测删掉 dialog 插件注册后
+ *      正面事实断言。本门与它是一对，缺任何一半都留着一条绕行路 —— 必须
+ *      **两个文件一起跑**，Vitest rc=0 要求两边同时绿（早期报告壳只跑本文件，实测删掉 dialog 插件注册后
  *      半真门当场红而报告一个字不变、照样会在清零那天宣布「全部接线达成」）。
  * 2. **守不住「从来没画过的功能」**：桌面有、移动端一行都没写、也没人登记 —— 它不在任何一面上。
  *    兜这一格的是「拿桌面那一侧与登记表逐条对差」的另一族门，本门不重复实现、也**不假装**覆盖：
@@ -120,19 +120,18 @@
  *
  * # 怎么跑（一条命令拿到「还剩几条、分别是哪些」）
  *
- *     bash scripts/report-wiring.sh
+ *     cd ui
+ *     POLARIS_WIRING_REPORT=1 pnpm exec vitest run --silent=false --reporter=verbose src/mobile/wiring-completeness.test.ts src/mobile/half-truth-facts.test.ts
  *
- * 退出码语义与「债务变了怎么办」都在 `scripts/wiring-verdict.mjs`（它自己带测试）。
+ * 直接保留 Vitest 的真实退出码；两份事实门与下方精确债务棘轮共同判定，不再由报告壳翻译结果。
  *
- * # 今天这道门**必然是红的**，以及它是怎么被显式标成「已知红」的
+ * # 完成门与已知债务的历史模式
  *
- * 清零断言的强度由 `COMPLETION_GATE_MODE` 一个常量控制，并**打进报告 marker**：
- *  · `known-red`（今天）：写成 `it.fails` —— 今天按预期失败 ⇒ 默认 suite 仍然绿，不会拿一片红
+ * 清零断言的强度由 `COMPLETION_GATE_MODE` 一个常量控制：
+ *  · `known-red`（历史模式）：写成 `it.fails` —— 按预期失败 ⇒ 默认 suite 仍然绿，不会拿一片红
  *    把别的门淹掉；**债务清零的那一天它会反过来变红**（vitest 报「expected test to fail」）。
  *  · `hard`：普通 `it` —— 从此是一道硬门。
- * 把 marker 打进输出是为了让 `scripts/report-wiring.sh` **不靠猜 vitest 的措辞**就能说出
- * 「现在该把 COMPLETION_GATE_MODE 改成 hard 了」，并且改完之后那条路真的能走到 rc=0
- * （第一版那条提示是死循环：它叫人去删 `.fails`，删了之后脚本仍然退 2、仍然打同一句话）。
+ * 当前值为 `hard`；完成门和精确债务基线仍由下方真实断言执行，报告输出不代替断言。
  *
  * 同时，默认 suite 里压着一条**精确棘轮**：断言的是**债务 id 的有序集合**（`WIRING_DEBT_BASELINE_IDS`），
  * 不是个数。第一版只比个数，于是「拆掉一颗死控件的写死形态（−1）+ 新交付一颗死按钮（+1）」这种
@@ -1391,7 +1390,7 @@ describe('移动端接线完成度', () => {
         !/\.(?:test|spec)\.tsx?$/.test(file) && file !== SELF;
       /* 🔴 2026-09-25 收窄第二个特征（`reasonKey`），并补一条等价的第三特征。
          起因：`domain/network-profile.ts`（网络场景的**运行期显示态**）同时含 `kind: 'unavailable'` /
-         `state: 'missing'` 与 `reasonKey`，被认成第六张处置表 ⇒ `report-wiring.sh` rc=2。它不是表：
+         `state: 'missing'` 与 `reasonKey`，被认成第六张处置表 ⇒ 事实门失败。它不是表：
          它的 `reasonKey` 只以两种形态出现 —— **类型注解**（`reasonKey: string`）与**运行期算出来的值**
          （`reasonKey: probeReasonKey(hit.reason)`）。处置表的 `reasonKey` 是**登记**：写死的键
          （字面量 / 常量 / 简写属性）。故第二特征改成「`reasonKey` 以数据形态出现」，排掉那两种形态。
@@ -1935,12 +1934,9 @@ describe('移动端接线完成度', () => {
   });
 
   describe('④ 债务账本', () => {
-    it('报告（一条命令的输出体；逐条清单见 scripts/report-wiring.sh）', () => {
-      // 摘要与 marker 恒打印；逐条清单只在 POLARIS_WIRING_REPORT=1 时展开，
-      // 免得默认 suite 每跑一次刷三十行。marker 是 scripts/wiring-verdict.mjs 判 rc 的唯一依据。
+    it('报告（取材面与债务摘要）', () => {
+      // 摘要恒打印；逐条清单只在 POLARIS_WIRING_REPORT=1 时展开。
       console.log(renderReport());
-      console.log(`WIRING_COMPLETION_GATE=${COMPLETION_GATE_MODE}`);
-      console.log(`WIRING_DEBT_TOTAL=${DEBT.length}`);
       expect(ALL_FACE_ITEMS.length, '取材面为空 ⇒ 报告没有信息量').toBeGreaterThan(0);
     });
 

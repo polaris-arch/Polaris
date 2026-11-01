@@ -1,12 +1,12 @@
 {
   "coreSource": {
-    "commit": "402f855858cead86d2ded3134a3bc77dfb0e4e26",
-    "tree": "9acb2bdc6fd4ff7f74aee010a590c806b00da04b"
+    "commit": "c87159cc6a7ec82138132b2f24fd4e0be4d9d1fa",
+    "tree": "d3529920b636dd548d71be380a981f46e8fa739c"
   },
   "goVersion": "go1.27.2",
   "producerSource": {
-    "commit": "37ede2e4e2f8c599855a002f6b4579e73eba5d9e",
-    "tree": "835276075e2fd2eabe0864fd3b590323bf1a8cb3"
+    "commit": "c87159cc6a7ec82138132b2f24fd4e0be4d9d1fa",
+    "tree": "d3529920b636dd548d71be380a981f46e8fa739c"
   },
   "schema": "polaris-local-development-source-v1",
   "sidecar": {
@@ -35,5 +35,5 @@
     "with_purego"
   ],
   "target": "linux/amd64",
-  "version": "1.15.0-polaris-dev.402f85585"
+  "version": "1.15.0-polaris-dev.c87159cc6"
 }

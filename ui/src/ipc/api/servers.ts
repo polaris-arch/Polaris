@@ -1,4 +1,5 @@
 import type { IdentityConflicts, IdentityRepairRequest, IdentityRepairReceipt } from '@/domain/identity-repair/model';
+import i18n from '@/i18n';
 import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { ServerConfig } from '../../contracts/types';
@@ -174,7 +175,7 @@ export const serverApi = {
 
   async identityConflicts(): Promise<IdentityConflicts> {
     const preview = await invoke<unknown>(IPC_CHANNELS.SERVER_IDENTITY_CONFLICTS);
-    if (!isIdentityConflicts(preview)) throw new Error('Invalid identity conflict preview');
+    if (!isIdentityConflicts(preview)) throw new Error(i18n.t('identityRepair.loadFailed'));
     return preview;
   },
   async identityRepair(request: IdentityRepairRequest): Promise<IdentityRepairReceipt> {

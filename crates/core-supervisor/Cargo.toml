@@ -25,6 +25,9 @@ rustix = { version = "1.1.4", features = ["fs", "process", "event"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31.3", features = ["fs"] }
+# The existing typed client is consumed inside the existing validation registry;
+# a caller-supplied boolean/owner callback cannot retire a remote Check producer.
+polaris-helper-client = { path = "../helper-client" }
 
 # Windows 进程接口：作业对象（直起的核随主程序一起结束）与孤儿清扫的进程枚举 / 命令行读取。
 # 与 helper / src-tauri 同一个 windows-sys 版本；仅 cfg(windows) 参与编译。

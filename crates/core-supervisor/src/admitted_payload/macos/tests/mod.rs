@@ -55,12 +55,12 @@ fn root_scope_cannot_be_selected_by_an_ordinary_input_or_purpose() {
     }
 }
 #[test]
-fn root_policy_is_exactly_main_and_five_fields() {
+fn root_policy_is_exactly_check_main_and_five_fields() {
     let source = "a".repeat(40);
     let tree = "b".repeat(40);
     let valid = serde_json::json!({"schema":"polaris-trusted-execution-v1",
         "sourceCommit":source,"sourceTree":tree,"loader":"macos-root-private-v1",
-        "purposes":["run-main-v1"]});
+        "purposes":["check-config-v1","run-main-v1"]});
     assert!(SelectedPolicy::declaration(&valid, &source, &tree, "mac-arm64").is_ok());
     for platform in ["mac-arm64", "mac-x64"] {
         for loader in ["linux-sealed-fd-v1", "macos-path-v1", ""] {
@@ -70,6 +70,8 @@ fn root_policy_is_exactly_main_and_five_fields() {
         }
         for purposes in [
             serde_json::json!([]),
+            serde_json::json!(["run-main-v1"]),
+            serde_json::json!(["run-main-v1", "check-config-v1"]),
             serde_json::json!(["run-main-v1", "run-login-v1"]),
             serde_json::json!(["check-config-v1"]),
             serde_json::json!(["run-main-v1", "run-main-v1"]),

@@ -79,10 +79,12 @@ use polaris_config_engine::user_config::ProxyModeType;
 use polaris_core_supervisor::port_bookkeeping::{
     FreePortProvider, PrimaryApiPortLedger, ResolvedPort, TokioPortProvider,
 };
+#[cfg(not(target_os = "macos"))]
+use polaris_core_supervisor::run_config_check;
 use polaris_core_supervisor::{
-    core_ready_budget_ms, core_startup_estimate_ms, decide_peel, run_config_check,
-    wait_for_core_ready, CoreReadyDeps, CoreReadyOutcome, KernelRejection, PeelStep, PortAllocator,
-    PortExclusions, RejectedArray, StdioPolicy, WaitForCoreReadyOptions, CORE_STARTUP_PER_NAIVE_MS,
+    core_ready_budget_ms, core_startup_estimate_ms, decide_peel, wait_for_core_ready,
+    CoreReadyDeps, CoreReadyOutcome, KernelRejection, PeelStep, PortAllocator, PortExclusions,
+    RejectedArray, StdioPolicy, WaitForCoreReadyOptions, CORE_STARTUP_PER_NAIVE_MS,
     INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
 };
 use polaris_helper_proto::Platform;
@@ -4338,8 +4340,18 @@ impl ProxyRuntime {
         if let Some(verdict) = self.business_kernel_check_result(binary, config) {
             return verdict;
         }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = binary; // Core identity comes from the compiled selection, not this data path.
+            return self
+                .helper
+                .check_config(config)
+                .await
+                .map(polaris_core_supervisor::config_gate::decide_verdict);
+        }
         // The default in every build still requires the sole real admission
         // factory. A mock verdict is neither a Prepared nor a native birth.
+        #[cfg(not(target_os = "macos"))]
         run_config_check(
             crate::runtime::core_identity::prepare(
                 binary,

@@ -32,6 +32,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod check_config;
 pub mod client;
 pub mod connector;
 pub mod manager;

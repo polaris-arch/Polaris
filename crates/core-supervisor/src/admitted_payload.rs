@@ -290,11 +290,11 @@ impl SelectedPolicy {
         }
         if matches!(platform, "mac-arm64" | "mac-x64")
             && (loader != "macos-root-private-v1"
-                || policy["purposes"] != serde_json::json!(["run-main-v1"]))
+                || policy["purposes"] != serde_json::json!(["check-config-v1", "run-main-v1"]))
         {
             return Err(AdmissionError::new(
                 AdmissionErrorKind::LoaderPolicy,
-                "Mac private execution is limited to root Helper RunMain",
+                "Mac private execution requires exact root Helper CheckConfig/RunMain purposes",
             ));
         }
         let declared = policy["purposes"].as_array().ok_or_else(|| {
@@ -415,9 +415,8 @@ static SLOT: OnceLock<Mutex<Option<Arc<AdmittedPayload>>>> = OnceLock::new();
 pub fn check_selected_capability(purpose: ExecPurpose) -> Result<(), AdmissionError> {
     #[cfg(target_os = "macos")]
     {
-        let mut error = AdmissionError::unsupported_exact_object();
-        error.purpose = Some(purpose);
-        Err(error)
+        // A compiled hint describes the Root Helper route, never an ordinary owner.
+        check_macos_root_helper_capability(purpose)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -428,6 +427,21 @@ pub fn check_selected_capability(purpose: ExecPurpose) -> Result<(), AdmissionEr
                 e
             })
     }
+}
+/// Static capability only. Actual preparation still requires the closed Root provider.
+#[cfg(target_os = "macos")]
+pub fn check_macos_root_helper_capability(purpose: ExecPurpose) -> Result<(), AdmissionError> {
+    if !matches!(purpose, ExecPurpose::CheckConfig | ExecPurpose::RunMain) {
+        let mut error = AdmissionError::unsupported_exact_object();
+        error.purpose = Some(purpose);
+        return Err(error);
+    }
+    SelectedPolicy::compiled()
+        .and_then(|p| p.allows(purpose))
+        .map_err(|mut e| {
+            e.purpose = Some(purpose);
+            e
+        })
 }
 pub fn invalidate_selected() {
     invalidate_slot(SLOT.get_or_init(Default::default));
@@ -743,6 +757,26 @@ impl PreparedExecution {
 }
 #[cfg(target_os = "macos")]
 impl PreparedExecution {
+    pub(crate) fn macos_check_input(
+        self,
+        lease: &std::fs::File,
+    ) -> Result<MacCheckInput, AdmissionError> {
+        macos::require_root()?;
+        if self.purpose != ExecPurpose::CheckConfig || !self.payload.candidate.root_helper {
+            return Err(AdmissionError::unsupported_exact_object());
+        }
+        self.payload.prepare(self.purpose)?;
+        // Reuse the existing independently verified shared-occupancy primitive.
+        // This command is never spawned; no caller-supplied owner is accepted.
+        let mut command = self.payload.protected.root_command()?;
+        let lease = macos::attach_store_lease(&mut command, lease, &self.payload.protected.lease)?;
+        let snapshot = self.payload.protected.check_snapshot()?;
+        Ok(MacCheckInput {
+            execution: Some(self),
+            snapshot,
+            lease,
+        })
+    }
     /// Data arguments are limited to the existing Helper run/config/log path.
     /// No mutable command or environment escapes this purpose-bound factory.
     pub fn spawn_macos_root_helper_main(
@@ -781,6 +815,7 @@ impl PreparedExecution {
             ));
         }
         self.payload.prepare(self.purpose)?;
+        self.payload.protected.check_debt_absent()?;
         let mut command = self.payload.protected.root_command()?;
         macos::configure_main_command(&mut command, config, working_directory, pipe);
         let native_lease =
@@ -794,6 +829,74 @@ impl PreparedExecution {
             lease_owner: Some(lease_owner),
         })
     }
+}
+
+/// No public constructor, raw Child extraction or erased-owner substitution.
+#[cfg(target_os = "macos")]
+pub(crate) struct MacCheckInput {
+    execution: Option<PreparedExecution>,
+    snapshot: macos::CheckSnapshot,
+    lease: Arc<std::fs::File>,
+}
+#[cfg(target_os = "macos")]
+impl MacCheckInput {
+    pub(crate) fn append(&mut self, offset: usize, bytes: &[u8]) -> Result<(), AdmissionError> {
+        self.snapshot.append(offset, bytes)
+    }
+    pub(crate) fn seal(&mut self, len: usize, digest: &[u8; 32]) -> Result<(), AdmissionError> {
+        self.snapshot.seal(len, digest)
+    }
+    pub(crate) fn retire(&mut self) -> Result<(), AdmissionError> {
+        self.snapshot.retire()
+    }
+    pub(crate) fn spawn(&mut self) -> Result<StdCustodiedChild, AdmissionError> {
+        macos::require_root()?;
+        let execution = self
+            .execution
+            .take()
+            .ok_or_else(AdmissionError::unsupported_exact_object)?;
+        let slot = SLOT.get_or_init(Default::default).lock().map_err(|_| {
+            AdmissionError::new(
+                AdmissionErrorKind::Unknown,
+                "admission slot poisoned before Check birth",
+            )
+        })?;
+        if execution.purpose != ExecPurpose::CheckConfig
+            || !execution.payload.candidate.root_helper
+            || !slot
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(p, &execution.payload))
+        {
+            return Err(AdmissionError::unsupported_exact_object());
+        }
+        execution.payload.prepare(ExecPurpose::CheckConfig)?;
+        let mut command = execution.payload.protected.root_command()?;
+        command
+            .args(["--disable-color", "check", "-c"])
+            .arg(self.snapshot.path()?)
+            .current_dir("/")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let lease = macos::attach_store_lease(
+            &mut command,
+            &self.lease,
+            &execution.payload.protected.lease,
+        )?;
+        execution.payload.prepare(ExecPurpose::CheckConfig)?;
+        let child = command.spawn()?;
+        Ok(StdCustodiedChild {
+            child: Some(child),
+            owner: Some(execution.payload),
+            lease_owner: Some(lease as Arc<dyn Send + Sync>),
+        })
+    }
+}
+
+/// A fixed private input left by a dead daemon is Unknown, never auto-recovered.
+#[cfg(target_os = "macos")]
+pub fn assert_macos_root_check_idle(store: &Path) -> Result<(), AdmissionError> {
+    macos::require_check_debt_absent(store)
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct StdCustodiedChild {

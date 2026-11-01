@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import type { ServerConfig } from '@/contracts/types';
 import type { IdentityConflicts } from '@/domain/identity-repair/model';
+import i18n, { i18nReady, syncLanguageChoice } from '@/i18n';
 
 const invoke = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<unknown>>());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
 const { serverApi } = await import('./servers');
+await i18nReady;
 beforeEach(() => {
   invoke.mockReset().mockResolvedValue({ 'ts-1': false });
   vi.stubGlobal('window', { __TAURI_INTERNALS__: {} });
@@ -104,7 +106,7 @@ describe('identity preview through the real non-void IPC boundary', () => {
       { version: 'v', groups: [group, group] }];
     for (const data of invalid) {
       invoke.mockResolvedValue({ success: true, data });
-      await expect(serverApi.identityConflicts()).rejects.toThrow('Invalid identity conflict preview');
+      await expect(serverApi.identityConflicts()).rejects.toThrow(i18n.t('identityRepair.loadFailed'));
     }
     expect(invoke.mock.calls.every(([command]) => command === IPC_CHANNELS.SERVER_IDENTITY_CONFLICTS)).toBe(true);
   });
@@ -112,7 +114,7 @@ describe('identity preview through the real non-void IPC boundary', () => {
   it('routes the real plain-browser unavailable result into rejection, not a false clear state', async () => {
     vi.stubGlobal('window', {});
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await expect(serverApi.identityConflicts()).rejects.toThrow('Invalid identity conflict preview');
+    await expect(serverApi.identityConflicts()).rejects.toThrow(i18n.t('identityRepair.loadFailed'));
     expect(invoke).not.toHaveBeenCalled();
     expect(warning).toHaveBeenCalledOnce();
   });
@@ -128,9 +130,30 @@ describe('identity preview through the real non-void IPC boundary', () => {
     });
   });
 
+  it('uses the selected locale for invalid previews, including after a language change', async () => {
+    const previousLanguage = i18n.language;
+    const messages: string[] = [];
+    try {
+      for (const language of ['en-US', 'zh-CN'] as const) {
+        syncLanguageChoice(language);
+        await vi.waitFor(() => expect(i18n.language).toBe(language));
+        const message = i18n.t('identityRepair.loadFailed');
+        expect(message).not.toBe('identityRepair.loadFailed');
+        messages.push(message);
+        invoke.mockResolvedValueOnce({ success: true, data: undefined });
+        await expect(serverApi.identityConflicts()).rejects.toThrow(message);
+        expect(invoke).toHaveBeenLastCalledWith(IPC_CHANNELS.SERVER_IDENTITY_CONFLICTS, {});
+      }
+      expect(messages[0]).not.toBe(messages[1]);
+    } finally {
+      syncLanguageChoice(previousLanguage);
+      await vi.waitFor(() => expect(i18n.language).toBe(previousLanguage));
+    }
+  });
+
   it('keeps an unrelated native void success legal through that same actual unwrap', async () => {
     invoke.mockResolvedValue({ success: true });
     await expect(serverApi.update({ id: 'unchanged', protocol: 'socks' } as ServerConfig)).resolves.toBeUndefined();
-    await expect(serverApi.identityConflicts()).rejects.toThrow('Invalid identity conflict preview');
+    await expect(serverApi.identityConflicts()).rejects.toThrow(i18n.t('identityRepair.loadFailed'));
   });
 });

@@ -832,7 +832,7 @@ describe('④ Tailscale 登录：URL 与登录态都只**读** store，不在面
  * 上面每一组都只覆盖到「函数体」为止：规格函数返回什么、判据函数怎么判、面板里出现过哪个名字。
  * 三条复审各自实测的变异全部落在**调用点把什么喂给它**这一跳，而那一跳一条门都没有：
  *  · `MeshJoinPanel` 的 `open(target)` → `open({ kind: 'node' })`：五个组网选择全开成通用节点表，
- *    三张表全废 —— tsc rc=0、全量 vitest 0 红、`report-wiring.sh` 数字一字不变；
+ *    三张表全废 —— tsc rc=0、全量 vitest 0 红、当时的接线报告数字一字不变；
  *  · `WarpPanel` 的 `fields={spec}` → `fields={spec.filter(…)}`：WARP 表静默丢掉前置代理与出口
  *    网卡两个控件 —— 九个门 418 条全绿；
  *  · `TsSettingsPanel` 的 `exitNodeOptions(peers, …)` → `(peers.slice(0, 0), …)`：出口设备下拉

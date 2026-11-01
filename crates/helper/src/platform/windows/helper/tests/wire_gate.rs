@@ -30,6 +30,9 @@ macro_rules! request_samples {
 }
 
 request_samples! {
+    MacCheck => Request::MacCheck(polaris_helper_proto::check_config::CheckRequest::Begin {
+        core:polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(), bytes:2,sha256:[0;32],
+    }),
     PrepareHelperUpgrade => Request::PrepareHelperUpgrade,
     CancelHelperUpgrade => Request::CancelHelperUpgrade,
     CoreStatus => Request::CoreStatus { id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap() },
