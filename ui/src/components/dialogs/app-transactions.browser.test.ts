@@ -982,6 +982,41 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     }));
   }
 
+  for (const theme of ['light', 'dark'] as const) it(`node menu footer has filled secondary actions in ${theme}`, async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({ locale: 'en-US', colorScheme: theme });
+    await openFixture(page, origin + '/__transactions?mode=node-menu&initialGroups=1');
+    await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+    // Resolve the existing palette in the real browser; do not hard-code a second
+    // theme or replace the production CSS with fixture rules.
+    const palette = await page.evaluate(() => {
+      const probe = document.createElement('meta');
+      document.head.appendChild(probe);
+      const tone = (token: string) => { probe.style.color = `hsl(var(${token}))`; return getComputedStyle(probe).color; };
+      const colors = { fill: tone('--surface-2'), hover: tone('--surface-3'), text: tone('--fg'), ring: tone('--ring') };
+      probe.remove();
+      return colors;
+    });
+    const buttons = page.locator('.nm-foot button');
+    expect(await buttons.count()).toBe(2);
+    const menuFill = await page.locator('.node-menu').evaluate(el => getComputedStyle(el).backgroundColor);
+    for (const button of await buttons.all()) {
+      expect(await button.evaluate(el => getComputedStyle(el).backgroundColor)).toBe(palette.fill);
+      expect(await button.evaluate(el => getComputedStyle(el).color)).toBe(palette.text);
+    }
+    expect(palette.fill).not.toBe(menuFill);
+    await buttons.first().hover();
+    await expect.poll(() => buttons.first().evaluate(el => getComputedStyle(el).backgroundColor)).toBe(palette.hover);
+    await buttons.first().focus();
+    await page.keyboard.press('Tab');
+    expect(await buttons.last().evaluate(el => el.matches(':focus-visible'))).toBe(true);
+    await expect.poll(() => buttons.last().evaluate(el => getComputedStyle(el).outlineColor)).toBe(palette.ring);
+    expect(await buttons.last().evaluate(el => getComputedStyle(el).outlineWidth)).toBe('2px');
+    await buttons.first().evaluate(el => { (el as HTMLButtonElement).disabled = true; });
+    await expect.poll(() => buttons.first().evaluate(el => getComputedStyle(el).opacity)).toBe('0.5');
+    expect(await buttons.first().evaluate(el => getComputedStyle(el).pointerEvents)).toBe('none');
+    await page.close();
+  }));
+
   it('node menu first committed render already expands the selected group', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=node-menu&initialGroups=1');

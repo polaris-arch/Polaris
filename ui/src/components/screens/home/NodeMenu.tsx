@@ -315,12 +315,12 @@ function OpenNodeMenu({
       <div className="nm-foot">
         <button
           type="button"
-          className="btn ghost sm"
+          className="btn sm"
           onClick={() => onTestAll(filteredGroups.flatMap((g) => g.servers.map((s) => s.id)))}
         >
           <span>{t('nodes.testAll')}</span>
         </button>
-        <button type="button" className="btn ghost sm" onClick={onManage}>
+        <button type="button" className="btn sm" onClick={onManage}>
           <span>{t('home.manageNodesArrow')}</span>
         </button>
       </div>
