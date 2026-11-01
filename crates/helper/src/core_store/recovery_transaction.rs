@@ -173,7 +173,7 @@ pub(super) enum RepairOutcome {
 impl RepairOutcome {
     /// Parent adapter: NoPendingJournal means continue preparation, not success.
     /// A committed repair with retirement debt stays an explicit error at the
-    /// old io::Result<InstallOutcome> boundary; no clean result is fabricated.
+    /// old `io::Result<InstallOutcome>` boundary; no clean result is fabricated.
     pub(super) fn into_install_result(self) -> io::Result<super::InstallOutcome> {
         match self {
             Self::Installed { .. } => Ok(super::InstallOutcome::Installed),

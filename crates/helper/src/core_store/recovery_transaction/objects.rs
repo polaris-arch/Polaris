@@ -304,35 +304,36 @@ impl<'a> Namespace<'a> {
         if self.identity_at(path, true)? != *directory {
             return Err(invalid("draft directory replaced"));
         }
-        let mut held = crate::core_objects::PayloadDir::open(path, self.store.owner.uid)?;
-        for name in held.entry_names(2)? {
-            let name = name
-                .to_str()
-                .ok_or_else(|| invalid("invalid draft member"))?;
-            let (_, expected) = records
-                .iter()
-                .find(|(key, _)| *key == name)
-                .ok_or_else(|| invalid("foreign draft member"))?;
-            let expected =
-                expected.ok_or_else(|| invalid("draft member has no creation identity"))?;
-            if self.identity_at(&path.join(name), false)? != *expected {
-                return Err(invalid("draft member replaced"));
-            }
-        }
-        for (name, expected) in records {
-            let file = path.join(name);
-            if exists(&file)? {
-                let expected = expected.ok_or_else(|| invalid("unknown draft member"))?;
-                self.check()?;
-                if self.identity_at(&file, false)? != *expected {
-                    return Err(invalid("draft member replaced before removal"));
+        {
+            let mut held = crate::core_objects::PayloadDir::open(path, self.store.owner.uid)?;
+            for name in held.entry_names(2)? {
+                let name = name
+                    .to_str()
+                    .ok_or_else(|| invalid("invalid draft member"))?;
+                let (_, expected) = records
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .ok_or_else(|| invalid("foreign draft member"))?;
+                let expected =
+                    expected.ok_or_else(|| invalid("draft member has no creation identity"))?;
+                if self.identity_at(&path.join(name), false)? != *expected {
+                    return Err(invalid("draft member replaced"));
                 }
-                fs::remove_file(file)?;
             }
+            for (name, expected) in records {
+                let file = path.join(name);
+                if exists(&file)? {
+                    let expected = expected.ok_or_else(|| invalid("unknown draft member"))?;
+                    self.check()?;
+                    if self.identity_at(&file, false)? != *expected {
+                        return Err(invalid("draft member replaced before removal"));
+                    }
+                    fs::remove_file(file)?;
+                }
+            }
+            // PayloadDir can deny delete sharing on some systems. Keep it through
+            // enumeration and member removal, then release it before rmdir.
         }
-        // PayloadDir can deny delete sharing on some systems. It is no longer
-        // needed after the bounded enumeration; release it before rmdir.
-        drop(held);
         if self.anchors.iter().any(|anchor| anchor.path == path) {
             self.release_anchor(path)?;
         }
@@ -537,13 +538,8 @@ pub(super) fn leaf(value: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(super) fn open_nofollow(path: &Path, directory: bool) -> io::Result<File> {
-    if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no protected repair object API",
-        ));
-    }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -579,6 +575,14 @@ pub(super) fn open_nofollow(path: &Path, directory: bool) -> io::Result<File> {
     {
         options.open(path)
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(super) fn open_nofollow(_path: &Path, _directory: bool) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no protected repair object API",
+    ))
 }
 
 #[cfg(unix)]

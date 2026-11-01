@@ -536,6 +536,12 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'crates/core-supervisor/src/admitted_payload/unsupported.rs': {
+    why: 'The generic non-desktop admission fallback is compiled into the APK Rust cdylib. '
+      + 'Android-minus-host dep-info includes this exact source; iOS also uses the fallback. '
+      + 'Changes affect the packaged availability/refusal implementation and require the APK build leg. '
+      + 'This registration does not grant execution or turn the fallback into an Android-specific executor.',
+  },
   'src-tauri/src/runtime/core_version.rs': {
     why: 'Android default HTTP UA and bundled-version displays embed the mobile producer contract through this module. '
       + 'Its Android cfg branch and include_str input enter the APK Rust cdylib; changes retain Android compilation/linking and packaging. '

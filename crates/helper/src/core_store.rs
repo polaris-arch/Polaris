@@ -552,7 +552,7 @@ fn store_admission_failure(error: io::Error) -> io::Error {
         error.kind(),
         io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
     );
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let structural = structural
         || matches!(
             error.raw_os_error(),

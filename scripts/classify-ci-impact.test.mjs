@@ -8,6 +8,7 @@ import {
   ALL_PACKAGE_PLATFORMS,
   ANDROID_IMPACT_SCOPES,
   NO_PACKAGE_IMPACT_SCOPES,
+  androidRegistrationOf,
   classifyImpact,
   classifyNativeImpact,
   classifyNativeCiEvent,
@@ -524,6 +525,28 @@ test('Android lifecycle observations are explicitly registered for APK validatio
   assert(Object.hasOwn(ANDROID_IMPACT_SCOPES, path));
   assert.match(ANDROID_IMPACT_SCOPES[path].why, /APK Rust cdylib/);
   assert.equal(classifyImpact([path]).android, true);
+});
+
+test('the shared non-desktop admission fallback explicitly selects APK validation', () => {
+  const path = 'crates/core-supervisor/src/admitted_payload/unsupported.rs';
+  assert.deepEqual(androidRegistrationOf(path), { key: path, table: 'ANDROID_IMPACT_SCOPES' });
+  assert.match(ANDROID_IMPACT_SCOPES[path].why, /APK Rust cdylib/);
+  assert.equal(classifyImpact([path]).android, true);
+  assert.deepEqual(compact([path]), {
+    kernel: false, platforms: [], preflight: false, hasPackage: false,
+  });
+});
+
+test('the fallback registration does not widen the supervisor directory or match a backup suffix', () => {
+  for (const path of [
+    'crates/core-supervisor/src/admitted_payload/linux.rs',
+    'crates/core-supervisor/src/admitted_payload/macos.rs',
+    'crates/core-supervisor/src/admitted_payload/windows.rs',
+    'crates/core-supervisor/src/admitted_payload/unsupported.rs.bak',
+  ]) {
+    assert.equal(androidRegistrationOf(path), null, path);
+    assert.equal(classifyImpact([path]).android, false, path);
+  }
 });
 
 // External device tooling does not participate in the product packaging graph.

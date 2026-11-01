@@ -1,7 +1,8 @@
-import { chromium, type Browser, type Page } from '@playwright/test';
+import { chromium, type Browser, type BrowserContext, type Page } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import path from 'node:path';
-import { beforeAll, afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, afterAll, afterEach, describe, expect, it, vi, type TestContext } from 'vitest';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import type { ServerConfig } from '@/contracts/types';
 import { RUNTIME_APPLY_POLL_INTERVAL_MS } from '@/components/layout/runtime-apply-polling';
 import enUS from '@/i18n/locales/en-US.json';
@@ -10,6 +11,249 @@ import fa from '@/i18n/locales/fa.json';
 
 type FixtureLanguage = 'en-US' | 'zh-CN' | 'fa';
 const fixtureCopy = { 'en-US': enUS, 'zh-CN': zhCN, fa };
+
+const CASE_BUDGET_MS = 5_000;
+const CLEANUP_BUDGET_MS = 4_000;
+const EVIDENCE_BUDGET_MS = 250;
+const fixtureCases = new Map<string, FixtureCase>();
+const browserCases = new WeakMap<Browser, Set<FixtureCase>>();
+const pageCases = new WeakMap<Page, FixtureCase>();
+const ownedBrowsers = new WeakMap<Browser, FixtureCase>();
+
+// A race here only bounds observation. Cancellation always closes the real
+// context; an unobserved completion remains owned and blocks later admission.
+async function observeUntil<T>(work: Promise<T>, deadline: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const result = work.then(value => ({ settled: true as const, value }), () => ({ settled: true as const, failed: true as const }));
+  try {
+    return await Promise.race([result, new Promise<{ settled: false }>(resolve => {
+      timer = setTimeout(() => resolve({ settled: false }), Math.max(0, deadline - performance.now()));
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+class FixtureCase {
+  readonly started = performance.now();
+  readonly deadline = this.started + CASE_BUDGET_MS;
+  readonly contexts = new Map<BrowserContext, { closed: boolean; closeSettled: boolean; close?: Promise<void> }>();
+  readonly pending = new Set<Promise<unknown>>();
+  readonly errors: string[] = [];
+  readonly phases: Record<string, unknown>[] = [];
+  readonly browser: Browser;
+  bodySettled = false;
+  cancelled = false;
+  finishing = false;
+  mode: string | null = null;
+  enabled: boolean | null = null;
+  previewCalls: number | null = null;
+  hasPayload: boolean | null = null;
+  evidence: 'not-requested' | 'complete' | 'missing' | 'expired' = 'not-requested';
+  private body: Promise<unknown> = Promise.resolve();
+  private timer: ReturnType<typeof setTimeout>;
+  private readonly proxies = new WeakMap<object, object>();
+  private readonly onAbort = () => this.cancel();
+
+  constructor(readonly id: string, readonly name: string, readonly signal: AbortSignal, readonly real: Browser) {
+    const siblings = browserCases.get(real) ?? new Set<FixtureCase>();
+    browserCases.set(real, siblings);
+    this.browser = new Proxy(real, { get: (target, key) => {
+      if (key === 'newPage') return (options?: Parameters<Browser['newPage']>[0]) => this.newPage(options);
+      if (key === 'newContext') return (options?: Parameters<Browser['newContext']>[0]) => this.ownedContext(options);
+      if (key === 'contexts') return () => { this.fence(); return [...this.contexts].filter(([, value]) => !value.closed).map(([context]) => this.contextView(context)); };
+      if (key === 'close') return () => { throw new Error('fixture-suite-browser-not-case-owned'); };
+      const value = Reflect.get(target, key, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    ownedBrowsers.set(this.browser, this);
+    this.timer = setTimeout(() => this.cancel(), Math.max(0, this.remaining()));
+    signal.addEventListener('abort', this.onAbort, { once: true });
+    this.record('case', 'start');
+    // A previous timed-out body cannot obtain a page under this case's identity.
+    if ([...siblings].some(scope => !scope.drained())) this.errors.push('fixture-previous-case-unsettled');
+    siblings.add(this);
+    if (signal.aborted) this.cancel();
+  }
+
+  remaining() { return Math.max(0, this.deadline - performance.now()); }
+  record(phase: string, event: string, at = performance.now()) {
+    if (this.phases.length === 48) this.phases.shift();
+    this.phases.push({ phase, event, atMs: at - this.started, remainingMs: Math.max(0, this.deadline - at), mode: this.mode, enabled: this.enabled });
+  }
+  snapshot() {
+    return { caseId: this.id, caseName: this.name, budgetMs: CASE_BUDGET_MS, mode: this.mode, enabled: this.enabled,
+      previewCalls: this.previewCalls, hasPayload: this.hasPayload, aborted: this.cancelled, bodySettled: this.bodySettled,
+      pendingAdmissionsAndOperations: this.pending.size, ownedContexts: this.contexts.size,
+      closedContexts: [...this.contexts.values()].filter(value => value.closed).length,
+      closeAcknowledgedContexts: [...this.contexts.values()].filter(value => value.closeSettled).length, evidence: this.evidence, phases: this.phases };
+  }
+  fence() {
+    if (this.signal.aborted || this.remaining() === 0) this.cancel();
+    if (this.cancelled || this.finishing || this.bodySettled) throw this.signal.reason ?? new Error('fixture-case-cancelled');
+    if (this.errors.includes('fixture-previous-case-unsettled')) throw new Error('fixture-previous-case-unsettled');
+  }
+  round(mode: string | null, enabled: boolean | null = null) {
+    this.mode = mode && /^[a-z0-9-]{1,48}$/.test(mode) ? mode : null;
+    this.enabled = enabled;
+    this.record('round', 'attempt');
+    this.fence();
+    this.record('round', 'start');
+  }
+  cancel() {
+    if (!this.cancelled) { this.cancelled = true; this.record('case', 'abort'); }
+    for (const context of this.contexts.keys()) void this.closeContext(context);
+  }
+  closeContext(context: BrowserContext) {
+    const owned = this.contexts.get(context);
+    if (!owned) throw new Error('fixture-context-not-owned');
+    if (!owned.close) owned.close = (async () => {
+      this.record('context-close', 'start');
+      try { await context.close(); owned.closed = true; this.record('context-close', 'end'); }
+      catch { this.errors.push('fixture-context-close-failed'); }
+      owned.closeSettled = true;
+      this.releaseIfDrained();
+    })();
+    return owned.close;
+  }
+  private track<T>(work: Promise<T>) {
+    this.pending.add(work);
+    void work.then(() => { this.pending.delete(work); this.releaseIfDrained(); }, () => { this.pending.delete(work); this.releaseIfDrained(); });
+    return work;
+  }
+  async step<T>(phase: string, action: () => Promise<T>) {
+    this.fence(); this.record(phase, 'start');
+    try { const value = await this.track(action()); this.fence(); this.record(phase, 'end'); return value; }
+    catch (error) { this.record(phase, 'rejected'); throw error; }
+  }
+  async newContext(options?: Parameters<Browser['newContext']>[0]) {
+    this.fence(); this.record('new-context', 'start');
+    const work = (async () => {
+      const context = await this.real.newContext(options);
+      const owned = { closed: false, closeSettled: false };
+      this.contexts.set(context, owned);
+      context.on?.('close', () => { owned.closed = true; this.releaseIfDrained(); });
+      if (this.cancelled || this.finishing || this.bodySettled || this.signal.aborted || this.remaining() === 0) {
+        this.record('new-context', 'late-close'); await this.closeContext(context); this.fence();
+      }
+      this.fence(); this.record('new-context', 'end');
+      return context;
+    })();
+    return this.track(work);
+  }
+  async newPage(options?: Parameters<Browser['newPage']>[0]) {
+    const context = await this.newContext(options);
+    if (this.cancelled || this.finishing || this.bodySettled || this.signal.aborted || this.remaining() === 0) await this.closeContext(context);
+    this.fence();
+    return this.pageInContext(context);
+  }
+  private ownedContext(options?: Parameters<Browser['newContext']>[0]) {
+    return this.track((async () => {
+      const context = await this.newContext(options);
+      if (this.cancelled || this.finishing || this.bodySettled || this.signal.aborted || this.remaining() === 0) {
+        this.record('new-context-publication', 'late-close'); await this.closeContext(context); this.fence();
+      }
+      this.fence(); return this.contextView(context);
+    })());
+  }
+  private contextView(context: BrowserContext): BrowserContext {
+    const previous = this.proxies.get(context); if (previous) return previous as BrowserContext;
+    const proxy = new Proxy(context, { get: (target, key) => {
+      if (key === 'newPage') return () => this.pageInContext(context);
+      if (key === 'close') return () => this.step('context.close', () => this.closeContext(context));
+      const value = Reflect.get(target, key, target);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        this.fence();
+        context.setDefaultTimeout(Math.max(1, this.remaining()));
+        context.setDefaultNavigationTimeout(Math.max(1, this.remaining()));
+        const answer = Reflect.apply(value, target, args);
+        if (answer && typeof (answer as { then?: unknown }).then === 'function') return this.step('context.' + String(key), () => Promise.resolve(answer));
+        this.fence(); return answer;
+      };
+    } });
+    this.proxies.set(context, proxy); return proxy;
+  }
+  private async pageInContext(context: BrowserContext) {
+    if (this.cancelled || this.finishing || this.bodySettled || this.signal.aborted || this.remaining() === 0) await this.closeContext(context);
+    this.fence(); this.record('new-page', 'start');
+    const work = (async () => {
+      const page = await context.newPage();
+      if (this.cancelled || this.finishing || this.bodySettled || this.signal.aborted || this.remaining() === 0) {
+        this.record('new-page', 'late-close');
+        try { await page.close(); } catch { /* The owned context close remains authoritative. */ }
+        await this.closeContext(context); this.fence();
+      }
+      this.fence(); this.record('new-page', 'end');
+      const scoped = this.wrap(page, page, context);
+      pageCases.set(scoped, this); pageCases.set(page, this);
+      return scoped;
+    })();
+    return this.track(work);
+  }
+  private wrap<T extends object>(value: T, page: Page, context: BrowserContext): T {
+    const old = this.proxies.get(value); if (old) return old as T;
+    const factories = new Set(['locator', 'getByRole', 'getByText', 'getByLabel', 'getByPlaceholder', 'getByTestId', 'getByTitle', 'getByAltText', 'frameLocator', 'first', 'last', 'nth', 'filter', 'and', 'or', 'context']);
+    const proxy = new Proxy(value, { get: (target, key) => {
+      const member = Reflect.get(target, key, target);
+      if ((key === 'keyboard' || key === 'mouse') && member) return this.wrap(member, page, context);
+      if (typeof member !== 'function') return member;
+      return (...args: unknown[]) => {
+        this.fence();
+        page.setDefaultTimeout(Math.max(1, this.remaining()));
+        page.setDefaultNavigationTimeout(Math.max(1, this.remaining()));
+        if (value === context && key === 'newPage') return this.pageInContext(context);
+        if (value === context && key === 'close') return this.step('context.close', () => this.closeContext(context));
+        if (value === page && key === 'close') return this.step('page.close', async () => { await page.close(...args as Parameters<Page['close']>); await this.closeContext(context); });
+        const started = performance.now();
+        const result = Reflect.apply(member, target, args);
+        if (result && typeof result.then === 'function') {
+          this.record('page.' + String(key), 'start', started);
+          return this.track(Promise.resolve(result).then(answer => {
+            this.fence(); this.record('page.' + String(key), 'end');
+            return key === 'newCDPSession' && answer && typeof answer === 'object' ? this.wrap(answer, page, context) : answer;
+          }, error => { this.record('page.' + String(key), 'rejected'); throw error; }));
+        }
+        this.fence();
+        if (factories.has(String(key))) return this.wrap(result, page, context);
+        return result;
+      };
+    } });
+    this.proxies.set(value, proxy); return proxy;
+  }
+  run<T>(body: (browser: Browser) => Promise<T>) {
+    this.body = Promise.resolve().then(() => { this.fence(); return body(this.browser); });
+    return this.body.finally(() => { this.bodySettled = true; clearTimeout(this.timer); this.record('body', 'settled'); this.releaseIfDrained(); }) as Promise<T>;
+  }
+  drained() { return this.bodySettled && this.pending.size === 0 && [...this.contexts.values()].every(value => value.closed && value.closeSettled); }
+  releaseIfDrained() { if (this.finishing && this.drained()) { this.signal.removeEventListener('abort', this.onAbort); browserCases.get(this.real)?.delete(this); } }
+  async finish(deadline: number) {
+    this.finishing = true;
+    for (const context of this.contexts.keys()) void this.closeContext(context);
+    const settled = await observeUntil(Promise.allSettled([this.body, ...this.pending, ...[...this.contexts.values()].map(value => value.close)]), deadline);
+    if (!settled.settled || !this.drained()) this.errors.push('fixture-case-unsettled');
+    clearTimeout(this.timer); this.releaseIfDrained();
+  }
+}
+
+function runFixtureCase<T>(context: TestContext, browser: Browser, body: (browser: Browser) => Promise<T>) {
+  const scope = new FixtureCase(context.task.id, context.task.name, context.signal, browser);
+  fixtureCases.set(context.task.id, scope);
+  return scope.run(body);
+}
+
+async function fixturePhase<T>(page: Page, phase: string, action: () => Promise<T>) {
+  const scope = pageCases.get(page);
+  return scope ? scope.step(phase, action) : action();
+}
+
+async function fixtureFacts(page: Page) {
+  const scope = pageCases.get(page); if (!scope) return;
+  const facts = await scope.step('fixture-facts', () => page.evaluate(() => {
+    const state = (window as any).__transactions;
+    return { previewCalls: typeof state?.previewCalls === 'number' ? state.previewCalls : null,
+      hasPayload: typeof state?.payload === 'function' ? state.payload() != null : null };
+  }));
+  scope.previewCalls = facts.previewCalls; scope.hasPayload = facts.hasPayload;
+}
 function assertFixtureLocale(snapshot: unknown, language: FixtureLanguage) {
   expect(snapshot).toEqual({ language, resolvedLanguage: language, direction: language === 'fa' ? 'rtl' : 'ltr', resourceLoaded: true,
     sample: fixtureCopy[language].feedback.subscriptionSaved });
@@ -17,15 +261,17 @@ function assertFixtureLocale(snapshot: unknown, language: FixtureLanguage) {
 
 async function openFixture(page: Page, url: string) {
   const target = new URL(url);
+  pageCases.get(page)?.round(target.searchParams.get('mode'), target.searchParams.has('enabled') ? target.searchParams.get('enabled') === 'true' : null);
   const feedback = target.pathname === '/__feedback';
   const language = (feedback ? target.searchParams.get('lang') || 'zh-CN' : 'en-US') as FixtureLanguage;
   const key = feedback ? '__feedback' : '__transactions';
-  await page.goto(url);
+  await fixturePhase(page, 'bootstrap-navigation', () => page.goto(url));
   // goto does not await async ES-module evaluation (including lazy locale chunks).
   // This is within the existing test timeout; it never repeats an application action.
-  await page.waitForFunction(name => (window as unknown as Record<string, { ready?: boolean }>)[name]?.ready === true, key);
-  const bootstrap = await page.evaluate(name => (window as unknown as Record<string, { bootstrap: unknown }>)[name].bootstrap, key);
+  await fixturePhase(page, 'bootstrap-ready', () => page.waitForFunction(name => (window as unknown as Record<string, { ready?: boolean }>)[name]?.ready === true, key));
+  const bootstrap = await fixturePhase(page, 'bootstrap-locale', () => page.evaluate(name => (window as unknown as Record<string, { bootstrap: unknown }>)[name].bootstrap, key));
   assertFixtureLocale(bootstrap, language);
+  if (!feedback) await fixtureFacts(page);
   if (feedback && target.searchParams.has('helper-bridge')) {
     if (target.searchParams.has('recovery')) {
       await page.waitForFunction(() => (window as any).__feedback.privacyApplied && (window as any).__feedback.trayReads >= 1);
@@ -40,18 +286,24 @@ async function openFixture(page: Page, url: string) {
   }
 }
 
-async function closeFixturePages(browser: Browser | undefined, failed: boolean, name: string) {
+async function closeFixturePages(browser: Browser | undefined, failed: boolean, name: string, owner?: FixtureCase, evidenceBudget = EVIDENCE_BUDGET_MS) {
   const cleanupErrors: string[] = [];
   if (!browser) return cleanupErrors;
-  for (const context of browser.contexts()) {
+  const cleanupDeadline = performance.now() + CLEANUP_BUDGET_MS;
+  const evidenceDeadline = Math.min(cleanupDeadline, performance.now() + evidenceBudget);
+  const contexts = owner ? [...owner.contexts.keys()] : browser.contexts();
+  if (owner) { owner.finishing = true; if (failed) owner.evidence = owner.cancelled ? 'expired' : 'missing'; }
+  for (const context of contexts) {
     try {
       if (failed) for (const [index, page] of context.pages().entries()) {
         if (page.isClosed()) continue;
         try {
-          const { mkdirSync, writeFileSync } = await import('node:fs');
+          if (performance.now() >= evidenceDeadline) { if (owner) owner.evidence = 'expired'; continue; }
           const output = path.join(fixtureOutputRoot, 'feedback');
           mkdirSync(output, { recursive: true });
-          const stem = 'failed-' + name.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 100) + '-' + index;
+          const stem = 'failed-' + name.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 100)
+            + (owner ? '-' + owner.id.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 64) : '') + '-' + index;
+          const capture = async () => {
           const state = await page.evaluate(() => {
             const globals = window as unknown as Record<string, Record<string, unknown> | undefined>;
             const transactions = globals.__transactions;
@@ -69,17 +321,38 @@ async function closeFixturePages(browser: Browser | undefined, failed: boolean, 
                 applyCalls: count(transactions?.applyCalls), writes: count(transactions?.writes),
                 persistenceRetries: Array.isArray(transactions?.persistenceTransactions) ? transactions.persistenceTransactions.length : null } };
           });
-          writeFileSync(path.join(output, stem + '.json'), JSON.stringify({ fixtureOnly: true, state }, null, 2));
-          await page.screenshot({ path: path.join(output, stem + '.png'), fullPage: true });
+          if (performance.now() >= evidenceDeadline) throw new Error('fixture-evidence-expired');
+          writeFileSync(path.join(output, stem + '.json'), JSON.stringify({ fixtureOnly: true, state, phases: owner?.snapshot() }, null, 2));
+          const png = await page.screenshot({ fullPage: true, timeout: Math.max(1, evidenceDeadline - performance.now()) });
+          if (performance.now() >= evidenceDeadline) throw new Error('fixture-evidence-expired');
+          writeFileSync(path.join(output, stem + '.png'), png);
+          };
+          const result = await observeUntil(capture(), evidenceDeadline);
+          if (owner && owner.evidence !== 'expired') owner.evidence = result.settled ? ('failed' in result ? 'missing' : 'complete') : 'expired';
+          if (!result.settled) console.warn('[fixture] failure evidence expired');
         } catch { console.warn('[fixture] failure evidence unavailable'); }
       }
     } catch {
       // Evidence enumeration is also best-effort; it must not skip later contexts.
       console.warn('[fixture] failure evidence unavailable');
     } finally {
-      // Existing success paths close their page/context. Only surviving contexts are here.
-      try { await context.close(); } catch { cleanupErrors.push('fixture-context-close-failed'); }
+      // Real close starts even if evaluation/screenshot never settled.
+      const close = owner ? owner.closeContext(context) : context.close();
+      const result = await observeUntil(close, cleanupDeadline);
+      if (!result.settled) cleanupErrors.push('fixture-context-close-unsettled');
+      else if ('failed' in result) cleanupErrors.push('fixture-context-close-failed');
     }
+  }
+  if (owner) {
+    await owner.finish(cleanupDeadline);
+    cleanupErrors.push(...owner.errors);
+    if (failed || cleanupErrors.length) {
+      const output = path.join(fixtureOutputRoot, 'feedback');
+      mkdirSync(output, { recursive: true });
+      const stem = 'failed-' + name.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 100) + '-' + owner.id.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 64);
+      writeFileSync(path.join(output, stem + '-phases.json'), JSON.stringify({ fixtureOnly: true, lifecycle: owner.snapshot(), cleanupErrors }, null, 2));
+    }
+    if (owner.drained()) fixtureCases.delete(owner.id);
   }
   return cleanupErrors;
 }
@@ -107,6 +380,78 @@ describe('browser fixture locale contract (independent expected copy)', () => {
 });
 
 describe('browser fixture cleanup failure contract', () => {
+  it('closes late context/page admissions under the cancelled original case before rejecting publication', async () => {
+    for (const late of ['context', 'page'] as const) {
+      let releaseContext!: (value: BrowserContext) => void;
+      let releasePage!: (value: Page) => void;
+      let releaseClose!: () => void;
+      let reached!: () => void;
+      const contextResult = new Promise<BrowserContext>(resolve => { releaseContext = resolve; });
+      const pageResult = new Promise<Page>(resolve => { releasePage = resolve; });
+      const closeResult = new Promise<void>(resolve => { releaseClose = resolve; });
+      const creationReached = new Promise<void>(resolve => { reached = resolve; });
+      let contextsCreated = 0;
+      let pagesCreated = 0;
+      let contextsClosed = 0;
+      let latePagesClosed = 0;
+      let published = 0;
+      const page = { close: async () => { latePagesClosed++; } } as unknown as Page;
+      const context = { on: () => {},
+        newPage: () => { pagesCreated++; reached(); return pageResult; },
+        close: async () => { contextsClosed++; await closeResult; },
+      } as unknown as BrowserContext;
+      const browser = { newContext: () => { contextsCreated++; if (late === 'context') reached(); return contextResult; } } as unknown as Browser;
+      const controller = new AbortController();
+      const scope = new FixtureCase('late-' + late, 'synthetic late admission', controller.signal, browser);
+      const body = scope.run(async owned => { await owned.newPage(); published++; });
+      const result = body.then(() => 'published', () => 'rejected');
+      if (late === 'page') releaseContext(context);
+      await creationReached;
+      controller.abort(new Error('synthetic cancellation'));
+      if (late === 'context') releaseContext(context); else releasePage(page);
+      // Close has started, but a pending close acknowledgement must not be
+      // mistaken for a settled body or permission to admit the next case.
+      await Promise.resolve(); await Promise.resolve();
+      expect(published).toBe(0);
+      expect(scope.bodySettled).toBe(false);
+      const next = new FixtureCase('next-' + late, 'synthetic next case', new AbortController().signal, browser);
+      await expect(next.run(async owned => { await owned.newPage(); })).rejects.toThrow('fixture-previous-case-unsettled');
+      await next.finish(performance.now() + 100);
+      expect(contextsCreated).toBe(1);
+      releaseClose();
+      expect(await result).toBe('rejected');
+      await scope.finish(performance.now() + 100);
+      expect(contextsClosed).toBe(1);
+      expect(pagesCreated).toBe(late === 'page' ? 1 : 0);
+      expect(latePagesClosed).toBe(late === 'page' ? 1 : 0);
+      expect(scope.bodySettled).toBe(true);
+      expect(scope.drained()).toBe(true);
+      expect(scope.phases.some(value => value.event === 'late-close')).toBe(true);
+    }
+  });
+  it('expires suspended failure evidence and still awaits actual owned context close', async () => {
+    let closed = 0;
+    let releaseEvidence!: (value: unknown) => void;
+    const suspended = new Promise<unknown>(resolve => { releaseEvidence = resolve; });
+    const page = { isClosed: () => closed > 0, evaluate: () => suspended, close: async () => {},
+      setDefaultTimeout: () => {}, setDefaultNavigationTimeout: () => {},
+    } as unknown as Page;
+    const context = { on: () => {}, newPage: async () => page, pages: () => [page], close: async () => { closed++; } } as unknown as BrowserContext;
+    const browser = { newContext: async () => context } as unknown as Browser;
+    const scope = new FixtureCase('evidence-budget', 'synthetic bounded evidence', new AbortController().signal, browser);
+    await scope.run(async owned => { await owned.newPage(); });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(await closeFixturePages(browser, true, 'synthetic bounded evidence', scope, 5)).toEqual([]);
+      expect(closed).toBe(1);
+      expect(scope.evidence).toBe('expired');
+      expect(scope.bodySettled).toBe(true);
+      expect(scope.drained()).toBe(true);
+      releaseEvidence({ synthetic: true });
+      await Promise.resolve(); await Promise.resolve();
+      expect(scope.evidence).toBe('expired');
+    } finally { releaseEvidence({ synthetic: true }); warn.mockRestore(); }
+  });
   it('attempts every context after multiple close failures and only returns fixed codes', async () => {
     const attempts: number[] = [];
     const browser = { contexts: () => [0, 1, 2].map(index => ({
@@ -155,8 +500,6 @@ const fixtureOutputRoot = path.resolve(process.env.POLARIS_FIXTURE_OUTPUT_DIR ||
 const entry = `
 import React, { useState, useLayoutEffect } from 'react';
 import { flushSync } from 'react-dom';
-import { NodeMenu } from '/src/components/screens/home/NodeMenu';
-import { SubFormPanel } from '/src/mobile/forms/SubFormPanel';
 import { useSubscriptionProgressStore } from '/src/store/use-subscription-progress-store';
 import { setToastImpl } from '/src/lib/error-handler';
 import { createRoot } from 'react-dom/client';
@@ -166,18 +509,12 @@ import { useVpnStatusStore } from '/src/store/use-vpn-status-store';
 import { useSubscriptionCreateOperationStore } from '/src/store/subscription-create-operation-store';
 import { useAppStore } from '/src/store/app-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
-import PendingChangesBar from '/src/components/layout/PendingChangesBar';
-import { MobilePendingBar } from '/src/mobile/MobilePendingBar';
-import { useNodeActions } from '/src/components/screens/nodes/use-node-actions';
-import { NodesBatchBar } from '/src/components/screens/nodes/NodesBatchBar';
-import { RulesScreen } from '/src/components/screens/rules/RulesScreen';
-import { MobileRulesScreen } from '/src/mobile/screens/rules/RulesScreen';
+import { configContentDigest } from '/src/lib/staged-config';
+import type { IdentityConflicts } from '/src/domain/identity-repair/model';
+import '/src/mobile/screens/rules/rules-screen.css';
 import { useAppPresetsStore } from '/src/store/use-app-presets-store';
-import { MobileNodesScreen } from '/src/mobile/nodes/MobileNodesScreen';
-import { MobileConnectionsScreen } from '/src/mobile/connections/MobileConnectionsScreen';
-import { ResCatalogPanel } from '/src/mobile/forms/ResourceAddPanel';
-import { WarpPanel } from '/src/mobile/forms/WarpPanel';
-import { TsSettingsPanel } from '/src/mobile/forms/TsSettingsPanel';
+import '/src/mobile/nodes/nodes.css';
+import '/src/mobile/connections/connections.css';
 import { systemApi } from '/src/ipc/api-client';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { api } from '/src/ipc';
@@ -188,9 +525,30 @@ import '/src/mobile/forms/forms.css';
 import '/src/mobile/redesign.css';
 import '/src/mobile/screens/rules/rules-screen.css';
 import '/src/mobile/screens/rules/rules-redesign.css';
-await i18nReady;
 // A fresh context's explicit navigator locale drives the real lazy resource loader.
 const mode = new URLSearchParams(location.search).get('mode');
+// Keep the original CSS cascade and real component exports, but do not make
+// every fresh page load screens that its existing render branches cannot use.
+const [
+  { NodeMenu }, { SubFormPanel }, { default: PendingChangesBar }, { MobilePendingBar },
+  { useNodeActions }, { NodesBatchBar }, { RulesScreen }, { MobileRulesScreen },
+  { MobileNodesScreen }, { MobileConnectionsScreen }, { ResCatalogPanel }, { WarpPanel }, { TsSettingsPanel },
+] = await Promise.all([
+  mode === 'node-menu' ? import('/src/components/screens/home/NodeMenu') : { NodeMenu: undefined },
+  mode === 'mobile-subscription-edit' ? import('/src/mobile/forms/SubFormPanel') : { SubFormPanel: undefined },
+  mode === 'apply' ? import('/src/components/layout/PendingChangesBar') : { default: undefined },
+  mode === 'mobile-apply' ? import('/src/mobile/MobilePendingBar') : { MobilePendingBar: undefined },
+  mode === 'selection' ? import('/src/components/screens/nodes/use-node-actions') : { useNodeActions: undefined },
+  mode === 'selection' ? import('/src/components/screens/nodes/NodesBatchBar') : { NodesBatchBar: undefined },
+  mode === 'route' || mode === 'dns' ? import('/src/components/screens/rules/RulesScreen') : { RulesScreen: undefined },
+  mode === 'mobile-route' || mode === 'mobile-dns' ? import('/src/mobile/screens/rules/RulesScreen') : { MobileRulesScreen: undefined },
+  mode === 'mobile-nodes' ? import('/src/mobile/nodes/MobileNodesScreen') : { MobileNodesScreen: undefined },
+  mode === 'connections' ? import('/src/mobile/connections/MobileConnectionsScreen') : { MobileConnectionsScreen: undefined },
+  mode === 'resources' ? import('/src/mobile/forms/ResourceAddPanel') : { ResCatalogPanel: undefined },
+  mode === 'mobile-warp' ? import('/src/mobile/forms/WarpPanel') : { WarpPanel: undefined },
+  mode === 'mobile-ts' ? import('/src/mobile/forms/TsSettingsPanel') : { TsSettingsPanel: undefined },
+]);
+await i18nReady;
 const initialGeneration = Number(new URLSearchParams(location.search).get('generation') ?? '10');
 const test = window.__transactions = { writes: 0, release: null, events: null };
 const config = { servers: [], subscriptions: [], trafficRules: [], dnsRules: [], proxyMode: 'smart', routeRuleOrder: [], dnsRuleOrder: [] };
@@ -198,6 +556,34 @@ useAppStore.setState({ config, servers: [], rules: [], dnsRules: [], privacyMode
 useStagedConfigStore.setState({ enabled: true, hydrated: true, baseline: config, entries: [], conflict: null, saveStatus: 'idle' });
 api.config.setStagedPending = async () => {};
 api.config.get = async () => config;
+// Same raw-document projection as ConfigManager::identity_conflicts: group only
+// exact string IDs, keep source indices/order, and hash the complete JSON seed.
+api.server.identityConflicts = async (): Promise<IdentityConflicts> => {
+  const raw: Record<string, unknown> = JSON.parse(JSON.stringify(config));
+  const nodes: Record<string, unknown>[] = Array.isArray(raw.servers)
+    ? raw.servers.map(node => node !== null && typeof node === 'object' && !Array.isArray(node) ? node : {}) : [];
+  const byId = new Map<string, number[]>();
+  nodes.forEach((node, index) => {
+    if (typeof node.id === 'string') { const indices = byId.get(node.id) ?? []; indices.push(index); byId.set(node.id, indices); }
+  });
+  const groups = [...byId.values()].filter(indices => indices.length > 1).sort((a, b) => a[0]! - b[0]!).map(indices => ({
+    indices,
+    repairable: indices.every(index => {
+      const node = nodes[index]!;
+      return typeof node.protocol === 'string' && node.protocol.replace(/[A-Z]/g, letter => letter.toLowerCase()) !== 'tailscale'
+        && !Object.hasOwn(node, 'tailscaleSettings') && !Object.hasOwn(node, 'tailscaleCredentialIntent')
+        && typeof node.id === 'string' && node.id.replace(/^\\p{White_Space}+|\\p{White_Space}+$/gu, '').length > 0;
+    }),
+    records: indices.map(index => {
+      const node = nodes[index]!;
+      return { index, name: typeof node.name === 'string' ? node.name : '', protocol: typeof node.protocol === 'string' ? node.protocol : '',
+        address: typeof node.address === 'string' ? node.address : null,
+        port: typeof node.port === 'number' && Number.isInteger(node.port) && node.port >= 0 && node.port < 2 ** 64 ? node.port : null };
+    }),
+  }));
+  return { version: await configContentDigest(raw), groups };
+};
+
 api.config.onChanged = () => () => {};
 api.ruleResources.onProgress = () => () => {};
 useAppPresetsStore.setState({ loaded: true, loading: false, presets: [] });
@@ -473,31 +859,39 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     const address = server.httpServer!.address();
     if (!address || typeof address === 'string') throw new Error('No fixture listener');
     origin = `http://127.0.0.1:${address.port}`;
+    // Compile the same virtual module graph inside the existing setup budget.
+    // No component is rendered or business readiness awaited outside its case.
+    if (!await server.transformRequest('/app-transactions-fixture.tsx')) throw new Error('No transaction fixture transform');
+    await server.waitForRequestsIdle();
     browser = await chromium.launch({ chromiumSandbox: true, headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
   }, 30_000);
   afterEach(async ({ task }) => {
     const failed = task.result?.state === 'fail';
-    const cleanup = await closeFixturePages(browser, failed, task.name);
+    const owner = fixtureCases.get(task.id);
+    if (!owner) { enforceFixtureCleanup(['fixture-case-owner-missing'], failed, task.meta); return; }
+    const cleanup = await closeFixturePages(browser, failed, task.name, owner);
     enforceFixtureCleanup(cleanup, failed, task.meta);
   });
   afterAll(async () => { await browser?.close(); await server?.close(); });
 
   for (const mode of ['subscription-edit','mobile-subscription-edit']) {
     const urlInput = mode === 'subscription-edit' ? '#sub-url' : '#msf-url';
-    it(mode + ' shows the classified preview failure with a live title and no save', async () => {
+    it(mode + ' shows the classified preview failure with a live title and no save', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+      ownedBrowsers.get(browser)!.round(mode);
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
-      await page.getByRole('button', {name: enUS.sub.previewBtn, exact:true}).click();
+      await fixturePhase(page, 'preview-click', () => page.getByRole('button', {name: enUS.sub.previewBtn, exact:true}).click());
+      await fixtureFacts(page);
       const notice = page.locator(mode === 'subscription-edit' ? '[data-feedback-notice]' : '.m-form-notice-detailed');
-      await notice.waitFor();
+      await fixturePhase(page, 'preview-notice', () => notice.waitFor());
       expect(await notice.getAttribute('role')).toBe('status');
       expect(await notice.locator('strong').textContent()).toBe(enUS.sub.previewFail);
       expect(await notice.textContent()).not.toContain('[object Object]');
       expect(await page.evaluate('window.__transactions.previewCalls')).toBe(1);
       expect(await page.evaluate('window.__transactions.writes')).toBe(0);
       await page.close();
-    });
-    it(mode + ' keeps saved and failed follow-up as separate facts without replay', async () => {
+    }));
+    it(mode + ' keeps saved and failed follow-up as separate facts without replay', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(urlInput).fill('https://example.invalid/new');
@@ -509,8 +903,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.writes')).toBe(1);
       expect(await page.evaluate('window.__transactions.refreshCalls')).toBe(0);
       await page.close();
-    });
-    it(mode + ' registers the saved listener before mutation and remains locked if no ack arrives', async () => {
+    }));
+    it(mode + ' registers the saved listener before mutation and remains locked if no ack arrives', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&delayEditListener=1');
       await page.locator(urlInput).fill('https://example.invalid/first');
@@ -527,8 +921,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.toasts')).toEqual([]);
       expect(await page.evaluate('window.__transactions.writes')).toBe(1);
       await page.close();
-    });
-    it(mode + ' awaits one saved edit and shows refresh failure separately without a second request', async () => {
+    }));
+    it(mode + ' awaits one saved edit and shows refresh failure separately without a second request', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(urlInput).fill('https://example.invalid/new');
@@ -542,8 +936,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.writes')).toBe(1);
       expect(await page.evaluate('window.__transactions.refreshCalls')).toBe(0);
       await page.close();
-    });
-    it(mode + ' serializes save until its correlated ack then permits a newer fetch without old completion clearing busy', async () => {
+    }));
+    it(mode + ' serializes save until its correlated ack then permits a newer fetch without old completion clearing busy', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(urlInput).fill('https://example.invalid/first');
@@ -568,8 +962,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.writes')).toBe(2);
       expect(await page.evaluate('window.__transactions.refreshCalls')).toBe(0);
       await page.close();
-    });
-    it(mode + ' ignores a late old save failure after the input revision changes', async () => {
+    }));
+    it(mode + ' ignores a late old save failure after the input revision changes', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(urlInput).fill('https://example.invalid/first');
@@ -585,18 +979,18 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.submitted.url')).toBe('https://example.invalid/latest');
       await page.evaluate('window.__transactions.release({saved:true,publication:"scheduled",refresh:null})');
       await page.close();
-    });
+    }));
   }
 
-  it('node menu first committed render already expands the selected group', async () => {
+  it('node menu first committed render already expands the selected group', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=node-menu&initialGroups=1');
     await page.waitForFunction('window.__transactions.menuCommits?.length > 0');
     expect(await page.evaluate('window.__transactions.menuCommits[0]')).toEqual([{label: 'Package loopback', expanded: 'true'}]);
     await page.close();
-  });
+  }));
 
-  it('node menu initializes async groups before commit and preserves explicit choices across config/status publications', async () => {
+  it('node menu initializes async groups before commit and preserves explicit choices across config/status publications', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=node-menu');
     await page.waitForFunction('!!window.__transactions.menuLoad');
@@ -619,9 +1013,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.getByRole('option', {name: /Loop B/}).click();
     expect(await page.evaluate('window.__transactions.menuPicked')).toBe('node-b');
     await page.close();
-  });
+  }));
 
-  it('node menu initializes only unseen async groups and resets on close/reopen', async () => {
+  it('node menu initializes only unseen async groups and resets on close/reopen', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=node-menu');
     await page.waitForFunction('!!window.__transactions.menuLoad');
@@ -639,9 +1033,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.evaluate('window.__transactions.menuPatch({open:true})');
     expect(await page.evaluate('window.__transactions.menuCommits.at(-1)')).toEqual([{label: 'Package loopback', expanded: 'false'}, {label: 'Later group', expanded: 'true'}]);
     await page.close();
-  });
+  }));
 
-  it('node menu search temporarily expands without destroying saved collapse intent', async () => {
+  it('node menu search temporarily expands without destroying saved collapse intent', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=node-menu');
     await page.waitForFunction('!!window.__transactions.menuLoad');
@@ -663,9 +1057,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.locator('#nm-search-inp').inputValue()).toBe('');
     expect(await group.getAttribute('aria-expanded')).toBe('false');
     await page.close();
-  });
+  }));
 
-  it('late VPN success closes its own instance, never a new challenge on top', async () => {
+  it('late VPN success closes its own instance, never a new challenge on top', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=vpn');
     await page.locator('dialog[open] .dlg-foot .flow').click();
@@ -676,8 +1070,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.evaluate('window.__transactions.clearChallenge("a")');
     expect(await page.evaluate('window.__transactions.stack()[0].serverId')).toBe('b');
     await page.close();
-  });
-  it('late success cannot dismiss a newer challenge in the same mounted instance', async () => {
+  }));
+  it('late success cannot dismiss a newer challenge in the same mounted instance', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=vpn');
     await page.locator('dialog[open] .dlg-foot .flow').click();
@@ -685,8 +1079,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.waitForFunction('document.querySelector("dialog[open] .flow")?.disabled === false');
     expect(await page.evaluate('window.__transactions.stack().length')).toBe(1);
     await page.close();
-  });
-  it('failed terminal received before Cancel confirmation remains dismissible', async () => {
+  }));
+  it('failed terminal received before Cancel confirmation remains dismissible', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=recovery');
     await page.locator('dialog[open] .dlg-x').click();
@@ -696,12 +1090,12 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.locator('dialog[open] .dlg-x').click();
     expect(await page.evaluate('window.__transactions.stack().length')).toBe(0);
     await page.close();
-  });
+  }));
   describe.each([
     { mode: 'apply', button: '.pending-bar .btn.flow', errorBar: '.pending-bar.err' },
     { mode: 'mobile-apply', button: '.m-pending .m-pending-primary', errorBar: '.m-pending.m-pending-err' },
   ])('attributed Apply consumer: $mode', ({ mode, button, errorBar }) => {
-    it('does not treat saved intent plus an empty first frame as accepted runtime', async () => {
+    it('does not treat saved intent plus an empty first frame as accepted runtime', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&deferredPending=1');
       await page.waitForFunction('typeof window.__transactions.publishPending === "function"');
@@ -721,8 +1115,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.locator(button).waitFor({state:'hidden'});
       expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
       await page.close();
-    });
-    it('reconciles persistence through the original status token without replay', async () => {
+    }));
+    it('reconciles persistence through the original status token without replay', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -735,8 +1129,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.getByText('Applied at runtime; persistence is still pending.', {exact:true}).count()).toBe(0);
       expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
       await page.close();
-    });
-    it('retries only persistence for the original receipt, without a second Apply', async () => {
+    }));
+    it('retries only persistence for the original receipt, without a second Apply', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -757,8 +1151,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.getByRole('button', { name: 'Retry persistence', exact: true }).count()).toBe(0);
       expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
       await page.close();
-    });
-    it.each(['unconfirmed', 'ipc', 'wrong-receipt'] as const)('keeps failed persistence retry isolated from drafts: %s', async (failure) => {
+    }));
+    it.for(['unconfirmed', 'ipc', 'wrong-receipt'] as const)('keeps failed persistence retry isolated from drafts: %s', async (failure, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -788,8 +1182,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.writes')).toBe(0);
       expect(await page.evaluate('window.__transactions.draftCount()')).toBe(1);
       await page.close();
-    });
-    it.each(['reply', 'poll'] as const)('exits confirmed obsolete recovery from %s before separately applying drafts', async (source) => {
+    }));
+    it.for(['reply', 'poll'] as const)('exits confirmed obsolete recovery from %s before separately applying drafts', async (source, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       // Only this two-poll scenario controls the existing production 2s timers.
       // The outer 5s test deadline stays real; no callback or mutation is replayed.
@@ -844,8 +1238,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
         }
       }
       await page.close();
-    });
-    it('ignores a late successful read after an attributed stop'   , async () => {
+    }));
+    it('ignores a late successful read after an attributed stop'   , async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -856,8 +1250,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.getByText('Applied at runtime; persistence is still pending.', {exact:true}).waitFor();
       expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
       await page.close();
-    });
-    it('asks before restart, decline preserves pending, and stale confirmation stays failed', async () => {
+    }));
+    it('asks before restart, decline preserves pending, and stale confirmation stays failed', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -878,8 +1272,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.locator(errorBar).waitFor();
       expect(await page.locator(button).isDisabled()).toBe(false);
       await page.close();
-    });
-    it.each(['hotApplied', 'hotDurabilityPending', 'unconfirmed'] as const)('renders %s without fabricating restart evidence', async (status) => {
+    }));
+    it.for(['hotApplied', 'hotDurabilityPending', 'unconfirmed'] as const)('renders %s without fabricating restart evidence', async (status, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -896,8 +1290,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       }
       expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
       await page.close();
-    });
-    it.each(['ready', 'failed'])('binds an early intermediate restart and then owned %s', async (phase) => {
+    }));
+    it.for(['ready', 'failed'])('binds an early intermediate restart and then owned %s', async (phase, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -910,8 +1304,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
       expect(await page.locator(errorBar).count()).toBe(phase === 'failed' ? 1 : 0);
       await page.close();
-    });
-    it.each([['ready', true], ['failed', true], ['ready', false], ['failed', false]] as const)('retains the early generation high-water mark after buffer overflow: %s/attributed=%s', async (phase, attributed) => {
+    }));
+    it.for([['ready', true], ['failed', true], ['ready', false], ['failed', false]] as const)('retains the early generation high-water mark after buffer overflow: %s/attributed=%s', async ([phase, attributed], fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&generation=100');
       await page.locator(button).click();
@@ -931,8 +1325,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
       expect(await page.locator(errorBar).count()).toBe(phase === 'failed' ? 1 : 0);
       await page.close();
-    });
-    it('invalid early generations never raise the retained floor, including across overflow', async () => {
+    }));
+    it('invalid early generations never raise the retained floor, including across overflow', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&generation=100');
       await page.locator(button).click();
@@ -946,8 +1340,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
       expect(await page.locator(errorBar).count()).toBe(0);
       await page.close();
-    });
-    it('an observed newer explicit stop stays neutral after its early payload is evicted', async () => {
+    }));
+    it('an observed newer explicit stop stays neutral after its early payload is evicted', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&generation=100');
       await page.locator(button).click();
@@ -963,8 +1357,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.evaluate('window.__transactions.events({ phase: "failed", kind: "restart", terminal: true, applyId: 7, mainGeneration: 103 })');
       expect(await page.locator(errorBar).count()).toBe(0);
       await page.close();
-    });
-    it('a delayed lower-generation stop cannot cancel after a higher early observation', async () => {
+    }));
+    it('a delayed lower-generation stop cannot cancel after a higher early observation', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&generation=100');
       await page.locator(button).click();
@@ -981,8 +1375,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.evaluate('window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: 7, mainGeneration: 104 })');
       await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
       await page.close();
-    });
-    it('lost completion cannot succeed from an unrelated running core status', async () => {
+    }));
+    it('lost completion cannot succeed from an unrelated running core status', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode);
       await page.locator(button).click();
@@ -994,8 +1388,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.statusReads')).toBe(1);
       expect(await page.locator(button).isDisabled()).toBe(false);
       await page.close();
-    });
-    it('awaits registration before Apply and ignores unowned broadcasts', async () => {
+    }));
+    it('awaits registration before Apply and ignores unowned broadcasts', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&listener=deferred');
       await page.waitForFunction('typeof window.__transactions.releaseListener === "function"');
@@ -1016,8 +1410,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.locator(errorBar).textContent()).not.toContain('private diagnostic');
       expect(await page.locator(button).isDisabled()).toBe(false);
       await page.close();
-    });
-    it('registration failure blocks Apply and remains a visible retryable failure', async () => {
+    }));
+    it('registration failure blocks Apply and remains a visible retryable failure', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&listener=failed');
       await page.locator(button).click();
@@ -1025,15 +1419,15 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       expect(await page.evaluate('window.__transactions.applyCalls')).toBe(0);
       expect(await page.locator(button).isDisabled()).toBe(false);
       await page.close();
-    });
+    }));
   });
-  it.each([
+  it.for([
     { selectedServerId: 'other-node', intent: 0, outcome: 'stopped' },
     { selectedServerId: null, intent: 6, outcome: 'stopped' },
     { selectedServerId: 'other-node', intent: 0, outcome: 'changed' },
     { selectedServerId: null, intent: 6, outcome: 'changed' },
   ].flatMap(owner => ['notHeld', 'unknown', 'held'].map(preflightHold => ({ ...owner, preflightHold }))))(
-    'mobile logout transparently forwards exact selection ownership: %j', async ({ selectedServerId, intent, outcome, preflightHold }) => {
+    'mobile logout transparently forwards exact selection ownership: %j', async ({ selectedServerId, intent, outcome, preflightHold }, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     const readMobileConfirmation = async () => {
       const confirmation: unknown = await page.evaluate('window.__transactions.mobileConfirmation()');
@@ -1092,8 +1486,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.evaluate('window.__transactions.mobileStack()')).toEqual(outcome === 'stopped' ? [] : [settings]);
     expect(await page.evaluate('window.__transactions.mobileSelection()')).toBe(selectedServerId);
     await page.close();
-  });
-  it('selects a disjoint same-size visible set and preserves hidden choices', async () => {
+  }));
+  it('selects a disjoint same-size visible set and preserves hidden choices', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=selection');
     expect(await page.locator('#nodes-batch .mono').textContent()).toBe('0');
@@ -1109,25 +1503,27 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.locator('#select-all').click();
     expect(await page.evaluate('window.__transactions.selected()')).toEqual(['a', 'b']);
     await page.close();
-  });
-  it.each(['desktop-warp', 'mobile-warp', 'mobile-ts'])('reads and writes the top-level onDemand flag without losing protocol data: %s', async (mode) => {
+  }));
+  it.for(['desktop-warp', 'mobile-warp', 'mobile-ts'])('reads and writes the top-level onDemand flag without losing protocol data: %s', async (mode, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     for (const enabled of [true, false]) {
+      ownedBrowsers.get(browser)!.round(mode, enabled);
       const page = await browser.newPage({ locale: 'en-US' });
       await openFixture(page, origin + '/__transactions?mode=' + mode + '&enabled=' + enabled);
-      await page.locator(mode === 'desktop-warp' ? '.form-field-fold > summary' : '.m-form-group-h').filter({ hasText: 'Advanced' }).click();
+      await fixturePhase(page, 'on-demand-advanced', () => page.locator(mode === 'desktop-warp' ? '.form-field-fold > summary' : '.m-form-group-h').filter({ hasText: 'Advanced' }).click());
       const toggle = page.getByRole('switch', { name: 'Connect on demand', exact: true });
       expect(await toggle.getAttribute('aria-checked')).toBe(String(enabled));
-      await toggle.click();
-      await page.locator(mode === 'desktop-warp' ? '.dlg-foot .btn.flow' : '.m-form-foot .primary').last().click();
-      await page.waitForFunction('!!window.__transactions.payload()');
+      await fixturePhase(page, 'on-demand-toggle', () => toggle.click());
+      await fixturePhase(page, 'on-demand-save', () => page.locator(mode === 'desktop-warp' ? '.dlg-foot .btn.flow' : '.m-form-foot .primary').last().click());
+      await fixtureFacts(page);
+      await fixturePhase(page, 'on-demand-payload', () => page.waitForFunction('!!window.__transactions.payload()'));
       const payload = await page.evaluate<ServerConfig>('window.__transactions.payload()');
       expect(payload.onDemand).toBe(enabled ? undefined : true);
       if (mode === 'mobile-ts') expect(payload.tailscaleSettings?.hostname).toBe('synthetic-ts');
       else expect(payload.wireguardSettings?.warpDevice?.deviceId).toBe('synthetic-device');
       await page.close();
     }
-  });
-  it('falls back after staged deletion of a selected mobile tab and does not jump back on undo', async () => {
+  }));
+  it('falls back after staged deletion of a selected mobile tab and does not jump back on undo', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=mobile-nodes');
     await page.locator('.mn-seg').filter({ hasText: 'Subscription two' }).click();
@@ -1139,8 +1535,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.locator('.mn-seg').filter({ hasText: 'Subscription two' }).waitFor();
     expect(await page.locator('.mn-seg[aria-current=true]').textContent()).toBe(fallback);
     await page.close();
-  });
-  it('a persisted catalog entry with no file stays downloadable', async () => {
+  }));
+  it('a persisted catalog entry with no file stays downloadable', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=resources');
     await page.getByRole('option').filter({ hasText: 'builtin' }).waitFor();
@@ -1151,8 +1547,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await missing.isDisabled()).toBe(false);
     expect(await page.getByRole('option').filter({ hasText: 'present' }).isDisabled()).toBe(true);
     await page.close();
-  });
-  it.each([['single', 'reject'], ['single', 'false'], ['all', 'reject'], ['all', 'false'], ['filtered', 'reject']])('restores only failed mobile close intents after an intervening frame: %s/%s', async (kind, failure) => {
+  }));
+  it.for([['single', 'reject'], ['single', 'false'], ['all', 'reject'], ['all', 'false'], ['filtered', 'reject']])('restores only failed mobile close intents after an intervening frame: %s/%s', async ([kind, failure], fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=connections');
     await page.getByRole('tab').nth(1).click();
@@ -1178,8 +1574,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.locator('[data-conn-row="b"]').count()).toBe(kind === 'filtered' ? 0 : 1);
     expect(await page.locator('[data-write-error]').count()).toBeGreaterThan(0);
     await page.close();
-  });
-  it.each(['route', 'dns', 'mobile-route', 'mobile-dns'])('staged %s toggle does not mutate disk and revert/reset restores visible value', async (mode) => {
+  }));
+  it.for(['route', 'dns', 'mobile-route', 'mobile-dns'])('staged %s toggle does not mutate disk and revert/reset restores visible value', async (mode, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=' + mode);
     if (mode === 'mobile-dns') await page.locator('.mr-seg [role="tab"]').nth(1).click();
@@ -1194,8 +1590,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await toggle.getAttribute('aria-checked')).toBe('true');
     expect(await page.evaluate('window.__transactions.writes')).toBe(0);
     await page.close();
-  });
-  it.each(['route', 'dns', 'mobile-route', 'mobile-dns'])('direct %s failure preserves newer same-ID and other-rule mirror updates', async (mode) => {
+  }));
+  it.for(['route', 'dns', 'mobile-route', 'mobile-dns'])('direct %s failure preserves newer same-ID and other-rule mirror updates', async (mode, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=' + mode + '&direct=1');
     if (mode === 'mobile-dns') await page.locator('.mr-seg [role="tab"]').nth(1).click();
@@ -1211,8 +1607,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     ]);
     expect(await page.evaluate('window.__transactions.disk()')).toBe(false);
     await page.close();
-  });
-  it.each(['res-url', 'res-catalog', 'network-profile'])('late %s completion closes only its captured instance beneath a new VPN dialog', async (mode) => {
+  }));
+  it.for(['res-url', 'res-catalog', 'network-profile'])('late %s completion closes only its captured instance beneath a new VPN dialog', async (mode, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=' + mode);
     if (mode === 'res-url') await page.locator('#res-url').fill('https://example.invalid/fixture.srs');
@@ -1232,8 +1628,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.evaluate('window.__transactions.stack()[0].instanceId')).toBe(await page.evaluate('window.__transactions.b'));
     expect(await page.locator('dialog[open] input').first().inputValue()).toBe('Retained VPN draft');
     await page.close();
-  });
-  it.each(['res-url', 'network-profile'])('captured %s discard removes its own confirm and form without touching a newer VPN', async (mode) => {
+  }));
+  it.for(['res-url', 'network-profile'])('captured %s discard removes its own confirm and form without touching a newer VPN', async (mode, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=' + mode);
     if (mode === 'res-url') await page.locator('#res-url').fill('https://example.invalid/fixture.srs');
@@ -1244,7 +1640,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.waitForFunction('window.__transactions.stack().length === 1');
     expect(await page.evaluate('window.__transactions.stack()[0].instanceId')).toBe(await page.evaluate('window.__transactions.b'));
     await page.close();
-  });
+  }));
 
 });
 
@@ -1436,13 +1832,14 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
   }, 30_000);
   afterEach(async ({ task }) => {
     const failed = task.result?.state === 'fail';
-    const cleanup = await closeFixturePages(browser, failed, task.name);
+    const owner = fixtureCases.get(task.id);
+    if (!owner) { enforceFixtureCleanup(['fixture-case-owner-missing'], failed, task.meta); return; }
+    const cleanup = await closeFixturePages(browser, failed, task.name, owner);
     enforceFixtureCleanup(cleanup, failed, task.meta);
   });
   afterAll(async () => { await browser?.close(); await server?.close(); });
 
   async function evidence(page: import('@playwright/test').Page, scenario: string, selector: string) {
-    const { mkdirSync, writeFileSync } = await import('node:fs');
     const output = path.join(fixtureOutputRoot, 'feedback');
     mkdirSync(output, { recursive: true });
     const stability = await page.locator(selector).evaluate(async el => {
@@ -1478,7 +1875,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
 
   // Incident regression: a typed deferral must replace the original repair action,
   // not leave the user repeating ordinary installs while recovery is elsewhere above it.
-  it.each(['cancel', 'escape', 'close', 'scrim'])('Helper recovery %s dismisses the explanation without navigation or install', async dismiss => {
+  it.for(['cancel', 'escape', 'close', 'scrim'])('Helper recovery %s dismisses the explanation without navigation or install', async (dismiss, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&recovery=event');
     await page.evaluate('window.__feedback.revealRecovery()');
@@ -1494,9 +1891,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
     expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
     await page.close();
-  });
+  }));
 
-  it.each(['seed', 'pending'])('Helper recovery cold %s opens translated explanation before any settings navigation', async delivery => {
+  it.for(['seed', 'pending'])('Helper recovery cold %s opens translated explanation before any settings navigation', async (delivery, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&recovery=' + delivery);
     const dialog = page.getByRole('dialog', { name: zhCN.helper.connectionRecoveryTitle });
@@ -1508,9 +1905,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.scope()')).toEqual({ scope: 'settings', settings: 'helper' });
     expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
     await page.close();
-  });
+  }));
 
-  it('Helper recovery event then cancel ignores an older pending drain reply', async () => {
+  it('Helper recovery event then cancel ignores an older pending drain reply', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&recovery=late-pending');
     await page.evaluate('window.__feedback.revealRecovery()');
@@ -1521,9 +1918,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
     expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
     await page.close();
-  });
+  }));
 
-  it.each(['HELPER_CORE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID'])('Helper recovery generic %s event shares the main prompt owner with await delivery', async code => {
+  it.for(['HELPER_CORE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID'])('Helper recovery generic %s event shares the main prompt owner with await delivery', async (code, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&recovery=event');
     await page.evaluate(code => (window as any).__feedback.errorEvent(code), code);
@@ -1534,9 +1931,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
     expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
     await page.close();
-  });
+  }));
 
-  it('Helper recovery privacy hides the prompt and only unlock makes the choice available', async () => {
+  it('Helper recovery privacy hides the prompt and only unlock makes the choice available', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&recovery=seed&privacy-locked');
     const dialog = page.locator('dialog');
@@ -1551,9 +1948,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     await dialog.getByRole('button', { name: zhCN.common.cancel, exact: true }).click();
     expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
     await page.close();
-  });
+  }));
 
-  it('Helper raw IPC deferral reaches real SettingsPage and replaces the repair action in place', async () => {
+  it('Helper raw IPC deferral reaches real SettingsPage and replaces the repair action in place', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN', viewport: { width: 640, height: 480 } });
     await openFixture(page, origin + '/__feedback?helper-bridge');
     const repair = page.locator('[data-s="needs-repair"]');
@@ -1619,9 +2016,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary', 'stopAndUpgrade']);
     await page.close();
-  });
+  }));
 
-  for (const width of [640, 320]) it(`Helper diagnostics disclosure and copy spacing at ${width}px`, async () => {
+  for (const width of [640, 320]) it(`Helper diagnostics disclosure and copy spacing at ${width}px`, async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN', viewport: { width, height: 640 } });
     await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
     await page.addInitScript(() => {
@@ -1675,9 +2072,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await checks.isVisible()).toBe(false);
     expect(await helper.innerText()).not.toContain(zhCN.helper.checkScope);
     await page.close();
-  });
+  }));
 
-  it('Helper raw status and CoreInfo keep service checks, versions and copied identities separate', async () => {
+  it('Helper raw status and CoreInfo keep service checks, versions and copied identities separate', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     // Synthetic clipboard sink in this disposable context: the real UI handler
     // executes, but no system clipboard or existing browser profile is accessed.
@@ -1714,7 +2111,17 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await card.locator('[data-core-info="bundled"]').textContent()).toBe('fixture-bundled');
     expect(await card.locator('[data-core-info="selected-version"]').textContent()).toBe('fixture-core');
     expect(await card.locator('[data-core-info="installed-state"]').textContent()).toBe(zhCN.helper.coreState.unavailable);
-    expect(await card.innerText()).toContain(zhCN.helper.checkScope);
+    const selectedStateRow = card.locator('.set-row').filter({ has: page.locator('[data-core-info="installed-state"]') });
+    const checkScope = selectedStateRow.getByRole('img', { name: zhCN.helper.checkScope, exact: true });
+    expect(await checkScope.count()).toBe(1);
+    expect(await checkScope.isVisible()).toBe(true);
+    expect(await checkScope.getAttribute('data-tip')).toBe(zhCN.helper.checkScope);
+    expect(await checkScope.getAttribute('tabindex')).toBe('0');
+    expect(await card.innerText()).not.toContain(zhCN.helper.checkScope);
+    await checkScope.focus();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    expect(await checkScope.evaluate(icon => icon === document.activeElement && icon.matches(':focus-visible'))).toBe(true);
     const coreDiagnostics = card.locator('[data-testid="core-diagnostics"]');
     expect(await coreDiagnostics.getAttribute('open')).toBeNull();
     expect(await coreDiagnostics.locator('[data-core-info="selected-id"]').isVisible()).toBe(false);
@@ -1734,9 +2141,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
     expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
     await page.close();
-  });
+  }));
 
-  it.each(['after-reply', 'before-reply'])('Helper deferral survives real settings unmount %s without re-install or automatic stop', async timing => {
+  it.for(['after-reply', 'before-reply'])('Helper deferral survives real settings unmount %s without re-install or automatic stop', async (timing, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge');
     await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
@@ -1756,9 +2163,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('dialog').count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     await page.close();
-  });
+  }));
 
-  it('Helper real parent remount retains the in-flight lock and clears feedback only after success', async () => {
+  it('Helper real parent remount retains the in-flight lock and clears feedback only after success', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge');
     const primary = page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true });
@@ -1786,9 +2193,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('dialog').count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     await page.close();
-  });
+  }));
 
-  it('Helper terminal refresh wins over a delayed pre-install status read in the remounted parent', async () => {
+  it('Helper terminal refresh wins over a delayed pre-install status read in the remounted parent', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge');
     await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
@@ -1805,9 +2212,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.locator('[data-s="needs-repair"]').count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     await page.close();
-  });
+  }));
 
-  it('Helper real settings unmount discards confirmation but retains typed recovery presentation', async () => {
+  it('Helper real settings unmount discards confirmation but retains typed recovery presentation', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge');
     await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
@@ -1822,9 +2229,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('dialog').count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     await page.close();
-  });
+  }));
 
-  it.each(['win', 'unknown'])('Helper raw typed deferral on %s cannot select migration', async platform => {
+  it.for(['win', 'unknown'])('Helper raw typed deferral on %s cannot select migration', async (platform, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&os=' + platform);
     const primary = page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true });
@@ -1837,9 +2244,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('dialog').count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     await page.close();
-  });
+  }));
 
-  it('Helper Linux typed deferral requires a fresh forward-only confirmation', async () => {
+  it('Helper Linux typed deferral requires a fresh forward-only confirmation', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&os=lin');
     const repair = page.locator('[data-s="needs-repair"]');
@@ -1870,9 +2277,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('dialog').count()).toBe(0);
     expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
     await page.close();
-  });
+  }));
 
-  it('Helper raw locked privacy snapshot keeps the real confirmation hidden and sends no migration', async () => {
+  it('Helper raw locked privacy snapshot keeps the real confirmation hidden and sends no migration', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge&privacy-locked');
     await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
@@ -1886,9 +2293,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
     await page.close();
-  });
+  }));
 
-  it('Helper raw ordinary installer failure does not authorize migration', async () => {
+  it('Helper raw ordinary installer failure does not authorize migration', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN' });
     await openFixture(page, origin + '/__feedback?helper-bridge');
     await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
@@ -1898,10 +2305,10 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).count()).toBe(0);
     expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
     await page.close();
-  });
+  }));
 
   for (const width of [1280, 640]) for (const theme of ['light', 'dark']) {
-    it(`Helper failure hierarchy and original actions ${width}/${theme}`, async () => {
+    it(`Helper failure hierarchy and original actions ${width}/${theme}`, async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'zh-CN', viewport: { width, height: 800 } });
       await openFixture(page, origin + '/__feedback?theme=' + theme);
       const install = page.getByRole('button', { name: '安装提权助手（需授权）', exact: true });
@@ -1928,11 +2335,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
       expect(await page.evaluate('window.__feedback.navigation')).toEqual(['logs']);
       expect(await notice.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
       await page.close();
-    });
+    }));
   }
 
   for (const width of [390, 320]) for (const scale of [1, 2]) {
-    it(`long mobile FormSheet notice retains focus, scrolling and footer ${width}/${scale}`, async () => {
+    it(`long mobile FormSheet notice retains focus, scrolling and footer ${width}/${scale}`, async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
       const page = await browser.newPage({ locale: 'zh-CN', viewport: { width, height: 568 } });
       await openFixture(page, origin + `/__feedback?mode=mobile&theme=${width === 390 ? 'light' : 'dark'}&scale=${scale}`);
       const notice = page.locator('.m-form-notice-detailed');
@@ -1976,10 +2383,10 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
       await save.click();
       expect(await page.evaluate('window.__feedback.submitted')).toBe(1);
       await page.close();
-    });
+    }));
   }
 
-  it.each(['zh-CN', 'en-US', 'fa'])('the real Toaster keeps long %s detail and dismissal within the viewport', async lang => {
+  it.for(['zh-CN', 'en-US', 'fa'])('the real Toaster keeps long %s detail and dismissal within the viewport', async (lang, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: lang, viewport: { width: 640, height: 800 } });
     await openFixture(page, origin + '/__feedback?theme=light&lang=' + lang);
     await page.locator('[data-s="none"]').waitFor();
@@ -2006,8 +2413,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     await page.locator('.toast').waitFor({ state: 'detached' });
     expect(await page.evaluate('window.__feedback.installs')).toBe(0);
     await page.close();
-  });
-  it('the independent MobileToaster keeps long actions and dismissal reachable above a FormSheet', async () => {
+  }));
+  it('the independent MobileToaster keeps long actions and dismissal reachable above a FormSheet', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'zh-CN', viewport: { width: 320, height: 568 } });
     await openFixture(page, origin + '/__feedback?mode=mobile&theme=dark');
     await page.locator('.m-form-notice-detailed').waitFor();
@@ -2047,6 +2454,6 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
     expect(await page.evaluate('window.__feedback.submitted')).toBe(0);
     expect(await page.evaluate('window.__feedback.installs')).toBe(0);
     await page.close();
-  });
+  }));
 
 });

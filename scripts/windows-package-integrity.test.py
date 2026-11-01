@@ -4,7 +4,7 @@ No Windows installer, product executable, signature or installation is simulated
 as successful native acceptance.
 """
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 import importlib.util
 import hashlib
 import io
@@ -600,6 +600,227 @@ class Integrity(unittest.TestCase):
                         w.stream_child([sys.executable, '-u', '-c', program], lambda block: None, 1024, timeout=timeout)
                 self.assertTrue(all(child.poll() is not None for child in children))
                 self.assertLess(time.monotonic() - started, 3)
+
+
+    def diagnostic_records(self, log):
+        prefix = 'POLARIS_OWNED_CHILD_DIAGNOSTIC '
+        records = []
+        for line in log.getvalue().splitlines():
+            if not line.startswith(prefix): continue
+            body = line[len(prefix):]
+            self.assertLessEqual(len(body.encode()), w.MAX_CHILD_DIAGNOSTIC)
+            record = json.loads(body)
+            self.assertTrue(record['diagnosticsOnly']); self.assertFalse(record['artifactAuthority'])
+            self.assertFalse(record['allDescendantsObserved']); records.append(record)
+        self.assertTrue(records)
+        return records
+
+    @contextmanager
+    def actual_transport(self, mutate=None):
+        # Every Popen here is real. Optional narrow read/wait faults do not
+        # fabricate Cargo output, process exit, Windows APIs, or descendants.
+        launch = subprocess.Popen; children = []; waits = []; log = io.StringIO()
+        def child(*args, **kwargs):
+            process = launch(*args, **kwargs); children.append(process); waits.append(process.wait)
+            if mutate: mutate(process)
+            return process
+        try:
+            with patch.object(w.subprocess, 'Popen', side_effect=child), redirect_stderr(log):
+                yield children, log
+            for process in children:
+                self.assertIsNotNone(process.poll())
+                self.assertTrue(process.stdout.closed); self.assertTrue(process.stderr.closed)
+        finally:
+            for process, wait in zip(children, waits):
+                if process.poll() is None: process.terminate()
+                wait(timeout=3)
+                process.stdout.close(); process.stderr.close()
+
+    def test_actual_chunked_utf8_json_and_partial_line_have_bounded_event_only_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); payload = root / 'events'; acknowledge = root / 'ack'
+            rows = [{'reason': 'compiler-artifact', 'package_id': 'inert-package', 'fresh': True,
+                     'target': {'name': '示例', 'kind': ['bin']}, 'unreviewed': 'STDOUT_PAYLOAD_NOT_DIAGNOSTICS'},
+                    {'reason': 'build-finished', 'success': True}]
+            partial = b'{"reason":"compiler-artifact"'
+            data = b''.join(json.dumps(row, ensure_ascii=False).encode()+b'\n' for row in rows)+partial
+            payload.write_bytes(data); split = data.index('示'.encode())+1
+            stderr = b'first\n'+b'z'*6000+b'last\xe2\x82'
+            err = root / 'stderr'; err.write_bytes(stderr)
+            program = ("import pathlib,sys,time;data=pathlib.Path(sys.argv[1]).read_bytes();n=int(sys.argv[3]);"
+                       "sys.stdout.buffer.write(data[:n]);sys.stdout.buffer.flush();"
+                       "deadline=time.monotonic()+2\n"
+                       "while not pathlib.Path(sys.argv[2]).exists():\n"
+                       " if time.monotonic()>deadline:raise RuntimeError('fixture ack deadline')\n"
+                       " time.sleep(.005)\n"
+                       "sys.stdout.buffer.write(data[n:]);sys.stdout.buffer.flush();"
+                       "sys.stderr.buffer.write(pathlib.Path(sys.argv[4]).read_bytes());sys.stderr.buffer.flush();sys.exit(3)")
+            received = bytearray(); blocks = []
+            def consume(block):
+                blocks.append(block); received.extend(block)
+                if len(received) >= split: acknowledge.touch()
+            with self.actual_transport() as (children, log):
+                with self.assertRaisesRegex(ValueError, 'owned child failed'):
+                    w.stream_child([sys.executable, '-u', '-c', program, str(payload), str(acknowledge), str(split), str(err)],
+                                   consume, w.MAX_LISTING, timeout=5, cargo_json=True)
+            self.assertEqual(received, data); self.assertEqual(blocks[0], data[:split])
+            records = self.diagnostic_records(log); final = records[-1]
+            self.assertEqual(final['streams']['stdout']['readSha256'], hashlib.sha256(data).hexdigest())
+            self.assertEqual(final['streams']['stdout']['retainedBytes'], len(data))
+            self.assertEqual(final['streams']['stderr']['totalReadBytes'], len(stderr))
+            self.assertEqual(final['streams']['stderr']['readSha256'], hashlib.sha256(stderr).hexdigest())
+            self.assertEqual(final['streams']['stderr']['tailBytes'], 4096)
+            self.assertGreater(final['streams']['stderr']['tailOmittedBytes'], 0)
+            self.assertFalse(final['streams']['stderr']['tailEndsAtLineBoundary'])
+            self.assertEqual(final['cargo']['incompleteLineBytes'], len(partial))
+            self.assertEqual(final['cargo']['freshTrue'], 1)
+            self.assertEqual(final['cargo']['counts']['compiler-artifact'], 1)
+            self.assertEqual(final['cargo']['buildFinishedSeen'], 1); self.assertTrue(final['cargo']['lastBuildSuccess'])
+            self.assertNotIn('STDOUT_PAYLOAD_NOT_DIAGNOSTICS', log.getvalue())
+            self.assertEqual(final['cleanup']['waits'][-1]['code'], 3)
+            self.assertTrue(all(not row['aliveAfterJoin'] for row in final['cleanup']['readers']))
+
+    def test_actual_cargo_output_encoding_errors_and_quota_failures_keep_partial_facts(self):
+        cases = [('invalid-utf8', b'\xff', b'', UnicodeDecodeError),
+                 ('incomplete-utf8', b'\xe2\x82', b'', UnicodeDecodeError),
+                 ('stdout-quota', b'12345', b'', ValueError),
+                 ('stderr-quota', b'', b'12345', ValueError)]
+        for name, out, err, error in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); (root/'out').write_bytes(out); (root/'err').write_bytes(err)
+                program = ("import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes());"
+                           "sys.stdout.buffer.flush();sys.stderr.buffer.write(pathlib.Path(sys.argv[2]).read_bytes())")
+                with self.actual_transport() as (children, log):
+                    with self.assertRaises(error):
+                        w.stream_child([sys.executable, '-u', '-c', program, str(root/'out'), str(root/'err')],
+                                       lambda block: None, 4, timeout=5, stderr_limit=4, cargo_json=True)
+                final = self.diagnostic_records(log)[-1]
+                self.assertEqual(final['cause']['type'], error.__name__)
+                self.assertLessEqual(final['streams']['stdout']['retainedBytes'], 4)
+                self.assertLessEqual(final['streams']['stderr']['retainedBytes'], 4)
+                self.assertTrue(final['cleanup']['waits'][-1]['returned'])
+
+    def test_actual_deadline_primary_alive_records_before_terminate_and_actual_wait(self):
+        with self.actual_transport() as (children, log):
+            with self.assertRaisesRegex(ValueError, 'output deadline'):
+                w.stream_child([sys.executable, '-u', '-c', 'import time;time.sleep(10)'], lambda block: None,
+                               1024, timeout=.2)
+        records = self.diagnostic_records(log); before = records[0]; final = records[-1]
+        self.assertIsNone(before['primaryPoll']); self.assertIsNone(before['cleanup']['terminate'])
+        self.assertTrue(final['cleanup']['terminate']['returned'])
+        self.assertTrue(final['cleanup']['waits'][-1]['returned'])
+        self.assertEqual(final['cleanup']['waits'][-1]['code'], children[0].returncode)
+        self.assertTrue(all(row['closed'] for row in final['cleanup']['pipes']))
+
+    def test_actual_exited_primary_with_finite_owned_pipe_holder_is_not_eof_success(self):
+        # Two actual fixture-owned children share inherited OS writer endpoints.
+        # Keeping the holder directly owned permits a real portable wait receipt,
+        # without guessing a grandchild PID or pretending to provide a Windows Job.
+        launch = subprocess.Popen; children = []; holder = None; log = io.StringIO()
+        def primary(argv, **kwargs):
+            nonlocal holder
+            out_read, out_write = os.pipe(); err_read, err_write = os.pipe()
+            with os.fdopen(out_write, 'wb', buffering=0) as stdout, os.fdopen(err_write, 'wb', buffering=0) as stderr:
+                process = launch(argv, stdin=kwargs['stdin'], stdout=stdout, stderr=stderr, cwd=kwargs['cwd'])
+                self.assertEqual(process.wait(timeout=3), 0)
+                holder = launch([sys.executable, '-c', 'import time;time.sleep(.8)'], stdin=subprocess.DEVNULL,
+                                stdout=stdout, stderr=stderr)
+            process.stdout = os.fdopen(out_read, 'rb', buffering=0)
+            process.stderr = os.fdopen(err_read, 'rb', buffering=0)
+            children.append(process); return process
+        try:
+            with patch.object(w.subprocess, 'Popen', side_effect=primary), redirect_stderr(log):
+                with self.assertRaisesRegex(ValueError, 'output deadline'):
+                    w.stream_child([sys.executable, '-c', 'pass'], lambda block: None, 1024, timeout=.3)
+            self.assertEqual(children[0].wait(timeout=3), 0); self.assertEqual(holder.wait(timeout=3), 0)
+            records = self.diagnostic_records(log); before = records[0]; final = records[-1]
+            self.assertEqual(before['primaryPoll'], 0)
+            self.assertFalse(before['streams']['stdout']['eofRead']); self.assertFalse(before['streams']['stderr']['eofRead'])
+            self.assertFalse(before['streams']['stdout']['eofConsumed']); self.assertFalse(before['streams']['stderr']['eofConsumed'])
+            self.assertIsNone(final['cleanup']['terminate']); self.assertIsNone(final['cleanup']['kill'])
+            self.assertEqual(final['cleanup']['waits'][-1]['code'], 0)
+            self.assertTrue(all(not row['aliveAfterJoin'] for row in final['cleanup']['readers']))
+            self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+        finally:
+            for process in [*children, *([holder] if holder is not None else [])]:
+                if process.poll() is None: process.terminate()
+                process.wait(timeout=3)
+
+    def test_actual_partial_cargo_events_and_record_fields_are_bounded_not_artifact_authority(self):
+        rows = [{'reason': 'compiler-artifact', 'package_id': 'p'*5000, 'fresh': index % 2 == 0,
+                 'target': {'name': 'n'*5000, 'kind': ['bin']}} for index in range(80)]
+        rows += [{'reason': 'compiler-message', 'message': {'level': 'warning', 'rendered': 'DO_NOT_DUMP_MESSAGE'}},
+                 {'reason': 'compiler-message', 'message': {'rendered': 'x'*(64*1024+1)}},
+                 {'reason': 'build-finished', 'success': True}]
+        data = b'not-json\n'+b''.join(json.dumps(row).encode()+b'\n' for row in rows)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'events'; path.write_bytes(data)
+            program = "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes());sys.exit(4)"
+            with self.actual_transport() as (children, log):
+                with self.assertRaises(ValueError):
+                    w.stream_child([sys.executable, '-c', program, str(path)], lambda block: None,
+                                   w.MAX_LISTING, timeout=5, cargo_json=True)
+            final = self.diagnostic_records(log)[-1]
+            self.assertEqual(final['cargo']['counts']['compiler-artifact'], 80)
+            self.assertEqual(final['cargo']['oversizedLines'], 1); self.assertEqual(final['cargo']['invalidJsonLines'], 1)
+            self.assertEqual(final['cargo']['freshTrue'], 40); self.assertEqual(final['cargo']['freshFalse'], 40)
+            self.assertEqual(len(final['cargo']['lastEvents']), 16)
+            self.assertTrue(final['cargo']['lastBuildSuccess']); self.assertFalse(final['artifactAuthority'])
+            self.assertNotIn('DO_NOT_DUMP_MESSAGE', log.getvalue())
+            for row in final['cargo']['lastEvents']:
+                self.assertLessEqual(len(row.get('packageId', '')), 512)
+                self.assertLessEqual(len(row.get('targetName', '')), 256)
+            with self.actual_transport() as (children, log):
+                with self.assertRaises(ValueError):
+                    w.stream_child([sys.executable, '-c', 'raise SystemExit(2)'], lambda block: None,
+                                   1024, timeout=5, diagnostic_context={'oversizedFixture': 'x'*(w.MAX_CHILD_DIAGNOSTIC+1)})
+            self.assertTrue(self.diagnostic_records(log)[-1]['diagnosticFieldsTruncated'])
+
+    def test_actual_consumer_reader_and_narrow_cleanup_faults_preserve_original_cause(self):
+        class ReadFault:
+            def __init__(self, pipe): self.pipe = pipe
+            def read(self, count): raise OSError('injected pipe read fault')
+            def close(self): self.pipe.close()
+            @property
+            def closed(self): return self.pipe.closed
+        for fault in ['consumer', 'reader', 'cleanup-wait']:
+            with self.subTest(fault=fault):
+                def mutate(process):
+                    if fault == 'reader': process.stdout = ReadFault(process.stdout)
+                    elif fault == 'cleanup-wait':
+                        wait = process.wait
+                        def fail_after_real_wait(*args, **kwargs):
+                            wait(*args, **kwargs)
+                            raise OSError('injected cleanup observation after actual wait')
+                        process.wait = fail_after_real_wait
+                def consume(block): raise ValueError('injected consumer failure')
+                with self.actual_transport(mutate) as (children, log):
+                    with self.assertRaisesRegex(ValueError, 'pipe read failed' if fault == 'reader' else 'consumer failure') as caught:
+                        w.stream_child([sys.executable, '-u', '-c', "import sys,time;sys.stdout.write('inert');sys.stdout.flush();time.sleep(.1)"],
+                                       consume, 1024, timeout=5)
+                final = self.diagnostic_records(log)[-1]
+                self.assertEqual(final['cause']['type'], 'ValueError')
+                if fault == 'cleanup-wait':
+                    self.assertEqual(final['cleanup']['errors'][0]['type'], 'OSError')
+                    self.assertTrue(any('cleanup also failed' in note for note in caught.exception.__notes__))
+                else: self.assertEqual(final['cleanup']['errors'], [])
+
+    def test_actual_cargo_context_diagnostics_hash_tauri_config_without_dumping_environment(self):
+        secret = '{"private":"TAURI_CONFIG_NOT_LOGGED"}'
+        for value in [None, '', secret]:
+            with self.subTest(value=value), patch.dict(os.environ), tempfile.TemporaryDirectory() as tmp:
+                if value is None: os.environ.pop('TAURI_CONFIG', None)
+                else: os.environ['TAURI_CONFIG'] = value
+                os.environ['UNRELATED_CREDENTIAL_FIXTURE'] = 'DO_NOT_DUMP_ENVIRONMENT'
+                with self.actual_transport() as (children, log):
+                    with self.assertRaises(ValueError):
+                        w.cargo_output([sys.executable, '-c', 'raise SystemExit(5)'], Path(tmp))
+                final = self.diagnostic_records(log)[-1]; config = final['context']['TAURI_CONFIG']
+                self.assertEqual(config['present'], value is not None); self.assertEqual(config['empty'], value == '')
+                self.assertEqual(config['bytes'], len(value.encode()) if value is not None else None)
+                self.assertEqual(config['sha256'], hashlib.sha256(value.encode()).hexdigest() if value is not None else None)
+                self.assertFalse(final['context']['firstActualChildObserved'])
+                self.assertNotIn('TAURI_CONFIG_NOT_LOGGED', log.getvalue()); self.assertNotIn('DO_NOT_DUMP_ENVIRONMENT', log.getvalue())
 
 
 @unittest.skipUnless(os.name == 'nt', 'native Windows filesystem required')

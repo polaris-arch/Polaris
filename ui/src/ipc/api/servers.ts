@@ -10,6 +10,34 @@ import type { ServerSwitchReceipt } from '../../contracts/server-switch';
 import type { NativeAutoReceipt as AutoSelectReceipt, NativeAutoStatus as AutoSelectStatus } from '../../contracts/auto-select';
 import type { MeasurementSnapshot } from '../../contracts/measurement-display';
 
+// This query is non-void. Reject an unavailable/malformed projection so both
+// recovery consumers use their existing failure path, rather than treating it
+// as an empty conflict set. The version is opaque; no digest format is assumed.
+function isIdentityConflicts(value: unknown): value is IdentityConflicts {
+  const object = (item: unknown): item is Record<string, unknown> => typeof item === 'object' && item !== null && !Array.isArray(item);
+  const index = (item: unknown): item is number => typeof item === 'number' && Number.isSafeInteger(item) && item >= 0;
+  if (!object(value) || typeof value.version !== 'string' || !Array.isArray(value.groups)) return false;
+  const seen = new Set<number>();
+  let previousFirst = -1;
+  for (const group of value.groups) {
+    if (!object(group) || typeof group.repairable !== 'boolean' || !Array.isArray(group.indices)
+      || group.indices.length < 2 || !Array.isArray(group.records) || group.records.length !== group.indices.length) return false;
+    let previous = -1;
+    for (let position = 0; position < group.indices.length; position++) {
+      const item: unknown = group.indices[position];
+      const record: unknown = group.records[position];
+      if (!index(item) || item <= previous || seen.has(item) || (position === 0 && item <= previousFirst)
+        || !object(record) || record.index !== item || typeof record.name !== 'string' || typeof record.protocol !== 'string'
+        || !(record.address === null || typeof record.address === 'string')
+        // JSON's u64::MAX rounds to 2**64 in a JavaScript number.
+        || !(record.port === null || (typeof record.port === 'number' && Number.isInteger(record.port) && record.port >= 0 && record.port <= 2 ** 64))) return false;
+      if (position === 0) previousFirst = item;
+      previous = item; seen.add(item);
+    }
+  }
+  return true;
+}
+
 // ============================================================================
 // serverApi
 // ============================================================================
@@ -145,7 +173,9 @@ export const serverApi = {
   },
 
   async identityConflicts(): Promise<IdentityConflicts> {
-    return invoke(IPC_CHANNELS.SERVER_IDENTITY_CONFLICTS);
+    const preview = await invoke<unknown>(IPC_CHANNELS.SERVER_IDENTITY_CONFLICTS);
+    if (!isIdentityConflicts(preview)) throw new Error('Invalid identity conflict preview');
+    return preview;
   },
   async identityRepair(request: IdentityRepairRequest): Promise<IdentityRepairReceipt> {
     return invoke(IPC_CHANNELS.SERVER_IDENTITY_REPAIR, { request });

@@ -6,6 +6,7 @@ inputs before bundling and compares every final member with those same bytes.
 """
 import argparse
 import ast
+import codecs
 import hashlib
 import importlib.util
 import json
@@ -32,6 +33,7 @@ MAX_TOTAL = 2 * 1024 ** 3
 MAX_MEMBERS = 10000
 MAX_LISTING = 8 * 1024 ** 2
 MAX_STDERR = 256 * 1024
+MAX_CHILD_DIAGNOSTIC = 256 * 1024
 MAX_UNINSTALLER = 64 * 1024 ** 2
 EXTRACT_TIMEOUT = 180
 PUBLIC_LEGAL_FILES = ('LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md')
@@ -204,9 +206,16 @@ def directory_id(path):
     return [value.st_dev, value.st_ino]
 
 
-def cargo_output(argv, root, *, timeout=30):
+def cargo_output(argv, root, *, timeout=30, diagnostic_context=None):
     output = bytearray()
-    stream_child(argv, output.extend, MAX_LISTING, timeout=timeout, cwd=root)
+    value = os.environ.get('TAURI_CONFIG')
+    config = None if value is None else value.encode('utf-8', errors='surrogatepass')
+    context = {**(diagnostic_context or {}), 'firstActualChildObserved': False,
+               'TAURI_CONFIG': {'present': value is not None, 'empty': value == '',
+                                'bytes': len(config) if config is not None else None,
+                                'sha256': hashlib.sha256(config).hexdigest() if config is not None else None}}
+    stream_child(argv, output.extend, MAX_LISTING, timeout=timeout, cwd=root,
+                 diagnostic_context=context, cargo_json=True)
     return output.decode('utf-8', errors='strict')
 
 
@@ -408,20 +417,119 @@ def nsis_listing(text):
     return records
 
 
-def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MAX_STDERR, cwd=None):
-    """Drain both pipes with bounded queues; the caller sees only quota-safe blocks.
+def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MAX_STDERR, cwd=None,
+                 diagnostic_context=None, cargo_json=False):
+    """Bounded pipe transport. Diagnostics never authorize an artifact or descendants.
 
-    Threads only read pipes. The parent alone checks budgets/writes files. All
-    failure paths terminate and wait for this exact Popen child before returning.
-    A queue carries at most four 64KiB blocks, never an unbounded child output.
+    Preserve the execution deadline and exact-Popen cleanup. In particular the
+    final kill/wait has no timeout: this is not a total cleanup wall-clock bound.
     """
     require(isinstance(stdout_limit, int) and stdout_limit >= 0 and timeout > 0,
             'invalid child output/deadline budget')
-    deadline = time.monotonic() + timeout
+    started = time.monotonic(); started_wall = time.time(); deadline = started + timeout
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, bufsize=0, cwd=cwd)
-    messages = queue.Queue(maxsize=4); stop = threading.Event()
-    stderr = bytearray(); stdout_bytes = 0; ended = set()
+    messages = queue.Queue(maxsize=4); stop = threading.Event(); stats_lock = threading.Lock()
+    stderr = bytearray(); stdout_bytes = 0; delivered_hash = hashlib.sha256(); ended = set(); cause = None
+    stats = {label: {'bytes': 0, 'hash': hashlib.sha256(), 'eof': False, 'lastReadElapsed': None}
+             for label in ('stdout', 'stderr')}
+    pending = bytearray(); line_bytes = 0; oversized = False
+    events = {'counts': {}, 'lastEvents': [], 'invalidJsonLines': 0, 'oversizedLines': 0,
+              'freshTrue': 0, 'freshFalse': 0, 'buildFinishedSeen': 0, 'lastBuildSuccess': None,
+              'lastEventElapsed': None}
+    decoder = codecs.getincrementaldecoder('utf-8')('strict') if cargo_json else None
+    cleanup = {'terminate': None, 'kill': None, 'waits': [], 'readers': [], 'pipes': [], 'errors': []}
+    def brief(error): return {'type': type(error).__name__, 'message': str(error)[:1024]}
+    def wait_primary(seconds, phase):
+        attempt = {'phase': phase, 'timeoutSeconds': seconds, 'startedElapsed': time.monotonic()-started}
+        cleanup['waits'].append(attempt); begin = time.monotonic()
+        try:
+            code = process.wait(timeout=seconds) if seconds is not None else process.wait()
+        except BaseException as error:
+            attempt.update(returned=False, elapsedSeconds=time.monotonic()-begin, error=brief(error)); raise
+        attempt.update(returned=True, code=code, elapsedSeconds=time.monotonic()-begin)
+        return code
+    def cargo_events(block):
+        nonlocal line_bytes, oversized
+        pieces = block.split(b'\n')
+        for index, part in enumerate(pieces):
+            line_bytes += len(part)
+            if not oversized and len(pending) + len(part) <= 64 * 1024: pending.extend(part)
+            else: oversized = True; pending.clear()
+            if index == len(pieces) - 1: continue
+            if oversized: events['oversizedLines'] += 1
+            elif pending.strip():
+                try: row = json.loads(pending)
+                except (ValueError, UnicodeError): events['invalidJsonLines'] += 1
+                else:
+                    reason = row.get('reason') if isinstance(row, dict) else None
+                    if reason in ('compiler-artifact', 'compiler-message', 'build-script-executed', 'build-finished'):
+                        summary = {'reason': reason}
+                        if isinstance(row.get('package_id'), str): summary['packageId'] = row['package_id'][:512]
+                        target = row.get('target')
+                        if isinstance(target, dict):
+                            if isinstance(target.get('name'), str): summary['targetName'] = target['name'][:256]
+                            if isinstance(target.get('kind'), list): summary['targetKind'] = [str(x)[:64] for x in target['kind'][:8]]
+                        if type(row.get('fresh')) is bool:
+                            summary['fresh'] = row['fresh']; events['freshTrue' if row['fresh'] else 'freshFalse'] += 1
+                        if reason == 'build-finished':
+                            events['buildFinishedSeen'] += 1
+                            events['lastBuildSuccess'] = row.get('success') if type(row.get('success')) is bool else None
+                            summary['success'] = events['lastBuildSuccess']
+                        if reason == 'compiler-message' and isinstance(row.get('message'), dict):
+                            level = row['message'].get('level')
+                            if isinstance(level, str): summary['level'] = level[:64]
+                        events['counts'][reason] = events['counts'].get(reason, 0) + 1
+                        events['lastEvents'] = (events['lastEvents'] + [summary])[-16:]
+                        events['lastEventElapsed'] = time.monotonic() - started
+            pending.clear(); line_bytes = 0; oversized = False
+    def observation(stage, error=None):
+        with stats_lock:
+            streams = {label: {'totalReadBytes': value['bytes'], 'readSha256': value['hash'].hexdigest(),
+                                'eofRead': value['eof'], 'eofConsumed': label in ended,
+                                'lastReadElapsed': value['lastReadElapsed']}
+                       for label, value in stats.items()}
+        streams['stdout'].update(retainedBytes=stdout_bytes, retainedSha256=delivered_hash.hexdigest(),
+                                 truncated=streams['stdout']['totalReadBytes']>stdout_bytes,
+                                 retentionBasis='blocks delivered successfully to consumer; failed callback retention unknown')
+        tail = bytes(stderr[-4096:])
+        streams['stderr'].update(retainedBytes=len(stderr), retainedSha256=hashlib.sha256(stderr).hexdigest(),
+                                 truncated=streams['stderr']['totalReadBytes']>len(stderr),
+                                 tail=tail.decode('utf-8', errors='replace'), tailTruncated=len(stderr)>len(tail),
+                                 tailBytes=len(tail), tailOmittedBytes=max(0, len(stderr)-len(tail)),
+                                 tailStartsAtLineBoundary=not tail or len(tail)==len(stderr) or stderr[-len(tail)-1] == 10,
+                                 tailEndsAtLineBoundary=not stderr or stderr.endswith(b'\n'))
+        try: poll = process.poll(); poll_error = None
+        except Exception as failure: poll = None; poll_error = brief(failure)
+        record = {'schema': 'polaris-owned-child-diagnostic-v1', 'diagnosticsOnly': True,
+                  'artifactAuthority': False, 'allDescendantsObserved': False, 'stage': stage,
+                  'argv': [str(x)[:512] for x in argv[:32]], 'argvTruncated': len(argv)>32 or any(len(str(x))>512 for x in argv),
+                  'cwd': str(cwd if cwd is not None else os.getcwd())[:2048], 'tool': str(argv[0])[:2048],
+                  'pid': process.pid, 'startedUnixSeconds': started_wall, 'startedMonotonic': started,
+                  'deadlineMonotonic': deadline, 'timeoutSeconds': timeout, 'elapsedSeconds': time.monotonic()-started,
+                  'primaryPoll': poll, 'pollError': poll_error, 'streams': streams,
+                  'queueMessages': messages.qsize(),
+                  'readerAlive': {label: reader.is_alive() for label, reader in zip(('stdout','stderr'), readers)},
+                  'limits': {'stdoutBytes': stdout_limit, 'stderrBytes': stderr_limit, 'queueBlocks': 4, 'blockBytes': 64*1024},
+                  'cause': brief(error) if error is not None else None, 'cleanup': cleanup}
+        if cargo_json:
+            record['cargo'] = {**events, 'incompleteLineBytes': line_bytes, 'retainedIncompleteLineBytes': len(pending)}
+        if diagnostic_context is not None: record['context'] = diagnostic_context
+        return record
+    def emit(stage, error=None):
+        record = observation(stage, error)
+        encoded = json.dumps(record, ensure_ascii=True, separators=(',', ':'))
+        if len(encoded.encode()) > MAX_CHILD_DIAGNOSTIC:
+            # Caller context is never proof; keep the actual transport/failure facts
+            # even if a future diagnostic field exceeds the closed record budget.
+            record.pop('context', None); record.pop('argv', None); record.pop('cargo', None)
+            record['diagnosticFieldsTruncated'] = True
+            encoded = json.dumps(record, ensure_ascii=True, separators=(',', ':'))
+        require(len(encoded.encode()) <= MAX_CHILD_DIAGNOSTIC, 'child diagnostic record byte limit exceeded')
+        try: print('POLARIS_OWNED_CHILD_DIAGNOSTIC ' + encoded, file=os.sys.stderr, flush=True)
+        except Exception as failure:
+            if error is not None: error.add_note('child diagnostic write failed: ' + type(failure).__name__)
+        return record
     def publish(message):
         while not stop.is_set():
             try: messages.put(message, timeout=0.05); return
@@ -430,10 +538,14 @@ def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MA
         try:
             while not stop.is_set():
                 block = pipe.read(64 * 1024)
-                if not block: break
+                if not block:
+                    with stats_lock: stats[label]['eof'] = True
+                    break
+                with stats_lock:
+                    stats[label]['bytes'] += len(block); stats[label]['hash'].update(block)
+                    stats[label]['lastReadElapsed'] = time.monotonic()-started
                 publish((label, block))
-        except OSError as error:
-            publish(('reader-error', str(error)))
+        except OSError as error: publish(('reader-error', str(error)))
         finally: publish((label, None))
     readers = [threading.Thread(target=read_pipe, args=(label, pipe), daemon=True)
                for label, pipe in [('stdout', process.stdout), ('stderr', process.stderr)]]
@@ -451,28 +563,54 @@ def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MA
                 stderr.extend(block)
             else:
                 require(stdout_bytes + len(block) <= stdout_limit, 'owned child stdout byte limit exceeded')
+                if cargo_json: cargo_events(block); decoder.decode(block)
                 consume_stdout(block)
-                stdout_bytes += len(block)
+                stdout_bytes += len(block); delivered_hash.update(block)
         remaining = deadline - time.monotonic()
         require(remaining > 0, 'owned child exit deadline exceeded')
-        try: code = process.wait(timeout=remaining)
+        try: code = wait_primary(remaining, 'exit')
         except subprocess.TimeoutExpired as error: raise ValueError('owned child exit deadline exceeded') from error
         require(code == 0, 'owned child failed (' + str(code) + '): ' + stderr.decode('utf-8', errors='replace'))
+        if decoder is not None: decoder.decode(b'', final=True)
         return {'stdoutBytes': stdout_bytes, 'stderrBytes': len(stderr), 'pid': process.pid,
                 'exitCode': code, 'stderr': stderr.decode('utf-8', errors='replace')}
+    except BaseException as error:
+        cause = error
+        emit('failure-before-cleanup', error)
+        raise
     finally:
-        # Never address a guessed PID/group or leave the 7z child writing while
-        # TemporaryDirectory removes its files. Popen owns this exact process.
         stop.set()
-        if process.poll() is None:
-            process.terminate()
-            try: process.wait(timeout=2)
-            except subprocess.TimeoutExpired: process.kill(); process.wait()
-        else: process.wait()
-        for reader in readers:
-            if reader.ident is not None: reader.join(timeout=2)
-        process.stdout.close(); process.stderr.close()
-        require(not any(reader.is_alive() for reader in readers), 'owned child pipe readers did not join')
+        try:
+            cleanup['pollBeforeAction'] = process.poll()
+            if cleanup['pollBeforeAction'] is None:
+                cleanup['terminate'] = {'attempted': True}; process.terminate(); cleanup['terminate']['returned'] = True
+                try:
+                    code = wait_primary(2, 'after-terminate')
+                except subprocess.TimeoutExpired:
+                    cleanup['kill'] = {'attempted': True}; process.kill(); cleanup['kill']['returned'] = True
+                    code = wait_primary(None, 'after-kill')  # Existing unbounded final wait.
+            else:
+                code = wait_primary(None, 'already-exited')
+        except BaseException as error: cleanup['errors'].append(brief(error)); cleanup_error = error
+        for label, reader in zip(('stdout', 'stderr'), readers):
+            try:
+                begin = time.monotonic()
+                if reader.ident is not None: reader.join(timeout=2)
+                cleanup['readers'].append({'stream': label, 'started': reader.ident is not None, 'aliveAfterJoin': reader.is_alive(),
+                                           'joinTimeoutSeconds': 2, 'joinElapsedSeconds': time.monotonic()-begin})
+            except BaseException as error: cleanup['errors'].append(brief(error)); cleanup_error = error
+        for label, pipe in [('stdout', process.stdout), ('stderr', process.stderr)]:
+            try: pipe.close(); cleanup['pipes'].append({'stream': label, 'closed': pipe.closed})
+            except BaseException as error: cleanup['errors'].append(brief(error)); cleanup_error = error
+        if any(reader.is_alive() for reader in readers):
+            cleanup_error = ValueError('owned child pipe readers did not join'); cleanup['errors'].append(brief(cleanup_error))
+        if cleanup['errors']:
+            if cause is not None: cause.add_note('owned child cleanup also failed: ' + json.dumps(cleanup['errors']))
+            else: cause = cleanup_error
+        if cause is not None: emit('failure-after-cleanup', cause)
+        elif diagnostic_context is not None and diagnostic_context.get('candidate'):
+            emit('transport-complete')
+        if cleanup['errors'] and cause is cleanup_error: raise cleanup_error
 
 
 def bounded_command(argv, limit, *, timeout):
@@ -713,7 +851,16 @@ def cargo_release_artifact(root, state):
             '--manifest-path', context['manifest'], '--package', context['packageId'], '--bin', 'polaris',
             '--features', 'tauri/custom-protocol', '--message-format=json']
     if context['target']: argv.extend(['--target', context['target']])
-    output = cargo_output(argv, root / 'src-tauri', timeout=180)
+    diagnostic_context = {'candidate': state['candidate'],
+                          'buildIdPresent': 'POLARIS_BUILD_ID' in os.environ,
+                          'buildId': os.environ.get('POLARIS_BUILD_ID'),
+                          'frozenContextSha256': hashlib.sha256(json.dumps(context, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+                          'tool': {'path': context['tool']['path'], 'sha256': context['tool']['sha256']},
+                          'packageId': context['packageId'], 'manifest': context['manifest'],
+                          'target': context['target'], 'profile': context['profile'],
+                          'targetDirectory': context['targetDirectory'], 'releaseDirectory': context['releaseDirectory'],
+                          'features': ['tauri/custom-protocol'], 'defaultFeatures': True}
+    output = cargo_output(argv, root / 'src-tauri', timeout=180, diagnostic_context=diagnostic_context)
     events = [json.loads(line) for line in output.splitlines() if line.strip()]
     artifacts = [row for row in events if row.get('reason') == 'compiler-artifact'
                  and row.get('target', {}).get('name') == 'polaris' and row['target'].get('kind') == ['bin']]

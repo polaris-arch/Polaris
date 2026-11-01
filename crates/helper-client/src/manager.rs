@@ -438,7 +438,7 @@ const WIN_PIPE_NAME: &str = polaris_helper_proto::windows_helper::PIPE_NAME;
 /// 共引同一份真值。
 const WIN_SUPPORT_DIR: &str = polaris_helper_proto::windows_helper::DEFAULT_SUPPORT_DIR;
 /// win helper 外置副本文件名。**单一真相源**：[`InstallPaths::win`] 与
-/// [`build_win_install_script`] 必须同取此常量。早先脚本用 `win_basename(src_binary)` 现算、
+/// `build_win_install_script` 必须同取此常量。早先脚本用 `win_basename(src_binary)` 现算、
 /// 而 `InstallPaths::win()` 另写死一个不同路径，两者分叉即 Windows 恒判「未安装」的成因。
 const WIN_HELPER_EXE: &str = "polaris-helper.exe";
 /// win 受保护核目录名（`<support>\core`）。

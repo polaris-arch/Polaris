@@ -8,12 +8,8 @@ const root = path.resolve(import.meta.dirname, '../..');
 const entry = `
 import React, { useState, useLayoutEffect } from 'react';
 import { createRoot } from 'react-dom/client';
-import NodesScreen from '/src/components/screens/nodes/NodesScreen';
-import { MobileNodesScreen } from '/src/mobile/nodes/MobileNodesScreen';
-import { MobileHomeScreen } from '/src/mobile/home/MobileHomeScreen';
-import { MeasurementStartNotice } from '/src/mobile/MeasurementStartNotice';
-import { MeasurementLabel } from '/src/mobile/MeasurementLabel';
-import { Csel } from '/src/components/dialogs/Csel';
+import '/src/mobile/nodes/nodes.css';
+import '/src/mobile/home/home.css';
 import { measurementT, refreshTrayLang } from '/src/tray/labels';
 import { useAppStore } from '/src/store/app-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
@@ -21,10 +17,21 @@ import { useLatencyStore, subscribeLatencyEvents } from '/src/store/use-latency-
 import { measurementFixture } from '/src/store/measurement-fixture.test-support';
 import { api, unlockApi } from '/src/ipc';
 import { configContentDigest } from '/src/lib/staged-config';
+import type { IdentityConflicts } from '/src/domain/identity-repair/model';
 import i18n, { i18nReady } from '/src/i18n';
 import zhCN from '/src/i18n/locales/zh-CN.json';
-await i18nReady; i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); await i18n.changeLanguage('zh-CN');
 const mode=new URLSearchParams(location.search).get('mode')||'desktop';
+// Load only the real leaf exports that the unchanged render branch uses.
+// Keep the formerly transitive styles unconditional and in their original order.
+const [{ default: NodesScreen }, { MobileNodesScreen }, { MobileHomeScreen }, { MeasurementStartNotice }, { MeasurementLabel }, { Csel }] = await Promise.all([
+  !['csel', 'tray-language', 'home', 'ios', 'mobile'].includes(mode) ? import('/src/components/screens/nodes/NodesScreen') : { default: undefined },
+  mode === 'mobile' ? import('/src/mobile/nodes/MobileNodesScreen') : { MobileNodesScreen: undefined },
+  mode === 'home' || mode === 'ios' ? import('/src/mobile/home/MobileHomeScreen') : { MobileHomeScreen: undefined },
+  mode === 'ios' ? import('/src/mobile/MeasurementStartNotice') : { MeasurementStartNotice: undefined },
+  mode === 'tray-language' ? import('/src/mobile/MeasurementLabel') : { MeasurementLabel: undefined },
+  mode === 'csel' ? import('/src/components/dialogs/Csel') : { Csel: undefined },
+]);
+await i18nReady; i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); await i18n.changeLanguage('zh-CN');
 localStorage.setItem('polaris.language','zh-CN');refreshTrayLang();
 document.documentElement.dataset.mobileOs=mode==='ios'?'ios':'android';
 if(mode==='desktop'||mode==='csel')await import('/src/styles/index.css');
@@ -52,6 +59,34 @@ let id=0;window.__TAURI_INTERNALS__={transformCallback(){return ++id;},invoke(cm
 }};
 window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener(){}};
 api.config.get=async()=>config;api.config.meshRouteReport=async()=>null;
+// Same raw-document projection as ConfigManager::identity_conflicts: group only
+// exact string IDs, keep source indices/order, and hash the complete JSON seed.
+api.server.identityConflicts = async (): Promise<IdentityConflicts> => {
+  const raw: Record<string, unknown> = JSON.parse(JSON.stringify(config));
+  const nodes: Record<string, unknown>[] = Array.isArray(raw.servers)
+    ? raw.servers.map(node => node !== null && typeof node === 'object' && !Array.isArray(node) ? node : {}) : [];
+  const byId = new Map<string, number[]>();
+  nodes.forEach((node, index) => {
+    if (typeof node.id === 'string') { const indices = byId.get(node.id) ?? []; indices.push(index); byId.set(node.id, indices); }
+  });
+  const groups = [...byId.values()].filter(indices => indices.length > 1).sort((a, b) => a[0]! - b[0]!).map(indices => ({
+    indices,
+    repairable: indices.every(index => {
+      const node = nodes[index]!;
+      return typeof node.protocol === 'string' && node.protocol.replace(/[A-Z]/g, letter => letter.toLowerCase()) !== 'tailscale'
+        && !Object.hasOwn(node, 'tailscaleSettings') && !Object.hasOwn(node, 'tailscaleCredentialIntent')
+        && typeof node.id === 'string' && node.id.replace(/^\\p{White_Space}+|\\p{White_Space}+$/gu, '').length > 0;
+    }),
+    records: indices.map(index => {
+      const node = nodes[index]!;
+      return { index, name: typeof node.name === 'string' ? node.name : '', protocol: typeof node.protocol === 'string' ? node.protocol : '',
+        address: typeof node.address === 'string' ? node.address : null,
+        port: typeof node.port === 'number' && Number.isInteger(node.port) && node.port >= 0 && node.port < 2 ** 64 ? node.port : null };
+    }),
+  }));
+  return { version: await configContentDigest(raw), groups };
+};
+
 api.proxy.getStatus=async()=>status;
 api.server.speedTestResultSnapshot=async()=>{const snap=measurementFixture(config,{a:40,b:null},String(++f.reads),Date.now());snap.generation=status.running?7:null;snap.frontendConfigDigest=await configContentDigest(config);
  if(!status.running||f.kind==='expired')snap.rows.a.candidate.state='expired';
@@ -159,6 +194,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
     await server.listen(); const address = server.httpServer!.address();
     if (!address || typeof address !== 'object') throw Error('fixture did not bind');
     origin = 'http://127.0.0.1:' + address.port;
+    if (!await server.transformRequest('/measurement-fixture.tsx')) throw Error('fixture transform missing');
+    await server.waitForRequestsIdle();
     browser = await chromium.launch({ chromiumSandbox: true, headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
     // Vite module/CSS/i18n preparation belongs to this bounded setup phase, not
     // the first behavior case's 5000ms allowance. Readiness comes from actual
