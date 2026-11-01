@@ -414,7 +414,6 @@ fn android_config_actually_contains_the_naive_outbound() {
             node_dns_decoy_override: None,
             probe_direct_port: None,
             probe_proxy_port: None,
-            debug_probe_mixed_udp: false,
             update_in_port: None,
             subscription_update_in_port: None,
             loopback_auth: None,

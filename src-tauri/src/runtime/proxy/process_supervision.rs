@@ -595,8 +595,6 @@ impl ProxyRuntime {
             exact_target: None,
             stop_only: false,
             start_confirmed: false,
-            #[cfg(any(all(target_os = "android", debug_assertions), test))]
-            debug_probe_input: None,
             historic_unknown: false,
             stop_inflight: None,
         });
@@ -728,8 +726,6 @@ impl ProxyRuntime {
                     exact_target: None,
                     stop_only: true,
                     start_confirmed: false,
-                    #[cfg(any(all(target_os = "android", debug_assertions), test))]
-                    debug_probe_input: None,
                     historic_unknown: false,
                     stop_inflight: Some(Arc::clone(&nonce)),
                 });

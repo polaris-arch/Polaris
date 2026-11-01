@@ -24,19 +24,6 @@ class AndroidCallbackSchedulingSourceTest {
         assertTrue(stats.contains("if (ownsSubscription) closeClient(token)"))
     }
 
-    @Test fun guardObservationHasOriginalSessionCustodyAndIndependentBoundedExecutor() {
-        val qa = source("DebugBatchQa")
-        val guard = qa.substringAfter("fun guardTick(activity: Activity)").substringBefore("private fun samplePlatform")
-        assertTrue(guard.contains("signalPending.compareAndSet(false, true)"))
-        assertTrue(guard.contains("lease.workerBorn()"))
-        assertTrue(guard.contains("observer.execute(task)"))
-        assertFalse(guard.contains("DebugBatchCommandExecutor"))
-        assertTrue(qa.contains("ArrayBlockingQueue<Runnable>(1)"))
-        assertTrue(qa.contains("observer.shutdownNow().forEach { (it as DebugBatchTask).rejectBeforeRun() }"))
-        assertTrue(qa.contains("observer.isTerminated"))
-        assertTrue(guard.contains("DebugBatchGuard.abortReason"))
-    }
-
     @Test fun networkAndNotificationCallbacksOnlyAdmitOffMainNativeWork() {
         val monitor = source("NetworkMonitorSession")
         assertTrue(monitor.contains("session.worker.execute { pump(session) }"))

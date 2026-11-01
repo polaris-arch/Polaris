@@ -495,8 +495,6 @@ pub(crate) mod guard_scan {
     }
 }
 
-pub mod android_batch_qa;
-pub mod android_transient_close_qa;
 pub mod coexistence_snapshot;
 pub mod config;
 pub mod helper;
@@ -517,8 +515,6 @@ pub mod updater;
 pub mod vpn;
 pub mod window;
 
-pub use android_batch_qa::*;
-pub use android_transient_close_qa::*;
 pub use coexistence_snapshot::{
     coex_readonly_snapshot, coex_runtime_get_state, coex_runtime_refresh,
 };

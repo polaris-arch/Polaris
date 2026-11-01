@@ -187,7 +187,6 @@ fn deps_hash(deps: &GenerateConfigDeps) -> Result<String, CandidateIntegrityErro
         node_dns_decoy_override,
         probe_direct_port,
         probe_proxy_port,
-        debug_probe_mixed_udp,
         update_in_port,
         subscription_update_in_port,
         loopback_auth,
@@ -220,7 +219,6 @@ fn deps_hash(deps: &GenerateConfigDeps) -> Result<String, CandidateIntegrityErro
     value_hash(&serde_json::json!({
         "platform":platform, "arch":arch, "nodeDnsDecoyOverride":node_dns_decoy_override,
         "probeDirectPort":probe_direct_port, "probeProxyPort":probe_proxy_port,
-        "debugProbeMixedUdp":debug_probe_mixed_udp,
         "updateInPort":update_in_port, "subscriptionUpdateInPort":subscription_update_in_port,
         "loopbackAuth":loopback_auth, "probePoolPorts":probe_pool_ports,
         "lanResolverForDns":lan_resolver_for_dns,

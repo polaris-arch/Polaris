@@ -67,20 +67,6 @@ class DebugReportArgs {
 }
 
 @InvokeArg
-class DebugBatchQaArgs {
-    lateinit var action: String
-    var sessionId: String? = null
-    var plan: String? = null
-}
-
-@InvokeArg
-class DebugTransientCloseTimeoutArgs {
-    lateinit var targetKind: String
-    lateinit var instanceId: String
-    lateinit var targetToken: String
-}
-
-@InvokeArg
 class MainStartArgs {
     lateinit var configContent: String
     lateinit var runId: String
@@ -357,87 +343,6 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun transientSpeedtestStatus(invoke: Invoke) {
         val args = invoke.parseArgs(TransientSpeedtestInstanceArgs::class.java)
         invoke.resolve(JSObject().put("state", TransientSpeedtestHost.status(args.instanceId)))
-    }
-
-    @Command
-    fun debugTransientCloseTargets(invoke: Invoke) {
-        if (!BuildConfig.DEBUG) { invoke.reject("Debug transient close timeout is disabled"); return }
-        try {
-            val targets = JSArray()
-            for ((kind, id, token) in DebugTransientCloseTimeout.process.currentTargets()) {
-                targets.put(debugTransientCloseTarget(kind, id, token))
-            }
-            invoke.resolve(JSObject().put("targets", targets))
-        } catch (_: Throwable) { invoke.reject("Transient close timeout targets unavailable") }
-    }
-
-    private fun debugTransientCloseTarget(kind: String, id: String, token: String): JSObject {
-        return JSObject().put("targetKind", kind).put("instanceId", id).put("targetToken", token)
-    }
-
-    @Command
-    fun debugTransientCloseTimeout(invoke: Invoke) {
-        if (!BuildConfig.DEBUG) { invoke.reject("Debug transient close timeout is disabled"); return }
-        try {
-            val args = invoke.parseArgs(DebugTransientCloseTimeoutArgs::class.java)
-            DebugTransientCloseTimeout.process.arm(args.targetKind, args.instanceId, args.targetToken)
-            invoke.resolve(JSObject().put("state", "armedUntilProcessRestart"))
-        } catch (_: Throwable) { invoke.reject("Transient close timeout target unavailable; restart the App process if already armed") }
-    }
-
-    @Command
-    fun debugBatchQa(invoke: Invoke) {
-        if (!BuildConfig.DEBUG) { invoke.reject("Debug batch QA is disabled"); return }
-        val args = invoke.parseArgs(DebugBatchQaArgs::class.java)
-        if (args.action.length > 32 || (args.sessionId?.length ?: 0) > 64 || (args.plan?.length ?: 0) > 4096) {
-            invoke.reject("Batch request outside finite profile"); return
-        }
-        val task = try {
-            DebugBatchQa.commandTask(activity, args.action, args.sessionId, args.plan,
-                { invoke.resolve(JSObject().put("report", it)) },
-                { invoke.reject("Debug batch request unavailable") })
-        } catch (_: Throwable) { invoke.reject("Debug batch request unavailable"); return }
-        try { DebugBatchCommandExecutor.value.execute(task) }
-        catch (error: java.util.concurrent.RejectedExecutionException) { task.rejectBeforeRun(error) }
-    }
-
-    @Command
-    fun debugCoreProbeScope(invoke: Invoke) {
-        if (!BuildConfig.DEBUG) { invoke.reject("Debug core probe loan is disabled"); return }
-        val args = invoke.parseArgs(DebugCoreProbeSessionArgs::class.java)
-        val task = try {
-            DebugBatchQa.coreProbeScopeTask(args.sessionId,
-                { invoke.resolve(JSObject().put("scope", org.json.JSONObject(it))) },
-                { invoke.reject("Core probe scope unavailable") })
-        } catch (_: Throwable) { invoke.reject("Core probe scope unavailable"); return }
-        try { DebugBatchCommandExecutor.value.execute(task) }
-        catch (error: java.util.concurrent.RejectedExecutionException) { task.rejectBeforeRun(error) }
-    }
-
-    @Command
-    fun debugPcEchoPrepare(invoke: Invoke) {
-        if (!BuildConfig.DEBUG) { invoke.reject("Debug PC echo is disabled"); return }
-        val args = invoke.parseArgs(DebugCoreProbeSessionArgs::class.java)
-        val task = try {
-            DebugBatchQa.pcEchoPrepareTask(activity, args.sessionId,
-                { invoke.resolve(JSObject().put("ready", org.json.JSONObject(it))) },
-                { invoke.reject("Current PC Ready unavailable") })
-        } catch (_: Throwable) { invoke.reject("Current PC Ready unavailable"); return }
-        try { DebugBatchCommandExecutor.value.execute(task) }
-        catch (error: java.util.concurrent.RejectedExecutionException) { task.rejectBeforeRun(error) }
-    }
-
-    @Command
-    fun debugCoreProbeLoan(invoke: Invoke) {
-        if (!BuildConfig.DEBUG) { invoke.reject("Debug core probe loan is disabled"); return }
-        val args = invoke.parseArgs(DebugCoreProbeLoanEnvelopeArgs::class.java)
-        val task = try {
-            DebugBatchQa.coreProbeLoanTask(args.loan,
-                { invoke.resolve(JSObject().put("report", it)) },
-                { invoke.reject("Core probe loan unavailable") }, activity)
-        } catch (_: Throwable) { args.loan.password.fill(0); invoke.reject("Core probe loan unavailable"); return }
-        try { DebugBatchCommandExecutor.value.execute(task) }
-        catch (error: java.util.concurrent.RejectedExecutionException) { task.rejectBeforeRun(error) }
     }
 
     @Command

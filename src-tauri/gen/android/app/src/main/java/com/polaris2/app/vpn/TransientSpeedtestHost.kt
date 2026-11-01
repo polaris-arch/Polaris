@@ -98,14 +98,13 @@ internal object TransientSpeedtestHost {
 
     private class LibboxEngine(private val id: String, private val config: String,
         private val validationTicket: AndroidNativeAdmission.Ticket) : TransientSpeedtestSessions.Engine {
-        private val closeTimeout = DebugTransientCloseTimeout.process.Target("speedtest", id)
         private var network: TransientLoginNetwork? = null
         private var server: CommandServer? = null
         private var cleanupProof = true
         private var store: AndroidTailscaleStoreCustody? = null
         private val cleanup = TransientHostCleanup(
             beginResolverClose = { network?.beginResolverClose() },
-            closeService = { closeTimeout.beforeClose(); server?.closeService() },
+            closeService = { server?.closeService() },
             // operationFinished must join before the final whole-run capture/handle release.
             closeServer = {},
             closeNetwork = { network?.close() },
@@ -128,7 +127,6 @@ internal object TransientSpeedtestHost {
             checkNotNull(store).invoke(config, { AndroidTailscaleStoreCustody.export(original) }) {
                 original.startOrReloadService(config, OverrideOptions())
             }
-            closeTimeout.started()
         }
 
         override fun close() = cleanup.close()

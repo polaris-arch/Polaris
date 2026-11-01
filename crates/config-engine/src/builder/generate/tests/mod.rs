@@ -16,7 +16,6 @@ fn deps_default() -> GenerateConfigDeps {
         node_dns_decoy_override: None,
         probe_direct_port: None,
         probe_proxy_port: None,
-        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
         loopback_auth: None,

@@ -53,7 +53,6 @@ fn send_signal(pid: u32, signal: polaris_core_supervisor::Signal) {
 /// 改动者对新触发点做一次显式决定。
 mod exit_ip_wiring_guard;
 
-mod android_probe_loan;
 mod android_takeover;
 mod core_log;
 mod exit_proxy_restore;

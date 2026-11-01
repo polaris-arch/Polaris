@@ -214,15 +214,12 @@ async fn real_pagination_finds_highest_and_current_only_on_page_two_before_host_
     assert_eq!(android["updateInfo"]["version"], "v3.0.0");
     assert_eq!(android["updateInfo"]["downloadUrl"], "");
 
-    // Keep the actual App and debug fixture entrypoints attached to the tested production helper.
+    // Keep the actual App entrypoint attached to the tested production helper.
     let production = crate::commands::guard_scan::top_level_fn_body(
         src(),
         "pub(crate) async fn fetch_releases_json(",
     );
     assert!(production.contains("fetch_release_pages("));
-    assert!(production.contains("local_acceptance::releases(MAX_GITHUB_JSON_BYTES).await"));
-    assert!(production
-        .contains("parse_release_list(body.as_bytes(), RELEASE_FETCH_LIMITS.max_entries)?"));
     assert!(production
         .contains("tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), fetch)"));
 }

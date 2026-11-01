@@ -2361,19 +2361,61 @@ fn external_module_cfg_survives_item_visibility_without_borrowing_neighbor_cfg()
 
 #[test]
 fn release_off_child_file_excludes_both_reads_and_names_but_live_file_does_not() {
-    // Reuse the actual two-read debug child as the controlled source input.
-    // Toggling only its inherited release gate tests both classifications
-    // without creating a temporary file or adding a dev dependency.
-    let rel = "src-tauri/src/runtime/http/local_acceptance.rs";
-    let path = workspace_root().join(rel);
-    let expected = ["POLARIS_ACC01_UPDATE_ORIGIN", "POLARIS_ACC01_UPDATE_TOKEN"];
-    for off in [false, true] {
-        let result = scan_files(vec![SourceFile {
-            rel: rel.to_owned(),
-            path: path.clone(),
-            in_tests_dir: false,
-            release_off_file: off,
-        }]);
+    // A synthetic module tree exercises the same cross-file classifier without
+    // retaining a runtime-only acceptance transport as its fixture.
+    struct SourceFixture(PathBuf);
+    impl Drop for SourceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let create = |name: &str| {
+        let path = std::env::temp_dir().join(format!("polaris-release-{name}-{token}.rs"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        SourceFixture(path)
+    };
+    let parent = create("parent");
+    let child = create("child");
+    let expected = ["POLARIS_FIXTURE_ONE", "POLARIS_FIXTURE_TWO"];
+    std::fs::write(
+        &child.0,
+        "fn reads() { let _ = std::env::var(\"POLARIS_FIXTURE_ONE\"); let _ = std::env::var(\"POLARIS_FIXTURE_TWO\"); }",
+    ).unwrap();
+    for (gate, off) in [
+        ("", false),
+        ("#[cfg(debug_assertions)]", true),
+        ("#[cfg(test)]", true),
+    ] {
+        std::fs::write(&parent.0, format!("{gate} pub(crate) mod child;")).unwrap();
+        let mut files = vec![
+            SourceFile {
+                rel: "src-tauri/src/runtime/fixture.rs".to_owned(),
+                path: parent.0.clone(),
+                in_tests_dir: false,
+                release_off_file: false,
+            },
+            SourceFile {
+                rel: "src-tauri/src/runtime/fixture/child.rs".to_owned(),
+                path: child.0.clone(),
+                in_tests_dir: false,
+                release_off_file: false,
+            },
+        ];
+        mark_release_off_files(&workspace_root(), &mut files);
+        assert_eq!(files[1].release_off_file, off);
+        let result = scan_files(files);
         assert_eq!(result.hits.len(), expected.len());
         for name in expected {
             assert!(result
@@ -2382,20 +2424,6 @@ fn release_off_child_file_excludes_both_reads_and_names_but_live_file_does_not()
                 .any(|hit| hit.name == name && hit.release != off));
             assert_eq!(result.names.contains_key(name), !off);
         }
-    }
-    let surface = scan_surface();
-    let child = surface
-        .iter()
-        .find(|f| f.rel == "src-tauri/src/runtime/http/local_acceptance.rs")
-        .unwrap();
-    assert!(
-        child.release_off_file,
-        "actual debug-only module declaration must propagate"
-    );
-    let result = scan();
-    for name in ["POLARIS_ACC01_UPDATE_ORIGIN", "POLARIS_ACC01_UPDATE_TOKEN"] {
-        assert!(!result.names.contains_key(name));
-        assert!(result.hits.iter().any(|h| h.name == name && !h.release));
     }
 }
 

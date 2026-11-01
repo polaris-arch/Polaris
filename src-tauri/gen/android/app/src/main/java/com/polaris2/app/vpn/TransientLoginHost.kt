@@ -55,7 +55,6 @@ internal object TransientLoginHost {
 
     private class LibboxEngine(id: String, config: String, private val stateDirectories: Set<String>,
         private val requestClose: () -> Unit) : TransientLoginHostState.Engine {
-        private val closeTimeout = DebugTransientCloseTimeout.process.Target("login", id)
         private var config: String? = config
         private var server: CommandServer? = null
         private var network: TransientLoginNetwork? = null
@@ -63,7 +62,7 @@ internal object TransientLoginHost {
         private var store: AndroidTailscaleStoreCustody? = null
         private val cleanup = TransientHostCleanup(
             beginResolverClose = { network?.beginResolverClose() },
-            closeService = { closeTimeout.beforeClose(); server?.let { server ->
+            closeService = { server?.let { server ->
                 try { server.closeService() }
                 finally { store?.closed { AndroidTailscaleStoreCustody.export(server) } }
             } },
@@ -109,7 +108,6 @@ internal object TransientLoginHost {
                 checkNotNull(store).invoke(checkNotNull(config), { AndroidTailscaleStoreCustody.export(original) }) {
                     original.startOrReloadService(checkNotNull(config), OverrideOptions())
                 }
-                closeTimeout.started()
             }
             finally { config = null }
         }

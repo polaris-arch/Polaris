@@ -1913,12 +1913,6 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
         "双模式 Clash 投影仅给已有管理 API 的 Android JNI 宿主；iOS/未知平台不因此取得该投影或管理能力，须先接入自己的管理 API 面。",
     ),
     (
-        "crates/config-engine/src/builder/inbounds.rs",
-        "if cfg!(debug_assertions) && deps.platform == \"android\" && deps.debug_probe_mixed_udp",
-        1,
-        "认证回环探针的 UDP mixed 仅限 Debug Android 且 runtime 明确开启；release/iOS/未知平台保持原 HTTP 入站，不凭平台字符串扩大监听能力。",
-    ),
-    (
         "src-tauri/src/runtime/proxy/mesh_apply/candidate.rs",
         ", target_os: deps.platform.clone(), target_arch: deps.arch.clone(), ports: PortsProvenance::ProbedNumbersNotReserved, interface_binding: SubsetApplicability::NotRequiredByValidatedNonTunSubset, check_support: if !userspace_mesh && deps.platform == \"linux\" && deps.arch == \"x86_64\" && plain_tcp",
         1,
@@ -3055,34 +3049,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
          但当前又落到桌面可执行文件路径，需独立进程内登录宿主。",
     ),
     // 2026-10-01：对齐出生/退出托管与 Android 调试桥的真实新增点。
-    (
-        "src-tauri/src/commands/android_transient_close_qa.rs",
-        "all(target_os = \"android\", debug_assertions)",
-        2,
-        IosSide::DiffersOnlyInDebug,
-        "ACC-01关闭超时注入只在Debug Android调用精确实例的JNI调试桥；iOS没有此宿主。",
-    ),
-    (
-        "src-tauri/src/commands/android_transient_close_qa.rs",
-        "not(all(target_os = \"android\", debug_assertions))",
-        2,
-        IosSide::DiffersOnlyInDebug,
-        "ACC-01非Debug Android命令只返回disabled，不创建资源。",
-    ),
-    (
-        "src-tauri/src/commands/android_batch_qa.rs",
-        "all(target_os = \"android\", debug_assertions)",
-        1,
-        IosSide::DiffersOnlyInDebug,
-        "batch QA 命令仅 Debug Android 调 JNI 调试桥；release 两平台都关闭，Debug iOS 没有 Android 桥，保持 disabled。",
-    ),
-    (
-        "src-tauri/src/commands/android_batch_qa.rs",
-        "not(all(target_os = \"android\", debug_assertions))",
-        1,
-        IosSide::DiffersOnlyInDebug,
-        "batch QA 非 Debug Android 返回 disabled；release Android/iOS 同侧，Debug iOS 仍禁用而非引用不存在的 JNI。",
-    ),
 
 
 
@@ -3097,24 +3063,10 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/runtime/proxy.rs",
-        "any(all(target_os = \"android\", debug_assertions), test)",
-        3,
-        IosSide::DiffersOnlyInDebug,
-        "Android probe snapshot/session 输入及 QA/probe 模块只为调试 Android 桥，test 可编纯状态机；release iOS/Android 都无调试模块，Debug iOS 不引用 JNI。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy.rs",
         "target_os = \"ios\"",
         8,
         IosSide::DiffersRight,
         "原 iOS 错误常量/正常 native receipt 槽及构造保留；新增 LocalStart/Observed exactly-one custody 表示与原槽方法。iOS 用自己的原 request/session/config/native 身份，Observed 无外来 MainBirthToken 且未 scoped关闭仍 occupied；Android 保原 JNI producer/booking，不消费 NE 字段。这里区分两端实际 producer 身份，不签 global NoOwner 或实际 iOS 运行验收。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/android_bridge.rs",
-        "all(target_os = \"android\", debug_assertions)",
-        6,
-        IosSide::DiffersOnlyInDebug,
-        "JNI debug command/core probe及ACC-01关闭超时注入只在Debug Android存在；iOS无该插件，release两端均无调试入口。",
     ),
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
@@ -3229,20 +3181,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "Android 容量错误转 SpawnError 时使用 android-libbox 标识；test 只验错误投影，iOS 没有此容量宿主，须定义自己的错误转换。",
     ),
     (
-        "src-tauri/src/runtime/proxy/android_probe_loan.rs",
-        "all(target_os = \"android\", debug_assertions)",
-        1,
-        IosSide::DiffersOnlyInDebug,
-        "debug_android_core_probe 消费 Debug Android 的会话/instance 出生凭据；release 两端均无此入口，iOS 不具 Android 实例身份。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/hot_switch.rs",
-        "any(all(target_os = \"android\", debug_assertions), test)",
-        2,
-        IosSide::DiffersOnlyInDebug,
-        "hot switch 的 probe snapshot 输入/提取仅 Debug Android 或纯 test；release 无此调试字段，Debug iOS 没有 Android probe session。",
-    ),
-    (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "any(target_os = \"android\", test)",
         3,
@@ -3256,13 +3194,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersUndecided,
         "七处 Android reconnect、主核 claim/drain/stop；普通与 owned Stop 状态共用同一 guard 外 reconnect/native bridge 投影，不保留重复平台分支。原 JNI instance 分派保持。iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
     ),
-    (
-        "src-tauri/src/runtime/proxy/process_supervision.rs",
-        "any(all(target_os = \"android\", debug_assertions), test)",
-        2,
-        IosSide::DiffersOnlyInDebug,
-        "stop observation 的 debug_probe_input 初始与历史 Unknown 构造仅 Debug Android/test；release 两平台均无该字段，Debug iOS 无 Android probe 会话。",
-    ),
 
     (
         "src-tauri/src/runtime/proxy/process_supervision/direct_stop.rs",
@@ -3270,20 +3201,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         3,
         IosSide::DiffersWrongToday,
         "三个 direct-stop 入口仅拒绝 Android/已有 helper，iOS 当前仍进入桌面 Child custody；iOS 不提供此 Child，需 NE 扩展 birth/stop adapter 后再收紧平台闭集。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/startup.rs",
-        "all(target_os = \"android\", debug_assertions)",
-        3,
-        IosSide::DiffersOnlyInDebug,
-        "启动后 Android probe 开始记录、发布 snapshot、deps UDP flag 仅 Debug Android；release 两平台同侧，Debug iOS 无 Android调试会话。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/startup.rs",
-        "not(all(target_os = \"android\", debug_assertions))",
-        1,
-        IosSide::DiffersOnlyInDebug,
-        "release 或非 Android 的常规 switch snapshot 分支不持 Android probe 凭据；Debug iOS 仍走常规分支，尚无 Android 调试能力。",
     ),
 
 

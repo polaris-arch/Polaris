@@ -503,7 +503,6 @@ class BoxService(
     ) {
         val token = if (BuildConfig.DEBUG) runCatching {
             check(Thread.holdsLock(attempt.operationLock))
-            DebugBatchQa.nativeInputChanged(attempt)
             val digest = SystemStart.sha256(config.toByteArray(Charsets.UTF_8))
             DebugAppliedInputs.witness.begin(attempt, server, attempt.runId, attempt.birthNonce, digest)
         }.getOrNull() else null
@@ -673,7 +672,6 @@ class BoxService(
         state = ServiceState.Stopping
         VpnBridge.publishLifecycle(attempt, "unavailable")
         if (BuildConfig.DEBUG) runCatching {
-            DebugBatchQa.nativeInputChanged(attempt)
             DebugAppliedInputs.witness.seal(attempt)
         }
         val detachedTun = attempt.revokeAndDetachTun()

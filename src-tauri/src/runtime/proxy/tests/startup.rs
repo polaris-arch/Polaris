@@ -4271,7 +4271,6 @@ fn probe_pool_generate_deps(slots: u16) -> polaris_config_engine::builder::Gener
         node_dns_decoy_override: None,
         probe_direct_port: None,
         probe_proxy_port: Some(39_000),
-        debug_probe_mixed_udp: false,
         update_in_port: None,
         subscription_update_in_port: None,
         loopback_auth: None,

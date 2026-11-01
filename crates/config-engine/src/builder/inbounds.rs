@@ -37,7 +37,6 @@ use polaris_helper_proto::Platform;
 pub struct InboundsDeps {
     pub probe_direct_port: Option<u16>,
     pub probe_proxy_port: Option<u16>,
-    pub debug_probe_mixed_udp: bool,
     pub update_in_port: Option<u16>,
     pub subscription_update_in_port: Option<u16>,
     pub probe_pool_ports: Vec<u16>,
@@ -222,15 +221,11 @@ pub fn build_inbounds(
             inbounds.push(http_loopback("probe-direct-in", dp, users.clone()));
         }
         if let Some(pp) = deps.probe_proxy_port {
-            let mut probe = http_loopback(
+            let probe = http_loopback(
                 crate::builder::helpers::PROBE_PROXY_INBOUND_TAG,
                 pp,
                 users.clone(),
             );
-            // Same authenticated tag/selector and HTTP behavior; SOCKS5 adds UDP only in Debug.
-            if cfg!(debug_assertions) && deps.platform == "android" && deps.debug_probe_mixed_udp {
-                probe.type_field = "mixed".into();
-            }
             inbounds.push(probe);
         }
 

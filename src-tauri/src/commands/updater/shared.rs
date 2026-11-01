@@ -223,22 +223,6 @@ pub(crate) async fn fetch_releases_json(
 ) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_millis(GITHUB_FETCH_TIMEOUT_MS);
     let fetch = async {
-        #[cfg(debug_assertions)]
-        if (owner, repo) == polaris_updater::github::APP_UPDATE_REPO {
-            if let Some(result) =
-                crate::runtime::http::local_acceptance::releases(MAX_GITHUB_JSON_BYTES).await
-            {
-                // The debug fixture is one complete list, not a GitHub API page. Keep its
-                // existing endpoint/auth contract, but enforce the same total-list limits.
-                let body = result?;
-                if body.len() > RELEASE_FETCH_LIMITS.max_bytes {
-                    return Err("GitHub releases total byte limit exceeded".to_string());
-                }
-                parse_release_list(body.as_bytes(), RELEASE_FETCH_LIMITS.max_entries)?;
-                check_release_deadline(deadline)?;
-                return Ok(body);
-            }
-        }
         let http = state.http().clone();
         fetch_release_pages(
             http.as_ref(),

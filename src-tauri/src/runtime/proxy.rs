@@ -26,10 +26,6 @@
 
 pub(crate) mod android_bridge;
 pub(crate) mod android_capacity;
-#[cfg(any(all(target_os = "android", debug_assertions), test))]
-mod android_probe_loan;
-#[cfg(any(all(target_os = "android", debug_assertions), test))]
-mod debug_pc_echo;
 // Read-only proof shape for a future Android managed handoff. It cannot release
 // legacy custody or publish NoOldCore until every native owner is wired.
 #[allow(dead_code)]
@@ -1772,8 +1768,6 @@ struct AndroidGlobalCustody {
     exact_target: Option<android_bridge::AndroidExactTarget>,
     stop_only: bool,
     start_confirmed: bool,
-    #[cfg(any(all(target_os = "android", debug_assertions), test))]
-    debug_probe_input: Option<android_probe_loan::AndroidProbeStartBinding>,
     /// Monotone until this entire birth is removed after a certain ACK.
     historic_unknown: bool,
     stop_inflight: Option<Arc<()>>,

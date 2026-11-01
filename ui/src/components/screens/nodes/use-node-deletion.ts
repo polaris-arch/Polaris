@@ -20,7 +20,7 @@ import { selectedDeletableIds } from './nodes-logic';
  *
  * **武装侧持有、读取侧 import**：翻红的 `.confirming` 样式与「再点一次」文案由 `NodesBatchBar`
  * 按 `confirmArmed === BATCH_DEL_KEY` 渲染，而武装是这里做的。两侧各写一份字面量时，任一侧改动
- * 都不会有任何东西转红（`prototype-confirm-parity` 只登记武装侧），症状是删除按钮永远不翻红 ——
+ * 可能漏掉读取侧回归，症状是删除按钮永远不翻红 ——
  * 破坏性操作的视觉确认信号静默消失，而两击删除照常执行。
  */
 export const BATCH_DEL_KEY = 'batch-del';

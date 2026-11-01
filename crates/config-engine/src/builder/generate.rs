@@ -139,8 +139,6 @@ pub struct GenerateConfigDeps {
     pub node_dns_decoy_override: Option<String>,
     pub probe_direct_port: Option<u16>,
     pub probe_proxy_port: Option<u16>,
-    /// Trusted runtime Debug Android capability; never a user-config/serialized approval.
-    pub debug_probe_mixed_udp: bool,
     pub update_in_port: Option<u16>,
     pub subscription_update_in_port: Option<u16>,
     /// 回环探针/更新入站的一次性凭据（见 [`InboundsDeps::loopback_auth`]）。
@@ -543,7 +541,6 @@ fn generate_base_config(
         log: deps.log,
         observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
         loopback_auth: deps.loopback_auth.clone(),
-        debug_probe_mixed_udp: deps.debug_probe_mixed_udp,
     };
     let inbounds = build_inbounds(config, Some(resolved_ips), &inbounds_deps);
 

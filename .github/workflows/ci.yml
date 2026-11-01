@@ -181,6 +181,15 @@ jobs:
           # The previous tip is normally a direct parent. Missing/multi-push
           # history falls back to full native CI instead of fetching more history.
           fetch-depth: 2
+      - name: Reject tracked local acceptance material
+        shell: bash
+        run: |
+          set -euo pipefail
+          tracked="$(git ls-files -- local-acceptance)"
+          if [[ -n "$tracked" ]]; then
+            printf 'Local acceptance files must remain untracked:\n%s\n' "$tracked" >&2
+            exit 1
+          fi
       - name: Setup candidate admission Node
         uses: actions/setup-node@v7
         with:

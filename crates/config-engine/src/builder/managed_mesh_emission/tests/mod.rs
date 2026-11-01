@@ -723,7 +723,6 @@ fn real_generator_normal_two_tailscale_config_emits_managed_rules() {
         node_dns_decoy_override: None,
         probe_direct_port: Some(21001),
         probe_proxy_port: Some(21002),
-        debug_probe_mixed_udp: false,
         update_in_port: Some(21003),
         subscription_update_in_port: None,
         loopback_auth: None,
