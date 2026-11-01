@@ -586,7 +586,7 @@ class Integrity(unittest.TestCase):
                 with self.assertRaises(ValueError): w.verify_generated_script(root, state)
 
     @contextmanager
-    def inert_reader(self, listing, payloads, *, stderr_bytes=0, delay=0, extra_files=None):
+    def inert_reader(self, listing, payloads, *, stderr_bytes=0, delay=0, extra_files=None, eof_handshake=None):
         # Exercise real pipe threads, bounded parent writes, exits and joins.
         # These children emit controlled bytes; none is a 7z/NSIS implementation.
         popen = subprocess.Popen; children = []; commands = []
@@ -597,14 +597,34 @@ class Integrity(unittest.TestCase):
                 selector = next(value[3:] for value in argv if value.startswith('-i@'))
                 names = Path(selector).read_text(encoding='utf-8').splitlines()
                 rows = [(name, payloads[name]) for name in names] + list((extra_files or {}).items())
+                before = after = ''
+                if eof_handshake is not None:
+                    go, ready, release = map(str, eof_handshake)
+                    before = ('os.close(1);os.close(2)\n'
+                              + 'deadline=time.monotonic()+6\n'
+                              + 'while not Path(' + repr(go) + ').exists():\n'
+                              + ' if time.monotonic()>deadline:os._exit(71)\n time.sleep(.005)\n')
+                    after = ('Path(' + repr(ready) + ').touch()\n'
+                             + 'while not Path(' + repr(release) + ').exists():\n'
+                             + ' if time.monotonic()>deadline:os._exit(72)\n time.sleep(.005)\n'
+                             + 'os._exit(0)\n')
                 program = ('import os,sys,time\nfrom pathlib import Path\ntime.sleep(' + repr(delay) + ')\n'
-                           + 'root=Path(' + repr(destination) + ')\n'
+                           + 'root=Path(' + repr(destination) + ')\n' + before
                            + 'for name,data in ' + repr(rows) + ':\n'
                            + ' p=root/name;p.parent.mkdir(parents=True,exist_ok=True)\n'
                            + ' if isinstance(data,dict):os.link(root/data["hardlink"],p)\n'
                            + ' else:p.write_bytes(b"x"*data if isinstance(data,int)else data)\n'
-                           + 'sys.stdout.buffer.write(b"inert named extraction\\n");sys.stdout.buffer.flush()\n')
-                child = popen([sys.executable, '-u', '-c', program], **kwargs); children.append(child); return child
+                           + (after or 'sys.stdout.buffer.write(b"inert named extraction\\n");sys.stdout.buffer.flush()\n'))
+                child = popen([sys.executable, '-u', '-c', program], **kwargs); children.append(child)
+                if eof_handshake is not None:
+                    actual_wait = child.wait
+                    def wait(timeout=None):
+                        # Signal only when the real transport reaches its post-EOF
+                        # wait. Preserve the actual Popen wait, timeout and result.
+                        if not Path(go).exists(): Path(go).touch()
+                        return actual_wait(timeout=timeout)
+                    child.wait = wait
+                return child
             payload = listing if argv[1] == 'l' else payloads[argv[-1]]
             if isinstance(payload, int):
                 producer = 'remaining=' + str(payload) + "\nwhile remaining:\n n=min(65536,remaining);sys.stdout.buffer.write(b'x'*n);sys.stdout.buffer.flush();remaining-=n\n"
@@ -982,6 +1002,59 @@ class Integrity(unittest.TestCase):
         self.assertTrue(final['cleanup']['waits'][-1]['returned'])
         self.assertEqual(final['cleanup']['waits'][-1]['code'], children[0].returncode)
         self.assertTrue(all(row['closed'] for row in final['cleanup']['pipes']))
+
+    def test_actual_named_child_writes_after_dual_eof_is_guarded_before_exit_and_reaped(self):
+        for extra, message in [(None, 'extracted member byte limit'),
+                               ({'foreign': b'x'}, 'unregistered NSIS extracted member')]:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); archive = root/'inert.exe'; archive.write_bytes(b'inert')
+                owned = root/'owned'; go, ready, release = [root/name for name in ('go', 'ready', 'release')]
+                log = io.StringIO(); expected = {'App': w.byte_facts(b'App')}
+                with self.inert_reader(self.listing([('App', 3)]), {'App': b'App' if extra else b'OVER'},
+                                       extra_files=extra, eof_handshake=(go, ready, release)) as (children, _), redirect_stderr(log):
+                    with self.assertRaisesRegex(ValueError, message):
+                        w.unpack_nsis('inert-reader', archive, owned, {'App': 3}, expected=expected, timeout=3)
+                self.assertTrue(go.exists()); self.assertFalse(release.exists())
+                self.assertFalse(owned.exists()); self.assertFalse(list(root.glob('nsis-list-*')))
+                before, final = self.diagnostic_records(log)
+                self.assertIsNone(before['primaryPoll'])
+                self.assertTrue(all(row['eofRead'] and row['eofConsumed'] for row in before['streams'].values()))
+                self.assertTrue(final['cleanup']['terminate']['returned'])
+                self.assertTrue(final['cleanup']['waits'][-1]['returned'])
+                self.assertEqual(final['cleanup']['waits'][-1]['code'], children[-1].returncode)
+                self.assertTrue(all(not row['aliveAfterJoin'] for row in final['cleanup']['readers']))
+                self.assertTrue(children[-1].stdout.closed and children[-1].stderr.closed)
+                self.assertLessEqual(len(final['cleanup']['waits']), 2)
+
+    def test_actual_named_child_early_dual_eof_success_requires_guarded_real_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); archive = root/'inert.exe'; archive.write_bytes(b'inert')
+            go, ready, release = [root/name for name in ('go', 'ready', 'release')]
+            expected = {'App': w.byte_facts(b'App')}; log = io.StringIO(); phases = set(); original = w.stream_child
+            def stream(*args, **kwargs):
+                if kwargs.get('output_guard') is not None:
+                    original_guard = kwargs['output_guard']
+                    def guard():
+                        original_guard()
+                        if ready.exists():
+                            phases.add('alive' if children[-1].poll() is None else 'exited')
+                            release.touch()
+                    kwargs.update(output_guard=guard, diagnostic_context={'candidate': 'inert-early-eof-fixture'})
+                return original(*args, **kwargs)
+            with self.inert_reader(self.listing([('App', 3)]), {'App': b'App'},
+                                   eof_handshake=(go, ready, release)) as (children, _), \
+                 patch.object(w, 'stream_child', side_effect=stream), redirect_stderr(log):
+                actual, _ = w.unpack_nsis('inert-reader', archive, root/'owned', {'App': 3}, expected=expected, timeout=3)
+            self.assertEqual(actual, expected); self.assertEqual(phases, {'alive', 'exited'})
+            self.assertEqual((root/'owned/App').read_bytes(), b'App')
+            final, = self.diagnostic_records(log)
+            self.assertEqual(final['stage'], 'transport-complete'); self.assertEqual(final['primaryPoll'], 0)
+            self.assertTrue(all(row['eofRead'] and row['eofConsumed'] for row in final['streams'].values()))
+            self.assertIsNone(final['cleanup']['terminate']); self.assertIsNone(final['cleanup']['kill'])
+            self.assertTrue(all(row['returned'] and row['code'] == 0 for row in final['cleanup']['waits']))
+            self.assertLessEqual(len(final['cleanup']['waits']), 2)
+            self.assertTrue(all(not row['aliveAfterJoin'] for row in final['cleanup']['readers']))
+            self.assertTrue(children[-1].stdout.closed and children[-1].stderr.closed)
 
     def test_actual_exited_primary_with_finite_owned_pipe_holder_is_not_eof_success(self):
         # Two actual fixture-owned children share inherited OS writer endpoints.

@@ -588,11 +588,22 @@ def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MA
                 if cargo_json: cargo_events(block); decoder.decode(block)
                 consume_stdout(block)
                 stdout_bytes += len(block); delivered_hash.update(block)
-        if output_guard is not None: output_guard()
+        if output_guard is not None:
+            # EOF closes the pipes, not the child's ability to write named files.
+            # Short waits keep the same guard/deadline active through actual exit;
+            # do not append every timed poll to the bounded cleanup diagnostics.
+            while True:
+                output_guard()
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, 'owned child exit deadline exceeded')
+                try: process.wait(timeout=min(remaining, 0.05))
+                except subprocess.TimeoutExpired: continue
+                break
         remaining = deadline - time.monotonic()
         require(remaining > 0, 'owned child exit deadline exceeded')
         try: code = wait_primary(remaining, 'exit')
         except subprocess.TimeoutExpired as error: raise ValueError('owned child exit deadline exceeded') from error
+        if output_guard is not None: output_guard()
         require(code == 0, 'owned child failed (' + str(code) + '): ' + stderr.decode('utf-8', errors='replace'))
         if decoder is not None: decoder.decode(b'', final=True)
         return {'stdoutBytes': stdout_bytes, 'stderrBytes': len(stderr), 'pid': process.pid,
