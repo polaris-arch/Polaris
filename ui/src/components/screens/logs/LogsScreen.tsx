@@ -327,7 +327,7 @@ export function LogsScreen() {
       if (!Array.isArray(batch)) throw new Error('Invalid log snapshot');
       setLogStreamReady(true);
       if (epoch !== logReadEpoch.current) return;
-      const snapshot = batch.slice(-MAX_BUFFERED_ROWS);
+      const snapshot: LogRow[] = batch.slice(-MAX_BUFFERED_ROWS);
       const top = maxLogId(snapshot);
       if (top !== null && top > lastIdRef.current) lastIdRef.current = top;
       if (followRef.current) {
