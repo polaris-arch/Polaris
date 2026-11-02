@@ -80,6 +80,33 @@ const CHARACTER: char = '}';
     expect(() => rustFunctionSource('fn other() {}\nfn 目标target() {}', 'target')).toThrow('Missing Rust function: target');
   });
 
+  it.each([
+    "fn target<T>(value: T) -> T where T: Read + Send + 'static { value }",
+    'fn target() -> &\'static str { "ready" }',
+    "fn target<'a, T>(value: &'a T) -> &'a T where 'a: 'static, T: Send + 'a + 'static { value }",
+    "fn target<'寿命, T>(value: &'寿命 T) -> &'寿命 T where T: '寿命 + Send + 'static { value }",
+    "fn target(value: &str) -> &'_ str { value }",
+  ])('keeps lifetime bounds and borrowed return types within their function: %s', (expected) => {
+    const source = `static BEFORE: &str = "before";\n${expected}\nstatic AFTER: &str = "after";\nfn neighbor() { trap(); }`;
+    expect(rustFunctionSource(source, 'target')).toBe(expected);
+  });
+
+  it.each([
+    'fn target<T>() -> T\nstatic LEAKED: T = { trap(); };',
+    "fn target<T>() -> T where T: Send + 'static\nstatic LEAKED: T = { trap(); };",
+    "fn target() -> &'static str\nstatic LEAKED: &str = { trap(); };",
+  ])('still rejects an actual static item after a header/lifetime instead of borrowing its initializer: %s', (source) => {
+    expect(() => rustFunctionSource(`${source}\nfn neighbor() {}`, 'target'))
+      .toThrow('Unexpected item in Rust function header: target');
+  });
+
+  it.each([
+    "fn target<T>() -> T where T: Send + ' static { value }\nfn neighbor() { trap(); }",
+    "fn target() -> &' { value }\nfn neighbor() { trap(); }",
+  ])('rejects a malformed lifetime token without consuming a later body: %s', (source) => {
+    expect(() => rustFunctionSource(source, 'target')).toThrow('Invalid Rust function lifetime: target');
+  });
+
   it('skips trait prototypes without borrowing a neighboring function body', () => {
     const prototype = 'trait Consumer { fn target<T>(&self, value: T) -> T where T: Send; }';
     expect(() => rustFunctionSource(`${prototype}\nfn neighbor() { trap(); }`, 'target'))

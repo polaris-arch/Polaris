@@ -138,6 +138,15 @@ export function rustFunctionSource(source: string, name: string): string {
     }
     while (at < limit && masked[at] !== '{' && masked[at] !== ';') {
       const token = masked[at];
+      // Lifetime names form one token, including the apostrophe. In particular,
+      // 'static in a bound/return type is not the independent static item below.
+      // Literals are already masked; a remaining bare apostrophe is malformed.
+      if (token === "'") {
+        const lifetime = /^'[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*/.exec(masked.slice(at, limit));
+        if (!lifetime) throw new Error(`Invalid Rust function lifetime: ${name}`);
+        at += lifetime[0].length;
+        continue;
+      }
       if (token === '<' || token === '(' || token === '[') {
         at = rustFunctionGroupEnd(masked, at, limit, name);
       } else {
