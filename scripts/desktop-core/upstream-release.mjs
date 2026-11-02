@@ -16,6 +16,74 @@ export const isUpstreamRelease = (contract) => contract?.schema === 'polaris-ups
 export const COMMITTED_INDEX_PATH = 'scripts/desktop-core/release-asset-index.json';
 export const hasCommittedReleaseMaterials = contract => contract?.materialTransport === 'committed-index-github-source-v1';
 export const isUpstreamRow = (row) => row?.schema === 'polaris-upstream-native-receipt-v1';
+
+// Owner classification recognizes retained metadata only. It never validates
+// native facts or grants execution authority: acquisition must still run the
+// byte/tree-verified, source-owned full proof validator in release-archive.py.
+const WINDOWS_PROOF_JOB = 'Explicit SYSTEM final-package Windows native execution proof';
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const PROOF_KEYS = ['sealedExecution', 'macosExecution', 'windowsExecution'];
+const PROOF_HEADER = ['sourceCommit', 'sourceTree', 'version', 'target', 'runId', 'runAttempt', 'archiveSha256', 'core', 'tlsProbe', 'cronet'];
+function nativeJobName(contract, key, row) {
+  const recipes = {
+    linux: { target: 'linux/amd64', proof: 'sealedExecution', schema: null, loader: 'linux-sealed-fd-v1' },
+    win: { target: 'windows/amd64', proof: 'windowsExecution', schema: 'polaris-windows-native-execution-proof-v1', loader: 'windows-helper-private-cohort-v1' },
+    'mac-x64': { target: 'darwin/amd64', proof: 'macosExecution', schema: 'polaris-macos-native-execution-proof-v1', loader: 'macos-root-private-v1' },
+    'mac-arm64': { target: 'darwin/arm64', proof: 'macosExecution', schema: 'polaris-macos-native-execution-proof-v1', loader: 'macos-root-private-v1' },
+  };
+  const recipe = recipes[key], smoke = row?.finalPackageCronetSmoke;
+  demand(recipe && record(row) && isUpstreamRow(row) && row.target === recipe.target
+    && row.sourceCommit === contract.sourceCommit && row.sourceTree === contract.sourceTree
+    && row.version === contract.version && record(smoke) && smoke.status === 'passed',
+  'Upstream native owner row differs');
+  same(row.variant, { linkage: key.startsWith('mac-') ? 'static-cgo' : 'shared-purego',
+    libc: '', goarm: '', gomips: '', go386: '', legacy: false }, 'Upstream native owner variant differs');
+  const ordinary = 'Native final-package Cronet and gVisor smoke (' + UPSTREAM_SMOKE_JOBS[key] + ')';
+  const keys = PROOF_KEYS.filter(name => Object.hasOwn(smoke, name));
+  const policyPresent = Object.hasOwn(row, 'trustedExecution');
+  if (!keys.length && !policyPresent) return ordinary;
+  demand(keys.length === 1 && keys[0] === recipe.proof && policyPresent,
+    'Upstream native owner requires one target proof and policy');
+  const proof = smoke[keys[0]], policy = row.trustedExecution;
+  demand(record(proof) && record(policy), 'Upstream native owner proof/policy shape differs');
+  const fields = [...PROOF_HEADER, ...(key === 'linux' ? ['sidecar', 'coreSeals', 'sidecarSeals']
+    : key === 'win' ? ['sidecar', 'schema', 'native'] : ['schema', 'postSign'])];
+  same(Object.keys(proof).sort(), fields.sort(), 'Upstream native owner proof header fields differ');
+  demand(recipe.schema === null ? !Object.hasOwn(proof, 'schema') : proof.schema === recipe.schema,
+    'Upstream native owner proof schema differs');
+  for (const name of ['sourceCommit', 'sourceTree', 'version', 'target'])
+    demand(proof[name] === row[name], 'Upstream native owner proof source/target differs');
+  demand(positive(proof.runId) && proof.runId === contract.producer.runId
+    && positive(proof.runAttempt) && proof.runAttempt === contract.producer.runAttempt
+    && proof.archiveSha256 === row.archive?.sha256 && record(proof.tlsProbe) && record(proof.cronet),
+  'Upstream native owner proof run/archive header differs');
+  same(proof.core, row.core, 'Upstream native owner Core header differs');
+  if (key === 'linux' || key === 'win') same(proof.sidecar, row.sidecar, 'Upstream native owner sidecar header differs');
+  demand(key === 'linux' ? proof.coreSeals === 15 && proof.sidecarSeals === 15
+    : record(key === 'win' ? proof.native : proof.postSign), 'Upstream native owner body container differs');
+  same(Object.keys(policy).sort(), ['schema', 'sourceCommit', 'sourceTree', 'loader', 'purposes'].sort(),
+    'Upstream native owner policy fields differ');
+  // Linux's existing versioned schema permits a nonempty unique subset. Its
+  // exact derived purposes remain the source-owned full validator's decision.
+  const linuxPurposes = ['check-config-v1', 'tls-inventory-v1', 'run-main-v1', 'run-login-v1', 'run-speedtest-v1'];
+  if (key === 'linux') demand(Array.isArray(policy.purposes) && policy.purposes.length > 0
+    && new Set(policy.purposes).size === policy.purposes.length && policy.purposes.every(p => linuxPurposes.includes(p)),
+  'Upstream native owner Linux purposes differ');
+  same(policy, { schema: 'polaris-trusted-execution-v1', sourceCommit: row.sourceCommit,
+    sourceTree: row.sourceTree, loader: recipe.loader,
+    purposes: key === 'linux' ? policy.purposes : ['check-config-v1', 'run-main-v1'] },
+  'Upstream native owner policy differs');
+  return key === 'win' ? WINDOWS_PROOF_JOB : ordinary;
+}
+function validateNativeJobOwners(contract) {
+  same(Object.keys(contract.platforms ?? {}).sort(), Object.keys(UPSTREAM_SMOKE_JOBS).sort(), 'Upstream native owner platform inventory differs');
+  const jobs = contract.producer?.nativeJobs;
+  same(Object.keys(jobs ?? {}).sort(), Object.keys(UPSTREAM_SMOKE_JOBS).sort(), 'Upstream native job inventory differs');
+  for (const [key, job] of Object.entries(jobs)) demand(record(job) && positive(job.id)
+    && job.name === nativeJobName(contract, key, contract.platforms[key]), 'Upstream native job identity differs');
+  demand(new Set(Object.values(jobs).map(job => job.id)).size === 4, 'Duplicate upstream native job');
+}
+
 export function safeNativePath(name) {
   return typeof name === 'string' && name.length <= 512 && name.split('/').every((part) =>
     /^[A-Za-z0-9_+.-]+$/.test(part) && !['.', '..'].includes(part) && !part.endsWith('.')
@@ -193,10 +261,6 @@ export function validateUpstreamContract(contract, targets) {
   demand(producer?.repository === REPO && producer.repositoryId === contract.repositoryId
     && /^\.github\/workflows\/[^/]+\.yml$/.test(producer.workflow ?? '') && hex(producer.workflowCommit, 40)
     && producer.workflowCommit === contract.sourceCommit && positive(producer.runId) && positive(producer.runAttempt), 'Upstream same-run producer identity differs');
-  same(Object.keys(producer.nativeJobs ?? {}).sort(), Object.keys(targets).sort(), 'Upstream native job inventory differs');
-  for (const [key, job] of Object.entries(producer.nativeJobs)) demand(positive(job.id)
-    && job.name === `Native final-package Cronet and gVisor smoke (${UPSTREAM_SMOKE_JOBS[key]})`, 'Upstream native job identity differs');
-  demand(new Set(Object.values(producer.nativeJobs).map((job) => job.id)).size === 4, 'Duplicate upstream native job');
   if (Object.hasOwn(contract, 'materialTransport')) {
     demand(hasCommittedReleaseMaterials(contract), 'Unsupported release material transport');
     file(contract.assetIndex, 8 * 1024 * 1024);
@@ -227,12 +291,14 @@ export function validateUpstreamContract(contract, targets) {
   same(Object.keys(contract.platforms ?? {}).sort(), Object.keys(targets).sort(), 'Four explicit upstream App recipes required');
   const ids = hasCommittedReleaseMaterials(contract) ? [] : [contract.assetIndex.assetId, contract.sourceArchive.assetId];
   for (const [key, row] of Object.entries(contract.platforms)) { validateUpstreamRow(contract, key, row, targets); ids.push(row.releaseAsset.assetId); }
+  validateNativeJobOwners(contract);
   demand(new Set(ids).size === ids.length && new Set(Object.values(contract.platforms).map((r) => r.id)).size === 4, 'Duplicate upstream release identities');
   const rows = Object.values(contract.platforms);
   for (const row of rows.slice(1)) same(row.sourceIdentity, rows[0].sourceIdentity, 'Upstream platform sources differ');
   return contract;
 }
 export function validateUpstreamIndex(index, contract) {
+  validateNativeJobOwners(contract);
   demand(index.schema === 'polaris-upstream-native-assets-v1' && Array.isArray(index.platforms)
     && index.platforms.length >= 4 && index.platforms.length <= 512
     && index.platforms.every((r) => typeof r.id === 'string' && /^[A-Za-z0-9._+-]+$/.test(r.id))
@@ -275,6 +341,7 @@ export function contractPublicAssets(contract) {
 }
 export function validateUpstreamReadback(snapshot, contract) {
   if (!isUpstreamRelease(contract)) return;
+  validateNativeJobOwners(contract);
   const readback = snapshot.producerReadback, producer = contract.producer;
   demand(readback?.runId === producer.runId && readback.runAttempt === producer.runAttempt
     && readback.sourceCommit === contract.sourceCommit && readback.workflow === producer.workflow
@@ -291,6 +358,7 @@ export function validateUpstreamReadback(snapshot, contract) {
 // status. Never label these observations as a fresh producer-success readback.
 export function validatePublishedUpstreamReadback(snapshot, contract) {
   if (!isUpstreamRelease(contract)) return;
+  validateNativeJobOwners(contract);
   demand(!Object.hasOwn(snapshot, 'producerReadback'), 'Published readback must not claim live producer verification');
   validateUpstreamSourceReadback(snapshot, contract);
 }
@@ -303,6 +371,7 @@ function validateUpstreamSourceReadback(snapshot, contract) {
 }
 
 export async function readUpstreamPublicEvidence(contract, request) {
+  validateNativeJobOwners(contract);
     const producer = contract.producer;
     const run = await request(`/actions/runs/${producer.runId}/attempts/${producer.runAttempt}`);
     demand(run.id === producer.runId && run.run_attempt === producer.runAttempt

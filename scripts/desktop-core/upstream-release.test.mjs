@@ -182,6 +182,185 @@ test('upstream producer identity is checked against public run, workflow, jobs a
     await assert.rejects(readUpstreamPublicEvidence(contract, async (path) => structuredClone(changed.get(path))));
   }
 });
+
+// These are intentionally incomplete synthetic proof bodies, never native
+// execution evidence. Positives certify owner/header routing only; the cold
+// source-owned full proof validator must still reject these bodies.
+const systemNativeOwner = 'Explicit SYSTEM final-package Windows native execution proof';
+function windowsOwnerHeader(contract) {
+  const row = contract.platforms.win;
+  row.trustedExecution = { schema: 'polaris-trusted-execution-v1', sourceCommit: row.sourceCommit,
+    sourceTree: row.sourceTree, loader: 'windows-helper-private-cohort-v1', purposes: ['check-config-v1', 'run-main-v1'] };
+  row.finalPackageCronetSmoke.windowsExecution = {
+    sourceCommit: row.sourceCommit, sourceTree: row.sourceTree, version: row.version, target: row.target,
+    runId: contract.producer.runId, runAttempt: contract.producer.runAttempt, archiveSha256: row.archive.sha256,
+    core: structuredClone(row.core), sidecar: structuredClone(row.sidecar),
+    tlsProbe: { synthetic: 'not a TLS receipt' }, cronet: { synthetic: 'not a native observation' },
+    schema: 'polaris-windows-native-execution-proof-v1', native: { synthetic: 'not an actual SYSTEM execution' },
+  };
+  contract.producer.nativeJobs.win.name = systemNativeOwner;
+  return contract;
+}
+function nonWindowsOwnerHeader(contract, key) {
+  const row = contract.platforms[key], linux = key === 'linux';
+  row.trustedExecution = { schema: 'polaris-trusted-execution-v1', sourceCommit: row.sourceCommit,
+    sourceTree: row.sourceTree, loader: linux ? 'linux-sealed-fd-v1' : 'macos-root-private-v1',
+    purposes: linux ? ['check-config-v1'] : ['check-config-v1', 'run-main-v1'] };
+  const proof = { sourceCommit: row.sourceCommit, sourceTree: row.sourceTree, version: row.version,
+    target: row.target, runId: contract.producer.runId, runAttempt: contract.producer.runAttempt,
+    archiveSha256: row.archive.sha256, core: structuredClone(row.core),
+    tlsProbe: { synthetic: 'not a TLS receipt' }, cronet: { synthetic: 'not a native observation' } };
+  if (linux) Object.assign(proof, { sidecar: structuredClone(row.sidecar), coreSeals: 15, sidecarSeals: 15 });
+  else Object.assign(proof, { schema: 'polaris-macos-native-execution-proof-v1', postSign: { synthetic: 'not a native signature' } });
+  row.finalPackageCronetSmoke[linux ? 'sealedExecution' : 'macosExecution'] = proof;
+}
+function windowsOwnerFixture() {
+  const { contract, index } = fixture();
+  windowsOwnerHeader(contract);
+  for (const key of ['linux', 'mac-x64', 'mac-arm64']) nonWindowsOwnerHeader(contract, key);
+  index.producer = structuredClone(contract.producer);
+  index.platforms = Object.values(contract.platforms).map(({ releaseAsset, ...row }) => structuredClone(row));
+  return { contract, index };
+}
+test('P1 historical absent proof and policy retain exactly four ordinary owners', () => {
+  const { contract, index } = fixture();
+  validateReleaseContract(contract); validateUpstreamIndex(index, contract);
+  for (const [key, row] of Object.entries(contract.platforms)) {
+    assert.equal(Object.hasOwn(row, 'trustedExecution'), false);
+    assert.equal(['sealedExecution', 'macosExecution', 'windowsExecution'].some(p => Object.hasOwn(row.finalPackageCronetSmoke, p)), false);
+    assert.match(contract.producer.nativeJobs[key].name, /^Native final-package Cronet and gVisor smoke \(/);
+  }
+});
+test('P2 recognized Windows metadata selects fixed SYSTEM owner without certifying its synthetic body', () => {
+  const { contract, index } = windowsOwnerFixture();
+  assert.equal(validateReleaseContract(contract), contract);
+  assert.equal(validateUpstreamIndex(index, contract), index);
+  assert.equal(contract.producer.nativeJobs.win.name, systemNativeOwner);
+  for (const key of ['linux', 'mac-x64', 'mac-arm64'])
+    assert.equal(contract.producer.nativeJobs[key].name, fixture().contract.producer.nativeJobs[key].name);
+  assert.deepEqual(contract.platforms.win.finalPackageCronetSmoke.windowsExecution.native,
+    { synthetic: 'not an actual SYSTEM execution' });
+});
+test('P3 fixed Windows owner is bound to actual API and saved source/run/attempt/job metadata', async () => {
+  const { contract } = windowsOwnerFixture(), responses = evidenceFixture(contract), seen = [];
+  validateReleaseContract(contract);
+  const snapshot = await readUpstreamPublicEvidence(contract, async path => { seen.push(path); return structuredClone(responses.get(path)); });
+  validateUpstreamReadback(snapshot, contract);
+  assert.deepEqual(snapshot.producerReadback.jobs.win, { id: 2, name: systemNativeOwner,
+    runId: 1, runAttempt: 1, sourceCommit: contract.sourceCommit, status: 'completed', conclusion: 'success' });
+  assert.deepEqual(seen.filter(path => path.startsWith('/actions/jobs/')).sort(),
+    ['/actions/jobs/1', '/actions/jobs/2', '/actions/jobs/3', '/actions/jobs/4']);
+});
+test('N1 SYSTEM without paired proof, ordinary owner with Windows proof and unrelated green owner are rejected at every metadata entry', async () => {
+  const mutations = [
+    () => { const c = fixture().contract; c.producer.nativeJobs.win.name = systemNativeOwner; return c; },
+    () => { const c = windowsOwnerFixture().contract; c.producer.nativeJobs.win.name = fixture().contract.producer.nativeJobs.win.name; return c; },
+    () => { const c = windowsOwnerFixture().contract; c.producer.nativeJobs.win.name = 'Unrelated successful job'; return c; },
+  ];
+  for (const mutation of mutations) {
+    const contract = mutation();
+    assert.throws(() => validateReleaseContract(contract));
+    assert.throws(() => validateUpstreamIndex(windowsOwnerFixture().index, contract));
+    assert.throws(() => validateUpstreamReadback({}, contract));
+    assert.throws(() => validatePublishedUpstreamReadback({ sourceGitlinks: [] }, contract));
+    let requests = 0;
+    await assert.rejects(readUpstreamPublicEvidence(contract, async () => { requests++; return {}; }));
+    assert.equal(requests, 0);
+  }
+});
+test('N2 proof and policy header shapes, exact five fields, source/run/archive and modern variant cannot be relabeled', () => {
+  const changes = [
+    ...[null, true, [], 'truthy', {}].map(value => c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution = value; }),
+    ...[null, true, [], 'truthy', {}].map(value => c => { c.platforms.win.trustedExecution = value; }),
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.schema = 'polaris-windows-native-execution-proof-v2'; },
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.extra = true; },
+    ...['schema', 'sourceCommit', 'sourceTree', 'version', 'target', 'runId', 'runAttempt', 'archiveSha256', 'core', 'sidecar', 'tlsProbe', 'cronet', 'native']
+      .map(key => c => { delete c.platforms.win.finalPackageCronetSmoke.windowsExecution[key]; }),
+    ...['schema', 'sourceCommit', 'sourceTree', 'loader', 'purposes'].map(key => c => { delete c.platforms.win.trustedExecution[key]; }),
+    c => { c.platforms.win.trustedExecution.extra = true; },
+    c => { c.platforms.win.trustedExecution.schema = 'polaris-trusted-execution-v2'; },
+    c => { c.platforms.win.trustedExecution.sourceCommit = 'f'.repeat(40); },
+    c => { c.platforms.win.trustedExecution.sourceTree = 'f'.repeat(40); },
+    c => { c.platforms.win.trustedExecution.loader = 'macos-root-private-v1'; },
+    ...[null, true, 'check-config-v1', [], ['check-config-v1'], ['run-main-v1', 'check-config-v1'],
+      ['check-config-v1', 'check-config-v1'], ['check-config-v1', 'run-main-v1', 'run-login-v1']]
+      .map(value => c => { c.platforms.win.trustedExecution.purposes = value; }),
+    ...['sourceCommit', 'sourceTree', 'version', 'target'].map(key => c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution[key] += '-foreign'; }),
+    ...[true, 0, 2].flatMap(value => ['runId', 'runAttempt'].map(key => c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution[key] = value; })),
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.archiveSha256 = 'f'.repeat(64); },
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.core.sha256 = 'f'.repeat(64); },
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.sidecar.bytes++; },
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.tlsProbe = []; },
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.cronet = true; },
+    c => { c.platforms.win.finalPackageCronetSmoke.windowsExecution.native = null; },
+    c => { c.platforms.win.target = 'windows/arm64'; },
+    c => { c.platforms.win.variant.linkage = 'static-cgo'; },
+    c => { c.platforms.win.variant.legacy = true; },
+    c => { c.platforms.win.variant.legacy = 'false'; },
+    c => { c.platforms.win.variant.libc = 'msvc'; },
+  ];
+  for (const [i, change] of changes.entries()) {
+    const { contract } = windowsOwnerFixture(); change(contract);
+    assert.throws(() => validateReleaseContract(contract), undefined, 'synthetic N2 mutation ' + i);
+  }
+});
+test('N3 policy-only, proof-only, ambiguous and cross-platform proof kinds never select SYSTEM', () => {
+  const changes = [
+    c => { delete c.platforms.win.trustedExecution; },
+    c => { delete c.platforms.win.finalPackageCronetSmoke.windowsExecution; },
+    c => { c.platforms.win.finalPackageCronetSmoke.sealedExecution = null; },
+    c => { c.platforms.win.finalPackageCronetSmoke.macosExecution = {}; },
+    c => { const s = c.platforms.win.finalPackageCronetSmoke; s.sealedExecution = s.windowsExecution; delete s.windowsExecution; },
+    ...['linux', 'mac-x64', 'mac-arm64'].flatMap(key => [
+      c => { for (const kind of ['sealedExecution', 'macosExecution']) delete c.platforms[key].finalPackageCronetSmoke[kind];
+        c.platforms[key].finalPackageCronetSmoke.windowsExecution = structuredClone(c.platforms.win.finalPackageCronetSmoke.windowsExecution);
+        c.platforms[key].trustedExecution = structuredClone(c.platforms.win.trustedExecution); },
+      c => { c.producer.nativeJobs[key].name = systemNativeOwner; },
+    ]),
+  ];
+  for (const [i, change] of changes.entries()) {
+    const { contract } = windowsOwnerFixture(); change(contract);
+    assert.throws(() => validateReleaseContract(contract), undefined, 'synthetic N3 mutation ' + i);
+  }
+});
+test('N4 modern owner keeps exact unique job IDs and live/saved source/run/attempt/status/conclusion checks', async () => {
+  for (const value of [true, 0, null, 1]) {
+    const { contract } = windowsOwnerFixture(); contract.producer.nativeJobs.win.id = value;
+    assert.throws(() => validateReleaseContract(contract));
+  }
+  const changes = [j => { j.id = 99; }, j => { j.name = fixture().contract.producer.nativeJobs.win.name; },
+    j => { j.name = 'Unrelated successful job'; }, j => { j.head_sha = 'f'.repeat(40); },
+    j => { j.run_id = 2; }, j => { j.run_attempt = 2; }, j => { j.status = 'in_progress'; },
+    j => { j.conclusion = null; }, j => { j.conclusion = 'failure'; }];
+  for (const change of changes) {
+    const { contract } = windowsOwnerFixture(), responses = evidenceFixture(contract);
+    change(responses.get('/actions/jobs/2'));
+    await assert.rejects(readUpstreamPublicEvidence(contract, async path => structuredClone(responses.get(path))));
+  }
+  const { contract } = windowsOwnerFixture(), responses = evidenceFixture(contract);
+  const snapshot = await readUpstreamPublicEvidence(contract, async path => structuredClone(responses.get(path)));
+  for (const [key, value] of [['id', 99], ['name', 'Unrelated successful job'], ['sourceCommit', 'f'.repeat(40)],
+    ['runId', 2], ['runAttempt', 2], ['status', 'queued'], ['conclusion', 'failure']]) {
+    const changed = structuredClone(snapshot); changed.producerReadback.jobs.win[key] = value;
+    assert.throws(() => validateUpstreamReadback(changed, contract));
+  }
+  contract.producer.nativeJobs.win.id = 99;
+  await assert.rejects(readUpstreamPublicEvidence(contract, async path => structuredClone(responses.get(path))));
+});
+test('N5 modern owner metadata never replaces unchanged full index, archive and proof byte binding', () => {
+  for (const change of [
+    i => { i.producer.nativeJobs.win.id++; },
+    i => { i.producer.nativeJobs.win.name = fixture().contract.producer.nativeJobs.win.name; },
+    i => { i.platforms.push(structuredClone(i.platforms[0])); },
+    i => { i.platforms.find(r => r.target === 'windows/amd64').archive.sha256 = 'f'.repeat(64); },
+    i => { const r = i.platforms.find(r => r.target === 'windows/amd64'); r.archive.members[r.archive.root + '/' + r.core.member] = 'f'.repeat(64); },
+    i => { i.platforms.find(r => r.target === 'windows/amd64').finalPackageCronetSmoke.windowsExecution.native.cleanup = { cohortRemoved: false }; },
+  ]) {
+    const { contract, index } = windowsOwnerFixture(); change(index);
+    assert.throws(() => validateUpstreamIndex(index, contract));
+  }
+});
+
 test('recursive Git tree credential scope allows only exact selected-repository query', async () => {
   const seen = [], fetch = async (url, options) => { seen.push(options.headers.Authorization); return new Response('ok'); };
   const options = { repository: 'polaris-arch/sing-box-polaris', fetch, env: { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'fixture' } };
@@ -889,6 +1068,46 @@ else:
   for (const check of sourceChecks) assert.deepEqual(check.legalFiles, contract.legalFiles.map(({path,bytes,sha256})=>({path,bytes,sha256})));
   assert.equal(calls.filter(url=>url.includes('/actions/')).length,0);
   assert.equal(calls.filter(url=>url.includes('/git/trees/')).length,2);
+
+  await t.test('N5 modern owner header still reaches and propagates rejecting cold source-owned full proof validation', async () => {
+    // Reuse only this private inert archive/source fixture. The injected source
+    // validator rejects the deliberately incomplete native body; this proves
+    // routing and failure propagation, not real proof acceptance or execution.
+    const modern = windowsOwnerHeader(structuredClone(contract)), modernIndex = JSON.parse(index);
+    modernIndex.producer = structuredClone(modern.producer);
+    modernIndex.platforms = Object.values(modern.platforms).map(({ releaseAsset, ...row }) => structuredClone(row));
+    const modernIndexBytes = encode(modernIndex);
+    Object.assign(modern.assetIndex, { bytes: modernIndexBytes.length, sha256: digest(modernIndexBytes) });
+    const modernRaw = encode(modern), modernManifest = { ...manifest,
+      desktopRelease: { ...manifest.desktopRelease, contractSha256: digest(modernRaw) } };
+    validateReleaseContract(modern); validateUpstreamIndex(modernIndex, modern);
+    const installed = Object.fromEntries(Object.entries(contract.platforms)
+      .map(([key, row]) => [key, digest(readFileSync(join(root, 'resources', key, row.core.member)))]));
+    let reached = 0;
+    try {
+      put(join(root, manifest.desktopRelease.contractPath), modernRaw);
+      put(join(root, contract.assetIndex.path), modernIndexBytes);
+      await assert.rejects(consumeRelease(root, modernManifest, ['win'], { read, host: 'linux', run: (command, args, settings) => {
+        if (args[1]?.endsWith('release-archive.py') && settings.input && JSON.parse(settings.input).sourceArchive) {
+          const request = JSON.parse(settings.input);
+          assert.equal(args.at(-1), '--source-trusted-proofs');
+          assert.deepEqual(request.trustedRows.find(row => row.target === 'windows/amd64'),
+            modernIndex.platforms.find(row => row.target === 'windows/amd64'));
+          assert.deepEqual(request.trustedProducer, modern.producer);
+          assert.equal(request.sourceCommit, modern.sourceCommit); assert.equal(request.sourceTree, modern.sourceTree);
+          reached++;
+          throw Error('synthetic full native proof rejection; metadata cannot authorize execution');
+        }
+        return run(command, args, settings);
+      } }), /stage=source-archive-validation/);
+      assert.equal(reached, 1);
+      assert.deepEqual(Object.fromEntries(Object.entries(contract.platforms)
+        .map(([key, row]) => [key, digest(readFileSync(join(root, 'resources', key, row.core.member)))])), installed);
+    } finally {
+      put(join(root, manifest.desktopRelease.contractPath), raw);
+      put(join(root, contract.assetIndex.path), index);
+    }
+  });
   const publicURL = api+`/releases/${contract.releaseId}`, publicBytes = transport.get(publicURL);
   for (const mutate of [r=>{r.id++;},r=>{r.draft=true;},r=>{r.tag_name+='changed';},
     r=>{r.assets[0].id++;},r=>{r.assets[0].digest='sha256:'+'0'.repeat(64);},
