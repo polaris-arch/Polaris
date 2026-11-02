@@ -6,7 +6,7 @@ import { closeSync, constants, copyFileSync, existsSync, fstatSync, lstatSync, o
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest, expectedTags, reviewedSourcePolicy, requireGraph as demand } from './source-graph.mjs';
-import { readUpstreamPublicEvidence, readUpstreamSourceEvidence, upstreamReleaseName, validateNativeArchiveRow } from './upstream-release.mjs';
+import { readUpstreamPublicEvidence, readUpstreamSourceEvidence, producerReleaseName, validateNativeArchiveRow } from './upstream-release.mjs';
 import { regularPath, releasePublicReader, RELEASE_TARGETS, verifyReleaseCore } from './release-consumer.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
 import { actualCoreFile } from '../lib/core-identity.mjs';
@@ -175,7 +175,8 @@ export function validateCandidateIndex(bytes, binding, source) {
     // Original row retains its original version tag and null index tagObject.
     validateNativeArchiveRow({ ...binding, tag: binding.originalIndexTag }, key, row, RELEASE_TARGETS);
     same(row.tags.split(',').sort(), expectedTags(key), 'Candidate feature tag inventory differs');
-    const delivery = asset(binding, upstreamReleaseName(row.archive));
+    // Candidate delivery retains the producer's complete Polaris build version.
+    const delivery = asset(binding, producerReleaseName(row.archive));
     demand(delivery.bytes === row.archive.bytes && delivery.sha256 === row.archive.sha256, 'Candidate transport/archive bytes differ');
     rows[key] = row;
   }
@@ -293,7 +294,7 @@ export async function acquireCandidate(root, candidate, options = {}) {
     for (const key of KEYS) {
       const row = rows[key], unpacked = join(work, `unpacked-${key}`);
       run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(root, 'scripts/desktop-core/release-archive.py'),
-        join(work, upstreamReleaseName(row.archive)), unpacked], { input: JSON.stringify({ archive: row.archive, root: row.archive.root, target: row.target }), encoding: 'utf8' });
+        join(work, producerReleaseName(row.archive)), unpacked], { input: JSON.stringify({ archive: row.archive, root: row.archive.root, target: row.target }), encoding: 'utf8' });
       const extracted = join(unpacked, row.archive.root);
       inspectPayload(join(extracted, row.core.member), row, key, binding, run);
       // Retain the complete original archive payload, including its legal files.

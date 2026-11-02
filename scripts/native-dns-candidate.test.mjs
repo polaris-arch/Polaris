@@ -10,6 +10,7 @@ import { acquireCandidate, consumeTemporaryDesktop, candidateContext, candidateF
 import { verifyManagedMeshCore, managedCheckPlatform, managedCheckSelection } from './desktop-core/managed-mesh-core.mjs';
 import { validateReleaseContract, RELEASE_TARGETS } from './desktop-core/release-consumer.mjs';
 import { expectedTags } from './desktop-core/source-graph.mjs';
+import { producerReleaseName } from './desktop-core/upstream-release.mjs';
 import { cronetFixture } from './lib/cronet-payload.test.mjs';
 const root = resolve(import.meta.dirname, '..'), binding = loadCandidate(root);
 const source = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/native-dns-source-binding.json')));
@@ -659,7 +660,13 @@ function candidateAcquisitionFixture(t, options = {}) {
   while (index.platforms.length < s.nativeRows) {
     const row = structuredClone(rows.linux); row.id += '-inert-unselected-' + index.platforms.length; index.platforms.push(row);
   }
-  options.mutate?.({ binding: b, source: s, index });
+  const renameAsset = (name, replacement) => {
+    const pin = assetPin(name), bytes = blobs.get(pin.url); assert(bytes);
+    pin.name = replacement;
+    pin.url = 'https://github.com/' + b.repository + '/releases/download/' + b.tag + '/' + replacement;
+    blobs.set(pin.url, bytes);
+  };
+  options.mutate?.({ binding: b, source: s, index, renameAsset });
   const indexBytes = options.rawIndexBytes ?? encode(index);
   Object.assign(s.index, { bytes: indexBytes.length, sha256: hash(indexBytes) });
   repin(assetPin(s.index.name), indexBytes);
@@ -738,13 +745,14 @@ function candidateAcquisitionFixture(t, options = {}) {
       const key = keys.find(k => b.platforms[k].archive.root === request.root); assert(key);
       const row = index.platforms.find(r => r.id === b.platforms[key].id);
       assert.deepEqual(request.archive, row.archive); assert.equal(request.target, row.target);
-      assert.deepEqual(readFileSync(args[2]), blobs.get(assetPin(row.archive.releaseName).url));
+      const transport = Object.hasOwn(row.archive, 'releaseName') ? row.archive.releaseName : row.archive.name;
+      assert.deepEqual(readFileSync(args[2]), blobs.get(assetPin(transport).url));
       extraction.push(key);
       const destination = join(args[3], request.root); mkdirSync(destination, { recursive: true });
       for (const [name, bytes] of Object.entries(files[key])) {
         writeFileSync(join(destination, name), bytes, { mode: name === row.core.member && key !== 'win' ? 0o755 : 0o644 });
       }
-      if (controls.corruptPayload && key === 'linux') writeFileSync(join(destination, row.core.member), 'changed inert payload');
+      if (controls.corruptPayload === key) writeFileSync(join(destination, row.core.member), 'changed inert payload');
       if (controls.corruptIndex && extraction.length === 4)
         writeFileSync(join(dirname(args[2]), s.index.name), Buffer.alloc(indexBytes.length));
       return '';
@@ -752,7 +760,7 @@ function candidateAcquisitionFixture(t, options = {}) {
     if (command === 'go') {
       const bytes = readFileSync(args.at(-1)), key = keys.find(k => hash(bytes) === rows[k].core.sha256); assert(key);
       goChecks.push({ key, args });
-      return args[0] === 'version' ? (controls.wrongBuildInfo ? rows[key].rawBuildInfo.replace('vcs.modified=false', 'vcs.modified=true') : rows[key].rawBuildInfo) : rows[key].buildID;
+      return args[0] === 'version' ? (controls.wrongBuildInfo === key ? rows[key].rawBuildInfo.replace('vcs.modified=false', 'vcs.modified=true') : rows[key].rawBuildInfo) : rows[key].buildID;
     }
     if (command === 'codesign') return { status: 0, stdout: args[0] === '--display' ? 'CDHash=' + '4'.repeat(40) + '\n' : '', stderr: '' };
     assert.fail('no native/tool command permitted in inert acquisition fixture: ' + command);
@@ -762,7 +770,7 @@ function candidateAcquisitionFixture(t, options = {}) {
     const value = { ...env, GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main' };
     delete value.POLARIS_NATIVE_DNS_CANDIDATE; return value;
   };
-  return { directory, binding: b, source: s, index, rows, files, events, controls, paths, sourceChecks, extraction, goChecks,
+  return { directory, binding: b, source: s, index, indexBytes, rows, files, events, controls, paths, sourceChecks, extraction, goChecks,
     acquire: mode => mode === 'explicit'
       ? acquireCandidate(directory, sha, { env: selectedEnv(mode), read, run })
       : consumeTemporaryDesktop(directory, manifest, { env: selectedEnv(mode), read, run }),
@@ -775,14 +783,35 @@ test('candidate acquisition fixture starts with the actual committed four-key co
   for (const pin of Object.values(binding.platforms)) assert.deepEqual(Object.keys(pin).sort(), ['archive', 'core', 'id', 'sidecar']);
   const f = candidateAcquisitionFixture(t), loaded = loadCandidate(f.directory);
   assert.equal(f.source.nativeRows, 44);
+  const committedNames = {
+    linux: 'sing-box-polaris-1.15.0-polaris-alpha.12-linux-amd64.tar.gz',
+    win: 'sing-box-polaris-1.15.0-polaris-alpha.12-windows-amd64.zip',
+    'mac-x64': 'sing-box-polaris-1.15.0-polaris-alpha.12-darwin-amd64.tar.gz',
+    'mac-arm64': 'sing-box-polaris-1.15.0-polaris-alpha.12-darwin-arm64.tar.gz',
+  };
+  for (const [key, expected] of Object.entries(committedNames)) {
+    assert.equal(producerReleaseName(binding.platforms[key].archive), expected);
+    assert.equal(loaded.platforms[key].archive.releaseName, expected);
+  }
+  // A present undefined alias is invalid even though JSON cannot encode it.
+  assert.throws(() => producerReleaseName({ ...binding.platforms.win.archive, releaseName: undefined }),
+    { message: 'Upstream producer release archive name differs' });
   for (const pin of Object.values(loaded.platforms)) {
     assert.deepEqual(Object.keys(pin).sort(), ['archive', 'core', 'id', 'sidecar']);
     assert.equal(Object.hasOwn(pin, 'finalPackageCronetSmoke'), false);
   }
 });
-for (const mode of ['explicit', 'temporary-default']) for (const modernWindows of [false, true])
-  test('actual compact ' + mode + ' acquisition closes verified full-index and both snapshots; Windows header-only owner=' + modernWindows, async t => {
-    const f = candidateAcquisitionFixture(t, { modernWindows }), receipt = await f.acquire(mode);
+for (const mode of ['explicit', 'temporary-default']) for (const modernWindows of [false, true]) for (const legacyNames of [false, true])
+  test('actual compact ' + mode + ' acquisition closes verified full-index and both snapshots; Windows header-only owner=' + modernWindows
+    + (legacyNames ? '; producer alias absent' : ''), async t => {
+    const f = candidateAcquisitionFixture(t, { modernWindows, mutate: legacyNames ? x => {
+      for (const key of Object.keys(RELEASE_TARGETS)) {
+        const pin = x.binding.platforms[key], row = x.index.platforms.find(r => r.id === pin.id);
+        const previous = pin.archive.releaseName;
+        delete pin.archive.releaseName; delete row.archive.releaseName;
+        x.renameAsset(previous, pin.archive.name);
+      }
+    } : undefined }), receipt = await f.acquire(mode);
     assert.equal(receipt.context.mode, mode === 'temporary-default' ? mode : undefined);
     assert.equal(receipt.runtimeValidated, false); assert.equal(receipt.AppAccepted, false); assert.equal(receipt.publicationEligible, false);
     assert.equal(receipt.publicReadback.producerReadback.jobs.win.name, f.binding.producer.nativeJobs.win.name);
@@ -802,13 +831,86 @@ for (const mode of ['explicit', 'temporary-default']) for (const modernWindows o
     }
     const retained = join(f.directory, 'resources/.native-dns-candidate');
     assert.deepEqual(JSON.parse(readFileSync(join(retained, f.source.index.name))), f.index);
+    const retainedRows = validateCandidateIndex(readFileSync(join(retained, f.source.index.name)), f.binding, f.source);
     for (const key of Object.keys(RELEASE_TARGETS)) {
+      assert.deepEqual(retainedRows[key], f.index.platforms.find(row => row.id === f.binding.platforms[key].id));
       assert.deepEqual(readFileSync(join(f.directory, 'resources', key, f.rows[key].core.member)), f.files[key][f.rows[key].core.member]);
       if (mode === 'temporary-default') assert.deepEqual(readFileSync(join(retained, 'payloads', key, f.rows[key].core.member)), f.files[key][f.rows[key].core.member]);
     }
     assert.equal(existsSyncForTest(join(f.directory, 'resources/.native-dns-candidate.lock')), false);
     assert.equal(readdirSync(join(f.directory, 'resources')).some(name => name.startsWith('.native-dns-acquire-')), false);
   });
+test('candidate producer transport rejects explicit invalid aliases and incoherent native recipes without fallback', async t => {
+  const aliasError = 'Upstream producer release archive name differs', recipeError = 'Upstream native archive recipe/layout differs';
+  const mutations = [
+    ...[null, false, 0, [], {}].map(value => ['alias type ' + JSON.stringify(value), a => { a.releaseName = value; }, aliasError]),
+    ['empty alias', a => { a.releaseName = ''; }, aliasError],
+    ['formal public alias', a => { a.releaseName = 'sing-box-polaris-1.15.0-alpha.12-windows-amd64.zip'; }, aliasError],
+    ['explicit native-name fallback', a => { a.releaseName = a.name; }, aliasError],
+    ['foreign alias', a => { a.releaseName = 'https://example.invalid/archive.zip'; }, aliasError],
+    ['duplicate other-target alias', a => { a.releaseName = binding.platforms.linux.archive.releaseName; }, aliasError],
+    ['wrong alias version', a => { a.releaseName = 'sing-box-polaris-1.15.1-polaris-alpha.12-windows-amd64.zip'; }, aliasError],
+    ['wrong alias prerelease', a => { a.releaseName = 'sing-box-polaris-1.15.0-polaris-alpha.12.7-windows-amd64.zip'; }, aliasError],
+    ['wrong alias channel', a => { a.releaseName = 'sing-box-polaris-1.15.0-polaris-beta.12-windows-amd64.zip'; }, aliasError],
+    ['wrong alias target', a => { a.releaseName = 'sing-box-polaris-1.15.0-polaris-alpha.12-windows-arm64.zip'; }, aliasError],
+    ['wrong alias extension', a => { a.releaseName = 'sing-box-polaris-1.15.0-polaris-alpha.12-windows-amd64.tar.gz'; }, aliasError],
+    ['wrong alias prefix', a => { a.releaseName = 'other-1.15.0-polaris-alpha.12-windows-amd64.zip'; }, aliasError],
+    ['trailing newline alias', a => { a.releaseName += '\n'; }, aliasError],
+    ['unsupported publicName', a => { a.publicName = a.releaseName; }, 'Unsupported upstream public-name alias'],
+    ['missing native name', a => { delete a.name; }, 'Upstream file pin differs'],
+    ['native name type', a => { a.name = null; }, 'Upstream file pin differs'],
+    ['native path', a => { a.name = '../' + a.name; }, 'Upstream file pin differs'],
+    ['coherent foreign native version and alias', a => {
+      a.name = 'sing-box-1.15.1-polaris-alpha.12-windows-amd64.zip';
+      a.releaseName = 'sing-box-polaris-1.15.1-polaris-alpha.12-windows-amd64.zip';
+    }, recipeError],
+    ['coherent foreign native target and alias', a => {
+      a.name = 'sing-box-1.15.0-polaris-alpha.12-linux-amd64.tar.gz';
+      a.releaseName = 'sing-box-polaris-1.15.0-polaris-alpha.12-linux-amd64.tar.gz';
+    }, recipeError],
+    ['coherent foreign native extension and alias', a => {
+      a.name = 'sing-box-1.15.0-polaris-alpha.12-windows-amd64.tar.gz';
+      a.releaseName = 'sing-box-polaris-1.15.0-polaris-alpha.12-windows-amd64.tar.gz';
+    }, recipeError],
+    ['native prefix', a => { a.name = 'other-' + a.name; }, recipeError],
+    ['legacy name cannot bypass the selected version', a => {
+      delete a.releaseName; a.name = 'sing-box-1.15.0-alpha.12-windows-amd64.zip';
+    }, recipeError],
+  ];
+  for (const [name, mutate, message] of mutations) await t.test(name, async t => {
+    const f = candidateAcquisitionFixture(t, { mutate: x => {
+      const pin = x.binding.platforms.win, row = x.index.platforms.find(r => r.id === pin.id);
+      mutate(pin.archive); row.archive = structuredClone(pin.archive);
+    } });
+    await assert.rejects(f.acquire('explicit'), { message });
+    assert.equal(f.assetEvents().length, 1); assert.equal(f.actionEvents().length, 0);
+    assert.equal(f.sourceChecks.length, 0); assert.equal(f.extraction.length, 0); f.assertEmpty();
+  });
+});
+test('candidate producer delivery rejects missing duplicate foreign or mistyped public asset names at their real boundary', async t => {
+  const mutations = [
+    ['missing', x => {
+      x.binding.assets.splice(x.binding.assets.findIndex(p => p.name === x.binding.platforms.win.archive.releaseName), 1);
+    }, 'Exact eight temporary assets required', 0],
+    ['duplicate', x => {
+      const first = x.binding.assets.find(p => p.name === x.binding.platforms.win.archive.releaseName);
+      const other = x.binding.assets.find(p => p.name === x.binding.platforms['mac-x64'].archive.releaseName);
+      other.name = first.name; other.url = first.url;
+    }, 'Exact eight temporary assets required', 0],
+    ['foreign', x => {
+      x.renameAsset(x.binding.platforms.win.archive.releaseName, 'foreign-windows-amd64.zip');
+    }, 'Unique candidate asset required', 1],
+    ['type', x => {
+      x.binding.assets.find(p => p.name === x.binding.platforms.win.archive.releaseName).name = null;
+    }, 'Candidate public asset pin differs', 0],
+  ];
+  for (const [name, mutate, message, assets] of mutations) await t.test(name, async t => {
+    const f = candidateAcquisitionFixture(t, { mutate });
+    await assert.rejects(f.acquire('explicit'), { message });
+    assert.equal(f.assetEvents().length, assets); assert.equal(f.actionEvents().length, 0);
+    assert.equal(f.sourceChecks.length, 0); assert.equal(f.extraction.length, 0); f.assertEmpty();
+  });
+});
 test('compact acquisition rejects full-index/source/pin/producer mismatches before native Actions or other assets', async t => {
   const selected = i => i.platforms.find(r => r.target === 'windows/amd64');
   const mutations = [
@@ -837,9 +939,40 @@ test('compact acquisition rejects full-index/source/pin/producer mismatches befo
     ['source archive identity', x => { x.index.sourceArchive.sha256 = 'f'.repeat(64); }],
     ['archive delivery pin', x => { x.binding.assets.find(p => p.name === x.binding.platforms.win.archive.releaseName).bytes++; }],
   ];
+  const messages = {
+    schema: 'Original staging index identity changed',
+    'original tag': 'Original staging index identity changed',
+    'tag object': 'Original staging index identity changed',
+    sourceCommit: 'Candidate index identity differs: sourceCommit',
+    sourceTree: 'Candidate index identity differs: sourceTree',
+    version: 'Candidate index identity differs: version',
+    'row census': 'Complete unique staging index required',
+    'non-array row census': 'Complete unique staging index required',
+    'duplicate ID': 'Complete unique staging index required',
+    'selected ID absent': 'Selected candidate row absent',
+    'unselected source identity': 'Staging row source identity differs',
+    'unselected source revision': 'Staging source revision differs',
+    'unselected dirty revision': 'Staging source revision differs',
+    'unselected source tree': 'Staging source revision differs',
+    'selected row schema': 'Upstream target/source differs',
+    'selected version': 'Upstream target/source differs',
+    'selected target': 'Upstream target/source differs',
+    'selected variant': 'Upstream App recipe differs',
+    'selected capability tags': 'Upstream required capabilities differ',
+    'selected smoke': 'Actual native capability smoke missing or unbound',
+    'compact Core pin': 'Candidate native pin differs',
+    'compact companion pin': 'Candidate native pin differs',
+    'original archive pin': 'Candidate native pin differs',
+    workflowCommit: 'Candidate index identity differs: producer',
+    runId: 'Candidate index identity differs: producer',
+    runAttempt: 'Candidate index identity differs: producer',
+    'source archive identity': 'Candidate source archive differs',
+    'archive delivery pin': 'Candidate transport/archive bytes differ',
+  };
   for (const [name, mutate] of mutations) await t.test(name, async t => {
     const f = candidateAcquisitionFixture(t, { mutate });
-    await assert.rejects(f.acquire('explicit'));
+    assert.equal(typeof messages[name], 'string', name);
+    await assert.rejects(f.acquire('explicit'), { message: messages[name] });
     assert.equal(f.assetEvents().length, 1); assert.equal(f.actionEvents().length, 0);
     assert.equal(f.sourceChecks.length, 0); assert.equal(f.extraction.length, 0); f.assertEmpty();
   });
@@ -869,11 +1002,34 @@ test('compact acquisition feeds genuine selected proof headers to the strict sha
     ['duplicate native job ID', x => { const id = x.binding.producer.nativeJobs.linux.id;
       x.binding.producer.nativeJobs.win.id = id; x.index.producer.nativeJobs.win.id = id; }],
   ];
+  const messages = {
+    'Windows proof with ordinary owner': 'Upstream native job identity differs',
+    'unrelated green owner': 'Upstream native job identity differs',
+    'SYSTEM without either proof or policy': 'Upstream native job identity differs',
+    'policy only': 'Upstream native owner requires one target proof and policy',
+    'proof only': 'Upstream native owner requires one target proof and policy',
+    'proof shape null': 'Upstream native owner proof/policy shape differs',
+    'proof shape true': 'Upstream native owner proof/policy shape differs',
+    'proof shape []': 'Upstream native owner proof/policy shape differs',
+    'unknown proof schema': 'Upstream native owner proof schema differs',
+    'mixed proof kinds': 'Upstream native owner requires one target proof and policy',
+    'null policy': 'Upstream native owner proof/policy shape differs',
+    'extra policy field': 'Upstream native owner policy fields differ',
+    'wrong loader': 'Upstream native owner policy differs',
+    'wrong purposes': 'Upstream native owner policy differs',
+    'proof source': 'Upstream native owner proof source/target differs',
+    'proof run': 'Upstream native owner proof run/archive header differs',
+    'proof attempt': 'Upstream native owner proof run/archive header differs',
+    'cross-target Windows proof': 'Upstream native owner requires one target proof and policy',
+    'duplicate native job ID': 'Duplicate upstream native job',
+  };
   for (const [name, mutate] of mutations) await t.test(name, async t => {
     const f = candidateAcquisitionFixture(t, { modernWindows: true, mutate });
-    await assert.rejects(f.acquire('explicit'));
+    assert.doesNotThrow(() => validateCandidateIndex(f.indexBytes, f.binding, f.source));
+    assert.equal(typeof messages[name], 'string', name);
+    await assert.rejects(f.acquire('explicit'), { message: messages[name] });
     assert.equal(f.assetEvents().length, 1); assert.equal(f.actionEvents().length, 0);
-    assert.equal(f.sourceChecks.length, 0); f.assertEmpty();
+    assert.equal(f.sourceChecks.length, 0); assert.equal(f.extraction.length, 0); f.assertEmpty();
   });
 });
 test('compact acquisition rejects malformed public identity in either genuine snapshot', async t => {
@@ -889,10 +1045,18 @@ test('compact acquisition rejects malformed public identity in either genuine sn
     ['tree', r => { r.tree[0].sha = 'f'.repeat(40); }],
   ];
   for (const phase of [1, 2]) for (const [i, [target, change]] of changes.entries()) await t.test('phase ' + phase + ' ' + target + ' ' + i, async t => {
-    const f = candidateAcquisitionFixture(t);
-    f.controls.api = (suffix, value, current) => { if (current === phase && suffix === f.paths[target]) change(value); };
-    await assert.rejects(f.acquire('explicit'));
+    const f = candidateAcquisitionFixture(t); let reached = 0;
+    f.controls.api = (suffix, value, current) => {
+      if (current === phase && suffix === f.paths[target]) { reached++; change(value); }
+    };
+    const message = target === 'tree' ? 'Candidate public gitlinks differ'
+      : ['ref', 'tag', 'commit'].includes(target) ? 'Annotated candidate tag/source differs'
+      : i < 4 ? 'Temporary published prerelease differs' : 'Temporary public asset inventory differs';
+    await assert.rejects(f.acquire('explicit'), { message });
+    assert.equal(reached, 1);
     assert.equal(f.assetEvents().length, phase === 1 ? 0 : 8);
+    assert.equal(f.sourceChecks.length, phase === 1 ? 0 : 1);
+    assert.equal(f.extraction.length, phase === 1 ? 0 : 4);
     if (phase === 1) assert.equal(f.actionEvents().length, 0);
     f.assertEmpty();
   });
@@ -909,23 +1073,35 @@ test('compact acquisition preserves native run/workflow/job/API rejection on bot
     ['workflow', w => { w.path = '.github/workflows/foreign.yml'; }],
   ];
   for (const phase of [1, 2]) for (const [i, [target, change]] of changes.entries()) await t.test('phase ' + phase + ' ' + target + ' ' + i, async t => {
-    const f = candidateAcquisitionFixture(t, { modernWindows: true });
-    f.controls.api = (suffix, value, current) => { if (current === phase && suffix === f.paths[target]) change(value); };
-    await assert.rejects(f.acquire('explicit'));
+    const f = candidateAcquisitionFixture(t, { modernWindows: true }); let reached = 0;
+    f.controls.api = (suffix, value, current) => {
+      if (current === phase && suffix === f.paths[target]) { reached++; change(value); }
+    };
+    const message = target === 'win' ? 'Published upstream native job differs'
+      : target === 'run' ? 'Published upstream producer run differs' : 'Published upstream workflow differs';
+    await assert.rejects(f.acquire('explicit'), { message });
+    assert.equal(reached, 1);
     assert.equal(f.assetEvents().length, phase === 1 ? 1 : 8);
-    assert.equal(f.sourceChecks.length, phase === 1 ? 0 : 1); f.assertEmpty();
+    assert.equal(f.sourceChecks.length, phase === 1 ? 0 : 1);
+    assert.equal(f.extraction.length, phase === 1 ? 0 : 4); f.assertEmpty();
   });
 });
 test('early source observations cannot be replaced by the index-enriched before snapshot', async t => {
-  const f = candidateAcquisitionFixture(t);
-  f.controls.api = (suffix, value, phase, count) => { if (suffix === f.paths.tree && phase === 1 && count === 2) value.tree[0].sha = 'f'.repeat(40); };
+  const f = candidateAcquisitionFixture(t); let reached = 0;
+  f.controls.api = (suffix, value, phase, count) => {
+    if (suffix === f.paths.tree && phase === 1 && count === 2) { reached++; value.tree[0].sha = 'f'.repeat(40); }
+  };
   await assert.rejects(f.acquire('explicit'), /source identity changed during producer readback/);
+  assert.equal(reached, 1);
   assert.equal(f.assetEvents().length, 1); assert.equal(f.sourceChecks.length, 0); f.assertEmpty();
 });
 test('after-only individually valid producer workflow ID drift reaches full snapshot comparison', async t => {
-  const f = candidateAcquisitionFixture(t);
-  f.controls.api = (suffix, value, phase) => { if (suffix === f.paths.run && phase === 2) value.workflow_id = 11; };
+  const f = candidateAcquisitionFixture(t); let reached = 0;
+  f.controls.api = (suffix, value, phase) => {
+    if (suffix === f.paths.run && phase === 2) { reached++; value.workflow_id = 11; }
+  };
   await assert.rejects(f.acquire('temporary-default'), /public identity changed during acquisition/);
+  assert.equal(reached, 1);
   assert(f.events.some(e => e.phase === 2 && e.suffix === '/actions/workflows/11'));
   assert.equal(f.sourceChecks.length, 1); assert.equal(f.extraction.length, 4); f.assertEmpty();
 });
@@ -940,6 +1116,8 @@ test('raw index bytes and size reject before owner reads and are rechecked befor
     assert.equal(f.assetEvents().filter(e => e.url.endsWith('/' + f.source.index.name)).length, 1);
     assert.equal(f.assetEvents().length, corruption === 'late' ? 8 : 1);
     assert.equal(f.sourceChecks.length, corruption === 'late' ? 1 : 0);
+    assert.equal(f.extraction.length, corruption === 'late' ? 4 : 0);
+    assert.equal(f.goChecks.length, corruption === 'late' ? 8 : 0);
     if (corruption !== 'late') assert.equal(f.actionEvents().length, 0);
     assert.equal(f.events.filter(e => e.suffix === f.paths.release).length, 1); f.assertEmpty();
   });
@@ -952,18 +1130,29 @@ for (const mode of ['explicit', 'temporary-default']) test('actual ' + mode + ' 
   assert.equal(f.extraction.length, 0); f.assertEmpty();
 });
 test('actual acquisition retains member bytes and Go graph inspection after owner closure', async t => {
-  for (const failure of ['corruptPayload', 'wrongBuildInfo']) await t.test(failure, async t => {
-    const f = candidateAcquisitionFixture(t); f.controls[failure] = true;
-    await assert.rejects(f.acquire('explicit'), /Candidate member bytes differ|Actual upstream raw BuildInfo differs/);
-    assert.equal(f.sourceChecks.length, 1); assert.equal(f.events.filter(e => e.suffix === f.paths.release).length, 1); f.assertEmpty();
-  });
+  const keys = Object.keys(RELEASE_TARGETS);
+  for (const failure of ['corruptPayload', 'wrongBuildInfo']) for (const key of keys)
+    await t.test(failure + (key === 'linux' ? '' : ' ' + key), async t => {
+      const f = candidateAcquisitionFixture(t); f.controls[failure] = key;
+      await assert.rejects(f.acquire('explicit'), {
+        message: failure === 'corruptPayload' ? 'Candidate member bytes differ' : 'Actual upstream raw BuildInfo differs',
+      });
+      assert.deepEqual(f.extraction, keys.slice(0, keys.indexOf(key) + 1));
+      assert.equal(f.goChecks.length, 2 * keys.indexOf(key) + (failure === 'wrongBuildInfo' ? 1 : 0));
+      assert.equal(f.assetEvents().length, 8); assert.equal(f.sourceChecks.length, 1);
+      assert.equal(f.events.filter(e => e.suffix === f.paths.release).length, 1); f.assertEmpty();
+    });
 });
 test('actual acquisition propagates receiver errors before and after payloads without receipt or partial install', async t => {
   for (const phase of [1, 2]) await t.test('phase ' + phase, async t => {
-    const f = candidateAcquisitionFixture(t), failure = Error('inert API receiver refusal');
-    f.controls.api = (suffix, _value, current) => { if (current === phase && suffix === f.paths.run) throw failure; };
+    const f = candidateAcquisitionFixture(t), failure = Error('inert API receiver refusal'); let reached = 0;
+    f.controls.api = (suffix, _value, current) => {
+      if (current === phase && suffix === f.paths.run) { reached++; throw failure; }
+    };
     await assert.rejects(f.acquire('temporary-default'), error => error === failure);
+    assert.equal(reached, 1);
     assert.equal(f.assetEvents().length, phase === 1 ? 1 : 8);
-    assert.equal(f.sourceChecks.length, phase === 1 ? 0 : 1); f.assertEmpty();
+    assert.equal(f.sourceChecks.length, phase === 1 ? 0 : 1);
+    assert.equal(f.extraction.length, phase === 1 ? 0 : 4); f.assertEmpty();
   });
 });

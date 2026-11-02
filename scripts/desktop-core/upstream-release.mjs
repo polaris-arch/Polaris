@@ -103,7 +103,7 @@ function nativeArchiveName(archive) {
   demand(!Object.hasOwn(archive, 'publicName'), 'Unsupported upstream public-name alias');
   return archive.name;
 }
-function producerReleaseName(archive) {
+export function producerReleaseName(archive) {
   const name = nativeArchiveName(archive);
   if (!Object.hasOwn(archive, 'releaseName')) return name;
   const expected = 'sing-box-polaris-' + name.slice('sing-box-'.length);
