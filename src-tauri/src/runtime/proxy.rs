@@ -2222,6 +2222,7 @@ pub(crate) async fn temp_tls_fingerprint_capabilities() -> crate::runtime::tls_f
     android_bridge::tls_fingerprint_capabilities().await
 }
 
-#[cfg(all(desktop, feature = "native-production-verification"))]
+#[cfg(desktop)]
+#[cfg(feature = "native-production-verification")]
 #[path = "../native_verification/proxy_carrier.rs"]
 pub(crate) mod native_verification;

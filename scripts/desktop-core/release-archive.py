@@ -293,6 +293,22 @@ TRUSTED_META_ROOT = 'third_party/metacubex-utls/'
 TRUSTED_CRONET_ROOT = 'third_party/cronet-go/'
 
 
+def source_tar_member_name(name, directory, root):
+    """Check raw Git member structure, without projecting it onto the filesystem.
+
+    Unselected members may use safe Git names such as @, spaces or Unicode.
+    This is separate from archive_name's closed portable selected-file domain.
+    """
+    require(isinstance(name, str), 'unsafe source archive path')
+    name = name.removesuffix('/') if directory else name
+    parts = name.split('/')
+    require(parts[0] == root and (len(parts) > 1 or directory)
+            and all(part and part not in ('.', '..')
+                    and all(ord(char) >= 32 and ord(char) != 127 and char not in '\\:'
+                            for char in part) for part in parts), 'unsafe source archive path')
+    return name
+
+
 def _trusted_validator_contents(expanded, prefix):
     """Select regular files from the *same immutable expanded bytes* already verified.
 
@@ -304,7 +320,9 @@ def _trusted_validator_contents(expanded, prefix):
     entries, ancestors = {}, set()
     with tarfile.open(fileobj=io.BytesIO(expanded), mode='r:') as package:
         for member in package:
-            name = archive_name(member.name, member.isdir(), prefix)
+            name = source_tar_member_name(member.name, member.isdir(), prefix)
+            require(member.type in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE),
+                    'trusted source special or hardlink member')
             require(name not in entries, 'trusted source duplicate member')
             parts = name.split('/')
             parents = {'/'.join(parts[:i]) for i in range(1,len(parts))}

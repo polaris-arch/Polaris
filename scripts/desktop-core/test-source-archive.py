@@ -697,6 +697,64 @@ class RealSourceValidatorClosureTests(unittest.TestCase):
             with self.subTest(missing=missing),self.assertRaisesRegex(ValueError,'regular source missing'):
                 archive._trusted_validator_contents(self.expanded(changed),'source-fixture')
 
+    @staticmethod
+    def real_unselected_at_names():
+        # Exact Git member names from Core dcc80eba94b786a84e099260b1d87eb225a65003.
+        # Payloads below are inert data: these members are never selected/imported.
+        keys=('4a6a0840','5243ef4b','524d27bb','5261cecb','58199dcc','58cbb476',
+              '58e4f17d','5e69ca50','60ac2099','6165ee59','61666e3f','616a9724',
+              '616abc23','616ac3bc','616adfeb','616ae350','616db30d','66ba20fe')
+        root='release/dependency-sources/oci/aports/b9f23becced4d7b3ccc0fa0f28530243ccd314a0/main/alpine-keys/'
+        return ['release/config/sing-box@.service']+[
+            root+'alpine-devel@lists.alpinelinux.org-'+key+'.rsa.pub' for key in keys]
+
+    def test_real_unselected_at_paths_do_not_block_same_source_data_validators(self):
+        files=self.files();names=self.real_unselected_at_names()
+        self.assertEqual(len(names),19)
+        full=dict(files);full.update({name:b'unselected ordinary Git blob\n' for name in names})
+        # Exercise safe Git characters beyond @ as raw, unselected member names.
+        full.update({'notes/a name=with,percent%[1].txt':b'data only',
+                     'notes/说明(1).txt':b'data only'})
+        link=tarfile.TarInfo('source-fixture/notes/opaque-link')
+        link.type=tarfile.SYMTYPE;link.linkname='../go.mod'
+        expanded=self.expanded(full,[(link,None)])
+        selected=archive._trusted_validator_contents(expanded,'source-fixture')
+        self.assertEqual(selected,archive._trusted_validator_contents(self.expanded(files),'source-fixture'))
+        self.assertTrue(all(name not in selected for name in names))
+        # Real same-source Linux/Mac/Windows data validators, not a policy stub.
+        # No native process/issuer is constructed by this ordinary source fixture.
+        archive._validate_trusted_source_rows(expanded,'source-fixture',self.rows(files),{'runId':42,'runAttempt':1})
+
+    def test_whole_tar_structure_and_fixed_selected_path_domains_remain_separate(self):
+        for name in self.real_unselected_at_names()+['notes/a name=with,percent%[1].txt','notes/说明(1).txt']:
+            full='source-fixture/'+name
+            self.assertEqual(archive.source_tar_member_name(full,False,'source-fixture'),full)
+            with self.assertRaisesRegex(ValueError,'unsafe archive path'):
+                archive.archive_name(full,False,'source-fixture')
+        for name in ('/source-fixture/absolute','source-fixture//empty','source-fixture/./dot',
+                     'source-fixture/../parent','source-fixture/back\\slash','source-fixture/C:drive',
+                     'source-fixture/nul\0name','source-fixture/line\nname','source-fixture/tab\tname',
+                     'source-fixture/file/','source-fixture'):
+            with self.subTest(name=repr(name)),self.assertRaisesRegex(ValueError,'unsafe source archive path'):
+                archive.source_tar_member_name(name,False,'source-fixture')
+        files=self.files();bad=archive.TRUSTED_META_ROOT+'not-selected@.go'
+        manifest=json.loads(files['release/dependency-sources/metacubex-utls-replacement.json'])
+        manifest['files']['not-selected@.go']=dict(next(iter(manifest['files'].values())))
+        files['release/dependency-sources/metacubex-utls-replacement.json']=json.dumps(manifest).encode()
+        files[bad]=b'data only'
+        with self.assertRaisesRegex(ValueError,'unsafe archive path'):
+            archive._trusted_validator_contents(self.expanded(files),'source-fixture')
+        parent=tarfile.TarInfo('source-fixture/notes/link-parent');parent.type=tarfile.SYMTYPE
+        parent.linkname='../elsewhere'
+        child=tarfile.TarInfo('source-fixture/notes/link-parent/child');child.size=1
+        for extras in ([(parent,None),(child,b'x')],[(child,b'x'),(parent,None)]):
+            with self.assertRaises(ValueError):
+                archive._trusted_validator_contents(self.expanded(self.files(),extras),'source-fixture')
+        for kind in (tarfile.LNKTYPE,tarfile.FIFOTYPE,tarfile.CHRTYPE):
+            item=tarfile.TarInfo('source-fixture/notes/not-regular');item.type=kind;item.linkname='source-fixture/go.mod'
+            with self.subTest(kind=kind),self.assertRaisesRegex(ValueError,'special or hardlink member'):
+                archive._trusted_validator_contents(self.expanded(self.files(),[(item,None)]),'source-fixture')
+
     def test_real_overlay_data_validator_rejects_missing_extra_changed_history_patch_tree_and_mode(self):
         files=self.files();rows=self.rows(files)
         vendor=next(name for name in sorted(files) if name.startswith(archive.TRUSTED_CRONET_ROOT))
@@ -723,7 +781,8 @@ class RealSourceValidatorClosureTests(unittest.TestCase):
             if kind=='symlink':item.type=tarfile.SYMTYPE;item.linkname='/outside';data=None
             elif kind=='hardlink':item.type=tarfile.LNKTYPE;item.linkname='source-fixture/go.mod';data=None
             else:item.mode=0o755
-            with self.subTest(kind=kind),self.assertRaisesRegex(ValueError,'Cronet regular source mode differs'):
+            with self.subTest(kind=kind),self.assertRaisesRegex(ValueError,
+                    'special or hardlink member' if kind=='hardlink' else 'Cronet regular source mode differs'):
                 archive._trusted_validator_contents(self.expanded(changed,[(item,data)]),'source-fixture')
 
     def test_independent_extraction_rejects_unsafe_duplicate_conflicting_and_nonregular_members(self):

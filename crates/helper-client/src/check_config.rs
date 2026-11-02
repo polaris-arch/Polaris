@@ -180,7 +180,11 @@ impl HelperClient {
             .send_with_timeout(
                 &match self.platform() {
                     Platform::Win => Request::WindowsCheck(request),
-                    _ => Request::MacCheck(request),
+                    Platform::Mac
+                    | Platform::Linux
+                    | Platform::Android
+                    | Platform::Ios
+                    | Platform::Other => Request::MacCheck(request),
                 },
                 timeout,
             )
@@ -253,7 +257,11 @@ impl HelperClient {
         };
         let begin = match self.platform() {
             Platform::Win => Request::WindowsCheck(begin_data),
-            _ => Request::MacCheck(begin_data),
+            Platform::Mac
+            | Platform::Linux
+            | Platform::Android
+            | Platform::Ios
+            | Platform::Other => Request::MacCheck(begin_data),
         };
         let key = match self
             .send_with_timeout(

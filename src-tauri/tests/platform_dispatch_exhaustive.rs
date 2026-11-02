@@ -177,8 +177,42 @@ type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
     ("crates/helper-client/src/check_config.rs", "client: HelperClient::new( Box::new(crate::connector::MacRootConnector), Platform::Mac, token, ),", 1,
      "SystemMacCheckClient::system constructs only the fixed Mac root connector and is compiled exclusively on macOS. Android/iOS/Linux/Windows/unknown platforms cannot construct this issuer; the Platform::Mac argument does not admit another platform or supply an ordinary execution fallback."),
-    ("crates/helper-client/src/check_config.rs", "if self.platform() != Platform::Mac", 2,
-     "Closed Root Helper CheckConfig is Mac-only. Win/Linux/Android/iOS/Other return Unsupported before connecting; this branch grants no execution owner or ordinary fallback."),
+    (
+        "crates/helper-client/src/check_config.rs",
+        "client: HelperClient::new( Box::new(crate::connector::WindowsSystemConnector), Platform::Win, token, ),",
+        1,
+        "SystemWindowsCheckClient::system is Windows-only and fixes the installed SYSTEM-authenticated pipe. Mac/Linux/Android/iOS/Other cannot construct this issuer; a token or generic injected stream cannot supply SYSTEM completion authority.",
+    ),
+    (
+        "crates/helper-client/src/check_config.rs",
+        "if !matches!(self.platform(), Platform::Mac | Platform::Win)",
+        2,
+        "Both the typed exchange and Begin admission reject Linux/Android/iOS/Other before connecting. Only Mac/Windows enter their own closed Root/SYSTEM CheckConfig protocol; no unsupported platform obtains an execution owner or ordinary fallback.",
+    ),
+    (
+        "crates/helper-client/src/check_config.rs",
+        "Response::Ok(ResponseKind::MacCheck(reply)) if self.platform() == Platform::Mac && reply.key().core == core && expected.as_ref().is_none_or(|k| k == reply.key()) =>",
+        1,
+        "Only a Mac reply on a Mac client with the exact CoreId and optional original CheckKey can be accepted. Windows has a separate response family; Linux/Android/iOS/Other fail before transport, and a cross-platform reply never becomes completion authority.",
+    ),
+    (
+        "crates/helper-client/src/check_config.rs",
+        "Response::Ok(ResponseKind::WindowsCheck(reply)) if self.platform() == Platform::Win && reply.key().core == core && expected.as_ref().is_none_or(|k| k == reply.key()) =>",
+        1,
+        "Only the Windows response family on a Windows client may match the exact CoreId/CheckKey. Mac cannot consume a Windows reply; Linux/mobile/Other are rejected before transport. This generic wire data is still not a production retirement issuer.",
+    ),
+    (
+        "crates/helper-client/src/check_config.rs",
+        ")) if self.platform() == Platform::Mac && key.core == expected_core =>",
+        1,
+        "A Mac Begin reply must retain the expected CoreId and Mac response family. The preceding allowlist rejects Linux/Android/iOS/Other; Windows must receive its own Begun family and cannot borrow this Mac branch.",
+    ),
+    (
+        "crates/helper-client/src/check_config.rs",
+        ")) if self.platform() == Platform::Win && key.core == expected_core =>",
+        1,
+        "A Windows Begin reply must retain the expected CoreId and Windows response family. Mac uses its separate branch; Linux/Android/iOS/Other never send Begin. A mismatched or unknown reply keeps admission/cleanup unconfirmed rather than releasing custody.",
+    ),
     ("crates/helper-client/src/manager.rs", "let script = if self.platform == Platform::Linux", 1,
      "Linux uninstall carries the responsible-user baseline/config only into its finite dispatcher. Mac keeps retirement and Windows keeps the native cleaner; unsupported/mobile platforms are rejected before this site."),
     ("src-tauri/src/runtime/helper.rs", "if self.platform != Platform::Linux", 1,
@@ -453,23 +487,21 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",
-        "mode.effective_on(platform).is_tun() && matches!(platform, Platform::Mac | Platform::Win \
-         | Platform::Linux)",
+        "mode.effective_on(platform).is_tun() && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)",
         1,
-        "should_start_via_helper。Android → false，正确且是起核能走对腿的前提：Android 起核\
-         走进程内 libbox（android_bridge），不建 helper client。与 helper.rs::platform_supported \
-         是同一个平台集合的两份写法，两份都必须把 Android 排除在外。\n\
-         2026-09-05 R1 判据加了半条：接管方式改读 `ProxyModeType::effective_on` 的**本平台生效值**\
-         （只对 Android 分叉）。对本条**零行为差** —— 合取项是 mac/win/linux 允许清单，Android 永远\
-         走不到 —— 接上是为了让 `src-tauri/tests/android_takeover_is_a_platform_fact.rs` 那道\
-         「每一处接管方式判据都读生效值」的门没有例外。Android 在这一格拿到的仍是 false。\n\
-         **2026-09-06 iOS 的显式确认（本条语句原文未变，故本表不会因它变红 —— 所以更要写下来）**：\
-         允许清单是 mac/win/linux，`Platform::Ios` 不在列 ⇒ 求值 false ⇒ 不建 helper client。\
-         这个答案**恰好是对的**（`runtime::helper::platform_supported(Ios) == false`，两处是同一个平台\
-         集合的两份写法），但它是白捡来的、没有人答过题。同一形态在 `builder/log.rs` 那一格上「不在\
-         允许清单里」是**错的**（=导出诊断无核日志），两格必须各自记一笔，不许互相推广。\
-         与 `is_tun()` 那半的交互：`effective_on(Ios)` 恒 Tun ⇒ 第一个合取项在 iOS 上恒真，整条判据完\
-         全由平台允许清单决定，不存在「靠模式判据兜住」的第二层。",
+        "managed_system_interfaces separates network takeover from the OS execution issuer. Only desktop TUN uses managed system interfaces; Android/iOS use their own native VPN containers and Other has no helper implementation. This predicate grants neither CheckConfig nor RunMain authority.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "if matches!(platform, Platform::Mac | Platform::Win) || (platform == Platform::Linux && mode.effective_on(platform).is_tun())",
+        1,
+        "execution_route uses the closed Root/SYSTEM provider on Mac/Windows even in manual mode; Linux uses its helper only for TUN and retains direct sealed-FD admission otherwise. Android/iOS/Other do not obtain a desktop Helper route, and native mobile admission remains separate.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "mode.effective_on(self.helper.platform()).is_tun() && matches!( self.helper.platform(), Platform::Mac | Platform::Win | Platform::Linux )",
+        1,
+        "The inline cfg(test) business-fixture adapter retains its existing desktop TUN path-spawn boundary. Android/iOS/Other remain outside the helper allowlist. It is counted because production-file text is scanned; the normal-library acceptance carrier does not compile cfg(test), and the fixture cannot mint production execution authority.",
     ),
     // ═══════════════════════════════════════════════════════════════════════
     // 2026-09-06 新进取材面的八处：`impl Platform` 块里写作 `Self::<Variant>` 的形态。
@@ -657,8 +689,8 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     (
         "src-tauri/src/runtime/proxy/startup.rs",
         "if matches!(self.helper.platform(), Platform::Mac | Platform::Win)",
-        1,
-        "接收 helper 启动凭据前 Mac/Win 必须声明 NativeBirth；Linux 另有 LinuxBirth。Android/iOS/Other 不会进入此桌面 helper 启动路径。",
+        2,
+        "Two distinct sites: production core_binary_for_start carries selected candidate data to the closed Mac/Windows issuer, and accepting a helper birth requires NativeBirth capability. Linux keeps its direct sealed-FD/helper LinuxBirth paths; Android/iOS/Other do not acquire desktop Helper execution or a pathname credential from either site.",
     ),
 
     (
@@ -1543,6 +1575,13 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "\"win\" => \"windowsExecution\", \"mac-x64\" | \"mac-arm64\" => \"macosExecution\", \"linux\" => \"sealedExecution\", _ => return Err(\"No platform execution report\".into()),",
+        1,
+        "This selects the expected proof field for the exact selected desktop source-contract row. Linux sealedExecution is distinct from Mac/Windows native Helper evidence; Android/iOS/unknown rows return an error. A selected row, CLI inventory or unknown string cannot mint running Helper authority.",
+    ),
+
     ("src-tauri/src/runtime/core_identity/tls_inventory.rs", "\"linux\" => \"linux/amd64\", \"win\" => \"windows/amd64\", \"mac-x64\" => \"darwin/amd64\", \"mac-arm64\" => \"darwin/arm64\", _ => return Err(reject()),", 1,
      "The compiled selected-support directory binds each of its four desktop rows to the exact target. Android/iOS/unknown platform strings reject rather than inherit a desktop target; the module is desktop-only, and this catalog mapping grants no execution or loaded-container evidence."),
     ("crates/core-supervisor/src/admitted_payload.rs", "if !matches!(platform, \"linux\" | \"win\" | \"mac-arm64\" | \"mac-x64\")", 1,
@@ -2396,6 +2435,14 @@ enum IosSide {
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
     (
+        "src-tauri/src/runtime/proxy.rs",
+        "desktop",
+        1,
+        IosSide::WithAndroid,
+        "The normal-library native acceptance carrier requires both desktop and its separate native-production-verification feature attribute. Android and iOS exclude the carrier, and enabling the feature cannot grant a mobile runtime a desktop issuer.",
+    ),
+
+    (
         "src-tauri/src/commands/updater/core_info.rs",
         "not(any(target_os = \"android\", target_os = \"ios\"))",
         1,
@@ -2522,9 +2569,16 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/tls_capabilities.rs",
         "not(any(target_os = \"android\", target_os = \"ios\"))",
-        4,
+        6,
         IosSide::WithAndroid,
-        "Desktop capability resolution binds retained Child custody or admitted CLI file identity. Both mobile platforms exclude these desktop methods and use their own native query.",
+        "Six desktop sites: direct binding, direct snapshot, desktop observation, startup CLI query, authenticated Helper snapshot impl and native birth predicate. Android and iOS exclude them and use their own loaded native containers; neither inherits desktop Child/file/Root/SYSTEM authority.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "all(test, not(any(target_os = \"android\", target_os = \"ios\")))",
+        1,
+        IosSide::WithAndroid,
+        "The separate tests/ module checks Mac/Windows birth data and explicit Linux/mobile/Other rejection on desktop hosts. test=false excludes it on both mobile production targets; the fixtures cannot supply a native receipt or production issuer.",
     ),
     (
         "src-tauri/src/runtime/proxy/tls_capabilities.rs",
@@ -2717,12 +2771,12 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/lib.rs",
         "desktop",
-        10,
+        11,
         IosSide::WithAndroid,
         "桌面专属插件与窗口装配（single-instance / autostart / 托盘锚点 / 窗口铬…），\
          以及两处只对独立内核可执行文件成立的启动步骤（清理旧版本内核残留目录、把随包内核\
          路径注入版本读取）：移动端的内核在进程内，没有这两件事的对象。\
-         两个移动平台同侧。**其中 single-instance 那条的既有理由只写了 Android**\
+         另加 native acceptance driver 的 desktop 属性，与独立 feature 属性仍作合取；移动端无此 driver。两个移动平台同侧。**其中 single-instance 那条的既有理由只写了 Android**\
          （「应用默认单进程 + tun fd 由 VpnService.prepare() 仲裁」）；iOS 的等价物是\
          「系统本就不允许同一 app 起第二个进程实例」+「`NEVPNManager` 侧的隧道单例」，\
          结论同、依据不同。答案不变，故不改代码。",
@@ -4294,7 +4348,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // TLS presentation adds five more: core_info (1 + 1), core_identity (2),
     // and tls_capabilities (1). eval_cfg checks Android/iOS in release/debug.
     // No existing verdict or debt site changes; no device validation is claimed.
-    ("WithAndroid", 142),
+    // CTE-R02 records two desktop Helper binding sites, one separate desktop test
+    // module and both desktop carrier declarations. No old iOS debt is repaid.
+    ("WithAndroid", 147),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
