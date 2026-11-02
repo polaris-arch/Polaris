@@ -1219,19 +1219,73 @@ async fn real_core_aggregate_relay_emits_real_frames() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+type NativeCaseFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>;
+type NativeCaseFactory = fn() -> NativeCaseFuture;
+
+fn lifecycle_case() -> NativeCaseFuture {
+    Box::pin(real_core_full_lifecycle())
+}
+
+fn lifecycle_race_case() -> NativeCaseFuture {
+    Box::pin(real_core_lifecycle_race_start_then_immediate_stop())
+}
+
+fn hot_switch_case() -> NativeCaseFuture {
+    Box::pin(real_core_hot_switch_keeps_pid())
+}
+
+fn failover_case() -> NativeCaseFuture {
+    Box::pin(real_core_auto_failover_attests_without_applying_saved_debt())
+}
+
+fn restart_confirmation_case() -> NativeCaseFuture {
+    Box::pin(real_core_hot_switch_failure_waits_for_explicit_restart_confirmation())
+}
+
+fn aggregate_relay_case() -> NativeCaseFuture {
+    Box::pin(real_core_aggregate_relay_emits_real_frames())
+}
+
+// Selection returns only a function pointer. Each separate factory constructs
+// one concrete future; Box::pin still materializes that selected future first.
+fn selected_case_factory(case: &str) -> Option<NativeCaseFactory> {
+    match case {
+        "runtime::proxy::tests::lifecycle::real_core_full_lifecycle" => {
+            Some(lifecycle_case)
+        }
+        "runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop" => {
+            Some(lifecycle_race_case)
+        }
+        "runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid" => {
+            Some(hot_switch_case)
+        }
+        "runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt" => {
+            Some(failover_case)
+        }
+        "runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation" => {
+            Some(restart_confirmation_case)
+        }
+        "runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames" => {
+            Some(aggregate_relay_case)
+        }
+        _ => None,
+    }
+}
+
 /// One bounded case per process. No path, policy, issuer, transport or argv inputs.
 #[cfg(debug_assertions)]
 pub(crate) async fn run_case(case: &str) -> Result<(), String> {
     if !CASE_NAMES.contains(&case) {
         return Err("unknown native acceptance case".into());
     }
-    if std::env::var_os("POLARIS_SINGBOX_PATH").is_some() {
-        return Err("Core path override is forbidden in native production verification".into());
-    }
+    let factory = selected_case_factory(case).ok_or("unknown native acceptance case")?;
+    super::core_binary::dev_core_binary_override().map(drop)?;
+    eprintln!("native verification stage: selected");
     let parent = std::env::temp_dir().join("polaris-native-production-verification");
     std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
     let dir = parent.join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+    eprintln!("native verification stage: runtime constructors");
     let config = Arc::new(ConfigManager::new(dir.clone()));
     let helper = Arc::new(HelperRuntime::new(dir.clone()));
     let mesh = Arc::new(MeshRuntime::new_with_helper(dir.clone(), helper.clone()));
@@ -1247,22 +1301,14 @@ pub(crate) async fn run_case(case: &str) -> Result<(), String> {
     RUNTIME
         .set(runtime.clone())
         .map_err(|_| "one case per process")?;
-    let result=AssertUnwindSafe(async {match case {
-
-
-"runtime::proxy::tests::lifecycle::real_core_full_lifecycle"=>real_core_full_lifecycle().await,
-
-"runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop"=>real_core_lifecycle_race_start_then_immediate_stop().await,
-
-"runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid"=>real_core_hot_switch_keeps_pid().await,
-
-"runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt"=>real_core_auto_failover_attests_without_applying_saved_debt().await,
-
-"runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation"=>real_core_hot_switch_failure_waits_for_explicit_restart_confirmation().await,
-
-"runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames"=>real_core_aggregate_relay_emits_real_frames().await,
-
-_=>unreachable!(),}}).catch_unwind().await;
+    let result = AssertUnwindSafe(async {
+        eprintln!("native verification stage: construct selected future");
+        let future = factory();
+        eprintln!("native verification stage: poll selected future");
+        future.await;
+    })
+    .catch_unwind()
+    .await;
     // Always fence admission and drain through the real production owner, even on
     // assertions or a missing selected candidate. Cleanup is never a native PASS.
     let check_fence = polaris_core_supervisor::begin_check_shutdown().map_err(|e| e.to_string());

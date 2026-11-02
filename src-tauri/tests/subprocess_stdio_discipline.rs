@@ -470,13 +470,18 @@ struct Passthrough {
     reason: &'static str,
 }
 
-/// **当前为空**。唯一那条（`impl LoginCoreChild for TokioLoginCoreChild {`）在 stdio 收口时失去了
-/// 对象：`LoginCoreChild` 已经没有 `take_stdout` / `take_stderr` 了，读端在 spawner 里就交给了
-/// 请求上的排空回调，没有任何一层再做「只透传不排空」。删它不是放宽判据 —— 防腐规则要求每条透传
-/// 项必须真盖住至少一处取管道的地方，留着它反而会让本门恒红（实测过一次，正是它把红报出来的）。
-///
-/// 机制保留：下一个真要透传的人得落进这套规则里，而不是自己新起一张没有过期检查的表。
-const PIPE_PASSTHROUGH: [Passthrough; 5] = [
+/// 只登记真实的逐流透传；每项必须继续覆盖实际取读端，排空仍由登记的消费者负责。
+const PIPE_PASSTHROUGH: [Passthrough; 7] = [
+    Passthrough {
+        file: "crates/core-supervisor/src/admitted_payload/windows.rs",
+        anchor: "pub(crate) fn take_stdout(",
+        reason: "WindowsCheckChild moves its exact stdout File while retaining native child/cohort/lease custody; the shared Check dispatcher takes both streams before handing them to bounded-retention EOF workers, exact field and custody contracts checked below",
+    },
+    Passthrough {
+        file: "crates/core-supervisor/src/admitted_payload/windows.rs",
+        anchor: "pub(crate) fn take_stderr(",
+        reason: "WindowsCheckChild moves its distinct stderr File to the stderr EOF worker without replacing or dropping native child/cohort/lease custody; exact individual field and dual-stream contracts checked below",
+    },
     Passthrough {
         file: "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
         anchor: "fn helper_check_request(",
@@ -839,6 +844,7 @@ fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, us
         rel,
         "crates/core-supervisor/src/admitted_payload.rs"
             | "crates/core-supervisor/src/config_gate/check_custody/macos.rs"
+            | "crates/core-supervisor/src/admitted_payload/windows.rs"
     ) {
         assert!(
             mac_check_stdio_custody_is_complete(index),
@@ -850,6 +856,7 @@ fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, us
         "crates/core-supervisor/src/admitted_payload/macos.rs"
             | "crates/helper/src/platform/macos/server.rs"
             | "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs"
+            | "crates/core-supervisor/src/admitted_payload/windows.rs"
     ) {
         assert!(
             platform_factory_stdio_custody_is_complete(index),
@@ -2622,6 +2629,18 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
         index,
         "crates/core-supervisor/src/admitted_payload/windows.rs",
     );
+    for (anchor, field) in [
+        ("pub(crate) fn take_stdout(", "stdout"),
+        ("pub(crate) fn take_stderr(", "stderr"),
+    ] {
+        if compact(block_of(windows, anchor))
+            != format!(
+                "pub(crate)fntake_{field}(&mutself)->Option<File>{{self.child.{field}.take()}}"
+            )
+        {
+            return false;
+        }
+    }
     let parts = compact(block_of(windows, "impl WindowsStartedChild {"));
     if !parts
         .contains("(self.pid,self.process,self.stdout.expect(),self.stderr.expect(),self.custody,)")
@@ -2713,6 +2732,21 @@ fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
             "crates/core-supervisor/src/admitted_payload/windows.rs",
             "self.stderr.expect(",
             "self.stdout.expect(",
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload/windows.rs",
+            "self.child.stdout.take()",
+            "self.child.stderr.take()",
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload/windows.rs",
+            "self.child.stderr.take()",
+            "self.child.stdout.take()",
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload/windows.rs",
+            "self.child.stderr.take()",
+            "None",
         ),
         (
             "crates/helper/src/platform/macos/server.rs",

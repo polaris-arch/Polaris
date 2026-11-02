@@ -136,7 +136,7 @@ pub(crate) fn first_existing_bundle_candidate(candidates: &[PathBuf]) -> Option<
 /// A process environment variable cannot admit a replacement core. Explicit
 /// per-runtime cfg(test) injection remains separate from shipped debug code.
 #[cfg(any(debug_assertions, test))]
-fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
+pub(super) fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
     if std::env::var_os("POLARIS_SINGBOX_PATH").is_some() {
         return Err("POLARIS_SINGBOX_PATH 不允许替换配套内核；请使用已验证的编译期内核选择".into());
     }

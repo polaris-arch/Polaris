@@ -79,7 +79,7 @@ use polaris_config_engine::user_config::ProxyModeType;
 use polaris_core_supervisor::port_bookkeeping::{
     FreePortProvider, PrimaryApiPortLedger, ResolvedPort, TokioPortProvider,
 };
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use polaris_core_supervisor::run_config_check;
 use polaris_core_supervisor::{
     core_ready_budget_ms, core_startup_estimate_ms, decide_peel, wait_for_core_ready,

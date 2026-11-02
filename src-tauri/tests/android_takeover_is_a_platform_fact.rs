@@ -242,6 +242,29 @@ fn every_takeover_mode_decision_reads_the_effective_value() {
 // The carrier stays in both automatic censuses. These two manual writes are
 // admitted only inside the actual debug/desktop/feature module and private
 // one-case runtime, never as a general production read of stored mode.
+fn native_carrier_body<'a>(source: &'a str, head: &str) -> Option<&'a str> {
+    let bare = polaris_source_probe::mask_comments_and_strings(source);
+    if bare.matches(head).count() != 1 {
+        return None;
+    }
+    let start = bare.find(head)?;
+    let open = start + bare[start..].find('{')?;
+    let mut depth = 0usize;
+    for (offset, byte) in bare[open..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&source[open..=open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn closed_native_configuration_scope(proxy: &str, library: &str, carrier: &str) -> bool {
     let compact = |s: &str| {
         mask_comments(s)
@@ -252,27 +275,83 @@ fn closed_native_configuration_scope(proxy: &str, library: &str, carrier: &str) 
     let p = compact(proxy);
     let l = compact(library);
     let c = compact(carrier);
+    let bare = compact(&polaris_source_probe::mask_comments_and_strings(carrier));
     let cases = [
-        ("runtime::proxy::tests::lifecycle::real_core_full_lifecycle", "real_core_full_lifecycle"),
-        ("runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop", "real_core_lifecycle_race_start_then_immediate_stop"),
-        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid", "real_core_hot_switch_keeps_pid"),
-        ("runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt", "real_core_auto_failover_attests_without_applying_saved_debt"),
-        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation", "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation"),
-        ("runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames", "real_core_aggregate_relay_emits_real_frames"),
+        ("runtime::proxy::tests::lifecycle::real_core_full_lifecycle", "lifecycle_case", "real_core_full_lifecycle"),
+        ("runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop", "lifecycle_race_case", "real_core_lifecycle_race_start_then_immediate_stop"),
+        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid", "hot_switch_case", "real_core_hot_switch_keeps_pid"),
+        ("runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt", "failover_case", "real_core_auto_failover_attests_without_applying_saved_debt"),
+        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation", "restart_confirmation_case", "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation"),
+        ("runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames", "aggregate_relay_case", "real_core_aggregate_relay_emits_real_frames"),
     ];
     let names = format!(
         "constCASE_NAMES:&[&str]=&[{}];",
         cases
             .iter()
-            .map(|(name, _)| format!("\"{name}\","))
+            .map(|(name, _, _)| format!("\"{name}\","))
             .collect::<String>()
     );
+    let Some(selector) = native_carrier_body(carrier, "fn selected_case_factory(") else {
+        return false;
+    };
+    let expected_selector = format!(
+        "{{matchcase{{{}_=>None,}}}}",
+        cases
+            .iter()
+            .map(|(name, factory, _)| format!("\"{name}\"=>{{Some({factory})}}"))
+            .collect::<String>()
+    );
+    if compact(selector) != expected_selector
+        || !bare.contains("typeNativeCaseFactory=fn()->NativeCaseFuture;")
+        || !bare.contains(
+            "typeNativeCaseFuture=std::pin::Pin<Box<dynstd::future::Future<Output=()>+'static>>;",
+        )
+        || !cases.iter().all(|(_, factory, method)| {
+            native_carrier_body(carrier, &format!("fn {factory}("))
+                .is_some_and(|body| compact(body) == format!("{{Box::pin({method}())}}"))
+        })
+    {
+        return false;
+    }
+    let Some(run_body) = native_carrier_body(carrier, "pub(crate) async fn run_case(") else {
+        return false;
+    };
+    let run = compact(run_body);
+    let run_code = compact(&polaris_source_probe::mask_comments_and_strings(run_body));
+    let policy = "super::core_binary::dev_core_binary_override().map(drop)?;";
+    let Some(policy_at) = run_code.find(policy) else {
+        return false;
+    };
+    let positions = (
+        run_code.find("letresult=AssertUnwindSafe(async{"),
+        run_code.find("letfuture=factory();"),
+        run_code.find("future.await;"),
+        run_code.find(").catch_unwind().await;"),
+    );
+    let (Some(catch), Some(construct), Some(poll), Some(caught)) = positions else {
+        return false;
+    };
+    if !(policy_at < catch && catch < construct && construct < poll && poll < caught)
+        || run_code.matches(policy).count() != 1
+        || run_code.matches("factory()").count() != 1
+        || [
+            "std::fs::",
+            "eprintln!",
+            "ConfigManager::new(",
+            "HelperRuntime::new(",
+            "ProxyRuntime::new(",
+            "factory()",
+        ]
+        .iter()
+        .any(|effect| run_code[..policy_at].contains(*effect))
+    {
+        return false;
+    }
     p.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]#[path=\"../native_verification/proxy_carrier.rs\"]pub(crate)modnative_verification;")
         && l.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]pubasyncfnrun_native_production_verification(case:&str)->Result<(),String>{runtime::proxy::native_verification::run_case(case).await}")
         && c.contains("#[cfg(debug_assertions)]pub(crate)asyncfnrun_case(case:&str)->Result<(),String>{if!CASE_NAMES.contains(&case){returnErr(")
         && c.contains(&names)
-        && cases.iter().all(|(name, method)| c.contains(&format!("\"{name}\"=>{method}().await,")))
-        && c.contains("ifstd::env::var_os(\"POLARIS_SINGBOX_PATH\").is_some(){returnErr(")
+        && run.contains("letfactory=selected_case_factory(case).ok_or(\"unknownnativeacceptancecase\")?;")
         && c.contains("letparent=std::env::temp_dir().join(\"polaris-native-production-verification\");")
         && c.contains("letdir=parent.join(uuid::Uuid::new_v4().to_string());")
         && c.contains("std::fs::create_dir(&dir).map_err(|e|e.to_string())?;")
@@ -351,6 +430,42 @@ fn native_manual_writes_require_the_closed_private_desktop_runtime() {
         assert!(
             !closed_native_configuration_scope(&changed[0], &changed[1], &changed[2]),
             "private acceptance scope escaped: {old}"
+        );
+    }
+    for (head, old, new) in [
+        (
+            "fn selected_case_factory(",
+            "Some(lifecycle_case)",
+            "Some(hot_switch_case)",
+        ),
+        (
+            "fn selected_case_factory(",
+            "_ => None",
+            "_ => Some(lifecycle_case)",
+        ),
+        (
+            "fn lifecycle_case(",
+            "Box::pin(real_core_full_lifecycle())",
+            "Box::pin(real_core_hot_switch_keeps_pid())",
+        ),
+        (
+            "pub(crate) async fn run_case(",
+            "let result = AssertUnwindSafe(async {",
+            "let future = factory();\n    let result = AssertUnwindSafe(async {",
+        ),
+        (
+            "pub(crate) async fn run_case(",
+            "super::core_binary::dev_core_binary_override().map(drop)?;",
+            "super::core_binary::dev_core_binary_override().ok();",
+        ),
+    ] {
+        let body = native_carrier_body(&faces[2], head).expect("actual native boundary missing");
+        assert_eq!(body.matches(old).count(), 1, "{head}: {old}");
+        assert_eq!(faces[2].matches(body).count(), 1);
+        let changed = faces[2].replacen(body, &body.replacen(old, new, 1), 1);
+        assert!(
+            !closed_native_configuration_scope(&faces[0], &faces[1], &changed),
+            "native dispatch boundary escaped: {head}: {old}"
         );
     }
 }

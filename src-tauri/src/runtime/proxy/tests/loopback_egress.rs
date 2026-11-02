@@ -324,6 +324,28 @@ fn private_native_proxy_scope(proxy: &str, carrier: &str) -> bool {
         || !c.contains("letconfig=Arc::new(ConfigManager::new(dir.clone()));")
         || !c.contains("letdir=parent.join(uuid::Uuid::new_v4().to_string());")
     { return false; }
+    let Some(run_body) = fn_body(&bare, "run_case") else {
+        return false;
+    };
+    let run = compact(run_body);
+    let policy = "super::core_binary::dev_core_binary_override().map(drop)?;";
+    let Some(policy_at) = run.find(policy) else {
+        return false;
+    };
+    if run.matches(policy).count() != 1
+        || [
+            "std::fs::",
+            "eprintln!",
+            "ConfigManager::new(",
+            "HelperRuntime::new(",
+            "ProxyRuntime::new(",
+            "factory()",
+        ]
+        .iter()
+        .any(|effect| run[..policy_at].contains(*effect))
+    {
+        return false;
+    }
     for name in PRIVATE_NATIVE_PROXY_FUNCTIONS {
         let Some(body) = fn_body(&bare, name) else {
             return false;
@@ -374,22 +396,43 @@ fn native_proxy_traffic_and_management_probe_keep_distinct_private_purposes() {
     for (old, new) in [
         ("\"127.0.0.1\", mixed", "\"0.0.0.0\", mixed"),
         (".write_all(b\"GET", ".pretend_write(b\"GET"),
-        ("\"127.0.0.1\", st.clash_api_port", "\"127.0.0.1\", mixed"),
+        (
+            "tokio::net::TcpStream::connect((\"127.0.0.1\", st.clash_api_port))",
+            "tokio::net::TcpStream::connect((\"127.0.0.1\", mixed))",
+        ),
         (
             "ConfigManager::new(dir.clone())",
             "ConfigManager::new(user_directory())",
         ),
         ("if !CASE_NAMES.contains(&case)", "if false"),
+        (
+            "super::core_binary::dev_core_binary_override().map(drop)?;",
+            "super::core_binary::dev_core_binary_override().ok();",
+        ),
+        (
+            "super::core_binary::dev_core_binary_override().map(drop)?;",
+            "",
+        ),
     ] {
         assert!(
             carrier.contains(old),
             "negative must mutate actual native traffic: {old}"
         );
-        assert!(!private_native_proxy_scope(
-            &proxy,
-            &carrier.replacen(old, new, 1)
-        ));
+        assert!(
+            !private_native_proxy_scope(&proxy, &carrier.replacen(old, new, 1)),
+            "private native purpose regression was not denied: {old}"
+        );
     }
+    let policy = "super::core_binary::dev_core_binary_override().map(drop)?;";
+    let constructor = "let config = Arc::new(ConfigManager::new(dir.clone()));";
+    assert_eq!(carrier.matches(policy).count(), 1);
+    assert_eq!(carrier.matches(constructor).count(), 1);
+    let late_policy = carrier.replacen(policy, "", 1).replacen(
+        constructor,
+        &format!("{constructor}\n    {policy}"),
+        1,
+    );
+    assert!(!private_native_proxy_scope(&proxy, &late_policy));
     let guard = "#[cfg(debug_assertions)]\n#[path = \"../native_verification/proxy_carrier.rs\"]";
     assert!(proxy.contains(guard));
     assert!(!private_native_proxy_scope(

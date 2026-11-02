@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { TESTS, selectNativeExecutable, bindNativeRuntime, runTests, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
 import test, { after } from 'node:test';
 import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesktopSelection, selectedCandidateContext } from './desktop-core/native-dns-candidate.mjs';
 import { regularPath } from './desktop-core/release-consumer.mjs';
@@ -707,63 +709,97 @@ test('formal host activation derives compiler and source from the validated cont
 });
 
 
-test('Windows controlled runtime summary requires all five exact stdout logs and passed records', () => {
+test('ordinary summary consumes one bound six-case normal projection without promoting SYSTEM or package scope', async () => {
   const source = nodeScript('Record ordinary candidate outcomes without claiming skipped acceptance');
   const names = [...step('Run exact controlled App lifecycle hot-switch and stats tests')
-    .matchAll(/^            (runtime::proxy::[^\s]+)$/gm)].map((m) => m[1]);
-  assert.equal(names.length, 5);
-  const pass = 'test result: ok. 1 passed; 0 failed; 0 ignored;';
-  function summary({ missingStatus = '', status = 'passed', stdout = pass, missingStdout = '',
-    mixed = pass, statusFile = true, system = {} } = {}) {
-    const directory = mkdtempSync(join(tmpdir(), 'windows-runtime-summary-'));
-    const fixturePath = (path) => join(directory, path);
+    .matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(names, TESTS); assert.equal(names.length, 6);
+  assert.equal(names[5], 'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames');
+  const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+  for (const mode of ['pass', 'stack-overflow', 'business-failure']) {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'ordinary-native-summary-')));
+    const evidence = join(directory, 'native-dns-ci-evidence'), platform = mode === 'business-failure' ? 'linux' : 'win';
     try {
-      mkdirSync(fixturePath('native-dns-ci-evidence'));
-      if (statusFile) writeFileSync(fixturePath('native-dns-ci-evidence/runtime-status.txt'), names.flatMap((name) =>
-        [`${name}: started`, `${name}: ${name === missingStatus ? 'started' : status}`]).join('\n'));
-      for (const name of names) {
-        const log = `native-dns-ci-evidence/${name.split('::').at(-1)}`;
-        if (name !== missingStdout) writeFileSync(fixturePath(`${log}.stdout.log`), stdout);
-        // Legacy human logs and stderr deliberately contain tempting pass text.
-        writeFileSync(fixturePath(`${log}.log`), mixed);
-        writeFileSync(fixturePath(`${log}.stderr.log`), pass);
+      mkdirSync(evidence); mkdirSync(join(directory, 'target/debug'), { recursive: true });
+      mkdirSync(join(directory, 'scripts')); mkdirSync(join(directory, '.github/workflows'), { recursive: true });
+      for (const path of ['scripts/run-native-dns-controlled-tests.mjs', '.github/workflows/ci.yml'])
+        writeFileSync(join(directory, path), readFileSync(join(root, path)));
+      const executable = join(directory, 'target/debug/native-admission-verifier'); writeFileSync(executable, 'inert normal fixture');
+      const target = { name: 'native-admission-verifier', kind: ['bin'], src_path: join(directory, 'src-tauri/src/bin/native-admission-verifier.rs') };
+      const metadata = { target_directory: join(directory, 'target'), packages: [{ id: 'app', name: 'polaris',
+        manifest_path: join(directory, 'src-tauri/Cargo.toml'), targets: [target] }] };
+      const artifact = { reason: 'compiler-artifact', package_id: 'app', target, profile: { test: false, debug_assertions: true },
+        executable, features: ['default', 'formal-selection', 'native-production-verification'] };
+      const env = { ...base, CORE_CANDIDATE: sha, CORE_PLATFORM: platform, RUNNER_OS: platform === 'win' ? 'Windows' : 'Linux',
+        POLARIS_NATIVE_DNS_FORMAL: '1', ADMITTED_FORMAL: 'true', ADMITTED_DEFAULT: '', ADMITTED_CANDIDATE: '',
+        POLARIS_CORE_IDENTITY_FILE: join(directory, 'compiled-core.json'), RUNTIME_OUTCOME: mode === 'pass' ? 'success' : 'failure' };
+      writeFileSync(env.POLARIS_CORE_IDENTITY_FILE, JSON.stringify({ schema: 'polaris-core-manifest-v1', id: 'f'.repeat(64), core: { platform, files: [{ name: 'inert metadata' }] } }));
+      writeFileSync(join(evidence, 'context.json'), JSON.stringify({ context: { repository: env.GITHUB_REPOSITORY,
+        repositoryId: env.GITHUB_REPOSITORY_ID, candidate: sha, tree: 'b'.repeat(40), runId: env.GITHUB_RUN_ID,
+        attempt: env.GITHUB_RUN_ATTEMPT, workflowRef: env.GITHUB_WORKFLOW_REF, ref: env.GITHUB_REF, contractSha256: 'c'.repeat(64) },
+        platform, selection: 'formal-default', kernelSourceCommit: 'd'.repeat(40), kernelSourceTree: 'e'.repeat(40) }));
+      writeFileSync(join(evidence, 'controlled-cargo-metadata.json'), JSON.stringify(metadata));
+      writeFileSync(join(evidence, 'controlled-build.stdout.log'), JSON.stringify(artifact) + '\n');
+      const selected = selectNativeExecutable([artifact], metadata, directory); selected.sha256 = hash('inert normal fixture');
+      writeFileSync(join(evidence, 'controlled-executable.json'), JSON.stringify({ ...selected, preparationCalls: 1 }));
+      const git = (command, args) => {
+        assert.equal(command, 'git');
+        if (args[0] === 'rev-parse') return args[1] === 'HEAD' ? sha : 'b'.repeat(40);
+        if (args[0] === 'status') return '';
+        assert.equal(args[0], 'show'); return readFileSync(join(directory, args[1].slice(41)), 'utf8');
+      };
+      bindNativeRuntime(selected, directory, env, evidence, git);
+      const calls = [];
+      const operation = runTests(selected, env, evidence, async command => {
+        const name = command.args[0]; calls.push(name);
+        const cleanup = { schema: 'polaris-controlled-cleanup-v1', testName: name, processId: 70, generation: 1,
+          shutdownFenced: true, custody: { state: 'empty-after-shutdown-fence', corePid: null, runRef: null }, publicationEligible: false };
+        const configJson = JSON.stringify({ services: [{ type: 'api', dashboard: { path: '/fixture' } }],
+          inbounds: [{ type: 'mixed', listen: '127.0.0.1' }], outbounds: [] });
+        const graph = { schema: 'polaris-controlled-production-graph-v1', processId: 70, stage: 'initial-start',
+          source: 'actual-runtime-config-path', dashboardEnabled: true, startSucceeded: true, dashboardPath: '/fixture',
+          bytes: Buffer.byteLength(configJson), sha256: hash(configJson), configJson, publicationEligible: false };
+        const native = { schema: 'polaris-native-production-case-v1', case: name, processId: 70, carrier: 'normal-production-library',
+          result: mode === 'business-failure' ? 'failed' : 'passed', validationCustodyDrained: true, publicationEligible: false };
+        const stdout = mode === 'stack-overflow' ? '' : `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(cleanup)}\n`
+          + (name === TESTS[2] ? `POLARIS_DEFAULT_GRAPH ${JSON.stringify(graph)}\n` : '') + `POLARIS_NATIVE_CASE ${JSON.stringify(native)}\n`;
+        const stderr = mode === 'stack-overflow' ? 'stack overflow\n' : 'ordinary diagnostic\n', output = stdout + stderr;
+        const id = name.split('::').at(-1);
+        for (const [suffix, bytes] of [['.log', output], ['.stdout.log', stdout], ['.stderr.log', stderr]]) writeFileSync(join(evidence, id + suffix), bytes);
+        return { status: mode === 'pass' ? 0 : 1, processId: 70, error: null, timedOut: false, cleanupUncertain: false, interrupted: false,
+          output, stdout, stderr, logBytes: Buffer.byteLength(output), logSha256: hash(output),
+          stdoutBytes: Buffer.byteLength(stdout), stdoutSha256: hash(stdout), stderrBytes: Buffer.byteLength(stderr), stderrSha256: hash(stderr) };
+      });
+      if (mode === 'pass') await operation; else await assert.rejects(operation);
+      let adapterCalls = 0;
+      const fixturePath = path => isAbsolute(path) ? path : join(directory, path);
+      const summary = (extra = {}) => {
+        new Function('process', 'copyFileSync', 'existsSync', 'mkdirSync', 'readFileSync', 'writeFileSync', 'nativeRuntimeSummary', source)(
+          { env: { ...env, ...extra } }, (from, to) => copyFileSync(fixturePath(from), fixturePath(to)),
+          path => existsSync(fixturePath(path)), (path, options) => mkdirSync(fixturePath(path), options),
+          (path, encoding) => readFileSync(fixturePath(path), encoding), (path, bytes) => writeFileSync(fixturePath(path), bytes),
+          (path, checked) => { adapterCalls++; return nativeRuntimeSummary(fixturePath(path), checked, directory, git); });
+        return JSON.parse(readFileSync(join(evidence, 'summary.json'), 'utf8'));
+      };
+      const value = summary(); assert.equal(adapterCalls, 1);
+      assert.deepEqual(value.nativeProductionRuntime.tests.map(row => row.name), TESTS);
+      assert.equal(value.nativeProductionRuntime.requirementState, mode === 'pass' ? 'satisfied' : 'open');
+      if (platform === 'win') assert.deepEqual(value.windowsProxyRuntimeTests, value.nativeProductionRuntime);
+      assert.equal(value.AppAccepted, false); assert.equal(value.packagedAcceptance, false); assert.equal(value.publicationEligible, false);
+      assert.equal(value.systemAcceptance.state, 'unexecuted');
+      if (mode === 'stack-overflow') {
+        assert.equal(value.nativeProductionRuntime.tests[0].state, 'cleanup-unknown');
+        assert.ok(value.nativeProductionRuntime.tests.slice(1).every(row => row.state === 'unexecuted')); assert.equal(calls.length, 1);
+      } else if (mode === 'business-failure') {
+        assert.ok(value.nativeProductionRuntime.tests.every(row => row.state === 'failed' && row.cleanup === 'confirmed')); assert.equal(calls.length, 6);
+      } else {
+        assert.equal(summary({ SYSTEM_FRESH_OUTCOME: 'success', SYSTEM_PREBUILT_OUTCOME: 'success' }).systemAcceptance.state, 'passed');
+        assert.equal(summary({ SYSTEM_FRESH_OUTCOME: 'success', SYSTEM_PREBUILT_OUTCOME: 'skipped' }).systemAcceptance.state, 'failed-or-incomplete');
+        assert.equal(summary({ SYSTEM_FRESH_OUTCOME: 'skipped', SYSTEM_PREBUILT_OUTCOME: 'skipped' }).systemAcceptance.state, 'unexecuted');
+        assert.equal(summary({ RUNTIME_OUTCOME: 'failure' }).nativeProductionRuntime.requirementState, 'open');
       }
-      new Function('process', 'copyFileSync', 'existsSync', 'mkdirSync', 'readFileSync', 'writeFileSync', source)(
-        { env: { RUNNER_OS: 'Windows', RUNTIME_OUTCOME: 'success', ...system } },
-        (from, to) => copyFileSync(fixturePath(from), fixturePath(to)), (path) => existsSync(fixturePath(path)),
-        (path, options) => mkdirSync(fixturePath(path), options),
-        (path, encoding) => readFileSync(fixturePath(path), encoding),
-        (path, value) => writeFileSync(fixturePath(path), value));
-      return JSON.parse(readFileSync(fixturePath('native-dns-ci-evidence/summary.json'), 'utf8'));
     } finally { rmSync(directory, { recursive: true, force: true }); }
   }
-  const success = summary();
-  assert.equal(success.windowsProxyRuntimeTests.state, 'passed');
-  assert.equal(success.windowsProxyRuntimeTests.requirementState, 'satisfied');
-  assert.deepEqual(success.windowsProxyRuntimeTests.tests.map(({ name }) => name), names);
-  assert.ok(success.windowsProxyRuntimeTests.tests.every(({ log }) => log.endsWith('.stdout.log')));
-  assert.equal(success.AppAccepted, false);
-  assert.equal(success.systemAcceptance.state, 'unexecuted');
-  for (const [fresh, prebuilt, state] of [['success','success','passed'], ['success','skipped','failed-or-incomplete'],
-    ['failure','skipped','failed-or-incomplete'], ['skipped','skipped','unexecuted']]) {
-    const value = summary({ system: { SYSTEM_FRESH_OUTCOME: fresh, SYSTEM_PREBUILT_OUTCOME: prebuilt } });
-    assert.equal(value.systemAcceptance.state, state);
-    assert.equal(value.AppAccepted, false);
-  }
-  for (const name of names) {
-    for (const absent of [{ missingStatus: name }, { missingStdout: name }]) {
-      const value = summary(absent).windowsProxyRuntimeTests;
-      assert.equal(value.requirementState, 'open');
-      assert.equal(value.tests.find((item) => item.name === name).state, 'failed-or-incomplete');
-      assert.ok(value.tests.filter((item) => item.name !== name).every((item) => item.state === 'passed'));
-    }
-  }
-  for (const log of ['', 'test result: ok. 0 passed; 0 failed; 0 ignored;', 'test result: FAILED.'])
-    assert.equal(summary({ stdout: log }).windowsProxyRuntimeTests.requirementState, 'open',
-      'fake pass text in mixed/stderr logs cannot replace stdout proof');
-  assert.equal(summary({ mixed: 'human-only diagnostics without a verdict' }).windowsProxyRuntimeTests.requirementState, 'satisfied');
-  assert.equal(summary({ status: 'started' }).windowsProxyRuntimeTests.requirementState, 'open');
-  assert.equal(summary({ statusFile: false }).windowsProxyRuntimeTests.state, 'unexecuted');
 });
 
 test('final SYSTEM request fails before heavy work for wrong identity, platform or diagnostic scope', () => {

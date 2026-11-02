@@ -1764,31 +1764,16 @@ jobs:
         run: |
           node --input-type=module - <<'NODE'
           import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+          import { nativeRuntimeSummary } from './scripts/run-native-dns-controlled-tests.mjs';
           const e = process.env, directory = 'native-dns-ci-evidence';
           mkdirSync(directory, { recursive: true });
           const outcomes = Object.fromEntries(Object.entries(e).filter(([key]) => key.endsWith('_OUTCOME')));
-          const proxyTests = [
-            'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',
-            'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
-            'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
-            'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
-            'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
-          ];
-          const statusPath = `${directory}/runtime-status.txt`;
-          const statuses = existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n') : [];
-          const tests = proxyTests.map((name) => {
-            const log = `${directory}/${name.split('::').at(-1)}.stdout.log`;
-            const exactPass = existsSync(log) && readFileSync(log, 'utf8').includes('test result: ok. 1 passed; 0 failed; 0 ignored;');
-            const passed = statuses.includes(`${name}: passed`) && exactPass;
-            return { name, state: passed ? 'passed' : statuses.includes(`${name}: started`) ? 'failed-or-incomplete' : 'unexecuted', log };
-          });
-          const passed = tests.every((test) => test.state === 'passed');
-          const windowsProxyRuntimeTests = e.RUNNER_OS === 'Windows' ? {
-            state: passed ? 'passed' : tests.some((test) => test.state !== 'unexecuted') ? 'failed-or-incomplete' : 'unexecuted',
-            requirementState: passed ? 'satisfied' : 'open',
-            scope: 'Five exact controlled compiled-carrier loopback/manual lifecycle and hot-switch tests; no SYSTEM or packaged acceptance',
-            tests,
-          } : { state: 'see exact runtime logs' };
+          const receipt = e.ADMITTED_FORMAL === 'true' ? `resources/.release-receipts/${e.CORE_PLATFORM}.json` : 'resources/.native-dns-candidate/receipt.json';
+          if (existsSync(receipt)) copyFileSync(receipt, `${directory}/acquisition-receipt.json`);
+          if (e.POLARIS_CORE_IDENTITY_FILE && existsSync(e.POLARIS_CORE_IDENTITY_FILE))
+            copyFileSync(e.POLARIS_CORE_IDENTITY_FILE, `${directory}/compiled-core-manifest.json`);
+          const nativeProductionRuntime = nativeRuntimeSummary(directory, e);
+          const windowsProxyRuntimeTests = e.RUNNER_OS === 'Windows' ? nativeProductionRuntime : { state: 'see nativeProductionRuntime' };
           const value = { schema: 'polaris-native-dns-ordinary-ci-v1', candidate: e.CORE_CANDIDATE ?? e.ADMITTED_CANDIDATE,
             selection: e.ADMITTED_FORMAL === 'true' ? 'formal-default' : e.ADMITTED_DEFAULT === 'true' ? 'temporary-default' : 'manual-candidate',
             runId: e.GITHUB_RUN_ID, attempt: e.GITHUB_RUN_ATTEMPT, workflowRef: e.GITHUB_WORKFLOW_REF,
@@ -1800,13 +1785,9 @@ jobs:
               fresh: e.SYSTEM_FRESH_OUTCOME || 'unexecuted', prebuiltUser: e.SYSTEM_PREBUILT_OUTCOME || 'unexecuted',
               evidence: 'Separate Windows directory artifact: system-fresh and system-prebuilt-user current attempt bindings; excludes packaged and device acceptance',
             },
-            windowsProxyRuntimeTests,
+            nativeProductionRuntime, windowsProxyRuntimeTests,
             AppAccepted: false, packagedAcceptance: false, publicationEligible: false };
           writeFileSync(`${directory}/summary.json`, JSON.stringify(value, null, 2) + '\n');
-          const receipt = e.ADMITTED_FORMAL === 'true' ? `resources/.release-receipts/${e.CORE_PLATFORM}.json` : 'resources/.native-dns-candidate/receipt.json';
-          if (existsSync(receipt)) copyFileSync(receipt, `${directory}/acquisition-receipt.json`);
-          if (e.POLARIS_CORE_IDENTITY_FILE && existsSync(e.POLARIS_CORE_IDENTITY_FILE))
-            copyFileSync(e.POLARIS_CORE_IDENTITY_FILE, `${directory}/compiled-core-manifest.json`);
           NODE
 
       - name: Always preserve exact ordinary candidate evidence

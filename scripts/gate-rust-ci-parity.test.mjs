@@ -3,7 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SOURCE_TESTS, BOOTSTRAP_TESTS } from './run-native-dns-controlled-tests.mjs';
+import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS } from './run-native-dns-controlled-tests.mjs';
 import { TESTS as LOOPBACK_TESTS } from './runtime-config-loopback.mjs';
 
 // gate-rust.sh 与 ci.yml 的 Rust 门必须逐字一致——起因见 gate-rust.sh 头注：本机手跑门用的
@@ -286,6 +286,57 @@ function assertCandidateOnlySteps(ci, controlled) {
 test('the two candidate-only Cargo steps retain exact commands, admitted scope and failure checks', () => {
   const { ci, controlled } = loadStripped();
   assertCandidateOnlySteps(ci, controlled);
+});
+
+function assertNativeSummaryConsumer(ci, controlled) {
+  const block = extractCiStepBlock(ci, 'Record ordinary candidate outcomes without claiming skipped acceptance');
+  assert.match(block, /import \{ nativeRuntimeSummary \} from '\.\/scripts\/run-native-dns-controlled-tests\.mjs'/);
+  assert.equal(block.split('const nativeProductionRuntime = nativeRuntimeSummary(directory, e);').length, 2);
+  assert.match(block, /const windowsProxyRuntimeTests = e\.RUNNER_OS === 'Windows' \? nativeProductionRuntime :/);
+  assert.match(block, /nativeProductionRuntime, windowsProxyRuntimeTests,/);
+  assert.doesNotMatch(block, /const proxyTests|test result: ok\.|\.includes\(.*passed/);
+  const scope = controlled.slice(controlled.indexOf('export const TESTS ='), controlled.indexOf('// Fixed ordinary source contracts'));
+  const names = [...scope.matchAll(/'(runtime::[^']+)'/g)].map(match => match[1]);
+  assert.deepEqual(names, TESTS); assert.equal(names.length, 6);
+  assert.equal(names[5], 'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames');
+  assert.match(controlled, /m\.profile\?\.test===false && m\.profile\?\.debug_assertions===true/);
+  assert.match(controlled, /nativeSelections\.get\(selected\) === JSON\.stringify\(selectionIdentity\(selected\)\)/);
+  assert.match(controlled, /bindNativeRuntime\(selected, root, process\.env, directory\);/);
+  const start = controlled.indexOf('export function nativeRuntimeSummary(');
+  const consumer = controlled.slice(start, controlled.indexOf('export async function runTests(', start));
+  assert.match(consumer, /const artifact = nativeArtifact\(resolve\(root\), directory\);/);
+  assert.match(consumer, /JSON\.stringify\(receipt\.binding\) === JSON\.stringify\(binding\)/);
+  assert.match(consumer, /const result = readCaseResult\(row, name, directory, artifact\.selected\.sha256\);/);
+  assert.match(consumer, /const clean = confirmedCleanup\(result, name\)/);
+  assert.match(consumer, /confirmedGraph\(result, name, directory, artifact\.selected\.sha256\)/);
+  assert.match(consumer, /exactNativePass\(result, name\)/);
+  assert.match(consumer, /env\.RUNTIME_OUTCOME === 'success'/);
+  assert.doesNotMatch(consumer, /exactPass\(|receipt\.passed|row\.passed/);
+  assert.match(controlled, /const e = row\.executor;/);
+  const cases = controlled.slice(controlled.indexOf('export async function runTests('), controlled.indexOf('export function contractGroups('));
+  assert.match(cases, /cases: TESTS\.map/);
+  assert.ok(cases.indexOf('preserveExecutor(current, result, name); save();') >= 0);
+  assert.ok(cases.indexOf('preserveExecutor(current, result, name); save();') < cases.indexOf('demand(confirmedCleanup(result, name),'));
+}
+test('ordinary native summary consumes the same six bound normal cases and preserves executor before failure', () => {
+  const { ci, controlled } = loadStripped(); assertNativeSummaryConsumer(ci, controlled);
+});
+for (const [name, source, before, after] of [
+  ['consumer disconnected', 'ci', 'const nativeProductionRuntime = nativeRuntimeSummary(directory, e);', 'const nativeProductionRuntime = oldSummary(directory, e);'],
+  ['Windows projection forked', 'ci', "e.RUNNER_OS === 'Windows' ? nativeProductionRuntime :", "e.RUNNER_OS === 'Windows' ? legacyFive :"],
+  ['stats omitted', 'controlled', "  'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',", ''],
+  ['non-test selector weakened', 'controlled', 'm.profile?.test===false && m.profile?.debug_assertions===true', 'true'],
+  ['bound selection bypassed', 'controlled', 'nativeSelections.get(selected) === JSON.stringify(selectionIdentity(selected))', 'true'],
+  ['receipt source/run binding bypassed', 'controlled', 'JSON.stringify(receipt.binding) === JSON.stringify(binding)', 'true'],
+  ['executor replaced by self claim', 'controlled', 'const e = row.executor;', 'const e = row.nativeRecord;'],
+  ['stream/executor reader disconnected', 'controlled', 'const result = readCaseResult(row, name, directory, artifact.selected.sha256);', 'const result = row.nativeRecord;'],
+  ['cleanup consumer bypassed', 'controlled', 'const clean = confirmedCleanup(result, name)', 'const clean = true'],
+  ['graph consumer bypassed', 'controlled', 'confirmedGraph(result, name, directory, artifact.selected.sha256)', 'true'],
+  ['failure persistence removed', 'controlled', 'preserveExecutor(current, result, name); save();', 'current.state = "passed";'],
+]) test(`ordinary native summary rejects ${name}`, () => {
+  const fixture = loadStripped(); assert.ok(fixture[source].includes(before));
+  fixture[source] = fixture[source].replaceAll(before, after);
+  assert.throws(() => assertNativeSummaryConsumer(fixture.ci, fixture.controlled), { name: 'AssertionError' });
 });
 for (const [name, source, before, after] of [
   ['candidate admission removed', 'ci', "needs.cheap_format.outputs.native_dns_candidate != ''", 'true'],

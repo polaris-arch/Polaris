@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests, confirmedCleanup, preserveProductionGraph, selectNativeExecutable, nativeCaseRecord, exactNativePass } from './run-native-dns-controlled-tests.mjs';
+import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests, confirmedCleanup, preserveProductionGraph, selectNativeExecutable, nativeCaseRecord, exactNativePass, bindNativeRuntime, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
 
 test('only this invocation’s exact package/library test artifact is selectable', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-artifact-')));
@@ -388,9 +388,10 @@ test('native acceptance selects only the explicit normal-library binary artifact
   mkdirSync(join(root,'target/debug'),{recursive:true});const executable=join(root,'target/debug/native-admission-verifier');writeFileSync(executable,'inert artifact');
   const target={name:'native-admission-verifier',kind:['bin'],src_path:join(root,'src-tauri/src/bin/native-admission-verifier.rs')};
   const metadata={target_directory:join(root,'target'),packages:[{id:'app',name:'polaris',manifest_path:join(root,'src-tauri/Cargo.toml'),targets:[target]}]};
-  const row={reason:'compiler-artifact',package_id:'app',profile:{test:false},target,executable,features:['native-production-verification']};
+  const row={reason:'compiler-artifact',package_id:'app',profile:{test:false,debug_assertions:true},target,executable,features:['native-production-verification']};
   assert.equal(selectNativeExecutable([row],metadata,root).carrier,'normal-production-library');
-  for(const rows of [[{...row,profile:{test:true}}],[{...row,features:[]}],[row,row],[{...row,target:{...target,src_path:join(root,'other.rs')}}],
+  for(const rows of [[{...row,profile:{test:true,debug_assertions:true}}],[{...row,profile:{test:false,debug_assertions:false}}],
+    [{...row,profile:{test:false}}],[{...row,features:[]}],[row,row],[{...row,target:{...target,src_path:join(root,'other.rs')}}],
     [{...row,package_id:'stale-app'}],[{...row,executable:null}],[{...row,executable:'relative-verifier'}]]){
    assert.throws(()=>selectNativeExecutable(rows,metadata,root));
   }
@@ -420,11 +421,54 @@ const syntheticNativeResult = (name, failed = false) => ({
       validationCustodyDrained: true, publicationEligible: false })}\n`),
 });
 
+function writeNativeStreams(directory, name, result) {
+  const id = name.split('::').at(-1), output = result.output ?? '';
+  writeFileSync(join(directory, `${id}.log`), output);
+  writeFileSync(join(directory, `${id}.stdout.log`), result.stdout ?? '');
+  writeFileSync(join(directory, `${id}.stderr.log`), result.stderr ?? '');
+  return { error: null, timedOut: false, cleanupUncertain: false, interrupted: false, ...result,
+    logBytes: Buffer.byteLength(output), logSha256: createHash('sha256').update(output).digest('hex') };
+}
+function boundNativeFixture(root, directory) {
+  const executable = join(root, 'target/debug/native-admission-verifier'), manifest = join(root, 'src-tauri/Cargo.toml');
+  mkdirSync(join(root, 'target/debug'), { recursive: true });
+  mkdirSync(join(root, 'scripts'), { recursive: true }); mkdirSync(join(root, '.github/workflows'), { recursive: true });
+  for (const path of ['scripts/run-native-dns-controlled-tests.mjs', '.github/workflows/ci.yml'])
+    writeFileSync(join(root, path), readFileSync(new URL(`../${path}`, import.meta.url)));
+  writeFileSync(executable, 'original');
+  const target = { name: 'native-admission-verifier', kind: ['bin'], src_path: join(root, 'src-tauri/src/bin/native-admission-verifier.rs') };
+  const metadata = { target_directory: join(root, 'target'), packages: [{ id: 'app', name: 'polaris', manifest_path: manifest, targets: [target] }] };
+  const artifact = { reason: 'compiler-artifact', package_id: 'app', profile: { test: false, debug_assertions: true }, target, executable,
+    features: ['default', 'formal-selection', 'native-production-verification'] };
+  const env = { FROZEN: 'yes', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_REPOSITORY_ID: '1347028220',
+    GITHUB_SHA: 'a'.repeat(40), CORE_CANDIDATE: 'a'.repeat(40), GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1',
+    GITHUB_REF: 'refs/heads/fixture', GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/ci.yml@refs/heads/fixture',
+    CORE_PLATFORM: 'win', POLARIS_NATIVE_DNS_FORMAL: '1', POLARIS_CORE_IDENTITY_FILE: join(root, 'compiled-core.json'), RUNTIME_OUTCOME: 'success' };
+  writeFileSync(env.POLARIS_CORE_IDENTITY_FILE, JSON.stringify({ schema: 'polaris-core-manifest-v1', id: 'f'.repeat(64),
+    core: { platform: 'win', files: [{ name: 'inert fixture only' }] } }));
+  writeFileSync(join(directory, 'context.json'), JSON.stringify({ context: { repository: env.GITHUB_REPOSITORY,
+    repositoryId: env.GITHUB_REPOSITORY_ID, candidate: env.GITHUB_SHA, tree: 'b'.repeat(40), runId: env.GITHUB_RUN_ID,
+    attempt: env.GITHUB_RUN_ATTEMPT, workflowRef: env.GITHUB_WORKFLOW_REF, ref: env.GITHUB_REF, contractSha256: 'c'.repeat(64) },
+    platform: 'win', selection: 'formal-default', kernelSourceCommit: 'd'.repeat(40), kernelSourceTree: 'e'.repeat(40) }));
+  writeFileSync(join(directory, 'controlled-cargo-metadata.json'), JSON.stringify(metadata));
+  writeFileSync(join(directory, 'controlled-build.stdout.log'), JSON.stringify(artifact) + '\n');
+  const selected = selectNativeExecutable([artifact], metadata, root);
+  selected.sha256 = createHash('sha256').update('original').digest('hex');
+  writeFileSync(join(directory, 'controlled-executable.json'), JSON.stringify({ ...selected, preparationCalls: 1 }));
+  const git = (command, args) => {
+    assert.equal(command, 'git');
+    if (args[0] === 'rev-parse') return args[1] === 'HEAD' ? env.GITHUB_SHA : 'b'.repeat(40);
+    if (args[0] === 'status') return '';
+    assert.equal(args[0], 'show'); return readFileSync(join(root, args[1].slice(41)), 'utf8');
+  };
+  bindNativeRuntime(selected, root, env, directory, git);
+  return { selected, env, git, summary: (patch = {}) => nativeRuntimeSummary(directory, { ...env, ...patch }, root, git) };
+}
+
 test('normal-library orchestration enforces exact authority and cleanup before six-case business aggregation', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'native-processes-')));
   try {
-    const executable = join(root, 'fixture'), manifest = join(root, 'Cargo.toml');
-    const digest = createHash('sha256').update('original').digest('hex');
+    const executable = join(root, 'target/debug/native-admission-verifier');
     const aggregateModes = ['pass', 'business-failure', 'status-failure', 'record-failure', 'bad-graph', 'missing-graph', 'stderr-graph', 'polluted-output'];
     const recordMutations = {
       'wrong-case': { case: TESTS[1] }, 'wrong-native-pid': { processId: 71 },
@@ -435,12 +479,12 @@ test('normal-library orchestration enforces exact authority and cleanup before s
       'stderr-case', 'libtest-only', 'bad-graph-count', 'missing-cleanup', 'wrong-process', 'wrong-cleanup-test', 'stderr-cleanup',
       'cleanup-uncertain', 'timeout', 'interrupted', 'error', 'output-only', 'drift', 'drift-before']) {
       const directory = join(root, mode); mkdirSync(directory);
+      const { selected, env } = boundNativeFixture(root, directory);
       writeFileSync(executable, mode === 'drift-before' ? 'changed' : 'original');
-      const selected = { executable, manifest, sha256: digest, carrier: 'normal-production-library' };
       const calls = [];
-      const run = runTests(selected, { FROZEN: 'yes' }, directory, async (command, options) => {
+      const run = runTests(selected, env, directory, async (command, options) => {
         calls.push(command);
-        assert.equal(options.root, root); assert.equal(options.env.FROZEN, 'yes');
+        assert.equal(options.root, join(root, 'src-tauri')); assert.equal(options.env.FROZEN, 'yes');
         assert.equal(options.timeout, 20 * 60_000);
         const name = command.args[0], result = syntheticNativeResult(name, mode === 'business-failure');
         const changeNative = patch => {
@@ -486,9 +530,9 @@ test('normal-library orchestration enforces exact authority and cleanup before s
           Object.assign(result, capturedStreams(result.stdout, result.stdout));
           result.output = 'untrusted interleaved diagnostics\n' + result.stdout + result.stderr;
         }
-        if (mode === 'output-only') return { status: result.status, processId: result.processId, output: result.output };
+        if (mode === 'output-only') return writeNativeStreams(directory, name, { status: result.status, processId: result.processId, output: result.output });
         if (mode === 'drift') writeFileSync(executable, 'changed');
-        return result;
+        return writeNativeStreams(directory, name, result);
       });
       if (['pass', 'polluted-output'].includes(mode)) await run;
       else if (aggregateModes.includes(mode)) await assert.rejects(run, /Controlled business\/evidence failures after confirmed cleanup/);
@@ -517,4 +561,219 @@ test('normal-library orchestration enforces exact authority and cleanup before s
         assert.ok(!readdirSync(directory).includes('default-production-graph.json'));
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+const receiptFile = (fixture) => join(fixture.directory, 'native-runtime-results.json');
+const readReceipt = (fixture) => JSON.parse(readFileSync(receiptFile(fixture), 'utf8'));
+const writeReceipt = (fixture, value) => writeFileSync(receiptFile(fixture), JSON.stringify(value));
+async function withNativeReceipt(mode, check) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'native-summary-'))), directory = join(root, 'evidence');
+  mkdirSync(directory);
+  try {
+    const fixture = { root, directory, ...boundNativeFixture(root, directory), calls: [] };
+    const operation = runTests(fixture.selected, fixture.env, directory, async (command) => {
+      const name = command.args[0]; fixture.calls.push(name);
+      let result = syntheticNativeResult(name, mode === 'business-failure');
+      result = { ...result, ...capturedStreams(result.stdout, 'benign native diagnostic\n') };
+      if (mode === 'stack-overflow') result = { status: 1, processId: 70, ...capturedStreams('', "thread 'main' has overflowed its stack\n") };
+      if (mode === 'missing-graph' && name === TESTS[2])
+        result = withStdout(result, result.stdout.replace(/^POLARIS_DEFAULT_GRAPH [^\n]+\n/m, ''));
+      if (mode === 'malformed-graph' && name === TESTS[2])
+        result = withStdout(result, result.stdout.replace(/^POLARIS_DEFAULT_GRAPH [^\n]+\n/m, 'POLARIS_DEFAULT_GRAPH {broken}\n'));
+      return writeNativeStreams(directory, name, result);
+    });
+    if (mode === 'pass') await operation;
+    else await assert.rejects(operation);
+    await check(fixture);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+function replaceCaseStream(fixture, index, channel, bytes) {
+  bytes = Buffer.from(bytes);
+  const receipt = readReceipt(fixture), stream = receipt.cases[index].streams[channel];
+  writeFileSync(join(fixture.directory, stream.file), bytes);
+  Object.assign(stream, { bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+  writeReceipt(fixture, receipt);
+}
+
+test('native summary R1 accepts six bound normal cases with real cleanup and nonempty diagnostic stderr', async () => {
+  await withNativeReceipt('pass', (f) => {
+    const value = f.summary();
+    assert.equal(value.state, 'passed'); assert.equal(value.requirementState, 'satisfied');
+    assert.equal(value.nativeProduction, true); assert.equal(value.nonTest, true);
+    assert.deepEqual(value.tests.map((row) => row.name), TESTS);
+    assert.ok(value.tests.every((row) => row.state === 'passed' && row.cleanup === 'confirmed' && row.processId === 70));
+    assert.deepEqual(f.calls, TESTS);
+  });
+});
+test('native summary R2 never promotes five legacy libtest statuses or six libtest-only streams', async () => {
+  await withNativeReceipt('pass', (f) => {
+    const original = readReceipt(f);
+    unlinkSync(receiptFile(f));
+    writeFileSync(join(f.directory, 'runtime-status.txt'), TESTS.slice(0, 5).map((name) => `${name}: passed\n`).join(''));
+    assert.equal(f.summary().requirementState, 'open'); assert.equal(f.summary().evidenceState, 'missing');
+    writeReceipt(f, original);
+    for (let i = 0; i < TESTS.length; i++) replaceCaseStream(f, i, 'stdout', 'test result: ok. 1 passed; 0 failed; 0 ignored;\n');
+    assert.equal(f.summary().requirementState, 'open');
+    assert.ok(f.summary().tests.every((row) => row.state !== 'passed'));
+  });
+});
+test('native summary R3 requires six exact ordered names including stats, never a five-proxy oracle', async () => {
+  assert.deepEqual(TESTS, [
+    'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',
+    'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
+    'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
+    'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
+    'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
+    'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',
+  ]);
+  assert.equal(TESTS.length, 6); assert.equal(TESTS[5], 'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames');
+  await withNativeReceipt('pass', (f) => {
+    const original = readReceipt(f);
+    for (const mutate of [r => r.cases.pop(), r => r.cases.reverse(), r => { r.cases[5].name = TESTS[4]; },
+      r => { r.cases[5].name = 'runtime::stats::unreviewed'; }]) {
+      const changed = structuredClone(original); mutate(changed); writeReceipt(f, changed);
+      assert.equal(f.summary().evidenceState, 'invalid'); assert.equal(f.summary().requirementState, 'open');
+    }
+    writeReceipt(f, original); assert.equal(f.summary().state, 'passed');
+  });
+});
+test('native summary R4 rejects foreign candidate/source/run/attempt/context and a null compiled authority', async () => {
+  await withNativeReceipt('pass', (f) => {
+    const original = readReceipt(f);
+    for (const [key, value] of [['candidate', '9'.repeat(40)], ['sourceTree', '9'.repeat(40)], ['runId', '124'], ['attempt', '2'],
+      ['workflowRef', 'foreign'], ['platform', 'linux']]) {
+      const changed = structuredClone(original); changed.binding[key] = value; writeReceipt(f, changed);
+      assert.equal(f.summary().requirementState, 'open', key);
+    }
+    for (const mutate of [r => { r.binding.sourceHashes['scripts/run-native-dns-controlled-tests.mjs'] = '9'.repeat(64); },
+      r => { r.binding.compiledManifest.sha256 = '9'.repeat(64); }, r => { r.binding.files.build.sha256 = '9'.repeat(64); }]) {
+      const changed = structuredClone(original); mutate(changed); writeReceipt(f, changed);
+      assert.equal(f.summary().requirementState, 'open');
+    }
+    writeReceipt(f, original);
+    for (const env of [{ CORE_CANDIDATE: '9'.repeat(40) }, { GITHUB_RUN_ATTEMPT: '2' }, { GITHUB_RUN_ID: '124' }])
+      assert.equal(f.summary(env).requirementState, 'open');
+    const contextPath = join(f.directory, 'context.json'), bytes = readFileSync(contextPath);
+    writeFileSync(contextPath, JSON.stringify({ ...JSON.parse(bytes), kernelSourceCommit: null }));
+    assert.equal(f.summary().requirementState, 'open'); writeFileSync(contextPath, bytes);
+    const compiled = readFileSync(f.env.POLARIS_CORE_IDENTITY_FILE);
+    writeFileSync(f.env.POLARIS_CORE_IDENTITY_FILE, 'null');
+    assert.equal(f.summary().requirementState, 'open'); writeFileSync(f.env.POLARIS_CORE_IDENTITY_FILE, compiled);
+    assert.equal(f.summary().state, 'passed');
+  });
+});
+test('native summary R5 derives flags only from current normal Cargo selection and actual executable bytes', async () => {
+  await withNativeReceipt('pass', (f) => {
+    assert.throws(() => bindNativeRuntime({ ...f.selected }, f.root, f.env, f.directory, f.git), /not validated/);
+    writeFileSync(f.selected.executable, 'different executable');
+    assert.equal(f.summary().requirementState, 'open'); writeFileSync(f.selected.executable, 'original');
+    const path = join(f.directory, 'controlled-executable.json'), bytes = readFileSync(path);
+    for (const key of ['nativeProduction', 'nonTest', 'debugAssertions']) {
+      const changed = JSON.parse(bytes); changed[key] = false; writeFileSync(path, JSON.stringify(changed));
+      assert.equal(f.summary().requirementState, 'open', key);
+    }
+    writeFileSync(path, bytes);
+    const cargoPath = join(f.directory, 'controlled-build.stdout.log'), cargoBytes = readFileSync(cargoPath);
+    const cargo = JSON.parse(cargoBytes); cargo.profile.test = true; writeFileSync(cargoPath, JSON.stringify(cargo) + '\n');
+    assert.equal(f.summary().requirementState, 'open'); writeFileSync(cargoPath, cargoBytes);
+    assert.equal(f.summary().state, 'passed');
+  });
+});
+test('native summary R6 reuses exact native decoder, not self-reported PID, receipt.passed or stderr claims', async () => {
+  await withNativeReceipt('pass', (f) => {
+    const original = readReceipt(f), stdout = readFileSync(join(f.directory, original.cases[0].streams.stdout.file), 'utf8');
+    const native = stdout.match(/^POLARIS_NATIVE_CASE ([^\n]+)\n/m)[0];
+    const deltas = [{ case: TESTS[1] }, { processId: 71 }, { carrier: 'libtest' }, { result: 'unknown' },
+      { validationCustodyDrained: false }, { publicationEligible: true }];
+    const inputs = deltas.map(patch => stdout.replace(native, 'POLARIS_NATIVE_CASE ' + JSON.stringify({ ...JSON.parse(native.slice(20)), ...patch }) + '\n'));
+    inputs.push(stdout + native, stdout.replace(native, 'POLARIS_NATIVE_CASE {broken}\n'), stdout.replace(native, ''),
+      stdout.replace(native, ' ' + native), stdout.replace(native, '\ufeff' + native), stdout.trimEnd());
+    for (const changed of inputs) {
+      writeReceipt(f, original); replaceCaseStream(f, 0, 'stdout', changed);
+      const declared = readReceipt(f); declared.passed = true; declared.cases[0].passed = true; writeReceipt(f, declared);
+      assert.notEqual(f.summary().tests[0].state, 'passed');
+    }
+    writeReceipt(f, original); replaceCaseStream(f, 0, 'stdout', stdout.replace(native, ''));
+    replaceCaseStream(f, 0, 'stderr', native);
+    assert.notEqual(f.summary().tests[0].state, 'passed');
+    writeReceipt(f, original); replaceCaseStream(f, 0, 'stdout', stdout);
+    replaceCaseStream(f, 0, 'stderr', 'benign native diagnostic\n');
+    assert.equal(f.summary().state, 'passed');
+  });
+});
+test('native summary R7 requires one original same-executor cleanup, even when native verdict says passed', async () => {
+  await withNativeReceipt('pass', (f) => {
+    const original = readReceipt(f), stdout = readFileSync(join(f.directory, original.cases[0].streams.stdout.file), 'utf8');
+    const line = stdout.match(/^POLARIS_CONTROLLED_CLEANUP [^\n]+\n/m)[0];
+    for (const changed of [stdout.replace(line, ''), stdout + line, stdout.replace('"processId":70', '"processId":71'),
+      stdout.replace('"shutdownFenced":true', '"shutdownFenced":false')]) {
+      writeReceipt(f, original); replaceCaseStream(f, 0, 'stdout', changed);
+      assert.equal(f.summary().tests[0].state, 'cleanup-unknown');
+    }
+    writeReceipt(f, original); replaceCaseStream(f, 0, 'stdout', stdout.replace(line, ''));
+    replaceCaseStream(f, 0, 'stderr', line);
+    assert.equal(f.summary().tests[0].cleanup, 'unknown');
+  });
+});
+test('native summary R8 saves first abort executor and five unexecuted slots before cleanup throws', async () => {
+  await withNativeReceipt('stack-overflow', (f) => {
+    const receipt = readReceipt(f), value = f.summary({ RUNTIME_OUTCOME: 'failure' });
+    assert.equal(receipt.phase, 'aborted'); assert.equal(receipt.cases[0].executor.processId, 70);
+    assert.equal(receipt.cases[0].executor.status, 1); assert.equal(receipt.cases[0].streams.stdout.bytes, 0);
+    assert.equal(receipt.cases[0].nativeRecord, null); assert.equal(receipt.cases[0].cleanupConfirmed, false);
+    assert.equal(value.tests[0].state, 'cleanup-unknown');
+    assert.ok(value.tests.slice(1).every(row => row.state === 'unexecuted' && !row.invoked));
+    assert.equal(f.calls.length, 1); assert.equal(value.requirementState, 'open');
+  });
+});
+test('native summary R9 preserves six business failures with six affirmative cleanup records', async () => {
+  await withNativeReceipt('business-failure', (f) => {
+    const value = f.summary({ RUNTIME_OUTCOME: 'failure' });
+    assert.equal(f.calls.length, 6); assert.equal(value.requirementState, 'open');
+    assert.ok(value.tests.every(row => row.state === 'failed' && row.cleanup === 'confirmed' && row.nativeResult === 'failed'));
+  });
+});
+test('native summary R10 retains graph failures and revalidates actual graph receipt binding', async () => {
+  for (const mode of ['missing-graph', 'malformed-graph']) await withNativeReceipt(mode, (f) => {
+    const value = f.summary({ RUNTIME_OUTCOME: 'failure' });
+    assert.equal(f.calls.length, 6); assert.notEqual(value.tests[2].state, 'passed');
+    assert.equal(value.tests[2].cleanup, 'confirmed'); assert.equal(value.requirementState, 'open');
+  });
+  await withNativeReceipt('pass', (f) => {
+    const path = join(f.directory, 'default-production-graph.receipt.json'), bytes = readFileSync(path);
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(bytes), executableSha256: '0'.repeat(64) }));
+    assert.notEqual(f.summary().tests[2].state, 'passed'); writeFileSync(path, bytes);
+    assert.equal(f.summary().state, 'passed');
+  });
+});
+test('native summary R11 verifies streams and executor flags independently of claimed positive rows', async () => {
+  await withNativeReceipt('pass', (f) => {
+    const original = readReceipt(f), path = join(f.directory, original.cases[0].streams.stdout.file), stdout = readFileSync(path);
+    writeFileSync(path, Buffer.concat([stdout, Buffer.from('tampered')]));
+    assert.notEqual(f.summary().tests[0].state, 'passed'); writeFileSync(path, stdout);
+    replaceCaseStream(f, 0, 'stdout', Buffer.concat([stdout, Buffer.from([0xff])]));
+    assert.notEqual(f.summary().tests[0].state, 'passed');
+    writeReceipt(f, original); writeFileSync(path, stdout);
+    for (const channel of ['log', 'stdout', 'stderr']) for (const mutate of [s => { s.sha256 = '0'.repeat(64); },
+      s => { s.bytes++; }, s => { s.file = '../foreign.log'; }]) {
+      const changed = structuredClone(original); mutate(changed.cases[0].streams[channel]); writeReceipt(f, changed);
+      assert.notEqual(f.summary().tests[0].state, 'passed', channel);
+    }
+    for (const patch of [{ processId: 71 }, { status: 1 }, { error: 'executor failed' }, { timedOut: true },
+      { cleanupUncertain: true }, { interrupted: true }, { timedOut: null }]) {
+      const changed = structuredClone(original); Object.assign(changed.cases[0].executor, patch); writeReceipt(f, changed);
+      assert.notEqual(f.summary().tests[0].state, 'passed', JSON.stringify(patch));
+    }
+    writeReceipt(f, original); assert.equal(f.summary().state, 'passed');
+  });
+});
+test('native summary R12 is read-only and never promotes ordinary evidence into other acceptance scopes', async () => {
+  await withNativeReceipt('pass', (f) => {
+    const before = readFileSync(receiptFile(f)), calls = f.calls.length;
+    const value = f.summary({ SYSTEM_FRESH_OUTCOME: 'success', SYSTEM_PREBUILT_OUTCOME: 'success' });
+    assert.equal(value.AppAccepted, false); assert.equal(value.packagedAcceptance, false); assert.equal(value.publicationEligible, false);
+    assert.equal(f.calls.length, calls); assert.deepEqual(readFileSync(receiptFile(f)), before);
+    assert.equal(f.summary({ RUNTIME_OUTCOME: 'failure' }).requirementState, 'open');
+    writeFileSync(receiptFile(f), '{partial'); assert.equal(f.summary().evidenceState, 'invalid');
+  });
 });

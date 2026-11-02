@@ -187,6 +187,9 @@ fn mac_system_route_is_closed(connector: &str, check: &str, registry: &str, app:
     let h = compact_code(check);
     let r = compact_code(registry);
     let a = compact_code(app);
+    let Some(app_check) = balanced_block(&a, "pub(crate)asyncfncheck_config(&self,config:&Path,)->Result<polaris_core_supervisor::RawCheck,String>{") else {
+        return false;
+    };
     let Some(root) = balanced_block(&c, "implConnectorforMacRootConnector{") else {
         return false;
     };
@@ -247,9 +250,9 @@ fn mac_system_route_is_closed(connector: &str, check: &str, registry: &str, app:
         && aliases.contains("#[cfg(target_os=\"macos\")]typeSystemCheckClient=polaris_helper_client::check_config::SystemMacCheckClient;")
         && aliases.contains("#[cfg(windows)]typeSystemCheckClient=polaris_helper_client::check_config::SystemWindowsCheckClient;")
         && r.contains("pubasyncfnrun_macos_helper_check(client:SystemCheckClient,")
-        && a.contains("letclient=polaris_helper_client::check_config::SystemMacCheckClient::system(read_token(&self.token_path()),)?;")
-        && a.contains("letclient=polaris_helper_client::check_config::SystemWindowsCheckClient::system(read_token(&self.token_path()),)?;")
-        && a.contains("ifself.never_connect||self.test_connector.is_some(){returnErr(")
+        && app_check.contains("letclient=polaris_helper_client::check_config::SystemMacCheckClient::system(read_token(&self.token_path()),)?;")
+        && app_check.contains("letclient=polaris_helper_client::check_config::SystemWindowsCheckClient::system(read_token(&self.token_path()),)?;")
+        && app_check.contains("ifself.never_connect||self.test_connector.is_some(){returnErr(")
 }
 
 #[test]
@@ -307,6 +310,7 @@ fn generic_same_key_wire_data_cannot_become_production_check_retirement() {
         (2, "#[cfg(windows)]\ntype SystemCheckClient", "#[cfg(unix)]\ntype SystemCheckClient"),
         (2, "type SystemCheckClient = polaris_helper_client::check_config::SystemWindowsCheckClient;", "type SystemCheckClient = polaris_helper_client::check_config::SystemMacCheckClient;"),
         (3, "polaris_helper_client::check_config::SystemWindowsCheckClient::system(", "self.build_client("),
+        (3, "if self.never_connect || self.test_connector.is_some()", "if false"),
     ] {
         let mut faces = [
             connector.clone(),
@@ -319,6 +323,12 @@ fn generic_same_key_wire_data_cannot_become_production_check_retirement() {
             "negative control must bind actual source: {old}"
         );
         faces[slot] = faces[slot].replacen(old, new, 1);
+        if slot == 3 {
+            assert!(
+                faces[slot].contains(old),
+                "the neighboring status query must remain as a decoy: {old}"
+            );
+        }
         assert!(
             !mac_system_route_is_closed(&faces[0], &faces[1], &faces[2], &faces[3]),
             "caller IO/peer/path/accessor regression was not denied: {old}"
