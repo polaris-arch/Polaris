@@ -6,7 +6,7 @@ import { closeSync, constants, copyFileSync, existsSync, fstatSync, lstatSync, o
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest, expectedTags, reviewedSourcePolicy, requireGraph as demand } from './source-graph.mjs';
-import { readUpstreamPublicEvidence, upstreamReleaseName, validateNativeArchiveRow } from './upstream-release.mjs';
+import { readUpstreamPublicEvidence, readUpstreamSourceEvidence, upstreamReleaseName, validateNativeArchiveRow } from './upstream-release.mjs';
 import { regularPath, releasePublicReader, RELEASE_TARGETS, verifyReleaseCore } from './release-consumer.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
 import { actualCoreFile } from '../lib/core-identity.mjs';
@@ -198,15 +198,28 @@ export function validateCandidateReadback(binding, source, release, ref, tag, co
   return { releaseId: release.id, tag: binding.tag, tagObject: tag.sha, sourceCommit: commit.sha,
     sourceTree: commit.tree.sha, assets: binding.assets, ...evidence };
 }
-async function snapshot(binding, source, fetchBytes) {
+async function publicSnapshot(binding, source, fetchBytes) {
   const api = `https://api.github.com/repos/${binding.repository}`;
   const request = async (suffix) => JSON.parse(await fetchBytes(api + suffix, 16 * 1024 * 1024));
   const release = await request(`/releases/${binding.releaseId}`);
   const ref = await request(`/git/ref/tags/${binding.tag}`);
   const tag = await request(`/git/tags/${binding.tagObject}`);
   const commit = await request(`/git/commits/${binding.sourceCommit}`);
-  const evidence = await readUpstreamPublicEvidence(binding, request);
-  return validateCandidateReadback(binding, source, release, ref, tag, commit, evidence);
+  // Preserve genuine public source/gitlink observations before any asset read.
+  const evidence = await readUpstreamSourceEvidence(binding, request);
+  validateCandidateReadback(binding, source, release, ref, tag, commit, evidence);
+  return { release, ref, tag, commit, evidence };
+}
+async function snapshot(binding, source, fetchBytes, rows, publication) {
+  const observed = publication ?? await publicSnapshot(binding, source, fetchBytes);
+  const api = 'https://api.github.com/repos/' + binding.repository;
+  const request = async suffix => JSON.parse(await fetchBytes(api + suffix, 16 * 1024 * 1024));
+  // These are original complete rows from a hash-checked, source/pin/producer-
+  // validated index. Compact pins never imply absent proof or an ordinary owner.
+  const evidence = await readUpstreamPublicEvidence({ ...binding, platforms: rows }, request);
+  same(evidence.sourceGitlinks, observed.evidence.sourceGitlinks,
+    'Candidate source identity changed during producer readback');
+  return validateCandidateReadback(binding, source, observed.release, observed.ref, observed.tag, observed.commit, evidence);
 }
 function sourceProof(root, directory, binding, source, rows, run = execFileSync) {
   const path = join(directory, source.sourceArchive.name); checked(path, source.sourceArchive);
@@ -246,7 +259,8 @@ function inspectPayload(path, row, key, binding, run = execFileSync) {
     ...inspectCronetBytes(bytes, key) };
 }
 export async function acquireCandidate(root, candidate, options = {}) {
-  const context = selectedCandidateContext(root, options.env ?? process.env);
+  const run = options.run ?? execFileSync;
+  const context = selectedCandidateContext(root, options.env ?? process.env, run);
   demand(!candidate || candidate === context.candidate, 'Selected App candidate differs');
   const binding = loadCandidate(root), source = read(join(root, 'scripts/desktop-core/native-dns-source-binding.json'));
   const resources = join(root, 'resources'); regularPath(resources, true);
@@ -260,25 +274,35 @@ export async function acquireCandidate(root, candidate, options = {}) {
     // already removed the dedicated token from native-tool environments; assets
     // and their approved CDN redirects remain anonymous in the shared reader.
     const fetchBytes = options.read ?? releasePublicReader({ repository: binding.repository });
-    const before = await snapshot(binding, source, fetchBytes);
-    for (const pin of binding.assets) {
+    const publication = await publicSnapshot(binding, source, fetchBytes);
+    const download = async pin => {
       const bytes = await fetchBytes(pin.url, pin.bytes, true);
-      demand(bytes.length === pin.bytes && digest(bytes) === pin.sha256, `Downloaded candidate asset differs: ${pin.name}`);
+      demand(bytes.length === pin.bytes && digest(bytes) === pin.sha256, 'Downloaded candidate asset differs: ' + pin.name);
       writeFileSync(join(work, pin.name), bytes, { flag: 'wx' });
-    }
-    const rows = validateCandidateIndex(checked(join(work, source.index.name), source.index), binding, source);
-    sourceProof(root, work, binding, source, rows);
+    };
+    // Only the existing index asset is read ahead of native-owner evidence.
+    // Its original raw size/hash and all source/producer/selected pins close
+    // the complete rows before the shared reader can classify any job owner.
+    const indexPin = asset(binding, source.index.name), indexPath = join(work, source.index.name);
+    await download(indexPin);
+    const rows = validateCandidateIndex(checked(indexPath, source.index), binding, source);
+    const before = await snapshot(binding, source, fetchBytes, rows, publication);
+    for (const pin of binding.assets) if (pin.name !== indexPin.name) await download(pin);
+    sourceProof(root, work, binding, source, rows, run);
     const staging = join(work, 'stage'); mkdirSync(staging);
     for (const key of KEYS) {
       const row = rows[key], unpacked = join(work, `unpacked-${key}`);
-      execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(root, 'scripts/desktop-core/release-archive.py'),
+      run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(root, 'scripts/desktop-core/release-archive.py'),
         join(work, upstreamReleaseName(row.archive)), unpacked], { input: JSON.stringify({ archive: row.archive, root: row.archive.root, target: row.target }), encoding: 'utf8' });
       const extracted = join(unpacked, row.archive.root);
-      inspectPayload(join(extracted, row.core.member), row, key, binding);
+      inspectPayload(join(extracted, row.core.member), row, key, binding, run);
       // Retain the complete original archive payload, including its legal files.
       renameSync(extracted, join(staging, key));
     }
-    const after = await snapshot(binding, source, fetchBytes); same(before, after, 'Candidate public identity changed during acquisition');
+    const afterRows = validateCandidateIndex(checked(indexPath, source.index), binding, source);
+    same(rows, afterRows, 'Candidate selected index rows changed during acquisition');
+    const after = await snapshot(binding, source, fetchBytes, afterRows);
+    same(before, after, 'Candidate public identity changed during acquisition');
     const metadata = join(staging, '.native-dns-candidate'); mkdirSync(metadata);
     if (context.mode === 'temporary-default') {
       const originals = join(metadata, 'payloads'); mkdirSync(originals);
@@ -311,7 +335,7 @@ export function installCandidateStage(staging, resources, rename = renameSync) {
 }
 export async function consumeTemporaryDesktop(root, manifest, options = {}) {
   loadTemporaryDesktopSelection(root, manifest);
-  const context = selectedCandidateContext(root, options.env ?? process.env);
+  const context = selectedCandidateContext(root, options.env ?? process.env, options.run ?? execFileSync);
   demand(context.mode === 'temporary-default', 'Committed default cannot use manual validation context');
   const present = [...KEYS, '.native-dns-candidate'].map((name) => existsSync(join(root, 'resources', name)));
   if (present.some(Boolean)) {
