@@ -841,6 +841,12 @@ fn status_serializes_frontend_keys() {
 
 #[test]
 fn install_missing_binary_returns_failure_without_escalation() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "install_missing_binary_returns_failure_without_escalation",
+    ) {
+        return;
+    }
     // 无 bundled polaris-helper（且未设 POLARIS_HELPER_PATH）→ install 早返失败，绝不弹提权框。
     // 尾部 `r.status.installed` 由替身给定（见 `runtime()`），不再赖「跑测机器没装过」。
     std::env::remove_var("POLARIS_HELPER_PATH");
@@ -858,6 +864,12 @@ fn install_missing_binary_returns_failure_without_escalation() {
 
 #[test]
 fn action_result_serializes_stable_code_diagnostic_and_status() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "action_result_serializes_stable_code_diagnostic_and_status",
+    ) {
+        return;
+    }
     let (rt, _d) = runtime();
     let json = serde_json::to_value(rt.install()).unwrap();
     assert!(json.get("success").is_some());

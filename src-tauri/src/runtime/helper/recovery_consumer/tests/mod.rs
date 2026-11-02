@@ -70,6 +70,12 @@ fn recovery_source_errors_do_not_loop_through_stop_or_assert_fake_damage() {
 
 #[test]
 fn consumer_keeps_existing_fences_through_failure_and_releases_its_own_reservation() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "consumer_keeps_existing_fences_through_failure_and_releases_its_own_reservation",
+    ) {
+        return;
+    }
     let runtime = HelperRuntime::never_installed_for_tests(std::env::temp_dir());
     let slot = Arc::new(Mutex::new(DirectCoreSlot::default()));
     runtime
