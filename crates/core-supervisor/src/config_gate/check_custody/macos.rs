@@ -6,9 +6,14 @@ use polaris_helper_proto::check_config::{
     OUTPUT_BYTES,
 };
 use polaris_helper_proto::core_manifest::CoreId;
+use polaris_helper_proto::core_protocol::CallerIdentity;
 use polaris_helper_proto::HelperBirthToken;
 use std::pin::Pin;
 use std::time::Instant;
+#[cfg(target_os = "macos")]
+type SystemCheckClient = polaris_helper_client::check_config::SystemMacCheckClient;
+#[cfg(windows)]
+type SystemCheckClient = polaris_helper_client::check_config::SystemWindowsCheckClient;
 
 pub(super) fn is_remote(
     custody: &CheckCustody,
@@ -33,7 +38,7 @@ pub(super) fn is_remote(
 /// }
 /// ```
 pub async fn run_macos_helper_check(
-    client: polaris_helper_client::check_config::SystemMacCheckClient,
+    client: SystemCheckClient,
     core: CoreId,
     config: Vec<u8>,
 ) -> Result<RawCheck, ValidationLifecycleError> {
@@ -99,7 +104,7 @@ pub async fn run_macos_helper_check(
             }
         }
         let _returned = Returned(completion);
-        let result = client.run_macos_check(core, &config, digest, &cancel);
+        let result = client.run_check(core, &config, digest, &cancel);
         let result = match result {
             Ok(out) => {
                 let raw = match out.status {
@@ -208,7 +213,7 @@ pub fn request_macos_checks_shutdown() -> Result<bool, ValidationLifecycleError>
 }
 
 pub(super) struct MacCheck {
-    uid: u32,
+    uid: CallerIdentity,
     key: CheckKey,
     bytes: usize,
     digest: [u8; 32],
@@ -237,7 +242,7 @@ impl MacCheck {
     }
 }
 pub(super) struct MacTerminal {
-    uid: u32,
+    uid: CallerIdentity,
     key: CheckKey,
     status: CheckStatus,
     stdout: Vec<u8>,
@@ -280,7 +285,7 @@ pub(super) fn terminal_before_retire(
         }
     };
     Ok(Some(MacTerminal {
-        uid: m.uid,
+        uid: m.uid.clone(),
         key: m.key.clone(),
         status,
         stdout,
@@ -362,10 +367,10 @@ impl OutputCapture {
 
 /// Only a prepared exact CheckConfig owner can enter the existing registry.
 /// `uid` comes from kernel peer credentials at the authenticated Mac dispatcher.
-pub fn begin_macos_helper_check(
+fn begin_helper_check(
     execution: PreparedExecution,
     lease: &File,
-    uid: u32,
+    uid: CallerIdentity,
     core: CoreId,
     bytes: usize,
     digest: [u8; 32],
@@ -385,7 +390,10 @@ pub fn begin_macos_helper_check(
         return Err(unknown("validation request/result slot occupied"));
     }
     let payload = execution.payload();
+    #[cfg(target_os = "macos")]
     let input = execution.macos_check_input(lease)?;
+    #[cfg(windows)]
+    let input = execution.windows_check_input(lease)?;
     let id = NEXT_REQUEST.fetch_add(1, Ordering::SeqCst);
     let request = CheckRequestRef {
         id,
@@ -405,7 +413,7 @@ pub fn begin_macos_helper_check(
         id,
         CheckRun {
             mac: Some(MacCheck {
-                uid,
+                uid: uid.clone(),
                 key: key.clone(),
                 bytes,
                 digest,
@@ -602,8 +610,8 @@ fn status_reply(run: &CheckRun) -> Result<CheckReply, ValidationLifecycleError> 
 }
 
 /// Every operation checks the kernel UID, exact core, correlation and current phase.
-pub fn macos_helper_check_request(
-    uid: u32,
+fn helper_check_request(
+    uid: CallerIdentity,
     request: &CheckRequest,
 ) -> Result<CheckReply, ValidationLifecycleError> {
     let key = request
@@ -762,5 +770,74 @@ pub fn macos_helper_check_request(
     }
 }
 
-#[cfg(test)]
+#[cfg(target_os = "macos")]
+pub fn begin_macos_helper_check(
+    execution: PreparedExecution,
+    lease: &File,
+    uid: u32,
+    core: CoreId,
+    bytes: usize,
+    digest: [u8; 32],
+    correlation: HelperBirthToken,
+) -> Result<CheckReply, ValidationLifecycleError> {
+    begin_helper_check(
+        execution,
+        lease,
+        CallerIdentity::Unix(uid),
+        core,
+        bytes,
+        digest,
+        correlation,
+    )
+}
+#[cfg(target_os = "macos")]
+pub fn macos_helper_check_request(
+    uid: u32,
+    request: &CheckRequest,
+) -> Result<CheckReply, ValidationLifecycleError> {
+    helper_check_request(CallerIdentity::Unix(uid), request)
+}
+#[cfg(windows)]
+pub fn begin_windows_helper_check(
+    execution: PreparedExecution,
+    lease: &File,
+    owner: CallerIdentity,
+    core: CoreId,
+    bytes: usize,
+    digest: [u8; 32],
+) -> Result<CheckReply, ValidationLifecycleError> {
+    if !matches!(owner, CallerIdentity::Windows(_)) {
+        return Err(unknown("Windows Check requires actual peer SID"));
+    }
+    let correlation = crate::admitted_payload::windows_check_correlation()?;
+    begin_helper_check(execution, lease, owner, core, bytes, digest, correlation)
+}
+#[cfg(windows)]
+pub fn windows_helper_check_request(
+    owner: CallerIdentity,
+    request: &CheckRequest,
+) -> Result<CheckReply, ValidationLifecycleError> {
+    if !matches!(owner, CallerIdentity::Windows(_)) {
+        return Err(unknown("Windows Check requires actual peer SID"));
+    }
+    helper_check_request(owner, request)
+}
+#[cfg(all(test, target_os = "macos"))]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_negative_tests {
+    use super::*;
+    #[test]
+    fn non_windows_kernel_identity_cannot_settle_windows_check() {
+        let key = CheckKey {
+            core: CoreId::parse(&"a".repeat(64)).unwrap(),
+            correlation: HelperBirthToken::from_bytes([9; 16]),
+        };
+        assert!(windows_helper_check_request(
+            CallerIdentity::Unix(0),
+            &CheckRequest::Release { key }
+        )
+        .is_err());
+    }
+}

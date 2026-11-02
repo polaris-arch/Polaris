@@ -49,6 +49,7 @@ fn native_case(cancel: bool) {
         &input,
         &root,
         &[&held, &marker_guard],
+        ExecPurpose::RunMain,
     )
     .unwrap();
     // The actual factory, including HANDLE_LIST/JOB_LIST/mitigations, has run.
@@ -143,4 +144,17 @@ fn native_atomic_guard_and_job_survive_parent_file_release_until_actual_wait() {
 #[test]
 fn native_atomic_job_close_is_fail_stop_without_post_spawn_assign() {
     native_case(true);
+}
+
+#[test]
+fn fixed_check_and_run_argv_are_separate_and_inventory_has_no_factory() {
+    assert_eq!(
+        fixed_arguments(ExecPurpose::CheckConfig).unwrap(),
+        "--disable-color check -c stdin"
+    );
+    assert_eq!(
+        fixed_arguments(ExecPurpose::RunMain).unwrap(),
+        "run -c stdin"
+    );
+    assert!(fixed_arguments(ExecPurpose::TlsInventory).is_err());
 }

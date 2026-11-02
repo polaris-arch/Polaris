@@ -107,3 +107,7 @@ pub(crate) fn creation_identity(pid: u32) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(feature = "native-production-verification")]
+#[path = "windows_process/tests/controlled_test_observation.rs"]
+pub(crate) mod native_verification_observation;

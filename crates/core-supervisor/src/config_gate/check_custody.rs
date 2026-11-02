@@ -23,12 +23,26 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: OnceLock<Arc<CheckCustody>> = OnceLock::new();
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
     begin_macos_helper_check, macos_helper_check_request, request_macos_checks_shutdown,
     run_macos_helper_check,
+};
+
+#[cfg(target_os = "macos")]
+type PrivilegedCheckInput = crate::admitted_payload::MacCheckInput;
+#[cfg(target_os = "macos")]
+type PrivilegedCheckChild = crate::admitted_payload::StdCustodiedChild;
+#[cfg(windows)]
+type PrivilegedCheckInput = crate::admitted_payload::WindowsCheckInput;
+#[cfg(windows)]
+type PrivilegedCheckChild = crate::admitted_payload::WindowsCheckChild;
+#[cfg(windows)]
+pub use macos::{
+    begin_windows_helper_check, request_macos_checks_shutdown as request_windows_checks_shutdown,
+    run_macos_helper_check as run_windows_helper_check, windows_helper_check_request,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -120,7 +134,7 @@ struct OutputCapture {
 #[derive(Default)]
 struct CaptureTask {
     handle: Option<JoinHandle<Result<(), String>>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     blocking: Option<std::thread::JoinHandle<Result<(), String>>>,
     completed: Option<Result<(), String>>,
 }
@@ -194,7 +208,7 @@ impl OutputCapture {
         // Concurrent run/Stop waiters must not overwrite a JoinHandle's waker.
         // Cancellation releases this gate without moving either owned handle.
         let _joining = self.join_gate.lock().await;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         loop {
             let pending = {
                 let mut tasks = self.tasks.lock().map_err(unknown)?;
@@ -342,7 +356,7 @@ enum NativeFactoryObservation {
     Entered,
     ReturnedNoChild,
     Attached(ValidationNativeMembers),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     RemoteHelperReturned,
 }
 
@@ -366,14 +380,14 @@ struct LocalValidationNativeTerminal {
 
 // The output policy comes from the concrete factory, never from absent pipes.
 enum CheckTail {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     MacRemote {
         cancel: Arc<AtomicBool>,
         unknown: Arc<AtomicBool>,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     MacRoot {
-        input: Box<crate::admitted_payload::MacCheckInput>,
+        input: Box<PrivilegedCheckInput>,
         output: Arc<OutputCapture>,
     },
     PathSnapshot {
@@ -396,10 +410,10 @@ struct NullCheckStdio;
 impl CheckTail {
     fn output(&self) -> Option<Arc<OutputCapture>> {
         match self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRemote { .. } => None,
             Self::PathSnapshot { output, .. } => Some(Arc::clone(output)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRoot { output, .. } => Some(Arc::clone(output)),
             #[cfg(target_os = "linux")]
             Self::OwnedSealedInputs { .. } => None,
@@ -408,10 +422,10 @@ impl CheckTail {
 
     fn validate_finished(&self) -> Result<(), ValidationLifecycleError> {
         match self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRemote { .. } => Ok(()),
             Self::PathSnapshot { output, .. } => output.validate_finished(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRoot { output, .. } => output.validate_finished(),
             #[cfg(target_os = "linux")]
             Self::OwnedSealedInputs { .. } => Ok(()),
@@ -420,9 +434,9 @@ impl CheckTail {
 
     fn retire(&mut self) -> io::Result<()> {
         match self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRemote { .. } => Ok(()),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRoot { input, .. } => input.retire().map_err(Into::into),
             Self::PathSnapshot { created: false, .. } => Ok(()),
             Self::PathSnapshot { path, .. } => match std::fs::remove_file(path) {
@@ -437,9 +451,9 @@ impl CheckTail {
     #[cfg(all(test, unix))]
     fn path_snapshot(&self) -> &PathBuf {
         match self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRemote { .. } => panic!("remote Check has no local path"),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Self::MacRoot { .. } => panic!("Root Check has a private input owner"),
             Self::PathSnapshot { path, .. } => path,
             #[cfg(target_os = "linux")]
@@ -515,10 +529,10 @@ impl CheckExecutable {
 }
 
 struct CheckRun {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     mac: Option<macos::MacCheck>,
-    #[cfg(target_os = "macos")]
-    mac_child: Option<crate::admitted_payload::StdCustodiedChild>,
+    #[cfg(any(target_os = "macos", windows))]
+    mac_child: Option<PrivilegedCheckChild>,
     payload: Option<Arc<AdmittedPayload>>,
     lease_owner: Option<Arc<dyn Send + Sync>>,
     completion: Arc<CheckCompletion>,
@@ -536,7 +550,7 @@ struct CheckRun {
 
 impl CheckRun {
     fn has_child(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if self.mac_child.is_some() {
             return true;
         }
@@ -567,7 +581,7 @@ impl CheckRun {
             return Err(unknown("validation native ownership is unavailable"));
         }
         match &self.factory {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             NativeFactoryObservation::RemoteHelperReturned
                 if !self.has_child() && matches!(self.tail, CheckTail::MacRemote { .. }) =>
             {
@@ -622,7 +636,7 @@ impl CheckRun {
         if self.lost_wait_ownership {
             return Poll::Ready(Err(io::Error::other("native wait ownership was lost")));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(child) = self.mac_child.as_mut() {
             match child.try_wait() {
                 Ok(Some(exit)) => {
@@ -662,12 +676,12 @@ impl CheckRun {
 
     fn request_close(&mut self) -> io::Result<()> {
         self.debt = true;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let CheckTail::MacRemote { cancel, .. } = &self.tail {
             cancel.store(true, Ordering::SeqCst);
             return Ok(());
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(meta) = self.mac.as_mut() {
             meta.request_cancel();
         }
@@ -677,7 +691,7 @@ impl CheckRun {
         if self.lost_wait_ownership {
             return Err(io::Error::other("native wait ownership was lost"));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(child) = self.mac_child.as_mut() {
             return match child.try_wait() {
                 Ok(Some(exit)) => self.cache_native_exit(exit, NativeExitSource::TryWait),
@@ -715,7 +729,7 @@ impl Drop for CheckRun {
             if let Some(lease) = self.lease_owner.take() {
                 std::mem::forget(lease);
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             if let Some(child) = self.mac_child.take() {
                 std::mem::forget(child);
             }
@@ -732,7 +746,7 @@ impl Drop for CheckRun {
 
 #[derive(Default)]
 struct CheckState {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     mac_result: Option<macos::MacTerminal>,
     closing: bool,
     settling: bool,
@@ -845,7 +859,7 @@ impl CheckCustody {
                 return Err(error);
             }
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let mac_terminal = macos::terminal_before_retire(run)?;
         if let Err(error) = run.tail.retire() {
             run.debt = true;
@@ -859,7 +873,7 @@ impl CheckCustody {
         let completion = Arc::clone(&run.completion);
         // Drop the exact owned images before publishing their local terminal.
         state.runs.remove(&request.id);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(terminal) = mac_terminal {
             state.mac_result = Some(terminal);
         }
@@ -872,7 +886,7 @@ impl CheckCustody {
         request: &CheckRequestRef,
     ) -> Result<(), ValidationLifecycleError> {
         self.request_close(request)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if macos::is_remote(self, request)? {
             return tokio::time::timeout(CLEANUP_BUDGET, async {
                 loop {
@@ -1050,9 +1064,9 @@ impl CheckCustody {
             ..OutputCapture::default()
         });
         let run = CheckRun {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             mac: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             mac_child: None,
             payload: execution.owner(),
             lease_owner: execution.lease_owner(),
@@ -1087,9 +1101,9 @@ impl CheckCustody {
             let run = state.runs.get_mut(&id).expect("admitted validation run");
             match &mut run.tail {
                 CheckTail::PathSnapshot { created, .. } => *created = true,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 CheckTail::MacRoot { .. } => unreachable!("ordinary factory has its own snapshot"),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 CheckTail::MacRemote { .. } => unreachable!("ordinary factory is not remote"),
                 #[cfg(target_os = "linux")]
                 CheckTail::OwnedSealedInputs { .. } => {}

@@ -181,7 +181,7 @@ pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 
 mod gate;
 mod projection;
-mod relay;
+pub(crate) mod relay;
 /// 两条长驻流的传输层与它**唯一**的平台分叉（桌面 daemon gRPC / Android libbox 命令通道）。
 mod source;
 mod subscription;

@@ -1,14 +1,14 @@
 use super::*;
 #[test]
-fn windows_contract_is_exact_compiled_run_main_only() {
+fn windows_contract_is_exact_compiled_check_and_main() {
     let source = "a".repeat(40);
     let tree = "b".repeat(40);
-    let policy = serde_json::json!({"schema":"polaris-trusted-execution-v1","sourceCommit":source,"sourceTree":tree,"loader":LOADER,"purposes":["run-main-v1"]});
+    let policy = serde_json::json!({"schema":"polaris-trusted-execution-v1","sourceCommit":source,"sourceTree":tree,"loader":LOADER,"purposes":["check-config-v1","run-main-v1"]});
     assert_eq!(
         SelectedPolicy::declaration(&policy, &source, &tree, "win")
             .unwrap()
             .0,
-        vec![ExecPurpose::RunMain]
+        vec![ExecPurpose::CheckConfig, ExecPurpose::RunMain]
     );
     for field in ["sourceCommit", "sourceTree", "loader", "purposes", "schema"] {
         let mut bad = policy.clone();
@@ -18,6 +18,15 @@ fn windows_contract_is_exact_compiled_run_main_only() {
     let mut bad = policy.clone();
     bad["allowUntrusted"] = true.into();
     assert!(SelectedPolicy::declaration(&bad, &source, &tree, "win").is_err());
+    for purposes in [
+        serde_json::json!(["run-main-v1"]),
+        serde_json::json!(["run-main-v1", "check-config-v1"]),
+        serde_json::json!(["check-config-v1", "run-main-v1", "tls-inventory-v1"]),
+    ] {
+        let mut bad = policy.clone();
+        bad["purposes"] = purposes;
+        assert!(SelectedPolicy::declaration(&bad, &source, &tree, "win").is_err());
+    }
     bad = policy;
     bad["purposes"] = serde_json::json!(["run-main-v1", "run-login-v1"]);
     assert!(SelectedPolicy::declaration(&bad, &source, &tree, "win").is_err());

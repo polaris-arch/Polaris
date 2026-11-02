@@ -25,6 +25,7 @@ fn is_peer_gone(error: u32) -> bool {
 
 pub(crate) struct WinPipeStream {
     handle: OwnedHandle,
+    system_peer: Option<OwnedHandle>,
     read_timeout: Duration,
     message_pipe: bool,
 }
@@ -55,6 +56,7 @@ impl WinPipeStream {
         let mut stream = Self {
             // SAFETY: new valid exclusively owned CreateFileW handle.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.cast()) },
+            system_peer: None,
             read_timeout: crate::transport::READ_TIMEOUT,
             message_pipe: false,
         };
@@ -76,6 +78,94 @@ impl WinPipeStream {
         Ok(stream)
     }
 
+    pub(crate) fn connect_system() -> io::Result<Self> {
+        use windows_sys::Win32::Security::*;
+        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        };
+        let mut stream = Self::connect(Path::new(r"\\.\pipe\polaris-helper"))?;
+        let mut pid = 0;
+        if unsafe { GetNamedPipeServerProcessId(stream.raw(), &mut pid) } == 0 || pid == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut bytes = 0;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes,
+            );
+        }
+        if bytes < std::mem::size_of::<TOKEN_USER>() as u32 || bytes > 65536 {
+            return Err(io::Error::other("SYSTEM Helper token size unavailable"));
+        }
+        let mut storage = vec![0u64; (bytes as usize).div_ceil(8)];
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                storage.as_mut_ptr().cast(),
+                bytes,
+                &mut bytes,
+            )
+        } == 0
+            || unsafe {
+                IsWellKnownSid(
+                    (*(storage.as_ptr().cast::<TOKEN_USER>())).User.Sid,
+                    WinLocalSystemSid,
+                )
+            } == 0
+        {
+            return Err(io::Error::other("Helper pipe server is not LocalSystem"));
+        }
+        let mut kind: TOKEN_TYPE = 0;
+        let mut written = 0;
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenType,
+                (&mut kind as *mut TOKEN_TYPE).cast(),
+                std::mem::size_of::<TOKEN_TYPE>() as u32,
+                &mut written,
+            )
+        } == 0
+            || kind != TokenPrimary
+        {
+            return Err(io::Error::other("Helper server primary token unavailable"));
+        }
+        let mut current = 0;
+        if unsafe { GetNamedPipeServerProcessId(stream.raw(), &mut current) } == 0 || current != pid
+        {
+            return Err(io::Error::other("Helper pipe server identity changed"));
+        }
+        // Keep the original process object alive with this pipe. PID reuse cannot
+        // substitute a new primary token after the endpoint observation.
+        if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } != WAIT_TIMEOUT {
+            return Err(io::Error::other("Helper server process already exited"));
+        }
+        stream.system_peer = Some(process);
+        Ok(stream)
+    }
+
     fn raw(&self) -> HANDLE {
         self.handle.as_raw_handle().cast()
     }
@@ -91,6 +181,13 @@ impl WinPipeStream {
         write: bool,
         deadline: Instant,
     ) -> io::Result<usize> {
+        if self.system_peer.as_ref().is_some_and(
+            |peer| unsafe { WaitForSingleObject(peer.as_raw_handle(), 0) } != WAIT_TIMEOUT,
+        ) {
+            return Err(io::Error::other(
+                "Authenticated Helper server process exited",
+            ));
+        }
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -160,6 +257,13 @@ impl WinPipeStream {
         // obtain the byte count from OVERLAPPED, not the asynchronous call's out argument.
         if unsafe { GetOverlappedResult(self.raw(), &operation, &mut transferred, 0) } == 0 {
             return Err(io::Error::last_os_error());
+        }
+        if self.system_peer.as_ref().is_some_and(
+            |peer| unsafe { WaitForSingleObject(peer.as_raw_handle(), 0) } != WAIT_TIMEOUT,
+        ) {
+            return Err(io::Error::other(
+                "Authenticated Helper server process exited",
+            ));
         }
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());

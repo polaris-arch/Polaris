@@ -253,3 +253,50 @@ async fn app_business_observation_fixture_cannot_reach_the_native_query_factory(
     assert!(result.snapshot.document.is_none());
     assert!(!marker.exists());
 }
+
+#[test]
+fn authenticated_document_is_strict_data_and_cannot_replace_native_channel_binding() {
+    let source = "a".repeat(40);
+    let sha = "b".repeat(64);
+    let mut proof = document();
+    proof["sourceCommit"] = source.clone().into();
+    proof["sourceModified"] = false.into();
+    let parse = |raw: &str, expected: &Value| {
+        Snapshot::from_authenticated_document(raw, expected, &source, "linux", "amd64", &sha)
+    };
+    assert!(parse(&proof.to_string(), &proof).is_ok());
+    for field in [
+        "sourceCommit",
+        "sourceModified",
+        "os",
+        "arch",
+        "goVersion",
+        "buildTags",
+        "modules",
+        "profiles",
+    ] {
+        let mut changed = proof.clone();
+        changed[field] = serde_json::Value::Null;
+        assert!(parse(&changed.to_string(), &proof).is_err(), "{field}");
+    }
+    for expected in [Value::Null, serde_json::json!({}), {
+        let mut x = proof.clone();
+        x["modules"][0]["sum"] = "h1:different".into();
+        x
+    }] {
+        assert!(parse(&proof.to_string(), &expected).is_err());
+    }
+    assert!(parse("", &proof).is_err());
+    let mut unknown = proof.clone();
+    unknown["extraPolicy"] = true.into();
+    assert!(parse(&unknown.to_string(), &proof).is_err());
+    assert!(Snapshot::from_authenticated_document(
+        &proof.to_string(),
+        &proof,
+        &source,
+        "darwin",
+        "arm64",
+        &sha
+    )
+    .is_err());
+}

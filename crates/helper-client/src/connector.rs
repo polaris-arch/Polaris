@@ -341,3 +341,36 @@ impl Connector for PipeConnector {
 
 #[cfg(test)]
 mod tests;
+
+/// Closed endpoint: no user-selected pipe or injected stream can issue completion.
+#[cfg(windows)]
+pub(crate) struct WindowsSystemConnector;
+#[cfg(windows)]
+impl Connector for WindowsSystemConnector {
+    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        self.connect_until(Instant::now() + READ_TIMEOUT)
+    }
+    fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(ClientError::Timeout);
+            }
+            match crate::windows_pipe::WinPipeStream::connect_system() {
+                Ok(stream) if Instant::now() < deadline => return Ok(Box::new(stream)),
+                Ok(_) => return Err(ClientError::Timeout),
+                Err(error) if error.raw_os_error() == Some(231) => {
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    );
+                }
+                Err(error) => {
+                    return Err(ClientError::Connect(format!(
+                        "SYSTEM Helper peer rejected: {error}"
+                    )))
+                }
+            }
+        }
+    }
+}

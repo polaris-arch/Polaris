@@ -348,3 +348,42 @@ fn caller_cancel_waits_for_terminal_before_explicit_output_abandon_and_release()
         "Release follows the pending and terminal statuses; Commit was never sent"
     );
 }
+
+#[test]
+fn platform_response_families_cannot_settle_each_other_even_with_identical_keys() {
+    let request = CheckRequest::Status { key: key() };
+    let reply = CheckReply::Released { key: key() };
+    for (platform, response, accepted) in [
+        (
+            Platform::Mac,
+            ResponseKind::WindowsCheck(reply.clone()),
+            false,
+        ),
+        (Platform::Win, ResponseKind::MacCheck(reply.clone()), false),
+        (
+            Platform::Win,
+            ResponseKind::WindowsCheck(reply.clone()),
+            true,
+        ),
+    ] {
+        let stream =
+            MockStream::with_response((Response::Ok(response).to_wire_line() + "\n").into_bytes());
+        let queue = Arc::new(Mutex::new(VecDeque::from([stream])));
+        let client = HelperClient::new(Box::new(Queue(queue)), platform, "token");
+        assert_eq!(
+            client
+                .send_macos_check(request.clone(), Duration::from_secs(1))
+                .is_ok(),
+            accepted
+        );
+    }
+}
+#[cfg(windows)]
+#[test]
+fn closed_system_windows_client_only_accepts_bounded_authentication_data() {
+    for token in ["", "line\nsecond", "line\rsecond"] {
+        assert!(SystemWindowsCheckClient::system(token.into()).is_err());
+    }
+    // Constructing the connector does not connect, issue authority or retire custody.
+    assert!(SystemWindowsCheckClient::system("bounded-auth-data".into()).is_ok());
+}

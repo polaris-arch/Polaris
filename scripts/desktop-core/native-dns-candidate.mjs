@@ -210,11 +210,11 @@ async function snapshot(binding, source, fetchBytes) {
 }
 function sourceProof(root, directory, binding, source, rows, run = execFileSync) {
   const path = join(directory, source.sourceArchive.name); checked(path, source.sourceArchive);
-  return run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(root, 'scripts/desktop-core/release-archive.py'), path],
+  return run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(root, 'scripts/desktop-core/release-archive.py'), path, '--source-trusted-proofs'],
     { input: JSON.stringify({ sourceArchive: source.sourceArchive, sourceCommit: binding.sourceCommit,
       sourceTree: binding.sourceTree, sourceGitlinks: source.sourceGitlinks, sourceIdentity: source.sourceIdentity,
-      buildReplacements: Object.values(rows).flatMap((r) => r.buildGraph.localReplacements), sourcePolicy: binding.sourcePolicy }),
-    encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      buildReplacements: Object.values(rows).flatMap((r) => r.buildGraph.localReplacements), sourcePolicy: binding.sourcePolicy, trustedSourceSelection:'candidate', trustedRows:Object.values(rows), trustedProducer:binding.producer }),
+    encoding: 'utf8', maxBuffer: 1024 * 1024, timeout:120_000, killSignal:'SIGKILL' });
 }
 export function verifyCandidateMembers(directory, row) {
   const expected = Object.fromEntries(Object.entries(row.archive.members)
@@ -433,30 +433,40 @@ export function inspectCandidateNativePayload(root, key, core, library, run = ex
       releaseId: binding.releaseId, tagObject: binding.tagObject, context: receipt.context },
     actualAppAcceptance: 'pending runtime gates and packaged App acceptance' };
 }
-export function verifiedCandidateSource(root) {
-  let selected;
+export function verifiedCandidateSource(root, {includeInstallationRows=false}={}) {
+  let selected; const rows={};
   for (const key of KEYS) {
     const proof = verifyCandidatePayload(root, key, join(root, 'resources', key, RELEASE_TARGETS[key].core));
+    rows[key]=proof.row;
     selected ??= proof;
     same(proof.binding, selected.binding, 'Selected platform source differs');
   }
   const temporary = selected.receipt.context.mode === 'temporary-default';
-  return { schema: temporary ? 'polaris-native-dns-compiled-source-v2' : 'polaris-native-dns-compiled-source-v1',
+  const source={ schema: temporary ? 'polaris-native-dns-compiled-source-v2' : 'polaris-native-dns-compiled-source-v1',
     ...(temporary ? { purpose: 'temporary-default' } : {}), validationOnly: !temporary,
     sourceCommit: selected.binding.sourceCommit, sourceTree: selected.binding.sourceTree,
     bindingSha256: selected.receipt.bindingSha256, context: selected.receipt.context,
     platforms: KEYS, AppAccepted: false, publicationEligible: false };
+  return includeInstallationRows ? {source,rows}:source;
 }
 // Internal projection only: the installation identity uses the digest of this
 // exact temporary contract, never a formal producer/provider fingerprint.
-export function candidateInstallationContract(binding, bindingSha256) {
+export function candidateInstallationContract(binding, bindingSha256, rows) {
   demand(binding?.schema === 'polaris-native-dns-candidate-v1' && hex(bindingSha256, 64)
     && binding.AppAccepted === false && binding.publicationEligible === false,
   'Verified candidate installation input required');
-  return { version: binding.version, platforms: Object.fromEntries(KEYS.map((key) => [key, {
-    core: binding.platforms[key].core, sidecar: binding.platforms[key].sidecar,
-    providerFingerprint: bindingSha256,
-  }])) };
+  demand(rows && JSON.stringify(Object.keys(rows).sort())===JSON.stringify([...KEYS].sort()),'Complete verified original rows required');
+  demand(Buffer.byteLength(JSON.stringify(rows))<=8*1024*1024,'Verified row transport exceeds bound');
+  for(const key of KEYS){
+    const row=rows[key],pin=binding.platforms[key],target=RELEASE_TARGETS[key];
+    demand(row.schema==='polaris-upstream-native-receipt-v1' && row.target===`${target.os}/${target.arch}`,'Installation row target/type differs');
+    for(const field of ['id','archive','core','sidecar'])same(row[field],pin[field],'Installation row native pin differs');
+    demand(row.sourceCommit===binding.sourceCommit && row.sourceTree===binding.sourceTree && row.version===binding.version,'Installation row source differs');
+  }
+  // Preserve the entire source-validated receipt/proof; never derive policy or
+  // reconstruct an execution proof from release version or data paths.
+  return {version:binding.version,sourceCommit:binding.sourceCommit,sourceTree:binding.sourceTree,
+    producer:binding.producer,platforms:Object.fromEntries(KEYS.map((key)=>[key,{...rows[key],providerFingerprint:bindingSha256}]))};
 }
 
 export function candidateBuildSelection(source, root, platform, directory, env = process.env,

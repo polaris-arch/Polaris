@@ -1526,3 +1526,5 @@ fn inventory_candidate_selection_is_data_only_and_rejects_priority_namespace_cha
     std::fs::write(&preferred, b"higher-priority foreign data").unwrap();
     assert!(!selection.is_current());
 }
+
+mod native_carrier;

@@ -1429,3 +1429,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests;
+
+/// Explicit acceptance-only carrier; absent from default and release builds.
+#[cfg(all(desktop, feature = "native-production-verification"))]
+pub async fn run_native_production_verification(case: &str) -> Result<(), String> {
+    runtime::proxy::native_verification::run_case(case).await
+}

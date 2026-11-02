@@ -1,6 +1,7 @@
 //! Closed Helper CheckConfig transport. Correlations name a registry row, never privilege.
 use crate::{core_manifest::CoreId, HelperBirthToken};
 
+pub const WINDOWS_COMMAND: &str = "check-config-system-custody-v1";
 pub const COMMAND: &str = "check-config-custody-v1";
 pub const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 pub const CHUNK_BYTES: usize = 64 * 1024;

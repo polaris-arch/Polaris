@@ -123,6 +123,22 @@ fn duplicate(f: &File) -> io::Result<OwnedHandle> {
     })?;
     owned(h)
 }
+fn read_only_stdin(f: &File) -> io::Result<OwnedHandle> {
+    let mut h = ptr::null_mut();
+    // Parent retains DELETE for retirement; the child receives only read rights.
+    check(unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            f.as_raw_handle(),
+            GetCurrentProcess(),
+            &mut h,
+            FILE_GENERIC_READ,
+            1,
+            0,
+        )
+    })?;
+    owned(h)
+}
 fn pipe() -> io::Result<(File, File)> {
     let (mut r, mut w) = (ptr::null_mut(), ptr::null_mut());
     let sa = SECURITY_ATTRIBUTES {
@@ -175,12 +191,13 @@ fn create_suspended(
     config: &File,
     cwd: &Path,
     guards: &[&File],
+    purpose: ExecPurpose,
 ) -> Result<Suspended, AdmissionError> {
     let job = new_job()?;
     let (stdout, out_write) = pipe()?;
     let (stderr, err_write) = pipe()?;
-    let mut inherit = Vec::new();
-    for f in [config, &out_write, &err_write]
+    let mut inherit = vec![read_only_stdin(config)?];
+    for f in [&out_write, &err_write]
         .into_iter()
         .chain(guards.iter().copied())
     {
@@ -206,8 +223,9 @@ fn create_suspended(
     let environment: Vec<u16> = env.encode_utf16().collect();
     let application = wide(image)?;
     let cwd = wide(cwd)?;
-    // Only the fixed RunMain argv exists. A path quote cannot become an option.
-    let mut command = wide(format!("\"{}\" run -c stdin", image.display()))?;
+    // Typed purpose selects one fixed argv; no caller argument is accepted.
+    let args = fixed_arguments(purpose)?;
+    let mut command = wide(format!("\"{}\" {args}", image.display()))?;
     let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -275,12 +293,24 @@ impl Drop for Suspended {
     }
 }
 
+fn fixed_arguments(purpose: ExecPurpose) -> Result<&'static str, AdmissionError> {
+    match purpose {
+        ExecPurpose::RunMain => Ok("run -c stdin"),
+        ExecPurpose::CheckConfig => Ok("--disable-color check -c stdin"),
+        _ => Err(unavailable()),
+    }
+}
+
 pub(in super::super) fn spawn(
     owner: &Arc<Cohort>,
     config: File,
     cwd: &Path,
+    purpose: ExecPurpose,
 ) -> Result<WindowsStartedChild, AdmissionError> {
     system_actor()?;
+    if purpose == ExecPurpose::RunMain {
+        super::check_input::require_debt_absent(owner)?;
+    }
     if !owner.is_current() || !cwd.is_absolute() {
         return Err(error("Windows plan changed before spawn"));
     }
@@ -299,6 +329,7 @@ pub(in super::super) fn spawn(
         &config,
         cwd,
         &guards,
+        purpose,
     )?;
     // The process is suspended and already in its job with inherited guards.
     // A changed plan is cancelled without permitting its first instruction.
@@ -332,8 +363,8 @@ pub(in super::super) fn spawn(
     }
     Ok(WindowsStartedChild {
         process: suspended.process.take().expect("owned child"),
-        stdout: suspended.stdout.take().expect("stdout"),
-        stderr: suspended.stderr.take().expect("stderr"),
+        stdout: suspended.stdout.take(),
+        stderr: suspended.stderr.take(),
         custody,
         pid: suspended.pid,
     })

@@ -64,6 +64,28 @@ impl SystemMacCheckClient {
         })
     }
 
+    pub fn native_birth_status(
+        &self,
+    ) -> Result<polaris_helper_proto::response::NativeBirthStatus, String> {
+        match self
+            .client
+            .send_with_timeout(&Request::NativeStatusBirth, Duration::from_millis(1500))
+            .map_err(|e| e.to_string())?
+        {
+            Response::Ok(ResponseKind::NativeBirthStatus(status)) => Ok(status),
+            _ => Err("Closed Helper native status unavailable".into()),
+        }
+    }
+
+    pub fn run_check(
+        &self,
+        core: CoreId,
+        config: &[u8],
+        digest: [u8; 32],
+        cancel: &AtomicBool,
+    ) -> Result<HelperCheckOutput, HelperCheckFailure> {
+        self.run_macos_check(core, config, digest, cancel)
+    }
     pub fn run_macos_check(
         &self,
         core: CoreId,
@@ -72,6 +94,58 @@ impl SystemMacCheckClient {
         cancel: &AtomicBool,
     ) -> Result<HelperCheckOutput, HelperCheckFailure> {
         self.client.run_macos_check(core, config, sha256, cancel)
+    }
+}
+
+/// Only this fixed, OS-authenticated system connector can settle a Windows Check.
+#[cfg(windows)]
+pub struct SystemWindowsCheckClient {
+    client: HelperClient,
+}
+#[cfg(windows)]
+impl SystemWindowsCheckClient {
+    pub fn system(token: String) -> Result<Self, String> {
+        if token.is_empty() || token.len() > 256 * 1024 || token.contains(['\r', '\n']) {
+            return Err("SYSTEM Helper token must be one bounded nonempty line".into());
+        }
+        Ok(Self {
+            client: HelperClient::new(
+                Box::new(crate::connector::WindowsSystemConnector),
+                Platform::Win,
+                token,
+            ),
+        })
+    }
+    pub fn native_birth_status(
+        &self,
+    ) -> Result<polaris_helper_proto::response::NativeBirthStatus, String> {
+        match self
+            .client
+            .send_with_timeout(&Request::NativeStatusBirth, Duration::from_millis(1500))
+            .map_err(|e| e.to_string())?
+        {
+            Response::Ok(ResponseKind::NativeBirthStatus(status)) => Ok(status),
+            _ => Err("Closed Helper native status unavailable".into()),
+        }
+    }
+
+    pub fn run_check(
+        &self,
+        core: CoreId,
+        config: &[u8],
+        digest: [u8; 32],
+        cancel: &AtomicBool,
+    ) -> Result<HelperCheckOutput, HelperCheckFailure> {
+        self.run_windows_check(core, config, digest, cancel)
+    }
+    pub fn run_windows_check(
+        &self,
+        core: CoreId,
+        config: &[u8],
+        digest: [u8; 32],
+        cancel: &AtomicBool,
+    ) -> Result<HelperCheckOutput, HelperCheckFailure> {
+        self.client.run_macos_check(core, config, digest, cancel)
     }
 }
 
@@ -97,17 +171,31 @@ impl HelperClient {
         if !valid {
             return Err("Helper CheckConfig request exceeds typed bounds".into());
         }
-        if self.platform() != Platform::Mac {
+        if !matches!(self.platform(), Platform::Mac | Platform::Win) {
             return Err("Helper CheckConfig Unsupported on this platform".into());
         }
         let expected = request.key().cloned();
         let core = request.core().clone();
         match self
-            .send_with_timeout(&Request::MacCheck(request), timeout)
+            .send_with_timeout(
+                &match self.platform() {
+                    Platform::Win => Request::WindowsCheck(request),
+                    _ => Request::MacCheck(request),
+                },
+                timeout,
+            )
             .map_err(|e| format!("Helper CheckConfig transport outcome unknown: {e}"))?
         {
             Response::Ok(ResponseKind::MacCheck(reply))
-                if reply.key().core == core
+                if self.platform() == Platform::Mac
+                    && reply.key().core == core
+                    && expected.as_ref().is_none_or(|k| k == reply.key()) =>
+            {
+                Ok(reply)
+            }
+            Response::Ok(ResponseKind::WindowsCheck(reply))
+                if self.platform() == Platform::Win
+                    && reply.key().core == core
                     && expected.as_ref().is_none_or(|k| k == reply.key()) =>
             {
                 Ok(reply)
@@ -152,17 +240,21 @@ impl HelperClient {
                     "CheckConfig exchange budget expired; cleanup unconfirmed".to_string()
                 })
         };
-        if self.platform() != Platform::Mac {
+        if !matches!(self.platform(), Platform::Mac | Platform::Win) {
             return Err(HelperCheckFailure::NotAdmitted(
                 "Unsupported platform".into(),
             ));
         }
         let expected_core = core.clone();
-        let begin = Request::MacCheck(CheckRequest::Begin {
+        let begin_data = CheckRequest::Begin {
             core,
             bytes: config.len(),
             sha256,
-        });
+        };
+        let begin = match self.platform() {
+            Platform::Win => Request::WindowsCheck(begin_data),
+            _ => Request::MacCheck(begin_data),
+        };
         let key = match self
             .send_with_timeout(
                 &begin,
@@ -175,7 +267,12 @@ impl HelperClient {
                 _ => HelperCheckFailure::Unconfirmed(e.to_string()),
             })? {
             Response::Ok(ResponseKind::MacCheck(CheckReply::Begun { key }))
-                if key.core == expected_core =>
+                if self.platform() == Platform::Mac && key.core == expected_core =>
+            {
+                key
+            }
+            Response::Ok(ResponseKind::WindowsCheck(CheckReply::Begun { key }))
+                if self.platform() == Platform::Win && key.core == expected_core =>
             {
                 key
             }

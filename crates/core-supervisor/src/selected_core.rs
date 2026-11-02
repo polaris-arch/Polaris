@@ -34,7 +34,7 @@ pub const COMPILED_DEVELOPMENT_SELECTION: &[u8] = include_bytes!(concat!(
 ));
 #[cfg(feature = "local-development-selection")]
 pub(crate) mod development;
-pub(crate) fn selected_contract() -> Result<&'static str, String> {
+pub fn selected_contract() -> Result<&'static str, String> {
     #[cfg(feature = "local-development-selection")]
     {
         development::contract_raw()

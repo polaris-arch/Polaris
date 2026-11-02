@@ -230,7 +230,7 @@ test('all four release archives keep exact cores, colocated libraries, notices a
 test('normal release consumption preserves each original compressed recovery archive independently', async () => withFixture(async f => {
   const extractions = [];
   const run = (command, args, options) => {
-    if (args[1]?.endsWith('release-archive.py') && args[3] !== '--source-legal-pins') {
+    if (args[1]?.endsWith('release-archive.py') && args[3] !== '--source-trusted-proofs') {
       assert.equal(command, PYTHON);
       assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
       assert.equal(options.encoding, 'utf8'); assert.equal(options.maxBuffer, 1024 * 1024);
@@ -1730,12 +1730,12 @@ test('cold source archive invocation preserves every proof input and bounds its 
   f.run((command, args, options) => {
     calls++;
     assert.equal(command, PYTHON);
-    assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)), f.sourceFile, '--source-legal-pins']);
+    assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)), f.sourceFile, '--source-trusted-proofs']);
     assert.deepEqual(options, { input: JSON.stringify({ sourceArchive: f.contract.sourceArchive,
       sourceCommit: f.contract.sourceCommit, sourceTree: f.contract.sourceTree,
       sourceGitlinks: f.before.sourceGitlinks,
       legalFiles: f.contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })),
-      sourceIdentity: f.contract.platforms.linux.sourceIdentity,
+      sourceIdentity: f.contract.platforms.linux.sourceIdentity, trustedSourceSelection:'formal', trustedRows:Object.values(f.contract.platforms).map(({releaseAsset,...row})=>row), trustedProducer:f.contract.producer,
       buildReplacements: Object.values(f.contract.platforms).flatMap(row => row.buildGraph.localReplacements),
       sourcePolicy: f.contract.sourcePolicy }), encoding: 'utf8', maxBuffer: 1024 * 1024,
       timeout: 120_000, killSignal: 'SIGKILL' });
@@ -1801,11 +1801,11 @@ test('source archive reproof preserves complete inputs and its existing 120-seco
       calls++;
       assert.equal(command, PYTHON);
       assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)),
-        join('inert', key, 'core-release/source', f.contract.sourceArchive.name), '--source-legal-pins']);
+        join('inert', key, 'core-release/source', f.contract.sourceArchive.name), '--source-trusted-proofs']);
       assert.deepEqual(options, { input: JSON.stringify({ sourceArchive: f.contract.sourceArchive,
         sourceCommit: f.contract.sourceCommit, sourceTree: f.contract.sourceTree,
         sourceGitlinks: f.snapshot.sourceGitlinks, legalFiles: f.contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })),
-        sourceIdentity: f.row.sourceIdentity, buildReplacements: f.row.buildGraph.localReplacements,
+        sourceIdentity: f.row.sourceIdentity, trustedSourceSelection:'formal', trustedRows:[(({releaseAsset,...original})=>original)(f.row)], trustedProducer:f.contract.producer, buildReplacements: f.row.buildGraph.localReplacements,
         sourcePolicy: f.contract.sourcePolicy }), encoding: 'utf8', maxBuffer: 1024 * 1024,
         timeout: 120_000, killSignal: 'SIGKILL' });
       return '';

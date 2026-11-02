@@ -114,7 +114,9 @@ test('candidate exact version text includes actual Revision and CGO setting', ()
 
 test('candidate installation identity uses its distinct exact contract digest and carrier namespace', () => {
   const hash = createHash('sha256').update(readFileSync(join(root, 'scripts/desktop-core/native-dns-candidate.json'))).digest('hex');
-  const contract = candidateInstallationContract(binding, hash);
+  const rows=Object.fromEntries(Object.entries(binding.platforms).map(([key,row])=>[key,{...row,schema:'polaris-upstream-native-receipt-v1',target:({linux:'linux/amd64',win:'windows/amd64','mac-x64':'darwin/amd64','mac-arm64':'darwin/arm64'})[key],sourceCommit:binding.sourceCommit,sourceTree:binding.sourceTree,version:binding.version,
+    finalPackageCronetSmoke:{windowsExecution:{schema:'synthetic-transport-only',native:{fileId:'1'.repeat(32)}}}}]));
+  const contract = candidateInstallationContract(binding, hash, rows);
   const formal = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/release-contract.json')));
   for (const key of Object.keys(binding.platforms)) {
     assert.equal(contract.platforms[key].providerFingerprint, hash);
@@ -122,6 +124,11 @@ test('candidate installation identity uses its distinct exact contract digest an
     assert.deepEqual(contract.platforms[key].core, binding.platforms[key].core);
     assert.equal(candidateAppDirectory(root, key), join(root, 'resources/.native-dns-app', key));
   }
+  assert.deepEqual(contract.platforms.win.finalPackageCronetSmoke.windowsExecution,rows.win.finalPackageCronetSmoke.windowsExecution);
+  assert.equal(contract.platforms.win.sourceCommit,binding.sourceCommit);
+  assert.throws(()=>candidateInstallationContract(binding,hash));
+  assert.throws(()=>candidateInstallationContract(binding,hash,{...rows,win:{...rows.win,target:'linux/amd64'}}));
+  assert.throws(()=>candidateInstallationContract(binding,hash,{...rows,win:{...rows.win,sourceCommit:'0'.repeat(40)}}));
   assert.throws(() => candidateAppDirectory(root, 'android'));
   assert.throws(() => candidateInstallationContract({ ...binding, AppAccepted: true }, hash));
   assert.throws(() => candidateInstallationContract(binding, 'fake'));

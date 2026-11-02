@@ -32,6 +32,7 @@ polaris-helper-client = { path = "../helper-client" }
 # Windows 进程接口：作业对象（直起的核随主程序一起结束）与孤儿清扫的进程枚举 / 命令行读取。
 # 与 helper / src-tauri 同一个 windows-sys 版本；仅 cfg(windows) 参与编译。
 [target.'cfg(windows)'.dependencies]
+polaris-helper-client = { path = "../helper-client" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

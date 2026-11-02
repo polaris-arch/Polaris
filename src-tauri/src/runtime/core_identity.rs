@@ -52,7 +52,6 @@ pub(crate) fn selected_payload_dirs(formal: &[&str]) -> Result<Vec<String>, Stri
     check_compiled_selection()?;
     polaris_core_supervisor::selected_core::selected_payload_dirs(formal)
 }
-#[cfg(any(windows, test))]
 pub(crate) fn selected_source_commit(platform: &str) -> Result<String, String> {
     check_compiled_selection()?;
     polaris_core_supervisor::selected_core::selected_source_commit(platform)

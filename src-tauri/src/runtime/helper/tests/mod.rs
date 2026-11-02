@@ -578,8 +578,8 @@ fn stop_requires_an_exact_stop_receipt() {
 fn managed_core_status_parses_native_birth_metadata_and_empty_view() {
     let target = birth_target(4242, "00112233445566778899aabbccddeeff");
     for (wire, expected) in [
-        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: None, image: None }),
-        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff created=133600000000000000 image=433a5c50726f6772616d2046696c65735c506f6c617269735c73696e672d626f782e657865\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: Some(133_600_000_000_000_000), image: Some(r"C:\Program Files\Polaris\sing-box.exe".into()) }),
+        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: None, image: None, core:None }),
+        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff created=133600000000000000 image=433a5c50726f6772616d2046696c65735c506f6c617269735c73696e672d626f782e657865\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: Some(133_600_000_000_000_000), image: Some(r"C:\Program Files\Polaris\sing-box.exe".into()),core:None }),
         (b"OK native-birth-status empty\n".to_vec(), ManagedCoreStatus::BirthEmpty),
         (b"OK native-birth-status unknown\n".to_vec(), ManagedCoreStatus::BirthUnidentified),
     ] {
@@ -1693,4 +1693,24 @@ fn independent_recovery_target_receipt_never_relabels_helper_cancel_as_global_su
     assert_eq!(wire["errorCode"], "cancelled");
     assert_eq!(wire["recovery"]["user"], "installed");
     assert_eq!(wire["recovery"]["helperComplete"], false);
+}
+
+#[test]
+fn native_status_parser_keeps_real_mac_core_binding_without_inventing_os_fields() {
+    let wire = format!(
+        "OK native-birth-status running 4242 00112233445566778899aabbccddeeff core={}\n",
+        "a".repeat(64)
+    );
+    // The closed connector supplies OS-root authentication; this parser fixture is data only.
+    assert!(matches!(
+        polaris_helper_proto::Response::parse(wire.trim()),
+        polaris_helper_proto::Response::Ok(polaris_helper_proto::ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Running {
+                created: None,
+                image: None,
+                core: Some(_),
+                ..
+            }
+        ))
+    ));
 }

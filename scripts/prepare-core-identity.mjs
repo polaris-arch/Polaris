@@ -43,9 +43,9 @@ let candidateReceipt;
 const temporaryDefault = hasTemporaryDesktop(input);
 if (candidateMode || temporaryDefault) {
   if (candidateMode) demand(process.env.POLARIS_NATIVE_DNS_CANDIDATE === '1', 'Explicit candidate build mode required');
-  const source = verifiedCandidateSource(root), binding = loadCandidate(root);
+  const {source,rows} = verifiedCandidateSource(root,{includeInstallationRows:true}), binding = loadCandidate(root);
   candidateBuildSelection(source, root, platform, directory);
-  contract = candidateInstallationContract(binding, source.bindingSha256);
+  contract = candidateInstallationContract(binding, source.bindingSha256, rows);
   const original = join(root, 'resources', platform);
   const helperNames = [platform === 'win' ? 'polaris-helper.exe' : 'polaris-helper', ...(platform === 'win' ? ['polaris-cleaner.exe'] : [])];
   if (mode === 'maintenance-anchor') {

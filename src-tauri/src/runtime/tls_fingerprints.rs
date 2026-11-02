@@ -172,6 +172,44 @@ impl Snapshot {
             unavailable_reason: Some(reason.into()),
         }
     }
+    /// Data-only strict provenance parser. The caller must separately bind the
+    /// authenticated channel, active incarnation, CoreId and retained birth.
+    pub(crate) fn from_authenticated_document(
+        raw: &str,
+        expected: &Value,
+        source: &str,
+        os: &str,
+        arch: &str,
+        binary_sha256: &str,
+    ) -> Result<Self, String> {
+        if source.len() != 40
+            || !source
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || !expected.is_object()
+        {
+            return Err("Selected native producer proof unavailable".into());
+        }
+        let actual = Self::from_loaded(raw, binary_sha256)?;
+        let doc = actual
+            .document
+            .as_ref()
+            .ok_or("Missing running capability document")?;
+        let expected = Capabilities::parse(&expected.to_string())?;
+        if doc.source_commit != source
+            || doc.source_modified != Some(false)
+            || doc.os != os
+            || doc.arch != arch
+            || serde_json::to_value(doc).map_err(|e| e.to_string())?
+                != serde_json::to_value(expected).map_err(|e| e.to_string())?
+        {
+            return Err(
+                "Running TLS source/build/module/target differs from selected producer proof"
+                    .into(),
+            );
+        }
+        Ok(actual)
+    }
     #[cfg(any(test, target_os = "android", target_os = "ios"))]
     pub(crate) fn from_native(raw: Option<&str>, binary_sha256: &str, scope: &str) -> Self {
         if binary_sha256.len() != 64

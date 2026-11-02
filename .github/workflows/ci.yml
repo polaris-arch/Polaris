@@ -1199,6 +1199,10 @@ jobs:
           go-version: ${{ steps.native_dns_host.outputs.go_version }}
           cache: false
 
+      - name: Install same-source trusted proof validator dependency
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        run: python -m pip install jsonschema==4.23.0
+
       - name: Verify exact candidate Go toolchain
         if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         shell: bash

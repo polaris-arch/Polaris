@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Current Cargo artifacts, isolated exact libtest processes. No cached verdicts.
+// Current Cargo artifacts: source libtests and a separate normal-library native carrier. No cached verdicts.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
@@ -19,6 +19,9 @@ export const TESTS = Object.freeze([
 
 // Fixed ordinary source contracts, separate from the six real-core processes.
 export const SOURCE_TESTS = Object.freeze([
+  'polaris:runtime::proxy::tests::native_carrier::normal_native_carrier_preserves_all_six_original_business_assertion_sets',
+  'polaris:runtime::proxy::tests::startup::execution_issuer_does_not_enable_network_takeover_for_manual',
+  'polaris:runtime::tls_fingerprints::tests::authenticated_document_is_strict_data_and_cannot_replace_native_channel_binding',
   "polaris-store:tests::store_tests::unsupported_vision_transport_remains_repairable_across_real_store",
   "polaris:runtime::speedtest::tests::vision_transport_temp_plan_reports_fixed_failure_without_losing_good_nodes",
   "polaris-config-engine:builder::outbound::tests::vision_transport_admission_preserves_supported_native_streams",
@@ -87,6 +90,38 @@ export function selectExecutable(messages, metadata, root, packageName = 'polari
   demand(Array.isArray(artifacts[0].features) && artifacts[0].features.every((value) => typeof value === 'string')
     && new Set(artifacts[0].features).size === artifacts[0].features.length, 'Malformed Cargo artifact feature identity');
   return { executable, packageId: pkg.id, features: artifacts[0].features, manifest: pkg.manifest_path };
+}
+
+export function selectNativeExecutable(messages, metadata, root) {
+  const packages=metadata.packages.filter((p)=>p.name==='polaris' && resolve(p.manifest_path)===join(root,'src-tauri/Cargo.toml'));
+  demand(packages.length===1,'Expected current App package');
+  const pkg=packages[0];
+  const targets=pkg.targets.filter((t)=>t.name==='native-admission-verifier' && t.kind.length===1 && t.kind[0]==='bin'
+    && resolve(t.src_path)===join(root,'src-tauri/src/bin/native-admission-verifier.rs'));
+  demand(targets.length===1,'Expected reviewed production verification binary');
+  const rows=messages.filter((m)=>m.reason==='compiler-artifact' && m.package_id===pkg.id && m.profile?.test===false
+    && m.target?.name===targets[0].name && JSON.stringify(m.target.kind)===JSON.stringify(targets[0].kind)
+    && resolve(m.target.src_path)===resolve(targets[0].src_path) && m.executable
+    && Array.isArray(m.features) && m.features.includes('native-production-verification'));
+  demand(rows.length===1,'Expected one normal-library verification artifact');
+  const artifact=rows[0], executable=artifact.executable;
+  demand(isAbsolute(executable) && inside(resolve(metadata.target_directory),executable),'Native artifact escaped Cargo target');
+  demand(lstatSync(executable).isFile() && realpathSync(executable)===executable,'Native artifact must be an unlinked regular file');
+  return {executable,packageId:pkg.id,manifest:pkg.manifest_path,features:artifact.features,carrier:'normal-production-library'};
+}
+export function nativeCaseRecord(result,name) {
+  try {
+    const rows=records(result.stdout,'POLARIS_NATIVE_CASE ');
+    if(rows.length!==1)return null;
+    const r=rows[0];
+    return r.schema==='polaris-native-production-case-v1' && r.case===name && r.processId===result.processId
+      && Number.isSafeInteger(r.processId) && r.processId>0 && r.carrier==='normal-production-library'
+      && ['passed','failed'].includes(r.result) && r.validationCustodyDrained===true && r.publicationEligible===false ? r:null;
+  } catch{return null;}
+}
+export function exactNativePass(result,name) {
+  return result.status===0 && !result.error && !result.timedOut && !result.cleanupUncertain && !result.interrupted
+    && nativeCaseRecord(result,name)?.result==='passed';
 }
 
 export function runtimeEnvironment(messages, targetDirectory, executable, sysroot, env = process.env, platform = process.platform) {
@@ -183,15 +218,15 @@ export async function runTests(selected, env, directory, execute = executeComman
     demand(hash(selected.executable) === digest, 'Controlled executable changed before a test');
     appendFileSync(statusPath, `${name}: started\n`);
     const result = await execute({ id: name.split('::').at(-1), program: selected.executable,
-      args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1'] },
+      args: selected.carrier === 'normal-production-library' ? [name] : [name, '--exact', '--ignored', '--nocapture', '--test-threads=1'] },
     { root: dirname(selected.manifest), env, directory, timeout: 20 * 60_000 });
     demand(hash(selected.executable) === digest, 'Controlled executable changed during a test');
     demand(confirmedCleanup(result, name), `Controlled owned-child cleanup is unconfirmed: ${name}`);
-    demand(oneExecutedTest(result), `Controlled invocation did not execute exactly one reviewed test: ${name}`);
+    demand(selected.carrier === 'normal-production-library' ? nativeCaseRecord(result,name) : oneExecutedTest(result), `Controlled invocation did not execute exactly one reviewed case: ${name}`);
     let graph = false, evidenceError = null;
     try { graph = preserveProductionGraph(result, name, directory, digest); }
     catch (cause) { evidenceError = String(cause.message ?? cause).replace(/[\r\n]/g, ' '); }
-    const passed = !evidenceError && exactPass(result) && (name !== TESTS[2] || graph);
+    const passed = !evidenceError && (selected.carrier === 'normal-production-library' ? exactNativePass(result,name) : exactPass(result)) && (name !== TESTS[2] || graph);
     appendFileSync(statusPath, `${name}: ${passed ? 'passed' : `failed; owned-child cleanup confirmed${evidenceError ? `; evidence: ${evidenceError}` : ''}`}\n`);
     if (!passed) failures.push(evidenceError ? `${name} (evidence: ${evidenceError})` : name);
   }
@@ -274,11 +309,11 @@ async function main() {
   const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--locked', '--no-deps', '--format-version=1'],
     { cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 }));
   const prepared = await executeCommand({ id: 'controlled-build', program: 'cargo',
-    args: ['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json'] },
+    args: ['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'] },
   { root, env: process.env, directory, timeout: 20 * 60_000, captureStdout: true });
-  demand(prepared.status === 0 && !prepared.error && !prepared.cleanupUncertain && !prepared.interrupted, 'Controlled library test preparation failed');
+  demand(prepared.status === 0 && !prepared.error && !prepared.cleanupUncertain && !prepared.interrupted, 'Controlled production verification preparation failed');
   const messages = prepared.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
-  const selected = selectExecutable(messages, metadata, root);
+  const selected = selectNativeExecutable(messages, metadata, root);
   selected.sha256 = hash(selected.executable);
   writeFileSync(join(directory, 'controlled-executable.json'), JSON.stringify({ ...selected, preparationCalls: 1 }, null, 2) + '\n');
   const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();

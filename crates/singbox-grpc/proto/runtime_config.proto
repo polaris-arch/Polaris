@@ -23,6 +23,8 @@ message RuntimeCapabilities {
   uint32 contract_version = 1; bool connected_hot_enabled = 2; string implementation_manifest_digest = 3;
   RuntimeIdentity active = 4; repeated RuntimeFieldCapability fields = 5; uint64 receipt_retention_seconds = 6;
   uint32 max_receipts = 7; bool full_effective_schema_supported = 8; uint64 control_revision = 9;
+  // Read-only report from this authenticated running binary; empty is unavailable.
+  string tls_fingerprint_capabilities_json = 10;
 }
 // Explicit snapshot; absent and empty package lists retain their protobuf
 // semantics. Native directory custody is never accepted through this message.

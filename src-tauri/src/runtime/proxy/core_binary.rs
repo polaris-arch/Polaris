@@ -380,3 +380,31 @@ pub(crate) fn resolve_dashboard_serve_dir(config_dir: &std::path::Path) -> Optio
 
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Verified installation data for a closed Helper route. No Prepared or payload owner.
+pub(super) struct HelperCandidateData {
+    path: PathBuf,
+}
+impl HelperCandidateData {
+    pub(super) fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+pub(super) fn resolve_helper_candidate_data() -> Result<HelperCandidateData, String> {
+    let observation = resolve_core_candidate_observation()?;
+    let platform = crate::runtime::core_identity::current_platform()?;
+    let manifest = crate::runtime::core_identity::selected_manifest(platform)?;
+    crate::runtime::core_identity::verify_directory(
+        observation
+            .path()
+            .parent()
+            .ok_or("Core candidate parent absent")?,
+        &manifest,
+    )?;
+    if !observation.is_current() {
+        return Err("CORE_BUNDLE_MISMATCH: helper candidate selection changed".into());
+    }
+    Ok(HelperCandidateData {
+        path: observation.path().to_path_buf(),
+    })
+}

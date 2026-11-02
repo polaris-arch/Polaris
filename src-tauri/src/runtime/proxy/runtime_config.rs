@@ -195,7 +195,7 @@ pub(super) fn observe_runtime_pairing(
     })
 }
 
-fn runtime_pairing_matches(
+pub(super) fn runtime_pairing_matches(
     pairing: &RuntimePairing,
     capabilities: &daemon::RuntimeCapabilities,
 ) -> bool {
@@ -234,7 +234,7 @@ pub(super) struct RuntimeConfigBaseline {
     pub(super) api_log_handoff: Option<super::core_log::CoreLogHandoff>,
     pub(super) generation: u64,
     committed_transaction: Option<String>,
-    pairing: RuntimePairing,
+    pub(super) pairing: RuntimePairing,
     physical_route_config: UserConfig,
     deps: GenerateConfigDeps,
     generated: SingBoxConfig,
@@ -1873,7 +1873,7 @@ impl ProxyRuntime {
         result
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-production-verification"))]
     pub(super) fn restart_choice_for_test(&self) -> RuntimeApplyResult {
         let candidate = self.config.current().expect("test desired configuration");
         self.restart_choice(
@@ -2142,3 +2142,31 @@ pub(super) fn structural_runtime_change(old: &Value, new: &Value, platform: Plat
 
 #[cfg(test)]
 mod tests;
+
+impl ProxyRuntime {
+    pub(super) fn runtime_pairing_for_capability(&self, generation: u64) -> Option<RuntimePairing> {
+        self.runtime_config_baseline
+            .read()
+            .ok()?
+            .as_ref()
+            .filter(|b| b.generation == generation)
+            .map(|b| b.pairing.clone())
+    }
+}
+
+#[cfg(feature = "native-production-verification")]
+impl ProxyRuntime {
+    pub(super) fn restart_choice_for_native_verification(&self) -> RuntimeApplyResult {
+        self.restart_choice_for_test()
+    }
+    pub(super) async fn apply_confirmed_for_native_verification(
+        self: &Arc<Self>,
+    ) -> (&'static str, Option<u64>) {
+        let choice = self.restart_choice_for_native_verification();
+        let result = match choice.restart_confirmation {
+            Some(token) => self.apply_pending_transaction(Some(token)).await,
+            None => choice,
+        };
+        (result.status, result.apply_id)
+    }
+}

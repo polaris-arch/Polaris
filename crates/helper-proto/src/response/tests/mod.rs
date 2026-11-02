@@ -40,11 +40,13 @@ fn native_birth_receipts_round_trip_without_linux_or_legacy_aliases() {
             target,
             created: Some(123),
             image: Some("C:\\core path\\sing-box.exe".into()),
+            core: None,
         }),
         ResponseKind::NativeBirthStatus(NativeBirthStatus::Running {
             target,
             created: None,
             image: None,
+            core: None,
         }),
         ResponseKind::NativeBirthStatus(NativeBirthStatus::Stopping { target }),
         ResponseKind::NativeBirthStatus(NativeBirthStatus::Unknown {
@@ -854,5 +856,27 @@ fn to_wire_line_round_trips_through_parse() {
     ];
     for r in cases {
         assert_eq!(Response::parse(&r.to_wire_line()), r, "round-trip failed");
+    }
+}
+
+#[test]
+fn selected_native_status_preserves_mac_truth_and_rejects_malformed_or_duplicate_core() {
+    let prefix = "OK native-birth-status running 4242 00112233445566778899aabbccddeeff";
+    let core = "a".repeat(64);
+    let wire = format!("{prefix} core={core}");
+    let reply = Response::parse(&wire);
+    assert!(
+        matches!(&reply,Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Running{created:None,image:None,core:Some(id),..})) if id.as_str()==core)
+    );
+    assert_eq!(reply.to_wire_line(), wire);
+    for suffix in [
+        format!("core={} core={core}", core),
+        "core=bad".into(),
+        format!("core={core} image=61"),
+    ] {
+        assert!(!matches!(
+            Response::parse(&format!("{prefix} {suffix}")),
+            Response::Ok(ResponseKind::NativeBirthStatus(_))
+        ));
     }
 }

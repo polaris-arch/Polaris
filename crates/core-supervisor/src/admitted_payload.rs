@@ -21,6 +21,8 @@ use unsupported as platform;
 #[cfg(windows)]
 use windows as platform;
 #[cfg(windows)]
+pub(crate) use windows::{WindowsCheckChild, WindowsCheckInput};
+#[cfg(windows)]
 pub use windows::{WindowsChildCustody, WindowsMaintenanceGuard, WindowsStartedChild};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,3 +1048,6 @@ fn foreign_windows_declaration_is_explicitly_unsupported() {
         .expect_err("a foreign Windows declaration cannot grant execution");
     assert_eq!(error.kind, AdmissionErrorKind::UnsupportedExactObject);
 }
+
+#[cfg(windows)]
+pub(crate) use windows::check_correlation as windows_check_correlation;

@@ -524,3 +524,9 @@ pub fn verdict_from_libbox_check(result: Result<Option<String>, String>) -> Conf
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(windows)]
+pub use check_custody::{
+    begin_windows_helper_check, request_windows_checks_shutdown, run_windows_helper_check,
+    windows_helper_check_request,
+};

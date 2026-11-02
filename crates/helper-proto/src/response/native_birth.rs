@@ -28,6 +28,8 @@ pub enum NativeBirthStatus {
         target: HelperBirthTarget,
         created: Option<u64>,
         image: Option<String>,
+        /// Selected identity held by the original Root birth, absent on legacy wire.
+        core: Option<crate::core_manifest::CoreId>,
     },
     Stopping {
         target: HelperBirthTarget,
@@ -94,6 +96,7 @@ pub(super) fn to_wire(kind: &ResponseKind) -> String {
             target,
             created,
             image,
+            core,
         }) => {
             let mut line = format!("OK native-birth-status running {}", pair(*target));
             if let Some(created) = created {
@@ -101,6 +104,9 @@ pub(super) fn to_wire(kind: &ResponseKind) -> String {
             }
             if let Some(image) = image {
                 line.push_str(&format!(" image={}", hex_encode(image.as_bytes())));
+            }
+            if let Some(core) = core {
+                line.push_str(&format!(" core={}", core.as_str()));
             }
             line
         }
@@ -195,6 +201,16 @@ pub(super) fn parse(token: &str, tail: &str) -> Option<ResponseKind> {
             ["empty"] => NativeBirthStatus::Empty,
             ["running", pid, birth, rest @ ..] => {
                 let target = HelperBirthTarget::parse_wire(pid, birth)?;
+                let (rest, core) = match rest.split_last() {
+                    Some((field, earlier)) if field.starts_with("core=") => (
+                        earlier,
+                        Some(
+                            crate::core_manifest::CoreId::parse(field.strip_prefix("core=")?)
+                                .ok()?,
+                        ),
+                    ),
+                    _ => (rest, None),
+                };
                 let (created, image) = match rest {
                     [] => (None, None),
                     [c] if c.starts_with("created=") => (Some(created(c)?), None),
@@ -206,6 +222,7 @@ pub(super) fn parse(token: &str, tail: &str) -> Option<ResponseKind> {
                     target,
                     created,
                     image,
+                    core,
                 }
             }
             ["stopping", rest @ ..] => NativeBirthStatus::Stopping {

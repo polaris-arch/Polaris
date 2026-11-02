@@ -716,6 +716,7 @@ pub(crate) enum ManagedCoreStatus {
         target: HelperBirthTarget,
         created: Option<u64>,
         image: Option<String>,
+        core: Option<polaris_helper_proto::core_manifest::CoreId>,
     },
     BirthUnidentified,
     BirthStopping {
@@ -1151,13 +1152,13 @@ impl HelperRuntime {
 
     /// Mac ordinary processes never receive an execution owner. They transmit
     /// bounded captured bytes to the installed Root Helper's closed Check route.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub(crate) async fn check_config(
         &self,
         config: &Path,
     ) -> Result<polaris_core_supervisor::RawCheck, String> {
         use std::io::Read;
-        polaris_core_supervisor::admitted_payload::check_macos_root_helper_capability(
+        polaris_core_supervisor::admitted_payload::check_selected_capability(
             crate::runtime::core_identity::ExecPurpose::CheckConfig,
         )
         .map_err(|e| e.to_string())?;
@@ -1174,11 +1175,17 @@ impl HelperRuntime {
         if self.never_connect || self.test_connector.is_some() {
             return Err("generic test transport cannot issue Root Check completion".into());
         }
+        #[cfg(target_os = "macos")]
         let client = polaris_helper_client::check_config::SystemMacCheckClient::system(
+            read_token(&self.token_path()),
+        )?;
+        #[cfg(windows)]
+        let client = polaris_helper_client::check_config::SystemWindowsCheckClient::system(
             read_token(&self.token_path()),
         )?;
         let path = config.to_path_buf();
         let bytes = tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "macos")]
             let fd = nix::fcntl::open(
                 path.as_path(),
                 nix::fcntl::OFlag::O_RDONLY
@@ -1188,7 +1195,29 @@ impl HelperRuntime {
                 nix::sys::stat::Mode::empty(),
             )
             .map_err(|e| e.to_string())?;
+            #[cfg(target_os = "macos")]
             let file = std::fs::File::from(fd);
+            #[cfg(windows)]
+            let file = {
+                use std::os::windows::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .custom_flags(0x00200000)
+                    .open(&path)
+                    .map_err(|e| e.to_string())?;
+                use std::os::windows::fs::MetadataExt;
+                if file
+                    .metadata()
+                    .map_err(|e| e.to_string())?
+                    .file_attributes()
+                    & 0x400
+                    != 0
+                {
+                    return Err("CheckConfig reparse input rejected".into());
+                }
+                file
+            };
             let metadata = file.metadata().map_err(|e| e.to_string())?;
             if !metadata.is_file()
                 || metadata.len() == 0
@@ -1211,9 +1240,13 @@ impl HelperRuntime {
         })
         .await
         .map_err(|e| e.to_string())??;
-        polaris_core_supervisor::config_gate::run_macos_helper_check(client, id, bytes)
-            .await
-            .map_err(|e| e.to_string())
+        #[cfg(target_os = "macos")]
+        let result =
+            polaris_core_supervisor::config_gate::run_macos_helper_check(client, id, bytes).await;
+        #[cfg(windows)]
+        let result =
+            polaris_core_supervisor::config_gate::run_windows_helper_check(client, id, bytes).await;
+        result.map_err(|e| e.to_string())
     }
 
     #[cfg(unix)]
@@ -1902,6 +1935,41 @@ impl HelperRuntime {
         managed_core_status_with_client(&client)
     }
 
+    /// Evidence query cannot be supplied a generic connector, even in unit builds.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(crate) fn protected_native_core_status(&self) -> Result<ManagedCoreStatus, String> {
+        #[cfg(test)]
+        if self.never_connect || self.test_connector.is_some() {
+            return Err("Fixture transport cannot attest native status".into());
+        }
+        #[cfg(target_os = "macos")]
+        let client = polaris_helper_client::check_config::SystemMacCheckClient::system(
+            read_token(&self.token_path()),
+        )?;
+        #[cfg(windows)]
+        let client = polaris_helper_client::check_config::SystemWindowsCheckClient::system(
+            read_token(&self.token_path()),
+        )?;
+        match client.native_birth_status()? {
+            NativeBirthStatus::Running {
+                target,
+                created,
+                image,
+                core,
+            } => Ok(ManagedCoreStatus::NativeBirthRunning {
+                target,
+                created,
+                image,
+                core,
+            }),
+            _ => Err("Closed Helper original native birth is not running".into()),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    pub(crate) fn protected_native_core_status(&self) -> Result<ManagedCoreStatus, String> {
+        Err("Protected native status unavailable on this platform".into())
+    }
+
     /// Probe support before any Linux helper Start reservation is armed. This
     /// status request is read-only; an old helper's ERR unknown must remain a
     /// recoverable upgrade error, not an unconfirmed possible child birth.
@@ -2587,10 +2655,12 @@ fn managed_core_status_with_client(client: &HelperClient) -> Result<ManagedCoreS
                 target,
                 created,
                 image,
+                core,
             })) => Ok(ManagedCoreStatus::NativeBirthRunning {
                 target,
                 created,
                 image,
+                core,
             }),
             Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Stopping {
                 target,

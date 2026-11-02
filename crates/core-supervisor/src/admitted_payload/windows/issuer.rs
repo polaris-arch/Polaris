@@ -14,6 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::*;
 
+pub(super) mod check_input;
 mod spawn;
 pub(super) use spawn::{spawn, ChildCustody};
 
@@ -316,6 +317,9 @@ pub(super) struct Cohort {
     _birth_data_lease: File,
 }
 impl Cohort {
+    pub(super) fn root_directory(&self) -> PathBuf {
+        self.root.clone()
+    }
     pub(super) fn is_current(&self) -> bool {
         system_actor().is_ok()
             && self.files.iter().all(|(p, f, id)| {
@@ -411,6 +415,15 @@ pub(super) fn issue(
         }
     }
     private_parent(parents.last().ok_or_else(unavailable)?)?;
+    // A predecessor's private Check snapshot is durable Unknown debt. Never
+    // delete or adopt it during a new cohort issue.
+    if !matches!(fs::symlink_metadata(support.join(".validation-check")), Err(e) if e.kind() == io::ErrorKind::NotFound)
+    {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::Unknown,
+            "SYSTEM Check input/custody remains unconfirmed",
+        ));
+    }
     let descriptor = Descriptor::private()?;
     let sa = descriptor.attributes();
     // Keep the real existing StartShared lock across marker creation/open and

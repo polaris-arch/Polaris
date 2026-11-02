@@ -1855,7 +1855,7 @@
     "startupFailed": "sing-box 启动失败，请检查服务器配置",
     "helperRuntimeRestartRequired": "本次切换到本地运行需要重启 Polaris。请正常退出并重新打开应用，再尝试本地运行。",
     "helperNotInstalledTitle": "helper 未安装或需要升级",
-    "helperNotInstalledDesc": "TUN 模式需要提权 helper，但它尚未安装，或已安装的版本过旧。前往「设置 › Helper」安装或升级后重试。",
+    "helperNotInstalledDesc": "当前模式使用助手的受保护内核，请通过助手设置中的可信安装流程处理。",
     "helperNotInstalledAction": "去安装",
     "helperGateAborted": "已取消安装提权助手，本次未启动 TUN 模式代理",
     "tunRouteNotCaptured": "检测到其他 VPN 占用默认路由，请先断开后重试",

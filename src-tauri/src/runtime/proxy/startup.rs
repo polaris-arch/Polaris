@@ -645,37 +645,31 @@ pub enum HelperGateDecision {
 /// **C6-5 起核路由决策（纯函数）**：是否经提权 helper 起核（而非 [`TokioSpawner`] 直起）。
 ///
 /// 判据 = TUN 模式 **且** 平台有 helper 实现。根因（对齐 上游 `startViaHelper` 门控）：
-/// - **TUN 需提权**：mac/Win 建 utun/wintun 需 root/SYSTEM；linux 建 tun 需 CAP_NET_ADMIN（经 helper 的
-///   AmbientCaps + setuid 降权拉核）。三平台 TUN 一律经 helper（上游 `isTunMode` → helper）。
-/// - **systemProxy/manual 不接管 TUN**：核只在本地端口截流，app 直接 spawn 即可（无需 root）→ [`TokioSpawner`]。
-/// - **平台无 helper**（`Platform::Other`）：无 daemon 可连 → 退回直起（best-effort；TUN 在未知平台本就无解）。
-///
-/// 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]）。这一格今天**零行为差** ——
-/// 合取项是 mac/win/linux 允许清单，Android 永远走不到 —— 接上是为了让「runtime 里每一处按
-/// 接管方式分流的判据都读生效值」没有例外：留例外就要靠人逐处复核「这个例外今天还成立吗」。
-///
-/// # iOS 的显式确认（2026-09-06，加 `Platform::Ios` 变体时逐处答题）
-///
-/// 这里的平台判据是**允许清单**（`matches!(… Mac | Win | Linux)`），`Platform::Ios` 不在列
-/// ⇒ 求值 `false` ⇒ 不建 helper client。**这个答案恰好是对的**（iOS 无 helper：
-/// `runtime::helper::platform_supported(Ios) == false`，两处是同一个平台集合的两份写法，
-/// 两份都必须把 iOS 排除在外）。
-///
-/// **但它是白捡来的，不是有人答过的题** —— 这正是本批要显式记一笔的原因：`matches!` 少一个
-/// 变体只是求值 false，编译器一句话都不说。同一形态在 `builder/log.rs` 那一格上答案是相反的
-/// （那里漏掉 iOS = 导出诊断里核日志为空），两格的差别只在「不在允许清单里」是不是想要的结果。
-/// 故此处的绿必须写下来，否则下一次有人从这一格推广到那一格时没有对照。
-///
-/// 与 `is_tun()` 那半的交互也要说清：`effective_on(Ios)` 恒 `Tun`，所以第一个合取项在 iOS 上
-/// 恒真，整条判据完全由平台允许清单决定 —— 不存在「靠模式判据兜住」的第二层。
-///
-/// 变异锚点：删 `is_tun()` → 全模式经 helper（systemProxy 也弹提权，回归）；删平台判 → Other 平台起核必失败。
-///
-/// DESIGN-REVIEW(c6-5-src-tauri-helper-wiring)：`Platform::Other` 的 TUN 判 false → 退回直起（无 helper
-/// 可连）；但直起也建不了 TUN——是否该改「Other+TUN→显式报错」由复审裁（R27.1，目标平台仅 mac/win/linux，低风险）。
-pub(super) fn should_start_via_helper(mode: ProxyModeType, platform: Platform) -> bool {
+/// Execution route is separate from network takeover. macOS/Windows use the
+/// existing closed Root/SYSTEM provider for selected CheckConfig and RunMain,
+/// including manual/no-TUN. Linux manual retains direct sealed-FD admission.
+/// Mobile/unknown platform behavior remains on its existing direct/libbox route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExecutionRoute {
+    DirectAdmitted,
+    PrivilegedHelper,
+}
+pub(super) fn execution_route(mode: ProxyModeType, platform: Platform) -> ExecutionRoute {
+    if matches!(platform, Platform::Mac | Platform::Win)
+        || (platform == Platform::Linux && mode.effective_on(platform).is_tun())
+    {
+        ExecutionRoute::PrivilegedHelper
+    } else {
+        ExecutionRoute::DirectAdmitted
+    }
+}
+/// Network takeover is independent of the OS execution issuer.
+pub(super) fn managed_system_interfaces(mode: ProxyModeType, platform: Platform) -> bool {
     mode.effective_on(platform).is_tun()
         && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
+}
+pub(super) fn should_start_via_helper(mode: ProxyModeType, platform: Platform) -> bool {
+    execution_route(mode, platform) == ExecutionRoute::PrivilegedHelper
 }
 
 /// **已装 helper「该不该提示升级」的纯判定**（与 [`should_start_via_helper`] 同层，形态照
@@ -832,9 +826,31 @@ impl ProxyRuntime {
             .map_err(|_| failure())?
     }
 
-    /// 本次起核要 spawn 的核二进制（生产）= [`resolve_core_binary`] 逐字不变。
+    fn helper_execution_for_start(&self, mode: ProxyModeType) -> bool {
+        // Unit business fixtures retain their ordinary path-spawn boundary.
+        // They do not exercise or mint production admission. The separate
+        // normal-library driver contains no cfg(test) branch.
+        #[cfg(test)]
+        {
+            mode.effective_on(self.helper.platform()).is_tun()
+                && matches!(
+                    self.helper.platform(),
+                    Platform::Mac | Platform::Win | Platform::Linux
+                )
+        }
+        #[cfg(not(test))]
+        {
+            should_start_via_helper(mode, self.helper.platform())
+        }
+    }
+
+    /// Production helper paths carry candidate data only; direct paths require admission.
     #[cfg(not(test))]
     pub(super) fn core_binary_for_start(&self) -> Result<PathBuf, String> {
+        if matches!(self.helper.platform(), Platform::Mac | Platform::Win) {
+            return super::core_binary::resolve_helper_candidate_data()
+                .map(|data| data.into_path());
+        }
         resolve_core_binary()
     }
 
@@ -884,7 +900,7 @@ impl ProxyRuntime {
     /// 「点连接按钮」一条腿，托盘切模式 / 启动自动连接 / switchMode 去抖重启全绕过它（§K7「门开在别处
     /// 却当全域门」）。别再据本注释以为命令层还有一道门：门只有 `start_inner` 汇流点那一道。
     pub(super) fn tun_helper_missing(&self, mode: ProxyModeType) -> bool {
-        should_start_via_helper(mode, self.helper.platform()) && !self.helper.status().installed
+        self.helper_execution_for_start(mode) && !self.helper.status().installed
     }
 
     /// **TUN 提权引导门**（起核汇流点；移植 上游 `ProxyManager.maybePromptHelperGate`，:1475-1497）。
@@ -923,8 +939,8 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         mode: ProxyModeType,
     ) -> Result<(), StartError> {
-        // 非 TUN / 平台无 helper 实现 → 绝大多数起核走这条：零系统调用、零弹框。
-        if !should_start_via_helper(mode, self.helper.platform()) {
+        // Only direct execution routes bypass the existing helper install/repair gate.
+        if !self.helper_execution_for_start(mode) {
             return Ok(());
         }
 
@@ -932,6 +948,18 @@ impl ProxyRuntime {
         // 下面两条腿共用：分两次取不仅多付一次调用，还会让两条腿看到不一致的世界
         // （例如「判未装 → 弹安装框」与「判已装 → 弹升级框」同时成立）。
         let status = self.helper.status();
+        // Extending the existing issuer to manual/no-TUN does not authorize
+        // an installer or a new elevation prompt. Keep the explicit settings action.
+        if !mode.effective_on(self.helper.platform()).is_tun() {
+            if status.installed {
+                return Ok(());
+            }
+            self.set_error(HELPER_NOT_INSTALLED_MSG, code::HELPER_NOT_INSTALLED);
+            return Err(StartError::coded(
+                HELPER_NOT_INSTALLED_MSG,
+                code::HELPER_NOT_INSTALLED,
+            ));
+        }
 
         // ── 腿 2：**已装** → 起核本身没有障碍，唯一可能要做的是「可升级」的温和提示。
         //
@@ -1359,7 +1387,7 @@ impl ProxyRuntime {
         // start 腿撞上无人值守的 preflight 直接 bail。
         let t_helper_gate = std::time::Instant::now();
         self.run_helper_gate(user_config.proxy_mode_type).await?;
-        if should_start_via_helper(user_config.proxy_mode_type, self.helper.platform()) {
+        if self.helper_execution_for_start(user_config.proxy_mode_type) {
             let helper = Arc::clone(&self.helper);
             let capability = tokio::task::spawn_blocking(move || {
                 if helper.platform() == Platform::Linux {
@@ -1442,9 +1470,8 @@ impl ProxyRuntime {
         let rules_prep_ms = t_rules_prep.elapsed().as_millis();
         log::info!("起核耗时：规则文件+内置规则集预置={rules_prep_ms}ms");
         // C6-5 起核路由：TUN + 有 helper 的平台 → 经提权 helper 起 root/SYSTEM 受管核；
-        // systemProxy/manual（不接管 TUN）→ TokioSpawner 直起（见 `should_start_via_helper`）。
-        let via_helper =
-            should_start_via_helper(user_config.proxy_mode_type, self.helper.platform());
+        // Execution issuer is independent of manual/systemProxy/TUN network takeover.
+        let via_helper = self.helper_execution_for_start(user_config.proxy_mode_type);
 
         // ── #159/#176 起核外层重试预算（移植 上游 `runStartWithRetry`，:859）──
         // 起核期未就绪/退出（wintun 适配器未释放 / 双 utun 抢占 / 管理口慢绑）→ 单次即终态太脆。按预算
@@ -1581,7 +1608,9 @@ impl ProxyRuntime {
             // emit 之后才在下面 `?`。每尝试解析（字面路径，成本极低）；解析不到 = 终态，不重试（非竞态失败）。
             let binary_res = self.core_binary_for_start();
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let startup_cli_proof = if let Ok(path) = &binary_res {
+            let startup_cli_proof = if via_helper {
+                None
+            } else if let Ok(path) = &binary_res {
                 // The gate below reuses this observation. Keep the same proof
                 // across every await; a later menu refresh cannot substitute it.
                 self.startup_cli_observation(path).await.ok()
@@ -1723,7 +1752,7 @@ impl ProxyRuntime {
             #[cfg(not(target_os = "android"))]
             let system_guard = ensure_managed_system_interfaces(
                 singbox_config.endpoints.as_deref().unwrap_or_default(),
-                via_helper,
+                managed_system_interfaces(user_config.proxy_mode_type, self.helper.platform()),
             );
             #[cfg(target_os = "android")]
             let (system_code, system_reason) = (
@@ -2461,7 +2490,8 @@ impl ProxyRuntime {
         let ready_tls = if !via_helper {
             self.direct_tls_snapshot(my_gen)
         } else {
-            self.tls_fingerprint_capabilities_for(Some(&binary)).await
+            self.helper_running_tls_snapshot(my_gen, &runtime_api_control, &runtime_pairing)
+                .await
         };
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let ready_tls = self.tls_fingerprint_capabilities_for(None).await;
@@ -4326,7 +4356,7 @@ impl ProxyRuntime {
         if let Some(verdict) = self.business_kernel_check_result(binary, config) {
             return verdict;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             let _ = binary; // Core identity comes from the compiled selection, not this data path.
             return self
@@ -4337,7 +4367,7 @@ impl ProxyRuntime {
         }
         // The default in every build still requires the sole real admission
         // factory. A mock verdict is neither a Prepared nor a native birth.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         run_config_check(
             crate::runtime::core_identity::prepare(
                 binary,

@@ -870,7 +870,7 @@ else:
   const run = (command,args,options) => {
     if(command==='git')return args[0]==='rev-parse'?'c'.repeat(40):'';
     if(command==='go'){const row=payloads.get(digest(readFileSync(args.at(-1))));assert(row);return args[0]==='version'?row.rawBuildInfo:row.buildID;}
-    if(args[1]?.endsWith('release-archive.py') && options.input && JSON.parse(options.input).sourceArchive){assert.equal(args.at(-1),'--source-legal-pins');sourceChecks.push(JSON.parse(options.input));return '{}';}
+    if(args[1]?.endsWith('release-archive.py') && options.input && JSON.parse(options.input).sourceArchive){assert.equal(args.at(-1),'--source-trusted-proofs');sourceChecks.push(JSON.parse(options.input));return '{}';}
     return execFileSync(command,args,options);
   };
   const receipts=await consumeRelease(root,manifest,undefined,{read,run,host:'linux'});

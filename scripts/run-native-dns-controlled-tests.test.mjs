@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests, confirmedCleanup, preserveProductionGraph } from './run-native-dns-controlled-tests.mjs';
+import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests, confirmedCleanup, preserveProductionGraph, selectNativeExecutable, nativeCaseRecord, exactNativePass } from './run-native-dns-controlled-tests.mjs';
 
 test('only this invocation’s exact package/library test artifact is selectable', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-artifact-')));
@@ -363,4 +363,27 @@ test('ordinary package artifact selection rejects another package, wrong manifes
     assert.throws(() => selectExecutable([row], { ...metadata, packages: [{ ...pkg, manifest_path: join(root, 'other/Cargo.toml') }] }, root, 'polaris-store'));
     assert.throws(() => selectExecutable([row], metadata, root, 'arbitrary-package'));
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('native acceptance selects only the explicit normal-library binary artifact',()=>{
+ const root=realpathSync(mkdtempSync(join(tmpdir(),'native-carrier-artifact-')));
+ try {
+  mkdirSync(join(root,'target/debug'),{recursive:true});const executable=join(root,'target/debug/native-admission-verifier');writeFileSync(executable,'inert artifact');
+  const target={name:'native-admission-verifier',kind:['bin'],src_path:join(root,'src-tauri/src/bin/native-admission-verifier.rs')};
+  const metadata={target_directory:join(root,'target'),packages:[{id:'app',name:'polaris',manifest_path:join(root,'src-tauri/Cargo.toml'),targets:[target]}]};
+  const row={reason:'compiler-artifact',package_id:'app',profile:{test:false},target,executable,features:['native-production-verification']};
+  assert.equal(selectNativeExecutable([row],metadata,root).carrier,'normal-production-library');
+  for(const rows of [[{...row,profile:{test:true}}],[{...row,features:[]}],[row,row],[{...row,target:{...target,src_path:join(root,'other.rs')}}]]){
+   assert.throws(()=>selectNativeExecutable(rows,metadata,root));
+  }
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('native result requires one exact case, actual PID, drained custody and normal carrier',()=>{
+ const name=TESTS[0],record={schema:'polaris-native-production-case-v1',case:name,processId:42,result:'passed',carrier:'normal-production-library',validationCustodyDrained:true,publicationEligible:false};
+ const result=(r)=>({status:0,processId:42,stdout:'POLARIS_NATIVE_CASE '+JSON.stringify(r)+'\n'});
+ assert.equal(exactNativePass(result(record),name),true);
+ for(const delta of [{case:TESTS[1]},{processId:43},{carrier:'libtest'},{validationCustodyDrained:false},{publicationEligible:true}])assert.equal(nativeCaseRecord(result({...record,...delta}),name),null);
+ assert.equal(exactNativePass(result({...record,result:'failed'}),name),false);
+ assert.equal(exactNativePass({...result(record),timedOut:true},name),false);
+ assert.equal(nativeCaseRecord({...result(record),stdout:result(record).stdout.repeat(2)},name),null);
 });

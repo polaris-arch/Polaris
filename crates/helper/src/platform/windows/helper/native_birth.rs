@@ -183,6 +183,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                             target,
                             created: identity.created,
                             image: identity.image,
+                            core: None,
                         }
                     }
                 }

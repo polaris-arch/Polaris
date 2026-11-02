@@ -553,6 +553,9 @@ mod unix {
         .is_err());
         assert!(custody.assert_admission().is_err());
         assert!(custody.retire(&request).is_err());
+        // The carrier must preserve this real registry fence failure and still
+        // attempt both original owners' shutdown; poison cannot become cleanup.
+        assert!(custody.begin_shutdown().is_err());
         assert!(custody.shutdown().await.is_err());
         let state = custody.state.lock().err().unwrap().into_inner();
         assert!(state.runs[&request.id].child.is_some());

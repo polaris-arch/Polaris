@@ -120,7 +120,7 @@ pub(super) fn daemon_events_to_engine(ev: &daemon::ConnectionEvents) -> SingBoxC
 /// 连接快照 → 拓扑聚合（首帧全量含历史环死连接，按 `closed_at>0` 过滤）。
 ///
 /// relay 的纯数据面核心（无 gRPC / 无 emit），单测直接喂 fixture。
-pub(super) fn build_aggregate(conns: &[daemon::Connection], at: u64) -> ConnectionsAggregate {
+pub(crate) fn build_aggregate(conns: &[daemon::Connection], at: u64) -> ConnectionsAggregate {
     let entries: Vec<ConnectionEntry> = conns
         .iter()
         .filter(|c| c.closed_at <= 0) // 丢弃历史环死连接（快照含之）
@@ -133,7 +133,7 @@ pub(super) fn build_aggregate(conns: &[daemon::Connection], at: u64) -> Connecti
 ///
 /// issue #227 的核心：载荷与连接总数解耦——连接风暴（大量 UPDATE）但拓扑内容不变时**不推**，
 /// 只在 host/outbound 计数或成员真变时推一帧。
-pub(super) fn signature_changed(
+pub(crate) fn signature_changed(
     agg: &ConnectionsAggregate,
     last: &Option<String>,
 ) -> Option<String> {
@@ -258,7 +258,7 @@ fn stream_session_current(proxy: &ProxyRuntime, port: u16, generation: u64) -> b
 }
 
 /// 当前 epoch 毫秒（聚合 `at` 采样时刻；签名比对时被剔除，故不影响去重）。
-pub(super) fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
