@@ -35,55 +35,51 @@ function windowsLogWiring(input: WindowsLogSources): boolean {
     if (start < 0) throw new Error(`Missing ${marker}`);
     return fn(input.issuer.slice(start), 'drop');
   };
-  try {
-    const pipe = fn(input.issuer, 'pipe');
-    const stdin = fn(input.issuer, 'read_only_stdin');
-    const duplicate = fn(input.issuer, 'duplicate');
-    const suspended = fn(input.issuer, 'create_suspended');
-    const spawn = fn(input.issuer, 'spawn');
-    const factory = fn(input.execution, 'spawn_windows_main');
-    const parts = fn(input.execution, 'into_parts');
-    const tracked = fn(input.helper, 'spawn_tracked');
-    const poll = fn(input.helper, 'poll_native_child');
-    const wait = fn(input.helper, 'native_wait');
-    const retire = fn(input.helper, 'retire_native_child');
-    const logger = fn(input.budget, 'spawn_pipe_loggers_with_preopened_files_custodied');
-    const drainer = fn(input.budget, 'spawn_pipe_drainers_custodied');
-    const readers = fn(input.budget, 'spawn_pipe_readers');
-    const reader = fn(input.budget, 'spawn_pipe_logger');
-    const revoke = fn(input.budget, 'revoke');
-    return /bInheritHandle:0,\};check\(unsafe\{CreatePipe\(&mutr,&mutw,&sa,0\)\}\)\?;Ok\(\(File::from\(owned\(r\)\?\),File::from\(owned\(w\)\?\)\)\)/.test(pipe)
-      && /fnread_only_stdin\(f:&File\)->io::Result<OwnedHandle>\{letmuth=ptr::null_mut\(\);check\(unsafe\{DuplicateHandle\(GetCurrentProcess\(\),f.as_raw_handle\(\),GetCurrentProcess\(\),&muth,FILE_GENERIC_READ,1,0,\)\}\)\?;owned\(h\)\}$/.test(stdin)
-      && /fnduplicate\(f:&File\)->io::Result<OwnedHandle>\{letmuth=ptr::null_mut\(\);check\(unsafe\{DuplicateHandle\(GetCurrentProcess\(\),f.as_raw_handle\(\),GetCurrentProcess\(\),&muth,0,1,DUPLICATE_SAME_ACCESS,\)\}\)\?;owned\(h\)\}$/.test(duplicate)
-      && /let\(stdout,out_write\)=pipe\(\)\?;let\(stderr,err_write\)=pipe\(\)\?;letmutinherit=vec!\[read_only_stdin\(config\)\?\];forfin\[&out_write,&err_write\]\.into_iter\(\)\.chain\(guards.iter\(\).copied\(\)\)\{inherit.push\(duplicate\(f\)\?\);\}lethandles:Vec<_>=inherit.iter\(\).map\(AsRawHandle::as_raw_handle\).collect\(\);/.test(suspended)
-      && /attributes.set\(PROC_THREAD_ATTRIBUTE_HANDLE_LIST,&handles\)\?;attributes.set\(PROC_THREAD_ATTRIBUTE_JOB_LIST,&jobs\)\?;/.test(suspended)
-      && /dwFlags=STARTF_USESTDHANDLES;startup.StartupInfo.hStdInput=handles\[0\];startup.StartupInfo.hStdOutput=handles\[1\];startup.StartupInfo.hStdError=handles\[2\];startup.lpAttributeList=attributes.pointer;/.test(suspended)
-      && /CreateProcessW\(application.as_ptr\(\),command.as_mut_ptr\(\),ptr::null\(\),ptr::null\(\),1,CREATE_SUSPENDED\|EXTENDED_STARTUPINFO_PRESENT\|CREATE_UNICODE_ENVIRONMENT\|CREATE_NO_WINDOW\|CREATE_NEW_PROCESS_GROUP,environment.as_ptr\(\).cast\(\),cwd.as_ptr\(\),&startup.StartupInfo,&mutinfo,\)/.test(suspended)
-      && /\)\}\)\?;letprocess=owned\(info.hProcess\)\?;letthread=owned\(info.hThread\)\?;drop\(inherit\);drop\(out_write\);drop\(err_write\);Ok\(Suspended\{process:Some\(process\),thread,job:Some\(job\),stdout:Some\(stdout\),stderr:Some\(stderr\),pid:info.dwProcessId,\}\)/.test(suspended)
-      && /letguards:Vec<&File>=owner.files.iter\(\).map\(\|\(_,f,_\)\|f\)\.chain\(owner.directories.iter\(\)\)\.chain\(owner.parents.iter\(\)\)\.chain\(owner.system.iter\(\)\)\.chain\(std::iter::once\(&owner.occupancy\)\)\.collect\(\);letmutsuspended=create_suspended\(&owner.final_exe,&owner.final_sidecar,&config,cwd,&guards,purpose,\)\?;/.test(spawn)
-      && /stdout:suspended.stdout.take\(\),stderr:suspended.stderr.take\(\),custody,pid:suspended.pid,/.test(spawn)
-      && /_job:suspended.job.take\(\).expect\("atomicjob"\),cohort:Some\(Arc::clone\(owner\)\),/.test(spawn)
-      && /issuer::spawn\(&self.payload.protected.inner,config,cwd,ExecPurpose::RunMain,\)/.test(factory)
-      && /\(self.pid,self.process,self.stdout.expect\("mainstdout"\),self.stderr.expect\("mainstderr"\),self.custody,\)/.test(parts)
-      && /letchild=execution.spawn_windows_main\(file,Path::new\(&cwd\)\)\?;letprocess_ms=crate::elapsed_ms\(process_started\);let\(pid,handle,stdout,stderr,execution_custody\)=child.into_parts\(\);letstdout=Some\(stdout\);letstderr=Some\(stderr\);/.test(tracked)
-      && /log_custody:None,_execution_custody:execution_custody,/.test(tracked)
-      && /letlog_custody=ifletSome\(files\)=log_files\{polaris_log_budget::spawn_pipe_loggers_with_preopened_files_custodied\(stdout,stderr,files,polaris_log_budget::DEFAULT_GENERATION_BYTES,\)\}else\{polaris_log_budget::spawn_pipe_drainers_custodied\(stdout,stderr\)\};custody.as_mut\(\).expect\("publishedownedHANDLE"\).log_custody=Some\(log_custody\);/.test(tracked)
-      && /c.pid==target.pid.get\(\)&&c.birth==Some\(target.birth\)/.test(poll)
-      && /native_wait\(child,0\)/.test(poll)
-      && /matchunsafe\{WaitForSingleObject\(child.handle.as_raw_handle\(\).cast\(\),timeout_ms\)\}\{WAIT_OBJECT_0=>\{child.exit_cached=true;NativeChildPoll::Exited\}WAIT_TIMEOUT=>NativeChildPoll::Running,_=>NativeChildPoll::Unknown,\}/.test(wait)
-      && /c.pid==target.pid.get\(\)&&c.birth==Some\(target.birth\)&&c.exit_cached/.test(retire)
-      && /letSome\(log_custody\)=guard.as_ref\(\).and_then\(\|child\|child.log_custody.as_ref\(\)\)else\{returnfalse;\};iflog_custody.revoke\(\).is_err\(\)\{returnfalse;\}\*guard=None;true/.test(retire)
-      && (retire.match(/\*guard=None;/g) ?? []).length === 1
-      && /ifunsafe\{WaitForSingleObject\(self.process.as_raw_handle\(\),0\)\}!=WAIT_OBJECT_0\{ifletSome\(owner\)=self.cohort.take\(\)\{let_=Arc::into_raw\(owner\);\}\}/.test(drop('ChildCustody'))
-      && /ifunsafe\{WaitForSingleObject\(process.as_raw_handle\(\),0\)\}!=WAIT_OBJECT_0\{ifletSome\(job\)=self.job.take\(\)\{drop\(job\);\}unsafe\{WaitForSingleObject\(process.as_raw_handle\(\),10_000\);\}\}/.test(drop('Suspended'))
-      && /letwriter=PreopenedRotatingFile::open\(files,generation_bytes,OpenMode::Fresh\)\.map\(PipeLogWriter::Preopened\)\.ok\(\);letshared=Arc::new\(Mutex::new\(writer\)\);spawn_pipe_readers\(stdout,stderr,Arc::clone\(&shared\)\);PipeLogCustody\{writer:shared\}/.test(logger)
-      && /letshared=Arc::new\(Mutex::new\(None\)\);spawn_pipe_readers\(stdout,stderr,Arc::clone\(&shared\)\);PipeLogCustody\{writer:shared\}/.test(drainer)
-      && /ifletSome\(reader\)=stdout\{spawn_pipe_logger\(reader,Arc::clone\(&shared\)\);\}ifletSome\(reader\)=stderr\{spawn_pipe_logger\(reader,shared\);\}/.test(readers)
-      && /letmutbuf=\[0_u8;16\*1024\];loop\{letOk\(read\)=reader.read\(&mutbuf\)else\{return;\};ifread==0\{return;\}ifletOk\(mutguard\)=writer.lock\(\)\{ifletSome\(file\)=guard.as_mut\(\)\{iffile.write_chunk\(&buf\[\.\.read\]\)\.is_err\(\)\{\*guard=None;\}\}\}\}/.test(reader)
-      && /letmutwriter=self.writer.lock\(\)\.map_err\(\|_\|std::io::Error::other\("pipelogwritercustodyunavailable"\)\)\?;\*writer=None;Ok\(\(\)\)/.test(revoke);
-  } catch {
-    return false; // A missing/renamed function or ownership scope is a broken wire.
-  }
+  const pipe = fn(input.issuer, 'pipe');
+  const stdin = fn(input.issuer, 'read_only_stdin');
+  const duplicate = fn(input.issuer, 'duplicate');
+  const suspended = fn(input.issuer, 'create_suspended');
+  const spawn = fn(input.issuer, 'spawn');
+  const factory = fn(input.execution, 'spawn_windows_main');
+  const parts = fn(input.execution, 'into_parts');
+  const tracked = fn(input.helper, 'spawn_tracked');
+  const poll = fn(input.helper, 'poll_native_child');
+  const wait = fn(input.helper, 'native_wait');
+  const retire = fn(input.helper, 'retire_native_child');
+  const logger = fn(input.budget, 'spawn_pipe_loggers_with_preopened_files_custodied');
+  const drainer = fn(input.budget, 'spawn_pipe_drainers_custodied');
+  const readers = fn(input.budget, 'spawn_pipe_readers');
+  const reader = fn(input.budget, 'spawn_pipe_logger');
+  const revoke = fn(input.budget, 'revoke');
+  return /bInheritHandle:0,\};check\(unsafe\{CreatePipe\(&mutr,&mutw,&sa,0\)\}\)\?;Ok\(\(File::from\(owned\(r\)\?\),File::from\(owned\(w\)\?\)\)\)/.test(pipe)
+    && /fnread_only_stdin\(f:&File\)->io::Result<OwnedHandle>\{letmuth=ptr::null_mut\(\);check\(unsafe\{DuplicateHandle\(GetCurrentProcess\(\),f.as_raw_handle\(\),GetCurrentProcess\(\),&muth,FILE_GENERIC_READ,1,0,\)\}\)\?;owned\(h\)\}$/.test(stdin)
+    && /fnduplicate\(f:&File\)->io::Result<OwnedHandle>\{letmuth=ptr::null_mut\(\);check\(unsafe\{DuplicateHandle\(GetCurrentProcess\(\),f.as_raw_handle\(\),GetCurrentProcess\(\),&muth,0,1,DUPLICATE_SAME_ACCESS,\)\}\)\?;owned\(h\)\}$/.test(duplicate)
+    && /let\(stdout,out_write\)=pipe\(\)\?;let\(stderr,err_write\)=pipe\(\)\?;letmutinherit=vec!\[read_only_stdin\(config\)\?\];forfin\[&out_write,&err_write\]\.into_iter\(\)\.chain\(guards.iter\(\).copied\(\)\)\{inherit.push\(duplicate\(f\)\?\);\}lethandles:Vec<_>=inherit.iter\(\).map\(AsRawHandle::as_raw_handle\).collect\(\);/.test(suspended)
+    && /attributes.set\(PROC_THREAD_ATTRIBUTE_HANDLE_LIST,&handles\)\?;attributes.set\(PROC_THREAD_ATTRIBUTE_JOB_LIST,&jobs\)\?;/.test(suspended)
+    && /dwFlags=STARTF_USESTDHANDLES;startup.StartupInfo.hStdInput=handles\[0\];startup.StartupInfo.hStdOutput=handles\[1\];startup.StartupInfo.hStdError=handles\[2\];startup.lpAttributeList=attributes.pointer;/.test(suspended)
+    && /CreateProcessW\(application.as_ptr\(\),command.as_mut_ptr\(\),ptr::null\(\),ptr::null\(\),1,CREATE_SUSPENDED\|EXTENDED_STARTUPINFO_PRESENT\|CREATE_UNICODE_ENVIRONMENT\|CREATE_NO_WINDOW\|CREATE_NEW_PROCESS_GROUP,environment.as_ptr\(\).cast\(\),cwd.as_ptr\(\),&startup.StartupInfo,&mutinfo,\)/.test(suspended)
+    && /\)\}\)\?;letprocess=owned\(info.hProcess\)\?;letthread=owned\(info.hThread\)\?;drop\(inherit\);drop\(out_write\);drop\(err_write\);Ok\(Suspended\{process:Some\(process\),thread,job:Some\(job\),stdout:Some\(stdout\),stderr:Some\(stderr\),pid:info.dwProcessId,\}\)/.test(suspended)
+    && /letguards:Vec<&File>=owner.files.iter\(\).map\(\|\(_,f,_\)\|f\)\.chain\(owner.directories.iter\(\)\)\.chain\(owner.parents.iter\(\)\)\.chain\(owner.system.iter\(\)\)\.chain\(std::iter::once\(&owner.occupancy\)\)\.collect\(\);letmutsuspended=create_suspended\(&owner.final_exe,&owner.final_sidecar,&config,cwd,&guards,purpose,\)\?;/.test(spawn)
+    && /stdout:suspended.stdout.take\(\),stderr:suspended.stderr.take\(\),custody,pid:suspended.pid,/.test(spawn)
+    && /_job:suspended.job.take\(\).expect\("atomicjob"\),cohort:Some\(Arc::clone\(owner\)\),/.test(spawn)
+    && /issuer::spawn\(&self.payload.protected.inner,config,cwd,ExecPurpose::RunMain,\)/.test(factory)
+    && /\(self.pid,self.process,self.stdout.expect\("mainstdout"\),self.stderr.expect\("mainstderr"\),self.custody,\)/.test(parts)
+    && /letchild=execution.spawn_windows_main\(file,Path::new\(&cwd\)\)\?;letprocess_ms=crate::elapsed_ms\(process_started\);let\(pid,handle,stdout,stderr,execution_custody\)=child.into_parts\(\);letstdout=Some\(stdout\);letstderr=Some\(stderr\);/.test(tracked)
+    && /log_custody:None,_execution_custody:execution_custody,/.test(tracked)
+    && /letlog_custody=ifletSome\(files\)=log_files\{polaris_log_budget::spawn_pipe_loggers_with_preopened_files_custodied\(stdout,stderr,files,polaris_log_budget::DEFAULT_GENERATION_BYTES,\)\}else\{polaris_log_budget::spawn_pipe_drainers_custodied\(stdout,stderr\)\};custody.as_mut\(\).expect\("publishedownedHANDLE"\).log_custody=Some\(log_custody\);/.test(tracked)
+    && /c.pid==target.pid.get\(\)&&c.birth==Some\(target.birth\)/.test(poll)
+    && /native_wait\(child,0\)/.test(poll)
+    && /matchunsafe\{WaitForSingleObject\(child.handle.as_raw_handle\(\).cast\(\),timeout_ms\)\}\{WAIT_OBJECT_0=>\{child.exit_cached=true;NativeChildPoll::Exited\}WAIT_TIMEOUT=>NativeChildPoll::Running,_=>NativeChildPoll::Unknown,\}/.test(wait)
+    && /c.pid==target.pid.get\(\)&&c.birth==Some\(target.birth\)&&c.exit_cached/.test(retire)
+    && /letSome\(log_custody\)=guard.as_ref\(\).and_then\(\|child\|child.log_custody.as_ref\(\)\)else\{returnfalse;\};iflog_custody.revoke\(\).is_err\(\)\{returnfalse;\}\*guard=None;true/.test(retire)
+    && (retire.match(/\*guard=None;/g) ?? []).length === 1
+    && /ifunsafe\{WaitForSingleObject\(self.process.as_raw_handle\(\),0\)\}!=WAIT_OBJECT_0\{ifletSome\(owner\)=self.cohort.take\(\)\{let_=Arc::into_raw\(owner\);\}\}/.test(drop('ChildCustody'))
+    && /ifunsafe\{WaitForSingleObject\(process.as_raw_handle\(\),0\)\}!=WAIT_OBJECT_0\{ifletSome\(job\)=self.job.take\(\)\{drop\(job\);\}unsafe\{WaitForSingleObject\(process.as_raw_handle\(\),10_000\);\}\}/.test(drop('Suspended'))
+    && /letwriter=PreopenedRotatingFile::open\(files,generation_bytes,OpenMode::Fresh\)\.map\(PipeLogWriter::Preopened\)\.ok\(\);letshared=Arc::new\(Mutex::new\(writer\)\);spawn_pipe_readers\(stdout,stderr,Arc::clone\(&shared\)\);PipeLogCustody\{writer:shared\}/.test(logger)
+    && /letshared=Arc::new\(Mutex::new\(None\)\);spawn_pipe_readers\(stdout,stderr,Arc::clone\(&shared\)\);PipeLogCustody\{writer:shared\}/.test(drainer)
+    && /ifletSome\(reader\)=stdout\{spawn_pipe_logger\(reader,Arc::clone\(&shared\)\);\}ifletSome\(reader\)=stderr\{spawn_pipe_logger\(reader,shared\);\}/.test(readers)
+    && /letmutbuf=\[0_u8;16\*1024\];loop\{letOk\(read\)=reader.read\(&mutbuf\)else\{return;\};ifread==0\{return;\}ifletOk\(mutguard\)=writer.lock\(\)\{ifletSome\(file\)=guard.as_mut\(\)\{iffile.write_chunk\(&buf\[\.\.read\]\)\.is_err\(\)\{\*guard=None;\}\}\}\}/.test(reader)
+    && /letmutwriter=self.writer.lock\(\)\.map_err\(\|_\|std::io::Error::other\("pipelogwritercustodyunavailable"\)\)\?;\*writer=None;Ok\(\(\)\)/.test(revoke);
 }
 
 describe('W26 bounded core-log wiring', () => {
@@ -182,6 +178,7 @@ describe('W26 bounded core-log wiring', () => {
       ['failed suspended child does not wait on its retained HANDLE', { ...source, issuer: source.issuer.replace('WaitForSingleObject(process.as_raw_handle(), 10_000);', 'WaitForSingleObject(process.as_raw_handle(), 0);') }],
       ['unknown child cohort is released', { ...source, issuer: source.issuer.replace('let _ = Arc::into_raw(owner);', 'drop(owner);') }],
     ];
+    expect(negatives, 'all original mutations must construct before rejection checks').toHaveLength(27);
     for (const [label, input] of negatives) {
       expect(input, `${label}: mutation must change real source`).not.toEqual(source);
       expect(windowsLogWiring(input), label).toBe(false);
