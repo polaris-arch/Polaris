@@ -1216,6 +1216,7 @@ fn linked_payload_and_weakened_store_permissions_are_rejected() {
 #[test]
 fn flat_retirement_preserves_unknown_or_busy_cohorts_and_all_versioned_inputs() {
     let (root, store, uid) = store();
+    let store_root = root.path().canonicalize().unwrap();
     let (source, manifest) = fixture("1.0.0");
     store
         .install(&manifest, source.path(), Some(uid), None)
@@ -1243,7 +1244,9 @@ fn flat_retirement_preserves_unknown_or_busy_cohorts_and_all_versioned_inputs() 
                     .collect::<Vec<_>>();
                 observed.sort_unstable();
                 assert_eq!(observed, ["libcronet.so", "sing-box"]);
-                assert!(paths.iter().all(|p| p.parent() == Some(root.path())));
+                assert!(paths
+                    .iter()
+                    .all(|p| p.parent() == Some(store_root.as_path())));
                 crate::legacy_use::LegacyUse::Idle
             })
             .unwrap()

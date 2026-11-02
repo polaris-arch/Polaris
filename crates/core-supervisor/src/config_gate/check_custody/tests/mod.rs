@@ -1282,6 +1282,11 @@ mod bounded_capture {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn admitted_validation_caller_budgets_keep_success_and_native_timeout_distinct() {
+        if crate::tests::isolated_lease_case(
+            "config_gate::check_custody::tests::bounded_capture::admitted_validation_caller_budgets_keep_success_and_native_timeout_distinct",
+        ) {
+            return;
+        }
         // App callers independently map RawCheck. Their old shell inputs must
         // not be promoted into PreparedExecution to exercise this lifecycle.
         // Use the existing crate-private admitted cohort and the same custody.

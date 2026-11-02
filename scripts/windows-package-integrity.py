@@ -12,8 +12,9 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import ntpath
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import queue
 import shutil
@@ -1216,17 +1217,78 @@ def run_tauri(root, argv, env, ready, timeout):
                         diagnostic_context={'candidate': env.get('POLARIS_BUILD_ID')})
 
 
+def resource_source_key(consumer, physical):
+    """Tauri source keys are relative to src-tauri, never drive-rooted paths."""
+    require(consumer.is_absolute() and physical.is_absolute()
+            and consumer.anchor.casefold() == physical.anchor.casefold(),
+            'native resource stage must share the consumer drive/share anchor')
+    paths = ntpath if isinstance(consumer, PureWindowsPath) else os.path
+    name = paths.relpath(str(physical), str(consumer))
+    require(not type(consumer)(name).anchor and not any(c in name for c in '*?')
+            and paths.normcase(paths.normpath(paths.join(str(consumer), name)))
+            == paths.normcase(paths.normpath(str(physical))), 'invalid relative native resource source')
+    return name
+
+
+def resource_source_path(root, stage, name):
+    """Resolve only the frozen role roots against the actual Tauri/Cargo cwd."""
+    require(isinstance(name, str) and not Path(name).anchor and not any(c in name for c in '*?'),
+            'relative native resource source required')
+    consumer = root / 'src-tauri'
+    physical = Path(os.path.abspath(consumer / name))
+    require(physical.parent == stage and resource_source_key(consumer, physical) == name,
+            'native resource source escaped its stage or fixed consumer base')
+    return physical
+
+
+@contextmanager
+def native_resource_stage(root, state):
+    """Allocate one short owned stage on the consumer's existing drive/share.
+
+    A default TEMP may be on another drive. Walk only existing source ancestors;
+    keep the first short writable namespace, without links, drive maps or ACL edits.
+    """
+    root = cargo_directory(root)
+    # Plan the exact short role/index suffixes, rather than charging their longer
+    # logical destinations or assuming TEMP's random-name length.
+    members = {}
+    for source, target in native_windows_config(root, root)['bundle']['resources'].items():
+        base = resource_source_path(root, root, source).relative_to(root)
+        for name in state['resources']:
+            if name == target or name.startswith(target + '/'):
+                require(name not in members, 'ambiguous native resource role')
+                members[name] = base if name == target else base / name[len(target) + 1:]
+    require(set(members) == set(state['resources']), 'native resource role member set differs')
+    for parent in root.parents:
+        parent = cargo_directory(parent)
+        if len(str(parent).encode('utf-16-le')) // 2 + 12 >= 260:
+            continue
+        try:
+            directory = tempfile.TemporaryDirectory(prefix='r-', dir=parent)
+        except PermissionError:
+            continue
+        with directory as temporary:
+            stage = cargo_directory(Path(temporary))
+            resource_source_key(root / 'src-tauri', stage / '0')
+            if any(len(str(stage / suffix).encode('utf-16-le')) // 2 >= 260 for suffix in members.values()):
+                continue
+            yield stage
+        return
+    raise ValueError('no short writable native resource stage on the consumer drive/share')
+
+
 def native_windows_config(root, resource_root):
     """The same eight declared logical roles, with owned short source paths."""
     config = json.loads(io_path(regular(root / 'src-tauri/tauri.windows.conf.json')).read_bytes())
-    resources = {}
+    resource_root = cargo_directory(resource_root); resources = {}
     for index, entry in enumerate(config['bundle']['resources']):
         require(isinstance(entry, str) and not any(c in entry for c in '*?')
                 and (entry == 'core-manifest.json' or entry.startswith('../') and not entry[3:].startswith('../')),
                 'unreviewed native resource declaration')
         source = Path(os.path.abspath(root / 'src-tauri' / entry))
         require(source.is_relative_to(root), 'native resource escaped repository')
-        name = str(resource_root / str(index)); target = entry.replace('../', '_up_/', 1).rstrip('/')
+        name = resource_source_key(root / 'src-tauri', resource_root / str(index))
+        target = entry.replace('../', '_up_/', 1).rstrip('/')
         require(name not in resources and target not in resources.values(), 'duplicate native resource declaration')
         resources[name] = target
     config['bundle']['resources'] = resources
@@ -1241,13 +1303,14 @@ def copy_resource_inputs(root, state, stage, owned):
     for directory in reversed([stage, *stage.parents]):
         copies['directories'][str(directory)] = list(owned.enter_context(hold_resource(directory, directory=True)))
     for short, target in config['bundle']['resources'].items():
-        base = Path(short)
+        base = resource_source_path(root, stage, short)
         is_file = target in state['sources']
         if not is_file: io_path(base).mkdir()
         for name, source in state['sources'].items():
             if name != target and not name.startswith(target + '/'): continue
             destination = base if is_file else base / name[len(target) + 1:]
-            require(len(str(destination)) < 260, 'normal TEMP is too deep for the native NSIS resource input')
+            require(len(str(destination).encode('utf-16-le')) // 2 < 260,
+                    'owned stage is too deep for the native NSIS resource input')
             io_path(destination.parent).mkdir(parents=True, exist_ok=True)
             before = app_identity(io_path(regular(source)).stat()); expected = state['resources'][name]
             with hold_app(source, write_share=False) as stream, io_path(destination).open('xb') as output:
@@ -1275,7 +1338,7 @@ def verify_resource_copies(root, state, copies):
     require(set(copies['members']) == set(state['sources']), 'derived resource member set differs')
     directories = {stage, *stage.parents}
     for short, target in config['bundle']['resources'].items():
-        if target not in state['sources']: directories.add(Path(short))
+        if target not in state['sources']: directories.add(resource_source_path(root, stage, short))
     for row in copies['members'].values():
         path = Path(row['path'])
         require(path.is_relative_to(stage), 'derived resource escaped its owner')
@@ -1289,7 +1352,8 @@ def verify_resource_copies(root, state, copies):
         declaration = [(short, target) for short, target in config['bundle']['resources'].items()
                        if name == target or name.startswith(target + '/')]
         require(len(declaration) == 1, 'ambiguous derived resource role')
-        short, target = declaration[0]; path = Path(short) if name == target else Path(short) / name[len(target) + 1:]
+        short, target = declaration[0]; base = resource_source_path(root, stage, short)
+        path = base if name == target else base / name[len(target) + 1:]
         row = copies['members'][name]; original = io_path(regular(source)).stat(); value = io_path(regular(path)).stat()
         require(row == {'sourceID': [original.st_dev, original.st_ino], 'path': str(path), 'copyID': [value.st_dev, value.st_ino]}
                 and facts(path) == state['resources'][name], 'derived resource identity or bytes changed')
@@ -1304,14 +1368,15 @@ def produce(root):
     require(not any(io_path(owner / name).exists() for name in ('runner.cmd', 'resource-copies.json', 'native-windows.conf.json', 'capture.json', 'capture-ack.json', 'first-cargo.jsonl', 'first-app.bin', 'produced.json')),
             'producer owner is single use; prepare a fresh owner after a known failure')
     with ExitStack() as owned:
-        stage = Path(owned.enter_context(tempfile.TemporaryDirectory(prefix='r-')))
+        stage = owned.enter_context(native_resource_stage(root, state))
         copies = copy_resource_inputs(root, state, stage, owned)
         proof = owner / 'resource-copies.json'
         with io_path(proof).open('xb') as stream:
             stream.write(encoded(copies)); stream.flush(); os.fsync(stream.fileno())
         config_path = owner / 'native-windows.conf.json'
+        config_value = native_windows_config(root, stage)
         with io_path(config_path).open('xb') as stream:
-            stream.write(encoded(native_windows_config(root, stage))); stream.flush(); os.fsync(stream.fileno())
+            stream.write(encoded(config_value)); stream.flush(); os.fsync(stream.fileno())
         scope = {'parent': os.getpid(), 'parentBirth': process_birth(os.getpid()),
                  'statePath': os.environ['POLARIS_WINDOWS_PACKAGE_STATE'],
                  'stateFile': facts(os.environ['POLARIS_WINDOWS_PACKAGE_STATE']), 'script': facts(Path(__file__)),

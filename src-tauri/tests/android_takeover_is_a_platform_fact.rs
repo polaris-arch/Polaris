@@ -104,10 +104,16 @@ const RAW_READ_EXEMPTIONS: &[Exemption] = &[];
 type RawJsonSite = (&'static str, &'static str, usize, &'static str);
 const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
     (
-        "src-tauri/src/runtime/proxy/runtime_config.rs",
-        "[ \"proxyModeType\", \"tunConfig\", \"mixedPort\", \"httpPort\", \"allowLan\", \"singboxDashboard\", ] .iter() .any(|key| old.get(*key) != new.get(*key))",
+        "src-tauri/src/runtime/proxy/dns_takeover.rs",
+        "let mode = config .get(\"proxyModeType\") .cloned() .and_then(|value| serde_json::from_value::<ProxyModeType>(value).ok()) .unwrap_or_default()",
         1,
-        "Structural preview compares opaque D/R physical-control values, not raw takeover policy. Android still uses effective_on(Tun), and the core Plan is authoritative for admission.",
+        "Host DNS intent is read only on Mac/Linux, after the platform guard: Android/iOS/Windows/Other return false before this raw read because they do not own this host DNS effect. Mac/Linux deserialize the typed ProxyModeType, apply effective_on(platform).is_tun(), and combine it with the raw DNS switch's existing default-on semantics on both sides; this never selects Android takeover from its stored mode.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/runtime_config.rs",
+        "[ \"proxyModeType\", \"tunConfig\", \"mixedPort\", \"httpPort\", \"allowLan\", \"singboxDashboard\", ] .iter() .any(|key| old.get(*key) != new.get(*key)) || super::dns_takeover::host_dns_takeover_changed(platform, old, new)",
+        1,
+        "The array previews opaque D/R physical/service setting differences, not Android's effective takeover mode. The added host DNS projection returns false before raw reads on Android/iOS/Windows/Other; Mac/Linux normalize the typed mode with effective_on(platform).is_tun(). This preview is reachable on Android: Core changes still require the effective generated configuration's Plan, while host DNS changes require a separate explicit application-managed restart choice.",
     ),
     (
         "src-tauri/src/commands/config.rs",

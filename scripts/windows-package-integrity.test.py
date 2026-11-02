@@ -10,10 +10,11 @@ import importlib.util
 import hashlib
 import io
 import json
+import ntpath
 import os
 import re
 from types import SimpleNamespace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import stat
 import subprocess
@@ -99,8 +100,11 @@ def source_contract(root, *, source_text=None, workflow_text=None):
         'verified_sources': {'source_inventory'},
         'prepare': {'verified_sources', 'find_sevenzip', 'cargo_context', 'directory_id'},
         'load_state': {'verified_sources', 'cargo_context', 'directory_id'},
-        'produce': {'load_state', 'tauri_identity', 'run_tauri', 'cargo_app_identity', 'compiled_app', 'assemble_carriers'},
+        'produce': {'load_state', 'tauri_identity', 'native_resource_stage', 'copy_resource_inputs',
+                    'native_windows_config', 'verify_resource_copies', 'run_tauri', 'cargo_app_identity', 'compiled_app', 'assemble_carriers'},
         'capture': {'release_arguments', 'capture_context', 'cargo_output', 'release_event'},
+        'capture_context': {'cargo_context', 'verify_resource_copies', 'native_windows_config', 'verified_sources'},
+        'copy_resource_inputs': {'native_windows_config', 'verify_resource_copies'},
         'assemble': {'load_state', 'cargo_app_identity', 'compiled_app', 'exact', 'zip_inventory'},
         'release_event': {'cargo_app_identity'},
         'assemble_carriers': {'tauri_identity', 'verify_generated_script', 'nsis_inventory', 'carrier_inventory', 'build_portable', 'zip_inventory', 'cargo_app_identity'},
@@ -665,6 +669,13 @@ class Integrity(unittest.TestCase):
                 source.replace('            app_path, app = compiled_app(root, staging=Path(stage), state=state)',
                                "            app_path, app = None, b'unchecked'"),
                 source.replace('    cli = tauri_identity(root)', "    cli = {'entry': 'fake', 'version': 'unchecked'}"),
+                source.replace('        stage = owned.enter_context(native_resource_stage(root, state))',
+                               "        stage = Path(state['owner'])"),
+                source.replace('        copies = copy_resource_inputs(root, state, stage, owned)', '        copies = {}'),
+                source.replace('        config_value = native_windows_config(root, stage)', '        config_value = {}'),
+                source.replace('    expected_config = native_windows_config(root, Path(copies[\'root\']))',
+                               '    expected_config = {}'),
+                source.replace('    verify_resource_copies(root, state, copies)\n', '    None\n'),
                 source.replace('    zip_inventory(destination, expected)\n', '    # actual final ZIP check removed\n'),
                 source.replace('        exact(actual, expected)\n', '        # full ZIP comparison removed\n'),
                 source.replace("require_legal_resources(resources)", "None  # mandatory legal registration removed"),
@@ -1255,6 +1266,18 @@ class WindowsLongPaths(unittest.TestCase):
                 self.assertEqual(self.native(owner / 'previous-nsis/old.exe').read_bytes(), b'old')
                 self.assertEqual(self.native(owner / 'previous-dist-win/old.exe').read_bytes(), b'old')
 
+    def test_native_long_source_uses_short_same_anchor_stage_and_fixed_relative_keys(self):
+        with self.deep_directory() as (root, native):
+            self.fixture(native)
+            resources, _ = w.source_inventory(root)
+            with w.native_resource_stage(root, {'resources': resources}) as stage:
+                self.assertEqual(stage.anchor.casefold(), root.anchor.casefold())
+                self.assertLess(len(str(stage).encode('utf-16-le')) // 2, 260)
+                for index, source in enumerate(w.native_windows_config(root, stage)['bundle']['resources']):
+                    self.assertFalse(Path(source).anchor)
+                    self.assertEqual(w.resource_source_path(root, stage, source), stage / str(index))
+                    self.assertEqual(Path(os.path.abspath(root / 'src-tauri' / source)), stage / str(index))
+
     def test_native_long_inert_nsis_extraction_output(self):
         with self.deep_directory() as (root, native):
             (native / 'inert.exe').write_bytes(b'inert archive')
@@ -1632,13 +1655,16 @@ class CargoContexts(unittest.TestCase):
                 w.prepare(root); owner = next((root / 'target/release').glob('.polaris-package-*'))
                 os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(owner / 'state.json'); state = w.load_state(root)
                 original = json.loads((root / 'src-tauri/tauri.windows.conf.json').read_bytes())
-                with tempfile.TemporaryDirectory(prefix='r-') as tmp_stage, ExitStack() as owned:
-                    stage = Path(tmp_stage); copies = w.copy_resource_inputs(root, state, stage, owned)
+                with w.native_resource_stage(root, state) as stage, ExitStack() as owned:
+                    copies = w.copy_resource_inputs(root, state, stage, owned)
                     actual = w.native_windows_config(root, stage); mapping = actual['bundle']['resources']
                     self.assertEqual(len(mapping), len(original['bundle']['resources']))
                     self.assertEqual(set(mapping.values()), {x.replace('../', '_up_/', 1).rstrip('/') for x in original['bundle']['resources']})
                     for index, entry in enumerate(original['bundle']['resources']):
-                        self.assertEqual(mapping[str(stage / str(index))], entry.replace('../', '_up_/', 1).rstrip('/'))
+                        source = w.resource_source_key(root / 'src-tauri', stage / str(index))
+                        self.assertFalse(Path(source).anchor)
+                        self.assertEqual(mapping[source], entry.replace('../', '_up_/', 1).rstrip('/'))
+                        self.assertEqual(w.resource_source_path(root, stage, source), stage / str(index))
                     self.assertEqual(set(copies['members']), set(state['sources']))
                     for name, row in copies['members'].items():
                         self.assertFalse(Path(row['path']).samefile(state['sources'][name]))
@@ -1653,6 +1679,58 @@ class CargoContexts(unittest.TestCase):
                                      {k:v for k,v in original['bundle'].items() if k != 'resources'})
                     self.assertEqual({k:v for k,v in actual.items() if k != 'bundle'},
                                      {k:v for k,v in original.items() if k != 'bundle'})
+
+    def test_resource_keys_reject_foreign_drives_and_shares_without_rooted_fallback(self):
+        consumer = PureWindowsPath('D:/a/Polaris/Polaris/src-tauri')
+        for physical in [PureWindowsPath('C:/Users/runner/Temp/r-owned/0'),
+                         PureWindowsPath('//server/share/r-owned/0')]:
+            with self.subTest(physical=physical), self.assertRaisesRegex(ValueError, 'drive/share anchor'):
+                w.resource_source_key(consumer, physical)
+        for base, physical in [(consumer, PureWindowsPath('D:/a/r-owned/0')),
+                               (PureWindowsPath('//server/share/app/src-tauri'),
+                                PureWindowsPath('//server/share/r-owned/0'))]:
+            source = w.resource_source_key(base, physical)
+            self.assertFalse(PureWindowsPath(source).anchor)
+            self.assertNotIn('*', source); self.assertNotIn('?', source)
+            self.assertEqual(ntpath.normpath(ntpath.join(str(base), source)), str(physical))
+        with self.assertRaisesRegex(ValueError, 'drive/share anchor'):
+            w.resource_source_key(PureWindowsPath('//server/share/app/src-tauri'),
+                                  PureWindowsPath('//server/other/r-owned/0'))
+
+    def test_owned_stage_ignores_foreign_temp_and_sources_use_only_the_cargo_consumer_base(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp); root = parent / 'source with space'; root.mkdir()
+            self.fixture(root)
+            with self.cargo(root, root / 'target'):
+                w.prepare(root); owner = next((root / 'target/release').glob('.polaris-package-*'))
+                os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(owner / 'state.json'); state = w.load_state(root)
+                # The physical stage must be chosen from source ancestors even
+                # when the ordinary TEMP accessor would point at another drive.
+                with patch.object(w.tempfile, 'gettempdir', side_effect=AssertionError('foreign TEMP selected')):
+                    with w.native_resource_stage(root, state) as stage, ExitStack() as owned:
+                        self.assertEqual(stage.parent, parent)
+                        # Caller cwd and the generated config's owner directory
+                        # are both different from the actual Cargo/Tauri base.
+                        with patch.object(w.os, 'getcwd', return_value=str(owner)):
+                            copies = w.copy_resource_inputs(root, state, stage, owned)
+                            w.verify_resource_copies(root, state, copies)
+                        for source in w.native_windows_config(root, stage)['bundle']['resources']:
+                            physical = w.resource_source_path(root, stage, source)
+                            self.assertEqual(Path(os.path.abspath(root / 'src-tauri' / source)), physical)
+                            self.assertNotEqual(Path(os.path.abspath(owner / source)), physical)
+                            self.assertTrue(w.io_path(physical).exists())
+                        for source in [str(stage / '0'), '../outside/0', 'C:relative', '/rooted/0']:
+                            with self.subTest(source=source), self.assertRaises(ValueError):
+                                w.resource_source_path(root, stage, source)
+                        member = copies['members']['core-manifest.json']
+                        self.assertEqual(w.facts(member['path']), state['resources']['core-manifest.json'])
+                        self.assertTrue(Path(member['path']).is_absolute())
+                        retained = stage
+                self.assertFalse(w.io_path(retained).exists(), 'owned stage must be retired after its handles')
+                with patch.object(w.tempfile, 'TemporaryDirectory', side_effect=PermissionError('inert denied ancestor')):
+                    with self.assertRaisesRegex(ValueError, 'no short writable native resource stage'):
+                        with w.native_resource_stage(root, state):
+                            self.fail('no stage was allocated')
 
     def test_derived_resources_reject_corruption_alias_extra_and_source_replacement(self):
         for fault in ['bad hash', 'copy hardlink', 'extra member', 'source replacement']:

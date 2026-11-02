@@ -422,9 +422,9 @@ fn host_dns_restart_fixture() -> (
     Value,
 ) {
     let (rt, dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
-    let mut raw = serde_json::to_value(UserConfig::default()).unwrap();
+    let mut raw = polaris_store::default_config();
     raw["proxyModeType"] = "tun".into();
-    raw["dnsConfig"] = json!({"takeoverSystemDns":true});
+    raw["dnsConfig"]["takeoverSystemDns"] = true.into();
     rt.config.save_full(&raw).unwrap();
     let running = rt.config.current().unwrap();
     let generation = rt.bump_generation();

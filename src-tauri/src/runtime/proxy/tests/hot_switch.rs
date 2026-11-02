@@ -70,6 +70,26 @@ async fn saved_host_dns_changes_stay_pending_without_accepting_raw_r() {
 async fn selected_only_switch_keeps_saved_host_dns_debt_out_of_r() {
     for platform in [Platform::Mac, Platform::Linux] {
         let (rt, _dir, sink, running) = host_dns_fixture(platform, true);
+        let previous: UserConfig = serde_json::from_value(running.clone()).unwrap();
+        let mut selected = previous.clone();
+        selected.selected_server_id = Some("node-b".into());
+        // Startup plans all hot-switchable roots before TUN owns the routes.
+        // This fixture only seeded active A; include B's captured planning fact.
+        let target_roots =
+            crate::runtime::route_binding::automatic_runtime_binding_root_ids(&selected);
+        assert!(target_roots.contains("node-b"));
+        {
+            let mut binding = rt.runtime_binding_state.lock().unwrap();
+            assert!(binding.plan.covered_roots.contains("node-a"));
+            binding.plan.covered_roots.extend(target_roots);
+            assert!(
+                crate::runtime::route_binding::runtime_binding_targets_reusable(
+                    &previous,
+                    &selected,
+                    &binding.plan,
+                )
+            );
+        }
         let mut disk = running.clone();
         disk["dnsConfig"]["takeoverSystemDns"] = false.into();
         disk["selectedServerId"] = "node-b".into();
