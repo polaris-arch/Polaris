@@ -332,7 +332,26 @@ test('Windows maintenance anchor is bin-only and does not create a helper self-h
   assert.ok(!lib.includes('option_env!'));
   assert.ok(installer.includes('anchor.admits(&request)'));
   assert.ok(!installer.includes('std::env::var("POLARIS_WINDOWS_INSTALL_ANCHOR")'));
-  assert.ok(prepare.includes('verifiedCandidateSource(root)'));
+  const checkSourceProjection = source => {
+    assert.match(source, /^  const \{source,rows\} = verifiedCandidateSource\(root,\{includeInstallationRows:true\}\), binding = loadCandidate\(root\);$/m);
+    assert.match(source, /^  candidateBuildSelection\(source, root, platform, directory\);$/m);
+    assert.match(source, /^  contract = candidateInstallationContract\(binding, source.bindingSha256, rows\);$/m);
+    const verified = source.indexOf('  const {source,rows} = verifiedCandidateSource(');
+    const selected = source.indexOf('  candidateBuildSelection(source, root, platform, directory);');
+    const contract = source.indexOf('  contract = candidateInstallationContract(binding, source.bindingSha256, rows);');
+    assert.ok(verified >= 0 && verified < selected && selected < contract);
+  };
+  checkSourceProjection(prepare);
+  for (const [before, after] of [
+    ['includeInstallationRows:true', 'includeInstallationRows:false'],
+    ['verifiedCandidateSource(root,', 'verifiedCandidateSource(directory,'],
+    ['candidateBuildSelection(source, root, platform, directory);', 'candidateBuildSelection(source, directory, platform, directory);'],
+    ['candidateInstallationContract(binding, source.bindingSha256, rows)', 'candidateInstallationContract(binding, source.bindingSha256, unverifiedRows)'],
+  ]) {
+    const changed = prepare.replace(before, after);
+    assert.notEqual(changed, prepare);
+    assert.throws(() => checkSourceProjection(changed), assert.AssertionError);
+  }
   assert.ok(prepare.includes('verifyPackagedRelease(root, input, platform'));
   assert.ok(prepare.includes("actualCoreFile(resolve(flags.get('helper-binary')))"));
   const block = files.package.slice(files.package.indexOf('      - name: Build and stage privileged helper'));

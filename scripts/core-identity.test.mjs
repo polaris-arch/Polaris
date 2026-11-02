@@ -377,13 +377,22 @@ test('App check identity uses shared compiled inputs and retains its Linux x86_6
   const selected = sourceText('../crates/core-supervisor/src/selected_core.rs');
   const caller = sourceText('../src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs');
   const cfg = '#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]';
-  const declaration = '#[cfg(test)]\npub(crate) use polaris_core_supervisor::selected_core::selected_check_source;';
+  const declaration = '#[cfg(all(target_os = "linux", target_arch = "x86_64"))]\n#[cfg(test)]\npub(crate) use polaris_core_supervisor::selected_core::selected_check_source;';
+  const sourceDeclaration = 'pub(crate) fn selected_source_commit(';
+  const itemAttributes = (source, item) => {
+    const code = rustMask(source), at = code.indexOf(item);
+    assert.ok(at >= 0, `missing actual Rust item: ${item}`);
+    assert.equal(code.indexOf(item, at + item.length), -1, `duplicate Rust item: ${item}`);
+    return rustMask(source, false).slice(0, at).match(/(?:^|\n)((?:#\[[^\n]*\]\n)*)$/)?.[1] ?? '';
+  };
   const check = (source, shared = selected, actualCaller = caller) => {
-    assert.ok(source.includes(declaration), 'App check identity must re-export the exact shared provider only in tests');
+    assert.ok(source.includes(declaration), 'App check identity must re-export the exact shared provider only in Linux x86_64 tests');
     const functionAt = source.indexOf('pub(crate) use polaris_core_supervisor::selected_core::selected_check_source;');
     const attributes = source.slice(source.lastIndexOf('\n\n', functionAt) + 2, functionAt);
     assert.doesNotMatch(attributes, /#\[(?:allow|expect)\(dead_code\)\]/);
-    assert.ok(source.includes('#[cfg(any(windows, test))]\npub(crate) fn selected_source_commit('));
+    assert.equal(itemAttributes(source, 'pub(crate) use polaris_core_supervisor::selected_core::selected_check_source;'),
+      declaration.slice(0, declaration.indexOf('pub(crate)')));
+    assert.equal(itemAttributes(source, sourceDeclaration), '', 'real desktop TLS selection requires the portable production wrapper');
     const wrapper = rustMask(rustFunction(source, 'selected_source_commit'));
     assert.match(wrapper, /check_compiled_selection\(\)\?;\s*polaris_core_supervisor::selected_core::selected_source_commit\(platform\)/);
     const provider = rustMask(rustFunction(shared, 'selected_check_source'));
@@ -416,8 +425,8 @@ test('App check identity uses shared compiled inputs and retains its Linux x86_6
     assert.notEqual(changed, caller);
     assert.throws(() => check(runtime, selected, changed));
   }
-  for (const replacement of ['', cfg + '\n', '#[allow(dead_code)]\n#[cfg(test)]\n']) {
-    const changed = runtime.replace(declaration, replacement + declaration.slice('#[cfg(test)]\n'.length));
+  for (const replacement of ['', '#[cfg(test)]\n', cfg + '\n', '#[allow(dead_code)]\n' + declaration.slice(0, declaration.indexOf('pub(crate)'))]) {
+    const changed = runtime.replace(declaration, replacement + declaration.slice(declaration.indexOf('pub(crate)')));
     assert.notEqual(changed, runtime);
     assert.throws(() => check(changed));
   }
@@ -430,6 +439,9 @@ test('App check identity uses shared compiled inputs and retains its Linux x86_6
     const changed = selected.replace(before, after); assert.notEqual(changed, selected);
     assert.throws(() => check(runtime, changed));
   }
-  const narrowed = runtime.replace('#[cfg(any(windows, test))]\npub(crate) fn selected_source_commit(', `${cfg}\npub(crate) fn selected_source_commit(`);
-  assert.throws(() => check(narrowed), 'portable/Windows helper coverage must not be narrowed with the Linux-only helper');
+  for (const attribute of ['#[cfg(any(windows, test))]', cfg, '#[cfg(feature = "native-production-verification")]']) {
+    const narrowed = runtime.replace(sourceDeclaration, `${attribute}\n${sourceDeclaration}`);
+    assert.notEqual(narrowed, runtime);
+    assert.throws(() => check(narrowed), 'portable production selection must not be narrowed to a helper or verification build');
+  }
 });

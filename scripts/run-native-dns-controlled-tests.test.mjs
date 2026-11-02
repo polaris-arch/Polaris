@@ -83,7 +83,13 @@ test('exact one-test verdict rejects zero, ignored, failed, duplicated and inter
   const names = [...workflow.matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
   assert.deepEqual(names, TESTS);
   const runner = readFileSync(new URL('./run-native-dns-controlled-tests.mjs', import.meta.url), 'utf8');
-  assert.equal((runner.match(/'--no-run'/g) ?? []).length, 2);
+  assert.equal((runner.match(/'--no-run'/g) ?? []).length, 1);
+  const ordinary = runner.slice(runner.indexOf('\nasync function runContractSuite('), runner.indexOf('\nasync function main()'));
+  const native = runner.slice(runner.indexOf('\nasync function main()'));
+  assert.match(ordinary, /^      args: \['test', '--locked', '-p', packageName, '--lib', '--no-run', '--message-format=json'\] \},$/m);
+  assert.match(native, /^    args: \['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'\] \},$/m);
+  assert.match(native, /^  const selected = selectNativeExecutable\(messages, metadata, root\);$/m);
+  assert.match(native, /^  await runTests\(selected, env, directory\);$/m);
   assert.match(runner, /root: dirname\(selected.manifest\)/);
   for (const [start, end] of [['export async function runTests(', 'export function contractGroups('], ['export async function runContractTests(', 'async function runContractSuite(']]) {
     const body = runner.slice(runner.indexOf(start), runner.indexOf(end));
@@ -159,7 +165,11 @@ test('six exact isolated cases aggregate business and graph failures only after 
       if (['pass', 'polluted-output'].includes(mode)) await run;
       else if (['ordinary-failure', 'bad-graph', 'stderr-graph'].includes(mode))
         await assert.rejects(run, /Controlled business\/evidence failures after confirmed cleanup/);
-      else if (['zero', 'stderr-pass', 'bad-graph-count'].includes(mode)) await assert.rejects(run, /did not execute exactly one reviewed test/);
+      else if (['zero', 'stderr-pass', 'bad-graph-count'].includes(mode)) await assert.rejects(run, error => {
+        const name = mode === 'bad-graph-count' ? TESTS[2] : TESTS[0];
+        assert.equal(error.message, `Controlled invocation did not execute exactly one reviewed case: ${name}`);
+        return true;
+      });
       else if (mode === 'bad-graph-cleanup') await assert.rejects(run, /owned-child cleanup is unconfirmed/);
       else await assert.rejects(run);
       const expectedCalls = ['pass', 'ordinary-failure', 'bad-graph', 'stderr-graph', 'polluted-output'].includes(mode) ? 6
@@ -310,10 +320,17 @@ test('80516-byte production graph survives stderr interleaving in the human comb
 });
 
 
-test('ordinary source suites retain thirty unique reviewed names and build groups', () => {
-  assert.equal(BOOTSTRAP_TESTS.length, 2); assert.equal(SOURCE_TESTS.length, 28);
-  assert.equal(new Set([...BOOTSTRAP_TESTS, ...SOURCE_TESTS]).size, 30);
+test('ordinary source suites retain thirty-three unique reviewed names and exact build groups', () => {
+  assert.equal(BOOTSTRAP_TESTS.length, 2); assert.equal(SOURCE_TESTS.length, 31);
+  assert.equal(new Set([...BOOTSTRAP_TESTS, ...SOURCE_TESTS]).size, 33);
   assert.equal(contractGroups(BOOTSTRAP_TESTS).size, 1); assert.equal(contractGroups(SOURCE_TESTS).size, 4);
+  assert.deepEqual(Object.fromEntries([...contractGroups(SOURCE_TESTS)].map(([pkg, names]) => [pkg, names.length])), {
+    polaris: 16, 'polaris-store': 2, 'polaris-config-engine': 6, 'polaris-net-stack': 7,
+  });
+  assert.deepEqual([...contractGroups(BOOTSTRAP_TESTS)], [['polaris-helper-client', [
+    'manager::tests::bootstrap_identity::bootstrap_identity_render_is_platform_specific',
+    'manager::tests::bootstrap_identity::native_bootstrap_descriptor_identity',
+  ]]]);
   assert.throws(() => contractGroups([...SOURCE_TESTS]));
   const wf = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   assert.equal((wf.match(/run-native-dns-controlled-tests.mjs --bootstrap-contracts/g) ?? []).length, 1);
@@ -373,9 +390,15 @@ test('native acceptance selects only the explicit normal-library binary artifact
   const metadata={target_directory:join(root,'target'),packages:[{id:'app',name:'polaris',manifest_path:join(root,'src-tauri/Cargo.toml'),targets:[target]}]};
   const row={reason:'compiler-artifact',package_id:'app',profile:{test:false},target,executable,features:['native-production-verification']};
   assert.equal(selectNativeExecutable([row],metadata,root).carrier,'normal-production-library');
-  for(const rows of [[{...row,profile:{test:true}}],[{...row,features:[]}],[row,row],[{...row,target:{...target,src_path:join(root,'other.rs')}}]]){
+  for(const rows of [[{...row,profile:{test:true}}],[{...row,features:[]}],[row,row],[{...row,target:{...target,src_path:join(root,'other.rs')}}],
+    [{...row,package_id:'stale-app'}],[{...row,executable:null}],[{...row,executable:'relative-verifier'}]]){
    assert.throws(()=>selectNativeExecutable(rows,metadata,root));
   }
+  const outside=join(root,'outside-verifier');writeFileSync(outside,'outside target');
+  assert.throws(()=>selectNativeExecutable([{...row,executable:outside}],metadata,root));
+  const alias=join(root,'target/debug/verifier-alias');symlinkSync(executable,alias,process.platform==='win32'?'file':undefined);
+  assert.throws(()=>selectNativeExecutable([{...row,executable:alias}],metadata,root));
+  assert.throws(()=>selectNativeExecutable([row],{...metadata,packages:[{...metadata.packages[0],manifest_path:join(root,'other/Cargo.toml')}]},root));
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('native result requires one exact case, actual PID, drained custody and normal carrier',()=>{
@@ -386,4 +409,112 @@ test('native result requires one exact case, actual PID, drained custody and nor
  assert.equal(exactNativePass(result({...record,result:'failed'}),name),false);
  assert.equal(exactNativePass({...result(record),timedOut:true},name),false);
  assert.equal(nativeCaseRecord({...result(record),stdout:result(record).stdout.repeat(2)},name),null);
+});
+
+const syntheticNativeResult = (name, failed = false) => ({
+  status: failed ? 1 : 0, processId: 70,
+  ...capturedStreams(`POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(syntheticCleanup(name))}\n`
+    + (name === TESTS[2] ? `POLARIS_DEFAULT_GRAPH ${JSON.stringify(syntheticGraph())}\n` : '')
+    + `POLARIS_NATIVE_CASE ${JSON.stringify({ schema: 'polaris-native-production-case-v1', case: name,
+      processId: 70, result: failed ? 'failed' : 'passed', carrier: 'normal-production-library',
+      validationCustodyDrained: true, publicationEligible: false })}\n`),
+});
+
+test('normal-library orchestration enforces exact authority and cleanup before six-case business aggregation', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'native-processes-')));
+  try {
+    const executable = join(root, 'fixture'), manifest = join(root, 'Cargo.toml');
+    const digest = createHash('sha256').update('original').digest('hex');
+    const aggregateModes = ['pass', 'business-failure', 'status-failure', 'record-failure', 'bad-graph', 'missing-graph', 'stderr-graph', 'polluted-output'];
+    const recordMutations = {
+      'wrong-case': { case: TESTS[1] }, 'wrong-native-pid': { processId: 71 },
+      'wrong-carrier': { carrier: 'libtest' }, 'undrained': { validationCustodyDrained: false },
+      'publishable': { publicationEligible: true }, 'unknown-result': { result: 'unknown' },
+    };
+    for (const mode of [...aggregateModes, ...Object.keys(recordMutations), 'missing-case', 'duplicate-case', 'malformed-case',
+      'stderr-case', 'libtest-only', 'bad-graph-count', 'missing-cleanup', 'wrong-process', 'wrong-cleanup-test', 'stderr-cleanup',
+      'cleanup-uncertain', 'timeout', 'interrupted', 'error', 'output-only', 'drift', 'drift-before']) {
+      const directory = join(root, mode); mkdirSync(directory);
+      writeFileSync(executable, mode === 'drift-before' ? 'changed' : 'original');
+      const selected = { executable, manifest, sha256: digest, carrier: 'normal-production-library' };
+      const calls = [];
+      const run = runTests(selected, { FROZEN: 'yes' }, directory, async (command, options) => {
+        calls.push(command);
+        assert.equal(options.root, root); assert.equal(options.env.FROZEN, 'yes');
+        assert.equal(options.timeout, 20 * 60_000);
+        const name = command.args[0], result = syntheticNativeResult(name, mode === 'business-failure');
+        const changeNative = patch => {
+          const record = JSON.parse(result.stdout.match(/^POLARIS_NATIVE_CASE ([^\n]+)$/m)[1]);
+          Object.assign(result, withStdout(result, result.stdout.replace(/^POLARIS_NATIVE_CASE [^\n]+\n/m,
+            `POLARIS_NATIVE_CASE ${JSON.stringify({ ...record, ...patch })}\n`)));
+        };
+        if (recordMutations[mode]) changeNative(recordMutations[mode]);
+        if (mode === 'status-failure') result.status = 1;
+        if (mode === 'record-failure') changeNative({ result: 'failed' });
+        if (mode === 'missing-case' || (mode === 'bad-graph-count' && name === TESTS[2]))
+          Object.assign(result, withStdout(result, result.stdout.replace(/^POLARIS_NATIVE_CASE [^\n]+\n/m, '')));
+        if (mode === 'duplicate-case') Object.assign(result, withStdout(result,
+          result.stdout + result.stdout.match(/^POLARIS_NATIVE_CASE [^\n]+\n/m)[0]));
+        if (mode === 'malformed-case') Object.assign(result, withStdout(result,
+          result.stdout.replace(/^POLARIS_NATIVE_CASE [^\n]+\n/m, 'POLARIS_NATIVE_CASE {broken-json}\n')));
+        if (mode === 'libtest-only') Object.assign(result, withStdout(result,
+          result.stdout.replace(/^POLARIS_NATIVE_CASE [^\n]+\n/m, 'test result: ok. 1 passed; 0 failed; 0 ignored;\n')));
+        if (mode === 'stderr-case') {
+          const line = result.stdout.match(/^POLARIS_NATIVE_CASE [^\n]+\n/m)[0];
+          Object.assign(result, capturedStreams(result.stdout.replace(line, ''), line));
+        }
+        if (['bad-graph', 'missing-graph', 'stderr-graph', 'bad-graph-count'].includes(mode) && name === TESTS[2]) {
+          const line = result.stdout.match(/^POLARIS_DEFAULT_GRAPH [^\n]+\n/m)[0];
+          Object.assign(result, capturedStreams(result.stdout.replace(line,
+            mode === 'bad-graph' || mode === 'bad-graph-count' ? 'POLARIS_DEFAULT_GRAPH {broken-json}\n' : ''),
+          mode === 'stderr-graph' ? line : ''));
+        }
+        if (mode === 'missing-cleanup') Object.assign(result, withStdout(result,
+          result.stdout.replace(/^POLARIS_CONTROLLED_CLEANUP [^\n]+\n/m, '')));
+        if (mode === 'wrong-process') result.processId = 71;
+        if (mode === 'wrong-cleanup-test') Object.assign(result, withStdout(result,
+          result.stdout.replace(`"testName":"${name}"`, `"testName":"${TESTS[1]}"`)));
+        if (mode === 'stderr-cleanup') {
+          const line = result.stdout.match(/^POLARIS_CONTROLLED_CLEANUP [^\n]+\n/m)[0];
+          Object.assign(result, capturedStreams(result.stdout.replace(line, ''), line));
+        }
+        if (mode === 'cleanup-uncertain') result.cleanupUncertain = true;
+        if (mode === 'timeout') result.timedOut = true;
+        if (mode === 'interrupted') result.interrupted = true;
+        if (mode === 'error') result.error = 'failed to execute';
+        if (mode === 'polluted-output') {
+          Object.assign(result, capturedStreams(result.stdout, result.stdout));
+          result.output = 'untrusted interleaved diagnostics\n' + result.stdout + result.stderr;
+        }
+        if (mode === 'output-only') return { status: result.status, processId: result.processId, output: result.output };
+        if (mode === 'drift') writeFileSync(executable, 'changed');
+        return result;
+      });
+      if (['pass', 'polluted-output'].includes(mode)) await run;
+      else if (aggregateModes.includes(mode)) await assert.rejects(run, /Controlled business\/evidence failures after confirmed cleanup/);
+      else if (Object.hasOwn(recordMutations, mode) || ['missing-case', 'duplicate-case', 'malformed-case', 'stderr-case', 'libtest-only', 'bad-graph-count'].includes(mode))
+        await assert.rejects(run, error => {
+          assert.equal(error.message, `Controlled invocation did not execute exactly one reviewed case: ${mode === 'bad-graph-count' ? TESTS[2] : TESTS[0]}`);
+          return true;
+        });
+      else await assert.rejects(run);
+      const expectedCalls = aggregateModes.includes(mode) ? 6 : mode === 'bad-graph-count' ? 3 : mode === 'drift-before' ? 0 : 1;
+      assert.equal(calls.length, expectedCalls, mode);
+      assert.ok(calls.every((command, at) => command.program === executable && command.args.length === 1 && command.args[0] === TESTS[at]), mode);
+      if (calls.length === 6) {
+        assert.deepEqual(calls.map(command => command.args[0]), TESTS);
+        const status = readFileSync(join(directory, 'runtime-status.txt'), 'utf8');
+        assert.equal((status.match(/: started\n/g) ?? []).length, 6);
+        assert.equal((status.match(/: (?:passed|failed; owned-child cleanup confirmed[^\n]*)\n/g) ?? []).length, 6);
+        if (['business-failure', 'status-failure', 'record-failure'].includes(mode))
+          assert.equal((status.match(/failed; owned-child cleanup confirmed/g) ?? []).length, 6);
+        if (['bad-graph', 'missing-graph', 'stderr-graph'].includes(mode)) {
+          assert.ok(status.includes(`${TESTS[2]}: failed; owned-child cleanup confirmed`));
+          for (const name of TESTS.slice(3)) assert.ok(status.includes(`${name}: passed\n`));
+        }
+      }
+      if (['bad-graph', 'missing-graph', 'stderr-graph', 'bad-graph-count'].includes(mode))
+        assert.ok(!readdirSync(directory).includes('default-production-graph.json'));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

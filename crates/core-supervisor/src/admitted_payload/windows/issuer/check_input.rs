@@ -148,7 +148,7 @@ impl CheckSnapshot {
             return Ok(());
         }
         self.current()?;
-        let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
         let f = self.file.as_ref().ok_or_else(unavailable)?;
         check(unsafe {
             SetFileInformationByHandle(

@@ -82,12 +82,61 @@ class SourceArchiveTests(unittest.TestCase):
                 [{'path': 'client', 'sha': GITLINK}] if links is None else links, source, linked)
 
     def test_trusted_profile_is_bound_to_the_committed_formal_source_without_a_path_override(self):
-        selected=json.loads(Path(archive.__file__).with_name('release-contract.json').read_text())
+        selected=json.loads(Path(archive.__file__).with_name('release-contract.json').read_text(encoding='utf-8'))
         request={key:selected[key] for key in ('sourceCommit','sourceTree','sourceArchive')}
         request.update(trustedSourceSelection='formal',trustedProducer=selected['producer'])
         archive._trusted_consumer_selection(request)
         for delta in ({'trustedSourceSelection':'/tmp/arbitrary-source'}, {'sourceCommit':'0'*40}, {'trustedProducer':{}}):
             with self.assertRaises(ValueError):archive._trusted_consumer_selection(dict(request,**delta))
+
+    def test_fixed_trusted_selections_read_strict_utf8_with_windows_legacy_default(self):
+        directory = Path(archive.__file__).resolve().parent
+        names = ('release-contract.json', 'native-dns-candidate.json', 'native-dns-source-binding.json')
+        raw_inputs = {directory / name: (directory / name).read_bytes() for name in names}
+        records = {name: json.loads(raw_inputs[directory / name]) for name in names}
+        # Candidate pins are currently ASCII. Inert in-memory text makes both
+        # candidate reads exercise UTF-8 without rewriting any committed input.
+        for name in names[1:]:
+            raw_inputs[directory / name] = json.dumps(
+                {**records[name], 'utf8Control': '\u4e2d\u6587\u201d'}, ensure_ascii=False).encode('utf-8')
+        for raw in raw_inputs.values():
+            with self.assertRaises(UnicodeDecodeError):
+                raw.decode('cp1252')
+        original_read_text = Path.read_text
+        observed = []
+
+        def windows_default_read_text(path, encoding=None, errors=None, **kwargs):
+            observed.append((path, encoding, errors))
+            if path in raw_inputs:
+                return raw_inputs[path].decode(encoding or 'cp1252', errors or 'strict')
+            return original_read_text(path, encoding=encoding or 'cp1252', errors=errors, **kwargs)
+
+        with patch.object(Path, 'read_text', windows_default_read_text):
+            for domain, selected_name, source_name in (
+                    ('formal', names[0], names[0]), ('candidate', names[1], names[2])):
+                selected, source = records[selected_name], records[source_name]
+                request = {key: source[key] for key in ('sourceCommit', 'sourceTree', 'sourceArchive')}
+                request.update(trustedSourceSelection=domain, trustedProducer=selected['producer'])
+                expected_paths = [directory / selected_name]
+                if domain == 'candidate':
+                    expected_paths.append(directory / source_name)
+                with self.subTest(domain=domain):
+                    observed.clear()
+                    archive._trusted_consumer_selection(request)
+                    self.assertEqual(observed, [(path, 'utf-8', None) for path in expected_paths])
+                    for delta in ({'trustedSourceSelection': '/tmp/arbitrary-source'},
+                                  {'sourceCommit': '0' * 40}, {'sourceTree': '0' * 40},
+                                  {'sourceArchive': {}}, {'trustedProducer': {}}):
+                        with self.subTest(delta=delta), self.assertRaises(ValueError):
+                            archive._trusted_consumer_selection(dict(request, **delta))
+                    for path in expected_paths:
+                        original = raw_inputs[path]
+                        try:
+                            raw_inputs[path] = original + b'\xff'
+                            with self.subTest(invalid_utf8=path.name), self.assertRaises(UnicodeDecodeError):
+                                archive._trusted_consumer_selection(request)
+                        finally:
+                            raw_inputs[path] = original
 
     def test_verified_bytes_survive_archive_replacement_at_the_validator_phase_boundary(self):
         data,pin,tree,source,linked=self.fixture()

@@ -262,9 +262,9 @@ def _trusted_consumer_selection(request):
     directory = app_root / 'scripts/desktop-core'
     domain = request.get('trustedSourceSelection')
     require(domain in ('formal','candidate'), 'closed trusted source selection required')
-    selected = json.loads((directory / ('release-contract.json' if domain == 'formal' else 'native-dns-candidate.json')).read_text())
+    selected = json.loads((directory / ('release-contract.json' if domain == 'formal' else 'native-dns-candidate.json')).read_text(encoding='utf-8'))
     require(selected.get('repository') == 'polaris-arch/sing-box-polaris' and selected.get('repositoryId') == 1421657509, 'trusted source repository differs')
-    source = selected if domain == 'formal' else json.loads((directory / 'native-dns-source-binding.json').read_text())
+    source = selected if domain == 'formal' else json.loads((directory / 'native-dns-source-binding.json').read_text(encoding='utf-8'))
     require(all(selected.get(key) == source.get(key) for key in ('sourceCommit','sourceTree')), 'trusted committed source pins disagree')
     require(all(request.get(key) == source.get(key) for key in ('sourceCommit','sourceTree','sourceArchive')),
             'trusted source archive is not the fixed committed source selection')

@@ -252,9 +252,31 @@ function assertCandidateOnlySteps(ci, controlled) {
   assert.ok(runtime.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"'));
   assert.match(runtime, /node --test scripts\/native-dns-ci-routing\.test\.mjs/);
   assert.match(runtime, /scripts\/run-native-dns-controlled-tests\.test\.mjs/);
-  assert.ok(controlled.includes("args: ['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json']"));
-  assert.equal((controlled.match(/'--no-run'/g) ?? []).length, 2);
-  assert.ok(controlled.includes("args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1']"));
+  const body = (start, end) => {
+    assert.equal(controlled.split(start).length, 2, `one actual runner boundary: ${start}`);
+    const tail = controlled.split(start)[1];
+    assert.ok(tail.includes(end), `missing runner boundary: ${end}`);
+    return tail.slice(0, tail.indexOf(end));
+  };
+  const main = body('\nasync function main() {\n', '\nif (process.argv[1]');
+  const ordinary = body('\nasync function runContractSuite(specs, root) {\n', '\nasync function main() {');
+  const cases = body('\nexport async function runTests(', '\nexport function contractGroups(');
+  assert.match(main, /^  const prepared = await executeCommand\(\{ id: 'controlled-build', program: 'cargo',$/m);
+  assert.match(main, /^    args: \['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'\] \},$/m);
+  assert.match(main, /^  const selected = selectNativeExecutable\(messages, metadata, root\);$/m);
+  assert.match(main, /^  selected\.sha256 = hash\(selected\.executable\);$/m);
+  assert.match(main, /^  writeFileSync\(join\(directory, 'controlled-executable\.json'\), JSON\.stringify\(\{ \.\.\.selected, preparationCalls: 1 \}/m);
+  assert.match(main, /^  const env = runtimeEnvironment\(messages, resolve\(metadata.target_directory\), selected.executable, sysroot\);$/m);
+  assert.match(main, /^  await runTests\(selected, env, directory\);$/m);
+  assert.doesNotMatch(main, /args: \['test'|--no-run|--release|--no-default-features/);
+  assert.match(ordinary, /^      args: \['test', '--locked', '-p', packageName, '--lib', '--no-run', '--message-format=json'\] \},$/m);
+  assert.match(ordinary, /^    const selected = selectExecutable\(messages, metadata, root, packageName\);$/m);
+  assert.match(ordinary, /^    await runContractTests\(selected, names, env, directory\);$/m);
+  assert.equal((controlled.match(/'--no-run'/g) ?? []).length, 1);
+  assert.match(cases, /^      args: selected\.carrier === 'normal-production-library' \? \[name\] : \[name, '--exact', '--ignored', '--nocapture', '--test-threads=1'\] \},$/m);
+  assert.match(cases, /demand\(confirmedCleanup\(result, name\),/);
+  assert.match(cases, /demand\(selected\.carrier === 'normal-production-library' \? nativeCaseRecord\(result,name\) : oneExecutedTest\(result\),/);
+  assert.match(cases, /selected\.carrier === 'normal-production-library' \? exactNativePass\(result,name\) : exactPass\(result\)/);
   assert.match(controlled, /summaries\.length === 1/);
   assert.match(controlled, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
   assert.match(runtime, /!cancelled\(\)/);
@@ -270,14 +292,26 @@ for (const [name, source, before, after] of [
   ['helper build selector weakened', 'ci', 'cargo build --locked -p polaris-helper --bin polaris-helper', 'cargo build -p polaris-helper'],
   ['cleaner selector changed', 'ci', 'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner', 'cargo build --locked -p polaris-helper --bin polaris-helper'],
   ['controlled runner disconnected', 'ci', 'node scripts/run-native-dns-controlled-tests.mjs', 'node scripts/other.mjs'],
-  ['controlled build selector weakened', 'controlled', "'--lib', '--no-run'", "'--no-run'"],
+  ['normal build selector weakened', 'controlled', "args: ['build', '--locked', '-p', 'polaris'", "args: ['build', '-p', 'polaris'"],
+  ['normal feature removed', 'controlled', "'--features', 'native-production-verification', ", ''],
+  ['normal binary replaced', 'controlled', "'--bin', 'native-admission-verifier'", "'--bin', 'polaris'"],
+  ['normal artifact replaced with libtest', 'controlled', 'selectNativeExecutable(messages, metadata, root)', 'selectExecutable(messages, metadata, root)'],
+  ['normal executable hash omitted', 'controlled', 'selected.sha256 = hash(selected.executable);', 'selected.sha256 = unverifiedDigest;'],
+  ['normal execution disconnected', 'controlled', 'await runTests(selected, env, directory);', 'await otherTests(selected, env, directory);'],
+  ['ordinary library selector weakened', 'controlled', "'--lib', '--no-run'", "'--no-run'"],
+  ['normal invocation broadened', 'controlled', "? [name] : [name,", "? [name, '--all'] : [name,"],
   ['ignored tests broadened', 'controlled', "name, '--exact', '--ignored'", "name, '--ignored'"],
+  ['cleanup confirmation removed', 'controlled', 'demand(confirmedCleanup(result, name),', 'demand(true,'],
+  ['native authority record bypassed', 'controlled', '? nativeCaseRecord(result,name) : oneExecutedTest(result)', '? true : oneExecutedTest(result)'],
+  ['native business verdict bypassed', 'controlled', '? exactNativePass(result,name) : exactPass(result)', '? true : exactPass(result)'],
   ['zero-test evidence accepted', 'controlled', 'test result: ok. 1 passed; 0 failed; 0 ignored;', 'test result: ok.'],
   ['duplicated verdict accepted', 'controlled', 'summaries.length === 1', 'summaries.length >= 1'],
 ]) test(`candidate-only Cargo registration rejects ${name}`, () => {
   const fixture = loadStripped();
   assert.ok(fixture[source].includes(before));
-  fixture[source] = fixture[source].replaceAll(before, after);
+  const changed = fixture[source].replaceAll(before, after);
+  assert.notEqual(changed, fixture[source], 'negative control must change its actual producer or consumer');
+  fixture[source] = changed;
   assert.throws(() => assertCandidateOnlySteps(fixture.ci, fixture.controlled), { name: 'AssertionError' });
 });
 
@@ -725,17 +759,34 @@ const SUBSCRIPTION_NATIVE_TESTS = [
   "polaris-store:tests::store_tests::new_installation_uses_follow_and_preserves_explicit_saved_policies",
   "polaris:runtime::proxy::pending_changes::tests::global_utls_change_creates_runtime_debt_and_missing_restores_follow_projection"
 ];
+const NATIVE_CARRIER_SOURCE_TESTS = [
+  'polaris:runtime::proxy::tests::native_carrier::normal_native_carrier_preserves_all_six_original_business_assertion_sets',
+  'polaris:runtime::proxy::tests::startup::execution_issuer_does_not_enable_network_takeover_for_manual',
+  'polaris:runtime::tls_fingerprints::tests::authenticated_document_is_strict_data_and_cannot_replace_native_channel_binding',
+];
+function assertNativeSourceSelectors(selectors) {
+  assert.deepEqual(selectors, [...NATIVE_CARRIER_SOURCE_TESTS, ...SUBSCRIPTION_NATIVE_TESTS]);
+}
 function assertSubscriptionNative(ci) {
   const block = extractCiStepBlock(ci, CI_ONLY_SUBSCRIPTION_STEP);
   assert.ok(block.includes("runner.os == 'macOS' || runner.os == 'Linux'"));
   assert.ok(block.includes("needs.cheap_format.outputs.app_native_compile_only != 'true'"));
   assert.ok(block.includes('!cancelled()'));
   assert.ok(block.includes('run: node scripts/run-native-dns-controlled-tests.mjs --source-contracts'));
-  assert.deepEqual(SOURCE_TESTS, SUBSCRIPTION_NATIVE_TESTS);
+  assertNativeSourceSelectors(SOURCE_TESTS);
   assert.ok(!block.includes('sudo'));
 }
 test('subscription native gate preserves exact JSON URI edit ownership uTLS and actual wire selectors', () => {
   const { ci } = loadStripped(); assertSubscriptionNative(ci);
+  for (let at = 0; at < SOURCE_TESTS.length; at++) {
+    const omitted = SOURCE_TESTS.filter((_, index) => index !== at);
+    assert.notDeepEqual(omitted, SOURCE_TESTS);
+    assert.throws(() => assertNativeSourceSelectors(omitted), assert.AssertionError);
+    const renamed = SOURCE_TESTS.map((name, index) => index === at ? `${name}_unreviewed` : name);
+    assert.notDeepEqual(renamed, SOURCE_TESTS);
+    assert.throws(() => assertNativeSourceSelectors(renamed), assert.AssertionError);
+  }
+  assert.throws(() => assertNativeSourceSelectors([...SOURCE_TESTS, SOURCE_TESTS[0]]), assert.AssertionError);
   for (const original of ['--source-contracts', "runner.os == 'macOS'", '!cancelled()']) {
     const block = extractCiStepBlock(ci, CI_ONLY_SUBSCRIPTION_STEP);
     assert.throws(() => assertSubscriptionNative(ci.replace(block, block.replace(original, 'omitted'))), { name: 'AssertionError' });
