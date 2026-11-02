@@ -40,7 +40,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { maskRustComments } from './rust-source.test-support';
+import { maskRustComments, maskRustCommentsAndStrings } from './rust-source.test-support';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -172,8 +172,84 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
     expect(entry).toContain('polaris_lib::run_native_production_verification(&args[0]).await');
     const library = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/lib.rs'), 'utf8'));
     const proxy = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/runtime/proxy.rs'), 'utf8'));
-    expect(library).toMatch(/#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*pub async fn run_native_production_verification\(/);
-    expect(proxy).toMatch(/#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*#\[path = "\.\.\/native_verification\/proxy_carrier\.rs"\]\s*pub\(crate\) mod native_verification;/);
+    const carrier = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/native_verification/proxy_carrier.rs'), 'utf8'));
+    // Separate cfg attrs are an AND. All three parent guards, the local debug
+    // guard and the exact normal-library route are mandatory, never optional.
+    const guardedDefinitionIsUnique = (source: string, guard: RegExp, declaration: RegExp): boolean => {
+      // Both Rust masks preserve UTF-8 byte offsets. Compare byte-wide views so
+      // Unicode before a declaration cannot move the ownership comparison.
+      const visible = Buffer.from(source, 'utf8').toString('latin1');
+      const code = Buffer.from(maskRustCommentsAndStrings(source), 'utf8').toString('latin1');
+      const guarded = [...visible.matchAll(guard)];
+      const declared = [...code.matchAll(declaration)];
+      return guarded.length === 1 && declared.length === 1
+        && guarded[0].index + guarded[0][0].indexOf('pub') === declared[0].index;
+    };
+    const parentGuardMutations = [
+      ['#[cfg(desktop)]', ''],
+      ['#[cfg(desktop)]', '#[cfg(mobile)]'],
+      ['#[cfg(feature = "native-production-verification")]', ''],
+      ['#[cfg(feature = "native-production-verification")]', '#[cfg(feature = "unreviewed-native-feature")]'],
+      ['#[cfg(debug_assertions)]', ''],
+      ['#[cfg(debug_assertions)]', '#[cfg(not(debug_assertions))]'],
+    ] as const;
+    const guardedOwners = [
+      {
+        name: 'normal-library export', source: library,
+        guard: /^#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*#\[cfg\(debug_assertions\)\]\s*pub async fn run_native_production_verification\(case: &str\) -> Result<\(\), String> \{\s*runtime::proxy::native_verification::run_case\(case\)\.await\s*\}/gm,
+        declaration: /\bpub\s+async\s+fn\s+run_native_production_verification\s*\(/g,
+        mutations: [
+          ...parentGuardMutations,
+          ['pub async fn run_native_production_verification(', 'pub async fn unreviewed_native_verification('],
+          ['runtime::proxy::native_verification::run_case(case).await', 'runtime::proxy::native_verification::unreviewed_case(case).await'],
+        ],
+      },
+      {
+        name: 'normal-library carrier module', source: proxy,
+        guard: /^#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*#\[cfg\(debug_assertions\)\]\s*#\[path = "\.\.\/native_verification\/proxy_carrier\.rs"\]\s*pub\(crate\) mod native_verification;/gm,
+        declaration: /\bpub\(crate\)\s+mod\s+native_verification\s*;/g,
+        mutations: [
+          ...parentGuardMutations,
+          ['../native_verification/proxy_carrier.rs', '../native_verification/unreviewed_carrier.rs'],
+          ['pub(crate) mod native_verification;', 'pub(crate) mod unreviewed_verification;'],
+        ],
+      },
+      {
+        name: 'local closed case entry', source: carrier,
+        guard: /^#\[cfg\(debug_assertions\)\]\s*pub\(crate\) async fn run_case\(case: &str\) -> Result<\(\), String> \{\s*if !CASE_NAMES\.contains\(&case\) \{/gm,
+        declaration: /\bpub\(crate\)\s+async\s+fn\s+run_case\s*\(/g,
+        mutations: [
+          ['#[cfg(debug_assertions)]', ''],
+          ['#[cfg(debug_assertions)]', '#[cfg(not(debug_assertions))]'],
+          ['pub(crate) async fn run_case(', 'pub(crate) async fn unreviewed_case('],
+          ['if !CASE_NAMES.contains(&case)', 'if false'],
+        ],
+      },
+    ] as const;
+    for (const { name, source, guard, declaration, mutations } of guardedOwners) {
+      expect(source.trim().length, `${name}: nonempty actual source`).toBeGreaterThan(0);
+      expect(guardedDefinitionIsUnique(source, guard, declaration), name).toBe(true);
+      const matches = [...source.matchAll(guard)];
+      expect(matches, `${name}: one actual guarded target`).toHaveLength(1);
+      const target = matches[0][0];
+      const start = matches[0].index;
+      expect(target.length, `${name}: nonempty target read domain`).toBeGreaterThan(0);
+      for (const [old, replacement] of mutations) {
+        expect(target.split(old), `${name}: unique target anchor ${old}`).toHaveLength(2);
+        const changedTarget = target.replace(old, replacement);
+        expect(changedTarget, `${name}: target itself must change`).not.toBe(target);
+        expect(changedTarget.trim().length, `${name}: mutation cannot empty the read domain`).toBeGreaterThan(0);
+        const changed = source.slice(0, start) + changedTarget + source.slice(start + target.length);
+        expect(changed.slice(start, start + changedTarget.length)).toBe(changedTarget);
+        expect(guardedDefinitionIsUnique(changed, guard, declaration), `${name}: reject ${old} -> ${replacement}`).toBe(false);
+      }
+      expect(guardedDefinitionIsUnique(`${source}\n${target}`, guard, declaration), `${name}: duplicate guarded target`).toBe(false);
+      const unguarded = target.slice(target.indexOf('pub'));
+      expect(guardedDefinitionIsUnique(`${source}\n${unguarded}`, guard, declaration), `${name}: duplicate unguarded target`).toBe(false);
+      const withoutDebug = target.replace('#[cfg(debug_assertions)]', '');
+      const changed = source.slice(0, start) + withoutDebug + source.slice(start + target.length);
+      expect(guardedDefinitionIsUnique(`${changed}\nconst REPLAY: &str = r####"\n${target}\n"####;`, guard, declaration), `${name}: string replay cannot replace the actual guard`).toBe(false);
+    }
     const runner = stripLineComments(readFileSync(join(REPO_ROOT, 'scripts/run-native-dns-controlled-tests.mjs'), 'utf8'), 'js');
     expect(runner).toContain("args: ['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json']");
     expect(runner).toContain('await runTests(selected, env, directory);');
