@@ -102,6 +102,48 @@ function nativeGit({ failureAt = '', head = nativePush.after, diff = rawChange()
   return { run, calls };
 }
 
+test('feature-gated desktop acceptance carriers require native CI without pretending to change package assets', () => {
+  for (const [scope, paths] of [
+    ['src-tauri/src/bin/', ['src-tauri/src/bin/native-admission-verifier.rs']],
+    ['src-tauri/src/native_verification/', [
+      'src-tauri/src/native_verification/proxy_carrier.rs',
+      'src-tauri/src/native_verification/cleanup.rs',
+    ]],
+  ]) {
+    assert.ok(Object.hasOwn(NO_PACKAGE_IMPACT_SCOPES, scope), scope);
+    assert.match(NO_PACKAGE_IMPACT_SCOPES[scope], /native-production-verification/);
+    assert.match(NO_PACKAGE_IMPACT_SCOPES[scope], /[Nn]ative CI/);
+    for (const path of paths) {
+      assert.deepEqual(compact([path]), {
+        kernel: false, platforms: [], preflight: false, hasPackage: false,
+      }, path);
+      assert.equal(classifyImpact([path]).android, false, path);
+      assert.deepEqual(classifyImpact([path]).unregisteredScopes, [], path);
+      for (const status of ['M', 'A', 'D']) {
+        assert.equal(classifyNativeImpact(rawChange(path, status)).nativeRequired, true, `${status}: ${path}`);
+        assert.equal(classifyNativeImpact(rawChange() + rawChange(path, status)).nativeRequired, true, `mixed ${status}: ${path}`);
+      }
+      const git = nativeGit({ diff: rawChange(path) });
+      assert.equal(classifyNativeCiEvent(nativeEventEnv, nativePush, git.run).nativeRequired, true, path);
+      assert.equal(git.calls.length, 4, path);
+    }
+  }
+  // These decisions must not make a fresh sibling tree appear registered or
+  // turn the native-only carrier into a global no-package rule.
+  for (const path of [
+    'src-tauri/src/bin_other/entry.rs',
+    'src-tauri/src/native_verification_other/mod.rs',
+  ]) {
+    const impact = classifyImpact([path]);
+    assert.equal(impact.kernel, true, path);
+    assert.equal(impact.android, true, path);
+    assert.deepEqual(impact.platforms, [...ALL_PACKAGE_PLATFORMS], path);
+    assert.equal(impact.unregisteredScopes.length, 1, path);
+  }
+  assert.equal(classifyNativeImpact(rawChange()).nativeRequired, false);
+  assert.equal(classifyImpact(['src-tauri/tauri.conf.json']).hasPackage, true);
+});
+
 test('native route admits only exact ordinary main push and uses complete raw no-rename diff', () => {
   const git = nativeGit();
   assert.equal(classifyNativeCiEvent(nativeEventEnv, nativePush, git.run).nativeRequired, false);

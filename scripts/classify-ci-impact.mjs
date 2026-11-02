@@ -444,6 +444,19 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
     + 'ci.yml 的 `aarch64-linux-android` 交叉 clippy、`src-tauri/tests/android_platform_verifier_wiring.rs` '
     + '这道跨 Rust/Kotlin/Gradle/ProGuard/manifest 的接线门，以及 android.yml 的 APK 腿'
     + '（本文件同时登记在 ANDROID_IMPACT_SCOPES，改它会点亮那条腿）。',
+  'src-tauri/src/bin/':
+    'Current target native-admission-verifier is an explicit Cargo [[bin]] with required-features = '
+    + '[native-production-verification] and rejects release builds. It links the normal production library, '
+    + 'not cfg(test), but is absent from the default desktop/Android packages. Native CI remains required '
+    + 'for these Rust paths; the controlled runtime step explicitly builds this feature/bin before execution. '
+    + 'This is an acceptance carrier, not a package asset or a claim that ordinary default builds run it. '
+    + 'The CI coverage contract binds this decision to the actual Cargo target and source declarations.',
+  'src-tauri/src/native_verification/':
+    'Desktop-only acceptance driver and cleanup shared with the controlled native-admission-verifier. '
+    + 'Both lib.rs and runtime/proxy.rs require desktop plus the non-default native-production-verification '
+    + 'feature; these files do not enter default App packages or mobile containers. Changes retain native CI '
+    + 'while actual native acceptance separately requires the controlled-runner feature build/execution; a source-only/default build is not native '
+    + 'acceptance. No bundle layout, packaged binary, Core selection or kernel schema is changed here.',
   'src-tauri/src/app_language.rs': APP_LOGIC('应用内语言与 macOS AppleLanguages 写入'),
   'src-tauri/src/app_tray.rs': APP_LOGIC('托盘装配'),
   'src-tauri/src/clean_exit.rs': APP_LOGIC('退出清理'),

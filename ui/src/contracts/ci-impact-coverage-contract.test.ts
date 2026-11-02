@@ -40,6 +40,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { maskRustComments } from './rust-source.test-support';
+
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
 type Impact = {
@@ -53,6 +55,7 @@ type Impact = {
 
 type Classifier = {
   classifyImpact: (paths: string[], options?: { forceFull?: boolean }) => Impact;
+  classifyNativeImpact: (rawDiff: string) => { nativeRequired: boolean; reason: string };
   scopeOf: (path: string) => string | null;
   isScopeRegistered: (scopeKey: string) => boolean;
   ALL_PACKAGE_PLATFORMS: readonly string[];
@@ -70,6 +73,7 @@ const classifier: Classifier = await import(
 
 const {
   classifyImpact,
+  classifyNativeImpact,
   scopeOf,
   REGISTRY_ROOTS,
   isScopeRegistered,
@@ -149,6 +153,52 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       expect(actual.unregisteredScopes).toEqual([]);
     }
   });
+  it('验收 carrier 的 no-package 判定绑定真实 feature/target，并保留 native CI', () => {
+    const cargo = readFileSync(join(REPO_ROOT, 'src-tauri/Cargo.toml'), 'utf8');
+    const binaries = cargo.split(/^\[\[bin\]\]\s*$/m).slice(1)
+      .map((section) => section.split(/^\[/m)[0]);
+    const verifier = binaries.filter((section) => /^name\s*=\s*"native-admission-verifier"\s*$/m.test(section));
+    expect(verifier).toHaveLength(1);
+    expect(verifier[0]).toMatch(/^path\s*=\s*"src\/bin\/native-admission-verifier\.rs"\s*$/m);
+    expect(verifier[0]).toMatch(/^required-features\s*=\s*\["native-production-verification"\]\s*$/m);
+    expect(cargo).toMatch(/^native-production-verification\s*=\s*\[\]\s*$/m);
+    expect(cargo.match(/^default\s*=.*$/m)?.[0]).not.toContain('native-production-verification');
+    // A new implicit/default binary needs a fresh impact decision, rather than
+    // inheriting the current acceptance-only explanation for src/bin/.
+    expect(readdirSync(join(REPO_ROOT, 'src-tauri/src/bin')).sort())
+      .toEqual(['native-admission-verifier.rs']);
+    const entry = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/bin/native-admission-verifier.rs'), 'utf8'));
+    expect(entry).toMatch(/#\[cfg\(not\(debug_assertions\)\)\]\s*compile_error!\("native admission verifier is unavailable in release builds"\);/);
+    expect(entry).toContain('polaris_lib::run_native_production_verification(&args[0]).await');
+    const library = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/lib.rs'), 'utf8'));
+    const proxy = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/runtime/proxy.rs'), 'utf8'));
+    expect(library).toMatch(/#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*pub async fn run_native_production_verification\(/);
+    expect(proxy).toMatch(/#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*#\[path = "\.\.\/native_verification\/proxy_carrier\.rs"\]\s*pub\(crate\) mod native_verification;/);
+    const runner = stripLineComments(readFileSync(join(REPO_ROOT, 'scripts/run-native-dns-controlled-tests.mjs'), 'utf8'), 'js');
+    expect(runner).toContain("args: ['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json']");
+    expect(runner).toContain('await runTests(selected, env, directory);');
+    for (const path of [
+      'src-tauri/src/bin/native-admission-verifier.rs',
+      'src-tauri/src/native_verification/proxy_carrier.rs',
+      'src-tauri/src/native_verification/cleanup.rs',
+    ]) {
+      expect(compact([path]), path).toEqual({ kernel: false, platforms: [], preflight: false, hasPackage: false });
+      expect(classifyImpact([path]).android, path).toBe(false);
+      expect(classifyImpact([path]).unregisteredScopes, path).toEqual([]);
+      const diff = `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0${path}\0`;
+      expect(classifyNativeImpact(diff).nativeRequired, path).toBe(true);
+      expect(classifyNativeImpact(`:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0scripts/postprocess-appimage.test.mjs\0${diff}`).nativeRequired, `mixed: ${path}`).toBe(true);
+    }
+    for (const scope of ['src-tauri/src/bin/', 'src-tauri/src/native_verification/']) {
+      expect(PACKAGE_IMPACT_SCOPES).not.toHaveProperty(scope);
+      expect(NO_PACKAGE_IMPACT_SCOPES[scope]).toContain('native-production-verification');
+    }
+    for (const path of ['src-tauri/src/bin_other/entry.rs', 'src-tauri/src/native_verification_other/mod.rs']) {
+      expect(classifyImpact([path]).unregisteredScopes, path).toHaveLength(1);
+      expect(classifyImpact([path]).platforms, path).toEqual([...ALL_PACKAGE_PLATFORMS]);
+    }
+  });
+
   it('本地资源目录 symlink 按目录 scope 枚举，未知目录仍会触发登记门', () => {
     const root = mkdtempSync(join(tmpdir(), 'polaris-impact-scopes-'));
     try {
@@ -178,6 +228,8 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'crates/stats-engine/',
       'crates/config-engine/',
       'src-tauri/src/runtime/',
+      'src-tauri/src/bin/',
+      'src-tauri/src/native_verification/',
       'src-tauri/tauri.conf.json',
       // resources/data/ 的 28 个 .srs 入库且进四个包（见分类器的 PACKAGE_IMPACT_SCOPES）；
       // 它掉出枚举面 = 整个 resources/ 登记根没被扫到，那正是 2026-08-30 前的 fail-open 形态。
