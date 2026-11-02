@@ -322,6 +322,34 @@ struct ExactFixtureContext {
     nonce: String,
 }
 
+// A thin entry to the same strict runner for sibling recovery tests. The guard
+// is declared before any fixture and completes only after its locals close.
+// This excludes incidental pre-exec inheritance by parallel libtest workers;
+// it does not identify the holder in any historical failure or change leases.
+pub(super) fn exact_fixture_scope(module: &str, name: &str) -> Option<impl Drop> {
+    struct Completion(ExactFixtureContext);
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                emit_exact_fixture_record(&self.0, "complete");
+            }
+        }
+    }
+    let module = module.split_once("::").expect("qualified test module").1;
+    let test = format!("{module}::{name}");
+    match exact_fixture_child_context(&test).expect("valid exact recovery fixture protocol") {
+        Some(context) => {
+            emit_exact_fixture_record(&context, "entry");
+            Some(Completion(context))
+        }
+        None => {
+            run_exact_fixture_child(&test, None, std::time::Duration::from_secs(30))
+                .expect("isolated recovery fixture completes once and is reaped");
+            None
+        }
+    }
+}
+
 fn exact_fixture_args(test: &str) -> [String; 4] {
     [
         "--exact".into(),

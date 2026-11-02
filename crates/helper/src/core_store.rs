@@ -187,7 +187,10 @@ fn lock_error(role: LockRole, observation: LockObservation, cause: TryLockError)
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     let holder_snapshot = if matches!(
         role,
-        LockRole::StoreMutationExclusive | LockRole::RepairExclusive | LockRole::RetainExclusive
+        LockRole::StoreMutationExclusive
+            | LockRole::RepairExclusive
+            | LockRole::StartShared
+            | LockRole::RetainExclusive
     ) && matches!(&cause, TryLockError::WouldBlock)
     {
         Some(lock_diagnostics::snapshot(&observation))

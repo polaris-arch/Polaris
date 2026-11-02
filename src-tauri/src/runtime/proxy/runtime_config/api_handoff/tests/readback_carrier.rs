@@ -123,8 +123,17 @@ impl RunningPeer {
     async fn start(port: u16) -> Self {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "owned loopback peer bind failed pid={} requested_port={port}: {error}",
+                    std::process::id()
+                )
+            });
         let port = listener.local_addr().unwrap().port();
+        eprintln!(
+            "READBACK_PEER phase=bound pid={} port={port}",
+            std::process::id()
+        );
         let state = Arc::new(PeerState::default());
         let incoming_state = state.clone();
         let incoming = futures::stream::unfold(listener, move |listener| {
@@ -181,6 +190,12 @@ impl RunningPeer {
                 panic!("owned loopback peer did not join");
             }
         }
+        eprintln!(
+            "READBACK_PEER phase=joined pid={} port={} accepted_sockets={}",
+            std::process::id(),
+            self.port,
+            self.state.sockets.lock().unwrap().len()
+        );
     }
 }
 impl Drop for RunningPeer {
@@ -335,6 +350,16 @@ async fn readback_joins_real_captured_opening_and_stream_without_a_cached_borrow
 #[tokio::test]
 async fn delayed_readback_cannot_send_old_bearer_to_a_reoccupied_port_even_before_epoch_invalidation(
 ) {
+    // Create the fixture only after exec: a parallel worker's pre-exec child
+    // must not retain this listener while the fixture requires native rebind.
+    // The historical bind failure had no holder PID evidence; this does not
+    // claim which process or TCP state held that particular port.
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "delayed_readback_cannot_send_old_bearer_to_a_reoccupied_port_even_before_epoch_invalidation",
+    ) {
+        return;
+    }
     let peer = RunningPeer::start(0).await;
     let port = peer.port;
     let (rt, epoch, _directory) = bound_runtime(&peer, false).await;
@@ -367,6 +392,11 @@ async fn delayed_readback_cannot_send_old_bearer_to_a_reoccupied_port_even_befor
     assert!(
         rt.readback_binding(None).is_none(),
         "dead original control must refuse new admission"
+    );
+    eprintln!(
+        "READBACK_PEER phase=carrier-closed-before-rebind pid={} port={port} epoch_closed={}",
+        std::process::id(),
+        epoch.is_closed()
     );
     let replacement = RunningPeer::start(port).await;
     release.send(()).unwrap();

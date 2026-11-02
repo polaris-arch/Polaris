@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::core_store::tests::exact_fixture_scope;
 use std::cell::RefCell;
 
 type Fault = Box<dyn FnMut(Point) -> io::Result<()>>;
@@ -1056,6 +1058,12 @@ mod filesystem {
     #[test]
     fn parent_unknown_cleanup_keeps_original_version_and_saved_manifest_then_resumes_without_input()
     {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "parent_unknown_cleanup_keeps_original_version_and_saved_manifest_then_resumes_without_input",
+        ) else {
+            return;
+        };
         let f = Fixture::new();
         let lease = lease_identity(&f);
         let injection = fault(|at| {
@@ -1101,6 +1109,12 @@ mod filesystem {
 
     #[test]
     fn parent_pending_fences_gc_retention_migration_and_busy_retry_before_copy() {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "parent_pending_fences_gc_retention_migration_and_busy_retry_before_copy",
+        ) else {
+            return;
+        };
         let f = Fixture::new();
         let injection = fail_once(Point::PublishManifest);
         assert!(parent_install(&f).is_err());
@@ -1137,6 +1151,12 @@ mod filesystem {
 
     #[test]
     fn parent_resume_precedes_already_present_and_preserves_torn_or_replaced_lease_evidence() {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "parent_resume_precedes_already_present_and_preserves_torn_or_replaced_lease_evidence",
+        ) else {
+            return;
+        };
         for replace_lease in [false, true] {
             let f = Fixture::new();
             let injection = fail_once(Point::Committed);
@@ -1241,6 +1261,12 @@ mod filesystem {
 
     #[test]
     fn parent_reopened_retry_replays_every_post_archive_rename_barrier_before_already_present() {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "parent_reopened_retry_replays_every_post_archive_rename_barrier_before_already_present",
+        ) else {
+            return;
+        };
         for point in [
             Point::ArchiveDirectorySync,
             Point::ArchiveStagingSync,
@@ -1301,6 +1327,12 @@ mod filesystem {
 
     #[test]
     fn parent_gc_cannot_swallow_archived_barrier_debt_and_completed_audits_do_not_pin_forever() {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "parent_gc_cannot_swallow_archived_barrier_debt_and_completed_audits_do_not_pin_forever",
+        ) else {
+            return;
+        };
         for point in [
             Point::ArchiveDirectorySync,
             Point::ArchiveStagingSync,
@@ -1335,6 +1367,12 @@ mod filesystem {
 
     #[test]
     fn parent_retention_replays_archive_barriers_before_removing_the_receipt() {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "parent_retention_replays_archive_barriers_before_removing_the_receipt",
+        ) else {
+            return;
+        };
         for point in [
             Point::ArchiveDirectorySync,
             Point::ArchiveStagingSync,
@@ -1385,6 +1423,12 @@ mod filesystem {
 
     #[test]
     fn archived_tampering_or_retained_data_is_unknown_and_never_a_completed_audit() {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "archived_tampering_or_retained_data_is_unknown_and_never_a_completed_audit",
+        ) else {
+            return;
+        };
         for attack in 0..3 {
             let f = Fixture::new();
             parent_install(&f).unwrap();
@@ -1442,6 +1486,12 @@ mod filesystem {
 
     #[test]
     fn historical_completed_audit_does_not_require_retired_candidate_inodes() {
+        let Some(_fixture) = exact_fixture_scope(
+            module_path!(),
+            "historical_completed_audit_does_not_require_retired_candidate_inodes",
+        ) else {
+            return;
+        };
         let f = Fixture::new();
         parent_install(&f).unwrap();
         let first = audit_path(&f);
@@ -1477,6 +1527,12 @@ mod filesystem {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn fresh_publication_faults_never_report_success_and_reopen_replays_real_barriers() {
+    let Some(_fixture) = exact_fixture_scope(
+        module_path!(),
+        "fresh_publication_faults_never_report_success_and_reopen_replays_real_barriers",
+    ) else {
+        return;
+    };
     let points = [
         Point::FreshLeasePublished,
         Point::FreshVersionPublished,
@@ -1563,6 +1619,12 @@ fn fresh_publication_faults_never_report_success_and_reopen_replays_real_barrier
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn already_present_must_repeat_failed_parent_barriers_before_reporting_success() {
+    let Some(_fixture) = exact_fixture_scope(
+        module_path!(),
+        "already_present_must_repeat_failed_parent_barriers_before_reporting_success",
+    ) else {
+        return;
+    };
     let (root, store, uid) = super::super::tests::store();
     let (source, manifest) = super::super::tests::fixture("already-durable");
     store
@@ -1600,6 +1662,12 @@ fn already_present_must_repeat_failed_parent_barriers_before_reporting_success()
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn every_new_parent_barrier_is_real_and_failure_requires_a_complete_retry() {
+    let Some(_fixture) = exact_fixture_scope(
+        module_path!(),
+        "every_new_parent_barrier_is_real_and_failure_requires_a_complete_retry",
+    ) else {
+        return;
+    };
     let (source, manifest) = super::super::tests::fixture("parent-durable");
     let (sample_root, sample_store, _) = super::super::tests::store();
     let parent_count = sample_store.root.ancestors().skip(1).count();
@@ -1651,6 +1719,12 @@ fn every_new_parent_barrier_is_real_and_failure_requires_a_complete_retry() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn failed_fresh_publication_and_retry_never_delete_a_new_unknown_member() {
+    let Some(_fixture) = exact_fixture_scope(
+        module_path!(),
+        "failed_fresh_publication_and_retry_never_delete_a_new_unknown_member",
+    ) else {
+        return;
+    };
     let (root, store, uid) = super::super::tests::store();
     let (source, manifest) = super::super::tests::fixture("unknown-after-publish");
     let alien = store
