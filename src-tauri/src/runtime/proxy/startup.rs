@@ -644,7 +644,7 @@ pub enum HelperGateDecision {
 
 /// **C6-5 起核路由决策（纯函数）**：是否经提权 helper 起核（而非 [`TokioSpawner`] 直起）。
 ///
-/// 判据 = TUN 模式 **且** 平台有 helper 实现。根因（对齐 上游 `startViaHelper` 门控）：
+/// 判据按平台执行发行者区分：macOS/Windows 始终经 helper；Linux 仅 TUN 经 helper。
 /// Execution route is separate from network takeover. macOS/Windows use the
 /// existing closed Root/SYSTEM provider for selected CheckConfig and RunMain,
 /// including manual/no-TUN. Linux manual retains direct sealed-FD admission.
@@ -675,12 +675,12 @@ pub(super) fn should_start_via_helper(mode: ProxyModeType, platform: Platform) -
 /// **已装 helper「该不该提示升级」的纯判定**（与 [`should_start_via_helper`] 同层，形态照
 /// `startup_tasks::should_notify_helper_upgradeable`）。
 ///
-/// 判据 = 本次起核确实要经 helper（TUN + 有实现的平台）**且** helper 已装 **且** 可升级。
+/// 判据 = 本次执行路由确实需要 helper **且** helper 已装 **且** 可升级。
 /// 三个合取项各有各的牙：
-/// - 删 `should_start_via_helper` → systemProxy/manual 起核也弹升级框（用户这次根本没用到 helper）；
+/// - 删 `should_start_via_helper` → 不经 helper 的起核路径也弹升级框；
 /// - 删 `installed` → 未装时也命中，与 [`ProxyRuntime::run_helper_gate`] 的「去装」腿撞车
 ///   （用户连点两个框，且第二个框问的是一件此刻无意义的事）；
-/// - 删 `upgradeable` → 每次 TUN 起核都弹，已装且最新的绝大多数用户被恒骚扰。
+/// - 删 `upgradeable` → 每次经 helper 起核都弹，已装且最新的绝大多数用户被恒骚扰。
 ///
 /// `ready` **刻意不再查一遍**（同 `should_notify_helper_upgradeable` 的理由）：`upgradeable` 在
 /// `helper-client::compute_status` 里已经合取 `ready`，在这里重复只会制造「两处判据、改一处漏一处」。
@@ -2494,7 +2494,7 @@ impl ProxyRuntime {
                 .await
         };
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        let ready_tls = self.tls_fingerprint_capabilities_for(None).await;
+        let ready_tls = self.tls_fingerprint_capabilities().await;
         if self.gate.generation() != my_gen {
             return Ok(self.status());
         }
@@ -4160,7 +4160,7 @@ impl ProxyRuntime {
             Err(snapshot) => snapshot.as_ref(),
         };
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        let capabilities = self.tls_fingerprint_capabilities_for(binary).await;
+        let capabilities = self.tls_fingerprint_capabilities().await;
         let started = std::time::Instant::now();
         let mut checks_run: u32 = 0;
         loop {

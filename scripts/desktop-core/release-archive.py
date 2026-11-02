@@ -675,7 +675,8 @@ if __name__ == '__main__':
     # Node sends UTF-8 JSON bytes. Never decode through the Windows console
     # code page or surrogateescape; malformed UTF-8 must remain an error.
     trusted_profile = len(sys.argv) == 3 and sys.argv[2] == '--source-trusted-proofs'
-    legal_pins = len(sys.argv) == 3 and sys.argv[2] == '--source-legal-pins' or trusted_profile
+    explicit_legal_pins = len(sys.argv) == 3 and sys.argv[2] == '--source-legal-pins'
+    legal_pins = explicit_legal_pins or trusted_profile
     started = time.monotonic()
     def progress(stage):
         # Fixed stage names and elapsed time only; never emit request contents.
@@ -705,7 +706,11 @@ if __name__ == '__main__':
         extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], wire_handoff=True)
     elif 'sourceArchive' in request:
         require((len(sys.argv) == 2 or legal_pins) and not sys.argv[1].startswith('--'), 'unexpected source archive arguments')
-        verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'], request.get('sourcePolicy'), request.get('legalFiles'), legal_pins=legal_pins and request.get("legalFiles") is not None, progress=progress, trusted_rows=request.get("trustedRows") if trusted_profile else None, trusted_producer=request.get("trustedProducer") if trusted_profile else None)
+        # Only the validated candidate profile may genuinely omit inventory.
+        # Explicit pin intent, formal inventory and a present null stay strict.
+        source_legal_pins = explicit_legal_pins or (trusted_profile and (
+            request['trustedSourceSelection'] == 'formal' or 'legalFiles' in request))
+        verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'], request.get('sourcePolicy'), request.get('legalFiles'), legal_pins=source_legal_pins, progress=progress, trusted_rows=request.get("trustedRows") if trusted_profile else None, trusted_producer=request.get("trustedProducer") if trusted_profile else None)
     elif 'wireTransport' in request:
         require(len(sys.argv) == 3 and not sys.argv[1].startswith('--'), 'unexpected wire ZIP arguments')
         extract_wire_transport(sys.argv[1], sys.argv[2], request['wireTransport'])

@@ -880,3 +880,69 @@ fn selected_native_status_preserves_mac_truth_and_rejects_malformed_or_duplicate
         ));
     }
 }
+
+#[test]
+fn selected_native_status_and_pinned_starts_keep_distinct_canonical_families() {
+    let core = "a".repeat(64);
+    let target = HelperBirthTarget::parse_wire("4242", BIRTH).unwrap();
+    let prefix = format!("OK native-birth-status running 4242 {BIRTH}");
+    for (fields, created, image) in [
+        (String::new(), None, None),
+        (" created=123".into(), Some(123), None),
+        (" image=61".into(), None, Some("a")),
+        (" created=123 image=61".into(), Some(123), Some("a")),
+    ] {
+        let wire = format!("{prefix}{fields} core={core}");
+        let reply = Response::parse(&wire);
+        assert!(matches!(&reply,
+            Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Running {
+                target: got_target, created: got_created, image: got_image, core: Some(id)
+            })) if *got_target == target && *got_created == created && got_image.as_deref() == image && id.as_str() == core));
+        assert_eq!(reply.to_wire_line(), wire);
+    }
+    for token in [
+        "birth-started",
+        "birth-already",
+        "birth-start-not-admitted pending",
+        "native-birth-started",
+        "native-birth-already",
+        "native-birth-start-not-admitted pending",
+    ] {
+        let wire = format!("OK {token} 4242 {BIRTH} core={core}");
+        let reply = Response::parse(&wire);
+        assert!(
+            matches!(&reply, Response::Ok(ResponseKind::PinnedStart { id, .. }) if id.as_str() == core)
+        );
+        assert_eq!(reply.to_wire_line(), wire);
+        for malformed in [
+            format!("{wire} core={core}"),
+            wire.replace(" core=", " core=bad "),
+        ] {
+            assert!(!matches!(
+                Response::parse(&malformed),
+                Response::Ok(ResponseKind::PinnedStart { .. })
+            ));
+        }
+    }
+    for wire in [
+        format!("{prefix} core=bad"),
+        format!("{prefix} core={core} core={core}"),
+        format!("{prefix} core={core} image=61"),
+        format!("{prefix} image=61 created=123 core={core}"),
+        format!("{prefix} created=0123 core={core}"),
+        format!("{prefix} image=ff core={core}"),
+        format!("{prefix}  core={core}"),
+        format!("{prefix} core={core} "),
+        format!(" {prefix} core={core}"),
+        format!("{prefix}\tcore={core}"),
+        format!("OK native-birth-status empty core={core}"),
+    ] {
+        assert!(
+            !matches!(
+                Response::parse(&wire),
+                Response::Ok(ResponseKind::NativeBirthStatus(_) | ResponseKind::PinnedStart { .. })
+            ),
+            "malformed status became custody: {wire}"
+        );
+    }
+}

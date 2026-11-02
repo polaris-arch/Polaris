@@ -119,6 +119,9 @@ jobs:
               raise SystemExit('Python 3.12 with working standard-library tomllib is required')
           PYTHON
 
+      - name: Install same-source trusted proof validator dependency
+        run: python3 -m pip install jsonschema==4.23.0
+
       - name: Install SquashFS fixture tools
         run: |
           sudo apt-get update

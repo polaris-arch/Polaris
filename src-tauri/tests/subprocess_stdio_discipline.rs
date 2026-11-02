@@ -479,8 +479,8 @@ struct Passthrough {
 const PIPE_PASSTHROUGH: [Passthrough; 5] = [
     Passthrough {
         file: "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
-        anchor: "pub fn macos_helper_check_request(",
-        reason: "Closed Root Check commits the opaque child into the existing registry before handing both OwnedReaders to bounded EOF threads; exact private factory/consumer/wait/join contract is checked below",
+        anchor: "fn helper_check_request(",
+        reason: "The private shared Root/SYSTEM Check dispatcher commits the opaque child before handing both OwnedReaders to bounded EOF threads; exact platform wrappers, factory, consumer, wait and join contract are checked below",
     },
     Passthrough {
         file: "crates/core-supervisor/src/admitted_payload.rs",
@@ -2387,7 +2387,18 @@ fn mac_check_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) -> bool
         index,
         "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
     );
-    let commit = compact(block_of(remote, "pub fn macos_helper_check_request("));
+    let mac_wrapper = compact(block_of(remote, "pub fn macos_helper_check_request("));
+    let windows_wrapper = compact(block_of(remote, "pub fn windows_helper_check_request("));
+    if !mac_wrapper.contains("helper_check_request(CallerIdentity::Unix(uid),request)")
+        || !windows_wrapper.contains("if!matches!(owner,CallerIdentity::Windows(_))")
+        || !windows_wrapper.contains("helper_check_request(owner,request)")
+    {
+        return false;
+    }
+    let commit = compact(block_of(remote, "fn helper_check_request("));
+    if !commit.contains("uid:CallerIdentity,") || !commit.contains("m.uid==uid&&m.key==*key") {
+        return false;
+    }
     let mut previous = 0;
     for needle in [
         "letchild=input.spawn();",
@@ -2471,6 +2482,11 @@ fn root_check_guard_and_each_owned_stream_are_real_source_obligations() {
             "crates/core-supervisor/src/config_gate/check_custody.rs",
             "h.join()",
             "drop(h)",
+        ),
+        (
+            "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
+            "helper_check_request(CallerIdentity::Unix(uid), request)",
+            "helper_check_request(caller_identity(), request)",
         ),
     ] {
         assert!(
@@ -2593,8 +2609,8 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
         "system_actor()?;",
         "create_suspended(",
         "ResumeThread(suspended.thread.as_raw_handle())",
-        "stdout:suspended.stdout.take().expect(",
-        "stderr:suspended.stderr.take().expect(",
+        "stdout:suspended.stdout.take(),",
+        "stderr:suspended.stderr.take(),",
         "_job:suspended.job.take().expect(",
         "cohort:Some(Arc::clone(owner))",
     ] {
@@ -2607,7 +2623,9 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
         "crates/core-supervisor/src/admitted_payload/windows.rs",
     );
     let parts = compact(block_of(windows, "impl WindowsStartedChild {"));
-    if !parts.contains("(self.pid,self.process,self.stdout,self.stderr,self.custody,)") {
+    if !parts
+        .contains("(self.pid,self.process,self.stdout.expect(),self.stderr.expect(),self.custody,)")
+    {
         return false;
     }
     let win_helper = file_of(index, "crates/helper/src/platform/windows/winproc/win.rs");
@@ -2690,6 +2708,11 @@ fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
             "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",
             "stderr: suspended.stderr.take()",
             "stderr: suspended.stdout.take()",
+        ),
+        (
+            "crates/core-supervisor/src/admitted_payload/windows.rs",
+            "self.stderr.expect(",
+            "self.stdout.expect(",
         ),
         (
             "crates/helper/src/platform/macos/server.rs",

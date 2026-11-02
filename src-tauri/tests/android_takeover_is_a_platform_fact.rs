@@ -104,6 +104,18 @@ const RAW_READ_EXEMPTIONS: &[Exemption] = &[];
 type RawJsonSite = (&'static str, &'static str, usize, &'static str);
 const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
     (
+        "src-tauri/src/native_verification/proxy_carrier.rs",
+        "obj.insert(\"proxyModeType\".into(), serde_json::json!(\"manual\"))",
+        1,
+        "Closed desktop acceptance constructs private manual configuration, not stored Android takeover state",
+    ),
+    (
+        "src-tauri/src/native_verification/proxy_carrier.rs",
+        "\"servers\": [], \"selectedServerId\": \"__direct__\", \"proxyMode\": \"direct\", \"proxyModeType\": \"manual\", \"mixedPort\": mixed, \"clashApiSecret\": FIXTURE_MANAGEMENT_SECRET,",
+        1,
+        "Closed desktop acceptance owns its loopback-only runtime directory; the exact scope is checked separately",
+    ),
+    (
         "src-tauri/src/runtime/proxy/dns_takeover.rs",
         "let mode = config .get(\"proxyModeType\") .cloned() .and_then(|value| serde_json::from_value::<ProxyModeType>(value).ok()) .unwrap_or_default()",
         1,
@@ -223,6 +235,122 @@ fn every_takeover_mode_decision_reads_the_effective_value() {
         assert!(
             found.contains_key(&((*path).to_owned(), (*snippet).to_owned())),
             "`RAW_READ_EXEMPTIONS` 里的 {path} 已经找不到这条判据 —— 删掉这条豁免。（原理由：{why}）\n      {snippet}"
+        );
+    }
+}
+
+// The carrier stays in both automatic censuses. These two manual writes are
+// admitted only inside the actual debug/desktop/feature module and private
+// one-case runtime, never as a general production read of stored mode.
+fn closed_native_configuration_scope(proxy: &str, library: &str, carrier: &str) -> bool {
+    let compact = |s: &str| {
+        mask_comments(s)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let p = compact(proxy);
+    let l = compact(library);
+    let c = compact(carrier);
+    let cases = [
+        ("runtime::proxy::tests::lifecycle::real_core_full_lifecycle", "real_core_full_lifecycle"),
+        ("runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop", "real_core_lifecycle_race_start_then_immediate_stop"),
+        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid", "real_core_hot_switch_keeps_pid"),
+        ("runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt", "real_core_auto_failover_attests_without_applying_saved_debt"),
+        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation", "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation"),
+        ("runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames", "real_core_aggregate_relay_emits_real_frames"),
+    ];
+    let names = format!(
+        "constCASE_NAMES:&[&str]=&[{}];",
+        cases
+            .iter()
+            .map(|(name, _)| format!("\"{name}\","))
+            .collect::<String>()
+    );
+    p.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]#[path=\"../native_verification/proxy_carrier.rs\"]pub(crate)modnative_verification;")
+        && l.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]pubasyncfnrun_native_production_verification(case:&str)->Result<(),String>{runtime::proxy::native_verification::run_case(case).await}")
+        && c.contains("#[cfg(debug_assertions)]pub(crate)asyncfnrun_case(case:&str)->Result<(),String>{if!CASE_NAMES.contains(&case){returnErr(")
+        && c.contains(&names)
+        && cases.iter().all(|(name, method)| c.contains(&format!("\"{name}\"=>{method}().await,")))
+        && c.contains("ifstd::env::var_os(\"POLARIS_SINGBOX_PATH\").is_some(){returnErr(")
+        && c.contains("letparent=std::env::temp_dir().join(\"polaris-native-production-verification\");")
+        && c.contains("letdir=parent.join(uuid::Uuid::new_v4().to_string());")
+        && c.contains("std::fs::create_dir(&dir).map_err(|e|e.to_string())?;")
+        && c.contains("letconfig=Arc::new(ConfigManager::new(dir.clone()));")
+        && c.contains("lethelper=Arc::new(HelperRuntime::new(dir.clone()));")
+        && c.contains("DIRECTORY.set(dir.clone()).map_err(|_|\"onecaseperprocess\")?;")
+        && c.contains("RUNTIME.set(runtime.clone()).map_err(|_|\"onecaseperprocess\")?;")
+        && c.contains("ProxyModeType::Manual.effective_on(runtime.helper.platform())")
+        && c.contains("obj.insert(\"proxyModeType\".into(),serde_json::json!(\"manual\"));")
+        && c.contains("\"proxyModeType\":\"manual\",")
+        && !c.contains("\"allowLan\"") && !c.contains("allow_lan")
+        && c.contains("cleanup::drain_after_fence(check_fence,runtime.shutdown_for_exit(),")
+}
+
+#[test]
+fn native_manual_writes_require_the_closed_private_desktop_runtime() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let faces = [
+        read(&root.join("src-tauri/src/runtime/proxy.rs")),
+        read(&root.join("src-tauri/src/lib.rs")),
+        read(&root.join("src-tauri/src/native_verification/proxy_carrier.rs")),
+    ];
+    assert!(closed_native_configuration_scope(
+        &faces[0], &faces[1], &faces[2]
+    ));
+    for (slot, old, new) in [
+        (
+            0,
+            "#[cfg(debug_assertions)]\n#[path = \"../native_verification/proxy_carrier.rs\"]",
+            "#[path = \"../native_verification/proxy_carrier.rs\"]",
+        ),
+        (
+            1,
+            "#[cfg(debug_assertions)]\npub async fn run_native_production_verification",
+            "pub async fn run_native_production_verification",
+        ),
+        (
+            2,
+            "#[cfg(debug_assertions)]\npub(crate) async fn run_case",
+            "pub(crate) async fn run_case",
+        ),
+        (2, "if !CASE_NAMES.contains(&case)", "if false"),
+        (
+            2,
+            "ConfigManager::new(dir.clone())",
+            "ConfigManager::new(user_directory())",
+        ),
+        (
+            2,
+            "let dir = parent.join(uuid::Uuid::new_v4().to_string());",
+            "let dir = user_directory();",
+        ),
+        (
+            2,
+            "serde_json::json!(\"manual\")",
+            "serde_json::json!(\"tun\")",
+        ),
+        (
+            2,
+            "\"proxyModeType\": \"manual\"",
+            "\"proxyModeType\": \"systemProxy\"",
+        ),
+        (
+            2,
+            ".effective_on(runtime.helper.platform())",
+            ".without_platform_projection()",
+        ),
+        (2, "runtime.shutdown_for_exit()", "pretend_cleanup()"),
+    ] {
+        let mut changed = faces.clone();
+        assert!(
+            changed[slot].contains(old),
+            "negative must mutate the real private carrier: {old}"
+        );
+        changed[slot] = changed[slot].replacen(old, new, 1);
+        assert!(
+            !closed_native_configuration_scope(&changed[0], &changed[1], &changed[2]),
+            "private acceptance scope escaped: {old}"
         );
     }
 }

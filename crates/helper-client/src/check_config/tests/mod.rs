@@ -125,16 +125,27 @@ fn different_core_or_correlation_response_is_not_custody() {
     assert!(q.lock().unwrap().is_empty());
 }
 #[test]
-fn non_mac_does_not_send_a_check_frame() {
-    let q = Arc::new(Mutex::new(VecDeque::from([MockStream::with_response(
-        b"OK\n".to_vec(),
-    )])));
-    let c = HelperClient::new(Box::new(Queue(Arc::clone(&q))), Platform::Win, "token");
-    assert!(c
-        .send_macos_check(CheckRequest::Cancel { key: key() }, Duration::from_secs(1))
-        .unwrap_err()
-        .contains("Unsupported"));
-    assert_eq!(q.lock().unwrap().len(), 1);
+fn unsupported_platforms_do_not_send_a_check_frame() {
+    for platform in [
+        Platform::Linux,
+        Platform::Android,
+        Platform::Ios,
+        Platform::Other,
+    ] {
+        let q = Arc::new(Mutex::new(VecDeque::from([MockStream::with_response(
+            b"OK\n".to_vec(),
+        )])));
+        let c = HelperClient::new(Box::new(Queue(Arc::clone(&q))), platform, "token");
+        assert!(c
+            .send_macos_check(CheckRequest::Cancel { key: key() }, Duration::from_secs(1))
+            .unwrap_err()
+            .contains("Unsupported"));
+        assert_eq!(
+            q.lock().unwrap().len(),
+            1,
+            "unsupported platform must not connect: {platform:?}"
+        );
+    }
 }
 
 #[test]

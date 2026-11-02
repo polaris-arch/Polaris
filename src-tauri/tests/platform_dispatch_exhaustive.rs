@@ -2362,6 +2362,10 @@ struct CfgEnv {
     mobile: bool,
     /// Tauri 的 `desktop` cfg（`mobile` 的反面）。
     desktop: bool,
+    /// Ordinary source inventory uses false; explicit consumer-scope controls also check lib-test.
+    test: bool,
+    /// The sole named normal-library acceptance feature recognized by this closed evaluator.
+    native_production_verification: bool,
 }
 
 const IOS_ENV: CfgEnv = CfgEnv {
@@ -2369,12 +2373,16 @@ const IOS_ENV: CfgEnv = CfgEnv {
     debug_assertions: false,
     mobile: true,
     desktop: false,
+    test: false,
+    native_production_verification: false,
 };
 const ANDROID_ENV: CfgEnv = CfgEnv {
     target_os: "android",
     debug_assertions: false,
     mobile: true,
     desktop: false,
+    test: false,
+    native_production_verification: false,
 };
 const IOS_DEBUG_ENV: CfgEnv = CfgEnv {
     debug_assertions: true,
@@ -2435,11 +2443,18 @@ enum IosSide {
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
     (
+        "src-tauri/src/runtime/proxy/core_binary.rs",
+        "any( not(test), all(debug_assertions, desktop, feature = \"native-production-verification\") )",
+        3,
+        IosSide::WithAndroid,
+        "The Helper candidate data type, its impl and resolver follow their actual consumers: normal startup remains present on every production target; lib-test includes them only for the debug desktop native acceptance carrier. Android/iOS production remain same-side and neither receives desktop execution authority. Release lib-test and ordinary business fixtures do not retain an unused acceptance resolver.",
+    ),
+    (
         "src-tauri/src/runtime/proxy.rs",
         "desktop",
         1,
         IosSide::WithAndroid,
-        "The normal-library native acceptance carrier requires both desktop and its separate native-production-verification feature attribute. Android and iOS exclude the carrier, and enabling the feature cannot grant a mobile runtime a desktop issuer.",
+        "The normal-library native acceptance carrier requires separate desktop, native-production-verification feature and debug_assertions attributes. Android and iOS exclude the carrier, release excludes it even with the feature, and enabling the feature cannot grant a mobile runtime a desktop issuer.",
     ),
 
     (
@@ -2562,16 +2577,16 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/tls_capabilities.rs",
         "any(target_os = \"android\", target_os = \"ios\")",
-        2,
+        1,
         IosSide::WithAndroid,
-        "The native-capability wrapper and the temporary-capability call site are both mobile-only. Android and iOS query their own current native container; neither treats an arbitrary CLI binary path or the desktop compiled support directory as its loaded libbox.",
+        "The native-capability method is mobile-only and is called directly by mobile startup and configuration gating. Android and iOS query their own current native container; neither treats an arbitrary CLI binary path or the desktop compiled support directory as its loaded libbox.",
     ),
     (
         "src-tauri/src/runtime/proxy/tls_capabilities.rs",
         "not(any(target_os = \"android\", target_os = \"ios\"))",
-        6,
+        5,
         IosSide::WithAndroid,
-        "Six desktop sites: direct binding, direct snapshot, desktop observation, startup CLI query, authenticated Helper snapshot impl and native birth predicate. Android and iOS exclude them and use their own loaded native containers; neither inherits desktop Child/file/Root/SYSTEM authority.",
+        "Five desktop sites: direct binding, direct snapshot, desktop observation, authenticated Helper snapshot impl and native birth predicate. The obsolete startup CLI wrapper is removed. Android and iOS exclude these sites and use their own loaded native containers; neither inherits desktop Child/file/Root/SYSTEM authority.",
     ),
     (
         "src-tauri/src/runtime/proxy/tls_capabilities.rs",
@@ -2776,7 +2791,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "桌面专属插件与窗口装配（single-instance / autostart / 托盘锚点 / 窗口铬…），\
          以及两处只对独立内核可执行文件成立的启动步骤（清理旧版本内核残留目录、把随包内核\
          路径注入版本读取）：移动端的内核在进程内，没有这两件事的对象。\
-         另加 native acceptance driver 的 desktop 属性，与独立 feature 属性仍作合取；移动端无此 driver。两个移动平台同侧。**其中 single-instance 那条的既有理由只写了 Android**\
+         另加 native acceptance driver 的 desktop 属性，与独立 feature、debug_assertions 属性仍作合取；移动端和 release 无此 driver。两个移动平台同侧。**其中 single-instance 那条的既有理由只写了 Android**\
          （「应用默认单进程 + tun fd 由 VpnService.prepare() 仲裁」）；iOS 的等价物是\
          「系统本就不允许同一 app 起第二个进程实例」+「`NEVPNManager` 侧的隧道单例」，\
          结论同、依据不同。答案不变，故不改代码。",
@@ -3817,8 +3832,8 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
 
 /// 谓词在给定环境下求值。**词表封闭**：不认识的原子返 `None`（调用方据此变红，不猜值）。
 ///
-/// `test` 恒 false：本门判的是**生产构建面**，`cfg(test)` 那一侧是测试构型，不在射程内
-/// （与 [`production_sources`] 排除 `tests/` 是同一条纪律）。
+/// Inventory environments keep `test=false`: this gate inventories production source.
+/// Explicit consumer-scope controls can also evaluate lib-test/debug/feature combinations.
 fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
     let p = pred.trim();
     for (head, len) in [("not(", 4usize), ("any(", 4), ("all(", 4)] {
@@ -3848,7 +3863,7 @@ fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
         }
     }
     match p {
-        "test" => Some(false),
+        "test" => Some(env.test),
         "debug_assertions" => Some(env.debug_assertions),
         // Closed target-family mapping for the supported App targets.
         "unix" => match env.target_os {
@@ -3863,6 +3878,7 @@ fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
         },
         "desktop" => Some(env.desktop),
         "mobile" => Some(env.mobile),
+        "feature = \"native-production-verification\"" => Some(env.native_production_verification),
         _ => p
             .strip_prefix("target_os")
             .map(str::trim_start)
@@ -3885,6 +3901,29 @@ fn cfg_side_profile(pred: &str) -> Option<(bool, bool)> {
 /// 求值器自身的正反双向自检 —— 它是本门第四列强制力的全部来源，坏掉就等于第四列没人看。
 #[test]
 fn cfg_evaluator_answers_both_ways() {
+    assert_eq!(eval_cfg("test", IOS_ENV), Some(false));
+    assert_eq!(
+        eval_cfg(
+            "test",
+            CfgEnv {
+                test: true,
+                ..IOS_ENV
+            }
+        ),
+        Some(true)
+    );
+    let native_feature = "feature = \"native-production-verification\"";
+    assert_eq!(eval_cfg(native_feature, IOS_ENV), Some(false));
+    assert_eq!(
+        eval_cfg(
+            native_feature,
+            CfgEnv {
+                native_production_verification: true,
+                ..IOS_ENV
+            }
+        ),
+        Some(true)
+    );
     // 正面：两个环境上各答对一次（只查一边会被「恒 true」骗过）。
     assert_eq!(eval_cfg("target_os = \"android\"", IOS_ENV), Some(false));
     assert_eq!(eval_cfg("target_os = \"android\"", ANDROID_ENV), Some(true));
@@ -3975,6 +4014,7 @@ fn cfg_evaluator_answers_both_ways() {
         "target_arch = \"arm\"",
         "windows_unknown",
         "any(target_os = \"ios\", feature = \"x\")",
+        "all(desktop, feature = \"native-production-verification-unknown\")",
         "not(unknown_build_mode)",
     ] {
         assert_eq!(
@@ -3982,6 +4022,48 @@ fn cfg_evaluator_answers_both_ways() {
             None,
             "{unknown:?} 被求值器猜出了一个值 —— 词表必须是封闭的，认不出来就该让门红"
         );
+    }
+}
+
+#[test]
+fn helper_candidate_scope_matches_normal_and_debug_native_consumers() {
+    let source = polaris_source_probe::repo_file!("src-tauri/src/runtime/proxy/core_binary.rs");
+    let predicates = cfg_predicates(&mask_comments(&source));
+    let native: Vec<_> = predicates
+        .iter()
+        .filter(|predicate| predicate.contains("feature = \"native-production-verification\""))
+        .collect();
+    assert_eq!(
+        native.len(),
+        3,
+        "type, impl and resolver must share the actual consumer scope"
+    );
+    for predicate in native {
+        for test in [false, true] {
+            for debug_assertions in [false, true] {
+                for native_production_verification in [false, true] {
+                    for (target_os, desktop) in [
+                        ("linux", true),
+                        ("macos", true),
+                        ("windows", true),
+                        ("android", false),
+                        ("ios", false),
+                    ] {
+                        let env = CfgEnv {
+                            target_os,
+                            debug_assertions,
+                            mobile: !desktop,
+                            desktop,
+                            test,
+                            native_production_verification,
+                        };
+                        let expected = !test
+                            || (debug_assertions && desktop && native_production_verification);
+                        assert_eq!(eval_cfg(predicate, env), Some(expected), "{predicate}: os={target_os}, test={test}, debug={debug_assertions}, feature={native_production_verification}");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -4123,7 +4205,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
         unknown_atoms.is_empty(),
         "以下 cfg 谓词里出现了本门词表之外的原子：\n    {}\n\n\
          本门**不猜**：`eval_cfg` 的词表是封闭的（`target_os = \"…\"` / `desktop` / `mobile` / \
-         `test` / `debug_assertions` / `unix` / `windows` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
+         `test` / `debug_assertions` / `unix` / `windows` / `feature = \"native-production-verification\"` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
          `cfg_evaluator_answers_both_ways` 里正反各钉一条，要么这条谓词根本不该落在移动轴上。",
         unknown_atoms.join("\n    ")
     );
@@ -4350,7 +4432,10 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // No existing verdict or debt site changes; no device validation is claimed.
     // CTE-R02 records two desktop Helper binding sites, one separate desktop test
     // module and both desktop carrier declarations. No old iOS debt is repaid.
-    ("WithAndroid", 147),
+    // The final Helper consumer gates add three same-side sites; removing the
+    // obsolete TLS wrapper retires two. Standalone debug carrier attributes do
+    // not mention the mobile axis. No existing debt site changes.
+    ("WithAndroid", 148),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

@@ -349,10 +349,20 @@ fn desktop_takeover_decisions_still_differ_between_stored_modes() {
             "{platform:?}：systemProxy 与 tun 算出了同一份决策 —— 要么桌面被接管成恒 TUN，\
              要么本文件的决策向量根本报不出差异（那样上一条的『相同』也就没有信息量）"
         );
+        let manual = takeover_decisions(ProxyModeType::Manual, platform, tag);
         assert!(
-            !system_proxy.via_helper && tun.via_helper,
-            "{platform:?}：只有 TUN 档该经提权 helper 起核"
+            tun.via_helper,
+            "{platform:?}: TUN keeps its real privileged issuer"
         );
+        match platform {
+            Platform::Mac | Platform::Win => assert!(
+                system_proxy.via_helper && manual.via_helper,
+                "{platform:?}: execution uses the closed OS issuer independently of takeover"
+            ),
+            Platform::Linux => assert!(!system_proxy.via_helper && !manual.via_helper),
+            _ => unreachable!("this matrix contains desktop platforms only"),
+        }
+        assert!(!manual.tun_route_gate && !manual.probe_wintun);
         assert!(
             !system_proxy.tun_route_gate && tun.tun_route_gate,
             "{platform:?}：只有 TUN 档该挂出口夺取硬闸"

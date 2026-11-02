@@ -261,6 +261,8 @@ class SourceArchiveTests(unittest.TestCase):
             # No optional-content fallback or request-controlled opt-in.
             self.assertNotEqual(check(flag=False).returncode, 0)
             self.assertNotEqual(check({**request, 'legal_pins': True}, flag=False).returncode, 0)
+            self.assertNotEqual(check({key: value for key, value in request.items()
+                                      if key != 'legalFiles'}).returncode, 0)
             for files in [None, [], [legal, legal],
                           [{**legal, 'content': content}],
                           [{k: v for k, v in legal.items() if k != 'sha256'}],
@@ -284,6 +286,63 @@ class SourceArchiveTests(unittest.TestCase):
             self.assertEqual(check(full, flag=False).returncode, 0)
             self.assertNotEqual(check({**full, 'legalFiles': [{**legal, 'content': 'changed'}]},
                                       flag=False).returncode, 0)
+
+    def test_real_cli_legal_inventory_intent_distinguishes_explicit_formal_and_candidate(self):
+        data, pin, tree, source, linked = self.fixture()
+        content = 'synthetic license\n'
+        legal = {'path': 'licenses/LICENSE', 'bytes': len(content.encode()),
+                 'sha256': hashlib.sha256(content.encode()).hexdigest()}
+        selection = {'repository': 'polaris-arch/sing-box-polaris', 'repositoryId': 1421657509,
+                     'sourceCommit': COMMIT, 'sourceTree': tree, 'sourceArchive': pin,
+                     'producer': {'runId': 7, 'runAttempt': 1}}
+        request = {'sourceArchive': pin, 'sourceCommit': COMMIT, 'sourceTree': tree,
+                   'sourceGitlinks': [{'path': 'client', 'sha': GITLINK}], 'sourceIdentity': source,
+                   'buildReplacements': linked, 'trustedRows': [{}],
+                   'trustedProducer': selection['producer']}
+        missing = object()
+        # Expected successes: ordinary, explicit pins, trusted formal, trusted candidate.
+        cases = (('missing', missing, (True, False, False, True)),
+                 ('null', None, (True, False, False, False)),
+                 ('empty', [], (True, False, False, False)),
+                 ('pins', [legal], (False, True, True, True)),
+                 ('content', [{**legal, 'content': content}], (True, False, False, False)))
+        flags = ((), ('--source-legal-pins',), ('--source-trusted-proofs',),
+                 ('--source-legal-pins', '--source-trusted-proofs'),
+                 ('--source-trusted-proofs', '--source-legal-pins'),
+                 ('--source-legal-pins', '--source-legal-pins'),
+                 ('--source-trusted-proofs', '--source-trusted-proofs'))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / 'scripts/desktop-core/release-archive.py'
+            script.parent.mkdir(parents=True)
+            script.write_bytes(Path(archive.__file__).read_bytes())
+            # A private inert CLI installation, not a product selection or proof.
+            # Its exact copied reader verifies real synthetic tar/tree/legal bytes.
+            # Inactive rows claim no execution facts; real schema-backed source
+            # validators remain independently exercised by the closure suite.
+            for name in ('release-contract.json', 'native-dns-candidate.json', 'native-dns-source-binding.json'):
+                script.with_name(name).write_bytes(json.dumps(selection).encode('utf-8'))
+            path = root / 'source.tar.gz'; path.write_bytes(data)
+            for domain in ('formal', 'candidate'):
+                for argv in flags:
+                    for label, files, successes in cases:
+                        payload = {**request, 'trustedSourceSelection': domain}
+                        if files is not missing:
+                            payload['legalFiles'] = files
+                        result = subprocess.run([sys.executable, '-B', str(script), str(path), *argv],
+                            input=json.dumps(payload).encode('utf-8'), capture_output=True, timeout=10)
+                        expected = (successes[0] if not argv else successes[1] if argv == flags[1]
+                                    else successes[2 if domain == 'formal' else 3] if argv == flags[2]
+                                    else False)
+                        with self.subTest(domain=domain, flags=argv, legalFiles=label):
+                            if expected:
+                                self.assertEqual(result.returncode, 0, result.stderr)
+                            else:
+                                self.assertNotEqual(result.returncode, 0, result.stderr)
+                            if len(argv) == 2:
+                                self.assertIn(b'unknown archive profile', result.stderr)
+                            elif argv and label in ('missing', 'null', 'empty') and not expected:
+                                self.assertIn(b'source legal pins inventory missing', result.stderr)
 
     def test_replace_tab_and_specific_version_precedence_follow_go_mod(self):
         for mod in [

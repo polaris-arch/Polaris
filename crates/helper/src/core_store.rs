@@ -466,7 +466,7 @@ impl VerifiedCore {
     pub(crate) fn diagnostic_cache(&self) -> io::Result<Self> {
         self.copy_with_lease(None)
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub fn execution_lease(&self) -> io::Result<&File> {
         self._lease
             .as_ref()

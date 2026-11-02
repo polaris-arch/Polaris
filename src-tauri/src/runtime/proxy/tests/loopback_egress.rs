@@ -248,6 +248,12 @@ const PRIMITIVES: &[&str] = &[
 /// 挂凭据标记；`None` = 不打本机代理入站，理由写第四列)。
 const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
     (
+        "src-tauri/src/native_verification/proxy_carrier.rs",
+        "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation",
+        None,
+        "Exact management API refusal probe: connects only to the retained runtime's API port, sends no proxy request; private purpose is checked separately",
+    ),
+    (
         "src-tauri/src/runtime/http.rs",
         "with_local_proxy_url",
         Some("basic_auth("),
@@ -296,6 +302,107 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
         "直连已验证 Core 管理口的单 carrier 拨号器；不是代理入站，Bearer 由原管理 client 持有；已捕获后禁止重拨",
     ),
 ];
+
+// These four sites really DO use the desktop mixed proxy ingress. They are
+// not control probes and must never borrow the None/control classification.
+const NATIVE_OWNER: &str = "src-tauri/src/native_verification/proxy_carrier.rs";
+const PRIVATE_NATIVE_PROXY_FUNCTIONS: &[&str] = &[
+    "drive_traffic_through_proxy",
+    "controlled_http_request",
+    "real_core_full_lifecycle",
+    "real_core_aggregate_relay_emits_real_frames",
+];
+
+fn private_native_proxy_scope(proxy: &str, carrier: &str) -> bool {
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let p = compact(&polaris_source_probe::mask_comments(proxy));
+    let bare = polaris_source_probe::mask_comments_and_strings(carrier);
+    let text = polaris_source_probe::mask_comments(carrier);
+    let c = compact(&text);
+    if !p.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]#[path=\"../native_verification/proxy_carrier.rs\"]pub(crate)modnative_verification;")
+        || !c.contains("#[cfg(debug_assertions)]pub(crate)asyncfnrun_case(case:&str)->Result<(),String>{if!CASE_NAMES.contains(&case){returnErr(")
+        || !c.contains("letconfig=Arc::new(ConfigManager::new(dir.clone()));")
+        || !c.contains("letdir=parent.join(uuid::Uuid::new_v4().to_string());")
+    { return false; }
+    for name in PRIVATE_NATIVE_PROXY_FUNCTIONS {
+        let Some(body) = fn_body(&bare, name) else {
+            return false;
+        };
+        let start = body.as_ptr() as usize - bare.as_ptr() as usize;
+        let source = compact(&text[start..start + body.len()]);
+        if PRIMITIVES
+            .iter()
+            .map(|primitive| body.matches(*primitive).count())
+            .sum::<usize>()
+            != 1
+            || !source.contains("tokio::net::TcpStream::connect((\"127.0.0.1\",mixed))")
+            || !body.contains(".write_all(")
+        {
+            return false;
+        }
+    }
+    let name = "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation";
+    for primitive in PRIMITIVES {
+        for (at, _) in bare.match_indices(*primitive) {
+            let owner = enclosing_fn(&bare, at);
+            if !PRIVATE_NATIVE_PROXY_FUNCTIONS.contains(&owner.as_str()) && owner != name {
+                return false;
+            }
+        }
+    }
+    let Some(body) = fn_body(&bare, name) else {
+        return false;
+    };
+    let start = body.as_ptr() as usize - bare.as_ptr() as usize;
+    let control = compact(&text[start..start + body.len()]);
+    control.contains("tokio::net::TcpStream::connect((\"127.0.0.1\",st.clash_api_port))")
+        && control.contains("letapi_dead=")
+        && control.contains(".is_err();")
+        && PRIMITIVES
+            .iter()
+            .map(|primitive| body.matches(*primitive).count())
+            .sum::<usize>()
+            == 1
+        && !body.contains(".write_all(")
+}
+
+#[test]
+fn native_proxy_traffic_and_management_probe_keep_distinct_private_purposes() {
+    let proxy = polaris_source_probe::crate_source!("runtime/proxy.rs");
+    let carrier = polaris_source_probe::crate_source!("native_verification/proxy_carrier.rs");
+    assert!(private_native_proxy_scope(&proxy, &carrier));
+    for (old, new) in [
+        ("\"127.0.0.1\", mixed", "\"0.0.0.0\", mixed"),
+        (".write_all(b\"GET", ".pretend_write(b\"GET"),
+        ("\"127.0.0.1\", st.clash_api_port", "\"127.0.0.1\", mixed"),
+        (
+            "ConfigManager::new(dir.clone())",
+            "ConfigManager::new(user_directory())",
+        ),
+        ("if !CASE_NAMES.contains(&case)", "if false"),
+    ] {
+        assert!(
+            carrier.contains(old),
+            "negative must mutate actual native traffic: {old}"
+        );
+        assert!(!private_native_proxy_scope(
+            &proxy,
+            &carrier.replacen(old, new, 1)
+        ));
+    }
+    let guard = "#[cfg(debug_assertions)]\n#[path = \"../native_verification/proxy_carrier.rs\"]";
+    assert!(proxy.contains(guard));
+    assert!(!private_native_proxy_scope(
+        &proxy.replacen(
+            guard,
+            "#[path = \"../native_verification/proxy_carrier.rs\"]",
+            1
+        ),
+        &carrier
+    ));
+    let added = format!("{carrier}\nasync fn unknown_proxy_caller() {{ tokio::net::TcpStream::connect((\"127.0.0.1\", 1)).await; }}");
+    assert!(!private_native_proxy_scope(&proxy, &added));
+}
 
 /// 带凭据构造器（名字, 凭据实参下标）。
 const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
@@ -469,6 +576,8 @@ fn every_loopback_egress_primitive_is_registered_and_credentialed() {
                 if PRIMITIVE_REGISTRY
                     .iter()
                     .any(|(p, f, _, _)| p == path && *f == func)
+                    || (path == NATIVE_OWNER
+                        && PRIVATE_NATIVE_PROXY_FUNCTIONS.contains(&func.as_str()))
                 {
                     found.push((path.clone(), func));
                 } else {
@@ -499,6 +608,14 @@ fn every_loopback_egress_primitive_is_registered_and_credentialed() {
                 "{path} fn {func} 是带凭据构造路径，但函数体里没有挂凭据的 `{marker}`（{why}）"
             );
         }
+    }
+    for function in PRIVATE_NATIVE_PROXY_FUNCTIONS {
+        assert!(
+            found
+                .iter()
+                .any(|(path, name)| path == NATIVE_OWNER && name == function),
+            "private native proxy registration must still be present: {function}"
+        );
     }
     // 两个「间接」凭据步骤本身也要在：CONNECT 报文与共用的头生成器。
     let tunnel = &surface

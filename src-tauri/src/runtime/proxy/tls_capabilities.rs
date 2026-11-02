@@ -1,6 +1,5 @@
 use super::ProxyRuntime;
 use crate::runtime::tls_fingerprints::Snapshot;
-use std::path::Path;
 
 impl ProxyRuntime {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -159,22 +158,6 @@ impl ProxyRuntime {
                 Err(reason) => Snapshot::unavailable(reason),
             };
             (snapshot, None)
-        }
-    }
-
-    /// Startup supplies its exact binary, rather than a UI version probe path.
-    pub(super) async fn tls_fingerprint_capabilities_for(&self, binary: Option<&Path>) -> Snapshot {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            match binary {
-                Some(path) => crate::runtime::tls_fingerprints::probe_cli(path).await,
-                None => Snapshot::unavailable("No selected core binary"),
-            }
-        }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            let _ = binary;
-            self.tls_fingerprint_capabilities().await
         }
     }
 }

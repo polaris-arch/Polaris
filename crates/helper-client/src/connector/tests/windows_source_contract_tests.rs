@@ -59,14 +59,118 @@ fn windows_read_and_write_use_one_bounded_transfer_owner() {
     assert!(!write.contains("is_peer_gone("));
 }
 
+// Each predicate reads one balanced impl. An adjacent platform's methods
+// cannot supply evidence for a missing deadline or a closed client API.
+fn balanced_block<'a>(code: &'a str, head: &str) -> Option<&'a str> {
+    if code.matches(head).count() != 1 || !head.ends_with('{') {
+        return None;
+    }
+    let start = code.find(head)?;
+    let mut depth = 1usize;
+    for (offset, byte) in code[start + head.len()..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&code[start..start + head.len() + offset + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn connectors_keep_one_absolute_deadline(raw: &str) -> bool {
+    let code = compact_code(raw);
+    let owners = [
+        "UnixConnector",
+        "MacRootConnector",
+        "PipeConnector",
+        "WindowsSystemConnector",
+    ];
+    if code.matches("implConnectorfor").count() != owners.len()
+        || code.matches("fnconnect_until(").count() != owners.len()
+        || code.contains("UnixStream::connect(")
+        || code.contains("thread::spawn")
+        || !code.contains("socket.connect_timeout(&address,remaining)")
+    {
+        return false;
+    }
+    for owner in owners {
+        let Some(body) = balanced_block(&code, &format!("implConnectorfor{owner}{{")) else {
+            return false;
+        };
+        if body
+            .matches("fnconnect_until(&self,deadline:Instant)")
+            .count()
+            != 1
+            || !body.contains("self.connect_until(Instant::now()+")
+        {
+            return false;
+        }
+        match owner {
+            "UnixConnector" | "MacRootConnector"
+                if !body.contains(".connect_stream_until(deadline)?") =>
+            {
+                return false
+            }
+            "PipeConnector"
+                if !body.contains("WinPipeStream::connect(&self.pipe_path)")
+                    || !body.contains("Instant::now()>=deadline")
+                    || !body.contains(".saturating_duration_since(Instant::now())") =>
+            {
+                return false
+            }
+            "WindowsSystemConnector"
+                if !body.contains("crate::windows_pipe::WinPipeStream::connect_system()")
+                    || !body.contains("Instant::now()>=deadline")
+                    || !body.contains(
+                        "Ok(stream)ifInstant::now()<deadline=>returnOk(Box::new(stream))",
+                    )
+                    || !body.contains("error.raw_os_error()==Some(231)")
+                    || !body.contains(".saturating_duration_since(Instant::now())") =>
+            {
+                return false
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 #[test]
 fn production_connectors_override_absolute_deadline() {
     let raw = polaris_source_probe::crate_source!("connector.rs");
-    let code = polaris_source_probe::mask_comments(&raw);
-    assert_eq!(code.matches("fn connect_until").count(), 3);
-    assert!(code.contains("socket.connect_timeout(&address, remaining)"));
-    assert!(!code.contains("UnixStream::connect("));
-    assert!(!code.contains("thread::spawn"));
+    assert!(connectors_keep_one_absolute_deadline(&raw));
+    for (old, new) in [
+        (
+            "impl Connector for WindowsSystemConnector",
+            "impl Connector for UnknownConnector",
+        ),
+        (
+            "WinPipeStream::connect_system()",
+            "WinPipeStream::connect(caller_path)",
+        ),
+        (
+            ".connect_stream_until(deadline)?",
+            ".connect_stream_until(Instant::now() + READ_TIMEOUT)?",
+        ),
+        (
+            "Ok(stream) if Instant::now() < deadline",
+            "Ok(stream) if true",
+        ),
+    ] {
+        assert!(
+            raw.contains(old),
+            "negative must mutate actual deadline owner: {old}"
+        );
+        assert!(!connectors_keep_one_absolute_deadline(
+            &raw.replacen(old, new, 1)
+        ));
+    }
+    assert!(!connectors_keep_one_absolute_deadline(&format!("{raw}\nimpl Connector for NewConnector {{ fn connect_until(&self, deadline: Instant) {{}} }}")));
 }
 
 // Inert authority-boundary regressions, including the Mac source when this
@@ -83,35 +187,68 @@ fn mac_system_route_is_closed(connector: &str, check: &str, registry: &str, app:
     let h = compact_code(check);
     let r = compact_code(registry);
     let a = compact_code(app);
-    let Some(root) = c.split("implConnectorforMacRootConnector{").nth(1) else {
+    let Some(root) = balanced_block(&c, "implConnectorforMacRootConnector{") else {
         return false;
     };
-    let root = root.split("structUnixConnStream{").next().unwrap();
+    let Some(windows) = balanced_block(&c, "implConnectorforWindowsSystemConnector{") else {
+        return false;
+    };
     let Some(auth) = root.find("nix::unistd::getpeereid(&connection.stream)") else {
         return false;
     };
     let Some(ready) = root.find("Ok(Box::new(connection))") else {
         return false;
     };
-    let Some(client) = h.split("implSystemMacCheckClient{").nth(1) else {
-        return false;
-    };
-    let client = client.split("implHelperClient{").next().unwrap();
+    for (owner, issuer, platform, operation, digest) in [
+        (
+            "SystemMacCheckClient",
+            "MacRootConnector",
+            "Mac",
+            "run_macos_check",
+            "sha256",
+        ),
+        (
+            "SystemWindowsCheckClient",
+            "WindowsSystemConnector",
+            "Win",
+            "run_windows_check",
+            "digest",
+        ),
+    ] {
+        let Some(client) = balanced_block(&h, &format!("impl{owner}{{")) else {
+            return false;
+        };
+        if !h.contains(&format!("pubstruct{owner}{{client:HelperClient,}}"))
+            || client.matches("pub").count() != 4
+            || !client.contains("pubfnsystem(token:String)->Result<Self,String>{")
+            || !client.contains("pubfnnative_birth_status(&self,)->Result<polaris_helper_proto::response::NativeBirthStatus,String>{")
+            || !client.contains("pubfnrun_check(&self,core:CoreId,config:&[u8],digest:[u8;32],cancel:&AtomicBool,)->Result<HelperCheckOutput,HelperCheckFailure>{")
+            || !client.contains(&format!("pubfn{operation}(&self,core:CoreId,config:&[u8],{digest}:[u8;32],cancel:&AtomicBool,)->Result<HelperCheckOutput,HelperCheckFailure>{{"))
+            || !client.contains(&format!("Box::new(crate::connector::{issuer}),Platform::{platform},token,"))
+            || client.contains("Box<dyn")
+            || h.contains(&format!("From<HelperClient>for{owner}"))
+            || h.contains(&format!("Dereffor{owner}"))
+        { return false; }
+    }
+    let aliases: String = polaris_source_probe::mask_comments(registry)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     auth < ready
         && root.contains("UnixConnector::new(crate::manager::InstallPaths::mac().socket)")
         && root.contains(".connect_stream_until(deadline)?")
         && root.contains("if!uid.is_root(){returnErr(ClientError::Connect(")
         && !root.contains("write_all")
         && c.contains("pub(crate)structMacRootConnector;")
-        && h.contains("pubstructSystemMacCheckClient{client:HelperClient,}")
-        && client.matches("pubfn").count() == 2
-        && client.contains("pubfnsystem(token:String)->Result<Self,String>")
-        && client.contains("Box::new(crate::connector::MacRootConnector)")
-        && !client.contains("Box<dyn")
-        && !h.contains("From<HelperClient>forSystemMacCheckClient")
-        && !h.contains("DerefforSystemMacCheckClient")
-        && r.contains("pubasyncfnrun_macos_helper_check(client:polaris_helper_client::check_config::SystemMacCheckClient,")
+        && c.contains("pub(crate)structWindowsSystemConnector;")
+        && windows.contains("crate::windows_pipe::WinPipeStream::connect_system()")
+        && !windows.contains("PipeConnector")
+        && r.matches("typeSystemCheckClient=").count() == 2
+        && aliases.contains("#[cfg(target_os=\"macos\")]typeSystemCheckClient=polaris_helper_client::check_config::SystemMacCheckClient;")
+        && aliases.contains("#[cfg(windows)]typeSystemCheckClient=polaris_helper_client::check_config::SystemWindowsCheckClient;")
+        && r.contains("pubasyncfnrun_macos_helper_check(client:SystemCheckClient,")
         && a.contains("letclient=polaris_helper_client::check_config::SystemMacCheckClient::system(read_token(&self.token_path()),)?;")
+        && a.contains("letclient=polaris_helper_client::check_config::SystemWindowsCheckClient::system(read_token(&self.token_path()),)?;")
         && a.contains("ifself.never_connect||self.test_connector.is_some(){returnErr(")
 }
 
@@ -154,7 +291,7 @@ fn generic_same_key_wire_data_cannot_become_production_check_retirement() {
         ),
         (
             2,
-            "client: polaris_helper_client::check_config::SystemMacCheckClient,",
+            "client: SystemCheckClient,",
             "client: polaris_helper_client::HelperClient,",
         ),
         (
@@ -162,6 +299,14 @@ fn generic_same_key_wire_data_cannot_become_production_check_retirement() {
             "polaris_helper_client::check_config::SystemMacCheckClient::system(",
             "self.build_client(",
         ),
+        (1, "impl SystemMacCheckClient {", "impl UntrustedClient {"),
+        (1, "    pub fn run_macos_check(", "    pub fn caller_transport("),
+        (1, "    pub fn native_birth_status(", "    fn native_birth_status("),
+        (1, "impl SystemWindowsCheckClient {", "impl SystemWindowsCheckClient {\n    pub fn from_client(client: HelperClient) -> Self { Self { client } }"),
+        (1, "Box::new(crate::connector::WindowsSystemConnector)", "caller_supplied_connector"),
+        (2, "#[cfg(windows)]\ntype SystemCheckClient", "#[cfg(unix)]\ntype SystemCheckClient"),
+        (2, "type SystemCheckClient = polaris_helper_client::check_config::SystemWindowsCheckClient;", "type SystemCheckClient = polaris_helper_client::check_config::SystemMacCheckClient;"),
+        (3, "polaris_helper_client::check_config::SystemWindowsCheckClient::system(", "self.build_client("),
     ] {
         let mut faces = [
             connector.clone(),

@@ -3,6 +3,7 @@ use super::auto_switch::*;
 use super::hot_switch::*;
 use super::*;
 use crate::runtime::auto_switch::RuntimeCandidate;
+use crate::runtime::config::Decision;
 use crate::runtime::stats::relay::{build_aggregate, now_ms, signature_changed};
 use futures::{FutureExt, StreamExt};
 use polaris_config_engine::builder::mesh_mode::DASHBOARD_SELECTOR;
@@ -45,7 +46,8 @@ fn real_core_runtime() -> (Arc<ProxyRuntime>, PathBuf, PathBuf, ()) {
         .expect("driver owns acceptance data directory")
         .clone();
     let path = if super::startup::should_start_via_helper(
-        polaris_config_engine::user_config::ProxyModeType::Manual,
+        polaris_config_engine::user_config::ProxyModeType::Manual
+            .effective_on(runtime.helper.platform()),
         runtime.helper.platform(),
     ) {
         super::core_binary::resolve_helper_candidate_data().map(|data| data.into_path())
@@ -562,7 +564,7 @@ async fn real_core_hot_switch_keeps_pid() {
     println!("[①] 节点监听器：Node A=127.0.0.1:{pa}, Node B=127.0.0.1:{pb}");
 
     // ── ① 起核（两节点，选中 Node A）────────────────────────────────────────
-    // 生产时序：save_full 落盘 → broadcast_config_changed → switch_mode。测试逐条照做，
+    // 生产时序：ConfigManager::update 落盘 → broadcast_config_changed → switch_mode_with。逐条照做，
     // 否则去抖重启回落读磁盘时会拿到默认配置（restart 腿的载荷来自 config.current()）。
     // Keep the production default enabled; only replace unrelated Internet ZIP
     // download with this test's own inert static bundle via the real resolver.
@@ -582,7 +584,13 @@ async fn real_core_hot_switch_keeps_pid() {
         cfg_a["singboxDashboard"], true,
         "production default dashboard must stay enabled"
     );
-    rt.config.save_full(&cfg_a).expect("落盘应成功");
+    rt.config
+        .update(|current| {
+            *current = cfg_a.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("落盘应成功");
     let started = rt.start(cfg_a.clone()).await;
     // These are the actual bytes written by the production generator for this
     // isolated synthetic fixture, not a second serialization/reconstructed graph.
@@ -622,8 +630,14 @@ async fn real_core_hot_switch_keeps_pid() {
 
     // ── ② 切节点 → 热切换，PID 不变（**核心判据**）───────────────────────────
     let cfg_b = two_node_config_ports(mixed, "node-b", pa, pb);
-    rt.config.save_full(&cfg_b).expect("落盘应成功");
-    let out = rt.switch_mode(cfg_b.clone()).await;
+    rt.config
+        .update(|current| {
+            *current = cfg_b.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("落盘应成功");
+    let out = rt.switch_mode_with(cfg_b.clone(), false).await;
     println!("[②] switch_mode（node-a → node-b）→ {out:?}");
     assert_eq!(
         out,
@@ -688,7 +702,13 @@ async fn real_core_hot_switch_keeps_pid() {
 
     // 显式节点命令的新路径：D 保存后只投影 selectedServerId 到 R，必须经真实
     // GroupsSnapshot 读回才回 HotSwitched，且新连接确实回到 A，PID 仍不变。
-    rt.config.save_full(&cfg_a).expect("显式选 A 落盘");
+    rt.config
+        .update(|current| {
+            *current = cfg_a.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("显式选 A 落盘");
     let intent = rt.register_selector_intent();
     let explicit = rt
         .switch_selected_server_if_current("node-a", intent)
@@ -713,8 +733,14 @@ async fn real_core_hot_switch_keeps_pid() {
     // Structural edit is deferred first. Only explicit confirmation may change PID.
     let mixed2 = free_port();
     let cfg_port = two_node_config_ports(mixed2, "node-b", pa, pb);
-    rt.config.save_full(&cfg_port).expect("落盘应成功");
-    let out = rt.switch_mode(cfg_port).await;
+    rt.config
+        .update(|current| {
+            *current = cfg_port.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("落盘应成功");
+    let out = rt.switch_mode_with(cfg_port, false).await;
     println!("[④] switch_mode（改 mixedPort {mixed} → {mixed2}）→ {out:?}");
     assert_eq!(
         out,
@@ -771,7 +797,13 @@ async fn real_core_auto_failover_attests_without_applying_saved_debt() {
     let (pa, _hits_a) = counting_listener().await;
     let (pb, hits_b) = counting_listener().await;
     let runtime = two_node_config_ports(mixed, "node-a", pa, pb);
-    rt.config.save_full(&runtime).expect("seed runtime config");
+    rt.config
+        .update(|current| {
+            *current = runtime.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("seed runtime config");
     let started = rt.start(runtime.clone()).await.expect("real core start");
     let pid = started.pid;
     // 生产心跳首拍晚于起核后的 selector reassert/attestation；测试直调事务也保持同一可达时序，
@@ -780,7 +812,13 @@ async fn real_core_auto_failover_attests_without_applying_saved_debt() {
 
     let mut disk = runtime.clone();
     disk["mixedPort"] = serde_json::json!(free_port());
-    rt.config.save_full(&disk).expect("save unapplied debt");
+    rt.config
+        .update(|current| {
+            *current = disk.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("save unapplied debt");
     let targets = rt
         .speed_probe_targets()
         .expect("running core probe targets");
@@ -848,7 +886,13 @@ async fn real_core_hot_switch_failure_waits_for_explicit_restart_confirmation() 
         {"id":"node-a","name":"Node A","protocol":"socks","address":"127.0.0.1","port":pa},
         {"id":"node-b","name":"Node B","protocol":"socks","address":"127.0.0.1","port":pb}
     ]);
-    rt.config.save_full(&cfg_a).expect("落盘应成功");
+    rt.config
+        .update(|current| {
+            *current = cfg_a.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("落盘应成功");
     let st = rt.start(cfg_a.clone()).await.expect("起核应成功");
     let client1 = polaris_singbox_grpc::SingBoxApiClient::connect(
         polaris_singbox_grpc::Endpoint::new("127.0.0.1", st.clash_api_port),
@@ -915,10 +959,19 @@ async fn real_core_hot_switch_failure_waits_for_explicit_restart_confirmation() 
     // Failed selector HOT must settle without an automatic restart.
     let mut cfg_b = cfg_a;
     cfg_b["selectedServerId"] = serde_json::json!("node-b");
-    rt.config.save_full(&cfg_b).expect("落盘应成功");
-    let out = tokio::time::timeout(Duration::from_secs(15), rt.switch_mode(cfg_b.clone()))
-        .await
-        .expect("[⑤] switch_mode 必须在 15s 内返回 —— 卡死即失败");
+    rt.config
+        .update(|current| {
+            *current = cfg_b.clone();
+            Decision::Write(())
+        })
+        .map(drop)
+        .expect("落盘应成功");
+    let out = tokio::time::timeout(
+        Duration::from_secs(15),
+        rt.switch_mode_with(cfg_b.clone(), false),
+    )
+    .await
+    .expect("[⑤] switch_mode 必须在 15s 内返回 —— 卡死即失败");
     println!("[⑤] 核已死时 switch_mode → {out:?}");
     assert_eq!(
         out,
@@ -1067,6 +1120,7 @@ async fn real_core_hot_switch_failure_waits_for_explicit_restart_confirmation() 
 }
 
 async fn real_core_aggregate_relay_emits_real_frames() {
+    let _real_core_guard = lock_real_core_tests().await;
     let (proxy, dir, _core, _cleanup) = real_core_runtime();
     crate::logging::init(&dir);
     let mixed = free_port();
@@ -1166,6 +1220,7 @@ async fn real_core_aggregate_relay_emits_real_frames() {
 }
 
 /// One bounded case per process. No path, policy, issuer, transport or argv inputs.
+#[cfg(debug_assertions)]
 pub(crate) async fn run_case(case: &str) -> Result<(), String> {
     if !CASE_NAMES.contains(&case) {
         return Err("unknown native acceptance case".into());

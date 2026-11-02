@@ -76,6 +76,8 @@ enum Class {
     Projection,
     /// Host-only fixture writes its own TestDir configuration, not a user choice.
     TestFixture,
+    /// Debug native acceptance writes only its newly allocated private runtime.
+    AcceptanceFixture,
 }
 
 /// 一处登记：(类别, 所在函数, 说明)。
@@ -83,6 +85,14 @@ type Site = (Class, &'static str, &'static str);
 
 /// 登记表：文件 → 按出现顺序逐处的登记。
 const WRITES: &[(&str, &[Site])] = &[
+    (
+        "src-tauri/src/native_verification/proxy_carrier.rs",
+        &[
+            (Class::AcceptanceFixture, "two_node_config_ports", "Construct a fresh private manual two-node configuration, never a user selection"),
+            (Class::AcceptanceFixture, "local_only_config", "Construct a private direct/manual configuration for the closed desktop carrier"),
+            (Class::AcceptanceFixture, "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation", "Write node-b only to the retained private acceptance runtime through its real ConfigManager transaction"),
+        ],
+    ),
     (
         "src-tauri/src/runtime/proxy/prerequisite.rs",
         &[(
@@ -578,6 +588,121 @@ fn scan(source: &str) -> (Vec<Write>, usize) {
     (writes, other)
 }
 
+const NATIVE_ACCEPTANCE_OWNER: &str = "src-tauri/src/native_verification/proxy_carrier.rs";
+fn native_acceptance_writer_is_private(
+    path: &str,
+    function: &str,
+    source: &str,
+    proxy: &str,
+) -> bool {
+    if path != NATIVE_ACCEPTANCE_OWNER {
+        return false;
+    }
+    let compact = |s: &str| {
+        mask_comments(s)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let parent = compact(proxy);
+    let code = mask_comments(source);
+    let bare = mask_comments_and_strings(source);
+    let head = format!("fn {function}(");
+    if bare.matches(&head).count() != 1 {
+        return false;
+    }
+    let body = compact(&code[fn_span(&bare, bare.find(&head).unwrap())]);
+    let owner = compact(source);
+    if !parent.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]#[path=\"../native_verification/proxy_carrier.rs\"]pub(crate)modnative_verification;")
+        || !owner.contains("#[cfg(debug_assertions)]pub(crate)asyncfnrun_case(case:&str)->Result<(),String>{if!CASE_NAMES.contains(&case){returnErr(")
+        || !owner.contains("letdir=parent.join(uuid::Uuid::new_v4().to_string());")
+        || !owner.contains("letconfig=Arc::new(ConfigManager::new(dir.clone()));")
+        || !owner.contains("RUNTIME.set(runtime.clone()).map_err(|_|\"onecaseperprocess\")?;")
+    { return false; }
+    match function {
+        "two_node_config_ports" => body.contains("letmutcfg=polaris_store::default_config();")
+            && body.contains("obj.insert(\"selectedServerId\".into(),serde_json::json!(selected));")
+            && body.contains("obj.insert(\"proxyModeType\".into(),serde_json::json!(\"manual\"));"),
+        "local_only_config" => body.contains("serde_json::json!({\"servers\":[],\"selectedServerId\":\"__direct__\",\"proxyMode\":\"direct\",\"proxyModeType\":\"manual\",") ,
+        "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation" => body.contains("let(rt,dir,_core,_cleanup)=real_core_runtime();")
+            && body.contains("cfg_b[\"selectedServerId\"]=serde_json::json!(\"node-b\");")
+            && body.contains("rt.config.update(|current|{*current=cfg_b.clone();Decision::Write(())}).map(drop)") ,
+        _ => false,
+    }
+}
+
+#[test]
+fn native_acceptance_class_cannot_be_borrowed_by_user_or_unknown_writers() {
+    let source =
+        polaris_source_probe::repo_file_in(env!("CARGO_MANIFEST_DIR"), NATIVE_ACCEPTANCE_OWNER);
+    let proxy =
+        polaris_source_probe::crate_source_in(env!("CARGO_MANIFEST_DIR"), "runtime/proxy.rs");
+    let functions = [
+        "two_node_config_ports",
+        "local_only_config",
+        "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation",
+    ];
+    for function in functions {
+        assert!(
+            native_acceptance_writer_is_private(NATIVE_ACCEPTANCE_OWNER, function, &source, &proxy),
+            "private writer: {function}"
+        );
+        assert!(!native_acceptance_writer_is_private(
+            "src-tauri/src/commands/server.rs",
+            function,
+            &source,
+            &proxy
+        ));
+    }
+    for (function, old, new) in [
+        (
+            functions[0],
+            "let mut cfg = polaris_store::default_config();",
+            "let mut cfg = load_user_config();",
+        ),
+        (
+            functions[1],
+            "\"proxyModeType\": \"manual\"",
+            "\"proxyModeType\": \"tun\"",
+        ),
+        (
+            functions[2],
+            "rt.config\n        .update(|current| {\n            *current = cfg_b.clone();",
+            "user_config\n        .update(|current| {\n            *current = cfg_b.clone();",
+        ),
+    ] {
+        assert!(
+            source.contains(old),
+            "negative must mutate actual private writer: {old}"
+        );
+        assert!(!native_acceptance_writer_is_private(
+            NATIVE_ACCEPTANCE_OWNER,
+            function,
+            &source.replacen(old, new, 1),
+            &proxy
+        ));
+    }
+    let guard = "#[cfg(debug_assertions)]\n#[path = \"../native_verification/proxy_carrier.rs\"]";
+    assert!(proxy.contains(guard));
+    assert!(!native_acceptance_writer_is_private(
+        NATIVE_ACCEPTANCE_OWNER,
+        functions[0],
+        &source,
+        &proxy.replacen(
+            guard,
+            "#[path = \"../native_verification/proxy_carrier.rs\"]",
+            1
+        )
+    ));
+    let added = format!("{source}\nfn unknown_writer() {{ let mut cfg = polaris_store::default_config(); cfg[\"selectedServerId\"] = serde_json::json!(\"node-a\"); }}");
+    assert!(!native_acceptance_writer_is_private(
+        NATIVE_ACCEPTANCE_OWNER,
+        "unknown_writer",
+        &added,
+        &proxy
+    ));
+}
+
 /// 取材面：两棵源码树里的生产 `.rs`。
 fn production_sources() -> Vec<(String, String)> {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -651,6 +776,12 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
                     write.line
                 ),
                 Class::User | Class::Restore | Class::Projection => {}
+                Class::AcceptanceFixture => {
+                    let proxy = polaris_source_probe::crate_source_in(env!("CARGO_MANIFEST_DIR"), "runtime/proxy.rs");
+                    assert!(!write.touches_intent);
+                    assert!(native_acceptance_writer_is_private(path, function, source, &proxy),
+                        "acceptance classification escaped its exact private writer: {path}::{function}");
+                }
                 Class::TestFixture => {
                     let bare = mask_comments(source);
                     assert!(bare.contains(
@@ -697,6 +828,7 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
         Class::Restore,
         Class::Projection,
         Class::TestFixture,
+        Class::AcceptanceFixture,
     ] {
         assert!(classes.contains(&class), "{class:?} 一条都没有");
     }

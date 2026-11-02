@@ -216,11 +216,11 @@ async fn disconnected_measurements_invalidate_when_actual_selected_source_is_rep
 
 #[cfg(any(target_os = "macos", windows))]
 #[tokio::test]
-async fn desktop_startup_inventory_method_is_available_and_truthfully_unsupported() {
-    let (rt, dir) = test_runtime();
-    let binary = dir.join("unsupported-exact-core");
+async fn desktop_inventory_probe_rejects_nonadmitted_bytes() {
+    let dir = crate::test_support::TestDir::new("unsupported-exact-core-");
+    let binary = dir.path().join("unsupported-exact-core");
     std::fs::write(&binary, b"foreign data").unwrap();
-    let snapshot = rt.tls_fingerprint_capabilities_for(Some(&binary)).await;
+    let snapshot = crate::runtime::tls_fingerprints::probe_cli(&binary).await;
     assert!(snapshot.document.is_none());
     assert!(snapshot.binary_sha256.is_none());
     assert!(snapshot

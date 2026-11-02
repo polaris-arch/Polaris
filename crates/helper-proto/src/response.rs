@@ -338,7 +338,22 @@ impl Response {
         if let Some(reply) = crate::check_config::CheckReply::parse(line) {
             return Self::Ok(ResponseKind::MacCheck(reply));
         }
-        if let Some((birth_line, id)) = line.rsplit_once(" core=") {
+        // Only start receipts wrap a separate selected CoreId. Native status
+        // owns its optional core field and must reach its canonical parser.
+        let pinned_start = matches!(
+            line.strip_prefix("OK ")
+                .and_then(|rest| rest.split_once(' '))
+                .map(|(token, _)| token),
+            Some(
+                "birth-started"
+                    | "birth-already"
+                    | "birth-start-not-admitted"
+                    | "native-birth-started"
+                    | "native-birth-already"
+                    | "native-birth-start-not-admitted"
+            )
+        );
+        if let Some((birth_line, id)) = line.rsplit_once(" core=").filter(|_| pinned_start) {
             if let Ok(id) = crate::core_manifest::CoreId::parse(id) {
                 if birth_line.contains(" core=") {
                     return Self::Ok(ResponseKind::OkRaw {
