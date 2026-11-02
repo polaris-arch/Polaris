@@ -642,6 +642,12 @@ fn native_acceptance_class_cannot_be_borrowed_by_user_or_unknown_writers() {
         "local_only_config",
         "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation",
     ];
+    let predicate_code = |text: &str| {
+        mask_comments(text)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
     for function in functions {
         assert!(
             native_acceptance_writer_is_private(NATIVE_ACCEPTANCE_OWNER, function, &source, &proxy),
@@ -671,30 +677,84 @@ fn native_acceptance_class_cannot_be_borrowed_by_user_or_unknown_writers() {
             "user_config\n        .update(|current| {\n            *current = cfg_b.clone();",
         ),
     ] {
-        assert!(
-            source.contains(old),
-            "negative must mutate actual private writer: {old}"
+        let bare = mask_comments_and_strings(&source);
+        let head = format!("fn {function}(");
+        assert_eq!(
+            bare.matches(&head).count(),
+            1,
+            "unique target function: {function}"
         );
+        let span = fn_span(&bare, bare.find(&head).unwrap());
+        let body = &source[span.clone()];
+        assert_eq!(
+            body.matches(old).count(),
+            1,
+            "negative must bind once inside target body: {function}: {old}"
+        );
+        let changed_body = body.replacen(old, new, 1);
+        assert_ne!(
+            predicate_code(body),
+            predicate_code(&changed_body),
+            "predicate body must change: {function}"
+        );
+        let changed = format!(
+            "{}{}{}",
+            &source[..span.start],
+            changed_body,
+            &source[span.end..]
+        );
+        let changed_bare = mask_comments_and_strings(&changed);
+        assert_eq!(changed_bare.matches(&head).count(), 1);
+        let changed_span = fn_span(&changed_bare, changed_bare.find(&head).unwrap());
+        assert_eq!(
+            &changed[changed_span], changed_body,
+            "reassembled target body must carry the mutation"
+        );
+        assert!(changed.starts_with(&source[..span.start]));
+        assert!(changed.ends_with(&source[span.end..]));
         assert!(!native_acceptance_writer_is_private(
             NATIVE_ACCEPTANCE_OWNER,
             function,
-            &source.replacen(old, new, 1),
+            &changed,
             &proxy
         ));
     }
     let guard = "#[cfg(debug_assertions)]\n#[path = \"../native_verification/proxy_carrier.rs\"]";
-    assert!(proxy.contains(guard));
+    assert_eq!(proxy.matches(guard).count(), 1);
+    let changed_proxy = proxy.replacen(
+        guard,
+        "#[path = \"../native_verification/proxy_carrier.rs\"]",
+        1,
+    );
+    assert_ne!(predicate_code(&proxy), predicate_code(&changed_proxy));
     assert!(!native_acceptance_writer_is_private(
         NATIVE_ACCEPTANCE_OWNER,
         functions[0],
         &source,
-        &proxy.replacen(
-            guard,
-            "#[path = \"../native_verification/proxy_carrier.rs\"]",
-            1
-        )
+        &changed_proxy
     ));
     let added = format!("{source}\nfn unknown_writer() {{ let mut cfg = polaris_store::default_config(); cfg[\"selectedServerId\"] = serde_json::json!(\"node-a\"); }}");
+    assert_eq!(
+        mask_comments_and_strings(&source)
+            .matches("fn unknown_writer(")
+            .count(),
+        0
+    );
+    assert_eq!(
+        mask_comments_and_strings(&added)
+            .matches("fn unknown_writer(")
+            .count(),
+        1
+    );
+    assert_eq!(scan(&added).0.len(), scan(&source).0.len() + 1);
+    for function in functions {
+        assert!(native_acceptance_writer_is_private(
+            NATIVE_ACCEPTANCE_OWNER,
+            function,
+            &added,
+            &proxy
+        ));
+    }
     assert!(!native_acceptance_writer_is_private(
         NATIVE_ACCEPTANCE_OWNER,
         "unknown_writer",

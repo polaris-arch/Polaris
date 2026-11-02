@@ -958,7 +958,15 @@ fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
 // reviewed binary keeps its published name, feature and physical runner path;
 // declaring an arbitrary bin or renaming a module cannot borrow this exception.
 const NATIVE_VERIFIER_ROOT: &str = "src/bin/native-admission-verifier.rs";
-fn reviewed_binary_root(manifest: &str) -> Result<Option<&'static str>, &'static str> {
+fn reviewed_binary_root(
+    owner: &Path,
+    manifest: &str,
+) -> Result<Option<&'static str>, &'static str> {
+    // Other Cargo binaries are not Rust module-name exceptions. Their physical
+    // src/tests files still pass through the complete ordinary naming census.
+    if owner != Path::new("src-tauri") {
+        return Ok(None);
+    }
     let masked = mask_toml_comments(manifest);
     let tables: Vec<_> = masked.split("[[bin]]").skip(1).collect();
     if tables.is_empty() {
@@ -1002,7 +1010,7 @@ fn rust_name_violation<'a>(rel: &'a str, target_root: Option<&str>) -> Option<&'
 fn binary_target_classification_does_not_exempt_modules_or_unreviewed_targets() {
     let manifest = std::fs::read_to_string(workspace_root().join("src-tauri/Cargo.toml")).unwrap();
     assert_eq!(
-        reviewed_binary_root(&manifest),
+        reviewed_binary_root(Path::new("src-tauri"), &manifest),
         Ok(Some(NATIVE_VERIFIER_ROOT))
     );
     for (old, new) in [
@@ -1024,14 +1032,17 @@ fn binary_target_classification_does_not_exempt_modules_or_unreviewed_targets() 
             manifest.contains(old),
             "negative must bind the real Cargo target: {old}"
         );
-        assert!(reviewed_binary_root(&manifest.replacen(old, new, 1)).is_err());
+        assert!(
+            reviewed_binary_root(Path::new("src-tauri"), &manifest.replacen(old, new, 1)).is_err()
+        );
     }
-    assert!(reviewed_binary_root(&format!(
-        "{manifest}\n[[bin]]\nname = \"extra\"\npath = \"src/bin/extra-bin.rs\"\n"
-    ))
+    assert!(reviewed_binary_root(
+        Path::new("src-tauri"),
+        &format!("{manifest}\n[[bin]]\nname = \"extra\"\npath = \"src/bin/extra-bin.rs\"\n")
+    )
     .is_err());
     assert_eq!(
-        reviewed_binary_root("[package]\nname = \"ordinary\"\n"),
+        reviewed_binary_root(Path::new("src-tauri"), "[package]\nname = \"ordinary\"\n"),
         Ok(None)
     );
     assert_eq!(
@@ -1050,6 +1061,35 @@ fn binary_target_classification_does_not_exempt_modules_or_unreviewed_targets() 
         assert!(rust_name_violation(rel, Some("bin/native-admission-verifier.rs")).is_some());
     }
     assert!(rust_name_violation("bin/native-admission-verifier.rs", None).is_some());
+
+    for (owner, physical_root, name) in [
+        ("crates/helper", "bin/main.rs", "polaris-helper"),
+        ("crates/windows-cleaner", "main.rs", "polaris-cleaner"),
+    ] {
+        let existing =
+            std::fs::read_to_string(workspace_root().join(owner).join("Cargo.toml")).unwrap();
+        assert!(existing.contains(&format!(
+            "[[bin]]\nname = \"{name}\"\npath = \"src/{physical_root}\""
+        )));
+        assert!(workspace_root()
+            .join(owner)
+            .join("src")
+            .join(physical_root)
+            .is_file());
+        assert_eq!(reviewed_binary_root(Path::new(owner), &existing), Ok(None));
+        assert_eq!(rust_name_violation(physical_root, None), None);
+        // Copying the native declaration to another owner cannot grant its
+        // physical filename an exception, even with identical Cargo fields.
+        let wrong_owner = reviewed_binary_root(Path::new(owner), &manifest).unwrap();
+        assert_eq!(wrong_owner, None);
+        assert!(rust_name_violation("bin/native-admission-verifier.rs", wrong_owner).is_some());
+        let unknown = format!(
+            "{existing}\n[[bin]]\nname = \"unknown-bin\"\npath = \"src/bin/unknown-bin.rs\"\n"
+        );
+        let no_exception = reviewed_binary_root(Path::new(owner), &unknown).unwrap();
+        assert_eq!(no_exception, None);
+        assert!(rust_name_violation("bin/unknown-bin.rs", no_exception).is_some());
+    }
 }
 
 /// **变异探针**：`mkdir crates/store/src/foo-bar` ⇒ Rust 侧转红；
@@ -1065,8 +1105,11 @@ fn directory_and_file_naming_is_uniform_within_each_namespace() {
     // Rust modules use snake case; only the exact validated Cargo root has a binary name.
     for member in workspace_members(&root) {
         let manifest = std::fs::read_to_string(member.join("Cargo.toml")).unwrap();
-        let binary =
-            reviewed_binary_root(&manifest).expect("binary declaration must be reviewed exactly");
+        let owner = member
+            .strip_prefix(&root)
+            .expect("member must belong to the workspace");
+        let binary = reviewed_binary_root(owner, &manifest)
+            .expect("native binary declaration must be reviewed exactly");
         if let Some(relative) = binary {
             assert_eq!(member.strip_prefix(&root).unwrap(), Path::new("src-tauri"));
             let target = member.join(relative);
