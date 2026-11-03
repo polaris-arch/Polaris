@@ -460,7 +460,6 @@
     "impactApplyClockConsumers": "新的時鐘使用元件將切換到更新後的時間來源。",
     "impactApplyUnknown": "無法確認此次變更的影響，已禁止套用。請取消並檢查待套用的變更。",
     "impactApplySavedPending": "這些變更已儲存。取消會保留待套用狀態，目前執行中的設定不變。",
-    "impactApplyReconnect": "受影響的連線可能需要重新連線。",
     "impactApplyDns": "更新系統 DNS 設定",
     "impactApplyProxy": "更新系統代理設定",
     "impactApplyTunnel": "更新通道設定",

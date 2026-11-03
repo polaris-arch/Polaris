@@ -2546,7 +2546,7 @@ fn checked_wire_snapshot(
     let mut conn = MockConn::new(vec![lcmd::RESOLVED_DNS_SNAPSHOT]);
     handle(state, deps, &mut conn);
     match Response::parse(&conn.writes()[0]) {
-        Response::Ok(ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot))) => snapshot,
+        Response::Ok(ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot))) => *snapshot,
         other => panic!("expected exact read-only snapshot, got {other:?}"),
     }
 }

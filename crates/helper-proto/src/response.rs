@@ -240,8 +240,8 @@ pub enum FlushDns {
 pub enum LinuxDns {
     /// `OK resolved-dns-set`：写入并读回自证成功。
     Set,
-    Snapshot(crate::linux_dns::Snapshot),
-    Changed(crate::linux_dns::Snapshot),
+    Snapshot(Box<crate::linux_dns::Snapshot>),
+    Changed(Box<crate::linux_dns::Snapshot>),
     Gone(crate::linux_dns::Gone),
     NoChange,
     /// `OK resolved-dns-reverted`：链路配置已撤销，或接口已不存在（等价于无残留）。
@@ -814,9 +814,9 @@ fn parse_ok(rest: &str) -> ResponseKind {
             match serde_json::from_str::<crate::linux_dns::Snapshot>(tail) {
                 Ok(snapshot) if snapshot.valid() => {
                     ResponseKind::LinuxDns(if token == "resolved-dns-snapshot-v1" {
-                        LinuxDns::Snapshot(snapshot)
+                        LinuxDns::Snapshot(Box::new(snapshot))
                     } else {
-                        LinuxDns::Changed(snapshot)
+                        LinuxDns::Changed(Box::new(snapshot))
                     })
                 }
                 _ => ResponseKind::OkRaw {

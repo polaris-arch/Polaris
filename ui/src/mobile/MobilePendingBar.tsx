@@ -45,7 +45,7 @@ import { api } from '@/ipc';
 import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
 import { restartReasonKeys, type RestartPrompt } from '@/components/dialogs/restart-apply-reasons';
 import { FormSheet } from './forms/FormSheet';
-import { ImpactApplySummary, impactApplyDisclosure } from '@/components/dialogs/ImpactApplyDialog';
+import { ImpactApplySummary, impactApplyDisclosure } from '@/shared/ImpactApplySummary';
 import { useImpactConfirmation } from '@/components/dialogs/use-impact-confirmation';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import type { ProxyLifecycleEvent } from '@/contracts/types';
@@ -457,7 +457,7 @@ export function MobilePendingBar(): ReactElement | null {
             const prompt = impactChoice.prompt;
             if (prompt && !impactApplyDisclosure(prompt).blocked) void onApply(undefined, undefined, prompt.token);
           }}>
-          <ImpactApplySummary prompt={impactChoice.prompt} />
+          <ImpactApplySummary prompt={{ coreImpacts: impactChoice.prompt.coreImpacts, hostEffects: impactChoice.prompt.hostEffects }} />
         </FormSheet>
       )}
       {restartPrompt !== null && (

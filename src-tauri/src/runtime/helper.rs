@@ -2149,7 +2149,7 @@ impl HelperRuntime {
             Ok(Response::Ok(ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot))))
                 if snapshot.valid() =>
             {
-                Ok(snapshot)
+                Ok(*snapshot)
             }
             other => Err(format!("helper resolved snapshot unavailable: {other:?}")),
         }

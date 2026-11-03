@@ -291,7 +291,7 @@ impl LinuxResolvedOps for CheckedOps {
             state.owned = false;
         }
         state.cleanup_pending = false;
-        Ok(Change::Changed(state.clone()))
+        Ok(Change::Changed(Box::new(state.clone())))
     }
 }
 

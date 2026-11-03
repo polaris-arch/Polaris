@@ -202,6 +202,9 @@ if (MIRROR_HITS.length < 15)
 type Route = 'disk' | 'derive';
 
 interface Site {
+  // Explicit saved-candidate operation ownership; not editable display.
+  readonly surface?: 'operation';
+  readonly operation?: 'impact-version-fence' | 'host-retry-fence';
   readonly file: string;
   readonly shape: string;
   readonly route: Route;
@@ -210,6 +213,30 @@ interface Site {
 }
 
 const SITES: readonly Site[] = [
+  {
+    file: 'components/dialogs/use-impact-confirmation.ts',
+    shape: 'useAppStore((state)=>state.config)',
+    route: 'disk', surface: 'operation', operation: 'impact-version-fence',
+    why: '对账类：保存 config 发布只触发 impact prompt 版本/草稿/运行代次 fence，失配 cancelRuntimeImpact 撤销旧 token；不展示可编辑实体或触发 Apply。',
+  },
+  {
+    file: 'components/dialogs/use-impact-confirmation.ts',
+    shape: 'useAppStore.getState().config',
+    route: 'disk', surface: 'operation', operation: 'impact-version-fence',
+    why: '基准类：currentVersion 经 configBaseVersion 绑定已保存候选，offer 与 effect 复核同版本；实际 API 仅 cancelRuntimeImpact，不借暂存展示代替磁盘身份。',
+  },
+  {
+    file: 'components/layout/PendingChangesBar.tsx',
+    shape: 'useAppStore.getState().config',
+    route: 'disk', surface: 'operation', operation: 'host-retry-fence',
+    why: '入参类：hostRetry 捕获保存候选并在等待后与 impact 确认前复核同一 config/draft 对象；仅固定候选调用 applyPendingChanges，不将暂存展示当持久候选。',
+  },
+  {
+    file: 'mobile/MobilePendingBar.tsx',
+    shape: 'useAppStore.getState().config',
+    route: 'disk', surface: 'operation', operation: 'host-retry-fence',
+    why: '入参类：移动 hostRetry 与桌面同样以保存 config/draft 对象 fence 保护 applyPendingChanges；读点不是展示，也不新增 config.get/save 旁路。',
+  },
   {
     file: 'hooks/use-subscription-user-agent.ts',
     shape: 'useAppStore(state=>state.config?.subscriptionUserAgent)',
@@ -1434,6 +1461,153 @@ describe('M4：权威 raw config 投影与实际 publication 的 AST 接线', ()
     for (const mutation of mutations) {
       expect(mutation).not.toBe(source);
       expect(rawPublicationIsConnected(mutation)).toBe(false);
+    }
+  });
+});
+
+
+// Finite source evidence for the four saved-candidate operation reads.
+function diskOperationReadsOwned(source: string, operation: 'impact-version-fence' | 'host-retry-fence'): boolean {
+  const nodes = publicationNodes(parse(source, { sourceType: 'module', plugins: ['typescript', 'jsx'] }));
+  const named = (node: unknown, name: string) => {
+    const value = node as PublicationNode | null;
+    return value?.type === 'Identifier' && value.name === name;
+  };
+  const statements = (text: string) => {
+    const fn = parse(`async function contract() { ${text} }`, { sourceType: 'module', plugins: ['typescript', 'jsx'] }).program.body[0];
+    return fn.type === 'FunctionDeclaration' ? fn.body.body : [];
+  };
+  const same = (value: unknown, text: string) => publicationShape(value) === publicationShape(statements(text));
+  const expression = (value: unknown, text: string) => {
+    const statement = statements(`const expected = ${text};`)[0];
+    return statement?.type === 'VariableDeclaration'
+      && publicationShape(value) === publicationShape(statement.declarations[0].init);
+  };
+  const calleePath = (value: unknown): string | null => {
+    const node = value as PublicationNode | null;
+    if (node?.type === 'Identifier') return String(node.name);
+    if (node?.type !== 'MemberExpression' || node.computed || (node.property as PublicationNode)?.type !== 'Identifier') return null;
+    const owner = calleePath(node.object);
+    return owner ? `${owner}.${String((node.property as PublicationNode).name)}` : null;
+  };
+  const handlers = nodes.filter(node => node.type === 'VariableDeclarator' && named(node.id, 'onApply'));
+  if (operation === 'host-retry-fence' && handlers.length !== 1) return false;
+  const scoped = operation === 'host-retry-fence' ? publicationNodes(handlers[0].init) : nodes;
+  const calls = scoped.filter(node => node.type === 'CallExpression').map(node => calleePath(node.callee))
+    .filter((path): path is string => path !== null && path.startsWith('api.'));
+  const allowed = operation === 'impact-version-fence' ? ['api.proxy.cancelRuntimeImpact']
+    : ['api.proxy.applyPendingChanges', 'api.proxy.retryRuntimePersistence', 'api.proxy.cancelRuntimeImpact'];
+  if (calls.length === 0 || calls.some(path => !allowed.includes(path))
+    || scoped.some(node => node.type === 'VariableDeclarator' && calleePath(node.init)?.startsWith('api.'))) return false;
+  if (operation === 'impact-version-fence') {
+    const current = nodes.filter(node => node.type === 'FunctionDeclaration' && named(node.id, 'currentVersion'));
+    const hook = nodes.filter(node => node.type === 'FunctionDeclaration' && named(node.id, 'useImpactConfirmation'));
+    if (current.length !== 1 || hook.length !== 1 || !same((current[0].body as PublicationNode).body, `
+      const config = useAppStore.getState().config;
+      return config === null ? null : configBaseVersion(config);
+    `)) return false;
+    const body = (hook[0].body as PublicationNode).body as PublicationNode[];
+    const declarations = body.filter(node => node.type === 'VariableDeclaration').flatMap(node => node.declarations as PublicationNode[]);
+    if (declarations.filter(node => named(node.id, 'config') && expression(node.init, 'useAppStore((state) => state.config)')).length !== 1) return false;
+    const effects = body.filter(node => node.type === 'ExpressionStatement' && named((node.expression as PublicationNode)?.callee, 'useEffect'));
+    if (effects.length !== 1 || !same(effects, `
+      useEffect(() => {
+        if (prompt && (entries !== prompt.draft || currentVersion() !== prompt.version
+          || !status?.running || status.mainGeneration !== prompt.generation)) {
+          setPrompt(null);
+          void api.proxy.cancelRuntimeImpact(prompt.token).catch(() => null);
+        }
+      }, [prompt, entries, config, status]);
+    `)) return false;
+    const offer = declarations.filter(node => named(node.id, 'offer'));
+    if (offer.length !== 1) return false;
+    const writes = publicationNodes(offer[0].init).filter(node => node.type === 'CallExpression' && named(node.callee, 'setPrompt'));
+    return writes.length === 1 && expression(writes[0], `setPrompt({
+      token: receipt.impactConfirmation, coreImpacts: receipt.coreImpacts ?? [],
+      hostEffects: receipt.hostEffectPreviews ?? [], generation: generation as number,
+      draft: useStagedConfigStore.getState().entries, version: currentVersion()
+    })`);
+  }
+  const handler = handlers[0].init as PublicationNode;
+  const body = (handler.body as PublicationNode).body as PublicationNode[];
+  const declarations = body.filter(node => node.type === 'VariableDeclaration').flatMap(node => node.declarations as PublicationNode[]);
+  const candidate = declarations.filter(node => named(node.id, 'hostCandidate'));
+  const sameCandidate = declarations.filter(node => named(node.id, 'sameHostCandidate'));
+  if (candidate.length !== 1 || sameCandidate.length !== 1
+    || !expression(candidate[0].init, `hostRetry ? { draft: useStagedConfigStore.getState().entries, config: useAppStore.getState().config } : null`)
+    || !expression(sameCandidate[0].init, `() => hostCandidate !== null
+      && useStagedConfigStore.getState().entries === hostCandidate.draft
+      && useAppStore.getState().config === hostCandidate.config`)) return false;
+  const tries = body.filter(node => node.type === 'TryStatement');
+  if (tries.length !== 1) return false;
+  const executed = (tries[0].block as PublicationNode).body as PublicationNode[];
+  const guardAt = executed.findIndex(node => node.type === 'IfStatement' && expression(node.test, 'hostRetry && !sameHostCandidate()'));
+  const resultAt = executed.findIndex(node => node.type === 'VariableDeclaration'
+    && (node.declarations as PublicationNode[]).some(declaration => named(declaration.id, 'result')));
+  if (guardAt < 0 || resultAt <= guardAt || !same([executed[guardAt]], `
+    if (hostRetry && !sameHostCandidate()) {
+      request.awaitingReply = false;
+      setApply({ ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+        reason: null, reconciling: !!initial.coreRecovery });
+      return;
+    }
+  `)) return false;
+  const impact = executed.filter(node => node.type === 'IfStatement' && expression(node.test, "result.status === 'impactConfirmationRequired'"));
+  if (impact.length !== 1) return false;
+  const impactBody = (impact[0].consequent as PublicationNode).body as PublicationNode[];
+  const fence = impactBody.filter(node => node.type === 'IfStatement' && expression(node.test, 'hostRetry && !sameHostCandidate()'));
+  if (fence.length !== 1 || !same(fence, `
+    if (hostRetry && !sameHostCandidate()) {
+      if (result.impactConfirmation) void api.proxy.cancelRuntimeImpact(result.impactConfirmation).catch(() => null);
+      setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotConflict'), reconciling: !!initial.coreRecovery });
+      return;
+    }
+  `)) return false;
+  return scoped.filter(node => expression(node, 'useAppStore.getState().config')).length === 2;
+}
+
+describe('T6：保存候选磁盘读点只服务原 operation fence', () => {
+  it('四登记均为 operation，并追到实际版本/同对象 fence 与有限 API', () => {
+    const rows = SITES.filter(site => site.operation !== undefined);
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      expect(row.route).toBe('disk');
+      expect(row.surface).toBe('operation');
+      expect(diskOperationReadsOwned(readFileSync(join(SRC, row.file), 'utf8'), row.operation!)).toBe(true);
+    }
+  });
+  it('impact 版本 fence 不能改展示源、漏订阅、丢版本或新增 API', () => {
+    const source = readFileSync(join(SRC, 'components/dialogs/use-impact-confirmation.ts'), 'utf8');
+    for (const [before, after] of [
+      ['const config = useAppStore.getState().config;', 'const config = getEffectiveConfig();'],
+      ['configBaseVersion(config)', 'configBaseVersion(other)'],
+      ['[prompt, entries, config, status]', '[prompt, entries, status]'],
+      ['version: currentVersion()', 'version: null'],
+      ['const config = useAppStore.getState().config;', 'api.config.get(); const config = useAppStore.getState().config;'],
+    ]) {
+      expect(source.split(before)).toHaveLength(2);
+      expect(diskOperationReadsOwned(source.replace(before, after), 'impact-version-fence')).toBe(false);
+    }
+  });
+  it('两宿主不能错接 effective、异对象、错 draft 或隐藏 config API', () => {
+    for (const path of ['components/layout/PendingChangesBar.tsx', 'mobile/MobilePendingBar.tsx']) {
+      const source = readFileSync(join(SRC, path), 'utf8');
+      const handlers = publicationNodes(parse(source, { sourceType: 'module', plugins: ['typescript', 'jsx'] }))
+        .filter(node => node.type === 'VariableDeclarator' && (node.id as PublicationNode)?.name === 'onApply');
+      expect(handlers).toHaveLength(1);
+      const handler = handlers[0].init as PublicationNode;
+      const start = handler.start as number, end = handler.end as number;
+      const body = source.slice(start, end);
+      for (const [before, after] of [
+        ['config: useAppStore.getState().config } : null', 'config: getEffectiveConfig() } : null'],
+        ['useAppStore.getState().config === hostCandidate.config', 'useAppStore.getState().config === other.config'],
+        ['useStagedConfigStore.getState().entries === hostCandidate.draft', 'useStagedConfigStore.getState().entries !== hostCandidate.draft'],
+        ['const hostCandidate =', 'api.config.get(); const hostCandidate ='],
+      ]) {
+        expect(body.split(before)).toHaveLength(2);
+        const mutation = source.slice(0, start) + body.replace(before, after) + source.slice(end);
+        expect(diskOperationReadsOwned(mutation, 'host-retry-fence')).toBe(false);
+      }
     }
   });
 });

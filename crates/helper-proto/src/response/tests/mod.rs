@@ -990,8 +990,8 @@ fn checked_dns_receipts_round_trip_without_legacy_or_reap_aliases() {
         link: before.link.clone(),
     };
     for value in [
-        LinuxDns::Snapshot(before),
-        LinuxDns::Changed(changed),
+        LinuxDns::Snapshot(Box::new(before)),
+        LinuxDns::Changed(Box::new(changed)),
         LinuxDns::Gone(gone),
         LinuxDns::NoChange,
     ] {
@@ -1002,6 +1002,30 @@ fn checked_dns_receipts_round_trip_without_legacy_or_reap_aliases() {
             Response::parse(&wire),
             Response::Ok(ResponseKind::LinuxBirthStop(_) | ResponseKind::Stop(_))
         ));
+    }
+}
+
+#[test]
+fn checked_dns_snapshot_and_changed_preserve_existing_json_wire_bytes() {
+    let snapshot_wire = concat!(
+        "OK resolved-dns-snapshot-v1 ",
+        r#"{"pid":77,"birth":"01010101010101010101010101010101","link":{"ifindex":8,"sysfsDevice":1,"sysfsInode":80,"netnsInode":9,"tunFlags":1},"settings":{"servers":[],"domains":[],"defaultRoute":false,"dnssec":"no","dnsOverTls":"no"},"original":null,"owned":false,"cleanupPending":false}"#
+    );
+    let changed_wire = concat!(
+        "OK resolved-dns-changed-v1 ",
+        r#"{"pid":77,"birth":"01010101010101010101010101010101","link":{"ifindex":8,"sysfsDevice":1,"sysfsInode":80,"netnsInode":9,"tunFlags":1},"settings":{"servers":["8.8.8.8"],"domains":["~."],"defaultRoute":true,"dnssec":"no","dnsOverTls":"no"},"original":{"servers":[],"domains":[],"defaultRoute":false,"dnssec":"no","dnsOverTls":"no"},"owned":true,"cleanupPending":false}"#
+    );
+    for (wire, changed) in [(snapshot_wire, false), (changed_wire, true)] {
+        let response = Response::parse(wire);
+        let snapshot = match (&response, changed) {
+            (Response::Ok(ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot))), false)
+            | (Response::Ok(ResponseKind::LinuxDns(LinuxDns::Changed(snapshot))), true) => snapshot,
+            other => panic!("existing JSON must retain its typed DNS receipt: {other:?}"),
+        };
+        assert!(snapshot.valid());
+        assert_eq!(snapshot.owned, changed);
+        assert_eq!(snapshot.original.is_some(), changed);
+        assert_eq!(response.to_wire_line(), wire);
     }
 }
 
@@ -1068,7 +1092,7 @@ fn checked_dns_debug_does_not_disclose_birth_or_private_resolver_baseline() {
     snapshot.owned = true;
     let debug = format!(
         "{:?}",
-        ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot.clone()))
+        ResponseKind::LinuxDns(LinuxDns::Snapshot(Box::new(snapshot.clone())))
     );
     assert!(!debug.contains(&snapshot.birth));
     assert!(!debug.contains("192.168.254.53"));

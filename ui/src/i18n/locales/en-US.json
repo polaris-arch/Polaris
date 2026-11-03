@@ -460,7 +460,6 @@
     "impactApplyClockConsumers": "New components using the clock switch to the updated time source.",
     "impactApplyUnknown": "The impact cannot be verified. Applying is blocked; cancel and review the pending changes.",
     "impactApplySavedPending": "These changes are saved. Cancel keeps them pending and leaves the running configuration unchanged.",
-    "impactApplyReconnect": "Affected connections may need to reconnect.",
     "impactApplyDns": "Update system DNS settings",
     "impactApplyProxy": "Update system proxy settings",
     "impactApplyTunnel": "Update tunnel settings",

@@ -411,7 +411,7 @@ fn handle_checked_dns<P, S, D, SD>(
         if !matches!(conn.read_line_strict(), Ok(None)) {
             let _ = conn.write_line("ERR bad-args");
         } else if let Some(snapshot) = checked_dns_snapshot(state, deps, cred) {
-            write_checked_dns(conn, LinuxDns::Snapshot(snapshot));
+            write_checked_dns(conn, LinuxDns::Snapshot(Box::new(snapshot)));
         } else {
             write_checked_dns(conn, LinuxDns::NoChange);
         }
@@ -592,7 +592,7 @@ fn handle_checked_dns<P, S, D, SD>(
         let (link, settings) = result.expect("checked native result");
         write_checked_dns(
             conn,
-            LinuxDns::Changed(Snapshot {
+            LinuxDns::Changed(Box::new(Snapshot {
                 pid: expected.pid,
                 birth: expected.birth,
                 link,
@@ -600,7 +600,7 @@ fn handle_checked_dns<P, S, D, SD>(
                 original: retained_original,
                 owned: request.enabled,
                 cleanup_pending: false,
-            }),
+            })),
         );
     } else {
         // Exact reservation/possible-write footprint survives lost IPC, partial

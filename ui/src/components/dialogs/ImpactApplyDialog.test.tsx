@@ -2,12 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ImpactPrompt } from './use-impact-confirmation';
-import type { ModalProps } from './Modal';
+import { Modal, type ModalProps } from './Modal';
+import { ImpactApplySummary, type ImpactDisclosure } from '@/shared/ImpactApplySummary';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 // The browser suite covers the actual Modal. Here invoke the real disclosure/footer handlers without a DOM.
 vi.mock('./Modal', () => ({ Modal: () => null }));
-import { ImpactApplyDialog, ImpactApplySummary } from './ImpactApplyDialog';
+import { ImpactApplyDialog } from './ImpactApplyDialog';
 
 function prompt(classes: string[], updateClass = 2, reconnectRequired = true): ImpactPrompt {
   return { token: 'private-token', generation: 7, draft: [], version: null, hostEffects: [],
@@ -25,6 +26,26 @@ function privateFieldsStayHidden(html: string) {
 }
 
 describe('desktop impact consent disclosure', () => {
+  it('keeps the read-only shared disclosure inside the real desktop Modal and cancellation separate', () => {
+    const value = prompt(['API streams on the replaced ingress']);
+    const onConfirm = vi.fn(), onDismiss = vi.fn();
+    const modal = ImpactApplyDialog({ prompt: value, onConfirm, onDismiss }) as ReactElement<ModalProps>;
+    expect(modal.type).toBe(Modal);
+    const summary = modal.props.children as ReactElement<{ prompt: ImpactDisclosure }>;
+    expect(summary.type).toBe(ImpactApplySummary);
+    expect(Object.keys(summary.props.prompt).sort()).toEqual(['coreImpacts', 'hostEffects']);
+    expect(summary.props.prompt).toEqual({ coreImpacts: value.coreImpacts, hostEffects: value.hostEffects });
+    const html = renderToStaticMarkup(summary);
+    expect(html).toContain('home.impactApplyApiStreams');
+    expect(html).toContain('home.impactApplySavedPending');
+    expect(html).not.toMatch(/<(?:button|input|select|dialog)\b/);
+    privateFieldsStayHidden(html);
+    const footer = modal.props.footer as ReactElement<{ children: ReactElement<{ onClick: () => void }>[] }>;
+    footer.props.children[0]!.props.onClick();
+    expect(onDismiss).toHaveBeenCalledOnce();
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
   it.each([
     { name: 'TUN', classes: ['existing TUN TCP flows', 'existing TUN UDP associations', 'changed ingress admissions'],
       expected: ['home.impactApplyTunTcpReset', 'home.impactApplyTunUdpReset', 'home.impactApplyTunRollback'], absent: 'home.impactApplyApiStreams' },

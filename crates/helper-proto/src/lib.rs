@@ -215,7 +215,7 @@ pub mod linux_dns {
     /// ambiguous transport/native failure. Gone proves only original DNS cleanup.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Change {
-        Changed(Snapshot),
+        Changed(Box<Snapshot>),
         NoChange,
         Gone(Gone),
     }

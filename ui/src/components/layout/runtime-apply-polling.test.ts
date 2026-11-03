@@ -38,6 +38,20 @@ describe('transaction-bound status-only polling', () => {
     expect(accept.mock.calls.map(([result]) => result.status)).toEqual(['unconfirmed','hotApplied']);
     cancel();
   });
+  it('retains read failures and ignores a host-only receipt with the same opaque id as its Core transaction', async () => {
+    vi.useFakeTimers();
+    const read = vi.fn().mockRejectedValueOnce(new Error('RUNTIME_APPLY_CORE_REFERENCE_REQUIRED'))
+      .mockResolvedValueOnce({ ok: true, status: 'hostEffectsFailed', hostExecutionId: 'original',
+        runtimeGeneration: 7, selectionIntentGeneration: 9 })
+      .mockResolvedValueOnce(receipt('hotApplied'));
+    const accept = vi.fn(() => true);
+    const cancel = startRuntimeApplyPolling({ transactionId: 'original', read, current: () => true, accept });
+    await vi.advanceTimersByTimeAsync(RUNTIME_APPLY_POLL_INTERVAL_MS * 4);
+    expect(read).toHaveBeenCalledTimes(3);
+    expect(read.mock.calls.every(([id]) => id === 'original')).toBe(true);
+    expect(accept).toHaveBeenCalledExactlyOnceWith(receipt('hotApplied'));
+    cancel();
+  });
   it('does not overlap a stalled read and ignores its result after unmount/cancel', async () => {
     vi.useFakeTimers();
     let release!: (result: PendingApplyResult) => void;

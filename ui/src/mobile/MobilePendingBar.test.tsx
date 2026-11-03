@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { PendingApplyResult } from '@/contracts/types';
+import { ImpactApplySummary, type ImpactDisclosure } from '@/shared/ImpactApplySummary';
 import type { ApplyState } from '@/components/layout/pending-bar-logic';
 import type { FormSheetProps } from './forms/FormSheet';
 
@@ -484,6 +485,30 @@ describe('mobile impact consent disclosure', () => {
     await vi.waitFor(() => expect(h.states[2]).toMatchObject({ token: 'private-impact-token' }));
     return restartSheet();
   }
+
+  it('keeps the shared disclosure in the mobile FormSheet and cancels only its retained choice', async () => {
+    const pending = h.app.pendingChanges;
+    const sheet = await offer(['existing TUN TCP flows', 'existing TUN UDP associations']);
+    const summary = sheet.props.children as ReactElement<{ prompt: ImpactDisclosure }>;
+    expect(sheet.type).toBe(FormSheet);
+    expect(sheet.props.submitDisabled).toBe(false);
+    expect(summary.type).toBe(ImpactApplySummary);
+    expect(Object.keys(summary.props.prompt).sort()).toEqual(['coreImpacts', 'hostEffects']);
+    const html = markup(summary);
+    for (const key of ['home.impactApplyTunTcpReset', 'home.impactApplyTunUdpReset', 'home.impactApplyTunRollback']) {
+      expect(html).toContain(key);
+    }
+    expect(html).not.toMatch(/<(?:button|input|select|dialog)\b/);
+    for (const raw of ['private-impact-token', 'private-impact-path', 'private-impact-reason']) expect(html).not.toContain(raw);
+    sheet.props.onRequestClose();
+    await microtasks();
+    expect(h.cancelImpact).toHaveBeenCalledExactlyOnceWith('private-impact-token');
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.app.pendingChanges).toBe(pending);
+    expect(h.app.pendingChanges.added).toEqual(['node-1']);
+  });
 
   it.each([
     { name: 'TUN', classes: ['existing TUN TCP flows', 'existing TUN UDP associations', 'changed ingress admissions'],

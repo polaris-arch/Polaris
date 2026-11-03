@@ -465,7 +465,7 @@ impl<Ops: LinuxResolvedOps, Fs: MarkerFs> LinuxResolvedController<Ops, Fs> {
                         && !restored.cleanup_pending
                         && restored.settings == prepared.original =>
                 {
-                    before = restored;
+                    before = *restored;
                     cleaned_prior = true;
                 }
                 Ok(Change::NoChange) => {
@@ -654,13 +654,13 @@ impl<Ops: LinuxResolvedOps, Fs: MarkerFs> LinuxResolvedController<Ops, Fs> {
                 && current.settings.controlled()
         });
         Ok(Some(TakeoverReceipt::new(
-            operation_id.clone(),
+            &operation_id,
             if accepted {
                 TakeoverOutcome::Unchanged
             } else {
                 TakeoverOutcome::RecoveryPending
             },
-            Some(operation_id),
+            Some(operation_id.clone()),
             (!accepted).then(|| format!("Linux DNS exact reconcile unresolved: {snapshot:?}")),
         )))
     }

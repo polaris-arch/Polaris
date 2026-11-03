@@ -59,12 +59,12 @@ function windowsLogWiring(input: WindowsLogSources): boolean {
     && /dwFlags=STARTF_USESTDHANDLES;startup.StartupInfo.hStdInput=handles\[0\];startup.StartupInfo.hStdOutput=handles\[1\];startup.StartupInfo.hStdError=handles\[2\];startup.lpAttributeList=attributes.pointer;/.test(suspended)
     && /CreateProcessW\(application.as_ptr\(\),command.as_mut_ptr\(\),ptr::null\(\),ptr::null\(\),1,CREATE_SUSPENDED\|EXTENDED_STARTUPINFO_PRESENT\|CREATE_UNICODE_ENVIRONMENT\|CREATE_NO_WINDOW\|CREATE_NEW_PROCESS_GROUP,environment.as_ptr\(\).cast\(\),cwd.as_ptr\(\),&startup.StartupInfo,&mutinfo,\)/.test(suspended)
     && /\)\}\)\?;letprocess=owned\(info.hProcess\)\?;letthread=owned\(info.hThread\)\?;drop\(inherit\);drop\(out_write\);drop\(err_write\);Ok\(Suspended\{process:Some\(process\),thread,job:Some\(job\),stdout:Some\(stdout\),stderr:Some\(stderr\),pid:info.dwProcessId,\}\)/.test(suspended)
-    && /letguards:Vec<&File>=owner.files.iter\(\).map\(\|\(_,f,_\)\|f\)\.chain\(owner.directories.iter\(\)\)\.chain\(owner.parents.iter\(\)\)\.chain\(owner.system.iter\(\)\)\.chain\(std::iter::once\(&owner.occupancy\)\)\.collect\(\);letmutsuspended=create_suspended\(&owner.final_exe,&owner.final_sidecar,&config,cwd,&guards,purpose,\)\?;/.test(spawn)
+    && /letguards:Vec<&File>=owner.files.iter\(\).map\(\|\(_,f,_\)\|f\)\.chain\(owner.directories.iter\(\)\)\.chain\(owner.parents.iter\(\)\)\.chain\(owner.system.iter\(\)\)\.chain\(std::iter::once\(&owner.occupancy\)\)\.collect\(\);letmutsuspended=create_suspended\(&owner.final_exe,&owner.final_sidecar,&config,cwd,&guards,purpose,runtime_directory,\)\?;/.test(spawn)
     && /stdout:suspended.stdout.take\(\),stderr:suspended.stderr.take\(\),custody,pid:suspended.pid,/.test(spawn)
     && /_job:suspended.job.take\(\).expect\("atomicjob"\),cohort:Some\(Arc::clone\(owner\)\),/.test(spawn)
-    && /issuer::spawn\(&self.payload.protected.inner,config,cwd,ExecPurpose::RunMain,\)/.test(factory)
+    && /issuer::spawn\(&self.payload.protected.inner,config,cwd,ExecPurpose::RunMain,Some\(runtime_directory\),\)/.test(factory)
     && /\(self.pid,self.process,self.stdout.expect\("mainstdout"\),self.stderr.expect\("mainstderr"\),self.custody,\)/.test(parts)
-    && /letchild=execution.spawn_windows_main\(file,Path::new\(&cwd\)\)\?;letprocess_ms=crate::elapsed_ms\(process_started\);let\(pid,handle,stdout,stderr,execution_custody\)=child.into_parts\(\);letstdout=Some\(stdout\);letstderr=Some\(stderr\);/.test(tracked)
+    && /letchild=execution.spawn_windows_main\(file,Path::new\(&cwd\),&runtime_directory\)\?;letprocess_ms=crate::elapsed_ms\(process_started\);let\(pid,handle,stdout,stderr,execution_custody\)=child.into_parts\(\);letstdout=Some\(stdout\);letstderr=Some\(stderr\);/.test(tracked)
     && /log_custody:None,_execution_custody:execution_custody,/.test(tracked)
     && /letlog_custody=ifletSome\(files\)=log_files\{polaris_log_budget::spawn_pipe_loggers_with_preopened_files_custodied\(stdout,stderr,files,polaris_log_budget::DEFAULT_GENERATION_BYTES,\)\}else\{polaris_log_budget::spawn_pipe_drainers_custodied\(stdout,stderr\)\};custody.as_mut\(\).expect\("publishedownedHANDLE"\).log_custody=Some\(log_custody\);/.test(tracked)
     && /c.pid==target.pid.get\(\)&&c.birth==Some\(target.birth\)/.test(poll)
@@ -161,9 +161,12 @@ describe('W26 bounded core-log wiring', () => {
       ['parent original stderr writer leaks', change('issuer', 'create_suspended', 'drop(err_write);', '')],
       ['system dependency guard omitted', change('issuer', 'spawn', '.chain(owner.system.iter())', '')],
       ['occupancy guard omitted', change('issuer', 'spawn', '.chain(std::iter::once(&owner.occupancy))', '')],
+      ['runtime directory lost before native creation', change('issuer', 'spawn', '        runtime_directory,', '        None,')],
       ['stdout reader discarded by factory', change('issuer', 'spawn', 'stdout: suspended.stdout.take(),', 'stdout: None,')],
       ['native factory purpose changed', change('execution', 'spawn_windows_main', 'ExecPurpose::RunMain,', 'ExecPurpose::CheckConfig,')],
+      ['runtime directory lost by native factory', change('execution', 'spawn_windows_main', '            Some(runtime_directory),', '            None,')],
       ['stderr reader discarded in conversion', change('execution', 'into_parts', 'self.stderr.expect("main stderr")', 'self.stdout.expect("main stdout")')],
+      ['registered runtime directory replaced by configuration CWD', change('helper', 'spawn_tracked', 'spawn_windows_main(file, Path::new(&cwd), &runtime_directory)', 'spawn_windows_main(file, Path::new(&cwd), Path::new(&cwd))')],
       ['factory custody not retained', change('helper', 'spawn_tracked', '_execution_custody: execution_custody,', '_execution_custody: drop(execution_custody),')],
       ['unbounded logger substituted', change('helper', 'spawn_tracked', 'spawn_pipe_loggers_with_preopened_files_custodied(', 'spawn_pipe_loggers(')],
       ['fallback does not drain', change('helper', 'spawn_tracked', 'spawn_pipe_drainers_custodied(stdout, stderr)', 'drop((stdout, stderr))')],
@@ -178,7 +181,7 @@ describe('W26 bounded core-log wiring', () => {
       ['failed suspended child does not wait on its retained HANDLE', { ...source, issuer: source.issuer.replace('WaitForSingleObject(process.as_raw_handle(), 10_000);', 'WaitForSingleObject(process.as_raw_handle(), 0);') }],
       ['unknown child cohort is released', { ...source, issuer: source.issuer.replace('let _ = Arc::into_raw(owner);', 'drop(owner);') }],
     ];
-    expect(negatives, 'all original mutations must construct before rejection checks').toHaveLength(27);
+    expect(negatives, 'all original mutations and runtime-directory links must construct before rejection checks').toHaveLength(30);
     for (const [label, input] of negatives) {
       expect(input, `${label}: mutation must change real source`).not.toEqual(source);
       expect(windowsLogWiring(input), label).toBe(false);

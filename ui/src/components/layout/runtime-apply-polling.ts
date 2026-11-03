@@ -73,7 +73,7 @@ export function startRuntimeApplyPolling(options: {
     ...options,
     execution: { kind: 'core', transactionId: options.transactionId },
     read: (execution) => {
-      if (execution.kind !== 'core') throw new Error('Core polling requires a transaction reference');
+      if (execution.kind !== 'core') throw new Error('RUNTIME_APPLY_CORE_REFERENCE_REQUIRED');
       return options.read(execution.transactionId);
     },
   });
