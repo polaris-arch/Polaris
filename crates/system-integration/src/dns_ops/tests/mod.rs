@@ -1629,6 +1629,17 @@ impl SystemDnsOps for InventoryDriftDnsOps {
         }
         Ok(())
     }
+    fn read_effective_resolvers(&self) -> Result<Vec<String>, SystemIntegrationError> {
+        let mut all = Vec::new();
+        for name in self.list_targets()? {
+            for ip in self.read_dns(&name)? {
+                if !all.contains(&ip) {
+                    all.push(ip);
+                }
+            }
+        }
+        Ok(all)
+    }
 }
 
 #[test]

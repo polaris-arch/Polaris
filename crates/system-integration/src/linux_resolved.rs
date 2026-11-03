@@ -311,7 +311,6 @@ impl<Ops: LinuxResolvedOps, Fs: MarkerFs> LinuxResolvedController<Ops, Fs> {
         })
     }
 
-    #[must_use]
     pub fn checked_owned_receipt(&self) -> Result<Option<TakeoverReceipt>, String> {
         let prepared = self.prepare_effect(true)?;
         let Some(operation) = prepared.prior_marker_operation_id() else {
