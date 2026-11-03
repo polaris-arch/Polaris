@@ -111,6 +111,16 @@ function reusableContract(caller = workflow, callee = candidateWorkflow) {
   assert.doesNotMatch(callee, /secrets:|secrets\.|contents: write|actions: write|id-token:|cargo (?:build|test) --workspace|run: pnpm/);
 }
 
+// These synthetic routing fixtures declare every observation explicitly.
+// Real pipe regressions live in run-native-dns-controlled-tests.test.mjs.
+function fixtureSessionEnd(processId, status, stdout, stderr, action) {
+  return { processId, status, signal: null, exitObserved: true, exitStatus: status, exitSignal: null,
+    closeObserved: true, processError: null, captureError: null, timedOut: false, interrupted: false,
+    control: { action, payloadBytes: action === 'teardown' ? 9 : 0, attempted: true, finished: true, closed: true, error: null },
+    stdout: Buffer.from(stdout), stderr: Buffer.from(stderr),
+    outputState: { stdout: { eof: true, error: null }, stderr: { eof: true, error: null } } };
+}
+
 // Inert orchestration fixture only. It opens no native endpoint and cannot issue
 // a production Check/RunMain receipt; actual case assertions use their own fixtures.
 async function fixtureSession(selected, env, directory) {
@@ -131,7 +141,7 @@ async function fixtureSession(selected, env, directory) {
     const stdout = `POLARIS_NATIVE_SESSION ${JSON.stringify(record)}\nPOLARIS_NATIVE_SESSION_TEARDOWN ${JSON.stringify(teardown)}\n`;
     writeFileSync(join(directory, 'native-session.stdout.log'), stdout);
     writeFileSync(join(directory, 'native-session.stderr.log'), '');
-    return { processId: 80, status: 0, signal: null, captureError: null, stdout, stderr: '' };
+    return fixtureSessionEnd(80, 0, stdout, '', 'teardown');
   } };
 }
 async function runTests(selected, env, directory, execute) {

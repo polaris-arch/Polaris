@@ -574,6 +574,47 @@ pub enum InstallOutcome {
     AlreadyPresent,
 }
 
+// Failure-only context for the preserving migration path. The outer kind and
+// Display are unchanged; private paths/messages are available only via source().
+struct MigrationPreservationFailure {
+    version_present: bool,
+    receipt_present: bool,
+    verification: Option<io::Error>,
+}
+impl std::fmt::Display for MigrationPreservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("migration cannot replace an existing unverified payload or receipt")
+    }
+}
+impl std::fmt::Debug for MigrationPreservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let phase = if self.verification.is_some() {
+            "existing-pair-verification"
+        } else {
+            "partial-existing-pair"
+        };
+        let cause = self.verification.as_ref();
+        let lock = cause
+            .and_then(|e| e.get_ref())
+            .and_then(|e| e.downcast_ref::<LockFailure>());
+        f.debug_struct("MigrationPreservationFailure")
+            .field("phase", &phase)
+            .field("version_present", &self.version_present)
+            .field("receipt_present", &self.receipt_present)
+            .field("kind", &cause.map(io::Error::kind))
+            .field("os_code", &cause.and_then(io::Error::raw_os_error))
+            .field("lock", &lock)
+            .finish()
+    }
+}
+impl std::error::Error for MigrationPreservationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.verification
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
+
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
@@ -1287,40 +1328,53 @@ impl CoreStore {
         }
         let version_present = object_present(&destination)?;
         let receipt_present = object_present(&receipt)?;
+        let mut verification_failure = None;
         if version_present && receipt_present {
-            if let Ok(verified) = self.verify_objects(&id, true) {
-                if !preserve_existing {
-                    let mut options = OpenOptions::new();
-                    options.write(true);
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.custom_flags(nix::libc::O_NOFOLLOW);
+            match self.verify_objects(&id, true) {
+                Ok(verified) => {
+                    if !preserve_existing {
+                        let mut options = OpenOptions::new();
+                        options.write(true);
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            options.custom_flags(nix::libc::O_NOFOLLOW);
+                        }
+                        let file = options.open(&receipt)?;
+                        self.owner.check(&receipt)?;
+                        file.set_modified(std::time::SystemTime::now())?;
                     }
-                    let file = options.open(&receipt)?;
-                    self.owner.check(&receipt)?;
-                    file.set_modified(std::time::SystemTime::now())?;
+                    // Refresh observations after the normal last-use timestamp
+                    // mutation, retaining the same already held occupancy lease.
+                    let verified = self.verify_objects_under_lease(
+                        &id,
+                        true,
+                        verified
+                            ._lease
+                            .as_ref()
+                            .ok_or_else(|| invalid("publication lease absent"))?
+                            .try_clone()?,
+                    )?;
+                    // Also closes an earlier complete publication whose parent
+                    // barrier failed. A read-only reopen alone is not durability.
+                    self.finish_install_publication(&id, &mutation, &verified)?;
+                    return Ok(InstallOutcome::AlreadyPresent);
                 }
-                // Refresh observations after the normal last-use timestamp
-                // mutation, retaining the same already held occupancy lease.
-                let verified = self.verify_objects_under_lease(
-                    &id,
-                    true,
-                    verified
-                        ._lease
-                        .as_ref()
-                        .ok_or_else(|| invalid("publication lease absent"))?
-                        .try_clone()?,
-                )?;
-                // Also closes an earlier complete publication whose parent
-                // barrier failed. A read-only reopen alone is not durability.
-                self.finish_install_publication(&id, &mutation, &verified)?;
-                return Ok(InstallOutcome::AlreadyPresent);
+                Err(error) => {
+                    if preserve_existing {
+                        verification_failure = Some(error);
+                    }
+                }
             }
         }
         if preserve_existing && (version_present || receipt_present) {
-            return Err(invalid(
-                "migration cannot replace an existing unverified payload or receipt",
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                MigrationPreservationFailure {
+                    version_present,
+                    receipt_present,
+                    verification: verification_failure,
+                },
             ));
         }
         let lease_path = self

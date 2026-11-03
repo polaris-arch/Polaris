@@ -109,6 +109,13 @@ struct RetiredHostReceipt {
     receipt: HostEffectReceipt,
 }
 
+/// Prior restoration evidence bound to the enclosing cold reservation.
+#[derive(Clone)]
+struct RestoredColdPrior {
+    marker_operation_id: String,
+    restored_generation: u64,
+}
+
 /// Bounded DNS cleanup account, independent of the latest host execution.
 /// The ID is the actual exact-marker owner, never a proxy-only execution ID.
 #[derive(Clone)]
@@ -117,6 +124,10 @@ struct ColdDnsOwner {
     intent: u64,
     operation_id: String,
     prior_marker: Option<String>,
+    // Exact prior restoration while this reservation has not admitted a new
+    // mutation. Every bind (including the cold producer's post-restore None)
+    // clears this proof before replacement apply can run.
+    restored_prior_marker: Option<RestoredColdPrior>,
     in_flight: bool,
     cleanup_pending: bool,
 }
@@ -565,6 +576,7 @@ impl ProxyRuntime {
             intent,
             operation_id: operation_id.into(),
             prior_marker: None,
+            restored_prior_marker: None,
             in_flight: true,
             cleanup_pending: false,
         });
@@ -590,6 +602,10 @@ impl ProxyRuntime {
             return false;
         };
         cold.prior_marker = prior_marker;
+        // Both real cold producer arms bind None after confirmed restoration,
+        // before preparing/applying the replacement. A later result may no
+        // longer borrow prior restoration as proof that no new write occurred.
+        cold.restored_prior_marker = None;
         true
     }
 
@@ -615,27 +631,38 @@ impl ProxyRuntime {
             let Ok(mut state) = self.runtime_config_apply.lock() else {
                 return;
             };
-            if state
-                .host
-                .dns_restored
-                .iter()
-                .any(|(id, old)| id == &receipt.operation_id && *old == generation)
-            {
-                if state
-                    .host
-                    .dns_cold
-                    .as_ref()
-                    .is_some_and(|cold| cold.operation_id == receipt.operation_id)
-                {
-                    state.host.dns_cold = None;
-                }
-                return;
-            }
-            if !state.host.dns_cold.as_ref().is_some_and(|cold| {
+            let Some(cold) = state.host.dns_cold.as_ref().filter(|cold| {
                 cold.generation == generation
                     && cold.intent == intent
                     && cold.operation_id == receipt.operation_id
-            }) {
+            }) else {
+                return;
+            };
+            let operation_restored = state
+                .host
+                .dns_restored
+                .iter()
+                .any(|(id, old)| id == &receipt.operation_id && *old == generation);
+            let prior_only = matches!(
+                (receipt.outcome, receipt.cleanup_pending),
+                (TakeoverOutcome::Unchanged, false) | (TakeoverOutcome::RecoveryPending, true)
+            );
+            let borrowed_marker_restored = cold.in_flight
+                && !cold.cleanup_pending
+                && prior_only
+                && cold.restored_prior_marker.as_ref().is_some_and(|proof| {
+                    proof.marker_operation_id != receipt.operation_id
+                        && receipt.marker_id.as_ref() == Some(&proof.marker_operation_id)
+                        && state.host.dns_restored.iter().any(|(id, old)| {
+                            id == &proof.marker_operation_id && *old == proof.restored_generation
+                        })
+                });
+            if operation_restored || borrowed_marker_restored {
+                // Unchanged owns no new write. RecoveryPending may refer only
+                // to the prior footprint while this no-replacement-bind proof
+                // is retained. A rebound/new Applied write cannot use it.
+                // Current required policy stays independently unconfirmed.
+                state.host.dns_cold = None;
                 return;
             }
             let success = !receipt.cleanup_pending
@@ -966,6 +993,12 @@ impl ProxyRuntime {
                     // Exact prior restoration does not retire the in-flight
                     // replacement's reservation or accept its requested policy.
                     replacement.prior_marker = None;
+                    replacement.restored_prior_marker = Some(RestoredColdPrior {
+                        marker_operation_id: marker_operation_id.into(),
+                        // Preserve the actual recorded owner generation, which
+                        // may predate this replacement reservation.
+                        restored_generation: generation,
+                    });
                 } else if cold.is_some() {
                     state.host.dns_cold = None;
                 }

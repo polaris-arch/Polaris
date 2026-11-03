@@ -1,3 +1,4 @@
+import { spawn as spawnInertNode } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
@@ -5,7 +6,17 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, unlinkSync, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests as runCaseTests, withNativeSession, sessionPreparation, unmetPrerequisite, sessionTeardown, confirmedCleanup, preserveProductionGraph, selectNativeExecutable, nativeCaseRecord, exactNativePass, bindNativeRuntime, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
+import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests as runCaseTests, withNativeSession, startNativeSession, sessionPreparation, unmetPrerequisite, sessionTeardown, confirmedCleanup, preserveProductionGraph, selectNativeExecutable, nativeCaseRecord, exactNativePass, bindNativeRuntime, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
+
+// Inert synthetic records below declare every observation explicitly. Real
+// pipe regressions later exercise startNativeSession with actual Node children.
+function fixtureSessionEnd(processId, status, stdout, stderr, action) {
+  return { processId, status, signal: null, exitObserved: true, exitStatus: status, exitSignal: null,
+    closeObserved: true, processError: null, captureError: null, timedOut: false, interrupted: false,
+    control: { action, payloadBytes: action === 'teardown' ? 9 : 0, attempted: true, finished: true, closed: true, error: null },
+    stdout: Buffer.from(stdout), stderr: Buffer.from(stderr),
+    outputState: { stdout: { eof: true, error: null }, stderr: { eof: true, error: null } } };
+}
 
 // Inert orchestration fixture only. It opens no native endpoint and cannot issue
 // a production Check/RunMain receipt; actual case assertions use their own fixtures.
@@ -27,7 +38,7 @@ async function fixtureSession(selected, env, directory) {
     const stdout = `POLARIS_NATIVE_SESSION ${JSON.stringify(record)}\nPOLARIS_NATIVE_SESSION_TEARDOWN ${JSON.stringify(teardown)}\n`;
     writeFileSync(join(directory, 'native-session.stdout.log'), stdout);
     writeFileSync(join(directory, 'native-session.stderr.log'), '');
-    return { processId: 80, status: 0, signal: null, captureError: null, stdout, stderr: '' };
+    return fixtureSessionEnd(80, 0, stdout, '', 'teardown');
   } };
 }
 async function runTests(selected, env, directory, execute) {
@@ -820,7 +831,7 @@ test('capability unmet preserves all six required rows and exact binding without
         finishes++; const stdout = `POLARIS_NATIVE_PREREQUISITE ${JSON.stringify(prerequisite)}\n`;
         writeFileSync(join(directory, 'native-session.stdout.log'), stdout);
         writeFileSync(join(directory, 'native-session.stderr.log'), '');
-        return { processId: 81, status: 1, signal: null, captureError: null, stdout, stderr: '' };
+        return fixtureSessionEnd(81, 1, stdout, '', 'eof');
       },
     })), /Required native prerequisite unmet/);
     assert.equal(calls, 0); assert.equal(finishes, 1);
@@ -867,7 +878,7 @@ test('session finally retains the business failure and a separate cleanup failur
     await assert.rejects(withNativeSession(f.selected, f.env, directory, () => { throw Error('actual case failure'); }, async (...args) => {
       const h = await fixtureSession(...args), finish = h.finish;
       return { ...h, async finish() {
-        const end = await finish(); end.stdout = end.stdout.replace('"caseDrainCheckpointsMatched":true', '"caseDrainCheckpointsMatched":false');
+        const end = await finish(); end.stdout = Buffer.from(end.stdout.toString('utf8').replace('"caseDrainCheckpointsMatched":true', '"caseDrainCheckpointsMatched":false'));
         writeFileSync(join(directory, 'native-session.stdout.log'), end.stdout); return end;
       } };
     }), /actual case failure; Session teardown unconfirmed/);
@@ -875,4 +886,265 @@ test('session finally retains the business failure and a separate cleanup failur
     assert.match(r.failure, /actual case failure/); assert.match(r.cleanupFailure, /teardown unconfirmed/);
     assert.equal(r.state, 'cleanup-unconfirmed'); assert.equal(f.summary().requirementState, 'open');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+// All process tests below run the actual session supervisor and actual pipe I/O.
+// The only seam launches process.execPath with inert source, never a shebang,
+// product verifier, Core, provider, native endpoint or substituted finish object.
+async function withRealSession(spec, exercise) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'session-pipes-'))), directory = join(root, 'evidence');
+  mkdirSync(directory); mkdirSync(join(root, 'src-tauri'));
+  const children = [];
+  try {
+    const f = boundNativeFixture(root, directory);
+    const prepared = (await fixtureSession(f.selected, f.env, directory)).record;
+    const prerequisite = { schema: 'polaris-native-prerequisite-v1', state: 'unmet', stage: 'capability',
+      code: spec.code ?? 'admission-unsupported-capability', detail: 'inert refusal 雪', processId: 1,
+      compiledAppBuildId: f.env.GITHUB_SHA, platform: f.env.CORE_PLATFORM,
+      requiredCases: [...TESTS], required: true, publicationEligible: false };
+    const config = { status: 1, kind: 'prerequisite', ...spec, prepared, prerequisite };
+    const source = String.raw`
+import process from 'node:process';
+import { spawn } from 'node:child_process';
+const c = ${JSON.stringify(config)};
+let record = c.kind === 'prerequisite' ? c.prerequisite : c.prepared;
+record.processId = process.pid;
+if (c.kind === 'provider-unmet') { record.state = 'unmet'; record.code = 'provider-unavailable'; }
+if (c.wrongBinding) record.compiledAppBuildId = '0'.repeat(40);
+const prefix = c.kind === 'prerequisite' ? 'POLARIS_NATIVE_PREREQUISITE ' : 'POLARIS_NATIVE_SESSION ';
+let bytes = Buffer.from(prefix + JSON.stringify(record) + (c.partial ? '' : c.crlf ? String.fromCharCode(13, 10) : String.fromCharCode(10)));
+const idle = () => setInterval(() => {}, 1000);
+const refuse = () => {
+  if (c.snoopInput) {
+    let received = 0; process.stdin.on('data', bytes => { received += bytes.length; });
+    process.stdin.on('end', () => process.stderr.write('observed-input-bytes:' + received + String.fromCharCode(10), () => process.exit(c.status)));
+    process.stdin.resume(); return;
+  }
+  if (c.linger || c.signal) { idle(); return; }
+  if (c.inheritedOutput) spawn(process.execPath, ['-e', 'setTimeout(() => {}, 1200)'], { stdio: ['ignore', 'inherit', 'inherit'] }).unref();
+  const end = () => process.stderr.write(c.overflow ? Buffer.alloc(128 * 1024 + 1, 120) : c.invalidUtf8 ? Buffer.from([255]) : 'late inert diagnostic\n', () => process.exit(c.status));
+  if (c.lateStderr) setTimeout(end, 40); else end();
+};
+if (c.kind !== 'prerequisite') {
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', chunk => { input += chunk; });
+  process.stdin.on('end', () => {
+    if (c.linger) { idle(); return; }
+    if (input !== 'teardown\n') { process.stderr.write('wrong closed teardown input\n'); process.exitCode = 3; return; }
+    const end = { schema: 'polaris-native-session-teardown-v1', sessionId: record.owner.sessionId,
+      processId: process.pid, startedCases: 0, caseDrainCheckpointsMatched: !c.badDrain,
+      providerIdle: true, state: 'retained-unopened', directoryState: 'retained', retainedBytes: 0,
+      maxRetainedBytes: record.maxRetainedBytes, evidenceKind: 'data-coordination-only',
+      registrationChanged: false, providerInstalled: false, publicationEligible: false };
+    if (c.wrongSession) end.sessionId = '00000000-0000-4000-8000-000000000002';
+    const text = c.missingTeardown ? '' : 'POLARIS_NATIVE_SESSION_TEARDOWN ' + JSON.stringify(end) + '\n';
+    process.stdout.write(text, () => process.stderr.write('opened inert diagnostic\n', () => process.exit(c.status)));
+  });
+}
+const emitted = () => {
+  if (c.kind === 'prerequisite') refuse();
+};
+if (c.duplicate) bytes = Buffer.concat([bytes, bytes]);
+if (c.split) {
+  const at = bytes.indexOf(Buffer.from('雪')) + 1;
+  process.stdout.write(bytes.subarray(0, at), () => setTimeout(() => process.stdout.write(bytes.subarray(at), emitted), 20));
+} else process.stdout.write(bytes, emitted);
+`;
+    const observed = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    const spawnChild = (program, argv, options) => {
+      assert.equal(program, f.selected.executable); assert.deepEqual(argv, ['--session']);
+      assert.deepEqual(options.stdio, ['pipe', 'pipe', 'pipe']); assert.equal(options.windowsHide, true);
+      const child = spec.spawnMissing
+        ? spawnInertNode(join(root, 'missing-inert-executable'), [], options)
+        : spawnInertNode(process.execPath, ['--input-type=module', '-e', source], options);
+      const closed = new Promise(resolve => child.once('close', resolve));
+      children.push({ child, closed });
+      for (const name of ['stdout', 'stderr']) child[name].on('data', bytes => {
+        assert.ok(observed[name].length + bytes.length <= 128 * 1024 + 1, 'inert fixture output bound');
+        observed[name] = Buffer.concat([observed[name], bytes]);
+      });
+      // Fault injection acts on actual child pipes; no fabricated child/finish
+      // return values can satisfy the supervisor's close/EOF observations.
+      if (spec.pipeFault) child.stdout.once('data', () => {
+        const error = Object.assign(Error(`inert ${spec.pipeFault} pipe fault`), { code: 'EINERT', syscall: 'fixture' });
+        child[spec.pipeFault].destroy(error);
+      });
+      if (spec.signal) child.stdout.once('data', () => child.kill('SIGTERM'));
+      return child;
+    };
+    const start = (...args) => startNativeSession(...args, { spawnChild, preparationTimeoutMs: 8000,
+      finishTimeoutMs: spec.linger || spec.inheritedOutput ? 500 : 8000 });
+    await exercise({ ...f, root, directory, start, child: () => children[0].child, raw: name => observed[name],
+      receipt: () => JSON.parse(readFileSync(join(directory, 'native-session-results.json'))) });
+  } finally {
+    // Only these exact inert test children are owned here. No production/native
+    // custody is inferred from their bounded test cleanup.
+    for (const { child, closed } of children) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      let timer;
+      try { await Promise.race([closed, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Inert fixture did not close')), 5000); })]); }
+      finally { clearTimeout(timer); }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+for (const status of [1, 2]) test(`actual early prerequisite child exit${status} retains exact refusal and complete original observations`, async () => {
+  await withRealSession({ status }, async f => {
+    let calls = 0;
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => { calls++; }, f.start),
+      /^Error: Required native prerequisite unmet: capability\/admission-unsupported-capability$/);
+    const r = f.receipt(), end = r.executor;
+    assert.equal(f.child().exitCode, status); assert.equal(f.child().signalCode, null);
+    assert.equal(calls, 0); assert.equal(end.status, status); assert.equal(end.exitStatus, status);
+    assert.equal(end.closeObserved, true); assert.equal(end.exitObserved, true); assert.equal(end.signal, null);
+    assert.equal(end.control.action, 'eof'); assert.equal(end.control.payloadBytes, 0);
+    assert.equal(end.control.error, null); assert.equal(end.captureError, null);
+    assert.equal(r.streams.stdout.eof, true); assert.equal(r.streams.stderr.eof, true);
+    assert.equal(f.child().stdout.readableEnded, true); assert.equal(f.child().stderr.readableEnded, true);
+    assert.equal(r.unopenedExitConfirmed, true); assert.equal(r.teardownConfirmed, false);
+    const summary = f.summary(); assert.equal(summary.state, 'unmet-prerequisite'); assert.equal(summary.requirementState, 'open');
+    assert.deepEqual(summary.tests.map(row => row.name), TESTS); assert.ok(summary.tests.every(row => !row.invoked));
+    for (const name of ['stdout', 'stderr']) {
+      const bytes = readFileSync(join(f.directory, `native-session.${name}.log`));
+      assert.deepEqual(bytes, f.raw(name)); assert.equal(r.streams[name].bytes, bytes.length);
+      assert.equal(r.streams[name].sha256, createHash('sha256').update(bytes).digest('hex'));
+    }
+  });
+});
+
+test('actual split UTF8 prerequisite and late stderr drain before exit evidence is consumed', async () => {
+  await withRealSession({ split: true, crlf: true, lateStderr: true, code: 'admission-unsupported-exact-object' }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start),
+      /^Error: Required native prerequisite unmet: capability\/admission-unsupported-exact-object$/);
+    assert.match(f.raw('stdout').toString('utf8'), /inert refusal 雪/);
+    assert.equal(f.raw('stderr').toString('utf8'), 'late inert diagnostic\n');
+    assert.equal(f.receipt().unopenedExitConfirmed, true);
+  });
+});
+
+for (const spec of [{ status: 0 }, { signal: true }, { linger: true }]) test(`actual prerequisite abnormal exit remains unconfirmed ${JSON.stringify(spec)}`, async () => {
+  await withRealSession(spec, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start),
+      /Required native prerequisite unmet: capability\/admission-unsupported-capability; Unopened prerequisite process exit unconfirmed/);
+    const r = f.receipt(); assert.equal(r.unopenedExitConfirmed, false); assert.equal(r.teardownConfirmed, false);
+    assert.equal(f.summary().requirementState, 'open');
+    if (spec.status === 0) assert.equal(r.executor.status, 0);
+    if (spec.signal) { assert.equal(r.executor.status, null); assert.equal(r.executor.signal, 'SIGTERM'); }
+    if (spec.linger) { assert.equal(r.executor.timedOut, true); assert.equal(r.executor.closeObserved, false); assert.equal(r.streams.stdout.eof, false); }
+  });
+});
+
+for (const spec of [{ duplicate: true }, { partial: true }, { wrongBinding: true }, { invalidUtf8: true }]) test(`actual prerequisite malformed or foreign stream never gains authority ${JSON.stringify(spec)}`, async () => {
+  await withRealSession(spec, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start));
+    const r = f.receipt(); assert.equal(r.teardownConfirmed, false); assert.equal(r.unopenedExitConfirmed, false);
+    assert.equal(r.executor.closeObserved, true); assert.equal(f.summary().requirementState, 'open');
+    if (spec.invalidUtf8) assert.deepEqual(readFileSync(join(f.directory, 'native-session.stderr.log')), Buffer.from([255]));
+  });
+});
+
+test('actual unopened input error is separate from output capture and never becomes teardown success', async () => {
+  await withRealSession({ pipeFault: 'stdin' }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), /Required native prerequisite unmet/);
+    const r = f.receipt(); assert.equal(r.executor.control.error.code, 'EINERT');
+    assert.equal(r.executor.captureError, null); assert.equal(r.executor.processError, null);
+    assert.equal(r.streams.stdout.error, null); assert.equal(r.streams.stderr.error, null);
+    assert.equal(r.teardownConfirmed, false); assert.equal(r.state, 'unmet');
+    assert.equal(r.unopenedExitConfirmed, true); assert.equal(f.summary().state, 'unmet-prerequisite');
+  });
+});
+
+for (const pipeFault of ['stdout', 'stderr']) test(`actual ${pipeFault} pipe error cannot be washed by a prerequisite`, async () => {
+  await withRealSession({ pipeFault, lateStderr: true }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start));
+    const r = f.receipt(); assert.equal(r.streams[pipeFault].error.code, 'EINERT');
+    assert.equal(r.streams[pipeFault].eof, false); assert.equal(r.unopenedExitConfirmed, false);
+    assert.equal(f.summary().requirementState, 'open');
+  });
+});
+
+for (const kind of ['ready', 'provider-unmet']) test(`actual prepared ${kind} holder still receives closed teardown and original marker`, async () => {
+  await withRealSession({ kind, status: 0 }, async f => {
+    let calls = 0;
+    const operation = withNativeSession(f.selected, f.env, f.directory, () => { calls++; }, f.start);
+    if (kind === 'provider-unmet') await assert.rejects(operation, /Required native provider prerequisite unmet: provider-unavailable/);
+    else await operation;
+    const r = f.receipt(); assert.equal(calls, kind === 'ready' ? 1 : 0);
+    assert.equal(r.executor.control.action, 'teardown'); assert.equal(r.executor.control.payloadBytes, 9);
+    assert.equal(r.teardownConfirmed, true); assert.equal(r.unopenedExitConfirmed, false);
+    assert.equal(r.teardown.processId, r.processId); assert.equal(r.teardown.sessionId, r.preparation.owner.sessionId);
+    assert.equal(f.summary().requirementState, 'open'); // No native case executed by this inert fixture.
+  });
+});
+
+for (const spec of [{ pipeFault: 'stdin' }, { badDrain: true }, { wrongSession: true }, { missingTeardown: true }, { linger: true }]) test(`actual opened failure retains business and teardown causes ${JSON.stringify(spec)}`, async () => {
+  await withRealSession({ kind: 'ready', status: 0, ...spec }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => { throw Error('original business failure'); }, f.start),
+      /original business failure;/);
+    const r = f.receipt(); assert.match(r.failure, /original business failure/);
+    assert.equal(r.teardownConfirmed, false); assert.ok(r.cleanupFailure); assert.equal(f.summary().requirementState, 'open');
+  });
+});
+
+test('consumer independently rejects altered or missing close EOF process and control observations', async () => {
+  await withRealSession({}, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), /Required native prerequisite unmet/);
+    const path = join(f.directory, 'native-session-results.json'), bytes = readFileSync(path), original = JSON.parse(bytes);
+    assert.equal(f.summary().state, 'unmet-prerequisite');
+    for (const mutate of [
+      r => { delete r.executor.closeObserved; }, r => { r.executor.exitObserved = false; },
+      r => { r.executor.exitStatus = 0; }, r => { r.executor.signal = 'SIGTERM'; },
+      r => { r.executor.processError = { message: 'spawn failed' }; }, r => { r.executor.timedOut = true; },
+      r => { r.streams.stdout.eof = false; }, r => { delete r.streams.stderr.error; },
+      r => { r.streams.stdout.error = { message: 'read failed' }; }, r => { r.streams.stdout.sha256 = '0'.repeat(64); },
+      r => { r.executor.control.action = 'teardown'; r.executor.control.payloadBytes = 9; },
+      r => { r.unopenedExitConfirmed = false; },
+    ]) {
+      const changed = structuredClone(original); mutate(changed); writeFileSync(path, JSON.stringify(changed));
+      assert.equal(f.summary().requirementState, 'open'); assert.notEqual(f.summary().state, 'unmet-prerequisite');
+    }
+    writeFileSync(path, bytes); assert.equal(f.summary().state, 'unmet-prerequisite');
+  });
+});
+
+
+test('actual exited child with inherited output handle is unknown until original output EOF and close', async () => {
+  await withRealSession({ inheritedOutput: true }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), /Unopened prerequisite process exit unconfirmed/);
+    const r = f.receipt(); assert.equal(r.executor.exitObserved, true); assert.equal(r.executor.exitStatus, 1);
+    assert.equal(r.executor.closeObserved, false); assert.equal(r.executor.timedOut, true);
+    assert.equal(r.streams.stdout.eof, false); assert.equal(r.streams.stderr.eof, false);
+    assert.equal(r.unopenedExitConfirmed, false); assert.equal(f.summary().requirementState, 'open');
+  });
+});
+
+test('actual spawn error preserves typed process observations without invented exit or EOF', async () => {
+  await withRealSession({ spawnMissing: true }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), /ENOENT/);
+    const r = f.receipt(); assert.equal(r.executor.processError.code, 'ENOENT');
+    assert.equal(r.executor.exitObserved, false); assert.equal(r.processId, null);
+    assert.equal(r.teardownConfirmed, false); assert.equal(r.unopenedExitConfirmed, false);
+  });
+});
+
+test('actual oversized output retains exactly the bound and cannot become complete capture', async () => {
+  await withRealSession({ overflow: true }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start));
+    const r = f.receipt(), raw = readFileSync(join(f.directory, 'native-session.stderr.log'));
+    assert.equal(raw.length, 128 * 1024); assert.equal(r.streams.stderr.bytes, raw.length);
+    assert.match(r.executor.captureError, /exceeded its bound/);
+    assert.equal(r.unopenedExitConfirmed, false); assert.equal(f.summary().requirementState, 'open');
+  });
+});
+
+
+test('actual unopened refusal observes EOF with zero teardown bytes on its real stdin', async () => {
+  await withRealSession({ snoopInput: true }, async f => {
+    await assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), /Required native prerequisite unmet/);
+    assert.equal(readFileSync(join(f.directory, 'native-session.stderr.log'), 'utf8'), 'observed-input-bytes:0\n');
+    assert.equal(f.receipt().unopenedExitConfirmed, true); assert.equal(f.receipt().teardownConfirmed, false);
+  });
 });

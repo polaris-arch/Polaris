@@ -210,6 +210,18 @@ const PENDING_TRUST_GATE: &[Entry] = &[];
 /// **同形但非读取**的串。每条同样要求恰好命中一次 —— 那个串一旦消失，条目必须跟着走。
 const TEXT_ONLY: &[Entry] = &[
     Entry {
+        name: "POLARIS_NATIVE_PREREQUISITE",
+        reason: "session.rs::failure emits a typed unmet prerequisite as a stdout JSON record with publicationEligible false; it is data, never an environment input or execution authority. Exact owner, sole live stdout format argument and negative mutations are checked below.",
+    },
+    Entry {
+        name: "POLARIS_NATIVE_SESSION",
+        reason: "session.rs::hold_session emits the ready/unmet preparation stdout record; the real caller-bound session owner and locks grant coordination, this marker grants no environment-read or execution authority. Exact owner, sole live stdout format argument and negative mutations are checked below.",
+    },
+    Entry {
+        name: "POLARIS_NATIVE_SESSION_TEARDOWN",
+        reason: "session.rs::hold_session emits retained/cleanup-unconfirmed stdout observations after original drain checks; this data marker neither reads the environment nor authorizes cleanup, installation or publication. Exact owner, sole live stdout format argument and negative mutations are checked below.",
+    },
+    Entry {
         name: "POLARIS_CORE_STORE_LEASE_FD",
         reason: "App Linux/Mac admitted_payload producers overwrite the child environment with a dedicated inherited descriptor of the held store occupancy lease. Core consumes the selector in its own process and validates/retains the same open-file-description; this Rust workspace never reads it as ambient input. It grants no payload admission. Exact producer ownership and negative mutations are checked separately below; changing it to a Rust env::var read remains red.",
     },
@@ -1043,6 +1055,8 @@ struct Scan {
     /// 探测器 ② 的 `blank_regions` 与探测器 ①「被 cfg 罩住」的分流都以它为输入：它恒为 0
     /// 时两处都退化成「整份文件都是生产」，是本门唯一的静默失效入口，故计数留档供自检断言。
     off_regions: usize,
+    // Only genuine first-format-argument stdout records in the reviewed functions.
+    native_stdout_roles: BTreeMap<String, Vec<String>>,
 }
 
 fn scan() -> Scan {
@@ -1053,6 +1067,7 @@ fn scan_files(files: Vec<SourceFile>) -> Scan {
     let mut hits = Vec::new();
     let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut off_regions = 0usize;
+    let mut native_stdout_roles: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for file in files {
         let raw = std::fs::read_to_string(&file.path)
@@ -1102,6 +1117,23 @@ fn scan_files(files: Vec<SourceFile>) -> Scan {
         if !file.in_tests_dir && !file.release_off_file {
             off_regions += regions.len();
             let production = blank_regions(&raw, &regions);
+            if file.rel == NATIVE_STDOUT_OWNER {
+                let code = polaris_source_probe::mask_comments_and_strings(&production);
+                for (at, _) in code.match_indices("println!(") {
+                    for (name, head, schema) in NATIVE_STDOUT_MARKERS {
+                        if native_stdout_role(&production, &code, at, name, head, schema) {
+                            native_stdout_roles
+                                .entry((*name).to_owned())
+                                .or_default()
+                                .push(format!(
+                                    "{}:{}",
+                                    file.rel,
+                                    line_of(&production, at + production[at..].find('"').unwrap())
+                                ));
+                        }
+                    }
+                }
+            }
             for (at, name) in polaris_names_in(&production) {
                 names.entry(name).or_default().push(format!(
                     "{}:{}",
@@ -1116,6 +1148,7 @@ fn scan_files(files: Vec<SourceFile>) -> Scan {
         hits,
         names,
         off_regions,
+        native_stdout_roles,
     }
 }
 
@@ -1391,6 +1424,65 @@ fn production_polaris_names_are_all_accounted_for() {
     assert_production_polaris_names_accounted_for(&scan);
 }
 
+const NATIVE_STDOUT_OWNER: &str = "src-tauri/src/native_verification/session.rs";
+const NATIVE_STDOUT_MARKERS: &[(&str, &str, &str)] = &[
+    (
+        "POLARIS_NATIVE_PREREQUISITE",
+        "fn failure(",
+        "polaris-native-prerequisite-v1",
+    ),
+    (
+        "POLARIS_NATIVE_SESSION",
+        "fn hold_session(",
+        "polaris-native-session-v1",
+    ),
+    (
+        "POLARIS_NATIVE_SESSION_TEARDOWN",
+        "fn hold_session(",
+        "polaris-native-session-teardown-v1",
+    ),
+];
+
+fn native_stdout_role(
+    raw: &str,
+    code: &str,
+    at: usize,
+    name: &str,
+    head: &str,
+    schema: &str,
+) -> bool {
+    if (at > 0 && is_ident_byte(code.as_bytes()[at - 1]))
+        || literal_arg(raw, at + "println!(".len()).as_deref()
+            != Some(format!("{name} {{}}").as_str())
+        || code.matches(head).count() != 1
+    {
+        return false;
+    }
+    let declaration = code.find(head).unwrap();
+    let Some(open) = code[declaration..].find('{').map(|n| declaration + n) else {
+        return false;
+    };
+    let (Some(expected), Some(actual)) = (
+        enclosing_fn_body(code, open + 1),
+        enclosing_fn_body(code, at),
+    ) else {
+        return false;
+    };
+    if expected.as_ptr() != actual.as_ptr() || expected.len() != actual.len() {
+        return false;
+    }
+    let Some(end) = match_delim(code.as_bytes(), at + "println!".len(), b'(', b')') else {
+        return false;
+    };
+    let call: String = polaris_source_probe::mask_comments(&raw[at..=end])
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    call.starts_with(&format!("println!(\"{name}{{}}\",json!({{"))
+        && call.contains(&format!("\"schema\":\"{schema}\""))
+        && call.contains("\"publicationEligible\":false")
+}
+
 fn assert_production_polaris_names_accounted_for(scan: &Scan) {
     // These child outputs / compile marker have exact source owners, not a
     // repository-wide exemption for any indirect read using the same name.
@@ -1410,6 +1502,12 @@ fn assert_production_polaris_names_accounted_for(scan: &Scan) {
             "POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1",
             &["crates/core-supervisor/src/selected_core.rs"][..],
         ),
+        ("POLARIS_NATIVE_PREREQUISITE", &[NATIVE_STDOUT_OWNER][..]),
+        ("POLARIS_NATIVE_SESSION", &[NATIVE_STDOUT_OWNER][..]),
+        (
+            "POLARIS_NATIVE_SESSION_TEARDOWN",
+            &[NATIVE_STDOUT_OWNER][..],
+        ),
     ] {
         let sites = scan.names.get(name).cloned().unwrap_or_default();
         let mut owners: Vec<_> = sites
@@ -1419,6 +1517,10 @@ fn assert_production_polaris_names_accounted_for(scan: &Scan) {
         owners.sort_unstable();
         assert_eq!(owners, expected,
             "TEXT_ONLY scoped occurrences for `{name}` changed: {sites:?}; each reviewed owner must occur exactly once");
+    }
+    for (name, _, _) in NATIVE_STDOUT_MARKERS {
+        assert_eq!(scan.native_stdout_roles.get(*name), scan.names.get(*name),
+            "TEXT_ONLY scoped occurrences for `{name}` must be the sole live stdout record in its exact reviewed function");
     }
     let claimed: BTreeSet<&str> = registry()
         .iter()
@@ -2799,4 +2901,206 @@ fn sweep_environment_is_a_bounded_current_token_selector() {
     assert!(!observed
         .release_reads()
         .contains_key("POLARIS_WINDOWS_INSTALL_ANCHOR"));
+}
+
+#[test]
+fn native_session_stdout_markers_reject_single_literal_role_and_owner_mutations() {
+    struct SourceFixture(PathBuf);
+    impl Drop for SourceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let fixture = SourceFixture(std::env::temp_dir().join(format!(
+        "polaris-stdout-owner-{}-{}.rs", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    )));
+    let moved = SourceFixture(fixture.0.with_extension("moved.rs"));
+    let original = std::fs::read_to_string(workspace_root().join(NATIVE_STDOUT_OWNER)).unwrap();
+    let baseline = scan();
+    for (name, _, schema) in NATIVE_STDOUT_MARKERS {
+        // Full format literals distinguish SESSION from SESSION_TEARDOWN.
+        let literal = format!("\"{name} {{}}\"");
+        assert_eq!(original.matches(&literal).count(), 1);
+        let relocated = original.replacen(&literal, "\"RELOCATED_TEXT_NAME {}\"", 1);
+        for (other, _, _) in NATIVE_STDOUT_MARKERS {
+            if other != name {
+                let other_literal = format!("\"{other} {{}}\"");
+                assert_eq!(
+                    relocated.matches(&other_literal).count(),
+                    original.matches(&other_literal).count(),
+                    "{name} mutation must preserve the other complete literal {other}"
+                );
+            }
+        }
+        let literal_at = original.find(&literal).unwrap();
+        let call_at = original[..literal_at].rfind("println!(").unwrap();
+        let call_prefix = &original[call_at..literal_at + literal.len()];
+        assert_eq!(original.matches(call_prefix).count(), 1);
+        let code = polaris_source_probe::mask_comments_and_strings(&original);
+        let call_end =
+            match_delim(code.as_bytes(), call_at + "println!".len(), b'(', b')').unwrap();
+        let call = &original[call_at..=call_end];
+        assert_eq!(original.matches(call).count(), 1);
+        for mode in [
+            "const-read",
+            "literal-read",
+            "duplicate",
+            "wrong-owner",
+            "same-owner-const-read",
+            "same-owner-literal-read",
+            "stderr-role",
+            "wrong-function",
+            "wrong-schema",
+            "publication-eligible",
+            "comment-replay",
+            "string-replay",
+            "missing",
+        ] {
+            // A clean complete production baseline is required before EACH mutant.
+            assert_production_polaris_names_accounted_for(&baseline);
+            let mut files = scan_surface();
+            let (rel, raw) = match mode {
+                "const-read" => (
+                    "src-tauri/src/runtime/owner_probe.rs",
+                    format!(
+                        "const K: &str = \"{name}\"; fn observed() {{ let _ = std::env::var(K); }}"
+                    ),
+                ),
+                "literal-read" => (
+                    "src-tauri/src/runtime/owner_probe.rs",
+                    format!("fn observed() {{ let _ = std::env::var_os(\"{name}\"); }}"),
+                ),
+                "duplicate" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (
+                        NATIVE_STDOUT_OWNER,
+                        format!("{original}\nconst EXTRA: &str = \"{name}\";\n"),
+                    )
+                }
+                "wrong-owner" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    std::fs::write(&moved.0, &relocated).unwrap();
+                    files.push(SourceFile {
+                        rel: NATIVE_STDOUT_OWNER.into(),
+                        path: moved.0.clone(),
+                        in_tests_dir: false,
+                        release_off_file: false,
+                    });
+                    (
+                        "src-tauri/src/runtime/owner_probe.rs",
+                        format!("const MOVED: &str = \"{name}\";"),
+                    )
+                }
+                "same-owner-const-read" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (NATIVE_STDOUT_OWNER, format!("{relocated}\nconst K: &str = \"{name}\"; fn observed() {{ let _ = std::env::var(K); }}"))
+                }
+                "same-owner-literal-read" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (NATIVE_STDOUT_OWNER, format!("{relocated}\nfn observed() {{ let _ = std::env::var_os(\"{name}\"); }}"))
+                }
+                "stderr-role" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (
+                        NATIVE_STDOUT_OWNER,
+                        original.replacen(
+                            call_prefix,
+                            &call_prefix.replacen("println!", "eprintln!", 1),
+                            1,
+                        ),
+                    )
+                }
+                "wrong-function" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (
+                        NATIVE_STDOUT_OWNER,
+                        format!(
+                            "{}\nfn unreviewed_output_owner() {{ {call}; }}\n",
+                            original.replacen(call, "", 1)
+                        ),
+                    )
+                }
+                "wrong-schema" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    assert_eq!(call.matches(*schema).count(), 1);
+                    (
+                        NATIVE_STDOUT_OWNER,
+                        original.replacen(call, &call.replacen(*schema, "unreviewed-schema", 1), 1),
+                    )
+                }
+                "publication-eligible" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    assert_eq!(call.matches("\"publicationEligible\":false").count(), 1);
+                    (
+                        NATIVE_STDOUT_OWNER,
+                        original.replacen(
+                            call,
+                            &call.replacen(
+                                "\"publicationEligible\":false",
+                                "\"publicationEligible\":true",
+                                1,
+                            ),
+                            1,
+                        ),
+                    )
+                }
+                "comment-replay" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (
+                        NATIVE_STDOUT_OWNER,
+                        format!("{relocated}\n// println!({literal}, json!({{}}));\n"),
+                    )
+                }
+                "string-replay" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (NATIVE_STDOUT_OWNER, format!("{relocated}\nconst REPLAY: &str = r#\"println!({literal}, json!({{}}));\"#;\n"))
+                }
+                "missing" => {
+                    files.retain(|file| file.rel != NATIVE_STDOUT_OWNER);
+                    (NATIVE_STDOUT_OWNER, relocated.clone())
+                }
+                _ => unreachable!(),
+            };
+            // Mutants preserve the other two names even when prefixes overlap.
+            if rel == NATIVE_STDOUT_OWNER {
+                for (other, _, _) in NATIVE_STDOUT_MARKERS {
+                    if other != name {
+                        let token = format!("\"{other} {{}}\"");
+                        assert_eq!(
+                            raw.matches(&token).count(),
+                            original.matches(&token).count()
+                        );
+                    }
+                }
+            }
+            std::fs::write(&fixture.0, raw).unwrap();
+            files.push(SourceFile {
+                rel: rel.into(),
+                path: fixture.0.clone(),
+                in_tests_dir: false,
+                release_off_file: false,
+            });
+            let result = scan_files(files);
+            if mode == "same-owner-const-read" {
+                assert!(!result.hits.iter().any(|hit| hit.name == *name),
+                    "the sole indirect read must be denied by the real stdout-role contract, not a new constant parser");
+                assert_eq!(result.names.get(*name).unwrap().len(), 1);
+            }
+            let error =
+                std::panic::catch_unwind(|| assert_production_polaris_names_accounted_for(&result))
+                    .expect_err(&format!(
+                        "{name}/{mode} escaped the complete production gate"
+                    ));
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(
+                message.contains("TEXT_ONLY scoped occurrences") && message.contains(*name),
+                "wrong rejection for {name}/{mode}: {message}"
+            );
+        }
+    }
 }

@@ -385,74 +385,158 @@ function saveSessionResults(directory, value) {
 }
 // The holder owns only the private data slot. It cannot install/elevate, execute
 // a core, accept a transport/path/policy, or issue a native retirement fact.
-export async function startNativeSession(selected, env, directory) {
-  const child = spawn(selected.executable, ['--session'], {
+const sessionError = (error) => ({ name: String(error?.name ?? 'Error').slice(0, 128), message: problem(error),
+  code: typeof error?.code === 'string' ? error.code.slice(0, 128) : null, syscall: typeof error?.syscall === 'string' ? error.syscall.slice(0, 128) : null });
+// The factory seam changes only child creation in inert tests. Production always
+// uses spawn with the original executable, closed --session argv and pipe policy.
+export async function startNativeSession(selected, env, directory, {
+  spawnChild = spawn, preparationTimeoutMs = 30_000, finishTimeoutMs = 30_000,
+} = {}) {
+  demand([preparationTimeoutMs, finishTimeoutMs].every(v => Number.isSafeInteger(v) && v > 0 && v <= 30_000),
+    'Invalid bounded session deadline');
+  const child = spawnChild(selected.executable, ['--session'], {
     cwd: dirname(selected.manifest), env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
   });
-  let stdout = '', stderr = '', captureError = null, settled = false, holderClosed = false, prepareResolve, prepareReject;
+  const output = Object.fromEntries(['stdout', 'stderr'].map(name => [name, { bytes: Buffer.alloc(0), eof: false, error: null }]));
+  const control = { action: null, payloadBytes: 0, attempted: false, finished: false, closed: false, error: null };
+  let processError = null, captureError = null, settled = false, kind = null, holderClosed = false;
+  let exitObserved = false, exitStatus = null, exitSignal = null, closeStatus = null, closeSignal = null;
+  let timedOut = false, wasInterrupted = false, prepareResolve, prepareReject, closeResolve, finishPromise;
   const preparation = new Promise((resolve, reject) => { prepareResolve = resolve; prepareReject = reject; });
-  const closed = new Promise((resolve) => {
-    child.once('error', error => { captureError = problem(error); if (!settled) { settled = true; prepareReject(error); } });
-    child.once('close', (status, signal) => {
-      holderClosed = true;
-      if (!settled) { settled = true; prepareReject(Error('Session holder exited without bounded preparation')); }
-      resolve({ processId: child.pid ?? null, status, signal, captureError, stdout, stderr });
-    });
+  const closed = new Promise(resolve => { closeResolve = resolve; });
+  const closeInput = () => {
+    if (control.action !== null) return;
+    control.action = kind === 'preparation' ? 'teardown' : 'eof';
+    control.payloadBytes = kind === 'preparation' ? Buffer.byteLength('teardown\n') : 0;
+    if (!child.stdin.destroyed && !child.stdin.writableEnded) {
+      control.attempted = true;
+      try { if (kind === 'preparation') child.stdin.end('teardown\n'); else child.stdin.end(); }
+      catch (error) { control.error = sessionError(error); }
+    }
+  };
+  child.stdin.on('error', error => { control.error ||= sessionError(error); });
+  child.stdin.once('finish', () => { control.finished = true; });
+  child.stdin.once('close', () => { control.closed = true; });
+  child.once('error', error => {
+    processError = sessionError(error);
+    if (!settled) { settled = true; prepareReject(error); }
   });
-  const closeInput = () => { if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end('teardown\n'); };
-  child.stdin.on('error', error => { captureError ||= problem(error); });
-  const capture = (key, chunk) => {
-    const value = (key === 'stdout' ? stdout : stderr) + chunk.toString('utf8');
-    if (Buffer.byteLength(value) > SESSION_OUTPUT_LIMIT) {
-      captureError ||= 'Session output exceeded its bound'; closeInput();
-      if (!settled) { settled = true; prepareReject(Error(captureError)); }
-      return;
-    }
-    if (key === 'stdout') stdout = value; else stderr = value;
-    if (!settled && key === 'stdout') {
-      for (const [prefix, kind] of [['POLARIS_NATIVE_SESSION ', 'preparation'], ['POLARIS_NATIVE_PREREQUISITE ', 'prerequisite']]) {
-        try {
-          const rows = records(stdout, prefix);
-          if (rows.length === 1) { settled = true; prepareResolve({ kind, record: rows[0] }); break; }
-          if (rows.length > 1) throw Error('Duplicate session preparation');
-        } catch (error) {
-          if (!stdout.endsWith('\n')) continue;
-          settled = true; closeInput(); prepareReject(error);
-        }
+  child.once('exit', (status, signal) => { exitObserved = true; exitStatus = status; exitSignal = signal; });
+  child.once('close', (status, signal) => {
+    holderClosed = true; closeStatus = status; closeSignal = signal;
+    if (!settled) { settled = true; prepareReject(Error('Session holder exited without bounded preparation')); }
+    closeResolve();
+  });
+  const failCapture = error => {
+    captureError ||= problem(error); closeInput();
+    if (!settled) { settled = true; prepareReject(error); }
+  };
+  const capture = (name, chunk) => {
+    const stream = output[name], bytes = Buffer.from(chunk);
+    const available = SESSION_OUTPUT_LIMIT - stream.bytes.length;
+    stream.bytes = Buffer.concat([stream.bytes, bytes.subarray(0, available)]);
+    if (bytes.length > available) { failCapture(Error('Session output exceeded its bound')); return; }
+    if (settled || name !== 'stdout') return;
+    // Decode only complete original protocol lines. Partial UTF-8/code points
+    // remain bytes until their newline; final decoding below is fatal as well.
+    const end = stream.bytes.lastIndexOf(10);
+    if (end < 0) return;
+    try {
+      const text = textBytes(stream.bytes.subarray(0, end + 1));
+      const prepared = records(text, 'POLARIS_NATIVE_SESSION '), refused = records(text, 'POLARIS_NATIVE_PREREQUISITE ');
+      demand(prepared.length + refused.length <= 1, 'Duplicate session preparation');
+      if (prepared.length + refused.length === 1) {
+        kind = prepared.length ? 'preparation' : 'prerequisite'; settled = true;
+        prepareResolve({ kind, record: prepared[0] ?? refused[0] });
       }
-    }
+    } catch (error) { failCapture(error); }
   };
-  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-  child.stdout.on('data', chunk => capture('stdout', chunk)); child.stderr.on('data', chunk => capture('stderr', chunk));
-  const interrupted = () => { captureError ||= 'Session runner interrupted; native custody must remain unconfirmed until original drains'; closeInput(); };
+  for (const name of ['stdout', 'stderr']) {
+    child[name].on('data', chunk => capture(name, chunk));
+    child[name].once('end', () => { output[name].eof = true; });
+    child[name].once('error', error => { output[name].error = sessionError(error); failCapture(error); });
+  }
+  const interrupted = () => { wasInterrupted = true; closeInput();
+    if (!settled) { settled = true; prepareReject(Error('Session runner interrupted; retain original owners')); } };
   process.on('SIGINT', interrupted); process.on('SIGTERM', interrupted);
-  const timer = setTimeout(() => { captureError ||= 'Session preparation deadline exceeded'; closeInput();
-    if (!settled) { settled = true; prepareReject(Error(captureError)); } }, 30_000);
-  const finish = async () => {
+  const timer = setTimeout(() => {
+    timedOut = true; closeInput();
+    if (!settled) { settled = true; prepareReject(Error('Session preparation deadline exceeded')); }
+  }, preparationTimeoutMs);
+  const finish = () => finishPromise ||= (async () => {
     clearTimeout(timer); closeInput();
-    // Do not kill the holder or discard custody on a timeout. Record unknown and
-    // retain its private slot; the runner's outer process lifetime owns delivery.
-    const outcome = await Promise.race([closed, new Promise(resolve => {
-      const deadline = setTimeout(() => resolve({ processId: child.pid ?? null, status: null,
-        captureError: 'Session teardown deadline exceeded; holder and data retained', stdout, stderr }), 30_000);
-      closed.then(() => clearTimeout(deadline));
+    let deadline;
+    await Promise.race([closed, new Promise(resolve => {
+      deadline = setTimeout(() => { timedOut = true; resolve(); }, finishTimeoutMs);
     })]);
+    clearTimeout(deadline);
     process.removeListener('SIGINT', interrupted); process.removeListener('SIGTERM', interrupted);
-    for (const [name, value] of [['stdout', outcome.stdout], ['stderr', outcome.stderr]])
-      writeFileSync(join(directory, `native-session.${name}.log`), value, { mode: 0o600 });
-    return outcome;
-  };
-  try { const value = await preparation; clearTimeout(timer); return { ...value, processId: child.pid, finish, assertActive() {
-    demand(!holderClosed && !captureError, 'Session holder interrupted/exited; retain original owners and stop further cases');
-  } }; }
-  catch (error) { await finish(); throw error; }
+    // A deadline does not kill a holder or prove any native exit. Preserve the
+    // bounded original partial bytes and explicit false EOF/close observations.
+    for (const name of ['stdout', 'stderr']) {
+      try { textBytes(output[name].bytes); } catch (error) { captureError ||= problem(error); }
+      writeFileSync(join(directory, `native-session.${name}.log`), output[name].bytes, { mode: 0o600 });
+    }
+    return { processId: child.pid ?? null, status: closeStatus, signal: closeSignal,
+      exitObserved, exitStatus, exitSignal, closeObserved: holderClosed, processError, captureError,
+      timedOut, interrupted: wasInterrupted, control: structuredClone(control),
+      stdout: Buffer.from(output.stdout.bytes), stderr: Buffer.from(output.stderr.bytes),
+      outputState: Object.fromEntries(['stdout', 'stderr'].map(name => [name, { eof: output[name].eof, error: output[name].error }])) };
+  })();
+  try {
+    const value = await preparation; clearTimeout(timer);
+    return { ...value, processId: child.pid, finish, assertActive() {
+      demand(!holderClosed && !exitObserved && !processError && !captureError && !control.error && !timedOut && !wasInterrupted,
+        'Session holder interrupted/exited; retain original owners and stop further cases');
+    } };
+  } catch (error) { error.sessionEnd = await finish(); throw error; }
+}
+
+// Recompute completion from distinct original observations, never from a passed
+// flag or a prerequisite alone. Missing fields are not backward-defaulted.
+function sessionErrorRecord(value) {
+  return value === null || value && typeof value === 'object' && typeof value.name === 'string'
+    && typeof value.message === 'string' && (value.code === null || typeof value.code === 'string')
+    && (value.syscall === null || typeof value.syscall === 'string');
+}
+function sessionProcessComplete(r) {
+  const e = r.executor, input = e?.control;
+  return !!(e?.processId === r.processId && Number.isSafeInteger(r.processId) && r.processId > 0
+    && e.closeObserved === true && e.exitObserved === true && Number.isInteger(e.status)
+    && e.exitStatus === e.status && e.signal === null && e.exitSignal === null
+    && e.processError === null && e.captureError === null && e.timedOut === false && e.interrupted === false
+    && input && ['eof', 'teardown'].includes(input.action) && typeof input.attempted === 'boolean'
+    && typeof input.finished === 'boolean' && input.closed === true && Number.isSafeInteger(input.payloadBytes)
+    && sessionErrorRecord(input.error)
+    && ['stdout', 'stderr'].every(name => r.streams[name]?.eof === true && r.streams[name]?.error === null));
+}
+function sessionFromOriginal(r, output, binding) {
+  const prepared = records(output.stdout, 'POLARIS_NATIVE_SESSION ');
+  const refused = records(output.stdout, 'POLARIS_NATIVE_PREREQUISITE ');
+  const ends = records(output.stdout, 'POLARIS_NATIVE_SESSION_TEARDOWN ');
+  if (r.preparation) {
+    demand(prepared.length === 1 && refused.length === 0 && JSON.stringify(prepared[0]) === JSON.stringify(r.preparation),
+      'Preparation stream differs');
+    sessionPreparation(prepared[0], binding, r.processId);
+    demand(ends.length === 1 && JSON.stringify(ends[0]) === JSON.stringify(r.teardown), 'Teardown stream differs');
+    return { teardownConfirmed: sessionProcessComplete(r) && r.executor.status === 0
+      && r.executor.control.action === 'teardown' && r.executor.control.payloadBytes === Buffer.byteLength('teardown\n')
+      && r.executor.control.attempted === true && r.executor.control.finished === true && r.executor.control.error === null
+      && sessionTeardown(ends[0], prepared[0], r.processId), unopenedExitConfirmed: false };
+  }
+  demand(refused.length === 1 && prepared.length === 0 && ends.length === 0
+    && JSON.stringify(refused[0]) === JSON.stringify(r.prerequisite), 'Prerequisite stream differs');
+  unmetPrerequisite(refused[0], binding, r.processId);
+  return { teardownConfirmed: false, unopenedExitConfirmed: sessionProcessComplete(r) && r.executor.status !== 0
+    && r.executor.control.action === 'eof' && r.executor.control.payloadBytes === 0 };
 }
 export async function withNativeSession(selected, env, directory, run, start = startNativeSession) {
   const authority = nativeBindings.get(selected);
   demand(authority && authority.sha256 === hash(selected.executable), 'Session requires current bound Cargo artifact');
   const receipt = { schema: 'polaris-native-session-runtime-v1', binding: authority.binding,
     executableSha256: authority.sha256, requiredCases: [...TESTS], state: 'starting', processId: null,
-    preparation: null, prerequisite: null, teardown: null, teardownConfirmed: false, failure: null, streams: null };
+    preparation: null, prerequisite: null, teardown: null, teardownConfirmed: false, unopenedExitConfirmed: false,
+    failure: null, executor: null, streams: null };
   saveSessionResults(directory, receipt);
   let holder = null, error = null;
   try {
@@ -471,26 +555,31 @@ export async function withNativeSession(selected, env, directory, run, start = s
   } catch (cause) { error = cause; receipt.failure = problem(cause); }
   finally {
     delete authority.session;
-    if (holder) {
+    if (holder || error?.sessionEnd) {
       try {
-        const end = await holder.finish();
+        const end = holder ? await holder.finish() : error.sessionEnd;
+        receipt.processId = end.processId;
+        receipt.executor = Object.fromEntries(['processId', 'status', 'signal', 'exitObserved', 'exitStatus', 'exitSignal',
+          'closeObserved', 'processError', 'captureError', 'timedOut', 'interrupted', 'control'].map(key => [key, end[key]]));
+        receipt.streams = Object.fromEntries(['stdout', 'stderr'].map(name => {
+          demand(Buffer.isBuffer(end[name]), 'Session output must retain original bytes');
+          return [name, { file: `native-session.${name}.log`, ...byteIdentity(end[name]),
+            eof: end.outputState?.[name]?.eof, error: end.outputState?.[name]?.error }];
+        }));
         demand(hash(selected.executable) === authority.sha256, 'Session executable changed during preparation/cases/teardown');
-        receipt.executor = { processId: end.processId, status: end.status, signal: end.signal ?? null, captureError: end.captureError ?? null };
-        receipt.streams = Object.fromEntries(['stdout', 'stderr'].map(name => [name, {
-          file: `native-session.${name}.log`, ...byteIdentity(Buffer.from(end[name] ?? '', 'utf8')),
-        }]));
-        const stdout = end.stdout ?? '';
+        const output = Object.fromEntries(['stdout', 'stderr'].map(name => {
+          const raw = boundedBytes(join(directory, `native-session.${name}.log`), SESSION_OUTPUT_LIMIT);
+          demand(raw.equals(end[name]), 'Session persisted original output differs');
+          return [name, textBytes(raw)];
+        }));
         if (receipt.preparation) {
-          const rows = records(stdout, 'POLARIS_NATIVE_SESSION_TEARDOWN ');
+          const rows = records(output.stdout, 'POLARIS_NATIVE_SESSION_TEARDOWN ');
           demand(rows.length === 1, 'Session teardown record missing or duplicated');
           receipt.teardown = rows[0];
-          receipt.teardownConfirmed = end.status === 0 && !end.signal && !end.captureError
-            && sessionTeardown(rows[0], receipt.preparation, holder.processId);
-          demand(receipt.teardownConfirmed, 'Session teardown unconfirmed; retain original data');
-        } else {
-          demand(receipt.prerequisite && Number.isInteger(end.status) && end.status !== 0 && !end.signal && !end.captureError,
-            'Unopened prerequisite process exit unconfirmed');
         }
+        Object.assign(receipt, sessionFromOriginal(receipt, output, authority.binding));
+        demand(receipt.preparation ? receipt.teardownConfirmed : receipt.unopenedExitConfirmed,
+          receipt.preparation ? 'Session teardown unconfirmed; retain original data' : 'Unopened prerequisite process exit unconfirmed');
       } catch (cause) {
         receipt.cleanupFailure = problem(cause);
         error = Error([receipt.failure, receipt.cleanupFailure].filter(Boolean).join('; '));
@@ -513,22 +602,11 @@ function readSessionResults(directory, binding, executableSha256) {
     demand(s?.file === file && s.bytes === b.length && s.sha256 === digestBytes(b), 'Session original streams differ');
     output[name] = textBytes(b);
   }
-  if (r.preparation) {
-    const rows = records(output.stdout, 'POLARIS_NATIVE_SESSION ');
-    demand(rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(r.preparation), 'Preparation stream differs');
-    sessionPreparation(r.preparation, binding, r.processId);
-    const ends = records(output.stdout, 'POLARIS_NATIVE_SESSION_TEARDOWN ');
-    demand(ends.length === 1 && JSON.stringify(ends[0]) === JSON.stringify(r.teardown), 'Teardown stream differs');
-    const confirmed = r.executor?.processId === r.processId && r.executor.status === 0
-      && r.executor.signal === null && r.executor.captureError === null && sessionTeardown(r.teardown, r.preparation, r.processId);
-    demand(r.teardownConfirmed === confirmed, 'Session teardown summary differs');
-  } else {
-    const rows = records(output.stdout, 'POLARIS_NATIVE_PREREQUISITE ');
-    demand(rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(r.prerequisite), 'Prerequisite stream differs');
-    unmetPrerequisite(r.prerequisite, binding, r.processId);
-    demand(r.executor?.processId === r.processId && Number.isInteger(r.executor.status) && r.executor.status !== 0
-      && r.executor.signal === null && r.executor.captureError === null, 'Unopened prerequisite executor differs');
-  }
+  const observed = sessionFromOriginal(r, output, binding);
+  demand(r.teardownConfirmed === observed.teardownConfirmed && r.unopenedExitConfirmed === observed.unopenedExitConfirmed,
+    'Session completion summary differs from original process/streams');
+  demand(r.preparation ? observed.teardownConfirmed : observed.unopenedExitConfirmed,
+    r.preparation ? 'Session teardown unconfirmed; retain original data' : 'Unopened prerequisite executor differs');
   return r;
 }
 

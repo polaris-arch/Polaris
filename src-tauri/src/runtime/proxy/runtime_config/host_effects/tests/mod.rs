@@ -1424,9 +1424,14 @@ fn cold_checked_dns_accepts_h_under_busy_start_without_a_host_or_core_transactio
 fn cold_restore_before_h_callback_survives_reset_without_reviving_native_cleanup() {
     for existing_owner in [false, true] {
         let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+        let claimed = runtime
+            .claim_generation(None, polaris_core_supervisor::LifecycleKind::Start)
+            .unwrap();
+        assert!(claimed > 0);
         runtime.gate.begin();
         let (execution, mut controller, prepared, values) =
             dns_execution_fixture(&runtime, "dns-startup:restore-first");
+        assert_eq!(execution.generation, claimed);
         let prepared = if existing_owner {
             assert_eq!(
                 controller.apply_effect(&prepared, "older-marker").outcome,
@@ -1705,6 +1710,17 @@ fn cold_prior_restore_keeps_replacement_reserved_until_its_actual_receipt() {
     }
     assert_eq!(runtime.accepted_host_dns_takeover(), None);
     assert!(runtime.host_effect_pending());
+    assert!(runtime.bind_runtime_cold_dns_marker(&execution.execution_id, None));
+    {
+        let state = runtime.runtime_config_apply.lock().unwrap();
+        assert!(state
+            .host
+            .dns_cold
+            .as_ref()
+            .unwrap()
+            .restored_prior_marker
+            .is_none());
+    }
     let next = controller.prepare_after_restore(&retry).unwrap();
     let applied = controller.apply_effect(&next, &execution.execution_id);
     assert_eq!(applied.outcome, TakeoverOutcome::Applied);
@@ -1725,4 +1741,546 @@ fn cold_prior_restore_keeps_replacement_reserved_until_its_actual_receipt() {
         Some(execution.execution_id.as_str())
     );
     assert_eq!(values.lock().unwrap()["A"], vec!["8.8.8.8"]);
+}
+
+// Construct the real prior marker and the same cold reservation/binding used by
+// the producer. No alternate settlement logic is implemented in this fixture.
+fn cold_reserved_prior_fixture(
+    runtime: &Arc<ProxyRuntime>,
+    id: &str,
+    partial: bool,
+) -> (
+    HostEffectExecution,
+    LedgerDnsController,
+    polaris_system_integration::dns_ops::PreparedDnsEffect,
+    LedgerDnsValues,
+    Arc<LedgerDnsFaults>,
+) {
+    let generation = runtime
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Start)
+        .unwrap();
+    assert!(generation > 0);
+    runtime.gate.begin();
+    let (execution, mut controller, prepared, values, faults) =
+        dns_execution_fixture_with_faults(runtime, id);
+    assert_eq!(execution.generation, generation);
+    faults
+        .fail_marker_after_write
+        .store(partial, std::sync::atomic::Ordering::SeqCst);
+    let prior = controller.apply_effect(&prepared, "cold-prior-owner");
+    assert_eq!(
+        prior.outcome,
+        if partial {
+            TakeoverOutcome::RecoveryPending
+        } else {
+            TakeoverOutcome::Applied
+        }
+    );
+    faults
+        .fail_marker_after_write
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    faults
+        .fail_marker_reads
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let prepared = controller.prepare_effect(true).unwrap();
+    assert_eq!(prepared.needs_prior_restore(), partial);
+    assert_eq!(
+        prepared.prior_marker_operation_id().as_deref(),
+        Some("cold-prior-owner")
+    );
+    assert_eq!(values.lock().unwrap()["A"], vec!["8.8.8.8"]);
+    assert!(runtime.begin_runtime_cold_dns(
+        execution.generation,
+        execution.intent,
+        &execution.execution_id
+    ));
+    assert!(runtime.bind_runtime_cold_dns_marker(
+        &execution.execution_id,
+        prepared.prior_marker_operation_id()
+    ));
+    (execution, controller, prepared, values, faults)
+}
+
+#[test]
+fn restored_borrowed_cold_receipts_cannot_accept_h_or_revive_cleanup_after_reset() {
+    for partial in [false, true] {
+        for reset in [false, true] {
+            let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+            let (execution, mut controller, prepared, values, _) =
+                cold_reserved_prior_fixture(&runtime, "borrowed-cold-result", partial);
+            let mut receipt = controller.apply_effect(&prepared, &execution.execution_id);
+            if partial {
+                assert_eq!(receipt.outcome, TakeoverOutcome::RecoveryPending);
+                assert!(receipt.cleanup_pending);
+                assert_eq!(receipt.marker_id.as_deref(), Some("cold-prior-owner"));
+                // The actual partial-plan guard must have performed no new
+                // marker or DNS mutation before borrowing the old footprint.
+                assert!(controller.effect_facts_match(&prepared).unwrap());
+            } else {
+                assert_eq!(receipt.outcome, TakeoverOutcome::Unchanged);
+                assert!(!receipt.cleanup_pending);
+                receipt.marker_id = controller
+                    .checked_owned_receipt()
+                    .unwrap()
+                    .unwrap()
+                    .marker_id;
+            }
+            assert_eq!(runtime.accepted_host_dns_takeover(), None);
+            controller.restore_dns();
+            assert!(!controller.has_marker());
+            assert_eq!(values.lock().unwrap()["A"], vec!["192.168.1.1"]);
+            runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+            runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+            runtime.record_runtime_dns_restore_result("foreign-marker", true);
+            {
+                let state = runtime.runtime_config_apply.lock().unwrap();
+                let cold = state.host.dns_cold.as_ref().unwrap();
+                assert!(cold.in_flight);
+                assert_eq!(
+                    cold.restored_prior_marker
+                        .as_ref()
+                        .map(|proof| proof.marker_operation_id.as_str()),
+                    Some("cold-prior-owner")
+                );
+            }
+            if reset {
+                let mut state = runtime.runtime_config_apply.lock().unwrap();
+                let mut previous = std::mem::take(&mut state.host);
+                state.host.carry_dns_cleanup_from(&mut previous);
+                assert_eq!(
+                    state
+                        .host
+                        .dns_cold
+                        .as_ref()
+                        .unwrap()
+                        .restored_prior_marker
+                        .as_ref()
+                        .map(|proof| proof.marker_operation_id.as_str()),
+                    Some("cold-prior-owner")
+                );
+                drop(state);
+                runtime.status.write().unwrap().running = false;
+            }
+            runtime.record_runtime_cold_dns_result(
+                execution.generation,
+                execution.intent,
+                receipt.clone(),
+            );
+            runtime.record_runtime_cold_dns_result(execution.generation, execution.intent, receipt);
+            runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+            assert_eq!(runtime.accepted_host_dns_takeover(), None);
+            assert_eq!(runtime.host_effect_pending(), !reset);
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            assert!(state.host.dns_cold.is_none());
+            assert!(state.host.dns_owner.is_none());
+            assert!(!state.host.dns_unknown_cleanup);
+            assert!(state.host.dns_unknown_owner.is_none());
+            assert_eq!(
+                state.host.dns_policy_unconfirmed,
+                (!reset).then_some(execution.generation)
+            );
+        }
+    }
+}
+
+#[test]
+fn borrowed_cold_cleanup_requires_exact_restore_and_full_reservation_identity() {
+    for mismatch in [
+        "unrestored",
+        "failed-restore",
+        "foreign-restore",
+        "generation",
+        "intent",
+        "operation",
+        "marker",
+        "missing-marker",
+        "unknown-outcome",
+    ] {
+        let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+        let (execution, mut controller, prepared, values, faults) =
+            cold_reserved_prior_fixture(&runtime, "exact-borrowed-cold", true);
+        let mut receipt = controller.apply_effect(&prepared, &execution.execution_id);
+        assert_eq!(receipt.outcome, TakeoverOutcome::RecoveryPending);
+        assert_eq!(receipt.marker_id.as_deref(), Some("cold-prior-owner"));
+        assert!(controller.effect_facts_match(&prepared).unwrap());
+        let confirmed = !matches!(
+            mismatch,
+            "unrestored" | "failed-restore" | "foreign-restore"
+        );
+        if confirmed {
+            controller.restore_dns();
+            assert!(!controller.has_marker());
+            assert_eq!(values.lock().unwrap()["A"], vec!["192.168.1.1"]);
+            runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        } else if mismatch == "failed-restore" {
+            faults
+                .fail_marker_reads
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            controller.restore_dns();
+            runtime.record_runtime_dns_restore_result("cold-prior-owner", false);
+            faults
+                .fail_marker_reads
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(controller.has_marker());
+        } else if mismatch == "foreign-restore" {
+            runtime.record_runtime_dns_restore_result("foreign-marker", true);
+            assert!(controller.has_marker());
+        }
+        {
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            assert_eq!(
+                state
+                    .host
+                    .dns_cold
+                    .as_ref()
+                    .unwrap()
+                    .restored_prior_marker
+                    .as_ref()
+                    .map(|proof| proof.marker_operation_id.as_str()),
+                confirmed.then_some("cold-prior-owner")
+            );
+        }
+        let original_pending = receipt.clone();
+        let mut generation = execution.generation;
+        let mut intent = execution.intent;
+        match mismatch {
+            "generation" => {
+                generation = runtime
+                    .claim_generation(None, polaris_core_supervisor::LifecycleKind::Start)
+                    .unwrap()
+            }
+            "intent" => {
+                runtime.selector_reconcile.register_intent();
+                intent = runtime.selector_reconcile.intent_generation();
+            }
+            "operation" => receipt.operation_id = "foreign-operation".into(),
+            "marker" => receipt.marker_id = Some("foreign-marker".into()),
+            "missing-marker" => receipt.marker_id = None,
+            "unknown-outcome" => receipt.outcome = TakeoverOutcome::Unknown,
+            _ => {}
+        }
+        if mismatch == "generation" {
+            assert_ne!(generation, execution.generation);
+        }
+        if mismatch == "intent" {
+            assert_ne!(intent, execution.intent);
+        }
+        runtime.record_runtime_cold_dns_result(generation, intent, receipt);
+        if mismatch == "unknown-outcome" {
+            runtime.record_runtime_cold_dns_result(
+                execution.generation,
+                execution.intent,
+                original_pending,
+            );
+        }
+        assert!(runtime.host_effect_pending(), "{mismatch}");
+        assert_eq!(runtime.accepted_host_dns_takeover(), None, "{mismatch}");
+        let state = runtime.runtime_config_apply.lock().unwrap();
+        let cold = state.host.dns_cold.as_ref().unwrap();
+        assert_eq!(cold.generation, execution.generation);
+        assert_eq!(cold.intent, execution.intent);
+        assert_eq!(cold.operation_id, execution.execution_id);
+        if matches!(mismatch, "generation" | "intent" | "operation") {
+            assert!(cold.in_flight);
+        } else {
+            assert!(!cold.in_flight);
+            assert!(cold.cleanup_pending);
+        }
+        assert!(state.host.dns_owner.is_none());
+    }
+}
+
+#[test]
+fn replacement_bind_ends_prior_only_proof_before_real_applied_or_partial_write() {
+    for partial in [false, true] {
+        let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+        let (execution, mut controller, prepared, values, faults) =
+            cold_reserved_prior_fixture(&runtime, "real-cold-replacement", true);
+        controller.restore_dns();
+        assert!(!controller.has_marker());
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        {
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            assert_eq!(
+                state
+                    .host
+                    .dns_cold
+                    .as_ref()
+                    .unwrap()
+                    .restored_prior_marker
+                    .as_ref()
+                    .map(|proof| proof.marker_operation_id.as_str()),
+                Some("cold-prior-owner")
+            );
+        }
+        assert!(runtime.bind_runtime_cold_dns_marker(&execution.execution_id, None));
+        // Both real producer arms perform this bind before prepare_after_restore
+        // and apply. A duplicated prior restore cannot put the proof back.
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        runtime.record_runtime_dns_restore_result("foreign-marker", true);
+        {
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            let cold = state.host.dns_cold.as_ref().unwrap();
+            assert!(cold.in_flight);
+            assert!(cold.prior_marker.is_none());
+            assert!(cold.restored_prior_marker.is_none());
+        }
+        let next = controller.prepare_after_restore(&prepared).unwrap();
+        faults
+            .fail_marker_after_write
+            .store(partial, std::sync::atomic::Ordering::SeqCst);
+        let mut receipt = controller.apply_effect(&next, &execution.execution_id);
+        assert_eq!(
+            receipt.outcome,
+            if partial {
+                TakeoverOutcome::RecoveryPending
+            } else {
+                TakeoverOutcome::Applied
+            }
+        );
+        faults
+            .fail_marker_after_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        faults
+            .fail_marker_reads
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        receipt.marker_id = controller.exact_marker_operation_id();
+        assert_eq!(
+            receipt.marker_id.as_deref(),
+            Some(execution.execution_id.as_str())
+        );
+        assert_eq!(values.lock().unwrap()["A"], vec!["8.8.8.8"]);
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        runtime.record_runtime_cold_dns_result(execution.generation, execution.intent, receipt);
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        assert_eq!(
+            runtime.accepted_host_dns_takeover(),
+            (!partial).then_some(true)
+        );
+        assert_eq!(runtime.host_effect_pending(), partial);
+        {
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            assert!(state.host.dns_cold.is_none());
+            let owner = state.host.dns_owner.as_ref().unwrap();
+            assert_eq!(owner.marker_operation_id, execution.execution_id);
+            assert_eq!(owner.cleanup_pending, partial);
+        }
+        controller.restore_dns();
+        assert!(!controller.has_marker());
+        runtime.record_runtime_dns_restore_result(&execution.execution_id, true);
+        assert_eq!(runtime.accepted_host_dns_takeover(), None);
+        assert_eq!(
+            runtime.runtime_host_dns_physical_active(execution.generation),
+            Some(false)
+        );
+        assert_eq!(values.lock().unwrap()["A"], vec!["192.168.1.1"]);
+    }
+}
+
+#[test]
+fn new_partial_write_cannot_borrow_prior_restoration_from_ambiguous_marker_metadata() {
+    for marker in [None, Some("cold-prior-owner"), Some("foreign-marker")] {
+        let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+        let (execution, mut controller, prepared, values, faults) =
+            cold_reserved_prior_fixture(&runtime, "ambiguous-new-write", true);
+        controller.restore_dns();
+        assert!(!controller.has_marker());
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        assert!(runtime.bind_runtime_cold_dns_marker(&execution.execution_id, None));
+        let next = controller.prepare_after_restore(&prepared).unwrap();
+        faults
+            .fail_marker_after_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut receipt = controller.apply_effect(&next, &execution.execution_id);
+        assert_eq!(receipt.outcome, TakeoverOutcome::RecoveryPending);
+        assert!(receipt.cleanup_pending);
+        faults
+            .fail_marker_after_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        faults
+            .fail_marker_reads
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            controller.exact_marker_operation_id().as_deref(),
+            Some(execution.execution_id.as_str())
+        );
+        assert_eq!(values.lock().unwrap()["A"], vec!["8.8.8.8"]);
+        // Change one metadata axis of a real partial-write receipt. Missing or
+        // even old-marker text cannot erase a newly written physical footprint.
+        receipt.marker_id = marker.map(str::to_owned);
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        runtime.record_runtime_cold_dns_result(execution.generation, execution.intent, receipt);
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        assert!(runtime.host_effect_pending());
+        assert_eq!(runtime.accepted_host_dns_takeover(), None);
+        let state = runtime.runtime_config_apply.lock().unwrap();
+        let cold = state.host.dns_cold.as_ref().unwrap();
+        assert!(!cold.in_flight);
+        assert!(cold.cleanup_pending);
+        assert!(cold.restored_prior_marker.is_none());
+        assert!(state.host.dns_owner.is_none());
+        assert_eq!(
+            controller.exact_marker_operation_id().as_deref(),
+            Some(execution.execution_id.as_str())
+        );
+    }
+}
+
+#[test]
+fn borrowed_cold_restore_proof_keeps_original_owner_generation() {
+    let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+    let old_generation = runtime
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Start)
+        .unwrap();
+    assert!(old_generation > 0);
+    runtime.gate.begin();
+    let (old, mut controller, prepared, values) = dns_execution_fixture(&runtime, "old-cold-owner");
+    assert!(runtime.begin_runtime_cold_dns(old.generation, old.intent, &old.execution_id));
+    assert!(runtime.bind_runtime_cold_dns_marker(&old.execution_id, None));
+    let old_receipt = controller.apply_effect(&prepared, &old.execution_id);
+    assert_eq!(old_receipt.outcome, TakeoverOutcome::Applied);
+    runtime.record_runtime_cold_dns_result(old.generation, old.intent, old_receipt);
+    assert_eq!(runtime.accepted_host_dns_takeover(), Some(true));
+    runtime
+        .gate
+        .end(polaris_core_supervisor::LifecycleKind::Start);
+    let new_generation = runtime
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Start)
+        .unwrap();
+    assert!(new_generation > old_generation);
+    runtime.gate.begin();
+    {
+        // Use the real reset carry path: old physical custody survives without
+        // borrowing its previous generation's accepted policy.
+        let mut state = runtime.runtime_config_apply.lock().unwrap();
+        let mut previous = std::mem::take(&mut state.host);
+        state.host.carry_dns_cleanup_from(&mut previous);
+        let owner = state.host.dns_owner.as_ref().unwrap();
+        assert_eq!(owner.generation, old_generation);
+        assert!(owner.cleanup_pending);
+        assert!(!owner.policy_required);
+    }
+    let mut successor = execution(&runtime, "new-cold-reservation");
+    successor.desired["proxyModeType"] = json!("tun");
+    *runtime.current_config.write().unwrap() = Some(successor.desired.clone());
+    assert!(runtime.begin_runtime_cold_dns(
+        successor.generation,
+        successor.intent,
+        &successor.execution_id
+    ));
+    let prepared = controller.prepare_effect(true).unwrap();
+    assert!(!prepared.needs_prior_restore());
+    assert_eq!(
+        prepared.prior_marker_operation_id().as_deref(),
+        Some(old.execution_id.as_str())
+    );
+    assert!(runtime.bind_runtime_cold_dns_marker(
+        &successor.execution_id,
+        prepared.prior_marker_operation_id()
+    ));
+    let mut borrowed = controller.apply_effect(&prepared, &successor.execution_id);
+    assert_eq!(borrowed.outcome, TakeoverOutcome::Unchanged);
+    borrowed.marker_id = controller
+        .checked_owned_receipt()
+        .unwrap()
+        .unwrap()
+        .marker_id;
+    controller.restore_dns();
+    assert!(!controller.has_marker());
+    assert_eq!(values.lock().unwrap()["A"], vec!["192.168.1.1"]);
+    runtime.record_runtime_dns_restore_result(&old.execution_id, true);
+    {
+        let state = runtime.runtime_config_apply.lock().unwrap();
+        let cold = state.host.dns_cold.as_ref().unwrap();
+        assert_eq!(cold.generation, new_generation);
+        assert_eq!(cold.intent, successor.intent);
+        assert_eq!(cold.operation_id, successor.execution_id);
+        let proof = cold.restored_prior_marker.as_ref().unwrap();
+        assert_eq!(proof.marker_operation_id, old.execution_id);
+        assert_eq!(proof.restored_generation, old_generation);
+        assert!(state
+            .host
+            .dns_restored
+            .iter()
+            .any(|(id, generation)| id == &old.execution_id && *generation == old_generation));
+        assert!(!state
+            .host
+            .dns_restored
+            .iter()
+            .any(|(id, generation)| id == &old.execution_id && *generation == new_generation));
+    }
+    runtime.record_runtime_cold_dns_result(successor.generation, successor.intent, borrowed);
+    assert_eq!(runtime.accepted_host_dns_takeover(), None);
+    assert!(runtime.host_effect_pending());
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    assert!(state.host.dns_cold.is_none());
+    assert_eq!(state.host.dns_policy_unconfirmed, Some(new_generation));
+    assert!(state.host.dns_owner.is_none());
+}
+
+#[test]
+fn borrowed_cold_restore_proof_requires_its_exact_bounded_history_entry() {
+    for mismatch in ["missing", "generation", "marker", "evicted"] {
+        let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+        let (execution, mut controller, prepared, _, _) =
+            cold_reserved_prior_fixture(&runtime, "bounded-borrowed-history", true);
+        let receipt = controller.apply_effect(&prepared, &execution.execution_id);
+        assert_eq!(receipt.outcome, TakeoverOutcome::RecoveryPending);
+        controller.restore_dns();
+        assert!(!controller.has_marker());
+        runtime.record_runtime_dns_restore_result("cold-prior-owner", true);
+        {
+            let mut state = runtime.runtime_config_apply.lock().unwrap();
+            assert_eq!(state.host.dns_restored.len(), 1);
+            assert_eq!(
+                state.host.dns_restored[0],
+                ("cold-prior-owner".into(), execution.generation)
+            );
+            assert_eq!(
+                state
+                    .host
+                    .dns_cold
+                    .as_ref()
+                    .unwrap()
+                    .restored_prior_marker
+                    .as_ref()
+                    .unwrap()
+                    .restored_generation,
+                execution.generation
+            );
+            // Start with real restore evidence, then remove or perturb exactly
+            // its history axis. The eviction case calls the actual bounded
+            // ledger method; these extra entries do not claim OS restoration.
+            match mismatch {
+                "missing" => state.host.dns_restored.clear(),
+                "generation" => state.host.dns_restored[0].1 += 1,
+                "marker" => state.host.dns_restored[0].0 = "other-history-marker".into(),
+                "evicted" => {
+                    for index in 0..8 {
+                        state.host.remember_dns_restore(
+                            &format!("bounded-entry-{index}"),
+                            execution.generation,
+                        );
+                    }
+                    assert_eq!(state.host.dns_restored.len(), 8);
+                    assert!(!state
+                        .host
+                        .dns_restored
+                        .iter()
+                        .any(|(id, _)| id == "cold-prior-owner"));
+                }
+                _ => unreachable!(),
+            }
+        }
+        runtime.record_runtime_cold_dns_result(execution.generation, execution.intent, receipt);
+        assert!(runtime.host_effect_pending(), "{mismatch}");
+        assert_eq!(runtime.accepted_host_dns_takeover(), None);
+        let state = runtime.runtime_config_apply.lock().unwrap();
+        let cold = state.host.dns_cold.as_ref().unwrap();
+        assert!(!cold.in_flight);
+        assert!(cold.cleanup_pending);
+        assert!(state.host.dns_owner.is_none());
+        assert!(state.host.dns_restored.len() <= 8);
+    }
 }

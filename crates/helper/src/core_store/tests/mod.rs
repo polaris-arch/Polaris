@@ -936,7 +936,13 @@ fn exact_fixture_marker_and_completion_fail_closed() {
     }
     // Each isolated fixture must bind its own test identity, not merely reuse
     // another fixture's valid nonce and parent identity.
-    for test in [SAME_ID_EXACT_TEST, INHERITED_VERSION_LEASE_EXACT_TEST] {
+    for test in [SAME_ID_EXACT_TEST, INHERITED_VERSION_LEASE_EXACT_TEST,
+        "core_store::tests::migration_preserves_existing_payload_even_when_unverified",
+        "core_store::tests::migration_preserves_orphan_payload_without_manifest",
+        "core_store::tests::migration_preservation_keeps_actual_busy_cause_and_bytes",
+        "core_store::tests::migration_preservation_keeps_corruption_cause_and_bytes",
+        "core_store::tests::migration_preservation_partial_pair_has_no_fabricated_verification_cause",
+    ] {
         let target_marker = format!("{EXACT_FIXTURE_PROTOCOL}|{test}|42|{nonce}");
         let target_args = exact_fixture_args(test);
         let target =
@@ -1304,6 +1310,12 @@ fn mutation_scope_releases_on_error_and_unwind() {
 
 #[test]
 fn migration_preserves_existing_payload_even_when_unverified() {
+    let Some(_completion) = exact_fixture_scope(
+        module_path!(),
+        "migration_preserves_existing_payload_even_when_unverified",
+    ) else {
+        return;
+    };
     let (root, store, uid) = store();
     let (source, manifest) = fixture("migration");
     assert_eq!(
@@ -1339,6 +1351,12 @@ fn migration_preserves_existing_payload_even_when_unverified() {
 
 #[test]
 fn migration_preserves_orphan_payload_without_manifest() {
+    let Some(_completion) = exact_fixture_scope(
+        module_path!(),
+        "migration_preserves_orphan_payload_without_manifest",
+    ) else {
+        return;
+    };
     let (root, store, uid) = store();
     let (source, manifest) = fixture("migration-orphan");
     let version = root.path().join("versions").join(&manifest.id);
@@ -1543,5 +1561,202 @@ fn helper_store_damage_and_environment_io_keep_distinct_recovery_routes() {
             .downcast_ref::<AdmissionError>()
             .unwrap();
         assert_eq!((typed.kind, typed.recovery), (kind, recovery));
+    }
+}
+
+fn migration_preservation_context(error: &io::Error) -> &MigrationPreservationFailure {
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "migration cannot replace an existing unverified payload or receipt"
+    );
+    error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<MigrationPreservationFailure>()
+        .unwrap()
+}
+
+#[test]
+fn migration_preservation_keeps_actual_busy_cause_and_bytes() {
+    let Some(_completion) = exact_fixture_scope(
+        module_path!(),
+        "migration_preservation_keeps_actual_busy_cause_and_bytes",
+    ) else {
+        return;
+    };
+    let (root, store, uid) = store();
+    let (source, manifest) = fixture("migration-busy-cause");
+    assert_eq!(
+        store
+            .install_preserving(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::Installed
+    );
+    let id = CoreId::parse(&manifest.id).unwrap();
+    let payload = root
+        .path()
+        .join("versions")
+        .join(&manifest.id)
+        .join("sing-box");
+    let receipt = root
+        .path()
+        .join("manifests")
+        .join(format!("{}.json", manifest.id));
+    let before_payload = fs::read(&payload).unwrap();
+    let before_receipt = fs::read(&receipt).unwrap();
+    // A real independently opened exclusive version lease excludes StartShared.
+    // This controlled holder says nothing about the historical CI holder/cause.
+    let occupied = store.lease_file(&id).unwrap();
+    acquire_lock(&occupied, LockRole::RepairExclusive).unwrap();
+    let error = store
+        .install_preserving(&manifest, source.path(), Some(uid), None)
+        .unwrap_err();
+    let context = migration_preservation_context(&error);
+    assert!(context.version_present && context.receipt_present);
+    let cause = std::error::Error::source(context)
+        .unwrap()
+        .downcast_ref::<io::Error>()
+        .unwrap();
+    assert_eq!(cause.kind(), io::ErrorKind::WouldBlock);
+    let failure = cause
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<LockFailure>()
+        .unwrap();
+    assert!(matches!(failure.role, LockRole::StartShared));
+    assert!(matches!(&failure.cause, TryLockError::WouldBlock));
+    let debug = format!("{error:?}");
+    assert!(debug.contains("existing-pair-verification"));
+    assert!(debug.contains("class=would-block"));
+    assert!(!debug.contains(root.path().to_str().unwrap()));
+    assert_eq!(fs::read(&payload).unwrap(), before_payload);
+    assert_eq!(fs::read(&receipt).unwrap(), before_receipt);
+    assert_eq!(fs::read_dir(root.path().join(".trash")).unwrap().count(), 0);
+    drop(occupied);
+}
+
+#[test]
+fn migration_preservation_keeps_corruption_cause_and_bytes() {
+    let Some(_completion) = exact_fixture_scope(
+        module_path!(),
+        "migration_preservation_keeps_corruption_cause_and_bytes",
+    ) else {
+        return;
+    };
+    let (root, store, uid) = store();
+    let (source, manifest) = fixture("migration-corrupt-cause");
+    assert_eq!(
+        store
+            .install_preserving(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::Installed
+    );
+    let payload = root
+        .path()
+        .join("versions")
+        .join(&manifest.id)
+        .join("sing-box");
+    let receipt = root
+        .path()
+        .join("manifests")
+        .join(format!("{}.json", manifest.id));
+    let before_receipt = fs::read(&receipt).unwrap();
+    fs::write(&payload, b"damaged old payload").unwrap();
+    let error = store
+        .install_preserving(&manifest, source.path(), Some(uid), None)
+        .unwrap_err();
+    let context = migration_preservation_context(&error);
+    assert!(context.version_present && context.receipt_present);
+    let cause = std::error::Error::source(context)
+        .unwrap()
+        .downcast_ref::<io::Error>()
+        .unwrap();
+    assert_eq!(cause.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(cause.to_string(), "payload size differs");
+    assert!(cause
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<LockFailure>()
+        .is_none());
+    assert!(!format!("{error:?}").contains(root.path().to_str().unwrap()));
+    assert_eq!(fs::read(&payload).unwrap(), b"damaged old payload");
+    assert_eq!(fs::read(&receipt).unwrap(), before_receipt);
+    assert_eq!(fs::read_dir(root.path().join(".trash")).unwrap().count(), 0);
+}
+
+#[test]
+fn migration_preservation_partial_pair_has_no_fabricated_verification_cause() {
+    let Some(_completion) = exact_fixture_scope(
+        module_path!(),
+        "migration_preservation_partial_pair_has_no_fabricated_verification_cause",
+    ) else {
+        return;
+    };
+    for version_only in [true, false] {
+        let (root, store, uid) = store();
+        let (source, manifest) = fixture("migration-partial-cause");
+        let version = root.path().join("versions").join(&manifest.id);
+        let receipt = root
+            .path()
+            .join("manifests")
+            .join(format!("{}.json", manifest.id));
+        let present = if version_only {
+            fs::create_dir(&version).unwrap();
+            version.join("sing-box")
+        } else {
+            receipt.clone()
+        };
+        fs::write(&present, b"original orphan bytes").unwrap();
+        let error = store
+            .install_preserving(&manifest, source.path(), Some(uid), None)
+            .unwrap_err();
+        let context = migration_preservation_context(&error);
+        assert_eq!(context.version_present, version_only);
+        assert_eq!(context.receipt_present, !version_only);
+        assert!(context.verification.is_none());
+        assert!(std::error::Error::source(context).is_none());
+        assert!(format!("{error:?}").contains("partial-existing-pair"));
+        assert_eq!(fs::read(&present).unwrap(), b"original orphan bytes");
+        assert_eq!(version.exists(), version_only);
+        assert_eq!(receipt.exists(), !version_only);
+        assert_eq!(fs::read_dir(root.path().join(".trash")).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn migration_preservation_debug_keeps_original_io_source_private_and_typed() {
+    let secret = "/private/fixture/owner payload=never-export";
+    for cause in [
+        io::Error::other(secret),
+        io::Error::new(io::ErrorKind::WouldBlock, secret),
+    ] {
+        let kind = cause.kind();
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            MigrationPreservationFailure {
+                version_present: true,
+                receipt_present: true,
+                verification: Some(cause),
+            },
+        );
+        let context = migration_preservation_context(&error);
+        let original = std::error::Error::source(context)
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(original.kind(), kind);
+        assert_eq!(original.to_string(), secret);
+        assert!(original
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<LockFailure>()
+            .is_none());
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+        assert!(
+            !format!("{error:?}").contains("class=would-block"),
+            "an arbitrary I/O kind must never fabricate native TryLockError contention"
+        );
     }
 }

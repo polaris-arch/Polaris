@@ -92,13 +92,15 @@ fn paired_runtime_binds_incarnation_and_manifest_but_not_mutable_revisions() {
 
 #[test]
 fn paired_runtime_rejects_missing_or_zero_started_identity() {
-    for change in 0..4 {
+    for change in 0..6 {
         let mut value = paired_capabilities();
         match change {
             0 => value.active = None,
             1 => value.active.as_mut().unwrap().incarnation.clear(),
             2 => value.active.as_mut().unwrap().applied_revision = 0,
-            _ => value.active.as_mut().unwrap().effective_digest.clear(),
+            3 => value.active.as_mut().unwrap().effective_digest.clear(),
+            4 => value.active.as_mut().unwrap().effective_digest = "next".into(),
+            _ => value.active.as_mut().unwrap().effective_digest = "A".repeat(64),
         }
         assert_eq!(
             observe_runtime_pairing(&value),
@@ -707,7 +709,9 @@ pub(super) fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> Pend
     let plan = daemon::RuntimeConfigPlan {
         contract_version: 1,
         transaction_id: "ts-operation".into(),
-        candidate_digest: "next".into(),
+        // Identity of the actual generated fixture bytes, shared by Plan,
+        // committed receipt and RPC capabilities; not a Core admission claim.
+        candidate_digest: polaris_updater::sha256_hex(&serde_json::to_vec(&generated).unwrap()),
         impact_digest: "impact".into(),
         expected: paired_capabilities().active,
         expected_control_revision: 7,
@@ -1918,7 +1922,19 @@ fn cached_kernel_receipt_retains_native_unknown_without_undoing_durable_commit()
 #[tokio::test]
 async fn real_settlement_preserves_native_unknown_with_empty_scope_and_no_host_work() {
     let (runtime, _dir, calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
+    runtime
+        .config
+        .save_full(&runnable_config_fixture())
+        .unwrap();
+    let pending = ts_pending_raw_fixture(&runtime, runtime.config.current().unwrap());
+    runtime.capture_runtime_config_baseline(
+        pending.generation,
+        pending.deps.clone(),
+        pending.generated.clone(),
+        pending.typed.clone(),
+        pending.pairing.clone(),
+    );
+    *runtime.current_config.write().unwrap() = Some(pending.desired.clone());
     assert!(pending.deletion_scope.is_empty());
     assert!(pending.host_plan.is_none());
     *runtime.startup_snapshot.write().unwrap() = Some(pending.desired.clone());
@@ -2334,6 +2350,7 @@ async fn native_retirement_rpc_peer(
     let mut capabilities = paired_capabilities();
     capabilities.active = operation.active.clone();
     capabilities.control_revision = operation.control_revision;
+    assert!(runtime_pairing_matches(&pending.pairing, &capabilities));
     let fixture = NativeRetirementRpcFixture {
         capabilities: Arc::new(std::sync::Mutex::new(capabilities)),
         status: Arc::new(std::sync::Mutex::new(native_retirement_status(operation))),
@@ -2379,7 +2396,9 @@ async fn native_retirement_rpc_peer(
     )
     .await
     .unwrap();
-    control.get_runtime_capabilities().await.unwrap();
+    let observed = control.get_runtime_capabilities().await.unwrap();
+    assert!(runtime_pairing_matches(&pending.pairing, &observed));
+    assert!(control.captured_transport_live());
     runtime.bind_runtime_api_control(pending.generation, Arc::new(control));
     (fixture, server)
 }
@@ -3055,5 +3074,81 @@ async fn generic_original_d_status_acknowledges_only_its_full_saved_owner_and_ke
         }
         server.abort();
         let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn native_unknown_does_not_authorize_publication_without_its_exact_baseline() {
+    for mismatch in ["missing", "generation", "pairing"] {
+        let (runtime, _dir, calls) = crate::runtime::proxy::tests::test_runtime_recording();
+        runtime
+            .config
+            .save_full(&runnable_config_fixture())
+            .unwrap();
+        let running = runtime.config.current().unwrap();
+        let original = ts_pending_raw_fixture(&runtime, running.clone());
+        runtime.capture_runtime_config_baseline(
+            original.generation,
+            original.deps.clone(),
+            original.generated.clone(),
+            original.typed.clone(),
+            original.pairing.clone(),
+        );
+        *runtime.current_config.write().unwrap() = Some(running.clone());
+        *runtime.startup_snapshot.write().unwrap() = Some(running.clone());
+        let mut desired = running.clone();
+        desired["logLevel"] = json!("debug");
+        runtime.config.save_full(&desired).unwrap();
+        let pending = ts_pending_raw_fixture(&runtime, runtime.config.current().unwrap());
+        assert_ne!(pending.desired, running);
+        assert!(pending.deletion_scope.is_empty());
+        assert!(pending.host_plan.is_none());
+        assert!(!pending.published);
+        {
+            let mut baseline = runtime.runtime_config_baseline.write().unwrap();
+            let actual = baseline.as_ref().unwrap();
+            assert_eq!(actual.generation, pending.generation);
+            assert_eq!(actual.pairing, pending.pairing);
+            match mismatch {
+                "missing" => *baseline = None,
+                "generation" => baseline.as_mut().unwrap().generation += 1,
+                "pairing" => {
+                    baseline
+                        .as_mut()
+                        .unwrap()
+                        .pairing
+                        .implementation_manifest_digest = "b".repeat(64)
+                }
+                _ => unreachable!(),
+            }
+        }
+        runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+        let result = runtime
+            .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+        let result = runtime.remember_runtime_result(result);
+        assert_original_native_debt(&result, &pending);
+        assert_eq!(result.status, "unconfirmed", "{mismatch}");
+        assert_eq!(result.core_state, Some("committed"));
+        assert_eq!(result.configuration_durable, Some(true));
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "RUNTIME_PUBLICATION_UNCONFIRMED"));
+        assert!(runtime.restart_deferred.load(Ordering::SeqCst));
+        assert_eq!(runtime.current_config_snapshot(), Some(running.clone()));
+        assert_eq!(*runtime.startup_snapshot.read().unwrap(), Some(running));
+        assert_eq!(runtime.config.current().unwrap(), pending.desired);
+        assert!(result.host_effects.is_empty());
+        let state = runtime.runtime_config_apply.lock().unwrap();
+        assert!(state.pending.is_some());
+        assert!(!state.host.has_in_flight());
+        assert_eq!(state.native_retirements.len(), 1);
+        assert_original_native_debt(
+            &state
+                .core_receipt_for(&pending.plan.transaction_id, pending.generation)
+                .unwrap(),
+            &pending,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -18,6 +18,210 @@ import { TESTS as LOOPBACK_TESTS } from './runtime-config-loopback.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
+// These views serve only the finite runner owners below, not a JavaScript AST.
+// Both views preserve UTF-16 offsets; literal contents cannot provide code anchors.
+function runnerViews(source) {
+  const visible = source.split(''), code = source.split('');
+  const blank = (out, start, end) => {
+    for (let i = start; i < end; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
+  };
+  const regexStart = (at) => {
+    const left = source.slice(0, at).trimEnd();
+    return !left || /[=(:,\[!&|?{};]$/.test(left) || /\b(?:return|throw|case)$/.test(left);
+  };
+  const regexEnd = (at) => {
+    let characterClass = false;
+    for (let i = at + 1; i < source.length; i++) {
+      if (source[i] === '\\') { i++; continue; }
+      if (source[i] === '[') characterClass = true;
+      if (source[i] === ']') characterClass = false;
+      if (source[i] === '/' && !characterClass) return i + 1;
+      assert.notEqual(source[i], '\n', 'unterminated runner regular expression');
+    }
+    assert.fail('unterminated runner regular expression');
+  };
+  const commentEnd = (at) => {
+    if (source[at + 1] === '/') {
+      const end = source.indexOf('\n', at + 2); return end < 0 ? source.length : end;
+    }
+    const end = source.indexOf('*/', at + 2);
+    assert.ok(end >= 0, 'unterminated runner block comment'); return end + 2;
+  };
+  // Literal text is inert; interpolation expressions remain executable code.
+  // Nested literals/comments need their own boundaries to prevent replay.
+  const interpolationEnd = (at) => {
+    let depth = 1;
+    for (let i = at; i < source.length;) {
+      const c = source[i], two = source.slice(i, i + 2);
+      if (two === '//' || two === '/*') { i = commentEnd(i); continue; }
+      if (c === "'" || c === '"' || c === '`') { i = quotedEnd(i); continue; }
+      if (c === '/' && regexStart(i)) { i = regexEnd(i); continue; }
+      if (c === '{') depth++;
+      if (c === '}' && --depth === 0) return i + 1;
+      i++;
+    }
+    assert.fail('unterminated runner interpolation');
+  };
+  const quotedEnd = (at) => {
+    const quote = source[at];
+    for (let i = at + 1; i < source.length;) {
+      if (source[i] === '\\') { i += 2; continue; }
+      if (quote === '`' && source.slice(i, i + 2) === '${') { i = interpolationEnd(i + 2); continue; }
+      if (source[i] === quote) return i + 1;
+      i++;
+    }
+    assert.fail('unterminated runner literal');
+  };
+  const scan = (from, to) => {
+    for (let i = from; i < to;) {
+      const c = source[i], two = source.slice(i, i + 2);
+      if (two === '//' || two === '/*') {
+        const end = commentEnd(i); assert.ok(end <= to, 'comment escaped its runner expression');
+        blank(visible, i, end); blank(code, i, end); i = end;
+      } else if (c === "'" || c === '"' || c === '`' || c === '/' && regexStart(i)) {
+        const end = c === '/' ? regexEnd(i) : quotedEnd(i);
+        assert.ok(end <= to, 'literal escaped its runner expression'); blank(code, i, end);
+        if (c === '`') {
+          for (let at = i + 1; at < end - 1;) {
+            if (source[at] === '\\') { at += 2; continue; }
+            if (source.slice(at, at + 2) === '${') {
+              const stop = interpolationEnd(at + 2);
+              for (let k = at + 1; k < stop; k++) code[k] = source[k];
+              scan(at + 2, stop - 1); at = stop;
+            } else at++;
+          }
+        }
+        i = end;
+      } else i++;
+    }
+  };
+  scan(0, source.length);
+  assert.equal(visible.length, source.length); assert.equal(code.length, source.length);
+  return { visible: visible.join(''), code: code.join('') };
+}
+
+function runnerRegion(source, owner) {
+  assert.ok(source.trim().length > 0, `${owner}: nonempty actual source`);
+  const views = runnerViews(source);
+  const declaration = owner === 'TESTS' ? /^export const TESTS = Object\.freeze\(\[/gm
+    : new RegExp(`^(?:export )?(?:async )?function ${owner}\\([^\\n]*\\) \\{`, 'gm');
+  const matches = [...views.code.matchAll(declaration)];
+  assert.equal(matches.length, 1, `${owner}: exactly one executable declaration`);
+  const start = matches[0].index;
+  let end = -1;
+  if (owner === 'TESTS') end = views.code.indexOf(']);', start) + 3;
+  else {
+    let depth = 0;
+    for (let i = start + matches[0][0].lastIndexOf('{'); i < views.code.length; i++) {
+      if (views.code[i] === '{') depth++;
+      if (views.code[i] === '}' && --depth === 0) { end = i + 1; break; }
+    }
+  }
+  assert.ok(end > start, `${owner}: nonempty closed owner`);
+  return { start, end, raw: source.slice(start, end), visible: views.visible.slice(start, end), code: views.code.slice(start, end) };
+}
+function executableAnchor(source, anchor) {
+  const view = runnerViews(source), expected = runnerViews(anchor);
+  assert.ok(expected.code.trim().length > 0, 'anchor needs actual code, not a literal or comment alone');
+  const hits = [];
+  for (let at = view.visible.indexOf(expected.visible); at >= 0; at = view.visible.indexOf(expected.visible, at + 1)) {
+    if (view.code.slice(at, at + anchor.length) === expected.code) hits.push(at);
+  }
+  assert.equal(hits.length, 1, `one executable anchor: ${anchor}`); return hits[0];
+}
+function requireRunnerCode(source, owner, anchor) {
+  executableAnchor(runnerRegion(source, owner).raw, anchor);
+}
+const nativeLines = (source) => runnerViews(source).visible.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+
+const NATIVE_MAIN = String.raw`async function main() {
+  const ordinary = process.argv.length === 3 && ({ '--bootstrap-contracts': BOOTSTRAP_TESTS, '--source-contracts': SOURCE_TESTS })[process.argv[2]];
+  if (ordinary) {
+    const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
+    demand(realpathSync(process.cwd()) === realpathSync(root), 'Run native source contracts from the workspace root');
+    return runContractSuite(ordinary, root);
+  }
+
+  demand(JSON.stringify(process.argv.slice(2)) === JSON.stringify(TESTS), 'Controlled test scope/order differs from the six reviewed exact names');
+  const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
+  demand(realpathSync(process.cwd()) === realpathSync(root), 'Run the controlled tests from the workspace root');
+  const directory = join(root, 'native-dns-ci-evidence');
+  mkdirSync(directory, { recursive: true });
+  const statusPath = join(directory, 'runtime-status.txt');
+  writeFileSync(statusPath, '');
+  const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--locked', '--no-deps', '--format-version=1'],
+    { cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 }));
+  const prepared = await executeCommand({ id: 'controlled-build', program: 'cargo',
+    args: ['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'] },
+  { root, env: process.env, directory, timeout: 20 * 60_000, captureStdout: true });
+  demand(prepared.status === 0 && !prepared.error && !prepared.cleanupUncertain && !prepared.interrupted, 'Controlled production verification preparation failed');
+  const messages = prepared.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  const selected = selectNativeExecutable(messages, metadata, root);
+  selected.sha256 = hash(selected.executable);
+  writeFileSync(join(directory, 'controlled-cargo-metadata.json'), JSON.stringify(metadata) + '\n');
+  writeFileSync(join(directory, 'controlled-executable.json'), JSON.stringify({ ...selected, preparationCalls: 1 }, null, 2) + '\n');
+  bindNativeRuntime(selected, root, process.env, directory);
+  const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();
+  const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);
+  // Cargo runs libtests in the package directory, rather than the workspace root.
+  await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));
+}`;
+const NATIVE_SELECTOR = String.raw`export function selectNativeExecutable(messages, metadata, root) {
+  const packages=metadata.packages.filter((p)=>p.name==='polaris' && resolve(p.manifest_path)===join(root,'src-tauri/Cargo.toml'));
+  demand(packages.length===1,'Expected current App package');
+  const pkg=packages[0];
+  const targets=pkg.targets.filter((t)=>t.name==='native-admission-verifier' && t.kind.length===1 && t.kind[0]==='bin'
+    && resolve(t.src_path)===join(root,'src-tauri/src/bin/native-admission-verifier.rs'));
+  demand(targets.length===1,'Expected reviewed production verification binary');
+  const rows=messages.filter((m)=>m.reason==='compiler-artifact' && m.package_id===pkg.id && m.profile?.test===false && m.profile?.debug_assertions===true
+    && m.target?.name===targets[0].name && JSON.stringify(m.target.kind)===JSON.stringify(targets[0].kind)
+    && resolve(m.target.src_path)===resolve(targets[0].src_path) && m.executable
+    && Array.isArray(m.features) && m.features.includes('native-production-verification'));
+  demand(rows.length===1,'Expected one normal-library verification artifact');
+  const artifact=rows[0], executable=artifact.executable;
+  demand(isAbsolute(executable) && inside(resolve(metadata.target_directory),executable),'Native artifact escaped Cargo target');
+  demand(lstatSync(executable).isFile() && realpathSync(executable)===executable,'Native artifact must be an unlinked regular file');
+  demand(artifact.features.every((value) => typeof value === 'string')
+    && new Set(artifact.features).size === artifact.features.length, 'Malformed native artifact features');
+  const selected = {executable,packageId:pkg.id,manifest:pkg.manifest_path,features:[...artifact.features],
+    carrier:'normal-production-library',nativeProduction:true,nonTest:true,debugAssertions:true};
+  nativeSelections.set(selected, JSON.stringify(selectionIdentity(selected)));
+  return selected;
+}`;
+const NATIVE_CASE_DECLARATION = String.raw`export const TESTS = Object.freeze([
+  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',
+  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
+  'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
+  'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
+  'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
+  'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',
+]);`;
+
+function assertClosedNativeMain(source) {
+  const main = runnerRegion(source, 'main');
+  assert.equal(nativeLines(main.raw), nativeLines(NATIVE_MAIN), 'exact single awaited normal build/receipt/binding/env/closed-session route');
+  assert.equal(nativeLines(runnerRegion(source, 'selectNativeExecutable').raw), nativeLines(NATIVE_SELECTOR), 'exact current normal non-test debug artifact selector');
+  assert.equal(nativeLines(runnerRegion(source, 'TESTS').raw), nativeLines(NATIVE_CASE_DECLARATION), 'all six names in their reviewed order, once');
+  const code = runnerViews(source).code;
+  for (const name of ['withNativeSession', 'runTests', 'bindNativeRuntime']) {
+    assert.equal([...code.matchAll(new RegExp(`\\b${name}\\s*\\(`, 'g'))].length, 2, `${name}: one declaration and one actual invocation`);
+  }
+  requireRunnerCode(source, 'bindNativeRuntime', 'nativeSelections.get(selected) === JSON.stringify(selectionIdentity(selected))');
+  requireRunnerCode(source, 'bindNativeRuntime', 'const artifact = nativeArtifact(root, directory);');
+  requireRunnerCode(source, 'withNativeSession', 'holder = await start(selected, env, directory);');
+  requireRunnerCode(source, 'withNativeSession', 'await run();');
+  const session = runnerRegion(source, 'withNativeSession').raw;
+  const attach = executableAnchor(session, 'authority.session = holder;');
+  const invoke = executableAnchor(session, 'await run();');
+  const detach = executableAnchor(session, 'delete authority.session;');
+  const finish = executableAnchor(session, 'await holder.finish()');
+  assert.ok(attach < invoke && invoke < detach && detach < finish, 'await the suite inside the one attached holder before teardown');
+  requireRunnerCode(source, 'runTests', 'for (const name of TESTS) {');
+  requireRunnerCode(source, 'runTests', "const result = await execute({ id: name.split('::').at(-1), program: selected.executable,");
+  requireRunnerCode(source, 'runTests', "args: selected.carrier === 'normal-production-library' ? [name] : [name, '--exact', '--ignored', '--nocapture', '--test-threads=1']");
+}
+
+
 function stripComments(text) {
   return text
     .split('\n')
@@ -252,33 +456,16 @@ function assertCandidateOnlySteps(ci, controlled) {
   assert.ok(runtime.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"'));
   assert.match(runtime, /node --test scripts\/native-dns-ci-routing\.test\.mjs/);
   assert.match(runtime, /scripts\/run-native-dns-controlled-tests\.test\.mjs/);
-  const body = (start, end) => {
-    assert.equal(controlled.split(start).length, 2, `one actual runner boundary: ${start}`);
-    const tail = controlled.split(start)[1];
-    assert.ok(tail.includes(end), `missing runner boundary: ${end}`);
-    return tail.slice(0, tail.indexOf(end));
-  };
-  const main = body('\nasync function main() {\n', '\nif (process.argv[1]');
-  const ordinary = body('\nasync function runContractSuite(specs, root) {\n', '\nasync function main() {');
-  const cases = body('\nexport async function runTests(', '\nexport function contractGroups(');
-  assert.match(main, /^  const prepared = await executeCommand\(\{ id: 'controlled-build', program: 'cargo',$/m);
-  assert.match(main, /^    args: \['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'\] \},$/m);
-  assert.match(main, /^  const selected = selectNativeExecutable\(messages, metadata, root\);$/m);
-  assert.match(main, /^  selected\.sha256 = hash\(selected\.executable\);$/m);
-  assert.match(main, /^  writeFileSync\(join\(directory, 'controlled-executable\.json'\), JSON\.stringify\(\{ \.\.\.selected, preparationCalls: 1 \}/m);
-  assert.match(main, /^  const env = runtimeEnvironment\(messages, resolve\(metadata.target_directory\), selected.executable, sysroot\);$/m);
-  assert.match(main, /^  await runTests\(selected, env, directory\);$/m);
-  assert.doesNotMatch(main, /args: \['test'|--no-run|--release|--no-default-features/);
-  assert.match(ordinary, /^      args: \['test', '--locked', '-p', packageName, '--lib', '--no-run', '--message-format=json'\] \},$/m);
-  assert.match(ordinary, /^    const selected = selectExecutable\(messages, metadata, root, packageName\);$/m);
-  assert.match(ordinary, /^    await runContractTests\(selected, names, env, directory\);$/m);
-  assert.equal((controlled.match(/'--no-run'/g) ?? []).length, 1);
-  assert.match(cases, /^      args: selected\.carrier === 'normal-production-library' \? \[name\] : \[name, '--exact', '--ignored', '--nocapture', '--test-threads=1'\] \},$/m);
-  assert.match(cases, /demand\(confirmedCleanup\(result, name\),/);
-  assert.match(cases, /demand\(selected\.carrier === 'normal-production-library' \? nativeCaseRecord\(result,name\) : oneExecutedTest\(result\),/);
-  assert.match(cases, /selected\.carrier === 'normal-production-library' \? exactNativePass\(result,name\) : exactPass\(result\)/);
-  assert.match(controlled, /summaries\.length === 1/);
-  assert.match(controlled, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
+  assertClosedNativeMain(controlled);
+  requireRunnerCode(controlled, 'runContractSuite', "args: ['test', '--locked', '-p', packageName, '--lib', '--no-run', '--message-format=json']");
+  requireRunnerCode(controlled, 'runContractSuite', 'const selected = selectExecutable(messages, metadata, root, packageName);');
+  requireRunnerCode(controlled, 'runContractSuite', 'await runContractTests(selected, names, env, directory);');
+  requireRunnerCode(controlled, 'runTests', "args: selected.carrier === 'normal-production-library' ? [name] : [name, '--exact', '--ignored', '--nocapture', '--test-threads=1']");
+  requireRunnerCode(controlled, 'runTests', 'demand(confirmedCleanup(result, name),');
+  requireRunnerCode(controlled, 'runTests', "selected.carrier === 'normal-production-library' ? nativeCaseRecord(result,name) : oneExecutedTest(result)");
+  requireRunnerCode(controlled, 'runTests', "selected.carrier === 'normal-production-library' ? exactNativePass(result,name) : exactPass(result)");
+  requireRunnerCode(controlled, 'exactPass', 'summaries.length === 1');
+  requireRunnerCode(controlled, 'exactPass', "summaries[0].startsWith('test result: ok. 1 passed; 0 failed; 0 ignored;')");
   assert.match(runtime, /!cancelled\(\)/);
   assert.match(runtime, /steps\.workspace_build\.outcome == 'success'/);
 }
@@ -288,82 +475,164 @@ test('the two candidate-only Cargo steps retain exact commands, admitted scope a
   assertCandidateOnlySteps(ci, controlled);
 });
 
-function assertNativeSummaryConsumer(ci, controlled) {
+function summaryProgram(ci) {
   const block = extractCiStepBlock(ci, 'Record ordinary candidate outcomes without claiming skipped acceptance');
-  assert.match(block, /import \{ nativeRuntimeSummary \} from '\.\/scripts\/run-native-dns-controlled-tests\.mjs'/);
-  assert.equal(block.split('const nativeProductionRuntime = nativeRuntimeSummary(directory, e);').length, 2);
-  assert.match(block, /const windowsProxyRuntimeTests = e\.RUNNER_OS === 'Windows' \? nativeProductionRuntime :/);
-  assert.match(block, /nativeProductionRuntime, windowsProxyRuntimeTests,/);
-  assert.doesNotMatch(block, /const proxyTests|test result: ok\.|\.includes\(.*passed/);
-  const scope = controlled.slice(controlled.indexOf('export const TESTS ='), controlled.indexOf('// Fixed ordinary source contracts'));
-  const names = [...scope.matchAll(/'(runtime::[^']+)'/g)].map(match => match[1]);
-  assert.deepEqual(names, TESTS); assert.equal(names.length, 6);
-  assert.equal(names[5], 'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames');
-  assert.match(controlled, /m\.profile\?\.test===false && m\.profile\?\.debug_assertions===true/);
-  assert.match(controlled, /nativeSelections\.get\(selected\) === JSON\.stringify\(selectionIdentity\(selected\)\)/);
-  assert.match(controlled, /bindNativeRuntime\(selected, root, process\.env, directory\);/);
-  const start = controlled.indexOf('export function nativeRuntimeSummary(');
-  const consumer = controlled.slice(start, controlled.indexOf('export async function runTests(', start));
-  assert.match(consumer, /const artifact = nativeArtifact\(resolve\(root\), directory\);/);
-  assert.match(consumer, /JSON\.stringify\(receipt\.binding\) === JSON\.stringify\(binding\)/);
-  assert.match(consumer, /const result = readCaseResult\(row, name, directory, artifact\.selected\.sha256\);/);
-  assert.match(consumer, /const clean = confirmedCleanup\(result, name\)/);
-  assert.match(consumer, /confirmedGraph\(result, name, directory, artifact\.selected\.sha256\)/);
-  assert.match(consumer, /exactNativePass\(result, name\)/);
-  assert.match(consumer, /env\.RUNTIME_OUTCOME === 'success'/);
-  assert.doesNotMatch(consumer, /exactPass\(|receipt\.passed|row\.passed/);
-  assert.match(controlled, /const e = row\.executor;/);
-  const cases = controlled.slice(controlled.indexOf('export async function runTests('), controlled.indexOf('export function contractGroups('));
-  assert.match(cases, /cases: TESTS\.map/);
-  assert.ok(cases.indexOf('preserveExecutor(current, result, name); save();') >= 0);
-  assert.ok(cases.indexOf('preserveExecutor(current, result, name); save();') < cases.indexOf('demand(confirmedCleanup(result, name),'));
+  const head = "node --input-type=module - <<'NODE'\n";
+  assert.equal(block.split(head).length, 2, 'one actual summary inline program');
+  const start = block.indexOf(head) + head.length, end = block.indexOf('\n          NODE', start);
+  assert.ok(end > start, 'closed nonempty summary program');
+  return block.slice(start, end);
+}
+function assertNativeSummaryConsumer(ci, controlled) {
+  const program = summaryProgram(ci);
+  executableAnchor(program, "import { nativeRuntimeSummary } from './scripts/run-native-dns-controlled-tests.mjs';");
+  executableAnchor(program, 'const nativeProductionRuntime = nativeRuntimeSummary(directory, e);');
+  executableAnchor(program, "const windowsProxyRuntimeTests = e.RUNNER_OS === 'Windows' ? nativeProductionRuntime :");
+  executableAnchor(program, 'nativeProductionRuntime, windowsProxyRuntimeTests,');
+  assert.doesNotMatch(runnerViews(program).code, /\b(?:proxyTests|oldSummary|legacyFive)\b/);
+  assertClosedNativeMain(controlled);
+  assert.equal(TESTS.length, 6);
+  for (const anchor of [
+    'const artifact = nativeArtifact(resolve(root), directory);',
+    'JSON.stringify(receipt.binding) === JSON.stringify(binding)',
+    'const result = readCaseResult(row, name, directory, artifact.selected.sha256);',
+    'const clean = confirmedCleanup(result, name)',
+    'confirmedGraph(result, name, directory, artifact.selected.sha256)',
+    'exactNativePass(result, name)',
+    "env.RUNTIME_OUTCOME === 'success'",
+  ]) requireRunnerCode(controlled, 'nativeRuntimeSummary', anchor);
+  assert.doesNotMatch(runnerRegion(controlled, 'nativeRuntimeSummary').code, /\bexactPass\s*\(|receipt\.passed|row\.passed/);
+  requireRunnerCode(controlled, 'readCaseResult', 'const e = row.executor;');
+  requireRunnerCode(controlled, 'runTests', 'cases: TESTS.map');
+  const cases = runnerRegion(controlled, 'runTests').raw;
+  assert.ok(executableAnchor(cases, 'preserveExecutor(current, result, name); save();')
+    < executableAnchor(cases, 'demand(confirmedCleanup(result, name),'));
+}
+
+// Each mutation starts from the same genuinely checked positive fixture. Change
+// one executable anchor inside its finite owner and prove both surroundings stay.
+function mutateConsumerOwner(fixture, source, owner, before, after) {
+  const original = fixture[source];
+  const target = source === 'controlled' ? runnerRegion(original, owner).raw
+    : owner === 'summary' ? summaryProgram(original) : extractCiStepBlock(original, owner);
+  assert.ok(target.trim().length > 0, `${owner}: nonempty mutation domain`);
+  assert.equal(original.split(target).length, 2, `${owner}: unique actual owner`);
+  const start = original.indexOf(target), at = executableAnchor(target, before);
+  assert.equal(target.slice(at, at + before.length), before, 'exact original anchor bytes');
+  const changedTarget = target.slice(0, at) + after + target.slice(at + before.length);
+  assert.notEqual(changedTarget, target, 'target must really change');
+  assert.ok(changedTarget.trim().length > 0, 'mutation cannot empty its owner');
+  const changed = original.slice(0, start) + changedTarget + original.slice(start + target.length);
+  assert.equal(changed.slice(0, start), original.slice(0, start), 'prefix unchanged');
+  assert.equal(changed.slice(start + changedTarget.length), original.slice(start + target.length), 'suffix unchanged');
+  return { ...fixture, [source]: changed };
 }
 test('ordinary native summary consumes the same six bound normal cases and preserves executor before failure', () => {
   const { ci, controlled } = loadStripped(); assertNativeSummaryConsumer(ci, controlled);
 });
-for (const [name, source, before, after] of [
-  ['consumer disconnected', 'ci', 'const nativeProductionRuntime = nativeRuntimeSummary(directory, e);', 'const nativeProductionRuntime = oldSummary(directory, e);'],
-  ['Windows projection forked', 'ci', "e.RUNNER_OS === 'Windows' ? nativeProductionRuntime :", "e.RUNNER_OS === 'Windows' ? legacyFive :"],
-  ['stats omitted', 'controlled', "  'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',", ''],
-  ['non-test selector weakened', 'controlled', 'm.profile?.test===false && m.profile?.debug_assertions===true', 'true'],
-  ['bound selection bypassed', 'controlled', 'nativeSelections.get(selected) === JSON.stringify(selectionIdentity(selected))', 'true'],
-  ['receipt source/run binding bypassed', 'controlled', 'JSON.stringify(receipt.binding) === JSON.stringify(binding)', 'true'],
-  ['executor replaced by self claim', 'controlled', 'const e = row.executor;', 'const e = row.nativeRecord;'],
-  ['stream/executor reader disconnected', 'controlled', 'const result = readCaseResult(row, name, directory, artifact.selected.sha256);', 'const result = row.nativeRecord;'],
-  ['cleanup consumer bypassed', 'controlled', 'const clean = confirmedCleanup(result, name)', 'const clean = true'],
-  ['graph consumer bypassed', 'controlled', 'confirmedGraph(result, name, directory, artifact.selected.sha256)', 'true'],
-  ['failure persistence removed', 'controlled', 'preserveExecutor(current, result, name); save();', 'current.state = "passed";'],
+for (const [name, source, before, after, owner] of [
+  ['consumer disconnected', 'ci', 'const nativeProductionRuntime = nativeRuntimeSummary(directory, e);', 'const nativeProductionRuntime = oldSummary(directory, e);', 'summary'],
+  ['Windows projection forked', 'ci', "e.RUNNER_OS === 'Windows' ? nativeProductionRuntime :", "e.RUNNER_OS === 'Windows' ? legacyFive :", 'summary'],
+  ['stats omitted', 'controlled', "  'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',", '', 'TESTS'],
+  ['non-test selector weakened', 'controlled', 'm.profile?.test===false && m.profile?.debug_assertions===true', 'true', 'selectNativeExecutable'],
+  ['bound selection bypassed', 'controlled', 'nativeSelections.get(selected) === JSON.stringify(selectionIdentity(selected))', 'true', 'bindNativeRuntime'],
+  ['receipt source/run binding bypassed', 'controlled', 'JSON.stringify(receipt.binding) === JSON.stringify(binding)', 'true', 'nativeRuntimeSummary'],
+  ['executor replaced by self claim', 'controlled', 'const e = row.executor;', 'const e = row.nativeRecord;', 'readCaseResult'],
+  ['stream/executor reader disconnected', 'controlled', 'const result = readCaseResult(row, name, directory, artifact.selected.sha256);', 'const result = row.nativeRecord;', 'nativeRuntimeSummary'],
+  ['cleanup consumer bypassed', 'controlled', 'const clean = confirmedCleanup(result, name)', 'const clean = true', 'nativeRuntimeSummary'],
+  ['graph consumer bypassed', 'controlled', 'confirmedGraph(result, name, directory, artifact.selected.sha256)', 'true', 'nativeRuntimeSummary'],
+  ['failure persistence removed', 'controlled', 'preserveExecutor(current, result, name); save();', 'current.state = "passed";', 'runTests'],
 ]) test(`ordinary native summary rejects ${name}`, () => {
-  const fixture = loadStripped(); assert.ok(fixture[source].includes(before));
-  fixture[source] = fixture[source].replaceAll(before, after);
-  assert.throws(() => assertNativeSummaryConsumer(fixture.ci, fixture.controlled), { name: 'AssertionError' });
+  const fixture = loadStripped();
+  assertNativeSummaryConsumer(fixture.ci, fixture.controlled);
+  const changed = mutateConsumerOwner(fixture, source, owner, before, after);
+  assert.throws(() => assertNativeSummaryConsumer(changed.ci, changed.controlled), { name: 'AssertionError' });
 });
-for (const [name, source, before, after] of [
-  ['candidate admission removed', 'ci', "needs.cheap_format.outputs.native_dns_candidate != ''", 'true'],
-  ['helper build selector weakened', 'ci', 'cargo build --locked -p polaris-helper --bin polaris-helper', 'cargo build -p polaris-helper'],
-  ['cleaner selector changed', 'ci', 'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner', 'cargo build --locked -p polaris-helper --bin polaris-helper'],
-  ['controlled runner disconnected', 'ci', 'node scripts/run-native-dns-controlled-tests.mjs', 'node scripts/other.mjs'],
-  ['normal build selector weakened', 'controlled', "args: ['build', '--locked', '-p', 'polaris'", "args: ['build', '-p', 'polaris'"],
-  ['normal feature removed', 'controlled', "'--features', 'native-production-verification', ", ''],
-  ['normal binary replaced', 'controlled', "'--bin', 'native-admission-verifier'", "'--bin', 'polaris'"],
-  ['normal artifact replaced with libtest', 'controlled', 'selectNativeExecutable(messages, metadata, root)', 'selectExecutable(messages, metadata, root)'],
-  ['normal executable hash omitted', 'controlled', 'selected.sha256 = hash(selected.executable);', 'selected.sha256 = unverifiedDigest;'],
-  ['normal execution disconnected', 'controlled', 'await runTests(selected, env, directory);', 'await otherTests(selected, env, directory);'],
-  ['ordinary library selector weakened', 'controlled', "'--lib', '--no-run'", "'--no-run'"],
-  ['normal invocation broadened', 'controlled', "? [name] : [name,", "? [name, '--all'] : [name,"],
-  ['ignored tests broadened', 'controlled', "name, '--exact', '--ignored'", "name, '--ignored'"],
-  ['cleanup confirmation removed', 'controlled', 'demand(confirmedCleanup(result, name),', 'demand(true,'],
-  ['native authority record bypassed', 'controlled', '? nativeCaseRecord(result,name) : oneExecutedTest(result)', '? true : oneExecutedTest(result)'],
-  ['native business verdict bypassed', 'controlled', '? exactNativePass(result,name) : exactPass(result)', '? true : exactPass(result)'],
-  ['zero-test evidence accepted', 'controlled', 'test result: ok. 1 passed; 0 failed; 0 ignored;', 'test result: ok.'],
-  ['duplicated verdict accepted', 'controlled', 'summaries.length === 1', 'summaries.length >= 1'],
+for (const [name, source, before, after, owner] of [
+  ['candidate admission removed', 'ci', "needs.cheap_format.outputs.native_dns_candidate != ''", 'true', CANDIDATE_BUILD_STEP],
+  ['helper build selector weakened', 'ci', 'cargo build --locked -p polaris-helper --bin polaris-helper', 'cargo build -p polaris-helper', CANDIDATE_BUILD_STEP],
+  ['cleaner selector changed', 'ci', 'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner', 'cargo build --locked -p polaris-helper --bin polaris-helper', CANDIDATE_BUILD_STEP],
+  ['controlled runner disconnected', 'ci', 'node scripts/run-native-dns-controlled-tests.mjs', 'node scripts/other.mjs', CANDIDATE_RUNTIME_STEP],
+  ['normal build selector weakened', 'controlled', "args: ['build', '--locked', '-p', 'polaris'", "args: ['build', '-p', 'polaris'", 'main'],
+  ['normal feature removed', 'controlled', "'--features', 'native-production-verification', ", '', 'main'],
+  ['normal binary replaced', 'controlled', "'--bin', 'native-admission-verifier'", "'--bin', 'polaris'", 'main'],
+  ['normal artifact replaced with libtest', 'controlled', 'selectNativeExecutable(messages, metadata, root)', 'selectExecutable(messages, metadata, root)', 'main'],
+  ['normal executable hash omitted', 'controlled', 'selected.sha256 = hash(selected.executable);', 'selected.sha256 = unverifiedDigest;', 'main'],
+  ['normal execution disconnected', 'controlled', '() => runTests(selected, env, directory)', '() => otherTests(selected, env, directory)', 'main'],
+  ['ordinary library selector weakened', 'controlled', "'--lib', '--no-run'", "'--no-run'", 'runContractSuite'],
+  ['normal invocation broadened', 'controlled', "? [name] : [name,", "? [name, '--all'] : [name,", 'runTests'],
+  ['ignored tests broadened', 'controlled', "name, '--exact', '--ignored'", "name, '--ignored'", 'runTests'],
+  ['cleanup confirmation removed', 'controlled', 'demand(confirmedCleanup(result, name),', 'demand(true,', 'runTests'],
+  ['native authority record bypassed', 'controlled', '? nativeCaseRecord(result,name) : oneExecutedTest(result)', '? true : oneExecutedTest(result)', 'runTests'],
+  ['native business verdict bypassed', 'controlled', '? exactNativePass(result,name) : exactPass(result)', '? true : exactPass(result)', 'runTests'],
+  ['zero-test evidence accepted', 'controlled', "summaries[0].startsWith('test result: ok. 1 passed; 0 failed; 0 ignored;')", "summaries[0].startsWith('test result: ok.')", 'exactPass'],
+  ['duplicated verdict accepted', 'controlled', 'summaries.length === 1', 'summaries.length >= 1', 'exactPass'],
 ]) test(`candidate-only Cargo registration rejects ${name}`, () => {
   const fixture = loadStripped();
-  assert.ok(fixture[source].includes(before));
-  const changed = fixture[source].replaceAll(before, after);
-  assert.notEqual(changed, fixture[source], 'negative control must change its actual producer or consumer');
-  fixture[source] = changed;
-  assert.throws(() => assertCandidateOnlySteps(fixture.ci, fixture.controlled), { name: 'AssertionError' });
+  assertCandidateOnlySteps(fixture.ci, fixture.controlled);
+  const changed = mutateConsumerOwner(fixture, source, owner, before, after);
+  assert.throws(() => assertCandidateOnlySteps(changed.ci, changed.controlled), { name: 'AssertionError' });
+});
+
+
+const CLOSED_SESSION_CALL = 'await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));';
+const CLOSED_ROUTE_NEGATIVES = [
+  ['empty main', 'main', NATIVE_MAIN, 'async function main() {}'],
+  ['duplicate main', 'main', NATIVE_MAIN, NATIVE_MAIN + '\n' + NATIVE_MAIN],
+  ['main string replay', 'main', NATIVE_MAIN, 'async function main() {}\nconst replay = ' + JSON.stringify(NATIVE_MAIN) + ';'],
+  ['fire-and-forget callback', 'main', '() => runTests(selected, env, directory)', '() => { runTests(selected, env, directory); }'],
+  ['extra suite outside main', 'main', NATIVE_MAIN, NATIVE_MAIN + '\nawait runTests(selected, env, directory);'],
+  ['extra wrapper outside main', 'main', NATIVE_MAIN, NATIVE_MAIN + '\n' + CLOSED_SESSION_CALL],
+  ['binding wrong selected', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'bindNativeRuntime(otherSelected, root, process.env, directory);'],
+  ['binding wrong env', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'bindNativeRuntime(selected, root, otherEnv, directory);'],
+  ['binding wrong directory', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'bindNativeRuntime(selected, root, process.env, otherDirectory);'],
+  ['template expression extra suite', 'main', NATIVE_MAIN, NATIVE_MAIN + '\nconst other = `${runTests(selected, env, directory)}`;'],
+  ['suite loop narrowed', 'runTests', 'for (const name of TESTS) {', 'for (const name of TESTS.slice(0, 1)) {'],
+  ['suite loop reordered', 'runTests', 'for (const name of TESTS) {', 'for (const name of [...TESTS].reverse()) {'],
+  ['suite loop duplicated', 'runTests', 'for (const name of TESTS) {', 'for (const name of [...TESTS, ...TESTS]) {'],
+  ['session callback not awaited', 'withNativeSession', 'await run();', 'run();'],
+  ['wrapper replaced', 'main', CLOSED_SESSION_CALL, 'await otherSession(selected, env, directory, () => runTests(selected, env, directory));'],
+  ['callback disconnected', 'main', '() => runTests(selected, env, directory)', '() => otherTests(selected, env, directory)'],
+  ['callback empty', 'main', '() => runTests(selected, env, directory)', '() => {}'],
+  ['wrapper not awaited', 'main', CLOSED_SESSION_CALL, CLOSED_SESSION_CALL.replace('await ', '')],
+  ['double wrapper', 'main', CLOSED_SESSION_CALL, `${CLOSED_SESSION_CALL}\n  ${CLOSED_SESSION_CALL}`],
+  ['extra direct suite', 'main', CLOSED_SESSION_CALL, `${CLOSED_SESSION_CALL}\n  await runTests(selected, env, directory);`],
+  ['direct suite bypass', 'main', CLOSED_SESSION_CALL, 'await runTests(selected, env, directory);'],
+  ['per-case sessions', 'main', CLOSED_SESSION_CALL, 'for (const name of TESTS) await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));'],
+  ['wrong selected', 'main', CLOSED_SESSION_CALL, CLOSED_SESSION_CALL.replace('withNativeSession(selected,', 'withNativeSession(otherSelected,')],
+  ['wrong env', 'main', '() => runTests(selected, env, directory)', '() => runTests(selected, otherEnv, directory)'],
+  ['wrong directory', 'main', '() => runTests(selected, env, directory)', '() => runTests(selected, env, otherDirectory)'],
+  ['binding omitted', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'void selected;'],
+  ['build repeated', 'main', "const prepared = await executeCommand({ id: 'controlled-build', program: 'cargo',", "await executeCommand({ id: 'other-build', program: 'cargo', args: [] }, {});\n  const prepared = await executeCommand({ id: 'controlled-build', program: 'cargo',"],
+  ['forged receipt', 'main', 'JSON.stringify({ ...selected, preparationCalls: 1 }, null, 2)', 'JSON.stringify({ ...otherSelected, preparationCalls: 1 }, null, 2)'],
+  ['line comment replay', 'main', CLOSED_SESSION_CALL, `await otherTests(selected, env, directory); // ${CLOSED_SESSION_CALL}`],
+  ['block comment replay', 'main', CLOSED_SESSION_CALL, `await otherTests(selected, env, directory); /* ${CLOSED_SESSION_CALL} */`],
+  ['string replay', 'main', CLOSED_SESSION_CALL, `await otherTests(selected, env, directory); const replay = ${JSON.stringify(CLOSED_SESSION_CALL)};`],
+  ['template replay', 'main', CLOSED_SESSION_CALL, 'await otherTests(selected, env, directory); const replay = `' + CLOSED_SESSION_CALL + '`;'],
+  ["binding after session", "main", "  bindNativeRuntime(selected, root, process.env, directory);\n  const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();\n  const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);\n  // Cargo runs libtests in the package directory, rather than the workspace root.\n  await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));", "  const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();\n  const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);\n  // Cargo runs libtests in the package directory, rather than the workspace root.\n  await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));\n  bindNativeRuntime(selected, root, process.env, directory);"],
+  ["case order changed", "TESTS", "  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',\n  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',", "  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',\n  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',"],
+  ["empty suite", "TESTS", NATIVE_CASE_DECLARATION, "export const TESTS = Object.freeze([]);"],
+  ["duplicate case", "TESTS", "  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',\n  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',", "  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',\n  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',\n  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',"],
+];
+
+test('finite runner owners keep offsets with Unicode and reject inert declaration replay as evidence', () => {
+  const { controlled } = loadStripped(); assertClosedNativeMain(controlled);
+  const replay = 'const unicode = "周边😀";\n' + controlled
+    + '\nconst inertTemplate = `' + NATIVE_MAIN + '`;\n// ' + CLOSED_SESSION_CALL + '\n/* ' + NATIVE_MAIN + ' */\nconst inert = ' + JSON.stringify(NATIVE_MAIN) + ';\n';
+  assertClosedNativeMain(replay); // Inert names must not count as extra executable calls/declarations.
+  const view = runnerViews(replay), owner = runnerRegion(replay, 'main');
+  assert.equal(view.visible.length, replay.length); assert.equal(view.code.length, replay.length);
+  assert.equal(replay.slice(owner.start, owner.end), owner.raw);
+  assert.equal(owner.raw, runnerRegion(controlled, 'main').raw);
+});
+
+for (const [name, owner, before, after] of CLOSED_ROUTE_NEGATIVES) test(`closed normal native route rejects ${name}`, () => {
+  const fixture = loadStripped();
+  assertCandidateOnlySteps(fixture.ci, fixture.controlled);
+  assertNativeSummaryConsumer(fixture.ci, fixture.controlled);
+  const changed = mutateConsumerOwner(fixture, 'controlled', owner, before, after);
+  assert.throws(() => assertCandidateOnlySteps(changed.ci, changed.controlled), { name: 'AssertionError' });
+  assert.throws(() => assertNativeSummaryConsumer(changed.ci, changed.controlled), { name: 'AssertionError' });
 });
 
 /**
