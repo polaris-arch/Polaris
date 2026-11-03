@@ -280,3 +280,556 @@ where
 
 #[cfg(test)]
 mod tests;
+
+/// Immutable facts captured before the App's TUN exists. This is deliberately
+/// narrower than the cold planner: IPv4, one physical default, canonical policy,
+/// and an actual resolver on that same link. It is not a user-selected bypass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxPhysicalRouteFacts {
+    pub interface: String,
+    pub ifindex: u32,
+    pub source: std::net::Ipv4Addr,
+    pub resolver: std::net::Ipv4Addr,
+    external_routes: Vec<serde_json::Value>,
+    all_routes: Vec<serde_json::Value>,
+    dns: PhysicalDnsFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhysicalDnsFacts {
+    Resolved(Vec<String>),
+    ResolvConf(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxProtectedRouteView {
+    managed_table: u32,
+    rules: Vec<serde_json::Value>,
+    managed_routes: Vec<serde_json::Value>,
+}
+
+fn protected_error(message: impl Into<String>) -> SystemIntegrationError {
+    SystemIntegrationError::route(message.into())
+}
+
+fn json_array(raw: &str) -> Result<Vec<serde_json::Value>, SystemIntegrationError> {
+    if raw.len() > 256 * 1024 {
+        return Err(protected_error(
+            "protected route observation exceeds budget",
+        ));
+    }
+    let value: Vec<serde_json::Value> =
+        serde_json::from_str(raw).map_err(|_| protected_error("invalid protected route JSON"))?;
+    if value.len() > 1024 || value.iter().any(|v| !v.is_object()) {
+        return Err(protected_error("invalid protected route inventory"));
+    }
+    Ok(value)
+}
+
+fn canonical_values(mut values: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    values.sort_by_key(serde_json::Value::to_string);
+    values
+}
+
+fn table_number(value: Option<&serde_json::Value>) -> Option<u32> {
+    match value? {
+        serde_json::Value::String(s) => match s.as_str() {
+            "local" => Some(255),
+            "main" => Some(254),
+            "default" => Some(253),
+            _ => s.parse().ok(),
+        },
+        serde_json::Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+        _ => None,
+    }
+}
+
+fn canonical_policy(rule: &serde_json::Value) -> bool {
+    let Some(object) = rule.as_object() else {
+        return false;
+    };
+    if object
+        .keys()
+        .any(|key| !["priority", "src", "table", "protocol"].contains(&key.as_str()))
+    {
+        return false;
+    }
+    if rule.get("src").and_then(serde_json::Value::as_str) != Some("all") {
+        return false;
+    }
+    matches!(
+        (
+            rule.get("priority").and_then(serde_json::Value::as_u64),
+            table_number(rule.get("table"))
+        ),
+        (Some(0), Some(255)) | (Some(32766), Some(254)) | (Some(32767), Some(253))
+    )
+}
+
+fn canonical_policy_inventory(rules: &[serde_json::Value]) -> bool {
+    let priorities: std::collections::BTreeSet<_> = rules
+        .iter()
+        .filter(|r| canonical_policy(r))
+        .filter_map(|r| r["priority"].as_u64())
+        .collect();
+    priorities == std::collections::BTreeSet::from([0, 32766, 32767])
+        && rules.iter().filter(|r| canonical_policy(r)).count() == 3
+}
+
+fn protected_policy(rule: &serde_json::Value, physical: &str, tun: &str, table: u32) -> bool {
+    if canonical_policy(rule) {
+        return true;
+    }
+    let Some(object) = rule.as_object() else {
+        return false;
+    };
+    // UID, source-port and transport selectors would make an App UDP probe an
+    // invalid proxy for the Core dialer. Unknown/new kernel selectors fail closed.
+    let allowed = [
+        "priority",
+        "src",
+        "dst",
+        "table",
+        "protocol",
+        "iif",
+        "oif",
+        "fwmark",
+        "fwmask",
+        "goto",
+        "suppress_prefixlength",
+        "not",
+        "dport",
+        "action",
+    ];
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return false;
+    }
+    if rule
+        .get("priority")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        return false;
+    }
+    if let Some(value) = rule.get("table") {
+        if ![Some(254), Some(255), Some(253), Some(table)].contains(&table_number(Some(value))) {
+            return false;
+        }
+    } else if rule
+        .get("goto")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        return false;
+    }
+    for key in ["iif", "oif"] {
+        if let Some(value) = rule.get(key) {
+            if !matches!(value.as_str(), Some(name) if name == physical || name == tun || name == "lo")
+            {
+                return false;
+            }
+        }
+    }
+    if let Some(port) = rule.get("dport") {
+        if !(port.as_u64() == Some(53) || matches!(port.as_str(), Some("53" | "53-53"))) {
+            return false;
+        }
+    }
+    if let Some(action) = rule.get("action") {
+        if !matches!(action.as_str(), Some("to_tbl" | "goto" | "unicast")) {
+            return false;
+        }
+    }
+    true
+}
+
+fn usable_physical_v4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+        && !(octets[0] == 169 && octets[1] == 254)
+        && !(octets[0] == 198 && matches!(octets[1], 18 | 19))
+}
+
+fn dns_link(line: &str) -> Option<(&str, &str)> {
+    let start = line.find('(')? + 1;
+    let end = line[start..].find(')')? + start;
+    let rest = line[end + 1..].trim().strip_prefix(':')?.trim();
+    Some((&line[start..end], rest))
+}
+
+fn resolved_evidence(
+    raw: [&str; 3],
+    physical: &str,
+    ignore: Option<&str>,
+) -> Result<(Vec<String>, std::net::Ipv4Addr), SystemIntegrationError> {
+    let mut evidence = Vec::new();
+    let mut resolver = None;
+    let mut default_seen = false;
+    for (kind, text) in raw.into_iter().enumerate() {
+        if text.len() > 64 * 1024 {
+            return Err(protected_error(
+                "physical resolver inventory exceeds budget",
+            ));
+        }
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if line.starts_with("Global:") {
+                if !line.trim_start_matches("Global:").trim().is_empty()
+                    && !(kind == 2 && line.trim_start_matches("Global:").trim() == "no")
+                {
+                    return Err(protected_error(
+                        "global/split resolver policy is not captured",
+                    ));
+                }
+            } else {
+                let (link, payload) = dns_link(line)
+                    .ok_or_else(|| protected_error("unknown per-link resolver format"))?;
+                if Some(link) == ignore {
+                    continue;
+                }
+                if link != physical && !payload.is_empty() && !(kind == 2 && payload == "no") {
+                    return Err(protected_error("multiple or split physical resolver links"));
+                }
+                if link == physical {
+                    if kind == 0 {
+                        let values: Vec<_> = payload.split_whitespace().collect();
+                        if values.len() != 1 {
+                            return Err(protected_error("physical resolver is not unique"));
+                        }
+                        let ip: std::net::Ipv4Addr = values[0]
+                            .parse()
+                            .map_err(|_| protected_error("physical resolver is not IPv4"))?;
+                        if !usable_physical_v4(ip)
+                            || values[0] == polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP
+                        {
+                            return Err(protected_error(
+                                "physical resolver is local, FakeIP or controlled TUN DNS",
+                            ));
+                        }
+                        resolver = Some(ip);
+                    }
+                    if kind == 2 {
+                        default_seen = payload == "yes";
+                    }
+                }
+            }
+            evidence.push(format!("{kind}:{line}"));
+        }
+    }
+    evidence.sort();
+    if !default_seen {
+        return Err(protected_error(
+            "physical resolver link is not the real default",
+        ));
+    }
+    Ok((
+        evidence,
+        resolver.ok_or_else(|| protected_error("physical resolver is absent"))?,
+    ))
+}
+
+impl<R: CommandRunner> SystemRouteOpsImpl<R> {
+    fn protected_json(
+        &self,
+        args: &[&str],
+    ) -> Result<Vec<serde_json::Value>, SystemIntegrationError> {
+        json_array(&self.run(&Command::new("ip", args.iter().copied()))?.stdout)
+    }
+    fn physical_dns(
+        &self,
+        interface: &str,
+        ignore: Option<&str>,
+        previous: Option<&PhysicalDnsFacts>,
+    ) -> Result<(PhysicalDnsFacts, std::net::Ipv4Addr), SystemIntegrationError> {
+        if !matches!(previous, Some(PhysicalDnsFacts::ResolvConf(_))) {
+            match self.run(&Command::new("resolvectl", ["dns"])) {
+                Ok(dns) => {
+                    let domains = self.run(&Command::new("resolvectl", ["domain"]))?;
+                    let defaults = self.run(&Command::new("resolvectl", ["default-route"]))?;
+                    let (evidence, resolver) = resolved_evidence(
+                        [&dns.stdout, &domains.stdout, &defaults.stdout],
+                        interface,
+                        ignore,
+                    )?;
+                    return Ok((PhysicalDnsFacts::Resolved(evidence), resolver));
+                }
+                Err(error) if previous.is_some() => return Err(error),
+                Err(_) => {}
+            }
+        }
+        let raw = self.run(&Command::new("cat", ["/etc/resolv.conf"]))?.stdout;
+        if raw.len() > 64 * 1024 {
+            return Err(protected_error("resolv.conf exceeds budget"));
+        }
+        for line in raw.lines() {
+            let mut fields = line.split('#').next().unwrap_or("").split_whitespace();
+            match fields.next() {
+                None | Some("search" | "domain") => {}
+                Some("nameserver") => {
+                    if fields.next().is_none() || fields.next().is_some() {
+                        return Err(protected_error("ambiguous direct resolver record"));
+                    }
+                }
+                _ => {
+                    return Err(protected_error(
+                        "direct resolver has unsupported transport/options",
+                    ))
+                }
+            }
+        }
+        let servers: Vec<_> = raw
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('#').next().unwrap_or("").split_whitespace();
+                (fields.next() == Some("nameserver"))
+                    .then(|| fields.next().unwrap_or("").to_owned())
+            })
+            .collect();
+        if servers.len() != 1 {
+            return Err(protected_error("direct resolver is not unique"));
+        }
+        let resolver = servers[0]
+            .parse()
+            .map_err(|_| protected_error("direct resolver is not IPv4"))?;
+        if !usable_physical_v4(resolver)
+            || servers[0] == polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP
+        {
+            return Err(protected_error("direct resolver is a stub or TUN resolver"));
+        }
+        Ok((PhysicalDnsFacts::ResolvConf(raw), resolver))
+    }
+    fn physical_address(
+        &self,
+        interface: &str,
+    ) -> Result<(u32, std::net::Ipv4Addr), SystemIntegrationError> {
+        let links = self.protected_json(&["-j", "-4", "address", "show", "dev", interface])?;
+        if links.len() != 1 || links[0]["ifname"].as_str() != Some(interface) {
+            return Err(protected_error(
+                "physical interface observation is ambiguous",
+            ));
+        }
+        let link = &links[0];
+        let flags = link["flags"]
+            .as_array()
+            .ok_or_else(|| protected_error("physical link flags absent"))?;
+        if !flags.iter().any(|v| v.as_str() == Some("UP"))
+            || link["operstate"].as_str() != Some("UP")
+        {
+            return Err(protected_error("physical interface is not up"));
+        }
+        let index = link["ifindex"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n != 0)
+            .ok_or_else(|| protected_error("physical ifindex absent"))?;
+        let addresses: Vec<std::net::Ipv4Addr> = link["addr_info"]
+            .as_array()
+            .ok_or_else(|| protected_error("physical IPv4 addresses absent"))?
+            .iter()
+            .filter(|v| {
+                v["family"].as_str() == Some("inet") && v["scope"].as_str() == Some("global")
+            })
+            .filter_map(|v| v["local"].as_str().and_then(|s| s.parse().ok()))
+            .collect();
+        if addresses.len() != 1 || !usable_physical_v4(addresses[0]) {
+            return Err(protected_error("physical IPv4 source is ambiguous"));
+        }
+        Ok((index, addresses[0]))
+    }
+    /// Must run before our TUN route/DNS takeover, never while TUN is active.
+    pub fn capture_linux_physical_route(
+        &self,
+    ) -> Result<LinuxPhysicalRouteFacts, SystemIntegrationError> {
+        if self.platform != Platform::Linux {
+            return Err(protected_error(
+                "protected physical route source is Linux-only",
+            ));
+        }
+        let rules = self.protected_json(&["-j", "-4", "rule", "show"])?;
+        if rules.len() != 3 || !canonical_policy_inventory(&rules) {
+            return Err(protected_error("pre-TUN route policy is not canonical"));
+        }
+        let routes = self.protected_json(&["-j", "-4", "route", "show", "table", "main"])?;
+        let defaults: Vec<_> = routes
+            .iter()
+            .filter(|v| v["dst"].as_str() == Some("default"))
+            .collect();
+        if defaults.len() != 1 {
+            return Err(protected_error("physical default route is not unique"));
+        }
+        let interface = defaults[0]["dev"]
+            .as_str()
+            .filter(|name| {
+                !name.is_empty()
+                    && name.len() < 16
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+            })
+            .ok_or_else(|| protected_error("physical default interface absent"))?
+            .to_owned();
+        if routes.iter().any(|v| {
+            v["dev"].as_str() != Some(interface.as_str())
+                || v.get("multipath").is_some()
+                || v.get("nhid").is_some()
+                || v.get("expires").is_some()
+        }) {
+            return Err(protected_error(
+                "pre-TUN routes require an unsupported physical policy",
+            ));
+        }
+        let (ifindex, source) = self.physical_address(&interface)?;
+        let (dns, resolver) = self.physical_dns(&interface, None, None)?;
+        self.verify_linux_bound_route(&interface, source, resolver, 53, "udp")?;
+        let all_routes = self.protected_json(&["-j", "-4", "route", "show", "table", "all"])?;
+        Ok(LinuxPhysicalRouteFacts {
+            interface,
+            ifindex,
+            source,
+            resolver,
+            external_routes: canonical_values(routes),
+            all_routes: canonical_values(all_routes),
+            dns,
+        })
+    }
+    /// Observe the full relevant live policy without accepting our TUN as a
+    /// physical exit. Only the actual managed table may be added to canonical
+    /// policy. All original non-TUN routes and resolver facts must be unchanged.
+    pub fn observe_linux_protected_route(
+        &self,
+        original: &LinuxPhysicalRouteFacts,
+        tun: &str,
+    ) -> Result<LinuxProtectedRouteView, SystemIntegrationError> {
+        if self.platform != Platform::Linux || tun == original.interface {
+            return Err(protected_error("invalid managed TUN route identity"));
+        }
+        let (index, source) = self.physical_address(&original.interface)?;
+        if index != original.ifindex || source != original.source {
+            return Err(protected_error("physical interface/source changed"));
+        }
+        let routes = self.protected_json(&["-j", "-4", "route", "show", "table", "main"])?;
+        let external = canonical_values(
+            routes
+                .into_iter()
+                .filter(|v| v["dev"].as_str() != Some(tun))
+                .collect(),
+        );
+        if external != original.external_routes {
+            return Err(protected_error("external route inventory changed"));
+        }
+        let all = self.protected_json(&["-j", "-4", "route", "show", "table", "all"])?;
+        let external_all = canonical_values(
+            all.iter()
+                .filter(|v| v["dev"].as_str() != Some(tun))
+                .cloned()
+                .collect(),
+        );
+        if external_all != original.all_routes {
+            return Err(protected_error("external route tables changed"));
+        }
+        let managed: Vec<_> = all
+            .into_iter()
+            .filter(|v| v["dev"].as_str() == Some(tun))
+            .collect();
+        let tables: std::collections::BTreeSet<_> = managed
+            .iter()
+            .filter_map(|v| table_number(v.get("table")))
+            .filter(|t| *t >= 256)
+            .collect();
+        if tables.len() != 1 {
+            return Err(protected_error("actual managed route table is not unique"));
+        }
+        let table = *tables
+            .first()
+            .ok_or_else(|| protected_error("actual managed route table absent"))?;
+        if original
+            .all_routes
+            .iter()
+            .any(|v| table_number(v.get("table")) == Some(table))
+        {
+            return Err(protected_error("managed table existed before TUN"));
+        }
+        if managed.is_empty()
+            || managed
+                .iter()
+                .any(|v| v.get("multipath").is_some() || v.get("nhid").is_some())
+        {
+            return Err(protected_error("managed route table has an unknown exit"));
+        }
+        let rules = self.protected_json(&["-j", "-4", "rule", "show"])?;
+        if !canonical_policy_inventory(&rules)
+            || !rules
+                .iter()
+                .all(|v| protected_policy(v, &original.interface, tun, table))
+        {
+            return Err(protected_error(
+                "live route policy contains unsupported selectors or owners",
+            ));
+        }
+        let (dns, resolver) =
+            self.physical_dns(&original.interface, Some(tun), Some(&original.dns))?;
+        if dns != original.dns || resolver != original.resolver {
+            return Err(protected_error("external resolver policy changed"));
+        }
+        Ok(LinuxProtectedRouteView {
+            managed_table: table,
+            rules: canonical_values(rules),
+            managed_routes: canonical_values(managed),
+        })
+    }
+    /// Match a real mark-zero, interface-bound socket. UID/sport-dependent rules
+    /// are rejected above, so this result can also describe the Core process.
+    pub fn verify_linux_bound_route(
+        &self,
+        interface: &str,
+        source: std::net::Ipv4Addr,
+        target: std::net::Ipv4Addr,
+        port: u16,
+        transport: &str,
+    ) -> Result<(), SystemIntegrationError> {
+        if !usable_physical_v4(target) || !matches!(transport, "udp" | "tcp") || port == 0 {
+            return Err(protected_error("unsupported protected route target"));
+        }
+        let values = self.protected_json(&[
+            "-j",
+            "-4",
+            "route",
+            "get",
+            &target.to_string(),
+            "from",
+            &source.to_string(),
+            "oif",
+            interface,
+            "mark",
+            "0",
+            "ipproto",
+            transport,
+            "dport",
+            &port.to_string(),
+        ])?;
+        if values.len() != 1 {
+            return Err(protected_error("bound route result is ambiguous"));
+        }
+        let route = &values[0];
+        let observed_source = route
+            .get("prefsrc")
+            .or_else(|| route.get("src"))
+            .or_else(|| route.get("from"))
+            .and_then(serde_json::Value::as_str);
+        if route["dev"].as_str() != Some(interface)
+            || observed_source != Some(source.to_string().as_str())
+            || route
+                .get("table")
+                .is_some_and(|v| table_number(Some(v)) != Some(254))
+            || route.get("multipath").is_some()
+            || route.get("nhid").is_some()
+        {
+            return Err(protected_error(
+                "bound socket route is not the retained physical exit",
+            ));
+        }
+        Ok(())
+    }
+}

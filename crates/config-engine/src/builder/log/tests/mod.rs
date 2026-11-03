@@ -146,7 +146,7 @@ fn privacy_raises_level() {
 }
 
 #[test]
-fn disable_log_file_short_circuits() {
+fn disabled_log_retains_only_the_host_output_anchor() {
     let input = LogConfigInput {
         disable_log_file: true,
         proxy_mode_type: ProxyModeType::Tun,
@@ -154,7 +154,11 @@ fn disable_log_file_short_circuits() {
     };
     let cfg = build_log_config(&input, &deps(false, Platform::Linux, Some("/fake/sb.log")));
     assert_eq!(cfg.disabled, Some(true));
-    assert!(cfg.output.is_none(), "disabled 时不写 output");
+    assert_eq!(
+        cfg.output.as_deref(),
+        Some("/fake/sb.log"),
+        "disabled保留元数据但不得创建文件"
+    );
 }
 
 #[test]
@@ -165,4 +169,29 @@ fn manual_mode_no_output() {
     };
     let cfg = build_log_config(&input, &deps(false, Platform::Linux, Some("/fake/sb.log")));
     assert!(cfg.output.is_none(), "manual 模式 stdout 直喂不写文件");
+}
+
+#[test]
+fn cold_disabled_and_enabled_recipes_share_the_fixed_host_destination() {
+    for platform in Platform::ALL.iter().copied() {
+        for mode in [
+            ProxyModeType::SystemProxy,
+            ProxyModeType::Manual,
+            ProxyModeType::Tun,
+        ] {
+            for path in [None, Some("/host-owned/singbox.log")] {
+                let mut input = LogConfigInput {
+                    proxy_mode_type: mode,
+                    ..Default::default()
+                };
+                let enabled = build_log_config(&input, &deps(false, platform, path));
+                input.disable_log_file = true;
+                let disabled = build_log_config(&input, &deps(false, platform, path));
+                assert_eq!(disabled.disabled, Some(true));
+                assert_eq!(disabled.output, enabled.output, "{platform:?}/{mode:?}");
+                assert_eq!(disabled.level, enabled.level);
+                assert_eq!(disabled.timestamp, enabled.timestamp);
+            }
+        }
+    }
 }

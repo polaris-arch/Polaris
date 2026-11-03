@@ -223,6 +223,7 @@ impl ProxyRuntime {
             || !removed.is_empty()
             || non_node_pending
             || selected_pending
+            || self.host_effect_pending()
             || self.has_uncommitted_rule_content();
         let restart_required = applied.as_ref().is_some_and(|runtime| {
             super::runtime_config::structural_runtime_change(
@@ -239,6 +240,7 @@ impl ProxyRuntime {
             removed,
             restart_deferred: non_node_pending
                 || selected_pending
+                || self.host_effect_pending()
                 || self.has_uncommitted_rule_content(),
         }
     }

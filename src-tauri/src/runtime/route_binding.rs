@@ -443,3 +443,947 @@ async fn query_route_interface(ip: IpAddr) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+/// Retained pre-TUN physical facts. No mutable config file, current system DNS
+/// lookup, hard-coded resolver or newly selected interface can create this owner.
+#[derive(Debug)]
+pub(crate) struct ProtectedPhysicalRoot {
+    captured_generation: u64,
+    captured_network_epoch: u64,
+    revoked: std::sync::atomic::AtomicBool,
+    #[cfg(target_os = "linux")]
+    facts: polaris_system_integration::route_ops::LinuxPhysicalRouteFacts,
+    #[cfg(target_os = "linux")]
+    physical: PhysicalLinkPin,
+    #[cfg(target_os = "linux")]
+    namespace: std::fs::File,
+    #[cfg(target_os = "linux")]
+    pre_links: BTreeSet<String>,
+    #[cfg(target_os = "linux")]
+    seal: std::sync::Mutex<Option<Arc<PhysicalRootSeal>>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PhysicalLinkPin {
+    directory: std::fs::File,
+    name: String,
+    index: u32,
+    address: String,
+}
+
+#[cfg(target_os = "linux")]
+impl PhysicalLinkPin {
+    fn open(name: &str, physical: bool) -> Result<Self, String> {
+        if name.is_empty()
+            || name.len() >= 16
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+        {
+            return Err("invalid physical link name".into());
+        }
+        let path = std::path::Path::new("/sys/class/net").join(name);
+        if physical && !path.join("device").exists() {
+            return Err("default route is not a physical device".into());
+        }
+        let directory = std::fs::File::open(&path).map_err(|_| "physical link cannot be pinned")?;
+        let index = std::fs::read_to_string(path.join("ifindex"))
+            .map_err(|_| "physical ifindex unavailable")?
+            .trim()
+            .parse()
+            .map_err(|_| "invalid physical ifindex")?;
+        let address = std::fs::read_to_string(path.join("address"))
+            .map_err(|_| "physical link address unavailable")?;
+        let pin = Self {
+            directory,
+            name: name.to_owned(),
+            index,
+            address,
+        };
+        pin.verify()?;
+        Ok(pin)
+    }
+    fn verify(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self
+            .directory
+            .metadata()
+            .map_err(|_| "held physical link disappeared")?;
+        let path = std::path::Path::new("/sys/class/net").join(&self.name);
+        let current = std::fs::metadata(&path).map_err(|_| "physical link disappeared")?;
+        let index: u32 = std::fs::read_to_string(path.join("ifindex"))
+            .map_err(|_| "physical ifindex disappeared")?
+            .trim()
+            .parse()
+            .map_err(|_| "invalid current ifindex")?;
+        let address = std::fs::read_to_string(path.join("address"))
+            .map_err(|_| "physical link address disappeared")?;
+        if held.dev() != current.dev()
+            || held.ino() != current.ino()
+            || index != self.index
+            || address != self.address
+            || nix::net::if_::if_nametoindex(self.name.as_str())
+                .map_err(|_| "physical link name disappeared")?
+                != self.index
+        {
+            return Err("physical link birth/index/address changed".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PhysicalRootSeal {
+    generation: u64,
+    network_epoch: u64,
+    tun: PhysicalLinkPin,
+    view: polaris_system_integration::route_ops::LinuxProtectedRouteView,
+}
+
+/// A candidate owns this proof independently of the currently admitted graph.
+/// Dropping it never updates accepted route facts. Blocking IO retains its Arc
+/// until real return; cancel/timeout is never reported as an IO join.
+#[derive(Debug, Clone)]
+pub(crate) struct ProtectedBindingPlan {
+    plan: RuntimeBindingPlan,
+    #[cfg(target_os = "linux")]
+    owner: Arc<ProtectedPhysicalRoot>,
+    generation: u64,
+    network_epoch: u64,
+    expires: std::time::Instant,
+    #[cfg(target_os = "linux")]
+    targets: Vec<(std::net::Ipv4Addr, u16)>,
+}
+
+pub(crate) async fn capture_protected_physical_root(
+    generation: u64,
+    network_epoch: u64,
+) -> Result<Arc<ProtectedPhysicalRoot>, String> {
+    if generation == 0 {
+        return Err("physical source has no original startup generation".into());
+    }
+    #[cfg(target_os = "linux")]
+    return tokio::task::spawn_blocking(move || {
+        let namespace = std::fs::File::open("/proc/self/ns/net")
+            .map_err(|_| "network namespace cannot be retained")?;
+        let ops = polaris_system_integration::production_route_ops();
+        let facts = ops
+            .capture_linux_physical_route()
+            .map_err(|e| e.to_string())?;
+        let physical = PhysicalLinkPin::open(&facts.interface, true)?;
+        if physical.index != facts.ifindex {
+            return Err("physical link changed during capture".into());
+        }
+        let pre_links = std::fs::read_dir("/sys/class/net")
+            .map_err(|_| "pre-TUN links unavailable")?
+            .map(|entry| {
+                entry
+                    .map_err(|_| "pre-TUN link unavailable")
+                    .and_then(|entry| {
+                        entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| "non-UTF8 link name")
+                    })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        physical.verify()?;
+        if ops
+            .capture_linux_physical_route()
+            .map_err(|e| e.to_string())?
+            != facts
+        {
+            return Err("physical route facts changed during pre-TUN capture".into());
+        }
+        let owner = Arc::new(ProtectedPhysicalRoot {
+            captured_generation: generation,
+            captured_network_epoch: network_epoch,
+            revoked: std::sync::atomic::AtomicBool::new(false),
+            facts,
+            physical,
+            namespace,
+            pre_links,
+            seal: std::sync::Mutex::new(None),
+        });
+        owner.verify_namespace()?;
+        owner.physical.verify()?;
+        Ok(owner)
+    })
+    .await
+    .map_err(|_| "physical capture task did not return".to_owned())?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = network_epoch;
+        Err("protected physical root source unavailable on this platform".into())
+    }
+}
+
+impl ProtectedPhysicalRoot {
+    pub(crate) fn revoke(&self) {
+        self.revoked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(target_os = "linux")]
+    fn verify_namespace(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self
+            .namespace
+            .metadata()
+            .map_err(|_| "held network namespace unavailable")?;
+        let current =
+            std::fs::metadata("/proc/self/ns/net").map_err(|_| "network namespace unavailable")?;
+        if held.dev() != current.dev() || held.ino() != current.ino() {
+            return Err("network namespace changed".into());
+        }
+        Ok(())
+    }
+    /// The caller supplies the actual ready generation and watcher epoch, not
+    /// an expected table number. The unique new table is read back from kernel.
+    /// Root must first prove generated mark=0 and auto_redirect=false for all
+    /// relevant dialers; absent/unknown native controls are not permission flags.
+    pub(crate) async fn seal(
+        self: &Arc<Self>,
+        managed_tun: &str,
+        generation: u64,
+        network_epoch: u64,
+    ) -> Result<(), String> {
+        if generation != self.captured_generation || network_epoch != self.captured_network_epoch {
+            return Err(
+                "pre-TUN physical source belongs to another startup or network epoch".into(),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let owner = Arc::clone(self);
+            let tun = managed_tun.to_owned();
+            return tokio::task::spawn_blocking(move || {
+                if generation == 0
+                    || owner.revoked.load(std::sync::atomic::Ordering::SeqCst)
+                    || owner.pre_links.contains(&tun)
+                {
+                    return Err("TUN is not a new link owned by this startup".into());
+                }
+                owner.verify_namespace()?;
+                owner.physical.verify()?;
+                let pin = PhysicalLinkPin::open(&tun, false)?;
+                if pin.index == owner.physical.index {
+                    return Err("physical root is the managed TUN".into());
+                }
+                let view = polaris_system_integration::production_route_ops()
+                    .observe_linux_protected_route(&owner.facts, &tun)
+                    .map_err(|e| e.to_string())?;
+                pin.verify()?;
+                owner.physical.verify()?;
+                let mut slot = owner
+                    .seal
+                    .lock()
+                    .map_err(|_| "physical source owner unavailable")?;
+                if slot.is_some() || owner.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("physical source was already sealed or revoked".into());
+                }
+                *slot = Some(Arc::new(PhysicalRootSeal {
+                    generation,
+                    network_epoch,
+                    tun: pin,
+                    view,
+                }));
+                Ok(())
+            })
+            .await
+            .map_err(|_| "physical seal task did not return".to_owned())?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (managed_tun, generation, network_epoch);
+            Err("protected physical source unavailable on this platform".into())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn verify_now(&self, generation: u64, network_epoch: u64) -> Result<(), String> {
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("original physical source is revoked".into());
+        }
+        let seal = self
+            .seal
+            .lock()
+            .map_err(|_| "physical source lock unavailable")?
+            .clone()
+            .ok_or("physical source is not sealed")?;
+        if seal.generation != generation || seal.network_epoch != network_epoch {
+            return Err("physical source generation/network epoch changed".into());
+        }
+        self.verify_namespace()?;
+        self.physical.verify()?;
+        seal.tun.verify()?;
+        let view = polaris_system_integration::production_route_ops()
+            .observe_linux_protected_route(&self.facts, &seal.tun.name)
+            .map_err(|e| e.to_string())?;
+        if view != seal.view {
+            return Err("physical route policy changed after ready".into());
+        }
+        self.physical.verify()?;
+        seal.tun.verify()?;
+        if self.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("physical source was revoked during observation".into());
+        }
+        Ok(())
+    }
+}
+
+impl ProtectedBindingPlan {
+    pub(crate) fn binding_plan(&self) -> &RuntimeBindingPlan {
+        &self.plan
+    }
+    /// Memory-only final publication fence. The caller must pass its current
+    /// watcher epoch while holding its existing generation/intent gate.
+    pub(crate) fn publication_current(&self, generation: u64, network_epoch: u64) -> bool {
+        generation == self.generation
+            && network_epoch == self.network_epoch
+            && std::time::Instant::now() < self.expires
+            && !self.owner_revoked()
+    }
+    fn owner_revoked(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.owner.revoked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+    pub(crate) async fn verify(&self, generation: u64, network_epoch: u64) -> Result<(), String> {
+        if !self.publication_current(generation, network_epoch) {
+            return Err("protected route proof expired, revoked or changed owner".into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let owner = Arc::clone(&self.owner);
+            let targets = self.targets.clone();
+            let expires = self.expires;
+            return tokio::task::spawn_blocking(move || {
+                owner.verify_now(generation, network_epoch)?;
+                let ops = polaris_system_integration::production_route_ops();
+                for (ip, port) in targets {
+                    for transport in ["tcp", "udp"] {
+                        ops.verify_linux_bound_route(
+                            &owner.facts.interface,
+                            owner.facts.source,
+                            ip,
+                            port,
+                            transport,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+                owner.verify_now(generation, network_epoch)?;
+                if std::time::Instant::now() >= expires {
+                    return Err("protected DNS proof expired during verification".into());
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| "physical verification task did not return".to_owned())?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err("protected physical proof unavailable on this platform".into())
+    }
+}
+
+pub(crate) async fn plan_protected_runtime_bindings(
+    owner: Arc<ProtectedPhysicalRoot>,
+    trusted: &UserConfig,
+    candidate: &UserConfig,
+    accepted: &RuntimeBindingPlan,
+    generation: u64,
+    network_epoch: u64,
+) -> Result<ProtectedBindingPlan, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let trusted = trusted.clone();
+        let candidate = candidate.clone();
+        let accepted = accepted.clone();
+        return tokio::task::spawn_blocking(move || {
+            owner.verify_now(generation, network_epoch)?;
+            let ops = polaris_system_integration::production_route_ops();
+            let started = std::time::Instant::now();
+            let (plan, ttl, targets) = extend_protected_binding_plan(
+                &trusted,
+                &candidate,
+                &accepted,
+                &owner.facts.interface,
+                |host| protected_resolve_v4(&owner, host),
+                |ip, port| {
+                    for transport in ["tcp", "udp"] {
+                        ops.verify_linux_bound_route(
+                            &owner.facts.interface,
+                            owner.facts.source,
+                            ip,
+                            port,
+                            transport,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                },
+            )?;
+            owner.verify_now(generation, network_epoch)?;
+            let expires = started + ttl;
+            if std::time::Instant::now() >= expires {
+                return Err("protected DNS proof expired while planning".into());
+            }
+            Ok(ProtectedBindingPlan {
+                plan,
+                owner,
+                generation,
+                network_epoch,
+                expires,
+                targets,
+            })
+        })
+        .await
+        .map_err(|_| "protected root planning task did not return".to_owned())?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            owner,
+            trusted,
+            candidate,
+            accepted,
+            generation,
+            network_epoch,
+        );
+        Err("protected root planner unavailable on this platform".into())
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn extend_protected_binding_plan(
+    trusted: &UserConfig,
+    candidate: &UserConfig,
+    accepted: &RuntimeBindingPlan,
+    interface: &str,
+    mut resolve: impl FnMut(&str) -> Result<(std::net::Ipv4Addr, Duration), String>,
+    mut verify: impl FnMut(std::net::Ipv4Addr, u16) -> Result<(), String>,
+) -> Result<(RuntimeBindingPlan, Duration, Vec<(std::net::Ipv4Addr, u16)>), String> {
+    let old: BTreeMap<_, _> = hot_switch_runtime_binding_candidates(Platform::Linux, trusted)
+        .into_iter()
+        .map(|c| (c.server_id, c.host))
+        .collect();
+    let candidates = runtime_binding_candidates_for_roots(
+        Platform::Linux,
+        candidate,
+        active_physical_root_ids(candidate),
+    );
+    if candidates.len() > MAX_CONCURRENT_TARGETS {
+        return Err("protected physical root inventory exceeds budget".into());
+    }
+    // Advancing the trusted config after this candidate must not attest an
+    // inactive edited host with its old covered fact. Remove only those stale
+    // facts from the candidate clone; active roots below earn new facts.
+    let new_hosts: BTreeMap<_, _> =
+        hot_switch_runtime_binding_candidates(Platform::Linux, candidate)
+            .into_iter()
+            .map(|root| (root.server_id, root.host))
+            .collect();
+    let stale: Vec<_> = accepted
+        .covered_roots
+        .iter()
+        .filter(|id| old.get(*id) != new_hosts.get(*id))
+        .cloned()
+        .collect();
+    let mut next = accepted.clone();
+    for id in stale {
+        next.bindings.remove(&id);
+        next.native_roots.remove(&id);
+        next.covered_roots.remove(&id);
+        next.probe_ips.remove(&id);
+        next.unresolved_roots.remove(&id);
+    }
+    let mut ttl = Duration::from_secs(60);
+    let mut targets = Vec::new();
+    for root in candidates {
+        if accepted.covered_roots.contains(&root.server_id)
+            && !accepted.unresolved_roots.contains_key(&root.server_id)
+            && old.get(&root.server_id) == Some(&root.host)
+        {
+            continue;
+        }
+        let server = candidate
+            .servers
+            .iter()
+            .find(|server| server.id == root.server_id)
+            .ok_or("protected root disappeared")?;
+        if server.port == 0
+            || matches!(
+                server.protocol,
+                Protocol::Custom | Protocol::Openconnect | Protocol::OpenvpnClient
+            )
+        {
+            return Err(
+                "protected root dialer requires an explicit native transport adapter".into(),
+            );
+        }
+        let (ip, lifetime) = if let Ok(ip) = root.host.parse::<std::net::Ipv4Addr>() {
+            (ip, ttl)
+        } else {
+            if root.host.parse::<std::net::IpAddr>().is_ok() {
+                return Err("protected physical source has no IPv6 proof".into());
+            }
+            resolve(&root.host)?
+        };
+        if lifetime.is_zero() {
+            return Err("protected DNS answer already expired".into());
+        }
+        verify(ip, server.port)?;
+        ttl = ttl.min(lifetime);
+        next.bindings
+            .insert(root.server_id.clone(), interface.to_owned());
+        next.native_roots.remove(&root.server_id);
+        next.unresolved_roots.remove(&root.server_id);
+        next.covered_roots.insert(root.server_id.clone());
+        next.probe_ips.insert(root.server_id, IpAddr::V4(ip));
+        targets.push((ip, server.port));
+    }
+    next.candidate_count = next.covered_roots.len();
+    Ok((next, ttl, targets))
+}
+
+#[cfg(target_os = "linux")]
+fn protected_resolve_v4(
+    owner: &ProtectedPhysicalRoot,
+    host: &str,
+) -> Result<(std::net::Ipv4Addr, Duration), String> {
+    let (id, query) = physical_dns_query(host)?;
+    owner.verify_namespace()?;
+    owner.physical.verify()?;
+    let socket = std::net::UdpSocket::bind((owner.facts.source, 0))
+        .map_err(|e| format!("physical DNS source bind failed: {e}"))?;
+    let device = std::ffi::OsString::from(&owner.facts.interface);
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::BindToDevice, &device)
+        .map_err(|e| format!("physical DNS SO_BINDTODEVICE failed: {e}"))?;
+    let observed = nix::sys::socket::getsockopt(&socket, nix::sys::socket::sockopt::BindToDevice)
+        .map_err(|e| format!("physical DNS device readback failed: {e}"))?;
+    if observed != device {
+        return Err("physical DNS device readback mismatch".into());
+    }
+    socket
+        .set_read_timeout(Some(LOOKUP_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    socket
+        .set_write_timeout(Some(LOOKUP_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    polaris_system_integration::production_route_ops()
+        .verify_linux_bound_route(
+            &owner.facts.interface,
+            owner.facts.source,
+            owner.facts.resolver,
+            53,
+            "udp",
+        )
+        .map_err(|e| e.to_string())?;
+    if owner.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("physical DNS owner revoked before send".into());
+    }
+    socket
+        .connect((owner.facts.resolver, 53))
+        .map_err(|e| format!("physical DNS connect failed: {e}"))?;
+    if socket
+        .send(&query)
+        .map_err(|e| format!("physical DNS send failed: {e}"))?
+        != query.len()
+    {
+        return Err("physical DNS query was truncated".into());
+    }
+    let mut bytes = [0u8; 513];
+    let count = socket
+        .recv(&mut bytes)
+        .map_err(|e| format!("physical DNS receive failed: {e}"))?;
+    if count > 512 {
+        return Err("physical DNS response exceeds UDP budget".into());
+    }
+    owner.physical.verify()?;
+    if owner.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("physical DNS owner revoked after receive".into());
+    }
+    physical_dns_answer(&bytes[..count], id, host)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn physical_dns_query(host: &str) -> Result<(u16, Vec<u8>), String> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.len() > 253 || !host.contains('.') {
+        return Err("protected DNS requires an absolute ASCII hostname".into());
+    }
+    let nonce = uuid::Uuid::new_v4();
+    let id = u16::from_be_bytes([nonce.as_bytes()[0], nonce.as_bytes()[1]]);
+    let mut query = vec![(id >> 8) as u8, id as u8, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in host.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid protected DNS hostname".into());
+        }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 1, 0, 1]);
+    Ok((id, query))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn physical_dns_name(packet: &[u8], cursor: &mut usize) -> Result<String, String> {
+    let mut offset = *cursor;
+    let mut end = None;
+    let mut labels = Vec::new();
+    let mut visited = BTreeSet::new();
+    for _ in 0..128 {
+        if !visited.insert(offset) {
+            return Err("DNS compression loop".into());
+        }
+        let length = *packet.get(offset).ok_or("truncated DNS name")? as usize;
+        if length & 0xc0 == 0xc0 {
+            let next = *packet.get(offset + 1).ok_or("truncated DNS pointer")? as usize;
+            let target = ((length & 0x3f) << 8) | next;
+            if target >= offset {
+                return Err("DNS compression is not a backward reference".into());
+            }
+            end.get_or_insert(offset + 2);
+            offset = target;
+            continue;
+        }
+        if length & 0xc0 != 0 || length > 63 {
+            return Err("invalid DNS label".into());
+        }
+        offset += 1;
+        if length == 0 {
+            *cursor = end.unwrap_or(offset);
+            return Ok(labels.join("."));
+        }
+        let label = packet
+            .get(offset..offset + length)
+            .ok_or("truncated DNS label")?;
+        if !label
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return Err("invalid DNS answer label".into());
+        }
+        labels.push(
+            std::str::from_utf8(label)
+                .map_err(|_| "non-ASCII DNS label")?
+                .to_ascii_lowercase(),
+        );
+        offset += length;
+        if labels.iter().map(String::len).sum::<usize>() + labels.len() > 254 {
+            return Err("DNS name exceeds budget".into());
+        }
+    }
+    Err("DNS compression exceeds budget".into())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn physical_dns_answer(
+    packet: &[u8],
+    id: u16,
+    host: &str,
+) -> Result<(std::net::Ipv4Addr, Duration), String> {
+    if packet.len() < 12
+        || packet.len() > 512
+        || u16::from_be_bytes([packet[0], packet[1]]) != id
+        || packet[2] & 0xfa != 0x80
+        || packet[3] & 0x0f != 0
+        || packet[4..6] != [0, 1]
+    {
+        return Err("unmatched, truncated or failed physical DNS response".into());
+    }
+    let count = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    if count == 0 || count > 64 {
+        return Err("physical DNS answer inventory invalid".into());
+    }
+    let expected = host.trim_end_matches('.').to_ascii_lowercase();
+    let mut cursor = 12;
+    if physical_dns_name(packet, &mut cursor)? != expected
+        || packet.get(cursor..cursor + 4) != Some([0u8, 1, 0, 1].as_slice())
+    {
+        return Err("physical DNS question mismatch".into());
+    }
+    cursor += 4;
+    let mut answers = Vec::new();
+    let mut aliases = BTreeMap::new();
+    for _ in 0..count {
+        let name = physical_dns_name(packet, &mut cursor)?;
+        let header = packet
+            .get(cursor..cursor + 10)
+            .ok_or("truncated DNS record")?;
+        cursor += 10;
+        let kind = u16::from_be_bytes([header[0], header[1]]);
+        let class = u16::from_be_bytes([header[2], header[3]]);
+        let ttl = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+        let length = u16::from_be_bytes([header[8], header[9]]) as usize;
+        let data = packet
+            .get(cursor..cursor + length)
+            .ok_or("truncated DNS data")?;
+        if class == 1 && kind == 1 && length == 4 {
+            answers.push((
+                name,
+                std::net::Ipv4Addr::new(data[0], data[1], data[2], data[3]),
+                ttl,
+            ));
+        } else if class == 1 && kind == 5 {
+            let mut alias_cursor = cursor;
+            let target = physical_dns_name(packet, &mut alias_cursor)?;
+            if alias_cursor != cursor + length || aliases.insert(name, (target, ttl)).is_some() {
+                return Err("invalid or ambiguous DNS alias".into());
+            }
+        }
+        cursor += length;
+    }
+    let mut name = expected;
+    let mut ttl = 60u32;
+    let mut visited = BTreeSet::new();
+    for _ in 0..16 {
+        if !visited.insert(name.clone()) {
+            return Err("DNS alias loop".into());
+        }
+        if let Some((_, ip, lifetime)) = answers.iter().find(|(owner, _, _)| owner == &name) {
+            let octets = ip.octets();
+            if ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+                || *lifetime == 0
+            {
+                return Err("physical DNS answer is not a usable physical address".into());
+            }
+            return Ok((*ip, Duration::from_secs(u64::from(ttl.min(*lifetime)))));
+        }
+        let (target, lifetime) = aliases
+            .get(&name)
+            .ok_or("physical DNS has no matching IPv4 answer")?;
+        ttl = ttl.min(*lifetime);
+        if ttl == 0 {
+            return Err("physical DNS alias expired".into());
+        }
+        name = target.clone();
+    }
+    Err("DNS alias depth exceeds budget".into())
+}
+
+/// Compare actual generated kernel policy, never desired config. Logical route
+/// rules/selector final and ordinary node payloads may change. New bind_interface
+/// values are supplied by the separately owned ProtectedBindingPlan; this
+/// predicate does not manufacture those per-target facts.
+pub(crate) fn protected_generated_policy_compatible(
+    before: &polaris_config_engine::singbox::SingBoxConfig,
+    after: &polaris_config_engine::singbox::SingBoxConfig,
+) -> bool {
+    fn controls_closed(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(object) => object.iter().all(|(key, value)| {
+                if matches!(
+                    key.as_str(),
+                    "routing_mark"
+                        | "default_mark"
+                        | "auto_redirect_input_mark"
+                        | "auto_redirect_output_mark"
+                        | "auto_redirect_reset_mark"
+                        | "auto_redirect_tproxy_mark"
+                ) {
+                    return value.as_u64() == Some(0);
+                }
+                if matches!(
+                    key.as_str(),
+                    "network_namespace"
+                        | "netns"
+                        | "inet4_bind_address"
+                        | "inet6_bind_address"
+                        | "network_strategy"
+                        | "network_type"
+                        | "fallback_network_type"
+                        | "fallback_delay"
+                        | "bind_network"
+                        | "protect_path"
+                        | "control_fd"
+                        | "socket_path"
+                        | "unix_path"
+                        | "bind_address_no_port"
+                        | "tcp_fast_open"
+                        | "tcp_multi_path"
+                        | "reuse_addr"
+                        | "udp_fragment"
+                        | "auto_redirect_nfqueue"
+                ) {
+                    return value.is_null() || value.as_bool() == Some(false);
+                }
+                controls_closed(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().all(controls_closed),
+            _ => true,
+        }
+    }
+    fn projection(
+        config: &polaris_config_engine::singbox::SingBoxConfig,
+    ) -> Option<(serde_json::Value, serde_json::Value)> {
+        let value = serde_json::to_value(config).ok()?;
+        if !controls_closed(&value) {
+            return None;
+        }
+        let tunnels: Vec<_> = value
+            .get("inbounds")?
+            .as_array()?
+            .iter()
+            .filter(|inbound| inbound["type"].as_str() == Some("tun"))
+            .collect();
+        if tunnels.len() != 1
+            || tunnels[0]
+                .get("auto_redirect")
+                .is_some_and(|flag| flag.as_bool() != Some(false))
+        {
+            return None;
+        }
+        let outbounds = value.get("outbounds")?.as_array()?;
+        if outbounds.iter().any(|outbound| {
+            !matches!(
+                outbound["type"].as_str(),
+                Some(
+                    "direct"
+                        | "block"
+                        | "selector"
+                        | "urltest"
+                        | "shadowsocks"
+                        | "socks"
+                        | "http"
+                        | "vless"
+                        | "vmess"
+                        | "trojan"
+                        | "hysteria"
+                        | "hysteria2"
+                        | "tuic"
+                        | "naive"
+                        | "snell"
+                        | "anytls"
+                        | "ssh"
+                        | "shadowtls"
+                        | "wireguard"
+                )
+            )
+        }) {
+            return None;
+        }
+        if outbounds.iter().any(|outbound| {
+            outbound
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|server| server.contains('/') || server.starts_with("unix:"))
+        }) {
+            return None;
+        }
+        let mut route = value.get("route")?.as_object()?.clone();
+        for logical in ["rules", "rule_set", "final"] {
+            route.remove(logical);
+        }
+        // The remaining generated route fields include automatic/default
+        // interface, resolver and future physical defaults. Unknown changes
+        // cannot inherit old kernel policy by omission.
+        Some(((*tunnels[0]).clone(), serde_json::Value::Object(route)))
+    }
+    match (projection(before), projection(after)) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    }
+}
+
+/// Negative-only memory fixture for the real settlement/publication tests.
+/// `expired=true` is already expired; `expired=false` is owner-revoked. Neither
+/// branch can be admitted. The ordinary source-file handles below are explicit
+/// placeholders, not sysfs/netns/Native custody, and seal is always None.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn blocked_physical_binding_proof_for_test(
+    generation: u64,
+    network_epoch: u64,
+    expired: bool,
+) -> (Arc<ProtectedPhysicalRoot>, ProtectedBindingPlan) {
+    struct MemoryReadback;
+    impl polaris_system_integration::exec::CommandRunner for MemoryReadback {
+        fn run(
+            &self,
+            command: &polaris_system_integration::exec::Command,
+            _: Duration,
+        ) -> Result<polaris_system_integration::exec::CommandOutput, String> {
+            let output = match command.program.as_str() {
+                "ip" if command.args.iter().any(|arg| arg == "rule") => {
+                    r#"[{"priority":0,"src":"all","table":"local"},{"priority":32766,"src":"all","table":"main"},{"priority":32767,"src":"all","table":"default"}]"#
+                }
+                "ip" if command.args.iter().any(|arg| arg == "address") => {
+                    r#"[{"ifname":"memory0","ifindex":2,"flags":["UP"],"operstate":"UP","addr_info":[{"family":"inet","scope":"global","local":"192.0.2.4"}]}]"#
+                }
+                "ip" if command.args.iter().any(|arg| arg == "get") => {
+                    r#"[{"dev":"memory0","prefsrc":"192.0.2.4","table":"main"}]"#
+                }
+                "ip" => {
+                    r#"[{"dst":"default","gateway":"192.0.2.1","dev":"memory0","table":"main"}]"#
+                }
+                "resolvectl" => match command.args.first().map(String::as_str) {
+                    Some("dns") => "Global:\nLink 2 (memory0): 192.0.2.53\n",
+                    Some("domain") => "Global:\nLink 2 (memory0):\n",
+                    Some("default-route") => "Global:\nLink 2 (memory0): yes\n",
+                    _ => return Err("unexpected negative-fixture resolver read".into()),
+                },
+                _ => return Err("unexpected negative-fixture read".into()),
+            };
+            Ok(polaris_system_integration::exec::CommandOutput {
+                stdout: output.to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+    // Reuse the existing pure CommandRunner parser to obtain the otherwise
+    // opaque cross-crate facts type; this runner cannot execute OS commands.
+    let facts = polaris_system_integration::route_ops::SystemRouteOpsImpl::with_platform(
+        MemoryReadback,
+        Platform::Linux,
+    )
+    .capture_linux_physical_route()
+    .expect("negative-only memory readback");
+    let placeholder = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("ordinary readonly fixture handle");
+    let owner = Arc::new(ProtectedPhysicalRoot {
+        captured_generation: generation,
+        captured_network_epoch: network_epoch,
+        revoked: std::sync::atomic::AtomicBool::new(!expired),
+        facts,
+        physical: PhysicalLinkPin {
+            directory: placeholder
+                .try_clone()
+                .expect("readonly fixture handle clone"),
+            name: "not-a-native-proof".into(),
+            index: 0,
+            address: String::new(),
+        },
+        namespace: placeholder,
+        pre_links: BTreeSet::new(),
+        seal: std::sync::Mutex::new(None),
+    });
+    let proof = ProtectedBindingPlan {
+        plan: RuntimeBindingPlan::default(),
+        owner: Arc::clone(&owner),
+        generation,
+        network_epoch,
+        expires: if expired {
+            std::time::Instant::now()
+        } else {
+            std::time::Instant::now() + Duration::from_secs(60)
+        },
+        targets: Vec::new(),
+    };
+    assert!(!proof.publication_current(generation, network_epoch));
+    (owner, proof)
+}

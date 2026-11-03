@@ -199,6 +199,14 @@ pub fn handle<P, S, D, SD>(
         return;
     }
 
+    if matches!(
+        command.as_str(),
+        lcmd::RESOLVED_DNS_SNAPSHOT | lcmd::RESOLVED_DNS_COMPARE
+    ) {
+        handle_checked_dns(state, deps, &cred, &command, conn);
+        return;
+    }
+
     // Reserve native ownership before a slow DNS operation, then release the
     // child mutex so the owner can still stop/status its retained birth.
     if matches!(
@@ -305,6 +313,300 @@ pub fn handle<P, S, D, SD>(
         }
     };
     dispatch_locked(&mut guard, deps, &cred, &command, conn);
+}
+
+fn write_checked_dns(conn: &mut impl Conn, value: LinuxDns) {
+    let _ = conn.write_line(&Response::Ok(ResponseKind::LinuxDns(value)).to_wire_line());
+}
+
+fn checked_dns_snapshot<P, S, D, SD>(
+    state: &Mutex<HandlerState>,
+    deps: &HandlerDeps<'_, P, S, D, SD>,
+    cred: &PeerCred,
+) -> Option<polaris_helper_proto::linux_dns::Snapshot>
+where
+    P: PeerCredProvider,
+    S: CoreSpawner,
+    D: FreePortDeps,
+    SD: SystemdOps,
+{
+    use polaris_helper_proto::linux_dns::Snapshot;
+    let guard = state.lock().ok()?;
+    if guard.dns_busy
+        || guard.upgrade_closed
+        || guard.shutting_down
+        || guard
+            .dns_owner
+            .is_some_and(|owner| cred.uid != 0 && owner != cred.uid)
+    {
+        return None;
+    }
+    let handle = guard.child.as_ref()?.running()?.clone();
+    let target = handle.target()?;
+    if !deps
+        .spawner
+        .caller_allowed(cred.uid, Some(&handle), Some(&target))
+        || deps.spawner.birth_admission(Some(&handle)) != BirthAdmission::Already(target)
+    {
+        return None;
+    }
+    let owned = guard.dns_owner.is_some()
+        && guard
+            .dns_birth
+            .as_ref()
+            .is_some_and(|birth| birth.same_birth(&handle));
+    let pending = guard.dns_cleanup_pending;
+    drop(guard);
+    let (link, settings) = deps.resolved_dns.snapshot().ok()?;
+    let original = deps.resolved_dns.original_settings();
+    let guard = state.lock().ok()?;
+    if guard.dns_busy
+        || guard.upgrade_closed
+        || guard.shutting_down
+        || guard.dns_cleanup_pending != pending
+        || !guard
+            .child
+            .as_ref()
+            .and_then(ManagedChild::running)
+            .is_some_and(|current| current.same_birth(&handle))
+        || (guard.dns_owner.is_some()
+            && guard
+                .dns_birth
+                .as_ref()
+                .is_some_and(|birth| birth.same_birth(&handle)))
+            != owned
+        || deps.spawner.birth_admission(Some(&handle)) != BirthAdmission::Already(target)
+    {
+        return None;
+    }
+    let snapshot = Snapshot {
+        pid: target.pid.get(),
+        birth: target.birth.to_wire(),
+        link,
+        settings,
+        original,
+        owned,
+        cleanup_pending: pending,
+    };
+    snapshot.valid().then_some(snapshot)
+}
+
+/// The authenticated caller can change only the helper's retained native birth
+/// and the original kernel TUN object. No caller-selected name/server or launch
+/// authority is introduced. Busy remains held through native completion/cleanup.
+fn handle_checked_dns<P, S, D, SD>(
+    state: &Mutex<HandlerState>,
+    deps: &HandlerDeps<'_, P, S, D, SD>,
+    cred: &PeerCred,
+    command: &str,
+    conn: &mut impl Conn,
+) where
+    P: PeerCredProvider,
+    S: CoreSpawner,
+    D: FreePortDeps,
+    SD: SystemdOps,
+{
+    use polaris_helper_proto::linux_dns::{CompareRequest, Gone, Snapshot};
+    if command == lcmd::RESOLVED_DNS_SNAPSHOT {
+        if !matches!(conn.read_line_strict(), Ok(None)) {
+            let _ = conn.write_line("ERR bad-args");
+        } else if let Some(snapshot) = checked_dns_snapshot(state, deps, cred) {
+            write_checked_dns(conn, LinuxDns::Snapshot(snapshot));
+        } else {
+            write_checked_dns(conn, LinuxDns::NoChange);
+        }
+        return;
+    }
+    let (Ok(Some(payload)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict()) else {
+        let _ = conn.write_line("ERR bad-args");
+        return;
+    };
+    let request = (payload.len() <= 16 * 1024)
+        .then(|| serde_json::from_str::<CompareRequest>(&payload).ok())
+        .flatten();
+    let Some(request) = request.filter(|request| request.expected.valid()) else {
+        let _ = conn.write_line("ERR bad-args");
+        return;
+    };
+    let expected = request.expected;
+    // Pure resource-absence proof is useful after Stop has already retired the
+    // child. It cannot clear helper custody or claim that any PID was reaped.
+    if !request.enabled && deps.resolved_dns.link_gone(&expected.link) == Ok(true) {
+        write_checked_dns(
+            conn,
+            LinuxDns::Gone(Gone {
+                pid: expected.pid,
+                birth: expected.birth,
+                link: expected.link,
+            }),
+        );
+        return;
+    }
+    let target = expected.target().expect("validated canonical birth");
+    let Ok(mut guard) = state.lock() else {
+        let _ = conn.write_line("ERR unknown");
+        return;
+    };
+    let handle = if request.enabled {
+        guard
+            .child
+            .as_ref()
+            .and_then(ManagedChild::running)
+            .cloned()
+    } else {
+        guard.dns_birth.clone()
+    };
+    let Some(handle) = handle.filter(|handle| handle.target() == Some(target)) else {
+        write_checked_dns(conn, LinuxDns::NoChange);
+        return;
+    };
+    let owned = guard.dns_owner.is_some()
+        && guard
+            .dns_birth
+            .as_ref()
+            .is_some_and(|birth| birth.same_birth(&handle));
+    if guard.dns_busy
+        || (request.enabled
+            && (guard.upgrade_closed || guard.shutting_down || guard.dns_cleanup_pending))
+        || guard
+            .dns_owner
+            .is_some_and(|owner| cred.uid != 0 && owner != cred.uid)
+        || !deps
+            .spawner
+            .caller_allowed(cred.uid, Some(&handle), Some(&target))
+        || expected.owned != owned
+        || expected.cleanup_pending != guard.dns_cleanup_pending
+        || (!request.enabled && !owned)
+        || (request.enabled
+            && deps.spawner.birth_admission(Some(&handle)) != BirthAdmission::Already(target))
+    {
+        write_checked_dns(conn, LinuxDns::NoChange);
+        return;
+    }
+    guard.dns_busy = true;
+    drop(guard);
+    // This read cannot write. A failed/changed precondition therefore gets a
+    // typed no-write receipt, unlike any failure after compare() is entered.
+    let actual = deps
+        .resolved_dns
+        .snapshot()
+        .ok()
+        .map(|(link, settings)| Snapshot {
+            pid: target.pid.get(),
+            birth: target.birth.to_wire(),
+            link,
+            settings,
+            original: deps.resolved_dns.original_settings(),
+            owned,
+            cleanup_pending: expected.cleanup_pending,
+        });
+    let Ok(mut guard) = state.lock() else {
+        let _ = conn.write_line("ERR unknown");
+        return;
+    };
+    let still_owned = if request.enabled {
+        guard
+            .child
+            .as_ref()
+            .and_then(ManagedChild::running)
+            .is_some_and(|current| current.same_birth(&handle))
+            && deps.spawner.birth_admission(Some(&handle)) == BirthAdmission::Already(target)
+            && !guard.upgrade_closed
+            && !guard.shutting_down
+            && !guard.dns_cleanup_pending
+    } else {
+        guard
+            .dns_birth
+            .as_ref()
+            .is_some_and(|current| current.same_birth(&handle))
+    };
+    if actual.as_ref() != Some(&expected) || !still_owned {
+        guard.dns_busy = false;
+        write_checked_dns(conn, LinuxDns::NoChange);
+        return;
+    }
+    guard.dns_birth = Some(handle.clone());
+    drop(guard);
+    let result = deps.resolved_dns.compare(
+        &(expected.link.clone(), expected.settings.clone()),
+        request.enabled,
+    );
+    let Ok(mut guard) = state.lock() else {
+        let _ = conn.write_line("ERR unknown");
+        return;
+    };
+    let current = guard
+        .child
+        .as_ref()
+        .and_then(ManagedChild::running)
+        .is_some_and(|child| child.same_birth(&handle));
+    let changed = match &result {
+        Ok((link, settings)) => {
+            *link == expected.link
+                && if request.enabled {
+                    settings.controlled()
+                } else {
+                    expected.original.as_ref() == Some(settings)
+                }
+        }
+        Err(_) => false,
+    };
+    if changed && !request.enabled {
+        guard.dns_owner = None;
+        guard.dns_birth = None;
+        guard.dns_cleanup_pending = false;
+    } else {
+        guard.dns_owner = Some(cred.uid);
+        guard.dns_birth = Some(handle.clone());
+        guard.dns_cleanup_pending = !changed || !current;
+    }
+    if !current && guard.dns_owner.is_some() {
+        drop(guard);
+        let cleanup = deps
+            .resolved_dns
+            .revert(polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME)
+            .is_ok();
+        if let Ok(mut guard) = state.lock() {
+            if cleanup {
+                guard.dns_owner = None;
+                guard.dns_birth = None;
+            }
+            guard.dns_cleanup_pending = !cleanup;
+            guard.dns_busy = false;
+        }
+        let _ = conn.write_line(if cleanup {
+            "ERR dns-owner-superseded-cleanup-confirmed"
+        } else {
+            "ERR dns-owner-superseded-cleanup-pending"
+        });
+        return;
+    }
+    let retained_original = if changed && request.enabled {
+        deps.resolved_dns.original_settings()
+    } else {
+        None
+    };
+    guard.dns_busy = false;
+    drop(guard);
+    if changed {
+        let (link, settings) = result.expect("checked native result");
+        write_checked_dns(
+            conn,
+            LinuxDns::Changed(Snapshot {
+                pid: expected.pid,
+                birth: expected.birth,
+                link,
+                settings,
+                original: retained_original,
+                owned: request.enabled,
+                cleanup_pending: false,
+            }),
+        );
+    } else {
+        // Exact reservation/possible-write footprint survives lost IPC, partial
+        // writes and readback failure. No failure response manufactures rollback.
+        let _ = conn.write_line("ERR dns-change-unconfirmed");
+    }
 }
 
 /// 持锁的命令分发（对照 Go switch cmd { ... }，:362-481）。
@@ -858,12 +1160,14 @@ fn handle_start<P, S, D, SD>(
             }
         }
     }
-    match conn.read_line_strict() {
-        Ok(Some(line)) => lines.push(line),
-        Ok(None) => {}
-        Err(_) => {
-            let _ = conn.write_line("ERR bad-args");
-            return;
+    for _ in 0..2 {
+        match conn.read_line_strict() {
+            Ok(Some(line)) => lines.push(line),
+            Ok(None) => break,
+            Err(_) => {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            }
         }
     }
     if !matches!(conn.read_line_strict(), Ok(None)) {
@@ -933,6 +1237,18 @@ fn handle_start<P, S, D, SD>(
         let _ = conn.write_line("ERR config-not-owned");
         return;
     }
+    let runtime_directory = match params
+        .runtime_directory
+        .as_deref()
+        .map(|directory| validate_runtime_directory(directory, cfg, cred.uid))
+        .transpose()
+    {
+        Ok(directory) => directory,
+        Err(_) => {
+            let _ = conn.write_line("ERR runtime-directory-denied");
+            return;
+        }
+    };
     let log = if params.common.log.is_empty() {
         None
     } else {
@@ -959,6 +1275,7 @@ fn handle_start<P, S, D, SD>(
         birth: Some(birth),
         binary: core.directory.join("sing-box"),
         config: cfg.to_path_buf(),
+        runtime_directory,
         log,
         fwd: params.common.fwd,
         parent_pid: params.common.parent_pid,
@@ -1007,3 +1324,45 @@ fn mint_birth_token() -> std::io::Result<HelperBirthToken> {
 
 #[cfg(test)]
 mod tests;
+
+/// This is data confinement under the authenticated UID, never execution
+/// authority. Core independently acquires its recovery namespace custody.
+fn validate_runtime_directory(
+    directory: &str,
+    config: &Path,
+    uid: u32,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    let root = Path::new(directory);
+    let denied = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "runtime directory denied",
+        )
+    };
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(denied());
+    }
+    // No symlink/alias expansion or config-parent inference. The exact directory
+    // and config must belong to the peer; other users may not replace the root.
+    if root.canonicalize()? != root || config.canonicalize()? != config || !config.starts_with(root)
+    {
+        return Err(denied());
+    }
+    let metadata = std::fs::symlink_metadata(root)?;
+    let config_metadata = std::fs::symlink_metadata(config)?;
+    if !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o022 != 0
+        || !config_metadata.is_file()
+        || config_metadata.uid() != uid
+    {
+        return Err(denied());
+    }
+    Ok(root.to_path_buf())
+}

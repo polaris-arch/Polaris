@@ -567,6 +567,7 @@ fn daemon_replaced_from_v3_to_v2_between_connections_cannot_start_or_trigger_leg
             Ok(Response::Ok(ResponseKind::Version { proto_version: 3 }))
         ));
         let params = polaris_helper_proto::core_protocol::PinnedStartParams {
+            runtime_directory: None,
             id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
             common: polaris_helper_proto::StartParams {
                 cfg: "/cfg".into(),

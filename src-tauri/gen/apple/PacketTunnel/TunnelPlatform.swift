@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Libbox
 import Network
@@ -5,18 +6,36 @@ import NetworkExtension
 
 // Libbox is embedded only in the extension; UIKit/WebView stay in the host App.
 final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCommandServerHandlerProtocol {
-    private unowned let provider: PacketTunnelProvider
+    fileprivate unowned let provider: PacketTunnelProvider
     private let monitorQueue = DispatchQueue(label: "com.polaris.tunnel-path")
     private let monitors = TunnelMonitorSession<NWPathMonitor, LibboxInterfaceUpdateListenerProtocol>()
     private var settings: NEPacketTunnelNetworkSettings?
     private var settingsReset = UUID()
     private let stateLock = NSLock()
     private let settingsOperation = NSLock()
+    private var settingsCallbacks: [UUID: (UInt64, TunnelSettingsCompletion)] = [:]
+    private var nativeTun = TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>()
 
     init(provider: PacketTunnelProvider) { self.provider = provider }
 
     func openTun(_ options: LibboxTunOptionsProtocol?, ret0_: UnsafeMutablePointer<Int32>?) throws {
         guard let options, let ret0_ else { throw tunnelError("Missing TUN options or output") }
+        guard !nativeTun.hasSessions else { throw tunnelError("Legacy TUN open cannot replace a native transaction owner") }
+        let network = try networkSettings(options)
+        guard settingsOperation.try() else { throw tunnelError("Another tunnel settings operation is already active") }
+        defer { settingsOperation.unlock() }
+        guard !nativeTun.hasSessions else { throw tunnelError("Legacy TUN open was superseded by a native transaction") }
+        let token = provider.settingsGeneration()
+        stateLock.lock(); let previous = settings; let reset = settingsReset; stateLock.unlock()
+        try apply(network, token: token)
+        try publish(network, replacing: previous, reset: reset, token: token)
+        // Upstream Libbox locates the extension's utun socket; no KVC/private key path.
+        let fd = LibboxGetTunnelFileDescriptor()
+        guard fd >= 0 else { throw tunnelError("The packet tunnel file descriptor is unavailable") }
+        ret0_.pointee = fd
+    }
+
+    private func networkSettings(_ options: LibboxTunOptionsProtocol) throws -> NEPacketTunnelNetworkSettings {
         let network = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         network.mtu = NSNumber(value: options.getMTU())
         let ipv4 = prefixes(options.getInet4Address())
@@ -55,16 +74,7 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
             proxy.matchDomains = strings(options.getHTTPProxyMatchDomain())
             network.proxySettings = proxy
         }
-        guard settingsOperation.try() else { throw tunnelError("Another tunnel settings operation is already active") }
-        defer { settingsOperation.unlock() }
-        let token = provider.settingsGeneration()
-        stateLock.lock(); let previous = settings; let reset = settingsReset; stateLock.unlock()
-        try apply(network, token: token)
-        try publish(network, replacing: previous, reset: reset, token: token)
-        // Upstream Libbox locates the extension's utun socket; no KVC/private key path.
-        let fd = LibboxGetTunnelFileDescriptor()
-        guard fd >= 0 else { throw tunnelError("The packet tunnel file descriptor is unavailable") }
-        ret0_.pointee = fd
+        return network
     }
 
     // Lock order: settingsOperation -> lifecycle publication gate -> stateLock.
@@ -79,27 +89,32 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
             return true
         }
         guard accepted else { throw tunnelError("Tunnel settings publication was superseded") }
+        nativeTun.noteCurrentSettings(network)
     }
 
     private func apply(_ network: NEPacketTunnelNetworkSettings?, token: UInt64) throws {
-        guard provider.acceptsSettings(token) else { throw tunnelError("Tunnel settings request is stale or uncertain") }
+        let owner = provider // Strongly retain the submitting provider until NE returns.
+        guard owner.acceptsSettings(token) else { throw tunnelError("Tunnel settings request is stale or uncertain") }
+        let requestID = UUID()
         let result = TunnelSettingsCompletion()
-        provider.setTunnelNetworkSettings(network) { error in
-            // A late callback may mean settings changed in the OS. It may not
-            // commit readiness/configuration into a superseding extension request.
-            guard self.provider.acceptsSettings(token) else {
-                result.finish(tunnelError("Tunnel settings callback belongs to a superseded request")); return
+        stateLock.lock(); settingsCallbacks[requestID] = (token, result); stateLock.unlock()
+        owner.setTunnelNetworkSettings(network) { [self, owner, network, result] error in
+            // This is the actual callback, even if the waiter timed out or Stop
+            // revoked its generation. Retain provider, candidate and result until
+            // here; late settlement cannot publish or lift quarantine.
+            withExtendedLifetime((owner, network, result)) {
+                stateLock.lock(); settingsCallbacks.removeValue(forKey: requestID); stateLock.unlock()
+                result.finish(error)
             }
-            result.finish(error)
         }
         do { try result.wait(seconds: 20) } catch {
-            // Timeout cannot undo setTunnelNetworkSettings. Quarantine this
-            // extension so no new start races a still-pending system callback.
-            if error is TunnelSettingsTimeout { provider.settingsTimedOut(token, error: error) }
+            if error is TunnelSettingsTimeout { owner.settingsTimedOut(token, error: error) }
             throw error
         }
-        guard provider.acceptsSettings(token) else { throw tunnelError("Tunnel settings completed after cancellation") }
+        guard owner.acceptsSettings(token) else { throw tunnelError("Tunnel settings completed after cancellation") }
     }
+
+    func revokeNativeTun() { nativeTun.revoke() }
 
     func usePlatformAutoDetectControl() -> Bool { false }
     func autoDetectControl(_ fd: Int32) throws {}
@@ -185,12 +200,29 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
     private func cancelMonitor(_ record: TunnelMonitorSession<NWPathMonitor, LibboxInterfaceUpdateListenerProtocol>.Record?) {
         if let record { monitors.takeCancellation(record)?.cancel() }
     }
-    func reset() { resetMonitor(); stateLock.lock(); settingsReset = UUID(); settings = nil; stateLock.unlock() }
+    func reset() -> String? {
+        resetMonitor()
+        stateLock.lock()
+        let pending = settingsCallbacks.values.first
+        if pending == nil && !nativeTun.hasSessions { settingsReset = UUID(); settings = nil }
+        stateLock.unlock()
+        if let pending {
+            let message = "The original NE settings callback has not joined"
+            provider.nativeTunCleanupUncertain(pending.0, message: message)
+            return message
+        }
+        guard !nativeTun.hasSessions else { return "Native TUN settings or descriptor custody remains uncertain" }
+        nativeTun = TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>()
+        return nil
+    }
     func clearDNSCache() {
         guard settingsOperation.try() else {
             provider.cancelTunnelWithError(tunnelError("DNS settings change could not be accepted while another settings operation is active")); return
         }
         defer { settingsOperation.unlock() }
+        guard !nativeTun.blocksSettingsChanges else {
+            provider.cancelTunnelWithError(tunnelError("Native TUN transaction holds the DNS settings lease")); return
+        }
         let token = provider.settingsGeneration()
         stateLock.lock(); let settings = self.settings; let reset = settingsReset; stateLock.unlock()
         guard let settings else { return }
@@ -223,6 +255,9 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
     func serviceStop() throws { provider.cancelTunnelWithError(nil) }
     func serviceReload() throws { try provider.enqueueReload() }
     func getSystemProxyStatus() throws -> LibboxSystemProxyStatus {
+        guard nativeTun.settingsArePublished, provider.acceptsSettings(provider.settingsGeneration()) else {
+            throw tunnelError("Tunnel proxy settings are not published by the current owner")
+        }
         stateLock.lock(); defer { stateLock.unlock() }
         let status = LibboxSystemProxyStatus()
         status.available = settings?.proxySettings?.httpServer != nil
@@ -232,6 +267,7 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
     func setSystemProxyEnabled(_ enabled: Bool) throws {
         guard settingsOperation.try() else { throw tunnelError("Another tunnel settings operation is already active") }
         defer { settingsOperation.unlock() }
+        guard !nativeTun.blocksSettingsChanges else { throw tunnelError("Native TUN transaction holds the proxy settings lease") }
         let token = provider.settingsGeneration()
         stateLock.lock(); let settings = self.settings; let reset = settingsReset; stateLock.unlock()
         guard let settings, let retainedProxy = settings.proxySettings else { throw tunnelError("Tunnel HTTP proxy is unavailable") }
@@ -273,3 +309,84 @@ private func strings(_ iterator: LibboxStringIteratorProtocol?) -> [String] {
     while iterator?.hasNext() == true { result.append(iterator?.next() ?? "") }
     return result
 }
+
+
+#if POLARIS_NATIVE_TUN_V1
+// Defined only when the selected framework's actual generated header exposes
+// the complete V1 protocol. Old pinned headers compile the legacy path above.
+extension TunnelPlatform: LibboxRuntimeTunPlatformProtocol {
+    func runtimeTunVersion() -> Int32 { 1 }
+
+    func newTunSession(_ options: LibboxTunOptionsProtocol?, previous: LibboxRuntimeTunSessionProtocol?,
+                       receipt: LibboxRuntimeTunReceipt?) throws -> LibboxRuntimeTunSessionProtocol {
+        guard let options, let receipt else { throw tunnelError("Native TUN receipt or options are absent") }
+        let suppliedOwnerID: String? = receipt.ownerID()
+        guard let ownerID = suppliedOwnerID, !ownerID.isEmpty else { throw tunnelError("Native TUN receipt identity is absent") }
+        guard settingsOperation.try() else { throw tunnelError("Tunnel settings operation is already active") }
+        defer { settingsOperation.unlock() }
+        let token = provider.settingsGeneration()
+        guard provider.acceptsSettings(token) else { throw tunnelError("Native TUN provider was revoked") }
+        let old = previous as? TunnelNativeTunSession
+        guard previous == nil || (old != nil && old!.platform === self && old!.owner === nativeTun) else {
+            throw tunnelError("Native TUN previous session belongs to another provider")
+        }
+        let network = try networkSettings(options)
+        stateLock.lock(); let snapshot = old == nil ? nil : settings; stateLock.unlock()
+        let state = try nativeTun.allocate(ownerID, token: token, network: network, snapshot: snapshot,
+                                          previous: old?.state, published: { receipt.published() })
+        return TunnelNativeTunSession(platform: self, owner: nativeTun, state: state, receipt: receipt)
+    }
+
+    fileprivate func nativeTunApply(_ network: NEPacketTunnelNetworkSettings?, token: UInt64) throws {
+        guard settingsOperation.try() else { throw tunnelError("Another tunnel settings operation is active") }
+        defer { settingsOperation.unlock() }
+        try apply(network, token: token)
+    }
+    fileprivate func nativeTunCache(_ network: NEPacketTunnelNetworkSettings?) {
+        stateLock.lock(); settings = network; stateLock.unlock()
+    }
+    fileprivate func nativeTunAcquireFile() throws -> TunnelNativeTunFile {
+        let original = LibboxGetTunnelFileDescriptor()
+        guard original >= 0 else { throw tunnelError("Provider utun descriptor is unavailable") }
+        let custody = Darwin.dup(original)
+        guard custody >= 0 else { throw tunnelError("Could not retain native utun descriptor custody") }
+        // The held duplicate pins this exact socket's lifetime. The fd integer
+        // never serves as a provider, operation, settings or receipt identity.
+        return TunnelNativeTunFile(custody, check: {
+            guard Darwin.fcntl(custody, F_GETFD) >= 0 else { throw tunnelError("Native utun custody was lost") }
+        }, dispose: {
+            guard Darwin.close(custody) == 0 else { throw tunnelError("Native utun custody close is unconfirmed") }
+        })
+    }
+}
+
+private final class TunnelNativeTunSession: NSObject, LibboxRuntimeTunSessionProtocol {
+    fileprivate let platform: TunnelPlatform
+    fileprivate let owner: TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>
+    fileprivate let state: TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>.Session
+    private let receipt: LibboxRuntimeTunReceipt
+    private let provider: PacketTunnelProvider // Exact original provider lives as long as this session.
+    init(platform: TunnelPlatform, owner: TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>,
+         state: TunnelNativeTunOwner<NEPacketTunnelNetworkSettings>.Session, receipt: LibboxRuntimeTunReceipt) {
+        self.platform = platform; self.owner = owner; self.state = state; self.receipt = receipt
+        self.provider = platform.provider
+    }
+    func ownerID() -> String { state.ownerID }
+    func prepare() throws {
+        try owner.prepare(state, accepts: provider.acceptsSettings,
+                          apply: platform.nativeTunApply, acquire: platform.nativeTunAcquireFile,
+                          cache: platform.nativeTunCache)
+    }
+    func fileDescriptor() -> Int32 { owner.descriptor(state, accepts: provider.acceptsSettings) }
+    func validate() throws { try owner.validate(state, accepts: provider.acceptsSettings) }
+    func abort() throws {
+        try owner.abort(state, accepts: provider.acceptsSettings,
+                        apply: platform.nativeTunApply, acquire: platform.nativeTunAcquireFile,
+                        cache: platform.nativeTunCache)
+    }
+    func retire() throws {
+        try owner.retire(state, accepts: provider.acceptsSettings,
+                         apply: platform.nativeTunApply, cache: platform.nativeTunCache)
+    }
+}
+#endif

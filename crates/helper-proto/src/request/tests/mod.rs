@@ -351,3 +351,32 @@ fn command_name_mapping() {
         "default-restore"
     );
 }
+
+#[test]
+fn checked_dns_commands_have_closed_distinct_argument_frames() {
+    assert_eq!(
+        Request::LinuxDnsSnapshot.command_name(),
+        crate::command::linux::RESOLVED_DNS_SNAPSHOT
+    );
+    assert!(Request::LinuxDnsSnapshot.args_lines().is_empty());
+    let payload = r#"{"expected":{"pid":77},"enabled":false}"#.to_owned();
+    let request = Request::LinuxDnsCompare {
+        payload: payload.clone(),
+    };
+    assert_eq!(
+        request.command_name(),
+        crate::command::linux::RESOLVED_DNS_COMPARE
+    );
+    assert_eq!(request.args_lines(), vec![payload.clone()]);
+    assert_eq!(
+        String::from_utf8(crate::codec::encode(crate::Platform::Linux, "", &request)).unwrap(),
+        format!("resolved-dns-compare-v1\n{payload}\n")
+    );
+    assert_ne!(
+        request.command_name(),
+        Request::LinuxDnsRevert {
+            interface_name: crate::linux_dns::TUN_INTERFACE_NAME.into()
+        }
+        .command_name()
+    );
+}

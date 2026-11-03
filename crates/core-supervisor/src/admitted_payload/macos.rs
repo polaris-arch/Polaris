@@ -631,6 +631,8 @@ pub(super) fn configure_main_command(
         .arg("run")
         .arg("-c")
         .arg(config)
+        .arg("-D")
+        .arg(working_directory)
         .current_dir(working_directory)
         .stdin(std::process::Stdio::null());
     if pipe {

@@ -20,6 +20,7 @@ fn spawn_request_carries_all_fields() {
         birth: None,
         binary: PathBuf::from("/core/sing-box"),
         config: PathBuf::from("/tmp/c.json"),
+        runtime_directory: None,
         log: Some(PathBuf::from("/tmp/l.log")),
         fwd: true,
         parent_pid: Some(999),
@@ -29,6 +30,7 @@ fn spawn_request_carries_all_fields() {
     };
     assert_eq!(r.binary, PathBuf::from("/core/sing-box"));
     assert_eq!(r.config, PathBuf::from("/tmp/c.json"));
+    assert!(r.runtime_directory.is_none());
     assert!(r.fwd);
     assert_eq!(r.parent_pid, Some(999));
     assert_eq!(r.uid, 1000);

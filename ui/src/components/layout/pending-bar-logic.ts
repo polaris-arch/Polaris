@@ -101,6 +101,9 @@ export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: P
       return { phase: 'idle', toast: { kind: 'info', key: 'home.pendingHotApplied' } };
     case 'hotDurabilityPending':
       return { phase: 'durabilityPending', toast: null };
+    case 'hostEffectsPending':
+    case 'hostEffectsFailed':
+      return { phase: 'idle', toast: null };
     case 'restartRequired':
       return { phase: 'idle', toast: null };
     case 'conflict':
@@ -149,6 +152,23 @@ export function isRestartFailureCode(code: string | undefined): boolean {
 }
 
 /** 条里由「这一次 apply」驱动的那部分状态（`phase` + 失败原因）。 */
+export interface RuntimeCoreRecovery {
+  transactionId: string;
+  runtimeGeneration: number;
+  /** Undefined until the original Core endpoint supplies its own intent; never copied from a HostOnly receipt. */
+  selectionIntentGeneration?: number;
+}
+
+export interface HostApplyState {
+  executionId: string;
+  runtimeGeneration: number;
+  selectionIntentGeneration: number;
+  phase: 'pending' | 'failed' | 'settled';
+  effects?: PendingApplyResult['hostEffects'];
+  coreState?: PendingApplyResult['coreState'];
+  superseded?: boolean;
+}
+
 export interface ApplyState {
   phase: ApplyPhase;
   applyId?: number;
@@ -157,11 +177,98 @@ export interface ApplyState {
   transactionId?: string;
   /** Preserve persistence-only recovery across ambiguous/failed replies. */
   persistenceOnly?: boolean;
+  /** Core persistence and host acceptance have separate original owners. */
+  coreRecovery?: RuntimeCoreRecovery;
+  configurationDurable?: boolean;
+  host?: HostApplyState;
+  hostReconciling?: boolean;
+  persistenceRetrying?: boolean;
   /** Confirmed regeneration supersession ends this original recovery, not durability. */
   persistenceRecoveryEnded?: boolean;
   mainGeneration?: number;
   /** 只在 `failed` 时有意义。 */
   reason: string | null;
+}
+
+
+/** Exiting an obsolete Core recovery never discards outstanding host acceptance. */
+export function dismissApplyState(current: ApplyState): ApplyState {
+  if (!current.host || current.host.phase === 'settled') return { phase: 'idle', reason: null };
+  if (current.persistenceRecoveryEnded) return { ...current, phase: 'idle', reason: null,
+    coreRecovery: undefined, transactionId: undefined, persistenceOnly: false,
+    reconciling: false, persistenceRecoveryEnded: false };
+  return { ...current, phase: current.coreRecovery ? 'durabilityPending' : 'idle', reason: null };
+}
+
+export function hostEffectsAccepted(effects: PendingApplyResult['hostEffects']): boolean {
+  return effects !== undefined && effects.length > 0
+    && effects.every(effect => effect.cleanupPending === false && (effect.outcome === 'applied' || effect.outcome === 'unchanged'));
+}
+
+export function hostRetryAvailable(host: HostApplyState | undefined): boolean {
+  return host?.phase === 'failed' && (host.superseded === true
+    || (host.effects !== undefined && host.effects.length > 0 && host.effects.every(effect =>
+      effect.cleanupPending === false && (effect.outcome === 'applied' || effect.outcome === 'unchanged' || effect.retryable))));
+}
+
+/** Fold a receipt without borrowing success from the other ledger. */
+export function applyReceiptState(
+  current: ApplyState,
+  result: { status: ApplyStatus | null | undefined } & Pick<PendingApplyResult, 'transactionId' | 'persistenceTransactionId' | 'hostExecutionId' | 'hostEffects'
+    | 'runtimeGeneration' | 'selectionIntentGeneration' | 'coreState' | 'configurationDurable' | 'retirementState'>,
+  allowNewHost = false,
+): ApplyState {
+  const next = { ...current };
+  const generation = result.runtimeGeneration;
+  const intent = result.selectionIntentGeneration;
+  const ownerKnown = Number.isSafeInteger(generation) && (generation ?? 0) > 0
+    && Number.isSafeInteger(intent) && (intent ?? -1) >= 0;
+  const persistenceId = result.persistenceTransactionId ?? result.transactionId;
+  const publishedNewCore = allowNewHost && !!result.transactionId && ownerKnown && result.coreState === 'committed'
+    && ['hotApplied', 'hostEffectsPending', 'hostEffectsFailed'].includes(result.status ?? '');
+  if (publishedNewCore || result.transactionId !== undefined
+      && result.transactionId === current.coreRecovery?.transactionId) next.transactionId = result.transactionId;
+  if (result.configurationDurable === true
+      && (!current.coreRecovery || persistenceId === current.coreRecovery.transactionId || publishedNewCore)) {
+    next.configurationDurable = true;
+    next.coreRecovery = undefined;
+    next.reconciling = false;
+    if (next.phase === 'durabilityPending') next.phase = 'idle';
+  } else if (persistenceId && ownerKnown
+      && (result.status === 'hotDurabilityPending' || result.configurationDurable === false)
+      && !(current.configurationDurable === true && current.transactionId === persistenceId)
+      && (!current.coreRecovery || current.coreRecovery.transactionId === persistenceId || result.transactionId === persistenceId)) {
+    next.configurationDurable = false;
+    if (result.transactionId) next.transactionId = result.transactionId;
+    next.coreRecovery = current.coreRecovery?.transactionId === persistenceId ? current.coreRecovery
+      : { transactionId: persistenceId, runtimeGeneration: generation!,
+        ...(result.transactionId === persistenceId ? { selectionIntentGeneration: intent! } : {}) };
+    next.phase = 'durabilityPending';
+    next.persistenceOnly = true;
+    next.reconciling = true;
+  }
+  if (result.hostExecutionId && ownerKnown
+      && (allowNewHost || !current.host || (current.host.executionId === result.hostExecutionId
+        && current.host.runtimeGeneration === generation && current.host.selectionIntentGeneration === intent))) {
+    const same = current.host?.executionId === result.hostExecutionId
+      && current.host.runtimeGeneration === generation && current.host.selectionIntentGeneration === intent;
+    const settled = hostEffectsAccepted(result.hostEffects)
+      && (result.status === 'hotApplied' || result.status === 'hotDurabilityPending');
+    const phase = settled ? 'settled' : ['hostEffectsFailed', 'conflict', 'rejected', 'skipped', 'cancelled'].includes(result.status ?? '') ? 'failed'
+      : result.status === 'hostEffectsPending' || result.status === 'unconfirmed' ? 'pending'
+        : !same && (result.status === 'hotApplied' || result.status === 'hotDurabilityPending') ? 'failed' : undefined;
+    if (phase && !(same && (current.host?.phase === 'settled'
+        || current.host?.phase === 'failed' && phase === 'pending'))) {
+      next.host = {
+        executionId: result.hostExecutionId, runtimeGeneration: generation!, selectionIntentGeneration: intent!,
+        phase, effects: result.hostEffects ?? (same ? current.host?.effects : undefined),
+        coreState: result.coreState ?? (same ? current.host?.coreState : undefined),
+      };
+      next.hostReconciling = phase === 'pending';
+    }
+  }
+  if (next.coreRecovery && next.phase === 'idle') next.phase = 'durabilityPending';
+  return next;
 }
 
 /** Only an attributed terminal event may conclude this Apply request. */
@@ -202,7 +309,7 @@ export type StagedPhase = 'clean' | 'staged' | 'saving' | 'saveFailed';
 /** 维度 B：pending（磁盘 vs 运行核）。 */
 export type PendingPhase = 'none' | 'pending' | 'applying' | 'applyFailed' | 'durabilityPending';
 
-export type BarActionId = 'reset' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave' | 'retryPersistence';
+export type BarActionId = 'reset' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave' | 'retryPersistence' | 'retryHost' | 'checkHost';
 
 /** `disabled` 与「不出现」是两回事：表里的「禁用」要求按钮仍在位（否则条会在重启期间抖一下）。 */
 export interface BarAction {
@@ -239,8 +346,12 @@ export interface BarInput {
    * 「保存」不受影响 —— 落盘在两种运行态下语义完全相同。
    */
   coreRunning: boolean;
+  coreGeneration?: number;
   /** Exact original receipt is available for an explicit persistence-only retry. */
   persistenceRetryAvailable?: boolean;
+  persistenceRetrying?: boolean;
+  persistenceOwnerPending?: boolean;
+  host?: HostApplyState;
   persistenceOnly?: boolean;
   /** Confirmed regeneration supersession ends this original recovery, not durability. */
   persistenceRecoveryEnded?: boolean;
@@ -273,7 +384,7 @@ export function composeBarView(input: BarInput): BarView {
 
   /** 核没在跑 ⇒ 抹掉全部「重启核」类动作（见 `BarInput.coreRunning`）。收在一处，别逐格判。 */
   const gateApply = (actions: BarAction[]): BarAction[] =>
-    coreRunning ? actions : actions.filter((a) => a.id !== 'apply' && a.id !== 'retryApply' && a.id !== 'retryPersistence');
+    coreRunning ? actions : actions.filter((a) => a.id !== 'apply' && a.id !== 'retryApply' && a.id !== 'retryPersistence' && a.id !== 'retryHost' && a.id !== 'checkHost');
 
   // ── A 的动作生命周期态覆盖整行 B ──
   if (stagedPhase === 'saving') {
@@ -300,10 +411,37 @@ export function composeBarView(input: BarInput): BarView {
     };
   }
 
+
+  if (input.host && input.host.phase !== 'settled') {
+    const host = input.host;
+    const waiting = host.phase === 'pending' && !host.superseded;
+    const coreCommitted = host.coreState === 'committed' && !host.superseded
+      && coreRunning && input.coreGeneration === host.runtimeGeneration;
+    const persistence = input.persistenceRetryAvailable && input.persistenceRecoveryEnded ? [act('dismissApply', pendingPhase === 'applying')]
+      : input.persistenceRetryAvailable ? [act('retryPersistence', input.persistenceRetrying === true || input.persistenceOwnerPending === true || pendingPhase === 'applying')] : [];
+    // A scalar pending flag may itself be host debt; only drafts/node diffs identify another candidate here.
+    const newCandidate = stagedCount > 0 || pendingCount > 0;
+    const hostActions = waiting ? [] : newCandidate
+      ? [act('apply', pendingPhase === 'applying')]
+      : hostRetryAvailable(host) ? [act('retryHost', pendingPhase === 'applying')]
+        : [act('checkHost', host.superseded === true || pendingPhase === 'applying')];
+    const drafts = stagedPhase === 'staged' ? [act('reset'), act('save')] : [];
+    return {
+      visible: true, err: !waiting,
+      titleKey: waiting ? coreCommitted ? 'home.pendingHostCoreCommitted' : 'home.pendingHostEffectsPending'
+        : coreCommitted ? 'home.pendingHostCoreCommittedFailed' : 'home.pendingHostEffectsFailed',
+      titleVars: {},
+      detailKey: host.superseded ? 'home.pendingHostSuperseded'
+        : input.persistenceRetryAvailable && !input.persistenceRecoveryEnded ? 'home.pendingHostAndDurabilityPending'
+          : waiting ? 'home.pendingHostWaitDetail' : 'home.pendingHostFailedDetail',
+      actions: gateApply([...drafts, ...persistence, ...hostActions]),
+    };
+  }
+
   // Persistence recovery is a distinct original-transaction action, never Apply.
   if (pendingPhase === 'durabilityPending') {
     return { visible: true, err: false, titleKey: 'home.pendingHotDurabilityPending',
-      titleVars: {}, detailKey: '', actions: input.persistenceRetryAvailable ? gateApply([act('retryPersistence')]) : [] };
+      titleVars: {}, detailKey: '', actions: input.persistenceRetryAvailable ? gateApply([act('retryPersistence', input.persistenceRetrying === true || input.persistenceOwnerPending === true)]) : [] };
   }
 
   const applyFailedTitle: Pick<BarView, 'titleKey' | 'titleVars'> = {
@@ -314,7 +452,7 @@ export function composeBarView(input: BarInput): BarView {
   if (pendingPhase === 'applyFailed' && input.persistenceOnly) {
     return { visible: true, err: true, ...applyFailedTitle, detailKey: '',
       actions: input.persistenceRecoveryEnded ? [act('dismissApply')]
-        : input.persistenceRetryAvailable ? gateApply([act('retryPersistence')]) : [] };
+        : input.persistenceRetryAvailable ? gateApply([act('retryPersistence', input.persistenceOwnerPending === true)]) : [] };
   }
 
   if (stagedPhase === 'clean') {

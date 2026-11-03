@@ -4,6 +4,12 @@ import {
   pendingChangesCount,
   hasPendingWork,
   applyOutcome,
+  applyReceiptState,
+  dismissApplyState,
+  hostEffectsAccepted,
+  hostRetryAvailable,
+  type ApplyState,
+  type HostApplyState,
   runtimePersistenceRecoveryEnded,
   runtimeApplyRejectedKey,
   applyStateOnLifecycle,
@@ -31,6 +37,7 @@ function barInput(over: Partial<BarInput> = {}): BarInput {
     // 既有各格默认「核在跑」——它们量的是 A×B 合成，不是运行态闸门。
     // 闸门本身另有专门的 describe（见文件末「coreRunning 闸门」）。
     coreRunning: true,
+    coreGeneration: 7,
     ...over,
   };
 }
@@ -626,4 +633,265 @@ describe('routed LAN prerequisites remain localized and fail closed', () => {
 it('Vision rejection explains the exact trusted compatibility reason', () => {
   expect(runtimeApplyRejectedKey([{code: 'VISION_TRANSPORT_UNSUPPORTED', path: 'outbounds.vision.transport'}])).toBe('nodes.invalidVisionTransport');
   expect(runtimeApplyRejectedKey([{code: 'VISION_TRANSPORT_UNSUPPORTED', path: 'private.raw'}])).toBe('home.pendingHotRejected');
+});
+
+
+describe('independent host acceptance and Core durability', () => {
+  const effect = { preview: { kind: 'systemProxy' as const, scopeDigest: 'scope', beforeDigest: 'before', targetDigest: 'target' },
+    outcome: 'applied' as const, receiptId: 'physical-receipt', cleanupPending: false, retryable: false, reasonCode: null };
+  const host: HostApplyState = { executionId: 'host-new', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    phase: 'pending', coreState: 'committed' };
+  const core = { transactionId: 'original-core', runtimeGeneration: 7, selectionIntentGeneration: 9 };
+  const state = (): ApplyState => ({ phase: 'durabilityPending', reason: null, transactionId: core.transactionId,
+    configurationDurable: false, coreRecovery: core, persistenceOnly: true, reconciling: true,
+    host: { ...host }, hostReconciling: true });
+  const receipt = { ok: true, status: 'hotApplied' as const, hostExecutionId: host.executionId,
+    runtimeGeneration: 7, selectionIntentGeneration: 9, hostEffects: [effect] };
+
+  it.each(['hostEffectsPending', 'hostEffectsFailed'] as const)('%s never produces an applied toast', status => {
+    expect(applyOutcome(status)).toEqual({ phase: 'idle', toast: null });
+  });
+
+  it('keeps HostOnly debt visible with no configuration diff and no Core transaction', () => {
+    const pending = applyReceiptState({ phase: 'idle', reason: null }, { ...receipt, status: 'hostEffectsPending',
+      hostEffects: undefined, coreState: 'unchanged', configurationDurable: true }, true);
+    expect(pending.transactionId).toBeUndefined();
+    expect(pending.coreRecovery).toBeUndefined();
+    expect(pending.host).toMatchObject({ phase: 'pending', executionId: 'host-new' });
+    const view = composeBarView(barInput({ host: pending.host, pendingCount: 0 }));
+    expect(view.visible).toBe(true);
+    expect(view.titleKey).toBe('home.pendingHostEffectsPending');
+    expect(view.actions).toEqual([]);
+  });
+
+  it('keeps a committed Core and failed host debt separate, offering a fresh review rather than Apply', () => {
+    const failed = applyReceiptState(state(), { ...receipt, status: 'hostEffectsFailed',
+      hostEffects: [{ ...effect, outcome: 'failedRestored', retryable: true }], coreState: 'committed' });
+    const view = composeBarView(barInput({ host: failed.host, persistenceRetryAvailable: true }));
+    expect(view.visible).toBe(true);
+    expect(view.err).toBe(true);
+    expect(view.titleKey).toBe('home.pendingHostCoreCommittedFailed');
+    expect(view.detailKey).toBe('home.pendingHostAndDurabilityPending');
+    expect(view.actions.map(action => action.id)).toEqual(['retryPersistence', 'retryHost']);
+    expect(failed.coreRecovery).toEqual(core);
+    expect(failed.configurationDurable).toBe(false);
+  });
+
+  it.each(['unknown', 'recoveryPending'] as const)('offers status-only inspection while %s cleanup is unresolved', outcome => {
+    const failed: HostApplyState = { ...host, phase: 'failed',
+      effects: [{ ...effect, outcome, cleanupPending: true, retryable: true }] };
+    expect(hostRetryAvailable(failed)).toBe(false);
+    expect(ids({ host: failed })).toEqual(['checkHost']);
+  });
+
+  it('settles host acceptance without consuming the original Core persistence recovery', () => {
+    const accepted = applyReceiptState(state(), receipt);
+    expect(accepted.host?.phase).toBe('settled');
+    expect(accepted.hostReconciling).toBe(false);
+    expect(accepted.coreRecovery).toEqual(core);
+    expect(accepted.phase).toBe('durabilityPending');
+    expect(accepted.configurationDurable).toBe(false);
+  });
+
+  it('settles original Core persistence without clearing failed host effects', () => {
+    const current = { ...state(), host: { ...host, phase: 'failed' as const } };
+    const persisted = applyReceiptState(current, { status: 'hotApplied', transactionId: core.transactionId,
+      runtimeGeneration: 7, selectionIntentGeneration: 9, configurationDurable: true });
+    expect(persisted.coreRecovery).toBeUndefined();
+    expect(persisted.configurationDurable).toBe(true);
+    expect(persisted.host).toEqual(current.host);
+    expect(composeBarView(barInput({ host: persisted.host })).visible).toBe(true);
+  });
+
+  it('does not treat a HostOnly durable flag as persistence evidence for another Core transaction', () => {
+    const next = applyReceiptState(state(), { ...receipt, configurationDurable: true });
+    expect(next.coreRecovery).toEqual(core);
+    expect(next.configurationDurable).toBe(false);
+    expect(next.phase).toBe('durabilityPending');
+    expect(next.host?.phase).toBe('settled');
+  });
+
+  it.each([
+    { hostExecutionId: 'host-old', runtimeGeneration: 7, selectionIntentGeneration: 9 },
+    { hostExecutionId: 'host-new', runtimeGeneration: 6, selectionIntentGeneration: 9 },
+    { hostExecutionId: 'host-new', runtimeGeneration: 7, selectionIntentGeneration: 8 },
+  ])('a late mismatched host owner cannot clear the newer debt: %j', owner => {
+    const current = state();
+    const next = applyReceiptState(current, { ...receipt, ...owner, configurationDurable: true });
+    expect(next.host).toEqual(current.host);
+    expect(next.hostReconciling).toBe(true);
+    expect(next.coreRecovery).toEqual(core);
+    expect(next.configurationDurable).toBe(false);
+  });
+
+  it('accepts a new execution only on the explicit dispatch path and does not regress settled receipts', () => {
+    const current = { ...state(), host: { ...host, phase: 'failed' as const } };
+    const newer = applyReceiptState(current, { ...receipt, hostExecutionId: 'host-next', selectionIntentGeneration: 10 }, true);
+    expect(newer.host).toMatchObject({ executionId: 'host-next', selectionIntentGeneration: 10, phase: 'settled' });
+    const delayed = applyReceiptState(newer, { ...receipt, hostExecutionId: 'host-next',
+      selectionIntentGeneration: 10, status: 'hostEffectsPending', hostEffects: undefined });
+    expect(delayed.host).toEqual(newer.host);
+  });
+
+  it('requires nonempty cleanup-confirmed physical results for host acceptance', () => {
+    expect(hostEffectsAccepted([effect])).toBe(true);
+    expect(hostEffectsAccepted([{ ...effect, outcome: 'unchanged' }])).toBe(true);
+    expect(hostEffectsAccepted([])).toBe(false);
+    expect(hostEffectsAccepted(undefined)).toBe(false);
+    expect(hostEffectsAccepted([{ ...effect, cleanupPending: true }])).toBe(false);
+    expect(hostEffectsAccepted([{ ...effect, cleanupPending: undefined } as unknown as typeof effect])).toBe(false);
+    expect(hostEffectsAccepted([{ ...effect, outcome: 'unknown' }])).toBe(false);
+    expect(hostEffectsAccepted([effect, { ...effect, outcome: 'failedUnchanged' }])).toBe(false);
+  });
+
+  it('does not regress durable Core state when a later host status repeats the older pending durability', () => {
+    const current: ApplyState = { phase: 'idle', reason: null, transactionId: core.transactionId, configurationDurable: true, host };
+    const next = applyReceiptState(current, { ...receipt, transactionId: core.transactionId,
+      status: 'hostEffectsPending', configurationDurable: false, hostEffects: undefined });
+    expect(next.configurationDurable).toBe(true);
+    expect(next.coreRecovery).toBeUndefined();
+    expect(next.phase).toBe('idle');
+    expect(next.host?.phase).toBe('pending');
+  });
+
+  it('keeps draft saving separate and routes a changed candidate through normal explicit Apply', () => {
+    const failed: HostApplyState = { ...host, phase: 'failed',
+      effects: [{ ...effect, outcome: 'failedRestored', retryable: true }] };
+    expect(ids({ host: failed, stagedPhase: 'staged', stagedCount: 1 })).toEqual(['reset', 'save', 'apply']);
+    expect(ids({ host: failed, stagedPhase: 'staged', stagedCount: 1 })).not.toContain('retryHost');
+    expect(ids({ host: failed, pendingPhase: 'pending', pendingCount: 1 })).toEqual(['apply']);
+    expect(ids({ host: failed, pendingPhase: 'pending', pendingCount: 0 })).toEqual(['retryHost']);
+    expect(ids({ host: failed, coreRunning: false })).not.toContain('retryHost');
+    expect(disabledIds({ host: failed, persistenceRetryAvailable: true, persistenceRetrying: true })).toContain('retryPersistence');
+  });
+});
+
+
+describe('host evidence does not borrow activity from another generation', () => {
+  it.each([undefined, 6, 8])('a committed old receipt does not label generation %s as active', coreGeneration => {
+    const view = composeBarView(barInput({ coreGeneration, host: { executionId: 'old', runtimeGeneration: 7,
+      selectionIntentGeneration: 9, phase: 'failed', coreState: 'committed' } }));
+    expect(view.visible).toBe(true);
+    expect(view.titleKey).toBe('home.pendingHostEffectsFailed');
+  });
+  it('retains a host execution observer for an ambiguous HostOnly receipt', () => {
+    const next = applyReceiptState({ phase: 'failed', reason: null }, { status: 'unconfirmed',
+      hostExecutionId: 'host-only', runtimeGeneration: 7, selectionIntentGeneration: 9 }, true);
+    expect(next.host).toMatchObject({ executionId: 'host-only', phase: 'pending' });
+    expect(next.hostReconciling).toBe(true);
+    expect(next.coreRecovery).toBeUndefined();
+  });
+  it('a first host id with no physical acceptance results remains explicit debt even with hotApplied', () => {
+    const next = applyReceiptState({ phase: 'idle', reason: null }, { status: 'hotApplied',
+      hostExecutionId: 'host-only', runtimeGeneration: 7, selectionIntentGeneration: 9,
+      coreState: 'unchanged', configurationDurable: true, hostEffects: [] }, true);
+    expect(next.host).toMatchObject({ executionId: 'host-only', phase: 'failed' });
+    expect(hostRetryAvailable(next.host)).toBe(false);
+    expect(composeBarView(barInput({ host: next.host })).visible).toBe(true);
+  });
+});
+
+
+describe('host retry cannot hide the older Core recovery leg', () => {
+  const core = { transactionId: 'original-core', runtimeGeneration: 7, selectionIntentGeneration: 9 };
+  const effect = { preview: { kind: 'dns' as const, scopeDigest: 'scope', beforeDigest: 'before', targetDigest: 'target' },
+    outcome: 'applied' as const, receiptId: 'physical-receipt', cleanupPending: false, retryable: false, reasonCode: null };
+  it.each([true, false])('foreign-intent HostOnly-shaped metadata with durable=%s cannot consume original Core recovery', configurationDurable => {
+    const current: ApplyState = { phase: 'idle', reason: null, transactionId: core.transactionId,
+      coreRecovery: core, configurationDurable: false, persistenceOnly: true, reconciling: true };
+    const next = applyReceiptState(current, { status: 'hotApplied', hostExecutionId: 'host-next',
+      runtimeGeneration: 7, selectionIntentGeneration: 10, coreState: 'unchanged',
+      configurationDurable, hostEffects: [effect] }, true);
+    expect(next.host?.phase).toBe('settled');
+    expect(next.coreRecovery).toEqual(core);
+    expect(next.configurationDurable).toBe(false);
+    expect(next.phase).toBe('durabilityPending');
+    expect(ids({ host: next.host, pendingPhase: 'durabilityPending', persistenceRetryAvailable: true })).toEqual(['retryPersistence']);
+  });
+  it('allows exiting only a confirmed obsolete Core recovery while retaining the independent host debt', () => {
+    const host: HostApplyState = { executionId: 'host-current', runtimeGeneration: 7,
+      selectionIntentGeneration: 10, phase: 'pending', coreState: 'committed' };
+    expect(ids({ host, persistenceRetryAvailable: true, persistenceRecoveryEnded: true })).toEqual(['dismissApply']);
+    expect(composeBarView(barInput({ host, persistenceRetryAvailable: true, persistenceRecoveryEnded: true })).detailKey)
+      .not.toBe('home.pendingHostAndDurabilityPending');
+  });
+});
+
+
+describe('dismissing only the intended recovery account', () => {
+  it('retains host debt when the original Core owner was superseded', () => {
+    const host: HostApplyState = { executionId: 'host-current', runtimeGeneration: 7,
+      selectionIntentGeneration: 10, phase: 'failed' };
+    const next = dismissApplyState({ phase: 'failed', reason: 'obsolete Core target', host,
+      transactionId: 'old', coreRecovery: { transactionId: 'old', runtimeGeneration: 7, selectionIntentGeneration: 9 },
+      persistenceOnly: true, persistenceRecoveryEnded: true, reconciling: false });
+    expect(next.host).toEqual(host);
+    expect(next.coreRecovery).toBeUndefined();
+    expect(next.transactionId).toBeUndefined();
+    expect(next.persistenceOnly).toBe(false);
+    expect(next.phase).toBe('idle');
+    expect(composeBarView(barInput({ host: next.host })).visible).toBe(true);
+  });
+});
+
+
+describe('HostOnly persistenceTransactionId names the original recovery account', () => {
+  it('does not invent a HostOnly transaction or use the host intent as the original Core intent', () => {
+    const next = applyReceiptState({ phase: 'idle', reason: null }, { status: 'hostEffectsFailed',
+      persistenceTransactionId: 'original-core', hostExecutionId: 'host-only', runtimeGeneration: 7,
+      selectionIntentGeneration: 9, configurationDurable: false, coreState: 'unchanged' }, true);
+    expect(next.transactionId).toBeUndefined();
+    expect(next.coreRecovery).toEqual({ transactionId: 'original-core', runtimeGeneration: 7 });
+    expect(next.phase).toBe('durabilityPending');
+    expect(next.configurationDurable).toBe(false);
+    expect(disabledIds({ host: next.host, persistenceRetryAvailable: true, persistenceOwnerPending: true }))
+      .toContain('retryPersistence');
+  });
+
+  it('preserves an already-known original owner instead of rebasing it from host metadata', () => {
+    const original = { transactionId: 'original-core', runtimeGeneration: 7, selectionIntentGeneration: 4 };
+    const next = applyReceiptState({ phase: 'durabilityPending', reason: null, coreRecovery: original,
+      configurationDurable: false }, { status: 'hostEffectsPending', persistenceTransactionId: 'original-core',
+      hostExecutionId: 'host-only', runtimeGeneration: 7, selectionIntentGeneration: 9, configurationDurable: false }, true);
+    // Conservative parsing of a cross-intent projection is not backend permission for that operation.
+    expect(next.coreRecovery).toEqual(original);
+    expect(next.transactionId).toBeUndefined();
+  });
+
+  it('can update a specifically named original durability account without clearing host failure', () => {
+    const original = { transactionId: 'original-core', runtimeGeneration: 7, selectionIntentGeneration: 9 };
+    const host: HostApplyState = { executionId: 'host-only', runtimeGeneration: 7,
+      selectionIntentGeneration: 9, phase: 'failed' };
+    const next = applyReceiptState({ phase: 'durabilityPending', reason: null,
+      coreRecovery: original, configurationDurable: false, host }, { status: 'hostEffectsFailed',
+      persistenceTransactionId: 'original-core', hostExecutionId: 'host-only',
+      runtimeGeneration: 7, selectionIntentGeneration: 9, configurationDurable: true });
+    expect(next.coreRecovery).toBeUndefined();
+    expect(next.configurationDurable).toBe(true);
+    expect(next.host?.phase).toBe('failed');
+    expect(composeBarView(barInput({ host: next.host })).visible).toBe(true);
+  });
+});
+
+
+describe('a real new Core correction differs from HostOnly durability', () => {
+  const original = { transactionId: 'old-core', runtimeGeneration: 7, selectionIntentGeneration: 9 };
+  it('uses an explicitly committed new Core transaction to replace obsolete recovery after a fresh Plan', () => {
+    const next = applyReceiptState({ phase: 'durabilityPending', reason: null, transactionId: 'old-core',
+      coreRecovery: original, configurationDurable: false }, { status: 'hostEffectsPending',
+      transactionId: 'real-noop-correction', hostExecutionId: 'host-after-correction',
+      runtimeGeneration: 7, selectionIntentGeneration: 10, coreState: 'committed', configurationDurable: true }, true);
+    expect(next.transactionId).toBe('real-noop-correction');
+    expect(next.coreRecovery).toBeUndefined();
+    expect(next.configurationDurable).toBe(true);
+    expect(next.host?.phase).toBe('pending');
+    expect(composeBarView(barInput({ host: next.host })).visible).toBe(true);
+  });
+  it('does not replace original recovery using a HostOnly unchanged Core scope or an unrelated observer', () => {
+    const current: ApplyState = { phase: 'durabilityPending', reason: null, coreRecovery: original, configurationDurable: false };
+    const result = { status: 'hostEffectsPending' as const, transactionId: 'unrelated', hostExecutionId: 'host',
+      runtimeGeneration: 7, selectionIntentGeneration: 10, coreState: 'unchanged' as const, configurationDurable: true };
+    expect(applyReceiptState(current, result, true).coreRecovery).toEqual(original);
+    expect(applyReceiptState(current, { ...result, coreState: 'committed' }, false).coreRecovery).toEqual(original);
+  });
 });

@@ -351,6 +351,7 @@ fn plan_request(value: &Value) -> ProbeResult<d::PlanRuntimeConfigRequest> {
         overrides: None,
         expected_control_revision: number(value, "expectedControlRevision")?,
         selector_intents: intents,
+        client_impact_policy_version: 0,
     })
 }
 fn apply_request(value: &Value) -> ProbeResult<d::ApplyRuntimeConfigRequest> {
@@ -456,6 +457,7 @@ async fn suite(client: &SingBoxApiClient, port: u16, request: &Value) -> ProbeRe
         overrides: None,
         expected_control_revision: before.control_revision,
         selector_intents: vec![],
+        client_impact_policy_version: 0,
     };
     let noop_plan = client
         .plan_runtime_config(original.clone())

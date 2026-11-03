@@ -835,7 +835,32 @@ export interface UserConfig {
   uiTheme?: 'light' | 'dark' | 'system';
 }
 
-/** Receipt-based HOT outcomes and legacy explicitly confirmed restart scheduling. */
+export interface RuntimeImpactPreview {
+  path: string;
+  updateClass: number;
+  reason: string;
+  affectedSessionClasses: string[];
+  reconnectRequired: boolean;
+}
+
+export interface RuntimeHostEffectPreview {
+  kind: 'dns' | 'systemProxy' | 'nativeTunnel';
+  scopeDigest: string;
+  beforeDigest: string;
+  targetDigest: string;
+}
+
+export interface RuntimeHostEffectResult {
+  preview: RuntimeHostEffectPreview;
+  outcome: 'unchanged' | 'applied' | 'failedUnchanged' | 'failedRestored'
+    | 'recoveryPending' | 'unknown' | 'superseded' | 'unsupported';
+  receiptId: string | null;
+  cleanupPending: boolean;
+  retryable: boolean;
+  reasonCode: string | null;
+}
+
+/** Receipt-based HOT outcomes and explicitly bound impact/restart choices. */
 export interface PendingApplyResult {
   persistenceMode?: string;
   transactionId?: string;
@@ -843,9 +868,20 @@ export interface PendingApplyResult {
   selectionIntentGeneration?: number;
   ok: boolean;
   status: 'applied' | 'deferred' | 'skipped' | 'hotApplied' | 'hotDurabilityPending'
-    | 'restartRequired' | 'conflict' | 'rejected' | 'unconfirmed';
+    | 'restartRequired' | 'impactConfirmationRequired' | 'cancelled'
+    | 'hostEffectsPending' | 'hostEffectsFailed'
+    | 'conflict' | 'rejected' | 'unconfirmed';
   applyId?: number | null;
   restartConfirmation?: string;
+  impactConfirmation?: string;
+  coreImpacts?: RuntimeImpactPreview[];
+  hostEffectPreviews?: RuntimeHostEffectPreview[];
+  hostExecutionId?: string;
+  hostEffects?: RuntimeHostEffectResult[];
+  coreState?: 'unchanged' | 'committed';
+  configurationDurable?: boolean;
+  persistenceTransactionId?: string;
+  retirementState?: string;
   reasons?: { code: string; path: string }[];
   pendingApply?: boolean;
   restartRequired?: boolean;

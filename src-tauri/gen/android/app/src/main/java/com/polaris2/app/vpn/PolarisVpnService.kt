@@ -67,8 +67,11 @@ class PolarisVpnService :
     override fun openTun(options: TunOptions): Int = error("android: TUN 回调缺少主核 attempt")
 
     internal fun openTun(attempt: MainKernelAttempt<CommandServer>, options: TunOptions): Int {
-        if (prepare(this) != null) error("android: 缺少 VPN 授权")
+        val settings = captureTunSettings(options)
+        return boxService.installTun(attempt, settings, settings.establish())
+    }
 
+    internal fun captureTunSettings(options: TunOptions): AndroidTunSettings {
         val builder = Builder()
             .setSession(SESSION_NAME)
             .setMtu(options.mtu)
@@ -108,8 +111,10 @@ class PolarisVpnService :
             )
         }
 
-        val pfd = builder.establish() ?: error("android: VPN 未授权或已被撤销")
-        return boxService.installTun(attempt, pfd, scope.snapshot(options.autoRoute))
+        return AndroidTunSettings(scope.snapshot(options.autoRoute)) {
+            if (prepare(this) != null) error("android: 缺少 VPN 授权")
+            builder.establish() ?: error("android: VPN 未授权或已被撤销")
+        }
     }
 
     private class TunScopeCollector {

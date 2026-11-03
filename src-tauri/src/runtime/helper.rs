@@ -1759,6 +1759,7 @@ impl HelperRuntime {
         )?;
         let params = polaris_helper_proto::core_protocol::PinnedStartParams {
             id: id.clone(),
+            runtime_directory: linux_runtime_directory_with_client(&client, &self.dir)?,
             common,
         };
         let req = match self.platform {
@@ -2131,6 +2132,70 @@ impl HelperRuntime {
             }
             Ok(Response::Err(error)) => Err(format!("helper resolved 还原失败：{error}")),
             Err(error) => Err(format!("helper resolved 还原通信失败：{error}")),
+        }
+    }
+
+    /// Read-only native-birth/link snapshot; old helpers fail explicitly.
+    pub fn linux_resolved_snapshot(
+        &self,
+    ) -> Result<polaris_helper_proto::linux_dns::Snapshot, String> {
+        if self.platform != Platform::Linux {
+            return Err("Linux resolved snapshot is unavailable on this platform".into());
+        }
+        match self
+            .build_client()?
+            .send_with_timeout(&Request::LinuxDnsSnapshot, HELPER_LINUX_RESOLVED_TIMEOUT)
+        {
+            Ok(Response::Ok(ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot))))
+                if snapshot.valid() =>
+            {
+                Ok(snapshot)
+            }
+            other => Err(format!("helper resolved snapshot unavailable: {other:?}")),
+        }
+    }
+
+    pub fn linux_resolved_compare(
+        &self,
+        expected: &polaris_helper_proto::linux_dns::Snapshot,
+        enabled: bool,
+    ) -> Result<polaris_helper_proto::linux_dns::Change, String> {
+        use polaris_helper_proto::linux_dns::{Change, CompareRequest};
+        if self.platform != Platform::Linux || !expected.valid() {
+            return Err("Linux checked DNS scope is unavailable or invalid".into());
+        }
+        let payload = serde_json::to_string(&CompareRequest {
+            expected: expected.clone(),
+            enabled,
+        })
+        .map_err(|error| error.to_string())?;
+        match self.build_client()?.send_with_timeout(
+            &Request::LinuxDnsCompare { payload },
+            HELPER_LINUX_RESOLVED_TIMEOUT,
+        ) {
+            Ok(Response::Ok(ResponseKind::LinuxDns(LinuxDns::Changed(snapshot))))
+                if snapshot.valid()
+                    && snapshot.target() == expected.target()
+                    && snapshot.link == expected.link
+                    && snapshot.owned == enabled
+                    && !snapshot.cleanup_pending
+                    && if enabled {
+                        snapshot.settings.controlled()
+                    } else {
+                        expected.original.as_ref() == Some(&snapshot.settings)
+                    } =>
+            {
+                Ok(Change::Changed(snapshot))
+            }
+            Ok(Response::Ok(ResponseKind::LinuxDns(LinuxDns::NoChange))) => Ok(Change::NoChange),
+            Ok(Response::Ok(ResponseKind::LinuxDns(LinuxDns::Gone(proof))))
+                if !enabled && proof.matches(expected) =>
+            {
+                Ok(Change::Gone(proof))
+            }
+            other => Err(format!(
+                "helper resolved checked change unconfirmed: {other:?}"
+            )),
         }
     }
 
@@ -2788,6 +2853,18 @@ impl LinuxResolvedOps for HelperLinuxResolvedOps {
     fn revert(&self) -> Result<(), String> {
         self.0.linux_resolved_revert()
     }
+
+    fn snapshot(&self) -> Result<polaris_helper_proto::linux_dns::Snapshot, String> {
+        self.0.linux_resolved_snapshot()
+    }
+
+    fn compare(
+        &self,
+        expected: &polaris_helper_proto::linux_dns::Snapshot,
+        enabled: bool,
+    ) -> Result<polaris_helper_proto::linux_dns::Change, String> {
+        self.0.linux_resolved_compare(expected, enabled)
+    }
 }
 
 /// POSIX real UID for the App's staged payload and administrator CLI caller.
@@ -2944,4 +3021,29 @@ fn query_core_status(
         }
         _ => Err("HELPER_CORE_MISMATCH: pinned content status unavailable; update helper".into()),
     }
+}
+
+/// Version is only an extension hint. The receiver still authenticates the peer,
+/// verifies directory/config ownership and admits the exact selected executable.
+fn linux_runtime_directory_with_client(
+    client: &HelperClient,
+    directory: &Path,
+) -> Result<Option<String>, String> {
+    if client.platform() != Platform::Linux {
+        return Ok(None);
+    }
+    match client.send_with_timeout(&Request::Version, Duration::from_secs(5)) {
+        Ok(Response::Ok(ResponseKind::Version { proto_version }))
+            if proto_version
+                >= polaris_helper_proto::proto_version::MIN_EXPLICIT_RUNTIME_DIRECTORY => {}
+        _ => return Ok(None),
+    }
+    if !directory.is_absolute() {
+        return Err("runtime state directory must be explicit and absolute".into());
+    }
+    let directory = directory
+        .to_str()
+        .filter(|value| !value.contains(['\0', '\r', '\n']))
+        .ok_or_else(|| "runtime state directory must be valid UTF-8 data".to_owned())?;
+    Ok(Some(directory.to_owned()))
 }

@@ -718,12 +718,17 @@ impl PreparedExecution {
     pub fn spawn_linux_helper_run(
         self,
         config: &Path,
+        runtime_directory: Option<&Path>,
         identity: LinuxHelperIdentity,
         pipe: bool,
         store_lease: &std::fs::File,
         lease_owner: Arc<dyn Send + Sync>,
     ) -> Result<StdCustodiedChild, AdmissionError> {
-        if !self.purpose.is_run() {
+        if self.purpose != ExecPurpose::RunMain
+            || runtime_directory.is_some_and(|directory| {
+                !directory.is_absolute() || directory.to_str().is_none()
+            })
+        {
             return Err(AdmissionError::new(
                 AdmissionErrorKind::UnsupportedCapability,
                 "validation plan cannot authorize Helper Run",
@@ -735,6 +740,9 @@ impl PreparedExecution {
             .arg("-c")
             .arg(config)
             .stdin(std::process::Stdio::null());
+        if let Some(directory) = runtime_directory {
+            command.arg("-D").arg(directory);
+        }
         if let Some(parent) = config.parent() {
             command.current_dir(parent);
         }
@@ -793,6 +801,7 @@ impl PreparedExecution {
             || !self.payload.candidate.root_helper
             || !config.is_absolute()
             || !working_directory.is_absolute()
+            || working_directory.to_str().is_none()
         {
             return Err(AdmissionError::new(
                 AdmissionErrorKind::UnsupportedCapability,

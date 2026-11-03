@@ -49,6 +49,7 @@ internal class MainKernelAttempt<Server>(
     val released = CompletableFuture<Unit>()
     private var tun: Closeable? = null
     private var tunScope: TunScope? = null
+    private var tunScopeProvider: (() -> TunScope?)? = null
     @Volatile private var startAcknowledged = false
 
     fun markConstructionUnknown() {
@@ -79,14 +80,30 @@ internal class MainKernelAttempt<Server>(
     /** The caller also holds BoxService's short state lock. */
     fun installTun(value: Closeable, scope: TunScope): Closeable? = synchronized(this) {
         check(!revoked) { "旧主核已撤销，拒收迟到的 VPN fd" }
+        check(tunScopeProvider == null) { "android: legacy install cannot replace graph-owned TUN custody" }
         val previous = tun
         tun = value
         tunScope = scope
+        tunScopeProvider = null
         previous
     }
 
-    fun currentTunScope(): TunScope? = synchronized(this) {
-        if (revoked || tun == null) null else tunScope
+    /** Bind original-FD custody before any native session can produce a descriptor. */
+    fun bindTunOwner(value: Closeable, scope: () -> TunScope?) = synchronized(this) {
+        check(!revoked && tun == null) { "android: native TUN owner already bound or revoked" }
+        tun = value
+        tunScopeProvider = scope
+    }
+
+    fun currentTunScope(): TunScope? {
+        val snapshot = synchronized(this) {
+            if (revoked || tun == null) return null
+            tunScopeProvider to tunScope
+        }
+        // Do not hold the attempt monitor across a receipt getter/native owner lock.
+        val provider = snapshot.first
+        val result = if (provider == null) snapshot.second else provider()
+        return if (revoked) null else result
     }
 
     /** The detached fd is closed by the Stop job outside BoxService's lock. */
@@ -96,6 +113,7 @@ internal class MainKernelAttempt<Server>(
             val detached = tun
             tun = null
             tunScope = null
+            tunScopeProvider = null
             detached
         }
         // Stop still holds BoxService's short state lock. This fence performs
@@ -216,6 +234,12 @@ internal class MainKernelAttemptLedger {
     fun installTun(attempt: MainKernelAttempt<*>, value: Closeable, scope: TunScope): Closeable? {
         check(owner === attempt) { "旧主核已失去 TUN 所有权" }
         return attempt.installTun(value, scope)
+    }
+
+    @Synchronized
+    fun bindTunOwner(attempt: MainKernelAttempt<*>, value: Closeable, scope: () -> TunScope?) {
+        check(owner === attempt) { "android: native TUN attempt lost registry ownership" }
+        attempt.bindTunOwner(value, scope)
     }
 
     /** No factory was started, so this rejected system intent owns no native server. */

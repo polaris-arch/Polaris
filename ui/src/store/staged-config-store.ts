@@ -237,7 +237,7 @@ export interface StagedConfigState {
   /** 关掉冲突弹窗、不保存（staged 一条不丢）。 */
   dismissConflict: () => void;
   /** Save then request Apply; an explicit restart token confirms the already saved candidate without re-saving. */
-  applyNow: (restartConfirmation?: string) => Promise<ApplyNowResult>;
+  applyNow: (restartConfirmation?: string, impactConfirmation?: string) => Promise<ApplyNowResult>;
   /**
    * 每次拿到磁盘 config 后调用。
    *  - 首次：**无条件恢复**存储里的条目，并连同存储里的 `baseline` 一起恢复（那是「这批编辑
@@ -328,10 +328,24 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
     set({ conflict: null, conflictBaseline: null });
   },
 
-  applyNow: async (restartConfirmation) => {
+  applyNow: async (restartConfirmation, impactConfirmation) => {
     // Confirmation is bound to the already saved candidate. Never save newer drafts here.
-    if (restartConfirmation === undefined && !(await get().save())) return { saved: false, status: null };
-    const r = await api.proxy.applyPendingChanges(restartConfirmation).catch(() => null);
+    if (restartConfirmation !== undefined && impactConfirmation !== undefined) return { saved: false, status: 'conflict' };
+    if (impactConfirmation === undefined) {
+      if (restartConfirmation === undefined && !(await get().save())) return { saved: false, status: null };
+    } else if (get().entries.length > 0) {
+      void api.proxy.cancelRuntimeImpact(impactConfirmation).catch(() => null);
+      return { saved: true, status: 'conflict' };
+    }
+    const entries = get().entries;
+    const version = get().baseVersion;
+    const r = await (impactConfirmation === undefined
+      ? api.proxy.applyPendingChanges(restartConfirmation)
+      : api.proxy.confirmRuntimeImpact(impactConfirmation)).catch(() => null);
+    if (r?.impactConfirmation && (get().entries !== entries || get().baseVersion !== version)) {
+      void api.proxy.cancelRuntimeImpact(r.impactConfirmation).catch(() => null);
+      return { saved: true, status: 'conflict' };
+    }
     return { saved: true, status: r?.status ?? null,
       ...(r?.persistenceMode === undefined ? {} : { persistenceMode: r.persistenceMode }),
       ...(r?.transactionId === undefined ? {} : { transactionId: r.transactionId }),
@@ -339,6 +353,15 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
       ...(r?.selectionIntentGeneration === undefined ? {} : { selectionIntentGeneration: r.selectionIntentGeneration }),
       ...(r?.applyId == null ? {} : { applyId: r.applyId }),
       ...(r?.restartConfirmation === undefined ? {} : { restartConfirmation: r.restartConfirmation }),
+      ...(r?.impactConfirmation === undefined ? {} : { impactConfirmation: r.impactConfirmation }),
+      ...(r?.coreImpacts === undefined ? {} : { coreImpacts: r.coreImpacts }),
+      ...(r?.hostEffectPreviews === undefined ? {} : { hostEffectPreviews: r.hostEffectPreviews }),
+      ...(r?.hostExecutionId === undefined ? {} : { hostExecutionId: r.hostExecutionId }),
+      ...(r?.hostEffects === undefined ? {} : { hostEffects: r.hostEffects }),
+      ...(r?.coreState === undefined ? {} : { coreState: r.coreState }),
+      ...(r?.configurationDurable === undefined ? {} : { configurationDurable: r.configurationDurable }),
+      ...(r?.persistenceTransactionId === undefined ? {} : { persistenceTransactionId: r.persistenceTransactionId }),
+      ...(r?.retirementState === undefined ? {} : { retirementState: r.retirementState }),
       ...(r?.reasons === undefined ? {} : { reasons: r.reasons }),
       ...(r?.pendingApply === undefined ? {} : { pendingApply: r.pendingApply }),
       ...(r?.restartRequired === undefined ? {} : { restartRequired: r.restartRequired }),

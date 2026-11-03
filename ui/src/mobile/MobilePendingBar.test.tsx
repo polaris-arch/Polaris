@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import type { PendingApplyResult } from '@/contracts/types';
 import type { ApplyState } from '@/components/layout/pending-bar-logic';
 import type { FormSheetProps } from './forms/FormSheet';
 
@@ -16,11 +17,20 @@ const h = vi.hoisted(() => ({
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(),
   retryPersistence: vi.fn(),
+  hostRead: vi.fn(),
+  coreRead: vi.fn(),
+  pendingRead: vi.fn(),
+  freshApply: vi.fn(),
+  cancelImpact: vi.fn(),
+  realReconciliation: false,
   lifecycleReady: vi.fn(),
   offLifecycle: vi.fn(),
   app: {
     pendingChanges: { added: ['node-1'], modified: [], removed: [], restartDeferred: false },
-    proxyStatus: { running: true, mainGeneration: 7 },
+    proxyStatus: { running: true, mainGeneration: 7,
+      ownedStopContext: undefined as { selectionIntentGeneration: number } | undefined },
+    config: null as Record<string, unknown> | null,
+    setPendingChanges: vi.fn(),
   },
 }));
 
@@ -50,16 +60,25 @@ vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => k
 vi.mock('@/lib/confirm-twice', () => ({
   useConfirmTwice: () => ({ armed: null, confirmTwice: vi.fn() }),
 }));
-// Poll ownership has separate tests; these cases cover the mobile write/confirmation boundary.
-vi.mock('@/components/layout/use-runtime-apply-reconciliation', () => ({
-  useRuntimeApplyReconciliation: () => undefined,
-}));
+// Existing restart tests isolate observation; host cases exercise the real shared hook and selectors.
+vi.mock('@/components/layout/use-runtime-apply-reconciliation', async (original) => {
+  const actual = await original<typeof import('@/components/layout/use-runtime-apply-reconciliation')>();
+  return { useRuntimeApplyReconciliation: (...args: Parameters<typeof actual.useRuntimeApplyReconciliation>) =>
+    h.realReconciliation ? actual.useRuntimeApplyReconciliation(...args)
+      : { retryPersistence: async () => undefined, checkHost: () => undefined } };
+});
 vi.mock('@/ipc', () => ({ api: { proxy: {
   onLifecycleReady: h.lifecycleReady,
   retryRuntimePersistence: h.retryPersistence,
+  runtimeHostEffectStatus: h.hostRead,
+  runtimeApplyStatus: h.coreRead,
+  getPendingChanges: h.pendingRead,
+  applyPendingChanges: h.freshApply,
+  cancelRuntimeImpact: h.cancelImpact,
   getStatus: vi.fn(),
 } } }));
 vi.mock('@/store/app-store', () => ({
+  normalizePendingChanges: (pending: unknown) => pending,
   useAppStore: Object.assign((selector: (state: typeof h.app) => unknown) => selector(h.app), {
     getState: () => h.app,
   }),
@@ -134,11 +153,18 @@ beforeEach(() => {
   h.states = [];
   h.refs = [];
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
+  h.app.config = null;
   h.app.pendingChanges = { added: ['node-1'], modified: [], removed: [], restartDeferred: false };
-  h.app.proxyStatus = { running: true, mainGeneration: 7 };
+  h.realReconciliation = false;
+  h.app.proxyStatus = { running: true, mainGeneration: 7, ownedStopContext: undefined };
+  h.app.setPendingChanges.mockImplementation((pending) => { h.app.pendingChanges = pending; });
+  h.pendingRead.mockImplementation(async () => h.app.pendingChanges);
+  h.hostRead.mockRejectedValue(new Error('no host status reply'));
+  h.coreRead.mockRejectedValue(new Error('no Core status reply'));
+  h.cancelImpact.mockResolvedValue({ ok: true, status: 'cancelled' });
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
-afterEach(() => { unmount(); vi.restoreAllMocks(); });
+afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('mobile pending restart and write feedback', () => {
   it('uses the mobile sheet and trusted reasons, without applying the restart while opening it', async () => {
@@ -270,5 +296,238 @@ describe('mobile pending restart and write feedback', () => {
     await vi.waitFor(() => expect(h.states[0]).toMatchObject({ phase: 'idle' }));
     expect(h.retryPersistence.mock.calls).toEqual([['same-transaction'], ['same-transaction']]);
     expect(h.applyNow).toHaveBeenCalledExactlyOnceWith(undefined);
+  });
+});
+
+
+describe('mobile independent host effect consumption', () => {
+  const effect = { preview: { kind: 'systemProxy' as const, scopeDigest: 'scope', beforeDigest: 'before', targetDigest: 'target' },
+    outcome: 'applied' as const, receiptId: 'host-receipt', cleanupPending: false, retryable: false, reasonCode: null };
+  const owned = (status: PendingApplyResult['status']): PendingApplyResult => ({
+    ok: true, status, hostExecutionId: 'host-only', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    coreState: 'unchanged', configurationDurable: true,
+  });
+  async function begin(result: PendingApplyResult): Promise<void> {
+    h.realReconciliation = true;
+    h.applyNow.mockResolvedValueOnce({ ...result, saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).host?.executionId).toBe(result.hostExecutionId));
+    h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
+    vi.useFakeTimers();
+    renderBar();
+  }
+  async function microtasks(): Promise<void> {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
+
+  it('keeps HostOnly waiting at D=R, reads only the host selector, and clears only its actual receipt', async () => {
+    await begin(owned('hostEffectsPending'));
+    expect((h.states[0] as ApplyState).transactionId).toBeUndefined();
+    expect(markup(renderBar())).toContain('home.pendingHostEffectsPending');
+    expect(elements(renderBar()).filter(e => e.type === 'button')).toHaveLength(0);
+    h.hostRead.mockResolvedValueOnce({ ...owned('hotApplied'), hostEffects: [effect] });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.hostRead).toHaveBeenCalledExactlyOnceWith('host-only');
+    expect((h.states[0] as ApplyState).host?.phase).toBe('settled');
+    expect(renderBar()).toBeNull();
+    expect(h.coreRead).not.toHaveBeenCalled();
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps failed host debt visible after the original Core persistence retry succeeds', async () => {
+    const failed = { ...effect, outcome: 'failedRestored' as const, retryable: true };
+    await begin({ ...owned('hostEffectsFailed'), transactionId: 'original-core',
+      coreState: 'committed', configurationDurable: false, hostEffects: [failed] });
+    expect(markup(renderBar())).toContain('home.pendingHostAndDurabilityPending');
+    h.retryPersistence.mockResolvedValueOnce({ ...owned('hostEffectsFailed'), transactionId: 'original-core',
+      coreState: 'committed', configurationDurable: true, hostEffects: [failed] });
+    click('home.pendingRetryPersistenceBtn');
+    await microtasks();
+    expect(h.retryPersistence).toHaveBeenCalledExactlyOnceWith('original-core');
+    expect((h.states[0] as ApplyState).coreRecovery).toBeUndefined();
+    expect((h.states[0] as ApplyState).host?.phase).toBe('failed');
+    expect(markup(renderBar())).toContain('home.pendingHostCoreCommittedFailed');
+    expect(markup(renderBar())).not.toContain('home.pendingRetryPersistenceBtn');
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('reviews a fresh saved candidate and requires its impact confirmation before a host retry', async () => {
+    await begin({ ...owned('hostEffectsFailed'),
+      hostEffects: [{ ...effect, outcome: 'failedRestored', retryable: true }] });
+    h.freshApply.mockResolvedValueOnce({ ok: false, status: 'impactConfirmationRequired', runtimeGeneration: 7,
+      impactConfirmation: 'fresh-host-plan', coreImpacts: [], hostEffectPreviews: [effect.preview] });
+    click('home.pendingRetryHostBtn');
+    await microtasks();
+    expect(h.freshApply).toHaveBeenCalledExactlyOnceWith();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.states[2]).toMatchObject({ token: 'fresh-host-plan', hostEffects: [effect.preview] });
+    const sheet = restartSheet();
+    expect(sheet.props.submitLabel).toBe('home.impactApplyConfirm');
+    h.applyNow.mockResolvedValueOnce({ saved: true, ...owned('hostEffectsPending'), hostExecutionId: 'host-next' });
+    sheet.props.onSubmit!();
+    await microtasks();
+    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'fresh-host-plan');
+    expect((h.states[0] as ApplyState).host).toMatchObject({ executionId: 'host-next', phase: 'pending' });
+    expect(h.freshApply).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['stop', 'generation', 'intent', 'execution'] as const)('a late host result cannot clear the debt after %s changes', async route => {
+    await begin(owned('hostEffectsPending'));
+    let finish!: (result: PendingApplyResult) => void;
+    h.hostRead.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.hostRead).toHaveBeenCalledTimes(1);
+    if (route === 'stop') {
+      const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
+      listener({ kind: 'stop', phase: 'stopped', terminal: true, mainGeneration: 8 });
+    } else if (route === 'generation') {
+      h.app.proxyStatus = { running: true, mainGeneration: 8, ownedStopContext: undefined };
+    } else if (route === 'intent') {
+      h.app.proxyStatus = { running: true, mainGeneration: 7, ownedStopContext: { selectionIntentGeneration: 10 } };
+    } else {
+      const current = h.states[0] as ApplyState;
+      h.states[0] = { ...current, host: { ...current.host!, executionId: 'host-newer' } };
+    }
+    renderBar();
+    finish({ ...owned('hotApplied'), hostEffects: [effect] });
+    await microtasks();
+    renderBar();
+    expect((h.states[0] as ApplyState).host?.phase).not.toBe('settled');
+    if (route === 'execution') expect((h.states[0] as ApplyState).host?.executionId).toBe('host-newer');
+    else expect((h.states[0] as ApplyState).host?.superseded).toBe(true);
+    expect(markup(renderBar())).toContain('home.pendingHost');
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
+describe('host review owns its saved candidate and explicit Stop boundary', () => {
+  it('cancels a fresh impact offer when the saved candidate changes during the request', async () => {
+    await begin({ ...owned('hostEffectsFailed'),
+      hostEffects: [{ ...effect, outcome: 'failedRestored', retryable: true }] });
+    let finish!: (result: PendingApplyResult) => void;
+    h.freshApply.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    click('home.pendingRetryHostBtn');
+    await microtasks();
+    expect(h.freshApply).toHaveBeenCalledTimes(1);
+    h.app.config = { savedVersion: 'changed-during-plan' };
+    finish({ ok: false, status: 'impactConfirmationRequired', impactConfirmation: 'obsolete-offer',
+      runtimeGeneration: 7, coreImpacts: [], hostEffectPreviews: [effect.preview] });
+    await microtasks();
+    expect(h.cancelImpact).toHaveBeenCalledExactlyOnceWith('obsolete-offer');
+    expect(h.states[2]).toBeNull();
+    expect((h.states[0] as ApplyState).host?.phase).not.toBe('settled');
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+  });
+
+  it('does not issue the fresh Plan request after an attributed Stop already cancelled the caller', async () => {
+    await begin({ ...owned('hostEffectsFailed'),
+      hostEffects: [{ ...effect, outcome: 'failedRestored', retryable: true }] });
+    click('home.pendingRetryHostBtn');
+    const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
+    listener({ kind: 'stop', phase: 'stopped', terminal: true, mainGeneration: 8 });
+    await microtasks();
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect((h.states[0] as ApplyState).host?.phase).not.toBe('settled');
+  });
+});
+
+
+describe('mobile HostOnly original persistence account', () => {
+  it('discovers the original Core owner before retrying and never sends the host id to a Core endpoint', async () => {
+    await begin({ ...owned('hostEffectsFailed'), persistenceTransactionId: 'original-core',
+      configurationDurable: false, hostEffects: [{ ...effect, outcome: 'failedRestored', retryable: true }] });
+    expect((h.states[0] as ApplyState).transactionId).toBeUndefined();
+    expect((h.states[0] as ApplyState).coreRecovery?.selectionIntentGeneration).toBeUndefined();
+    const retry = elements(renderBar()).find(e => e.type === 'button' && e.props.children === 'home.pendingRetryPersistenceBtn');
+    expect(retry?.props.disabled).toBe(true);
+    h.coreRead.mockResolvedValueOnce({ ok: true, status: 'hotDurabilityPending', transactionId: 'original-core',
+      runtimeGeneration: 7, selectionIntentGeneration: 9, configurationDurable: false });
+    await vi.advanceTimersByTimeAsync(2000);
+    renderBar();
+    expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('original-core');
+    expect((h.states[0] as ApplyState).coreRecovery).toEqual({ transactionId: 'original-core',
+      runtimeGeneration: 7, selectionIntentGeneration: 9 });
+    h.retryPersistence.mockResolvedValueOnce({ ok: true, status: 'hotApplied', transactionId: 'original-core',
+      runtimeGeneration: 7, selectionIntentGeneration: 9, configurationDurable: true });
+    click('home.pendingRetryPersistenceBtn');
+    await microtasks();
+    expect(h.retryPersistence).toHaveBeenCalledExactlyOnceWith('original-core');
+    expect((h.states[0] as ApplyState).coreRecovery).toBeUndefined();
+    expect((h.states[0] as ApplyState).host).toMatchObject({ executionId: 'host-only', phase: 'failed' });
+    expect(markup(renderBar())).toContain('home.pendingHostEffectsFailed');
+    expect(h.hostRead).not.toHaveBeenCalled();
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+});
+
+});
+
+
+describe('mobile impact consent disclosure', () => {
+  async function offer(classes: string[], updateClass = 2) {
+    h.applyNow.mockResolvedValueOnce({ saved: true, ok: false, status: 'impactConfirmationRequired',
+      impactConfirmation: 'private-impact-token', runtimeGeneration: 7, coreImpacts: [{
+        path: 'private-impact-path', reason: 'private-impact-reason', updateClass,
+        reconnectRequired: true, affectedSessionClasses: classes,
+      }] });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect(h.states[2]).toMatchObject({ token: 'private-impact-token' }));
+    return restartSheet();
+  }
+
+  it.each([
+    { name: 'TUN', classes: ['existing TUN TCP flows', 'existing TUN UDP associations', 'changed ingress admissions'],
+      expected: ['home.impactApplyTunTcpReset', 'home.impactApplyTunUdpReset', 'home.impactApplyTunRollback'], absent: 'home.impactApplyApiStreams' },
+    { name: 'API/dashboard', classes: ['API streams on the replaced ingress', 'api_generation_handoff_v1', 'dashboard updater'],
+      expected: ['home.impactApplyApiStreams', 'home.impactApplyDashboard'], absent: 'home.impactApplyTunRollback' },
+    { name: 'listener/UDP', classes: ['changed ingress admissions', 'affected UDP associations', 'dependent listener handoff'],
+      expected: ['home.impactApplyListenerAdmissions', 'home.impactApplyListenerUdp', 'home.impactApplyListenerHandoff'], absent: 'home.impactApplyTunRollback' },
+  ])('discloses $name in the existing sheet before confirming its opaque token', async ({ classes, expected, absent }) => {
+    const sheet = await offer(classes);
+    expect(sheet.props.submitDisabled).toBe(false);
+    const html = markup(sheet);
+    for (const key of expected) expect(html).toContain(key);
+    expect(html).not.toContain(absent);
+    expect(html).toContain('home.impactApplySavedPending');
+    for (const raw of ['private-impact-token', 'private-impact-path', 'private-impact-reason', 'api_generation_handoff_v1']) expect(html).not.toContain(raw);
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    h.applyNow.mockResolvedValueOnce({ saved: true, ok: true, status: 'hotApplied', configurationDurable: true });
+    sheet.props.onSubmit!();
+    await microtasks();
+    expect(h.applyNow).toHaveBeenNthCalledWith(2, undefined, 'private-impact-token');
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { classes: ['private-session-never-render'], updateClass: 2 },
+    ...[0, 4, 5, 99].map(updateClass => ({ classes: ['API streams on the replaced ingress'], updateClass })),
+  ])('blocks unknown risk, including direct submit, while cancel keeps the pending changes: %j', async ({ classes, updateClass }) => {
+    const sheet = await offer(classes, updateClass);
+    const html = markup(sheet);
+    expect(sheet.props.submitDisabled).toBe(true);
+    expect(html).toContain('role="alert"');
+    expect(html).toContain('home.impactApplyUnknown');
+    expect(html).toContain('home.impactApplySavedPending');
+    for (const raw of ['private-impact-token', 'private-impact-path', 'private-impact-reason', 'private-session-never-render']) expect(html).not.toContain(raw);
+    sheet.props.onSubmit!();
+    await microtasks();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.states[2]).toMatchObject({ token: 'private-impact-token' });
+    sheet.props.onRequestClose();
+    expect(h.cancelImpact).toHaveBeenCalledExactlyOnceWith('private-impact-token');
+    expect(h.app.pendingChanges.added).toEqual(['node-1']);
+    expect(h.app.proxyStatus.mainGeneration).toBe(7);
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.retryPersistence).not.toHaveBeenCalled();
   });
 });

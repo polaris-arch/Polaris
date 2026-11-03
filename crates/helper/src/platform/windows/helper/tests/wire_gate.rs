@@ -40,10 +40,12 @@ request_samples! {
     CancelHelperUpgrade => Request::CancelHelperUpgrade,
     CoreStatus => Request::CoreStatus { id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap() },
     LinuxStartPinned => Request::LinuxStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        runtime_directory: None,
         id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
         common: StartParams { cfg: "/home/u/config.json".into(), log: String::new(), fwd: false, parent_pid: None },
     }),
     NativeStartPinned => Request::NativeStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        runtime_directory: None,
         id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
         common: StartParams { cfg: r"C:\Users\polaris\config\config.json".into(), log: String::new(), fwd: false, parent_pid: None },
     }),
@@ -104,6 +106,8 @@ request_samples! {
         src_dir: r"C:\Users\polaris\AppData\Roaming\Polaris\retired-upload".to_owned(),
         want_hash: "ab".repeat(32),
     }),
+    LinuxDnsSnapshot => Request::LinuxDnsSnapshot,
+    LinuxDnsCompare => Request::LinuxDnsCompare { payload: r#"{"enabled":false}"#.into() },
     LinuxDnsSet => Request::LinuxDnsSet(polaris_helper_proto::LinuxDnsSetParams {
         interface_name: "polaris-tun".to_owned(),
         server_ip: "172.19.0.2".to_owned(),

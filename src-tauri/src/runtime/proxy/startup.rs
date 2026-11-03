@@ -1540,6 +1540,23 @@ impl ProxyRuntime {
         // DNS candidates are native core transports; App prestart only plans
         // the node socket's physical interface binding.
         let prestart = std::time::Instant::now();
+        let mut protected_physical_root = if self.helper.platform() == Platform::Linux
+            && user_config
+                .proxy_mode_type
+                .effective_on(self.helper.platform())
+                .is_tun()
+        {
+            match self.network_epoch() {
+                Some(epoch) => {
+                    crate::runtime::route_binding::capture_protected_physical_root(my_gen, epoch)
+                        .await
+                        .ok()
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut runtime_binding_plan = plan_runtime_bindings(&user_config).await;
         let route_binding_ms = prestart.elapsed().as_millis();
         let parallel_prestart_ms = route_binding_ms;
@@ -1562,6 +1579,12 @@ impl ProxyRuntime {
             ready_deadline,
         ) = loop {
             attempt += 1;
+            if attempt > 1 {
+                // A failed native start cannot lend its pre-TUN source to a retry.
+                if let Some(owner) = protected_physical_root.take() {
+                    owner.revoke();
+                }
+            }
             // 轮首让位：退避已可中断，但被唤醒的腿仍会走到这里 —— 在**重新生成配置 / 写盘 / 重解析端口**
             // 之前就退场，别拿已被接管的世代去动共享的 runtime config 文件。这是「省功 + 早退」，
             // **不是**取消的实现（真正的取消在退避与就绪等待的 select 里）：只留这一条、把等待改回裸
@@ -2094,8 +2117,9 @@ impl ProxyRuntime {
                 .map_err(|e| e.to_string())?;
                 // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
                 req.extra_args = vec!["--disable-color".to_string()];
-                // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
-                // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
+                // The admitted RunMain factory also passes this explicit state directory
+                // as Core -D. It is never inferred from config_path or ambient CWD;
+                // temporary login/speedtest requests do not acquire a recovery root.
                 req.working_dir = Some(self.config.dir().to_path_buf());
                 // Reuse the validated file observation; retain it across synchronous
                 // spawn and bind it to the opaque identity returned for that Child.
@@ -2750,6 +2774,32 @@ impl ProxyRuntime {
             Platform::current(),
             captured_tun_interface,
         );
+        if let Some(owner) = protected_physical_root.take() {
+            let sealed_epoch = self.network_epoch();
+            let sealed = if crate::runtime::route_binding::protected_generated_policy_compatible(
+                &singbox_config,
+                &singbox_config,
+            ) {
+                match (
+                    managed_tun_interface
+                        .as_ref()
+                        .and_then(ExitInterfaceId::alias),
+                    sealed_epoch,
+                ) {
+                    (Some(alias), Some(epoch)) => owner.seal(alias, my_gen, epoch).await.is_ok(),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if sealed {
+                if let Some(epoch) = sealed_epoch {
+                    self.attach_protected_physical_root(my_gen, epoch, owner);
+                }
+            } else {
+                owner.revoke();
+            }
+        }
         let pre_ready_fingerprint = runtime_binding_fingerprint.clone();
         if runtime_binding_plan.candidate_count > 0 || !explicit_interfaces.is_empty() {
             if let Some(latest) = self.observe_network_interfaces().await {

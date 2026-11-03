@@ -946,3 +946,136 @@ fn selected_native_status_and_pinned_starts_keep_distinct_canonical_families() {
         );
     }
 }
+
+fn checked_dns_wire_snapshot() -> crate::linux_dns::Snapshot {
+    crate::linux_dns::Snapshot {
+        pid: 77,
+        birth: "01".repeat(16),
+        link: crate::linux_dns::LinkIdentity {
+            ifindex: 8,
+            sysfs_device: 1,
+            sysfs_inode: 80,
+            netns_inode: 9,
+            tun_flags: 1,
+        },
+        settings: crate::linux_dns::Settings {
+            servers: vec![],
+            domains: vec![],
+            default_route: false,
+            dnssec: "no".into(),
+            dns_over_tls: "no".into(),
+        },
+        original: None,
+        owned: false,
+        cleanup_pending: false,
+    }
+}
+
+#[test]
+fn checked_dns_receipts_round_trip_without_legacy_or_reap_aliases() {
+    let before = checked_dns_wire_snapshot();
+    let mut changed = before.clone();
+    changed.original = Some(before.settings.clone());
+    changed.owned = true;
+    changed.settings = crate::linux_dns::Settings {
+        servers: vec!["8.8.8.8".into()],
+        domains: vec!["~.".into()],
+        default_route: true,
+        dnssec: "no".into(),
+        dns_over_tls: "no".into(),
+    };
+    let gone = crate::linux_dns::Gone {
+        pid: before.pid,
+        birth: before.birth.clone(),
+        link: before.link.clone(),
+    };
+    for value in [
+        LinuxDns::Snapshot(before),
+        LinuxDns::Changed(changed),
+        LinuxDns::Gone(gone),
+        LinuxDns::NoChange,
+    ] {
+        let response = Response::Ok(ResponseKind::LinuxDns(value));
+        let wire = response.to_wire_line();
+        assert_eq!(Response::parse(&wire), response);
+        assert!(!matches!(
+            Response::parse(&wire),
+            Response::Ok(ResponseKind::LinuxBirthStop(_) | ResponseKind::Stop(_))
+        ));
+    }
+}
+
+#[test]
+fn checked_dns_wire_rejects_invalid_birth_link_baseline_unknown_and_duplicate_fields() {
+    let original = serde_json::to_value(checked_dns_wire_snapshot()).unwrap();
+    for mutation in [
+        "birth", "pid", "ifindex", "inode", "netns", "tap", "ip", "domain", "owned", "original",
+        "unknown",
+    ] {
+        let mut value = original.clone();
+        match mutation {
+            "birth" => value["birth"] = serde_json::json!("AA".repeat(16)),
+            "pid" => value["pid"] = serde_json::json!(0),
+            "ifindex" => value["link"]["ifindex"] = serde_json::json!(0),
+            "inode" => value["link"]["sysfsInode"] = serde_json::json!(0),
+            "netns" => value["link"]["netnsInode"] = serde_json::json!(0),
+            "tap" => value["link"]["tunFlags"] = serde_json::json!(2),
+            "ip" => value["settings"]["servers"] = serde_json::json!(["not-an-ip"]),
+            "domain" => value["settings"]["domains"] = serde_json::json!(["bad domain"]),
+            "owned" => value["owned"] = serde_json::json!(true),
+            "original" => {
+                value["original"] = value["settings"].clone();
+                value["original"]["dnssec"] = serde_json::json!("unknown");
+            }
+            _ => value["future"] = serde_json::json!(true),
+        }
+        for token in ["resolved-dns-snapshot-v1", "resolved-dns-changed-v1"] {
+            assert!(
+                matches!(
+                    Response::parse(&format!("OK {token} {value}")),
+                    Response::Ok(ResponseKind::OkRaw { .. })
+                ),
+                "{mutation}"
+            );
+        }
+    }
+    let duplicate = original
+        .to_string()
+        .replacen("\"pid\":77", "\"pid\":77,\"pid\":77", 1);
+    assert_ne!(duplicate, original.to_string());
+    assert!(matches!(
+        Response::parse(&format!("OK resolved-dns-snapshot-v1 {duplicate}")),
+        Response::Ok(ResponseKind::OkRaw { .. })
+    ));
+    for line in [
+        "OK resolved-dns-not-changed-v1 extra",
+        "OK resolved-dns-snapshot-v1",
+        "OK resolved-dns-changed-v1 {}",
+        "OK resolved-dns-gone-v1 {}",
+    ] {
+        assert!(matches!(
+            Response::parse(line),
+            Response::Ok(ResponseKind::OkRaw { .. })
+        ));
+    }
+}
+
+#[test]
+fn checked_dns_debug_does_not_disclose_birth_or_private_resolver_baseline() {
+    let mut snapshot = checked_dns_wire_snapshot();
+    snapshot.settings.servers = vec!["192.168.254.53".into()];
+    snapshot.original = Some(snapshot.settings.clone());
+    snapshot.owned = true;
+    let debug = format!(
+        "{:?}",
+        ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot.clone()))
+    );
+    assert!(!debug.contains(&snapshot.birth));
+    assert!(!debug.contains("192.168.254.53"));
+    let gone = crate::linux_dns::Gone {
+        pid: snapshot.pid,
+        birth: snapshot.birth.clone(),
+        link: snapshot.link,
+    };
+    assert!(!format!("{gone:?}").contains(&snapshot.birth));
+}

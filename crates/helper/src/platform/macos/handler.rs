@@ -504,6 +504,8 @@ pub fn dispatch_from_peer(
         | Request::LinuxStartBirth(_)
         | Request::LinuxStatusBirth
         | Request::LinuxStopBirth { .. }
+        | Request::LinuxDnsSnapshot
+        | Request::LinuxDnsCompare { .. }
         | Request::LinuxDnsSet(_)
         | Request::LinuxDnsRevert { .. }
         | Request::IfaceMetric { .. }

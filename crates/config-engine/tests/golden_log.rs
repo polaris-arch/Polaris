@@ -1,7 +1,7 @@
 //! B1 金样对拍 harness —— log builder。
 //!
 //! 读 fixtures/log.json（TS 导出的 180 cases），逐条用 Rust build_log_config 生成，
-//! 与 TS output 逐字节 diff（serde_json 规范化后字符串比较）。diff = 0 即 TS↔Rust 等价。
+//! 与当前 producer output 逐字节 diff（serde_json 规范化后字符串比较）。SC02保留disabled TUN的host output元数据，原180业务组合全部保留。
 //!
 //! fixture 来源：scripts/export-log-fixtures.mts（内联 Polaris singbox-log-builder.ts 逻辑）。
 //! 这是 B1 对拍脚手架的首条通路；后续 builder（dns/route/outbounds/inbounds/custom-rules）
@@ -73,6 +73,10 @@ fn log_builder_matches_polaris_golden() {
         checked += 1;
     }
 
+    assert_eq!(
+        checked, 180,
+        "original full producer matrix must remain intact"
+    );
     assert!(
         !fixture.cases.is_empty(),
         "fixture 为空——导出器未跑或路径错"

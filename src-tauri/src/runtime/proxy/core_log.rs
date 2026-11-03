@@ -22,17 +22,47 @@ use super::startup::SINGBOX_STARTUP_LOG;
 use super::TUN_ADDRESS_UNAVAILABLE_MSG;
 
 impl ProxyRuntime {
-    /// 用户是否关掉了日志写盘（`disableLogFile`）。**它不只是「不写文件」**：该开关落到生成配置就是
-    /// `log.disabled=true`，而 sing-box 见到它直接返回 `NewNOPFactory()`（`log/log.go`）—— 整个日志
-    /// 工厂变空实现，`SubscribeLog` 也就永久没有任何一帧。核日志 relay 据此决定压根不订阅。
-    ///
-    /// 同 [`crate::runtime::management_api::current_clash_api_secret`] 走 `with_current` 投影而非 `current()`：只要一个布尔，
-    /// 不为它 clone 整份配置。
-    fn log_file_disabled(&self) -> bool {
-        self.config
-            .with_current(|c| c.get("disableLogFile").and_then(Value::as_bool))
+    /// The relay follows applied R, never saved/pending D. A disabled cold
+    /// start retains one owned, quiet SubscribeLog borrower so an in-place
+    /// enable needs neither a new process nor an unrelated API epoch reset.
+    fn core_log_relay_enabled(&self, my_gen: u64) -> bool {
+        if self.gate.generation() != my_gen {
+            return false;
+        }
+        let Ok(baseline) = self.runtime_config_baseline.read() else {
+            return false;
+        };
+        if let Some(baseline) = baseline.as_ref() {
+            return baseline.core_log_relay_enabled(my_gen);
+        }
+        // Publication takes current_config before baseline; never hold this
+        // read guard while entering the legacy current_config fallback.
+        drop(baseline);
+        // Legacy startup without a paired baseline still has a committed
+        // runtime snapshot. Missing/poisoned state is not authority to emit.
+        self.current_config
+            .read()
             .ok()
-            .flatten()
+            .and_then(|config| {
+                config.as_ref().map(|config| {
+                    config.get("disableLogFile").and_then(Value::as_bool) != Some(true)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn core_log_relay_initial_history(&self, my_gen: u64) -> bool {
+        if self.gate.generation() != my_gen {
+            return false;
+        }
+        self.runtime_config_baseline
+            .read()
+            .ok()
+            .map(|baseline| {
+                baseline
+                    .as_ref()
+                    .is_none_or(|baseline| baseline.core_log_relay_initial_history(my_gen))
+            })
             .unwrap_or(false)
     }
 
@@ -71,32 +101,30 @@ impl ProxyRuntime {
     /// 最多 3000 行重放上屏；故一律跳过，代价是断连窗口内的行看不到。**这是有意的取舍**，并在
     /// debug 日志里点名说出跳过了多少行，不静默。
     ///
-    /// # `disableLogFile` 时压根不订阅
+    /// # Disabled startup and hot publication
     ///
-    /// 该开关落到核就是 `log.disabled=true` → `log.New` 直接返回 `NewNOPFactory()`
-    /// （`log/log.go`），其 `AttachPlatformWriter` 是空实现 ⇒ 本流永久空。此时订阅只是白建连接，
-    /// 更糟的是「订阅着却一行没有」与「核真的一句话没说」在外部无从区分。故直接不订阅，并把原因
-    /// **写进日志**（那行本身会进日志页，用户一眼看见为什么这里是空的）——这就是原先挂在
-    /// 「开始诊断采集」按钮上那道护栏的去处：它守的事实没变，只是搬到了机制真正所在的地方。
+    /// The Core stable factory keeps its attached daemon writer even while
+    /// disabled. Keep this existing API-epoch borrower alive: its empty reset
+    /// is real protocol data, not a fabricated log record. Every received
+    /// frame is admitted against committed runtime log policy, including
+    /// helper/TUN where stderr is unavailable. Saved-but-unapplied D cannot
+    /// enable logging. Original epoch cancellation joins the stream before
+    /// the pipe handoff guard resets; API-generation handoff respawns only
+    /// after the old epoch has joined, as before.
     pub(super) fn spawn_core_log_relay(
         self: &Arc<Self>,
         my_gen: u64,
         api_port: u16,
         pipe_handoff: Option<CoreLogHandoff>,
     ) {
-        if self.log_file_disabled() {
-            log::warn!(
-                "「关闭日志写盘」已开启 ⇒ sing-box 侧日志被整体禁用（log.disabled），\
-                 本次运行不会有任何内核日志（实时日志与基于日志的诊断均不可用）。\
-                 要排查内核问题请先在「设置 · 高级」里关掉该开关"
-            );
-            return;
-        }
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
             if let Some(b) = baseline.as_mut().filter(|b| b.generation == my_gen) {
                 b.api_log_handoff = pipe_handoff.clone();
             }
         }
+        // This relay owns the history decision from its original API epoch;
+        // capture it before scheduling, while per-frame emission still reads R.
+        let initial_history = pipe_handoff.is_none() && self.core_log_relay_initial_history(my_gen);
         let me = Arc::clone(self);
         self.spawn_runtime_api_relay(async move {
             let _pipe_reset = ApiLogPipeReset(pipe_handoff.clone());
@@ -113,8 +141,8 @@ impl ProxyRuntime {
             // 世代兜底轮询间隔：`ReconnectingStream` 永不自结束（断开即重连），核安静时也得有机会
             // 醒来查世代 —— 否则核停了但一直没帧时 relay 会泄漏、对死端口无限重连（同 TS STATUS relay）。
             let tick = Duration::from_millis(CRASH_MONITOR_POLL_MS);
-            // 首帧那份历史收不收：无管道（helper 腿）才收，见方法文档。
-            let mut history_pending = pipe_handoff.is_none();
+            // 只有无管道的冷启动才收首次历史；同Core的API换代不能重放。
+            let mut history_pending = initial_history;
             let mut forwarded: u64 = 0;
             // 被本侧筛掉的行数。计它不是为了好看：**「全级别流的常态开销」在此之前无从观测** ——
             // 核恒推 trace 在内的每一帧，用户却常年停在 info，两者之比只能靠猜。退场时把它说出来，
@@ -157,6 +185,12 @@ impl ProxyRuntime {
                         }
                         // 两道闸都**逐帧现读**（隐私模式与日志级别都能在运行期变；起流时定死分别就是
                         // 「开了锁还在漏」和「拨到 debug 却还是看不到」）。
+                        if !me.core_log_relay_enabled(my_gen) {
+                            // Consume the reset boundary while disabled: a later
+                            // reconnect must not replay pre-disable history.
+                            history_pending = false;
+                            continue;
+                        }
                         let floor = core_log_privacy_floor(me.privacy_mode_active());
                         let max = log::max_level();
                         for m in &frame.messages {

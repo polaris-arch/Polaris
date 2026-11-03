@@ -254,6 +254,12 @@ pub enum Request {
     InstallCore(InstallCoreParams),
     /// Linux：`resolved-dns-set <interface> <server-ip>`（proto v1 兼容扩展）。
     LinuxDnsSet(LinuxDnsSetParams),
+    /// Read only the current authenticated helper birth and its fixed TUN link.
+    LinuxDnsSnapshot,
+    /// Strict JSON CompareRequest; no arbitrary interface/DNS setter.
+    LinuxDnsCompare {
+        payload: String,
+    },
     /// Linux：`resolved-dns-revert <interface>`（proto v1 兼容扩展）。
     LinuxDnsRevert {
         interface_name: String,
@@ -318,6 +324,8 @@ impl Request {
             Self::RouteDel(_) => command::common::ROUTE_DEL,
             Self::InstallCore(_) => command::mac::INSTALL_CORE, // linux 同名（command::linux::INSTALL_CORE == "install-core"）
             Self::LinuxDnsSet(_) => command::linux::RESOLVED_DNS_SET,
+            Self::LinuxDnsSnapshot => command::linux::RESOLVED_DNS_SNAPSHOT,
+            Self::LinuxDnsCompare { .. } => command::linux::RESOLVED_DNS_COMPARE,
             Self::LinuxDnsRevert { .. } => command::linux::RESOLVED_DNS_REVERT,
             Self::DefaultRestore { .. } => command::mac::DEFAULT_RESTORE,
             Self::FlushDns => command::mac::FLUSH_DNS,
@@ -344,6 +352,12 @@ impl Request {
                 out.push(crate::core_protocol::PINNED_EXECUTION_DISCRIMINATOR.to_owned());
                 out.push(params.id.as_str().to_owned());
                 push_start_args(&params.common, out);
+                if let Some(directory) = &params.runtime_directory {
+                    if params.common.parent_pid.is_none() {
+                        out.push(String::new());
+                    }
+                    out.push(format!("runtime-root-v1={directory}"));
+                }
             }
             Self::Ping
             | Self::PrepareHelperUpgrade
@@ -351,6 +365,7 @@ impl Request {
             | Self::Version
             | Self::Status
             | Self::LinuxStatusBirth
+            | Self::LinuxDnsSnapshot
             | Self::NativeStatusBirth
             | Self::Cleanup
             | Self::FlushDns
@@ -403,6 +418,7 @@ impl Request {
                 out.push(p.src_dir.clone());
                 out.push(p.want_hash.clone());
             }
+            Self::LinuxDnsCompare { payload } => out.push(payload.clone()),
             Self::LinuxDnsSet(p) => {
                 out.push(p.interface_name.clone());
                 out.push(p.server_ip.clone());

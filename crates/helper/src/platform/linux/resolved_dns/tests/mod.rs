@@ -1,65 +1,165 @@
 use super::*;
-use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 struct MockRunner {
-    link_exists: bool,
-    calls: Mutex<Vec<Vec<String>>>,
-    replies: Mutex<VecDeque<Result<String, String>>>,
+    state: Arc<Mutex<MockResolvedState>>,
+}
+struct MockResolvedState {
+    exists: bool,
+    link: LinkIdentity,
+    settings: Settings,
+    baseline: Settings,
+    calls: Vec<Vec<String>>,
+    fail_mutation: Option<String>,
+    bad_readback_after_write: bool,
+    bad_readback_pending: bool,
+    foreign_after_write: bool,
 }
 
 impl MockRunner {
     fn healthy() -> Self {
+        let baseline = Settings {
+            servers: vec![],
+            domains: vec![],
+            default_route: false,
+            dnssec: "no".into(),
+            dns_over_tls: "no".into(),
+        };
         Self {
-            link_exists: true,
-            calls: Mutex::new(Vec::new()),
-            replies: Mutex::new(VecDeque::from([
-                Ok(String::new()),
-                Ok(String::new()),
-                Ok(String::new()),
-                Ok(String::new()),
-                Ok(String::new()),
-                Ok(format!(
-                    "Link 7 ({TUN_INTERFACE_NAME}): {CONTROLLED_DNS_IP}"
-                )),
-                Ok(format!("Link 7 ({TUN_INTERFACE_NAME}): {ROUTE_ALL_DOMAIN}")),
-                Ok(format!("Link 7 ({TUN_INTERFACE_NAME}): yes")),
-            ])),
+            state: Arc::new(Mutex::new(MockResolvedState {
+                exists: true,
+                link: LinkIdentity {
+                    ifindex: 7,
+                    sysfs_device: 1,
+                    sysfs_inode: 70,
+                    netns_inode: 9,
+                    tun_flags: 1,
+                },
+                settings: baseline.clone(),
+                baseline,
+                calls: vec![],
+                fail_mutation: None,
+                bad_readback_after_write: false,
+                bad_readback_pending: false,
+                foreign_after_write: false,
+            })),
         }
+    }
+    fn ops(&self) -> ResolvectlDnsOps {
+        ResolvectlDnsOps {
+            runner: Box::new(self.clone()),
+            ..ResolvectlDnsOps::default()
+        }
+    }
+    fn mutations(&self) -> Vec<Vec<String>> {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|args| args.len() > 2 || args[0] == "revert")
+            .cloned()
+            .collect()
     }
 }
 
 impl ResolvectlRunner for MockRunner {
-    fn link_exists(&self, _interface_name: &str) -> bool {
-        self.link_exists
+    fn link_exists(&self, _: &str) -> bool {
+        self.state.lock().unwrap().exists
     }
-
+    fn link_identity(&self) -> Result<LinkIdentity, String> {
+        let state = self.state.lock().unwrap();
+        if state.exists {
+            Ok(state.link.clone())
+        } else {
+            Err("managed kernel link missing".into())
+        }
+    }
+    fn link_gone(&self, expected: &LinkIdentity) -> Result<bool, String> {
+        let state = self.state.lock().unwrap();
+        Ok(!state.exists && expected == &state.link)
+    }
+    fn pin_link(&self, expected: &LinkIdentity) -> Result<std::fs::File, String> {
+        assert_eq!(expected, &self.state.lock().unwrap().link);
+        // Unit runner seam only. Production SystemResolvectlRunner opens and
+        // verifies the real sysfs object, not this inert fixture file.
+        tempfile::tempfile().map_err(|error| error.to_string())
+    }
     fn run(&self, args: &[&str]) -> Result<String, String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(args.iter().map(|arg| (*arg).to_owned()).collect());
-        self.replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| Ok(String::new()))
+        let mut state = self.state.lock().unwrap();
+        state
+            .calls
+            .push(args.iter().map(|arg| (*arg).into()).collect());
+        assert_eq!(args[1], state.link.ifindex.to_string());
+        if args.len() == 2 && args[0] != "revert" {
+            if state.bad_readback_pending {
+                state.bad_readback_pending = false;
+                return Ok("Link 99 (foreign): no".into());
+            }
+            let value = match args[0] {
+                "dns" => state.settings.servers.join(" "),
+                "domain" => state.settings.domains.join(" "),
+                "default-route" => if state.settings.default_route {
+                    "yes"
+                } else {
+                    "no"
+                }
+                .into(),
+                "dnssec" => state.settings.dnssec.clone(),
+                "dnsovertls" => state.settings.dns_over_tls.clone(),
+                _ => return Err("unexpected query".into()),
+            };
+            return Ok(format!(
+                "Link {} ({}): {value}",
+                state.link.ifindex, TUN_INTERFACE_NAME
+            ));
+        }
+        match args[0] {
+            "dnssec" => state.settings.dnssec = args[2].into(),
+            "dnsovertls" => state.settings.dns_over_tls = args[2].into(),
+            "dns" => state.settings.servers = vec![args[2].into()],
+            "domain" => state.settings.domains = vec![args[2].into()],
+            "default-route" => state.settings.default_route = args[2] == "yes",
+            "revert" => state.settings = state.baseline.clone(),
+            _ => return Err("unexpected mutation".into()),
+        }
+        if state.bad_readback_after_write {
+            state.bad_readback_after_write = false;
+            state.bad_readback_pending = true;
+        }
+        if state.foreign_after_write {
+            state.foreign_after_write = false;
+            state.settings.servers = vec!["9.9.9.9".into()];
+        }
+        if state.fail_mutation.as_deref() == Some(args[0]) {
+            return Err(format!("{} failed", args[0]));
+        }
+        Ok(String::new())
     }
 }
 
 #[test]
 fn takeover_sets_and_attests_the_managed_link() {
     let runner = MockRunner::healthy();
-    takeover_with(&runner, TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).unwrap();
-    let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls[0], ["dnssec", TUN_INTERFACE_NAME, "no"]);
-    assert_eq!(calls[1], ["dnsovertls", TUN_INTERFACE_NAME, "no"]);
-    assert_eq!(calls[2], ["dns", TUN_INTERFACE_NAME, CONTROLLED_DNS_IP]);
-    assert_eq!(calls[3], ["domain", TUN_INTERFACE_NAME, ROUTE_ALL_DOMAIN]);
-    assert_eq!(calls[4], ["default-route", TUN_INTERFACE_NAME, "yes"]);
-    assert_eq!(calls[5], ["dns", TUN_INTERFACE_NAME]);
-    assert_eq!(calls[6], ["domain", TUN_INTERFACE_NAME]);
-    assert_eq!(calls[7], ["default-route", TUN_INTERFACE_NAME]);
+    let ops = runner.ops();
+    ops.takeover(TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).unwrap();
+    let mutations = runner.mutations();
+    assert_eq!(mutations.len(), 5);
+    assert_eq!(mutations[0], ["dnssec", "7", "no"]);
+    assert_eq!(mutations[1], ["dnsovertls", "7", "no"]);
+    assert_eq!(mutations[2], ["dns", "7", CONTROLLED_DNS_IP]);
+    assert_eq!(mutations[3], ["domain", "7", ROUTE_ALL_DOMAIN]);
+    assert_eq!(mutations[4], ["default-route", "7", "yes"]);
+    let state = runner.state.lock().unwrap();
+    assert!(state.settings.controlled());
+    let final_reads = &state.calls[state.calls.len() - 5..];
+    assert_eq!(final_reads[0], ["dns", "7"]);
+    assert_eq!(final_reads[1], ["domain", "7"]);
+    assert_eq!(final_reads[2], ["default-route", "7"]);
+    assert_eq!(final_reads[3], ["dnssec", "7"]);
+    assert_eq!(final_reads[4], ["dnsovertls", "7"]);
+    assert!(ops.owned_link.lock().unwrap().is_some());
 }
 
 #[test]
@@ -79,62 +179,106 @@ fn resolvectl_poll_interval_backs_off_to_the_existing_ceiling() {
 #[test]
 fn invalid_request_is_rejected_without_commands() {
     let runner = MockRunner::healthy();
-    assert!(takeover_with(&runner, "eth0", "1.1.1.1").is_err());
-    assert!(runner.calls.lock().unwrap().is_empty());
+    let ops = runner.ops();
+    assert!(ops.takeover("eth0", "1.1.1.1").is_err());
+    assert!(ops.revert("eth0").is_err());
+    assert!(runner.state.lock().unwrap().calls.is_empty());
 }
 
 #[test]
 fn partial_failure_reverts_the_link() {
-    let runner = MockRunner {
-        link_exists: true,
-        calls: Mutex::new(Vec::new()),
-        replies: Mutex::new(VecDeque::from([
-            Ok(String::new()),
-            Err("dnsovertls failed".to_owned()),
-            Ok(String::new()),
-        ])),
-    };
-    let error = takeover_with(&runner, TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).unwrap_err();
-    assert!(error.contains("partial resolved state reverted"));
+    let runner = MockRunner::healthy();
+    let ops = runner.ops();
+    runner.state.lock().unwrap().fail_mutation = Some("dnsovertls".into());
     assert_eq!(
-        runner.calls.lock().unwrap().last().unwrap(),
-        &["revert", TUN_INTERFACE_NAME]
+        ops.takeover(TUN_INTERFACE_NAME, CONTROLLED_DNS_IP)
+            .unwrap_err(),
+        "dnsovertls failed"
     );
+    assert!(ops.owned_link.lock().unwrap().is_some());
+    runner.state.lock().unwrap().fail_mutation = None;
+    ops.revert(TUN_INTERFACE_NAME).unwrap();
+    assert_eq!(runner.mutations().last().unwrap(), &["revert", "7"]);
+    {
+        let state = runner.state.lock().unwrap();
+        assert_eq!(state.settings, state.baseline);
+    }
+    assert!(ops.owned_link.lock().unwrap().is_none());
 }
 
 #[test]
 fn missing_link_is_already_reverted_but_cannot_be_taken_over() {
-    let runner = MockRunner {
-        link_exists: false,
-        calls: Mutex::new(Vec::new()),
-        replies: Mutex::new(VecDeque::new()),
-    };
-    assert!(takeover_with(&runner, TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).is_err());
-    revert_with(&runner, TUN_INTERFACE_NAME).unwrap();
-    assert!(runner.calls.lock().unwrap().is_empty());
+    let runner = MockRunner::healthy();
+    runner.state.lock().unwrap().exists = false;
+    let ops = runner.ops();
+    assert!(ops.takeover(TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).is_err());
+    ops.revert(TUN_INTERFACE_NAME).unwrap();
+    assert!(runner.state.lock().unwrap().calls.is_empty());
 }
 
 #[test]
 fn failed_attestation_reverts_the_link() {
-    let runner = MockRunner {
-        link_exists: true,
-        calls: Mutex::new(Vec::new()),
-        replies: Mutex::new(VecDeque::from([
-            Ok(String::new()),
-            Ok(String::new()),
-            Ok(String::new()),
-            Ok(String::new()),
-            Ok(String::new()),
-            Ok("Link 7: 1.1.1.1".to_owned()),
-            Ok(String::new()),
-        ])),
-    };
-    let error = takeover_with(&runner, TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).unwrap_err();
-    assert!(error.contains("read-back missing DNS"));
+    let runner = MockRunner::healthy();
+    let ops = runner.ops();
+    runner.state.lock().unwrap().bad_readback_after_write = true;
     assert_eq!(
-        runner.calls.lock().unwrap().last().unwrap(),
-        &["revert", TUN_INTERFACE_NAME]
+        ops.takeover(TUN_INTERFACE_NAME, CONTROLLED_DNS_IP)
+            .unwrap_err(),
+        "resolved readback has wrong link identity"
     );
+    assert!(ops.owned_link.lock().unwrap().is_some());
+    ops.revert(TUN_INTERFACE_NAME).unwrap();
+    assert_eq!(runner.mutations().last().unwrap(), &["revert", "7"]);
+    assert!(ops.owned_link.lock().unwrap().is_none());
+    assert!(runner.state.lock().unwrap().settings.unconfigured());
+}
+
+#[test]
+fn checked_revert_rejects_successor_and_foreign_values_but_accepts_original_object_absence() {
+    for successor in [false, true] {
+        let runner = MockRunner::healthy();
+        let ops = runner.ops();
+        ops.takeover(TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).unwrap();
+        if successor {
+            runner.state.lock().unwrap().link.sysfs_inode += 1;
+        } else {
+            runner.state.lock().unwrap().settings.servers = vec!["9.9.9.9".into()];
+        }
+        let before = runner.mutations().len();
+        assert!(ops.revert(TUN_INTERFACE_NAME).is_err());
+        assert_eq!(runner.mutations().len(), before);
+        assert!(ops.owned_link.lock().unwrap().is_some());
+    }
+    let runner = MockRunner::healthy();
+    let ops = runner.ops();
+    ops.takeover(TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).unwrap();
+    runner.state.lock().unwrap().exists = false;
+    let before = runner.mutations().len();
+    ops.revert(TUN_INTERFACE_NAME).unwrap();
+    assert_eq!(runner.mutations().len(), before);
+    assert!(ops.owned_link.lock().unwrap().is_none());
+}
+
+#[test]
+fn strict_snapshot_has_no_writes_and_checked_mutation_stops_at_foreign_readback() {
+    let runner = MockRunner::healthy();
+    let ops = runner.ops();
+    let before = ops.snapshot().unwrap();
+    assert!(runner.mutations().is_empty());
+    assert!(ops.original_settings().is_none());
+    runner.state.lock().unwrap().foreign_after_write = true;
+    assert!(ops.compare(&before, true).is_err());
+    assert_eq!(
+        runner.mutations(),
+        vec![vec!["dnssec".to_owned(), "7".into(), "no".into()]]
+    );
+    assert_eq!(
+        runner.state.lock().unwrap().settings.servers,
+        vec!["9.9.9.9"]
+    );
+    assert!(ops.revert(TUN_INTERFACE_NAME).is_err());
+    assert_eq!(runner.mutations().len(), 1);
+    assert!(ops.owned_link.lock().unwrap().is_some());
 }
 
 // ── 管道排空必须早于等待（同根因姊妹腿：测速临时核 2026-09-02）──

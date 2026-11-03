@@ -447,15 +447,23 @@ async fn host_dns_consent_and_failed_admission_do_not_accept_the_saved_host_effe
     let (rt, _dir, running, candidate) = host_dns_restart_fixture();
     let generation = rt.gate.generation();
     let intent = rt.register_selector_intent();
-    let result = rt.restart_choice(
-        &candidate,
-        "structuralChange",
-        vec!["dnsConfig.takeoverSystemDns".into()],
-        generation,
-        intent,
-    );
+    let host_plan = host_effects::HostEffectPlan {
+        effect_digest: "dns-effect".into(),
+        physical_facts_digest: "dns-facts".into(),
+        host_epoch: 0,
+        effects: vec![host_effects::HostEffectPreview {
+            kind: host_effects::HostEffectKind::Dns,
+            scope_digest: "dns-scope".into(),
+            before_digest: "before".into(),
+            target_digest: "target".into(),
+        }],
+        strategy: host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore,
+        recipe: Value::Null,
+    };
+    let result = rt.host_effect_restart_choice(&candidate, &host_plan, generation, intent);
     assert_eq!(result.status, "restartRequired");
     assert!(result.restart_confirmation.is_some());
+    assert_eq!(result.reasons[0].code, "hostEffectsRequireRestart");
     assert_eq!(result.reasons[0].path, "dnsConfig.takeoverSystemDns");
     // Declining confirmation sends no operation: D and its debt remain, R stays old.
     assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
@@ -663,7 +671,7 @@ fn ts_pending_fixture(rt: &Arc<ProxyRuntime>, authority: &str) -> PendingOperati
     ts_pending_raw_fixture(rt, raw)
 }
 
-fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> PendingOperation {
+pub(super) fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> PendingOperation {
     let typed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
     let generated =
@@ -700,11 +708,14 @@ fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> PendingOperatio
         ..Default::default()
     };
     PendingOperation {
+        host_plan: None,
         api_handoff: None,
         pairing,
         desired: raw.clone(),
         deletion_scope: vec![],
         physical_route_config: typed.clone(),
+        protected_physical_root: None,
+        protected_binding_plan: None,
         generation,
         intent: rt.selector_reconcile.intent_generation(),
         candidate: raw,
@@ -719,6 +730,273 @@ fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> PendingOperatio
         tailnet_suspended_token: None,
         tailnet_bindings,
     }
+}
+
+#[test]
+fn incoming_plan_effects_require_known_scope_and_consistent_explicit_policy() {
+    let mut plan = daemon::RuntimeConfigPlan {
+        applicable: true,
+        client_impact_policy_version: CLIENT_IMPACT_POLICY_VERSION,
+        impact_confirmation_required: true,
+        impacts: vec![daemon::RuntimeImpact {
+            update_class: 2,
+            reconnect_required: true,
+            affected_session_classes: vec![
+                "existing TUN TCP flows".into(),
+                "existing TUN UDP associations".into(),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(runtime_plan_impacts_supported(&plan));
+    assert!(runtime_plan_needs_local_confirmation(&plan));
+    let mut bad = plan.clone();
+    bad.impacts[0].update_class = 999;
+    assert!(!runtime_plan_impacts_supported(&bad));
+    bad = plan.clone();
+    bad.impact_confirmation_required = false;
+    assert!(!runtime_plan_impacts_supported(&bad));
+    bad.impacts[0].reconnect_required = false;
+    assert!(
+        !runtime_plan_impacts_supported(&bad),
+        "known session resets cannot be disguised by clearing both producer flags"
+    );
+    bad.impacts[0].affected_session_classes.clear();
+    assert!(
+        !runtime_plan_impacts_supported(&bad),
+        "an unscoped effect does not authorize a live Apply"
+    );
+    bad = plan.clone();
+    bad.impacts[0].affected_session_classes = vec!["new admissions".into()];
+    assert!(!runtime_plan_impacts_supported(&bad));
+    bad = plan.clone();
+    bad.impacts[0]
+        .affected_session_classes
+        .push("future-reset-v2".into());
+    assert!(!runtime_plan_impacts_supported(&bad));
+    bad = plan.clone();
+    bad.no_op = true;
+    assert!(!runtime_plan_impacts_supported(&bad));
+    // Core returns rejected mixed plans before issuing a confirmation bit.
+    // Preserve their precise restart path instead of treating rejection as consent.
+    let mut restart = plan.clone();
+    restart.applicable = false;
+    restart.impact_confirmation_required = false;
+    restart.impacts.push(daemon::RuntimeImpact {
+        update_class: daemon::RuntimeUpdateClass::RestartRequired as i32,
+        effective_path: "dns.servers".into(),
+        reconnect_required: true,
+        ..Default::default()
+    });
+    assert!(runtime_plan_impacts_supported(&restart));
+    assert!(!runtime_plan_needs_local_confirmation(&restart));
+    restart.impact_confirmation_required = true;
+    assert!(!runtime_plan_impacts_supported(&restart));
+    // This is a recognized rejected reply vocabulary, never an applicable
+    // authorization. Check both negotiated and legacy producer contracts.
+    for policy in [0, CLIENT_IMPACT_POLICY_VERSION] {
+        let mut rejected_only = daemon::RuntimeConfigPlan {
+            applicable: true,
+            client_impact_policy_version: policy,
+            impacts: vec![daemon::RuntimeImpact {
+                update_class: daemon::RuntimeUpdateClass::LocalReplace as i32,
+                effective_path: "outbounds".into(),
+                affected_session_classes: vec!["none; candidate not applied".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!runtime_plan_impacts_supported(&rejected_only));
+        rejected_only.applicable = false;
+        rejected_only.impacts[0].update_class = daemon::RuntimeUpdateClass::RestartRequired as i32;
+        assert!(runtime_plan_impacts_supported(&rejected_only));
+        assert!(!runtime_plan_needs_local_confirmation(&rejected_only));
+    }
+    // Legacy producers do not promise the v1 confirmation bit. The new client
+    // still binds its own explicit choice to a known disruptive legacy plan.
+    plan.client_impact_policy_version = 0;
+    plan.impact_confirmation_required = false;
+    assert!(runtime_plan_impacts_supported(&plan));
+    assert!(runtime_plan_needs_local_confirmation(&plan));
+    let noop = daemon::RuntimeConfigPlan {
+        no_op: true,
+        applicable: true,
+        client_impact_policy_version: CLIENT_IMPACT_POLICY_VERSION,
+        ..Default::default()
+    };
+    assert!(runtime_plan_impacts_supported(&noop));
+    assert!(!runtime_plan_needs_local_confirmation(&noop));
+}
+
+#[test]
+fn verified_kernel_receipt_survives_unrelated_last_request_and_keeps_its_owner() {
+    let mut state = RuntimeConfigApplyState::default();
+    let active = daemon::RuntimeIdentity {
+        incarnation: "kernel".into(),
+        applied_revision: 2,
+        effective_digest: "e".repeat(64),
+    };
+    state.kernel = Some(RuntimeKernelReceipt {
+        generation: 7,
+        intent: 11,
+        superseded: false,
+        operation: daemon::RuntimeConfigOperation {
+            transaction_id: "original".into(),
+            active: Some(active.clone()),
+            state: daemon::RuntimeOperationState::Committed as i32,
+            durable: true,
+            ..Default::default()
+        },
+    });
+    let mut unrelated = RuntimeApplyResult::status("conflict");
+    unrelated.transaction_id = Some("original".into());
+    unrelated.runtime_generation = Some(7);
+    unrelated.selection_intent_generation = Some(12);
+    state.last = Some(unrelated);
+    let receipt = state.core_receipt_for("original", 7).unwrap();
+    assert_eq!(receipt.status, "hotApplied");
+    assert_eq!(receipt.configuration_durable, Some(true));
+    assert_eq!(receipt.selection_intent_generation, Some(11));
+    assert!(state.core_receipt_for("different", 7).is_none());
+    assert!(state.core_receipt_for("original", 8).is_none());
+    let mut plan = daemon::RuntimeConfigPlan {
+        no_op: true,
+        expected: Some(active),
+        ..Default::default()
+    };
+    assert!(!state.requires_regeneration_owner_restart(7, &plan));
+    state.kernel.as_mut().unwrap().superseded = true;
+    assert!(state.requires_regeneration_owner_restart(7, &plan));
+    assert_eq!(
+        state.core_receipt_for("original", 7).unwrap().status,
+        "conflict"
+    );
+    assert!(!state.requires_regeneration_owner_restart(8, &plan));
+    plan.expected.as_mut().unwrap().applied_revision += 1;
+    assert!(!state.requires_regeneration_owner_restart(7, &plan));
+    plan.expected.as_mut().unwrap().applied_revision -= 1;
+    plan.no_op = false;
+    assert!(!state.requires_regeneration_owner_restart(7, &plan));
+}
+
+#[test]
+fn stale_intent_keeps_verified_core_fact_without_publishing_or_rebinding() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let running = json!({"oldRunningSnapshot": true});
+    *runtime.current_config.write().unwrap() = Some(running.clone());
+    runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+    let mut active = pending.plan.expected.clone().unwrap();
+    active.applied_revision += 1;
+    active.effective_digest = pending.plan.candidate_digest.clone();
+    let operation = daemon::RuntimeConfigOperation {
+        contract_version: 1,
+        transaction_id: pending.plan.transaction_id.clone(),
+        candidate_digest: pending.plan.candidate_digest.clone(),
+        impact_digest: pending.plan.impact_digest.clone(),
+        before: pending.plan.expected.clone(),
+        active: Some(active),
+        control_revision: pending.plan.expected_control_revision,
+        state: daemon::RuntimeOperationState::CommittedDurabilityPending as i32,
+        durable: false,
+        persistence_mode: "exact_configuration_file".into(),
+        ..Default::default()
+    };
+    assert_ne!(runtime.selector_reconcile.register_intent(), pending.intent);
+    let result = runtime.settle_runtime_operation(&pending, operation);
+    assert_eq!(result.status, "conflict");
+    assert_eq!(runtime.current_config_snapshot(), Some(running));
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    let receipt = state
+        .core_receipt_for(&pending.plan.transaction_id, pending.generation)
+        .unwrap();
+    assert_eq!(receipt.selection_intent_generation, Some(pending.intent));
+    assert_eq!(receipt.configuration_durable, Some(false));
+    assert_eq!(
+        state.pending.as_ref().unwrap().plan.transaction_id,
+        pending.plan.transaction_id
+    );
+}
+
+#[test]
+fn host_only_publication_preserves_the_original_kernel_persistence_owner() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut original = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    original.published = true;
+    original.plan.transaction_id = "original-kernel-transaction".into();
+    *runtime.current_config.write().unwrap() = Some(original.candidate.clone());
+    runtime.capture_runtime_config_baseline(
+        original.generation,
+        original.deps.clone(),
+        original.generated.clone(),
+        original.typed.clone(),
+        original.pairing.clone(),
+    );
+    let mut active = original.plan.expected.clone().unwrap();
+    active.applied_revision += 1;
+    active.effective_digest = "e".repeat(64);
+    let operation = daemon::RuntimeConfigOperation {
+        transaction_id: original.plan.transaction_id.clone(),
+        active: Some(active.clone()),
+        control_revision: 9,
+        durable: false,
+        state: daemon::RuntimeOperationState::CommittedDurabilityPending as i32,
+        ..Default::default()
+    };
+    let mut retry = original.clone();
+    retry.plan.no_op = true;
+    retry.plan.transaction_id = "unused-noop-plan".into();
+    retry.plan.expected = Some(active.clone());
+    retry.plan.candidate_digest = active.effective_digest.clone();
+    retry.plan.expected_control_revision = 9;
+    retry.plan.expires_at_unix_milli = i64::MAX;
+    retry.host_plan = Some(host_effects::HostEffectPlan {
+        effect_digest: "effect".into(),
+        physical_facts_digest: "physical".into(),
+        host_epoch: 2,
+        effects: vec![host_effects::HostEffectPreview {
+            kind: host_effects::HostEffectKind::Dns,
+            scope_digest: "scope".into(),
+            before_digest: "before".into(),
+            target_digest: "after".into(),
+        }],
+        strategy: host_effects::HostEffectStrategy::HostOnly,
+        recipe: json!({}),
+    });
+    {
+        let mut state = runtime.runtime_config_apply.lock().unwrap();
+        state.pending = Some(original.clone());
+        state.kernel = Some(RuntimeKernelReceipt {
+            generation: original.generation,
+            intent: original.intent,
+            operation,
+            superseded: false,
+        });
+        assert!(state.host_only_preserves_pending_core(&retry));
+        let mut changed = retry.clone();
+        changed.candidate["mixedPort"] = json!(3080);
+        assert!(!state.host_only_preserves_pending_core(&changed));
+        changed = retry.clone();
+        changed.plan.no_op = false;
+        assert!(!state.host_only_preserves_pending_core(&changed));
+    }
+    // Exercise the real publication reservation with a mocked already-verified
+    // NoOp receipt. No RPC, persistence callback, or native worker is invoked.
+    let (_, _, execution) = runtime
+        .publish_prepared_runtime_candidate(&retry, None, Some(active), 9, None)
+        .expect("same-candidate host admission");
+    let execution = execution.expect("real independent host execution reservation");
+    assert!(execution.transaction_id.is_none());
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    assert_eq!(
+        state.pending.as_ref().unwrap().plan.transaction_id,
+        "original-kernel-transaction"
+    );
+    assert_eq!(
+        state.kernel.as_ref().unwrap().operation.transaction_id,
+        "original-kernel-transaction"
+    );
 }
 
 // V04/V05: exercise the actual receipt settlement, with the original paused
@@ -1316,4 +1594,229 @@ async fn weak_legacy_context_filter_applies_before_capacity_and_real_confirmed_a
     assert!(content.len() <= crate::runtime::proxy::tailnet_rules::MAX_TAILNET_RULE_BYTES);
     assert!(rt.observed_tailnet_snapshot().is_empty());
     assert!(rt.fresh_tailnet_snapshot(next.generation).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn committed_receipt_with_blocked_physical_proof_keeps_kernel_fact_without_publication() {
+    for expired in [true, false] {
+        for durable in [true, false] {
+            let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+            let accepted = ts_pending_fixture(&runtime, "https://accepted.example");
+            *runtime.current_config.write().unwrap() = Some(accepted.candidate.clone());
+            *runtime.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+                &accepted.typed,
+                &accepted.generated,
+                &accepted.deps,
+            ));
+            runtime.capture_runtime_config_baseline(
+                accepted.generation,
+                accepted.deps.clone(),
+                accepted.generated.clone(),
+                accepted.typed.clone(),
+                accepted.pairing.clone(),
+            );
+            let accepted_bindings = runtime.runtime_binding_state.lock().unwrap().plan.clone();
+            let mut pending = ts_pending_fixture(&runtime, "https://candidate.example");
+            pending.host_plan = Some(host_effects::HostEffectPlan {
+                effect_digest: "candidate-effect".into(),
+                physical_facts_digest: "physical".into(),
+                host_epoch: 2,
+                effects: vec![host_effects::HostEffectPreview {
+                    kind: host_effects::HostEffectKind::Dns,
+                    scope_digest: "scope".into(),
+                    before_digest: "before".into(),
+                    target_digest: "after".into(),
+                }],
+                strategy: host_effects::HostEffectStrategy::AfterCoreCommit,
+                recipe: json!({}),
+            });
+            let epoch = runtime.network_epoch().expect("desktop watcher epoch");
+            let (owner, proof) =
+                crate::runtime::route_binding::blocked_physical_binding_proof_for_test(
+                    pending.generation,
+                    epoch,
+                    expired,
+                );
+            pending.protected_physical_root = Some(owner);
+            pending.protected_binding_plan = Some(proof);
+            runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+            let mut committed = committed_ts_receipt(&pending);
+            committed.durable = durable;
+            committed.persistence_mode = "exact_configuration_file".into();
+            committed.state = if durable {
+                daemon::RuntimeOperationState::Committed as i32
+            } else {
+                daemon::RuntimeOperationState::CommittedDurabilityPending as i32
+            };
+            // Exercise production verification + original settlement. The
+            // fixture is expired/revoked and has no native seal, so no OS/RPC
+            // or host-effect worker can be reached by this committed receipt.
+            let result = runtime
+                .settle_runtime_operation_with_physical_verification(&pending, committed.clone())
+                .await;
+            assert_eq!(result.status, "unconfirmed");
+            assert_eq!(result.core_state, Some("committed"));
+            assert_eq!(result.configuration_durable, Some(durable));
+            assert!(
+                runtime.switch_snapshot.read().unwrap().is_none(),
+                "a committed but unpublished graph cannot retain the old cheap-selector classification"
+            );
+            assert_eq!(
+                result.persistence_mode.as_deref(),
+                Some("exact_configuration_file")
+            );
+            assert!(result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "PHYSICAL_ROUTE_FACTS_CHANGED"));
+            assert_eq!(
+                *runtime.current_config.read().unwrap(),
+                Some(accepted.candidate.clone())
+            );
+            assert_eq!(
+                runtime.runtime_binding_state.lock().unwrap().plan,
+                accepted_bindings
+            );
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            let kernel = state
+                .kernel
+                .as_ref()
+                .expect("real matching committed fact retained");
+            assert_eq!(kernel.operation.transaction_id, pending.plan.transaction_id);
+            assert_eq!(kernel.operation.active, committed.active);
+            assert_eq!(kernel.operation.state, committed.state);
+            assert_eq!(kernel.operation.durable, durable);
+            let fact = state
+                .core_receipt_for(&pending.plan.transaction_id, pending.generation)
+                .expect("K stays queryable independently of R");
+            assert_eq!(fact.core_state, Some("committed"));
+            assert_eq!(fact.configuration_durable, Some(durable));
+            assert_eq!(
+                fact.persistence_mode.as_deref(),
+                Some("exact_configuration_file")
+            );
+            let retained = state.pending.as_ref().expect("unpublished owner retained");
+            assert_eq!(retained.plan.transaction_id, pending.plan.transaction_id);
+            assert!(!retained.published);
+            assert!(
+                !state.host.has_in_flight(),
+                "physical rejection cannot reserve host execution"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn blocked_noop_publication_preserves_original_kernel_persistence_owner() {
+    for expired in [true, false] {
+        let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+        let mut original = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+        original.published = true;
+        original.plan.transaction_id = "original-kernel-transaction".into();
+        *runtime.current_config.write().unwrap() = Some(original.candidate.clone());
+        runtime.capture_runtime_config_baseline(
+            original.generation,
+            original.deps.clone(),
+            original.generated.clone(),
+            original.typed.clone(),
+            original.pairing.clone(),
+        );
+        let mut operation = committed_ts_receipt(&original);
+        operation.durable = false;
+        operation.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+        operation.persistence_mode = "exact_configuration_file".into();
+        let active = operation.active.clone().unwrap();
+        let control_revision = operation.control_revision;
+        let mut retry = original.clone();
+        retry.published = false;
+        retry.plan.no_op = true;
+        retry.plan.transaction_id = "unused-noop-plan".into();
+        retry.plan.expected = Some(active.clone());
+        retry.plan.candidate_digest = active.effective_digest.clone();
+        retry.plan.expected_control_revision = control_revision;
+        retry.plan.expires_at_unix_milli = i64::MAX;
+        retry.host_plan = Some(host_effects::HostEffectPlan {
+            effect_digest: "effect".into(),
+            physical_facts_digest: "physical".into(),
+            host_epoch: 2,
+            effects: vec![host_effects::HostEffectPreview {
+                kind: host_effects::HostEffectKind::Dns,
+                scope_digest: "scope".into(),
+                before_digest: "before".into(),
+                target_digest: "after".into(),
+            }],
+            strategy: host_effects::HostEffectStrategy::HostOnly,
+            recipe: json!({}),
+        });
+        let (owner, proof) = crate::runtime::route_binding::blocked_physical_binding_proof_for_test(
+            retry.generation,
+            runtime.network_epoch().expect("desktop watcher epoch"),
+            expired,
+        );
+        retry.protected_physical_root = Some(owner);
+        retry.protected_binding_plan = Some(proof);
+        {
+            let mut state = runtime.runtime_config_apply.lock().unwrap();
+            state.pending = Some(original.clone());
+            state.kernel = Some(RuntimeKernelReceipt {
+                generation: original.generation,
+                intent: original.intent,
+                operation: operation.clone(),
+                superseded: false,
+            });
+            assert!(
+                state.host_only_preserves_pending_core(&retry),
+                "same-candidate NoOp admission precondition"
+            );
+        }
+        // Invoke the actual publication reservation, not a parallel test state
+        // machine. Its memory proof gate must reject before host reservation.
+        assert!(runtime
+            .publish_prepared_runtime_candidate(&retry, None, Some(active), control_revision, None,)
+            .is_none());
+        assert_eq!(
+            *runtime.current_config.read().unwrap(),
+            Some(original.candidate.clone())
+        );
+        let state = runtime.runtime_config_apply.lock().unwrap();
+        let retained = state
+            .pending
+            .as_ref()
+            .expect("original persistence owner retained");
+        assert_eq!(retained.plan.transaction_id, original.plan.transaction_id);
+        assert!(retained.published);
+        let kernel = state
+            .kernel
+            .as_ref()
+            .expect("original Core receipt retained");
+        assert_eq!(
+            kernel.operation.transaction_id,
+            original.plan.transaction_id
+        );
+        assert_eq!(kernel.operation.active, operation.active);
+        assert_eq!(
+            kernel.operation.control_revision,
+            operation.control_revision
+        );
+        assert_eq!(kernel.operation.state, operation.state);
+        assert!(!kernel.operation.durable);
+        let fact = state
+            .core_receipt_for(&original.plan.transaction_id, original.generation)
+            .unwrap();
+        assert_eq!(fact.core_state, Some("committed"));
+        assert_eq!(fact.configuration_durable, Some(false));
+        assert_eq!(
+            fact.persistence_mode.as_deref(),
+            Some("exact_configuration_file")
+        );
+        assert!(state
+            .core_receipt_for(&retry.plan.transaction_id, retry.generation)
+            .is_none());
+        assert!(
+            !state.host.has_in_flight(),
+            "blocked NoOp cannot reserve host execution"
+        );
+    }
 }

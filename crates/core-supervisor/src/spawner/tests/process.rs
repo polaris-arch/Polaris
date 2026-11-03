@@ -190,3 +190,28 @@ async fn tokio_spawner_applies_working_dir() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn admitted_main_passes_explicit_state_directory_to_actual_child() {
+    // Reuse the existing std-only fixture directory pattern; no dependency or
+    // production Core is needed for this factory regression.
+    let directory = std::env::temp_dir().join(format!(
+        "polaris-explicit-state-{} with spaces 测试",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let (policy, received) = collect_stdio();
+    let mut request = SpawnRequest::new(execution(), "/nested/profiles/runtime.json", policy);
+    request.working_dir = Some(directory.clone());
+    request.extra_args = vec!["--disable-color".into()];
+    let mut child = TokioSpawner::new().spawn(request).unwrap();
+    assert!(child.child.wait().await.unwrap().success());
+    assert_eq!(
+        received.await.unwrap().stdout.trim(),
+        format!(
+            "run -c /nested/profiles/runtime.json -D {} --disable-color",
+            directory.display()
+        )
+    );
+    std::fs::remove_dir(&directory).unwrap();
+}

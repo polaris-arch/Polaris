@@ -2025,6 +2025,7 @@
 			);
 			outputPaths = (
 				"$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",
+				"$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",
 				"$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -2036,7 +2037,7 @@
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
 			files = ();
-			inputPaths = ("$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)", "$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json",);
+			inputPaths = ("$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)", "$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json", "$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);
 			name = "Verify TLS Capability Link";
 			outputPaths = ();
 			runOnlyForDeploymentPostprocessing = 0;
@@ -2190,6 +2191,7 @@
 					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
 				OTHER_LDFLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",);
+				OTHER_SWIFT_FLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -2222,6 +2224,7 @@
 					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
 				OTHER_LDFLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",);
+				OTHER_SWIFT_FLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

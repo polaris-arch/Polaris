@@ -357,7 +357,8 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
                     .iter()
                     .map(|line| (*line).to_owned())
                     .collect::<Vec<_>>(),
-            )?,
+            )
+            .filter(|params| params.runtime_directory.is_none())?,
         ),
         command::common::PING => Request::Ping,
         command::common::VERSION => Request::Version,

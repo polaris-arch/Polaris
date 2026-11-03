@@ -20,6 +20,8 @@ const saveMock = vi.fn(
 );
 const getMock = vi.fn(async (): Promise<UserConfig> => CONFIG);
 const applyMock = vi.fn(async (_token?: string): Promise<import('@/contracts/types').PendingApplyResult> => ({ ok: true, status: 'applied' }));
+const impactMock = vi.fn(async (_token: string): Promise<import('@/contracts/types').PendingApplyResult> => ({ ok: false, status: 'conflict' }));
+const cancelImpactMock = vi.fn(async (_token: string): Promise<import('@/contracts/types').PendingApplyResult> => ({ ok: true, status: 'cancelled' }));
 /** Q1-b ④：「上次是不是正常退出」。默认假 = 强杀/重载/没退过 ⇒ 照常恢复（旧行为）。 */
 const cleanExitMock = vi.fn(async () => false);
 const stagedPendingMock = vi.fn(async (_pending: boolean) => undefined);
@@ -30,7 +32,11 @@ vi.mock('@/ipc', () => ({
       save: (c: unknown, d?: boolean, b?: string) => saveMock(c, d, b),
       setStagedPending: (pending: boolean) => stagedPendingMock(pending),
     },
-    proxy: { applyPendingChanges: (token?: string) => applyMock(token) },
+    proxy: {
+      applyPendingChanges: (token?: string) => applyMock(token),
+      confirmRuntimeImpact: (token: string) => impactMock(token),
+      cancelRuntimeImpact: (token: string) => cancelImpactMock(token),
+    },
     window: { takeCleanExitFlag: () => cleanExitMock() },
   },
 }));
@@ -120,6 +126,9 @@ beforeEach(() => {
   getMock.mockImplementation(async () => CONFIG);
   applyMock.mockClear();
   applyMock.mockImplementation(async () => ({ ok: true, status: 'applied' as const }));
+  impactMock.mockClear();
+  impactMock.mockImplementation(async () => ({ ok: false, status: 'conflict' as const }));
+  cancelImpactMock.mockClear();
   cleanExitMock.mockClear();
   stagedPendingMock.mockClear();
   cleanExitMock.mockImplementation(async () => false);
@@ -541,6 +550,48 @@ describe('applyNow —— 保存 + force-restart（FR-6）', () => {
     await expect(useStagedConfigStore.getState().applyNow()).resolves.toEqual({
       saved: true, status: 'restartRequired', restartConfirmation: 'token', reasons, pendingApply: true, restartRequired: true,
     });
+  });
+
+  it('forwards only the exact impact token without saving, loading, or replanning', async () => {
+    await expect(useStagedConfigStore.getState().applyNow(undefined, 'same-plan-token')).resolves.toEqual({ saved: true, status: 'conflict' });
+    expect(impactMock).toHaveBeenCalledExactlyOnceWith('same-plan-token');
+    expect(applyMock).not.toHaveBeenCalled();
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('invalidates a retained impact token when a new unsaved draft exists', async () => {
+    seedStaged();
+    const before = useStagedConfigStore.getState().entries;
+    await expect(useStagedConfigStore.getState().applyNow(undefined, 'old-plan-token')).resolves.toEqual({ saved: true, status: 'conflict' });
+    expect(cancelImpactMock).toHaveBeenCalledExactlyOnceWith('old-plan-token');
+    expect(impactMock).not.toHaveBeenCalled();
+    expect(applyMock).not.toHaveBeenCalled();
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(getMock).not.toHaveBeenCalled();
+    expect(useStagedConfigStore.getState().entries).toBe(before);
+  });
+
+  it('does not offer a plan that returned after the user created a newer draft', async () => {
+    let reply!: (receipt: import('@/contracts/types').PendingApplyResult) => void;
+    applyMock.mockImplementationOnce(() => new Promise((resolve) => { reply = resolve; }));
+    const applying = useStagedConfigStore.getState().applyNow();
+    await flush();
+    seedStaged();
+    const before = useStagedConfigStore.getState().entries;
+    reply({ ok: false, status: 'impactConfirmationRequired', impactConfirmation: 'late-plan-token' });
+    await expect(applying).resolves.toEqual({ saved: true, status: 'conflict' });
+    expect(cancelImpactMock).toHaveBeenCalledExactlyOnceWith('late-plan-token');
+    expect(impactMock).not.toHaveBeenCalled();
+    expect(useStagedConfigStore.getState().entries).toBe(before);
+  });
+
+  it('keeps restart and impact choices mutually exclusive before any IPC or save', async () => {
+    await expect(useStagedConfigStore.getState().applyNow('restart', 'impact')).resolves.toEqual({ saved: false, status: 'conflict' });
+    expect(applyMock).not.toHaveBeenCalled();
+    expect(impactMock).not.toHaveBeenCalled();
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(getMock).not.toHaveBeenCalled();
   });
 
   it('保存过关 ⇒ 调 applyPendingChanges 并回传排程结果', async () => {
@@ -1098,5 +1149,54 @@ describe('save snapshot ownership across awaited reads/writes', () => {
     expect(await saving).toBe(false);
     expect(saveMock).not.toHaveBeenCalled();
     expect(useStagedConfigStore.getState().entries).toEqual([]);
+  });
+});
+
+
+describe('host receipt fields cross the existing staged Apply boundary intact', () => {
+  const effect = { preview: { kind: 'dns' as const, scopeDigest: 'dns-scope', beforeDigest: 'before', targetDigest: 'target' },
+    outcome: 'failedRestored' as const, receiptId: 'host-receipt', cleanupPending: false, retryable: true, reasonCode: 'DNS_WRITE_FAILED' };
+
+  it('forwards HostOnly ownership and pending state without inventing a Core transaction or saving an empty draft', async () => {
+    const result: import('@/contracts/types').PendingApplyResult = { ok: true, status: 'hostEffectsPending',
+      hostExecutionId: 'host-only', runtimeGeneration: 7, selectionIntentGeneration: 9,
+      coreState: 'unchanged', configurationDurable: true, retirementState: 'none' };
+    applyMock.mockResolvedValueOnce(result);
+    const returned = await useStagedConfigStore.getState().applyNow();
+    expect(returned).toEqual({ saved: true, status: result.status, hostExecutionId: 'host-only',
+      runtimeGeneration: 7, selectionIntentGeneration: 9, coreState: 'unchanged', configurationDurable: true, retirementState: 'none' });
+    expect(returned).not.toHaveProperty('transactionId');
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(applyMock).toHaveBeenCalledExactlyOnceWith(undefined);
+  });
+
+  it('preserves failed host results alongside committed Core and unconfirmed durability for independent recovery', async () => {
+    const result: import('@/contracts/types').PendingApplyResult = { ok: false, status: 'hostEffectsFailed',
+      transactionId: 'original-core', hostExecutionId: 'host-after-core', runtimeGeneration: 7, selectionIntentGeneration: 9,
+      hostEffects: [effect], coreState: 'committed', configurationDurable: false, retirementState: 'pending' };
+    applyMock.mockResolvedValueOnce(result);
+    const returned = await useStagedConfigStore.getState().applyNow();
+    expect(returned).toEqual({ saved: true, status: result.status, transactionId: 'original-core', hostExecutionId: 'host-after-core',
+      runtimeGeneration: 7, selectionIntentGeneration: 9, hostEffects: [effect],
+      coreState: 'committed', configurationDurable: false, retirementState: 'pending' });
+    expect(returned.hostEffects).toBe(result.hostEffects);
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(applyMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('HostOnly original persistence ownership is a separate field', () => {
+  it('passes persistenceTransactionId without creating transactionId on the host operation', async () => {
+    applyMock.mockResolvedValueOnce({ ok: false, status: 'hostEffectsFailed', hostExecutionId: 'host-only',
+      persistenceTransactionId: 'original-core', runtimeGeneration: 7, selectionIntentGeneration: 10,
+      coreState: 'unchanged', configurationDurable: false });
+    const result = await useStagedConfigStore.getState().applyNow();
+    expect(result.persistenceTransactionId).toBe('original-core');
+    expect(result.hostExecutionId).toBe('host-only');
+    expect(result).not.toHaveProperty('transactionId');
+    expect(result.configurationDurable).toBe(false);
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(applyMock).toHaveBeenCalledTimes(1);
   });
 });

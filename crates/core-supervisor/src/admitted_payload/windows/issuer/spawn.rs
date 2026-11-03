@@ -192,6 +192,7 @@ fn create_suspended(
     cwd: &Path,
     guards: &[&File],
     purpose: ExecPurpose,
+    runtime_directory: Option<&Path>,
 ) -> Result<Suspended, AdmissionError> {
     let job = new_job()?;
     let (stdout, out_write) = pipe()?;
@@ -223,8 +224,8 @@ fn create_suspended(
     let environment: Vec<u16> = env.encode_utf16().collect();
     let application = wide(image)?;
     let cwd = wide(cwd)?;
-    // Typed purpose selects one fixed argv; no caller argument is accepted.
-    let args = fixed_arguments(purpose)?;
+    // Typed purpose owns argv; only the verified registered state directory is data.
+    let args = fixed_arguments(purpose, runtime_directory)?;
     let mut command = wide(format!("\"{}\" {args}", image.display()))?;
     let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -293,10 +294,26 @@ impl Drop for Suspended {
     }
 }
 
-fn fixed_arguments(purpose: ExecPurpose) -> Result<&'static str, AdmissionError> {
-    match purpose {
-        ExecPurpose::RunMain => Ok("run -c stdin"),
-        ExecPurpose::CheckConfig => Ok("--disable-color check -c stdin"),
+fn fixed_arguments(
+    purpose: ExecPurpose,
+    runtime_directory: Option<&Path>,
+) -> Result<String, AdmissionError> {
+    match (purpose, runtime_directory) {
+        (ExecPurpose::RunMain, Some(directory)) if directory.is_absolute() => {
+            let directory = directory.to_str().ok_or_else(unavailable)?;
+            // Ordinary Windows paths cannot contain quotes/control bytes. Never
+            // splice arbitrary argv; double terminal slashes before the closing
+            // quote so a drive root and paths with spaces remain one operand.
+            if directory.contains(['"', '\0', '\r', '\n']) {
+                return Err(unavailable());
+            }
+            let trailing = directory.len() - directory.trim_end_matches('\\').len();
+            Ok(format!(
+                "run -c stdin -D \"{directory}{}\"",
+                "\\".repeat(trailing)
+            ))
+        }
+        (ExecPurpose::CheckConfig, None) => Ok("--disable-color check -c stdin".into()),
         _ => Err(unavailable()),
     }
 }
@@ -306,6 +323,7 @@ pub(in super::super) fn spawn(
     config: File,
     cwd: &Path,
     purpose: ExecPurpose,
+    runtime_directory: Option<&Path>,
 ) -> Result<WindowsStartedChild, AdmissionError> {
     system_actor()?;
     if purpose == ExecPurpose::RunMain {
@@ -330,6 +348,7 @@ pub(in super::super) fn spawn(
         cwd,
         &guards,
         purpose,
+        runtime_directory,
     )?;
     // The process is suspended and already in its job with inherited guards.
     // A changed plan is cancelled without permitting its first instruction.

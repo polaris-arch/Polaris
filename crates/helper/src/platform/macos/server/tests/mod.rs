@@ -551,6 +551,7 @@ fn process_conn_pinned_start_full_flow_with_native_peer() {
     };
     for fwd in [false, true] {
         let params = PinnedStartParams {
+            runtime_directory: None,
             id: CoreId::parse(&"a".repeat(64)).unwrap(),
             common: StartParams {
                 cfg: "/Users/test/Polaris/c.json".into(),

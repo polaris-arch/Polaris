@@ -165,6 +165,7 @@ fn production_spawn_reaches_log_pinning_without_a_deployment_gate() {
         birth: None,
         binary: dir.path().join("sing-box"),
         config: dir.path().join("cfg.json"),
+        runtime_directory: None,
         log: Some(dir.path().join("core.log")),
         fwd: false,
         parent_pid: None,

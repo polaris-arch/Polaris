@@ -45,6 +45,8 @@ import { api } from '@/ipc';
 import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
 import { restartReasonKeys, type RestartPrompt } from '@/components/dialogs/restart-apply-reasons';
 import { FormSheet } from './forms/FormSheet';
+import { ImpactApplySummary, impactApplyDisclosure } from '@/components/dialogs/ImpactApplyDialog';
+import { useImpactConfirmation } from '@/components/dialogs/use-impact-confirmation';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import type { ProxyLifecycleEvent } from '@/contracts/types';
 import { useConfirmTwice } from '@/lib/confirm-twice';
@@ -53,6 +55,8 @@ import { useStagedConfigStore } from '@/store/staged-config-store';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
+  applyReceiptState,
+  dismissApplyState,
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   composeBarView,
@@ -72,10 +76,12 @@ const ACTION_LABEL: Record<BarActionId, string> = {
   dismissApply: 'home.pendingIgnoreBtn',
   retrySave: 'home.pendingRetrySaveBtn',
   retryPersistence: 'home.pendingRetryPersistenceBtn',
+  retryHost: 'home.pendingRetryHostBtn',
+  checkHost: 'home.pendingCheckHostBtn',
 };
 
 /** 主按钮（实心）：断流的那颗永远是主按钮，与桌面同口径。 */
-const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply', 'retryPersistence']);
+const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply', 'retryPersistence', 'retryHost']);
 
 /** 「重置」的原地二次确认 key（同桌面 `PendingChangesBar` 的 `RESET_KEY`）。 */
 const RESET_KEY = 'mobile-reset-pending';
@@ -85,6 +91,7 @@ export function MobilePendingBar(): ReactElement | null {
   const pending = useAppStore((s) => s.pendingChanges);
   /** 「立即应用」保存后请求 HOT；仅确认重启时允许中断连接。核没在跑时没有应用对象，那颗整颗不渲染（见 `BarInput.coreRunning`）。 */
   const coreRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
+  const coreGeneration = useAppStore((s) => s.proxyStatus?.mainGeneration);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
   const conflict = useStagedConfigStore((s) => s.conflict);
@@ -93,6 +100,7 @@ export function MobilePendingBar(): ReactElement | null {
     reason: null,
   });
   const [restartPrompt, setRestartPrompt] = useState<RestartPrompt | null>(null);
+  const impactChoice = useImpactConfirmation();
   const applyRequest = useRef<{
     awaitingReply: boolean;
     cancelled: boolean;
@@ -109,7 +117,7 @@ export function MobilePendingBar(): ReactElement | null {
   translateRef.current = simpleT;
   const { armed, confirmTwice } = useConfirmTwice();
 
-  useRuntimeApplyReconciliation(apply, setApply, applyRequest, simpleT);
+  const reconciliation = useRuntimeApplyReconciliation(apply, setApply, applyRequest, simpleT);
 
   // Await actual listener registration before issuing Apply; plain start/error broadcasts have
   // no action ownership and therefore must not decide this request's outcome.
@@ -123,7 +131,10 @@ export function MobilePendingBar(): ReactElement | null {
           && Number.isSafeInteger(data.mainGeneration)
           && data.mainGeneration >= (request.earlyGeneration ?? Number.POSITIVE_INFINITY)) {
         request.cancelled = true;
-        setApply((state) => state.reconciling ? { ...state, reconciling: false } : state);
+        setApply((state) => state.reconciling || state.hostReconciling
+          ? { ...state, reconciling: false, hostReconciling: false,
+            ...(state.host && state.host.phase !== 'settled'
+              ? { host: { ...state.host, phase: 'failed', superseded: true } } : {}) } : state);
       }
       if (request.awaitingReply) {
         // Payload retention is bounded, but generation knowledge must never be evicted.
@@ -208,18 +219,38 @@ export function MobilePendingBar(): ReactElement | null {
     pendingCount: pendingChangesCount(pending),
     applyError: apply.reason,
     coreRunning,
-    persistenceRetryAvailable: !!apply.transactionId,
+    coreGeneration,
+    persistenceRetryAvailable: !!apply.coreRecovery || (apply.configurationDurable !== true && !!apply.transactionId
+      && (apply.persistenceOnly === true || apply.phase === 'durabilityPending')),
+    host: apply.host,
+    persistenceRetrying: apply.persistenceRetrying,
+    persistenceOwnerPending: !!apply.coreRecovery && apply.coreRecovery.selectionIntentGeneration === undefined,
     persistenceOnly: apply.persistenceOnly,
     persistenceRecoveryEnded: apply.persistenceRecoveryEnded,
   });
-  if (!view.visible && restartPrompt === null) return null;
+  if (!view.visible && restartPrompt === null && impactChoice.prompt === null) return null;
 
-  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string): Promise<void> => {
-    if (applyRequest.current?.awaitingReply || apply.phase === 'applying') return;
+  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string, impactConfirmation?: string, hostRetry = false): Promise<void> => {
+    if (applyRequest.current?.awaitingReply || apply.phase === 'applying'
+        || apply.host?.phase === 'pending' && !apply.host.superseded) return;
+    if (hostRetry && useStagedConfigStore.getState().entries.length > 0) return;
+    const hostDebt = apply.host !== undefined && apply.host.phase !== 'settled';
+    const hostCandidate = hostRetry ? { draft: useStagedConfigStore.getState().entries,
+      config: useAppStore.getState().config } : null;
+    const sameHostCandidate = () => hostCandidate !== null
+      && useStagedConfigStore.getState().entries === hostCandidate.draft
+      && useAppStore.getState().config === hostCandidate.config;
+    const retainingRecovery = persistenceTransactionId !== undefined
+      && apply.coreRecovery?.transactionId === persistenceTransactionId;
     setRestartPrompt(null);
+    if (impactConfirmation === undefined) impactChoice.dismiss();
+    else impactChoice.hide();
     const generation = useAppStore.getState().proxyStatus?.mainGeneration;
-    const initial: ApplyState = { phase: 'applying', reason: null,
-      persistenceOnly: persistenceTransactionId !== undefined, transactionId: persistenceTransactionId,
+    const initial: ApplyState = { ...(hostDebt || retainingRecovery ? apply : {}), phase: 'applying', reason: null,
+      ...(hostDebt || retainingRecovery ? { reconciling: false } : {}),
+      ...(hostDebt ? { host: { ...apply.host!, superseded: true }, hostReconciling: false } : {}),
+      persistenceOnly: persistenceTransactionId !== undefined || (hostDebt && apply.persistenceOnly === true),
+      transactionId: persistenceTransactionId ?? (hostDebt ? apply.transactionId : undefined),
       ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) };
     const request = { awaitingReply: true, cancelled: false,
       intentGeneration: undefined as number | undefined,
@@ -231,16 +262,35 @@ export function MobilePendingBar(): ReactElement | null {
       if (!lifecycleReady.current) throw new Error('APPLY_LIFECYCLE_LISTENER_UNAVAILABLE');
       await lifecycleReady.current;
       if (applyRequest.current !== request) return;
-      const result = persistenceTransactionId === undefined
-        ? await useStagedConfigStore.getState().applyNow(restartConfirmation)
-        : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
+      if (request.cancelled) {
+        request.awaitingReply = false;
+        setApply({ ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: false, hostReconciling: false });
+        return;
+      }
+      if (hostRetry && !sameHostCandidate()) {
+        request.awaitingReply = false;
+        setApply({ ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery });
+        return;
+      }
+      const result = hostRetry
+        // Fresh Plan/confirmation for the saved candidate; never save drafts or replay a Core transaction.
+        ? { ...await api.proxy.applyPendingChanges(), saved: true }
+        : persistenceTransactionId === undefined
+          ? await (impactConfirmation === undefined
+            ? useStagedConfigStore.getState().applyNow(restartConfirmation)
+            : useStagedConfigStore.getState().applyNow(undefined, impactConfirmation))
+          : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       if (!result.saved) {
-        setApply({ phase: 'idle', reason: null });
+        setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery } : { phase: 'idle', reason: null });
         return;
       }
-      if ((result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'unconfirmed')
+      if ((result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'unconfirmed'
+          || result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed')
           && (request.cancelled || (request.earlyGeneration ?? 0) > (initial.mainGeneration ?? 0))) {
         request.early = [];
         setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
@@ -248,9 +298,26 @@ export function MobilePendingBar(): ReactElement | null {
       }
       if (persistenceTransactionId !== undefined
           && (result.transactionId !== persistenceTransactionId
-            || !['hotApplied', 'hotDurabilityPending', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
+            || !['hotApplied', 'hotDurabilityPending', 'hostEffectsPending', 'hostEffectsFailed', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
         request.early = [];
         setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+        return;
+      }
+      if (result.status === 'impactConfirmationRequired') {
+        request.early = [];
+        if (hostRetry && !sameHostCandidate()) {
+          if (result.impactConfirmation) void api.proxy.cancelRuntimeImpact(result.impactConfirmation).catch(() => null);
+          setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotConflict'),
+            reconciling: !!initial.coreRecovery });
+          return;
+        }
+        if (request.cancelled || !impactChoice.offer(result)) {
+          if (result.impactConfirmation) void api.proxy.cancelRuntimeImpact(result.impactConfirmation).catch(() => null);
+          setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+          return;
+        }
+        setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery } : { phase: 'idle', reason: null });
         return;
       }
       if (result.status === 'restartRequired') {
@@ -261,7 +328,8 @@ export function MobilePendingBar(): ReactElement | null {
           return;
         }
         setRestartPrompt({ token: result.restartConfirmation, reasons: result.reasons ?? [] });
-        setApply({ phase: 'idle', reason: null });
+        setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery } : { phase: 'idle', reason: null });
         return;
       }
       const reconcileOwnerKnown = Number.isSafeInteger(result.runtimeGeneration) && (result.runtimeGeneration ?? 0) > 0
@@ -270,11 +338,21 @@ export function MobilePendingBar(): ReactElement | null {
       const outcome = applyOutcome(result.status, result.reasons);
       let next: ApplyState = { ...initial, phase: outcome.phase,
         reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null,
-        transactionId: result.transactionId,
+        transactionId: result.transactionId ?? initial.transactionId,
         persistenceRecoveryEnded: persistenceTransactionId !== undefined
           && runtimePersistenceRecoveryEnded(result.status, result.reasons),
         mainGeneration: result.runtimeGeneration ?? initial.mainGeneration,
-        reconciling: !request.cancelled && reconcileOwnerKnown && !!result.transactionId && (result.status === 'hotDurabilityPending' || result.status === 'unconfirmed') };
+        reconciling: !request.cancelled && (initial.coreRecovery !== undefined
+          || reconcileOwnerKnown && !!result.transactionId && (result.status === 'hotDurabilityPending' || result.status === 'unconfirmed')) };
+      // Legacy hotApplied already confirmed durability; an explicit false never borrows that meaning.
+      const receipt = result.status === 'hotApplied' && result.transactionId !== undefined && result.configurationDurable !== false
+        ? { ...result, configurationDurable: true } : result;
+      next = applyReceiptState(next, receipt, true);
+      next.hostReconciling = !request.cancelled && reconcileOwnerKnown && next.host?.phase === 'pending';
+      if ((result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed')
+          && (!result.hostExecutionId || !reconcileOwnerKnown)) {
+        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false };
+      }
       if (outcome.phase === 'applying') {
         if (typeof result.applyId !== 'number' || !Number.isSafeInteger(result.applyId) || result.applyId <= 0) {
           next = { phase: 'failed', reason: null };
@@ -293,12 +371,13 @@ export function MobilePendingBar(): ReactElement | null {
       request.early = [];
       setApply(next);
       // Preserve the mobile policy: an Apply racing Stop stays neutral without a skipped toast.
-      if (outcome.toast !== null && result.status !== 'skipped') toast[outcome.toast.kind](t(outcome.toast.key));
+      if (outcome.toast !== null && result.status !== 'skipped'
+          && !(result.status === 'hotApplied' && next.host && next.host.phase !== 'settled')) toast[outcome.toast.kind](t(outcome.toast.key));
     } catch (error) {
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       request.early = [];
-      setApply({ ...initial, phase: 'failed', reason: null });
+      setApply({ ...initial, phase: 'failed', reason: null, reconciling: !request.cancelled && !!initial.coreRecovery });
       console.error('[MobilePendingBar] Apply failed:', error);
     }
   };
@@ -323,10 +402,17 @@ export function MobilePendingBar(): ReactElement | null {
         void onApply();
         return;
       case 'retryPersistence':
-        if (apply.transactionId) void onApply(undefined, apply.transactionId);
+        if (apply.host && (apply.coreRecovery || apply.host.phase !== 'settled')) void reconciliation.retryPersistence();
+        else if (apply.transactionId) void onApply(undefined, apply.transactionId);
+        return;
+      case 'retryHost':
+        void onApply(undefined, undefined, undefined, true);
+        return;
+      case 'checkHost':
+        reconciliation.checkHost();
         return;
       case 'dismissApply':
-        setApply({ phase: 'idle', reason: null });
+        setApply(dismissApplyState);
     }
   };
 
@@ -338,7 +424,9 @@ export function MobilePendingBar(): ReactElement | null {
     >
       <div className="m-pending-text">
         <b>{armed === RESET_KEY ? t('home.pendingResetShortConfirm') : t(view.titleKey, view.titleVars)}</b>
-        {pendingPhase === 'pending' && (
+        {apply.host && apply.host.phase !== 'settled' && view.detailKey !== '' ? (
+          <span className="m-pending-detail">{t(view.detailKey)}</span>
+        ) : pendingPhase === 'pending' && (
           <span className="m-pending-detail">{t('home.pendingSavedStillNeedsApply')}</span>
         )}
       </div>
@@ -360,6 +448,18 @@ export function MobilePendingBar(): ReactElement | null {
           );
         })}
       </div>
+      {impactChoice.prompt !== null && (
+        <FormSheet compact title={t('home.impactApplyTitle')}
+          onRequestClose={impactChoice.dismiss} closeLabel={t('common.close')}
+          cancelLabel={t('common.cancel')} submitLabel={t('home.impactApplyConfirm')}
+          submitDisabled={impactApplyDisclosure(impactChoice.prompt).blocked}
+          onSubmit={() => {
+            const prompt = impactChoice.prompt;
+            if (prompt && !impactApplyDisclosure(prompt).blocked) void onApply(undefined, undefined, prompt.token);
+          }}>
+          <ImpactApplySummary prompt={impactChoice.prompt} />
+        </FormSheet>
+      )}
       {restartPrompt !== null && (
         <FormSheet
           compact

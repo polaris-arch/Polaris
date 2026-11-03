@@ -1726,3 +1726,44 @@ fn native_status_parser_keeps_real_mac_core_binding_without_inventing_os_fields(
         ))
     ));
 }
+
+#[test]
+fn explicit_linux_runtime_directory_is_negotiated_without_changing_legacy_frames() {
+    for (version, expected) in [
+        ("OK 3\n", None),
+        ("OK 4\n", Some("/app/state 测试")),
+        ("ERR unknown\n", None),
+        ("OK nonsense\n", None),
+    ] {
+        let (client, connects, frames) = stop_test_client_with_frames(
+            Platform::Linux,
+            vec![polaris_helper_client::MockStream::with_response(
+                version.as_bytes().to_vec(),
+            )],
+        );
+        assert_eq!(
+            linux_runtime_directory_with_client(&client, Path::new("/app/state 测试"))
+                .unwrap()
+                .as_deref(),
+            expected
+        );
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(frames.lock().unwrap().as_slice(), ["version\n"]);
+    }
+    let (client, connects, _) = stop_test_client_with_frames(Platform::Win, vec![]);
+    assert_eq!(
+        linux_runtime_directory_with_client(&client, Path::new("C:\\state")).unwrap(),
+        None
+    );
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    let (client, _, _) = stop_test_client_with_frames(
+        Platform::Linux,
+        vec![polaris_helper_client::MockStream::with_response(
+            b"OK 4\n".to_vec(),
+        )],
+    );
+    assert!(linux_runtime_directory_with_client(&client, Path::new("relative")).is_err());
+    let source = crate_code("runtime/helper.rs");
+    assert!(source
+        .contains("runtime_directory: linux_runtime_directory_with_client(&client, &self.dir)?"));
+}

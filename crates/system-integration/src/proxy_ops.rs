@@ -43,7 +43,7 @@ pub use macos_cli::{
 };
 pub use model::{
     points_to_mixed_inbound, MacProxyTransactionWriter, MacProxyWriterError, ProxyEnableRequest,
-    SystemProxyLiveStatus, WindowsProxyRegistryValues, WindowsProxyRegistryWriter,
+    PreparedProxyEffect, TakeoverOutcome, TakeoverReceipt, SystemProxyLiveStatus, WindowsProxyRegistryValues, WindowsProxyRegistryWriter,
     WindowsProxyWriterError,
 };
 #[cfg(target_os = "macos")]

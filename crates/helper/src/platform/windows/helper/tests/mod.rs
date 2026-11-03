@@ -96,6 +96,7 @@ fn pinned_start(
     common: StartParams,
 ) -> Request {
     Request::NativeStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        runtime_directory: None,
         id: polaris_helper_proto::core_manifest::CoreId::parse(
             &h.test_context.as_ref().unwrap().core.manifest.id,
         )

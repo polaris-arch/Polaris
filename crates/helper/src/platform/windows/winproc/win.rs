@@ -161,6 +161,7 @@ impl WinProcOps {
 /// opened original CWD. Prefix handles deny rename while resolving descendants.
 struct ConfinedConfig {
     file: File,
+    runtime_directory: PathBuf,
     _directories: Vec<File>,
 }
 
@@ -228,6 +229,7 @@ fn open_confined_config(
     }
     Ok(ConfinedConfig {
         file,
+        runtime_directory: PathBuf::from(registered),
         _directories: directories,
     })
 }
@@ -381,7 +383,11 @@ impl WinProcOps {
         // object itself: child never reopens a mutable privileged path. Original
         // App config can still be atomically replaced for a future Start.
         // Bytes remain same-account mutable; this is not a frozen snapshot.
-        let ConfinedConfig { file, _directories } = config;
+        let ConfinedConfig {
+            file,
+            runtime_directory,
+            _directories,
+        } = config;
         // SYSTEM helper 必须在 spawn 前固定日志对象。每级目录 handle 都拒绝 reparse 且不共享
         // DELETE，直到 current/.1 两个 file object 都打开；之后轮转只操作这两个 handle。
         // 安全打开失败只关闭日志能力，pipe 仍会被排空，不阻断核心启动。
@@ -403,7 +409,7 @@ impl WinProcOps {
         let process_started = Instant::now();
         // The factory fixes the admitted image, argv, cleared environment,
         // physical guards and fail-stop job before the first instruction.
-        let child = execution.spawn_windows_main(file, Path::new(&cwd))?;
+        let child = execution.spawn_windows_main(file, Path::new(&cwd), &runtime_directory)?;
         let process_ms = crate::elapsed_ms(process_started);
         let (pid, handle, stdout, stderr, execution_custody) = child.into_parts();
         let stdout = Some(stdout);

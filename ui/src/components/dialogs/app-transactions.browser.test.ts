@@ -615,6 +615,8 @@ api.proxy.onLifecycleReady = async listener => {
   return () => { test.events = null; };
 };
 api.proxy.applyPendingChanges = async token => { test.applyTokens = [...(test.applyTokens ?? []), token]; test.applyCalls++; return new Promise(resolve => { test.receipt = resolve; }); };
+api.proxy.confirmRuntimeImpact = async token => { test.impactTokens = [...(test.impactTokens ?? []), token]; return new Promise(resolve => { test.receipt = resolve; }); };
+api.proxy.cancelRuntimeImpact = async token => { test.cancelledImpactTokens = [...(test.cancelledImpactTokens ?? []), token]; return { ok: true, status: 'cancelled' }; };
 api.proxy.retryRuntimePersistence = async transactionId => { test.persistenceTransactions = [...(test.persistenceTransactions ?? []), transactionId]; return new Promise((resolve, reject) => { test.retryReceipt = resolve; test.retryReject = reject; }); };
 api.proxy.runtimeApplyStatus = async transactionId => { test.runtimeStatusReads = (test.runtimeStatusReads ?? 0) + 1; test.runtimeTransactions = [...(test.runtimeTransactions ?? []), transactionId]; return new Promise(resolve => { test.statusReceipt = resolve; }); };
 api.proxy.getStatus = async () => { test.statusReads = (test.statusReads ?? 0) + 1; return { running: true, mainGeneration: 99, ownedStopContext: { selectedServerId: useAppStore.getState().selectedServerId, selectionIntentGeneration: 0 } }; };
@@ -1345,6 +1347,106 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await page.evaluate('window.__transactions.events({phase:"stopped",kind:"stop",terminal:true,mainGeneration:11}); window.__transactions.statusReceipt({ok:true,status:"hotApplied",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0});');
       await page.getByText('Applied at runtime; persistence is still pending.', {exact:true}).waitFor();
       expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.close();
+    }));
+    it('retains an explicit impact decision and confirms the same plan without saving or replanning', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+      const page = await browser.newPage({ locale: 'en-US' });
+      await openFixture(page, origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ ok:false,status:"impactConfirmationRequired",impactConfirmation:"exact-impact",runtimeGeneration:10,selectionIntentGeneration:0,coreImpacts:[{path:"secret-path-never-render",updateClass:3,reason:"private-reason-never-render",affectedSessionClasses:["existing TUN TCP flows","existing TUN UDP associations","changed ingress admissions"],reconnectRequired:true}] });');
+      await page.getByRole('dialog').waitFor();
+      expect(await page.getByRole('dialog').textContent()).not.toContain('secret-path-never-render');
+      expect(await page.getByRole('dialog').textContent()).not.toContain('private-reason-never-render');
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      await page.getByRole('button', { name: 'Confirm and apply', exact: true }).click();
+      await page.waitForFunction('window.__transactions.impactTokens?.length === 1');
+      expect(await page.evaluate('window.__transactions.impactTokens')).toEqual(['exact-impact']);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      await page.evaluate('window.__transactions.receipt({ok:false,status:"conflict",pendingApply:true});');
+      await page.locator(errorBar).waitFor();
+      await page.close();
+    }));
+    it.for([
+      { name: 'TUN', classes: ['existing TUN TCP flows', 'existing TUN UDP associations', 'changed ingress admissions'],
+        expected: ['impactApplyTunTcpReset', 'impactApplyTunUdpReset', 'impactApplyTunRollback'], absent: 'impactApplyApiStreams' },
+      { name: 'API-dashboard', classes: ['API streams on the replaced ingress', 'api_generation_handoff_v1', 'dashboard updater'],
+        expected: ['impactApplyApiStreams', 'impactApplyDashboard'], absent: 'impactApplyTunRollback' },
+      { name: 'listener-UDP', classes: ['changed ingress admissions', 'affected UDP associations', 'dependent listener handoff'],
+        expected: ['impactApplyListenerAdmissions', 'impactApplyListenerUdp', 'impactApplyListenerHandoff'], absent: 'impactApplyTunRollback' },
+    ] as const)('shows the exact $name impact in the existing confirmation before token-only Apply', async (scenario, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+      const page = await browser.newPage({ locale: 'en-US' });
+      await openFixture(page, origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      const token = 'private-impact-' + scenario.name;
+      await page.evaluate(`window.__transactions.receipt(${JSON.stringify({ ok: false, status: 'impactConfirmationRequired',
+        impactConfirmation: token, runtimeGeneration: 10, selectionIntentGeneration: 0, coreImpacts: [{
+          path: 'private-impact-path', reason: 'private-impact-reason', updateClass: 2,
+          affectedSessionClasses: scenario.classes, reconnectRequired: true,
+        }] })});`);
+      const dialog = page.getByRole('dialog');
+      await dialog.waitFor();
+      const text = await dialog.textContent();
+      for (const key of scenario.expected) expect(text).toContain(enUS.home[key]);
+      expect(text).not.toContain(enUS.home[scenario.absent]);
+      expect(text).toContain(enUS.home.impactApplySavedPending);
+      for (const raw of [token, 'private-impact-path', 'private-impact-reason', 'api_generation_handoff_v1']) expect(text).not.toContain(raw);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      await dialog.getByRole('button', { name: enUS.home.impactApplyConfirm, exact: true }).click();
+      await page.waitForFunction('window.__transactions.impactTokens?.length === 1');
+      expect(await page.evaluate('window.__transactions.impactTokens')).toEqual([token]);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      await page.evaluate('window.__transactions.receipt({ok:false,status:"conflict",pendingApply:true});');
+      await page.locator(errorBar).waitFor();
+      await page.close();
+    }));
+    it.for([
+      { name: 'session-class', classes: ['private-unknown-session'], updateClass: 2 },
+      { name: 'update-class', classes: ['API streams on the replaced ingress'], updateClass: 99 },
+    ])('blocks an unknown $name and cancels its token without changing the running configuration', async (scenario, fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+      const page = await browser.newPage({ locale: 'en-US' });
+      await openFixture(page, origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate(`window.__transactions.receipt(${JSON.stringify({ ok: false, status: 'impactConfirmationRequired',
+        impactConfirmation: 'private-unknown-impact', runtimeGeneration: 10, selectionIntentGeneration: 0, coreImpacts: [{
+          path: 'private-impact-path', reason: 'private-impact-reason', updateClass: scenario.updateClass,
+          affectedSessionClasses: scenario.classes, reconnectRequired: true,
+        }] })});`);
+      const dialog = page.getByRole('dialog');
+      await dialog.waitFor();
+      expect(await dialog.getByRole('alert').textContent()).toBe(enUS.home.impactApplyUnknown);
+      expect(await dialog.getByRole('button', { name: enUS.home.impactApplyConfirm, exact: true }).isDisabled()).toBe(true);
+      const text = await dialog.textContent();
+      for (const raw of ['private-unknown-impact', 'private-unknown-session', 'private-impact-path', 'private-impact-reason']) expect(text).not.toContain(raw);
+      await dialog.getByRole('button', { name: enUS.common.cancel, exact: true }).click();
+      await page.waitForFunction('window.__transactions.cancelledImpactTokens?.includes("private-unknown-impact")');
+      expect(await page.getByRole('dialog').count()).toBe(0);
+      expect(await page.evaluate('window.__transactions.impactTokens ?? []')).toEqual([]);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      expect(await page.locator(button).isEnabled()).toBe(true);
+      await page.close();
+    }));
+    it('cancels an impact choice when a newer draft is staged without applying either draft', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+      const page = await browser.newPage({ locale: 'en-US' });
+      await openFixture(page, origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ok:false,status:"impactConfirmationRequired",impactConfirmation:"stale-impact",runtimeGeneration:10,selectionIntentGeneration:0});');
+      await page.getByRole('dialog').waitFor();
+      await page.evaluate('window.__transactions.stagePersistenceDraft();');
+      await page.waitForFunction('window.__transactions.cancelledImpactTokens?.includes("stale-impact")');
+      expect(await page.getByRole('dialog').count()).toBe(0);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.impactTokens ?? []')).toEqual([]);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      expect(await page.evaluate('window.__transactions.draftCount()')).toBe(1);
       await page.close();
     }));
     it('asks before restart, decline preserves pending, and stale confirmation stays failed', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {

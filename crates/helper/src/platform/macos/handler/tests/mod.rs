@@ -774,3 +774,25 @@ fn proto_start_params() -> polaris_helper_proto::StartParams {
         parent_pid: Some(3333),
     }
 }
+
+#[test]
+fn linux_checked_dns_snapshot_and_compare_are_truly_unsupported_on_mac() {
+    let svc = TestServices::new("t");
+    let cfg = test_config();
+    for request in [
+        Request::LinuxDnsSnapshot,
+        Request::LinuxDnsCompare {
+            payload: "{}".into(),
+        },
+    ] {
+        assert!(matches!(
+            dispatch(&svc, &cfg, "t", &request),
+            Response::Err(ProtoError {
+                code: ErrorCode::Unknown,
+                ..
+            })
+        ));
+    }
+    assert!(svc.calls().is_empty());
+    assert!(svc.child.lock().unwrap().is_none());
+}

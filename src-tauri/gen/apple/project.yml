@@ -124,6 +124,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(POLARIS_BUNDLE_ID).PacketTunnel
         PRODUCT_NAME: PolarisPacketTunnel
         OTHER_LDFLAGS: $(inherited) "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args"
+        OTHER_SWIFT_FLAGS: $(inherited) "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args"
         APPLICATION_EXTENSION_API_ONLY: true
         FRAMEWORK_SEARCH_PATHS: $(inherited) "$(POLARIS_LIBBOX_GENERATION_ROOT)"
         SKIP_INSTALL: true
@@ -163,6 +164,7 @@ targets:
         basedOnDependencyAnalysis: false
         outputFiles:
           - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args
+          - $(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args
           - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json
     postBuildScripts:
       - name: Verify TLS Capability Link
@@ -172,3 +174,4 @@ targets:
         inputFiles:
           - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
           - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json
+          - $(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args

@@ -1,9 +1,9 @@
 /**
  * export-log-fixtures.mts — 导出 buildLogConfig 金样对拍 fixture（B1 对拍脚手架）。
  *
- * 内联 上游 `singbox-log-builder.ts buildLogConfig` + `log-level.ts effectiveLogLevel` 逻辑
+ * 当前 producer recipe：基于原 `buildLogConfig`/`effectiveLogLevel`，SC02保留disabled TUN输出锚点元数据
  * （避免 import 拖入 electron 依赖 —— getSingBoxLogPath → app.getPath）。
- * 逻辑与 上游 源逐行对齐；Rust 侧 build_log_config 对拍此输出。
+ * Rust 侧逐项对拍当前 recipe；SC02 的 30 个 disabled TUN cases 只新增原固定 output 元数据。
  *
  * 覆盖矩阵：3 platform × 3 proxyModeType × {privacy on/off} × {disableLogFile on/off} × 5 logLevel = 180 cases。
  *
@@ -35,8 +35,8 @@ function buildLogConfig(
     timestamp: true,
   };
   if (disableLogFile) {
+    // Preserve the inert host-owned output anchor for same-process enable.
     cfg.disabled = true;
-    return cfg;
   }
   const isTunMode = proxyModeType?.toLowerCase() === 'tun';
   const writesLogToFile =

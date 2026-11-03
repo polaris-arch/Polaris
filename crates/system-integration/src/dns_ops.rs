@@ -23,7 +23,7 @@ use crate::dns::{
 use crate::error::SystemIntegrationError;
 use crate::exec::{Command, CommandRunner};
 use crate::proxy::MarkerFs;
-use crate::proxy_ops::{retry_op, RetryConfig};
+use crate::proxy_ops::{retry_op, RetryConfig, TakeoverOutcome, TakeoverReceipt};
 use polaris_helper_proto::Platform;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -67,8 +67,12 @@ impl<Fs: MarkerFs> DnsMarker<Fs> {
     }
 
     fn read_checked(&self) -> std::io::Result<Option<SystemDnsMarker>> {
+        self.read_raw_checked().map(|(_, marker)| marker)
+    }
+
+    fn read_raw_checked(&self) -> std::io::Result<(Option<String>, Option<SystemDnsMarker>)> {
         let Some(raw) = self.fs.read_marker_checked(&self.path)? else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let marker: SystemDnsMarker = serde_json::from_str(&raw)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -78,7 +82,7 @@ impl<Fs: MarkerFs> DnsMarker<Fs> {
                 "invalid DNS marker",
             ));
         }
-        Ok(Some(marker))
+        Ok((Some(raw), Some(marker)))
     }
 
     /// 读 marker；不存在 / 损坏 / 结构非法 → None。
@@ -353,6 +357,96 @@ fn dns_set_should_retry(e: &SystemIntegrationError) -> bool {
     !crate::proxy_ops::is_permission_denied(&e.to_string().to_lowercase())
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DnsEffectMarker {
+    operation_id: String,
+    phase: String,
+    before: BTreeMap<String, Vec<String>>,
+    target: BTreeMap<String, Vec<String>>,
+}
+
+fn dns_effect_marker(
+    raw: &str,
+    baseline: &SystemDnsMarker,
+) -> Result<Option<DnsEffectMarker>, SystemIntegrationError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| SystemIntegrationError::dns(e.to_string()))?;
+    let Some(effect) = value.get("hostEffect") else {
+        return Ok(None);
+    };
+    let effect: DnsEffectMarker = serde_json::from_value(effect.clone())
+        .map_err(|e| SystemIntegrationError::dns(e.to_string()))?;
+    if effect.operation_id.trim().is_empty()
+        || !matches!(effect.phase.as_str(), "applying" | "owned" | "restoring")
+        || effect.before.is_empty()
+        || !effect.before.keys().eq(effect.target.keys())
+        || !effect.before.keys().eq(baseline.original.keys())
+        || effect
+            .before
+            .values()
+            .chain(effect.target.values())
+            .flatten()
+            .any(|ip| ip.parse::<std::net::IpAddr>().is_err())
+        || effect.phase == "owned"
+            && effect
+                .target
+                .values()
+                .any(|ips| !is_controlled(ips, &baseline.controlled_ip))
+    {
+        return Err(SystemIntegrationError::dns(
+            "invalid live DNS recovery footprint",
+        ));
+    }
+    Ok(Some(effect))
+}
+
+/// Full snapshots are a private App recipe, never an IPC response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedDnsEffect {
+    marker_path: String,
+    marker_raw: Option<String>,
+    before: BTreeMap<String, Vec<String>>,
+    target: BTreeMap<String, Vec<String>>,
+    original: BTreeMap<String, Vec<String>>,
+    controlled_ip: String,
+    enabled: bool,
+    physical_lan_resolver: Option<String>,
+}
+
+impl PreparedDnsEffect {
+    /// Bind the existing App pre-TUN resolver, never a fresh in-TUN probe.
+    pub fn with_physical_lan_resolver(mut self, resolver: Option<String>) -> Self {
+        self.physical_lan_resolver = resolver;
+        self
+    }
+    pub fn prior_marker_operation_id(&self) -> Option<String> {
+        let raw = self.marker_raw.as_ref()?;
+        let marker: SystemDnsMarker = serde_json::from_str(raw).ok()?;
+        dns_effect_marker(raw, &marker)
+            .ok()
+            .flatten()
+            .map(|effect| effect.operation_id)
+    }
+    pub fn needs_prior_restore(&self) -> bool {
+        self.marker_raw.as_ref().is_some_and(|raw| {
+            serde_json::from_str::<SystemDnsMarker>(raw)
+                .ok()
+                .and_then(|marker| dns_effect_marker(raw, &marker).ok().flatten())
+                .is_some_and(|effect| effect.phase != "owned")
+        })
+    }
+    pub fn scope(&self) -> &str {
+        &self.marker_path
+    }
+    pub fn before(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.before
+    }
+    pub fn target(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.target
+    }
+}
+
 /// 系统 DNS 控制器：setDns / restoreDns / reconcileDns / sync 编排。
 pub struct SystemDnsController<Ops: SystemDnsOps, Fs: MarkerFs> {
     ops: Ops,
@@ -437,9 +531,401 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         Ok(current)
     }
 
+    /// Read-only exact recipe. DHCP is an empty static list, never a failed read.
+    /// Effective physical resolvers are supplied by the retained pre-TUN deps, not
+    /// freshly probed through an active tunnel.
+    pub fn prepare_effect(
+        &self,
+        enabled: bool,
+    ) -> Result<PreparedDnsEffect, SystemIntegrationError> {
+        if !self.ops.takeover_supported() || !is_controlled_dns_ip_valid(&self.marker.controlled_ip)
+        {
+            return Err(SystemIntegrationError::UnsupportedPlatform(
+                "live system DNS takeover".into(),
+            ));
+        }
+        let (marker_raw, marker) = self
+            .marker
+            .read_raw_checked()
+            .map_err(|e| SystemIntegrationError::dns(e.to_string()))?;
+        let mut targets = self.ops.list_targets()?;
+        targets.sort();
+        if targets.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(SystemIntegrationError::dns(
+                "duplicate DNS service identity",
+            ));
+        }
+        if enabled && targets.is_empty() {
+            return Err(SystemIntegrationError::dns(
+                "no DNS service available for takeover",
+            ));
+        }
+        if let Some(marker) = &marker {
+            targets.extend(marker.original.keys().cloned());
+            targets.sort();
+            targets.dedup();
+        }
+        let before = self.snapshot_current(&targets)?;
+        if let (Some(raw), Some(marker)) = (&marker_raw, &marker) {
+            if let Some(effect) = dns_effect_marker(raw, marker)? {
+                for (name, target) in &effect.target {
+                    let current = before.get(name).ok_or_else(|| {
+                        SystemIntegrationError::dns("DNS original scope is unavailable")
+                    })?;
+                    let owned = effect.phase == "owned" && current == target;
+                    let partial = effect.phase != "owned"
+                        && (Some(current) == effect.before.get(name)
+                            || current == target
+                            || Some(current) == marker.original.get(name));
+                    if !owned && !partial {
+                        return Err(SystemIntegrationError::dns(
+                            "live DNS values are outside the exact restoration footprint",
+                        ));
+                    }
+                }
+            } else if marker.original.keys().any(|name| {
+                !before
+                    .get(name)
+                    .is_some_and(|ips| is_controlled(ips, &marker.controlled_ip))
+            }) {
+                return Err(SystemIntegrationError::dns(
+                    "legacy DNS intent has no complete owned read-back",
+                ));
+            }
+        }
+        if before.iter().any(|(name, values)| {
+            is_controlled(values, &self.marker.controlled_ip)
+                && !marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.original.contains_key(name))
+        }) {
+            return Err(SystemIntegrationError::dns(
+                "controlled DNS service has no original owner baseline",
+            ));
+        }
+        let mut original = marker
+            .as_ref()
+            .map(|m| m.original.clone())
+            .unwrap_or_default();
+        for (name, ips) in compute_original_to_save(
+            &before,
+            &self.marker.controlled_ip,
+            marker.as_ref().map(|m| &m.original),
+        ) {
+            original.entry(name).or_insert(ips);
+        }
+        let target = if enabled {
+            before
+                .keys()
+                .map(|name| (name.clone(), vec![self.marker.controlled_ip.clone()]))
+                .collect()
+        } else if marker.is_some() {
+            original.clone()
+        } else {
+            before.clone()
+        };
+        Ok(PreparedDnsEffect {
+            marker_path: self.marker.path.clone(),
+            marker_raw,
+            before,
+            target,
+            original,
+            controlled_ip: self.marker.controlled_ip.clone(),
+            enabled,
+            physical_lan_resolver: self.original_lan_resolver.clone(),
+        })
+    }
+
+    /// Read-only adoption requires a complete typed owned scope and target
+    /// readback. A legacy marker/policy bit is not an acceptance receipt.
+    pub fn checked_owned_receipt(&self) -> Result<Option<TakeoverReceipt>, SystemIntegrationError> {
+        let prepared = self.prepare_effect(true)?;
+        let Some(operation) = prepared.prior_marker_operation_id() else {
+            return Ok(None);
+        };
+        if prepared.needs_prior_restore()
+            || prepared.before != prepared.target
+            || !self.effect_facts_match(&prepared)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(TakeoverReceipt::new(
+            &operation,
+            TakeoverOutcome::Unchanged,
+            Some(operation.clone()),
+            None,
+        )))
+    }
+
+    pub fn exact_marker_operation_id(&self) -> Option<String> {
+        let (raw, marker) = self.marker.read_raw_checked().ok()?;
+        let raw = raw?;
+        let marker = marker?;
+        dns_effect_marker(&raw, &marker)
+            .ok()
+            .flatten()
+            .map(|effect| effect.operation_id)
+    }
+
+    pub fn prepare_after_restore(
+        &self,
+        prior: &PreparedDnsEffect,
+    ) -> Result<PreparedDnsEffect, SystemIntegrationError> {
+        let next = self
+            .prepare_effect(prior.enabled)?
+            .with_physical_lan_resolver(prior.physical_lan_resolver.clone());
+        if next.marker_path != prior.marker_path
+            || next.marker_raw.is_some()
+            || next.before != prior.original
+            || next.original != prior.original
+            || next.target != prior.target
+        {
+            return Err(SystemIntegrationError::dns(
+                "DNS scope/baseline changed after exact prior-owner restoration",
+            ));
+        }
+        Ok(next)
+    }
+
+    pub fn effect_facts_match(
+        &self,
+        prepared: &PreparedDnsEffect,
+    ) -> Result<bool, SystemIntegrationError> {
+        let current = self
+            .prepare_effect(prepared.enabled)?
+            .with_physical_lan_resolver(prepared.physical_lan_resolver.clone());
+        Ok(current == *prepared)
+    }
+
+    fn effect_intent(
+        &self,
+        prepared: &PreparedDnsEffect,
+        operation_id: &str,
+        phase: &str,
+    ) -> Result<String, String> {
+        let baseline = SystemDnsMarker {
+            controlled_ip: self.marker.controlled_ip.clone(),
+            original: prepared.original.clone(),
+            at: now_ms(),
+        };
+        let mut value = serde_json::to_value(baseline).map_err(|e| e.to_string())?;
+        value["hostEffect"] = serde_json::json!({
+            "operationId": operation_id, "phase": phase,
+            "before": prepared.before, "target": prepared.target,
+        });
+        serde_json::to_string(&value).map_err(|e| e.to_string())
+    }
+
+    fn raw_matches(&self, expected: &Option<String>) -> bool {
+        self.marker
+            .fs
+            .read_marker_checked(&self.marker.path)
+            .is_ok_and(|raw| &raw == expected)
+    }
+
+    /// Same controller + durable marker lock as startup/restore/reconcile. Intent
+    /// precedes the first OS write and every completion is read back. A failed live
+    /// apply compensates to this recipe's before state, not the user baseline.
+    pub fn apply_effect(
+        &mut self,
+        prepared: &PreparedDnsEffect,
+        operation_id: &str,
+    ) -> TakeoverReceipt {
+        let receipt = |outcome, reason| {
+            TakeoverReceipt::new(operation_id, outcome, Some(operation_id.to_owned()), reason)
+        };
+        if operation_id.trim().is_empty() {
+            return receipt(
+                TakeoverOutcome::FailedUnchanged,
+                Some("empty DNS operation identity".into()),
+            );
+        }
+        let _marker_lock = match self
+            .marker
+            .fs
+            .acquire_marker_mutation_lock(&self.marker.path)
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                return receipt(TakeoverOutcome::FailedUnchanged, Some(error.to_string()))
+            }
+        };
+        match self.effect_facts_match(prepared) {
+            Ok(true) => {}
+            Ok(false) => {
+                return receipt(
+                    TakeoverOutcome::Superseded,
+                    Some("DNS scope, values or marker changed".into()),
+                )
+            }
+            Err(error) => {
+                return receipt(TakeoverOutcome::FailedUnchanged, Some(error.to_string()))
+            }
+        }
+        let typed_owned = prepared.marker_raw.as_ref().is_some_and(|raw| {
+            self.marker
+                .read()
+                .and_then(|marker| dns_effect_marker(raw, &marker).ok().flatten())
+                .is_some_and(|effect| effect.phase == "owned")
+        });
+        if prepared.before == prepared.target
+            && (prepared.enabled && typed_owned
+                || !prepared.enabled && prepared.marker_raw.is_none())
+        {
+            if prepared.enabled && self.original_lan_resolver.is_none() {
+                self.original_lan_resolver = prepared.physical_lan_resolver.clone();
+            }
+            let mut unchanged = receipt(TakeoverOutcome::Unchanged, None);
+            unchanged.marker_id = None; // no new marker was created by this operation
+            return unchanged;
+        }
+        if prepared.enabled {
+            self.displaced_resolvers = self
+                .ops
+                .read_effective_resolvers()
+                .map(|values| {
+                    crate::dns::displaced_private_resolvers(&values, &self.marker.controlled_ip)
+                })
+                .unwrap_or_default();
+        }
+        let intent = match self.effect_intent(prepared, operation_id, "applying") {
+            Ok(raw) => raw,
+            Err(error) => return receipt(TakeoverOutcome::FailedUnchanged, Some(error)),
+        };
+        if !self.raw_matches(&prepared.marker_raw) {
+            return receipt(
+                TakeoverOutcome::Superseded,
+                Some("DNS marker changed before intent".into()),
+            );
+        }
+        if let Err(error) = self.marker.fs.write_marker(&self.marker.path, &intent) {
+            return receipt(TakeoverOutcome::FailedUnchanged, Some(error.to_string()));
+        }
+        self.original = Some(prepared.original.clone());
+        let owned_raw = Some(intent);
+        let mut attempted = Vec::new();
+        let result: Result<(), String> = (|| {
+            for (name, target) in &prepared.target {
+                if !self.raw_matches(&owned_raw) {
+                    return Err("DNS intent replaced before mutation".into());
+                }
+                let before = prepared
+                    .before
+                    .get(name)
+                    .ok_or("DNS target outside prepared scope")?;
+                let current = self.ops.read_dns(name).map_err(|e| e.to_string())?;
+                if &current != before {
+                    return Err("DNS service changed before mutation".into());
+                }
+                if before != target {
+                    attempted.push(name.clone());
+                    self.ops
+                        .apply_dns(name, target)
+                        .map_err(|e| e.to_string())?;
+                }
+                if self.ops.read_dns(name).map_err(|e| e.to_string())? != *target {
+                    return Err("DNS target read-back mismatch".into());
+                }
+            }
+            let mut visible = self.ops.list_targets().map_err(|error| error.to_string())?;
+            visible.sort();
+            if visible != prepared.before.keys().cloned().collect::<Vec<_>>() {
+                return Err("DNS service inventory changed during mutation".into());
+            }
+            if !self.raw_matches(&owned_raw) {
+                return Err("DNS intent replaced before settlement".into());
+            }
+            if prepared.enabled {
+                let owned = self.effect_intent(prepared, operation_id, "owned")?;
+                self.marker
+                    .fs
+                    .write_marker(&self.marker.path, &owned)
+                    .map_err(|e| e.to_string())?;
+                if self.original_lan_resolver.is_none() {
+                    self.original_lan_resolver = prepared.physical_lan_resolver.clone();
+                }
+            } else {
+                self.marker
+                    .fs
+                    .remove_marker(&self.marker.path)
+                    .map_err(|e| e.to_string())?;
+                self.original = None;
+                self.displaced_resolvers.clear();
+                self.original_lan_resolver = None;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => receipt(TakeoverOutcome::Applied, None),
+            Err(error) => {
+                // Metadata failure may have installed a different phase. Never use a
+                // stale receipt to overwrite it; retained intent owns recovery.
+                if !self.raw_matches(&owned_raw) {
+                    return receipt(TakeoverOutcome::RecoveryPending, Some(error));
+                }
+                let mut restored = true;
+                let mut compensated = false;
+                for name in attempted.iter().rev() {
+                    let before = &prepared.before[name];
+                    let target = &prepared.target[name];
+                    match self.ops.read_dns(name) {
+                        Ok(current) if &current == before => {}
+                        Ok(current) if &current == target => {
+                            compensated = true;
+                            if self.ops.apply_dns(name, before).is_err()
+                                || self
+                                    .ops
+                                    .read_dns(name)
+                                    .map_or(true, |current| &current != before)
+                            {
+                                restored = false;
+                            }
+                        }
+                        _ => restored = false, // foreign/unknown values confer no restore authority
+                    }
+                }
+                // Include untouched services: a concurrent outside change is not a
+                // "restored" receipt merely because our attempted subset recovered.
+                restored &= self
+                    .snapshot_current(&prepared.before.keys().cloned().collect::<Vec<_>>())
+                    .is_ok_and(|current| current == prepared.before);
+                if restored && self.raw_matches(&owned_raw) {
+                    let settled = match &prepared.marker_raw {
+                        Some(raw) => self.marker.fs.write_marker(&self.marker.path, raw),
+                        None => self.marker.fs.remove_marker(&self.marker.path),
+                    }
+                    .is_ok();
+                    if settled {
+                        self.original = prepared
+                            .marker_raw
+                            .as_ref()
+                            .map(|_| prepared.original.clone());
+                        return receipt(
+                            if compensated {
+                                TakeoverOutcome::FailedRestored
+                            } else {
+                                TakeoverOutcome::FailedUnchanged
+                            },
+                            Some(error),
+                        );
+                    }
+                }
+                receipt(TakeoverOutcome::RecoveryPending, Some(error))
+            }
+        }
+    }
+
     /// TUN 启动接管系统 DNS。**best-effort**：失败仅告警 + 回滚，绝不抛（不阻断 TUN 启动）。
     /// 上游 `setDns`。
     pub fn set_dns(&mut self) {
+        let Ok(_marker_lock) = self
+            .marker
+            .fs
+            .acquire_marker_mutation_lock(&self.marker.path)
+        else {
+            log::warn!("DNS marker lock unavailable; retaining recovery authority");
+            return;
+        };
         // 守卫：本平台不接管 DNS（win/linux）→ 早退。**必须在写 marker 之前** ——
         // 否则 marker 写下、apply 必失败（win netsh 需管理员）→ marker 卡死 → 每次启动反复空跑还原。
         // 判据见 `SystemDnsOps::takeover_supported`。
@@ -462,9 +948,16 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         let Ok(current) = self.snapshot_current(&targets) else {
             return;
         };
-        let Ok(existing) = self.marker.read_checked() else {
+        let Ok((raw, existing)) = self.marker.read_raw_checked() else {
             return;
         };
+        if let (Some(raw), Some(marker)) = (&raw, &existing) {
+            match dns_effect_marker(raw, marker) {
+                Ok(Some(effect)) if effect.phase != "owned" || effect.target != current => return,
+                Err(_) => return,
+                _ => {}
+            }
+        }
         let original = compute_original_to_save(
             &current,
             &self.marker.controlled_ip,
@@ -490,6 +983,9 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         }
 
         // marker 前置写（intent）。
+        if !self.raw_matches(&raw) {
+            return;
+        }
         if !self.marker.write(&original) {
             log::warn!("DNS recovery intent could not be persisted; takeover skipped");
             return;
@@ -519,6 +1015,14 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
 
     /// 还原系统 DNS。无 marker/原始 → 仅清 marker。上游 `restoreDns`。
     pub fn restore_dns(&mut self) {
+        let Ok(_marker_lock) = self
+            .marker
+            .fs
+            .acquire_marker_mutation_lock(&self.marker.path)
+        else {
+            log::warn!("DNS marker lock unavailable; retaining recovery authority");
+            return;
+        };
         // 不接管的平台（win/linux）：**仍要清 marker** —— 清掉历史版本（旧版 netsh 失败）残留的
         // stuck marker，否则 has_marker 恒 true 致每个终态点/启动 recovery 反复空跑还原。
         // 对齐上游 `WindowsSystemDns.restoreDns` = `this.clearMarker()`。
@@ -531,8 +1035,15 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
     }
 
     fn restore_dns_inner(&mut self) -> bool {
-        let Ok(marker) = self.marker.read_checked() else {
+        let Ok((mut raw, marker)) = self.marker.read_raw_checked() else {
             return false;
+        };
+        let effect = match (&raw, &marker) {
+            (Some(raw), Some(marker)) => match dns_effect_marker(raw, marker) {
+                Ok(effect) => effect,
+                Err(_) => return false,
+            },
+            _ => None,
         };
         let original = self
             .original
@@ -542,15 +1053,73 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             return self.marker.clear();
         };
 
+        // A live receipt retains only its exact before/target footprint. An
+        // outside administrator's values do not become restore authority.
+        if let Some(effect) = &effect {
+            // A visible foreign value blocks all writes. A temporarily missing
+            // service keeps debt but does not block restoring the visible subset.
+            for (name, ips) in &original {
+                if let Ok(current) = self.ops.read_dns(name) {
+                    if Some(&current) != effect.before.get(name)
+                        && Some(&current) != effect.target.get(name)
+                        && &current != ips
+                    {
+                        return false;
+                    }
+                }
+            }
+            let Some(expected) = raw.as_ref() else {
+                return false;
+            };
+            if !self.raw_matches(&raw) {
+                return false;
+            }
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(expected) else {
+                return false;
+            };
+            value["hostEffect"]["phase"] = "restoring".into();
+            let restoring = value.to_string();
+            if self
+                .marker
+                .fs
+                .write_marker(&self.marker.path, &restoring)
+                .is_err()
+            {
+                return false;
+            }
+            raw = Some(restoring);
+        }
         // Recorded custody, not today's enabled-service enumeration, owns restoration.
         // Unavailable services retain their recovery evidence for a later retry.
         let mut all_ok = true;
         for (target, ips) in &original {
-            if self.ops.apply_dns(target, ips).is_err() {
+            if effect.is_some() && !self.raw_matches(&raw) {
+                return false;
+            }
+            if let Some(effect) = &effect {
+                let Ok(current) = self.ops.read_dns(target) else {
+                    all_ok = false;
+                    continue;
+                };
+                if Some(&current) != effect.before.get(target)
+                    && Some(&current) != effect.target.get(target)
+                    && &current != ips
+                {
+                    all_ok = false;
+                    continue;
+                }
+            }
+            if self.ops.apply_dns(target, ips).is_err()
+                || effect.is_some()
+                    && self
+                        .ops
+                        .read_dns(target)
+                        .map_or(true, |current| &current != ips)
+            {
                 all_ok = false;
             }
         }
-        if all_ok && self.marker.clear() {
+        if all_ok && (effect.is_none() || self.raw_matches(&raw)) && self.marker.clear() {
             self.original = None;
             self.displaced_resolvers.clear();
             self.original_lan_resolver = None;
@@ -566,29 +1135,69 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
     /// ④ best-effort 逐服务；⑤ 防自指（mergedOriginal 以既有 marker.original 为底）。
     /// 上游 `reconcileDns`。
     pub fn reconcile_dns(&mut self) {
+        let _ = self.reconcile_dns_checked();
+    }
+
+    pub fn reconcile_dns_checked(&mut self) -> Option<TakeoverReceipt> {
+        let Ok(_marker_lock) = self
+            .marker
+            .fs
+            .acquire_marker_mutation_lock(&self.marker.path)
+        else {
+            log::warn!("DNS marker lock unavailable; retaining recovery authority");
+            return None;
+        };
         // 守卫：本平台不接管 DNS → 无物可重灌（marker 也不会有）。
         if !self.ops.takeover_supported() {
-            return;
+            return None;
         }
         // 守卫：受控 IP 在 bootstrap-direct → fail-closed。
         if !is_controlled_dns_ip_valid(&self.marker.controlled_ip) {
-            return;
+            return None;
         }
-        let Ok(Some(marker)) = self.marker.read_checked() else {
+        let Ok((Some(raw), Some(marker))) = self.marker.read_raw_checked() else {
             // marker 不在 = 接管未激活 → 绝不擅自接管。
-            return;
+            return None;
         };
 
-        let Ok(targets) = self.ops.list_targets() else {
-            return;
+        let effect = match dns_effect_marker(&raw, &marker) {
+            Ok(effect) => effect,
+            Err(_) => return None,
         };
-        if targets.is_empty() {
-            return;
+        let debt = |reason: &str| {
+            effect.as_ref().map(|effect| {
+                TakeoverReceipt::new(
+                    &effect.operation_id,
+                    TakeoverOutcome::RecoveryPending,
+                    Some(effect.operation_id.clone()),
+                    Some(reason.into()),
+                )
+            })
+        };
+        let mut targets = match self.ops.list_targets() {
+            Ok(targets) => targets,
+            Err(_) => return debt("DNS service enumeration is unavailable"),
+        };
+        targets.sort();
+        if targets.windows(2).any(|pair| pair[0] == pair[1]) {
+            return debt("duplicate DNS service identity");
         }
-
-        let Ok(current) = self.snapshot_current(&targets) else {
-            return;
+        if targets.is_empty() && effect.is_none() {
+            return None;
+        }
+        let current = match self.snapshot_current(&targets) {
+            Ok(current) => current,
+            Err(_) => return debt("visible DNS service read-back is unavailable"),
         };
+        if self.ops.list_targets().map_or(true, |mut visible| {
+            visible.sort();
+            visible != targets
+        }) {
+            return debt("DNS service inventory changed during capture");
+        }
+        if let Some(effect) = effect {
+            return Some(self.reconcile_live_dns(raw, marker, effect, current));
+        }
 
         // 以既有 marker.original 为底，并入当前各服务的应保存原始（防自指）。
         let mut merged = marker.original.clone();
@@ -607,13 +1216,16 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             })
             .collect();
         if to_apply.is_empty() {
-            return; // 全部已受控 → 幂等 no-op。
+            return None; // 全部已受控 → 幂等 no-op。
         }
 
         // 先写 marker 再 apply（崩溃留 intent）。
+        if !self.raw_matches(&Some(raw)) {
+            return None;
+        }
         if !self.marker.write(&merged) {
             log::warn!("DNS recovery intent update failed; reconcile skipped");
-            return;
+            return None;
         }
         self.original = Some(merged.clone());
 
@@ -622,6 +1234,195 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
                 .ops
                 .apply_dns(t, std::slice::from_ref(&self.marker.controlled_ip));
         }
+        None
+    }
+
+    /// Extend an accepted exact footprint under its original operation identity.
+    /// Missing old services keep custody; they never prevent admission of a new
+    /// visible service. Foreign values are not promoted to restore authority.
+    fn reconcile_live_dns(
+        &mut self,
+        raw: String,
+        mut marker: SystemDnsMarker,
+        mut effect: DnsEffectMarker,
+        current: BTreeMap<String, Vec<String>>,
+    ) -> TakeoverReceipt {
+        let document: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(document) => document,
+            Err(error) => {
+                return TakeoverReceipt::new(
+                    &effect.operation_id,
+                    TakeoverOutcome::RecoveryPending,
+                    Some(effect.operation_id.clone()),
+                    Some(error.to_string()),
+                )
+            }
+        };
+        let operation_id = effect.operation_id.clone();
+        let receipt = |outcome, reason| {
+            TakeoverReceipt::new(&operation_id, outcome, Some(operation_id.clone()), reason)
+        };
+        if effect.phase == "restoring" {
+            return receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some("DNS restoration cannot be reversed by reconcile".into()),
+            );
+        }
+        let applying = effect.phase == "applying";
+        let missing = effect.target.keys().any(|name| !current.contains_key(name));
+        if effect.target.iter().any(|(name, target)| {
+            current.get(name).is_some_and(|value| {
+                value != target && !(applying && Some(value) == effect.before.get(name))
+            })
+        }) {
+            return receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some("owned DNS service has foreign values".into()),
+            );
+        }
+        let additions: Vec<_> = current
+            .keys()
+            .filter(|name| !effect.target.contains_key(*name))
+            .cloned()
+            .collect();
+        if additions.is_empty() && !applying {
+            return receipt(
+                if missing {
+                    TakeoverOutcome::RecoveryPending
+                } else {
+                    TakeoverOutcome::Unchanged
+                },
+                missing.then(|| "recorded DNS service is not visible".into()),
+            );
+        }
+        for name in &additions {
+            let before = &current[name];
+            if is_controlled(before, &marker.controlled_ip) {
+                return receipt(
+                    TakeoverOutcome::RecoveryPending,
+                    Some("new DNS service has no restoration baseline".into()),
+                );
+            }
+            marker.original.insert(name.clone(), before.clone());
+            effect.before.insert(name.clone(), before.clone());
+            effect
+                .target
+                .insert(name.clone(), vec![marker.controlled_ip.clone()]);
+        }
+        let pending: Vec<_> = current
+            .keys()
+            .filter(|name| current.get(*name) != effect.target.get(*name))
+            .cloned()
+            .collect();
+        marker.at = now_ms();
+        effect.phase = "applying".into();
+        let encode = |effect: &DnsEffectMarker| -> Result<String, String> {
+            let mut value = document.clone();
+            value["original"] =
+                serde_json::to_value(&marker.original).map_err(|error| error.to_string())?;
+            value["at"] = serde_json::json!(marker.at);
+            value["hostEffect"] =
+                serde_json::to_value(effect).map_err(|error| error.to_string())?;
+            serde_json::to_string(&value).map_err(|error| error.to_string())
+        };
+        let intent = match encode(&effect) {
+            Ok(intent) => intent,
+            Err(error) => return receipt(TakeoverOutcome::FailedUnchanged, Some(error)),
+        };
+        if !self.raw_matches(&Some(raw)) {
+            return receipt(
+                TakeoverOutcome::Superseded,
+                Some("DNS owner changed before reconcile".into()),
+            );
+        }
+        if let Err(error) = self.marker.fs.write_marker(&self.marker.path, &intent) {
+            return receipt(TakeoverOutcome::RecoveryPending, Some(error.to_string()));
+        }
+        self.original = Some(marker.original.clone());
+        let owned = Some(intent);
+        for name in &pending {
+            if !self.raw_matches(&owned)
+                || self
+                    .ops
+                    .read_dns(name)
+                    .map_or(true, |value| value != effect.before[name])
+            {
+                return receipt(
+                    TakeoverOutcome::RecoveryPending,
+                    Some("DNS service or intent changed before reconcile write".into()),
+                );
+            }
+            if self.ops.apply_dns(name, &effect.target[name]).is_err()
+                || self
+                    .ops
+                    .read_dns(name)
+                    .map_or(true, |value| value != effect.target[name])
+            {
+                return receipt(
+                    TakeoverOutcome::RecoveryPending,
+                    Some("DNS reconcile write/read-back failed".into()),
+                );
+            }
+        }
+        for name in current.keys() {
+            if self
+                .ops
+                .read_dns(name)
+                .map_or(true, |value| Some(&value) != effect.target.get(name))
+            {
+                return receipt(
+                    TakeoverOutcome::RecoveryPending,
+                    Some("DNS scope drifted during reconcile".into()),
+                );
+            }
+        }
+        if self.ops.list_targets().map_or(true, |mut visible| {
+            visible.sort();
+            visible != current.keys().cloned().collect::<Vec<_>>()
+        }) {
+            return receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some("DNS service inventory changed during reconcile".into()),
+            );
+        }
+        if !self.raw_matches(&owned) {
+            return receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some("DNS owner changed before reconcile settlement".into()),
+            );
+        }
+        if applying && missing {
+            return receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some("partial DNS scope is still unavailable; applying footprint retained".into()),
+            );
+        }
+        effect.phase = "owned".into();
+        let settled = match encode(&effect) {
+            Ok(settled) => settled,
+            Err(error) => return receipt(TakeoverOutcome::RecoveryPending, Some(error)),
+        };
+        if self
+            .marker
+            .fs
+            .write_marker(&self.marker.path, &settled)
+            .is_err()
+            || !self.raw_matches(&Some(settled))
+        {
+            return receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some("DNS reconcile settlement is unconfirmed".into()),
+            );
+        }
+        receipt(
+            if missing {
+                TakeoverOutcome::RecoveryPending
+            } else {
+                TakeoverOutcome::Applied
+            },
+            missing
+                .then(|| "old DNS service restoration evidence retained while unavailable".into()),
+        )
     }
 
     /// 是否存在接管 marker（终态清理门控用）。

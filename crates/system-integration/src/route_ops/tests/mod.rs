@@ -338,3 +338,232 @@ fn verify_single_poll_grace_still_evaluates() {
     );
     assert_eq!(sleeps.get(), 0, "单次探测无相邻间隔可等");
 }
+
+#[derive(Clone)]
+struct PhysicalRouteRunner(
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(Vec<String>, String)>>>,
+);
+impl CommandRunner for PhysicalRouteRunner {
+    fn run(
+        &self,
+        command: &Command,
+        timeout: Duration,
+    ) -> Result<crate::exec::CommandOutput, String> {
+        assert_eq!(timeout, ROUTE_CMD_TIMEOUT);
+        let (expected, output) = self
+            .0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected route command");
+        let actual: Vec<_> = std::iter::once(command.program.clone())
+            .chain(command.args.clone())
+            .collect();
+        assert_eq!(actual, expected);
+        Ok(crate::exec::CommandOutput {
+            stdout: output,
+            stderr: String::new(),
+        })
+    }
+}
+fn protected_runner(
+    rows: Vec<(&str, String)>,
+) -> (SystemRouteOpsImpl<PhysicalRouteRunner>, PhysicalRouteRunner) {
+    let runner = PhysicalRouteRunner(std::sync::Arc::new(std::sync::Mutex::new(
+        rows.into_iter()
+            .map(|(args, out)| (args.split_whitespace().map(str::to_owned).collect(), out))
+            .collect(),
+    )));
+    (
+        SystemRouteOpsImpl::with_platform(runner.clone(), Platform::Linux),
+        runner,
+    )
+}
+fn physical_rules() -> Vec<serde_json::Value> {
+    serde_json::from_str(r#"[{"priority":0,"src":"all","table":"local"},{"priority":32766,"src":"all","table":"main"},{"priority":32767,"src":"all","table":"default"}]"#).unwrap()
+}
+fn physical_routes() -> Vec<serde_json::Value> {
+    serde_json::from_str(r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0","table":"main"},{"dst":"192.0.2.0/24","dev":"eth0","table":"main","scope":"link"}]"#).unwrap()
+}
+fn physical_dns_rows() -> [&'static str; 3] {
+    [
+        "Global:\nLink 2 (eth0): 192.0.2.53\n",
+        "Global:\nLink 2 (eth0): example.test\n",
+        "Global:\nLink 2 (eth0): yes\n",
+    ]
+}
+fn physical_addresses() -> String {
+    r#"[{"ifname":"eth0","ifindex":2,"flags":["UP","LOWER_UP"],"operstate":"UP","addr_info":[{"family":"inet","scope":"global","local":"192.0.2.4"}]}]"#.into()
+}
+fn physical_fixture() -> LinuxPhysicalRouteFacts {
+    let (dns, resolver) = resolved_evidence(physical_dns_rows(), "eth0", None).unwrap();
+    LinuxPhysicalRouteFacts {
+        interface: "eth0".into(),
+        ifindex: 2,
+        source: "192.0.2.4".parse().unwrap(),
+        resolver,
+        external_routes: canonical_values(physical_routes()),
+        all_routes: canonical_values(physical_routes()),
+        dns: PhysicalDnsFacts::Resolved(dns),
+    }
+}
+#[test]
+fn protected_capture_reads_actual_default_and_resolver_without_public_probe_or_system_lookup() {
+    let dns = physical_dns_rows();
+    let rows = vec![
+        (
+            "ip -j -4 rule show",
+            serde_json::to_string(&physical_rules()).unwrap(),
+        ),
+        (
+            "ip -j -4 route show table main",
+            serde_json::to_string(&physical_routes()).unwrap(),
+        ),
+        ("ip -j -4 address show dev eth0", physical_addresses()),
+        ("resolvectl dns", dns[0].into()),
+        ("resolvectl domain", dns[1].into()),
+        ("resolvectl default-route", dns[2].into()),
+        (
+            "ip -j -4 route get 192.0.2.53 from 192.0.2.4 oif eth0 mark 0 ipproto udp dport 53",
+            r#"[{"dev":"eth0","prefsrc":"192.0.2.4","table":"main"}]"#.into(),
+        ),
+        (
+            "ip -j -4 route show table all",
+            serde_json::to_string(&physical_routes()).unwrap(),
+        ),
+    ];
+    let (ops, runner) = protected_runner(rows);
+    assert_eq!(
+        ops.capture_linux_physical_route().unwrap(),
+        physical_fixture()
+    );
+    assert!(runner.0.lock().unwrap().is_empty());
+}
+#[test]
+fn protected_policy_rejects_user_port_uid_foreign_table_and_unknown_selectors() {
+    for extra in [
+        serde_json::json!({"uidrange":"0-0"}),
+        serde_json::json!({"sport":1234}),
+        serde_json::json!({"ipproto":"tcp"}),
+        serde_json::json!({"future_selector":1}),
+        serde_json::json!({"dport":443}),
+        serde_json::json!({"oif":"other-vpn"}),
+    ] {
+        let mut rule = serde_json::json!({"priority":9000,"src":"all","table":2022});
+        rule.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(!protected_policy(&rule, "eth0", "polaris-tun0", 2022));
+    }
+    assert!(!protected_policy(
+        &serde_json::json!({"priority":9000,"src":"all","table":777}),
+        "eth0",
+        "polaris-tun0",
+        2022
+    ));
+    assert!(protected_policy(
+        &serde_json::json!({"priority":9001,"src":"all","table":"main","not":true,"dport":"53","suppress_prefixlength":0}),
+        "eth0",
+        "polaris-tun0",
+        2022
+    ));
+    assert!(!canonical_policy_inventory(&[
+        physical_rules()[0].clone(),
+        physical_rules()[0].clone(),
+        physical_rules()[0].clone()
+    ]));
+}
+#[test]
+fn protected_resolver_rejects_stub_controlled_and_split_domain_sources() {
+    let baseline = physical_dns_rows();
+    for raw in [
+        "Global:\nLink 2 (eth0): 127.0.0.53\n",
+        "Global:\nLink 2 (eth0): 198.18.0.2\n",
+        "Global:\nLink 2 (eth0): 192.0.2.53 192.0.2.54\n",
+        "Global:\nLink 2 (eth0): 192.0.2.53\nLink 4 (vpn0): 10.0.0.53\n",
+    ] {
+        assert!(resolved_evidence([raw, baseline[1], baseline[2]], "eth0", None).is_err());
+    }
+    let controlled = format!(
+        "Global:\nLink 2 (eth0): {}\n",
+        polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP
+    );
+    assert!(resolved_evidence([&controlled, baseline[1], baseline[2]], "eth0", None).is_err());
+    let with_tun = format!(
+        "{}Link 9 (polaris-tun0): {}\n",
+        baseline[0],
+        polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP
+    );
+    assert_eq!(
+        resolved_evidence(
+            [&with_tun, baseline[1], baseline[2]],
+            "eth0",
+            Some("polaris-tun0")
+        )
+        .unwrap(),
+        resolved_evidence(baseline, "eth0", None).unwrap()
+    );
+}
+#[test]
+fn protected_live_view_derives_actual_new_table_and_rejects_external_route_drift() {
+    let original = physical_fixture();
+    let mut all = physical_routes();
+    all.push(serde_json::json!({"dst":"default","dev":"polaris-tun0","table":3107}));
+    let mut rules = physical_rules();
+    rules.push(serde_json::json!({"priority":9100,"src":"all","table":3107}));
+    let dns = physical_dns_rows();
+    let (ops, runner) = protected_runner(vec![
+        ("ip -j -4 address show dev eth0", physical_addresses()),
+        (
+            "ip -j -4 route show table main",
+            serde_json::to_string(&physical_routes()).unwrap(),
+        ),
+        (
+            "ip -j -4 route show table all",
+            serde_json::to_string(&all).unwrap(),
+        ),
+        ("ip -j -4 rule show", serde_json::to_string(&rules).unwrap()),
+        ("resolvectl dns", dns[0].into()),
+        ("resolvectl domain", dns[1].into()),
+        ("resolvectl default-route", dns[2].into()),
+    ]);
+    let view = ops
+        .observe_linux_protected_route(&original, "polaris-tun0")
+        .unwrap();
+    assert_eq!(view.managed_table, 3107);
+    assert!(runner.0.lock().unwrap().is_empty());
+    let mut drift = physical_routes();
+    drift[0]["gateway"] = serde_json::json!("192.0.2.254");
+    let (ops, _) = protected_runner(vec![
+        ("ip -j -4 address show dev eth0", physical_addresses()),
+        (
+            "ip -j -4 route show table main",
+            serde_json::to_string(&drift).unwrap(),
+        ),
+    ]);
+    assert!(ops
+        .observe_linux_protected_route(&original, "polaris-tun0")
+        .is_err());
+}
+#[test]
+fn protected_bound_route_never_accepts_own_tun_or_a_foreign_source() {
+    for reply in [
+        r#"[{"dev":"polaris-tun0","prefsrc":"192.0.2.4","table":"main"}]"#,
+        r#"[{"dev":"eth0","prefsrc":"192.0.2.99","table":"main"}]"#,
+        r#"[{"dev":"eth0","prefsrc":"192.0.2.4","table":3107}]"#,
+    ] {
+        let (ops, _) = protected_runner(vec![(
+            "ip -j -4 route get 203.0.113.7 from 192.0.2.4 oif eth0 mark 0 ipproto tcp dport 443",
+            reply.into(),
+        )]);
+        assert!(ops
+            .verify_linux_bound_route(
+                "eth0",
+                "192.0.2.4".parse().unwrap(),
+                "203.0.113.7".parse().unwrap(),
+                443,
+                "tcp"
+            )
+            .is_err());
+    }
+}

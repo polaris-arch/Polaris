@@ -120,6 +120,7 @@ impl PreparedExecution {
         &self,
         config: File,
         cwd: &Path,
+        runtime_directory: &Path,
     ) -> Result<WindowsStartedChild, AdmissionError> {
         // Serialize queued-plan recheck through ResumeThread with replacement/
         // retirement. No future may outlive this gate by retaining a Command.
@@ -138,6 +139,7 @@ impl PreparedExecution {
             config,
             cwd,
             ExecPurpose::RunMain,
+            Some(runtime_directory),
         )
     }
 }
@@ -228,6 +230,7 @@ impl WindowsCheckInput {
             input,
             &cwd,
             ExecPurpose::CheckConfig,
+            None,
         )?;
         Ok(WindowsCheckChild { child })
     }

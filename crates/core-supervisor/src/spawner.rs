@@ -179,13 +179,23 @@ impl SpawnRequest {
         }
     }
 
-    /// 完整 CLI 参数序列（`[run, -c, <config>, ...extra]`）。
+    /// Exact admitted RunMain adds the explicit absolute UTF-8 working directory
+    /// as Core data (`-D`). Other purposes and unadmitted fixtures keep legacy argv.
     pub fn argv(&self) -> Vec<String> {
         let mut v = vec![
             "run".to_string(),
             "-c".to_string(),
             self.config.to_string_lossy().into_owned(),
         ];
+        if self.execution.as_ref().is_some_and(|execution| {
+            execution.purpose() == crate::admitted_payload::ExecPurpose::RunMain
+        }) {
+            if let Some(directory) = self.working_dir.as_deref().filter(|path| path.is_absolute()) {
+                if let Some(directory) = directory.to_str() {
+                    v.extend(["-D".to_string(), directory.to_string()]);
+                }
+            }
+        }
         v.extend(self.extra_args.iter().cloned());
         v
     }

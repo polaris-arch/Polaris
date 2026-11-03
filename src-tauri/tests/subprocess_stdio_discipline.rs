@@ -2650,7 +2650,7 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
     let win_helper = file_of(index, "crates/helper/src/platform/windows/winproc/win.rs");
     let spawn = compact(block_of(win_helper, "fn spawn_tracked("));
     for needle in [
-        ".spawn_windows_main(file,Path::new(&cwd))?",
+        ".spawn_windows_main(file,Path::new(&cwd),&runtime_directory)?",
         "let(pid,handle,stdout,stderr,execution_custody)=child.into_parts();",
         "_execution_custody:execution_custody",
         "spawn_pipe_loggers_with_preopened_files_custodied(stdout,stderr,files,",
@@ -2775,4 +2775,36 @@ fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
             "lost reader/lease/Fresh custody must remain red: {file}"
         );
     }
+}
+
+#[test]
+fn recovery_root_is_explicit_main_data_under_existing_factories() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let payload = file_of(&index, "crates/core-supervisor/src/admitted_payload.rs");
+    let linux = block_of(payload, "pub fn spawn_linux_helper_run(");
+    assert!(linux.contains("self.purpose != ExecPurpose::RunMain"));
+    assert!(linux.contains("runtime_directory: Option<&Path>"));
+    assert!(linux.contains(".arg(directory)"));
+    let mac = block_of(payload, "pub fn spawn_macos_root_helper_main(");
+    assert!(mac.contains("!working_directory.is_absolute()"));
+    assert!(mac.contains("working_directory.to_str().is_none()"));
+    let mac = block_of(
+        file_of(
+            &index,
+            "crates/core-supervisor/src/admitted_payload/macos.rs",
+        ),
+        "pub(super) fn configure_main_command(",
+    );
+    assert!(mac.contains(".arg(working_directory)"));
+    let windows = block_of(
+        file_of(
+            &index,
+            "crates/core-supervisor/src/admitted_payload/windows/issuer/spawn.rs",
+        ),
+        "fn fixed_arguments(",
+    );
+    assert!(windows.contains("(ExecPurpose::RunMain, Some(directory))"));
+    assert!(windows.contains("(ExecPurpose::CheckConfig, None)"));
+    assert!(!windows.contains("extra_args"));
 }

@@ -90,6 +90,11 @@ export const proxyApi = {
     return invoke(IPC_CHANNELS.PROXY_RUNTIME_APPLY_STATUS, { transactionId });
   },
 
+  /** Observe the retained host execution without inventing a Core transaction. */
+  async runtimeHostEffectStatus(hostExecutionId: string): Promise<PendingApplyResult> {
+    return invoke(IPC_CHANNELS.PROXY_RUNTIME_APPLY_STATUS, { hostExecutionId });
+  },
+
   /** Explicit same-transaction persistence recovery; never saves or reapplies D. */
   async retryRuntimePersistence(transactionId: string): Promise<PendingApplyResult> {
     return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { retryPersistenceTransactionId: transactionId });
@@ -100,6 +105,16 @@ export const proxyApi = {
     return restartConfirmation === undefined
       ? invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES)
       : invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { restartConfirmation });
+  },
+
+  /** Confirm the retained candidate without saving, regenerating or replanning. */
+  async confirmRuntimeImpact(impactConfirmation: string): Promise<PendingApplyResult> {
+    return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { impactConfirmation });
+  },
+
+  /** Release only this private choice; cancellation never applies configuration. */
+  async cancelRuntimeImpact(cancelImpactConfirmation: string): Promise<PendingApplyResult> {
+    return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { cancelImpactConfirmation });
   },
 
   /**

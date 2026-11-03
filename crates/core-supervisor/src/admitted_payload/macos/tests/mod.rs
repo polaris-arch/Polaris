@@ -337,7 +337,9 @@ fn nested_config_keeps_registered_runtime_directory_for_relative_resources() {
             [
                 std::ffi::OsStr::new("run"),
                 std::ffi::OsStr::new("-c"),
-                profile.as_os_str()
+                profile.as_os_str(),
+                std::ffi::OsStr::new("-D"),
+                root.as_os_str()
             ]
         );
         assert_eq!(

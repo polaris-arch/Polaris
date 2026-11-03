@@ -42,6 +42,7 @@ fn request_samples() -> Vec<Request> {
     for parent_pid in [None, Some(12345)] {
         samples.push(Request::NativeStartPinned(
             polaris_helper_proto::core_protocol::PinnedStartParams {
+                runtime_directory: None,
                 id: id.clone(),
                 common: StartParams {
                     cfg: "C:\\Users\\测试\\配置.json".into(),

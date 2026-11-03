@@ -68,3 +68,68 @@ fn spawned_child_pid_api_is_callable() {
 
 #[cfg(target_os = "linux")]
 mod process;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn only_admitted_main_with_explicit_absolute_utf8_directory_gets_recovery_root() {
+    use crate::admitted_payload::{fixture, ExecPurpose};
+    let directory = PathBuf::from("/explicit state/测试");
+    let payload = fixture(
+        b"#!/bin/sh\nexit 0\n",
+        vec![
+            ExecPurpose::RunMain,
+            ExecPurpose::RunLogin,
+            ExecPurpose::RunSpeedtest,
+        ],
+    );
+    for purpose in [
+        ExecPurpose::RunMain,
+        ExecPurpose::RunLogin,
+        ExecPurpose::RunSpeedtest,
+    ] {
+        let mut request = SpawnRequest::new(
+            payload.prepare(purpose).unwrap(),
+            "/other/profiles/config.json",
+            StdioPolicy::Discard,
+        );
+        request.working_dir = Some(directory.clone());
+        request.extra_args = vec!["--disable-color".into()];
+        let expected = if purpose == ExecPurpose::RunMain {
+            vec![
+                "run",
+                "-c",
+                "/other/profiles/config.json",
+                "-D",
+                "/explicit state/测试",
+                "--disable-color",
+            ]
+        } else {
+            vec![
+                "run",
+                "-c",
+                "/other/profiles/config.json",
+                "--disable-color",
+            ]
+        };
+        assert_eq!(request.argv(), expected);
+    }
+    let mut unadmitted = SpawnRequest::unadmitted_intent("/bin/core", "/cfg", StdioPolicy::Discard);
+    unadmitted.working_dir = Some(directory);
+    assert!(!unadmitted.argv().contains(&"-D".to_string()));
+    use std::os::unix::ffi::OsStringExt;
+    for directory in [
+        None,
+        Some(PathBuf::from("relative")),
+        Some(PathBuf::from(std::ffi::OsString::from_vec(
+            b"/invalid/\xff".to_vec(),
+        ))),
+    ] {
+        let mut request = SpawnRequest::new(
+            payload.prepare(ExecPurpose::RunMain).unwrap(),
+            "/cfg",
+            StdioPolicy::Discard,
+        );
+        request.working_dir = directory;
+        assert_eq!(request.argv(), ["run", "-c", "/cfg"]);
+    }
+}

@@ -258,6 +258,9 @@ final class TunnelSettingsCompletion {
     private let done = DispatchSemaphore(value: 0)
     private var pending = true
     private var error: Error?
+    private var waitTimedOut = false
+    var timedOut: Bool { lock.lock(); defer { lock.unlock() }; return waitTimedOut }
+    var callbackPending: Bool { lock.lock(); defer { lock.unlock() }; return pending }
     @discardableResult
     func finish(_ error: Error?) -> Bool {
         lock.lock()
@@ -269,9 +272,21 @@ final class TunnelSettingsCompletion {
         return true
     }
     func wait(seconds: Double) throws {
-        guard done.wait(timeout: .now() + seconds) == .success else {
-            lock.lock(); pending = false; lock.unlock()
-            throw TunnelSettingsTimeout()
+        lock.lock(); let alreadyFinished = !pending; let previousError = error; lock.unlock()
+        if alreadyFinished {
+            if let previousError { throw previousError }
+            return
+        }
+        if done.wait(timeout: .now() + seconds) != .success {
+            lock.lock()
+            if pending {
+                waitTimedOut = true
+                lock.unlock()
+                // The waiter has ended, but the actual NE callback still owns
+                // this request. Only finish() may settle callback ownership.
+                throw TunnelSettingsTimeout()
+            }
+            lock.unlock()
         }
         lock.lock(); let error = self.error; lock.unlock()
         if let error { throw error }
@@ -390,5 +405,273 @@ struct TunnelRuntimeAdmission {
         // Full-schema support and unknown build-tag metadata never disable a live supported graph.
         return TunnelRuntimeAdmission(manifestDigest: value.implementation_manifest_digest, identity: identity,
             controlRevision: try uint64(value.control_revision), unsupportedPaths: unsupported)
+    }
+}
+
+
+/// Owns a native custody duplicate, never the provider's original utun socket.
+/// FileDescriptor lends this held descriptor to Core, which owns another dup.
+final class TunnelNativeTunFile {
+    let descriptor: Int32
+    private let lock = NSLock()
+    private var closed = false
+    private let check: () throws -> Void
+    private let dispose: () throws -> Void
+    init(_ descriptor: Int32, check: @escaping () throws -> Void, dispose: @escaping () throws -> Void) {
+        self.descriptor = descriptor; self.check = check; self.dispose = dispose
+    }
+    func validate() throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, descriptor >= 0 else { throw lifecycleError("Native TUN custody descriptor is closed") }
+        try check()
+    }
+    func close() throws {
+        lock.lock(); defer { lock.unlock() }
+        if closed { return }
+        // A failed close is sticky. Never retry a possibly reused FD number.
+        closed = true
+        try dispose()
+    }
+}
+
+/// Header-independent native transaction state. The real binding supplies NE
+/// apply and descriptor custody; tests exercise these same ownership decisions.
+/// Lock order: operation -> access. No external call occurs under access.
+final class TunnelNativeTunOwner<Settings: AnyObject> {
+    final class Session {
+        let ownerID: String
+        let token: UInt64
+        let operationID = UUID()
+        fileprivate let issuer: NSObject
+        fileprivate var previous: Session?
+        let published: () -> Bool
+        fileprivate var network: Settings
+        fileprivate var snapshot: Settings?
+        fileprivate var file: TunnelNativeTunFile?
+        fileprivate var retainedFiles: [TunnelNativeTunFile] = []
+        fileprivate var phase = "allocated"
+        fileprivate var attempted = false
+        fileprivate var failure: Error?
+        fileprivate init(_ ownerID: String, issuer: NSObject, token: UInt64, network: Settings, snapshot: Settings?,
+                         previous: Session?, published: @escaping () -> Bool) {
+            self.ownerID = ownerID; self.issuer = issuer; self.token = token; self.network = network
+            self.snapshot = snapshot; self.previous = previous; self.published = published
+        }
+    }
+    private let operation = NSLock()
+    private let access = NSLock()
+    private let issuer = NSObject() // Held provider-local identity, never a publication/readiness bit.
+    private var current: Session?
+    private var pending: Session?
+    private var lastEffect: Session?
+    private var revoked = false
+    private var debt: Error?
+
+    // Receipt reads are Core-owned atomic reads, not callbacks into native code.
+    private func observePublicationLocked() {
+        if let pending, current === pending, pending.phase == "prepared", pending.published() {
+            self.pending = nil
+            pending.previous = nil; pending.snapshot = nil
+        }
+    }
+    var blocksSettingsChanges: Bool {
+        access.lock(); defer { access.unlock() }
+        observePublicationLocked()
+        return revoked || debt != nil || pending != nil || (current != nil && !current!.published())
+    }
+    var settingsArePublished: Bool {
+        access.lock(); defer { access.unlock() }
+        observePublicationLocked()
+        return !revoked && debt == nil && pending == nil && (current == nil || current!.published())
+    }
+    var hasSessions: Bool {
+        access.lock(); defer { access.unlock() }
+        return current != nil || pending != nil || debt != nil
+    }
+    func revoke() { access.lock(); revoked = true; access.unlock() }
+    func noteCurrentSettings(_ network: Settings) {
+        access.lock(); defer { access.unlock() }
+        observePublicationLocked()
+        if pending == nil, debt == nil, !revoked { current?.network = network }
+    }
+    func allocate(_ ownerID: String, token: UInt64, network: Settings, snapshot: Settings?,
+                  previous: Session?, published: @escaping () -> Bool) throws -> Session {
+        access.lock(); defer { access.unlock() }
+        observePublicationLocked()
+        // Core suspends/joins the exact previous physical before NewSession.
+        // Its reversible Published bit may already be false without any native
+        // getter ever observing true. The exact prepared previous is the lease
+        // transfer authority; allocated/preparing/failed/foreign owners are not.
+        let transfersCurrentLease = pending != nil && pending === current && current === previous
+            && previous?.phase == "prepared"
+        guard !ownerID.isEmpty, !revoked, debt == nil, pending == nil || transfersCurrentLease,
+              current === previous, ownerID != previous?.ownerID,
+              previous == nil || (previous!.issuer === issuer && previous!.phase == "prepared") else {
+            throw lifecycleError("Native TUN allocation has a stale owner or settings lease")
+        }
+        if transfersCurrentLease {
+            previous?.previous = nil; previous?.snapshot = nil
+        }
+        let result = Session(ownerID, issuer: issuer, token: token, network: network, snapshot: snapshot,
+                             previous: previous, published: published)
+        pending = result
+        return result // Allocation reserves custody, but has no native effects.
+    }
+    private func beginOperation() throws {
+        guard operation.try() else { throw lifecycleError("Native TUN operation is still owned by its caller") }
+    }
+    private func admit(_ session: Session, accepts: (UInt64) -> Bool) throws {
+        access.lock()
+        // A failed allocation or no-effect Abort may leave this exact old
+        // current suspended with no pending candidate. Core must be able to
+        // Validate/rebuild it even if a prior getter released its old lease.
+        let resumesCurrentLease = pending == nil && current === session && session.phase == "prepared"
+        let ownsLease = pending === session || resumesCurrentLease
+        let valid = session.issuer === issuer && !revoked && debt == nil && ownsLease
+        if valid && resumesCurrentLease { pending = session }
+        access.unlock()
+        guard valid, accepts(session.token) else { throw lifecycleError("Native TUN provider or transaction was revoked") }
+    }
+    private func retainDebt(_ session: Session, _ error: Error) {
+        access.lock(); debt = debt ?? error; session.failure = session.failure ?? error; access.unlock()
+    }
+    func prepare(_ session: Session, accepts: (UInt64) -> Bool,
+                 apply: (Settings?, UInt64) throws -> Void,
+                 acquire: () throws -> TunnelNativeTunFile, cache: (Settings?) -> Void) throws {
+        try beginOperation(); defer { operation.unlock() }
+        try admit(session, accepts: accepts)
+        access.lock()
+        guard session.phase == "allocated" else { access.unlock(); throw lifecycleError("Native TUN prepare cannot be repeated") }
+        session.phase = "preparing"; session.attempted = true; lastEffect = session
+        access.unlock()
+        do {
+            // Core has already joined the previous reader and its duplicate.
+            // Drop our old duplicate too: libbox's upstream utun lookup scans
+            // process FDs, and an old custody dup must not masquerade as the
+            // provider's actual post-apply socket. The provider original stays open.
+            if let previous = session.previous, let old = previous.file {
+                access.lock(); session.retainedFiles.append(old); access.unlock()
+                do { try old.close() } catch { retainDebt(session, error); throw error }
+                access.lock(); previous.file = nil; access.unlock()
+            }
+            try apply(session.network, session.token)
+            let file = try acquire()
+            // Retain the real descriptor before any further failure can occur.
+            access.lock(); session.file = file; access.unlock()
+            try admit(session, accepts: accepts)
+            cache(session.network)
+            access.lock(); current = session; session.phase = "prepared"; access.unlock()
+        } catch {
+            access.lock(); session.phase = "failed"; session.failure = error; access.unlock()
+            if error is TunnelSettingsTimeout || !accepts(session.token) { retainDebt(session, error) }
+            throw error
+        }
+    }
+    func descriptor(_ session: Session, accepts: (UInt64) -> Bool) -> Int32 {
+        guard operation.try() else { return -1 }
+        defer { operation.unlock() }
+        access.lock()
+        let valid = !revoked && debt == nil && current === session && (session.phase == "prepared" || session.phase == "restored")
+        let file = session.file
+        access.unlock()
+        guard valid, accepts(session.token), let file, (try? file.validate()) != nil else { return -1 }
+        return file.descriptor
+    }
+    func validate(_ session: Session, accepts: (UInt64) -> Bool) throws {
+        try beginOperation(); defer { operation.unlock() }
+        try admit(session, accepts: accepts)
+        access.lock(); let valid = current === session && (session.phase == "prepared" || session.phase == "restored"); let file = session.file; access.unlock()
+        guard valid, let file else { throw lifecycleError("Native TUN prepare has no current descriptor") }
+        try file.validate()
+        try admit(session, accepts: accepts)
+        access.lock(); session.phase = "prepared"; access.unlock()
+        // pending keeps the settings lease until Published is observed, Abort,
+        // or Retire. Validation never publishes native readiness.
+    }
+    func abort(_ session: Session, accepts: (UInt64) -> Bool,
+               apply: (Settings?, UInt64) throws -> Void,
+               acquire: () throws -> TunnelNativeTunFile, cache: (Settings?) -> Void) throws {
+        try beginOperation(); defer { operation.unlock() }
+        access.lock()
+        guard session.issuer === issuer else { access.unlock(); throw lifecycleError("Native TUN abort belongs to another provider") }
+        if session.phase == "aborted" { access.unlock(); return }
+        let attempted = session.attempted
+        let eligible = debt == nil && pending === session && !session.published() && (!attempted || lastEffect === session)
+        access.unlock()
+        guard eligible else { throw lifecycleError("Native TUN abort does not own the current settings effect") }
+        do {
+            if attempted {
+                try admit(session, accepts: accepts)
+                // Candidate Core cleanup has joined before Abort. Release its
+                // native duplicate before restoring and locating provider utun,
+                // so the candidate socket cannot contaminate that scan either.
+                if let candidate = session.file {
+                    access.lock(); session.retainedFiles.append(candidate); access.unlock()
+                    try candidate.close()
+                    access.lock(); session.file = nil; access.unlock()
+                }
+                try apply(session.snapshot, session.token)
+                var restored: TunnelNativeTunFile?
+                if session.previous != nil { restored = try acquire() }
+                // Core joined the old reader before Prepare. Its old custody
+                // duplicate is replaced only after restoration actually returns.
+                if let previous = session.previous {
+                    access.lock()
+                    let old = previous.file; previous.file = restored
+                    if let old { session.retainedFiles.append(old) }
+                    access.unlock()
+                    try old?.close()
+                }
+                try admit(session, accepts: accepts)
+                cache(session.snapshot)
+            }
+            try session.file?.close()
+            access.lock()
+            current = session.previous; lastEffect = session.previous
+            session.phase = "aborted"
+            if attempted, let previous = session.previous {
+                previous.phase = "restored"
+                pending = previous // Keep the lease through validation until Core republishes the rebuilt old physical.
+            } else { pending = nil }
+            session.previous = nil; session.snapshot = nil
+            access.unlock()
+        } catch { retainDebt(session, error); throw error }
+    }
+    func retire(_ session: Session, accepts: (UInt64) -> Bool,
+                apply: (Settings?, UInt64) throws -> Void, cache: (Settings?) -> Void) throws {
+        try beginOperation(); defer { operation.unlock() }
+        access.lock()
+        guard session.issuer === issuer else { access.unlock(); throw lifecycleError("Native TUN retirement belongs to another provider") }
+        if session.phase == "retired" || session.phase == "aborted" { access.unlock(); return }
+        observePublicationLocked()
+        let isCurrent = current === session
+        let isRevoked = revoked
+        let rollbackStillNeedsOwner = pending?.previous === session && pending?.published() == false
+        // Core invokes Retire only from its private WasPublished history, after
+        // joining readers/duplicates. Current Published=false is expected after
+        // Suspend/Stop and cannot revoke that exact prepared owner's cleanup.
+        // This trusts the original Core method schedule, not native readiness.
+        let preparedCurrent = isCurrent && (session.phase == "prepared" || session.phase == "restored")
+        let preparedPredecessor = pending !== session && session.phase == "prepared"
+        let noEffectAllocation = pending === session && !session.attempted
+        let eligible = debt == nil && !rollbackStillNeedsOwner
+            && (preparedCurrent || preparedPredecessor || noEffectAllocation)
+        access.unlock()
+        guard eligible else { throw lifecycleError("Native TUN retirement still has an unapplied or uncertain owner") }
+        do {
+            if isCurrent && !isRevoked && accepts(session.token) {
+                try apply(nil, session.token)
+                cache(nil)
+            }
+            // If Stop revoked the provider, NE's existing stop lifecycle owns
+            // clearing OS settings. This releases only our custody duplicate;
+            // it does not assert that NE cleanup or a callback has joined.
+            try session.file?.close()
+            access.lock()
+            if current === session { current = nil; lastEffect = nil }
+            if pending === session { pending = nil }
+            session.phase = "retired"; session.previous = nil; session.snapshot = nil
+            access.unlock()
+        } catch { retainDebt(session, error); throw error }
     }
 }
