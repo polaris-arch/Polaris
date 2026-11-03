@@ -149,7 +149,7 @@ export default function PendingChangesBar() {
 
   /* 点外部 / Esc 关闭（对齐首页出口选单、节点页 add-menu 的既有模式）。 */
   useEffect(() => {
-    if (!detailOpen) return;
+    if (!detailOpen || typeof document === 'undefined') return;
     const onDown = (e: MouseEvent) => {
       if (!barRef.current?.contains(e.target as Node)) setDetailOpen(false);
     };

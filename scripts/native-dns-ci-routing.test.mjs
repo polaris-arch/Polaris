@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { basename, isAbsolute, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { TESTS, selectNativeExecutable, bindNativeRuntime, runTests, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
+import { TESTS, selectNativeExecutable, bindNativeRuntime, runTests as runCaseTests, withNativeSession, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
 import test, { after } from 'node:test';
 import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesktopSelection, selectedCandidateContext } from './desktop-core/native-dns-candidate.mjs';
 import { regularPath } from './desktop-core/release-consumer.mjs';
@@ -109,6 +109,34 @@ function reusableContract(caller = workflow, callee = candidateWorkflow) {
   assert.ok(callee.includes(formalAcquisition));
   assert.doesNotMatch(callee.replace(acquisition, '').replace(formalAcquisition, ''), /github\.token|POLARIS_RELEASE_API_TOKEN/);
   assert.doesNotMatch(callee, /secrets:|secrets\.|contents: write|actions: write|id-token:|cargo (?:build|test) --workspace|run: pnpm/);
+}
+
+// Inert orchestration fixture only. It opens no native endpoint and cannot issue
+// a production Check/RunMain receipt; actual case assertions use their own fixtures.
+async function fixtureSession(selected, env, directory) {
+  const compiled = JSON.parse(readFileSync(env.POLARIS_CORE_IDENTITY_FILE));
+  const record = { schema: 'polaris-native-session-v1', state: 'ready', code: 'ready', detail: null,
+    processId: 80, owner: { schema: 'polaris-native-session-owner-v1', sessionId: '00000000-0000-4000-8000-000000000001',
+      compiledAppBuildId: env.GITHUB_SHA, caller: env.CORE_PLATFORM === 'win' ? 'sS-1-5-21-1000' : 'u1000',
+      platform: env.CORE_PLATFORM, coreId: compiled.id, providerFingerprint: compiled.core.providerFingerprint, coreFiles: compiled.core.files,
+      helperSha256: compiled.core.helperSha256 ?? null, cleanerSha256: compiled.core.cleanerSha256 ?? null,
+      requiredCases: [...TESTS] }, configRoot: join(directory, 'inert-private-session'),
+    provider: 'compiled-platform-production-route', registrationScope: 'enforced-by-production-start', executionAuthorized: false, slots: 1,
+    maxRetainedBytes: 32 * 1024 * 1024, retainedBytesBefore: 0, required: true, publicationEligible: false };
+  return { kind: 'preparation', record, processId: 80, async finish() {
+    const teardown = { schema: 'polaris-native-session-teardown-v1', sessionId: record.owner.sessionId,
+      processId: 80, startedCases: 6, caseDrainCheckpointsMatched: true, providerIdle: true,
+      state: 'retained', directoryState: 'retained', retainedBytes: 2048, maxRetainedBytes: record.maxRetainedBytes,
+      retentionReason: 'inert retained fixture', evidenceKind: 'data-coordination-only', registrationChanged: false, providerInstalled: false, publicationEligible: false };
+    const stdout = `POLARIS_NATIVE_SESSION ${JSON.stringify(record)}\nPOLARIS_NATIVE_SESSION_TEARDOWN ${JSON.stringify(teardown)}\n`;
+    writeFileSync(join(directory, 'native-session.stdout.log'), stdout);
+    writeFileSync(join(directory, 'native-session.stderr.log'), '');
+    return { processId: 80, status: 0, signal: null, captureError: null, stdout, stderr: '' };
+  } };
+}
+async function runTests(selected, env, directory, execute) {
+  if (selected.carrier !== 'normal-production-library') return runCaseTests(selected, env, directory, execute);
+  return withNativeSession(selected, env, directory, () => runCaseTests(selected, env, directory, execute), fixtureSession);
 }
 
 test('RuntimeConfig source mocks remain independent of payload admission and use the exact package test', () => {

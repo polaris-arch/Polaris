@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Current Cargo artifacts: source libtests and a separate normal-library native carrier. No cached verdicts.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -300,7 +300,7 @@ function nativeBinding(root, directory, env, run) {
   return { repository: c.repository, repositoryId: c.repositoryId, candidate: sourceCommit, sourceTree,
     runId, attempt, workflowRef: env.GITHUB_WORKFLOW_REF, ref: env.GITHUB_REF, platform: context.platform,
     selection: context.selection, kernelSourceCommit: context.kernelSourceCommit, kernelSourceTree: context.kernelSourceTree,
-    sourceHashes, context: byteIdentity(contextBytes), compiledManifest: { ...byteIdentity(compiledBytes), id: compiled.id } };
+    sourceHashes, context: byteIdentity(contextBytes), compiledManifest: { ...byteIdentity(compiledBytes), id: compiled.id, core: compiled.core } };
 }
 
 // Only a validated Cargo selection can obtain producer authority. The executor's
@@ -325,6 +325,213 @@ function saveNativeResults(directory, receipt) {
   writeFileSync(`${path}.tmp`, bytes, { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
 }
+const SESSION_RESULTS = 'native-session-results.json';
+const SESSION_OUTPUT_LIMIT = 128 * 1024;
+export function sessionPreparation(record, binding, processId) {
+  demand(record?.schema === 'polaris-native-session-v1' && ['ready', 'unmet'].includes(record.state)
+    && record.processId === processId && Number.isSafeInteger(processId) && processId > 0
+    && record.required === true && record.publicationEligible === false && record.executionAuthorized === false
+    && record.registrationScope === 'enforced-by-production-start'
+    && record.slots === 1 && record.maxRetainedBytes === 32 * 1024 * 1024
+    && Number.isSafeInteger(record.retainedBytesBefore) && record.retainedBytesBefore >= 0
+    && record.retainedBytesBefore <= record.maxRetainedBytes
+    && typeof record.configRoot === 'string' && isAbsolute(record.configRoot), 'Invalid native preparation envelope');
+  const owner = record.owner;
+  demand(owner?.schema === 'polaris-native-session-owner-v1'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(owner.sessionId ?? '')
+    && owner.compiledAppBuildId === binding.candidate && owner.platform === binding.platform
+    && owner.coreId === binding.compiledManifest.id
+    && owner.providerFingerprint === binding.compiledManifest.core.providerFingerprint
+    && typeof owner.caller === 'string'
+    && (binding.platform === 'win' ? /^sS-1-[0-9-]+$/.test(owner.caller) && owner.caller !== 'sS-1-5-18'
+      : /^u[1-9][0-9]*$/.test(owner.caller))
+    && JSON.stringify(owner.requiredCases) === JSON.stringify(TESTS)
+    && Array.isArray(owner.coreFiles) && JSON.stringify(owner.coreFiles.map(f => [f.name, f.bytes, f.sha256]))
+      === JSON.stringify(binding.compiledManifest.core.files.map(f => [f.name, f.bytes, f.sha256]))
+    && owner.helperSha256 === (binding.compiledManifest.core.helperSha256 ?? null)
+    && owner.cleanerSha256 === (binding.compiledManifest.core.cleanerSha256 ?? null),
+  'Native preparation differs from exact source/platform/CoreID or required scope');
+  return record;
+}
+export function unmetPrerequisite(record, binding, processId) {
+  demand(record?.schema === 'polaris-native-prerequisite-v1' && record.state === 'unmet'
+    && record.required === true && record.publicationEligible === false && record.processId === processId
+    && record.compiledAppBuildId === binding.candidate && record.platform === binding.platform
+    && JSON.stringify(record.requiredCases) === JSON.stringify(TESTS)
+    && typeof record.stage === 'string' && typeof record.code === 'string' && typeof record.detail === 'string',
+  'Native unmet prerequisite differs from exact source/platform or required scope');
+  return record;
+}
+export function sessionTeardown(record, preparation, processId) {
+  demand(record?.schema === 'polaris-native-session-teardown-v1' && record.processId === processId
+    && record.sessionId === preparation.owner.sessionId && record.publicationEligible === false
+    && record.evidenceKind === 'data-coordination-only'
+    && record.registrationChanged === false && record.providerInstalled === false
+    && ['retained', 'retained-unopened', 'cleanup-unconfirmed'].includes(record.state) && record.directoryState === 'retained'
+    && (record.providerIdle === null || typeof record.providerIdle === 'boolean')
+    && Number.isSafeInteger(record.startedCases) && record.startedCases >= 0 && record.startedCases <= TESTS.length,
+  'Native teardown differs from the original session');
+  return (record.state === 'retained' && record.providerIdle === true
+      || record.state === 'retained-unopened' && record.startedCases === 0)
+    && record.caseDrainCheckpointsMatched === true
+    && Number.isSafeInteger(record.retainedBytes) && record.retainedBytes >= 0
+    && record.retainedBytes <= preparation.maxRetainedBytes && record.maxRetainedBytes === preparation.maxRetainedBytes;
+}
+function saveSessionResults(directory, value) {
+  const bytes = JSON.stringify(value, null, 2) + '\n';
+  demand(Buffer.byteLength(bytes) <= 256 * 1024, 'Session receipt exceeds bound');
+  const path = join(directory, SESSION_RESULTS);
+  writeFileSync(`${path}.tmp`, bytes, { mode: 0o600 }); renameSync(`${path}.tmp`, path);
+}
+// The holder owns only the private data slot. It cannot install/elevate, execute
+// a core, accept a transport/path/policy, or issue a native retirement fact.
+export async function startNativeSession(selected, env, directory) {
+  const child = spawn(selected.executable, ['--session'], {
+    cwd: dirname(selected.manifest), env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  });
+  let stdout = '', stderr = '', captureError = null, settled = false, holderClosed = false, prepareResolve, prepareReject;
+  const preparation = new Promise((resolve, reject) => { prepareResolve = resolve; prepareReject = reject; });
+  const closed = new Promise((resolve) => {
+    child.once('error', error => { captureError = problem(error); if (!settled) { settled = true; prepareReject(error); } });
+    child.once('close', (status, signal) => {
+      holderClosed = true;
+      if (!settled) { settled = true; prepareReject(Error('Session holder exited without bounded preparation')); }
+      resolve({ processId: child.pid ?? null, status, signal, captureError, stdout, stderr });
+    });
+  });
+  const closeInput = () => { if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end('teardown\n'); };
+  child.stdin.on('error', error => { captureError ||= problem(error); });
+  const capture = (key, chunk) => {
+    const value = (key === 'stdout' ? stdout : stderr) + chunk.toString('utf8');
+    if (Buffer.byteLength(value) > SESSION_OUTPUT_LIMIT) {
+      captureError ||= 'Session output exceeded its bound'; closeInput();
+      if (!settled) { settled = true; prepareReject(Error(captureError)); }
+      return;
+    }
+    if (key === 'stdout') stdout = value; else stderr = value;
+    if (!settled && key === 'stdout') {
+      for (const [prefix, kind] of [['POLARIS_NATIVE_SESSION ', 'preparation'], ['POLARIS_NATIVE_PREREQUISITE ', 'prerequisite']]) {
+        try {
+          const rows = records(stdout, prefix);
+          if (rows.length === 1) { settled = true; prepareResolve({ kind, record: rows[0] }); break; }
+          if (rows.length > 1) throw Error('Duplicate session preparation');
+        } catch (error) {
+          if (!stdout.endsWith('\n')) continue;
+          settled = true; closeInput(); prepareReject(error);
+        }
+      }
+    }
+  };
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', chunk => capture('stdout', chunk)); child.stderr.on('data', chunk => capture('stderr', chunk));
+  const interrupted = () => { captureError ||= 'Session runner interrupted; native custody must remain unconfirmed until original drains'; closeInput(); };
+  process.on('SIGINT', interrupted); process.on('SIGTERM', interrupted);
+  const timer = setTimeout(() => { captureError ||= 'Session preparation deadline exceeded'; closeInput();
+    if (!settled) { settled = true; prepareReject(Error(captureError)); } }, 30_000);
+  const finish = async () => {
+    clearTimeout(timer); closeInput();
+    // Do not kill the holder or discard custody on a timeout. Record unknown and
+    // retain its private slot; the runner's outer process lifetime owns delivery.
+    const outcome = await Promise.race([closed, new Promise(resolve => {
+      const deadline = setTimeout(() => resolve({ processId: child.pid ?? null, status: null,
+        captureError: 'Session teardown deadline exceeded; holder and data retained', stdout, stderr }), 30_000);
+      closed.then(() => clearTimeout(deadline));
+    })]);
+    process.removeListener('SIGINT', interrupted); process.removeListener('SIGTERM', interrupted);
+    for (const [name, value] of [['stdout', outcome.stdout], ['stderr', outcome.stderr]])
+      writeFileSync(join(directory, `native-session.${name}.log`), value, { mode: 0o600 });
+    return outcome;
+  };
+  try { const value = await preparation; clearTimeout(timer); return { ...value, processId: child.pid, finish, assertActive() {
+    demand(!holderClosed && !captureError, 'Session holder interrupted/exited; retain original owners and stop further cases');
+  } }; }
+  catch (error) { await finish(); throw error; }
+}
+export async function withNativeSession(selected, env, directory, run, start = startNativeSession) {
+  const authority = nativeBindings.get(selected);
+  demand(authority && authority.sha256 === hash(selected.executable), 'Session requires current bound Cargo artifact');
+  const receipt = { schema: 'polaris-native-session-runtime-v1', binding: authority.binding,
+    executableSha256: authority.sha256, requiredCases: [...TESTS], state: 'starting', processId: null,
+    preparation: null, prerequisite: null, teardown: null, teardownConfirmed: false, failure: null, streams: null };
+  saveSessionResults(directory, receipt);
+  let holder = null, error = null;
+  try {
+    holder = await start(selected, env, directory); receipt.processId = holder.processId;
+    if (holder.kind === 'prerequisite') {
+      receipt.prerequisite = unmetPrerequisite(holder.record, authority.binding, holder.processId);
+      receipt.state = 'unmet'; throw Error(`Required native prerequisite unmet: ${receipt.prerequisite.stage}/${receipt.prerequisite.code}`);
+    }
+    receipt.preparation = sessionPreparation(holder.record, authority.binding, holder.processId);
+    if (receipt.preparation.state !== 'ready') {
+      receipt.state = 'unmet'; throw Error(`Required native provider prerequisite unmet: ${receipt.preparation.code}`);
+    }
+    receipt.state = 'ready'; saveSessionResults(directory, receipt);
+    authority.session = holder;
+    await run();
+  } catch (cause) { error = cause; receipt.failure = problem(cause); }
+  finally {
+    delete authority.session;
+    if (holder) {
+      try {
+        const end = await holder.finish();
+        demand(hash(selected.executable) === authority.sha256, 'Session executable changed during preparation/cases/teardown');
+        receipt.executor = { processId: end.processId, status: end.status, signal: end.signal ?? null, captureError: end.captureError ?? null };
+        receipt.streams = Object.fromEntries(['stdout', 'stderr'].map(name => [name, {
+          file: `native-session.${name}.log`, ...byteIdentity(Buffer.from(end[name] ?? '', 'utf8')),
+        }]));
+        const stdout = end.stdout ?? '';
+        if (receipt.preparation) {
+          const rows = records(stdout, 'POLARIS_NATIVE_SESSION_TEARDOWN ');
+          demand(rows.length === 1, 'Session teardown record missing or duplicated');
+          receipt.teardown = rows[0];
+          receipt.teardownConfirmed = end.status === 0 && !end.signal && !end.captureError
+            && sessionTeardown(rows[0], receipt.preparation, holder.processId);
+          demand(receipt.teardownConfirmed, 'Session teardown unconfirmed; retain original data');
+        } else {
+          demand(receipt.prerequisite && Number.isInteger(end.status) && end.status !== 0 && !end.signal && !end.captureError,
+            'Unopened prerequisite process exit unconfirmed');
+        }
+      } catch (cause) {
+        receipt.cleanupFailure = problem(cause);
+        error = Error([receipt.failure, receipt.cleanupFailure].filter(Boolean).join('; '));
+      }
+    }
+    if (receipt.state !== 'unmet') receipt.state = receipt.teardownConfirmed ? 'completed' : 'cleanup-unconfirmed';
+    receipt.failure = error ? problem(error) : null; saveSessionResults(directory, receipt);
+  }
+  if (error) throw error;
+}
+function readSessionResults(directory, binding, executableSha256) {
+  const r = JSON.parse(textBytes(boundedBytes(join(directory, SESSION_RESULTS), 256 * 1024)));
+  demand(r.schema === 'polaris-native-session-runtime-v1' && JSON.stringify(r.binding) === JSON.stringify(binding)
+    && r.executableSha256 === executableSha256 && JSON.stringify(r.requiredCases) === JSON.stringify(TESTS)
+    && ['unmet', 'completed', 'cleanup-unconfirmed'].includes(r.state), 'Session receipt source/scope/state differs');
+  const output = {};
+  for (const name of ['stdout', 'stderr']) {
+    const s = r.streams?.[name], file = `native-session.${name}.log`;
+    const b = boundedBytes(join(directory, file), SESSION_OUTPUT_LIMIT);
+    demand(s?.file === file && s.bytes === b.length && s.sha256 === digestBytes(b), 'Session original streams differ');
+    output[name] = textBytes(b);
+  }
+  if (r.preparation) {
+    const rows = records(output.stdout, 'POLARIS_NATIVE_SESSION ');
+    demand(rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(r.preparation), 'Preparation stream differs');
+    sessionPreparation(r.preparation, binding, r.processId);
+    const ends = records(output.stdout, 'POLARIS_NATIVE_SESSION_TEARDOWN ');
+    demand(ends.length === 1 && JSON.stringify(ends[0]) === JSON.stringify(r.teardown), 'Teardown stream differs');
+    const confirmed = r.executor?.processId === r.processId && r.executor.status === 0
+      && r.executor.signal === null && r.executor.captureError === null && sessionTeardown(r.teardown, r.preparation, r.processId);
+    demand(r.teardownConfirmed === confirmed, 'Session teardown summary differs');
+  } else {
+    const rows = records(output.stdout, 'POLARIS_NATIVE_PREREQUISITE ');
+    demand(rows.length === 1 && JSON.stringify(rows[0]) === JSON.stringify(r.prerequisite), 'Prerequisite stream differs');
+    unmetPrerequisite(r.prerequisite, binding, r.processId);
+    demand(r.executor?.processId === r.processId && Number.isInteger(r.executor.status) && r.executor.status !== 0
+      && r.executor.signal === null && r.executor.captureError === null, 'Unopened prerequisite executor differs');
+  }
+  return r;
+}
+
 const nativeFields = (record) => record && Object.fromEntries([
   'schema', 'case', 'processId', 'result', 'carrier', 'validationCustodyDrained', 'publicationEligible',
 ].map((key) => [key, record[key]]));
@@ -374,13 +581,15 @@ function confirmedGraph(result, name, directory, executableSha256) {
 export function nativeRuntimeSummary(directory, env, root = process.cwd(), run = execFileSync) {
   const tests = TESTS.map((name) => ({ name, state: 'unexecuted', cleanup: 'not-started', invoked: false,
     log: join(directory, `${name.split('::').at(-1)}.stdout.log`) }));
-  const summary = { state: 'unexecuted', requirementState: 'open', scope: 'Six exact normal-production-library lifecycle, hot-switch and stats cases; no SYSTEM or packaged acceptance',
+  const summary = { state: 'unexecuted', requirementState: 'open', scope: 'Six required normal-production-library lifecycle, hot-switch and stats cases; ordinary source preparation does not authorize required Mac root/Windows SYSTEM provider installation or execution; no packaged acceptance',
     nativeProduction: false, nonTest: false, tests, AppAccepted: false, packagedAcceptance: false, publicationEligible: false };
-  if (!existsSync(join(directory, NATIVE_RESULTS))) return { ...summary, evidenceState: 'missing' };
   try {
-    const receipt = JSON.parse(textBytes(boundedBytes(join(directory, NATIVE_RESULTS), 2 * 1024 * 1024)));
     const artifact = nativeArtifact(resolve(root), directory);
     const binding = { ...nativeBinding(root, directory, env, run), files: artifact.files };
+    const session = readSessionResults(directory, binding, artifact.selected.sha256);
+    Object.assign(summary, { session, binding });
+    if (!existsSync(join(directory, NATIVE_RESULTS))) return { ...summary, state: session.state === 'unmet' ? 'unmet-prerequisite' : 'failed-or-incomplete', evidenceState: 'bound', tests: tests.map(row => ({ ...row, state: session.state === 'unmet' ? 'unmet-prerequisite' : row.state, required: true, prerequisite: session.prerequisite ?? session.preparation })) };
+    const receipt = JSON.parse(textBytes(boundedBytes(join(directory, NATIVE_RESULTS), 2 * 1024 * 1024)));
     demand(receipt.schema === 'polaris-native-production-runtime-v1' && JSON.stringify(receipt.binding) === JSON.stringify(binding)
       && JSON.stringify(receipt.executable) === JSON.stringify({ ...selectionIdentity(artifact.selected), sha256: artifact.selected.sha256 })
       && ['in-progress', 'completed', 'aborted'].includes(receipt.phase)
@@ -412,7 +621,9 @@ export function nativeRuntimeSummary(directory, env, root = process.cwd(), run =
         view.state = row.state === 'passed' && !row.failure && graph && exactNativePass(result, name) ? 'passed' : 'failed';
       } catch (error) { Object.assign(view, { state: 'invalid-evidence', failure: problem(error) }); }
     }
-    const passed = receipt.phase === 'completed' && receipt.failure === null && env.RUNTIME_OUTCOME === 'success'
+    const passed = session.state === 'completed' && session.failure === null && session.preparation?.state === 'ready'
+      && session.teardownConfirmed === true && session.teardown.startedCases === TESTS.length
+      && receipt.phase === 'completed' && receipt.failure === null && env.RUNTIME_OUTCOME === 'success'
       && tests.every((row) => row.state === 'passed');
     summary.state = passed ? 'passed' : tests.some((row) => row.invoked || row.state === 'invalid-evidence') ? 'failed-or-incomplete' : 'unexecuted';
     summary.requirementState = passed ? 'satisfied' : 'open';
@@ -439,6 +650,7 @@ export async function runTests(selected, env, directory, execute = executeComman
   let current = null;
   try {
   for (const name of TESTS) {
+    authority?.session?.assertActive?.();
     demand(hash(selected.executable) === digest, 'Controlled executable changed before a test');
     current = receipt?.cases[TESTS.indexOf(name)] ?? null;
     if (current) { current.state = 'started'; current.executableBeforeSha256 = digest; save(); }
@@ -456,6 +668,7 @@ export async function runTests(selected, env, directory, execute = executeComman
       save();
     }
     demand(confirmedCleanup(result, name), `Controlled owned-child cleanup is unconfirmed: ${name}`);
+    authority?.session?.assertActive?.();
     demand(selected.carrier === 'normal-production-library' ? nativeCaseRecord(result,name) : oneExecutedTest(result), `Controlled invocation did not execute exactly one reviewed case: ${name}`);
     let graph = false, evidenceError = null;
     try { graph = preserveProductionGraph(result, name, directory, digest); }
@@ -566,7 +779,7 @@ async function main() {
   const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();
   const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);
   // Cargo runs libtests in the package directory, rather than the workspace root.
-  await runTests(selected, env, directory);
+  await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

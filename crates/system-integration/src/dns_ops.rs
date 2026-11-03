@@ -762,6 +762,14 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
                 return receipt(TakeoverOutcome::FailedUnchanged, Some(error.to_string()))
             }
         }
+        if prepared.needs_prior_restore() {
+            let mut pending = receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some("DNS prior owner requires confirmed restoration before replacement".into()),
+            );
+            pending.marker_id = prepared.prior_marker_operation_id();
+            return pending;
+        }
         let typed_owned = prepared.marker_raw.as_ref().is_some_and(|raw| {
             self.marker
                 .read()

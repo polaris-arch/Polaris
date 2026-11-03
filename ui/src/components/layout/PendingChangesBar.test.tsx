@@ -129,7 +129,7 @@ beforeEach(() => {
   h.nativeRead.mockRejectedValue(new Error('Native-only status unavailable'));
   h.hostRead.mockRejectedValue(new Error('Host status unavailable'));
 });
-afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); });
+afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('desktop host execution and four-account feedback', () => {
   it('polls HostOnly without a transaction and retains the bar at D=R until a physical receipt', async () => {
@@ -378,6 +378,45 @@ describe('desktop native listener cleanup stays independent', () => {
     expect(expanded).toContain('white-space:normal');
     expect(expanded).toContain('<p>home.pendingNativeCleanupDetail</p>');
     expect(expanded).not.toContain('native-A');
+  });
+
+  it('the real popover effect keeps browser outside-click/Escape behavior and releases its listeners', async () => {
+    const add = vi.fn(), remove = vi.fn();
+    vi.stubGlobal('document', { addEventListener: add, removeEventListener: remove });
+    await start();
+    const inside = {}, outside = {};
+    const root = renderBar() as ReactElement<{ ref: { current: { contains: (target: unknown) => boolean } | null } }>;
+    root.props.ref.current = { contains: target => target === inside };
+    const open = () => {
+      const details = elements(renderBar()).find(element => element.type === 'button'
+        && text(element.props.children).includes('home.pendingNativeCleanupUnknown'));
+      details!.props.onClick!();
+      return markup();
+    };
+    expect(add).not.toHaveBeenCalled();
+    expect(open()).toContain('class="pd-pop"');
+    expect(add.mock.calls.map(([kind]) => kind)).toEqual(['mousedown', 'keydown']);
+    const down = add.mock.calls[0][1] as (event: { target: unknown }) => void;
+    const key = add.mock.calls[1][1] as (event: { key: string }) => void;
+    down({ target: inside }); key({ key: 'Enter' });
+    expect(markup()).toContain('class="pd-pop"');
+    key({ key: 'Escape' });
+    expect(markup()).not.toContain('class="pd-pop"');
+    expect(remove).toHaveBeenCalledWith('mousedown', down);
+    expect(remove).toHaveBeenCalledWith('keydown', key);
+    expect(open()).toContain('class="pd-pop"');
+    const outsideDown = add.mock.calls[2][1] as (event: { target: unknown }) => void;
+    outsideDown({ target: outside });
+    expect(markup()).not.toContain('class="pd-pop"');
+    expect(remove).toHaveBeenCalledWith('mousedown', outsideDown);
+    expect(open()).toContain('class="pd-pop"');
+    const finalDown = add.mock.calls[4][1], finalKey = add.mock.calls[5][1];
+    unmount();
+    expect(remove).toHaveBeenCalledWith('mousedown', finalDown);
+    expect(remove).toHaveBeenCalledWith('keydown', finalKey);
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.nativeRead).not.toHaveBeenCalled();
+    expect(h.freshApply).not.toHaveBeenCalled();
   });
 
   it('keeps normal accepted-carrier PENDING successful, then receives delayed UNKNOWN through the pending feed', async () => {

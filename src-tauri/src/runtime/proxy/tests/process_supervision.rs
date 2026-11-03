@@ -98,6 +98,26 @@ fn pinned_birth_started_reply(pid: u32, birth: &str) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn pinned_birth_start_frame(
+    id: &polaris_helper_proto::core_manifest::CoreId,
+    directory: &Path,
+    config_path: &Path,
+) -> String {
+    format!(
+        "start-pinned-birth-safe\n{}\n{}\n{}\n{}\n0\n{}\nruntime-root-v1={}\n",
+        polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+        id.as_str(),
+        config_path.to_str().unwrap(),
+        directory
+            .join(super::super::startup::SINGBOX_STARTUP_LOG)
+            .to_str()
+            .unwrap(),
+        std::process::id(),
+        directory.to_str().unwrap(),
+    )
+}
+
 fn android_target(run_id: &str) -> super::super::android_bridge::AndroidExactTarget {
     super::super::android_bridge::AndroidExactTarget {
         run_id: run_id.to_owned(),
@@ -2138,8 +2158,10 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
     let a_hex = "00112233445566778899aabbccddeeff";
     let b_hex = "11112222333344445555666677778888";
     let (rt, dir, frames) = birth_daemon_runtime([
+        format!("OK {}\n", polaris_helper_proto::proto_version::CURRENT),
         pinned_birth_started_reply(a_pid, a_hex),
         format!("OK birth-stopped {a_pid} {a_hex}\n"),
+        format!("OK {}\n", polaris_helper_proto::proto_version::CURRENT),
         pinned_birth_started_reply(b_pid, b_hex),
     ]);
     let gate = rt.mesh.tailscale_state_gate().await;
@@ -2212,26 +2234,22 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
     );
     {
         let sent = frames.lock().unwrap();
-        assert_eq!(
-            sent.len(),
-            3,
-            "only Start A, Stop A, Start B may reach the daemon"
-        );
         let id = crate::runtime::core_identity::selected_id(
             crate::runtime::core_identity::current_platform().unwrap(),
         )
         .unwrap();
-        assert!(sent[0].starts_with(&format!(
-            "start-pinned-birth-safe\n{}\n{}\n",
-            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
-            id.as_str()
-        )));
-        assert_eq!(sent[1], format!("stop-birth-safe\n{a_pid}\n{a_hex}\n"));
-        assert!(sent[2].starts_with(&format!(
-            "start-pinned-birth-safe\n{}\n{}\n",
-            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
-            id.as_str()
-        )));
+        let start = pinned_birth_start_frame(&id, &dir, &config_path);
+        assert_eq!(
+            sent.as_slice(),
+            [
+                "version\n".to_owned(),
+                start.clone(),
+                format!("stop-birth-safe\n{a_pid}\n{a_hex}\n"),
+                "version\n".to_owned(),
+                start,
+            ],
+            "Version A, Start A, Stop A, Version B, Start B are the complete schedule"
+        );
     }
     b_process.start_kill().unwrap();
     b_process.wait().await.unwrap();
@@ -2243,6 +2261,7 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     let pid = u32::MAX; // checked_pid rejects it without probing any host process.
     let hex = "00112233445566778899aabbccddeeff";
     let (rt, dir, frames) = birth_daemon_runtime([
+        format!("OK {}\n", polaris_helper_proto::proto_version::CURRENT),
         pinned_birth_started_reply(pid, hex),
         format!("OK birth-stopped {pid} {hex}\n"),
     ]);
@@ -2277,17 +2296,18 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     assert!(!rt.child.lock().unwrap().has_helper_start());
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
     let sent = frames.lock().unwrap();
-    assert_eq!(sent.len(), 2);
     let id = crate::runtime::core_identity::selected_id(
         crate::runtime::core_identity::current_platform().unwrap(),
     )
     .unwrap();
-    assert!(sent[0].starts_with(&format!(
-        "start-pinned-birth-safe\n{}\n{}\n",
-        polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
-        id.as_str()
-    )));
-    assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{hex}\n"));
+    assert_eq!(
+        sent.as_slice(),
+        [
+            "version\n".to_owned(),
+            pinned_birth_start_frame(&id, &dir, &dir.join("test-core.json")),
+            format!("stop-birth-safe\n{pid}\n{hex}\n"),
+        ]
+    );
 }
 
 /// A legacy birth receipt or a different CoreID may identify a process to stop,
@@ -2311,8 +2331,11 @@ async fn unpinned_and_wrong_id_birth_receipts_are_rejected_and_exact_stopped() {
         format!("OK birth-started {pid} {birth}\n"),
         format!("OK birth-started {pid} {birth} core={wrong}\n"),
     ] {
-        let (rt, dir, frames) =
-            birth_daemon_runtime([reply, format!("OK birth-stopped {pid} {birth}\n")]);
+        let (rt, dir, frames) = birth_daemon_runtime([
+            format!("OK {}\n", polaris_helper_proto::proto_version::CURRENT),
+            reply,
+            format!("OK birth-stopped {pid} {birth}\n"),
+        ]);
         let gate = rt.mesh.tailscale_state_gate().await;
         let mut reservation = rt
             .mesh
@@ -2341,13 +2364,14 @@ async fn unpinned_and_wrong_id_birth_receipts_are_rejected_and_exact_stopped() {
         assert!(!rt.child.lock().unwrap().has_helper_start());
         assert!(rt.pid.lock().unwrap().is_none());
         let sent = frames.lock().unwrap();
-        assert_eq!(sent.len(), 2);
-        assert!(sent[0].starts_with(&format!(
-            "start-pinned-birth-safe\n{}\n{}\n",
-            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
-            selected.as_str()
-        )));
-        assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{birth}\n"));
+        assert_eq!(
+            sent.as_slice(),
+            [
+                "version\n".to_owned(),
+                pinned_birth_start_frame(&selected, &dir, &dir.join("config.json")),
+                format!("stop-birth-safe\n{pid}\n{birth}\n"),
+            ]
+        );
     }
 }
 

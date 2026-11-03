@@ -17,6 +17,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "cleanup.rs"]
 mod cleanup;
+#[path = "session.rs"]
+mod session;
+
+pub(crate) fn hold_session() -> Result<(), String> {
+    session::hold_session()
+}
 const FIXTURE_MANAGEMENT_SECRET: &str = "fixture-management-secret";
 static RUNTIME: OnceLock<Arc<ProxyRuntime>> = OnceLock::new();
 static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
@@ -1216,7 +1222,6 @@ async fn real_core_aggregate_relay_emits_real_frames() {
     proxy.stop().await.expect("停核应成功");
     assert!(!proxy.status().running, "停核后 running 必须为 false");
     println!("[done] proxy.stop() → running=false（pid={pid} 已收割）");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 type NativeCaseFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>;
@@ -1279,15 +1284,14 @@ pub(crate) async fn run_case(case: &str) -> Result<(), String> {
         return Err("unknown native acceptance case".into());
     }
     let factory = selected_case_factory(case).ok_or("unknown native acceptance case")?;
+    session::capability_preflight()?;
     super::core_binary::dev_core_binary_override().map(drop)?;
     eprintln!("native verification stage: selected");
-    let parent = std::env::temp_dir().join("polaris-native-production-verification");
-    std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
-    let dir = parent.join(uuid::Uuid::new_v4().to_string());
-    std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+    let session = session::CaseSession::open(case)?;
+    let dir = session.case_dir.clone();
     eprintln!("native verification stage: runtime constructors");
     let config = Arc::new(ConfigManager::new(dir.clone()));
-    let helper = Arc::new(HelperRuntime::new(dir.clone()));
+    let helper = Arc::new(HelperRuntime::new(session.config_root.clone()));
     let mesh = Arc::new(MeshRuntime::new_with_helper(dir.clone(), helper.clone()));
     let clearer = Box::new(polaris_system_integration::production_proxy_controller(
         dir.join(polaris_system_integration::PROXY_MARKER_FILENAME)
@@ -1335,11 +1339,9 @@ pub(crate) async fn run_case(case: &str) -> Result<(), String> {
             "production shutdown custody unconfirmed: {cleanup:?}; fenced={fenced}, empty={empty}, no_pid={no_pid}"
         ));
     }
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.to_string()),
-    };
+    // The suite owns the fixed registered root and retained case data. A case
+    // never removes that namespace/token or claims descriptor-bound deletion.
+    session.drained(case)?;
     println!(
         "POLARIS_NATIVE_CASE {}",
         serde_json::json!({"schema":"polaris-native-production-case-v1","case":case,"processId":std::process::id(),"result":if result.is_ok(){"passed"}else{"failed"},"carrier":"normal-production-library","validationCustodyDrained":true,"publicationEligible":false})

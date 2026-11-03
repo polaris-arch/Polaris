@@ -1358,12 +1358,56 @@ fn live_dns_restore_silent_success_retains_restoring_marker_until_actual_readbac
         serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
     assert_eq!(raw["hostEffect"]["operationId"], "restore-owner");
     assert_eq!(raw["hostEffect"]["phase"], "restoring");
-    assert!(c.prepare_effect(true).is_err());
+    let marker_before = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    let values_before = c.ops.dns_state.borrow().clone();
+    c.ops.apply_calls.borrow_mut().clear();
+    let retry = c.prepare_effect(true).unwrap();
+    assert!(retry.needs_prior_restore());
+    assert_eq!(
+        retry.prior_marker_operation_id().as_deref(),
+        Some("restore-owner")
+    );
+    assert_eq!(retry.scope(), prepared.scope());
+    assert_eq!(retry.original, prepared.before);
+    assert_eq!(retry.before(), &values_before);
+    assert!(c.checked_owned_receipt().unwrap().is_none());
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
+    let rejected = c.apply_effect(&retry, "must-not-replace-restoring");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("restore-owner"));
+    assert!(rejected.cleanup_pending);
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
+    assert!(c.prepare_after_restore(&retry).is_err());
+    c.restore_dns();
+    assert!(
+        c.has_marker(),
+        "silent restore cannot discharge old-owner debt"
+    );
+    assert_eq!(
+        c.exact_marker_operation_id().as_deref(),
+        Some("restore-owner")
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
     assert_eq!(c.marker.read().unwrap().original, prepared.before);
     c.ops.suppress_apply = false;
     c.restore_dns();
     assert!(!c.has_marker());
     assert_eq!(*c.ops.dns_state.borrow(), prepared.before);
+    let next = c.prepare_after_restore(&retry).unwrap();
+    assert_eq!(next.scope(), retry.scope());
+    assert_eq!(next.before(), &prepared.before);
+    assert!(!next.needs_prior_restore());
+    assert!(next.prior_marker_operation_id().is_none());
 }
 
 #[test]
@@ -1551,12 +1595,39 @@ fn exact_partial_dns_retry_restores_original_owner_before_replacement_and_rechec
         TakeoverOutcome::RecoveryPending
     );
     c.ops.suppress_apply = false;
+    let marker_before = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    let values_before = c.ops.dns_state.borrow().clone();
+    c.ops.apply_calls.borrow_mut().clear();
     let retry = c.prepare_effect(true).unwrap();
     assert!(retry.needs_prior_restore());
     assert_eq!(
         retry.prior_marker_operation_id().as_deref(),
         Some("old-owner")
     );
+    assert_eq!(retry.scope(), prepared.scope());
+    assert_eq!(retry.original["A"], prepared.before["A"]);
+    assert_eq!(retry.original["C"], vec!["10.0.0.53"]);
+    assert!(c.checked_owned_receipt().unwrap().is_none());
+    let rejected = c.apply_effect(&retry, "must-not-replace-applying");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("old-owner"));
+    assert!(rejected.cleanup_pending);
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("A".into(), vec!["9.9.9.9".into()]);
+    assert!(c.prepare_effect(true).is_err());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    *c.ops.dns_state.borrow_mut() = values_before;
     c.restore_dns();
     assert!(!c.has_marker());
     let next = c.prepare_after_restore(&retry).unwrap();
@@ -1567,6 +1638,15 @@ fn exact_partial_dns_retry_restores_original_owner_before_replacement_and_rechec
     );
     assert_eq!(c.exact_marker_operation_id().as_deref(), Some("new-owner"));
     c.restore_dns();
+    assert!(!c.has_marker());
+    assert_eq!(*c.ops.dns_state.borrow(), retry.original);
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("A".into(), vec!["9.9.9.9".into()]);
+    assert!(c.prepare_after_restore(&retry).is_err());
+    assert!(!c.has_marker());
+    *c.ops.dns_state.borrow_mut() = retry.original.clone();
     c.ops.targets.push("D".into());
     assert!(c.prepare_after_restore(&retry).is_err());
 }

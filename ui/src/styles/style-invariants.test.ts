@@ -126,9 +126,9 @@ function ownedFailureReason(value: unknown, owner: string): boolean {
 function ownedToastGuard(value: unknown, result: string, outcome: string, next: string): boolean {
   const names = { RESULT: result, OUTCOME: outcome, NEXT: next };
   return flowMatches(value, `OUTCOME.toast !== null
-    && !(RESULT.status === 'hotApplied' && NEXT.host && NEXT.host.phase !== 'settled')`, names)
+    && !(RESULT.status === 'hotApplied' && (NEXT.nativeRetirements?.length || NEXT.host && NEXT.host.phase !== 'settled'))`, names)
     || flowMatches(value, `OUTCOME.toast !== null && RESULT.status !== 'skipped'
-      && !(RESULT.status === 'hotApplied' && NEXT.host && NEXT.host.phase !== 'settled')`, names);
+      && !(RESULT.status === 'hotApplied' && (NEXT.nativeRetirements?.length || NEXT.host && NEXT.host.phase !== 'settled'))`, names);
 }
 function ownedToastStatement(value: unknown, owner: string): boolean {
   if (!flowNode(value)) return false;
@@ -220,6 +220,9 @@ function ownsApplyOutcome(source: string): boolean {
             const RECEIPT = RESULT.status === 'hotApplied' && RESULT.transactionId !== undefined && RESULT.configurationDurable !== false
               ? { ...RESULT, configurationDurable: true } : RESULT;
             NEXT = applyReceiptState(NEXT, RECEIPT, true);
+            if (RESULT.status === 'nativeCleanupUnknown' && !NEXT.nativeRetirements?.length) {
+              NEXT = { ...NEXT, phase: 'failed', reason: t('home.pendingHotUnconfirmed') };
+            }
             NEXT.hostReconciling = !request.cancelled && OWNER && NEXT.host?.phase === 'pending';
             if ((RESULT.status === 'hostEffectsPending' || RESULT.status === 'hostEffectsFailed')
                 && (!RESULT.hostExecutionId || !OWNER)) {
@@ -227,11 +230,11 @@ function ownsApplyOutcome(source: string): boolean {
             }
             if (OUTCOME.phase === 'applying') {
               if (typeof RESULT.applyId !== 'number' || !Number.isSafeInteger(RESULT.applyId) || RESULT.applyId <= 0) {
-                NEXT = { phase: 'failed', reason: null };
+                NEXT = preserveNativeRetirements(initial, { phase: 'failed', reason: null });
               } else {
                 NEXT.applyId = RESULT.applyId;
                 if (request.earlyStopped) {
-                  NEXT = { phase: 'idle', reason: null };
+                  NEXT = preserveNativeRetirements(initial, { phase: 'idle', reason: null });
                 } else {
                   NEXT.mainGeneration = request.earlyGeneration;
                   for (const event of request.early) NEXT = applyStateOnLifecycle(NEXT, event, translateRef.current) ?? NEXT;
@@ -239,6 +242,7 @@ function ownsApplyOutcome(source: string): boolean {
               }
             }
             request.early = [];
+            NEXT = preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), NEXT);
           `, bound)) continue;
           const allowedWrites = flowNodes(tail);
           const disconnectedWrite = scoped.some(node => ((node.type === 'AssignmentExpression' && writesOwner(node.left, nextName))
@@ -772,6 +776,17 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
         ["next.host.phase !== 'settled'", "other.host.phase !== 'settled'"],
         ['setApply(next);', 'next.host = undefined; setApply(next);'],
         ['setApply(next);', 'receipt.configurationDurable = true; setApply(next);'],
+        ["result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length", "other.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length"],
+        ["result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length", "result.status === 'nativeCleanupUnknown' && !other.nativeRetirements?.length"],
+        ["if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) {\n        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed') };\n      }", "if (false) { next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed') }; }"],
+        ["next = preserveNativeRetirements(initial, { phase: 'failed', reason: null })", "next = preserveNativeRetirements(other, { phase: 'failed', reason: null })"],
+        ["next = preserveNativeRetirements(initial, { phase: 'idle', reason: null })", "next = ({ phase: 'idle', reason: null })"],
+        ["preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next)", "next"],
+        ["preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next)", "preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), initial)"],
+        ["mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements)", "mergeNativeRetirements(other.current, useAppStore.getState().pendingChanges.nativeRetirements)"],
+        ["mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements)", "mergeNativeRetirements(latestApply.current, other.pendingChanges.nativeRetirements)"],
+        ["next.nativeRetirements?.length || next.host", "other.nativeRetirements?.length || next.host"],
+        ["next.nativeRetirements?.length || next.host", "next.host"],
 
       ]) {
         expect(source, before).toContain(before);

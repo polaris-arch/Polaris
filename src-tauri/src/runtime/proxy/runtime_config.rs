@@ -10,6 +10,7 @@ use crate::runtime::route_binding::{
     ProtectedPhysicalRoot,
 };
 use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
+use polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG;
 use polaris_config_engine::builder::{
     generate_sing_box_config_with_report_and_runtime_bindings, GenerateConfigDeps,
 };
@@ -1986,12 +1987,11 @@ impl ProxyRuntime {
                 choice.reasons = result.reasons;
                 return self.remember_runtime_result(choice);
             }
-            Err(result) => return self.remember_runtime_result(result),
+            Err(result) => return self.remember_runtime_result(*result),
         };
         if matches!(
             host_plan.strategy,
             host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore
-                | host_effects::HostEffectStrategy::BridgeOrRestart
         ) {
             return self.remember_runtime_result(
                 self.host_effect_restart_choice(&candidate, &host_plan, generation, intent),
@@ -2503,7 +2503,9 @@ impl ProxyRuntime {
                     .generated
                     .inbounds
                     .iter()
-                    .find(|inbound| inbound.tag == "mixed-in" && inbound.type_field == "mixed")
+                    .find(|inbound| {
+                        inbound.tag == MIXED_INBOUND_TAG && inbound.type_field == "mixed"
+                    })
                     .and_then(|inbound| inbound.listen_port)
                     .unwrap_or(0);
             }
@@ -2856,7 +2858,8 @@ impl ProxyRuntime {
                                 .inbounds
                                 .iter()
                                 .find(|inbound| {
-                                    inbound.tag == "mixed-in" && inbound.type_field == "mixed"
+                                    inbound.tag == MIXED_INBOUND_TAG
+                                        && inbound.type_field == "mixed"
                                 })
                                 .and_then(|inbound| inbound.listen_port)
                                 .unwrap_or(0)

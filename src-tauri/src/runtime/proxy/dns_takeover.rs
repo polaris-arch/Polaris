@@ -256,9 +256,9 @@ impl ProxyRuntime {
         generation: u64,
         intent: u64,
         core_changes: bool,
-    ) -> Result<HostEffectPlan, RuntimeApplyResult> {
+    ) -> Result<HostEffectPlan, Box<RuntimeApplyResult>> {
         if !self.selector_operation_is_current(generation, intent) {
-            return Err(RuntimeApplyResult::status("conflict"));
+            return Err(Box::new(RuntimeApplyResult::status("conflict")));
         }
         let platform = self.helper.platform();
         let accepted_host = self.runtime_accepted_host_config(generation);
@@ -284,7 +284,7 @@ impl ProxyRuntime {
             || self.runtime_dns_effect_retry_required(generation, intent);
         let host_epoch = self.system_proxy.host_epoch();
         if host_epoch & 1 != 0 {
-            return Err(RuntimeApplyResult::status("conflict"));
+            return Err(Box::new(RuntimeApplyResult::status("conflict")));
         }
         let mut strategy = if core_changes {
             HostEffectStrategy::AfterCoreCommit
@@ -310,10 +310,10 @@ impl ProxyRuntime {
             if before.proxy_mode_type.effective_on(platform).is_tun()
                 != after.proxy_mode_type.effective_on(platform).is_tun()
             {
-                return Err(host_rejection(
+                return Err(Box::new(host_rejection(
                     "HOST_CARRIER_TRANSITION_REQUIRES_RESTART",
                     "proxyModeType",
-                ));
+                )));
             }
         }
         if dns_changed {
@@ -380,10 +380,10 @@ impl ProxyRuntime {
             });
                 recipe.dns = Some(prepared);
             } else {
-                return Err(host_rejection(
+                return Err(Box::new(host_rejection(
                     "HOST_DNS_TAKEOVER_UNSUPPORTED",
                     "dnsConfig.takeoverSystemDns",
-                ));
+                )));
             }
         }
         if proxy_changed {
@@ -419,7 +419,7 @@ impl ProxyRuntime {
         };
         plan.effect_digest = host_plan_digest(&plan);
         if !self.runtime_host_facts_match(&plan) {
-            return Err(RuntimeApplyResult::status("conflict"));
+            return Err(Box::new(RuntimeApplyResult::status("conflict")));
         }
         Ok(plan)
     }
@@ -699,7 +699,7 @@ impl ProxyRuntime {
         for preview in &execution.plan.effects {
             let blocked_strategy = matches!(
                 execution.plan.strategy,
-                HostEffectStrategy::NeedsSnapshotBeforeCore | HostEffectStrategy::BridgeOrRestart
+                HostEffectStrategy::NeedsSnapshotBeforeCore
             );
             let mut result = host_leaf_failure(
                 &execution.execution_id,
@@ -748,13 +748,6 @@ impl ProxyRuntime {
                                 }
                             }
                         }
-                        HostEffectKind::NativeTunnel => {
-                            result = host_leaf_failure(
-                                &execution.execution_id,
-                                TakeoverOutcome::Unsupported,
-                                "native tunnel uses its platform owner",
-                            );
-                        }
                     }
                 }
             }
@@ -801,12 +794,83 @@ impl ProxyRuntime {
                             &operation_id,
                             prepared.prior_marker_operation_id(),
                         ) =>
-                    {
+                    'cold: {
+                        let after_restore = prepared.needs_prior_restore();
+                        if after_restore {
+                            let (owner, restored) = match self.linux_resolved_controller.lock() {
+                                Ok(mut controller)
+                                    if self.selector_operation_is_current(generation, intent)
+                                        && controller
+                                            .effect_facts_match(&prepared)
+                                            .unwrap_or(false) =>
+                                {
+                                    let owner = prepared.prior_marker_operation_id();
+                                    let restored = controller.restore().is_ok()
+                                        && controller
+                                            .read_marker_checked()
+                                            .is_ok_and(|marker| marker.is_none());
+                                    (owner, restored)
+                                }
+                                _ => {
+                                    let mut pending = host_leaf_failure(
+                                        &operation_id,
+                                        TakeoverOutcome::RecoveryPending,
+                                        "cold Linux DNS prior cleanup scope changed",
+                                    );
+                                    pending.marker_id = prepared.prior_marker_operation_id();
+                                    break 'cold pending;
+                                }
+                            };
+                            // Controller mutation locks are released before the
+                            // App owner ledger observes exact prior restoration.
+                            if let Some(owner) = &owner {
+                                self.record_runtime_dns_restore_result(owner, restored);
+                            }
+                            if !restored {
+                                let mut pending = host_leaf_failure(
+                                    &operation_id,
+                                    TakeoverOutcome::RecoveryPending,
+                                    "cold Linux DNS prior restoration is unconfirmed",
+                                );
+                                pending.marker_id = owner;
+                                break 'cold pending;
+                            }
+                            if !self.bind_runtime_cold_dns_marker(&operation_id, None) {
+                                break 'cold host_leaf_failure(
+                                    &operation_id,
+                                    TakeoverOutcome::FailedRestored,
+                                    "cold Linux DNS replacement reservation retired after restoration",
+                                );
+                            }
+                        }
                         match self.linux_resolved_controller.lock() {
                             Ok(mut controller)
                                 if self.selector_operation_is_current(generation, intent) =>
                             {
-                                let mut receipt = controller.apply_effect(&prepared, &operation_id);
+                                let next;
+                                let prepared = if after_restore {
+                                    next = match controller.prepare_after_restore(&prepared) {
+                                        Ok(next) => next,
+                                        Err(_) => break 'cold host_leaf_failure(
+                                            &operation_id,
+                                            TakeoverOutcome::FailedRestored,
+                                            "cold Linux DNS scope changed after confirmed restoration",
+                                        ),
+                                    };
+                                    &next
+                                } else {
+                                    &prepared
+                                };
+                                let mut receipt = controller.apply_effect(prepared, &operation_id);
+                                if after_restore
+                                    && matches!(
+                                        receipt.outcome,
+                                        TakeoverOutcome::Superseded
+                                            | TakeoverOutcome::FailedUnchanged
+                                    )
+                                {
+                                    receipt.outcome = TakeoverOutcome::FailedRestored;
+                                }
                                 if receipt.outcome == TakeoverOutcome::Unchanged {
                                     receipt.marker_id = controller
                                         .checked_owned_receipt()
@@ -820,7 +884,11 @@ impl ProxyRuntime {
                             }
                             _ => host_leaf_failure(
                                 &operation_id,
-                                TakeoverOutcome::Superseded,
+                                if after_restore {
+                                    TakeoverOutcome::FailedRestored
+                                } else {
+                                    TakeoverOutcome::Superseded
+                                },
                                 "cold Linux DNS owner changed before write",
                             ),
                         }
@@ -854,12 +922,81 @@ impl ProxyRuntime {
                             &operation_id,
                             prepared.prior_marker_operation_id(),
                         ) =>
-                    {
+                    'cold: {
+                        let after_restore = prepared.needs_prior_restore();
+                        if after_restore {
+                            let (owner, restored) = match self.dns_controller.lock() {
+                                Ok(mut controller)
+                                    if self.selector_operation_is_current(generation, intent)
+                                        && controller
+                                            .effect_facts_match(&prepared)
+                                            .unwrap_or(false) =>
+                                {
+                                    let owner = prepared.prior_marker_operation_id();
+                                    controller.restore_dns();
+                                    let restored = !controller.has_marker();
+                                    (owner, restored)
+                                }
+                                _ => {
+                                    let mut pending = host_leaf_failure(
+                                        &operation_id,
+                                        TakeoverOutcome::RecoveryPending,
+                                        "cold DNS prior cleanup scope changed",
+                                    );
+                                    pending.marker_id = prepared.prior_marker_operation_id();
+                                    break 'cold pending;
+                                }
+                            };
+                            // Controller mutation locks are released before the
+                            // App owner ledger observes exact prior restoration.
+                            if let Some(owner) = &owner {
+                                self.record_runtime_dns_restore_result(owner, restored);
+                            }
+                            if !restored {
+                                let mut pending = host_leaf_failure(
+                                    &operation_id,
+                                    TakeoverOutcome::RecoveryPending,
+                                    "cold DNS prior restoration is unconfirmed",
+                                );
+                                pending.marker_id = owner;
+                                break 'cold pending;
+                            }
+                            if !self.bind_runtime_cold_dns_marker(&operation_id, None) {
+                                break 'cold host_leaf_failure(
+                                    &operation_id,
+                                    TakeoverOutcome::FailedRestored,
+                                    "cold DNS replacement reservation retired after restoration",
+                                );
+                            }
+                        }
                         match self.dns_controller.lock() {
                             Ok(mut controller)
                                 if self.selector_operation_is_current(generation, intent) =>
                             {
-                                let mut receipt = controller.apply_effect(&prepared, &operation_id);
+                                let next;
+                                let prepared = if after_restore {
+                                    next = match controller.prepare_after_restore(&prepared) {
+                                        Ok(next) => next,
+                                        Err(_) => break 'cold host_leaf_failure(
+                                            &operation_id,
+                                            TakeoverOutcome::FailedRestored,
+                                            "cold DNS scope changed after confirmed restoration",
+                                        ),
+                                    };
+                                    &next
+                                } else {
+                                    &prepared
+                                };
+                                let mut receipt = controller.apply_effect(prepared, &operation_id);
+                                if after_restore
+                                    && matches!(
+                                        receipt.outcome,
+                                        TakeoverOutcome::Superseded
+                                            | TakeoverOutcome::FailedUnchanged
+                                    )
+                                {
+                                    receipt.outcome = TakeoverOutcome::FailedRestored;
+                                }
                                 if receipt.outcome == TakeoverOutcome::Unchanged {
                                     receipt.marker_id = controller
                                         .checked_owned_receipt()
@@ -877,7 +1014,11 @@ impl ProxyRuntime {
                             }
                             _ => host_leaf_failure(
                                 &operation_id,
-                                TakeoverOutcome::Superseded,
+                                if after_restore {
+                                    TakeoverOutcome::FailedRestored
+                                } else {
+                                    TakeoverOutcome::Superseded
+                                },
                                 "cold DNS owner changed before write",
                             ),
                         }
@@ -892,11 +1033,13 @@ impl ProxyRuntime {
                     }
                 }
             }
-            _ => host_leaf_failure(
-                &operation_id,
-                TakeoverOutcome::Unsupported,
-                "platform has no checked system DNS adapter",
-            ),
+            Platform::Win | Platform::Other | Platform::Android | Platform::Ios => {
+                host_leaf_failure(
+                    &operation_id,
+                    TakeoverOutcome::Unsupported,
+                    "platform has no checked system DNS adapter",
+                )
+            }
         };
         let accepted = !receipt.cleanup_pending
             && receipt.marker_id.is_some()

@@ -56,6 +56,8 @@ enum Kind {
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 不执行或仅 Windows 执行的具体理由)`。
 const REGISTERED: &[(&str, Kind, usize, &str)] = &[
+    ("crates/core-supervisor/src/spawner/tests/mod.rs", Kind::Shebang, 1,
+        "Linux-only only_admitted_main_with_explicit_absolute_utf8_directory_gets_recovery_root supplies inert admitted_payload::fixture bytes, prepares SpawnRequest and checks argv only. It never spawns or executes this input; the exact owner and no-execution boundary are checked below."),
     ("crates/core-supervisor/src/admitted_payload/macos/tests/mod.rs", Kind::ExecBit, 1,
         "macOS-only Temp::new/impl Temp: DirBuilder.mode(0700) seals a private directory, never an executable file"),
     ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", Kind::ExecBit, 1,
@@ -125,8 +127,8 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "crates/helper/src/platform/linux/handler/tests/mod.rs",
         Kind::ExecBit,
-        2,
-        "Only the owned temporary root and its core subdirectory use 0700 for private traversal; auth and inert core/sidecar files use 0600, with no execution.",
+        5,
+        "setup_env seals only its owned root/core directories to 0700 (two hits). explicit_runtime_root_requires_peer_ownership_and_exact_config_confinement sets its owned temporary root to 0700/0777/0700 (three hits) to reject unsafe directory custody and recover the valid control. Auth and inert payload files remain nonexecutable; no executable writer is admitted.",
     ),
     (
         "crates/core-supervisor/src/config_gate/check_custody/tests/mod.rs",
@@ -360,6 +362,8 @@ fn test_code_drops_executables_only_through_the_shared_helper() {
     // their exact owners so moving a chmod to an executable writer stays red.
     for (file, anchor, expected_exec_bits) in [
         ("crates/core-supervisor/src/admitted_payload/macos/tests/mod.rs", "impl Temp {", 1),
+        ("crates/helper/src/platform/linux/handler/tests/mod.rs", "fn setup_env()", 2),
+        ("crates/helper/src/platform/linux/handler/tests/mod.rs", "fn explicit_runtime_root_requires_peer_ownership_and_exact_config_confinement()", 3),
         ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", "fn sealed_members_keep_required_access_after_helper_uid_drop_and_mode_change_invalidates(", 1),
         ("crates/core-supervisor/src/admitted_payload/tests/mod.rs", "fn permission_failure_remains_environment_io_without_a_reinstall_promise(", 0),
     ] {
@@ -381,6 +385,55 @@ fn test_code_drops_executables_only_through_the_shared_helper() {
             assert!(!syntax[start..=end].contains(".spawn("));
             assert!(!syntax[start..=end].contains(".output("));
         }
+    }
+    // This input is confined to argv construction, not an executable stand-in.
+    let file = "crates/core-supervisor/src/spawner/tests/mod.rs";
+    let source = &files
+        .iter()
+        .find(|(rel, _)| rel == file)
+        .expect("inert argv fixture file")
+        .1;
+    let syntax = polaris_source_probe::mask_comments_and_strings(source);
+    let anchor = "fn only_admitted_main_with_explicit_absolute_utf8_directory_gets_recovery_root()";
+    assert_eq!(syntax.matches(anchor).count(), 1);
+    let start = syntax.find(anchor).unwrap();
+    let open = start + syntax[start..].find('{').unwrap();
+    let mut depth = 0usize;
+    let end = syntax.as_bytes()[open..]
+        .iter()
+        .position(|byte| {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })
+        .expect("closed inert argv fixture body")
+        + open;
+    let body = &source[start..=end];
+    let code = &syntax[start..=end];
+    assert_eq!(
+        hits(body)
+            .iter()
+            .filter(|(kind, _)| *kind == Kind::Shebang)
+            .count(),
+        1
+    );
+    assert!(code.contains("let payload = fixture("));
+    assert!(code.contains("payload.prepare("));
+    assert!(code.contains("request.argv()"));
+    for forbidden in [
+        ".spawn(",
+        ".output(",
+        ".status(",
+        "Command::",
+        "TokioSpawner::",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "{file}: inert argv fixture gained {forbidden}"
+        );
     }
     let problems = violations(&files, REGISTERED);
     assert!(

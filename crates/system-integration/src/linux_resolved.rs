@@ -421,6 +421,17 @@ impl<Ops: LinuxResolvedOps, Fs: MarkerFs> LinuxResolvedController<Ops, Fs> {
             }
             Err(error) => return receipt(TakeoverOutcome::FailedUnchanged, Some(error)),
         }
+        if prepared.needs_prior_restore() {
+            let mut pending = receipt(
+                TakeoverOutcome::RecoveryPending,
+                Some(
+                    "Linux DNS prior owner requires confirmed restoration before replacement"
+                        .into(),
+                ),
+            );
+            pending.marker_id = prepared.prior_marker_operation_id();
+            return pending;
+        }
         let typed_owned = prepared.marker_raw.as_ref().is_some_and(|raw| {
             LiveDnsMarker::parse(raw)
                 .ok()
@@ -453,51 +464,7 @@ impl<Ops: LinuxResolvedOps, Fs: MarkerFs> LinuxResolvedController<Ops, Fs> {
         if let Err(error) = self.replace_raw(&prepared.marker_raw, &Some(intent.clone())) {
             return receipt(TakeoverOutcome::RecoveryPending, Some(error));
         }
-        let mut before = prepared.before.clone();
-        let mut cleaned_prior = false;
-        // A new explicitly confirmed retry can first discharge an ambiguous
-        // partial footprint. It never treats a prior error as restoration.
-        if prepared.enabled && before.cleanup_pending {
-            match self.ops.compare(&before, false) {
-                Ok(Change::Changed(restored))
-                    if !restored.owned
-                        && !restored.cleanup_pending
-                        && restored.settings == prepared.original =>
-                {
-                    before = *restored;
-                    cleaned_prior = true;
-                }
-                Ok(Change::NoChange) => {
-                    if self
-                        .replace_raw(&Some(intent), &prepared.marker_raw)
-                        .is_ok()
-                    {
-                        return receipt(
-                            TakeoverOutcome::Superseded,
-                            Some("Linux DNS retry rejected before write".into()),
-                        );
-                    }
-                    return receipt(
-                        TakeoverOutcome::RecoveryPending,
-                        Some("Linux DNS retry marker changed".into()),
-                    );
-                }
-                other => {
-                    return receipt(
-                        TakeoverOutcome::RecoveryPending,
-                        Some(format!(
-                            "Linux DNS prior footprint cleanup unconfirmed: {other:?}"
-                        )),
-                    )
-                }
-            }
-            if !self.raw_matches(&Some(intent.clone())) {
-                return receipt(
-                    TakeoverOutcome::RecoveryPending,
-                    Some("Linux DNS retry owner changed".into()),
-                );
-            }
-        }
+        let before = prepared.before.clone();
         let result = self.ops.compare(&before, prepared.enabled);
         let changed = match &result {
             Ok(Change::Changed(after)) => {
@@ -526,22 +493,6 @@ impl<Ops: LinuxResolvedOps, Fs: MarkerFs> LinuxResolvedController<Ops, Fs> {
             };
         }
         if matches!(result, Ok(Change::NoChange)) {
-            if cleaned_prior {
-                return if self.replace_raw(&Some(intent), &None).is_ok() {
-                    receipt(
-                        TakeoverOutcome::FailedRestored,
-                        Some(
-                            "Linux DNS prior footprint restored; replacement rejected before write"
-                                .into(),
-                        ),
-                    )
-                } else {
-                    receipt(
-                        TakeoverOutcome::RecoveryPending,
-                        Some("Linux DNS restored retry marker changed".into()),
-                    )
-                };
-            }
             return if self
                 .replace_raw(&Some(intent), &prepared.marker_raw)
                 .is_ok()

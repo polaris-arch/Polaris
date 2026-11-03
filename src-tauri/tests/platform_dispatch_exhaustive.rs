@@ -175,6 +175,91 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    // R14: exact supported-domain comparisons and bounded negative fixture.
+    (
+        "crates/system-integration/src/route_ops.rs",
+        "if self.platform != Platform::Linux",
+        1,
+        "capture_linux_physical_route rejects Mac/Win/Android/iOS/Other before reading Linux ip/resolvectl policy. Only Linux can provide the checked pre-TUN physical route facts; no other platform inherits Linux custody.",
+    ),
+    (
+        "crates/system-integration/src/route_ops.rs",
+        "if self.platform != Platform::Linux || tun == original.interface",
+        1,
+        "observe_linux_protected_route rejects every non-Linux platform and rejects a TUN equal to the original physical interface. Mac/Win/Android/iOS/Other gain no Linux route readback or protected-route acceptance.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if self.platform != Platform::Linux || !expected.valid()",
+        1,
+        "linux_resolved_compare rejects Mac/Win/Android/iOS/Other and invalid snapshots before serializing a checked Linux DNS request. Linux must still match exact birth/link/ownership; another platform gains no adapter or success receipt.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/dns_takeover.rs",
+        "else if platform == Platform::Mac",
+        1,
+        "Live DNS preparation selects the Mac service controller only for Mac, after the separate Linux per-link branch. Win/Android/iOS/Other enter neither adapter, and supported-domain intent guards prevent them from requesting host DNS effects.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/dns_takeover.rs",
+        "if platform != Platform::Mac || before_active == target_active",
+        1,
+        "dns_effect_requires_precore_snapshot applies Mac service-search-domain probing only when Mac DNS intent changes. Linux uses its per-link adapter without this Mac resolver projection; Win/Android/iOS/Other return false and gain no host DNS capability.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/dns_takeover.rs",
+        "if platform == Platform::Linux",
+        1,
+        "Live DNS preparation selects Linux checked per-link DNS only on Linux. Mac has the following service-DNS branch; Win/Android/iOS/Other have no checked host DNS write adapter and cannot borrow either receipt.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/dns_takeover.rs",
+        "let observed = if Platform::current() == Platform::Linux",
+        1,
+        "DNS reconciliation reads Linux per-link ownership on Linux and the generic service controller elsewhere. Mac is supported by that service controller; Win/Android/iOS/Other remain unsupported before marker/write operations. Observation never accepts requested policy as a physical receipt.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/runtime_config/host_effects.rs",
+        "let observed = if self.helper.platform() == polaris_helper_proto::Platform::Linux",
+        1,
+        "Cold readonly DNS adoption obtains a checked Linux per-link receipt only for Linux and a Mac service receipt for Mac. The enclosing supported-domain needs_observation guard excludes Win/Android/iOS/Other, so none receives a fabricated accepted DNS projection.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/runtime_config/host_effects.rs",
+        "physical_active.is_none() && current_dns_required && matches!( self.helper.platform(), polaris_helper_proto::Platform::Mac | polaris_helper_proto::Platform::Linux )",
+        1,
+        "Missing physical DNS observation blocks candidate generation only for supported Mac/Linux host-DNS intent. Win/Android/iOS/Other cannot acquire host-DNS policy debt through this guard, even though mobile effective TUN remains true; requested intent never substitutes for checked physical acceptance.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "let mut protected_physical_root = if self.helper.platform() == Platform::Linux && user_config .proxy_mode_type .effective_on(self.helper.platform()) .is_tun()",
+        1,
+        "Startup captures a protected physical root only for Linux effective TUN before its takeover. Mac/Win/Android/iOS/Other get no Linux physical proof and retain their own execution routes; this does not invent protected-root support for them.",
+    ),
+    (
+        "src-tauri/src/runtime/route_binding.rs",
+        "let candidates = runtime_binding_candidates_for_roots( Platform::Linux, candidate, active_physical_root_ids(candidate), )",
+        1,
+        "extend_protected_binding_plan uses the fixed Linux candidate semantics for the Linux protected-route extension. Its production caller is Linux-only; Mac/Win/Android/iOS/Other cannot inherit a Linux proof. The test compilation exposes only the existing bounded test seam.",
+    ),
+    (
+        "src-tauri/src/runtime/route_binding.rs",
+        "let facts = polaris_system_integration::route_ops::SystemRouteOpsImpl::with_platform( MemoryReadback, Platform::Linux, ) .capture_linux_physical_route() .expect( )",
+        1,
+        "blocked_physical_binding_proof_for_test is cfg(all(test,target_os=linux)) and uses MemoryReadback only as an already-expired or owner-revoked negative fixture, with seal=None. It cannot admit a physical root on Linux and is absent for Mac/Win/Android/iOS/Other and ordinary production builds. This exact statement alone is registered; the file stays fully scanned.",
+    ),
+    (
+        "src-tauri/src/runtime/route_binding.rs",
+        "let new_hosts: BTreeMap<_, _> = hot_switch_runtime_binding_candidates(Platform::Linux, candidate) .into_iter() .map(|root| (root.server_id, root.host)) .collect()",
+        1,
+        "The Linux protected-plan extension derives new candidate hosts using the same fixed Linux binding semantics before removing stale facts. Mac/Win/Android/iOS/Other cannot call this production Linux route to inherit its facts or proof.",
+    ),
+    (
+        "src-tauri/src/runtime/route_binding.rs",
+        "let old: BTreeMap<_, _> = hot_switch_runtime_binding_candidates(Platform::Linux, trusted) .into_iter() .map(|c| (c.server_id, c.host)) .collect()",
+        1,
+        "The Linux protected-plan extension derives old trusted hosts using fixed Linux binding semantics; changed hosts must earn fresh verified facts. Mac/Win/Android/iOS/Other gain no protected route capability from this constant argument.",
+    ),
     ("crates/helper-client/src/check_config.rs", "client: HelperClient::new( Box::new(crate::connector::MacRootConnector), Platform::Mac, token, ),", 1,
      "SystemMacCheckClient::system constructs only the fixed Mac root connector and is compiled exclusively on macOS. Android/iOS/Linux/Windows/unknown platforms cannot construct this issuer; the Platform::Mac argument does not admit another platform or supply an ordinary execution fallback."),
     (
@@ -448,9 +533,8 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     (
         "src-tauri/src/runtime/helper.rs",
         "if self.platform != Platform::Linux",
-        2,
-        "两处同形（linux_resolved_takeover / linux_resolved_revert）。Android → 立即返\
-         Err(\"unavailable on this platform\")，这是**显式**降级而非静默假成功，正确。",
+        3,
+        "linux_resolved_takeover, linux_resolved_revert and linux_resolved_snapshot each reject Mac/Win/Android/iOS/Other explicitly before a Linux request. Snapshot additionally validates its exact returned scope. These guards do not claim that another platform supports resolved or that a rejected operation succeeded.",
     ),
     (
         "src-tauri/src/runtime/mesh.rs",
@@ -473,10 +557,8 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     (
         "src-tauri/src/runtime/proxy/dns_takeover.rs",
         "if Platform::current() == Platform::Linux",
-        4,
-        "四处同形（set/restore/has_marker/reconcile 的 Linux resolved 分流）。Android → 走\
-         通用 dns_controller 腿，而该控制器的 takeover_supported 在 Android 为 false ⇒ 写 marker \
-         前早退 ⇒ 诚实 no-op。正确：Android 上没有要接管的系统解析器。",
+        2,
+        "restore_system_dns_locked and system_dns_has_marker use Linux's per-link resolved controller. Mac uses its system DNS controller; Win/Android/iOS/Other cannot acquire a host DNS write capability from these checks and their generic controller is unsupported. Cold set now has an exhaustive platform match and reconcile has its own let-observed shape, so neither is counted by this row.",
     ),
     (
         "src-tauri/src/runtime/proxy/dns_takeover.rs",
@@ -623,8 +705,8 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     (
         "src-tauri/src/runtime/helper.rs",
         "if client.platform() != Platform::Linux",
-        1,
-        "Linux birth 能力探测在非 Linux 不发送 Linux 专属请求；Mac/Win 另问 native birth，Android/iOS/Other 无 helper，不能靠此提前返回取得能力。",
+        2,
+        "Linux birth capability and explicit runtime-directory Version negotiation each return before sending Linux-only requests on Mac/Win/Android/iOS/Other. Mac/Win retain their native birth protocol; mobile/Other gain no helper capability or Linux runtime-root field. Legacy Linux Version fallback remains separately bounded.",
     ),
     (
         "src-tauri/src/runtime/helper.rs",
@@ -2798,6 +2880,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/lib.rs",
+        "desktop",
+        1,
+        IosSide::WithAndroid,
+        "The separate hold_native_production_verification_session export has its own desktop attribute, conjunctive with native-production-verification and debug_assertions. Android/iOS both exclude this fixed caller-private session holder; release excludes it independently. It prepares data coordination only, never installs or grants a native provider. The eleven existing desktop sites and every historical mobile debt remain unchanged.",
+    ),
+    (
+        "src-tauri/src/lib.rs",
         "mobile",
         5,
         IosSide::WithAndroid,
@@ -4435,7 +4524,8 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // The final Helper consumer gates add three same-side sites; removing the
     // obsolete TLS wrapper retires two. Standalone debug carrier attributes do
     // not mention the mobile axis. No existing debt site changes.
-    ("WithAndroid", 148),
+    // R15: one separate debug/feature/desktop session-holder export; no debt changed.
+    ("WithAndroid", 149),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

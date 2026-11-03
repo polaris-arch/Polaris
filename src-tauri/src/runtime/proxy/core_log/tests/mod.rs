@@ -70,7 +70,9 @@ fn relay_log_policy_tracks_committed_runtime_not_saved_pending_desire() {
     for mode in ["manual", "systemProxy", "tun"] {
         let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Linux);
         let generation = runtime.gate.generation();
-        let mut running = serde_json::json!({"proxyModeType": mode, "disableLogFile": true});
+        let mut running = polaris_store::default_config();
+        running["proxyModeType"] = serde_json::json!(mode);
+        running["disableLogFile"] = serde_json::json!(true);
         *runtime.current_config.write().unwrap() = Some(running.clone());
         let mut saved = running.clone();
         saved["disableLogFile"] = serde_json::json!(false);

@@ -1437,3 +1437,11 @@ mod tests;
 pub async fn run_native_production_verification(case: &str) -> Result<(), String> {
     runtime::proxy::native_verification::run_case(case).await
 }
+
+/// Closed ordinary preparation/retention holder; never installs or authorizes a provider.
+#[cfg(desktop)]
+#[cfg(feature = "native-production-verification")]
+#[cfg(debug_assertions)]
+pub fn hold_native_production_verification_session() -> Result<(), String> {
+    runtime::proxy::native_verification::hold_session()
+}

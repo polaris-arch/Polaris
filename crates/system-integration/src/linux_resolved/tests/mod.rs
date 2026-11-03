@@ -384,11 +384,48 @@ fn linux_partial_write_and_failed_restore_retain_exact_recovery_phase_then_expli
         c.reconcile_checked().unwrap().unwrap().outcome,
         TakeoverOutcome::RecoveryPending
     );
+    let calls_before = c.ops.calls.lock().unwrap().clone();
+    let state_before = c.ops.state.lock().unwrap().clone();
+    let raw_before = c.raw().unwrap().unwrap();
     let retry = c.prepare_effect(true).unwrap();
     assert!(retry.needs_prior_restore());
+    assert_eq!(
+        retry.prior_marker_operation_id().as_deref(),
+        Some("partial-owner")
+    );
+    assert!(c.checked_owned_receipt().unwrap().is_none());
+    let rejected = c.apply_effect(&retry, "must-not-replace-partial");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("partial-owner"));
+    assert!(rejected.cleanup_pending);
+    assert_eq!(*c.ops.calls.lock().unwrap(), calls_before);
+    assert_eq!(*c.ops.state.lock().unwrap(), state_before);
+    assert_eq!(c.raw().unwrap().unwrap(), raw_before);
+    assert!(c.prepare_after_restore(&retry).is_err());
+    assert!(c.restore().is_err());
+    assert_eq!(
+        c.exact_marker_operation_id().as_deref(),
+        Some("partial-owner")
+    );
+    assert!(c.has_marker());
     c.ops.partial_set = false;
     c.ops.fail_restore = false;
     c.restore().unwrap();
+    assert!(!c.has_marker());
+    assert_eq!(*c.ops.state.lock().unwrap(), exact_snapshot());
+    for field in ["birth", "link", "settings"] {
+        {
+            let mut state = c.ops.state.lock().unwrap();
+            match field {
+                "birth" => state.birth = "02".repeat(16),
+                "link" => state.link.sysfs_inode += 1,
+                _ => state.settings.servers = vec!["9.9.9.9".into()],
+            }
+        }
+        assert!(c.prepare_after_restore(&retry).is_err(), "{field}");
+        assert!(!c.has_marker());
+        *c.ops.state.lock().unwrap() = exact_snapshot();
+    }
     let next = c.prepare_after_restore(&retry).unwrap();
     assert_eq!(
         c.apply_effect(&next, "replacement-owner").outcome,
@@ -414,6 +451,18 @@ fn linux_partial_cleanup_followed_by_no_change_cannot_restore_a_false_owned_mark
     c.ops.partial_set = false;
     c.ops.fail_restore = false;
     let retry = c.prepare_effect(true).unwrap();
+    assert!(retry.needs_prior_restore());
+    let raw_before = c.raw().unwrap().unwrap();
+    let state_before = c.ops.state.lock().unwrap().clone();
+    let calls_before = c.ops.calls.lock().unwrap().clone();
+    let rejected = c.apply_effect(&retry, "must-not-replace-first");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("first"));
+    assert!(rejected.cleanup_pending);
+    assert_eq!(c.raw().unwrap().unwrap(), raw_before);
+    assert_eq!(*c.ops.state.lock().unwrap(), state_before);
+    assert_eq!(*c.ops.calls.lock().unwrap(), calls_before);
+    assert!(c.checked_owned_receipt().unwrap().is_none());
     c.restore().unwrap();
     let next = c.prepare_after_restore(&retry).unwrap();
     c.ops.no_change = true;

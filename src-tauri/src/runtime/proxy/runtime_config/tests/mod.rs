@@ -1,4 +1,5 @@
 use super::*;
+use polaris_config_engine::user_config::dns_constants::DIRECT_SERVER_ID;
 use serde_json::json;
 pub(super) fn paired_capabilities() -> daemon::RuntimeCapabilities {
     daemon::RuntimeCapabilities {
@@ -422,7 +423,7 @@ fn host_dns_restart_fixture() -> (
     Value,
 ) {
     let (rt, dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
-    let mut raw = polaris_store::default_config();
+    let mut raw = runnable_config_fixture();
     raw["proxyModeType"] = "tun".into();
     raw["dnsConfig"]["takeoverSystemDns"] = true.into();
     rt.config.save_full(&raw).unwrap();
@@ -666,8 +667,19 @@ fn identity_needs_all_three_axes() {
     assert!(!identity_equal(None, None));
 }
 
+// New-install defaults are valid saved data, but a running graph needs an
+// explicit exit. Construct the complete candidate before saving/typing/building
+// it; the raw pending helper must never repair only a generated clone.
+pub(super) fn runnable_config_fixture() -> Value {
+    let mut raw = polaris_store::default_config();
+    raw["selectedServerId"] = json!(DIRECT_SERVER_ID);
+    raw
+}
+
 fn ts_pending_fixture(rt: &Arc<ProxyRuntime>, authority: &str) -> PendingOperation {
-    let raw = json!({"servers":[{"id":"ts","name":"ts","protocol":"tailscale","tailscaleSettings":{"controlUrl":authority}}],"selectedServerId":"__direct__","proxyMode":"smart","proxyModeType":"manual"});
+    let mut raw = runnable_config_fixture();
+    raw["servers"] = json!([{"id":"ts","name":"ts","protocol":"tailscale","tailscaleSettings":{"controlUrl":authority}}]);
+    raw["proxyModeType"] = json!("manual");
     ts_pending_raw_fixture(rt, raw)
 }
 
@@ -883,7 +895,7 @@ fn verified_kernel_receipt_survives_unrelated_last_request_and_keeps_its_owner()
 #[test]
 fn stale_intent_keeps_verified_core_fact_without_publishing_or_rebinding() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     let running = json!({"oldRunningSnapshot": true});
     *runtime.current_config.write().unwrap() = Some(running.clone());
     runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
@@ -922,7 +934,7 @@ fn stale_intent_keeps_verified_core_fact_without_publishing_or_rebinding() {
 #[test]
 fn host_only_publication_preserves_the_original_kernel_persistence_owner() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let mut original = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut original = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     original.published = true;
     original.plan.transaction_id = "original-kernel-transaction".into();
     *runtime.current_config.write().unwrap() = Some(original.candidate.clone());
@@ -1162,11 +1174,13 @@ async fn confirmed_non_ts_graph_change_preserves_ts_token_and_known_hosts() {
 }
 
 fn ts_identity_raw_for_projection() -> Value {
-    json!({"servers":[{"id":"ts","name":"ts","protocol":"tailscale","tailscaleSettings":{"controlUrl":"https://one.example"}}],
-        "selectedServerId":"__direct__","proxyMode":"smart","proxyModeType":"manual",
-        "meshRouteState":{"schemaVersion":1,"localId":"local","revision":"1",
-            "identities":[{"serverId":"ts","identityEpoch":"epoch-one","controlAuthority":"https://one.example","selfStableId":"self-one","bindingState":"bound","evidenceSource":"status"}],
-            "observations":[],"reservations":[],"intent":{"revision":"1","desiredRun":"stopped"},"identityEffects":[]}})
+    let mut raw = runnable_config_fixture();
+    raw["servers"] = json!([{"id":"ts","name":"ts","protocol":"tailscale","tailscaleSettings":{"controlUrl":"https://one.example"}}]);
+    raw["proxyModeType"] = json!("manual");
+    raw["meshRouteState"] = json!({"schemaVersion":1,"localId":"local","revision":"1",
+        "identities":[{"serverId":"ts","identityEpoch":"epoch-one","controlAuthority":"https://one.example","selfStableId":"self-one","bindingState":"bound","evidenceSource":"status"}],
+        "observations":[],"reservations":[],"intent":{"revision":"1","desiredRun":"stopped"},"identityEffects":[]});
+    raw
 }
 
 // Exercise the production accepted-H projection and actual generated Plan payload
@@ -1712,7 +1726,7 @@ async fn committed_receipt_with_blocked_physical_proof_keeps_kernel_fact_without
 fn blocked_noop_publication_preserves_original_kernel_persistence_owner() {
     for expired in [true, false] {
         let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-        let mut original = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+        let mut original = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
         original.published = true;
         original.plan.transaction_id = "original-kernel-transaction".into();
         *runtime.current_config.write().unwrap() = Some(original.candidate.clone());
@@ -1872,14 +1886,16 @@ fn assert_original_native_debt(result: &RuntimeApplyResult, pending: &PendingOpe
 #[test]
 fn cached_kernel_receipt_retains_native_unknown_without_undoing_durable_commit() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
-    let mut state = RuntimeConfigApplyState::default();
-    state.kernel = Some(RuntimeKernelReceipt {
-        generation: pending.generation,
-        intent: pending.intent,
-        superseded: false,
-        operation: listener_retirement_receipt(&pending, "UNKNOWN"),
-    });
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
+    let state = RuntimeConfigApplyState {
+        kernel: Some(RuntimeKernelReceipt {
+            generation: pending.generation,
+            intent: pending.intent,
+            superseded: false,
+            operation: listener_retirement_receipt(&pending, "UNKNOWN"),
+        }),
+        ..Default::default()
+    };
     let result = state
         .core_receipt_for(&pending.plan.transaction_id, pending.generation)
         .unwrap();
@@ -1902,7 +1918,7 @@ fn cached_kernel_receipt_retains_native_unknown_without_undoing_durable_commit()
 #[tokio::test]
 async fn real_settlement_preserves_native_unknown_with_empty_scope_and_no_host_work() {
     let (runtime, _dir, calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     assert!(pending.deletion_scope.is_empty());
     assert!(pending.host_plan.is_none());
     *runtime.startup_snapshot.write().unwrap() = Some(pending.desired.clone());
@@ -1952,7 +1968,7 @@ async fn accepted_carrier_pending_remains_success_and_durability_keeps_its_own_t
     for retirement in ["PENDING", "DRAINING"] {
         for durable in [true, false] {
             let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-            let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+            let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
             pending.published = true;
             let mut operation = listener_retirement_receipt(&pending, retirement);
             operation.durable = durable;
@@ -1990,7 +2006,7 @@ async fn accepted_carrier_pending_remains_success_and_durability_keeps_its_own_t
 #[test]
 fn original_retirement_refresh_rejects_each_mismatched_receipt_axis() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     let original_operation = listener_retirement_receipt(&pending, "PENDING");
     for change in 0..20 {
         let mut state = RuntimeConfigApplyState::default();
@@ -2064,7 +2080,7 @@ fn original_retirement_refresh_rejects_each_mismatched_receipt_axis() {
 #[test]
 fn original_refresh_keeps_first_unknown_and_does_not_borrow_successor_kernel_owner() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     let mut state = RuntimeConfigApplyState::default();
     state.observe_native_retirement(&pending, &listener_retirement_receipt(&pending, "PENDING"));
     let original = state.native_retirements[&pending.plan.transaction_id].clone();
@@ -2106,7 +2122,7 @@ fn original_refresh_keeps_first_unknown_and_does_not_borrow_successor_kernel_own
 #[tokio::test]
 async fn stale_verified_commit_still_observes_native_failure_without_publishing_over_new_intent() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     let newer = json!({"newerRunningOwner": true});
     *runtime.current_config.write().unwrap() = Some(newer.clone());
     runtime.selector_reconcile.register_intent();
@@ -2131,7 +2147,7 @@ async fn stale_verified_commit_still_observes_native_failure_without_publishing_
 #[tokio::test]
 async fn native_unknown_survives_same_generation_baseline_recapture_until_teardown() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     pending.published = true;
     *runtime.startup_snapshot.write().unwrap() = Some(pending.desired.clone());
     runtime.settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
@@ -2373,7 +2389,7 @@ async fn actual_status_refreshes_original_pending_without_deletion_scope_and_kee
 {
     for terminal in ["UNKNOWN", "DRAINED"] {
         let (runtime, _dir, calls) = crate::runtime::proxy::tests::test_runtime_recording();
-        let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+        let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
         pending.published = true;
         assert!(pending.deletion_scope.is_empty() && pending.host_plan.is_none());
         let operation = listener_retirement_receipt(&pending, "PENDING");
@@ -2424,20 +2440,21 @@ async fn actual_status_refreshes_original_pending_without_deletion_scope_and_kee
             assert!(result.ok);
             assert!(!runtime.native_retirement_pending());
         }
-        let requests = rpc.requests.lock().unwrap();
-        assert!(
-            !requests.is_empty(),
-            "cached PENDING must actually refresh over the production status RPC"
-        );
-        for request in requests.iter() {
-            assert_eq!(request.contract_version, 1);
-            assert_eq!(request.transaction_id, pending.plan.transaction_id);
-            assert_eq!(
-                request.runtime_incarnation,
-                pending.plan.expected.as_ref().unwrap().incarnation
+        {
+            let requests = rpc.requests.lock().unwrap();
+            assert!(
+                !requests.is_empty(),
+                "cached PENDING must actually refresh over the production status RPC"
             );
+            for request in requests.iter() {
+                assert_eq!(request.contract_version, 1);
+                assert_eq!(request.transaction_id, pending.plan.transaction_id);
+                assert_eq!(
+                    request.runtime_incarnation,
+                    pending.plan.expected.as_ref().unwrap().incarnation
+                );
+            }
         }
-        drop(requests);
         assert_eq!(
             rpc.mutations.load(Ordering::SeqCst),
             0,
@@ -2454,7 +2471,7 @@ async fn actual_status_rejects_replacement_pairing_but_gate_bump_keeps_original_
 ) {
     for wrong_generation in [false, true] {
         let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-        let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+        let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
         pending.published = true;
         let operation = listener_retirement_receipt(&pending, "PENDING");
         let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation.clone()).await;
@@ -2517,7 +2534,7 @@ async fn accepted_host_only_and_late_host_callbacks_cannot_discharge_native_unkn
         HostEffectReceipt, HostEffectResult, HostEffectStrategy,
     };
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     pending.published = true;
     runtime.capture_runtime_config_baseline(
         pending.generation,
@@ -2638,7 +2655,7 @@ async fn accepted_host_only_and_late_host_callbacks_cannot_discharge_native_unkn
 #[test]
 fn native_failure_requires_exact_unknown_listener_code_and_inbounds_path() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     for change in 0..4 {
         let mut operation = listener_retirement_receipt(&pending, "UNKNOWN");
         match change {
@@ -2663,8 +2680,11 @@ fn native_failure_requires_exact_unknown_listener_code_and_inbounds_path() {
 #[tokio::test]
 async fn superseded_regeneration_owner_still_retains_original_native_failure() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    runtime
+        .config
+        .save_full(&runnable_config_fixture())
+        .unwrap();
     let saved = runtime.config.current().unwrap();
-    runtime.config.save_full(&saved).unwrap();
     let mut obsolete = saved.clone();
     obsolete["logLevel"] = json!("debug");
     let mut pending = ts_pending_raw_fixture(&runtime, obsolete);
@@ -2697,7 +2717,7 @@ async fn superseded_regeneration_owner_still_retains_original_native_failure() {
 #[test]
 fn native_observation_capacity_preserves_unsettled_owners_and_only_reclaims_drained_slots() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     let mut state = RuntimeConfigApplyState::default();
     for index in 0..NATIVE_RETIREMENT_OBSERVATION_LIMIT {
         let mut owner = pending.clone();
@@ -2740,7 +2760,7 @@ fn native_observation_capacity_preserves_unsettled_owners_and_only_reclaims_drai
 #[tokio::test]
 async fn late_same_owner_drained_settlement_cannot_launder_cached_first_unknown() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     pending.published = true;
     let first = listener_retirement_receipt(&pending, "UNKNOWN");
     assert_original_native_debt(
@@ -2771,7 +2791,7 @@ async fn late_same_owner_drained_settlement_cannot_launder_cached_first_unknown(
 #[tokio::test]
 async fn verified_later_durability_updates_d_without_discharging_first_native_unknown() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     pending.published = true;
     let mut first = listener_retirement_receipt(&pending, "UNKNOWN");
     first.durable = false;
@@ -2811,7 +2831,7 @@ async fn verified_later_durability_updates_d_without_discharging_first_native_un
 #[tokio::test]
 async fn successor_saved_desired_and_committed_kernel_keep_the_original_native_owner() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-    let mut original = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut original = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     original.published = true;
     let first = listener_retirement_receipt(&original, "UNKNOWN");
     runtime.settle_runtime_operation(&original, first.clone());
@@ -2859,6 +2879,10 @@ async fn successor_saved_desired_and_committed_kernel_keep_the_original_native_o
 #[tokio::test]
 async fn native_unknown_status_with_independent_d_pending_never_acknowledges_persistence() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    runtime
+        .config
+        .save_full(&runnable_config_fixture())
+        .unwrap();
     let mut pending = ts_pending_raw_fixture(&runtime, runtime.config.current().unwrap());
     pending.published = true;
     let mut operation = listener_retirement_receipt(&pending, "UNKNOWN");
@@ -2909,8 +2933,10 @@ async fn generic_original_d_status_acknowledges_only_its_full_saved_owner_and_ke
 {
     for superseding_desired in [false, true] {
         let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
-        let saved = runtime.config.current().unwrap();
-        runtime.config.save_full(&saved).unwrap();
+        runtime
+            .config
+            .save_full(&runnable_config_fixture())
+            .unwrap();
         let saved = runtime.config.current().unwrap();
         let mut pending = ts_pending_raw_fixture(&runtime, saved.clone());
         pending.published = true;
@@ -2973,47 +2999,48 @@ async fn generic_original_d_status_acknowledges_only_its_full_saved_owner_and_ke
         assert_eq!(completed.runtime_generation, Some(pending.generation));
         assert_eq!(completed.selection_intent_generation, Some(pending.intent));
         assert_eq!(completed.core_state, Some("committed"));
-        let acknowledgements = rpc.acknowledgements.lock().unwrap();
-        if superseding_desired {
-            assert!(
-                acknowledgements.is_empty(),
-                "original A cannot acknowledge durability using newer saved B evidence"
-            );
-            assert_eq!(completed.configuration_durable, Some(false));
-            assert_eq!(completed.status, "conflict");
-            assert!(completed
-                .reasons
-                .iter()
-                .any(|reason| reason.code == "OWNER_STATE_SUPERSEDED"));
-        } else {
-            assert_eq!(
-                acknowledgements.len(),
-                1,
-                "generic original D status must retain its automatic original-owner ACK"
-            );
-            let request = &acknowledgements[0];
-            assert_eq!(request.contract_version, 1);
-            assert_eq!(request.transaction_id, pending.plan.transaction_id);
-            assert_eq!(request.active, ready.active);
-            assert_eq!(request.control_revision, ready.control_revision);
-            assert_eq!(request.persistence_mode, "app_authoritative_regeneration");
-            assert_eq!(request.desired_state_digest, digest);
-            assert_eq!(request.desired_state_revision, revision);
-            assert_eq!(completed.configuration_durable, Some(true));
-            assert_eq!(completed.status, "nativeCleanupUnknown");
-            assert!(runtime
-                .runtime_config_apply
-                .lock()
-                .unwrap()
-                .pending
-                .is_none());
-            let state = runtime.runtime_config_apply.lock().unwrap();
-            let original = &state.native_retirements[&pending.plan.transaction_id].receipt;
-            assert!(original.operation.durable);
-            assert_eq!(original.operation.retirement_state, "UNKNOWN");
-            assert_eq!(original.operation.errors, not_ready.errors);
+        {
+            let acknowledgements = rpc.acknowledgements.lock().unwrap();
+            if superseding_desired {
+                assert!(
+                    acknowledgements.is_empty(),
+                    "original A cannot acknowledge durability using newer saved B evidence"
+                );
+                assert_eq!(completed.configuration_durable, Some(false));
+                assert_eq!(completed.status, "conflict");
+                assert!(completed
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.code == "OWNER_STATE_SUPERSEDED"));
+            } else {
+                assert_eq!(
+                    acknowledgements.len(),
+                    1,
+                    "generic original D status must retain its automatic original-owner ACK"
+                );
+                let request = &acknowledgements[0];
+                assert_eq!(request.contract_version, 1);
+                assert_eq!(request.transaction_id, pending.plan.transaction_id);
+                assert_eq!(request.active, ready.active);
+                assert_eq!(request.control_revision, ready.control_revision);
+                assert_eq!(request.persistence_mode, "app_authoritative_regeneration");
+                assert_eq!(request.desired_state_digest, digest);
+                assert_eq!(request.desired_state_revision, revision);
+                assert_eq!(completed.configuration_durable, Some(true));
+                assert_eq!(completed.status, "nativeCleanupUnknown");
+                assert!(runtime
+                    .runtime_config_apply
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .is_none());
+                let state = runtime.runtime_config_apply.lock().unwrap();
+                let original = &state.native_retirements[&pending.plan.transaction_id].receipt;
+                assert!(original.operation.durable);
+                assert_eq!(original.operation.retirement_state, "UNKNOWN");
+                assert_eq!(original.operation.errors, not_ready.errors);
+            }
         }
-        drop(acknowledgements);
         assert_eq!(
             rpc.mutations.load(Ordering::SeqCst),
             0,

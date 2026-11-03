@@ -658,7 +658,7 @@ impl ProtectedPhysicalRoot {
         {
             let owner = Arc::clone(self);
             let tun = managed_tun.to_owned();
-            return tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 if generation == 0
                     || owner.revoked.load(std::sync::atomic::Ordering::SeqCst)
                     || owner.pre_links.contains(&tun)
@@ -692,7 +692,7 @@ impl ProtectedPhysicalRoot {
                 Ok(())
             })
             .await
-            .map_err(|_| "physical seal task did not return".to_owned())?;
+            .map_err(|_| "physical seal task did not return".to_owned())?
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -763,7 +763,7 @@ impl ProtectedBindingPlan {
             let owner = Arc::clone(&self.owner);
             let targets = self.targets.clone();
             let expires = self.expires;
-            return tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 owner.verify_now(generation, network_epoch)?;
                 let ops = polaris_system_integration::production_route_ops();
                 for (ip, port) in targets {
@@ -785,7 +785,7 @@ impl ProtectedBindingPlan {
                 Ok(())
             })
             .await
-            .map_err(|_| "physical verification task did not return".to_owned())?;
+            .map_err(|_| "physical verification task did not return".to_owned())?
         }
         #[cfg(not(target_os = "linux"))]
         Err("protected physical proof unavailable on this platform".into())
@@ -805,7 +805,7 @@ pub(crate) async fn plan_protected_runtime_bindings(
         let trusted = trusted.clone();
         let candidate = candidate.clone();
         let accepted = accepted.clone();
-        return tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             owner.verify_now(generation, network_epoch)?;
             let ops = polaris_system_integration::production_route_ops();
             let started = std::time::Instant::now();
@@ -844,7 +844,7 @@ pub(crate) async fn plan_protected_runtime_bindings(
             })
         })
         .await
-        .map_err(|_| "protected root planning task did not return".to_owned())?;
+        .map_err(|_| "protected root planning task did not return".to_owned())?
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -861,6 +861,9 @@ pub(crate) async fn plan_protected_runtime_bindings(
 }
 
 #[cfg(any(target_os = "linux", test))]
+type ProtectedBindingExtension = (RuntimeBindingPlan, Duration, Vec<(std::net::Ipv4Addr, u16)>);
+
+#[cfg(any(target_os = "linux", test))]
 fn extend_protected_binding_plan(
     trusted: &UserConfig,
     candidate: &UserConfig,
@@ -868,7 +871,7 @@ fn extend_protected_binding_plan(
     interface: &str,
     mut resolve: impl FnMut(&str) -> Result<(std::net::Ipv4Addr, Duration), String>,
     mut verify: impl FnMut(std::net::Ipv4Addr, u16) -> Result<(), String>,
-) -> Result<(RuntimeBindingPlan, Duration, Vec<(std::net::Ipv4Addr, u16)>), String> {
+) -> Result<ProtectedBindingExtension, String> {
     let old: BTreeMap<_, _> = hot_switch_runtime_binding_candidates(Platform::Linux, trusted)
         .into_iter()
         .map(|c| (c.server_id, c.host))

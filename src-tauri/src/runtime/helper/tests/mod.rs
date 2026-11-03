@@ -1729,40 +1729,77 @@ fn native_status_parser_keeps_real_mac_core_binding_without_inventing_os_fields(
 
 #[test]
 fn explicit_linux_runtime_directory_is_negotiated_without_changing_legacy_frames() {
-    for (version, expected) in [
-        ("OK 3\n", None),
-        ("OK 4\n", Some("/app/state 测试")),
-        ("ERR unknown\n", None),
-        ("OK nonsense\n", None),
+    let dir = TestDir::new("polaris-helper-runtime-root-");
+    let state = dir.join("state 测试");
+    std::fs::create_dir(&state).unwrap();
+    assert!(state.is_absolute());
+    let directory = state.to_str().unwrap();
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    let cfg = state.join("core config.json");
+    let log = state.join("core 日志.log");
+    for (version, explicit) in [
+        ("OK 3\n", false),
+        ("OK 4\n", true),
+        ("ERR unknown\n", false),
+        ("OK nonsense\n", false),
     ] {
         let (client, connects, frames) = stop_test_client_with_frames(
             Platform::Linux,
-            vec![polaris_helper_client::MockStream::with_response(
-                version.as_bytes().to_vec(),
-            )],
+            vec![
+                polaris_helper_client::MockStream::with_response(version.as_bytes().to_vec()),
+                polaris_helper_client::MockStream::with_response(b"ERR unknown\n".to_vec()),
+            ],
         );
-        assert_eq!(
-            linux_runtime_directory_with_client(&client, Path::new("/app/state 测试"))
-                .unwrap()
-                .as_deref(),
-            expected
-        );
+        let negotiated = linux_runtime_directory_with_client(&client, &state).unwrap();
+        assert_eq!(negotiated.as_deref(), explicit.then_some(directory));
         assert_eq!(connects.load(Ordering::SeqCst), 1);
         assert_eq!(frames.lock().unwrap().as_slice(), ["version\n"]);
+        let request =
+            Request::LinuxStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+                id: id.clone(),
+                runtime_directory: negotiated,
+                common: StartParams {
+                    cfg: cfg.to_str().unwrap().to_owned(),
+                    log: log.to_str().unwrap().to_owned(),
+                    fwd: false,
+                    parent_pid: None,
+                },
+            });
+        client.send(&request).unwrap();
+        let extension = if explicit {
+            format!("\nruntime-root-v1={directory}\n")
+        } else {
+            String::new()
+        };
+        let expected = format!(
+            "start-pinned-birth-safe\n{}\n{}\n{}\n{}\n0\n{extension}",
+            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+            id.as_str(),
+            cfg.to_str().unwrap(),
+            log.to_str().unwrap(),
+        );
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        let sent = frames.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], "version\n");
+        assert_eq!(sent[1].as_bytes(), expected.as_bytes());
     }
-    let (client, connects, _) = stop_test_client_with_frames(Platform::Win, vec![]);
+    let (client, connects, frames) = stop_test_client_with_frames(Platform::Win, vec![]);
     assert_eq!(
-        linux_runtime_directory_with_client(&client, Path::new("C:\\state")).unwrap(),
+        linux_runtime_directory_with_client(&client, &state).unwrap(),
         None
     );
     assert_eq!(connects.load(Ordering::SeqCst), 0);
-    let (client, _, _) = stop_test_client_with_frames(
+    assert!(frames.lock().unwrap().is_empty());
+    let (client, connects, frames) = stop_test_client_with_frames(
         Platform::Linux,
         vec![polaris_helper_client::MockStream::with_response(
             b"OK 4\n".to_vec(),
         )],
     );
     assert!(linux_runtime_directory_with_client(&client, Path::new("relative")).is_err());
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    assert_eq!(frames.lock().unwrap().as_slice(), ["version\n"]);
     let source = crate_code("runtime/helper.rs");
     assert!(source
         .contains("runtime_directory: linux_runtime_directory_with_client(&client, &self.dir)?"));

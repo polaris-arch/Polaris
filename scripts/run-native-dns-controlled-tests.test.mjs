@@ -5,7 +5,35 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, unlinkSync, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests, confirmedCleanup, preserveProductionGraph, selectNativeExecutable, nativeCaseRecord, exactNativePass, bindNativeRuntime, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
+import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests as runCaseTests, withNativeSession, sessionPreparation, unmetPrerequisite, sessionTeardown, confirmedCleanup, preserveProductionGraph, selectNativeExecutable, nativeCaseRecord, exactNativePass, bindNativeRuntime, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
+
+// Inert orchestration fixture only. It opens no native endpoint and cannot issue
+// a production Check/RunMain receipt; actual case assertions use their own fixtures.
+async function fixtureSession(selected, env, directory) {
+  const compiled = JSON.parse(readFileSync(env.POLARIS_CORE_IDENTITY_FILE));
+  const record = { schema: 'polaris-native-session-v1', state: 'ready', code: 'ready', detail: null,
+    processId: 80, owner: { schema: 'polaris-native-session-owner-v1', sessionId: '00000000-0000-4000-8000-000000000001',
+      compiledAppBuildId: env.GITHUB_SHA, caller: env.CORE_PLATFORM === 'win' ? 'sS-1-5-21-1000' : 'u1000',
+      platform: env.CORE_PLATFORM, coreId: compiled.id, providerFingerprint: compiled.core.providerFingerprint, coreFiles: compiled.core.files,
+      helperSha256: compiled.core.helperSha256 ?? null, cleanerSha256: compiled.core.cleanerSha256 ?? null,
+      requiredCases: [...TESTS] }, configRoot: join(directory, 'inert-private-session'),
+    provider: 'compiled-platform-production-route', registrationScope: 'enforced-by-production-start', executionAuthorized: false, slots: 1,
+    maxRetainedBytes: 32 * 1024 * 1024, retainedBytesBefore: 0, required: true, publicationEligible: false };
+  return { kind: 'preparation', record, processId: 80, async finish() {
+    const teardown = { schema: 'polaris-native-session-teardown-v1', sessionId: record.owner.sessionId,
+      processId: 80, startedCases: 6, caseDrainCheckpointsMatched: true, providerIdle: true,
+      state: 'retained', directoryState: 'retained', retainedBytes: 2048, maxRetainedBytes: record.maxRetainedBytes,
+      retentionReason: 'inert retained fixture', evidenceKind: 'data-coordination-only', registrationChanged: false, providerInstalled: false, publicationEligible: false };
+    const stdout = `POLARIS_NATIVE_SESSION ${JSON.stringify(record)}\nPOLARIS_NATIVE_SESSION_TEARDOWN ${JSON.stringify(teardown)}\n`;
+    writeFileSync(join(directory, 'native-session.stdout.log'), stdout);
+    writeFileSync(join(directory, 'native-session.stderr.log'), '');
+    return { processId: 80, status: 0, signal: null, captureError: null, stdout, stderr: '' };
+  } };
+}
+async function runTests(selected, env, directory, execute) {
+  if (selected.carrier !== 'normal-production-library') return runCaseTests(selected, env, directory, execute);
+  return withNativeSession(selected, env, directory, () => runCaseTests(selected, env, directory, execute), fixtureSession);
+}
 
 test('only this invocation’s exact package/library test artifact is selectable', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-artifact-')));
@@ -89,7 +117,7 @@ test('exact one-test verdict rejects zero, ignored, failed, duplicated and inter
   assert.match(ordinary, /^      args: \['test', '--locked', '-p', packageName, '--lib', '--no-run', '--message-format=json'\] \},$/m);
   assert.match(native, /^    args: \['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'\] \},$/m);
   assert.match(native, /^  const selected = selectNativeExecutable\(messages, metadata, root\);$/m);
-  assert.match(native, /^  await runTests\(selected, env, directory\);$/m);
+  assert.match(native, /^  await withNativeSession\(selected, env, directory, \(\) => runTests\(selected, env, directory\)\);$/m);
   assert.match(runner, /root: dirname\(selected.manifest\)/);
   for (const [start, end] of [['export async function runTests(', 'export function contractGroups('], ['export async function runContractTests(', 'async function runContractSuite(']]) {
     const body = runner.slice(runner.indexOf(start), runner.indexOf(end));
@@ -461,8 +489,8 @@ function boundNativeFixture(root, directory) {
     if (args[0] === 'status') return '';
     assert.equal(args[0], 'show'); return readFileSync(join(root, args[1].slice(41)), 'utf8');
   };
-  bindNativeRuntime(selected, root, env, directory, git);
-  return { selected, env, git, summary: (patch = {}) => nativeRuntimeSummary(directory, { ...env, ...patch }, root, git) };
+  const binding = bindNativeRuntime(selected, root, env, directory, git);
+  return { selected, env, git, binding, summary: (patch = {}) => nativeRuntimeSummary(directory, { ...env, ...patch }, root, git) };
 }
 
 test('normal-library orchestration enforces exact authority and cleanup before six-case business aggregation', async () => {
@@ -610,7 +638,7 @@ test('native summary R2 never promotes five legacy libtest statuses or six libte
     const original = readReceipt(f);
     unlinkSync(receiptFile(f));
     writeFileSync(join(f.directory, 'runtime-status.txt'), TESTS.slice(0, 5).map((name) => `${name}: passed\n`).join(''));
-    assert.equal(f.summary().requirementState, 'open'); assert.equal(f.summary().evidenceState, 'missing');
+    assert.equal(f.summary().requirementState, 'open'); assert.equal(f.summary().evidenceState, 'bound');
     writeReceipt(f, original);
     for (let i = 0; i < TESTS.length; i++) replaceCaseStream(f, i, 'stdout', 'test result: ok. 1 passed; 0 failed; 0 ignored;\n');
     assert.equal(f.summary().requirementState, 'open');
@@ -776,4 +804,75 @@ test('native summary R12 is read-only and never promotes ordinary evidence into 
     assert.equal(f.summary({ RUNTIME_OUTCOME: 'failure' }).requirementState, 'open');
     writeFileSync(receiptFile(f), '{partial'); assert.equal(f.summary().evidenceState, 'invalid');
   });
+});
+
+test('capability unmet preserves all six required rows and exact binding without invoking a case or granting cleanup', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'native-prerequisite-'))), directory = join(root, 'evidence');
+  mkdirSync(directory);
+  try {
+    const f = boundNativeFixture(root, directory); let calls = 0, finishes = 0;
+    const prerequisite = { schema: 'polaris-native-prerequisite-v1', state: 'unmet', stage: 'capability',
+      code: 'admission-unsupported-capability', detail: 'actual production capability refused', processId: 81,
+      compiledAppBuildId: f.env.GITHUB_SHA, platform: f.env.CORE_PLATFORM,
+      requiredCases: [...TESTS], required: true, publicationEligible: false };
+    await assert.rejects(withNativeSession(f.selected, f.env, directory, () => { calls++; }, async () => ({
+      kind: 'prerequisite', record: prerequisite, processId: 81, async finish() {
+        finishes++; const stdout = `POLARIS_NATIVE_PREREQUISITE ${JSON.stringify(prerequisite)}\n`;
+        writeFileSync(join(directory, 'native-session.stdout.log'), stdout);
+        writeFileSync(join(directory, 'native-session.stderr.log'), '');
+        return { processId: 81, status: 1, signal: null, captureError: null, stdout, stderr: '' };
+      },
+    })), /Required native prerequisite unmet/);
+    assert.equal(calls, 0); assert.equal(finishes, 1);
+    const summary = f.summary(); assert.equal(summary.state, 'unmet-prerequisite'); assert.equal(summary.requirementState, 'open');
+    assert.deepEqual(summary.tests.map(v => v.name), TESTS);
+    assert.ok(summary.tests.every(v => v.required === true && v.invoked === false));
+    assert.equal(summary.session.teardownConfirmed, false);
+    for (const patch of [{ compiledAppBuildId: '0'.repeat(40) }, { platform: 'linux' },
+      { requiredCases: TESTS.slice(0, 5) }, { required: false }, { state: 'passed' }, { publicationEligible: true }])
+      assert.throws(() => unmetPrerequisite({ ...prerequisite, ...patch }, f.binding, 81));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('session descriptor and retained data never replace source identity, exact CoreID, native owner drains or all six cases', async () => {
+  await withNativeReceipt('pass', async f => {
+    const holder = await fixtureSession(f.selected, f.env, f.directory), p = holder.record;
+    assert.equal(sessionPreparation(p, f.binding, 80), p);
+    for (const patch of [{ compiledAppBuildId: '0'.repeat(40) }, { platform: 'linux' }, { coreId: '0'.repeat(64) },
+      { helperSha256: '0'.repeat(64) }, { coreFiles: [] }, { requiredCases: TESTS.slice(0, 5) }, { caller: 'sS-1-5-18' }])
+      assert.throws(() => sessionPreparation({ ...p, owner: { ...p.owner, ...patch } }, f.binding, 80));
+    const path = join(f.directory, 'native-session-results.json'), original = readFileSync(path);
+    const value = JSON.parse(original);
+    assert.equal(value.teardown.directoryState, 'retained'); assert.equal(f.summary().state, 'passed');
+    for (const patch of [{ caseDrainCheckpointsMatched: false }, { providerIdle: false },
+      { state: 'cleanup-unconfirmed' }, { retainedBytes: p.maxRetainedBytes + 1 }])
+      assert.equal(sessionTeardown({ ...value.teardown, ...patch }, p, 80), false);
+    for (const patch of [{ state: 'cleanup-unconfirmed' }, { teardownConfirmed: false },
+      { failure: 'original owner retained' }, { executor: { ...value.executor, status: 1 } }]) {
+      writeFileSync(path, JSON.stringify({ ...value, ...patch })); assert.equal(f.summary().requirementState, 'open');
+    }
+    writeFileSync(path, original);
+    const stdout = join(f.directory, 'native-session.stdout.log'), raw = readFileSync(stdout);
+    writeFileSync(stdout, raw.toString().replace('"caseDrainCheckpointsMatched":true', '"caseDrainCheckpointsMatched":false'));
+    assert.equal(f.summary().requirementState, 'open'); writeFileSync(stdout, raw);
+    unlinkSync(path); assert.equal(f.summary().requirementState, 'open');
+    writeFileSync(path, original); assert.equal(f.summary().state, 'passed');
+  });
+});
+
+test('session finally retains the business failure and a separate cleanup failure', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'native-teardown-'))), directory = join(root, 'evidence'); mkdirSync(directory);
+  try {
+    const f = boundNativeFixture(root, directory);
+    await assert.rejects(withNativeSession(f.selected, f.env, directory, () => { throw Error('actual case failure'); }, async (...args) => {
+      const h = await fixtureSession(...args), finish = h.finish;
+      return { ...h, async finish() {
+        const end = await finish(); end.stdout = end.stdout.replace('"caseDrainCheckpointsMatched":true', '"caseDrainCheckpointsMatched":false');
+        writeFileSync(join(directory, 'native-session.stdout.log'), end.stdout); return end;
+      } };
+    }), /actual case failure; Session teardown unconfirmed/);
+    const r = JSON.parse(readFileSync(join(directory, 'native-session-results.json')));
+    assert.match(r.failure, /actual case failure/); assert.match(r.cleanupFailure, /teardown unconfirmed/);
+    assert.equal(r.state, 'cleanup-unconfirmed'); assert.equal(f.summary().requirementState, 'open');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
