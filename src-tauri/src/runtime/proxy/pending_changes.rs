@@ -56,6 +56,10 @@ pub struct PendingChangesSummary {
     pub restart_deferred: bool,
     pub pending_apply: bool,
     pub restart_required: bool,
+    /// Independent original native owners; K/D equality and host acceptance
+    /// cannot discharge a verified physical listener-retirement failure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub native_retirements: Vec<super::runtime_config::NativeRetirementDebt>,
 }
 
 /// 与 `generate_rule_selectors` 同一组有效性判据；比较目标值而非目标 id 集合，
@@ -162,15 +166,19 @@ impl ProxyRuntime {
     /// 三个集合都**排序**后返回：`HashSet` 的迭代序每次进程都不同，不排序会让 UI 明细列表无故重排、
     /// 也让单测只能写成集合比较。排序成本 O(n log n)、n = 节点数，可忽略。
     pub fn pending_changes(&self) -> PendingChangesSummary {
-        // 无起核快照 = 核没在跑（或快照不可信）⇒ 没有「运行核」这个分母 ⇒ 谈不上待应用。
-        // `restart_deferred` 在此同样为 false：停核腿已把它复位，这里只是把该不变式写死在返回值上。
+        // Without a startup snapshot the configuration diff has no denominator.
+        // Independently proven native debt still survives until real stop-success
+        // releases its original owner, including an interrupted lifecycle bump.
+        let native_retirements = self.native_retirement_debts();
+        let native_pending = !native_retirements.is_empty() || self.native_retirement_pending();
         let empty = || PendingChangesSummary {
             added: Vec::new(),
             modified: Vec::new(),
             removed: Vec::new(),
             restart_deferred: false,
-            pending_apply: false,
+            pending_apply: native_pending,
             restart_required: false,
+            native_retirements: native_retirements.clone(),
         };
         let Some(snap) = self.startup_snapshot.read().ok().and_then(|g| g.clone()) else {
             return empty();
@@ -224,7 +232,8 @@ impl ProxyRuntime {
             || non_node_pending
             || selected_pending
             || self.host_effect_pending()
-            || self.has_uncommitted_rule_content();
+            || self.has_uncommitted_rule_content()
+            || native_pending;
         let restart_required = applied.as_ref().is_some_and(|runtime| {
             super::runtime_config::structural_runtime_change(
                 runtime,
@@ -235,6 +244,7 @@ impl ProxyRuntime {
         PendingChangesSummary {
             pending_apply,
             restart_required,
+            native_retirements,
             added,
             modified,
             removed,

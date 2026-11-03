@@ -362,6 +362,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
       ...(r?.configurationDurable === undefined ? {} : { configurationDurable: r.configurationDurable }),
       ...(r?.persistenceTransactionId === undefined ? {} : { persistenceTransactionId: r.persistenceTransactionId }),
       ...(r?.retirementState === undefined ? {} : { retirementState: r.retirementState }),
+      ...(r?.nativeRetirements === undefined ? {} : { nativeRetirements: r.nativeRetirements }),
       ...(r?.reasons === undefined ? {} : { reasons: r.reasons }),
       ...(r?.pendingApply === undefined ? {} : { pendingApply: r.pendingApply }),
       ...(r?.restartRequired === undefined ? {} : { restartRequired: r.restartRequired }),

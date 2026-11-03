@@ -1,4 +1,4 @@
-import type { PendingApplyResult } from '@/contracts/types';
+import type { NativeRetirementDebt, PendingApplyResult } from '@/contracts/types';
 
 export const RUNTIME_APPLY_POLL_INTERVAL_MS = 2000;
 
@@ -15,6 +15,12 @@ export function runtimeApplyPollDisposition(
       || result.runtimeGeneration !== runtimeGeneration
       || result.selectionIntentGeneration !== selectionIntentGeneration) return 'ignore';
   return 'owned';
+}
+
+/** Native cleanup keeps its original owner even after a different selection or HostOnly intent. */
+export function runtimeNativePollDisposition(result: PendingApplyResult, owner: NativeRetirementDebt): 'owned' | 'ignore' {
+  return result.transactionId === owner.transactionId && result.runtimeGeneration === owner.runtimeGeneration
+    && result.selectionIntentGeneration === owner.selectionIntentGeneration ? 'owned' : 'ignore';
 }
 
 export type RuntimeExecutionRef =

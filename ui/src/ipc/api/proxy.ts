@@ -90,6 +90,11 @@ export const proxyApi = {
     return invoke(IPC_CHANNELS.PROXY_RUNTIME_APPLY_STATUS, { transactionId });
   },
 
+  /** Read only original native retirement evidence; never acknowledges or retries persistence. */
+  async runtimeNativeRetirementStatus(transactionId: string): Promise<PendingApplyResult> {
+    return invoke(IPC_CHANNELS.PROXY_RUNTIME_APPLY_STATUS, { transactionId, nativeRetirementOnly: true });
+  },
+
   /** Observe the retained host execution without inventing a Core transaction. */
   async runtimeHostEffectStatus(hostExecutionId: string): Promise<PendingApplyResult> {
     return invoke(IPC_CHANNELS.PROXY_RUNTIME_APPLY_STATUS, { hostExecutionId });

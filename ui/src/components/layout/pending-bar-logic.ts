@@ -1,4 +1,6 @@
-import type { PendingApplyResult, PendingNodeChanges, ProxyLifecycleEvent } from '@/contracts/types';
+import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges, ProxyLifecycleEvent } from '@/contracts/types';
+import { nativeRetirementDebts, mergeNativeRetirementDebts, nativeRetirementEndGeneration } from '@/domain/native-retirement';
+export { nativeRetirementDebts } from '@/domain/native-retirement';
 import {
   proxyErrorReason,
   type ProxyErrorTranslate,
@@ -101,6 +103,8 @@ export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: P
       return { phase: 'idle', toast: { kind: 'info', key: 'home.pendingHotApplied' } };
     case 'hotDurabilityPending':
       return { phase: 'durabilityPending', toast: null };
+    case 'nativeCleanupUnknown':
+      return { phase: 'idle', toast: null };
     case 'hostEffectsPending':
     case 'hostEffectsFailed':
       return { phase: 'idle', toast: null };
@@ -180,8 +184,13 @@ export interface ApplyState {
   /** Core persistence and host acceptance have separate original owners. */
   coreRecovery?: RuntimeCoreRecovery;
   configurationDurable?: boolean;
+  coreState?: PendingApplyResult['coreState'];
   host?: HostApplyState;
   hostReconciling?: boolean;
+  nativeRetirements?: NativeRetirementDebt[];
+  nativeChecking?: boolean;
+  /** Set only after a terminal lifecycle event and its matching live status confirm teardown. */
+  nativeEndedBeforeGeneration?: number;
   persistenceRetrying?: boolean;
   /** Confirmed regeneration supersession ends this original recovery, not durability. */
   persistenceRecoveryEnded?: boolean;
@@ -191,9 +200,37 @@ export interface ApplyState {
 }
 
 
-/** Exiting an obsolete Core recovery never discards outstanding host acceptance. */
+/** Missing, empty or later-success receipts cannot erase an original UNKNOWN. */
+export function mergeNativeRetirements(current: ApplyState, raw: PendingApplyResult['nativeRetirements'], endedBeforeGeneration = 0): ApplyState {
+  const floor = Math.max(current.nativeEndedBeforeGeneration ?? 0, endedBeforeGeneration);
+  const debts = mergeNativeRetirementDebts(current.nativeRetirements, raw, floor);
+  return debts === current.nativeRetirements && floor === (current.nativeEndedBeforeGeneration ?? 0) ? current : { ...current,
+    ...(debts === undefined ? {} : { nativeRetirements: debts }),
+    ...(floor > 0 ? { nativeEndedBeforeGeneration: floor } : {}) };
+}
+
+/** Keep this independent account through ordinary Apply, save and restart result classification. */
+export function preserveNativeRetirements(current: ApplyState, next: ApplyState): ApplyState {
+  const floor = Math.max(current.nativeEndedBeforeGeneration ?? 0, next.nativeEndedBeforeGeneration ?? 0);
+  if (!current.nativeRetirements?.length && floor === 0) return next;
+  const base: ApplyState = { ...next, nativeRetirements: [],
+    ...(floor > 0 ? { nativeEndedBeforeGeneration: floor } : {}) };
+  return mergeNativeRetirements(mergeNativeRetirements(base, current.nativeRetirements), next.nativeRetirements);
+}
+
+/** mainGeneration and runtimeGeneration share LifecycleGate, which advances BEFORE teardown.
+ * A number or running flag alone is insufficient: require a real terminal event and matching status.
+ */
+export function nativeRetirementsAfterLifecycle(
+  current: ApplyState, event: ProxyLifecycleEvent, live: { running: boolean; mainGeneration?: number } | null | undefined,
+): ApplyState {
+  const generation = nativeRetirementEndGeneration(event, live);
+  return generation === undefined ? current : mergeNativeRetirements(current, undefined, generation);
+}
+
+/** Exiting an obsolete Core recovery never discards outstanding host or native acceptance. */
 export function dismissApplyState(current: ApplyState): ApplyState {
-  if (!current.host || current.host.phase === 'settled') return { phase: 'idle', reason: null };
+  if (!current.host || current.host.phase === 'settled') return preserveNativeRetirements(current, { phase: 'idle', reason: null });
   if (current.persistenceRecoveryEnded) return { ...current, phase: 'idle', reason: null,
     coreRecovery: undefined, transactionId: undefined, persistenceOnly: false,
     reconciling: false, persistenceRecoveryEnded: false };
@@ -215,17 +252,18 @@ export function hostRetryAvailable(host: HostApplyState | undefined): boolean {
 export function applyReceiptState(
   current: ApplyState,
   result: { status: ApplyStatus | null | undefined } & Pick<PendingApplyResult, 'transactionId' | 'persistenceTransactionId' | 'hostExecutionId' | 'hostEffects'
-    | 'runtimeGeneration' | 'selectionIntentGeneration' | 'coreState' | 'configurationDurable' | 'retirementState'>,
+    | 'runtimeGeneration' | 'selectionIntentGeneration' | 'coreState' | 'configurationDurable' | 'retirementState' | 'nativeRetirements'>,
   allowNewHost = false,
 ): ApplyState {
-  const next = { ...current };
+  const next = { ...mergeNativeRetirements(current, result.nativeRetirements) };
   const generation = result.runtimeGeneration;
   const intent = result.selectionIntentGeneration;
   const ownerKnown = Number.isSafeInteger(generation) && (generation ?? 0) > 0
     && Number.isSafeInteger(intent) && (intent ?? -1) >= 0;
+  if (allowNewHost && ownerKnown && result.coreState !== undefined) next.coreState = result.coreState;
   const persistenceId = result.persistenceTransactionId ?? result.transactionId;
   const publishedNewCore = allowNewHost && !!result.transactionId && ownerKnown && result.coreState === 'committed'
-    && ['hotApplied', 'hostEffectsPending', 'hostEffectsFailed'].includes(result.status ?? '');
+    && ['hotApplied', 'hostEffectsPending', 'hostEffectsFailed', 'nativeCleanupUnknown'].includes(result.status ?? '');
   if (publishedNewCore || result.transactionId !== undefined
       && result.transactionId === current.coreRecovery?.transactionId) next.transactionId = result.transactionId;
   if (result.configurationDurable === true
@@ -253,10 +291,10 @@ export function applyReceiptState(
     const same = current.host?.executionId === result.hostExecutionId
       && current.host.runtimeGeneration === generation && current.host.selectionIntentGeneration === intent;
     const settled = hostEffectsAccepted(result.hostEffects)
-      && (result.status === 'hotApplied' || result.status === 'hotDurabilityPending');
+      && (result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'nativeCleanupUnknown');
     const phase = settled ? 'settled' : ['hostEffectsFailed', 'conflict', 'rejected', 'skipped', 'cancelled'].includes(result.status ?? '') ? 'failed'
       : result.status === 'hostEffectsPending' || result.status === 'unconfirmed' ? 'pending'
-        : !same && (result.status === 'hotApplied' || result.status === 'hotDurabilityPending') ? 'failed' : undefined;
+        : !same && (result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'nativeCleanupUnknown') ? 'failed' : undefined;
     if (phase && !(same && (current.host?.phase === 'settled'
         || current.host?.phase === 'failed' && phase === 'pending'))) {
       next.host = {
@@ -268,6 +306,7 @@ export function applyReceiptState(
     }
   }
   if (next.coreRecovery && next.phase === 'idle') next.phase = 'durabilityPending';
+  if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) next.phase = 'failed';
   return next;
 }
 
@@ -288,14 +327,14 @@ export function applyStateOnLifecycle(
   // A newer explicit user stop cancels neutrally; an old stop cannot cancel a newer Apply.
   if (event.kind === 'stop' && event.terminal === true && event.phase === 'stopped'
       && current.mainGeneration !== undefined && event.mainGeneration > current.mainGeneration) {
-    return { phase: 'idle', reason: null };
+    return preserveNativeRetirements(current, { phase: 'idle', reason: null });
   }
   if (event.applyId !== current.applyId || event.kind !== 'restart') {
     return observed === current ? null : observed;
   }
   if (event.terminal !== true) return observed;
-  if (event.phase === 'failed') return { phase: 'failed', reason: proxyErrorReason(event, t) };
-  if (event.phase === 'ready') return { phase: 'idle', reason: null };
+  if (event.phase === 'failed') return preserveNativeRetirements(current, { phase: 'failed', reason: proxyErrorReason(event, t) });
+  if (event.phase === 'ready') return preserveNativeRetirements(current, { phase: 'idle', reason: null });
   return observed === current ? null : observed;
 }
 
@@ -309,7 +348,7 @@ export type StagedPhase = 'clean' | 'staged' | 'saving' | 'saveFailed';
 /** 维度 B：pending（磁盘 vs 运行核）。 */
 export type PendingPhase = 'none' | 'pending' | 'applying' | 'applyFailed' | 'durabilityPending';
 
-export type BarActionId = 'reset' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave' | 'retryPersistence' | 'retryHost' | 'checkHost';
+export type BarActionId = 'reset' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave' | 'retryPersistence' | 'retryHost' | 'checkHost' | 'checkNative';
 
 /** `disabled` 与「不出现」是两回事：表里的「禁用」要求按钮仍在位（否则条会在重启期间抖一下）。 */
 export interface BarAction {
@@ -326,6 +365,8 @@ export interface BarView {
   /** 副标题（`.pb-tx div`）。空串 = 该行不渲染。 */
   detailKey: string;
   actions: BarAction[];
+  /** Independently proven configuration/save and host facts beside native cleanup guidance. */
+  accountDetailKeys?: string[];
 }
 
 export interface BarInput {
@@ -352,6 +393,11 @@ export interface BarInput {
   persistenceRetrying?: boolean;
   persistenceOwnerPending?: boolean;
   host?: HostApplyState;
+  nativeRetirements?: NativeRetirementDebt[];
+  nativeChecking?: boolean;
+  configurationDurable?: boolean;
+  coreCommitted?: boolean;
+  configurationPending?: boolean;
   persistenceOnly?: boolean;
   /** Confirmed regeneration supersession ends this original recovery, not durability. */
   persistenceRecoveryEnded?: boolean;
@@ -411,6 +457,28 @@ export function composeBarView(input: BarInput): BarView {
     };
   }
 
+
+  if (nativeRetirementDebts(input.nativeRetirements).length > 0) {
+    const busy = pendingPhase === 'applying';
+    const host = input.host;
+    const hostUnsettled = host && host.phase !== 'settled';
+    const drafts = stagedPhase === 'staged' ? [act('reset'), act('save')] : [];
+    const persistence = input.persistenceRetryAvailable && input.persistenceRecoveryEnded ? [act('dismissApply', busy)]
+      : input.persistenceRetryAvailable ? [act('retryPersistence', busy || input.persistenceRetrying === true || input.persistenceOwnerPending === true)] : [];
+    const hostActions = stagedCount === 0 && pendingCount === 0 && hostUnsettled && host.phase !== 'pending'
+      ? [act(hostRetryAvailable(host) ? 'retryHost' : 'checkHost', busy || host.superseded === true && !hostRetryAvailable(host))] : [];
+    const candidate = stagedCount > 0 || pendingCount > 0
+      || input.configurationPending === true && !hostUnsettled && !input.persistenceRetryAvailable ? [act('apply', busy)] : [];
+    return { visible: true, err: true, titleKey: 'home.pendingNativeCleanupUnknown', titleVars: {},
+      detailKey: 'home.pendingNativeCleanupDetail',
+      accountDetailKeys: [
+        ...(input.coreCommitted === true ? [input.configurationDurable === true ? 'home.pendingNativeSavedActive' : 'home.pendingNativeActive'] : []),
+        ...(input.configurationDurable === false ? ['home.pendingNativeSaveUnconfirmed'] : []),
+        ...(host ? [host.phase === 'settled' ? 'home.pendingNativeHostSettled'
+          : host.phase === 'pending' ? 'home.pendingHostEffectsPending' : 'home.pendingHostEffectsFailed'] : []),
+      ],
+      actions: gateApply([...drafts, ...persistence, ...candidate, ...hostActions, act('checkNative', busy || input.nativeChecking === true)]) };
+  }
 
   if (input.host && input.host.phase !== 'settled') {
     const host = input.host;

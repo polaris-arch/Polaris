@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { PendingApplyResult } from '@/contracts/types';
+import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges } from '@/contracts/types';
 import { ImpactApplySummary, type ImpactDisclosure } from '@/shared/ImpactApplySummary';
 import type { ApplyState } from '@/components/layout/pending-bar-logic';
 import type { FormSheetProps } from './forms/FormSheet';
@@ -20,16 +20,19 @@ const h = vi.hoisted(() => ({
   retryPersistence: vi.fn(),
   hostRead: vi.fn(),
   coreRead: vi.fn(),
+  nativeRead: vi.fn(),
   pendingRead: vi.fn(),
   freshApply: vi.fn(),
   cancelImpact: vi.fn(),
   realReconciliation: false,
   lifecycleReady: vi.fn(),
   offLifecycle: vi.fn(),
+  statusRead: vi.fn(),
   app: {
-    pendingChanges: { added: ['node-1'], modified: [], removed: [], restartDeferred: false },
+    pendingChanges: { added: ['node-1'], modified: [], removed: [], restartDeferred: false } as PendingNodeChanges,
     proxyStatus: { running: true, mainGeneration: 7,
       ownedStopContext: undefined as { selectionIntentGeneration: number } | undefined },
+    nativeRetirementEndedBeforeGeneration: 0, confirmNativeRetirementEnd: vi.fn(),
     config: null as Record<string, unknown> | null,
     setPendingChanges: vi.fn(),
   },
@@ -66,17 +69,18 @@ vi.mock('@/components/layout/use-runtime-apply-reconciliation', async (original)
   const actual = await original<typeof import('@/components/layout/use-runtime-apply-reconciliation')>();
   return { useRuntimeApplyReconciliation: (...args: Parameters<typeof actual.useRuntimeApplyReconciliation>) =>
     h.realReconciliation ? actual.useRuntimeApplyReconciliation(...args)
-      : { retryPersistence: async () => undefined, checkHost: () => undefined } };
+      : { retryPersistence: async () => undefined, checkHost: () => undefined, checkNative: async () => undefined } };
 });
 vi.mock('@/ipc', () => ({ api: { proxy: {
   onLifecycleReady: h.lifecycleReady,
   retryRuntimePersistence: h.retryPersistence,
   runtimeHostEffectStatus: h.hostRead,
   runtimeApplyStatus: h.coreRead,
+  runtimeNativeRetirementStatus: h.nativeRead,
   getPendingChanges: h.pendingRead,
   applyPendingChanges: h.freshApply,
   cancelRuntimeImpact: h.cancelImpact,
-  getStatus: vi.fn(),
+  getStatus: h.statusRead,
 } } }));
 vi.mock('@/store/app-store', () => ({
   normalizePendingChanges: (pending: unknown) => pending,
@@ -158,7 +162,9 @@ beforeEach(() => {
   h.states = [];
   h.refs = [];
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
+  h.statusRead.mockImplementation(async () => h.app.proxyStatus);
   h.app.config = null;
+  h.app.nativeRetirementEndedBeforeGeneration = 0;
   h.app.pendingChanges = { added: ['node-1'], modified: [], removed: [], restartDeferred: false };
   h.realReconciliation = false;
   h.app.proxyStatus = { running: true, mainGeneration: 7, ownedStopContext: undefined };
@@ -166,6 +172,7 @@ beforeEach(() => {
   h.pendingRead.mockImplementation(async () => h.app.pendingChanges);
   h.hostRead.mockRejectedValue(new Error('no host status reply'));
   h.coreRead.mockRejectedValue(new Error('no Core status reply'));
+  h.nativeRead.mockRejectedValue(new Error('no native-only status reply'));
   h.cancelImpact.mockResolvedValue({ ok: true, status: 'cancelled' });
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
@@ -555,5 +562,194 @@ describe('mobile impact consent disclosure', () => {
     expect(h.app.proxyStatus.mainGeneration).toBe(7);
     expect(h.freshApply).not.toHaveBeenCalled();
     expect(h.retryPersistence).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('mobile original native listener cleanup', () => {
+  const native: NativeRetirementDebt = { transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    retirementState: 'UNKNOWN', reason: { code: 'LISTENER_RETIREMENT_FAILED', path: 'inbounds' } };
+  const empty = (): PendingNodeChanges => ({ added: [], modified: [], removed: [], restartDeferred: false });
+  const effect = { preview: { kind: 'dns' as const, scopeDigest: 'dns', beforeDigest: 'before', targetDigest: 'target' },
+    outcome: 'applied' as const, receiptId: 'accepted-host-B', cleanupPending: false, retryable: false, reasonCode: null };
+  const receipt = (over: Partial<PendingApplyResult> = {}): PendingApplyResult => ({ ok: false,
+    status: 'nativeCleanupUnknown', transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    coreState: 'committed', configurationDurable: true, retirementState: 'UNKNOWN', nativeRetirements: [native], ...over });
+  async function start(over: Partial<PendingApplyResult> = {}) {
+    h.realReconciliation = true;
+    h.applyNow.mockResolvedValueOnce({ ...receipt(over), saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]));
+    h.app.pendingChanges = empty();
+    renderBar();
+  }
+
+  it('renders the saved/current-core facts and unresolved entry closure at empty deletion scope without success', async () => {
+    await start();
+    const html = markup(renderBar());
+    expect(html).toContain('m-pending-err');
+    expect(html).toContain('home.pendingNativeCleanupUnknown');
+    expect(html).toContain('home.pendingNativeSavedActive');
+    expect(html).toContain('home.pendingNativeCleanupDetail');
+    expect(html).toContain('home.pendingCheckNativeBtn');
+    expect(html).not.toContain('home.pendingIgnoreBtn');
+    expect(html).not.toContain('home.pendingRetryBtn');
+    expect(h.nativeRead).not.toHaveBeenCalled();
+    expect(h.coreRead).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    const { toast } = await import('@/lib/error-handler');
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it('permits accepted-carrier PENDING success and later discovers UNKNOWN from the backend pending feed', async () => {
+    h.realReconciliation = true;
+    h.applyNow.mockResolvedValueOnce({ ...receipt({ ok: true, status: 'hotApplied', retirementState: 'PENDING',
+      nativeRetirements: undefined }), saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).configurationDurable).toBe(true));
+    h.app.pendingChanges = empty();
+    expect(renderBar()).toBeNull();
+    const { toast } = await import('@/lib/error-handler');
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.freshApply).not.toHaveBeenCalled();
+  });
+
+  it('restores native-only debt without an Apply request, then retains it through an empty pending frame', () => {
+    h.realReconciliation = true;
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+    expect((h.states[0] as ApplyState).transactionId).toBeUndefined();
+    h.app.pendingChanges = empty();
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+    expect(markup(renderBar())).not.toContain('home.pendingNativeSavedActive');
+    expect(h.applyNow).not.toHaveBeenCalled();
+  });
+
+  it('keeps native A independent of accepted Host B and reads only A original token after the host intent changes', async () => {
+    await start({ transactionId: undefined, hostExecutionId: 'host-B', selectionIntentGeneration: 10,
+      coreState: 'unchanged', hostEffects: [effect] });
+    expect((h.states[0] as ApplyState).host).toMatchObject({ executionId: 'host-B', phase: 'settled' });
+    expect(markup(renderBar())).toContain('home.pendingNativeHostSettled');
+    h.app.proxyStatus.ownedStopContext = { selectionIntentGeneration: 11 };
+    h.nativeRead.mockResolvedValueOnce(receipt({ nativeRetirements: [], retirementState: 'DRAINED' }));
+    click('home.pendingCheckNativeBtn'); await microtasks();
+    expect(h.nativeRead).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect(h.coreRead).not.toHaveBeenCalled();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+    expect(h.hostRead).not.toHaveBeenCalled();
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('a native-only check stays read-only while the original generic status later advances pending D', async () => {
+    h.realReconciliation = true;
+    h.applyNow.mockResolvedValueOnce({ ...receipt({ configurationDurable: false }), saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).configurationDurable).toBe(false));
+    h.app.pendingChanges = empty();
+    vi.useFakeTimers();
+    renderBar();
+    h.nativeRead.mockResolvedValueOnce(receipt({ configurationDurable: false }));
+    click('home.pendingCheckNativeBtn'); await microtasks();
+    expect(h.nativeRead).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect(h.coreRead).not.toHaveBeenCalled();
+    expect((h.states[0] as ApplyState).configurationDurable).toBe(false);
+    // Provider readiness is observed by the original D endpoint, whose backend may perform its existing full-owner ACK.
+    h.coreRead.mockResolvedValueOnce(receipt({ configurationDurable: true }));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect(h.nativeRead).toHaveBeenCalledTimes(1);
+    expect((h.states[0] as ApplyState).coreRecovery).toBeUndefined();
+    expect((h.states[0] as ApplyState).configurationDurable).toBe(true);
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+    expect(markup(renderBar())).toContain('home.pendingNativeSavedActive');
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.freshApply).not.toHaveBeenCalled();
+  });
+
+  it('recovers original persistence while retaining independent native and accepted host facts', async () => {
+    await start({ configurationDurable: false, hostExecutionId: 'host-B', hostEffects: [effect] });
+    expect(markup(renderBar())).toContain('home.pendingNativeSaveUnconfirmed');
+    h.retryPersistence.mockResolvedValueOnce(receipt({ hostExecutionId: 'host-B', hostEffects: [effect] }));
+    click('home.pendingRetryPersistenceBtn'); await microtasks();
+    expect(h.retryPersistence).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect((h.states[0] as ApplyState).configurationDurable).toBe(true);
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(markup(renderBar())).toContain('home.pendingNativeSavedActive');
+    expect(markup(renderBar())).toContain('home.pendingNativeHostSettled');
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not accept a mismatched check and does not land its delayed reply after unmount', async () => {
+    await start();
+    h.nativeRead.mockResolvedValueOnce(receipt({ transactionId: 'host-B', selectionIntentGeneration: 10,
+      nativeRetirements: [{ ...native, transactionId: 'foreign' }] }));
+    click('home.pendingCheckNativeBtn'); await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    let finish!: (result: PendingApplyResult) => void;
+    h.nativeRead.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    click('home.pendingCheckNativeBtn'); await microtasks();
+    unmount();
+    const last = h.states[0];
+    finish(receipt({ nativeRetirements: [{ ...native, transactionId: 'foreign' }] }));
+    await microtasks();
+    expect(h.states[0]).toBe(last);
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.freshApply).not.toHaveBeenCalled();
+  });
+
+  it('keeps a delayed native feed when a new successful Apply replies and suppresses its success toast', async () => {
+    h.realReconciliation = true;
+    let finish!: (result: unknown) => void;
+    h.applyNow.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    click('home.pendingApplyBtn'); await microtasks();
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    renderBar();
+    finish({ saved: true, ok: true, status: 'hotApplied', transactionId: 'new-B', runtimeGeneration: 7,
+      selectionIntentGeneration: 10, coreState: 'committed', configurationDurable: true });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+    const { toast } = await import('@/lib/error-handler');
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it('a late unowned stop A cannot clear successor B native debt', async () => {
+    await start();
+    const successor = { ...native, transactionId: 'native-B', runtimeGeneration: 9, selectionIntentGeneration: 10 };
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [successor] };
+    h.app.proxyStatus = { running: true, mainGeneration: 9, ownedStopContext: undefined };
+    renderBar();
+    const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
+    listener({ kind: 'stop', phase: 'stopped', terminal: true, mainGeneration: 8 });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native, successor]);
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+  });
+
+  it('does not clear on a claimed generation or failed restart, and requires the terminal stop plus fresh same-generation status', async () => {
+    await start();
+    const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
+    h.app.proxyStatus = { running: true, mainGeneration: 8, ownedStopContext: undefined };
+    renderBar();
+    expect(markup(renderBar())).toContain('home.pendingNativeCleanupUnknown');
+    listener({ kind: 'restart', phase: 'failed', terminal: true, mainGeneration: 8 });
+    listener({ kind: 'stop', phase: 'stopped', terminal: false, mainGeneration: 8 });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    h.app.proxyStatus = { running: false, mainGeneration: 8, ownedStopContext: undefined };
+    listener({ kind: 'stop', phase: 'stopped', terminal: true, mainGeneration: 8 });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([]);
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    expect(renderBar()).toBeNull();
   });
 });

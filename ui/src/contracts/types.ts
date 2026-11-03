@@ -499,6 +499,15 @@ export interface RegionRoutingConfig {
   reverse: boolean; // 反向：本地走代理·海外直连（region=cn+reverse=回国）
 }
 
+/** Original native cleanup proof; independent of the current result's Core, save and host owners. */
+export interface NativeRetirementDebt {
+  transactionId: string;
+  runtimeGeneration: number;
+  selectionIntentGeneration: number;
+  retirementState: 'UNKNOWN';
+  reason: { code: 'LISTENER_RETIREMENT_FAILED'; path: 'inbounds' };
+}
+
 /**
  * §2 待应用差集：节点集相对**运行核起核快照**的差异。均为 serverId 列表；
  * 三个都空 = 运行核与 config 一致（或核未运行）。
@@ -527,6 +536,7 @@ export interface PendingNodeChanges {
    * 需要重启才生效。条上必须把它算进「有没有东西待应用」，否则「保存」在 UI 上完全无痕。
    */
   restartDeferred: boolean;
+  nativeRetirements?: NativeRetirementDebt[];
 }
 
 /**
@@ -869,7 +879,7 @@ export interface PendingApplyResult {
   ok: boolean;
   status: 'applied' | 'deferred' | 'skipped' | 'hotApplied' | 'hotDurabilityPending'
     | 'restartRequired' | 'impactConfirmationRequired' | 'cancelled'
-    | 'hostEffectsPending' | 'hostEffectsFailed'
+    | 'hostEffectsPending' | 'hostEffectsFailed' | 'nativeCleanupUnknown'
     | 'conflict' | 'rejected' | 'unconfirmed';
   applyId?: number | null;
   restartConfirmation?: string;
@@ -882,6 +892,7 @@ export interface PendingApplyResult {
   configurationDurable?: boolean;
   persistenceTransactionId?: string;
   retirementState?: string;
+  nativeRetirements?: NativeRetirementDebt[];
   reasons?: { code: string; path: string }[];
   pendingApply?: boolean;
   restartRequired?: boolean;

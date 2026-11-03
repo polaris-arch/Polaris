@@ -1967,6 +1967,7 @@ fn pending_changes_baseline_states_are_all_empty() {
         restart_deferred: false,
         pending_apply: false,
         restart_required: false,
+        native_retirements: vec![],
     };
 
     // ① 核未运行 / 无起核快照。
@@ -4085,6 +4086,7 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
             restart_deferred: false,
             pending_apply: false,
             restart_required: false,
+            native_retirements: vec![],
         },
         "重启落地后差集必须为空 —— 非空 = 条上继续挂「立即应用」，用户再点也清不掉"
     );

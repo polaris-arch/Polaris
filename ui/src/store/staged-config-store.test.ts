@@ -1200,3 +1200,20 @@ describe('HostOnly original persistence ownership is a separate field', () => {
     expect(applyMock).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe('native cleanup crosses the real staged Apply projection', () => {
+  const native = { transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    retirementState: 'UNKNOWN' as const, reason: { code: 'LISTENER_RETIREMENT_FAILED' as const, path: 'inbounds' as const } };
+  it.each(['nativeCleanupUnknown', 'hostEffectsFailed'] as const)('forwards independent native owner with current %s owner and proven K/D', async status => {
+    applyMock.mockResolvedValueOnce({ ok: false, status, transactionId: 'current-B', runtimeGeneration: 7,
+      selectionIntentGeneration: 10, coreState: 'committed', configurationDurable: true, nativeRetirements: [native] });
+    const returned = await useStagedConfigStore.getState().applyNow();
+    expect(returned).toMatchObject({ saved: true, status, transactionId: 'current-B', selectionIntentGeneration: 10,
+      coreState: 'committed', configurationDurable: true, nativeRetirements: [native] });
+    expect(returned.nativeRetirements?.[0].transactionId).toBe('native-A');
+    expect(returned.nativeRetirements?.[0].selectionIntentGeneration).toBe(9);
+    expect(applyMock).toHaveBeenCalledExactlyOnceWith(undefined);
+    expect(saveMock).not.toHaveBeenCalled();
+  });
+});

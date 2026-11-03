@@ -38,7 +38,7 @@
  *    ⚠️ 如实登记射程：这是**整批**裁决，不是桌面那样的逐项裁决。逐项面归表单批。
  */
 
-import { useEffect, useRef, useState, type ReactElement } from 'react';
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '@/ipc';
@@ -56,6 +56,9 @@ import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
   applyReceiptState,
+  mergeNativeRetirements,
+  nativeRetirementsAfterLifecycle,
+  preserveNativeRetirements,
   dismissApplyState,
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
@@ -78,6 +81,7 @@ const ACTION_LABEL: Record<BarActionId, string> = {
   retryPersistence: 'home.pendingRetryPersistenceBtn',
   retryHost: 'home.pendingRetryHostBtn',
   checkHost: 'home.pendingCheckHostBtn',
+  checkNative: 'home.pendingCheckNativeBtn',
 };
 
 /** 主按钮（实心）：断流的那颗永远是主按钮，与桌面同口径。 */
@@ -95,10 +99,19 @@ export function MobilePendingBar(): ReactElement | null {
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
   const conflict = useStagedConfigStore((s) => s.conflict);
-  const [apply, setApply] = useState<ApplyState>({
+  const [apply, setApplyState] = useState<ApplyState>({
     phase: 'idle',
     reason: null,
   });
+  const latestApply = useRef(apply);
+  latestApply.current = apply;
+  // Receipts can race a delayed native-debt push. Preserve both original owners at the setter boundary.
+  const setApply = useRef<Dispatch<SetStateAction<ApplyState>>>((update) => setApplyState((state) => {
+    const next = typeof update === 'function' ? update(state) : update;
+    const folded = next === state ? state : preserveNativeRetirements(state, next);
+    latestApply.current = folded;
+    return folded;
+  })).current;
   const [restartPrompt, setRestartPrompt] = useState<RestartPrompt | null>(null);
   const impactChoice = useImpactConfirmation();
   const applyRequest = useRef<{
@@ -125,6 +138,14 @@ export function MobilePendingBar(): ReactElement | null {
     let disposed = false;
     let offLifecycle: (() => void) | undefined;
     const ready = api.proxy.onLifecycleReady((data) => {
+      if (data.terminal === true && (data.phase === 'ready' || data.kind === 'stop' && data.phase === 'stopped')) {
+        void api.proxy.getStatus().then((live) => {
+          if (!disposed) {
+            useAppStore.getState().confirmNativeRetirementEnd(data, live);
+            setApply((state) => nativeRetirementsAfterLifecycle(state, data, live));
+          }
+        }).catch(() => undefined);
+      }
       const request = applyRequest.current;
       if (!request) return;
       if (data.kind === 'stop' && data.terminal === true && data.phase === 'stopped'
@@ -175,7 +196,7 @@ export function MobilePendingBar(): ReactElement | null {
       void api.proxy.getStatus().catch(() => null).then(() => {
         if (applyRequest.current !== request) return;
         setApply((state) => state.phase === 'applying' && state.applyId === apply.applyId
-          ? { phase: 'failed', reason: null } : state);
+          ? preserveNativeRetirements(state, { phase: 'failed', reason: null }) : state);
       });
     }, APPLY_CONFIRM_TIMEOUT_MS);
     return () => clearTimeout(timer);
@@ -223,6 +244,11 @@ export function MobilePendingBar(): ReactElement | null {
     persistenceRetryAvailable: !!apply.coreRecovery || (apply.configurationDurable !== true && !!apply.transactionId
       && (apply.persistenceOnly === true || apply.phase === 'durabilityPending')),
     host: apply.host,
+    nativeRetirements: mergeNativeRetirements(apply, pending.nativeRetirements).nativeRetirements,
+    nativeChecking: apply.nativeChecking,
+    configurationDurable: apply.configurationDurable,
+    coreCommitted: coreRunning && apply.mainGeneration === coreGeneration && apply.coreState === 'committed',
+    configurationPending: pending.restartDeferred,
     persistenceRetrying: apply.persistenceRetrying,
     persistenceOwnerPending: !!apply.coreRecovery && apply.coreRecovery.selectionIntentGeneration === undefined,
     persistenceOnly: apply.persistenceOnly,
@@ -246,12 +272,12 @@ export function MobilePendingBar(): ReactElement | null {
     if (impactConfirmation === undefined) impactChoice.dismiss();
     else impactChoice.hide();
     const generation = useAppStore.getState().proxyStatus?.mainGeneration;
-    const initial: ApplyState = { ...(hostDebt || retainingRecovery ? apply : {}), phase: 'applying', reason: null,
+    const initial: ApplyState = preserveNativeRetirements(mergeNativeRetirements(apply, pending.nativeRetirements), { ...(hostDebt || retainingRecovery ? apply : {}), phase: 'applying', reason: null,
       ...(hostDebt || retainingRecovery ? { reconciling: false } : {}),
       ...(hostDebt ? { host: { ...apply.host!, superseded: true }, hostReconciling: false } : {}),
       persistenceOnly: persistenceTransactionId !== undefined || (hostDebt && apply.persistenceOnly === true),
       transactionId: persistenceTransactionId ?? (hostDebt ? apply.transactionId : undefined),
-      ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) };
+      ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) });
     const request = { awaitingReply: true, cancelled: false,
       intentGeneration: undefined as number | undefined,
       early: [] as ProxyLifecycleEvent[],
@@ -286,11 +312,13 @@ export function MobilePendingBar(): ReactElement | null {
       request.awaitingReply = false;
       if (!result.saved) {
         setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
-          reason: null, reconciling: !!initial.coreRecovery } : { phase: 'idle', reason: null });
+          reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
         return;
       }
+      // Every saved receipt may report older native owners, including a rejected or superseded new attempt.
+      setApply((state) => mergeNativeRetirements(state, result.nativeRetirements));
       if ((result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'unconfirmed'
-          || result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed')
+          || result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed' || result.status === 'nativeCleanupUnknown')
           && (request.cancelled || (request.earlyGeneration ?? 0) > (initial.mainGeneration ?? 0))) {
         request.early = [];
         setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
@@ -298,7 +326,7 @@ export function MobilePendingBar(): ReactElement | null {
       }
       if (persistenceTransactionId !== undefined
           && (result.transactionId !== persistenceTransactionId
-            || !['hotApplied', 'hotDurabilityPending', 'hostEffectsPending', 'hostEffectsFailed', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
+            || !['hotApplied', 'hotDurabilityPending', 'hostEffectsPending', 'hostEffectsFailed', 'nativeCleanupUnknown', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
         request.early = [];
         setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
         return;
@@ -317,7 +345,7 @@ export function MobilePendingBar(): ReactElement | null {
           return;
         }
         setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
-          reason: null, reconciling: !!initial.coreRecovery } : { phase: 'idle', reason: null });
+          reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
         return;
       }
       if (result.status === 'restartRequired') {
@@ -329,7 +357,7 @@ export function MobilePendingBar(): ReactElement | null {
         }
         setRestartPrompt({ token: result.restartConfirmation, reasons: result.reasons ?? [] });
         setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
-          reason: null, reconciling: !!initial.coreRecovery } : { phase: 'idle', reason: null });
+          reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
         return;
       }
       const reconcileOwnerKnown = Number.isSafeInteger(result.runtimeGeneration) && (result.runtimeGeneration ?? 0) > 0
@@ -348,6 +376,9 @@ export function MobilePendingBar(): ReactElement | null {
       const receipt = result.status === 'hotApplied' && result.transactionId !== undefined && result.configurationDurable !== false
         ? { ...result, configurationDurable: true } : result;
       next = applyReceiptState(next, receipt, true);
+      if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) {
+        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed') };
+      }
       next.hostReconciling = !request.cancelled && reconcileOwnerKnown && next.host?.phase === 'pending';
       if ((result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed')
           && (!result.hostExecutionId || !reconcileOwnerKnown)) {
@@ -355,11 +386,11 @@ export function MobilePendingBar(): ReactElement | null {
       }
       if (outcome.phase === 'applying') {
         if (typeof result.applyId !== 'number' || !Number.isSafeInteger(result.applyId) || result.applyId <= 0) {
-          next = { phase: 'failed', reason: null };
+          next = preserveNativeRetirements(initial, { phase: 'failed', reason: null });
         } else {
           next.applyId = result.applyId;
           if (request.earlyStopped) {
-            next = { phase: 'idle', reason: null };
+            next = preserveNativeRetirements(initial, { phase: 'idle', reason: null });
           } else {
             // A retained old terminal cannot settle below a newer observation that overflow
             // evicted. Missing payload remains pending for a future owned event or timeout.
@@ -369,10 +400,11 @@ export function MobilePendingBar(): ReactElement | null {
         }
       }
       request.early = [];
+      next = preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next);
       setApply(next);
       // Preserve the mobile policy: an Apply racing Stop stays neutral without a skipped toast.
       if (outcome.toast !== null && result.status !== 'skipped'
-          && !(result.status === 'hotApplied' && next.host && next.host.phase !== 'settled')) toast[outcome.toast.kind](t(outcome.toast.key));
+          && !(result.status === 'hotApplied' && (next.nativeRetirements?.length || next.host && next.host.phase !== 'settled'))) toast[outcome.toast.kind](t(outcome.toast.key));
     } catch (error) {
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
@@ -411,6 +443,9 @@ export function MobilePendingBar(): ReactElement | null {
       case 'checkHost':
         reconciliation.checkHost();
         return;
+      case 'checkNative':
+        void reconciliation.checkNative();
+        return;
       case 'dismissApply':
         setApply(dismissApplyState);
     }
@@ -424,7 +459,8 @@ export function MobilePendingBar(): ReactElement | null {
     >
       <div className="m-pending-text">
         <b>{armed === RESET_KEY ? t('home.pendingResetShortConfirm') : t(view.titleKey, view.titleVars)}</b>
-        {apply.host && apply.host.phase !== 'settled' && view.detailKey !== '' ? (
+        {view.accountDetailKeys?.map(key => <span className="m-pending-detail" key={key}>{t(key)}</span>)}
+        {view.detailKey !== '' && (apply.nativeRetirements?.length || pending.nativeRetirements?.length || apply.host && apply.host.phase !== 'settled') ? (
           <span className="m-pending-detail">{t(view.detailKey)}</span>
         ) : pendingPhase === 'pending' && (
           <span className="m-pending-detail">{t('home.pendingSavedStillNeedsApply')}</span>

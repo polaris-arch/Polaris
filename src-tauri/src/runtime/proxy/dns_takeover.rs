@@ -20,7 +20,6 @@ use polaris_system_integration::proxy_ops::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::{code, ProxyRuntime};
 
@@ -52,7 +51,7 @@ pub(super) fn runtime_dns_plan_prior_owner(plan: &HostEffectPlan) -> Option<Stri
 }
 
 fn host_digest(value: &Value) -> String {
-    format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
+    polaris_updater::sha256_hex(value.to_string().as_bytes())
 }
 
 fn host_plan_digest(plan: &HostEffectPlan) -> String {

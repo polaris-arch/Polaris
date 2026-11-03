@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import type { PendingApplyResult } from '@/contracts/types';
+import type { NativeRetirementDebt, PendingApplyResult, PendingNodeChanges } from '@/contracts/types';
 import type { ApplyState } from './pending-bar-logic';
 
 // Render the actual desktop handlers and shared observers in the existing node suite.
@@ -10,12 +10,13 @@ const h = vi.hoisted(() => ({
   stateIndex: 0, refIndex: 0, effectIndex: 0,
   effects: [] as Array<{ deps?: readonly unknown[]; cleanup?: () => void }>,
   pendingEffects: [] as Array<() => void>,
-  applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(),
+  applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
   retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(),
-  lifecycleReady: vi.fn(), offLifecycle: vi.fn(),
+  lifecycleReady: vi.fn(), offLifecycle: vi.fn(), statusRead: vi.fn(),
   app: {
-    pendingChanges: { added: ['node'], modified: [] as string[], removed: [] as string[], restartDeferred: false },
+    pendingChanges: { added: ['node'], modified: [] as string[], removed: [] as string[], restartDeferred: false } as PendingNodeChanges,
     proxyStatus: { running: true, mainGeneration: 7 }, config: null as Record<string, unknown> | null,
+    nativeRetirementEndedBeforeGeneration: 0, confirmNativeRetirementEnd: vi.fn(),
     servers: [] as Array<{ id: string; name: string }>, setPendingChanges: vi.fn(),
   },
 }));
@@ -46,8 +47,9 @@ vi.mock('@/components/dialogs/ImpactApplyDialog', () => ({ ImpactApplyDialog: ()
 vi.mock('@/ipc', () => ({ api: { proxy: {
   onLifecycleReady: h.lifecycleReady, applyPendingChanges: h.freshApply,
   runtimeHostEffectStatus: h.hostRead, runtimeApplyStatus: h.coreRead,
+  runtimeNativeRetirementStatus: h.nativeRead,
   retryRuntimePersistence: h.retryPersistence, getPendingChanges: h.pendingRead,
-  cancelRuntimeImpact: h.cancelImpact, getStatus: vi.fn(),
+  cancelRuntimeImpact: h.cancelImpact, getStatus: h.statusRead,
 } } }));
 vi.mock('@/store/app-store', () => ({
   normalizePendingChanges: (pending: unknown) => pending,
@@ -115,13 +117,16 @@ async function begin(result: PendingApplyResult): Promise<void> {
 beforeEach(() => {
   unmount(); vi.resetAllMocks(); h.states = []; h.refs = [];
   h.app.config = null;
+  h.app.nativeRetirementEndedBeforeGeneration = 0;
   h.app.pendingChanges = { added: ['node'], modified: [], removed: [], restartDeferred: false };
   h.app.proxyStatus = { running: true, mainGeneration: 7 };
   h.app.setPendingChanges.mockImplementation(pending => { h.app.pendingChanges = pending; });
   h.pendingRead.mockImplementation(async () => h.app.pendingChanges);
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
+  h.statusRead.mockImplementation(async () => h.app.proxyStatus);
   h.cancelImpact.mockResolvedValue({ ok: true, status: 'cancelled' });
   h.coreRead.mockRejectedValue(new Error('Core status unavailable'));
+  h.nativeRead.mockRejectedValue(new Error('Native-only status unavailable'));
   h.hostRead.mockRejectedValue(new Error('Host status unavailable'));
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); });
@@ -334,5 +339,182 @@ describe('desktop HostOnly projection preserves the old persistence account', ()
     expect(renderBar()).toBeNull();
     expect(h.freshApply).not.toHaveBeenCalled();
     expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('desktop native listener cleanup stays independent', () => {
+  const native: NativeRetirementDebt = { transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    retirementState: 'UNKNOWN', reason: { code: 'LISTENER_RETIREMENT_FAILED', path: 'inbounds' } };
+  const empty = (): PendingNodeChanges => ({ added: [], modified: [], removed: [], restartDeferred: false });
+  const receipt = (over: Partial<PendingApplyResult> = {}): PendingApplyResult => ({ ok: false,
+    status: 'nativeCleanupUnknown', transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    coreState: 'committed', configurationDurable: true, retirementState: 'UNKNOWN', nativeRetirements: [native], ...over });
+  async function start(over: Partial<PendingApplyResult> = {}) {
+    h.applyNow.mockResolvedValueOnce({ ...receipt(over), saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]));
+    h.app.pendingChanges = empty();
+    renderBar();
+  }
+
+  it('shows the real durable committed result at empty deletion scope and never toasts success', async () => {
+    await start();
+    const html = markup();
+    expect(html).toContain('home.pendingNativeCleanupUnknown');
+    expect(html).toContain('home.pendingNativeSavedActive');
+    expect(html).toContain('home.pendingNativeCleanupDetail');
+    expect(html).toContain('home.pendingCheckNativeBtn');
+    expect(html).not.toContain('home.pendingRetryBtn');
+    expect(html).not.toContain('home.pendingIgnoreBtn');
+    expect(toast.info).not.toHaveBeenCalled();
+    expect(h.nativeRead).not.toHaveBeenCalled();
+    expect(h.coreRead).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    const details = elements(renderBar()).find(element => element.type === 'button'
+      && text(element.props.children).includes('home.pendingNativeCleanupUnknown'));
+    details!.props.onClick!();
+    const expanded = markup();
+    expect(expanded).toContain('white-space:normal');
+    expect(expanded).toContain('<p>home.pendingNativeCleanupDetail</p>');
+    expect(expanded).not.toContain('native-A');
+  });
+
+  it('keeps normal accepted-carrier PENDING successful, then receives delayed UNKNOWN through the pending feed', async () => {
+    h.applyNow.mockResolvedValueOnce({ ...receipt({ ok: true, status: 'hotApplied', retirementState: 'PENDING',
+      nativeRetirements: undefined }), saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).configurationDurable).toBe(true));
+    h.app.pendingChanges = empty();
+    expect(renderBar()).toBeNull();
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith('home.pendingHotApplied');
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.freshApply).not.toHaveBeenCalled();
+  });
+
+  it('restores a native-only pending push with no local Apply owner and keeps it after an empty late frame', () => {
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+    expect((h.states[0] as ApplyState).transactionId).toBeUndefined();
+    h.app.pendingChanges = empty();
+    expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+    expect(markup()).not.toContain('home.pendingNativeSavedActive');
+    expect(h.applyNow).not.toHaveBeenCalled();
+    expect(h.nativeRead).not.toHaveBeenCalled();
+    expect(h.coreRead).not.toHaveBeenCalled();
+  });
+
+  it('retains A through a successor HostOnly B acceptance and checks only A original transaction', async () => {
+    await start({ hostExecutionId: 'host-B', selectionIntentGeneration: 10, transactionId: undefined,
+      coreState: 'unchanged', hostEffects: [effect] });
+    expect((h.states[0] as ApplyState).host).toMatchObject({ executionId: 'host-B', phase: 'settled' });
+    expect(markup()).toContain('home.pendingNativeHostSettled');
+    Object.assign(h.app.proxyStatus, { ownedStopContext: { selectionIntentGeneration: 11 } });
+    h.nativeRead.mockResolvedValueOnce(receipt({ nativeRetirements: [], retirementState: 'DRAINED' }));
+    const check = button('home.pendingCheckNativeBtn');
+    check.props.onClick!(); check.props.onClick!();
+    await microtasks();
+    expect(h.nativeRead).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect(h.coreRead).not.toHaveBeenCalled();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect((h.states[0] as ApplyState).host?.phase).toBe('settled');
+    expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+    expect(h.hostRead).not.toHaveBeenCalled();
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.freshApply).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['wrong transaction', 'wrong generation', 'wrong intent', 'missing owner'] as const)(
+    'a %s native check cannot add a foreign proof or clear A', async route => {
+      await start();
+      const foreign = { ...native, transactionId: 'foreign' };
+      h.nativeRead.mockResolvedValueOnce(receipt({ nativeRetirements: [foreign],
+        ...(route === 'wrong transaction' ? { transactionId: 'other' } : route === 'wrong generation'
+          ? { runtimeGeneration: 8 } : route === 'wrong intent' ? { selectionIntentGeneration: 10 }
+            : { transactionId: undefined, hostExecutionId: 'native-A' }) }));
+      click('home.pendingCheckNativeBtn'); await microtasks();
+      expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+      expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+      expect(h.nativeRead).toHaveBeenCalledExactlyOnceWith('native-A');
+      expect(h.coreRead).not.toHaveBeenCalled();
+    });
+
+  it('a native-only check stays read-only while the original generic status later advances pending D', async () => {
+    h.applyNow.mockResolvedValueOnce({ ...receipt({ configurationDurable: false }), saved: true });
+    click('home.pendingApplyBtn');
+    await vi.waitFor(() => expect((h.states[0] as ApplyState).configurationDurable).toBe(false));
+    h.app.pendingChanges = empty();
+    vi.useFakeTimers();
+    renderBar();
+    h.nativeRead.mockResolvedValueOnce(receipt({ configurationDurable: false }));
+    click('home.pendingCheckNativeBtn'); await microtasks();
+    expect(h.nativeRead).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect(h.coreRead).not.toHaveBeenCalled();
+    expect((h.states[0] as ApplyState).configurationDurable).toBe(false);
+    // Provider readiness is observed by the original D endpoint, whose backend may perform its existing full-owner ACK.
+    h.coreRead.mockResolvedValueOnce(receipt({ configurationDurable: true }));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect(h.nativeRead).toHaveBeenCalledTimes(1);
+    expect((h.states[0] as ApplyState).coreRecovery).toBeUndefined();
+    expect((h.states[0] as ApplyState).configurationDurable).toBe(true);
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+    expect(markup()).toContain('home.pendingNativeSavedActive');
+    expect(h.retryPersistence).not.toHaveBeenCalled();
+    expect(h.applyNow).toHaveBeenCalledTimes(1);
+    expect(h.freshApply).not.toHaveBeenCalled();
+  });
+
+  it('finishes D independently and keeps native A while the same host receipt remains accepted', async () => {
+    await start({ configurationDurable: false, hostExecutionId: 'host-B', hostEffects: [effect] });
+    expect(markup()).toContain('home.pendingNativeSaveUnconfirmed');
+    h.retryPersistence.mockResolvedValueOnce(receipt({ hostExecutionId: 'host-B', hostEffects: [effect] }));
+    click('home.pendingRetryPersistenceBtn'); await microtasks();
+    expect(h.retryPersistence).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect((h.states[0] as ApplyState).coreRecovery).toBeUndefined();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(markup()).toContain('home.pendingNativeSavedActive');
+    expect(markup()).toContain('home.pendingNativeHostSettled');
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it('a new successful Apply racing a native feed cannot overwrite the newly observed original debt', async () => {
+    let finish!: (result: unknown) => void;
+    h.applyNow.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    click('home.pendingApplyBtn'); await microtasks();
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    renderBar();
+    finish({ saved: true, ok: true, status: 'hotApplied', transactionId: 'new-B', runtimeGeneration: 7,
+      selectionIntentGeneration: 10, coreState: 'committed', configurationDurable: true });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it('clears only after terminal process completion plus matching fresh status and rejects late A push', async () => {
+    await start();
+    const listener = h.lifecycleReady.mock.calls[0][0] as (event: unknown) => void;
+    h.app.proxyStatus = { running: true, mainGeneration: 8 };
+    renderBar();
+    expect(markup()).toContain('home.pendingNativeCleanupUnknown');
+    listener({ kind: 'restart', phase: 'failed', terminal: true, mainGeneration: 8 });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    listener({ kind: 'stop', phase: 'stopped', terminal: false, mainGeneration: 8 });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
+    h.app.proxyStatus = { running: false, mainGeneration: 8 };
+    listener({ kind: 'stop', phase: 'stopped', terminal: true, mainGeneration: 8 });
+    await microtasks();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([]);
+    h.app.pendingChanges = { ...empty(), nativeRetirements: [native] };
+    expect(renderBar()).toBeNull();
+    expect((h.states[0] as ApplyState).nativeRetirements).toEqual([]);
   });
 });

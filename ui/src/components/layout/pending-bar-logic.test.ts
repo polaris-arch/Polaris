@@ -5,6 +5,10 @@ import {
   hasPendingWork,
   applyOutcome,
   applyReceiptState,
+  nativeRetirementDebts,
+  mergeNativeRetirements,
+  preserveNativeRetirements,
+  nativeRetirementsAfterLifecycle,
   dismissApplyState,
   hostEffectsAccepted,
   hostRetryAvailable,
@@ -893,5 +897,131 @@ describe('a real new Core correction differs from HostOnly durability', () => {
       runtimeGeneration: 7, selectionIntentGeneration: 10, coreState: 'unchanged' as const, configurationDurable: true };
     expect(applyReceiptState(current, result, true).coreRecovery).toEqual(original);
     expect(applyReceiptState(current, { ...result, coreState: 'committed' }, false).coreRecovery).toEqual(original);
+  });
+});
+
+
+// Core has already committed K; D, host acceptance and old native ingress disposal remain separate facts.
+describe('original native listener retirement account', () => {
+  const native = { transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    retirementState: 'UNKNOWN' as const, reason: { code: 'LISTENER_RETIREMENT_FAILED' as const, path: 'inbounds' as const } };
+  const state = (): ApplyState => ({ phase: 'idle', reason: null });
+  const result = { status: 'nativeCleanupUnknown' as const, transactionId: 'native-A', runtimeGeneration: 7,
+    selectionIntentGeneration: 9, coreState: 'committed' as const, configurationDurable: true,
+    retirementState: 'UNKNOWN', nativeRetirements: [native] };
+  const effect = { preview: { kind: 'dns' as const, scopeDigest: 'dns', beforeDigest: 'before', targetDigest: 'target' },
+    outcome: 'applied' as const, receiptId: 'accepted-host', cleanupPending: false, retryable: false, reasonCode: null };
+
+  it('keeps exact UNKNOWN visible at K/D success and empty node scope, without an applied toast or another Apply', () => {
+    const next = applyReceiptState(state(), result, true);
+    expect(next.configurationDurable).toBe(true);
+    expect(next.coreRecovery).toBeUndefined();
+    expect(next.nativeRetirements).toEqual([native]);
+    expect(applyOutcome(result.status)).toEqual({ phase: 'idle', toast: null });
+    const view = composeBarView(barInput({ nativeRetirements: next.nativeRetirements,
+      coreCommitted: true, configurationDurable: true }));
+    expect(view).toMatchObject({ visible: true, err: true, titleKey: 'home.pendingNativeCleanupUnknown',
+      detailKey: 'home.pendingNativeCleanupDetail', accountDetailKeys: ['home.pendingNativeSavedActive'] });
+    expect(view.actions).toEqual([{ id: 'checkNative', disabled: false }]);
+    expect(view.actions.map(action => action.id)).not.toContain('dismissApply');
+    expect(ids({ nativeRetirements: [native], configurationPending: true })).toEqual(['apply', 'checkNative']);
+    expect(ids({ nativeRetirements: [native], stagedPhase: 'staged', stagedCount: 1 })).toEqual(['reset', 'save', 'apply', 'checkNative']);
+  });
+
+  it('a native-unknown classification without its complete original proof fails closed', () => {
+    expect(applyReceiptState(state(), { ...result, nativeRetirements: undefined }, true).phase).toBe('failed');
+  });
+
+  it('does not call accepted-carrier PENDING a listener close failure', () => {
+    const pending = applyReceiptState(state(), { ...result, status: 'hotApplied', retirementState: 'PENDING',
+      nativeRetirements: undefined }, true);
+    expect(pending.nativeRetirements).toBeUndefined();
+    expect(applyOutcome('hotApplied').toast?.key).toBe('home.pendingHotApplied');
+    expect(composeBarView(barInput({ nativeRetirements: pending.nativeRetirements })).visible).toBe(false);
+  });
+
+  it.each([
+    { retirementState: 'PENDING' }, { retirementState: 'DRAINED' },
+    { reason: { code: 'LISTENER_RETIREMENT_FAILED', path: 'private.path' } },
+    { reason: { code: 'untrusted message', path: 'inbounds' } }, { reason: undefined },
+    { transactionId: '' }, { runtimeGeneration: 0 }, { runtimeGeneration: 1.5 },
+    { selectionIntentGeneration: -1 }, { selectionIntentGeneration: Number.MAX_SAFE_INTEGER + 1 },
+  ])('requires the complete fixed attributed native proof: %j', change => {
+    expect(nativeRetirementDebts([{ ...native, ...change }] as unknown as typeof result.nativeRetirements)).toEqual([]);
+  });
+
+  it('preserves native A through accepted HostOnly B and a later committed NoOp correction', () => {
+    const current = applyReceiptState(state(), result, true);
+    const host = applyReceiptState(current, { status: 'nativeCleanupUnknown', hostExecutionId: 'host-B',
+      runtimeGeneration: 7, selectionIntentGeneration: 10, coreState: 'unchanged', configurationDurable: true,
+      hostEffects: [effect], nativeRetirements: [native] }, true);
+    expect(host.host).toMatchObject({ executionId: 'host-B', selectionIntentGeneration: 10, phase: 'settled' });
+    expect(host.nativeRetirements).toEqual([native]);
+    const view = composeBarView(barInput({ host: host.host, nativeRetirements: host.nativeRetirements }));
+    expect(view.visible).toBe(true);
+    expect(view.accountDetailKeys).toContain('home.pendingNativeHostSettled');
+    const corrected = applyReceiptState(host, { status: 'hotApplied', transactionId: 'noop-C', runtimeGeneration: 7,
+      selectionIntentGeneration: 11, coreState: 'committed', configurationDurable: true, nativeRetirements: [] }, true);
+    expect(corrected.transactionId).toBe('noop-C');
+    expect(corrected.nativeRetirements).toEqual([native]);
+    expect(dismissApplyState(corrected).nativeRetirements).toEqual([native]);
+  });
+
+  it('retains native A when original persistence finishes or obsolete desired recovery exits', () => {
+    const current = applyReceiptState(state(), { ...result, configurationDurable: false }, true);
+    expect(current.coreRecovery?.transactionId).toBe('native-A');
+    const durable = applyReceiptState(current, { ...result, nativeRetirements: undefined });
+    expect(durable.coreRecovery).toBeUndefined();
+    expect(durable.nativeRetirements).toEqual([native]);
+    const exited = dismissApplyState({ ...current, phase: 'failed', persistenceRecoveryEnded: true });
+    expect(exited.nativeRetirements).toEqual([native]);
+    const view = composeBarView(barInput({ nativeRetirements: current.nativeRetirements,
+      configurationDurable: false, persistenceRetryAvailable: true }));
+    expect(view.accountDetailKeys).toContain('home.pendingNativeSaveUnconfirmed');
+    expect(view.accountDetailKeys).not.toContain('home.pendingNativeSavedActive');
+    expect(view.actions.map(action => action.id)).toEqual(['retryPersistence', 'checkNative']);
+  });
+
+  it('merges different original owners and ignores absent/empty or pseudo-DRAINED evidence', () => {
+    const another = { ...native, transactionId: 'native-B', selectionIntentGeneration: 10 };
+    const current = mergeNativeRetirements(state(), [native, another]);
+    expect(mergeNativeRetirements(current, [native]).nativeRetirements).toEqual([native, another]);
+    for (const nativeRetirements of [undefined, [], [{ ...native, retirementState: 'DRAINED' }]]) {
+      const next = applyReceiptState(current, { ...result, retirementState: 'DRAINED',
+        nativeRetirements: nativeRetirements as typeof result.nativeRetirements });
+      expect(next.nativeRetirements).toEqual([native, another]);
+    }
+    const raced = preserveNativeRetirements(current, { ...state(), nativeRetirements: [{ ...another, transactionId: 'native-C' }] });
+    expect(raced.nativeRetirements?.map(debt => debt.transactionId)).toEqual(['native-A', 'native-B', 'native-C']);
+  });
+
+  it('requires real terminal lifecycle completion and a matching fresh status, never just a larger generation', () => {
+    const current = mergeNativeRetirements(state(), [native]);
+    const event = { kind: 'stop' as const, terminal: true, phase: 'stopped' as const, mainGeneration: 8 };
+    for (const frame of [
+      { ...event, terminal: false }, { ...event, kind: 'restart' as const },
+      { ...event, phase: 'failed' as const }, { ...event, kind: 'unknown' as const },
+      { ...event, mainGeneration: Number.NaN },
+    ]) expect(nativeRetirementsAfterLifecycle(current, frame, { running: false, mainGeneration: 8 })).toBe(current);
+    expect(nativeRetirementsAfterLifecycle(current, event, undefined)).toBe(current);
+    expect(nativeRetirementsAfterLifecycle(current, event, { running: true, mainGeneration: 8 })).toBe(current);
+    expect(nativeRetirementsAfterLifecycle(current, event, { running: false, mainGeneration: 9 })).toBe(current);
+    const failedRestart = { kind: 'restart' as const, terminal: true, phase: 'failed' as const, mainGeneration: 9 };
+    expect(nativeRetirementsAfterLifecycle(current, failedRestart, { running: true, mainGeneration: 9 })).toBe(current);
+    const stopped = nativeRetirementsAfterLifecycle(current, event, { running: false, mainGeneration: 8 });
+    expect(stopped.nativeRetirements).toEqual([]);
+    expect(stopped.nativeEndedBeforeGeneration).toBe(8);
+    expect(mergeNativeRetirements(stopped, [native]).nativeRetirements).toEqual([]);
+  });
+
+  it('keeps successor B debt when a late original stop A arrives, and clears only a completed replacement', () => {
+    const successor = { ...native, transactionId: 'native-B', runtimeGeneration: 9, selectionIntentGeneration: 10 };
+    const current = mergeNativeRetirements(state(), [native, successor]);
+    const late = { kind: 'stop' as const, terminal: true, phase: 'stopped' as const, mainGeneration: 8 };
+    expect(nativeRetirementsAfterLifecycle(current, late, { running: true, mainGeneration: 9 })).toBe(current);
+    const priorEnded = nativeRetirementsAfterLifecycle(current, late, { running: false, mainGeneration: 8 });
+    expect(priorEnded.nativeRetirements).toEqual([successor]);
+    const ready = { kind: 'start' as const, terminal: true, phase: 'ready' as const, mainGeneration: 10 };
+    expect(nativeRetirementsAfterLifecycle(current, ready, { running: true, mainGeneration: 10 }).nativeRetirements).toEqual([]);
   });
 });

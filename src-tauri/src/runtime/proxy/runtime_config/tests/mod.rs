@@ -1820,3 +1820,1213 @@ fn blocked_noop_publication_preserves_original_kernel_persistence_owner() {
         );
     }
 }
+
+// R13: exercise the real K/D settlement and original native retirement observer.
+// These are synthetic authenticated RPC receipts, not native Close evidence.
+fn listener_retirement_receipt(
+    pending: &PendingOperation,
+    retirement: &str,
+) -> daemon::RuntimeConfigOperation {
+    let mut operation = committed_ts_receipt(pending);
+    operation.persistence_mode = "exact_configuration_file".into();
+    operation.retirement_state = retirement.into();
+    if retirement == "UNKNOWN" {
+        operation.errors.push(daemon::RuntimePlanError {
+            code: "LISTENER_RETIREMENT_FAILED".into(),
+            effective_path: "inbounds".into(),
+            ..Default::default()
+        });
+    }
+    operation
+}
+
+fn native_retirement_status(
+    operation: daemon::RuntimeConfigOperation,
+) -> daemon::RuntimeConfigStatus {
+    daemon::RuntimeConfigStatus {
+        contract_version: 1,
+        active: operation.active.clone(),
+        lookup_state: daemon::RuntimeLookupState::Found as i32,
+        control_revision: operation.control_revision,
+        operation: Some(operation),
+        ..Default::default()
+    }
+}
+
+fn assert_original_native_debt(result: &RuntimeApplyResult, pending: &PendingOperation) {
+    assert!(!result.ok);
+    assert!(result.pending_apply);
+    let wire = serde_json::to_value(result).unwrap();
+    assert_eq!(
+        wire["nativeRetirements"],
+        json!([{
+            "transactionId": pending.plan.transaction_id,
+            "runtimeGeneration": pending.generation,
+            "selectionIntentGeneration": pending.intent,
+            "retirementState": "UNKNOWN",
+            "reason": {"code": "LISTENER_RETIREMENT_FAILED", "path": "inbounds"}
+        }])
+    );
+}
+
+#[test]
+fn cached_kernel_receipt_retains_native_unknown_without_undoing_durable_commit() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut state = RuntimeConfigApplyState::default();
+    state.kernel = Some(RuntimeKernelReceipt {
+        generation: pending.generation,
+        intent: pending.intent,
+        superseded: false,
+        operation: listener_retirement_receipt(&pending, "UNKNOWN"),
+    });
+    let result = state
+        .core_receipt_for(&pending.plan.transaction_id, pending.generation)
+        .unwrap();
+    assert_original_native_debt(&result, &pending);
+    assert_eq!(result.status, "nativeCleanupUnknown");
+    assert_eq!(result.core_state, Some("committed"));
+    assert_eq!(result.configuration_durable, Some(true));
+    assert_eq!(
+        result.transaction_id.as_deref(),
+        Some(pending.plan.transaction_id.as_str())
+    );
+    assert_eq!(result.selection_intent_generation, Some(pending.intent));
+    assert_eq!(result.retirement_state.as_deref(), Some("UNKNOWN"));
+    assert_eq!(
+        result.persistence_mode.as_deref(),
+        Some("exact_configuration_file")
+    );
+}
+
+#[tokio::test]
+async fn real_settlement_preserves_native_unknown_with_empty_scope_and_no_host_work() {
+    let (runtime, _dir, calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    assert!(pending.deletion_scope.is_empty());
+    assert!(pending.host_plan.is_none());
+    *runtime.startup_snapshot.write().unwrap() = Some(pending.desired.clone());
+    runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+    let result = runtime
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+    let result = runtime.remember_runtime_result(result);
+    assert_original_native_debt(&result, &pending);
+    assert!(
+        !runtime.restart_deferred.load(Ordering::SeqCst),
+        "native cleanup alone is not an unapplied desired-state change"
+    );
+    assert_eq!(result.status, "nativeCleanupUnknown");
+    assert_eq!(result.core_state, Some("committed"));
+    assert_eq!(result.configuration_durable, Some(true));
+    assert_eq!(
+        runtime.current_config_snapshot(),
+        Some(pending.candidate.clone())
+    );
+    assert!(result.host_effects.is_empty());
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    assert!(
+        state.pending.is_none(),
+        "native cleanup does not invent a D persistence debt"
+    );
+    assert!(!state.host.has_in_flight());
+    assert_eq!(state.native_retirements.len(), 1);
+    assert_original_native_debt(
+        &state
+            .core_receipt_for(&pending.plan.transaction_id, pending.generation)
+            .unwrap(),
+        &pending,
+    );
+    drop(state);
+    let summary = runtime.pending_changes();
+    assert!(summary.added.is_empty() && summary.modified.is_empty() && summary.removed.is_empty());
+    assert!(summary.pending_apply);
+    assert_eq!(
+        serde_json::to_value(summary).unwrap()["nativeRetirements"],
+        serde_json::to_value(result).unwrap()["nativeRetirements"]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn accepted_carrier_pending_remains_success_and_durability_keeps_its_own_truth() {
+    for retirement in ["PENDING", "DRAINING"] {
+        for durable in [true, false] {
+            let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+            let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+            pending.published = true;
+            let mut operation = listener_retirement_receipt(&pending, retirement);
+            operation.durable = durable;
+            if !durable {
+                operation.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+            }
+            let result = runtime.settle_runtime_operation(&pending, operation);
+            assert_eq!(
+                result.status,
+                if durable {
+                    "hotApplied"
+                } else {
+                    "hotDurabilityPending"
+                }
+            );
+            assert!(result.ok);
+            assert_eq!(result.core_state, Some("committed"));
+            assert_eq!(result.configuration_durable, Some(durable));
+            assert_eq!(result.retirement_state.as_deref(), Some(retirement));
+            assert!(serde_json::to_value(result)
+                .unwrap()
+                .get("nativeRetirements")
+                .is_none_or(|v| v.as_array().unwrap().is_empty()));
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            assert_eq!(state.pending.is_some(), !durable);
+            assert_eq!(
+                state.native_retirements.len(),
+                1,
+                "empty deletion scope still retains the original observer"
+            );
+        }
+    }
+}
+
+#[test]
+fn original_retirement_refresh_rejects_each_mismatched_receipt_axis() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let original_operation = listener_retirement_receipt(&pending, "PENDING");
+    for change in 0..20 {
+        let mut state = RuntimeConfigApplyState::default();
+        assert!(state.observe_native_retirement(&pending, &original_operation));
+        let original = state.native_retirements[&pending.plan.transaction_id].clone();
+        let mut status = native_retirement_status(listener_retirement_receipt(&pending, "UNKNOWN"));
+        match change {
+            0 => status.contract_version = 2,
+            1 => status.lookup_state = daemon::RuntimeLookupState::UnknownOrExpired as i32,
+            2 => status.operation = None,
+            3 => status.active.as_mut().unwrap().incarnation = "replacement".into(),
+            _ => {
+                let operation = status.operation.as_mut().unwrap();
+                match change {
+                    4 => operation.contract_version = 2,
+                    5 => operation.transaction_id = "host-B-or-new-D".into(),
+                    6 => operation.candidate_digest = "other-candidate".into(),
+                    7 => operation.impact_digest = "other-impact".into(),
+                    8 => operation.before.as_mut().unwrap().incarnation = "other-before".into(),
+                    9 => operation.before.as_mut().unwrap().applied_revision += 1,
+                    10 => {
+                        operation.before.as_mut().unwrap().effective_digest = "other-before".into()
+                    }
+                    11 => operation.before = None,
+                    12 => operation.active.as_mut().unwrap().incarnation = "other-active".into(),
+                    13 => operation.active.as_mut().unwrap().applied_revision += 1,
+                    14 => {
+                        operation.active.as_mut().unwrap().effective_digest = "other-active".into()
+                    }
+                    15 => operation.active = None,
+                    16 => operation.control_revision += 1,
+                    17 => operation.state = daemon::RuntimeOperationState::RejectedUnapplied as i32,
+                    18 => operation.durable = false,
+                    _ => operation.retirement_state = "FUTURE_STATE".into(),
+                }
+            }
+        }
+        assert!(
+            state
+                .refresh_native_retirement(&original, &status)
+                .is_none(),
+            "axis {change}"
+        );
+        assert_eq!(
+            state.native_retirements[&pending.plan.transaction_id]
+                .receipt
+                .operation
+                .retirement_state,
+            "PENDING",
+            "axis {change}"
+        );
+    }
+    for change in 0..3 {
+        let mut state = RuntimeConfigApplyState::default();
+        state.observe_native_retirement(&pending, &original_operation);
+        let mut borrowed = state.native_retirements[&pending.plan.transaction_id].clone();
+        match change {
+            0 => borrowed.receipt.generation += 1,
+            1 => borrowed.receipt.intent += 1,
+            _ => borrowed.pairing.implementation_manifest_digest = "b".repeat(64),
+        }
+        assert!(state
+            .refresh_native_retirement(
+                &borrowed,
+                &native_retirement_status(listener_retirement_receipt(&pending, "UNKNOWN"))
+            )
+            .is_none());
+    }
+}
+
+#[test]
+fn original_refresh_keeps_first_unknown_and_does_not_borrow_successor_kernel_owner() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut state = RuntimeConfigApplyState::default();
+    state.observe_native_retirement(&pending, &listener_retirement_receipt(&pending, "PENDING"));
+    let original = state.native_retirements[&pending.plan.transaction_id].clone();
+    let mut successor = listener_retirement_receipt(&pending, "DRAINED");
+    successor.transaction_id = "later-core-owner".into();
+    successor.active.as_mut().unwrap().applied_revision += 1;
+    state.kernel = Some(RuntimeKernelReceipt {
+        generation: pending.generation,
+        intent: pending.intent + 1,
+        superseded: false,
+        operation: successor.clone(),
+    });
+    let mut status = native_retirement_status(listener_retirement_receipt(&pending, "UNKNOWN"));
+    status.active = successor.active.clone();
+    let result = state.refresh_native_retirement(&original, &status).unwrap();
+    assert_original_native_debt(&result, &pending);
+    assert_eq!(state.kernel.as_ref().unwrap().operation, successor);
+    let first = state.native_retirements[&pending.plan.transaction_id]
+        .receipt
+        .operation
+        .clone();
+    for retirement in ["DRAINED", "PENDING", "UNKNOWN"] {
+        let mut status =
+            native_retirement_status(listener_retirement_receipt(&pending, retirement));
+        status.operation.as_mut().unwrap().errors.clear();
+        assert_original_native_debt(
+            &state.refresh_native_retirement(&original, &status).unwrap(),
+            &pending,
+        );
+        assert_eq!(
+            state.native_retirements[&pending.plan.transaction_id]
+                .receipt
+                .operation,
+            first
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_verified_commit_still_observes_native_failure_without_publishing_over_new_intent() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let newer = json!({"newerRunningOwner": true});
+    *runtime.current_config.write().unwrap() = Some(newer.clone());
+    runtime.selector_reconcile.register_intent();
+    let result = runtime
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+    assert_eq!(runtime.current_config_snapshot(), Some(newer));
+    let remembered = runtime.remember_runtime_result(result);
+    assert_original_native_debt(&remembered, &pending);
+    assert_eq!(remembered.status, "conflict");
+    assert_eq!(
+        runtime
+            .runtime_config_apply
+            .lock()
+            .unwrap()
+            .native_retirements[&pending.plan.transaction_id]
+            .receipt
+            .intent,
+        pending.intent
+    );
+}
+
+#[tokio::test]
+async fn native_unknown_survives_same_generation_baseline_recapture_until_teardown() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    pending.published = true;
+    *runtime.startup_snapshot.write().unwrap() = Some(pending.desired.clone());
+    runtime.settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+    runtime.capture_runtime_config_baseline(
+        pending.generation,
+        pending.deps.clone(),
+        pending.generated.clone(),
+        pending.typed.clone(),
+        pending.pairing.clone(),
+    );
+    assert!(runtime.native_retirement_pending());
+    assert_eq!(
+        runtime
+            .runtime_config_apply
+            .lock()
+            .unwrap()
+            .native_retirements
+            .len(),
+        1
+    );
+    // Lifecycle claims/bump happen before native stop; a still-running old
+    // process has not released its FD merely because the gate value changed.
+    runtime.gate.bump_generation();
+    assert!(runtime.core_running());
+    assert!(runtime.native_retirement_pending());
+    assert!(runtime.pending_changes().pending_apply);
+    // This lifecycle fixture has no RPC peer; fail closed before connecting to
+    // the generated management port and still expose the retained native debt.
+    runtime
+        .runtime_config_baseline
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .management = None;
+    let result = runtime
+        .runtime_apply_status(pending.plan.transaction_id.clone())
+        .await;
+    assert_original_native_debt(&result, &pending);
+    let newer_generation = runtime.gate.generation();
+    runtime.capture_runtime_config_baseline(
+        newer_generation,
+        pending.deps.clone(),
+        pending.generated.clone(),
+        pending.typed.clone(),
+        pending.pairing.clone(),
+    );
+    assert!(
+        runtime.native_retirement_pending(),
+        "recapture cannot certify old native teardown"
+    );
+    assert_eq!(
+        runtime.native_retirement_debts()[0].runtime_generation,
+        pending.generation
+    );
+    // This is the production baseline teardown invoked after actual process stop;
+    // the synthetic fixture makes no claim about an OS/native stop having run.
+    runtime.clear_runtime_config_baseline();
+    assert!(!runtime.native_retirement_pending());
+    assert!(runtime
+        .runtime_config_apply
+        .lock()
+        .unwrap()
+        .native_retirements
+        .is_empty());
+    runtime.gate.bump_generation();
+    runtime.settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+    assert!(
+        runtime
+            .runtime_config_apply
+            .lock()
+            .unwrap()
+            .native_retirements
+            .is_empty(),
+        "old-generation callbacks cannot resurrect retired debt"
+    );
+}
+
+#[derive(Clone)]
+struct NativeRetirementRpcFixture {
+    capabilities: Arc<std::sync::Mutex<daemon::RuntimeCapabilities>>,
+    status: Arc<std::sync::Mutex<daemon::RuntimeConfigStatus>>,
+    requests: Arc<std::sync::Mutex<Vec<daemon::RuntimeConfigStatusRequest>>>,
+    mutations: Arc<std::sync::atomic::AtomicUsize>,
+    acknowledgement_response: Arc<std::sync::Mutex<Option<daemon::RuntimeConfigOperation>>>,
+    acknowledgements: Arc<std::sync::Mutex<Vec<daemon::RuntimePersistenceAcknowledgementRequest>>>,
+}
+
+impl NativeRetirementRpcFixture {
+    fn forbidden(&self) -> polaris_singbox_grpc::tonic::Status {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        polaris_singbox_grpc::tonic::Status::failed_precondition(
+            "native retirement observation cannot mutate Core or acknowledge persistence",
+        )
+    }
+}
+
+#[polaris_singbox_grpc::tonic::async_trait]
+impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetirementRpcFixture {
+    async fn get_runtime_capabilities(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<()>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::RuntimeCapabilities>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Ok(polaris_singbox_grpc::tonic::Response::new(
+            self.capabilities.lock().unwrap().clone(),
+        ))
+    }
+    async fn plan_runtime_config(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<daemon::PlanRuntimeConfigRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigPlan>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Err(self.forbidden())
+    }
+    async fn apply_runtime_config(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<daemon::ApplyRuntimeConfigRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigOperation>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Err(self.forbidden())
+    }
+    async fn get_runtime_config_status(
+        &self,
+        request: polaris_singbox_grpc::tonic::Request<daemon::RuntimeConfigStatusRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigStatus>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        self.requests.lock().unwrap().push(request.into_inner());
+        Ok(polaris_singbox_grpc::tonic::Response::new(
+            self.status.lock().unwrap().clone(),
+        ))
+    }
+    async fn retry_runtime_persistence(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<daemon::RuntimePersistenceRetryRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigOperation>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Err(self.forbidden())
+    }
+    async fn acknowledge_runtime_persistence(
+        &self,
+        request: polaris_singbox_grpc::tonic::Request<
+            daemon::RuntimePersistenceAcknowledgementRequest,
+        >,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::RuntimeConfigOperation>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        self.acknowledgements
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        // An explicit static response is test data. Production retains all
+        // durable-owner admission, identity construction and response checks.
+        match self.acknowledgement_response.lock().unwrap().clone() {
+            Some(response) => Ok(polaris_singbox_grpc::tonic::Response::new(response)),
+            None => Err(self.forbidden()),
+        }
+    }
+}
+
+// Reuse the existing API-handoff tests' tonic peer pattern. Only an authenticated
+// captured transport and synthetic status are supplied; no native runtime starts.
+async fn native_retirement_rpc_peer(
+    runtime: &Arc<ProxyRuntime>,
+    pending: &PendingOperation,
+    operation: daemon::RuntimeConfigOperation,
+) -> (
+    NativeRetirementRpcFixture,
+    tokio::task::JoinHandle<Result<(), polaris_singbox_grpc::tonic::transport::Error>>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut capabilities = paired_capabilities();
+    capabilities.active = operation.active.clone();
+    capabilities.control_revision = operation.control_revision;
+    let fixture = NativeRetirementRpcFixture {
+        capabilities: Arc::new(std::sync::Mutex::new(capabilities)),
+        status: Arc::new(std::sync::Mutex::new(native_retirement_status(operation))),
+        requests: Arc::default(),
+        mutations: Arc::default(),
+        acknowledgement_response: Arc::default(),
+        acknowledgements: Arc::default(),
+    };
+    let incoming = futures::stream::unfold(listener, |listener| async move {
+        let next = listener.accept().await.map(|(stream, _)| stream);
+        Some((next, listener))
+    });
+    let service = fixture.clone();
+    let server = tokio::spawn(async move {
+        polaris_singbox_grpc::tonic::transport::Server::builder()
+            .serve_with_incoming(
+                daemon::runtime_config_service_server::RuntimeConfigServiceServer::new(service),
+                incoming,
+            )
+            .await
+    });
+    runtime.capture_runtime_config_baseline(
+        pending.generation,
+        pending.deps.clone(),
+        pending.generated.clone(),
+        pending.typed.clone(),
+        pending.pairing.clone(),
+    );
+    runtime
+        .runtime_config_baseline
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .management = Some(ApiEndpoint {
+        host: "127.0.0.1".into(),
+        port,
+        secret: "native-retirement-test".into(),
+    });
+    let control = SingBoxApiClient::connect_captured(
+        Endpoint::new("127.0.0.1", port),
+        "native-retirement-test",
+    )
+    .await
+    .unwrap();
+    control.get_runtime_capabilities().await.unwrap();
+    runtime.bind_runtime_api_control(pending.generation, Arc::new(control));
+    (fixture, server)
+}
+
+#[tokio::test]
+async fn actual_status_refreshes_original_pending_without_deletion_scope_and_keeps_unknown_sticky()
+{
+    for terminal in ["UNKNOWN", "DRAINED"] {
+        let (runtime, _dir, calls) = crate::runtime::proxy::tests::test_runtime_recording();
+        let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+        pending.published = true;
+        assert!(pending.deletion_scope.is_empty() && pending.host_plan.is_none());
+        let operation = listener_retirement_receipt(&pending, "PENDING");
+        let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation.clone()).await;
+        runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+        assert_eq!(
+            runtime.settle_runtime_operation(&pending, operation).status,
+            "hotApplied"
+        );
+        assert!(runtime
+            .runtime_config_apply
+            .lock()
+            .unwrap()
+            .pending
+            .is_none());
+        *rpc.status.lock().unwrap() =
+            native_retirement_status(listener_retirement_receipt(&pending, terminal));
+        // A fresh original-owner read is still required after the selector intent
+        // and desired state move on. Neither becomes ownership of this old Close.
+        runtime.selector_reconcile.register_intent();
+        let result = runtime
+            .runtime_apply_status(pending.plan.transaction_id.clone())
+            .await;
+        assert_eq!(
+            result.transaction_id.as_deref(),
+            Some(pending.plan.transaction_id.as_str())
+        );
+        assert_eq!(result.runtime_generation, Some(pending.generation));
+        assert_eq!(result.selection_intent_generation, Some(pending.intent));
+        assert_eq!(result.core_state, Some("committed"));
+        assert_eq!(result.configuration_durable, Some(true));
+        assert_eq!(result.retirement_state.as_deref(), Some(terminal));
+        if terminal == "UNKNOWN" {
+            assert_eq!(result.status, "nativeCleanupUnknown");
+            assert_original_native_debt(&result, &pending);
+            *rpc.status.lock().unwrap() =
+                native_retirement_status(listener_retirement_receipt(&pending, "DRAINED"));
+            for _ in 0..2 {
+                assert_original_native_debt(
+                    &runtime
+                        .runtime_apply_status(pending.plan.transaction_id.clone())
+                        .await,
+                    &pending,
+                );
+            }
+        } else {
+            assert_eq!(result.status, "hotApplied");
+            assert!(result.ok);
+            assert!(!runtime.native_retirement_pending());
+        }
+        let requests = rpc.requests.lock().unwrap();
+        assert!(
+            !requests.is_empty(),
+            "cached PENDING must actually refresh over the production status RPC"
+        );
+        for request in requests.iter() {
+            assert_eq!(request.contract_version, 1);
+            assert_eq!(request.transaction_id, pending.plan.transaction_id);
+            assert_eq!(
+                request.runtime_incarnation,
+                pending.plan.expected.as_ref().unwrap().incarnation
+            );
+        }
+        drop(requests);
+        assert_eq!(
+            rpc.mutations.load(Ordering::SeqCst),
+            0,
+            "status never plans/applies/retries/ACKs"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn actual_status_rejects_replacement_pairing_but_gate_bump_keeps_original_live_owner_observable(
+) {
+    for wrong_generation in [false, true] {
+        let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+        let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+        pending.published = true;
+        let operation = listener_retirement_receipt(&pending, "PENDING");
+        let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation.clone()).await;
+        runtime.settle_runtime_operation(&pending, operation);
+        *rpc.status.lock().unwrap() =
+            native_retirement_status(listener_retirement_receipt(&pending, "UNKNOWN"));
+        if wrong_generation {
+            runtime.gate.bump_generation();
+        } else {
+            rpc.capabilities
+                .lock()
+                .unwrap()
+                .implementation_manifest_digest = "b".repeat(64);
+        }
+        let result = runtime
+            .runtime_apply_status(pending.plan.transaction_id.clone())
+            .await;
+        assert!(!result.ok);
+        if wrong_generation {
+            assert_original_native_debt(&result, &pending);
+            assert!(!rpc.requests.lock().unwrap().is_empty(), "a gate claim is not native process termination; authenticate and observe the original live owner");
+            assert_eq!(
+                runtime
+                    .runtime_config_apply
+                    .lock()
+                    .unwrap()
+                    .native_retirements[&pending.plan.transaction_id]
+                    .receipt
+                    .operation
+                    .retirement_state,
+                "UNKNOWN"
+            );
+        } else {
+            assert!(
+                rpc.requests.lock().unwrap().is_empty(),
+                "a replacement pairing cannot authenticate the original process"
+            );
+            assert_eq!(
+                runtime
+                    .runtime_config_apply
+                    .lock()
+                    .unwrap()
+                    .native_retirements[&pending.plan.transaction_id]
+                    .receipt
+                    .operation
+                    .retirement_state,
+                "PENDING"
+            );
+        }
+        assert_eq!(rpc.mutations.load(Ordering::SeqCst), 0);
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn accepted_host_only_and_late_host_callbacks_cannot_discharge_native_unknown() {
+    use host_effects::{
+        HostEffectExecution, HostEffectKind, HostEffectOutcome, HostEffectPlan, HostEffectPreview,
+        HostEffectReceipt, HostEffectResult, HostEffectStrategy,
+    };
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    pending.published = true;
+    runtime.capture_runtime_config_baseline(
+        pending.generation,
+        pending.deps.clone(),
+        pending.generated.clone(),
+        pending.typed.clone(),
+        pending.pairing.clone(),
+    );
+    let operation = listener_retirement_receipt(&pending, "UNKNOWN");
+    runtime.settle_runtime_operation(&pending, operation.clone());
+    let execution = HostEffectExecution {
+        execution_id: "accepted-host-only-B".into(),
+        transaction_id: None,
+        generation: pending.generation,
+        intent: pending.intent,
+        desired: pending.desired.clone(),
+        core_active: operation.active.clone(),
+        core_control_revision: operation.control_revision,
+        plan: HostEffectPlan {
+            effect_digest: "host-effect".into(),
+            physical_facts_digest: "host-physical".into(),
+            host_epoch: 4,
+            strategy: HostEffectStrategy::HostOnly,
+            recipe: json!({}),
+            effects: [HostEffectKind::Dns, HostEffectKind::SystemProxy]
+                .into_iter()
+                .map(|kind| HostEffectPreview {
+                    kind,
+                    scope_digest: "host-scope".into(),
+                    before_digest: "host-before".into(),
+                    target_digest: "host-target".into(),
+                })
+                .collect(),
+        },
+    };
+    let receipt = HostEffectReceipt {
+        effect_digest: execution.plan.effect_digest.clone(),
+        physical_facts_digest: execution.plan.physical_facts_digest.clone(),
+        host_epoch: execution.plan.host_epoch,
+        effects: execution
+            .plan
+            .effects
+            .iter()
+            .cloned()
+            .map(|preview| HostEffectResult {
+                preview,
+                outcome: HostEffectOutcome::Applied,
+                receipt_id: Some("owned-host-receipt".into()),
+                cleanup_pending: false,
+                retryable: false,
+                reason_code: None,
+            })
+            .collect(),
+    };
+    assert!(runtime.begin_runtime_host_execution(execution.clone(), &pending.desired));
+    runtime.record_runtime_host_effect_result(&execution, receipt.clone());
+    assert!(
+        !runtime.host_effect_pending(),
+        "host receipt is an actually accepted independent positive control"
+    );
+    let mut result = RuntimeApplyResult::status("hostEffectsFailed");
+    result.core_state = Some("unchanged");
+    result.configuration_durable = Some(true);
+    result.runtime_generation = Some(pending.generation);
+    result.selection_intent_generation = Some(pending.intent);
+    result.host_execution_id = Some(execution.execution_id.clone());
+    let result = runtime.remember_runtime_result(result);
+    assert_original_native_debt(&result, &pending);
+    assert_eq!(result.configuration_durable, Some(true));
+    assert_eq!(result.host_effects.len(), 2);
+    let mut next = pending.clone();
+    next.plan.transaction_id = "later-noop-plan".into();
+    next.plan.no_op = true;
+    next.plan.expected = operation.active.clone();
+    next.plan.candidate_digest = operation.active.as_ref().unwrap().effective_digest.clone();
+    next.plan.expected_control_revision = operation.control_revision;
+    let mut noop = operation.clone();
+    noop.transaction_id = next.plan.transaction_id.clone();
+    noop.before = next.plan.expected.clone();
+    noop.active = next.plan.expected.clone();
+    noop.retirement_state = "DRAINED".into();
+    noop.errors.clear();
+    let noop_result = runtime.settle_runtime_operation(&next, noop);
+    assert_original_native_debt(&noop_result, &pending);
+    assert_eq!(noop_result.status, "nativeCleanupUnknown");
+    assert_eq!(
+        runtime
+            .runtime_config_apply
+            .lock()
+            .unwrap()
+            .kernel
+            .as_ref()
+            .unwrap()
+            .operation
+            .transaction_id,
+        "later-noop-plan"
+    );
+    assert_eq!(noop_result.core_state, Some("committed"));
+    assert_eq!(noop_result.configuration_durable, Some(true));
+    runtime.selector_reconcile.register_intent();
+    let mut late = execution.clone();
+    late.execution_id = "late-unregistered-host".into();
+    runtime.record_runtime_host_effect_result(&late, receipt);
+    let mut later = RuntimeApplyResult::status("hotApplied");
+    later.core_state = Some("unchanged");
+    later.configuration_durable = Some(true);
+    later.runtime_generation = Some(pending.generation);
+    later.selection_intent_generation = Some(runtime.selector_reconcile.intent_generation());
+    let later = runtime.remember_runtime_result(later);
+    assert_original_native_debt(&later, &pending);
+    assert_eq!(
+        later.selection_intent_generation,
+        Some(runtime.selector_reconcile.intent_generation()),
+        "native debt retains its own original intent without relabeling the current result"
+    );
+}
+
+#[test]
+fn native_failure_requires_exact_unknown_listener_code_and_inbounds_path() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    for change in 0..4 {
+        let mut operation = listener_retirement_receipt(&pending, "UNKNOWN");
+        match change {
+            0 => operation.retirement_state = "PENDING".into(),
+            1 => operation.errors.clear(),
+            2 => operation.errors[0].code = "OTHER_RETIREMENT_FAILURE".into(),
+            _ => operation.errors[0].effective_path = "outbounds".into(),
+        }
+        let receipt = RuntimeKernelReceipt {
+            generation: pending.generation,
+            intent: pending.intent,
+            superseded: false,
+            operation,
+        };
+        let result = receipt.result();
+        assert_eq!(result.status, "hotApplied", "proof axis {change}");
+        assert!(result.ok);
+        assert!(result.native_retirements.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn superseded_regeneration_owner_still_retains_original_native_failure() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let saved = runtime.config.current().unwrap();
+    runtime.config.save_full(&saved).unwrap();
+    let mut obsolete = saved.clone();
+    obsolete["logLevel"] = json!("debug");
+    let mut pending = ts_pending_raw_fixture(&runtime, obsolete);
+    pending.published = true;
+    let mut operation = listener_retirement_receipt(&pending, "UNKNOWN");
+    operation.durable = false;
+    operation.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+    operation.persistence_mode = "app_authoritative_regeneration".into();
+    operation.owner_reload_acknowledged = true;
+    assert!(runtime.regeneration_owner_superseded(&pending, &operation));
+    let result = runtime.settle_runtime_operation(&pending, operation);
+    let result = runtime.remember_runtime_result(result);
+    assert_eq!(result.status, "conflict");
+    assert!(result
+        .reasons
+        .iter()
+        .any(|reason| reason.code == "OWNER_STATE_SUPERSEDED"));
+    assert_original_native_debt(&result, &pending);
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    assert!(state.kernel.as_ref().unwrap().superseded);
+    assert!(state.pending.is_none());
+    assert_eq!(
+        state.native_retirements[&pending.plan.transaction_id]
+            .receipt
+            .intent,
+        pending.intent
+    );
+}
+
+#[test]
+fn native_observation_capacity_preserves_unsettled_owners_and_only_reclaims_drained_slots() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    let mut state = RuntimeConfigApplyState::default();
+    for index in 0..NATIVE_RETIREMENT_OBSERVATION_LIMIT {
+        let mut owner = pending.clone();
+        owner.plan.transaction_id = format!("native-owner-{index}");
+        let operation =
+            listener_retirement_receipt(&owner, if index == 0 { "UNKNOWN" } else { "PENDING" });
+        assert!(state.observe_native_retirement(&owner, &operation));
+    }
+    assert!(!state.native_retirement_capacity_available());
+    assert_eq!(
+        state.native_retirements.len(),
+        NATIVE_RETIREMENT_OBSERVATION_LIMIT
+    );
+    assert_eq!(state.native_retirement_debts().len(), 1);
+    let first = state.native_retirements["native-owner-0"]
+        .receipt
+        .operation
+        .clone();
+    let drained = state.native_retirements["native-owner-1"].clone();
+    let mut operation = drained.receipt.operation.clone();
+    operation.retirement_state = "DRAINED".into();
+    assert!(state
+        .refresh_native_retirement(&drained, &native_retirement_status(operation))
+        .is_some());
+    assert!(state.native_retirement_capacity_available());
+    let mut next = pending.clone();
+    next.plan.transaction_id = "next-native-owner".into();
+    assert!(state.observe_native_retirement(&next, &listener_retirement_receipt(&next, "PENDING")));
+    assert_eq!(
+        state.native_retirements.len(),
+        NATIVE_RETIREMENT_OBSERVATION_LIMIT
+    );
+    assert!(!state.native_retirements.contains_key("native-owner-1"));
+    assert_eq!(
+        state.native_retirements["native-owner-0"].receipt.operation,
+        first
+    );
+}
+
+#[tokio::test]
+async fn late_same_owner_drained_settlement_cannot_launder_cached_first_unknown() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    pending.published = true;
+    let first = listener_retirement_receipt(&pending, "UNKNOWN");
+    assert_original_native_debt(
+        &runtime.settle_runtime_operation(&pending, first.clone()),
+        &pending,
+    );
+    let late = listener_retirement_receipt(&pending, "DRAINED");
+    let result = runtime.settle_runtime_operation(&pending, late);
+    assert_original_native_debt(&result, &pending);
+    assert_eq!(result.core_state, Some("committed"));
+    assert_eq!(result.configuration_durable, Some(true));
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    assert_eq!(
+        state.native_retirements[&pending.plan.transaction_id]
+            .receipt
+            .operation,
+        first
+    );
+    let cached = state
+        .core_receipt_for(&pending.plan.transaction_id, pending.generation)
+        .unwrap();
+    assert_original_native_debt(&cached, &pending);
+    assert_eq!(cached.status, "nativeCleanupUnknown");
+    assert_eq!(cached.core_state, Some("committed"));
+    assert_eq!(cached.configuration_durable, Some(true));
+}
+
+#[tokio::test]
+async fn verified_later_durability_updates_d_without_discharging_first_native_unknown() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut pending = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    pending.published = true;
+    let mut first = listener_retirement_receipt(&pending, "UNKNOWN");
+    first.durable = false;
+    first.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+    let result = runtime.settle_runtime_operation(&pending, first.clone());
+    assert_original_native_debt(&result, &pending);
+    assert_eq!(result.configuration_durable, Some(false));
+    assert!(runtime
+        .runtime_config_apply
+        .lock()
+        .unwrap()
+        .pending
+        .is_some());
+    let result = runtime
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "DRAINED"));
+    assert_original_native_debt(&result, &pending);
+    assert_eq!(result.configuration_durable, Some(true));
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    assert!(state.pending.is_none());
+    let original = &state.native_retirements[&pending.plan.transaction_id].receipt;
+    assert_eq!(original.intent, pending.intent);
+    assert_eq!(original.generation, pending.generation);
+    assert!(original.operation.durable);
+    assert_eq!(
+        original.operation.state,
+        daemon::RuntimeOperationState::Committed as i32
+    );
+    assert_eq!(original.operation.retirement_state, "UNKNOWN");
+    assert_eq!(original.operation.errors, first.errors);
+    let cached = state
+        .core_receipt_for(&pending.plan.transaction_id, pending.generation)
+        .unwrap();
+    assert_original_native_debt(&cached, &pending);
+    assert_eq!(cached.configuration_durable, Some(true));
+}
+
+#[tokio::test]
+async fn successor_saved_desired_and_committed_kernel_keep_the_original_native_owner() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut original = ts_pending_raw_fixture(&runtime, polaris_store::default_config());
+    original.published = true;
+    let first = listener_retirement_receipt(&original, "UNKNOWN");
+    runtime.settle_runtime_operation(&original, first.clone());
+    let mut desired = original.desired.clone();
+    desired["logLevel"] = json!("debug");
+    runtime.config.save_full(&desired).unwrap();
+    runtime.selector_reconcile.register_intent();
+    let mut successor = ts_pending_raw_fixture(&runtime, runtime.config.current().unwrap());
+    successor.published = true;
+    successor.plan.transaction_id = "successor-durable-core-owner".into();
+    successor.plan.expected = first.active.clone();
+    successor.plan.expected_control_revision = first.control_revision;
+    let result = runtime.settle_runtime_operation(
+        &successor,
+        listener_retirement_receipt(&successor, "DRAINED"),
+    );
+    let result = runtime.remember_runtime_result(result);
+    assert_original_native_debt(&result, &original);
+    assert_eq!(result.core_state, Some("committed"));
+    assert_eq!(result.configuration_durable, Some(true));
+    assert_eq!(runtime.config.current().unwrap(), successor.desired);
+    let state = runtime.runtime_config_apply.lock().unwrap();
+    assert_eq!(
+        state.kernel.as_ref().unwrap().operation.transaction_id,
+        successor.plan.transaction_id
+    );
+    let cached = state
+        .core_receipt_for(&successor.plan.transaction_id, successor.generation)
+        .unwrap();
+    assert_original_native_debt(&cached, &original);
+    assert_eq!(
+        cached.transaction_id.as_deref(),
+        Some(successor.plan.transaction_id.as_str())
+    );
+    assert_eq!(cached.selection_intent_generation, Some(successor.intent));
+    assert_ne!(cached.selection_intent_generation, Some(original.intent));
+    assert_eq!(
+        state.native_retirements[&original.plan.transaction_id]
+            .receipt
+            .operation,
+        first
+    );
+}
+
+#[tokio::test]
+async fn native_unknown_status_with_independent_d_pending_never_acknowledges_persistence() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let mut pending = ts_pending_raw_fixture(&runtime, runtime.config.current().unwrap());
+    pending.published = true;
+    let mut operation = listener_retirement_receipt(&pending, "UNKNOWN");
+    operation.durable = false;
+    operation.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+    operation.persistence_mode = "app_authoritative_regeneration".into();
+    operation.owner_reload_acknowledged = true;
+    let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation.clone()).await;
+    runtime.settle_runtime_operation(&pending, operation);
+    assert!(runtime
+        .runtime_config_apply
+        .lock()
+        .unwrap()
+        .pending
+        .is_some());
+    let result = runtime
+        .runtime_native_retirement_status(pending.plan.transaction_id.clone())
+        .await;
+    assert_original_native_debt(&result, &pending);
+    assert_eq!(result.configuration_durable, Some(false));
+    assert_eq!(result.selection_intent_generation, Some(pending.intent));
+    assert!(runtime
+        .runtime_config_apply
+        .lock()
+        .unwrap()
+        .pending
+        .is_some());
+    assert!(
+        rpc.requests.lock().unwrap().is_empty(),
+        "first UNKNOWN requires no further Close/status attempt"
+    );
+    assert!(rpc.acknowledgements.lock().unwrap().is_empty());
+    assert_eq!(
+        rpc.mutations.load(Ordering::SeqCst),
+        0,
+        "checking native cleanup cannot retry or ACK the separate D debt"
+    );
+    assert!(matches!(
+        ProxyRuntime::runtime_result_outcome(&result),
+        SwitchOutcome::Pending
+    ));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn generic_original_d_status_acknowledges_only_its_full_saved_owner_and_keeps_native_unknown()
+{
+    for superseding_desired in [false, true] {
+        let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+        let saved = runtime.config.current().unwrap();
+        runtime.config.save_full(&saved).unwrap();
+        let saved = runtime.config.current().unwrap();
+        let mut pending = ts_pending_raw_fixture(&runtime, saved.clone());
+        pending.published = true;
+        let mut not_ready = listener_retirement_receipt(&pending, "UNKNOWN");
+        not_ready.durable = false;
+        not_ready.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+        not_ready.persistence_mode = "app_authoritative_regeneration".into();
+        not_ready.owner_reload_acknowledged = false;
+        let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, not_ready.clone()).await;
+        runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
+        // Reach the actual generic status -> original owner acknowledgement
+        // helper -> settlement before provider readiness, rather than seeding
+        // the native account through a separate test state machine.
+        let initial = runtime
+            .runtime_apply_status(pending.plan.transaction_id.clone())
+            .await;
+        assert_original_native_debt(&initial, &pending);
+        assert_eq!(initial.configuration_durable, Some(false));
+        assert!(runtime
+            .runtime_config_apply
+            .lock()
+            .unwrap()
+            .pending
+            .is_some());
+        assert!(rpc.acknowledgements.lock().unwrap().is_empty());
+        assert!(!rpc.requests.lock().unwrap().is_empty());
+        let owner_runtime = Arc::clone(&runtime);
+        let owner_desired = saved.clone();
+        let (digest, revision) = tokio::task::spawn_blocking(move || {
+            owner_runtime
+                .config
+                .with_durable_runtime_owner(&owner_desired, |digest, revision| (digest, revision))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let mut ready = not_ready.clone();
+        ready.owner_reload_acknowledged = true;
+        *rpc.status.lock().unwrap() = native_retirement_status(ready.clone());
+        let mut acknowledged = ready.clone();
+        acknowledged.durable = true;
+        acknowledged.state = daemon::RuntimeOperationState::Committed as i32;
+        acknowledged.desired_state_digest = digest.clone();
+        acknowledged.desired_state_revision = revision.clone();
+        *rpc.acknowledgement_response.lock().unwrap() = Some(acknowledged);
+        if superseding_desired {
+            let mut newer = saved.clone();
+            newer["logLevel"] = json!("debug");
+            runtime.config.save_full(&newer).unwrap();
+            assert_ne!(runtime.config.current().unwrap(), saved);
+        }
+        let completed = runtime
+            .runtime_apply_status(pending.plan.transaction_id.clone())
+            .await;
+        assert_original_native_debt(&completed, &pending);
+        assert_eq!(
+            completed.transaction_id.as_deref(),
+            Some(pending.plan.transaction_id.as_str())
+        );
+        assert_eq!(completed.runtime_generation, Some(pending.generation));
+        assert_eq!(completed.selection_intent_generation, Some(pending.intent));
+        assert_eq!(completed.core_state, Some("committed"));
+        let acknowledgements = rpc.acknowledgements.lock().unwrap();
+        if superseding_desired {
+            assert!(
+                acknowledgements.is_empty(),
+                "original A cannot acknowledge durability using newer saved B evidence"
+            );
+            assert_eq!(completed.configuration_durable, Some(false));
+            assert_eq!(completed.status, "conflict");
+            assert!(completed
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "OWNER_STATE_SUPERSEDED"));
+        } else {
+            assert_eq!(
+                acknowledgements.len(),
+                1,
+                "generic original D status must retain its automatic original-owner ACK"
+            );
+            let request = &acknowledgements[0];
+            assert_eq!(request.contract_version, 1);
+            assert_eq!(request.transaction_id, pending.plan.transaction_id);
+            assert_eq!(request.active, ready.active);
+            assert_eq!(request.control_revision, ready.control_revision);
+            assert_eq!(request.persistence_mode, "app_authoritative_regeneration");
+            assert_eq!(request.desired_state_digest, digest);
+            assert_eq!(request.desired_state_revision, revision);
+            assert_eq!(completed.configuration_durable, Some(true));
+            assert_eq!(completed.status, "nativeCleanupUnknown");
+            assert!(runtime
+                .runtime_config_apply
+                .lock()
+                .unwrap()
+                .pending
+                .is_none());
+            let state = runtime.runtime_config_apply.lock().unwrap();
+            let original = &state.native_retirements[&pending.plan.transaction_id].receipt;
+            assert!(original.operation.durable);
+            assert_eq!(original.operation.retirement_state, "UNKNOWN");
+            assert_eq!(original.operation.errors, not_ready.errors);
+        }
+        drop(acknowledgements);
+        assert_eq!(
+            rpc.mutations.load(Ordering::SeqCst),
+            0,
+            "status recovery must never Plan/Apply/retry or send an unconfigured ACK"
+        );
+        for request in rpc.requests.lock().unwrap().iter() {
+            assert_eq!(request.transaction_id, pending.plan.transaction_id);
+            assert_eq!(
+                request.runtime_incarnation,
+                pending.plan.expected.as_ref().unwrap().incarnation
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}

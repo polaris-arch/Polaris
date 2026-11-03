@@ -15,12 +15,14 @@ import type {
   IpInfoSnapshot,
   InvalidNodeInfo,
   PendingNodeChanges,
+  ProxyLifecycleEvent,
   ServerConfig,
 } from '../contracts/types';
 import type { UnlockResult, UnlockEgress, UnlockSnapshot } from '../contracts/unlock-detection';
 import type { TailscaleStatusEvent } from '../contracts/tailscale-status';
 import type { ServerSwitchReceipt } from '../contracts/server-switch';
 import { api } from '../ipc';
+import { mergeNativeRetirementDebts, nativeRetirementEndGeneration } from '../domain/native-retirement';
 import { withConfigWriteLock } from '../lib/config-write-lock';
 import { configReadGeneration } from '../lib/config-read-generation';
 import { replay, type StagedEntry } from '../lib/staged-config';
@@ -65,6 +67,7 @@ export interface PendingChangesState {
   removed: string[];
   /** 「保存只持久化」延后的非节点结构性变更（三个数组看不见它，见 `PendingNodeChanges`）。 */
   restartDeferred: boolean;
+  nativeRetirements?: PendingNodeChanges['nativeRetirements'];
 }
 
 /**
@@ -84,6 +87,7 @@ export function normalizePendingChanges(
     modified: raw?.modified ?? [],
     removed: raw?.removed ?? [],
     restartDeferred: raw?.restartDeferred ?? false,
+    ...(raw?.nativeRetirements === undefined ? {} : { nativeRetirements: raw.nativeRetirements }),
   };
 }
 
@@ -420,6 +424,9 @@ export interface AppState {
   beginUnlockCheck: () => void;
   resetUnlock: () => void;
   setPendingChanges: (changes: PendingChangesState) => void;
+  nativeRetirementEndedBeforeGeneration: number;
+  /** Shared proof check; ordinary status snapshots and intent changes cannot clear native debt. */
+  confirmNativeRetirementEnd: (event: ProxyLifecycleEvent, live: Pick<ProxyStatus, 'running' | 'mainGeneration'> | null | undefined) => void;
   setInvalidNodes: (nodes: InvalidNodeInfo[]) => void;
   setPrivacyMode: (enabled: boolean) => void;
   setTailscaleLoginState: (serverId: string, loggedIn: boolean) => void;
@@ -694,7 +701,25 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   /** 复位 idle（停代理 / IPC 失败兜底）：连 lastRunAt 一并清，重连后不被陈旧冷却误锁刷新钮。 */
   resetUnlock: () => set({ unlock: freshUnlock() }),
-  setPendingChanges: (changes) => set({ pendingChanges: changes }),
+  nativeRetirementEndedBeforeGeneration: 0,
+  setPendingChanges: (changes) => set((state) => {
+    const native = mergeNativeRetirementDebts(state.pendingChanges.nativeRetirements, changes.nativeRetirements,
+      state.nativeRetirementEndedBeforeGeneration);
+    const pendingChanges = { ...changes };
+    if (native === undefined) delete pendingChanges.nativeRetirements;
+    else pendingChanges.nativeRetirements = native;
+    return { pendingChanges };
+  }),
+  confirmNativeRetirementEnd: (event, live) => {
+    const generation = nativeRetirementEndGeneration(event, live);
+    if (generation === undefined) return;
+    set((state) => {
+      const floor = Math.max(state.nativeRetirementEndedBeforeGeneration, generation);
+      const native = mergeNativeRetirementDebts(state.pendingChanges.nativeRetirements, undefined, floor);
+      return { nativeRetirementEndedBeforeGeneration: floor,
+        pendingChanges: { ...state.pendingChanges, ...(native === undefined ? {} : { nativeRetirements: native }) } };
+    });
+  },
   setInvalidNodes: (nodes) => set({ invalidNodes: nodes }),
   setPrivacyMode: (enabled) => set({ privacyMode: enabled }),
 

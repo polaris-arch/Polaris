@@ -1469,6 +1469,13 @@ impl ProxyRuntime {
     }
 
     pub(super) fn annotate_runtime_host_result(&self, result: &mut RuntimeApplyResult) {
+        self.annotate_runtime_host_result_inner(result);
+        // Native retirement has an independent original Core owner. Every host
+        // path, including no current host and accepted callbacks, retains it.
+        self.annotate_runtime_native_result(result);
+    }
+
+    fn annotate_runtime_host_result_inner(&self, result: &mut RuntimeApplyResult) {
         if result.core_state.is_none()
             && result.host_execution_id.is_none()
             && result.transaction_id.is_none()
@@ -1541,7 +1548,11 @@ impl ProxyRuntime {
             result.pending_apply = true;
             if matches!(
                 result.status,
-                "hotApplied" | "hotDurabilityPending" | "hostEffectsPending" | "hostEffectsFailed"
+                "hotApplied"
+                    | "hotDurabilityPending"
+                    | "hostEffectsPending"
+                    | "hostEffectsFailed"
+                    | "nativeCleanupUnknown"
             ) {
                 result.status = if current.in_flight {
                     "hostEffectsPending"
@@ -1602,16 +1613,16 @@ impl ProxyRuntime {
                 })
         });
         let Some(mut result) = cached else {
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         };
         if result.runtime_generation != Some(generation)
             || !self.core_running()
             || self.gate.is_busy()
         {
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         }
         if let Err(error) = self.verify_cached_runtime_pairing(generation).await {
-            return *error;
+            return self.runtime_native_result(*error);
         }
         self.annotate_runtime_host_result(&mut result);
         result
@@ -1921,6 +1932,104 @@ mod tests {
         assert_eq!(host_result.core_state, Some("unchanged"));
         assert_eq!(host_result.configuration_durable, Some(true));
     }
+    #[test]
+    fn native_listener_owner_survives_host_success_failure_and_absent_host_paths() {
+        for outcome in [
+            HostEffectOutcome::Applied,
+            HostEffectOutcome::FailedRestored,
+            HostEffectOutcome::Unknown,
+        ] {
+            let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+            let execution = execution(&runtime, "successor-host-B");
+            let generation = execution.generation;
+            let intent = execution.intent;
+            let pairing =
+                super::super::observe_runtime_pairing(&super::super::tests::paired_capabilities())
+                    .unwrap();
+            let operation = daemon::RuntimeConfigOperation {
+                transaction_id: "original-native-A".into(),
+                state: daemon::RuntimeOperationState::Committed as i32,
+                durable: true,
+                retirement_state: "UNKNOWN".into(),
+                errors: vec![daemon::RuntimePlanError {
+                    code: "LISTENER_RETIREMENT_FAILED".into(),
+                    effective_path: "inbounds".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            runtime
+                .runtime_config_apply
+                .lock()
+                .unwrap()
+                .native_retirements
+                .insert(
+                    operation.transaction_id.clone(),
+                    super::super::NativeRetirementObservation {
+                        pairing,
+                        receipt: super::super::RuntimeKernelReceipt {
+                            generation,
+                            intent,
+                            superseded: false,
+                            operation,
+                        },
+                    },
+                );
+            // No host owner used to short-circuit annotation before the native
+            // projection could run. Preserve the successor result's own K/D.
+            let mut no_host = RuntimeApplyResult::status("hotApplied");
+            runtime.annotate_runtime_host_result(&mut no_host);
+            assert_eq!(no_host.status, "nativeCleanupUnknown");
+            assert!(!no_host.ok);
+            assert_eq!(
+                no_host.native_retirements[0].transaction_id,
+                "original-native-A"
+            );
+            assert!(no_host.transaction_id.is_none());
+            assert!(no_host.configuration_durable.is_none());
+            assert!(runtime.begin_runtime_host_execution(execution.clone(), &json!({})));
+            let mut result = RuntimeApplyResult::status("hotApplied");
+            result.core_state = Some("unchanged");
+            result.configuration_durable = Some(true);
+            result.runtime_generation = Some(generation);
+            result.selection_intent_generation = Some(intent);
+            runtime.annotate_runtime_host_result(&mut result);
+            assert_eq!(result.status, "hostEffectsPending");
+            assert!(result.pending_apply);
+            assert!(!result.ok);
+            runtime
+                .record_runtime_host_effect_result(&execution, receipt(&execution, [outcome; 2]));
+            runtime.annotate_runtime_host_result(&mut result);
+            assert_eq!(result.configuration_durable, Some(true));
+            assert!(result.transaction_id.is_none());
+            assert_eq!(
+                result.host_execution_id.as_deref(),
+                Some("successor-host-B")
+            );
+            assert_eq!(result.native_retirements.len(), 1);
+            assert_eq!(
+                result.native_retirements[0].transaction_id,
+                "original-native-A"
+            );
+            assert_eq!(result.native_retirements[0].runtime_generation, generation);
+            assert_eq!(
+                result.native_retirements[0].selection_intent_generation,
+                intent
+            );
+            assert!(result.pending_apply);
+            assert!(!result.ok);
+            assert_eq!(
+                result.status,
+                if outcome == HostEffectOutcome::Applied {
+                    "nativeCleanupUnknown"
+                } else {
+                    "hostEffectsFailed"
+                }
+            );
+            assert!(runtime.native_retirement_pending());
+        }
+    }
+
     #[derive(Default)]
     struct LedgerDnsFaults {
         fail_marker_reads: std::sync::atomic::AtomicBool,
@@ -2038,7 +2147,6 @@ mod tests {
         LedgerDnsValues,
         Arc<LedgerDnsFaults>,
     ) {
-        use sha2::Digest as _;
         let mut execution = execution(runtime, id);
         execution.desired["proxyModeType"] = json!("tun");
         let values = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([(
@@ -2060,8 +2168,7 @@ mod tests {
             ),
         );
         let prepared = controller.prepare_effect(true).unwrap();
-        let digest =
-            |value: Value| format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes()));
+        let digest = |value: Value| polaris_updater::sha256_hex(value.to_string().as_bytes());
         execution.plan.effects = vec![HostEffectPreview {
             kind: HostEffectKind::Dns,
             scope_digest: "exact-DNS-scope".into(),
@@ -2539,7 +2646,6 @@ mod tests {
 
     #[test]
     fn exact_dns_restore_projects_off_for_only_its_recipe_predecessor_not_a_successor() {
-        use sha2::Digest as _;
         for successor in [false, true] {
             let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
             let (mut execution, mut controller, prepared, values, faults) =
@@ -2551,27 +2657,20 @@ mod tests {
             let disable = controller.prepare_effect(false).unwrap();
             execution.desired["dnsConfig"]["takeoverSystemDns"] = json!(false);
             execution.plan.recipe["dns"] = serde_json::to_value(&disable).unwrap();
-            execution.plan.recipe["desired_digest"] = json!(format!(
-                "{:x}",
-                sha2::Sha256::digest(execution.desired.to_string().as_bytes())
+            execution.plan.recipe["desired_digest"] = json!(polaris_updater::sha256_hex(
+                execution.desired.to_string().as_bytes()
             ));
-            execution.plan.effects[0].before_digest = format!(
-                "{:x}",
-                sha2::Sha256::digest(
-                    serde_json::to_value(disable.before())
-                        .unwrap()
-                        .to_string()
-                        .as_bytes()
-                )
+            execution.plan.effects[0].before_digest = polaris_updater::sha256_hex(
+                serde_json::to_value(disable.before())
+                    .unwrap()
+                    .to_string()
+                    .as_bytes(),
             );
-            execution.plan.effects[0].target_digest = format!(
-                "{:x}",
-                sha2::Sha256::digest(
-                    serde_json::to_value(disable.target())
-                        .unwrap()
-                        .to_string()
-                        .as_bytes()
-                )
+            execution.plan.effects[0].target_digest = polaris_updater::sha256_hex(
+                serde_json::to_value(disable.target())
+                    .unwrap()
+                    .to_string()
+                    .as_bytes(),
             );
             *runtime.current_config.write().unwrap() = Some(execution.desired.clone());
             {

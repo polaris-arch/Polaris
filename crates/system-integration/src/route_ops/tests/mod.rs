@@ -339,10 +339,10 @@ fn verify_single_poll_grace_still_evaluates() {
     assert_eq!(sleeps.get(), 0, "单次探测无相邻间隔可等");
 }
 
+type PhysicalRouteReplies = std::collections::VecDeque<(Vec<String>, String)>;
+
 #[derive(Clone)]
-struct PhysicalRouteRunner(
-    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(Vec<String>, String)>>>,
-);
+struct PhysicalRouteRunner(std::sync::Arc<std::sync::Mutex<PhysicalRouteReplies>>);
 impl CommandRunner for PhysicalRouteRunner {
     fn run(
         &self,

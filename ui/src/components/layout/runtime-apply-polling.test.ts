@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PendingApplyResult } from '@/contracts/types';
-import { runtimeHostPollDisposition, startRuntimeExecutionPolling, runtimeApplyPollDisposition, startRuntimeApplyPolling, RUNTIME_APPLY_POLL_INTERVAL_MS } from './runtime-apply-polling';
+import { runtimeHostPollDisposition, runtimeNativePollDisposition, startRuntimeExecutionPolling, runtimeApplyPollDisposition, startRuntimeApplyPolling, RUNTIME_APPLY_POLL_INTERVAL_MS } from './runtime-apply-polling';
 
 afterEach(() => vi.useRealTimers());
 const receipt = (status: PendingApplyResult['status'], transactionId = 'original'): PendingApplyResult => ({ok:true,status,transactionId});
@@ -145,5 +145,19 @@ describe('typed independent host execution polling', () => {
     expect(coreAccept).toHaveBeenCalledExactlyOnceWith(receipt('hotApplied'));
     expect(hostAccept).toHaveBeenCalledExactlyOnceWith(hostReceipt('hostEffectsFailed'));
     stopCore(); stopHost();
+  });
+});
+
+
+describe('original native retirement status selector', () => {
+  const native = { transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+    retirementState: 'UNKNOWN' as const, reason: { code: 'LISTENER_RETIREMENT_FAILED' as const, path: 'inbounds' as const } };
+  it.each(['nativeCleanupUnknown', 'hotApplied', 'conflict', 'rejected'] as const)('requires the exact original tuple even for %s', status => {
+    const result = { ok: false, status, transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9 };
+    expect(runtimeNativePollDisposition(result, native)).toBe('owned');
+    for (const other of [
+      { transactionId: 'host-B' }, { transactionId: undefined, hostExecutionId: 'native-A' },
+      { runtimeGeneration: 8 }, { selectionIntentGeneration: 10 }, { selectionIntentGeneration: undefined },
+    ]) expect(runtimeNativePollDisposition({ ...result, ...other }, native)).toBe('ignore');
   });
 });

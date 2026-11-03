@@ -26,6 +26,10 @@ use api_handoff::{ApiChannelHandoff, ApiEndpoint, ApiRelayEpoch};
 use impact_confirmation::{PreparedImpactChoice, RuntimeImpactPreview};
 
 const CLIENT_IMPACT_POLICY_VERSION: u32 = 1;
+// Pinned Core box_runtime_plan.go runtimePlanLimit. Reserve before every Apply,
+// including a delayed impact confirmation; never evict an unobserved PENDING or
+// sticky UNKNOWN to make room for another native owner.
+const NATIVE_RETIREMENT_OBSERVATION_LIMIT: usize = 256;
 
 // The protocol is an authenticated observation of a previously byte/source-admitted
 // core. Its manifest digest is metadata, NOT a signature or substitute for that
@@ -275,11 +279,49 @@ impl RuntimeConfigBaseline {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeApplyReason {
     pub(super) code: &'static str,
     pub(super) path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeRetirementDebt {
+    pub(super) transaction_id: String,
+    pub(super) runtime_generation: u64,
+    pub(super) selection_intent_generation: u64,
+    pub(super) retirement_state: &'static str,
+    pub(super) reason: RuntimeApplyReason,
+}
+
+fn annotate_native_retirement_debts(
+    result: &mut RuntimeApplyResult,
+    debts: Vec<NativeRetirementDebt>,
+) {
+    if debts.is_empty() {
+        return;
+    }
+    result.native_retirements = debts;
+    result.pending_apply = true;
+    result.ok = false;
+    if matches!(
+        result.status,
+        "hotApplied" | "hotDurabilityPending" | "applied" | "nativeCleanupUnknown"
+    ) {
+        result.status = "nativeCleanupUnknown";
+    }
+    if !result
+        .reasons
+        .iter()
+        .any(|reason| reason.code == "LISTENER_RETIREMENT_FAILED" && reason.path == "inbounds")
+    {
+        result.reasons.push(RuntimeApplyReason {
+            code: "LISTENER_RETIREMENT_FAILED",
+            path: "inbounds".into(),
+        });
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -315,6 +357,8 @@ pub(crate) struct RuntimeApplyResult {
     pub persistence_transaction_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retirement_state: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub native_retirements: Vec<NativeRetirementDebt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_mode: Option<String>,
     pub reasons: Vec<RuntimeApplyReason>,
@@ -340,6 +384,7 @@ impl RuntimeApplyResult {
             configuration_durable: None,
             persistence_transaction_id: None,
             retirement_state: None,
+            native_retirements: vec![],
             persistence_mode: None,
             reasons: vec![],
             pending_apply: !matches!(status, "hotApplied" | "hotDurabilityPending" | "skipped"),
@@ -403,6 +448,7 @@ struct PendingOperation {
 #[derive(Default)]
 pub(super) struct RuntimeConfigApplyState {
     kernel: Option<RuntimeKernelReceipt>,
+    native_retirements: BTreeMap<String, NativeRetirementObservation>,
     host: host_effects::RuntimeHostState,
     impact: Option<PreparedImpactChoice>,
     restart: Option<RestartChoice>,
@@ -418,7 +464,35 @@ struct RuntimeKernelReceipt {
     operation: daemon::RuntimeConfigOperation,
 }
 
+// This observer owns only the original post-K native retirement. It never owns
+// durable D, host effects or a later selection intent.
+#[derive(Clone)]
+struct NativeRetirementObservation {
+    pairing: RuntimePairing,
+    receipt: RuntimeKernelReceipt,
+}
+
+fn listener_retirement_failed(operation: &daemon::RuntimeConfigOperation) -> bool {
+    operation.retirement_state == "UNKNOWN"
+        && operation.errors.iter().any(|error| {
+            error.code == "LISTENER_RETIREMENT_FAILED" && error.effective_path == "inbounds"
+        })
+}
+
 impl RuntimeKernelReceipt {
+    fn native_retirement_debt(&self) -> Option<NativeRetirementDebt> {
+        listener_retirement_failed(&self.operation).then(|| NativeRetirementDebt {
+            transaction_id: self.operation.transaction_id.clone(),
+            runtime_generation: self.generation,
+            selection_intent_generation: self.intent,
+            retirement_state: "UNKNOWN",
+            reason: RuntimeApplyReason {
+                code: "LISTENER_RETIREMENT_FAILED",
+                path: "inbounds".into(),
+            },
+        })
+    }
+
     fn result(&self) -> RuntimeApplyResult {
         let durable = self.operation.durable
             && self.operation.state == daemon::RuntimeOperationState::Committed as i32;
@@ -442,13 +516,189 @@ impl RuntimeKernelReceipt {
                 path: "desired".into(),
             });
         }
+        annotate_native_retirement_debts(
+            &mut result,
+            self.native_retirement_debt().into_iter().collect(),
+        );
         result
     }
 }
 
 impl RuntimeConfigApplyState {
+    fn native_retirement_debts(&self) -> Vec<NativeRetirementDebt> {
+        self.native_retirements
+            .values()
+            .filter_map(|original| original.receipt.native_retirement_debt())
+            .collect()
+    }
+
+    fn native_retirement_capacity_available(&self) -> bool {
+        self.native_retirements
+            .values()
+            .filter(|original| original.receipt.operation.retirement_state != "DRAINED")
+            .count()
+            < NATIVE_RETIREMENT_OBSERVATION_LIMIT
+    }
+
+    /// Called after settlement has authenticated the exact committed operation.
+    /// A newer K/D owner cannot replace an older uncertain native retirement.
+    fn observe_native_retirement(
+        &mut self,
+        pending: &PendingOperation,
+        operation: &daemon::RuntimeConfigOperation,
+    ) -> bool {
+        if let Some(original) = self
+            .native_retirements
+            .get(&operation.transaction_id)
+            .cloned()
+        {
+            // A proven later D success may advance durability while the first
+            // native UNKNOWN proof stays charged to this same original owner.
+            if listener_retirement_failed(&original.receipt.operation)
+                && operation.durable
+                && operation.state == daemon::RuntimeOperationState::Committed as i32
+                && operation.candidate_digest == original.receipt.operation.candidate_digest
+                && operation.impact_digest == original.receipt.operation.impact_digest
+                && identity_equal(
+                    operation.before.as_ref(),
+                    original.receipt.operation.before.as_ref(),
+                )
+                && identity_equal(
+                    operation.active.as_ref(),
+                    original.receipt.operation.active.as_ref(),
+                )
+                && operation.control_revision == original.receipt.operation.control_revision
+            {
+                let mut retained = operation.clone();
+                retained.retirement_state = "UNKNOWN".into();
+                if !listener_retirement_failed(&retained) {
+                    retained.errors.extend(
+                        original
+                            .receipt
+                            .operation
+                            .errors
+                            .iter()
+                            .filter(|error| {
+                                error.code == "LISTENER_RETIREMENT_FAILED"
+                                    && error.effective_path == "inbounds"
+                            })
+                            .cloned(),
+                    );
+                }
+                if let Some(registered) = self.native_retirements.get_mut(&operation.transaction_id)
+                {
+                    registered.receipt.operation = retained;
+                }
+                return false;
+            }
+            // A later settlement of the same verified operation can deliver the
+            // first UNKNOWN proof before its background status task wakes up.
+            let _ = self.refresh_native_retirement(
+                &original,
+                &daemon::RuntimeConfigStatus {
+                    contract_version: 1,
+                    lookup_state: daemon::RuntimeLookupState::Found as i32,
+                    active: operation.active.clone(),
+                    operation: Some(operation.clone()),
+                    ..Default::default()
+                },
+            );
+            return false;
+        }
+        self.native_retirements
+            .retain(|_, original| original.receipt.operation.retirement_state != "DRAINED");
+        // DRAINED has nothing to observe. Other unknown resource-retirement
+        // states do not manufacture the fixed listener failure proof.
+        if !matches!(operation.retirement_state.as_str(), "PENDING" | "DRAINING")
+            && !listener_retirement_failed(operation)
+        {
+            return false;
+        }
+        self.native_retirements.insert(
+            operation.transaction_id.clone(),
+            NativeRetirementObservation {
+                pairing: pending.pairing.clone(),
+                receipt: RuntimeKernelReceipt {
+                    generation: pending.generation,
+                    intent: pending.intent,
+                    superseded: false,
+                    operation: operation.clone(),
+                },
+            },
+        );
+        true
+    }
+
+    /// Shared by the real status and background observer paths. This consumes
+    /// evidence only: it cannot publish R, acknowledge D or replay native Close.
+    fn refresh_native_retirement(
+        &mut self,
+        original: &NativeRetirementObservation,
+        status: &daemon::RuntimeConfigStatus,
+    ) -> Option<RuntimeApplyResult> {
+        let old = &original.receipt;
+        let registered = self.native_retirements.get(&old.operation.transaction_id)?;
+        if registered.receipt.generation != old.generation
+            || registered.receipt.intent != old.intent
+            || registered.pairing != original.pairing
+        {
+            return None;
+        }
+        // Core retains the first failed Close proof. Even a later contradictory
+        // DRAINED response cannot discharge that original native uncertainty.
+        if listener_retirement_failed(&registered.receipt.operation)
+            || registered.receipt.operation.retirement_state == "DRAINED"
+        {
+            return Some(registered.receipt.result());
+        }
+        let operation = status.operation.as_ref()?;
+        if status.contract_version != 1
+            || status.lookup_state != daemon::RuntimeLookupState::Found as i32
+            || !status.active.as_ref().is_some_and(|active| {
+                original.pairing.incarnation.as_deref() == Some(active.incarnation.as_str())
+            })
+            || operation.contract_version != 1
+            || operation.transaction_id != old.operation.transaction_id
+            || operation.candidate_digest != old.operation.candidate_digest
+            || operation.impact_digest != old.operation.impact_digest
+            || !identity_equal(operation.before.as_ref(), old.operation.before.as_ref())
+            || !identity_equal(operation.active.as_ref(), old.operation.active.as_ref())
+            || operation.control_revision != old.operation.control_revision
+            || (registered.receipt.operation.durable && !operation.durable)
+            || !matches!(operation.state, x if x == daemon::RuntimeOperationState::Committed as i32
+                || x == daemon::RuntimeOperationState::CommittedDurabilityPending as i32)
+            || (operation.durable
+                && operation.state != daemon::RuntimeOperationState::Committed as i32)
+            || !matches!(
+                operation.retirement_state.as_str(),
+                "PENDING" | "DRAINING" | "DRAINED" | "UNKNOWN"
+            )
+        {
+            return None;
+        }
+        let mut updated = registered.receipt.clone();
+        updated.operation = operation.clone();
+        if let Some(kernel) = self.kernel.as_mut().filter(|kernel| {
+            kernel.generation == old.generation
+                && kernel.intent == old.intent
+                && kernel.operation.transaction_id == old.operation.transaction_id
+        }) {
+            // Keep local supersession separate from the original physical fact.
+            kernel.operation = operation.clone();
+            updated.superseded = kernel.superseded;
+        }
+        if let Some(registered) = self
+            .native_retirements
+            .get_mut(&old.operation.transaction_id)
+        {
+            registered.receipt = updated.clone();
+        }
+        Some(updated.result())
+    }
+
     fn core_receipt_for(&self, transaction: &str, generation: u64) -> Option<RuntimeApplyResult> {
-        self.kernel
+        let mut result = self
+            .kernel
             .as_ref()
             .filter(|kernel| {
                 kernel.generation == generation && kernel.operation.transaction_id == transaction
@@ -459,7 +709,9 @@ impl RuntimeConfigApplyState {
                     result.transaction_id.as_deref() == Some(transaction)
                         && result.runtime_generation == Some(generation)
                 })
-            })
+            })?;
+        annotate_native_retirement_debts(&mut result, self.native_retirement_debts());
+        Some(result)
     }
 
     fn requires_regeneration_owner_restart(
@@ -916,7 +1168,12 @@ impl ProxyRuntime {
                 h.revoke();
             }
             let mut previous_host = std::mem::take(&mut state.host);
+            // A gate bump or baseline recapture is not proof that the old
+            // native process ended. Only the real stop-success clear below
+            // releases this ledger, including old-generation PENDING observers.
+            let native_retirements = std::mem::take(&mut state.native_retirements);
             *state = RuntimeConfigApplyState::default();
+            state.native_retirements = native_retirements;
             state.host.carry_dns_cleanup_from(&mut previous_host);
             state.host.seed(generation, accepted_host_deps);
         }
@@ -995,13 +1252,42 @@ impl ProxyRuntime {
         };
         proof.verify(pending.generation, epoch).await.is_ok()
     }
+    pub(super) fn native_retirement_debts(&self) -> Vec<NativeRetirementDebt> {
+        self.runtime_config_apply
+            .lock()
+            .ok()
+            .map(|state| state.native_retirement_debts())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn native_retirement_pending(&self) -> bool {
+        self.runtime_config_apply.lock().is_ok_and(|state| {
+            state
+                .native_retirements
+                .values()
+                .any(|original| listener_retirement_failed(&original.receipt.operation))
+        })
+    }
+
+    pub(super) fn annotate_runtime_native_result(&self, result: &mut RuntimeApplyResult) {
+        annotate_native_retirement_debts(result, self.native_retirement_debts());
+    }
+
+    fn runtime_native_result(&self, mut result: RuntimeApplyResult) -> RuntimeApplyResult {
+        self.annotate_runtime_native_result(&mut result);
+        result
+    }
+
     fn remember_runtime_result(&self, mut result: RuntimeApplyResult) -> RuntimeApplyResult {
         self.annotate_runtime_host_result(&mut result);
         if let Ok(mut state) = self.runtime_config_apply.lock() {
             state.host.remember_result(&result);
             state.last = Some(result.clone());
         }
-        if result.pending_apply {
+        if result.pending_apply
+            && !(result.status == "nativeCleanupUnknown"
+                && result.configuration_durable == Some(true))
+        {
             self.restart_deferred.store(true, Ordering::SeqCst);
         }
         self.push_pending_changes();
@@ -1800,6 +2086,7 @@ impl ProxyRuntime {
         // Pause a binding-changing writer BEFORE the RPC. Unknown completion
         // keeps it paused; a verified unapplied rejection alone may resume it.
         let mut tailnet_limited = false;
+        let mut native_limited = false;
         let admitted = self
             .config
             .with_current(|desired| {
@@ -1830,6 +2117,10 @@ impl ProxyRuntime {
                     if state.host.has_in_flight() {
                         return false;
                     }
+                    if !state.native_retirement_capacity_available() {
+                        native_limited = true;
+                        return false;
+                    }
                     if confirmation.as_deref().is_some_and(|token| {
                         !state.impact.as_ref().is_some_and(|choice| {
                             choice.token == token
@@ -1854,6 +2145,12 @@ impl ProxyRuntime {
             } else {
                 "conflict"
             });
+            if native_limited {
+                result.reasons.push(RuntimeApplyReason {
+                    code: "RESOURCE_LIMIT_EXCEEDED",
+                    path: "runtime.retirement".into(),
+                });
+            }
             if tailnet_limited {
                 result.reasons.push(RuntimeApplyReason {
                     code: "RESOURCE_LIMIT_EXCEEDED",
@@ -2269,10 +2566,14 @@ impl ProxyRuntime {
         result.configuration_durable = Some(operation.durable);
         result.persistence_mode = Some(operation.persistence_mode.clone());
         result.retirement_state = Some(operation.retirement_state.clone());
+        result.transaction_id = Some(pending.plan.transaction_id.clone());
+        result.runtime_generation = Some(pending.generation);
+        result.selection_intent_generation = Some(pending.intent);
         result.reasons.push(RuntimeApplyReason {
             code: reason,
             path: "runtime.publication".into(),
         });
+        self.annotate_runtime_native_result(&mut result);
         result
     }
 
@@ -2345,16 +2646,51 @@ impl ProxyRuntime {
         }
         // Record the verified Core fact even when a later App owner prevents R
         // publication. This does not grant the old intent any new rights.
-        if self.gate.generation() == pending.generation {
+        let mut observe_retirement = false;
+        let native_owner_retained;
+        {
             let superseded = self.regeneration_owner_superseded(pending, &operation);
+            let _publication = self.gate.lock_generation_publication();
             if let Ok(mut state) = self.runtime_config_apply.lock() {
-                state.kernel = Some(RuntimeKernelReceipt {
-                    generation: pending.generation,
-                    intent: pending.intent,
-                    superseded,
-                    operation: operation.clone(),
-                });
+                // The exact receipt remains a native fact after a lifecycle
+                // gate bump, while publication and current K retain their CAS.
+                let owner_retained = (self.gate.generation() == pending.generation
+                    && self.core_running())
+                    || state.pending.as_ref().is_some_and(|original| {
+                        original.generation == pending.generation
+                            && original.intent == pending.intent
+                            && original.plan.transaction_id == pending.plan.transaction_id
+                    })
+                    || state
+                        .native_retirements
+                        .get(&operation.transaction_id)
+                        .is_some_and(|original| {
+                            original.receipt.generation == pending.generation
+                                && original.receipt.intent == pending.intent
+                        });
+                native_owner_retained = owner_retained;
+                if owner_retained {
+                    observe_retirement = state.observe_native_retirement(pending, &operation);
+                }
+                if owner_retained && self.gate.generation() == pending.generation {
+                    state.kernel = Some(RuntimeKernelReceipt {
+                        generation: pending.generation,
+                        intent: pending.intent,
+                        superseded,
+                        operation: operation.clone(),
+                    });
+                }
+            } else {
+                native_owner_retained = false;
             }
+        }
+        if !native_owner_retained && self.gate.generation() != pending.generation {
+            // Real stop-success cleared custody. A late old callback cannot
+            // recreate native debt after that terminal ownership boundary.
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
+        }
+        if observe_retirement {
+            self.spawn_runtime_retirement_reconcile(pending, &operation);
         }
         // The receipt proves kernel state, but obsolete local intent cannot publish R
         // over a newer owner. Consume terminal state without claiming local publication.
@@ -2378,14 +2714,17 @@ impl ProxyRuntime {
                 }
                 self.selector_reconcile.mark_required();
             }
-            let mut result = RuntimeApplyResult::status("conflict");
-            if superseded {
-                result.persistence_mode = Some(operation.persistence_mode.clone());
-                result.reasons.push(RuntimeApplyReason {
-                    code: "OWNER_STATE_SUPERSEDED",
-                    path: "desired".into(),
-                });
+            let mut result = RuntimeKernelReceipt {
+                generation: pending.generation,
+                intent: pending.intent,
+                superseded,
+                operation: operation.clone(),
             }
+            .result();
+            result.status = "conflict";
+            result.ok = false;
+            result.pending_apply = true;
+            self.annotate_runtime_native_result(&mut result);
             return result;
         }
         if !pending.published && !self.protected_runtime_publication_current(pending) {
@@ -2427,7 +2766,9 @@ impl ProxyRuntime {
             let mut evidence = pending.mesh_evidence.clone();
             evidence.tailnet_token = committed_tailnet_token;
             self.publish_mesh_route_runtime_receipt(evidence);
-            self.spawn_runtime_retirement_reconcile(pending, &operation);
+            if operation.retirement_state == "DRAINED" {
+                self.spawn_runtime_retirement_reconcile(pending, &operation);
+            }
         }
         // The provider accepted reload bytes, but a newer durably saved D is
         // authoritative for the next App bootstrap. Keep the old kernel receipt
@@ -2440,12 +2781,14 @@ impl ProxyRuntime {
                     kernel.superseded = true;
                 }
             }
-            let mut result = RuntimeApplyResult::status("conflict");
-            result.persistence_mode = Some(operation.persistence_mode.clone());
-            result.reasons.push(RuntimeApplyReason {
-                code: "OWNER_STATE_SUPERSEDED",
-                path: "desired".into(),
-            });
+            let mut result = RuntimeKernelReceipt {
+                generation: pending.generation,
+                intent: pending.intent,
+                superseded: true,
+                operation: operation.clone(),
+            }
+            .result();
+            self.annotate_runtime_native_result(&mut result);
             return result;
         }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
@@ -2471,8 +2814,11 @@ impl ProxyRuntime {
         );
         result.persistence_mode = Some(operation.persistence_mode);
         result.core_state = Some("committed");
-        result.configuration_durable = Some(operation.durable);
+        result.configuration_durable = Some(
+            operation.durable && operation.state == daemon::RuntimeOperationState::Committed as i32,
+        );
         result.retirement_state = Some(operation.retirement_state);
+        self.annotate_runtime_native_result(&mut result);
         result
     }
 
@@ -2604,6 +2950,68 @@ impl ProxyRuntime {
         })
     }
 
+    /// Fresh observation is bound to the original native owner, independent of
+    /// state.pending's (possibly newer) durable-D transaction and current intent.
+    async fn refresh_runtime_native_retirement(
+        self: &Arc<Self>,
+        original: NativeRetirementObservation,
+    ) -> RuntimeApplyResult {
+        let generation = original.receipt.generation;
+        if !self.core_running() {
+            return RuntimeApplyResult::status("unconfirmed");
+        }
+        let Ok(client) = self.runtime_management_client(generation).await else {
+            return RuntimeApplyResult::status("unconfirmed");
+        };
+        if let Err(error) = paired_runtime_capabilities(&client, &original.pairing).await {
+            return *error;
+        }
+        if listener_retirement_failed(&original.receipt.operation)
+            || original.receipt.operation.retirement_state == "DRAINED"
+        {
+            // No repeated native cleanup or mutable status can discharge firstproof.
+            return self
+                .runtime_config_apply
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .native_retirements
+                        .get(&original.receipt.operation.transaction_id)
+                        .filter(|registered| {
+                            registered.receipt.generation == generation
+                                && registered.receipt.intent == original.receipt.intent
+                                && registered.pairing == original.pairing
+                        })
+                        .map(|registered| registered.receipt.result())
+                })
+                .unwrap_or_else(|| RuntimeApplyResult::status("conflict"));
+        }
+        let Some(expected) = original.receipt.operation.before.as_ref() else {
+            return RuntimeApplyResult::status("unconfirmed");
+        };
+        let status = match client
+            .get_runtime_config_status(daemon::RuntimeConfigStatusRequest {
+                contract_version: 1,
+                transaction_id: original.receipt.operation.transaction_id.clone(),
+                runtime_incarnation: expected.incarnation.clone(),
+            })
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => return RuntimeApplyResult::status("unconfirmed"),
+        };
+        let result = {
+            let _publication = self.gate.lock_generation_publication();
+            self.runtime_config_apply
+                .lock()
+                .ok()
+                .and_then(|mut state| state.refresh_native_retirement(&original, &status))
+        };
+        self.push_pending_changes();
+        result.unwrap_or_else(|| RuntimeApplyResult::status("unconfirmed"))
+    }
+
     /// Deferred node-state deletion waits for the kernel's old graph retirement,
     /// independently of durable config success. Never infer DRAINED from COMMITTED.
     fn spawn_runtime_retirement_reconcile(
@@ -2622,16 +3030,26 @@ impl ProxyRuntime {
         let initial = operation.retirement_state.clone();
         let candidate = pending.candidate.clone();
         let scope = pending.deletion_scope.clone();
-        if scope.is_empty() {
-            return;
-        }
+        // An empty deletion scope does not end native listener observation.
+        // PENDING can acquire the first fixed UNKNOWN proof after K/D settle.
         tokio::spawn(async move {
             let mut retirement = initial;
             loop {
-                if me.gate.generation() != generation || !me.core_running() {
+                let retained = me.runtime_config_apply.lock().is_ok_and(|state| {
+                    state
+                        .native_retirements
+                        .get(&transaction_id)
+                        .is_some_and(|original| {
+                            original.receipt.generation == generation && original.pairing == pairing
+                        })
+                });
+                if !retained && retirement != "DRAINED" {
                     return;
                 }
                 if retirement == "DRAINED" {
+                    if scope.is_empty() {
+                        return;
+                    }
                     let _serial = me.switch_serial.lock().await;
                     if me.verify_cached_runtime_pairing(generation).await.is_err() {
                         return;
@@ -2656,12 +3074,15 @@ impl ProxyRuntime {
                     }
                     return;
                 }
-                if retirement != "PENDING" {
+                if !matches!(retirement.as_str(), "PENDING" | "DRAINING") {
                     return;
                 }
                 tokio::select! {
-                    _ = me.gen_changed.notified() => { if me.gate.generation() != generation { return; } }
+                    _ = me.gen_changed.notified() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
+                if !me.core_running() {
+                    continue;
                 }
                 let Ok(client) = me.runtime_management_client(generation).await else {
                     continue;
@@ -2687,7 +3108,7 @@ impl ProxyRuntime {
                                 active.incarnation == expected.incarnation
                             }) =>
                     {
-                        let Some(operation) = status.operation else {
+                        let Some(operation) = status.operation.clone() else {
                             return;
                         };
                         if operation.transaction_id != transaction_id
@@ -2697,7 +3118,25 @@ impl ProxyRuntime {
                         {
                             return;
                         }
-                        retirement = operation.retirement_state;
+                        let observed = {
+                            let _publication = me.gate.lock_generation_publication();
+                            me.runtime_config_apply.lock().ok().and_then(|mut state| {
+                                let original =
+                                    state.native_retirements.get(&transaction_id)?.clone();
+                                state.refresh_native_retirement(
+                                    &original,
+                                    &daemon::RuntimeConfigStatus {
+                                        operation: Some(operation.clone()),
+                                        ..status
+                                    },
+                                )
+                            })
+                        };
+                        let Some(observed) = observed else {
+                            return;
+                        };
+                        retirement = observed.retirement_state.unwrap_or_default();
+                        me.push_pending_changes();
                     }
                     Ok(_) => return, // Expired/unknown receipts leave the journal intact.
                     Err(_) => continue,
@@ -2720,7 +3159,7 @@ impl ProxyRuntime {
                 .ok()
                 .and_then(|mut state| state.restart.take());
             let Some(choice) = choice.filter(|choice| choice.token == token) else {
-                return RuntimeApplyResult::status("conflict");
+                return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
             };
             let baseline = self
                 .runtime_config_baseline
@@ -2786,12 +3225,12 @@ impl ProxyRuntime {
             true
         });
         if !accepted {
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         }
         self.schedule_restart_for_generation(choice.generation);
         let mut result = RuntimeApplyResult::status("applied");
         result.apply_id = Some(id);
-        result
+        self.runtime_native_result(result)
     }
 
     #[cfg(any(test, feature = "native-production-verification"))]
@@ -2864,20 +3303,21 @@ impl ProxyRuntime {
                     )
                 }) {
                     let Some(generation) = result.runtime_generation else {
-                        return RuntimeApplyResult::status("unconfirmed");
+                        return self
+                            .runtime_native_result(RuntimeApplyResult::status("unconfirmed"));
                     };
                     if let Err(error) = self.verify_cached_runtime_pairing(generation).await {
-                        return *error;
+                        return self.runtime_native_result(*error);
                     }
                     let mut result = result;
                     self.annotate_runtime_host_result(&mut result);
                     return result;
                 }
             }
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         };
         if pending.plan.transaction_id != transaction_id {
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         }
         let mut result = self.retry_runtime_persistence_inner(&pending).await;
         result.transaction_id = Some(transaction_id);
@@ -2979,8 +3419,31 @@ impl ProxyRuntime {
         }
     }
 
-    /// Read-only reconciliation of the original transaction. Never replans or
-    /// reapplies; suitable for a bounded UI poll while durability is pending.
+    /// Explicit native-retirement observation is separate from ordinary D/Core
+    /// status recovery. It never acknowledges persistence or publishes R, even
+    /// when the same original transaction still has an active D owner.
+    pub(crate) async fn runtime_native_retirement_status(
+        self: &Arc<Self>,
+        transaction_id: String,
+    ) -> RuntimeApplyResult {
+        let _serial = self.switch_serial.lock().await;
+        let original = self
+            .runtime_config_apply
+            .lock()
+            .ok()
+            .and_then(|state| state.native_retirements.get(&transaction_id).cloned());
+        let mut result = match original {
+            Some(original) => self.refresh_runtime_native_retirement(original).await,
+            None => RuntimeApplyResult::status("conflict"),
+        };
+        result.transaction_id = Some(transaction_id);
+        self.annotate_runtime_host_result(&mut result);
+        result
+    }
+
+    /// Reconcile the original D/Core owner without replanning or resubmitting
+    /// Apply. The established app-authoritative owner acknowledgement remains
+    /// automatic when its original provider callback becomes ready.
     pub(crate) async fn runtime_apply_status(
         self: &Arc<Self>,
         transaction_id: String,
@@ -3006,6 +3469,22 @@ impl ProxyRuntime {
             .lock()
             .ok()
             .and_then(|state| state.pending.clone());
+        let original = self
+            .runtime_config_apply
+            .lock()
+            .ok()
+            .and_then(|state| state.native_retirements.get(&transaction_id).cloned());
+        // An original active D owner must keep its established automatic
+        // acknowledgement path, independently of sticky native UNKNOWN. Only
+        // the explicit native-only entry above may bypass that D recovery.
+        if let Some(original) = original.filter(|_| {
+            pending.as_ref().is_none_or(|pending| {
+                pending.plan.transaction_id != transaction_id
+                    || pending.generation != self.gate.generation()
+            })
+        }) {
+            return self.refresh_runtime_native_retirement(original).await;
+        }
         let Some(pending) = pending else {
             let generation = self.gate.generation();
             let cached = self
@@ -3042,7 +3521,7 @@ impl ProxyRuntime {
         match result.status {
             "hotApplied" | "hotDurabilityPending" => SwitchOutcome::HotSwitched,
             "skipped" => SwitchOutcome::NotRunning,
-            "conflict" | "unconfirmed" => SwitchOutcome::Pending,
+            "conflict" | "unconfirmed" | "nativeCleanupUnknown" => SwitchOutcome::Pending,
             _ => SwitchOutcome::Deferred,
         }
     }

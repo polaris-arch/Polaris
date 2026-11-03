@@ -353,16 +353,29 @@ pub async fn proxy_apply_pending_changes(
     ))
 }
 
-/// Observe an existing HOT transaction without resubmission or restart.
+/// Observe an existing transaction without resubmission or restart. Native-only
+/// checks cannot enter the original D owner's automatic acknowledgement path.
 #[tauri::command]
 pub async fn proxy_runtime_apply_status(
     state: State<'_, AppRuntime>,
     transaction_id: Option<String>,
     host_execution_id: Option<String>,
+    native_retirement_only: Option<bool>,
 ) -> Result<ApiResponse<Value>, ()> {
-    let result = match (transaction_id, host_execution_id) {
-        (Some(transaction), None) => state.proxy.runtime_apply_status(transaction).await,
-        (None, Some(execution)) => state.proxy.runtime_host_apply_status(execution).await,
+    let result = match (
+        native_retirement_only.unwrap_or(false),
+        transaction_id,
+        host_execution_id,
+    ) {
+        (true, Some(transaction), None) => {
+            state
+                .proxy
+                .runtime_native_retirement_status(transaction)
+                .await
+        }
+        (true, _, _) => return Err(()),
+        (false, Some(transaction), None) => state.proxy.runtime_apply_status(transaction).await,
+        (false, None, Some(execution)) => state.proxy.runtime_host_apply_status(execution).await,
         _ => return Err(()),
     };
     Ok(ApiResponse::ok(
