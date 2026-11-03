@@ -91,7 +91,10 @@ impl SystemProxyOps for MockOps {
         _apply_base: &ProxyTransactionSnapshot,
     ) -> Result<ProxyTransactionSnapshot, SystemIntegrationError> {
         self.calls.borrow_mut().push("build_applied");
-        Ok(self.applied_override.clone().unwrap_or_else(|| exact_linux_snapshot(&req.our_host_port())))
+        Ok(self
+            .applied_override
+            .clone()
+            .unwrap_or_else(|| exact_linux_snapshot(&req.our_host_port())))
     }
     fn apply_transaction(
         &self,
@@ -100,7 +103,11 @@ impl SystemProxyOps for MockOps {
     ) -> Result<(), SystemIntegrationError> {
         self.calls.borrow_mut().push("apply_transaction");
         if !self.suppress_exact_apply {
-            *self.transaction_status.borrow_mut() = Some(self.applied_override.clone().unwrap_or_else(|| exact_linux_snapshot(&req.our_host_port())));
+            *self.transaction_status.borrow_mut() = Some(
+                self.applied_override
+                    .clone()
+                    .unwrap_or_else(|| exact_linux_snapshot(&req.our_host_port())),
+            );
         }
         if self.set_fails {
             return Err(SystemIntegrationError::proxy("apply transaction failed"));
@@ -5259,16 +5266,27 @@ fn live_proxy_prepare_readback_release_and_baseline_are_one_exact_owner() {
     assert_eq!(result.outcome, TakeoverOutcome::Applied);
     assert!(!result.cleanup_pending);
     let owned = c.marker.read_checked();
-    let ProxyMarkerRead::CurrentValidated(ref owner) = owned else { panic!("Owned receipt requires marker"); };
+    let ProxyMarkerRead::CurrentValidated(ref owner) = owned else {
+        panic!("Owned receipt requires marker");
+    };
     assert_eq!(owner.phase, ProxyMarkerPhase::Owned);
     assert_eq!(owner.txn_id, result.marker_id);
     assert_eq!(owner.exact_original.as_ref(), Some(&original));
-    assert_eq!(c.ops.transaction_status.borrow().as_ref(), Some(plan.target()));
+    assert_eq!(
+        c.ops.transaction_status.borrow().as_ref(),
+        Some(plan.target())
+    );
     let same = c.prepare_effect(Some(&req())).unwrap();
-    assert_eq!(c.apply_effect(&same, "proxy-same").outcome, TakeoverOutcome::Unchanged);
+    assert_eq!(
+        c.apply_effect(&same, "proxy-same").outcome,
+        TakeoverOutcome::Unchanged
+    );
     assert_eq!(c.marker.read_checked(), owned);
     let release = c.prepare_effect(None).unwrap();
-    assert_eq!(c.apply_effect(&release, "proxy-release").outcome, TakeoverOutcome::Applied);
+    assert_eq!(
+        c.apply_effect(&release, "proxy-release").outcome,
+        TakeoverOutcome::Applied
+    );
     assert_eq!(*c.ops.transaction_status.borrow(), Some(original));
     assert_eq!(c.marker.read_checked(), ProxyMarkerRead::Missing);
 }
@@ -5278,7 +5296,9 @@ fn live_proxy_replacement_preserves_original_and_never_restores_retired_pointer_
     let original = exact_linux_disabled_snapshot();
     let mut c = SystemProxyController::new(exact_ops(original.clone()), mem_marker());
     c.enable(&req()).unwrap();
-    let mut next = req(); next.http_port = 8091; next.socks_port = 8091;
+    let mut next = req();
+    next.http_port = 8091;
+    next.socks_port = 8091;
     let plan = c.prepare_effect(Some(&next)).unwrap();
     c.ops.set_fails = true;
     c.ops.calls.borrow_mut().clear();
@@ -5286,8 +5306,13 @@ fn live_proxy_replacement_preserves_original_and_never_restores_retired_pointer_
     assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
     assert!(result.cleanup_pending);
     assert!(!c.ops.calls.borrow().contains(&"restore_transaction"));
-    assert_eq!(*c.ops.transaction_status.borrow(), Some(exact_linux_snapshot(&next.our_host_port())));
-    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else { panic!("intent must survive"); };
+    assert_eq!(
+        *c.ops.transaction_status.borrow(),
+        Some(exact_linux_snapshot(&next.our_host_port()))
+    );
+    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else {
+        panic!("intent must survive");
+    };
     assert_eq!(marker.phase, ProxyMarkerPhase::Applying);
     assert_eq!(marker.exact_original, Some(original));
     assert_eq!(marker.exact_apply_base.as_ref(), Some(plan.before()));
@@ -5302,7 +5327,9 @@ fn live_proxy_silent_apply_and_silent_restore_remain_recovery_pending() {
     let result = c.apply_effect(&plan, "silent-apply");
     assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
     assert_eq!(*c.ops.transaction_status.borrow(), Some(original.clone()));
-    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else { panic!("intent must survive"); };
+    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else {
+        panic!("intent must survive");
+    };
     assert_eq!(marker.phase, ProxyMarkerPhase::Applying);
     c.ops.suppress_exact_apply = false;
     c.recover_from_marker().unwrap();
@@ -5311,27 +5338,37 @@ fn live_proxy_silent_apply_and_silent_restore_remain_recovery_pending() {
     c.ops.suppress_exact_restore = true;
     let result = c.apply_effect(&release, "silent-restore");
     assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
-    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else { panic!("restore intent must survive"); };
+    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else {
+        panic!("restore intent must survive");
+    };
     assert_eq!(marker.phase, ProxyMarkerPhase::Restoring);
     assert_eq!(marker.exact_original, Some(original));
 }
 
 #[test]
 fn live_proxy_foreign_state_and_successor_marker_block_stale_mutation() {
-    let mut c = SystemProxyController::new(exact_ops(exact_linux_disabled_snapshot()), mem_marker());
+    let mut c =
+        SystemProxyController::new(exact_ops(exact_linux_disabled_snapshot()), mem_marker());
     let plan = c.prepare_effect(Some(&req())).unwrap();
     *c.ops.transaction_status.borrow_mut() = Some(exact_linux_snapshot("foreign:9000"));
-    assert_eq!(c.apply_effect(&plan, "foreign").outcome, TakeoverOutcome::Superseded);
+    assert_eq!(
+        c.apply_effect(&plan, "foreign").outcome,
+        TakeoverOutcome::Superseded
+    );
     assert!(!c.ops.calls.borrow().contains(&"apply_transaction"));
     assert_eq!(c.marker.read_checked(), ProxyMarkerRead::Missing);
     *c.ops.transaction_status.borrow_mut() = Some(exact_linux_disabled_snapshot());
     c.enable(&req()).unwrap();
     let release = c.prepare_effect(None).unwrap();
-    let mut next = req(); next.http_port = 8092;
+    let mut next = req();
+    next.http_port = 8092;
     c.enable(&next).unwrap();
     let successor = c.marker.read_checked();
     c.ops.calls.borrow_mut().clear();
-    assert_eq!(c.apply_effect(&release, "late-release").outcome, TakeoverOutcome::Superseded);
+    assert_eq!(
+        c.apply_effect(&release, "late-release").outcome,
+        TakeoverOutcome::Superseded
+    );
     assert_eq!(c.marker.read_checked(), successor);
     assert!(!c.ops.calls.borrow().contains(&"restore_transaction"));
 }
@@ -5339,17 +5376,31 @@ fn live_proxy_foreign_state_and_successor_marker_block_stale_mutation() {
 #[test]
 fn live_proxy_failed_intent_has_zero_os_writes_and_failed_owned_phase_keeps_debt() {
     let original = exact_linux_disabled_snapshot();
-    let mut c = SystemProxyController::new(exact_ops(original.clone()), ProxyMarker::new(FailNthWriteFs::new(1), "/live.json"));
+    let mut c = SystemProxyController::new(
+        exact_ops(original.clone()),
+        ProxyMarker::new(FailNthWriteFs::new(1), "/live.json"),
+    );
     let plan = c.prepare_effect(Some(&req())).unwrap();
-    assert_eq!(c.apply_effect(&plan, "no-intent").outcome, TakeoverOutcome::FailedUnchanged);
+    assert_eq!(
+        c.apply_effect(&plan, "no-intent").outcome,
+        TakeoverOutcome::FailedUnchanged
+    );
     assert!(!c.ops.calls.borrow().contains(&"apply_transaction"));
     assert_eq!(*c.ops.transaction_status.borrow(), Some(original.clone()));
-    let mut c = SystemProxyController::new(exact_ops(original.clone()), ProxyMarker::new(FailNthWriteFs::new(2), "/live.json"));
+    let mut c = SystemProxyController::new(
+        exact_ops(original.clone()),
+        ProxyMarker::new(FailNthWriteFs::new(2), "/live.json"),
+    );
     let plan = c.prepare_effect(Some(&req())).unwrap();
     let result = c.apply_effect(&plan, "owned-cas");
     assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
-    assert_eq!(c.ops.transaction_status.borrow().as_ref(), Some(plan.target()));
-    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else { panic!("Applying owner must survive"); };
+    assert_eq!(
+        c.ops.transaction_status.borrow().as_ref(),
+        Some(plan.target())
+    );
+    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else {
+        panic!("Applying owner must survive");
+    };
     assert_eq!(marker.phase, ProxyMarkerPhase::Applying);
     assert_eq!(marker.exact_original, Some(original));
 }
@@ -5357,7 +5408,10 @@ fn live_proxy_failed_intent_has_zero_os_writes_and_failed_owned_phase_keeps_debt
 #[test]
 fn live_proxy_never_falls_back_to_legacy_without_exact_capability() {
     let c = SystemProxyController::new(MockOps::default(), mem_marker());
-    assert!(matches!(c.prepare_effect(Some(&req())), Err(SystemIntegrationError::UnsupportedPlatform(_))));
+    assert!(matches!(
+        c.prepare_effect(Some(&req())),
+        Err(SystemIntegrationError::UnsupportedPlatform(_))
+    ));
     assert_eq!(c.marker.read_checked(), ProxyMarkerRead::Missing);
     assert!(!c.ops.calls.borrow().contains(&"set"));
     assert!(!c.ops.calls.borrow().contains(&"apply_transaction"));
@@ -5366,9 +5420,13 @@ fn live_proxy_never_falls_back_to_legacy_without_exact_capability() {
 #[test]
 fn live_proxy_claim_changed_before_first_os_write_retains_the_actual_successor() {
     let fs = StaleCasFs::default();
-    let mut c = SystemProxyController::new(exact_ops(exact_linux_disabled_snapshot()), ProxyMarker::new(fs.clone(), "/live.json"));
+    let mut c = SystemProxyController::new(
+        exact_ops(exact_linux_disabled_snapshot()),
+        ProxyMarker::new(fs.clone(), "/live.json"),
+    );
     c.enable(&req()).unwrap();
-    let mut next = req(); next.http_port = 8093;
+    let mut next = req();
+    next.http_port = 8093;
     let prepared = c.prepare_effect(Some(&next)).unwrap();
     c.ops.calls.borrow_mut().clear();
     // First read checks facts; second is replacement CAS; next read observes the
@@ -5377,52 +5435,93 @@ fn live_proxy_claim_changed_before_first_os_write_retains_the_actual_successor()
     let result = c.apply_effect(&prepared, "claimed-then-superseded");
     assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
     assert!(!c.ops.calls.borrow().contains(&"apply_transaction"));
-    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else { panic!("successor must remain"); };
+    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else {
+        panic!("successor must remain");
+    };
     assert_eq!(marker.txn_id.as_deref(), Some("concurrent-transaction"));
     assert_eq!(marker.phase, ProxyMarkerPhase::Applying);
 }
 
 #[test]
 fn live_proxy_recipe_target_scope_and_original_marker_cannot_be_substituted() {
-    let mut c = SystemProxyController::new(exact_ops(exact_linux_disabled_snapshot()), mem_marker());
+    let mut c =
+        SystemProxyController::new(exact_ops(exact_linux_disabled_snapshot()), mem_marker());
     let mut wrong_target = c.prepare_effect(Some(&req())).unwrap();
     wrong_target.target = exact_linux_snapshot("wrong:9999");
-    assert_eq!(c.apply_effect(&wrong_target, "wrong-target").outcome, TakeoverOutcome::FailedUnchanged);
+    assert_eq!(
+        c.apply_effect(&wrong_target, "wrong-target").outcome,
+        TakeoverOutcome::FailedUnchanged
+    );
     assert_eq!(c.marker.read_checked(), ProxyMarkerRead::Missing);
     assert!(!c.ops.calls.borrow().contains(&"apply_transaction"));
     let mut wrong_scope = c.prepare_effect(Some(&req())).unwrap();
     wrong_scope.marker_path = "/another-owner.json".into();
-    assert_eq!(c.apply_effect(&wrong_scope, "wrong-scope").outcome, TakeoverOutcome::Superseded);
+    assert_eq!(
+        c.apply_effect(&wrong_scope, "wrong-scope").outcome,
+        TakeoverOutcome::Superseded
+    );
     assert!(!c.ops.calls.borrow().contains(&"apply_transaction"));
     c.enable(&req()).unwrap();
     let mut wrong_owner = c.prepare_effect(None).unwrap();
-    wrong_owner.marker.as_mut().unwrap().exact_original = Some(exact_linux_snapshot("forged-original:9000"));
+    wrong_owner.marker.as_mut().unwrap().exact_original =
+        Some(exact_linux_snapshot("forged-original:9000"));
     let actual = c.marker.read_checked();
     c.ops.calls.borrow_mut().clear();
-    assert_eq!(c.apply_effect(&wrong_owner, "wrong-owner").outcome, TakeoverOutcome::Superseded);
+    assert_eq!(
+        c.apply_effect(&wrong_owner, "wrong-owner").outcome,
+        TakeoverOutcome::Superseded
+    );
     assert_eq!(c.marker.read_checked(), actual);
     assert!(!c.ops.calls.borrow().contains(&"restore_transaction"));
 }
 
 #[test]
 fn live_production_linux_bypass_replacement_readback_and_original_restore_use_all_exact_keys() {
-    let initial = exact_linux_snapshot("proxy.corp:3128").linux_gsettings.unwrap();
+    let initial = exact_linux_snapshot("proxy.corp:3128")
+        .linux_gsettings
+        .unwrap();
     let runner = StatefulLinuxRunner::new(initial.clone());
-    let ops = SystemProxyOpsImpl::with_platform(runner.clone(), Platform::Linux).with_noop_sleeper();
+    let ops =
+        SystemProxyOpsImpl::with_platform(runner.clone(), Platform::Linux).with_noop_sleeper();
     let mut c = SystemProxyController::new(ops, mem_marker());
     let first = c.prepare_effect(Some(&req())).unwrap();
     assert_eq!(runner.set_calls.get(), 0);
-    assert_eq!(c.apply_effect(&first, "linux-first").outcome, TakeoverOutcome::Applied);
+    assert_eq!(
+        c.apply_effect(&first, "linux-first").outcome,
+        TakeoverOutcome::Applied
+    );
     let mut next = req();
     next.bypass_list = vec!["accepted.example".into(), "10.0.0.0/8".into()];
     let replacement = c.prepare_effect(Some(&next)).unwrap();
-    assert_ne!(replacement.before().linux_gsettings, replacement.target().linux_gsettings);
-    assert_eq!(c.apply_effect(&replacement, "linux-bypass").outcome, TakeoverOutcome::Applied);
-    assert_eq!(*runner.current.borrow(), linux_applied_snapshot(&next).unwrap());
-    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else { panic!("Owned marker required"); };
-    assert_eq!(marker.exact_original.as_ref().unwrap().linux_gsettings.as_ref(), Some(&initial));
+    assert_ne!(
+        replacement.before().linux_gsettings,
+        replacement.target().linux_gsettings
+    );
+    assert_eq!(
+        c.apply_effect(&replacement, "linux-bypass").outcome,
+        TakeoverOutcome::Applied
+    );
+    assert_eq!(
+        *runner.current.borrow(),
+        linux_applied_snapshot(&next).unwrap()
+    );
+    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else {
+        panic!("Owned marker required");
+    };
+    assert_eq!(
+        marker
+            .exact_original
+            .as_ref()
+            .unwrap()
+            .linux_gsettings
+            .as_ref(),
+        Some(&initial)
+    );
     let release = c.prepare_effect(None).unwrap();
-    assert_eq!(c.apply_effect(&release, "linux-release").outcome, TakeoverOutcome::Applied);
+    assert_eq!(
+        c.apply_effect(&release, "linux-release").outcome,
+        TakeoverOutcome::Applied
+    );
     assert_eq!(*runner.current.borrow(), initial);
     assert_eq!(c.marker.read_checked(), ProxyMarkerRead::Missing);
 }
@@ -5432,23 +5531,37 @@ fn live_production_windows_notification_failure_keeps_exact_debt_without_old_poi
     use std::sync::atomic::Ordering;
     let original = windows_original_snapshot().windows_registry.unwrap();
     let writer = Arc::new(ExactWindowsWriter::new(original.clone()));
-    let ops = ops_for(Platform::Win, MockRunner::default()).with_noop_sleeper()
+    let ops = ops_for(Platform::Win, MockRunner::default())
+        .with_noop_sleeper()
         .with_windows_registry_writer(writer.clone(), true);
     let mut c = SystemProxyController::new(ops, mem_marker());
     let first = c.prepare_effect(Some(&req())).unwrap();
     assert_eq!(writer.writes.load(Ordering::Relaxed), 0);
-    assert_eq!(c.apply_effect(&first, "windows-first").outcome, TakeoverOutcome::Applied);
-    let mut next = req(); next.http_port = 8094; next.bypass_list = vec!["new.example".into()];
+    assert_eq!(
+        c.apply_effect(&first, "windows-first").outcome,
+        TakeoverOutcome::Applied
+    );
+    let mut next = req();
+    next.http_port = 8094;
+    next.bypass_list = vec!["new.example".into()];
     let replacement = c.prepare_effect(Some(&next)).unwrap();
     writer.fail_next_notification.store(true, Ordering::Relaxed);
     let result = c.apply_effect(&replacement, "windows-notification");
     assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
     assert!(result.cleanup_pending);
-    assert_eq!(*writer.current.lock().unwrap(), replacement.target().windows_registry.clone().unwrap());
+    assert_eq!(
+        *writer.current.lock().unwrap(),
+        replacement.target().windows_registry.clone().unwrap()
+    );
     assert_eq!(writer.restores.load(Ordering::Relaxed), 0);
-    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else { panic!("Applying authority required"); };
+    let ProxyMarkerRead::CurrentValidated(marker) = c.marker.read_checked() else {
+        panic!("Applying authority required");
+    };
     assert_eq!(marker.phase, ProxyMarkerPhase::Applying);
-    assert_eq!(marker.exact_original.unwrap().windows_registry, Some(original.clone()));
+    assert_eq!(
+        marker.exact_original.unwrap().windows_registry,
+        Some(original.clone())
+    );
     assert!(c.prepare_effect(Some(&next)).is_err());
     c.recover_from_marker().unwrap();
     assert_eq!(*writer.current.lock().unwrap(), original);
@@ -5459,9 +5572,11 @@ fn live_production_windows_notification_failure_keeps_exact_debt_without_old_poi
 #[test]
 fn live_macos_exact_service_recipe_uses_real_target_builder_and_preserves_original_scope() {
     let writer = Arc::new(CapabilityMacWriter {
-        probe: Ok(true), executes: std::sync::atomic::AtomicUsize::new(0),
+        probe: Ok(true),
+        executes: std::sync::atomic::AtomicUsize::new(0),
     });
-    let build_ops = SystemProxyOpsImpl::new(MockRunner::default()).with_macos_writer(writer.clone());
+    let build_ops =
+        SystemProxyOpsImpl::new(MockRunner::default()).with_macos_writer(writer.clone());
     let original = mac_exact_snapshot();
     let target = build_ops.build_applied_snapshot(&req(), &original).unwrap();
     let mut ops = exact_ops(original.clone());
@@ -5469,10 +5584,19 @@ fn live_macos_exact_service_recipe_uses_real_target_builder_and_preserves_origin
     let mut c = SystemProxyController::new(ops, mem_marker());
     let prepared = c.prepare_effect(Some(&req())).unwrap();
     assert_eq!(prepared.target(), &target);
-    assert_eq!(writer.executes.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert_eq!(c.apply_effect(&prepared, "mac-service").outcome, TakeoverOutcome::Applied);
+    assert_eq!(
+        writer.executes.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        c.apply_effect(&prepared, "mac-service").outcome,
+        TakeoverOutcome::Applied
+    );
     let release = c.prepare_effect(None).unwrap();
-    assert_eq!(c.apply_effect(&release, "mac-release").outcome, TakeoverOutcome::Applied);
+    assert_eq!(
+        c.apply_effect(&release, "mac-release").outcome,
+        TakeoverOutcome::Applied
+    );
     assert_eq!(*c.ops.transaction_status.borrow(), Some(original));
     assert_eq!(c.marker.read_checked(), ProxyMarkerRead::Missing);
     assert!(build_ops.runner.snapshot().is_empty());

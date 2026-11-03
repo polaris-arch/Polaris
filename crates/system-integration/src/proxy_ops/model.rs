@@ -164,7 +164,10 @@ impl TakeoverReceipt {
             operation_id: operation_id.to_owned(),
             outcome,
             marker_id,
-            cleanup_pending: matches!(outcome, TakeoverOutcome::RecoveryPending | TakeoverOutcome::Unknown),
+            cleanup_pending: matches!(
+                outcome,
+                TakeoverOutcome::RecoveryPending | TakeoverOutcome::Unknown
+            ),
             reason,
         }
     }
@@ -181,7 +184,13 @@ pub struct PreparedProxyEffect {
 }
 
 impl PreparedProxyEffect {
-    pub fn scope(&self) -> &str { &self.marker_path }
-    pub fn before(&self) -> &crate::proxy::ProxyTransactionSnapshot { &self.before }
-    pub fn target(&self) -> &crate::proxy::ProxyTransactionSnapshot { &self.target }
+    pub fn scope(&self) -> &str {
+        &self.marker_path
+    }
+    pub fn before(&self) -> &crate::proxy::ProxyTransactionSnapshot {
+        &self.before
+    }
+    pub fn target(&self) -> &crate::proxy::ProxyTransactionSnapshot {
+        &self.target
+    }
 }

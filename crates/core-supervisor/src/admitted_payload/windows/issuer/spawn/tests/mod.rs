@@ -154,7 +154,11 @@ fn fixed_check_and_run_argv_are_separate_and_inventory_has_no_factory() {
         "--disable-color check -c stdin"
     );
     assert_eq!(
-        fixed_arguments(ExecPurpose::RunMain, Some(Path::new(r"C:\Users\测试 Account\Polaris"))).unwrap(),
+        fixed_arguments(
+            ExecPurpose::RunMain,
+            Some(Path::new(r"C:\Users\测试 Account\Polaris"))
+        )
+        .unwrap(),
         r#"run -c stdin -D "C:\Users\测试 Account\Polaris""#
     );
     assert!(fixed_arguments(ExecPurpose::TlsInventory, None).is_err());

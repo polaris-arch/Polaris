@@ -2268,7 +2268,7 @@ impl ProxyRuntime {
         result.core_state = Some("committed");
         result.configuration_durable = Some(operation.durable);
         result.persistence_mode = Some(operation.persistence_mode.clone());
-        result.retirement_state = Some(operation.retirement_state);
+        result.retirement_state = Some(operation.retirement_state.clone());
         result.reasons.push(RuntimeApplyReason {
             code: reason,
             path: "runtime.publication".into(),

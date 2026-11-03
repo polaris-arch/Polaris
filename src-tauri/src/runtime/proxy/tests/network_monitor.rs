@@ -255,40 +255,105 @@ fn network_change_reconciles_dns_then_replans_tun_or_schedules_recovery() {
 
 #[test]
 fn live_dns_source_ordering_uses_actual_builder_resolution_and_keeps_nonchanging_variants() {
-    use polaris_config_engine::user_config::network_profile::{NetworkProfile, NetworkProbeSource};
     use crate::runtime::proxy::dns_takeover::dns_effect_requires_precore_snapshot;
+    use polaris_config_engine::user_config::network_profile::{NetworkProbeSource, NetworkProfile};
     let mut before = UserConfig::default();
     before.network_profiles.push(NetworkProfile {
         id: "office".into(),
         criteria: polaris_config_engine::user_config::network_profile::NetworkProfileCriteria {
-            dns_server_cidrs: vec!["192.168.0.0/16".into()], search_domains: vec![],
+            dns_server_cidrs: vec!["192.168.0.0/16".into()],
+            search_domains: vec![],
         },
         ..Default::default()
     });
     let mut after = before.clone();
-    assert!(dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, false, true, false));
-    assert!(dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, true, false, false));
-    assert!(dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, false, true, true));
-    assert!(!dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, true, true, false));
-    for platform in [Platform::Linux, Platform::Win, Platform::Android, Platform::Ios, Platform::Other] {
-        assert!(!dns_effect_requires_precore_snapshot(platform, &before, &after, false, true, false));
+    assert!(dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        false,
+        true,
+        false
+    ));
+    assert!(dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        true,
+        false,
+        false
+    ));
+    assert!(dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        false,
+        true,
+        true
+    ));
+    assert!(!dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        true,
+        true,
+        false
+    ));
+    for platform in [
+        Platform::Linux,
+        Platform::Win,
+        Platform::Android,
+        Platform::Ios,
+        Platform::Other,
+    ] {
+        assert!(!dns_effect_requires_precore_snapshot(
+            platform, &before, &after, false, true, false
+        ));
     }
     before.network_profiles[0].probe = NetworkProbeSource::System;
     after.network_profiles[0].probe = NetworkProbeSource::System;
-    assert!(!dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, false, true, false));
+    assert!(!dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        false,
+        true,
+        false
+    ));
     before.network_profiles[0].probe = NetworkProbeSource::Dhcp;
     after.network_profiles[0].probe = NetworkProbeSource::Dhcp;
-    assert!(!dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, false, true, false));
+    assert!(!dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        false,
+        true,
+        false
+    ));
     before.network_profiles[0].probe = NetworkProbeSource::Auto;
     after.network_profiles[0].probe = NetworkProbeSource::Auto;
     before.network_profiles[0].enabled = false;
     after.network_profiles[0].enabled = false;
-    assert!(!dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, false, true, false));
+    assert!(!dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        false,
+        true,
+        false
+    ));
     before.network_profiles[0].enabled = true;
     after.network_profiles[0].enabled = true;
     before.network_profiles[0].criteria.dns_server_cidrs = vec!["invalid-cidr".into()];
     after.network_profiles[0].criteria.dns_server_cidrs = vec!["invalid-cidr".into()];
-    assert!(!dns_effect_requires_precore_snapshot(Platform::Mac, &before, &after, false, true, false));
+    assert!(!dns_effect_requires_precore_snapshot(
+        Platform::Mac,
+        &before,
+        &after,
+        false,
+        true,
+        false
+    ));
 }
 
 #[test]
@@ -311,13 +376,22 @@ fn accepted_host_projection_cannot_replace_current_core_dns_or_profile_basis() {
     let merged = merge_runtime_host_projection(&running, Some(&accepted));
     assert_eq!(merged["proxyModeType"], "systemProxy");
     assert_eq!(merged["mixedPort"], 8000);
-    assert_eq!(merged["bypassLANList"], serde_json::json!(["accepted.example"]));
+    assert_eq!(
+        merged["bypassLANList"],
+        serde_json::json!(["accepted.example"])
+    );
     assert_eq!(merged["dnsConfig"]["takeoverSystemDns"], false);
     assert_eq!(merged["networkProfiles"], running["networkProfiles"]);
-    assert_eq!(merged["dnsConfig"]["nameservers"], running["dnsConfig"]["nameservers"]);
+    assert_eq!(
+        merged["dnsConfig"]["nameservers"],
+        running["dnsConfig"]["nameservers"]
+    );
     assert_eq!(merged["logLevel"], "debug");
     let missing = merge_runtime_host_projection(&running, Some(&serde_json::json!({})));
     assert!(missing["dnsConfig"].get("takeoverSystemDns").is_none());
-    assert_eq!(missing["dnsConfig"]["nameservers"], running["dnsConfig"]["nameservers"]);
+    assert_eq!(
+        missing["dnsConfig"]["nameservers"],
+        running["dnsConfig"]["nameservers"]
+    );
     assert_eq!(merge_runtime_host_projection(&running, None), running);
 }

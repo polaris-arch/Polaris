@@ -190,7 +190,11 @@ impl SpawnRequest {
         if self.execution.as_ref().is_some_and(|execution| {
             execution.purpose() == crate::admitted_payload::ExecPurpose::RunMain
         }) {
-            if let Some(directory) = self.working_dir.as_deref().filter(|path| path.is_absolute()) {
+            if let Some(directory) = self
+                .working_dir
+                .as_deref()
+                .filter(|path| path.is_absolute())
+            {
                 if let Some(directory) = directory.to_str() {
                     v.extend(["-D".to_string(), directory.to_string()]);
                 }

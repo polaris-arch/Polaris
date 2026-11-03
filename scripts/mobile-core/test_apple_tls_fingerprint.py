@@ -446,7 +446,14 @@ class OptionalNativeTunCompilerABI(unittest.TestCase):
         self.assertLess(builder.index("'original-tls-prepare.log'"), builder.index("timed_phase('app-extension-archive'"))
         swift = (root / 'src-tauri/gen/apple/PacketTunnel/TunnelPlatform.swift').read_text()
         self.assertIn('#if POLARIS_NATIVE_TUN_V1', swift)
-        self.assertIn('setRuntimeTunPlatform', swift)
+        native_tun = swift.split('#if POLARIS_NATIVE_TUN_V1', 1)[1].split('#endif', 1)[0]
+        self.assertIn('extension TunnelPlatform: LibboxRuntimeTunPlatformProtocol', native_tun)
+        provider = (root / 'src-tauri/gen/apple/PacketTunnel/PacketTunnelProvider.swift').read_text()
+        guard_start = provider.index('#if POLARIS_NATIVE_TUN_V1')
+        guard_end = provider.index('#endif', guard_start)
+        registration = provider[guard_start:guard_end]
+        self.assertIn('try server.setRuntimeTunPlatform(self.platform)', registration)
+        self.assertLess(guard_end, provider.index('try server.start()'))
 
 
 if __name__ == '__main__':

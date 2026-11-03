@@ -97,6 +97,10 @@ import { MobilePendingBar } from './MobilePendingBar';
 import { FormSheet } from './forms/FormSheet';
 import { clearDismissables, dismissTop } from './back-stack';
 
+async function microtasks(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
 function unmount(): void {
   h.effects.forEach((effect) => effect.cleanup?.());
   h.effects = [];
@@ -315,9 +319,6 @@ describe('mobile independent host effect consumption', () => {
     h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
     vi.useFakeTimers();
     renderBar();
-  }
-  async function microtasks(): Promise<void> {
-    for (let i = 0; i < 10; i++) await Promise.resolve();
   }
 
   it('keeps HostOnly waiting at D=R, reads only the host selector, and clears only its actual receipt', async () => {

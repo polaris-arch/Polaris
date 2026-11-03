@@ -13,7 +13,8 @@ use polaris_config_engine::user_config::ProxyModeType;
 use polaris_helper_proto::Platform;
 use polaris_system_integration::proxy::MarkerFs;
 use polaris_system_integration::proxy_ops::{
-    PreparedProxyEffect, ProxyEnableRequest, SystemProxyController, SystemProxyOps, TakeoverOutcome, TakeoverReceipt,
+    PreparedProxyEffect, ProxyEnableRequest, SystemProxyController, SystemProxyOps,
+    TakeoverOutcome, TakeoverReceipt,
 };
 
 use crate::runtime::config::LegacyStartLease;
@@ -38,16 +39,26 @@ pub(crate) trait SystemProxyClearer: Send {
     /// 启动自愈与退出确认共用此释放状态机；不能用 best-effort bool 代替退出确认。
     fn recover_from_marker(&mut self) -> Result<bool, String>;
 
-    fn prepare_host_effect(&self, _request: Option<&ProxyEnableRequest>) -> Result<PreparedProxyEffect, String> {
+    fn prepare_host_effect(
+        &self,
+        _request: Option<&ProxyEnableRequest>,
+    ) -> Result<PreparedProxyEffect, String> {
         Err("exact live proxy effect unavailable".into())
     }
     fn host_effect_facts_match(&self, _prepared: &PreparedProxyEffect) -> Result<bool, String> {
         Ok(false)
     }
-    fn apply_host_effect(&mut self, _prepared: &PreparedProxyEffect, operation_id: &str) -> TakeoverReceipt {
+    fn apply_host_effect(
+        &mut self,
+        _prepared: &PreparedProxyEffect,
+        operation_id: &str,
+    ) -> TakeoverReceipt {
         TakeoverReceipt {
-            operation_id: operation_id.to_owned(), outcome: TakeoverOutcome::Unsupported,
-            marker_id: None, cleanup_pending: false, reason: Some("exact live proxy effect unavailable".into()),
+            operation_id: operation_id.to_owned(),
+            outcome: TakeoverOutcome::Unsupported,
+            marker_id: None,
+            cleanup_pending: false,
+            reason: Some("exact live proxy effect unavailable".into()),
         }
     }
 }
@@ -74,13 +85,20 @@ where
             .map(|marker| marker.is_some())
             .map_err(|error| error.to_string())
     }
-    fn prepare_host_effect(&self, request: Option<&ProxyEnableRequest>) -> Result<PreparedProxyEffect, String> {
+    fn prepare_host_effect(
+        &self,
+        request: Option<&ProxyEnableRequest>,
+    ) -> Result<PreparedProxyEffect, String> {
         self.prepare_effect(request).map_err(|e| e.to_string())
     }
     fn host_effect_facts_match(&self, prepared: &PreparedProxyEffect) -> Result<bool, String> {
         self.effect_facts_match(prepared).map_err(|e| e.to_string())
     }
-    fn apply_host_effect(&mut self, prepared: &PreparedProxyEffect, operation_id: &str) -> TakeoverReceipt {
+    fn apply_host_effect(
+        &mut self,
+        prepared: &PreparedProxyEffect,
+        operation_id: &str,
+    ) -> TakeoverReceipt {
         self.apply_effect(prepared, operation_id)
     }
 }
@@ -101,24 +119,42 @@ impl SystemProxyTakeover {
         }
     }
 
-
     pub(super) fn host_epoch(&self) -> u64 {
         self.session_epoch.load(Ordering::SeqCst)
     }
 
-    pub(super) fn prepare_host_effect(&self, request: Option<&ProxyEnableRequest>) -> Result<PreparedProxyEffect, String> {
+    pub(super) fn prepare_host_effect(
+        &self,
+        request: Option<&ProxyEnableRequest>,
+    ) -> Result<PreparedProxyEffect, String> {
         let epoch = self.host_epoch();
-        if epoch & 1 != 0 { return Err("session query prevents live proxy preparation".into()); }
-        let controller = self.controller.lock().map_err(|_| "proxy controller poisoned")?;
+        if epoch & 1 != 0 {
+            return Err("session query prevents live proxy preparation".into());
+        }
+        let controller = self
+            .controller
+            .lock()
+            .map_err(|_| "proxy controller poisoned")?;
         let prepared = controller.prepare_host_effect(request)?;
-        if self.host_epoch() != epoch { return Err("session epoch changed during proxy preparation".into()); }
+        if self.host_epoch() != epoch {
+            return Err("session epoch changed during proxy preparation".into());
+        }
         Ok(prepared)
     }
 
-    pub(super) fn host_effect_facts_match(&self, prepared: &PreparedProxyEffect, epoch: u64) -> bool {
-        if epoch & 1 != 0 || self.host_epoch() != epoch { return false; }
+    pub(super) fn host_effect_facts_match(
+        &self,
+        prepared: &PreparedProxyEffect,
+        epoch: u64,
+    ) -> bool {
+        if epoch & 1 != 0 || self.host_epoch() != epoch {
+            return false;
+        }
         self.controller.lock().is_ok_and(|controller| {
-            self.host_epoch() == epoch && controller.host_effect_facts_match(prepared).unwrap_or(false)
+            self.host_epoch() == epoch
+                && controller
+                    .host_effect_facts_match(prepared)
+                    .unwrap_or(false)
         })
     }
 
@@ -132,14 +168,21 @@ impl SystemProxyTakeover {
         still_current: impl FnOnce() -> bool,
     ) -> TakeoverReceipt {
         let fail = |outcome, cleanup_pending, reason: &str| TakeoverReceipt {
-            operation_id: operation_id.to_owned(), outcome, marker_id: None,
-            cleanup_pending, reason: Some(reason.to_owned()),
+            operation_id: operation_id.to_owned(),
+            outcome,
+            marker_id: None,
+            cleanup_pending,
+            reason: Some(reason.to_owned()),
         };
         let Ok(mut controller) = self.controller.lock() else {
             return fail(TakeoverOutcome::Unknown, true, "proxy controller poisoned");
         };
         if epoch & 1 != 0 || self.host_epoch() != epoch || !still_current() {
-            return fail(TakeoverOutcome::Superseded, false, "proxy host owner or session epoch superseded");
+            return fail(
+                TakeoverOutcome::Superseded,
+                false,
+                "proxy host owner or session epoch superseded",
+            );
         }
         controller.apply_host_effect(prepared, operation_id)
     }
@@ -317,16 +360,27 @@ impl SystemProxyTakeover {
 /// 平台收成入参而不是在函数里读 `Platform::current()`：判定要在任何 host 上都跑得到。
 
 /// The startup and live paths share exactly the same policy projection.
-pub(super) fn runtime_system_proxy_request(user_config: &UserConfig, platform: Platform) -> Option<ProxyEnableRequest> {
-    if !should_enable_system_proxy(user_config.proxy_mode_type, platform) { return None; }
+pub(super) fn runtime_system_proxy_request(
+    user_config: &UserConfig,
+    platform: Platform,
+) -> Option<ProxyEnableRequest> {
+    if !should_enable_system_proxy(user_config.proxy_mode_type, platform) {
+        return None;
+    }
     struct BypassCfg<'a>(&'a UserConfig);
     impl BypassConfig for BypassCfg<'_> {
-        fn bypass_lan(&self) -> Option<bool> { self.0.bypass_lan }
-        fn bypass_lan_list(&self) -> Option<&[String]> { self.0.bypass_lan_list.as_deref() }
+        fn bypass_lan(&self) -> Option<bool> {
+            self.0.bypass_lan
+        }
+        fn bypass_lan_list(&self) -> Option<&[String]> {
+            self.0.bypass_lan_list.as_deref()
+        }
     }
     let port = polaris_config_engine::user_config::proxy_ports::local_proxy_port(user_config);
     Some(ProxyEnableRequest {
-        address: "127.0.0.1".into(), http_port: port, socks_port: port,
+        address: "127.0.0.1".into(),
+        http_port: port,
+        socks_port: port,
         bypass_list: effective_bypass_lan(&BypassCfg(user_config)),
     })
 }
@@ -470,7 +524,8 @@ impl ProxyRuntime {
         user_config: &UserConfig,
         mixed_port: u16,
     ) {
-        let Some(mut request) = runtime_system_proxy_request(user_config, self.helper.platform()) else {
+        let Some(mut request) = runtime_system_proxy_request(user_config, self.helper.platform())
+        else {
             return;
         };
         // Startup may have resolved an actual port different from the configured default.

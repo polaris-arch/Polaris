@@ -42,9 +42,9 @@ pub use macos_cli::{
     MAC_BYPASS_EMPTY_SENTINEL, MAC_BYPASS_READ_SUB, MAC_PROXY_READ_SUBS,
 };
 pub use model::{
-    points_to_mixed_inbound, MacProxyTransactionWriter, MacProxyWriterError, ProxyEnableRequest,
-    PreparedProxyEffect, TakeoverOutcome, TakeoverReceipt, SystemProxyLiveStatus, WindowsProxyRegistryValues, WindowsProxyRegistryWriter,
-    WindowsProxyWriterError,
+    points_to_mixed_inbound, MacProxyTransactionWriter, MacProxyWriterError, PreparedProxyEffect,
+    ProxyEnableRequest, SystemProxyLiveStatus, TakeoverOutcome, TakeoverReceipt,
+    WindowsProxyRegistryValues, WindowsProxyRegistryWriter, WindowsProxyWriterError,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use ops::mac_snapshot_relation;

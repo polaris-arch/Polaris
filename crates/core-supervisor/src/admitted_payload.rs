@@ -725,9 +725,8 @@ impl PreparedExecution {
         lease_owner: Arc<dyn Send + Sync>,
     ) -> Result<StdCustodiedChild, AdmissionError> {
         if self.purpose != ExecPurpose::RunMain
-            || runtime_directory.is_some_and(|directory| {
-                !directory.is_absolute() || directory.to_str().is_none()
-            })
+            || runtime_directory
+                .is_some_and(|directory| !directory.is_absolute() || directory.to_str().is_none())
         {
             return Err(AdmissionError::new(
                 AdmissionErrorKind::UnsupportedCapability,
