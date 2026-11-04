@@ -2,7 +2,7 @@
 //! fragment, synthetic files, and an inherited-fd flock fixture.
 use super::*;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,7 @@ impl Fixture {
         // short-lived fixture exits, as in the actual process_lease utility.
         crate::test_support::write_executable_stand_in(
             &source,
-            b"#!/usr/bin/env python3\nimport sys,fcntl\nfd=int(sys.argv[-1])\nfcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB if sys.argv[1]=='lease-acquire' else fcntl.LOCK_UN)\n",
+            b"#!/usr/bin/env python3\nimport sys,fcntl,errno\nfd=int(sys.argv[-1])\ntry:\n    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB if sys.argv[1]=='lease-acquire' else fcntl.LOCK_UN)\nexcept BlockingIOError as error:\n    if sys.argv[1]!='lease-acquire' or error.errno not in (errno.EAGAIN,errno.EWOULDBLOCK):\n        raise\n    sys.stderr.write('polaris-test-lease-busy\\n')\n    sys.exit(73)\n",
         );
         let helper = fs::read(&source).unwrap();
         let frozen =
@@ -206,6 +206,44 @@ fn committed_recovery_requires_actual_candidate_identity_unknown_or_linked_stage
     }
 }
 
+// Own only this fixture's first Bash child, including assertion unwinding.
+struct LeaseOwner(Option<Child>);
+impl LeaseOwner {
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("lease owner already retired")
+    }
+    fn kill_and_wait(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.0.take() else {
+            return Ok(());
+        };
+        // Keep its stdin writer owned until the actual kill/wait sequence.
+        // Always attempt wait, including when kill itself reports an error.
+        let killed = child.kill();
+        let waited = child.wait();
+        if killed.is_err() || waited.is_err() {
+            return Err(format!(
+                "lease owner cleanup failed: kill={killed:?}, wait={waited:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+impl Drop for LeaseOwner {
+    fn drop(&mut self) {
+        if let Err(error) = self.kill_and_wait() {
+            if std::thread::panicking() {
+                // Preserve the primary panic even if the diagnostic sink fails.
+                let _ = std::io::Write::write_fmt(
+                    &mut std::io::stderr().lock(),
+                    format_args!("secondary fixture cleanup failure: {error}\n"),
+                );
+            } else {
+                panic!("{error}");
+            }
+        }
+    }
+}
+
 fn wait_for_marker(child: &mut Child, marker: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !marker.exists() {
@@ -214,7 +252,6 @@ fn wait_for_marker(child: &mut Child, marker: &Path) {
             "lease owner exited before barrier"
         );
         if Instant::now() >= deadline {
-            let _ = child.kill();
             panic!("lease barrier timed out");
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -225,21 +262,74 @@ fn wait_for_marker(child: &mut Child, marker: &Path) {
 fn competing_admission_is_busy_not_an_old_recovery_object_and_abandoned_owner_is_recovered() {
     let fixture = Fixture::new();
     let marker = fixture.0.join("admitted");
-    let mut first = fixture
-        .command(&format!(
-            "printf '%s' \"$WORK\" > {}\nread -r RELEASE",
-            sh_quote(marker.to_str().unwrap())
-        ))
-        .spawn()
-        .unwrap();
-    wait_for_marker(&mut first, &marker);
-    let old = PathBuf::from(fs::read_to_string(&marker).unwrap());
+    let pending = fixture.0.join("admitted.next");
+    let mut first = LeaseOwner(Some(
+        fixture
+            .command(&format!(
+                "umask 077\n(set -C; printf '%s' \"$WORK\" > {}) && mv {} {} 9>&- || exit 1\nread -r RELEASE",
+                sh_quote(pending.to_str().unwrap()),
+                sh_quote(pending.to_str().unwrap()),
+                sh_quote(marker.to_str().unwrap())
+            ))
+            .spawn()
+            .unwrap(),
+    ));
+    // Only the publisher's fd9 is closed for mv; Bash remains the lease owner.
+    wait_for_marker(first.child(), &marker);
+    let marker_info = fs::symlink_metadata(&marker).unwrap();
+    assert!(marker_info.is_file());
+    assert_eq!(marker_info.permissions().mode() & 0o777, 0o600);
+    let owner = fs::symlink_metadata(&fixture.0).unwrap().uid();
+    assert_eq!(marker_info.uid(), owner);
+    let record = fs::read_to_string(&marker).unwrap();
+    assert!(!record.is_empty(), "owner published an empty WORK path");
+    let old = PathBuf::from(record);
+    assert!(old.is_absolute());
+    assert_eq!(old.parent(), Some(fixture.0.as_path()));
+    assert!(old
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with(".polaris-update."));
+    let journal_info = fs::symlink_metadata(&old).unwrap();
+    assert!(journal_info.is_dir());
+    assert_eq!(journal_info.permissions().mode() & 0o777, 0o700);
+    assert_eq!(journal_info.uid(), owner);
+    let journal_names = [
+        "transaction-kind",
+        "transaction-destination",
+        "transaction-phase",
+    ];
+    let journal_before = journal_names.map(|name| fs::read(old.join(name)).unwrap());
+    assert_eq!(
+        journal_before,
+        [
+            b"polaris-update-v1\n".to_vec(),
+            fixture.destination().to_str().unwrap().as_bytes().to_vec(),
+            b"staging\n".to_vec(),
+        ]
+    );
+    assert!(first.child().stdin.is_some());
+    assert!(first.child().try_wait().unwrap().is_none());
     let second = fixture.run();
     assert!(!second.status.success());
+    assert_eq!(second.status.code(), Some(1)); // Production admission's exit contract.
+    assert_eq!(second.stderr.as_slice(), b"polaris-test-lease-busy\n");
+    assert!(first.child().try_wait().unwrap().is_none());
     assert!(old.exists());
+    let retained = fs::symlink_metadata(&old).unwrap();
+    assert!(retained.is_dir());
+    assert_eq!(
+        (retained.dev(), retained.ino()),
+        (journal_info.dev(), journal_info.ino())
+    );
+    assert_eq!(
+        journal_names.map(|name| fs::read(old.join(name)).unwrap()),
+        journal_before
+    );
     assert!(!String::from_utf8_lossy(&second.stderr).contains("recovery required"));
-    first.kill().unwrap();
-    first.wait().unwrap();
+    first.kill_and_wait().unwrap();
     assert!(fixture.run().status.success());
     assert!(
         !old.exists(),

@@ -3,6 +3,7 @@ use polaris_helper_proto::core_manifest::{CoreFile, CoreManifest, InstalledCoreM
 use std::os::unix::fs::PermissionsExt;
 #[test]
 fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
+    use polaris_core_supervisor::admitted_payload::{AdmissionError, AdmissionErrorKind, ExecPurpose};
     let root_dir = tempfile::tempdir().unwrap();
     let source_dir = tempfile::tempdir().unwrap();
     for dir in [root_dir.path(), source_dir.path()] {
@@ -79,6 +80,7 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
                 reason: AdmissionErrorKind::Busy.status_token().into(),
             }
         );
+        std::fs::File::unlock(&held).unwrap();
         drop(held);
         let saved = root.join("saved-mutation-lock");
         std::fs::rename(&lock_path, &saved).unwrap();
@@ -120,10 +122,22 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
         std::fs::remove_dir(&lock_path).unwrap();
         std::fs::rename(saved, lock_path).unwrap();
     }
-    assert!(matches!(
+    // Observe the actual typed execution refusal after the original data checks.
+    // Its safe reason may differ by host/policy; Busy cannot prove this premise.
+    let error = store.verify_for_start(&id).unwrap_err();
+    let admission = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<AdmissionError>())
+        .expect("inert installed bytes must reach typed execution admission");
+    assert_ne!(admission.kind, AdmissionErrorKind::Busy);
+    assert_eq!(admission.purpose, Some(ExecPurpose::RunMain));
+    assert_eq!(
         status_with_owner(Some(&root), &id, owner),
-        CoreStatus::Invalid { .. }
-    ));
+        CoreStatus::Invalid {
+            id: id.clone(),
+            reason: admission.kind.status_token().into(),
+        }
+    );
     // A rejected status admission must not retain a shared execution lease
     // and permanently prevent the real existing repair transaction.
     store.install(&manifest, &source, Some(uid), None).unwrap();
