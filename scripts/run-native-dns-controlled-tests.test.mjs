@@ -950,12 +950,27 @@ async function inheritedOutputControl(controlFault) {
   };
   const releasePeer = () => {
     if (!inheritor || inheritor.phase === 'release-sent' || inheritor.phase === 'fin' || inheritor.closed) return;
+    const ownAbort = inheritor.localAbort, original = errors.get(ownAbort);
+    if (ownAbort && ownAbort === injectedFailure && ownAbort === inheritor.injectedFailure
+      && original?.connectionId === inheritor.id && original.role === 'inheritor'
+      && original.phase === 'probe-sent' && original.origin === 'frame'
+      && inheritor.phase === 'probe-sent' && inheritor.socket.destroyed) {
+      // Only this exact locally rejected frame already destroyed this connection.
+      // Keep its real close/join, without initiating another write or claiming FIN.
+      note('release-not-sent-local-abort', { connectionId: inheritor.id, role: inheritor.role,
+        phase: inheritor.phase, errorId: original.id });
+      return;
+    }
     inheritor.phase = 'release-sent'; send(inheritor, 'release');
+  };
+  const release = () => {
+    if (releasing) return;
+    releasing = true; note('explicit-release'); stop(); releasePeer();
   };
   const server = createServer({ allowHalfOpen: true }, socket => {
     let closeResolve;
     const connection = { socket, id: ++connectionId, role: null, phase: 'auth', input: '', bytes: 0,
-      frames: 0, ended: false, finished: false, closed: false, forced: false,
+      frames: 0, ended: false, finished: false, closed: false, forced: false, localAbort: null,
       closedPromise: new Promise(resolve => { closeResolve = resolve; }) };
     sockets.add(connection);
     if (connection.id <= 2) connections.push(connection);
@@ -1027,7 +1042,21 @@ async function inheritedOutputControl(controlFault) {
             send(connection, connection.role === 'holder' ? 'holder-acknowledged' : 'release-acknowledged', {}, true);
           }
         }
-      } catch (error) { fail(error, connection, 'frame', injected); socket.destroy(); }
+      } catch (error) {
+        fail(error, connection, 'frame', injected);
+        const ownAbort = controlFault === 'premature-ack' && injected && error === injectedFailure
+          && connection.injectedFailure === error && errors.has(error) ? error : null;
+        if (ownAbort) connection.localAbort = ownAbort;
+        socket.destroy();
+        if (ownAbort) {
+          // Exercise the real rejected-frame -> destroy -> release -> close order
+          // inside this event handler, before any close callback can run.
+          note('local-abort-destroyed', { connectionId: connection.id, role: connection.role,
+            phase: connection.phase, errorId: errors.get(ownAbort).id,
+            destroyed: socket.destroyed, closed: connection.closed });
+          release();
+        }
+      }
     });
   });
   server.maxConnections = 2;
@@ -1086,10 +1115,7 @@ async function inheritedOutputControl(controlFault) {
       if (errors.size) throw errors.keys().next().value;
       assert.equal(child.stdout.readableEnded, false); assert.equal(child.stderr.readableEnded, false);
     },
-    release() {
-      if (releasing) return;
-      releasing = true; note('explicit-release'); stop(); releasePeer();
-    },
+    release,
     async close() {
       stop();
       try { await boundedFixtureWait(serverClosed, 'acknowledged control server close'); }
@@ -1601,7 +1627,58 @@ test('actual unopened refusal observes EOF with zero teardown bytes on its real 
 
 // Intentional transport negatives keep their bounded failure JSON inside the
 // actual fixture temporary root, never in the two unexpected-suite slots.
-async function expectInertControlFault(controlFault, counterFault = null) {
+// Only the four existing unexpected transport negatives expose this bounded TAP
+// summary. Keep original Error objects/aggregate and never serialize env or tokens.
+function diagnoseInertControlFault(failure, controlFault, diagnostic) {
+  if (typeof diagnostic !== 'function') return;
+  try {
+    const outcome = failure.inertControlOutcome, d = failure.inertControlDiagnostics;
+    const ids = new Map();
+    const id = value => {
+      if (!value || !['object', 'function'].includes(typeof value)) return null;
+      if (!ids.has(value)) ids.set(value, ids.size + 1);
+      return ids.get(value);
+    };
+    const text = (value, limit) => String(value ?? '').replace(/[a-f0-9]{48}/gi, '[inert nonce]').slice(0, limit);
+    const summary = { schema: 'polaris-inert-control-unexpected-v1', controlFault,
+      failureId: id(failure), primaryId: id(outcome?.primary), injectedId: id(outcome?.injectedFailure),
+      aggregateIds: Array.isArray(failure.errors) ? failure.errors.slice(0, 32).map(id) : null,
+      cleanupIds: Array.isArray(outcome?.cleanupErrors) ? outcome.cleanupErrors.slice(0, 32).map(id) : null,
+      cleanupCount: outcome?.cleanupErrors?.length ?? null,
+      exerciseCompleted: outcome?.exerciseCompleted ?? null, controllerClosed: outcome?.controllerClosed ?? null,
+      settled: outcome?.settled ?? null, rootRemoved: outcome?.rootRemoved ?? null,
+      evidenceSaved: typeof outcome?.evidenceSaved === 'string', isolated: failure.inertFailureEvidenceIsolated === true,
+      supervision: Array.isArray(outcome?.supervision) ? outcome.supervision.slice(0, 2).map(entry => ({
+        label: text(entry.label, 32), settled: entry.settled, errorId: id(entry.error) })) : null,
+      injectedControlErrorId: d?.injectedErrorId ?? null, controlErrorCount: d?.errors?.length ?? null,
+      eventsTruncated: d?.eventsTruncated ?? null, errorsTruncated: d?.errorsTruncated ?? null,
+      inheritorProcessExit: d?.inheritorProcessExit ?? 'UNKNOWN' };
+    summary.errors = [...ids].slice(0, 8).map(([error, errorId]) => ({ id: errorId,
+      name: text(error.name, 64), code: text(error.code, 64), message: text(error.message, 384), stack: text(error.stack, 512) }));
+    summary.errorObjectsOmitted = Math.max(0, ids.size - summary.errors.length);
+    summary.controlErrors = Array.isArray(d?.errors) ? d.errors.slice(0, 8).map(error => ({
+      id: error.id, connectionId: error.connectionId, role: text(error.role, 32), phase: text(error.phase, 32),
+      origin: text(error.origin, 32), code: text(error.code, 64), message: text(error.message, 256) })) : null;
+    summary.controlErrorsOmitted = Math.max(0, (d?.errors?.length ?? 0) - (summary.controlErrors?.length ?? 0));
+    summary.events = Array.isArray(d?.events) ? d.events.slice(-16).map(event => ({ sequence: event.sequence,
+      event: text(event.event, 64), connectionId: event.connectionId ?? null, role: text(event.role, 32),
+      phase: text(event.phase, 32), origin: text(event.origin, 32), action: text(event.action, 32),
+      errorId: event.errorId ?? event.causeErrorId ?? null, destroyed: event.destroyed ?? null,
+      closed: event.closed ?? null, ended: event.ended ?? null, finished: event.finished ?? null })) : null;
+    summary.eventsOmitted = Math.max(0, (d?.events?.length ?? 0) - (summary.events?.length ?? 0));
+    let output = JSON.stringify(summary);
+    if (Buffer.byteLength(output, 'utf8') > 16384) output = JSON.stringify({
+      schema: summary.schema, controlFault, truncated: true, failureId: summary.failureId,
+      primaryId: summary.primaryId, injectedId: summary.injectedId, cleanupIds: summary.cleanupIds,
+      cleanupCount: summary.cleanupCount, controlErrorCount: summary.controlErrorCount,
+      settled: summary.settled, rootRemoved: summary.rootRemoved, evidenceSaved: summary.evidenceSaved });
+    if (Buffer.byteLength(output, 'utf8') <= 16384) diagnostic(output);
+  } catch {
+    // A diagnostic failure cannot replace or absorb the exact original failure.
+  }
+}
+
+async function expectInertControlFault(controlFault, counterFault = null, diagnostic = null) {
   assert.ok(['holder-reset', 'release-reset', 'foreign-auth', 'premature-ack'].includes(controlFault));
   assert.ok(counterFault === null || controlFault === 'release-reset'
     && ['premise-assertion', 'evidence-collision'].includes(counterFault));
@@ -1676,8 +1753,10 @@ async function expectInertControlFault(controlFault, counterFault = null) {
     || outcome.supervision.length !== 2 || outcome.supervision.some(entry => !entry.settled)
     || outcome.supervision.find(entry => entry.label === 'supervisor')?.error !== supervisorFailure
     || !supervisorFailure || outcome.supervision.find(entry => entry.label === 'assertion')?.error !== null
-    || !diagnostics || diagnostics.eventsTruncated || diagnostics.errorsTruncated || diagnostics.errors.length !== 1)
+    || !diagnostics || diagnostics.eventsTruncated || diagnostics.errorsTruncated || diagnostics.errors.length !== 1) {
+    if (counterFault === null) diagnoseInertControlFault(failure, controlFault, diagnostic);
     throw failure;
+  }
   const [role, phase, origin] = {
     'holder-reset': ['holder', 'emit-sent', 'socket-error'],
     'release-reset': ['inheritor', 'release-sent', 'socket-error'],
@@ -1687,13 +1766,33 @@ async function expectInertControlFault(controlFault, counterFault = null) {
   if (!diagnostics.events.some(row => row.event === 'control-error' && row.errorId === diagnostics.injectedErrorId
       && row.role === role && row.phase === phase && row.origin === origin)
     || !diagnostics.events.some(row => row.event === 'explicit-release')
-    || diagnostics.inheritorProcessExit !== 'UNKNOWN' || failure.inertFailureEvidenceIsolated !== true)
+    || diagnostics.inheritorProcessExit !== 'UNKNOWN' || failure.inertFailureEvidenceIsolated !== true) {
+    if (counterFault === null) diagnoseInertControlFault(failure, controlFault, diagnostic);
     throw failure;
+  }
+  if (controlFault === 'premature-ack') {
+    const destroyed = diagnostics.events.find(row => row.event === 'local-abort-destroyed'
+      && row.errorId === diagnostics.injectedErrorId && row.role === role && row.phase === phase
+      && row.destroyed === true && row.closed === false);
+    const release = diagnostics.events.find(row => row.event === 'explicit-release');
+    const notSent = diagnostics.events.find(row => row.event === 'release-not-sent-local-abort'
+      && row.errorId === diagnostics.injectedErrorId && row.connectionId === destroyed?.connectionId
+      && row.role === role && row.phase === phase);
+    const closed = diagnostics.events.find(row => row.event === 'control-closed'
+      && row.connectionId === destroyed?.connectionId && row.causeErrorId === diagnostics.injectedErrorId);
+    if (!destroyed || !release || !notSent || !closed
+      || !(destroyed.sequence < release.sequence && release.sequence < notSent.sequence && notSent.sequence < closed.sequence)
+      || diagnostics.events.some(row => row.event === 'control-send' && row.action === 'release'
+        && row.connectionId === destroyed.connectionId && row.sequence > destroyed.sequence)) {
+      diagnoseInertControlFault(failure, controlFault, diagnostic);
+      throw failure;
+    }
+  }
 }
 
 for (const controlFault of ['holder-reset', 'release-reset', 'foreign-auth', 'premature-ack'])
-  test(`inert control rejects actual transport failure ${controlFault} without granting pipe custody`, async () => {
-    await expectInertControlFault(controlFault);
+  test(`inert control rejects actual transport failure ${controlFault} without granting pipe custody`, async t => {
+    await expectInertControlFault(controlFault, null, message => t.diagnostic(message));
   });
 
 for (const counterFault of ['premise-assertion', 'evidence-collision'])
