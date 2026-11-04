@@ -3,7 +3,9 @@ use polaris_helper_proto::core_manifest::{CoreFile, CoreManifest, InstalledCoreM
 use std::os::unix::fs::PermissionsExt;
 #[test]
 fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
-    use polaris_core_supervisor::admitted_payload::{AdmissionError, AdmissionErrorKind, ExecPurpose};
+    use polaris_core_supervisor::admitted_payload::{
+        AdmissionError, AdmissionErrorKind, ExecPurpose,
+    };
     let root_dir = tempfile::tempdir().unwrap();
     let source_dir = tempfile::tempdir().unwrap();
     for dir in [root_dir.path(), source_dir.path()] {
