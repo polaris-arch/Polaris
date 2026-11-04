@@ -904,56 +904,148 @@ async function boundedFixtureWait(promise, label) {
 
 // This loopback socket controls only two inert Node processes. It is not an
 // output substitute: post-exit proof is read from the original child pipes.
-async function inheritedOutputControl() {
-  const token = randomBytes(24).toString('hex'), sockets = new Set(), events = [];
-  let holder, inheritor, releasing = false, childExit, exitResolve, probe, failure = null;
+async function inheritedOutputControl(controlFault) {
+  const token = randomBytes(24).toString('hex'), sockets = new Set(), connections = [], events = [], errors = new Map(), writes = [];
+  let holder, inheritor, releasing = false, stopping = false, childExit, exitResolve, probe, sequence = 0, connectionId = 0;
+  let serverClosedResolve, errorsTruncated = false, injectedFailure = null, faultResolve;
+  const faultObserved = new Promise(resolve => { faultResolve = resolve; });
+  const serverClosed = new Promise(resolve => { serverClosedResolve = resolve; });
   const exited = new Promise(resolve => { exitResolve = resolve; });
   const note = (event, fields = {}) => {
-    if (events.length < 48) events.push({ sequence: events.length, event, ...fields });
+    const next = sequence++;
+    if (events.length < 48) events.push({ sequence: next, event, ...fields });
   };
-  const fail = error => { failure ||= error; note('control-error', { code: String(error.code ?? error.name).slice(0, 64) }); probe?.reject(error); };
-  const send = (socket, value) => {
-    if (socket && !socket.destroyed) socket.write(JSON.stringify(value) + '\n', error => { if (error) fail(error); });
+  const fail = (error, connection = null, origin = 'server', injected = false) => {
+    // Nominate only the actual Error from this invocation's exact injection site.
+    // An earlier error, a second Error, or another role/phase is never expected.
+    if (injected && injectedFailure === null && errors.size === 0) {
+      injectedFailure = error; connection.injectedFailure = error; faultResolve(error);
+    }
+    if (!errors.has(error) && errors.size < 32) errors.set(error, { id: errors.size + 1,
+      connectionId: connection?.id ?? null, role: connection?.role ?? null, phase: connection?.phase ?? 'server', origin });
+    if (!errors.has(error)) errorsTruncated = true;
+    note('control-error', { errorId: errors.get(error)?.id ?? null, connectionId: connection?.id ?? null,
+      role: connection?.role ?? null, phase: connection?.phase ?? 'server', origin,
+      code: String(error.code ?? error.name).slice(0, 64) });
+    probe?.reject(error); stop();
+    // A rejected inheritor auth must not strand an already-authenticated holder
+    // waiting for emit. Abort uses the same two-frame ACK/FIN exchange.
+    if (holder?.phase === 'ready') { holder.phase = 'abort-sent'; send(holder, 'abort'); }
   };
-  const server = createServer(socket => {
-    sockets.add(socket); let input = '', role = null;
-    socket.on('error', fail);
-    socket.once('close', () => {
-      sockets.delete(socket); note('control-closed', { role });
-      if (role === 'inheritor' && !releasing) fail(Error('Inert inheritor control closed before explicit release'));
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    server.close(error => { if (error) fail(error, null, 'server-close'); serverClosedResolve(); });
+  };
+  const send = (connection, action, extra = {}, end = false) => {
+    if (!connection || connection.socket.destroyed || connection.socket.writableEnded) {
+      fail(Error('Inert control write unavailable'), connection, action); return;
+    }
+    note('control-send', { connectionId: connection.id, role: connection.role, phase: connection.phase, action });
+    writes.push(new Promise(resolve => {
+      const done = error => { if (error) fail(error, connection, action); resolve(); };
+      try { connection.socket[end ? 'end' : 'write'](JSON.stringify({ action, ...extra }) + '\n', done); }
+      catch (error) { done(error); }
+    }));
+  };
+  const releasePeer = () => {
+    if (!inheritor || inheritor.phase === 'release-sent' || inheritor.phase === 'fin' || inheritor.closed) return;
+    inheritor.phase = 'release-sent'; send(inheritor, 'release');
+  };
+  const server = createServer({ allowHalfOpen: true }, socket => {
+    let closeResolve;
+    const connection = { socket, id: ++connectionId, role: null, phase: 'auth', input: '', bytes: 0,
+      frames: 0, ended: false, finished: false, closed: false, forced: false,
+      closedPromise: new Promise(resolve => { closeResolve = resolve; }) };
+    sockets.add(connection);
+    if (connection.id <= 2) connections.push(connection);
+    if (connection.id > 2) { fail(Error('Inert control connection bound exceeded'), connection, 'accept'); socket.destroy(); }
+    socket.on('error', error => fail(error, connection, 'socket-error', error.code === 'ECONNRESET'
+      && (controlFault === 'holder-reset' && connection.role === 'holder' && connection.phase === 'emit-sent'
+        || controlFault === 'release-reset' && connection.role === 'inheritor' && connection.phase === 'release-sent')));
+    socket.once('finish', () => { connection.finished = true;
+      note('control-finish', { connectionId: connection.id, role: connection.role, phase: connection.phase }); });
+    socket.once('end', () => {
+      connection.ended = true;
+      note('control-end', { connectionId: connection.id, role: connection.role, phase: connection.phase });
+      if (connection.input || connection.phase !== 'fin') {
+        fail(Error('Inert control ended without its complete acknowledgement'), connection, 'end'); socket.destroy();
+      }
+    });
+    socket.once('close', hadError => {
+      connection.closed = true; sockets.delete(connection);
+      note('control-closed', { connectionId: connection.id, role: connection.role, phase: connection.phase, hadError,
+        ended: connection.ended, finished: connection.finished,
+        causeErrorId: errors.get(connection.injectedFailure)?.id ?? null });
+      // This close observes the already-recorded injected reset/frame rejection;
+      // do not invent a second Error for the same cause. Every other error event
+      // and every uncaused early close still fails independently.
+      if (!connection.forced && !(injectedFailure && connection.injectedFailure === injectedFailure)
+        && (hadError || connection.phase !== 'fin' || !connection.ended || !connection.finished))
+        fail(Error('Inert control closed before acknowledged FIN/end/finish'), connection, 'close');
+      closeResolve();
     });
     socket.setEncoding('utf8');
     socket.on('data', chunk => {
-      input += chunk;
-      if (Buffer.byteLength(input) > 512) { fail(Error('Inert control input exceeded bound')); socket.destroy(); return; }
-      const end = input.indexOf('\n');
-      if (end < 0) return;
+      connection.bytes += Buffer.byteLength(chunk); connection.input += chunk;
+      let injected = false;
       try {
-        assert.equal(role, null, 'one inert control handshake');
-        assert.equal(end, input.length - 1, 'one bounded handshake line');
-        const value = JSON.parse(input.slice(0, end)); input = '';
-        assert.equal(value.token, token); assert.ok(['holder', 'inheritor'].includes(value.role)); role = value.role;
-        if (role === 'holder') {
-          assert.equal(holder, undefined); holder = socket;
-          note('inheritor-spawn-event', { processId: value.spawnProcessId });
-        } else { assert.equal(inheritor, undefined); inheritor = socket; note('inheritor-control-connected'); }
-        // Readiness merely schedules the holder. It proves neither pipe custody
-        // nor any process exit; those have their own original-event assertions.
-        if (releasing) { if (role === 'inheritor') send(inheritor, { action: 'release' }); else socket.destroy(); }
-        else if (holder && inheritor) send(holder, { action: 'emit' });
-      } catch (error) { fail(error); socket.destroy(); }
+        assert.ok(connection.bytes <= 512, 'inert control total input bound');
+        let end;
+        while ((end = connection.input.indexOf('\n')) >= 0) {
+          assert.ok(++connection.frames <= 2, 'two closed inert control frames');
+          const value = JSON.parse(connection.input.slice(0, end)); connection.input = connection.input.slice(end + 1);
+          if (connection.phase === 'auth') {
+            injected = controlFault === 'foreign-auth' && value.role === 'inheritor'
+              && Object.keys(value).sort().join(',') === 'role,token'
+              && value.token === (token[0] === '0' ? '1' : '0') + token.slice(1);
+            assert.ok(value.token === token, 'inert control authentication mismatch'); assert.ok(['holder', 'inheritor'].includes(value.role));
+            assert.deepEqual(Object.keys(value).sort(), value.role === 'holder'
+              ? ['role', 'spawnProcessId', 'token'] : ['role', 'token']);
+            connection.role = value.role;
+            if (value.role === 'holder') {
+              assert.equal(holder, undefined); assert.ok(Number.isSafeInteger(value.spawnProcessId) && value.spawnProcessId > 0);
+              holder = connection; connection.phase = 'ready';
+              note('inheritor-spawn-event', { processId: value.spawnProcessId });
+            } else {
+              assert.equal(inheritor, undefined); inheritor = connection; connection.phase = 'held';
+              note('inheritor-control-connected');
+            }
+            if (releasing || stopping) {
+              if (connection.role === 'inheritor') releasePeer();
+              else { connection.phase = 'abort-sent'; send(connection, 'abort'); }
+            } else if (holder && inheritor && holder.phase === 'ready' && !errors.size) {
+              holder.phase = 'emit-sent'; send(holder, 'emit');
+            }
+          } else {
+            assert.deepEqual(Object.keys(value), ['action']);
+            assert.equal(value.action, connection.role === 'holder' ? 'holder-ack' : 'release-ack');
+            injected = controlFault === 'premature-ack' && connection.role === 'inheritor' && connection.phase === 'probe-sent';
+            assert.equal(connection.phase, connection.role === 'holder'
+              ? connection.phase === 'abort-sent' ? 'abort-sent' : 'emit-sent' : 'release-sent');
+            connection.phase = 'fin';
+            send(connection, connection.role === 'holder' ? 'holder-acknowledged' : 'release-acknowledged', {}, true);
+          }
+        }
+      } catch (error) { fail(error, connection, 'frame', injected); socket.destroy(); }
     });
   });
   server.maxConnections = 2;
-  server.on('error', fail);
+  server.on('error', error => fail(error));
+  server.on('drop', () => fail(Error('Inert control connection dropped')));
   try {
     await boundedFixtureWait(new Promise((resolve, reject) => {
       server.once('error', reject); server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
     }), 'control listen');
-  } catch (error) { server.close(); throw error; }
-  const configuration = { token, port: server.address().port };
+  } catch (error) {
+    stop();
+    try { await boundedFixtureWait(serverClosed, 'failed control listen close'); }
+    catch (cause) { fail(cause, null, 'listen-cleanup'); }
+    const causes = [error, ...errors.keys()].filter((value, index, all) => all.indexOf(value) === index);
+    throw causes.length === 1 ? error : new AggregateError(causes, 'Inert control listen and cleanup failed');
+  }
   return {
-    configuration,
+    configuration: { token, port: server.address().port },
     bind(child) {
       child.once('spawn', () => note('holder-spawn-event', { processId: child.pid }));
       child.once('error', error => { note('holder-process-error', { code: String(error.code ?? error.name).slice(0, 64) }); exitResolve(null); });
@@ -975,43 +1067,68 @@ async function inheritedOutputControl() {
     async provePostExitPipes(child) {
       const exit = await boundedFixtureWait(exited, 'actual holder exit');
       assert.deepEqual(exit, { status: 1, signal: null });
-      if (failure) throw failure;
-      assert.ok(inheritor && !inheritor.destroyed, 'inheritor control remains available after holder exit');
+      if (errors.size) throw errors.keys().next().value;
+      assert.ok(holder && inheritor && !inheritor.closed && !inheritor.socket.destroyed, 'authenticated inheritor remains available');
+      await boundedFixtureWait(holder.closedPromise, 'acknowledged holder control close');
+      if (errors.size) throw errors.keys().next().value;
       assert.equal(child.stdout.readableEnded, false); assert.equal(child.stderr.readableEnded, false);
-      // This unpredictable challenge is created only after the actual exit
-      // callback. Neither a READY message nor a previously buffered line passes.
+      // The challenge exists only after actual direct-child exit. Control ACKs
+      // cannot satisfy either original output witness or the 500ms snapshot.
+      assert.equal(probe, undefined, 'one original post-exit challenge');
+      assert.equal(inheritor.phase, 'held');
       const challenge = randomBytes(24).toString('hex');
       const originalActivity = new Promise((resolve, reject) => {
         probe = { resolve, reject, bytes: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }, seen: {},
           markers: Object.fromEntries(['stdout', 'stderr'].map(name => [name, Buffer.from(`INERT_INHERITED_${name} ${challenge}\n`)])) };
       });
-      send(inheritor, { action: 'probe', challenge });
+      inheritor.phase = 'probe-sent'; send(inheritor, 'probe', { challenge });
       await boundedFixtureWait(originalActivity, 'post-exit activity on both original output pipes');
-      if (failure) throw failure;
+      if (errors.size) throw errors.keys().next().value;
       assert.equal(child.stdout.readableEnded, false); assert.equal(child.stderr.readableEnded, false);
     },
-    release() { releasing = true; note('explicit-release'); send(inheritor, { action: 'release' }); },
-    async close() {
-      for (const socket of sockets) socket.destroy();
-      await boundedFixtureWait(new Promise(resolve => server.close(resolve)), 'control server close');
-      if (failure) throw failure;
+    release() {
+      if (releasing) return;
+      releasing = true; note('explicit-release'); stop(); releasePeer();
     },
-    diagnostics() { return { events, holderExit: childExit ?? null, inheritorProcessExit: 'UNKNOWN',
+    async close() {
+      stop();
+      try { await boundedFixtureWait(serverClosed, 'acknowledged control server close'); }
+      catch (error) {
+        fail(error, null, 'cleanup');
+        for (const connection of sockets) {
+          connection.forced = true; fail(Error('Inert control required forced close'), connection, 'cleanup');
+          connection.socket.destroy();
+        }
+        await boundedFixtureWait(serverClosed, 'forced control server close');
+      }
+      await boundedFixtureWait(Promise.all(connections.map(connection => connection.closedPromise)), 'actual accepted socket close events');
+      await boundedFixtureWait(Promise.all(writes), 'actual control write callbacks');
+    },
+    async waitForInjectedFailure() { return boundedFixtureWait(faultObserved, 'actual injected control failure'); },
+    injectedFailure() { return injectedFailure; },
+    failures() { return [...errors.keys()]; },
+    diagnostics() { return { events, eventsTruncated: sequence > events.length, errorsTruncated,
+      injectedErrorId: errors.get(injectedFailure)?.id ?? null,
+      errors: [...errors].map(([error, fields]) => ({ ...fields, name: String(error.name).slice(0, 64),
+        code: String(error.code ?? '').slice(0, 64),
+        message: String(error.message ?? error).slice(0, 256).replace(/[a-f0-9]{48}/g, '[inert nonce]') })), holderExit: childExit ?? null, inheritorProcessExit: 'UNKNOWN',
       scope: 'Original direct-child pipe custody only; control close is not inheritor exit or native cleanup' }; },
   };
 }
 
-function preserveInertSessionFailure(directory, observed, error, cleanupErrors, inheritance) {
+function inertReceiptSnapshot(directory) {
+  try {
+    const bytes = readFileSync(join(directory, 'native-session-results.json'));
+    return { bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'),
+      truncated: bytes.length > 256 * 1024, base64: bytes.subarray(0, 256 * 1024).toString('base64') };
+  } catch { return null; }
+}
+
+function preserveInertSessionFailure(directory, observed, error, cleanupErrors, inheritance, isolated = false, supervision = [], receipt = inertReceiptSnapshot(directory), requireNew = false) {
   // Two exclusive fixed slots, <=768KiB each / 1536KiB total. Keep this
   // inherited-output failure even if an earlier ordinary fixture also failed.
   // Serialize inert original output/receipt/events, never env/argv/source.
-  const limit = 768 * 1024, receiptPath = join(directory, 'native-session-results.json');
-  let receipt = null;
-  try {
-    const bytes = readFileSync(receiptPath);
-    receipt = { bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'),
-      truncated: bytes.length > 256 * 1024, base64: bytes.subarray(0, 256 * 1024).toString('base64') };
-  } catch {}
+  const limit = 768 * 1024;
   const describe = value => ({ name: String(value?.name ?? 'Error').slice(0, 64),
     code: typeof value?.code === 'string' ? value.code.slice(0, 64) : null,
     message: String(value?.message ?? value).slice(0, 1024).replace(/[a-f0-9]{48}/g, '[inert challenge/token]') });
@@ -1019,6 +1136,8 @@ function preserveInertSessionFailure(directory, observed, error, cleanupErrors, 
     testSourceSha256: createHash('sha256').update(readFileSync(new URL(import.meta.url))).digest('hex'),
     node: process.versions.node, uv: process.versions.uv,
     platform: process.platform, failure: error ? describe(error) : null, cleanupFailures: cleanupErrors.map(describe),
+    supervision: supervision.map(entry => ({ label: entry.label, settled: entry.settled,
+      error: entry.error ? describe(entry.error) : null })),
     inheritedOutput: inheritance?.diagnostics() ?? null, receipt,
     streams: Object.fromEntries(['stdout', 'stderr'].map(name => [name, {
       bytes: observed[name].length, sha256: createHash('sha256').update(observed[name]).digest('hex'),
@@ -1026,20 +1145,31 @@ function preserveInertSessionFailure(directory, observed, error, cleanupErrors, 
     }])), inheritorProcessExit: 'UNKNOWN', nativeCleanupConfirmed: false };
   const bytes = Buffer.from(JSON.stringify(value, null, 2) + '\n');
   assert.ok(bytes.length <= limit, 'bounded inert failure evidence');
-  const target = new URL('../native-dns-ci-evidence/inert-session-failures/', import.meta.url);
+  const target = isolated ? join(directory, 'inert-failure-evidence')
+    : new URL('../native-dns-ci-evidence/inert-session-failures/', import.meta.url);
   mkdirSync(target, { recursive: true });
   const slot = inheritance ? 'inherited-output-failure.json' : 'first-other-failure.json';
-  try { writeFileSync(new URL(slot, target), bytes, { mode: 0o600, flag: 'wx' }); }
-  catch (cause) { if (cause.code !== 'EEXIST') throw cause; }
+  const destination = isolated ? join(target, slot) : new URL(slot, target);
+  try { writeFileSync(destination, bytes, { mode: 0o600, flag: 'wx' }); }
+  catch (cause) { if (cause.code !== 'EEXIST' || requireNew) throw cause; }
+  return destination;
 }
 
 async function withRealSession(spec, exercise) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'session-pipes-'))), directory = join(root, 'evidence');
   mkdirSync(directory); mkdirSync(join(root, 'src-tauri'));
-  const children = [], observed = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
-  let inheritance, failure = null;
+  const children = [], pending = [], observed = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+  let inheritance, failure = null, exerciseCompleted = false;
+  const track = (operation, label) => {
+    assert.ok(['supervisor', 'assertion'].includes(label) && !pending.some(entry => entry.label === label));
+    const entry = { label, settled: false, error: null };
+    entry.done = operation.then(() => { entry.settled = true; }, error => { entry.settled = true; entry.error = error; });
+    pending.push(entry); return operation;
+  };
   try {
-    if (spec.inheritedOutput) inheritance = await inheritedOutputControl();
+    assert.ok(spec.controlFault === undefined || spec.inheritedOutput
+      && ['holder-reset', 'release-reset', 'foreign-auth', 'premature-ack'].includes(spec.controlFault), 'closed inert transport fault');
+    if (spec.inheritedOutput) inheritance = await inheritedOutputControl(spec.controlFault);
     const f = boundNativeFixture(root, directory);
     const prepared = (await fixtureSession(f.selected, f.env, directory)).record;
     const prerequisite = { schema: 'polaris-native-prerequisite-v1', state: 'unmet', stage: 'capability',
@@ -1054,27 +1184,60 @@ async function withRealSession(spec, exercise) {
 import process from 'node:process';
 import { connect } from 'node:net';
 const c = ${JSON.stringify(inheritance?.configuration)};
+const fault = ${JSON.stringify(spec.controlFault ?? null)};
 const watchdog = setTimeout(() => process.exit(4), 15000);
-const socket = connect({ host: '127.0.0.1', port: c.port });
-let input = '', probed = false;
-socket.once('connect', () => socket.write(JSON.stringify({ role: 'inheritor', token: c.token }) + '\n'));
-socket.on('error', () => process.exit(3));
-socket.once('end', () => process.exit(3));
+const socket = connect({ host: '127.0.0.1', port: c.port, allowHalfOpen: true });
+let input = '', received = 0, frames = 0, phase = 'held', failed = false;
+let peerEnded = false, finished = false, acknowledged = false, pendingOutput = Promise.resolve();
+const fail = () => { failed = true; socket.destroy(); };
+socket.once('connect', () => {
+  const auth = JSON.stringify({ role: 'inheritor', token: fault === 'foreign-auth' ? (c.token[0] === '0' ? '1' : '0') + c.token.slice(1) : c.token }) + '\n';
+  // Actual writes deliberately split the handshake; TCP may coalesce them.
+  socket.write(auth.slice(0, 17), error => {
+    if (error) fail(); else socket.write(auth.slice(17), error => { if (error) fail(); });
+  });
+});
+socket.on('error', fail);
+socket.once('finish', () => { finished = true; });
+socket.once('end', () => { peerEnded = true; if (!acknowledged || input) fail(); });
+socket.once('close', hadError => {
+  pendingOutput.then(() => {
+    clearTimeout(watchdog);
+    process.exit(!failed && !hadError && peerEnded && finished && acknowledged ? 0 : 3);
+  }, () => { clearTimeout(watchdog); process.exit(3); });
+});
 socket.setEncoding('utf8');
-for (const output of [process.stdout, process.stderr]) output.on('error', () => process.exit(3));
+for (const output of [process.stdout, process.stderr]) output.on('error', fail);
 socket.on('data', chunk => {
-  input += chunk;
-  if (Buffer.byteLength(input) > 512) process.exit(3);
-  const end = input.indexOf('\n'); if (end < 0) return;
+  received += Buffer.byteLength(chunk); input += chunk;
   try {
-    const value = JSON.parse(input.slice(0, end)); input = input.slice(end + 1);
-    if (input) process.exit(3);
-    if (value.action === 'release') { clearTimeout(watchdog); process.exit(0); }
-    if (value.action !== 'probe' || probed || !/^[a-f0-9]{48}$/.test(value.challenge)) process.exit(3);
-    probed = true;
-    process.stdout.write('INERT_INHERITED_stdout ' + value.challenge + '\n');
-    process.stderr.write('INERT_INHERITED_stderr ' + value.challenge + '\n');
-  } catch { process.exit(3); }
+    if (received > 512) throw Error('inert inheritor input bound');
+    let end;
+    while ((end = input.indexOf('\n')) >= 0) {
+      if (++frames > 3) throw Error('inert inheritor frame bound');
+      const value = JSON.parse(input.slice(0, end)); input = input.slice(end + 1);
+      if (value.action === 'probe') {
+        if (phase !== 'held' || Object.keys(value).sort().join(',') !== 'action,challenge'
+          || !/^[a-f0-9]{48}$/.test(value.challenge)) throw Error('inert probe transition');
+        phase = 'probed';
+        pendingOutput = Promise.all(['stdout', 'stderr'].map(name => new Promise((resolve, reject) => {
+          process[name].write('INERT_INHERITED_' + name + ' ' + value.challenge + '\n', error => error ? reject(error) : resolve());
+        })));
+        pendingOutput.catch(fail);
+        if (fault === 'premature-ack') socket.write(JSON.stringify({ action: 'release-ack' }) + '\n', error => { if (error) fail(); });
+      } else if (value.action === 'release') {
+        if (!['held', 'probed'].includes(phase) || Object.keys(value).join(',') !== 'action') throw Error('inert release transition');
+        phase = 'closing';
+        if (fault === 'release-reset') { failed = true; socket.resetAndDestroy(); continue; }
+        pendingOutput.then(() => {
+          if (!failed) socket.end(JSON.stringify({ action: 'release-ack' }) + '\n', error => { if (error) fail(); });
+        }, fail);
+      } else if (value.action === 'release-acknowledged') {
+        if (phase !== 'closing' || acknowledged || Object.keys(value).join(',') !== 'action') throw Error('inert release acknowledgement');
+        acknowledged = true;
+      } else throw Error('inert inheritor action');
+    }
+  } catch { fail(); }
 });
 ` : undefined;
     const source = String.raw`
@@ -1096,7 +1259,7 @@ const refuse = () => {
     process.stdin.resume(); return;
   }
   if (c.linger || c.signal) { idle(); return; }
-  const end = () => process.stderr.write(c.overflow ? Buffer.alloc(128 * 1024 + 1, 120) : c.invalidUtf8 ? Buffer.from([255]) : 'late inert diagnostic\n', () => process.exit(c.status));
+  const end = () => process.stderr.write(c.overflow ? Buffer.alloc(128 * 1024 + 1, 120) : c.invalidUtf8 ? Buffer.from([255]) : 'late inert diagnostic\n', error => process.exit(c.inheritedOutput && error ? 3 : c.status));
   if (c.lateStderr) setTimeout(end, 40); else end();
 };
 if (c.kind !== 'prerequisite') {
@@ -1130,16 +1293,42 @@ if (c.split) {
   });
   heir.once('error', error => process.stderr.write('inert-inheritor-spawn-error:' + String(error.code ?? error.name).slice(0, 64) + '\n', () => process.exit(3)));
   heir.once('spawn', () => {
-    const socket = connect({ host: '127.0.0.1', port: c.inheritedControl.port }); let input = '';
-    socket.once('connect', () => socket.write(JSON.stringify({ role: 'holder', token: c.inheritedControl.token, spawnProcessId: heir.pid }) + '\n'));
-    socket.on('error', () => process.exit(3)); socket.once('end', () => process.exit(3)); socket.setEncoding('utf8');
+    const socket = connect({ host: '127.0.0.1', port: c.inheritedControl.port, allowHalfOpen: true });
+    let input = '', received = 0, frames = 0, phase = 'emit', failed = false;
+    let peerEnded = false, finished = false, acknowledged = false, aborted = false;
+    const fail = () => { failed = true; socket.destroy(); };
+    socket.once('connect', () => socket.write(JSON.stringify({ role: 'holder', token: c.inheritedControl.token,
+      spawnProcessId: heir.pid }) + '\n', error => { if (error) fail(); }));
+    socket.on('error', fail);
+    socket.once('finish', () => { finished = true; });
+    socket.once('end', () => { peerEnded = true; if (!acknowledged || input) fail(); });
+    socket.once('close', hadError => {
+      if (failed || hadError || !peerEnded || !finished || !acknowledged) { clearTimeout(watchdog); process.exit(3); }
+      if (aborted) { clearTimeout(watchdog); process.exit(3); }
+      // Only actual acknowledged TCP closure precedes the original output and
+      // intentional holder exit. The inherited descriptors remain with the heir.
+      // The watchdog stays armed while either original write is pending.
+      for (const output of [process.stdout, process.stderr]) output.on('error', () => process.exit(3));
+      process.stdout.write(bytes, error => { if (error) process.exit(3); else emitted(); });
+    });
+    socket.setEncoding('utf8');
     socket.on('data', chunk => {
-      input += chunk; if (Buffer.byteLength(input) > 64) process.exit(3);
-      const end = input.indexOf('\n'); if (end < 0) return;
+      received += Buffer.byteLength(chunk); input += chunk;
       try {
-        if (end !== input.length - 1 || JSON.parse(input.slice(0, end)).action !== 'emit') process.exit(3);
-        clearTimeout(watchdog); process.stdout.write(bytes, emitted);
-      } catch { process.exit(3); }
+        if (received > 64) throw Error('inert holder input bound');
+        let end;
+        while ((end = input.indexOf('\n')) >= 0) {
+          if (++frames > 2) throw Error('inert holder frame bound');
+          const value = JSON.parse(input.slice(0, end)); input = input.slice(end + 1);
+          if (Object.keys(value).join(',') !== 'action') throw Error('inert holder action fields');
+          if (phase === 'emit' && ['emit', 'abort'].includes(value.action)) {
+            aborted = value.action === 'abort'; phase = 'closing';
+            if (c.controlFault === 'holder-reset') { failed = true; socket.resetAndDestroy(); continue; }
+            socket.end(JSON.stringify({ action: 'holder-ack' }) + '\n', error => { if (error) fail(); });
+          } else if (phase === 'closing' && !acknowledged && value.action === 'holder-acknowledged') acknowledged = true;
+          else throw Error('inert holder transition');
+        }
+      } catch { fail(); }
     });
   });
   heir.unref();
@@ -1151,8 +1340,9 @@ if (c.split) {
       const child = spec.spawnMissing
         ? spawnInertNode(join(root, 'missing-inert-executable'), [], options)
         : spawnInertNode(process.execPath, ['--input-type=module', '-e', source], options);
-      const closed = new Promise(resolve => child.once('close', resolve));
-      children.push({ child, closed });
+      const entry = { child, closeObserved: false };
+      entry.closed = new Promise(resolve => child.once('close', () => { entry.closeObserved = true; resolve(); }));
+      children.push(entry);
       inheritance?.bind(child);
       for (const name of ['stdout', 'stderr']) child[name].on('data', bytes => {
         assert.ok(observed[name].length + bytes.length <= 128 * 1024 + 1, 'inert fixture output bound');
@@ -1169,36 +1359,72 @@ if (c.split) {
     };
     const start = (...args) => startNativeSession(...args, { spawnChild, preparationTimeoutMs: 8000,
       finishTimeoutMs: spec.linger || spec.inheritedOutput ? 500 : 8000 });
-    await exercise({ ...f, root, directory, start, inheritance, child: () => children[0].child, raw: name => observed[name],
+    await exercise({ ...f, root, directory, start, track, inheritance, child: () => children[0].child, raw: name => observed[name],
       receipt: () => JSON.parse(readFileSync(join(directory, 'native-session-results.json'))) });
+    exerciseCompleted = true;
   } catch (error) { failure = error;
   } finally {
-    const cleanupErrors = [];
-    inheritance?.release();
-    // Direct ChildProcess events and original EOF are observed. The detached
-    // inheritor has an independent watchdog; its exact process exit is UNKNOWN.
-    for (const { child, closed } of children) {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    const primary = failure, cleanupErrors = [];
+    let evidenceSaved = null, rootRemoved = false;
+    const retain = error => { if (error !== failure && !cleanupErrors.includes(error)) cleanupErrors.push(error); };
+    let controllerClosed = !inheritance;
+    try { inheritance?.release(); } catch (error) { retain(error); }
+    for (const { child } of children) {
+      try { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }
+      catch (error) { retain(error); }
+    }
+    for (const { closed } of children) {
+      try { await boundedFixtureWait(closed, 'actual direct-child close after release'); }
+      catch (error) { retain(error); }
+    }
+    try { await inheritance?.close(); controllerClosed = true; } catch (error) { retain(error); }
+    // A failed graceful wait may have needed the controller's forced disconnect.
+    for (const entry of children) if (!entry.closeObserved) {
+      try { await boundedFixtureWait(entry.closed, 'direct-child close after control shutdown'); }
+      catch (error) { retain(error); }
+    }
+    try { await boundedFixtureWait(Promise.all(pending.map(entry => entry.done)), 'original supervisor and assertion settlement'); }
+    catch (error) { retain(error); }
+    for (const entry of pending) if (entry.label === 'assertion' && entry.error) retain(entry.error);
+    for (const error of inheritance?.failures() ?? []) retain(error);
+    if (inheritance) for (const { child, closeObserved } of children) if (closeObserved) {
       try {
-        await boundedFixtureWait(closed, 'actual direct-child close after release');
-        if (inheritance) {
-          assert.equal(child.stdout.readableEnded, true, 'original stdout EOF after release');
-          assert.equal(child.stderr.readableEnded, true, 'original stderr EOF after release');
-        }
-      } catch (error) { cleanupErrors.push(error); }
+        assert.equal(child.stdout.readableEnded, true, 'original stdout EOF after release');
+        assert.equal(child.stderr.readableEnded, true, 'original stderr EOF after release');
+      } catch (error) { retain(error); }
     }
-    try { await inheritance?.close(); } catch (error) { cleanupErrors.push(error); }
-    if (failure || cleanupErrors.length) {
-      try { preserveInertSessionFailure(directory, observed, failure, cleanupErrors, inheritance); }
-      catch (error) { cleanupErrors.push(error); }
+    const settled = controllerClosed && children.every(entry => entry.closeObserved) && pending.every(entry => entry.settled)
+      && (!inheritance || children.every(({ child }) => child.stdout.readableEnded && child.stderr.readableEnded));
+    if (!settled) retain(Error('Inert original operations unconfirmed; temporary evidence retained'));
+    const isolated = spec.controlFault !== undefined, receiptSnapshot = inertReceiptSnapshot(directory);
+    const preserve = () => preserveInertSessionFailure(directory, observed, failure, cleanupErrors, inheritance, isolated, pending, receiptSnapshot, isolated);
+    // Intentional negatives use only their bounded temporary slot. Unexpected
+    // evidence is written once after deletion is attempted, with original receipt
+    // bytes captured beforehand, so a removal error is not lost behind wx.
+    if (isolated && (failure || cleanupErrors.length)) {
+      try {
+        const destination = preserve(), bytes = readFileSync(destination);
+        assert.ok(bytes.length <= 768 * 1024, 'actual isolated evidence readback bound');
+        const value = JSON.parse(bytes);
+        assert.equal(value.schema, 'polaris-inert-session-failure-v1');
+        assert.equal(value.testSourceSha256, createHash('sha256').update(readFileSync(new URL(import.meta.url))).digest('hex'));
+        evidenceSaved = destination;
+      } catch (error) { retain(error); }
     }
-    try { rmSync(root, { recursive: true, force: true }); }
-    catch (error) {
-      cleanupErrors.push(error);
-      try { preserveInertSessionFailure(directory, observed, failure, cleanupErrors, inheritance); }
-      catch (cause) { cleanupErrors.push(cause); }
+    // Do not delete a root still used by an unjoined real supervisor callback.
+    if (settled) try { rmSync(root, { recursive: true, force: true }); rootRemoved = true; }
+    catch (error) { retain(error); }
+    if (!isolated && (failure || cleanupErrors.length)) {
+      try { preserve(); } catch (error) { retain(error); }
     }
-    if (cleanupErrors.length) failure = new AggregateError([failure, ...cleanupErrors].filter(Boolean), 'Inert fixture failure; bounded cleanup/evidence also failed');
+    if (cleanupErrors.length) failure = new AggregateError([failure, ...cleanupErrors].filter(Boolean), 'Inert fixture failure; distinct cleanup/evidence causes retained');
+    if (failure) {
+      failure.inertControlDiagnostics = inheritance?.diagnostics() ?? null;
+      failure.inertFailureEvidenceIsolated = isolated;
+      if (isolated) failure.inertControlOutcome = { primary, exerciseCompleted, cleanupErrors,
+        injectedFailure: inheritance?.injectedFailure() ?? null, supervision: pending,
+        controllerClosed, settled, evidenceSaved, rootRemoved };
+    }
   }
   if (failure) throw failure;
 }
@@ -1325,7 +1551,8 @@ test('consumer independently rejects altered or missing close EOF process and co
 
 test('actual exited child with inherited output handle is unknown until original output EOF and close', async () => {
   await withRealSession({ inheritedOutput: true }, async f => {
-    const rejection = assert.rejects(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), /Unopened prerequisite process exit unconfirmed/);
+    const operation = f.track(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), 'supervisor');
+    const rejection = f.track(assert.rejects(operation, /Unopened prerequisite process exit unconfirmed/), 'assertion');
     rejection.catch(() => {}); // Retain early assertion rejection while proving the real fixture precondition.
     await f.inheritance.provePostExitPipes(f.child());
     await rejection;
@@ -1370,4 +1597,155 @@ test('actual unopened refusal observes EOF with zero teardown bytes on its real 
     assert.equal(readFileSync(join(f.directory, 'native-session.stderr.log'), 'utf8'), 'observed-input-bytes:0\n');
     assert.equal(f.receipt().unopenedExitConfirmed, true); assert.equal(f.receipt().teardownConfirmed, false);
   });
+});
+
+// Intentional transport negatives keep their bounded failure JSON inside the
+// actual fixture temporary root, never in the two unexpected-suite slots.
+async function expectInertControlFault(controlFault, counterFault = null) {
+  assert.ok(['holder-reset', 'release-reset', 'foreign-auth', 'premature-ack'].includes(controlFault));
+  assert.ok(counterFault === null || controlFault === 'release-reset'
+    && ['premise-assertion', 'evidence-collision'].includes(counterFault));
+  let failure, supervisorFailure;
+  try {
+    await withRealSession({ inheritedOutput: true, controlFault }, async f => {
+      const operation = f.track(withNativeSession(f.selected, f.env, f.directory, () => assert.fail('no case'), f.start), 'supervisor');
+      const expected = ['holder-reset', 'foreign-auth'].includes(controlFault)
+        ? /^Session holder exited without bounded preparation; Prerequisite stream differs$/
+        : controlFault === 'release-reset'
+          ? /^Required native prerequisite unmet: capability\/admission-unsupported-capability; Unopened prerequisite process exit unconfirmed$/
+          : /^Required native prerequisite unmet: capability\/admission-unsupported-capability(?:; Unopened prerequisite process exit unconfirmed)?$/;
+      const rejection = f.track(assert.rejects(operation, error => {
+        supervisorFailure = error; assert.match(error.message, expected); return true;
+      }), 'assertion');
+      rejection.catch(() => {}); // Observe early rejection; finally still joins this original promise.
+      if (controlFault === 'release-reset') {
+        // Same invocation: actual exit1, fresh challenge on BOTH original pipes,
+        // and the genuine 500ms incomplete snapshot must all precede release.
+        await f.inheritance.provePostExitPipes(f.child());
+        await rejection;
+        const receipt = f.receipt();
+        assert.equal(receipt.executor.exitObserved, true); assert.equal(receipt.executor.exitStatus, 1);
+        assert.equal(receipt.executor.timedOut, true); assert.equal(receipt.executor.closeObserved, false);
+        assert.equal(receipt.streams.stdout.eof, false); assert.equal(receipt.streams.stderr.eof, false);
+        assert.equal(receipt.unopenedExitConfirmed, false); assert.equal(f.summary().requirementState, 'open');
+      } else {
+        if (controlFault === 'premature-ack') {
+          try { await f.inheritance.provePostExitPipes(f.child()); }
+          catch (error) { if (error !== f.inheritance.injectedFailure()) throw error; }
+        }
+        await f.inheritance.waitForInjectedFailure();
+        f.inheritance.release();
+        await rejection;
+        const receipt = f.receipt();
+        // Early aborts do not claim the normal A2/500ms premise. They must instead
+        // finish their own actual process/pipe join and phase-specific refusal.
+        assert.equal(receipt.executor.exitObserved, true); assert.equal(receipt.executor.signal, null);
+        assert.equal(receipt.executor.exitStatus, controlFault === 'premature-ack' ? 1 : 3);
+        assert.equal(receipt.teardownConfirmed, false);
+        if (controlFault !== 'premature-ack') {
+          assert.equal(receipt.executor.closeObserved, true); assert.equal(receipt.executor.timedOut, false);
+          assert.equal(receipt.streams.stdout.eof, true); assert.equal(receipt.streams.stderr.eof, true);
+          assert.equal(receipt.prerequisite, null); assert.equal(receipt.unopenedExitConfirmed, false);
+          assert.equal(f.raw('stdout').length, 0); assert.equal(f.raw('stderr').length, 0);
+        }
+        // A premature ACK can reach the controller before or after the genuine
+        // 500ms snapshot. Actual final EOF/close/join is required below either way;
+        // its snapshot is not a second claim of the normal A2 holding premise.
+      }
+      const receipt = f.receipt();
+      assert.equal(receipt.executor.processId, f.child().pid);
+      assert.equal(receipt.executor.processError, null); assert.equal(receipt.executor.captureError, null);
+      assert.equal(receipt.executor.interrupted, false); assert.equal(receipt.executor.control.error, null);
+      assert.equal(receipt.executor.control.action, 'eof'); assert.equal(receipt.executor.control.payloadBytes, 0);
+      assert.equal(receipt.streams.stdout.error, null); assert.equal(receipt.streams.stderr.error, null);
+      if (counterFault === 'premise-assertion')
+        assert.equal(receipt.executor.timedOut, false, 'deliberate independent actual snapshot assertion failure');
+      if (counterFault === 'evidence-collision')
+        writeFileSync(join(f.directory, 'inert-failure-evidence'), 'actual independent file/directory collision', { flag: 'wx' });
+      // finally must release even if an independent assertion above fails.
+    });
+  } catch (error) { failure = error; }
+  assert.ok(failure, 'the actual transport injection must reject');
+  const outcome = failure.inertControlOutcome, diagnostics = failure.inertControlDiagnostics;
+  // Propagate the original full aggregate, including its exact primary/late Error
+  // objects. The presence of an expected event cannot accept ANY extra cause.
+  if (!outcome || outcome.primary !== null || !outcome.exerciseCompleted
+    || !outcome.injectedFailure || outcome.cleanupErrors.length !== 1
+    || outcome.cleanupErrors[0] !== outcome.injectedFailure
+    || !outcome.controllerClosed || !outcome.settled || !outcome.rootRemoved || !outcome.evidenceSaved
+    || outcome.supervision.length !== 2 || outcome.supervision.some(entry => !entry.settled)
+    || outcome.supervision.find(entry => entry.label === 'supervisor')?.error !== supervisorFailure
+    || !supervisorFailure || outcome.supervision.find(entry => entry.label === 'assertion')?.error !== null
+    || !diagnostics || diagnostics.eventsTruncated || diagnostics.errorsTruncated || diagnostics.errors.length !== 1)
+    throw failure;
+  const [role, phase, origin] = {
+    'holder-reset': ['holder', 'emit-sent', 'socket-error'],
+    'release-reset': ['inheritor', 'release-sent', 'socket-error'],
+    'foreign-auth': [null, 'auth', 'frame'],
+    'premature-ack': ['inheritor', 'probe-sent', 'frame'],
+  }[controlFault];
+  if (!diagnostics.events.some(row => row.event === 'control-error' && row.errorId === diagnostics.injectedErrorId
+      && row.role === role && row.phase === phase && row.origin === origin)
+    || !diagnostics.events.some(row => row.event === 'explicit-release')
+    || diagnostics.inheritorProcessExit !== 'UNKNOWN' || failure.inertFailureEvidenceIsolated !== true)
+    throw failure;
+}
+
+for (const controlFault of ['holder-reset', 'release-reset', 'foreign-auth', 'premature-ack'])
+  test(`inert control rejects actual transport failure ${controlFault} without granting pipe custody`, async () => {
+    await expectInertControlFault(controlFault);
+  });
+
+for (const counterFault of ['premise-assertion', 'evidence-collision'])
+  test(`actual expected release reset cannot accept independent ${counterFault}`, async () => {
+    await assert.rejects(expectInertControlFault('release-reset', counterFault), error => {
+      const outcome = error.inertControlOutcome, diagnostics = error.inertControlDiagnostics;
+      assert.ok(outcome?.injectedFailure && error.errors.includes(outcome.injectedFailure));
+      assert.ok(diagnostics.events.some(row => row.event === 'control-error'
+        && row.errorId === diagnostics.injectedErrorId && row.role === 'inheritor'
+        && row.phase === 'release-sent' && row.origin === 'socket-error'));
+      assert.equal(outcome.controllerClosed, true); assert.equal(outcome.settled, true); assert.equal(outcome.rootRemoved, true);
+      assert.equal(outcome.supervision.length, 2);
+      for (const entry of outcome.supervision) assert.equal(entry.settled, true);
+      assert.equal(outcome.supervision.find(entry => entry.label === 'assertion').error, null);
+      if (counterFault === 'premise-assertion') {
+        assert.equal(outcome.primary.name, 'AssertionError');
+        assert.match(outcome.primary.message, /deliberate independent actual snapshot assertion failure/);
+        assert.ok(error.errors.includes(outcome.primary), 'original AssertionError object retained');
+        assert.equal(outcome.exerciseCompleted, false); assert.ok(outcome.evidenceSaved);
+        assert.deepEqual(outcome.cleanupErrors, [outcome.injectedFailure]);
+      } else {
+        assert.equal(outcome.primary, null); assert.equal(outcome.exerciseCompleted, true); assert.equal(outcome.evidenceSaved, null);
+        const filesystemError = outcome.cleanupErrors.find(cause => cause !== outcome.injectedFailure);
+        assert.ok(filesystemError && ['EEXIST', 'ENOTDIR'].includes(filesystemError.code));
+        assert.equal(outcome.cleanupErrors.length, 2);
+        assert.ok(error.errors.includes(filesystemError), 'actual filesystem Error object retained');
+      }
+      assert.equal(diagnostics.inheritorProcessExit, 'UNKNOWN');
+      assert.equal(error.inertFailureEvidenceIsolated, true);
+      return true;
+    });
+  });
+
+test('inert failure evidence uses actual isolated files and preserves the first bounded slot', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'inert-evidence-')));
+  const directory = join(root, 'evidence'); mkdirSync(directory);
+  const observed = { stdout: Buffer.from('inert stdout\n'), stderr: Buffer.from('inert stderr\n') };
+  try {
+    const destination = preserveInertSessionFailure(directory, observed, Error('first inert failure'), [], null, true);
+    assert.equal(destination, join(directory, 'inert-failure-evidence', 'first-other-failure.json'));
+    const first = readFileSync(destination), value = JSON.parse(first);
+    assert.ok(first.length <= 768 * 1024); assert.equal(value.failure.message, 'first inert failure');
+    for (const name of ['stdout', 'stderr']) {
+      const bytes = Buffer.from(value.streams[name].base64, 'base64');
+      assert.deepEqual(bytes, observed[name]); assert.equal(value.streams[name].bytes, bytes.length);
+      assert.equal(value.streams[name].sha256, createHash('sha256').update(bytes).digest('hex'));
+    }
+    assert.equal(value.inheritorProcessExit, 'UNKNOWN'); assert.equal(value.nativeCleanupConfirmed, false);
+    preserveInertSessionFailure(directory, observed, Error('second inert failure'), [], null, true);
+    assert.deepEqual(readFileSync(destination), first, 'wx must retain the actual first file');
+    rmSync(join(directory, 'inert-failure-evidence'), { recursive: true });
+    writeFileSync(join(directory, 'inert-failure-evidence'), 'actual file/directory collision');
+    assert.throws(() => preserveInertSessionFailure(directory, observed, Error('original cause'), [], null, true));
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
