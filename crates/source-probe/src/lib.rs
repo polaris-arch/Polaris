@@ -680,11 +680,20 @@ fn mask(source: &str, mask_literals: bool) -> String {
             i = j;
             continue;
         }
+        // Pattern_White_Space 是 token 分隔符，不属于保守 Unicode 标识符。
+        // 整个 UTF8 序列原样越过，不能让它与后面的 r/br 合成一个标识符。
+        if let Some(width) = rust_whitespace_width(bytes, i) {
+            i += width;
+            continue;
+        }
         // 标识符整体消费：`r` / `b` / `br` 只有作为**独立**标识符时才是字面量前缀。
         // 逐字节扫会把 `foo_r"…"` 里的 `r"` 读成原始字符串起点，从此整段偏移错位。
         if is_ident_start(bytes[i]) {
             let mut j = i;
-            while j < total && is_ident_continue(bytes[j]) {
+            while j < total
+                && rust_whitespace_width(bytes, j).is_none()
+                && is_ident_continue(bytes[j])
+            {
                 j += 1;
             }
             let ident = &bytes[i..j];
@@ -740,6 +749,17 @@ fn mask(source: &str, mask_literals: bool) -> String {
     }
 
     String::from_utf8(out).expect("只把整段多字节序列换成 ASCII 空格，不会破坏 UTF-8")
+}
+
+// Rust 的有限 11 个 Pattern_White_Space；不用更宽的 char::is_whitespace。
+// 只在源字节处识别完整序列，其余非 ASCII 字节仍按原保守 identifier 规则处理。
+fn rust_whitespace_width(bytes: &[u8], at: usize) -> Option<usize> {
+    match bytes.get(at..)? {
+        [b'\t'..=b'\r' | b' ', ..] => Some(1),
+        [0xc2, 0x85, ..] => Some(2),
+        [0xe2, 0x80, 0x8e | 0x8f | 0xa8 | 0xa9, ..] => Some(3),
+        _ => None,
+    }
 }
 
 fn is_ident_start(byte: u8) -> bool {
@@ -932,6 +952,105 @@ macro_rules! module_files_with_tests {
     ($dir_rel:expr $(,)?) => {
         $crate::module_files_with_tests_in(env!("CARGO_MANIFEST_DIR"), $dir_rel)
     };
+}
+
+// Grouped finite lexical controls live in this already-scoped source file;
+// the existing external tests module and every prior control stay unchanged.
+#[cfg(test)]
+#[test]
+fn both_rust_masks_keep_pattern11_raw_prefix_boundaries_and_literal_bytes() {
+    let whitespace = [
+        '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', ' ', '\u{0085}', '\u{200e}',
+        '\u{200f}', '\u{2028}', '\u{2029}',
+    ];
+    let blank = |text: &str| {
+        text.bytes()
+            .map(|byte| if byte == b'\n' { '\n' } else { ' ' })
+            .collect::<String>()
+    };
+    for ws in whitespace {
+        for prefix in ["r", "br"] {
+            // Empty prefix covers scanner entry; the others force identifier
+            // continuation to stop before the same separator and raw prefix.
+            for before in ["", "return", "é", "e\u{301}", "未知", "r#kept"] {
+                let head = format!("{before}{ws}");
+                let literal = format!(
+                    "{prefix}##\"a\"; c.write_all(req.as_bytes()).await.unwrap(); /* raw */ // raw\n\"b\"##"
+                );
+                let tail = "; /* outside */\nlet after = 1; // outside line\nkeep();";
+                let source = format!("{head}{literal}{tail}");
+                let visible_tail = tail
+                    .replace("/* outside */", &blank("/* outside */"))
+                    .replace("// outside line", &blank("// outside line"));
+                let code = mask_comments_and_strings(&source);
+                let literals = mask_comments(&source);
+                assert_eq!(code, format!("{head}{}{visible_tail}", blank(&literal)));
+                assert_eq!(literals, format!("{head}{literal}{visible_tail}"));
+                for face in [&code, &literals] {
+                    assert_eq!(face.len(), source.len());
+                    assert_eq!(face.find("let after"), source.find("let after"));
+                    assert_eq!(
+                        face.match_indices('\n')
+                            .map(|(at, _)| at)
+                            .collect::<Vec<_>>(),
+                        source
+                            .match_indices('\n')
+                            .map(|(at, _)| at)
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        for literal in [
+            "b\"a // literal /* literal */\"",
+            "b'\\''",
+            "r\"plain\"",
+            "br\"plain\"",
+        ] {
+            for head in [format!("{ws}"), format!("é{ws}"), format!("e\u{301}{ws}")] {
+                let source = format!("{head}{literal}; after();");
+                assert_eq!(mask_comments(&source), source);
+                assert_eq!(
+                    mask_comments_and_strings(&source),
+                    format!("{head}{}; after();", blank(literal))
+                );
+            }
+        }
+        // Whitespace inside a literal is data, even when non ASCII. Byte raw
+        // literals above contain only ASCII; these UTF8 data use string forms.
+        for literal in [
+            format!("\"a{ws}// literal /* literal */ é\""),
+            format!("r#\"a{ws}\"; // literal /* literal */ é\"#"),
+        ] {
+            let source = format!("let data = {literal}; after();");
+            assert_eq!(mask_comments(&source), source);
+            assert_eq!(
+                mask_comments_and_strings(&source),
+                format!("let data = {}; after();", blank(&literal))
+            );
+        }
+    }
+    // Adjacent identifier bytes never donate their r/br suffix. NBSP and ZWSP
+    // remain in the old conservative nonASCII class, outside Pattern11.
+    for ident in [
+        "foo_r",
+        "ér",
+        "e\u{301}r",
+        "未知br",
+        "r#foo_r",
+        "\u{a0}r",
+        "\u{200b}br",
+    ] {
+        let source = format!("{ident}#\"a\"; exposed(); \"b\"#; after();");
+        assert_eq!(mask_comments(&source), source);
+        assert_eq!(
+            mask_comments_and_strings(&source),
+            format!("{ident}#   ; exposed();    #; after();")
+        );
+    }
+    let raw_identifiers = "let r#r = 1; let r#br = 2; let r#未知 = 3; r#r + r#br;";
+    assert_eq!(mask_comments(raw_identifiers), raw_identifiers);
+    assert_eq!(mask_comments_and_strings(raw_identifiers), raw_identifiers);
 }
 
 #[cfg(test)]
