@@ -116,6 +116,69 @@ def ten_vendor_fixture():
     return policy, files, modes, trees
 
 
+def eleven_vendor_fixture():
+    """Synthetic explicit v4 facts; no selected mobile contract is changed."""
+    policy, files, modes, trees = ten_vendor_fixture()
+    name, version = 'github.com/libp2p/go-nat', 'v1.0.1-0.20250821073202-01afc089f138'
+    path = 'third_party/go-nat/fixture.go'
+    files[path], modes[path] = b'synthetic go-nat only', '100644'
+    trees[name] = vendor_tree({'fixture.go': (modes[path], files[path])})
+    policy['vendors'][name] = dict(version=version, replacementPath='./third_party/go-nat',
+        replacementTree=trees[name], replacementFileCount=1)
+    files['go.mod'] += ('require ' + name + ' ' + version + '\n'
+                       'replace ' + name + ' => ./third_party/go-nat\n').encode()
+    policy.update(schema='polaris-reviewed-kernel-source-v4', goModSha256=sha(files['go.mod']))
+    return policy, files, modes, trees
+
+
+class ElevenVendorSourcePolicy(unittest.TestCase):
+    def test_v4_verifies_complete_eleven_module_bytes_modes_and_declarations(self):
+        policy, files, modes, trees = eleven_vendor_fixture()
+        self.assertIs(validate_source_policy(policy, policy), policy)
+        result = verify_source_policy_files(policy, policy, files, policy['metacubex']['replacementTree'],
+            vendor_modes=modes, vendor_trees=trees)
+        self.assertEqual(len(result['vendors']), 11)
+        self.assertEqual(result['vendors']['github.com/libp2p/go-nat'],
+            {'path': './third_party/go-nat', 'tree': trees['github.com/libp2p/go-nat'], 'files': 1})
+
+    def test_v3_still_rejects_the_eleventh_module(self):
+        policy, _, _, _ = eleven_vendor_fixture()
+        policy['schema'] = 'polaris-reviewed-kernel-source-v3'
+        with self.assertRaisesRegex(RuntimeError, 'exact reviewed vendor names'):
+            validate_source_policy(policy, policy)
+
+    def test_v4_rejects_missing_or_extra_modules(self):
+        for mutation in ('missing', 'extra'):
+            policy, _, _, _ = eleven_vendor_fixture()
+            if mutation == 'missing': del policy['vendors']['github.com/libp2p/go-nat']
+            else: policy['vendors']['example.invalid/extra'] = deepcopy(policy['vendors']['github.com/libp2p/go-nat'])
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(RuntimeError, 'exact reviewed vendor names'):
+                validate_source_policy(policy, policy)
+
+    def test_v4_binds_go_nat_path_version_bytes_and_actual_replacement_set(self):
+        for mutation in ('path', 'version', 'bytes', 'missing-replace', 'extra-replace'):
+            policy, files, modes, trees = eleven_vendor_fixture()
+            pin = policy['vendors']['github.com/libp2p/go-nat']
+            if mutation == 'path': pin['replacementPath'] = './third_party/go-nat-other'
+            elif mutation == 'version':
+                files['go.mod'] = files['go.mod'].replace(pin['version'].encode(), b'v1.0.0')
+            elif mutation == 'bytes': files['third_party/go-nat/fixture.go'] += b'changed'
+            elif mutation == 'missing-replace':
+                files['go.mod'] = files['go.mod'].replace(b'replace github.com/libp2p/go-nat => ./third_party/go-nat\n', b'')
+            else: files['go.mod'] += b'replace example.invalid/extra => ./third_party/extra\n'
+            policy['goModSha256'] = sha(files['go.mod'])
+            expected = {
+                'path': r'invalid vendor pin: github\.com/libp2p/go-nat',
+                'version': r'actual vendor dependency version differs: github\.com/libp2p/go-nat',
+                'bytes': 'vendor subtree differs',
+                'missing-replace': 'exact reviewed local replacements required',
+                'extra-replace': 'exact reviewed local replacements required',
+            }[mutation]
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(RuntimeError, '^reviewed source policy: ' + expected + '$'):
+                verify_source_policy_files(policy, policy, files, policy['metacubex']['replacementTree'],
+                    vendor_modes=modes, vendor_trees=trees)
+
+
 class TenVendorSourcePolicy(unittest.TestCase):
     def test_v3_complete_bytes_modes_and_module_graph(self):
         policy, files, modes, trees = ten_vendor_fixture()
@@ -509,16 +572,23 @@ def current_mobile_graph_fixture(value, source):
 
 
 class CurrentMobileGraphFixture(unittest.TestCase):
-    def test_v3_selected_contract_fixture_keeps_exact_ten_source_replacements(self):
+    def test_v4_selected_contract_fixture_keeps_exact_eleven_source_replacements(self):
         from fork_input import load
         from source_policy import verify_vendor_graph
         value = load()
-        self.assertEqual(value['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v3')
+        self.assertEqual(value['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v4')
         vendors = value['sourcePolicy']['vendors']
+        self.assertEqual(len(vendors), 11)
+        self.assertEqual(vendors['github.com/libp2p/go-nat'], {
+            'version': 'v1.0.1-0.20250821073202-01afc089f138',
+            'replacementPath': './third_party/go-nat',
+            'replacementTree': '2125093d0d080b4ad0151dd129d41df8a305ea69',
+            'replacementFileCount': 12,
+        })
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / 'source'
             graph, raw = current_mobile_graph_fixture(value, source)
-            self.assertEqual(len(graph), 11)  # Main plus ten reviewed vendors.
+            self.assertEqual(len(graph), 12)  # Main plus eleven reviewed vendors.
             self.assertIs(verify_vendor_graph(graph, source, vendors), graph)
             for row in graph[1:]:
                 self.assertEqual(row['Version'], vendors[row['Path']]['version'])

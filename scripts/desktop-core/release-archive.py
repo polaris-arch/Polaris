@@ -437,7 +437,7 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mobile-core'))
         from source_policy import validate_source_policy, verify_source_policy_files
         validate_source_policy(reviewed_source, {**source_identity, 'sourceCommit': commit, 'sourceTree': expected_tree})
-        if reviewed_source['schema'] in ('polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3'):
+        if reviewed_source['schema'] in ('polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3', 'polaris-reviewed-kernel-source-v4'):
             vendors = reviewed_source['vendors']
     vendor_prefixes = tuple(pin['replacementPath'][2:] + '/' for pin in vendors.values()) if vendors else ()
     vendor_modes, vendor_bytes, proof_bytes = {}, 0, 0

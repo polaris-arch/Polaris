@@ -426,8 +426,10 @@ class SourceArchiveTests(unittest.TestCase):
 class ReviewedVendorArchiveTests(unittest.TestCase):
     def fixture(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mobile-core'))
-        from test_source_policy import nine_vendor_fixture, ten_vendor_fixture
-        policy, files, modes, _ = (ten_vendor_fixture if getattr(self, 'v3', False) else nine_vendor_fixture)()
+        from test_source_policy import nine_vendor_fixture, ten_vendor_fixture, eleven_vendor_fixture
+        maker = (eleven_vendor_fixture if getattr(self, 'v4', False) else
+                 ten_vendor_fixture if getattr(self, 'v3', False) else nine_vendor_fixture)
+        policy, files, modes, _ = maker()
         # Reuse the shared nine-vendor data, but derive the complete archive tree
         # independently, including non-vendor files, legal bytes and a gitlink.
         files['LICENSE'] = b'synthetic legal bytes\n'
@@ -528,7 +530,9 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                 elif case == 'path': observed['replacement']['module'] = './third_party/elsewhere'
                 elif case == 'sum': observed['h1'] = 'h1:YQ='
                 else: observed['replacement']['h1'] = 'h1:YQ='
-                with self.subTest(vendor=row['module'], platform=2, case=case), self.assertRaises(ValueError):
+                expected = ('linked reviewed vendor version/path differs' if case in ('version', 'path')
+                            else 'local replacement cannot carry an invented module sum')
+                with self.subTest(vendor=row['module'], platform=2, case=case), self.assertRaisesRegex(ValueError, '^' + expected + '$'):
                     self.verify(changed, data=data)
 
     def test_v2_declarations_reject_omitted_extra_wrong_vendor_path_and_tree(self):
@@ -541,7 +545,15 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'wrong-tree': pin['replacementTree'] = 'f' * 40
             elif case == 'wrong-mode': pin['mode'] = '100644'
             else: pin['replacementFileCount'] += 1
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'missing': (RuntimeError, 'reviewed source policy: exact reviewed vendor names required'),
+                'extra': (RuntimeError, 'reviewed source policy: exact reviewed vendor names required'),
+                'wrong-path': (RuntimeError, r'reviewed source policy: invalid vendor pin: github\.com/sagernet/sing-tun'),
+                'wrong-tree': (ValueError, 'complete reviewed vendor source replacement inventory differs'),
+                'wrong-mode': (RuntimeError, r'reviewed source policy: complete vendor declaration required: github\.com/sagernet/sing-tun'),
+                'wrong-count': (RuntimeError, 'reviewed source policy: vendor inventory differs'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture)
 
     def test_v2_each_vendor_file_inventory_bytes_and_modes_are_bound(self):
@@ -558,7 +570,10 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                 else:
                     fixture['files'] = {p: raw for p, raw in fixture['files'].items() if not p.startswith(prefix)}
                 self.refresh_tree(fixture)
-                with self.subTest(vendor=name, case=case), self.assertRaises((ValueError, RuntimeError)):
+                expected = ('source replacement subtree missing' if case == 'omitted-root'
+                            or (case == 'omitted-file' and pin['replacementFileCount'] == 1)
+                            else 'downloaded local replacement tree differs')
+                with self.subTest(vendor=name, case=case), self.assertRaisesRegex(ValueError, '^' + expected + '$'):
                     self.verify(fixture)
 
     def test_v2_vendor_paths_links_and_special_tar_members_fail_closed(self):
@@ -569,6 +584,8 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                 path = prefix + {'parent': '../escape', 'backslash': 'bad\\name', 'control': 'bad\nname'}[case]
                 fixture['files'][path] = b'unsafe'
                 self.refresh_tree(fixture)
+                # Retained independent vendor pins reject backslash/control at
+                # subtree identity; parent paths fail the earlier tar path guard.
             elif case == 'link-target': fixture['files']['third_party/tailscale/.stignore'] = b'../.gitignore'
             elif case == 'link-regularized': fixture['modes']['third_party/tailscale/.stignore'] = '100644'
             elif case == 'other-link':
@@ -592,7 +609,17 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                     tree = tree_for(files, modes)
                     fixture['policy']['vendors'][vendor]['replacementTree'] = tree
                     next(pin for pin in fixture['source']['replacements'] if pin['module'] == vendor)['tree'] = tree
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'parent': (ValueError, 'source archive path/duplicate differs'),
+                'backslash': (ValueError, 'downloaded local replacement tree differs'),
+                'control': (ValueError, 'downloaded local replacement tree differs'),
+                'link-target': (RuntimeError, 'reviewed source policy: unexpected vendor symlink'),
+                'link-regularized': (ValueError, 'downloaded local replacement tree differs'),
+                'other-link': (RuntimeError, 'reviewed source policy: unexpected vendor symlink'),
+                'hardlink': (ValueError, 'source special/gitlink or entry limit'),
+                'special-mode': (ValueError, 'source duplicate/oversized/special-mode file'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture, data=data)
 
     def test_v2_vendor_file_budget_is_checked_before_reading_body(self):
@@ -647,7 +674,19 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'legal': fixture['legal'][0]['content'] = 'changed'
             elif case == 'gitlink': fixture['gitlinks'] = []
             else: fixture['linked'][-1]['replacement']['h1'] = 'h1:Yg='
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'archive-sha': (ValueError, 'source archive SHA differs'),
+                'archive-size': (ValueError, 'source archive size differs'),
+                'transport': (ValueError, 'fixed commit source transport differs'),
+                'url': (ValueError, 'fixed commit source transport differs'),
+                'tree': (ValueError, 'downloaded source archive Git tree differs'),
+                'module': (RuntimeError, 'reviewed source policy: goModSha256 differs'),
+                'overlay': (ValueError, 'source overlay unsupported'),
+                'legal': (ValueError, 'source legal identity differs'),
+                'gitlink': (ValueError, 'empty source directory/gitlink cannot prove a Git tree'),
+                'remote-sum': (ValueError, 'linked remote replacement version/checksum differs from source'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture, data=data, record_change=record)
 
     def test_v2_retains_actual_module_legal_and_meta_proof_bytes(self):
@@ -658,7 +697,16 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             if case.startswith('missing-'): fixture['files'].pop(path)
             else: fixture['files'][path] += b'changed'
             self.refresh_tree(fixture)
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'go.mod': (ValueError, 'downloaded source module bytes differ'),
+                'go.sum': (ValueError, 'downloaded source module bytes differ'),
+                'LICENSE': (ValueError, 'source legal bytes/inventory differ'),
+                'binding': (RuntimeError, 'reviewed source policy: actual Meta binding differs'),
+                'patch': (RuntimeError, 'reviewed source policy: actual Meta patch differs'),
+                'missing-binding': (RuntimeError, 'reviewed source policy: actual Meta binding differs'),
+                'missing-patch': (RuntimeError, 'reviewed source policy: actual Meta patch differs'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture)
 
     def test_v2_source_identity_is_exactly_the_reviewed_nine_roots(self):
@@ -668,7 +716,7 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'unknown': replacement['module'] = 'example.invalid/unknown'
             elif case == 'wrong-tree': replacement['tree'] = 'f' * 40
             else: replacement['path'] = './third_party/tailscale'
-            with self.subTest(case=case), self.assertRaises(ValueError):
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, '^complete reviewed vendor source replacement inventory differs$'):
                 self.verify(fixture)
 
     def test_v2_vendor_collection_uses_32_mib_not_the_legacy_meta_budget(self):
@@ -693,7 +741,16 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'sum': fixture['linked'][0]['replacement']['h1'] = 'h1:YQ='
             elif case == 'version': fixture['linked'][0]['replacement']['version'] = 'v1.0.0'
             else: fixture['linked'][0]['version'] = 'v9.9.9'
-            with self.subTest(case=case), self.assertRaisesRegex(ValueError, 'local replacement|vendor'):
+            expected = {
+                'pruned': 'complete source/linked local replacement inventory differs',
+                'source-and-linked-pruned': 'complete reviewed vendor source replacement inventory differs',
+                'extra': 'complete source/linked local replacement inventory differs',
+                'path': 'linked reviewed vendor version/path differs',
+                'sum': 'local replacement cannot carry an invented module sum',
+                'version': 'local replacement cannot carry an invented module sum',
+                'vendor-version': 'linked reviewed vendor version/path differs',
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, '^' + expected + '$'):
                 self.verify(fixture)
 
 
@@ -701,6 +758,22 @@ class ReviewedTenVendorArchiveTests(ReviewedVendorArchiveTests):
     # Re-run the same real archive reader and all negative controls on the
     # explicit ten-vendor schema; original v2 fixture semantics stay unchanged.
     v3 = True
+
+
+class ReviewedElevenVendorArchiveTests(ReviewedVendorArchiveTests):
+    # The same complete archive, mode/tree, legal, linked and budget controls
+    # now cover the explicit eleven-vendor schema; old fixtures stay unchanged.
+    v4 = True
+
+    def test_v4_does_not_relabel_the_eleven_vendor_archive_as_v3(self):
+        fixture = self.fixture()
+        self.assertEqual(fixture['policy']['schema'], 'polaris-reviewed-kernel-source-v4')
+        self.assertEqual(len(fixture['policy']['vendors']), 11)
+        self.assertIn('github.com/libp2p/go-nat', fixture['policy']['vendors'])
+        self.assertEqual(self.verify(fixture), fixture['policy']['sourceTree'])
+        fixture['policy']['schema'] = 'polaris-reviewed-kernel-source-v3'
+        with self.assertRaisesRegex(RuntimeError, 'exact reviewed vendor names'):
+            self.verify(fixture)
 
 
 class RealSourceValidatorClosureTests(unittest.TestCase):

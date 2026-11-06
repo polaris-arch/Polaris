@@ -810,10 +810,13 @@ class RoutingContracts(unittest.TestCase):
             self.assertIn(guard, selected)
         self.assertIn('build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimeProtocolAdmissionTest.xml', self.workflow)
 
-    def test_pins_all_ten_source_vendor_roots_and_formal_untouched(self):
+    def test_pins_closed_ten_vendor_diagnostic_and_distinct_current_candidate(self):
         self.assertEqual(sum(row[2] for row in hot.VENDORS.values()), 2876)
         self.assertEqual(len(hot.VENDORS), 10)
-        self.assertEqual(hot.sha((hot.ROOT / 'scripts/mobile-core/source-contract.json').read_bytes()), hot.FORMAL_HASH)
+        self.assertEqual(hot.FORMAL_HASH, '8acececd46ddbe2f12056a15b6009400044508f2c162781f86ef2b63fee01104')
+        current_hash = hot.sha((hot.ROOT / 'scripts/mobile-core/source-contract.json').read_bytes())
+        self.assertEqual(current_hash, '0c9b279d40d33f8cb9bb096a38e29e6d98220a7f25e6cc682ad94e9817f9b208')
+        self.assertNotEqual(current_hash, hot.FORMAL_HASH)
         self.assertIn('trackedMirror', self.source)
         self.assertIn("git(source, 'ls-tree', '-r', 'HEAD')", self.source)
         self.assertIn("mode == '160000'", self.source)

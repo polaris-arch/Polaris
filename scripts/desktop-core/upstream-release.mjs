@@ -180,7 +180,7 @@ export function validateNativeArchiveRow(contract, key, row, targets) {
     const meta = policy.metacubex;
     demand(source.goModSha256 === policy.goModSha256 && source.goSumSha256 === policy.goSumSha256,
       'Reviewed source module pins differ');
-    const vendors = ['polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3'].includes(policy.schema) ? policy.vendors : undefined;
+    const vendors = ['polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3', 'polaris-reviewed-kernel-source-v4'].includes(policy.schema) ? policy.vendors : undefined;
     const expected = (vendors ? Object.keys(vendors) : ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun']).sort();
     same(source.replacements.map((r) => r.module).sort(), expected, 'Reviewed local source inventory differs');
     demand(source.replacements.some((r) => r.module === meta.module && r.path === meta.replacementPath

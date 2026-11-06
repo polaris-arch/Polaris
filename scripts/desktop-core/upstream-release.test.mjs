@@ -549,8 +549,10 @@ function reviewedFixture(v2 = false) {
       'github.com/sagernet/sing-quic': 'sing-quic', 'github.com/sagernet/wireguard-go': 'wireguard-go',
       'github.com/database64128/tfo-go/v2': 'tfo-go',
     };
-    if (v2 === 3) directories['github.com/sagernet/sing-vmess'] = 'sing-vmess';
-    contract.sourcePolicy.schema = v2 === 3 ? 'polaris-reviewed-kernel-source-v3' : 'polaris-reviewed-kernel-source-v2';
+    if (v2 === 3 || v2 === 4) directories['github.com/sagernet/sing-vmess'] = 'sing-vmess';
+    if (v2 === 4) directories['github.com/libp2p/go-nat'] = 'go-nat';
+    contract.sourcePolicy.schema = v2 === 4 ? 'polaris-reviewed-kernel-source-v4'
+      : v2 === 3 ? 'polaris-reviewed-kernel-source-v3' : 'polaris-reviewed-kernel-source-v2';
     contract.sourcePolicy.vendors = Object.fromEntries(Object.entries(directories).map(([name, directory], index) => [name,
       name === contract.sourcePolicy.metacubex.module
         ? Object.fromEntries(['version', 'replacementPath', 'replacementTree', 'replacementFileCount']
@@ -651,37 +653,64 @@ test('reviewed v3 admits exactly ten vendors without changing historical v2 or i
     assert.throws(() => validateReleaseContract(changed));
   }
 });
-for (const schema of [true, 3]) test(`reviewed ${schema === 3 ? 'v3 ten' : 'v2 nine'} desktop rows retain exact source and linked inventories on every platform`, () => {
+test('reviewed v4 adds only go-nat to the complete eleven-vendor desktop contract', () => {
+  const contract = reviewedFixture(4), policy = reviewedSourcePolicy(contract);
+  assert.equal(validateReleaseContract(contract), contract);
+  assert.equal(upstreamSourceGoVersion(contract), 'go1.27.2');
+  assert.equal(Object.keys(policy.vendors).length, 11);
+  assert.equal(policy.vendors['github.com/libp2p/go-nat'].replacementPath, './third_party/go-nat');
+  assert.equal(Object.keys(reviewedSourcePolicy(reviewedFixture(3)).vendors).length, 10);
+  assert.equal(Object.keys(reviewedSourcePolicy(reviewedFixture(true)).vendors).length, 9);
+  for (const [mutate, expected] of [
+    [c => { c.sourcePolicy.schema = 'polaris-reviewed-kernel-source-v3'; }, 'Exact schema-specific reviewed vendor names required'],
+    [c => { delete c.sourcePolicy.vendors['github.com/libp2p/go-nat']; }, 'Exact schema-specific reviewed vendor names required'],
+    [c => { c.sourcePolicy.vendors.extra = structuredClone(policy.vendors['github.com/libp2p/go-nat']); }, 'Exact schema-specific reviewed vendor names required'],
+    [c => { c.sourcePolicy.vendors['github.com/libp2p/go-nat'].replacementPath = './third_party/tailscale'; }, 'Exact reviewed vendor declaration differs: github.com/libp2p/go-nat'],
+    [c => { c.sourcePolicy.vendors['github.com/libp2p/go-nat'].replacementFileCount = true; }, 'Exact reviewed vendor declaration differs: github.com/libp2p/go-nat'],
+    [c => { c.releaseId = null; }, 'Upstream release contract identity differs'],
+    [c => { c.producer.runId = null; }, 'Upstream same-run producer identity differs'],
+  ]) {
+    const changed = structuredClone(contract); mutate(changed);
+    assert.throws(() => validateReleaseContract(changed), { name: 'Error', message: expected });
+  }
+});
+for (const schema of [true, 3, 4]) test(`reviewed ${schema === 4 ? 'v4 eleven' : schema === 3 ? 'v3 ten' : 'v2 nine'} desktop rows retain exact source and linked inventories on every platform`, () => {
   const contract = reviewedFixture(schema);
+  assert.equal(validateReleaseContract(contract), contract);
   for (const key of Object.keys(contract.platforms)) {
     for (const name of Object.keys(contract.sourcePolicy.vendors)) {
+      const sourceMismatch = name === 'github.com/metacubex/utls' ? 'Reviewed Meta source subtree differs' : 'Reviewed vendor source subtree differs';
       const changes = [
-        (r, s) => { s.tree = '0'.repeat(40); }, (r, s) => { s.path = './outside'; },
-        r => { r.sourceIdentity.replacements = r.sourceIdentity.replacements.filter(s => s.module !== name); },
-        (r, s) => { r.sourceIdentity.replacements.push(structuredClone(s)); },
-        r => { r.buildGraph.localReplacements = r.buildGraph.localReplacements.filter(l => l.module !== name); },
-        (r, s, l) => { r.buildGraph.localReplacements.push(structuredClone(l)); },
-        (r, s, l) => { l.version = 'v9.9.9'; }, (r, s, l) => { l.h1 = 'h1:YQ='; },
-        (r, s, l) => { l.replacement.module = './outside'; },
-        (r, s, l) => { l.replacement.version = 'v1.0.0'; }, (r, s, l) => { l.replacement.h1 = 'h1:YQ='; },
-        (r, s, l) => { l.replacement = { module: name, version: 'v1.0.0', h1: 'h1:YQ=' }; },
-        r => { r.buildGraph.localReplacements = r.buildGraph.localReplacements.filter(l => l.module !== name);
-          r.buildGraph.normalModules.push({ module: name, version: 'v1.0.0', h1: 'h1:YQ=' }); },
+        [(r, s) => { s.tree = '0'.repeat(40); }, sourceMismatch],
+        [(r, s) => { s.path = './outside'; }, sourceMismatch],
+        [r => { r.sourceIdentity.replacements = r.sourceIdentity.replacements.filter(s => s.module !== name); }, 'Reviewed local source inventory differs'],
+        [(r, s) => { r.sourceIdentity.replacements.push(structuredClone(s)); }, 'Upstream source/replacement proof differs'],
+        [r => { r.buildGraph.localReplacements = r.buildGraph.localReplacements.filter(l => l.module !== name); }, 'Reviewed embedded local inventory differs'],
+        [(r, s, l) => { r.buildGraph.localReplacements.push(structuredClone(l)); }, 'Upstream module graph incomplete'],
+        [(r, s, l) => { l.version = 'v9.9.9'; }, 'Actual reviewed vendor local replacement differs'],
+        [(r, s, l) => { l.h1 = 'h1:YQ='; }, 'Upstream replacement identities missing'],
+        [(r, s, l) => { l.replacement.module = './outside'; }, 'Actual reviewed vendor local replacement differs'],
+        [(r, s, l) => { l.replacement.version = 'v1.0.0'; }, 'Upstream replacement identities missing'],
+        [(r, s, l) => { l.replacement.h1 = 'h1:YQ='; }, 'Upstream replacement identities missing'],
+        [(r, s, l) => { l.replacement = { module: name, version: 'v1.0.0', h1: 'h1:YQ=' }; }, 'Reviewed embedded local inventory differs'],
+        [r => { r.buildGraph.localReplacements = r.buildGraph.localReplacements.filter(l => l.module !== name);
+          r.buildGraph.normalModules.push({ module: name, version: 'v1.0.0', h1: 'h1:YQ=' }); }, 'Reviewed embedded local inventory differs'],
       ];
-      for (const change of changes) {
+      for (const [change, expected] of changes) {
         const changed = structuredClone(contract), row = changed.platforms[key];
         change(row, row.sourceIdentity.replacements.find(s => s.module === name), row.buildGraph.localReplacements.find(l => l.module === name));
-        assert.throws(() => validateReleaseContract(changed), undefined, `${key}: ${name}`);
+        assert.throws(() => validateReleaseContract(changed), { name: 'Error', message: expected }, `${key}: ${name}`);
       }
     }
   }
-  for (const change of [
-    c => { c.platforms.linux.sourceIdentity.replacements.push({ module: 'example.invalid/extra', path: './extra', tree }); },
-    c => { c.platforms.linux.buildGraph.localReplacements.push({ module: 'example.invalid/extra', version: 'v1.0.0', h1: '',
-      replacement: { module: './extra', version: '(devel)', h1: '' } }); },
-    c => { c.platforms.linux.sourceIdentity.goSumSha256 = '0'.repeat(64); },
-    c => { c.platforms.linux.goVersion = 'go1.26.8'; },
-  ]) { const changed = structuredClone(contract); change(changed); assert.throws(() => validateReleaseContract(changed)); }
+  for (const [change, expected] of [
+    [c => { c.platforms.linux.sourceIdentity.replacements.push({ module: 'example.invalid/extra', path: './extra', tree }); }, 'Reviewed local source inventory differs'],
+    [c => { c.platforms.linux.buildGraph.localReplacements.push({ module: 'example.invalid/extra', version: 'v1.0.0', h1: '',
+      replacement: { module: './extra', version: '(devel)', h1: '' } }); }, 'Reviewed embedded local inventory differs'],
+    [c => { c.platforms.linux.sourceIdentity.goSumSha256 = '0'.repeat(64); }, 'Reviewed source module pins differ'],
+    [c => { c.platforms.linux.goVersion = 'go1.26.8'; }, 'Upstream toolchain/BuildID differs'],
+  ]) { const changed = structuredClone(contract); change(changed);
+    assert.throws(() => validateReleaseContract(changed), { name: 'Error', message: expected }); }
 });
 test('reviewed v2 source schema never supplies missing final tag producer or public asset facts', () => {
   const contract = reviewedFixture(true);
@@ -738,7 +767,7 @@ test('actual Go1.27.2 BuildInfo preserves real local devel identity with no inve
     assert.throws(() => verifyReleaseCore(path, row, 'linux', run(raw), 'linux', undefined, mismatched), /source pair/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-for (const schema of [true, 3]) test(`reviewed ${schema === 3 ? 'v3 ten' : 'v2 nine'} inert BuildInfo matches all linked vendors on all four desktop targets`, () => {
+for (const schema of [true, 3, 4]) test(`reviewed ${schema === 4 ? 'v4 eleven' : schema === 3 ? 'v3 ten' : 'v2 nine'} inert BuildInfo matches all linked vendors on all four desktop targets`, () => {
   const contract = reviewedFixture(schema), root = mkdtempSync(join(tmpdir(), 'reviewed-vendor-buildinfo-'));
   try {
     for (const [key, row] of Object.entries(contract.platforms)) {

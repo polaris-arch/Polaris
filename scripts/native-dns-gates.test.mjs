@@ -651,8 +651,8 @@ test('published replacement is selected only through the complete exact contract
   assert.equal(pending.producerRunId, 40956987023);
   assert.equal(pending.producerRunAttempt, 1);
   assert.equal(pending.originalIndexSha256, '6a1ccf4dc27e7a9e2216688a65aecb72bcdc0874e308aa2bb589cf5011eb1c52');
-  // Desktop alpha.12.7 and the unchanged alpha.12.6 mobile input retain
-  // separate identities; the original a4d input remains immutable history.
+  // Desktop alpha.12.7 retains its prior mobile pin. The alpha.12.17 source
+  // candidate is separate; the original a4d input remains immutable history.
   const historicalMobileBytes = readFileSync(join(root, 'scripts/mobile-core/fixtures/selected-source-contract-a4d.json'));
   assert.equal(digest(historicalMobileBytes), 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0');
   const historicalMobile = JSON.parse(historicalMobileBytes);
@@ -662,13 +662,16 @@ test('published replacement is selected only through the complete exact contract
   assert.notEqual(pending.mobileSourceContractSha256, digest(historicalMobileBytes));
   const selectedMobileBytes = readFileSync(join(root, 'scripts/mobile-core/source-contract.json'));
   const selectedMobile = JSON.parse(selectedMobileBytes);
-  assert.equal(selectedMobile.sourceCommit, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
-  assert.equal(selectedMobile.sourceTagObject, '8a230c1d34cb4855b261944e2935ce36f9cd14de');
+  assert.equal(selectedMobile.sourceCommit, '2dba95e1b0285c29e78c48fc8ab8a451788a7d83');
+  assert.equal(selectedMobile.sourceTree, '47f42dc28e36fd9f49168fe3041324f349164f43');
+  assert.equal(selectedMobile.sourceTagObject, 'e2062a447f2ade69818b1313a38d5e0654ea0aa4');
   assert.notEqual(selectedMobile.sourceCommit, current.sourceCommit);
   assert.notEqual(selectedMobile.sourceTree, current.sourceTree);
   assert.notEqual(selectedMobile.sourceTagObject, current.tagObject);
   assert.notDeepEqual(selectedMobile.sourcePolicy, current.sourcePolicy);
-  assert.equal(digest(selectedMobileBytes), pending.mobileSourceContractSha256);
+  assert.equal(pending.mobileSourceContractSha256, '8acececd46ddbe2f12056a15b6009400044508f2c162781f86ef2b63fee01104');
+  assert.equal(digest(selectedMobileBytes), '0c9b279d40d33f8cb9bb096a38e29e6d98220a7f25e6cc682ad94e9817f9b208');
+  assert.notEqual(digest(selectedMobileBytes), pending.mobileSourceContractSha256);
   assert.equal(selectedMobile.artifactPins, null);
   assert.equal(selectedMobile.producerReceipt, null);
   for (const flag of ['AppAccepted', 'devicePassed', 'publicationEligible']) assert.equal(selectedMobile[flag], false);
