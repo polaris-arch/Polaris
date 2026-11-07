@@ -1444,7 +1444,7 @@ jobs:
 
       - name: Run exact controlled App lifecycle hot-switch and stats tests
         id: native_dns_app_runtime
-        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && !cancelled() && needs.cheap_format.outputs.native_dns_candidate != '' && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && !cancelled() && (needs.cheap_format.outputs.native_dns_candidate != '' || (needs.cheap_format.outputs.native_dns_formal == 'true' && github.event_name == 'workflow_dispatch')) && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
         shell: bash
         run: |
           set -euo pipefail
