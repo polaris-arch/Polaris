@@ -655,12 +655,11 @@ mod linux {
         let config = sealed_config(&closure.config_bytes)?;
         #[cfg(test)]
         eprintln!("strict-check stage=sealed_config complete");
-        let source_identity =
-            FileSnapshot::path(binary_path).map_err(|_error| {
-                #[cfg(test)]
-                eprintln!("strict-check stage=source_snapshot_before error={_error:?}");
-                CandidateCheckError::Unsupported
-            })?;
+        let source_identity = FileSnapshot::path(binary_path).map_err(|_error| {
+            #[cfg(test)]
+            eprintln!("strict-check stage=source_snapshot_before error={_error:?}");
+            CandidateCheckError::Unsupported
+        })?;
         let payload = crate::runtime::core_identity::acquire_at(
             binary_path,
             polaris_core_supervisor::admitted_payload::ExecPurpose::CheckConfig,
@@ -689,12 +688,11 @@ mod linux {
             CandidateCheckError::Unsupported
         })?;
         run_check(execution, config, timeout).await?;
-        let after =
-            FileSnapshot::path(binary_path).map_err(|_error| {
-                #[cfg(test)]
-                eprintln!("strict-check stage=source_snapshot_after error={_error:?}");
-                CandidateCheckError::Unsupported
-            })?;
+        let after = FileSnapshot::path(binary_path).map_err(|_error| {
+            #[cfg(test)]
+            eprintln!("strict-check stage=source_snapshot_after error={_error:?}");
+            CandidateCheckError::Unsupported
+        })?;
         if !source_identity.same_snapshot(&after) {
             #[cfg(test)]
             eprintln!(
