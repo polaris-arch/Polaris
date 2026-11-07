@@ -686,8 +686,8 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
     expect(ownsApplyOutcome(read('../mobile/MobilePendingBar.tsx'))).toBe(true);
   });
 
-  it('Apply result ownership AST rejects disconnected and comment-only lookalikes on both surfaces', () => {
-    for (const path of ['../components/layout/PendingChangesBar.tsx', '../mobile/MobilePendingBar.tsx']) {
+  it.each(['../components/layout/PendingChangesBar.tsx', '../mobile/MobilePendingBar.tsx'])(
+    'Apply result ownership AST rejects disconnected and comment-only lookalikes on %s', (path) => {
       const source = read(path);
       const outcomeCall = 'applyOutcome(result.status, result.reasons)';
       const reason = "reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null";
@@ -793,7 +793,7 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
         expect(ownsApplyOutcome(mutateApplyHandler(source, before, after)), `${path}: ${after}`).toBe(false);
       }
     }
-  });
+  );
 
   it('`#s-home > .pending-bar` override 必须留着 —— 它现在是降级横幅的唯一支撑', () => {
     /**
