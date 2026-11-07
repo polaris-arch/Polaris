@@ -477,7 +477,7 @@ mod linux_tests {
     fn historical_alpha125_retains_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 12);
         let replacement = &REVIEWED_CHECK_IDENTITIES[7];
         assert_eq!(
             replacement.source_commit,
@@ -555,7 +555,7 @@ mod linux_tests {
     fn historical_alpha126_requires_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 12);
         let replacement = &REVIEWED_CHECK_IDENTITIES[8];
         assert_eq!(
             replacement.source_commit,
@@ -633,7 +633,7 @@ mod linux_tests {
     fn alpha127_requires_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 12);
         let replacement = &REVIEWED_CHECK_IDENTITIES[9];
         assert_eq!(
             replacement.source_commit,
@@ -725,7 +725,7 @@ mod linux_tests {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
 
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 11);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 12);
         let local = &REVIEWED_CHECK_IDENTITIES[10];
         assert_eq!(
             local.source_commit,
@@ -788,6 +788,61 @@ mod linux_tests {
     }
 
     #[test]
+    fn alpha1219_requires_its_exact_source_contract_and_elf_without_historical_borrowing() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+        let current = &REVIEWED_CHECK_IDENTITIES[11];
+        assert_eq!(
+            current.source_commit,
+            "d8727ed53de26cfd13c95f96d0a69235792d221b"
+        );
+        let contract = "138b6f4cfd32a98672e61cc9c1254f111edaf9329ffd8d29fa068ea4f31d885a";
+        assert_eq!(current.contract_sha256, Some(contract));
+        assert_eq!(
+            reviewed_compiled_profile(current.source_commit, contract),
+            Ok(LinuxCheckProfile::D8727E)
+        );
+        assert_eq!(
+            LinuxCheckProfile::D8727E.binary_sha256(),
+            "52fa28601a23cb248e0bd259ae1c770e06aa3c8aa46f62f4360d6435a5090675"
+        );
+        assert_eq!(
+            LinuxCheckProfile::D8727E.input_profile(),
+            LinuxInputProfile::D8727E
+        );
+        assert!(LinuxCheckProfile::D8727E
+            .execution_profile()
+            .contains("d8727e:runtime-evidence-pending"));
+        for historical in &REVIEWED_CHECK_IDENTITIES[..11] {
+            assert_ne!(historical.binary_sha256, current.binary_sha256);
+            assert_eq!(
+                reviewed_compiled_profile(historical.source_commit, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+            if let Some(old_contract) = historical.contract_sha256 {
+                assert_eq!(
+                    reviewed_compiled_profile(current.source_commit, old_contract),
+                    Err(CandidateCheckError::Unsupported)
+                );
+            }
+        }
+        for wrong in ["", "unknown", current.binary_sha256] {
+            assert_eq!(
+                reviewed_compiled_profile(current.source_commit, wrong),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&current.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(current.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+
+    #[test]
     fn candidate_test_selection_requires_exact_opt_in_or_reviewed_compiled_identity() {
         use super::super::select_test_core;
         use std::ffi::OsStr;
@@ -808,6 +863,7 @@ mod linux_tests {
             LinuxCheckProfile::E332935,
             LinuxCheckProfile::BFCDF96,
             LinuxCheckProfile::E3155C9,
+            LinuxCheckProfile::D8727E,
         ] {
             for required in [false, true] {
                 assert_eq!(
@@ -913,6 +969,7 @@ mod linux_tests {
             LinuxCheckProfile::E332935,
             LinuxCheckProfile::BFCDF96,
             LinuxCheckProfile::E3155C9,
+            LinuxCheckProfile::D8727E,
         ] {
             for path in [dir.join("missing"), wrong.clone(), link.clone()] {
                 assert!(matches!(
@@ -970,6 +1027,10 @@ mod linux_tests {
             (LinuxCheckProfile::E3155C9, LinuxCheckProfile::BFCDF96),
             (LinuxCheckProfile::BFCDF96, LinuxCheckProfile::E3155C9),
             (LinuxCheckProfile::C6C0D8, LinuxCheckProfile::E332935),
+            (LinuxCheckProfile::D8727E, LinuxCheckProfile::E3155C9),
+            (LinuxCheckProfile::E3155C9, LinuxCheckProfile::D8727E),
+            (LinuxCheckProfile::D8727E, LinuxCheckProfile::LOCAL402F),
+            (LinuxCheckProfile::LOCAL402F, LinuxCheckProfile::D8727E),
         ] {
             let (dir, runtime, snapshot, input, plan) = fixture();
             let candidate =
@@ -1276,6 +1337,7 @@ mod linux_tests {
             LinuxCheckProfile::E332935,
             LinuxCheckProfile::BFCDF96,
             LinuxCheckProfile::E3155C9,
+            LinuxCheckProfile::D8727E,
         ] {
             if substituted != profile {
                 assert!(matches!(
