@@ -317,10 +317,9 @@ function faceCheckerCall(text) {
   return m[1].replace(/"\$\{?[A-Za-z_]\w*\}?\/([\w.-]+)"/g, '$1').trim();
 }
 
-// 6 个 CI 步骤（两个 fmt 共用同一本机门）：ci.yml 的 step 名 → gate-rust.sh 的 run_gate 名 → 若该步骤有 env 限定则给出变量名。
+// CI 步骤 → gate-rust.sh 的同源门；fmt 只在 cheap_format 跑一次。
 const GATES = [
   { ci: 'Check workspace formatting before native compilation', sh: 'fmt', envVar: null },
-  { ci: 'Check formatting', sh: 'fmt', envVar: null },
   { ci: 'Clippy (deny warnings)', sh: 'clippy', envVar: 'RUSTFLAGS' },
   { ci: 'Rustdoc documentation invariants (deny four lints)', sh: 'rustdoc', envVar: 'RUSTDOCFLAGS' },
   { ci: 'Build', sh: 'build', envVar: null },
@@ -417,6 +416,8 @@ const ANDROID_FACE_STEP = 'Android impact face must be registered (dep-info 对�
 // scope and commands below; native-dns-ci-routing.test.mjs checks admission,
 // payload identity, exact Rust namespaces and failure/evidence routing.
 const CI_ONLY_SOURCE_STEP = 'Test additive RuntimeConfig client against loopback mocks';
+// This early subset is already covered by the later complete workspace and local test gate.
+const CI_ONLY_SOURCE_CRATES_STEP = 'Test source and mock crates before core acquisition';
 const CI_ONLY_LOOPBACK_STEP = 'Run exact real App to paired kernel HOT loopback tests';
 const CI_ONLY_SUBSCRIPTION_STEP = 'Verify native subscription JSON URI and UA preservation';
 const CI_ONLY_BOOTSTRAP_STEP = 'Verify native helper bootstrap descriptor primitives';
@@ -824,7 +825,7 @@ function assertCargoStepCoverage(ci) {
   }
   assert.ok(cargoSteps.length > 0, '一个跑 cargo 的步骤都没抠到 —— 取材面是空的，本断言恒真');
 
-  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP, CI_ONLY_WINDOWS_INSTALLER_STEP]);
+  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_SOURCE_CRATES_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP, CI_ONLY_WINDOWS_INSTALLER_STEP]);
   const orphans = cargoSteps.filter((n) => !covered.has(n));
   assert.deepEqual(
     orphans,
@@ -834,9 +835,32 @@ function assertCargoStepCoverage(ci) {
       '要么（多行 shell 块，抠不出单行）加进 MIRRORED_BUT_NOT_VERBATIM 并为它补一条针对性对拍。'
   );
 
-  const stale = [...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP, CI_ONLY_WINDOWS_INSTALLER_STEP].filter((n) => !cargoSteps.includes(n));
+  const stale = [...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_SOURCE_CRATES_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP, CI_ONLY_WINDOWS_INSTALLER_STEP].filter((n) => !cargoSteps.includes(n));
   assert.deepEqual(stale, [], `非逐字镜像名单里有 ci.yml 已经没有的步骤（名单陈旧）：${JSON.stringify(stale)}`);
 }
+
+function assertEarlySourceCrates(ci) {
+  const block = extractCiStepBlock(extractCiJobBlock(ci, 'test'), CI_ONLY_SOURCE_CRATES_STEP);
+  assert.equal(extractRunCommand(block, CI_ONLY_SOURCE_CRATES_STEP),
+    'cargo test --locked -p polaris-helper-proto -p polaris-log-budget -p polaris-source-probe -p polaris-stats-engine -p polaris-store -p polaris-unlock -p polaris-unlock-transport --no-fail-fast');
+  assert.deepEqual([...block.matchAll(/^        if: (.+)$/gm)].map((m) => m[1]),
+    ["needs.cheap_format.outputs.app_native_compile_only != 'true'"]);
+  assert.doesNotMatch(block, /continue-on-error|--lib|--no-default-features|\|\| true/);
+}
+test('early source crates retain all seven default test and doctest targets and ordinary failure propagation', () => {
+  const { ci } = loadStripped();
+  assertEarlySourceCrates(ci);
+  const block = extractCiStepBlock(extractCiJobBlock(ci, 'test'), CI_ONLY_SOURCE_CRATES_STEP);
+  for (const [before, after] of [
+    ['-p polaris-store ', ''],
+    ['--no-fail-fast', '--lib --no-fail-fast'],
+    ["if: needs.cheap_format.outputs.app_native_compile_only != 'true'", 'if: false'],
+    ['        run:', '        continue-on-error: true\n        run:'],
+  ]) {
+    assert.ok(block.includes(before));
+    assert.throws(() => assertEarlySourceCrates(ci.replace(block, block.replace(before, after))), { name: 'AssertionError' });
+  }
+});
 
 test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字镜像名单里', () => {
   const { ci } = loadStripped();

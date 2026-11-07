@@ -185,6 +185,47 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     }
   });
 
+  it('source/mock tests run before native inputs with their compiler prerequisites and ordinary failure semantics', () => {
+    const ci = workflow('ci.yml');
+    const name = 'Test source and mock crates before core acquisition';
+    const check = (source: string) => {
+      const job = executable(jobBlock(source, 'test'));
+      const early = stepBlock(job, name);
+      const condition = /^ {8}if: (.+)$/m.exec(early);
+      expect(condition).not.toBeNull();
+      for (const value of ['', 'false', 'unknown', 'true'])
+        expect(runInNewContext(condition![1], { needs: { cheap_format: { outputs: { app_native_compile_only: value } } } }))
+          .toBe(value !== 'true');
+      expect(early).not.toMatch(/continue-on-error|always\(\)|\|\| true/);
+      const at = job.indexOf(`- name: ${name}\n`);
+      for (const prerequisite of ['Install Rust toolchain (preinstalled rustup)', 'Setup Rust cache',
+        'Install NASM (Windows — pinned URL + sha256)']) {
+        const position = job.indexOf(`- name: ${prerequisite}\n`);
+        expect(position, prerequisite).toBeGreaterThanOrEqual(0);
+        expect(position, prerequisite).toBeLessThan(at);
+      }
+      for (const native of ['Activate admitted native DNS test inputs for the actual host',
+        'Install protoc (pinned URL + sha256)', 'Install Linux system dependencies (Tauri webkit/gtk)',
+        'Acquire all four explicit candidate payloads before placeholders',
+        'Build actual candidate helper bytes and freeze the separate App identity',
+        'Verify all candidate payloads and compiled identity before workspace build', 'Build', 'Test'])
+        expect(job.indexOf(`- name: ${native}\n`), native).toBeGreaterThan(at);
+      expect(stepBlock(job, 'Test')).toMatch(/^ {8}run: cargo test --workspace --no-fail-fast$/m);
+      expect(job.match(/POLARIS_RELEASE_JOB_DEADLINE_MS=/g)).toHaveLength(1);
+    };
+    check(ci);
+    const job = jobBlock(ci, 'test');
+    const early = stepBlock(job, name);
+    const acquire = stepBlock(job, 'Acquire all four explicit candidate payloads before placeholders');
+    const nasm = stepBlock(job, 'Install NASM (Windows — pinned URL + sha256)');
+    const protoc = stepBlock(job, 'Install protoc (pinned URL + sha256)');
+    for (const changed of [
+      ci.replace(early, '').replace(acquire, acquire + early),
+      ci.replace(nasm, ''),
+      ci.replace(protoc, '').replace(early, protoc + early),
+    ]) expect(() => check(changed)).toThrow();
+  });
+
   it('ci.yml 格式前置门与三个并行 job：Linux 专属检查恰在 ubuntu 腿存在时运行，且不能静默关闭', () => {
     // 背景：2026-10-07 之前交叉 clippy / Android dep-info 对差 / 豁免反腐烂是矩阵 job 里
     // `if: runner.os == 'Linux'` 的三步 —— 「ubuntu 腿在跑」⇔「这三步在跑」由构造保证。
@@ -252,7 +293,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属四步都在 cross）。
     const home: [string, string][] = [
       ['- name: Check workspace formatting before native compilation', 'cheap_format'],
-      ['- name: Check formatting', 'lint'],
       ['- name: Clippy (deny warnings)', 'lint'],
       ['- name: Rustdoc documentation invariants (deny four lints)', 'lint'],
       ['- name: Resolve core-owned Cronet dependencies', 'lint'],
@@ -264,6 +304,8 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       ['- name: Test\n', 'test'],
     ];
     const blocks = { cheap_format: cheapFormat, lint, cross, test };
+    expect([...ci.matchAll(/^ {8}run: cargo fmt --all -- --check$/gm)]).toHaveLength(1);
+    expect(lint).not.toContain('- name: Check formatting');
     for (const [needle, owner] of home) {
       for (const [name, block] of Object.entries(blocks)) {
         expect(block.includes(needle), `「${needle.trim()}」应只在 ${owner} job 里（现在查的是 ${name}）`)

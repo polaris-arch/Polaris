@@ -679,10 +679,6 @@ jobs:
           appendFileSync(process.env.GITHUB_ENV, `TAURI_CONFIG=${JSON.stringify({ bundle: { resources } })}\n`);
           NODE
 
-      # fmt 独立 job 之外的快速门：直接检 fmt 是否干净（--check 不改文件）。
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
       # Keep independent crates visible after one fails; failed dependencies still block consumers.
       # The failure exit code, target selection and job budget are unchanged.
       - name: Clippy (deny warnings)
@@ -1119,6 +1115,41 @@ jobs:
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
 
+      # 键独立的理由见 lint job 同名步。这一份是三者里最大的（dev 构型全量 codegen）。
+      - name: Setup Rust cache
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Install NASM (Windows — pinned URL + sha256)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          NASM_VERSION: '3.02'
+        run: |
+          set -euo pipefail
+          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
+          tmp="$(cygpath -u "$RUNNER_TEMP")"
+          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
+            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
+          echo "${sha256}  ${zip}" | sha256sum -c -
+          rm -rf "${tmp}/nasm-${NASM_VERSION}"
+          # zip 内已带 `nasm-<ver>/` 顶层目录，解到 tmp 即得 `<tmp>/nasm-<ver>/nasm.exe`。
+          # 落点是 `$tmp`（= RUNNER_TEMP，runner 保证存在；bsdtar 的 -C 要求目录已在，故成立）。
+          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
+          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
+          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
+          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
+
+      # These crates use source/mock/local HTTP fixtures, never the selected core.
+      # btls-sys uses the runner C/C++/CMake/Clang toolchain and pinned Windows NASM above.
+      # Default targets include doctests; native tests still run in the full workspace below.
+      - name: Test source and mock crates before core acquisition
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true'
+        run: cargo test --locked -p polaris-helper-proto -p polaris-log-budget -p polaris-source-probe -p polaris-stats-engine -p polaris-store -p polaris-unlock -p polaris-unlock-transport --no-fail-fast
+
       - name: Activate admitted native DNS test inputs for the actual host
         if: needs.cheap_format.outputs.app_native_compile_only != 'true'
         id: native_dns_host
@@ -1227,39 +1258,11 @@ jobs:
             node scripts/fetch-core.mjs 2>&1 | tee native-dns-ci-evidence/acquisition.log
           fi
 
-      # 键独立的理由见 lint job 同名步。这一份是三者里最大的（dev 构型全量 codegen）。
-      - name: Setup Rust cache
-        if: needs.cheap_format.outputs.app_native_compile_only != 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: test
-
-      # protoc / NASM：钉扎真值、版本依据与「活步，勿删」的实证都在 lint job 同名步上方。
+      # protoc 的钉扎真值与实证见 lint；Windows NASM 已为前面的无核测试安装。
       # NASM 常量现在全仓三处内联（本文件 lint / test 两处 + package.yml 一处），必须同时改；
       # 三处逐字相等由 `ui/src/contracts/workflow-toolchain-pin-parity.test.ts` 对拍。
       - name: Install protoc (pinned URL + sha256)
         run: node scripts/fetch-protoc.mjs
-
-      - name: Install NASM (Windows — pinned URL + sha256)
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          NASM_VERSION: '3.02'
-        run: |
-          set -euo pipefail
-          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
-          tmp="$(cygpath -u "$RUNNER_TEMP")"
-          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
-            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
-          echo "${sha256}  ${zip}" | sha256sum -c -
-          rm -rf "${tmp}/nasm-${NASM_VERSION}"
-          # zip 内已带 `nasm-<ver>/` 顶层目录，解到 tmp 即得 `<tmp>/nasm-<ver>/nasm.exe`。
-          # 落点是 `$tmp`（= RUNNER_TEMP，runner 保证存在；bsdtar 的 -C 要求目录已在，故成立）。
-          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
-          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
-          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
-          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
 
       # 断言的理由与写法同 lint job 同名步。
       - name: Assert pinned tools resolve on PATH
