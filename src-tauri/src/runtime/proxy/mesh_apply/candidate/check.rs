@@ -559,6 +559,17 @@ mod linux {
                 Err(CandidateCheckError::CheckFailed)
             }
             Ok(RawCheck::TimedOut { .. }) => Err(CandidateCheckError::TimedOut),
+            #[cfg(test)]
+            Ok(RawCheck::SpawnFailed(error)) => {
+                eprintln!("strict-check stage=run_check_spawn error={error:?}");
+                Err(CandidateCheckError::Unsupported)
+            }
+            #[cfg(test)]
+            Err(ValidationLifecycleError::Admission(error)) => {
+                eprintln!("strict-check stage=run_check_admission error={error:?}");
+                Err(CandidateCheckError::Unsupported)
+            }
+            #[cfg(not(test))]
             Ok(RawCheck::SpawnFailed(_)) | Err(ValidationLifecycleError::Admission(_)) => {
                 Err(CandidateCheckError::Unsupported)
             }
@@ -602,12 +613,21 @@ mod linux {
                 &candidate.facts.plan,
                 super::super::CandidateProfile::DesktopNonTunDirectVlessV1,
             )
-            .map_err(|_| CandidateCheckError::Unsupported)?;
+            .map_err(|_error| {
+                #[cfg(test)]
+                eprintln!("strict-check stage=validate_candidate_before error={_error:?}");
+                CandidateCheckError::Unsupported
+            })?;
         // Scope comes from the same owned effective config used by the full
         // builder, never a new live deps/config projection after preparation.
         if candidate.metadata().check_support
             != super::super::CheckSupport::LinuxX8664PinnedPlainTcpOnly
         {
+            #[cfg(test)]
+            eprintln!(
+                "strict-check stage=metadata_support actual={:?}",
+                candidate.metadata().check_support,
+            );
             return Err(CandidateCheckError::Unsupported);
         }
         let closure = &candidate.materialized.closure;
@@ -618,28 +638,66 @@ mod linux {
             || closure.config_sha256 != candidate.facts.final_config_sha256
             || polaris_updater::verify::sha256_hex(&closure.config_bytes) != closure.config_sha256
         {
+            #[cfg(test)]
+            eprintln!(
+                "strict-check stage=closure rule_files={} raw_matches={} version_matches={} revision_matches={} candidate_hash_matches={} bytes_hash_matches={}",
+                closure.rule_files.len(),
+                candidate.facts.raw_document_sha256 == snapshot.raw_document_sha256(),
+                candidate.facts.config_version == snapshot.config_version(),
+                candidate.facts.input_state_revision == snapshot.state().revision,
+                closure.config_sha256 == candidate.facts.final_config_sha256,
+                polaris_updater::verify::sha256_hex(&closure.config_bytes) == closure.config_sha256,
+            );
             return Err(CandidateCheckError::Unsupported);
         }
+        #[cfg(test)]
+        eprintln!("strict-check stage=sealed_config begin");
         let config = sealed_config(&closure.config_bytes)?;
-        let source_identity =
-            FileSnapshot::path(binary_path).map_err(|_| CandidateCheckError::Unsupported)?;
+        #[cfg(test)]
+        eprintln!("strict-check stage=sealed_config complete");
+        let source_identity = FileSnapshot::path(binary_path).map_err(|_error| {
+            #[cfg(test)]
+            eprintln!("strict-check stage=source_snapshot_before error={_error:?}");
+            CandidateCheckError::Unsupported
+        })?;
         let payload = crate::runtime::core_identity::acquire_at(
             binary_path,
             polaris_core_supervisor::admitted_payload::ExecPurpose::CheckConfig,
         )
-        .map_err(|_| CandidateCheckError::Unsupported)?;
+        .map_err(|_error| {
+            #[cfg(test)]
+            eprintln!("strict-check stage=acquire_at error={_error:?}");
+            CandidateCheckError::Unsupported
+        })?;
         if payload.binary_sha256() != profile.binary_sha256() {
+            #[cfg(test)]
+            eprintln!(
+                "strict-check stage=binary_profile actual={} expected={}",
+                payload.binary_sha256(),
+                profile.binary_sha256(),
+            );
             return Err(CandidateCheckError::Unsupported);
         }
         let execution = crate::runtime::core_identity::prepare_admitted(
             &payload,
             polaris_core_supervisor::admitted_payload::ExecPurpose::CheckConfig,
         )
-        .map_err(|_| CandidateCheckError::Unsupported)?;
+        .map_err(|_error| {
+            #[cfg(test)]
+            eprintln!("strict-check stage=prepare_admitted error={_error:?}");
+            CandidateCheckError::Unsupported
+        })?;
         run_check(execution, config, timeout).await?;
-        let after =
-            FileSnapshot::path(binary_path).map_err(|_| CandidateCheckError::Unsupported)?;
+        let after = FileSnapshot::path(binary_path).map_err(|_error| {
+            #[cfg(test)]
+            eprintln!("strict-check stage=source_snapshot_after error={_error:?}");
+            CandidateCheckError::Unsupported
+        })?;
         if !source_identity.same_snapshot(&after) {
+            #[cfg(test)]
+            eprintln!(
+                "strict-check stage=source_snapshot_changed before={source_identity:?} after={after:?}",
+            );
             return Err(CandidateCheckError::Unsupported);
         }
         runtime
@@ -652,7 +710,11 @@ mod linux {
                 &candidate.facts.plan,
                 super::super::CandidateProfile::DesktopNonTunDirectVlessV1,
             )
-            .map_err(|_| CandidateCheckError::Unsupported)?;
+            .map_err(|_error| {
+                #[cfg(test)]
+                eprintln!("strict-check stage=validate_candidate_after error={_error:?}");
+                CandidateCheckError::Unsupported
+            })?;
         Ok(CheckedCandidate {
             config_sha256: closure.config_sha256.clone(),
             binary_sha256: profile.binary_sha256().into(),

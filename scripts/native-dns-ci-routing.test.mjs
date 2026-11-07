@@ -488,11 +488,12 @@ test('controlled real-core tests resolve exact library namespaces and never sele
   const selected = step('Run exact controlled App lifecycle hot-switch and stats tests');
   const condition = /^        if: \$\{\{ (.+) \}\}$/m.exec(selected)?.[1];
   assert.ok(condition);
-  assert.doesNotMatch(condition, /native_dns_default|native_dns_formal|runner\.os/);
-  const route = (outputs = {}, build = 'success', tests = 'success', cancelled = false) =>
-    new Function('needs', 'steps', 'cancelled', `return (${condition});`)(
+  assert.doesNotMatch(condition, /native_dns_default|runner\.os/);
+  assert.match(condition, /native_dns_formal == 'true' && github\.event_name == 'workflow_dispatch'/);
+  const route = (outputs = {}, build = 'success', tests = 'success', cancelled = false, event = 'push') =>
+    new Function('needs', 'steps', 'cancelled', 'github', `return (${condition});`)(
       { cheap_format: { outputs: { app_native_compile_only: '', native_dns_candidate: '', ...outputs } } },
-      { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } }, () => cancelled);
+      { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } }, () => cancelled, { event_name: event });
   assert.equal(route(), false);
   assert.equal(route({ native_dns_formal: 'true' }), false);
   assert.equal(route({ native_dns_default: 'true' }), false);
@@ -502,6 +503,19 @@ test('controlled real-core tests resolve exact library namespaces and never sele
   assert.equal(route({ native_dns_candidate: sha }, 'failure'), false);
   assert.equal(route({ native_dns_candidate: sha }, 'success', 'skipped'), false);
   assert.equal(route({ native_dns_candidate: sha }, 'success', 'success', true), false);
+  for (const event of ['push', 'pull_request', 'merge_group']) {
+    assert.equal(route({ native_dns_formal: 'true' }, 'success', 'success', false, event), false);
+  }
+  const manual = (outputs = {}, build = 'success', tests = 'success', cancelled = false) =>
+    route(outputs, build, tests, cancelled, 'workflow_dispatch');
+  assert.equal(manual({ native_dns_formal: 'true' }), true);
+  assert.equal(manual({ native_dns_formal: 'true' }, 'success', 'failure'), true);
+  assert.equal(manual(), false);
+  assert.equal(manual({ native_dns_default: 'true' }), false);
+  assert.equal(manual({ native_dns_formal: 'true', app_native_compile_only: 'true' }), false);
+  assert.equal(manual({ native_dns_formal: 'true' }, 'failure'), false);
+  assert.equal(manual({ native_dns_formal: 'true' }, 'success', 'skipped'), false);
+  assert.equal(manual({ native_dns_formal: 'true' }, 'success', 'success', true), false);
   const names = [...selected.matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
   assert.equal(names.length, 6);
   assert.equal(new Set(names).size, 6);

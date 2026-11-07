@@ -1230,6 +1230,8 @@ else:
       return clean;
     };
     const fixtureGit=(directory,args,settings={})=>execFileSync('git',[
+      // Private byte snapshots must not race detached maintenance after commits.
+      '-c','maintenance.auto=false',
       '-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false',...args,
     ],{...settings,cwd:directory,env:isolateGitEnvironment(settings.env??process.env),encoding:'utf8'});
     const outside=mkdtempSync(join(tmpdir(),'cache-adapter-external-'));t.after(()=>rmSync(outside,{recursive:true,force:true}));
