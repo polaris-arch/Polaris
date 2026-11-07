@@ -107,6 +107,14 @@ function reusableContract(caller = workflow, callee = candidateWorkflow) {
     + '        env:\n          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}\n'
     + '        run: node scripts/fetch-core.mjs';
   assert.ok(callee.includes(formalAcquisition));
+  const pythonSetup = "      - uses: actions/setup-python@v6\n        with:\n          python-version: '3.12'\n";
+  const dependency = '      - name: Install same-source trusted proof validator dependency\n'
+    + '        run: python -m pip install jsonschema==4.23.0\n';
+  assert.ok(callee.includes(pythonSetup));
+  assert.ok(callee.includes(dependency));
+  assert.ok(callee.indexOf(dependency) > callee.indexOf(pythonSetup));
+  assert.ok(callee.indexOf(dependency) < callee.indexOf(acquisition));
+  assert.ok(callee.indexOf(dependency) < callee.indexOf(formalAcquisition));
   assert.doesNotMatch(callee.replace(acquisition, '').replace(formalAcquisition, ''), /github\.token|POLARIS_RELEASE_API_TOKEN/);
   assert.doesNotMatch(callee, /secrets:|secrets\.|contents: write|actions: write|id-token:|cargo (?:build|test) --workspace|run: pnpm/);
 }
@@ -326,6 +334,8 @@ test('same-commit reusable route has required string inputs, read-only permissio
     ['caller', 'candidate: ${{ needs.cheap_format.outputs.native_dns_candidate || needs.cheap_format.outputs.native_dns_formal_app }}', 'candidate: ${{ inputs.native_dns_candidate }}'],
     ['caller', '    uses: ./.github/workflows/native-dns-candidate.yml', '    secrets: inherit\n    uses: ./.github/workflows/native-dns-candidate.yml'],
     ['caller', '    uses: ./.github/workflows/native-dns-candidate.yml', '    runs-on: ubuntu-22.04\n    uses: ./.github/workflows/native-dns-candidate.yml'],
+    ['callee', 'run: python -m pip install jsonschema==4.23.0', 'run: echo missing dependency'],
+    ['callee', 'jsonschema==4.23.0', 'jsonschema==4.19.2'],
     ['callee', 'type: string', 'type: boolean'],
     ['callee', 'required: true', 'required: false'],
     ['callee', "default: ''", `default: '${sha}'`],
