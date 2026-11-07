@@ -30,6 +30,9 @@ macro_rules! request_samples {
 }
 
 request_samples! {
+    WindowsCheck => Request::WindowsCheck(polaris_helper_proto::check_config::CheckRequest::Begin {
+        core:polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(), bytes:2,sha256:[0;32],
+    }),
     MacCheck => Request::MacCheck(polaris_helper_proto::check_config::CheckRequest::Begin {
         core:polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(), bytes:2,sha256:[0;32],
     }),
@@ -37,10 +40,12 @@ request_samples! {
     CancelHelperUpgrade => Request::CancelHelperUpgrade,
     CoreStatus => Request::CoreStatus { id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap() },
     LinuxStartPinned => Request::LinuxStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        runtime_directory: None,
         id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
         common: StartParams { cfg: "/home/u/config.json".into(), log: String::new(), fwd: false, parent_pid: None },
     }),
     NativeStartPinned => Request::NativeStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        runtime_directory: None,
         id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
         common: StartParams { cfg: r"C:\Users\polaris\config\config.json".into(), log: String::new(), fwd: false, parent_pid: None },
     }),
@@ -101,6 +106,8 @@ request_samples! {
         src_dir: r"C:\Users\polaris\AppData\Roaming\Polaris\retired-upload".to_owned(),
         want_hash: "ab".repeat(32),
     }),
+    LinuxDnsSnapshot => Request::LinuxDnsSnapshot,
+    LinuxDnsCompare => Request::LinuxDnsCompare { payload: r#"{"enabled":false}"#.into() },
     LinuxDnsSet => Request::LinuxDnsSet(polaris_helper_proto::LinuxDnsSetParams {
         interface_name: "polaris-tun".to_owned(),
         server_ip: "172.19.0.2".to_owned(),
@@ -145,6 +152,8 @@ fn is_unknown(out: &HandleOutcome) -> bool {
 /// 「解得出」取**无损往返**（`parse_request(..) == Some(原请求)`），不取 `is_some()`：
 /// Linux capability commands use distinct wire tokens and must stay unsupported on Windows;
 /// while any supported variant must round-trip without losing lines or shifting fields.
+/// WindowsCheck is separately classified on a non-Windows host: its codec must
+/// round-trip while the actual native issuer returns exactly helper-check-unsupported.
 ///
 /// 第三条腿：同一份字节喂生产入口 [`WinHelper::handle_frame`]，其是否回 `ERR unknown` 必须与
 /// 「解码结果 + 分派」的结论一致 —— 证明门测的切行/解码就是 `handle_frame` 用的那一份。
@@ -155,12 +164,15 @@ fn decoder_and_dispatch_agree_on_every_request_variant() {
     let mut failures: Vec<String> = Vec::new();
     let mut both_supported = 0usize;
     let mut both_unsupported = 0usize;
+    let mut native_host_unsupported = 0usize;
 
     for (label, req) in &samples {
         // 判据自检：样本表的标签与样本本身是同一个变体。
         assert_eq!(variant_name(req), *label, "样本表标签错配");
 
-        let dispatched = !is_unknown(&fresh_helper(support.path()).handle(TOKEN, req.clone()));
+        let helper = fresh_helper(support.path());
+        let outcome = helper.handle(TOKEN, req.clone());
+        let dispatched = !is_unknown(&outcome);
 
         let raw = String::from_utf8(codec::encode(Platform::Win, TOKEN, req))
             .expect("编码帧必须是 UTF-8");
@@ -175,7 +187,20 @@ fn decoder_and_dispatch_agree_on_every_request_variant() {
         let decoded = logic::parse_request(frame.command, &frame.args);
         let lossless = decoded.as_ref() == Some(req);
 
-        if lossless != dispatched {
+        // The wire format is portable; a native SYSTEM Check issuer is not.
+        // This exact native-only command must stay closed on the Linux/Mac
+        // harness, even though the protocol decoder can recognize it.
+        let native_only = !cfg!(windows) && matches!(req, Request::WindowsCheck(_));
+        if native_only {
+            assert!(lossless);
+            assert!(
+                matches!(&outcome, HandleOutcome::Respond(Response::Err(error))
+                if error.code == ErrorCode::Unknown && error.detail == "helper-check-unsupported")
+            );
+            let state = helper.child_mu.lock().unwrap();
+            assert!(state.native.is_none() && state.pid.is_none());
+            native_host_unsupported += 1;
+        } else if lossless != dispatched {
             failures.push(format!(
                 "{label}: 解码无损={lossless}（解出 {decoded:?}）但分派{}",
                 if dispatched {
@@ -185,9 +210,9 @@ fn decoder_and_dispatch_agree_on_every_request_variant() {
                 }
             ));
         }
-        match (lossless, dispatched) {
-            (true, true) => both_supported += 1,
-            (false, false) => both_unsupported += 1,
+        match (lossless, dispatched, native_only) {
+            (true, true, false) => both_supported += 1,
+            (false, false, false) => both_unsupported += 1,
             _ => {}
         }
 
@@ -197,7 +222,9 @@ fn decoder_and_dispatch_agree_on_every_request_variant() {
             Some(d) => is_unknown(&fresh_helper(support.path()).handle(TOKEN, d.clone())),
         };
         let reply = fresh_helper(support.path()).handle_frame(&raw);
-        if (reply.line == "ERR unknown\n") != expect_unknown {
+        let frame_unknown = matches!(Response::parse(reply.line.trim_end_matches('\n')),
+            Response::Err(error) if error.code == ErrorCode::Unknown);
+        if frame_unknown != expect_unknown {
             failures.push(format!(
                 "{label}: handle_frame 回 {:?}，与「解码 {decoded:?} + 分派」的结论（unknown={expect_unknown}）不一致",
                 reply.line
@@ -212,10 +239,11 @@ fn decoder_and_dispatch_agree_on_every_request_variant() {
     );
     // 正面断言：两侧都真有样本落进判定，不是「全部恰好不支持」这种空绿。
     assert_eq!(
-        both_supported + both_unsupported,
+        both_supported + both_unsupported + native_host_unsupported,
         samples.len(),
         "每个变体都必须落进一致的一格"
     );
+    assert_eq!(native_host_unsupported, usize::from(!cfg!(windows)));
     assert!(
         both_supported >= 12,
         "Windows 两侧都支持的变体只有 {both_supported} 个：取材面塌了"
@@ -224,6 +252,30 @@ fn decoder_and_dispatch_agree_on_every_request_variant() {
         both_unsupported >= 1,
         "没有任何两侧都不支持的变体：反向格失去对照"
     );
+}
+
+#[test]
+fn recognizing_a_windows_check_frame_does_not_authenticate_a_native_peer() {
+    let request = request_samples()
+        .into_iter()
+        .find(|(_, request)| matches!(request, Request::WindowsCheck(_)))
+        .unwrap()
+        .1;
+    let mut helper = make_helper_defaults();
+    helper.test_context = None;
+    let raw = String::from_utf8(codec::encode(Platform::Win, TOKEN, &request)).unwrap();
+    let frame = logic::split_frame(&raw).unwrap();
+    assert_eq!(
+        logic::parse_request(frame.command, &frame.args),
+        Some(request.clone())
+    );
+    assert!(matches!(
+        helper.handle(TOKEN, request),
+        HandleOutcome::AuthFailed
+    ));
+    assert_eq!(helper.handle_frame(&raw).line, "ERR auth\n");
+    let state = helper.child_mu.lock().unwrap();
+    assert!(state.native.is_none() && state.pid.is_none());
 }
 
 // ===== handle_frame 的顺序判据（先验 token，再判命令）=====

@@ -885,6 +885,7 @@ impl AmbientCapsSpawner {
         let mut child = execution
             .spawn_linux_helper_run(
                 &req.config,
+                req.runtime_directory.as_deref(),
                 polaris_core_supervisor::admitted_payload::LinuxHelperIdentity {
                     uid: req.uid,
                     gid: req.gid,

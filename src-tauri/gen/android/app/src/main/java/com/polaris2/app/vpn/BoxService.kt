@@ -61,22 +61,39 @@ class BoxService(
     private val service: Service,
     private val platformInterface: PlatformInterface,
 ) : CommandServerHandler {
-    /** A late openTun after Stop must close its fd before returning to native code. */
-    internal fun installTun(attempt: MainKernelAttempt<CommandServer>, descriptor: ParcelFileDescriptor, scope: TunScope): Int {
-        val previous = try {
-            synchronized(this) {
-                check(mainAttempt === attempt && !attempt.revoked &&
-                    (state == ServiceState.Starting || state == ServiceState.Started)) {
-                    "旧主核已撤销，拒收迟到的 VPN fd"
-                }
-                MainKernelAttemptRegistry.installTun(attempt, descriptor, scope)
-            }
-        } catch (error: Throwable) {
-            runCatching { descriptor.close() }
-            throw error
+    /** Legacy selected AAR still uses the same original-attempt descriptor custody. */
+    internal fun installTun(attempt: MainKernelAttempt<CommandServer>, settings: AndroidTunSettings, descriptor: ParcelFileDescriptor): Int {
+        val bridge = nativeTunBridge
+        if (bridge == null || bridge.attempt !== attempt) {
+            descriptor.close()
+            error("android: TUN descriptor has no exact attempt owner")
         }
-        runCatching { previous?.close() }
-        return descriptor.fd
+        return bridge.installLegacy(settings, descriptor)
+    }
+
+    private fun bindNativeTun(attempt: MainKernelAttempt<CommandServer>, opener: PolarisVpnService): AndroidNativeTunBridge {
+        val bridge = AndroidNativeTunBridge(attempt, opener::captureTunSettings,
+            current = {
+                check(mainAttempt === attempt && !attempt.revoked &&
+                    (state == ServiceState.Starting || state == ServiceState.Started) &&
+                    MainKernelAttemptRegistry.isCurrent(attempt)) { "android: native TUN attempt revoked" }
+            },
+            stillOwner = {
+                check(mainAttempt === attempt && MainKernelAttemptRegistry.isCurrent(attempt)) {
+                    "android: native TUN exact close owner differs"
+                }
+            },
+            onUnknown = {
+                AndroidNativeMain.unknown(attempt)
+                mainHandler.post { stopService(attempt) }
+            },
+        )
+        synchronized(this) {
+            check(mainAttempt === attempt && !attempt.revoked && nativeTunBridge == null)
+            MainKernelAttemptRegistry.bindTunOwner(attempt, bridge, bridge::currentScope)
+            nativeTunBridge = bridge
+        }
+        return bridge
     }
 
     @Volatile
@@ -87,6 +104,7 @@ class BoxService(
     private val notification = ServiceNotification(service)
     @Volatile private var commandServer: CommandServer? = null
     @Volatile private var mainAttempt: MainKernelAttempt<CommandServer>? = null
+    @Volatile private var nativeTunBridge: AndroidNativeTunBridge? = null
     private var receiverRegistered = false
     private var runtimePersistenceEpoch = 0L
     // Replaced only after this exact server/epoch passes the post-Start protocol gate.
@@ -259,9 +277,12 @@ class BoxService(
                             override fun closeDefaultInterfaceMonitor(listener: io.nekohasekai.libbox.InterfaceUpdateListener) =
                                 checkNotNull(attempt.network).closeListener(listener)
                         }
+                        val nativeTun = bindNativeTun(attempt, tunOpener)
                         val server = Libbox.newStrictCommandServer(AttemptHandler(attempt, this), boundPlatform)
                         attempt.publish(server)
                         synchronized(this) { if (mainAttempt === attempt) commandServer = server }
+                        // Optional setter is discovered from the real selected binding, before platform Initialize.
+                        nativeTun.register(server)
                         check(isStarting(attempt)) { "起核已被停核接管" }
                         server.start()
                         // No login instance may hold this Tailscale state directory during main startup.
@@ -702,14 +723,14 @@ class BoxService(
                         synchronized(attempt.operationLock) {
                             closeStage = "login-ownership"
                             TransientLoginHost.closeMain(attempt) {
-                                // Go's strict terminal close joins Start/OpenTun before this Java
-                                // descriptor can be released; OpenInterface duplicates it afterwards.
+                                // Strict close joins native Start/Reload, physical readers and callbacks.
+                                // Core retires exact V1 sessions only after its duplicate has closed.
                                 closeStage = "native-service"
-                                try { server?.closeService() }
-                                finally {
-                                    server?.let { original -> attempt.tailscaleStore?.closed { AndroidTailscaleStoreCustody.export(original) } }
-                                    runCatching { detachedTun?.close() }
-                                }
+                                server?.closeService()
+                                // A failed native join keeps every original FD in the exact attempt's custody.
+                                server?.let { original -> attempt.tailscaleStore?.closed { AndroidTailscaleStoreCustody.export(original) } }
+                                closeStage = "native-tun-originals"
+                                detachedTun?.close()
                                 closeStage = "native-command"
                                 server?.close()
                             }
@@ -755,6 +776,7 @@ class BoxService(
             check(MainKernelAttemptRegistry.completeAfterClose(attempt) {
                 deliverStop = VpnBridge.takeFinishStop(attempt = attempt)
                 commandServer = null
+                nativeTunBridge = null
                 runtimeAdmission = null
                 mainAttempt = null
                 state = ServiceState.Stopped

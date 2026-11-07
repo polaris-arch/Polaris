@@ -276,7 +276,7 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
   - Windows 与 macOS 原生 lint 与测试在 pull_request、手动触发、发布时跑（发布经 `package.yml` 调用，
     三平台不绿不发布）。
   - 含平台分支的改动合入前须手动触发三平台：`gh workflow run ci.yml --ref <分支>`；只确认一个平台时加
-    `-f os=windows-2022` 或 `-f os=macos-14`。直接推送 `main` 不会跑这两个平台，原生腿上的失败要到下一次
+    `-f os=windows-2022` 或 `-f os=macos-15`。直接推送 `main` 不会跑这两个平台，原生腿上的失败要到下一次
     手动触发或发布时才会出现。
 
   本机镜像是 `scripts/gate-rust.sh`（加 `--with-cross` 才跑交叉那几条），与 `ci.yml` 由

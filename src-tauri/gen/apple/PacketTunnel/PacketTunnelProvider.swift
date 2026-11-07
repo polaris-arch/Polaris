@@ -71,6 +71,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.commandServer = server
                     self.commandIdentity = identity
                     if let error { throw error }
+                    #if POLARIS_NATIVE_TUN_V1
+                    // Registration is an actual binding call before first Initialize.
+                    try server.setRuntimeTunPlatform(self.platform)
+                    #endif
                     try server.start()
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start was superseded") }
                     if bootstrap {
@@ -129,6 +133,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             pending.completion.finish(tunnelError("Managed bootstrap was stopped before activation"))
         }
         runtimeRestartOwner?.revoke()
+        platform.revokeNativeTun()
         if let commandServer {
             do { try commandServer.closeService() } catch {
                 failure = error.localizedDescription
@@ -146,7 +151,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         commandServer = nil
         commandIdentity = nil
         runtimeRestartOwner = nil
-        platform.reset()
+        if let nativeFailure = platform.reset() {
+            lifecycle.retainCleanupFailure(nativeFailure)
+            failure = [failure, nativeFailure].compactMap { $0 }.joined(separator: "; ")
+        }
         return failure
     }
 
@@ -196,6 +204,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         lifecycle.settingsUncertain(token, error.localizedDescription)
         publishReport()
         cancelTunnelWithError(error)
+    }
+
+    func nativeTunCleanupUncertain(_ token: UInt64, message: String) {
+        lifecycle.settingsUncertain(token, message)
+        lifecycle.retainCleanupFailure(message)
+        publishReport()
     }
 
     func logDebugMessage(_ message: String) { logger.debug("\(message, privacy: .private)") }

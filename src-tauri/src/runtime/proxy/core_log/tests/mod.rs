@@ -63,3 +63,46 @@ async fn bounded_lines_preserve_invalid_utf8_crlf_and_eof() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn relay_log_policy_tracks_committed_runtime_not_saved_pending_desire() {
+    use polaris_helper_proto::Platform;
+    for mode in ["manual", "systemProxy", "tun"] {
+        let (runtime, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Linux);
+        let generation = runtime.gate.generation();
+        let mut running = polaris_store::default_config();
+        running["proxyModeType"] = serde_json::json!(mode);
+        running["disableLogFile"] = serde_json::json!(true);
+        *runtime.current_config.write().unwrap() = Some(running.clone());
+        let mut saved = running.clone();
+        saved["disableLogFile"] = serde_json::json!(false);
+        runtime.config.save_full(&saved).unwrap();
+        assert!(
+            !runtime.core_log_relay_enabled(generation),
+            "saving D cannot enable {mode} logs"
+        );
+        running["disableLogFile"] = serde_json::json!(false);
+        *runtime.current_config.write().unwrap() = Some(running.clone());
+        saved["disableLogFile"] = serde_json::json!(true);
+        runtime.config.save_full(&saved).unwrap();
+        assert!(
+            runtime.core_log_relay_enabled(generation),
+            "unapplied D cannot disable running {mode}"
+        );
+        running["disableLogFile"] = serde_json::json!(true);
+        *runtime.current_config.write().unwrap() = Some(running.clone());
+        assert!(!runtime.core_log_relay_enabled(generation));
+        running["disableLogFile"] = serde_json::json!(false);
+        *runtime.current_config.write().unwrap() = Some(running);
+        assert!(runtime.core_log_relay_enabled(generation));
+        assert!(
+            !runtime.core_log_relay_enabled(generation.wrapping_add(1)),
+            "foreign runtime generation admitted"
+        );
+        *runtime.current_config.write().unwrap() = None;
+        assert!(
+            !runtime.core_log_relay_enabled(generation),
+            "missing running snapshot is not emission authority"
+        );
+    }
+}

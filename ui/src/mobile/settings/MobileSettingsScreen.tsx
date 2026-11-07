@@ -375,7 +375,10 @@ export function watchVpnAuth(
 /** 屏级接线：把 [`watchVpnAuth`] 挂到真的 `document` 与真的 IPC 上。逻辑全在那边，这里只接线。 */
 function useVpnAuthState(): VpnAuthState {
   const [state, setState] = useState<VpnAuthState>('unknown');
-  useEffect(() => watchVpnAuth(() => vpnApi.getAuthStatus(), setState, document), []);
+  useEffect(() => {
+    if (document.documentElement.dataset.mobileOs === 'ios') return;
+    return watchVpnAuth(() => vpnApi.getAuthStatus(), setState, document);
+  }, []);
   return state;
 }
 
@@ -423,6 +426,7 @@ export function SettingsRoot({
   appUpdate: string | null;
 }): ReactElement {
   const { t } = useTranslation();
+  const isIOS = typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios';
   const titleOf = (id: MobileSettingsPageId): string => {
     const title = MOBILE_SETTINGS_PAGE_TITLE[id];
     return isTitleKey(title) ? t(title) : title;
@@ -472,9 +476,9 @@ export function SettingsRoot({
               key={rowId}
               id={rowId}
               label={t('mobileSettings.vpnAuth.title')}
-              desc={t('mobileSettings.vpnAuth.desc')}
-              status={t(VPN_AUTH_LABEL[vpnAuth])}
-              tone={vpnAuth === 'authorized' ? 'ok' : vpnAuth === 'denied' ? 'warn' : 'neutral'}
+              desc={t(isIOS ? 'mobileSettings.vpnAuth.unsupportedDesc' : 'mobileSettings.vpnAuth.desc')}
+              status={t(isIOS ? 'mobileSettings.vpnAuth.unsupported' : VPN_AUTH_LABEL[vpnAuth])}
+              tone={isIOS ? 'neutral' : vpnAuth === 'authorized' ? 'ok' : vpnAuth === 'denied' ? 'warn' : 'neutral'}
             />
           ))}
         </SettingsGroup>

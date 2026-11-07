@@ -60,6 +60,7 @@ polaris-system-integration = { path = "../system-integration" }
 # caps = L10 AmbientCaps 拉核（securebits::set_keepcaps + raise Inheritable/Ambient；对照 Go
 #   SysProcAttr.AmbientCaps）。Capability::X.index() 与 Go L16 常量一致（BIND_SERVICE=10/ADMIN=12/RAW=13）。
 [target.'cfg(target_os = "linux")'.dependencies]
+serde_json.workspace = true
 tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal"] }
 nix = { version = "0.31", features = ["dir", "fs", "process", "signal", "user"] }
 caps = "0.5"

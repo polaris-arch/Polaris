@@ -655,11 +655,11 @@ export function ConnectionsScreen() {
   );
 
   /**
-   * 批量关闭的抑制集出入口（与单条 `onClose` 同一道防线）。
+   * 按筛选逐条关闭的抑制集出入口（与单条 `onClose` 同一道防线）。
    *
    * 少了它，批量关闭后**在途的那一帧增量仍可能更新这些行** ⇒ 整批「消失 → 闪回 → 再消失」：
    * 后端已经关掉了、渲染端也已按新帧清空，然后 ≤1s 前就发出的那帧把它们全部画回来，
-   * 再等一帧才真消失。单条关闭早就入集了，两条批量腿是漏网的（2026-07-28 复审 LOW）。
+   * 再等一帧才真消失。本腿有逐 id 结果；全部关闭只有计数，按真实 detail 帧更新。
    *
    * 成功路径**不需要**显式清：抑制集在增量索引确认 id 已移除时自清理。
    * 失败路径**必须**显式清 —— 否则那条还活着的连接会被永久滤掉（它每帧都在，自清理永远等不到），
@@ -684,31 +684,27 @@ export function ConnectionsScreen() {
   const confirmingClear = armed === CLEAR_CLOSED_KEY;
 
   const onCloseAll = useCallback(async () => {
-    // 「全部关闭」的射程是当前索引里的全部连接（`rows` 而非 `filteredRows`：搜索框有内容时
-    // 这个按钮关的仍是全部）。发请求**之前**入集：请求在飞期间就可能有增量帧回来。
-    const ids = rows.map((r) => r.entry.id);
-    suppressClosing(ids);
+    // The bulk receipt contains counts, not per-id outcomes. Keep rows visible until
+    // real detail frames remove them; suppressing every id would hide partial failures.
     try {
       const res = await api.connections.closeAll();
-      if (res?.ok) {
+      if (res?.ok && res.failed === 0) {
         toast.success(t('connections.closeAllDone'));
       } else {
-        unsuppressClosing(ids);
         toast.error(closeFailedText);
       }
     } catch (err) {
       console.error('[connections] closeAll failed:', err);
-      unsuppressClosing(ids);
       toast.error(closeFailedText);
     }
-  }, [rows, suppressClosing, unsuppressClosing, closeFailedText, t]);
+  }, [closeFailedText, t]);
 
   /** 关闭当前筛选命中的全部连接（原型 #conn-close-filtered :2012；仅搜索命中时可用，非「全部关闭」）。 */
   const onCloseFiltered = useCallback(async () => {
     // 用 filteredRows 而非 visibleRows：这个按钮的语义是「关闭筛选命中的**全部**连接」，
     // 分页只改变 DOM 行数，不得把动作偷偷降级成「只关当前页的几十条」。
     const n = filteredRows.length;
-    // fan-out **之前**批量入抑制集（同 onCloseAll，理由见 suppressClosing）。
+    // fan-out 前批量入抑制集；本腿持有逐 id 结果，能释放未确认关闭的项。
     const ids = filteredRows.map((r) => r.entry.id);
     suppressClosing(ids);
     try {

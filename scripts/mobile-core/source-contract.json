@@ -5,12 +5,12 @@
   "repository": "polaris-arch/sing-box-polaris",
   "repositoryId": 1421657509,
   "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
-  "version": "1.15.0-polaris-alpha.12.6",
-  "sourceTag": "v1.15.0-polaris-alpha.12.6",
-  "sourceTagObject": "8a230c1d34cb4855b261944e2935ce36f9cd14de",
-  "sourceCommit": "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
-  "sourceTree": "4c0fdb31d59967f41c808ea6b63f87ca9661c2cf",
-  "goModSha256": "d16c533c97de535cf38985a62a78993c1b755a8f723a78ea8a0d75d585d7201d",
+  "version": "1.15.0-polaris-alpha.12.17",
+  "sourceTag": "v1.15.0-polaris-alpha.12.17",
+  "sourceTagObject": "e2062a447f2ade69818b1313a38d5e0654ea0aa4",
+  "sourceCommit": "2dba95e1b0285c29e78c48fc8ab8a451788a7d83",
+  "sourceTree": "47f42dc28e36fd9f49168fe3041324f349164f43",
+  "goModSha256": "7f8d729f71eabdbb0caf97da95b2920f8c797f6913dadccd7b5135f4bf5eb440",
   "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
   "goModule": "github.com/sagernet/sing-box",
   "sourceOverlay": 0,
@@ -72,7 +72,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.6-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.17-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -122,7 +122,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.6-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.17-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -140,11 +140,11 @@
     "workspacePolicy": "Explicit fixed caller-owned source/work/cache slots and exclusive build lease; no global Go/gomobile/NDK upgrade, no per-run full source copies"
   },
   "sourcePolicy": {
-    "schema": "polaris-reviewed-kernel-source-v3",
-    "sourceCommit": "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
-    "sourceTree": "4c0fdb31d59967f41c808ea6b63f87ca9661c2cf",
+    "schema": "polaris-reviewed-kernel-source-v4",
+    "sourceCommit": "2dba95e1b0285c29e78c48fc8ab8a451788a7d83",
+    "sourceTree": "47f42dc28e36fd9f49168fe3041324f349164f43",
     "goVersion": "1.27.2",
-    "goModSha256": "d16c533c97de535cf38985a62a78993c1b755a8f723a78ea8a0d75d585d7201d",
+    "goModSha256": "7f8d729f71eabdbb0caf97da95b2920f8c797f6913dadccd7b5135f4bf5eb440",
     "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
     "goDirective": "1.27.0",
     "toolchain": "go1.27.2",
@@ -172,8 +172,8 @@
       "github.com/sagernet/tailscale": {
         "version": "v1.102.1-sing-box-1.14-mod.5.0.20260925112514-35e61219dedd",
         "replacementPath": "./third_party/tailscale",
-        "replacementTree": "595e6f60e106780e60f55e20753da07b62ac0d7f",
-        "replacementFileCount": 1520
+        "replacementTree": "2a64a58e8626644ce4175afef637ff59ede9c7f3",
+        "replacementFileCount": 1521
       },
       "github.com/metacubex/utls": {
         "version": "v1.8.8",
@@ -184,8 +184,8 @@
       "github.com/sagernet/cronet-go": {
         "version": "v0.0.0-20260929213745-4d18a60dc3a8",
         "replacementPath": "./third_party/cronet-go",
-        "replacementTree": "d61da6bb9082f951fb5e57503fc1eb840e07949b",
-        "replacementFileCount": 127
+        "replacementTree": "bcd6baf6240459b192c31a9fe7ef63af02e0781c",
+        "replacementFileCount": 137
       },
       "github.com/sagernet/fswatch": {
         "version": "v0.1.2",
@@ -202,8 +202,8 @@
       "github.com/sagernet/sing-quic": {
         "version": "v0.7.2-0.20261002084117-75c3ac4fa12b",
         "replacementPath": "./third_party/sing-quic",
-        "replacementTree": "35dca4b40ca8b33ac5d7f697271fac5f14aea9da",
-        "replacementFileCount": 81
+        "replacementTree": "923ea112b8b93cb0d971af8e6f3b239104317280",
+        "replacementFileCount": 82
       },
       "github.com/sagernet/wireguard-go": {
         "version": "v0.0.8-0.20260929150556-ca3bc60c4ce7",
@@ -222,6 +222,12 @@
         "replacementPath": "./third_party/sing-vmess",
         "replacementTree": "c06c20c35da9997e56b5f6169143e3c0261da672",
         "replacementFileCount": 36
+      },
+      "github.com/libp2p/go-nat": {
+        "version": "v1.0.1-0.20250821073202-01afc089f138",
+        "replacementPath": "./third_party/go-nat",
+        "replacementTree": "2125093d0d080b4ad0151dd129d41df8a305ea69",
+        "replacementFileCount": 12
       }
     }
   }

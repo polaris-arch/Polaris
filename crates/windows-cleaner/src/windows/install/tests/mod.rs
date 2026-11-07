@@ -247,6 +247,51 @@ fn source_fixture() -> (tempfile::TempDir, Request) {
     use polaris_helper_proto::core_manifest::{CoreFile, CoreManifest};
     let dir = tempfile::tempdir().unwrap();
     let (sid, _) = token_info().unwrap();
+    // Match the App's new-object producer: an elevated token's default owner
+    // may be BA, but the source contract requires the actual TokenUser SID.
+    // Supply that owner at creation; never re-own an existing fixture object.
+    let descriptor = Descriptor::parse(&format!(
+        "O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;GRGX;;;BA)"
+    ))
+    .unwrap();
+    let parent = Chain::open(dir.path(), Some(&sid)).unwrap();
+    let directory = child(
+        parent.last(),
+        OsStr::new("source"),
+        false,
+        true,
+        descriptor.ptr(),
+    )
+    .unwrap();
+    assert_eq!(file_owner(&directory).unwrap(), sid);
+    drop(directory);
+    let stage = dir.path().join("source");
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.ptr(),
+        bInheritHandle: 0,
+    };
+    let write_source = |name: &str, data: &[u8]| {
+        // SAFETY: fresh fixture-only leaf below the held parent, fixed private
+        // descriptor and CREATE_NEW. No pre-existing owner's ACL is changed.
+        let raw = unsafe {
+            CreateFileW(
+                wide(stage.join(name).as_os_str()).as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &attributes,
+                CREATE_NEW,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        assert_ne!(raw, INVALID_HANDLE_VALUE);
+        // SAFETY: successful native creation transfers exactly one HANDLE.
+        let mut file = unsafe { File::from_raw_handle(raw.cast()) };
+        file.write_all(data).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(file_owner(&file).unwrap(), sid);
+    };
     let digest = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
     let bytes = [
         ("sing-box.exe", b"inert core".as_slice()),
@@ -255,7 +300,7 @@ fn source_fixture() -> (tempfile::TempDir, Request) {
         (IMAGE_NAME, b"inert cleaner".as_slice()),
     ];
     for (name, data) in bytes {
-        std::fs::write(dir.path().join(name), data).unwrap();
+        write_source(name, data);
     }
     let core = CoreManifest {
         platform: "win".into(),
@@ -280,11 +325,11 @@ fn source_fixture() -> (tempfile::TempDir, Request) {
         core,
     };
     let raw = manifest.to_json().unwrap();
-    std::fs::write(dir.path().join("core-manifest.json"), &raw).unwrap();
+    write_source("core-manifest.json", &raw);
     let request = Request {
-        stage: dir.path().to_str().unwrap().into(),
+        stage: stage.to_str().unwrap().into(),
         original_sid: sid,
-        config: dir.path().to_str().unwrap().into(),
+        config: stage.to_str().unwrap().into(),
         core_id: id,
         manifest_sha256: digest(&raw),
         helper_sha256: digest(bytes[2].1),
@@ -299,6 +344,7 @@ fn source_fixture() -> (tempfile::TempDir, Request) {
 #[test]
 fn production_source_admission_binds_ids_bytes_and_alternate_admin_read_acl() {
     let (dir, mut request) = source_fixture();
+    let stage = PathBuf::from(&request.stage);
     let source = Source::open(&request, true).unwrap();
     request.source_identities = source.ids().unwrap();
     request.stage_identity = object(source.chain.last()).unwrap();
@@ -314,7 +360,7 @@ fn production_source_admission_binds_ids_bytes_and_alternate_admin_read_acl() {
     wrong = request.clone();
     wrong.original_sid = "S-1-5-21-1-2-3-9999".into();
     assert!(Source::open(&wrong, true).is_err());
-    assert!(std::fs::write(dir.path().join("polaris-helper.exe"), b"foreign helper").is_err());
+    assert!(std::fs::write(stage.join("polaris-helper.exe"), b"foreign helper").is_err());
     assert!(
         std::fs::rename(dir.path(), dir.path().with_extension("moved")).is_err(),
         "LIST_DIRECTORY full-chain guard must block ancestor rename; attributes-only is not evidence"
@@ -327,7 +373,7 @@ fn production_source_admission_binds_ids_bytes_and_alternate_admin_read_acl() {
     // Actual alternate-admin token execution is a separate UAC window. This
     // source test proves the explicit BA read ACL, not that device execution.
     drop(source);
-    std::fs::write(dir.path().join("libcronet.dll"), b"foreign sidecar").unwrap();
+    std::fs::write(stage.join("libcronet.dll"), b"foreign sidecar").unwrap();
     assert!(Source::open(&request, true).is_err());
 }
 

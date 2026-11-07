@@ -3712,8 +3712,7 @@ describe('⑱ 应用更新：检查 + 显示 + 打开发布页（W-19 / W-20）'
     /*
      * 与「打开发布页」那条同族：上一条只证明按钮画出来了。把 `updateApi.skip(...)` 换成
      * `Promise.resolve()`（持久化整条拔掉、按钮还在、这次会话看着像成功了）时，上一条照样全绿。
-     * 故按整次调用对拍，并单独钉住「`success:false` 折成 reject」那一格 ——
-     * 后端这条回的是 `{success}` 信封、不抛，漏判它会让一次失败安静地长成一次成功。
+     * 故按整次调用对拍：IPC 解包后的成功值为 void，拒绝由 commit 回显。
      */
     const src = stripComments(readFileSync(join(HERE, 'UpdatePage.tsx'), 'utf8'));
     expect(
@@ -3721,8 +3720,8 @@ describe('⑱ 应用更新：检查 + 显示 + 打开发布页（W-19 / W-20）'
       '「跳过此版本」没有把版本号交给后端 —— 下次检查它还会再报一遍',
     ).toBe(true);
     expect(
-      /if \(!result\.success\) throw new Error\(\);/.test(src),
-      '后端回 `success:false` 时没有折成一次 reject —— 跳过失败会显示成跳过成功',
+      /updateApi\.skip\(foundVersion\)\.then\(\(\) => \{\s*markAppVersionSkipped\(foundVersion\);/.test(src),
+      '成功的 void 返回应直接更新会话，不能读取不存在的 result.success',
     ).toBe(true);
     expect(src).toContain('markAppVersionSkipped(foundVersion)');
   });

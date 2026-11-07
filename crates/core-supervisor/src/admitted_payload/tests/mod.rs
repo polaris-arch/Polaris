@@ -2,6 +2,11 @@ use super::*;
 
 #[tokio::test]
 async fn initialization_exits_retire_unregistered_plans_but_keep_actual_child_and_lease() {
+    if crate::tests::isolated_lease_case(
+        "admitted_payload::tests::initialization_exits_retire_unregistered_plans_but_keep_actual_child_and_lease",
+    ) {
+        return;
+    }
     use std::fs::{self, OpenOptions};
     let directories = ["versions", "manifests", ".staging", ".trash", "leases"];
     for failure in std::iter::once("root").chain(directories) {
@@ -126,6 +131,11 @@ fn explicit_retirement_revokes_queued_plans_without_turning_data_into_admission(
 
 #[tokio::test]
 async fn operation_lease_survives_native_exec_and_idle_admission_does_not_retain_it() {
+    if crate::tests::isolated_lease_case(
+        "admitted_payload::tests::operation_lease_survives_native_exec_and_idle_admission_does_not_retain_it",
+    ) {
+        return;
+    }
     let payload = fixture(
         b"#!/bin/sh\nread line\nexit 0\n",
         vec![ExecPurpose::RunMain],

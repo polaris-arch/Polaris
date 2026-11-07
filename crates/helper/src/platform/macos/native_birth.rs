@@ -285,6 +285,10 @@ impl NativeCustody {
                         target: birth.target,
                         created: None,
                         image: None,
+                        core: birth.core.get().and_then(|(core, _)| {
+                            polaris_helper_proto::core_manifest::CoreId::parse(&core.manifest.id)
+                                .ok()
+                        }),
                     }
                 }
                 Phase::Unknown => NativeBirthStatus::Unknown {

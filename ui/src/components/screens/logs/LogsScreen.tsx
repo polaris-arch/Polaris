@@ -140,6 +140,8 @@ export function LogsScreen() {
   const toggleRedactLogs = useLogRedactStore((s) => s.toggleRedactLogs);
 
   const [logs, setLogs] = useState<LogRow[]>([]);
+  const logsRef = useRef(logs);
+  logsRef.current = logs;
   /** 核在跑的真实日志级别（`null` = 还没取回；轮询见下方 effect）。 */
   const [runtimeLevel, setRuntimeLevel] = useState<RuntimeLogLevel | null>(null);
   /** `null` = 尚未从后端进程态水合；boolean = 本次应用运行是否临时抬到 DEBUG。 */
@@ -152,6 +154,8 @@ export function LogsScreen() {
   const [search, setSearch] = useState('');
   const [searchSnapshot, setSearchSnapshot] = useState<LogSearchSnapshot | null>(null);
   const [logStreamReady, setLogStreamReady] = useState(false);
+  const [logStreamFailed, setLogStreamFailed] = useState(false);
+  const [logStreamAttempt, setLogStreamAttempt] = useState(0);
   const [follow, setFollow] = useState(true);
   const [logPage, setLogPage] = useState(0);
   /** 直播监听只在 mount 时建立一次；用 ref 读取最新 follow，避免每次暂停都退订、重水合。 */
@@ -270,10 +274,12 @@ export function LogsScreen() {
    * 游标仍要**快进到快照最大 id**，否则快照里比游标新的行会被随后的流式批当成新行再收一次。 */
   useEffect(() => {
     let alive = true;
+    setLogStreamReady(false);
+    setLogStreamFailed(false);
     const subscriptionId = nextLogSubscriptionId();
     let off: (() => void) | null = null;
     const onBatch = (raw: LogRow[]) => {
-      if (!Array.isArray(raw) || raw.length === 0) return;
+      if (!alive || !Array.isArray(raw) || raw.length === 0) return;
       const batch = dedupe(raw);
       if (batch.length === 0) return;
       const criteria = searchCriteriaRef.current;
@@ -298,10 +304,7 @@ export function LogsScreen() {
           return next.length > MAX_BUFFERED_ROWS ? next.slice(-MAX_BUFFERED_ROWS) : next;
         });
       } else {
-        pendingRef.current.push(...batch);
-        if (pendingRef.current.length > MAX_BUFFERED_ROWS) {
-          pendingRef.current = pendingRef.current.slice(-MAX_BUFFERED_ROWS);
-        }
+        pendingRef.current = mergeHydration(pendingRef.current, batch, MAX_BUFFERED_ROWS);
         setPendingCount(pendingRef.current.length);
       }
     };
@@ -314,30 +317,46 @@ export function LogsScreen() {
         off = null;
         return;
       }
-      setLogStreamReady(true);
       const epoch = logReadEpoch.current;
       const batch = await api.logs.get(subscriptionId, MAX_BUFFERED_ROWS);
       if (!alive) {
         // invoke 可能晚于 React cleanup 返回；token 退订只会删除这个陈旧实例。
-        void api.logs.unsubscribe(subscriptionId);
+        void api.logs.unsubscribe(subscriptionId).catch(() => {});
         return;
       }
-      if (epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
-      const snapshot = batch.slice(-MAX_BUFFERED_ROWS);
+      if (!Array.isArray(batch)) throw new Error('LOG_SNAPSHOT_INVALID');
+      setLogStreamReady(true);
+      if (epoch !== logReadEpoch.current) return;
+      const snapshot: LogRow[] = batch.slice(-MAX_BUFFERED_ROWS);
       const top = maxLogId(snapshot);
       if (top !== null && top > lastIdRef.current) lastIdRef.current = top;
-      setLogs((prev) => mergeHydration(prev, snapshot, MAX_BUFFERED_ROWS));
+      if (followRef.current) {
+        setLogs((prev) => mergeHydration(prev, snapshot, MAX_BUFFERED_ROWS));
+      } else {
+        // Retry history can contain both frozen visible rows and live pending rows.
+        // Keep the visible snapshot frozen and count each pending native id once.
+        const shownIds = new Set(logsRef.current.map((row) => row._id).filter((id) => typeof id === 'number'));
+        const unseen = snapshot.filter((row) => typeof row._id !== 'number' || !shownIds.has(row._id));
+        pendingRef.current = mergeHydration(pendingRef.current, unseen, MAX_BUFFERED_ROWS);
+        setPendingCount(pendingRef.current.length);
+      }
     })()
-      .catch(() => {
-        /* 非 Tauri 忽略 */
+      .catch((error) => {
+        if (!alive) return;
+        console.error('[logs] stream registration failed:', error);
+        off?.();
+        off = null;
+        void api.logs.unsubscribe(subscriptionId).catch(() => {});
+        setLogStreamReady(false);
+        setLogStreamFailed(true);
       });
     return () => {
       alive = false;
       off?.();
       off = null;
-      void api.logs.unsubscribe(subscriptionId);
+      void api.logs.unsubscribe(subscriptionId).catch(() => {});
     };
-  }, [dedupe]);
+  }, [dedupe, logStreamAttempt]);
 
   /* 非空查询走后端完整保留环；结果上限只约束 IPC/DOM。直播匹配行由上方 onBatch 同步并入同一快照。 */
   useEffect(() => {
@@ -524,6 +543,7 @@ export function LogsScreen() {
         await saveConfig({ logLevel: v });
       } catch (err) {
         console.error('[logs] set level failed:', err);
+        toast.error(t('common.saveFailed'));
       }
     },
     [diskConfig, saveConfig, stagingEnabled, stage, t]
@@ -728,10 +748,7 @@ export function LogsScreen() {
       const pending = pendingRef.current;
       pendingRef.current = [];
       setPendingCount(0);
-      setLogs((prev) => {
-        const merged = [...prev, ...pending];
-        return merged.length > MAX_BUFFERED_ROWS ? merged.slice(-MAX_BUFFERED_ROWS) : merged;
-      });
+      setLogs((prev) => mergeHydration(prev, pending, MAX_BUFFERED_ROWS));
     }
     followRef.current = true;
     setFollow(true);
@@ -783,6 +800,15 @@ export function LogsScreen() {
       <div className="phead">
         <h1>{t('logs.pageTitle')}</h1>
       </div>
+
+      {logStreamFailed && (
+        <div className="mode-warn show" role="alert" id="log-stream-error">
+          <span>{t('logs.streamFailed')}</span>
+          <button type="button" className="btn ghost sm" onClick={() => setLogStreamAttempt((attempt) => attempt + 1)}>
+            {t('common.retry')}
+          </button>
+        </div>
+      )}
 
       {/* 隐私锁提示条（原型内联覆盖为 flow 色，非默认 mode-warn 的 warn 色） */}
       {privacyMode && (
@@ -1042,10 +1068,10 @@ export function LogsScreen() {
         {/* 底栏只承载“流状态”：直播状态、当前行数与暂停后的恢复入口作为一个左侧簇，
             避开应用统一占用的右下 toast 区域。 */}
         <span className="log-stream-state">
-          <span className="log-live">
+          {logStreamReady && <span className="log-live">
             <span className="log-live-dot" />
             <span>{t('logs.liveStream')}</span>
-          </span>
+          </span>}
           <span className="log-count">
             <b id="log-count">{visible.length}</b>{' '}
             <span>{t('logs.linesUnit')}</span>

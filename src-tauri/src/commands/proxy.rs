@@ -315,12 +315,31 @@ pub async fn proxy_apply_pending_changes(
     state: State<'_, AppRuntime>,
     restart_confirmation: Option<String>,
     retry_persistence_transaction_id: Option<String>,
+    impact_confirmation: Option<String>,
+    cancel_impact_confirmation: Option<String>,
 ) -> Result<ApiResponse<Value>, ()> {
     // The explicit retry selector is mutually exclusive with restart permission.
     if restart_confirmation.is_some() && retry_persistence_transaction_id.is_some() {
         return Err(());
     }
-    let result = if let Some(transaction_id) = retry_persistence_transaction_id {
+    if (impact_confirmation.is_some()
+        && (restart_confirmation.is_some()
+            || retry_persistence_transaction_id.is_some()
+            || cancel_impact_confirmation.is_some()))
+        || (cancel_impact_confirmation.is_some()
+            && (restart_confirmation.is_some() || retry_persistence_transaction_id.is_some()))
+    {
+        return Err(());
+    }
+    let result = if let Some(token) = cancel_impact_confirmation {
+        state.proxy.cancel_runtime_impact_choice(&token)
+    } else if let Some(token) = impact_confirmation {
+        state
+            .proxy
+            .clone()
+            .confirm_runtime_impact_choice(token)
+            .await
+    } else if let Some(transaction_id) = retry_persistence_transaction_id {
         state.proxy.retry_runtime_persistence(transaction_id).await
     } else {
         state
@@ -334,13 +353,31 @@ pub async fn proxy_apply_pending_changes(
     ))
 }
 
-/// Observe an existing HOT transaction without resubmission or restart.
+/// Observe an existing transaction without resubmission or restart. Native-only
+/// checks cannot enter the original D owner's automatic acknowledgement path.
 #[tauri::command]
 pub async fn proxy_runtime_apply_status(
     state: State<'_, AppRuntime>,
-    transaction_id: String,
+    transaction_id: Option<String>,
+    host_execution_id: Option<String>,
+    native_retirement_only: Option<bool>,
 ) -> Result<ApiResponse<Value>, ()> {
-    let result = state.proxy.runtime_apply_status(transaction_id).await;
+    let result = match (
+        native_retirement_only.unwrap_or(false),
+        transaction_id,
+        host_execution_id,
+    ) {
+        (true, Some(transaction), None) => {
+            state
+                .proxy
+                .runtime_native_retirement_status(transaction)
+                .await
+        }
+        (true, _, _) => return Err(()),
+        (false, Some(transaction), None) => state.proxy.runtime_apply_status(transaction).await,
+        (false, None, Some(execution)) => state.proxy.runtime_host_apply_status(execution).await,
+        _ => return Err(()),
+    };
     Ok(ApiResponse::ok(
         serde_json::to_value(result).map_err(|_| ())?,
     ))

@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { TESTS, selectNativeExecutable, bindNativeRuntime, runTests as runCaseTests, withNativeSession, nativeRuntimeSummary } from './run-native-dns-controlled-tests.mjs';
 import test, { after } from 'node:test';
 import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesktopSelection, selectedCandidateContext } from './desktop-core/native-dns-candidate.mjs';
 import { regularPath } from './desktop-core/release-consumer.mjs';
@@ -105,8 +107,54 @@ function reusableContract(caller = workflow, callee = candidateWorkflow) {
     + '        env:\n          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}\n'
     + '        run: node scripts/fetch-core.mjs';
   assert.ok(callee.includes(formalAcquisition));
+  const pythonSetup = "      - uses: actions/setup-python@v6\n        with:\n          python-version: '3.12'\n";
+  const dependency = '      - name: Install same-source trusted proof validator dependency\n'
+    + '        run: python -m pip install jsonschema==4.23.0\n';
+  assert.ok(callee.includes(pythonSetup));
+  assert.ok(callee.includes(dependency));
+  assert.ok(callee.indexOf(dependency) > callee.indexOf(pythonSetup));
+  assert.ok(callee.indexOf(dependency) < callee.indexOf(acquisition));
+  assert.ok(callee.indexOf(dependency) < callee.indexOf(formalAcquisition));
   assert.doesNotMatch(callee.replace(acquisition, '').replace(formalAcquisition, ''), /github\.token|POLARIS_RELEASE_API_TOKEN/);
   assert.doesNotMatch(callee, /secrets:|secrets\.|contents: write|actions: write|id-token:|cargo (?:build|test) --workspace|run: pnpm/);
+}
+
+// These synthetic routing fixtures declare every observation explicitly.
+// Real pipe regressions live in run-native-dns-controlled-tests.test.mjs.
+function fixtureSessionEnd(processId, status, stdout, stderr, action) {
+  return { processId, status, signal: null, exitObserved: true, exitStatus: status, exitSignal: null,
+    closeObserved: true, processError: null, captureError: null, timedOut: false, interrupted: false,
+    control: { action, payloadBytes: action === 'teardown' ? 9 : 0, attempted: true, finished: true, closed: true, error: null },
+    stdout: Buffer.from(stdout), stderr: Buffer.from(stderr),
+    outputState: { stdout: { eof: true, error: null }, stderr: { eof: true, error: null } } };
+}
+
+// Inert orchestration fixture only. It opens no native endpoint and cannot issue
+// a production Check/RunMain receipt; actual case assertions use their own fixtures.
+async function fixtureSession(selected, env, directory) {
+  const compiled = JSON.parse(readFileSync(env.POLARIS_CORE_IDENTITY_FILE));
+  const record = { schema: 'polaris-native-session-v1', state: 'ready', code: 'ready', detail: null,
+    processId: 80, owner: { schema: 'polaris-native-session-owner-v1', sessionId: '00000000-0000-4000-8000-000000000001',
+      compiledAppBuildId: env.GITHUB_SHA, caller: env.CORE_PLATFORM === 'win' ? 'sS-1-5-21-1000' : 'u1000',
+      platform: env.CORE_PLATFORM, coreId: compiled.id, providerFingerprint: compiled.core.providerFingerprint, coreFiles: compiled.core.files,
+      helperSha256: compiled.core.helperSha256 ?? null, cleanerSha256: compiled.core.cleanerSha256 ?? null,
+      requiredCases: [...TESTS] }, configRoot: join(directory, 'inert-private-session'),
+    provider: 'compiled-platform-production-route', registrationScope: 'enforced-by-production-start', executionAuthorized: false, slots: 1,
+    maxRetainedBytes: 32 * 1024 * 1024, retainedBytesBefore: 0, required: true, publicationEligible: false };
+  return { kind: 'preparation', record, processId: 80, async finish() {
+    const teardown = { schema: 'polaris-native-session-teardown-v1', sessionId: record.owner.sessionId,
+      processId: 80, startedCases: 6, caseDrainCheckpointsMatched: true, providerIdle: true,
+      state: 'retained', directoryState: 'retained', retainedBytes: 2048, maxRetainedBytes: record.maxRetainedBytes,
+      retentionReason: 'inert retained fixture', evidenceKind: 'data-coordination-only', registrationChanged: false, providerInstalled: false, publicationEligible: false };
+    const stdout = `POLARIS_NATIVE_SESSION ${JSON.stringify(record)}\nPOLARIS_NATIVE_SESSION_TEARDOWN ${JSON.stringify(teardown)}\n`;
+    writeFileSync(join(directory, 'native-session.stdout.log'), stdout);
+    writeFileSync(join(directory, 'native-session.stderr.log'), '');
+    return fixtureSessionEnd(80, 0, stdout, '', 'teardown');
+  } };
+}
+async function runTests(selected, env, directory, execute) {
+  if (selected.carrier !== 'normal-production-library') return runCaseTests(selected, env, directory, execute);
+  return withNativeSession(selected, env, directory, () => runCaseTests(selected, env, directory, execute), fixtureSession);
 }
 
 test('RuntimeConfig source mocks remain independent of payload admission and use the exact package test', () => {
@@ -123,7 +171,7 @@ const runtimeSourceDefaults = { runtime_config_loopback_input: 'diagnostic-sourc
 const runtimeSourceConflicts = [
   { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
   { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' },
-  { windows_directory_candidate_source: sha }, { os: 'windows-2022' }, { os: 'macos-14' },
+  { windows_directory_candidate_source: sha }, { os: 'windows-2022' }, { os: 'macos-15' },
   { windows_launcher_diagnostics: true, windows_system_candidate: sha },
 ];
 function ciJobSection(source, name) {
@@ -208,7 +256,7 @@ function runtimeSourceRoutingContract(source = workflow) {
   for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
     for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
       for (const diagnostic of [undefined, false, true])
-        for (const system of ['', sha]) for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-14'])
+        for (const system of ['', sha]) for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-15'])
           for (const nativeRequired of ['', 'true', 'unknown', 'false']) for (const formal of ['', 'true']) {
             const inputs = { ...runtimeSourceDefaults, runtime_config_source_only: sourceOnly,
               windows_launcher_diagnostics: diagnostic, windows_system_candidate: system, os };
@@ -286,6 +334,8 @@ test('same-commit reusable route has required string inputs, read-only permissio
     ['caller', 'candidate: ${{ needs.cheap_format.outputs.native_dns_candidate || needs.cheap_format.outputs.native_dns_formal_app }}', 'candidate: ${{ inputs.native_dns_candidate }}'],
     ['caller', '    uses: ./.github/workflows/native-dns-candidate.yml', '    secrets: inherit\n    uses: ./.github/workflows/native-dns-candidate.yml'],
     ['caller', '    uses: ./.github/workflows/native-dns-candidate.yml', '    runs-on: ubuntu-22.04\n    uses: ./.github/workflows/native-dns-candidate.yml'],
+    ['callee', 'run: python -m pip install jsonschema==4.23.0', 'run: echo missing dependency'],
+    ['callee', 'jsonschema==4.23.0', 'jsonschema==4.19.2'],
     ['callee', 'type: string', 'type: boolean'],
     ['callee', 'required: true', 'required: false'],
     ['callee', "default: ''", `default: '${sha}'`],
@@ -436,6 +486,22 @@ test('actual helper bytes and isolated candidate identity are frozen before the 
 
 test('controlled real-core tests resolve exact library namespaces and never select all ignored tests', () => {
   const selected = step('Run exact controlled App lifecycle hot-switch and stats tests');
+  const condition = /^        if: \$\{\{ (.+) \}\}$/m.exec(selected)?.[1];
+  assert.ok(condition);
+  assert.doesNotMatch(condition, /native_dns_default|native_dns_formal|runner\.os/);
+  const route = (outputs = {}, build = 'success', tests = 'success', cancelled = false) =>
+    new Function('needs', 'steps', 'cancelled', `return (${condition});`)(
+      { cheap_format: { outputs: { app_native_compile_only: '', native_dns_candidate: '', ...outputs } } },
+      { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } }, () => cancelled);
+  assert.equal(route(), false);
+  assert.equal(route({ native_dns_formal: 'true' }), false);
+  assert.equal(route({ native_dns_default: 'true' }), false);
+  assert.equal(route({ native_dns_candidate: sha }), true);
+  assert.equal(route({ native_dns_candidate: sha }, 'success', 'failure'), true);
+  assert.equal(route({ native_dns_candidate: sha, app_native_compile_only: 'true' }), false);
+  assert.equal(route({ native_dns_candidate: sha }, 'failure'), false);
+  assert.equal(route({ native_dns_candidate: sha }, 'success', 'skipped'), false);
+  assert.equal(route({ native_dns_candidate: sha }, 'success', 'success', true), false);
   const names = [...selected.matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
   assert.equal(names.length, 6);
   assert.equal(new Set(names).size, 6);
@@ -581,7 +647,6 @@ test('committed temporary default is admitted without manual branch inputs or en
     'Verify exact candidate Go toolchain', 'Acquire all four explicit candidate payloads before placeholders',
     'Build actual candidate helper bytes and freeze the separate App identity',
     'Verify all candidate payloads and compiled identity before workspace build',
-    'Run exact controlled App lifecycle hot-switch and stats tests',
     'Verify all candidate payloads after workspace and controlled App tests',
     'Record ordinary candidate outcomes without claiming skipped acceptance', 'Always preserve exact ordinary candidate evidence'])
     assert.ok(step(name).includes("needs.cheap_format.outputs.native_dns_default == 'true'"), name);
@@ -660,7 +725,6 @@ test('committed formal admission enables the same ordinary preparation and lifec
     'Verify exact candidate Go toolchain', 'Acquire all four explicit candidate payloads before placeholders',
     'Build actual candidate helper bytes and freeze the separate App identity',
     'Verify all candidate payloads and compiled identity before workspace build',
-    'Run exact controlled App lifecycle hot-switch and stats tests',
     'Verify all candidate payloads after workspace and controlled App tests',
     'Record ordinary candidate outcomes without claiming skipped acceptance', 'Always preserve exact ordinary candidate evidence'])
     assert.ok(step(name).includes("needs.cheap_format.outputs.native_dns_formal == 'true'"), name);
@@ -707,63 +771,97 @@ test('formal host activation derives compiler and source from the validated cont
 });
 
 
-test('Windows controlled runtime summary requires all five exact stdout logs and passed records', () => {
+test('ordinary summary consumes one bound six-case normal projection without promoting SYSTEM or package scope', async () => {
   const source = nodeScript('Record ordinary candidate outcomes without claiming skipped acceptance');
   const names = [...step('Run exact controlled App lifecycle hot-switch and stats tests')
-    .matchAll(/^            (runtime::proxy::[^\s]+)$/gm)].map((m) => m[1]);
-  assert.equal(names.length, 5);
-  const pass = 'test result: ok. 1 passed; 0 failed; 0 ignored;';
-  function summary({ missingStatus = '', status = 'passed', stdout = pass, missingStdout = '',
-    mixed = pass, statusFile = true, system = {} } = {}) {
-    const directory = mkdtempSync(join(tmpdir(), 'windows-runtime-summary-'));
-    const fixturePath = (path) => join(directory, path);
+    .matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(names, TESTS); assert.equal(names.length, 6);
+  assert.equal(names[5], 'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames');
+  const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+  for (const mode of ['pass', 'stack-overflow', 'business-failure']) {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'ordinary-native-summary-')));
+    const evidence = join(directory, 'native-dns-ci-evidence'), platform = mode === 'business-failure' ? 'linux' : 'win';
     try {
-      mkdirSync(fixturePath('native-dns-ci-evidence'));
-      if (statusFile) writeFileSync(fixturePath('native-dns-ci-evidence/runtime-status.txt'), names.flatMap((name) =>
-        [`${name}: started`, `${name}: ${name === missingStatus ? 'started' : status}`]).join('\n'));
-      for (const name of names) {
-        const log = `native-dns-ci-evidence/${name.split('::').at(-1)}`;
-        if (name !== missingStdout) writeFileSync(fixturePath(`${log}.stdout.log`), stdout);
-        // Legacy human logs and stderr deliberately contain tempting pass text.
-        writeFileSync(fixturePath(`${log}.log`), mixed);
-        writeFileSync(fixturePath(`${log}.stderr.log`), pass);
+      mkdirSync(evidence); mkdirSync(join(directory, 'target/debug'), { recursive: true });
+      mkdirSync(join(directory, 'scripts')); mkdirSync(join(directory, '.github/workflows'), { recursive: true });
+      for (const path of ['scripts/run-native-dns-controlled-tests.mjs', '.github/workflows/ci.yml'])
+        writeFileSync(join(directory, path), readFileSync(join(root, path)));
+      const executable = join(directory, 'target/debug/native-admission-verifier'); writeFileSync(executable, 'inert normal fixture');
+      const target = { name: 'native-admission-verifier', kind: ['bin'], src_path: join(directory, 'src-tauri/src/bin/native-admission-verifier.rs') };
+      const metadata = { target_directory: join(directory, 'target'), packages: [{ id: 'app', name: 'polaris',
+        manifest_path: join(directory, 'src-tauri/Cargo.toml'), targets: [target] }] };
+      const artifact = { reason: 'compiler-artifact', package_id: 'app', target, profile: { test: false, debug_assertions: true },
+        executable, features: ['default', 'formal-selection', 'native-production-verification'] };
+      const env = { ...base, CORE_CANDIDATE: sha, CORE_PLATFORM: platform, RUNNER_OS: platform === 'win' ? 'Windows' : 'Linux',
+        POLARIS_NATIVE_DNS_FORMAL: '1', ADMITTED_FORMAL: 'true', ADMITTED_DEFAULT: '', ADMITTED_CANDIDATE: '',
+        POLARIS_CORE_IDENTITY_FILE: join(directory, 'compiled-core.json'), RUNTIME_OUTCOME: mode === 'pass' ? 'success' : 'failure' };
+      writeFileSync(env.POLARIS_CORE_IDENTITY_FILE, JSON.stringify({ schema: 'polaris-core-manifest-v1', id: 'f'.repeat(64), core: { platform, files: [{ name: 'inert metadata' }] } }));
+      writeFileSync(join(evidence, 'context.json'), JSON.stringify({ context: { repository: env.GITHUB_REPOSITORY,
+        repositoryId: env.GITHUB_REPOSITORY_ID, candidate: sha, tree: 'b'.repeat(40), runId: env.GITHUB_RUN_ID,
+        attempt: env.GITHUB_RUN_ATTEMPT, workflowRef: env.GITHUB_WORKFLOW_REF, ref: env.GITHUB_REF, contractSha256: 'c'.repeat(64) },
+        platform, selection: 'formal-default', kernelSourceCommit: 'd'.repeat(40), kernelSourceTree: 'e'.repeat(40) }));
+      writeFileSync(join(evidence, 'controlled-cargo-metadata.json'), JSON.stringify(metadata));
+      writeFileSync(join(evidence, 'controlled-build.stdout.log'), JSON.stringify(artifact) + '\n');
+      const selected = selectNativeExecutable([artifact], metadata, directory); selected.sha256 = hash('inert normal fixture');
+      writeFileSync(join(evidence, 'controlled-executable.json'), JSON.stringify({ ...selected, preparationCalls: 1 }));
+      const git = (command, args) => {
+        assert.equal(command, 'git');
+        if (args[0] === 'rev-parse') return args[1] === 'HEAD' ? sha : 'b'.repeat(40);
+        if (args[0] === 'status') return '';
+        assert.equal(args[0], 'show'); return readFileSync(join(directory, args[1].slice(41)), 'utf8');
+      };
+      bindNativeRuntime(selected, directory, env, evidence, git);
+      const calls = [];
+      const operation = runTests(selected, env, evidence, async command => {
+        const name = command.args[0]; calls.push(name);
+        const cleanup = { schema: 'polaris-controlled-cleanup-v1', testName: name, processId: 70, generation: 1,
+          shutdownFenced: true, custody: { state: 'empty-after-shutdown-fence', corePid: null, runRef: null }, publicationEligible: false };
+        const configJson = JSON.stringify({ services: [{ type: 'api', dashboard: { path: '/fixture' } }],
+          inbounds: [{ type: 'mixed', listen: '127.0.0.1' }], outbounds: [] });
+        const graph = { schema: 'polaris-controlled-production-graph-v1', processId: 70, stage: 'initial-start',
+          source: 'actual-runtime-config-path', dashboardEnabled: true, startSucceeded: true, dashboardPath: '/fixture',
+          bytes: Buffer.byteLength(configJson), sha256: hash(configJson), configJson, publicationEligible: false };
+        const native = { schema: 'polaris-native-production-case-v1', case: name, processId: 70, carrier: 'normal-production-library',
+          result: mode === 'business-failure' ? 'failed' : 'passed', validationCustodyDrained: true, publicationEligible: false };
+        const stdout = mode === 'stack-overflow' ? '' : `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(cleanup)}\n`
+          + (name === TESTS[2] ? `POLARIS_DEFAULT_GRAPH ${JSON.stringify(graph)}\n` : '') + `POLARIS_NATIVE_CASE ${JSON.stringify(native)}\n`;
+        const stderr = mode === 'stack-overflow' ? 'stack overflow\n' : 'ordinary diagnostic\n', output = stdout + stderr;
+        const id = name.split('::').at(-1);
+        for (const [suffix, bytes] of [['.log', output], ['.stdout.log', stdout], ['.stderr.log', stderr]]) writeFileSync(join(evidence, id + suffix), bytes);
+        return { status: mode === 'pass' ? 0 : 1, processId: 70, error: null, timedOut: false, cleanupUncertain: false, interrupted: false,
+          output, stdout, stderr, logBytes: Buffer.byteLength(output), logSha256: hash(output),
+          stdoutBytes: Buffer.byteLength(stdout), stdoutSha256: hash(stdout), stderrBytes: Buffer.byteLength(stderr), stderrSha256: hash(stderr) };
+      });
+      if (mode === 'pass') await operation; else await assert.rejects(operation);
+      let adapterCalls = 0;
+      const fixturePath = path => isAbsolute(path) ? path : join(directory, path);
+      const summary = (extra = {}) => {
+        new Function('process', 'copyFileSync', 'existsSync', 'mkdirSync', 'readFileSync', 'writeFileSync', 'nativeRuntimeSummary', source)(
+          { env: { ...env, ...extra } }, (from, to) => copyFileSync(fixturePath(from), fixturePath(to)),
+          path => existsSync(fixturePath(path)), (path, options) => mkdirSync(fixturePath(path), options),
+          (path, encoding) => readFileSync(fixturePath(path), encoding), (path, bytes) => writeFileSync(fixturePath(path), bytes),
+          (path, checked) => { adapterCalls++; return nativeRuntimeSummary(fixturePath(path), checked, directory, git); });
+        return JSON.parse(readFileSync(join(evidence, 'summary.json'), 'utf8'));
+      };
+      const value = summary(); assert.equal(adapterCalls, 1);
+      assert.deepEqual(value.nativeProductionRuntime.tests.map(row => row.name), TESTS);
+      assert.equal(value.nativeProductionRuntime.requirementState, mode === 'pass' ? 'satisfied' : 'open');
+      if (platform === 'win') assert.deepEqual(value.windowsProxyRuntimeTests, value.nativeProductionRuntime);
+      assert.equal(value.AppAccepted, false); assert.equal(value.packagedAcceptance, false); assert.equal(value.publicationEligible, false);
+      assert.equal(value.systemAcceptance.state, 'unexecuted');
+      if (mode === 'stack-overflow') {
+        assert.equal(value.nativeProductionRuntime.tests[0].state, 'cleanup-unknown');
+        assert.ok(value.nativeProductionRuntime.tests.slice(1).every(row => row.state === 'unexecuted')); assert.equal(calls.length, 1);
+      } else if (mode === 'business-failure') {
+        assert.ok(value.nativeProductionRuntime.tests.every(row => row.state === 'failed' && row.cleanup === 'confirmed')); assert.equal(calls.length, 6);
+      } else {
+        assert.equal(summary({ SYSTEM_FRESH_OUTCOME: 'success', SYSTEM_PREBUILT_OUTCOME: 'success' }).systemAcceptance.state, 'passed');
+        assert.equal(summary({ SYSTEM_FRESH_OUTCOME: 'success', SYSTEM_PREBUILT_OUTCOME: 'skipped' }).systemAcceptance.state, 'failed-or-incomplete');
+        assert.equal(summary({ SYSTEM_FRESH_OUTCOME: 'skipped', SYSTEM_PREBUILT_OUTCOME: 'skipped' }).systemAcceptance.state, 'unexecuted');
+        assert.equal(summary({ RUNTIME_OUTCOME: 'failure' }).nativeProductionRuntime.requirementState, 'open');
       }
-      new Function('process', 'copyFileSync', 'existsSync', 'mkdirSync', 'readFileSync', 'writeFileSync', source)(
-        { env: { RUNNER_OS: 'Windows', RUNTIME_OUTCOME: 'success', ...system } },
-        (from, to) => copyFileSync(fixturePath(from), fixturePath(to)), (path) => existsSync(fixturePath(path)),
-        (path, options) => mkdirSync(fixturePath(path), options),
-        (path, encoding) => readFileSync(fixturePath(path), encoding),
-        (path, value) => writeFileSync(fixturePath(path), value));
-      return JSON.parse(readFileSync(fixturePath('native-dns-ci-evidence/summary.json'), 'utf8'));
     } finally { rmSync(directory, { recursive: true, force: true }); }
   }
-  const success = summary();
-  assert.equal(success.windowsProxyRuntimeTests.state, 'passed');
-  assert.equal(success.windowsProxyRuntimeTests.requirementState, 'satisfied');
-  assert.deepEqual(success.windowsProxyRuntimeTests.tests.map(({ name }) => name), names);
-  assert.ok(success.windowsProxyRuntimeTests.tests.every(({ log }) => log.endsWith('.stdout.log')));
-  assert.equal(success.AppAccepted, false);
-  assert.equal(success.systemAcceptance.state, 'unexecuted');
-  for (const [fresh, prebuilt, state] of [['success','success','passed'], ['success','skipped','failed-or-incomplete'],
-    ['failure','skipped','failed-or-incomplete'], ['skipped','skipped','unexecuted']]) {
-    const value = summary({ system: { SYSTEM_FRESH_OUTCOME: fresh, SYSTEM_PREBUILT_OUTCOME: prebuilt } });
-    assert.equal(value.systemAcceptance.state, state);
-    assert.equal(value.AppAccepted, false);
-  }
-  for (const name of names) {
-    for (const absent of [{ missingStatus: name }, { missingStdout: name }]) {
-      const value = summary(absent).windowsProxyRuntimeTests;
-      assert.equal(value.requirementState, 'open');
-      assert.equal(value.tests.find((item) => item.name === name).state, 'failed-or-incomplete');
-      assert.ok(value.tests.filter((item) => item.name !== name).every((item) => item.state === 'passed'));
-    }
-  }
-  for (const log of ['', 'test result: ok. 0 passed; 0 failed; 0 ignored;', 'test result: FAILED.'])
-    assert.equal(summary({ stdout: log }).windowsProxyRuntimeTests.requirementState, 'open',
-      'fake pass text in mixed/stderr logs cannot replace stdout proof');
-  assert.equal(summary({ mixed: 'human-only diagnostics without a verdict' }).windowsProxyRuntimeTests.requirementState, 'satisfied');
-  assert.equal(summary({ status: 'started' }).windowsProxyRuntimeTests.requirementState, 'open');
-  assert.equal(summary({ statusFile: false }).windowsProxyRuntimeTests.state, 'unexecuted');
 });
 
 test('final SYSTEM request fails before heavy work for wrong identity, platform or diagnostic scope', () => {
@@ -774,7 +872,7 @@ test('final SYSTEM request fails before heavy work for wrong identity, platform 
     { env: { ...env, ...extra } }, () => head + '\n');
   run(); run({ GITHUB_REF: 'refs/heads/main', SYSTEM_OS: 'windows-2022' });
   for (const extra of [{ SYSTEM_CANDIDATE: 'b'.repeat(40) }, { SYSTEM_CANDIDATE: sha.toUpperCase() },
-    { SYSTEM_OS: 'macos-14' }, { SYSTEM_MODE: 'candidate' }, { SYSTEM_DIAGNOSTIC: 'true' },
+    { SYSTEM_OS: 'macos-15' }, { SYSTEM_MODE: 'candidate' }, { SYSTEM_DIAGNOSTIC: 'true' },
     { GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_REPOSITORY: 'other/Polaris' },
     { GITHUB_REF: 'refs/heads/unapproved' }, { GITHUB_REF: 'refs/tags/v1.0.0' }]) assert.throws(() => run(extra));
   assert.throws(() => run({}, 'b'.repeat(40)));
@@ -837,7 +935,7 @@ test('exact App compile-only admission is read-only, Ubuntu-only and rejects eve
   assert.deepEqual(compileAdmission().writes, [{ path: 'output', value: 'compile_only=true\n' }]);
   for (const candidate of ['', ' ', 'false', false, true, 'A'.repeat(40), 'b'.repeat(40), null])
     assert.throws(() => compileAdmission({ ...compileInputs, app_native_compile_candidate: candidate }));
-  const conflicts = [{ runtime_config_loopback_candidate: sha }, { runtime_config_loopback_candidate: ' ' }, { os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { os: 'other' },
+  const conflicts = [{ runtime_config_loopback_candidate: sha }, { runtime_config_loopback_candidate: ' ' }, { os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-15' }, { os: 'other' },
     { runtime_config_source_only: true }, { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
     { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
     { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' }];
@@ -950,7 +1048,7 @@ const loopbackInputs = { ...runtimeSourceDefaults, runtime_config_loopback_candi
 const loopbackConflicts = [{ app_native_compile_candidate: sha }, { runtime_config_source_only: true },
   { native_dns_candidate: sha }, { windows_system_candidate: sha }, { windows_launcher_diagnostics: true },
   { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
-  { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { preserve_run: false },
+  { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-15' }, { preserve_run: false },
   { app_native_compile_candidate: ' ' }, { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' },
   { runtime_config_source_only: true, windows_launcher_diagnostics: true, app_native_compile_candidate: sha }];
 function loopbackAdmission(inputs = loopbackInputs, extra = {}) {

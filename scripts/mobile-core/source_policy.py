@@ -22,9 +22,11 @@ VENDOR_DIRECTORIES = {
 
 
 VENDOR_DIRECTORIES_V3 = {**VENDOR_DIRECTORIES, 'github.com/sagernet/sing-vmess': 'sing-vmess'}
+VENDOR_DIRECTORIES_V4 = {**VENDOR_DIRECTORIES_V3, 'github.com/libp2p/go-nat': 'go-nat'}
 VENDOR_SCHEMAS = {
     'polaris-reviewed-kernel-source-v2': VENDOR_DIRECTORIES,
     'polaris-reviewed-kernel-source-v3': VENDOR_DIRECTORIES_V3,
+    'polaris-reviewed-kernel-source-v4': VENDOR_DIRECTORIES_V4,
 }
 
 
@@ -309,7 +311,7 @@ def source_module_declarations(raw):
 
 
 def verify_source_policy_files(policy, context, files, actual_meta_tree, *, vendor_modes=None, vendor_trees=None):
-    """V1 retains its Meta proof; v2/v3 require every declared vendor bytes/modes/tree.
+    """V1 retains its Meta proof; v2/v3/v4 require every declared vendor bytes/modes/tree.
 
     V2 link entries contain the link-target bytes, never followed file contents.
     Archive callers without that complete evidence fail closed rather than

@@ -649,7 +649,6 @@ fn unchanged_config_is_rebound_to_a_new_session_with_new_revision() {
 async fn actual_debounced_restart_invalidates_before_blocked_failed_cleanup_and_old_worker() {
     // Keep this lifecycle's real global admission independent of unrelated
     // fixtures that intentionally pause PC producers in the parent process.
-    #[cfg(unix)]
     if crate::test_support::ran_in_isolated_worker(
         module_path!(),
         "actual_debounced_restart_invalidates_before_blocked_failed_cleanup_and_old_worker",

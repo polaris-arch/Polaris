@@ -1,7 +1,7 @@
-//! sing-box 日志配置生成（上游 `singbox-log-builder.ts` 1:1 移植）。
+//! sing-box 日志配置生成；SC02 在 disabled 时保留可信 host 输出锚点元数据。
 //!
 //! 纯函数：读 UserConfig 子集 + privacyMode + 平台 + 日志文件路径（注入，不硬编码）。
-//! config 字节等价由 config-snapshot 网验证（含 TUN 三平台 output 文件路径分支）。
+//! 当前 producer 字节契约由 golden/config-snapshot 守卫验证；本 builder 不执行文件 I/O。
 
 #![forbid(unsafe_code)]
 
@@ -17,7 +17,7 @@ use polaris_helper_proto::Platform;
 pub struct LogBuildDeps<'a> {
     pub privacy_mode: bool,
     pub platform: Platform,
-    /// TUN 模式下 sing-box 日志文件路径。None = 调用方未提供（TUN 时 output 留空，与异常态一致）。
+    /// TUN 的可信固定输出锚点。None = 不让 Core 持固定 fd；实际 App 使用 SubscribeLog + bounded sink。
     pub log_file_path: Option<&'a str>,
 }
 
@@ -29,23 +29,19 @@ pub struct LogConfigInput {
     pub proxy_mode_type: ProxyModeType,
 }
 
-/// 生成日志配置（上游 `buildLogConfig` 1:1 移植）。
+/// 生成日志配置；disabled 保留已有可信 host 锚点，启用无需重新授权任意路径。
 ///
 /// 行为契约（对拍锁）：
 /// 1. level = effectiveLogLevel(config.logLevel || 'info', privacyMode) —— 隐私模式抬 ≥warn。
 /// 2. timestamp 恒 true。
-/// 3. disableLogFile → disabled=true，直接返回（不下发 output）。
+/// 3. disableLogFile → disabled=true；仍保留可信 host 注入的固定 output 元数据（核不打开它）。
 /// 4. TUN 模式（三平台）→ output = 日志文件路径；manual/systemProxy 模式不写文件（stderr 直喂）。
 ///
-/// # `output` 一旦下发，核的 stderr 就**一行不出**（这条后果必须记住）
-///
-/// sing-box 的 `log.New` 见到非空 `output` 即把 `logWriter` 换成 `io.Discard` 并把日志写进那个文件
-/// （`log/log.go`）。而 TUN 模式恒经提权 helper 起核、app 侧连管道都没有 ⇒ **本仓一度在 TUN 下拿不到
-/// 任何实时核日志**，日志页零核行，只有导出诊断时事后 `read_tail` 才看得到。
-///
-/// 那条缺口现已由**另一条路**补上：核日志实时流走管理 API 的 `SubscribeLog`（不经 stderr、不经文件，
-/// 见 `src-tauri/runtime/proxy.rs` 的核日志 relay）。故这里继续写文件是**有意保留**的——它服务的是
-/// 「导出诊断报告时附上核日志原文」，不再是实时日志的来源。改动这一格前请先确认那条 gRPC 腿仍在。
+/// `output` 仅来自 host 注入的依赖，不从 renderer 用户配置读取路径。
+/// disabled 只保留这个名字，Core 的稳定 logger owner 不在构造/启动时打开它。
+/// 实际 App 启动固定使用 None（W26）：SubscribeLog relay 将核日志交给 App 的 bounded writer，
+/// 不能为了热启用而恢复一个无法响应轮转的固定 Core fd。显式 Some 仍受 Core 原路径/文件存在
+/// 检查；本 builder 本身不创建目录、文件或占位日志。
 pub fn build_log_config(input: &LogConfigInput, deps: &LogBuildDeps) -> LogConfig {
     // 1. level（隐私模式从源头不让 sing-box 记录连接明细）。
     let level = input.log_level.effective(deps.privacy_mode);
@@ -56,10 +52,10 @@ pub fn build_log_config(input: &LogConfigInput, deps: &LogBuildDeps) -> LogConfi
         disabled: None,
     };
 
-    // 2. 用户关闭日志写盘：整体禁用（隐私/省盘），不再写文件，直接返回。
+    // Disabled suppresses emission/opening, not the immutable host output anchor.
+    // This builder does no I/O; Core keeps the name inert until explicit enable.
     if input.disable_log_file {
         cfg.disabled = Some(true);
-        return cfg;
     }
 
     // 3. TUN 模式（三平台）→ output 写文件。

@@ -89,6 +89,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Install same-source trusted proof validator dependency
+        run: python -m pip install jsonschema==4.23.0
 
       - name: Verify exact candidate and native compiler host
         env:
@@ -212,9 +214,10 @@ jobs:
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - uses: actions/setup-python@v6
-        if: needs.plan.outputs.legacy_origins == 'true'
         with:
           python-version: '3.12'
+      - name: Install same-source trusted proof validator dependency
+        run: python -m pip install jsonschema==4.23.0
 
       - name: Retrieve reviewed unchanged native origins
         if: needs.plan.outputs.legacy_origins == 'true'

@@ -736,3 +736,22 @@ fn pinned_native_start_refuses_legacy_wrong_or_duplicate_execution_marker() {
         assert!(parse_request("start-native-pinned-birth-safe", &args).is_none());
     }
 }
+
+#[test]
+fn native_start_rejects_linux_only_runtime_root_data() {
+    let id = "a".repeat(64);
+    let marker = polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR;
+    assert!(parse_request(
+        "start-native-pinned-birth-safe",
+        &[
+            marker,
+            &id,
+            r"C:\state\config.json",
+            "",
+            "0",
+            "",
+            r"runtime-root-v1=C:\state"
+        ]
+    )
+    .is_none());
+}

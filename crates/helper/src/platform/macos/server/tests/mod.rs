@@ -551,6 +551,7 @@ fn process_conn_pinned_start_full_flow_with_native_peer() {
     };
     for fwd in [false, true] {
         let params = PinnedStartParams {
+            runtime_directory: None,
             id: CoreId::parse(&"a".repeat(64)).unwrap(),
             common: StartParams {
                 cfg: "/Users/test/Polaris/c.json".into(),
@@ -937,5 +938,5 @@ fn check_chunk_decoder_and_dispatch_fail_closed_without_peer_or_platform_factory
         frame.bytes,
         polaris_helper_proto::codec::MAX_FRAME_BYTES + 1
     );
-    assert!(CHUNK_BYTES * 2 < MAX_WIRE_LINE_BYTES);
+    const { assert!(CHUNK_BYTES * 2 < MAX_WIRE_LINE_BYTES) };
 }

@@ -19,7 +19,7 @@ fn windows_policy_and_actual_callers_keep_execution_unavailable() {
         "unknown",
     ] {
         let policy = serde_json::json!({"schema":"polaris-trusted-execution-v1",
-            "sourceCommit":source,"sourceTree":tree,"loader":loader,"purposes":["run-main-v1"]});
+            "sourceCommit":source,"sourceTree":tree,"loader":loader,"purposes":["check-config-v1","run-main-v1"]});
         assert_eq!(
             SelectedPolicy::declaration(&policy, &source, &tree, "win")
                 .unwrap_err()

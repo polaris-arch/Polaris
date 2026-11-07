@@ -36,6 +36,7 @@ import { api } from '@/ipc';
 import { useAppStore } from '@/store/app-store';
 import { useNavStore } from '@/store/nav-store';
 import { ListEditor } from './ListEditor';
+import { shellPlatformFromDataOs } from './settings-logic';
 import {
   DNS_FALLBACK,
   dnsUpstreamIdentity,
@@ -138,6 +139,7 @@ export default function SettingsDns({
   }
 
   const raceStrategy: RaceStrategy = dns.resolveNodeDomainsAhead === false ? 'single' : 'race';
+  const systemDnsTakeoverUnsupported = shellPlatformFromDataOs() === 'win';
 
   /* ── 国内/国外 DNS + 查询超时：本地草稿 + onBlur 提交（契约 L94）──────────────
    * 三个都是文本输入，逐键写盘会在代理运行时按每个字符触发一次整核重启评估，且中间态是非法值。
@@ -456,9 +458,12 @@ export default function SettingsDns({
 
         <SetRow
           label={t('settings.advanced.takeoverSystemDns')}
-          tip={t('settings.dns.takeoverSystemDnsDesc')}
+          tip={systemDnsTakeoverUnsupported ? t('settings.dns.takeoverSystemDnsUnsupported') : t('settings.dns.takeoverSystemDnsDesc')}
         >
-          <Switch checked={dns.takeoverSystemDns !== false} onChange={(v) => patchDns({ takeoverSystemDns: v })} />
+          <Switch checked={dns.takeoverSystemDns !== false}
+            disabled={systemDnsTakeoverUnsupported}
+            tip={systemDnsTakeoverUnsupported ? t('settings.dns.takeoverSystemDnsUnsupported') : undefined}
+            onChange={(v) => { if (!systemDnsTakeoverUnsupported) patchDns({ takeoverSystemDns: v }); }} />
         </SetRow>
 
         {/* 乐观 DNS 缓存 → 顶层 dns.optimistic（builder/dns.rs:465，仅 true 时下发）。

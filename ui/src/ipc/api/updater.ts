@@ -253,7 +253,7 @@ export const updateApi = {
     return invoke(IPC_CHANNELS.UPDATE_REQUEST_INSTALL_PERMISSION);
   },
 
-  async skip(version: string): Promise<{ success: boolean }> {
+  async skip(version: string): Promise<void> {
     return invoke(IPC_CHANNELS.UPDATE_SKIP, { version });
   },
 
@@ -280,9 +280,9 @@ export const updateApi = {
 // ============================================================================
 
 export const coreApi = {
-  /** Bounded capabilities query, independent of the legacy display version probe. */
-  async getTlsFingerprints(): Promise<import('@/domain/utls').TlsFingerprintSnapshot> {
-    const response = await invoke<{ tlsFingerprints: import('@/domain/utls').TlsFingerprintSnapshot }>(IPC_CHANNELS.CORE_GET_VERSION_INFO, { capabilitiesOnly: true });
+  /** Expected selected support on desktop; loaded native capabilities on mobile. */
+  async getTlsFingerprints(): Promise<import('@/domain/utls').TlsFingerprintPresentation> {
+    const response = await invoke<{ tlsFingerprints: import('@/domain/utls').TlsFingerprintPresentation }>(IPC_CHANNELS.CORE_GET_VERSION_INFO, { capabilitiesOnly: true });
     return response.tlsFingerprints;
   },
   async getVersionInfo(): Promise<CoreVersionInfo> {

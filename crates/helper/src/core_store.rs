@@ -10,6 +10,17 @@ use polaris_helper_proto::core_manifest::{CoreId, InstalledCoreManifest};
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 mod recovery_transaction;
 
+/// Create a new private recovery-data object owned by the actual TokenUser.
+/// These producers never change an existing object's owner or grant execution.
+#[cfg(windows)]
+pub fn create_current_user_data_directory(path: &Path) -> io::Result<()> {
+    crate::platform::windows::user_data::create_current_user_directory(path)
+}
+#[cfg(windows)]
+pub fn create_current_user_data_file(path: &Path) -> io::Result<File> {
+    crate::platform::windows::user_data::create_current_user_file(path)
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod lock_diagnostics;
 // Store mutation authority ends with this scope, not with the last incidental
@@ -176,7 +187,10 @@ fn lock_error(role: LockRole, observation: LockObservation, cause: TryLockError)
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     let holder_snapshot = if matches!(
         role,
-        LockRole::StoreMutationExclusive | LockRole::RepairExclusive | LockRole::RetainExclusive
+        LockRole::StoreMutationExclusive
+            | LockRole::RepairExclusive
+            | LockRole::StartShared
+            | LockRole::RetainExclusive
     ) && matches!(&cause, TryLockError::WouldBlock)
     {
         Some(lock_diagnostics::snapshot(&observation))
@@ -322,11 +336,22 @@ impl StoreOwner {
         private_mode(path, mode)
     }
     fn private_dir(&self, path: &Path) -> io::Result<()> {
-        if self.data.is_some() {
-            fs::create_dir(path)?;
-            self.check(path)
+        if let Some(data) = &self.data {
+            data.create_directory(path)
         } else {
             private_dir(path)
+        }
+    }
+    fn create_file(
+        &self,
+        path: &Path,
+        options: &OpenOptions,
+        write_through: bool,
+    ) -> io::Result<File> {
+        if let Some(data) = &self.data {
+            data.create_file(path, write_through)
+        } else {
+            options.open(path)
         }
     }
     fn seal_dir(&self, path: &Path) -> io::Result<()> {
@@ -339,6 +364,14 @@ impl StoreOwner {
 }
 #[cfg(not(windows))]
 impl OwnerPolicy {
+    fn create_file(
+        self,
+        path: &Path,
+        options: &OpenOptions,
+        _write_through: bool,
+    ) -> io::Result<File> {
+        options.open(path)
+    }
     fn stamp(self, path: &Path) -> io::Result<String> {
         object_stamp(path)
     }
@@ -433,7 +466,7 @@ impl VerifiedCore {
     pub(crate) fn diagnostic_cache(&self) -> io::Result<Self> {
         self.copy_with_lease(None)
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     pub fn execution_lease(&self) -> io::Result<&File> {
         self._lease
             .as_ref()
@@ -539,6 +572,47 @@ impl VerifiedCore {
 pub enum InstallOutcome {
     Installed,
     AlreadyPresent,
+}
+
+// Failure-only context for the preserving migration path. The outer kind and
+// Display are unchanged; private paths/messages are available only via source().
+struct MigrationPreservationFailure {
+    version_present: bool,
+    receipt_present: bool,
+    verification: Option<io::Error>,
+}
+impl std::fmt::Display for MigrationPreservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("migration cannot replace an existing unverified payload or receipt")
+    }
+}
+impl std::fmt::Debug for MigrationPreservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let phase = if self.verification.is_some() {
+            "existing-pair-verification"
+        } else {
+            "partial-existing-pair"
+        };
+        let cause = self.verification.as_ref();
+        let lock = cause
+            .and_then(|e| e.get_ref())
+            .and_then(|e| e.downcast_ref::<LockFailure>());
+        f.debug_struct("MigrationPreservationFailure")
+            .field("phase", &phase)
+            .field("version_present", &self.version_present)
+            .field("receipt_present", &self.receipt_present)
+            .field("kind", &cause.map(io::Error::kind))
+            .field("os_code", &cause.and_then(io::Error::raw_os_error))
+            .field("lock", &lock)
+            .finish()
+    }
+}
+impl std::error::Error for MigrationPreservationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.verification
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -803,6 +877,21 @@ impl CoreStore {
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             );
         }
+        #[cfg(windows)]
+        let file = if let Some(data) = &self.owner.data {
+            match data.create_file(&path, false) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // Existing locks are observed as-is, never re-owned. Do
+                    // not let the fallback recreate a concurrently lost name.
+                    options.create(false).open(&path)?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            options.open(&path)?
+        };
+        #[cfg(not(windows))]
         let file = options.open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(invalid("invalid store lock"));
@@ -810,6 +899,10 @@ impl CoreStore {
         #[cfg(windows)]
         self.owner.mode(&path, 0o600)?;
         self.owner.check(&path)?;
+        #[cfg(windows)]
+        if let Some(data) = &self.owner.data {
+            data.stamp_named_held(&file, &path, false)?;
+        }
         acquire_lock(&file, LockRole::StoreMutationExclusive)?;
         Ok(MutationLock::new(file))
     }
@@ -872,7 +965,15 @@ impl CoreStore {
         let _root = PayloadDir::open(root, owner.uid)?;
         for name in ["versions", "manifests", ".staging", ".trash", "leases"] {
             let child = root.join(name);
-            match fs::create_dir(&child) {
+            #[cfg(windows)]
+            let created = if owner.data.is_some() {
+                owner.private_dir(&child)
+            } else {
+                fs::create_dir(&child)
+            };
+            #[cfg(not(windows))]
+            let created = fs::create_dir(&child);
+            match created {
                 Ok(()) => {
                     owner.mode(&child, 0o755)?;
                 }
@@ -1227,40 +1328,53 @@ impl CoreStore {
         }
         let version_present = object_present(&destination)?;
         let receipt_present = object_present(&receipt)?;
+        let mut verification_failure = None;
         if version_present && receipt_present {
-            if let Ok(verified) = self.verify_objects(&id, true) {
-                if !preserve_existing {
-                    let mut options = OpenOptions::new();
-                    options.write(true);
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        options.custom_flags(nix::libc::O_NOFOLLOW);
+            match self.verify_objects(&id, true) {
+                Ok(verified) => {
+                    if !preserve_existing {
+                        let mut options = OpenOptions::new();
+                        options.write(true);
+                        #[cfg(any(target_os = "linux", target_os = "macos"))]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            options.custom_flags(nix::libc::O_NOFOLLOW);
+                        }
+                        let file = options.open(&receipt)?;
+                        self.owner.check(&receipt)?;
+                        file.set_modified(std::time::SystemTime::now())?;
                     }
-                    let file = options.open(&receipt)?;
-                    self.owner.check(&receipt)?;
-                    file.set_modified(std::time::SystemTime::now())?;
+                    // Refresh observations after the normal last-use timestamp
+                    // mutation, retaining the same already held occupancy lease.
+                    let verified = self.verify_objects_under_lease(
+                        &id,
+                        true,
+                        verified
+                            ._lease
+                            .as_ref()
+                            .ok_or_else(|| invalid("publication lease absent"))?
+                            .try_clone()?,
+                    )?;
+                    // Also closes an earlier complete publication whose parent
+                    // barrier failed. A read-only reopen alone is not durability.
+                    self.finish_install_publication(&id, &mutation, &verified)?;
+                    return Ok(InstallOutcome::AlreadyPresent);
                 }
-                // Refresh observations after the normal last-use timestamp
-                // mutation, retaining the same already held occupancy lease.
-                let verified = self.verify_objects_under_lease(
-                    &id,
-                    true,
-                    verified
-                        ._lease
-                        .as_ref()
-                        .ok_or_else(|| invalid("publication lease absent"))?
-                        .try_clone()?,
-                )?;
-                // Also closes an earlier complete publication whose parent
-                // barrier failed. A read-only reopen alone is not durability.
-                self.finish_install_publication(&id, &mutation, &verified)?;
-                return Ok(InstallOutcome::AlreadyPresent);
+                Err(error) => {
+                    if preserve_existing {
+                        verification_failure = Some(error);
+                    }
+                }
             }
         }
         if preserve_existing && (version_present || receipt_present) {
-            return Err(invalid(
-                "migration cannot replace an existing unverified payload or receipt",
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                MigrationPreservationFailure {
+                    version_present,
+                    receipt_present,
+                    verification: verification_failure,
+                },
             ));
         }
         let lease_path = self
@@ -1325,7 +1439,7 @@ impl CoreStore {
                     use std::os::unix::fs::OpenOptionsExt;
                     options.mode(0o600);
                 }
-                let mut output = options.open(&path)?;
+                let mut output = self.owner.create_file(&path, &options, false)?;
                 let mut hash = sha2::Sha256::new();
                 use sha2::Digest;
                 let mut total = 0u64;
@@ -1398,7 +1512,7 @@ impl CoreStore {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let lease = options.open(&lease_path)?;
+            let lease = self.owner.create_file(&lease_path, &options, false)?;
             self.owner.mode(&lease_path, 0o600)?;
             acquire_lock(&lease, LockRole::OrphanExclusive)?;
             #[cfg(windows)]
@@ -1434,7 +1548,7 @@ impl CoreStore {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o644);
             }
-            let mut file = options.open(&temporary)?;
+            let mut file = self.owner.create_file(&temporary, &options, false)?;
             file.write_all(&raw)?;
             file.sync_all()?;
             self.owner.mode(&temporary, 0o644)?;

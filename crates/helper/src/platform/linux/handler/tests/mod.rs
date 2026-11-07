@@ -1493,15 +1493,15 @@ fn resolved_dns_failure_keeps_structured_error_detail() {
 #[test]
 fn wire_forms_match_go_source() {
     // v3 requires the pinned execution discriminator; build remains diagnostic.
-    assert_eq!(PROTO_VERSION, 3);
+    assert_eq!(PROTO_VERSION, 4);
     assert_eq!(
         Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(0))).to_wire_line(),
         format!(
-            "OK pong uid=0 v3 build={}",
+            "OK pong uid=0 v4 build={}",
             polaris_helper_proto::build_identity::current()
         )
     );
-    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 3");
+    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 4");
     assert_eq!("OK stopped", "OK stopped");
     assert_eq!("OK running 12345", "OK running 12345");
     assert_eq!("OK notrunning", "OK notrunning");
@@ -2262,4 +2262,509 @@ fn v3_dispatch_refuses_legacy_wrong_or_duplicate_marker_before_native_factory() 
         assert!(fp.killed.lock().unwrap().is_empty());
         assert!(systemd.calls.lock().unwrap().is_empty());
     }
+}
+
+#[test]
+fn explicit_runtime_root_requires_peer_ownership_and_exact_config_confinement() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let temp = tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = root.join("profiles/current.json");
+    std::fs::create_dir(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, b"{}").unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let text = root.to_str().unwrap();
+    assert_eq!(
+        validate_runtime_directory(text, &config, uid).unwrap(),
+        root
+    );
+    assert!(validate_runtime_directory(text, &config, uid.wrapping_add(1)).is_err());
+    assert!(validate_runtime_directory("relative", &config, uid).is_err());
+    assert!(validate_runtime_directory(config.to_str().unwrap(), &config, uid).is_err());
+    let outside = tempdir().unwrap();
+    let outside_config = outside.path().join("config.json");
+    std::fs::write(&outside_config, b"{}").unwrap();
+    assert!(validate_runtime_directory(text, &outside_config, uid).is_err());
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(validate_runtime_directory(text, &config, uid).is_err());
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = outside.path().join("state-alias");
+    symlink(&root, &alias).unwrap();
+    assert!(validate_runtime_directory(alias.to_str().unwrap(), &config, uid).is_err());
+    let config_alias = root.join("config-alias.json");
+    symlink(&config, &config_alias).unwrap();
+    assert!(validate_runtime_directory(text, &config_alias, uid).is_err());
+}
+
+#[test]
+fn explicit_runtime_root_flows_through_original_pinned_start_and_legacy_stays_none() {
+    for explicit in [false, true] {
+        let (dir, auth, core_dir) = setup_env();
+        let root = dir.path().canonicalize().unwrap();
+        let cfg = root.join("runtime.json");
+        std::fs::write(&cfg, b"{}").unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let peer = StaticPeerCred::new(uid, uid);
+        let spawner = MockSpawner::succeeding(7777);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let deps = make_deps(
+            Some(&core_dir),
+            &auth,
+            &peer,
+            &spawner,
+            &fp,
+            &systemd,
+            &ss,
+            &fwd,
+        );
+        let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+        let cfg = cfg.to_str().unwrap();
+        let extension = format!("runtime-root-v1={}", root.display());
+        let mut fields = vec![EXEC_V3, &id, cfg, "", "0", ""];
+        if explicit {
+            fields.push(&extension);
+        }
+        let mut conn = MockConn::new(fields);
+        let mut state = HandlerState::new();
+        handle_start(&mut state, &deps, &PeerCred { uid, gid: uid }, &mut conn);
+        assert!(matches!(
+            selected_start(&conn.writes()[0], &id),
+            LinuxBirthStart::Started { .. }
+        ));
+        assert_eq!(
+            spawner.spawn_calls.lock().unwrap()[0].runtime_directory,
+            explicit.then_some(root)
+        );
+    }
+}
+
+#[test]
+fn explicit_runtime_root_denial_never_reaches_the_original_spawner() {
+    let (dir, auth, core_dir) = setup_env();
+    let cfg = dir.path().join("runtime.json");
+    std::fs::write(&cfg, b"{}").unwrap();
+    let outside = tempdir().unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let peer = StaticPeerCred::new(uid, uid);
+    let spawner = MockSpawner::succeeding(7777);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd = no_op_fwd();
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    for root in [
+        outside.path().to_str().unwrap(),
+        cfg.to_str().unwrap(),
+        "relative",
+    ] {
+        let extension = format!("runtime-root-v1={root}");
+        let mut conn = MockConn::new(vec![
+            EXEC_V3,
+            &id,
+            cfg.to_str().unwrap(),
+            "",
+            "0",
+            "",
+            &extension,
+        ]);
+        handle_start(
+            &mut HandlerState::new(),
+            &deps,
+            &PeerCred { uid, gid: uid },
+            &mut conn,
+        );
+        assert_eq!(conn.writes(), ["ERR runtime-directory-denied"]);
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    }
+}
+
+#[derive(Default)]
+struct CheckedDnsCase {
+    reap: bool,
+    partial: bool,
+    fail_cleanup: bool,
+    gone: bool,
+}
+
+struct CheckedHandlerDns<'a> {
+    state: &'a Mutex<HandlerState>,
+    physical: StdMutex<(
+        polaris_helper_proto::linux_dns::LinkIdentity,
+        polaris_helper_proto::linux_dns::Settings,
+    )>,
+    original: StdMutex<Option<polaris_helper_proto::linux_dns::Settings>>,
+    writes: StdMutex<Vec<bool>>,
+    case: CheckedDnsCase,
+}
+
+impl ResolvedDnsOps for CheckedHandlerDns<'_> {
+    fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+        panic!("checked command cannot call legacy SET")
+    }
+    fn revert(&self, interface: &str) -> Result<(), String> {
+        assert_eq!(
+            interface,
+            polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME
+        );
+        self.writes.lock().unwrap().push(false);
+        if self.case.fail_cleanup {
+            return Err("cleanup unavailable".into());
+        }
+        if let Some(original) = self.original.lock().unwrap().take() {
+            self.physical.lock().unwrap().1 = original;
+        }
+        Ok(())
+    }
+    fn snapshot(
+        &self,
+    ) -> Result<
+        (
+            polaris_helper_proto::linux_dns::LinkIdentity,
+            polaris_helper_proto::linux_dns::Settings,
+        ),
+        String,
+    > {
+        Ok(self.physical.lock().unwrap().clone())
+    }
+    fn original_settings(&self) -> Option<polaris_helper_proto::linux_dns::Settings> {
+        self.original.lock().unwrap().clone()
+    }
+    fn link_gone(&self, _: &polaris_helper_proto::linux_dns::LinkIdentity) -> Result<bool, String> {
+        Ok(self.case.gone)
+    }
+    fn compare(
+        &self,
+        expected: &(
+            polaris_helper_proto::linux_dns::LinkIdentity,
+            polaris_helper_proto::linux_dns::Settings,
+        ),
+        enabled: bool,
+    ) -> Result<
+        (
+            polaris_helper_proto::linux_dns::LinkIdentity,
+            polaris_helper_proto::linux_dns::Settings,
+        ),
+        String,
+    > {
+        assert!(self.state.lock().unwrap().dns_busy);
+        let mut physical = self.physical.lock().unwrap();
+        if &*physical != expected {
+            return Err("scope changed".into());
+        }
+        self.writes.lock().unwrap().push(enabled);
+        if enabled {
+            *self.original.lock().unwrap() = Some(physical.1.clone());
+            physical.1.servers = vec![polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP.into()];
+            physical.1.domains = vec!["~.".into()];
+            physical.1.default_route = true;
+            physical.1.dnssec = "no".into();
+            physical.1.dns_over_tls = "no".into();
+        } else {
+            physical.1 = self
+                .original
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or("original unavailable")?;
+        }
+        if self.case.reap {
+            let mut state = self.state.lock().unwrap();
+            let birth = state.child.as_ref().unwrap().handle().clone();
+            state.retire_birth(&birth);
+        }
+        if self.case.partial {
+            return Err("native write/read-back unknown".into());
+        }
+        Ok(physical.clone())
+    }
+}
+
+type CheckedHandlerDeps<'a> =
+    HandlerDeps<'a, StaticPeerCred, MockSpawner, MockFreePort, MockSystemd>;
+fn checked_dns_case(
+    case: CheckedDnsCase,
+    f: impl FnOnce(&Mutex<HandlerState>, &CheckedHandlerDeps<'_>, &CheckedHandlerDns<'_>),
+) {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd = no_op_fwd();
+    let mut initial = HandlerState::new();
+    initial.child = Some(ManagedChild::Running(CoreHandle::exact(
+        std::num::NonZeroU32::new(77).unwrap(),
+        HelperBirthToken::from_bytes([1; 16]),
+    )));
+    let state = Mutex::new(initial);
+    let dns = CheckedHandlerDns {
+        state: &state,
+        physical: StdMutex::new((
+            polaris_helper_proto::linux_dns::LinkIdentity {
+                ifindex: 8,
+                sysfs_device: 1,
+                sysfs_inode: 80,
+                netns_inode: 9,
+                tun_flags: 1,
+            },
+            polaris_helper_proto::linux_dns::Settings {
+                servers: vec![],
+                domains: vec![],
+                default_route: false,
+                dnssec: "no".into(),
+                dns_over_tls: "no".into(),
+            },
+        )),
+        original: StdMutex::new(None),
+        writes: StdMutex::new(vec![]),
+        case,
+    };
+    let deps =
+        make_deps_with_resolved(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &dns);
+    f(&state, &deps, &dns);
+}
+
+fn checked_wire_snapshot(
+    state: &Mutex<HandlerState>,
+    deps: &CheckedHandlerDeps<'_>,
+) -> polaris_helper_proto::linux_dns::Snapshot {
+    let mut conn = MockConn::new(vec![lcmd::RESOLVED_DNS_SNAPSHOT]);
+    handle(state, deps, &mut conn);
+    match Response::parse(&conn.writes()[0]) {
+        Response::Ok(ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot))) => *snapshot,
+        other => panic!("expected exact read-only snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn checked_dns_snapshot_and_compare_use_authenticated_exact_birth_without_legacy_io() {
+    checked_dns_case(CheckedDnsCase::default(), |state, deps, dns| {
+        let snapshot = checked_wire_snapshot(state, deps);
+        assert!(!snapshot.owned);
+        assert!(snapshot.original.is_none());
+        assert!(dns.writes.lock().unwrap().is_empty());
+        assert!(!state.lock().unwrap().dns_busy);
+        let payload = serde_json::to_string(&polaris_helper_proto::linux_dns::CompareRequest {
+            expected: snapshot.clone(),
+            enabled: true,
+        })
+        .unwrap();
+        let mut conn = MockConn::new(vec![lcmd::RESOLVED_DNS_COMPARE, &payload]);
+        handle(state, deps, &mut conn);
+        let Response::Ok(ResponseKind::LinuxDns(LinuxDns::Changed(changed))) =
+            Response::parse(&conn.writes()[0])
+        else {
+            panic!("checked SET must return a typed native receipt");
+        };
+        assert_eq!(changed.target(), snapshot.target());
+        assert_eq!(changed.link, snapshot.link);
+        assert!(changed.settings.controlled() && changed.owned && !changed.cleanup_pending);
+        assert_eq!(changed.original, Some(snapshot.settings));
+        assert_eq!(*dns.writes.lock().unwrap(), [true]);
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.dns_owner, Some(0));
+        assert!(!guard.dns_cleanup_pending && !guard.dns_busy);
+    });
+}
+
+#[test]
+fn checked_dns_extra_frames_wrong_birth_and_changed_values_prove_no_write() {
+    for mutation in ["extra", "birth", "link", "values", "admission"] {
+        checked_dns_case(CheckedDnsCase::default(), |state, deps, dns| {
+            let mut snapshot = checked_wire_snapshot(state, deps);
+            match mutation {
+                "birth" => snapshot.birth = "02".repeat(16),
+                "link" => snapshot.link.sysfs_inode += 1,
+                "values" => snapshot.settings.servers = vec!["9.9.9.9".into()],
+                "admission" => {
+                    *deps.spawner.birth_admission.lock().unwrap() = Some(BirthAdmission::Blocked {
+                        target: snapshot.target(),
+                        state: ReapBlockerState::Unknown,
+                    })
+                }
+                _ => {}
+            }
+            let payload = serde_json::to_string(&polaris_helper_proto::linux_dns::CompareRequest {
+                expected: snapshot,
+                enabled: true,
+            })
+            .unwrap();
+            let mut lines = vec![lcmd::RESOLVED_DNS_COMPARE, payload.as_str()];
+            if mutation == "extra" {
+                lines.push("extra");
+            }
+            let mut conn = MockConn::new(lines);
+            handle(state, deps, &mut conn);
+            if mutation == "extra" {
+                assert_eq!(conn.writes(), ["ERR bad-args"]);
+            } else {
+                assert_eq!(
+                    Response::parse(&conn.writes()[0]),
+                    Response::Ok(ResponseKind::LinuxDns(LinuxDns::NoChange))
+                );
+            }
+            assert!(dns.writes.lock().unwrap().is_empty());
+            assert!(!state.lock().unwrap().dns_busy);
+            assert!(state.lock().unwrap().dns_owner.is_none());
+            assert!(deps.spawner.spawn_calls.lock().unwrap().is_empty());
+        });
+    }
+}
+
+#[test]
+fn checked_dns_partial_failure_retains_original_native_cleanup_reservation() {
+    checked_dns_case(
+        CheckedDnsCase {
+            partial: true,
+            fail_cleanup: true,
+            ..Default::default()
+        },
+        |state, deps, dns| {
+            let snapshot = checked_wire_snapshot(state, deps);
+            let payload = serde_json::to_string(&polaris_helper_proto::linux_dns::CompareRequest {
+                expected: snapshot.clone(),
+                enabled: true,
+            })
+            .unwrap();
+            let mut conn = MockConn::new(vec![lcmd::RESOLVED_DNS_COMPARE, &payload]);
+            handle(state, deps, &mut conn);
+            assert_eq!(conn.writes(), ["ERR dns-change-unconfirmed"]);
+            assert_eq!(*dns.writes.lock().unwrap(), [true]);
+            let guard = state.lock().unwrap();
+            assert!(guard.dns_cleanup_pending && !guard.dns_busy);
+            assert_eq!(guard.dns_owner, Some(0));
+            assert_eq!(
+                guard.dns_birth.as_ref().unwrap().target(),
+                snapshot.target()
+            );
+        },
+    );
+}
+
+#[test]
+fn checked_dns_reap_during_native_write_never_returns_applied_and_cleanup_is_real() {
+    for fail_cleanup in [false, true] {
+        checked_dns_case(
+            CheckedDnsCase {
+                reap: true,
+                fail_cleanup,
+                ..Default::default()
+            },
+            |state, deps, dns| {
+                let snapshot = checked_wire_snapshot(state, deps);
+                let payload =
+                    serde_json::to_string(&polaris_helper_proto::linux_dns::CompareRequest {
+                        expected: snapshot,
+                        enabled: true,
+                    })
+                    .unwrap();
+                let mut conn = MockConn::new(vec![lcmd::RESOLVED_DNS_COMPARE, &payload]);
+                handle(state, deps, &mut conn);
+                assert_eq!(
+                    conn.writes(),
+                    [if fail_cleanup {
+                        "ERR dns-owner-superseded-cleanup-pending"
+                    } else {
+                        "ERR dns-owner-superseded-cleanup-confirmed"
+                    }]
+                );
+                assert_eq!(*dns.writes.lock().unwrap(), [true, false]);
+                let guard = state.lock().unwrap();
+                assert!(guard.child.is_none() && !guard.dns_busy);
+                assert_eq!(guard.dns_cleanup_pending, fail_cleanup);
+                assert_eq!(guard.dns_owner.is_some(), fail_cleanup);
+                if !fail_cleanup {
+                    assert!(dns.physical.lock().unwrap().1.unconfigured());
+                }
+            },
+        );
+    }
+}
+
+#[test]
+fn checked_dns_gone_proof_is_read_only_and_never_claims_reap_or_clears_another_owner() {
+    checked_dns_case(
+        CheckedDnsCase {
+            gone: true,
+            ..Default::default()
+        },
+        |state, deps, dns| {
+            let snapshot = checked_wire_snapshot(state, deps);
+            {
+                let mut guard = state.lock().unwrap();
+                guard.child = None;
+                guard.dns_owner = Some(9001);
+            }
+            let payload = serde_json::to_string(&polaris_helper_proto::linux_dns::CompareRequest {
+                expected: snapshot.clone(),
+                enabled: false,
+            })
+            .unwrap();
+            let mut conn = MockConn::new(vec![lcmd::RESOLVED_DNS_COMPARE, &payload]);
+            handle(state, deps, &mut conn);
+            let Response::Ok(ResponseKind::LinuxDns(LinuxDns::Gone(proof))) =
+                Response::parse(&conn.writes()[0])
+            else {
+                panic!("expected only original resource absence");
+            };
+            assert!(proof.matches(&snapshot));
+            assert_eq!(state.lock().unwrap().dns_owner, Some(9001));
+            assert!(dns.writes.lock().unwrap().is_empty());
+            assert!(deps.spawner.birth_stop_calls.lock().unwrap().is_empty());
+        },
+    );
+}
+
+#[test]
+fn checked_dns_foreign_uid_cannot_borrow_the_retained_birth_or_original_settings() {
+    checked_dns_case(CheckedDnsCase::default(), |state, deps, dns| {
+        let mut expected = checked_wire_snapshot(state, deps);
+        expected.owned = true;
+        expected.original = Some(expected.settings.clone());
+        *dns.original.lock().unwrap() = expected.original.clone();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.dns_owner = Some(1000);
+            guard.dns_birth = guard.child.as_ref().map(|child| child.handle().clone());
+        }
+        let payload = serde_json::to_string(&polaris_helper_proto::linux_dns::CompareRequest {
+            expected,
+            enabled: true,
+        })
+        .unwrap();
+        let mut conn = MockConn::new(vec![&payload]);
+        // Auth-file policy is covered independently; this direct call isolates
+        // ownership after authorization, without requiring a root-owned fixture.
+        handle_checked_dns(
+            state,
+            deps,
+            &PeerCred {
+                uid: 1001,
+                gid: 1001,
+            },
+            lcmd::RESOLVED_DNS_COMPARE,
+            &mut conn,
+        );
+        assert_eq!(
+            Response::parse(&conn.writes()[0]),
+            Response::Ok(ResponseKind::LinuxDns(LinuxDns::NoChange))
+        );
+        assert!(dns.writes.lock().unwrap().is_empty());
+        assert_eq!(state.lock().unwrap().dns_owner, Some(1000));
+    });
 }

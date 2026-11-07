@@ -553,6 +553,9 @@ mod unix {
         .is_err());
         assert!(custody.assert_admission().is_err());
         assert!(custody.retire(&request).is_err());
+        // The carrier must preserve this real registry fence failure and still
+        // attempt both original owners' shutdown; poison cannot become cleanup.
+        assert!(custody.begin_shutdown().is_err());
         assert!(custody.shutdown().await.is_err());
         let state = custody.state.lock().err().unwrap().into_inner();
         assert!(state.runs[&request.id].child.is_some());
@@ -1282,6 +1285,11 @@ mod bounded_capture {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn admitted_validation_caller_budgets_keep_success_and_native_timeout_distinct() {
+        if crate::tests::isolated_lease_case(
+            "config_gate::check_custody::tests::bounded_capture::admitted_validation_caller_budgets_keep_success_and_native_timeout_distinct",
+        ) {
+            return;
+        }
         // App callers independently map RawCheck. Their old shell inputs must
         // not be promoted into PreparedExecution to exercise this lifecycle.
         // Use the existing crate-private admitted cohort and the same custody.

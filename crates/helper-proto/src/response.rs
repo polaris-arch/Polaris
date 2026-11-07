@@ -236,10 +236,14 @@ pub enum FlushDns {
 }
 
 /// Linux systemd-resolved 接管响应（proto v1 兼容扩展）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinuxDns {
     /// `OK resolved-dns-set`：写入并读回自证成功。
     Set,
+    Snapshot(Box<crate::linux_dns::Snapshot>),
+    Changed(Box<crate::linux_dns::Snapshot>),
+    Gone(crate::linux_dns::Gone),
+    NoChange,
     /// `OK resolved-dns-reverted`：链路配置已撤销，或接口已不存在（等价于无残留）。
     Reverted,
 }
@@ -251,6 +255,7 @@ pub enum LinuxDns {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseKind {
     MacCheck(crate::check_config::CheckReply),
+    WindowsCheck(crate::check_config::CheckReply),
     HelperUpgradeAdmitted,
     HelperUpgradeCancelled,
     CoreStatus(crate::core_protocol::CoreStatus),
@@ -327,10 +332,32 @@ impl Response {
     /// - 其它 → [`Response::Ok`](ResponseKind::OkRaw)，token 为原文（永不丢消息，便于诊断畸形/未来协议响应）。
     #[must_use]
     pub fn parse(line: &str) -> Self {
+        if let Some(rest) = line.strip_prefix("OK system-check-config ") {
+            if let Some(reply) =
+                crate::check_config::CheckReply::parse(&format!("OK check-config {rest}"))
+            {
+                return Self::Ok(ResponseKind::WindowsCheck(reply));
+            }
+        }
         if let Some(reply) = crate::check_config::CheckReply::parse(line) {
             return Self::Ok(ResponseKind::MacCheck(reply));
         }
-        if let Some((birth_line, id)) = line.rsplit_once(" core=") {
+        // Only start receipts wrap a separate selected CoreId. Native status
+        // owns its optional core field and must reach its canonical parser.
+        let pinned_start = matches!(
+            line.strip_prefix("OK ")
+                .and_then(|rest| rest.split_once(' '))
+                .map(|(token, _)| token),
+            Some(
+                "birth-started"
+                    | "birth-already"
+                    | "birth-start-not-admitted"
+                    | "native-birth-started"
+                    | "native-birth-already"
+                    | "native-birth-start-not-admitted"
+            )
+        );
+        if let Some((birth_line, id)) = line.rsplit_once(" core=").filter(|_| pinned_start) {
             if let Ok(id) = crate::core_manifest::CoreId::parse(id) {
                 if birth_line.contains(" core=") {
                     return Self::Ok(ResponseKind::OkRaw {
@@ -421,6 +448,11 @@ impl Response {
 fn ok_kind_to_wire(kind: &ResponseKind) -> String {
     match kind {
         ResponseKind::MacCheck(reply) => reply.to_wire(),
+        ResponseKind::WindowsCheck(reply) => {
+            reply
+                .to_wire()
+                .replacen("OK check-config ", "OK system-check-config ", 1)
+        }
         ResponseKind::HelperUpgradeAdmitted => "OK helper-upgrade-admitted".into(),
         ResponseKind::HelperUpgradeCancelled => "OK helper-upgrade-cancelled".into(),
         ResponseKind::CoreStatus(status) => status.to_wire(),
@@ -551,6 +583,19 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
         ResponseKind::Installed => "OK installed".to_owned(),
         ResponseKind::DefaultRestored => "OK default-restore".to_owned(),
         ResponseKind::FlushDns(f) => flush_dns_to_wire(f),
+        ResponseKind::LinuxDns(LinuxDns::NoChange) => "OK resolved-dns-not-changed-v1".into(),
+        ResponseKind::LinuxDns(LinuxDns::Gone(proof)) => format!(
+            "OK resolved-dns-gone-v1 {}",
+            serde_json::to_string(proof).expect("DNS gone proof contains JSON primitives")
+        ),
+        ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot)) => format!(
+            "OK resolved-dns-snapshot-v1 {}",
+            serde_json::to_string(snapshot).expect("DNS snapshot contains JSON primitives")
+        ),
+        ResponseKind::LinuxDns(LinuxDns::Changed(snapshot)) => format!(
+            "OK resolved-dns-changed-v1 {}",
+            serde_json::to_string(snapshot).expect("DNS snapshot contains JSON primitives")
+        ),
         ResponseKind::LinuxDns(LinuxDns::Set) => "OK resolved-dns-set".to_owned(),
         ResponseKind::LinuxDns(LinuxDns::Reverted) => "OK resolved-dns-reverted".to_owned(),
         ResponseKind::MacProxyTransaction => "OK system-proxy".to_owned(),
@@ -746,6 +791,40 @@ fn parse_ok(rest: &str) -> ResponseKind {
         "flushed-partial" => ResponseKind::FlushDns(FlushDns::FlushedPartial {
             tail: tail.to_owned(),
         }),
+        "resolved-dns-not-changed-v1" if tail.is_empty() => {
+            ResponseKind::LinuxDns(LinuxDns::NoChange)
+        }
+        "resolved-dns-gone-v1" => match serde_json::from_str::<crate::linux_dns::Gone>(tail) {
+            Ok(proof)
+                if crate::HelperBirthTarget::parse_wire(&proof.pid.to_string(), &proof.birth)
+                    .is_some()
+                    && proof.link.ifindex > 0
+                    && proof.link.sysfs_inode > 0
+                    && proof.link.netns_inode > 0
+                    && proof.link.tun_flags & 1 != 0 =>
+            {
+                ResponseKind::LinuxDns(LinuxDns::Gone(proof))
+            }
+            _ => ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: tail.to_owned(),
+            },
+        },
+        "resolved-dns-snapshot-v1" | "resolved-dns-changed-v1" => {
+            match serde_json::from_str::<crate::linux_dns::Snapshot>(tail) {
+                Ok(snapshot) if snapshot.valid() => {
+                    ResponseKind::LinuxDns(if token == "resolved-dns-snapshot-v1" {
+                        LinuxDns::Snapshot(Box::new(snapshot))
+                    } else {
+                        LinuxDns::Changed(Box::new(snapshot))
+                    })
+                }
+                _ => ResponseKind::OkRaw {
+                    token: token.to_owned(),
+                    rest: tail.to_owned(),
+                },
+            }
+        }
         "resolved-dns-set" => ResponseKind::LinuxDns(LinuxDns::Set),
         "resolved-dns-reverted" => ResponseKind::LinuxDns(LinuxDns::Reverted),
         "system-proxy" => ResponseKind::MacProxyTransaction,

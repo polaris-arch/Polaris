@@ -77,6 +77,7 @@ type TagKind = 'geosite' | 'geoip';
 export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElement {
   const { t } = useTranslation();
   const tr = (key: string, vars?: Record<string, unknown>): string => t(key, vars ?? {}) as string;
+  const isIOS = typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios';
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -153,6 +154,7 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
    * 而 Android 上系统包在数量上占大头。`system` 这一列在本表里的全部用途就是这个次序。
    */
   useEffect(() => {
+    if (isIOS) return;
     let alive = true;
     void (async () => {
       try {
@@ -177,7 +179,7 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
     return () => {
       alive = false;
     };
-  }, []);
+  }, [isIOS]);
 
   const filteredApps = useMemo(() => {
     const list = apps ?? [];
@@ -327,7 +329,7 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
         为什么这句话必须在这张表的**最前面**：两条匹配腿覆盖的策略档不一样（geosite/geoip 四档
         都认，包名只有「直连」那一档），先说清楚，才谈得上填得对。
       */}
-      <div className="m-form-hint"><MobileInfo title={tr('mobileRules.matchSummary')} summary={tr('mobileHelp.customAppMatch')} details={tr('mobileRules.customAppMatch')} /></div>
+      <div className="m-form-hint"><MobileInfo title={tr(isIOS ? 'mobileRules.matchDetailsLabel' : 'mobileRules.matchSummary')} summary={tr(isIOS ? 'mobileRules.matchTrafficOnlyShort' : 'mobileHelp.customAppMatch')} details={tr(isIOS ? 'mobileRules.customAppMatchIos' : 'mobileRules.customAppMatch')} /></div>
 
       <div className="m-form-row">
         <label className="m-form-label" htmlFor="maa-name">
@@ -486,7 +488,9 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
           {tr('mobileRules.customAppPackages')}
           <span className="m-form-opt">{tr('common.optional')}</span>
         </span>
-        {apps === null ? (
+        {isIOS ? (
+          <p className="m-form-hint">{tr('mobileRules.customAppPackagesUnsupported')}</p>
+        ) : apps === null ? (
           <p className="m-form-hint">{tr('common.loading')}</p>
         ) : appsFailed ? (
           /* 读不到 ≠ 一个都没有：后端对这条腿的失败是显式的（不返空表），照实说。 */

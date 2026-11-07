@@ -694,15 +694,15 @@ fn should_start_via_helper_truth_table() {
         !should_start_via_helper(Tun, Platform::Android),
         "Android 无 helper：起核走进程内 libbox，绝不建 helper client"
     );
-    // 非 TUN（systemProxy/manual 不接管 TUN）→ 恒直起，绝不弹提权。
+    // macOS/Windows execution issuer stays Helper independently of no-TUN mode.
     for p in Platform::ALL.iter().copied() {
         assert!(
-            !should_start_via_helper(SystemProxy, p),
-            "systemProxy@{p:?} 不应经 helper"
+            should_start_via_helper(SystemProxy, p) == matches!(p, Platform::Mac | Platform::Win),
+            "systemProxy@{p:?} execution issuer mismatch"
         );
         assert!(
-            !should_start_via_helper(Manual, p),
-            "manual@{p:?} 不应经 helper"
+            should_start_via_helper(Manual, p) == matches!(p, Platform::Mac | Platform::Win),
+            "manual@{p:?} execution issuer mismatch"
         );
     }
 }
@@ -739,7 +739,7 @@ fn system_interface_ownership_preserves_desktop_tun_helper_for_vpn_clients() {
                 ProxyModeType::SystemProxy,
                 ProxyModeType::Tun,
             ] {
-                let managed = should_start_via_helper(mode, platform);
+                let managed = managed_system_interfaces(mode, platform);
                 assert_eq!(
                     ensure_managed_system_interfaces(std::slice::from_ref(&endpoint), managed)
                         .is_ok(),
@@ -4876,4 +4876,47 @@ async fn untouched_startup_is_admitted_but_exit_retires_its_ticket() {
     assert!(rt
         .startup_start_completion(tun_config(), scheduled)
         .is_err());
+}
+
+#[test]
+fn execution_issuer_does_not_enable_network_takeover_for_manual() {
+    for platform in [Platform::Mac, Platform::Win] {
+        assert_eq!(
+            execution_route(ProxyModeType::Manual, platform),
+            ExecutionRoute::PrivilegedHelper
+        );
+        assert_eq!(
+            ProxyModeType::Manual.effective_on(platform),
+            ProxyModeType::Manual
+        );
+        assert!(!managed_system_interfaces(ProxyModeType::Manual, platform));
+        assert!(!managed_system_interfaces(
+            ProxyModeType::SystemProxy,
+            platform
+        ));
+    }
+    assert_eq!(
+        execution_route(ProxyModeType::Manual, Platform::Linux),
+        ExecutionRoute::DirectAdmitted
+    );
+}
+
+#[test]
+fn manual_helper_requirement_reports_install_error_before_any_installer_prompt() {
+    let source = crate::test_support::crate_code("runtime/proxy/startup.rs");
+    let gate = crate::test_support::method_body(&source, "pub(super) async fn run_helper_gate(");
+    let branch = gate
+        .find("if !mode.effective_on(self.helper.platform()).is_tun()")
+        .expect("manual/no-TUN boundary");
+    let error = gate[branch..]
+        .find("return Err(StartError::coded")
+        .expect("honest install/repair error")
+        + branch;
+    let prompt = gate
+        .find("prompt_helper_gate(&status)")
+        .expect("existing TUN prompt");
+    assert!(
+        branch < error && error < prompt,
+        "manual execution does not authorize installation/elevation"
+    );
 }

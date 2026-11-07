@@ -125,16 +125,27 @@ fn different_core_or_correlation_response_is_not_custody() {
     assert!(q.lock().unwrap().is_empty());
 }
 #[test]
-fn non_mac_does_not_send_a_check_frame() {
-    let q = Arc::new(Mutex::new(VecDeque::from([MockStream::with_response(
-        b"OK\n".to_vec(),
-    )])));
-    let c = HelperClient::new(Box::new(Queue(Arc::clone(&q))), Platform::Win, "token");
-    assert!(c
-        .send_macos_check(CheckRequest::Cancel { key: key() }, Duration::from_secs(1))
-        .unwrap_err()
-        .contains("Unsupported"));
-    assert_eq!(q.lock().unwrap().len(), 1);
+fn unsupported_platforms_do_not_send_a_check_frame() {
+    for platform in [
+        Platform::Linux,
+        Platform::Android,
+        Platform::Ios,
+        Platform::Other,
+    ] {
+        let q = Arc::new(Mutex::new(VecDeque::from([MockStream::with_response(
+            b"OK\n".to_vec(),
+        )])));
+        let c = HelperClient::new(Box::new(Queue(Arc::clone(&q))), platform, "token");
+        assert!(c
+            .send_macos_check(CheckRequest::Cancel { key: key() }, Duration::from_secs(1))
+            .unwrap_err()
+            .contains("Unsupported"));
+        assert_eq!(
+            q.lock().unwrap().len(),
+            1,
+            "unsupported platform must not connect: {platform:?}"
+        );
+    }
 }
 
 #[test]
@@ -347,4 +358,43 @@ fn caller_cancel_waits_for_terminal_before_explicit_output_abandon_and_release()
         q.lock().unwrap().is_empty(),
         "Release follows the pending and terminal statuses; Commit was never sent"
     );
+}
+
+#[test]
+fn platform_response_families_cannot_settle_each_other_even_with_identical_keys() {
+    let request = CheckRequest::Status { key: key() };
+    let reply = CheckReply::Released { key: key() };
+    for (platform, response, accepted) in [
+        (
+            Platform::Mac,
+            ResponseKind::WindowsCheck(reply.clone()),
+            false,
+        ),
+        (Platform::Win, ResponseKind::MacCheck(reply.clone()), false),
+        (
+            Platform::Win,
+            ResponseKind::WindowsCheck(reply.clone()),
+            true,
+        ),
+    ] {
+        let stream =
+            MockStream::with_response((Response::Ok(response).to_wire_line() + "\n").into_bytes());
+        let queue = Arc::new(Mutex::new(VecDeque::from([stream])));
+        let client = HelperClient::new(Box::new(Queue(queue)), platform, "token");
+        assert_eq!(
+            client
+                .send_macos_check(request.clone(), Duration::from_secs(1))
+                .is_ok(),
+            accepted
+        );
+    }
+}
+#[cfg(windows)]
+#[test]
+fn closed_system_windows_client_only_accepts_bounded_authentication_data() {
+    for token in ["", "line\nsecond", "line\rsecond"] {
+        assert!(SystemWindowsCheckClient::system(token.into()).is_err());
+    }
+    // Constructing the connector does not connect, issue authority or retire custody.
+    assert!(SystemWindowsCheckClient::system("bounded-auth-data".into()).is_ok());
 }

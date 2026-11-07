@@ -226,17 +226,22 @@ const REVIEWED_VENDOR_DIRECTORIES_V3 = Object.freeze({
   ...REVIEWED_VENDOR_DIRECTORIES,
   'github.com/sagernet/sing-vmess': 'sing-vmess',
 });
+const REVIEWED_VENDOR_DIRECTORIES_V4 = Object.freeze({
+  ...REVIEWED_VENDOR_DIRECTORIES_V3,
+  'github.com/libp2p/go-nat': 'go-nat',
+});
 export function reviewedSourcePolicy(context) {
   if (!Object.hasOwn(context ?? {}, 'sourcePolicy')) return undefined;
   const p = context.sourcePolicy;
   const v2 = p?.schema === 'polaris-reviewed-kernel-source-v2';
   const v3 = p?.schema === 'polaris-reviewed-kernel-source-v3';
-  const hasVendors = v2 || v3;
-  const directories = v3 ? REVIEWED_VENDOR_DIRECTORIES_V3 : REVIEWED_VENDOR_DIRECTORIES;
+  const v4 = p?.schema === 'polaris-reviewed-kernel-source-v4';
+  const hasVendors = v2 || v3 || v4;
+  const directories = v4 ? REVIEWED_VENDOR_DIRECTORIES_V4 : v3 ? REVIEWED_VENDOR_DIRECTORIES_V3 : REVIEWED_VENDOR_DIRECTORIES;
   const fields = ['schema', 'sourceCommit', 'sourceTree', 'goDirective', 'goVersion', 'toolchain',
     'goModSha256', 'goSumSha256', 'metacubex', ...(hasVendors ? ['vendors'] : [])];
   requireGraph(p && same(Object.keys(p).sort(), fields.sort())
-    && ['polaris-reviewed-kernel-source-v1', 'polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3'].includes(p.schema)
+    && ['polaris-reviewed-kernel-source-v1', 'polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3', 'polaris-reviewed-kernel-source-v4'].includes(p.schema)
     && isTree(p.sourceCommit) && p.sourceCommit === context.sourceCommit
     && isTree(p.sourceTree) && p.sourceTree === context.sourceTree
     && p.goDirective === '1.27.0' && p.goVersion === '1.27.2' && p.toolchain === 'go1.27.2'

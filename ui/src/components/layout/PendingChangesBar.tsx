@@ -35,7 +35,7 @@
  * 结果，不累积历史失败。
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -44,6 +44,8 @@ import { replay } from '@/lib/staged-config';
 import { api } from '@/ipc';
 import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
 import { RestartApplyDialog, type RestartPrompt } from '@/components/dialogs/RestartApplyDialog';
+import { ImpactApplyDialog } from '@/components/dialogs/ImpactApplyDialog';
+import { useImpactConfirmation } from '@/components/dialogs/use-impact-confirmation';
 import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
 import { useConfirmTwice } from '@/lib/confirm-twice';
@@ -52,6 +54,11 @@ import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
+  applyReceiptState,
+  mergeNativeRetirements,
+  nativeRetirementsAfterLifecycle,
+  preserveNativeRetirements,
+  dismissApplyState,
   runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   composeBarView,
@@ -71,10 +78,13 @@ const ACTION_LABEL: Record<BarActionId, string> = {
   dismissApply: 'home.pendingIgnoreBtn',
   retrySave: 'home.pendingRetrySaveBtn',
   retryPersistence: 'home.pendingRetryPersistenceBtn',
+  retryHost: 'home.pendingRetryHostBtn',
+  checkHost: 'home.pendingCheckHostBtn',
+  checkNative: 'home.pendingCheckNativeBtn',
 };
 
 /** `btn flow`（主）vs `btn ghost`（次）。断流的那颗永远是主按钮，与今天的单按钮形态一致。 */
-const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply', 'retryPersistence']);
+const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply', 'retryPersistence', 'retryHost']);
 
 /**
  * 「重置」的原地二次确认 key（原型 :4070 `reset-pending` → `confirmTwice(t,'放弃全部待应用改动？',…)`）。
@@ -90,6 +100,7 @@ export default function PendingChangesBar() {
   const pending = useAppStore((s) => s.pendingChanges);
   /** 「立即应用」保存后请求 HOT；仅确认重启时允许中断连接。核没在跑时没有应用对象，故那颗整颗不渲染（见 BarInput.coreRunning）。 */
   const coreRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
+  const coreGeneration = useAppStore((s) => s.proxyStatus?.mainGeneration);
   const servers = useAppStore((s) => s.servers);
   /** **裸磁盘 config**（不是 `effectiveConfig`）：下面 FR-9 那轮 `classifyStaged` 问的是
    *  「**只有这一条**时保存后是否还待应用」，重放基准必须是盘。喂 `effectiveConfig`
@@ -99,11 +110,21 @@ export default function PendingChangesBar() {
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
   const conflict = useStagedConfigStore((s) => s.conflict);
   /** B 维度里属于「这一次 apply」的那部分。`reason` 只在 `failed` 时有意义。 */
-  const [apply, setApply] = useState<ApplyState>({
+  const [apply, setApplyState] = useState<ApplyState>({
     phase: 'idle',
     reason: null,
   });
+  const latestApply = useRef(apply);
+  latestApply.current = apply;
+  // Receipts can race a delayed native-debt push. Preserve both original owners at the setter boundary.
+  const setApply = useRef<Dispatch<SetStateAction<ApplyState>>>((update) => setApplyState((state) => {
+    const next = typeof update === 'function' ? update(state) : update;
+    const folded = next === state ? state : preserveNativeRetirements(state, next);
+    latestApply.current = folded;
+    return folded;
+  })).current;
   const [restartPrompt, setRestartPrompt] = useState<RestartPrompt | null>(null);
+  const impactChoice = useImpactConfirmation();
   const applyRequest = useRef<{
     awaitingReply: boolean;
     cancelled: boolean;
@@ -128,7 +149,7 @@ export default function PendingChangesBar() {
 
   /* 点外部 / Esc 关闭（对齐首页出口选单、节点页 add-menu 的既有模式）。 */
   useEffect(() => {
-    if (!detailOpen) return;
+    if (!detailOpen || typeof document === 'undefined') return;
     const onDown = (e: MouseEvent) => {
       if (!barRef.current?.contains(e.target as Node)) setDetailOpen(false);
     };
@@ -143,7 +164,7 @@ export default function PendingChangesBar() {
     };
   }, [detailOpen]);
 
-  useRuntimeApplyReconciliation(apply, setApply, applyRequest, simpleT);
+  const reconciliation = useRuntimeApplyReconciliation(apply, setApply, applyRequest, simpleT);
 
   // Await actual listener registration before issuing Apply; plain start/error broadcasts have
   // no action ownership and therefore must not decide this request's outcome.
@@ -151,13 +172,24 @@ export default function PendingChangesBar() {
     let disposed = false;
     let offLifecycle: (() => void) | undefined;
     const ready = api.proxy.onLifecycleReady((data) => {
+      if (data.terminal === true && (data.phase === 'ready' || data.kind === 'stop' && data.phase === 'stopped')) {
+        void api.proxy.getStatus().then((live) => {
+          if (!disposed) {
+            useAppStore.getState().confirmNativeRetirementEnd(data, live);
+            setApply((state) => nativeRetirementsAfterLifecycle(state, data, live));
+          }
+        }).catch(() => undefined);
+      }
       const request = applyRequest.current;
       if (!request) return;
       if (data.kind === 'stop' && data.terminal === true && data.phase === 'stopped'
           && Number.isSafeInteger(data.mainGeneration)
           && data.mainGeneration >= (request.earlyGeneration ?? Number.POSITIVE_INFINITY)) {
         request.cancelled = true;
-        setApply((state) => state.reconciling ? { ...state, reconciling: false } : state);
+        setApply((state) => state.reconciling || state.hostReconciling
+          ? { ...state, reconciling: false, hostReconciling: false,
+            ...(state.host && state.host.phase !== 'settled'
+              ? { host: { ...state.host, phase: 'failed', superseded: true } } : {}) } : state);
       }
       if (request.awaitingReply) {
         // Payload retention is bounded, but generation knowledge must never be evicted.
@@ -198,7 +230,7 @@ export default function PendingChangesBar() {
       void api.proxy.getStatus().catch(() => null).then(() => {
         if (applyRequest.current !== request) return;
         setApply((state) => state.phase === 'applying' && state.applyId === apply.applyId
-          ? { phase: 'failed', reason: null } : state);
+          ? preserveNativeRetirements(state, { phase: 'failed', reason: null }) : state);
       });
     }, APPLY_CONFIRM_TIMEOUT_MS);
     return () => clearTimeout(timer);
@@ -233,7 +265,17 @@ export default function PendingChangesBar() {
     pendingCount: n,
     applyError: apply.reason,
     coreRunning,
-    persistenceRetryAvailable: !!apply.transactionId,
+    coreGeneration,
+    persistenceRetryAvailable: !!apply.coreRecovery || (apply.configurationDurable !== true && !!apply.transactionId
+      && (apply.persistenceOnly === true || apply.phase === 'durabilityPending')),
+    host: apply.host,
+    nativeRetirements: mergeNativeRetirements(apply, pending.nativeRetirements).nativeRetirements,
+    nativeChecking: apply.nativeChecking,
+    configurationDurable: apply.configurationDurable,
+    coreCommitted: coreRunning && apply.mainGeneration === coreGeneration && apply.coreState === 'committed',
+    configurationPending: pending.restartDeferred,
+    persistenceRetrying: apply.persistenceRetrying,
+    persistenceOwnerPending: !!apply.coreRecovery && apply.coreRecovery.selectionIntentGeneration === undefined,
     persistenceOnly: apply.persistenceOnly,
     persistenceRecoveryEnded: apply.persistenceRecoveryEnded,
   });
@@ -250,7 +292,7 @@ export default function PendingChangesBar() {
         onDismiss={() => useStagedConfigStore.getState().dismissConflict()}
       />
     );
-  if (!view.visible && restartPrompt === null) return conflictDialog;
+  if (!view.visible && restartPrompt === null && impactChoice.prompt === null) return conflictDialog;
 
   /** n===0 而差集腿仍有活 ⇒ 唯一可能是 `restartDeferred`：明细里没有 id 可列，给一行说明。 */
   const configOnly = n === 0 && hasPendingWork(pending);
@@ -259,13 +301,28 @@ export default function PendingChangesBar() {
     await useStagedConfigStore.getState().save();
   };
 
-  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string) => {
-    if (applyRequest.current?.awaitingReply || apply.phase === 'applying') return;
+  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string, impactConfirmation?: string, hostRetry = false) => {
+    if (applyRequest.current?.awaitingReply || apply.phase === 'applying'
+        || apply.host?.phase === 'pending' && !apply.host.superseded) return;
+    if (hostRetry && useStagedConfigStore.getState().entries.length > 0) return;
+    const hostDebt = apply.host !== undefined && apply.host.phase !== 'settled';
+    const hostCandidate = hostRetry ? { draft: useStagedConfigStore.getState().entries,
+      config: useAppStore.getState().config } : null;
+    const sameHostCandidate = () => hostCandidate !== null
+      && useStagedConfigStore.getState().entries === hostCandidate.draft
+      && useAppStore.getState().config === hostCandidate.config;
+    const retainingRecovery = persistenceTransactionId !== undefined
+      && apply.coreRecovery?.transactionId === persistenceTransactionId;
     setRestartPrompt(null);
+    if (impactConfirmation === undefined) impactChoice.dismiss();
+    else impactChoice.hide();
     const generation = useAppStore.getState().proxyStatus?.mainGeneration;
-    const initial: ApplyState = { phase: 'applying', reason: null,
-      persistenceOnly: persistenceTransactionId !== undefined, transactionId: persistenceTransactionId,
-      ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) };
+    const initial: ApplyState = preserveNativeRetirements(mergeNativeRetirements(apply, pending.nativeRetirements), { ...(hostDebt || retainingRecovery ? apply : {}), phase: 'applying', reason: null,
+      ...(hostDebt || retainingRecovery ? { reconciling: false } : {}),
+      ...(hostDebt ? { host: { ...apply.host!, superseded: true }, hostReconciling: false } : {}),
+      persistenceOnly: persistenceTransactionId !== undefined || (hostDebt && apply.persistenceOnly === true),
+      transactionId: persistenceTransactionId ?? (hostDebt ? apply.transactionId : undefined),
+      ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) });
     const request = { awaitingReply: true, cancelled: false,
       intentGeneration: undefined as number | undefined,
       early: [] as ProxyLifecycleEvent[],
@@ -276,16 +333,37 @@ export default function PendingChangesBar() {
       if (!lifecycleReady.current) throw new Error('APPLY_LIFECYCLE_LISTENER_UNAVAILABLE');
       await lifecycleReady.current;
       if (applyRequest.current !== request) return;
-      const result = persistenceTransactionId === undefined
-        ? await useStagedConfigStore.getState().applyNow(restartConfirmation)
-        : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
+      if (request.cancelled) {
+        request.awaitingReply = false;
+        setApply({ ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: false, hostReconciling: false });
+        return;
+      }
+      if (hostRetry && !sameHostCandidate()) {
+        request.awaitingReply = false;
+        setApply({ ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery });
+        return;
+      }
+      const result = hostRetry
+        // Fresh Plan/confirmation for the saved candidate; never save drafts or replay a Core transaction.
+        ? { ...await api.proxy.applyPendingChanges(), saved: true }
+        : persistenceTransactionId === undefined
+          ? await (impactConfirmation === undefined
+            ? useStagedConfigStore.getState().applyNow(restartConfirmation)
+            : useStagedConfigStore.getState().applyNow(undefined, impactConfirmation))
+          : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       if (!result.saved) {
-        setApply({ phase: 'idle', reason: null });
+        setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
         return;
       }
-      if ((result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'unconfirmed')
+      // Every saved receipt may report older native owners, including a rejected or superseded new attempt.
+      setApply((state) => mergeNativeRetirements(state, result.nativeRetirements));
+      if ((result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'unconfirmed'
+          || result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed' || result.status === 'nativeCleanupUnknown')
           && (request.cancelled || (request.earlyGeneration ?? 0) > (initial.mainGeneration ?? 0))) {
         request.early = [];
         setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
@@ -293,9 +371,26 @@ export default function PendingChangesBar() {
       }
       if (persistenceTransactionId !== undefined
           && (result.transactionId !== persistenceTransactionId
-            || !['hotApplied', 'hotDurabilityPending', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
+            || !['hotApplied', 'hotDurabilityPending', 'hostEffectsPending', 'hostEffectsFailed', 'nativeCleanupUnknown', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
         request.early = [];
         setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+        return;
+      }
+      if (result.status === 'impactConfirmationRequired') {
+        request.early = [];
+        if (hostRetry && !sameHostCandidate()) {
+          if (result.impactConfirmation) void api.proxy.cancelRuntimeImpact(result.impactConfirmation).catch(() => null);
+          setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotConflict'),
+            reconciling: !!initial.coreRecovery });
+          return;
+        }
+        if (request.cancelled || !impactChoice.offer(result)) {
+          if (result.impactConfirmation) void api.proxy.cancelRuntimeImpact(result.impactConfirmation).catch(() => null);
+          setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+          return;
+        }
+        setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
         return;
       }
       if (result.status === 'restartRequired') {
@@ -306,7 +401,8 @@ export default function PendingChangesBar() {
           return;
         }
         setRestartPrompt({ token: result.restartConfirmation, reasons: result.reasons ?? [] });
-        setApply({ phase: 'idle', reason: null });
+        setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
+          reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
         return;
       }
       const reconcileOwnerKnown = Number.isSafeInteger(result.runtimeGeneration) && (result.runtimeGeneration ?? 0) > 0
@@ -315,18 +411,31 @@ export default function PendingChangesBar() {
       const outcome = applyOutcome(result.status, result.reasons);
       let next: ApplyState = { ...initial, phase: outcome.phase,
         reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null,
-        transactionId: result.transactionId,
+        transactionId: result.transactionId ?? initial.transactionId,
         persistenceRecoveryEnded: persistenceTransactionId !== undefined
           && runtimePersistenceRecoveryEnded(result.status, result.reasons),
         mainGeneration: result.runtimeGeneration ?? initial.mainGeneration,
-        reconciling: !request.cancelled && reconcileOwnerKnown && !!result.transactionId && (result.status === 'hotDurabilityPending' || result.status === 'unconfirmed') };
+        reconciling: !request.cancelled && (initial.coreRecovery !== undefined
+          || reconcileOwnerKnown && !!result.transactionId && (result.status === 'hotDurabilityPending' || result.status === 'unconfirmed')) };
+      // Legacy hotApplied already confirmed durability; an explicit false never borrows that meaning.
+      const receipt = result.status === 'hotApplied' && result.transactionId !== undefined && result.configurationDurable !== false
+        ? { ...result, configurationDurable: true } : result;
+      next = applyReceiptState(next, receipt, true);
+      if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) {
+        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed') };
+      }
+      next.hostReconciling = !request.cancelled && reconcileOwnerKnown && next.host?.phase === 'pending';
+      if ((result.status === 'hostEffectsPending' || result.status === 'hostEffectsFailed')
+          && (!result.hostExecutionId || !reconcileOwnerKnown)) {
+        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false };
+      }
       if (outcome.phase === 'applying') {
         if (typeof result.applyId !== 'number' || !Number.isSafeInteger(result.applyId) || result.applyId <= 0) {
-          next = { phase: 'failed', reason: null };
+          next = preserveNativeRetirements(initial, { phase: 'failed', reason: null });
         } else {
           next.applyId = result.applyId;
           if (request.earlyStopped) {
-            next = { phase: 'idle', reason: null };
+            next = preserveNativeRetirements(initial, { phase: 'idle', reason: null });
           } else {
             // A retained old terminal cannot settle below a newer observation that overflow
             // evicted. Missing payload remains pending for a future owned event or timeout.
@@ -336,13 +445,15 @@ export default function PendingChangesBar() {
         }
       }
       request.early = [];
+      next = preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next);
       setApply(next);
-      if (outcome.toast !== null) toast[outcome.toast.kind](t(outcome.toast.key));
+      if (outcome.toast !== null
+          && !(result.status === 'hotApplied' && (next.nativeRetirements?.length || next.host && next.host.phase !== 'settled'))) toast[outcome.toast.kind](t(outcome.toast.key));
     } catch (error) {
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       request.early = [];
-      setApply({ ...initial, phase: 'failed', reason: null });
+      setApply({ ...initial, phase: 'failed', reason: null, reconciling: !request.cancelled && !!initial.coreRecovery });
       console.error('[PendingChangesBar] Apply failed:', error);
     }
   };
@@ -362,10 +473,20 @@ export default function PendingChangesBar() {
         void onApply();
         return;
       case 'retryPersistence':
-        if (apply.transactionId) void onApply(undefined, apply.transactionId);
+        if (apply.host && (apply.coreRecovery || apply.host.phase !== 'settled')) void reconciliation.retryPersistence();
+        else if (apply.transactionId) void onApply(undefined, apply.transactionId);
+        return;
+      case 'retryHost':
+        void onApply(undefined, undefined, undefined, true);
+        return;
+      case 'checkHost':
+        reconciliation.checkHost();
+        return;
+      case 'checkNative':
+        void reconciliation.checkNative();
         return;
       case 'dismissApply':
-        setApply({ phase: 'idle', reason: null });
+        setApply(dismissApplyState);
         return;
     }
   };
@@ -411,6 +532,7 @@ export default function PendingChangesBar() {
         onClick={() => setDetailOpen((v) => !v)}
       >
         <b>{t(view.titleKey, view.titleVars)}</b>
+        {view.accountDetailKeys?.map(key => <div key={key}>{t(key)}</div>)}
         {view.detailKey !== '' && <div>{t(view.detailKey)}</div>}
       </button>
       <div className="pb-acts">
@@ -440,6 +562,13 @@ export default function PendingChangesBar() {
           向下弹整块出屏。用 `bottom:calc(100% + 6px)` 表达，无需测量。 */}
       {detailOpen && (
         <div className="pd-pop" style={{ bottom: 'calc(100% + 6px)', left: 0 }} role="group">
+          {view.titleKey === 'home.pendingNativeCleanupUnknown' && (
+            <div style={{ padding: '6px 8px', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+              <b>{t(view.titleKey)}</b>
+              {view.accountDetailKeys?.map(key => <p key={key}>{t(key)}</p>)}
+              <p>{t('home.pendingNativeCleanupDetail')}</p>
+            </div>
+          )}
           {/* 待保存组：逐条可撤销（FR-3）+ 逐条标生效类别（FR-9）。撤销走「移除后重放」，
               效果等价于「这一条从未加入过」。 */}
           {stagedEntries.length > 0 && (
@@ -503,6 +632,11 @@ export default function PendingChangesBar() {
         </div>
       )}
       {conflictDialog}
+      {impactChoice.prompt !== null && (
+        <ImpactApplyDialog prompt={impactChoice.prompt}
+          onDismiss={impactChoice.dismiss}
+          onConfirm={() => { if (impactChoice.prompt) void onApply(undefined, undefined, impactChoice.prompt.token); }} />
+      )}
       {restartPrompt !== null && (
         <RestartApplyDialog prompt={restartPrompt}
           onDismiss={() => setRestartPrompt(null)}

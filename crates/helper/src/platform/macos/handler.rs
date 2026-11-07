@@ -497,12 +497,15 @@ pub fn dispatch_from_peer(
             Response::Err(ProtoError::new(ErrorCode::Unknown))
         }
         // 以下命令不属于 mac helper 谱系（LinuxStart/IfaceMetric/Uninstall）
-        Request::LinuxStart(_)
+        Request::WindowsCheck(_)
+        | Request::LinuxStart(_)
         | Request::LinuxStartPinned(_)
         | Request::LinuxStop { .. }
         | Request::LinuxStartBirth(_)
         | Request::LinuxStatusBirth
         | Request::LinuxStopBirth { .. }
+        | Request::LinuxDnsSnapshot
+        | Request::LinuxDnsCompare { .. }
         | Request::LinuxDnsSet(_)
         | Request::LinuxDnsRevert { .. }
         | Request::IfaceMetric { .. }

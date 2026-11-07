@@ -111,6 +111,8 @@ pub struct SpawnCoreRequest {
     pub binary: PathBuf,
     /// 配置文件路径（已校验属主 == 对端 uid）。
     pub config: PathBuf,
+    /// Peer-verified explicit runtime directory; None retains legacy cold startup.
+    pub runtime_directory: Option<PathBuf>,
     /// 日志文件路径（None = 不重定向）。
     pub log: Option<PathBuf>,
     /// Legacy wire compatibility only; does not authorize host router changes.

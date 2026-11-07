@@ -1007,9 +1007,9 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       // loadReleaseContract already checks legal content; send pins, then reprove tar bytes.
       const sourceFile = join(work, contract.sourceArchive.name); writeFileSync(sourceFile, sourceArchive, { flag: 'wx' });
       cacheWrites.push({ pin: contract.sourceArchive, file: sourceFile });
-      runColdArchive(run, 'source-archive-validation', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), sourceFile, '--source-legal-pins'],
+      runColdArchive(run, 'source-archive-validation', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), sourceFile, '--source-trusted-proofs'],
         JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
-          sourceTree: contract.sourceTree, sourceGitlinks: before.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: contract.platforms.linux.sourceIdentity,
+          sourceTree: contract.sourceTree, sourceGitlinks: before.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: contract.platforms.linux.sourceIdentity, trustedSourceSelection:'formal', trustedRows:Object.values(contract.platforms).map(({releaseAsset,...row})=>row), trustedProducer:contract.producer,
           buildReplacements: Object.values(contract.platforms).flatMap((r) => r.buildGraph.localReplacements),
           ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }));
     }
@@ -1135,9 +1135,9 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     const started = performance.now();
     try {
       run(process.platform === 'win32' ? 'python' : 'python3',
-        ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name), '--source-legal-pins'],
+        ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name), '--source-trusted-proofs'],
         { input: JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
-          sourceTree: contract.sourceTree, sourceGitlinks: snapshot.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: row.sourceIdentity,
+          sourceTree: contract.sourceTree, sourceGitlinks: snapshot.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: row.sourceIdentity, trustedSourceSelection:'formal', trustedRows:[(({releaseAsset,...original})=>original)(row)], trustedProducer:contract.producer,
           buildReplacements: row.buildGraph.localReplacements, ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }),
           encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: LOCAL_ARCHIVE_TIMEOUT_MS, killSignal: 'SIGKILL' });
     } catch (error) {

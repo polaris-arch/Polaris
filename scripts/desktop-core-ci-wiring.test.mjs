@@ -61,6 +61,22 @@ function bundles(source) {
   const packageJob = job(source.package, 'package');
   // The host-independent wire gate consumes the same exact bundle in its own job.
   const wireJob = job(source.package, 'core_wire');
+  const pythonSetup = "      - uses: actions/setup-python@v6\n        with:\n          python-version: '3.12'\n";
+  const dependency = '      - name: Install same-source trusted proof validator dependency\n'
+    + '        run: python -m pip install jsonschema==4.23.0\n';
+  for (const [body, acquisition] of [
+    [producer, '      - name: Acquire exact platform core input\n'],
+    [assemble, '      - name: Assemble and verify exact candidate bundle\n'],
+    [preflight, '      - name: Fetch sing-box core\n'],
+    [packageJob, '      - name: Consume sing-box core bundle\n'],
+    [wireJob, '      - name: Consume sing-box core bundle\n'],
+  ]) {
+    assert.ok(body.includes(pythonSetup));
+    assert.ok(body.includes(dependency));
+    assert.ok(body.indexOf(dependency) > body.indexOf(pythonSetup));
+    assert.ok(body.indexOf(acquisition) >= 0);
+    assert.ok(body.indexOf(dependency) < body.indexOf(acquisition));
+  }
   assert.match(producer, /name: desktop-core-producer-\$\{\{ inputs.candidate \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.platform \}\}/);
   assert.match(producer, /path: \$\{\{ runner.temp \}\}\/desktop-core-bundle\n/, 'upload bundle root retains platform directories');
   assert.match(assemble, /needs: \[plan, produce\]/);
@@ -222,6 +238,12 @@ test('candidate checkout and App/helper identity follow PR head instead of a def
 test('exact same-run artifacts preserve platform directories and pass assemble plus all-four consumption', () => {
   bundles(files);
   for (const changed of [
+    { ...files, 'desktop-core': files['desktop-core'].replace('run: python -m pip install jsonschema==4.23.0', 'run: echo missing dependency') },
+    { ...files, 'desktop-core': files['desktop-core'].replace('jsonschema==4.23.0', 'jsonschema==4.19.2') },
+    { ...files, 'desktop-core': files['desktop-core'].replace(job(files['desktop-core'], 'assemble'), job(files['desktop-core'], 'assemble').replace('run: python -m pip install jsonschema==4.23.0', 'run: echo missing assembler dependency')) },
+    { ...files, 'release-risk': files['release-risk'].replace(job(files['release-risk'], 'preflight'), job(files['release-risk'], 'preflight').replace('run: python -m pip install jsonschema==4.23.0', 'run: echo missing preflight dependency')) },
+    { ...files, package: files.package.replace(job(files.package, 'package'), job(files.package, 'package').replace('run: python -m pip install jsonschema==4.23.0', 'run: echo missing package dependency')) },
+    { ...files, package: files.package.replace(job(files.package, 'core_wire'), job(files.package, 'core_wire').replace('run: python -m pip install jsonschema==4.23.0', 'run: echo missing wire dependency')) },
     { ...files, 'desktop-core': files['desktop-core'].replace('path: ${{ runner.temp }}/desktop-core-bundle\n', 'path: ${{ runner.temp }}/desktop-core-bundle/${{ matrix.platform }}\n') },
     { ...files, 'desktop-core': files['desktop-core'].replace('-${{ github.run_attempt }}-win', '-1-win') },
     { ...files, 'desktop-core': files['desktop-core'].replace('-${{ github.run_attempt }}-linux\n', '-${{ github.run_attempt }}-linux\n          run-id: 1\n') },
@@ -332,7 +354,26 @@ test('Windows maintenance anchor is bin-only and does not create a helper self-h
   assert.ok(!lib.includes('option_env!'));
   assert.ok(installer.includes('anchor.admits(&request)'));
   assert.ok(!installer.includes('std::env::var("POLARIS_WINDOWS_INSTALL_ANCHOR")'));
-  assert.ok(prepare.includes('verifiedCandidateSource(root)'));
+  const checkSourceProjection = source => {
+    assert.match(source, /^  const \{source,rows\} = verifiedCandidateSource\(root,\{includeInstallationRows:true\}\), binding = loadCandidate\(root\);$/m);
+    assert.match(source, /^  candidateBuildSelection\(source, root, platform, directory\);$/m);
+    assert.match(source, /^  contract = candidateInstallationContract\(binding, source.bindingSha256, rows\);$/m);
+    const verified = source.indexOf('  const {source,rows} = verifiedCandidateSource(');
+    const selected = source.indexOf('  candidateBuildSelection(source, root, platform, directory);');
+    const contract = source.indexOf('  contract = candidateInstallationContract(binding, source.bindingSha256, rows);');
+    assert.ok(verified >= 0 && verified < selected && selected < contract);
+  };
+  checkSourceProjection(prepare);
+  for (const [before, after] of [
+    ['includeInstallationRows:true', 'includeInstallationRows:false'],
+    ['verifiedCandidateSource(root,', 'verifiedCandidateSource(directory,'],
+    ['candidateBuildSelection(source, root, platform, directory);', 'candidateBuildSelection(source, directory, platform, directory);'],
+    ['candidateInstallationContract(binding, source.bindingSha256, rows)', 'candidateInstallationContract(binding, source.bindingSha256, unverifiedRows)'],
+  ]) {
+    const changed = prepare.replace(before, after);
+    assert.notEqual(changed, prepare);
+    assert.throws(() => checkSourceProjection(changed), assert.AssertionError);
+  }
   assert.ok(prepare.includes('verifyPackagedRelease(root, input, platform'));
   assert.ok(prepare.includes("actualCoreFile(resolve(flags.get('helper-binary')))"));
   const block = files.package.slice(files.package.indexOf('      - name: Build and stage privileged helper'));

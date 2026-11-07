@@ -577,7 +577,7 @@ impl ProxyRuntime {
             current: new_digest,
         })
     }
-    pub(super) async fn runtime_management_client(
+    pub(in crate::runtime::proxy) async fn runtime_management_client(
         &self,
         generation: u64,
     ) -> Result<Arc<SingBoxApiClient>, ()> {

@@ -3,7 +3,7 @@
 //! `enable`/`disable`/`recover_from_marker`/`ensure_cleared` 与 `points_to_us` 是同一个
 //! marker 事务的 owner（设计文档 T1），整体留在本模块，不拆。
 
-use super::model::ProxyEnableRequest;
+use super::model::{PreparedProxyEffect, ProxyEnableRequest, TakeoverOutcome, TakeoverReceipt};
 use super::ops::{ProxySnapshotRelation, SystemProxyOps};
 use crate::error::SystemIntegrationError;
 use crate::proxy::{
@@ -45,12 +45,268 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
         self.original.as_ref()
     }
 
+    /// Synchronous read-only preparation. Live acceptance requires exact platform
+    /// compare/apply/restore; an unavailable capability never falls back to CLI.
+    pub fn prepare_effect(
+        &self,
+        request: Option<&ProxyEnableRequest>,
+    ) -> Result<PreparedProxyEffect, SystemIntegrationError> {
+        if !self.ops.exact_transaction_available()? {
+            return Err(SystemIntegrationError::UnsupportedPlatform(
+                "live proxy effect requires exact compare/apply/restore".into(),
+            ));
+        }
+        let before = self.ops.capture_transaction_snapshot()?;
+        let marker = match self.marker.read_checked() {
+            ProxyMarkerRead::Missing => None,
+            ProxyMarkerRead::CurrentValidated(marker)
+                if marker.phase == ProxyMarkerPhase::Owned =>
+            {
+                let (Some(original), Some(base), Some(applied)) = (
+                    &marker.exact_original,
+                    &marker.exact_apply_base,
+                    &marker.exact_applied,
+                ) else {
+                    return Err(SystemIntegrationError::proxy(
+                        "live proxy marker lacks exact snapshots",
+                    ));
+                };
+                if self.ops.snapshot_relation(base, applied, &before)
+                    != ProxySnapshotRelation::Exact
+                {
+                    return Err(SystemIntegrationError::proxy(
+                        "live proxy owner no longer matches OS state",
+                    ));
+                }
+                validate_restore_scope(original, applied, &before)?;
+                Some(marker)
+            }
+            other => {
+                return Err(SystemIntegrationError::proxy(format!(
+                    "live proxy marker is not settled: {other:?}"
+                )))
+            }
+        };
+        let target = match request {
+            Some(request) => self.ops.build_applied_snapshot(request, &before)?,
+            None => marker
+                .as_ref()
+                .and_then(|m| m.exact_original.clone())
+                .unwrap_or_else(|| before.clone()),
+        };
+        Ok(PreparedProxyEffect {
+            marker_path: self.marker.path().to_owned(),
+            marker,
+            before,
+            target,
+            request: request.cloned(),
+        })
+    }
+
+    pub fn effect_facts_match(
+        &self,
+        prepared: &PreparedProxyEffect,
+    ) -> Result<bool, SystemIntegrationError> {
+        if prepared.marker_path != self.marker.path() || !self.ops.exact_transaction_available()? {
+            return Ok(false);
+        }
+        let expected = prepared
+            .marker
+            .clone()
+            .map(ProxyMarkerRead::CurrentValidated)
+            .unwrap_or(ProxyMarkerRead::Missing);
+        if self.marker.read_checked() != expected {
+            return Ok(false);
+        }
+        let current = self.ops.capture_transaction_snapshot()?;
+        Ok(self
+            .ops
+            .snapshot_relation(&prepared.before, &prepared.before, &current)
+            == ProxySnapshotRelation::Exact)
+    }
+
+    fn check_prepared_values(
+        &self,
+        prepared: Option<&PreparedProxyEffect>,
+        before: &ProxyTransactionSnapshot,
+        target: &ProxyTransactionSnapshot,
+    ) -> Result<(), SystemIntegrationError> {
+        if prepared.is_some_and(|p| {
+            self.ops.snapshot_relation(&p.before, &p.before, before) != ProxySnapshotRelation::Exact
+                || self.ops.snapshot_relation(&p.target, &p.target, target)
+                    != ProxySnapshotRelation::Exact
+        }) {
+            return Err(SystemIntegrationError::proxy(
+                "live proxy recipe changed before mutation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Caller holds its existing controller mutex and generation/intent admission.
+    /// V2 marker CAS remains the sole durable owner; late callers cannot clear a new txn.
+    pub fn apply_effect(
+        &mut self,
+        prepared: &PreparedProxyEffect,
+        operation_id: &str,
+    ) -> TakeoverReceipt {
+        let failure = |outcome, marker_id, reason| {
+            TakeoverReceipt::new(operation_id, outcome, marker_id, reason)
+        };
+        if operation_id.trim().is_empty() {
+            return failure(
+                TakeoverOutcome::FailedUnchanged,
+                None,
+                Some("empty host operation identity".into()),
+            );
+        }
+        match self.effect_facts_match(prepared) {
+            Ok(true) => {}
+            Ok(false) => {
+                return failure(
+                    TakeoverOutcome::Superseded,
+                    None,
+                    Some("proxy facts or marker changed".into()),
+                )
+            }
+            Err(error) => {
+                return failure(
+                    TakeoverOutcome::FailedUnchanged,
+                    None,
+                    Some(error.to_string()),
+                )
+            }
+        }
+        if prepared.request.is_none() && prepared.marker.is_none()
+            || prepared.marker.is_some()
+                && prepared.request.is_some()
+                && self
+                    .ops
+                    .snapshot_relation(&prepared.before, &prepared.target, &prepared.before)
+                    == ProxySnapshotRelation::Exact
+        {
+            return failure(
+                TakeoverOutcome::Unchanged,
+                prepared.marker.as_ref().and_then(|m| m.txn_id.clone()),
+                None,
+            );
+        }
+        let result = if let Some(request) = &prepared.request {
+            let marker = prepared
+                .marker
+                .clone()
+                .map(ProxyMarkerRead::CurrentValidated)
+                .unwrap_or(ProxyMarkerRead::Missing);
+            self.enable_exact(request, marker, Some(prepared))
+        } else {
+            let marker = prepared
+                .marker
+                .as_ref()
+                .expect("release without marker handled above");
+            let txn_id = marker
+                .txn_id
+                .as_deref()
+                .expect("strict V2 marker has txn_id");
+            (|| {
+                validate_restore_scope(&prepared.target, &prepared.before, &prepared.before)?;
+                match self
+                    .marker
+                    .begin_restore(txn_id, ProxyMarkerPhase::Owned, &prepared.before)
+                {
+                    ProxyMarkerMutationOutcome::Updated => {}
+                    _ => {
+                        return Err(SystemIntegrationError::proxy(
+                            "live release restore-anchor CAS failed",
+                        ))
+                    }
+                }
+                let mut restoring = marker.clone();
+                restoring.phase = ProxyMarkerPhase::Restoring;
+                restoring.plan_version = crate::proxy::PROXY_TRANSACTION_PLAN_VERSION;
+                restoring.exact_restore_base = Some(prepared.before.clone());
+                if self.marker.read_checked()
+                    != ProxyMarkerRead::CurrentValidated(restoring.clone())
+                {
+                    return Err(SystemIntegrationError::proxy(
+                        "live release marker changed before OS write",
+                    ));
+                }
+                self.ops
+                    .restore_transaction(&prepared.target, &prepared.before)?;
+                let current = self.ops.capture_transaction_snapshot()?;
+                if self
+                    .ops
+                    .snapshot_relation(&prepared.before, &prepared.target, &current)
+                    != ProxySnapshotRelation::Exact
+                {
+                    return Err(SystemIntegrationError::proxy(
+                        "live release read-back mismatch",
+                    ));
+                }
+                if self.marker.read_checked()
+                    != ProxyMarkerRead::CurrentValidated(restoring.clone())
+                {
+                    return Err(SystemIntegrationError::proxy(
+                        "live release marker changed during OS restore",
+                    ));
+                }
+                self.advance_current_phase(
+                    txn_id,
+                    ProxyMarkerPhase::Restoring,
+                    ProxyMarkerPhase::RestoredPendingClear,
+                )?;
+                restoring.phase = ProxyMarkerPhase::RestoredPendingClear;
+                if self.marker.read_checked() != ProxyMarkerRead::CurrentValidated(restoring) {
+                    return Err(SystemIntegrationError::proxy(
+                        "live release settlement marker changed",
+                    ));
+                }
+                self.clear_current_marker(txn_id, ProxyMarkerPhase::RestoredPendingClear)?;
+                self.original = None;
+                Ok(())
+            })()
+        };
+        let after = self.marker.read_checked();
+        let marker_id = match &after {
+            ProxyMarkerRead::CurrentValidated(marker) => marker.txn_id.clone(),
+            _ => prepared.marker.as_ref().and_then(|m| m.txn_id.clone()),
+        };
+        match result {
+            Ok(()) => failure(TakeoverOutcome::Applied, marker_id, None),
+            Err(error) => {
+                let expected = prepared
+                    .marker
+                    .clone()
+                    .map(ProxyMarkerRead::CurrentValidated)
+                    .unwrap_or(ProxyMarkerRead::Missing);
+                let unchanged = after == expected
+                    && self
+                        .ops
+                        .capture_transaction_snapshot()
+                        .is_ok_and(|current| {
+                            self.ops
+                                .snapshot_relation(&prepared.before, &prepared.before, &current)
+                                == ProxySnapshotRelation::Exact
+                        });
+                failure(
+                    if unchanged {
+                        TakeoverOutcome::FailedUnchanged
+                    } else {
+                        TakeoverOutcome::RecoveryPending
+                    },
+                    marker_id,
+                    Some(error.to_string()),
+                )
+            }
+        }
+    }
+
     /// 启用系统代理（接管）。exact-capable 平台使用 V2 marker + whole-marker CAS；没有
     /// exact capability 的部署继续走 legacy 命令路径，但只允许从 Missing marker 开始。
     pub fn enable(&mut self, req: &ProxyEnableRequest) -> Result<(), SystemIntegrationError> {
         let marker = self.marker.read_checked();
         if self.ops.exact_transaction_available()? {
-            self.enable_exact(req, marker)
+            self.enable_exact(req, marker, None)
         } else {
             self.enable_legacy(req, marker)
         }
@@ -60,11 +316,13 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
         &mut self,
         req: &ProxyEnableRequest,
         marker: ProxyMarkerRead,
+        prepared: Option<&PreparedProxyEffect>,
     ) -> Result<(), SystemIntegrationError> {
         let (original, apply_base, applied, transaction) = match marker {
             ProxyMarkerRead::Missing => {
                 let current = self.ops.capture_transaction_snapshot()?;
                 let applied = self.ops.build_applied_snapshot(req, &current)?;
+                self.check_prepared_values(prepared, &current, &applied)?;
                 let begun =
                     self.marker
                         .begin_if_absent(&req.our_host_port(), &current, &current, &applied);
@@ -111,6 +369,7 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                 // Do not launder newly added PAC/unowned fields into replacement authority.
                 validate_restore_scope(original, old_applied, &current)?;
                 let applied = self.ops.build_applied_snapshot(req, &current)?;
+                self.check_prepared_values(prepared, &current, &applied)?;
                 let replaced = self.marker.replace_if_current(
                     old_txn_id,
                     &req.our_host_port(),
@@ -142,14 +401,45 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
             }
         };
 
+        if prepared.is_some()
+            && (transaction.exact_original.as_ref() != Some(&original)
+                || transaction.exact_apply_base.as_ref() != Some(&apply_base)
+                || transaction.exact_applied.as_ref() != Some(&applied)
+                || self.marker.read_checked()
+                    != ProxyMarkerRead::CurrentValidated(transaction.clone()))
+        {
+            return Err(SystemIntegrationError::proxy(
+                "live proxy claimed marker differs from prepared authority",
+            ));
+        }
         self.original = original.original_settings();
         let txn_id = transaction
             .txn_id
             .as_deref()
             .expect("validated V2 marker always has txn_id");
         if let Err(apply_error) = self.ops.apply_transaction(req, &apply_base) {
-            self.rollback_failed_exact_apply(txn_id, &apply_base, &applied);
+            // Live pointer replacement may follow Core retirement of the old listener.
+            // Only the legacy startup path may automatically restore that old pointer.
+            if prepared.is_none() {
+                self.rollback_failed_exact_apply(txn_id, &apply_base, &applied);
+            }
             return Err(apply_error);
+        }
+        if prepared.is_some() {
+            let current = self.ops.capture_transaction_snapshot()?;
+            if self.ops.snapshot_relation(&apply_base, &applied, &current)
+                != ProxySnapshotRelation::Exact
+            {
+                return Err(SystemIntegrationError::proxy(
+                    "live proxy target read-back mismatch; Applying marker retained",
+                ));
+            }
+            if self.marker.read_checked() != ProxyMarkerRead::CurrentValidated(transaction.clone())
+            {
+                return Err(SystemIntegrationError::proxy(
+                    "live proxy marker changed during OS mutation",
+                ));
+            }
         }
 
         match self.marker.update_current_phase(
@@ -157,7 +447,18 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
             ProxyMarkerPhase::Applying,
             ProxyMarkerPhase::Owned,
         ) {
-            ProxyMarkerMutationOutcome::Updated => Ok(()),
+            ProxyMarkerMutationOutcome::Updated => {
+                if prepared.is_some() {
+                    let mut owned = transaction.clone();
+                    owned.phase = ProxyMarkerPhase::Owned;
+                    if self.marker.read_checked() != ProxyMarkerRead::CurrentValidated(owned) {
+                        return Err(SystemIntegrationError::proxy(
+                            "live proxy Owned receipt changed before settlement",
+                        ));
+                    }
+                }
+                Ok(())
+            }
             ProxyMarkerMutationOutcome::Mismatch => Err(SystemIntegrationError::proxy(
                 "系统代理已应用，但 marker 阶段 CAS 已失效；保留现有 marker 供恢复",
             )),

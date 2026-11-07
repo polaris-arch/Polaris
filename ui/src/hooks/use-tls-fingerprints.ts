@@ -1,11 +1,11 @@
 import { useCallback, useSyncExternalStore } from 'react';
 import { coreApi } from '@/ipc/api/updater';
 import { proxyApi } from '@/ipc/api/proxy';
-import type { TlsFingerprintSnapshot } from '@/domain/utls';
+import type { TlsFingerprintPresentation } from '@/domain/utls';
 
-// One live read model for both renderers and settings. It owns no persistent
+// One capability presentation model for both renderers and settings. It owns no persistent
 // cache: last unmount clears it; start/stop/focus invalidate before querying.
-let snapshot: TlsFingerprintSnapshot | undefined;
+let snapshot: TlsFingerprintPresentation | undefined;
 const listeners = new Set<() => void>();
 let epoch = 0;
 let inFlight = false;

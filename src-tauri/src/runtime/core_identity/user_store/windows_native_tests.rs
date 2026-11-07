@@ -63,6 +63,34 @@ fn normal_compiled_stage_persists_repairs_under_real_profile_without_execution_a
         super::super::stage_recovery_installation(&helper, &config, &AtomicBool::new(false))
             .unwrap();
     assert_eq!(stage.manifest.core, selected);
+    // A real elevated process may default new objects to BA. The production
+    // staging producer must still bind the exact TokenUser, before any consumer.
+    let polaris_helper_proto::core_protocol::CallerIdentity::Windows(sid) =
+        polaris_helper::platform::windows::native_caller::current_user().unwrap()
+    else {
+        panic!("native Windows TokenUser required");
+    };
+    use std::os::windows::fs::OpenOptionsExt;
+    let stage_directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0200_0000 | 0x0020_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        .open(&stage.directory)
+        .unwrap();
+    assert_eq!(
+        polaris_helper::platform::windows::winproc::file_owner(&stage_directory).unwrap(),
+        sid
+    );
+    for entry in std::fs::read_dir(&stage.directory).unwrap() {
+        let entry = entry.unwrap();
+        let file = std::fs::File::open(entry.path()).unwrap();
+        assert_eq!(
+            polaris_helper::platform::windows::winproc::file_owner(&file).unwrap(),
+            sid,
+            "new staging member {} must belong to TokenUser",
+            entry.file_name().to_string_lossy()
+        );
+    }
+    drop(stage_directory);
     assert!(selected_at(&config, &selected).unwrap().is_none());
     assert_eq!(
         install(&config, &stage).unwrap(),

@@ -263,7 +263,7 @@ impl<'a> Namespace<'a> {
             };
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
         }
-        let mut file = options.open(path)?;
+        let mut file = self.store.owner.create_file(path, &options, true)?;
         *created = Some(identity(&file)?);
         // Parent is already protected. Seal before writing bytes, never repair
         // permissions on an arbitrary pre-existing object.
@@ -286,6 +286,13 @@ impl<'a> Namespace<'a> {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
+        #[cfg(windows)]
+        if self.store.owner.data.is_some() {
+            self.store.owner.private_dir(path)?;
+        } else {
+            builder.create(path)?;
+        }
+        #[cfg(not(windows))]
         builder.create(path)?;
         *created = Some(identity(&open_nofollow(path, true)?)?);
         self.store.owner.mode(path, 0o700)?;

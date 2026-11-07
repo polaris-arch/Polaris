@@ -15,6 +15,123 @@ fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>
     (rt, dir, sink, running)
 }
 
+fn host_dns_fixture(
+    platform: Platform,
+    enabled: bool,
+) -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
+    let (rt, dir) = test_runtime_on(platform);
+    let mut running = tun_config();
+    running["dnsConfig"]["takeoverSystemDns"] = enabled.into();
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_snapshot(&rt, &running);
+    cover_running_binding_roots(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    let sink = Arc::new(TestPutSink::default());
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]);
+    sink.follow_puts.store(true, Ordering::SeqCst);
+    *rt.management_api_stub.lock().unwrap() = Some(sink.clone());
+    (rt, dir, sink, running)
+}
+
+#[tokio::test]
+async fn saved_host_dns_changes_stay_pending_without_accepting_raw_r() {
+    for platform in [Platform::Mac, Platform::Linux] {
+        for enabled in [false, true] {
+            let (rt, _dir, sink, running) = host_dns_fixture(platform, enabled);
+            let mut disk = running.clone();
+            disk["dnsConfig"]["takeoverSystemDns"] = (!enabled).into();
+            let preview = rt.classify_staged(&disk);
+            assert!(preview.pending_apply && preview.restart_required);
+            rt.config.save_full(&disk).unwrap();
+            let disk = rt.config.current().unwrap();
+            assert_eq!(
+                rt.switch_mode_with(disk.clone(), true).await,
+                SwitchOutcome::Deferred
+            );
+            assert_eq!(rt.config.current().unwrap(), disk);
+            assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
+            let debt = rt.pending_changes();
+            assert!(debt.pending_apply && debt.restart_deferred && debt.restart_required);
+            assert!(sink.calls().is_empty());
+            assert!(rt.pending_force_restart.read().unwrap().is_none());
+
+            // Reverting D to the accepted host intent clears the debt, not a sticky bit.
+            rt.config.save_full(&running).unwrap();
+            rt.switch_mode_with(rt.config.current().unwrap(), true)
+                .await;
+            assert!(!rt.pending_changes().pending_apply);
+            assert_eq!(rt.current_config_snapshot(), Some(running));
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_only_switch_keeps_saved_host_dns_debt_out_of_r() {
+    for platform in [Platform::Mac, Platform::Linux] {
+        let (rt, _dir, sink, running) = host_dns_fixture(platform, true);
+        let previous: UserConfig = serde_json::from_value(running.clone()).unwrap();
+        let mut selected = previous.clone();
+        selected.selected_server_id = Some("node-b".into());
+        // Startup plans all hot-switchable roots before TUN owns the routes.
+        // This fixture only seeded active A; include B's captured planning fact.
+        let target_roots =
+            crate::runtime::route_binding::automatic_runtime_binding_root_ids(&selected);
+        assert!(target_roots.contains("node-b"));
+        {
+            let mut binding = rt.runtime_binding_state.lock().unwrap();
+            assert!(binding.plan.covered_roots.contains("node-a"));
+            binding.plan.covered_roots.extend(target_roots);
+            assert!(
+                crate::runtime::route_binding::runtime_binding_targets_reusable(
+                    &previous,
+                    &selected,
+                    &binding.plan,
+                )
+            );
+        }
+        let mut disk = running.clone();
+        disk["dnsConfig"]["takeoverSystemDns"] = false.into();
+        disk["selectedServerId"] = "node-b".into();
+        rt.config.save_full(&disk).unwrap();
+        let intent = rt.register_selector_intent();
+        assert_eq!(
+            rt.switch_selected_server_if_current("node-b", intent)
+                .await
+                .unwrap(),
+            Some(SwitchOutcome::HotSwitched)
+        );
+        assert!(!sink.calls().is_empty());
+        let accepted = rt.current_config_snapshot().unwrap();
+        assert_eq!(accepted["selectedServerId"], "node-b");
+        assert_eq!(accepted["dnsConfig"]["takeoverSystemDns"], true);
+        assert_eq!(
+            rt.config.current().unwrap()["dnsConfig"]["takeoverSystemDns"],
+            false
+        );
+        assert!(rt.pending_changes().pending_apply);
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn unsupported_host_dns_switch_is_a_real_noop_without_restart_debt() {
+    let (rt, _dir, sink, running) = host_dns_fixture(Platform::Win, true);
+    let mut disk = running.clone();
+    disk["dnsConfig"]["takeoverSystemDns"] = false.into();
+    assert!(!rt.classify_staged(&disk).pending_apply);
+    rt.config.save_full(&disk).unwrap();
+    let disk = rt.config.current().unwrap();
+    assert_eq!(
+        rt.switch_mode_with(disk.clone(), true).await,
+        SwitchOutcome::NoOp
+    );
+    assert_eq!(rt.current_config_snapshot(), Some(disk));
+    assert!(!rt.pending_changes().pending_apply);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(sink.calls().is_empty());
+}
+
 #[tokio::test]
 async fn block_saved_over_direct_running_mode_is_deferred_without_false_blocking() {
     let (rt, _dir, sink, mut running) = explicit_selection_fixture();
@@ -1850,6 +1967,7 @@ fn pending_changes_baseline_states_are_all_empty() {
         restart_deferred: false,
         pending_apply: false,
         restart_required: false,
+        native_retirements: vec![],
     };
 
     // ① 核未运行 / 无起核快照。
@@ -3968,6 +4086,7 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
             restart_deferred: false,
             pending_apply: false,
             restart_required: false,
+            native_retirements: vec![],
         },
         "重启落地后差集必须为空 —— 非空 = 条上继续挂「立即应用」，用户再点也清不掉"
     );

@@ -1020,6 +1020,18 @@ impl DirectCoreSlot {
         matches!(self.state, SlotState::Empty)
     }
 
+    #[cfg(feature = "native-production-verification")]
+    pub(in crate::runtime::proxy) fn terminate_for_native_verification(
+        &mut self,
+    ) -> std::io::Result<()> {
+        match &mut self.state {
+            SlotState::Running(run) => run.signal_with(|child| child.start_kill()),
+            _ => Err(std::io::Error::other(
+                "no original running Child for failure injection",
+            )),
+        }
+    }
+
     pub(in crate::runtime::proxy) fn empty_for_install(&mut self) -> Option<EmptyDirectSlot<'_>> {
         if self.is_empty() && !self.recovery_reserved {
             Some(EmptyDirectSlot { slot: self })

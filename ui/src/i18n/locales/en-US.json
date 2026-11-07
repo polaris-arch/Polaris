@@ -270,7 +270,8 @@
     "diagnosticMode": "Diagnostic mode",
     "diagnosticTipOff": "Temporarily enable DEBUG for this run; restarting the app restores the configured level.",
     "diagnosticTipOn": "Diagnostic mode is on; click again or restart the app to restore the configured level.",
-    "diagnosticFailed": "Failed to toggle diagnostic mode"
+    "diagnosticFailed": "Failed to toggle diagnostic mode",
+    "streamFailed": "The live log stream could not connect. Existing records are kept; retry to reconnect."
   },
   "notify": {
     "proxyError": {
@@ -443,6 +444,26 @@
     "pendingDetailTip": "Needs a core restart · click for details",
     "pendingDetailTipStaged": "Click for details",
     "pendingEffectNeedsRestart": "Apply after saving",
+    "impactApplyTitle": "Review connection impact",
+    "impactApplyDescription": "These changes affect connections or system network settings.",
+    "impactApplyTunTcpReset": "Existing TUN TCP connections will be reset.",
+    "impactApplyTunUdpReset": "Existing TUN UDP associations will be reset.",
+    "impactApplyTunRollback": "Rolling back the settings cannot restore these reset TUN sessions.",
+    "impactApplyListenerAdmissions": "New connections on the changed inbound use the updated settings.",
+    "impactApplyListenerUdp": "Affected listener UDP associations may be interrupted and need to be re-established.",
+    "impactApplyListenerHandoff": "Dependent listeners will be handed over; affected connections may need to reconnect.",
+    "impactApplyApiStreams": "Management API streams on the replaced endpoint will reconnect.",
+    "impactApplyDashboard": "The dashboard updater will stop or restart to match the new setting.",
+    "impactApplyNewAdmissions": "New connections use the updated runtime settings.",
+    "impactApplyLogEmissions": "Log output switches to the updated settings.",
+    "impactApplyTlsConsumers": "New TLS connections and components using certificate providers switch to the updated providers.",
+    "impactApplyClockConsumers": "New components using the clock switch to the updated time source.",
+    "impactApplyUnknown": "The impact cannot be verified. Applying is blocked; cancel and review the pending changes.",
+    "impactApplySavedPending": "These changes are saved. Cancel keeps them pending and leaves the running configuration unchanged.",
+    "impactApplyDns": "Update system DNS settings",
+    "impactApplyProxy": "Update system proxy settings",
+    "impactApplyTunnel": "Update tunnel settings",
+    "impactApplyConfirm": "Confirm and apply",
     "restartApplyTitle": "Restart required",
     "restartApplyDescription": "This change needs a restart and will interrupt the current connection.",
     "restartApplyConfirm": "Restart and apply",
@@ -453,7 +474,27 @@
     "restartApplyNamespace": "Network namespace changed.",
     "restartApplyServices": "Service lifecycle settings changed.",
     "restartApplyCache": "Persistent cache path changed.",
+    "restartApplyPersistenceOwner": "The configuration was saved again during the update. Restart to finish applying it.",
+    "restartApplyHostEffects": "The current system network settings require a restart to take over again.",
+    "restartApplyDnsAutoSource": "Changing system DNS takeover changes the automatic DNS source or its availability. Restart the core to apply it.",
     "restartApplyStructural": "A structural runtime setting changed.",
+    "pendingHostEffectsPending": "Applying system settings",
+    "pendingHostCoreCommitted": "Core configuration is active; system settings are pending",
+    "pendingHostEffectsFailed": "System settings need attention",
+    "pendingHostCoreCommittedFailed": "Core configuration is active; system settings need attention",
+    "pendingHostSuperseded": "This settings operation is no longer current. Review the settings for the current connection.",
+    "pendingHostAndDurabilityPending": "System settings are unfinished and configuration saving is unconfirmed. Their states update separately.",
+    "pendingHostWaitDetail": "Waiting for the system settings result. No automatic retry.",
+    "pendingHostFailedDetail": "Unfinished system settings remain pending. A retry starts with a fresh review of its effects.",
+    "pendingRetryHostBtn": "Review system settings again",
+    "pendingCheckHostBtn": "Check system settings",
+    "pendingNativeCleanupUnknown": "Old network entry closure is unconfirmed",
+    "pendingNativeCleanupDetail": "Check the closure status. To recover, disconnect and connect again on Home to restart the core normally; this interrupts connections. Applying settings again does not confirm closure.",
+    "pendingNativeSavedActive": "Configuration is saved and the current core has switched to it.",
+    "pendingNativeActive": "The current core has switched to the updated configuration.",
+    "pendingNativeSaveUnconfirmed": "Configuration saving is still unconfirmed and must be recovered separately.",
+    "pendingNativeHostSettled": "System settings are confirmed; old network entry cleanup remains separate.",
+    "pendingCheckNativeBtn": "Check entry closure",
     "pendingHotApplied": "Applied to the running core.",
     "pendingHotDurabilityPending": "Applied at runtime; persistence is still pending.",
     "pendingRetryPersistenceBtn": "Retry persistence",
@@ -737,7 +778,9 @@
       "privacyPasswordUnset": "Not set — anyone can unlock",
       "privacyPasswordChange": "Change password",
       "privacyPasswordSetBtn": "Set password",
-      "pageTitle": "General"
+      "pageTitle": "General",
+      "privacyPasswordUnknown": "The lock password status has not been read yet.",
+      "privacyPasswordReadFailed": "Could not read the lock password status. Please retry."
     },
     "restartApp": {
       "title": "Restart Polaris to apply",
@@ -1376,7 +1419,8 @@
       "raceCustomHint": "Use literal IP addresses. DoH and DoT share a limit of 3; UDP does not use the encrypted race quota.",
       "raceCustomEmpty": "No custom upstreams",
       "fakeIpFilterEmpty": "No custom exceptions; A/AAAA queries can use FakeIP",
-      "browserDohEmpty": "No endpoints listed; nothing is blocked"
+      "browserDohEmpty": "No endpoints listed; nothing is blocked",
+      "takeoverSystemDnsUnsupported": "This platform does not separately take over system DNS, so this switch has no effect."
     }
   },
   "rules": {
@@ -1851,7 +1895,7 @@
     "startupFailed": "sing-box failed to start. Please check the server configuration",
     "helperRuntimeRestartRequired": "This switch to local execution requires restarting Polaris. Quit Polaris normally, reopen it, then try local execution again.",
     "helperNotInstalledTitle": "Helper not installed or outdated",
-    "helperNotInstalledDesc": "TUN mode requires the privileged helper, but it isn't installed or the installed version is too old. Go to Settings › Helper to install or upgrade it, then try again.",
+    "helperNotInstalledDesc": "This mode uses Helper's protected core. Use the trusted installation flow in Helper settings.",
     "helperNotInstalledAction": "Install",
     "helperGateAborted": "Helper installation cancelled — TUN mode proxy was not started",
     "tunRouteNotCaptured": "Another VPN is holding the default route. Disconnect it first, then try again.",
@@ -1878,7 +1922,9 @@
     "subtitle": "Enter your password to unlock. The proxy keeps running.",
     "unlock": "Unlock",
     "enterPassword": "Enter a password",
-    "unlockFailed": "The unlock attempt could not be completed. Try again."
+    "unlockFailed": "The unlock attempt could not be completed. Try again.",
+    "passwordStatusUnknown": "The lock password status has not been read yet.",
+    "passwordStatusFailed": "Could not read the lock password status. Please retry."
   },
   "appAdd": {
     "catCustom": "Custom…",
@@ -2055,7 +2101,8 @@
       "default": "Default",
       "disabled": "Disable uTLS",
       "loading": "Checking core fingerprint capabilities…",
-      "unavailable": "Fingerprint capabilities unavailable: {{reason}}. Existing settings are retained and checked by the core.",
+      "unavailable": "Fingerprint capabilities are temporarily unavailable, so supported browser fingerprints cannot be listed. Your saved selection is unchanged.",
+      "selectedSupport": "Options reflect the core selected for this app; installation and running status are not verified here.",
       "realityRequired": "REALITY requires uTLS and cannot disable it. Default uses Chrome; a supported browser fingerprint can also be selected.",
       "random": "Random",
       "description": "Default uses Chrome on connections that support uTLS. Disable turns off uTLS while keeping TLS; REALITY cannot disable it. Random selects a browser template once per core process.",
@@ -3015,7 +3062,10 @@
       "intro": "A rule limited to a profile applies only while this phone is on that network, and is skipped automatically when you leave. No reconnect needed.",
       "reasonDhcpNoPermission": "apps on a phone have no permission to ask the router directly (DHCP). Use Auto or System DNS",
       "listEmpty": "Nothing added yet"
-    }
+    },
+    "customAppPackagesUnsupported": "iOS cannot match Android app package names. You can still configure domains or IP addresses for this app.",
+    "customAppMatchIos": "On iOS, matching uses this app’s domains or IP addresses and requires the corresponding rule resources. Process names apply to desktop; Android package names have no effect on iOS.",
+    "appRoutingMatchNoteIos": "On iOS, app routing matches known domains or IP addresses and requires the corresponding rule resources. It cannot identify apps or Android package names, or exclude an app from the system VPN."
   },
   "mobileSettings": {
     "saveFailedWithReason": "Save failed: {{reason}}",
@@ -3029,7 +3079,11 @@
       "bootConnectDesc": "Android can restore the VPN after boot or a drop, and block traffic outside the VPN.",
       "bootConnectPath": "Settings → Network & internet → VPN → Polaris → Always-on VPN",
       "bootConnectOpenFailed": "The system settings page could not be opened — follow the path above.",
-      "privacyLockFailed": "The idle lock did not engage; the screen is still unlocked."
+      "privacyLockFailed": "The idle lock did not engage; the screen is still unlocked.",
+      "autoStartUnsupported": "iOS does not support connecting automatically after boot.",
+      "bootConnectUnsupported": "iOS does not provide Android’s Always-on VPN setting.",
+      "privacyPasswordUnknown": "The lock password status has not been read yet.",
+      "privacyPasswordReadFailed": "Could not read the lock password status. Please retry."
     },
     "dns": {
       "fakeIpOffRisk": "Turning this off under TUN makes nodes receive real IPs instead of domains; providers with strict anti-abuse rules may refuse the connection, and the client cannot mitigate that."
@@ -3045,7 +3099,9 @@
       "desc": "Polaris will request system VPN permission when you connect.",
       "granted": "Granted",
       "denied": "Not granted",
-      "unknown": "Unreadable"
+      "unknown": "Unreadable",
+      "unsupported": "Not applicable",
+      "unsupportedDesc": "This authorization status query is available only on Android. On iOS, the system manages VPN configuration permission when connecting."
     },
     "update": {
       "channelBlock": "App updates",
@@ -3089,7 +3145,8 @@
       "systemBackupTitle": "Allow system backup of app data",
       "systemBackupDesc": "Off by default. When on, Android backs up Polaris app data — including node credentials and subscriptions — to your Google account, and carries it to a new device during a device transfer. Google cloud backups are end-to-end encrypted only on Android 9 or later and only when the device has a screen lock (PIN, pattern or password). After a restore on a new device this switch is off again until you turn it back on. Export above is not affected by this switch.",
       "systemBackupReadFailed": "Could not read the current state of the system backup switch.",
-      "systemBackupReadFailedWithReason": "Could not read the current state of the system backup switch: {{reason}}"
+      "systemBackupReadFailedWithReason": "Could not read the current state of the system backup switch: {{reason}}",
+      "systemBackupUnsupported": "This system backup switch is available only on Android; it does not apply to iOS."
     },
     "about": {
       "licenseBlock": "Licensing",

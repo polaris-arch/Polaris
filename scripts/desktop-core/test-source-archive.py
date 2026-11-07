@@ -81,6 +81,91 @@ class SourceArchiveTests(unittest.TestCase):
             return archive.verify_source_archive(path, pin, COMMIT, tree,
                 [{'path': 'client', 'sha': GITLINK}] if links is None else links, source, linked)
 
+    def test_trusted_profile_is_bound_to_the_committed_formal_source_without_a_path_override(self):
+        selected=json.loads(Path(archive.__file__).with_name('release-contract.json').read_text(encoding='utf-8'))
+        request={key:selected[key] for key in ('sourceCommit','sourceTree','sourceArchive')}
+        request.update(trustedSourceSelection='formal',trustedProducer=selected['producer'])
+        archive._trusted_consumer_selection(request)
+        for delta in ({'trustedSourceSelection':'/tmp/arbitrary-source'}, {'sourceCommit':'0'*40}, {'trustedProducer':{}}):
+            with self.assertRaises(ValueError):archive._trusted_consumer_selection(dict(request,**delta))
+
+    def test_fixed_trusted_selections_read_strict_utf8_with_windows_legacy_default(self):
+        directory = Path(archive.__file__).resolve().parent
+        names = ('release-contract.json', 'native-dns-candidate.json', 'native-dns-source-binding.json')
+        raw_inputs = {directory / name: (directory / name).read_bytes() for name in names}
+        records = {name: json.loads(raw_inputs[directory / name]) for name in names}
+        # Candidate pins are currently ASCII. Inert in-memory text makes both
+        # candidate reads exercise UTF-8 without rewriting any committed input.
+        for name in names[1:]:
+            raw_inputs[directory / name] = json.dumps(
+                {**records[name], 'utf8Control': '\u4e2d\u6587\u201d'}, ensure_ascii=False).encode('utf-8')
+        for raw in raw_inputs.values():
+            with self.assertRaises(UnicodeDecodeError):
+                raw.decode('cp1252')
+        original_read_text = Path.read_text
+        observed = []
+
+        def windows_default_read_text(path, encoding=None, errors=None, **kwargs):
+            observed.append((path, encoding, errors))
+            if path in raw_inputs:
+                return raw_inputs[path].decode(encoding or 'cp1252', errors or 'strict')
+            return original_read_text(path, encoding=encoding or 'cp1252', errors=errors, **kwargs)
+
+        with patch.object(Path, 'read_text', windows_default_read_text):
+            for domain, selected_name, source_name in (
+                    ('formal', names[0], names[0]), ('candidate', names[1], names[2])):
+                selected, source = records[selected_name], records[source_name]
+                request = {key: source[key] for key in ('sourceCommit', 'sourceTree', 'sourceArchive')}
+                request.update(trustedSourceSelection=domain, trustedProducer=selected['producer'])
+                expected_paths = [directory / selected_name]
+                if domain == 'candidate':
+                    expected_paths.append(directory / source_name)
+                with self.subTest(domain=domain):
+                    observed.clear()
+                    archive._trusted_consumer_selection(request)
+                    self.assertEqual(observed, [(path, 'utf-8', None) for path in expected_paths])
+                    for delta in ({'trustedSourceSelection': '/tmp/arbitrary-source'},
+                                  {'sourceCommit': '0' * 40}, {'sourceTree': '0' * 40},
+                                  {'sourceArchive': {}}, {'trustedProducer': {}}):
+                        with self.subTest(delta=delta), self.assertRaises(ValueError):
+                            archive._trusted_consumer_selection(dict(request, **delta))
+                    for path in expected_paths:
+                        original = raw_inputs[path]
+                        try:
+                            raw_inputs[path] = original + b'\xff'
+                            with self.subTest(invalid_utf8=path.name), self.assertRaises(UnicodeDecodeError):
+                                archive._trusted_consumer_selection(request)
+                        finally:
+                            raw_inputs[path] = original
+
+    def test_verified_bytes_survive_archive_replacement_at_the_validator_phase_boundary(self):
+        data,pin,tree,source,linked=self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'source.tar.gz';path.write_bytes(data)
+            replacement=gzip.compress(b'replacement tar must never be opened',mtime=0)
+            seen=[]
+            def boundary(expanded,prefix,rows,producer):
+                path.write_bytes(replacement)
+                with tarfile.open(fileobj=io.BytesIO(expanded),mode='r:') as package:
+                    seen.append(package.extractfile(prefix+'/go.mod').read())
+                self.assertEqual(rows,[{'trustedExecution':{}}])
+            with patch.object(archive,'_validate_trusted_source_rows',side_effect=boundary):
+                archive.verify_source_archive(path,pin,COMMIT,tree,[{'path':'client','sha':GITLINK}],source,linked,
+                    trusted_rows=[{'trustedExecution':{}}],trusted_producer={'runId':7,'runAttempt':1})
+            self.assertEqual(len(seen),1)
+            self.assertIn(b'module example.invalid/fixture',seen[0])
+            self.assertEqual(path.read_bytes(),replacement)
+            # A wrong original tree must still stop before the second phase.
+            path.write_bytes(data)
+            with patch.object(archive,'_validate_trusted_source_rows') as called:
+                with self.assertRaises(ValueError):
+                    archive.verify_source_archive(path,pin,COMMIT,'0'*40,[{'path':'client','sha':GITLINK}],source,linked,
+                        trusted_rows=[{'trustedExecution':{}}],trusted_producer={})
+                called.assert_not_called()
+            with patch.object(archive,'_validate_trusted_source_rows') as called:
+                archive.verify_source_archive(path,pin,COMMIT,tree,[{'path':'client','sha':GITLINK}],source,linked)
+                called.assert_not_called()
+
     def test_source_tree_and_remote_replacement_are_independently_bound(self):
         fixture = self.fixture()
         self.assertEqual(self.verify(fixture), fixture[2])
@@ -176,6 +261,8 @@ class SourceArchiveTests(unittest.TestCase):
             # No optional-content fallback or request-controlled opt-in.
             self.assertNotEqual(check(flag=False).returncode, 0)
             self.assertNotEqual(check({**request, 'legal_pins': True}, flag=False).returncode, 0)
+            self.assertNotEqual(check({key: value for key, value in request.items()
+                                      if key != 'legalFiles'}).returncode, 0)
             for files in [None, [], [legal, legal],
                           [{**legal, 'content': content}],
                           [{k: v for k, v in legal.items() if k != 'sha256'}],
@@ -199,6 +286,63 @@ class SourceArchiveTests(unittest.TestCase):
             self.assertEqual(check(full, flag=False).returncode, 0)
             self.assertNotEqual(check({**full, 'legalFiles': [{**legal, 'content': 'changed'}]},
                                       flag=False).returncode, 0)
+
+    def test_real_cli_legal_inventory_intent_distinguishes_explicit_formal_and_candidate(self):
+        data, pin, tree, source, linked = self.fixture()
+        content = 'synthetic license\n'
+        legal = {'path': 'licenses/LICENSE', 'bytes': len(content.encode()),
+                 'sha256': hashlib.sha256(content.encode()).hexdigest()}
+        selection = {'repository': 'polaris-arch/sing-box-polaris', 'repositoryId': 1421657509,
+                     'sourceCommit': COMMIT, 'sourceTree': tree, 'sourceArchive': pin,
+                     'producer': {'runId': 7, 'runAttempt': 1}}
+        request = {'sourceArchive': pin, 'sourceCommit': COMMIT, 'sourceTree': tree,
+                   'sourceGitlinks': [{'path': 'client', 'sha': GITLINK}], 'sourceIdentity': source,
+                   'buildReplacements': linked, 'trustedRows': [{}],
+                   'trustedProducer': selection['producer']}
+        missing = object()
+        # Expected successes: ordinary, explicit pins, trusted formal, trusted candidate.
+        cases = (('missing', missing, (True, False, False, True)),
+                 ('null', None, (True, False, False, False)),
+                 ('empty', [], (True, False, False, False)),
+                 ('pins', [legal], (False, True, True, True)),
+                 ('content', [{**legal, 'content': content}], (True, False, False, False)))
+        flags = ((), ('--source-legal-pins',), ('--source-trusted-proofs',),
+                 ('--source-legal-pins', '--source-trusted-proofs'),
+                 ('--source-trusted-proofs', '--source-legal-pins'),
+                 ('--source-legal-pins', '--source-legal-pins'),
+                 ('--source-trusted-proofs', '--source-trusted-proofs'))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / 'scripts/desktop-core/release-archive.py'
+            script.parent.mkdir(parents=True)
+            script.write_bytes(Path(archive.__file__).read_bytes())
+            # A private inert CLI installation, not a product selection or proof.
+            # Its exact copied reader verifies real synthetic tar/tree/legal bytes.
+            # Inactive rows claim no execution facts; real schema-backed source
+            # validators remain independently exercised by the closure suite.
+            for name in ('release-contract.json', 'native-dns-candidate.json', 'native-dns-source-binding.json'):
+                script.with_name(name).write_bytes(json.dumps(selection).encode('utf-8'))
+            path = root / 'source.tar.gz'; path.write_bytes(data)
+            for domain in ('formal', 'candidate'):
+                for argv in flags:
+                    for label, files, successes in cases:
+                        payload = {**request, 'trustedSourceSelection': domain}
+                        if files is not missing:
+                            payload['legalFiles'] = files
+                        result = subprocess.run([sys.executable, '-B', str(script), str(path), *argv],
+                            input=json.dumps(payload).encode('utf-8'), capture_output=True, timeout=10)
+                        expected = (successes[0] if not argv else successes[1] if argv == flags[1]
+                                    else successes[2 if domain == 'formal' else 3] if argv == flags[2]
+                                    else False)
+                        with self.subTest(domain=domain, flags=argv, legalFiles=label):
+                            if expected:
+                                self.assertEqual(result.returncode, 0, result.stderr)
+                            else:
+                                self.assertNotEqual(result.returncode, 0, result.stderr)
+                            if len(argv) == 2:
+                                self.assertIn(b'unknown archive profile', result.stderr)
+                            elif argv and label in ('missing', 'null', 'empty') and not expected:
+                                self.assertIn(b'source legal pins inventory missing', result.stderr)
 
     def test_replace_tab_and_specific_version_precedence_follow_go_mod(self):
         for mod in [
@@ -282,8 +426,10 @@ class SourceArchiveTests(unittest.TestCase):
 class ReviewedVendorArchiveTests(unittest.TestCase):
     def fixture(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mobile-core'))
-        from test_source_policy import nine_vendor_fixture, ten_vendor_fixture
-        policy, files, modes, _ = (ten_vendor_fixture if getattr(self, 'v3', False) else nine_vendor_fixture)()
+        from test_source_policy import nine_vendor_fixture, ten_vendor_fixture, eleven_vendor_fixture
+        maker = (eleven_vendor_fixture if getattr(self, 'v4', False) else
+                 ten_vendor_fixture if getattr(self, 'v3', False) else nine_vendor_fixture)
+        policy, files, modes, _ = maker()
         # Reuse the shared nine-vendor data, but derive the complete archive tree
         # independently, including non-vendor files, legal bytes and a gitlink.
         files['LICENSE'] = b'synthetic legal bytes\n'
@@ -384,7 +530,9 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                 elif case == 'path': observed['replacement']['module'] = './third_party/elsewhere'
                 elif case == 'sum': observed['h1'] = 'h1:YQ='
                 else: observed['replacement']['h1'] = 'h1:YQ='
-                with self.subTest(vendor=row['module'], platform=2, case=case), self.assertRaises(ValueError):
+                expected = ('linked reviewed vendor version/path differs' if case in ('version', 'path')
+                            else 'local replacement cannot carry an invented module sum')
+                with self.subTest(vendor=row['module'], platform=2, case=case), self.assertRaisesRegex(ValueError, '^' + expected + '$'):
                     self.verify(changed, data=data)
 
     def test_v2_declarations_reject_omitted_extra_wrong_vendor_path_and_tree(self):
@@ -397,7 +545,15 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'wrong-tree': pin['replacementTree'] = 'f' * 40
             elif case == 'wrong-mode': pin['mode'] = '100644'
             else: pin['replacementFileCount'] += 1
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'missing': (RuntimeError, 'reviewed source policy: exact reviewed vendor names required'),
+                'extra': (RuntimeError, 'reviewed source policy: exact reviewed vendor names required'),
+                'wrong-path': (RuntimeError, r'reviewed source policy: invalid vendor pin: github\.com/sagernet/sing-tun'),
+                'wrong-tree': (ValueError, 'complete reviewed vendor source replacement inventory differs'),
+                'wrong-mode': (RuntimeError, r'reviewed source policy: complete vendor declaration required: github\.com/sagernet/sing-tun'),
+                'wrong-count': (RuntimeError, 'reviewed source policy: vendor inventory differs'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture)
 
     def test_v2_each_vendor_file_inventory_bytes_and_modes_are_bound(self):
@@ -414,7 +570,10 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                 else:
                     fixture['files'] = {p: raw for p, raw in fixture['files'].items() if not p.startswith(prefix)}
                 self.refresh_tree(fixture)
-                with self.subTest(vendor=name, case=case), self.assertRaises((ValueError, RuntimeError)):
+                expected = ('source replacement subtree missing' if case == 'omitted-root'
+                            or (case == 'omitted-file' and pin['replacementFileCount'] == 1)
+                            else 'downloaded local replacement tree differs')
+                with self.subTest(vendor=name, case=case), self.assertRaisesRegex(ValueError, '^' + expected + '$'):
                     self.verify(fixture)
 
     def test_v2_vendor_paths_links_and_special_tar_members_fail_closed(self):
@@ -425,6 +584,8 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                 path = prefix + {'parent': '../escape', 'backslash': 'bad\\name', 'control': 'bad\nname'}[case]
                 fixture['files'][path] = b'unsafe'
                 self.refresh_tree(fixture)
+                # Retained independent vendor pins reject backslash/control at
+                # subtree identity; parent paths fail the earlier tar path guard.
             elif case == 'link-target': fixture['files']['third_party/tailscale/.stignore'] = b'../.gitignore'
             elif case == 'link-regularized': fixture['modes']['third_party/tailscale/.stignore'] = '100644'
             elif case == 'other-link':
@@ -448,7 +609,17 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
                     tree = tree_for(files, modes)
                     fixture['policy']['vendors'][vendor]['replacementTree'] = tree
                     next(pin for pin in fixture['source']['replacements'] if pin['module'] == vendor)['tree'] = tree
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'parent': (ValueError, 'source archive path/duplicate differs'),
+                'backslash': (ValueError, 'downloaded local replacement tree differs'),
+                'control': (ValueError, 'downloaded local replacement tree differs'),
+                'link-target': (RuntimeError, 'reviewed source policy: unexpected vendor symlink'),
+                'link-regularized': (ValueError, 'downloaded local replacement tree differs'),
+                'other-link': (RuntimeError, 'reviewed source policy: unexpected vendor symlink'),
+                'hardlink': (ValueError, 'source special/gitlink or entry limit'),
+                'special-mode': (ValueError, 'source duplicate/oversized/special-mode file'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture, data=data)
 
     def test_v2_vendor_file_budget_is_checked_before_reading_body(self):
@@ -503,7 +674,19 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'legal': fixture['legal'][0]['content'] = 'changed'
             elif case == 'gitlink': fixture['gitlinks'] = []
             else: fixture['linked'][-1]['replacement']['h1'] = 'h1:Yg='
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'archive-sha': (ValueError, 'source archive SHA differs'),
+                'archive-size': (ValueError, 'source archive size differs'),
+                'transport': (ValueError, 'fixed commit source transport differs'),
+                'url': (ValueError, 'fixed commit source transport differs'),
+                'tree': (ValueError, 'downloaded source archive Git tree differs'),
+                'module': (RuntimeError, 'reviewed source policy: goModSha256 differs'),
+                'overlay': (ValueError, 'source overlay unsupported'),
+                'legal': (ValueError, 'source legal identity differs'),
+                'gitlink': (ValueError, 'empty source directory/gitlink cannot prove a Git tree'),
+                'remote-sum': (ValueError, 'linked remote replacement version/checksum differs from source'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture, data=data, record_change=record)
 
     def test_v2_retains_actual_module_legal_and_meta_proof_bytes(self):
@@ -514,7 +697,16 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             if case.startswith('missing-'): fixture['files'].pop(path)
             else: fixture['files'][path] += b'changed'
             self.refresh_tree(fixture)
-            with self.subTest(case=case), self.assertRaises((ValueError, RuntimeError)):
+            error, expected = {
+                'go.mod': (ValueError, 'downloaded source module bytes differ'),
+                'go.sum': (ValueError, 'downloaded source module bytes differ'),
+                'LICENSE': (ValueError, 'source legal bytes/inventory differ'),
+                'binding': (RuntimeError, 'reviewed source policy: actual Meta binding differs'),
+                'patch': (RuntimeError, 'reviewed source policy: actual Meta patch differs'),
+                'missing-binding': (RuntimeError, 'reviewed source policy: actual Meta binding differs'),
+                'missing-patch': (RuntimeError, 'reviewed source policy: actual Meta patch differs'),
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(error, '^' + expected + '$'):
                 self.verify(fixture)
 
     def test_v2_source_identity_is_exactly_the_reviewed_nine_roots(self):
@@ -524,7 +716,7 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'unknown': replacement['module'] = 'example.invalid/unknown'
             elif case == 'wrong-tree': replacement['tree'] = 'f' * 40
             else: replacement['path'] = './third_party/tailscale'
-            with self.subTest(case=case), self.assertRaises(ValueError):
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, '^complete reviewed vendor source replacement inventory differs$'):
                 self.verify(fixture)
 
     def test_v2_vendor_collection_uses_32_mib_not_the_legacy_meta_budget(self):
@@ -549,7 +741,16 @@ class ReviewedVendorArchiveTests(unittest.TestCase):
             elif case == 'sum': fixture['linked'][0]['replacement']['h1'] = 'h1:YQ='
             elif case == 'version': fixture['linked'][0]['replacement']['version'] = 'v1.0.0'
             else: fixture['linked'][0]['version'] = 'v9.9.9'
-            with self.subTest(case=case), self.assertRaisesRegex(ValueError, 'local replacement|vendor'):
+            expected = {
+                'pruned': 'complete source/linked local replacement inventory differs',
+                'source-and-linked-pruned': 'complete reviewed vendor source replacement inventory differs',
+                'extra': 'complete source/linked local replacement inventory differs',
+                'path': 'linked reviewed vendor version/path differs',
+                'sum': 'local replacement cannot carry an invented module sum',
+                'version': 'local replacement cannot carry an invented module sum',
+                'vendor-version': 'linked reviewed vendor version/path differs',
+            }[case]
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, '^' + expected + '$'):
                 self.verify(fixture)
 
 
@@ -557,6 +758,231 @@ class ReviewedTenVendorArchiveTests(ReviewedVendorArchiveTests):
     # Re-run the same real archive reader and all negative controls on the
     # explicit ten-vendor schema; original v2 fixture semantics stay unchanged.
     v3 = True
+
+
+class ReviewedElevenVendorArchiveTests(ReviewedVendorArchiveTests):
+    # The same complete archive, mode/tree, legal, linked and budget controls
+    # now cover the explicit eleven-vendor schema; old fixtures stay unchanged.
+    v4 = True
+
+    def test_v4_does_not_relabel_the_eleven_vendor_archive_as_v3(self):
+        fixture = self.fixture()
+        self.assertEqual(fixture['policy']['schema'], 'polaris-reviewed-kernel-source-v4')
+        self.assertEqual(len(fixture['policy']['vendors']), 11)
+        self.assertIn('github.com/libp2p/go-nat', fixture['policy']['vendors'])
+        self.assertEqual(self.verify(fixture), fixture['policy']['sourceTree'])
+        fixture['policy']['schema'] = 'polaris-reviewed-kernel-source-v3'
+        with self.assertRaisesRegex(RuntimeError, 'exact reviewed vendor names'):
+            self.verify(fixture)
+
+
+class RealSourceValidatorClosureTests(unittest.TestCase):
+    """Actual source-owned validators and inert source-control rows; no native issuer/PASS.
+
+    The one bounded fixture contains exact offline validator Python source,
+    its true read closure and existing source-control helper function slices.
+    It contains no executable native payload and is never an App selection.
+    """
+    @staticmethod
+    def files():
+        import base64
+        record=json.loads(Path(__file__).with_name('fixtures').joinpath('trusted-validator-source.json').read_bytes())
+        packed=base64.b64decode(record['gzipBase64'],validate=True)
+        with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:raw=stream.read(8*1024*1024+1)
+        assert len(raw)==record['uncompressedBytes'] and len(raw)<=8*1024*1024
+        assert hashlib.sha256(raw).hexdigest()==record['uncompressedSha256']
+        files={name:base64.b64decode(data,validate=True) for name,data in json.loads(raw).items()}
+        for proof in record['sourceFiles']:
+            if proof['role']=='exact-readonly-source':
+                assert hashlib.sha256(files[proof['path']]).hexdigest()==proof['sha256']
+        return files
+
+    @staticmethod
+    def expanded(files, extras=()):
+        result=io.BytesIO()
+        with tarfile.open(fileobj=result,mode='w') as package:
+            for relative,data in sorted(files.items()):
+                member=tarfile.TarInfo('source-fixture/'+relative);member.size=len(data);member.mode=0o644
+                package.addfile(member,io.BytesIO(data))
+            for member,data in extras:package.addfile(member,io.BytesIO(data) if data is not None else None)
+        return result.getvalue()
+
+    @classmethod
+    def rows(cls,files):
+        # Build only the existing inert source-control DTOs. The actual data
+        # validators read their real module/profile/schema files while doing so.
+        import importlib
+        names=('native_release_index','tls_fingerprint_probe','windows_native_execution','polaris_version','release_identity',
+               'test_native_release_index','test_tls_fingerprint_probe','test_windows_native_execution','cronet_windows_overlay')
+        saved={name:sys.modules[name] for name in names if name in sys.modules}
+        for name in names:sys.modules.pop(name,None)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for relative,data in files.items():
+                path=root/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+            sys.path.insert(0,str(root/'scripts/ci'))
+            try:
+                controls=importlib.import_module('test_native_release_index')
+                windows=importlib.import_module('test_windows_native_execution')
+                return [controls.sealed_row_fixture(),controls.MacNativeExecutionControls().fixture()[0],windows.windows_row_fixture()]
+            finally:
+                sys.path.pop(0)
+                for name in names:sys.modules.pop(name,None)
+                sys.modules.update(saved)
+
+    def test_real_linux_macos_windows_validators_receive_the_complete_read_closure(self):
+        files=self.files();expanded=self.expanded(files)
+        selected=archive._trusted_validator_contents(expanded,'source-fixture')
+        for required in ('release/GO_VERSION','option/tls.go','release/polaris-candidate-inputs.json',
+                         'release/dependency-sources/metacubex-utls-replacement.json',
+                         'release/dependency-sources/metacubex-utls-reality-alpn.patch',
+                         'scripts/ci/windows_native_execution.py','scripts/ci/cronet_windows_overlay.py',
+                         'release/dependency-sources/cronet-go-windows-native-observation.json',
+                         'release/dependency-sources/cronet-go-windows-native-observation.patch',
+                         'release/dependency-sources/cronet-go-replacement.json',
+                         'release/dependency-sources/cronet-go-client-admission.patch'):
+            self.assertEqual(selected[required],files[required])
+        meta=json.loads(files['release/dependency-sources/metacubex-utls-replacement.json'])
+        self.assertEqual(set(selected),set(archive.TRUSTED_VALIDATOR_FILES)|{archive.TRUSTED_META_ROOT+name for name in meta['files']}|{name for name in files if name.startswith(archive.TRUSTED_CRONET_ROOT)})
+        self.assertEqual(sum(name.startswith(archive.TRUSTED_CRONET_ROOT) for name in selected),137)
+        self.assertNotIn('scripts/ci/test_native_release_index.py',selected)
+        self.assertNotIn('scripts/ci/windows_native_admission.py',selected)
+        with patch('subprocess.Popen',side_effect=AssertionError('data validator must not run a producer/CLI')), \
+             patch('subprocess.run',side_effect=AssertionError('data validator must not run a producer/CLI')), \
+             patch('subprocess.check_output',side_effect=AssertionError('data validator must not run a producer/CLI')):
+            rows=self.rows(files)
+            self.assertEqual({row['target'].split('/')[0] for row in rows},{'linux','darwin','windows'})
+            import types
+            foreign=types.ModuleType('tls_fingerprint_probe')
+            def refuse(name):raise AssertionError('foreign-source validator module reused: '+name)
+            foreign.__getattr__=refuse
+            with patch.dict(sys.modules,{'tls_fingerprint_probe':foreign,'cronet_windows_overlay':foreign}):
+                archive._validate_trusted_source_rows(expanded,'source-fixture',rows,{'runId':42,'runAttempt':1})
+                self.assertIs(sys.modules['tls_fingerprint_probe'],foreign)
+                self.assertIs(sys.modules['cronet_windows_overlay'],foreign)
+        with self.assertRaises(ValueError):
+            archive._validate_trusted_source_rows(expanded,'source-fixture',rows,{'runId':43,'runAttempt':1})
+        wrong=deepcopy(rows);wrong[0]['trustedExecution']['purposes'].reverse()
+        with self.assertRaises(ValueError):
+            archive._validate_trusted_source_rows(expanded,'source-fixture',wrong,{'runId':42,'runAttempt':1})
+        # This is source-data validation only; not a native execution receipt.
+        for missing in ('release/GO_VERSION','option/tls.go','go.mod','go.sum','release/polaris-candidate-inputs.json',
+                        'release/dependency-sources/metacubex-utls-replacement.json',
+                        'release/dependency-sources/metacubex-utls-reality-alpn.patch',
+                        'scripts/ci/cronet_windows_overlay.py',
+                        'release/dependency-sources/cronet-go-windows-native-observation.json',
+                        'release/dependency-sources/cronet-go-windows-native-observation.patch',
+                        'release/dependency-sources/cronet-go-replacement.json',
+                        'release/dependency-sources/cronet-go-client-admission.patch'):
+            changed=dict(files);del changed[missing]
+            with self.subTest(missing=missing),self.assertRaisesRegex(ValueError,'regular source missing'):
+                archive._trusted_validator_contents(self.expanded(changed),'source-fixture')
+
+    @staticmethod
+    def real_unselected_at_names():
+        # Exact Git member names from Core dcc80eba94b786a84e099260b1d87eb225a65003.
+        # Payloads below are inert data: these members are never selected/imported.
+        keys=('4a6a0840','5243ef4b','524d27bb','5261cecb','58199dcc','58cbb476',
+              '58e4f17d','5e69ca50','60ac2099','6165ee59','61666e3f','616a9724',
+              '616abc23','616ac3bc','616adfeb','616ae350','616db30d','66ba20fe')
+        root='release/dependency-sources/oci/aports/b9f23becced4d7b3ccc0fa0f28530243ccd314a0/main/alpine-keys/'
+        return ['release/config/sing-box@.service']+[
+            root+'alpine-devel@lists.alpinelinux.org-'+key+'.rsa.pub' for key in keys]
+
+    def test_real_unselected_at_paths_do_not_block_same_source_data_validators(self):
+        files=self.files();names=self.real_unselected_at_names()
+        self.assertEqual(len(names),19)
+        full=dict(files);full.update({name:b'unselected ordinary Git blob\n' for name in names})
+        # Exercise safe Git characters beyond @ as raw, unselected member names.
+        full.update({'notes/a name=with,percent%[1].txt':b'data only',
+                     'notes/说明(1).txt':b'data only'})
+        link=tarfile.TarInfo('source-fixture/notes/opaque-link')
+        link.type=tarfile.SYMTYPE;link.linkname='../go.mod'
+        expanded=self.expanded(full,[(link,None)])
+        selected=archive._trusted_validator_contents(expanded,'source-fixture')
+        self.assertEqual(selected,archive._trusted_validator_contents(self.expanded(files),'source-fixture'))
+        self.assertTrue(all(name not in selected for name in names))
+        # Real same-source Linux/Mac/Windows data validators, not a policy stub.
+        # No native process/issuer is constructed by this ordinary source fixture.
+        archive._validate_trusted_source_rows(expanded,'source-fixture',self.rows(files),{'runId':42,'runAttempt':1})
+
+    def test_whole_tar_structure_and_fixed_selected_path_domains_remain_separate(self):
+        for name in self.real_unselected_at_names()+['notes/a name=with,percent%[1].txt','notes/说明(1).txt']:
+            full='source-fixture/'+name
+            self.assertEqual(archive.source_tar_member_name(full,False,'source-fixture'),full)
+            with self.assertRaisesRegex(ValueError,'unsafe archive path'):
+                archive.archive_name(full,False,'source-fixture')
+        for name in ('/source-fixture/absolute','source-fixture//empty','source-fixture/./dot',
+                     'source-fixture/../parent','source-fixture/back\\slash','source-fixture/C:drive',
+                     'source-fixture/nul\0name','source-fixture/line\nname','source-fixture/tab\tname',
+                     'source-fixture/file/','source-fixture'):
+            with self.subTest(name=repr(name)),self.assertRaisesRegex(ValueError,'unsafe source archive path'):
+                archive.source_tar_member_name(name,False,'source-fixture')
+        files=self.files();bad=archive.TRUSTED_META_ROOT+'not-selected@.go'
+        manifest=json.loads(files['release/dependency-sources/metacubex-utls-replacement.json'])
+        manifest['files']['not-selected@.go']=dict(next(iter(manifest['files'].values())))
+        files['release/dependency-sources/metacubex-utls-replacement.json']=json.dumps(manifest).encode()
+        files[bad]=b'data only'
+        with self.assertRaisesRegex(ValueError,'unsafe archive path'):
+            archive._trusted_validator_contents(self.expanded(files),'source-fixture')
+        parent=tarfile.TarInfo('source-fixture/notes/link-parent');parent.type=tarfile.SYMTYPE
+        parent.linkname='../elsewhere'
+        child=tarfile.TarInfo('source-fixture/notes/link-parent/child');child.size=1
+        for extras in ([(parent,None),(child,b'x')],[(child,b'x'),(parent,None)]):
+            with self.assertRaises(ValueError):
+                archive._trusted_validator_contents(self.expanded(self.files(),extras),'source-fixture')
+        for kind in (tarfile.LNKTYPE,tarfile.FIFOTYPE,tarfile.CHRTYPE):
+            item=tarfile.TarInfo('source-fixture/notes/not-regular');item.type=kind;item.linkname='source-fixture/go.mod'
+            with self.subTest(kind=kind),self.assertRaisesRegex(ValueError,'special or hardlink member'):
+                archive._trusted_validator_contents(self.expanded(self.files(),[(item,None)]),'source-fixture')
+
+    def test_real_overlay_data_validator_rejects_missing_extra_changed_history_patch_tree_and_mode(self):
+        files=self.files();rows=self.rows(files)
+        vendor=next(name for name in sorted(files) if name.startswith(archive.TRUSTED_CRONET_ROOT))
+        for case in ('missing-current','extra-current','changed-current','historical','overlay-patch','tree-proof'):
+            changed=dict(files)
+            if case=='missing-current':del changed[vendor]
+            elif case=='extra-current':changed[archive.TRUSTED_CRONET_ROOT+'extra.go']=b'package dataonly\n'
+            elif case=='changed-current':changed[vendor]+=b'changed'
+            elif case=='historical':changed['release/dependency-sources/cronet-go-client-admission.patch']+=b'changed'
+            elif case=='overlay-patch':changed['release/dependency-sources/cronet-go-windows-native-observation.patch']+=b'changed'
+            else:
+                name='release/dependency-sources/cronet-go-windows-native-observation.json'
+                manifest=json.loads(changed[name]);manifest['baseTreeProof'][0]['gitTree']='0'*40
+                changed[name]=json.dumps(manifest).encode()
+            with self.subTest(case=case),self.assertRaises(ValueError):
+                archive._validate_trusted_source_rows(self.expanded(changed),'source-fixture',rows,{'runId':42,'runAttempt':1})
+        empty=tarfile.TarInfo('source-fixture/'+archive.TRUSTED_CRONET_ROOT+'extra-empty')
+        empty.type=tarfile.DIRTYPE
+        with self.assertRaisesRegex(ValueError,'Cronet directory inventory differs'):
+            archive._trusted_validator_contents(self.expanded(files,[(empty,None)]),'source-fixture')
+        for kind in ('symlink','hardlink','executable'):
+            changed=dict(files);data=changed.pop(vendor)
+            item=tarfile.TarInfo('source-fixture/'+vendor);item.size=len(data);item.mode=0o644
+            if kind=='symlink':item.type=tarfile.SYMTYPE;item.linkname='/outside';data=None
+            elif kind=='hardlink':item.type=tarfile.LNKTYPE;item.linkname='source-fixture/go.mod';data=None
+            else:item.mode=0o755
+            with self.subTest(kind=kind),self.assertRaisesRegex(ValueError,
+                    'special or hardlink member' if kind=='hardlink' else 'Cronet regular source mode differs'):
+                archive._trusted_validator_contents(self.expanded(changed,[(item,data)]),'source-fixture')
+
+    def test_independent_extraction_rejects_unsafe_duplicate_conflicting_and_nonregular_members(self):
+        files=self.files()
+        attacks=[]
+        for name in ('/source-fixture/evil','source-fixture/../evil','source-fixture/a\\b','source-fixture/C:evil'):
+            item=tarfile.TarInfo(name);item.size=1;attacks.append((item,b'x'))
+        duplicate=tarfile.TarInfo('source-fixture/go.mod');duplicate.size=1;attacks.append((duplicate,b'x'))
+        parent=tarfile.TarInfo('source-fixture/scripts');parent.size=1;attacks.append((parent,b'x'))
+        for attack in attacks:
+            with self.subTest(name=attack[0].name),self.assertRaises(ValueError):
+                archive._trusted_validator_contents(self.expanded(files,[attack]),'source-fixture')
+        extra=tarfile.TarInfo('source-fixture/third_party/metacubex-utls/extra.go');extra.size=1
+        with self.assertRaisesRegex(ValueError,'Meta inventory differs'):
+            archive._trusted_validator_contents(self.expanded(files,[(extra,b'x')]),'source-fixture')
+        changed=dict(files);del changed['release/GO_VERSION']
+        link=tarfile.TarInfo('source-fixture/release/GO_VERSION');link.type=tarfile.SYMTYPE;link.linkname='/tmp/outside'
+        with self.assertRaisesRegex(ValueError,'regular source missing'):
+            archive._trusted_validator_contents(self.expanded(changed,[(link,None)]),'source-fixture')
 
 
 if __name__ == '__main__': unittest.main()

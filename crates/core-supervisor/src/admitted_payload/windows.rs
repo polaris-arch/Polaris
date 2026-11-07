@@ -51,18 +51,23 @@ pub(super) fn declaration(
         || value["sourceCommit"] != source
         || value["sourceTree"] != tree
         || value["loader"] != LOADER
-        || value["purposes"] != serde_json::json!(["run-main-v1"])
+        || value["purposes"] != serde_json::json!(["check-config-v1", "run-main-v1"])
     {
         return Err(unavailable());
     }
-    Ok((vec![ExecPurpose::RunMain], LOADER.into()))
+    Ok((
+        vec![ExecPurpose::CheckConfig, ExecPurpose::RunMain],
+        LOADER.into(),
+    ))
 }
 
 pub(super) fn protect_members(
     input: &UntrustedPayload,
     policy: &SelectedPolicy,
 ) -> Result<ProtectedMembers, AdmissionError> {
-    if policy.loader != LOADER || policy.purposes != [ExecPurpose::RunMain] {
+    if policy.loader != LOADER
+        || policy.purposes != [ExecPurpose::CheckConfig, ExecPurpose::RunMain]
+    {
         return Err(unavailable());
     }
     Ok(ProtectedMembers {
@@ -82,8 +87,8 @@ impl ProtectedMembers {
 /// raw File constructor is exposed to the caller.
 pub struct WindowsStartedChild {
     process: OwnedHandle,
-    stdout: File,
-    stderr: File,
+    stdout: Option<File>,
+    stderr: Option<File>,
     custody: WindowsChildCustody,
     pid: u32,
 }
@@ -92,8 +97,8 @@ impl WindowsStartedChild {
         (
             self.pid,
             self.process,
-            self.stdout,
-            self.stderr,
+            self.stdout.expect("main stdout"),
+            self.stderr.expect("main stderr"),
             self.custody,
         )
     }
@@ -115,6 +120,7 @@ impl PreparedExecution {
         &self,
         config: File,
         cwd: &Path,
+        runtime_directory: &Path,
     ) -> Result<WindowsStartedChild, AdmissionError> {
         // Serialize queued-plan recheck through ResumeThread with replacement/
         // retirement. No future may outlive this gate by retaining a Command.
@@ -128,9 +134,142 @@ impl PreparedExecution {
         if self.purpose != ExecPurpose::RunMain {
             return Err(unavailable());
         }
-        issuer::spawn(&self.payload.protected.inner, config, cwd)
+        issuer::spawn(
+            &self.payload.protected.inner,
+            config,
+            cwd,
+            ExecPurpose::RunMain,
+            Some(runtime_directory),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// Check child custody never exposes a process handle or mutable native command.
+pub(crate) struct WindowsCheckChild {
+    child: WindowsStartedChild,
+}
+#[allow(
+    unsafe_code,
+    reason = "wait and terminate only the retained exact Check process HANDLE"
+)]
+impl WindowsCheckChild {
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::os::windows::{io::AsRawHandle, process::ExitStatusExt};
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+        };
+        match unsafe { WaitForSingleObject(self.child.process.as_raw_handle(), 0) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut code = 0;
+                if unsafe { GetExitCodeProcess(self.child.process.as_raw_handle(), &mut code) } == 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(Some(std::process::ExitStatus::from_raw(code)))
+            }
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        if unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(
+                self.child.process.as_raw_handle(),
+                1,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    pub(crate) fn take_stdout(&mut self) -> Option<File> {
+        self.child.stdout.take()
+    }
+    pub(crate) fn take_stderr(&mut self) -> Option<File> {
+        self.child.stderr.take()
+    }
+}
+pub(crate) struct WindowsCheckInput {
+    execution: Option<PreparedExecution>,
+    snapshot: issuer::check_input::CheckSnapshot,
+}
+impl WindowsCheckInput {
+    pub(crate) fn append(&mut self, offset: usize, bytes: &[u8]) -> Result<(), AdmissionError> {
+        self.snapshot.append(offset, bytes)
+    }
+    pub(crate) fn seal(&mut self, len: usize, digest: &[u8; 32]) -> Result<(), AdmissionError> {
+        self.snapshot.seal(len, digest)
+    }
+    pub(crate) fn retire(&mut self) -> Result<(), AdmissionError> {
+        self.snapshot.retire()
+    }
+    pub(crate) fn spawn(&mut self) -> Result<WindowsCheckChild, AdmissionError> {
+        let execution = self.execution.take().ok_or_else(unavailable)?;
+        let slot = SLOT
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| unavailable())?;
+        if !slot
+            .as_ref()
+            .is_some_and(|p| Arc::ptr_eq(p, &execution.payload))
+            || execution.purpose != ExecPurpose::CheckConfig
+        {
+            return Err(unavailable());
+        }
+        execution.payload.prepare(ExecPurpose::CheckConfig)?;
+        let input = self.snapshot.input()?;
+        let cwd = execution.payload.protected.inner.root_directory();
+        let child = issuer::spawn(
+            &execution.payload.protected.inner,
+            input,
+            &cwd,
+            ExecPurpose::CheckConfig,
+            None,
+        )?;
+        Ok(WindowsCheckChild { child })
+    }
+}
+impl PreparedExecution {
+    pub(crate) fn windows_check_input(
+        self,
+        _lease: &File,
+    ) -> Result<WindowsCheckInput, AdmissionError> {
+        if self.purpose != ExecPurpose::CheckConfig {
+            return Err(unavailable());
+        }
+        self.payload.prepare(self.purpose)?;
+        let snapshot =
+            issuer::check_input::CheckSnapshot::create(Arc::clone(&self.payload.protected.inner))?;
+        Ok(WindowsCheckInput {
+            execution: Some(self),
+            snapshot,
+        })
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "OS CSPRNG produces correlation data, never an execution credential"
+)]
+pub(crate) fn check_correlation() -> Result<polaris_helper_proto::HelperBirthToken, AdmissionError>
+{
+    let mut bytes = [0u8; 16];
+    if unsafe {
+        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    } != 0
+    {
+        return Err(unavailable());
+    }
+    Ok(polaris_helper_proto::HelperBirthToken::from_bytes(bytes))
+}

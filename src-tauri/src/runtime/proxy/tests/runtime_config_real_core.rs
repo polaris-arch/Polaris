@@ -3436,6 +3436,7 @@ async fn real_hot_public_rpc_contract() {
         overrides: None,
         expected_control_revision: running.initial.control_revision,
         selector_intents: vec![],
+        client_impact_policy_version: 0,
     };
     let no_op = running
         .client

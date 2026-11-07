@@ -578,8 +578,8 @@ fn stop_requires_an_exact_stop_receipt() {
 fn managed_core_status_parses_native_birth_metadata_and_empty_view() {
     let target = birth_target(4242, "00112233445566778899aabbccddeeff");
     for (wire, expected) in [
-        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: None, image: None }),
-        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff created=133600000000000000 image=433a5c50726f6772616d2046696c65735c506f6c617269735c73696e672d626f782e657865\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: Some(133_600_000_000_000_000), image: Some(r"C:\Program Files\Polaris\sing-box.exe".into()) }),
+        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: None, image: None, core:None }),
+        (b"OK native-birth-status running 4242 00112233445566778899aabbccddeeff created=133600000000000000 image=433a5c50726f6772616d2046696c65735c506f6c617269735c73696e672d626f782e657865\n".to_vec(), ManagedCoreStatus::NativeBirthRunning { target, created: Some(133_600_000_000_000_000), image: Some(r"C:\Program Files\Polaris\sing-box.exe".into()),core:None }),
         (b"OK native-birth-status empty\n".to_vec(), ManagedCoreStatus::BirthEmpty),
         (b"OK native-birth-status unknown\n".to_vec(), ManagedCoreStatus::BirthUnidentified),
     ] {
@@ -841,6 +841,12 @@ fn status_serializes_frontend_keys() {
 
 #[test]
 fn install_missing_binary_returns_failure_without_escalation() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "install_missing_binary_returns_failure_without_escalation",
+    ) {
+        return;
+    }
     // 无 bundled polaris-helper（且未设 POLARIS_HELPER_PATH）→ install 早返失败，绝不弹提权框。
     // 尾部 `r.status.installed` 由替身给定（见 `runtime()`），不再赖「跑测机器没装过」。
     std::env::remove_var("POLARIS_HELPER_PATH");
@@ -858,6 +864,12 @@ fn install_missing_binary_returns_failure_without_escalation() {
 
 #[test]
 fn action_result_serializes_stable_code_diagnostic_and_status() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "action_result_serializes_stable_code_diagnostic_and_status",
+    ) {
+        return;
+    }
     let (rt, _d) = runtime();
     let json = serde_json::to_value(rt.install()).unwrap();
     assert!(json.get("success").is_some());
@@ -1693,4 +1705,102 @@ fn independent_recovery_target_receipt_never_relabels_helper_cancel_as_global_su
     assert_eq!(wire["errorCode"], "cancelled");
     assert_eq!(wire["recovery"]["user"], "installed");
     assert_eq!(wire["recovery"]["helperComplete"], false);
+}
+
+#[test]
+fn native_status_parser_keeps_real_mac_core_binding_without_inventing_os_fields() {
+    let wire = format!(
+        "OK native-birth-status running 4242 00112233445566778899aabbccddeeff core={}\n",
+        "a".repeat(64)
+    );
+    // The closed connector supplies OS-root authentication; this parser fixture is data only.
+    assert!(matches!(
+        polaris_helper_proto::Response::parse(wire.trim()),
+        polaris_helper_proto::Response::Ok(polaris_helper_proto::ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Running {
+                created: None,
+                image: None,
+                core: Some(_),
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
+fn explicit_linux_runtime_directory_is_negotiated_without_changing_legacy_frames() {
+    let dir = TestDir::new("polaris-helper-runtime-root-");
+    let state = dir.join("state 测试");
+    std::fs::create_dir(&state).unwrap();
+    assert!(state.is_absolute());
+    let directory = state.to_str().unwrap();
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    let cfg = state.join("core config.json");
+    let log = state.join("core 日志.log");
+    for (version, explicit) in [
+        ("OK 3\n", false),
+        ("OK 4\n", true),
+        ("ERR unknown\n", false),
+        ("OK nonsense\n", false),
+    ] {
+        let (client, connects, frames) = stop_test_client_with_frames(
+            Platform::Linux,
+            vec![
+                polaris_helper_client::MockStream::with_response(version.as_bytes().to_vec()),
+                polaris_helper_client::MockStream::with_response(b"ERR unknown\n".to_vec()),
+            ],
+        );
+        let negotiated = linux_runtime_directory_with_client(&client, &state).unwrap();
+        assert_eq!(negotiated.as_deref(), explicit.then_some(directory));
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        assert_eq!(frames.lock().unwrap().as_slice(), ["version\n"]);
+        let request =
+            Request::LinuxStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+                id: id.clone(),
+                runtime_directory: negotiated,
+                common: StartParams {
+                    cfg: cfg.to_str().unwrap().to_owned(),
+                    log: log.to_str().unwrap().to_owned(),
+                    fwd: false,
+                    parent_pid: None,
+                },
+            });
+        client.send(&request).unwrap();
+        let extension = if explicit {
+            format!("\nruntime-root-v1={directory}\n")
+        } else {
+            String::new()
+        };
+        let expected = format!(
+            "start-pinned-birth-safe\n{}\n{}\n{}\n{}\n0\n{extension}",
+            polaris_helper_proto::core_protocol::PINNED_EXECUTION_DISCRIMINATOR,
+            id.as_str(),
+            cfg.to_str().unwrap(),
+            log.to_str().unwrap(),
+        );
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        let sent = frames.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], "version\n");
+        assert_eq!(sent[1].as_bytes(), expected.as_bytes());
+    }
+    let (client, connects, frames) = stop_test_client_with_frames(Platform::Win, vec![]);
+    assert_eq!(
+        linux_runtime_directory_with_client(&client, &state).unwrap(),
+        None
+    );
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    assert!(frames.lock().unwrap().is_empty());
+    let (client, connects, frames) = stop_test_client_with_frames(
+        Platform::Linux,
+        vec![polaris_helper_client::MockStream::with_response(
+            b"OK 4\n".to_vec(),
+        )],
+    );
+    assert!(linux_runtime_directory_with_client(&client, Path::new("relative")).is_err());
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    assert_eq!(frames.lock().unwrap().as_slice(), ["version\n"]);
+    let source = crate_code("runtime/helper.rs");
+    assert!(source
+        .contains("runtime_directory: linux_runtime_directory_with_client(&client, &self.dir)?"));
 }

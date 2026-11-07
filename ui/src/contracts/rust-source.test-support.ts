@@ -76,21 +76,102 @@ export function moduleSource(relModule: string): string {
   return read(relModule, false, '生产');
 }
 
-/** First named function in the supplied scope; brace matching ignores comments and literals. */
-export function rustFunctionSource(source: string, name: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`Invalid Rust function name: ${name}`);
-  const masked = maskRustCommentsAndStrings(source);
-  const declaration = new RegExp(`\\bfn\\s+${name}\\s*\\([^;{]*\\)[^;{]*\\{`).exec(masked);
-  if (!declaration) throw new Error(`Missing Rust function: ${name}`);
-  const opening = masked.indexOf('{', declaration.index);
-  let depth = 1;
-  for (let end = opening + 1; end < masked.length; end++) {
-    if (masked[end] === '{') depth++;
-    if (masked[end] === '}' && --depth === 0) {
-      return maskRustComments(source).slice(declaration.index, end + 1);
+/** A balanced Rust header/body group; literals/comments are already masked. */
+function rustFunctionGroupEnd(code: string, opening: number, limit: number, name: string): number {
+  const pairs: Record<string, string> = { '(': ')', '[': ']', '{': '}', '<': '>' };
+  const stack = [code[opening]];
+  for (let at = opening + 1; at < limit; at++) {
+    const token = code[at];
+    // A braced const expression/body may contain comparisons and shifts. Angle
+    // brackets outside those expressions are type/generic delimiters; an arrow
+    // in a Fn bound or function-pointer type does not close a generic parameter.
+    const inBraces = stack.includes('{');
+    if (token === '(' || token === '[' || token === '{' || (token === '<' && !inBraces)) {
+      stack.push(token);
+    } else if (token === ')' || token === ']' || token === '}' || (token === '>' && !inBraces && code[at - 1] !== '-')) {
+      if (pairs[stack[stack.length - 1]] !== token) {
+        throw new Error(`Mismatched Rust function delimiter: ${name}`);
+      }
+      stack.pop();
+      if (stack.length === 0) return at + 1;
+    } else if (token === ';' && stack.length === 1 && stack[0] === '<') {
+      throw new Error(`Invalid Rust function generic parameters: ${name}`);
     }
   }
-  throw new Error(`Unclosed Rust function: ${name}`);
+  throw new Error(`Unclosed Rust function delimiter: ${name}`);
+}
+
+/**
+ * First definition of the named function in the supplied scope. Balance the
+ * optional generic parameters, parameters and return/where types before taking
+ * its body; a trait declaration or malformed header cannot borrow the next body.
+ * This is a bounded source extractor, not a Rust type/semantic parser.
+ */
+export function rustFunctionSource(source: string, name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`Invalid Rust function name: ${name}`);
+  // Both masks preserve UTF-8 byte offsets. A Latin1 view makes each parser index
+  // one byte wide, including before/inside Unicode literals and identifiers. Slice
+  // the comment-masked UTF-8 buffer with those same indices, then decode once.
+  const masked = Buffer.from(maskRustCommentsAndStrings(source), 'utf8').toString('latin1');
+  const visible = Buffer.from(maskRustComments(source), 'utf8');
+  const declarations = new RegExp(`\\bfn\\s+${name}(?![A-Za-z0-9_\\x80-\\xff])`, 'g');
+  const whitespaceEnd = (from: number): number => {
+    while (from < masked.length && /\s/.test(masked[from])) from++;
+    return from;
+  };
+  for (const declaration of masked.matchAll(declarations)) {
+    const start = declaration.index;
+    if (start > 0 && /[A-Za-z0-9_\x80-\xff]/.test(masked[start - 1])) continue;
+    let at = whitespaceEnd(start + declaration[0].length);
+    // Named fn items cannot occur within a function header. Function-pointer
+    // types use fn(...), so they remain legal in generic bounds and return types.
+    const nextItem = /\bfn\s+[A-Za-z_][A-Za-z0-9_]*/g;
+    nextItem.lastIndex = at;
+    const limit = nextItem.exec(masked)?.index ?? masked.length;
+    if (masked[at] === '<') at = whitespaceEnd(rustFunctionGroupEnd(masked, at, limit, name));
+    if (masked[at] !== '(') throw new Error(`Invalid Rust function parameters: ${name}`);
+    at = whitespaceEnd(rustFunctionGroupEnd(masked, at, limit, name));
+    const tailStart = at;
+    if (masked[at] !== '{' && masked[at] !== ';'
+      && !masked.startsWith('->', at) && !/^where\b/.test(masked.slice(at))) {
+      throw new Error(`Invalid Rust function header: ${name}`);
+    }
+    while (at < limit && masked[at] !== '{' && masked[at] !== ';') {
+      const token = masked[at];
+      // Lifetime names form one token, including the apostrophe. In particular,
+      // 'static in a bound/return type is not the independent static item below.
+      // Literals are already masked; a remaining bare apostrophe is malformed.
+      if (token === "'") {
+        const lifetime = /^'[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*/.exec(masked.slice(at, limit));
+        if (!lifetime) throw new Error(`Invalid Rust function lifetime: ${name}`);
+        at += lifetime[0].length;
+        continue;
+      }
+      if (token === '<' || token === '(' || token === '[') {
+        at = rustFunctionGroupEnd(masked, at, limit, name);
+      } else {
+        if (token === ')' || token === ']' || token === '}' || (token === '>' && masked[at - 1] !== '-')) {
+          throw new Error(`Mismatched Rust function header: ${name}`);
+        }
+        if ((at === 0 || !/[A-Za-z0-9_\x80-\xff]/.test(masked[at - 1]))
+          && /^(?:struct|enum|trait|mod|use|static)\b/.test(masked.slice(at))) {
+          throw new Error(`Unexpected item in Rust function header: ${name}`);
+        }
+        at++;
+      }
+    }
+    if (masked[at] === ';') continue; // A declaration is not a definition.
+    if (at >= limit || masked[at] !== '{') {
+      throw new Error(`Unclosed Rust function header: ${name}`);
+    }
+    const tail = masked.slice(tailStart, at).trim();
+    if (tail === '->' || /\bwhere$/.test(tail)) {
+      throw new Error(`Invalid Rust function return/where clause: ${name}`);
+    }
+    const end = rustFunctionGroupEnd(masked, at, masked.length, name);
+    return visible.subarray(start, end).toString('utf8');
+  }
+  throw new Error(`Missing Rust function: ${name}`);
 }
 
 /**

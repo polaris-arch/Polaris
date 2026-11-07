@@ -96,6 +96,7 @@ jobs:
       # `build` = check-ipc-args.mjs + tsc + vite build（见 ui/package.json）。
       # 放在 test 前：类型错会让 vitest 的失败信息变得难读，先让 tsc 报准位置。
       - name: Typecheck + build
+        id: ui_build
         run: pnpm run build
 
       # 第三方许可清单与真实依赖一致（`--check` 只比对，不写盘）。
@@ -112,15 +113,17 @@ jobs:
           node scripts/gen-third-party-licenses.mjs --check
 
       - name: Test
+        if: ${{ !cancelled() && steps.ui_build.outcome == 'success' }}
         # Each worker can cold-compile CSS and launch Chromium. Bound that
         # concurrency so fixture startup stays within its existing 30s budget.
         run: pnpm exec vitest run --maxWorkers=2
 
       - name: Browser form round trip (mock IPC, no app or core)
         id: browser_forms
+        if: ${{ !cancelled() && steps.ui_build.outcome == 'success' }}
         run: |
           pnpm exec playwright install --with-deps chromium
-          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts src/hooks/use-subscription-user-agent.browser.test.tsx --maxWorkers=1
+          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts src/hooks/use-subscription-user-agent.browser.test.tsx src/components/screens/settings/tun-preview.browser.test.ts src/mobile/settings/platform-settings.browser.test.tsx src/mobile/connections/log-recovery.browser.test.tsx --maxWorkers=1
           pnpm exec playwright test --config playwright.config.ts
 
       - name: Browser form failure evidence (mock fixture only)

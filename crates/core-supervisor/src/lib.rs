@@ -41,6 +41,8 @@ pub mod readiness_gate;
 pub mod selected_core;
 pub mod spawner;
 pub mod stale_core;
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
 
 pub use config_gate::{
     assert_check_admission, begin_check_shutdown, decide_peel, parse_kernel_rejection,

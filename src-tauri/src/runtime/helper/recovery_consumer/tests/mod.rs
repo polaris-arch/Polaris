@@ -4,6 +4,13 @@ use std::sync::{Arc, Mutex};
 
 #[test]
 fn data_verifier_requires_real_damage_without_execution_admission() {
+    #[cfg(any(windows, target_os = "macos"))]
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "data_verifier_requires_real_damage_without_execution_admission",
+    ) {
+        return;
+    }
     let fixture = core_identity::RecoveryFixture::new("win");
     let stage = fixture.stage().unwrap();
     assert_eq!(
@@ -20,13 +27,15 @@ fn data_verifier_requires_real_damage_without_execution_admission() {
         data_requirement_in(&stage.directory, &fixture.selected),
         Ok(())
     );
+    // A host SDK capability hint cannot admit these staged fixture bytes.
     #[cfg(any(windows, target_os = "macos"))]
-    assert!(
-        polaris_core_supervisor::admitted_payload::check_selected_capability(
-            core_identity::ExecPurpose::RunMain
-        )
-        .is_err()
-    );
+    assert!(polaris_core_supervisor::admitted_payload::admit_selected(
+        polaris_core_supervisor::admitted_payload::UntrustedPayload::bundled(
+            stage.directory.join(&member.name)
+        ),
+        core_identity::ExecPurpose::RunMain
+    )
+    .is_err());
 }
 
 #[test]
@@ -70,6 +79,12 @@ fn recovery_source_errors_do_not_loop_through_stop_or_assert_fake_damage() {
 
 #[test]
 fn consumer_keeps_existing_fences_through_failure_and_releases_its_own_reservation() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "consumer_keeps_existing_fences_through_failure_and_releases_its_own_reservation",
+    ) {
+        return;
+    }
     let runtime = HelperRuntime::never_installed_for_tests(std::env::temp_dir());
     let slot = Arc::new(Mutex::new(DirectCoreSlot::default()));
     runtime

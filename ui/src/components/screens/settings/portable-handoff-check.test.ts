@@ -13,16 +13,42 @@ vi.mock('react', async (original) => ({
   useEffect: () => {},
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => `translated:${key}` }) }));
-vi.mock('@/ipc/api-client', () => ({ updateApi: { check: vi.fn(), clearPortableHandoff: vi.fn() }, versionApi: {} }));
+vi.mock('@/ipc/api-client', () => ({ updateApi: { check: vi.fn(), clearPortableHandoff: vi.fn(), skip: vi.fn() }, versionApi: {} }));
 vi.mock('../../dialogs/dialog-store', () => ({ useDialogStore: (selector: (s: unknown) => unknown) => selector({ open: vi.fn(), close: vi.fn() }) }));
 vi.mock('../../layout/app-update-banner', () => ({ markAppVersionSkipped: vi.fn() }));
 vi.mock('@/lib/error-handler', () => ({ toast: { error: vi.fn() } }));
 const { updateApi } = await import('@/ipc/api-client');
 const { toast } = await import('@/lib/error-handler');
+const { markAppVersionSkipped } = await import('../../layout/app-update-banner');
 const { useAppUpdate } = await import('./use-app-update');
 function render() { h.si = h.ri = 0; return useAppUpdate(false); }
 function manual() { render(); h.state[0] = 'manual'; h.state[9] = true; return render(); }
 beforeEach(() => { h.state = []; h.refs = []; vi.clearAllMocks(); });
+it('failed durable skip keeps the offered version actionable and only hides it after a successful retry', async () => {
+  render();
+  h.state[0] = 'available';
+  h.state[2] = { version: 'v1.2.3' };
+  const api = render();
+  vi.mocked(updateApi.skip).mockRejectedValueOnce(new Error('write failed'));
+  await api.skipVersion();
+  expect(render().us).toBe('available');
+  expect(render().updateInfo?.version).toBe('v1.2.3');
+  expect(markAppVersionSkipped).not.toHaveBeenCalled();
+  expect(toast.error).toHaveBeenCalledWith('translated:mobileSettings.update.skipFailedPlain');
+
+  let saved!: () => void;
+  // update_skip succeeds with ok_void; the IPC client unwraps it to undefined.
+  vi.mocked(updateApi.skip).mockImplementationOnce(() => new Promise((resolve) => {
+    saved = () => resolve(undefined as never);
+  }));
+  const retry = render().skipVersion();
+  expect(render().us).toBe('available');
+  expect(markAppVersionSkipped).not.toHaveBeenCalled();
+  saved(); await retry;
+  expect(updateApi.skip).toHaveBeenNthCalledWith(2, 'v1.2.3');
+  expect(markAppVersionSkipped).toHaveBeenCalledExactlyOnceWith('v1.2.3');
+  expect(render().us).toBe('idle');
+});
 it.each([false, true])('ordinary check with network failure=%s does not dismiss unconfirmed handoff', async (failed) => {
   const api = manual();
   if (failed) vi.mocked(updateApi.check).mockRejectedValue(new Error('offline'));

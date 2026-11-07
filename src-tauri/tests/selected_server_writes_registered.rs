@@ -76,6 +76,8 @@ enum Class {
     Projection,
     /// Host-only fixture writes its own TestDir configuration, not a user choice.
     TestFixture,
+    /// Debug native acceptance writes only its newly allocated private runtime.
+    AcceptanceFixture,
 }
 
 /// 一处登记：(类别, 所在函数, 说明)。
@@ -83,6 +85,14 @@ type Site = (Class, &'static str, &'static str);
 
 /// 登记表：文件 → 按出现顺序逐处的登记。
 const WRITES: &[(&str, &[Site])] = &[
+    (
+        "src-tauri/src/native_verification/proxy_carrier.rs",
+        &[
+            (Class::AcceptanceFixture, "two_node_config_ports", "Construct a fresh private manual two-node configuration, never a user selection"),
+            (Class::AcceptanceFixture, "local_only_config", "Construct a private direct/manual configuration for the closed desktop carrier"),
+            (Class::AcceptanceFixture, "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation", "Write node-b only to the retained private acceptance runtime through its real ConfigManager transaction"),
+        ],
+    ),
     (
         "src-tauri/src/runtime/proxy/prerequisite.rs",
         &[(
@@ -304,7 +314,6 @@ const GENERIC: &[(&str, &str, &str)] = &[
 /// 原生源码目录而这里不动即红。
 const NATIVE_ROOTS: &[&str] = &[
     "crates/tauri-plugin-polaris-ios/ios",
-    "scripts/qa",
     "src-tauri/gen/android",
     "src-tauri/gen/apple",
 ];
@@ -579,6 +588,696 @@ fn scan(source: &str) -> (Vec<Write>, usize) {
     (writes, other)
 }
 
+// Exact closed normal-library producer contract, including its actual session owner.
+// Both configuration censuses keep the carrier on their ordinary source surface.
+fn native_compact(source: &str) -> String {
+    mask_comments(source)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+fn native_code(source: &str) -> String {
+    native_compact(&mask_comments_and_strings(source))
+}
+fn native_carrier_body<'a>(source: &'a str, head: &str) -> Option<&'a str> {
+    let bare = mask_comments_and_strings(source);
+    if bare.matches(head).count() != 1 {
+        return None;
+    }
+    let start = bare.find(head)?;
+    let open = start + bare[start..].find('{')?;
+    let mut depth = 0usize;
+    for (offset, byte) in bare[open..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&source[open..=open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+// Match live code, not comments/string text, and require each causal anchor once.
+fn native_ordered(body: &str, anchors: &[&str]) -> bool {
+    let code = native_code(body);
+    let mut previous = None;
+    for anchor in anchors {
+        if code.matches(anchor).count() != 1 {
+            return false;
+        }
+        let at = code.find(anchor).unwrap();
+        if previous.is_some_and(|before| before >= at) {
+            return false;
+        }
+        previous = Some(at);
+    }
+    true
+}
+fn closed_native_session_scope(session: &str) -> bool {
+    let heads = [
+        "fn capability_preflight(",
+        "fn caller(",
+        "fn root(",
+        "fn private_directory(",
+        "fn lock_file(",
+        "fn selected_owner(",
+        "fn matches_selection(",
+        "fn hold_session(",
+        "fn open(",
+        "fn drained(",
+    ];
+    let bodies: Option<Vec<_>> = heads
+        .iter()
+        .map(|head| native_carrier_body(session, head))
+        .collect();
+    let Some(bodies) = bodies else {
+        return false;
+    };
+    let [preflight, caller, root, private, lock, owner, selection, hold, open, drained] =
+        bodies.as_slice()
+    else {
+        return false;
+    };
+    let s = native_compact(session);
+    let root_code = native_code(root);
+    let private_code = native_code(private);
+    let open_code = native_code(open);
+    s.contains("usesuper::CASE_NAMES;")
+        && native_code(preflight).starts_with("{super::super::core_binary::dev_core_binary_override()")
+        && native_ordered(preflight, &[
+            "super::super::core_binary::dev_core_binary_override()",
+            "ifpolaris_core_supervisor::selected_core::selection_lane()!=polaris_core_supervisor::selected_core::SelectionLane::Formal",
+            "forpurposein[ExecPurpose::CheckConfig,ExecPurpose::RunMain]",
+            "check_selected_capability(purpose)",
+        ])
+        && native_compact(preflight).contains("super::super::core_binary::dev_core_binary_override().map(drop).map_err(|e|failure(\"selection\",\"path-override-refused\",e))?;")
+        && native_code(preflight).contains("SelectionLane::Formal{returnErr(")
+        && native_compact(preflight).contains("check_selected_capability(purpose).map_err(|e|failure(\"capability\",e.kind.status_token(),e))?;")
+        && !["std::fs::", "ConfigManager::new(", "HelperRuntime::new(", "ProxyRuntime::new(", "TcpListener::bind("].iter().any(|effect| native_code(preflight).contains(effect))
+        && native_code(caller).contains("letuid=nix::unistd::getuid().as_raw();ifuid==0{returnErr(")
+        && native_code(caller).contains("Ok(polaris_helper_proto::core_protocol::CallerIdentity::Unix(uid).key())")
+        && native_compact(caller).contains("ifvalue==\"sS-1-5-18\"{returnErr(")
+        && native_code(caller).contains("polaris_helper::platform::windows::native_caller::current_user()")
+        && root_code.contains("letkey=polaris_updater::sha256_hex(caller()?.as_bytes());")
+        && native_compact(root).contains("Ok(parent.join(format!(\"polaris-native-production-verification-{key}\")))")
+        && root_code.contains("std::env::temp_dir().canonicalize().map_err(|e|e.to_string())?;")
+        && root_code.contains("polaris_helper::platform::windows::logic::cfg_allowed(")
+        && s.contains("fnroot()->Result<PathBuf,String>{")
+        && private_code.contains("std::fs::symlink_metadata(path).map_err(|e|e.to_string())?;")
+        && private_code.contains("ifm.uid()!=nix::unistd::getuid().as_raw()||m.mode()&0o077!=0{returnErr(")
+        && private_code.contains("PayloadDir::open(path,Some(m.uid()))")
+        && private_code.contains(".custom_flags(0x02200000)")
+        && private_code.contains("if!m.is_dir()||m.file_attributes()&0x400!=0{returnErr(")
+        && private_code.contains("if!polaris_helper::platform::windows::coreacl::is_private_user_config(&sec,&sid[1..]){returnErr(")
+        && native_ordered(lock, &["letf=matchstd::fs::symlink_metadata(root.join(name))", "f.try_lock()", "Ok(f)"])
+        && native_code(lock).contains("f.try_lock().map_err(|e|format!())?;")
+        && native_code(lock).contains("Err(e)ife.kind()==std::io::ErrorKind::NotFound=>create_file(&root.join(name))?,Err(e)=>returnErr(e.to_string()),")
+        && native_code(owner).contains("crate::runtime::core_identity::selected_manifest(&platform)?;")
+        && native_code(owner).contains("caller:caller()?,platform,core_id:id.as_str().into(),provider_fingerprint:m.provider_fingerprint,core_files:m.files,")
+        && native_code(owner).contains("helper_sha256:m.helper_sha256,cleaner_sha256:m.cleaner_sha256,required_cases:CASE_NAMES.iter().map(|v|(*v).into()).collect(),")
+        && native_code(selection)=="{letmuta=a.clone();a.session_id.clear();a==*b}"
+        && s.contains("pub(super)fnhold_session()->Result<(),String>{")
+        && native_code(hold).starts_with("{capability_preflight()?;")
+        && native_ordered(hold, &["capability_preflight()?;", "letmutowner=selected_owner()", "letroot=root()", "letdir=private_directory(&root)", "let_suite=lock_file(&root,&dir,SUITE_LOCK)", "ifstd::fs::symlink_metadata(root.join(OWNER)).is_ok()", "letbefore=retained_size(&root)", "letready=provider_ready(&root);", "ifready.is_ok(){record(", "std::io::stdout().flush()", "letcase_lock=lock_file(&root,&dir,CASE_LOCK);", "letendpoint_idle=provider_idle(&root).ok();"])
+        && native_code(hold).contains("ifstd::fs::symlink_metadata(root.join(OWNER)).is_ok(){returnErr(")
+        && native_code(hold).contains("letmutdrained=case_lock.is_ok();")
+        && native_compact(hold).contains("drained&=matches!((a,b),(Ok(a),Ok(b))ifa==b&&a[\"sessionId\"]==owner.session_id&&a[\"case\"]==CASE_NAMES[i]);")
+        && native_compact(hold).contains("foriin0..CASE_NAMES.len(){create_directory(&root.join(format!(\"case-{i}\")))?;}")
+        && native_code(hold).contains("record(&root.join(OWNER),&serde_json::to_value(&owner).map_err(|e|e.to_string())?,)?;")
+        && native_code(hold).contains("letok=action_ok&&drained&&(started==0||endpoint_idle==Some(true))&&retained.is_ok();")
+        && s.contains("pub(super)fnopen(case:&str)->Result<Self,String>{")
+        && open_code.starts_with("{capability_preflight()?;")
+        && native_ordered(open, &["capability_preflight()?;", "leti=CASE_NAMES.iter().position(|v|*v==case)", "letroot=root()?;", "letdirectory=private_directory(&root)?;", "letsuite=directory.open_regular(SUITE_LOCK)", "matchsuite.try_lock()", "letcase_lock=lock_file(&root,&directory,CASE_LOCK)?;", "retained_size(&root)?;", "letowner:Owner=serde_json::from_value(read_record(&directory,OWNER)?)", "ifuuid::Uuid::parse_str(&owner.session_id).is_err()||!matches_selection(&owner,&selected_owner()?)", "provider_ready(&root)", "letcase_dir=root.join(format!(", "private_directory(&case_dir)?;", "record(&root.join(format!(", "Ok(Self{"])
+        && open_code.contains("ifuuid::Uuid::parse_str(&owner.session_id).is_err()||!matches_selection(&owner,&selected_owner()?){returnErr(")
+        && open_code.contains("Err(std::fs::TryLockError::WouldBlock)=>{}Err(e)=>returnErr(")
+        && open_code.contains("Ok(())=>{returnErr(")
+        && native_compact(open).contains("provider_ready(&root).map_err(|e|failure(\"provider\",\"provider-unavailable\",e))?;")
+        && native_compact(open).contains("letcase_dir=root.join(format!(\"case-{i}\"));")
+        && native_compact(open).contains("record(&root.join(format!(\"case-{i}-started.json\")),&receipt)?;")
+        && open_code.contains("Ok(Self{config_root:root.clone(),case_dir,root,receipt,_case_lock:case_lock,_directory:directory,})")
+        && native_compact(drained).contains("record(&self.root.join(format!(\"case-{i}-drained.json\")),&self.receipt,)")
+}
+fn closed_native_configuration_scope(
+    proxy: &str,
+    library: &str,
+    carrier: &str,
+    session: &str,
+    cleanup: &str,
+    entrypoint: &str,
+    manifest: &str,
+) -> bool {
+    let c = native_compact(carrier);
+    let bare = native_code(carrier);
+    let cases = [
+        ("runtime::proxy::tests::lifecycle::real_core_full_lifecycle", "lifecycle_case", "real_core_full_lifecycle"),
+        ("runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop", "lifecycle_race_case", "real_core_lifecycle_race_start_then_immediate_stop"),
+        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid", "hot_switch_case", "real_core_hot_switch_keeps_pid"),
+        ("runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt", "failover_case", "real_core_auto_failover_attests_without_applying_saved_debt"),
+        ("runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation", "restart_confirmation_case", "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation"),
+        ("runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames", "aggregate_relay_case", "real_core_aggregate_relay_emits_real_frames"),
+    ];
+    let names = format!(
+        "constCASE_NAMES:&[&str]=&[{}];",
+        cases
+            .iter()
+            .map(|(name, _, _)| format!("\"{name}\","))
+            .collect::<String>()
+    );
+    let Some(selector) = native_carrier_body(carrier, "fn selected_case_factory(") else {
+        return false;
+    };
+    let expected_selector = format!(
+        "{{matchcase{{{}_=>None,}}}}",
+        cases
+            .iter()
+            .map(|(name, factory, _)| format!("\"{name}\"=>{{Some({factory})}}"))
+            .collect::<String>()
+    );
+    if native_compact(selector) != expected_selector
+        || !bare.contains("typeNativeCaseFactory=fn()->NativeCaseFuture;")
+        || !bare.contains(
+            "typeNativeCaseFuture=std::pin::Pin<Box<dynstd::future::Future<Output=()>+'static>>;",
+        )
+        || !cases.iter().all(|(_, factory, method)| {
+            native_carrier_body(carrier, &format!("fn {factory}("))
+                .is_some_and(|body| native_compact(body) == format!("{{Box::pin({method}())}}"))
+        })
+    {
+        return false;
+    }
+    let Some(run_body) = native_carrier_body(carrier, "pub(crate) async fn run_case(") else {
+        return false;
+    };
+    let Some(caught) = native_carrier_body(run_body, "let result = AssertUnwindSafe(async") else {
+        return false;
+    };
+    if !native_ordered(caught, &["letfuture=factory();", "future.await;"])
+        || !native_compact(run_body).contains(&format!(
+            "letresult=AssertUnwindSafe(async{}).catch_unwind().await;",
+            native_compact(caught)
+        ))
+    {
+        return false;
+    }
+    let run = native_compact(run_body);
+    let run_code = native_code(run_body);
+    let policy = "super::core_binary::dev_core_binary_override().map(drop)?;";
+    let Some(policy_at) = run_code.find(policy) else {
+        return false;
+    };
+    if !native_ordered(
+        run_body,
+        &[
+            "letfactory=selected_case_factory(case).ok_or(",
+            "session::capability_preflight()?;",
+            policy,
+            "letsession=session::CaseSession::open(case)?;",
+            "letdir=session.case_dir.clone();",
+            "letconfig=Arc::new(ConfigManager::new(dir.clone()));",
+            "lethelper=Arc::new(HelperRuntime::new(session.config_root.clone()));",
+            "letmesh=Arc::new(MeshRuntime::new_with_helper(dir.clone(),helper.clone()));",
+            "letclearer=Box::new(polaris_system_integration::production_proxy_controller(",
+            "letruntime=Arc::new(ProxyRuntime::new(config,helper,mesh,clearer));",
+            "DIRECTORY.set(dir.clone()).map_err(",
+            "RUNTIME.set(runtime.clone()).map_err(",
+            "letresult=AssertUnwindSafe(async{",
+            "letfuture=factory();",
+            "future.await;",
+            ").catch_unwind().await;",
+            "letcheck_fence=polaris_core_supervisor::begin_check_shutdown()",
+            "letcleanup=cleanup::drain_after_fence(check_fence,runtime.shutdown_for_exit(),async{",
+            "polaris_core_supervisor::shutdown_checks_for_exit()",
+            "ifcleanup.is_ok()&&fenced&&empty&&no_pid",
+            "session.drained(case)?;",
+            "ifresult.is_err()",
+        ],
+    ) || run_code.matches("factory()").count() != 1
+        || [
+            "std::fs::",
+            "eprintln!",
+            "ConfigManager::new(",
+            "HelperRuntime::new(",
+            "ProxyRuntime::new(",
+            "CaseSession::open(",
+            "factory()",
+        ]
+        .iter()
+        .any(|effect| run_code[..policy_at].contains(effect))
+    {
+        return false;
+    }
+    let Some(drain) = native_carrier_body(cleanup, "pub(super) async fn drain_after_fence(") else {
+        return false;
+    };
+    let p = native_compact(proxy);
+    let l = native_compact(library);
+    let e = native_compact(entrypoint);
+    p.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]#[path=\"../native_verification/proxy_carrier.rs\"]pub(crate)modnative_verification;")
+        && l.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]pubasyncfnrun_native_production_verification(case:&str)->Result<(),String>{runtime::proxy::native_verification::run_case(case).await}")
+        && l.contains("#[cfg(desktop)]#[cfg(feature=\"native-production-verification\")]#[cfg(debug_assertions)]pubfnhold_native_production_verification_session()->Result<(),String>{runtime::proxy::native_verification::hold_session()}")
+        && e.contains("#[cfg(not(debug_assertions))]compile_error!(\"nativeadmissionverifierisunavailableinreleasebuilds\");")
+        && e.contains("letresult=ifargs.len()==1&&args[0]==\"--session\"{polaris_lib::hold_native_production_verification_session()}elseifargs.len()==1{polaris_lib::run_native_production_verification(&args[0]).await}else{")
+        && native_compact(manifest).contains("[[bin]]name=\"native-admission-verifier\"path=\"src/bin/native-admission-verifier.rs\"required-features=[\"native-production-verification\"]")
+        && c.contains("#[path=\"session.rs\"]modsession;")
+        && c.contains("pub(crate)fnhold_session()->Result<(),String>{session::hold_session()}")
+        && c.contains("#[cfg(debug_assertions)]pub(crate)asyncfnrun_case(case:&str)->Result<(),String>{if!CASE_NAMES.contains(&case){returnErr(")
+        && c.contains(&names)
+        && run.contains("DIRECTORY.set(dir.clone()).map_err(|_|\"onecaseperprocess\")?;")
+        && run.contains("RUNTIME.set(runtime.clone()).map_err(|_|\"onecaseperprocess\")?;")
+        && c.contains("ProxyModeType::Manual.effective_on(runtime.helper.platform())")
+        && c.contains("obj.insert(\"proxyModeType\".into(),serde_json::json!(\"manual\"));")
+        && c.contains("\"proxyModeType\":\"manual\",")
+        && !c.contains("\"allowLan\"") && !c.contains("allow_lan")
+        && run_code.contains("letfenced=runtime.desktop_shutdown.lock().map(|v|*v).unwrap_or(false);")
+        && run_code.contains(".map(|v|v.is_empty()&&!v.has_helper_start()).unwrap_or(false);")
+        && run_code.contains("letno_pid=runtime.pid.lock().map(|v|v.is_none()).unwrap_or(false);")
+        && native_code(drain).starts_with("{letmain=main.await;letchecks=checks.await;letmutfailures=Vec::new();")
+        && native_ordered(drain,&["letmain=main.await;","letchecks=checks.await;","letmutfailures=Vec::new();"])
+        && native_compact(drain).contains("[(\"Checkfence\",fence),(\"mainshutdown\",main),(\"Checkdrain\",checks),]")
+        && closed_native_session_scope(session)
+}
+fn native_scope_faces() -> [String; 7] {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    [
+        "src-tauri/src/runtime/proxy.rs",
+        "src-tauri/src/lib.rs",
+        "src-tauri/src/native_verification/proxy_carrier.rs",
+        "src-tauri/src/native_verification/session.rs",
+        "src-tauri/src/native_verification/cleanup.rs",
+        "src-tauri/src/bin/native-admission-verifier.rs",
+        "src-tauri/Cargo.toml",
+    ]
+    .map(|path| std::fs::read_to_string(root.join(path)).expect("actual native producer context"))
+}
+fn native_scope_is_closed(faces: &[String; 7]) -> bool {
+    closed_native_configuration_scope(
+        &faces[0], &faces[1], &faces[2], &faces[3], &faces[4], &faces[5], &faces[6],
+    )
+}
+// Mutations below always target the current real producer/owner/caller source.
+fn assert_native_scope_controls(faces: &[String; 7]) {
+    assert!(native_scope_is_closed(faces));
+    // Each conjunct is independently necessary on the actual facade and both exports.
+    for (slot, tail) in [
+        (0, "#[path = \"../native_verification/proxy_carrier.rs\"]"),
+        (1, "pub async fn run_native_production_verification"),
+        (1, "pub fn hold_native_production_verification_session"),
+    ] {
+        let prefix = format!("#[cfg(desktop)]\n#[cfg(feature = \"native-production-verification\")]\n#[cfg(debug_assertions)]\n{tail}");
+        assert_eq!(faces[slot].matches(&prefix).count(), 1);
+        for attribute in [
+            "#[cfg(desktop)]\n",
+            "#[cfg(feature = \"native-production-verification\")]\n",
+            "#[cfg(debug_assertions)]\n",
+        ] {
+            let mut changed = (*faces).clone();
+            changed[slot] = faces[slot].replacen(&prefix, &prefix.replacen(attribute, "", 1), 1);
+            assert!(
+                !native_scope_is_closed(&changed),
+                "missing native scope conjunct: {tail}: {attribute}"
+            );
+        }
+    }
+    for (slot,old,new) in [
+        (0,"#[cfg(desktop)]\n#[cfg(feature = \"native-production-verification\")]\n#[cfg(debug_assertions)]\n#[path = \"../native_verification/proxy_carrier.rs\"]","#[path = \"../native_verification/proxy_carrier.rs\"]"),
+        (1,"#[cfg(desktop)]\n#[cfg(feature = \"native-production-verification\")]\n#[cfg(debug_assertions)]\npub async fn run_native_production_verification","pub async fn run_native_production_verification"),
+        (1,"#[cfg(desktop)]\n#[cfg(feature = \"native-production-verification\")]\n#[cfg(debug_assertions)]\npub fn hold_native_production_verification_session","pub fn hold_native_production_verification_session"),
+        (2,"#[cfg(debug_assertions)]\npub(crate) async fn run_case","pub(crate) async fn run_case"),
+        (2,"if !CASE_NAMES.contains(&case)","if false"),
+        (2,"ConfigManager::new(dir.clone())","ConfigManager::new(user_directory())"),
+        (2,"let dir = session.case_dir.clone();","let dir = user_directory();"),
+        (2,"HelperRuntime::new(session.config_root.clone())","HelperRuntime::new(dir.clone())"),
+        (2,"let session = session::CaseSession::open(case)?;","let session = unbound_session();"),
+        (2,"serde_json::json!(\"manual\")","serde_json::json!(\"tun\")"),
+        (2,"\"proxyModeType\": \"manual\"","\"proxyModeType\": \"systemProxy\""),
+        (2,".effective_on(runtime.helper.platform())",".without_platform_projection()"),
+        (2,"runtime.shutdown_for_exit()","pretend_cleanup()"),
+        (2,"polaris_core_supervisor::shutdown_checks_for_exit()","pretend_check_cleanup()"),
+        (3,"polaris_updater::sha256_hex(caller()?.as_bytes())","polaris_updater::sha256_hex(b\"another-caller\")"),
+        (3,"polaris-native-production-verification-{key}","user-configuration-{key}"),
+        (3,"m.uid() != nix::unistd::getuid().as_raw() || m.mode() & 0o077 != 0","false"),
+        (3,"!polaris_helper::platform::windows::coreacl::is_private_user_config(&sec, &sid[1..])","false"),
+        (3,"config_root: root.clone(),","config_root: user_directory(),"),
+        (3,"_case_lock: case_lock,","_case_lock: unrelated_lock(),"),
+        (3,"required_cases: CASE_NAMES.iter().map(|v| (*v).into()).collect(),","required_cases: Vec::new(),"),
+        (4,"let checks = checks.await;","let checks = Ok(());"),
+        (5,"polaris_lib::hold_native_production_verification_session()","ordinary_session()"),
+        (6,"required-features = [\"native-production-verification\"]","required-features = []"),
+    ] {
+        let mut changed=(*faces).clone();
+        assert!(changed[slot].contains(old),"negative must mutate actual source: {slot}: {old}");
+        changed[slot]=changed[slot].replacen(old,new,1);
+        assert!(!native_scope_is_closed(&changed),"closed native scope escaped: {slot}: {old}");
+    }
+    for (slot, head, old, new) in [
+        (
+            2,
+            "fn selected_case_factory(",
+            "Some(lifecycle_case)",
+            "Some(hot_switch_case)",
+        ),
+        (
+            2,
+            "fn selected_case_factory(",
+            "_ => None",
+            "_ => Some(lifecycle_case)",
+        ),
+        (
+            2,
+            "fn lifecycle_case(",
+            "Box::pin(real_core_full_lifecycle())",
+            "Box::pin(real_core_hot_switch_keeps_pid())",
+        ),
+        (
+            2,
+            "pub(crate) async fn run_case(",
+            "let result = AssertUnwindSafe(async {",
+            "let future = factory();\nlet result = AssertUnwindSafe(async {",
+        ),
+        (
+            2,
+            "pub(crate) async fn run_case(",
+            "super::core_binary::dev_core_binary_override().map(drop)?;",
+            "super::core_binary::dev_core_binary_override().ok();",
+        ),
+        (
+            2,
+            "pub(crate) async fn run_case(",
+            "session::capability_preflight()?;",
+            "session::capability_preflight().ok();",
+        ),
+        (
+            2,
+            "pub(crate) async fn run_case(",
+            "if cleanup.is_ok() && fenced && empty && no_pid",
+            "if true",
+        ),
+        (
+            3,
+            "fn capability_preflight(",
+            ".map_err(|e| failure(\"selection\", \"path-override-refused\", e))?;",
+            ".ok();",
+        ),
+        (
+            3,
+            "fn capability_preflight(",
+            "ExecPurpose::CheckConfig, ExecPurpose::RunMain",
+            "ExecPurpose::RunMain, ExecPurpose::RunMain",
+        ),
+        (
+            3,
+            "fn capability_preflight(",
+            "!= polaris_core_supervisor::selected_core::SelectionLane::Formal",
+            "== polaris_core_supervisor::selected_core::SelectionLane::Formal",
+        ),
+        (
+            3,
+            "fn hold_session(",
+            "let mut drained = case_lock.is_ok();",
+            "let mut drained = true;",
+        ),
+        (
+            3,
+            "fn hold_session(",
+            "if std::fs::symlink_metadata(root.join(OWNER)).is_ok()",
+            "if false",
+        ),
+        (
+            3,
+            "fn hold_session(",
+            "capability_preflight()?;",
+            "capability_preflight().ok();",
+        ),
+        (
+            3,
+            "fn hold_session(",
+            "lock_file(&root, &dir, SUITE_LOCK)",
+            "lock_file(&root, &dir, CASE_LOCK)",
+        ),
+        (
+            3,
+            "fn open(",
+            "capability_preflight()?;",
+            "capability_preflight().ok();",
+        ),
+        (
+            3,
+            "fn open(",
+            "Err(std::fs::TryLockError::WouldBlock) => {}",
+            "Ok(()) => {}",
+        ),
+        (
+            3,
+            "fn open(",
+            "!matches_selection(&owner, &selected_owner()?)",
+            "false",
+        ),
+        (
+            3,
+            "fn open(",
+            "private_directory(&case_dir)?;",
+            "private_directory(&root)?;",
+        ),
+        (3, "fn lock_file(", "f.try_lock()", "f.metadata()"),
+    ] {
+        let body = native_carrier_body(&faces[slot], head).expect("actual native boundary");
+        assert_eq!(body.matches(old).count(), 1, "{slot}: {head}: {old}");
+        assert_eq!(faces[slot].matches(body).count(), 1);
+        let mut changed = (*faces).clone();
+        changed[slot] = faces[slot].replacen(body, &body.replacen(old, new, 1), 1);
+        assert!(
+            !native_scope_is_closed(&changed),
+            "native owner boundary escaped: {head}: {old}"
+        );
+    }
+    let drain = native_carrier_body(&faces[4], "pub(super) async fn drain_after_fence(").unwrap();
+    assert_eq!(drain.matches("let checks = checks.await;").count(), 1);
+    let early_return = drain.replacen(
+        "let checks = checks.await;",
+        "if main.is_err() { return main; }\nlet checks = checks.await;",
+        1,
+    );
+    let mut changed = (*faces).clone();
+    changed[4] = faces[4].replacen(drain, &early_return, 1);
+    assert!(
+        !native_scope_is_closed(&changed),
+        "Main error cannot skip the original Check owner drain"
+    );
+    let run = native_carrier_body(&faces[2], "pub(crate) async fn run_case(").unwrap();
+    for anchor in [
+        "let future = factory();",
+        "let result = AssertUnwindSafe(async {",
+        "session.drained(case)?;",
+        "let check_fence =",
+    ] {
+        assert_eq!(
+            run.matches(anchor).count(),
+            1,
+            "actual movement target: {anchor}"
+        );
+    }
+    let outside = run.replacen("let future = factory();", "", 1).replacen(
+        "let result = AssertUnwindSafe(async {",
+        "let future = factory();\nlet result = AssertUnwindSafe(async {",
+        1,
+    );
+    let mut changed = (*faces).clone();
+    changed[2] = faces[2].replacen(run, &outside, 1);
+    assert!(
+        !native_scope_is_closed(&changed),
+        "the one selected future must be constructed inside catch"
+    );
+    let moved = run.replacen("session.drained(case)?;", "", 1).replacen(
+        "let check_fence =",
+        "session.drained(case)?;\nlet check_fence =",
+        1,
+    );
+    let mut changed = (*faces).clone();
+    changed[2] = faces[2].replacen(run, &moved, 1);
+    assert!(
+        !native_scope_is_closed(&changed),
+        "checkpoint cannot precede original Main/Check drain"
+    );
+}
+
+const NATIVE_ACCEPTANCE_OWNER: &str = "src-tauri/src/native_verification/proxy_carrier.rs";
+fn native_acceptance_writer_is_private(
+    path: &str,
+    function: &str,
+    source: &str,
+    faces: &[String; 7],
+) -> bool {
+    if path != NATIVE_ACCEPTANCE_OWNER {
+        return false;
+    }
+    let compact = |s: &str| {
+        mask_comments(s)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let code = mask_comments(source);
+    let bare = mask_comments_and_strings(source);
+    let head = format!("fn {function}(");
+    if bare.matches(&head).count() != 1 {
+        return false;
+    }
+    let body = compact(&code[fn_span(&bare, bare.find(&head).unwrap())]);
+    if !closed_native_configuration_scope(
+        &faces[0], &faces[1], source, &faces[3], &faces[4], &faces[5], &faces[6],
+    ) {
+        return false;
+    }
+    match function {
+        "two_node_config_ports" => body.contains("letmutcfg=polaris_store::default_config();")
+            && body.contains("obj.insert(\"selectedServerId\".into(),serde_json::json!(selected));")
+            && body.contains("obj.insert(\"proxyModeType\".into(),serde_json::json!(\"manual\"));"),
+        "local_only_config" => body.contains("serde_json::json!({\"servers\":[],\"selectedServerId\":\"__direct__\",\"proxyMode\":\"direct\",\"proxyModeType\":\"manual\",") ,
+        "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation" => body.contains("let(rt,dir,_core,_cleanup)=real_core_runtime();")
+            && body.contains("cfg_b[\"selectedServerId\"]=serde_json::json!(\"node-b\");")
+            && body.contains("rt.config.update(|current|{*current=cfg_b.clone();Decision::Write(())}).map(drop)") ,
+        _ => false,
+    }
+}
+
+#[test]
+fn native_acceptance_class_cannot_be_borrowed_by_user_or_unknown_writers() {
+    let faces = native_scope_faces();
+    assert_native_scope_controls(&faces);
+    let source = faces[2].clone();
+    let proxy = faces[0].clone();
+    let functions = [
+        "two_node_config_ports",
+        "local_only_config",
+        "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation",
+    ];
+    let predicate_code = |text: &str| {
+        mask_comments(text)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    for function in functions {
+        assert!(
+            native_acceptance_writer_is_private(NATIVE_ACCEPTANCE_OWNER, function, &source, &faces),
+            "private writer: {function}"
+        );
+        assert!(!native_acceptance_writer_is_private(
+            "src-tauri/src/commands/server.rs",
+            function,
+            &source,
+            &faces
+        ));
+    }
+    for (function, old, new) in [
+        (
+            functions[0],
+            "let mut cfg = polaris_store::default_config();",
+            "let mut cfg = load_user_config();",
+        ),
+        (
+            functions[1],
+            "\"proxyModeType\": \"manual\"",
+            "\"proxyModeType\": \"tun\"",
+        ),
+        (
+            functions[2],
+            "rt.config\n        .update(|current| {\n            *current = cfg_b.clone();",
+            "user_config\n        .update(|current| {\n            *current = cfg_b.clone();",
+        ),
+    ] {
+        let bare = mask_comments_and_strings(&source);
+        let head = format!("fn {function}(");
+        assert_eq!(
+            bare.matches(&head).count(),
+            1,
+            "unique target function: {function}"
+        );
+        let span = fn_span(&bare, bare.find(&head).unwrap());
+        let body = &source[span.clone()];
+        assert_eq!(
+            body.matches(old).count(),
+            1,
+            "negative must bind once inside target body: {function}: {old}"
+        );
+        let changed_body = body.replacen(old, new, 1);
+        assert_ne!(
+            predicate_code(body),
+            predicate_code(&changed_body),
+            "predicate body must change: {function}"
+        );
+        let changed = format!(
+            "{}{}{}",
+            &source[..span.start],
+            changed_body,
+            &source[span.end..]
+        );
+        let changed_bare = mask_comments_and_strings(&changed);
+        assert_eq!(changed_bare.matches(&head).count(), 1);
+        let changed_span = fn_span(&changed_bare, changed_bare.find(&head).unwrap());
+        assert_eq!(
+            &changed[changed_span], changed_body,
+            "reassembled target body must carry the mutation"
+        );
+        assert!(changed.starts_with(&source[..span.start]));
+        assert!(changed.ends_with(&source[span.end..]));
+        assert!(!native_acceptance_writer_is_private(
+            NATIVE_ACCEPTANCE_OWNER,
+            function,
+            &changed,
+            &faces
+        ));
+    }
+    let guard = "#[cfg(debug_assertions)]\n#[path = \"../native_verification/proxy_carrier.rs\"]";
+    assert_eq!(proxy.matches(guard).count(), 1);
+    let changed_proxy = proxy.replacen(
+        guard,
+        "#[path = \"../native_verification/proxy_carrier.rs\"]",
+        1,
+    );
+    assert_ne!(predicate_code(&proxy), predicate_code(&changed_proxy));
+    let mut changed_faces = faces.clone();
+    changed_faces[0] = changed_proxy;
+    assert!(!native_acceptance_writer_is_private(
+        NATIVE_ACCEPTANCE_OWNER,
+        functions[0],
+        &source,
+        &changed_faces
+    ));
+    let added = format!("{source}\nfn unknown_writer() {{ let mut cfg = polaris_store::default_config(); cfg[\"selectedServerId\"] = serde_json::json!(\"node-a\"); }}");
+    assert_eq!(
+        mask_comments_and_strings(&source)
+            .matches("fn unknown_writer(")
+            .count(),
+        0
+    );
+    assert_eq!(
+        mask_comments_and_strings(&added)
+            .matches("fn unknown_writer(")
+            .count(),
+        1
+    );
+    assert_eq!(scan(&added).0.len(), scan(&source).0.len() + 1);
+    for function in functions {
+        assert!(native_acceptance_writer_is_private(
+            NATIVE_ACCEPTANCE_OWNER,
+            function,
+            &added,
+            &faces
+        ));
+    }
+    assert!(!native_acceptance_writer_is_private(
+        NATIVE_ACCEPTANCE_OWNER,
+        "unknown_writer",
+        &added,
+        &faces
+    ));
+}
+
 /// 取材面：两棵源码树里的生产 `.rs`。
 fn production_sources() -> Vec<(String, String)> {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -593,6 +1292,7 @@ fn production_sources() -> Vec<(String, String)> {
 #[test]
 fn every_write_of_the_selected_server_is_registered_with_its_class_and_function() {
     let sources = production_sources();
+    let native_faces = native_scope_faces();
     // 取材面下限：扫描器坏了、目录改名了，表现为扫到的文件骤减而变红，不会空跑判绿。
     assert!(
         sources.len() > 300,
@@ -652,6 +1352,11 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
                     write.line
                 ),
                 Class::User | Class::Restore | Class::Projection => {}
+                Class::AcceptanceFixture => {
+                    assert!(!write.touches_intent);
+                    assert!(native_acceptance_writer_is_private(path, function, source, &native_faces),
+                        "acceptance classification escaped its exact private writer: {path}::{function}");
+                }
                 Class::TestFixture => {
                     let bare = mask_comments(source);
                     assert!(bare.contains(
@@ -698,6 +1403,7 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
         Class::Restore,
         Class::Projection,
         Class::TestFixture,
+        Class::AcceptanceFixture,
     ] {
         assert!(classes.contains(&class), "{class:?} 一条都没有");
     }

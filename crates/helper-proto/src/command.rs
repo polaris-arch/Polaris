@@ -107,6 +107,10 @@ pub mod linux {
     pub const RESOLVED_DNS_SET: &str = "resolved-dns-set";
     /// `OK resolved-dns-reverted` / `ERR ...`：撤销 Polaris TUN 链路的 resolved 配置（proto v1 兼容扩展）。
     pub const RESOLVED_DNS_REVERT: &str = "resolved-dns-revert";
+    /// Read-only exact current-birth/link/settings capture.
+    pub const RESOLVED_DNS_SNAPSHOT: &str = "resolved-dns-snapshot-v1";
+    /// Fixed-link same-birth/settings compare before set/revert.
+    pub const RESOLVED_DNS_COMPARE: &str = "resolved-dns-compare-v1";
     // 注意：Linux **无** route-add/route-del/uninstall —— TUN 路由由核 sing-tun 自己装（CAP_NET_ADMIN 在 ambient set），
     // 卸载走 systemd unit disable+remove（非 socket 命令）。
 }

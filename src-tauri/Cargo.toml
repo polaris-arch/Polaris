@@ -175,7 +175,13 @@ tokio = { version = "1", features = ["test-util"] }
 # 不进 lib/bin 依赖图，不进包。零第三方依赖（只用 std）⇒ Cargo.lock 与 THIRD-PARTY 均无新增。
 polaris-source-probe = { version = "1.0.0", path = "../crates/source-probe" }
 
+[[bin]]
+name = "native-admission-verifier"
+path = "src/bin/native-admission-verifier.rs"
+required-features = ["native-production-verification"]
+
 [features]
+native-production-verification = []
 default = ["formal-selection"]
 formal-selection = ["polaris-core-supervisor/formal-selection", "polaris-helper/formal-selection", "polaris-switch-engine/formal-selection"]
 local-development-selection = ["installed-development-selection", "polaris-core-supervisor/local-development-selection", "polaris-helper/local-development-selection", "polaris-switch-engine/local-development-selection"]

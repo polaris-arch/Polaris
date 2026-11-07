@@ -5,6 +5,10 @@ use polaris_helper_proto::core_manifest::{CoreId, CoreManifest};
 
 pub(crate) use polaris_core_supervisor::selected_core::current_platform;
 mod recovery;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod tls_inventory;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) use tls_inventory::expected_tls_support;
 pub(crate) mod user_store;
 pub(crate) use recovery::stage_recovery_installation;
 #[cfg(test)]
@@ -48,7 +52,6 @@ pub(crate) fn selected_payload_dirs(formal: &[&str]) -> Result<Vec<String>, Stri
     check_compiled_selection()?;
     polaris_core_supervisor::selected_core::selected_payload_dirs(formal)
 }
-#[cfg(any(windows, test))]
 pub(crate) fn selected_source_commit(platform: &str) -> Result<String, String> {
     check_compiled_selection()?;
     polaris_core_supervisor::selected_core::selected_source_commit(platform)
@@ -297,6 +300,10 @@ pub(crate) fn stage_installation(
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        #[cfg(windows)]
+        let mut output = polaris_helper::core_store::create_current_user_data_file(&path)
+            .map_err(|error| error.to_string())?;
+        #[cfg(not(windows))]
         let mut output = options.open(&path).map_err(|error| error.to_string())?;
         let copied = std::io::copy(&mut input.take(bytes + 1), &mut output)
             .map_err(|error| error.to_string())?;
@@ -341,6 +348,12 @@ pub(crate) fn stage_installation(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    #[cfg(windows)]
+    let mut output = polaris_helper::core_store::create_current_user_data_file(
+        &stage.directory.join("core-manifest.json"),
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(not(windows))]
     let mut output = options
         .open(stage.directory.join("core-manifest.json"))
         .map_err(|error| error.to_string())?;

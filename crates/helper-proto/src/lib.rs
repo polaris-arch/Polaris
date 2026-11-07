@@ -20,6 +20,7 @@
 //!
 //! 三平台共用一个 [`proto_version::CURRENT`]。旧 v2 只保证内容 id 与退役路径帧；
 //! v3 要求执行者自己的准入工厂，并在现有 pinned Start 参数中携带固定标记。
+//! v4 仅扩展 Linux pinned Start 的显式状态目录数据；新 App 对 v3 helper 仍发原帧。
 //! Version 只作兼容性提示；实际 Start 必须在同一帧拒绝旧执行者，并核实当前对象。
 //!
 //! 平台差异不再靠版本号表达，而是由 [`Platform`] 承载（mac/win 有 token 行、linux 走 SO_PEERCRED；
@@ -76,6 +77,148 @@ pub mod linux_dns {
     pub const CONTROLLED_DNS_IP: &str = "8.8.8.8";
     /// route-only 根域：让 resolved 把所有普通 DNS 查询交给 Polaris TUN 链路。
     pub const ROUTE_ALL_DOMAIN: &str = "~.";
+
+    /// Kernel identity is separate from the configured interface name.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    pub struct LinkIdentity {
+        pub ifindex: u32,
+        pub sysfs_device: u64,
+        pub sysfs_inode: u64,
+        pub netns_inode: u64,
+        pub tun_flags: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    pub struct Settings {
+        pub servers: Vec<String>,
+        pub domains: Vec<String>,
+        pub default_route: bool,
+        pub dnssec: String,
+        pub dns_over_tls: String,
+    }
+
+    impl Settings {
+        #[must_use]
+        pub fn valid(&self) -> bool {
+            self.servers.len() <= 16
+                && self.domains.len() <= 16
+                && self
+                    .servers
+                    .iter()
+                    .all(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+                && self.domains.iter().all(|domain| {
+                    !domain.is_empty()
+                        && domain.len() <= 253
+                        && !domain.chars().any(char::is_whitespace)
+                        && !domain.chars().any(char::is_control)
+                })
+                && matches!(self.dnssec.as_str(), "yes" | "no" | "allow-downgrade")
+                && matches!(self.dns_over_tls.as_str(), "yes" | "no" | "opportunistic")
+        }
+        #[must_use]
+        pub fn controlled(&self) -> bool {
+            self.servers == [CONTROLLED_DNS_IP]
+                && self.domains == [ROUTE_ALL_DOMAIN]
+                && self.default_route
+                && self.dnssec == "no"
+                && self.dns_over_tls == "no"
+        }
+
+        #[must_use]
+        pub fn unconfigured(&self) -> bool {
+            self.servers.is_empty() && self.domains.is_empty()
+        }
+    }
+
+    /// Read-only helper attestation. Only the current authenticated exact birth
+    /// may use it for a checked change; the App cannot choose a different link.
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    pub struct Snapshot {
+        pub pid: u32,
+        pub birth: String,
+        pub link: LinkIdentity,
+        pub settings: Settings,
+        pub original: Option<Settings>,
+        pub owned: bool,
+        pub cleanup_pending: bool,
+    }
+
+    impl std::fmt::Debug for Snapshot {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("LinuxDnsSnapshot")
+                .field("pid", &self.pid)
+                .field("link", &self.link)
+                .field("owned", &self.owned)
+                .field("cleanup_pending", &self.cleanup_pending)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Snapshot {
+        #[must_use]
+        pub fn target(&self) -> Option<crate::HelperBirthTarget> {
+            crate::HelperBirthTarget::parse_wire(&self.pid.to_string(), &self.birth)
+        }
+
+        #[must_use]
+        pub fn valid(&self) -> bool {
+            self.target().is_some()
+                && self.link.ifindex > 0
+                && self.link.sysfs_inode > 0
+                && self.link.netns_inode > 0
+                && self.link.tun_flags & 1 != 0
+                && self.settings.valid()
+                && self.original.as_ref().is_none_or(Settings::valid)
+                && (!self.owned || self.original.is_some())
+        }
+    }
+
+    /// The original kernel link object is absent in the same network namespace.
+    /// This is DNS-resource cleanup, never a child-reaped or new-birth receipt.
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    pub struct Gone {
+        pub pid: u32,
+        pub birth: String,
+        pub link: LinkIdentity,
+    }
+
+    impl std::fmt::Debug for Gone {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("LinuxDnsGone")
+                .field("pid", &self.pid)
+                .field("link", &self.link)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Gone {
+        #[must_use]
+        pub fn matches(&self, snapshot: &Snapshot) -> bool {
+            self.pid == snapshot.pid && self.birth == snapshot.birth && self.link == snapshot.link
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    pub struct CompareRequest {
+        pub expected: Snapshot,
+        pub enabled: bool,
+    }
+
+    /// A checked command distinguishes a proven no-write rejection from an
+    /// ambiguous transport/native failure. Gone proves only original DNS cleanup.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Change {
+        Changed(Box<Snapshot>),
+        NoChange,
+        Gone(Gone),
+    }
 
     /// root helper 的最窄白名单判据：只允许操作 Polaris 自己的 TUN 与固定受控哨兵。
     #[must_use]
@@ -176,7 +319,9 @@ pub mod proto_version {
     /// v3 requires executor-owned selected admission and a strict v3 marker in
     /// every pinned Start. Version is a compatibility hint, never object proof.
     pub const MIN_TRUSTED_EXECUTION: u32 = 3;
-    pub const CURRENT: u32 = MIN_TRUSTED_EXECUTION;
+    /// v4 adds the optional explicit runtime-directory data to pinned Linux Start.
+    pub const MIN_EXPLICIT_RUNTIME_DIRECTORY: u32 = 4;
+    pub const CURRENT: u32 = MIN_EXPLICIT_RUNTIME_DIRECTORY;
 }
 
 /// 当前安装包内 app/helper 的共同构建身份。

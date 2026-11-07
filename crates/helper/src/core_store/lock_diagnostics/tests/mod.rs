@@ -357,6 +357,40 @@ fn native_retain_and_mutation_contention_keep_original_descriptor_snapshots() {
     // The original shared holder remains alive throughout all observations.
     // No explicit unlock, timer, descriptor flag mutation or retirement occurs.
     drop(holder);
+
+    // Observe genuine shared-start contention against a real exclusive holder.
+    // Use a new inode so this control has no close/reacquire inheritance window.
+    let holder = tempfile::NamedTempFile::new().unwrap();
+    holder.as_file().try_lock().unwrap();
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(holder.path())
+        .unwrap();
+    let before = LockObservation::from_file(&contender);
+    let error = acquire_lock(&contender, LockRole::StartShared).unwrap_err();
+    let failure = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<LockFailure>()
+        .unwrap();
+    assert!(matches!(&failure.cause, std::fs::TryLockError::WouldBlock));
+    let snapshot = failure.holder_snapshot.as_ref().unwrap();
+    let original = LockObservation::from_file(holder.as_file());
+    for fd in [original.fd.unwrap(), before.fd.unwrap()] {
+        assert!(snapshot
+            .native
+            .peers
+            .iter()
+            .any(|peer| peer.identity.pid == std::process::id() && peer.fd == fd));
+    }
+    assert_eq!(failure.observation.dev, original.dev);
+    assert_eq!(failure.observation.inode, original.inode);
+    assert_eq!(failure.observation.fd, before.fd);
+    assert_eq!(
+        LockObservation::from_file(&contender).cloexec,
+        before.cloexec
+    );
 }
 
 #[test]
@@ -365,6 +399,7 @@ fn non_native_errors_preserve_cause_without_a_holder_snapshot() {
         LockRole::RepairExclusive,
         LockRole::RetainExclusive,
         LockRole::StoreMutationExclusive,
+        LockRole::StartShared,
     ] {
         for cause in [
             io::Error::from_raw_os_error(nix::libc::EACCES),

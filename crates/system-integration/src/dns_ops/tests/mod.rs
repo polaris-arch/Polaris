@@ -13,6 +13,8 @@ struct MockDnsOps {
     effective: RefCell<Vec<String>>,
     /// 模拟平台是否接管（mac=true / win·linux=false）。
     takeover: bool,
+    suppress_apply: bool,
+    foreign_after_apply: Option<String>,
     /// 仅对**该 target** 生效的「瞬时失败」计数器：每次对它的 `apply_dns` 调用消耗 1，耗尽后
     /// 转正常（成功）。与 `apply_fail_targets` 的**永久**失败区分——用于验证重试：先失败 N 次
     /// 再成功，且不误伤同一轮里的其它 target（同构 `proxy_ops.rs` `FlakyRunner` 设计）。
@@ -35,6 +37,8 @@ impl Default for MockDnsOps {
             list_fails: false,
             effective: RefCell::new(vec!["192.168.1.1".into()]),
             takeover: true,
+            suppress_apply: false,
+            foreign_after_apply: None,
             transient_fail_target: None,
             transient_fail_count: RefCell::new(0),
             transient_fail_msg: String::new(),
@@ -91,6 +95,17 @@ impl SystemDnsOps for MockDnsOps {
             return Err(crate::error::SystemIntegrationError::dns(
                 "restore unavailable",
             ));
+        }
+        if self.suppress_apply {
+            return Ok(());
+        }
+        if self.foreign_after_apply.as_deref() == Some(target)
+            && ips == [controlled_tun_dns_ip().to_string()]
+        {
+            self.dns_state
+                .borrow_mut()
+                .insert(target.to_owned(), vec!["9.9.9.9".into()]);
+            return Err(SystemIntegrationError::dns("external state after write"));
         }
         // 模拟真实写入状态。
         self.dns_state
@@ -992,4 +1007,770 @@ fn invisible_service_remains_owned_until_restore_succeeds() {
     assert!(c.restore_dns_inner());
     assert!(!c.has_marker());
     assert_eq!(c.ops.dns_state.borrow()["A"], vec!["10.0.0.1"]);
+}
+
+fn live_dns_controller() -> SystemDnsController<MockDnsOps, MemFs> {
+    controller(MockDnsOps {
+        targets: vec!["A".into(), "B".into()],
+        dns_state: RefCell::new(BTreeMap::from([
+            ("A".into(), vec!["192.168.1.2".into()]),
+            ("B".into(), Vec::new()),
+        ])),
+        ..Default::default()
+    })
+    .with_noop_sleeper()
+}
+
+#[test]
+fn live_dns_prepare_is_read_only_and_receipt_requires_target_readback() {
+    let mut c = live_dns_controller();
+    let before = c.ops.dns_state.borrow().clone();
+    let plan = c.prepare_effect(true).unwrap();
+    assert_eq!(plan.before(), &before);
+    assert!(plan
+        .target()
+        .values()
+        .all(|ips| ips == &[controlled_tun_dns_ip().to_string()]));
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert!(!c.has_marker());
+    let receipt = c.apply_effect(&plan, "dns-one");
+    assert_eq!(receipt.outcome, TakeoverOutcome::Applied);
+    assert_eq!(receipt.marker_id.as_deref(), Some("dns-one"));
+    assert!(!receipt.cleanup_pending);
+    assert_eq!(&*c.ops.dns_state.borrow(), plan.target());
+    assert_eq!(c.marker.read().unwrap().original, before);
+    let raw = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    let unchanged = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&unchanged, "dns-two").outcome,
+        TakeoverOutcome::Unchanged
+    );
+    assert_eq!(c.marker.fs.read_marker(c.marker.path()).unwrap(), raw);
+    let release = c.prepare_effect(false).unwrap();
+    assert_eq!(
+        c.apply_effect(&release, "dns-release").outcome,
+        TakeoverOutcome::Applied
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), before);
+    assert!(c.marker.read_checked().unwrap().is_none());
+    assert!(c.original.is_none());
+}
+
+#[test]
+fn live_dns_rejects_values_scope_and_marker_drift_without_mutation() {
+    let mut c = live_dns_controller();
+    let plan = c.prepare_effect(true).unwrap();
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("A".into(), vec!["10.0.0.1".into()]);
+    assert_eq!(
+        c.apply_effect(&plan, "drift").outcome,
+        TakeoverOutcome::Superseded
+    );
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    let plan = c.prepare_effect(true).unwrap();
+    c.ops.targets.push("C".into());
+    assert_eq!(
+        c.apply_effect(&plan, "scope").outcome,
+        TakeoverOutcome::Superseded
+    );
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    c.ops.targets.pop();
+    let plan = c.prepare_effect(true).unwrap();
+    c.marker
+        .fs
+        .write_marker(c.marker.path(), "invalid")
+        .unwrap();
+    assert!(c.prepare_effect(true).is_err());
+    assert_eq!(
+        c.apply_effect(&plan, "invalid").outcome,
+        TakeoverOutcome::FailedUnchanged
+    );
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).as_deref(),
+        Some("invalid")
+    );
+    assert!(c.ops.apply_calls.borrow().is_empty());
+}
+
+#[test]
+fn live_dns_partial_failure_compensates_to_before_not_user_baseline() {
+    let mut c = live_dns_controller();
+    let before = c.ops.dns_state.borrow().clone();
+    let plan = c.prepare_effect(true).unwrap();
+    c.ops.apply_fail_targets.push("B".into());
+    let result = c.apply_effect(&plan, "partial");
+    assert_eq!(result.outcome, TakeoverOutcome::FailedRestored);
+    assert!(!result.cleanup_pending);
+    assert_eq!(*c.ops.dns_state.borrow(), before);
+    assert!(c.marker.read_checked().unwrap().is_none());
+    assert!(c.original.is_none());
+    assert_eq!(
+        c.ops.apply_calls.borrow().as_slice(),
+        &[
+            ("A".to_string(), vec![controlled_tun_dns_ip().to_string()]),
+            ("B".to_string(), vec![controlled_tun_dns_ip().to_string()]),
+            ("A".to_string(), vec!["192.168.1.2".to_string()]),
+        ]
+    );
+}
+
+#[test]
+fn live_dns_failed_compensation_retains_original_and_durable_intent() {
+    let mut c = live_dns_controller();
+    let plan = c.prepare_effect(true).unwrap();
+    c.ops.apply_fail_targets.push("B".into());
+    c.ops.restore_fail_targets.push("A".into());
+    let result = c.apply_effect(&plan, "debt");
+    assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
+    assert!(result.cleanup_pending);
+    assert_eq!(c.marker.read().unwrap().original, plan.before);
+    assert_eq!(c.original.as_ref(), Some(&plan.before));
+    let raw: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(raw["hostEffect"]["operationId"], "debt");
+    assert_eq!(raw["hostEffect"]["phase"], "applying");
+    c.ops.apply_fail_targets.clear();
+    c.ops.restore_fail_targets.clear();
+    c.restore_dns();
+    assert_eq!(*c.ops.dns_state.borrow(), plan.before);
+    assert!(!c.has_marker());
+}
+
+#[test]
+fn live_dns_does_not_overwrite_foreign_values_during_compensation() {
+    let mut c = live_dns_controller();
+    let plan = c.prepare_effect(true).unwrap();
+    c.ops.foreign_after_apply = Some("A".into());
+    let result = c.apply_effect(&plan, "foreign");
+    assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(c.ops.dns_state.borrow()["A"], vec!["9.9.9.9"]);
+    assert_eq!(c.ops.apply_calls.borrow().len(), 1);
+    assert!(c.has_marker());
+    assert_eq!(c.marker.read().unwrap().original, plan.before);
+}
+
+#[test]
+fn live_dns_silent_success_cannot_produce_an_applied_receipt() {
+    let mut c = live_dns_controller();
+    c.ops.suppress_apply = true;
+    let plan = c.prepare_effect(true).unwrap();
+    let result = c.apply_effect(&plan, "readback");
+    assert_eq!(result.outcome, TakeoverOutcome::FailedUnchanged);
+    assert_eq!(*c.ops.dns_state.borrow(), plan.before);
+    assert!(!c.has_marker());
+}
+
+#[test]
+fn live_dns_marker_failure_prevents_writes_and_unreadable_snapshot_is_not_dhcp() {
+    let fs = FailingMarkerFs {
+        inner: MemFs::new(),
+        write_fails: true.into(),
+        remove_fails: false.into(),
+    };
+    let mut c =
+        SystemDnsController::new(live_dns_controller().ops, DnsMarker::new(fs, "/live.json"));
+    let plan = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&plan, "no-intent").outcome,
+        TakeoverOutcome::FailedUnchanged
+    );
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    c.ops.read_fail_targets.push("B".into());
+    assert!(c.prepare_effect(true).is_err());
+    assert!(c.ops.apply_calls.borrow().is_empty());
+}
+
+#[test]
+fn live_dns_late_release_cannot_clear_a_successor_marker() {
+    let mut c = live_dns_controller();
+    let plan = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&plan, "first").outcome,
+        TakeoverOutcome::Applied
+    );
+    let release = c.prepare_effect(false).unwrap();
+    let mut successor: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    successor["hostEffect"]["operationId"] = "successor".into();
+    let raw = successor.to_string();
+    c.marker.fs.write_marker(c.marker.path(), &raw).unwrap();
+    c.ops.apply_calls.borrow_mut().clear();
+    assert_eq!(
+        c.apply_effect(&release, "late").outcome,
+        TakeoverOutcome::Superseded
+    );
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).as_deref(),
+        Some(raw.as_str())
+    );
+    assert!(c.ops.apply_calls.borrow().is_empty());
+}
+
+#[test]
+fn live_dns_unsupported_platform_has_no_intent_or_fake_success() {
+    let mut c = live_dns_controller();
+    c.ops.takeover = false;
+    assert!(matches!(
+        c.prepare_effect(true),
+        Err(SystemIntegrationError::UnsupportedPlatform(_))
+    ));
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert!(!c.has_marker());
+}
+
+#[test]
+fn live_dns_unsettled_or_foreign_footprint_blocks_new_apply_and_stop_restore() {
+    let mut c = live_dns_controller();
+    let plan = c.prepare_effect(true).unwrap();
+    c.ops.foreign_after_apply = Some("A".into());
+    assert_eq!(
+        c.apply_effect(&plan, "foreign-owner").outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    assert!(c.prepare_effect(true).is_err());
+    assert!(c.prepare_effect(false).is_err());
+    let raw = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    c.ops.apply_calls.borrow_mut().clear();
+    c.restore_dns();
+    assert_eq!(c.ops.dns_state.borrow()["A"], vec!["9.9.9.9"]);
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).as_deref(),
+        Some(raw.as_str())
+    );
+    c.reconcile_dns();
+    assert!(c.ops.apply_calls.borrow().is_empty());
+}
+
+#[test]
+fn live_dns_original_dhcp_and_physical_lan_resolver_have_separate_custody() {
+    let mut c = live_dns_controller();
+    let plan = c
+        .prepare_effect(true)
+        .unwrap()
+        .with_physical_lan_resolver(Some("192.168.1.1".into()));
+    assert_eq!(
+        c.apply_effect(&plan, "lan-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    assert!(c.marker.read().unwrap().original["B"].is_empty());
+    *c.ops.effective.borrow_mut() = vec![controlled_tun_dns_ip().into()];
+    assert_eq!(c.get_lan_resolver_for_dns().as_deref(), Some("192.168.1.1"));
+    let release = c.prepare_effect(false).unwrap();
+    assert_eq!(
+        c.apply_effect(&release, "lan-release").outcome,
+        TakeoverOutcome::Applied
+    );
+    assert!(c.ops.dns_state.borrow()["B"].is_empty());
+    assert!(c.original_lan_resolver.is_none());
+}
+
+struct LockedOutDnsFs(MemFs);
+impl MarkerFs for LockedOutDnsFs {
+    fn write_marker(&self, path: &str, data: &str) -> std::io::Result<()> {
+        self.0.write_marker(path, data)
+    }
+    fn read_marker(&self, path: &str) -> Option<String> {
+        self.0.read_marker(path)
+    }
+    fn remove_marker(&self, path: &str) -> std::io::Result<()> {
+        self.0.remove_marker(path)
+    }
+    fn acquire_marker_mutation_lock(
+        &self,
+        _: &str,
+    ) -> std::io::Result<crate::proxy::MarkerMutationLockGuard> {
+        Err(std::io::Error::other("marker already held"))
+    }
+}
+
+#[test]
+fn live_dns_marker_lock_failure_blocks_new_and_existing_lifecycle_writers() {
+    let mut c = SystemDnsController::new(
+        live_dns_controller().ops,
+        DnsMarker::new(LockedOutDnsFs(MemFs::new()), "/locked.json"),
+    );
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "locked").outcome,
+        TakeoverOutcome::FailedUnchanged
+    );
+    c.set_dns();
+    c.restore_dns();
+    c.reconcile_dns();
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert!(!c.has_marker());
+}
+
+#[test]
+fn live_dns_invalid_operation_phase_and_scope_cannot_become_legacy_authority() {
+    for mutation in ["identity", "phase", "scope", "target"] {
+        let mut c = live_dns_controller();
+        let prepared = c.prepare_effect(true).unwrap();
+        assert_eq!(
+            c.apply_effect(&prepared, "owned").outcome,
+            TakeoverOutcome::Applied
+        );
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+        match mutation {
+            "identity" => raw["hostEffect"]["operationId"] = "".into(),
+            "phase" => raw["hostEffect"]["phase"] = "unrecognized".into(),
+            "scope" => {
+                raw["hostEffect"]["target"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("A");
+            }
+            "target" => raw["hostEffect"]["target"]["A"] = serde_json::json!(["1.1.1.1"]),
+            _ => unreachable!(),
+        }
+        let raw = raw.to_string();
+        c.marker.fs.write_marker(c.marker.path(), &raw).unwrap();
+        c.ops.apply_calls.borrow_mut().clear();
+        assert!(c.prepare_effect(false).is_err(), "{mutation}");
+        c.set_dns();
+        c.reconcile_dns();
+        c.restore_dns();
+        assert!(c.ops.apply_calls.borrow().is_empty(), "{mutation}");
+        assert_eq!(
+            c.marker.fs.read_marker(c.marker.path()).as_deref(),
+            Some(raw.as_str()),
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+fn live_dns_restore_silent_success_retains_restoring_marker_until_actual_readback() {
+    let mut c = live_dns_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "restore-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    c.ops.suppress_apply = true;
+    c.restore_dns();
+    assert!(c.has_marker());
+    let raw: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(raw["hostEffect"]["operationId"], "restore-owner");
+    assert_eq!(raw["hostEffect"]["phase"], "restoring");
+    let marker_before = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    let values_before = c.ops.dns_state.borrow().clone();
+    c.ops.apply_calls.borrow_mut().clear();
+    let retry = c.prepare_effect(true).unwrap();
+    assert!(retry.needs_prior_restore());
+    assert_eq!(
+        retry.prior_marker_operation_id().as_deref(),
+        Some("restore-owner")
+    );
+    assert_eq!(retry.scope(), prepared.scope());
+    assert_eq!(retry.original, prepared.before);
+    assert_eq!(retry.before(), &values_before);
+    assert!(c.checked_owned_receipt().unwrap().is_none());
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
+    let rejected = c.apply_effect(&retry, "must-not-replace-restoring");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("restore-owner"));
+    assert!(rejected.cleanup_pending);
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
+    assert!(c.prepare_after_restore(&retry).is_err());
+    c.restore_dns();
+    assert!(
+        c.has_marker(),
+        "silent restore cannot discharge old-owner debt"
+    );
+    assert_eq!(
+        c.exact_marker_operation_id().as_deref(),
+        Some("restore-owner")
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
+    assert_eq!(c.marker.read().unwrap().original, prepared.before);
+    c.ops.suppress_apply = false;
+    c.restore_dns();
+    assert!(!c.has_marker());
+    assert_eq!(*c.ops.dns_state.borrow(), prepared.before);
+    let next = c.prepare_after_restore(&retry).unwrap();
+    assert_eq!(next.scope(), retry.scope());
+    assert_eq!(next.before(), &prepared.before);
+    assert!(!next.needs_prior_restore());
+    assert!(next.prior_marker_operation_id().is_none());
+}
+
+#[test]
+fn live_reconcile_extends_exact_marker_and_preserves_original_document_and_owner() {
+    let mut c = live_dns_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "dns-origin").outcome,
+        TakeoverOutcome::Applied
+    );
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    raw["diagnosticExtension"] = serde_json::json!({"keep":true});
+    c.marker
+        .fs
+        .write_marker(c.marker.path(), &raw.to_string())
+        .unwrap();
+    c.ops.targets.push("C".into());
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("C".into(), vec!["10.0.0.53".into()]);
+    c.ops.apply_calls.borrow_mut().clear();
+    let receipt = c.reconcile_dns_checked().unwrap();
+    assert_eq!(receipt.outcome, TakeoverOutcome::Applied);
+    assert_eq!(receipt.operation_id, "dns-origin");
+    assert_eq!(receipt.marker_id.as_deref(), Some("dns-origin"));
+    let raw: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(raw["diagnosticExtension"]["keep"], true);
+    assert_eq!(raw["hostEffect"]["operationId"], "dns-origin");
+    assert_eq!(raw["hostEffect"]["phase"], "owned");
+    assert_eq!(raw["original"]["C"], serde_json::json!(["10.0.0.53"]));
+    assert_eq!(
+        raw["hostEffect"]["before"]["C"],
+        serde_json::json!(["10.0.0.53"])
+    );
+    assert_eq!(
+        raw["hostEffect"]["target"]["C"],
+        serde_json::json!([controlled_tun_dns_ip()])
+    );
+    assert_eq!(
+        *c.ops.apply_calls.borrow(),
+        vec![("C".into(), vec![controlled_tun_dns_ip().into()])]
+    );
+    c.restore_dns();
+    assert!(!c.has_marker());
+    assert_eq!(c.ops.dns_state.borrow()["C"], vec!["10.0.0.53"]);
+    assert!(c.ops.dns_state.borrow()["B"].is_empty());
+}
+
+#[test]
+fn live_reconcile_missing_old_service_admits_new_service_but_retains_partial_restore_debt() {
+    let mut c = live_dns_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "scope-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    c.ops.targets = vec!["B".into(), "C".into()];
+    c.ops.dns_state.borrow_mut().remove("A");
+    c.ops.read_fail_targets.push("A".into());
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("C".into(), vec!["10.1.0.53".into()]);
+    let receipt = c.reconcile_dns_checked().unwrap();
+    assert_eq!(receipt.outcome, TakeoverOutcome::RecoveryPending);
+    assert!(receipt.cleanup_pending);
+    assert_eq!(c.ops.dns_state.borrow()["C"], vec![controlled_tun_dns_ip()]);
+    let raw: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(raw["hostEffect"]["operationId"], "scope-owner");
+    assert_eq!(raw["original"]["A"], serde_json::json!(["192.168.1.2"]));
+    assert!(raw["hostEffect"]["target"].get("A").is_some());
+    c.restore_dns();
+    assert!(c.has_marker());
+    assert!(c.ops.dns_state.borrow()["B"].is_empty());
+    assert_eq!(c.ops.dns_state.borrow()["C"], vec!["10.1.0.53"]);
+    let restoring: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(restoring["hostEffect"]["phase"], "restoring");
+    c.ops.apply_calls.borrow_mut().clear();
+    assert_eq!(
+        c.reconcile_dns_checked().unwrap().outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    c.ops.read_fail_targets.clear();
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("A".into(), vec!["192.168.1.2".into()]);
+    c.restore_dns();
+    assert!(!c.has_marker());
+}
+
+#[test]
+fn live_reconcile_foreign_existing_or_unowned_controlled_new_service_never_writes_or_downgrades() {
+    for foreign_existing in [false, true] {
+        let mut c = live_dns_controller();
+        let prepared = c.prepare_effect(true).unwrap();
+        assert_eq!(
+            c.apply_effect(&prepared, "kept-owner").outcome,
+            TakeoverOutcome::Applied
+        );
+        c.ops.targets.push("C".into());
+        c.ops.dns_state.borrow_mut().insert(
+            "C".into(),
+            vec![if foreign_existing {
+                "10.0.0.53"
+            } else {
+                controlled_tun_dns_ip()
+            }
+            .into()],
+        );
+        if foreign_existing {
+            c.ops
+                .dns_state
+                .borrow_mut()
+                .insert("A".into(), vec!["9.9.9.9".into()]);
+        }
+        let before = c.marker.fs.read_marker(c.marker.path()).unwrap();
+        c.ops.apply_calls.borrow_mut().clear();
+        assert_eq!(
+            c.reconcile_dns_checked().unwrap().outcome,
+            TakeoverOutcome::RecoveryPending
+        );
+        assert!(c.ops.apply_calls.borrow().is_empty());
+        assert_eq!(c.marker.fs.read_marker(c.marker.path()).unwrap(), before);
+        assert!(c.prepare_effect(true).is_err());
+    }
+}
+
+#[test]
+fn live_reconcile_failed_new_service_readback_keeps_applying_and_same_owner_can_finish() {
+    let mut c = live_dns_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "readback-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    c.ops.targets.push("C".into());
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("C".into(), vec!["10.0.0.53".into()]);
+    c.ops.suppress_apply = true;
+    assert_eq!(
+        c.reconcile_dns_checked().unwrap().outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    let raw: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(raw["hostEffect"]["phase"], "applying");
+    assert_eq!(raw["hostEffect"]["operationId"], "readback-owner");
+    assert_eq!(raw["original"]["C"], serde_json::json!(["10.0.0.53"]));
+    c.ops.suppress_apply = false;
+    let receipt = c.reconcile_dns_checked().unwrap();
+    assert_eq!(receipt.outcome, TakeoverOutcome::Applied);
+    assert_eq!(receipt.marker_id.as_deref(), Some("readback-owner"));
+    let raw: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(raw["hostEffect"]["phase"], "owned");
+    c.restore_dns();
+    assert_eq!(c.ops.dns_state.borrow()["C"], vec!["10.0.0.53"]);
+}
+
+#[test]
+fn exact_partial_dns_retry_restores_original_owner_before_replacement_and_rechecks_scope() {
+    let mut c = live_dns_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "old-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    c.ops.targets.push("C".into());
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("C".into(), vec!["10.0.0.53".into()]);
+    c.ops.suppress_apply = true;
+    assert_eq!(
+        c.reconcile_dns_checked().unwrap().outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    c.ops.suppress_apply = false;
+    let marker_before = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    let values_before = c.ops.dns_state.borrow().clone();
+    c.ops.apply_calls.borrow_mut().clear();
+    let retry = c.prepare_effect(true).unwrap();
+    assert!(retry.needs_prior_restore());
+    assert_eq!(
+        retry.prior_marker_operation_id().as_deref(),
+        Some("old-owner")
+    );
+    assert_eq!(retry.scope(), prepared.scope());
+    assert_eq!(retry.original["A"], prepared.before["A"]);
+    assert_eq!(retry.original["C"], vec!["10.0.0.53"]);
+    assert!(c.checked_owned_receipt().unwrap().is_none());
+    let rejected = c.apply_effect(&retry, "must-not-replace-applying");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("old-owner"));
+    assert!(rejected.cleanup_pending);
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    assert_eq!(*c.ops.dns_state.borrow(), values_before);
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("A".into(), vec!["9.9.9.9".into()]);
+    assert!(c.prepare_effect(true).is_err());
+    assert_eq!(
+        c.marker.fs.read_marker(c.marker.path()).unwrap(),
+        marker_before
+    );
+    *c.ops.dns_state.borrow_mut() = values_before;
+    c.restore_dns();
+    assert!(!c.has_marker());
+    let next = c.prepare_after_restore(&retry).unwrap();
+    assert_eq!(next.before()["A"], vec!["192.168.1.2"]);
+    assert_eq!(
+        c.apply_effect(&next, "new-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    assert_eq!(c.exact_marker_operation_id().as_deref(), Some("new-owner"));
+    c.restore_dns();
+    assert!(!c.has_marker());
+    assert_eq!(*c.ops.dns_state.borrow(), retry.original);
+    c.ops
+        .dns_state
+        .borrow_mut()
+        .insert("A".into(), vec!["9.9.9.9".into()]);
+    assert!(c.prepare_after_restore(&retry).is_err());
+    assert!(!c.has_marker());
+    *c.ops.dns_state.borrow_mut() = retry.original.clone();
+    c.ops.targets.push("D".into());
+    assert!(c.prepare_after_restore(&retry).is_err());
+}
+
+#[test]
+fn live_reconcile_duplicate_service_identity_keeps_exact_marker_without_mutation() {
+    let mut c = live_dns_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "unique-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    let raw = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    c.ops.targets.push("A".into());
+    c.ops.apply_calls.borrow_mut().clear();
+    assert_eq!(
+        c.reconcile_dns_checked().unwrap().outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(c.marker.fs.read_marker(c.marker.path()).unwrap(), raw);
+}
+
+struct InventoryDriftDnsOps {
+    values: std::cell::RefCell<BTreeMap<String, Vec<String>>>,
+    visible: std::cell::RefCell<Vec<String>>,
+    next_on_write: std::cell::RefCell<Option<String>>,
+}
+impl InventoryDriftDnsOps {
+    fn new() -> Self {
+        Self {
+            values: std::cell::RefCell::new(BTreeMap::from([
+                ("A".into(), vec!["192.168.1.2".into()]),
+                ("C".into(), vec!["10.0.0.53".into()]),
+                ("D".into(), vec!["172.16.0.53".into()]),
+            ])),
+            visible: std::cell::RefCell::new(vec!["A".into()]),
+            next_on_write: std::cell::RefCell::new(None),
+        }
+    }
+}
+impl SystemDnsOps for InventoryDriftDnsOps {
+    fn takeover_supported(&self) -> bool {
+        true
+    }
+    fn list_targets(&self) -> Result<Vec<String>, SystemIntegrationError> {
+        Ok(self.visible.borrow().clone())
+    }
+    fn read_dns(&self, name: &str) -> Result<Vec<String>, SystemIntegrationError> {
+        self.values
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| SystemIntegrationError::dns("missing test service"))
+    }
+    fn apply_dns(&self, name: &str, values: &[String]) -> Result<(), SystemIntegrationError> {
+        self.values.borrow_mut().insert(name.into(), values.into());
+        if let Some(appeared) = self.next_on_write.borrow_mut().take() {
+            self.visible.borrow_mut().push(appeared);
+        }
+        Ok(())
+    }
+    fn read_effective_resolvers(&self) -> Result<Vec<String>, SystemIntegrationError> {
+        let mut all = Vec::new();
+        for name in self.list_targets()? {
+            for ip in self.read_dns(&name)? {
+                if !all.contains(&ip) {
+                    all.push(ip);
+                }
+            }
+        }
+        Ok(all)
+    }
+}
+
+#[test]
+fn exact_apply_inventory_drift_cannot_report_an_unchecked_full_scope_as_owned() {
+    let ops = InventoryDriftDnsOps::new();
+    *ops.next_on_write.borrow_mut() = Some("C".into());
+    let mut c = SystemDnsController::new(ops, DnsMarker::new(MemFs::default(), "/inventory.json"));
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(prepared.before().len(), 1);
+    let result = c.apply_effect(&prepared, "inventory-apply");
+    assert_eq!(result.outcome, TakeoverOutcome::FailedRestored);
+    assert!(!c.has_marker());
+    assert_eq!(c.ops.values.borrow()["A"], vec!["192.168.1.2"]);
+    assert_eq!(c.ops.values.borrow()["C"], vec!["10.0.0.53"]);
+}
+
+#[test]
+fn live_reconcile_inventory_drift_retains_applying_and_next_checked_scope_can_finish() {
+    let ops = InventoryDriftDnsOps::new();
+    let mut c = SystemDnsController::new(
+        ops,
+        DnsMarker::new(MemFs::default(), "/inventory-live.json"),
+    );
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "inventory-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    c.ops.visible.borrow_mut().push("C".into());
+    *c.ops.next_on_write.borrow_mut() = Some("D".into());
+    assert_eq!(
+        c.reconcile_dns_checked().unwrap().outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    let pending: serde_json::Value =
+        serde_json::from_str(&c.marker.fs.read_marker(c.marker.path()).unwrap()).unwrap();
+    assert_eq!(pending["hostEffect"]["operationId"], "inventory-owner");
+    assert_eq!(pending["hostEffect"]["phase"], "applying");
+    assert_eq!(pending["original"]["C"], serde_json::json!(["10.0.0.53"]));
+    assert!(
+        pending["original"].get("D").is_none(),
+        "not-yet-admitted service is not falsely owned"
+    );
+    assert_eq!(c.ops.values.borrow()["D"], vec!["172.16.0.53"]);
+    assert_eq!(
+        c.reconcile_dns_checked().unwrap().outcome,
+        TakeoverOutcome::Applied
+    );
+    c.restore_dns();
+    assert!(!c.has_marker());
+    assert_eq!(c.ops.values.borrow()["A"], vec!["192.168.1.2"]);
+    assert_eq!(c.ops.values.borrow()["C"], vec!["10.0.0.53"]);
+    assert_eq!(c.ops.values.borrow()["D"], vec!["172.16.0.53"]);
 }

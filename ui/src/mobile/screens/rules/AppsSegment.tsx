@@ -71,6 +71,7 @@ export interface AppsSegmentProps {
   groups: ReadonlyArray<{ key: string; label: string; rows: readonly AppRowModel[] }>;
   /** 这台设备按什么识别应用（平台事实，**不是**缺席声明）。通告条与每一行共用同一句。 */
   platformNote: string;
+  isIOS?: boolean;
   /** 列表排布。桌面在同一处有这颗二选一，移动端同两档。 */
   view: AppView;
   onViewChange: (next: AppView) => void;
@@ -154,6 +155,7 @@ export function AppsSegment({
   onSearchChange,
   groups,
   platformNote,
+  isIOS = false,
   view,
   onViewChange,
   masterError,
@@ -245,12 +247,14 @@ export function AppsSegment({
   );
 
   const matchDetails = (row: AppRowModel): ReactElement => {
-    const copy = matchCopy(row, t);
+    const copy = isIOS
+      ? { short: t('mobileRules.matchTrafficOnlyShort'), detail: platformNote }
+      : matchCopy(row, t);
     return (
       <details className="rc-app-match" onToggle={revealOnToggle}>
         <summary><span>{copy.short}</span><span className="rc-app-match-link">{matchingLabel}</span></summary>
         <p>{copy.detail}</p>
-        <p>{platformNote}</p>
+        {!isIOS && <p>{platformNote}</p>}
       </details>
     );
   };
@@ -278,7 +282,7 @@ export function AppsSegment({
       <InlineError text={masterError} />
 
       <div className="mr-note rc-app-platform">
-        <MobileInfo title={t('mobileRules.matchSummary')} summary={t('mobileHelp.appRoutingMatch')} details={platformNote} />
+        <MobileInfo title={t(isIOS ? 'mobileRules.matchDetailsLabel' : 'mobileRules.matchSummary')} summary={t(isIOS ? 'mobileRules.matchTrafficOnlyShort' : 'mobileHelp.appRoutingMatch')} details={platformNote} />
       </div>
 
       {/* ③ 预设加载失败 —— 降级为只剩自定义应用并明说，而不是白墙。 */}
@@ -424,7 +428,7 @@ export function AppsSegment({
       */}
       <SelectSheetPanel
         label={policyRow?.name ?? t('appPolicy.policy')}
-        note={<MobileInfo title={t('mobileRules.matchSummary')} summary={t('mobileHelp.appRoutingMatch')} details={platformNote} />}
+        note={<MobileInfo title={t(isIOS ? 'mobileRules.matchDetailsLabel' : 'mobileRules.matchSummary')} summary={t(isIOS ? 'mobileRules.matchTrafficOnlyShort' : 'mobileHelp.appRoutingMatch')} details={platformNote} />}
         groups={policyGroups}
         value={policyRow?.policyValue ?? 'follow'}
         open={policyRow != null}

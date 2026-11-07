@@ -1,11 +1,13 @@
 //! Linux `systemd-resolved` per-link DNS 接管。
 //!
 //! 该模块运行在 root helper 内，但能力被收敛到一个固定 TUN 接口与一个受控 DNS 哨兵；app 不能借此
-//! 修改任意网卡或任意 DNS。写入是事务性的：任一步或读回自证失败都会 `revert` 已写状态。
+//! 修改任意网卡或任意 DNS。checked 写入保留完整 possible-write footprint；只有同一 birth/link 的真实还原读回才清责任。
 
+use polaris_helper_proto::linux_dns::{LinkIdentity, Settings};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,11 +34,40 @@ pub trait ResolvedDnsOps: Send + Sync {
     fn takeover(&self, interface_name: &str, server_ip: &str) -> Result<(), String>;
     /// 撤销链路配置；接口已经消失视为无残留。
     fn revert(&self, interface_name: &str) -> Result<(), String>;
+    fn snapshot(&self) -> Result<(LinkIdentity, Settings), String> {
+        Err("exact resolved snapshot unsupported".into())
+    }
+    fn compare(
+        &self,
+        expected: &(LinkIdentity, Settings),
+        enabled: bool,
+    ) -> Result<(LinkIdentity, Settings), String> {
+        let _ = (expected, enabled);
+        Err("exact resolved compare unsupported".into())
+    }
+    fn link_gone(&self, expected: &LinkIdentity) -> Result<bool, String> {
+        let _ = expected;
+        Err("exact resolved link absence unsupported".into())
+    }
+    fn original_settings(&self) -> Option<Settings> {
+        None
+    }
 }
 
 trait ResolvectlRunner: Send + Sync {
     fn link_exists(&self, interface_name: &str) -> bool;
     fn run(&self, args: &[&str]) -> Result<String, String>;
+    fn link_identity(&self) -> Result<LinkIdentity, String> {
+        Err("kernel link identity unavailable".into())
+    }
+    fn link_gone(&self, expected: &LinkIdentity) -> Result<bool, String> {
+        let _ = expected;
+        Err("kernel link absence unavailable".into())
+    }
+    fn pin_link(&self, expected: &LinkIdentity) -> Result<std::fs::File, String> {
+        let _ = expected;
+        Err("kernel link pin unsupported".into())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +80,19 @@ impl ResolvectlRunner for SystemResolvectlRunner {
 
     fn run(&self, args: &[&str]) -> Result<String, String> {
         run_resolvectl(RESOLVECTL_BIN, args)
+    }
+    fn link_identity(&self) -> Result<LinkIdentity, String> {
+        kernel_link_identity(
+            Path::new("/sys/class/net")
+                .join(TUN_INTERFACE_NAME)
+                .as_path(),
+        )
+    }
+    fn link_gone(&self, expected: &LinkIdentity) -> Result<bool, String> {
+        kernel_link_gone(expected)
+    }
+    fn pin_link(&self, expected: &LinkIdentity) -> Result<std::fs::File, String> {
+        pin_kernel_link(expected)
     }
 }
 
@@ -183,9 +227,43 @@ fn drain(pipe: Option<impl Read>) -> String {
 }
 
 /// 生产实现。
-#[derive(Debug, Default)]
 pub struct ResolvectlDnsOps {
-    runner: SystemResolvectlRunner,
+    runner: Box<dyn ResolvectlRunner>,
+    owned_link: Mutex<Option<OwnedResolved>>,
+    observed_link: Mutex<Option<(LinkIdentity, std::sync::Arc<std::fs::File>)>>,
+}
+
+impl Default for ResolvectlDnsOps {
+    fn default() -> Self {
+        Self {
+            runner: Box::new(SystemResolvectlRunner),
+            owned_link: Mutex::new(None),
+            observed_link: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OwnedResolved {
+    link: LinkIdentity,
+    footprint: Vec<Settings>,
+    _link_pin: std::sync::Arc<std::fs::File>,
+}
+
+fn set_footprint(before: &Settings) -> Vec<Settings> {
+    let mut value = before.clone();
+    let mut values = vec![value.clone()];
+    value.dnssec = "no".into();
+    values.push(value.clone());
+    value.dns_over_tls = "no".into();
+    values.push(value.clone());
+    value.servers = vec![polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP.into()];
+    values.push(value.clone());
+    value.domains = vec![ROUTE_ALL_DOMAIN.into()];
+    values.push(value.clone());
+    value.default_route = true;
+    values.push(value);
+    values
 }
 
 impl ResolvectlDnsOps {
@@ -194,95 +272,304 @@ impl ResolvectlDnsOps {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn retain_link(
+        &self,
+        expected: &LinkIdentity,
+    ) -> Result<std::sync::Arc<std::fs::File>, String> {
+        let mut observed = self
+            .observed_link
+            .lock()
+            .map_err(|_| "resolved link pin poisoned")?;
+        if let Some((identity, pin)) = observed.as_ref() {
+            if identity == expected {
+                return Ok(pin.clone());
+            }
+        }
+        let pin = std::sync::Arc::new(self.runner.pin_link(expected)?);
+        *observed = Some((expected.clone(), pin.clone()));
+        Ok(pin)
+    }
 }
 
 impl ResolvedDnsOps for ResolvectlDnsOps {
     fn takeover(&self, interface_name: &str, server_ip: &str) -> Result<(), String> {
-        takeover_with(&self.runner, interface_name, server_ip)
+        if !takeover_request_allowed(interface_name, server_ip) {
+            return Err("resolved whitelist denied".into());
+        }
+        let before = snapshot_with(self.runner.as_ref())?;
+        self.compare(&before, true).map(|_| ())
     }
 
     fn revert(&self, interface_name: &str) -> Result<(), String> {
-        revert_with(&self.runner, interface_name)
+        if interface_name != TUN_INTERFACE_NAME {
+            return Err("resolved whitelist denied".into());
+        }
+        let mut owner = self
+            .owned_link
+            .lock()
+            .map_err(|_| "resolved owner poisoned")?;
+        if let Some(expected) = owner.as_ref() {
+            if self.runner.link_gone(&expected.link)? {
+                *owner = None;
+                return Ok(());
+            }
+            let before = snapshot_with(self.runner.as_ref())?;
+            if before.0 != expected.link {
+                return Err("refusing DNS revert on a successor link".into());
+            }
+            if !expected.footprint.contains(&before.1) {
+                return Err("foreign DNS values are outside the retained footprint".into());
+            }
+            let after = compare_with(self.runner.as_ref(), &before, false)?;
+            if expected.footprint.first() != Some(&after.1) {
+                return Err("DNS revert does not match retained original settings".into());
+            }
+            *owner = None;
+            return Ok(());
+        }
+        // No retained baseline can authorize writes to an existing link. Keep
+        // the legacy missing-name no-op, without promoting it to an exact-link
+        // receipt. Checked requests prove original object absence separately.
+        if !self.runner.link_exists(interface_name) {
+            return Ok(());
+        }
+        Err("resolved revert has no retained kernel-link custody".into())
+    }
+
+    fn snapshot(&self) -> Result<(LinkIdentity, Settings), String> {
+        let snapshot = snapshot_with(self.runner.as_ref())?;
+        let _pin = self.retain_link(&snapshot.0)?;
+        if self.runner.link_identity()? != snapshot.0 {
+            return Err("kernel link changed while retaining snapshot".into());
+        }
+        Ok(snapshot)
+    }
+
+    fn compare(
+        &self,
+        expected: &(LinkIdentity, Settings),
+        enabled: bool,
+    ) -> Result<(LinkIdentity, Settings), String> {
+        let mut owner = self
+            .owned_link
+            .lock()
+            .map_err(|_| "resolved owner poisoned")?;
+        if owner.as_ref().is_some_and(|owned| owned.link != expected.0) {
+            return Err("resolved link belongs to a different retained owner".into());
+        }
+        if let Some(owned) = owner.as_ref() {
+            if !owned.footprint.contains(&expected.1) {
+                return Err("foreign resolved settings are outside retained custody".into());
+            }
+        } else if !expected.1.unconfigured() {
+            return Err("resolved live admission has no original unconfigured baseline".into());
+        }
+        let pin = self.retain_link(&expected.0)?;
+        if enabled {
+            let mut footprint = owner
+                .as_ref()
+                .map(|owned| owned.footprint.clone())
+                .unwrap_or_default();
+            footprint.extend(set_footprint(&expected.1));
+            *owner = Some(OwnedResolved {
+                link: expected.0.clone(),
+                footprint,
+                _link_pin: pin,
+            });
+        }
+        let result = compare_with(self.runner.as_ref(), expected, enabled)?;
+        if !enabled {
+            if owner.as_ref().and_then(|owned| owned.footprint.first()) != Some(&result.1) {
+                return Err("DNS revert does not match retained original settings".into());
+            }
+            *owner = None;
+        }
+        Ok(result)
+    }
+
+    fn original_settings(&self) -> Option<Settings> {
+        self.owned_link.lock().ok().and_then(|owner| {
+            owner
+                .as_ref()
+                .and_then(|owned| owned.footprint.first().cloned())
+        })
+    }
+
+    fn link_gone(&self, expected: &LinkIdentity) -> Result<bool, String> {
+        self.runner.link_gone(expected)
     }
 }
 
-fn takeover_with(
-    runner: &dyn ResolvectlRunner,
-    interface_name: &str,
-    server_ip: &str,
-) -> Result<(), String> {
-    if !takeover_request_allowed(interface_name, server_ip) {
-        return Err("request denied by Polaris resolved whitelist".to_owned());
+/// Readbacks use the exact kernel index and verify identity on both sides.
+fn snapshot_with(runner: &dyn ResolvectlRunner) -> Result<(LinkIdentity, Settings), String> {
+    let identity = runner.link_identity()?;
+    let index = identity.ifindex.to_string();
+    let property = |name| -> Result<Vec<String>, String> {
+        let raw = runner.run(&[name, &index])?;
+        let expected_prefix = format!("Link {} ({}):", identity.ifindex, TUN_INTERFACE_NAME);
+        let payload = raw
+            .strip_prefix(&expected_prefix)
+            .ok_or("resolved readback has wrong link identity")?;
+        if payload.contains(['\r', '\n']) {
+            return Err("resolved property has multiple lines".into());
+        }
+        Ok(payload.split_whitespace().map(str::to_owned).collect())
+    };
+    let servers = property("dns")?;
+    let domains = property("domain")?;
+    let boolean = property("default-route")?;
+    let dnssec = property("dnssec")?;
+    let tls = property("dnsovertls")?;
+    if boolean.len() != 1
+        || !matches!(boolean[0].as_str(), "yes" | "no")
+        || dnssec.len() != 1
+        || tls.len() != 1
+        || !matches!(dnssec[0].as_str(), "yes" | "no" | "allow-downgrade")
+        || !matches!(tls[0].as_str(), "yes" | "no" | "opportunistic")
+        || servers
+            .iter()
+            .any(|ip| ip.parse::<std::net::IpAddr>().is_err())
+        || domains.len() > 16
+        || servers.len() > 16
+    {
+        return Err("resolved property is invalid or unavailable".into());
     }
-    if !runner.link_exists(interface_name) {
-        return Err(format!("managed TUN interface {interface_name} is missing"));
+    if runner.link_identity()? != identity {
+        return Err("kernel link changed during DNS capture".into());
     }
+    Ok((
+        identity,
+        Settings {
+            servers,
+            domains,
+            default_route: boolean[0] == "yes",
+            dnssec: dnssec[0].clone(),
+            dns_over_tls: tls[0].clone(),
+        },
+    ))
+}
 
-    let mutations: [&[&str]; 5] = [
-        &["dnssec", interface_name, "no"],
-        &["dnsovertls", interface_name, "no"],
-        &["dns", interface_name, server_ip],
-        &["domain", interface_name, ROUTE_ALL_DOMAIN],
-        &["default-route", interface_name, "yes"],
-    ];
-    for args in mutations {
-        if let Err(error) = runner.run(args) {
-            return Err(rollback_error(runner, interface_name, error));
+fn compare_with(
+    runner: &dyn ResolvectlRunner,
+    expected: &(LinkIdentity, Settings),
+    enabled: bool,
+) -> Result<(LinkIdentity, Settings), String> {
+    if snapshot_with(runner)? != *expected {
+        return Err("DNS link/settings changed before write".into());
+    }
+    let index = expected.0.ifindex.to_string();
+    let commands: Vec<Vec<&str>> = if enabled {
+        vec![
+            vec!["dnssec", &index, "no"],
+            vec!["dnsovertls", &index, "no"],
+            vec![
+                "dns",
+                &index,
+                polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+            ],
+            vec!["domain", &index, ROUTE_ALL_DOMAIN],
+            vec!["default-route", &index, "yes"],
+        ]
+    } else {
+        vec![vec!["revert", &index]]
+    };
+    let mut prior = expected.1.clone();
+    for command in commands {
+        if snapshot_with(runner)? != (expected.0.clone(), prior.clone()) {
+            return Err("kernel link/settings changed before DNS mutation".into());
+        }
+        runner.run(&command)?;
+        if enabled {
+            match command[0] {
+                "dnssec" => prior.dnssec = "no".into(),
+                "dnsovertls" => prior.dns_over_tls = "no".into(),
+                "dns" => {
+                    prior.servers = vec![polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP.into()]
+                }
+                "domain" => prior.domains = vec![ROUTE_ALL_DOMAIN.into()],
+                "default-route" => prior.default_route = true,
+                _ => unreachable!("closed resolved command list"),
+            }
+            if snapshot_with(runner)? != (expected.0.clone(), prior.clone()) {
+                return Err("DNS mutation read-back changed outside this owner".into());
+            }
         }
     }
-
-    let attestation = attest(runner, interface_name, server_ip);
-    if let Err(error) = attestation {
-        return Err(rollback_error(runner, interface_name, error));
-    }
-    Ok(())
-}
-
-fn attest(
-    runner: &dyn ResolvectlRunner,
-    interface_name: &str,
-    server_ip: &str,
-) -> Result<(), String> {
-    let dns = runner.run(&["dns", interface_name])?;
-    if !dns.split_whitespace().any(|token| token == server_ip) {
-        return Err(format!("resolved read-back missing DNS {server_ip}: {dns}"));
-    }
-    let domains = runner.run(&["domain", interface_name])?;
-    if !domains
-        .split_whitespace()
-        .any(|token| token == ROUTE_ALL_DOMAIN)
+    let after = snapshot_with(runner)?;
+    if after.0 != expected.0
+        || enabled && !after.1.controlled()
+        || !enabled && !after.1.unconfigured()
     {
-        return Err(format!(
-            "resolved read-back missing route-only domain {ROUTE_ALL_DOMAIN}: {domains}"
-        ));
+        return Err("DNS checked mutation read-back did not settle".into());
     }
-    let default_route = runner.run(&["default-route", interface_name])?;
-    if !default_route
-        .split_whitespace()
-        .any(|token| token.eq_ignore_ascii_case("yes"))
+    Ok(after)
+}
+
+/// Pin the sysfs object while a read-only snapshot/owned mutation can refer to
+/// it. The numeric ifindex/name alone cannot distinguish a replacement link.
+fn pin_kernel_link(expected: &LinkIdentity) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = Path::new("/sys/class/net").join(TUN_INTERFACE_NAME);
+    let pin =
+        std::fs::File::open(&path).map_err(|error| format!("pin resolved kernel link: {error}"))?;
+    let metadata = pin.metadata().map_err(|error| error.to_string())?;
+    if metadata.dev() != expected.sysfs_device
+        || metadata.ino() != expected.sysfs_inode
+        || kernel_link_identity(&path)? != *expected
     {
-        return Err(format!(
-            "resolved read-back did not confirm default-route=yes: {default_route}"
-        ));
+        return Err("kernel link changed before snapshot pin".into());
     }
-    Ok(())
+    Ok(pin)
 }
 
-fn rollback_error(runner: &dyn ResolvectlRunner, interface_name: &str, cause: String) -> String {
-    match runner.run(&["revert", interface_name]) {
-        Ok(_) => format!("{cause}; partial resolved state reverted"),
-        Err(rollback) => format!("{cause}; rollback failed: {rollback}"),
+fn kernel_link_identity(path: &Path) -> Result<LinkIdentity, String> {
+    use std::os::unix::fs::MetadataExt;
+    let read =
+        |name: &str| std::fs::read_to_string(path.join(name)).map_err(|error| error.to_string());
+    let meta = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    let netns = std::fs::metadata("/proc/self/ns/net").map_err(|error| error.to_string())?;
+    let ifindex = read("ifindex")?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| error.to_string())?;
+    let flags = read("tun_flags")?;
+    let tun_flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16)
+        .map_err(|error| error.to_string())?;
+    if ifindex == 0 || tun_flags & 1 == 0 {
+        return Err("fixed DNS link is not a real TUN object".into());
     }
+    let verify = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if meta.ino() != verify.ino() || meta.dev() != verify.dev() {
+        return Err("TUN object changed during capture".into());
+    }
+    Ok(LinkIdentity {
+        ifindex,
+        sysfs_device: meta.dev(),
+        sysfs_inode: meta.ino(),
+        netns_inode: netns.ino(),
+        tun_flags,
+    })
 }
 
-fn revert_with(runner: &dyn ResolvectlRunner, interface_name: &str) -> Result<(), String> {
-    if interface_name != TUN_INTERFACE_NAME {
-        return Err("request denied by Polaris resolved whitelist".to_owned());
+fn kernel_link_gone(expected: &LinkIdentity) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let netns = std::fs::metadata("/proc/self/ns/net").map_err(|error| error.to_string())?;
+    if netns.ino() != expected.netns_inode {
+        return Err("network namespace changed".into());
     }
-    if !runner.link_exists(interface_name) {
-        return Ok(());
+    for entry in std::fs::read_dir("/sys/class/net").map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let meta = match std::fs::metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if meta.ino() == expected.sysfs_inode && meta.dev() == expected.sysfs_device {
+            return Ok(false);
+        }
     }
-    runner.run(&["revert", interface_name]).map(|_| ())
+    Ok(true)
 }
 
 #[cfg(test)]

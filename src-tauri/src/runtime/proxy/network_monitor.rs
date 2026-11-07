@@ -94,6 +94,7 @@ impl ProxyRuntime {
         // 网络代次先进一格：此刻在飞的测速结果量的是哪张网已经说不清，由测速侧据此作废。
         self.network_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.revoke_protected_physical_root();
         // 网络场景命中态：旧网络的结果先作废（未知），canary 探测任务被唤醒立即重探。放在最前：
         // 下面几条腿可能 await 很久或调度重启，命中态不该在这期间继续显示旧网络的判定。
         self.invalidate_network_canary();

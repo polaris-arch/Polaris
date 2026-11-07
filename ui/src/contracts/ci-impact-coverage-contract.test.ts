@@ -35,10 +35,13 @@
  *   失败形态是多要求登记一个脚本，而不是漏掉一个。
  */
 import { describe, expect, it } from 'vitest';
+import { strict as assert, AssertionError } from 'node:assert';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { maskRustComments, maskRustCommentsAndStrings } from './rust-source.test-support';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -53,6 +56,7 @@ type Impact = {
 
 type Classifier = {
   classifyImpact: (paths: string[], options?: { forceFull?: boolean }) => Impact;
+  classifyNativeImpact: (rawDiff: string) => { nativeRequired: boolean; reason: string };
   scopeOf: (path: string) => string | null;
   isScopeRegistered: (scopeKey: string) => boolean;
   ALL_PACKAGE_PLATFORMS: readonly string[];
@@ -70,6 +74,7 @@ const classifier: Classifier = await import(
 
 const {
   classifyImpact,
+  classifyNativeImpact,
   scopeOf,
   REGISTRY_ROOTS,
   isScopeRegistered,
@@ -132,6 +137,290 @@ function stripLineComments(source: string, kind: 'js' | 'yaml'): string {
     .join('\n');
 }
 
+// These views serve only the finite runner owners below, not a JavaScript AST.
+// Both views preserve UTF-16 offsets; literal contents cannot provide code anchors.
+function runnerViews(source: string): { visible: string; code: string } {
+  const visible = source.split(''), code = source.split('');
+  const blank = (out: string[], start: number, end: number) => {
+    for (let i = start; i < end; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
+  };
+  const regexStart = (at: number): boolean => {
+    const left = source.slice(0, at).trimEnd();
+    return !left || /[=(:,\[!&|?{};]$/.test(left) || /\b(?:return|throw|case)$/.test(left);
+  };
+  const regexEnd = (at: number): number => {
+    let characterClass = false;
+    for (let i = at + 1; i < source.length; i++) {
+      if (source[i] === '\\') { i++; continue; }
+      if (source[i] === '[') characterClass = true;
+      if (source[i] === ']') characterClass = false;
+      if (source[i] === '/' && !characterClass) return i + 1;
+      assert.notEqual(source[i], '\n', 'unterminated runner regular expression');
+    }
+    assert.fail('unterminated runner regular expression');
+  };
+  const commentEnd = (at: number): number => {
+    if (source[at + 1] === '/') {
+      const end = source.indexOf('\n', at + 2); return end < 0 ? source.length : end;
+    }
+    const end = source.indexOf('*/', at + 2);
+    assert.ok(end >= 0, 'unterminated runner block comment'); return end + 2;
+  };
+  // Literal text is inert; interpolation expressions remain executable code.
+  // Nested literals/comments need their own boundaries to prevent replay.
+  const interpolationEnd = (at: number): number => {
+    let depth = 1;
+    for (let i = at; i < source.length;) {
+      const c = source[i], two = source.slice(i, i + 2);
+      if (two === '//' || two === '/*') { i = commentEnd(i); continue; }
+      if (c === "'" || c === '"' || c === '`') { i = quotedEnd(i); continue; }
+      if (c === '/' && regexStart(i)) { i = regexEnd(i); continue; }
+      if (c === '{') depth++;
+      if (c === '}' && --depth === 0) return i + 1;
+      i++;
+    }
+    assert.fail('unterminated runner interpolation');
+  };
+  const quotedEnd = (at: number): number => {
+    const quote = source[at];
+    for (let i = at + 1; i < source.length;) {
+      if (source[i] === '\\') { i += 2; continue; }
+      if (quote === '`' && source.slice(i, i + 2) === '${') { i = interpolationEnd(i + 2); continue; }
+      if (source[i] === quote) return i + 1;
+      i++;
+    }
+    assert.fail('unterminated runner literal');
+  };
+  const scan = (from: number, to: number): void => {
+    for (let i = from; i < to;) {
+      const c = source[i], two = source.slice(i, i + 2);
+      if (two === '//' || two === '/*') {
+        const end = commentEnd(i); assert.ok(end <= to, 'comment escaped its runner expression');
+        blank(visible, i, end); blank(code, i, end); i = end;
+      } else if (c === "'" || c === '"' || c === '`' || c === '/' && regexStart(i)) {
+        const end = c === '/' ? regexEnd(i) : quotedEnd(i);
+        assert.ok(end <= to, 'literal escaped its runner expression'); blank(code, i, end);
+        if (c === '`') {
+          for (let at = i + 1; at < end - 1;) {
+            if (source[at] === '\\') { at += 2; continue; }
+            if (source.slice(at, at + 2) === '${') {
+              const stop = interpolationEnd(at + 2);
+              for (let k = at + 1; k < stop; k++) code[k] = source[k];
+              scan(at + 2, stop - 1); at = stop;
+            } else at++;
+          }
+        }
+        i = end;
+      } else i++;
+    }
+  };
+  scan(0, source.length);
+  assert.equal(visible.length, source.length); assert.equal(code.length, source.length);
+  return { visible: visible.join(''), code: code.join('') };
+}
+
+function runnerRegion(source: string, owner: string): { start: number; end: number; raw: string; visible: string; code: string } {
+  assert.ok(source.trim().length > 0, `${owner}: nonempty actual source`);
+  const views = runnerViews(source);
+  const declaration = owner === 'TESTS' ? /^export const TESTS = Object\.freeze\(\[/gm
+    : new RegExp(`^(?:export )?(?:async )?function ${owner}\\([^\\n]*\\) \\{`, 'gm');
+  const matches = [...views.code.matchAll(declaration)];
+  assert.equal(matches.length, 1, `${owner}: exactly one executable declaration`);
+  const start = matches[0].index!;
+  let end = -1;
+  if (owner === 'TESTS') end = views.code.indexOf(']);', start) + 3;
+  else {
+    let depth = 0;
+    for (let i = start + matches[0][0].lastIndexOf('{'); i < views.code.length; i++) {
+      if (views.code[i] === '{') depth++;
+      if (views.code[i] === '}' && --depth === 0) { end = i + 1; break; }
+    }
+  }
+  assert.ok(end > start, `${owner}: nonempty closed owner`);
+  return { start, end, raw: source.slice(start, end), visible: views.visible.slice(start, end), code: views.code.slice(start, end) };
+}
+function executableAnchor(source: string, anchor: string): number {
+  const view = runnerViews(source), expected = runnerViews(anchor);
+  assert.ok(expected.code.trim().length > 0, 'anchor needs actual code, not a literal or comment alone');
+  const hits: number[] = [];
+  for (let at = view.visible.indexOf(expected.visible); at >= 0; at = view.visible.indexOf(expected.visible, at + 1)) {
+    if (view.code.slice(at, at + anchor.length) === expected.code) hits.push(at);
+  }
+  assert.equal(hits.length, 1, `one executable anchor: ${anchor}`); return hits[0];
+}
+function requireRunnerCode(source: string, owner: string, anchor: string): void {
+  executableAnchor(runnerRegion(source, owner).raw, anchor);
+}
+const nativeLines = (source: string): string => runnerViews(source).visible.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+
+const NATIVE_MAIN = String.raw`async function main() {
+  const ordinary = process.argv.length === 3 && ({ '--bootstrap-contracts': BOOTSTRAP_TESTS, '--source-contracts': SOURCE_TESTS })[process.argv[2]];
+  if (ordinary) {
+    const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
+    demand(realpathSync(process.cwd()) === realpathSync(root), 'Run native source contracts from the workspace root');
+    return runContractSuite(ordinary, root);
+  }
+
+  demand(JSON.stringify(process.argv.slice(2)) === JSON.stringify(TESTS), 'Controlled test scope/order differs from the six reviewed exact names');
+  const root = resolve(fileURLToPath(new URL('../', import.meta.url)));
+  demand(realpathSync(process.cwd()) === realpathSync(root), 'Run the controlled tests from the workspace root');
+  const directory = join(root, 'native-dns-ci-evidence');
+  mkdirSync(directory, { recursive: true });
+  const statusPath = join(directory, 'runtime-status.txt');
+  writeFileSync(statusPath, '');
+  const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--locked', '--no-deps', '--format-version=1'],
+    { cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024 }));
+  const prepared = await executeCommand({ id: 'controlled-build', program: 'cargo',
+    args: ['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'] },
+  { root, env: process.env, directory, timeout: 20 * 60_000, captureStdout: true });
+  demand(prepared.status === 0 && !prepared.error && !prepared.cleanupUncertain && !prepared.interrupted, 'Controlled production verification preparation failed');
+  const messages = prepared.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  const selected = selectNativeExecutable(messages, metadata, root);
+  selected.sha256 = hash(selected.executable);
+  writeFileSync(join(directory, 'controlled-cargo-metadata.json'), JSON.stringify(metadata) + '\n');
+  writeFileSync(join(directory, 'controlled-executable.json'), JSON.stringify({ ...selected, preparationCalls: 1 }, null, 2) + '\n');
+  bindNativeRuntime(selected, root, process.env, directory);
+  const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();
+  const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);
+  // Cargo runs libtests in the package directory, rather than the workspace root.
+  await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));
+}`;
+const NATIVE_SELECTOR = String.raw`export function selectNativeExecutable(messages, metadata, root) {
+  const packages=metadata.packages.filter((p)=>p.name==='polaris' && resolve(p.manifest_path)===join(root,'src-tauri/Cargo.toml'));
+  demand(packages.length===1,'Expected current App package');
+  const pkg=packages[0];
+  const targets=pkg.targets.filter((t)=>t.name==='native-admission-verifier' && t.kind.length===1 && t.kind[0]==='bin'
+    && resolve(t.src_path)===join(root,'src-tauri/src/bin/native-admission-verifier.rs'));
+  demand(targets.length===1,'Expected reviewed production verification binary');
+  const rows=messages.filter((m)=>m.reason==='compiler-artifact' && m.package_id===pkg.id && m.profile?.test===false && m.profile?.debug_assertions===true
+    && m.target?.name===targets[0].name && JSON.stringify(m.target.kind)===JSON.stringify(targets[0].kind)
+    && resolve(m.target.src_path)===resolve(targets[0].src_path) && m.executable
+    && Array.isArray(m.features) && m.features.includes('native-production-verification'));
+  demand(rows.length===1,'Expected one normal-library verification artifact');
+  const artifact=rows[0], executable=artifact.executable;
+  demand(isAbsolute(executable) && inside(resolve(metadata.target_directory),executable),'Native artifact escaped Cargo target');
+  demand(lstatSync(executable).isFile() && realpathSync(executable)===executable,'Native artifact must be an unlinked regular file');
+  demand(artifact.features.every((value) => typeof value === 'string')
+    && new Set(artifact.features).size === artifact.features.length, 'Malformed native artifact features');
+  const selected = {executable,packageId:pkg.id,manifest:pkg.manifest_path,features:[...artifact.features],
+    carrier:'normal-production-library',nativeProduction:true,nonTest:true,debugAssertions:true};
+  nativeSelections.set(selected, JSON.stringify(selectionIdentity(selected)));
+  return selected;
+}`;
+const NATIVE_CASE_DECLARATION = String.raw`export const TESTS = Object.freeze([
+  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',
+  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
+  'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
+  'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
+  'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
+  'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',
+]);`;
+
+function assertClosedNativeMain(source: string): void {
+  const main = runnerRegion(source, 'main');
+  assert.equal(nativeLines(main.raw), nativeLines(NATIVE_MAIN), 'exact single awaited normal build/receipt/binding/env/closed-session route');
+  assert.equal(nativeLines(runnerRegion(source, 'selectNativeExecutable').raw), nativeLines(NATIVE_SELECTOR), 'exact current normal non-test debug artifact selector');
+  assert.equal(nativeLines(runnerRegion(source, 'TESTS').raw), nativeLines(NATIVE_CASE_DECLARATION), 'all six names in their reviewed order, once');
+  const code = runnerViews(source).code;
+  for (const name of ['withNativeSession', 'runTests', 'bindNativeRuntime']) {
+    assert.equal([...code.matchAll(new RegExp(`\\b${name}\\s*\\(`, 'g'))].length, 2, `${name}: one declaration and one actual invocation`);
+  }
+  requireRunnerCode(source, 'bindNativeRuntime', 'nativeSelections.get(selected) === JSON.stringify(selectionIdentity(selected))');
+  requireRunnerCode(source, 'bindNativeRuntime', 'const artifact = nativeArtifact(root, directory);');
+  requireRunnerCode(source, 'withNativeSession', 'holder = await start(selected, env, directory);');
+  requireRunnerCode(source, 'withNativeSession', 'await run();');
+  const session = runnerRegion(source, 'withNativeSession').raw;
+  const attach = executableAnchor(session, 'authority.session = holder;');
+  const invoke = executableAnchor(session, 'await run();');
+  const detach = executableAnchor(session, 'delete authority.session;');
+  const finish = executableAnchor(session, 'await holder.finish()');
+  assert.ok(attach < invoke && invoke < detach && detach < finish, 'await the suite inside the one attached holder before teardown');
+  requireRunnerCode(source, 'runTests', 'for (const name of TESTS) {');
+  requireRunnerCode(source, 'runTests', "const result = await execute({ id: name.split('::').at(-1), program: selected.executable,");
+  requireRunnerCode(source, 'runTests', "args: selected.carrier === 'normal-production-library' ? [name] : [name, '--exact', '--ignored', '--nocapture', '--test-threads=1']");
+}
+
+
+const CLOSED_SESSION_CALL = 'await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));';
+const CLOSED_ROUTE_NEGATIVES = [
+  ['empty main', 'main', NATIVE_MAIN, 'async function main() {}'],
+  ['duplicate main', 'main', NATIVE_MAIN, NATIVE_MAIN + '\n' + NATIVE_MAIN],
+  ['main string replay', 'main', NATIVE_MAIN, 'async function main() {}\nconst replay = ' + JSON.stringify(NATIVE_MAIN) + ';'],
+  ['fire-and-forget callback', 'main', '() => runTests(selected, env, directory)', '() => { runTests(selected, env, directory); }'],
+  ['extra suite outside main', 'main', NATIVE_MAIN, NATIVE_MAIN + '\nawait runTests(selected, env, directory);'],
+  ['extra wrapper outside main', 'main', NATIVE_MAIN, NATIVE_MAIN + '\n' + CLOSED_SESSION_CALL],
+  ['binding wrong selected', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'bindNativeRuntime(otherSelected, root, process.env, directory);'],
+  ['binding wrong env', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'bindNativeRuntime(selected, root, otherEnv, directory);'],
+  ['binding wrong directory', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'bindNativeRuntime(selected, root, process.env, otherDirectory);'],
+  ['template expression extra suite', 'main', NATIVE_MAIN, NATIVE_MAIN + '\nconst other = `${runTests(selected, env, directory)}`;'],
+  ['suite loop narrowed', 'runTests', 'for (const name of TESTS) {', 'for (const name of TESTS.slice(0, 1)) {'],
+  ['suite loop reordered', 'runTests', 'for (const name of TESTS) {', 'for (const name of [...TESTS].reverse()) {'],
+  ['suite loop duplicated', 'runTests', 'for (const name of TESTS) {', 'for (const name of [...TESTS, ...TESTS]) {'],
+  ['session callback not awaited', 'withNativeSession', 'await run();', 'run();'],
+  ['wrapper replaced', 'main', CLOSED_SESSION_CALL, 'await otherSession(selected, env, directory, () => runTests(selected, env, directory));'],
+  ['callback disconnected', 'main', '() => runTests(selected, env, directory)', '() => otherTests(selected, env, directory)'],
+  ['callback empty', 'main', '() => runTests(selected, env, directory)', '() => {}'],
+  ['wrapper not awaited', 'main', CLOSED_SESSION_CALL, CLOSED_SESSION_CALL.replace('await ', '')],
+  ['double wrapper', 'main', CLOSED_SESSION_CALL, `${CLOSED_SESSION_CALL}\n  ${CLOSED_SESSION_CALL}`],
+  ['extra direct suite', 'main', CLOSED_SESSION_CALL, `${CLOSED_SESSION_CALL}\n  await runTests(selected, env, directory);`],
+  ['direct suite bypass', 'main', CLOSED_SESSION_CALL, 'await runTests(selected, env, directory);'],
+  ['per-case sessions', 'main', CLOSED_SESSION_CALL, 'for (const name of TESTS) await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));'],
+  ['wrong selected', 'main', CLOSED_SESSION_CALL, CLOSED_SESSION_CALL.replace('withNativeSession(selected,', 'withNativeSession(otherSelected,')],
+  ['wrong env', 'main', '() => runTests(selected, env, directory)', '() => runTests(selected, otherEnv, directory)'],
+  ['wrong directory', 'main', '() => runTests(selected, env, directory)', '() => runTests(selected, env, otherDirectory)'],
+  ['binding omitted', 'main', 'bindNativeRuntime(selected, root, process.env, directory);', 'void selected;'],
+  ['build repeated', 'main', "const prepared = await executeCommand({ id: 'controlled-build', program: 'cargo',", "await executeCommand({ id: 'other-build', program: 'cargo', args: [] }, {});\n  const prepared = await executeCommand({ id: 'controlled-build', program: 'cargo',"],
+  ['forged receipt', 'main', 'JSON.stringify({ ...selected, preparationCalls: 1 }, null, 2)', 'JSON.stringify({ ...otherSelected, preparationCalls: 1 }, null, 2)'],
+  ['line comment replay', 'main', CLOSED_SESSION_CALL, `await otherTests(selected, env, directory); // ${CLOSED_SESSION_CALL}`],
+  ['block comment replay', 'main', CLOSED_SESSION_CALL, `await otherTests(selected, env, directory); /* ${CLOSED_SESSION_CALL} */`],
+  ['string replay', 'main', CLOSED_SESSION_CALL, `await otherTests(selected, env, directory); const replay = ${JSON.stringify(CLOSED_SESSION_CALL)};`],
+  ['template replay', 'main', CLOSED_SESSION_CALL, 'await otherTests(selected, env, directory); const replay = `' + CLOSED_SESSION_CALL + '`;'],
+  ["binding after session", "main", "  bindNativeRuntime(selected, root, process.env, directory);\n  const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();\n  const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);\n  // Cargo runs libtests in the package directory, rather than the workspace root.\n  await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));", "  const sysroot = execFileSync('rustc', ['--print', 'target-libdir'], { encoding: 'utf8', timeout: 30_000 }).trim();\n  const env = runtimeEnvironment(messages, resolve(metadata.target_directory), selected.executable, sysroot);\n  // Cargo runs libtests in the package directory, rather than the workspace root.\n  await withNativeSession(selected, env, directory, () => runTests(selected, env, directory));\n  bindNativeRuntime(selected, root, process.env, directory);"],
+  ["case order changed", "TESTS", "  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',\n  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',", "  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',\n  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',"],
+  ["empty suite", "TESTS", NATIVE_CASE_DECLARATION, "export const TESTS = Object.freeze([]);"],
+  ["duplicate case", "TESTS", "  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',\n  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',", "  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',\n  'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',\n  'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',"],
+] as const;
+
+
+// The no-package explanation also depends on the real native-required CI job,
+// its full platform matrix and the actual six-case shell invocation.
+function nativeCiRegion(source: string, owner: 'header' | 'runtime'): { start: number; end: number; raw: string; visible: string } {
+  const visible = source.replace(/^[ \t]*#.*$/gm, line => ' '.repeat(line.length));
+  const jobs = [...visible.matchAll(/^  test:\n/gm)];
+  assert.equal(jobs.length, 1, 'one actual native CI job');
+  const jobStart = jobs[0].index!;
+  const next = /^  [a-z][a-z0-9_-]*:\n/gm; next.lastIndex = jobStart + jobs[0][0].length;
+  const jobEnd = next.exec(visible)?.index ?? visible.length;
+  let start = jobStart, end = visible.indexOf('\n    steps:', start) + '\n    steps:'.length;
+  if (owner === 'runtime') {
+    const marker = '      - name: Run exact controlled App lifecycle hot-switch and stats tests';
+    const positions = [...visible.slice(jobStart, jobEnd).matchAll(/^      - name: Run exact controlled App lifecycle hot-switch and stats tests$/gm)];
+    assert.equal(positions.length, 1, 'one actual controlled runtime step in native job');
+    start = jobStart + positions[0].index!;
+    const sibling = /^      - /gm; sibling.lastIndex = start + marker.length;
+    end = sibling.exec(visible)?.index ?? jobEnd;
+  }
+  assert.ok(start >= jobStart && end > start && end <= jobEnd, 'closed nonempty native CI owner');
+  return { start, end, raw: source.slice(start, end), visible: visible.slice(start, end) };
+}
+const yamlNativeLines = (source: string): string => source.replace(/^[ \t]*#.*$/gm, '').split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+const NATIVE_CI_HEADER = "  test:\n    needs: cheap_format\n    if: >-\n      needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.native_required != 'false'\n    name: ${{ needs.cheap_format.outputs.app_native_compile_only == 'true' && 'Native consumer compile only' || 'build + test' }} (${{ matrix.os }})\n    runs-on: ${{ matrix.os }}\n    timeout-minutes: 120\n    permissions:\n      contents: read\n    strategy:\n      # 维持 false 的理由见 lint job 的同名字段（那段别优化掉；两个矩阵 job 取同一判据）。\n      fail-fast: false\n      matrix:\n        # 与 lint job 的矩阵表达式**逐字相同**（事件条件矩阵 + dispatch 单平台分支，逐条理由写在那边）。\n        # 两份必须一起改：只改一份，同一事件下「lint 跑了哪些平台」与「test 跑了哪些平台」就分家了。\n        # 逐字相等由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 钉住。\n        os: >-\n          ${{ (github.event_name == 'workflow_dispatch'\n              && github.event.inputs.os != ''\n              && github.event.inputs.os != 'all')\n              && fromJSON(format('[\"{0}\"]', github.event.inputs.os))\n              || ((github.event_name == 'push' && github.ref == 'refs/heads/main')\n                  && fromJSON('[\"ubuntu-22.04\"]')\n                  || fromJSON('[\"ubuntu-22.04\",\"windows-2022\",\"macos-15\"]')) }}\n\n    steps:";
+const NATIVE_CI_RUNTIME = "      - name: Run exact controlled App lifecycle hot-switch and stats tests\n        id: native_dns_app_runtime\n        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && !cancelled() && needs.cheap_format.outputs.native_dns_candidate != '' && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}\n        shell: bash\n        run: |\n          set -euo pipefail\n          node --test scripts/native-dns-ci-routing.test.mjs scripts/run-native-dns-controlled-tests.test.mjs scripts/windows-directory-toolchain.test.mjs\n          tests=(\n            runtime::proxy::tests::lifecycle::real_core_full_lifecycle\n            runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop\n            runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid\n            runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt\n            runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation\n            runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames\n          )\n          node scripts/run-native-dns-controlled-tests.mjs \"${tests[@]}\"\n";
+function assertNativeCiRoute(source: string): void {
+  assert.equal(yamlNativeLines(nativeCiRegion(source, 'header').raw), yamlNativeLines(NATIVE_CI_HEADER), 'native-required gate keeps its full platform scope');
+  assert.equal(yamlNativeLines(nativeCiRegion(source, 'runtime').raw), yamlNativeLines(NATIVE_CI_RUNTIME), 'real native CI runs all six normal cases with existing build/admission/error gates');
+}
+const NATIVE_CI_NEGATIVES = [
+  ['native job disconnected', 'header', "needs.cheap_format.outputs.native_required != 'false'", 'false'],
+  ['platform scope narrowed', 'header', "fromJSON('[\"ubuntu-22.04\",\"windows-2022\",\"macos-15\"]')", "fromJSON('[\"ubuntu-22.04\"]')"],
+  ['runner disconnected', 'runtime', 'node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"', 'node scripts/other.mjs "${tests[@]}"'],
+  ['case omitted', 'runtime', '            runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames\n', ''],
+  ['explicit candidate admission removed', 'runtime', "needs.cheap_format.outputs.native_dns_candidate != ''", 'false'],
+  ['implicit default cannot authorize controlled runtime', 'runtime', "needs.cheap_format.outputs.native_dns_candidate != ''", "(needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true')"],
+  ['build gate bypassed', 'runtime', "steps.workspace_build.outcome == 'success'", 'true'],
+  ['error ignored', 'runtime', '        shell: bash', '        continue-on-error: true\n        shell: bash'],
+] as const;
+
 describe('CI 影响分类器的完备性（fail-open 根治）', () => {
   it('实际核身份采集入口的变更同时点亮真核门与桌面包装，不能只登记包装腿', () => {
     expect(compact(['scripts/native-payload-input.mjs'])).toEqual({
@@ -149,6 +438,156 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       expect(actual.unregisteredScopes).toEqual([]);
     }
   });
+  it('验收 carrier 的 no-package 判定绑定真实 feature/target，并保留 native CI', () => {
+    const cargo = readFileSync(join(REPO_ROOT, 'src-tauri/Cargo.toml'), 'utf8');
+    const binaries = cargo.split(/^\[\[bin\]\]\s*$/m).slice(1)
+      .map((section) => section.split(/^\[/m)[0]);
+    const verifier = binaries.filter((section) => /^name\s*=\s*"native-admission-verifier"\s*$/m.test(section));
+    expect(verifier).toHaveLength(1);
+    expect(verifier[0]).toMatch(/^path\s*=\s*"src\/bin\/native-admission-verifier\.rs"\s*$/m);
+    expect(verifier[0]).toMatch(/^required-features\s*=\s*\["native-production-verification"\]\s*$/m);
+    expect(cargo).toMatch(/^native-production-verification\s*=\s*\[\]\s*$/m);
+    expect(cargo.match(/^default\s*=.*$/m)?.[0]).not.toContain('native-production-verification');
+    // A new implicit/default binary needs a fresh impact decision, rather than
+    // inheriting the current acceptance-only explanation for src/bin/.
+    expect(readdirSync(join(REPO_ROOT, 'src-tauri/src/bin')).sort())
+      .toEqual(['native-admission-verifier.rs']);
+    const entry = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/bin/native-admission-verifier.rs'), 'utf8'));
+    expect(entry).toMatch(/#\[cfg\(not\(debug_assertions\)\)\]\s*compile_error!\("native admission verifier is unavailable in release builds"\);/);
+    expect(entry).toContain('polaris_lib::run_native_production_verification(&args[0]).await');
+    const library = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/lib.rs'), 'utf8'));
+    const proxy = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/runtime/proxy.rs'), 'utf8'));
+    const carrier = maskRustComments(readFileSync(join(REPO_ROOT, 'src-tauri/src/native_verification/proxy_carrier.rs'), 'utf8'));
+    // Separate cfg attrs are an AND. All three parent guards, the local debug
+    // guard and the exact normal-library route are mandatory, never optional.
+    const guardedDefinitionIsUnique = (source: string, guard: RegExp, declaration: RegExp): boolean => {
+      // Both Rust masks preserve UTF-8 byte offsets. Compare byte-wide views so
+      // Unicode before a declaration cannot move the ownership comparison.
+      const visible = Buffer.from(source, 'utf8').toString('latin1');
+      const code = Buffer.from(maskRustCommentsAndStrings(source), 'utf8').toString('latin1');
+      const guarded = [...visible.matchAll(guard)];
+      const declared = [...code.matchAll(declaration)];
+      return guarded.length === 1 && declared.length === 1
+        && guarded[0].index + guarded[0][0].indexOf('pub') === declared[0].index;
+    };
+    const parentGuardMutations = [
+      ['#[cfg(desktop)]', ''],
+      ['#[cfg(desktop)]', '#[cfg(mobile)]'],
+      ['#[cfg(feature = "native-production-verification")]', ''],
+      ['#[cfg(feature = "native-production-verification")]', '#[cfg(feature = "unreviewed-native-feature")]'],
+      ['#[cfg(debug_assertions)]', ''],
+      ['#[cfg(debug_assertions)]', '#[cfg(not(debug_assertions))]'],
+    ] as const;
+    const guardedOwners = [
+      {
+        name: 'normal-library export', source: library,
+        guard: /^#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*#\[cfg\(debug_assertions\)\]\s*pub async fn run_native_production_verification\(case: &str\) -> Result<\(\), String> \{\s*runtime::proxy::native_verification::run_case\(case\)\.await\s*\}/gm,
+        declaration: /\bpub\s+async\s+fn\s+run_native_production_verification\s*\(/g,
+        mutations: [
+          ...parentGuardMutations,
+          ['pub async fn run_native_production_verification(', 'pub async fn unreviewed_native_verification('],
+          ['runtime::proxy::native_verification::run_case(case).await', 'runtime::proxy::native_verification::unreviewed_case(case).await'],
+        ],
+      },
+      {
+        name: 'normal-library carrier module', source: proxy,
+        guard: /^#\[cfg\(desktop\)\]\s*#\[cfg\(feature = "native-production-verification"\)\]\s*#\[cfg\(debug_assertions\)\]\s*#\[path = "\.\.\/native_verification\/proxy_carrier\.rs"\]\s*pub\(crate\) mod native_verification;/gm,
+        declaration: /\bpub\(crate\)\s+mod\s+native_verification\s*;/g,
+        mutations: [
+          ...parentGuardMutations,
+          ['../native_verification/proxy_carrier.rs', '../native_verification/unreviewed_carrier.rs'],
+          ['pub(crate) mod native_verification;', 'pub(crate) mod unreviewed_verification;'],
+        ],
+      },
+      {
+        name: 'local closed case entry', source: carrier,
+        guard: /^#\[cfg\(debug_assertions\)\]\s*pub\(crate\) async fn run_case\(case: &str\) -> Result<\(\), String> \{\s*if !CASE_NAMES\.contains\(&case\) \{/gm,
+        declaration: /\bpub\(crate\)\s+async\s+fn\s+run_case\s*\(/g,
+        mutations: [
+          ['#[cfg(debug_assertions)]', ''],
+          ['#[cfg(debug_assertions)]', '#[cfg(not(debug_assertions))]'],
+          ['pub(crate) async fn run_case(', 'pub(crate) async fn unreviewed_case('],
+          ['if !CASE_NAMES.contains(&case)', 'if false'],
+        ],
+      },
+    ] as const;
+    for (const { name, source, guard, declaration, mutations } of guardedOwners) {
+      expect(source.trim().length, `${name}: nonempty actual source`).toBeGreaterThan(0);
+      expect(guardedDefinitionIsUnique(source, guard, declaration), name).toBe(true);
+      const matches = [...source.matchAll(guard)];
+      expect(matches, `${name}: one actual guarded target`).toHaveLength(1);
+      const target = matches[0][0];
+      const start = matches[0].index;
+      expect(target.length, `${name}: nonempty target read domain`).toBeGreaterThan(0);
+      for (const [old, replacement] of mutations) {
+        expect(guardedDefinitionIsUnique(source, guard, declaration), `${name}: positive before each mutation`).toBe(true);
+        expect(target.split(old), `${name}: unique target anchor ${old}`).toHaveLength(2);
+        const changedTarget = target.replace(old, replacement);
+        expect(changedTarget, `${name}: target itself must change`).not.toBe(target);
+        expect(changedTarget.trim().length, `${name}: mutation cannot empty the read domain`).toBeGreaterThan(0);
+        const changed = source.slice(0, start) + changedTarget + source.slice(start + target.length);
+        expect(changed.slice(start, start + changedTarget.length)).toBe(changedTarget);
+        expect(changed.slice(0, start)).toBe(source.slice(0, start));
+        expect(changed.slice(start + changedTarget.length)).toBe(source.slice(start + target.length));
+        expect(guardedDefinitionIsUnique(changed, guard, declaration), `${name}: reject ${old} -> ${replacement}`).toBe(false);
+      }
+      expect(guardedDefinitionIsUnique(`${source}\n${target}`, guard, declaration), `${name}: duplicate guarded target`).toBe(false);
+      const unguarded = target.slice(target.indexOf('pub'));
+      expect(guardedDefinitionIsUnique(`${source}\n${unguarded}`, guard, declaration), `${name}: duplicate unguarded target`).toBe(false);
+      const withoutDebug = target.replace('#[cfg(debug_assertions)]', '');
+      const changed = source.slice(0, start) + withoutDebug + source.slice(start + target.length);
+      expect(guardedDefinitionIsUnique(`${changed}\nconst REPLAY: &str = r####"\n${target}\n"####;`, guard, declaration), `${name}: string replay cannot replace the actual guard`).toBe(false);
+    }
+    const runner = readFileSync(join(REPO_ROOT, 'scripts/run-native-dns-controlled-tests.mjs'), 'utf8');
+    assertClosedNativeMain(runner);
+    const nativeCi = readFileSync(join(REPO_ROOT, '.github/workflows/ci.yml'), 'utf8');
+    assertNativeCiRoute(nativeCi);
+    for (const [name, owner, before, after] of NATIVE_CI_NEGATIVES) {
+      assertNativeCiRoute(nativeCi);
+      const region = nativeCiRegion(nativeCi, owner), at = executableAnchor(region.raw, before);
+      expect(region.raw.slice(at, at + before.length), name).toBe(before);
+      const changedTarget = region.raw.slice(0, at) + after + region.raw.slice(at + before.length);
+      expect(changedTarget, name).not.toBe(region.raw);
+      expect(changedTarget.trim().length, name).toBeGreaterThan(0);
+      const changed = nativeCi.slice(0, region.start) + changedTarget + nativeCi.slice(region.end);
+      expect(changed.slice(0, region.start), name).toBe(nativeCi.slice(0, region.start));
+      expect(changed.slice(region.start + changedTarget.length), name).toBe(nativeCi.slice(region.end));
+      expect(() => assertNativeCiRoute(changed), name).toThrow(AssertionError);
+    }
+    for (const [name, owner, before, after] of CLOSED_ROUTE_NEGATIVES) {
+      assertClosedNativeMain(runner); // Positive baseline before every individual mutation.
+      const region = runnerRegion(runner, owner), at = executableAnchor(region.raw, before);
+      const changedTarget = region.raw.slice(0, at) + after + region.raw.slice(at + before.length);
+      expect(region.raw.slice(at, at + before.length), name).toBe(before);
+      expect(changedTarget, name).not.toBe(region.raw);
+      expect(changedTarget.trim().length, name).toBeGreaterThan(0);
+      const changed = runner.slice(0, region.start) + changedTarget + runner.slice(region.end);
+      expect(changed.slice(0, region.start), name).toBe(runner.slice(0, region.start));
+      expect(changed.slice(region.start + changedTarget.length), name).toBe(runner.slice(region.end));
+      expect(() => assertClosedNativeMain(changed), name).toThrow(AssertionError);
+    }
+    for (const path of [
+      'src-tauri/src/bin/native-admission-verifier.rs',
+      'src-tauri/src/native_verification/proxy_carrier.rs',
+      'src-tauri/src/native_verification/cleanup.rs',
+    ]) {
+      expect(compact([path]), path).toEqual({ kernel: false, platforms: [], preflight: false, hasPackage: false });
+      expect(classifyImpact([path]).android, path).toBe(false);
+      expect(classifyImpact([path]).unregisteredScopes, path).toEqual([]);
+      const diff = `:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0${path}\0`;
+      expect(classifyNativeImpact(diff).nativeRequired, path).toBe(true);
+      expect(classifyNativeImpact(`:100644 100644 ${'1'.repeat(40)} ${'2'.repeat(40)} M\0scripts/postprocess-appimage.test.mjs\0${diff}`).nativeRequired, `mixed: ${path}`).toBe(true);
+    }
+    for (const scope of ['src-tauri/src/bin/', 'src-tauri/src/native_verification/']) {
+      expect(PACKAGE_IMPACT_SCOPES).not.toHaveProperty(scope);
+      expect(NO_PACKAGE_IMPACT_SCOPES[scope]).toContain('native-production-verification');
+    }
+    for (const path of ['src-tauri/src/bin_other/entry.rs', 'src-tauri/src/native_verification_other/mod.rs']) {
+      expect(classifyImpact([path]).unregisteredScopes, path).toHaveLength(1);
+      expect(classifyImpact([path]).platforms, path).toEqual([...ALL_PACKAGE_PLATFORMS]);
+    }
+  });
+
   it('本地资源目录 symlink 按目录 scope 枚举，未知目录仍会触发登记门', () => {
     const root = mkdtempSync(join(tmpdir(), 'polaris-impact-scopes-'));
     try {
@@ -178,6 +617,8 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'crates/stats-engine/',
       'crates/config-engine/',
       'src-tauri/src/runtime/',
+      'src-tauri/src/bin/',
+      'src-tauri/src/native_verification/',
       'src-tauri/tauri.conf.json',
       // resources/data/ 的 28 个 .srs 入库且进四个包（见分类器的 PACKAGE_IMPACT_SCOPES）；
       // 它掉出枚举面 = 整个 resources/ 登记根没被扫到，那正是 2026-08-30 前的 fail-open 形态。

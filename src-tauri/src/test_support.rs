@@ -346,7 +346,7 @@ pub(crate) fn write_executable_stand_in(path: &Path, contents: impl AsRef<[u8]>)
         .expect("替身必须可加执行位");
 }
 
-/// 把一条真起 `sing-box check` 探针的测试原样放进**独占子进程**里跑；返回 `true` 表示本进程是
+/// 把一条依赖进程级准入账本的测试原样放进**独占子进程**里跑；返回 `true` 表示本进程是
 /// 父进程、子进程已跑完并通过。`module` 传调用处的 `module_path!()`，`name` 传测试函数名。
 ///
 /// 这些测试经 `run_check_raw` 记进**进程级**那本 check 账，与同进程里并行的原生起核测试共用同一道
@@ -357,7 +357,8 @@ pub(crate) fn write_executable_stand_in(path: &Path, contents: impl AsRef<[u8]>)
 ///
 /// 子进程必须**恰好跑了这一条且通过**：`--exact` 过滤成 0 条时退出码同样是 0，只看退出码会把
 /// 「什么都没跑」当成通过。
-#[cfg(all(test, unix))]
+/// 隔离器只用跨平台 std 进程接口；Windows 上的纯状态测试同样不能共享父进程的 producer pause。
+#[cfg(test)]
 pub(crate) fn ran_in_isolated_worker(module: &str, name: &str) -> bool {
     const MARKER: &str = "POLARIS_ISOLATED_CHECK_WORKER";
     let test = format!("{}::{name}", module.split_once("::").unwrap().1);

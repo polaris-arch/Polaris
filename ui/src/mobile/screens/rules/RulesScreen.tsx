@@ -155,6 +155,7 @@ const GEO_RESET_KEY = 'geo-reset';
 const APP_CATEGORY_KEYS = [APP_CATEGORY_ALL, 'video', 'social', 'ai', 'tools', 'game'] as const;
 
 export function MobileRulesScreen(): ReactElement {
+  const isIOS = typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios';
   const { t, i18n } = useTranslation();
   /** 薄封装：分段是纯呈现组件，不该各自持有 i18next 实例。 */
   const tr = useCallback(
@@ -1830,7 +1831,8 @@ export function MobileRulesScreen(): ReactElement {
           search={appSearch}
           onSearchChange={setAppSearch}
           groups={appGroups}
-          platformNote={tr('mobileRules.appRoutingMatchNote')}
+          platformNote={tr(isIOS ? 'mobileRules.appRoutingMatchNoteIos' : 'mobileRules.appRoutingMatchNote')}
+          isIOS={isIOS}
           view={appView}
           onViewChange={setAppView}
           masterError={errorOf('appRoutingEnabled')}

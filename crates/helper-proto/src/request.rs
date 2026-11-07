@@ -193,6 +193,7 @@ pub struct LinuxDnsSetParams {
 pub enum Request {
     /// Closed Mac Root Helper CheckConfig, never a general process request.
     MacCheck(crate::check_config::CheckRequest),
+    WindowsCheck(crate::check_config::CheckRequest),
     /// `ping`（无参数行）。
     Ping,
     /// `version`（无参数行）。
@@ -253,6 +254,12 @@ pub enum Request {
     InstallCore(InstallCoreParams),
     /// Linux：`resolved-dns-set <interface> <server-ip>`（proto v1 兼容扩展）。
     LinuxDnsSet(LinuxDnsSetParams),
+    /// Read only the current authenticated helper birth and its fixed TUN link.
+    LinuxDnsSnapshot,
+    /// Strict JSON CompareRequest; no arbitrary interface/DNS setter.
+    LinuxDnsCompare {
+        payload: String,
+    },
     /// Linux：`resolved-dns-revert <interface>`（proto v1 兼容扩展）。
     LinuxDnsRevert {
         interface_name: String,
@@ -292,6 +299,7 @@ impl Request {
     pub fn command_name(&self) -> &'static str {
         match self {
             Self::MacCheck(_) => crate::check_config::COMMAND,
+            Self::WindowsCheck(_) => crate::check_config::WINDOWS_COMMAND,
             Self::Ping => command::common::PING,
             Self::Version => command::common::VERSION,
             Self::PrepareHelperUpgrade => command::common::PREPARE_HELPER_UPGRADE,
@@ -316,6 +324,8 @@ impl Request {
             Self::RouteDel(_) => command::common::ROUTE_DEL,
             Self::InstallCore(_) => command::mac::INSTALL_CORE, // linux 同名（command::linux::INSTALL_CORE == "install-core"）
             Self::LinuxDnsSet(_) => command::linux::RESOLVED_DNS_SET,
+            Self::LinuxDnsSnapshot => command::linux::RESOLVED_DNS_SNAPSHOT,
+            Self::LinuxDnsCompare { .. } => command::linux::RESOLVED_DNS_COMPARE,
             Self::LinuxDnsRevert { .. } => command::linux::RESOLVED_DNS_REVERT,
             Self::DefaultRestore { .. } => command::mac::DEFAULT_RESTORE,
             Self::FlushDns => command::mac::FLUSH_DNS,
@@ -336,12 +346,18 @@ impl Request {
     /// （Go 的 `readLine` 对 EOF 返回 `""`，故少发一行 ≠ 协议错，只是该参数取默认值 —— 如 start 的 ppid）。
     pub fn write_args(&self, out: &mut Vec<String>) {
         match self {
-            Self::MacCheck(request) => request.write_args(out),
+            Self::MacCheck(request) | Self::WindowsCheck(request) => request.write_args(out),
             Self::CoreStatus { id } => out.push(id.as_str().to_owned()),
             Self::LinuxStartPinned(params) | Self::NativeStartPinned(params) => {
                 out.push(crate::core_protocol::PINNED_EXECUTION_DISCRIMINATOR.to_owned());
                 out.push(params.id.as_str().to_owned());
                 push_start_args(&params.common, out);
+                if let Some(directory) = &params.runtime_directory {
+                    if params.common.parent_pid.is_none() {
+                        out.push(String::new());
+                    }
+                    out.push(format!("runtime-root-v1={directory}"));
+                }
             }
             Self::Ping
             | Self::PrepareHelperUpgrade
@@ -349,6 +365,7 @@ impl Request {
             | Self::Version
             | Self::Status
             | Self::LinuxStatusBirth
+            | Self::LinuxDnsSnapshot
             | Self::NativeStatusBirth
             | Self::Cleanup
             | Self::FlushDns
@@ -401,6 +418,7 @@ impl Request {
                 out.push(p.src_dir.clone());
                 out.push(p.want_hash.clone());
             }
+            Self::LinuxDnsCompare { payload } => out.push(payload.clone()),
             Self::LinuxDnsSet(p) => {
                 out.push(p.interface_name.clone());
                 out.push(p.server_ip.clone());

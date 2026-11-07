@@ -618,6 +618,10 @@ export interface ConnectionsViewProps {
   logWindow: PageSlice;
   onLogPage: (page: number) => void;
   logPrivacyNote: boolean;
+  logStreamReady?: boolean;
+  logStreamFailed?: boolean;
+  logSearchFailed?: boolean;
+  onRetryLogs?: () => void;
   /**
    * W26 前遗留的无界 `singbox.log` 那条提示（桌面 `LogsScreen.tsx` 的 `#log-legacy-note`）。
    *
@@ -845,6 +849,14 @@ export function ConnectionsView(props: ConnectionsViewProps): ReactElement {
       {/* ══════════ 日志 ══════════ */}
       {segment === 'logs' && (
         <div className="mc-body" data-segment="logs">
+          {(props.logStreamFailed || props.logSearchFailed) && (
+            <div className="mc-notice" role="alert" data-log-stream-error="1">
+              <span>{t(props.logStreamFailed ? 'logs.streamFailed' : 'errors.operationFailed')}</span>
+              <button type="button" className="mc-btn" onClick={props.onRetryLogs}>
+                {t('common.retry')}
+              </button>
+            </div>
+          )}
           {props.logPrivacyNote && (
             <div className="mc-notice info" role="status">
               <WarningIcon />
@@ -918,10 +930,10 @@ export function ConnectionsView(props: ConnectionsViewProps): ReactElement {
           </div>
 
           <div className="mc-logfoot">
-            <span className="mc-live">
+            {props.logStreamReady !== false && <span className="mc-live">
               <span className={`mc-live-dot ${props.follow ? 'on' : 'off'}`} />
               <span>{t('logs.liveStream')}</span>
-            </span>
+            </span>}
             <span className="mc-log-count">
               {t('mobileConnections.logs.lines', { n: props.logTotal })}
             </span>

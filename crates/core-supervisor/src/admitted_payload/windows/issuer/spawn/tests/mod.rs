@@ -49,6 +49,8 @@ fn native_case(cancel: bool) {
         &input,
         &root,
         &[&held, &marker_guard],
+        ExecPurpose::RunMain,
+        Some(&root),
     )
     .unwrap();
     // The actual factory, including HANDLE_LIST/JOB_LIST/mitigations, has run.
@@ -143,4 +145,46 @@ fn native_atomic_guard_and_job_survive_parent_file_release_until_actual_wait() {
 #[test]
 fn native_atomic_job_close_is_fail_stop_without_post_spawn_assign() {
     native_case(true);
+}
+
+#[test]
+fn fixed_check_and_run_argv_are_separate_and_inventory_has_no_factory() {
+    assert_eq!(
+        fixed_arguments(ExecPurpose::CheckConfig, None).unwrap(),
+        "--disable-color check -c stdin"
+    );
+    assert_eq!(
+        fixed_arguments(
+            ExecPurpose::RunMain,
+            Some(Path::new(r"C:\Users\测试 Account\Polaris"))
+        )
+        .unwrap(),
+        r#"run -c stdin -D "C:\Users\测试 Account\Polaris""#
+    );
+    assert!(fixed_arguments(ExecPurpose::TlsInventory, None).is_err());
+}
+
+#[test]
+fn recovery_directory_cannot_become_extra_windows_arguments_or_check_state() {
+    assert_eq!(
+        fixed_arguments(ExecPurpose::RunMain, Some(Path::new(r"C:\"))).unwrap(),
+        r#"run -c stdin -D "C:\\""#
+    );
+    for root in [
+        r"relative",
+        "C:\\bad\" -c other",
+        "C:\\bad\nroot",
+        "C:\\bad\0root",
+    ] {
+        assert!(fixed_arguments(ExecPurpose::RunMain, Some(Path::new(root))).is_err());
+    }
+    assert!(fixed_arguments(ExecPurpose::RunMain, None).is_err());
+    for purpose in [
+        ExecPurpose::CheckConfig,
+        ExecPurpose::RunLogin,
+        ExecPurpose::RunSpeedtest,
+        ExecPurpose::TlsInventory,
+    ] {
+        assert!(fixed_arguments(purpose, Some(Path::new(r"C:\state"))).is_err());
+    }
 }

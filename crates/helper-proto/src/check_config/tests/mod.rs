@@ -123,3 +123,17 @@ fn each_pipe_is_separate_and_each_reply_is_canonical_bounded() {
         assert!(CheckRequest::parse(&args).is_none());
     }
 }
+
+#[test]
+fn windows_check_has_a_distinct_command_and_response_family() {
+    let request = CheckRequest::Status { key: key() };
+    let mac = Request::MacCheck(request.clone());
+    let win = Request::WindowsCheck(request);
+    assert_ne!(mac.command_name(), win.command_name());
+    let reply = CheckReply::Released { key: key() };
+    let win = Response::Ok(ResponseKind::WindowsCheck(reply.clone()));
+    let mac = Response::Ok(ResponseKind::MacCheck(reply));
+    assert_ne!(win.to_wire_line(), mac.to_wire_line());
+    assert_eq!(Response::parse(&win.to_wire_line()), win);
+    assert_eq!(Response::parse(&mac.to_wire_line()), mac);
+}

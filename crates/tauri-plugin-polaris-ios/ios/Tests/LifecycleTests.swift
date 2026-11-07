@@ -2,12 +2,290 @@ import Foundation
 
 @main
 struct LifecycleTests {
+    private final class NativeSettings: NSObject { let value: String; init(_ value: String) { self.value = value } }
+    private static func nativeTunTransactionCases() throws {
+        typealias Owner = TunnelNativeTunOwner<NativeSettings>
+        let owner = Owner()
+        let firstNetwork = NativeSettings("old")
+        let nextNetwork = NativeSettings("new")
+        var active = true
+        var published: [String: Bool] = [:]
+        var effects: [String] = []
+        var closed: [Int32] = []
+        var sequence: Int32 = 100
+        var cached: NativeSettings?
+        let accepts: (UInt64) -> Bool = { active && $0 == 7 }
+        let apply: (NativeSettings?, UInt64) throws -> Void = { settings, token in
+            assert(token == 7)
+            if effects == ["old"] { assert(closed == [101]) } // Old custody cannot pollute utun scan.
+            if effects == ["old", "new"] { assert(closed == [101, 102]) } // Candidate closed before restore scan.
+            effects.append(settings?.value ?? "nil")
+        }
+        let acquire: () throws -> TunnelNativeTunFile = {
+            sequence += 1; let fd = sequence
+            return TunnelNativeTunFile(fd, check: { assert(!closed.contains(fd)) }, dispose: { closed.append(fd) })
+        }
+        let cache: (NativeSettings?) -> Void = { cached = $0 }
+        let first = try owner.allocate("old-owner", token: 7, network: firstNetwork, snapshot: nil,
+                                       previous: nil, published: { published["old"] == true })
+        assert(effects.isEmpty && owner.blocksSettingsChanges)
+        try owner.prepare(first, accepts: accepts, apply: apply, acquire: acquire, cache: cache)
+        try owner.validate(first, accepts: accepts)
+        assert(owner.blocksSettingsChanges) // Validate cannot release the publication lease.
+        let firstFD = owner.descriptor(first, accepts: accepts)
+        assert(firstFD == 101 && cached === firstNetwork)
+        published["old"] = true
+        published["old"] = false // Actual Core order: suspend/join BEFORE NewSession; no intervening getter.
+        let next = try owner.allocate("next-owner", token: 7, network: nextNetwork, snapshot: firstNetwork,
+                                      previous: first, published: { published["next"] == true })
+        do {
+            _ = try owner.allocate("foreign", token: 7, network: nextNetwork, snapshot: firstNetwork,
+                                   previous: first, published: { false })
+            assertionFailure("Concurrent native owner admitted")
+        } catch {}
+        try owner.prepare(next, accepts: accepts, apply: apply, acquire: acquire, cache: cache)
+        try owner.validate(next, accepts: accepts)
+        try owner.abort(next, accepts: accepts, apply: apply, acquire: acquire, cache: cache)
+        try owner.abort(next, accepts: accepts, apply: apply, acquire: acquire, cache: cache)
+        assert(effects == ["old", "new", "old"])
+        assert(cached === firstNetwork)
+        assert(owner.descriptor(first, accepts: accepts) == 103) // Restored actual FD, never old fd number.
+        assert(closed == [101, 102])
+        assert(owner.blocksSettingsChanges)
+        try owner.validate(first, accepts: accepts) // preFD validation still owns restoration lease.
+        assert(owner.blocksSettingsChanges && !owner.settingsArePublished)
+        try owner.validate(first, accepts: accepts) // post-stack validation alone cannot publish.
+        assert(owner.blocksSettingsChanges)
+        published["old"] = true // Core's actual restored-stack publication.
+        assert(!owner.blocksSettingsChanges && owner.settingsArePublished)
+        published["old"] = false // A later replacement also allocates after the real suspension.
+        let committed = try owner.allocate("committed", token: 7, network: nextNetwork, snapshot: firstNetwork,
+                                           previous: first, published: { published["commit"] == true })
+        try owner.prepare(committed, accepts: accepts, apply: apply, acquire: acquire, cache: cache)
+        try owner.validate(committed, accepts: accepts)
+        published["commit"] = true
+        assert(!owner.blocksSettingsChanges)
+        try owner.retire(first, accepts: accepts, apply: apply, cache: cache)
+        assert(effects.last == "new") // Old retirement cannot clear newer settings.
+        assert(owner.descriptor(committed, accepts: accepts) == 104)
+        published["commit"] = false // Core suspends again before Retire on Stop.
+        active = false; owner.revoke()
+        try owner.retire(committed, accepts: accepts, apply: apply, cache: cache)
+        try owner.retire(committed, accepts: accepts, apply: apply, cache: cache)
+        assert(effects.last == "new") // NE Stop owns OS clearing; custody only.
+        assert(closed == [101, 102, 103, 104] && !owner.hasSessions)
+
+        let noEffect = Owner()
+        let allocated = try noEffect.allocate("allocated", token: 7, network: firstNetwork, snapshot: nil,
+                                               previous: nil, published: { false })
+        noEffect.revoke()
+        let beforeAllocationAbort = effects.count
+        try noEffect.abort(allocated, accepts: { _ in false }, apply: apply, acquire: acquire, cache: cache)
+        assert(!noEffect.hasSessions && effects.count == beforeAllocationAbort)
+
+        // A returned Prepare error remains owned until actual Abort restores it.
+        let failed = Owner()
+        let failedSession = try failed.allocate("failed", token: 7, network: nextNetwork, snapshot: nil,
+                                               previous: nil, published: { false })
+        var failedOnce = false
+        do {
+            try failed.prepare(failedSession, accepts: { _ in true }, apply: { _, _ in
+                failedOnce = true; throw NSError(domain: "fixture", code: 1)
+            }, acquire: acquire, cache: cache)
+            assertionFailure("Expected actual apply error")
+        } catch {}
+        assert(failedOnce && failed.hasSessions && failed.blocksSettingsChanges)
+        try failed.abort(failedSession, accepts: { _ in true }, apply: apply, acquire: acquire, cache: cache)
+        assert(!failed.hasSessions && effects.last == "nil")
+
+        // A failed compensation remains sticky and owns the exact candidate,
+        // even after a repeated Abort or Retire; no successor can reuse it.
+        let rollback = Owner()
+        let partial = try rollback.allocate("partial", token: 7, network: nextNetwork, snapshot: nil,
+                                            previous: nil, published: { false })
+        try rollback.prepare(partial, accepts: { _ in true }, apply: apply, acquire: acquire, cache: cache)
+        let retainedFD = rollback.descriptor(partial, accepts: { _ in true })
+        var restorationCalls = 0
+        let failRestore: (NativeSettings?, UInt64) throws -> Void = { _, _ in
+            restorationCalls += 1; throw NSError(domain: "restore", code: 1)
+        }
+        do { try rollback.abort(partial, accepts: { _ in true }, apply: failRestore, acquire: acquire, cache: cache); assertionFailure() } catch {}
+        do { try rollback.abort(partial, accepts: { _ in true }, apply: failRestore, acquire: acquire, cache: cache); assertionFailure() } catch {}
+        do { try rollback.retire(partial, accepts: { _ in true }, apply: apply, cache: cache); assertionFailure() } catch {}
+        assert(restorationCalls == 1 && closed.filter { $0 == retainedFD }.count == 1)
+        assert(rollback.hasSessions && rollback.blocksSettingsChanges && !rollback.settingsArePublished)
+
+        // Revocation after actual apply cannot borrow a new token for rollback.
+        let stopped = Owner()
+        var oldTokenAccepted = true
+        let stopping = try stopped.allocate("stopping", token: 7, network: nextNetwork, snapshot: nil,
+                                            previous: nil, published: { false })
+        do {
+            try stopped.prepare(stopping, accepts: { _ in oldTokenAccepted }, apply: { _, _ in
+                oldTokenAccepted = false; stopped.revoke()
+            }, acquire: acquire, cache: cache)
+            assertionFailure("Revoked native owner became ready")
+        } catch {}
+        let stopEffects = effects.count
+        do { try stopped.abort(stopping, accepts: { _ in true }, apply: apply, acquire: acquire, cache: cache); assertionFailure() } catch {}
+        assert(stopped.hasSessions && stopped.blocksSettingsChanges && effects.count == stopEffects)
+
+        // Timeout is callback debt, never a join, and Abort cannot borrow a
+        // superseding provider generation to restore an old settings snapshot.
+        let uncertain = Owner()
+        let lateNativeCallback = TunnelSettingsCompletion()
+        let held = try uncertain.allocate("uncertain", token: 7, network: nextNetwork, snapshot: nil,
+                                          previous: nil, published: { false })
+        do {
+            try uncertain.prepare(held, accepts: { _ in true }, apply: { _, _ in try lateNativeCallback.wait(seconds: 0) },
+                                  acquire: acquire, cache: cache)
+            assertionFailure("Expected timeout")
+        } catch {}
+        let before = effects.count
+        do { try uncertain.abort(held, accepts: { _ in true }, apply: apply, acquire: acquire, cache: cache); assertionFailure() } catch {}
+        do { try uncertain.retire(held, accepts: { _ in true }, apply: apply, cache: cache); assertionFailure() } catch {}
+        assert(uncertain.hasSessions && uncertain.blocksSettingsChanges && effects.count == before)
+        do {
+            _ = try uncertain.allocate("successor", token: 8, network: firstNetwork, snapshot: nil,
+                                       previous: nil, published: { false })
+            assertionFailure("Uncertain owner replaced")
+        } catch {}
+        assert(lateNativeCallback.callbackPending && lateNativeCallback.timedOut)
+        assert(lateNativeCallback.finish(nil)) // Real late return settles callback ownership only.
+        assert(!lateNativeCallback.callbackPending)
+        do { try uncertain.abort(held, accepts: { _ in true }, apply: apply, acquire: acquire, cache: cache); assertionFailure() } catch {}
+        do { try uncertain.retire(held, accepts: { _ in true }, apply: apply, cache: cache); assertionFailure() } catch {}
+        assert(uncertain.hasSessions && uncertain.blocksSettingsChanges && effects.count == before)
+    }
+
+    /// Exercise the production owner methods in Core's actual method order.
+    /// Inert apply/FD closures prove ownership decisions only, never NE/native IO.
+    private static func suspendedNativeTunLeaseCases() throws {
+        typealias Owner = TunnelNativeTunOwner<NativeSettings>
+        let network = NativeSettings("held")
+        let accepts: (UInt64) -> Bool = { $0 == 7 }
+        let unexpectedApply: (NativeSettings?, UInt64) throws -> Void = { _, _ in assertionFailure("No new native effect expected") }
+        let unexpectedAcquire: () throws -> TunnelNativeTunFile = { assertionFailure("No new descriptor expected"); throw NSError(domain: "unexpected-acquire", code: 1) }
+
+        // Publish -> Suspend -> revoke -> Retire, with no intervening getter or
+        // other native callback observing Published=true. Close custody once;
+        // NE Stop owns OS settings and no native publication is invented.
+        let stopped = Owner()
+        var publication = false
+        var closes = 0
+        var writes = 0
+        let original = try stopped.allocate("same-id", token: 7, network: network, snapshot: nil,
+                                           previous: nil, published: { publication })
+        try stopped.prepare(original, accepts: accepts, apply: { _, _ in writes += 1 },
+                            acquire: { TunnelNativeTunFile(301, check: {}, dispose: { closes += 1 }) }, cache: { _ in })
+        try stopped.validate(original, accepts: accepts)
+        publication = true
+        publication = false
+        stopped.revoke()
+        try stopped.retire(original, accepts: { _ in false }, apply: unexpectedApply, cache: { _ in assertionFailure() })
+        try stopped.retire(original, accepts: { _ in false }, apply: unexpectedApply, cache: { _ in assertionFailure() })
+        assert(closes == 1 && writes == 1 && !stopped.hasSessions)
+        assert(stopped.descriptor(original, accepts: accepts) == -1)
+        do { try stopped.validate(original, accepts: accepts); assertionFailure("Retired owner resurrected") } catch {}
+
+        // Consecutive successful replacements follow Suspend -> NewSession,
+        // and predecessor Retire must never clear its successor's settings.
+        let replacements = Owner()
+        var publications: [String: Bool] = [:]
+        var previous: Owner.Session?
+        var previousNetwork: NativeSettings?
+        var replacementCloses: [Int32] = []
+        var replacementEffects: [String] = []
+        for index in 0...2 {
+            let key = "replacement-\(index)"
+            let candidateNetwork = NativeSettings(key)
+            if let previous { publications[previous.ownerID] = false }
+            let candidate = try replacements.allocate(key, token: 7, network: candidateNetwork,
+                snapshot: previousNetwork, previous: previous, published: { publications[key] == true })
+            let fd = Int32(501 + index)
+            try replacements.prepare(candidate, accepts: accepts,
+                apply: { settings, _ in replacementEffects.append(settings?.value ?? "nil") },
+                acquire: { TunnelNativeTunFile(fd, check: { assert(!replacementCloses.contains(fd)) },
+                    dispose: { replacementCloses.append(fd) }) }, cache: { _ in })
+            try replacements.validate(candidate, accepts: accepts)
+            publications[key] = true
+            if let previous {
+                try replacements.retire(previous, accepts: accepts, apply: unexpectedApply, cache: { _ in assertionFailure() })
+            }
+            assert(replacements.descriptor(candidate, accepts: accepts) == fd)
+            previous = candidate; previousNetwork = candidateNetwork
+        }
+        publications[previous!.ownerID] = false
+        replacements.revoke()
+        try replacements.retire(previous!, accepts: { _ in false }, apply: unexpectedApply, cache: { _ in assertionFailure() })
+        assert(replacementCloses == [501, 502, 503])
+        assert(replacementEffects == ["replacement-0", "replacement-1", "replacement-2"])
+        assert(!replacements.hasSessions)
+
+        // Identical public owner IDs and fd numbers from a different provider
+        // cannot authorize allocation, validation, or the trusted Retire path.
+        let foreign = Owner()
+        let foreignSession = try foreign.allocate("same-id", token: 7, network: network, snapshot: nil,
+                                                 previous: nil, published: { false })
+        var foreignCloses = 0
+        try foreign.prepare(foreignSession, accepts: accepts, apply: { _, _ in },
+                            acquire: { TunnelNativeTunFile(301, check: {}, dispose: { foreignCloses += 1 }) }, cache: { _ in })
+        let stranger = Owner()
+        do { _ = try stranger.allocate("successor", token: 7, network: network, snapshot: nil,
+                                      previous: foreignSession, published: { false }); assertionFailure() } catch {}
+        do { try stranger.validate(foreignSession, accepts: accepts); assertionFailure() } catch {}
+        do { try stranger.retire(foreignSession, accepts: accepts, apply: unexpectedApply, cache: { _ in }); assertionFailure() } catch {}
+        assert(foreignCloses == 0 && foreign.descriptor(foreignSession, accepts: accepts) == 301)
+        try foreign.abort(foreignSession, accepts: accepts, apply: { _, _ in }, acquire: unexpectedAcquire, cache: { _ in })
+        assert(foreignCloses == 1 && !foreign.hasSessions)
+
+        // Both allocation rejection and allocated/no-effect Abort leave the
+        // original descriptor/settings untouched. Having observed publication
+        // previously must not prevent Core's later suspended-old Validate.
+        for allocatedThenAborted in [false, true] {
+            let owner = Owner()
+            var published = false
+            var effects = 0
+            var closed = 0
+            let first = try owner.allocate("accepted", token: 7, network: network, snapshot: nil,
+                                           previous: nil, published: { published })
+            try owner.prepare(first, accepts: accepts, apply: { _, _ in effects += 1 },
+                              acquire: { TunnelNativeTunFile(401, check: { assert(closed == 0) }, dispose: { closed += 1 }) }, cache: { _ in })
+            try owner.validate(first, accepts: accepts)
+            published = true
+            assert(!owner.blocksSettingsChanges) // This branch deliberately exercised the old observation path.
+            published = false // Actual Core Stage suspends before the failing candidate allocation.
+            if allocatedThenAborted {
+                let candidate = try owner.allocate("no-effect", token: 7, network: NativeSettings("candidate"), snapshot: network,
+                                                   previous: first, published: { false })
+                try owner.abort(candidate, accepts: accepts, apply: unexpectedApply, acquire: unexpectedAcquire, cache: { _ in assertionFailure() })
+                try owner.abort(candidate, accepts: accepts, apply: unexpectedApply, acquire: unexpectedAcquire, cache: { _ in assertionFailure() })
+            } else {
+                do { _ = try owner.allocate("", token: 7, network: NativeSettings("candidate"), snapshot: network,
+                                            previous: first, published: { false }); assertionFailure("Invalid allocation accepted") } catch {}
+            }
+            try owner.validate(first, accepts: accepts) // Real preFD reopening of the old physical.
+            assert(owner.descriptor(first, accepts: accepts) == 401)
+            assert(owner.blocksSettingsChanges && !owner.settingsArePublished)
+            try owner.validate(first, accepts: accepts) // Real post-stack publication preparation.
+            assert(owner.blocksSettingsChanges && effects == 1 && closed == 0)
+            published = true // Only Core's completed old-stack publication releases this lease.
+            assert(!owner.blocksSettingsChanges && owner.settingsArePublished)
+            published = false
+            owner.revoke()
+            try owner.retire(first, accepts: { _ in false }, apply: unexpectedApply, cache: { _ in })
+            assert(closed == 1 && !owner.hasSessions)
+        }
+    }
+
     static func main() throws {
         let executable = URL(fileURLWithPath: "/app/PlugIns/PacketTunnel.appex/PacketTunnel")
         assert(tlsCapabilityImageMatches(executable.path, executable: executable))
         assert(!tlsCapabilityImageMatches("/other/PacketTunnel", executable: executable))
         assert(!tlsCapabilityImageMatches("/app/Frameworks/Other.framework/Other", executable: executable))
 
+        try nativeTunTransactionCases()
+        try suspendedNativeTunLeaseCases()
         try directoryRetirementCases()
         try reloadCustodyCases()
         managedBootstrapCases()
@@ -34,6 +312,9 @@ struct LifecycleTests {
 
         let lateSettings = TunnelSettingsCompletion()
         do { try lateSettings.wait(seconds: 0); assertionFailure("Expected settings timeout") } catch {}
+        assert(lateSettings.callbackPending && lateSettings.timedOut)
+        assert(lateSettings.finish(nil)) // Actual callback ownership survives waiter timeout.
+        assert(!lateSettings.callbackPending)
         assert(!lateSettings.finish(nil))
         assert(lifecycle.timeout(reload2, "settings timeout: system callback may still apply"))
         assert(!lifecycle.accepts(reload2))
@@ -64,7 +345,10 @@ struct LifecycleTests {
         assert(supersededSettings.report().runtimeStopped == true)
         assert(supersededSettings.report().uncertainSettingsGeneration == submittingStart)
         assert(supersededSettings.report().lifecycle == "uncertain")
-        assert(!pendingSystemCallback.finish(nil))
+        assert(pendingSystemCallback.callbackPending)
+        assert(pendingSystemCallback.finish(nil))
+        assert(!pendingSystemCallback.callbackPending)
+        assert(supersededSettings.report().lifecycle == "uncertain")
         do { _ = try supersededSettings.start(identity); assertionFailure("New core admitted while old OS settings may still apply") } catch {}
 
         let heldCloseFailure = TunnelLifecycle()

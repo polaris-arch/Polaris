@@ -85,6 +85,7 @@ function displayName(filePath: string): string {
 
 export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
   const { t } = useTranslation();
+  const isIOS = typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios';
   const [selected, setSelected] = useState<Set<BackupCategory>>(() => new Set(BACKUP_CATEGORIES));
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<PendingImport | null>(null);
@@ -337,7 +338,12 @@ export function BackupPage({ commit }: { commit: CommitWrite }): ReactElement {
         </SettingsGroup>
       )}
 
-      <SystemBackupGroup commit={commit} />
+      {isIOS ? (
+        <SettingsGroup header={t('mobileSettings.backup.systemBackupGroup')}>
+          <SettingsRow first id="system-backup" label={t('mobileSettings.backup.systemBackupTitle')}
+            desc={t('mobileSettings.backup.systemBackupUnsupported')} />
+        </SettingsGroup>
+      ) : <SystemBackupGroup commit={commit} />}
     </>
   );
 }

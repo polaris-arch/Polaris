@@ -4,7 +4,7 @@ pub use crate::error::WindowsProxyWriterError;
 use crate::proxy::{SystemProxyStatus, WindowsProxyRegistrySnapshot};
 
 /// 代理设置请求。上游 `enableProxy(address, httpPort, socksPort, bypassList?)`。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProxyEnableRequest {
     pub address: String,
     pub http_port: u16,
@@ -127,4 +127,70 @@ pub fn points_to_mixed_inbound(status: &SystemProxyStatus, address: &str, mixed_
         }
     }
     matched
+}
+
+/// Result of a controlled host mutation, independent of Core commit/durability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TakeoverOutcome {
+    Unchanged,
+    Applied,
+    FailedUnchanged,
+    FailedRestored,
+    RecoveryPending,
+    Unknown,
+    Superseded,
+    Unsupported,
+}
+
+/// An operation receipt is not ownership of a successor's marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeoverReceipt {
+    pub operation_id: String,
+    pub outcome: TakeoverOutcome,
+    pub marker_id: Option<String>,
+    pub cleanup_pending: bool,
+    pub reason: Option<String>,
+}
+
+impl TakeoverReceipt {
+    pub(crate) fn new(
+        operation_id: &str,
+        outcome: TakeoverOutcome,
+        marker_id: Option<String>,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.to_owned(),
+            outcome,
+            marker_id,
+            cleanup_pending: matches!(
+                outcome,
+                TakeoverOutcome::RecoveryPending | TakeoverOutcome::Unknown
+            ),
+            reason,
+        }
+    }
+}
+
+/// Private App recipe payload; full OS snapshots must never be sent to the UI.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreparedProxyEffect {
+    pub(crate) marker_path: String,
+    pub(crate) marker: Option<crate::proxy::ProxyMarkerData>,
+    pub(crate) before: crate::proxy::ProxyTransactionSnapshot,
+    pub(crate) target: crate::proxy::ProxyTransactionSnapshot,
+    pub(crate) request: Option<ProxyEnableRequest>,
+}
+
+impl PreparedProxyEffect {
+    pub fn scope(&self) -> &str {
+        &self.marker_path
+    }
+    pub fn before(&self) -> &crate::proxy::ProxyTransactionSnapshot {
+        &self.before
+    }
+    pub fn target(&self) -> &crate::proxy::ProxyTransactionSnapshot {
+        &self.target
+    }
 }

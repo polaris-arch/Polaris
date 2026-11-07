@@ -28,6 +28,7 @@ test('publication combines generation acceptance and cached identity/reset valid
   assert.match(provider, /lifecycle\.publishSettings\(token, publication: publication\)/);
 });
 test('reset changes identity even when cached settings were already nil', () => {
+  assert.match(platform, /pending == nil && !nativeTun\.hasSessions/);
   assert.match(platform, /settingsReset = UUID\(\); settings = nil/);
   assert.match(platform, /try publish\(network, replacing: previous, reset: reset, token: token\)/);
 });
@@ -42,8 +43,8 @@ test('DNS reset keeps one generation and replays the retained accepted snapshot'
 test('apply preserves the existing timeout quarantine and never publishes by itself', () => {
   const apply = section(platform, '    private func apply(', '    func usePlatformAutoDetectControl');
   assert.doesNotMatch(apply, /settingsGeneration\(\)|self\.settings\s*=/);
-  assert.match(apply, /provider\.settingsTimedOut\(token, error: error\)/);
-  assert.match(apply, /guard provider\.acceptsSettings\(token\)/);
+  assert.match(apply, /owner\.settingsTimedOut\(token, error: error\)/);
+  assert.match(apply, /guard owner\.acceptsSettings\(token\)/);
 });
 
 test('runtime receipt retains the exact owner without pretending memory is crash durability', () => {
@@ -144,4 +145,43 @@ test('native protojson uint64 parsing preserves exact strings and omitted zero',
   const owner = provider.slice(provider.indexOf('private final class TunnelRuntimeRestartOwner'));
   assert.match(owner, /admittedIncarnation == incarnation/);
   assert.match(owner, /admittedIncarnation = admission.identity\?\.incarnation/);
+});
+
+
+test('native bridge retains real NE callbacks and conditionally registers actual V1 bindings', () => {
+  const apply = section(platform, '    private func apply(', '    func revokeNativeTun()');
+  assert.match(apply, /let owner = provider/);
+  assert.match(apply, /settingsCallbacks\[requestID\] = \(token, result\)/);
+  assert.match(apply, /\[self, owner, network, result\]/);
+  assert.match(apply, /withExtendedLifetime\(\(owner, network, result\)\)/);
+  assert.ok(apply.indexOf('settingsCallbacks.removeValue') < apply.indexOf('result.finish(error)'));
+  assert.doesNotMatch(apply, /guard self\.provider\.acceptsSettings/);
+  assert.match(provider, /#if POLARIS_NATIVE_TUN_V1[\s\S]*try server\.setRuntimeTunPlatform\(self\.platform\)/);
+  assert.ok(provider.indexOf('try server.setRuntimeTunPlatform') < provider.indexOf('try server.start()'));
+  assert.match(platform, /#if POLARIS_NATIVE_TUN_V1[\s\S]*extension TunnelPlatform: LibboxRuntimeTunPlatformProtocol/);
+  assert.match(platform, /previous: old\?\.state, published: \{ receipt\.published\(\) \}/);
+  assert.match(platform, /private let provider: PacketTunnelProvider/);
+  assert.match(platform, /let custody = Darwin\.dup\(original\)/);
+  assert.match(platform, /Darwin\.close\(custody\)/);
+  assert.doesNotMatch(platform, /Darwin\.close\(original\)/);
+});
+
+test('native transaction keeps exact custody, publication lease and sticky failed restoration', () => {
+  const native = lifecycle.slice(lifecycle.indexOf('final class TunnelNativeTunOwner'));
+  assert.match(native, /current === previous/);
+  assert.match(native, /pending === session/);
+  assert.match(native, /lastEffect === session/);
+  assert.match(native, /session\.published\(\)/);
+  assert.match(native, /if error is TunnelSettingsTimeout \|\| !accepts\(session\.token\)/);
+  assert.match(native, /previous\.file = restored/);
+  assert.match(native, /retainDebt\(session, error\)/);
+  const prepare = section(native, '    func prepare(', '    func descriptor(');
+  assert.ok(prepare.indexOf('try old.close()') < prepare.indexOf('try apply(session.network'));
+  const abort = section(native, '    func abort(', '    func retire(');
+  assert.ok(abort.indexOf('try candidate.close()') < abort.indexOf('try apply(session.snapshot'));
+  assert.match(provider, /platform\.revokeNativeTun\(\)/);
+  assert.match(provider, /if let nativeFailure = platform\.reset\(\)/);
+  const completion = section(lifecycle, 'final class TunnelSettingsCompletion', 'struct TunnelSettingsTimeout');
+  assert.match(completion, /if pending \{[\s\S]*waitTimedOut = true/);
+  assert.doesNotMatch(completion.slice(completion.indexOf('func wait(')), /pending = false/);
 });

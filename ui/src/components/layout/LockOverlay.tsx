@@ -25,7 +25,8 @@ export default function LockOverlay() {
   const { t } = useTranslation();
   const privacyMode = useAppStore((s) => s.privacyMode);
   const [pw, setPw] = useState('');
-  const [hasPassword, setHasPassword] = useState(false);
+  const [hasPassword, setHasPassword] = useState<boolean | null>(null);
+  const [passwordRead, setPasswordRead] = useState(0);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -46,18 +47,20 @@ export default function LockOverlay() {
   // 进入锁定态：查是否设了密码（决定空密码放行）+ 复位输入/错误 + 聚焦密码框（对齐原型 openLock）。
   useEffect(() => {
     if (!privacyMode) return;
+    let cancelled = false;
+    setHasPassword(null);
     setPw('');
     setErr('');
     void api.privacy
       .hasPassword()
-      .then(setHasPassword)
-      .catch(() => setHasPassword(false));
+      .then((value) => { if (!cancelled) setHasPassword(value); })
+      .catch(() => { if (!cancelled) setErr(t('privacy.passwordStatusFailed')); });
     const id = setTimeout(() => inputRef.current?.focus(), 50);
-    return () => clearTimeout(id);
-  }, [privacyMode]);
+    return () => { cancelled = true; clearTimeout(id); };
+  }, [privacyMode, passwordRead, t]);
 
   const submit = useCallback(async () => {
-    if (busy) return;
+    if (busy || hasPassword === null) return;
     if (resolveUnlockAttempt(hasPassword, pw) === 'require-input') {
       setErr(t('privacy.enterPassword'));
       inputRef.current?.focus();
@@ -106,13 +109,13 @@ export default function LockOverlay() {
             placeholder="••••••••"
             autoComplete="off"
             value={pw}
-            disabled={busy}
+            disabled={busy || hasPassword === null}
             onChange={(e) => setPw(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') void submit();
             }}
           />
-          <button className="btn flow" disabled={busy} onClick={() => void submit()}>
+          <button className="btn flow" disabled={busy || hasPassword === null} onClick={() => void submit()}>
             {busy ? (
               <span className="spinner spin-inline" role="status" aria-label={t('common.loading')} />
             ) : (
@@ -127,6 +130,13 @@ export default function LockOverlay() {
         >
           {err}
         </div>
+        {hasPassword === null && (err ? (
+          <button className="btn ghost" onClick={() => setPasswordRead((value) => value + 1)}>
+            {t('common.retry')}
+          </button>
+        ) : (
+          <p role="status">{t('privacy.passwordStatusUnknown')}</p>
+        ))}
       </div>
     </dialog>
   );

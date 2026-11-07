@@ -518,6 +518,18 @@ fn release_core_resolution_has_exactly_one_leg() {
 ///
 /// 定义处（`runtime/proxy/core_binary.rs`、`runtime/core_paths.rs`）整文件不计。
 const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
+    ("native_verification/proxy_carrier.rs", "\"sing-box\"", 1,
+     "Private acceptance process census; this basename never supplies a core path"),
+    ("native_verification/proxy_carrier.rs", "resolve_core_binary", 1,
+     "Direct acceptance uses the normal compiled bundle admission"),
+    ("native_verification/proxy_carrier.rs", "resolve_helper_candidate_data", 1,
+     "Helper acceptance supplies current bundle candidate data, independently admitted by the privileged issuer"),
+    ("runtime/proxy/startup.rs", "resolve_helper_candidate_data", 1,
+     "Normal helper startup supplies current selected candidate data, not a caller-selected executable or admission proof"),
+    ("runtime/proxy/tls_capabilities.rs", "\"sing-box\"", 1,
+     "Compiled manifest basename binds TLS capabilities to an authenticated live birth"),
+    ("runtime/proxy/tls_capabilities.rs", "\"sing-box.exe\"", 1,
+     "Windows compiled manifest basename binds TLS capabilities to an authenticated live birth"),
     (
         "runtime/helper.rs",
         "core_filename(",
@@ -617,8 +629,9 @@ const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
 #[test]
 fn core_path_has_one_source() {
     const DEFINITIONS: [&str; 2] = ["runtime/proxy/core_binary.rs", "runtime/core_paths.rs"];
-    const NEEDLES: [&str; 5] = [
+    const NEEDLES: [&str; 6] = [
         "resolve_core_binary",
+        "resolve_helper_candidate_data",
         "core_filename_for(",
         "core_filename(",
         "\"sing-box\"",

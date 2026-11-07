@@ -86,3 +86,7 @@ src-tauri/gen/schemas/
 
 # Explicit local compiler lane: generated verified inputs, never release assets.
 /resources/.local-development/
+
+# Desktop Windows package outputs and local evidence.
+/dist-win/
+/windows-package-evidence/

@@ -133,7 +133,7 @@ const CI_ENTRIES = [
   { label: 'ci dispatch os=all', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'all' },
   { label: 'ci dispatch os=ubuntu-22.04', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'ubuntu-22.04' },
   { label: 'ci dispatch os=windows-2022', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'windows-2022' },
-  { label: 'ci dispatch os=macos-14', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'macos-14' },
+  { label: 'ci dispatch os=macos-15', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'macos-15' },
 ] as const;
 
 /**
@@ -159,7 +159,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       /github\.event_name == 'workflow_dispatch'\s*&& github\.event\.inputs\.os != ''\s*&& github\.event\.inputs\.os != 'all'/s,
     );
     expect(ci).toContain(`fromJSON(format('["{0}"]', github.event.inputs.os))`);
-    expect(ci).toContain(`fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')`);
+    expect(ci).toContain(`fromJSON('["ubuntu-22.04","windows-2022","macos-15"]')`);
 
     // 2026-10-07 拆成并行 job 后矩阵表达式有两份（lint / test）。上面三条 `toContain` 对「只改坏
     // 其中一份」是瞎的（另一份照样喂饱它们），故按 job 取出来逐字比，并把表达式真的求值一遍：
@@ -167,7 +167,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const lint = matrixOsExpression(executable(jobBlock(ci, 'lint')), 'lint');
     const test = matrixOsExpression(executable(jobBlock(ci, 'test')), 'test');
     expect(test, 'lint 与 test 两个矩阵 job 的 os 表达式不再逐字相同 —— 同一事件下两边跑的平台分家了').toBe(lint);
-    const all = ['ubuntu-22.04', 'windows-2022', 'macos-14'];
+    const all = ['ubuntu-22.04', 'windows-2022', 'macos-15'];
     const expected: Record<(typeof CI_ENTRIES)[number]['label'], string[]> = {
       'push main': ['ubuntu-22.04'],
       pull_request: all,
@@ -178,11 +178,52 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       'ci dispatch os=all': all,
       'ci dispatch os=ubuntu-22.04': ['ubuntu-22.04'],
       'ci dispatch os=windows-2022': ['windows-2022'],
-      'ci dispatch os=macos-14': ['macos-14'],
+      'ci dispatch os=macos-15': ['macos-15'],
     };
     for (const entry of CI_ENTRIES) {
       expect(evaluateActions(lint, entry), entry.label).toEqual(expected[entry.label]);
     }
+  });
+
+  it('source/mock tests run before native inputs with their compiler prerequisites and ordinary failure semantics', () => {
+    const ci = workflow('ci.yml');
+    const name = 'Test source and mock crates before core acquisition';
+    const check = (source: string) => {
+      const job = executable(jobBlock(source, 'test'));
+      const early = stepBlock(job, name);
+      const condition = /^ {8}if: (.+)$/m.exec(early);
+      expect(condition).not.toBeNull();
+      for (const value of ['', 'false', 'unknown', 'true'])
+        expect(runInNewContext(condition![1], { needs: { cheap_format: { outputs: { app_native_compile_only: value } } } }))
+          .toBe(value !== 'true');
+      expect(early).not.toMatch(/continue-on-error|always\(\)|\|\| true/);
+      const at = job.indexOf(`- name: ${name}\n`);
+      for (const prerequisite of ['Install Rust toolchain (preinstalled rustup)', 'Setup Rust cache',
+        'Install NASM (Windows — pinned URL + sha256)']) {
+        const position = job.indexOf(`- name: ${prerequisite}\n`);
+        expect(position, prerequisite).toBeGreaterThanOrEqual(0);
+        expect(position, prerequisite).toBeLessThan(at);
+      }
+      for (const native of ['Activate admitted native DNS test inputs for the actual host',
+        'Install protoc (pinned URL + sha256)', 'Install Linux system dependencies (Tauri webkit/gtk)',
+        'Acquire all four explicit candidate payloads before placeholders',
+        'Build actual candidate helper bytes and freeze the separate App identity',
+        'Verify all candidate payloads and compiled identity before workspace build', 'Build', 'Test'])
+        expect(job.indexOf(`- name: ${native}\n`), native).toBeGreaterThan(at);
+      expect(stepBlock(job, 'Test')).toMatch(/^ {8}run: cargo test --workspace --no-fail-fast$/m);
+      expect(job.match(/POLARIS_RELEASE_JOB_DEADLINE_MS=/g)).toHaveLength(1);
+    };
+    check(ci);
+    const job = jobBlock(ci, 'test');
+    const early = stepBlock(job, name);
+    const acquire = stepBlock(job, 'Acquire all four explicit candidate payloads before placeholders');
+    const nasm = stepBlock(job, 'Install NASM (Windows — pinned URL + sha256)');
+    const protoc = stepBlock(job, 'Install protoc (pinned URL + sha256)');
+    for (const changed of [
+      ci.replace(early, '').replace(acquire, acquire + early),
+      ci.replace(nasm, ''),
+      ci.replace(protoc, '').replace(early, protoc + early),
+    ]) expect(() => check(changed)).toThrow();
   });
 
   it('ci.yml 格式前置门与三个并行 job：Linux 专属检查恰在 ubuntu 腿存在时运行，且不能静默关闭', () => {
@@ -252,7 +293,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属四步都在 cross）。
     const home: [string, string][] = [
       ['- name: Check workspace formatting before native compilation', 'cheap_format'],
-      ['- name: Check formatting', 'lint'],
       ['- name: Clippy (deny warnings)', 'lint'],
       ['- name: Rustdoc documentation invariants (deny four lints)', 'lint'],
       ['- name: Resolve core-owned Cronet dependencies', 'lint'],
@@ -264,6 +304,8 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       ['- name: Test\n', 'test'],
     ];
     const blocks = { cheap_format: cheapFormat, lint, cross, test };
+    expect([...ci.matchAll(/^ {8}run: cargo fmt --all -- --check$/gm)]).toHaveLength(1);
+    expect(lint).not.toContain('- name: Check formatting');
     for (const [needle, owner] of home) {
       for (const [name, block] of Object.entries(blocks)) {
         expect(block.includes(needle), `「${needle.trim()}」应只在 ${owner} job 里（现在查的是 ${name}）`)
@@ -396,7 +438,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     type Selection = Partial<typeof defaults> & { runtime_config_loopback_input?: string };
     const conflicts: Selection[] = [{ windows_launcher_diagnostics: true }, { native_dns_candidate: 'a'.repeat(40) },
       { windows_system_candidate: 'a'.repeat(40) }, { windows_directory_mode: 'candidate' },
-      { windows_directory_candidate_source: 'a'.repeat(40) }, { os: 'windows-2022' }, { os: 'macos-14' },
+      { windows_directory_candidate_source: 'a'.repeat(40) }, { os: 'windows-2022' }, { os: 'macos-15' },
       { windows_launcher_diagnostics: true, windows_system_candidate: 'a'.repeat(40) }];
     // Compile each actual expression once; exhaustive truth tables should not
     // create thousands of VM contexts or depend on a relaxed test timeout.
@@ -514,7 +556,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
       for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
         for (const diagnostic of [false, true]) for (const system of ['', 'a'.repeat(40)])
-          for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-14'])
+          for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-15'])
             for (const nativeRequired of ['', 'true', 'false']) for (const formal of ['', 'true']) {
               const ordinary = event !== 'workflow_dispatch' || !diagnostic || system !== '';
               const native = ordinary && nativeRequired !== 'false';

@@ -15,18 +15,35 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 function fixture() {
   const contract = { schema: 'polaris-upstream-native-release-consumer-v1', repository: 'polaris-arch/sing-box-polaris', repositoryId: 42, materialTransport: 'committed-index-github-source-v1',
     sourceCommit: 'b'.repeat(40), sourceTree: 'c'.repeat(40), version: 'fixture', tag: 'fixture-tag', tagObject: 'd'.repeat(40), releaseId: 42,
-    assetIndex: { sha256: '1'.repeat(64), bytes: 7 }, platforms: { linux: {
-      core: { bytes: 11, sha256: '2'.repeat(64) }, sidecar: { bytes: 13, sha256: '3'.repeat(64) },
-      tags: 'with_gvisor,with_naive_outbound', goVersion: 'fixture-go', buildID: 'fixture-build', releaseAsset: { name: 'fixture-asset', assetId: 7, bytes: 31, url: 'https://fixture.invalid/asset', sha256: '7'.repeat(64) } } } };
+    assetIndex: { sha256: '1'.repeat(64), bytes: 7 }, platforms: {} };
+  // Full historical owner context, with no policy/proof or real producer claim.
+  // The private IDs, smoke labels and payload pins are inert binding-test data.
+  contract.producer = { repository: contract.repository, repositoryId: contract.repositoryId,
+    workflow: '.github/workflows/build.yml', workflowCommit: contract.sourceCommit, runId: 101, runAttempt: 1, nativeJobs: {} };
+  const targets = [
+    ['linux', 'linux/amd64', 'linux-amd64-purego'], ['win', 'windows/amd64', 'windows-amd64'],
+    ['mac-x64', 'darwin/amd64', 'darwin-amd64'], ['mac-arm64', 'darwin/arm64', 'darwin-arm64'],
+  ];
+  for (const [index, [key, target, owner]] of targets.entries()) {
+    contract.platforms[key] = { schema: 'polaris-upstream-native-receipt-v1', target,
+      sourceCommit: contract.sourceCommit, sourceTree: contract.sourceTree, version: contract.version,
+      variant: { linkage: key.startsWith('mac-') ? 'static-cgo' : 'shared-purego', libc: '', goarm: '', gomips: '', go386: '', legacy: false },
+      finalPackageCronetSmoke: { status: 'passed' },
+      core: { member: key === 'win' ? 'sing-box.exe' : 'sing-box', bytes: 11, sha256: '2'.repeat(64) },
+      sidecar: key.startsWith('mac-') ? null : { member: key === 'win' ? 'libcronet.dll' : 'libcronet.so', bytes: 13, sha256: '3'.repeat(64) },
+      tags: 'with_gvisor,with_naive_outbound', goVersion: 'fixture-go', buildID: 'fixture-build',
+      releaseAsset: { name: `fixture-${key}-asset`, assetId: 7 + index, bytes: 31, url: `https://fixture.invalid/${key}`, sha256: '7'.repeat(64) } };
+    contract.producer.nativeJobs[key] = { id: 1 + index, name: `Native final-package Cronet and gVisor smoke (${owner})` };
+  }
   const release = Object.fromEntries(['repository', 'version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree', 'releaseId'].map((key) => [key, contract[key]]));
   const manifest = { desktopRelease: { ...release, contractPath: 'scripts/desktop-core/release-contract.json', contractSha256: '4'.repeat(64) } };
   const snapshot = { repositoryId: 42, releaseId: contract.releaseId, tag: contract.tagObject, sourceCommit: contract.sourceCommit, sourceTree: contract.sourceTree, sourceGitlinks: [],
-    assets: [{ name: 'fixture-asset', id: 7, bytes: 31, url: 'https://fixture.invalid/asset', digest: 'sha256:' + '7'.repeat(64) }] };
+    assets: Object.values(contract.platforms).map(({ releaseAsset: pin }) => ({ name: pin.name, id: pin.assetId, bytes: pin.bytes, url: pin.url, digest: 'sha256:' + pin.sha256 })) };
   const context = { candidate: 'a'.repeat(40), appTree: 'f'.repeat(40) };
   const receipt = { schema: 'polaris-app-release-consumption-v1', platform: 'linux',
     signaturePolicy: 'preserve measured original bytes; ad-hoc/not-signed observations do not assert trust', macCodeSignature: null,
     actualAppAcceptance: 'pending native load, gvisor/mixed, feature and final carrier gates', contractSha256: '4'.repeat(64), assetIndexSha256: '1'.repeat(64),
-    adapter: { schema: 'polaris-app-release-adapter-v1', facts: { candidate: 'a'.repeat(40) } }, producer: structuredClone(contract.platforms.linux), releaseAsset: { name: 'fixture-asset', assetId: 7, bytes: 31, url: 'https://fixture.invalid/asset', sha256: '7'.repeat(64) }, publicReadback: snapshot };
+    adapter: { schema: 'polaris-app-release-adapter-v1', facts: { candidate: 'a'.repeat(40) } }, producer: structuredClone(contract.platforms.linux), releaseAsset: structuredClone(contract.platforms.linux.releaseAsset), publicReadback: snapshot };
   receipt.adapter.fingerprint = sha(portableCanonical(receipt.adapter.facts));
   const repair = () => { const { fingerprint, schema, ...facts } = receipt; receipt.fingerprint = sha(portableCanonical(facts)); };
   repair();
@@ -49,6 +66,7 @@ test('explicit mode is strict, with only absent undefined defaulting to diagnost
 });
 test('formal binding uses original receipt and measured feature facts, not diagnostic relabelling', () => {
   const value = fixture(); assert.equal(value.check(), value.binding);
+  // Pure measured-fact binding only; this does not assert a publishable no-Naive recipe.
   value.contract.platforms.linux.tags = 'with_gvisor'; value.receipt.producer.tags = 'with_gvisor'; value.binding.build.tags = 'with_gvisor';
   value.binding.naiveIncluded = false; value.repair(); value.binding.consumptionFingerprint = value.receipt.fingerprint;
   assert.equal(value.check(), value.binding);
@@ -96,7 +114,141 @@ for (const key of ['version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree', 
 for (const payload of ['binary', 'sidecar']) for (const key of ['bytes', 'sha256'])
   mutations[`${payload}-${key}`] = (x) => { x.binding[payload][key] = key === 'bytes' ? 999 : 'f'.repeat(64); };
 for (const key of ['tags', 'goVersion', 'buildID']) mutations[`build-${key}`] = (x) => { x.binding.build[key] = 'wrong'; };
-for (const [name, mutate] of Object.entries(mutations)) test(`formal binding rejects ${name}`, () => { const x = fixture(); mutate(x); assert.throws(x.check); });
+const mutationErrors = {
+  "schema": "Distinct formal HOT input binding required",
+  "profile": "Distinct formal HOT input binding required",
+  "mode": "Distinct formal HOT input binding required",
+  "sourceVerified": "Distinct formal HOT input binding required",
+  "publication": "Distinct formal HOT input binding required",
+  "fabricatedManifest": "Distinct formal HOT input binding required",
+  "temporary": "Committed canonical Polaris formal selection required",
+  "pending": "Committed canonical Polaris formal selection required",
+  "foreignKernel": "Committed canonical Polaris formal selection required",
+  "historicalSchema": "Committed canonical Polaris formal selection required",
+  "app": "Verified App source identity differs",
+  "appTree": "Verified App source identity differs",
+  "source": "Formal source/protocol attribution differs",
+  "sourceTree": "Formal source/protocol attribution differs",
+  "proto": "Formal source/protocol attribution differs",
+  "release-version": "Formal release identity differs",
+  "release-tag": "Formal release identity differs",
+  "release-tagObject": "Formal release identity differs",
+  "release-sourceCommit": "Formal release identity differs",
+  "release-sourceTree": "Formal release identity differs",
+  "release-releaseId": "Formal release identity differs",
+  "release-repository": "Formal release identity differs",
+  "selection-version": "Formal selection differs: version",
+  "selection-tag": "Formal selection differs: tag",
+  "selection-tagObject": "Formal selection differs: tagObject",
+  "selection-sourceCommit": "Formal selection differs: sourceCommit",
+  "selection-sourceTree": "Formal selection differs: sourceTree",
+  "selection-releaseId": "Formal selection differs: releaseId",
+  "contract": "Formal contract/index binding differs",
+  "indexHash": "Formal contract/index binding differs",
+  "indexBytes": "Formal contract/index binding differs",
+  "adapterSchema": "Original formal consumption attribution differs",
+  "adapterFingerprint": "Original formal consumption attribution differs",
+  "receiptSchema": "Original formal consumption attribution differs",
+  "signaturePolicy": "Original formal consumption attribution differs",
+  "macCodeSignature": "Original formal consumption attribution differs",
+  "relabelledAcceptance": "Original formal consumption attribution differs",
+  "receiptFingerprint": "Original formal consumption attribution differs",
+  "bindingFingerprint": "Original formal consumption attribution differs",
+  "missing-signaturePolicy": "Original formal consumption attribution differs",
+  "missing-macCodeSignature": "Original formal consumption attribution differs",
+  "missing-actualAppAcceptance": "Original formal consumption attribution differs",
+  "producer": "Original formal producer differs",
+  "publicBinding": "Original formal public readback differs",
+  "publicAfter": "Formal public readback changed",
+  "binary-bytes": "Actual formal binary differs",
+  "binary-sha256": "Actual formal binary differs",
+  "sidecar-bytes": "Actual formal sidecar differs",
+  "sidecar-sha256": "Actual formal sidecar differs",
+  "build-tags": "Formal build facts differ",
+  "build-goVersion": "Formal build facts differ",
+  "build-buildID": "Formal build facts differ",
+  "naive": "Formal Naive availability differs from admitted build",
+  "helper": "Actual formal installation/helper binding differs",
+  "installationId": "Actual formal installation/helper binding differs",
+};
+for (const [name, mutate] of Object.entries(mutations)) test(`formal binding rejects ${name}`, () => {
+  const x = fixture(); assert.equal(x.check(), x.binding);
+  const message = mutationErrors[name]; assert.equal(typeof message, 'string', `Missing target error for ${name}`);
+  mutate(x); assert.throws(x.check, { message });
+});
+
+// These malformed metadata controls run through the formal caller, not a bypass.
+// No intentionally incomplete proof below is a native execution receipt.
+const ownerMutations = {
+  missingPlatform: { message: 'Upstream native owner platform inventory differs', mutate: x => { delete x.contract.platforms.win; } },
+  extraPlatform: { message: 'Upstream native owner platform inventory differs', mutate: x => { x.contract.platforms.extra = structuredClone(x.contract.platforms.win); } },
+  missingProducer: { message: 'Upstream native job inventory differs', mutate: x => { delete x.contract.producer; } },
+  missingJob: { message: 'Upstream native job inventory differs', mutate: x => { delete x.contract.producer.nativeJobs.win; } },
+  extraJob: { message: 'Upstream native job inventory differs', mutate: x => { x.contract.producer.nativeJobs.extra = { id: 99, name: 'unrelated' }; } },
+  duplicateId: { message: 'Duplicate upstream native job', mutate: x => { x.contract.producer.nativeJobs.win.id = x.contract.producer.nativeJobs.linux.id; } },
+  unrelatedOwner: { message: 'Upstream native job identity differs', mutate: x => { x.contract.producer.nativeJobs.win.name = 'Unrelated successful job'; } },
+  systemWithoutProof: { message: 'Upstream native job identity differs', mutate: x => { x.contract.producer.nativeJobs.win.name = 'Explicit SYSTEM final-package Windows native execution proof'; } },
+  wrongRowSource: { message: 'Upstream native owner row differs', mutate: x => { x.contract.platforms.win.sourceCommit = 'e'.repeat(40); } },
+  wrongRowTarget: { message: 'Upstream native owner row differs', mutate: x => { x.contract.platforms.win.target = 'linux/amd64'; } },
+  wrongVariant: { message: 'Upstream native owner variant differs', mutate: x => { x.contract.platforms.win.variant.legacy = true; } },
+  missingSmoke: { message: 'Upstream native owner row differs', mutate: x => { delete x.contract.platforms.win.finalPackageCronetSmoke; } },
+  policyOnly: { message: 'Upstream native owner requires one target proof and policy', mutate: x => { x.contract.platforms.win.trustedExecution = {}; } },
+  proofOnly: { message: 'Upstream native owner requires one target proof and policy', mutate: x => { x.contract.platforms.win.finalPackageCronetSmoke.windowsExecution = {}; } },
+  mixedProofs: { message: 'Upstream native owner requires one target proof and policy', mutate: x => {
+    x.contract.platforms.win.trustedExecution = {};
+    Object.assign(x.contract.platforms.win.finalPackageCronetSmoke, { windowsExecution: {}, sealedExecution: {} });
+  } },
+  nullProof: { message: 'Upstream native owner proof/policy shape differs', mutate: x => {
+    x.contract.platforms.win.trustedExecution = {}; x.contract.platforms.win.finalPackageCronetSmoke.windowsExecution = null;
+  } },
+  incompleteHeader: { message: 'Upstream native owner proof header fields differ', mutate: x => {
+    x.contract.platforms.win.trustedExecution = {}; x.contract.platforms.win.finalPackageCronetSmoke.windowsExecution = {};
+  } },
+};
+for (const [name, { message, mutate }] of Object.entries(ownerMutations)) test(`formal binding reaches owner rejection: ${name}`, () => {
+  const x = fixture(); assert.equal(x.check(), x.binding);
+  mutate(x); assert.throws(x.check, { message });
+});
+for (const id of [0, -1, 1.5, '1', true, null, undefined]) test(`formal binding rejects invalid owner ID ${String(id)}`, () => {
+  const x = fixture(); assert.equal(x.check(), x.binding);
+  x.contract.producer.nativeJobs.win.id = id;
+  assert.throws(x.check, { message: 'Upstream native job identity differs' });
+});
+// A different positive unique ID/run is not independently disprovable by this
+// pure binder. Full pinned index/proof or live/saved producer validators own it.
+function mutatePublicSnapshot(x, mutate) {
+  mutate(x.readback.before); x.readback.after = structuredClone(x.readback.before);
+  x.receipt.publicReadback = structuredClone(x.readback.before);
+  x.repair(); x.binding.consumptionFingerprint = x.receipt.fingerprint;
+}
+test('formal published binding forbids a fresh producer success claim', () => {
+  const x = fixture(); assert.equal(x.check(), x.binding);
+  mutatePublicSnapshot(x, snapshot => { snapshot.producerReadback = {}; });
+  assert.throws(x.check, { message: 'Published readback must not claim live producer verification' });
+});
+const gitlinkMutations = {
+  missing: snapshot => { delete snapshot.sourceGitlinks; },
+  null: snapshot => { snapshot.sourceGitlinks = null; },
+  notArray: snapshot => { snapshot.sourceGitlinks = {}; },
+  parentPath: snapshot => { snapshot.sourceGitlinks = [{ path: '../escape', sha: 'e'.repeat(40) }]; },
+  badSha: snapshot => { snapshot.sourceGitlinks = [{ path: 'valid', sha: 'bad' }]; },
+  duplicate: snapshot => { snapshot.sourceGitlinks = [{ path: 'same', sha: 'e'.repeat(40) }, { path: 'same', sha: 'e'.repeat(40) }]; },
+};
+for (const [name, mutate] of Object.entries(gitlinkMutations)) test(`formal binding reaches public gitlink rejection: ${name}`, () => {
+  const x = fixture(); assert.equal(x.check(), x.binding);
+  mutatePublicSnapshot(x, mutate); assert.throws(x.check, { message: 'Saved public gitlinks differ' });
+});
+test('formal owner failure survives a failing finalizer without becoming a pass', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'formal-owner-finalizer-unit-')), result = { status: 'passed' };
+  try {
+    const x = fixture(); assert.equal(x.check(), x.binding); delete x.contract.platforms.win;
+    const message = 'Upstream native owner platform inventory differs';
+    await assert.rejects(withResultEvidence(directory, result, async () => x.check(), async () => { throw Error('after owner failure'); }), { message });
+    const saved = JSON.parse(readFileSync(join(directory, 'result.json')));
+    assert.equal(saved.status, 'failed'); assert.equal(saved.failure, message);
+    assert.equal(saved.finalVerificationFailure, 'after owner failure');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
 
 test('formal filesystem pins reject redirect, hardlink, unsafe mode, empty, oversize, byte and mode drift', () => {
   const directory = mkdtempSync(join(tmpdir(), 'formal-hot-unit-'));
@@ -174,12 +326,10 @@ test('prepared App tree is anchored to measured source, not a format-valid admis
 });
 for (const key of ['repositoryId', 'releaseId', 'tag', 'sourceCommit', 'sourceTree', 'assets'])
   test(`self-consistent forged readback cannot replace compiled public ${key}`, () => {
-    const x = fixture();
-    x.readback.before[key] = key === 'assets' ? [] : 'wrong';
-    x.readback.after = structuredClone(x.readback.before);
-    x.receipt.publicReadback = structuredClone(x.readback.before);
-    x.repair(); x.binding.consumptionFingerprint = x.receipt.fingerprint;
-    assert.throws(x.check);
+    const x = fixture(); assert.equal(x.check(), x.binding);
+    mutatePublicSnapshot(x, snapshot => { snapshot[key] = key === 'assets' ? [] : 'wrong'; });
+    const message = key === 'assets' ? 'Exact public asset set required' : `Compiled public identity differs: ${key}`;
+    assert.throws(x.check, { message });
   });
 
 

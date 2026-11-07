@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Extract one pinned native archive into a new private directory, never run it."""
+import importlib.util
+import tempfile
 import hashlib
 import gzip
 import io
@@ -254,8 +256,172 @@ def extract_wire_transport(path, destination, record):
         (destination / name).chmod(0o600)
 
 
-def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_identity, build_replacements, reviewed_source=None, legal_files=None, *, legal_pins=False, progress=None):
-    """Hash the full Git tree from source tar bytes without extracting anything.
+def _trusted_consumer_selection(request):
+    # This executable never accepts a caller-selected source repository/path.
+    app_root = Path(__file__).resolve().parents[2]
+    directory = app_root / 'scripts/desktop-core'
+    domain = request.get('trustedSourceSelection')
+    require(domain in ('formal','candidate'), 'closed trusted source selection required')
+    selected = json.loads((directory / ('release-contract.json' if domain == 'formal' else 'native-dns-candidate.json')).read_text(encoding='utf-8'))
+    require(selected.get('repository') == 'polaris-arch/sing-box-polaris' and selected.get('repositoryId') == 1421657509, 'trusted source repository differs')
+    source = selected if domain == 'formal' else json.loads((directory / 'native-dns-source-binding.json').read_text(encoding='utf-8'))
+    require(all(selected.get(key) == source.get(key) for key in ('sourceCommit','sourceTree')), 'trusted committed source pins disagree')
+    require(all(request.get(key) == source.get(key) for key in ('sourceCommit','sourceTree','sourceArchive')),
+            'trusted source archive is not the fixed committed source selection')
+    require(request.get('trustedProducer') == selected.get('producer'), 'trusted source producer differs')
+
+
+# Exact offline data-validator read closure. No producer/adapter, unrelated
+# dependency tree or caller-selected path is imported. The Meta replacement's
+# own manifest determines its complete regular-file inventory under one fixed root.
+TRUSTED_VALIDATOR_FILES = (
+    'scripts/ci/native_release_index.py', 'scripts/ci/polaris_version.py',
+    'scripts/ci/release_identity.py', 'scripts/ci/tls_fingerprint_probe.py',
+    'scripts/ci/windows_native_execution.py', 'scripts/ci/cronet_windows_overlay.py',
+    'release/ci/native-release-index.schema.json',
+    'release/ci/tls-fingerprint-capabilities.schema.json',
+    'go.mod', 'go.sum', 'release/GO_VERSION', 'option/tls.go',
+    'release/polaris-candidate-inputs.json',
+    'release/dependency-sources/metacubex-utls-replacement.json',
+    'release/dependency-sources/metacubex-utls-reality-alpn.patch',
+    'release/dependency-sources/cronet-go-windows-native-observation.json',
+    'release/dependency-sources/cronet-go-windows-native-observation.patch',
+    'release/dependency-sources/cronet-go-replacement.json',
+    'release/dependency-sources/cronet-go-client-admission.patch',
+)
+TRUSTED_META_ROOT = 'third_party/metacubex-utls/'
+TRUSTED_CRONET_ROOT = 'third_party/cronet-go/'
+
+
+def source_tar_member_name(name, directory, root):
+    """Check raw Git member structure, without projecting it onto the filesystem.
+
+    Unselected members may use safe Git names such as @, spaces or Unicode.
+    This is separate from archive_name's closed portable selected-file domain.
+    """
+    require(isinstance(name, str), 'unsafe source archive path')
+    name = name.removesuffix('/') if directory else name
+    parts = name.split('/')
+    require(parts[0] == root and (len(parts) > 1 or directory)
+            and all(part and part not in ('.', '..')
+                    and all(ord(char) >= 32 and ord(char) != 127 and char not in '\\:'
+                            for char in part) for part in parts), 'unsafe source archive path')
+    return name
+
+
+def _trusted_validator_contents(expanded, prefix):
+    """Select regular files from the *same immutable expanded bytes* already verified.
+
+    This boundary independently checks names, duplicates and file/parent
+    collisions; it never relies on an earlier pathname or archive traversal.
+    Unselected Git symlink blobs remain data and are never materialized.
+    """
+    require(type(expanded) is bytes and len(expanded) <= 1024 ** 3, 'verified expanded tar bytes required')
+    entries, ancestors = {}, set()
+    with tarfile.open(fileobj=io.BytesIO(expanded), mode='r:') as package:
+        for member in package:
+            name = source_tar_member_name(member.name, member.isdir(), prefix)
+            require(member.type in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE),
+                    'trusted source special or hardlink member')
+            require(name not in entries, 'trusted source duplicate member')
+            parts = name.split('/')
+            parents = {'/'.join(parts[:i]) for i in range(1,len(parts))}
+            require(not any(parent in entries and not entries[parent].isdir() for parent in parents),
+                    'trusted source parent is not a directory')
+            require(member.isdir() or name not in ancestors, 'trusted source file/directory conflict')
+            entries[name] = member
+            ancestors.update(parents)
+        files, copied = {}, 0
+        def take(relative):
+            nonlocal copied
+            name = archive_name(prefix+'/'+relative, False, prefix)
+            if relative in files:
+                return files[relative]
+            member = entries.get(name)
+            require(member is not None and member.type in (tarfile.REGTYPE,tarfile.AREGTYPE), 'trusted validator regular source missing: '+relative)
+            copied += member.size
+            require(0 <= member.size <= 32*1024*1024 and copied <= 512*1024*1024,
+                    'trusted validator source exceeds bound')
+            stream = package.extractfile(member)
+            require(stream is not None, 'trusted validator member cannot be read')
+            data = stream.read(member.size+1)
+            require(len(data) == member.size, 'trusted validator member size differs')
+            files[relative] = data
+            return data
+        for relative in TRUSTED_VALIDATOR_FILES:
+            take(relative)
+        manifest = json.loads(files['release/dependency-sources/metacubex-utls-replacement.json'])
+        require(manifest.get('replacementPath') == './'+TRUSTED_META_ROOT.rstrip('/')
+                and manifest.get('patch') == 'release/dependency-sources/metacubex-utls-reality-alpn.patch'
+                and isinstance(manifest.get('files'),dict) and 0 < len(manifest['files']) <= 1024,
+                'trusted validator Meta read closure differs')
+        expected_meta = {prefix+'/'+TRUSTED_META_ROOT+relative for relative in manifest['files']}
+        observed_meta = {name for name,member in entries.items()
+                         if name.startswith(prefix+'/'+TRUSTED_META_ROOT) and not member.isdir()}
+        require(observed_meta == expected_meta, 'trusted validator Meta inventory differs')
+        for relative in manifest['files']:
+            take(TRUSTED_META_ROOT+relative)
+        # Copy the complete fixed Cronet subtree, not a projection hiding extra
+        # files from the same-source overlay validator's actual directory walk.
+        cronet_entries = [(name,member) for name,member in entries.items()
+                          if name.startswith(prefix+'/'+TRUSTED_CRONET_ROOT)]
+        cronet = [(name,member) for name,member in cronet_entries if not member.isdir()]
+        require(0 < len(cronet) and len(cronet_entries) <= 256,
+                'trusted validator Cronet inventory bound differs')
+        require(all(not member.isdir() or name in ancestors for name,member in cronet_entries),
+                'trusted validator Cronet directory inventory differs')
+        for name,member in cronet:
+            # This fixed overlay's complete current 137 records are 100644.
+            # Do not erase an executable/archive-special fact during staging.
+            require(member.type in (tarfile.REGTYPE,tarfile.AREGTYPE) and member.mode & 0o7111 == 0,
+                    'trusted validator Cronet regular source mode differs')
+            take(name[len(prefix)+1:])
+        return files
+
+
+def _validate_trusted_source_rows(expanded, prefix, rows, producer):
+    """Explicit acquisition-only same-source data validation after byte/tree verification."""
+    require(isinstance(rows,list) and 0 < len(rows) <= 44 and isinstance(producer,dict), 'trusted source rows/producer required')
+    active = [row for row in rows if row.get('trustedExecution') is not None or any(
+        name in row.get('finalPackageCronetSmoke',{}) for name in ('sealedExecution','macosExecution','windowsExecution'))]
+    if not active:
+        return
+    files = _trusted_validator_contents(expanded,prefix)
+    with tempfile.TemporaryDirectory(prefix='polaris-source-owned-proof-') as directory:
+        root = Path(directory)
+        for relative,data in files.items():
+            target = root.joinpath(*relative.split('/'))
+            require(target.is_relative_to(root) and not target.exists(), 'trusted validator path differs')
+            target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(data)
+        script = root/'scripts/ci/native_release_index.py'
+        sys.path.insert(0,str(script.parent))
+        closed_modules = ('polaris_source_owned_native_index','native_release_index','polaris_version',
+                          'release_identity','tls_fingerprint_probe','windows_native_execution','cronet_windows_overlay')
+        saved_modules = {name:sys.modules.pop(name) for name in closed_modules if name in sys.modules}
+        previous = set(sys.modules)
+        try:
+            spec = importlib.util.spec_from_file_location('polaris_source_owned_native_index',script)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            for row in active:
+                policy = module.validate_trusted_execution(row,producer,source_root=root)
+                require(policy is not None and policy == row.get('trustedExecution'), 'source proof did not validate exact declared policy')
+        finally:
+            sys.path.pop(0)
+            for name in tuple(sys.modules):
+                if name not in previous:
+                    del sys.modules[name]
+            sys.modules.update(saved_modules)
+
+
+def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_identity, build_replacements, reviewed_source=None, legal_files=None, *, legal_pins=False, progress=None, trusted_rows=None, trusted_producer=None):
+    """Hash the full Git tree without extracting or executing source by default.
+
+    An explicit acquisition-only trusted_rows profile subsequently calls the
+    same-source data validator after these byte/tree checks; ordinary offline
+    source verification retains its no-source-execution behavior.
 
     This independently links the downloaded source archive to the public commit
     tree. Tar metadata is never trusted as a commit assertion. Symlink targets
@@ -271,14 +437,15 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mobile-core'))
         from source_policy import validate_source_policy, verify_source_policy_files
         validate_source_policy(reviewed_source, {**source_identity, 'sourceCommit': commit, 'sourceTree': expected_tree})
-        if reviewed_source['schema'] in ('polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3'):
+        if reviewed_source['schema'] in ('polaris-reviewed-kernel-source-v2', 'polaris-reviewed-kernel-source-v3', 'polaris-reviewed-kernel-source-v4'):
             vendors = reviewed_source['vendors']
     vendor_prefixes = tuple(pin['replacementPath'][2:] + '/' for pin in vendors.values()) if vendors else ()
     vendor_modes, vendor_bytes, proof_bytes = {}, 0, 0
     source = Path(path)
-    require(0 < record['bytes'] <= 512 * 1024 * 1024
-            and source.stat().st_size == record['bytes'], 'source archive size differs')
-    data = source.read_bytes()
+    require(0 < record['bytes'] <= 512 * 1024 * 1024, 'source archive size differs')
+    with source.open('rb') as stream:
+        data = stream.read(512 * 1024 * 1024 + 1)
+    require(len(data) == record['bytes'], 'source archive size differs')
     require(hashlib.sha256(data).hexdigest() == record['sha256'], 'source archive SHA differs')
     mark('archive-hash-verified')
     with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
@@ -498,6 +665,8 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
             require(len(new) == 2 and new[1] == target['version']
                     and f"{new[0]} {new[1]} {target['h1']}" in sums,
                     'linked remote replacement version/checksum differs from source')
+    if trusted_rows is not None:
+        _validate_trusted_source_rows(expanded, prefix, trusted_rows, trusted_producer)
     mark('complete')
     return observed
 
@@ -505,7 +674,9 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
 if __name__ == '__main__':
     # Node sends UTF-8 JSON bytes. Never decode through the Windows console
     # code page or surrogateescape; malformed UTF-8 must remain an error.
-    legal_pins = len(sys.argv) == 3 and sys.argv[2] == '--source-legal-pins'
+    trusted_profile = len(sys.argv) == 3 and sys.argv[2] == '--source-trusted-proofs'
+    explicit_legal_pins = len(sys.argv) == 3 and sys.argv[2] == '--source-legal-pins'
+    legal_pins = explicit_legal_pins or trusted_profile
     started = time.monotonic()
     def progress(stage):
         # Fixed stage names and elapsed time only; never emit request contents.
@@ -513,10 +684,14 @@ if __name__ == '__main__':
             print(f'SOURCE_ARCHIVE_PROOF stage={stage} elapsed_ms={int((time.monotonic() - started) * 1000)}',
                   file=sys.stderr, flush=True)
     progress('stdin-start')
-    raw_request = sys.stdin.buffer.read()
+    raw_request = sys.stdin.buffer.read(16 * 1024 * 1024 + 1) if trusted_profile else sys.stdin.buffer.read()
+    require(not trusted_profile or len(raw_request) <= 16 * 1024 * 1024, "trusted proof input exceeds bound")
     progress('stdin-read')
     request = json.loads(raw_request.decode('utf-8', errors='strict'))
     progress('request-decoded')
+    require(not trusted_profile or isinstance(request,dict) and isinstance(request.get('trustedRows'),list) and isinstance(request.get('trustedProducer'),dict), 'explicit trusted rows required')
+    if trusted_profile:
+        _trusted_consumer_selection(request)
     require(not legal_pins or isinstance(request, dict) and 'sourceArchive' in request, 'source legal pins require source archive')
     require(isinstance(request, dict) and 'profile' not in request, 'unexpected archive profile field')
     # Only trusted command-line call sites select this distinct transport
@@ -531,7 +706,11 @@ if __name__ == '__main__':
         extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], wire_handoff=True)
     elif 'sourceArchive' in request:
         require((len(sys.argv) == 2 or legal_pins) and not sys.argv[1].startswith('--'), 'unexpected source archive arguments')
-        verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'], request.get('sourcePolicy'), request.get('legalFiles'), legal_pins=legal_pins, progress=progress)
+        # Only the validated candidate profile may genuinely omit inventory.
+        # Explicit pin intent, formal inventory and a present null stay strict.
+        source_legal_pins = explicit_legal_pins or (trusted_profile and (
+            request['trustedSourceSelection'] == 'formal' or 'legalFiles' in request))
+        verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'], request.get('sourcePolicy'), request.get('legalFiles'), legal_pins=source_legal_pins, progress=progress, trusted_rows=request.get("trustedRows") if trusted_profile else None, trusted_producer=request.get("trustedProducer") if trusted_profile else None)
     elif 'wireTransport' in request:
         require(len(sys.argv) == 3 and not sys.argv[1].startswith('--'), 'unexpected wire ZIP arguments')
         extract_wire_transport(sys.argv[1], sys.argv[2], request['wireTransport'])

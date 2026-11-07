@@ -25,7 +25,9 @@ export interface SettingsGeneralProps {
 
 export default function SettingsGeneral({ config, update }: SettingsGeneralProps) {
   const { t } = useTranslation();
-  const [hasPassword, setHasPassword] = useState(false);
+  const [hasPassword, setHasPassword] = useState<boolean | null>(null);
+  const [passwordReadFailed, setPasswordReadFailed] = useState(false);
+  const passwordReadSerial = useRef(0);
   const [autoStart, setAutoStart] = useState<boolean | null>(null);
   const [autoStartBusy, setAutoStartBusy] = useState(false);
   const autoStartGate = useRef(false);
@@ -53,9 +55,26 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
   const [pwErr, setPwErr] = useState('');
   const [saving, setSaving] = useState(false);
 
-  // 查询是否已设密码（隐私锁状态文案依赖）
+  async function readPassword() {
+    const serial = ++passwordReadSerial.current;
+    setHasPassword(null);
+    setPasswordReadFailed(false);
+    try {
+      const value = await privacyApi.hasPassword();
+      if (alive.current && serial === passwordReadSerial.current) {
+        if (typeof value === 'boolean') setHasPassword(value);
+        else setPasswordReadFailed(true);
+      }
+    } catch (error) {
+      if (alive.current && serial === passwordReadSerial.current) setPasswordReadFailed(true);
+      console.error('[SettingsGeneral] privacy password status unavailable:', error);
+    }
+  }
+
+  // A failed query remains unknown; it cannot authorize setting/clearing a password.
   useEffect(() => {
-    void privacyApi.hasPassword().then(setHasPassword).catch(() => undefined);
+    void readPassword();
+    return () => { passwordReadSerial.current++; };
   }, []);
 
   async function toggleAutoStart(next: boolean) {
@@ -77,6 +96,7 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
   }
 
   function openPwEditor() {
+    if (hasPassword === null) return;
     setPwDraft('');
     setPwErr('');
     setEditing(true);
@@ -85,7 +105,7 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
   // 保存锁屏密码：留空 = 清除（对齐后端 set_password_core：空串 remove hash）。调 privacy_set_password。
   // 后端锁屏中拒改（PRIVACY_LOCKED），但 Settings 只在未锁时可达，此路径正常不触发；仍捕获兜底显错。
   async function savePassword() {
-    if (saving) return;
+    if (saving || hasPassword === null) return;
     setSaving(true);
     setPwErr('');
     try {
@@ -179,9 +199,13 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
           <SetRow
             label={t('settings.general.privacyPassword')}
             desc={
-              hasPassword
-                ? t('settings.general.privacyPasswordSet')
-                : t('settings.general.privacyPasswordUnset')
+              passwordReadFailed
+                ? t('settings.general.privacyPasswordReadFailed')
+                : hasPassword === null
+                  ? t('settings.general.privacyPasswordUnknown')
+                  : hasPassword
+                    ? t('settings.general.privacyPasswordSet')
+                    : t('settings.general.privacyPasswordUnset')
             }
             align={editing ? 'start' : undefined}
           >
@@ -214,13 +238,18 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
                 )}
               </div>
             ) : (
-              <Button variant="ghost" size="sm" onClick={openPwEditor}>
-                <span>
-                  {hasPassword
-                    ? t('settings.general.privacyPasswordChange')
-                    : t('settings.general.privacyPasswordSetBtn')}
-                </span>
-              </Button>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <Button variant="ghost" size="sm" disabled={hasPassword === null} onClick={openPwEditor}>
+                  <span>
+                    {hasPassword
+                      ? t('settings.general.privacyPasswordChange')
+                      : t('settings.general.privacyPasswordSetBtn')}
+                  </span>
+                </Button>
+                {passwordReadFailed && <Button variant="ghost" size="sm" onClick={() => void readPassword()}>
+                  <span>{t('common.retry')}</span>
+                </Button>}
+              </div>
             )}
           </SetRow>
         )}

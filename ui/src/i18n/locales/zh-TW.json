@@ -270,7 +270,8 @@
     "diagnosticMode": "診斷模式",
     "diagnosticTipOff": "本次執行暫時啟用 DEBUG；重啟應用程式後恢復。",
     "diagnosticTipOn": "診斷模式已開啟；再次點擊或重啟應用程式後恢復。",
-    "diagnosticFailed": "切換診斷模式失敗"
+    "diagnosticFailed": "切換診斷模式失敗",
+    "streamFailed": "日誌即時串流連線失敗。現有紀錄已保留，請重試。"
   },
   "notify": {
     "proxyError": {
@@ -443,6 +444,26 @@
     "pendingDetailTip": "需重啟核心生效 · 點擊查看明細",
     "pendingDetailTipStaged": "點擊查看明細",
     "pendingEffectNeedsRestart": "儲存後待套用",
+    "impactApplyTitle": "確認套用影響",
+    "impactApplyDescription": "以下變更會更新連線或系統網路設定。",
+    "impactApplyTunTcpReset": "現有 TUN TCP 連線將被重設。",
+    "impactApplyTunUdpReset": "現有 TUN UDP 工作階段將被重設。",
+    "impactApplyTunRollback": "即使還原設定，也無法恢復這些已重設的 TUN 工作階段。",
+    "impactApplyListenerAdmissions": "變更入站的新連線將使用更新後的設定。",
+    "impactApplyListenerUdp": "受影響的接聽程式 UDP 工作階段可能中斷，需要重新建立。",
+    "impactApplyListenerHandoff": "相關接聽程式將進行交接，受影響的連線可能需要重新連線。",
+    "impactApplyApiStreams": "替換端點上的管理 API 串流將重新連線。",
+    "impactApplyDashboard": "儀表板更新工作將停止或重新啟動，以符合新設定。",
+    "impactApplyNewAdmissions": "新連線將使用更新後的執行設定。",
+    "impactApplyLogEmissions": "日誌輸出將切換到更新後的設定。",
+    "impactApplyTlsConsumers": "新的 TLS 連線及使用憑證提供者的元件將切換到更新後的提供者。",
+    "impactApplyClockConsumers": "新的時鐘使用元件將切換到更新後的時間來源。",
+    "impactApplyUnknown": "無法確認此次變更的影響，已禁止套用。請取消並檢查待套用的變更。",
+    "impactApplySavedPending": "這些變更已儲存。取消會保留待套用狀態，目前執行中的設定不變。",
+    "impactApplyDns": "更新系統 DNS 設定",
+    "impactApplyProxy": "更新系統代理設定",
+    "impactApplyTunnel": "更新通道設定",
+    "impactApplyConfirm": "確認並套用",
     "restartApplyTitle": "需要重新啟動",
     "restartApplyDescription": "此變更需要重新啟動，會中斷目前連線。",
     "restartApplyConfirm": "重新啟動並套用",
@@ -453,7 +474,27 @@
     "restartApplyNamespace": "網路命名空間已變更。",
     "restartApplyServices": "服務生命週期設定已變更。",
     "restartApplyCache": "持久快取路徑已變更。",
+    "restartApplyPersistenceOwner": "更新期間設定再次被儲存，需要重新啟動以完成套用。",
+    "restartApplyHostEffects": "目前的系統網路設定需要透過重新啟動重新接管。",
+    "restartApplyDnsAutoSource": "系統 DNS 接管會改變自動 DNS 的來源或可用性，需要重新啟動核心後生效。",
     "restartApplyStructural": "執行階段結構性設定已變更。",
+    "pendingHostEffectsPending": "系統設定正在套用",
+    "pendingHostCoreCommitted": "核心設定已生效，系統設定仍在處理中",
+    "pendingHostEffectsFailed": "系統設定尚未完成",
+    "pendingHostCoreCommittedFailed": "核心設定已生效，系統設定仍待處理",
+    "pendingHostSuperseded": "這次系統設定操作已過期。請重新預覽目前連線的設定。",
+    "pendingHostAndDurabilityPending": "系統設定仍待完成，設定也尚未確認儲存。兩項狀態會分別更新。",
+    "pendingHostWaitDetail": "正在等待系統設定的執行結果，不會自動重試。",
+    "pendingHostFailedDetail": "未完成的系統設定仍保留。重試前會重新顯示需要確認的影響。",
+    "pendingRetryHostBtn": "重新預覽系統設定",
+    "pendingCheckHostBtn": "檢查系統設定狀態",
+    "pendingNativeCleanupUnknown": "舊網路入口關閉未確認",
+    "pendingNativeCleanupDetail": "可檢查關閉狀態。若需復原，請在首頁先中斷再連線，以正常重新啟動核心；這會中斷連線。再次套用設定無法證明舊入口已關閉。",
+    "pendingNativeSavedActive": "設定已儲存，目前核心已切換至該設定。",
+    "pendingNativeActive": "目前核心已切換至更新後的設定。",
+    "pendingNativeSaveUnconfirmed": "設定儲存仍未確認，需另行復原儲存。",
+    "pendingNativeHostSettled": "系統設定已確認完成；舊網路入口清理仍須另行確認。",
+    "pendingCheckNativeBtn": "檢查入口關閉狀態",
     "pendingHotApplied": "已套用至執行中的核心。",
     "pendingHotDurabilityPending": "執行階段已套用，持久化仍待完成。",
     "pendingRetryPersistenceBtn": "重試持久化",
@@ -737,7 +778,9 @@
       "privacyPasswordUnset": "未設定 · 任何人皆可解鎖",
       "privacyPasswordChange": "修改密碼",
       "privacyPasswordSetBtn": "設定密碼",
-      "pageTitle": "通用"
+      "pageTitle": "通用",
+      "privacyPasswordUnknown": "尚未讀取鎖定密碼狀態。",
+      "privacyPasswordReadFailed": "無法讀取鎖定密碼狀態，請重試。"
     },
     "restartApp": {
       "title": "需重新啟動 Polaris 才會生效",
@@ -1376,7 +1419,8 @@
       "raceCustomHint": "上游必須使用純 IP 位址。DoH 和 DoT 合計最多 3 個；UDP 不占加密競速額度。",
       "raceCustomEmpty": "沒有自訂上游",
       "fakeIpFilterEmpty": "無自訂例外；A/AAAA 查詢可使用 FakeIP",
-      "browserDohEmpty": "清單為空，不會攔截任何端點"
+      "browserDohEmpty": "清單為空，不會攔截任何端點",
+      "takeoverSystemDnsUnsupported": "此平台不會另外接管系統 DNS，此開關不會生效。"
     }
   },
   "rules": {
@@ -1851,7 +1895,7 @@
     "startupFailed": "sing-box 啟動失敗，請檢查伺服器設定",
     "helperRuntimeRestartRequired": "本次切換到本機執行需要重新啟動 Polaris。請正常結束並重新開啟應用程式，再嘗試本機執行。",
     "helperNotInstalledTitle": "helper 未安裝或需要升級",
-    "helperNotInstalledDesc": "TUN 模式需要提權 helper，但它尚未安裝，或已安裝的版本過舊。前往「設定 › Helper」安裝或升級後重試。",
+    "helperNotInstalledDesc": "目前模式使用助手的受保護核心，請透過助手設定中的可信安裝流程處理。",
     "helperNotInstalledAction": "去安裝",
     "helperGateAborted": "已取消安裝提權助手，本次未啟動 TUN 模式代理",
     "tunRouteNotCaptured": "偵測到其他 VPN 佔用預設路由，請先中斷後重試",
@@ -1878,7 +1922,9 @@
     "subtitle": "輸入密碼解鎖。代理仍在執行。",
     "unlock": "解鎖",
     "enterPassword": "請輸入密碼",
-    "unlockFailed": "解鎖沒能完成，請稍後再試。"
+    "unlockFailed": "解鎖沒能完成，請稍後再試。",
+    "passwordStatusUnknown": "尚未讀取鎖定密碼狀態。",
+    "passwordStatusFailed": "無法讀取鎖定密碼狀態，請重試。"
   },
   "appAdd": {
     "catCustom": "自訂…",
@@ -2055,7 +2101,8 @@
       "default": "預設",
       "disabled": "關閉 uTLS",
       "loading": "正在讀取核心指紋能力…",
-      "unavailable": "無法讀取指紋能力：{{reason}}。保留現有設定，由實際核心檢查。",
+      "unavailable": "指紋能力暫時無法使用，目前無法列出支援的瀏覽器指紋。已儲存的選擇保持不變。",
+      "selectedSupport": "依本應用程式所選核心顯示支援的選項；此處不驗證安裝或執行狀態。",
       "realityRequired": "REALITY 需要 uTLS，不能關閉。預設使用 Chrome，也可選擇支援的瀏覽器指紋。",
       "random": "隨機",
       "description": "預設在支援 uTLS 的連線上使用 Chrome。關閉僅停用 uTLS，保留 TLS；REALITY 不允許關閉。隨機在每次核心啟動時選擇一種瀏覽器範本。",
@@ -3015,7 +3062,10 @@
       "intro": "規則在「生效網路」裡選中某個場景後，只在手機連著該網路時生效；離開後自動略過，不用重新連線。",
       "reasonDhcpNoPermission": "手機上的 App 沒有權限直接向路由器詢問（DHCP），請改用自動或系統 DNS",
       "listEmpty": "還沒有填寫"
-    }
+    },
+    "customAppPackagesUnsupported": "iOS 不支援依 Android 應用程式套件名稱比對，仍可依網域或 IP 設定此應用程式。",
+    "customAppMatchIos": "iOS 僅依此應用程式的網域或 IP 比對，且須具備對應規則資源。程序名稱適用於桌面端，Android 套件名稱在 iOS 不會生效。",
+    "appRoutingMatchNoteIos": "iOS 應用程式分流依已知網域或 IP 比對，且須具備對應規則資源；無法依應用程式身分或 Android 套件名稱辨識，也不會將應用程式排除於系統 VPN 之外。"
   },
   "mobileSettings": {
     "saveFailedWithReason": "儲存失敗：{{reason}}",
@@ -3029,7 +3079,11 @@
       "bootConnectDesc": "由系統在開機或斷線後恢復 VPN，也可阻止未經 VPN 的流量。",
       "bootConnectPath": "系統設定 → 網路和網際網路 → VPN → Polaris → 一律開啟 VPN",
       "bootConnectOpenFailed": "打不開系統設定頁，請按上面的路徑手動前往。",
-      "privacyLockFailed": "自動鎖屏沒能生效，介面仍是解鎖狀態。"
+      "privacyLockFailed": "自動鎖屏沒能生效，介面仍是解鎖狀態。",
+      "autoStartUnsupported": "iOS 不支援開機自動連線。",
+      "bootConnectUnsupported": "iOS 不提供 Android 的「一律啟用 VPN」設定。",
+      "privacyPasswordUnknown": "尚未讀取鎖定密碼狀態。",
+      "privacyPasswordReadFailed": "無法讀取鎖定密碼狀態，請重試。"
     },
     "dns": {
       "fakeIpOffRisk": "在 TUN 模式下關掉它，節點會收到真實 IP 而不是網域；部分防濫用嚴格的機場會因此拒絕連線，這個風險用戶端緩解不了。"
@@ -3045,7 +3099,9 @@
       "desc": "連線時會視需要請求系統 VPN 授權。",
       "granted": "已授權",
       "denied": "未授權",
-      "unknown": "讀不到"
+      "unknown": "讀不到",
+      "unsupported": "不適用",
+      "unsupportedDesc": "此授權狀態查詢僅適用於 Android；iOS 連線時由系統管理 VPN 設定授權。"
     },
     "update": {
       "channelBlock": "應用程式更新",
@@ -3089,7 +3145,8 @@
       "systemBackupTitle": "允許系統備份應用程式資料",
       "systemBackupDesc": "預設關閉。開啟後，Android 會把 Polaris 的應用程式資料（包括節點憑證和訂閱）備份到你的 Google 帳戶，換機移轉時也會一併帶到新裝置。Google 雲端備份僅在 Android 9 以上、且裝置設定了螢幕鎖定（PIN、圖案或密碼）時才端對端加密。在新裝置上還原後，此開關仍為關閉，需要重新開啟。上方的匯出不受此開關影響。",
       "systemBackupReadFailed": "讀不到系統備份開關的目前狀態。",
-      "systemBackupReadFailedWithReason": "讀不到系統備份開關的目前狀態：{{reason}}"
+      "systemBackupReadFailedWithReason": "讀不到系統備份開關的目前狀態：{{reason}}",
+      "systemBackupUnsupported": "此系統備份開關僅適用於 Android；不適用於 iOS。"
     },
     "about": {
       "licenseBlock": "授權",

@@ -431,3 +431,285 @@ fn runtime_reuse_rejects_new_or_preexisting_uncovered_active_roots() {
         "coverage alone cannot invent a previous accepted route target"
     );
 }
+
+#[test]
+fn protected_plan_extends_only_new_active_targets_and_keeps_accepted_owner_immutable() {
+    let old = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        selected_server_id: Some("a".into()),
+        servers: vec![server("a", "old.example")],
+        ..Default::default()
+    };
+    let accepted = RuntimeBindingPlan {
+        native_roots: BTreeSet::from(["a".into()]),
+        covered_roots: BTreeSet::from(["a".into()]),
+        candidate_count: 1,
+        ..Default::default()
+    };
+    let mut new = old.clone();
+    new.servers[0].address = "new.example".into();
+    let mut resolved = Vec::new();
+    let mut verified = Vec::new();
+    let (plan, ttl, targets) = extend_protected_binding_plan(
+        &old,
+        &new,
+        &accepted,
+        "eth0",
+        |host| {
+            resolved.push(host.to_owned());
+            Ok(("203.0.113.8".parse().unwrap(), Duration::from_secs(23)))
+        },
+        |ip, port| {
+            verified.push((ip, port));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved, ["new.example"]);
+    assert_eq!(verified, targets);
+    assert_eq!(ttl, Duration::from_secs(23));
+    assert_eq!(plan.bindings.get("a").map(String::as_str), Some("eth0"));
+    assert!(!plan.native_roots.contains("a"));
+    assert!(accepted.bindings.is_empty() && accepted.native_roots.contains("a"));
+    let reused = extend_protected_binding_plan(
+        &old,
+        &old,
+        &accepted,
+        "eth0",
+        |_| panic!("covered host must not resolve again"),
+        |_, _| panic!("covered host must not probe again"),
+    )
+    .unwrap();
+    assert_eq!(reused.0, accepted);
+}
+#[test]
+fn protected_plan_resolution_and_route_failures_never_partially_publish() {
+    let old = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        ..Default::default()
+    };
+    let new = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        selected_server_id: Some("a".into()),
+        servers: vec![server("a", "new.example")],
+        ..Default::default()
+    };
+    let accepted = RuntimeBindingPlan::default();
+    assert!(extend_protected_binding_plan(
+        &old,
+        &new,
+        &accepted,
+        "eth0",
+        |_| Err("DNS IO still owned or failed".into()),
+        |_, _| panic!("no route query after DNS error")
+    )
+    .is_err());
+    assert!(extend_protected_binding_plan(
+        &old,
+        &new,
+        &accepted,
+        "eth0",
+        |_| Ok(("203.0.113.8".parse().unwrap(), Duration::from_secs(30))),
+        |_, _| Err("policy drift".into())
+    )
+    .is_err());
+    assert_eq!(accepted, RuntimeBindingPlan::default());
+    let mut ipv6 = new;
+    ipv6.servers[0].address = "2001:db8::8".into();
+    assert!(extend_protected_binding_plan(
+        &old,
+        &ipv6,
+        &accepted,
+        "eth0",
+        |_| panic!("no unprotected fallback lookup"),
+        |_, _| Ok(())
+    )
+    .is_err());
+}
+fn physical_answer_fixture(host: &str, ip: [u8; 4], ttl: u32) -> (u16, Vec<u8>) {
+    let (id, mut packet) = physical_dns_query(host).unwrap();
+    packet[2] = 0x81;
+    packet[3] = 0x80;
+    packet[7] = 1;
+    packet.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+    packet.extend_from_slice(&ttl.to_be_bytes());
+    packet.extend_from_slice(&[0, 4]);
+    packet.extend_from_slice(&ip);
+    (id, packet)
+}
+#[test]
+fn physical_dns_wire_validates_original_question_id_truncation_and_compression() {
+    let (id, packet) = physical_answer_fixture("node.example", [203, 0, 113, 8], 21);
+    assert_eq!(
+        physical_dns_answer(&packet, id, "node.example").unwrap(),
+        ("203.0.113.8".parse().unwrap(), Duration::from_secs(21))
+    );
+    assert!(physical_dns_answer(&packet, id.wrapping_add(1), "node.example").is_err());
+    assert!(physical_dns_answer(&packet, id, "foreign.example").is_err());
+    let mut truncated = packet.clone();
+    truncated[2] |= 2;
+    assert!(physical_dns_answer(&truncated, id, "node.example").is_err());
+    for end in 0..packet.len() {
+        assert!(physical_dns_answer(&packet[..end], id, "node.example").is_err());
+    }
+    let mut cursor = 0;
+    assert!(physical_dns_name(&[0xc0, 0], &mut cursor).is_err());
+    for (ip, ttl) in [
+        ([127, 0, 0, 1], 30),
+        ([198, 18, 0, 2], 30),
+        ([203, 0, 113, 8], 0),
+    ] {
+        let (id, answer) = physical_answer_fixture("node.example", ip, ttl);
+        assert!(physical_dns_answer(&answer, id, "node.example").is_err());
+    }
+    assert!(physical_dns_query("singlelabel").is_err());
+    assert!(physical_dns_query("bad\n.example").is_err());
+}
+#[test]
+fn physical_dns_alias_requires_exact_chain_and_keeps_shortest_ttl() {
+    let (id, mut packet) = physical_dns_query("node.example").unwrap();
+    packet[2] = 0x81;
+    packet[3] = 0x80;
+    packet[7] = 2;
+    let alias = b"\x04edge\x07example\0";
+    packet.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1]);
+    packet.extend_from_slice(&7u32.to_be_bytes());
+    packet.extend_from_slice(&(alias.len() as u16).to_be_bytes());
+    packet.extend_from_slice(alias);
+    packet.extend_from_slice(alias);
+    packet.extend_from_slice(&[0, 1, 0, 1]);
+    packet.extend_from_slice(&40u32.to_be_bytes());
+    packet.extend_from_slice(&[0, 4, 203, 0, 113, 9]);
+    assert_eq!(
+        physical_dns_answer(&packet, id, "node.example").unwrap().1,
+        Duration::from_secs(7)
+    );
+    let (foreign_id, foreign) = physical_answer_fixture("other.example", [203, 0, 113, 9], 30);
+    assert!(physical_dns_answer(&foreign, foreign_id, "node.example").is_err());
+}
+
+fn protected_generated_fixture() -> polaris_config_engine::singbox::SingBoxConfig {
+    serde_json::from_value(serde_json::json!({
+        "log":{"level":"info","timestamp":true},
+        "inbounds":[{"type":"tun","tag":"tun-in","interface_name":"polaris-tun0","address":["172.19.0.1/30"],"auto_route":true,"auto_redirect":false}],
+        "outbounds":[{"type":"vless","tag":"np-a","server":"old.example","server_port":443,"uuid":"fixture"}],
+        "route":{"rules":[],"auto_detect_interface":true,"final":"np-a"}
+    })).unwrap()
+}
+#[test]
+fn protected_generated_projection_allows_new_proven_node_and_logical_route_changes() {
+    let before = protected_generated_fixture();
+    let mut after = before.clone();
+    let mut node = after.outbounds[0].clone();
+    node.tag = "np-b".into();
+    node.server = Some("new.example".into());
+    node.extra
+        .insert("bind_interface".into(), serde_json::json!("eth0"));
+    after.outbounds.push(node);
+    after.outbounds[0].uuid = Some("changed-credential".into());
+    after.route.as_mut().unwrap().final_outbound = Some("np-b".into());
+    after.route.as_mut().unwrap().rules.push(
+        serde_json::from_value(
+            serde_json::json!({"domain":["example.test"],"action":"route","outbound":"np-b"}),
+        )
+        .unwrap(),
+    );
+    assert!(protected_generated_policy_compatible(&before, &after));
+}
+#[test]
+fn protected_generated_projection_rejects_tun_replacement_implicit_marks_and_special_sockets() {
+    let before = protected_generated_fixture();
+    let mut next = before.clone();
+    next.inbounds[0].mtu = Some(1400);
+    assert!(!protected_generated_policy_compatible(&before, &next));
+    next = before.clone();
+    next.inbounds[0].auto_redirect = Some(true);
+    assert!(!protected_generated_policy_compatible(&next, &next));
+    next = before.clone();
+    next.route.as_mut().unwrap().auto_detect_interface = Some(false);
+    assert!(!protected_generated_policy_compatible(&before, &next));
+    for (key, value) in [
+        ("routing_mark", serde_json::json!(123)),
+        ("network_namespace", serde_json::json!("foreign")),
+        ("inet4_bind_address", serde_json::json!("192.0.2.9")),
+        ("network_strategy", serde_json::json!("hybrid")),
+        ("protect_path", serde_json::json!("/run/socket")),
+    ] {
+        next = before.clone();
+        next.outbounds[0].extra.insert(key.into(), value);
+        assert!(
+            !protected_generated_policy_compatible(&next, &next),
+            "{key}"
+        );
+    }
+    next = before.clone();
+    next.outbounds[0]
+        .extra
+        .insert("routing_mark".into(), serde_json::json!(0));
+    assert!(protected_generated_policy_compatible(&before, &next));
+    next = before.clone();
+    next.inbounds.push(next.inbounds[0].clone());
+    assert!(!protected_generated_policy_compatible(&next, &next));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn protected_plan_does_not_attest_an_inactive_edit_when_advancing_trusted_config() {
+    let old = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        selected_server_id: Some("a".into()),
+        servers: vec![server("a", "old-a.example"), server("b", "old-b.example")],
+        ..Default::default()
+    };
+    let accepted = RuntimeBindingPlan {
+        covered_roots: BTreeSet::from(["a".into(), "b".into()]),
+        native_roots: BTreeSet::from(["a".into(), "b".into()]),
+        candidate_count: 2,
+        ..Default::default()
+    };
+    let mut next = old.clone();
+    next.servers[0].address = "new-a.example".into();
+    next.servers[1].address = "unprobed-b.example".into();
+    let (plan, _, _) = extend_protected_binding_plan(
+        &old,
+        &next,
+        &accepted,
+        "eth0",
+        |host| {
+            assert_eq!(host, "new-a.example");
+            Ok(("203.0.113.9".parse().unwrap(), Duration::from_secs(30)))
+        },
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    assert!(plan.covered_roots.contains("a") && !plan.covered_roots.contains("b"));
+    assert!(
+        accepted.covered_roots.contains("b"),
+        "old owner facts remain unchanged"
+    );
+    let mut activated = next.clone();
+    activated.selected_server_id = Some("b".into());
+    assert!(
+        !runtime_binding_targets_reusable(&next, &activated, &plan),
+        "new trusted host cannot borrow removed old coverage"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn negative_memory_proofs_fail_before_any_native_or_network_verification() {
+    for expired in [true, false] {
+        let (owner, proof) = blocked_physical_binding_proof_for_test(7, 11, expired);
+        assert!(owner.seal.lock().unwrap().is_none());
+        assert!(!proof.publication_current(7, 11));
+        assert_eq!(
+            proof.verify(7, 11).await.unwrap_err(),
+            "protected route proof expired, revoked or changed owner"
+        );
+        // No real proof may be synthesized by changing the caller's identity.
+        assert!(!proof.publication_current(8, 11));
+        assert!(!proof.publication_current(7, 12));
+        owner.revoke();
+        assert!(!proof.publication_current(7, 11));
+    }
+}

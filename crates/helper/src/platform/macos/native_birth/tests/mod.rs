@@ -637,6 +637,7 @@ fn wire(
 fn wire_start() -> polaris_helper_proto::Request {
     polaris_helper_proto::Request::NativeStartPinned(
         polaris_helper_proto::core_protocol::PinnedStartParams {
+            runtime_directory: None,
             id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
             common: polaris_helper_proto::StartParams {
                 cfg: "/inert/config.json".into(),

@@ -1,12 +1,12 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import type { TlsFingerprintSnapshot } from '@/domain/utls';
+import type { TlsFingerprintPresentation, TlsFingerprintSnapshot, SelectedTlsSupportDirectory } from '@/domain/utls';
 
 const reads = vi.hoisted(() => ({
-  pending: [] as ((value: TlsFingerprintSnapshot) => void)[],
+  pending: [] as ((value: TlsFingerprintPresentation) => void)[],
   started: () => {}, stopped: () => {},
 }));
 vi.mock('@/ipc/api/updater', () => ({ coreApi: {
-  getTlsFingerprints: () => new Promise<TlsFingerprintSnapshot>(resolve => { reads.pending.push(resolve); }),
+  getTlsFingerprints: () => new Promise<TlsFingerprintPresentation>(resolve => { reads.pending.push(resolve); }),
 } }));
 vi.mock('@/ipc/api/proxy', () => ({ proxyApi: {
   onStarted: (callback: () => void) => { reads.started = callback; return () => { reads.started = () => {}; }; },
@@ -38,7 +38,7 @@ it('coalesces readers, invalidates at core transitions, and rejects an older in-
   await vi.waitFor(() => expect(reads.pending).toHaveLength(1));
   expect(currentTlsFingerprints()).toBeUndefined();
   reads.pending.shift()!(observed('b'));
-  await vi.waitFor(() => expect(currentTlsFingerprints()?.binarySha256).toBe('b'.repeat(64)));
+  await vi.waitFor(() => expect(currentTlsFingerprints()).toEqual(observed('b')));
   reads.stopped();
   expect(currentTlsFingerprints()).toBeUndefined();
   offSecond(); off(); off = undefined;
@@ -51,9 +51,31 @@ it('refreshes after delayed native setup completes without focus or a core trans
   vi.stubGlobal('window', new EventTarget());
   off = subscribeTlsFingerprints(() => {});
   reads.pending.shift()!(observed('a'));
-  await vi.waitFor(() => expect(currentTlsFingerprints()?.binarySha256).toBe('a'.repeat(64)));
+  await vi.waitFor(() => expect(currentTlsFingerprints()).toEqual(observed('a')));
   window.dispatchEvent(new Event('polaris-libbox-ready'));
   expect(currentTlsFingerprints()).toBeUndefined();
   reads.pending.shift()!(observed('b'));
-  await vi.waitFor(() => expect(currentTlsFingerprints()?.binarySha256).toBe('b'.repeat(64)));
+  await vi.waitFor(() => expect(currentTlsFingerprints()).toEqual(observed('b')));
+});
+
+it('retains the complete native refusal in the shared diagnostic snapshot', async () => {
+  vi.stubGlobal('window', new EventTarget());
+  off = subscribeTlsFingerprints(() => {});
+  const refusal = { ...observed('a'), unavailableReason: 'CORE_ADMISSION_UnsupportedExactObject: exact native object unavailable' };
+  reads.pending.shift()!(refusal);
+  await vi.waitFor(() => expect(currentTlsFingerprints()).toEqual(refusal));
+  expect(currentTlsFingerprints()?.unavailableReason).toBe(refusal.unavailableReason);
+});
+
+it('publishes expected selected support without converting it to a loaded byte observation', async () => {
+  vi.stubGlobal('window', new EventTarget());
+  off = subscribeTlsFingerprints(() => {});
+  const expected: SelectedTlsSupportDirectory = {
+    evidenceKind: 'compiled-selected-support-v1', selectedSpec: null, document: null,
+    unavailableReason: 'No reviewed support for this compiled selection',
+  };
+  reads.pending.shift()!(expected);
+  await vi.waitFor(() => expect(currentTlsFingerprints()).toEqual(expected));
+  expect(currentTlsFingerprints()).not.toHaveProperty('binarySha256');
+  expect(currentTlsFingerprints()).not.toHaveProperty('observationScope');
 });

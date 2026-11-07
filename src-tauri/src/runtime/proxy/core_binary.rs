@@ -136,7 +136,7 @@ pub(crate) fn first_existing_bundle_candidate(candidates: &[PathBuf]) -> Option<
 /// A process environment variable cannot admit a replacement core. Explicit
 /// per-runtime cfg(test) injection remains separate from shipped debug code.
 #[cfg(any(debug_assertions, test))]
-fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
+pub(super) fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
     if std::env::var_os("POLARIS_SINGBOX_PATH").is_some() {
         return Err("POLARIS_SINGBOX_PATH 不允许替换配套内核；请使用已验证的编译期内核选择".into());
     }
@@ -380,3 +380,43 @@ pub(crate) fn resolve_dashboard_serve_dir(config_dir: &std::path::Path) -> Optio
 
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Verified installation data for a closed Helper route. No Prepared or payload owner.
+#[cfg(any(
+    not(test),
+    all(debug_assertions, desktop, feature = "native-production-verification")
+))]
+pub(super) struct HelperCandidateData {
+    path: PathBuf,
+}
+#[cfg(any(
+    not(test),
+    all(debug_assertions, desktop, feature = "native-production-verification")
+))]
+impl HelperCandidateData {
+    pub(super) fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+#[cfg(any(
+    not(test),
+    all(debug_assertions, desktop, feature = "native-production-verification")
+))]
+pub(super) fn resolve_helper_candidate_data() -> Result<HelperCandidateData, String> {
+    let observation = resolve_core_candidate_observation()?;
+    let platform = crate::runtime::core_identity::current_platform()?;
+    let manifest = crate::runtime::core_identity::selected_manifest(platform)?;
+    crate::runtime::core_identity::verify_directory(
+        observation
+            .path()
+            .parent()
+            .ok_or("Core candidate parent absent")?,
+        &manifest,
+    )?;
+    if !observation.is_current() {
+        return Err("CORE_BUNDLE_MISMATCH: helper candidate selection changed".into());
+    }
+    Ok(HelperCandidateData {
+        path: observation.path().to_path_buf(),
+    })
+}

@@ -78,6 +78,7 @@ fn frozen_v2_parse(lines: &[String]) -> Option<PinnedStartParams> {
         }
     };
     Some(PinnedStartParams {
+        runtime_directory: None,
         id,
         common: StartParams {
             cfg: cfg.clone(),
@@ -94,6 +95,7 @@ fn v3_pinned_frames_are_rejected_by_frozen_v2_before_any_birth() {
     assert!(CoreId::parse(PINNED_EXECUTION_DISCRIMINATOR).is_err());
     for parent_pid in [None, Some(42)] {
         let params = PinnedStartParams {
+            runtime_directory: None,
             id: id.clone(),
             common: StartParams {
                 cfg: "/caller/cfg".into(),
@@ -121,5 +123,56 @@ fn v3_pinned_frames_are_rejected_by_frozen_v2_before_any_birth() {
             duplicate.insert(1, PINNED_EXECUTION_DISCRIMINATOR.into());
             assert!(PinnedStartParams::parse(&duplicate).is_none());
         }
+    }
+}
+
+fn frozen_v3_parse(lines: &[String]) -> Option<PinnedStartParams> {
+    let (marker, rest) = lines.split_first()?;
+    if marker != PINNED_EXECUTION_DISCRIMINATOR || !(4..=5).contains(&rest.len()) {
+        return None;
+    }
+    frozen_v2_parse(rest)
+}
+#[test]
+fn explicit_runtime_directory_is_optional_framed_data_and_old_v3_rejects_it() {
+    use crate::{Request, StartParams};
+    for parent_pid in [None, Some(42)] {
+        let mut params = PinnedStartParams {
+            id: CoreId::parse(&"a".repeat(64)).unwrap(),
+            common: StartParams {
+                cfg: "/state/profiles/current.json".into(),
+                log: String::new(),
+                fwd: false,
+                parent_pid,
+            },
+            runtime_directory: None,
+        };
+        let legacy = Request::LinuxStartPinned(params.clone()).args_lines();
+        assert_eq!(frozen_v3_parse(&legacy), Some(params.clone()));
+        params.runtime_directory = Some("/state with spaces/测试".into());
+        let frame = Request::LinuxStartPinned(params.clone()).args_lines();
+        assert_eq!(frame.len(), 7);
+        assert_eq!(
+            frame[5],
+            parent_pid.map(|pid| pid.to_string()).unwrap_or_default()
+        );
+        assert_eq!(frame[6], "runtime-root-v1=/state with spaces/测试");
+        assert_eq!(PinnedStartParams::parse(&frame), Some(params));
+        assert!(frozen_v3_parse(&frame).is_none());
+        for value in [
+            "",
+            "runtime-root-v1=",
+            "runtime-root-v1=/bad\ncommand",
+            "runtime-root-v1=/bad\rcommand",
+            "runtime-root-v1=/bad\0command",
+            "runtime-root-v2=/state",
+        ] {
+            let mut invalid = frame.clone();
+            invalid[6] = value.into();
+            assert!(PinnedStartParams::parse(&invalid).is_none());
+        }
+        let mut extra = frame.clone();
+        extra.push("runtime-root-v1=/other".into());
+        assert!(PinnedStartParams::parse(&extra).is_none());
     }
 }

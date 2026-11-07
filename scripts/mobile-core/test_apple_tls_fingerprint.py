@@ -288,5 +288,173 @@ class OptionalTLSCapabilityLink(unittest.TestCase):
 
 
 
+# Interface declarations match the fixed gomobile contract, including nullable
+# direct return instead of ret0_. Inert fixtures never import or execute Libbox.
+NATIVE_PLATFORM_METHODS = """
+- (int32_t)runtimeTunVersion;
+- (id<LibboxRuntimeTunSession> _Nullable)newTunSession:(id<LibboxTunOptions> _Nullable)options previous:(id<LibboxRuntimeTunSession> _Nullable)previous receipt:(LibboxRuntimeTunReceipt* _Nullable)receipt error:(NSError* _Nullable* _Nullable)error;
+"""
+NATIVE_SESSION_METHODS = """
+- (NSString* _Nonnull)ownerID;
+- (BOOL)prepare:(NSError* _Nullable* _Nullable)error;
+- (int32_t)fileDescriptor;
+- (BOOL)validate:(NSError* _Nullable* _Nullable)error;
+- (BOOL)abort:(NSError* _Nullable* _Nullable)error;
+- (BOOL)retire:(NSError* _Nullable* _Nullable)error;
+"""
+NATIVE_HEADER = ('@protocol LibboxRuntimeTunPlatform;\n'
+    '@protocol LibboxRuntimeTunSession;\n'
+    '@class LibboxRuntimeTunReceipt;\n'
+    '@protocol LibboxRuntimeTunPlatform <NSObject>\n' + NATIVE_PLATFORM_METHODS + '@end\n'
+    '@protocol LibboxRuntimeTunSession <NSObject>\n' + NATIVE_SESSION_METHODS + '@end\n'
+    '@interface LibboxRuntimeTunPlatform : NSObject <goSeqRefInterface, LibboxRuntimeTunPlatform> {\n}\n' +
+    NATIVE_PLATFORM_METHODS + '@end\n'
+    '@interface LibboxRuntimeTunSession : NSObject <goSeqRefInterface, LibboxRuntimeTunSession> {\n}\n' +
+    NATIVE_SESSION_METHODS + '@end\n'
+    '@interface LibboxRuntimeTunReceipt : NSObject <goSeqRefInterface> {\n}\n'
+    '- (NSString* _Nonnull)ownerID;\n- (BOOL)published;\n@end\n'
+    '@interface LibboxCommandServer : NSObject <goSeqRefInterface> {\n}\n'
+    '- (BOOL)setRuntimeTunPlatform:(id<LibboxRuntimeTunPlatform> _Nullable)platform error:(NSError* _Nullable* _Nullable)error;\n@end\n')
+
+
+class OptionalNativeTunCompilerABI(unittest.TestCase):
+    def test_old_complete_and_comment_only_headers(self):
+        self.assertFalse(subject.native_tun_abi_present(['NSString* LibboxVersion(void);']))
+        self.assertTrue(subject.native_tun_abi_present([NATIVE_HEADER]))
+        self.assertTrue(subject.native_tun_abi_present(['#ifndef __Libbox_H__\n#define __Libbox_H__\n' +
+                                                       NATIVE_HEADER + '#endif\n']))
+        self.assertFalse(subject.native_tun_abi_present(['/*' + NATIVE_HEADER + '*/']))
+        self.assertEqual(subject.compiler_args(True), b'-D\nPOLARIS_NATIVE_TUN_V1\n')
+        self.assertEqual(subject.compiler_args(False), b'')
+
+    def test_partial_conflicting_duplicate_disabled_and_wrong_return_fail_closed(self):
+        bad_headers = [
+            '@protocol LibboxRuntimeTunPlatform;',
+            NATIVE_HEADER.replace('- (BOOL)published;', ''),
+            NATIVE_HEADER.replace('newTunSession:', 'newTunSessionWrong:', 1),
+            NATIVE_HEADER.replace('id<LibboxRuntimeTunSession> _Nullable)newTunSession:',
+                                  'BOOL)newTunSession:', 1),
+            NATIVE_HEADER.replace('- (int32_t)fileDescriptor;', '- (int64_t)fileDescriptor;', 1),
+            NATIVE_HEADER.replace('- (BOOL)prepare:(NSError* _Nullable* _Nullable)error;',
+                                  '- (BOOL)prepare:(NSError* _Nullable* _Nullable)error;\n'
+                                  '- (void)prepare:(NSError* _Nullable* _Nullable)error;', 1),
+            NATIVE_HEADER + '@protocol LibboxRuntimeTunSession <NSObject>\n' + NATIVE_SESSION_METHODS + '@end\n',
+            '#if 0\n' + NATIVE_HEADER + '#endif\n',
+            '#ifdef POLARIS_NATIVE_TUN_V1\n' + NATIVE_HEADER + '#endif\n',
+        ]
+        for header in bad_headers:
+            with self.subTest(header=header[:80]), self.assertRaises(RuntimeError):
+                subject.native_tun_abi_present([header])
+
+    @staticmethod
+    def prepared(root, platform, new_abi):
+        _, _, header, _, _, env = OptionalTLSCapabilityLink.versioned_framework(root, platform, False)
+        if new_abi:
+            header.write_text(NATIVE_HEADER)
+        prepared = root / 'parent-prepared'
+        with patch.dict(os.environ, dict(env, DERIVED_FILE_DIR=str(prepared))), \
+                patch.object(subject, 'run', return_value='T _LibboxVersion\n'):
+            subject.prepare()
+        env.update(POLARIS_TLS_PREPARED_ROOT=str(prepared),
+                   POLARIS_TLS_PREPARED_SHA256=subject.file_pin(prepared / 'PolarisTLSFingerprintLinker.json')['sha256'])
+        return header, prepared, env
+
+    def test_actual_selected_slice_prepare_install_and_verify_recompute_abi(self):
+        for platform in ('iphoneos', 'iphonesimulator'):
+            for present in (False, True):
+                with self.subTest(platform=platform, present=present), tempfile.TemporaryDirectory() as tmp:
+                    _, prepared, env = self.prepared(Path(tmp), platform, present)
+                    receipt = json.loads((prepared / 'PolarisTLSFingerprintLinker.json').read_text())
+                    self.assertEqual(receipt['nativeTun']['present'], present)
+                    with patch.dict(os.environ, env), \
+                            patch.object(subject, 'run', side_effect=AssertionError('Xcode hook ran native tools')):
+                        subject.install()
+                        self.assertEqual(subject.compiler_args_path().read_bytes(), subject.compiler_args(present))
+                        subject.verify_installed()
+                        subject.compiler_args_path().write_bytes(b'-D\nFORGED\n')
+                        with self.assertRaisesRegex(RuntimeError, 'native TUN compiler input changed'):
+                            subject.verify_installed()
+
+    def test_stale_native_args_are_overwritten_for_actual_old_headers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, env = self.prepared(Path(tmp), 'iphoneos', False)
+            with patch.dict(os.environ, env):
+                subject.compiler_args_path().write_bytes(subject.compiler_args(True))
+                subject.install()
+                self.assertEqual(subject.compiler_args_path().read_bytes(), b'')
+                subject.verify_installed()
+
+    def test_legacy_receipt_requires_old_abi_and_cannot_authorize_stale_flags(self):
+        for new_abi in (False, True):
+            with self.subTest(new_abi=new_abi), tempfile.TemporaryDirectory() as tmp:
+                _, prepared, env = self.prepared(Path(tmp), 'iphoneos', new_abi)
+                receipt = prepared / 'PolarisTLSFingerprintLinker.json'
+                value = json.loads(receipt.read_text()); value.pop('nativeTun')
+                receipt.write_text(json.dumps(value))
+                (prepared / subject.NATIVE_TUN_ARGS).unlink()
+                env['POLARIS_TLS_PREPARED_SHA256'] = subject.file_pin(receipt)['sha256']
+                with patch.dict(os.environ, env):
+                    if new_abi:
+                        with self.assertRaisesRegex(RuntimeError, 'legacy TLS receipt cannot attest'):
+                            subject.install()
+                    else:
+                        subject.install()
+                        self.assertEqual(subject.compiler_args_path().read_bytes(), b'')
+                        (prepared / subject.NATIVE_TUN_ARGS).write_bytes(subject.compiler_args(True))
+                        with self.assertRaisesRegex(RuntimeError, 'unexpected native TUN compiler arguments'):
+                            subject.install()
+
+    def test_parent_argument_and_actual_header_drift_rejected_before_compile(self):
+        for case in ('parent-args', 'header', 'receipt-abi', 'receipt-shape', 'redirected-output'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                header, prepared, env = self.prepared(Path(tmp), 'iphoneos', True)
+                if case == 'parent-args':
+                    (prepared / subject.NATIVE_TUN_ARGS).write_bytes(b'')
+                elif case == 'header':
+                    header.write_text(header.read_text().replace('- (BOOL)published;', ''))
+                elif case in ('receipt-abi', 'receipt-shape'):
+                    receipt = prepared / 'PolarisTLSFingerprintLinker.json'
+                    value = json.loads(receipt.read_text())
+                    if case == 'receipt-abi':
+                        value['nativeTun']['present'] = False
+                    else:
+                        value['nativeTun']['unrecognized'] = True
+                    receipt.write_text(json.dumps(value))
+                    env['POLARIS_TLS_PREPARED_SHA256'] = subject.file_pin(receipt)['sha256']
+                with patch.dict(os.environ, env):
+                    if case == 'redirected-output':
+                        elsewhere = Path(tmp) / 'foreign-args'; elsewhere.write_bytes(b'')
+                        subject.compiler_args_path().symlink_to(elsewhere)
+                    with self.assertRaises(RuntimeError):
+                        subject.install()
+
+    def test_project_templates_and_existing_gui_cli_ci_target_consume_response_file(self):
+        root = Path(__file__).resolve().parents[2]
+        for name in ('project.yml', 'polaris.xcodeproj/project.pbxproj'):
+            text = (root / 'src-tauri/gen/apple' / name).read_text()
+            self.assertIn('OTHER_SWIFT_FLAGS', text)
+            self.assertIn('@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args', text)
+            self.assertNotIn('-D POLARIS_NATIVE_TUN_V1', text)
+        pbx = (root / 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj').read_text()
+        target = pbx.split('78552A5C57D5DDA9797F1E67 /* polaris_PacketTunnel */ =', 1)[1].split('buildRules', 1)[0]
+        self.assertLess(target.index('Verify iOS Core'), target.index('Sources'))
+        phase = pbx.split('B395AB4CF19394B13456AAB7 /* Verify iOS Core */ =', 1)[1].split('6BA4F5A019704F91829A51D3', 1)[0]
+        self.assertIn('alwaysOutOfDate = 1', phase)
+        self.assertIn('$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args', phase)
+        self.assertEqual(pbx.count('OTHER_SWIFT_FLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);'), 2)
+        builder = (root / 'scripts/mobile-core/build_apple_app.py').read_text()
+        self.assertLess(builder.index("'original-tls-prepare.log'"), builder.index("timed_phase('app-extension-archive'"))
+        swift = (root / 'src-tauri/gen/apple/PacketTunnel/TunnelPlatform.swift').read_text()
+        self.assertIn('#if POLARIS_NATIVE_TUN_V1', swift)
+        native_tun = swift.split('#if POLARIS_NATIVE_TUN_V1', 1)[1].split('#endif', 1)[0]
+        self.assertIn('extension TunnelPlatform: LibboxRuntimeTunPlatformProtocol', native_tun)
+        provider = (root / 'src-tauri/gen/apple/PacketTunnel/PacketTunnelProvider.swift').read_text()
+        guard_start = provider.index('#if POLARIS_NATIVE_TUN_V1')
+        guard_end = provider.index('#endif', guard_start)
+        registration = provider[guard_start:guard_end]
+        self.assertIn('try server.setRuntimeTunPlatform(self.platform)', registration)
+        self.assertLess(guard_end, provider.index('try server.start()'))
+
+
 if __name__ == '__main__':
     unittest.main()

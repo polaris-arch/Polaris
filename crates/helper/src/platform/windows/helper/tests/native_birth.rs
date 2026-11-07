@@ -907,6 +907,7 @@ fn windows_native_config_uses_verified_object_without_path_reopen() {
         "open_directory_no_reparse",
         "is_private_user_config",
         "directory.open_regular(name)",
+        "runtime_directory: PathBuf::from(registered)",
         "nNumberOfLinks != 1",
     ] {
         assert!(
@@ -921,7 +922,9 @@ fn windows_native_config_uses_verified_object_without_path_reopen() {
         .split("fn take_managed_handle")
         .next()
         .unwrap();
-    assert!(spawn.contains("execution.spawn_windows_main(file, Path::new(&cwd))?"));
+    assert!(
+        spawn.contains("execution.spawn_windows_main(file, Path::new(&cwd), &runtime_directory)?")
+    );
     assert!(spawn.contains("_execution_custody: execution_custody"));
     assert!(!spawn.contains("cmd.spawn()"));
     assert!(!spawn.contains("cmd.args([\"run\", \"-c\", cfg])"));

@@ -21,7 +21,6 @@ fn production_runtime_installs_the_leftover_login_core_sweeper() {
 async fn scoped_android_fs_body_rejects_unbound_changed_revision_and_missing_reappearance() {
     // Login registration uses the process-wide validation admission. Other
     // independent runtime fixtures may deliberately hold its producer pause.
-    #[cfg(unix)]
     if crate::test_support::ran_in_isolated_worker(
         module_path!(),
         "scoped_android_fs_body_rejects_unbound_changed_revision_and_missing_reappearance",

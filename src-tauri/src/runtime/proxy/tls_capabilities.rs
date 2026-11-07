@@ -1,6 +1,5 @@
 use super::ProxyRuntime;
 use crate::runtime::tls_fingerprints::Snapshot;
-use std::path::Path;
 
 impl ProxyRuntime {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -46,6 +45,7 @@ impl ProxyRuntime {
         }
     }
 
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     pub(crate) async fn tls_fingerprint_capabilities(&self) -> Snapshot {
         self.tls_fingerprint_capabilities_observed().await.0
     }
@@ -83,6 +83,33 @@ impl ProxyRuntime {
                     }
                     _ => (
                         Snapshot::unavailable("Core instance changed during capability retry"),
+                        None,
+                    ),
+                };
+            }
+            if status.running
+                && self
+                    .core_via_helper
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let client = match self.runtime_management_client(generation).await {
+                    Ok(client) => client,
+                    Err(()) => {
+                        return (
+                            Snapshot::unavailable("Running Helper API channel unavailable"),
+                            None,
+                        )
+                    }
+                };
+                let pairing = self.runtime_pairing_for_capability(generation);
+                return match pairing {
+                    Some(pairing) => (
+                        self.helper_running_tls_snapshot(generation, &client, &pairing)
+                            .await,
+                        None,
+                    ),
+                    None => (
+                        Snapshot::unavailable("Running Helper pairing unavailable"),
                         None,
                     ),
                 };
@@ -133,20 +160,149 @@ impl ProxyRuntime {
             (snapshot, None)
         }
     }
+}
 
-    /// Startup supplies its exact binary, rather than a UI version probe path.
-    pub(super) async fn tls_fingerprint_capabilities_for(&self, binary: Option<&Path>) -> Snapshot {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            match binary {
-                Some(path) => crate::runtime::tls_fingerprints::probe_cli(path).await,
-                None => Snapshot::unavailable("No selected core binary"),
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl ProxyRuntime {
+    /// Running Helper birth + authenticated API channel, never a CLI inventory launch.
+    pub(super) async fn helper_running_tls_snapshot(
+        &self,
+        generation: u64,
+        client: &polaris_singbox_grpc::SingBoxApiClient,
+        pairing: &super::runtime_config::RuntimePairing,
+    ) -> Snapshot {
+        let result = async {
+            use crate::runtime::helper::HelperStopTarget;
+            let (start_token, target) = self
+                .child
+                .lock()
+                .map_err(|_| "Helper child custody unavailable")?
+                .helper_stop_target()
+                .ok_or("Helper birth unavailable")?;
+            let platform = crate::runtime::core_identity::current_platform()?;
+            let core = crate::runtime::core_identity::selected_id(platform)?;
+            let HelperStopTarget::Birth(birth) = target else {
+                return Err("Legacy Helper PID is not execution evidence".into());
+            };
+            let helper = std::sync::Arc::clone(&self.helper);
+            let before = tokio::task::spawn_blocking(move || helper.protected_native_core_status())
+                .await
+                .map_err(|e| e.to_string())??;
+            if !native_helper_birth_matches(self.helper.platform(), &before, birth, &core) {
+                return Err("Helper original birth/selected Core binding unavailable".into());
             }
+            let capabilities = client
+                .get_runtime_capabilities()
+                .await
+                .map_err(|_| "Authenticated running capability query unavailable")?;
+            if !super::runtime_config::runtime_pairing_matches(pairing, &capabilities)
+                || capabilities
+                    .active
+                    .as_ref()
+                    .is_none_or(|active| active.incarnation.is_empty())
+            {
+                return Err("Running capability incarnation differs".into());
+            }
+            let manifest = crate::runtime::core_identity::selected_manifest(platform)?;
+            let source = crate::runtime::core_identity::selected_source_commit(platform)?;
+            let binary = manifest
+                .files
+                .iter()
+                .find(|f| f.name == "sing-box" || f.name == "sing-box.exe")
+                .ok_or("Compiled Core member absent")?;
+            if capabilities.tls_fingerprint_capabilities_json.is_empty() {
+                return Err("Running core has no TLS capability report".into());
+            }
+            let contract: serde_json::Value =
+                serde_json::from_str(polaris_core_supervisor::selected_core::selected_contract()?)
+                    .map_err(|e| e.to_string())?;
+            let row = &contract["platforms"][platform];
+            let proof_field = match platform {
+                "win" => "windowsExecution",
+                "mac-x64" | "mac-arm64" => "macosExecution",
+                "linux" => "sealedExecution",
+                _ => return Err("No platform execution report".into()),
+            };
+            let expected_doc =
+                &row["finalPackageCronetSmoke"][proof_field]["tlsProbe"]["capabilities"];
+            let arch = match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            };
+            let os = if cfg!(target_os = "macos") {
+                "darwin"
+            } else {
+                std::env::consts::OS
+            };
+            let mut snapshot = Snapshot::from_authenticated_document(
+                &capabilities.tls_fingerprint_capabilities_json,
+                expected_doc,
+                &source,
+                os,
+                arch,
+                &binary.sha256,
+            )?;
+            let helper = std::sync::Arc::clone(&self.helper);
+            let after = tokio::task::spawn_blocking(move || helper.protected_native_core_status())
+                .await
+                .map_err(|e| e.to_string())??;
+            if generation != self.core_generation()
+                || after != before
+                || !self
+                    .child
+                    .lock()
+                    .map_err(|_| "Helper custody unavailable")?
+                    .helper_stop_target()
+                    .is_some_and(|(current, t)| current.same(&start_token) && t == target)
+            {
+                return Err("Helper birth changed during capability query".into());
+            }
+            snapshot.observation_scope = "running-helper-authenticated-api".into();
+            snapshot.byte_identity_scope = "helper-private-executable".into();
+            Ok::<_, String>(snapshot)
         }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            let _ = binary;
-            self.tls_fingerprint_capabilities().await
-        }
+        .await;
+        result.unwrap_or_else(Snapshot::unavailable)
     }
 }
+
+/// Data predicate only. Production calls it only after the closed OS-root/system
+/// connector has returned the original native-custody status, never generic IPC.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn native_helper_birth_matches(
+    platform: polaris_helper_proto::Platform,
+    status: &crate::runtime::helper::ManagedCoreStatus,
+    expected: polaris_helper_proto::HelperBirthTarget,
+    core: &polaris_helper_proto::core_manifest::CoreId,
+) -> bool {
+    use crate::runtime::helper::ManagedCoreStatus;
+    use polaris_helper_proto::Platform;
+    let ManagedCoreStatus::NativeBirthRunning {
+        target,
+        created,
+        image,
+        core: reported,
+    } = status
+    else {
+        return false;
+    };
+    if *target != expected || reported.as_ref().is_some_and(|id| id != core) {
+        return false;
+    }
+    match platform {
+        // macOS truth is the Root registry's original Child, immutable selected
+        // CoreId and random birth. It does not claim Windows process fields.
+        Platform::Mac => reported.as_ref() == Some(core),
+        Platform::Win => {
+            created.is_some_and(|value| value > 0)
+                && image.as_ref().is_some_and(|value| !value.is_empty())
+        }
+        // Linux uses its separate sealed execution receipt. Mobile runtimes
+        // use loaded native containers, and Other has no desktop Helper issuer.
+        Platform::Linux | Platform::Android | Platform::Ios | Platform::Other => false,
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod tests;

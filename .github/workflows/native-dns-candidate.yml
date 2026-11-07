@@ -105,6 +105,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Install same-source trusted proof validator dependency
+        run: python -m pip install jsonschema==4.23.0
       - name: Read verified candidate Go version
         id: go-pin
         run: |

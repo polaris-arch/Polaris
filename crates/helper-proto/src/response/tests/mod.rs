@@ -40,11 +40,13 @@ fn native_birth_receipts_round_trip_without_linux_or_legacy_aliases() {
             target,
             created: Some(123),
             image: Some("C:\\core path\\sing-box.exe".into()),
+            core: None,
         }),
         ResponseKind::NativeBirthStatus(NativeBirthStatus::Running {
             target,
             created: None,
             image: None,
+            core: None,
         }),
         ResponseKind::NativeBirthStatus(NativeBirthStatus::Stopping { target }),
         ResponseKind::NativeBirthStatus(NativeBirthStatus::Unknown {
@@ -855,4 +857,249 @@ fn to_wire_line_round_trips_through_parse() {
     for r in cases {
         assert_eq!(Response::parse(&r.to_wire_line()), r, "round-trip failed");
     }
+}
+
+#[test]
+fn selected_native_status_preserves_mac_truth_and_rejects_malformed_or_duplicate_core() {
+    let prefix = "OK native-birth-status running 4242 00112233445566778899aabbccddeeff";
+    let core = "a".repeat(64);
+    let wire = format!("{prefix} core={core}");
+    let reply = Response::parse(&wire);
+    assert!(
+        matches!(&reply,Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Running{created:None,image:None,core:Some(id),..})) if id.as_str()==core)
+    );
+    assert_eq!(reply.to_wire_line(), wire);
+    for suffix in [
+        format!("core={} core={core}", core),
+        "core=bad".into(),
+        format!("core={core} image=61"),
+    ] {
+        assert!(!matches!(
+            Response::parse(&format!("{prefix} {suffix}")),
+            Response::Ok(ResponseKind::NativeBirthStatus(_))
+        ));
+    }
+}
+
+#[test]
+fn selected_native_status_and_pinned_starts_keep_distinct_canonical_families() {
+    let core = "a".repeat(64);
+    let target = HelperBirthTarget::parse_wire("4242", BIRTH).unwrap();
+    let prefix = format!("OK native-birth-status running 4242 {BIRTH}");
+    for (fields, created, image) in [
+        (String::new(), None, None),
+        (" created=123".into(), Some(123), None),
+        (" image=61".into(), None, Some("a")),
+        (" created=123 image=61".into(), Some(123), Some("a")),
+    ] {
+        let wire = format!("{prefix}{fields} core={core}");
+        let reply = Response::parse(&wire);
+        assert!(matches!(&reply,
+            Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Running {
+                target: got_target, created: got_created, image: got_image, core: Some(id)
+            })) if *got_target == target && *got_created == created && got_image.as_deref() == image && id.as_str() == core));
+        assert_eq!(reply.to_wire_line(), wire);
+    }
+    for token in [
+        "birth-started",
+        "birth-already",
+        "birth-start-not-admitted pending",
+        "native-birth-started",
+        "native-birth-already",
+        "native-birth-start-not-admitted pending",
+    ] {
+        let wire = format!("OK {token} 4242 {BIRTH} core={core}");
+        let reply = Response::parse(&wire);
+        assert!(
+            matches!(&reply, Response::Ok(ResponseKind::PinnedStart { id, .. }) if id.as_str() == core)
+        );
+        assert_eq!(reply.to_wire_line(), wire);
+        for malformed in [
+            format!("{wire} core={core}"),
+            wire.replace(" core=", " core=bad "),
+        ] {
+            assert!(!matches!(
+                Response::parse(&malformed),
+                Response::Ok(ResponseKind::PinnedStart { .. })
+            ));
+        }
+    }
+    for wire in [
+        format!("{prefix} core=bad"),
+        format!("{prefix} core={core} core={core}"),
+        format!("{prefix} core={core} image=61"),
+        format!("{prefix} image=61 created=123 core={core}"),
+        format!("{prefix} created=0123 core={core}"),
+        format!("{prefix} image=ff core={core}"),
+        format!("{prefix}  core={core}"),
+        format!("{prefix} core={core} "),
+        format!(" {prefix} core={core}"),
+        format!("{prefix}\tcore={core}"),
+        format!("OK native-birth-status empty core={core}"),
+    ] {
+        assert!(
+            !matches!(
+                Response::parse(&wire),
+                Response::Ok(ResponseKind::NativeBirthStatus(_) | ResponseKind::PinnedStart { .. })
+            ),
+            "malformed status became custody: {wire}"
+        );
+    }
+}
+
+fn checked_dns_wire_snapshot() -> crate::linux_dns::Snapshot {
+    crate::linux_dns::Snapshot {
+        pid: 77,
+        birth: "01".repeat(16),
+        link: crate::linux_dns::LinkIdentity {
+            ifindex: 8,
+            sysfs_device: 1,
+            sysfs_inode: 80,
+            netns_inode: 9,
+            tun_flags: 1,
+        },
+        settings: crate::linux_dns::Settings {
+            servers: vec![],
+            domains: vec![],
+            default_route: false,
+            dnssec: "no".into(),
+            dns_over_tls: "no".into(),
+        },
+        original: None,
+        owned: false,
+        cleanup_pending: false,
+    }
+}
+
+#[test]
+fn checked_dns_receipts_round_trip_without_legacy_or_reap_aliases() {
+    let before = checked_dns_wire_snapshot();
+    let mut changed = before.clone();
+    changed.original = Some(before.settings.clone());
+    changed.owned = true;
+    changed.settings = crate::linux_dns::Settings {
+        servers: vec!["8.8.8.8".into()],
+        domains: vec!["~.".into()],
+        default_route: true,
+        dnssec: "no".into(),
+        dns_over_tls: "no".into(),
+    };
+    let gone = crate::linux_dns::Gone {
+        pid: before.pid,
+        birth: before.birth.clone(),
+        link: before.link.clone(),
+    };
+    for value in [
+        LinuxDns::Snapshot(Box::new(before)),
+        LinuxDns::Changed(Box::new(changed)),
+        LinuxDns::Gone(gone),
+        LinuxDns::NoChange,
+    ] {
+        let response = Response::Ok(ResponseKind::LinuxDns(value));
+        let wire = response.to_wire_line();
+        assert_eq!(Response::parse(&wire), response);
+        assert!(!matches!(
+            Response::parse(&wire),
+            Response::Ok(ResponseKind::LinuxBirthStop(_) | ResponseKind::Stop(_))
+        ));
+    }
+}
+
+#[test]
+fn checked_dns_snapshot_and_changed_preserve_existing_json_wire_bytes() {
+    let snapshot_wire = concat!(
+        "OK resolved-dns-snapshot-v1 ",
+        r#"{"pid":77,"birth":"01010101010101010101010101010101","link":{"ifindex":8,"sysfsDevice":1,"sysfsInode":80,"netnsInode":9,"tunFlags":1},"settings":{"servers":[],"domains":[],"defaultRoute":false,"dnssec":"no","dnsOverTls":"no"},"original":null,"owned":false,"cleanupPending":false}"#
+    );
+    let changed_wire = concat!(
+        "OK resolved-dns-changed-v1 ",
+        r#"{"pid":77,"birth":"01010101010101010101010101010101","link":{"ifindex":8,"sysfsDevice":1,"sysfsInode":80,"netnsInode":9,"tunFlags":1},"settings":{"servers":["8.8.8.8"],"domains":["~."],"defaultRoute":true,"dnssec":"no","dnsOverTls":"no"},"original":{"servers":[],"domains":[],"defaultRoute":false,"dnssec":"no","dnsOverTls":"no"},"owned":true,"cleanupPending":false}"#
+    );
+    for (wire, changed) in [(snapshot_wire, false), (changed_wire, true)] {
+        let response = Response::parse(wire);
+        let snapshot = match (&response, changed) {
+            (Response::Ok(ResponseKind::LinuxDns(LinuxDns::Snapshot(snapshot))), false)
+            | (Response::Ok(ResponseKind::LinuxDns(LinuxDns::Changed(snapshot))), true) => snapshot,
+            other => panic!("existing JSON must retain its typed DNS receipt: {other:?}"),
+        };
+        assert!(snapshot.valid());
+        assert_eq!(snapshot.owned, changed);
+        assert_eq!(snapshot.original.is_some(), changed);
+        assert_eq!(response.to_wire_line(), wire);
+    }
+}
+
+#[test]
+fn checked_dns_wire_rejects_invalid_birth_link_baseline_unknown_and_duplicate_fields() {
+    let original = serde_json::to_value(checked_dns_wire_snapshot()).unwrap();
+    for mutation in [
+        "birth", "pid", "ifindex", "inode", "netns", "tap", "ip", "domain", "owned", "original",
+        "unknown",
+    ] {
+        let mut value = original.clone();
+        match mutation {
+            "birth" => value["birth"] = serde_json::json!("AA".repeat(16)),
+            "pid" => value["pid"] = serde_json::json!(0),
+            "ifindex" => value["link"]["ifindex"] = serde_json::json!(0),
+            "inode" => value["link"]["sysfsInode"] = serde_json::json!(0),
+            "netns" => value["link"]["netnsInode"] = serde_json::json!(0),
+            "tap" => value["link"]["tunFlags"] = serde_json::json!(2),
+            "ip" => value["settings"]["servers"] = serde_json::json!(["not-an-ip"]),
+            "domain" => value["settings"]["domains"] = serde_json::json!(["bad domain"]),
+            "owned" => value["owned"] = serde_json::json!(true),
+            "original" => {
+                value["original"] = value["settings"].clone();
+                value["original"]["dnssec"] = serde_json::json!("unknown");
+            }
+            _ => value["future"] = serde_json::json!(true),
+        }
+        for token in ["resolved-dns-snapshot-v1", "resolved-dns-changed-v1"] {
+            assert!(
+                matches!(
+                    Response::parse(&format!("OK {token} {value}")),
+                    Response::Ok(ResponseKind::OkRaw { .. })
+                ),
+                "{mutation}"
+            );
+        }
+    }
+    let duplicate = original
+        .to_string()
+        .replacen("\"pid\":77", "\"pid\":77,\"pid\":77", 1);
+    assert_ne!(duplicate, original.to_string());
+    assert!(matches!(
+        Response::parse(&format!("OK resolved-dns-snapshot-v1 {duplicate}")),
+        Response::Ok(ResponseKind::OkRaw { .. })
+    ));
+    for line in [
+        "OK resolved-dns-not-changed-v1 extra",
+        "OK resolved-dns-snapshot-v1",
+        "OK resolved-dns-changed-v1 {}",
+        "OK resolved-dns-gone-v1 {}",
+    ] {
+        assert!(matches!(
+            Response::parse(line),
+            Response::Ok(ResponseKind::OkRaw { .. })
+        ));
+    }
+}
+
+#[test]
+fn checked_dns_debug_does_not_disclose_birth_or_private_resolver_baseline() {
+    let mut snapshot = checked_dns_wire_snapshot();
+    snapshot.settings.servers = vec!["192.168.254.53".into()];
+    snapshot.original = Some(snapshot.settings.clone());
+    snapshot.owned = true;
+    let debug = format!(
+        "{:?}",
+        ResponseKind::LinuxDns(LinuxDns::Snapshot(Box::new(snapshot.clone())))
+    );
+    assert!(!debug.contains(&snapshot.birth));
+    assert!(!debug.contains("192.168.254.53"));
+    let gone = crate::linux_dns::Gone {
+        pid: snapshot.pid,
+        birth: snapshot.birth.clone(),
+        link: snapshot.link,
+    };
+    assert!(!format!("{gone:?}").contains(&snapshot.birth));
 }

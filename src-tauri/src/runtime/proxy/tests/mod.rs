@@ -270,7 +270,7 @@ fn test_runtime_in(dir: PathBuf) -> Arc<ProxyRuntime> {
 /// `ProxyRuntime` 的接管方式判据全部经 `self.helper.platform()` 分流（见
 /// `HelperRuntime::with_platform_for_tests` 的头注）；不注入平台，「Android 上接管方式恒 TUN」
 /// 这条不变式在本机就只有源码级证据。
-fn test_runtime_on(platform: Platform) -> (Arc<ProxyRuntime>, TestDir) {
+pub(crate) fn test_runtime_on(platform: Platform) -> (Arc<ProxyRuntime>, TestDir) {
     let dir = fresh_test_dir();
     let rt = test_runtime_in_on(
         dir.clone(),
@@ -1526,3 +1526,5 @@ fn inventory_candidate_selection_is_data_only_and_rejects_priority_namespace_cha
     std::fs::write(&preferred, b"higher-priority foreign data").unwrap();
     assert!(!selection.is_current());
 }
+
+mod native_carrier;

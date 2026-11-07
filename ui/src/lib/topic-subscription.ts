@@ -23,7 +23,7 @@ export interface TopicPort<T> {
 }
 
 export interface TopicSubscription {
-  /** 想不想要数据（可见且聚焦 = true）。幂等：同值重复调用不产生 IPC。 */
+  /** 想不想要数据（可见且聚焦 = true）。健康态幂等；失败后显式重申需求可重试。 */
   setWanted(want: boolean): void;
   /** 卸载：注销监听 + 补发退订（**只要订过就退**，不看 IPC 有没有 resolve）。 */
   dispose(): void;
@@ -35,30 +35,84 @@ export function createTopicSubscription<T>(
 ): TopicSubscription {
   let off: (() => void) | null = null;
   let subscribed = false;
+  let subscribeFailed = false;
   let wanted = false;
   let disposed = false;
+  let registering = false;
+  let commandGeneration = 0;
+  let retryAvailable = true;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearRetry = () => {
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    retryTimer = null;
+  };
+  // A transient native failure gets one delayed recovery per demand cycle.
+  // Further attempts require renewed demand; persistent faults never spin.
+  const retry = () => {
+    if (disposed || !wanted || !retryAvailable || retryTimer !== null) return;
+    retryAvailable = false;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      reconcile();
+    }, 1000);
+  };
 
   const reconcile = () => {
-    if (disposed || !off || wanted === subscribed) return;
+    if (disposed) return;
+    if (!off) { if (wanted) register(); return; }
+    if (wanted === subscribed && !subscribeFailed) return;
+    clearRetry();
+    subscribeFailed = false;
     subscribed = wanted;
-    const p = subscribed ? port.subscribe() : port.unsubscribe();
-    p.catch(() => {});
+    const generation = ++commandGeneration;
+    const subscribing = subscribed;
+    const p = subscribing ? port.subscribe() : port.unsubscribe();
+    p.catch((error) => {
+      if (disposed || generation !== commandGeneration) return;
+      console.error('[stats] topic demand failed:', error);
+      // Retain attempted ownership: rejection may follow native acceptance,
+      // so cancellation/disposal must still send unsubscribe.
+      if (subscribing && wanted) {
+        subscribeFailed = true;
+        retry();
+      }
+    });
   };
   const registered = (unlisten: () => void) => {
     if (disposed) { unlisten(); return; }
     off = unlisten;
     reconcile();
   };
-  // A synchronous cleanup handle does not prove native listener readiness.
-  const registration = port.onFrame((data) => { if (!disposed) onData(data); });
-  if (typeof registration === 'function') registered(registration);
-  else void registration.then(registered).catch((error) => {
-    // Never start a producer after failed registration. Remount can retry.
-    if (!disposed) console.error('[stats] listener registration failed:', error);
-  });
+  const register = () => {
+    if (disposed || registering || off) return;
+    registering = true;
+    const failed = (error: unknown) => {
+      registering = false;
+      if (!disposed) {
+        console.error('[stats] listener registration failed:', error);
+        retry();
+      }
+    };
+    try {
+      // A synchronous cleanup handle does not prove native listener readiness.
+      const registration = port.onFrame((data) => { if (!disposed) onData(data); });
+      if (typeof registration === 'function') {
+        registering = false;
+        registered(registration);
+      } else void registration.then((unlisten) => {
+        registering = false;
+        registered(unlisten);
+      }, failed);
+    } catch (error) { failed(error); }
+  };
 
   const setWanted = (want: boolean) => {
     if (disposed) return;
+    if (want !== wanted) {
+      retryAvailable = true;
+      clearRetry();
+    }
     wanted = want;
     reconcile();
   };
@@ -66,6 +120,8 @@ export function createTopicSubscription<T>(
   const dispose = () => {
     if (disposed) return;
     disposed = true;
+    clearRetry();
+    commandGeneration += 1;
     off?.();
     off = null;
     if (subscribed) {
@@ -74,5 +130,6 @@ export function createTopicSubscription<T>(
     }
   };
 
+  register();
   return { setWanted, dispose };
 }

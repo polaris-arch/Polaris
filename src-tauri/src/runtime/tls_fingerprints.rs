@@ -56,56 +56,11 @@ pub(crate) struct Module {
     replace: Option<Box<Module>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Snapshot {
-    /// CLI random selection belongs to the probe process, not the running main.
-    pub observation_scope: String,
-    pub byte_identity_scope: String,
-    /// Hash of executable bytes + capability document; never a version label.
-    pub identity: Option<String>,
-    pub binary_sha256: Option<String>,
-    pub document: Option<Capabilities>,
-    pub unavailable_reason: Option<String>,
-}
-
-impl Snapshot {
-    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
-        Self {
-            observation_scope: "unavailable".into(),
-            byte_identity_scope: "unavailable".into(),
-            identity: None,
-            binary_sha256: None,
-            document: None,
-            unavailable_reason: Some(reason.into()),
-        }
-    }
-    #[cfg(any(test, target_os = "android", target_os = "ios"))]
-    pub(crate) fn from_native(raw: Option<&str>, binary_sha256: &str, scope: &str) -> Self {
-        if binary_sha256.len() != 64
-            || !binary_sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            return Self::unavailable("Loaded core byte identity is invalid");
-        }
-        let mut snapshot = match raw {
-            Some(raw) => Self::from_loaded(raw, binary_sha256).unwrap_or_else(Self::unavailable),
-            None => Self::unavailable("Loaded core has no TLS capability report"),
-        };
-        snapshot.binary_sha256 = Some(binary_sha256.into());
-        snapshot.byte_identity_scope = scope.into();
-        snapshot
-    }
-
-    pub(crate) fn from_loaded(raw: &str, binary_sha256: &str) -> Result<Self, String> {
-        if raw.len() > MAX_DOCUMENT
-            || binary_sha256.len() != 64
-            || !binary_sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            return Err("Invalid loaded-core capability identity".into());
+impl Capabilities {
+    /// Shared bounded document parser; parsing does not create execution evidence.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        if raw.len() > MAX_DOCUMENT {
+            return Err("TLS capability report exceeds its bound".into());
         }
         let raw_value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
         let required = [
@@ -189,6 +144,100 @@ impl Snapshot {
         {
             return Err("Unsupported TLS capability schema or inventory".into());
         }
+        Ok(doc)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Snapshot {
+    /// CLI random selection belongs to the probe process, not the running main.
+    pub observation_scope: String,
+    pub byte_identity_scope: String,
+    /// Hash of executable bytes + capability document; never a version label.
+    pub identity: Option<String>,
+    pub binary_sha256: Option<String>,
+    pub document: Option<Capabilities>,
+    pub unavailable_reason: Option<String>,
+}
+
+impl Snapshot {
+    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            observation_scope: "unavailable".into(),
+            byte_identity_scope: "unavailable".into(),
+            identity: None,
+            binary_sha256: None,
+            document: None,
+            unavailable_reason: Some(reason.into()),
+        }
+    }
+    /// Data-only strict provenance parser. The caller must separately bind the
+    /// authenticated channel, active incarnation, CoreId and retained birth.
+    pub(crate) fn from_authenticated_document(
+        raw: &str,
+        expected: &Value,
+        source: &str,
+        os: &str,
+        arch: &str,
+        binary_sha256: &str,
+    ) -> Result<Self, String> {
+        if source.len() != 40
+            || !source
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || !expected.is_object()
+        {
+            return Err("Selected native producer proof unavailable".into());
+        }
+        let actual = Self::from_loaded(raw, binary_sha256)?;
+        let doc = actual
+            .document
+            .as_ref()
+            .ok_or("Missing running capability document")?;
+        let expected = Capabilities::parse(&expected.to_string())?;
+        if doc.source_commit != source
+            || doc.source_modified != Some(false)
+            || doc.os != os
+            || doc.arch != arch
+            || serde_json::to_value(doc).map_err(|e| e.to_string())?
+                != serde_json::to_value(expected).map_err(|e| e.to_string())?
+        {
+            return Err(
+                "Running TLS source/build/module/target differs from selected producer proof"
+                    .into(),
+            );
+        }
+        Ok(actual)
+    }
+    #[cfg(any(test, target_os = "android", target_os = "ios"))]
+    pub(crate) fn from_native(raw: Option<&str>, binary_sha256: &str, scope: &str) -> Self {
+        if binary_sha256.len() != 64
+            || !binary_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Self::unavailable("Loaded core byte identity is invalid");
+        }
+        let mut snapshot = match raw {
+            Some(raw) => Self::from_loaded(raw, binary_sha256).unwrap_or_else(Self::unavailable),
+            None => Self::unavailable("Loaded core has no TLS capability report"),
+        };
+        snapshot.binary_sha256 = Some(binary_sha256.into());
+        snapshot.byte_identity_scope = scope.into();
+        snapshot
+    }
+
+    pub(crate) fn from_loaded(raw: &str, binary_sha256: &str) -> Result<Self, String> {
+        if raw.len() > MAX_DOCUMENT
+            || binary_sha256.len() != 64
+            || !binary_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("Invalid loaded-core capability identity".into());
+        }
+        let doc = Capabilities::parse(raw)?;
         let identity = polaris_updater::sha256_hex(
             &serde_json::to_vec(&(binary_sha256, &doc)).map_err(|e| e.to_string())?,
         );

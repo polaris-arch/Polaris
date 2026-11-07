@@ -23,6 +23,11 @@ message RuntimeCapabilities {
   uint32 contract_version = 1; bool connected_hot_enabled = 2; string implementation_manifest_digest = 3;
   RuntimeIdentity active = 4; repeated RuntimeFieldCapability fields = 5; uint64 receipt_retention_seconds = 6;
   uint32 max_receipts = 7; bool full_effective_schema_supported = 8; uint64 control_revision = 9;
+  // Read-only document from this authenticated running Core. An absent/empty
+  // field is unavailable; it never grants an execution purpose or a CLI fallback.
+  string tls_fingerprint_capabilities_json = 10;
+  // Recognition of a consumer's explicit-confirmation protocol, never consent.
+  repeated uint32 supported_client_impact_policy_versions = 11;
 }
 // Explicit snapshot; absent and empty package lists retain their protobuf
 // semantics. Native directory custody is never accepted through this message.
@@ -30,6 +35,7 @@ message RuntimeOverrideOptions { bool auto_redirect = 1; repeated string include
 message PlanRuntimeConfigRequest {
   uint32 contract_version = 1; RuntimeIdentity expected = 2; string config_content = 3; RuntimeOverrideOptions overrides = 4;
   uint64 expected_control_revision = 5; repeated RuntimeSelectorIntent selector_intents = 6;
+  uint32 client_impact_policy_version = 7;
 }
 message RuntimeSelectorIntent { string group = 1; string selected = 2; repeated string expected_selection_path = 3; bool pin_current_tcp = 4; }
 message RuntimeConfigPlan {
@@ -37,6 +43,7 @@ message RuntimeConfigPlan {
   string dependency_digest = 5; string impact_digest = 6; repeated RuntimeImpact impacts = 7;
   repeated RuntimePlanError errors = 8; int64 expires_at_unix_milli = 9; bool applicable = 10;
   uint64 expected_control_revision = 11; string transaction_id = 12; bool no_op = 13;
+  uint32 client_impact_policy_version = 14; bool impact_confirmation_required = 15;
 }
 message RuntimeImpact {
   string resource_id = 1; string effective_path = 2; RuntimeUpdateClass update_class = 3;

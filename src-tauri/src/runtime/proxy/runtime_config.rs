@@ -5,17 +5,32 @@ use std::sync::{atomic::Ordering, Arc};
 
 use super::hot_switch::SwitchOutcome;
 use super::ProxyRuntime;
+use crate::runtime::route_binding::{
+    plan_protected_runtime_bindings, protected_generated_policy_compatible, ProtectedBindingPlan,
+    ProtectedPhysicalRoot,
+};
 use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
+use polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG;
 use polaris_config_engine::builder::{
     generate_sing_box_config_with_report_and_runtime_bindings, GenerateConfigDeps,
 };
 use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_config_engine::user_config::UserConfig;
+use polaris_helper_proto::Platform;
 use polaris_singbox_grpc::{daemon, Endpoint, RuntimeConfigError, SingBoxApiClient};
 use serde::Serialize;
 use serde_json::Value;
 pub(crate) mod api_handoff;
+pub(crate) mod host_effects;
+mod impact_confirmation;
 use api_handoff::{ApiChannelHandoff, ApiEndpoint, ApiRelayEpoch};
+use impact_confirmation::{PreparedImpactChoice, RuntimeImpactPreview};
+
+const CLIENT_IMPACT_POLICY_VERSION: u32 = 1;
+// Pinned Core box_runtime_plan.go runtimePlanLimit. Reserve before every Apply,
+// including a delayed impact confirmation; never evict an unobserved PENDING or
+// sticky UNKNOWN to make room for another native owner.
+const NATIVE_RETIREMENT_OBSERVATION_LIMIT: usize = 256;
 
 // The protocol is an authenticated observation of a previously byte/source-admitted
 // core. Its manifest digest is metadata, NOT a signature or substitute for that
@@ -33,6 +48,7 @@ const RUNTIME_PROTOCOL_METHODS: [&str; 6] = [
 pub(super) struct RuntimePairing {
     protocol: daemon::RuntimeFieldCapability,
     implementation_manifest_digest: String,
+    client_impact_policy_version: u32,
     // A successfully started legacy unsupported graph has no runtime coordinator.
     // None is retained as None; a later coordinator cannot join this old baseline.
     incarnation: Option<String>,
@@ -190,11 +206,19 @@ pub(super) fn observe_runtime_pairing(
     Ok(RuntimePairing {
         protocol: protocol.clone(),
         implementation_manifest_digest: capabilities.implementation_manifest_digest.clone(),
+        client_impact_policy_version: if capabilities
+            .supported_client_impact_policy_versions
+            .contains(&CLIENT_IMPACT_POLICY_VERSION)
+        {
+            CLIENT_IMPACT_POLICY_VERSION
+        } else {
+            0
+        },
         incarnation,
     })
 }
 
-fn runtime_pairing_matches(
+pub(super) fn runtime_pairing_matches(
     pairing: &RuntimePairing,
     capabilities: &daemon::RuntimeCapabilities,
 ) -> bool {
@@ -233,17 +257,72 @@ pub(super) struct RuntimeConfigBaseline {
     pub(super) api_log_handoff: Option<super::core_log::CoreLogHandoff>,
     pub(super) generation: u64,
     committed_transaction: Option<String>,
-    pairing: RuntimePairing,
+    observed_active: Option<daemon::RuntimeIdentity>,
+    observed_control_revision: u64,
+    pub(super) pairing: RuntimePairing,
     physical_route_config: UserConfig,
+    protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
     deps: GenerateConfigDeps,
     generated: SingBoxConfig,
 }
 
-#[derive(Clone, Serialize)]
+impl RuntimeConfigBaseline {
+    pub(super) fn core_log_relay_enabled(&self, generation: u64) -> bool {
+        self.generation == generation
+            && !self.api_epoch.is_closed()
+            && self.generated.log.disabled != Some(true)
+    }
+
+    pub(super) fn core_log_relay_initial_history(&self, generation: u64) -> bool {
+        self.generation == generation
+            && !self.api_epoch.is_closed()
+            && self.api_saved_projection.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeApplyReason {
-    code: &'static str,
-    path: String,
+    pub(super) code: &'static str,
+    pub(super) path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeRetirementDebt {
+    pub(super) transaction_id: String,
+    pub(super) runtime_generation: u64,
+    pub(super) selection_intent_generation: u64,
+    pub(super) retirement_state: &'static str,
+    pub(super) reason: RuntimeApplyReason,
+}
+
+fn annotate_native_retirement_debts(
+    result: &mut RuntimeApplyResult,
+    debts: Vec<NativeRetirementDebt>,
+) {
+    if debts.is_empty() {
+        return;
+    }
+    result.native_retirements = debts;
+    result.pending_apply = true;
+    result.ok = false;
+    if matches!(
+        result.status,
+        "hotApplied" | "hotDurabilityPending" | "applied" | "nativeCleanupUnknown"
+    ) {
+        result.status = "nativeCleanupUnknown";
+    }
+    if !result
+        .reasons
+        .iter()
+        .any(|reason| reason.code == "LISTENER_RETIREMENT_FAILED" && reason.path == "inbounds")
+    {
+        result.reasons.push(RuntimeApplyReason {
+            code: "LISTENER_RETIREMENT_FAILED",
+            path: "inbounds".into(),
+        });
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -262,13 +341,33 @@ pub(crate) struct RuntimeApplyResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_confirmation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact_confirmation: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub core_impacts: Vec<RuntimeImpactPreview>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub host_effect_previews: Vec<host_effects::HostEffectPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_execution_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub host_effects: Vec<host_effects::HostEffectResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration_durable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_transaction_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retirement_state: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub native_retirements: Vec<NativeRetirementDebt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence_mode: Option<String>,
     pub reasons: Vec<RuntimeApplyReason>,
     pub pending_apply: bool,
     pub restart_required: bool,
 }
 impl RuntimeApplyResult {
-    fn status(status: &'static str) -> Self {
+    pub(super) fn status(status: &'static str) -> Self {
         Self {
             status,
             ok: matches!(status, "hotApplied" | "hotDurabilityPending" | "applied"),
@@ -277,6 +376,16 @@ impl RuntimeApplyResult {
             runtime_generation: None,
             selection_intent_generation: None,
             restart_confirmation: None,
+            impact_confirmation: None,
+            core_impacts: vec![],
+            host_effect_previews: vec![],
+            host_execution_id: None,
+            host_effects: vec![],
+            core_state: None,
+            configuration_durable: None,
+            persistence_transaction_id: None,
+            retirement_state: None,
+            native_retirements: vec![],
             persistence_mode: None,
             reasons: vec![],
             pending_apply: !matches!(status, "hotApplied" | "hotDurabilityPending" | "skipped"),
@@ -315,11 +424,14 @@ struct RestartChoice {
 }
 #[derive(Clone)]
 struct PendingOperation {
+    host_plan: Option<host_effects::HostEffectPlan>,
     api_handoff: Option<Arc<ApiChannelHandoff>>,
     pairing: RuntimePairing,
     desired: Value,
     deletion_scope: Vec<crate::runtime::config::DeferredConfigDeletion>,
     physical_route_config: UserConfig,
+    protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
+    protected_binding_plan: Option<ProtectedBindingPlan>,
     generation: u64,
     intent: u64,
     candidate: Value,
@@ -336,9 +448,312 @@ struct PendingOperation {
 }
 #[derive(Default)]
 pub(super) struct RuntimeConfigApplyState {
+    kernel: Option<RuntimeKernelReceipt>,
+    native_retirements: BTreeMap<String, NativeRetirementObservation>,
+    host: host_effects::RuntimeHostState,
+    impact: Option<PreparedImpactChoice>,
     restart: Option<RestartChoice>,
     pending: Option<PendingOperation>,
     last: Option<RuntimeApplyResult>,
+}
+
+#[derive(Clone)]
+struct RuntimeKernelReceipt {
+    generation: u64,
+    intent: u64,
+    superseded: bool,
+    operation: daemon::RuntimeConfigOperation,
+}
+
+// This observer owns only the original post-K native retirement. It never owns
+// durable D, host effects or a later selection intent.
+#[derive(Clone)]
+struct NativeRetirementObservation {
+    pairing: RuntimePairing,
+    receipt: RuntimeKernelReceipt,
+}
+
+fn listener_retirement_failed(operation: &daemon::RuntimeConfigOperation) -> bool {
+    operation.retirement_state == "UNKNOWN"
+        && operation.errors.iter().any(|error| {
+            error.code == "LISTENER_RETIREMENT_FAILED" && error.effective_path == "inbounds"
+        })
+}
+
+impl RuntimeKernelReceipt {
+    fn native_retirement_debt(&self) -> Option<NativeRetirementDebt> {
+        listener_retirement_failed(&self.operation).then(|| NativeRetirementDebt {
+            transaction_id: self.operation.transaction_id.clone(),
+            runtime_generation: self.generation,
+            selection_intent_generation: self.intent,
+            retirement_state: "UNKNOWN",
+            reason: RuntimeApplyReason {
+                code: "LISTENER_RETIREMENT_FAILED",
+                path: "inbounds".into(),
+            },
+        })
+    }
+
+    fn result(&self) -> RuntimeApplyResult {
+        let durable = self.operation.durable
+            && self.operation.state == daemon::RuntimeOperationState::Committed as i32;
+        let mut result = RuntimeApplyResult::status(if self.superseded {
+            "conflict"
+        } else if durable {
+            "hotApplied"
+        } else {
+            "hotDurabilityPending"
+        });
+        result.transaction_id = Some(self.operation.transaction_id.clone());
+        result.runtime_generation = Some(self.generation);
+        result.selection_intent_generation = Some(self.intent);
+        result.core_state = Some("committed");
+        result.configuration_durable = Some(durable);
+        result.persistence_mode = Some(self.operation.persistence_mode.clone());
+        result.retirement_state = Some(self.operation.retirement_state.clone());
+        if self.superseded {
+            result.reasons.push(RuntimeApplyReason {
+                code: "OWNER_STATE_SUPERSEDED",
+                path: "desired".into(),
+            });
+        }
+        annotate_native_retirement_debts(
+            &mut result,
+            self.native_retirement_debt().into_iter().collect(),
+        );
+        result
+    }
+}
+
+impl RuntimeConfigApplyState {
+    fn native_retirement_debts(&self) -> Vec<NativeRetirementDebt> {
+        self.native_retirements
+            .values()
+            .filter_map(|original| original.receipt.native_retirement_debt())
+            .collect()
+    }
+
+    fn native_retirement_capacity_available(&self) -> bool {
+        self.native_retirements
+            .values()
+            .filter(|original| original.receipt.operation.retirement_state != "DRAINED")
+            .count()
+            < NATIVE_RETIREMENT_OBSERVATION_LIMIT
+    }
+
+    /// Called after settlement has authenticated the exact committed operation.
+    /// A newer K/D owner cannot replace an older uncertain native retirement.
+    fn observe_native_retirement(
+        &mut self,
+        pending: &PendingOperation,
+        operation: &daemon::RuntimeConfigOperation,
+    ) -> bool {
+        if let Some(original) = self
+            .native_retirements
+            .get(&operation.transaction_id)
+            .cloned()
+        {
+            // A proven later D success may advance durability while the first
+            // native UNKNOWN proof stays charged to this same original owner.
+            if listener_retirement_failed(&original.receipt.operation)
+                && operation.durable
+                && operation.state == daemon::RuntimeOperationState::Committed as i32
+                && operation.candidate_digest == original.receipt.operation.candidate_digest
+                && operation.impact_digest == original.receipt.operation.impact_digest
+                && identity_equal(
+                    operation.before.as_ref(),
+                    original.receipt.operation.before.as_ref(),
+                )
+                && identity_equal(
+                    operation.active.as_ref(),
+                    original.receipt.operation.active.as_ref(),
+                )
+                && operation.control_revision == original.receipt.operation.control_revision
+            {
+                let mut retained = operation.clone();
+                retained.retirement_state = "UNKNOWN".into();
+                if !listener_retirement_failed(&retained) {
+                    retained.errors.extend(
+                        original
+                            .receipt
+                            .operation
+                            .errors
+                            .iter()
+                            .filter(|error| {
+                                error.code == "LISTENER_RETIREMENT_FAILED"
+                                    && error.effective_path == "inbounds"
+                            })
+                            .cloned(),
+                    );
+                }
+                if let Some(registered) = self.native_retirements.get_mut(&operation.transaction_id)
+                {
+                    registered.receipt.operation = retained;
+                }
+                return false;
+            }
+            // A later settlement of the same verified operation can deliver the
+            // first UNKNOWN proof before its background status task wakes up.
+            let _ = self.refresh_native_retirement(
+                &original,
+                &daemon::RuntimeConfigStatus {
+                    contract_version: 1,
+                    lookup_state: daemon::RuntimeLookupState::Found as i32,
+                    active: operation.active.clone(),
+                    operation: Some(operation.clone()),
+                    ..Default::default()
+                },
+            );
+            return false;
+        }
+        self.native_retirements
+            .retain(|_, original| original.receipt.operation.retirement_state != "DRAINED");
+        // DRAINED has nothing to observe. Other unknown resource-retirement
+        // states do not manufacture the fixed listener failure proof.
+        if !matches!(operation.retirement_state.as_str(), "PENDING" | "DRAINING")
+            && !listener_retirement_failed(operation)
+        {
+            return false;
+        }
+        self.native_retirements.insert(
+            operation.transaction_id.clone(),
+            NativeRetirementObservation {
+                pairing: pending.pairing.clone(),
+                receipt: RuntimeKernelReceipt {
+                    generation: pending.generation,
+                    intent: pending.intent,
+                    superseded: false,
+                    operation: operation.clone(),
+                },
+            },
+        );
+        true
+    }
+
+    /// Shared by the real status and background observer paths. This consumes
+    /// evidence only: it cannot publish R, acknowledge D or replay native Close.
+    fn refresh_native_retirement(
+        &mut self,
+        original: &NativeRetirementObservation,
+        status: &daemon::RuntimeConfigStatus,
+    ) -> Option<RuntimeApplyResult> {
+        let old = &original.receipt;
+        let registered = self.native_retirements.get(&old.operation.transaction_id)?;
+        if registered.receipt.generation != old.generation
+            || registered.receipt.intent != old.intent
+            || registered.pairing != original.pairing
+        {
+            return None;
+        }
+        // Core retains the first failed Close proof. Even a later contradictory
+        // DRAINED response cannot discharge that original native uncertainty.
+        if listener_retirement_failed(&registered.receipt.operation)
+            || registered.receipt.operation.retirement_state == "DRAINED"
+        {
+            return Some(registered.receipt.result());
+        }
+        let operation = status.operation.as_ref()?;
+        if status.contract_version != 1
+            || status.lookup_state != daemon::RuntimeLookupState::Found as i32
+            || !status.active.as_ref().is_some_and(|active| {
+                original.pairing.incarnation.as_deref() == Some(active.incarnation.as_str())
+            })
+            || operation.contract_version != 1
+            || operation.transaction_id != old.operation.transaction_id
+            || operation.candidate_digest != old.operation.candidate_digest
+            || operation.impact_digest != old.operation.impact_digest
+            || !identity_equal(operation.before.as_ref(), old.operation.before.as_ref())
+            || !identity_equal(operation.active.as_ref(), old.operation.active.as_ref())
+            || operation.control_revision != old.operation.control_revision
+            || (registered.receipt.operation.durable && !operation.durable)
+            || !matches!(operation.state, x if x == daemon::RuntimeOperationState::Committed as i32
+                || x == daemon::RuntimeOperationState::CommittedDurabilityPending as i32)
+            || (operation.durable
+                && operation.state != daemon::RuntimeOperationState::Committed as i32)
+            || !matches!(
+                operation.retirement_state.as_str(),
+                "PENDING" | "DRAINING" | "DRAINED" | "UNKNOWN"
+            )
+        {
+            return None;
+        }
+        let mut updated = registered.receipt.clone();
+        updated.operation = operation.clone();
+        if let Some(kernel) = self.kernel.as_mut().filter(|kernel| {
+            kernel.generation == old.generation
+                && kernel.intent == old.intent
+                && kernel.operation.transaction_id == old.operation.transaction_id
+        }) {
+            // Keep local supersession separate from the original physical fact.
+            kernel.operation = operation.clone();
+            updated.superseded = kernel.superseded;
+        }
+        if let Some(registered) = self
+            .native_retirements
+            .get_mut(&old.operation.transaction_id)
+        {
+            registered.receipt = updated.clone();
+        }
+        Some(updated.result())
+    }
+
+    fn core_receipt_for(&self, transaction: &str, generation: u64) -> Option<RuntimeApplyResult> {
+        let mut result = self
+            .kernel
+            .as_ref()
+            .filter(|kernel| {
+                kernel.generation == generation && kernel.operation.transaction_id == transaction
+            })
+            .map(RuntimeKernelReceipt::result)
+            .or_else(|| {
+                self.last.clone().filter(|result| {
+                    result.transaction_id.as_deref() == Some(transaction)
+                        && result.runtime_generation == Some(generation)
+                })
+            })?;
+        annotate_native_retirement_debts(&mut result, self.native_retirement_debts());
+        Some(result)
+    }
+
+    fn requires_regeneration_owner_restart(
+        &self,
+        generation: u64,
+        plan: &daemon::RuntimeConfigPlan,
+    ) -> bool {
+        plan.no_op
+            && self.kernel.as_ref().is_some_and(|kernel| {
+                kernel.superseded
+                    && kernel.generation == generation
+                    && identity_equal(kernel.operation.active.as_ref(), plan.expected.as_ref())
+            })
+    }
+
+    fn host_only_preserves_pending_core(&self, next: &PendingOperation) -> bool {
+        let Some(previous) = self.pending.as_ref() else {
+            return true;
+        };
+        next.plan.no_op
+            && previous.published
+            && previous.generation == next.generation
+            && previous.intent == next.intent
+            && previous.desired == next.desired
+            && previous.candidate == next.candidate
+            && next.host_plan.as_ref().is_some_and(|plan| {
+                plan.strategy == host_effects::HostEffectStrategy::HostOnly
+                    && !plan.effects.is_empty()
+            })
+            && self.kernel.as_ref().is_some_and(|kernel| {
+                !kernel.superseded
+                    && kernel.generation == next.generation
+                    && kernel.intent == previous.intent
+                    && kernel.operation.transaction_id == previous.plan.transaction_id
+                    && identity_equal(
+                        kernel.operation.active.as_ref(),
+                        next.plan.expected.as_ref(),
+                    )
+                    && kernel.operation.control_revision == next.plan.expected_control_revision
+            })
+    }
 }
 
 fn identity_equal(
@@ -354,6 +769,99 @@ fn identity_equal(
         }
         _ => false,
     }
+}
+
+// Versioned consumer policy is checked independently of the producer's boolean.
+// Unknown/inconsistent effects cannot acquire consent by omitting the flag.
+fn runtime_impact_scope_requires_confirmation(impact: &daemon::RuntimeImpact) -> bool {
+    impact.affected_session_classes.iter().any(|class| {
+        matches!(
+            class.as_str(),
+            "existing TUN TCP flows"
+                | "existing TUN UDP associations"
+                | "affected UDP associations"
+                | "API streams on the replaced ingress"
+                | "api_generation_handoff_v1"
+                | "dashboard updater"
+        )
+    })
+}
+
+fn runtime_plan_impacts_supported(plan: &daemon::RuntimeConfigPlan) -> bool {
+    const KNOWN_SESSIONS: &[&str] = &[
+        "new admissions",
+        "log emissions",
+        "API streams on the replaced ingress",
+        "api_generation_handoff_v1",
+        "dashboard updater",
+        "changed ingress admissions",
+        "affected UDP associations",
+        "existing TUN TCP flows",
+        "existing TUN UDP associations",
+        "new TLS admissions",
+        "captured provider consumers",
+        "dependent listener handoff",
+        "new clock consumers",
+        "none; candidate not applied",
+    ];
+    if plan.impacts.iter().any(|impact| {
+        !(1..=5).contains(&impact.update_class)
+            || (plan.applicable && impact.update_class > 3)
+            || (impact.update_class == 1 && impact.reconnect_required)
+            || (plan.applicable && impact.affected_session_classes.is_empty())
+            || (plan.applicable
+                && impact
+                    .affected_session_classes
+                    .iter()
+                    .any(|class| class == "none; candidate not applied"))
+            || (plan.applicable
+                && plan.client_impact_policy_version == CLIENT_IMPACT_POLICY_VERSION
+                && runtime_impact_scope_requires_confirmation(impact)
+                && !impact.reconnect_required
+                && impact.update_class != 3)
+            || impact
+                .affected_session_classes
+                .iter()
+                .any(|class| !KNOWN_SESSIONS.contains(&class.as_str()))
+            || (plan.applicable
+                && (impact.reconnect_required || impact.update_class == 3)
+                && !impact.affected_session_classes.iter().any(|class| {
+                    matches!(
+                        class.as_str(),
+                        "API streams on the replaced ingress"
+                            | "api_generation_handoff_v1"
+                            | "dashboard updater"
+                            | "changed ingress admissions"
+                            | "affected UDP associations"
+                            | "existing TUN TCP flows"
+                            | "existing TUN UDP associations"
+                            | "dependent listener handoff"
+                    )
+                }))
+    }) {
+        return false;
+    }
+    let disruptive = plan
+        .impacts
+        .iter()
+        .any(|impact| impact.reconnect_required || impact.update_class == 3);
+    if plan.no_op
+        && (!plan.applicable || !plan.impacts.is_empty() || plan.impact_confirmation_required)
+    {
+        return false;
+    }
+    plan.client_impact_policy_version != CLIENT_IMPACT_POLICY_VERSION
+        || plan.impact_confirmation_required == (plan.applicable && disruptive)
+}
+
+fn runtime_plan_needs_local_confirmation(plan: &daemon::RuntimeConfigPlan) -> bool {
+    plan.applicable
+        && (plan.impact_confirmation_required
+            || plan.impacts.iter().any(|impact| {
+                impact.reconnect_required
+                    || impact.update_class == 3
+                    || runtime_impact_scope_requires_confirmation(impact)
+            }))
 }
 
 fn stale_receipt_releases_pending(
@@ -631,7 +1139,14 @@ impl ProxyRuntime {
         physical_route_config: UserConfig,
         pairing: RuntimePairing,
     ) {
+        let accepted_host_deps = deps.clone();
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
+            if let Some(owner) = baseline
+                .as_ref()
+                .and_then(|b| b.protected_physical_root.as_ref())
+            {
+                owner.revoke();
+            }
             *baseline = Some(RuntimeConfigBaseline {
                 management: ApiEndpoint::from_generated(&generated),
                 control: None,
@@ -640,8 +1155,11 @@ impl ProxyRuntime {
                 api_log_handoff: None,
                 generation,
                 committed_transaction: None,
+                observed_active: None,
+                observed_control_revision: 0,
                 pairing,
                 physical_route_config,
+                protected_physical_root: None,
                 deps,
                 generated,
             });
@@ -650,27 +1168,127 @@ impl ProxyRuntime {
             if let Some(h) = state.pending.as_ref().and_then(|p| p.api_handoff.as_ref()) {
                 h.revoke();
             }
+            let mut previous_host = std::mem::take(&mut state.host);
+            // A gate bump or baseline recapture is not proof that the old
+            // native process ended. Only the real stop-success clear below
+            // releases this ledger, including old-generation PENDING observers.
+            let native_retirements = std::mem::take(&mut state.native_retirements);
             *state = RuntimeConfigApplyState::default();
+            state.native_retirements = native_retirements;
+            state.host.carry_dns_cleanup_from(&mut previous_host);
+            state.host.seed(generation, accepted_host_deps);
         }
     }
     pub(super) fn clear_runtime_config_baseline(&self) {
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
             if let Some(previous) = baseline.take() {
                 previous.api_epoch.invalidate();
+                if let Some(owner) = previous.protected_physical_root {
+                    owner.revoke();
+                }
             }
         }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
             if let Some(h) = state.pending.as_ref().and_then(|p| p.api_handoff.as_ref()) {
                 h.revoke();
             }
+            let mut previous_host = std::mem::take(&mut state.host);
             *state = RuntimeConfigApplyState::default();
+            state.host.carry_dns_cleanup_from(&mut previous_host);
         }
     }
-    fn remember_runtime_result(&self, result: RuntimeApplyResult) -> RuntimeApplyResult {
+
+    pub(super) fn attach_protected_physical_root(
+        &self,
+        generation: u64,
+        network_epoch: u64,
+        owner: Arc<ProtectedPhysicalRoot>,
+    ) {
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() != generation
+            || !self.core_running()
+            || self.network_epoch() != Some(network_epoch)
+        {
+            owner.revoke();
+            return;
+        }
+        if let Ok(mut baseline) = self.runtime_config_baseline.write() {
+            if let Some(baseline) = baseline.as_mut().filter(|b| b.generation == generation) {
+                if let Some(previous) = baseline.protected_physical_root.replace(Arc::clone(&owner))
+                {
+                    if !Arc::ptr_eq(&previous, &owner) {
+                        previous.revoke();
+                    }
+                }
+                return;
+            }
+        }
+        owner.revoke();
+    }
+
+    pub(super) fn revoke_protected_physical_root(&self) {
+        if let Ok(baseline) = self.runtime_config_baseline.read() {
+            if let Some(owner) = baseline
+                .as_ref()
+                .and_then(|b| b.protected_physical_root.as_ref())
+            {
+                owner.revoke();
+            }
+        }
+    }
+
+    fn protected_runtime_publication_current(&self, pending: &PendingOperation) -> bool {
+        pending.protected_binding_plan.as_ref().is_none_or(|proof| {
+            self.network_epoch()
+                .is_some_and(|epoch| proof.publication_current(pending.generation, epoch))
+        })
+    }
+
+    async fn verify_prepared_physical_bindings(&self, pending: &PendingOperation) -> bool {
+        let Some(proof) = pending.protected_binding_plan.as_ref() else {
+            return true;
+        };
+        let Some(epoch) = self.network_epoch() else {
+            return false;
+        };
+        proof.verify(pending.generation, epoch).await.is_ok()
+    }
+    pub(super) fn native_retirement_debts(&self) -> Vec<NativeRetirementDebt> {
+        self.runtime_config_apply
+            .lock()
+            .ok()
+            .map(|state| state.native_retirement_debts())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn native_retirement_pending(&self) -> bool {
+        self.runtime_config_apply.lock().is_ok_and(|state| {
+            state
+                .native_retirements
+                .values()
+                .any(|original| listener_retirement_failed(&original.receipt.operation))
+        })
+    }
+
+    pub(super) fn annotate_runtime_native_result(&self, result: &mut RuntimeApplyResult) {
+        annotate_native_retirement_debts(result, self.native_retirement_debts());
+    }
+
+    fn runtime_native_result(&self, mut result: RuntimeApplyResult) -> RuntimeApplyResult {
+        self.annotate_runtime_native_result(&mut result);
+        result
+    }
+
+    fn remember_runtime_result(&self, mut result: RuntimeApplyResult) -> RuntimeApplyResult {
+        self.annotate_runtime_host_result(&mut result);
         if let Ok(mut state) = self.runtime_config_apply.lock() {
+            state.host.remember_result(&result);
             state.last = Some(result.clone());
         }
-        if result.pending_apply {
+        if result.pending_apply
+            && !(result.status == "nativeCleanupUnknown"
+                && result.configuration_durable == Some(true))
+        {
             self.restart_deferred.store(true, Ordering::SeqCst);
         }
         self.push_pending_changes();
@@ -680,6 +1298,33 @@ impl ProxyRuntime {
         self.restart_deferred.store(true, Ordering::SeqCst);
         self.push_pending_changes();
     }
+    fn host_effect_restart_choice(
+        &self,
+        candidate: &Value,
+        plan: &host_effects::HostEffectPlan,
+        generation: u64,
+        intent: u64,
+    ) -> RuntimeApplyResult {
+        let dns_source_snapshot = matches!(
+            plan.strategy,
+            host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore
+        ) && plan
+            .effects
+            .iter()
+            .any(|effect| effect.kind == host_effects::HostEffectKind::Dns);
+        self.restart_choice(
+            candidate,
+            "hostEffectsRequireRestart",
+            vec![if dns_source_snapshot {
+                "dnsConfig.takeoverSystemDns".into()
+            } else {
+                "host.effects".into()
+            }],
+            generation,
+            intent,
+        )
+    }
+
     fn restart_choice(
         &self,
         candidate: &Value,
@@ -721,6 +1366,7 @@ impl ProxyRuntime {
         }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
             state.restart = Some(choice);
+            state.impact = None;
         }
         result
     }
@@ -789,17 +1435,32 @@ impl ProxyRuntime {
             .lock()
             .ok()
             .and_then(|s| s.pending.clone());
+        let mut host_retry_only = false;
         if let Some(pending) = pending {
             let result = self.reconcile_runtime_operation(&client, pending).await;
             let superseded = result
                 .reasons
                 .iter()
                 .any(|reason| reason.code == "OWNER_STATE_SUPERSEDED");
-            if !superseded || self.config.current().ok().as_ref() != Some(&candidate) {
+            host_retry_only = self.runtime_config_apply.lock().is_ok_and(|state| {
+                state.host.has_pending()
+                    && !state.host.has_in_flight()
+                    && state.pending.as_ref().is_some_and(|pending| {
+                        pending.published
+                            && pending.generation == generation
+                            && pending.intent == intent
+                            && pending.desired == desired
+                            && pending.candidate == candidate
+                    })
+            });
+            if (!superseded && !host_retry_only)
+                || self.config.current().ok().as_ref() != Some(&candidate)
+            {
                 return self.remember_runtime_result(result);
             }
-            // Only an explicit Apply of the latest saved D may correct a typed
-            // regeneration supersession. Generic callback failures stay pending.
+            // Generic Core persistence remains owned by its original transaction.
+            // A same-candidate host retry may proceed only through a fresh NoOp
+            // Plan; it does not replace or replay that pending Core transaction.
             baseline = match self
                 .runtime_config_baseline
                 .read()
@@ -882,7 +1543,37 @@ impl ProxyRuntime {
             Some(value) => value,
             None => return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
         };
-        let mut deps = baseline.deps.clone();
+        if baseline.pairing.client_impact_policy_version == 0
+            && super::dns_takeover::host_dns_takeover_changed(
+                self.helper.platform(),
+                &previous_raw,
+                &candidate,
+            )
+        {
+            return self.remember_runtime_result(self.restart_choice(
+                &candidate,
+                "structuralChange",
+                vec!["dnsConfig.takeoverSystemDns".into()],
+                generation,
+                intent,
+            ));
+        }
+        let Some(mut deps) = self.runtime_host_dns_generation_deps(generation, &baseline.deps)
+        else {
+            return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+        };
+        if baseline.pairing.client_impact_policy_version == CLIENT_IMPACT_POLICY_VERSION {
+            // Calculation input only. The physical controller snapshot and its
+            // receipt remain separate host authority, checked before Core Apply.
+            deps.system_dns_takeover_active = super::dns_takeover::system_dns_takeover_active(
+                self.helper.platform(),
+                typed
+                    .proxy_mode_type
+                    .effective_on(self.helper.platform())
+                    .is_tun(),
+                super::dns_takeover::dns_takeover_enabled(&candidate),
+            );
+        }
         if let Some(endpoint) = baseline.management.as_ref() {
             deps.tailscale_api_port = endpoint.port;
         }
@@ -905,7 +1596,7 @@ impl ProxyRuntime {
         deps.log_level = log_level;
         deps.disable_log_file = disable_log_file;
         deps.node_dns_decoy_override = self.node_dns_decoy_override();
-        let Some(binding_plan) = self
+        let Some(mut binding_plan) = self
             .runtime_binding_state
             .lock()
             .ok()
@@ -914,6 +1605,7 @@ impl ProxyRuntime {
             return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
         };
         let previous_bindings = binding_plan.bindings.clone();
+        let mut protected_binding_plan = None;
         // This planner's route probes are only trustworthy before TUN startup.
         // Retain accepted physical facts for ordinary graph edits. New automatic
         // targets need a safe pre-TUN plan, never a probe through our own tunnel.
@@ -927,20 +1619,61 @@ impl ProxyRuntime {
                 &binding_plan,
             )
         {
-            let result = self.restart_choice(
-                &candidate,
-                "structuralChange",
-                vec!["outbounds.physical_route_binding".into()],
-                generation,
-                intent,
-            );
-            return self.remember_runtime_result(result);
+            let proof = match (
+                baseline.protected_physical_root.clone(),
+                self.network_epoch(),
+            ) {
+                (Some(owner), Some(epoch))
+                    if protected_generated_policy_compatible(
+                        &baseline.generated,
+                        &baseline.generated,
+                    ) =>
+                {
+                    plan_protected_runtime_bindings(
+                        owner,
+                        &baseline.physical_route_config,
+                        &typed,
+                        &binding_plan,
+                        generation,
+                        epoch,
+                    )
+                    .await
+                    .ok()
+                }
+                _ => None,
+            };
+            let Some(proof) = proof else {
+                let result = self.restart_choice(
+                    &candidate,
+                    "structuralChange",
+                    vec!["outbounds.physical_route_binding".into()],
+                    generation,
+                    intent,
+                );
+                return self.remember_runtime_result(result);
+            };
+            binding_plan = proof.binding_plan().clone();
+            protected_binding_plan = Some(proof);
         }
         if !self.selector_operation_is_current(generation, intent) {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         }
         let bindings = binding_plan.bindings.clone();
-        if baseline.deps.network_canary_port.is_none()
+        if baseline.pairing.client_impact_policy_version == CLIENT_IMPACT_POLICY_VERSION
+            && deps.network_canary_port.is_none()
+            && !typed.network_profiles.is_empty()
+        {
+            // Reuse the startup UDP allocator/exclusions; Core still reserves
+            // and binds the real socket transactionally, including collision rollback.
+            deps.network_canary_port = self.resolve_network_canary_port(
+                &typed,
+                polaris_config_engine::user_config::proxy_ports::control_api_port(&typed),
+                deps.tailscale_api_port,
+                deps.update_in_port.unwrap_or(0),
+                deps.subscription_update_in_port.unwrap_or(0),
+            );
+        }
+        if deps.network_canary_port.is_none()
             && !typed.network_profiles.is_empty()
             && self
                 .current_config_snapshot()
@@ -993,6 +1726,17 @@ impl ProxyRuntime {
         let network_canary = outcome.network_canary;
         let mut generated = outcome.config;
         generated.polaris_windows_directory = baseline.generated.polaris_windows_directory.clone();
+        if protected_binding_plan.is_some()
+            && !protected_generated_policy_compatible(&baseline.generated, &generated)
+        {
+            return self.remember_runtime_result(self.restart_choice(
+                &candidate,
+                "structuralChange",
+                vec!["outbounds.physical_route_binding".into()],
+                generation,
+                intent,
+            ));
+        }
         let mut content = match serde_json::to_value(&generated) {
             Ok(value) => value,
             Err(_) => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
@@ -1087,6 +1831,7 @@ impl ProxyRuntime {
                 overrides,
                 expected_control_revision: capabilities.control_revision,
                 selector_intents,
+                client_impact_policy_version: baseline.pairing.client_impact_policy_version,
             })
             .await
         {
@@ -1096,11 +1841,22 @@ impl ProxyRuntime {
             }
         };
         if plan.contract_version != 1
+            || plan.client_impact_policy_version != baseline.pairing.client_impact_policy_version
+            || (plan.impact_confirmation_required
+                && plan.client_impact_policy_version != CLIENT_IMPACT_POLICY_VERSION)
             || !identity_equal(plan.expected.as_ref(), capabilities.active.as_ref())
             || plan.expected_control_revision != capabilities.control_revision
             || !self.selector_operation_is_current(generation, intent)
         {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        if !runtime_plan_impacts_supported(&plan) {
+            let mut result = RuntimeApplyResult::status("unconfirmed");
+            result.reasons.push(RuntimeApplyReason {
+                code: "UNSUPPORTED_RUNTIME_IMPACT",
+                path: "runtime.impacts".into(),
+            });
+            return self.remember_runtime_result(result);
         }
         if !plan.applicable {
             let paths: Vec<String> = plan
@@ -1124,8 +1880,22 @@ impl ProxyRuntime {
         {
             return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
         }
+        if host_retry_only && !plan.no_op {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
         let target_api = ApiEndpoint::from_generated(&generated);
-        let api_handoff = if target_api != baseline.management {
+        let api_generation_handoff = plan.client_impact_policy_version
+            == CLIENT_IMPACT_POLICY_VERSION
+            && plan.impacts.iter().any(|impact| {
+                impact.effective_path == "services"
+                    && impact.update_class == daemon::RuntimeUpdateClass::LocalReplace as i32
+                    && impact.reconnect_required
+                    && impact
+                        .affected_session_classes
+                        .iter()
+                        .any(|class| class == "api_generation_handoff_v1")
+            });
+        let api_handoff = if target_api != baseline.management || api_generation_handoff {
             if baseline
                 .control
                 .as_ref()
@@ -1178,12 +1948,68 @@ impl ProxyRuntime {
         } else {
             None
         };
-        let mut pending = PendingOperation {
+        if self
+            .runtime_config_apply
+            .lock()
+            .is_ok_and(|state| state.requires_regeneration_owner_restart(generation, &plan))
+        {
+            // A NoOp ticket has no persistence tail of its own and cannot borrow
+            // the superseded original owner's reload/namespace acknowledgement.
+            return self.remember_runtime_result(self.restart_choice(
+                &candidate,
+                "regenerationOwnerRequiresRestart",
+                vec!["runtime.persistence.owner".into()],
+                generation,
+                intent,
+            ));
+        }
+        let host_plan = match self.prepare_runtime_host_effects(
+            &candidate,
+            &self.current_config_snapshot().unwrap_or(Value::Null),
+            generation,
+            intent,
+            !plan.no_op,
+        ) {
+            Ok(plan) => plan,
+            Err(result) if result.restart_required => {
+                let paths = result
+                    .reasons
+                    .iter()
+                    .map(|reason| reason.path.clone())
+                    .collect();
+                let mut choice = self.restart_choice(
+                    &candidate,
+                    "hostEffectsRequireRestart",
+                    paths,
+                    generation,
+                    intent,
+                );
+                choice.reasons = result.reasons;
+                return self.remember_runtime_result(choice);
+            }
+            Err(result) => return self.remember_runtime_result(*result),
+        };
+        if matches!(
+            host_plan.strategy,
+            host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore
+        ) {
+            return self.remember_runtime_result(
+                self.host_effect_restart_choice(&candidate, &host_plan, generation, intent),
+            );
+        }
+        let pending = PendingOperation {
+            host_plan: Some(host_plan),
             api_handoff,
             pairing: baseline.pairing.clone(),
             desired,
             deletion_scope,
-            physical_route_config: baseline.physical_route_config.clone(),
+            physical_route_config: if protected_binding_plan.is_some() {
+                typed.clone()
+            } else {
+                baseline.physical_route_config.clone()
+            },
+            protected_physical_root: baseline.protected_physical_root.clone(),
+            protected_binding_plan,
             generation,
             intent,
             candidate,
@@ -1198,38 +2024,133 @@ impl ProxyRuntime {
             tailnet_suspended_token: None,
             tailnet_bindings,
         };
+        if runtime_plan_needs_local_confirmation(&pending.plan)
+            || pending.host_plan.as_ref().is_some_and(|plan| {
+                plan.effects
+                    .iter()
+                    .any(|effect| effect.before_digest != effect.target_digest)
+            })
+        {
+            return self.remember_runtime_result(self.prepare_runtime_impact_choice(pending));
+        }
+        self.execute_prepared_runtime_candidate(client, pending, None)
+            .await
+    }
+
+    async fn execute_prepared_runtime_candidate(
+        self: &Arc<Self>,
+        client: Arc<SingBoxApiClient>,
+        mut pending: PendingOperation,
+        confirmation: Option<String>,
+    ) -> RuntimeApplyResult {
+        let generation = pending.generation;
+        let intent = pending.intent;
+        if self.runtime_host_execution_in_flight() {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        let expected_running = confirmation.as_ref().and_then(|token| {
+            self.runtime_config_apply.lock().ok().and_then(|state| {
+                state
+                    .impact
+                    .as_ref()
+                    .filter(|choice| &choice.token == token)
+                    .map(|choice| choice.running.clone())
+            })
+        });
+        if confirmation.is_some() && expected_running.is_none() {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        // Controller facts are read with no ledger/publication lock held. The
+        // retained OS owner rechecks its exact execution under controller locks.
+        if pending
+            .host_plan
+            .as_ref()
+            .is_some_and(|plan| !self.runtime_host_facts_match(plan))
+        {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        if !self.verify_prepared_physical_bindings(&pending).await {
+            return self.remember_runtime_result(self.restart_choice(
+                &pending.candidate,
+                "structuralChange",
+                vec!["outbounds.physical_route_binding".into()],
+                generation,
+                intent,
+            ));
+        }
+        if pending.plan.no_op {
+            return self
+                .execute_runtime_host_only(&client, pending, confirmation.as_deref())
+                .await;
+        }
         // Pause a binding-changing writer BEFORE the RPC. Unknown completion
         // keeps it paused; a verified unapplied rejection alone may resume it.
         let mut tailnet_limited = false;
-        let admitted = self.selector_reconcile.with_intent_claim(|current_intent| {
-            let _publication = self.gate.lock_generation_publication();
-            if current_intent != intent
-                || self.gate.generation() != generation
-                || self.gate.is_busy()
-            {
-                return false;
-            }
-            // STATUS may have grown H during Plan. Check the final canonical
-            // source before pausing the writer and admitting the Apply RPC.
-            if !self.tailnet_bindings_within_limit(&pending.tailnet_bindings) {
-                tailnet_limited = true;
-                return false;
-            }
-            let Ok(mut state) = self.runtime_config_apply.lock() else {
-                return false;
-            };
-            pending.tailnet_suspended_token =
-                self.suspend_tailnet_context(&pending.tailnet_bindings);
-            state.pending = Some(pending.clone());
-            state.restart = None;
-            true
-        });
+        let mut native_limited = false;
+        let admitted = self
+            .config
+            .with_current(|desired| {
+                if desired != &pending.desired {
+                    return false;
+                }
+                self.selector_reconcile.with_intent_claim(|current_intent| {
+                    let _publication = self.gate.lock_generation_publication();
+                    if current_intent != intent
+                        || self.gate.generation() != generation
+                        || self.gate.is_busy()
+                        || !self.protected_runtime_publication_current(&pending)
+                        || expected_running.as_ref().is_some_and(|running| {
+                            self.current_config_snapshot().as_ref() != Some(running)
+                        })
+                    {
+                        return false;
+                    }
+                    // STATUS may have grown H during Plan. Check the final canonical
+                    // source before pausing the writer and admitting the Apply RPC.
+                    if !self.tailnet_bindings_within_limit(&pending.tailnet_bindings) {
+                        tailnet_limited = true;
+                        return false;
+                    }
+                    let Ok(mut state) = self.runtime_config_apply.lock() else {
+                        return false;
+                    };
+                    if state.host.has_in_flight() {
+                        return false;
+                    }
+                    if !state.native_retirement_capacity_available() {
+                        native_limited = true;
+                        return false;
+                    }
+                    if confirmation.as_deref().is_some_and(|token| {
+                        !state.impact.as_ref().is_some_and(|choice| {
+                            choice.token == token
+                                && choice.pending.plan.plan_id == pending.plan.plan_id
+                                && choice.pending.plan.impact_digest == pending.plan.impact_digest
+                        })
+                    }) {
+                        return false;
+                    }
+                    pending.tailnet_suspended_token =
+                        self.suspend_tailnet_context(&pending.tailnet_bindings);
+                    state.pending = Some(pending.clone());
+                    state.restart = None;
+                    state.impact = None;
+                    true
+                })
+            })
+            .unwrap_or(false);
         if !admitted {
             let mut result = RuntimeApplyResult::status(if tailnet_limited {
                 "rejected"
             } else {
                 "conflict"
             });
+            if native_limited {
+                result.reasons.push(RuntimeApplyReason {
+                    code: "RESOURCE_LIMIT_EXCEEDED",
+                    path: "runtime.retirement".into(),
+                });
+            }
             if tailnet_limited {
                 result.reasons.push(RuntimeApplyReason {
                     code: "RESOURCE_LIMIT_EXCEEDED",
@@ -1256,7 +2177,12 @@ impl ProxyRuntime {
                     .acknowledge_regeneration_owner(&pending, operation)
                     .await
                 {
-                    Ok(operation) => self.settle_runtime_operation(&pending, operation),
+                    Ok(operation) => {
+                        self.settle_runtime_operation_with_physical_verification(
+                            &pending, operation,
+                        )
+                        .await
+                    }
                     Err(error) => *error,
                 }
             }
@@ -1323,7 +2249,12 @@ impl ProxyRuntime {
                             .acknowledge_regeneration_owner(&pending, operation)
                             .await
                         {
-                            Ok(operation) => self.settle_runtime_operation(&pending, operation),
+                            Ok(operation) => {
+                                self.settle_runtime_operation_with_physical_verification(
+                                    &pending, operation,
+                                )
+                                .await
+                            }
                             Err(error) => *error,
                         }
                     }
@@ -1426,6 +2357,228 @@ impl ProxyRuntime {
         }
     }
 
+    // Called only with a verified committed receipt or the exact, freshly
+    // authenticated NoOp Plan. Host work is reserved before R is published.
+    fn publish_prepared_runtime_candidate(
+        &self,
+        pending: &PendingOperation,
+        transaction_id: Option<&str>,
+        active: Option<daemon::RuntimeIdentity>,
+        control_revision: u64,
+        confirmation: Option<&str>,
+    ) -> Option<(bool, Option<u64>, Option<host_effects::HostEffectExecution>)> {
+        let mut committed_tailnet_token = None;
+        let mut tailnet_context_changed = false;
+        let mut host_execution = None;
+        let published = self.selector_reconcile.with_intent_claim(|intent| {
+            let _publication = self.gate.lock_generation_publication();
+            if intent != pending.intent
+                || self.gate.generation() != pending.generation
+                || self.gate.is_busy()
+                || !self.protected_runtime_publication_current(pending)
+            {
+                return false;
+            }
+            let Ok(mut current) = self.current_config.write() else {
+                return false;
+            };
+            let Ok(mut snapshot) = self.switch_snapshot.write() else {
+                return false;
+            };
+            let Ok(mut startup) = self.startup_snapshot.write() else {
+                return false;
+            };
+            let Ok(mut baseline) = self.runtime_config_baseline.write() else {
+                return false;
+            };
+            if !baseline.as_ref().is_some_and(|baseline| {
+                baseline.generation == pending.generation && baseline.pairing == pending.pairing
+            }) {
+                return false;
+            }
+            let Ok(mut binding_state) = self.runtime_binding_state.lock() else {
+                return false;
+            };
+            let running = current.as_ref().cloned().unwrap_or(Value::Null);
+            if transaction_id.is_none() {
+                let Ok(mut state) = self.runtime_config_apply.lock() else {
+                    return false;
+                };
+                if !state.host_only_preserves_pending_core(pending)
+                    || state.host.has_in_flight()
+                    || confirmation.is_some_and(|token| {
+                        !state.impact.as_ref().is_some_and(|choice| {
+                            choice.token == token
+                                && choice.running == running
+                                && choice.pending.plan.plan_id == pending.plan.plan_id
+                                && choice.pending.plan.impact_digest == pending.plan.impact_digest
+                        })
+                    })
+                {
+                    return false;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                if pending.plan.expires_at_unix_milli <= 0
+                    || pending.plan.expires_at_unix_milli as u128 <= now.as_millis()
+                {
+                    return false;
+                }
+                state.impact = None;
+                state.restart = None;
+            }
+            if let Some(plan) = pending
+                .host_plan
+                .as_ref()
+                .filter(|plan| !plan.effects.is_empty())
+            {
+                let execution = host_effects::HostEffectExecution {
+                    execution_id: uuid::Uuid::new_v4().to_string(),
+                    transaction_id: transaction_id.map(str::to_owned),
+                    generation: pending.generation,
+                    intent: pending.intent,
+                    plan: plan.clone(),
+                    desired: pending.candidate.clone(),
+                    core_active: active.clone(),
+                    core_control_revision: control_revision,
+                };
+                if !self.begin_runtime_host_execution(execution.clone(), &running) {
+                    return false;
+                }
+                host_execution = Some(execution);
+            }
+            self.coex
+                .commit_config(&mut current, pending.candidate.clone());
+            *snapshot = Some(Self::build_switch_snapshot(
+                &pending.typed,
+                &pending.generated,
+                &pending.deps,
+            ));
+            *startup = Some(pending.candidate.clone());
+            let protected_physical_root = baseline.as_ref().and_then(|previous| {
+                let owner = previous.protected_physical_root.as_ref()?;
+                if protected_generated_policy_compatible(&previous.generated, &pending.generated) {
+                    Some(Arc::clone(owner))
+                } else {
+                    // Core may replace TUN normally; the previous physical source
+                    // cannot attest the replacement's new kernel birth/policy.
+                    owner.revoke();
+                    None
+                }
+            });
+            *baseline = Some(RuntimeConfigBaseline {
+                management: baseline.as_ref().and_then(|b| b.management.clone()),
+                control: baseline.as_ref().and_then(|b| b.control.clone()),
+                api_epoch: baseline
+                    .as_ref()
+                    .map(|b| b.api_epoch.clone())
+                    .unwrap_or_default(),
+                api_saved_projection: pending
+                    .api_handoff
+                    .as_ref()
+                    .and_then(|h| h.published_projection())
+                    .or_else(|| {
+                        baseline
+                            .as_ref()
+                            .and_then(|baseline| baseline.api_saved_projection.clone())
+                    }),
+                api_log_handoff: baseline.as_ref().and_then(|b| b.api_log_handoff.clone()),
+                generation: pending.generation,
+                committed_transaction: transaction_id.map(str::to_owned).or_else(|| {
+                    baseline
+                        .as_ref()
+                        .and_then(|baseline| baseline.committed_transaction.clone())
+                }),
+                observed_active: active.clone(),
+                observed_control_revision: control_revision,
+                pairing: pending.pairing.clone(),
+                physical_route_config: pending.physical_route_config.clone(),
+                protected_physical_root,
+                deps: pending.deps.clone(),
+                generated: pending.generated.clone(),
+            });
+            if let Ok(mut status) = self.status.write() {
+                status.mixed_port = pending
+                    .generated
+                    .inbounds
+                    .iter()
+                    .find(|inbound| {
+                        inbound.tag == MIXED_INBOUND_TAG && inbound.type_field == "mixed"
+                    })
+                    .and_then(|inbound| inbound.listen_port)
+                    .unwrap_or(0);
+            }
+            binding_state.plan = pending.binding_plan.clone();
+            binding_state.explicit_unavailable = Default::default();
+            tailnet_context_changed =
+                self.activate_tailnet_context(pending.generation, pending.tailnet_bindings.clone());
+            committed_tailnet_token = self.tailnet_context().map(|context| context.token);
+            true
+        });
+        if !published {
+            return None;
+        }
+        Some((
+            tailnet_context_changed,
+            committed_tailnet_token,
+            host_execution,
+        ))
+    }
+
+    async fn settle_runtime_operation_with_physical_verification(
+        self: &Arc<Self>,
+        pending: &PendingOperation,
+        operation: daemon::RuntimeConfigOperation,
+    ) -> RuntimeApplyResult {
+        let committed = operation.state == daemon::RuntimeOperationState::Committed as i32
+            || operation.state == daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+        if !pending.published
+            && committed
+            && operation.contract_version == 1
+            && operation.transaction_id == pending.plan.transaction_id
+            && operation.candidate_digest == pending.plan.candidate_digest
+            && operation.impact_digest == pending.plan.impact_digest
+            && pending.protected_binding_plan.is_some()
+            && !self.verify_prepared_physical_bindings(pending).await
+        {
+            if let Some(owner) = pending.protected_physical_root.as_ref() {
+                owner.revoke();
+            }
+        }
+        // The original settlement records the verified Core fact even when
+        // current physical facts no longer permit App R publication.
+        self.settle_runtime_operation(pending, operation)
+    }
+
+    fn committed_runtime_without_publication(
+        &self,
+        pending: &PendingOperation,
+        operation: &daemon::RuntimeConfigOperation,
+        reason: &'static str,
+    ) -> RuntimeApplyResult {
+        if self.gate.generation() == pending.generation {
+            if let Ok(mut snapshot) = self.switch_snapshot.write() {
+                *snapshot = None;
+            }
+            self.selector_reconcile.mark_required();
+        }
+        let mut result = RuntimeApplyResult::status("unconfirmed");
+        result.core_state = Some("committed");
+        result.configuration_durable = Some(operation.durable);
+        result.persistence_mode = Some(operation.persistence_mode.clone());
+        result.retirement_state = Some(operation.retirement_state.clone());
+        result.transaction_id = Some(pending.plan.transaction_id.clone());
+        result.runtime_generation = Some(pending.generation);
+        result.selection_intent_generation = Some(pending.intent);
+        result.reasons.push(RuntimeApplyReason {
+            code: reason,
+            path: "runtime.publication".into(),
+        });
+        self.annotate_runtime_native_result(&mut result);
+        result
+    }
+
     fn settle_runtime_operation(
         self: &Arc<Self>,
         pending: &PendingOperation,
@@ -1493,6 +2646,54 @@ impl ProxyRuntime {
         {
             return RuntimeApplyResult::status("unconfirmed");
         }
+        // Record the verified Core fact even when a later App owner prevents R
+        // publication. This does not grant the old intent any new rights.
+        let mut observe_retirement = false;
+        let native_owner_retained;
+        {
+            let superseded = self.regeneration_owner_superseded(pending, &operation);
+            let _publication = self.gate.lock_generation_publication();
+            if let Ok(mut state) = self.runtime_config_apply.lock() {
+                // The exact receipt remains a native fact after a lifecycle
+                // gate bump, while publication and current K retain their CAS.
+                let owner_retained = (self.gate.generation() == pending.generation
+                    && self.core_running())
+                    || state.pending.as_ref().is_some_and(|original| {
+                        original.generation == pending.generation
+                            && original.intent == pending.intent
+                            && original.plan.transaction_id == pending.plan.transaction_id
+                    })
+                    || state
+                        .native_retirements
+                        .get(&operation.transaction_id)
+                        .is_some_and(|original| {
+                            original.receipt.generation == pending.generation
+                                && original.receipt.intent == pending.intent
+                        });
+                native_owner_retained = owner_retained;
+                if owner_retained {
+                    observe_retirement = state.observe_native_retirement(pending, &operation);
+                }
+                if owner_retained && self.gate.generation() == pending.generation {
+                    state.kernel = Some(RuntimeKernelReceipt {
+                        generation: pending.generation,
+                        intent: pending.intent,
+                        superseded,
+                        operation: operation.clone(),
+                    });
+                }
+            } else {
+                native_owner_retained = false;
+            }
+        }
+        if !native_owner_retained && self.gate.generation() != pending.generation {
+            // Real stop-success cleared custody. A late old callback cannot
+            // recreate native debt after that terminal ownership boundary.
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
+        }
+        if observe_retirement {
+            self.spawn_runtime_retirement_reconcile(pending, &operation);
+        }
         // The receipt proves kernel state, but obsolete local intent cannot publish R
         // over a newer owner. Consume terminal state without claiming local publication.
         if !self.selector_operation_is_current(pending.generation, pending.intent) {
@@ -1515,83 +2716,47 @@ impl ProxyRuntime {
                 }
                 self.selector_reconcile.mark_required();
             }
-            let mut result = RuntimeApplyResult::status("conflict");
-            if superseded {
-                result.persistence_mode = Some(operation.persistence_mode.clone());
-                result.reasons.push(RuntimeApplyReason {
-                    code: "OWNER_STATE_SUPERSEDED",
-                    path: "desired".into(),
-                });
+            let mut result = RuntimeKernelReceipt {
+                generation: pending.generation,
+                intent: pending.intent,
+                superseded,
+                operation: operation.clone(),
             }
+            .result();
+            result.status = "conflict";
+            result.ok = false;
+            result.pending_apply = true;
+            self.annotate_runtime_native_result(&mut result);
             return result;
         }
-        let mut committed_tailnet_token = None;
-        let mut tailnet_context_changed = false;
-        let published = pending.published
-            || self.selector_reconcile.with_intent_claim(|intent| {
-                let _publication = self.gate.lock_generation_publication();
-                if intent != pending.intent
-                    || self.gate.generation() != pending.generation
-                    || self.gate.is_busy()
-                {
-                    return false;
-                }
-                let Ok(mut current) = self.current_config.write() else {
-                    return false;
+        if !pending.published && !self.protected_runtime_publication_current(pending) {
+            return self.committed_runtime_without_publication(
+                pending,
+                &operation,
+                "PHYSICAL_ROUTE_FACTS_CHANGED",
+            );
+        }
+        let (tailnet_context_changed, committed_tailnet_token, host_execution) =
+            if pending.published {
+                (false, None, None)
+            } else {
+                let Some(publication) = self.publish_prepared_runtime_candidate(
+                    pending,
+                    Some(&pending.plan.transaction_id),
+                    operation.active.clone(),
+                    operation.control_revision,
+                    None,
+                ) else {
+                    return self.committed_runtime_without_publication(
+                        pending,
+                        &operation,
+                        "RUNTIME_PUBLICATION_UNCONFIRMED",
+                    );
                 };
-                let Ok(mut snapshot) = self.switch_snapshot.write() else {
-                    return false;
-                };
-                let Ok(mut startup) = self.startup_snapshot.write() else {
-                    return false;
-                };
-                let Ok(mut baseline) = self.runtime_config_baseline.write() else {
-                    return false;
-                };
-                if !baseline.as_ref().is_some_and(|baseline| {
-                    baseline.generation == pending.generation && baseline.pairing == pending.pairing
-                }) {
-                    return false;
-                }
-                let Ok(mut binding_state) = self.runtime_binding_state.lock() else {
-                    return false;
-                };
-                self.coex
-                    .commit_config(&mut current, pending.candidate.clone());
-                *snapshot = Some(Self::build_switch_snapshot(
-                    &pending.typed,
-                    &pending.generated,
-                    &pending.deps,
-                ));
-                *startup = Some(pending.candidate.clone());
-                *baseline = Some(RuntimeConfigBaseline {
-                    management: baseline.as_ref().and_then(|b| b.management.clone()),
-                    control: baseline.as_ref().and_then(|b| b.control.clone()),
-                    api_epoch: baseline
-                        .as_ref()
-                        .map(|b| b.api_epoch.clone())
-                        .unwrap_or_default(),
-                    api_saved_projection: pending
-                        .api_handoff
-                        .as_ref()
-                        .and_then(|h| h.published_projection()),
-                    api_log_handoff: baseline.as_ref().and_then(|b| b.api_log_handoff.clone()),
-                    generation: pending.generation,
-                    committed_transaction: Some(pending.plan.transaction_id.clone()),
-                    pairing: pending.pairing.clone(),
-                    physical_route_config: pending.physical_route_config.clone(),
-                    deps: pending.deps.clone(),
-                    generated: pending.generated.clone(),
-                });
-                binding_state.plan = pending.binding_plan.clone();
-                binding_state.explicit_unavailable = Default::default();
-                tailnet_context_changed = self
-                    .activate_tailnet_context(pending.generation, pending.tailnet_bindings.clone());
-                committed_tailnet_token = self.tailnet_context().map(|context| context.token);
-                true
-            });
-        if !published {
-            return RuntimeApplyResult::status("conflict");
+                publication
+            };
+        if let Some(execution) = host_execution {
+            self.spawn_runtime_host_effects(execution);
         }
         if !pending.published {
             if tailnet_context_changed {
@@ -1603,7 +2768,9 @@ impl ProxyRuntime {
             let mut evidence = pending.mesh_evidence.clone();
             evidence.tailnet_token = committed_tailnet_token;
             self.publish_mesh_route_runtime_receipt(evidence);
-            self.spawn_runtime_retirement_reconcile(pending, &operation);
+            if operation.retirement_state == "DRAINED" {
+                self.spawn_runtime_retirement_reconcile(pending, &operation);
+            }
         }
         // The provider accepted reload bytes, but a newer durably saved D is
         // authoritative for the next App bootstrap. Keep the old kernel receipt
@@ -1612,13 +2779,18 @@ impl ProxyRuntime {
         if self.regeneration_owner_superseded(pending, &operation) {
             if let Ok(mut state) = self.runtime_config_apply.lock() {
                 state.pending = None;
+                if let Some(kernel) = state.kernel.as_mut() {
+                    kernel.superseded = true;
+                }
             }
-            let mut result = RuntimeApplyResult::status("conflict");
-            result.persistence_mode = Some(operation.persistence_mode.clone());
-            result.reasons.push(RuntimeApplyReason {
-                code: "OWNER_STATE_SUPERSEDED",
-                path: "desired".into(),
-            });
+            let mut result = RuntimeKernelReceipt {
+                generation: pending.generation,
+                intent: pending.intent,
+                superseded: true,
+                operation: operation.clone(),
+            }
+            .result();
+            self.annotate_runtime_native_result(&mut result);
             return result;
         }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
@@ -1643,7 +2815,119 @@ impl ProxyRuntime {
             },
         );
         result.persistence_mode = Some(operation.persistence_mode);
+        result.core_state = Some("committed");
+        result.configuration_durable = Some(
+            operation.durable && operation.state == daemon::RuntimeOperationState::Committed as i32,
+        );
+        result.retirement_state = Some(operation.retirement_state);
+        self.annotate_runtime_native_result(&mut result);
         result
+    }
+
+    async fn execute_runtime_host_only(
+        self: &Arc<Self>,
+        client: &SingBoxApiClient,
+        pending: PendingOperation,
+        confirmation: Option<&str>,
+    ) -> RuntimeApplyResult {
+        let runtime = Arc::clone(self);
+        let desired = pending.desired.clone();
+        let durable = tokio::task::spawn_blocking(move || {
+            runtime
+                .config
+                .with_durable_runtime_owner(&desired, |_, _| ())
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        if !durable {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        let capabilities = match paired_runtime_capabilities(client, &pending.pairing).await {
+            Ok(capabilities) => capabilities,
+            Err(result) => return self.remember_runtime_result(*result),
+        };
+        let baseline_matches = self.runtime_config_baseline.read().is_ok_and(|baseline| {
+            baseline.as_ref().is_some_and(|baseline| {
+                baseline.generation == pending.generation
+                    && baseline.pairing == pending.pairing
+                    && self.status.read().is_ok_and(|status| {
+                        status.mixed_port
+                            == baseline
+                                .generated
+                                .inbounds
+                                .iter()
+                                .find(|inbound| {
+                                    inbound.tag == MIXED_INBOUND_TAG
+                                        && inbound.type_field == "mixed"
+                                })
+                                .and_then(|inbound| inbound.listen_port)
+                                .unwrap_or(0)
+                    })
+            })
+        });
+        if !pending.plan.no_op
+            || pending.api_handoff.is_some()
+            || !baseline_matches
+            || !capabilities.connected_hot_enabled
+            || !identity_equal(capabilities.active.as_ref(), pending.plan.expected.as_ref())
+            || capabilities.control_revision != pending.plan.expected_control_revision
+            || pending
+                .plan
+                .expected
+                .as_ref()
+                .is_none_or(|identity| identity.effective_digest != pending.plan.candidate_digest)
+            || pending.host_plan.as_ref().is_none_or(|plan| {
+                plan.strategy != host_effects::HostEffectStrategy::HostOnly
+                    || !self.runtime_host_facts_match(plan)
+            })
+        {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        // No ApplyRuntimeConfig and no invented RuntimeConfigOperation: this is
+        // the already active graph observed by the original NoOp Plan and CAS.
+        if !self.verify_prepared_physical_bindings(&pending).await {
+            let mut result = RuntimeApplyResult::status("unconfirmed");
+            result.core_state = Some("unchanged");
+            return self.remember_runtime_result(result);
+        }
+        let publication = self
+            .config
+            .try_with_saved_commit(|desired| {
+                (desired == &pending.desired)
+                    .then(|| {
+                        self.publish_prepared_runtime_candidate(
+                            &pending,
+                            None,
+                            capabilities.active.clone(),
+                            capabilities.control_revision,
+                            confirmation,
+                        )
+                    })
+                    .flatten()
+            })
+            .ok()
+            .flatten();
+        let Some((tailnet_changed, tailnet_token, execution)) = publication else {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        };
+        if tailnet_changed {
+            self.restart_tailnet_relay_if_active(pending.generation);
+        }
+        let mut evidence = pending.mesh_evidence.clone();
+        evidence.tailnet_token = tailnet_token;
+        self.publish_mesh_route_runtime_receipt(evidence);
+        if let Some(execution) = execution {
+            self.spawn_runtime_host_effects(execution);
+        }
+        let mut result = RuntimeApplyResult::status("hotApplied");
+        result.core_state = Some("unchanged");
+        result.configuration_durable = Some(true);
+        result.runtime_generation = Some(pending.generation);
+        result.selection_intent_generation = Some(pending.intent);
+        // The private Plan transaction stays unused; IPC identifies host work
+        // solely by its execution id. No Core persistence callback is fabricated.
+        self.remember_runtime_result(result)
     }
 
     fn regeneration_owner_superseded(
@@ -1669,6 +2953,68 @@ impl ProxyRuntime {
         })
     }
 
+    /// Fresh observation is bound to the original native owner, independent of
+    /// state.pending's (possibly newer) durable-D transaction and current intent.
+    async fn refresh_runtime_native_retirement(
+        self: &Arc<Self>,
+        original: NativeRetirementObservation,
+    ) -> RuntimeApplyResult {
+        let generation = original.receipt.generation;
+        if !self.core_running() {
+            return RuntimeApplyResult::status("unconfirmed");
+        }
+        let Ok(client) = self.runtime_management_client(generation).await else {
+            return RuntimeApplyResult::status("unconfirmed");
+        };
+        if let Err(error) = paired_runtime_capabilities(&client, &original.pairing).await {
+            return *error;
+        }
+        if listener_retirement_failed(&original.receipt.operation)
+            || original.receipt.operation.retirement_state == "DRAINED"
+        {
+            // No repeated native cleanup or mutable status can discharge firstproof.
+            return self
+                .runtime_config_apply
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .native_retirements
+                        .get(&original.receipt.operation.transaction_id)
+                        .filter(|registered| {
+                            registered.receipt.generation == generation
+                                && registered.receipt.intent == original.receipt.intent
+                                && registered.pairing == original.pairing
+                        })
+                        .map(|registered| registered.receipt.result())
+                })
+                .unwrap_or_else(|| RuntimeApplyResult::status("conflict"));
+        }
+        let Some(expected) = original.receipt.operation.before.as_ref() else {
+            return RuntimeApplyResult::status("unconfirmed");
+        };
+        let status = match client
+            .get_runtime_config_status(daemon::RuntimeConfigStatusRequest {
+                contract_version: 1,
+                transaction_id: original.receipt.operation.transaction_id.clone(),
+                runtime_incarnation: expected.incarnation.clone(),
+            })
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => return RuntimeApplyResult::status("unconfirmed"),
+        };
+        let result = {
+            let _publication = self.gate.lock_generation_publication();
+            self.runtime_config_apply
+                .lock()
+                .ok()
+                .and_then(|mut state| state.refresh_native_retirement(&original, &status))
+        };
+        self.push_pending_changes();
+        result.unwrap_or_else(|| RuntimeApplyResult::status("unconfirmed"))
+    }
+
     /// Deferred node-state deletion waits for the kernel's old graph retirement,
     /// independently of durable config success. Never infer DRAINED from COMMITTED.
     fn spawn_runtime_retirement_reconcile(
@@ -1687,16 +3033,26 @@ impl ProxyRuntime {
         let initial = operation.retirement_state.clone();
         let candidate = pending.candidate.clone();
         let scope = pending.deletion_scope.clone();
-        if scope.is_empty() {
-            return;
-        }
+        // An empty deletion scope does not end native listener observation.
+        // PENDING can acquire the first fixed UNKNOWN proof after K/D settle.
         tokio::spawn(async move {
             let mut retirement = initial;
             loop {
-                if me.gate.generation() != generation || !me.core_running() {
+                let retained = me.runtime_config_apply.lock().is_ok_and(|state| {
+                    state
+                        .native_retirements
+                        .get(&transaction_id)
+                        .is_some_and(|original| {
+                            original.receipt.generation == generation && original.pairing == pairing
+                        })
+                });
+                if !retained && retirement != "DRAINED" {
                     return;
                 }
                 if retirement == "DRAINED" {
+                    if scope.is_empty() {
+                        return;
+                    }
                     let _serial = me.switch_serial.lock().await;
                     if me.verify_cached_runtime_pairing(generation).await.is_err() {
                         return;
@@ -1721,12 +3077,15 @@ impl ProxyRuntime {
                     }
                     return;
                 }
-                if retirement != "PENDING" {
+                if !matches!(retirement.as_str(), "PENDING" | "DRAINING") {
                     return;
                 }
                 tokio::select! {
-                    _ = me.gen_changed.notified() => { if me.gate.generation() != generation { return; } }
+                    _ = me.gen_changed.notified() => {}
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
+                if !me.core_running() {
+                    continue;
                 }
                 let Ok(client) = me.runtime_management_client(generation).await else {
                     continue;
@@ -1752,7 +3111,7 @@ impl ProxyRuntime {
                                 active.incarnation == expected.incarnation
                             }) =>
                     {
-                        let Some(operation) = status.operation else {
+                        let Some(operation) = status.operation.clone() else {
                             return;
                         };
                         if operation.transaction_id != transaction_id
@@ -1762,7 +3121,25 @@ impl ProxyRuntime {
                         {
                             return;
                         }
-                        retirement = operation.retirement_state;
+                        let observed = {
+                            let _publication = me.gate.lock_generation_publication();
+                            me.runtime_config_apply.lock().ok().and_then(|mut state| {
+                                let original =
+                                    state.native_retirements.get(&transaction_id)?.clone();
+                                state.refresh_native_retirement(
+                                    &original,
+                                    &daemon::RuntimeConfigStatus {
+                                        operation: Some(operation.clone()),
+                                        ..status
+                                    },
+                                )
+                            })
+                        };
+                        let Some(observed) = observed else {
+                            return;
+                        };
+                        retirement = observed.retirement_state.unwrap_or_default();
+                        me.push_pending_changes();
                     }
                     Ok(_) => return, // Expired/unknown receipts leave the journal intact.
                     Err(_) => continue,
@@ -1785,7 +3162,7 @@ impl ProxyRuntime {
                 .ok()
                 .and_then(|mut state| state.restart.take());
             let Some(choice) = choice.filter(|choice| choice.token == token) else {
-                return RuntimeApplyResult::status("conflict");
+                return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
             };
             let baseline = self
                 .runtime_config_baseline
@@ -1851,15 +3228,15 @@ impl ProxyRuntime {
             true
         });
         if !accepted {
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         }
         self.schedule_restart_for_generation(choice.generation);
         let mut result = RuntimeApplyResult::status("applied");
         result.apply_id = Some(id);
-        result
+        self.runtime_native_result(result)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "native-production-verification"))]
     pub(super) fn restart_choice_for_test(&self) -> RuntimeApplyResult {
         let candidate = self.config.current().expect("test desired configuration");
         self.restart_choice(
@@ -1920,26 +3297,30 @@ impl ProxyRuntime {
             // result without invoking any callback or applying a different graph.
             if self.core_running() && !self.gate.is_busy() {
                 if let Some(result) = self.runtime_config_apply.lock().ok().and_then(|state| {
+                    let cached = state.core_receipt_for(&transaction_id, self.gate.generation())?;
                     terminal_persistence_receipt(
-                        state.last.as_ref(),
+                        Some(&cached),
                         &transaction_id,
                         self.gate.generation(),
                         self.selector_reconcile.intent_generation(),
                     )
                 }) {
                     let Some(generation) = result.runtime_generation else {
-                        return RuntimeApplyResult::status("unconfirmed");
+                        return self
+                            .runtime_native_result(RuntimeApplyResult::status("unconfirmed"));
                     };
                     if let Err(error) = self.verify_cached_runtime_pairing(generation).await {
-                        return *error;
+                        return self.runtime_native_result(*error);
                     }
+                    let mut result = result;
+                    self.annotate_runtime_host_result(&mut result);
                     return result;
                 }
             }
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         };
         if pending.plan.transaction_id != transaction_id {
-            return RuntimeApplyResult::status("conflict");
+            return self.runtime_native_result(RuntimeApplyResult::status("conflict"));
         }
         let mut result = self.retry_runtime_persistence_inner(&pending).await;
         result.transaction_id = Some(transaction_id);
@@ -2033,13 +3414,39 @@ impl ProxyRuntime {
             .acknowledge_regeneration_owner(pending, operation)
             .await
         {
-            Ok(operation) => self.settle_runtime_operation(pending, operation),
+            Ok(operation) => {
+                self.settle_runtime_operation_with_physical_verification(pending, operation)
+                    .await
+            }
             Err(error) => *error,
         }
     }
 
-    /// Read-only reconciliation of the original transaction. Never replans or
-    /// reapplies; suitable for a bounded UI poll while durability is pending.
+    /// Explicit native-retirement observation is separate from ordinary D/Core
+    /// status recovery. It never acknowledges persistence or publishes R, even
+    /// when the same original transaction still has an active D owner.
+    pub(crate) async fn runtime_native_retirement_status(
+        self: &Arc<Self>,
+        transaction_id: String,
+    ) -> RuntimeApplyResult {
+        let _serial = self.switch_serial.lock().await;
+        let original = self
+            .runtime_config_apply
+            .lock()
+            .ok()
+            .and_then(|state| state.native_retirements.get(&transaction_id).cloned());
+        let mut result = match original {
+            Some(original) => self.refresh_runtime_native_retirement(original).await,
+            None => RuntimeApplyResult::status("conflict"),
+        };
+        result.transaction_id = Some(transaction_id);
+        self.annotate_runtime_host_result(&mut result);
+        result
+    }
+
+    /// Reconcile the original D/Core owner without replanning or resubmitting
+    /// Apply. The established app-authoritative owner acknowledgement remains
+    /// automatic when its original provider callback becomes ready.
     pub(crate) async fn runtime_apply_status(
         self: &Arc<Self>,
         transaction_id: String,
@@ -2048,6 +3455,7 @@ impl ProxyRuntime {
             .runtime_apply_status_inner(transaction_id.clone())
             .await;
         result.transaction_id = Some(transaction_id);
+        self.annotate_runtime_host_result(&mut result);
         result
     }
 
@@ -2064,17 +3472,29 @@ impl ProxyRuntime {
             .lock()
             .ok()
             .and_then(|state| state.pending.clone());
+        let original = self
+            .runtime_config_apply
+            .lock()
+            .ok()
+            .and_then(|state| state.native_retirements.get(&transaction_id).cloned());
+        // An original active D owner must keep its established automatic
+        // acknowledgement path, independently of sticky native UNKNOWN. Only
+        // the explicit native-only entry above may bypass that D recovery.
+        if let Some(original) = original.filter(|_| {
+            pending.as_ref().is_none_or(|pending| {
+                pending.plan.transaction_id != transaction_id
+                    || pending.generation != self.gate.generation()
+            })
+        }) {
+            return self.refresh_runtime_native_retirement(original).await;
+        }
         let Some(pending) = pending else {
             let generation = self.gate.generation();
             let cached = self
                 .runtime_config_apply
                 .lock()
                 .ok()
-                .and_then(|state| state.last.clone())
-                .filter(|result| {
-                    result.transaction_id.as_deref() == Some(transaction_id.as_str())
-                        && result.runtime_generation == Some(generation)
-                });
+                .and_then(|state| state.core_receipt_for(&transaction_id, generation));
             let Some(cached) = cached else {
                 return RuntimeApplyResult::status("conflict");
             };
@@ -2104,15 +3524,15 @@ impl ProxyRuntime {
         match result.status {
             "hotApplied" | "hotDurabilityPending" => SwitchOutcome::HotSwitched,
             "skipped" => SwitchOutcome::NotRunning,
-            "conflict" | "unconfirmed" => SwitchOutcome::Pending,
+            "conflict" | "unconfirmed" | "nativeCleanupUnknown" => SwitchOutcome::Pending,
             _ => SwitchOutcome::Deferred,
         }
     }
 }
 
-/// Preview only. Kernel Plan remains authoritative; presence of a TUN/cache
-/// field is never enough. These are changed physical host/service controls.
-pub(super) fn structural_runtime_change(old: &Value, new: &Value) -> bool {
+/// Preview of changed host/service controls, not mere TUN/cache presence.
+/// Core changes still use Kernel Plan; host DNS needs application-managed restart.
+pub(super) fn structural_runtime_change(old: &Value, new: &Value, platform: Platform) -> bool {
     [
         "proxyModeType",
         "tunConfig",
@@ -2123,7 +3543,36 @@ pub(super) fn structural_runtime_change(old: &Value, new: &Value) -> bool {
     ]
     .iter()
     .any(|key| old.get(*key) != new.get(*key))
+        || super::dns_takeover::host_dns_takeover_changed(platform, old, new)
 }
 
 #[cfg(test)]
 mod tests;
+
+impl ProxyRuntime {
+    pub(super) fn runtime_pairing_for_capability(&self, generation: u64) -> Option<RuntimePairing> {
+        self.runtime_config_baseline
+            .read()
+            .ok()?
+            .as_ref()
+            .filter(|b| b.generation == generation)
+            .map(|b| b.pairing.clone())
+    }
+}
+
+#[cfg(feature = "native-production-verification")]
+impl ProxyRuntime {
+    pub(super) fn restart_choice_for_native_verification(&self) -> RuntimeApplyResult {
+        self.restart_choice_for_test()
+    }
+    pub(super) async fn apply_confirmed_for_native_verification(
+        self: &Arc<Self>,
+    ) -> (&'static str, Option<u64>) {
+        let choice = self.restart_choice_for_native_verification();
+        let result = match choice.restart_confirmation {
+            Some(token) => self.apply_pending_transaction(Some(token)).await,
+            None => choice,
+        };
+        (result.status, result.apply_id)
+    }
+}

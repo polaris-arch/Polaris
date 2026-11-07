@@ -54,6 +54,31 @@ test('ordinary Windows publishing consumes the complete static gate after one bu
 
 });
 
+test('Windows prepares the full locked native App closure before the offline first producer', () => {
+  const source = readFileSync(new URL('../.github/workflows/package.yml', import.meta.url), 'utf8');
+  const cache = source.indexOf('      - name: Setup Rust cache');
+  const prefetch = source.indexOf('      - name: Prefetch locked Windows App dependencies');
+  const freeze = source.indexOf('python scripts/windows-package-integrity.py prepare');
+  const produce = source.indexOf('python scripts/windows-package-integrity.py produce');
+  assert.ok(cache >= 0 && cache < prefetch && prefetch < freeze && freeze < produce);
+  const step = source.slice(prefetch, source.indexOf('      - name:', prefetch + 1));
+  assert.match(step, /if: runner\.os == 'Windows'\n/);
+  assert.match(step, /Get-Command cargo -CommandType Application/);
+  assert.match(step, /GetFullPath\(\$env:CARGO\) -ne \$cargo/);
+  assert.match(step, /\$target = '\$\{\{ matrix\.rust_target \}\}'/);
+  assert.match(step, /\$cargoInfo -notcontains "host: \$target"/);
+  assert.match(step, /\$env:CARGO_BUILD_TARGET -ne \$target/);
+  assert.match(step, /Push-Location src-tauri[\s\S]*finally \{ Pop-Location \}/);
+  assert.match(step, /& \$cargo fetch --locked --target \$target --manifest-path Cargo\.toml\n\s+if \(\$LASTEXITCODE -ne 0\) \{ throw/);
+  assert.match(step, /& \$cargo metadata --locked --offline --format-version=1 --manifest-path Cargo\.toml --features tauri\/custom-protocol --filter-platform \$target > \$null\n\s+if \(\$LASTEXITCODE -ne 0\) \{ throw/);
+  assert.match(step, /"CARGO=\$cargo" \| Out-File -FilePath \$env:GITHUB_ENV/);
+  assert.doesNotMatch(step, /--no-deps|--no-default-features|continue-on-error|cargo (?:build|check)|\$env:(?:CARGO_HOME|RUSTUP_HOME|CARGO_TARGET_DIR|CARGO_BUILD_TARGET)\s*=/);
+  // Keep one true compiler invocation offline; cache preparation is not a build
+  // or a replacement artifact/identity gate.
+  const producer = readFileSync(new URL('./windows-package-integrity.py', import.meta.url), 'utf8');
+  assert.match(producer, /argv\.extend\(\['--', '--locked', '--offline', '--message-format=json'\]\)/);
+});
+
 test('mobile version diagnostics consume the validated formal contract in both normal Android jobs', () => {
   const source = readFileSync(new URL('../.github/workflows/android.yml', import.meta.url), 'utf8');
   const steps = [...source.matchAll(/      - name: Resolve bundled core version\n([\s\S]*?)(?=      - name:)/g)];

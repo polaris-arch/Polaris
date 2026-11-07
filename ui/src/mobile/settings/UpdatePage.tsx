@@ -513,19 +513,13 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
               {/* 「跳过此版本」（桌面 `AppUpdateCard.tsx:144` 那一颗）。后端 `update_skip` 把版本号
                   持久化进 updater state，`update_check` 的第四道闸据此过滤 —— 两端同一条腿。
                   IPC 调用**内联在 `commit` 的实参里**：失败必须落成这一行下面的红字（裁定 #14），
-                  而 `update_skip` 回的是 `{success}` 信封、不抛，故这里显式把 `false` 折成一次
-                  reject —— 不然「跳过失败」会安静地长成「跳过成功」。 */}
+                  IPC 解包后的成功返回值为 void；仅成功后更新会话，拒绝仍保留重试入口。 */}
               {foundVersion !== null && !versionSkipped && (
                 <MobileButton
                   onClick={() => {
                     commit(
                       'app-update',
-                      updateApi.skip(foundVersion).then((result) => {
-                        /* 🔴 **不编一条 message**：`failureText` 会把 `err.message` 原样当成
-                           「原因」贴进那一行的红字里，而后端这一档并没有给原因 —— 编一句英文
-                           出来既是开发者信息外露（元规则 #5），也是在替后端造一个它没说过的事实。
-                           空 message ⇒ 走 `plain` 那支，界面上是「跳过此版本失败。」。 */
-                        if (!result.success) throw new Error();
+                      updateApi.skip(foundVersion).then(() => {
                         markAppVersionSkipped(foundVersion);
                       }),
                       (err) =>

@@ -551,7 +551,7 @@ pub mod code {
 /// 本码也表示「装着但太旧」（见 [`code::HELPER_NOT_INSTALLED`]），故文案两种情形都要说到，动作
 /// 也是两个：安装，或升级。
 pub const HELPER_NOT_INSTALLED_MSG: &str =
-    "TUN 模式需要提权 helper，但 helper 尚未安装或版本过旧。请到「设置 › Helper」安装或升级后重试。";
+    "当前内核执行需要系统助手，但助手尚未安装或版本过旧。请到「设置 › Helper」安装或升级后重试。";
 
 /// [`code::HELPER_GATE_ABORTED`] 的用户可见兜底文案（zh）。渲染端另有 i18n key
 /// (`errors.helperGateAborted`) 覆写多语，此常量为无 emitter / 极早期失败时的兜底。
@@ -2221,3 +2221,9 @@ pub(crate) async fn temp_tls_fingerprint_capabilities() -> crate::runtime::tls_f
 {
     android_bridge::tls_fingerprint_capabilities().await
 }
+
+#[cfg(desktop)]
+#[cfg(feature = "native-production-verification")]
+#[cfg(debug_assertions)]
+#[path = "../native_verification/proxy_carrier.rs"]
+pub(crate) mod native_verification;

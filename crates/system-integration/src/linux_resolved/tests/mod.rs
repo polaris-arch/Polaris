@@ -194,3 +194,336 @@ fn failed_takeover_and_failed_revert_preserve_recovery_marker() {
     controller.restore().unwrap();
     assert!(!controller.has_marker());
 }
+
+fn exact_snapshot() -> Snapshot {
+    Snapshot {
+        pid: 77,
+        birth: "01".repeat(16),
+        link: polaris_helper_proto::linux_dns::LinkIdentity {
+            ifindex: 8,
+            sysfs_device: 1,
+            sysfs_inode: 80,
+            netns_inode: 9,
+            tun_flags: 1,
+        },
+        settings: Settings {
+            servers: vec![],
+            domains: vec![],
+            default_route: false,
+            dnssec: "no".into(),
+            dns_over_tls: "no".into(),
+        },
+        original: None,
+        owned: false,
+        cleanup_pending: false,
+    }
+}
+
+struct CheckedOps {
+    state: Mutex<Snapshot>,
+    calls: Mutex<Vec<bool>>,
+    no_change: bool,
+    partial_set: bool,
+    fail_restore: bool,
+    gone: bool,
+}
+
+impl CheckedOps {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(exact_snapshot()),
+            calls: Mutex::new(vec![]),
+            no_change: false,
+            partial_set: false,
+            fail_restore: false,
+            gone: false,
+        }
+    }
+}
+
+impl LinuxResolvedOps for CheckedOps {
+    fn takeover(&self) -> Result<(), String> {
+        panic!("exact effects cannot downgrade to legacy SET")
+    }
+    fn revert(&self) -> Result<(), String> {
+        panic!("exact effects cannot downgrade to legacy REVERT")
+    }
+    fn snapshot(&self) -> Result<Snapshot, String> {
+        if self.gone {
+            Err("native link gone".into())
+        } else {
+            Ok(self.state.lock().unwrap().clone())
+        }
+    }
+    fn compare(&self, expected: &Snapshot, enabled: bool) -> Result<Change, String> {
+        if !enabled && self.gone {
+            return Ok(Change::Gone(polaris_helper_proto::linux_dns::Gone {
+                pid: expected.pid,
+                birth: expected.birth.clone(),
+                link: expected.link.clone(),
+            }));
+        }
+        let mut state = self.state.lock().unwrap();
+        if self.no_change || &*state != expected {
+            return Ok(Change::NoChange);
+        }
+        self.calls.lock().unwrap().push(enabled);
+        if enabled {
+            if state.original.is_none() {
+                state.original = Some(state.settings.clone());
+            }
+            state.owned = true;
+            state.settings.servers = vec![CONTROLLED_DNS_IP.into()];
+            if self.partial_set {
+                state.cleanup_pending = true;
+                return Err("partial DNS write".into());
+            }
+            state.settings.domains = vec!["~.".into()];
+            state.settings.default_route = true;
+            state.settings.dnssec = "no".into();
+            state.settings.dns_over_tls = "no".into();
+        } else {
+            if self.fail_restore {
+                state.cleanup_pending = true;
+                return Err("restore unavailable".into());
+            }
+            state.settings = state.original.take().ok_or("missing original settings")?;
+            state.owned = false;
+        }
+        state.cleanup_pending = false;
+        Ok(Change::Changed(Box::new(state.clone())))
+    }
+}
+
+fn checked_controller() -> LinuxResolvedController<CheckedOps, MemFs> {
+    LinuxResolvedController::new(CheckedOps::new(), MemFs::new(), "/exact-linux-dns.json")
+}
+
+#[test]
+fn linux_live_prepare_is_read_only_and_checked_set_restore_preserve_original_scope() {
+    let mut c = checked_controller();
+    let before = c.ops.state.lock().unwrap().clone();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert!(c.ops.calls.lock().unwrap().is_empty());
+    assert!(!c.has_marker());
+    assert_eq!(prepared.before(), &before);
+    assert_ne!(prepared.before_facts(), prepared.target_facts());
+    let result = c.apply_effect(&prepared, "linux-owner");
+    assert_eq!(result.outcome, TakeoverOutcome::Applied);
+    assert_eq!(
+        c.exact_marker_operation_id().as_deref(),
+        Some("linux-owner")
+    );
+    assert!(c.ops.state.lock().unwrap().settings.controlled());
+    let unchanged = c.prepare_effect(true).unwrap();
+    assert_eq!(unchanged.before_facts(), unchanged.target_facts());
+    assert_eq!(
+        c.apply_effect(&unchanged, "not-a-new-owner").outcome,
+        TakeoverOutcome::Unchanged
+    );
+    assert_eq!(
+        c.exact_marker_operation_id().as_deref(),
+        Some("linux-owner")
+    );
+    c.restore().unwrap();
+    assert!(!c.has_marker());
+    assert_eq!(*c.ops.state.lock().unwrap(), before);
+    assert_eq!(*c.ops.calls.lock().unwrap(), [true, false]);
+}
+
+#[test]
+fn linux_live_birth_link_and_settings_drift_reject_before_native_mutation() {
+    for field in ["birth", "link", "settings"] {
+        let mut c = checked_controller();
+        let prepared = c.prepare_effect(true).unwrap();
+        {
+            let mut state = c.ops.state.lock().unwrap();
+            match field {
+                "birth" => state.birth = "02".repeat(16),
+                "link" => state.link.sysfs_inode += 1,
+                _ => state.settings.servers = vec!["9.9.9.9".into()],
+            }
+        }
+        assert_eq!(
+            c.apply_effect(&prepared, "stale-plan").outcome,
+            TakeoverOutcome::Superseded
+        );
+        assert!(c.ops.calls.lock().unwrap().is_empty());
+        assert!(!c.has_marker());
+    }
+}
+
+#[test]
+fn linux_typed_no_write_rejection_restores_marker_without_claiming_application() {
+    let mut c = checked_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    c.ops.no_change = true;
+    let result = c.apply_effect(&prepared, "no-write");
+    assert_eq!(result.outcome, TakeoverOutcome::Superseded);
+    assert!(!result.cleanup_pending);
+    assert_eq!(*c.ops.state.lock().unwrap(), exact_snapshot());
+    assert!(c.ops.calls.lock().unwrap().is_empty());
+    assert!(!c.has_marker());
+}
+
+#[test]
+fn linux_partial_write_and_failed_restore_retain_exact_recovery_phase_then_explicit_retry() {
+    let mut c = checked_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    c.ops.partial_set = true;
+    c.ops.fail_restore = true;
+    assert_eq!(
+        c.apply_effect(&prepared, "partial-owner").outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    let raw = c.raw().unwrap().unwrap();
+    let marker = LiveDnsMarker::parse(&raw).unwrap().unwrap();
+    assert_eq!(marker.host_effect.operation_id, "partial-owner");
+    assert_eq!(marker.host_effect.original, exact_snapshot().settings);
+    assert_eq!(
+        c.reconcile_checked().unwrap().unwrap().outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    let calls_before = c.ops.calls.lock().unwrap().clone();
+    let state_before = c.ops.state.lock().unwrap().clone();
+    let raw_before = c.raw().unwrap().unwrap();
+    let retry = c.prepare_effect(true).unwrap();
+    assert!(retry.needs_prior_restore());
+    assert_eq!(
+        retry.prior_marker_operation_id().as_deref(),
+        Some("partial-owner")
+    );
+    assert!(c.checked_owned_receipt().unwrap().is_none());
+    let rejected = c.apply_effect(&retry, "must-not-replace-partial");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("partial-owner"));
+    assert!(rejected.cleanup_pending);
+    assert_eq!(*c.ops.calls.lock().unwrap(), calls_before);
+    assert_eq!(*c.ops.state.lock().unwrap(), state_before);
+    assert_eq!(c.raw().unwrap().unwrap(), raw_before);
+    assert!(c.prepare_after_restore(&retry).is_err());
+    assert!(c.restore().is_err());
+    assert_eq!(
+        c.exact_marker_operation_id().as_deref(),
+        Some("partial-owner")
+    );
+    assert!(c.has_marker());
+    c.ops.partial_set = false;
+    c.ops.fail_restore = false;
+    c.restore().unwrap();
+    assert!(!c.has_marker());
+    assert_eq!(*c.ops.state.lock().unwrap(), exact_snapshot());
+    for field in ["birth", "link", "settings"] {
+        {
+            let mut state = c.ops.state.lock().unwrap();
+            match field {
+                "birth" => state.birth = "02".repeat(16),
+                "link" => state.link.sysfs_inode += 1,
+                _ => state.settings.servers = vec!["9.9.9.9".into()],
+            }
+        }
+        assert!(c.prepare_after_restore(&retry).is_err(), "{field}");
+        assert!(!c.has_marker());
+        *c.ops.state.lock().unwrap() = exact_snapshot();
+    }
+    let next = c.prepare_after_restore(&retry).unwrap();
+    assert_eq!(
+        c.apply_effect(&next, "replacement-owner").outcome,
+        TakeoverOutcome::Applied
+    );
+    assert_eq!(
+        c.exact_marker_operation_id().as_deref(),
+        Some("replacement-owner")
+    );
+    assert!(c.ops.state.lock().unwrap().settings.controlled());
+}
+
+#[test]
+fn linux_partial_cleanup_followed_by_no_change_cannot_restore_a_false_owned_marker() {
+    let mut c = checked_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    c.ops.partial_set = true;
+    c.ops.fail_restore = true;
+    assert_eq!(
+        c.apply_effect(&prepared, "first").outcome,
+        TakeoverOutcome::RecoveryPending
+    );
+    c.ops.partial_set = false;
+    c.ops.fail_restore = false;
+    let retry = c.prepare_effect(true).unwrap();
+    assert!(retry.needs_prior_restore());
+    let raw_before = c.raw().unwrap().unwrap();
+    let state_before = c.ops.state.lock().unwrap().clone();
+    let calls_before = c.ops.calls.lock().unwrap().clone();
+    let rejected = c.apply_effect(&retry, "must-not-replace-first");
+    assert_eq!(rejected.outcome, TakeoverOutcome::RecoveryPending);
+    assert_eq!(rejected.marker_id.as_deref(), Some("first"));
+    assert!(rejected.cleanup_pending);
+    assert_eq!(c.raw().unwrap().unwrap(), raw_before);
+    assert_eq!(*c.ops.state.lock().unwrap(), state_before);
+    assert_eq!(*c.ops.calls.lock().unwrap(), calls_before);
+    assert!(c.checked_owned_receipt().unwrap().is_none());
+    c.restore().unwrap();
+    let next = c.prepare_after_restore(&retry).unwrap();
+    c.ops.no_change = true;
+    assert_eq!(
+        c.apply_effect(&next, "replacement").outcome,
+        TakeoverOutcome::Superseded
+    );
+    assert!(!c.has_marker());
+    assert!(!c.ops.state.lock().unwrap().owned);
+    assert_eq!(
+        c.ops.state.lock().unwrap().settings,
+        exact_snapshot().settings
+    );
+}
+
+#[test]
+fn linux_stop_absence_proof_is_for_original_kernel_resource_not_a_successor() {
+    let mut c = checked_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "old-birth").outcome,
+        TakeoverOutcome::Applied
+    );
+    c.ops.gone = true;
+    c.restore().unwrap();
+    assert!(!c.has_marker());
+    // A present replacement link is never equivalent to original-object absence.
+    let mut c = checked_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "original").outcome,
+        TakeoverOutcome::Applied
+    );
+    c.ops.state.lock().unwrap().link.sysfs_inode += 1;
+    let calls = c.ops.calls.lock().unwrap().len();
+    assert!(c.restore().is_err());
+    assert!(c.has_marker());
+    assert_eq!(c.ops.calls.lock().unwrap().len(), calls);
+    let marker = LiveDnsMarker::parse(&c.raw().unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.host_effect.operation_id, "original");
+    assert_eq!(marker.host_effect.before.link, exact_snapshot().link);
+    assert_eq!(marker.host_effect.phase, "restoring");
+}
+
+#[test]
+fn linux_exact_restore_retries_lost_ack_only_after_real_baseline_readback() {
+    let mut c = checked_controller();
+    let prepared = c.prepare_effect(true).unwrap();
+    assert_eq!(
+        c.apply_effect(&prepared, "lost-ack").outcome,
+        TakeoverOutcome::Applied
+    );
+    let current = c.ops.snapshot().unwrap();
+    assert!(matches!(
+        c.ops.compare(&current, false).unwrap(),
+        Change::Changed(_)
+    ));
+    assert!(c.has_marker());
+    c.restore().unwrap();
+    assert!(!c.has_marker());
+    assert!(!c.ops.snapshot().unwrap().owned);
+}

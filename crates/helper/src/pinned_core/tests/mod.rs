@@ -3,21 +3,28 @@ use polaris_helper_proto::core_manifest::{CoreFile, CoreManifest, InstalledCoreM
 use std::os::unix::fs::PermissionsExt;
 #[test]
 fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
-    let root = tempfile::tempdir().unwrap();
-    let source = tempfile::tempdir().unwrap();
-    for dir in [root.path(), source.path()] {
+    use polaris_core_supervisor::admitted_payload::{
+        AdmissionError, AdmissionErrorKind, ExecPurpose,
+    };
+    let root_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    for dir in [root_dir.path(), source_dir.path()] {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+    // Keep both TempDir guards alive while removing macOS's /var alias from
+    // these newly owned fixtures before exercising strict no-follow admission.
+    let root = root_dir.path().canonicalize().unwrap();
+    let source = source_dir.path().canonicalize().unwrap();
     let uid = nix::unistd::Uid::effective().as_raw();
     let owner = OwnerPolicy { uid: Some(uid) };
-    let store = CoreStore::initialize(root.path(), owner).unwrap();
+    let store = CoreStore::initialize(&root, owner).unwrap();
     let files = [
         ("sing-box", b"inert-core".as_slice()),
         ("libcronet.so", b"inert-sidecar".as_slice()),
     ]
     .into_iter()
     .map(|(name, raw)| {
-        let path = source.path().join(name);
+        let path = source.join(name);
         std::fs::write(&path, raw).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         CoreFile {
@@ -43,18 +50,16 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
         core,
     };
     assert_eq!(
-        status_with_owner(Some(root.path()), &id, owner),
+        status_with_owner(Some(&root), &id, owner),
         CoreStatus::Absent { id: id.clone() }
     );
-    store
-        .install(&manifest, source.path(), Some(uid), None)
-        .unwrap();
+    store.install(&manifest, &source, Some(uid), None).unwrap();
     #[cfg(target_os = "macos")]
     {
         use polaris_core_supervisor::admitted_payload::{
             AdmissionError, AdmissionErrorKind, RecoveryAction,
         };
-        let lock_path = root.path().join(".core-store.lock");
+        let lock_path = root.join(".core-store.lock");
         let held = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -71,14 +76,15 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
         assert_eq!(admission.recovery, RecoveryAction::RetryAfterStop);
         assert!(!admission.kind.is_payload_damage());
         assert_eq!(
-            status_with_owner(Some(root.path()), &id, owner),
+            status_with_owner(Some(&root), &id, owner),
             CoreStatus::Invalid {
                 id: id.clone(),
                 reason: AdmissionErrorKind::Busy.status_token().into(),
             }
         );
+        std::fs::File::unlock(&held).unwrap();
         drop(held);
-        let saved = root.path().join("saved-mutation-lock");
+        let saved = root.join("saved-mutation-lock");
         std::fs::rename(&lock_path, &saved).unwrap();
         std::os::unix::fs::symlink(&saved, &lock_path).unwrap();
         let error = store.verify_for_start(&id).unwrap_err();
@@ -91,7 +97,7 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
         assert_eq!(admission.recovery, RecoveryAction::RepairHelperInstallation);
         assert!(admission.kind.is_payload_damage());
         assert_eq!(
-            status_with_owner(Some(root.path()), &id, owner),
+            status_with_owner(Some(&root), &id, owner),
             CoreStatus::Invalid {
                 id: id.clone(),
                 reason: AdmissionErrorKind::Mismatch.status_token().into(),
@@ -109,7 +115,7 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
         assert_eq!(admission.recovery, RecoveryAction::None);
         assert!(!admission.kind.is_payload_damage());
         assert_eq!(
-            status_with_owner(Some(root.path()), &id, owner),
+            status_with_owner(Some(&root), &id, owner),
             CoreStatus::Invalid {
                 id: id.clone(),
                 reason: AdmissionErrorKind::Io.status_token().into(),
@@ -118,34 +124,33 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
         std::fs::remove_dir(&lock_path).unwrap();
         std::fs::rename(saved, lock_path).unwrap();
     }
-    assert!(matches!(
-        status_with_owner(Some(root.path()), &id, owner),
-        CoreStatus::Invalid { .. }
-    ));
+    // Observe the actual typed execution refusal after the original data checks.
+    // Its safe reason may differ by host/policy; Busy cannot prove this premise.
+    let error = store.verify_for_start(&id).unwrap_err();
+    let admission = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<AdmissionError>())
+        .expect("inert installed bytes must reach typed execution admission");
+    assert_ne!(admission.kind, AdmissionErrorKind::Busy);
+    assert_eq!(admission.purpose, Some(ExecPurpose::RunMain));
+    assert_eq!(
+        status_with_owner(Some(&root), &id, owner),
+        CoreStatus::Invalid {
+            id: id.clone(),
+            reason: admission.kind.status_token().into(),
+        }
+    );
     // A rejected status admission must not retain a shared execution lease
     // and permanently prevent the real existing repair transaction.
-    store
-        .install(&manifest, source.path(), Some(uid), None)
-        .unwrap();
-    std::fs::remove_file(
-        root.path()
-            .join("versions")
-            .join(id.as_str())
-            .join("libcronet.so"),
-    )
-    .unwrap();
+    store.install(&manifest, &source, Some(uid), None).unwrap();
+    std::fs::remove_file(root.join("versions").join(id.as_str()).join("libcronet.so")).unwrap();
     assert!(matches!(
-        status_with_owner(Some(root.path()), &id, owner),
+        status_with_owner(Some(&root), &id, owner),
         CoreStatus::Invalid { .. }
     ));
-    std::fs::remove_file(
-        root.path()
-            .join("manifests")
-            .join(format!("{}.json", id.as_str())),
-    )
-    .unwrap();
+    std::fs::remove_file(root.join("manifests").join(format!("{}.json", id.as_str()))).unwrap();
     assert!(matches!(
-        status_with_owner(Some(root.path()), &id, owner),
+        status_with_owner(Some(&root), &id, owner),
         CoreStatus::Invalid { .. }
     ));
 }

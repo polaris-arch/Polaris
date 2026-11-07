@@ -52,16 +52,20 @@ impl CallerIdentity {
 pub struct PinnedStartParams {
     pub id: CoreId,
     pub common: StartParams,
+    /// Optional explicit state directory, negotiated at protocol v4 (Linux only).
+    pub runtime_directory: Option<String>,
 }
 
 impl PinnedStartParams {
-    /// `v3-marker/id/cfg/log/fwd/[parentPid]`, with no legacy fallback.
+    /// `v3-marker/id/cfg/log/fwd/[parentPid][/runtime-root-v1=<directory>]`.
+    /// The extension always includes the parent slot, including an empty one.
+    /// Missing extension preserves cold-start semantics; no directory is inferred.
     pub fn parse(lines: &[String]) -> Option<Self> {
         let (marker, lines) = lines.split_first()?;
         if marker != PINNED_EXECUTION_DISCRIMINATOR {
             return None;
         }
-        if !(4..=5).contains(&lines.len()) {
+        if !(4..=6).contains(&lines.len()) {
             return None;
         }
         let id = CoreId::parse(&lines[0]).ok()?;
@@ -89,8 +93,19 @@ impl PinnedStartParams {
                 Some(pid.get())
             }
         };
+        let runtime_directory = match lines.get(5) {
+            None => None,
+            Some(value) => {
+                let directory = value.strip_prefix("runtime-root-v1=")?;
+                if directory.is_empty() || directory.contains(['\n', '\r', '\0']) {
+                    return None;
+                }
+                Some(directory.to_owned())
+            }
+        };
         Some(Self {
             id,
+            runtime_directory,
             common: StartParams {
                 cfg: cfg.clone(),
                 log: log.clone(),

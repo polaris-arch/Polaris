@@ -339,6 +339,12 @@ pub fn split_frame(raw: &str) -> Option<Frame<'_>> {
 pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
     let mut iter = args.iter();
     let mut next_line = || iter.next().copied().unwrap_or("");
+    if cmd == polaris_helper_proto::check_config::WINDOWS_COMMAND {
+        return polaris_helper_proto::check_config::CheckRequest::parse(
+            &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        )
+        .map(Request::WindowsCheck);
+    }
     Some(match cmd {
         command::common::PREPARE_HELPER_UPGRADE if args.is_empty() => Request::PrepareHelperUpgrade,
         command::common::CANCEL_HELPER_UPGRADE if args.is_empty() => Request::CancelHelperUpgrade,
@@ -351,7 +357,8 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
                     .iter()
                     .map(|line| (*line).to_owned())
                     .collect::<Vec<_>>(),
-            )?,
+            )
+            .filter(|params| params.runtime_directory.is_none())?,
         ),
         command::common::PING => Request::Ping,
         command::common::VERSION => Request::Version,

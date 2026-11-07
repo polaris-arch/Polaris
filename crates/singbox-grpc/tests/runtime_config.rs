@@ -57,6 +57,7 @@ fn plan_request() -> daemon::PlanRuntimeConfigRequest {
             exclude_package: vec!["app.two".into()],
         }),
         expected_control_revision: 7,
+        client_impact_policy_version: 0,
         selector_intents: vec![daemon::RuntimeSelectorIntent {
             group: "default".into(),
             selected: "physical-tcp-winner".into(),
@@ -68,6 +69,52 @@ fn plan_request() -> daemon::PlanRuntimeConfigRequest {
             ],
         }],
     }
+}
+
+// The original six-field schema is deliberately independent from the new
+// request. Legacy consumers must emit exactly the same bytes for policy zero.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyPlanRequest {
+    #[prost(uint32, tag = "1")]
+    contract_version: u32,
+    #[prost(message, optional, tag = "2")]
+    expected: Option<daemon::RuntimeIdentity>,
+    #[prost(string, tag = "3")]
+    config_content: String,
+    #[prost(message, optional, tag = "4")]
+    overrides: Option<daemon::RuntimeOverrideOptions>,
+    #[prost(uint64, tag = "5")]
+    expected_control_revision: u64,
+    #[prost(message, repeated, tag = "6")]
+    selector_intents: Vec<daemon::RuntimeSelectorIntent>,
+}
+
+#[test]
+fn policy_zero_preserves_original_six_field_wire_bytes() {
+    use prost::Message;
+    let current = plan_request();
+    let legacy = LegacyPlanRequest {
+        contract_version: current.contract_version,
+        expected: current.expected.clone(),
+        config_content: current.config_content.clone(),
+        overrides: current.overrides.clone(),
+        expected_control_revision: current.expected_control_revision,
+        selector_intents: current.selector_intents.clone(),
+    };
+    assert_eq!(current.encode_to_vec(), legacy.encode_to_vec());
+    assert_eq!(
+        daemon::PlanRuntimeConfigRequest::decode(legacy.encode_to_vec().as_slice()).unwrap(),
+        current
+    );
+    let mut explicit = current.clone();
+    explicit.client_impact_policy_version = 1;
+    let bytes = explicit.encode_to_vec();
+    assert!(bytes.ends_with(&[0x38, 1])); // field 7, not a new Apply field
+    assert_eq!(LegacyPlanRequest::decode(bytes.as_slice()).unwrap(), legacy);
+    assert_eq!(
+        daemon::PlanRuntimeConfigRequest::decode(bytes.as_slice()).unwrap(),
+        explicit
+    );
 }
 fn apply_request() -> daemon::ApplyRuntimeConfigRequest {
     daemon::ApplyRuntimeConfigRequest {

@@ -10,6 +10,16 @@ export interface RestartPrompt {
 export function restartReasonKeys(reasons: PendingApplyResult['reasons']): string[] {
   const keys = new Set<string>();
   for (const reason of (reasons ?? []).slice(0, 32)) {
+    if (reason.code === 'regenerationOwnerRequiresRestart') {
+      keys.add('home.restartApplyPersistenceOwner');
+      continue;
+    }
+    if (reason.code === 'hostEffectsRequireRestart') {
+      keys.add(reason.path === 'dnsConfig.takeoverSystemDns'
+        ? 'home.restartApplyDnsAutoSource'
+        : 'home.restartApplyHostEffects');
+      continue;
+    }
     if (reason.code === 'unsupportedCore') {
       keys.add('home.restartApplyUnsupportedCore');
       continue;

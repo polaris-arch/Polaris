@@ -7,5 +7,10 @@ import test from 'node:test';
 
 test('native ZIP/tar safety boundary rejects private adversarial archive fixtures', () => {
   execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B',
-    fileURLToPath(new URL('./desktop-core/test-release-archive.py', import.meta.url))], { stdio: 'pipe' });
+    fileURLToPath(new URL('./desktop-core/test-release-archive.py', import.meta.url))], { stdio: 'pipe', timeout: 120_000 });
+});
+
+test('trusted source archive closure and strict UTF-8 survive the Windows legacy default', () => {
+  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B',
+    fileURLToPath(new URL('./desktop-core/test-source-archive.py', import.meta.url))], { stdio: 'pipe', timeout: 120_000 });
 });

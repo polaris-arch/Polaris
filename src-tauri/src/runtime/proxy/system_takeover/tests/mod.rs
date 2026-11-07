@@ -221,3 +221,171 @@ async fn cancelled_clear_waiter_cannot_clear_a_successor_marker() {
     );
     assert_eq!(clears.load(Ordering::SeqCst), 1);
 }
+
+fn prepared_proxy_fixture() -> PreparedProxyEffect {
+    let snapshot = polaris_system_integration::proxy::ProxyTransactionSnapshot::default();
+    serde_json::from_value(serde_json::json!({
+        "marker_path": "/proxy-live.json", "marker": null,
+        "before": snapshot, "target": snapshot, "request": null,
+    }))
+    .unwrap()
+}
+
+struct TypedProxyCounter {
+    writes: Arc<AtomicU64>,
+    prepared: PreparedProxyEffect,
+}
+impl SystemProxyClearer for TypedProxyCounter {
+    fn ensure_cleared(&mut self) -> bool {
+        false
+    }
+    fn detect_foreign_proxy(&self) -> Option<String> {
+        None
+    }
+    fn enable_system_proxy(&mut self, _: &ProxyEnableRequest) -> Result<(), String> {
+        unreachable!("live must not use legacy enable")
+    }
+    fn recover_from_marker(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn prepare_host_effect(
+        &self,
+        _: Option<&ProxyEnableRequest>,
+    ) -> Result<PreparedProxyEffect, String> {
+        Ok(self.prepared.clone())
+    }
+    fn host_effect_facts_match(&self, prepared: &PreparedProxyEffect) -> Result<bool, String> {
+        Ok(
+            serde_json::to_value(prepared).unwrap()
+                == serde_json::to_value(&self.prepared).unwrap(),
+        )
+    }
+    fn apply_host_effect(
+        &mut self,
+        prepared: &PreparedProxyEffect,
+        operation_id: &str,
+    ) -> TakeoverReceipt {
+        assert!(self.host_effect_facts_match(prepared).unwrap());
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        TakeoverReceipt {
+            operation_id: operation_id.to_owned(),
+            outcome: TakeoverOutcome::Applied,
+            marker_id: Some("original-marker".into()),
+            cleanup_pending: false,
+            reason: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_proxy_checks_original_session_epoch_and_owner_inside_controller_lock() {
+    let writes = Arc::new(AtomicU64::new(0));
+    let prepared = prepared_proxy_fixture();
+    let takeover = Arc::new(SystemProxyTakeover::new(Box::new(TypedProxyCounter {
+        writes: writes.clone(),
+        prepared: prepared.clone(),
+    })));
+    let epoch = takeover.host_epoch();
+    let controller = takeover.controller.clone();
+    let held = controller.lock().unwrap();
+    let worker = takeover.clone();
+    let worker_plan = prepared.clone();
+    let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        queued_tx.send(()).unwrap();
+        worker.apply_host_effect_when(&worker_plan, "old-operation", epoch, || true)
+    });
+    queued_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let query = takeover.begin_session_query();
+    assert!(takeover.cancel_session_query(query));
+    drop(held);
+    assert_eq!(task.await.unwrap().outcome, TakeoverOutcome::Superseded);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    let epoch = takeover.host_epoch();
+    assert_eq!(
+        takeover
+            .apply_host_effect_when(&prepared, "revoked-owner", epoch, || false)
+            .outcome,
+        TakeoverOutcome::Superseded
+    );
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    let result = takeover.apply_host_effect_when(&prepared, "current-owner", epoch, || true);
+    assert_eq!(result.outcome, TakeoverOutcome::Applied);
+    assert_eq!(result.operation_id, "current-owner");
+    assert_eq!(result.marker_id.as_deref(), Some("original-marker"));
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn dropped_typed_proxy_waiter_does_not_cancel_the_queued_owner() {
+    let writes = Arc::new(AtomicU64::new(0));
+    let prepared = prepared_proxy_fixture();
+    let takeover = Arc::new(SystemProxyTakeover::new(Box::new(TypedProxyCounter {
+        writes: writes.clone(),
+        prepared: prepared.clone(),
+    })));
+    let epoch = takeover.host_epoch();
+    let controller = takeover.controller.clone();
+    let held = controller.lock().unwrap();
+    let worker = takeover.clone();
+    let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let observer = tokio::task::spawn_blocking(move || {
+        queued_tx.send(()).unwrap();
+        let receipt =
+            worker.apply_host_effect_when(&prepared, "retained-operation", epoch, || true);
+        done_tx.send(receipt).unwrap();
+    });
+    queued_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    drop(observer); // detach only; the real owner still retains controller + operation
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    drop(held);
+    let result = done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(result.outcome, TakeoverOutcome::Applied);
+    assert_eq!(result.operation_id, "retained-operation");
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    drop(controller.lock().unwrap());
+}
+
+#[test]
+fn typed_proxy_missing_adapter_never_calls_startup_enable() {
+    let writes = Arc::new(AtomicU64::new(0));
+    let takeover = SystemProxyTakeover::new(Box::new(EnableCounter(writes.clone())));
+    assert!(takeover.prepare_host_effect(None).is_err());
+    let result = takeover.apply_host_effect_when(
+        &prepared_proxy_fixture(),
+        "no-adapter",
+        takeover.host_epoch(),
+        || true,
+    );
+    assert_eq!(result.outcome, TakeoverOutcome::Unsupported);
+    assert!(!result.cleanup_pending);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn shared_live_and_startup_proxy_projection_preserves_effective_platform_and_bypass() {
+    let config: UserConfig = serde_json::from_value(serde_json::json!({
+        "servers":[], "selectedServerId":null, "proxyModeType":"systemProxy",
+        "mixedPort":8123, "bypassLAN":true, "bypassLANList":["internal.example"],
+    }))
+    .unwrap();
+    for platform in [Platform::Mac, Platform::Win, Platform::Linux] {
+        let request = runtime_system_proxy_request(&config, platform).unwrap();
+        assert_eq!(request.address, "127.0.0.1");
+        assert_eq!(request.http_port, 8123);
+        assert_eq!(request.socks_port, 8123);
+        assert!(request
+            .bypass_list
+            .iter()
+            .any(|entry| entry == "internal.example"));
+    }
+    assert!(runtime_system_proxy_request(&config, Platform::Android).is_none());
+    assert!(runtime_system_proxy_request(&config, Platform::Ios).is_none());
+}
