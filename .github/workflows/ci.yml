@@ -39,10 +39,8 @@ name: CI
 #   · 发布质量不降级：tag 发布经 package.yml 的 `ci` gate job 调回本 workflow 跑满 3-OS，
 #     CI 不绿不发布（见 package.yml jobs.release）。2026-09-04 起打包腿与本门**并行**开跑：
 #     门拦的是 release job，不是 package job —— 门红时安装包会被构建出来但发不出去。
-# main 应开 ruleset，把本 workflow 的 `fmt + clippy (<os>)`、`build + test (<os>)` 三平台各一条与
-# `cross-target clippy + android face`，连同 UI 与 release risk gate 设为 required checks。
-# ⚠️ 2026-10-07 拆分改了 check 名（原 `fmt + clippy + test (<os>)` 不再存在）：已按旧名配过
-#    required checks 的话必须同步改，否则那条 check 永远 Pending。
+# GitHub 侧分支保护已按用户要求移除；本 workflow、UI 与 release-risk 的实际验证门仍保留。
+# 合入使用准确候选的完整必要反馈；普通源码 CI 不代系统、设备或受控运行验收。
 on:
   push:
     branches: [main]
@@ -1446,7 +1444,7 @@ jobs:
 
       - name: Run exact controlled App lifecycle hot-switch and stats tests
         id: native_dns_app_runtime
-        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && !cancelled() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && !cancelled() && needs.cheap_format.outputs.native_dns_candidate != '' && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
         shell: bash
         run: |
           set -euo pipefail

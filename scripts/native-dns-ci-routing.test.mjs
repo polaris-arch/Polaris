@@ -476,6 +476,22 @@ test('actual helper bytes and isolated candidate identity are frozen before the 
 
 test('controlled real-core tests resolve exact library namespaces and never select all ignored tests', () => {
   const selected = step('Run exact controlled App lifecycle hot-switch and stats tests');
+  const condition = /^        if: \$\{\{ (.+) \}\}$/m.exec(selected)?.[1];
+  assert.ok(condition);
+  assert.doesNotMatch(condition, /native_dns_default|native_dns_formal|runner\.os/);
+  const route = (outputs = {}, build = 'success', tests = 'success', cancelled = false) =>
+    new Function('needs', 'steps', 'cancelled', `return (${condition});`)(
+      { cheap_format: { outputs: { app_native_compile_only: '', native_dns_candidate: '', ...outputs } } },
+      { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } }, () => cancelled);
+  assert.equal(route(), false);
+  assert.equal(route({ native_dns_formal: 'true' }), false);
+  assert.equal(route({ native_dns_default: 'true' }), false);
+  assert.equal(route({ native_dns_candidate: sha }), true);
+  assert.equal(route({ native_dns_candidate: sha }, 'success', 'failure'), true);
+  assert.equal(route({ native_dns_candidate: sha, app_native_compile_only: 'true' }), false);
+  assert.equal(route({ native_dns_candidate: sha }, 'failure'), false);
+  assert.equal(route({ native_dns_candidate: sha }, 'success', 'skipped'), false);
+  assert.equal(route({ native_dns_candidate: sha }, 'success', 'success', true), false);
   const names = [...selected.matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
   assert.equal(names.length, 6);
   assert.equal(new Set(names).size, 6);
@@ -621,7 +637,6 @@ test('committed temporary default is admitted without manual branch inputs or en
     'Verify exact candidate Go toolchain', 'Acquire all four explicit candidate payloads before placeholders',
     'Build actual candidate helper bytes and freeze the separate App identity',
     'Verify all candidate payloads and compiled identity before workspace build',
-    'Run exact controlled App lifecycle hot-switch and stats tests',
     'Verify all candidate payloads after workspace and controlled App tests',
     'Record ordinary candidate outcomes without claiming skipped acceptance', 'Always preserve exact ordinary candidate evidence'])
     assert.ok(step(name).includes("needs.cheap_format.outputs.native_dns_default == 'true'"), name);
@@ -700,7 +715,6 @@ test('committed formal admission enables the same ordinary preparation and lifec
     'Verify exact candidate Go toolchain', 'Acquire all four explicit candidate payloads before placeholders',
     'Build actual candidate helper bytes and freeze the separate App identity',
     'Verify all candidate payloads and compiled identity before workspace build',
-    'Run exact controlled App lifecycle hot-switch and stats tests',
     'Verify all candidate payloads after workspace and controlled App tests',
     'Record ordinary candidate outcomes without claiming skipped acceptance', 'Always preserve exact ordinary candidate evidence'])
     assert.ok(step(name).includes("needs.cheap_format.outputs.native_dns_formal == 'true'"), name);

@@ -648,17 +648,6 @@ mod linux_tests {
             reviewed_compiled_profile(replacement.source_commit, contract),
             Ok(LinuxCheckProfile::E3155C9)
         );
-        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
-        assert_eq!(
-            polaris_updater::verify::sha256_hex(binding.as_bytes()),
-            contract
-        );
-        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
-        assert_eq!(binding["sourceCommit"], replacement.source_commit);
-        assert_eq!(
-            binding["platforms"]["linux"]["core"]["sha256"],
-            replacement.binary_sha256
-        );
         assert_eq!(
             LinuxCheckProfile::E3155C9.binary_sha256(),
             "1188baf18f7e4d9d4daabcf01633d72a2174ccb95ed71847d5032d857ad6679b"
@@ -801,6 +790,17 @@ mod linux_tests {
         assert_eq!(
             reviewed_compiled_profile(current.source_commit, contract),
             Ok(LinuxCheckProfile::D8727E)
+        );
+        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
+        assert_eq!(
+            polaris_updater::verify::sha256_hex(binding.as_bytes()),
+            contract
+        );
+        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+        assert_eq!(binding["sourceCommit"], current.source_commit);
+        assert_eq!(
+            binding["platforms"]["linux"]["core"]["sha256"],
+            current.binary_sha256
         );
         assert_eq!(
             LinuxCheckProfile::D8727E.binary_sha256(),
