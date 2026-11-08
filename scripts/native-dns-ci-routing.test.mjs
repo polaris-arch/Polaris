@@ -489,11 +489,13 @@ test('controlled real-core tests resolve exact library namespaces and never sele
   const condition = /^        if: \$\{\{ (.+) \}\}$/m.exec(selected)?.[1];
   assert.ok(condition);
   assert.doesNotMatch(condition, /native_dns_default|runner\.os/);
-  assert.match(condition, /native_dns_formal == 'true' && github\.event_name == 'workflow_dispatch'/);
-  const route = (outputs = {}, build = 'success', tests = 'success', cancelled = false, event = 'push') =>
-    new Function('needs', 'steps', 'cancelled', 'github', `return (${condition});`)(
+  assert.match(condition, /native_dns_formal == 'true' && github\.event_name == 'workflow_dispatch' && startsWith\(github\.workflow_ref, 'polaris-arch\/Polaris\/\.github\/workflows\/ci\.yml@'\)/);
+  const directCi = 'polaris-arch/Polaris/.github/workflows/ci.yml@refs/heads/main';
+  const route = (outputs = {}, build = 'success', tests = 'success', cancelled = false, event = 'push', workflowRef = directCi) =>
+    new Function('needs', 'steps', 'cancelled', 'github', 'startsWith', `return (${condition});`)(
       { cheap_format: { outputs: { app_native_compile_only: '', native_dns_candidate: '', ...outputs } } },
-      { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } }, () => cancelled, { event_name: event });
+      { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } }, () => cancelled,
+      { event_name: event, workflow_ref: workflowRef }, (value, prefix) => value.toLowerCase().startsWith(prefix.toLowerCase()));
   assert.equal(route(), false);
   assert.equal(route({ native_dns_formal: 'true' }), false);
   assert.equal(route({ native_dns_default: 'true' }), false);
@@ -506,10 +508,21 @@ test('controlled real-core tests resolve exact library namespaces and never sele
   for (const event of ['push', 'pull_request', 'merge_group']) {
     assert.equal(route({ native_dns_formal: 'true' }, 'success', 'success', false, event), false);
   }
-  const manual = (outputs = {}, build = 'success', tests = 'success', cancelled = false) =>
-    route(outputs, build, tests, cancelled, 'workflow_dispatch');
+  const manual = (outputs = {}, build = 'success', tests = 'success', cancelled = false, workflowRef = directCi) =>
+    route(outputs, build, tests, cancelled, 'workflow_dispatch', workflowRef);
   assert.equal(manual({ native_dns_formal: 'true' }), true);
   assert.equal(manual({ native_dns_formal: 'true' }, 'success', 'failure'), true);
+  for (const workflowRef of [
+    'polaris-arch/Polaris/.github/workflows/package.yml@refs/heads/main',
+    'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/main',
+    'other/Polaris/.github/workflows/ci.yml@refs/heads/main',
+    'polaris-arch/Other/.github/workflows/ci.yml@refs/heads/main',
+    'polaris-arch/Polaris/.github/workflows/ci.yml.extra@refs/heads/main',
+    'polaris-arch/Polaris/.github/workflows/ci.yml',
+    '',
+  ]) assert.equal(manual({ native_dns_formal: 'true' }, 'success', 'success', false, workflowRef), false, workflowRef);
+  assert.equal(manual({ native_dns_candidate: sha }, 'success', 'success', false,
+    'polaris-arch/Polaris/.github/workflows/package.yml@refs/heads/main'), true);
   assert.equal(manual(), false);
   assert.equal(manual({ native_dns_default: 'true' }), false);
   assert.equal(manual({ native_dns_formal: 'true', app_native_compile_only: 'true' }), false);
