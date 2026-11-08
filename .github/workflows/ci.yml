@@ -43,7 +43,7 @@ name: CI
 # 合入使用准确候选的完整必要反馈；普通源码 CI 不代系统、设备或受控运行验收。
 on:
   push:
-    branches: [main]
+    branches: [main, 'work/**']
     # 纯文档改动不碰任何判据面，push 直跑是纯浪费。注意 paths-ignore 只在**全部**改动文件命中时跳过。
     # 只对 push 生效：PR 不加，避免将来设 required checks 后文档 PR 卡在 pending。
     #

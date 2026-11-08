@@ -126,6 +126,7 @@ const runtimeModeExpression = (expression: string) => expression.replaceAll(
 /** 本仓 ci.yml 会遇到的全部入口（`os` 列：没有该输入的事件按 Actions 语义记作 ''）。 */
 const CI_ENTRIES = [
   { label: 'push main', event_name: 'push', ref: 'refs/heads/main', os: '' },
+  { label: 'push work branch', event_name: 'push', ref: 'refs/heads/work/ci-task-branch-validation-20261108', os: '' },
   { label: 'pull_request', event_name: 'pull_request', ref: 'refs/pull/7/merge', os: '' },
   { label: 'merge_group', event_name: 'merge_group', ref: 'refs/heads/gh-readonly-queue/main/pr-7', os: '' },
   { label: 'tag push 经 package.yml workflow_call', event_name: 'push', ref: 'refs/tags/v1.0.0', os: '' },
@@ -170,6 +171,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const all = ['ubuntu-22.04', 'windows-2022', 'macos-15'];
     const expected: Record<(typeof CI_ENTRIES)[number]['label'], string[]> = {
       'push main': ['ubuntu-22.04'],
+      'push work branch': all,
       pull_request: all,
       merge_group: all,
       'tag push 经 package.yml workflow_call': all,
