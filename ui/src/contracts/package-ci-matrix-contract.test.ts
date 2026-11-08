@@ -419,7 +419,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       if (runs) ran += 1; else skipped += 1;
     }
     // 反向对照：两种结论都真的出现过（否则「相等」可以被两边同时恒真 / 恒假满足）。
-    expect(ran).toBe(7);
+    expect(ran).toBe(8);
     expect(skipped).toBe(2);
     // 求值器自身的牙：把条件改成常量假，必须被上面那套逐入口比对判红。
     expect(evaluateActions('!(true)', CI_ENTRIES[0])).toBe(false);
