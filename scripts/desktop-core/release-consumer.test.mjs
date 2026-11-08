@@ -882,9 +882,45 @@ test('dedicated Actions token is API-only while ambient tokens, assets and redir
   await publicBytes('https://github.com/polaris-arch/polaris-box/releases/download/inert/core.zip', 2, true, { fetch: assetFetch, env });
   assert.equal(calls.length, 2); assert(calls.every((call) => call.headers.Authorization === undefined));
   assert(calls.every((call) => call.redirect === 'manual'));
+  calls.length = 0;
+  assert.equal((await publicBytes(`https://github.com/polaris-arch/sing-box-polaris/archive/${commit}.tar.gz`, 2, true,
+    { fetch, env, repository: 'polaris-arch/sing-box-polaris' })).toString(), 'ok');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, `https://codeload.github.com/polaris-arch/sing-box-polaris/tar.gz/${commit}`);
+  assert.equal(calls[0].headers.Authorization, undefined); assert.equal(calls[0].redirect, 'manual');
   } finally { for (const [key, value] of Object.entries(previous)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   } }
+});
+test('noncanonical source identities never become a codeload request', async () => {
+  const repository = 'polaris-arch/sing-box-polaris';
+  const source = `https://github.com/${repository}/archive/${commit}.tar.gz`;
+  const env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token' };
+  for (const url of [source.replace('https://', 'https://fixture-user:fixture-password@'),
+    source + '?ref=fixture', source + '#fixture',
+    source.replace(repository, 'polaris-arch/polaris-box'), source.replace(commit, commit.slice(1))]) {
+    const calls = [];
+    await assert.rejects(publicBytes(url, 2, true, { repository, env, fetch: async (requested, options) => {
+      calls.push(requested); assert.equal(options.headers.Authorization, undefined);
+      return new Response('denied', { status: 403 });
+    } }), /Release HTTP 403/);
+    assert.deepEqual(calls, [url]);
+  }
+});
+test('derived source origin is terminal even for same-origin or approved asset-CDN redirects', async () => {
+  const repository = 'polaris-arch/sing-box-polaris';
+  const terminal = `https://codeload.github.com/${repository}/tar.gz/${commit}`;
+  for (const location of [terminal, 'https://release-assets.githubusercontent.com/inert-source']) {
+    const calls = [];
+    await assert.rejects(publicBytes(`https://github.com/${repository}/archive/${commit}.tar.gz`, 2, true,
+      { repository, env: { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token' },
+        fetch: async (url, options) => {
+          calls.push(url); assert.equal(options.headers.Authorization, undefined);
+          assert.equal(options.redirect, 'manual');
+          return new Response(null, { status: 302, headers: { Location: location } });
+        } }), /Unapproved release redirect/);
+    assert.deepEqual(calls, [terminal]);
+  }
 });
 test('HTTP denial records phase, host, request-id and quota but neither credentials nor query and never blindly retries', async () => {
   const env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'never-log-fixture-secret' }; let requests = 0;

@@ -464,8 +464,12 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
   const request = options.fetch ?? fetch;
   const token = options.apiToken ?? releaseAPIToken(options.env ?? RELEASE_API_ENV);
   const original = new URL(url);
-  const sourceMatch = original.origin === 'https://github.com' && !original.search && !original.hash
+  const sourceMatch = original.origin === 'https://github.com' && !original.username && !original.password
+    && !original.search && !original.hash
     ? new RegExp(`^/${repository}/archive/([a-f0-9]{40})\\.tar\\.gz$`).exec(original.pathname) : null;
+  // Resolve the archive alias to its approved fixed-commit origin. Source
+  // responses must be terminal; all source identity checks still follow.
+  if (asset && sourceMatch) url = `https://codeload.github.com/${repository}/tar.gz/${sourceMatch[1]}`;
   for (let redirects = 0; redirects <= 3;) {
     const endpoint = new URL(url);
     const headers = { 'User-Agent': 'Polaris-release-consumer', Accept: 'application/vnd.github+json' };
@@ -518,10 +522,8 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
     }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       await cancelBody(); const next = new URL(response.headers.get('location') ?? '', url);
-      const sourceRedirect = sourceMatch && redirects === 0 && next.hostname === 'codeload.github.com'
-        && !next.search && !next.hash && next.pathname === `/${repository}/tar.gz/${sourceMatch[1]}`;
-      demand(asset && next.protocol === 'https:' && !next.username && !next.password && !next.port
-        && (sourceMatch ? sourceRedirect : ['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname)),
+      demand(asset && !sourceMatch && next.protocol === 'https:' && !next.username && !next.password && !next.port
+        && ['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname),
       'Unapproved release redirect');
       url = next.href; redirects++; continue;
     }
