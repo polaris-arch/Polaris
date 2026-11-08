@@ -609,6 +609,14 @@ fn selected_check_has_known_denial(
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[tokio::test]
 async fn checked_candidate_prepares_same_protected_images_without_managed_permit() {
+    // Recovery fixtures retire the process-global selected admission slot.
+    // Keep the real selected cohort in the existing one-test worker.
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "checked_candidate_prepares_same_protected_images_without_managed_permit",
+    ) {
+        return;
+    }
     let Some((binary, profile)) = selected_core_for_test() else {
         return;
     };
@@ -687,6 +695,12 @@ async fn checked_candidate_prepares_same_protected_images_without_managed_permit
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[tokio::test]
 async fn pinned_strict_check_uses_full_builder_bytes_without_cache_or_listener_side_effects() {
+    if crate::test_support::ran_in_isolated_worker(
+        module_path!(),
+        "pinned_strict_check_uses_full_builder_bytes_without_cache_or_listener_side_effects",
+    ) {
+        return;
+    }
     let Some((binary, profile)) = selected_core_for_test() else {
         return;
     };
