@@ -956,16 +956,16 @@ test('committed materials reject aliases, omitted transport, mixed asset IDs and
     assert.throws(() => { validateReleaseContract(bad); validateUpstreamIndex(index, bad); });
   }
 });
-test('automatic commit archive permits only its exact anonymous codeload redirect', async () => {
+test('automatic commit archive resolves directly to its exact anonymous codeload endpoint', async () => {
   const url = `https://github.com/polaris-arch/sing-box-polaris/archive/${commit}.tar.gz`;
   const destination = `https://codeload.github.com/polaris-arch/sing-box-polaris/tar.gz/${commit}`;
   const seen = [];
   const options = { repository: 'polaris-arch/sing-box-polaris', apiToken: 'fixture', fetch: async (at, opts) => {
     seen.push([at, opts.headers.Authorization]);
-    return at === url ? new Response(null, { status: 302, headers: { location: destination } }) : new Response('ok');
+    return new Response('ok');
   } };
   assert.equal(String(await publicBytes(url, 2, true, options)), 'ok');
-  assert.deepEqual(seen, [[url, undefined], [destination, undefined]]);
+  assert.deepEqual(seen, [[destination, undefined]]);
   for (const wrong of [destination.replace(commit, 'main'), destination.replace(commit, '0'.repeat(40)),
     destination.replace('polaris-arch', 'elsewhere'), destination + '?token=bad',
     'https://release-assets.githubusercontent.com/other', destination.replace('https:', 'http:')]) {
