@@ -3,6 +3,12 @@ use super::*;
 
 #[test]
 fn private_generation_root_change_refreshes_data_without_minting_admission() {
+    let Some(_completion) = tests::exact_fixture_scope(
+        module_path!(),
+        "private_generation_root_change_refreshes_data_without_minting_admission",
+    ) else {
+        return;
+    };
     let (_root, store, uid) = tests::store();
     let (source, manifest) = tests::fixture("private-preparation");
     store
@@ -30,6 +36,12 @@ fn private_generation_root_change_refreshes_data_without_minting_admission() {
 
 #[test]
 fn private_root_refresh_cannot_hide_selected_member_changes() {
+    let Some(_completion) = tests::exact_fixture_scope(
+        module_path!(),
+        "private_root_refresh_cannot_hide_selected_member_changes",
+    ) else {
+        return;
+    };
     let (_root, store, uid) = tests::store();
     let (source, manifest) = tests::fixture("private-preparation-negative");
     store

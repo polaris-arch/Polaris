@@ -118,6 +118,8 @@ async fn actual_redirect_hops_rewrite_post_and_strip_cross_origin_secrets() {
                 loop {
                     match target.accept() {
                         Ok((mut socket, _)) => {
+                            // Winsock inherits the listener's nonblocking mode; only accept polls.
+                            socket.set_nonblocking(false).unwrap();
                             let request = read_request(&mut socket);
                             let _ = socket.write_all(&http_response("200 OK", &[], b"ok"));
                             tx.send(Some(request)).unwrap();
