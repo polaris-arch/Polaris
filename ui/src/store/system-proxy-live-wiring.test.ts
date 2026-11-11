@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { relative, resolve } from 'node:path';
 
 const SRC = resolve(__dirname, '..');
 const read = (rel: string): string => readFileSync(resolve(SRC, rel), 'utf8');
@@ -54,7 +54,7 @@ describe('T1：轮询只有一份，且挂在窗口级持久位置', () => {
     // （`async getSystemProxyStatus(`，无前导点）不计入。
     const callers = listSources(SRC)
       .filter((f) => /\.getSystemProxyStatus\s*\(/.test(code(readFileSync(f, 'utf8'))))
-      .map((f) => f.slice(SRC.length + 1))
+      .map((f) => relative(SRC, f).replaceAll('\\', '/'))
       .sort();
     expect(callers).toEqual([STORE]);
   });

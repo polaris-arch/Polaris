@@ -1,5 +1,8 @@
 use super::*;
-use super::{app_update::*, core_info::core_version_info};
+use super::{
+    app_update::*,
+    core_info::{core_admission_info, core_version_info},
+};
 
 use std::sync::Arc;
 
@@ -165,6 +168,36 @@ fn core_version_info_never_substitutes_the_bundled_version_for_a_failed_probe() 
             .replace("read_core_version_line()", "")
             .contains("read_core_version()"),
         "内核信息卡的随包内核自报版本取自会回落清单声明版本的读法 —— 读不到会被显示成「就是清单声明的版本」"
+    );
+}
+
+#[test]
+fn helper_owned_core_info_does_not_attempt_or_claim_app_admission() {
+    assert_eq!(
+        core_admission_info(true, Ok(()), || panic!("ordinary App must not admit")),
+        None
+    );
+}
+
+#[test]
+fn helper_owned_core_info_retains_static_capability_refusal() {
+    let refused = core_admission_info(
+        true,
+        Err(polaris_core_supervisor::admitted_payload::AdmissionError::unsupported_exact_object()),
+        || panic!("static refusal must not attempt direct admission"),
+    )
+    .unwrap();
+    assert_eq!(refused["state"], "rejected");
+    assert_eq!(refused["kind"], "UnsupportedExactObject");
+    assert_eq!(refused["recovery"], "none");
+}
+
+#[test]
+fn direct_core_info_retains_actual_admission_result() {
+    let refused = json!({"state":"rejected","kind":"Changed","recovery":"reinstallCurrentApp"});
+    assert_eq!(
+        core_admission_info(false, Ok(()), || refused.clone()),
+        Some(refused)
     );
 }
 

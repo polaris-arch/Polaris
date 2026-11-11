@@ -3477,6 +3477,7 @@ name = "polaris-windows-cleaner"
 version = "1.0.0"
 dependencies = [
  "hex",
+ "log",
  "polaris-helper-proto",
  "polaris-source-probe",
  "serde",

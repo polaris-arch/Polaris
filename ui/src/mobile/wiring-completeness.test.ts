@@ -200,7 +200,7 @@ const REGISTER_FILES: readonly string[] = [
   join(MOBILE_DIR, 'forms', 'node-form-parity.test-support.ts'),
 ];
 
-const rel = (absolute: string): string => relative(UI_SRC_DIR, absolute);
+const rel = (absolute: string): string => relative(UI_SRC_DIR, absolute).replaceAll('\\', '/');
 
 /** 完成门的强度。清零那天改成 `'hard'`，`it.fails` 随之变成普通 `it`。 */
 /* 2026-09-14 清零：三个取材面减去处置表 === 空集，故完成门从 `known-red` 转 `hard`

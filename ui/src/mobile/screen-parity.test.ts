@@ -116,7 +116,7 @@
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, relative as nativeRelative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { blankComments } from '@/contracts/comment-blanking.test-support';
@@ -139,6 +139,8 @@ import { HOME_PARITY } from './home/absence-register.test-support';
 import { RULES_PARITY } from './screens/rules/absence-register.test-support';
 import { CONNECTIONS_PARITY } from './connections/absence-register.test-support';
 import { SETTINGS_PARITY } from './settings/absence-register.test-support';
+
+const relative = (from: string, to: string): string => nativeRelative(from, to).replaceAll('\\', '/');
 
 /** 仓根（同 `wiring-completeness.test.ts` 的算法，两处的锚因此可以互相搬）。 */
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
@@ -355,7 +357,7 @@ export function actionId(button: { tag: string; seg: string }): string {
  */
 function renderedImports(dirsAbs: readonly string[]): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
-  const inOwnDirs = (abs: string): boolean => dirsAbs.some((d) => abs.startsWith(`${d}/`));
+  const inOwnDirs = (abs: string): boolean => dirsAbs.some((d) => abs.startsWith(`${d}${sep}`));
   const resolveSpec = (fromFile: string, spec: string): string | null => {
     let base: string;
     if (spec.startsWith('@/')) base = join(UI_SRC, spec.slice(2));
@@ -432,7 +434,7 @@ function desktopActions(sources: readonly ActionSource[]): DesktopAction[] {
   const out: DesktopAction[] = [];
   const seen = new Map<string, number>();
   for (const source of sources) {
-    const name = source.abs.slice(source.abs.lastIndexOf('/') + 1);
+    const name = basename(source.abs);
     const body = strip(readFileSync(source.abs, 'utf8'));
     let inScope: (index: number) => boolean = () => true;
     if (source.onlyComponents !== null) {
@@ -1066,7 +1068,7 @@ describe('⓪ 自检：四个取材面都是活的，且判据没被自己污染
 
   it('动作面取材文件的基名唯一（否则两份文件的动作会被合并进同一串序号）', () => {
     for (const face of FACES) {
-      const names = face.actionSources.map((f) => f.abs.slice(f.abs.lastIndexOf('/') + 1));
+      const names = face.actionSources.map((f) => basename(f.abs));
       const dup = names.filter((n, i) => names.indexOf(n) !== i);
       expect(
         [...new Set(dup)],

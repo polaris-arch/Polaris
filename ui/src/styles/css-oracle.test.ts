@@ -33,6 +33,7 @@ import {
   browserWsUrl,
   buildCssUnit,
   buildDocument,
+  CHROME_CANDIDATES,
   closeOracle,
   cssBundleScan,
   cssBundleUnits,
@@ -380,7 +381,7 @@ describe('⑥ 反向对照：故障关闭', () => {
   it('浏览器缺席 ⇒ 抛（不是 skip）', () => {
     expect(() => resolveChromeBinary(['/nonexistent/chrome'])).toThrow(/找不到浏览器/);
     // 正向对照：本机这份候选表是找得到的 —— 上一条不是恒抛。
-    expect(resolveChromeBinary()).toMatch(/chrom/i);
+    expect(CHROME_CANDIDATES).toContain(resolveChromeBinary());
   });
 
   it('`ctx` 与 `css` 必须二选一，且不许一条都不问', async () => {
@@ -482,12 +483,12 @@ describe('⑧ 进程与 profile 卫生：收尾不保证就得自曝（第五轮
     expect(() => assertNoOracleLeak({ started: 1, liveBrowsers: [], leftProfiles: [] })).not.toThrow();
   });
 
-  it('启动抛出的路径会清 profile（进程都没起来时，目录不该留在 /var/tmp）', async () => {
-    const dir = mkdtempSync('/var/tmp/polaris-css-oracle-abandon-');
+  it('启动抛出的路径会清 profile（进程都没起来时，临时目录不该残留）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'polaris-css-oracle-abandon-'));
     expect(existsSync(dir)).toBe(true);
     // 子进程与 ws 都还没建起来 —— 正是 `launch` 在等 `DevToolsActivePort` 之前抛掉的那一档。
     await abandon({ pid: undefined, dir, closed: false, state: 'not-started' }, undefined, undefined);
-    expect(existsSync(dir), '启动失败路径把 profile 留在了 /var/tmp').toBe(false);
+    expect(existsSync(dir), '启动失败路径留下了临时 profile').toBe(false);
   });
 
   describe('POL-U32：无 /proc 时用 ChildProcess/owned 状态，不把未知当退出', () => {
@@ -756,7 +757,7 @@ describe('⑨ 第六轮：故障关闭分支逐条有门', () => {
         oracleHygiene().liveBrowsers.filter((x) => x.dir === b.owned.dir),
         '没有 ws 就请退不动了 —— 那一档留下的浏览器模块自己永远回收不了（第六轮 A2）',
       ).toEqual([]);
-      expect(existsSync(b.owned.dir), '请退掉了却把 profile 留在 /var/tmp').toBe(false);
+      expect(existsSync(b.owned.dir), '请退掉了却把 profile 留在临时目录').toBe(false);
     }, 120_000);
   });
 
@@ -1048,7 +1049,7 @@ describe('⑩ 第七轮：段序 + A6 规矩上欠着的那几条', () => {
     });
 
     it('`waitForDevToolsEndpoint`：进程已经退了 ⇒ 抛；等超时 ⇒ 抛；写全了 ⇒ 读得出来', async () => {
-      const dir = mkdtempSync('/var/tmp/polaris-css-oracle-portfile-');
+      const dir = mkdtempSync(join(tmpdir(), 'polaris-css-oracle-portfile-'));
       try {
         // ① 子进程已经退了 —— 再等下去只会等到超时，死因在 stderr 里。
         await expect(waitForDevToolsEndpoint(fakeBrowser(3, dir), 5_000)).rejects.toThrow(
@@ -1068,6 +1069,45 @@ describe('⑩ 第七轮：段序 + A6 规矩上欠着的那几条', () => {
         rmSync(dir, { recursive: true, force: true });
       }
     }, 30_000);
+
+    it.each(['ENOENT', 'EBUSY'])('端口文件 %s 后仍等待两行写全', async (code) => {
+      const dir = join(tmpdir(), 'polaris-portfile-reader-fixture');
+      const read = vi.fn<(file: string) => string>()
+        .mockImplementationOnce(() => { throw Object.assign(new Error(code), { code }); })
+        .mockReturnValueOnce('44663\n')
+        .mockReturnValue('44663\n/devtools/browser/abc-123\n');
+      await expect(waitForDevToolsEndpoint(fakeBrowser(null, dir), 5_000, undefined, read))
+        .resolves.toEqual({ port: '44663', path: '/devtools/browser/abc-123' });
+      expect(read).toHaveBeenCalledTimes(3);
+      expect(read.mock.calls.every(([file]) => file === join(dir, 'DevToolsActivePort'))).toBe(true);
+    });
+
+    it('端口文件持续忙仍受原期限和进程退出约束', async () => {
+      const read = () => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }); };
+      const dir = join(tmpdir(), 'polaris-portfile-reader-fixture');
+      await expect(waitForDevToolsEndpoint(fakeBrowser(null, dir), 1, undefined, read))
+        .rejects.toThrow(/等 DevToolsActivePort 写全超时/);
+      await expect(waitForDevToolsEndpoint(fakeBrowser(3, dir), 5_000, undefined, read))
+        .rejects.toThrow(/Chrome 起不来（退出码 3）/);
+    });
+
+    it('端口文件权限错误仍立即失败', async () => {
+      const denied = Object.assign(new Error('denied'), { code: 'EACCES' });
+      const read = () => { throw denied; };
+      await expect(waitForDevToolsEndpoint(fakeBrowser(null, tmpdir()), 5_000, undefined, read))
+        .rejects.toBe(denied);
+    });
+
+    it('端口文件忙时仍能取消等待', async () => {
+      const controller = new AbortController();
+      const stopped = new Error('cancel portfile wait');
+      const read = () => {
+        controller.abort(stopped);
+        throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+      };
+      await expect(waitForDevToolsEndpoint(fakeBrowser(null, tmpdir()), 5_000, controller.signal, read))
+        .rejects.toBe(stopped);
+    });
 
     it('`closeOracle`：在途的度量迟迟不落地 ⇒ 抛（不是撒手继续收尾）', async () => {
       // 撒手的后果第六轮 A1 实测过：浏览器在收尾之后才起来，`OWNED` 还空着，

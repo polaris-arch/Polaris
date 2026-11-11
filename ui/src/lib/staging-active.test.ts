@@ -10,7 +10,8 @@
  *     (d) 不会。没有这一组就分不出实现的是哪一个。
  */
 import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 import { editRoute, stagingActive } from './staged-config';
 
@@ -114,7 +115,7 @@ describe('与 editRoute 合成 —— 穷举 coreRunning × entries × 改动类
  * 它在核没跑时就还会走暂存 —— (d) 对那条入口静默失效，而所有纯函数门仍绿。
  */
 describe('接线：编辑入口喂给 editRoute 的布尔必须来自 useStagingActive', () => {
-  const SRC = new URL('..', import.meta.url).pathname; // ui/src/
+  const SRC = fileURLToPath(new URL('..', import.meta.url)); // ui/src/
 
   function sources(dir = SRC, out: string[] = []): string[] {
     for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -129,7 +130,7 @@ describe('接线：编辑入口喂给 editRoute 的布尔必须来自 useStaging
   const relWith = (needle: string): string[] =>
     sources()
       .filter((p) => stripComments(readFileSync(p, 'utf8')).includes(needle))
-      .map((p) => p.slice(SRC.length))
+      .map((p) => relative(SRC, p).replaceAll('\\', '/'))
       .sort();
 
   // 变异对照：把任一入口改回 `useStagedConfigStore((s) => s.enabled)` → 本条转红。

@@ -128,16 +128,38 @@ fn administrative_self_hash_cannot_select_a_foreign_core_id() {
             assert!(require_compiled_selection(&manifest, platform).is_err());
         }
         Err(_) => {
-            // A missing candidate carrier must not fall back to a formal id.
+            // Only the exact formal pre-install helper can use the content pin;
+            // candidate/temporary failures still must not borrow a formal id.
             let core = polaris_core_supervisor::selected_core::formal_manifest(platform).unwrap();
             let id = core.id(crate::core_hash::sha256_hex).unwrap();
-            let manifest = InstalledCoreManifest {
+            let mut manifest = InstalledCoreManifest {
                 schema: "polaris-core-manifest-v1".into(),
                 id: id.as_str().into(),
                 app_version: "fixture".into(),
                 core,
             };
+            let formal_bootstrap = polaris_core_supervisor::selected_core::selection_lane()
+                == polaris_core_supervisor::selected_core::SelectionLane::Formal
+                && polaris_core_supervisor::selected_core::COMPILED_INSTALLATION
+                    == br#"{"schema":"polaris-formal-desktop-unavailable-v1"}"#
+                && polaris_core_supervisor::selected_core::COMPILED_VALIDATION_SOURCE == b"null";
+            if formal_bootstrap {
+                require_compiled_selection(&manifest, platform).unwrap();
+                // A valid self-rehashed manifest is still a foreign selection.
+                manifest.core.files[0].sha256 = "f".repeat(64);
+                manifest.id = manifest
+                    .core
+                    .id(crate::core_hash::sha256_hex)
+                    .unwrap()
+                    .as_str()
+                    .into();
+            }
             assert!(require_compiled_selection(&manifest, platform).is_err());
+            if formal_bootstrap {
+                println!(
+                    "POLARIS_TEST_FORMAL_PENDING_HELPER_SELECTION_ACCEPTED_FOREIGN_ID_REJECTED"
+                );
+            }
         }
     }
 }

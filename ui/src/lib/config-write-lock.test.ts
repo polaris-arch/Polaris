@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 // 模块级队列（`tail`）不给生产模块开复位口 —— 那是进产物的公开 API，且生产零调用点。
@@ -58,7 +59,7 @@ describe('withConfigWriteLock —— 串行语义', () => {
  * 后端 `baseVersion` 检出机制负责（见闸门头注的射程边界）。
  */
 describe('接线：主窗里的配置事务必须都在闸门内', () => {
-  const SRC = new URL('..', import.meta.url).pathname; // ui/src/
+  const SRC = fileURLToPath(new URL('..', import.meta.url)); // ui/src/
 
   /** 递归收集 ui/src 下的源码文件（去掉测试）。不含子进程、不依赖 git 索引（新文件也扫得到）。 */
   function sources(dir = SRC, out: string[] = []): string[] {
@@ -82,7 +83,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
   const filesWith = (needle: string, skip: readonly string[] = []): string[] =>
     sources()
       .filter((p) => stripComments(readFileSync(p, 'utf8')).includes(needle))
-      .map((p) => p.slice(SRC.length))
+      .map((p) => relative(SRC, p).replaceAll('\\', '/'))
       .filter((rel) => !skip.some((s) => rel.startsWith(s)))
       .sort();
 

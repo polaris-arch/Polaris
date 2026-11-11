@@ -23,7 +23,7 @@ import { describe, it, expect } from 'vitest';
 import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 const SRC = fileURLToPath(new URL('..', import.meta.url));
 
@@ -64,7 +64,7 @@ const SUBSCRIBERS = new Map<string, string>(
     )
 );
 
-const rel = (p: string) => p.slice(SRC.length);
+const rel = (p: string) => relative(SRC, p).replaceAll('\\', '/');
 
 describe('守卫自检：扫到的确实是源码（防扫空目录 / 过滤过头 → 恒绿）', () => {
   it('产品源码文件被真的收集到了', () => {

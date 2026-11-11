@@ -9,9 +9,10 @@ import { runInNewContext } from 'node:vm';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const wrapper = readFileSync(join(root, 'scripts/macos-bundler-diagnostics.sh'), 'utf8');
+const linuxWrapper = readFileSync(join(root, 'scripts/linux-bundler-diagnostics.sh'), 'utf8');
 const workflow = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
 const testShell = (name, fn) => test(name, {
-  skip: process.platform === 'win32' ? 'macOS-only POSIX wrapper; source contract runs on Windows' : false,
+  skip: process.platform === 'win32' ? 'POSIX diagnostic wrappers; source contract runs on Windows' : false,
 }, fn);
 function step(source, name) {
   const active = source.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
@@ -32,6 +33,7 @@ function evaluate(value, os, outcome = 'success') {
 }
 function assertWorkflow(source) {
   const build = step(source, 'Build installers'), evidence = step(source, 'Preserve macOS bundler evidence');
+  const linuxEvidence = step(source, 'Preserve Linux bundler evidence');
   assert.equal(field(build, 'id'), 'installers');
   assert.equal(field(build, 'uses'), 'tauri-apps/tauri-action@v1');
   assert.equal(field(build, 'args'), '${{ matrix.tauri_args }}');
@@ -39,11 +41,14 @@ function assertWorkflow(source) {
   assert.doesNotMatch(build, /continue-on-error:|TAURI_BUNDLER_DMG_IGNORE_CI:|RUST_LOG:|run:/);
   for (const os of ['macOS', 'Linux', 'Windows']) {
     assert.equal(evaluate(field(build, 'tauriScript'), os),
-      os === 'macOS' ? 'bash scripts/macos-bundler-diagnostics.sh' : 'tauri');
+      os === 'macOS' ? 'bash scripts/macos-bundler-diagnostics.sh'
+        : os === 'Linux' ? 'bash scripts/linux-bundler-diagnostics.sh' : 'tauri');
     assert.equal(evaluate(field(build, 'TAURI_CLI_VERBOSITY'), os), os === 'macOS' ? '1' : '');
     for (const outcome of ['', 'skipped', 'success', 'failure', 'cancelled']) {
       assert.equal(evaluate(field(evidence, 'if'), os, outcome),
         os === 'macOS' && !['', 'skipped'].includes(outcome));
+      assert.equal(evaluate(field(linuxEvidence, 'if'), os, outcome),
+        os === 'Linux' && !['', 'skipped'].includes(outcome));
     }
   }
   assert.match(field(evidence, 'if'), /^always\(\) && /);
@@ -57,14 +62,22 @@ function assertWorkflow(source) {
     'macos-bundler-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}');
   assert(evidence.includes('target/*/release/bundle/dmg/bundle_dmg.sh'));
   assert.doesNotMatch(evidence, /continue-on-error:|run:/);
+  assert.match(field(linuxEvidence, 'if'), /^always\(\) && /);
+  assert.equal(field(linuxEvidence, 'path'), log);
+  assert.equal(field(linuxEvidence, 'uses'), 'actions/upload-artifact@v7');
+  assert.equal(field(linuxEvidence, 'if-no-files-found'), 'error');
+  assert.equal(field(linuxEvidence, 'retention-days'), '7');
+  assert.equal(field(linuxEvidence, 'name'),
+    'linux-bundler-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}');
+  assert.doesNotMatch(linuxEvidence, /continue-on-error:|run:/);
 }
-test('macOS-only diagnostics retain the action and arguments and always archive attempted output', () => {
+test('POSIX diagnostics retain the action and product arguments and always archive attempted output', () => {
   assertWorkflow(workflow);
 });
 test('workflow negative controls reject lost logs, retries, skips and widened wrapper scope', () => {
   for (const [before, after] of [
     ["runner.os == 'macOS' && '1' || ''", "runner.os == 'macOS' && '0' || ''"],
-    ["runner.os == 'macOS' && 'bash scripts/macos-bundler-diagnostics.sh' || 'tauri'",
+    ["runner.os == 'macOS' && 'bash scripts/macos-bundler-diagnostics.sh' || runner.os == 'Linux' && 'bash scripts/linux-bundler-diagnostics.sh' || 'tauri'",
       "'bash scripts/macos-bundler-diagnostics.sh'"],
     ['          args: ${{ matrix.tauri_args }}', '          args: --bundles app'],
     ['          retryAttempts: 0', '          retryAttempts: 1'],
@@ -86,11 +99,12 @@ test('workflow negative controls reject lost logs, retries, skips and widened wr
   }
 });
 function fixture({ status = 0, teeStatus = null, source = wrapper, missingLog = false,
-  unusableLog = false, missingTauri = false, bytes = 0 } = {}) {
+  unusableLog = false, missingTauri = false, bytes = 0, prefixArgs = [],
+  target = 'aarch64-apple-darwin' } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'polaris-dmg-log-test-'));
   const log = unusableLog ? directory : join(directory, 'full output.log');
   const calls = join(directory, 'calls.jsonl'), script = join(directory, 'wrapper.sh');
-  const args = ['build', '--target', 'aarch64-apple-darwin', '--config',
+  const args = ['build', '--target', target, '--config',
     'config with spaces.json', '--', 'literal;$HOME', 'line\nbreak', ''];
   const out = 'original stdout\n' + 'O'.repeat(bytes) + '\nstdout end\n';
   const err = 'original stderr\n' + 'E'.repeat(bytes) + '\nstderr end\n';
@@ -118,14 +132,14 @@ function fixture({ status = 0, teeStatus = null, source = wrapper, missingLog = 
       env, encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024,
     });
     assert.ifError(result.error);
-    return { ...result, args, out, err,
+    return { ...result, args, expectedArgs: [...prefixArgs, ...args], out, err,
       log: !unusableLog && existsSync(log) ? readFileSync(log, 'utf8') : '',
       calls: existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse) : [] };
   } finally { rmSync(directory, { recursive: true, force: true }); }
 }
 function assertOriginalFailure(result, expected = 37) {
   assert.equal(result.status, expected, result.stderr + result.log.slice(-3000));
-  assert.deepEqual(result.calls, [result.args], 'exactly one unchanged Tauri invocation');
+  assert.deepEqual(result.calls, [result.expectedArgs], 'exactly one Tauri invocation with only admitted diagnostic flags');
   assert(result.log.includes(result.out), 'original stdout missing');
   assert(result.log.includes(result.err), 'original stderr missing');
 }
@@ -171,3 +185,39 @@ testShell('runtime negative controls reject dropped stderr, swallowed exit statu
   }
 });
 
+
+testShell('Linux explicit CLI Debug preserves full output, every product argument and the original exit', () => {
+  for (const status of [0, 1, 37, 127, 143]) {
+    const result = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'],
+      target: 'x86_64-unknown-linux-gnu', status, bytes: status === 37 ? 256 * 1024 : 0 });
+    assertOriginalFailure(result, status);
+    assert.equal(result.log, result.stdout);
+    assert.doesNotMatch(result.log + result.stdout + result.stderr, /must-not-print-/);
+  }
+});
+testShell('Linux evidence failure cannot make a failed bundler green or start it without a destination', () => {
+  for (const status of [0, 37]) {
+    const result = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'], status, teeStatus: 19 });
+    assert.equal(result.status, status || 19);
+    assert.deepEqual(result.calls, [result.expectedArgs]);
+  }
+  for (const options of [{ missingLog: true }, { unusableLog: true }]) {
+    const result = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'], ...options });
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(result.calls, []);
+  }
+  const failed = fixture({ source: linuxWrapper, prefixArgs: ['--verbose'], missingTauri: true });
+  assert.notEqual(failed.status, 0);
+  assert(failed.log.length > 0);
+});
+testShell('Linux negative controls reject environment-only verbosity, swallowed failures and lost stderr', () => {
+  for (const [before, after] of [
+    ['tauri --verbose "$@"', 'tauri "$@"'],
+    ['exit "${statuses[0]}"', 'exit 0'],
+    ['"$@" 2>&1 | tee', '"$@" | tee'],
+  ]) {
+    const source = linuxWrapper.replace(before, after);
+    assert.notEqual(source, linuxWrapper);
+    assert.throws(() => assertOriginalFailure(fixture({ source, prefixArgs: ['--verbose'], status: 37 })));
+  }
+});

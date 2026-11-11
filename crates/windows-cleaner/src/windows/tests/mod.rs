@@ -7,6 +7,127 @@ fn parent(path: &Path) -> File {
         .open(path)
         .unwrap()
 }
+
+fn attribute_handle(path: &Path) -> File {
+    let name = wide(path.as_os_str());
+    // Attribute-only opens are outside the share-read data/write exclusion.
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    assert_ne!(raw, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+    unsafe { File::from_raw_handle(raw.cast()) }
+}
+
+fn set_fixture_junction(file: &File, target: &Path) -> io::Result<()> {
+    let mut substitute = OsString::from(r"\??\");
+    substitute.push(target);
+    let substitute: Vec<u16> = substitute.encode_wide().collect();
+    let print: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let mut names = substitute.clone();
+    names.push(0);
+    names.extend(&print);
+    names.push(0);
+    let mut bytes = Vec::new();
+    bytes.extend(0xa0000003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+    bytes.extend(u16::try_from(8 + names.len() * 2).unwrap().to_le_bytes());
+    bytes.extend(0u16.to_le_bytes());
+    for value in [
+        0,
+        substitute.len() * 2,
+        (substitute.len() + 1) * 2,
+        print.len() * 2,
+    ] {
+        bytes.extend(u16::try_from(value).unwrap().to_le_bytes());
+    }
+    for unit in names {
+        bytes.extend(unit.to_le_bytes());
+    }
+    let mut returned = 0;
+    bool_ok(unsafe {
+        DeviceIoControl(
+            handle(file),
+            0x000900a4,
+            bytes.as_ptr().cast(),
+            bytes.len() as u32,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+        )
+    })
+}
+
+#[test]
+fn pinned_child_prevents_attribute_only_ancestor_junction_conversion() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("ancestor");
+    let target = temp.path().join("foreign");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(directory.join("held"), b"original").unwrap();
+    let ancestor = child(
+        &parent(temp.path()),
+        OsStr::new("ancestor"),
+        false,
+        false,
+        null_mut(),
+    )
+    .unwrap();
+    let leaf = child(&ancestor, OsStr::new("held"), false, false, null_mut()).unwrap();
+    let attribute = attribute_handle(&directory);
+    assert!(set_fixture_junction(&attribute, &target).is_err());
+    assert!(info(&ancestor).is_ok());
+    assert_eq!(std::fs::read(directory.join("held")).unwrap(), b"original");
+    drop(attribute);
+    drop(leaf);
+    drop(ancestor);
+}
+
+#[test]
+fn empty_ancestor_junction_cannot_redirect_a_relative_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("ancestor");
+    let target = temp.path().join("foreign");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("sentinel"), b"foreign untouched").unwrap();
+    let ancestor = child(
+        &parent(temp.path()),
+        OsStr::new("ancestor"),
+        false,
+        false,
+        null_mut(),
+    )
+    .unwrap();
+    let attribute = attribute_handle(&directory);
+    // This must really mutate the empty ancestor despite its data/read lock;
+    // failure to exercise the competitor is not evidence for the policy.
+    set_fixture_junction(&attribute, &target).unwrap();
+    assert!(child(&ancestor, OsStr::new("sentinel"), false, false, null_mut()).is_err());
+    let created = child(&ancestor, OsStr::new("new-private"), true, true, null_mut());
+    assert!(
+        !target.join("new-private").exists(),
+        "relative creation must never use the junction target"
+    );
+    if let Ok(created) = created {
+        delete_same(&created).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(target.join("sentinel")).unwrap(),
+        b"foreign untouched"
+    );
+    drop(attribute);
+    drop(ancestor);
+    std::fs::remove_dir(&directory).unwrap();
+}
 #[test]
 fn relative_open_rejects_traversal_ads_and_separators() {
     let temp = tempfile::tempdir().unwrap();
@@ -25,6 +146,19 @@ fn relative_open_rejects_traversal_ads_and_separators() {
             "{name:?}"
         );
     }
+}
+
+#[test]
+fn missing_support_is_empty_success_but_a_present_invalid_target_is_not_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let sentinel = temp.path().join("unrelated");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    cleanup_tree(&parent(temp.path())).unwrap();
+    let target = temp.path().join(SUPPORT_LEAF);
+    std::fs::write(&target, b"invalid support target").unwrap();
+    assert!(cleanup_tree(&parent(temp.path())).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"invalid support target");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
 }
 #[test]
 fn pinned_object_blocks_replacement_and_writes_until_close() {

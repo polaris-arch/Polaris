@@ -141,6 +141,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, onTestFinished, TestRunner } from 'vitest';
@@ -945,7 +946,7 @@ export interface SpawnedBrowser {
  * 它必须跟生产路径起同一种浏览器，抄一份参数就成了「测的不是生产那条腿」。
  */
 export function spawnOwnedBrowser(): SpawnedBrowser {
-  const dir = mkdtempSync('/var/tmp/polaris-css-oracle-');
+  const dir = mkdtempSync(join(tmpdir(), 'polaris-css-oracle-'));
   const owned: Owned = { pid: undefined, dir, closed: false, state: 'starting' };
   OWNED.push(owned);
   let child: ChildProcess;
@@ -979,18 +980,27 @@ export function spawnOwnedBrowser(): SpawnedBrowser {
  *
  * 「文件存在」不等于「写完了」：Chrome 分两行写，中间那一瞬读出来的 path 是 `undefined`。
  * 这里的循环条件是 [`parseDevToolsEndpoint`] 给出非 `null`，不是 `existsSync`。
+ * Windows 上文件出现后也可能尚被写者锁住；ENOENT / EBUSY 沿同一期限等待，不重启浏览器。
  */
 export async function waitForDevToolsEndpoint(
   b: SpawnedBrowser,
   timeoutMs: number = ORACLE_TIMING.endpointMs,
   signal?: AbortSignal,
+  readPortFile: (file: string) => string = (file) => readFileSync(file, 'utf8'),
 ): Promise<{ port: string; path: string }> {
   const portFile = join(b.owned.dir, 'DevToolsActivePort');
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     signal?.throwIfAborted();
-    if (existsSync(portFile)) {
-      const ep = parseDevToolsEndpoint(readFileSync(portFile, 'utf8'));
+    let raw: string | undefined;
+    try {
+      raw = readPortFile(portFile);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code !== 'ENOENT' && code !== 'EBUSY') throw error;
+    }
+    if (raw !== undefined) {
+      const ep = parseDevToolsEndpoint(raw);
       if (ep !== null) return ep;
     }
     if (b.child.exitCode !== null || b.child.signalCode != null || b.owned.state === 'failed')

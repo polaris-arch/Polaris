@@ -906,7 +906,7 @@ const STYLE_BLOCK = /<style[^>]*>([\s\S]*?)<\/style>/g;
 
 const handwrittenSources = (): Source[] => {
   const srcs: Source[] = walkCss(SRC_ROOT).map((p) => ({
-    label: relative(UI_ROOT, p),
+    label: relative(UI_ROOT, p).replaceAll('\\', '/'),
     css: stripNoise(readFileSync(p, 'utf8')),
   }));
   // HTML 入口内联 <style>（index.html 的首帧主题兜底就住在这里）
@@ -1288,7 +1288,7 @@ describe('⑥ 构建产物面豁免项的兜底', () => {
       ),
     );
     expect(
-      withDateInput.map((p) => relative(UI_ROOT, p)),
+      withDateInput.map((p) => relative(UI_ROOT, p).replaceAll('\\', '/')),
       'date/time 输入控件出现了 ⇒ lh 的豁免理由不再成立，需要另想兜底',
     ).toEqual([]);
   });

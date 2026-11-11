@@ -1324,6 +1324,20 @@ jobs:
           set -euo pipefail
           export POLARIS_BUILD_ID="$CORE_CANDIDATE"
           cargo build --locked -p polaris-helper --bin polaris-helper 2>&1 | tee native-dns-ci-evidence/helper-build.log
+          if [ "${POLARIS_NATIVE_DNS_FORMAL:-}" = 1 ]; then
+            # Exercise the actual helper bootstrap, before its own hash and the
+            # final App identity exist. No altered feature or supplier input.
+            [ -z "${POLARIS_CORE_IDENTITY_FILE+x}" ]
+            [ -z "${POLARIS_NATIVE_DNS_CANDIDATE+x}" ]
+            test_name=selected_core::tests::installer_bootstrap_pin_does_not_admit_an_execution_selection
+            cargo test --locked -p polaris-core-supervisor --lib "$test_name" -- --exact --nocapture 2>&1 | tee native-dns-ci-evidence/formal-pending-installer-pin.log
+            grep -F 'test result: ok. 1 passed; 0 failed;' native-dns-ci-evidence/formal-pending-installer-pin.log
+            grep -F 'POLARIS_TEST_FORMAL_PENDING_INSTALLER_PIN_ACCEPTED_EXECUTION_REJECTED' native-dns-ci-evidence/formal-pending-installer-pin.log
+            test_name=core_cli::tests::administrative_self_hash_cannot_select_a_foreign_core_id
+            cargo test --locked -p polaris-helper --lib "$test_name" -- --exact --nocapture 2>&1 | tee native-dns-ci-evidence/formal-pending-helper-selection.log
+            grep -F 'test result: ok. 1 passed; 0 failed;' native-dns-ci-evidence/formal-pending-helper-selection.log
+            grep -F 'POLARIS_TEST_FORMAL_PENDING_HELPER_SELECTION_ACCEPTED_FOREIGN_ID_REJECTED' native-dns-ci-evidence/formal-pending-helper-selection.log
+          fi
           if [ "$RUNNER_OS" = Windows ]; then
             # Independent single-link copy: Cargo target output can be hardlinked.
             cp target/debug/polaris-helper.exe native-dns-ci-evidence/polaris-helper.exe

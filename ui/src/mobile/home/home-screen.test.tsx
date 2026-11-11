@@ -43,7 +43,7 @@ import { inMobileShell } from '@/styles/mount.test-support';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { ServerConfig } from '@/contracts/types';
 import { HomeScreenView, RuleHitsSheet, RULE_ACTION_KEY, RULE_ACTION_ORDER } from './HomeScreenView';
 import {
@@ -383,7 +383,7 @@ describe('⓪ 自检：判据的取材面是活的', () => {
   });
 
   it('源码 / CSS 取材面非空，且**不含**本测试文件（否则门会对着自己的禁令列表报红）', () => {
-    expect(HOME_SRC.map((p) => p.split('/').pop())).toContain('HomeScreenView.tsx');
+    expect(HOME_SRC.map((p) => basename(p))).toContain('HomeScreenView.tsx');
     expect(HOME_SRC.some((p) => p.endsWith('.test.tsx'))).toBe(false);
     expect(HOME_TEXT.length).toBeGreaterThan(5000);
     expect(HOME_CSS.length).toBeGreaterThan(3000);

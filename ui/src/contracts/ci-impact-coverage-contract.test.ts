@@ -597,8 +597,9 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       mkdirSync(join(root, 'resources'));
       mkdirSync(join(root, 'fetched'));
       for (const name of ['dashboard', 'linux', '__not_registered__']) {
-        symlinkSync(join(root, 'fetched'), join(root, 'resources', name), 'dir');
+        symlinkSync(join(root, 'fetched'), join(root, 'resources', name), process.platform === 'win32' ? 'junction' : 'dir');
       }
+      expect(readdirSync(join(root, 'resources'), { withFileTypes: true }).every((entry) => entry.isSymbolicLink())).toBe(true);
       const scopes = scopeKeys('resources', root);
       expect(scopes).toEqual([
         'resources/__not_registered__/', 'resources/dashboard/', 'resources/linux/',

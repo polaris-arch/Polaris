@@ -29,7 +29,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
@@ -296,7 +296,7 @@ describe('update:progress 的消费点', () => {
     expect(files.length, '递归遍历 ui/src 一个源文件都没拿到 —— 取材器失效').toBeGreaterThan(50);
     const consumers = files.filter((f) => readFileSync(f, 'utf8').includes('updateApi.onProgress('));
     expect(
-      consumers.map((f) => f.replace(/^.*\/ui\/src\//, '')).sort(),
+      consumers.map((f) => relative(fileURLToPath(new URL('..', import.meta.url)), f).replaceAll('\\', '/')).sort(),
       '`update:progress` 的消费点与登记表对不上 —— 剥除表的扫描面按消费点逐个配，' +
         '新消费者会静默出界（读到的被剥字段恒 undefined，两道门都不响）',
     ).toEqual([...CONSUMERS].sort());

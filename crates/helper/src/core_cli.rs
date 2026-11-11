@@ -72,8 +72,8 @@ fn invalid(reason: &'static str) -> io::Error {
 }
 
 fn require_compiled_selection(manifest: &InstalledCoreManifest, platform: &str) -> io::Result<()> {
-    let selected =
-        polaris_core_supervisor::selected_core::selected_id(platform).map_err(io::Error::other)?;
+    let selected = polaris_core_supervisor::selected_core::selected_installer_id(platform)
+        .map_err(io::Error::other)?;
     if manifest.id != selected.as_str() {
         return Err(invalid("installation differs from compiled selected core"));
     }

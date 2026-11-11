@@ -38,7 +38,7 @@ import { describe, it, expect } from 'vitest';
 import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import * as ts from '@/test/ts-compiler';
 import { aliasWriteLegs, ALIAS_FIXTURE, ALIAS_FIXTURE_LEGS } from '@/test/write-leg-aliases';
 
@@ -71,7 +71,7 @@ function code(src: string): string {
  * 本轮加这条排除正是被下面那条自检抓出来的）。
  * 代价是「有人把产品代码塞进 `src/test/`」会静默逃出判据面 ⇒ 由下面「适配层清单逐字对拍」兜住。
  */
-const TEST_ADAPTER_DIR = join('src', 'test') + '/';
+const TEST_ADAPTER_DIR = join('src', 'test') + sep;
 
 function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -136,7 +136,7 @@ function scan(): Hit[] {
   const hits: Hit[] = [];
   for (const p of sourceFiles(SRC)) {
     // api-client（barrel + 按域拆分的 ipc/api/ 目录）是这些方法的**定义**处，不是调用点。
-    if (p.endsWith(join('ipc', 'api-client.ts')) || p.includes(join('ipc', 'api') + '/')) continue;
+    if (p.endsWith(join('ipc', 'api-client.ts')) || p.includes(join('ipc', 'api') + sep)) continue;
     const src = code(readFileSync(p, 'utf8'));
     // 绑定别名腿（句柄成员访问 / 解构改名 / 选择器改名）与静态判据面同口径，见 `@/test/write-leg-aliases`。
     const aliased: Array<readonly [string, RegExp]> = aliasWriteLegs(src, STORE_CONFIG_WRITES).map(
@@ -145,7 +145,7 @@ function scan(): Hit[] {
     for (const [tag, re] of [...PATTERNS, ...aliased]) {
       for (const m of src.matchAll(re)) {
         hits.push({
-          file: p.slice(SRC.length).split(/[\\/]/).join('/'),
+          file: relative(SRC, p).replaceAll('\\', '/'),
           callee: m[0].replace(/\s+/g, ''),
           line: src.slice(0, m.index).split('\n').length,
           index: m.index,
@@ -167,7 +167,7 @@ const HITS = scan();
 if (FILES.length < 100) throw new Error(`接线守卫扫不到源码（只收到 ${FILES.length} 个文件）`);
 if (HITS.length < 90) throw new Error(`接线守卫只扫到 ${HITS.length} 个写入口，判据面已失配`);
 
-const SOURCE = new Map(FILES.map((p) => [p.slice(SRC.length).split(/[\\/]/).join('/'), code(readFileSync(p, 'utf8'))]));
+const SOURCE = new Map(FILES.map((p) => [relative(SRC, p).replaceAll('\\', '/'), code(readFileSync(p, 'utf8'))]));
 
 // ─────────────────────────── 闸门判据（AST 侧） ───────────────────────────
 

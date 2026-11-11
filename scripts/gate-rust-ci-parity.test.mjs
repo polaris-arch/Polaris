@@ -447,6 +447,8 @@ function assertCandidateOnlySteps(ci, controlled) {
   const commands = (block) => block.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('cargo '));
   assert.deepEqual(commands(build), [
     'cargo build --locked -p polaris-helper --bin polaris-helper 2>&1 | tee native-dns-ci-evidence/helper-build.log',
+    'cargo test --locked -p polaris-core-supervisor --lib "$test_name" -- --exact --nocapture 2>&1 | tee native-dns-ci-evidence/formal-pending-installer-pin.log',
+    'cargo test --locked -p polaris-helper --lib "$test_name" -- --exact --nocapture 2>&1 | tee native-dns-ci-evidence/formal-pending-helper-selection.log',
     'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner 2>&1 | tee native-dns-ci-evidence/cleaner-build.log',
   ]);
   assert.match(build, /if \[ "\$RUNNER_OS" = Windows \]; then/);

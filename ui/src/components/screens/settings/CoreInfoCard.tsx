@@ -50,7 +50,7 @@ export default function CoreInfoCard({ info, selectedCore, onRecovered, recovery
   }
   return (
     <SetBlock id="core-info-card" header={t('settings.update.coreCard')}>
-      {recoveryComplete && <p role="status" className="core-card-note">{t('coreRecovery.restored')}</p>}
+      {recoveryComplete && <p role="status" className="card-sub core-card-note">{t('coreRecovery.restored')}</p>}
       {info?.admission?.state === 'rejected' && (
         <div className="core-admission" data-core-admission={info.admission.kind}>
           <FeedbackNotice tone={coreAdmissionIsDamage(info.admission.kind) ? 'error' : 'warning'} title={t(coreAdmissionMessageKey(info.admission.kind))} />

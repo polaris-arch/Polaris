@@ -1183,7 +1183,7 @@ jobs:
           TAURI_CLI_VERBOSITY: ${{ runner.os == 'macOS' && '1' || '' }}
           POLARIS_TAURI_LOG: ${{ runner.temp }}/polaris-tauri-${{ matrix.label }}.log
         with:
-          tauriScript: ${{ runner.os == 'macOS' && 'bash scripts/macos-bundler-diagnostics.sh' || 'tauri' }}
+          tauriScript: ${{ runner.os == 'macOS' && 'bash scripts/macos-bundler-diagnostics.sh' || runner.os == 'Linux' && 'bash scripts/linux-bundler-diagnostics.sh' || 'tauri' }}
           args: ${{ matrix.tauri_args }}
           retryAttempts: 0
 
@@ -1208,6 +1208,15 @@ jobs:
             target/*/release/bundle/dmg/*.log
             target/release/bundle/dmg/bundle_dmg.sh
             target/release/bundle/dmg/*.log
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve Linux bundler evidence
+        if: always() && runner.os == 'Linux' && steps.installers.outcome != 'skipped' && steps.installers.outcome != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-bundler-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
+          path: ${{ runner.temp }}/polaris-tauri-${{ matrix.label }}.log
           if-no-files-found: error
           retention-days: 7
 
@@ -1372,16 +1381,34 @@ jobs:
           guide_x=330
           guide_y=330
           [ -f "$guide" ] || { echo "::error::引导文件不存在: $guide"; exit 1; }
-          # detach 偶发 "resource busy"（Spotlight/mds 刚扫过），一次重试足够；
-          # 不重试的话整条腿会因为一次时序抖动红掉，而产物其实是好的。
-          detach_retry() { hdiutil detach "$1" -quiet || { sleep 2; hdiutil detach "$1" -force -quiet; }; }
+          # One normal + one forced detach budget per owned mount, including EXIT.
+          # Keep native stderr and exit codes; failure is not proof of a good artifact.
+          detach_retry() {
+            local normal_status force_status
+            [ -n "$owned_mnt" ] && [ "$1" = "$owned_mnt" ] || {
+              echo "::error::Refusing detach outside the owned guide mount" >&2
+              return 1
+            }
+            if [ "$detach_attempted" = 1 ]; then
+              echo "::error::Owned guide mount detach already attempted; EXIT will not replay it: $1" >&2
+              return 1
+            fi
+            detach_attempted=1
+            if hdiutil detach "$1"; then owned_mnt=""; return 0; else normal_status=$?; fi
+            echo "::warning::Owned guide mount normal detach exited $normal_status: $1" >&2
+            sleep 2
+            if hdiutil detach "$1" -force; then owned_mnt=""; return 0; else force_status=$?; fi
+            echo "::error::Owned guide mount forced detach exited $force_status: $1" >&2
+            return "$force_status"
+          }
           owned_mnt=""
+          detach_attempted=0
           cleanup_owned_mount() {
             local cleanup_status=$?
             trap - EXIT
             if [ -n "$owned_mnt" ] && ! detach_retry "$owned_mnt"; then
               echo "::error::Failed to detach owned guide mount: $owned_mnt" >&2
-              cleanup_status=1
+              if [ "$cleanup_status" = 0 ]; then cleanup_status=1; fi
             fi
             exit "$cleanup_status"
           }
@@ -1408,6 +1435,7 @@ jobs:
             mnt=$(cd "$mnt" && pwd -P)
             hdiutil attach "$rw" -mountpoint "$mnt" -nobrowse -noverify -quiet
             owned_mnt="$mnt"
+            detach_attempted=0
             cp "$guide" "$mnt/$guide_name"
             # Tauri 先生成 Finder 的 .DS_Store，本步骤随后才把指南复制进去；只 cp 会让文件没有
             # Iloc（图标坐标），实际打开 DMG 时必须放大窗口或滚动才看得到。让 Finder 把指南
@@ -1487,14 +1515,32 @@ jobs:
           guide_x=330
           guide_y=330
           min_window_height=500
-          detach_retry() { hdiutil detach "$1" -quiet || { sleep 2; hdiutil detach "$1" -force -quiet; }; }
+          detach_retry() {
+            local normal_status force_status
+            [ -n "$owned_mnt" ] && [ "$1" = "$owned_mnt" ] || {
+              echo "::error::Refusing detach outside the owned guide mount" >&2
+              return 1
+            }
+            if [ "$detach_attempted" = 1 ]; then
+              echo "::error::Owned guide mount detach already attempted; EXIT will not replay it: $1" >&2
+              return 1
+            fi
+            detach_attempted=1
+            if hdiutil detach "$1"; then owned_mnt=""; return 0; else normal_status=$?; fi
+            echo "::warning::Owned guide mount normal detach exited $normal_status: $1" >&2
+            sleep 2
+            if hdiutil detach "$1" -force; then owned_mnt=""; return 0; else force_status=$?; fi
+            echo "::error::Owned guide mount forced detach exited $force_status: $1" >&2
+            return "$force_status"
+          }
           owned_mnt=""
+          detach_attempted=0
           cleanup_owned_mount() {
             local cleanup_status=$?
             trap - EXIT
             if [ -n "$owned_mnt" ] && ! detach_retry "$owned_mnt"; then
               echo "::error::Failed to detach owned guide mount: $owned_mnt" >&2
-              cleanup_status=1
+              if [ "$cleanup_status" = 0 ]; then cleanup_status=1; fi
             fi
             exit "$cleanup_status"
           }
@@ -1506,6 +1552,7 @@ jobs:
             mnt=$(cd "$mnt" && pwd -P)
             hdiutil attach "$dmg" -mountpoint "$mnt" -nobrowse -readonly -quiet
             owned_mnt="$mnt"
+            detach_attempted=0
             apps=("$mnt"/*.app)
             if [ "${#apps[@]}" -ne 1 ] || ! codesign --verify --deep --strict --verbose=2 "${apps[0]}"; then
               echo "::error::$(basename "$dmg") 内 app 未通过最终 bundle seal 严格校验"

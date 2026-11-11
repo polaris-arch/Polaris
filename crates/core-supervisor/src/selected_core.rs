@@ -402,6 +402,22 @@ pub fn selected_id(platform: &str) -> Result<CoreId, String> {
         .map_err(|reason| format!("CORE_BUNDLE_MISMATCH: {reason}"))
 }
 
+/// Installation utility data pin, never an execution or installed-manifest grant.
+/// The helper is built before its own hash can be frozen into the App's
+/// installation manifest. Only that exact formal bootstrap state may read the
+/// same compiled contract's content-only id; all other selections stay strict.
+pub fn selected_installer_id(platform: &str) -> Result<CoreId, String> {
+    #[cfg(feature = "formal-selection")]
+    if COMPILED_INSTALLATION == br#"{"schema":"polaris-formal-desktop-unavailable-v1"}"#
+        && COMPILED_VALIDATION_SOURCE == b"null"
+    {
+        return formal_manifest(platform)?
+            .id(sha256_hex)
+            .map_err(|reason| format!("CORE_BUNDLE_MISMATCH: {reason}"));
+    }
+    selected_id(platform)
+}
+
 pub fn current_platform() -> Result<&'static str, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok("linux"),

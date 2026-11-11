@@ -13,6 +13,7 @@ sha2 = "0.11"
 hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+log = "0.4"
 # Existing workspace dependency; all privileged IO stays in one native module.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",

@@ -108,7 +108,10 @@ hdiutil() {
       [ "$STUB_BAD_GUIDE" = 0 ] || printf corrupted > "$1/README First.txt" ;;
     detach)
       printf 'detach:%s\n' "$2" >> "$STUB_LOG"
-      [ "$STUB_DETACH_FAIL" = 0 ] || return 22 ;;
+      if [ "$STUB_DETACH_FAIL" != 0 ] || { [ "$STUB_DETACH_FAIL_ONCE" = 1 ] && [ "$(grep -c '^detach:' "$STUB_LOG")" = 1 ]; }; then
+        echo 'hdiutil stub: detach failed (22)' >&2
+        return 22
+      fi ;;
     *) return 23 ;;
   esac
 }
@@ -149,7 +152,7 @@ function runGuideStep(name, options = {}) {
     writeFileSync(log, '');
     const result = spawnSync('bash', ['-c', `${stubCommands}\n${guideStep(name)}`], {
       cwd: root, encoding: 'utf8', env: { ...process.env, TMPDIR: `${root}/`, STUB_LOG: log,
-        STUB_ATTACH_FAIL: '0', STUB_BAD_GUIDE: '0', STUB_DETACH_FAIL: '0', STUB_SCRIPT_FAIL_ON: '0', STUB_CODESIGN_FAIL: '0',
+        STUB_ATTACH_FAIL: '0', STUB_BAD_GUIDE: '0', STUB_DETACH_FAIL: '0', STUB_DETACH_FAIL_ONCE: '0', STUB_SCRIPT_FAIL_ON: '0', STUB_CODESIGN_FAIL: '0',
         STUB_IMAGE_BYTES: '41943057',
         STUB_APPLESCRIPT: join(root, 'script.applescript'), STUB_LAYOUT: name === guideSteps[0] ? '330,330' : '330,330;500', ...options.env },
     });
@@ -328,6 +331,31 @@ test('cleanup failure is visible and cannot turn a failed Finder operation into 
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /Finder stub: close event failed/);
     assert.match(result.stderr, /Failed to detach owned guide mount/);
+    const attached = result.calls.find((line) => line.startsWith('attach:')).slice(7);
+    assert.deepEqual(result.calls.filter((line) => line.startsWith('detach:')), [`detach:${attached}`, `detach:${attached}`]);
+  }
+});
+
+test('normal detach failure retains diagnostics and EXIT does not repeat its force budget', { skip: !posix }, () => {
+  for (const name of guideSteps) {
+    const result = runGuideStep(name, { env: { STUB_DETACH_FAIL: '1' } });
+    assert.equal(result.status, 22, 'preserve the primary native failure through EXIT');
+    assert.match(result.stderr, /hdiutil stub: detach failed \(22\)/);
+    assert.match(result.stderr, /normal detach exited 22/);
+    assert.match(result.stderr, /forced detach exited 22/);
+    assert.match(result.stderr, /EXIT will not replay/);
+    const attached = result.calls.find((line) => line.startsWith('attach:')).slice(7);
+    assert.deepEqual(result.calls.filter((line) => line.startsWith('detach:')), [`detach:${attached}`, `detach:${attached}`]);
+    if (name === guideSteps[0]) assert.equal(result.calls.filter((line) => line === 'convert:UDZO').length, 0);
+  }
+});
+
+test('one graceful failure can use the existing owned force fallback once', { skip: !posix }, () => {
+  for (const name of guideSteps) {
+    const result = runGuideStep(name, { env: { STUB_DETACH_FAIL_ONCE: '1' } });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /normal detach exited 22/);
+    assert.doesNotMatch(result.stderr, /forced detach exited|EXIT will not replay/);
     const attached = result.calls.find((line) => line.startsWith('attach:')).slice(7);
     assert.deepEqual(result.calls.filter((line) => line.startsWith('detach:')), [`detach:${attached}`, `detach:${attached}`]);
   }

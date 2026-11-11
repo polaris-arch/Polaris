@@ -91,6 +91,77 @@ fn source_user_is_permitted_only_in_launch_policy() {
         true
     ));
 }
+
+#[test]
+fn shared_ancestor_creation_and_attributes_do_not_grant_leaf_mutation() {
+    // C's ProgramData projection: Everyone 0012019F / Users 00000116.
+    let grants = [
+        ace(0, 0, 0x0012_019f, "S-1-1-0"),
+        ace(0, 0, 0x116, "S-1-5-32-545"),
+    ];
+    assert!(trusted_security(SYSTEM, Some(&grants), None, true));
+    assert!(!trusted_security(SYSTEM, Some(&grants), None, false));
+    for bit in [0x40, 0x10000, 0x40000, 0x80000, 0x10000000, 0x40000000] {
+        assert!(!trusted_security(
+            SYSTEM,
+            Some(&[ace(0, 0, bit, "foreign")]),
+            None,
+            true
+        ));
+    }
+}
+
+#[test]
+fn appcontainer_intersection_never_trusts_a_foreign_primary_grant_or_owner() {
+    for sid in [
+        "S-1-15-2-1",
+        "S-1-15-2-2",
+        "S-1-15-2-10-20-30-40-50-60-70",
+        "S-1-15-3-1",
+    ] {
+        let capability = ace(0, 0, 0x001f_01ff, sid);
+        let grants = [ace(0, 0, WRITE_MASK, "caller"), capability];
+        assert!(trusted_security(
+            "caller",
+            Some(&grants),
+            Some("caller"),
+            true
+        ));
+        assert!(trusted_security(
+            "caller",
+            Some(&grants),
+            Some("caller"),
+            false
+        ));
+        assert!(!trusted_security("caller", Some(&grants), None, false));
+        assert!(!trusted_security(sid, Some(&grants), Some("caller"), true));
+        for ancestor in [false, true] {
+            for bit in [0x40, 0x10000, 0x40000, 0x80000, 0x10000000] {
+                let foreign = [ace(0, 0, 0x001f_01ff, sid), ace(0, 0, bit, "foreign")];
+                assert!(!trusted_security(SYSTEM, Some(&foreign), None, ancestor));
+            }
+        }
+        for bit in [2, 4, 16, 256] {
+            let foreign = [ace(0, 0, 0x001f_01ff, sid), ace(0, 0, bit, "foreign")];
+            assert!(!trusted_security(SYSTEM, Some(&foreign), None, false));
+        }
+    }
+    for sid in [
+        "S-1-15",
+        "S-1-15-4-1",
+        "S-1-15-3",
+        "S-1-15-3-",
+        "S-1-15-3-+1",
+        "S-1-15-3-4294967296",
+    ] {
+        assert!(!trusted_security(
+            SYSTEM,
+            Some(&[ace(0, 0, WRITE_MASK, sid)]),
+            None,
+            true
+        ));
+    }
+}
 #[test]
 fn unknown_exit_does_not_become_success() {
     assert_eq!(Outcome::from_code(0), Outcome::Success);

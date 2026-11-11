@@ -261,15 +261,15 @@ export default function SettingsAbout() {
               {/* 按后端返回的数组序渲染 —— 那就是因果执行序，前端不重排、不筛掉任何一项。
                   「未执行」的项**必须**也显示：它是 fail-fast 生效的证据，藏起来等于假装没这回事。 */}
               {report.steps.map((s) => (
-                <li key={s.step} style={{ display: 'flex', gap: 8, padding: '4px 0' }}>
-                  <span style={{ flex: '0 0 auto', color: KIND_META[s.outcome.kind].tone }}>
-                    {t(KIND_META[s.outcome.kind].key)}
-                  </span>
-                  <span style={{ flex: 1, minWidth: 0 }}>
-                    <span>{t(STEP_KEY[s.step])}</span>
+                <li key={s.step} className="set-row uninstall-step" style={{ alignItems: 'flex-start', gap: 8, padding: '4px 0', overflowWrap: 'anywhere' }}>
+                  <div className="sr-tx" style={{ flex: '0 0 auto', color: KIND_META[s.outcome.kind].tone }}>
+                    <b>{t(KIND_META[s.outcome.kind].key)}</b>
+                  </div>
+                  <div className="sr-tx">
+                    <b>{t(STEP_KEY[s.step])}</b>
                     {/* detail 由后端给（含真实路径 / 失败原因 / 为什么本平台做不到），不在前端复述 */}
                     <CardSub style={{ wordBreak: 'break-word' }}>{s.outcome.detail}</CardSub>
-                  </span>
+                  </div>
                 </li>
               ))}
             </ul>

@@ -758,7 +758,13 @@ impl Image {
         Ok(image)
     }
     fn check(&self) -> io::Result<()> {
-        let _ = &self.chain;
+        // The executable and every next component remain pinned without DELETE
+        // sharing. Thus each named ancestor is nonempty and cannot acquire a
+        // reparse point through an attribute-only handle (MS-FSA 2.1.5.10.37).
+        // Recheck after the leaf was captured, before handing its name to UAC.
+        for directory in &self.chain.dirs {
+            info(directory)?;
+        }
         if identity(&self.file)? == self.identity {
             Ok(())
         } else {
@@ -768,7 +774,12 @@ impl Image {
 }
 
 fn elevate(image: Image) -> Outcome {
-    if image.check().is_err() {
+    if let Err(e) = image.check() {
+        log::warn!(
+            "native cleaner refused stage=controller-image-recheck kind={:?} os_code={:?}",
+            e.kind(),
+            e.raw_os_error()
+        );
         return Outcome::Refused;
     }
     let verb = wide(OsStr::new("runas"));
@@ -820,6 +831,14 @@ fn elevate(image: Image) -> Outcome {
         return Outcome::LaunchFailed;
     }
     let outcome = Outcome::from_code(code);
+    log::info!("native cleaner stage=worker-exit child_exit={code} outcome={outcome:?}");
+    if outcome == Outcome::Refused {
+        // ShellExecuteExW provides only an exit code, not the elevated child's
+        // stderr. Exit 2 here proves neither which preflight failed nor cleanup.
+        log::warn!(
+            "native cleaner refused stage=worker-preflight; token or fixed ProgramData ancestor; worker stderr unavailable"
+        );
+    }
     drop(process);
     drop(image); // Actual image and ancestors stay locked through exit.
     outcome
@@ -864,6 +883,13 @@ pub fn launch_bundle() -> Outcome {
     match result {
         Ok(image) => elevate(image),
         Err(e) => {
+            // This branch runs inside the GUI App. eprintln alone is not routed
+            // to its log sink; retain a bounded stage without paths or SID text.
+            log::warn!(
+                "native cleaner refused stage=controller-bundle-custody kind={:?} os_code={:?}",
+                e.kind(),
+                e.raw_os_error()
+            );
             eprintln!("bundled cleaner refused: {e}");
             Outcome::Refused
         }

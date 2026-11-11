@@ -1334,37 +1334,52 @@ impl FileTransaction {
         self.registration_path.clone()
     }
     fn secure_dir(&self, path: &Path, public: bool) -> io::Result<()> {
-        let _parent = Chain::open(
+        let parent = Chain::open(
             path.parent()
                 .ok_or_else(|| error("managed parent missing"))?,
             self.caller(),
         )?;
-        if !entry_present(path)? {
-            std::fs::create_dir(path)?;
-            apply_path_security(
-                path,
-                if public && self.caller().is_none() {
-                    PUBLIC_SD
-                } else {
-                    &self.private_sd
-                },
-                self.caller().is_none(),
-            )?;
+        let descriptor = Descriptor::parse(if public && self.caller().is_none() {
+            PUBLIC_SD
         } else {
-            let chain = Chain::open(path, self.caller())?;
-            drop(chain);
-            apply_path_security(
-                path,
-                if public && self.caller().is_none() {
-                    PUBLIC_SD
-                } else {
-                    &self.private_sd
-                },
-                self.caller().is_none(),
-            )?;
+            &self.private_sd
+        })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| error("managed leaf missing"))?;
+        // In particular, ProgramData may grant attribute/create rights. Never
+        // replay its path to create a child: an empty parent can become reparse.
+        // A colliding entry after NotFound is refused, not adopted or retried.
+        let held = match child(parent.last(), name, false, false, null_mut()) {
+            Ok(directory) => directory,
+            Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                child(parent.last(), name, false, true, descriptor.ptr())?
+            }
+            Err(e) => return Err(e),
+        };
+        if info(&held)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(error("managed target is not a directory"));
         }
-        let _confirmed = Chain::open(path, self.caller())?;
-        Ok(())
+        security(&held, self.caller(), false)?;
+        // The protected child now pins a nonempty component at every ancestor.
+        // Reopen for metadata rights, bind identity, then change that same handle.
+        let owner = self.caller().is_none();
+        let writer = open_security(path, owner)?;
+        if identity(&writer)? != identity(&held)? {
+            return Err(error("managed directory identity changed"));
+        }
+        set_security(
+            &writer,
+            &descriptor,
+            DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION
+                | if owner {
+                    OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION
+                } else {
+                    0
+                },
+        )?;
+        security(&writer, self.caller(), false)
     }
     fn copy_to(&self, input: &File, path: &Path, expected: Option<&str>) -> io::Result<()> {
         let mut source = input.try_clone()?;

@@ -82,7 +82,12 @@ pub fn role(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<Role> 
 // Native security descriptors are reduced to this policy. Unsupported ACEs
 // and missing/null DACLs fail closed; inherited-only ACEs do not apply here.
 pub const WRITE_MASK: u32 = 0x500d_0156;
-pub const REPLACE_MASK: u32 = 0x500d_0140;
+// Attribute/create rights on an ancestor do not replace an existing child.
+// This narrower mask is valid only with Chain's pinned, non-reparse relative IO;
+// named image execution also retains a child at every ancestor (see Image).
+// Attribute-only handles are NOT excluded by FILE_SHARE_READ and can set a
+// reparse point on an empty directory. Never apply this mask to a payload leaf.
+pub const REPLACE_MASK: u32 = 0x500d_0040;
 pub const SYSTEM: &str = "S-1-5-18";
 pub const ADMINS: &str = "S-1-5-32-544";
 pub const TRUSTED_INSTALLER: &str =
@@ -94,6 +99,28 @@ pub struct Ace {
     pub flags: u8,
     pub mask: u32,
     pub sid: String,
+}
+
+fn appcontainer_principal(sid: &str) -> bool {
+    // Package/capability SIDs are the restricting half of AppContainer access,
+    // not an independent grant to an ordinary foreign user. Do not trust their
+    // owners, other authority-15 namespaces, or malformed SID text.
+    // https://learn.microsoft.com/windows/win32/secauthz/implementing-an-appcontainer
+    let Some(rest) = sid.strip_prefix("S-1-15-") else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    if !matches!(parts.next(), Some("2" | "3")) {
+        return false;
+    }
+    let tail: Vec<_> = parts.collect();
+    !tail.is_empty()
+        && tail.len() <= 14
+        && tail.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|c| c.is_ascii_digit())
+                && part.parse::<u32>().is_ok()
+        })
 }
 
 pub fn trusted_security(
@@ -121,7 +148,11 @@ pub fn trusted_security(
         match ace.kind {
             1 => true, // Deny grants nothing. Actual handle access is still required.
             0 => {
+                // ALL ordinary grants must still pass this conjunction. A
+                // capability ACE cannot cancel a foreign user's dangerous ACE
+                // or promote a capability/package SID into an allowed owner.
                 allowed(&ace.sid)
+                    || appcontainer_principal(&ace.sid)
                     || ace.mask & if ancestor { REPLACE_MASK } else { WRITE_MASK } == 0
             }
             _ => false,

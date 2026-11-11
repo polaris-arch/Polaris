@@ -34,7 +34,7 @@ import { ALL, context, declaringSites } from '@/styles/css-cascade.test-support'
 import { createElement, type ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { readFileSync, readdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import i18next, { type i18n as I18n } from 'i18next';
 import { I18nextProvider, initReactI18next } from 'react-i18next';
@@ -2566,7 +2566,7 @@ describe('⑫bis DNS 上游预设下拉：两端读**同一张表**（2026-09-06
     for (const needle of ['cloudflare-dns.com/dns-query', 'dns.alidns.com/dns-query']) {
       const holders = production
         .filter((f) => stripComments(readFileSync(f, 'utf8')).includes(needle))
-        .map((f) => f.slice(UI_SRC.length).replace(/^\//, ''));
+        .map((f) => relative(UI_SRC, f).replaceAll('\\', '/'));
       expect(
         holders,
         `「${needle}」出现在不止一个生产文件里 —— 预设表又分叉了（这正是上一版拒绝移植的那个理由）`,

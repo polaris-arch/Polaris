@@ -68,7 +68,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative as nativeRelative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
@@ -79,6 +79,8 @@ import {
   stripComments as stripCommentsKeepingLines,
 } from '@/test/call-sites.test-support';
 import { ROW_ACTIONS } from './nodes/absence-register';
+
+const relative = (from: string, to: string): string => nativeRelative(from, to).replaceAll('\\', '/');
 
 const REPO_DIR = fileURLToPath(new URL('../../../', import.meta.url));
 const UI_SRC_DIR = fileURLToPath(new URL('..', import.meta.url));
