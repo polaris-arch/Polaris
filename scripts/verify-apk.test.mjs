@@ -852,9 +852,8 @@ test('换了 ABI 之后，构建 tag 与剥符号两条判据照样有牙', () =
 
 // ───────────────────── 出厂权限集判据（判据 ⑦）─────────────────────
 //
-// 这条判据存在的理由（2026-09-06 实证）：源码侧那道权限门（`src-tauri/tests/
-// android_native_surface_wiring.rs`）读的是**本仓自有**的 AndroidManifest.xml，而 APK 带的是
-// manifest merger 合并库 manifest 之后的集合。本仓 8 条、合并后 11 条，两者今天就已经不等。
+// 这条判据存在的理由（2026-09-06 实证）：本仓自有的 AndroidManifest.xml 不是 APK 的权限集，
+// APK 带的是 manifest merger 合并库 manifest 之后的集合。本仓 8 条、合并后 11 条，两者今天就已经不等。
 // 于是「升一版 tauri 插件 ⇒ APK 多一条敏感权限」这一形，在本判据之前没有任何一处会说话。
 //
 // 下面这段是**本机真 aapt2 的真实输出**（build-tools 36.0.0，喂的是由本仓 packaged manifest

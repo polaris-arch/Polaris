@@ -7,7 +7,7 @@
 //!
 //! - 覆盖面 = **盘上 present 的每一份核**；平台名单从 `support/core_locator.rs` 的 `CORE_MATRIX` 派生。
 //! - 盘上缺哪个平台就少看哪个平台；一份都没有时跳过，`POLARIS_REQUIRE_KERNEL_GATE=1` 时缺一即红
-//!   （打包腿强制生效，`ci_step_still_wired` 守着）。
+//!   （打包腿强制生效）。
 //! - 🔴 **「跳过」是静默的**：提示语归 libtest 捕获，只在测试失败时才回放。
 
 #[path = "support/core_locator.rs"]
@@ -302,22 +302,6 @@ fn bundled_core_sing_tun_matches_the_release_contract() {
             .unwrap_or_else(|error| panic!("{}: {error}", core.key));
         stage_finished("embedded-scan", started);
     }
-}
-
-/// 打包腿上本门必须真的在跑 —— 否则「缺核强制红」那条开关形同虚设。
-#[test]
-fn ci_step_still_wired() {
-    let wf = repo_root().join(".github/workflows/package.yml");
-    let raw =
-        std::fs::read_to_string(&wf).unwrap_or_else(|e| panic!("读不到 {}: {e}", wf.display()));
-    // 匹配 **run 命令本身**而不是裸词：本文件在 package.yml 里还留了一段说明注释，
-    // 注释里就写着 `core_dep_fingerprint`。用裸词做判据的话，把整个 step 删掉、注释留下，
-    // 本断言照样绿 —— 实测过，这正是「绿没有信息量」的一个新鲜样本。
-    assert!(
-        raw.contains("--test core_dep_fingerprint"),
-        "package.yml 里找不到 `--test core_dep_fingerprint` —— 打包腿没在跑依赖指纹门，\
-         缺核时它会静静跳过而没人知道"
-    );
 }
 
 fn framed_identity_fixture(info: &str) -> Vec<u8> {

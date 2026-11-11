@@ -15,9 +15,7 @@
  *
  * 第一次的修法是给那一个字段在边界补齐 —— 补丁没有传染性，所以第二个字段原样复发。
  * 现在的机制是：**值的唯一真值源在 Rust**（`user_config::effective_view::ensure_effective_config`，
- * 登记在 `INJECTED_FIELD_PATHS`），前端一条兜底都不写。由 Rust 侧
- * `tests/frontend_sot_guard.rs::frontend_holds_no_config_default_fallback` 守住：
- * 那道门按 `INJECTED_FIELD_PATHS` 逐字段扫 `ui/src`，见到读取点自带兜底就转红。
+ * 登记在 `INJECTED_FIELD_PATHS`），前端一条兜底都不写。
  *
  * # 本模块回落的空值不是"默认值"
  *

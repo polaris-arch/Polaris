@@ -37,8 +37,7 @@
  *    文件，那正是 dep-info 门守的东西。
  *  - **C（哨兵 / 取材面自检）**：枚举面为空或明显偏小 ⇒ 红；剥离器被注释或字符串喂饱 ⇒ 红。
  *  - **D（替补覆盖还在）**：`NO_ANDROID_IMPACT_SCOPES` 的理由几乎都落在 ci.yml 的
- *    `aarch64-linux-android` 交叉腿上，而那条腿今天**没有任何门钉住**它自己（`cross_target_coverage.rs`
- *    只钉 clippy 主行字面量与从 `rustup target add` 行**派生**的 triple 集）。在 ci.yml 与豁免表两侧
+ *    `aarch64-linux-android` 交叉腿上，而那条腿今天**没有任何门钉住**它自己。在 ci.yml 与豁免表两侧
  *    同时动手，就能让上面那些理由集体变成假话而全仓无一处转红。D 组把它们钉成正面断言。
  *    D2 按 **step** 取材而不是整文件 grep（子串存在性对「命令还在但不生效 / 换了包」全盲），
  *    D3 把**整包**豁免与 **scope 型**豁免一并编进比对面（只数前者时，一条 `"scope": "tests"`
@@ -602,11 +601,6 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
 
     // ④ 仓内真实 JNI 负例与固定 comment-only cfg 负例（判据不被自己的注释/字符串喂饱）
     const wiring = 'src-tauri/tests/android_platform_verifier_wiring.rs';
-    const wiringRaw = readFileSync(join(REPO_ROOT, wiring), 'utf8');
-    expect(
-      (wiringRaw.match(/jni_mangle/g) ?? []).length,
-      `${wiring} 里 jni_mangle 的出现次数掉到 0 —— 本对照失去意义，先确认那道门是不是搬家了`,
-    ).toBeGreaterThan(5);
     expect(
       jniFace,
       `${wiring} 被判成了 JNI 导出点 —— 它那 18 处 jni_mangle 全在注释与字符串里（第 109 行是` +

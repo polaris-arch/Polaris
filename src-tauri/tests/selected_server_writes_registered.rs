@@ -45,6 +45,8 @@
 //!
 //! 前端的对应门在 `ui/src/contracts/auto-select.test.ts`（界面写出口的位置逐处登记、键名的
 //! 字符串形态逐处登记、界面不写意图）。原生侧见本文件末尾一条。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::path::Path;

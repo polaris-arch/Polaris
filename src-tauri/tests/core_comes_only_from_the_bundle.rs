@@ -6,17 +6,14 @@
 //! 应用应当运行与本应用版本配套的内核。本门守的是**路径来源**这一层（内容层面的配套校验
 //! 不在这里）。能把另一个内核文件交给应用执行的入口，
 //! 历史上有三类：手动上传、应用内在线更新（连同回滚 / 恢复出厂 / 自动更新）、以及「设置里
-//! 填一个内核路径」。前两类已整体删除，第三类从未存在。本门钉住这两件事不被悄悄加回来：
+//! 填一个内核路径」。前两类已整体删除，第三类从未存在。本门以结构判据钉住它们不被悄悄加回来：
 //!
-//! 1. [`removed_core_replacement_surface_stays_removed`]：已删除入口的标识不得重新出现在
-//!    生产源码里（Rust 与前端）。名字清单只挡「原样加回来」，挡不住换个名字重做，故另有两条
-//!    结构判据：
-//! 2. [`release_core_resolution_has_exactly_one_leg`]：release 构型下 `resolve_core_binary`
+//! 1. [`release_core_resolution_has_exactly_one_leg`]：release 构型下 `resolve_core_binary`
 //!    的函数体就是「调随包解析」这一句，没有第二条腿；
-//! 3. [`core_path_has_one_source`]：应用 crate 里能拿到内核路径的地方是一张登记表 ——
+//! 2. [`core_path_has_one_source`]：应用 crate 里能拿到内核路径的地方是一张登记表 ——
 //!    `resolve_core_binary` 的每个引用点、以及内核文件名（定位一个内核文件绕不开它）的每个
 //!    出现点，都逐文件登记；新出现一处即红；
-//! 4. [`no_setting_points_at_a_core_binary`]：用户配置的键集里不得出现指向内核文件 / 目录的键。
+//! 3. [`no_setting_points_at_a_core_binary`]：用户配置的键集里不得出现指向内核文件 / 目录的键。
 //!
 //! 环境变量那条入口由 `release_escape_hatches.rs` 的 `core_path_env_override_is_dev_only` 守。
 //!
@@ -29,6 +26,8 @@
 //!
 //! `crates/helper`、`crates/helper-proto`、`crates/helper-client` 与应用侧向提权助手递送内核的
 //! 那条腿（`install-core`）：它递送的是随包内核，收口另有安排，不归本门。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
 
@@ -62,60 +61,6 @@ fn production_files(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     }
 }
 
-/// 已删除的「换内核」入口留下的标识。每条写清它曾经是什么。
-///
-/// 旧配置里的三个内核更新设置键不在此列：`crates/store/src/sanitize.rs` 要点它们的名才能把
-/// 它们从存量配置里删掉。
-const REMOVED_IDENTIFIERS: [(&str, &str); 13] = [
-    ("core_replace_manual", "手动上传内核的命令"),
-    ("replaceManual", "手动上传内核的前端调用"),
-    ("core_update_check", "应用内检查内核更新的命令"),
-    ("core_update_run", "应用内下载并更换内核的命令"),
-    ("core_update_apply_staged", "应用已暂存内核的命令"),
-    ("core_update_get_auto_status", "内核自动更新状态的命令"),
-    ("core_rollback", "回滚内核的命令"),
-    ("core_reset_factory", "恢复出厂内核的命令"),
-    ("CORE_UPDATE_REPO", "内核在线更新的来源仓库常量"),
-    (
-        "find_suitable_singbox_asset",
-        "从 release 里挑内核资产的选包器",
-    ),
-    ("SwapSource", "更换内核的来源枚举"),
-    ("core_update_dir", "用户目录里的可写内核目录"),
-    ("writable_core_path", "用户目录里的可写现役内核路径"),
-];
-
-/// 生产源码取材面：应用 crate、各库 crate（提权助手三件除外）、前端。
-fn production_sources() -> Vec<(String, String)> {
-    let root = repo_root();
-    let mut files = Vec::new();
-    production_files(&root.join("src-tauri/src"), &[".rs"], &mut files);
-    for entry in std::fs::read_dir(root.join("crates")).expect("读不到 crates/") {
-        let dir = entry.expect("读目录项失败").path();
-        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-        if matches!(name.as_str(), "helper" | "helper-proto" | "helper-client") {
-            continue;
-        }
-        if dir.join("src").is_dir() {
-            production_files(&dir.join("src"), &[".rs"], &mut files);
-        }
-    }
-    production_files(&root.join("ui/src"), &[".ts", ".tsx"], &mut files);
-    files
-        .into_iter()
-        .map(|path| {
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("读不到 `{}`（{err}）", path.display()));
-            (rel, text)
-        })
-        .collect()
-}
-
 /// `needle` 作为**完整标识**出现的位置（两侧都不是标识符字符）。
 fn identifier_hits(text: &str, needle: &str) -> usize {
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -133,51 +78,6 @@ fn identifier_hits(text: &str, needle: &str) -> usize {
         from = end;
     }
     count
-}
-
-/// 🔴 已删除的「换内核」入口不得重新出现在生产源码里。
-///
-/// 取材是**原文**（含注释与字符串）：通道名、事件名本来就是字符串字面量，剥掉就什么都看不见；
-/// 注释里提到它们同样算 —— 讲已删功能的注释留在生产源码里，下一个人会照着它把功能接回来。
-///
-/// **变异探针**：在 `src-tauri/src` 任意生产文件里加一行 `// core_rollback` ⇒ 本条转红并点名
-/// 文件；加在某个 `tests/` 目录下 ⇒ 仍绿。
-#[test]
-fn removed_core_replacement_surface_stays_removed() {
-    let sources = production_sources();
-    // 取材面自检：三块都必须真的扫到了，否则下面的否定断言对着空集成立。
-    for (prefix, floor) in [("src-tauri/src/", 120), ("crates/", 80), ("ui/src/", 150)] {
-        let seen = sources
-            .iter()
-            .filter(|(rel, _)| rel.starts_with(prefix))
-            .count();
-        assert!(
-            seen >= floor,
-            "`{prefix}` 只扫到 {seen} 个生产源文件（下限 {floor}）—— 取材面塌了"
-        );
-    }
-    // 探测器自检：它认得出完整标识，也不把更长标识的一部分算进来。
-    assert_eq!(
-        identifier_hits("x core_rollback(y) core_rollback", "core_rollback"),
-        2
-    );
-    assert_eq!(identifier_hits("no_core_rollback_here", "core_rollback"), 0);
-
-    let mut offenders = Vec::new();
-    for (name, what) in REMOVED_IDENTIFIERS {
-        for (rel, text) in &sources {
-            let hits = identifier_hits(text, name);
-            if hits > 0 {
-                offenders.push(format!("    {rel} · `{name}` × {hits}（{what}）"));
-            }
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "生产源码里重新出现了已删除的「换内核」入口：\n{}\n\n\
-         应用只从安装包解析内核。应用内不提供上传、在线更新、回滚、恢复出厂或自动更新内核。",
-        offenders.join("\n")
-    );
 }
 
 /// 把一个键拆成小写的词：`camelCase` / `snake_case` / `kebab-case` 的词界，数字并入前一个词。

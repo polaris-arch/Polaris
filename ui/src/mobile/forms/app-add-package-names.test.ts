@@ -7,8 +7,6 @@
  *  · Rust 侧有正面断言「包名真的流到 `tun-in.exclude_package`」
  *    （`app_rules_preset/tests/mod.rs#get_custom_preset`）—— 它从一份**夹具**出发，
  *    证明不了「表单装袋时装的是用户挑的那些」；
- *  · `frontend_sot_guard.rs` 有键名契约（TS ⇄ Rust 的 `packageNames` 逐字相等）——
- *    它证明键名没漂，证明不了那个键里装的是什么；
  *  · 接线完成度门数「还剩几条没接」—— 它数的是渲染点与登记表。
  * 缝正好在中间那一跳：**表单把哪个值装进 `packageNames`**。
  *

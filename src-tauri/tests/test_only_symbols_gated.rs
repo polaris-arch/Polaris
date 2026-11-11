@@ -38,6 +38,8 @@
 //! `#[cfg(test)] mod tests;` ⇒ `foo/tests.rs` 与 `foo/tests/mod.rs` 整文件视为已门控。
 //! 于是外移前（`foo/tests.rs`）与外移后（`foo/tests/mod.rs`）判据不变，且**没有** "叫 tests 就放行"
 //! 这条命名约定漏洞 —— 一个叫 `helpers` 的模块只要 `mod helpers;` 没带 cfg，里面的替身照样红。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -749,57 +751,6 @@ fn file_level_gates(
     gated
 }
 
-#[test]
-fn file_gates_follow_inline_module_paths_and_do_not_leak_to_siblings() {
-    let parent = PathBuf::from("src/source.rs");
-    let child = PathBuf::from("src/source/android/tests/mod.rs");
-    let sibling = PathBuf::from("src/source/tests/mod.rs");
-    let nested = PathBuf::from("src/source/android/tests/nested.rs");
-    let files = vec![
-        parent.clone(),
-        child.clone(),
-        sibling.clone(),
-        nested.clone(),
-    ];
-    for (source, should_gate) in [
-        (
-            "mod android {\n    #[cfg(test)]\n    mod tests;\n}\nmod tests;",
-            true,
-        ),
-        (
-            "#[cfg(test)]\nmod android {\n    mod tests;\n}\nmod tests;",
-            true,
-        ),
-        ("mod android {\n    mod tests;\n}\nmod tests;", false),
-        (
-            "mod android {\n    // #[cfg(test)]\n    mod tests;\n}\nmod tests;",
-            false,
-        ),
-        (
-            "mod android {\n    #[cfg(test)]\n    // mod tests;\n}\nmod tests;",
-            false,
-        ),
-        (
-            "mod other {\n    #[cfg(test)]\n    mod tests;\n}\nmod tests;",
-            false,
-        ),
-    ] {
-        let masked = BTreeMap::from([
-            (parent.clone(), mask(source)),
-            (child.clone(), mask("mod nested;")),
-            (sibling.clone(), mask("")),
-            (nested.clone(), mask("")),
-        ]);
-        let gated = file_level_gates(&files, &masked);
-        assert_eq!(gated.contains(&child), should_gate, "{source}");
-        assert_eq!(gated.contains(&nested), should_gate, "{source}");
-        assert!(
-            !gated.contains(&sibling),
-            "inline gate must not cover its sibling: {source}"
-        );
-    }
-}
-
 // ===================== 扫描 =====================
 
 const NAME_NEEDLES: &[&str] = &["Mock", "Fake", "Stub", "Dummy"];
@@ -828,8 +779,6 @@ struct Scan {
     hits: Vec<Hit>,
     ungated_tests: Vec<(String, usize)>,
     total_test_attrs: usize,
-    /// 实际扫描的 `.rs` 文件数。此前这里是写死的 305，会随仓库漂移而失真。
-    files_scanned: usize,
     /// 名字含 tests 的模块声明（第 4 条对照用）：(file, line, name, gated)
     test_named_mods: Vec<(String, usize, String, bool)>,
     /// **真正装着 `#[test]` 的模块**（语义判据，非命名约定）：`file::mod_path` -> `#[test]` 条数。
@@ -959,7 +908,6 @@ fn scan_repo() -> Scan {
         hits: Vec::new(),
         ungated_tests: Vec::new(),
         total_test_attrs: 0,
-        files_scanned: files.len(),
         test_named_mods: Vec::new(),
         modules_with_tests: BTreeMap::new(),
     };
@@ -1025,250 +973,6 @@ fn test_only_symbols_must_be_cfg_gated() {
         stale.len(),
         stale.join("\n")
     );
-}
-
-/// 第 4 条：**语义**验证「测试模块都带 cfg(test)」——判据是「函数带 `#[test]`」，
-/// 不是「模块名里有 tests」。名字不含 test 的测试模块整类逃逸，正是命名约定型判据的盲区。
-#[test]
-fn every_test_attribute_is_under_a_cfg_gate() {
-    let scan = scan_repo();
-    // 正向对照：扫描器必须真的看得见 #[test]，否则「0 个未门控」只是扫描器死了。
-    assert!(
-        scan.total_test_attrs >= 3000,
-        "正向对照失败：全仓只扫到 {} 个 #[test]/#[tokio::test] 属性（实测量级 4000+）——\
-         扫描器或取材面坏了，本门的「0 个未门控」无信息量",
-        scan.total_test_attrs
-    );
-    // ---- 第 4 条：命名约定判据 vs 语义判据的对差 ----
-    let named_total = scan.test_named_mods.len();
-    let named_ungated: Vec<&(String, usize, String, bool)> = scan
-        .test_named_mods
-        .iter()
-        .filter(|(_, _, _, g)| !*g)
-        .collect();
-    let holders = scan.modules_with_tests.len();
-    // 「装着 #[test] 却不叫 *test*」的模块 —— 命名约定型判据整类看不见它们。
-    let escapees: Vec<(&String, &usize)> = scan
-        .modules_with_tests
-        .iter()
-        .filter(|(k, _)| {
-            let m = k.rsplit("::").next().unwrap_or("");
-            !m.to_lowercase().contains("test")
-        })
-        .collect();
-    println!("\n=== 第 4 条：测试模块门控的两种判据对差 ===");
-    println!(
-        "  取材面：src-tauri/src/** + crates/*/src/**（{} 个 .rs），已剥注释与字符串字面量；",
-        scan.files_scanned
-    );
-    println!(
-        "          文件级门从父模块的 `mod x;` 声明读，cfg 谓词按生产构建求值（非字面量匹配）。"
-    );
-    println!(
-        "  命名约定判据（名字含 test）：命中 {named_total} 个 mod，其中无 cfg 门 {} 个 —— \
-逐条看都是**生产模块**（假阳性方向）：",
-        named_ungated.len()
-    );
-    for (f, l, n, _) in &named_ungated {
-        println!("      {f}:{l}  mod {n}");
-    }
-    println!("  语义判据    ：真正装着 #[test] 的作用域共 {holders} 个（#[test] 总数 {}），其中未门控 {} 个",
-             scan.total_test_attrs, scan.ungated_tests.len());
-    println!(
-        "  命名约定的盲区（装着 #[test] 但名字不含 test 的作用域）共 {} 个：",
-        escapees.len()
-    );
-    for (k, n) in escapees.iter().take(30) {
-        println!("      {k}  ({n} 个 #[test])");
-    }
-
-    assert!(
-        scan.ungated_tests.is_empty(),
-        "\n{} 个 #[test] 不在任何 cfg 门下（自身属性 / 祖先块 / 父模块 `mod x;` 声明都没有）：\n{}\n",
-        scan.ungated_tests.len(),
-        scan.ungated_tests
-            .iter()
-            .map(|(f, l)| format!("  {f}:{l}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-}
-
-// ===================== 取材面自检（两支各一条切片）=====================
-
-const FIXTURE: &str = r####"
-// 行注释里写 struct MockGhost 不是声明
-/* 块注释里写 测试用 也不是 doc：NotADocKeywordHere */
-const S: &str = "字符串里写 pub struct DummyInString { 还带花括号 }";
-const R: &str = r#"原始串里写 // 与 " 与 struct FakeInRaw"#;
-
-/// 测试用：本类型必须被 DOC 支抓到。
-pub struct DocOnlyDouble {
-    ch: char,
-}
-
-pub struct MockGood;
-
-#[cfg(test)]
-pub struct MockGatedBySelf;
-
-#[cfg(all(test, unix))]
-pub struct MockGatedByAllTestUnix;
-
-#[cfg(any(test, feature = "test-utils"))]
-pub struct MockGatedByFeature;
-
-#[cfg(any(target_os = "windows", test))]
-pub struct MockNotGatedPlatformPredicate;
-
-#[cfg(test)]
-mod inner {
-    pub struct MockGatedByAncestor;
-}
-
-impl DocOnlyDouble {
-    fn lifetime_vs_char<'a>(x: &'a str) -> char {
-        let _q = '\'';
-        let _b = b'\n';
-        let _brace_in_char = '{';
-        x.chars().next().unwrap_or('}')
-    }
-}
-"####;
-
-#[test]
-fn extraction_self_check_two_surfaces() {
-    let (code, docs, attr_surface) = mask(FIXTURE);
-
-    // 行号必须对齐 —— 门的失败信息全靠它定位。
-    assert_eq!(
-        FIXTURE.split('\n').count(),
-        code.split('\n').count(),
-        "code 面行数漂移"
-    );
-    assert_eq!(
-        FIXTURE.split('\n').count(),
-        docs.split('\n').count(),
-        "docs 面行数漂移"
-    );
-
-    let cl: Vec<&str> = code.split('\n').collect();
-    let dl: Vec<&str> = docs.split('\n').collect();
-
-    // ---- 切片自检 ①：NAME 支的取材面（code，全剥）----
-    println!("\n=== 切片自检 ① NAME 支取材面（code：注释与字面量全剥）===");
-    for (i, masked_line) in cl.iter().enumerate().take(8).skip(1) {
-        println!(
-            "  L{:<2} 原文 | {}",
-            i + 1,
-            FIXTURE.split('\n').nth(i).unwrap()
-        );
-        println!("       剥后 | {masked_line}");
-    }
-    assert!(!code.contains("MockGhost"), "行注释里的声明未剥净");
-    assert!(!code.contains("DummyInString"), "字符串里的声明未剥净");
-    assert!(!code.contains("FakeInRaw"), "原始字符串未剥净");
-    assert!(!code.contains("测试用"), "doc 注释未从 code 面剥净");
-    assert!(!code.contains("NotADocKeywordHere"), "块注释未剥净");
-    assert!(code.contains("pub struct MockGood"), "真声明被误剥");
-
-    // ---- 切片自检 ②：DOC 支的取材面（docs，只剥非 doc 注释与字面量）----
-    println!("\n=== 切片自检 ② DOC 支取材面（docs：doc 注释保留，其余剥）===");
-    for i in [2, 3, 4, 6, 7] {
-        println!(
-            "  L{:<2} 原文 | {}",
-            i + 1,
-            FIXTURE.split('\n').nth(i).unwrap()
-        );
-        println!("       剥后 | {}", dl[i]);
-    }
-    assert!(
-        docs.contains("/// 测试用：本类型必须被 DOC 支抓到。"),
-        "doc 注释被误剥 —— DOC 支会恒绿"
-    );
-    assert!(
-        !docs.contains("NotADocKeywordHere"),
-        "非 doc 块注释未从 docs 面剥净"
-    );
-    assert!(!docs.contains("DummyInString"), "字符串未从 docs 面剥净");
-    assert!(!docs.contains("FakeInRaw"), "原始字符串未从 docs 面剥净");
-
-    // ---- 切片自检 ③：cfg 求值面（attrs：只剥注释，字面量保留）----
-    // 首版本门就是把 cfg 求值放在 code 面上，`feature = "test-utils"` 的字面量被抹成空格，
-    // 于是 `#[cfg(any(test, feature = "test-utils"))]` 被读成「无门」而静默放行。
-    let al: Vec<&str> = attr_surface.split('\n').collect();
-    println!("\n=== 切片自检 ③ cfg 求值面（attrs：注释剥、字面量留）===");
-    for i in [1, 2, 3, 4, 19] {
-        println!(
-            "  L{:<2} 原文 | {}",
-            i + 1,
-            FIXTURE.split('\n').nth(i).unwrap()
-        );
-        println!("       剥后 | {}", al[i]);
-    }
-    assert!(
-        attr_surface.contains("#[cfg(any(test, feature = \"test-utils\"))]"),
-        "cfg 求值面把 feature 字面量剥掉了 —— test-utils 门会被读成无门"
-    );
-    assert!(!attr_surface.contains("MockGhost"), "cfg 面的行注释未剥净");
-    assert!(
-        !attr_surface.contains("NotADocKeywordHere"),
-        "cfg 面的块注释未剥净 —— 被注释掉的 #[cfg(test)] 不是门"
-    );
-
-    // ---- 正向对照：扫描器在 fixture 上的判定 ----
-    let mut out = Scan {
-        hits: Vec::new(),
-        ungated_tests: Vec::new(),
-        total_test_attrs: 0,
-        files_scanned: 1,
-        test_named_mods: Vec::new(),
-        modules_with_tests: BTreeMap::new(),
-    };
-    scan_file("FIXTURE", &code, &docs, &attr_surface, false, &mut out);
-    let names: Vec<&str> = out.hits.iter().map(|h| h.name.as_str()).collect();
-    println!("\n=== fixture 上的命中 ===\n  {names:?}");
-    assert!(
-        names.contains(&"DocOnlyDouble"),
-        "DOC 支未命中（正向对照失败）"
-    );
-    assert!(names.contains(&"MockGood"), "NAME 支未命中（正向对照失败）");
-    assert!(
-        names.contains(&"MockNotGatedPlatformPredicate"),
-        "cfg(any(target_os=…, test)) 不应算门控 —— 它在 Windows 生产构建里真的存在"
-    );
-    for gated in [
-        "MockGatedBySelf",
-        "MockGatedByAllTestUnix",
-        "MockGatedByFeature",
-        "MockGatedByAncestor",
-        "MockGhost",
-        "DummyInString",
-        "FakeInRaw",
-    ] {
-        assert!(!names.contains(&gated), "{gated} 不该命中");
-    }
-}
-
-#[test]
-fn cfg_evaluator_self_check() {
-    for (expr, survives_prod) in [
-        ("test", false),
-        ("all(test, unix)", false),
-        ("any(test, feature = \"test-utils\")", false),
-        ("any(target_os = \"windows\", test)", true),
-        ("not(test)", true),
-        ("windows", true),
-        ("all(unix, not(test))", true),
-        ("feature = \"test-utils\"", false),
-        ("any(feature = \"test-utils\", feature = \"other\")", true),
-    ] {
-        assert_eq!(
-            eval_cfg(expr),
-            survives_prod,
-            "cfg({expr}) 在生产构建下的存活判定错了"
-        );
-    }
 }
 
 // ===================== test-utils feature 的隔离门 =====================

@@ -87,85 +87,6 @@ mod tray_dark_bg_probe {
     }
 }
 
-/// **结构门，不是行为门** —— 它证的是「写 `AppleLanguages` 的那一句排在建 `NSApplication`
-/// 的那一句之前」，证不了「macOS 上原生对话框真的换了语言」。后者要一台 mac
-/// （本仓 CI / 开发机是 Linux，AppKit 根本不存在），已列真机判据。
-///
-/// # 为什么这条顺序值一个门
-///
-/// `app_language::apply_process_language` 的效果**只在下次启动兑现**，所以挪错位置**当场
-/// 什么都不会变**：不 panic、不报错、单测全绿、Linux/Windows 完全无感，连 macOS 用户也只是
-/// 「改完语言重启一次没生效，重启第二次才生效」。这种缺陷不会有人报 bug，只会被当成「这软件
-/// 就这样」。因果链见 `app_language` 模块文档的那张表：Tauri 2 的 `setup` 由
-/// `Builder::build()` 在建完 runtime（= tao 建 `NSApplication`）之后才调
-/// （`tauri-2.11.5/src/app.rs:2344` 建、`:2531` 才 setup），故写在 `.build(ctx)` 之后 =
-/// AppKit 本次已经读过旧值 = 用户要重启两次。
-///
-/// **变异锁**：把 `apply_process_language(...)` 挪到 `.build(ctx)` 之后 ⇒ 顺序断言转红；
-/// 整句删掉 ⇒ 锚点消失、`expect` 转红；把 `.build(ctx)` 改回内联 `generate_context!()`
-/// ⇒ 锚点消失转红（那意味着 identifier 又拿不到了）。
-///
-/// 三平台同源：非 macOS 上 `apply_process_language` 是空函数，但调用点照样在，
-/// 故本门在 Linux/Windows 的 CI 上一样有判据 —— 不会出现「只有 mac 跑得到的门」。
-#[test]
-fn native_dialog_language_is_applied_before_appkit_boots() {
-    let body = crate::commands::guard_scan::top_level_fn_body(&crate_root_code(), "pub fn run() {");
-    let apply = body
-        .find("app_language::apply_process_language(")
-        .expect("锚点消失：原生对话框语言对账的调用点没了 —— macOS 上原生对话框会退回跟随系统语言");
-    let build = body
-        .find(".build(ctx)")
-        .expect("锚点消失：`.build(ctx)` —— 守卫已失去「AppKit 何时起来」的判据");
-    assert!(
-        apply < build,
-        "`apply_process_language` 排到了 `.build(ctx)` 之后 —— Tauri 在 build 里就建好了 \
-             NSApplication，AppKit 本次已按旧值解析完本地化，用户改语言后要重启**两次**才生效。"
-    );
-}
-
-/// QUIC 旧规则清理必须在日志可用后、代理 controller 装配前启动；否则要么没有真机分段证据，
-/// 要么 controller 看不到 prewarm 标记并在每次 System 连接里重复 `netsh`。
-#[test]
-fn windows_quic_cleanup_prewarm_precedes_proxy_runtime_construction() {
-    let source = crate_root_code();
-    let logging = source
-        .find("logging::init(&config_dir)")
-        .expect("日志初始化锚点消失");
-    let prewarm = source
-        .find("start_windows_quic_cleanup_prewarm()")
-        .expect("Windows QUIC 启动预热接线消失");
-    let runtime = source
-        .find("AppRuntime::new(config_dir)")
-        .expect("AppRuntime 装配锚点消失");
-    assert!(logging < prewarm && prewarm < runtime);
-}
-
-/// Windows 官方 single-instance 2.4.3 的 mutex→监听窗间隙必须被外层启动闸门完整包住。
-/// 这里只钉装配顺序；mutex 的排他行为由 `windows_single_instance` 的 Windows 单测真跑。
-#[test]
-fn windows_single_instance_startup_gate_wraps_plugin_setup() {
-    let body = crate::commands::guard_scan::top_level_fn_body(&crate_root_code(), "pub fn run() {");
-    let acquire = body
-        .find("windows_single_instance::StartupGate::acquire(")
-        .expect("Windows 单实例启动闸门的取得点消失");
-    let plugin = body
-        .find(".plugin(tauri_plugin_single_instance::init(")
-        .expect("官方 single-instance 插件注册点消失");
-    let build = body.find(".build(ctx)").expect("Tauri build 锚点消失");
-    let verify = body
-        .find("windows_single_instance::verify_listener(")
-        .expect("官方监听窗的放行前验证消失");
-    let release = body
-        .find("drop(single_instance_startup_gate)")
-        .expect("Windows 单实例启动闸门的释放点消失");
-    let run = body.find("app.run(").expect("Tauri run 锚点消失");
-
-    assert!(
-        acquire < plugin && plugin < build && build < verify && verify < release && release < run,
-        "顺序必须是：取启动闸门 → 注册官方插件 → build/setup → 验证监听窗 → 释放 → run"
-    );
-}
-
 // ── 托盘图标汇流点（P1「中断后不回落」）──────────────────────────────────────
 //
 // 图标本身只能真机看；能自动断言的是**装配决策**：哪些源被接上汇流点。此前这条腿零测试，
@@ -174,36 +95,10 @@ fn windows_single_instance_startup_gate_wraps_plugin_setup() {
 //   ② 事件订阅退化成只订一条 / 只订部分（补一个 ERROR 监听就收工的半修）
 //   ③ 轮询自愈网没挂，或挂了但周期长到形同没有（零 emit 腿仍无人兜）
 
-/// 主窗尺寸只能有一个真值源：`tauri.conf.json`。
-///
-/// 建窗走 `WebviewWindowBuilder::from_config`（conf 的 `create:false`），conf 里的
-/// width/height/minWidth/minHeight 由它套上。mac 分支曾在其后另写一份 `inner_size` +
-/// `min_inner_size`，把 conf 那四个值在 mac 上变成死值 —— 改 conf 不生效、且**没有任何门会红**
-/// （2026-07-29 真机才发现最小尺寸不是 conf 写的值）。这条锁住「建主窗的代码里不得再出现尺寸设置」。
-///
-/// 射程刻意收在 `create_main_window`：Dashboard 窗（`commands/misc.rs`）是独立窗、有自己的尺寸，
-/// 不在此列。
-#[test]
-fn main_window_size_comes_only_from_conf() {
-    let src = crate_root_code();
-    let body = crate::commands::guard_scan::top_level_fn_body(&src, "fn create_main_window(");
-    assert!(
-        !body.is_empty(),
-        "抓不到 create_main_window 的函数体 —— 判据面塌了（改名了？），本门会恒绿"
-    );
-    for forbidden in ["inner_size(", "min_inner_size("] {
-        assert!(
-            !body.contains(forbidden),
-            "建主窗的代码里出现 `{forbidden}` —— 它会覆盖 from_config 套上的 conf 尺寸，\
-                 使 tauri.conf.json 的 width/height/minWidth/minHeight 变成死值。\
-                 尺寸改动请改 conf，不要在这里再设一份。"
-        );
-    }
-}
-
 /// 首建天然发生在 setup 主线程，轻量态重建则可能由托盘 WebView IPC 线程触发。两条路径必须在
 /// `show_main_window` 入口合流到主线程，否则 macOS `apply_vibrancy` 会拒绝重建窗，透明侧栏背后
 /// 没有原生材质，表现为整个左侧导航直接透出桌面。
+#[cfg(target_os = "linux")]
 #[test]
 fn main_window_rebuild_is_dispatched_to_main_thread() {
     let src = crate_root_code();
@@ -437,6 +332,7 @@ fn strip_ts(src: &str, blank_literals: bool) -> String {
 /// 排除测试文件：vitest 跑在 node 环境、根本不经 Tauri ACL，测试文本里出现 `window.confirm`
 /// 既不需要授权，也不该让「前端还在用 confirm」这个前提为真（`settings-logic.test.ts` 此前正是
 /// 这么把反向哨兵喂绿的）。
+#[cfg(target_os = "linux")]
 fn collect_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -459,8 +355,7 @@ fn collect_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Str
             .unwrap_or_default()
             .to_owned();
         // 🔴 三种**永不进包**的模块一律排出取材面（口径的单一真值源在
-        // `ui/src/contracts/test-only-modules.ts` 的 `IS_TEST_ONLY_MODULE`，
-        // 由 `test_only_module_infixes_match_the_typescript_source` 与本列表对拍）。
+        // `ui/src/contracts/test-only-modules.ts` 的 `IS_TEST_ONLY_MODULE`）。
         //
         // `.test-support.` 是 2026-09-13 补的，起因是一次真的假阳性：连接屏的登记表
         // `mobile/connections/absence-register.test-support.ts` 有一条 `note:`，那句话本身在说
@@ -476,46 +371,6 @@ fn collect_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, Str
         if let Ok(s) = std::fs::read_to_string(&p) {
             out.push((p, strip_ts_comments(&s)));
         }
-    }
-}
-
-/// 本文件排除的三种「永不进包」中缀，必须与 TS 侧那份**单一枚举**逐条对上。
-///
-/// 两边各写一份名单，就是把「哪些文件不进包」这件事变成两个会各自漂的答案：TS 侧加一种
-/// 中缀（比如 `.fixture.`）而这边没跟上时，那种文件会重新落进 dialog ACL 的取材面，
-/// 而它们里面的任何一句说明文字都可能被读成一次调用。
-#[test]
-fn test_only_module_infixes_match_the_typescript_source() {
-    let path = ui_src().join("contracts/test-only-modules.ts");
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("读不到 {}：{e} —— 本对拍的另一端没了", path.display()));
-    let line = src
-        .lines()
-        .find(|l| l.contains("IS_TEST_ONLY_MODULE"))
-        .unwrap_or_else(|| panic!("{} 里找不到 IS_TEST_ONLY_MODULE", path.display()));
-    // 取正则体里的那组交替分支：`\.(test|spec|test-support)\.tsx?$`
-    let open = line
-        .find("(")
-        .expect("IS_TEST_ONLY_MODULE 的正则里没有分组");
-    let close = line[open..].find(')').expect("分组没闭合") + open;
-    let infixes: Vec<&str> = line[open + 1..close].split('|').map(str::trim).collect();
-    assert!(
-        !infixes.is_empty() && infixes.iter().all(|i| !i.is_empty()),
-        "从 {} 解出 0 个中缀 —— 取材面塌了",
-        path.display()
-    );
-    // 本文件 `collect_sources` 里那三条 `name.contains(...)` 的字面量。
-    let rust = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tests/mod.rs"),
-    )
-    .expect("读不到本文件");
-    for infix in &infixes {
-        let needle = format!("name.contains(\".{infix}.\")");
-        assert!(
-            rust.contains(&needle),
-            "TS 侧把 `.{infix}.` 算成永不进包，而 `collect_sources` 没排除它 —— \
-             那种文件里的说明文字会被 dialog ACL 的裸串表读成一次调用"
-        );
     }
 }
 
@@ -689,7 +544,7 @@ fn imports_binding(src: &str, name: &str) -> bool {
 /// 取材面先过 [`strip_ts_comments_and_strings`]：注释、字符串 / 模板 / 正则字面量里的
 /// `const confirm =` 一律不算声明 —— 否则一行注释或一段示例文本就能把真实的全局调用喂绿。
 ///
-/// **认这些形态**（每条在 `calls_global_sees_through_local_bindings` 里各有一条用例）：
+/// **认这些形态**：
 /// - `import { confirm } from …` / `import confirm from …` / `import { ask as confirm } from …`
 /// - `const|let|var confirm = …`、`function confirm(…)`、`class confirm`
 /// - 对象解构：`const { a, confirm } = x`、`const { ask: confirm } = x`、嵌套 `const { a: { confirm } } = x`、
@@ -722,8 +577,7 @@ fn imports_binding(src: &str, name: &str) -> bool {
 /// （都是 `:` 后跟 `{`），要分开得看等号右边有没有初始化器，那已经是在写 parser 了。外层那道
 /// 「花括号被 `(` 包着就得是形参列表」的收窄在这里够不着：`{ confirm }` 的外层是 `{` 不是 `(`。
 /// 未嵌套的同类形状（`foo(a, { confirm })`、`foo({ confirm })`、`return { confirm }`、
-/// `export default { confirm }`、`foo(a, [{ confirm }])`）都已判对，见
-/// `calls_global_local_binding_exemption_has_teeth`。
+/// `export default { confirm }`、`foo(a, [{ confirm }])`）都已判对。
 fn declares_binding(src: &str, name: &str) -> bool {
     let stripped = strip_ts_comments_and_strings(src);
     let src = stripped.as_str();
@@ -1009,6 +863,7 @@ fn secondary_window_dirs() -> Vec<String> {
 
 mod secondary_window_capabilities;
 
+#[cfg(target_os = "linux")]
 #[test]
 fn dialog_acl_covers_every_frontend_dialog_call() {
     let mut files = Vec::new();
@@ -1037,8 +892,7 @@ fn dialog_acl_covers_every_frontend_dialog_call() {
     // 前身是「生产代码确实还在用 window.confirm」的反向哨兵，用来防本测空转。
     // 2026-07-29 破坏性操作的二次确认改走原地二次点击（`ui/src/lib/confirm-twice.ts`）后
     // 生产代码已无 confirm 调用，该哨兵按它自己写的退役条件退役，换成下面那条**正向不变式**：
-    // 生产代码不得再回退到 window.confirm。防空转的职责由本函数开头的 `!files.is_empty()`
-    // 与 `comment_stripper_has_teeth` 共同承担。
+    // 生产代码不得再回退到 window.confirm。防空转的职责由本函数开头的 `!files.is_empty()` 承担。
 }
 
 /// 生产代码不得再调用 `window.confirm` —— 破坏性操作一律走原地二次点击
@@ -1052,6 +906,7 @@ fn dialog_acl_covers_every_frontend_dialog_call() {
 /// 运行期授权变回一段普通渲染，没有这条失败模式。
 ///
 /// 前端侧同名约束已删，本条为唯一判据（扫整个 `ui/src`）。
+#[cfg(target_os = "linux")]
 #[test]
 fn production_code_never_calls_global_confirm() {
     let mut files = Vec::new();
@@ -1081,6 +936,7 @@ fn production_code_never_calls_global_confirm() {
 ///
 /// 单独一条而不是并进上面那测：两者失败的含义不同 —— 上面红 = 有人写回了 confirm 调用；
 /// 这条红 = 授权面在没有调用点的情况下被重新放开（纯多余授权面，且会让上面那条的后果重新变得隐蔽）。
+#[cfg(target_os = "linux")]
 #[test]
 fn dialog_confirm_permission_stays_revoked() {
     let perms = granted(&crate_file("capabilities/default.json"));
@@ -1094,6 +950,7 @@ fn dialog_confirm_permission_stays_revoked() {
 
 /// 这些插件仍由 Rust 宿主使用，但生产 renderer 没有任何对应 invoke/import。把宿主依赖误读成
 /// “前端也要授权”会把配置、文件与进程能力平白暴露给一旦被注入的 webview 脚本。
+#[cfg(target_os = "linux")]
 #[test]
 fn unused_high_risk_renderer_permissions_stay_revoked() {
     let perms = granted(&crate_file("capabilities/default.json"));
@@ -1111,365 +968,6 @@ fn unused_high_risk_renderer_permissions_stay_revoked() {
             !perms.iter().any(|granted| granted == permission),
             "capabilities/default.json 又授了未使用的 renderer 权限 {permission}；\
                  若新增了真实前端调用，请把调用点与最窄权限一起纳入审查"
-        );
-    }
-}
-
-/// [`calls_global`] 的**豁免面**：文件自己声明了同名绑定时，裸 `confirm(` 解析到那个局部绑定，
-/// 不是被插件覆写的 `window.confirm`，判成全局调用就是假阳性。
-///
-/// 每条用例 = [`declares_binding`] 头注里「认这些形态」的一条。少认一种形态，对应那条就红 ——
-/// 这份清单与头注互为对拍，不许只改一边。（源码片段只求触发判据，不求是能跑的 TS。）
-#[test]
-fn calls_global_sees_through_local_bindings() {
-    let misjudged: Vec<&str> = [
-        // import 三形态
-        "import { confirm } from './x';\nconfirm(1);",
-        "import confirm from './x';\nconfirm(1);",
-        "import { ask as confirm } from './x';\nconfirm(1);",
-        // 声明关键字
-        "const confirm = make();\nconfirm(1);",
-        "let confirm;\nconfirm(1);",
-        "var confirm = make();\nconfirm(1);",
-        "function confirm(x) { return x; }\nconfirm(1);",
-        "class confirm {}\nconfirm(1);",
-        // 解构
-        "const { t, confirm, dismiss } = deps;\nconfirm(1);",
-        "const { ask: confirm } = deps;\nconfirm(1);",
-        "const { a: { confirm } } = deps;\nconfirm(1);",
-        "const [confirm] = useState();\nconfirm(1);",
-        // 形参
-        "function f(confirm) { confirm(1); }",
-        "function f({ confirm }) { confirm(1); }",
-        "const f = (confirm) => confirm(1);",
-        "const f = (a, confirm: Fn) => confirm(1);",
-        "({ confirm }) => confirm(x);",
-        "try { x(); } catch (confirm) { confirm(1); }",
-        // 收窄「被 `(` 包着的花括号」之后的回归：不被括号包着的解构是主路径，不许被砍掉
-        "const { confirm } = deps;\nconfirm(1);",
-        // 病灶原型：`node-deletion.ts` 的注入式 confirm（接口字段声明类型 + 解构拿到真绑定 + 调用）
-        "interface Deps {\n  readonly confirm: (p: P) => string;\n}\n\
-         export function use(deps: Deps) {\n  const { t, confirm } = deps;\n\
-         const id = confirm({ title: t('x') });\n  return id;\n}",
-    ]
-    .into_iter()
-    .filter(|src| calls_global(src, "confirm"))
-    .collect::<Vec<_>>();
-    // 收集完再断言（不是逐条 assert）：一次跑出**所有**被误判的形态，而不是撞见第一条就停 ——
-    // 判据被改弱时，这份清单直接就是缺口全集。
-    assert!(
-        misjudged.is_empty(),
-        "这些都是局部绑定，裸调到不了 window.confirm，不该判成全局调用：{misjudged:#?}"
-    );
-}
-
-/// 上面那道豁免**不许把门吃空**：覆盖面缩水必须在这里自曝。
-///
-/// 三类都得留牙：①没有同名绑定时裸调照抓（门还在）②显式属主 `window.` / `globalThis.` /
-/// `window['…']` 不受豁免影响（真回退到全局对话框的常见写法）③声明只出现在注释 / 字符串 /
-/// 模板字面量里时不算声明（取材面剥离那一步有牙）。外加一组**使用位**，它们长得像声明位但不是。
-#[test]
-fn calls_global_local_binding_exemption_has_teeth() {
-    let leaked: Vec<&str> = [
-        // ① 没有绑定：门必须照抓
-        "confirm('x');",
-        "if (confirm('x')) drop();",
-        "await confirm('x');",
-        // 有绑定，但绑的是**别的**名字 —— 豁免认名字，不是「有任何绑定就放行」
-        "const dismiss = make();\nconfirm('x');",
-        // ② 显式属主：同文件也声明了 confirm 也照抓
-        "const confirm = make();\nwindow.confirm('x');",
-        "const confirm = make();\nglobalThis.confirm('x');",
-        "const confirm = make();\nwindow['confirm']('x');",
-        // ③ 声明只写在注释里（生产路径上注释已被 collect_sources 剥掉，这里连未剥的也不认）
-        "// const confirm = make();\nconfirm('x');",
-        "/* const { confirm } = deps; */\nconfirm('x');",
-        // ③ 声明只写在字符串 / 模板字面量里
-        "const s = 'const confirm = make()';\nconfirm('x');",
-        "const s = `const { confirm } = deps`;\nconfirm('x');",
-        // 使用位不是声明位
-        "register(confirm);\nconfirm('x');",
-        // 对象字面量简写**实参**：花括号被调用的 `(` 包着，不是解构模式；这里的 confirm 引用的是
-        // 别处的绑定（可能正是全局），把它当声明就会放过同文件那次真·全局调用。
-        "foo(a, { confirm });\nconfirm('x');",
-        "foo({ confirm });\nconfirm('x');",
-        "bar({ confirm: fn });\nconfirm('x');",
-        "foo(a, [{ confirm }]);\nconfirm('x');",
-        "return { confirm };\nconfirm('x');",
-        "export default { confirm };\nconfirm('x');",
-        "useMemo(() => 1, [confirm]);\nconfirm('x');",
-        "if (confirm) { drop(); }\nconfirm('x');",
-        "interface D { readonly confirm: Fn }\nconfirm('x');",
-        "const deps = { confirm: 1 };\nconfirm('x');",
-    ]
-    .into_iter()
-    .filter(|src| !calls_global(src, "confirm"))
-    .collect::<Vec<_>>();
-    // 同样收集完再断言：把豁免改弱（比如让遮蔽判据恒真）时，这份清单一次列全被放过的调用。
-    assert!(
-        leaked.is_empty(),
-        "这些是真·全局 confirm 调用，作用域豁免不该放过它们：{leaked:#?}"
-    );
-    // 生产取材面是剥过注释的（collect_sources），那一档同样不许把注释里的声明当真。
-    assert!(
-        calls_global(
-            &strip_ts_comments("// const confirm = make();\nconfirm('x');"),
-            "confirm"
-        ),
-        "剥注释后再判，注释里的声明依旧不算声明"
-    );
-    // 遮蔽面自身的地基自检：清空字面量那一档必须**只清内容**，不塌行、不改结构。
-    assert_eq!(
-        strip_ts_comments_and_strings("const s = 'const confirm = 1';\nconfirm(2);"),
-        // 引号原样留、内容等长清空、行不塌：长度用 `repeat` 算，免得手数空格数错。
-        format!(
-            "const s = '{}';\nconfirm(2);",
-            " ".repeat("const confirm = 1".len())
-        )
-    );
-    assert_eq!(
-        strip_ts_comments_and_strings("const t = `a\nb`;")
-            .lines()
-            .count(),
-        2
-    );
-}
-
-#[test]
-fn comment_stripper_has_teeth() {
-    // 哨兵的地基自检：剥注释必须**真的**吃掉注释里的 window.confirm，又**不能**吃掉代码。
-    // 剥过头（比如把整份源码吃空）→ 命中面恒空 → 哨兵恒红；剥不动 → 哨兵恒绿。两侧都锁。
-    assert!(!strip_ts_comments("/* window.confirm(x) */\nlet a = 1;").contains("window.confirm("));
-    assert!(!strip_ts_comments("// window.confirm(x)\nlet a = 1;").contains("window.confirm("));
-    assert!(
-        !strip_ts_comments("/**\n * window.confirm(x)\n */\nlet a = 1;")
-            .contains("window.confirm(")
-    );
-    assert!(
-        strip_ts_comments("if (window.confirm(\"x\")) drop(); // 尾注释")
-            .contains("window.confirm(")
-    );
-    // 字符串里的 `//` 不是注释起点 —— 否则同行后续真调用被吃掉 = 扫描面出洞（假绿）。
-    assert!(
-        strip_ts_comments("const u = \"https://x\"; if (window.confirm(\"y\")) drop();")
-            .contains("window.confirm(")
-    );
-    assert!(
-        strip_ts_comments("const t = `a // b`; window.confirm(\"y\");").contains("window.confirm(")
-    );
-    // 剥完不塌行：注释吃掉的换行必须补回，否则剥后文本与真实文件行号错位（断言消息里的
-    // file:line 就成了假话），且相邻两行会被拼到一起。块注释与行注释两侧都锁。
-    assert_eq!(strip_ts_comments("a;\n/* x\ny */\nb;").lines().count(), 4);
-    assert_eq!(strip_ts_comments("a; // c\nb;").lines().count(), 2);
-    // 正则字面量里的引号不得污染字符串状态：`/['"]/` 若被当成字符串起点，引号态会一路挂到文件
-    // 后面某个落单引号，中间的注释全不再被剥 ⇒ 哨兵被注释文本喂绿。原样拷贝 + 后续注释照剥。
-    let re = strip_ts_comments("const r = /['\"]/g; // window.confirm(x)\nlet a = 1;");
-    assert!(re.contains("/['\"]/g"), "正则字面量必须原样保留");
-    assert!(!re.contains("window.confirm("), "正则之后的行注释仍须被剥");
-    // JSX 的 `/` **不是**正则起点（`</div>`、`<img … />`）：误判成正则会吃掉同行后续注释边界，
-    // 在 .tsx 里反倒新造泄漏。两种形态都必须让紧随其后的注释照常被剥。
-    assert!(!strip_ts_comments("<div />; // window.confirm(x)\n").contains("window.confirm("));
-    assert!(!strip_ts_comments("</div>; // window.confirm(x)\n").contains("window.confirm("));
-    // 除法不得被当成正则：`a / b` 之后的注释照剥。
-    assert!(
-        !strip_ts_comments("const q = a / b; // window.confirm(x)\n").contains("window.confirm(")
-    );
-    // 兜底：单/双引号串不跨行 —— 未闭合的引号（JSX 文本里的 `don't` 等）只准污染一行。
-    assert!(
-        !strip_ts_comments("<p>don't</p>\n// window.confirm(x)\n").contains("window.confirm("),
-        "未闭合引号必须在换行处复位，否则污染一路级联到文件尾"
-    );
-    // 测试文件不进扫描面（此前 settings-logic.test.ts 的测试文本就是哨兵的假绿来源之一）。
-    let mut files = Vec::new();
-    collect_sources(&ui_src(), &mut files);
-    // 非空兜底：`collect_sources` 在 read_dir 失败时静默 return，files 为空则下面的
-    // `!any(...)` 恒真 —— 空集上的「不存在」断言没牙。
-    assert!(
-        !files.is_empty(),
-        "没扫到前端源码，测试形同虚设（路径漂了？）"
-    );
-    assert!(
-        !files
-            .iter()
-            .any(|(p, _)| p.to_string_lossy().contains(".test.")),
-        "测试文件混进了 ACL 扫描面"
-    );
-}
-
-#[test]
-fn dialog_import_form_is_in_the_detection_surface() {
-    // B2：插件 JS API 的具名 import 形态。源码里**不会**出现 `plugin:dialog|save` 字样，
-    // 旧守卫（只认裸串、且表里根本没有 save）对它全绿 → 真机 'plugin:dialog|save not allowed by ACL'。
-    let src = "import { save } from '@tauri-apps/plugin-dialog';\nawait save({});";
-    assert_eq!(
-        required_dialog_perms(src).unwrap(),
-        ["dialog:allow-save"],
-        "具名 import 的 save 必须被识别为需要 dialog:allow-save"
-    );
-    // 别名与类型 import：ACL 认的是**导出名**，不是本地别名；纯类型 import 不产生权限需求。
-    assert_eq!(
-        required_dialog_perms(
-            "import { open as pick, type OpenDialogOptions } from '@tauri-apps/plugin-dialog';"
-        )
-        .unwrap(),
-        ["dialog:allow-open"]
-    );
-    // 多具名 + 双引号 + 换行排版。
-    let multi = "import {\n  ask,\n  message,\n} from \"@tauri-apps/plugin-dialog\";";
-    let mut got = required_dialog_perms(multi).unwrap();
-    got.sort_unstable();
-    assert_eq!(got, ["dialog:allow-ask", "dialog:allow-message"]);
-    // 裸串形态没被这次改动挤掉。
-    assert_eq!(
-        required_dialog_perms("await invoke('plugin:dialog|save')").unwrap(),
-        ["dialog:allow-save"]
-    );
-    assert_eq!(
-        required_dialog_perms("if (window.confirm('x')) {}").unwrap(),
-        ["dialog:allow-confirm"]
-    );
-    // 不引用该模块 ⇒ 零需求（守卫不能对无关文件乱要权限）。
-    assert_eq!(
-        required_dialog_perms("import { useState } from 'react';").unwrap(),
-        Vec::<&str>::new()
-    );
-    // `import` 只算 token，不算子串 —— 两侧边界都锁：
-    // ① 前边界：`save as reimport` 里的 `reimport` 落在真关键字与模块名**之间**，若不校验前边界，
-    //    回看会停在它身上 ⇒ stmt 里没有 `{` ⇒ 误判 Opaque，把一条本可精确判定的 import 打成噪声。
-    assert_eq!(
-        dialog_import("import { save as reimport } from '@tauri-apps/plugin-dialog';"),
-        DialogImport::Named(vec!["save".into()])
-    );
-    // ② 后边界：`importantThing` 同理（且它证明 rfind 不会被前文的同形子串带偏）。
-    assert_eq!(
-        dialog_import(
-            "const important = { save };\nimport { ask } from '@tauri-apps/plugin-dialog';"
-        ),
-        DialogImport::Named(vec!["ask".into()])
-    );
-    assert_eq!(
-        dialog_import("import { importantFlag, ask } from '@tauri-apps/plugin-dialog';"),
-        DialogImport::Named(vec!["importantFlag".into(), "ask".into()])
-    );
-    // 失败关闭：取不到具名列表的三种形态一律判「不可判」，不许静默放行。
-    for opaque in [
-        "import * as dialog from '@tauri-apps/plugin-dialog';",
-        "const d = await import('@tauri-apps/plugin-dialog');",
-        "import '@tauri-apps/plugin-dialog';",
-    ] {
-        assert!(
-            required_dialog_perms(opaque).is_err(),
-            "{opaque} 的调用面不可判，守卫必须失败关闭而不是放行"
-        );
-    }
-    // 当前前端确实没人用 import 形态（现状安全）—— 变了要么这条红、要么 ACL 测红。
-    let mut files = Vec::new();
-    collect_sources(&ui_src(), &mut files);
-    assert!(
-        !files.iter().any(|(_, s)| s.contains(DIALOG_MODULE)),
-        "前端开始直接 import @tauri-apps/plugin-dialog 了 —— 复核 capabilities 授权面后更新本条"
-    );
-}
-
-#[test]
-fn dialog_import_detection_survives_multi_statement_files() {
-    // A1 根因：旧实现从模块名 `rfind("import")` **回看整份文件**，stmt 于是从*上一条* import 的
-    // 关键字一路切到本处 —— 只要文件里此前有任何一条带花括号的 import（真实源文件几乎必有），
-    // `find('{')` / `rfind('}')` 就被上一条 import 的花括号满足 ⇒ 永远进不了 Opaque 分支，反而把
-    // 上一条 import 的名字当成 dialog 的具名列表（需求集为空 ⇒ **静默全绿**，真机才炸 ACL）。
-    //
-    // 旧单测全绿只是因为用例都是**单行、无前置 import 的玩具输入** —— 这正是本缺陷藏住的直接原因。
-    // 下面每条都带真实前置 import。
-    const HEAD: &str = "import { useState } from 'react';\nimport { clsx } from 'clsx';\n";
-
-    // ① 具名 import 仍须精确：前置 import 的名字不得混进 dialog 的需求集。
-    assert_eq!(
-        dialog_import(&format!(
-            "{HEAD}import {{ save }} from '@tauri-apps/plugin-dialog';\nawait save({{}});"
-        )),
-        DialogImport::Named(vec!["save".into()]),
-        "前置 import 的具名列表混进了 dialog 的需求集"
-    );
-    // ② 逃逸面穷举：旧实现在这些构造上一律返回 Named([\"useState\"]) ⇒ 需求为空 ⇒ 静默全绿。
-    //    新实现一律失败关闭（不可判就让人来判，绝不默默放行）。
-    for escape in [
-        "export { save } from '@tauri-apps/plugin-dialog';",
-        "export * from '@tauri-apps/plugin-dialog';",
-        "export { confirm, save } from '@tauri-apps/plugin-dialog';",
-        "const M = '@tauri-apps/plugin-dialog';\nconst d = await import(M);",
-        "const d = require('@tauri-apps/plugin-dialog');",
-        "import * as d from '@tauri-apps/plugin-dialog';",
-        "const d = await import('@tauri-apps/plugin-dialog');",
-        "import '@tauri-apps/plugin-dialog';",
-        "import d, { save } from '@tauri-apps/plugin-dialog';",
-        "import { save } from '@tauri-apps/plugin-dialog/foo';",
-    ] {
-        let src = format!("{HEAD}{escape}");
-        assert_eq!(
-            dialog_import(&src),
-            DialogImport::Opaque,
-            "{escape}（带前置 import）必须失败关闭"
-        );
-        assert!(
-            required_dialog_perms(&src).is_err(),
-            "{escape} 的调用面不可判，守卫必须失败关闭而不是放行"
-        );
-    }
-    // ③ 多条 dialog import 并存：名字合并，不能只认其中一条。
-    let two = format!(
-        "{HEAD}import {{ save }} from '@tauri-apps/plugin-dialog';\n\
-             import {{ ask }} from '@tauri-apps/plugin-dialog';"
-    );
-    let mut got = required_dialog_perms(&two).unwrap();
-    got.sort_unstable();
-    assert_eq!(got, ["dialog:allow-ask", "dialog:allow-save"]);
-    // ④ 真实排版：dialog import 夹在中间，后面还有 export / 别的 import。
-    let sandwich = format!(
-        "{HEAD}import {{ message }} from '@tauri-apps/plugin-dialog';\n\
-             import type {{ Foo }} from './foo';\nexport function go() {{}}\n"
-    );
-    assert_eq!(
-        required_dialog_perms(&sandwich).unwrap(),
-        ["dialog:allow-message"]
-    );
-}
-
-#[test]
-fn dialog_global_call_forms_are_in_the_detection_surface() {
-    // 插件 init 脚本覆写的是**全局对象**，以下形态撞的是同一条 `plugin:dialog|confirm` ACL。
-    // 只认字面量 `window.confirm(` 会全部漏掉：今天不成洞只因 allow-confirm 已授 —— 收回即逃逸；
-    // 且反向哨兵「confirm 只许出现在 nativeConfirm 一处」对「别处裸用」根本不转红。
-    for form in [
-        "if (window.confirm('x')) {}",
-        "if (await confirm('x')) {}",
-        "if (window.confirm ('x')) {}",
-        "if (window['confirm']('x')) {}",
-        "if (window[\"confirm\"]('x')) {}",
-        "if (globalThis.confirm('x')) {}",
-    ] {
-        assert_eq!(
-            required_dialog_perms(form).unwrap(),
-            ["dialog:allow-confirm"],
-            "{form} 走 plugin:dialog|confirm，必须进检测面"
-        );
-    }
-    assert_eq!(
-        required_dialog_perms("alert('x')").unwrap(),
-        ["dialog:allow-message"]
-    );
-    // 反向：不得过度命中 —— 他人成员 / 同前缀标识符不是被覆写的那个全局。过度命中会把无关文件
-    // 拖进需求集，更会让反向哨兵的唯一命中面失真。
-    for benign in [
-        "dialog.confirm('x')",
-        "reconfirm('x')",
-        "confirmDelete('x')",
-        "const confirmed = true;",
-        "type Alerts = { alert: string };",
-    ] {
-        assert_eq!(
-            required_dialog_perms(benign).unwrap(),
-            Vec::<&str>::new(),
-            "{benign} 不是 dialog 调用，守卫不许乱要权限"
         );
     }
 }

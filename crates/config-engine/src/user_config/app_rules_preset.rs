@@ -29,7 +29,7 @@ pub struct AppPreset {
 ///
 /// **键名契约**：`rename_all = "camelCase"` 产出 `labelKey`/`iconUrl`/`geositeTags`/`geoipTags`/
 /// `processNames` —— 与 TS interface 一致。改键名 = 破坏前端渲染，且 **tsc 抓不到**（invoke 返回值
-/// 是 as-cast）→ 由 `tests/frontend_sot_guard.rs` 锁死。
+/// 是 as-cast）。
 ///
 /// `iconUrl` 用 `Option` + `skip_serializing_if`：对齐 TS `iconUrl?: string`（自定义预设可无图标）。
 /// `geoipTags`/`processNames` 恒序列化为数组（TS 侧标 `?` 但消费点全是 `|| []` / `.some()`，

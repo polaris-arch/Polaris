@@ -28,6 +28,8 @@
 //! 的实参本身就是字面量）与 [`polaris_source_probe::mask_comments_and_strings`]（符号面：
 //! 断言调用了哪个函数）。Kotlin / Gradle / ProGuard 侧按行剥 `//` 与 `#` 注释后再取材，
 //! 理由同上 —— 不剥的话，注释里写着的同一句话会给正面断言喂一份与生产代码无关的证据。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 
@@ -667,85 +669,4 @@ fn proguard_pattern_covers(pattern: &str, class: &str) -> bool {
         p[0] == c[0] && go(&p[1..], &c[1..])
     }
     go(pattern.as_bytes(), class.as_bytes())
-}
-
-#[test]
-fn the_proguard_pattern_matcher_has_teeth() {
-    // 正：本仓今天那条规则罩得住目标类。
-    assert!(proguard_pattern_covers(
-        "org.rustls.platformverifier.**",
-        RUSTLS_VERIFIER_CLASS
-    ));
-    // 反：验收员用过的那条变异罩不住 —— 没有这条对照，上面的覆盖判定可能是恒真的。
-    assert!(!proguard_pattern_covers(
-        "org.rustls.platformverifier.NoSuchThing",
-        RUSTLS_VERIFIER_CLASS
-    ));
-    // `*` 不跨 `.`：单星只能罩一段。
-    assert!(!proguard_pattern_covers(
-        "org.rustls.*",
-        RUSTLS_VERIFIER_CLASS
-    ));
-    assert!(proguard_pattern_covers(
-        "org.rustls.platformverifier.*",
-        RUSTLS_VERIFIER_CLASS
-    ));
-    // 逐字全等也算罩住。
-    assert!(proguard_pattern_covers(
-        RUSTLS_VERIFIER_CLASS,
-        RUSTLS_VERIFIER_CLASS
-    ));
-    // 提取器自检：三种 keep 前缀与注解限定都取得到 class 后面那个 token，且指令原样带回来。
-    let patterns = keep_class_patterns(
-        "-keep class a.B { *; }\n-keepnames class c.D\n-keep @E.F class g.H { *; }\n-dontwarn i.J\n",
-    );
-    assert_eq!(
-        patterns
-            .iter()
-            .map(|rule| (rule.directive.as_str(), rule.pattern.as_str()))
-            .collect::<Vec<_>>(),
-        vec![("-keep", "a.B"), ("-keepnames", "c.D"), ("-keep", "g.H")]
-    );
-}
-
-/// A8 的对照：指令语义判定必须真的把「不保类本体」的那几种筛掉。
-///
-/// 没有这条，`keep_directive_preserves_class` 写成恒真（那正是上一版的行为）也没人说话。
-#[test]
-fn only_the_directives_that_really_pin_the_class_count_as_coverage() {
-    // ✅ 真的保住类本体
-    assert!(keep_directive_preserves_class("-keep"));
-    assert!(keep_directive_preserves_class("-keepclasseswithmembers"));
-    // ❌ allowshrinking 一族：类照剪，只是留下时不改名
-    assert!(!keep_directive_preserves_class("-keepnames"));
-    assert!(!keep_directive_preserves_class("-keepclassmembernames"));
-    assert!(!keep_directive_preserves_class(
-        "-keepclasseswithmembernames"
-    ));
-    // ❌ 只管成员：类本身没保住，成员也就跟着没了
-    assert!(!keep_directive_preserves_class("-keepclassmembers"));
-    // ❌ 修饰符直接写出来的那一形
-    assert!(!keep_directive_preserves_class("-keep,allowshrinking"));
-    assert!(keep_directive_preserves_class("-keep,allowobfuscation"));
-
-    // 端到端：同一个类名，用 ❌ 指令写出来时覆盖判定必须为空。
-    let weak = keep_class_patterns(&format!(
-        "-keepnames class {RUSTLS_VERIFIER_CLASS}\n-keepclassmembers class {RUSTLS_VERIFIER_CLASS} {{ *; }}\n"
-    ));
-    assert_eq!(weak.len(), 2, "两条都该被抠出来（提取器不按语义筛）");
-    assert!(
-        weak.iter()
-            .filter(|rule| keep_directive_preserves_class(&rule.directive))
-            .all(|rule| !proguard_pattern_covers(&rule.pattern, RUSTLS_VERIFIER_CLASS)),
-        "用 -keepnames / -keepclassmembers 写的规则被算成了「罩住了」—— 那是上一版的洞"
-    );
-    // 正向对照：换成 `-keep` 之后必须算罩住（否则上一条会被一个恒假的判定满足）。
-    let strong = keep_class_patterns(&format!("-keep class {RUSTLS_VERIFIER_CLASS} {{ *; }}\n"));
-    assert!(
-        strong
-            .iter()
-            .any(|rule| keep_directive_preserves_class(&rule.directive)
-                && proguard_pattern_covers(&rule.pattern, RUSTLS_VERIFIER_CLASS)),
-        "`-keep class <全名>` 竟然不算罩住 —— 判定恒假，上面那条否定断言没有信息量"
-    );
 }

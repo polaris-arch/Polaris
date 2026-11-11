@@ -48,6 +48,8 @@
 //! `src-tauri/src/**` + `crates/*/src/**` 的**生产**文件（排除 `tests/` 目录与 `tests.rs`：测试里
 //! 用通配臂是正当的，它们不是分派点）。判据一律在**剥掉注释与字符串字面量之后**的代码面上取 ——
 //! 本文件自己的头注就写满了 `Platform::Other`，不剥就会自己污染自己。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1588,7 +1590,7 @@ fn statement_span(code: &str, pos: usize) -> (usize, usize) {
 // # 不在本面之内的（显式声明边界，否则「扫到 0 个也叫全绿」）
 //
 // - `#[cfg(target_os = "…")]` / `cfg!(target_os = "…")`：那是**编译期**平台轴，由
-//   `scripts/gate-rust.sh` 的三目标 cross-clippy 与 `tests/cross_target_coverage.rs` 守。
+//   `scripts/gate-rust.sh` 的三目标 cross-clippy 守。
 //   形态上也区分得开：`cfg` 用的是单个 `=`，不落在本门的分派位判据里。
 // - 测试代码（`production_sources` 已排除）：测试里按平台串分叉是**构造输入**，不是分派点。
 // ═══════════════════════════════════════════════════════════════════════════

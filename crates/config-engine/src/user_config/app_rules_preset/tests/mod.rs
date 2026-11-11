@@ -168,13 +168,11 @@ fn seed_drops_offline_preset() {
 
 // ── DTO 门 ──────────────────────────────────────────────────────────
 //
-// 「前端不得再有第二份表」那几条**读前端源码**的门在 `tests/frontend_sot_guard.rs`（集成测试，
-// 与 catalog 的同类门同处一室、共用剥注释器）。本处只放**纯 Rust 侧**的自洽性门。
+// 本处只放**纯 Rust 侧**的自洽性门。
 
 #[test]
 fn dto_keys_are_camel_case_contract() {
-    // DTO 键名是跨语言契约（前端 AppPreset interface）。与前端字段的对差在
-    // tests/frontend_sot_guard.rs::frontend_preset_interface_matches_rust_dto_fields。
+    // DTO 键名是跨语言契约（前端 AppPreset interface）。
     let dto = &all_presets_dto()[0];
     let json = serde_json::to_value(dto).expect("DTO 序列化");
     let obj = json.as_object().expect("DTO 应为对象");

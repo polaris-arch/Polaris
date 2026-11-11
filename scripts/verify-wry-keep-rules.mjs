@@ -25,8 +25,7 @@
 // 「文件不在就跳过」而变成一条**静默缺席**的假门。
 //
 // 出路是把判据放到生成物**保证在场**的那一刻：`.github/workflows/android.yml` 里
-// `tauri android build` 铺完生成物的下一步。Rust 门那边改为守「这一步还在不在 android.yml 里」
-// （`android_release_signing_wiring.rs` 的 ⑥），于是删掉这条腿会在每次 `cargo test` 上红。
+// `tauri android build` 铺完生成物的下一步。
 // 判据只有这一份实现，两处调用。
 //
 // ── 用法 ────────────────────────────────────────────────────────────────────────

@@ -325,15 +325,14 @@ export const REQUIRED_ELF_SECTIONS = Object.freeze(['.text', '.dynamic', '.dynsy
  *
  * ── 为什么这条判据必须住在**产物侧**（2026-09-06 实证）──
  *
- * `src-tauri/tests/android_native_surface_wiring.rs` 已经有一道逐条全等的权限门，但它读的是
- * **本仓自有**的 `AndroidManifest.xml`。APK 真正申请的权限集是 AGP 的 manifest merger 把
+ * **本仓自有**的 `AndroidManifest.xml` 不是出厂权限集。APK 真正申请的权限集是 AGP 的 manifest merger 把
  * **库 manifest** 合并进来之后的结果 —— 两者今天就已经不等：本仓自己声明 8 条，
  * `app/build/intermediates/packaged_manifests/arm64Debug/…/AndroidManifest.xml` 是 11 条。
  * 多出来的三条来自依赖（见下面每条的 `from`，出处 `app/build/outputs/logs/manifest-merger-*.txt`）。
  *
  * 于是有一条完整的失效链，链上没有一处会说话：把任一 tauri 插件升一版、或加一个在自己
  * manifest 里声明 `QUERY_ALL_PACKAGES` / `READ_EXTERNAL_STORAGE` 的插件 ⇒ 出厂 APK 当场
- * 多一条敏感权限，而源码侧那道门绿（它看不见库 manifest）、包可见性门绿（同上）、
+ * 多一条敏感权限，而源码侧的包可见性门绿（它看不见库 manifest）、
  * 本文件此前的六条判据一条都不涉及权限（`grep -n permission scripts/verify-apk.mjs` 零命中）。
  * 本判据就是那条链上唯一一处能说话的地方。
  *
@@ -345,10 +344,6 @@ export const REQUIRED_ELF_SECTIONS = Object.freeze(['.text', '.dynamic', '.dynsy
  * ── `from` 不是装饰 ──
  *
  * `'self'` = 本仓 `AndroidManifest.xml` 自己写的；其余取值 = 注入它的那个库的坐标。
- * `src-tauri/tests/android_native_surface_wiring.rs` 的
- * `permission_registry_agrees_with_the_artifact_side_registry` 拿本表里 `from: 'self'` 的那批
- * 与它自己的登记表做集合恰等 —— 两张表因此不会各自漂移，而「这条权限从哪儿来」也就不是
- * 可以在登记表里改口的东西（把一条自有权限改标成「库注入」来消红，那道门当场红）。
  */
 export const APK_PERMISSION_REGISTRY = Object.freeze([
   { name: 'android.permission.INTERNET', from: 'self', why: '内核出站与所有 HTTPS（订阅拉取、更新检查、测速）。没有它这个应用不存在。' },

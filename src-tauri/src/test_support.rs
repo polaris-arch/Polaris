@@ -297,7 +297,7 @@ pub(crate) fn sleeping_probe_script(witness: &Path) -> String {
 }
 
 /// 落一个**随后要被直接执行**的替身文件（0o755）。测试里凡是「写出一个文件再把它当程序起」
-/// 都必须走这里，`src-tauri/tests/executable_stand_in_discipline.rs` 在源码层面强制。
+/// 都必须走这里。
 ///
 /// # 它消除的竞态
 ///

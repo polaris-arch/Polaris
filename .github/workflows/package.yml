@@ -717,7 +717,6 @@ jobs:
       # 判据刻意取「依赖版本」而非「那个默认值」本身——二进制里读不到默认值（符号表被剥），
       # 且判据独立于被检查的值，是 28f5d46 修 cronet go.mod 对拍时立下的同一条。
       # 挂本腿的理由：ci.yml 不拉核，在那边加就是永不会红的假门。
-      # 删掉本步会让 core_dep_fingerprint 的 `ci_step_still_wired` 转红（它 grep 本文件）。
       - name: Bundled core dependency fingerprint (sing-tun pin)
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
         env:
@@ -733,7 +732,6 @@ jobs:
       # 判据是内核那一侧的形状（`sing-box schema` 的 $defs 属性路径清单，按协议分支分域），
       # **不**断言差集为零 —— 差集本来就不该是零。红 ≠ 有 bug，红 = 该看一眼了。
       # 与上一步同挂本腿同理由（ci.yml 不拉核，在那边加就是永不会红的假门）。
-      # 删掉本步会让 core_schema_surface 的 `ci_step_still_wired` 转红（它 grep 本文件）。
       - name: Bundled core config schema surface (drift tripwire)
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
         env:
@@ -750,7 +748,6 @@ jobs:
       # 故在任意宿主上都能把四个平台一起看一遍；上一步的 fetch 不传 --platform = 全平台，
       # 四份必然在盘上，`POLARIS_REQUIRE_KERNEL_GATE=1` 让缺任一份变成红而不是静默少看一个平台。
       # 它还顺带守着上一步只落**一份**共享 schema 夹具的依据（四平台 tag 集只差 with_purego）。
-      # 删掉本步会让 core_build_matrix 的 `ci_step_still_wired` 转红（它 grep 本文件）。
       - name: Bundled core build face matrix (per-platform tags/GOOS/CGO)
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
         env:
@@ -766,15 +763,13 @@ jobs:
       # 在那边加只会得到一条「文件不在就跳过」的、**永远不会红**的假门。本腿刚 fetch 完核，
       # 核必然在盘上；`POLARIS_REQUIRE_KERNEL_GATE=1` 让「核没拉到」也变成红而不是静默跳过。
       # 成本：随包核实测单次 check ≈13ms × 37 场景，可忽略。
-      # 删掉本步会让 `ci_step_still_wired` 那条断言转红（它 grep 本文件）。
       #
       # 🔴 **必须排在「Fetch sing-box core」之后**（2026-08-13 实测教训，当时 Cronet 由独立步骤拉取）。此前排在它之前，
       # Windows 腿红在 `naive outbound → cronet: library not found. Place libcronet.dll in the
       # executable directory`：随包核 beta.14 在 **initialize 阶段**就硬要这个库，而它如今随
       # 发布归档由 `fetch-core.mjs` 落到 `resources/win/`（= 核的同目录）。08-05 那次绿是因为旧核不要它，
       # 抬核到 beta.14 后才暴露 —— 而 Windows 腿从 08-05 起就没再跑过，缺陷潜伏了一周。
-      # 排在之后同时更贴近生产：生产就是把 DLL 放在核旁边。顺序由 `ci_step_order_is_load_bearing`
-      # 钉住。
+      # 排在之后同时更贴近生产：生产就是把 DLL 放在核旁边。挪回去 Windows 腿必红。
       - name: Kernel accepts generated outbounds (decode-stage gate)
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
         env:
@@ -874,7 +869,6 @@ jobs:
       # 构建之后另有一遍产物口径的清点（见下方 `Verify bundled package inventory`），两遍口径不同：
       # 这一遍只判「多余」方向（helper 由下面的 `Build and stage privileged helper` 现编现铺，
       # 此刻还不在盘上，份数不可判定），产物那一遍两个方向都判。
-      # 删掉本步会让 packaging_inventory_gate_wired 那条断言转红（它 grep 本文件）。
       - name: Verify packaging inventory (static, pre-build)
         shell: bash
         run: node scripts/verify-packaging.mjs inventory --label ${{ matrix.label }} --static
@@ -1189,7 +1183,6 @@ jobs:
       # 射程如实标注：清点的是 bundler 铺 bundle.resources 的那一片（资源载荷树），
       # 不含 bundler / linuxdeploy 自己铺的 ELF 与宿主共享库 —— 那些不由 bundle.resources 决定，
       # 而 windows 腿的 --root 就是整棵 target/release（cargo 产物几万个文件）。输出里会打印射程外的文件数。
-      # 删掉这三步中的任意一步都会让 packaging_inventory_gate_wired 转红（它 grep 本文件）。
       - name: Verify bundled package inventory (macOS)
         if: runner.os == 'macOS'
         shell: bash

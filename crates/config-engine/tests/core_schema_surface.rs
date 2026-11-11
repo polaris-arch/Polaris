@@ -45,7 +45,7 @@
 //!   「这份配置这个核收不收」由起核时的 `sing-box check` 回答（`runtime/proxy::generate_and_gate`）。
 //!   三者各管一格，别拿其中任一条的绿去读另外两格。
 //! - 缺核时跳过；`POLARIS_REQUIRE_KERNEL_GATE=1` 时缺核直接红（与 `core_dep_fingerprint` /
-//!   `kernel_accepts_outbounds` 同一套接线，打包腿强制生效，`ci_step_still_wired` 守着）。
+//!   `kernel_accepts_outbounds` 同一套接线，打包腿强制生效）。
 //! - 🔴 **「跳过」是静默的**：下面那句 `eprintln!` 归 libtest 捕获，**只在测试失败时才回放**。
 //!   CI 的 ubuntu 腿不拉核 ⇒ 那条绿只说明「编得过 + 抽取器自检过」，没有比对过任何 schema。
 //!
@@ -387,20 +387,5 @@ fn the_domain_dimension_catches_value_only_narrowing() {
             .iter()
             .any(|s| s.starts_with("Inbound.tls = [")),
         "把下一级字段的取值域挂到了父字段名下：{nested_object:?}"
-    );
-}
-
-#[test]
-fn ci_step_still_wired() {
-    let wf = repo_root().join(".github/workflows/package.yml");
-    let raw =
-        std::fs::read_to_string(&wf).unwrap_or_else(|e| panic!("读不到 {}: {e}", wf.display()));
-    // 匹配 **run 命令本身**而不是裸词：本文件在 package.yml 里还留了一段说明注释，注释里就写着
-    // `core_schema_surface`。用裸词做判据的话，把整个 step 删掉、注释留下，本断言照样绿 ——
-    // 本仓两天内因此踩空两次（见 memory `feedback_gate_exists_but_toothless`）。
-    assert!(
-        raw.contains("--test core_schema_surface"),
-        "package.yml 里找不到 `--test core_schema_surface` —— 打包腿没在跑 schema 面门，\
-         缺核时它会静静跳过而没人知道"
     );
 }

@@ -62,9 +62,10 @@
 //!
 //! # 与既有门的分工
 //!
-//! `windows_console_suppression.rs` 守的是「进程**怎么被创建**」（有没有挂 `CREATE_NO_WINDOW`），
 //! 本门守的是「进程创建**之后**它的输出归谁」。批 A 在 `speedtest/tests` 里的两道门（内存 duplex
 //! 灌满的行为门 + `drive_after_spawn` 的次序门）射程是测速这一条腿；本门的射程是全仓每一条腿。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -521,7 +522,7 @@ const UTILITY_PIPE_CUSTODY: &[&str] = &["fn capture(", "impl Drop for UtilityChi
 
 /// 豁免表：允许某个站点不满足纪律 1（排空形态 / 排空早于等待），但**不能**免掉登记本身。
 ///
-/// 规则抄 `test_source_anchors.rs` 的防腐形态：每条必须**恰好命中一次**。命中 0 次说明它守的东西
+/// 防腐形态：每条必须**恰好命中一次**。命中 0 次说明它守的东西
 /// 已经没了，条目本身成了将来某个真违规的免死金牌；命中多次说明一条豁免悄悄盖住了它没打算覆盖的
 /// 地方。`reason` 与 `tracked_by` 都必须非空——豁免要能被审计，不能是随手加一行就静默过。
 ///
@@ -649,7 +650,7 @@ fn members_from_cargo_metadata(root: &Path) -> Vec<PathBuf> {
     members
 }
 
-/// 仓根 `Cargo.toml` 的 `[workspace] members` 字面展开（形态抄 `test_source_anchors.rs`）。
+/// 仓根 `Cargo.toml` 的 `[workspace] members` 字面展开。
 ///
 /// 只用作 [`workspace_members`] 的对差面，**不再单独充当取材面**（理由见那里）。
 fn members_from_manifest_literal(root: &Path) -> Vec<PathBuf> {

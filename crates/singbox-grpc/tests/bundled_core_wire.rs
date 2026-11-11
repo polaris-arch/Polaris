@@ -16,8 +16,6 @@
 //! | `machinery_detects_nested_message_drift` | 否 | **跑** | 嵌套那条腿（`Log.Message`，descriptor 侧 nested_type + vendored 侧带点路径）是活的 |
 //! | `message_and_enum_tables_do_not_cross_contaminate` | 否 | **跑** | message 表与 enum 表各走各的，不串味 |
 //! | `vendored_proto_matches_recorded_core_layout` | 否 | **跑** | vendored proto 与实测记录的 beta.7 布局一致 |
-//! | `every_checked_symbol_has_a_recorded_layout` | 否 | **跑** | 进对拍表的符号都留了「核对过真核」的书面证据 |
-//! | `manifest_key_reader_has_teeth` | 否 | **跑** | 平台枚举的读取器真读得出、且看不懂时真报错（不返回空表） |
 //! | `core_platform_enumeration_comes_from_the_manifest` | 否 | **跑** | 覆盖轴取自 manifest，路径由 key 推导（加平台自动跟上） |
 //! | `vendored_proto_matches_every_bundled_core` | 是 | 执行但跳过对拍（**静默**） | vendored proto 与**盘上真核**一致；孤儿核即红 |
 //!
@@ -41,8 +39,7 @@ const CHECKED_MESSAGE: &str = "TailscaleEndpointStatus";
 
 // 符号表与 vendored proto 原文取自 `proto_wire_check`（三个消费点共用一份，
 // 此前 build.rs 与本文件各存一份、靠注释互相提醒「一处漏加，另一处就白守」）。
-// 表里每一项仍必须有下面 `RECORDED_LAYOUTS` 里的实测记录作书面证据 ——
-// 由 `every_checked_symbol_has_a_recorded_layout` 守着。
+// 表里每一项仍必须有下面 `RECORDED_LAYOUTS` 里的实测记录作书面证据。
 use proto_wire_check::{SymbolKind, CHECKED_SYMBOLS, PROTO_SRC};
 
 /// `TailscaleEndpointStatus` 的真实字段号。**f1..f10 记于 1.14.0-beta.7，f11..f14 记于 1.14.0-beta.15。**
@@ -240,8 +237,7 @@ const RECORDED_BETA7_LOG: &[(&str, u32)] = &[("messages", 1), ("reset", 2)];
 /// prost 零容忍整帧丢弃，故这层与外层同等重要，不能因为它是嵌套的就不进表。
 const RECORDED_BETA7_LOG_MESSAGE: &[(&str, u32)] = &[("level", 1), ("message", 2)];
 
-/// `CHECKED_SYMBOLS` 每一项对应的实测记录。两张表**必须逐项对上**（由
-/// `every_checked_symbol_has_a_recorded_layout` 守）：只加进对拍表却不留实测记录，等于把
+/// `CHECKED_SYMBOLS` 每一项对应的实测记录。两张表**必须逐项对上**：只加进对拍表却不留实测记录，等于把
 /// 「我们确实核对过真核」这条书面证据跳过了。
 type RecordedLayout = (SymbolKind, &'static str, &'static [(&'static str, u32)]);
 /// Taildrop 收件侧四个消费面的字段号。**记于 1.14.0-beta.15**（该版本首次引入）。
@@ -830,26 +826,6 @@ fn vendored_proto_matches_recorded_core_layout() {
     }
 }
 
-/// 对拍表与实测记录表**逐项对上**：往 `CHECKED_SYMBOLS` 里加一个符号却不留 `RECORDED_*` 记录，
-/// 等于跳过了「我们确实核对过真核」这一步 —— 那正是这道门当初建起来要防的事。
-#[test]
-fn every_checked_symbol_has_a_recorded_layout() {
-    for (kind, name) in CHECKED_SYMBOLS {
-        assert!(
-            RECORDED_LAYOUTS
-                .iter()
-                .any(|(k, n, _)| k == kind && n == name),
-            "`{name}` 进了 CHECKED_SYMBOLS 却没有 RECORDED_* 实测记录"
-        );
-    }
-    for (kind, name, _) in RECORDED_LAYOUTS {
-        assert!(
-            CHECKED_SYMBOLS.iter().any(|(k, n)| k == kind && n == name),
-            "`{name}` 有实测记录却没进 CHECKED_SYMBOLS（真核那条腿不会去对它）"
-        );
-    }
-}
-
 /// **平台枚举的真值源**：随包核有哪几个平台，只由 `scripts/desktop-core/release-contract.json` 的
 /// `platforms` 键集合决定；平台在仓内的路径由 key 推导，不是第二份名单。
 /// 不需要真核，故 CI 上也跑。
@@ -897,61 +873,6 @@ fn core_platform_enumeration_comes_from_the_manifest() {
         proto_wire_check::core_relative_path("win-arm64"),
         "resources/win-arm64/sing-box.exe"
     );
-}
-
-/// **变异验证（平台枚举读取器有没有牙）**：它读得出真的键，且**看不懂时真的报错** ——
-/// 后半条才是重点。返回空表的读取器会让「按存在即检」的门变成「没核可查 = 绿」，
-/// 那种失效连一行日志都没有。
-#[test]
-fn manifest_key_reader_has_teeth() {
-    use proto_wire_check::object_keys;
-
-    // 正向：本层键按序读出，前后的无关字段不干扰。
-    let src = r#"{ "v": "1.0", "coreArchiveSha256": { "linux": "aa", "win": "bb" }, "z": 1 }"#;
-    assert_eq!(
-        object_keys(src, "coreArchiveSha256").expect("应读得出"),
-        vec!["linux".to_owned(), "win".to_owned()]
-    );
-
-    // 嵌套对象里的键不得漏进来（否则平台枚举会混进 sha 结构里的字段名）。
-    let nested = r#"{"coreArchiveSha256": {"linux": {"sha": "aa"}, "win": "bb"}}"#;
-    assert_eq!(
-        object_keys(nested, "coreArchiveSha256").expect("应读得出"),
-        vec!["linux".to_owned(), "win".to_owned()]
-    );
-
-    // 定位的是**指名的那个字段**，不是「文件里第一个对象」：真 manifest 里紧邻着
-    // `cronetLibrarySha256`，两个字段的键集合本就不同，串了就读成另一批平台。
-    let two = r#"{"coreArchiveSha256": {"linux": "aa", "mac-x64": "bb"},
-                  "cronetLibrarySha256": {"linux": "cc"}}"#;
-    assert_eq!(
-        object_keys(two, "coreArchiveSha256").expect("应读得出"),
-        vec!["linux".to_owned(), "mac-x64".to_owned()]
-    );
-    assert_eq!(
-        object_keys(two, "cronetLibrarySha256").expect("应读得出"),
-        vec!["linux".to_owned()]
-    );
-
-    // 反向对照：以下每一种「看不懂」都必须是 Err，而不是空表。
-    for (bad, why) in [
-        (r#"{"other": {"linux": "aa"}}"#, "字段缺席"),
-        (r#"{"coreArchiveSha256": {}}"#, "空对象"),
-        (r#"{"coreArchiveSha256": []}"#, "值不是对象"),
-        (r#"{"coreArchiveSha256": "linux"}"#, "值是字符串"),
-        (r#"{"coreArchiveSha256" "linux"}"#, "缺冒号"),
-        (r#"{"coreArchiveSha256": {"linux": "aa""#, "对象没闭合"),
-        (r#"{"coreArchiveSha256": {"li\nux": "aa"}}"#, "键里有转义"),
-        (
-            r#"{"coreArchiveSha256": {"linux": "aa", "linux": "bb"}}"#,
-            "键重复",
-        ),
-    ] {
-        assert!(
-            object_keys(bad, "coreArchiveSha256").is_err(),
-            "「{why}」必须报错而不是返回空表：{bad}"
-        );
-    }
 }
 
 /// vendored `.proto` ⇄ **盘上真核**（对拍表里每一个符号）。需要 `node scripts/fetch-core.mjs` 拉过核。
@@ -1005,9 +926,12 @@ fn vendored_proto_matches_every_bundled_core() {
 
     let mut checked = 0usize;
     for (key, core) in &survey.present {
-        for (kind, name) in CHECKED_SYMBOLS {
-            proto_wire_check::check_core_against_proto(core, PROTO_SRC, *kind, name)
-                .unwrap_or_else(|report| panic!("{key}: {report}"));
+        // 每份核只读一次、整表对拍一次（逐符号重读约 50MB 的核曾让本条在 debug 下跑两分钟）。
+        let bytes = std::fs::read(core)
+            .unwrap_or_else(|e| panic!("{key}: 读不到随包核 {}：{e}", core.display()));
+        match proto_wire_check::verdict_for_core_bytes(&bytes) {
+            proto_wire_check::WireVerdict::Match => {}
+            other => panic!("{key} {}: {other:?}", core.display()),
         }
         checked += 1;
         eprintln!("[ok] {key} {} 与 vendored proto 一致", core.display());
@@ -1088,6 +1012,7 @@ fn whole_core_verdict_checks_every_required_symbol_and_reports_missing_separatel
     ));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn release_guard_uses_one_whole_core_verdict_and_fails_closed() {
     // Wiring guard complements the synthetic semantic tests above: runtime

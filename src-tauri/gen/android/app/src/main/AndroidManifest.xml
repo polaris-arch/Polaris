@@ -23,7 +23,7 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 设置 → 通用「开机自动连接」（autoStart 的 Android 腿）：开机后由 vpn.BootReceiver 判准入再起核。
          normal 级权限（安装即授予，不弹窗）。射程只有「开机时收到一次广播」。判据：
-         src-tauri/tests/android_native_surface_wiring.rs 的权限登记表 + scripts/check-android-bridge.mjs 的 A13。 -->
+         scripts/verify-apk.mjs 的权限登记表 + scripts/check-android-bridge.mjs 的 A13。 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- 包可见性（Android 11 / API 30 起；本仓 targetSdk = 36 ⇒ 生效）。

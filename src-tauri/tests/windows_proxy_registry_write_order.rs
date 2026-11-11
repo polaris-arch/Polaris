@@ -3,6 +3,8 @@
 //! `windows_proxy_registry` 在 Linux 不参与运行期编译，因此普通单测无法防止原生写序与
 //! `reg.exe` 回退分叉。本门使用 `polaris-source-probe` 的等长净化面精确截取 writer impl 及
 //! `write` 方法，只在该射程内锁定 Server → Override → Enable 的三步顺序。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 fn unique_braced_scope<'a>(source: &'a str, anchor: &str) -> &'a str {
     let masked = polaris_source_probe::mask_comments_and_strings(source);

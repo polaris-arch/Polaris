@@ -107,7 +107,7 @@ permissions:
 # Shared provider imports are source reads; do not write Python bytecode into the App checkout.
 env:
   PYTHONDONTWRITEBYTECODE: '1'
-  # 构建权重的两个开关放在 workflow 级而不是某个 job：两个 job 的前置步骤逐字相同（⑦ 对拍），
+  # 构建权重的两个开关放在 workflow 级而不是某个 job：两个 job 的前置步骤逐字相同，
   # 其中 `Select APK build weight` 步与 rust-cache 的键都读它们；放 job 级就得写两份、会漂。
   # 轻量构建只认调用方显式传入的 true；手动 dispatch 与 tag 发布调用都没有它 ⇒ '0'。
   # 两者的组合由 `Select APK build weight` 步 fail-closed 校验（轻量 + 发布 ⇒ 当场红）。
@@ -157,9 +157,8 @@ jobs:
   #    两条腿的判据不能互相冒充。边界表在 scripts/gate-android-release-behavior.sh 头注。
   #
   # ── 前置步骤与 `release-apk` job 逐字相同 ──
-  # GitHub Actions 没有 job 内的 step 复用，只能复制。两份会漂 ⇒ 由
-  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑦ 逐字对拍
-  # （射程：`- uses: actions/checkout@v7` 起，到 `libbox.aar 必须在位` 步止）。
+  # GitHub Actions 没有 job 内的 step 复用，只能复制；两份须同步修改
+  # （范围：`- uses: actions/checkout@v7` 起，到 `libbox.aar 必须在位` 步止）。
   #
   # ── 构建权重：发行构型 vs 风险门轻量构型（2026-10-08）──
   #
@@ -268,7 +267,7 @@ jobs:
       # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架
       # （两处由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 对拍，不许各自漂移）。
       # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
-      # 本步随前置步骤在两个 job 里逐字复制（⑦ 对拍），这里只留指针。
+      # 本步随前置步骤在两个 job 里逐字复制，这里只留指针。
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
       # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
       - name: Select APK build weight (release profile vs risk-gate light)
@@ -635,12 +634,7 @@ jobs:
   # 文件名本身就写着没签名。Android **只接受与已装应用同一把签名的升级包**：拿一个签名不一致
   # （或干脆没签名）的 APK 去覆盖安装，系统给的是一句「应用未安装」，而这件事应用内观测不到
   # （ACTION_VIEW 交出去之后没有回调）。故这条腿与验证腿刻意分开，且本腿的 assemble 那一行
-  # **不许**带验证腿那个 `-P…` 逃生门实参 —— 由
-  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑧ 逐字守着。
-  #
-  # ⚠️ 本段（连同下面 assemble 那一步的注释）**刻意不写出那个属性名的字面量**：⑧ 的取材面是
-  #    整个 job 的原文、含注释 —— 说明与实参在文本上不可分辨，把判据改成「只扫非注释行」
-  #    等于给「在注释里写、在实参里也写」开一条缝。宁可让说明绕着走。
+  # **不许**带验证腿那个 `-P…` 逃生门实参。
   #
   # ── 资产名是一条跨文件命名契约 ──
   # 下面 `asset_name=` 那一行的字面形态，与 `crates/updater/src/github.rs` 的
@@ -651,8 +645,7 @@ jobs:
   # 把这一行取出来、展开成一个真实文件名、喂进真的选包器。
   #
   # ── 前置步骤与 `release_check` job 逐字相同 ──
-  # GitHub Actions 没有 job 内的 step 复用，只能复制。两份会漂 ⇒ 由
-  # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑦ 逐字对拍。
+  # GitHub Actions 没有 job 内的 step 复用，只能复制；两份须同步修改。
   release-apk:
     name: 签名 release APK → GitHub release 资产
     if: inputs.publish_release
@@ -762,7 +755,7 @@ jobs:
       # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架
       # （两处由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 对拍，不许各自漂移）。
       # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
-      # 本步随前置步骤在两个 job 里逐字复制（⑦ 对拍），这里只留指针。
+      # 本步随前置步骤在两个 job 里逐字复制，这里只留指针。
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
       # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
       - name: Select APK build weight (release profile vs risk-gate light)

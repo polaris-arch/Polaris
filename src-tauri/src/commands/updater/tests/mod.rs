@@ -652,248 +652,6 @@ fn declared_file_size_is_enforced_as_an_equality_criterion() {
     assert!(check_declared_size(1000, None).is_ok());
 }
 
-/// 🟡 **调用点守卫：单飞闸必须早于「发进度」与「真下载」。**
-///
-/// 闸拿在后面 = 等待中的那条腿照样先发一发 `downloading(0)`，把已在跑的另一条腿的百分比顶回 0。
-#[test]
-fn update_download_takes_the_gate_before_emitting_or_downloading() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
-    let gate_at = body
-        .find("download_gate(&dest)")
-        .expect("下载单飞闸被删了 —— 后台自动下载与弹窗「更新」会同时写同一个 dest");
-    let emit_at = body
-        .find("emit(ProgressStage::Downloading {")
-        .expect("锚点消失：守卫已失去判据");
-    // 锚点随 U1（整包入内存 → 流式落盘）从 `download_with_progress(` 换成
-    // `download_to_sink_with_progress(`：守的东西**一个字没变**（闸必须早于发进度与真下载），
-    // 只是「真下载」那一句的名字变了。
-    let dl_at = body
-        .find("download_to_sink_with_progress(")
-        .expect("锚点消失：守卫已失去判据");
-    assert!(
-            gate_at < emit_at && gate_at < dl_at,
-            "单飞闸必须在「发 downloading(0)」与「真下载」之前拿到（实得 {gate_at} / {emit_at} / {dl_at}）"
-        );
-}
-
-/// 🟡 **调用点守卫：落位只许 rename，绝不许把刚流式写完的文件读回内存。**
-///
-/// `atomic_replace` 吃 `&[u8]`。谁要是图省事把落位写回 `atomic_replace(&StdFs, &dest, &bytes)`，
-/// 就等于在流式下载之后又做一次「整包读回内存 + 整包重写」—— 本次改造的收益**当场归零**，
-/// 而且四条 gate 全绿、行为完全正确，只有真机上几十 MiB 的内存峰值会告诉你。
-/// 源码扫描是这条不变式**唯一**够得着的判据。
-///
-/// **变异探针**：把 `promote_staged(...)` 换回 `atomic_replace(...)` ⇒ 两条断言同时转红。
-#[test]
-fn payload_is_promoted_by_rename_not_re_read_into_memory() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
-    assert!(
-        body.contains("land_payload("),
-        "落位必须走 `land_payload` → `verify::promote_staged`（tmp 已在盘 → 只 rename）"
-    );
-    // ── 「整包回内存」按**族**禁，不按单个字面量禁 ──────────────────────────
-    //
-    // 前身只禁 `atomic_replace(` 与 `verify_bytes(` 两个字面量，而被守的语义面远大于这两项：
-    // 在落位前插一行 `let bytes = std::fs::read(&tmp)?;`（动机很自然 —— 落位前补一次大小复核）
-    // 内存峰值就回到包体积、整个改造收益归零，而两条断言**全绿**。
-    // 故改为禁掉「先把字节攒齐」这一族的全部入口。
-    for banned in [
-        "std::fs::read(",
-        ".read(&tmp",
-        "read_to_end(",
-        "atomic_replace(",
-        "verify_bytes(",
-    ] {
-        assert!(
-                !body.contains(banned),
-                "`{banned}` 属「整包入内存」族 —— 流式下载之后再把文件读回内存，本次改造的收益当场归零，\
-                 而四条 gate 会全绿、行为完全正确，只有真机上几十 MiB 的内存峰值会告诉你"
-            );
-    }
-}
-
-/// 🟡 **调用点守卫：全程只碰 tmp，dest 只在最后一次 rename 时出现。**
-///
-/// dest 一旦被中途写入（哪怕只是 `open_write(&dest)` 建个空文件），并发单飞的**后到者**
-/// 就会经 [`cached_download_is_reusable`] 读到一个半截包 —— 而它的判据是 sha256，
-/// 半截包会被判「不可复用」从而重下，看起来还挺正常；真正的坏形态是 dest 上留下一个
-/// 长度不对的文件，`update_install` 拿它去装。
-///
-/// **变异探针**：把 sink 的目标从 tmp 改成 dest ⇒ 白名单计数对不上 ⇒ 转红。
-#[test]
-fn streaming_download_only_ever_touches_the_tmp_path() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
-    assert!(
-        body.contains("verify::tmp_name(&dest)"),
-        "tmp 必须由 `verify::tmp_name` 生成（同目录同卷 = 原子 rename 的前提）"
-    );
-    assert!(
-        body.contains("open_write(&sink_path)")
-            && body.contains("let sink_path = partial.path().to_path_buf()"),
-        "写句柄必须指向 tmp（经 RAII 守卫持有的那条路径）"
-    );
-
-    // ── dest 侧改**白名单计数**（前身是单字面量黑名单 `!contains("open_write(&dest")`）──
-    //
-    // 黑名单挡不住同一语义的任何别的写法：`File::create(&dest)` / `StdFs.write(&dest, ..)` /
-    // `open_write(dest.as_path())` 全都绕得过去，而后果一样 —— dest 上留下一个长度不对的文件，
-    // `update_install` 拿它去装。故反过来：**列出 dest 的全部合法用法**，
-    // 出现次数钉死；新增任何一处对 dest 的引用都必须显式改这张表，并在改的时候回答
-    // 「它会不会在落位之前碰 dest」。
-    const DEST_USES: [&str; 12] = [
-        "let dest = dir.join(&file_name);",
-        "let gate = download_gate(&dest);",
-        "let dest = dest.clone();",
-        "cached_download_is_reusable(&dest, sha.as_deref())",
-        "dest.display()",
-        "dest.to_string_lossy()",
-        "verify::tmp_name(&dest)",
-        "land_payload(&polaris_updater::traits::StdFs, partial.path(), &dest)",
-        // 两处 `ProgressStage::Downloaded { path: &dest, .. }`（复用腿 / 落位成功腿）。
-        // 逐条回答本白名单要求回答的那个问题：**都在落位之后**（复用腿的前提是
-        // `cached_download_is_reusable` 已认下盘上那份完整包，落位腿在 `Landed` 臂内），
-        // 且两处都只是**读**路径去拼事件载荷，一个字节都不写。
-        "path: &dest,",
-        // Receipt creation reads already-complete bytes, after cache verification or
-        // successful landing. It records authority without writing payload bytes.
-        "std::fs::metadata(&dest)",
-        "custody.record(\n            &dest,",
-        ".record(&dest, &streamed.sha256_hex, streamed.bytes)",
-    ];
-    /// dest 在 `update_download` 里的**总出现次数**（含上表每一项各自的出现次数之和）。
-    const DEST_MENTIONS: usize = 16;
-    let total = body.matches("dest").count();
-    let covered: usize = DEST_USES
-        .iter()
-        .map(|p| body.matches(p).count() * p.matches("dest").count())
-        .sum();
-    assert_eq!(
-        total, DEST_MENTIONS,
-        "对 dest 的引用数变了（实得 {total}，钉死 {DEST_MENTIONS}）—— \
-             新增/删除任何一处都必须显式改白名单，并复核它没有在落位之前碰 dest"
-    );
-    assert_eq!(
-        covered, total,
-        "出现了不在白名单里的 dest 用法（白名单覆盖 {covered} / 实得 {total}）—— \
-             dest 必须从「不存在」瞬间变为「完整文件」，中途碰它就会让后到者读到半截包"
-    );
-
-    // ── `downloaded` 的位置：**降级为弱断言**（真正的门是运行时的
-    //    `landing_reports_failure_and_leaves_dest_untouched_when_rename_fails`）。
-    //
-    // 文本下标比较表达不了「rename **成功**才发」：把落位失败的早退降级成「只 log 不早退」，
-    // 文本序照样成立。故这里只钉一件文本层面**确实**表达得了的事：下载腿的 `downloaded`
-    // 落在 `LandingOutcome::Landed` 那一支里。
-    //
-    // 注意 `downloaded` 在本函数里有**两个**合法产地：① 复用分支（文件已在盘且 sha256 复核过，
-    // 此时根本没下载）② 本次下载落位成功之后。故不能拿首个匹配比大小 —— 那只会量到 ①。
-    let landed_at = body
-        .find("LandingOutcome::Landed =>")
-        .expect("落位成功分支消失：守卫已失去判据");
-    let download_began_at = body
-        .find("emit(ProgressStage::Downloading {")
-        .expect("锚点消失：守卫已失去判据");
-    let downloaded_after_start: Vec<usize> = body
-        .match_indices("ProgressStage::Downloaded {")
-        .map(|(i, _)| i)
-        .filter(|i| *i > download_began_at)
-        .collect();
-    assert!(
-        !downloaded_after_start.is_empty(),
-        "锚点消失：守卫已失去判据（下载腿一发 `downloaded` 都不发？）"
-    );
-    for at in downloaded_after_start {
-        assert!(
-                at > landed_at,
-                "`downloaded` 必须落在 `LandingOutcome::Landed` 分支内（实得 Landed {landed_at} / downloaded {at}）"
-            );
-    }
-}
-
-/// 🟡 **调用点守卫：残件清理必须是**类型**（RAII），不是「数一数清理调用」。**
-///
-/// # 前身（计数守卫）为什么是假的
-///
-/// 它数「`ApiResponse::err(` 出现次数 == `discard_partial_download(&tmp)` 出现次数」。
-/// 三条独立反例，每条都能让「漏清理」照样全绿：
-///  1. 把落位失败的早退降级成「只 log 不早退」⇒ 两侧计数**同减**，仍相等；
-///  2. 给一条早退配**两次**清理即可把另一条漏掉的配平；
-///  3. 它**不匹配** `ApiResponse::err_with_code(` ⇒ tmp 之后新增一条带 code 且漏清理的早退，
-///     守卫全盲。
-///
-/// 根因是它守错了对象：不变量是「控制流离开这个作用域时残件不在」——那是**作用域**的性质，
-/// 计数表达不了。换成 [`PartialDownload`] 之后，`?` / panic / 将来新增的任何早退都自动覆盖，
-/// 也就没有「配平」这回事。
-///
-/// 本条因此只守**形态**（真正的行为门是运行时的
-/// [`partial_download_deletes_the_tmp_on_drop_and_keeps_it_after_disarm`]）：
-///
-/// **变异探针**：删掉 `PartialDownload::new(` ⇒ 第 1 条转红；把 `partial.disarm()` 挪出
-/// `Landed` 分支（例如提到 match 之前，失败路径就不再清残件了）⇒ 第 3 条转红；
-/// 再引入一个手工清理函数 ⇒ 第 2 条转红。
-#[test]
-fn the_partial_tmp_is_owned_by_an_raii_guard_not_by_counted_cleanup_calls() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
-    assert!(
-            body.contains("PartialDownload::new("),
-            "残件必须由 RAII 守卫持有 —— 计数守卫守不住「离开作用域时残件不在」（三条反例见本测试文档）"
-        );
-    assert!(
-        !body.contains("discard_partial_download("),
-        "回到了手工清理 ⇒ 又要靠「每条早退都记得配一行」，而那正是被推翻的形态"
-    );
-    let disarms = body.matches("disarm()").count();
-    assert_eq!(
-        disarms, 1,
-        "`disarm()` 只该有一处（落位成功那一支），实得 {disarms} 处 —— \
-             多一处就意味着某条失败路径也把守卫解除了，残件从此无人清"
-    );
-    assert!(
-        body.contains("LandingOutcome::Landed => {")
-            && body[body
-                .find("LandingOutcome::Landed => {")
-                .expect("锚点消失：守卫已失去判据")..]
-                .contains("partial.disarm()"),
-        "`disarm()` 必须在**落位成功**分支内：提到分支之外（哪怕只是 match 之前一行），\
-             落位失败时残件就不再被清"
-    );
-}
-
-/// 🟡 **调用点守卫：`update_download` 的每一条失败早退都必须先发 `error` 进度事件。**
-///
-/// 弹窗被 `force progress(0)` 推进 Progress 后，只有 `error` / `downloaded` 能把它推出去；
-/// 静默 return 会让它永远转圈（只剩 Cancel 可点）。原实现的三条前置校验早退正是这样。
-///
-/// 按**计数**锁而不是逐条锁：新增任何一条失败早退却忘了配一发 error 事件，
-/// 两个计数立刻对不上 ⇒ 转红。
-///
-/// # 计数用**前缀** `ApiResponse::err`
-///
-/// 数 `ApiResponse::err(` 会**漏掉** `ApiResponse::err_with_code(`（`err` 后面是 `_` 不是 `(`），
-/// 新增一条带 code 的早退时守卫全盲；故按前缀数。今天函数体内没有「一条早退里两个信封共用
-/// 一发 error 事件」的分支，两个计数须**逐一相等**。
-#[test]
-fn every_failure_path_emits_an_error_progress_event() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
-    let errors = body.matches("ApiResponse::err").count();
-    let emits = body.matches("emit(ProgressStage::Failed(").count();
-    assert!(errors > 0, "锚点消失：守卫已失去判据");
-    assert_eq!(
-        errors, emits,
-        "失败信封 {errors} 处、error 进度事件 {emits} 发 —— 对不上的那条会让弹窗永远转圈"
-    );
-    // 配对由结构保证：全部早退经 fail 闭包，其体内 emit 与 err_with_code 同体。
-    assert!(
-        body.contains("let fail = |e: UpdateErr<'_>|"),
-        "fail 统一出口被改形 —— 它体内 emit+信封的配对是本守卫的前提"
-    );
-}
-
 // ── 随行事实：态与它依赖的数据同帧同行 ──────────────────────────────────
 
 /// 🟡 **行为门：每一帧都带着它那个态所依赖的全部随行事实。**
@@ -1096,54 +854,6 @@ fn progress_frame_carries_the_facts_its_state_depends_on() {
     );
     assert!(bare.get("errorDetail").is_none());
     assert_eq!(failed["percentage"], json!(0), "失败帧的百分比由类型定死");
-}
-
-/// 🟡 **调用点守卫：本次下载的随行事实只由一处附着。**
-///
-/// `update_download` 里有十余处发进度的地方（每条失败早退各一发 + 三处正常帧）。若每处
-/// 各自调 `emit_progress(&app, <某个清单>, …)`，失守形态有二：漏传（编译红，无所谓）与
-/// **传成另一个对象**（编译绿、gate 全绿，而设置页显示的版本号是别的包的）。故本函数体内
-/// `emit_progress(` 只许出现一次 —— 就是那条把 `update_info` 绑死的闭包定义本身。
-///
-/// 中间帧（下载回调）跑在另一个线程上、借不了栈，故它经 `download_progress_emitter` 按值
-/// 收清单；本门连带钉住它收的是**同一份** `update_info`。
-///
-/// **变异探针**：把任一处 `emit(ProgressStage::Failed(&msg))` 改回
-/// `emit_progress(&app, &Value::Null, ProgressStage::Failed(&msg))` ⇒ 计数变 2 ⇒ 转红；
-/// 把 `download_progress_emitter(&app, update_info.clone())` 的第二个实参换成
-/// `Value::Null` ⇒ 转红。
-#[test]
-fn every_progress_frame_of_this_download_carries_this_downloads_manifest() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
-    assert!(
-        body.contains(
-            "let emit = |stage: ProgressStage<'_>| emit_progress(&app, &update_info, stage);"
-        ),
-        "单一发事件入口没了 —— 十余个调用点各自带清单，迟早有一处带成另一个版本的"
-    );
-    let direct = body.matches("emit_progress(").count();
-    assert_eq!(
-        direct, 1,
-        "`emit_progress(` 在本函数里出现 {direct} 次（只该是那条闭包定义）—— \
-             绕过 `emit` 直发就等于给这一处附着的清单开了个后门"
-    );
-    // 正向对照：三种帧确实都还在发（否则上面那条在「一发都不发」时也绿）。
-    for anchor in [
-        "emit(ProgressStage::Downloading {",
-        "emit(ProgressStage::Downloaded {",
-        "emit(ProgressStage::Failed(",
-    ] {
-        assert!(
-            body.contains(anchor),
-            "锚点消失：守卫已失去判据（{anchor}）"
-        );
-    }
-    assert!(
-        body.contains("download_progress_emitter(&app, update_info.clone())"),
-        "中间帧的清单必须是**同一份** `update_info` —— 另造一个对象会让下载中卡片的\
-             版本号与首尾两帧不符"
-    );
 }
 
 // ── 残件所有权：RAII（H1）───────────────────────────────────────────────
@@ -1407,187 +1117,6 @@ fn orphan_sweep_collects_only_what_it_can_prove_is_abandoned() {
     sweep_orphan_downloads(&StdFs, &dir.join("nope"), file_name);
 }
 
-/// 🟡 **调用点守卫：清扫必须夹在「拿到单飞闸」与「生成本次 tmp」之间。**
-///
-/// 两侧都是硬要求：
-///  - 早于闸 ⇒ 本进程可能有另一条腿正在写同名 tmp，那一档是**不看 mtime 直接删**的，会删掉在飞的下载；
-///  - 晚于 `tmp_name` ⇒ 本次自己的 tmp 也带着本进程 pid，会被当场删掉。
-///
-/// **变异探针**：删掉调用 / 挪到 `gate.lock()` 之前 / 挪到 `verify::tmp_name(&dest)` 之后
-/// ⇒ 逐条转红。
-#[test]
-fn orphan_sweep_runs_inside_the_gate_and_before_this_download_stages_its_tmp() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
-    let lock_at = body
-        .find("gate.lock().await")
-        .expect("锚点消失：守卫已失去判据");
-    let sweep_at = body.find("sweep_orphan_downloads(").expect(
-        "孤儿清扫被删了 —— 下载途中退出 App 会绕过 RAII 守卫，每个周期攒一个几十 MiB 的残件",
-    );
-    let tmp_at = body
-        .find("verify::tmp_name(&dest)")
-        .expect("锚点消失：守卫已失去判据");
-    assert!(
-        lock_at < sweep_at,
-        "清扫必须在单飞闸**之内**（实得 lock={lock_at} / sweep={sweep_at}）：\
-             闸外清扫会删掉本进程另一条腿正在写的 tmp"
-    );
-    assert!(
-        sweep_at < tmp_at,
-        "清扫必须在生成本次 tmp **之前**（实得 sweep={sweep_at} / tmp={tmp_at}）：\
-             之后清扫会把自己这一次的 tmp 当孤儿删掉"
-    );
-}
-
-/// 🟡 **调用点守卫：复查回来「没有可下的东西」时，既不广播假的 `downloaded`，也不对弹窗
-/// 自己谎称「已下载」。**
-///
-/// # 这道门此前只守住了一半
-///
-/// 旧判据是「函数体里必须出现 `push_popup_state(&app, UpdatePopupState::done())`」+「函数体里
-/// 不得出现 `ProgressStage::Downloaded`」。它守的是**广播给设置页的那一份**（后半条），而
-/// 前半条**要求**把 `done()` 推给弹窗自己 —— 于是「一个字节都没下」在发起本次动作的那一屏上
-/// 被渲染成 `updatePopup.downloaded`（「下载完成」）+ 满格进度条。门在，守的方向漏了发起方。
-///
-/// 新判据把「推出 progress」与「推的是哪一档」拆开：仍必须把弹窗推出 progress（否则永远转圈），
-/// 但那一档必须是 `no_update`；`done` 在本臂**一次都不许出现**。`UpdatePopupState::done` 现在
-/// 是必填落位路径的构造函数，本臂根本没有路径可传 —— 源码门与类型闸在此重合，两道都留着：
-/// 类型挡「拿不出路径」，本门挡「随手编一个路径喂给它」。
-///
-/// # 判据必须收到**分支**，臂一级还不够
-///
-/// 射程收紧走过三级，每一级都是被同一形态咬出来的（「取材面宽于意图面」）：
-///  1. **整函数**：把推送搬进别的臂就能替本臂作证 —— 本仓在同一个函数上栽过两次
-///     （见 `guard_scan::match_arm_body` 文档）。
-///  2. **臂**（`match_arm_body`）：仍不够。`Update | Retry` 臂内有 **5 条早退分支**，而
-///     `arm.contains(…)` 只问「臂内某处有没有这句话」。实测：把本分支的推送**整个删掉**
-///     （⇒ 弹窗永远停在 progress 转圈，正是本门自称要防的那件事）、把它挪进下面的
-///     `Renegotiate` 分支 ⇒ **全仓 1428 passed / 0 failed，本门全绿**。
-///  3. **分支**（现判据）：用**位置区间**钉死 —— 那两发推送的 offset 必须落在
-///     「`let Some(info) = data.get("updateInfo")` 这一行」与「本分支自己的
-///     `"hasUpdate": false` 早退」之间。同款先例见本文件
-///     [`the_user_action_forces_the_popup_into_progress_before_rechecking`] 的 `force_at < check_at`。
-///
-/// 「我要判的是什么位置的什么形状」：形状 = 那两发推送，位置 = **那一条 `let-else` 的 else 体内**。
-/// 计数不是位置（把推送搬进 helper 里计数纹丝不动），故这里判的是区间不是次数；但两个锚点
-/// 各自的**唯一性**要单独断言，否则「区间」本身可以被第二处同名锚点重新划定。
-///
-/// 负向断言（不得广播 `ProgressStage::Downloaded`）**故意保持全函数**：任何一条臂都不许广播，
-/// 那是更强的形态，与 `recheck_failures_settle_the_popup_without_broadcasting` 同一取向。
-/// `done(` 的负向断言保持**臂级**：本臂任何一条分支都不许推 done，同样严于分支级。
-///
-/// **变异探针**：把 `no_update(...)` 改回 `done(popup.version.clone(), "")` ⇒ 转红；
-/// 把两发推送挪进 `Renegotiate` 分支 ⇒ 区间判定转红（臂级判据在此**全绿**，见上面第 2 条）；
-/// 把它挪进 `ViewLog` 臂 ⇒ 臂内找不到，转红。
-#[test]
-fn the_no_download_path_never_claims_a_download() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_popup_action(");
-    let arm = crate::commands::guard_scan::match_arm_body(
-        &body,
-        "PopupAction::Update | PopupAction::Retry =>",
-        "PopupAction::",
-    );
-
-    // ── 区间的两个端点：先证明它们各自唯一，否则「落在区间内」可以被第二处锚点重新划定 ──
-    const BRANCH_HEAD: &str = "let Some(info) = data.get(\"updateInfo\")";
-    const BRANCH_EXIT: &str = "\"hasUpdate\": false";
-    // 🟡 #3（confirm 轮登记）：`BRANCH_EXIT` 曾要求**全臂恰 1**——正当的分支细分（把 no-update
-    // 拆成「平台不受支持」与「其它」，两边都各自 `hasUpdate:false` 早退）会误红。安全方向，
-    // 但留给后人的最省事修法就是把判据放宽跑 —— 这里先行改到**不随细分复制**的形态：
-    // 头锚保持恰 1（let-else 那一行不该重样）；尾锚取**最后一次**出现且至少一次，区间 =
-    // 头..最后一次。细分出的每一条子分支都被区间罩住，推送落在任一条里都判绿。
-    // ⚠️ 残余缺口如实登记（相对「恰 1」版弱了一格，复审 F3 校正口径）：推送若被挪进
-    // `updateInfo` **存在**的路径、且其后还存在更晚的 `hasUpdate:false`，旧判据会红、新判据
-    // 不红。**没有自动姊妹门覆盖这个缺口**（本臂三道门都不钉「no_update 推送必须在该
-    // 分支」），暴露途径只剩 code review 与真机（转圈窗）；补门方向 = 对 else 块子区间
-    // 逐分支计数 no_update 推送 ≥1——真被咬到再做。
-    // 锚点先收集后断言（🟢#7/F4 的修法，消灭 n=0 误归因与两条不可达 expect）。
-    let heads: Vec<usize> = arm.match_indices(BRANCH_HEAD).map(|(i, _)| i).collect();
-    assert!(
-        !heads.is_empty(),
-        "头锚 {BRANCH_HEAD:?} 在本臂里一次都没有 —— let-else 的形状变了，守卫失去判据"
-    );
-    assert_eq!(
-        heads.len(),
-        1,
-        "头锚 {BRANCH_HEAD:?} 在本臂里出现 {} 处 —— let-else 那一行被复制了，\
-             「落在分支内」这句话就不再指同一段代码",
-        heads.len()
-    );
-    let head = heads[0];
-    let exits: Vec<usize> = arm.match_indices(BRANCH_EXIT).map(|(i, _)| i).collect();
-    assert!(
-        !exits.is_empty(),
-        "尾锚 {BRANCH_EXIT:?} 在本臂里一次都没有 —— no-update 早退的形状变了，守卫失去判据"
-    );
-    let exit = *exits.last().unwrap();
-
-    // ── 那两发推送必须落在这条 `let-else` 的 else 体内 ──
-    for (needle, why) in [
-            (
-                "push_popup_state(&app, UpdatePopupState::no_update(",
-                "「没有可下的东西」仍须把弹窗推出 progress（否则永远转圈），且必须推 `no_update` 那一档",
-            ),
-            (
-                "schedule_popup_auto_close(&app, NO_UPDATE_AUTO_CLOSE_MS)",
-                "`noupdate` 终态没有排自动关窗，或沿用了 done 的 800ms —— 后者一闪而过，等于没说",
-            ),
-        ] {
-            // 🔴 唯一性断言（confirm 轮 #2 的修法）：`top_level_fn_body` 只剥**整行**注释
-            // （射程在 `commands.rs:47-50` 登记），**行尾注释携带同形串可以喂饱 `find`**。
-            // 剥行尾注释要先认字符串字面量（`commands.rs:51-53` 既有裁决：不划算），故两层兜：
-            //   ① `count == 1`：真调用 + 注释各一份 ⇒ 计数 2 ⇒ 红；
-            //   ② 行级拒绝：命中的那一行若 needle 之前就有 `//`（= needle 落在行尾注释里）不算数
-            //      ——「删掉真调用、只留一行注释」时计数仍 1，①抓不住，②让「找不到真调用」转红
-            //      （confirm 轮原始收据正是这个形态）。
-            // ② 的真实射程（复审 F2 校正口径，别照旧登记读反）：**未设防面 = 同形串出现在无先行
-            // `//` 的任何非调用文本里**（典型：字符串字面量 `let s = "push_popup_state(…"` 且真调用
-            // 已删 ⇒ ①计数 1、②当真 ⇒ 假绿——要防得认字符串=parser，不做）；串内带 `//` 且在
-            // 同形串之前的形态反而会被 ② 拒绝转红（安全方向，panic 文案归因略偏但响亮）；真调用
-            // 与行内更早的 `//` 同屏会被误拒（误红，安全）。
-            let n = arm.matches(needle).count();
-            assert_eq!(
-                n, 1,
-                "needle {needle:?} 在本臂里出现 {n} 次（须恰好 1）—— 大概率是行尾注释携带了\
-                 同形串替真调用作证（`find` 命中哪一处全凭先后）：{why}"
-            );
-            // 命中行若在 needle 前就有 `//`，那是行尾注释不是代码——继续找代码行里的那一处。
-            let mut real_at = None;
-            let mut offset = 0usize;
-            for line in arm.lines() {
-                if line.contains(needle) {
-                    let before = line.split(needle).next().unwrap_or("");
-                    if !before.contains("//") {
-                        real_at = Some(offset + before.len());
-                        break;
-                    }
-                }
-                offset += line.len() + 1;
-            }
-            let at = real_at.unwrap_or_else(|| {
-                panic!("{why}（本臂里只剩行尾注释在携带这个串 —— 真调用没了，注释在替它作证）")
-            });
-            assert!(
-                head < at && at < exit,
-                "{why}。实得 offset：分支头={head} / 本句={at} / 分支早退={exit} —— \
-                 它不在「复查回来没有 updateInfo」那条分支里。搬到臂内别的分支上，\
-                 这条路径就一发都不推，而弹窗停在 progress 永远转圈"
-            );
-        }
-
-    assert!(
-        !arm.contains("UpdatePopupState::done("),
-        "本臂一个字节都没下 —— 推 `done` 就是在发起本次动作的那一屏上谎称「下载完成」\
-             （2026-08-17 前的现状）。落位路径是 `done` 的必填参数，本臂拿不出真的那一个"
-    );
-    assert!(
-        !body.contains("ProgressStage::Downloaded"),
-        "「没有可下的东西」不得广播 downloaded —— 无文件、无 filePath，设置页会显示假的「已下载」"
-    );
-}
-
 // ── 弹窗邀请 ↔ 真正下载：同一个版本 ────────────────────────────────────
 
 /// 两个 App 更新通道都由同一份 GitHub release 选择逻辑解释；稳定版过滤 prerelease，测试版纳入。
@@ -1750,9 +1279,6 @@ fn every_internal_update_check_preserves_channel_and_disables_current_version_re
 }
 /// 🟡 **真值表：对账判定本身（`reconcile_recheck`）。**
 ///
-/// 与它配套的接线由 [`popup_recheck_reconciles_the_version_against_what_the_popup_showed`] 守：
-/// 那条守「有没有调用、结论有没有被执行」，本条守「判对没判对」。缺任一条都只有一半。
-///
 /// **变异探针**：把 `advertised == Some(rechecked)` 改成 `!=`、或把空串那条早退删掉
 /// ⇒ 逐条转红。
 #[test]
@@ -1791,174 +1317,6 @@ fn reconcile_recheck_only_proceeds_on_a_verbatim_match() {
         RecheckVerdict::Unusable
     );
     assert_eq!(reconcile_recheck(None, ""), RecheckVerdict::Unusable);
-}
-
-/// 🟡 **调用点守卫：兑现腿必须拿复查回来的版本与弹窗上写着的那串字逐字对账。**
-///
-/// 上面那道门统一的是候选集**规则**；这道守的是**内容**。两次 check 之间隔着用户的思考时间，
-/// 上游随时可能再发一版 —— 那时两端都是正式版、口径完全相同，「按 A 邀请、下到 B」照样发生。
-/// 而弹窗上真写着的那串字就在同一作用域里（`popup.version`，Skip / ManualDownload 一直在读它）。
-///
-/// 顺序判据不是形式主义：对账必须夹在**复查之后、下载之前**，且不一致时必须**提前返回** ——
-/// 只推个 `remind` 却继续往下走 = 弹窗回到提醒态、包照下，比不改还糟。
-///
-/// **变异探针**：删掉比较 / 删掉 `remind` / 把 `return` 去掉让它继续往下走 / 把对账挪到
-/// `update_download` 之后 ⇒ 逐条转红。
-#[test]
-fn popup_recheck_reconciles_the_version_against_what_the_popup_showed() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_popup_action(");
-    // 锚点限定在 `Update | Retry` 臂内：在整个函数体上 find 时，别的臂里出现同形代码就会
-    // 替本臂作证（同文件两道门都栽在这个形态上，见 `guard_scan::match_arm_body` 头注）。
-    let arm = crate::commands::guard_scan::match_arm_body(
-        &body,
-        "PopupAction::Update | PopupAction::Retry =>",
-        "PopupAction::",
-    );
-    let check_at = arm.find("update_check(").expect("锚点消失：守卫已失去判据");
-    let cmp_at = arm
-        .find("reconcile_recheck(popup.version.as_deref(), rechecked)")
-        .expect("版本对账被删了 —— 复查换了目标也会照下，而弹窗上仍写着旧版本号");
-    let remind_at = arm.find("UpdatePopupState::remind_with_channel(").expect(
-        "不一致时没有退回 remind —— 换个目标接着下只是「告知」，不是「征求同意」\
-             （何况 progress 态根本不渲染版本号，连告知都不成立）",
-    );
-    let download_at = arm
-        .find("update_download(")
-        .expect("锚点消失：守卫已失去判据");
-    assert!(
-            check_at < cmp_at && cmp_at < download_at,
-            "对账必须夹在复查与下载之间（实得 check={check_at} / cmp={cmp_at} / download={download_at}）"
-        );
-    assert!(
-            cmp_at < remind_at && remind_at < download_at,
-            "退回 remind 必须在下载之前（实得 cmp={cmp_at} / remind={remind_at} / download={download_at}）"
-        );
-    assert!(
-        arm[remind_at..download_at].contains("return Ok("),
-        "退回 remind 之后没有 return —— 弹窗回到提醒态，下载却照跑"
-    );
-}
-
-/// 🟡 **调用点守卫：`ManualDownload` 必须把会话记住的版本喂给 release 页。**
-///
-/// 这条钉的是一次**用户可见行为变更**：`PopupSession::send_state` 开始跨 phase 继承版本号后，
-/// error 态的「手动下载」从「回落 GitHub 泛 releases 列表页」变成「直达该版本 tag 页」
-/// （`releases_url_for(Some(v))`）。改进是真的，但它**不能顺带发生、也不能顺带消失** ——
-/// 有人把这里改成传 `None`，用户又会掉回列表页而没有任何门说话。
-///
-/// 分工：数据侧（版本号跨 phase 还在不在）由 `polaris_updater::popup` 的
-/// `the_invited_version_survives_phase_changes` 守；映射侧（版本号 → tag 页 URL）由
-/// [`releases_url_for_version_targets_tag_page`] 守；本条只守中间那根线还接着。
-///
-/// **变异探针**：把 `popup.version.clone()` 改成 `None` ⇒ 转红。
-#[test]
-fn manual_download_opens_the_release_page_of_the_invited_version() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_popup_action(");
-    const NEEDLE: &str = "update_open_releases(app, popup.version.clone())";
-    const HEAD: &str = "PopupAction::ManualDownload =>";
-    // 切片封到下一条臂头（[`guard_scan::match_arm_body`]，那里有它自己的合成样本单测）：
-    // 切到函数体尾时，`ViewLog` 臂里有一句**逐字相同**的调用会替本条作证 —— 实测把
-    // ManualDownload 臂整体移到 ViewLog 之前、实参保持 `None`，编译通过、全仓测试全绿，
-    // 而用户行为退回 #311 原形。
-    let arm = crate::commands::guard_scan::match_arm_body(&body, HEAD, "PopupAction::");
-    assert!(
-        arm.contains(NEEDLE),
-        "ManualDownload 没有把会话记住的版本喂给 release 页 —— 用户会掉回泛列表页（#311 的原形）"
-    );
-    // 位置判据 + 计数判据合起来才闭合：位置判据挡「臂被搬走」，计数判据挡「某一臂的调用被删」
-    // （ViewLog 与 ManualDownload 各一处，两者都得在）。单用计数挡不住「两处都在同一臂里」，
-    // 单用位置挡不住「另一臂悄悄丢了」。
-    //
-    // ⚠️ **登记一处今天等价、将来不等价的形态**：`ManualDownload` 是末臂，切片因而一路延伸到
-    // 函数的右花括号。今天无害（`match act { … }` 是尾表达式，其后没有代码）；一旦改成
-    // `let resp = match act { … };` 再加后续处理，match **之后**的代码就落进本切片 ⇒ 上面那条
-    // `contains(NEEDLE)` 可被它喂饱。封顶挡不住（那里没有臂头）、`match_arm_body` 的输出自检
-    // 也挡不住（没有 `PopupAction::`），届时只剩下面的 `count == 2` 部分设防。
-    assert_eq!(
-        body.matches(NEEDLE).count(),
-        2,
-        "`{NEEDLE}` 应恰好两处（ViewLog + ManualDownload），实得 {}",
-        body.matches(NEEDLE).count()
-    );
-}
-
-/// 🟡 **调用点守卫：复查之前必须先把弹窗**强制**推进 progress(0)。**
-///
-/// 两件事都压在这一行上：
-///  1. **窗内反馈**：复查可跑满 15s，其间没有任何进度事件 ⇒ 用户点完「更新」看着 remind 发呆；
-///  2. **后续所有 `push_popup_state` 的前提**：闸 [`should_mirror_to_popup`] 只放行 `Progress`。
-///     这一发若换成带闸的 `push_popup_state`，phase 会停在 `Remind` ⇒ 闸对之后每一发都判否
-///     ⇒ 对账退回 remind、两条复查失败早退推 error、下载进度镜像**全部变成 no-op**，
-///     而 `PopupAction::Cancel`（仅 Progress 合法）结构性不可达。
-///
-/// 本批删掉全局广播之后，这条的后果被放大了：改动前设置页至少还会亮一条（虽然那条本身是误报），
-/// 现在两条复查失败腿在任何地方都不再有反馈。
-///
-/// **此前唯一拦住它的是偶然**：改成 `push_popup_state` 会让 `force_popup_state` 变成零调用点
-/// ⇒ clippy `-D warnings` 报 never used。那是**夹具级**保护 —— 再多一处 `force_popup_state`
-/// 调用它就消失。实测：直接改成 `push_popup_state` ⇒ 编译通过、全仓测试全绿。
-///
-/// **变异探针**：改成 `push_popup_state` / 删掉这一行 / 把它挪到 `update_check(` 之后 ⇒ 逐条转红。
-#[test]
-fn the_user_action_forces_the_popup_into_progress_before_rechecking() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_popup_action(");
-    // **两个锚点都必须限定在 `Update | Retry` 臂内**。在整个函数体上 `find()` 时，把这发
-    // `force_popup_state` 挪进 `ViewLog` 臂（位置更靠前）再从本臂删掉 ⇒ 两个 `find` 依旧命中、
-    // 顺序依旧成立、本门全绿，而上面列的后果一条不少地发生。实测：全仓 4178 全绿。
-    // 这与同文件 `manual_download_...` 那道门踩的是同一形态（别的臂替本臂作证）。
-    let arm = crate::commands::guard_scan::match_arm_body(
-        &body,
-        "PopupAction::Update | PopupAction::Retry =>",
-        "PopupAction::",
-    );
-    let force_at = arm
-        .find("force_popup_state(&app, UpdatePopupState::progress(0, None, None))")
-        .expect(
-            "复查前那发强制 progress(0) 没了 —— 窗内 15s 零反馈，且之后每一发状态推送都会被闸拦掉",
-        );
-    let check_at = arm.find("update_check(").expect("锚点消失：守卫已失去判据");
-    assert!(
-        force_at < check_at,
-        "强制 progress(0) 必须在复查**之前**（实得 force={force_at} / check={check_at}）：\
-             之后才推等于那 15s 里窗内仍是零反馈"
-    );
-}
-
-/// 🟡 **不变量：复查阶段的失败只推弹窗，绝不广播 `update:progress`。**
-///
-/// 这条路径一个字节都没下、没有 filePath。`emit_progress` 会把事件**全局广播**，让设置页
-/// 弹一条它从未发起过的下载错误（`SettingsUpdate` 的 `onProgress` 直接置 error 态 + 错误文案）。
-/// 同函数「已是最新」那档早就写着「只推弹窗、不广播」，两条复查失败腿此前却在广播 ——
-/// 同一个函数里两种取向。行为对**弹窗**逐字不变：`emit_progress` 的弹窗镜像就是
-/// `push_popup_state(UpdatePopupState::error(msg))` 这一发（见 `popup_state_for`）。
-///
-/// **变异探针**：任一条早退改回 `emit_progress(&app, &info, ProgressStage::Failed(..))` ⇒ 转红。
-#[test]
-fn recheck_failures_settle_the_popup_without_broadcasting() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_popup_action(");
-    assert!(
-        !body.contains("emit_progress("),
-        "复查腿又开始广播 update:progress —— 设置页会显示一条它从未发起过的下载错误"
-    );
-    // 正向对照：两条早退确实各自把弹窗推进了 error（不广播 ≠ 什么都不做）。
-    // 负向断言（上面那条）**故意保持全函数**：任何一条臂都不许广播，那是更强的形态。
-    // 正向计数则限定到本臂 —— 否则把某条早退搬去别的臂，计数照样是 2。
-    let arm = crate::commands::guard_scan::match_arm_body(
-        &body,
-        "PopupAction::Update | PopupAction::Retry =>",
-        "PopupAction::",
-    );
-    // U1 起锚定码形（rustfmt 折行后旧串形不再逐字命中）。
-    assert_eq!(
-        arm.matches("UpdatePopupState::error(UpdateErrCode::RecheckFailed")
-            .count(),
-        2,
-        "复查失败的两条早退（请求失败 / 回包缺版本号）必须各自把弹窗推进 error，否则窗内永远转圈"
-    );
 }
 
 /// 这条是修复的另一半。修好选包器却让本函数恒返回 `false`（旧实现读的
@@ -2174,134 +1532,6 @@ fn stored_skip_version_matches_the_compare_side_form() {
     // 里带「原始 tag ⇒ Available」反例，钉死不许把比较侧改回原始 tag 来「修」跳过。
 }
 
-/// 🟡 **调用点守卫：生产写点恰两处（update_skip / PopupAction::Skip），且都过归一化点。**
-///
-/// 第三个写点若直写 `.skipped_version = …`，跳过功能会静默失效回 W8 前的形态
-/// （用户按了跳过，下次照样被提醒）。
-///
-/// 计数是**全仓**的（`src-tauri/src` + `crates/updater/src` 递归、带点形态 `.skipped_version = `，
-/// 不依赖闭包参数名）：首版只扫本文件 + `s.` 前缀，跨文件或 `|st| st.` 形态的第三写点
-/// 会把它喂饱（复审 F1 实证）。`mutate_state` 是这条状态唯一可变入口，生产赋值必然以
-/// `.skipped_version = ` 文本出现 ⇒ 文本扫描无漏。
-///
-/// **变异探针**：`update_skip` 里 `stored_skip_version(&v)` 换回 `v` ⇒ 第 1 条红；
-/// Skip 臂删掉 `.map(|v| stored_skip_version(&v))` ⇒ 第 2 条红；
-/// 在**任何文件**（含 runtime/updater.rs）新增生产赋值 ⇒ 第 3 条红；
-/// 改用异参数名（`|st| st.skipped_version = …`）⇒ 仍第 3 条红（带点形态不分参数名）。
-#[test]
-fn skipped_version_write_points_all_go_through_the_normalizer() {
-    let cmd = crate::commands::guard_scan::top_level_fn_body(src(), "pub fn update_skip(");
-    assert!(
-        cmd.contains("stored_skip_version(&v)"),
-        "update_skip 的写点绕过了归一化 —— 存原始 tag 与比较侧（strip_v 后）永不相等，W8 原发病理"
-    );
-    let act =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_popup_action(");
-    assert!(
-        act.contains(".map(|v| stored_skip_version(&v))"),
-        "弹窗 Skip 臂的写点绕过了归一化 —— 同上"
-    );
-
-    // 全仓命中清单：`路径` → `.skipped_version = ` 出现次数（**不剔测试区**，见 helper 头注）。
-    let mut writes: Vec<(String, usize)> = vec![];
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    for root in [
-        format!("{manifest}/src"),
-        format!("{manifest}/../crates/updater/src"),
-    ] {
-        collect_skip_writes(std::path::Path::new(&root), &root, &mut writes);
-    }
-    // 当前构成：生产 2（update_skip / PopupAction::Skip）+ 测试与 doc 示例 13
-    // （本文件 8、runtime/updater/tests/mod.rs 5，新增两次失败发布状态赋值）。任何**新增**命中——生产第三写点、新测试写
-    // state、doc 示例串——都先红：红了就过目定性，属生产写点必须过 stored_skip_version
-    // 并两处体内断言，其余 bump 常量登记。（常量自己就咬过一次：helper 头注里的示例串
-    // 让首版钉 11 立刻红，正是「全响无哑」的实证。）
-    const PINNED_TOTAL: usize = 15;
-    let total: usize = writes.iter().map(|(_, n)| n).sum();
-    let locations = writes
-        .iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(p, n)| format!("{p}×{n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    assert_eq!(
-            total, PINNED_TOTAL,
-            "全仓 `.skipped_version = ` 命中数漂了（期望 {PINNED_TOTAL}，实得 {total}：[{locations}]）。\
-             多了：生产第三写点必须先过 stored_skip_version；测试/doc 新增也在此登记后 bump 常量。\
-             少了：写点被删/搬走 —— 两处体内断言应同步红，一并修"
-        );
-}
-
-/// 递归收集 `dir` 下 `.rs` 文件里 `.skipped_version = ` 的出现次数（**全文件**计数）。
-///
-/// ⚠️ **不剔测试区**（复审 F2 实证的教训）：本仓存在三类打破「测试置尾」假设的合法布局——
-/// 文件头部的 `#[cfg(test)] mod guard_scan`（commands.rs，93% 内容在首锚之后）、中部的具名
-/// sub 测试 mod（commands/proxy.rs 的 `mod probe_tests`，其后还有 472 行）、inline
-/// `#[cfg(test)]` 项（runtime/proxy.rs 的 `TEST_CORE_NOT_INJECTED` const、runtime.rs 的
-/// TmpDir）。「按第一个锚截断」会让这些文件锚后的生产代码
-/// 整段免扫——哑绿。安全截断需要 cfg(test) 块的完整花括号解析（半个 parser），不成比例；
-/// 故改为全文件计数 + 总数钉扎（调用处断言），新增命中一律先红后登记，全响无哑。
-fn collect_skip_writes(dir: &std::path::Path, root: &str, out: &mut Vec<(String, usize)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        panic!(
-            "守卫扫描不到目录 {} —— 仓库布局变了，先修守卫再改代码",
-            dir.display()
-        );
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect_skip_writes(&p, root, out);
-            continue;
-        }
-        if p.extension().is_none_or(|x| x != "rs") {
-            continue;
-        }
-        let src =
-            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("读不了 {}: {e}", p.display()));
-        let n = src.matches(".skipped_version = ").count();
-        let rel = p
-            .strip_prefix(root)
-            .unwrap_or(&p)
-            .to_string_lossy()
-            .into_owned();
-        out.push((format!("{}/{}", root.trim_end_matches('/'), rel), n));
-    }
-}
-
-/// 🟡 **调用点守卫（#4）：自动关窗定时器必须带代次核对。**
-///
-/// `schedule_popup_auto_close` 服务 done（800ms）与 noupdate（3000ms）两个终态。窗口拉长后，
-/// 「用户手动关掉 noupdate 卡 → 3s 内另一条腿开出新弹窗 → 陈旧定时器把新窗关掉」从理论
-/// 竞态变成现实可达。解法 = 调度时捕获 `popup_generation`、fire 时核对不等即跳过。
-/// 本守卫钉住这三件都在，删任何一件（= 退回无守卫形态）转红。
-///
-/// **变异探针**：删 `let scheduled_gen = popup_generation(app);` ⇒ 第 1 条红；
-/// 删 `if popup_generation(&app) != scheduled_gen` 那个分支 ⇒ 第 2 条红；
-/// 把核对挪到 `close_update_popup` **之后**（先关再核对，守卫失效）⇒ 第 3 条红。
-#[test]
-fn auto_close_timer_is_generation_guarded() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "fn schedule_popup_auto_close(");
-    let capture_at = body
-        .find("let scheduled_gen = popup_generation(app);")
-        .expect("锚点消失：调度时的代次捕获没了 —— 定时器退回无守卫形态（🟡#4）");
-    let check_at = body
-        .find("if popup_generation(&app) != scheduled_gen {")
-        .expect("锚点消失：fire 时的代次核对没了 —— 陈旧定时器会关掉新窗");
-    let close_at = body
-        .find("close_update_popup(&app, rt.updater().popup())")
-        .expect("锚点消失：自动关窗的关闭调用没了");
-    assert!(
-        capture_at < check_at,
-        "代次捕获必须在 fire 核对之前（实得 capture={capture_at} / check={check_at}）"
-    );
-    assert!(
-            check_at < close_at,
-            "代次核对必须在关闭调用之前 —— 先关再核对等于没守（实得 check={check_at} / close={close_at}）"
-        );
-}
-
 /// Detached spawn 失败不得提交退出；成功后消费持锁的 Ready，提交失败也不得报成功。
 #[test]
 fn complete_detached_install_owns_success_effects_and_leaves_errors_untouched() {
@@ -2321,26 +1551,6 @@ fn complete_detached_install_owns_success_effects_and_leaves_errors_untouched() 
     let rejected: Result<&str, &str> =
         complete_detached_install(Ok("detached-script"), || Err("ready invalid"));
     assert_eq!(rejected, Err("ready invalid"));
-}
-
-#[test]
-fn update_install_delegates_detached_spawn_to_completion_helper() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
-    let prepare = body.find("prepare_desktop_exit(&app).await").unwrap();
-    let spawn = body
-        .find("update_install::spawn_detached_script(&dir, spec).map(|_| ())")
-        .unwrap();
-    let complete = body
-        .find("complete_detached_install(delivered, || {")
-        .unwrap();
-    assert!(prepare < spawn && spawn < complete);
-    assert_eq!(body.matches("prepare_desktop_exit(").count(), 1);
-    assert_eq!(body.matches("spawn_detached_script(").count(), 1);
-    assert_eq!(body.matches("complete_detached_install(").count(), 1);
-    assert!(body[complete..].contains("commit_desktop_exit("));
-    assert!(!body.contains("app.state::<QuitState>()") && !body.contains("app.exit(0)"));
-    assert!(!body.contains("proxy.status().running") && !body.contains("proxy.stop().await"));
 }
 
 // ── 更新进度快照槽：切走再切回来不丢进度 ────────────────────────────────
@@ -2447,86 +1657,6 @@ fn last_progress_slot_keeps_terminal_frames_instead_of_clearing() {
     );
 }
 
-/// 🟡 **调用点守卫：`emit_progress` 只派生一次载荷，广播与快照存的是同一个值。**
-///
-/// 纯单测测不到（`emit_progress` 持 `AppHandle`，本仓未在 lib 单测里引 `tauri::test`）。守的是
-/// **第二份派生**这一形态：再调一次 `progress_payload(info, stage)` 存进槽，编译绿、上面两条行为门
-/// 也照样绿，而两份从此各算各的 —— 回读到的与刚收到的事件对不上正是本批要消掉的不一致。
-///
-/// 顺序（先存后播）同样钉住：反过来的话，收到事件的窗口立刻回读会读到**上一帧**。
-///
-/// **变异探针**：把 `set_last_progress(payload.clone())` 换成
-/// `set_last_progress(progress_payload(info, stage))` ⇒ 第 2 条转红（计数变 2）；
-/// 把那次存整段删掉 ⇒ 第 1 条转红；把存挪到 `broadcast` 之后 ⇒ 第 3 条转红。
-#[test]
-fn emit_progress_stores_the_very_payload_it_broadcasts() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub(super) fn emit_progress(");
-    assert!(
-        body.contains("rt.updater().set_last_progress(payload.clone());"),
-        "发事件的唯一产地没有把这一帧留档 —— 设置页重挂载后就再也拿不到在途/已完成的下载"
-    );
-    // 值的**同一性**：广播出去的必须就是存进槽的那一个绑定。
-    //
-    // 上一版只断言了「`broadcast(` 出现在 `set_last_progress` 之后」——那守得住顺序，守不住
-    // 「播的和存的是不是同一份」：把 `broadcast` 的实参换成任意别的变量，顺序断言照样绿，而
-    // 回读到的与刚收到的事件从此各说各话，正是本槽要消掉的那类不一致。
-    //
-    // 两条正面断言把这条链钉死：`payload` 只由这一次派生产生（下面的计数保证没有第二次），
-    // 存进槽的是它，播出去的也是它。**不需要再配一条「禁止重新赋值」的负面断言**：`payload`
-    // 是不可变绑定，重新赋值编译不过，唯一的绕法是把 `let` 改成 `let mut`，而那会让下面
-    // 这条字面断言直接红。
-    assert!(
-        body.contains("let payload = progress_payload(info, stage);"),
-        "那一帧不再由**一次**派生绑定到 `payload` —— 存进槽的与播出去的从此可能是两份"
-    );
-    assert!(
-        body.contains("crate::events::channel::EVENT_UPDATE_PROGRESS, payload);"),
-        "广播的实参不再是 `payload` 这个绑定 —— 顺序断言拦不住这一档：\
-         播的和存的成了两份，回读到的与刚收到的事件对不上"
-    );
-    let derived = body.matches("progress_payload(").count();
-    assert_eq!(
-        derived, 1,
-        "`progress_payload(` 在 emit_progress 里出现 {derived} 次（只该是那条 `let payload =`）—— \
-         第二次调用就是第二份派生，与广播出去的那份从此各算各的"
-    );
-    let store = body
-        .find("set_last_progress")
-        .expect("上面已断言存在这一处");
-    let broadcast = body
-        .find("crate::events::broadcast(")
-        .expect("发事件的唯一产地必须仍在广播");
-    assert!(
-        store < broadcast,
-        "快照必须先于广播写入 —— 否则收到事件的窗口立刻回读会读到上一帧"
-    );
-}
-
-/// 🟡 **接线守卫：回读命令读的是这个槽，且 `None` 不被编造成 idle 帧。**
-///
-/// 命令壳持 `State<'_, AppRuntime>`，单测直调不了（本仓一贯做法，见 `update_skip` 一节）。
-///
-/// **变异探针**：把 `unwrap_or(Value::Null)` 换成 `unwrap_or(json!({"status":"idle"}))` ⇒ 第 2 条转红
-///（UI 会把「后端不知道」误当成「后端说没在下」，卡片被一个假态钉在 idle）。
-#[test]
-fn update_get_progress_returns_the_slot_and_never_fabricates_an_idle_frame() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_get_progress(");
-    assert!(
-        body.contains("state.updater().last_progress()"),
-        "回读腿必须读 emit_progress 写的那个槽，不得另起一份状态"
-    );
-    assert!(
-        body.contains("unwrap_or(Value::Null)"),
-        "一帧都没发过时必须如实返 null —— 编造 idle 帧就是拿假状态换掉「不知道」"
-    );
-    assert!(
-        !body.contains("\"status\""),
-        "回读腿不得自己拼装任何进度态：它只是把槽里的那一帧原样交出去"
-    );
-}
-
 /// 🔴 **次序锁：Android 那条腿必须在「停代理」与「写脚本」之前整条早退。**
 ///
 /// # 为什么次序是判据本体，而不是风格
@@ -2543,8 +1673,8 @@ fn update_get_progress_returns_the_slot_and_never_fabricates_an_idle_frame() {
 /// # 为什么是源码扫描
 ///
 /// 这条不变式的两端（`State<'_, AppRuntime>` 与 Tauri `AppHandle`）在单测里构造不出来，
-/// 而它守的是**控制流位置**，不是某个函数的返回值。同一理由见本文件
-/// `update_install_delegates_detached_spawn_to_completion_helper`。
+/// 而它守的是**控制流位置**，不是某个函数的返回值。
+#[cfg(target_os = "linux")]
 #[test]
 fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
     let body =
@@ -2666,10 +1796,10 @@ fn confirm_request_carries_the_program_dir_only_for_the_portable_leg() {
 /// 内核若还在跑，被占用的文件会被跳过，目录里就是新旧混装。故次序是
 /// 「告知 → 退出准备门（停核）→ 打开 → 提交退出」，这里按调用点位置钉住。
 ///
-/// 控制流位置在单测里构造不出两端（`AppHandle` / `State`），故扫源码，理由同
-/// `update_install_delegates_detached_spawn_to_completion_helper`。
+/// 控制流位置在单测里构造不出两端（`AppHandle` / `State`），故扫源码。
 ///
 /// 变异：把 `open_portable_update(` 那次调用挪到 `prepare_desktop_exit` 之前 ⇒ 本条红。
+#[cfg(target_os = "linux")]
 #[test]
 fn update_install_stops_the_core_before_opening_the_portable_archive() {
     let body =
@@ -2911,6 +2041,7 @@ fn full_uninstall_prepares_all_desktop_owners_before_any_destructive_step() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn portable_reminder_is_read_only_and_confirmed_install_requires_fresh_custody() {
     let body =
@@ -2945,4 +2076,185 @@ fn portable_reminder_is_read_only_and_confirmed_install_requires_fresh_custody()
     assert!(authority < stage && stage < handoff);
     assert!(body[authority..stage].contains("updateTrustRequired"));
     assert!(body[stage..handoff].contains("plan.installer_path = installer.clone()"));
+}
+
+/// 🟡 **调用点守卫：`update_download` 的每一条失败早退都必须先发 `error` 进度事件。**
+///
+/// 弹窗被 `force progress(0)` 推进 Progress 后，只有 `error` / `downloaded` 能把它推出去；
+/// 静默 return 会让它永远转圈（只剩 Cancel 可点）。原实现的三条前置校验早退正是这样。
+///
+/// 按**计数**锁而不是逐条锁：新增任何一条失败早退却忘了配一发 error 事件，
+/// 两个计数立刻对不上 ⇒ 转红。
+///
+/// # 计数用**前缀** `ApiResponse::err`
+///
+/// 数 `ApiResponse::err(` 会**漏掉** `ApiResponse::err_with_code(`（`err` 后面是 `_` 不是 `(`），
+/// 新增一条带 code 的早退时守卫全盲；故按前缀数。今天函数体内没有「一条早退里两个信封共用
+/// 一发 error 事件」的分支，两个计数须**逐一相等**。
+#[cfg(target_os = "linux")]
+#[test]
+fn every_failure_path_emits_an_error_progress_event() {
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
+    let errors = body.matches("ApiResponse::err").count();
+    let emits = body.matches("emit(ProgressStage::Failed(").count();
+    assert!(errors > 0, "锚点消失：守卫已失去判据");
+    assert_eq!(
+        errors, emits,
+        "失败信封 {errors} 处、error 进度事件 {emits} 发 —— 对不上的那条会让弹窗永远转圈"
+    );
+    // 配对由结构保证：全部早退经 fail 闭包，其体内 emit 与 err_with_code 同体。
+    assert!(
+        body.contains("let fail = |e: UpdateErr<'_>|"),
+        "fail 统一出口被改形 —— 它体内 emit+信封的配对是本守卫的前提"
+    );
+}
+
+/// 🟡 **调用点守卫：复查回来「没有可下的东西」时，既不广播假的 `downloaded`，也不对弹窗
+/// 自己谎称「已下载」。**
+///
+/// # 这道门此前只守住了一半
+///
+/// 旧判据是「函数体里必须出现 `push_popup_state(&app, UpdatePopupState::done())`」+「函数体里
+/// 不得出现 `ProgressStage::Downloaded`」。它守的是**广播给设置页的那一份**（后半条），而
+/// 前半条**要求**把 `done()` 推给弹窗自己 —— 于是「一个字节都没下」在发起本次动作的那一屏上
+/// 被渲染成 `updatePopup.downloaded`（「下载完成」）+ 满格进度条。门在，守的方向漏了发起方。
+///
+/// 新判据把「推出 progress」与「推的是哪一档」拆开：仍必须把弹窗推出 progress（否则永远转圈），
+/// 但那一档必须是 `no_update`；`done` 在本臂**一次都不许出现**。`UpdatePopupState::done` 现在
+/// 是必填落位路径的构造函数，本臂根本没有路径可传 —— 源码门与类型闸在此重合，两道都留着：
+/// 类型挡「拿不出路径」，本门挡「随手编一个路径喂给它」。
+///
+/// # 判据必须收到**分支**，臂一级还不够
+///
+/// 射程收紧走过三级，每一级都是被同一形态咬出来的（「取材面宽于意图面」）：
+///  1. **整函数**：把推送搬进别的臂就能替本臂作证 —— 本仓在同一个函数上栽过两次
+///     （见 `guard_scan::match_arm_body` 文档）。
+///  2. **臂**（`match_arm_body`）：仍不够。`Update | Retry` 臂内有 **5 条早退分支**，而
+///     `arm.contains(…)` 只问「臂内某处有没有这句话」。实测：把本分支的推送**整个删掉**
+///     （⇒ 弹窗永远停在 progress 转圈，正是本门自称要防的那件事）、把它挪进下面的
+///     `Renegotiate` 分支 ⇒ **全仓 1428 passed / 0 failed，本门全绿**。
+///  3. **分支**（现判据）：用**位置区间**钉死 —— 那两发推送的 offset 必须落在
+///     「`let Some(info) = data.get("updateInfo")` 这一行」与「本分支自己的
+///     `"hasUpdate": false` 早退」之间。同款先例见本文件
+///     [`the_user_action_forces_the_popup_into_progress_before_rechecking`] 的 `force_at < check_at`。
+///
+/// 「我要判的是什么位置的什么形状」：形状 = 那两发推送，位置 = **那一条 `let-else` 的 else 体内**。
+/// 计数不是位置（把推送搬进 helper 里计数纹丝不动），故这里判的是区间不是次数；但两个锚点
+/// 各自的**唯一性**要单独断言，否则「区间」本身可以被第二处同名锚点重新划定。
+///
+/// 负向断言（不得广播 `ProgressStage::Downloaded`）**故意保持全函数**：任何一条臂都不许广播，
+/// 那是更强的形态，与 `recheck_failures_settle_the_popup_without_broadcasting` 同一取向。
+/// `done(` 的负向断言保持**臂级**：本臂任何一条分支都不许推 done，同样严于分支级。
+///
+/// **变异探针**：把 `no_update(...)` 改回 `done(popup.version.clone(), "")` ⇒ 转红；
+/// 把两发推送挪进 `Renegotiate` 分支 ⇒ 区间判定转红（臂级判据在此**全绿**，见上面第 2 条）；
+/// 把它挪进 `ViewLog` 臂 ⇒ 臂内找不到，转红。
+#[cfg(target_os = "linux")]
+#[test]
+fn the_no_download_path_never_claims_a_download() {
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_popup_action(");
+    let arm = crate::commands::guard_scan::match_arm_body(
+        &body,
+        "PopupAction::Update | PopupAction::Retry =>",
+        "PopupAction::",
+    );
+
+    // ── 区间的两个端点：先证明它们各自唯一，否则「落在区间内」可以被第二处锚点重新划定 ──
+    const BRANCH_HEAD: &str = "let Some(info) = data.get(\"updateInfo\")";
+    const BRANCH_EXIT: &str = "\"hasUpdate\": false";
+    // 🟡 #3（confirm 轮登记）：`BRANCH_EXIT` 曾要求**全臂恰 1**——正当的分支细分（把 no-update
+    // 拆成「平台不受支持」与「其它」，两边都各自 `hasUpdate:false` 早退）会误红。安全方向，
+    // 但留给后人的最省事修法就是把判据放宽跑 —— 这里先行改到**不随细分复制**的形态：
+    // 头锚保持恰 1（let-else 那一行不该重样）；尾锚取**最后一次**出现且至少一次，区间 =
+    // 头..最后一次。细分出的每一条子分支都被区间罩住，推送落在任一条里都判绿。
+    // ⚠️ 残余缺口如实登记（相对「恰 1」版弱了一格，复审 F3 校正口径）：推送若被挪进
+    // `updateInfo` **存在**的路径、且其后还存在更晚的 `hasUpdate:false`，旧判据会红、新判据
+    // 不红。**没有自动姊妹门覆盖这个缺口**（本臂三道门都不钉「no_update 推送必须在该
+    // 分支」），暴露途径只剩 code review 与真机（转圈窗）；补门方向 = 对 else 块子区间
+    // 逐分支计数 no_update 推送 ≥1——真被咬到再做。
+    // 锚点先收集后断言（🟢#7/F4 的修法，消灭 n=0 误归因与两条不可达 expect）。
+    let heads: Vec<usize> = arm.match_indices(BRANCH_HEAD).map(|(i, _)| i).collect();
+    assert!(
+        !heads.is_empty(),
+        "头锚 {BRANCH_HEAD:?} 在本臂里一次都没有 —— let-else 的形状变了，守卫失去判据"
+    );
+    assert_eq!(
+        heads.len(),
+        1,
+        "头锚 {BRANCH_HEAD:?} 在本臂里出现 {} 处 —— let-else 那一行被复制了，\
+             「落在分支内」这句话就不再指同一段代码",
+        heads.len()
+    );
+    let head = heads[0];
+    let exits: Vec<usize> = arm.match_indices(BRANCH_EXIT).map(|(i, _)| i).collect();
+    assert!(
+        !exits.is_empty(),
+        "尾锚 {BRANCH_EXIT:?} 在本臂里一次都没有 —— no-update 早退的形状变了，守卫失去判据"
+    );
+    let exit = *exits.last().unwrap();
+
+    // ── 那两发推送必须落在这条 `let-else` 的 else 体内 ──
+    for (needle, why) in [
+            (
+                "push_popup_state(&app, UpdatePopupState::no_update(",
+                "「没有可下的东西」仍须把弹窗推出 progress（否则永远转圈），且必须推 `no_update` 那一档",
+            ),
+            (
+                "schedule_popup_auto_close(&app, NO_UPDATE_AUTO_CLOSE_MS)",
+                "`noupdate` 终态没有排自动关窗，或沿用了 done 的 800ms —— 后者一闪而过，等于没说",
+            ),
+        ] {
+            // 🔴 唯一性断言（confirm 轮 #2 的修法）：`top_level_fn_body` 只剥**整行**注释
+            // （射程在 `commands.rs:47-50` 登记），**行尾注释携带同形串可以喂饱 `find`**。
+            // 剥行尾注释要先认字符串字面量（`commands.rs:51-53` 既有裁决：不划算），故两层兜：
+            //   ① `count == 1`：真调用 + 注释各一份 ⇒ 计数 2 ⇒ 红；
+            //   ② 行级拒绝：命中的那一行若 needle 之前就有 `//`（= needle 落在行尾注释里）不算数
+            //      ——「删掉真调用、只留一行注释」时计数仍 1，①抓不住，②让「找不到真调用」转红
+            //      （confirm 轮原始收据正是这个形态）。
+            // ② 的真实射程（复审 F2 校正口径，别照旧登记读反）：**未设防面 = 同形串出现在无先行
+            // `//` 的任何非调用文本里**（典型：字符串字面量 `let s = "push_popup_state(…"` 且真调用
+            // 已删 ⇒ ①计数 1、②当真 ⇒ 假绿——要防得认字符串=parser，不做）；串内带 `//` 且在
+            // 同形串之前的形态反而会被 ② 拒绝转红（安全方向，panic 文案归因略偏但响亮）；真调用
+            // 与行内更早的 `//` 同屏会被误拒（误红，安全）。
+            let n = arm.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "needle {needle:?} 在本臂里出现 {n} 次（须恰好 1）—— 大概率是行尾注释携带了\
+                 同形串替真调用作证（`find` 命中哪一处全凭先后）：{why}"
+            );
+            // 命中行若在 needle 前就有 `//`，那是行尾注释不是代码——继续找代码行里的那一处。
+            let mut real_at = None;
+            let mut offset = 0usize;
+            for line in arm.lines() {
+                if line.contains(needle) {
+                    let before = line.split(needle).next().unwrap_or("");
+                    if !before.contains("//") {
+                        real_at = Some(offset + before.len());
+                        break;
+                    }
+                }
+                offset += line.len() + 1;
+            }
+            let at = real_at.unwrap_or_else(|| {
+                panic!("{why}（本臂里只剩行尾注释在携带这个串 —— 真调用没了，注释在替它作证）")
+            });
+            assert!(
+                head < at && at < exit,
+                "{why}。实得 offset：分支头={head} / 本句={at} / 分支早退={exit} —— \
+                 它不在「复查回来没有 updateInfo」那条分支里。搬到臂内别的分支上，\
+                 这条路径就一发都不推，而弹窗停在 progress 永远转圈"
+            );
+        }
+
+    assert!(
+        !arm.contains("UpdatePopupState::done("),
+        "本臂一个字节都没下 —— 推 `done` 就是在发起本次动作的那一屏上谎称「下载完成」\
+             （2026-08-17 前的现状）。落位路径是 `done` 的必填参数，本臂拿不出真的那一个"
+    );
+    assert!(
+        !body.contains("ProgressStage::Downloaded"),
+        "「没有可下的东西」不得广播 downloaded —— 无文件、无 filePath，设置页会显示假的「已下载」"
+    );
 }

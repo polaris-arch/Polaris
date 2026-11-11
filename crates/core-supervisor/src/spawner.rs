@@ -311,8 +311,6 @@ impl SingBoxSpawner for TokioSpawner {
         // （sing-box 正是）会新分配一个控制台窗口。必须显式加 `CREATE_NO_WINDOW`（winbase.h 0x0800_0000）。
         // 位置要求只有一条、而且是**语义**上的：必须早于进程真正被创建（`.stdout(` / `.spawn()`）。
         // `Command` 的构建器调用彼此顺序无关，唯独「设标志」晚于「起进程」会静默失效。
-        // `windows_console_suppression` 这条腿的判据就写成这句话本身（`Guarded::before`），不数行
-        // ——数行的判据会被本方法体里越写越长的注释顶红，而顶红的原因与它守的属性无关。
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000);
         cmd

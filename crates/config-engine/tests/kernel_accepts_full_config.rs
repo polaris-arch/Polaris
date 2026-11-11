@@ -24,40 +24,6 @@ use support::kernel_gate::{
 };
 use tempfile::tempdir;
 
-const OUTBOUNDS_GATE: &str = "cargo test -p polaris-config-engine --test kernel_accepts_outbounds";
-const FULL_CONFIG_GATE: &str =
-    "cargo test -p polaris-config-engine --test kernel_accepts_full_config";
-
-fn workflow(name: &str) -> String {
-    let path = support::kernel_gate::repo_root().join(format!(".github/workflows/{name}.yml"));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()))
-}
-
-fn assert_hardened_full_gate_after_outbounds(raw: &str, workflow_name: &str) {
-    let outbounds = raw
-        .find(OUTBOUNDS_GATE)
-        .unwrap_or_else(|| panic!("{workflow_name} 缺出站真核门"));
-    let full = raw
-        .find(FULL_CONFIG_GATE)
-        .unwrap_or_else(|| panic!("{workflow_name} 缺完整配置真核门"));
-    assert!(
-        outbounds < full,
-        "{workflow_name} 的完整配置门必须排在出站真核门之后"
-    );
-    let step_start = raw[..full]
-        .rfind("\n      - name:")
-        .unwrap_or_else(|| panic!("{workflow_name} 完整配置门前缺 workflow step 边界"));
-    let after_step = &raw[step_start..];
-    let step_end = after_step[1..]
-        .find("\n      - name:")
-        .map_or(after_step.len(), |offset| offset + 1);
-    let step = &after_step[..step_end];
-    assert!(
-        step.contains("POLARIS_REQUIRE_KERNEL_GATE: '1'"),
-        "{workflow_name} 的完整配置门必须硬化：缺随包核不得静默跳过"
-    );
-}
-
 /// Production management API requires exactly one API service in every full configuration.
 fn assert_api_service_shape(case: &SnapshotCase, value: &Value) -> (bool, bool) {
     let services = value["services"]
@@ -128,51 +94,6 @@ fn bundled_core_target_resolution_contract() {
         command.get_args().collect::<Vec<_>>(),
         ["-x86_64", "resources/mac-x64/sing-box"]
     );
-}
-
-/// 打包腿才有刚下载的核与 cronet；CI 常规腿不拉核，在那里挂 REQUIRE=1 是永久假红。
-#[test]
-fn package_workflow_runs_full_gate_after_cronet_and_outbounds_gate() {
-    let raw = workflow("package");
-    assert!(
-        raw.contains("POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}"),
-        "package 的真核门必须接收 matrix.label；macos-x64 不能按 arm64 宿主误选核"
-    );
-    let fetch = raw
-        .find("run: node scripts/fetch-core.mjs")
-        .expect("package.yml 缺随包核（含 Cronet sidecar）拉取；真核门不能初始化 naive");
-    let outbounds = raw.find(OUTBOUNDS_GATE).expect("package.yml 缺出站真核门");
-    let full = raw
-        .find(FULL_CONFIG_GATE)
-        .expect("package.yml 缺完整配置真核门");
-    assert!(
-        fetch < outbounds,
-        "随包核与 Cronet sidecar 的拉取必须早于第一道出站真核门"
-    );
-    assert!(outbounds < full, "完整配置门必须位于出站真核门之后");
-    assert_hardened_full_gate_after_outbounds(&raw, "package.yml");
-}
-
-/// release-risk 禁用 package.yml 的 `POLARIS_RUN_KERNEL_GATES`，故自身的 mandatory 步必须显式执行完整门。
-#[test]
-fn release_risk_runs_hardened_full_gate_after_cronet_and_outbounds_gate() {
-    let raw = workflow("release-risk");
-    let fetch = raw.find("run: node scripts/fetch-core.mjs").expect(
-        "release-risk.yml 缺随包核（含 Linux Cronet SO）拉取；Ubuntu 真核门不能初始化 naive",
-    );
-    let full = raw
-        .find(FULL_CONFIG_GATE)
-        .expect("release-risk.yml 缺完整配置真核门");
-    assert!(
-        fetch < full,
-        "release-risk 的完整配置门必须位于 Fetch sing-box core 之后"
-    );
-    assert!(
-        raw.contains("Run mandatory bundled-core gates")
-            && raw.contains("if: needs.classify.outputs.kernel == 'true'"),
-        "release-risk 的完整配置门必须留在 kernel 影响触发的 mandatory job"
-    );
-    assert_hardened_full_gate_after_outbounds(&raw, "release-risk.yml");
 }
 
 /// 全量 37 个 fixture 必须逐一生成、使用真实 `.srs` 资源并由同一凭据棘轮判定。

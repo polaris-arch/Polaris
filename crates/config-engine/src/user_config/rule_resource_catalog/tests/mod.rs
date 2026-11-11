@@ -99,5 +99,3 @@ fn catalog_url_matches_builtin_source_url() {
 fn find_unknown_returns_none() {
     assert!(find_catalog_item("geosite-nonexistent").is_none());
 }
-
-// 「前端不得再有第二份 catalog 表」的门在 `tests/frontend_sot_guard.rs`（与预设表的同类门同处）。

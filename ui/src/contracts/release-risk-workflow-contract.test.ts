@@ -399,9 +399,8 @@ esac
   });
 
   it('四道随包内核门在 package.yml 与 release-risk.yml 两份定义之间逐条对拍', () => {
-    // Rust 侧四条 `ci_step_still_wired`（crates/config-engine/tests/*.rs）只 grep package.yml。
-    // 但**合入前路径上真正在跑的是 release-risk.yml 这一份**：删掉它 129-132 里任意一行，
-    // 四条 Rust 断言零转红、合入前内核门静默少一道。本条把接线断言扩到两文件。
+    // **合入前路径上真正在跑的是 release-risk.yml 这一份**：删掉它 129-132 里任意一行，
+    // 合入前内核门静默少一道。本条把两文件的接线逐条对拍。
     const pkgGates = configGateTargets(pkg);
     const riskGates = configGateTargets(risk);
     const command = 'cargo test -p polaris-config-engine';

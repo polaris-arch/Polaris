@@ -114,7 +114,7 @@ run_gate build cargo build --workspace --verbose
 # ── 本机专属：禁起核（陈先生决策 2026-09-25）──
 # 本机硬约束「不许起 sing-box run」，而 `cargo test --workspace` 里有真起核的门（盘上有随包核就真起）。
 # 决策：本机跳过起核用例，覆盖交给 CI。判定与 `run` 的拼接只在
-# crates/config-engine/tests/support/kernel_run.rs 一处（源码级门 kernel_run_single_entry.rs 钉死）。
+# crates/config-engine/tests/support/kernel_run.rs 一处。
 # 只在非 CI（GITHUB_ACTIONS 未设）时 export；ci.yml / package.yml / release-risk.yml 不设，照常起核。
 # 不改下面那条 `run_gate test` 行本身：它与 ci.yml 逐字相同。
 # 自曝：cargo test 吞掉通过用例的 stderr，故跳过记账写进文件、由本脚本汇总打印「跳过 N 个」；

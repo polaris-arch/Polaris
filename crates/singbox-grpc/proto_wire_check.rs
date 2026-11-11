@@ -661,48 +661,6 @@ mod proto_wire_check {
         bad
     }
 
-    /// 一次完整对拍：读核 → 抠 descriptor → 与 vendored proto 文本比某个 message/enum。
-    /// `Ok(())` = 一致；`Err(人类可读报告)` = 不一致或提取失败。
-    pub fn check_core_against_proto(
-        core: &Path,
-        proto_src: &str,
-        kind: SymbolKind,
-        name: &str,
-    ) -> Result<(), String> {
-        let bytes =
-            std::fs::read(core).map_err(|e| format!("读不到随包核 {}：{e}", core.display()))?;
-        let desc =
-            descriptor_from_core(&bytes).map_err(|e| format!("{}：{e}", core.display()))?;
-        let table = match kind {
-            SymbolKind::Message => &desc.messages,
-            SymbolKind::Enum => &desc.enums,
-        };
-        let kind_label = kind.label();
-        let real = table.get(name).ok_or_else(|| {
-            format!(
-                "{} 的 descriptor 里没有 {kind_label} `{name}`",
-                core.display()
-            )
-        })?;
-        let vendored = symbol_from_proto_src(proto_src, kind, name)?;
-        let bad = diff(&vendored, real);
-        if bad.is_empty() {
-            return Ok(());
-        }
-        Err(format!(
-            "vendored proto 与随包内核的 wire 契约不一致：{}\n\
-             {kind_label} `{name}` 的号对不上：\n{}\n\n\
-             后果（2026-08-05 真机实证）：prost 对 wire type 不匹配零容忍，错位后**整帧解码失败**，\n\
-             而 ReconnectingStream 把它当断线无限重连 —— 外部只看得到「没有下一帧」，功能整块静默消失。\n\
-             修复：以随包核的 descriptor 为准改 `crates/singbox-grpc/proto/started_service.proto`，\n\
-             不要以文档或旧版本记忆为准。真核字段号可直接读出：\n\
-               strings -n 6 {} | grep -oE 'protobuf:\"[^\"]*\"' | sort -u",
-            core.display(),
-            bad.join("\n"),
-            core.display(),
-        ))
-    }
-
     // ── 共享真值：符号表 + vendored proto 文本 ────────────────────────────────
     //
     // 这两项此前在 `build.rs` 与 `tests/bundled_core_wire.rs` 各存一份，两处注释都写着

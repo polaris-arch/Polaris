@@ -79,7 +79,7 @@ export function TunPage({ config, update, commit }: MobileSettingsPageProps): Re
      这里**不许**写 `?? {…}` 兜底：那份兜底就是与内核默认分叉的第二真值源 —— `bypassLANList` /
      `inboundExcludeCidrs` 两次都栽在同一个形态上（UI 与内核各说一套 + 用户按下第一个键就把
      兜底当成自己的清单落了库）。缺席 ⇒ 报错 + 空对象，界面看起来就是坏的，而不是显示一份
-     看似正常、实则与内核不符的配置。判据在 `crates/config-engine/tests/frontend_sot_guard.rs`。 */
+     看似正常、实则与内核不符的配置。 */
   const tun = injectedRecord<TunModeConfig>(config.tunConfig, 'tunConfig');
 
   /** 写一段 TUN 配置。**必须带行 id**：写失败要贴在动手的那一行下面。 */

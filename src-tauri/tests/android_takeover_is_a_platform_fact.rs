@@ -63,6 +63,8 @@
 //! 这个洞由**行为侧**那一半兜住（`runtime/proxy/tests/android_takeover.rs` 的
 //! `android_running_effective_mode_is_tun_whatever_is_stored` 在 M5 下转红）——
 //! 这也正是「两条成对交、只交一条算没做完」在本批的具体所指。
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -305,9 +305,8 @@ pub(crate) fn all_presets() -> Vec<AppPreset> {
 
 /// 全列投影：`Vec<AppPresetDto>`（含 UI 列）—— `app_presets_list` command 下发前端。
 ///
-/// **刻意不带 `package_names`**：DTO 的键集是与前端 `AppPreset` interface 的逐字契约
-/// （`tests/frontend_sot_guard.rs` 锁死），而包名当前无任何渲染消费方。加一个前端不读的键
-/// 只会让那道契约门变松（多出的键谁都不看，漂了也没人知道）。
+/// **刻意不带 `package_names`**：DTO 的键集是与前端 `AppPreset` interface 的逐字契约，
+/// 而包名当前无任何渲染消费方。加一个前端不读的键只会让契约变松（多出的键谁都不看，漂了也没人知道）。
 pub fn all_presets_dto() -> Vec<AppPresetDto> {
     PRESETS_RAW
         .iter()

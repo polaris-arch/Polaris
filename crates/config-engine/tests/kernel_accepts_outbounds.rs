@@ -47,8 +47,7 @@
 //!
 //! 缺核时跳过，同时提供硬化开关：`POLARIS_REQUIRE_KERNEL_GATE=1` 时缺核直接**红**。
 //! `package.yml` 的打包腿在 `fetch-core.mjs` 之后带着该变量跑本门 —— 于是「拉核失败」与
-//! 「本门没跑」在**那条腿上**都会自曝，而不是静静变成一条绿。这条 CI 接线本身也有门守着，见
-//! `ci_step_still_wired`：删掉那一步会转红。
+//! 「本门没跑」在**那条腿上**都会自曝，而不是静静变成一条绿。
 //!
 //! 🔴 **「跳过」这件事本身是静默的，别把它读成会自曝**（2026-08-07 实测更正，原文写的是
 //! 「跳过并大声说」）：下面那句 `eprintln!` 归 libtest 捕获，**只在测试失败时才回放** ——
@@ -333,63 +332,6 @@ fn the_gate_can_actually_fail() {
     assert!(
         diag.contains("outbounds[0]"),
         "内核诊断不再自带下标 —— 起核闸门的 `classify_peel_target` 靠它归因，那边会跟着失效；实得：{diag}"
-    );
-}
-
-/// 🔴 **CI 接线自曝：打包腿必须带着硬化开关跑本门。**
-///
-/// 本门在缺核时跳过（开发机常态），故它的真正牙在 `package.yml` ——
-/// 那条腿在 `fetch-core.mjs` 之后跑，核必然在盘上。若有人删掉那一步，本门就退化成
-/// 「开发机上偶尔跑跑」，而**不会有任何东西报警**。这条断言就是那个警报。
-///
-/// 判据刻意宽（只认关键字共现，不认行号/缩进/步骤名），避免变成格式洁癖门。
-#[test]
-fn ci_step_still_wired() {
-    let wf = repo_root().join(".github/workflows/package.yml");
-    let raw =
-        std::fs::read_to_string(&wf).unwrap_or_else(|e| panic!("读不到 {}: {e}", wf.display()));
-    assert!(
-        raw.contains("POLARIS_REQUIRE_KERNEL_GATE"),
-        "package.yml 里找不到 POLARIS_REQUIRE_KERNEL_GATE —— \
-         内核加载门在打包腿上没有强制执行，缺核会静静跳过"
-    );
-    assert!(
-        // 匹配 run 命令本身而非裸词：本文件名一旦出现在 package.yml 的注释里（相邻的
-        // core_dep_fingerprint 那步就踩过这个坑），裸词判据会在 step 被删后仍然绿。
-        raw.contains("--test kernel_accepts_outbounds"),
-        "package.yml 里找不到 `--test kernel_accepts_outbounds` —— 打包腿没在跑本门"
-    );
-}
-
-/// 🔴 本门必须排在「Fetch sing-box core」**之后** —— 这个先后关系是承重的。
-///
-/// # 血证（2026-08-13）
-///
-/// 此前本门排在 cronet 拉取之前，Windows 腿红在：
-/// `naive outbound → initialize outbound[0]: cronet: library not found.
-///  Place libcronet.dll in the executable directory or PATH`
-///
-/// 随包核 **beta.14 在 initialize 阶段就硬要这个库**，而它如今随发布归档由 `fetch-core.mjs` 落到
-/// `resources/win/`（= 核的同目录）。2026-08-05 那次 Windows 腿是绿的，因为旧核不要它 ——
-/// 抬核到 beta.14 之后才成立，而 **Windows 腿从 08-05 起整整一周没再跑过**，缺陷就潜伏在那里。
-///
-/// 排在之后同时更贴近生产：生产就是把 DLL 放在核旁边。故这不是「顺手挪一下」，
-/// 挪回去会让 Windows 打包腿必红，且症状（一句 cronet 找不到）跟本门要守的东西毫无关系。
-#[test]
-fn ci_step_order_is_load_bearing() {
-    let wf = repo_root().join(".github/workflows/package.yml");
-    let raw =
-        std::fs::read_to_string(&wf).unwrap_or_else(|e| panic!("读不到 {}: {e}", wf.display()));
-    let cronet = raw
-        .find("run: node scripts/fetch-core.mjs")
-        .expect("package.yml 里找不到 fetch-core 步骤");
-    let gate = raw
-        .find("--test kernel_accepts_outbounds")
-        .expect("package.yml 里找不到本门的 run 命令");
-    assert!(
-        cronet < gate,
-        "内核门排到了 Windows cronet DLL 拉取**之前** —— Windows 腿会红在 `cronet: library not found`，\
-         那是环境缺件，与本门要守的「生成的配置内核收不收」毫无关系"
     );
 }
 

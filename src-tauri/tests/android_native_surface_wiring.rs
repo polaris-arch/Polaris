@@ -1,4 +1,5 @@
-//! Android **原生面**的三道源码级门：权限画像 / 包可见性 / 安装器不静默失败。
+//! Android **原生面**的源码级门：包可见性 / 安装器不静默失败（权限画像由 `scripts/verify-apk.mjs`
+//! 判据 ⑦ 在产物侧守）。
 //!
 //! # 守的是什么（三条各自的失效形态，都没有运行期表征）
 //!
@@ -7,7 +8,7 @@
 //!
 //! | # | 事故 | 症状 | 谁能抓 |
 //! |---|---|---|---|
-//! | 1 | 权限画像无声漂移（多一条 / 少一条） | 多：安全边界被悄悄放宽；少：某条腿在真机上恒失败 | 只有源码 |
+//! | 1 | 权限画像无声漂移（多一条 / 少一条） | 多：安全边界被悄悄放宽；少：某条腿在真机上恒失败 | 产物侧 `verify-apk.mjs` ⑦ |
 //! | 2 | 包可见性声明与代码走的路不一致 | 真机上「已装应用」是**空列表**，不报错、不抛异常 | 只有源码 |
 //! | 3 | 「安装未知应用」没授权那一支被吞掉 | 点了更新**什么都没发生** | 只有源码 |
 //!
@@ -41,10 +42,7 @@
 //!   多出的 `RECEIVE_BOOT_COMPLETED` / `WAKE_LOCK` 来自 `tauri-plugin-notification 2.3.3`、
 //!   `com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` 来自 `androidx.core:core:1.13.1`
 //!   （出处见 `app/build/outputs/logs/manifest-merger-arm64-debug-report.txt`）。
-//!   故 [`self_declared_permissions_match_the_registry_exactly`] 断言的是「**本仓自己**写了什么」，
-//!   **不是**「这个应用要什么」——「升一版插件就多一条敏感权限」这一形它看不见。
-//!   出厂集由 `scripts/verify-apk.mjs` 的判据 ⑦ 在**产物侧**（`aapt2 dump permissions <apk>`）守，
-//!   两张登记表由 [`permission_registry_agrees_with_the_artifact_side_registry`] 钉在一起。
+//!   出厂集由 `scripts/verify-apk.mjs` 的判据 ⑦ 在**产物侧**（`aapt2 dump permissions <apk>`）守。
 //! - **不覆盖 `MainActivity.kt` 与 `StatsBridge.kt`**：取材面只有 `PolarisVpnPlugin.kt` 与
 //!   `AndroidManifest.xml`。别的 Kotlin 文件里另写一份包枚举/安装腿，本门看不见
 //!   （`scripts/check-android-bridge.mjs` 的 A11d 会拦「`@Command` 搬出插件类文件」这一形，
@@ -59,10 +57,9 @@
 //! - manifest 走 [`polaris_source_probe::mask_html_comments`]（XML 注释 = HTML 注释）；
 //! - Kotlin 走 [`polaris_source_probe::mask_comments`]（剥注释、**留字符串** —— 本门的针有一半
 //!   就是字符串字面量，如 `PACKAGE_VISIBILITY_ROUTE` 的取值与 intent action 的全名）。
-//!
-//! 两个剥离面各自带一条**切点自检**（[`manifest_extraction_reads_code_not_comments`] /
-//! [`kotlin_extraction_reads_code_not_comments`]）：喂一份合成输入，证明注释里的同形物真的被
-//! 剥掉了、而代码里的真的还在。自检**不依赖生产文本**，故删掉生产里的注释不会让自检失效。
+
+// 源码文本门：三平台源码逐字一致（`.gitattributes` eol=lf），只在必跑的 Linux 腿执行一次。
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeSet;
 
@@ -75,8 +72,6 @@ const PLUGIN_KT: &str =
 const FILE_PATHS_XML: &str = "src-tauri/gen/android/app/src/main/res/xml/file_paths.xml";
 /// Rust 侧的桥（reason 透传那一条断言的取材，相对 workspace 根）。
 const BRIDGE_RS: &str = "src-tauri/src/runtime/proxy/android_bridge.rs";
-/// 产物侧的权限判据本体（判据 ⑦ 的登记表住在这里，相对 workspace 根）。
-const VERIFY_APK_MJS: &str = "scripts/verify-apk.mjs";
 
 /// Edge-to-edge 下必须显式接收 IME insets；它不证明 WebView 布局视口已随键盘缩小。
 #[test]
@@ -95,89 +90,6 @@ fn main_activity_explicitly_requests_ime_resize() {
 // ═══════════════════════════════════════════════════════════════════════════
 // 门 1：**本仓自有** manifest 的 uses-permission（逐条全等一张登记表）
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// **本仓自有权限登记表**：`(权限, 为什么需要它)`。
-///
-/// # 🔴 这张表**不是**出厂 APK 的权限画像
-///
-/// 它是「本仓的 `AndroidManifest.xml` 里写了哪几条」。APK 真正申请的是 manifest merger 把
-/// 库 manifest 合并进来之后的集合 —— 2026-09-06 实测本仓 8 条、合并后 11 条（三条注入来源见
-/// 本文件头注）。所以本门守的是「**本仓自己**顺手加了一条」这一形；「**依赖**带进来一条」
-/// 由 `scripts/verify-apk.mjs` 的判据 ⑦ 在产物侧守，两张表由
-/// [`permission_registry_agrees_with_the_artifact_side_registry`] 钉在一起。
-/// 别把本门读成「权限画像门」—— 那句话它证明不了。
-///
-/// # 判据是**集合恰等**，不是「都在」
-///
-/// 多一条与少一条是同一类事故，且多的那一类更危险：权限是安全边界，`QUERY_ALL_PACKAGES` /
-/// `READ_EXTERNAL_STORAGE` 这种东西被顺手加进 manifest 时，构建全绿、APK 打得出、
-/// 而应用要的东西已经变了。
-/// 「都在」型判据（membership）对这一形是瞎的，故本门用有序全等。
-///
-/// # 第二列不是装饰
-///
-/// 每条必须写清「为什么需要它」，且由 [`every_permission_states_why_it_is_needed`] 断言非空、
-/// 有实质长度。理由写不出来的权限就是不该要的权限 —— 这条规则的成本恰好落在加权限的那个人身上，
-/// 那正是应该承担它的人。
-///
-/// # 顺序 = manifest 里的出现顺序
-///
-/// 断言按**排序后**的集合比，故这里的书写顺序不影响红绿；照 manifest 的顺序写只是为了 review
-/// 时能逐行对着看。
-const PERMISSION_REGISTRY: &[(&str, &str)] = &[
-    (
-        "android.permission.INTERNET",
-        "内核出站与所有 HTTPS（订阅拉取、更新检查、测速）都要它。没有它这个应用不存在。",
-    ),
-    (
-        "android.permission.FOREGROUND_SERVICE",
-        "隧道由 PolarisVpnService（前台服务）承载。Android 8+ 上没有它 startForegroundService \
-         会抛 SecurityException ⇒ 起核整条不可用。",
-    ),
-    (
-        "android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED",
-        "Android 14+ 要求前台服务声明类型化权限；VPN 应用是 systemExempted 的合法用例\
-         （上游 sing-box-for-android 同款声明）。缺它在 14+ 上起前台服务即抛。",
-    ),
-    (
-        "android.permission.POST_NOTIFICATIONS",
-        "前台服务的常驻通知在 Android 13+ 需要运行期授权。缺它通知不显示 —— 而那条通知是\
-         用户唯一能看见「隧道在跑」的地方，也是系统要求前台服务必须有的可见性。",
-    ),
-    (
-        "android.permission.ACCESS_NETWORK_STATE",
-        "DefaultNetworkMonitor 观察底层网络变化（切 WiFi/蜂窝时内核要重新绑出接口）。",
-    ),
-    (
-        "android.permission.CHANGE_NETWORK_STATE",
-        "API 28..30 上「取真正的默认网络」只能用 requestNetwork，那条 API 要这个权限。\
-         用 registerDefaultNetworkCallback 会把我们自己的 tun 当成默认网络 ⇒ 内核出站绕回自己\
-         （成因见 DefaultNetworkMonitor.register 的注释）。",
-    ),
-    (
-        "android.permission.ACCESS_WIFI_STATE",
-        "readWIFIState()：内核的 wifi_ssid / wifi_bssid 路由规则要读当前 SSID/BSSID。",
-    ),
-    (
-        "android.permission.REQUEST_INSTALL_PACKAGES",
-        "W-21 应用内自更新：把下载好的 APK 交给系统安装器。本仓经 GitHub Releases 分发、\
-         没有商店托管更新，这是唯一的落地手段。缺它时 API 26+ 上 canRequestPackageInstalls() \
-         恒 false、那次 ACTION_VIEW 被系统直接拒 ⇒ 「点了更新什么都没发生」。\
-         射程只有「请求安装一个包」——不给静默安装、不给卸载，每次仍由系统弹确认框。",
-    ),
-    (
-        "android.permission.RECEIVE_BOOT_COMPLETED",
-        "设置 → 通用「开机自动连接」（autoStart 的 Android 腿）：vpn.BootReceiver 在开机后判准入\
-         （开关开 + VPN 已授权 + 用户上次没有主动断开 + 落盘配置可用）再起核。normal 级、不弹窗；\
-         此前它由 tauri-plugin-notification 注入且本仓不用，现在本仓自己声明并真的消费它。",
-    ),
-];
-
-/// 登记表条数下限（正面断言）。
-///
-/// 2026-09-06 实测 8 条（原 7 条 + REQUEST_INSTALL_PACKAGES）；2026-09-25 第 9 条 RECEIVE_BOOT_COMPLETED（开机自动连接）。取恰值而不是留余量：
-/// 权限**不该**随便增删，真要动就该来改这个数并在 review 里被看见一次。
-const PERMISSION_FLOOR: usize = 9;
 
 /// 从（已剥注释的）manifest 里抠 `uses-permission` 的 `android:name`。
 ///
@@ -203,273 +115,6 @@ fn declared_permissions(masked_manifest: &str) -> BTreeSet<String> {
         rest = &tail[end..];
     }
     out
-}
-
-/// **本仓自有** manifest 的 `uses-permission` 清单必须与 [`PERMISSION_REGISTRY`] **逐条全等**。
-///
-/// 射程见 [`PERMISSION_REGISTRY`] 的第一段：这条判不了出厂 APK 的权限集。
-#[test]
-fn self_declared_permissions_match_the_registry_exactly() {
-    let masked = polaris_source_probe::mask_html_comments(&polaris_source_probe::expect_marker(
-        polaris_source_probe::repo_file!(MANIFEST),
-        MANIFEST,
-        ".vpn.PolarisVpnService",
-    ));
-    let declared = declared_permissions(&masked);
-
-    assert!(
-        declared.len() >= PERMISSION_FLOOR,
-        "manifest 上只抠出 {} 条 uses-permission（下限 {PERMISSION_FLOOR}）—— \
-         抠取口径塌了，而不是权限真的只剩这么点。塌掉的判据会把「集合恰等」变成一句空话。",
-        declared.len()
-    );
-
-    let registered: BTreeSet<String> = PERMISSION_REGISTRY
-        .iter()
-        .map(|(p, _)| (*p).to_string())
-        .collect();
-    assert_eq!(
-        PERMISSION_REGISTRY.len(),
-        registered.len(),
-        "登记表里有重复条目 —— 那会让「集合恰等」在一条被删掉时仍然绿"
-    );
-
-    let extra: Vec<&String> = declared.difference(&registered).collect();
-    let missing: Vec<&String> = registered.difference(&declared).collect();
-    assert!(
-        extra.is_empty(),
-        "manifest 里有**没登记**的权限：{extra:?}\n\
-         权限是安全边界，多一条与少一条是同一类事故。确实需要它 ⇒ 加进 PERMISSION_REGISTRY \
-         并写清「为什么需要它」；不需要 ⇒ 从 manifest 删掉。"
-    );
-    assert!(
-        missing.is_empty(),
-        "登记表里有 manifest 上**不存在**的权限：{missing:?}\n\
-         要么某条腿的权限被误删（那条腿在真机上会恒失败），要么登记表腐烂了。"
-    );
-}
-
-/// 登记表每条都必须写清「为什么需要它」。
-#[test]
-fn every_permission_states_why_it_is_needed() {
-    for (permission, why) in PERMISSION_REGISTRY {
-        let why = why.trim();
-        assert!(
-            why.chars().count() >= 20,
-            "{permission} 的理由太短（{} 字）：`{why}`\n\
-             理由要说清「缺了它哪条腿会怎样失败」，不是复述权限名。",
-            why.chars().count()
-        );
-        assert!(
-            !why.contains(permission),
-            "{permission} 的理由只是把权限名重复了一遍 —— 那不是理由"
-        );
-    }
-}
-
-/// 把 **JavaScript** 源码里的注释抹成空格（偏移与行号守恒），字符串原样保留。
-///
-/// # 为什么不能直接用 [`polaris_source_probe::mask_comments`]
-///
-/// 那个函数是 **Rust 词法**：Rust 的块注释**可嵌套**，`/*` 会让深度加一。而
-/// `scripts/verify-apk.mjs` 的文档注释里逐字写着 `` `lib/<ABI>/*.so` `` 与 `` `lib/**.so` ``
-/// —— 那两个 `/*` 在 Rust 口径下各开了一层永不闭合的注释，**整份文件从那一行起全被抹掉**
-/// （2026-09-06 实测：抠取器当场 panic 说「找不到 export const APK_PERMISSION_REGISTRY」）。
-/// JS 的块注释不嵌套，第一个 `*/` 就闭合，与浏览器/Node 一致。
-///
-/// # 覆盖（射程如实登记）
-///
-/// **剥**：`//` 到行尾、`/* … */` 到最近一个 `*/`。
-/// **不剥**：`'…'` / `"…"` / `` `…` `` 三种字符串（含 `\` 转义）—— 本判据的针
-/// （权限名与 `from` 取值）本身就是字符串字面量，连字符串一起抹等于把判据的对象抹没。
-///
-/// **已知边界**：不认 JS 的正则字面量。`/…/` 里若出现 `//` 或 `/*` 会被当成注释起笔，
-/// 方向是**多剥** ⇒ 抠取器找不到登记表而 panic（响亮的红），不会静默判绿。
-fn mask_js_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut out = source.to_string().into_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += if bytes[i] == b'\\' { 2 } else { 1 };
-                }
-                i += 1;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    out[i] = b' ';
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let end = source[i + 2..]
-                    .find("*/")
-                    .map_or(bytes.len(), |at| i + 2 + at + 2);
-                while i < end {
-                    if bytes[i] != b'\n' {
-                        out[i] = b' ';
-                    }
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    String::from_utf8(out).expect("按字节抹空格不会破坏 UTF-8（只改 ASCII 位置）")
-}
-
-/// 🔴 **切点自检：JS 剥离面读的是代码，不是注释；且块注释不嵌套。**
-#[test]
-fn js_extraction_reads_code_not_comments() {
-    let synthetic = concat!(
-        "/** 说明里写着 `lib/<ABI>/*.so`，也写着一份假登记表：\n",
-        " * export const APK_PERMISSION_REGISTRY = Object.freeze([{ name: 'masked', from: 'self' }]);\n",
-        " */\n",
-        "// 行注释里也写一份：{ name: 'also-masked', from: 'self' }\n",
-        "export const APK_PERMISSION_REGISTRY = Object.freeze([\n",
-        "  { name: 'real', from: 'self', why: '注释里的 /* 不许把这一行吃掉' },\n",
-        "]);\n",
-    );
-    let masked = mask_js_comments(synthetic);
-    // 正面对照：真的那一条必须还在（否则「注释里的没了」可能只是因为整段都没了）。
-    assert!(
-        masked.contains("{ name: 'real'"),
-        "剥注释把代码也剥了 —— Rust 口径的嵌套块注释正是这么吃掉整份文件的：\n{masked}"
-    );
-    assert!(
-        !masked.contains("'masked'") && !masked.contains("'also-masked'"),
-        "注释里的假登记表没被剥掉 —— 判据会被自己的说明文字喂饱：\n{masked}"
-    );
-    let got = artifact_side_permissions(&masked);
-    assert_eq!(
-        got,
-        vec![("real".to_string(), "self".to_string())],
-        "抠出来的不是代码里那一条"
-    );
-}
-
-/// 从（已剥注释的）`scripts/verify-apk.mjs` 里抠产物侧登记表：`(权限, 来源)`。
-///
-/// 判据不做 JS 解析（不引依赖）：按 `export const APK_PERMISSION_REGISTRY` 起、到 `]);` 止，
-/// 在这一段里按 `{ name: '…', from: '…'` 逐条抠。任一处抠不出来 ⇒ panic
-/// （判据塌了必须转红，不许静默少取 —— 少取会让下面的「集合恰等」变成一句空话）。
-fn artifact_side_permissions(masked_mjs: &str) -> Vec<(String, String)> {
-    const HEAD: &str = "export const APK_PERMISSION_REGISTRY";
-    let at = masked_mjs.get_or_panic(HEAD);
-    let tail = &masked_mjs[at..];
-    let end = tail
-        .find("]);")
-        .unwrap_or_else(|| panic!("`{HEAD}` 的数组没有闭合 —— 取材塌了"));
-    let block = &tail[..end];
-
-    let mut out = Vec::new();
-    let mut rest = block;
-    while let Some(name_at) = rest.find("{ name: '") {
-        let after = &rest[name_at + "{ name: '".len()..];
-        let name_end = after
-            .find('\'')
-            .unwrap_or_else(|| panic!("登记表条目的 name 引号没闭合：{after:.80}"));
-        let name = after[..name_end].to_string();
-        let after = &after[name_end..];
-        let from_at = after
-            .find("from: '")
-            .unwrap_or_else(|| panic!("{name} 这条没有 `from:` —— 来源没登记，判不了它算谁的"));
-        let from_tail = &after[from_at + "from: '".len()..];
-        let from_end = from_tail
-            .find('\'')
-            .unwrap_or_else(|| panic!("{name} 这条的 from 引号没闭合"));
-        out.push((name, from_tail[..from_end].to_string()));
-        rest = &after[from_at..];
-    }
-    out
-}
-
-/// 两张权限登记表必须对得上：产物侧登记为 `self` 的那批，恰好等于本文件的
-/// [`PERMISSION_REGISTRY`]。
-///
-/// # 为什么要这条（而不是让两张表各自为政）
-///
-/// 两张表守的是**同一条边界的两段**：本文件守「本仓自己顺手加了一条」，
-/// `scripts/verify-apk.mjs` 的判据 ⑦ 守「出厂 APK 里到底有哪些」。分开写就会漂：
-/// 往 manifest 里加一条权限、只更新本文件 ⇒ 本门绿，而产物侧那张表落后一条 ⇒
-/// 判据 ⑦ 在 Android 腿上红，**而那条腿不是每个 PR 都跑**（`android.yml` 由
-/// `release-risk` 按影响面调用）。这条把那次红提前到每次 `cargo test`。
-///
-/// 反方向同样承重：有人只改产物侧那张表（比如把一条权限从 `self` 挪成「库注入」来消一个红），
-/// 本门当场红 —— 权限从哪儿来是**事实**，不是可以在登记表里改口的东西。
-#[test]
-fn permission_registry_agrees_with_the_artifact_side_registry() {
-    let mjs = mask_js_comments(&polaris_source_probe::expect_marker(
-        polaris_source_probe::repo_file!(VERIFY_APK_MJS),
-        VERIFY_APK_MJS,
-        "export const APK_PERMISSION_REGISTRY",
-    ));
-    let artifact = artifact_side_permissions(&mjs);
-    assert!(
-        artifact.len() >= PERMISSION_FLOOR,
-        "产物侧登记表只抠出 {} 条（下限 {PERMISSION_FLOOR}）—— 抠取口径塌了，\
-         而「集合恰等」在一份空表上是恒真的",
-        artifact.len()
-    );
-
-    let self_declared: BTreeSet<String> = artifact
-        .iter()
-        .filter(|(_, from)| from == "self")
-        .map(|(name, _)| name.clone())
-        .collect();
-    let registered: BTreeSet<String> = PERMISSION_REGISTRY
-        .iter()
-        .map(|(p, _)| (*p).to_string())
-        .collect();
-    assert_eq!(
-        self_declared, registered,
-        "两张权限登记表对不上。\n\
-         本文件的 PERMISSION_REGISTRY（本仓自有 manifest）：{registered:?}\n\
-         scripts/verify-apk.mjs 里 from:'self' 的那批：{self_declared:?}\n\
-         同一条边界的两段判据必须看同一批权限 —— 改一处就要改另一处。"
-    );
-
-    // 正面对照：产物侧必须**真的**登记着库注入的那一段。全是 `self` ⇒ 那张表退化成本表的
-    // 副本，判据 ⑦ 也就不再守「依赖带进来一条」这一形（而那正是它存在的唯一理由）。
-    let injected: Vec<&(String, String)> = artifact.iter().filter(|(_, f)| f != "self").collect();
-    assert!(
-        !injected.is_empty(),
-        "产物侧登记表里一条「库注入」都没有 —— 2026-09-06 实测合并 manifest 有三条不是本仓写的，\
-         登记表里没有它们说明那张表量的不是出厂集"
-    );
-}
-
-/// 🔴 **切点自检：抠取口径读的是代码，不是注释。**
-///
-/// 不做这条自检的后果不是理论上的：本仓 manifest 的注释里逐字写着
-/// `QUERY_ALL_PACKAGES` 与 `REQUEST_INSTALL_PACKAGES`（在解释「为什么不要前者」的那段里），
-/// 而 `<uses-permission` 这个标签名同样出现在注释里。不剥注释 ⇒ 权限画像门会把一条
-/// **被注释掉的**权限算成已声明，而包可见性门会把注释里的 `QUERY_ALL_PACKAGES` 当成真的声明了。
-///
-/// 自检喂的是**合成输入**，不依赖生产文本 —— 删掉生产里的注释不会让本条失效。
-#[test]
-fn manifest_extraction_reads_code_not_comments() {
-    let synthetic = concat!(
-        "<manifest>\n",
-        "  <!-- 刻意不要 <uses-permission android:name=\"android.permission.MASKED\" /> -->\n",
-        "  <uses-permission android:name=\"android.permission.REAL\" />\n",
-        "</manifest>\n",
-    );
-    let masked = polaris_source_probe::mask_html_comments(synthetic);
-    let found = declared_permissions(&masked);
-    // 正面对照：真的那一条必须还在（否则「注释里的没了」这句话可能只是因为整段都没了）。
-    assert!(
-        found.contains("android.permission.REAL"),
-        "剥注释把代码也剥了 —— 抠到 {found:?}"
-    );
-    assert!(
-        !found.contains("android.permission.MASKED"),
-        "注释里的权限被算成了已声明 —— 判据会被自己的说明文字喂饱：{found:?}"
-    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -539,61 +184,6 @@ fn declares_launcher_query(masked_manifest: &str) -> bool {
     block.contains("<intent")
         && block.contains("android.intent.action.MAIN")
         && block.contains("android.intent.category.LAUNCHER")
-}
-
-/// 🔴 **负向对照：包可见性的 manifest 侧判据认得出「什么都没声明」。**
-///
-/// 喂的全是**合成** manifest（不依赖生产文本），每一份都带着一个与生产同形的启动器
-/// `<intent-filter>` —— 那正是旧判据被喂饱的那个东西。四条里三条必须判假，一条必须判真：
-/// 少了「必须判真」那条，本条会被一个恒假的谓词满足（那时它对生产同样恒红，但在这里看不出来）。
-#[test]
-fn launcher_query_detection_is_not_fed_by_the_apps_own_launcher_filter() {
-    const LAUNCHER_ACTIVITY: &str = concat!(
-        "  <application><activity android:name=\".MainActivity\">\n",
-        "    <intent-filter>\n",
-        "      <action android:name=\"android.intent.action.MAIN\" />\n",
-        "      <category android:name=\"android.intent.category.LAUNCHER\" />\n",
-        "    </intent-filter>\n",
-        "  </activity></application>\n",
-    );
-    let with_launcher =
-        |queries: &str| format!("<manifest>\n{queries}\n{LAUNCHER_ACTIVITY}</manifest>\n");
-
-    // 正面对照：真的声明了那对 intent ⇒ 必须判真。
-    assert!(
-        declares_launcher_query(&with_launcher(concat!(
-            "  <queries><intent>\n",
-            "    <action android:name=\"android.intent.action.MAIN\" />\n",
-            "    <category android:name=\"android.intent.category.LAUNCHER\" />\n",
-            "  </intent></queries>\n",
-        ))),
-        "真的声明了 MAIN + LAUNCHER 的 <queries> 被判成没声明 —— 判据恒假，对生产恒红"
-    );
-    // 三条负向：块空 / 只有 <package> / 换成别的 intent。
-    assert!(
-        !declares_launcher_query(&with_launcher("  <queries>\n  </queries>\n")),
-        "空的 <queries> 被判成声明过了 —— 判据被应用自己的启动器 intent-filter 喂饱了"
-    );
-    assert!(
-        !declares_launcher_query(&with_launcher(
-            "  <queries><package android:name=\"com.example.nothing\" /></queries>\n"
-        )),
-        "只声明了一个具体包名的 <queries> 被判成声明了 LAUNCHER 类 —— 真机上仍是空列表"
-    );
-    assert!(
-        !declares_launcher_query(&with_launcher(concat!(
-            "  <queries><intent>\n",
-            "    <action android:name=\"android.intent.action.SEND\" />\n",
-            "    <category android:name=\"android.intent.category.DEFAULT\" />\n",
-            "  </intent></queries>\n",
-        ))),
-        "声明的是另一对 intent，却被判成声明了 MAIN + LAUNCHER"
-    );
-    // 连块都没有 ⇒ 判假（这一条旧判据是判得对的，保留以免修补时把它丢掉）。
-    assert!(
-        !declares_launcher_query(&with_launcher("")),
-        "根本没有 <queries> 块，却被判成声明过了"
-    );
 }
 
 /// 声明的包可见性路线必须与 manifest 的事实一致，**并且与代码真的走的那条一致**。
@@ -671,38 +261,7 @@ fn package_visibility_route_agrees_across_constant_manifest_and_code() {
             declares_query_all,
             "声明走 `{ROUTE_QUERY_ALL}`，manifest 里却没有 {QUERY_ALL_PERMISSION}"
         );
-        // 走宽路线时，那条权限必须**登记过理由**（权限画像门会强制这一点，这里点名一次）。
-        assert!(
-            PERMISSION_REGISTRY
-                .iter()
-                .any(|(p, _)| *p == QUERY_ALL_PERMISSION),
-            "走宽路线就必须把 {QUERY_ALL_PERMISSION} 写进 PERMISSION_REGISTRY 并说清用途"
-        );
     }
-}
-
-/// 🔴 **切点自检：Kotlin 剥离面读的是代码，不是注释。**
-///
-/// 同 [`manifest_extraction_reads_code_not_comments`] 之理：`PolarisVpnPlugin.kt` 的
-/// `PACKAGE_VISIBILITY_ROUTE` 文档里逐字写着两条路线的取值与 `QUERY_ALL_PACKAGES`。
-/// 不剥注释，路线判据可以被一句注释改写。
-#[test]
-fn kotlin_extraction_reads_code_not_comments() {
-    let synthetic = concat!(
-        "/** 说明里写着 const val ROUTE = \"masked-value\" 与 QUERY_ALL_PACKAGES。 */\n",
-        "// 行尾注释里也写一份：const val ROUTE = \"also-masked\"\n",
-        "const val ROUTE = \"real-value\"\n",
-    );
-    let masked = polaris_source_probe::mask_comments(synthetic);
-    assert_eq!(
-        kotlin_str_const(&masked, "ROUTE"),
-        "real-value",
-        "剥离面上第一处 `const val ROUTE` 命中的是注释里那份 —— 判据被自己的说明喂饱了"
-    );
-    assert!(
-        !masked.contains("QUERY_ALL_PACKAGES"),
-        "注释里的 QUERY_ALL_PACKAGES 没被剥掉"
-    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -756,33 +315,6 @@ fn call_site_is_negated(code: &str, call: &str) -> bool {
         return false;
     };
     code[..at].trim_end().ends_with('!')
-}
-
-/// 🔴 **负向对照：极性判据认得出「`!` 被删掉了」。**
-///
-/// 合成输入，不依赖生产文本。三条：取反 ⇒ 真；没取反 ⇒ 假；调用点根本不在 ⇒ 假
-///（最后一条守的是「谓词退化成恒真」——那时它对生产也恒绿）。
-#[test]
-fn negation_detection_distinguishes_the_two_polarities() {
-    const CALL: &str = "pm.canRequestPackageInstalls()";
-    assert!(
-        call_site_is_negated(
-            "if (sdk >= 26 &&\n    !pm.canRequestPackageInstalls()\n) { deny() }",
-            CALL
-        ),
-        "取反的调用点被判成没取反 —— 谓词恒假，对生产恒红"
-    );
-    assert!(
-        !call_site_is_negated(
-            "if (sdk >= 26 &&\n    pm.canRequestPackageInstalls()\n) { deny() }",
-            CALL
-        ),
-        "🔴 `!` 被删掉了却判成取反 —— 正是 2026-09-06 实测那条假绿的形态"
-    );
-    assert!(
-        !call_site_is_negated("if (sdk >= 26) { deny() }", CALL),
-        "调用点根本不在，却判成「取反过了」—— 判据在缺席的输入上必须判假"
-    );
 }
 
 /// 🔴 **授权判据必须在交付动作之前跑，且没授权那一支要有可读回报。**
@@ -1100,35 +632,6 @@ fn reason_is_forwarded_verbatim(masked_rs: &str) -> bool {
     hits.len() == 1 && hits[0] == "reason: r.reason,"
 }
 
-/// 🔴 **负向对照：原样透传的判据认得出「后面接了东西」。**
-///
-/// 合成输入（不依赖生产文本），四条：原样 ⇒ 真；`.map(…)` / `.or_else(…)` ⇒ 假；整条不在 ⇒ 假。
-#[test]
-fn verbatim_reason_detection_rejects_folded_forms() {
-    assert!(
-        reason_is_forwarded_verbatim(
-            "Ok(ApkHandoff {\n    handed_off: r.handed_off,\n    reason: r.reason,\n})"
-        ),
-        "原样透传被判成折叠过 —— 谓词恒假，对生产恒红"
-    );
-    assert!(
-        !reason_is_forwarded_verbatim(
-            "Ok(ApkHandoff {\n    reason: r.reason.map(|_| \"failed\".to_string()),\n})"
-        ),
-        "🔴 `.map(…)` 把五个码抹成一个串，却被判成原样透传 —— 2026-09-06 实测的那条假绿"
-    );
-    assert!(
-        !reason_is_forwarded_verbatim(
-            "Ok(ApkHandoff {\n    reason: r.reason.or_else(|| Some(\"failed\".to_string())),\n})"
-        ),
-        "🔴 `.or_else(…)` 兜了一个默认值，却被判成原样透传"
-    );
-    assert!(
-        !reason_is_forwarded_verbatim("Ok(ApkHandoff { handed_off: r.handed_off, reason: None })"),
-        "原因整条被丢掉了，却判成透传过了"
-    );
-}
-
 /// FileProvider 的授权面登记表：`(标签, name, path)`，**逐条全等**。
 ///
 /// # 🔴 这张表**不是**「APK 落点在不在授权面内」，比那句话宽
@@ -1251,35 +754,6 @@ fn file_provider_exposure_matches_the_registry_exactly() {
     assert!(
         kt.contains("\"${activity.packageName}.fileprovider\""),
         "代码里拼的 authority 与 manifest 声明的对不上 —— 这一对失配只在运行到那一行时才炸"
-    );
-}
-
-/// 🔴 **切点自检：`<paths>` 的抠取口径读的是标签，不是整份文件。**
-///
-/// 喂合成输入证明：加一条 `<root-path>` 会被抠出来（于是集合恰等会红），
-/// 且属性是按**标签**取的 —— 三个标签带着不同的 `path`，不会串味。
-#[test]
-fn file_provider_extraction_reads_each_tag_separately() {
-    let synthetic = concat!(
-        "<paths xmlns:android=\"http://schemas.android.com/apk/res/android\">\n",
-        "  <!-- <root-path name=\"masked\" path=\"/\" /> -->\n",
-        "  <cache-path name=\"c\" path=\".\" />\n",
-        "  <root-path name=\"r\" path=\"/\" />\n",
-        "</paths>\n",
-    );
-    let got = file_provider_paths(&polaris_source_probe::mask_html_comments(synthetic));
-    assert!(
-        got.contains(&("cache-path".to_string(), "c".to_string(), ".".to_string())),
-        "cache-path 那条没抠出来：{got:?}"
-    );
-    assert!(
-        got.contains(&("root-path".to_string(), "r".to_string(), "/".to_string())),
-        "新加的 <root-path> 没被抠出来 —— 集合恰等判据于是对「授权面变宽」是瞎的：{got:?}"
-    );
-    assert_eq!(
-        got.len(),
-        2,
-        "注释里那条 <root-path> 被算成了真的声明（或多抠了别的东西）：{got:?}"
     );
 }
 

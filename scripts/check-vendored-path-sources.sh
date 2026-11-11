@@ -25,8 +25,7 @@
 #     不能静默算过）。
 #   · 特性取该目标下依赖图实际启用的那一组。swift-rs 的 `build` 特性只由 macOS 宿主的构建依赖
 #     启用，这里编不到 `src-rs/build.rs`；那一段仍只有 macOS 原生腿看得见。
-#   · 副本自带的上限（crate 级 `#![allow(warnings)]`）由
-#     `src-tauri/tests/cross_target_coverage.rs` 的源码级门守；本脚本验的是上限在真工具链上确实生效，
+#   · 本脚本验的是副本自带的上限（crate 级 `#![allow(warnings)]`）在真工具链上确实生效，
 #     以及副本在该目标上编得过。
 set -euo pipefail
 cd "$(dirname "$0")/.."

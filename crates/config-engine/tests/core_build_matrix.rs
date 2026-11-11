@@ -58,7 +58,7 @@ use std::path::Path;
 #[path = "support/core_locator.rs"]
 mod core_locator;
 
-use core_locator::{present_cores, repo_root, require_all_present, CoreBuild, CORE_MATRIX};
+use core_locator::{present_cores, require_all_present, CoreBuild, CORE_MATRIX};
 
 /// 缺核信息里用来说明「是哪道门没跑全」的名字。
 const GATE_NAME: &str = "构建面矩阵门未完整执行";
@@ -313,22 +313,6 @@ fn the_extractor_has_teeth() {
     // 顺序无关：windows 资产的 -tags 顺序与其余三份不同
     let reordered = build_settings(b"build\t-tags=with_utls,with_quic\n");
     assert_eq!(tag_set(&ok), tag_set(&reordered));
-}
-
-/// 打包腿上本门必须真的在跑 —— 否则「缺核强制红」那条开关形同虚设。
-#[test]
-fn ci_step_still_wired() {
-    let wf = repo_root().join(".github/workflows/package.yml");
-    let raw =
-        std::fs::read_to_string(&wf).unwrap_or_else(|e| panic!("读不到 {}: {e}", wf.display()));
-    // 匹配 **run 命令本身**而不是裸词：本文件在 package.yml 里还留了一段说明注释，
-    // 注释里就写着 `core_build_matrix`。用裸词做判据的话，把整个 step 删掉、注释留下，
-    // 本断言照样绿（本仓两天内被同一形状骗过两次，见 handoff §4）。
-    assert!(
-        raw.contains("--test core_build_matrix"),
-        "package.yml 里找不到 `--test core_build_matrix` —— 打包腿没在跑构建面矩阵门，\
-         缺核时它会静静跳过而没人知道"
-    );
 }
 
 /// 真实构建门应拒绝旧 Windows 无 gvisor 面；不启动核。

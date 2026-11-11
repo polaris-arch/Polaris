@@ -657,7 +657,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + '`rustls-platform-verifier` 的唯一消费者，那份 AAR 能不能被 `app/build.gradle.kts` 的 '
       + '`rustlsPlatformVerifierAar()` 真解析出来，同样只有 Gradle 跑一遍才知道。'
       + '🔴 **旧理由（「让接线门与开箱判据都跑一遍」）是假话，别照抄**：接线门 '
-      + '`src-tauri/tests/android_platform_verifier_wiring.rs` 是纯读文件的集成测试，ci.yml 三平台 '
+      + '`src-tauri/tests/android_platform_verifier_wiring.rs` 是纯读文件的集成测试，ci.yml Linux 腿的 '
       + '`cargo test --workspace` 每次都跑，与本腿是否被调用无关；`verify-apk.mjs` 对本文件零判据。'
       + '「不初始化 ⇒ 每次 HTTPS panic 掉一个 tokio worker」是**运行期**语义，而本腿只打包不运行 APK，'
       + '那个形态它一条判据都看不见。',
@@ -960,7 +960,7 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     'app crate 装配根，三处 android cfg：`mod android_tls;`、`android_tls::assert_ready_before_any_https()` '
     + '调用点、`builder.plugin(runtime::proxy::android_bridge::init())`。前两处都有更早更便宜的门 ——'
     + '删 `mod` ⇒ 调用点编不过 ⇒ `cargo check --target aarch64-linux-android -p polaris` 当场红；'
-    + '删调用点 ⇒ 接线门 `src-tauri/tests/android_platform_verifier_wiring.rs` 在三平台 `cargo test` 上红。'
+    + '删调用点 ⇒ 接线门 `src-tauri/tests/android_platform_verifier_wiring.rs` 在 Linux `cargo test` 上红。'
     + '🔴 第三处（插件注册行）**今天没有任何门**，但 APK 腿同样抓不到它：本腿只打包、不运行 APK，'
     + '`register_android_plugin` 是运行期反射。把本文件塞进 ANDROID_IMPACT_SCOPES 不会让那条缝被量到，'
     + '补法是往 check-android-bridge.mjs 加一条「`init()` 必须出现在 `run()` 的 builder 链上」的断言。',
@@ -1003,8 +1003,8 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     + 'A11 只能断言它被 `Builder::new` 真的用上且形状合法，断不了跨语言一致性。'
     + '本批新增的两条腿（`installed_apps` / `hand_apk_to_system_installer`）同样落在上面那几条覆盖里：'
     + '回包元素面多一条 A12（Kotlin 的 `installedApp()` 工厂 ⇄ Rust `InstalledApp`，同源命名配对）；'
-    + '🔴 而「Android 权限画像 / 包可见性 / 安装器不静默失败」三件事**不在这条腿的射程内**，'
-    + '由 `src-tauri/tests/android_native_surface_wiring.rs` 在三平台 `cargo test` 上守（源码级）——'
+    + '🔴 而「Android 包可见性 / 安装器不静默失败」两件事**不在这条腿的射程内**，'
+    + '由 `src-tauri/tests/android_native_surface_wiring.rs` 在 Linux `cargo test` 上守（源码级）——'
     + 'APK 腿同样量不到它们：它只打包、不装、不运行，`canRequestPackageInstalls()` 与 `<queries>` '
     + '的实际效果都要真机才看得见，本批**没有真机证据**。',
   'src-tauri/src/runtime/proxy/startup.rs':
@@ -1358,8 +1358,6 @@ function stdinPaths() {
 // Separate from kernel/package impact: pure Rust logic often has no package
 // impact but still requires native CI. Only existing Node-test content changes
 // on the ordinary main push may reuse the full Linux Node/UI gates instead.
-// Rust test_source_anchors enumerates scripts/ names, so A/D/R/T and mode changes
-// must retain native CI even when the new name looks like a Node test.
 export function classifyNativeImpact(rawDiff) {
   const full = (reason) => ({ nativeRequired: true, reason });
   if (typeof rawDiff !== 'string' || !rawDiff || !rawDiff.endsWith('\0')) return full('missing-or-empty-diff');

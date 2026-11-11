@@ -293,7 +293,7 @@ fn create_main_window(
     // 任何键"这个缺口，不该为一个入口名把它拆掉。故装载面收在这一行，前端侧由
     // `ui/src/mobile/mobile-entry.test.ts` 反查本行存在（入口在、却没人装载 = 门在但没牙）。
     //
-    // 尺寸/最小尺寸仍**只**来自 conf（`main_window_size_comes_only_from_conf` 那道门管的是那件事）：
+    // 尺寸/最小尺寸仍**只**来自 conf：
     // 这里改的是文档 URL，不是几何。
     #[cfg(mobile)]
     {
@@ -598,8 +598,7 @@ pub fn run() {
     //
     // 把 `config.language` 写进本应用 UserDefaults 域的 `AppleLanguages`，让 NSOpenPanel /
     // NSAlert 等 AppKit 自绘的原生 UI 跟随**应用内**语言而非系统语言。为什么这个位置不可挪、
-    // 挪到 `setup` 会让用户要重启两次 —— 见 `app_language` 模块文档；顺序由 `lib.rs` 的
-    // `native_dialog_language_is_applied_before_appkit_boots` 守卫钉住。
+    // 挪到 `setup` 会让用户要重启两次 —— 见 `app_language` 模块文档。
     //
     // `generate_context!()` 提到这里（原先内联在 `.build()` 的实参位）**只为拿 identifier**：
     // 配置路径要用它，而在 `AppHandle` 存在之前只有 context 认得这个值。写死一份
