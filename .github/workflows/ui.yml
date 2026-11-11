@@ -122,6 +122,9 @@ jobs:
         id: browser_forms
         if: ${{ !cancelled() && steps.ui_build.outcome == 'success' }}
         run: |
+          # Azure DNS 曾持续解析不了 azure.archive.ubuntu.com：加公共 DNS 作 resolved 全局解析器并行补位。
+          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8\n" | sudo install -D -m 644 /dev/stdin /etc/systemd/resolved.conf.d/public-dns.conf
+          sudo systemctl restart systemd-resolved
           pnpm exec playwright install --with-deps chromium
           POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts src/hooks/use-subscription-user-agent.browser.test.tsx src/components/screens/settings/tun-preview.browser.test.ts src/mobile/settings/platform-settings.browser.test.tsx src/mobile/connections/log-recovery.browser.test.tsx --maxWorkers=1
           pnpm exec playwright test --config playwright.config.ts
