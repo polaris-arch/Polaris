@@ -1580,7 +1580,7 @@ pub fn build_dns_config(
         //
         // `bypassFakeIP` 的语义是「这个域名别用假 IP、给我真实 IP」，用户会打开它的域名，恰恰是
         // 那些**必须绕开境内 DNS 才拿得到正确解析**的域名（否则他也不需要 bypass）。而
-        // `dns-bootstrap` = 223.5.5.5（见本文件 DoH IP Bootstrap 那节），是**境内**解析器。
+        // `dns-bootstrap` 默认 = 223.5.5.5（内置 Bootstrap 资源，见 `builtin_bootstrap_dns_resource`），是**境内**解析器。
         // 于是旧写法把最需要境外解析的域名精准地送进了最可能被污染的那条路 —— 逃生口朝里开。
         //
         // 这条缺陷从 上游 逐字继承（`singbox-dns-builder.ts` 的 bypass 分支同样写死

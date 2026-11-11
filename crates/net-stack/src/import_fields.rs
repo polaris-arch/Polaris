@@ -58,7 +58,7 @@ pub(crate) fn valid_detour(value: Option<&Value>) -> bool {
 #[derive(Default)]
 pub(crate) struct ImportGraph {
     source_counts: BTreeMap<String, usize>,
-    accepted_tags: BTreeMap<String, String>,
+    pub(crate) accepted_tags: BTreeMap<String, String>,
 }
 impl ImportGraph {
     pub(crate) fn observe(&mut self, tag: Option<&Value>) {

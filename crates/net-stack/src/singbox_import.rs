@@ -1039,6 +1039,34 @@ pub fn parse_singbox_document(
     result.failed += ep.failed;
     result.skipped += ep.skipped;
     result.warnings.extend(ep.warnings);
+    // 节点顺序以订阅自己的 selector/urltest 成员序为准：masque-client 等只能写在 endpoints[]，
+    // 直接拼接会把它们整体排到末尾。未被任何组引用的节点保持「先 outbounds 后 endpoints」（稳定排序）。
+    let mut order: BTreeMap<&str, usize> = BTreeMap::new();
+    for group in outbounds.as_array().into_iter().flatten().filter(|ob| {
+        matches!(
+            ob.get("type").and_then(Value::as_str),
+            Some("selector" | "urltest")
+        )
+    }) {
+        for tag in group
+            .get("outbounds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let next = order.len();
+            order.entry(tag).or_insert(next);
+        }
+    }
+    result.servers.sort_by_key(|server| {
+        graph
+            .accepted_tags
+            .get(&server.id)
+            .and_then(|tag| order.get(tag.as_str()))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
     graph.finish(result)
 }
 

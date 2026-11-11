@@ -1353,6 +1353,44 @@ fn masque_client_that_generation_would_drop_counts_failed() {
         .any(|w| w.contains("3 个") && w.contains("masque-client")));
 }
 
+/// outbounds / endpoints 混排订阅：节点按 selector/urltest 成员首次出现的顺序排列，endpoints 节点
+/// 不再整体落到末尾；未被任何组引用的节点排在其后并保持「先 outbounds 后 endpoints」。节点 id 不随重排变化。
+#[test]
+fn singbox_document_orders_nodes_by_group_members() {
+    let vless = |tag: &str| json!({ "type": "vless", "tag": tag, "server": "e.com", "server_port": 443, "uuid": "u" });
+    let masque = |tag: &str| json!({ "type": "masque-client", "tag": tag, "server": "mq.example.com", "server_port": 443 });
+    let groups = [
+        json!({ "type": "selector", "tag": "G", "outbounds": ["auto", "A", "MQ", "B"] }),
+        json!({ "type": "urltest", "tag": "auto", "outbounds": ["B", "C"] }),
+    ];
+    let nodes = [vless("U"), vless("A"), vless("B"), vless("C")];
+    let doc = json!({
+        "outbounds": groups.iter().chain(&nodes).collect::<Vec<_>>(),
+        "endpoints": [masque("MQ-X"), masque("MQ")],
+    });
+    let r = parse_doc(&doc, ImportOrigin::RemoteSubscription);
+    let names: Vec<&str> = r.servers.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["A", "MQ", "B", "C", "U", "MQ-X"],
+        "{:?}",
+        r.warnings
+    );
+
+    let baseline = parse_doc(
+        &json!({ "outbounds": nodes, "endpoints": doc["endpoints"] }),
+        ImportOrigin::RemoteSubscription,
+    );
+    for s in &r.servers {
+        assert_eq!(
+            s.id,
+            by_name(&baseline, &s.name).id,
+            "重排改变了 {} 的 id",
+            s.name
+        );
+    }
+}
+
 /// Tailcat 本地文件映射：key / DERP 进具名字段，`http_client` 不存并告警（出口由生成侧决定），
 /// servers 模式残留的 region / URL 不存并告警，袋里生成侧会剥的 `server` 不存。
 ///
