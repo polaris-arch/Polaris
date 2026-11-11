@@ -106,8 +106,8 @@ After fetching, CI runs `node scripts/verify-packaging.mjs confs` to check that 
 Payload / asset checks and native acceptance are still required. A successful download, digest verification, and runtime
 acceptance are separate checks.
 
-To import a new desktop core release, maintainers run `node scripts/desktop-core/import-release.mjs <new release-contract.json>`:
-it replaces the contract and regenerates `desktopRelease` and the kernel paragraphs of NOTICE;
+To import a new core release, maintainers run `node scripts/desktop-core/import-release.mjs --tag <core tag>` (requires a logged-in `gh`):
+it reads the GitHub Release, publisher audit artifact and source tree, generates the desktop consumer contract and the source fields of the mobile contract, and regenerates `desktopRelease` and the kernel paragraphs of NOTICE;
 `node scripts/desktop-core/import-release.mjs --check` and `verify-packaging confs` check that the three stay consistent.
 The core ships with the App; this guide does not expose independent user core upload, online replacement, or rollback.
 

@@ -102,8 +102,8 @@ codesign 并记入收据；不能用本机仅下载一个平台的结果替代�
 CI 在 fetch 后通过 `node scripts/verify-packaging.mjs confs` 检查资源存在且非空，
 产物仍须通过后续 payload / assets 与原生验收。下载成功、摘要正确和运行验收是不同检查。
 
-维护者导入新的桌面内核发布时运行 `node scripts/desktop-core/import-release.mjs <新的 release-contract.json>`：
-它替换合同并重新生成 `desktopRelease` 与 NOTICE 的内核段落；`node scripts/desktop-core/import-release.mjs --check`
+维护者导入新的内核发布时运行 `node scripts/desktop-core/import-release.mjs --tag <内核 tag>`（需已登录 `gh`）：
+它从 GitHub 读取 Release、发布审计 artifact 与源码树，生成桌面消费合同和移动端合同的源码字段，并重新生成 `desktopRelease` 与 NOTICE 的内核段落；`node scripts/desktop-core/import-release.mjs --check`
 在 `verify-packaging confs` 中校验三者一致。内核随 App 配套交付；本说明不提供用户独立上传、在线替换或回滚内核的入口。
 
 ### 打包出安装包
