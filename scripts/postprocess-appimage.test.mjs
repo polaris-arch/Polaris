@@ -7,9 +7,9 @@ import { dirname, join } from 'node:path';
 
 import { createHash } from 'node:crypto';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
-import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
+import { cronetFixture, fixtureContract, fixtureManifest } from './lib/cronet-payload.test.mjs';
 
-import { APPIMAGE_CARRIER_MEMBER, verifyTemporaryCarrierReceipt, APPIMAGE_CORE_MEMBER, APPIMAGE_HOST_WAYLAND_LIBS, appImageRuntimeViolations, patchGtkHook, restoreCoreSeed, verifyAppImageMembers } from './postprocess-appimage.mjs';
+import { APPIMAGE_CORE_MEMBER, APPIMAGE_HOST_WAYLAND_LIBS, appImageRuntimeViolations, patchGtkHook, restoreCoreSeed, verifyAppImageMembers } from './postprocess-appimage.mjs';
 
 // 判据与修复同源：`appImageRuntimeViolations` 由 postprocess-appimage.mjs 导出、被
 // verify-packaging.mjs 的 payload 门 import（`verify-packaging.mjs:71` / `:1454`），即
@@ -219,11 +219,11 @@ test('CLI repairs both hook layouts and reaches repack only after the runtime co
     const artifact = join(root, 'Polaris.AppImage');
     writeFileSync(artifact, 'unprocessed');
     seedCoreFixture(root, appDir);
-    mkdirSync(join(root, 'scripts'));
+    mkdirSync(join(root, 'scripts'), { recursive: true });
     const script = join(root, 'scripts/postprocess-appimage.mjs');
     copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
     cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
-    cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
+    cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true, force: false });
     // The plugin is a fixture, but its output is a real SquashFS behind a dummy
     // runtime header. The verifier never executes that header or the core.
     const tool = join(root, 'fixture-output-plugin');
@@ -259,7 +259,7 @@ function seedCoreFixture(root, appDir) {
   writeFileSync(join(dirname(source), 'core-manifest.json'), installation);
   writeFileSync(join(dirname(target), 'core-manifest.json'), installation);
   mkdirSync(join(root, 'src-tauri'), { recursive: true });
-  writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(fixtureManifest(cronet)));
+  writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(fixtureManifest(root, fixtureContract(cronet))));
   return { source, target };
 }
 
@@ -349,11 +349,11 @@ for (const component of ['core', 'cronet']) test(`CLI refuses a repacker changin
   t.after(() => rmSync(graphical, { recursive: true, force: true }));
   renameSync(join(graphical, 'apprun-hooks'), join(appDir, 'apprun-hooks'));
   mkdirSync(join(appDir, GIO_RELATIVE), { recursive: true });
-  mkdirSync(join(root, 'scripts'));
+  mkdirSync(join(root, 'scripts'), { recursive: true });
   const script = join(root, 'scripts/postprocess-appimage.mjs');
   copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
   cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
-  cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
+  cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true, force: false });
   const artifact = join(root, 'Polaris.AppImage');
   writeFileSync(artifact, 'previous-artifact');
   const tool = join(root, 'fixture-output-plugin');
@@ -383,23 +383,27 @@ function linuxPayloadFixture(t) {
   cpSync(appDir, join(bundle, 'deb/package/data'), { recursive: true });
   const packedDir = join(bundle, 'appimage/Polaris.AppDir');
   renameSync(appDir, packedDir);
-  mkdirSync(join(root, 'scripts'));
+  mkdirSync(join(root, 'scripts'), { recursive: true });
   mkdirSync(join(root, 'src-tauri'), { recursive: true });
   for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs', 'release-assets.mjs']) {
     copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));
   }
-  cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
+  cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true, force: false });
   // verify-packaging.mjs 静态 import `./lib/` 下的判据模块；只拷入口不拷它们，CLI 在模块解析期就退出。
   cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
-  writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify({ ...fixtureManifest(cronetFixture('linux')), coreArchiveSha256: { linux: 'fixture' } }));
   writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'Polaris' }));
   const args = [join(root, 'scripts/verify-packaging.mjs'), 'payload', '--label', 'linux', '--root', bundle];
   return { root, args, target: join(packedDir, APPIMAGE_CORE_MEMBER) };
 }
 
-test('Linux payload CLI rejects same-size substituted core bytes in a previously passing bundle', (t) => {
+// Synthetic cores carry no consumed-release receipt, so the formal release gate
+// always fails here; each case asserts its own diagnostic is absent before the fault.
+const onlyReleaseReceipt = (error) => /release artifact\/receipt mismatch/.test(error.message)
+  && !/随包原核 SHA-256|Cronet source\/final/.test(error.message);
+
+test('Linux payload CLI rejects same-size substituted core bytes', (t) => {
   const { args, target } = linuxPayloadFixture(t);
-  execFileSync(process.execPath, args, { stdio: 'pipe' });
+  assert.throws(() => execFileSync(process.execPath, args, { stdio: 'pipe' }), onlyReleaseReceipt);
   const beforeSize = statSync(target).size;
   writeFileSync(target, 'untrusted-core-xxx');
   assert.equal(statSync(target).size, beforeSize);
@@ -409,7 +413,7 @@ test('Linux payload CLI rejects same-size substituted core bytes in a previously
 for (const fault of ['same-size substitution', 'different size same GNU Build ID', 'wrong source SHA', 'symlink']) {
   test(`actual Linux AppImage payload CLI rejects Cronet ${fault}`, (t) => {
     const { root, args, target } = linuxPayloadFixture(t);
-    execFileSync(process.execPath, args, { stdio: 'pipe' });
+    assert.throws(() => execFileSync(process.execPath, args, { stdio: 'pipe' }), onlyReleaseReceipt);
     const cronet = join(dirname(target), 'libcronet.so'), source = join(root, 'resources/linux/libcronet.so');
     const bytes = readFileSync(cronet), changed = Buffer.from(bytes); changed[0x210] ^= 1;
     if (fault === 'same-size substitution') { writeFileSync(cronet, changed); assert.equal(statSync(cronet).size, bytes.length); }
@@ -436,7 +440,7 @@ test('AppImage restores Cronet from the pinned canonical seed, never trusts linu
   assert.deepEqual(readFileSync(target), canonical);
   assert.deepEqual(readFileSync(linked), changed);
   const hash = expected[dirname(APPIMAGE_CORE_MEMBER) + '/libcronet.so'].sha256;
-  assert.equal(hash, fixtureManifest(canonical).cronetLibrarySha256.linux);
+  assert.equal(hash, fixtureContract(canonical).platforms.linux.sidecar.sha256);
   verifyAppImageMembers(packFixture(root, appDir), expected);
   writeFileSync(target, changed);
   assert.throws(() => verifyAppImageMembers(packFixture(root, appDir), expected), /SHA\/权限不符/);
@@ -457,39 +461,3 @@ for (const fault of ['wrong source SHA', 'missing pin', 'source Cronet symlink',
   });
 }
 
-
-function temporaryCarrierFixture(t) {
-  const f = coreFixture(t), expected = restoreCoreSeed(f.appDir, f.root);
-  const source = { schema: 'polaris-native-dns-compiled-source-v2', mode: 'temporary-default',
-    context: { candidate: 'a'.repeat(40), tree: 'b'.repeat(40), attempt: { runId: '123', attempt: '1' } } };
-  const helper = readFileSync(join(dirname(f.source), 'polaris-helper'));
-  const receipt = { schema: 'polaris-native-dns-app-carrier-v1', source, built: {
-    'polaris-helper': { bytes: helper.length, sha256: createHash('sha256').update(helper).digest('hex') },
-  } };
-  const bytes = JSON.stringify(receipt), sourceReceipt = join(dirname(f.source), 'candidate-carrier.json');
-  const finalReceipt = join(f.appDir, APPIMAGE_CARRIER_MEMBER);
-  for (const path of [sourceReceipt, finalReceipt]) writeFileSync(path, bytes, { mode: 0o644 });
-  return { ...f, expected, sourceProof: source, sourceReceipt, finalReceipt };
-}
-
-test('temporary AppImage binds the carrier receipt to source/App/run and final SquashFS bytes', t => {
-  const f = temporaryCarrierFixture(t);
-  const carrier = verifyTemporaryCarrierReceipt(f.root, f.appDir, f.sourceProof);
-  assert.deepEqual(Object.keys(carrier), [APPIMAGE_CARRIER_MEMBER]);
-  const expected = { ...f.expected, ...carrier };
-  verifyAppImageMembers(packFixture(f.root, f.appDir), expected);
-  writeFileSync(f.finalReceipt, readFileSync(f.finalReceipt, 'utf8') + '\n');
-  assert.throws(() => verifyAppImageMembers(packFixture(f.root, f.appDir), expected), /SHA\/权限不符/);
-});
-
-for (const fault of ['wrong source', 'helper changed', 'receipt changed', 'missing receipt', 'linked receipt']) {
-  test(`temporary AppImage carrier refuses ${fault}`, t => {
-    const f = temporaryCarrierFixture(t);
-    if (fault === 'wrong source') f.sourceProof.context.candidate = 'c'.repeat(40);
-    if (fault === 'helper changed') writeFileSync(join(dirname(f.target), 'polaris-helper'), 'changed-helper');
-    if (fault === 'receipt changed') writeFileSync(f.finalReceipt, readFileSync(f.finalReceipt, 'utf8') + '\n');
-    if (fault === 'missing receipt') rmSync(f.finalReceipt);
-    if (fault === 'linked receipt') { rmSync(f.finalReceipt); symlinkSync(f.sourceReceipt, f.finalReceipt); }
-    assert.throws(() => verifyTemporaryCarrierReceipt(f.root, f.appDir, f.sourceProof));
-  });
-}

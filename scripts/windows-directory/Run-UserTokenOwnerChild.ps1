@@ -54,11 +54,8 @@ try {
     Save-ChildEvidence
     $parameters = $config.parameters
     $keys = @($parameters.Keys | Sort-Object)
-    $formal = ($keys -join ',') -ceq 'FormalContract,KernelRoot,OutputDirectory'
-    $candidate = ($keys -join ',') -ceq 'CandidateSourceCommit,KernelRoot,OutputDirectory'
-    if (-not ($formal -xor $candidate)) { throw 'Only fixed acceptance parameters are permitted' }
-    if ($formal -and $parameters.FormalContract -ne $true) { throw 'Formal contract flag must be true' }
-    if ($candidate -and $parameters.CandidateSourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact candidate source SHA required' }
+    if (($keys -join ',') -cne 'FormalContract,KernelRoot,OutputDirectory') { throw 'Only fixed acceptance parameters are permitted' }
+    if ($parameters.FormalContract -ne $true) { throw 'Formal contract flag must be true' }
     if ((Resolve-Path -LiteralPath $parameters.OutputDirectory).Path -cne (Split-Path -Parent (Split-Path -Parent $evidence))) { throw 'Acceptance output and owner evidence directory differ' }
     $state.targetStarted = $true
     Save-ChildEvidence

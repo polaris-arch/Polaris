@@ -775,12 +775,6 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         "Two distinct sites: production core_binary_for_start carries selected candidate data to the closed Mac/Windows issuer, and accepting a helper birth requires NativeBirth capability. Linux keeps its direct sealed-FD/helper LinuxBirth paths; Android/iOS/Other do not acquire desktop Helper execution or a pathname credential from either site.",
     ),
 
-    (
-        "src-tauri/src/runtime/proxy/mesh_apply/candidate.rs",
-        "matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) && !config.proxy_mode_type.effective_on(platform).is_tun() && config.servers.len() == 2 && config.servers.iter().all(|server| server.protocol == Protocol::Tailscale && !polaris_config_engine::builder::endpoint_routes::mesh_uses_system_interface(server) && server.bind_interface.is_none() && server.detour.is_none() && server.custom_settings.is_none() && server.mesh_inbound_policy.is_none()) && config.subscriptions.is_empty() && config.network_interfaces.is_none() && config.network_profiles.is_empty() && !polaris_config_engine::node_dns::enabled(config) && config.singbox_dashboard != Some(true) && raw.get( ).and_then(Value::as_array).is_some_and(|servers| servers.len() == 2 && servers.iter().all(|server|",
-        1,
-        "C1新增完整双TS候选仅限三个桌面userspace且无TUN、系统接口、绑定网卡或原生节点DNS策略；Android/iOS/Other及新平台明确不满足此有限候选，不影响原normal代理/完整builder能力。该比较只候选准入，不签check/Ready/managed出生或NoOwner。",
-    ),
 ];
 
 // ===================== 判据本体 =====================
@@ -2043,12 +2037,6 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
         1,
         "双模式 Clash 投影仅给已有管理 API 的 Android JNI 宿主；iOS/未知平台不因此取得该投影或管理能力，须先接入自己的管理 API 面。",
     ),
-    (
-        "src-tauri/src/runtime/proxy/mesh_apply/candidate.rs",
-        ", target_os: deps.platform.clone(), target_arch: deps.arch.clone(), ports: PortsProvenance::ProbedNumbersNotReserved, interface_binding: SubsetApplicability::NotRequiredByValidatedNonTunSubset, check_support: if !userspace_mesh && deps.platform == \"linux\" && deps.arch == \"x86_64\" && plain_tcp",
-        1,
-        "严格候选核检查仍只支持 Linux x86_64 plain TCP VLESS子集；新增userspace_mesh即使在Linux也明确Unsupported，不能借原TCP核证明许可双TS。其它平台/架构、Android/iOS/未知平台也Unsupported；候选不是Ready/managed出生，原normal功能与plainTCP形态保留。",
-    ),
 
 ];
 
@@ -2868,11 +2856,11 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/lib.rs",
         "desktop",
-        11,
+        10,
         IosSide::WithAndroid,
         "桌面专属插件与窗口装配（single-instance / autostart / 托盘锚点 / 窗口铬…），\
-         以及两处只对独立内核可执行文件成立的启动步骤（清理旧版本内核残留目录、把随包内核\
-         路径注入版本读取）：移动端的内核在进程内，没有这两件事的对象。\
+         以及一处只对独立内核可执行文件成立的启动步骤（把随包内核路径注入版本读取）：\
+         移动端的内核在进程内，没有这件事的对象。\
          另加 native acceptance driver 的 desktop 属性，与独立 feature、debug_assertions 属性仍作合取；移动端和 release 无此 driver。两个移动平台同侧。**其中 single-instance 那条的既有理由只写了 Android**\
          （「应用默认单进程 + tun fd 由 VpnService.prepare() 仲裁」）；iOS 的等价物是\
          「系统本就不允许同一 app 起第二个进程实例」+「`NEVPNManager` 侧的隧道单例」，\
@@ -2883,7 +2871,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "desktop",
         1,
         IosSide::WithAndroid,
-        "The separate hold_native_production_verification_session export has its own desktop attribute, conjunctive with native-production-verification and debug_assertions. Android/iOS both exclude this fixed caller-private session holder; release excludes it independently. It prepares data coordination only, never installs or grants a native provider. The eleven existing desktop sites and every historical mobile debt remain unchanged.",
+        "The separate hold_native_production_verification_session export has its own desktop attribute, conjunctive with native-production-verification and debug_assertions. Android/iOS both exclude this fixed caller-private session holder; release excludes it independently. It prepares data coordination only, never installs or grants a native provider. The ten existing desktop sites and every historical mobile debt remain unchanged.",
     ),
     (
         "src-tauri/src/lib.rs",
@@ -3384,13 +3372,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "七处 Android reconnect、主核 claim/drain/stop；普通与 owned Stop 状态共用同一 guard 外 reconnect/native bridge 投影，不保留重复平台分支。原 JNI instance 分派保持。iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
     ),
 
-    (
-        "src-tauri/src/runtime/proxy/process_supervision/direct_stop.rs",
-        "target_os = \"android\"",
-        3,
-        IosSide::DiffersWrongToday,
-        "三个 direct-stop 入口仅拒绝 Android/已有 helper，iOS 当前仍进入桌面 Child custody；iOS 不提供此 Child，需 NE 扩展 birth/stop adapter 后再收紧平台闭集。",
-    ),
 
 
     (
@@ -3437,13 +3418,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         1,
         IosSide::WithAndroid,
         "Android/iOS 默认 UA 与随包版本展示读取各自构建共同消费的 mobile source-contract version，与 builder 链接 constant.Version 同源，不启动内核或改变更新策略。",
-    ),
-    (
-        "src-tauri/src/runtime/updater.rs",
-        "target_os = \"ios\"",
-        1,
-        IosSide::DiffersRight,
-        "旧 bundled_core_version_from_manifest 已仅供 cfg(test) 兼容夹具；生产文件扫描仍计入其内部 cfg!(ios)，谓词本身 iOS=true、Android=false。实际 UA/版本展示改用 core_version 的所选构建身份，本条不再宣称生产旧版本路径可达，也不新增更新能力或设备验收。",
     ),
     (
         "src-tauri/src/runtime/updater.rs",
@@ -3673,30 +3647,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/speedtest.rs",
         "not(target_os = \"android\")",
-        10,
+        7,
         IosSide::DiffersWrongToday,
-        "F1给PC Temp补原producer登记：PcTempBatchProducer/Dispatch及其Drop、TempProducerView与impl、pc_temp_producer_view六处定义，run_batch的登记/传参/finished三处与run_admitted_batch的producer形参。同谓词组仍含iOS不适用的桌面Child起核/收割链，原21/8子计数和理由保留；新10保守组级登记，不是十个新增iOS运行错误。iOS产品入口仍拒独立temp，这些metadata不授出生、退出或NoOwner证明。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
-        "not(any(target_os = \"android\", target_os = \"ios\"))",
-        4,
-        IosSide::WithAndroid,
-        "pause_pc_producers、original_members、seal、surrender四个PC producer暂停/普查/交还入口只在桌面编译；两移动端同不编译，无法取得PcPauseBorrow或封存成员。该普查只登记原责任，不签NoOwner、StopLease或managed出生。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
-        "not(target_os = \"android\")",
-        2,
-        IosSide::DiffersWrongToday,
-        "OriginalMembers的temp字段与member_counts的Temp计数随speedtest.rs里TempProducerView的可见性写成非Android；iOS因此编进桌面Temp producer视图，而它没有独立temp核，应与Android同答。今天不可达：唯一构造点original_members仅桌面编译。改成与四个入口同谓词须先有iOS编译面取收据，登记为债而不凭推断改写。",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
-        "target_os = \"android\"",
-        1,
-        IosSide::DiffersRight,
-        "member_counts在Android上Temp成员恒报0：Android测速走进程内libbox，没有PC Temp custody可普查。iOS不编此腿；它错误继承桌面Temp视图的事实在同文件not(android)条目单独登记为债。",
+        "F1给PC Temp补原producer登记：PcTempBatchProducer/Dispatch及其Drop三处定义，run_batch的登记/传参/finished三处与run_admitted_batch的producer形参。同谓词组仍含iOS不适用的桌面Child起核/收割链，原21/8子计数和理由保留；新7保守组级登记，不是七个新增iOS运行错误。iOS产品入口仍拒独立temp，这些metadata不授出生、退出或NoOwner证明。",
     ),
     // G4 source-only accounting; historical debt verdicts remain intact.
     (
@@ -4506,15 +4459,20 @@ fn cfg_axis_platform_dispatch_is_registered() {
 // two management test adapters and retire two absent TLS attributes (Path and
 // capabilities-for are now unconditional); those last changes cancel in count.
 // No existing iOS debt is repaid, and no iOS runtime evidence is claimed.
+// Managed mesh coordinator deletion: pc_owner_census.rs (4 WithAndroid, 1 Right, 2 WrongToday),
+// the dormant direct_stop worker (3 WrongToday) and the speedtest Temp producer view
+// (3 WrongToday) disappear with the guarded code; the test-only updater cfg!(ios) fixture
+// (1 Right) is already gone; the lib.rs legacy core-state cleanup (1 desktop, WithAndroid)
+// is deleted. No debt is reclassified; its objects no longer exist.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // A175 retires 24 private runtime acceptance sites; six ordinary debug sites remain.
     // This changes no surviving iOS verdict or debt site.
     ("DiffersOnlyInDebug", 6),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 337),
+    ("DiffersRight", 335),
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
-    ("DiffersWrongToday", 148),
+    ("DiffersWrongToday", 140),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1).
     // TLS presentation adds five more: core_info (1 + 1), core_identity (2),
     // and tls_capabilities (1). eval_cfg checks Android/iOS in release/debug.
@@ -4525,7 +4483,7 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // obsolete TLS wrapper retires two. Standalone debug carrier attributes do
     // not mention the mobile axis. No existing debt site changes.
     // R15: one separate debug/feature/desktop session-holder export; no debt changed.
-    ("WithAndroid", 149),
+    ("WithAndroid", 144),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -4595,16 +4553,6 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         7,
     ),
     (
-        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
-        "not(target_os = \"android\")",
-        2,
-    ),
-    (
-        "src-tauri/src/runtime/proxy/process_supervision/direct_stop.rs",
-        "target_os = \"android\"",
-        3,
-    ),
-    (
         "src-tauri/src/runtime/proxy/startup.rs",
         "not(target_os = \"android\")",
         3,
@@ -4617,12 +4565,12 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/speedtest.rs",
         "not(target_os = \"android\")",
-        8,
+        7,
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",
         "not(target_os = \"android\")",
-        10,
+        8,
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",

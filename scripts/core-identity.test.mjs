@@ -91,8 +91,7 @@ function assertBuildDelegation(entry, selected) {
   const main = rustMask(rustFunction(entry, 'main')).replace(/\s+/g, '');
   assert.equal((main.match(/(?<![\w:])selected_core::emit\(\);/g) ?? []).length, 1);
   const emit = rustMask(rustFunction(selected, 'emit')).replace(/\s+/g, '');
-  for (const name of ['embed_validation_core_source', 'embed_selected_core_identity'])
-    assert.equal((emit.match(new RegExp(`(?<![\\w:])${name}\\(\\);`, 'g')) ?? []).length, 1);
+  assert.equal((emit.match(/(?<![\w:])embed_selected_core_identity\(\);/g) ?? []).length, 1);
 }
 test('App build delegates selection to the exact shared module and emit entry', () => {
   assertBuildDelegation(buildEntry, buildSource);
@@ -120,10 +119,8 @@ test('shared build delegation rejects commented, literal and duplicate Rust evid
     `/*\n${emit}\n*/\n` + buildSource.replace('fn emit(', 'fn renamed_emit('),
     `const FAKE: &str = r###"${emit}"###;\n` + buildSource.replace('fn emit(', 'fn renamed_emit('),
     `${buildSource}\n${emit}`,
-    ...['embed_validation_core_source', 'embed_selected_core_identity'].flatMap(name => [
-      buildSource.replace(`${name}();`, `/* ${name}(); */ unreviewed_selection();`),
-      buildSource.replace(`${name}();`, `let _ = "${name}();"; unreviewed_selection();`),
-    ]),
+    buildSource.replace('embed_selected_core_identity();', '/* embed_selected_core_identity(); */ unreviewed_selection();'),
+    buildSource.replace('embed_selected_core_identity();', 'let _ = "embed_selected_core_identity();"; unreviewed_selection();'),
   ]) assert.throws(() => assertBuildDelegation(buildEntry, changed), assert.AssertionError);
 });
 function assertBuildDigestSource(source) {
@@ -133,11 +130,9 @@ function assertBuildDigestSource(source) {
     'sha2 digest arrays require per-byte lowercase, zero-padded hex');
   const identity = rustFunction(source, 'embed_selected_core_identity');
   assert.match(identity, /InstalledCoreManifest::parse\(&raw, sha256_hex\)/,
-    'manifest identity and candidate fingerprint must share the encoder');
-  assert.match(identity, /if !temporary_default && std::env::var_os\("POLARIS_NATIVE_DNS_CANDIDATE"\)\.is_none\(\) \{\s*let candidate_fingerprint = sha256_hex\(\s*&std::fs::read\(\s*repository_root\(\)\.join\("scripts\/desktop-core\/native-dns-candidate\.json"\),?\s*\)\s*\.expect\("candidate contract"\),?\s*\);\s*assert_ne!\(\s*manifest\.core\.provider_fingerprint, candidate_fingerprint,/,
-    'formal builds must reject the fingerprint of the exact candidate contract bytes');
+    'manifest identity must use the shared encoder');
 }
-test('build identity shares byte-wise SHA-256 encoding and keeps the candidate exclusion', () => {
+test('build identity shares byte-wise SHA-256 encoding', () => {
   assertBuildDigestSource(buildSource);
 });
 
@@ -219,66 +214,29 @@ test('candidate carrier cannot synthesize missing helper or Windows cleaner hash
   assert.throws(() => verifySelectedCoreManifest(root, root, 'win'), /actual cleaner pin/);
 });
 
-function assertTemporaryBuildSource(source) {
-  assert.match(rustFunction(source, 'desktop_platform'), /std::env::var\("CARGO_CFG_TARGET_ARCH"\)/);
-  assert.match(rustFunction(source, 'temporary_desktop_default'), /desktop_platform\(\)\.is_some\(\) && manifest\.get\("desktopTemporary"\)\.is_some\(\)/);
-  const validation = rustFunction(source, 'embed_validation_core_source');
-  assert.match(validation, /assert_eq!\(\s*source\["schema"\], "polaris-native-dns-compiled-source-v2"\)/);
-  assert.match(validation, /assert_eq!\(source\["validationOnly"\], false\)/);
-  assert.match(validation, /assert_eq!\(source\["purpose"\], "temporary-default"\)/);
-  assert.match(validation, /assert_eq!\(source\["context"\]\["mode"\], "temporary-default"\)/);
-  source = rustFunction(source, 'embed_selected_core_identity');
-  assert.match(source, /\(temporary_default \|\| formal_default\)\.then\(\|\| \{\s*root\.join\("resources"\)\s*\.join\(desktop_platform\(\)\.expect\("desktop target"\)\)/);
-  assert.match(source, /assert_eq!\(\s*manifest\.core\.provider_fingerprint,\s*sha256_hex\(\s*&std::fs::read\(\s*repository_root\(\)\s*\.join\("scripts\/desktop-core\/native-dns-candidate\.json"\)/);
-  const temporaryVerify = source.slice(source.indexOf('if temporary_default || std::env::var_os'), source.indexOf('if formal_default &&'));
-  assert.match(temporaryVerify, /assert_eq!\(\s*path,\s*directory\.join\("core-manifest.json"\)/);
-  assert.match(temporaryVerify, /\.arg\("--mode=verify"\)/);
-  assert.match(source, /assert!\(\s*verified\.status\.success\(\),\s*"candidate App identity verification failed/);
-  assert.match(source, /raw,\s*std::fs::read\(&path\)\.expect\("verified identity remains readable"\)/);
-}
-test('temporary desktop compilation binds target, actual source, exact path and verified carrier', () => {
-  assertTemporaryBuildSource(buildSource);
-});
-
 function assertUnavailableAnalysisSource(source) {
-  const pending = rustFunction(source, 'temporary_installation_pending');
-  assert.match(pending, /!temporary_default/);
-  assert.match(pending, /var_os\("POLARIS_NATIVE_DNS_CANDIDATE"\)\.is_some\(\)/);
+  const pending = rustFunction(source, 'installation_pending');
+  assert.match(pending, /!formal_default/);
   assert.match(pending, /var_os\("POLARIS_CORE_IDENTITY_FILE"\)\.is_some\(\)/);
-  assert.match(pending, /\["core-manifest.json", "candidate-carrier.json"\]/);
+  assert.match(pending, /\.join\("core-manifest.json"\)/);
   assert.match(pending, /symlink_metadata\(&path\)\.is_ok\(\) \{\s*return false;/);
   assert.match(pending, /try_exists\(\)\s*\.expect\("inspect selected installation path"\)/);
-  assert.match(source, /const TEMPORARY_UNAVAILABLE: &\[u8\] =\s*br#"\{"schema":"polaris-temporary-desktop-unavailable-v1"\}"#/);
-  assert.equal((rustFunction(source, 'embed_validation_core_source').match(/temporary_installation_pending\(temporary_default\)/g) ?? []).length, 1);
-  assert.match(rustFunction(source, 'embed_selected_core_identity'), /temporary_installation_pending\(temporary_default \|\| formal_default\)/);
+  assert.match(source, /const FORMAL_UNAVAILABLE: &\[u8\] =\s*br#"\{"schema":"polaris-formal-desktop-unavailable-v1"\}"#/);
+  assert.match(rustFunction(source, 'embed_selected_core_identity'), /installation_pending\(formal_default\)/);
 }
 test('analysis image cannot silently use a missing or partially frozen desktop identity', () => {
   assertUnavailableAnalysisSource(buildSource);
 });
-test('temporary default freezes staged signed helper bytes once, while manual preparation remains isolated', () => {
-  const source = readFileSync(new URL('./prepare-core-identity.mjs', import.meta.url), 'utf8');
-  const start = source.indexOf("if (mode === 'prepare' && temporaryDefault && !candidateMode) {");
-  const end = source.indexOf("} else if (mode === 'prepare') {", start);
-  assert.ok(start >= 0 && end > start);
-  const staged = source.slice(start, end);
-  assert.match(staged, /actualCoreFile\(join\(directory, name\)\)/);
-  assert.match(staged, /!existsSync\(join\(directory, 'candidate-carrier.json'\)\)/);
-  assert.match(staged, /!existsSync\(join\(directory, 'core-manifest.json'\)\)/);
-  assert.doesNotMatch(staged, /freezeCandidateBuildOutput|copyFileSync|target\/debug/);
-  assert.match(source.slice(end), /freezeCandidateBuildOutput\(root, directory, name\)/);
-});
-
 function assertFormalBuildSource(source) {
-  const selection = rustFunction(source, 'upstream_desktop_default');
+  const selection = rustFunction(source, 'formal_desktop_selection');
   assert.match(selection, /desktop_platform\(\)\.is_none\(\)/);
-  assert.match(selection, /manifest\.get\("desktopTemporary"\)\.is_none\(\)/);
   assert.match(selection, /selection\["contractSha256"\]\.as_str\(\),\s*Some\(sha256_hex\(&raw\)\.as_str\(\)\)/);
-  assert.match(selection, /contract\["schema"\] != "polaris-upstream-native-release-consumer-v1"/);
-  assert.match(selection, /assert_eq!\(\s*path,\s*"scripts\/desktop-core\/release-contract.json"/);
+  assert.match(selection, /assert_eq!\(\s*selection\["contractPath"\]\.as_str\(\),\s*Some\(CONTRACT_PATH\)/);
+  assert.match(source, /const CONTRACT_PATH: &str = "scripts\/desktop-core\/release-contract.json";/);
   source = rustFunction(source, 'embed_selected_core_identity');
-  assert.match(source, /temporary_installation_pending\(temporary_default \|\| formal_default\)/);
-  assert.match(source, /\(temporary_default \|\| formal_default\)\.then\(/);
-  const verify = source.match(/if formal_default &&[\s\S]*?(?=\n            assert_eq!\(\s*manifest.core.platform)/)?.[0] ?? '';
+  assert.match(source, /installation_pending\(formal_default\)/);
+  assert.match(source, /formal_default\.then\(/);
+  const verify = source.match(/if formal_default \{[\s\S]*?(?=\n            assert_eq!\(\s*manifest.core.platform)/)?.[0] ?? '';
   assert.match(verify, /directory = root.join\("resources"\).join\(platform\)/);
   assert.match(verify, /assert_eq!\(\s*path,\s*directory.join\("core-manifest.json"\)/);
   assert.match(verify, /\.arg\("--mode=verify"\)/);
@@ -293,77 +251,3 @@ test('formal default compiles only exact verified installation with real helper 
   assert.match(prepare, /actualCoreFile\(join\(directory, 'polaris-cleaner.exe'\)\).sha256 !== old.core.cleanerSha256/);
 });
 
-
-test('App check identity uses shared compiled inputs and retains its Linux x86_64 test-only caller', () => {
-  const runtime = sourceText('../src-tauri/src/runtime/core_identity.rs');
-  const selected = sourceText('../crates/core-supervisor/src/selected_core.rs');
-  const caller = sourceText('../src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs');
-  const cfg = '#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]';
-  const declaration = '#[cfg(all(target_os = "linux", target_arch = "x86_64"))]\n#[cfg(test)]\npub(crate) use polaris_core_supervisor::selected_core::selected_check_source;';
-  const sourceDeclaration = 'pub(crate) fn selected_source_commit(';
-  const itemAttributes = (source, item) => {
-    const code = rustMask(source), at = code.indexOf(item);
-    assert.ok(at >= 0, `missing actual Rust item: ${item}`);
-    assert.equal(code.indexOf(item, at + item.length), -1, `duplicate Rust item: ${item}`);
-    return rustMask(source, false).slice(0, at).match(/(?:^|\n)((?:#\[[^\n]*\]\n)*)$/)?.[1] ?? '';
-  };
-  const check = (source, shared = selected, actualCaller = caller) => {
-    assert.ok(source.includes(declaration), 'App check identity must re-export the exact shared provider only in Linux x86_64 tests');
-    const functionAt = source.indexOf('pub(crate) use polaris_core_supervisor::selected_core::selected_check_source;');
-    const attributes = source.slice(source.lastIndexOf('\n\n', functionAt) + 2, functionAt);
-    assert.doesNotMatch(attributes, /#\[(?:allow|expect)\(dead_code\)\]/);
-    assert.equal(itemAttributes(source, 'pub(crate) use polaris_core_supervisor::selected_core::selected_check_source;'),
-      declaration.slice(0, declaration.indexOf('pub(crate)')));
-    assert.equal(itemAttributes(source, sourceDeclaration), '', 'real desktop TLS selection requires the portable production wrapper');
-    const wrapper = rustMask(rustFunction(source, 'selected_source_commit'));
-    assert.match(wrapper, /check_compiled_selection\(\)\?;\s*polaris_core_supervisor::selected_core::selected_source_commit\(platform\)/);
-    const provider = rustMask(rustFunction(shared, 'selected_check_source'));
-    assert.match(provider, /let selected = selected_manifest\(platform\)\?;/);
-    assert.match(provider, /let source = selected_source_commit\(platform\)\?;/);
-    assert.match(provider, /sha256_hex\(selected_contract\(\)\?\.as_bytes\(\)\)/);
-    assert.match(provider, /compiled_source\(COMPILED_VALIDATION_SOURCE, platform\)\?/);
-    assert.match(provider, /digest != selected\.provider_fingerprint/);
-    assert.doesNotMatch(provider, /std::env|var_os|std::fs/);
-    assert.match(rustFunction(shared, 'selected_source_commit'), /selected_source_from\(COMPILED_VALIDATION_SOURCE, platform\)/);
-    assert.match(rustFunction(shared, 'selected_source_from'), /compiled_source\(compiled, platform\)\?/);
-    assert.ok(actualCaller.includes(`${cfg}\npub(super) fn selected_core_for_test()`));
-    const callerAt = actualCaller.indexOf('pub(super) fn selected_core_for_test()');
-    assert.doesNotMatch(actualCaller.slice(actualCaller.lastIndexOf('\n\n', callerAt) + 2, callerAt),
-      /#\[(?:allow|expect)\(dead_code\)\]/);
-    assert.equal((actualCaller.match(/core_identity::selected_check_source\("linux"\)/g) ?? []).length, 1);
-  };
-  check(runtime);
-  const actualProvider = rustFunction(selected, 'selected_check_source');
-  const renamedProvider = selected.replace('fn selected_check_source(', 'fn renamed_provider(');
-  for (const changed of [
-    `/*\n${actualProvider}\n*/\n${renamedProvider}`,
-    `const FAKE: &str = r####"${actualProvider}"####;\n${renamedProvider}`,
-    `${selected}\n${actualProvider}`,
-  ]) assert.throws(() => check(runtime, changed), assert.AssertionError);
-  for (const replacement of ['#[cfg(test)]', '#[cfg(target_os = "linux")]',
-    '#[cfg(all(test, target_os = "linux", target_arch = "aarch64"))]',
-    '#[allow(dead_code)]\n' + cfg]) {
-    const changed = caller.replace(`${cfg}\npub(super) fn selected_core_for_test()`, `${replacement}\npub(super) fn selected_core_for_test()`);
-    assert.notEqual(changed, caller);
-    assert.throws(() => check(runtime, selected, changed));
-  }
-  for (const replacement of ['', '#[cfg(test)]\n', cfg + '\n', '#[allow(dead_code)]\n' + declaration.slice(0, declaration.indexOf('pub(crate)'))]) {
-    const changed = runtime.replace(declaration, replacement + declaration.slice(declaration.indexOf('pub(crate)')));
-    assert.notEqual(changed, runtime);
-    assert.throws(() => check(changed));
-  }
-  for (const [before, after] of [
-    ['let selected = selected_manifest(platform)?;', 'let selected = unverified_manifest(platform)?;'],
-    ['let source = selected_source_commit(platform)?;', 'let source = env_source(platform)?;'],
-    ['sha256_hex(selected_contract()?.as_bytes())', 'sha256_hex(b"unverified")'],
-    ['digest != selected.provider_fingerprint', 'false'],
-  ]) {
-    const changed = selected.replace(before, after); assert.notEqual(changed, selected);
-    assert.throws(() => check(runtime, changed));
-  }
-  for (const attribute of ['#[cfg(any(windows, test))]', cfg, '#[cfg(feature = "native-production-verification")]']) {
-    const narrowed = runtime.replace(sourceDeclaration, `${attribute}\n${sourceDeclaration}`);
-    assert.notEqual(narrowed, runtime);
-    assert.throws(() => check(narrowed), 'portable production selection must not be narrowed to a helper or verification build');
-  }
-});

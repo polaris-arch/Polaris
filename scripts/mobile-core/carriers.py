@@ -172,7 +172,7 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     # deployment floor. Require current native facts, even with correct plists.
     minimum = apple_version_raw(value['apple']['appMinimumOS'])
     sdk = apple_version_raw(value['apple']['simulatorSDK' if simulator_arch else 'iPhoneSDK'])
-    helper = module('final_mobile_info', 'scripts/libbox-patches/android-source.py')
+    helper = module('final_mobile_info', 'scripts/mobile-core/android-source.py')
     parser = module('final_mobile_carrier', 'scripts/apple-carrier.py')
     with inspection_stage('ipa-parse'):
         with zipfile.ZipFile(ipa) as archive:

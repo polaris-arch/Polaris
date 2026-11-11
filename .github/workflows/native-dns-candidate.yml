@@ -2,24 +2,13 @@ name: Native DNS Candidate
 
 # Technical validation only. Formal inputs must already be committed; no selection change, packaging, publication or mobile acceptance.
 on:
-  workflow_dispatch:
-    inputs:
-      candidate:
-        description: Exact App commit on collab/native-node-dns-20261018; must equal workflow SHA
-        type: string
-        required: true
-        default: ''
   workflow_call:
     inputs:
       candidate:
-        description: Exact admitted App commit from the same-commit manual CI caller
+        description: Exact admitted App commit from the same-commit CI caller
         type: string
         required: true
         default: ''
-      formal_release:
-        description: Validate the caller-selected committed strict upstream release
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -30,7 +19,6 @@ defaults:
 
 env:
   CORE_CANDIDATE: ${{ inputs.candidate }}
-  NATIVE_DNS_FORMAL_INPUT: ${{ inputs.formal_release && '1' || '' }}
 
 jobs:
   admit:
@@ -41,19 +29,16 @@ jobs:
         run: |
           node - <<'NODE'
           const e = process.env;
-          // Formal reuse retains the ordinary CI caller's event; historical manual
-          // candidate dispatch retains its original fixed branch and workflow list.
-          const formal = e.NATIVE_DNS_FORMAL_INPUT === '1';
-          const workflows = formal ? ['ci.yml', 'package.yml'] : ['native-dns-candidate.yml', 'ci.yml'];
-          if ((e.NATIVE_DNS_FORMAL_INPUT && !formal) || e.GITHUB_ACTIONS !== 'true'
-            || (formal ? !['push', 'pull_request', 'merge_group', 'workflow_dispatch'].includes(e.GITHUB_EVENT_NAME) : e.GITHUB_EVENT_NAME !== 'workflow_dispatch')
+          // Formal reuse retains the ordinary CI caller's event.
+          if (e.GITHUB_ACTIONS !== 'true'
+            || !['push', 'pull_request', 'merge_group', 'workflow_dispatch'].includes(e.GITHUB_EVENT_NAME)
             || e.GITHUB_REPOSITORY !== 'polaris-arch/Polaris' || e.GITHUB_REPOSITORY_ID !== '1347028220'
-            || (formal ? !/^refs\/(heads|tags|pull)\/.+/.test(e.GITHUB_REF ?? '') : e.GITHUB_REF !== 'refs/heads/collab/native-node-dns-20261018')
+            || !/^refs\/(heads|tags|pull)\/.+/.test(e.GITHUB_REF ?? '')
             || !/^[a-f0-9]{40}$/.test(e.CORE_CANDIDATE ?? '') || e.CORE_CANDIDATE !== e.GITHUB_SHA
-            || !workflows.some((name) => e.GITHUB_WORKFLOW_REF === `polaris-arch/Polaris/.github/workflows/${name}@${e.GITHUB_REF}`)
+            || !['ci.yml', 'package.yml'].some((name) => e.GITHUB_WORKFLOW_REF === `polaris-arch/Polaris/.github/workflows/${name}@${e.GITHUB_REF}`)
             || !/^[1-9][0-9]*$/.test(e.GITHUB_RUN_ID ?? '') || !/^[1-9][0-9]*$/.test(e.GITHUB_RUN_ATTEMPT ?? '')
             || e.POLARIS_NO_KERNEL_RUN === '1')
-            throw Error('Exact native DNS manual candidate context required');
+            throw Error('Exact native DNS formal context required');
           NODE
   validate:
     needs: admit
@@ -82,25 +67,19 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
-      - name: Verify exact manual candidate context
+      - name: Verify exact formal context
         run: |
           set -euo pipefail
           [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
           [ "$(git rev-parse HEAD)" = "$CORE_CANDIDATE" ]
           node --input-type=module - <<'NODE'
           import {appendFileSync} from 'node:fs';
-          import {candidateContext} from './scripts/desktop-core/native-dns-candidate.mjs';
           import {formalGateContext} from './scripts/desktop-core/native-dns-gates.mjs';
           const e = process.env;
           for (const key of ['POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_FORMAL', 'POLARIS_SINGBOX_PATH'])
             if (Object.hasOwn(e, key)) throw Error(`Validation mode must not precede admission: ${key}`);
-          if (e.NATIVE_DNS_FORMAL_INPUT === '1') {
-            formalGateContext(process.cwd(), e);
-            appendFileSync(e.GITHUB_ENV, 'POLARIS_NATIVE_DNS_FORMAL=1\n');
-          } else {
-            candidateContext(e.CORE_CANDIDATE, {...e, POLARIS_NATIVE_DNS_CANDIDATE: '1'}, process.cwd());
-            appendFileSync(e.GITHUB_ENV, 'POLARIS_NATIVE_DNS_CANDIDATE=1\nPOLARIS_NATIVE_PAYLOAD_VALIDATION=1\n');
-          }
+          formalGateContext(process.cwd(), e);
+          appendFileSync(e.GITHUB_ENV, 'POLARIS_NATIVE_DNS_FORMAL=1\n');
           NODE
       - uses: actions/setup-python@v6
         with:
@@ -111,12 +90,9 @@ jobs:
         id: go-pin
         run: |
           node --input-type=module - <<'NODE' >> "$GITHUB_OUTPUT"
-          import {loadCandidate} from './scripts/desktop-core/native-dns-candidate.mjs';
           import {loadFormalGateSelection} from './scripts/desktop-core/native-dns-gates.mjs';
           import {releaseGoVersion} from './scripts/desktop-core/source-graph.mjs';
-          const version = process.env.POLARIS_NATIVE_DNS_FORMAL === '1'
-            ? releaseGoVersion(loadFormalGateSelection(process.cwd())).replace(/^go/, '')
-            : loadCandidate(process.cwd()).sourcePolicy.goVersion;
+          const version = releaseGoVersion(loadFormalGateSelection(process.cwd())).replace(/^go/, '');
           console.log(`version=${version}`);
           NODE
       - uses: actions/setup-go@v6
@@ -174,24 +150,12 @@ jobs:
         run: |
           set -euo pipefail
           [ "$(protoc --version)" = "$PROTOC_EXPECT" ]
-      - name: Acquire four exact temporary desktop payloads
-        if: ${{ inputs.formal_release != true }}
-        env:
-          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
-        run: node scripts/desktop-core/native-dns-candidate.mjs acquire --candidate="$CORE_CANDIDATE"
       - name: Acquire four committed strict formal desktop payloads
-        if: ${{ inputs.formal_release == true }}
         env:
           POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
         run: node scripts/fetch-core.mjs
       - name: Verify candidate checkout and all payload bytes
-        run: |
-          set -euo pipefail
-          if [ "${POLARIS_NATIVE_DNS_FORMAL:-}" = 1 ]; then
-            node scripts/desktop-core/native-dns-gates.mjs verify-formal --platform="$CORE_PLATFORM"
-          else
-            node scripts/desktop-core/native-dns-candidate.mjs verify --candidate="$CORE_CANDIDATE"
-          fi
+        run: node scripts/desktop-core/native-dns-gates.mjs verify-formal --platform="$CORE_PLATFORM"
       - name: Collect every mandatory ordinary gate independently
         run: node scripts/desktop-core/native-dns-gates.mjs run --platform="$CORE_PLATFORM"
       - name: Finalize honest runtime summary

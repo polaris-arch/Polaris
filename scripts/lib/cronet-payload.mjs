@@ -2,7 +2,6 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { validateCronetLibraryPins } from './cronet-contract.mjs';
 
 export const CRONET_REQUIRED_EXPORTS = Object.freeze([
   'Cronet_Engine_Create', 'Cronet_EngineParams_Create', 'Cronet_Engine_StartWithParams',
@@ -186,15 +185,12 @@ function regularBytes(path) {
   return readFileSync(path);
 }
 
-// Both input and final payload bind to the manifest's source-library digest.
+// Both input and final payload bind to the release contract's library digest.
 // Same size, GNU Build ID and an already-processed AppDir are never authority.
-export function verifyCronetPayload(source, payload, platform, manifest) {
+export function verifyCronetPayload(source, payload, platform, contract) {
   // Release verification is performed by verifyPackagedRelease before this static
-  // same-package check; an explicit block never borrows the legacy library pins.
-  const pin = Object.hasOwn(manifest, 'desktopTemporary') ? manifest.desktopTemporary.librarySha256?.[platform]
-    : Object.hasOwn(manifest, 'desktopRelease')
-    ? manifest.desktopRelease.librarySha256?.[platform]
-    : validateCronetLibraryPins(manifest.cronetLibrarySha256)[platform];
+  // same-package check.
+  const pin = contract?.platforms?.[platform]?.sidecar?.sha256;
   demand(typeof pin === 'string' && /^[a-f0-9]{64}$/.test(pin), 'release library pin missing');
   const sourceBytes = regularBytes(source), payloadBytes = regularBytes(payload);
   demand(sha256(sourceBytes) === pin, 'source SHA-256 differs from manifest pin');

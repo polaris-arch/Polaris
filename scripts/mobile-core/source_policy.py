@@ -18,21 +18,9 @@ VENDOR_DIRECTORIES = {
     'github.com/sagernet/sing-quic': 'sing-quic',
     'github.com/sagernet/wireguard-go': 'wireguard-go',
     'github.com/database64128/tfo-go/v2': 'tfo-go',
+    'github.com/sagernet/sing-vmess': 'sing-vmess',
+    'github.com/libp2p/go-nat': 'go-nat',
 }
-
-
-VENDOR_DIRECTORIES_V3 = {**VENDOR_DIRECTORIES, 'github.com/sagernet/sing-vmess': 'sing-vmess'}
-VENDOR_DIRECTORIES_V4 = {**VENDOR_DIRECTORIES_V3, 'github.com/libp2p/go-nat': 'go-nat'}
-VENDOR_SCHEMAS = {
-    'polaris-reviewed-kernel-source-v2': VENDOR_DIRECTORIES,
-    'polaris-reviewed-kernel-source-v3': VENDOR_DIRECTORIES_V3,
-    'polaris-reviewed-kernel-source-v4': VENDOR_DIRECTORIES_V4,
-}
-
-
-def vendor_directories(schema):
-    require(schema in VENDOR_SCHEMAS, 'explicit reviewed vendor schema required')
-    return VENDOR_SCHEMAS[schema]
 
 
 def require(condition, reason):
@@ -55,12 +43,9 @@ def hexadecimal(value, width):
 
 def validate_source_policy(policy, context):
     fields = {'schema', 'sourceCommit', 'sourceTree', 'goDirective', 'goVersion', 'toolchain',
-              'goModSha256', 'goSumSha256', 'metacubex'}
-    require(isinstance(policy, dict), 'complete explicit declaration required')
-    multi_vendor = policy.get('schema') in VENDOR_SCHEMAS
-    require(set(policy) == fields | ({'vendors'} if multi_vendor else set()) and
-            policy['schema'] in ('polaris-reviewed-kernel-source-v1', *VENDOR_SCHEMAS),
-            'complete explicit declaration required')
+              'goModSha256', 'goSumSha256', 'metacubex', 'vendors'}
+    require(isinstance(policy, dict) and set(policy) == fields and
+            policy['schema'] == 'polaris-reviewed-kernel-source-v4', 'complete explicit declaration required')
     for key in ('sourceCommit', 'sourceTree'):
         require(hexadecimal(policy[key], 40) and policy[key] == context.get(key), key + ' differs')
     require(policy['goDirective'] == '1.27.0' and policy['goVersion'] == '1.27.2' and
@@ -83,43 +68,27 @@ def validate_source_policy(policy, context):
             all(hexadecimal(meta[key], 64) for key in ('bindingSha256', 'patchSha256', 'upstreamZipSha256')) and
             isinstance(meta['upstreamH1'], str) and re.fullmatch(r'h1:[A-Za-z0-9+/]{43}=', meta['upstreamH1']),
             'Meta source hashes/baseline sum differ')
-    if multi_vendor:
-        validate_vendors(policy['vendors'], versions=True, schema=policy['schema'])
-        require(policy['vendors'][meta['module']] == {key: meta[key] for key in
-                ('version', 'replacementPath', 'replacementTree', 'replacementFileCount')},
-                'Meta and reviewed-vendor declarations disagree')
+    validate_vendors(policy['vendors'])
+    require(policy['vendors'][meta['module']] == {key: meta[key] for key in
+            ('version', 'replacementPath', 'replacementTree', 'replacementFileCount')},
+            'Meta and reviewed-vendor declarations disagree')
     return policy
 
 
-def validate_vendors(vendors, *, versions=False, schema='polaris-reviewed-kernel-source-v2'):
-    directories = vendor_directories(schema)
-    require(isinstance(vendors, dict) and set(vendors) == set(directories),
+def validate_vendors(vendors):
+    require(isinstance(vendors, dict) and set(vendors) == set(VENDOR_DIRECTORIES),
             'exact reviewed vendor names required')
-    fields = {'replacementPath', 'replacementTree', 'replacementFileCount'}
+    fields = {'version', 'replacementPath', 'replacementTree', 'replacementFileCount'}
     for name, pin in vendors.items():
-        require(isinstance(pin, dict) and set(pin) == fields | ({'version'} if versions else set()),
+        require(isinstance(pin, dict) and set(pin) == fields,
                 'complete vendor declaration required: ' + name)
-        require(pin['replacementPath'] == './third_party/' + directories[name] and
+        require(pin['replacementPath'] == './third_party/' + VENDOR_DIRECTORIES[name] and
                 hexadecimal(pin['replacementTree'], 40) and type(pin['replacementFileCount']) is int and
                 0 < pin['replacementFileCount'] <= 65536, 'invalid vendor pin: ' + name)
-        if versions:
-            require(isinstance(pin['version'], str) and
-                    re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', pin['version']),
-                    'explicit vendor module version required: ' + name)
+        require(isinstance(pin['version'], str) and
+                re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', pin['version']),
+                'explicit vendor module version required: ' + name)
     return vendors
-
-
-def candidate_vendors(pins, *, schema='polaris-reviewed-kernel-source-v2'):
-    """Adapt the frozen Android/desktop tuple declaration without changing it."""
-    directories = vendor_directories(schema)
-    require(isinstance(pins, dict) and set(pins) == set(directories), 'exact reviewed vendor names required')
-    result = {}
-    for name, row in pins.items():
-        require(isinstance(row, (tuple, list)) and len(row) == 3 and row[0] == directories[name],
-                'invalid kernel vendor pin')
-        result[name] = dict(replacementPath='./third_party/' + row[0],
-                            replacementTree=row[1], replacementFileCount=row[2])
-    return validate_vendors(result, schema=schema)
 
 
 def verify_vendor_module_declarations(raw, vendors):
@@ -134,8 +103,7 @@ def verify_vendor_module_declarations(raw, vendors):
     require(local == {name: pin['replacementPath'] for name, pin in vendors.items()},
             'exact reviewed local replacements required')
     for name, pin in vendors.items():
-        if 'version' in pin:
-            require(dependencies.get(name) == pin['version'], 'actual vendor dependency version differs: ' + name)
+        require(dependencies.get(name) == pin['version'], 'actual vendor dependency version differs: ' + name)
     return directives, dependencies, replacements
 
 
@@ -165,7 +133,7 @@ def vendor_tree(entries):
 
 
 def verify_vendor_files(vendors, files, modes, trees):
-    """Pure byte/mode proof, shared by formal source and frozen candidate callers."""
+    """Pure byte/mode proof over the formal source's observed vendor files."""
     require(isinstance(modes, dict) and isinstance(trees, dict) and set(trees) == set(vendors),
             'complete vendor mode/tree observations required')
     observed, total, inventory = {}, 0, set()
@@ -248,8 +216,7 @@ def verify_vendor_graph(graph, source, vendors):
                 expected.resolve(strict=True).is_relative_to(physical_root), 'local graph path differs')
         require(not row.get('Main') and row.get('Sum', '') == '' and replacement.get('Sum', '') == '' and
                 replacement.get('Version', '') == '', 'local replacement must not invent h1/version')
-        if 'version' in pin:
-            require(row.get('Version') == pin['version'], 'actual vendor graph version differs: ' + name)
+        require(row.get('Version') == pin['version'], 'actual vendor graph version differs: ' + name)
     return graph
 
 
@@ -311,39 +278,27 @@ def source_module_declarations(raw):
 
 
 def verify_source_policy_files(policy, context, files, actual_meta_tree, *, vendor_modes=None, vendor_trees=None):
-    """V1 retains its Meta proof; v2/v3/v4 require every declared vendor bytes/modes/tree.
+    """Require every declared vendor's bytes/modes/tree plus the Meta proof.
 
-    V2 link entries contain the link-target bytes, never followed file contents.
+    Link entries contain the link-target bytes, never followed file contents.
     Archive callers without that complete evidence fail closed rather than
-    treating their existing Meta-only inventory as a complete reviewed-vendor source proof.
+    treating a Meta-only inventory as a complete reviewed-vendor source proof.
     """
     validate_source_policy(policy, context)
     meta = policy['metacubex']
-    vendors = policy.get('vendors')
-    reviewed_vendors = verify_vendor_files(vendors, files, vendor_modes, vendor_trees) if vendors else None
+    vendors = policy['vendors']
+    reviewed_vendors = verify_vendor_files(vendors, files, vendor_modes, vendor_trees)
     require(actual_meta_tree == meta['replacementTree'], 'actual Meta subtree differs')
     for name, key in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
         require(name in files and sha(files[name]) == policy[key], 'actual ' + name + ' differs')
-    directives, dependencies, replacements = source_module_declarations(files['go.mod'])
+    directives, dependencies, _ = source_module_declarations(files['go.mod'])
     require(directives == {'module': 'github.com/sagernet/sing-box',
                            'go': policy['goDirective'], 'toolchain': policy['toolchain']},
             'actual Go/module directives differ')
     require(dependencies.get(meta['module']) == meta['version'] and
             dependencies.get('github.com/sagernet/gomobile') == 'v0.1.13',
             'actual Meta/generator dependency version differs')
-    local = {}
-    for name, (version, target) in replacements.items():
-        if len(target) == 1:
-            # A versionless replacement is always local. Include ../, absolute
-            # and platform-specific paths in the inventory so none disappear.
-            require(not version, 'version-scoped local replacement refused')
-            local[name] = target[0]
-    if vendors:
-        verify_vendor_module_declarations(files['go.mod'], vendors)
-    else:
-        require(local == {'github.com/metacubex/utls': './third_party/metacubex-utls',
-                          'github.com/sagernet/sing-tun': './third_party/sing-tun'},
-                'undeclared local replacement inventory')
+    verify_vendor_module_declarations(files['go.mod'], vendors)
     require(meta['bindingPath'] in files and sha(files[meta['bindingPath']]) == meta['bindingSha256'],
             'actual Meta binding differs')
     binding = decode_binding(files[meta['bindingPath']])
@@ -376,9 +331,9 @@ def verify_source_policy_files(policy, context, files, actual_meta_tree, *, vend
     patch = files.get(meta['patchPath'])
     require(isinstance(patch, bytes) and 0 < len(patch) <= 2 * 1024 * 1024 and
             sha(patch) == meta['patchSha256'], 'actual Meta patch differs')
-    return {'schema': 'polaris-reviewed-source-observation-v2' if vendors else 'polaris-reviewed-source-observation-v1',
+    return {'schema': 'polaris-reviewed-source-observation-v2',
             'sourcePolicySha256': sha(canonical(policy)),
             'replacementTree': actual_meta_tree, 'replacementFileCount': 355,
             'bindingSha256': meta['bindingSha256'], 'patchSha256': meta['patchSha256'],
-            **({'vendors': reviewed_vendors} if vendors else {}),
+            'vendors': reviewed_vendors,
             'baselineH1Role': 'upstream provenance only; local replacement has no h1'}

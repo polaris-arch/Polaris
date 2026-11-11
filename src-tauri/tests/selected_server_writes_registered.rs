@@ -219,14 +219,6 @@ const WRITES: &[(&str, &[Site])] = &[
         ],
     ),
     (
-        "src-tauri/src/runtime/config.rs",
-        &[(
-            Class::System,
-            "update_mesh_identity_server_if_revision",
-            "组网节点身份事务删除节点时，出口是它则归零",
-        )],
-    ),
-    (
         "src-tauri/src/runtime/proxy/auto_switch.rs",
         &[
             (

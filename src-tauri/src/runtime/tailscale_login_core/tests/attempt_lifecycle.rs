@@ -3453,11 +3453,7 @@ async fn f1_prepared_unclaimed_attempt_is_retained_and_late_claim_has_no_effects
     );
     reg.prepare("ts1", "f1-original").await.unwrap();
     let original = reg.attempts.get("ts1", "f1-original").unwrap();
-    let capture = reg.pc_producer_view().await.unwrap();
     let pause = polaris_core_supervisor::config_gate::pause_check_producers().unwrap();
-    let view = capture.into_view();
-    assert_eq!(view.member_count(), 1);
-    assert!(Arc::ptr_eq(&view.attempts[0], &original));
     assert!(reg.prepare("ts1", "f1-late").await.is_err());
     let ud = temp_ud();
     let server = ts_server("ts1", "myts");
@@ -3478,7 +3474,6 @@ async fn f1_prepared_unclaimed_attempt_is_retained_and_late_claim_has_no_effects
     );
     assert_eq!(spawner.count.load(Ordering::SeqCst), 0);
     assert!(login_configs(&ud).is_empty());
-    view.verify_surrender().unwrap();
     pause.surrender().unwrap();
     reg.prepare("ts1", "f1-next").await.unwrap();
     std::fs::remove_dir_all(ud).unwrap();

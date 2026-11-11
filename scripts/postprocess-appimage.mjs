@@ -40,7 +40,7 @@ import { tmpdir } from 'os';
 import { basename, dirname, join, relative, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { verifyCronetPayload } from './lib/cronet-payload.mjs';
-import { hasTemporaryDesktop, verifiedCandidateSource, verifyCandidateAppCarrier } from './desktop-core/native-dns-candidate.mjs';
+import { loadReleaseContract } from './desktop-core/release-consumer.mjs';
 
 export const APPIMAGE_HOST_WAYLAND_LIBS = Object.freeze([
   'libwayland-client.so.0',
@@ -56,7 +56,6 @@ export const APPIMAGE_CORE_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/sing-b
 const CRONET_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/libcronet.so';
 export const APPIMAGE_HELPER_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/polaris-helper';
 const INSTALL_MANIFEST_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/core-manifest.json';
-export const APPIMAGE_CARRIER_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/candidate-carrier.json';
 
 function regularMember(root, member) {
   let path = resolve(root);
@@ -77,18 +76,6 @@ function identity(path) {
   return { sha256: createHash('sha256').update(readFileSync(path)).digest('hex'), mode: lstatSync(path).mode & 0o7777 };
 }
 
-// The caller must obtain source from verifiedCandidateSource. Binding this exact
-// receipt also covers the final SquashFS, whose bytes can differ from AppDir.
-export function verifyTemporaryCarrierReceipt(sourceRoot, appDir, source) {
-  const original = regularMember(sourceRoot, 'resources/linux/candidate-carrier.json');
-  const installed = regularMember(appDir, APPIMAGE_CARRIER_MEMBER);
-  verifyCandidateAppCarrier(dirname(original), source, 'linux');
-  verifyCandidateAppCarrier(dirname(installed), source, 'linux');
-  if (!readFileSync(original).equals(readFileSync(installed)))
-    throw new Error('AppDir temporary carrier receipt differs from compiled input');
-  return { [APPIMAGE_CARRIER_MEMBER]: identity(original) };
-}
-
 // Restore both canonical seeds before repacking. Cronet's fixed source library
 // has only system NEEDED entries and no RPATH/RUNPATH; no transform is allowed.
 // Validate all inputs before replacement and bind final SquashFS bytes to these
@@ -103,7 +90,8 @@ export function restoreCoreSeed(appDir, sourceRoot = ROOT) {
   const installationSource = regularMember(sourceRoot, 'resources/linux/core-manifest.json');
   const installationTarget = regularMember(appDir, INSTALL_MANIFEST_MEMBER);
   const manifest = JSON.parse(readFileSync(regularMember(sourceRoot, 'src-tauri/core-manifest.json'), 'utf8'));
-  const verifiedCronet = verifyCronetPayload(cronetSource, cronetSource, 'linux', manifest);
+  const contract = loadReleaseContract(sourceRoot, manifest);
+  const verifiedCronet = verifyCronetPayload(cronetSource, cronetSource, 'linux', contract);
   const matches = new Map([['sing-box', []], ['libcronet.so', []], ['polaris-helper', []]]);
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -140,11 +128,9 @@ export function restoreCoreSeed(appDir, sourceRoot = ROOT) {
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
-  verifyCronetPayload(cronetSource, cronetTarget, 'linux', manifest);
-  const carrier = hasTemporaryDesktop(manifest)
-    ? verifyTemporaryCarrierReceipt(sourceRoot, appDir, verifiedCandidateSource(sourceRoot)) : {};
+  verifyCronetPayload(cronetSource, cronetTarget, 'linux', contract);
   return { [APPIMAGE_CORE_MEMBER]: expected, [CRONET_MEMBER]: cronetIdentity,
-    [APPIMAGE_HELPER_MEMBER]: helperIdentity, [INSTALL_MANIFEST_MEMBER]: installationIdentity, ...carrier };
+    [APPIMAGE_HELPER_MEMBER]: helperIdentity, [INSTALL_MANIFEST_MEMBER]: installationIdentity };
 }
 
 // Read SquashFS with a host tool, never execute the AppImage runtime. A magic

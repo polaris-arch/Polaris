@@ -36,8 +36,11 @@ class OptionalTLSCapabilityLink(unittest.TestCase):
             executable.write_bytes(b'fixture native bytes')
             flags = root / 'PolarisTLSFingerprintLinker.args'
             flags.write_text('-Xlinker\n-u\n-Xlinker\n' + subject.SYMBOL + '\n')
+            (root / subject.NATIVE_TUN_ARGS).write_bytes(b'')
             env = {'DERIVED_FILE_DIR': tmp, 'TARGET_BUILD_DIR': tmp, 'EXECUTABLE_PATH': 'extension'}
-            receipt = {'capabilityPresent': True, 'flags': subject.file_pin(flags)}
+            receipt = {'capabilityPresent': True, 'flags': subject.file_pin(flags),
+                       'nativeTun': {'present': False,
+                                     'compilerArgs': subject.file_pin(root / subject.NATIVE_TUN_ARGS, allow_empty=True)}}
             with patch.dict(os.environ, env), patch.object(subject, 'read_receipt', return_value=receipt):
                 with patch.object(subject, 'run', side_effect=['T ' + subject.SYMBOL + '\n', 'unrelated export']):
                     with self.assertRaisesRegex(RuntimeError, 'dynamically discoverable'):
@@ -383,26 +386,6 @@ class OptionalNativeTunCompilerABI(unittest.TestCase):
                 subject.install()
                 self.assertEqual(subject.compiler_args_path().read_bytes(), b'')
                 subject.verify_installed()
-
-    def test_legacy_receipt_requires_old_abi_and_cannot_authorize_stale_flags(self):
-        for new_abi in (False, True):
-            with self.subTest(new_abi=new_abi), tempfile.TemporaryDirectory() as tmp:
-                _, prepared, env = self.prepared(Path(tmp), 'iphoneos', new_abi)
-                receipt = prepared / 'PolarisTLSFingerprintLinker.json'
-                value = json.loads(receipt.read_text()); value.pop('nativeTun')
-                receipt.write_text(json.dumps(value))
-                (prepared / subject.NATIVE_TUN_ARGS).unlink()
-                env['POLARIS_TLS_PREPARED_SHA256'] = subject.file_pin(receipt)['sha256']
-                with patch.dict(os.environ, env):
-                    if new_abi:
-                        with self.assertRaisesRegex(RuntimeError, 'legacy TLS receipt cannot attest'):
-                            subject.install()
-                    else:
-                        subject.install()
-                        self.assertEqual(subject.compiler_args_path().read_bytes(), b'')
-                        (prepared / subject.NATIVE_TUN_ARGS).write_bytes(subject.compiler_args(True))
-                        with self.assertRaisesRegex(RuntimeError, 'unexpected native TUN compiler arguments'):
-                            subject.install()
 
     def test_parent_argument_and_actual_header_drift_rejected_before_compile(self):
         for case in ('parent-args', 'header', 'receipt-abi', 'receipt-shape', 'redirected-output'):

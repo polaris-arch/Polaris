@@ -651,7 +651,7 @@ test('M5 变异是定点的：不牵连许可文本 / 符号计数 / .srs / 死�
   assert.equal(hits(violations, '没有任何条目指向'), 0, violations.join(' | '));
 });
 
-test('libbox.so 也在射程内，且报文指向 build-libbox.sh 而不是 rustflags', () => {
+test('libbox.so 也在射程内，且报文指向 build-mobile-core.sh 而不是 rustflags', () => {
   // 实测：三份真库（libbox 30 节 / libc++_shared 31 节 / libpolaris_lib 28 节）当下
   // 都是 0 个 debug 节，故把它们全纳入不会造出假红。而 libbox 由 Go/gomobile 构建、
   // 不经 rustc —— 出处不同，报文就必须指不同的地方，否则红了也修不到点上。
@@ -660,7 +660,7 @@ test('libbox.so 也在射程内，且报文指向 build-libbox.sh 而不是 rust
   );
   assert.equal(violations.length, 1, violations.join(' | '));
   assert.match(violations[0], /libbox\.so 里还留着 1 个调试信息节/);
-  assert.match(violations[0], /build-libbox\.sh/);
+  assert.match(violations[0], /build-mobile-core\.sh/);
   assert.doesNotMatch(violations[0], /cargo\/config\.toml/);
 });
 

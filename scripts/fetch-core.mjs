@@ -1,93 +1,25 @@
 #!/usr/bin/env node
-/** Produce one native source artifact, or consume an exact four-artifact bundle.
- * Consumption defaults to all four; producer selection must be explicit.
- * Darwin CGO needs a real SDK/compiler. Incomplete sourceBuild inputs reject
- * before provisioning. --force remains accepted, with no old-cache/stock bypass.
- * This command never runs a target kernel; native Windows runs DNS unit tests.
+/** Acquire the committed desktop release archives into resources/.
+ * Defaults to all four platforms; `--platform=a,b` selects a subset.
+ * `--recover-release` restores an interrupted acquisition. --force remains
+ * accepted. This command never runs a target kernel.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { produceDesktopCore } from './desktop-core/build-core.mjs';
-import { consumeDesktopBundle, coreFilename, writeBundleInventory } from './desktop-core/bundle.mjs';
-import { writeValidationBundle } from './desktop-core/validation-origin.mjs';
-import { validateSourcePins } from './desktop-core/source-graph.mjs';
-import { consumeRelease, hasDesktopSelection, recoverRelease, releasePlatforms } from './desktop-core/release-consumer.mjs';
-import { verifyNativeReleaseBundle } from './desktop-core/release-native-gates.mjs';
-import { acquireCandidate, candidateFetchSelection, hasTemporaryDesktop } from './desktop-core/native-dns-candidate.mjs';
+import { consumeRelease, recoverRelease, releasePlatforms } from './desktop-core/release-consumer.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-const TARGETS = [
-  { dir: 'resources/linux', bin: 'sing-box', key: 'linux' },
-  { dir: 'resources/win', bin: 'sing-box.exe', key: 'win' },
-  { dir: 'resources/mac-x64', bin: 'sing-box', key: 'mac-x64' },
-  { dir: 'resources/mac-arm64', bin: 'sing-box', key: 'mac-arm64' },
-];
-
-function selectedKeys() {
-  const arg = process.argv.find((a) => a.startsWith('--platform='));
-  if (!arg) return null; // 全平台
-  const all = TARGETS.map((t) => t.key);
-  const want = arg.slice('--platform='.length).split(',').map((s) => s.trim()).filter(Boolean);
-  if (want.length === 0) {
-    console.error(`FAILED: --platform 值为空。可选：${all.join(' / ')}（不传该 flag = 全平台）`);
-    process.exit(1);
-  }
-  const bad = want.filter((k) => !all.includes(k));
-  if (bad.length > 0) {
-    console.error(`FAILED: 未知平台 ${bad.join(', ')}。可选：${all.join(' / ')}`);
-    process.exit(1);
-  }
-  return want;
-}
-
-const ONLY = selectedKeys();
-const PICKED = ONLY ? TARGETS.filter((target) => ONLY.includes(target.key)) : TARGETS;
-function valueOf(name) {
-  const args = process.argv.slice(2).filter((arg) => arg.startsWith(`--${name}=`));
-  if (args.length > 1) throw new Error(`Duplicate --${name}`);
-  return args[0]?.slice(name.length + 3);
-}
 try {
-  const nativeCandidate = candidateFetchSelection(process.argv.slice(2));
-  if (nativeCandidate) {
-    console.log(JSON.stringify(await acquireCandidate(ROOT, nativeCandidate)));
-  } else if (hasDesktopSelection(manifest)) {
-    if (process.argv.slice(2).length === 1 && process.argv[2] === '--recover-release') {
-      if (hasTemporaryDesktop(manifest)) throw Error('Temporary default cannot recover a historical formal installation; explicit cleanup required');
-      console.log(JSON.stringify(recoverRelease(ROOT)));
-    } else {
-      const argv = process.argv.slice(2), bundle = valueOf('bundle-dir'), candidate = valueOf('candidate');
-      if (bundle || candidate) {
-        if (!bundle || !candidate) throw Error('Release native bundle and candidate must be supplied together');
-        verifyNativeReleaseBundle(ROOT, manifest, bundle, candidate);
-      }
-      const selection = argv.filter((arg) => !arg.startsWith('--bundle-dir=') && !arg.startsWith('--candidate='));
-      await consumeRelease(ROOT, manifest, releasePlatforms(selection));
-      console.log('Pinned release resources ready; native App acceptance remains pending');
-    }
+  const argv = process.argv.slice(2);
+  if (argv.length === 1 && argv[0] === '--recover-release') {
+    console.log(JSON.stringify(recoverRelease(ROOT)));
   } else {
-    validateSourcePins(manifest, PICKED[0].key, false);
-    const candidate = valueOf('candidate');
-    const bundle = valueOf('bundle-dir');
-    if (process.argv.includes('--producer')) {
-      if (!ONLY || ONLY.length !== 1 || !bundle || process.argv.includes('--assemble')) {
-        throw new Error('Producer requires exactly one explicit --platform and --bundle-dir; do not fake cross-platform native builds');
-      }
-      const key = ONLY[0];
-      const receipt = produceDesktopCore(ROOT, manifest, key, join(bundle, key, coreFilename(key)), candidate);
-      console.log(JSON.stringify({ candidate, platform: key, binarySha256: receipt.binarySha256, fingerprint: receipt.fingerprint }));
-    } else if (process.argv.includes('--assemble')) {
-      if (!bundle || ONLY) throw new Error('Assembly requires --bundle-dir and all four producer outputs');
-      if (process.argv.includes('--validation-origin')) writeValidationBundle(ROOT, bundle, candidate);
-      else writeBundleInventory(bundle, candidate);
-    } else {
-      if (!bundle) throw new Error('Consumption requires --bundle-dir containing all four candidate producer outputs');
-      consumeDesktopBundle(ROOT, manifest, bundle, candidate, PICKED.map((target) => target.key));
-    }
+    await consumeRelease(ROOT, manifest, releasePlatforms(argv));
+    console.log('Pinned release resources ready; native App acceptance remains pending');
   }
 } catch (error) {
-  console.error(`FAILED desktop source graph: ${error.message}`);
+  console.error(`FAILED desktop release acquisition: ${error.message}`);
   process.exitCode = 1;
 }

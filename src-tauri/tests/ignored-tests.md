@@ -13,14 +13,13 @@
 
 ---
 
-## 八个类别
+## 七个类别
 
 | 类别 | 为什么默认不跑 | 谁来跑 |
 |---|---|---|
 | **RealCore** | 需要 `POLARIS_SINGBOX_PATH` 指向**真实的 sing-box 二进制**，会真起进程、真占端口 | 真机验收环节，人在场 |
 | **PublicNetwork** | 需要公网连通性。CI 与本机开发环境都不保证，且本仓禁止在默认门里碰网络 | 手动，确认网络可用时 |
 | **LiveHostState** | 会读或**改写宿主机的真实状态**（路由表 / 系统代理）。跑错机器会把开发机的网络配置改掉 | 专用测试机，人在场 |
-| **PrivateChildFixture** | 由父测试供给私有输入与身份，不能作为独立门运行 | 仅由父门以精确过滤器调用并收尾 |
 | **NativeWindowsInterop** | 需要原生 NTFS、固定来源与哈希的 App 测试产物及真实 Go producer | 专用 Windows 互操作 runner，使用精确测试名 |
 | **NativeWindowsCompilerFixture** | 既有 whole-PE 缓存/加载器实验需要原生 Windows 与 MSVC；自编译 EXE/DLL 从不获得生产 admission | 专用 Windows 编译器 fixture，逐名显式 opt-in |
 | **PrivilegedWindowsInterop** | 需要显式批准的一次性 SYSTEM 任务与普通用户 consumer | 经批准的专用 Windows runner，任务清理归 runner 负责 |
@@ -82,7 +81,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 
 ---
 
-## 完整清单（32 条）
+## 完整清单（26 条）
 
 `src-tauri/tests/ignored_tests_registry.rs` 的 `REGISTRY` 是真值源；本表由它逐条对应，
 **每个测试名都必须在本文档里逐字出现**（那道门会逐条核对，前缀兜底已被去掉——它会让 2/3 的条目失守）。
@@ -91,10 +90,6 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 |---|---|---|
 | `cached_sec_image_and_retained_writer_can_disagree_with_cold_hash_and_create_process` | `crates/core-supervisor/src/admitted_payload/windows/tests/mod.rs` | NativeWindowsCompilerFixture |
 | `held_exe_and_dll_do_not_close_late_dot_local_namespace_before_entry` | 同上 | NativeWindowsCompilerFixture |
-| `real_hot_dispatcher_apply_and_status` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
-| `real_hot_dispatcher_persistence_retry` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
-| `real_hot_public_rpc_contract` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
-| `real_hot_dispatcher_rejections_preserve_runtime` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
 | `real_core_full_lifecycle` | `src-tauri/src/runtime/proxy/tests/lifecycle.rs` | RealCore |
 | `real_core_lifecycle_race_start_then_immediate_stop` | `src-tauri/src/runtime/proxy/tests/lifecycle.rs` | RealCore |
 | `real_core_hot_switch_keeps_pid` | `src-tauri/src/runtime/proxy/tests/hot_switch.rs` | RealCore |
@@ -114,8 +109,6 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 | `production_macos_native_proxy_transaction_restores_after_takeover` | `crates/system-integration/src/tests/mod.rs` | LiveHostState（**写宿主机**，macOS-only） |
 | `production_macos_native_proxy_recovers_across_process_sessions` | 同上 | LiveHostState（**写宿主机**，macOS-only） |
 | `inventory` | `src-tauri/tests/release_escape_hatches.rs` | NotAGate |
-| `no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
-| `unrelated_no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
 | `native_core_lists_and_switches_the_two_compiled_modes` | `crates/singbox-grpc/tests/native_clash_mode.rs` | RealCore |
 | `interop_writer_retirement_and_stale_intent` | `src-tauri/src/runtime/windows_directory/tests/mod.rs` | NativeWindowsInterop |
 | `interop_crash_reopen_and_revocation` | `src-tauri/src/runtime/windows_directory/tests/mod.rs` | NativeWindowsInterop |
@@ -124,16 +117,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 
 ---
 
-## 私有夹具的跑法与边界
-
-`no_network_fixture` 只由 `exact_spawn::tests` 的私有 probe 执行；父门供给 sealed stdin、管理子进程身份与管道并收尾。不能把子夹具的成功当成独立能力验收：
-
-```bash
-POLARIS_NO_KERNEL_RUN=1 cargo test -p polaris-core-supervisor exact_spawn::tests -- --test-threads=1
-```
-
-`unrelated_no_network_fixture` 是普通 `Command` 启动的独立子可执行夹具，不打开或关闭受保护 FD。父门以 `--exact --ignored --nocapture exact_spawn::tests::unrelated_no_network_fixture` 调用它，在两秒内收到真实用户态 READY 后扫描其 FD，并在观察或断言失败前 kill/wait。
-默认运行的 `unrelated_child_does_not_inherit_protected_images` 保留 FD 隔离断言；`deliberately_passed_protected_stdin_is_detected_after_userland_ready` 保留真实继承 FD 的反向对照。不要独立调用这个会等待父门收尾的子夹具，也不要把它的 ignored 数当成安全门退出默认覆盖。
+## 原生 gRPC 契约的跑法
 
 `native_core_lists_and_switches_the_two_compiled_modes` 是真实核 gRPC 契约，使用相同的 `kernel_run_or_skip` / `with_run` 双重守卫。经授权的真核验证才执行下面命令；本次源码修复未执行真核验收：
 
@@ -143,7 +127,7 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
 
 ## 平台差异：`ignored` 的数字是平台相关的
 
-源码登记共 32 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门、两项 NativeWindowsCompilerFixture 各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
+源码登记共 26 条。Windows 路由和 macOS 系统代理门、两项 NativeWindowsCompilerFixture 各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
 
 
 ## NativeWindowsInterop 与 PrivilegedWindowsInterop 的执行边界
@@ -162,11 +146,11 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
   -AppArtifactManifest C:/evidence/app-test-artifact.json `
   -KernelArtifactManifest C:/evidence/kernel-test-artifact.json `
   -ExpectedAppSource <app-sha40> -ExpectedKernelSource <kernel-sha40> `
-  -ValidationMode candidate
+  -ValidationMode formal
 ```
 
 需要从已审核源码构建配套产物时，使用 `scripts/windows-directory/Build-And-Test.ps1`
-的显式 `-CandidateSourceCommit` 或 `-FormalContract` 模式。candidate 结果不是 formal release 验收。
+的显式 `-FormalContract` 模式。
 
 `interop_system_producer_user_consumer` 只能由 `scripts/windows-directory/Run-SystemBootstrap.ps1`
 执行。它要求非 SYSTEM 的已批准管理员测试用户；显式创建一次性 SYSTEM producer，并由当前用户
@@ -178,64 +162,12 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
   -AppArtifactManifest C:/evidence/app-test-artifact.json `
   -KernelArtifactManifest C:/evidence/kernel-test-artifact.json `
   -ExpectedAppSource <app-sha40> -ExpectedKernelSource <kernel-sha40> `
-  -ValidationMode candidate -EvidenceDirectory C:/evidence/system-interop `
+  -ValidationMode formal -EvidenceDirectory C:/evidence/system-interop `
   -ApproveTemporarySystemTask
 ```
 
 本次源码结构修复没有运行上述四条测试，没有创建 SYSTEM 任务，也不签署 Windows 原生互操作能力。
 
-
-## Exact-source GitHub RuntimeConfig loopback lane (four RealCore tests)
-
-These tests are Linux amd64 only and require the dedicated `ci.yml` manual
-`runtime_config_loopback_candidate` lane on the reviewed HOT branch. They are not
-local manual commands: `POLARIS_SINGBOX_PATH` alone is insufficient. The runner
-must supply a regular absolute `POLARIS_RUNTIME_LOOPBACK_RECEIPT` with exact App
-and kernel commit/tree/proto identity, verified source closure and binary hash,
-plus the matching `POLARIS_SINGBOX_PATH`. Each test verifies the real GitHub
-context and bytes before using the existing test-only binary injection.
-
-| Exact function | Class | Evidence |
-|---|---|---|
-| `real_hot_dispatcher_apply_and_status` | RealCore | Production App Plan/Apply/Status; retained A TCP stream, new B stream and TTL0 owned DNS address change; same PID/incarnation |
-| `real_hot_dispatcher_persistence_retry` | RealCore | Real CLI source-byte mismatch, pending durability, read-only polling and original-transaction retry |
-| `real_hot_public_rpc_contract` | RealCore | Actual six-method authentication, Plan/Apply/Status/Retry positives, idempotence/conflict and honest CLI negative regeneration Ack |
-| `real_hot_dispatcher_rejections_preserve_runtime` | RealCore | Structural restart choice without confirmation and invalid-reference rejection, preserving the live graph |
-
-The runner compiles `cargo test --locked -p polaris --lib --no-run
---message-format=json`, discovers the actual `polaris_lib` test executable and
-runs each full name with `--exact --ignored --nocapture --test-threads=1`. The full
-name is `runtime::proxy::tests::runtime_config_real_core::` followed by the exact
-function above. Exactly one passed test per invocation is required; missing
-receipts, wrong files, zero matches and unavailable public HOT support are hard
-failures, never skipped success.
-
-The current lane is `linux-amd64-purego-no-naive`: this is partial-profile
-noTUN evidence, not the complete paired Linux feature profile, full-schema HOT,
-mobile/device, installed-package or publication acceptance. Positive regeneration
-Ack belongs to companion evidence from the kernel's actual libbox owner handler.
-No fake CLI acknowledgement or forced capability enablement is permitted.
-
-Before starting the core, each test checks the canonical fixture allowlist and
-runs the ordinary production generator. It admits only noTUN loopback listeners,
-two owned numeric SOCKS endpoints, owned source rule files, and the fixture's
-reachable DNS dependency closure. The actual generated file must match that
-safety projection. Production's unused node/local/LAN/mDNS/probe DNS definitions
-remain present; the claim is not that every definition is a loopback address.
-Only `runtime-loopback.test` is sent through `mixed-in`; explicit auto-switch and
-auto-selection switches are off, no probe emitter is attached, and there are no
-mesh endpoints, network profiles, URLTest outbounds or remote rule downloads.
-
-The durability test distinguishes committed live App R from durable CLI source:
-R already describes the committed graph while persistence is pending, status
-polls change neither R nor source bytes, and explicit retry changes only the
-restart source/durability receipt without another graph publication.
-
-Each test writes sanitized actual capabilities/manifest, operation and data-plane
-observations to `<test-name>.json` beside the runner receipt. Secrets and full
-generated configuration are not included. Only owned loopback listeners and
-owned temporary configuration files are used; no TUN, system proxy, host DNS,
-routes, firewall, helper/device installation or privileged core execution.
 
 ### NativeWindowsCompilerFixture
 

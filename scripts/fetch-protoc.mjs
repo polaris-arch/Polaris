@@ -11,7 +11,7 @@
  * 此前 protoc 的「固定版本 + 四平台 URL + 四个 sha256」常量在 `ci.yml` 与 `package.yml`
  * **各内联一份**，靠 `workflow-toolchain-pin-parity.test.ts` 对拍防漂。收敛到脚本后常量只有
  * 一处，对拍对象消失，该测试的 protoc 部分退休（NASM 部分仍在——它还是两份）。
- * 与 `fetch-core` / `fetch-cronet` / `fetch-dashboard` 四处同形：**不是引入新概念，
+ * 与 `fetch-core` / `fetch-dashboard` 同形：**不是引入新概念，
  * 是回到仓里已有的概念**。
  *
  * 相比内联 bash 步还消掉两个平台分支：
@@ -143,7 +143,7 @@ const url =
 const base = process.env.RUNNER_TEMP || tmpdir();
 
 // 落点绝不落进仓库——protoc 是构建工具不是随包产物（与 resources/ 下那批不同），库里多一份
-// 只会漂。目录名织入**完整** sha（对齐 fetch-cronet 的指纹思路）：换版本或**同版本重钉 sha**
+// 只会漂。目录名织入**完整** sha：换版本或**同版本重钉 sha**
 // 都换目录 ⇒ 必然重新下载重校验。⚠️ 不能只织前 12 位——confirm 轮 M13 实证：改 sha 尾位
 // 的 hex 不动前缀 ⇒ 同目录 ⇒ 旧产物 skip 掉新 sha 的验证，重钉保护整个失效。
 const dest = join(
@@ -164,8 +164,8 @@ if (!FORCE && completeCache(dest)) {
   try {
     const zip = join(work, 'protoc.zip');
     console.log(`downloading ${url} ...`);
-    // 骨架形制照 fetch-cronet，强度参数（--retry 5 / --retry-all-errors / --connect-timeout 20）
-    // 承自被替掉的内联步 —— 与两个先例都不逐字同款，差异有意：不带 --retry-delay 5（curl 默认
+    // 强度参数（--retry 5 / --retry-all-errors / --connect-timeout 20）
+    // 承自被替掉的内联步，差异有意：不带 --retry-delay 5（curl 默认
     // 指数退避，总等待反而更长）；不带 -sS（stdio inherit 下进度条进日志，噪音不是功能差）。
     boundedDownload(url, { output: zip,
       stdio: 'inherit',
@@ -184,7 +184,7 @@ if (!FORCE && completeCache(dest)) {
     rmSync(work, { recursive: true, force: true });
   }
   // exit 放在 finally 之后：catch 里直接 process.exit 会跳过 finally、泄漏整个 mkdtemp 工作区
-  //（fetch-cronet 的 catch 只记数、循环外统一 exit，就是为这个——照抄骨架时别把这处变形抄丢）。
+  //（catch 只记数、循环外统一 exit，就是为这个——照抄骨架时别把这处变形抄丢）。
   if (failed) process.exit(1);
 }
 

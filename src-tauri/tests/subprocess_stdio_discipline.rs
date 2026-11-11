@@ -1205,9 +1205,9 @@ fn check_custody_starts_both_eof_readers_before_return() {
     let spawn = block_of(owner, "fn spawn_mode(");
     let compact: String = spawn.chars().filter(|c| !c.is_whitespace()).collect();
     let factory_call = "Self::attach_child(run,&mutbuilder)";
-    // 此新增形态只登记原 custody 的两条实际调用；不能把同名空 helper
+    // 此新增形态只登记原 custody 的一条实际调用；不能把同名空 helper
     // 当作其它站点的 spawn 信用。
-    assert_eq!(owner.masked.matches("Self::attach_child(").count(), 2);
+    assert_eq!(owner.masked.matches("Self::attach_child(").count(), 1);
     assert!(surface
         .iter()
         .filter(|scanned| scanned.rel != owner.rel)

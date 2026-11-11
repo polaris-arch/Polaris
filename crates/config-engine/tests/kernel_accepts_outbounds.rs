@@ -361,7 +361,7 @@ fn ci_step_still_wired() {
     );
 }
 
-/// 🔴 本门必须排在 Windows 的「Fetch cronet library」**之后** —— 这个先后关系是承重的。
+/// 🔴 本门必须排在「Fetch sing-box core」**之后** —— 这个先后关系是承重的。
 ///
 /// # 血证（2026-08-13）
 ///
@@ -369,7 +369,7 @@ fn ci_step_still_wired() {
 /// `naive outbound → initialize outbound[0]: cronet: library not found.
 ///  Place libcronet.dll in the executable directory or PATH`
 ///
-/// 随包核 **beta.14 在 initialize 阶段就硬要这个库**，而它由 `fetch-cronet.mjs` 落到
+/// 随包核 **beta.14 在 initialize 阶段就硬要这个库**，而它如今随发布归档由 `fetch-core.mjs` 落到
 /// `resources/win/`（= 核的同目录）。2026-08-05 那次 Windows 腿是绿的，因为旧核不要它 ——
 /// 抬核到 beta.14 之后才成立，而 **Windows 腿从 08-05 起整整一周没再跑过**，缺陷就潜伏在那里。
 ///
@@ -381,8 +381,8 @@ fn ci_step_order_is_load_bearing() {
     let raw =
         std::fs::read_to_string(&wf).unwrap_or_else(|e| panic!("读不到 {}: {e}", wf.display()));
     let cronet = raw
-        .find("run: node scripts/fetch-cronet.mjs --platform=win")
-        .expect("package.yml 里找不到 Windows fetch-cronet 步骤");
+        .find("run: node scripts/fetch-core.mjs")
+        .expect("package.yml 里找不到 fetch-core 步骤");
     let gate = raw
         .find("--test kernel_accepts_outbounds")
         .expect("package.yml 里找不到本门的 run 命令");
@@ -2225,48 +2225,9 @@ fn bundled_core_accepts_cert_pinned_tls_outbounds() {
 
 /// Only the currently bound historical source may explain a missing report.
 /// A new report's bad JSON/schema or an ordinary execution failure never means legacy.
-fn admitted_utls_report(
-    success: bool,
-    stdout: &[u8],
-    stderr: &[u8],
-    known_legacy_source: bool,
-) -> Result<Option<Value>, String> {
-    let stdout_text = std::str::from_utf8(stdout)
-        .map_err(|error| format!("TLS capability stdout UTF-8: {error}"))?
-        .replace("\r\n", "\n");
-    let stderr_text = std::str::from_utf8(stderr)
-        .map_err(|error| format!("TLS capability stderr UTF-8: {error}"))?;
-    let help = stdout_text.trim();
-    let missing = stderr_text
-        .trim()
-        .strip_prefix("Error: ")
-        .unwrap_or(stderr_text.trim());
-    let explicit_missing = !success
-        && help.is_empty()
-        && matches!(
-            missing,
-            "unknown command \"tls-fingerprints\" for \"sing-box tools\""
-                | "No help topic for 'tls-fingerprints'"
-        );
-    // The pinned 577d4b9 tools command has Short="Experimental tools" and no
-    // runnable handler. Cobra v1.10.2 can return its help with exit 0.
-    let old_tools_help = success
-        && stderr_text.trim().is_empty()
-        && help.starts_with("Experimental tools\n\nUsage:\n")
-        && help
-            .lines()
-            .any(|line| line.trim() == "sing-box tools [command]")
-        && help.contains("\nAvailable Commands:\n")
-        && help.contains("\nFlags:\n")
-        && help.ends_with(
-            "Use \"sing-box tools [command] --help\" for more information about a command.",
-        )
-        && !help.contains("tls-fingerprints");
-    if known_legacy_source && (explicit_missing || old_tools_help) {
-        return Ok(None);
-    }
+fn admitted_utls_report(success: bool, stdout: &[u8]) -> Result<Value, String> {
     if !success {
-        return Err("TLS capability command failed without a bound legacy response".into());
+        return Err("TLS capability command failed".into());
     }
     let report: Value = serde_json::from_slice(stdout)
         .map_err(|error| format!("actual TLS report JSON: {error}"))?;
@@ -2281,38 +2242,24 @@ fn admitted_utls_report(
     {
         return Err("actual TLS capability schema or profile inventory differs".into());
     }
-    Ok(Some(report))
+    Ok(report)
 }
 
 #[test]
-fn tls_report_legacy_help_requires_exact_bound_source_and_new_reports_fail_closed() {
-    let help = b"Experimental tools\n\nUsage:\n  sing-box tools [command]\n\nAvailable Commands:\n  fetch       Fetch a resource\n\nFlags:\n  -h, --help   help for tools\n\nUse \"sing-box tools [command] --help\" for more information about a command.\n";
-    assert!(admitted_utls_report(true, help, b"", true)
-        .unwrap()
-        .is_none());
-    assert!(admitted_utls_report(true, help, b"", false).is_err());
-    let missing = b"Error: unknown command \"tls-fingerprints\" for \"sing-box tools\"";
-    assert!(admitted_utls_report(false, b"", missing, true)
-        .unwrap()
-        .is_none());
-    assert!(admitted_utls_report(false, b"", missing, false).is_err());
-    for legacy in [false, true] {
-        for bad in [
-            &b"{broken"[..],
-            &b""[..],
-            &b"ordinary output"[..],
-            &br#"{"schema":"wrong","enabled":true,"profiles":[],"legacyChromeAliases":[]}"#[..],
-            &br#"{"schema":"polaris-tls-fingerprint-capabilities-v1","enabled":true,"profiles":"wrong","legacyChromeAliases":[]}"#[..],
-        ] {
-            assert!(admitted_utls_report(true, bad, b"", legacy).is_err());
-        }
-        assert!(admitted_utls_report(false, b"", b"permission denied", legacy).is_err());
-        assert!(admitted_utls_report(false, help, b"", legacy).is_err());
+fn tls_report_requires_the_capability_schema_and_fails_closed() {
+    let help = b"Experimental tools\n\nUsage:\n  sing-box tools [command]\n";
+    for bad in [
+        &b"{broken"[..],
+        &b""[..],
+        &help[..],
+        &br#"{"schema":"wrong","enabled":true,"profiles":[],"legacyChromeAliases":[]}"#[..],
+        &br#"{"schema":"polaris-tls-fingerprint-capabilities-v1","enabled":true,"profiles":"wrong","legacyChromeAliases":[]}"#[..],
+    ] {
+        assert!(admitted_utls_report(true, bad).is_err());
     }
     let report = br#"{"schema":"polaris-tls-fingerprint-capabilities-v1","enabled":true,"profiles":[{"id":"chrome_155"}],"legacyChromeAliases":[]}"#;
-    assert!(admitted_utls_report(true, report, b"", false)
-        .unwrap()
-        .is_some());
+    assert!(admitted_utls_report(false, report).is_err());
+    assert!(admitted_utls_report(true, report).is_ok());
 }
 
 /// Admission uses the final downloaded binary, not a library constant. This is
@@ -2323,9 +2270,7 @@ fn bundled_core_accepts_every_admitted_utls_profile_and_rejects_unknown() {
     use polaris_config_engine::singbox::dns::DomainResolver;
     use polaris_config_engine::user_config::protocol_settings::TlsSettings;
     use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode};
-    use polaris_config_engine::user_config::utls::{
-        effective_server_for_platform, UtlsMode, SUPPORTED_PROFILES,
-    };
+    use polaris_config_engine::user_config::utls::{effective_server_for_platform, UtlsMode};
     let Some(core) = core_or_skip("uTLS JSON profile admission") else {
         return;
     };
@@ -2346,71 +2291,34 @@ fn bundled_core_accepts_every_admitted_utls_profile_and_rejects_unknown() {
     } else {
         build.goarch
     };
-    // Query the exact final bytes. Old CLI versions lack this command: their
-    // historical IDs still get actual check coverage, without advertising new IDs.
+    // Query the exact final bytes.
     let output = support::core_locator::command_for_core_target(&target, &core)
         .args(["tools", "tls-fingerprints"])
         .output()
         .unwrap();
-    let legacy_profiles: Vec<&str> = SUPPORTED_PROFILES
+    let report =
+        admitted_utls_report(output.status.success(), &output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{error}; stdout={:?}; stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(report["os"], build.goos);
+    assert_eq!(report["arch"], build.goarch);
+    let actual_profiles: Vec<&str> = report["profiles"]
+        .as_array()
+        .unwrap()
         .iter()
-        .copied()
-        .filter(|id| {
-            ![
-                "chrome_155",
-                "chrome_133",
-                "firefox_148",
-                "firefox_120",
-                "safari_26_3",
-                "safari_16_0",
-            ]
-            .contains(id)
-        })
-        .collect();
-    let manifest: Value = serde_json::from_slice(
-        &std::fs::read(repo_root().join("src-tauri/core-manifest.json")).unwrap(),
-    )
-    .unwrap();
-    let bound = &manifest["desktopRelease"];
-    let known_legacy_source = std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_none()
-        && bound["sourceCommit"] == "577d4b9a089b71d2f0a4ca334b87264b55c10478"
-        && bound["sourceTree"] == "072dacb999c07c7948816f10efaaaf371da45eb9"
-        && bound["version"] == "1.15.0-alpha.12";
-    let reported = admitted_utls_report(
-        output.status.success(),
-        &output.stdout,
-        &output.stderr,
-        known_legacy_source,
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "{error}; stdout={:?}; stderr={:?}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    let actual_profiles: Vec<&str> = match &reported {
-        Some(report) => {
-            assert_eq!(report["schema"], "polaris-tls-fingerprint-capabilities-v1");
-            assert_eq!(report["enabled"], true, "final core must include with_utls");
-            assert_eq!(report["os"], build.goos);
-            assert_eq!(report["arch"], build.goarch);
-            report["profiles"]
+        .map(|p| p["id"].as_str().unwrap())
+        .chain(
+            report["legacyChromeAliases"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|p| p["id"].as_str().unwrap())
-                .chain(
-                    report["legacyChromeAliases"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|id| id.as_str().unwrap()),
-                )
-                .collect()
-        }
-        None => legacy_profiles,
-    };
+                .map(|id| id.as_str().unwrap()),
+        )
+        .collect();
     let mut last = Value::Null;
     let intents = std::iter::once((Some(UtlsMode::Disabled), None))
         .chain(std::iter::once((Some(UtlsMode::Default), None)))

@@ -15,7 +15,6 @@ pub(crate) use recovery::stage_recovery_installation;
 pub(crate) use recovery::tests::Fixture as RecoveryFixture;
 const APP_INSTALLATION: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/selected-core-manifest.json"));
-const APP_SOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/validation-core-source.json"));
 const APP_RECOVERY: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/selected-core-recovery-inventory.json"
@@ -31,7 +30,6 @@ fn check_compiled_selection() -> Result<(), String> {
         || APP_DEVELOPMENT_CONTRACT
             != polaris_core_supervisor::selected_core::COMPILED_DEVELOPMENT_CONTRACT
         || APP_INSTALLATION != polaris_core_supervisor::selected_core::COMPILED_INSTALLATION
-        || APP_SOURCE != polaris_core_supervisor::selected_core::COMPILED_VALIDATION_SOURCE
         || APP_RECOVERY != polaris_core_supervisor::selected_core::COMPILED_RECOVERY_INVENTORY
     {
         return Err(
@@ -56,13 +54,9 @@ pub(crate) fn selected_source_commit(platform: &str) -> Result<String, String> {
     check_compiled_selection()?;
     polaris_core_supervisor::selected_core::selected_source_commit(platform)
 }
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[cfg(test)]
-pub(crate) use polaris_core_supervisor::selected_core::selected_check_source;
 #[cfg(test)]
 use polaris_core_supervisor::selected_core::{
-    formal_manifest, formal_provider_fingerprint, selected_source_from, COMPILED_INSTALLATION,
-    COMPILED_VALIDATION_SOURCE, RELEASE_CONTRACT,
+    formal_manifest, formal_provider_fingerprint, COMPILED_INSTALLATION, RELEASE_CONTRACT,
 };
 
 pub(crate) use polaris_core_supervisor::admitted_payload::{

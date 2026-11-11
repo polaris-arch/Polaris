@@ -22,10 +22,10 @@
  *    而这期间 `unzip -t` 全绿、装得上、跑得起来，① 与 ③ 两条判据一条都不会说话：
  *    它们只问「该在的成员在不在、内容对不对」，不问「包本身是不是有一半是垃圾」。
  *
- * ③ **构建 tag 掉了**：`libbox.aar` 由 `scripts/build-libbox.sh` 现场构建，其坑② 明确记着
+ * ③ **构建 tag 掉了**：`libbox.aar` 由 `scripts/build-mobile-core.sh android` 现场构建；已知坑：
  *    「NDK 27 链 cronet 的预编译 .a 会报 unknown relocation ⇒ **不能靠摘掉 with_naive_outbound 绕过**」。
  *    摘掉之后一切照常：aar 出得来、APK 打得出、CI 全绿，只有真机上 naive/H3 节点静默连不上。
- *    判据形状抄 `scripts/build-libbox.sh` 尾部那段 aar 开箱验（四 ABI + cronet/naive 计数），
+ *    判据形状沿用原 aar 开箱验（四 ABI + cronet/naive 计数），
  *    射程从 aar 挪到**最终 APK**：aar 对了但 AGP 没把它的 jni 合并进包，同样只有这里看得见。
  *
  * ④ **原生库的 debug 信息回来了**（2026-09-05 实证）：Android 的剥符号开关是
@@ -171,8 +171,7 @@ export function parseArgs(argv) {
 export const NATIVE_LIBS = Object.freeze(['libbox.so', 'libpolaris_lib.so', 'libc++_shared.so']);
 
 /**
- * `libbox.so` 里的构建 tag 指纹。阈值与形状抄 `scripts/build-libbox.sh` 尾部的 aar 开箱验，
- * 判据是 `count > min`（严格大于，与那边逐字一致）。
+ * `libbox.so` 里的构建 tag 指纹。判据是 `count > min`（严格大于）。
  *
  * 为什么用计数而不是「出现过就算」：符号表 / 路径串里蹭到一次 `naive` 是噪声，
  * 真链进 cronet-go 时这两个串是成百上千次量级（本机实测：cronet 1201、naive 223）。
@@ -741,7 +740,7 @@ function debugOwnerHint(lib) {
     return '本仓 Rust 侧：`.cargo/config.toml` 的 `[target.*-linux-android*] rustflags = ["-C", "strip=debuginfo"]` 四段是否被删/改';
   }
   if (lib === 'libbox.so') {
-    return 'sing-box 内核侧：`scripts/build-libbox.sh` 的 gomobile/Go 链接期参数（这份不经 rustc，与上面那四段无关）';
+    return 'sing-box 内核侧：`scripts/build-mobile-core.sh android`（scripts/mobile-core）的 gomobile/Go 链接期参数（这份不经 rustc，与上面那四段无关）';
   }
   return 'NDK 预编译件（由 tauri 那一步 symlink 进 jniLibs）：只能在打包侧剥，或换一份 NDK';
 }
@@ -859,7 +858,7 @@ export function apkViolations({
       if (count <= min) {
         fail(
           `${boxEntry} 里 '${needle}' 只出现 ${count} 次（要求 > ${min}）—— ${why}。\n` +
-            '  判据来源：scripts/build-libbox.sh 尾部的 aar 开箱验，同一阈值同一形状。',
+            '  内核构建入口：scripts/build-mobile-core.sh android。',
         );
       }
     }

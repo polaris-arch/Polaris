@@ -1,6 +1,6 @@
 name: Apple unsigned App and PacketTunnel
 
-# One admitted host builds or revalidates the two-slice component. Device App and
+# One admitted host builds the two-slice component. Device App and
 # PacketTunnel are required; the simulator carrier is an explicit manual opt-in.
 # Keep exact tools, originals/exports, and strict declared-scope aggregation.
 on:
@@ -9,10 +9,6 @@ on:
       candidate:
         type: string
         required: true
-      allow_merge_reuse:
-        description: Allow verified same-tree PR evidence only for an ordinary main push
-        type: boolean
-        default: false
       include_simulator:
         description: Also compile the unsigned sim-arm64 App and PacketTunnel
         type: boolean
@@ -20,10 +16,6 @@ on:
       preserve_run:
         type: boolean
         default: false
-    outputs:
-      evidence_mode:
-        description: Whether unsigned Apple evidence was rebuilt or verified from a same-tree PR run
-        value: ${{ jobs.unsigned-chain.outputs.evidence_mode }}
   workflow_dispatch:
     inputs:
       include_simulator:
@@ -41,54 +33,13 @@ env:
   PYTHONDONTWRITEBYTECODE: '1'
   POLARIS_APP_CANDIDATE: ${{ inputs.candidate || github.sha }}
   POLARIS_APPLE_SCOPE: ${{ inputs.include_simulator && 'device-and-simulator' || 'device-only' }}
-  # Only successful Release Risk PR builds become future same-tree reuse sources.
-  # Standalone/manual/main fallback/merge-group builds retain their original gate.
-  POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: ${{ github.event_name == 'pull_request' && contains(github.workflow_ref, '/.github/workflows/release-risk.yml@') && !inputs.include_simulator && 'true' || 'false' }}
-  # Cache trust is the repository's trusted-main execution/cache-write boundary.
-  # PR/manual/tag runs neither restore nor save this complete-component cache.
-  # Historical run IDs are provenance labels only; no live old-run API is needed.
-  POLARIS_APPLE_COMPONENT_CACHE_ALLOWED: ${{ github.repository == 'polaris-arch/Polaris' && github.event_name == 'push' && github.ref == 'refs/heads/main' && (inputs.candidate || github.sha) == github.sha && github.workflow_ref == format('{0}/.github/workflows/release-risk.yml@refs/heads/main', github.repository) && 'true' || 'false' }}
 
 concurrency:
   group: apple-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}-${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && github.run_id || 'tip' }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && github.event_name != 'merge_group' && (github.event_name == 'push' || github.event_name == 'pull_request') }}
 
 jobs:
-  resolve:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      # A resolver miss, command failure or receipt upload failure must build.
-      reused: ${{ steps.resolve.outcome == 'success' && steps.receipt.outcome == 'success' && steps.resolve.outputs.reused == 'true' && 'true' || 'false' }}
-      receipt_sha256: ${{ steps.resolve.outputs.receipt_sha256 }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.candidate || github.sha }}
-      - name: Resolve complete same-tree PR evidence or request a full build
-        id: resolve
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          POLARIS_APPLE_ALLOW_MERGE_REUSE: ${{ inputs.allow_merge_reuse && github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.include_simulator && 'true' || 'false' }}
-        run: python3 -B scripts/mobile-core/apple_merge_reuse.py resolve --output "$RUNNER_TEMP/apple-merge-reuse.json"
-      - name: Preserve the resolver receipt without relabeling original evidence
-        id: receipt
-        if: ${{ steps.resolve.outcome == 'success' && steps.resolve.outputs.reused == 'true' }}
-        continue-on-error: true
-        uses: actions/upload-artifact@v7
-        with:
-          name: apple-merge-reuse-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/apple-merge-reuse.json
-          if-no-files-found: error
-          retention-days: 7
-
   component:
-    needs: resolve
-    if: ${{ !cancelled() && !(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true') }}
     runs-on: xcode-27
     timeout-minutes: 180
     steps:
@@ -97,19 +48,9 @@ jobs:
           ref: ${{ inputs.candidate || github.sha }}
       - name: Reject a mismatched runner before installing tools or transporting inputs
         run: python3 -B scripts/mobile-core/ci_apple.py admit
-      # tomllib is standard-library only on Python 3.11+; never inherit runner defaults.
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Verify Python and Cargo configuration parser
-        run: |
-          python3 - <<'PYTHON'
-          import sys, tomllib
-          print('Apple evidence Python:', sys.version, sys.executable)
-          print('Cargo configuration parser:', tomllib.__file__)
-          if sys.version_info[:2] != (3, 12) or tomllib.loads('[profile.release]\nopt-level=3')['profile']['release']['opt-level'] != 3:
-              raise SystemExit('Python 3.12 with working standard-library tomllib is required')
-          PYTHON
       - name: Select the validated mobile Go toolchain
         id: mobile-go
         run: |
@@ -162,38 +103,9 @@ jobs:
           restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
       - name: Locked frontend dependencies
         run: pnpm --dir ui install --frozen-lockfile
-      - name: Recompute complete Go component source and actual tool inputs
-        id: go_component_cache
-        if: ${{ env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py component-cache-key
-      - name: Restore exact trusted-main complete Go component package
-        id: go_component_restore
-        if: ${{ env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' && steps.go_component_cache.conclusion == 'success' && steps.go_component_cache.outputs.eligible == 'true' }}
-        continue-on-error: true
-        uses: actions/cache/restore@v5
-        with:
-          path: target/apple-go-component-cache
-          key: apple-go-component-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_component_cache.outputs.identity }}
-      # A missing or invalid package is a fresh bind, never a skipped component.
-      # Restored data is admitted before it can install any original-path bytes.
-      - name: Snapshot complete frontend execution inputs before the build
-        if: ${{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' }}
-        run: python3 -B scripts/mobile-core/apple_merge_reuse.py snapshot --phase frontend-before
       - name: Frontend resources and admitted two-slice arm64 component
         id: shared_component
         run: python3 -B scripts/mobile-core/ci_apple.py build
-      - name: Snapshot complete frontend execution inputs after the build
-        if: ${{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' && !cancelled() && steps.shared_component.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_merge_reuse.py snapshot --phase frontend-after
-      - uses: actions/upload-artifact@v7
-        id: component_payload
-        with:
-          name: apple-component-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/component-handoff.zip
-            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/component-transport.json
-          if-no-files-found: error
-          retention-days: 7
       - uses: actions/upload-artifact@v7
         id: component_manifest
         with:
@@ -219,17 +131,6 @@ jobs:
         id: local_component
         if: ${{ !cancelled() && steps.shared_component.conclusion == 'success' }}
         run: python3 -B scripts/mobile-core/ci_apple.py import-local
-      - name: Retain complete verified Go originals for an equivalent main consumer
-        id: go_component_export
-        if: ${{ !cancelled() && env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' && steps.local_component.conclusion == 'success' && steps.go_component_cache.outputs.eligible == 'true' && steps.go_component_restore.outputs.cache-hit != 'true' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py component-cache-export
-      - name: Save exact trusted-main component package
-        if: ${{ !cancelled() && env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' && steps.go_component_export.conclusion == 'success' && steps.go_component_export.outputs.exported == 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@v5
-        with:
-          path: target/apple-go-component-cache
-          key: apple-go-component-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_component_cache.outputs.identity }}
       - name: Pinned protobuf compiler
         id: protoc
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
@@ -262,24 +163,17 @@ jobs:
 
       - name: Require all shared carrier prerequisites
         id: shared_ready
-        if: ${{ !cancelled() && steps.swift_lifecycle.conclusion == 'success' && steps.shared_component.conclusion == 'success' && steps.component_payload.conclusion == 'success' && steps.component_manifest.conclusion == 'success' && steps.component_original.conclusion == 'success' && steps.local_component.conclusion == 'success' && steps.protoc.conclusion == 'success' && steps.rust_cache.conclusion == 'success' && steps.rust_registry_restore.conclusion == 'success' && steps.rust_device_ready.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.swift_lifecycle.conclusion == 'success' && steps.shared_component.conclusion == 'success' && steps.component_manifest.conclusion == 'success' && steps.component_original.conclusion == 'success' && steps.local_component.conclusion == 'success' && steps.protoc.conclusion == 'success' && steps.rust_cache.conclusion == 'success' && steps.rust_registry_restore.conclusion == 'success' && steps.rust_device_ready.conclusion == 'success' }}
         run: |
           set -euo pipefail
           echo "Exact component, original transport, protobuf and cache prerequisites succeeded"
           # The same host/source lifecycle controls already passed before the
           # component build. Reuse that required outcome, not a second compile.
 
-      - name: Snapshot complete device carrier execution inputs before compilation
-        id: carrier_before
-        if: ${{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' && !cancelled() && steps.shared_ready.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_merge_reuse.py snapshot --phase carrier-before --slot device-arm64
       - name: Real device-arm64 Rust and unsigned App plus PacketTunnel
         id: device_arm64
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' && (env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT != 'true' || steps.carrier_before.conclusion == 'success') }}
+        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
         run: python3 -B scripts/mobile-core/ci_apple.py carrier --slot "device-arm64"
-      - name: Snapshot complete device carrier execution inputs before preserving originals
-        if: ${{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' && !cancelled() && steps.device_arm64.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_merge_reuse.py snapshot --phase carrier-after --slot device-arm64
       - name: Preserve device-arm64 originals before another target touches staging
         if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
         run: python3 -B scripts/mobile-core/ci_apple.py evidence --slot "device-arm64"
@@ -387,51 +281,20 @@ jobs:
         if: ${{ inputs.include_simulator && !cancelled() && steps.original_sim_arm64.conclusion == 'success' && (steps.rust_sim_export.conclusion == 'skipped' || steps.rust_sim_return.conclusion == 'success') }}
         run: python3 -B scripts/mobile-core/ci_apple.py retire-slot --slot "sim-arm64"
 
-      - name: Preserve same-host retirement observations
-        uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
-        with:
-          name: apple-host-retirement-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/retirement-*.json
-            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/apple-cache-*.json
-          if-no-files-found: warn
-          retention-days: 7
-
   unsigned-chain:
-    needs: [resolve, component]
+    needs: component
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      evidence_mode: ${{ steps.result.outputs.evidence_mode }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate || github.sha }}
-      - name: Download the exact resolver receipt for this attempt
-        if: ${{ needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true' }}
-        uses: actions/download-artifact@v8
-        with:
-          name: apple-merge-reuse-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/apple-merge-reuse
-      - name: Verify same-tree evidence receipt against the current candidate and context
-        id: reuse_verified
-        if: ${{ needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true' }}
-        env:
-          POLARIS_APPLE_ALLOW_MERGE_REUSE: ${{ inputs.allow_merge_reuse && github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.include_simulator && 'true' || 'false' }}
-          RECEIPT_SHA256: ${{ needs.resolve.outputs.receipt_sha256 }}
-        run: python3 -B scripts/mobile-core/apple_merge_reuse.py check-result --receipt "$RUNNER_TEMP/apple-merge-reuse/apple-merge-reuse.json" --expected-sha "$RECEIPT_SHA256"
       - uses: actions/download-artifact@v8
-        if: ${{ !(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true') }}
         with:
           name: apple-component-manifest-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/apple-chain/component
       - uses: actions/download-artifact@v8
-        if: ${{ !(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true') }}
         with:
           name: apple-carrier-summary-device-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/apple-chain/device-arm64
@@ -441,8 +304,6 @@ jobs:
           name: apple-carrier-summary-sim-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/apple-chain/sim-arm64
       - name: Strict declared-scope same-run candidate/source/component aggregate
-        id: aggregate
-        if: ${{ !(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true') }}
         env:
           COMPONENT_RESULT: ${{ needs.component.result }}
         shell: bash
@@ -458,79 +319,3 @@ jobs:
             printf '%s\n' 'sim-arm64: not requested.' >> "$GITHUB_STEP_SUMMARY"
           fi
           printf '%s\n' 'Shared Libbox component retains both arm64 slices. No signing, device execution or publication acceptance.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
-        id: chain
-        if: ${{ always() && !(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true') }}
-        with:
-          name: apple-chain-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/apple-chain.json
-          if-no-files-found: error
-          retention-days: 7
-      - name: Seal complete execution inputs against uploaded original evidence and chain
-        id: execution_contract
-        if: ${{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' && !cancelled() && steps.aggregate.conclusion == 'success' && steps.chain.conclusion == 'success' }}
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -B scripts/mobile-core/apple_merge_reuse.py seal --summaries "$RUNNER_TEMP/apple-chain" --chain "$RUNNER_TEMP/apple-chain.json" --output "$RUNNER_TEMP/apple-execution-contract.json"
-      - name: Preserve the complete full-build execution contract
-        id: execution_contract_upload
-        if: ${{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' && !cancelled() && steps.execution_contract.conclusion == 'success' && steps.execution_contract.outputs.eligible == 'true' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: apple-execution-contract-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/apple-execution-contract.json
-          if-no-files-found: error
-          retention-days: 7
-      - name: Require verified reuse or the complete current-attempt build chain
-        id: result
-        if: always()
-        env:
-          RESOLVE_RESULT: ${{ needs.resolve.result }}
-          REUSED: ${{ needs.resolve.outputs.reused }}
-          COMPONENT_RESULT: ${{ needs.component.result }}
-          REUSE_VERIFIED: ${{ steps.reuse_verified.conclusion }}
-          AGGREGATE_RESULT: ${{ steps.aggregate.conclusion }}
-          CHAIN_RESULT: ${{ steps.chain.conclusion }}
-          CONTRACT_RESULT: ${{ steps.execution_contract.conclusion }}
-          CONTRACT_ELIGIBLE: ${{ steps.execution_contract.outputs.eligible }}
-          CONTRACT_UPLOAD_RESULT: ${{ steps.execution_contract_upload.conclusion }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RESOLVE_RESULT" = success ] && [ "$REUSED" = true ]; then
-            [ "$POLARIS_APPLE_SCOPE" = device-only ] && [ "$POLARIS_APPLE_PRODUCE_REUSE_CONTRACT" = false ] && \
-              [ "$COMPONENT_RESULT" = skipped ] && [ "$REUSE_VERIFIED" = success ] && \
-              [ "$AGGREGATE_RESULT" = skipped ] && [ "$CHAIN_RESULT" = skipped ] && \
-              [ "$CONTRACT_RESULT" = skipped ] && [ "$CONTRACT_UPLOAD_RESULT" = skipped ] || {
-              echo '::error::Apple reuse requires a verified receipt and no current-attempt build chain'; exit 1; }
-            echo 'evidence_mode=reused' >> "$GITHUB_OUTPUT"
-            printf '%s\n' 'Apple device-arm64: reused verified same-tree PR unsigned App + PacketTunnel compile/link evidence; no new compilation in this run.' 'sim-arm64: not requested.' 'Original evidence retains its source run identity. No signing, device execution or publication acceptance.' >> "$GITHUB_STEP_SUMMARY"
-          else
-            [ "$COMPONENT_RESULT" = success ] && [ "$REUSE_VERIFIED" = skipped ] && \
-              [ "$AGGREGATE_RESULT" = success ] && [ "$CHAIN_RESULT" = success ] || {
-              echo '::error::Apple full build requires a successful component and strict uploaded aggregate'; exit 1; }
-            case "$POLARIS_APPLE_SCOPE" in
-              device-only|device-and-simulator) ;;
-              *) echo '::error::Unknown Apple scope'; exit 1 ;;
-            esac
-            if [ "$POLARIS_APPLE_PRODUCE_REUSE_CONTRACT" = true ]; then
-              [ "$POLARIS_APPLE_SCOPE" = device-only ] && [ "$CONTRACT_RESULT" = success ] || {
-                echo '::error::Release Risk device-only PR execution-input verification failed'; exit 1; }
-              if [ "$CONTRACT_ELIGIBLE" = true ]; then
-                [ "$CONTRACT_UPLOAD_RESULT" = success ] || {
-                  echo '::error::Reusable full build lacks a complete uploaded execution contract'; exit 1; }
-              elif [ "$CONTRACT_ELIGIBLE" = false ]; then
-                [ "$CONTRACT_UPLOAD_RESULT" = skipped ] || {
-                  echo '::error::Ineligible full build must not upload an execution contract'; exit 1; }
-                printf '%s\n' 'Full native build passed; unsupported Cargo inputs make its evidence ineligible for later reuse.' >> "$GITHUB_STEP_SUMMARY"
-              else
-                echo '::error::Unknown Apple execution-input eligibility'; exit 1
-              fi
-            elif [ "$POLARIS_APPLE_PRODUCE_REUSE_CONTRACT" = false ]; then
-              [ "$CONTRACT_RESULT" = skipped ] && [ "$CONTRACT_UPLOAD_RESULT" = skipped ] || {
-                echo '::error::This Apple build cannot produce a PR device-only reuse contract'; exit 1; }
-            else
-              echo '::error::Unknown Apple execution-contract requirement'; exit 1
-            fi
-            echo 'evidence_mode=rebuilt' >> "$GITHUB_OUTPUT"
-          fi

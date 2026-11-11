@@ -6144,7 +6144,7 @@ async fn generation_identity_is_shared_by_staged_save_pending_and_explicit_apply
             "{axis}"
         );
 
-        // Seed D through the existing real managed opt-in, not a UserConfig
+        // Seed D as an existing managed document on disk, not a UserConfig
         // field, untrusted ledger save or private cache bypass. R is the prior
         // accepted test-core snapshot; no process/service exists in this fixture.
         let policy: MeshRoutePolicy =
@@ -6155,8 +6155,24 @@ async fn generation_identity_is_shared_by_staged_save_pending_and_explicit_apply
         legacy.as_object_mut().unwrap().remove("meshRoutePolicy");
         legacy.as_object_mut().unwrap().remove("meshRouteState");
         rt.config.save_full(&legacy).unwrap();
-        rt.config.prepare_mesh_route_enable("local").unwrap();
-        rt.config.commit_prepared_mesh_route(policy, state).unwrap();
+        let mut raw: Value =
+            serde_json::from_slice(&std::fs::read(rt.config.path()).unwrap()).unwrap();
+        raw["meshRoutePolicy"] = serde_json::to_value(policy).unwrap();
+        raw["meshRouteState"] = serde_json::to_value(&state).unwrap();
+        std::fs::write(rt.config.path(), serde_json::to_vec(&raw).unwrap()).unwrap();
+        std::fs::write(
+            rt.config
+                .dir()
+                .join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "phase": "enabled",
+                "localId": state.local_id,
+                "legacyConfigDigest": "0".repeat(64),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        rt.config.load_full().unwrap();
         let disk = rt.config.current().unwrap();
         assert_eq!(
             tailnet_generation_identity(&disk),

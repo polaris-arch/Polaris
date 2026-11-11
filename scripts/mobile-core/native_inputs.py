@@ -12,7 +12,7 @@ def source_table(files, *, reader=None):
     """Build origin facts from local originals or a bounded archive reader."""
     reader = read_pinned if reader is None else reader
     require(0 < len(files) <= 65536, 'native source file count budget')
-    helper = module('origin_buildinfo', 'scripts/libbox-patches/android-source.py')
+    helper = module('origin_buildinfo', 'scripts/mobile-core/android-source.py')
     carrier = module('origin_container', 'scripts/apple-carrier.py')
     origins = defaultdict(list)
     rows = characters = 0
@@ -85,14 +85,14 @@ def member_references(output, origins):
 
 def origin_identity(row):
     """One bounded, hashable identity; never sort/copy a full origins list."""
-    require(isinstance(row, dict), 'invalid legacy/static origin identity')
+    require(isinstance(row, dict), 'invalid static origin identity')
     keys = {'kind', 'path', 'sha256'}
     archive = row.get('kind') == 'external-static-archive'
     if archive: keys |= {'archiveSha256', 'sliceOrdinal', 'memberOrdinal'}
     require(set(row) == keys and row.get('kind') in ('compiler-object', 'external-static-archive')
             and isinstance(row.get('path'), str) and 0 < len(row['path']) <= 4096
             and isinstance(row.get('sha256'), str) and re.fullmatch('[0-9a-f]{64}', row['sha256']),
-            'invalid legacy/static origin identity')
+            'invalid static origin identity')
     identity = (row['kind'], row['path'], row['sha256'])
     if archive:
         require(isinstance(row['archiveSha256'], str) and re.fullmatch('[0-9a-f]{64}', row['archiveSha256'])
@@ -104,22 +104,16 @@ def origin_identity(row):
 
 def verify_mapping_shape(facts, refs):
     mapping = facts.get('staticMemberOrigins')
-    require(isinstance(mapping, dict) and mapping.keys() == refs.keys(),
-            'static source table/member targets required')
-    legacy = facts['schema'] == 'polaris-mobile-native-inputs-v1'
-    keys = {'memberOrdinal', 'sha256'} | ({'origins'} if legacy else set())
+    require(facts['schema'] == 'polaris-mobile-native-inputs-v2' and isinstance(mapping, dict)
+            and mapping.keys() == refs.keys(), 'static source table/member targets required')
     for target, wanted in refs.items():
         rows = mapping[target]
         require(isinstance(rows, list) and len(rows) == len(wanted), 'static source table/member counts differ')
         for row, reference in zip(rows, wanted):
-            require(isinstance(row, dict) and set(row) == keys and type(row.get('memberOrdinal')) is int
+            require(isinstance(row, dict) and set(row) == {'memberOrdinal', 'sha256'} and type(row.get('memberOrdinal')) is int
                     and row['memberOrdinal'] == reference['memberOrdinal'] and row.get('sha256') == reference['sha256'],
                     'static source table/member references differ')
-            if legacy:
-                require(isinstance(row['origins'], list) and 0 < len(row['origins']) <= 65536,
-                        'legacy actual source/member origins required')
-    if not legacy:
-        require(isinstance(facts.get('originsByDigest'), dict), 'actual source table/member origins required')
+    require(isinstance(facts.get('originsByDigest'), dict), 'actual source table/member origins required')
 
 
 def collect(scratch, log, platform, output, cache):
@@ -190,24 +184,8 @@ def verify(facts, scratch=None, log=None, output=None):
             require(file_pin(p) == {key: pin[key] for key in ('bytes', 'sha256')}, 'actual native input bytes changed')
     if static:
         actual = bind_origins(refs, source_table(facts['files']))
-        if facts['schema'] == 'polaris-mobile-native-inputs-v2':
-            require(facts.get('originsByDigest') == actual and facts.get('staticMemberOrigins') == refs,
-                    'actual source table/member references/counts differ')
-            for choices in facts['originsByDigest'].values():
-                require(isinstance(choices, list), 'actual source table/member origins required')
-                for origin in choices: origin_identity(origin)
-        else:
-            # Normalize each actual digest's complete candidates only once. The
-            # historical inline input is already expanded; scan each old list
-            # with one bounded counter, without an expanded expected mapping.
-            normalized = {digest: Counter(origin_identity(row) for row in choices)
-                          for digest, choices in actual.items()}
-            for rows in facts['staticMemberOrigins'].values():
-                for row in rows:
-                    digest = row['sha256']; expected = normalized[digest]
-                    require(len(row['origins']) == len(actual[digest]), 'legacy actual source/member origin counts differ')
-                    seen = Counter()
-                    for origin in row['origins']:
-                        key = origin_identity(origin)
-                        seen[key] += 1
-                        require(seen[key] <= expected.get(key, 0), 'legacy actual source/member origins differ')
+        require(facts.get('originsByDigest') == actual and facts.get('staticMemberOrigins') == refs,
+                'actual source table/member references/counts differ')
+        for choices in facts['originsByDigest'].values():
+            require(isinstance(choices, list), 'actual source table/member origins required')
+            for origin in choices: origin_identity(origin)

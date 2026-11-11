@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CRONET_REQUIRED_EXPORTS, inspectCronetBytes, verifyCronetPayload } from './cronet-payload.mjs';
 
@@ -73,9 +73,24 @@ export function cronetFixture(platform, options = {}) {
   return bytes;
 }
 
-export const fixtureManifest = (bytes) => {
+// The checked-in release contract with both Cronet pins bound to the fixture bytes.
+export const fixtureContract = (bytes) => {
   const sha = createHash('sha256').update(bytes).digest('hex');
-  return { cronetLibrarySha256: { linux: sha, win: sha } };
+  const contract = JSON.parse(readFileSync(new URL('../desktop-core/release-contract.json', import.meta.url), 'utf8'));
+  for (const key of ['linux', 'win']) {
+    const row = contract.platforms[key];
+    Object.assign(row.sidecar, { bytes: bytes.length, sha256: sha });
+    row.archive.members[`${row.archive.root}/${row.sidecar.member}`] = sha;
+  }
+  return contract;
+};
+
+// Writes the contract under root and returns its exact three-key App selection.
+export const fixtureManifest = (root, contract) => {
+  const raw = JSON.stringify(contract), path = join(root, 'scripts/desktop-core/release-contract.json');
+  mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, raw);
+  return { desktopRelease: { schema: 'polaris-app-release-selection-v1', contractPath: 'scripts/desktop-core/release-contract.json',
+    contractSha256: createHash('sha256').update(raw).digest('hex') } };
 };
 
 // Other contract tests import only the inert fixture constructors above.
@@ -131,16 +146,16 @@ if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
     });
     test(`${platform}: source and final hash, permissions, symlinks and pin prerequisites are independent gates`, (t) => {
       const root = mkdtempSync(join(tmpdir(), 'polaris-cronet-bytes-')); t.after(() => rmSync(root, { recursive: true, force: true }));
-      const source = join(root, 'source'), payload = join(root, 'payload'), bytes = cronetFixture(platform), manifest = fixtureManifest(bytes);
+      const source = join(root, 'source'), payload = join(root, 'payload'), bytes = cronetFixture(platform), contract = fixtureContract(bytes);
       writeFileSync(source, bytes, { mode: 0o755 }); writeFileSync(payload, bytes, { mode: 0o755 });
-      assert.equal(verifyCronetPayload(source, payload, platform, manifest).bytes, bytes.length);
+      assert.equal(verifyCronetPayload(source, payload, platform, contract).bytes, bytes.length);
       const wrong = Buffer.from(bytes); wrong[0x210] ^= 1;
-      writeFileSync(payload, wrong); assert.throws(() => verifyCronetPayload(source, payload, platform, manifest), /final SHA/);
-      writeFileSync(payload, bytes); writeFileSync(source, wrong); assert.throws(() => verifyCronetPayload(source, payload, platform, manifest), /source SHA/);
-      writeFileSync(source, bytes); chmodSync(payload, 0o700); assert.throws(() => verifyCronetPayload(source, payload, platform, manifest), /permissions/);
-      chmodSync(payload, 0o755); assert.throws(() => verifyCronetPayload(source, payload, platform, {}), /cronetLibrarySha256/);
-      renameSync(payload, payload + '.real'); symlinkSync(payload + '.real', payload); assert.throws(() => verifyCronetPayload(source, payload, platform, manifest), /regular file/);
-      const dir = join(root, 'linked'); symlinkSync(root, dir); assert.throws(() => verifyCronetPayload(join(dir, 'source'), payload + '.real', platform, manifest), /ancestor/);
+      writeFileSync(payload, wrong); assert.throws(() => verifyCronetPayload(source, payload, platform, contract), /final SHA/);
+      writeFileSync(payload, bytes); writeFileSync(source, wrong); assert.throws(() => verifyCronetPayload(source, payload, platform, contract), /source SHA/);
+      writeFileSync(source, bytes); chmodSync(payload, 0o700); assert.throws(() => verifyCronetPayload(source, payload, platform, contract), /permissions/);
+      chmodSync(payload, 0o755); assert.throws(() => verifyCronetPayload(source, payload, platform, {}), /release library pin missing/);
+      renameSync(payload, payload + '.real'); symlinkSync(payload + '.real', payload); assert.throws(() => verifyCronetPayload(source, payload, platform, contract), /regular file/);
+      const dir = join(root, 'linked'); symlinkSync(root, dir); assert.throws(() => verifyCronetPayload(join(dir, 'source'), payload + '.real', platform, contract), /ancestor/);
     });
   }
 }

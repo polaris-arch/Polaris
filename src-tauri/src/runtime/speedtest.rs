@@ -871,101 +871,6 @@ impl Drop for PcTempBatchDispatch {
 }
 
 #[cfg(not(target_os = "android"))]
-pub(crate) struct TempProducerView {
-    custody: Arc<PcTempCoreCustody>,
-    producers: Vec<Arc<PcTempBatchProducer>>,
-    births: Vec<Arc<PcTempCoreBirth>>,
-}
-
-#[cfg(not(target_os = "android"))]
-impl TempProducerView {
-    pub(crate) fn member_count(&self) -> usize {
-        self.producers.len() + self.births.len()
-    }
-
-    pub(crate) fn verify_surrender(&self) -> Result<(), String> {
-        let current = self.custody.current()?;
-        let retired = self
-            .custody
-            .retired_births
-            .lock()
-            .map_err(|_| "Temp legacy tail custody poisoned")?;
-        for producer in &self.producers {
-            if !producer.finished.load(Ordering::SeqCst) {
-                if !producer.cancelled.load(Ordering::SeqCst) {
-                    return Err("original Temp batch dispatch has not returned".into());
-                }
-                if producer.factory_started.load(Ordering::SeqCst) {
-                    let birth = producer
-                        .birth
-                        .lock()
-                        .map_err(|_| "Temp batch birth binding poisoned")?
-                        .clone()
-                        .ok_or("cancelled unqualified Temp factory remains unknown")?;
-                    let native = birth
-                        .native
-                        .as_ref()
-                        .ok_or("cancelled legacy Temp factory remains unknown")?;
-                    native.verify_census_dispatch(&self.custody.identity, &birth.identity)?;
-                    if !birth.retired.load(Ordering::SeqCst)
-                        && birth
-                            .child
-                            .try_lock()
-                            .map_err(|_| "Temp child dispatch unresolved")?
-                            .is_none()
-                    {
-                        return Err(
-                            "cancelled Temp dispatch has not returned a physical Child".into()
-                        );
-                    }
-                }
-                // This original Rust body was dropped before factory, or its private
-                // factory returned to the retained exact birth. Uncovered tails stay typed.
-            }
-        }
-        let mut births = self.births.clone();
-        for producer in &self.producers {
-            if let Some(birth) = producer
-                .birth
-                .lock()
-                .map_err(|_| "Temp batch birth binding poisoned")?
-                .clone()
-            {
-                births.push(birth);
-            }
-        }
-        for birth in &births {
-            if !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some())
-                && !current
-                    .as_ref()
-                    .is_some_and(|owner| Arc::ptr_eq(owner, birth))
-                && !retired.iter().any(|owner| Arc::ptr_eq(owner, birth))
-            {
-                return Err("original Temp birth responsibility disappeared".into());
-            }
-            if let Some(native) = &birth.native {
-                native.verify_census_dispatch(&self.custody.identity, &birth.identity)?;
-            } else if birth.retired.load(Ordering::SeqCst) {
-                // Legacy native-only close carries explicit uncovered tails, never full terminal.
-            } else if birth
-                .child
-                .try_lock()
-                .map_err(|_| "Temp child dispatch unresolved")?
-                .is_none()
-            {
-                return Err("legacy Temp factory return is not known".into());
-            }
-        }
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-pub(crate) fn pc_temp_producer_view() -> Result<TempProducerView, String> {
-    PC_TEMP_CORE_CUSTODY.producer_view()
-}
-
-#[cfg(not(target_os = "android"))]
 struct PcTempCoreBirth {
     child: tokio::sync::Mutex<Option<Box<dyn LoginCoreChild>>>,
     pid: OnceLock<Option<u32>>,
@@ -1039,29 +944,6 @@ impl PcTempCoreCustody {
             .map_err(|_| "Temp legacy tail custody poisoned")?
             .retain(|birth| !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some()));
         Ok(())
-    }
-
-    fn producer_view(self: &Arc<Self>) -> Result<TempProducerView, String> {
-        self.prune_terminal()?;
-        let custody = Arc::clone(self);
-        let producers = custody
-            .producers
-            .lock()
-            .map_err(|_| "Temp producer custody poisoned")?
-            .clone();
-        let mut births = custody
-            .retired_births
-            .lock()
-            .map_err(|_| "Temp legacy tail custody poisoned")?
-            .clone();
-        if let Some(current) = custody.current()? {
-            births.push(current);
-        }
-        Ok(TempProducerView {
-            custody,
-            producers,
-            births,
-        })
     }
 
     fn current(&self) -> Result<Option<Arc<PcTempCoreBirth>>, String> {

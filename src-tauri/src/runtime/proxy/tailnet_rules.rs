@@ -546,6 +546,7 @@ impl ProxyRuntime {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn observed_tailnet_snapshot(&self) -> ObservedTailnetAddresses {
         self.tailnet_routes
             .lock()

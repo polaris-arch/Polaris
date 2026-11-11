@@ -45,18 +45,14 @@ mod lifecycle;
 mod login_fallback;
 mod management_api;
 pub(crate) use management_api::ApiReadbackBinding;
-pub(crate) mod runtime_config;
-// S4 journal, artifact, and guarded CAS contract. The managed coordinator is
-// deliberately not wired until core ownership and platform receipts exist.
 pub(crate) mod coex_observer;
-#[allow(dead_code)]
-pub(crate) mod mesh_apply;
 mod mesh_route_report;
 mod network_canary;
 mod network_monitor;
 mod network_settle;
 mod pending_changes;
 mod prerequisite;
+pub(crate) mod runtime_config;
 pub(crate) use prerequisite::{
     ActionBinding, ActionRequirement, MainPrerequisiteError, NormalMainAction, ReadyMainTicket,
     StartupAdmission,
@@ -1797,7 +1793,7 @@ impl ProxyRuntime {
         proxy_clearer: Box<dyn SystemProxyClearer>,
     ) -> Self {
         let gate = Arc::new(LifecycleGate::default());
-        let stop_domain = crate::runtime::config::StopRuntimeDomain::new(Arc::clone(&gate));
+        let stop_domain = crate::runtime::config::StopRuntimeDomain::new();
         let child = Arc::new(Mutex::new(DirectCoreSlot::default()));
         helper
             .bind_core_mutation_fence(Arc::downgrade(&child))

@@ -39,12 +39,8 @@ test('the existing final installation collector freezes actual Helper bytes with
   assert.notEqual(first.core.helperSha256, second.core.helperSha256);
   assert.equal(second.core.helperSha256, hash(Buffer.from('second actual owned Helper')));
 }));
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-test('local compiler, artifact and DMG controls reject malformed selection inputs', () => {
-  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', fileURLToPath(new URL('./desktop-core/test-local-development.py', import.meta.url))], { stdio: 'pipe' });
-  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', fileURLToPath(new URL('./desktop-core/test-dmg-selection.py', import.meta.url))], { stdio: 'pipe' });
-});
 
 test('Linux containers preserve exact namespaces without weakening carrier controls', { skip: process.platform !== 'linux' }, (t) => fixture((root) => {
   // Real, small deb/SquashFS containers containing inert opaque bytes only.

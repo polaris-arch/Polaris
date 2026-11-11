@@ -4,7 +4,7 @@ param(
  [Parameter(Mandatory=$true)][string]$KernelArtifactManifest,
  [Parameter(Mandatory=$true)][string]$ExpectedAppSource,
  [Parameter(Mandatory=$true)][string]$ExpectedKernelSource,
- [Parameter(Mandatory=$true)][ValidateSet('formal','candidate')][string]$ValidationMode
+ [Parameter(Mandatory=$true)][ValidateSet('formal')][string]$ValidationMode
 )
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'Native Windows runner required' }
@@ -34,4 +34,4 @@ foreach ($name in $names) {
     & $app --exact $name --ignored --nocapture --test-threads=1
     if ($LASTEXITCODE -ne 0) { throw "App integration failed: $name" }
 }
-Write-Output "Directory integration executed: mode=$ValidationMode source=$ExpectedKernelSource; candidate is not formal release acceptance."
+Write-Output "Directory integration executed: mode=$ValidationMode source=$ExpectedKernelSource"

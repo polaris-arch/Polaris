@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # gate-rust.sh —— .github/workflows/ci.yml 里 Rust 门（lint / cross / test 三个并行 job）的本机镜像。
-# CI 侧 2026-10-07 起并行跑；本机仍按下面的顺序串行跑同一批命令，判据逐字相同（对拍见
-# scripts/gate-rust-ci-parity.test.mjs，它按步骤名取材，不依赖步骤住在哪个 job）。
+# CI 侧 2026-10-07 起并行跑；本机仍按下面的顺序串行跑同一批命令，判据逐字相同。
 #
 # 起因（2026-09-02）：本机手跑门时用的命令比 CI 弱，本机全绿但取材面比 CI 窄——
 # 具体漏了 clippy 的 `--workspace`/`RUSTFLAGS="-D warnings"`，doc 门漏了
 # `--bins --lib --document-private-items` 与四个 `-D rustdoc::*`。这份清单不该靠人记，
-# 该由脚本逐字镜像 ci.yml。**改 CI 就要改这里**——两边由 gate-rust-ci-parity.test.mjs 钉死一致，
-# 改一边不改另一边，那条测试会红。
+# 该由脚本逐字镜像 ci.yml。**改 CI 就要改这里**。
 #
 # 为什么 doc 门不能省 `--bins --lib`（照抄 ci.yml「Rustdoc documentation invariants」步骤的
 # 头注，用自己的话说一遍）：
@@ -118,7 +116,7 @@ run_gate build cargo build --workspace --verbose
 # 决策：本机跳过起核用例，覆盖交给 CI。判定与 `run` 的拼接只在
 # crates/config-engine/tests/support/kernel_run.rs 一处（源码级门 kernel_run_single_entry.rs 钉死）。
 # 只在非 CI（GITHUB_ACTIONS 未设）时 export；ci.yml / package.yml / release-risk.yml 不设，照常起核。
-# 不改下面那条 `run_gate test` 行本身：它与 ci.yml 由 gate-rust-ci-parity.test.mjs 逐字对拍。
+# 不改下面那条 `run_gate test` 行本身：它与 ci.yml 逐字相同。
 # 自曝：cargo test 吞掉通过用例的 stderr，故跳过记账写进文件、由本脚本汇总打印「跳过 N 个」；
 # 若本机 shell 里还设着 POLARIS_REQUIRE_KERNEL_GATE=1，helper 会当场红（二者互斥）。
 kernel_skip_log=""
@@ -207,8 +205,7 @@ if [ "$WITH_CROSS" = 1 ]; then
     PATH="$NDK_BIN:$PATH" cargo check --target aarch64-linux-android -p polaris
   '
   # ── ci.yml「Vendored path sources stay diagnostic-free」的本机镜像 ──
-  # 判据本体在被调脚本里，两侧调的是同一条命令（gate-rust-ci-parity.test.mjs 逐字对拍，并把这里的
-  # 目标清单与上面 cross-clippy 的清单钉成同一份）。排在 cross-clippy 之后：目标由那一格
+  # 判据本体在被调脚本里，两侧调的是同一条命令。排在 cross-clippy 之后：目标由那一格
   # `rustup target add`。
   run_gate cross-vendored bash scripts/check-vendored-path-sources.sh x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios
   # ── ci.yml「Android impact face must be registered (dep-info 对差)」的本机镜像 ──
@@ -216,11 +213,6 @@ if [ "$WITH_CROSS" = 1 ]; then
   # 它守的是：`ANDROID_IMPACT_SCOPES`（scripts/classify-ci-impact.mjs）是 android.yml 的**唯一**
   # 触发面，新增一个 Android 专属源文件而不登记 ⇒ APK 腿永远不为它跑。判据本体与它的射程/已知
   # 上限全在 scripts/check-android-only-face.mjs 的头注里，本处不复述。
-  #
-  # 逐字对拍抠不出来（多行块，不是一条 run:），故登记在 gate-rust-ci-parity.test.mjs 的
-  # MIRRORED_BUT_NOT_VERBATIM 里，由那边一条**针对性**对拍钉住实质：两条 cargo check 的选择器
-  # 两侧一致且互相对称、checker 的调用形态两侧一致。只登记名字不补跑法的话，本机对这件事的
-  # 检出力恒为 0，而「MIRRORED」这个名字会说谎。
   #
   # 为什么挂在 --with-cross 下、而不是常规五门：它要 aarch64-linux-android 目标（首次得
   # `rustup target add`，联网）与 NDK 的 C 工具链——与上面两条门同一批前置。次序照抄 ci.yml：

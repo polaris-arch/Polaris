@@ -882,9 +882,6 @@ impl ProxyRuntime {
                         )
                     }
                 };
-                if let Err(error) = guard.assert_unpaused() {
-                    return StartLeg::Finished(Err(StartError::from(error)), None);
-                }
                 if completion.is_some_and(|claim| {
                     !claim.owns(guard.as_ref()) || self.gate.generation() != claim.expected
                 }) {
@@ -1024,7 +1021,6 @@ impl ProxyRuntime {
             .normal_start
             .lock()
             .map_err(|_| "Main admission poisoned".to_owned())
-            .and_then(|starts| starts.assert_unpaused())
         {
             return StartLeg::Finished(Err(StartError::from(error)), None);
         }
@@ -1080,9 +1076,6 @@ impl ProxyRuntime {
                         )
                     }
                 };
-                if let Err(error) = guard.assert_unpaused() {
-                    return StartLeg::Finished(Err(StartError::from(error)), None);
-                }
                 if completion.is_some_and(|claim| !claim.owns(guard.as_ref())) {
                     return StartLeg::Superseded;
                 }
@@ -1953,7 +1946,7 @@ impl ProxyRuntime {
         let claim = if cfg!(target_os = "android") {
             claim
         } else {
-            let starts = match self.normal_start.lock() {
+            let _starts = match self.normal_start.lock() {
                 Ok(starts) => starts,
                 Err(_) => {
                     return RestartLeg::Finished(
@@ -1962,9 +1955,6 @@ impl ProxyRuntime {
                     )
                 }
             };
-            if let Err(error) = starts.assert_unpaused() {
-                return RestartLeg::Finished(Err(StartError::from(error)), already_claimed);
-            }
             let _crash = self.crash_lock();
             let closing = match self.desktop_shutdown.lock() {
                 Ok(closing) => closing,
@@ -2222,7 +2212,6 @@ impl ProxyRuntime {
         ticket: u64,
     ) -> Option<(Option<Value>, u64, Option<LegacyStartLease>)> {
         let mut starts = self.normal_start.lock().ok()?;
-        starts.assert_unpaused().ok()?;
         polaris_core_supervisor::config_gate::assert_check_producer_registration().ok()?;
         // Keep exit admission and the generation claim indivisible. A late timer must
         // never supersede the shutdown generation, even if it passed an earlier check.

@@ -6,12 +6,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, after } from 'node:test';
 import { copyPackagingSource, writeFormalAssets } from './lib/formal-package-fixtures.test.mjs';
-import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
+import { cronetFixture, fixtureContract, fixtureManifest } from './lib/cronet-payload.test.mjs';
 import { assetNames } from './release-assets.mjs';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
 import { createHash } from 'node:crypto';
-import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers } from './desktop-core/release-consumer.mjs';
-import { hasTemporaryDesktop, loadTemporaryDesktopSelection, loadCandidate } from './desktop-core/native-dns-candidate.mjs';
+import { loadReleaseContract, releasePayloadMembers } from './desktop-core/release-consumer.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const cleanRepo=mkdtempSync(join(tmpdir(),'polaris-formal-packaging-source-'));copyPackagingSource(repo,cleanRepo);after(()=>rmSync(cleanRepo,{recursive:true,force:true}));
@@ -38,13 +37,8 @@ function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo, 
   const core = { linux: 'linux', windows: 'win', 'macos-x64': 'mac-x64', 'macos-arm64': 'mac-arm64' }[label];
   const suffix = label === 'windows' ? '.exe' : '';
   const manifest = JSON.parse(readFileSync(join(selectionRepo, 'src-tauri/core-manifest.json')));
-  const temporary = hasTemporaryDesktop(manifest);
-  const release = hasDesktopRelease(manifest) ? loadReleaseContract(selectionRepo, manifest) : null;
-  if (temporary) loadTemporaryDesktopSelection(selectionRepo, manifest);
-  const row = temporary ? loadCandidate(selectionRepo).platforms[core] : null;
-  const legalMembers = row ? Object.keys(row.archive.members).map((name) => name.slice(row.archive.root.length + 1))
-    .filter((name) => name !== row.core.member && name !== row.sidecar?.member)
-    : release ? releasePayloadMembers(release, core) : [];
+  const release = loadReleaseContract(selectionRepo, manifest);
+  const legalMembers = releasePayloadMembers(release, core);
   const members = [
     'core-manifest.json', '_up_/LICENSE', '_up_/NOTICE', '_up_/THIRD-PARTY-LICENSES.md',
     ...Array.from({ length: count }, (_, i) => `_up_/resources/data/fixture-${i}.srs`),
@@ -52,11 +46,10 @@ function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo, 
     '_up_/resources/dashboard/licenses/fixture.txt', '_up_/resources/dashboard/favicon.ico',
     '_up_/resources/dashboard/favicon.svg', '_up_/resources/dashboard/apple-touch-icon-180x180.png',
     `_up_/resources/${core}/core-manifest.json`,
-    ...(temporary ? [`_up_/resources/${core}/candidate-carrier.json`] : []),
     `_up_/resources/${core}/sing-box${suffix}`, `_up_/resources/${core}/polaris-helper${suffix}`,
     ...(['linux', 'windows'].includes(label) ? [`_up_/resources/${core}/libcronet.${label === 'windows' ? 'dll' : 'so'}`] : []),
-    ...(release ? [`_up_/resources/core-recovery/${core}/inventory.json`,
-      `_up_/resources/core-recovery/${core}/${release.platforms[core].archive.name}`] : []),
+    `_up_/resources/core-recovery/${core}/inventory.json`,
+    `_up_/resources/core-recovery/${core}/${release.platforms[core].archive.name}`,
     ...legalMembers.map((member) => `_up_/resources/${core}/${member}`), ...extra,
   ];
   const scopes = isStatic ? [selectionRepo] : label === 'windows' ? [root]
@@ -78,32 +71,6 @@ function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo, 
   return { code: result.status, output: result.stdout + result.stderr };
 }
 const cleaner = '_up_/resources/win/polaris-cleaner.exe';
-
-function temporaryFixture(t, label, extra = [], mutate = () => {}) {
-  const selectionRepo = mkdtempSync(join(tmpdir(), 'historical-temporary-inventory-'));
-  t.after(() => rmSync(selectionRepo, { recursive: true, force: true }));
-  // Copy only the CLI's module dependencies and exact historical binding bytes.
-  // These inert inventory fixtures neither acquire nor execute a native payload.
-  for (const path of [
-    'scripts/verify-packaging.mjs', 'scripts/postprocess-appimage.mjs', 'scripts/release-assets.mjs',
-    'scripts/lib/polaris-version.json',
-    ...['cronet-payload', 'cronet-contract', 'nsis-core-sweep', 'nsis-helper-cleanup', 'core-identity', 'macos-open-guide']
-      .map(name => `scripts/lib/${name}.mjs`),
-    ...['source-graph', 'bundle', 'release-consumer', 'recovery', 'native-dns-candidate', 'upstream-release', 'validation-origin', 'native-dns-gates', 'local-development']
-      .map(name => `scripts/desktop-core/${name}.mjs`),
-    'scripts/desktop-core/native-dns-candidate.json', 'scripts/desktop-core/native-dns-source-binding.json',
-    'src-tauri/build.rs', 'src-tauri/tauri.windows.conf.json',
-  ]) {
-    const destination = join(selectionRepo, path);
-    mkdirSync(dirname(destination), { recursive: true });
-    copyFileSync(join(repo, path), destination);
-  }
-  const current = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')));
-  const manifest = { desktopTemporary: current.historicalDesktopTemporary };
-  writeFileSync(join(selectionRepo, 'src-tauri/core-manifest.json'), JSON.stringify(manifest));
-  loadTemporaryDesktopSelection(selectionRepo);
-  return fixture(t, label, extra, mutate, selectionRepo);
-}
 
 test('actual Windows inventory admits exactly the fixed cleaner artifact', (t) => {
   const r = fixture(t, 'windows', [cleaner]);
@@ -145,7 +112,7 @@ function windowsPayloadFixture(t, options = {}) {
   cpSync(join(repo, 'scripts'), join(root, 'scripts'), { recursive: true, filter: (p) => !p.includes('node_modules') });
   mkdirSync(join(root, 'src-tauri'));
   const bytes = cronetFixture('win', options);
-  const manifest = { ...fixtureManifest(bytes), coreArchiveSha256: { win: 'fixture' } };
+  const manifest = fixtureManifest(root, fixtureContract(bytes));
   writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(manifest));
   const source = join(root, 'resources/win'), staging = join(root, 'staging/_up_/resources/win');
   mkdirSync(source, { recursive: true }); mkdirSync(staging, { recursive: true });
@@ -162,14 +129,17 @@ function windowsPayloadFixture(t, options = {}) {
   return { root, source: join(source, 'libcronet.dll'), payload: join(staging, 'libcronet.dll'), bytes, run };
 }
 
+// Synthetic cores carry no consumed-release receipt, so the formal release gate always
+// fails; the clean fixture must not produce any Cronet diagnostic before the fault.
 test('actual Windows payload CLI closes same-size Cronet substitution', (t) => {
-  const f = windowsPayloadFixture(t); let result = f.run(); assert.equal(result.code, 0, result.output);
+  const f = windowsPayloadFixture(t); let result = f.run(); assert.equal(result.code, 1, result.output);
+  assert.match(result.output, /release artifact\/receipt mismatch/); assert.doesNotMatch(result.output, /Cronet source\/final/);
   const size = statSync(f.payload).size, changed = Buffer.from(f.bytes); changed[0x1200] ^= 1; writeFileSync(f.payload, changed);
   assert.equal(statSync(f.payload).size, size);
   result = f.run(); assert.equal(result.code, 1, result.output); assert.match(result.output, /final SHA-256/);
 });
 
-for (const fault of ['source replacement', 'symlink', 'symlink ancestor', 'missing pin', 'wrong architecture', 'unknown dependency', 'missing exported function']) {
+for (const fault of ['source replacement', 'symlink', 'symlink ancestor', 'wrong architecture', 'unknown dependency', 'missing exported function']) {
   test(`actual Windows payload CLI rejects ${fault}`, (t) => {
     const options = fault === 'wrong architecture' ? { machine: 0xaa64 } : fault === 'unknown dependency' ? { dependency: 'injected.dll' } : fault === 'missing exported function' ? { missingExport: 'Cronet_Engine_Create' } : {};
     const f = windowsPayloadFixture(t, options);
@@ -180,8 +150,7 @@ for (const fault of ['source replacement', 'symlink', 'symlink ancestor', 'missi
       renameSync(directory, original);
       symlinkSync(original, directory, process.platform === 'win32' ? 'junction' : 'dir');
     }
-    if (fault === 'missing pin') writeFileSync(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify({ coreArchiveSha256: { win: 'fixture' } }));
-    const result = f.run(); assert.equal(result.code, 1, result.output); assert.match(result.output, /Cronet|cronetLibrarySha256/);
+    const result = f.run(); assert.equal(result.code, 1, result.output); assert.match(result.output, /Cronet source\/final/);
   });
 }
 
@@ -281,46 +250,6 @@ test('Linux assets gate still fails closed beyond its depth 24 budget', t => {
   const result = linuxAssetFixture(t, 25);
   assert.equal(result.code, 1, result.output);
   assert.match(result.output, /depth limit 24 exceeded/);
-});
-
-
-test('temporary default inventory requires its exact carrier receipt beside compiled identity', (t) => {
-  assert.equal(hasTemporaryDesktop(JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')))), false);
-  const valid = temporaryFixture(t, 'windows', [cleaner]);
-  assert.equal(valid.code, 0, valid.output);
-  assert.match(valid.output, /temporary-app-carrier=1/);
-  const missing = temporaryFixture(t, 'windows', [cleaner], root => rmSync(join(root, '_up_/resources/win/candidate-carrier.json')));
-  assert.equal(missing.code, 1, missing.output);
-  assert.match(missing.output, /temporary-app-carrier.*实为 0 份/);
-});
-for (const member of ['other-carrier.json', 'candidate-carrier.JSON', 'nested/candidate-carrier.json', '.native-dns-candidate/receipt.json']) {
-  test(`temporary carrier does not allow arbitrary metadata: ${member}`, t => {
-    const result = member === 'candidate-carrier.JSON'
-      ? temporaryFixture(t, 'windows', [cleaner], root => {
-        const directory = join(root, '_up_/resources/win');
-        const canonical = join(directory, 'candidate-carrier.json');
-        const moving = join(directory, 'owned-case-change.tmp');
-        // Two distinct renames construct an uppercase-only entry on both case
-        // sensitive and insensitive volumes. An extra write can merely alias
-        // the already-created canonical file and never exercise the negative.
-        renameSync(canonical, moving);
-        renameSync(moving, join(directory, member));
-        const names = readdirSync(directory);
-        assert(names.includes(member), 'actual uppercase directory entry required');
-        assert(!names.includes('candidate-carrier.json'), 'canonical entry must be absent');
-        assert(!names.includes('owned-case-change.tmp'));
-      })
-      : temporaryFixture(t, 'windows', [cleaner, `_up_/resources/win/${member}`]);
-    assert.equal(result.code, 1, result.output); assert.match(result.output, /未登记/);
-  });
-}
-
-test('temporary default keeps exact original legal member paths without formal-release relabeling', t => {
-  const result = temporaryFixture(t, 'windows', [cleaner], root => rmSync(join(root, '_up_/resources/win/TLS-DEPENDENCY-NOTICES.txt')));
-  assert.equal(result.code, 1, result.output);
-  assert.match(result.output, /release-member:TLS-DEPENDENCY-NOTICES.txt.*实为 0 份/);
-  const relabeled = temporaryFixture(t, 'windows', [cleaner, '_up_/resources/win/core-release/TLS-DEPENDENCY-NOTICES.txt']);
-  assert.equal(relabeled.code, 1, relabeled.output); assert.match(relabeled.output, /未登记/);
 });
 
 

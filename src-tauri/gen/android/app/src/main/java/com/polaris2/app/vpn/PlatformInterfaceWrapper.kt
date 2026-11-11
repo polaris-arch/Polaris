@@ -3,8 +3,8 @@
 // 该项目按 GNU General Public License v3（或更新版本）分发，本文件因此继承 GPLv3。
 // 与上游的差异：裁剪到本仓 libbox（sing-box v1.15.0-alpha.2 tag）的 33 个方法接口面。
 // 本仓不做 root 形态，需要 root 的能力一律显式关闭（见各方法注释）。
-// 接口面随内核版本走：`src-tauri/core-manifest.json` 的 bundledCoreVersion 一变，
-// `scripts/build-libbox.sh` 重建出来的 aar 就可能多出抽象方法，Kotlin 会在
+// 接口面随内核版本走：`scripts/mobile-core/source-contract.json` 的 version 一变，
+// `scripts/build-mobile-core.sh android` 重建出来的 aar 就可能多出抽象方法，Kotlin 会在
 // `compileArm64DebugKotlin` 上点名缺哪一个 —— 真值在
 // `experimental/libbox/platform.go` 的 `PlatformInterface`，照它补。
 

@@ -1,6 +1,5 @@
 // Explicit release acquisition for build resources. Never executes target code.
 import { rejectLocalDistribution } from './local-development.mjs';
-import { hasTemporaryDesktop, loadTemporaryDesktopSelection, verifyCandidatePayload } from './native-dns-candidate.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -9,16 +8,14 @@ import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lsta
   opendirSync, readSync, realpathSync, rmdirSync, statfsSync, unlinkSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature, verifyMacCodeSignatureReceipt,
-  kernelRepositoryIdentity, releaseGoVersion, upstreamSourceGoVersion, requireGraph as demand } from './source-graph.mjs';
-import { isUpstreamRelease, isUpstreamRow, validateUpstreamContract, validateUpstreamRow, validateUpstreamIndex,
-  upstreamMetadata, upstreamPayloadPins, contractPublicAssets, hasCommittedReleaseMaterials, validatePublishedUpstreamReadback, readUpstreamSourceEvidence } from './upstream-release.mjs';
+import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature,
+  kernelRepositoryIdentity, requireGraph as demand } from './source-graph.mjs';
+import { isUpstreamRelease, validateUpstreamContract, validateUpstreamRow,
+  upstreamMetadata, upstreamPayloadPins, contractPublicAssets } from './upstream-release.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
 import { RECOVERY_RESOURCE, stageRecoveryResource, verifyRecoveryResource } from './recovery.mjs';
 
-const REPO = 'polaris-arch/polaris-box';
-// v1 remains the historical archive/provenance contract. New upstream-layout
-// releases require their own validated contract; changing hosting is not enough.
+const REPO = 'polaris-arch/sing-box-polaris';
 export function releaseRepositoryId(contract) {
   return kernelRepositoryIdentity(contract.repository).id;
 }
@@ -43,73 +40,24 @@ function runColdArchive(run, stage, args, input) {
     const code = ['ETIMEDOUT', 'ENOBUFS', 'ENOENT', 'EACCES', 'EINTR', 'ENOMEM', 'ENOEXEC'].includes(error?.code) ? error.code : 'unknown';
     const status = Number.isInteger(error?.status) && error.status >= 0 && error.status <= 255 ? error.status : 'unknown';
     const signal = ['SIGKILL', 'SIGTERM', 'SIGABRT', 'SIGSEGV', 'SIGBUS', 'SIGINT', 'SIGPIPE', 'SIGHUP', 'SIGQUIT', 'SIGILL', 'SIGFPE', 'SIGXCPU', 'SIGXFSZ', 'SIGSYS'].includes(error?.signal) ? error.signal : 'unknown';
-    const stderr = typeof error?.stderr === 'string' ? error.stderr.slice(-4096)
-      : Buffer.isBuffer(error?.stderr) ? error.stderr.subarray(-4096).toString('utf8') : '';
-    const progress = [...stderr.matchAll(/^SOURCE_ARCHIVE_PROOF stage=(stdin-start|stdin-read|request-decoded|source-start|archive-hash-verified|archive-expanded|legal-inventory-verified|archive-members-verified|tree-verified|source-policy-verified|complete) elapsed_ms=([0-9]{1,12})\r?$/gm)].at(-1);
     // No raw cause: Node's default error rendering would print its captured
     // stderr, command and request even when the outer message is bounded.
-    throw new Error(`Release archive failed (stage=${stage}; elapsedMs=${Math.round(performance.now() - started)}; timeoutMs=${LOCAL_ARCHIVE_TIMEOUT_MS}; code=${code}; status=${status}; signal=${signal}; progress=${progress ? `${progress[1]}@${progress[2]}ms` : 'unknown'})`);
+    throw new Error(`Release archive failed (stage=${stage}; elapsedMs=${Math.round(performance.now() - started)}; timeoutMs=${LOCAL_ARCHIVE_TIMEOUT_MS}; code=${code}; status=${status}; signal=${signal})`);
   }
 }
 const CONTRACT_PATH = 'scripts/desktop-core/release-contract.json';
-const PENDING_CONTRACT_PATH = 'scripts/desktop-core/pending-release-contract.json';
-const PROVIDER_FILES = ['scripts/polaris_production_release.py', 'scripts/polaris_native_candidate.py',
-  'scripts/polaris_source_fingerprint.py', 'scripts/polaris_dns_identity.py', 'scripts/polaris_go_environment.py',
-  'scripts/polaris_native_distribution.py', 'release/polaris-production-release.json', 'release/polaris-candidate-inputs.json'];
 export const RELEASE_TARGETS = Object.freeze({
   linux: { os: 'linux', arch: 'amd64', core: 'sing-box', sidecar: 'libcronet.so', suffix: '.tar.gz', cgo: '0' },
   win: { os: 'windows', arch: 'amd64', core: 'sing-box.exe', sidecar: 'libcronet.dll', suffix: '.zip', cgo: '0' },
   'mac-x64': { os: 'darwin', arch: 'amd64', core: 'sing-box', sidecar: null, suffix: '.tar.gz', cgo: '1' },
   'mac-arm64': { os: 'darwin', arch: 'arm64', core: 'sing-box', sidecar: null, suffix: '.tar.gz', cgo: '1' },
 });
-export const ADAPTER_FILES = ['scripts/desktop-core/local-development.mjs', 'scripts/desktop-core/recovery.mjs', 'scripts/desktop-core/native-dns-candidate.mjs', 'scripts/desktop-core/native-dns-candidate.json',
-  'scripts/desktop-core/native-dns-source-binding.json', 'scripts/desktop-core/validation-origin.mjs',
-  'scripts/desktop-core/native-dns-gates.mjs',
-  'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/release-archive.py', 'scripts/mobile-core/source_policy.py',
-  'scripts/desktop-core/wire-input-handoff.mjs',
-  'scripts/lib/polaris-version.json',
-  'scripts/prepare-core-identity.mjs', 'scripts/lib/core-identity.mjs',
-  'scripts/postprocess-appimage.mjs', 'src-tauri/build.rs',
-  'src-tauri/src/runtime/core_identity.rs', 'src-tauri/src/runtime/helper.rs',
-  'Cargo.toml', 'Cargo.lock', 'crates/helper/Cargo.toml',
-  'crates/helper/src/cli.rs', 'crates/helper/src/platform/unix_log.rs',
-  'crates/helper/src/platform/windows/daemon.rs',
-  'crates/helper/src/admin_probe.rs',
-  'crates/helper/src/lib.rs', 'crates/helper/src/core_cli.rs', 'crates/helper/src/core_hash.rs',
-  'crates/helper/src/core_store.rs', 'crates/helper/src/core_objects.rs', 'crates/helper/src/pinned_core.rs',
-  'crates/helper/src/user_control.rs', 'crates/helper/src/helper_policy.rs', 'crates/helper/src/legacy_use.rs',
-  'crates/helper/src/platform/linux/daemon.rs', 'crates/helper/src/platform/linux/handler.rs',
-  'crates/helper/src/platform/linux/server.rs', 'crates/helper/src/platform/linux/state.rs',
-  'crates/helper/src/platform/macos/daemon.rs', 'crates/helper/src/platform/macos/handler.rs',
-  'crates/helper/src/platform/macos/server.rs', 'crates/helper/src/platform/macos/native_birth.rs',
-  'crates/helper/src/platform/windows/helper.rs', 'crates/helper/src/platform/windows/helper/native_birth.rs',
-  'crates/helper/src/platform/windows/coreacl.rs', 'crates/helper/src/platform/windows/logic.rs',
-  'crates/helper/src/platform/windows/native_caller.rs', 'crates/helper/src/platform/windows/service/win.rs',
-  'crates/helper/src/platform/windows/winproc/win.rs',
-  'crates/helper-client/src/lib.rs', 'crates/helper-client/src/manager.rs',
-  'crates/helper-client/src/manager/install_unix.rs', 'crates/helper-client/src/manager/install_windows.rs',
-  '.github/workflows/package.yml',
-  'crates/helper-proto/src/lib.rs', 'crates/helper-proto/src/codec.rs', 'crates/helper-proto/src/error.rs',
-  'crates/helper-client/src/client.rs', 'crates/helper-client/src/transport.rs',
-  'src-tauri/src/runtime/update_install.rs',
-  'src-tauri/src/runtime/core_paths.rs', 'src-tauri/src/runtime/proxy/core_binary.rs',
-  'src-tauri/src/runtime/proxy/startup.rs', 'src-tauri/src/runtime/proxy/process_supervision.rs',
-  'crates/helper-proto/src/core_manifest.rs', 'crates/helper-proto/src/core_protocol.rs',
-  'crates/helper-proto/src/request.rs', 'crates/helper-proto/src/response.rs', 'crates/helper-proto/src/command.rs',
-  'scripts/macos-nested-code.sh',
-  'scripts/desktop-core/release-native-gates.mjs',
-  'scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/lib/bounded-download.mjs', 'scripts/desktop-core/bundle.mjs',
-  'scripts/lib/cronet-payload.mjs', 'scripts/native-payload-input.mjs', 'scripts/verify-packaging.mjs',
-  'crates/updater/src/core_release.rs', 'crates/updater/src/lib.rs', 'src-tauri/src/runtime/updater.rs',
-  'scripts/desktop-core/source-graph.mjs', 'scripts/lib/cronet-contract.mjs', 'scripts/assert-pc-runtime-release.mjs'];
 const hex = (v, n) => typeof v === 'string' && new RegExp(`^[a-f0-9]{${n}}$`).test(v);
 const positive = (v) => Number.isSafeInteger(v) && v > 0;
 const same = (a, b, message) => demand(canonical(a) === canonical(b), message);
 // Match producer Python json.dumps(sort_keys=True, separators=(',', ':'), ensure_ascii=True).
 export const portableCanonical = (v) => canonical(v).replace(/[\u007f-\uffff]/g,
   (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
-export const hasDesktopSelection = (manifest) => Object.hasOwn(manifest, 'desktopRelease') || Object.hasOwn(manifest, 'desktopTemporary');
-export const hasDesktopRelease = (manifest) => Object.hasOwn(manifest, 'desktopRelease');
 const json = (path) => JSON.parse(readFileSync(path, 'utf8'));
 
 export function releasePlatforms(argv) {
@@ -134,138 +82,43 @@ function checkedBytes(path, pin) {
   demand(bytes.length === pin.bytes && digest(bytes) === pin.sha256, `Release bytes differ: ${path}`);
   return bytes;
 }
-function pin(pin, name, contract, max = 512 * 1024 * 1024) {
-  demand(pin?.name === name && positive(pin.bytes) && pin.bytes <= max && hex(pin.sha256, 64)
-    && positive(pin.assetId) && pin.releaseId === contract.releaseId
-    && pin.url === `https://github.com/${contract.repository}/releases/download/${contract.tag}/${name}`, 'Release asset pin/URL differs');
-}
-function identity(value, schema, facts) {
-  demand(value?.schema === schema && hex(value.fingerprint, 64), 'Portable identity shape differs');
-  same(value.facts, facts, 'Portable identity facts differ');
-  demand(value.fingerprint === digest(portableCanonical(facts)), 'Portable identity fingerprint differs');
-}
 function validateRow(contract, key, row) {
-  if (isUpstreamRelease(contract)) return validateUpstreamRow(contract, key, row, RELEASE_TARGETS);
-  const target = RELEASE_TARGETS[key];
-  const root = `polaris-box-${contract.version}-${target.os}-${target.arch}`;
-  demand(row?.schema === 'polaris-production-native-receipt-v1' && row.target === `${target.os}/${target.arch}`
-    && row.version === contract.version && row.tag === contract.tag && row.sourceCommit === contract.sourceCommit
-    && row.sourceTree === contract.sourceTree && row.providerContract === 'polaris-box-release-v1'
-    && row.signaturePolicy === POLICY && row.signatureObservation?.trustValidated === false,
-  'Producer row/source/signature policy differs');
-  releaseMacCodeSignature(row, key);
-  demand(row.sourceFingerprint?.schema === 'fork-source-fingerprint-v1', 'Original source collector missing');
-  const facts = Object.fromEntries(['sourceCommit', 'sourceTree', 'sourceOverlay', 'goVersion',
-    'goModSha256', 'goSumSha256', 'replacement'].map((k) => [k, row.sourceFingerprint[k]]));
-  demand(facts.sourceCommit === contract.sourceCommit && facts.sourceTree === contract.sourceTree
-    && facts.sourceOverlay === 0 && facts.goVersion === releaseGoVersion(contract) && hex(facts.goModSha256, 64)
-    && hex(facts.goSumSha256, 64) && facts.replacement?.module === 'github.com/sagernet/sing-tun', 'Stable source facts differ');
-  identity(row.portableSourceIdentity, 'polaris-production-source-v1', facts);
-  const tags = typeof row.tags === 'string' ? row.tags.split(',') : [];
-  demand(tags.length && tags.every((tag) => /^[a-z0-9_]+$/.test(tag)) && new Set(tags).size === tags.length
-    && tags.includes('with_gvisor') && tags.includes('with_naive_outbound')
-    && (target.sidecar ? tags.includes('with_purego') : !tags.includes('with_purego')), 'Release capabilities/tags differ');
-  const platform = { sourceFingerprint: row.portableSourceIdentity.fingerprint, os: target.os, arch: target.arch,
-    CGO_ENABLED: target.cgo, tags: [...tags].sort(), version: contract.version, tag: contract.tag,
-    goVersion: facts.goVersion, sourceOverlay: 0 };
-  identity(row.portablePlatformIdentity, 'polaris-production-platform-v1', platform);
-  demand(row.sourceIdentityFingerprint === row.portableSourceIdentity.fingerprint
-    && row.platformInputFingerprint === row.portablePlatformIdentity.fingerprint
-    && row.buildID === `polaris-production-v1-${row.platformInputFingerprint}`
-    && row.portablePlatformIdentity.buildID === row.buildID, 'Release BuildID/identity differs');
-  const provider = row.providerIdentity?.facts;
-  same(Object.keys(provider?.fileSha256 ?? {}).sort(), [...PROVIDER_FILES].sort(), 'Provider file inventory differs');
-  demand(provider.sourceCommit === contract.sourceCommit && provider.providerContract === row.providerContract
-    && Object.values(provider.fileSha256).every((v) => hex(v, 64)), 'Provider source binding differs');
-  identity(row.providerIdentity, 'polaris-production-provider-v1', provider);
-  demand(row.providerFingerprint === row.providerIdentity.fingerprint, 'Provider fingerprint differs');
-  pin(row.releaseAsset, root + target.suffix, contract);
-  same({ name: row.archive?.name, bytes: row.archive?.bytes, sha256: row.archive?.sha256 },
-    { name: row.releaseAsset.name, bytes: row.releaseAsset.bytes, sha256: row.releaseAsset.sha256 }, 'Archive pin differs');
-  const members = row.archive.members;
-  demand(members && Object.keys(members).length <= 1024 && Object.values(members).every((v) => hex(v, 64)), 'Archive inventory invalid');
-  demand(Object.keys(members).every((name) => name.startsWith(`${root}/`) && name.slice(root.length + 1).split('/').every((part) =>
-    /^[A-Za-z0-9_+.-]+$/.test(part) && !['.', '..'].includes(part) && !part.endsWith('.')
-    && !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(part.split('.')[0]))), 'Archive member path invalid');
-  for (const name of [target.core, 'LICENSE', 'NOTICE', 'licenses/NOTICE', 'provenance.json', 'source/SOURCE-INDEX.json', 'SHA256SUMS'])
-    demand(hex(members[`${root}/${name}`], 64), `Required release member absent: ${name}`);
-  function payload(p, name) {
-    demand(p?.member === name && positive(p.bytes) && p.bytes <= 200 * 1024 * 1024
-      && p.sha256 === members[`${root}/${name}`], 'Payload pin/layout differs');
-  }
-  payload(row.core, target.core);
-  if (target.sidecar) payload(row.sidecar, target.sidecar);
-  else demand(row.sidecar === null && !Object.keys(members).some((n) => /\.(so|dll|dylib)$/.test(n)), 'Static target contains sidecar');
-  // Receipt inputs are source-owned. Actual binary BuildID is checked separately.
-  const command = row.buildCommand;
-  demand(Array.isArray(command) && command.length === 14 && typeof command[12] === 'string', 'Build command shape differs');
-  same(command, ['go', 'build', '-buildvcs=true', '-mod=readonly', '-p', '1', '-trimpath', '-tags', row.tags,
-    '-ldflags', row.ldflags, '-o', command[12], './cmd/sing-box'], 'Build command inputs differ');
-  demand(command[12].replace(/\\/g, '/').endsWith(`/${root}/${target.core}`)
-    && typeof row.ldflags === 'string' && row.ldflags.endsWith(` -s -w -X github.com/sagernet/sing-box/constant.Version=${contract.version} -buildid=${row.buildID}`), 'Linker version/BuildID inputs differ');
-  return root;
+  return validateUpstreamRow(contract, key, row, RELEASE_TARGETS);
 }
 
 export function validateReleaseContract(contract) {
-  if (isUpstreamRelease(contract)) return validateUpstreamContract(contract, RELEASE_TARGETS);
-  demand(contract?.schema === 'polaris-box-release-consumer-contract-v1'
-    && contract.providerContract === 'polaris-box-release-v1' && contract.repository === REPO
-    && positive(contract.releaseId) && hex(contract.sourceCommit, 40) && hex(contract.sourceTree, 40)
-    && hex(contract.tagObject, 40) && /^1\.15\.0-alpha\.12(?:\.polaris\.[1-9][0-9]*)?$/.test(contract.version)
-    && contract.tag === `v${contract.version}`, 'Unbound or unsupported desktop release contract');
-  same(Object.keys(contract.platforms ?? {}).sort(), Object.keys(RELEASE_TARGETS).sort(), 'Exactly four App targets required');
-  pin(contract.assetIndex, 'polaris-box-assets.json', contract, 8 * 1024 * 1024);
-  const ids = [contract.assetIndex.assetId];
-  for (const [key, row] of Object.entries(contract.platforms)) { validateRow(contract, key, row); ids.push(row.releaseAsset.assetId); }
-  demand(new Set(ids).size === ids.length, 'Duplicate release asset identity');
-  same(new Set(Object.values(contract.platforms).map((r) => r.providerFingerprint)).size, 1, 'Platform providers differ');
-  same(new Set(Object.values(contract.platforms).map((r) => r.sourceIdentityFingerprint)).size, 1, 'Platform sources differ');
-  return contract;
+  demand(isUpstreamRelease(contract), 'Unsupported desktop release contract');
+  return validateUpstreamContract(contract, RELEASE_TARGETS);
 }
 
 // Shared with the existing Rust embedded dependency gate. V2 preserves all
 // Go replacement rows; the sing-tun gate must select exactly its own module.
 export function releaseSingTunDependency(row) {
-  let dependency;
-  if (isUpstreamRow(row)) {
-    demand(Array.isArray(row.buildGraph?.localReplacements), 'Upstream replacement inventory missing');
-    const selected = row.buildGraph.localReplacements.filter((item) => item.module === 'github.com/sagernet/sing-tun');
-    demand(selected.length === 1 && selected[0].replacement?.module === './third_party/sing-tun'
-      && selected[0].replacement.version === '(devel)' && selected[0].replacement.h1 === '', 'Unique upstream sing-tun replacement required');
-    dependency = selected[0];
-  } else {
-    demand(row?.schema === 'polaris-production-native-receipt-v1', 'Unsupported dependency receipt');
-    dependency = row.buildGraph?.localReplacement;
-  }
+  demand(Array.isArray(row.buildGraph?.localReplacements), 'Upstream replacement inventory missing');
+  const selected = row.buildGraph.localReplacements.filter((item) => item.module === 'github.com/sagernet/sing-tun');
+  demand(selected.length === 1 && selected[0].replacement?.module === './third_party/sing-tun'
+    && selected[0].replacement.version === '(devel)' && selected[0].replacement.h1 === '', 'Unique upstream sing-tun replacement required');
+  const dependency = selected[0];
   demand(dependency?.module === 'github.com/sagernet/sing-tun' && typeof dependency.version === 'string'
     && dependency.version.length > 0 && typeof dependency.h1 === 'string', 'Release sing-tun identity differs');
   return { module: dependency.module, version: dependency.version, h1: dependency.h1 };
 }
 
+// The committed selection is only the contract path and digest; every other
+// identity is read from the digest-bound contract itself.
 export function loadReleaseContract(root, manifest) {
-  demand(!hasTemporaryDesktop(manifest), 'Formal and temporary desktop selections cannot coexist');
   const selection = manifest.desktopRelease;
-  demand(selection?.schema === 'polaris-app-release-selection-v1' && [CONTRACT_PATH, PENDING_CONTRACT_PATH].includes(selection.contractPath)
-    && hex(selection.contractSha256, 64), 'Explicit release selection incomplete');
+  demand(selection?.schema === 'polaris-app-release-selection-v1' && selection.contractPath === CONTRACT_PATH
+    && hex(selection.contractSha256, 64) && Object.keys(selection).length === 3, 'Explicit release selection incomplete');
   const file = join(root, selection.contractPath); regularPath(file);
   const bytes = readFileSync(file); demand(bytes.length <= 8 * 1024 * 1024 && digest(bytes) === selection.contractSha256, 'Reviewed consumer contract SHA differs');
-  const contract = validateReleaseContract(JSON.parse(bytes));
-  if (hasCommittedReleaseMaterials(contract)) indexRows(checkedBytes(join(root, contract.assetIndex.path), contract.assetIndex), contract);
-  for (const key of ['version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree', 'releaseId'])
-    same(selection[key], contract[key], `Compiled release selection ${key} differs`);
-  same(selection.librarySha256, { linux: contract.platforms.linux.sidecar.sha256,
-    win: contract.platforms.win.sidecar.sha256 }, 'Compiled same-package library pins differ');
-  return contract;
+  return validateReleaseContract(JSON.parse(bytes));
 }
 
-// App installation identity for the upstream layout. This is deliberately a
-// separate domain from both the historical producer fingerprint and the
-// temporary candidate digest. Original producer rows/index bytes stay intact.
+// App installation identity for the upstream layout. Original producer rows stay intact.
 export const UPSTREAM_INSTALLATION_DOMAIN = 'polaris-upstream-native-installation-v1\0';
 export function releaseInstallationContract(root, manifest) {
   const contract = loadReleaseContract(root, manifest);
-  if (!isUpstreamRelease(contract)) return contract;
-  demand(manifest.desktopRelease.contractPath === CONTRACT_PATH, 'Upstream installation requires the compiled canonical contract');
   const raw = readFileSync(join(root, manifest.desktopRelease.contractPath));
   demand(digest(raw) === manifest.desktopRelease.contractSha256, 'Installation contract changed during verification');
   const providerFingerprint = digest(Buffer.concat([Buffer.from(UPSTREAM_INSTALLATION_DOMAIN), raw]));
@@ -280,74 +133,14 @@ export function releaseInstallationContract(root, manifest) {
 // Derive a bound state/CDHash, then use the existing strict native observer on Mac.
 function releaseMacCodeSignature(row, key) {
   if (!key.startsWith('mac-')) return null;
-  if (isUpstreamRow(row)) {
-    const { state, cdHash, trustValidated } = row.signatureObservation ?? {};
-    demand(trustValidated === false, 'Upstream signature trust must not be asserted');
-    const signature = { state, cdHash }; validateMacCodeSignature(signature, key); return signature;
-  }
-  const original = row.signatureObservation?.core;
-  demand(original?.format === 'Mach-O' && original.signatureTrustValidated === false
-    && typeof original.codeSignatureInspection === 'string', 'Original Mac signature observation missing');
-  const display = original.codeSignatureInspection;
-  const hashes = [...display.matchAll(/^CDHash=([a-fA-F0-9]{40})\r?$/gm)];
-  const unsigned = display.includes('code object is not signed at all');
-  demand(display.split(/\r?\n/).filter((line) => line.startsWith('CDHash=')).length === hashes.length
-    && (unsigned ? hashes.length === 0 : hashes.length === 1), 'Original Mac signature state/CDHash invalid');
-  const signature = unsigned ? { state: 'unsigned', cdHash: null }
-    : { state: 'signed', cdHash: hashes[0][1].toLowerCase() };
-  validateMacCodeSignature(signature, key);
-  return signature;
+  const { state, cdHash, trustValidated } = row.signatureObservation ?? {};
+  demand(trustValidated === false, 'Upstream signature trust must not be asserted');
+  const signature = { state, cdHash }; validateMacCodeSignature(signature, key); return signature;
 }
 
 export function releasePayloadMembers(contract, key) {
-  const row = contract.platforms[key], prefix = validateRow(contract, key, row) + '/';
-  if (isUpstreamRelease(contract)) return Object.keys(upstreamPayloadPins(contract, row)).sort().map((name) => `core-release/${name}`);
-  return Object.keys(row.archive.members).sort().map((name) => name.slice(prefix.length))
-    .filter((name) => name !== row.core.member && name !== row.sidecar?.member)
-    .map((name) => `core-release/${name}`);
-}
-
-export function validateReleaseNotice(notice, manifest, contract, mobile) {
-  function section(label) {
-    const lines = notice.split(/\r?\n/), starts = lines.flatMap((line, i) => line.startsWith(`  - ${label} `) ? [i] : []);
-    demand(starts.length === 1, `NOTICE: unique ${label} section required`);
-    const end = lines.findIndex((line, i) => i > starts[0] && line.startsWith('  - '));
-    return lines.slice(starts[0], end < 0 ? lines.length : end).map((line) => line.trim());
-  }
-  function exact(lines, text) {
-    const label = text.slice(0, text.indexOf('：') + 1);
-    demand(lines.filter((line) => line.startsWith(label)).length === 1 && lines.includes(text), `NOTICE: release identity missing/duplicated: ${text}`);
-  }
-  const committed = hasCommittedReleaseMaterials(contract);
-  const desktop = section('桌面 sing-box');
-  demand(desktop[0] === `- 桌面 sing-box v${contract.version} (GPLv3) — https://github.com/${contract.repository}`, 'NOTICE: release baseline differs');
-  for (const text of [`上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12`,
-    `桌面发布构建：${contract.version}`, `固定源码：https://github.com/${contract.repository}/tree/${contract.sourceCommit}`,
-    `源码 tree：${contract.sourceTree}`, `固定消费标签：https://github.com/${contract.repository}/tree/${contract.tag}`,
-    `消费标签对象：${contract.tagObject}`, `消费合同 SHA-256：${manifest.desktopRelease.contractSha256}`,
-    `${committed ? '受审原始 index' : '公开资产 index'} SHA-256：${contract.assetIndex.sha256}`, `桌面发布：https://github.com/${contract.repository}/releases/tag/${contract.tag}`]) exact(desktop, text);
-  // Source guidance is bilingual. Reject contradictory legacy desktop guidance
-  // anywhere in NOTICE, while preserving the independent mobile manifests.
-  for (const text of [`Desktop release: ${contract.version} — https://github.com/${contract.repository}/releases/tag/${contract.tag}`,
-    `Desktop source: https://github.com/${contract.repository}/tree/${contract.sourceCommit}`,
-    `Desktop release contract: ${manifest.desktopRelease.contractPath} (SHA-256 ${manifest.desktopRelease.contractSha256})`,
-    `${committed ? 'Committed original index' : 'Published asset index'} SHA-256: ${contract.assetIndex.sha256}`]) {
-    const label = text.slice(0, text.indexOf(':') + 1), lines = notice.split(/\r?\n/);
-    demand(lines.filter((line) => line.startsWith(label)).length === 1 && lines.includes(text), 'NOTICE: English release identity differs');
-  }
-  demand(notice.includes('`src-tauri/core-manifest.json` 的 `desktopRelease`')
-    && notice.includes(committed ? '`sourceArchive` 指向固定 commit 的 GitHub 自动源码归档，按实际传输 hash 与完整 Git tree 核验。' : isUpstreamRelease(contract) ? '`sourceArchive` 指向同批完整源码归档。' : '`sourceDelivery` 指向固定公开来源。')
-    && notice.includes('Desktop selection uses src-tauri/core-manifest.json desktopRelease.')
-    && notice.includes(committed ? 'The committed original index retains the producer archive identity; sourceArchive pins the independently verified fixed-commit GitHub source archive,' : isUpstreamRelease(contract) ? 'asset index sourceArchive identifies the same-run complete source archive,' : 'asset index sourceDelivery identifies the automatic product source archive,'), 'NOTICE: bilingual release source guidance missing');
-  demand(!/desktopSourceBuild|scripts\/desktop-core\/source-manifest\.json|desktop[^\n]*alpha\.11|Final native kernels, signatures, source archives/i.test(notice),
-    'NOTICE: obsolete desktop source guidance');
-  for (const [label, source] of [['Android libbox 基线', mobile.android], ['Apple libbox 基线', mobile.apple]]) {
-    demand(hex(source?.sourceCommit, 40) && hex(source?.manifestSha256, 64), 'NOTICE: mobile source identity missing');
-    const lines = section(label);
-    demand(lines[0] === `- ${label} v${manifest.bundledCoreVersion} (GPLv3) — https://github.com/SagerNet/sing-box`, 'NOTICE: mobile baseline differs');
-    for (const text of [`上游基线源码：https://github.com/SagerNet/sing-box/tree/v${manifest.bundledCoreVersion}`,
-      `固定源码：https://github.com/SagerNet/sing-box/tree/${source.sourceCommit}`, `source manifest SHA-256：${source.manifestSha256}`]) exact(lines, text);
-  }
+  const row = contract.platforms[key]; validateRow(contract, key, row);
+  return Object.keys(upstreamPayloadPins(contract, row)).sort().map((name) => `core-release/${name}`);
 }
 
 // Redirects are permitted only for immutable asset bytes, whose expected hash is already pinned.
@@ -365,10 +158,7 @@ const TRANSIENT_TRANSPORT_CODES = new Set(['EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT
 function canonicalPublicAPI(endpoint, asset, repository = REPO) {
   kernelRepositoryIdentity(repository);
   return !asset && endpoint.protocol === 'https:' && endpoint.hostname === 'api.github.com'
-    && !endpoint.port && !endpoint.username && !endpoint.password && !endpoint.hash
-    && (!endpoint.search || endpoint.search === '?recursive=1'
-      && endpoint.pathname.startsWith(`/repos/${repository}/git/trees/`)
-      && /^[a-f0-9]{40}$/.test(endpoint.pathname.slice(`/repos/${repository}/git/trees/`.length)))
+    && !endpoint.port && !endpoint.username && !endpoint.password && !endpoint.hash && !endpoint.search
     && (endpoint.pathname === `/repos/${repository}` || endpoint.pathname.startsWith(`/repos/${repository}/`));
 }
 // Installation credentials are opaque Bearer values, not a frozen GitHub token-prefix alphabet.
@@ -463,13 +253,6 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
   kernelRepositoryIdentity(repository);
   const request = options.fetch ?? fetch;
   const token = options.apiToken ?? releaseAPIToken(options.env ?? RELEASE_API_ENV);
-  const original = new URL(url);
-  const sourceMatch = original.origin === 'https://github.com' && !original.username && !original.password
-    && !original.search && !original.hash
-    ? new RegExp(`^/${repository}/archive/([a-f0-9]{40})\\.tar\\.gz$`).exec(original.pathname) : null;
-  // Resolve the archive alias to its approved fixed-commit origin. Source
-  // responses must be terminal; all source identity checks still follow.
-  if (asset && sourceMatch) url = `https://codeload.github.com/${repository}/tar.gz/${sourceMatch[1]}`;
   for (let redirects = 0; redirects <= 3;) {
     const endpoint = new URL(url);
     const headers = { 'User-Agent': 'Polaris-release-consumer', Accept: 'application/vnd.github+json' };
@@ -522,7 +305,7 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
     }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       await cancelBody(); const next = new URL(response.headers.get('location') ?? '', url);
-      demand(asset && !sourceMatch && next.protocol === 'https:' && !next.username && !next.password && !next.port
+      demand(asset && next.protocol === 'https:' && !next.username && !next.password && !next.port
         && ['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname),
       'Unapproved release redirect');
       url = next.href; redirects++; continue;
@@ -593,23 +376,8 @@ async function publicSnapshot(contract, read) {
       && asset.browser_download_url === pin.url && (asset.digest == null || asset.digest === `sha256:${pin.sha256}`), 'Public asset identity differs');
     return { name: asset.name, id: asset.id, bytes: asset.size, url: asset.browser_download_url, digest: asset.digest ?? null };
   });
-  const upstream = isUpstreamRelease(contract) ? await readUpstreamSourceEvidence(contract, request) : undefined;
-  return { repositoryId: repo.id, releaseId: release.id, tag: tag.sha, sourceCommit: commit.sha, sourceTree: commit.tree.sha, assets, ...upstream };
+  return { repositoryId: repo.id, releaseId: release.id, tag: tag.sha, sourceCommit: commit.sha, sourceTree: commit.tree.sha, assets };
 }
-function indexRows(bytes, contract) {
-  demand(bytes.length === contract.assetIndex.bytes && digest(bytes) === contract.assetIndex.sha256, 'Published asset index SHA differs');
-  const index = JSON.parse(bytes);
-  if (isUpstreamRelease(contract)) return validateUpstreamIndex(index, contract);
-  demand(index.schema === 'polaris-production-assets-v1' && index.repository === contract.repository && Array.isArray(index.platforms), 'Published asset index schema differs');
-  for (const name of ['version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree']) same(index[name], contract[name], `Index ${name} differs`);
-  same(index.platforms.map((r) => r.target).sort(), ['linux/amd64', 'linux/arm64', 'windows/amd64', 'windows/arm64', 'darwin/amd64', 'darwin/arm64'].sort(), 'Six CLI index targets differ');
-  for (const row of Object.values(contract.platforms)) {
-    const { releaseAsset, ...producer } = row;
-    same(index.platforms.find((r) => r.target === row.target), producer, 'Public index producer row differs');
-  }
-  return index;
-}
-
 function coreHeader(bytes, target) {
   let ok = false;
   if (target.os === 'linux') ok = bytes.length >= 20 && bytes.subarray(0, 6).equals(Buffer.from([127, 69, 76, 70, 2, 1])) && bytes.readUInt16LE(18) === 62;
@@ -620,7 +388,7 @@ function coreHeader(bytes, target) {
   }
   demand(ok, 'Actual release core architecture differs');
 }
-function actualBuildInfo(raw, upstream, goVersion) {
+function actualBuildInfo(raw, goVersion) {
   const settings = {}, deps = [], replacements = [];
   demand(raw.split('\n')[0].endsWith(`: ${goVersion}`), 'Actual release Go version differs');
   demand(raw.includes('\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n')
@@ -630,24 +398,19 @@ function actualBuildInfo(raw, upstream, goVersion) {
     if (parts[1] === 'build') {
       const at = parts[2].indexOf('='); demand(at > 0 && !Object.hasOwn(settings, parts[2].slice(0, at)), 'Duplicate/invalid BuildInfo setting');
       let value = parts[2].slice(at + 1);
-      if (upstream && value.startsWith('\"')) value = JSON.parse(value);
+      if (value.startsWith('\"')) value = JSON.parse(value);
       demand(typeof value === 'string', 'Actual upstream BuildInfo setting differs');
       settings[parts[2].slice(0, at)] = value;
     } else if (parts[1] === 'dep') deps.push({ module: parts[2], version: parts[3], h1: parts[4] ?? '' });
     else if (parts[1] === '=>') {
-      if (upstream) {
-        demand(deps.length > 0 && typeof parts[2] === 'string' && parts[2].length > 0 && typeof parts[3] === 'string', 'Actual upstream replacement differs');
-        replacements.push({ ...deps.pop(), replacement: { module: parts[2], version: parts[3], h1: parts[4] ?? '' } });
-        continue;
-      }
-      demand(deps.at(-1)?.module === 'github.com/sagernet/sing-tun' && parts[2] === './third_party/sing-tun'
-        && parts[3] === '(devel)', 'Actual local replacement differs'); replacements.push(deps.pop());
+      demand(deps.length > 0 && typeof parts[2] === 'string' && parts[2].length > 0 && typeof parts[3] === 'string', 'Actual upstream replacement differs');
+      replacements.push({ ...deps.pop(), replacement: { module: parts[2], version: parts[3], h1: parts[4] ?? '' } });
     }
   }
-  demand((upstream ? replacements.length > 0 : replacements.length === 1) && deps.length && deps.every((d) => /^h1:[A-Za-z0-9+/]+=$/.test(d.h1))
+  demand(replacements.length > 0 && deps.length && deps.every((d) => /^h1:[A-Za-z0-9+/]+=$/.test(d.h1))
     && new Set([...deps, ...replacements].map((d) => d.module)).size === deps.length + replacements.length, 'Actual module graph incomplete');
   const acquisition = deps.filter((d) => d.module.startsWith('github.com/sagernet/cronet-go/lib/'));
-  return { settings, normalModules: deps.filter((d) => !acquisition.includes(d)), prebuiltAcquisitionModules: acquisition, ...(upstream ? { localReplacements: replacements } : { localReplacement: replacements[0] }) };
+  return { settings, normalModules: deps.filter((d) => !acquisition.includes(d)), prebuiltAcquisitionModules: acquisition, localReplacements: replacements };
 }
 export function verifyReleaseCore(path, row, key, run = execFileSync, host = process.platform,
   signatureRun = run === execFileSync ? undefined : run, contract = undefined) {
@@ -655,26 +418,19 @@ export function verifyReleaseCore(path, row, key, run = execFileSync, host = pro
   const options = { encoding: 'utf8', env: { ...process.env, GOTOOLCHAIN: 'local', GOWORK: 'off' },
     maxBuffer: 8 * 1024 * 1024, timeout: LOCAL_METADATA_TIMEOUT_MS, killSignal: 'SIGKILL' };
   const raw = String(run('go', ['version', '-m', path], options)).trimEnd() + '\n';
-  const upstream = isUpstreamRow(row);
   if (contract) demand(row.sourceCommit === contract.sourceCommit && row.sourceTree === contract.sourceTree,
     'Actual core/contract source pair differs');
-  const goVersion = contract ? releaseGoVersion(contract) : upstream ? upstreamSourceGoVersion(row)
-    : releaseGoVersion({ schema: 'polaris-box-release-consumer-contract-v1' });
-  const graph = actualBuildInfo(raw, upstream, goVersion);
-  if (upstream) {
-    const normalized = (value) => { const lines = value.trimEnd().split(/\r?\n/);
-      demand(lines[0].endsWith(row.goVersion), 'Original upstream BuildInfo Go version differs');
-      return [row.goVersion, ...lines.slice(1)].join('\n'); };
-    same(normalized(raw), normalized(row.rawBuildInfo), 'Actual upstream raw BuildInfo differs');
-  }
+  const graph = actualBuildInfo(raw, row.goVersion);
+  const normalized = (value) => { const lines = value.trimEnd().split(/\r?\n/);
+    demand(lines[0].endsWith(row.goVersion), 'Original upstream BuildInfo Go version differs');
+    return [row.goVersion, ...lines.slice(1)].join('\n'); };
+  same(normalized(raw), normalized(row.rawBuildInfo), 'Actual upstream raw BuildInfo differs');
   same(graph, row.buildGraph, 'Actual release BuildInfo/module graph differs');
   const settings = graph.settings;
   demand(settings.GOOS === target.os && settings.GOARCH === target.arch && settings.CGO_ENABLED === target.cgo
-    && (upstream
-      ? (!Object.hasOwn(settings, 'vcs.revision') || settings['vcs.revision'] === row.sourceCommit)
-        && (!Object.hasOwn(settings, 'vcs.modified') || settings['vcs.modified'] === 'false')
-      : settings['vcs.revision'] === row.sourceCommit && settings['vcs.modified'] === 'false')
-    && settings['-trimpath'] === 'true' && (upstream || !Object.hasOwn(settings, '-ldflags')), 'Actual release build settings differ');
+    && (!Object.hasOwn(settings, 'vcs.revision') || settings['vcs.revision'] === row.sourceCommit)
+    && (!Object.hasOwn(settings, 'vcs.modified') || settings['vcs.modified'] === 'false')
+    && settings['-trimpath'] === 'true', 'Actual release build settings differ');
   same(settings['-tags']?.replaceAll('"', '').split(',').sort(), row.tags.split(',').sort(), 'Actual release feature tags differ');
   demand(String(run('go', ['tool', 'buildid', path], options)).trim() === row.buildID, 'Actual release BuildID differs');
   const signature = releaseMacCodeSignature(row, key);
@@ -684,44 +440,9 @@ export function verifyReleaseCore(path, row, key, run = execFileSync, host = pro
   }
   return graph;
 }
-export function verifyReleaseProvenance(bytes, row, key) {
-  const target = RELEASE_TARGETS[key], rootName = `polaris-box-${row.version}-${target.os}-${target.arch}`;
-  demand(digest(bytes) === row.archive.members[`${rootName}/provenance.json`], 'Inner provenance bytes differ');
-  const { archive: nativeArchive, ...nativeProducer } = JSON.parse(bytes);
-  const { archive, core, sidecar, releaseAsset, finalPackageCronetSmoke, ...producer } = row;
-  // The producer's original receipt contains its first archive inventory. The
-  // final assembly adds legal/source inputs and a final-package smoke record.
-  // Both records retain their original identities; the pinned member hash above
-  // binds the complete original receipt, including its earlier archive facts.
-  same(nativeProducer, producer, 'Inner release provenance differs');
-  demand(nativeArchive && equalKeys(nativeArchive, ['name', 'bytes', 'sha256', 'members'])
-    && nativeArchive.name === archive.name && positive(nativeArchive.bytes)
-    && nativeArchive.bytes <= archive.bytes && hex(nativeArchive.sha256, 64)
-    && nativeArchive.members && Object.keys(nativeArchive.members).length > 0
-    && Object.entries(nativeArchive.members).every(([name, hash]) => Object.hasOwn(archive.members, name) && hex(hash, 64))
-    && nativeArchive.members[`${rootName}/${core.member}`] === core.sha256
-    && (!sidecar || nativeArchive.members[`${rootName}/${sidecar.member}`] === sidecar.sha256),
-  'Original native archive lineage differs');
-  const smoke = finalPackageCronetSmoke;
-  demand(smoke && smoke.os === target.os && smoke.arch === target.arch
-    && smoke.go === row.sourceFingerprint.goVersion && smoke.gvisorCompiled === true
-    && smoke.linkage === (sidecar ? 'shared-purego' : 'static-cgo')
-    && /^\d+\.\d+\.\d+\.\d+$/.test(smoke.version ?? '')
-    && (sidecar ? smoke.sha256 === sidecar.sha256
-      && typeof smoke.library === 'string' && smoke.library.replaceAll('\\', '/').endsWith(`/${rootName}/${sidecar.member}`)
-      : smoke.library === undefined && smoke.sha256 === undefined), 'Final package Cronet smoke binding differs');
-  return nativeProducer;
-}
-function equalKeys(value, keys) { return canonical(Object.keys(value).sort()) === canonical([...keys].sort()); }
 function verifyExtracted(directory, rootName, row, key, run, host, signatureRun, contract) {
   const root = join(directory, rootName);
-  const { archive, core, sidecar } = row;
-  if (!isUpstreamRow(row)) {
-  verifyReleaseProvenance(readFileSync(join(root, 'provenance.json')), row, key);
-  const sums = Object.keys(archive.members).filter((n) => n !== `${rootName}/SHA256SUMS`).sort()
-    .map((n) => `${archive.members[n]}  ${n.slice(rootName.length + 1)}\n`).join('');
-  demand(readFileSync(join(root, 'SHA256SUMS'), 'utf8') === sums, 'Inner checksum inventory differs');
-  }
+  const { core, sidecar } = row;
   verifyReleaseCore(join(root, core.member), row, key, run, host, signatureRun, contract);
   if (sidecar) inspectCronetBytes(checkedBytes(join(root, sidecar.member), sidecar), key);
   return root;
@@ -791,16 +512,6 @@ export function recoverRelease(root, options = {}) {
   }
   rmSync(work, { recursive: true }); rmSync(lock);
   return { schema: 'polaris-release-consumer-recovery-v1', phase: journal.phase, restoredPreviousResources: journal.phase === 'replacing' };
-}
-function adapterIdentity(root, run) {
-  const options = { cwd: root, encoding: 'utf8', env: { ...process.env },
-    timeout: LOCAL_METADATA_TIMEOUT_MS, killSignal: 'SIGKILL' };
-  for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete options.env[name];
-  const candidate = String(run('git', ['rev-parse', 'HEAD'], options)).trim();
-  demand(hex(candidate, 40) && !String(run('git', ['status', '--porcelain', '--untracked-files=no'], options)).trim(), 'Release adapter checkout differs');
-  const files = Object.fromEntries(ADAPTER_FILES.map((name) => { regularPath(join(root, name)); return [name, digest(readFileSync(join(root, name)))]; }));
-  const facts = { candidate, fileSha256: files };
-  return { schema: 'polaris-app-release-adapter-v1', facts, fingerprint: digest(portableCanonical(facts)) };
 }
 function replaceDirectories(resources, work, keys, rename) {
   const completed = [];
@@ -968,11 +679,6 @@ function releaseBlobCache(root, options) {
 }
 
 export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_TARGETS), options = {}) {
-  if (Object.hasOwn(manifest, 'desktopTemporary')) {
-    const { consumeTemporaryDesktop } = await import('./native-dns-candidate.mjs');
-    demand(keys.length && new Set(keys).size === keys.length && keys.every((key) => Object.hasOwn(RELEASE_TARGETS, key)), 'Unknown/duplicate App architecture selection');
-    return consumeTemporaryDesktop(root, manifest, options);
-  }
   demand(keys.length && new Set(keys).size === keys.length && keys.every((k) => Object.hasOwn(RELEASE_TARGETS, k)), 'Unknown/duplicate App architecture selection');
   const contract = loadReleaseContract(root, manifest), invoke = options.run ?? execFileSync, read = options.read ?? releasePublicReader({ repository: contract.repository });
   const withoutAPIToken = (execute) => (command, args, settings = {}) => {
@@ -984,7 +690,6 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
   // codesign --display writes CDHash to stderr even on success. execFileSync
   // returns stdout only; preserve the observer's status/stdout/stderr contract.
   const signatureRun = invoke === execFileSync ? withoutAPIToken(spawnSync) : run;
-  const adapter = adapterIdentity(root, run);
   const blobCache = releaseBlobCache(root, options), cacheWrites = [];
   const resources = join(root, 'resources'); mkdirSync(resources, { recursive: true }); regularPath(resources, true);
   const lock = join(resources, '.release-consumer.lock');
@@ -998,23 +703,6 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     const journal = { schema: 'polaris-release-consumer-lock-v1', pid: process.pid, work: basename(work), phase: 'acquiring' };
     saveJournal(lock, work, journal);
     const before = await publicSnapshot(contract, read);
-    const index = hasCommittedReleaseMaterials(contract)
-      ? checkedBytes(join(root, contract.assetIndex.path), contract.assetIndex)
-      : await read(contract.assetIndex.url, contract.assetIndex.bytes, true);
-    indexRows(index, contract);
-    let sourceArchive;
-    if (isUpstreamRelease(contract)) {
-      sourceArchive = blobCache.read(contract.sourceArchive) ?? await read(contract.sourceArchive.url, contract.sourceArchive.bytes, true);
-      demand(sourceArchive.length === contract.sourceArchive.bytes && digest(sourceArchive) === contract.sourceArchive.sha256, 'Downloaded complete source archive differs');
-      // loadReleaseContract already checks legal content; send pins, then reprove tar bytes.
-      const sourceFile = join(work, contract.sourceArchive.name); writeFileSync(sourceFile, sourceArchive, { flag: 'wx' });
-      cacheWrites.push({ pin: contract.sourceArchive, file: sourceFile });
-      runColdArchive(run, 'source-archive-validation', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), sourceFile, '--source-trusted-proofs'],
-        JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
-          sourceTree: contract.sourceTree, sourceGitlinks: before.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: contract.platforms.linux.sourceIdentity, trustedSourceSelection:'formal', trustedRows:Object.values(contract.platforms).map(({releaseAsset,...row})=>row), trustedProducer:contract.producer,
-          buildReplacements: Object.values(contract.platforms).flatMap((r) => r.buildGraph.localReplacements),
-          ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }));
-    }
     const stage = join(work, 'stage'); mkdirSync(stage);
     const metadata = join(stage, '.release-receipts'); mkdirSync(metadata);
     const oldMetadata = join(resources, '.release-receipts');
@@ -1046,15 +734,12 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       for (const name of [target.core, target.sidecar].filter(Boolean)) { copyFileSync(join(source, name), join(dest, name)); chmodSync(join(dest, name), lstatSync(join(source, name)).mode & 0o777); }
       const notices = join(dest, 'core-release'); rmSync(notices, { recursive: true, force: true }); mkdirSync(notices);
       for (const name of readdirSync(source).filter((n) => n !== target.core && n !== target.sidecar)) cpSync(join(source, name), join(notices, name), { recursive: true });
-      if (isUpstreamRelease(contract)) {
-        const metadata = { ...upstreamMetadata(contract, row), [`source/${contract.sourceArchive.name}`]: sourceArchive };
-        for (const [name, content] of Object.entries(metadata)) {
-          const path = join(notices, name); mkdirSync(dirname(path), { recursive: true });
-          writeFileSync(path, content, { flag: 'wx', mode: 0o644 });
-        }
+      for (const [name, content] of Object.entries(upstreamMetadata(contract, row))) {
+        const path = join(notices, name); mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, content, { flag: 'wx', mode: 0o644 });
       }
       const facts = { platform: key, contractSha256: manifest.desktopRelease.contractSha256,
-        assetIndexSha256: contract.assetIndex.sha256, releaseAsset: row.releaseAsset, adapter, producer: row,
+        releaseAsset: row.releaseAsset, producer: row,
         publicReadback: before,
         signaturePolicy: POLICY, macCodeSignature: releaseMacCodeSignature(row, key),
         actualAppAcceptance: 'pending native load, gvisor/mixed, feature and final carrier gates' };
@@ -1063,7 +748,6 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     }
     const after = await publicSnapshot(contract, read); same(after, before, 'Release identity changed during acquisition');
     writeFileSync(join(metadata, 'public-readback.json'), JSON.stringify({ schema: 'polaris-app-release-readback-v1', contractSha256: manifest.desktopRelease.contractSha256, before, after }, null, 2) + '\n', { mode: 0o600 });
-    writeFileSync(join(metadata, contract.assetIndex.name), index, { mode: 0o600 });
     journal.phase = 'replacing'; journal.directories = [...keys, RECOVERY_RESOURCE, '.release-receipts'].map((key) => ({ key,
       original: existsSync(join(resources, key)) ? directoryFingerprint(join(resources, key)) : null,
       staged: directoryFingerprint(join(stage, key)) }));
@@ -1089,18 +773,15 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
   const receipt = json(file); const { fingerprint, schema, ...facts } = receipt;
   demand(schema === 'polaris-app-release-consumption-v1' && fingerprint === digest(portableCanonical(facts))
     && receipt.platform === key && receipt.contractSha256 === manifest.desktopRelease.contractSha256
-    && receipt.assetIndexSha256 === contract.assetIndex.sha256 && receipt.signaturePolicy === POLICY, 'Release consumption receipt differs');
+    && receipt.signaturePolicy === POLICY, 'Release consumption receipt differs');
   same(receipt.producer, row, 'Saved original producer differs'); same(receipt.releaseAsset, row.releaseAsset, 'Saved asset identity differs');
   same(receipt.macCodeSignature, releaseMacCodeSignature(row, key), 'Saved Mac signature state/CDHash differs');
-  same(receipt.adapter, adapterIdentity(root, run), 'App adapter identity differs');
-  indexRows(checkedBytes(join(metadata, contract.assetIndex.name), contract.assetIndex), contract);
   regularPath(join(metadata, 'public-readback.json'));
   const readback = json(join(metadata, 'public-readback.json'));
   demand(readback.schema === 'polaris-app-release-readback-v1' && readback.contractSha256 === receipt.contractSha256, 'Saved public readback differs');
   same(readback.before, readback.after, 'Saved readback snapshots differ');
   same(readback.before, receipt.publicReadback, 'Consumption public snapshot differs');
   const snapshot = receipt.publicReadback;
-  validatePublishedUpstreamReadback(snapshot, contract);
   demand(snapshot?.repositoryId === releaseRepositoryId(contract) && snapshot.releaseId === contract.releaseId
     && snapshot.tag === contract.tagObject && snapshot.sourceCommit === contract.sourceCommit
     && snapshot.sourceTree === contract.sourceTree, 'Saved readback identity differs');
@@ -1118,55 +799,27 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     demand(((lstatSync(lib).mode | lstatSync(original).mode) & 0o7000) === 0
       && (lstatSync(lib).mode & 0o7777) === (lstatSync(original).mode & 0o7777), 'Final release library permissions differ');
   } else demand(!readdirSync(dirname(core)).some((n) => /^libcronet\.(so|dll|dylib)$/.test(n)), 'Static carrier contains Cronet sidecar');
-  const prefix = validateRow(contract, key, row) + '/';
   verifyRecoveryResource(join(root, 'resources', RECOVERY_RESOURCE, key), row, key,
     manifest.desktopRelease.contractSha256, dirname(source));
-  const payloadPins = isUpstreamRelease(contract) ? upstreamPayloadPins(contract, row)
-    : Object.fromEntries(Object.entries(row.archive.members).map(([name, hash]) => [name.slice(prefix.length), hash]));
-  for (const [relative, sha256] of Object.entries(payloadPins)) {
+  for (const [relative, sha256] of Object.entries(upstreamPayloadPins(contract, row))) {
     if (relative === row.core.member || relative === row.sidecar?.member) continue;
     const original = join(dirname(source), 'core-release', relative), final = join(dirname(core), 'core-release', relative);
     regularPath(original); regularPath(final);
     demand(digest(readFileSync(original)) === sha256 && digest(readFileSync(final)) === sha256,
-      'Release notice/source/provenance bytes differ in final carrier');
+      'Release notice/provenance bytes differ in final carrier');
     demand(((lstatSync(original).mode | lstatSync(final).mode) & 0o7000) === 0
       && (lstatSync(original).mode & 0o7777) === (lstatSync(final).mode & 0o7777), 'Final release notice permissions differ');
-  }
-  if (isUpstreamRelease(contract)) {
-    // The validated contract binds legal content to these pins; Python still checks actual tar bytes.
-    const started = performance.now();
-    try {
-      run(process.platform === 'win32' ? 'python' : 'python3',
-        ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name), '--source-trusted-proofs'],
-        { input: JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
-          sourceTree: contract.sourceTree, sourceGitlinks: snapshot.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: row.sourceIdentity, trustedSourceSelection:'formal', trustedRows:[(({releaseAsset,...original})=>original)(row)], trustedProducer:contract.producer,
-          buildReplacements: row.buildGraph.localReplacements, ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }),
-          encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: LOCAL_ARCHIVE_TIMEOUT_MS, killSignal: 'SIGKILL' });
-    } catch (error) {
-      // Identify the exact local proof that failed without logging its input,
-      // changing the verification budget, retrying, or accepting older evidence.
-      const elapsedMs = Math.round(performance.now() - started);
-      throw new Error(`Release proof failed (platform=${key}; archive=${contract.sourceArchive.name}; stage=source-archive-reproof; elapsedMs=${elapsedMs}; timeoutMs=${LOCAL_ARCHIVE_TIMEOUT_MS}; code=${error?.code ?? 'unknown'}; status=${error?.status ?? 'unknown'}; signal=${error?.signal ?? 'unknown'}): ${error?.message ?? error}`, { cause: error });
-    }
   }
   return receipt;
 }
 
-// Final Mac bundle validation selects the explicit release contract before any
-// legacy source receipt. It never aliases/relabels the two receipt schemas.
-export function verifyMacPackagedCore(root, manifest, key, binary, run = execFileSync) {
-  demand(key === 'mac-x64' || key === 'mac-arm64', 'Mac packaged core requires a Mac target');
-  if (hasTemporaryDesktop(manifest)) { loadTemporaryDesktopSelection(root, manifest); return verifyCandidatePayload(root, key, binary, run); }
-  if (hasDesktopRelease(manifest)) {
-    const receipt = verifyPackagedRelease(root, manifest, key, binary, run, 'darwin');
-    const contract = loadReleaseContract(root, manifest);
-    // A valid outer bundle seal can cover a damaged copy made before sealing.
-    // Reprove the delivered recovery bytes, not only the acquisition directory.
-    verifyRecoveryResource(join(dirname(dirname(binary)), RECOVERY_RESOURCE, key),
-      contract.platforms[key], key, manifest.desktopRelease.contractSha256, dirname(binary));
-    return receipt;
-  }
-  const path = join(root, 'resources/.source-receipts', `${key}.json`); regularPath(path);
-  const receipt = json(path); verifyMacCodeSignatureReceipt(binary, receipt, key, run === execFileSync ? undefined : run);
+// Final bundle validation also reproves the delivered recovery bytes rather
+// than borrowing the checkout's good archive when a final resource was omitted.
+export function verifyPackagedCore(root, manifest, key, binary, run = execFileSync, host = process.platform) {
+  const receipt = verifyPackagedRelease(root, manifest, key, binary, run, host);
+  const contract = loadReleaseContract(root, manifest);
+  // A valid outer bundle seal can cover a damaged copy made before sealing.
+  verifyRecoveryResource(join(dirname(dirname(binary)), RECOVERY_RESOURCE, key),
+    contract.platforms[key], key, manifest.desktopRelease.contractSha256, dirname(binary));
   return receipt;
 }

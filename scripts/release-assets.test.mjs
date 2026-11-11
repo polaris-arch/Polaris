@@ -122,13 +122,5 @@ test('transport retention, light-build isolation and evidence retention are unch
   assert.match(upload, /if: env\.POLARIS_UPLOAD_ARTIFACTS == '1'/);
   assert.doesNotMatch(packageWorkflow, /actions: write|deleteArtifact|delete-artifact/);
   const android = readFileSync(new URL('../.github/workflows/android.yml', import.meta.url), 'utf8');
-  const candidateParts = android.split('      - name: Retain Android candidate evidence only\n');
-  assert.equal(candidateParts.length, 2, 'one explicit candidate evidence step');
-  const candidate = candidateParts[1].split('\n      - ')[0];
-  assert.equal(candidate.match(/^ {8}if: (.+)$/m)?.[1],
-    "always() && (inputs.hot_consumer_candidate || '') != '' && steps.hot_candidate.outcome == 'success'");
-  assert.match(candidate, /if-no-files-found: error/);
-  assert.doesNotMatch(candidate, /\.(?:aar|apk|aab|so|jks)\b/);
   assert.match(android, /name: android-release-mapping/);
-  assert.match(android, /name: formal-mobile-input-\$\{\{ github\.job \}\}/);
 });

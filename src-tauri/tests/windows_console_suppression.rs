@@ -387,9 +387,8 @@ fn no_new_console_program_spawn_escapes_the_suppression() {
 /// （`tasklist` / `sc` / `netsh`…），而 sing-box 的路径是个变量。于是「有人在这两个文件里重新写一份
 /// `Command::new(binary).arg("check")`」既不会被清单抓到，也不会被字面量扫描抓到。
 ///
-/// 常规 check 已移至 CheckCustody。新 mesh candidate 的另一处仅在 Linux x86_64 模块编译，
-/// 且必须使用 sealed fd、空输出管道、kill_on_drop 与预算托管。本门逐个锁住两处精确 argv、
-/// 次数和 Linux cfg；新拷贝仍要求归入已有托管入口，不能只补一个窗口标志。
+/// 常规 check 已移至 CheckCustody。本门逐个锁住两处精确 argv 与次数；新拷贝仍要求归入
+/// 已有托管入口，不能只补一个窗口标志。
 ///
 /// # 判据形态
 ///
@@ -401,7 +400,6 @@ fn only_one_production_site_spawns_sing_box_check() {
     const CHECK_ARG: &str = "\"check\"";
     const HOME: &str = "crates/core-supervisor/src/config_gate/check_custody.rs";
     const LINUX: &str = "crates/core-supervisor/src/admitted_payload.rs";
-    const RELAY: &str = "src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs";
     let root = repo_root();
     let mut sites = Vec::new();
     let mut scanned = 0;
@@ -427,15 +425,11 @@ fn only_one_production_site_spawns_sing_box_check() {
     assert!(scanned > 50);
     assert_eq!(
         sites.len(),
-        3,
-        "normal, fixed sealed and closed Mac Root CheckConfig constructors only: {sites:?}"
+        2,
+        "normal and closed Mac Root CheckConfig constructors only: {sites:?}"
     );
     for (file, argv) in [
         (HOME, ".args([\"--disable-color\", \"check\", \"-c\"])"),
-        (
-            LINUX,
-            ".args([\"--disable-color\", \"check\", \"-c\", \"/proc/self/fd/0\"])",
-        ),
         (LINUX, ".args([\"--disable-color\", \"check\", \"-c\"])"),
     ] {
         assert_eq!(
@@ -447,126 +441,7 @@ fn only_one_production_site_spawns_sing_box_check() {
             "{file}: {sites:?}"
         );
     }
-    let owner = strip_comments(&read(LINUX));
     assert_mac_root_check_factory(&read(LINUX));
-    let parts = braced_block(&owner, "pub(crate) fn sealed_check_parts(");
-    for required in [
-        "self.purpose != ExecPurpose::CheckConfig",
-        "self.command()?",
-        ".current_dir(\"/\")",
-        ".kill_on_drop(true)",
-        "binary_for_custody()?",
-    ] {
-        assert!(
-            parts.contains(required),
-            "opaque sealed check lost {required}"
-        );
-    }
-    let app = strip_comments(&read(RELAY));
-    let relay = braced_block(&app, "pub(super) async fn supervise(");
-    assert!(relay.contains("supervise_owned_sealed_check(execution, config, timeout, spawned)"));
-    let source = read(HOME);
-    let home = strip_comments(&source);
-    let public = braced_block(&home, "pub async fn supervise_owned_sealed_check(");
-    assert!(public.contains("supervise_admitted_sealed_check("));
-    assert_sealed_check_owner_custody(&source);
-    let queue = braced_block(&home, "fn queue_owned_sealed_with_owner(");
-    for required in [
-        "validate_sealed_file(&binary)?",
-        "validate_sealed_file(&config)?",
-        "rustix::io::fcntl_dupfd_cloexec(&config, 3)",
-        ".stdin(std::process::Stdio::from(stdin))",
-        "payload,",
-    ] {
-        assert!(
-            queue.contains(required),
-            "opaque check custody lost {required}"
-        );
-    }
-}
-
-/// Follow the real PreparedExecution reference through both retained owners,
-/// then the same Child wait/Unknown path. Literal decoys are not executable proof.
-fn assert_sealed_check_owner_custody(source: &str) {
-    let code = polaris_source_probe::mask_comments_and_strings(source);
-    let compact = |text: &str| text.split_whitespace().collect::<String>();
-    let block = |anchor| compact(braced_block(&code, anchor));
-    let private = block("async fn supervise_admitted_sealed_check(");
-    assert!(private.contains("let(command,binary,_)=execution.sealed_check_parts()?;"));
-    assert_eq!(private.matches(
-        "custody.supervise_owned_sealed_with_owner(command,binary,config,timeout,spawned,Some(&execution),)"
-    ).count(), 1, "the actual private call must transfer the same execution reference");
-    let inner = block("async fn supervise_owned_sealed_with_owner(");
-    assert!(inner.contains("execution:Option<&PreparedExecution>"));
-    assert_eq!(inner.matches(
-        "self.queue_owned_sealed_with_owner(command,binary,config,Arc::new(NativeIo),execution.map(PreparedExecution::payload),execution.and_then(PreparedExecution::lease_owner),)"
-    ).count(), 1, "queue must receive both owners from that reference before birth");
-    let queue = braced_block(&code, "fn queue_owned_sealed_with_owner(");
-    let retained = compact(braced_block(queue, "CheckRun {"));
-    assert!(retained.starts_with("CheckRun{payload,lease_owner,completion:"));
-    for required in ["_binary:binary", "_config:config", "command:Some(command)"] {
-        assert!(
-            retained.contains(required),
-            "owned sealed state lost {required}"
-        );
-    }
-    let fields = block("struct CheckRun {");
-    for required in [
-        "payload:Option<Arc<AdmittedPayload>>",
-        "lease_owner:Option<Arc<dynSend+Sync>>",
-    ] {
-        assert!(
-            fields.contains(required),
-            "strong owner storage lost {required}"
-        );
-    }
-    assert!(compact(&code).contains("implCheckIoforNativeIo{}"));
-    let native = block("fn poll_wait(&self, child: &mut Child, cx:");
-    assert!(native.contains("letwait=child.wait();"));
-    assert!(native.contains("wait.poll(cx)"));
-    let wait = block("async fn wait_exit(");
-    assert!(wait.contains("run.poll_exit(cx).map_err(unknown)"));
-    let poll = block("fn poll_exit(");
-    assert!(poll.contains("self.io.poll_wait(child,cx)"));
-    assert!(poll.contains("self.cache_native_exit(exit,NativeExitSource::PollWait)"));
-    let validate = block("fn validate_retirement(");
-    for required in [
-        "self.lost_wait_ownership",
-        "letSome(fact)=&self.native_exitedelse",
-        "NativeExitSource::PollWait|NativeExitSource::TryWait",
-        "returnErr(unknown(",
-    ] {
-        assert!(
-            validate.contains(required),
-            "native/Unknown validation lost {required}"
-        );
-    }
-    let retire = block("fn retire(&self, request: &CheckRequestRef)");
-    let validated = retire
-        .find("run.validate_retirement()")
-        .expect("validate same Child first");
-    let terminal = retire
-        .find("run.native_terminal=validated.map(")
-        .expect("bound native terminal");
-    let removed = retire
-        .find("state.runs.remove(&request.id)")
-        .expect("retire exact original row");
-    assert!(validated < terminal && terminal < removed);
-    assert!(retire.contains("Err(error)=>{run.debt=true;returnErr(error);}"));
-    let drop = block("impl Drop for CheckRun {");
-    assert!(drop.contains("ifself.has_child()&&self.native_terminal.is_none()"));
-    let has_child = block("fn has_child(");
-    assert!(has_child.contains("self.child.is_some()"));
-    assert!(has_child.contains("self.mac_child.is_some()"));
-    for required in [
-        "ifletSome(owner)=self.payload.take(){std::mem::forget(owner);}",
-        "ifletSome(lease)=self.lease_owner.take(){std::mem::forget(lease);}",
-    ] {
-        assert!(
-            drop.contains(required),
-            "unconfirmed child must retain {required}"
-        );
-    }
 }
 
 fn assert_mac_root_check_factory(source: &str) {
@@ -609,45 +484,6 @@ fn mac_check_factory_is_root_and_exact_purpose_not_a_literal_decoy() {
             &source.replace(old, new)
         ))
         .is_err());
-    }
-}
-
-#[test]
-fn sealed_check_source_requires_reference_both_owners_and_native_retirement() {
-    let source = read("crates/core-supervisor/src/config_gate/check_custody.rs");
-    assert_sealed_check_owner_custody(&source);
-    for (before, after) in [
-        ("Some(&execution)", "None"),
-        ("execution.map(PreparedExecution::payload)", "None"),
-        ("execution.and_then(PreparedExecution::lease_owner)", "None"),
-        (
-            "                payload,\n                lease_owner,",
-            "                payload: None,\n                lease_owner,",
-        ),
-        (
-            "                payload,\n                lease_owner,",
-            "                payload,\n                lease_owner: None,",
-        ),
-        (
-            "\n    payload: Option<Arc<AdmittedPayload>>,",
-            "\n    payload: Option<std::sync::Weak<AdmittedPayload>>,",
-        ),
-        ("std::mem::forget(owner)", "drop(owner)"),
-        ("std::mem::forget(lease)", "drop(lease)"),
-        ("self.io.poll_wait(child, cx)", "fake_pid_probe(child, cx)"),
-        ("run.validate_retirement()", "Ok(None)"),
-    ] {
-        assert_eq!(
-            source.matches(before).count(),
-            1,
-            "negative fixture anchor drift: {before}"
-        );
-        let bad = source.replacen(before, after, 1);
-        assert_ne!(bad, source);
-        assert!(
-            std::panic::catch_unwind(|| assert_sealed_check_owner_custody(&bad)).is_err(),
-            "missing reference/extraction/retention/native wait must fail: {before}"
-        );
     }
 }
 

@@ -1,6 +1,5 @@
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -86,7 +85,7 @@ case "$1" in
   rev-parse) printf 'expected-head\\n' ;;
   merge-base) printf 'expected-base\\n' ;;
   cat-file) exit 0 ;;
-  diff) printf 'crates/config-engine/src/builder/managed_mesh_emission.rs\\0' ;;
+  diff) printf 'crates/config-engine/src/builder/mesh_inbound.rs\\0' ;;
   *) exit 9 ;;
 esac
 `);
@@ -106,7 +105,6 @@ esac
             FAIL_FETCH: failFetch ? '1' : '0',
             RUNNER_TEMP: temp,
             GITHUB_OUTPUT: output,
-            POLARIS_NATIVE_PAYLOAD_VALIDATION: '0',
           },
           encoding: 'utf8',
         });
@@ -145,58 +143,6 @@ esac
     expect(risk).toContain('node scripts/classify-ci-impact.mjs');
     expect(risk).toContain('name: release risk gate');
     expect(risk).toMatch(/\n  gate:[\s\S]*?\n    if: always\(\)/);
-  });
-
-  it('native 分类仅接受明确的同候选 Risk 上下文，不借用 ordinary preflight 或 Android 结论', () => {
-    const temp = mkdtempSync(join(tmpdir(), 'polaris-native-risk-contract-'));
-    try {
-      // This is the historical Risk admission contract, before strict formal
-      // defaults. Keep its exact release bytes isolated from today's selection.
-      for (const directory of ['desktop-core', 'lib'])
-        cpSync(join(REPO_ROOT, 'scripts', directory), join(temp, 'scripts', directory), { recursive: true });
-      mkdirSync(join(temp, 'src-tauri'));
-      const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-      writeFileSync(join(temp, 'src-tauri/core-manifest.json'), JSON.stringify({ desktopRelease: manifest.historicalDesktopRelease }));
-      cpSync(join(REPO_ROOT, manifest.historicalDesktopReleaseContractPath),
-        join(temp, manifest.historicalDesktopRelease.contractPath));
-      const output = join(temp, 'output');
-      const candidate = 'a'.repeat(40);
-      const ref = 'refs/heads/collab/fk02-native-payload-validation-20261010';
-      const base = {
-        POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', POLARIS_NO_KERNEL_RUN: '0', DISPATCH_SHA: candidate,
-        GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
-        GITHUB_REF: ref, GITHUB_SHA: candidate, GITHUB_RUN_ID: '12', GITHUB_RUN_ATTEMPT: '3',
-        GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}`,
-        RUNNER_TEMP: temp, GITHUB_OUTPUT: output,
-      };
-      const run = (changed: Record<string, string>, cwd = temp) => {
-        writeFileSync(output, '');
-        const result = spawnSync('bash', ['-c', classifyScript(risk)], {
-          cwd, env: { ...process.env, ...base, ...changed }, encoding: 'utf8',
-        });
-        return { result, output: readFileSync(output, 'utf8') };
-      };
-      const formal = run({}, REPO_ROOT);
-      expect(formal.result.status, formal.result.stderr).not.toBe(0);
-      expect(formal.result.stderr).toContain('Exact committed formal App/caller/run context required');
-      expect(formal.output).toBe('');
-      const good = run({});
-      expect(good.result.status, good.result.stderr).toBe(0);
-      expect(good.output).toBe('kernel=false\nplatforms=[]\npreflight=false\nhas_package=false\nandroid=false\napple=false\nunregistered=\n');
-      const invalidContexts: Record<string, string>[] = [
-        { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REF: 'refs/tags/v1.0.0' },
-        { GITHUB_SHA: 'b'.repeat(40) }, { GITHUB_REPOSITORY: 'other/repo' },
-        { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/package.yml@${ref}` },
-        { GITHUB_RUN_ID: '0' }, { GITHUB_RUN_ATTEMPT: '0' }, { POLARIS_NO_KERNEL_RUN: '1' },
-      ];
-      for (const changed of invalidContexts) {
-        const bad = run(changed);
-        expect(bad.result.status, bad.result.stderr).not.toBe(0);
-        expect(bad.output).toBe('');
-      }
-    } finally {
-      rmSync(temp, { recursive: true, force: true });
-    }
   });
 
   it('gate 对「未登记影响面」有牙：分类器自曝的 scope 必须当场红并点名', () => {
@@ -332,7 +278,7 @@ esac
     const classify = jobSection(risk, 'classify', 'release-risk.yml');
     expect(classify).toContain("POLARIS_APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}");
     expect(classifyScript(risk)).toContain('if [ "${POLARIS_APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then\n  printf \'true\\n\' > "$apple_result"\nfi');
-    expect(classify).toContain('[ "$VALIDATION_MODE" = ordinary ] && [ "$APPLE_DEFERRED" = false ]');
+    expect(classify).toContain('[ "$APPLE_DEFERRED" = false ]');
   });
 
   it('Apple 单 host 串行保全，所有 simulator 操作显式条件化且 cache 不替代真实 carrier', () => {
@@ -392,9 +338,8 @@ esac
     const chainStart = apple.indexOf('\n  unsigned-chain:\n');
     expect(chainStart).toBeGreaterThan(0);
     const chain = apple.slice(chainStart);
-    // The final job must observe both the optional resolver and the full-build
-    // component, including the deliberately skipped component on verified reuse.
-    expect(chain).toContain('needs: [resolve, component]\n    if: always()');
+    // The final job always runs so a failed or skipped component turns the gate red.
+    expect(chain).toContain('needs: component\n    if: always()');
     expect(chain).toContain('COMPONENT_RESULT: ${{ needs.component.result }}');
     const blocks = chain.split(/^ {6}- /m).slice(1);
     const simDownload = blocks.find((block) => block.includes('name: apple-carrier-summary-sim-arm64'))!;
@@ -405,93 +350,6 @@ esac
     expect(aggregate).toContain('aggregate --scope "$POLARIS_APPLE_SCOPE"');
     expect(aggregate).toContain('sim-arm64: not requested.');
     expect(aggregate).not.toContain('continue-on-error');
-  });
-
-  it('Apple resolver 未完成就回退实编译，复用与全量聚合互斥且最终判据不能被跳过', () => {
-    const apple = read('apple.yml');
-    const check = (source: string) => {
-      const resolver = jobSection(source, 'resolve', 'apple.yml');
-      const component = jobSection(source, 'component', 'apple.yml');
-      const chainStart = source.indexOf('\n  unsigned-chain:\n');
-      expect(chainStart).toBeGreaterThan(0);
-      const chain = source.slice(chainStart);
-      expect(chain.match(/^ {2}[\w-]+:/gm)).toEqual(['  unsigned-chain:']);
-      expect(chain).toMatch(/^    needs: \[resolve, component\]\n    if: always\(\)$/m);
-      expect(component).toMatch(/^    needs: resolve$/m);
-      const blocks = chain.split(/^ {6}- /m).slice(1);
-      const step = (needle: string) => {
-        const matches = blocks.filter((block) => block.includes(needle));
-        expect(matches, `unsigned-chain step missing or ambiguous: ${needle}`).toHaveLength(1);
-        return matches[0];
-      };
-      const expression = (block: string, indent: number, key = 'if') => {
-        const match = block.match(new RegExp(`^ {${indent}}${key}: \\$\\{\\{ (.+) \\}\\}$`, 'm'));
-        expect(match, `missing ${key} expression`).not.toBeNull();
-        return match![1];
-      };
-      const componentIf = expression(component, 4);
-      const reusedOutput = expression(resolver, 6, 'reused');
-      const reuseSteps = [
-        step('name: Download the exact resolver receipt for this attempt\n'),
-        step('id: reuse_verified\n'),
-      ];
-      const buildSteps = [
-        step('name: apple-component-manifest-'),
-        step('name: apple-carrier-summary-device-arm64-'),
-        step('id: aggregate\n'),
-      ];
-      const chainUpload = expression(step('id: chain\n'), 8);
-      const result = step('id: result\n');
-      expect(result).toMatch(/^        if: always\(\)$/m);
-      expect(result).not.toContain('continue-on-error');
-      // A status function is required here: GitHub's implicit success() would
-      // otherwise suppress fallback after a failed resolver or failed aggregate.
-      expect(componentIf).toContain('!cancelled()');
-      expect(chainUpload).toContain('always()');
-      const statuses = ['success', 'failure', 'cancelled', 'skipped', '', 'unknown'];
-      for (const status of statuses) {
-        for (const reused of ['true', 'false', '', 'unknown']) {
-          const hit = status === 'success' && reused === 'true';
-          const context = { needs: { resolve: { result: status, outputs: { reused } } }, always: () => true };
-          for (const cancelled of [false, true]) {
-            expect(runInNewContext(componentIf, { ...context, cancelled: () => cancelled }))
-              .toBe(!cancelled && !hit);
-          }
-          for (const block of reuseSteps) expect(runInNewContext(expression(block, 8), context)).toBe(hit);
-          for (const block of buildSteps) expect(runInNewContext(expression(block, 8), context)).toBe(!hit);
-          expect(runInNewContext(chainUpload, context)).toBe(!hit);
-          // continue-on-error changes conclusion to success, but cannot turn a
-          // resolver/receipt failure into the published reused=true output.
-          for (const receipt of statuses) {
-            expect(runInNewContext(reusedOutput, { steps: {
-              resolve: { outcome: status, conclusion: 'success', outputs: { reused } },
-              receipt: { outcome: receipt, conclusion: 'success' },
-            } })).toBe(hit && receipt === 'success' ? 'true' : 'false');
-          }
-        }
-      }
-    };
-    check(apple);
-    // Replay dependency removal, skipped final gates, masked resolver failures,
-    // and overlapping or missing evidence branches against the same predicates.
-    for (const [before, after] of [
-      ['needs: [resolve, component]', 'needs: component'],
-      ['needs: [resolve, component]', 'needs: resolve'],
-      ['needs: resolve\n    if:', 'needs: []\n    if:'],
-      ['needs: [resolve, component]\n    if: always()', 'needs: [resolve, component]\n    if: success()'],
-      ['id: result\n        if: always()', 'id: result\n        if: success()'],
-      ["!cancelled() && !(needs.resolve.result == 'success'", "!(needs.resolve.result == 'success'"],
-      ['steps.resolve.outcome', 'steps.resolve.conclusion'],
-      ['steps.receipt.outcome', 'steps.receipt.conclusion'],
-      ["needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true'", "needs.resolve.outputs.reused == 'true'"],
-      ["id: reuse_verified\n        if: ${{ needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true' }}", 'id: reuse_verified\n        if: ${{ true }}'],
-      ["id: aggregate\n        if: ${{ !(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true') }}", 'id: aggregate\n        if: ${{ true }}'],
-      ["always() && !(needs.resolve.result == 'success'", "!(needs.resolve.result == 'success'"],
-    ]) {
-      const changed = apple.replace(before, after);
-      expect(changed).not.toBe(apple);
-      expect(() => check(changed), `mutation escaped: ${before}`).toThrow();
-    }
   });
 
   it('Android 复用调用 job 满足嵌套发布 job 的权限上限', () => {
@@ -522,8 +380,6 @@ esac
 
   it('preflight 用钉扎 protoc 对拍四平台 wire，D1 CONNECT 仍在 REQUIRE 强制腿', () => {
     const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-    const sourceBytes = readFileSync(join(REPO_ROOT, 'scripts/desktop-core/source-manifest.json'));
-    expect(manifest.desktopSourceBuild.sourceManifestSha256).toBe(createHash('sha256').update(sourceBytes).digest('hex'));
     expect(manifest.windowsBuild).toBeUndefined();
     const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
     const fetchCore = preflight.indexOf('      - name: Fetch sing-box core');
@@ -535,14 +391,10 @@ esac
     expect(wire).toBeGreaterThan(fetchProtoc);
     expect(mandatory).toBeGreaterThan(wire);
     expect(preflight).toContain('node scripts/fetch-protoc.mjs');
-    expect(preflight).toContain('node scripts/desktop-core/wire-input-handoff.mjs wire');
-    const wireSource = readFileSync(join(REPO_ROOT, 'scripts/desktop-core/wire-input-handoff.mjs'), 'utf8');
-    expect(wireSource).toMatch(/const WIRE_ARGS = \['test', '-p', 'polaris-singbox-grpc', '--test', 'bundled_core_wire',\s*'vendored_proto_matches_every_bundled_core', '--', '--exact'\]/);
-    expect(wireSource).toContain("run('cargo', WIRE_ARGS,");
-    expect(wireSource).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
+    expect(preflight).toContain('cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact');
     const mandatoryStep = preflight.slice(mandatory);
     expect(mandatoryStep).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
-    expect(mandatoryStep).toContain('cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture');
+    expect(mandatoryStep).toContain('cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture');
     expect(mandatoryStep).not.toContain('POLARIS_NO_KERNEL_RUN');
   });
 
@@ -581,9 +433,6 @@ esac
   });
 
   it('手动分支内核门保持桌面 fork 角色来源、旧 mobile alpha8 与 REQUIRE 硬化', () => {
-    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-    const source = JSON.parse(readFileSync(join(REPO_ROOT, 'scripts/desktop-core/source-manifest.json'), 'utf8'));
-    expect(manifest.desktopSourceBuild.patchedSourceTree).toBe(source.sourceTree);
     const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
     const mandatory = preflight.slice(preflight.indexOf('      - name: Run mandatory bundled-core gates'));
     expect(preflight).toContain('run: node scripts/fetch-core.mjs');
@@ -651,17 +500,6 @@ esac
         expect(classify).toContain('candidate: ${{ github.event.pull_request.head.sha || github.sha }}');
         continue;
       }
-      if (selector === 'native_validation') {
-        expect(classify).toContain("native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}");
-        const enabled = (event: string, mode: string) => runInNewContext(
-          "github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false'",
-          { github: { event_name: event }, inputs: { mode } },
-        );
-        expect(enabled('workflow_dispatch', 'native-payload')).toBe('true');
-        expect(enabled('workflow_dispatch', 'ordinary')).toBe('false');
-        expect(enabled('push', 'native-payload')).toBe('false');
-        continue;
-      }
       expect(
         classify,
         `classify job 没有声明 output \`${selector}\` —— 引用它的地方恒为空串`,
@@ -670,48 +508,6 @@ esac
         classify,
         `impact step 没有写出 \`${selector}\` —— output 声明了但没人赋值`,
       ).toContain(`echo "${selector}=`);
-    }
-  });
-
-  it('真实最终 gate 对选中的 desktop_core 只接受 success，未选中允许 skipped', () => {
-    const gate = risk.slice(risk.indexOf('\n  gate:\n'));
-    expect(gate).toContain('DESKTOP_CORE_REQUIRED: ${{ needs.classify.outputs.preflight }}');
-    expect(gate).toContain('DESKTOP_CORE_RESULT: ${{ needs.desktop_core.result }}');
-    const runAt = gate.indexOf('        run: |\n');
-    expect(runAt).toBeGreaterThan(0);
-    const script = gate.slice(runAt + '        run: |\n'.length)
-      .split('\n').map((line) => line.slice(10)).join('\n');
-    const base = {
-      CLASSIFY_RESULT: 'success', PC_RUNTIME_POLICY_RESULT: 'success', UNREGISTERED: '',
-      DESKTOP_CORE_REQUIRED: 'true', DESKTOP_CORE_RESULT: 'success',
-      PREFLIGHT_REQUIRED: 'true', PREFLIGHT_RESULT: 'success',
-      PACKAGE_REQUIRED: 'true', PACKAGE_RESULT: 'success',
-      ANDROID_REQUIRED: 'true', ANDROID_RESULT: 'success',
-      APPLE_REQUIRED: 'false', APPLE_RESULT: 'skipped',
-      NATIVE_VALIDATION_REQUIRED: 'false', NATIVE_VALIDATION_RESULT: 'skipped',
-    };
-    const run = (body: string, required: string, result: string) => spawnSync('bash', ['-c', body], {
-      env: { ...process.env, ...base, DESKTOP_CORE_REQUIRED: required, DESKTOP_CORE_RESULT: result },
-      encoding: 'utf8',
-    });
-    const check = (body: string) => {
-      expect(run(body, 'true', 'success').status).toBe(0);
-      expect(run(body, 'false', 'skipped').status).toBe(0);
-      for (const result of ['failure', 'cancelled', 'skipped', '']) {
-        const actual = run(body, 'true', result);
-        expect(actual.status, `selected desktop_core=${result}: ${actual.stdout}`).toBe(1);
-        expect(actual.stdout).toContain('四平台内核源码产物未通过：');
-      }
-    };
-    check(script);
-    // The same actual shell controls must catch permissive status tests and
-    // a guard that observes the result but exits successfully.
-    for (const changed of [
-      script.replace('[ "$DESKTOP_CORE_RESULT" != success ]', '[ "$DESKTOP_CORE_RESULT" = failure ]'),
-      script.replace('echo "::error::四平台内核源码产物未通过：$DESKTOP_CORE_RESULT"\n  exit 1', 'echo "::error::四平台内核源码产物未通过：$DESKTOP_CORE_RESULT"\n  exit 0'),
-    ]) {
-      expect(changed).not.toBe(script);
-      expect(() => check(changed)).toThrow();
     }
   });
 
@@ -737,47 +533,6 @@ esac
       positive.split('\n').map((line) => `# ${line}`).join('\n'),
       negative.split('\n').map((line) => `# ${line}`).join('\n')]) {
       expect(hasStrictResultGate(body, variable), body).toBe(false);
-    }
-  });
-
-  it('真实 native 汇总同时要求四核与 final payload success，错误状态及实际门突变均拒绝', () => {
-    const gate = risk.slice(risk.indexOf('\n  gate:\n'));
-    expect(gate).toContain('NATIVE_VALIDATION_REQUIRED: ${{ needs.classify.outputs.native_validation }}');
-    expect(gate).toContain('NATIVE_VALIDATION_RESULT: ${{ needs.native_payload.result }}');
-    const runAt = gate.indexOf('        run: |\n');
-    expect(runAt).toBeGreaterThan(0);
-    const script = gate.slice(runAt + '        run: |\n'.length).split('\n').map((line) => line.slice(10)).join('\n');
-    const base = {
-      CLASSIFY_RESULT: 'success', PC_RUNTIME_POLICY_RESULT: 'success', UNREGISTERED: '',
-      NATIVE_VALIDATION_REQUIRED: 'true', DESKTOP_CORE_RESULT: 'success', NATIVE_VALIDATION_RESULT: 'success',
-      DESKTOP_CORE_REQUIRED: 'false', PREFLIGHT_REQUIRED: 'false', PREFLIGHT_RESULT: 'skipped',
-      PACKAGE_REQUIRED: 'false', PACKAGE_RESULT: 'skipped', ANDROID_REQUIRED: 'false', ANDROID_RESULT: 'skipped',
-      APPLE_REQUIRED: 'false', APPLE_RESULT: 'skipped',
-    };
-    const run = (body: string, changed: Record<string, string>) => spawnSync('bash', ['-c', body], {
-      env: { ...process.env, ...base, ...changed }, encoding: 'utf8',
-    });
-    const check = (body: string) => {
-      expect(run(body, {}).status).toBe(0);
-      expect(run(body, { NATIVE_VALIDATION_REQUIRED: 'false', DESKTOP_CORE_RESULT: 'skipped', NATIVE_VALIDATION_RESULT: 'skipped' }).status).toBe(0);
-      for (const field of ['DESKTOP_CORE_RESULT', 'NATIVE_VALIDATION_RESULT']) {
-        for (const result of ['failure', 'cancelled', 'skipped', '', 'unknown']) {
-          const actual = run(body, { [field]: result });
-          expect(actual.status, `${field}=${result}: ${actual.stdout + actual.stderr}`).toBe(1);
-          expect(actual.stdout).toContain('native source/actual final payload proof did not pass');
-        }
-      }
-    };
-    check(script);
-    for (const changed of [
-      script.replace('[ "$DESKTOP_CORE_RESULT" = success ] && [ "$NATIVE_VALIDATION_RESULT" = success ]',
-        '[ "$DESKTOP_CORE_RESULT" = success ] || [ "$NATIVE_VALIDATION_RESULT" = success ]'),
-      script.replace("echo '::error::native source/actual final payload proof did not pass'; exit 1;",
-        "echo '::error::native source/actual final payload proof did not pass'; exit 0;"),
-      script.replace('[ "$NATIVE_VALIDATION_REQUIRED" = true ]', '[ "$NATIVE_VALIDATION_REQUIRED" = false ]'),
-    ]) {
-      expect(changed).not.toBe(script);
-      expect(() => check(changed)).toThrow();
     }
   });
 

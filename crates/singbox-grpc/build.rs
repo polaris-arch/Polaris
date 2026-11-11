@@ -99,7 +99,7 @@ fn assert_proto_matches_bundled_core() {
         }
         return;
     }
-    // 覆盖轴（有哪几个平台）来自 `src-tauri/core-manifest.json` 的 `coreArchiveSha256` 键集合，
+    // 覆盖轴（有哪几个平台）来自 `scripts/desktop-core/release-contract.json` 的 `platforms` 键集合，
     // 不在这里再写一份名单 —— 此前这里那四条字面路径正是「两处各写一份平台名单」的第三份。
     // manifest 本身也要进重跑触发面：加/减平台时本门的覆盖轴跟着变。
     println!(
@@ -125,7 +125,7 @@ fn assert_proto_matches_bundled_core() {
     );
     assert!(
         survey.orphans.is_empty(),
-        "拒绝出包：`resources/` 下这些目录里有 sing-box 二进制，但 `{}` 的 `coreArchiveSha256` \
+        "拒绝出包：`resources/` 下这些目录里有 sing-box 二进制，但 `{}` 的 `platforms` \
          里没有对应平台：{}\n\
          它会被 tauri 的 resources 照样打进包，却不在任何一道逐平台门的覆盖轴上（没人对拍过它的 \
          wire 契约、build tag、依赖指纹）。\n\

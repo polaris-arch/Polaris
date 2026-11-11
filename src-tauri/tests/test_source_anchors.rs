@@ -31,15 +31,7 @@ use std::path::{Path, PathBuf};
 /// 从 `app_tray.rs` 搬进 `app_tray/tests/mod.rs`，那串 `..` 整体平移，门一声不吭。
 const FORBIDDEN: &[&str] = &["include_str", "include_bytes"];
 
-// Three compiled identities cannot be replaced by runtime source-probe reads.
-// Each exact expression is allowed once in this one owner; no file-wide exemption.
-const COMPILED_IDENTITY_OWNER: &str =
-    "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs";
-const WHITELIST: [Exempt; 3] = [
-    Exempt { file: COMPILED_IDENTITY_OWNER, expression: "include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/core-manifest.json\"))", reason: "Compile-time bytes bind the real-core test artifact, not mutable runtime files." },
-    Exempt { file: COMPILED_IDENTITY_OWNER, expression: "include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../scripts/desktop-core/release-contract.json\"))", reason: "Compile-time bytes bind the real-core test artifact, not mutable runtime files." },
-    Exempt { file: COMPILED_IDENTITY_OWNER, expression: "include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../crates/singbox-grpc/proto/runtime_config.proto\"))", reason: "Compile-time bytes bind the real-core test artifact, not mutable runtime files." },
- ];
+const WHITELIST: [Exempt; 0] = [];
 struct Exempt {
     file: &'static str,
     expression: &'static str,
@@ -850,33 +842,19 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     // Package acceptance modules use Python import identifiers and unittest test_* discovery.
     // Include the four simple-name siblings too so their exact CPython caches
     // are recognized without admitting caches of any unregistered source.
-    "scripts/mobile-core/test_producer.py",
     "scripts/mobile-core/apple_rust.py",
     "scripts/mobile-core/apple_tls_fingerprint.py",
     "scripts/mobile-core/test_apple_tls_fingerprint.py",
-    "scripts/mobile-core/test_apple_entry.py",
     "scripts/mobile-core/ci_android.py",
     "scripts/mobile-core/test_outputs.py",
-    // Python unittest discover requires test_*.py; exact source-checkout regression module.
-    "scripts/mobile-core/test_source_checkout.py",
-    "scripts/mobile-core/test_native_inputs.py",
-    "scripts/mobile-core/test_delivery_boundaries.py",
     "scripts/mobile-core/ci_apple.py",
     "scripts/mobile-core/native_inputs.py",
     "scripts/mobile-core/build_apple_app.py",
     "scripts/mobile-core/fork_input.py",
     "scripts/mobile-core/source_policy.py",
-    "scripts/mobile-core/test_source_policy.py",
     "scripts/mobile-core/android_sdk.py",
-    "scripts/mobile-core/test_inputs.py",
     "scripts/mobile-core/apple_admission.py",
     "scripts/mobile-core/apple_handoff.py",
-    "scripts/mobile-core/apple_merge_reuse.py",
-    "scripts/mobile-core/test_apple_merge_reuse.py",
-    "scripts/mobile-core/test_apple_admission.py",
-    "scripts/mobile-core/test_apple_handoff.py",
-    "scripts/mobile-core/test_apple_progress.py",
-    "scripts/mobile-core/test_apple_read_reuse.py",
 ];
 
 fn registered_python_module(rel: &str) -> bool {
@@ -904,7 +882,7 @@ fn is_registered_python_bytecode(rel: &str) -> bool {
 #[test]
 fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
     assert!(is_registered_python_bytecode(
-        "scripts/mobile-core/__pycache__/test_native_inputs.cpython-312.pyc"
+        "scripts/mobile-core/__pycache__/test_outputs.cpython-312.pyc"
     ));
     for path in [
         "scripts/package-acceptance/__pycache__/unregistered_module.py",
@@ -1271,95 +1249,4 @@ fn the_cfg_test_leg_has_live_population() {
          躲在 `#[cfg(test)] fn` 里的 `include_str!` 会整类放行"
     );
     eprintln!("[门 D] cfg 腿活样本：{with_regions} 个生产文件 / {total_regions} 个块");
-}
-
-#[test]
-fn compiled_identity_exemptions_bind_exact_file_tokens_literals_and_one_occurrence() {
-    let good = WHITELIST
-        .iter()
-        .map(|e| e.expression)
-        .collect::<Vec<_>>()
-        .join(";\n");
-    let hits = scan_source(COMPILED_IDENTITY_OWNER, &good);
-    assert!(unregistered_hits(&hits).is_empty());
-    for exempt in &WHITELIST {
-        assert_eq!(
-            hits.iter().filter(|h| matches_exemption(h, exempt)).count(),
-            1
-        );
-        let spaced = exempt
-            .expression
-            .replace("!", " /* comment */ ! ")
-            .replace(",", ",\n");
-        let hits = scan_source(COMPILED_IDENTITY_OWNER, &spaced);
-        assert_eq!(hits.len(), 1);
-        assert!(matches_exemption(&hits[0], exempt));
-        assert_eq!(
-            unregistered_hits(&scan_source("src-tauri/tests/other.rs", exempt.expression)).len(),
-            1
-        );
-    }
-    let first = WHITELIST[0].expression;
-    for bad in [
-        first.replace("include_bytes", "include_str"),
-        first.replace("CARGO_MANIFEST_DIR", "CARGO_MANIFEST_DI R"),
-        first.replace("CARGO_MANIFEST_DIR", "OTHER_ROOT"),
-        first.replace("env!", "option_env!"),
-        first.replace("/core-manifest.json", "/core-manifest .json"),
-        first.replace("/core-manifest.json", "/other.json"),
-        first.replace("concat", "con cat"),
-        first.replace("env", "e nv"),
-        format!("std::{first}"),
-        format!("std::\u{200e}{first}"),
-        format!("r#{first}"),
-        first.replace("))", ", 1))"),
-        first.trim_end_matches(')').to_string(),
-        "include_bytes!(\"../core-manifest.json\")".into(),
-        "include_bytes!{concat!(env!(\"CARGO_MANIFEST_DIR\"),\"/core-manifest.json\")}".into(),
-    ] {
-        let hits = scan_source(COMPILED_IDENTITY_OWNER, &bad);
-        assert!(!hits.is_empty(), "negative must be scanned: {bad}");
-        assert!(!unregistered_hits(&hits).is_empty(), "must reject: {bad}");
-    }
-    // Three total is insufficient: each of the three distinct identities is required.
-    for changed in [
-        format!("{good}; {first}"),
-        format!("{first};{first};{first}"),
-    ] {
-        let hits = scan_source(COMPILED_IDENTITY_OWNER, &changed);
-        assert!(!unregistered_hits(&hits).is_empty());
-    }
-    let missing = scan_source(COMPILED_IDENTITY_OWNER, first);
-    assert!(WHITELIST
-        .iter()
-        .any(|e| !missing.iter().any(|h| matches_exemption(h, e))));
-    let fourth = format!("{good}; include_bytes!(\"unreviewed\")");
-    assert_eq!(
-        unregistered_hits(&scan_source(COMPILED_IDENTITY_OWNER, &fourth)).len(),
-        1
-    );
-    let nested = first.replace("\"/core-manifest.json\"", "include_bytes!(\"unreviewed\")");
-    assert_eq!(
-        unregistered_hits(&scan_source(COMPILED_IDENTITY_OWNER, &nested)).len(),
-        2
-    );
-    let fake = format!("// {first}\n/* {first} */\nlet text = {first:?};");
-    assert!(scan_source(COMPILED_IDENTITY_OWNER, &fake).is_empty());
-    assert!(scan_source(COMPILED_IDENTITY_OWNER, "foo_include_bytes!(\"x\")").is_empty());
-    for lookalike in [
-        format!("α{first}"),
-        first.replacen("include_bytes", "include_bytesα", 1),
-        first.replacen("include_bytes", "include_bytes\u{301}", 1),
-    ] {
-        assert!(scan_source(COMPILED_IDENTITY_OWNER, &lookalike).is_empty());
-    }
-    // Unicode whitespace is a separator, not an identifier prefix hiding a macro.
-    assert_eq!(
-        scan_source(
-            COMPILED_IDENTITY_OWNER,
-            "\u{200e}include_bytes\u{200e}!(\"unreviewed\")"
-        )
-        .len(),
-        1
-    );
 }

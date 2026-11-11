@@ -74,47 +74,37 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 
 ### 资源拉取（sing-box 核 / cronet / 面板）
 
-当前桌面输入选择 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) 的固定 alpha.12.7 发布，移动端保留独立的 alpha.12.6 源码输入。桌面发布资产与移动端源码分别由下述契约锁定；仓库名、源码提交、tag 对象和摘要须一起核验，不能机械改写旧资产 URL 或复用历史收据。
+桌面发布资产与移动端源码分别由下述契约锁定；仓库名、源码提交、tag 对象和摘要须一起核验，不能机械改写旧资产 URL 或复用历史收据。
 
 当前桌面打包以 `src-tauri/core-manifest.json` 的 `desktopRelease` 为入口，按
 `scripts/desktop-core/release-contract.json` 消费固定的 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)
-发布资产。源码提交、tag 对象、资产索引与摘要由清单锁定；不要改用 fork 默认分支的最新提交，
-也不要把旧 `sourceBuild` 或移动端 `scripts/mobile-core/source-contract.json` 当成当前桌面选择。
+发布资产。源码提交、tag 对象与摘要由合同锁定；不要改用 fork 默认分支的最新提交，
+也不要把移动端 `scripts/mobile-core/source-contract.json` 当成当前桌面选择。
 这些是构建输入约束，不代表该 App 候选已经完成原生验收或已发布。
 
 ```bash
 # 本地 Linux 资源准备；其它平台为 win、mac-x64、mac-arm64
 node scripts/fetch-core.mjs --platform=linux
-node scripts/fetch-cronet.mjs --platform=linux
 node scripts/fetch-dashboard.mjs
 ```
 
-`fetch-core` 验证固定发布输入后放入 `resources/<平台>/`。Linux / Windows 的 Cronet 动态库也必须
-符合清单摘要；macOS 使用静态输入。`fetch-dashboard` 从固定 commit 获取 sing-box 面板，验证归档字节数与 SHA256，
+`fetch-core` 验证固定发布输入后放入 `resources/<平台>/`；Linux / Windows 的 Cronet 动态库随同一发布归档取得，
+并须符合合同摘要；macOS 为静态链接。`fetch-dashboard` 从固定 commit 获取 sing-box 面板，验证归档字节数与 SHA256，
 并在复用或落盘前核对清理后的完整文件清单摘要。
 资源不入库；Tauri 打包配置引用的文件必须事先准备好，不能把获取资源视作运行期在线换核功能。
 
-#### 发布打包与原生验收包
+#### 发布打包
 
-`.github/workflows/desktop-core.yml` 按冻结清单选择路径：发布选择模式在四个平台验证固定资产，
-源码模式才从固定源码构建。原生输入汇总为候选专属内核包；`package.yml` 的消费形态为：
-
-```bash
-node scripts/fetch-core.mjs --bundle-dir=<内核包目录> --candidate="$(git rev-parse HEAD)"
-```
-
-`--bundle-dir` 与 `--candidate` 必须一起提供。当前 `desktopRelease` 路径先验证原生验收包，
-再消费固定资产；不能用本机仅下载一个平台的结果替代发布验收。取包时使用实际 workflow 返回的
-artifact 名称和候选提交，不复用其它提交的回执。当前清单存在 `desktopRelease`，不要照旧示例
-直接使用 `--producer`；源码生产路径只在无此发布选择时适用。
+`package.yml` 的每条平台腿直接运行 `node scripts/fetch-core.mjs`（默认四平台），在 macOS 宿主上同时观测发布核的
+codesign 并记入收据；不能用本机仅下载一个平台的结果替代发布验收。
 
 `tauri.conf.json` 没有 `build.beforeBundleCommand`；`tauri build` 不会代替手动准备上述资源。
 CI 在 fetch 后通过 `node scripts/verify-packaging.mjs confs` 检查资源存在且非空，
 产物仍须通过后续 payload / assets 与原生验收。下载成功、摘要正确和运行验收是不同检查。
 
-维护者调整桌面内核选择时须同步审查 `desktopRelease`、发布契约及其摘要，并核对实际固定发布资产。
-移动端源码清单和历史 source-mode 输入分别维护，不能只改 `bundledCoreVersion` 或旧 `sourceBuild`
-就宣称桌面选择已更新。内核随 App 配套交付；本说明不提供用户独立上传、在线替换或回滚内核的入口。
+维护者导入新的桌面内核发布时运行 `node scripts/desktop-core/import-release.mjs <新的 release-contract.json>`：
+它替换合同并重新生成 `desktopRelease` 与 NOTICE 的内核段落；`node scripts/desktop-core/import-release.mjs --check`
+在 `verify-packaging confs` 中校验三者一致。内核随 App 配套交付；本说明不提供用户独立上传、在线替换或回滚内核的入口。
 
 ### 打包出安装包
 
@@ -139,9 +129,6 @@ pnpm --dir ui install --frozen-lockfile
 protoc --version
 export POLARIS_BUILD_ID="$(git rev-parse HEAD)"
 node scripts/fetch-core.mjs --platform="$platform"
-case "$platform" in
-  linux|win) node scripts/fetch-cronet.mjs --platform="$platform" ;;
-esac
 node scripts/fetch-dashboard.mjs
 args=(--target "$target")
 out="target/$target/release"
@@ -279,13 +266,11 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
     `-f os=windows-2022` 或 `-f os=macos-15`。直接推送 `main` 不会跑这两个平台，原生腿上的失败要到下一次
     手动触发或发布时才会出现。
 
-  本机镜像是 `scripts/gate-rust.sh`（加 `--with-cross` 才跑交叉那几条），与 `ci.yml` 由
-  `scripts/gate-rust-ci-parity.test.mjs` 对拍。建议把三平台的 `fmt + clippy (<os>)`、`build + test (<os>)`
+  本机镜像是 `scripts/gate-rust.sh`（加 `--with-cross` 才跑交叉那几条）。建议把三平台的 `fmt + clippy (<os>)`、`build + test (<os>)`
   与 `cross-target clippy + android face` 设为 required checks。
 - **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
 - **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
-  只对受影响的面调用 `desktop-core.yml`、`package.yml`、`android.yml` 与 `apple.yml`。常规桌面与 Android 风险腿使用轻量构型，安装包 / APK 不上传、不可分发。独立的 `native_payload` 原生验收路径使用完整构型，可上传候选桌面包与证据，但不是公开 Release，也不自动证明安装或设备验收；应按具体 job 的构型与实际附件判断。
-- **`desktop-core.yml`** — 只被调用：四个原生 runner 验证固定发布输入，或在源码模式下构建固定源码，再汇总候选内核包。
+  只对受影响的面调用 `package.yml`、`android.yml` 与 `apple.yml`。常规桌面与 Android 风险腿使用轻量构型，安装包 / APK 不上传、不可分发。
 - **`package.yml`** — 发布工程：Linux / Windows / macOS arm64 / macOS x64 四条腿跑 fetch + `tauri build` + 产物校验。
   触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用。发行构型用于构建可分发安装包；风险门轻量构型只验证打包链。tag 发布时建草稿 release、
   上传桌面资产，再调用 `android.yml` 上传签名 APK，全量对账后公开。

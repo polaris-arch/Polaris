@@ -14,205 +14,6 @@ fn bundled_core_version_uses_the_same_selected_build_as_http() {
     assert!(!bundled_core_version().is_empty());
 }
 
-const PATCHED_FIXTURE: [&str; 3] = [
-    "example.com/patched",
-    "example.com/second",
-    "example.com/tiny",
-];
-
-fn source_baseline_fixture() -> serde_json::Value {
-    source_baseline_fixture_with(&PATCHED_FIXTURE)
-}
-
-fn source_baseline_fixture_with(patched: &[&str]) -> serde_json::Value {
-    let platforms: serde_json::Map<String, serde_json::Value> = ["linux", "win", "mac-x64", "mac-arm64"]
-        .into_iter()
-        .map(|key| {
-            let transport_required = if key == "linux" { vec!["example.com/transport", "example.com/linux-transport"] }
-                else { vec!["example.com/transport"] };
-            let transport_absent = if key == "linux" { vec![] } else { vec!["example.com/linux-transport"] };
-            (key.to_owned(), serde_json::json!({ "buildTree": "1".repeat(40), "binarySha256": null,
-                "patchedModules": { "requiredLinked": patched, "allowedAbsent": [] },
-                "transportModules": { "requiredLinked": transport_required, "confirmedAbsent": transport_absent } }))
-        }).collect();
-    serde_json::json!({ "bundledCoreVersion": "1.0.0", "windowsBuild": { "version": "1.0.0.polaris.1" },
-        "sourceBuild": { "sourceManifestSha256": "a".repeat(64), "provisionerSha256": "b".repeat(64),
-            "sourceReceiptFingerprint": "c".repeat(64), "moduleGraphSha256": "d".repeat(64),
-            "patchedSourceTree": "e".repeat(40), "buildTree": "f".repeat(40),
-            "version": "1.0.0.polaris.2", "dependencyModules": patched,
-            "transportPins": { "example.com/transport": "v1.0.0", "example.com/linux-transport": "v1.2.0" },
-            "platforms": platforms } })
-}
-
-#[test]
-fn frozen_source_baseline_covers_all_desktops_without_changing_android() {
-    // 依赖补丁为空的清单同样是冻结清单。
-    for fixture in [source_baseline_fixture(), source_baseline_fixture_with(&[])] {
-        let raw = fixture.to_string();
-        for windows in [false, true] {
-            assert_eq!(
-                bundled_core_version_from_manifest(&raw, windows, false).unwrap(),
-                "1.0.0.polaris.2"
-            );
-        }
-        assert_eq!(
-            bundled_core_version_from_manifest(&raw, false, true).unwrap(),
-            "1.0.0"
-        );
-    }
-}
-
-#[test]
-fn partial_source_inputs_preserve_the_original_platform_baselines() {
-    for field in [
-        "sourceManifestSha256",
-        "provisionerSha256",
-        "sourceReceiptFingerprint",
-        "moduleGraphSha256",
-        "patchedSourceTree",
-        "buildTree",
-        "version",
-        "dependencyModules",
-        "transportPins",
-        "platforms",
-    ] {
-        let mut fixture = source_baseline_fixture();
-        fixture["sourceBuild"][field] = serde_json::Value::Null;
-        let raw = fixture.to_string();
-        assert_eq!(
-            bundled_core_version_from_manifest(&raw, false, false).unwrap(),
-            "1.0.0"
-        );
-        assert_eq!(
-            bundled_core_version_from_manifest(&raw, true, false).unwrap(),
-            "1.0.0.polaris.1"
-        );
-    }
-    for key in ["linux", "win", "mac-x64", "mac-arm64"] {
-        for field in ["patchedModules", "transportModules"] {
-            let mut fixture = source_baseline_fixture();
-            fixture["sourceBuild"]["platforms"][key][field] = serde_json::Value::Null;
-            for (windows, expected) in [(false, "1.0.0"), (true, "1.0.0.polaris.1")] {
-                assert_eq!(
-                    bundled_core_version_from_manifest(&fixture.to_string(), windows, false)
-                        .unwrap(),
-                    expected
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn malformed_source_input_identity_is_not_a_frozen_baseline() {
-    let cases = [
-        ("version", serde_json::json!("1.0.0.polaris.0")),
-        ("version", serde_json::json!("1.0.1.polaris.2")),
-        ("sourceManifestSha256", serde_json::json!("A".repeat(64))),
-        ("sourceManifestSha256", serde_json::json!(["a".repeat(64)])),
-        (
-            "transportPins",
-            serde_json::json!({ "example.com/tiny": 1 }),
-        ),
-        (
-            "dependencyModules",
-            serde_json::json!(["example.com/tiny", "example.com/tiny"]),
-        ),
-        (
-            "dependencyModules",
-            serde_json::json!(["../module+invalid"]),
-        ),
-    ];
-    for (field, value) in cases {
-        let mut fixture = source_baseline_fixture();
-        fixture["sourceBuild"][field] = value;
-        assert_eq!(
-            bundled_core_version_from_manifest(&fixture.to_string(), false, false).unwrap(),
-            "1.0.0"
-        );
-    }
-    let mut fixture = source_baseline_fixture();
-    fixture["sourceBuild"]["platforms"]
-        .as_object_mut()
-        .unwrap()
-        .remove("mac-x64");
-    assert_eq!(
-        bundled_core_version_from_manifest(&fixture.to_string(), false, false).unwrap(),
-        "1.0.0"
-    );
-    for key in ["linux", "win", "mac-x64", "mac-arm64"] {
-        for (field, policy) in [
-            (
-                "patchedModules",
-                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/patched", "example.com/second", "example.com/tiny"], "allowedAbsent": [] }),
-            ),
-            (
-                "patchedModules",
-                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/tiny"], "allowedAbsent": ["example.com/second", "example.com/patched"] }),
-            ),
-            (
-                "patchedModules",
-                serde_json::json!({ "requiredLinked": ["example.com/tiny", "example.com/second"], "allowedAbsent": [] }),
-            ),
-            (
-                "patchedModules",
-                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/second", "example.com/tiny", "unknown/module"], "allowedAbsent": [] }),
-            ),
-            (
-                "patchedModules",
-                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/tiny", "example.com/second"], "allowedAbsent": [], "allowUnknownMissing": true }),
-            ),
-            (
-                "transportModules",
-                serde_json::json!({ "requiredLinked": ["example.com/transport", "example.com/transport"], "confirmedAbsent": ["example.com/linux-transport"] }),
-            ),
-            (
-                "transportModules",
-                serde_json::json!({ "requiredLinked": ["example.com/transport"], "confirmedAbsent": ["example.com/transport", "example.com/linux-transport"] }),
-            ),
-            (
-                "transportModules",
-                serde_json::json!({ "requiredLinked": [], "confirmedAbsent": ["example.com/linux-transport"] }),
-            ),
-            (
-                "transportModules",
-                serde_json::json!({ "requiredLinked": ["example.com/transport"], "confirmedAbsent": ["example.com/linux-transport", "unknown/transport"] }),
-            ),
-            (
-                "transportModules",
-                serde_json::json!({ "requiredLinked": ["example.com/transport", "example.com/linux-transport"], "confirmedAbsent": [], "allowUnknownMissing": true }),
-            ),
-        ] {
-            let mut fixture = source_baseline_fixture();
-            fixture["sourceBuild"]["platforms"][key][field] = policy;
-            for (windows, expected) in [(false, "1.0.0"), (true, "1.0.0.polaris.1")] {
-                assert_eq!(
-                    bundled_core_version_from_manifest(&fixture.to_string(), windows, false)
-                        .unwrap(),
-                    expected
-                );
-            }
-        }
-    }
-    // 分区完整、不相交，仅因 allowedAbsent 非空：任一平台、任一模块都回落。
-    for key in ["linux", "win", "mac-x64", "mac-arm64"] {
-        for absent in PATCHED_FIXTURE {
-            let required: Vec<_> = PATCHED_FIXTURE
-                .into_iter()
-                .filter(|module| *module != absent)
-                .collect();
-            let mut fixture = source_baseline_fixture();
-            fixture["sourceBuild"]["platforms"][key]["patchedModules"] =
-                serde_json::json!({ "requiredLinked": required, "allowedAbsent": [absent] });
-            assert_eq!(
-                bundled_core_version_from_manifest(&fixture.to_string(), false, false).unwrap(),
-                "1.0.0",
-                "{key} {absent}"
-            );
-        }
-    }
-}
-
 #[test]
 fn state_file_roundtrip_is_atomic_and_survives_reload() {
     let tmp = TestDir::new("polaris-updater-runtime-test-");
@@ -293,57 +94,28 @@ fn core_version_readers_are_asymmetric() {
     );
 }
 
-/// 嵌入清单所选桌面发布的 sourceTree 或旧源码的 patchedSourceTree 由运行时访问器原样给出。
+/// 嵌入清单所选桌面发布合同的 sourceTree 由运行时访问器原样给出；无效选择与移动端不给。
 #[test]
-fn bundled_patch_set_comes_from_the_embedded_manifest() {
-    let manifest: serde_json::Value = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
-    let expected = if let Some(release) = manifest
-        .get("desktopTemporary")
-        .or_else(|| manifest.get("desktopRelease"))
-    {
-        release["sourceTree"]
-            .as_str()
-            .expect("selected release sourceTree")
-    } else {
-        let source = manifest
-            .get("desktopSourceBuild")
-            .unwrap_or(&manifest["sourceBuild"]);
-        source["patchedSourceTree"]
-            .as_str()
-            .expect("selected patchedSourceTree")
-    };
-    assert_eq!(expected.len(), 40);
+fn bundled_patch_set_comes_from_the_selected_release_contract() {
+    let contract: serde_json::Value = serde_json::from_str(&crate::test_support::repo_file(
+        "scripts/desktop-core/release-contract.json",
+    ))
+    .unwrap();
+    let expected = contract["sourceTree"].as_str().unwrap();
     assert_eq!(
         bundled_core_patch_set_from_manifest(CORE_MANIFEST_JSON, false).as_deref(),
         Some(expected)
     );
     let tmp = TestDir::new("polaris-updater-runtime-test-");
     assert_eq!(rt(tmp.path()).bundled_core_patch_set(), Some(expected));
-}
-
-/// 清单没被认作冻结清单（版本回落上游基线）时不给补丁集标识；移动端恒不给。
-#[test]
-fn patch_set_is_withheld_when_the_manifest_is_not_frozen() {
-    let frozen = source_baseline_fixture();
-    let raw = frozen.to_string();
-    let tree = frozen["sourceBuild"]["patchedSourceTree"].as_str().unwrap();
     assert_eq!(
-        bundled_core_patch_set_from_manifest(&raw, false).as_deref(),
-        Some(tree),
-        "对照：冻结清单必须给出标识，否则下面几条的 None 没有信息量"
-    );
-    assert_eq!(bundled_core_patch_set_from_manifest(&raw, true), None);
-
-    let mut partial = frozen.clone();
-    partial["sourceBuild"]["moduleGraphSha256"] = serde_json::Value::Null;
-    assert_eq!(
-        bundled_core_patch_set_from_manifest(&partial.to_string(), false),
+        bundled_core_patch_set_from_manifest(CORE_MANIFEST_JSON, true),
         None
     );
-    let mut absent = frozen;
-    absent.as_object_mut().unwrap().remove("sourceBuild");
+    let mut invalid: serde_json::Value = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
+    invalid["desktopRelease"]["contractSha256"] = serde_json::json!("f".repeat(64));
     assert_eq!(
-        bundled_core_patch_set_from_manifest(&absent.to_string(), false),
+        bundled_core_patch_set_from_manifest(&invalid.to_string(), false),
         None
     );
     assert_eq!(
@@ -492,139 +264,6 @@ fn pending_portable_update_round_trips_through_the_state_file() {
     assert_eq!(
         read_back.pending_portable_update,
         state.pending_portable_update
-    );
-}
-
-fn desktop_source_fixture() -> serde_json::Value {
-    let mut fixture = source_baseline_fixture_with(&[]);
-    let mut desktop = fixture["sourceBuild"].clone();
-    desktop["sourceMode"] = serde_json::json!("fork-commit-v1");
-    desktop["upstreamVersion"] = serde_json::json!("2.0.0-alpha.11");
-    desktop["version"] = serde_json::json!("2.0.0-alpha.11.polaris.1");
-    desktop["graphScope"] = serde_json::json!("core-source-only");
-    desktop["mainGoModSha256"] = serde_json::json!("a".repeat(64));
-    desktop["mainGoSumSha256"] = serde_json::json!("b".repeat(64));
-    desktop["buildTree"] = desktop["patchedSourceTree"].clone();
-    for platform in desktop["platforms"].as_object_mut().unwrap().values_mut() {
-        platform["buildTree"] = serde_json::json!("e".repeat(40));
-    }
-    fixture["desktopSourceBuild"] = desktop;
-    fixture.as_object_mut().unwrap().remove("windowsBuild");
-    fixture
-}
-
-#[test]
-fn explicit_desktop_source_selects_d_and_preserves_mobile_baselines() {
-    let fixture = desktop_source_fixture();
-    for platform in ["linux", "win", "mac-x64", "mac-arm64"] {
-        assert_eq!(
-            bundled_core_version_with_ios(&fixture.to_string(), platform == "win", false, false)
-                .unwrap(),
-            "2.0.0-alpha.11.polaris.1",
-            "{platform}"
-        );
-    }
-    assert_eq!(
-        bundled_core_patch_set_from_manifest(&fixture.to_string(), false),
-        Some("e".repeat(40))
-    );
-    assert_eq!(
-        bundled_core_version_with_ios(&fixture.to_string(), false, true, false).unwrap(),
-        "1.0.0"
-    );
-    assert_eq!(
-        bundled_core_version_with_ios(&fixture.to_string(), false, false, true).unwrap(),
-        "1.0.0.polaris.2"
-    );
-    assert_eq!(
-        bundled_core_patch_set_from_manifest(&fixture.to_string(), true),
-        None
-    );
-}
-
-#[test]
-fn present_invalid_desktop_source_cannot_fall_back_to_legacy_graph() {
-    let mut cases = vec![
-        serde_json::Value::Null,
-        serde_json::json!([]),
-        serde_json::json!("bad"),
-        serde_json::json!({}),
-    ];
-    for field in [
-        "sourceMode",
-        "upstreamVersion",
-        "version",
-        "graphScope",
-        "mainGoModSha256",
-        "mainGoSumSha256",
-        "buildTree",
-        "patchedSourceTree",
-        "platforms",
-        "dependencyModules",
-        "transportPins",
-        "sourceManifestSha256",
-    ] {
-        let mut invalid = desktop_source_fixture()["desktopSourceBuild"].clone();
-        invalid[field] = serde_json::Value::Null;
-        cases.push(invalid);
-    }
-    let mut swapped = source_baseline_fixture()["sourceBuild"].clone();
-    swapped["sourceMode"] = serde_json::json!("fork-commit-v1");
-    swapped["upstreamVersion"] = serde_json::json!("1.0.0");
-    cases.push(swapped);
-    for invalid in cases {
-        let mut fixture = desktop_source_fixture();
-        fixture["desktopSourceBuild"] = invalid;
-        for windows in [false, true] {
-            assert_eq!(
-                bundled_core_version_with_ios(&fixture.to_string(), windows, false, false).unwrap(),
-                ""
-            );
-        }
-        assert_eq!(
-            bundled_core_patch_set_from_manifest(&fixture.to_string(), false),
-            None
-        );
-        assert_eq!(
-            bundled_core_version_with_ios(&fixture.to_string(), false, true, false).unwrap(),
-            "1.0.0"
-        );
-        assert_eq!(
-            bundled_core_version_with_ios(&fixture.to_string(), false, false, true).unwrap(),
-            "1.0.0.polaris.2"
-        );
-    }
-    let mut fixture = desktop_source_fixture();
-    fixture["windowsBuild"] = serde_json::json!({"version": "1.0.0.polaris.1"});
-    assert_eq!(
-        bundled_core_version_with_ios(&fixture.to_string(), true, false, false).unwrap(),
-        ""
-    );
-    fixture
-        .as_object_mut()
-        .unwrap()
-        .remove("desktopSourceBuild");
-    assert_eq!(
-        bundled_core_version_with_ios(&fixture.to_string(), true, false, false).unwrap(),
-        "1.0.0.polaris.2"
-    );
-}
-
-#[test]
-fn desktop_source_with_explicit_null_windows_overlay_is_invalid() {
-    let mut fixture = desktop_source_fixture();
-    fixture["windowsBuild"] = serde_json::Value::Null;
-    assert_eq!(
-        bundled_core_version_with_ios(&fixture.to_string(), true, false, false).unwrap(),
-        ""
-    );
-    assert_eq!(
-        bundled_core_patch_set_from_manifest(&fixture.to_string(), false),
-        None
-    );
-    assert_eq!(
-        bundled_core_version_with_ios(&fixture.to_string(), false, false, true).unwrap(),
-        "1.0.0.polaris.2"
     );
 }
 

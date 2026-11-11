@@ -24,8 +24,8 @@
 #           codesign 明确报告「根本没有签名」（不是「签名无效」）时放行，并打一条 notice 如实记录。
 #           依据：Intel 上执行 Mach-O 不要求代码签名；arm64 上没有有效签名的 Mach-O 一执行就被系统
 #           终止，故 arm64（含 universal）没有这条例外。「有签名但验不过」在任何架构上都判失败。
-#      内核验不过 ⇒ 打包失败，不在这里修：签名属于内核构建产物那一步（前置说明见
-#      `scripts/core-patches/README.md` 的「macOS code signature of the bundled core」一节）。
+#      内核验不过 ⇒ 打包失败，不在这里修：签名属于内核发布产物那一步（fetch-core 消费时由
+#      `scripts/desktop-core/source-graph.mjs` 的 observeMacCodeSignature 观测并记入收据）。
 #
 #   2. `polaris-helper` —— 编译 App 之前已签并冻结。两种模式仅校验源/载体
 #      字节与签名；验不过即拒绝，不在包后补签，也不改写安装身份。
@@ -90,7 +90,7 @@ sig_state() {
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-BUILD_SIDE="应在内核构建产物那一步签名，而不是在打包时补（见 scripts/core-patches/README.md「macOS code signature of the bundled core」）"
+BUILD_SIDE="应在内核发布产物那一步签名，而不是在打包时补（fetch-core 收据记录了发布核的签名观测）"
 
 # 内核：只读。本函数及它调用的 sig_state 里没有任何签名命令。
 check_core() {
@@ -117,7 +117,7 @@ check_core() {
       ;;
   esac
   # Explicit release mode checks the complete original release contract and
-  # carrier bytes. The legacy source lane retains its source signature receipt.
+  # carrier bytes.
   node --input-type=module - "$core_ref" "$f" "$script_dir" <<'NODE'
 import { readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -126,8 +126,8 @@ const [reference, binary, scripts] = process.argv.slice(2);
 const key = basename(dirname(reference));
 const root = resolve(dirname(dirname(reference)), '..');
 const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json'), 'utf8'));
-const { verifyMacPackagedCore } = await import(pathToFileURL(join(scripts, 'desktop-core/release-consumer.mjs')));
-verifyMacPackagedCore(root, manifest, key, binary);
+const { verifyPackagedCore } = await import(pathToFileURL(join(scripts, 'desktop-core/release-consumer.mjs')));
+verifyPackagedCore(root, manifest, key, binary);
 NODE
 }
 

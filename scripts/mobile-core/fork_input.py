@@ -50,27 +50,22 @@ def decode(raw, maximum=65536):
 def validate(value):
     require(value.get('schema') == 'polaris-mobile-fork-input-v1' and value.get('role') == 'mobile',
             'formal mobile source role is required')
-    historical = value.get('repository') == 'polaris-arch/polaris-box'
-    repository, repository_id = ('polaris-arch/polaris-box', 1407705262) if historical else ('polaris-arch/sing-box-polaris', 1421657509)
-    require(value.get('repository') == repository and value.get('repositoryId') == repository_id
-            and value.get('sourceURL') == 'https://github.com/' + repository, 'mobile source repository differs')
-    require(not historical or 'sourcePolicy' not in value, 'historical mobile source policy differs')
+    require(value.get('repository') == 'polaris-arch/sing-box-polaris' and value.get('repositoryId') == 1421657509
+            and value.get('sourceURL') == 'https://github.com/polaris-arch/sing-box-polaris', 'mobile source repository differs')
     require(value.get('goModule') == 'github.com/sagernet/sing-box', 'file branding must not rename the Go module')
     for key, width in [('sourceCommit', 40), ('sourceTree', 40), ('sourceTagObject', 40),
                        ('goModSha256', 64), ('goSumSha256', 64)]:
         require(isinstance(value.get(key), str) and re.fullmatch('[0-9a-f]{%d}' % width, value[key]),
                 'actual immutable source field required: ' + key)
     version = value.get('version')
-    version_match = (re.fullmatch(r'\d+\.\d+\.\d+-alpha\.\d+', version) if historical
-                     else POLARIS_VERSION.fullmatch(version)) if isinstance(version, str) else None
-    require(version_match and (historical or version_match[3] == 'alpha') and
+    version_match = POLARIS_VERSION.fullmatch(version) if isinstance(version, str) else None
+    require(version_match and version_match[3] == 'alpha' and
             value.get('sourceTag') == 'v' + version, 'mobile source tag/version differs')
-    require(historical or 'sourcePolicy' in value, 'new mobile repository requires an explicit reviewed source policy')
-    policy = validate_source_policy(value['sourcePolicy'], value) if 'sourcePolicy' in value else None
+    policy = validate_source_policy(value.get('sourcePolicy'), value)
     require(type(value.get('sourceOverlay')) is int and value['sourceOverlay'] == 0 and
             value.get('patches') == [] and value.get('dependencyPatches') == [],
             'formal mobile source must be zero-overlay')
-    require(value.get('goVersion') == (policy['goVersion'] if policy else '1.25.5') and
+    require(value.get('goVersion') == policy['goVersion'] and
             value.get('gomobileVersion') == value.get('gobindVersion') == 'v0.1.13',
             'formal generator must match the actual source module and API')
     require(value.get('artifactPins') is None and value.get('producerReceipt') is None and
@@ -81,10 +76,8 @@ def validate(value):
             android['minimumAPI'] == 24 and android['minimumLoadAlignment'] == 16384 and
             android['javaMajor'] == 17 and android['legacyAPI21Enabled'] is False,
             'formal Android requires one API24/four-ABI AAR and no legacy variant')
-    ndk = ('30.0.16138531', '30.0.16138531-beta3', 'android-ndk-r30-beta3',
-           'scripts/libbox-patches/ndk-linux-archive.json') if historical else (
-           '30.0.16248370', '30.0.16248370', 'android-ndk-r30', 'scripts/mobile-core/ndk-r30-linux.json')
-    require(tuple(android.get(key) for key in ('ndkRevision', 'ndkSourceRevision', 'ndkPackage', 'ndkArchivePath')) == ndk,
+    require(tuple(android.get(key) for key in ('ndkRevision', 'ndkSourceRevision', 'ndkPackage', 'ndkArchivePath')) ==
+            ('30.0.16248370', '30.0.16248370', 'android-ndk-r30', 'scripts/mobile-core/ndk-r30-linux.json'),
             'formal Android NDK differs')
     require(apple['targets'] == APPLE_TARGETS and
             apple['slices'] == ['ios-arm64', 'ios-arm64-simulator'] and
@@ -146,9 +139,9 @@ def verify_source(source, value, *, generator_outputs=False):
             'source checkout must be exact and clean before mobile bind')
     for name, key in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
         require(sha((source / name).read_bytes()) == value[key], 'source module bytes differ')
-    policy = validate_source_policy(value['sourcePolicy'], value) if 'sourcePolicy' in value else None
+    policy = validate_source_policy(value['sourcePolicy'], value)
     module = (source / 'go.mod').read_text()
-    directive = policy['goDirective'] if policy else value['goVersion']
+    directive = policy['goDirective']
     require(re.search(r'^module\s+' + re.escape(value['goModule']) + r'\s*$', module, re.M) and
             re.search(r'^go\s+' + re.escape(directive) + r'\s*$', module, re.M) and
             re.search(r'^\s*github\.com/sagernet/gomobile\s+' + re.escape(value['gomobileVersion']) + r'\s*$', module, re.M),
@@ -166,32 +159,24 @@ def verify_source(source, value, *, generator_outputs=False):
     unexpected = [name for name in ignored + untracked
                   if not (generator_outputs and name.startswith('build/'))]
     require(not unexpected, 'untracked ignored compiler/embed input is not a zero-overlay source')
-    reviewed = {}
-    if policy:
-        meta = policy['metacubex']
-        prefix = meta['replacementPath'][2:]
-        files, total_bytes, vendor_evidence = {}, 0, {}
-        if 'vendors' in policy:
-            _, files, modes, trees = verify_vendor_sources(source, policy['vendors'], git)
-            vendor_evidence = {'vendor_modes': modes, 'vendor_trees': trees}
-            names = []  # The complete tracked nine-vendor bytes/modes are already read.
-        else:
-            names = git(source, 'ls-tree', '-r', '--name-only', 'HEAD', '--', prefix).splitlines()
-            require(len(names) == meta['replacementFileCount'], 'actual Meta tracked inventory differs')
-        for name in names + ['go.mod', 'go.sum', meta['bindingPath'], meta['patchPath']]:
-            path = source / name
-            require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(source),
-                    'reviewed source input redirected/missing')
-            require(path.stat().st_size <= 2 * 1024 * 1024, 'reviewed source input exceeds bound')
-            total_bytes += path.stat().st_size
-            require(total_bytes <= 32 * 1024 * 1024, 'reviewed source proof exceeds bound')
-            files[name] = path.read_bytes()
-        reviewed['reviewedSource'] = verify_source_policy_files(policy, value, files,
-            git(source, 'rev-parse', 'HEAD:' + prefix), **vendor_evidence)
+    meta = policy['metacubex']
+    prefix = meta['replacementPath'][2:]
+    total_bytes = 0
+    _, files, modes, trees = verify_vendor_sources(source, policy['vendors'], git)
+    for name in ['go.mod', 'go.sum', meta['bindingPath'], meta['patchPath']]:
+        path = source / name
+        require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(source),
+                'reviewed source input redirected/missing')
+        require(path.stat().st_size <= 2 * 1024 * 1024, 'reviewed source input exceeds bound')
+        total_bytes += path.stat().st_size
+        require(total_bytes <= 32 * 1024 * 1024, 'reviewed source proof exceeds bound')
+        files[name] = path.read_bytes()
     return {'schema': 'polaris-mobile-source-observation-v1', 'sourceCommit': value['sourceCommit'],
             'sourceTree': value['sourceTree'], 'sourceTag': value['sourceTag'],
             'sourceTagObject': value['sourceTagObject'], 'sourceOverlay': 0,
-            'inputContractSha256': sha(canonical(value)), 'artifactAcceptance': False, **reviewed}
+            'inputContractSha256': sha(canonical(value)), 'artifactAcceptance': False,
+            'reviewedSource': verify_source_policy_files(policy, value, files, git(source, 'rev-parse', 'HEAD:' + prefix),
+                                                         vendor_modes=modes, vendor_trees=trees)}
 
 
 def linker_flags(value, input_fingerprint):

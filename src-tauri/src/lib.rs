@@ -775,10 +775,6 @@ pub fn run() {
 
             // ── 配置根目录注入（供无 AppHandle 的自由函数取用）──
             runtime::core_paths::init_base_dir(config_dir.clone());
-            // 旧版本曾把内核放在配置根下的可写目录里（在线更新 / 手动上传 / 回滚备份）。应用现在
-            // 只从安装包解析内核；原生观察确认旧目录闲置才清，活跃/不可观察时保留供后续重试。
-            #[cfg(desktop)]
-            runtime::core_paths::remove_legacy_core_state(&config_dir);
 
             // ── 内置 geo 规则集播种（调用点 1/2：应用启动；对齐 上游 `index.ts:1834`）──
             // 不种 → `<userData>/rules` 恒空 → route builder 一个 rule_set 都不注入 → 全部 geo 规则被

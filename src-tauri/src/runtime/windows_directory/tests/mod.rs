@@ -300,19 +300,6 @@ impl KernelWriter {
                 configuration_envelope(config).unwrap()["expected_source"].as_str(),
                 Some(expected.as_str())
             ),
-            "candidate" => {
-                if std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_some() {
-                    assert_eq!(
-                        std::env::var("POLARIS_NATIVE_DNS_CANDIDATE").as_deref(),
-                        Ok("1")
-                    );
-                    assert_eq!(
-                        configuration_envelope(config).unwrap()["expected_source"].as_str(),
-                        Some(expected.as_str())
-                    );
-                }
-                eprintln!("candidate source={expected}; not formal release acceptance");
-            }
             _ => panic!("explicit validation mode required"),
         }
         assert_eq!(
@@ -538,7 +525,6 @@ fn interop_system_producer_user_consumer() {
             configuration_envelope(&config).unwrap()["expected_source"].as_str(),
             Some(source.as_str())
         ),
-        "candidate" => eprintln!("candidate SYSTEM bootstrap, not formal release acceptance"),
         _ => panic!("explicit mode required"),
     }
     let wait = |name: &str| {

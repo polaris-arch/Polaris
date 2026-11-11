@@ -5,14 +5,12 @@ import io
 import json
 import os
 from pathlib import Path
-import struct
-import plistlib
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from fork_input import ROOT, canonical, load, sha, validate
+from fork_input import ROOT, canonical, load, sha
 from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_hot_contract, objc_validation_getter_contract, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import capacity_limit, native_capacity, native_environment, reservation
@@ -206,7 +204,16 @@ public interface io.nekohasekai.libbox.RuntimePersistenceHandler {
 
 class FormalOutputs(unittest.TestCase):
     def setUp(self):
-        self.value = validate(json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes()))
+        self.value = load()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.source = Path(temporary.name).resolve()
+        self.graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
+                      {'Path': self.value['goModule'], 'Main': True, 'Dir': str(self.source)}]
+        for name, pin in self.value['sourcePolicy']['vendors'].items():
+            directory = self.source / pin['replacementPath'][2:]; directory.mkdir(parents=True)
+            self.graph.append({'Path': name, 'Version': pin['version'],
+                               'Replace': {'Path': pin['replacementPath'], 'Dir': str(directory)}})
 
     def test_hot_java_accepts_actual_retained_generated_forms(self):
         with patch('subprocess.Popen', side_effect=AssertionError('no external tools in fixture')):
@@ -736,173 +743,87 @@ class FormalOutputs(unittest.TestCase):
         tags = self.value['apple' if apple else 'android']['tags'][:]
         if apple:
             tags += ['ios', *(['iossimulator'] if simulator else [])]
-        return {'goVersion': '1.25.5', 'settings': {'GOOS': 'ios' if apple else 'android',
+        facts = {'goVersion': self.value['goVersion'], 'settings': {'GOOS': 'ios' if apple else 'android',
             'GOARCH': 'arm64', 'CGO_ENABLED': '1', '-buildmode': 'c-archive' if apple else 'c-shared',
             '-trimpath': 'true', '-tags': ','.join(tags)}, 'modules': {'example.org/module':
             {'kind': 'dep', 'version': 'v1.2.3', 'sum': 'h1:fixed'}, self.value['goModule']:
-            {'kind': 'dep', 'version': 'v0.0.0-00010101000000-000000000000', 'replacement': '/verified/fork'}}}
+            {'kind': 'dep', 'version': 'v0.0.0-00010101000000-000000000000', 'replacement': str(self.source)}}}
+        for name, pin in self.value['sourcePolicy']['vendors'].items():
+            facts['modules'][name] = {'kind': 'dep', 'version': pin['version'], 'sum': '',
+                'replacement': pin['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
+        return facts
 
     def check(self, facts, **kwargs):
-        check_buildinfo(facts, self.value, [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
-                                         {'Path': self.value['goModule'], 'Main': True, 'Dir': '/verified/fork'}],
+        check_buildinfo(facts, self.value, self.graph,
                         os_name=kwargs.pop('os_name', 'android'), arch='arm64', mode=kwargs.pop('mode', 'c-shared'),
                         expected_id='polaris-mobile-' + 'a' * 64, actual_id=kwargs.pop('actual_id', 'polaris-mobile-' + 'a' * 64),
                         **kwargs)
 
-    def test_final_go_meta_buildinfo_preserves_actual_devel_and_rejects_invented_sum(self):
-        from test_source_policy import future_mobile_fixture
-        value, _ = future_mobile_fixture()
-        old = self.value
-        self.value = value
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                source = Path(tmp).resolve(); meta_dir = source / 'third_party/metacubex-utls'
-                meta_dir.mkdir(parents=True)
-                tun_dir = source / 'third_party/sing-tun'; tun_dir.mkdir()
-                facts = self.facts(); facts['goVersion'] = value['goVersion']
-                facts['modules'][value['goModule']]['replacement'] = str(source)
-                meta = value['sourcePolicy']['metacubex']
-                facts['modules'][meta['module']] = {'kind': 'dep', 'version': meta['version'], 'sum': '',
-                    'replacement': meta['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
-                facts['modules']['github.com/sagernet/sing-tun'] = {'kind': 'dep', 'version': 'v1.0.0', 'sum': '',
-                    'replacement': './third_party/sing-tun', 'replacementVersion': '(devel)', 'replacementSum': ''}
-                graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
-                    {'Path': value['goModule'], 'Main': True, 'Dir': str(source)},
-                    {'Path': meta['module'], 'Version': meta['version'],
-                     'Replace': {'Path': meta['replacementPath'], 'Dir': str(meta_dir)}},
-                    {'Path': 'github.com/sagernet/sing-tun', 'Version': 'v1.0.0',
-                     'Replace': {'Path': './third_party/sing-tun', 'Dir': str(tun_dir)}}]
-                def check(actual, source_graph=None):
-                    check_buildinfo(actual, value, graph if source_graph is None else source_graph, os_name='android', arch='arm64', mode='c-shared',
-                        expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
-                check(facts)
-                for case in ('duplicate', 'unlinked-local', 'missing-local', 'graph-sum', 'graph-version', 'graph-directory'):
-                    changed_graph = deepcopy(graph)
-                    if case == 'duplicate': changed_graph.append(deepcopy(changed_graph[-1]))
-                    elif case == 'unlinked-local': changed_graph.append({'Path': 'example.invalid/unlinked',
-                        'Replace': {'Path': '../outside', 'Dir': str(source.parent / 'outside')}})
-                    elif case == 'missing-local': changed_graph.pop()
-                    elif case == 'graph-sum': changed_graph[-2]['Sum'] = meta['upstreamH1']
-                    elif case == 'graph-version': changed_graph[-2]['Version'] = 'v1.8.7'
-                    else: changed_graph[-2]['Replace']['Dir'] = str(source / 'outside')
-                    with self.subTest(case=case), self.assertRaises(RuntimeError): check(facts, changed_graph)
-                for field, bad in [('replacement', './outside'), ('replacementVersion', ''),
-                                   ('replacementSum', meta['upstreamH1']), ('sum', meta['upstreamH1']),
-                                   ('version', 'v1.8.7')]:
-                    changed = deepcopy(facts); changed['modules'][meta['module']][field] = bad
-                    with self.subTest(field=field), self.assertRaises(RuntimeError): check(changed)
-                changed = deepcopy(facts); changed['goVersion'] = '1.25.5'
-                with self.assertRaisesRegex(RuntimeError, 'Go version'): check(changed)
-        finally:
-            self.value = old
-
-    def nine_vendor_buildinfo(self, source, *, apple=False, simulator=False):
-        from test_source_policy import future_mobile_fixture_v2, future_mobile_fixture_v3
-        make = future_mobile_fixture_v3 if getattr(self, '_ten_vendor_fixture', False) else future_mobile_fixture_v2
-        self.value, _, _, _ = make()
-        facts = self.facts(apple=apple, simulator=simulator)
-        facts['goVersion'] = self.value['goVersion']
-        facts['modules'][self.value['goModule']]['replacement'] = str(source)
-        graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
-                 {'Path': self.value['goModule'], 'Main': True, 'Dir': str(source)}]
-        for name, pin in self.value['sourcePolicy']['vendors'].items():
-            directory = source / pin['replacementPath'][2:]; directory.mkdir(parents=True, exist_ok=True)
-            graph.append({'Path': name, 'Version': pin['version'],
-                          'Replace': {'Path': pin['replacementPath'], 'Dir': str(directory)}})
-            facts['modules'][name] = {'kind': 'dep', 'version': pin['version'], 'sum': '',
-                'replacement': pin['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
-        return facts, graph
-
-    def check_nine_vendor_buildinfo(self, facts, graph, *, apple=False, simulator=False):
+    def check_vendor_buildinfo(self, facts, graph, *, apple=False, simulator=False):
         check_buildinfo(facts, self.value, graph, os_name='ios' if apple else 'android', arch='arm64',
                         mode='c-archive' if apple else 'c-shared', simulator=simulator,
                         expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
 
-    def test_v3_ten_vendor_native_consistency_allows_only_unrequired_link_pruning(self):
-        self._ten_vendor_fixture = True
-        try:
-            self.test_v2_nine_vendor_native_consistency_allows_only_unrequired_link_pruning()
-        finally:
-            self._ten_vendor_fixture = False
-
-    def test_v3_buildinfo_rejects_every_linked_vendor_identity_mutation(self):
-        self._ten_vendor_fixture = True
-        try:
-            self.test_v2_buildinfo_rejects_every_linked_vendor_identity_mutation()
-        finally:
-            self._ten_vendor_fixture = False
-
-    def test_v3_complete_graph_is_checked_even_for_native_pruned_modules(self):
-        self._ten_vendor_fixture = True
-        try:
-            self.test_v2_complete_graph_is_checked_even_for_native_pruned_modules()
-        finally:
-            self._ten_vendor_fixture = False
-
-    def test_v2_nine_vendor_native_consistency_allows_only_unrequired_link_pruning(self):
+    def test_vendor_native_consistency_allows_only_unrequired_link_pruning(self):
         required = {'github.com/metacubex/utls', 'github.com/sagernet/sing-tun'}
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp).resolve()
-            for apple, simulator in [(False, False), (True, False), (True, True)]:
-                facts, graph = self.nine_vendor_buildinfo(source, apple=apple, simulator=simulator)
-                frozen = deepcopy(facts)
-                self.check_nine_vendor_buildinfo(facts, graph, apple=apple, simulator=simulator)
-                self.assertEqual(facts, frozen)
-                for name in self.value['sourcePolicy']['vendors']:
-                    changed = deepcopy(facts); del changed['modules'][name]
-                    with self.subTest(apple=apple, simulator=simulator, name=name):
-                        if name in required:
-                            with self.assertRaisesRegex(RuntimeError, 'required local source module'):
-                                self.check_nine_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
-                        else:
-                            self.check_nine_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
-                pruned = deepcopy(facts)
-                for name in set(self.value['sourcePolicy']['vendors']) - required: del pruned['modules'][name]
-                self.check_nine_vendor_buildinfo(pruned, graph, apple=apple, simulator=simulator)
-
-    def test_v2_buildinfo_rejects_every_linked_vendor_identity_mutation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp).resolve(); facts, graph = self.nine_vendor_buildinfo(source)
+        for apple, simulator in [(False, False), (True, False), (True, True)]:
+            facts, graph = self.facts(apple, simulator), self.graph
+            frozen = deepcopy(facts)
+            self.check_vendor_buildinfo(facts, graph, apple=apple, simulator=simulator)
+            self.assertEqual(facts, frozen)
             for name in self.value['sourcePolicy']['vendors']:
-                for field, bad in [('version', 'v9.9.9'), ('replacement', './third_party/stock'),
-                                   ('replacementVersion', 'v1.0.0'), ('replacementSum', 'h1:invented'),
-                                   ('sum', 'h1:invented'), ('kind', 'mod')]:
-                    changed = deepcopy(facts); changed['modules'][name][field] = bad
-                    with self.subTest(name=name, field=field), self.assertRaises(RuntimeError):
-                        self.check_nine_vendor_buildinfo(changed, graph)
-            changed = deepcopy(facts)
-            changed['modules']['example.invalid/unreviewed'] = {'kind': 'dep', 'version': 'v1.0.0', 'sum': 'h1:invented'}
-            with self.assertRaisesRegex(RuntimeError, 'not in actual source graph'):
-                self.check_nine_vendor_buildinfo(changed, graph)
-            # Source-owned absolute aliases remain admissible for non-Meta vendors.
-            changed = deepcopy(facts)
-            name = 'github.com/sagernet/sing'
-            changed['modules'][name]['replacement'] = str(source / 'third_party/sing')
-            self.check_nine_vendor_buildinfo(changed, graph)
+                changed = deepcopy(facts); del changed['modules'][name]
+                with self.subTest(apple=apple, simulator=simulator, name=name):
+                    if name in required:
+                        with self.assertRaisesRegex(RuntimeError, 'required local source module'):
+                            self.check_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
+                    else:
+                        self.check_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
+            pruned = deepcopy(facts)
+            for name in set(self.value['sourcePolicy']['vendors']) - required: del pruned['modules'][name]
+            self.check_vendor_buildinfo(pruned, graph, apple=apple, simulator=simulator)
 
-    def test_v2_complete_graph_is_checked_even_for_native_pruned_modules(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp).resolve(); facts, graph = self.nine_vendor_buildinfo(source)
-            name = 'github.com/sagernet/fswatch'
-            del facts['modules'][name]
-            index = next(i for i, row in enumerate(graph) if row['Path'] == name)
-            for case in ('missing', 'duplicate', 'version', 'sum', 'path', 'directory', 'replacement-sum', 'stock', 'extra', 'main'):
-                changed = deepcopy(graph); row = changed[index]
-                if case == 'missing': changed.pop(index)
-                elif case == 'duplicate': changed.append(deepcopy(row))
-                elif case == 'version': row['Version'] = 'v9.9.9'
-                elif case == 'sum': row['Sum'] = 'h1:invented'
-                elif case == 'path': row['Replace']['Path'] = '../outside'
-                elif case == 'directory': row['Replace']['Dir'] = str(source / 'third_party/sing')
-                elif case == 'replacement-sum': row['Replace']['Sum'] = 'h1:invented'
-                elif case == 'stock': row.pop('Replace')
-                elif case == 'extra': changed.append({'Path': 'example.invalid/extra', 'Replace': {'Path': './extra', 'Dir': str(source / 'extra')}})
-                else: row['Main'] = True
-                with self.subTest(case=case), self.assertRaises(RuntimeError): self.check_nine_vendor_buildinfo(facts, changed)
-            outside = source / 'outside'; outside.mkdir()
-            escaped = source / 'third_party/fswatch'; escaped.rmdir(); escaped.symlink_to(source.parent, target_is_directory=True)
-            with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
-                self.check_nine_vendor_buildinfo(facts, graph)
+    def test_buildinfo_rejects_every_linked_vendor_identity_mutation(self):
+        facts, graph = self.facts(), self.graph
+        for name in self.value['sourcePolicy']['vendors']:
+            for field, bad in [('version', 'v9.9.9'), ('replacement', './third_party/stock'),
+                               ('replacementVersion', 'v1.0.0'), ('replacementSum', 'h1:invented'),
+                               ('sum', 'h1:invented'), ('kind', 'mod')]:
+                changed = deepcopy(facts); changed['modules'][name][field] = bad
+                with self.subTest(name=name, field=field), self.assertRaises(RuntimeError):
+                    self.check_vendor_buildinfo(changed, graph)
+        changed = deepcopy(facts)
+        changed['modules']['example.invalid/unreviewed'] = {'kind': 'dep', 'version': 'v1.0.0', 'sum': 'h1:invented'}
+        with self.assertRaisesRegex(RuntimeError, 'not in actual source graph'):
+            self.check_vendor_buildinfo(changed, graph)
+        # Source-owned absolute aliases remain admissible for non-Meta vendors.
+        changed = deepcopy(facts)
+        name = 'github.com/sagernet/sing'
+        changed['modules'][name]['replacement'] = str(self.source / 'third_party/sing')
+        self.check_vendor_buildinfo(changed, graph)
+
+    def test_complete_graph_is_checked_even_for_native_pruned_modules(self):
+        source, facts, graph = self.source, self.facts(), self.graph
+        name = 'github.com/sagernet/fswatch'
+        del facts['modules'][name]
+        index = next(i for i, row in enumerate(graph) if row['Path'] == name)
+        for case in ('missing', 'duplicate', 'version', 'sum', 'path', 'directory', 'replacement-sum', 'stock', 'extra', 'main'):
+            changed = deepcopy(graph); row = changed[index]
+            if case == 'missing': changed.pop(index)
+            elif case == 'duplicate': changed.append(deepcopy(row))
+            elif case == 'version': row['Version'] = 'v9.9.9'
+            elif case == 'sum': row['Sum'] = 'h1:invented'
+            elif case == 'path': row['Replace']['Path'] = '../outside'
+            elif case == 'directory': row['Replace']['Dir'] = str(source / 'third_party/sing')
+            elif case == 'replacement-sum': row['Replace']['Sum'] = 'h1:invented'
+            elif case == 'stock': row.pop('Replace')
+            elif case == 'extra': changed.append({'Path': 'example.invalid/extra', 'Replace': {'Path': './extra', 'Dir': str(source / 'extra')}})
+            else: row['Main'] = True
+            with self.subTest(case=case), self.assertRaises(RuntimeError): self.check_vendor_buildinfo(facts, changed)
+        outside = source / 'outside'; outside.mkdir()
+        escaped = source / 'third_party/fswatch'; escaped.rmdir(); escaped.symlink_to(source.parent, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
+            self.check_vendor_buildinfo(facts, graph)
 
     def test_trimpath_does_not_invent_absent_ldflags(self):
         self.check(self.facts())
@@ -1122,7 +1043,7 @@ class FormalOutputs(unittest.TestCase):
 
     def test_actual_ndk_properties_spacing_keeps_exact_pin_and_rejects_duplicate_or_other_revision(self):
         # Matches the observed fixed archive's full revision and distinct base revision.
-        self.assertEqual(revision_from_properties('Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16138531-beta3\n'),
+        self.assertEqual(revision_from_properties('Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\n'),
                          self.value['android']['ndkSourceRevision'])
         self.assertEqual(revision_from_properties('Pkg.Revision=30.0.16138531\n'), '30.0.16138531')
         for bad in ['Pkg.Revision = 30.0.16138531\nPkg.Revision=30.0.16138531',
@@ -1140,7 +1061,7 @@ class FormalOutputs(unittest.TestCase):
             jar = sdk / 'platforms' / profile['bootclasspath']['platform'] / 'android.jar'
             jar.write_bytes(b'actual controlled bootclasspath')
             profile['bootclasspath']['sha256'] = sha(jar.read_bytes())
-            properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16138531-beta3\nPkg.BaseRevision = 30.0.16138531\nPkg.ReleaseName = r30-beta3\n'
+            properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\nPkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n'
             (ndk / 'source.properties').write_bytes(properties)
             observation = observe_ndk_input(root, ndk, profile)
             self.assertEqual((root / 'ndk-source.properties').read_bytes(), properties)
@@ -1156,10 +1077,9 @@ class FormalOutputs(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'observation differs'):
                 observe_ndk_input(root, ndk, profile)
             self.assertEqual((root / 'ndk-source.properties').read_bytes(), properties)
-            for bad in [properties.replace(b'-beta3', b'-beta2'),
-                        properties.replace(b'Pkg.BaseRevision = 30.0.16138531', b'Pkg.BaseRevision = 30.0.0'),
-                        properties.replace(b'r30-beta3', b'r30-rc1'),
-                        properties.replace(b'Pkg.Revision = 30.0.16138531-beta3', b'Pkg.Revision = 30.0.16138531')]:
+            for bad in [properties.replace(b'Pkg.Revision = 30.0.16248370', b'Pkg.Revision = 30.0.16248370-beta3'),
+                        properties.replace(b'Pkg.BaseRevision = 30.0.16248370', b'Pkg.BaseRevision = 30.0.0'),
+                        properties.replace(b'= r30', b'= r30-rc1')]:
                 (ndk / 'source.properties').write_bytes(bad)
                 with self.assertRaisesRegex(RuntimeError, 'revision/base/release differs'):
                     prepare_view(work, sdk, ndk, profile)
@@ -1195,7 +1115,7 @@ class FormalOutputs(unittest.TestCase):
                             'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
                             'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']]:
                         return ''
-                    installer = [str(ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py'), '--profile',
+                    installer = [str(ROOT / 'scripts/mobile-core/prepare-ndk-linux.py'), '--profile',
                                  str(ROOT / value['android']['ndkArchivePath']), '--sdk', str(sdk)]
                     if command[1:] == installer + ['--check-license-only']:
                         return ''
@@ -1248,108 +1168,6 @@ class FormalOutputs(unittest.TestCase):
             with self.subTest(entry=bad), self.assertRaises(RuntimeError):
                 framework_entry_targets(bad)
 
-    def test_framework_content_predicate_requires_exact_two_arm64_platform_slices(self):
-        fixtures = module('formal_mobile_framework_fixtures', 'scripts/apple-carrier.test.py')
-        from test_apple_entry import single_fat_archive
-        raw_info = 'path\tsynthetic/main\nmod\tgithub.com/sagernet/sing-box\t(devel)\t\n'
-        expected_id = 'polaris-mobile-' + 'a' * 64
-        def archive(target):
-            return fixtures.archive([('go.o', fixtures.mach_object(target, fixtures.inline(raw_info), expected_id)),
-                                     ('native.o', fixtures.mach_object(target))])
-        device = single_fat_archive(archive('ios-arm64'))
-        simulator = archive('ios-arm64-simulator')
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            framework = root / 'Libbox.xcframework'; framework.mkdir()
-            entries = []
-            for identifier, variant, arches, raw in [('ios-arm64', None, ['arm64'], device),
-                    ('ios-arm64-simulator', 'simulator', ['arm64'], simulator)]:
-                entry = {'LibraryIdentifier': identifier, 'LibraryPath': 'Libbox.framework',
-                         'SupportedPlatform': 'ios', 'SupportedArchitectures': arches}
-                if variant: entry['SupportedPlatformVariant'] = variant
-                entries.append(entry)
-                lib = framework / identifier / 'Libbox.framework'; (lib / 'Resources').mkdir(parents=True)
-                (lib / 'Headers').mkdir()
-                (lib / 'Libbox').write_bytes(raw)
-                (lib / 'Resources/Info.plist').write_bytes(plistlib.dumps({}))
-                symbols = ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
-                    'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement', 'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
-                    'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
-                    'wakeNow', 'recordScreenState']
-                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header() + self.hot_objc_header())
-            info = framework / 'Info.plist'; info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
-            with patch('artifacts.check_buildinfo') as buildinfo:
-                output = inspect_framework(framework, self.value, [], expected_id)
-                self.assertEqual(set(output['slices']), set(self.value['apple']['slices']))
-                self.assertEqual(buildinfo.call_count, 2)
-                for row in output['slices'].values():
-                    self.assertEqual(row['validationResultGetterContract']['receiver'], 'LibboxConfigValidationResult')
-                    self.assertEqual(row['hotObjectiveCContract'], objc_hot_contract(self.hot_objc_header()))
-                for entry in entries:
-                    path = framework / entry['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
-                    original = path.read_text()
-                    path.write_text(original.replace(')runtimeCapabilities:', ')omittedCapabilities:'))
-                    with self.subTest(component=entry['LibraryIdentifier']), self.assertRaisesRegex(RuntimeError, 'HOT method'):
-                        inspect_framework(framework, self.value, [], expected_id)
-                    path.write_text(original)
-                original_header = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
-                text = original_header.read_text()
-                for missing in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
-                                'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement']:
-                    original_header.write_text(text.replace(missing, 'omittedAPI'))
-                    with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, 'API missing'):
-                        inspect_framework(framework, self.value, [], expected_id)
-                original_header.write_text(text)
-                original_header.write_text(text.replace('- (NSString* _Nonnull)getTailscaleStoreRetirement;',
-                                                       '// - (NSString* _Nonnull)getTailscaleStoreRetirement;'))
-                with self.assertRaisesRegex(RuntimeError, 'immutable getter'):
-                    inspect_framework(framework, self.value, [], expected_id)
-                original_header.write_text(text)
-                paths = [framework / entry['LibraryIdentifier'] / 'Libbox.framework/Libbox' for entry in entries]
-                # Admit the actual format, never assume the generator must emit
-                # a thin archive or reject a valid one-entry fat wrapper.
-                for device_fat in (False, True):
-                    for simulator_fat in (False, True):
-                        for path, target, wrap in zip(paths, self.value['apple']['slices'],
-                                                      (device_fat, simulator_fat)):
-                            raw = archive(target)
-                            path.write_bytes(single_fat_archive(raw) if wrap else raw)
-                        self.assertEqual(set(inspect_framework(framework, self.value, [], expected_id)['slices']),
-                                         {'ios-arm64', 'ios-arm64-simulator'})
-                paths[0].write_bytes(device); paths[1].write_bytes(simulator)
-                for bad_entries in [entries[:1], [entries[0], entries[0]], entries + [dict(entries[1])],
-                                    [entries[0], {**entries[1], 'SupportedPlatformVariant': 'maccatalyst'}]]:
-                    info.write_bytes(plistlib.dumps({'AvailableLibraries': bad_entries}))
-                    with self.subTest(entries=bad_entries), self.assertRaises(RuntimeError):
-                        inspect_framework(framework, self.value, [], expected_id)
-                entries[1]['SupportedArchitectures'] = ['arm64', 'x86_64']
-                info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
-                with self.assertRaisesRegex(RuntimeError, 'declared architecture inventory'):
-                    inspect_framework(framework, self.value, [], expected_id)
-                entries[1]['SupportedArchitectures'] = ['arm64']
-                info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
-                sim = paths[1]
-                for bad, reason in [(fixtures.fat(archive('ios-x86_64-simulator'), simulator), 'static slice inventory'),
-                                    (archive('ios-x86_64-simulator'), 'unknown/duplicate Apple architecture'),
-                                    (archive('ios-arm64'), 'deployment/platform')]:
-                    sim.write_bytes(bad)
-                    with self.subTest(reason=reason), self.assertRaisesRegex(RuntimeError, reason):
-                        inspect_framework(framework, self.value, [], expected_id)
-                sim.write_bytes(simulator)
-                bad = bytearray(device); struct.pack_into('>I', bad, 8, 0x1000007)
-                (framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Libbox').write_bytes(bad)
-                with self.assertRaisesRegex(RuntimeError, 'header/payload CPU'):
-                    inspect_framework(framework, self.value, [], expected_id)
-                bad_count = bytearray(device); struct.pack_into('>I', bad_count, 4, 3)
-                device_path = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Libbox'
-                device_path.write_bytes(bad_count)
-                with self.assertRaisesRegex(RuntimeError, 'fatCount=3') as rejected:
-                    inspect_framework(framework, self.value, [], expected_id)
-                message = str(rejected.exception)
-                self.assertIn('path=' + str(device_path), message)
-                self.assertIn('header=' + bytes(bad_count[:16]).hex(), message)
-                self.assertIn("declaredArchitectures=['arm64']", message)
-
     def test_llvm_symlink_drivers_keep_invocation_name_and_bind_actual_physical_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -1401,12 +1219,12 @@ class FormalOutputs(unittest.TestCase):
         body = '\tpath\tgobind\n\tdep\texample.org/module\tv1.2.3\th1:fixed\n'
         original = {'format': 'AAR', 'artifact': {'bytes': 123, 'sha256': 'a' * 64},
                     'nativeLibraries': {name: {'bytes': 42, 'sha256': 'b' * 64,
-                        'goBuildInfo': '/producer/scratch/jni_arm64-v8a_libbox.so: go1.25.5\n' + body,
+                        'goBuildInfo': '/producer/scratch/jni_arm64-v8a_libbox.so: go1.27.2\n' + body,
                         'parsedBuildInfo': self.facts(), 'buildID': 'original-build-id',
                         'jniExports': ['JNI_OnLoad'], 'needed': ['libc.so']}},
                     'javaInterfaces': {'Libbox': 'original API'}}
         observed = deepcopy(original)
-        observed['nativeLibraries'][name]['goBuildInfo'] = '/consumer/work/jni_arm64-v8a_libbox.so: go1.25.5\n' + body
+        observed['nativeLibraries'][name]['goBuildInfo'] = '/consumer/work/jni_arm64-v8a_libbox.so: go1.27.2\n' + body
         return name, original, observed
 
     def test_component_identity_ignores_only_the_exact_go_invocation_filename_and_preserves_raw(self):
@@ -1429,8 +1247,8 @@ class FormalOutputs(unittest.TestCase):
         ]:
             wrong = deepcopy(observed); mutate(wrong)
             self.assertNotEqual(component_output_identity(original), component_output_identity(wrong))
-        for header in ['relative/jni_arm64-v8a_libbox.so: go1.25.5',
-                       '/consumer/work/other.so: go1.25.5',
+        for header in ['relative/jni_arm64-v8a_libbox.so: go1.27.2',
+                       '/consumer/work/other.so: go1.27.2',
                        '/consumer/work/jni_arm64-v8a_libbox.so: go1.25.6']:
             wrong = deepcopy(observed)
             wrong['nativeLibraries'][name]['goBuildInfo'] = header + '\n\tpath\tgobind\n'
@@ -1485,87 +1303,6 @@ class FormalOutputs(unittest.TestCase):
             self.assertEqual(original_inputs.call_count, 8)
         self.assertEqual(receipt, frozen)
 
-    def test_apple_consumer_link_and_original_reinspection_refuse_legacy_or_tampered_inventory(self):
-        from contextlib import nullcontext
-        import consume
-        from test_apple_read_reuse import AppleReadReuse
-        fixtures = module('two_target_consumer_fixture', 'scripts/apple-carrier.test.py')
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            framework, binaries, _, expected_id = AppleReadReuse().framework_fixture(root)
-            work = root / 'work'; work.mkdir()
-            cache = root / 'cache'; cache.mkdir()
-            binding = {'platform': 'apple', 'sourceContract': self.value, 'sourceOverlay': 0,
-                       'sourceObservation': {'sourceCommit': self.value['sourceCommit'],
-                                             'sourceTree': self.value['sourceTree']}, 'moduleGraph': []}
-            # Native-origin verification is isolated; the full framework/native
-            # parser, source-contract comparison and every consumer boundary run.
-            with patch('artifacts.check_buildinfo'), patch('native_inputs.verify'), \
-                    patch('consume.load', return_value=self.value), \
-                    patch('consume.lease', return_value=nullcontext((work, cache))), \
-                    patch('consume.app_identity', return_value={'candidate': 'a' * 40}), \
-                    patch('consume.apple_resources', return_value={}):
-                output = inspect_framework(framework, self.value, [], expected_id)
-                receipt = {'schema': 'polaris-mobile-component-v1', 'platform': 'apple',
-                           'input': binding, 'output': output, 'nativeInputs': {'cache': str(cache)},
-                           'sourceOverlay': 0, 'AppAccepted': False, 'devicePassed': False}
-                receipt['fingerprint'] = artifacts.receipt_digest(receipt)
-                receipt_path = root / 'original-receipt.json'; write_json(receipt_path, receipt)
-                receipt_bytes = receipt_path.read_bytes()
-                self.assertEqual(consume.verify_original(framework, receipt_path, 'apple', {}, work), receipt)
-                link_path = root / 'original-link.json'
-                link = consume.apple_link(framework, receipt_path, link_path, work, cache)
-                link_bytes = link_path.read_bytes()
-                self.assertEqual(consume.verify_link(link_path, sha(link_bytes), work), link)
-                mutations = {}
-                legacy = deepcopy(receipt)
-                legacy['input']['sourceContract']['apple']['targets'].append('iossimulator/amd64')
-                legacy['input']['sourceContract']['apple']['slices'].append('ios-x86_64-simulator')
-                mutations['legacy-contract'] = legacy
-                extra = deepcopy(receipt)
-                extra['output']['slices']['ios-x86_64-simulator'] = deepcopy(output['slices']['ios-arm64-simulator'])
-                mutations['extra-intel-output'] = extra
-                missing = deepcopy(receipt); del missing['output']['slices']['ios-arm64-simulator']
-                mutations['missing-simulator'] = missing
-                changed = deepcopy(receipt); changed['output']['slices']['ios-arm64-simulator']['binary']['sha256'] = 'f' * 64
-                mutations['native-pin'] = changed
-                for label, changed in mutations.items():
-                    changed['fingerprint'] = artifacts.receipt_digest({k: v for k, v in changed.items() if k != 'fingerprint'})
-                    bad_receipt = root / (label + '-receipt.json'); write_json(bad_receipt, changed)
-                    bad_link = deepcopy(link)
-                    bad_link.update(componentReceipt=str(bad_receipt), componentReceiptSha256=artifacts.file_pin(bad_receipt)['sha256'],
-                                    componentFingerprint=changed['fingerprint'], componentOutput=changed['output'],
-                                    producerInput=changed['input'])
-                    bad_link['fingerprint'] = artifacts.receipt_digest({k: v for k, v in bad_link.items() if k != 'fingerprint'})
-                    bad_path = root / (label + '-link.json'); write_json(bad_path, bad_link)
-                    destination = root / (label + '-new-link.json')
-                    actions = [lambda: consume.verify_original(framework, bad_receipt, 'apple', {}, work),
-                               lambda: consume.apple_link(framework, bad_receipt, destination, work, cache),
-                               lambda: consume.verify_link(bad_path, artifacts.file_pin(bad_path)['sha256'], work)]
-                    for action in actions:
-                        with self.subTest(mutation=label), self.assertRaises(RuntimeError):
-                            action()
-                    self.assertFalse(destination.exists())
-                # A current two-target declaration cannot conceal legacy native
-                # Intel bytes or an arm64 slice for the wrong Apple platform.
-                original_simulator = binaries[1].read_bytes()
-                arm = fixtures.archive([('native.o', fixtures.mach_object('ios-arm64-simulator'))])
-                intel = fixtures.archive([('native.o', fixtures.mach_object('ios-x86_64-simulator'))])
-                for label, raw in [('legacy-fat', fixtures.fat(intel, arm)),
-                                   ('wrong-platform', binaries[0].read_bytes())]:
-                    binaries[1].write_bytes(raw)
-                    destination = root / (label + '-new-link.json')
-                    for action in [lambda: consume.verify_original(framework, receipt_path, 'apple', {}, work),
-                                   lambda: consume.apple_link(framework, receipt_path, destination, work, cache),
-                                   lambda: consume.verify_link(link_path, sha(link_bytes), work)]:
-                        with self.subTest(native=label), self.assertRaises(RuntimeError):
-                            action()
-                    self.assertFalse(destination.exists())
-                binaries[1].write_bytes(original_simulator)
-                self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
-                self.assertEqual(link_path.read_bytes(), link_bytes)
-                self.assertEqual(consume.verify_link(link_path, sha(link_bytes), work), link)
-
     def test_consumer_and_producer_reinspection_keep_the_original_receipt_identity(self):
         from consume import verify_original
         from producer import verify_receipt
@@ -1591,56 +1328,51 @@ class FormalOutputs(unittest.TestCase):
                 verify_receipt('/component.aar', receipt, self.value, binding, tools, None, Path('/consumer/work'))
 
     def test_source_owned_local_replacement_accepts_only_coherent_declared_literal_or_directory(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            source = root / 'fork'; directory = source / 'third_party/sing-tun'; directory.mkdir(parents=True)
-            name = 'github.com/sagernet/sing-tun'
-            version = 'v0.9.7-0.20261009022811-5c2edb183cc9'
-            graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
-                     {'Path': self.value['goModule'], 'Main': True, 'Dir': str(source)},
-                     {'Path': name, 'Version': version, 'Replace': {'Path': './third_party/sing-tun', 'Dir': str(directory)}}]
-            facts = self.facts(); facts['modules'][self.value['goModule']]['replacement'] = str(source)
-            def check(observed, declared=graph):
-                check_buildinfo(observed, self.value, declared, os_name='android', arch='arm64', mode='c-shared',
-                                expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
-            for alias in ('./third_party/sing-tun', str(directory)):
-                for replacement_version in ('', '(devel)'):
-                    facts['modules'][name] = {'kind': 'dep', 'version': version, 'replacement': alias,
-                                             'replacementVersion': replacement_version}
-                    frozen = deepcopy(facts)
-                    check(facts)
-                    self.assertEqual(facts, frozen, 'native BuildInfo must remain its original observed values')
-            for wrong in ('third_party/sing-tun', '../third_party/sing-tun', './third_party/sing-tun/',
-                          './third_party/../third_party/sing-tun', str(root / 'elsewhere/sing-tun')):
-                facts['modules'][name]['replacement'] = wrong
-                with self.subTest(path=wrong), self.assertRaisesRegex(RuntimeError, 'observed=.*declaredPath=.*declaredDir='):
-                    check(facts)
-            facts['modules'][name]['replacement'] = './third_party/sing-tun'
-            for change in [('version', 'v9.0.0'), ('replacementVersion', 'v0.1.0'),
-                           ('replacementVersion', 'devel'), ('replacementSum', 'h1:undeclared')]:
-                wrong = deepcopy(facts); wrong['modules'][name][change[0]] = change[1]
-                with self.subTest(change=change), self.assertRaises(RuntimeError):
-                    check(wrong)
-            wrong = deepcopy(graph); wrong[-1]['Replace']['Dir'] = str(root / 'outside')
-            with self.assertRaisesRegex(RuntimeError, 'Path/Dir disagree'):
-                check(facts, wrong)
-            for path in ('./../outside', './third_party/../sing-tun', '/absolute', './third_party//sing-tun'):
-                wrong = deepcopy(graph); wrong[-1]['Replace']['Path'] = path
-                with self.subTest(declared=path), self.assertRaises(RuntimeError):
-                    check(facts, wrong)
-            with self.assertRaisesRegex(RuntimeError, 'native module not in actual source graph'):
-                check(facts, graph[:-1])
-            outside = root / 'outside'; outside.mkdir()
-            directory.rmdir(); directory.symlink_to(outside, target_is_directory=True)
-            with self.assertRaisesRegex(RuntimeError, 'escaped verified source root'):
+        source, graph = self.source, self.graph
+        directory = source / 'third_party/sing-tun'
+        name = 'github.com/sagernet/sing-tun'
+        version = self.value['sourcePolicy']['vendors'][name]['version']
+        index = next(i for i, row in enumerate(graph) if row['Path'] == name)
+        facts = self.facts()
+        def check(observed, declared=graph):
+            check_buildinfo(observed, self.value, declared, os_name='android', arch='arm64', mode='c-shared',
+                            expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
+        for alias in ('./third_party/sing-tun', str(directory)):
+            for replacement_version in ('', '(devel)'):
+                facts['modules'][name] = {'kind': 'dep', 'version': version, 'replacement': alias,
+                                         'replacementVersion': replacement_version}
+                frozen = deepcopy(facts)
                 check(facts)
+                self.assertEqual(facts, frozen, 'native BuildInfo must remain its original observed values')
+        for wrong in ('third_party/sing-tun', '../third_party/sing-tun', './third_party/sing-tun/',
+                      './third_party/../third_party/sing-tun', str(source.parent / 'elsewhere/sing-tun')):
+            facts['modules'][name]['replacement'] = wrong
+            with self.subTest(path=wrong), self.assertRaisesRegex(RuntimeError, 'observed=.*declaredPath=.*declaredDir='):
+                check(facts)
+        facts['modules'][name]['replacement'] = './third_party/sing-tun'
+        for change in [('version', 'v9.0.0'), ('replacementVersion', 'v0.1.0'),
+                       ('replacementVersion', 'devel'), ('replacementSum', 'h1:undeclared')]:
+            wrong = deepcopy(facts); wrong['modules'][name][change[0]] = change[1]
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                check(wrong)
+        wrong = deepcopy(graph); wrong[index]['Replace']['Dir'] = str(source / 'outside')
+        with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
+            check(facts, wrong)
+        for path in ('./../outside', './third_party/../sing-tun', '/absolute', './third_party//sing-tun'):
+            wrong = deepcopy(graph); wrong[index]['Replace']['Path'] = path
+            with self.subTest(declared=path), self.assertRaises(RuntimeError):
+                check(facts, wrong)
+        with self.assertRaisesRegex(RuntimeError, 'actual graph replacements differ'):
+            check(facts, graph[:index] + graph[index + 1:])
+        directory.rmdir(); directory.symlink_to(source.parent, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
+            check(facts)
 
     def test_remote_versioned_replacement_retains_exact_path_version_and_h1(self):
         facts = self.facts()
         name = 'example.org/module'
-        graph = [{'Path': name, 'Version': 'v1.2.3',
-                  'Replace': {'Path': 'example.org/replaced', 'Version': 'v1.4.5', 'Sum': 'h1:replaced'}},
-                 {'Path': self.value['goModule'], 'Main': True, 'Dir': '/verified/fork'}]
+        graph = deepcopy(self.graph)
+        graph[0]['Replace'] = {'Path': 'example.org/replaced', 'Version': 'v1.4.5', 'Sum': 'h1:replaced'}
         facts['modules'][name].update(replacement='example.org/replaced', replacementVersion='v1.4.5',
                                       replacementSum='h1:replaced')
         def check(observed):

@@ -22,7 +22,6 @@ def load(name, filename):
 
 native = load('native', 'native-payload-proof.py')
 final = load('final', 'final-package-receipt.py')
-download = load('download', 'desktop-core/validation-download.py')
 ENV = {'POLARIS_NATIVE_PAYLOAD_VALIDATION': '1', 'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
        'GITHUB_REPOSITORY': 'polaris-arch/Polaris', 'GITHUB_SHA': 'c' * 40, 'GITHUB_RUN_ID': '900', 'GITHUB_RUN_ATTEMPT': '1',
        'GITHUB_REF': 'refs/heads/collab/fk02-native-payload-validation-20261010',
@@ -181,15 +180,6 @@ class NativeContract(unittest.TestCase):
             self.assertFalse(evidence['completeFileBytesEqualExpected'])
             self.assertIn('exact carrier-stage',evidence['failure']['message'])
 
-    def test_windows_failure_upload_keeps_exact_evidence_without_new_installation(self):
-        workflow=(ROOT/'.github/workflows/package.yml').read_text(encoding='utf-8')
-        block=workflow.split('- name: Preserve Windows App stage bytes and failure evidence')[1].split('# ── 上传产物')[0]
-        self.assertIn("!cancelled() && inputs.native_validation == true && runner.os == 'Windows'",block)
-        for path in ['native-payload-evidence/app-bytes/**','target/release/polaris.exe',
-                     'target/release/nsis/x64/installer.nsi','dist-win/*.exe','dist-win/*-Portable.zip']:
-            self.assertIn(path,block)
-        self.assertNotIn('run:',block)
-
     def test_nsis_policy_reads_utf8_with_windows_legacy_default_before_native_actions(self):
         raw = (ROOT / 'src-tauri/tauri.conf.json').read_bytes()
         # The actual repository config contains Chinese text that CP1252 rejects.
@@ -266,13 +256,6 @@ class NativeContract(unittest.TestCase):
             observed = native.observe_unsigned_windows(path)
             self.assertEqual(observed, {'status': 'NotSigned', 'signerThumbprint': None})
             self.assertEqual(native.sha(path), before)
-
-    def test_exact_native_ci_contract(self):
-        # This exercises the historical validation context independently of the
-        # repository's current committed temporary-default selection.
-        with tempfile.TemporaryDirectory() as root:
-            for key, system in [('linux', 'Linux'), ('win', 'Windows')]:
-                self.assertEqual(native.ci_context(key, ENV, system, 'AMD64', root=root)['candidate'], 'c' * 40)
 
     def test_context_rejects_each_scope_drift(self):
         with tempfile.TemporaryDirectory() as root:
@@ -383,17 +366,6 @@ class NativeContract(unittest.TestCase):
             with self.assertRaises(ValueError): final.squashfs_offset(path)
             path.write_bytes(b'hsqsdecoy')
             with self.assertRaises(ValueError): final.squashfs_offset(path)
-
-    def test_origin_zip_requires_exact_two_original_members_and_never_overwrites(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); archive = root / 'origin.zip'; destination = root / 'dest'; destination.mkdir()
-            with zipfile.ZipFile(archive, 'w') as z:
-                z.writestr('linux/sing-box', b'core'); z.writestr('linux/sing-box.source-receipt.json', b'original receipt bytes')
-            download.extract_archive(archive, destination, 'linux')
-            self.assertEqual((destination / 'linux/sing-box.source-receipt.json').read_bytes(), b'original receipt bytes')
-            with self.assertRaises(ValueError): download.extract_archive(archive, destination, 'linux')
-            with zipfile.ZipFile(archive, 'a') as z: z.writestr('extra', b'x')
-            with self.assertRaises(ValueError): download.extract_archive(archive, root / 'other', 'linux')
 
 
 if __name__ == '__main__':

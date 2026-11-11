@@ -17,9 +17,6 @@ fn repository_root() -> PathBuf {
         dir.parent().unwrap().parent().unwrap().to_path_buf()
     }
 }
-fn app_manifest_dir() -> PathBuf {
-    repository_root().join("src-tauri")
-}
 pub fn emit() {
     if cfg!(feature = "local-development-selection") {
         emit_local_development();
@@ -41,7 +38,6 @@ pub fn emit() {
         .unwrap();
     }
 
-    embed_validation_core_source();
     embed_selected_core_identity();
     embed_recovery_inventory();
 }
@@ -58,187 +54,60 @@ fn desktop_platform() -> Option<&'static str> {
     }
 }
 
-fn temporary_desktop_default() -> bool {
-    let path = app_manifest_dir().as_path().join("core-manifest.json");
-    println!("cargo:rerun-if-changed={}", path.display());
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).expect("committed core selection is readable"))
-            .expect("committed core selection is JSON");
-    desktop_platform().is_some() && manifest.get("desktopTemporary").is_some()
-}
+const CONTRACT_PATH: &str = "scripts/desktop-core/release-contract.json";
 
-fn upstream_desktop_default() -> bool {
+// The committed selection is the contract path and digest; the build verifies
+// both before any installation identity can be compiled.
+fn formal_desktop_selection() -> bool {
     if desktop_platform().is_none() {
         return false;
     }
     let root = repository_root();
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.join("src-tauri/core-manifest.json")).expect("committed selection"),
-    )
-    .expect("committed selection JSON");
-    let Some(selection) = manifest.get("desktopRelease") else {
-        return false;
-    };
-    assert!(
-        manifest.get("desktopTemporary").is_none(),
-        "exclusive desktop selection required"
-    );
-    let path = selection["contractPath"]
-        .as_str()
-        .expect("formal contract path");
-    assert!(
-        matches!(
-            path,
-            "scripts/desktop-core/release-contract.json"
-                | "scripts/desktop-core/pending-release-contract.json"
-        ),
+    let manifest_path = root.join("src-tauri/core-manifest.json");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(manifest_path).expect("committed selection"))
+            .expect("committed selection JSON");
+    let selection = &manifest["desktopRelease"];
+    assert_eq!(
+        selection["contractPath"].as_str(),
+        Some(CONTRACT_PATH),
         "reviewed formal contract path required"
     );
-    println!("cargo:rerun-if-changed={}", root.join(path).display());
-    let raw = std::fs::read(root.join(path)).expect("formal contract is readable");
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join(CONTRACT_PATH).display()
+    );
+    let raw = std::fs::read(root.join(CONTRACT_PATH)).expect("formal contract is readable");
     assert_eq!(
         selection["contractSha256"].as_str(),
         Some(sha256_hex(&raw).as_str()),
         "formal contract digest differs"
     );
-    let contract: serde_json::Value = serde_json::from_slice(&raw).expect("formal contract JSON");
-    if contract["schema"] != "polaris-upstream-native-release-consumer-v1" {
-        return false;
-    }
-    // Runtime and Windows source identity embed this canonical committed file.
-    assert_eq!(
-        path, "scripts/desktop-core/release-contract.json",
-        "upstream installation must use the compiled canonical contract"
-    );
     true
 }
 
 // Analysis-only builds have no frozen carrier. The explicit sentinel is never a
-// usable installation and must not silently select the historical formal core.
-const TEMPORARY_UNAVAILABLE: &[u8] = br#"{"schema":"polaris-temporary-desktop-unavailable-v1"}"#;
+// usable installation.
 const FORMAL_UNAVAILABLE: &[u8] = br#"{"schema":"polaris-formal-desktop-unavailable-v1"}"#;
 
-fn temporary_installation_pending(temporary_default: bool) -> bool {
-    if !temporary_default
-        || std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_some()
-        || std::env::var_os("POLARIS_CORE_IDENTITY_FILE").is_some()
-    {
+fn installation_pending(formal_default: bool) -> bool {
+    if !formal_default || std::env::var_os("POLARIS_CORE_IDENTITY_FILE").is_some() {
         return false;
     }
-    let directory = app_manifest_dir()
-        .as_path()
-        .parent()
-        .expect("repository root")
+    let path = repository_root()
         .join("resources")
-        .join(desktop_platform().expect("desktop target"));
-    for name in ["core-manifest.json", "candidate-carrier.json"] {
-        let path = directory.join(name);
-        println!("cargo:rerun-if-changed={}", path.display());
-        if std::fs::symlink_metadata(&path).is_ok() {
-            return false;
-        }
-        // Only true absence admits an unavailable analysis image. Permission or
-        // I/O errors, and dangling symlinks above, must enter strict verification.
-        if path
-            .try_exists()
-            .expect("inspect selected installation path")
-        {
-            return false;
-        }
+        .join(desktop_platform().expect("desktop target"))
+        .join("core-manifest.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return false;
     }
-    true
-}
-
-/// Technical candidate source facts are compiled only after the existing strict
-/// consumer verifies the actual payloads and exact manual App/run context. This
-/// is paired with a separately verified installation identity; neither authorizes managed launch.
-fn embed_validation_core_source() {
-    println!("cargo:rerun-if-env-changed=POLARIS_NATIVE_DNS_CANDIDATE");
-    println!("cargo:rerun-if-env-changed=CORE_CANDIDATE");
-    println!("cargo:rerun-if-env-changed=GITHUB_RUN_ID");
-    println!("cargo:rerun-if-env-changed=GITHUB_RUN_ATTEMPT");
-    for key in [
-        "POLARIS_NO_KERNEL_RUN",
-        "POLARIS_BUILD_ID",
-        "CARGO_TARGET_DIR",
-        "GITHUB_ACTIONS",
-        "GITHUB_EVENT_NAME",
-        "GITHUB_REPOSITORY",
-        "GITHUB_REPOSITORY_ID",
-        "GITHUB_REF",
-        "GITHUB_SHA",
-        "GITHUB_WORKFLOW_REF",
-    ] {
-        println!("cargo:rerun-if-env-changed={key}");
-    }
-    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"))
-        .join("validation-core-source.json");
-    let temporary_default = temporary_desktop_default();
-    let mode = std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE");
-    let raw = if temporary_installation_pending(temporary_default) {
-        TEMPORARY_UNAVAILABLE.to_vec()
-    } else if mode.is_none() && !temporary_default {
-        b"null".to_vec()
-    } else {
-        assert!(
-            desktop_platform().is_some(),
-            "desktop candidate on unsupported target"
-        );
-        let candidate = if let Some(mode) = mode {
-            assert_eq!(mode, "1", "explicit native DNS validation mode required");
-            Some(std::env::var("CORE_CANDIDATE").expect("exact candidate App SHA"))
-        } else {
-            None
-        };
-        let root = repository_root();
-        for path in [
-            "scripts/desktop-core/native-dns-candidate.mjs",
-            "scripts/desktop-core/native-dns-candidate.json",
-            "scripts/desktop-core/native-dns-source-binding.json",
-            "resources",
-            "scripts/desktop-core",
-            "scripts/prepare-core-identity.mjs",
-            "scripts/lib/core-identity.mjs",
-        ] {
-            println!("cargo:rerun-if-changed={}", root.join(path).display());
-        }
-        let mut command = std::process::Command::new("node");
-        command
-            .arg(root.join("scripts/desktop-core/native-dns-candidate.mjs"))
-            .arg("source");
-        if let Some(candidate) = &candidate {
-            command.arg(format!("--candidate={candidate}"));
-        }
-        let verified = command
-            .current_dir(&root)
-            .output()
-            .expect("strict candidate source verifier must execute");
-        assert!(
-            verified.status.success(),
-            "candidate source verification failed: {}",
-            String::from_utf8_lossy(&verified.stderr)
-        );
-        let source: serde_json::Value =
-            serde_json::from_slice(&verified.stdout).expect("verified candidate source JSON");
-        if let Some(candidate) = candidate {
-            assert_eq!(source["schema"], "polaris-native-dns-compiled-source-v1");
-            assert_eq!(source["validationOnly"], true);
-            assert_eq!(source["context"]["candidate"], candidate);
-        } else {
-            assert_eq!(source["schema"], "polaris-native-dns-compiled-source-v2");
-            assert_eq!(source["validationOnly"], false);
-            assert_eq!(source["purpose"], "temporary-default");
-            assert_eq!(source["context"]["mode"], "temporary-default");
-            assert_eq!(
-                source["context"]["candidate"],
-                std::env::var("POLARIS_BUILD_ID").expect("exact build identity")
-            );
-        }
-        assert_eq!(source["AppAccepted"], false);
-        assert_eq!(source["publicationEligible"], false);
-        verified.stdout
-    };
-    std::fs::write(output, raw).expect("write compiled validation source identity");
+    // Only true absence admits an unavailable analysis image. Permission or
+    // I/O errors, and dangling symlinks above, must enter strict verification.
+    !path
+        .try_exists()
+        .expect("inspect selected installation path")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -255,25 +124,17 @@ fn embed_selected_core_identity() {
     println!("cargo:rerun-if-env-changed=POLARIS_CORE_IDENTITY_FILE");
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"))
         .join("selected-core-manifest.json");
-    let temporary_default = temporary_desktop_default();
-    let formal_default = upstream_desktop_default();
+    let formal_default = formal_desktop_selection();
     let root = repository_root();
-    if temporary_installation_pending(temporary_default || formal_default) {
-        std::fs::write(
-            output,
-            if formal_default {
-                FORMAL_UNAVAILABLE
-            } else {
-                TEMPORARY_UNAVAILABLE
-            },
-        )
-        .expect("write unavailable installation identity");
+    if installation_pending(formal_default) {
+        std::fs::write(output, FORMAL_UNAVAILABLE)
+            .expect("write unavailable installation identity");
         return;
     }
     let selected_path = std::env::var_os("POLARIS_CORE_IDENTITY_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            (temporary_default || formal_default).then(|| {
+            formal_default.then(|| {
                 root.join("resources")
                     .join(desktop_platform().expect("desktop target"))
                     .join("core-manifest.json")
@@ -286,73 +147,9 @@ fn embed_selected_core_identity() {
             let manifest =
                 polaris_helper_proto::core_manifest::InstalledCoreManifest::parse(&raw, sha256_hex)
                     .expect("selected installation manifest has an exact content identity");
-            let os = std::env::var("CARGO_CFG_TARGET_OS").expect("target OS");
-            let arch = std::env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture");
-            let platform = match (os.as_str(), arch.as_str()) {
-                ("linux", "x86_64") => "linux",
-                ("windows", "x86_64") => "win",
-                ("macos", "x86_64") => "mac-x64",
-                ("macos", "aarch64") => "mac-arm64",
-                _ => panic!("selected desktop identity on unsupported target"),
-            };
-            if !temporary_default && std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_none() {
-                let candidate_fingerprint = sha256_hex(
-                    &std::fs::read(
-                        repository_root().join("scripts/desktop-core/native-dns-candidate.json"),
-                    )
-                    .expect("candidate contract"),
-                );
-                assert_ne!(
-                    manifest.core.provider_fingerprint, candidate_fingerprint,
-                    "candidate installation cannot be compiled as a formal/default identity"
-                );
-            }
-            if temporary_default || std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_some() {
-                let root = repository_root();
-                let manual = std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_some();
-                let directory = root
-                    .join(if manual {
-                        "resources/.native-dns-app"
-                    } else {
-                        "resources"
-                    })
-                    .join(platform);
-                assert_eq!(
-                    manifest.core.provider_fingerprint,
-                    sha256_hex(
-                        &std::fs::read(
-                            repository_root()
-                                .join("scripts/desktop-core/native-dns-candidate.json")
-                        )
-                        .expect("candidate contract")
-                    ),
-                    "selected temporary contract fingerprint differs"
-                );
-                assert_eq!(
-                    path,
-                    directory.join("core-manifest.json"),
-                    "exact candidate identity path required"
-                );
-                let verified = std::process::Command::new("node")
-                    .arg(root.join("scripts/prepare-core-identity.mjs"))
-                    .arg(format!("--platform={platform}"))
-                    .arg(format!("--directory={}", directory.display()))
-                    .arg("--mode=verify")
-                    .current_dir(&root)
-                    .output()
-                    .expect("strict candidate App carrier verifier must execute");
-                assert!(
-                    verified.status.success(),
-                    "candidate App identity verification failed: {}",
-                    String::from_utf8_lossy(&verified.stderr)
-                );
-                assert_eq!(
-                    raw,
-                    std::fs::read(&path).expect("verified identity remains readable"),
-                    "candidate identity changed during verification"
-                );
-            }
-            if formal_default && std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_none() {
+            let platform =
+                desktop_platform().expect("selected desktop identity on unsupported target");
+            if formal_default {
                 let directory = root.join("resources").join(platform);
                 assert_eq!(
                     path,
@@ -396,13 +193,7 @@ fn embed_selected_core_identity() {
         }
         // Library tests/mobile/debug source compilation do not create a desktop
         // installer. Actual installers always supply this frozen input in package.yml.
-        None => {
-            assert!(
-                std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_none(),
-                "candidate App requires a frozen actual helper/core installation identity"
-            );
-            b"null".to_vec()
-        }
+        None => b"null".to_vec(),
     };
     std::fs::write(output, raw).expect("write compiled selected core identity");
 }
@@ -440,8 +231,6 @@ fn emit_local_development() {
         "local provider is Linux-only"
     );
     for key in [
-        "POLARIS_NATIVE_DNS_CANDIDATE",
-        "CORE_CANDIDATE",
         "POLARIS_CORE_IDENTITY_FILE",
         "GITHUB_RUN_ID",
         "GITHUB_RUN_ATTEMPT",
@@ -542,5 +331,4 @@ fn emit_local_development() {
     };
     // The pure Helper compilation never embeds its own future digest.
     std::fs::write(output.join("selected-core-manifest.json"), installation).unwrap();
-    std::fs::write(output.join("validation-core-source.json"), b"null").unwrap();
 }

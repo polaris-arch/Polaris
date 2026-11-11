@@ -266,8 +266,7 @@ rust {
 dependencies {
     // sing-box 内核（libbox，gomobile bind 产物）。形态与上游 sing-box-for-android 一致
     // （其 app/build.gradle.kts:184 也是 `implementation(files("libs/libbox.aar"))`）：
-    // 上游没有为本仓钉的 v1.14.0 tag 发布预编译 aar，故不能像桌面内核那样 fetch，
-    // 由 scripts/build-libbox.sh 现场构建（含 sha256 收据与四个坑的注释）。
+    // 由 scripts/build-mobile-core.sh android 按 scripts/mobile-core/source-contract.json 现场构建。
     // aar 本体 112 MiB，不入库（gitignore 在 app/.gitignore）。
     implementation(files("libs/libbox.aar"))
     // rustls-platform-verifier 的 Kotlin 校验器（见上方 rustlsPlatformVerifierAar 注释）。

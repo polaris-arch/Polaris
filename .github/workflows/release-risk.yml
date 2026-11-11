@@ -16,11 +16,6 @@ on:
         description: 固定源码审计不被后续 tip 取消
         type: boolean
         default: false
-      mode:
-        type: choice
-        options: [ordinary, native-payload]
-        default: ordinary
-        required: true
       apple_include_simulator:
         description: 'ordinary 验证额外编译 sim-arm64 App/PacketTunnel；不能与 defer_apple 同用'
         type: boolean
@@ -72,18 +67,16 @@ jobs:
       apple: ${{ steps.impact.outputs.apple }}
       unregistered: ${{ steps.impact.outputs.unregistered }}
       candidate: ${{ github.event.pull_request.head.sha || github.sha }}
-      native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}
     steps:
       - name: Validate manual Apple simulator scope
         if: github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator
         shell: bash
         env:
-          VALIDATION_MODE: ${{ inputs.mode }}
           APPLE_DEFERRED: ${{ inputs.defer_apple && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          [ "$VALIDATION_MODE" = ordinary ] && [ "$APPLE_DEFERRED" = false ] || {
-            echo '::error::Simulator opt-in requires ordinary validation without Apple deferral'; exit 1; }
+          [ "$APPLE_DEFERRED" = false ] || {
+            echo '::error::Simulator opt-in requires validation without Apple deferral'; exit 1; }
       - name: Validate manual Apple deferral scope
         if: github.event_name == 'workflow_dispatch' && inputs.defer_apple
         shell: bash
@@ -105,19 +98,9 @@ jobs:
         with:
           node-version: '26'
 
-      # tomllib is standard-library only on Python 3.11+; never inherit runner defaults.
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Verify Python and Cargo configuration parser
-        run: |
-          python3 - <<'PYTHON'
-          import sys, tomllib
-          print('Apple evidence Python:', sys.version, sys.executable)
-          print('Cargo configuration parser:', tomllib.__file__)
-          if sys.version_info[:2] != (3, 12) or tomllib.loads('[profile.release]\nopt-level=3')['profile']['release']['opt-level'] != 3:
-              raise SystemExit('Python 3.12 with working standard-library tomllib is required')
-          PYTHON
 
       - name: Install same-source trusted proof validator dependency
         run: python3 -m pip install jsonschema==4.23.0
@@ -133,6 +116,17 @@ jobs:
         # （vault SoT §12.3c）调用的是同一份脚本，两处判据共用一份实现，不各自漂移。
         run: bash scripts/gate-node-test.sh
 
+      - name: Test release script Python contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s scripts/mobile-core -p 'test_*.py'
+          python3 -B scripts/native-payload-proof.test.py
+          python3 -B -X utf8 scripts/windows-package-integrity.test.py
+          python3 -B scripts/desktop-core/test-release-archive.py
+          python3 -B scripts/desktop-core/test-local-development.py
+          python3 -B scripts/desktop-core/test-dmg-selection.py
+
       - name: Classify changed paths
         id: impact
         shell: bash
@@ -146,24 +140,9 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_SHA: ${{ github.sha }}
-          POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.mode == 'native-payload' && '1' || '0' }}
           POLARIS_APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          # Technical payload mode is explicit, branch-only and never publishing.
-          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
-            node --input-type=module -e 'import {validationContext} from "./scripts/desktop-core/validation-origin.mjs"; validationContext(process.env.DISPATCH_SHA)'
-            {
-              echo 'kernel=false'
-              echo 'platforms=[]'
-              echo 'preflight=false'
-              echo 'has_package=false'
-              echo 'android=false'
-              echo 'apple=false'
-              echo 'unregistered='
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           base=''
           head=''
           case "$EVENT_NAME" in
@@ -191,7 +170,7 @@ jobs:
             && git cat-file -e "${base}^{commit}" 2>/dev/null \
             && git cat-file -e "${head}^{commit}" 2>/dev/null; then
             git diff --name-only -z "$base" "$head" | node scripts/classify-ci-impact.mjs > "$result"
-            git diff --name-only -z "$base" "$head" | node scripts/apple-ci-impact.mjs --release-risk > "$apple_result"
+            git diff --name-only -z "$base" "$head" | node scripts/apple-ci-impact.mjs > "$apple_result"
           else
             echo "无法取得可靠 diff，故障关闭为内核门 + 四平台。"
             node scripts/classify-ci-impact.mjs --full > "$result"
@@ -214,49 +193,12 @@ jobs:
             echo "unregistered=$(jq -r '.unregisteredScopes | join(" ")' "$result")"
           } >> "$GITHUB_OUTPUT"
 
-  desktop_core:
-    name: four native source producers
-    needs: classify
-    if: needs.classify.outputs.preflight == 'true' || needs.classify.outputs.native_validation == 'true'
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/desktop-core.yml
-    with:
-      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
-      candidate: ${{ needs.classify.outputs.candidate }}
-      native_validation: ${{ needs.classify.outputs.native_validation == 'true' }}
-
-  native_payload:
-    name: reviewed Linux Windows native final payload
-    needs: [classify, desktop_core]
-    if: needs.classify.outputs.native_validation == 'true'
-    permissions:
-      contents: write # reusable publishing DAG declaration; branch guard keeps it unreachable
-      actions: read # ceiling for nested desktop-core assembler; no new write grant
-    uses: ./.github/workflows/package.yml
-    with:
-      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
-      platforms: '["linux","windows"]'
-      skip_quality_gates: true
-      run_kernel_gates: true
-      upload_artifacts: true
-      light_build: false
-      native_validation: true
-      core_candidate: ${{ needs.classify.outputs.candidate }}
-      core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
-    secrets: inherit
-
   preflight:
     name: static packaging + bundled core gate
-    needs: [classify, desktop_core]
+    needs: classify
     if: needs.classify.outputs.preflight == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 120
-    outputs:
-      core_wire_input_artifact: ${{ steps.wire-inputs.outputs.artifact_name }}
-      core_wire_input_artifact_id: ${{ steps.wire-upload.outputs.artifact-id }}
-      core_wire_input_artifact_digest: ${{ steps.wire-upload.outputs.artifact-digest }}
     steps:
       - name: Set absolute release-consumer job deadline
         shell: bash
@@ -287,18 +229,10 @@ jobs:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
 
-      - name: Download exact candidate core bundle
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ needs.desktop_core.outputs.artifact_name }}
-          path: ${{ runner.temp }}/desktop-core-bundle
-
       - name: Fetch sing-box core
         env:
           POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
-          CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
-          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
-        run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+        run: node scripts/fetch-core.mjs
 
       - name: Fetch packaging resources
         if: needs.classify.outputs.has_package == 'true'
@@ -333,12 +267,7 @@ jobs:
         if: needs.classify.outputs.kernel == 'true'
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: node scripts/desktop-core/wire-input-handoff.mjs wire --bundle-dir="$RUNNER_TEMP/preflight-wire-result.json" --candidate="${{ needs.classify.outputs.candidate }}"
-
-      # release-risk 的真核门只在 Ubuntu 跑：只需 Linux SO；两个 go.mod 依赖仍由脚本交叉校验。
-      - name: Fetch cronet library (Linux)
-        if: needs.classify.outputs.kernel == 'true'
-        run: node scripts/fetch-cronet.mjs --platform=linux
+        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
 
       - name: Run mandatory bundled-core gates
         if: needs.classify.outputs.kernel == 'true'
@@ -347,11 +276,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Metadata inspection only, distinct from the native C API/final-payload proof.
-          # Retain the actual consumed core binding before the first runtime probe.
-          mkdir -p native-payload-evidence
-          node scripts/native-payload-input.mjs linux "$PWD/resources/linux/sing-box" "$PWD/resources/linux/libcronet.so" > native-payload-evidence/runtime-input-linux.json
-          node -e 'const i=JSON.parse(require("node:fs").readFileSync("native-payload-evidence/runtime-input-linux.json")); console.log("WG_RUNTIME_CORE_INPUT="+JSON.stringify({core:i.core,sourceCommit:i.producer?.sourceCommit,sourceTree:i.producer?.sourceTree,scope:"actual metadata binding; no runtime/device acceptance"}))'
           cargo test -p polaris-config-engine \
             --test core_dep_fingerprint \
             --test core_schema_surface \
@@ -362,38 +286,13 @@ jobs:
           cargo test -p polaris-config-engine --test network_profile_runtime
           cargo test -p polaris-config-engine --test subscription_update_guard_runtime
           cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture
-          cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture
           cargo test -p polaris-net-stack --lib singbox_import::tests::local_import_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
 
-      # Carry checked resources within this exact candidate/run/attempt. The
-      # downstream core_wire verifies the exact checked input and successful
-      # wire command/tool binding, without repeating HTTP or the wire test. Other Package entry points remain independent.
-      - name: Prepare current-attempt wire inputs
-        id: wire-inputs
-        if: needs.classify.outputs.has_package == 'true'
-        shell: bash
-        env:
-          CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
-          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
-          WIRE_RESULT_PATH: ${{ needs.classify.outputs.kernel == 'true' && format('{0}/preflight-wire-result.json', runner.temp) || '' }}
-        run: node scripts/desktop-core/wire-input-handoff.mjs create --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --wire-result="$WIRE_RESULT_PATH"
-
-      - name: Upload current-attempt wire inputs
-        id: wire-upload
-        if: steps.wire-inputs.outputs.artifact_name != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.wire-inputs.outputs.artifact_name }}
-          path: ${{ runner.temp }}/core-wire-inputs
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
   package:
     name: package selected platforms
-    needs: [classify, preflight, desktop_core]
+    needs: [classify, preflight]
     if: needs.classify.outputs.has_package == 'true' && needs.preflight.result == 'success'
     # package.yml 内含一个仅 v* tag 才会运行的 publish job。GitHub 会在启动前校验整张复用图，
     # 即使本次 ref 不可能发布，也要求调用 job 提供它声明的 contents: write 权限上限。
@@ -414,10 +313,6 @@ jobs:
       # 风险门因此**不再验** fat LTO 链接本身，那只在 tag / 手动全量的发行构建上暴露。
       light_build: true
       core_candidate: ${{ needs.classify.outputs.candidate }}
-      core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
-      core_wire_input_artifact: ${{ needs.preflight.outputs.core_wire_input_artifact }}
-      core_wire_input_artifact_id: ${{ needs.preflight.outputs.core_wire_input_artifact_id }}
-      core_wire_input_artifact_digest: ${{ needs.preflight.outputs.core_wire_input_artifact_digest }}
     secrets: inherit
 
   # ══ Android release-profile 产物腿 ══
@@ -451,26 +346,20 @@ jobs:
     if: needs.classify.outputs.apple == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.defer_apple)
     permissions:
       contents: read
-      actions: read # Only Apple resolver/sealer jobs consume Actions metadata and original artifacts.
     uses: ./.github/workflows/apple.yml
     with:
-      allow_merge_reuse: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify.outputs.native_validation != 'true' }}
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       candidate: ${{ needs.classify.outputs.candidate }}
       include_simulator: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator }}
 
   gate:
     name: release risk gate
-    needs: [classify, desktop_core, preflight, package, android, apple, native_payload, pc_runtime_release_policy]
+    needs: [classify, preflight, package, android, apple, pc_runtime_release_policy]
     if: always()
     runs-on: ubuntu-22.04
     env:
       CLASSIFY_RESULT: ${{ needs.classify.result }}
-      NATIVE_VALIDATION_REQUIRED: ${{ needs.classify.outputs.native_validation }}
-      NATIVE_VALIDATION_RESULT: ${{ needs.native_payload.result }}
       PC_RUNTIME_POLICY_RESULT: ${{ needs.pc_runtime_release_policy.result }}
-      DESKTOP_CORE_REQUIRED: ${{ needs.classify.outputs.preflight }}
-      DESKTOP_CORE_RESULT: ${{ needs.desktop_core.result }}
       PREFLIGHT_REQUIRED: ${{ needs.classify.outputs.preflight }}
       PREFLIGHT_RESULT: ${{ needs.preflight.result }}
       PACKAGE_REQUIRED: ${{ needs.classify.outputs.has_package }}
@@ -479,7 +368,6 @@ jobs:
       ANDROID_RESULT: ${{ needs.android.result }}
       APPLE_REQUIRED: ${{ needs.classify.outputs.apple }}
       APPLE_RESULT: ${{ needs.apple.result }}
-      APPLE_EVIDENCE_MODE: ${{ needs.apple.outputs.evidence_mode }}
       APPLE_DEFERRED: ${{ github.event_name == 'workflow_dispatch' && inputs.defer_apple && 'true' || 'false' }}
       APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
@@ -496,10 +384,6 @@ jobs:
             echo "::error::影响分类失败：$CLASSIFY_RESULT"; exit 1; }
           [ "$PC_RUNTIME_POLICY_RESULT" = success ] || {
             echo "::error::PC runtime 发布阻断策略未通过：$PC_RUNTIME_POLICY_RESULT"; exit 1; }
-          if [ "$NATIVE_VALIDATION_REQUIRED" = true ]; then
-            [ "$DESKTOP_CORE_RESULT" = success ] && [ "$NATIVE_VALIDATION_RESULT" = success ] || {
-              echo '::error::native source/actual final payload proof did not pass'; exit 1; }
-          fi
           # 未登记的影响面（落在 crates/ 或 src-tauri/ 内、两张登记表都查不到的 scope）当场红并点名。
           # 为什么这条门开在这里，而不是只靠 ui.yml 的 vitest 完备性门：
           #   1) 独立性 —— ui.yml 挂了、被 skip、或 required check 集合被改，那条门就没牙；
@@ -509,10 +393,6 @@ jobs:
           #      这里把它升级成「当场红 + 点名 scope」，让补登记成为合入的前置条件。
           [ -z "$UNREGISTERED" ] || {
             echo "::error::未登记的影响面 scope：$UNREGISTERED"; exit 1; }
-          if [ "$DESKTOP_CORE_REQUIRED" = true ] && [ "$DESKTOP_CORE_RESULT" != success ]; then
-            echo "::error::四平台内核源码产物未通过：$DESKTOP_CORE_RESULT"
-            exit 1
-          fi
           if [ "$PREFLIGHT_REQUIRED" = true ] && [ "$PREFLIGHT_RESULT" != success ]; then
             echo "::error::发布预检未通过：$PREFLIGHT_RESULT"
             exit 1
@@ -536,20 +416,11 @@ jobs:
             exit 1
           fi
           if [ "$APPLE_REQUIRED" = true ]; then
-            case "${APPLE_EVIDENCE_MODE:-}" in
-              reused)
-                [ "${APPLE_INCLUDE_SIMULATOR:-false}" = false ] || {
-                  echo '::error::Simulator validation cannot reuse device-only Apple evidence'; exit 1; }
-                printf '%s\n' 'Apple device-arm64: reused verified same-tree PR unsigned App + PacketTunnel compile/link evidence; no new compilation in this run.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ;;
-              rebuilt)
-                printf '%s\n' 'Apple device-arm64: unsigned App + PacketTunnel compile/link rebuilt and passed in this run.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ;;
-              *) echo '::error::Apple success lacks a verified evidence mode'; exit 1 ;;
-            esac
             if [ "${APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then
               printf '%s\n' 'Apple sim-arm64: unsigned App + PacketTunnel compile/link passed (requested).' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
             else
               printf '%s\n' 'Apple sim-arm64: not requested.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
             fi
           fi
-          echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT apple=$APPLE_RESULT"
+          echo "发布风险门通过：preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT apple=$APPLE_RESULT"
 

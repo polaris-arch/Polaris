@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PendingApplyResult } from '@/contracts/types';
-import { runtimeHostPollDisposition, runtimeNativePollDisposition, startRuntimeExecutionPolling, runtimeApplyPollDisposition, startRuntimeApplyPolling, RUNTIME_APPLY_POLL_INTERVAL_MS } from './runtime-apply-polling';
+import { runtimeHostPollDisposition, runtimeNativePollDisposition, startRuntimeExecutionPolling, runtimeApplyPollDisposition, RUNTIME_APPLY_POLL_INTERVAL_MS } from './runtime-apply-polling';
 
 afterEach(() => vi.useRealTimers());
 const receipt = (status: PendingApplyResult['status'], transactionId = 'original'): PendingApplyResult => ({ok:true,status,transactionId});
@@ -11,7 +11,7 @@ describe('transaction-bound status-only polling', () => {
     const read = vi.fn().mockResolvedValue(receipt(status));
     const accept = vi.fn((result: PendingApplyResult) =>
       runtimeApplyPollDisposition(result, 'original', 7, 9) === 'failure');
-    startRuntimeApplyPolling({ transactionId: 'original', read, current: () => true, accept });
+    startRuntimeExecutionPolling({ execution: { kind: 'core', transactionId: 'original' }, read, current: () => true, accept });
     await vi.advanceTimersByTimeAsync(RUNTIME_APPLY_POLL_INTERVAL_MS * 3);
     expect(read).toHaveBeenCalledTimes(1);
     expect(accept).toHaveReturnedWith(true);
@@ -31,10 +31,10 @@ describe('transaction-bound status-only polling', () => {
       .mockResolvedValueOnce(receipt('unconfirmed'))
       .mockResolvedValueOnce(receipt('hotApplied'));
     const accept = vi.fn((result: PendingApplyResult) => result.status === 'hotApplied');
-    const cancel = startRuntimeApplyPolling({transactionId:'original',read,current:()=>true,accept});
+    const cancel = startRuntimeExecutionPolling({execution:{kind:'core',transactionId:'original'},read,current:()=>true,accept});
     await vi.advanceTimersByTimeAsync(RUNTIME_APPLY_POLL_INTERVAL_MS * 5);
     expect(read).toHaveBeenCalledTimes(4);
-    expect(read.mock.calls.every(([id]) => id === 'original')).toBe(true);
+    expect(read.mock.calls.every(([execution]) => execution.kind === 'core' && execution.transactionId === 'original')).toBe(true);
     expect(accept.mock.calls.map(([result]) => result.status)).toEqual(['unconfirmed','hotApplied']);
     cancel();
   });
@@ -45,10 +45,10 @@ describe('transaction-bound status-only polling', () => {
         runtimeGeneration: 7, selectionIntentGeneration: 9 })
       .mockResolvedValueOnce(receipt('hotApplied'));
     const accept = vi.fn(() => true);
-    const cancel = startRuntimeApplyPolling({ transactionId: 'original', read, current: () => true, accept });
+    const cancel = startRuntimeExecutionPolling({ execution: { kind: 'core', transactionId: 'original' }, read, current: () => true, accept });
     await vi.advanceTimersByTimeAsync(RUNTIME_APPLY_POLL_INTERVAL_MS * 4);
     expect(read).toHaveBeenCalledTimes(3);
-    expect(read.mock.calls.every(([id]) => id === 'original')).toBe(true);
+    expect(read.mock.calls.every(([execution]) => execution.kind === 'core' && execution.transactionId === 'original')).toBe(true);
     expect(accept).toHaveBeenCalledExactlyOnceWith(receipt('hotApplied'));
     cancel();
   });
@@ -57,7 +57,7 @@ describe('transaction-bound status-only polling', () => {
     let release!: (result: PendingApplyResult) => void;
     const read = vi.fn(() => new Promise<PendingApplyResult>(resolve => {release=resolve;}));
     const accept = vi.fn(() => true);
-    const cancel = startRuntimeApplyPolling({transactionId:'original',read,current:()=>true,accept});
+    const cancel = startRuntimeExecutionPolling({execution:{kind:'core',transactionId:'original'},read,current:()=>true,accept});
     await vi.advanceTimersByTimeAsync(RUNTIME_APPLY_POLL_INTERVAL_MS * 10);
     expect(read).toHaveBeenCalledTimes(1);
     cancel(); release(receipt('hotApplied'));
@@ -71,7 +71,7 @@ describe('transaction-bound status-only polling', () => {
     let release!: (result: PendingApplyResult) => void;
     const read = vi.fn(() => new Promise<PendingApplyResult>(resolve => {release=resolve;}));
     const accept = vi.fn(() => true);
-    const cancel = startRuntimeApplyPolling({transactionId:'original',read,current:()=>valid,accept});
+    const cancel = startRuntimeExecutionPolling({execution:{kind:'core',transactionId:'original'},read,current:()=>valid,accept});
     await vi.advanceTimersByTimeAsync(RUNTIME_APPLY_POLL_INTERVAL_MS);
     valid = false; release(receipt('hotApplied'));
     await vi.advanceTimersByTimeAsync(RUNTIME_APPLY_POLL_INTERVAL_MS * 2);

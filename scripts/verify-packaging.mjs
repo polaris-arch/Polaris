@@ -15,7 +15,7 @@
  *         每个 conf 都被 workflow 显式引用（改名即红）/
  *         **per-platform conf 不得含未登记条目**（不变量 E，反向；见下）/
  *         **许可文本的整条分发链**（LICENSE / NOTICE / THIRD-PARTY-LICENSES.md 各恰 1 条、
- *         NOTICE 的 sing-box 版本与 core-manifest 对拍、便携 zip 那条腿也带上；见
+ *         NOTICE 内核段落与发布合同生成结果一致、便携 zip 那条腿也带上；见
  *         [`checkLicenseArtifacts`]）。
  *
  *   node scripts/verify-packaging.mjs payload --label <label> --root <bundle 根>
@@ -78,11 +78,9 @@ import { verifyCronetPayload } from './lib/cronet-payload.mjs';
 import { nsisCoreSweepViolations, nativeSweepViolations } from './lib/nsis-core-sweep.mjs';
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
-import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
-import { verifyPackagedSource } from './desktop-core/bundle.mjs';
 import { verifySelectedCoreManifest } from './lib/core-identity.mjs';
-import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers, validateReleaseNotice } from './desktop-core/release-consumer.mjs';
-import { hasTemporaryDesktop, loadTemporaryDesktopSelection, loadCandidate, verifiedCandidateSource, verifyCandidateAppCarrier, validateTemporaryDesktopNotice } from './desktop-core/native-dns-candidate.mjs';
+import { loadReleaseContract, releasePayloadMembers, verifyPackagedCore } from './desktop-core/release-consumer.mjs';
+import { generated } from './desktop-core/import-release.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = join(ROOT, 'src-tauri');
@@ -91,7 +89,7 @@ const WORKFLOW = join(WORKFLOWS_DIR, 'package.yml');
 
 /**
  * label（CI matrix）→ 平台内核目录名（resources/ 下的目录 = core-manifest 的 key）。
- * 单一真值：平台集合本身取自 core-manifest.json 的 coreArchiveSha256 键，
+ * 单一真值：平台集合本身取自发布合同 release-contract.json 的 platforms 键，
  * 新增平台却忘了配 conf ⇒ confs 模式转红。
  */
 const LABEL_TO_CORE = {
@@ -422,11 +420,9 @@ function checkConfs() {
     join(SRC_TAURI, 'core-manifest.json'),
     '平台集合无真值来源 ⇒ conf 模式的全部不变量（A/B/C/D）都无从断言'
   );
-  const platforms = Object.keys(manifest.coreArchiveSha256 ?? {});
-  if (platforms.length === 0) {
-    fail('core-manifest.json: coreArchiveSha256 为空 —— 平台集合无真值来源');
-    return;
-  }
+  let platforms;
+  try { platforms = Object.keys(loadReleaseContract(ROOT, manifest).platforms); }
+  catch (error) { fail(`core-manifest.json: 发布合同无法载入 —— 平台集合无真值来源：${error.message}`); return; }
 
   // 平台集合 ↔ conf 映射必须一一对应（新增平台忘了配 conf / conf 多余，都转红）。
   for (const p of platforms) {
@@ -436,7 +432,7 @@ function checkConfs() {
   }
   for (const p of Object.keys(CORE_TO_CONF)) {
     if (!platforms.includes(p)) {
-      fail(`CORE_TO_CONF 登记了 '${p}'，但 core-manifest.coreArchiveSha256 里没有该平台`);
+      fail(`CORE_TO_CONF 登记了 '${p}'，但发布合同 platforms 里没有该平台`);
     }
   }
 
@@ -568,7 +564,7 @@ function checkConfs() {
     // 不变量 B 已明确「同平台多条 / 文件粒度条目」是合法的（`coreDirOf` 认前缀），这里必须同口径，
     // 否则本条会把 B 认可的合法形态判红。恢复目录只允许唯一完整 subtree，
     // 不把内核文件粒度规则泛化到恢复前缀；正式来源不得遗漏/重复恢复映射。
-    checkPlatformResourceEntries(confName, res, baseResources, p, platforms, hasDesktopRelease(manifest));
+    checkPlatformResourceEntries(confName, res, baseResources, p, platforms, true);
 
     // 不变量 C：引用的目录必须真实存在（conf 写对了但目录没 fetch 也要红）。
     for (const entry of res) {
@@ -980,83 +976,9 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   }
   if (!texts.NOTICE || !texts.LICENSE) return;
 
-  // ── ③ 版本一致性：NOTICE 里写死的 sing-box 版本 == core-manifest 的 bundledCoreVersion。
-  //
-  // 判据由代码持有：手写在法律声明里的版本号一定会漂（换核只改 core-manifest，没人记得回头改 NOTICE），
-  // 漂了的后果是 NOTICE 指向的对应源码 tag 与包里那份二进制**不是同一份**，即 GPLv3 §6 的指引失效。
-  // 反过来「只留个 JSON 指针」也不行 —— 法律声明不该让读者去翻另一个文件。故两处都要，且必须对拍。
-  //
-  // 取材面是 NOTICE 全文（纯文本，无注释/字符串层需要剥）。两条正则各自**至少命中一次**是正面断言：
-  // 只写「不许出现别的版本号」会被「把版本号整段删掉」骗过（删了就一处都不命中，仍是零违反）。
-  if (hasTemporaryDesktop(manifest)) {
-    try { validateTemporaryDesktopNotice(texts.NOTICE, ROOT); }
-    catch (error) { fail(error.message); }
-  } else if (hasDesktopRelease(manifest)) {
-    try {
-      const contract = loadReleaseContract(ROOT, manifest);
-      const android = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
-      const apple = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
-      verifyHash(android, manifest.sourceBuild.sourceManifestSha256);
-      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
-        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
-      validateReleaseNotice(texts.NOTICE, manifest, contract, { android: identity(android), apple: identity(apple) });
-    } catch (error) { fail(error.message); }
-  } else if (hasDesktopSource(manifest)) {
-    try {
-      const spec = validateSourcePins(manifest, 'linux', false);
-      const path = join(ROOT, desktopSourceManifestPath(spec));
-      verifyHash(path, spec.sourceManifestSha256);
-      const source = readJson(path);
-      const androidPath = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
-      const applePath = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
-      verifyHash(androidPath, manifest.sourceBuild.sourceManifestSha256);
-      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
-        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
-      validateForkNotice(texts.NOTICE, manifest, source,
-        { android: identity(androidPath), apple: identity(applePath) });
-    } catch (error) { fail(error.message); }
-  } else {
-    const version = String(manifest.bundledCoreVersion ?? '');
-    const sourceVersion = frozenSourceVersion(manifest);
-    if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
-        || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
-        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
-      fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
-    }
-    if (manifest.windowsBuild) {
-      const build = manifest.windowsBuild;
-      if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
-          || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
-          || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
-        fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
-      }
-    }
-    if (!/^\d[\w.\-+]*$/.test(version)) {
-      fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
-      return;
-    }
-    const proseVersions = [...texts.NOTICE.matchAll(/sing-box\s+v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-    const tagVersions = [...texts.NOTICE.matchAll(/https:\/\/github\.com\/SagerNet\/sing-box\/tree\/v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-    if (proseVersions.length === 0) {
-      fail(`NOTICE: 找不到形如 \`sing-box v<版本>\` 的版本提法 —— 随包内核版本必须在 NOTICE 正文里显式出现（应为 v${version}）`);
-    }
-    if (tagVersions.length === 0) {
-      fail(
-        `NOTICE: 找不到 \`https://github.com/SagerNet/sing-box/tree/v<版本>\` 形态的源码 tag 链接 —— ` +
-          `GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，缺了这条链接指引就不成立（应为 v${version}）`
-      );
-    }
-    for (const [where, list] of [['正文版本提法', proseVersions], ['源码 tag 链接', tagVersions]]) {
-      for (const v of list) {
-        if (v !== version) {
-          fail(
-            `NOTICE 的${where}写的是 v${v}，core-manifest.json 的 bundledCoreVersion 是 ${version} —— ` +
-              `声明指向的对应源码与包里那份二进制不是同一版，GPLv3 §6 的源码指引随之失效`
-          );
-        }
-      }
-    }
-
+  // ── ③ NOTICE 的内核段落由 import-release.mjs 从发布合同生成；手改或换核未重生成即漂。
+  if (texts.NOTICE !== generated(ROOT).NOTICE) {
+    fail('NOTICE: 内核段落与发布合同不一致 —— 用 node scripts/desktop-core/import-release.mjs 重新生成');
   }
 
   // ── ④ 版权行单一真值：NOTICE 的版权行必须与 LICENSE 里那行逐字一致（同 checkMacOpenGuide 的口径）。
@@ -1108,7 +1030,7 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   if (errors.length === errorsBefore) {
     note(
       `许可文本分发链：${LICENSE_BASENAMES.join(' / ')} 在 base + ${platforms.length} 份平台 conf 里各恰 1 条；` +
-        `NOTICE 的 sing-box 版本与 tag 链接 = core-manifest v${manifest.bundledCoreVersion}，版权行与 LICENSE 逐字一致，` +
+        `NOTICE 内核段落 = 发布合同生成结果，版权行与 LICENSE 逐字一致，` +
         `mere-aggregation 作为**未经检验的立场**并附 GNU FAQ 出处；Windows 普通 assemble 已接完整 source-map 与实际ZIP全集/SHA/size门` +
         `${workflow === null ? '（⚠️ workflow 读不到，便携腿这一半未验）' : ''}`
     );
@@ -1987,10 +1909,8 @@ function checkPayload(label, root) {
   // 但**不把 `_up_` 写死进判据**：各平台 bundler 的中间 staging 目录布局未逐一实证过，写死会在
   // 布局不同的平台上假红。判据放宽为「路径里出现 `/resources/<manifest 里的平台名>/` 的 sing-box」——
   // 源码树的 resources/ 不在 bundle/ 下，不会被误判。日志里回打实际布局，布局变了肉眼可见。
-  const platforms = Object.keys(
-    readJson(join(SRC_TAURI, 'core-manifest.json'), '平台目录集合无真值来源 ⇒ payload 模式无从判定产物里的内核属于哪个平台')
-      .coreArchiveSha256 ?? {}
-  );
+  const platforms = Object.keys(loadReleaseContract(ROOT,
+    readJson(join(SRC_TAURI, 'core-manifest.json'), '平台目录集合无真值来源 ⇒ payload 模式无从判定产物里的内核属于哪个平台')).platforms);
   const srcDir = join(ROOT, 'resources', expected);
   if (!existsSync(srcDir)) {
     // 前置缺失一律判红。此前体积断言被 `existsSync(src)` 包着 ⇒ 源不在就静默跳过，
@@ -2066,22 +1986,12 @@ function checkPayload(label, root) {
       // 必须独立比 SHA/权限，不能用相同体积或 Build ID 豁免替代内容身份。
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
-        const coreManifest = family.what === 'sing-box' ? readJson(join(SRC_TAURI, 'core-manifest.json')) : undefined;
-        if (coreManifest && (hasTemporaryDesktop(coreManifest) || Object.hasOwn(coreManifest, 'desktopRelease') || hasDesktopSource(coreManifest) || frozenSourceVersion(coreManifest))) {
-          try { verifyPackagedSource(ROOT, coreManifest, expected, p); }
-          catch (error) { fail(`${scope.name}: frozen source artifact/receipt mismatch: ${error.message}`); }
-        } else if (label === 'windows' && family.what === 'sing-box') {
-          const build = readJson(join(SRC_TAURI, 'core-manifest.json')).windowsBuild;
-          if (build && createHash('sha256').update(readFileSync(p)).digest('hex') !== build.binarySha256) {
-            fail(`${scope.name}: Windows 修复核 SHA-256 与 manifest 不符：${p}`);
-          }
+        if (family.what === 'sing-box') {
+          try { verifyPackagedCore(ROOT, readJson(join(SRC_TAURI, 'core-manifest.json')), expected, p); }
+          catch (error) { fail(`${scope.name}: release artifact/receipt mismatch: ${error.message}`); }
         }
         if (family.what === 'polaris-helper') {
-          try {
-            verifySelectedCoreManifest(dirname(p), srcDir, expected);
-            if (hasTemporaryDesktop(readJson(join(SRC_TAURI, 'core-manifest.json'))))
-              verifyCandidateAppCarrier(dirname(p), verifiedCandidateSource(ROOT), expected);
-          }
+          try { verifySelectedCoreManifest(dirname(p), srcDir, expected); }
           catch (error) { fail(`${scope.name}: compiled installation payload differs: ${error.message}`); }
         }
         const src = join(srcDir, basename(p));
@@ -2093,7 +2003,7 @@ function checkPayload(label, root) {
           try {
             const name = expected === 'linux' ? 'libcronet.so' : 'libcronet.dll';
             if (basename(p) !== name) throw new Error(`wrong Cronet filename for ${expected}: ${basename(p)}`);
-            verifyCronetPayload(src, p, expected, readJson(join(SRC_TAURI, 'core-manifest.json')));
+            verifyCronetPayload(src, p, expected, loadReleaseContract(ROOT, readJson(join(SRC_TAURI, 'core-manifest.json'))));
           } catch (error) {
             fail(`${scope.name}: Cronet source/final content or static ABI mismatch: ${error.message}`);
           }
@@ -2880,7 +2790,7 @@ function expectedSrsCount() {
  * 发布合同的 core-release 成员是已下载的精确输入，--static 同样逐项要求一份。
  * 它挡的是白名单门的经典假绿：**空目录也满足「没有多余文件」**。
  */
-function payloadAllowRules(label, coreDir, srsCount, releaseContract, temporary = false) {
+function payloadAllowRules(label, coreDir, srsCount, releaseContract) {
   const core = reQuote(coreDir);
   const rules = [
     {
@@ -3002,13 +2912,7 @@ function payloadAllowRules(label, coreDir, srsCount, releaseContract, temporary 
       why: 'Naive/H3 出站的 Cronet 动态库，核在 initialize 阶段就要它、且必须与核同目录；缺了那两类节点直接起不来。',
     });
   }
-  if (temporary) rules.push({
-    id: 'temporary-app-carrier',
-    re: new RegExp(`^_up_/resources/${core}/candidate-carrier\\.json$`),
-    min: 1, max: 1,
-    why: 'Committed temporary default carrier receipt: exact source/App/run and actual helper/cleaner bytes, verified with the compiled core manifest before and after packaging.',
-  });
-  if (releaseContract && !temporary) {
+  if (releaseContract) {
     const recovery = `_up_/resources/core-recovery/${coreDir}/`;
     for (const [id, name, why] of [
       ['core-recovery-archive', releaseContract.platforms[coreDir].archive.name,
@@ -3022,13 +2926,8 @@ function payloadAllowRules(label, coreDir, srsCount, releaseContract, temporary 
     });
   }
   // Legal/source/provenance bytes retain their original reviewed archive paths.
-  // Temporary archives use direct members; historical releases keep core-release/.
-  // Neither branch grants a directory-wide exemption for arbitrary files.
-  const row = temporary ? releaseContract.platforms[coreDir] : undefined;
-  const members = temporary ? Object.keys(row.archive.members).sort()
-    .map((name) => name.slice(row.archive.root.length + 1))
-    .filter((name) => name !== row.core.member && name !== row.sidecar?.member)
-    : releaseContract ? releasePayloadMembers(releaseContract, coreDir) : [];
+  // No directory-wide exemption for arbitrary files.
+  const members = releaseContract ? releasePayloadMembers(releaseContract, coreDir) : [];
   for (const member of members) rules.push({
     id: `release-member:${member}`, re: new RegExp(`^${reQuote(`_up_/resources/${coreDir}/${member}`)}$`),
     min: 1, max: 1, releaseMember: true,
@@ -3086,11 +2985,8 @@ function checkInventory(label, { root, isStatic }) {
   }
   const srs = expectedSrsCount(); // 读不出来会抛 InputError → 顶层转成一条可读的违反，不静默
   const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'), '包内容清单缺少内核 manifest');
-  const temporary = hasTemporaryDesktop(manifest);
-  if (temporary) loadTemporaryDesktopSelection(ROOT, manifest);
-  const releaseContract = temporary ? loadCandidate(ROOT)
-    : hasDesktopRelease(manifest) ? loadReleaseContract(ROOT, manifest) : undefined;
-  const rules = payloadAllowRules(label, coreDir, srs.count, releaseContract, temporary);
+  const releaseContract = loadReleaseContract(ROOT, manifest);
+  const rules = payloadAllowRules(label, coreDir, srs.count, releaseContract);
 
   /** @type {{rel:string, abs:string, from?:string}[]} */
   let items = [];
@@ -3300,20 +3196,8 @@ try {
 
 function runMode() {
   const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'));
-  if (hasTemporaryDesktop(manifest)) {
-    try { loadTemporaryDesktopSelection(ROOT, manifest); }
-    catch (error) { fail(`Temporary desktop admission failed: ${error.message}`); return; }
-  } else if (hasDesktopRelease(manifest)) {
-    try { loadReleaseContract(ROOT, manifest); }
-    catch (error) { fail(`Desktop release admission failed: ${error.message}`); return; }
-  } else if (hasDesktopSource(manifest)) {
-    try {
-      for (const key of Object.keys(CORE_TO_CONF)) validateSourcePins(manifest, key, false);
-    } catch (error) {
-      fail(`Desktop source admission failed: ${error.message}`);
-      return; // Never enter a legacy/bytes-only branch after invalid D admission.
-    }
-  }
+  try { loadReleaseContract(ROOT, manifest); }
+  catch (error) { fail(`Desktop release admission failed: ${error.message}`); return; }
 switch (mode) {
   case 'confs':
     checkConfs();

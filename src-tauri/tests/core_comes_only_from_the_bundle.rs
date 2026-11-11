@@ -9,16 +9,14 @@
 //! 填一个内核路径」。前两类已整体删除，第三类从未存在。本门钉住这两件事不被悄悄加回来：
 //!
 //! 1. [`removed_core_replacement_surface_stays_removed`]：已删除入口的标识不得重新出现在
-//!    生产源码里（Rust 与前端）。名字清单只挡「原样加回来」，挡不住换个名字重做，故另有三条
+//!    生产源码里（Rust 与前端）。名字清单只挡「原样加回来」，挡不住换个名字重做，故另有两条
 //!    结构判据：
 //! 2. [`release_core_resolution_has_exactly_one_leg`]：release 构型下 `resolve_core_binary`
 //!    的函数体就是「调随包解析」这一句，没有第二条腿；
 //! 3. [`core_path_has_one_source`]：应用 crate 里能拿到内核路径的地方是一张登记表 ——
 //!    `resolve_core_binary` 的每个引用点、以及内核文件名（定位一个内核文件绕不开它）的每个
 //!    出现点，都逐文件登记；新出现一处即红；
-//! 4. [`legacy_cleanup_runs_once_before_any_core_start`]：旧版本内核残留的清理在启动序列里
-//!    的位置；
-//! 5. [`no_setting_points_at_a_core_binary`]：用户配置的键集里不得出现指向内核文件 / 目录的键。
+//! 4. [`no_setting_points_at_a_core_binary`]：用户配置的键集里不得出现指向内核文件 / 目录的键。
 //!
 //! 环境变量那条入口由 `release_escape_hatches.rs` 的 `core_path_env_override_is_dev_only` 守。
 //!
@@ -703,68 +701,5 @@ fn core_path_has_one_source() {
         "\n内核路径来源的出现点与登记表不一致（左：源码实测；右：登记）。\n\
          新增出现点：先确认它拿到的是 `resolve_core_binary` 给的随包核路径，再登记用途；\n\
          任意外部路径、上传或在线换核来源不许登记。"
-    );
-}
-
-/// 🔴 旧版本内核残留的清理：整个 crate 只调一次，且在启动序列的固定位置。
-///
-/// 顺序（同一个 `run()` 里，自上而下）：单实例插件注册 → `setup` → 配置根注入 → **清理** →
-/// 运行时构造 → 随包核路径注入 → 启动期任务。
-///
-/// - 在单实例守卫之后：守卫是 builder 上的插件，Tauri 在 `Builder::build` 里初始化全部插件，
-///   之后才在事件循环 Ready 时跑 `setup`；第二个实例在插件初始化阶段就把参数交给首实例并退出，
-///   走不到清理。否则第二个实例会删掉首实例正在向提权助手递送的暂存目录。
-/// - 在运行时构造与任何起核之前：递送暂存目录在起核路径上重建，清理必须先于它。
-///
-/// **变异探针**：把清理挪到 `AppRuntime::new` 之后，或挪进一个 `spawn` 出去的任务里（那就不在
-/// `setup` 的同步序列上了）⇒ 红；在别处再调一次 ⇒ 红。
-#[test]
-fn legacy_cleanup_runs_once_before_any_core_start() {
-    let files = app_crate_code();
-    let calls: Vec<(&str, usize)> = files
-        .iter()
-        .filter(|(rel, _)| rel != "runtime/core_paths.rs")
-        .map(|(rel, text)| {
-            (
-                rel.as_str(),
-                text.matches("remove_legacy_core_state(").count(),
-            )
-        })
-        .filter(|(_, hits)| *hits > 0)
-        .collect();
-    assert_eq!(calls, [("lib.rs", 1)], "清理的调用点应只有启动序列里那一处");
-
-    let lib = &files.iter().find(|(rel, _)| rel == "lib.rs").unwrap().1;
-    let position = |needle: &str| -> usize {
-        assert_eq!(
-            lib.matches(needle).count(),
-            1,
-            "`{needle}` 在 lib.rs 里应恰好出现一次 —— 顺序判据的锚点失准"
-        );
-        lib.find(needle).unwrap()
-    };
-    let sequence = [
-        "tauri_plugin_single_instance::init(",
-        ".setup(move |app|",
-        "core_paths::init_base_dir(",
-        "core_paths::remove_legacy_core_state(",
-        "AppRuntime::new(",
-        "runtime::core_identity::acquire(",
-        "startup_tasks::spawn(",
-    ];
-    let positions: Vec<usize> = sequence.iter().map(|needle| position(needle)).collect();
-    for (pair, names) in positions.windows(2).zip(sequence.windows(2)) {
-        assert!(
-            pair[0] < pair[1],
-            "启动序列里 `{}` 必须先于 `{}`",
-            names[0],
-            names[1]
-        );
-    }
-    // 清理是 `setup` 同步序列上的一条语句，不在任何 spawn 出去的任务里。
-    let between = &lib[positions[2]..positions[3]];
-    assert!(
-        !between.contains("spawn("),
-        "配置根注入与清理之间出现了 spawn —— 清理可能被挪进了异步任务"
     );
 }

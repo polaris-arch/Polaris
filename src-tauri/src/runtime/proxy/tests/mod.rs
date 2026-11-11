@@ -1,6 +1,4 @@
 pub(crate) mod real_core_cleanup;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod runtime_config_real_core;
 use real_core_cleanup::RealCoreCleanupGuard;
 
 use super::core_log::*;
@@ -738,13 +736,6 @@ fn candidate_real_core_selection_rejects_wrong_mode_and_any_override() {
 }
 
 fn committed_real_core_default(manifest: &Value, contract_bytes: &str) -> bool {
-    if manifest.get("desktopTemporary").is_some() {
-        assert!(
-            manifest.get("desktopRelease").is_none(),
-            "exclusive desktop selection required"
-        );
-        return true;
-    }
     let Some(selection) = manifest.get("desktopRelease") else {
         return false;
     };
@@ -781,25 +772,18 @@ fn committed_real_core_default_requires_exact_upstream_bytes() {
         &serde_json::json!({}),
         contract
     ));
-    assert!(committed_real_core_default(
-        &serde_json::json!({"desktopTemporary": {}}),
-        contract
-    ));
     manifest["desktopRelease"]["contractSha256"] = "wrong".into();
     assert!(std::panic::catch_unwind(|| committed_real_core_default(&manifest, contract)).is_err());
 }
 
 pub(crate) fn require_core() -> PathBuf {
-    let explicit = std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE");
     let manifest = serde_json::from_str::<Value>(&crate_file("core-manifest.json"))
         .expect("committed core selection");
     let committed_default = committed_real_core_default(
         &manifest,
         &repo_file("scripts/desktop-core/release-contract.json"),
     );
-    let selected = explicit
-        .as_deref()
-        .or_else(|| committed_default.then_some(std::ffi::OsStr::new("1")));
+    let selected = committed_default.then_some(std::ffi::OsStr::new("1"));
     let candidate = candidate_real_core_selection(
         selected,
         std::env::var_os("POLARIS_SINGBOX_PATH").as_deref(),
@@ -826,12 +810,7 @@ pub(crate) fn require_core() -> PathBuf {
             assert_eq!(compiled_dirs.len(), 1, "one compiled Local carrier");
             compiled_dirs[0].clone()
         } else {
-            // Keep the original Formal/native candidate location restriction.
-            let expected = if explicit.is_some() {
-                format!(".native-dns-app/{platform}")
-            } else {
-                platform.to_owned()
-            };
+            let expected = platform.to_owned();
             assert!(
                 compiled_dirs.contains(&expected),
                 "compiled Formal/native carrier differs"

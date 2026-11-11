@@ -5,7 +5,7 @@ param(
  [Parameter(Mandatory=$true)][string]$KernelArtifactManifest,
  [Parameter(Mandatory=$true)][string]$ExpectedAppSource,
  [Parameter(Mandatory=$true)][string]$ExpectedKernelSource,
- [Parameter(Mandatory=$true)][ValidateSet('formal','candidate')][string]$ValidationMode,
+ [Parameter(Mandatory=$true)][ValidateSet('formal')][string]$ValidationMode,
  [Parameter(Mandatory=$true)][string]$EvidenceDirectory,
  [switch]$ApproveTemporarySystemTask,
  [switch]$PrebuildUserDomain

@@ -1,9 +1,8 @@
-//! Bounded, read-only observations for retiring exact legacy directories.
+//! Bounded, read-only observations for retiring exact legacy payloads.
 //! An unavailable or partial scan keeps files. This is not a machine-wide
 //! no-owner receipt and never signals a process or executes a candidate binary.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::io::{self, Read};
-use std::path::Path;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::process::{Command, Stdio};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -187,92 +186,6 @@ pub fn classify_unix(code: i32, stdout: &[u8], stderr: &[u8]) -> LegacyUse {
     }) {
         LegacyUse::InUse
     } else {
-        LegacyUse::Unknown
-    }
-}
-
-pub fn directory_use(path: &Path) -> LegacyUse {
-    if !path.is_absolute()
-        || path
-            .as_os_str()
-            .to_string_lossy()
-            .contains(['\n', '\r', '\0'])
-    {
-        return LegacyUse::Unknown;
-    }
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return LegacyUse::Unknown;
-    };
-    if meta.file_type().is_symlink() {
-        return LegacyUse::Unknown;
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let tool = if cfg!(target_os = "macos") {
-            "/usr/sbin/lsof"
-        } else {
-            "/usr/bin/lsof"
-        };
-        let mut command = Command::new(tool);
-        command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .args(["-nP", "-Fpn"]);
-        if meta.is_dir() {
-            command.arg("+D");
-        } else {
-            command.arg("--");
-        }
-        command.arg(path);
-        match observe_command(&mut command) {
-            Ok((code, out, err)) => classify_unix(code, &out, &err),
-            Err(_) => LegacyUse::Unknown,
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let Ok(root) = native_windows_root() else {
-            return LegacyUse::Unknown;
-        };
-        let tool = root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let quoted = path.to_string_lossy().replace('\'', "''");
-        // Native process modules include loaded sidecars; any inaccessible
-        // process makes the observation unknown. No process is stopped.
-        let script = format!(
-            r#"$ErrorActionPreference='Stop'; $prefix='{quoted}'.TrimEnd('\')+'\'; $unknown=$false; $busy=$false; try {{ foreach($p in Get-Process) {{ try {{ foreach($m in $p.Modules) {{ if($m.FileName.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {{$busy=$true}} }} }} catch {{$unknown=$true}} }} }} catch {{$unknown=$true}}; if($busy){{'in-use'}} elseif($unknown){{'unknown'}} else {{'idle'}}"#
-        );
-        let mut command = Command::new(tool);
-        command
-            .env_clear()
-            .env("SystemRoot", &root)
-            .env("PATH", root.join("System32"))
-            .env(
-                "PSModulePath",
-                root.join("System32/WindowsPowerShell/v1.0/Modules"),
-            );
-        command
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &script,
-            ])
-            .creation_flags(0x0800_0000);
-        match observe_command(&mut command) {
-            Ok((0, out, err)) if err.is_empty() => {
-                match std::str::from_utf8(&out).ok().map(str::trim) {
-                    Some("idle") => LegacyUse::Idle,
-                    Some("in-use") => LegacyUse::InUse,
-                    _ => LegacyUse::Unknown,
-                }
-            }
-            _ => LegacyUse::Unknown,
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
         LegacyUse::Unknown
     }
 }

@@ -256,7 +256,7 @@ pub mod windows_helper {
 /// 每次起核重试。放在这里的理由同 [`windows_helper`]：本 crate 无 cfg、两侧都已依赖。
 ///
 /// 白名单是**精确名**，不是前缀：发布产物里核与配套库各只有一个固定名字（打包侧的落位名见
-/// `scripts/lib/cronet-contract.mjs`，验包侧见 `scripts/verify-packaging.mjs`），没有带版本后缀
+/// `scripts/desktop-core/release-consumer.mjs` 的 `RELEASE_TARGETS`，验包侧见 `scripts/verify-packaging.mjs`），没有带版本后缀
 /// 的变体。前缀匹配会放进 `libcronet.dll.` 这类名字 —— Windows 对非 `\\?\` 路径剥尾点，
 /// 装入的名字与记下的名字不一致，随后被清理当成多余文件删掉。
 pub mod core_payload {

@@ -11,48 +11,21 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { digest } from './source-graph.mjs';
-import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
-  RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
-  verifyReleaseProvenance, verifyReleaseCore, verifyMacPackagedCore } from './release-consumer.mjs';
+import { consumeRelease, loadReleaseContract, portableCanonical,
+  RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, verifyPackagedRelease,
+  verifyReleaseCore, verifyPackagedCore, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
 import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
-import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
-import { validationContext } from './validation-origin.mjs';
-import { verifyPackagedSource } from './bundle.mjs';
-import { coreWireHandoffName, createCoreWireHandoff, importCoreWireHandoff, packCoreWireHandoff, unpackCoreWireHandoff } from './wire-input-handoff.mjs';
 import { verifyRecoveryResource } from './recovery.mjs';
-import { assertSourceFirstRelease } from '../assert-pc-runtime-release.mjs';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
 const candidate = 'c'.repeat(40), commit = '1'.repeat(40), tree = '2'.repeat(40), tagObject = '3'.repeat(40);
-const version = '1.15.0-alpha.12.polaris.1', tag = `v${version}`;
+const version = '1.15.0-polaris-alpha.12', tag = `v${version}`;
 const write = (p, b) => { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, b); };
 const encode = (v) => Buffer.from(JSON.stringify(v));
-const identity = (schema, facts) => ({ schema, facts, fingerprint: digest(portableCanonical(facts)) });
-const providerNames = ['scripts/polaris_production_release.py', 'scripts/polaris_native_candidate.py',
-  'scripts/polaris_source_fingerprint.py', 'scripts/polaris_dns_identity.py', 'scripts/polaris_go_environment.py',
-  'scripts/polaris_native_distribution.py', 'release/polaris-production-release.json', 'release/polaris-candidate-inputs.json'];
 
-test('historical 577d evidence retains exact four identities without becoming current acceptance', t => {
-  const bytes = readFileSync(join(repo, 'scripts/desktop-core/historical-release-contract-577d4b9.json'));
-  const historicalRoot = mkdtempSync(join(tmpdir(), 'historical-release-'));
-  t.after(() => rmSync(historicalRoot, { recursive: true, force: true }));
-  write(join(historicalRoot, 'scripts/desktop-core/release-contract.json'), bytes);
-  const actual = validateReleaseContract(JSON.parse(bytes));
-  assert.deepEqual(Object.keys(actual.platforms).sort(), ['linux', 'mac-arm64', 'mac-x64', 'win']);
-  const pending = JSON.parse(readFileSync(join(repo, 'scripts/desktop-core/pending-release-selection.json')));
-  assert.equal(pending.AppAccepted, false);
-  assert.throws(() => loadReleaseContract(repo, { desktopRelease: pending.historicalSelection }), /SHA differs/);
-  assert.deepEqual(loadReleaseContract(historicalRoot, { desktopRelease: pending.historicalSelection }), actual);
-  const active = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json'))).historicalDesktopRelease;
-  assert.equal(active.sourceCommit, actual.sourceCommit);
-  const changed = structuredClone(pending.historicalSelection); changed.contractSha256 = 'a'.repeat(64);
-  assert.throws(() => loadReleaseContract(historicalRoot, { desktopRelease: changed }), /SHA differs/);
-  const changedVersion = structuredClone(actual); changedVersion.version = '1.15.0-alpha.12.polaris.1';
-  assert.throws(() => validateReleaseContract(changedVersion));
-});
 function coreFixture(key) {
   const t = RELEASE_TARGETS[key], b = Buffer.alloc(256);
   if (t.os === 'linux') { b.set([127, 69, 76, 70, 2, 1]); b.writeUInt16LE(62, 18); }
@@ -62,67 +35,36 @@ function coreFixture(key) {
 }
 function metadata(row) {
   const g = row.buildGraph;
-  return `/synthetic/sing-box: go1.25.5\n\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n\tmod\tgithub.com/sagernet/sing-box\t(devel)\n`
-    + `\tdep\t${g.localReplacement.module}\t${g.localReplacement.version}\n\t=>\t./third_party/sing-tun\t(devel)\n`
+  return `/synthetic/sing-box: ${row.goVersion}\n\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n\tmod\tgithub.com/sagernet/sing-box\t(devel)\n`
+    + g.localReplacements.map((r) => `\tdep\t${r.module}\t${r.version}\n\t=>\t${r.replacement.module}\t${r.replacement.version}\n`).join('')
     + [...g.normalModules, ...g.prebuiltAcquisitionModules].map((d) => `\tdep\t${d.module}\t${d.version}\t${d.h1}\n`).join('')
     + Object.entries(g.settings).map(([k, v]) => `\tbuild\t${k}=${v}\n`).join('');
 }
 function fixture(options = {}) {
   const root = mkdtempSync(join(tmpdir(), 'polaris-release-fixture-'));
-  const transport = new Map(), calls = [];
-  const contract = { schema: 'polaris-box-release-consumer-contract-v1', providerContract: 'polaris-box-release-v1',
-    repository: 'polaris-arch/polaris-box', releaseId: 17, sourceCommit: commit, sourceTree: tree,
-    version, tag, tagObject, platforms: {} };
+  const transport = new Map(), calls = [], displays = {};
+  const repository = 'polaris-arch/sing-box-polaris', goVersion = 'go1.26.8';
+  const legal = (path, content) => ({ path, content, bytes: Buffer.byteLength(content), sha256: digest(content) });
+  const contract = { schema: 'polaris-upstream-native-release-consumer-v1', providerContract: 'polaris-upstream-native-release-v1',
+    repository, repositoryId: 1421657509, releaseId: 17, sourceCommit: commit, sourceTree: tree,
+    version, tag, tagObject, sourcePolicy: { goVersion: goVersion.slice(2) }, producer: { fixtureOnly: true },
+    sourceArchive: { name: `sing-box-polaris-${commit}.tar.gz`, url: `https://github.com/${repository}/archive/${commit}.tar.gz`,
+      bytes: 1, sha256: 'f'.repeat(64) },
+    legalFiles: [legal('licenses/LICENSE', 'synthetic license'), legal('licenses/NOTICE', 'synthetic notice'), legal('licenses/go-1.26.8/LICENSE', 'synthetic go license')], platforms: {} };
   const asset = (name, bytes, id) => ({ name, bytes: bytes.length, sha256: digest(bytes), assetId: id,
-    releaseId: 17, url: `https://github.com/polaris-arch/polaris-box/releases/download/${tag}/${name}` });
-  const raw = { schema: 'fork-source-fingerprint-v1', sourceCommit: commit, sourceTree: tree, sourceOverlay: 0,
-    goVersion: 'go1.25.5', goModSha256: 'a'.repeat(64), goSumSha256: 'b'.repeat(64),
-    replacement: { module: 'github.com/sagernet/sing-tun', bindingSha256: 'f'.repeat(64) }, observedHost: 'synthetic only' };
-  const { schema, observedHost, ...sourceFacts } = raw;
-  const portableSource = identity('polaris-production-source-v1', sourceFacts);
-  const provider = identity('polaris-production-provider-v1', { sourceCommit: commit, providerContract: contract.providerContract,
-    fileSha256: Object.fromEntries(providerNames.map((n) => [n, 'd'.repeat(64)])) });
+    releaseId: 17, url: `https://github.com/${repository}/releases/download/${tag}/${name}` });
   for (const [key, t] of Object.entries(RELEASE_TARGETS)) {
-    const rootName = `polaris-box-${version}-${t.os}-${t.arch}`;
+    const rootName = `sing-box-${version}-${t.os}-${t.arch}`;
     const tags = ['with_naive_outbound', 'with_gvisor', ...(t.sidecar ? ['with_purego'] : [])].sort().join(',');
-    const platform = identity('polaris-production-platform-v1', { sourceFingerprint: portableSource.fingerprint,
-      os: t.os, arch: t.arch, CGO_ENABLED: t.cgo, tags: tags.split(','), version, tag, goVersion: raw.goVersion, sourceOverlay: 0 });
-    platform.buildID = `polaris-production-v1-${platform.fingerprint}`;
-    const flags = `-checklinkname=0 -s -w -X github.com/sagernet/sing-box/constant.Version=${version} -buildid=${platform.buildID}`;
-    const provenance = { schema: 'polaris-production-native-receipt-v1', target: `${t.os}/${t.arch}`, version, tag,
-      sourceCommit: commit, sourceTree: tree, sourceFingerprint: raw, portableSourceIdentity: portableSource,
-      portablePlatformIdentity: platform, sourceIdentityFingerprint: portableSource.fingerprint,
-      platformInputFingerprint: platform.fingerprint, buildID: platform.buildID,
-      providerContract: contract.providerContract, providerFingerprint: provider.fingerprint, providerIdentity: provider,
-      signaturePolicy: 'preserve measured original bytes; ad-hoc/not-signed observations do not assert trust',
-      signatureObservation: { core: t.os === 'darwin' ? { format: 'Mach-O', signatureTrustValidated: false,
-        codeSignatureInspection: options.unsignedIntel && key === 'mac-x64' ? 'sing-box: code object is not signed at all\n'
-          : `Executable=/synthetic/sing-box\nSignature=adhoc\nCDHash=${'4'.repeat(40)}\n` }
-        : { synthetic: true }, cronet: {}, trustValidated: false }, tags, ldflags: flags,
-      buildCommand: ['go', 'build', '-buildvcs=true', '-mod=readonly', '-p', '1', '-trimpath', '-tags', tags,
-        '-ldflags', flags, '-o', `/synthetic/${rootName}/${t.core}`, './cmd/sing-box'],
-      buildGraph: { settings: { GOOS: t.os, GOARCH: t.arch, CGO_ENABLED: t.cgo, 'vcs.revision': commit,
-        'vcs.modified': 'false', '-trimpath': 'true', '-tags': tags },
-      normalModules: [{ module: 'example.com/inert', version: 'v1.0.0', h1: 'h1:AA=' }],
-      prebuiltAcquisitionModules: t.sidecar ? [{ module: `github.com/sagernet/cronet-go/lib/${t.os}_amd64`, version: 'v1.0.0', h1: 'h1:BB=' }] : [],
-      localReplacement: { module: 'github.com/sagernet/sing-tun', version: 'v0.9.7', h1: '' } },
-      consumerAcceptance: 'pending', actualVersionOutput: `sing-box version ${version}\nRevision: ${commit}\n`, fixtureOnly: true };
+    const signed = t.os === 'darwin' && !(options.unsignedIntel && key === 'mac-x64');
+    displays[key] = signed ? `Executable=/synthetic/sing-box\nSignature=adhoc\nCDHash=${'4'.repeat(40)}\n`
+      : 'sing-box: code object is not signed at all\n';
     const coreBytes = coreFixture(key), sidecarBytes = t.sidecar ? cronetFixture(key) : null;
     if (options.coreMarker !== undefined) coreBytes[255] = options.coreMarker;
     if (key === 'linux' && options.linuxMachine !== undefined) coreBytes.writeUInt16LE(options.linuxMachine, 18);
-    const originalArchive = { name: rootName + t.suffix, bytes: 1, sha256: 'e'.repeat(64), members: {
-      [`${rootName}/${t.core}`]: digest(coreBytes), ...(t.sidecar ? { [`${rootName}/${t.sidecar}`]: digest(sidecarBytes) } : {}) } };
-    const finalPackageCronetSmoke = { os: t.os, arch: t.arch, go: raw.goVersion, gvisorCompiled: true,
-      linkage: t.sidecar ? 'shared-purego' : 'static-cgo', version: '154.0.8037.49',
-      ...(t.sidecar ? { library: `/synthetic/${rootName}/${t.sidecar}`, sha256: digest(sidecarBytes) } : {}) };
-    const files = { [t.core]: coreBytes, LICENSE: Buffer.from('synthetic license'), NOTICE: Buffer.from('synthetic notice'),
-      'licenses/NOTICE': Buffer.from('synthetic notice'), 'provenance.json': encode({ ...provenance, archive: originalArchive }),
-      'source/SOURCE-INDEX.json': encode({ fixtureOnly: true }) };
-    for (let n = 0; n < (options.legalMembers ?? 0); n++) {
-      files[`licenses/dependency-${n}/LICENSE`] = Buffer.from(`synthetic dependency license ${n}`);
-    }
+    const files = { [t.core]: coreBytes, LICENSE: Buffer.from('synthetic license'), NOTICE: Buffer.from('synthetic notice') };
+    if (t.sidecar) files[t.sidecar] = sidecarBytes;
     files.SHA256SUMS = Buffer.from(Object.keys(files).sort().map((n) => `${digest(files[n])}  ${n}\n`).join(''));
-    if (t.sidecar) { files[t.sidecar] = sidecarBytes; files.SHA256SUMS = Buffer.from(Object.keys(files).filter((n) => n !== 'SHA256SUMS').sort().map((n) => `${digest(files[n])}  ${n}\n`).join('')); }
     const archiveFile = join(root, 'inputs', rootName + t.suffix);
     write(join(root, 'members.json'), encode(Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, b.toString('base64')]))));
     mkdirSync(dirname(archiveFile), { recursive: true });
@@ -137,29 +79,35 @@ else:
   for name,value in members.items():
    b=base64.b64decode(value);info=tarfile.TarInfo(name);info.size=len(b);info.mode=0o755 if name.endswith('/sing-box') else 0o644;z.addfile(info,io.BytesIO(b))
 `, join(root, 'members.json'), archiveFile, String(options.windowsZipMode ?? 0), String(options.windowsCoreMode ?? 0)]);
-    const bytes = readFileSync(archiveFile), releaseAsset = asset(rootName + t.suffix, bytes, 20 + Object.keys(contract.platforms).length);
-    contract.platforms[key] = { ...provenance, finalPackageCronetSmoke, releaseAsset, archive: { name: releaseAsset.name, bytes: bytes.length, sha256: digest(bytes),
-      members: Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, digest(b)])) },
-    core: { member: t.core, bytes: files[t.core].length, sha256: digest(files[t.core]) },
-    sidecar: t.sidecar ? { member: t.sidecar, bytes: files[t.sidecar].length, sha256: digest(files[t.sidecar]) } : null };
+    const bytes = readFileSync(archiveFile), releaseAsset = asset(`sing-box-polaris-${version.replace('-polaris-', '-')}-${t.os}-${t.arch}${t.suffix}`, bytes, 20 + Object.keys(contract.platforms).length);
+    const row = { schema: 'polaris-upstream-native-receipt-v1', id: rootName, target: `${t.os}/${t.arch}`,
+      variant: { linkage: t.sidecar ? 'shared-purego' : 'static-cgo', libc: '', goarm: '', gomips: '', go386: '', legacy: false },
+      version, tag, sourceCommit: commit, sourceTree: tree, goVersion, tags, buildID: `synthetic-build-id-${key}`,
+      buildGraph: { settings: { GOOS: t.os, GOARCH: t.arch, CGO_ENABLED: t.cgo, 'vcs.revision': commit,
+        'vcs.modified': 'false', '-trimpath': 'true', '-tags': tags },
+      normalModules: [{ module: 'example.com/inert', version: 'v1.0.0', h1: 'h1:AA=' }],
+      prebuiltAcquisitionModules: t.sidecar ? [{ module: `github.com/sagernet/cronet-go/lib/${t.os}_amd64`, version: 'v1.0.0', h1: 'h1:BB=' }] : [],
+      localReplacements: [{ module: 'github.com/sagernet/sing-tun', version: 'v0.9.7', h1: '',
+        replacement: { module: './third_party/sing-tun', version: '(devel)', h1: '' } }] },
+      archive: { name: rootName + t.suffix, releaseName: releaseAsset.name, root: rootName, bytes: bytes.length, sha256: digest(bytes),
+        members: Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, digest(b)])) },
+      core: { member: t.core, bytes: files[t.core].length, sha256: digest(files[t.core]) },
+      sidecar: t.sidecar ? { member: t.sidecar, bytes: files[t.sidecar].length, sha256: digest(files[t.sidecar]) } : null,
+      signatureObservation: t.os === 'darwin' ? { state: signed ? 'signed' : 'unsigned', cdHash: signed ? '4'.repeat(40) : null,
+        trustValidated: false } : null, releaseAsset };
+    row.rawBuildInfo = metadata(row);
+    contract.platforms[key] = row;
     transport.set(releaseAsset.url, bytes);
   }
-  const rows = Object.values(contract.platforms).map(({ releaseAsset, ...r }) => r);
-  const index = encode({ schema: 'polaris-production-assets-v1', repository: contract.repository, version, tag, tagObject,
-    sourceCommit: commit, sourceTree: tree, platforms: [...rows, { target: 'linux/arm64' }, { target: 'windows/arm64' }] });
-  contract.assetIndex = asset('polaris-box-assets.json', index, 25); transport.set(contract.assetIndex.url, index);
   const contractBytes = encode(contract);
-  const manifest = { bundledCoreVersion: '1.15.0-alpha.8', desktopSourceBuild: { old: 'never accepted for release' }, desktopRelease: {
-    schema: 'polaris-app-release-selection-v1', contractPath: 'scripts/desktop-core/release-contract.json',
-    contractSha256: digest(contractBytes), version, tag, tagObject, sourceCommit: commit, sourceTree: tree, releaseId: 17,
-    librarySha256: { linux: contract.platforms.linux.sidecar.sha256, win: contract.platforms.win.sidecar.sha256 } } };
+  const manifest = { desktopRelease: { schema: 'polaris-app-release-selection-v1',
+    contractPath: 'scripts/desktop-core/release-contract.json', contractSha256: digest(contractBytes) } };
   write(join(root, manifest.desktopRelease.contractPath), contractBytes);
   write(join(root, 'src-tauri/core-manifest.json'), encode(manifest));
-  for (const name of ADAPTER_FILES) { mkdirSync(dirname(join(root, name)), { recursive: true }); copyFileSync(join(repo, name), join(root, name)); }
   const base = `https://api.github.com/repos/${contract.repository}`;
-  transport.set(base, encode({ id: 1407705262, full_name: contract.repository, private: false }));
+  transport.set(base, encode({ id: contract.repositoryId, full_name: contract.repository, private: false }));
   const publicRelease = { id: 17, tag_name: tag, draft: false, html_url: `https://github.com/${contract.repository}/releases/tag/${tag}`,
-    assets: [contract.assetIndex, ...Object.values(contract.platforms).map((r) => r.releaseAsset)].map((a) => ({ id: a.assetId, name: a.name,
+    assets: Object.values(contract.platforms).map((r) => r.releaseAsset).map((a) => ({ id: a.assetId, name: a.name,
       size: a.bytes, state: 'uploaded', browser_download_url: a.url, digest: `sha256:${a.sha256}` })) };
   transport.set(base + '/releases/17', encode(publicRelease));
   transport.set(base + '/git/ref/tags/' + tag, encode({ ref: 'refs/tags/' + tag, object: { type: 'tag', sha: tagObject } }));
@@ -172,13 +120,13 @@ else:
     if (command === 'go') {
       const path = args.at(-1), hash = digest(readFileSync(path));
       const row = Object.values(contract.platforms).find((r) => r.core.sha256 === hash);
-      assert(row, 'Unknown inert binary'); return args[0] === 'version' ? metadata(row) : row.buildID;
+      assert(row, 'Unknown inert binary'); return args[0] === 'version' ? row.rawBuildInfo : row.buildID;
     }
     if (command === 'codesign' || command === 'file') {
       inspections.push([command, ...args]);
-      const hash = digest(readFileSync(args.at(-1))), row = Object.values(contract.platforms).find((r) => r.core.sha256 === hash);
+      const hash = digest(readFileSync(args.at(-1))), [key, row] = Object.entries(contract.platforms).find(([, r]) => r.core.sha256 === hash) ?? [];
       assert(row && row.target.startsWith('darwin/'), 'Unknown inert Mac binary');
-      const display = row.signatureObservation.core.codeSignatureInspection;
+      const display = displays[key];
       if (command === 'file') return 'Mach-O 64-bit executable x86_64';
       if (args[0] === '--display') return display;
       assert.deepEqual(args.slice(0, -1), ['--verify', '--strict']);
@@ -187,7 +135,11 @@ else:
     }
     assert(['python3', 'python'].includes(command), 'Target execution prohibited'); return execFileSync(command, args, options);
   };
-  return { root, contract, manifest, transport, calls, read, run, base, publicRelease, inspections, blobCacheDir: false };
+  const linux = contract.platforms.linux;
+  const linuxVersionOutput = `sing-box version ${version}\n\nEnvironment: ${goVersion} ${linux.target}\nTags: ${linux.tags}\n`
+    + `Revision: ${commit}\nCGO: disabled\n`;
+  return { root, contract, manifest, transport, calls, read, run, base, publicRelease, inspections, displays,
+    linuxVersionOutput, blobCacheDir: false };
 }
 async function withFixture(fn, options) { const f = fixture(options); try { await fn(f); } finally { rmSync(f.root, { recursive: true, force: true }); } }
 function resources(f) {
@@ -199,24 +151,17 @@ function resources(f) {
   walk(dir); return result;
 }
 
-test('all four release archives keep exact cores, colocated libraries, notices and separate adapter receipts', async () => withFixture(async (f) => {
+test('all four release archives keep exact cores, colocated libraries and notices', async () => withFixture(async (f) => {
   validateReleaseContract(f.contract); const receipts = await consumeRelease(f.root, f.manifest, undefined, f);
   assert.equal(Object.keys(receipts).length, 4);
   for (const [key, row] of Object.entries(f.contract.platforms)) {
     const path = join(f.root, 'resources', key, row.core.member);
-    const receipt = verifyPackagedSource(f.root, f.manifest, key, path, f.run);
+    const receipt = verifyPackagedCore(f.root, f.manifest, key, path, f.run);
     assert.equal(receipt.schema, 'polaris-app-release-consumption-v1');
-    assert.equal(receipt.producer.providerContract, 'polaris-box-release-v1');
-    assert.equal(receipt.adapter.facts.candidate, candidate); assert.equal(receipt.producer.fixtureOnly, true);
+    assert.deepEqual(receipt.producer, row);
     assert(existsSync(join(dirname(path), 'core-release/LICENSE')));
     if (row.sidecar) assert.equal(inspectNativePayload(f.root, key, path, join(dirname(path), row.sidecar.member), f.run).schema, 'polaris-native-release-payload-input-v1');
   }
-  const localGate = join(f.root, 'scripts/desktop-core/local-development.mjs');
-  const gateBytes = readFileSync(localGate);
-  writeFileSync(localGate, Buffer.concat([gateBytes, Buffer.from('\n// changed rejection module\n')]));
-  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux',
-    join(f.root, 'resources/linux/sing-box'), f.run), /App adapter identity differs/);
-  writeFileSync(localGate, gateBytes);
   assert.equal(f.calls.filter((url) => url.includes('/releases/17')).length, 2);
   assert(f.calls.every((url) => !url.includes('proxy.golang.org') && !url.includes('raw.githubusercontent.com')));
   assert(!existsSync(join(f.root, 'resources/.source-receipts')));
@@ -224,7 +169,7 @@ test('all four release archives keep exact cores, colocated libraries, notices a
 test('normal release consumption preserves each original compressed recovery archive independently', async () => withFixture(async f => {
   const extractions = [];
   const run = (command, args, options) => {
-    if (args[1]?.endsWith('release-archive.py') && args[3] !== '--source-trusted-proofs') {
+    if (args[1]?.endsWith('release-archive.py')) {
       assert.equal(command, PYTHON);
       assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
       assert.equal(options.encoding, 'utf8'); assert.equal(options.maxBuffer, 1024 * 1024);
@@ -320,7 +265,7 @@ test('production package verification rejects bad recovery bytes, sizes, extras 
   const row = f.contract.platforms.linux, directory = join(f.root, 'resources/core-recovery/linux');
   const archive = join(directory, row.archive.name), original = readFileSync(archive);
   const inventory = join(directory, 'inventory.json'), originalInventory = readFileSync(inventory);
-  const verify = () => verifyPackagedSource(f.root, f.manifest, 'linux', join(f.root, 'resources/linux/sing-box'), f.run);
+  const verify = () => verifyPackagedCore(f.root, f.manifest, 'linux', join(f.root, 'resources/linux/sing-box'), f.run);
   const corrupt = Buffer.from(original); corrupt[0] ^= 1; writeFileSync(archive, corrupt);
   assert.throws(verify, /Recovery compressed bytes differ/); writeFileSync(archive, original);
   for (const mutate of [v => { v.contractSha256 = '0'.repeat(64); }, v => { v.memberBytes[Object.keys(v.memberBytes)[0]]++; }, v => { v.authority = true; }]) {
@@ -351,7 +296,7 @@ test('final carrier verification checks its own recovery copy without borrowing 
   const directory = join(carrier, 'core-recovery/linux');
   cpSync(join(f.root, 'resources/linux'), join(carrier, 'linux'), { recursive: true });
   cpSync(join(f.root, 'resources/core-recovery/linux'), directory, { recursive: true });
-  const verify = () => verifyPackagedSource(f.root, f.manifest, 'linux', join(carrier, 'linux/sing-box'), f.run);
+  const verify = () => verifyPackagedCore(f.root, f.manifest, 'linux', join(carrier, 'linux/sing-box'), f.run);
   assert.equal(verify().platform, 'linux');
   const archive = join(directory, row.archive.name), original = readFileSync(archive);
   const corrupt = Buffer.from(original); corrupt[0] ^= 1; write(archive, corrupt);
@@ -375,7 +320,7 @@ test('subset update preserves other platforms and unrelated files; current bytes
 test('malformed explicit selection never falls back to old source/mobile pins', async () => withFixture(async (f) => {
   for (const value of [null, [], {}, { ...f.manifest.desktopRelease, contractSha256: '0'.repeat(64) },
     { ...f.manifest.desktopRelease, librarySha256: { linux: '0'.repeat(64), win: 'f'.repeat(64) } }]) {
-    const manifest = { ...f.manifest, desktopRelease: value }; assert(hasDesktopRelease(manifest));
+    const manifest = { ...f.manifest, desktopRelease: value };
     assert.throws(() => loadReleaseContract(f.root, manifest));
     await assert.rejects(consumeRelease(f.root, manifest, ['linux'], f));
   }
@@ -397,9 +342,9 @@ test('repository/tag/source/asset IDs, URL and digest mismatch each preserve pri
     assert.deepEqual(resources(f), before); f.transport.set(url, old);
   }
 }));
-test('truncated/replaced index or archive fails before replacing any core or library', async () => withFixture(async (f) => {
+test('truncated/replaced archive fails before replacing any core or library', async () => withFixture(async (f) => {
   write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f);
-  for (const url of [f.contract.assetIndex.url, f.contract.platforms.linux.releaseAsset.url]) {
+  for (const url of [f.contract.platforms.linux.releaseAsset.url]) {
     const original = f.transport.get(url); f.transport.set(url, original.subarray(0, original.length - 1));
     await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], f)); assert.deepEqual(resources(f), before);
     f.transport.set(url, original);
@@ -484,10 +429,8 @@ test('failed rollback retains the original backup and lock; explicit recovery re
   assert.equal(recoverRelease(f.root, { isAlive: () => false }).restoredPreviousResources, true);
   assert.deepEqual(resources(f), before);
 }));
-test('producer fingerprint/tags/BuildID or module graph tampering fails closed', async () => withFixture(async (f) => {
-  for (const change of [(r) => { r.providerFingerprint = '0'.repeat(64); },
-    (r) => { r.buildID = 'wrong'; }, (r) => { r.portableSourceIdentity.facts.sourceOverlay = 1; },
-    (r) => { r.tags += ',with_purego'; }, (r) => { r.signaturePolicy = 'trust everything'; },
+test('producer tags/asset, BuildID or module graph tampering fails closed', async () => withFixture(async (f) => {
+  for (const change of [(r) => { r.tags += ',with_purego'; },
     (r) => { r.releaseAsset.url = 'https://example.invalid/asset'; }]) {
     const contract = structuredClone(f.contract); change(contract.platforms.linux);
     assert.throws(() => validateReleaseContract(contract));
@@ -500,12 +443,12 @@ test('producer fingerprint/tags/BuildID or module graph tampering fails closed',
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, run: run2 }), /BuildInfo/);
   assert.deepEqual(resources(f), {});
 }));
-test('final carrier retains original notice/source bytes as well as exact core and Cronet bytes', async () => withFixture(async (f) => {
+test('final carrier retains original notice bytes as well as exact core and Cronet bytes', async () => withFixture(async (f) => {
   await consumeRelease(f.root, f.manifest, ['linux'], f);
   const carrier = join(f.root, 'carrier/linux'); cpSync(join(f.root, 'resources/linux'), carrier, { recursive: true });
   assert.equal(verifyPackagedRelease(f.root, f.manifest, 'linux', join(carrier, 'sing-box'), f.run).platform, 'linux');
   writeFileSync(join(carrier, 'core-release/LICENSE'), 'wrong license');
-  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux', join(carrier, 'sing-box'), f.run), /notice\/source\/provenance/);
+  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux', join(carrier, 'sing-box'), f.run), /notice\/provenance/);
 }));
 
 test('actual inventory CLI admits precisely the release members and rejects missing/extra files in static and carrier trees', async () => withFixture(async (f) => {
@@ -524,7 +467,7 @@ test('actual inventory CLI admits precisely the release members and rejects miss
     copyFileSync(join(repo, 'src-tauri', conf), join(f.root, 'src-tauri', conf));
     write(join(f.root, 'resources', key, key === 'win' ? 'polaris-helper.exe' : 'polaris-helper'), 'inert');
     if (key === 'win') write(join(f.root, 'resources/win/polaris-cleaner.exe'), 'inert');
-    writeSelectedCoreManifest(join(f.root, 'resources', key), f.contract, key, '1.0.0-fixture');
+    writeSelectedCoreManifest(join(f.root, 'resources', key), releaseInstallationContract(f.root, f.manifest), key, '1.0.0-fixture');
     const carrier = join(f.root, 'inventory-carrier', key);
     const scopes = key === 'linux' ? [join(carrier, 'deb/usr/lib/Polaris'), join(carrier, 'appimage/Polaris.AppDir/usr/lib/Polaris')]
       : key === 'win' ? [carrier] : [join(carrier, 'macos/Polaris.app/Contents/Resources')];
@@ -552,11 +495,11 @@ test('actual inventory CLI admits precisely the release members and rejects miss
   }
 }));
 
-test('producer Mac display must yield a unique state/CDHash with no unsigned arm64 exception', () => withFixture(async (f) => {
-  for (const display of [undefined, '', 'CDHash=invalid\n', 'sing-box: code object is not signed at all\n',
-    `CDHash=${'4'.repeat(40)}\nCDHash=invalid\n`,
-    `CDHash=${'4'.repeat(40)}\nCDHash=${'5'.repeat(40)}\n`]) {
-    const contract = structuredClone(f.contract); contract.platforms['mac-arm64'].signatureObservation.core.codeSignatureInspection = display;
+test('producer Mac observation must yield an untrusted valid state/CDHash', () => withFixture(async (f) => {
+  for (const observation of [undefined, null, {}, { state: 'signed', cdHash: 'invalid', trustValidated: false },
+    { state: 'signed', cdHash: '4'.repeat(40), trustValidated: true },
+    { state: 'unsigned', cdHash: '4'.repeat(40), trustValidated: false }]) {
+    const contract = structuredClone(f.contract); contract.platforms['mac-arm64'].signatureObservation = observation;
     assert.throws(() => validateReleaseContract(contract), /signature|Mac/);
   }
 }));
@@ -580,20 +523,20 @@ test('Mac consumption and final bundle entry enforce strict native verification 
   const recovery = join(carrier, 'core-recovery', key);
   cpSync(join(f.root, 'resources/core-recovery', key), recovery, { recursive: true });
   const core = join(runtime, 'sing-box'), before = digest(readFileSync(core));
-  assert.equal(verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
+  assert.equal(verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
   const archive = join(recovery, f.contract.platforms[key].archive.name), archiveBytes = readFileSync(archive);
   const corrupt = Buffer.from(archiveBytes); corrupt[0] ^= 1; write(archive, corrupt);
-  assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin'), /Recovery compressed bytes differ/);
+  assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin'), /Recovery compressed bytes differ/);
   write(archive, archiveBytes);
   const inventory = join(recovery, 'inventory.json'), inventoryBytes = readFileSync(inventory); rmSync(inventory);
-  assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin'), /Extra\/missing recovery/);
+  assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin'), /Extra\/missing recovery/);
   write(inventory, inventoryBytes);
-  for (const run of badRuns) assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, run, 'darwin'), /signature|CDHash/);
+  for (const run of badRuns) assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, run, 'darwin'), /signature|CDHash/);
   const file = join(f.root, 'resources/.release-receipts', `${key}.json`), original = readFileSync(file);
   for (const signature of [undefined, { state: 'invalid', cdHash: '4'.repeat(40) }, { state: 'signed', cdHash: '5'.repeat(40) }, { state: 'unsigned', cdHash: null }]) {
     const value = JSON.parse(original); if (signature === undefined) delete value.macCodeSignature; else value.macCodeSignature = signature;
     const { schema, fingerprint, ...facts } = value; value.fingerprint = digest(portableCanonical(facts)); write(file, encode(value));
-    assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin'), /signature|CDHash/);
+    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin'), /signature|CDHash/);
   }
   write(file, original); assert.equal(digest(readFileSync(core)), before);
   assert(f.inspections.some(([command, flag, strict]) => command === 'codesign' && flag === '--verify' && strict === '--strict'));
@@ -604,218 +547,49 @@ test('unsigned Intel release retains only the existing thin-x86_64 native except
   const key = 'mac-x64', receipts = await consumeRelease(f.root, f.manifest, [key], { ...f, host: 'darwin' });
   assert.deepEqual(receipts[key].macCodeSignature, { state: 'unsigned', cdHash: null });
   const core = join(f.root, 'resources', key, 'sing-box');
-  assert.equal(verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
+  assert.equal(verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
   const run = (command, args, options) => command === 'file' ? 'Mach-O universal x86_64 arm64' : f.run(command, args, options);
-  assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, run, 'darwin'), /thin Intel/);
+  assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, run, 'darwin'), /thin Intel/);
 }, { unsignedIntel: true }));
-test('actual fetch CLIs reject malformed release mode and check-only Cronet has no module proxy access', async () => withFixture(async (f) => {
+test('actual fetch CLI rejects malformed release mode and an incomplete selection', async () => withFixture(async (f) => {
   cpSync(join(repo, 'scripts'), join(f.root, 'scripts'), { recursive: true });
   // Production now has a bound contract; this private fixture retains its own exact bytes.
   write(join(f.root, f.manifest.desktopRelease.contractPath), encode(f.contract));
-  let result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-cronet.mjs'), '--check-only'], { encoding: 'utf8' });
-  assert.equal(result.status, 0, result.stderr); assert.match(result.stdout, /exclusively from the core archive/);
+  let result;
   for (const args of [['--producer'], ['--platform=linux,,win']]) {
     result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-core.mjs'), ...args], { encoding: 'utf8' });
     assert.equal(result.status, 1); assert.match(result.stderr, /Release mode|architecture selection/);
   }
-  result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-core.mjs'), '--bundle-dir=old', '--candidate=' + candidate], { encoding: 'utf8' });
-  assert.equal(result.status, 1); assert.match(result.stderr, /ENOENT|Non-regular/);
   write(join(f.root, 'src-tauri/core-manifest.json'), encode({ ...f.manifest, desktopRelease: null }));
-  result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-cronet.mjs'), '--check-only'], { encoding: 'utf8' });
+  result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-core.mjs')], { encoding: 'utf8' });
   assert.equal(result.status, 1); assert.match(result.stderr, /Explicit release selection incomplete/);
   assert.deepEqual(resources(f), {});
 }));
-test('release notice identities are section-local and independent from mobile; old formal approval is not transferable', async () => withFixture(async (f) => {
-  const mobile = { android: { sourceCommit: 'a'.repeat(40), manifestSha256: 'b'.repeat(64) },
-    apple: { sourceCommit: 'd'.repeat(40), manifestSha256: 'e'.repeat(64) } };
-  const desktop = [`  - 桌面 sing-box v${version} (GPLv3) — https://github.com/polaris-arch/polaris-box`,
-    '上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12', `桌面发布构建：${version}`,
-    `固定源码：https://github.com/polaris-arch/polaris-box/tree/${commit}`, `源码 tree：${tree}`,
-    `固定消费标签：https://github.com/polaris-arch/polaris-box/tree/${tag}`, `消费标签对象：${tagObject}`,
-    `消费合同 SHA-256：${f.manifest.desktopRelease.contractSha256}`, `公开资产 index SHA-256：${f.contract.assetIndex.sha256}`,
-    `桌面发布：https://github.com/polaris-arch/polaris-box/releases/tag/${tag}`];
-  const blocks = Object.entries(mobile).flatMap(([key, row]) => {
-    const label = key === 'android' ? 'Android libbox 基线' : 'Apple libbox 基线';
-    return [`  - ${label} v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box`,
-      '上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8',
-      `固定源码：https://github.com/SagerNet/sing-box/tree/${row.sourceCommit}`, `source manifest SHA-256：${row.manifestSha256}`];
-  });
-  const guidance = ['`src-tauri/core-manifest.json` 的 `desktopRelease`', '`sourceDelivery` 指向固定公开来源。',
-    `Desktop release: ${version} — https://github.com/polaris-arch/polaris-box/releases/tag/${tag}`,
-    `Desktop source: https://github.com/polaris-arch/polaris-box/tree/${commit}`,
-    `Desktop release contract: scripts/desktop-core/release-contract.json (SHA-256 ${f.manifest.desktopRelease.contractSha256})`,
-    `Published asset index SHA-256: ${f.contract.assetIndex.sha256}`,
-    'Desktop selection uses src-tauri/core-manifest.json desktopRelease.',
-    'asset index sourceDelivery identifies the automatic product source archive,'];
-  const notice = [...desktop, ...blocks, ...guidance].join('\n'); validateReleaseNotice(notice, f.manifest, f.contract, mobile);
-  // The desktop label names the exact release; the upstream baseline remains
-  // a separate identity and must not substitute for the .polaris release.
-  assert.throws(() => validateReleaseNotice(notice.replace(desktop[0], desktop[0].replace(version, '1.15.0-alpha.12')),
-    f.manifest, f.contract, mobile), /release baseline differs/);
-  for (const line of guidance) assert.throws(() => validateReleaseNotice(notice.replace(line, ''), f.manifest, f.contract, mobile));
-  for (const stale of ['desktopSourceBuild', 'scripts/desktop-core/source-manifest.json', 'Desktop v1.15.0-alpha.11',
-    'Final native kernels, signatures, source archives remain pending']) {
-    assert.throws(() => validateReleaseNotice(notice + '\n' + stale, f.manifest, f.contract, mobile), /obsolete desktop/);
-  }
-  assert.throws(() => validateReleaseNotice(notice.replace(guidance[2], guidance[2] + '\n' + guidance[2]), f.manifest, f.contract, mobile));
-  for (const line of desktop.slice(1)) assert.throws(() => validateReleaseNotice(notice.replace(line, ''), f.manifest, f.contract, mobile));
-  assert.throws(() => validateReleaseNotice(notice.replace('v1.15.0-alpha.8', 'v1.15.0-alpha.12'), f.manifest, f.contract, mobile));
-  assert.throws(() => validateReleaseNotice(notice.replace(desktop[1], desktop[1] + '\n' + desktop[1]), f.manifest, f.contract, mobile));
-  assert.throws(() => assertSourceFirstRelease((path) => { assert.equal(path, 'src-tauri/core-manifest.json'); return encode(f.manifest); }), /Reviewed consumer contract SHA differs/);
-}));
-
-// Inert fixture acquisition checks the native-attempt receipt transport only.
-// It does not claim a real native download, signature or final carrier gate.
-test('published native gate rejects wrong attempt, host, source, adapter and asset snapshots', () => withFixture(async (f) => {
-  const context = releaseGateContext({ GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
-    GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' });
-  assert.throws(() => releaseGateContext({}), /Actions/);
-  const receipts = await consumeRelease(f.root, f.manifest, ['linux'], f);
-  const receipt = receipts.linux;
-  const facts = { schema: 'polaris-app-native-release-gate-v1', candidate: receipt.adapter.facts.candidate,
-    context, contractSha256: f.manifest.desktopRelease.contractSha256, platform: 'linux', host: 'linux', arch: 'x64',
-    receipt, readback: JSON.parse(readFileSync(join(f.root, 'resources/.release-receipts/public-readback.json'), 'utf8')),
-    indexSha256: f.contract.assetIndex.sha256,
-    inspection: 'download-extract-buildinfo-buildid-cronet-native-signature',
-    actualAppAcceptance: 'pending load, gvisor/mixed, feature and final carrier' };
-  const freeze = (value) => { const { fingerprint, ...rest } = value; return { ...rest, fingerprint: digest(portableCanonical(rest)) }; };
-  const gate = freeze(facts);
-  const verify = (value) => verifyNativeReleaseGate(value, f.contract, f.manifest.desktopRelease, receipt.adapter, context, 'linux');
-  verify(gate);
-  for (const mutate of [
-    (g) => { g.context.attempt = '2'; }, (g) => { g.context.runId = '456'; },
-    (g) => { g.host = 'win32'; }, (g) => { g.arch = 'arm64'; },
-    (g) => { g.contractSha256 = '0'.repeat(64); }, (g) => { g.indexSha256 = '0'.repeat(64); },
-    (g) => { g.candidate = '0'.repeat(40); }, (g) => { g.actualAppAcceptance = 'passed'; },
-    (g) => { g.readback.after.sourceCommit = '0'.repeat(40); },
-    (g) => { g.receipt.producer.sourceCommit = '0'.repeat(40); },
-    (g) => { g.receipt.adapter.facts.fileSha256['scripts/fetch-core.mjs'] = '0'.repeat(64); },
-    (g) => { g.receipt.publicReadback.assets.pop(); },
-  ]) {
-    const changed = structuredClone(gate); mutate(changed); assert.throws(() => verify(freeze(changed)));
-  }
-}));
-
-
-for (const ref of ['refs/heads/collab/s5-android-signal-20261010', 'refs/heads/collab/ui01-status-20261010'])
-  test(`cumulative strict Risk ${ref} accepts only published selection and exact manual run`, async () => withFixture(async (f) => {
-  const env = { POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true',
-    GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
-    GITHUB_REF: ref, GITHUB_SHA: candidate, GITHUB_RUN_ID: '900', GITHUB_RUN_ATTEMPT: '1',
-    GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}` };
-  assert.deepEqual(validationContext(candidate, env, f.root), { runId: '900', attempt: '1' });
-  // Execute the actual Package Bash prefix and actual Python admission. These
-  // fixtures never run a kernel, loader, installer or network request.
-  copyFileSync(join(repo, 'scripts/desktop-core/validation-origin.mjs'), join(f.root, 'scripts/desktop-core/validation-origin.mjs'));
-  const workflow = readFileSync(join(repo, '.github/workflows/package.yml'), 'utf8');
-  const body = workflow.match(/      - name: Resolve platform matrix[\s\S]*?        run: \|\n([\s\S]*?)          # 全量矩阵/)[1];
-  const bash = body.split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n');
-  const setupEnv = { ...process.env, ...env, SYSTEM_CANDIDATE: '', POLARIS_NO_KERNEL_RUN: '0', CORE_CANDIDATE: candidate,
-    EXPECTED_CANDIDATE: candidate, PLATFORMS_JSON: '["linux","windows"]',
-    CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-900-1`, CORE_RUN_ID: '900', CORE_RUN_ATTEMPT: '1',
-    VALIDATION_KERNEL: 'true', VALIDATION_UPLOAD: 'true', VALIDATION_LIGHT: 'false', VALIDATION_SKIP_QUALITY: 'true' };
-  const runBash = (changes = {}) => spawnSync('bash', ['-c', bash], { cwd: f.root, env: { ...setupEnv, ...changes }, encoding: 'utf8' });
-  const python = `import importlib.util,json,sys
-spec=importlib.util.spec_from_file_location('native',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-print(json.dumps(m.ci_context('linux',json.loads(sys.argv[2]),'Linux','amd64',root=sys.argv[3])))`;
-  const runPython = (changes = {}) => spawnSync(PYTHON, ['-B', '-c', python,
-    join(repo, 'scripts/native-payload-proof.py'), JSON.stringify({ ...env, ...changes }), f.root], { encoding: 'utf8' });
-  for (const run of [runBash, runPython]) {
-    let result = run(); assert.equal(result.status, 0, result.stdout + result.stderr);
-    for (const change of [{ POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }, { GITHUB_ACTIONS: 'false' },
-      { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REPOSITORY: 'other/Polaris' }, { GITHUB_REF: 'refs/heads/main' },
-      { GITHUB_REF: 'refs/tags/v1' }, { GITHUB_SHA: 'invalid' }, { GITHUB_RUN_ID: '0' }, { GITHUB_RUN_ATTEMPT: '0' },
-      { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}` }, { POLARIS_NO_KERNEL_RUN: '1' }]) {
-      // Native-validation=false is ordinary Package setup, so admission is not
-      // invoked there; Python must still reject it.
-      if (run === runBash && change.POLARIS_NATIVE_PAYLOAD_VALIDATION === '0') continue;
-      assert.notEqual(run(change).status, 0, JSON.stringify(change));
-    }
-  }
-  for (const change of [{ CORE_CANDIDATE: '0'.repeat(40) }, { EXPECTED_CANDIDATE: '0'.repeat(40) },
-    { CORE_BUNDLE_ARTIFACT: 'desktop-core-bundle-wrong' }, { CORE_RUN_ID: '901' }, { CORE_RUN_ATTEMPT: '2' },
-    { PLATFORMS_JSON: '["linux"]' }, { VALIDATION_KERNEL: 'false' }, { VALIDATION_UPLOAD: 'false' },
-    { VALIDATION_LIGHT: 'true' }, { VALIDATION_SKIP_QUALITY: 'false' }]) assert.notEqual(runBash(change).status, 0, JSON.stringify(change));
-
-  for (const change of [{ POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }, { GITHUB_ACTIONS: 'false' },
-    { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REPOSITORY: 'other/Polaris' },
-    { GITHUB_REF: 'refs/heads/main' }, { GITHUB_REF: 'refs/heads/collab/ui01-unapproved' }, { GITHUB_SHA: '0'.repeat(40) },
-    { GITHUB_RUN_ATTEMPT: '0' }, { GITHUB_RUN_ID: '0' },
-    { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}` },
-    { POLARIS_NO_KERNEL_RUN: '1' }]) {
-    assert.throws(() => validationContext(candidate, { ...env, ...change }, f.root), /exact non-tag/);
-  }
-  const path = join(f.root, f.manifest.desktopRelease.contractPath), original = readFileSync(path);
-  write(path, Buffer.concat([original, Buffer.from(' ')]));
-  assert.throws(() => validationContext(candidate, env, f.root), /SHA|hash|differs/i);
-  assert.notEqual(runBash().status, 0); assert.notEqual(runPython().status, 0);
-  write(path, original);
-  const manifestPath = join(f.root, 'src-tauri/core-manifest.json');
-  const sourceOnly = structuredClone(f.manifest); delete sourceOnly.desktopRelease;
-  write(manifestPath, encode(sourceOnly));
-  assert.throws(() => validationContext(candidate, env, f.root));
-  assert.notEqual(runBash().status, 0); assert.notEqual(runPython().status, 0);
-}));
-
-
-test('original native receipt and final assembly remain separately bound, with no provenance projection bypass', async () => withFixture(async (f) => {
-  await consumeRelease(f.root, f.manifest, Object.keys(RELEASE_TARGETS), f);
-  for (const key of Object.keys(RELEASE_TARGETS)) {
-    const row = f.contract.platforms[key], target = RELEASE_TARGETS[key];
-    const rootName = `polaris-box-${row.version}-${target.os}-${target.arch}`;
-    const bytes = readFileSync(join(f.root, 'resources', key, 'core-release/provenance.json'));
-    verifyReleaseProvenance(bytes, row, key);
-    assert.throws(() => verifyReleaseProvenance(Buffer.concat([bytes, Buffer.from(' ')]), row, key), /provenance bytes/);
-    const original = JSON.parse(bytes);
-    for (const mutate of [
-      (p) => { delete p.archive; }, (p) => { p.sourceCommit = '0'.repeat(40); },
-      (p) => { p.unreviewed = true; }, (p) => { p.finalPackageCronetSmoke = row.finalPackageCronetSmoke; },
-      (p) => { p.archive.name = 'other.tar.gz'; },
-      (p) => { p.archive.members[`${rootName}/${target.core}`] = '0'.repeat(64); },
-      (p) => { p.archive.members['../escape'] = '0'.repeat(64); },
-      (p) => { p.archive.unreviewed = true; },
-    ]) {
-      const changed = structuredClone(original); mutate(changed);
-      const raw = encode(changed), pin = structuredClone(row);
-      // Rebind only this synthetic member to exercise semantics beyond the byte hash.
-      pin.archive.members[`${rootName}/provenance.json`] = digest(raw);
-      assert.throws(() => verifyReleaseProvenance(raw, pin, key), /lineage|provenance differs/);
-    }
-    for (const mutate of [(r) => { delete r.finalPackageCronetSmoke; },
-      (r) => { r.finalPackageCronetSmoke.gvisorCompiled = false; },
-      (r) => { r.finalPackageCronetSmoke.os = 'other'; },
-      (r) => { r.finalPackageCronetSmoke.go = 'go1.27.1'; },
-      (r) => { r.finalPackageCronetSmoke.linkage = 'unknown'; }]) {
-      const changed = structuredClone(row); mutate(changed);
-      assert.throws(() => verifyReleaseProvenance(bytes, changed, key), /smoke binding/);
-    }
-  }
-}));
-
 test('selected managed mesh identity binds original release bytes, receipt and full version observation', async () => withFixture(async f => {
   await consumeRelease(f.root,f.manifest,['linux'],f);
   const core=join(f.root,'resources/linux/sing-box'), row=f.contract.platforms.linux; let versions=0;
-  const run=(command,args,options)=>{if(command===core){assert.deepEqual(args,['version']);versions++;return row.actualVersionOutput;}return f.run(command,args,options);};
+  const run=(command,args,options)=>{if(command===core){assert.deepEqual(args,['version']);versions++;return f.linuxVersionOutput;}return f.run(command,args,options);};
   const id=verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'});
   assert.equal(id.sourceCommit,commit);assert.equal(id.sourceTree,tree);assert.equal(id.coreSha256,row.core.sha256);
-  assert.equal(id.providerFingerprint,row.providerFingerprint);assert.equal(id.buildID,row.buildID);assert.equal(versions,1);
+  const raw=readFileSync(join(f.root,f.manifest.desktopRelease.contractPath));
+  assert.equal(id.providerFingerprint,digest(Buffer.concat([Buffer.from(UPSTREAM_INSTALLATION_DOMAIN),raw])));assert.equal(id.buildID,row.buildID);assert.equal(versions,1);
 }));
 test('selected managed mesh wrong core bytes fail before executing version', async () => withFixture(async f => {
   await consumeRelease(f.root,f.manifest,['linux'],f);
   const core=join(f.root,'resources/linux/sing-box'), bytes=readFileSync(core);bytes[220]^=1;writeFileSync(core,bytes);let versions=0;
-  const run=(command,args,options)=>{if(command===core){versions++;return f.contract.platforms.linux.actualVersionOutput;}return f.run(command,args,options);};
+  const run=(command,args,options)=>{if(command===core){versions++;return f.linuxVersionOutput;}return f.run(command,args,options);};
   assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'}),/bytes differ/);assert.equal(versions,0);
 }));
 test('selected managed mesh wrong Revision and nonzero version both fail after strict metadata verification', async () => withFixture(async f => {
   await consumeRelease(f.root,f.manifest,['linux'],f);const core=join(f.root,'resources/linux/sing-box'), row=f.contract.platforms.linux;
   for(const fail of ['revision','status']){let versions=0;
-   const run=(command,args,options)=>{if(command===core){versions++;if(fail==='status')throw Object.assign(Error('version status 7'),{status:7});return row.actualVersionOutput.replace(`Revision: ${commit}`,`Revision: ${'9'.repeat(40)}`);}return f.run(command,args,options);};
+   const run=(command,args,options)=>{if(command===core){versions++;if(fail==='status')throw Object.assign(Error('version status 7'),{status:7});return f.linuxVersionOutput.replace(`Revision: ${commit}`,`Revision: ${'9'.repeat(40)}`);}return f.run(command,args,options);};
    assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'}),fail==='status'?/version status 7/:/version output differs/);assert.equal(versions,1);
   }
 }));
-test('historical managed mesh refuses foreign hosts before inspecting or executing a core', () => withFixture(f => {
-  for(const host of [{os:'win32',arch:'x64'},{os:'linux',arch:'arm64'}])
-    assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,'/absent',()=>assert.fail('foreign execution'),host),/native Linux amd64/);
+test('managed mesh refuses unsupported hosts before inspecting or executing a core', () => withFixture(f => {
+  for(const host of [{os:'win32',arch:'arm64'},{os:'linux',arch:'arm64'}])
+    assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,'/absent',()=>assert.fail('foreign execution'),host),/supported native desktop host/);
 }));
 
 
@@ -848,73 +622,37 @@ test('dedicated Actions token is API-only while ambient tokens, assets and redir
   Object.assign(process.env, env);
   try {
   const fetch = async (url, options) => { calls.push({ url, ...options }); return new Response('ok'); };
-  await publicBytes('https://api.github.com/repos/polaris-arch/polaris-box/releases/17', 2, false, { fetch, env });
+  await publicBytes('https://api.github.com/repos/polaris-arch/sing-box-polaris/releases/17', 2, false, { fetch, env });
    assert.equal(calls.pop().headers.Authorization, 'Bearer inert-fixture-token');
    for (const outside of [{ GITHUB_ACTIONS: 'false', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token' },
      { GITHUB_ACTIONS: 'true', GH_TOKEN: 'ignored-fixture-token', GITHUB_TOKEN: 'ignored-fixture-token' }]) {
-     await publicBytes('https://api.github.com/repos/polaris-arch/polaris-box', 2, false, { fetch, env: outside });
+     await publicBytes('https://api.github.com/repos/polaris-arch/sing-box-polaris', 2, false, { fetch, env: outside });
      assert.equal(calls.pop().headers.Authorization, undefined);
    }
    for (const url of ['https://api.github.com/repos/other/repo',
-     'https://api.github.com/repos/polaris-arch/polaris-box?secret=fixture',
-     'https://api.github.com/repos/polaris-arch/polaris-box#fragment',
-     'https://fixture-user@api.github.com/repos/polaris-arch/polaris-box',
-     'http://api.github.com/repos/polaris-arch/polaris-box']) {
+     'https://api.github.com/repos/polaris-arch/sing-box-polaris?secret=fixture',
+     'https://api.github.com/repos/polaris-arch/sing-box-polaris#fragment',
+     'https://fixture-user@api.github.com/repos/polaris-arch/sing-box-polaris',
+     'http://api.github.com/repos/polaris-arch/sing-box-polaris']) {
      await publicBytes(url, 2, false, { fetch, env });
      assert.equal(calls.pop().headers.Authorization, undefined);
    }
   const assetFetch = async (url, options) => { calls.push({ url, ...options });
     return url.includes('github.com/') ? new Response(null, { status: 302,
       headers: { Location: 'https://release-assets.githubusercontent.com/inert?signature=fixture' } }) : new Response('ok'); };
-  await publicBytes('https://github.com/polaris-arch/polaris-box/releases/download/inert/core.zip', 2, true, { fetch: assetFetch, env });
+  await publicBytes('https://github.com/polaris-arch/sing-box-polaris/releases/download/inert/core.zip', 2, true, { fetch: assetFetch, env });
   assert.equal(calls.length, 2); assert(calls.every((call) => call.headers.Authorization === undefined));
   assert(calls.every((call) => call.redirect === 'manual'));
-  calls.length = 0;
-  assert.equal((await publicBytes(`https://github.com/polaris-arch/sing-box-polaris/archive/${commit}.tar.gz`, 2, true,
-    { fetch, env, repository: 'polaris-arch/sing-box-polaris' })).toString(), 'ok');
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, `https://codeload.github.com/polaris-arch/sing-box-polaris/tar.gz/${commit}`);
-  assert.equal(calls[0].headers.Authorization, undefined); assert.equal(calls[0].redirect, 'manual');
   } finally { for (const [key, value] of Object.entries(previous)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   } }
-});
-test('noncanonical source identities never become a codeload request', async () => {
-  const repository = 'polaris-arch/sing-box-polaris';
-  const source = `https://github.com/${repository}/archive/${commit}.tar.gz`;
-  const env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token' };
-  for (const url of [source.replace('https://', 'https://fixture-user:fixture-password@'),
-    source + '?ref=fixture', source + '#fixture',
-    source.replace(repository, 'polaris-arch/polaris-box'), source.replace(commit, commit.slice(1))]) {
-    const calls = [];
-    await assert.rejects(publicBytes(url, 2, true, { repository, env, fetch: async (requested, options) => {
-      calls.push(requested); assert.equal(options.headers.Authorization, undefined);
-      return new Response('denied', { status: 403 });
-    } }), /Release HTTP 403/);
-    assert.deepEqual(calls, [url]);
-  }
-});
-test('derived source origin is terminal even for same-origin or approved asset-CDN redirects', async () => {
-  const repository = 'polaris-arch/sing-box-polaris';
-  const terminal = `https://codeload.github.com/${repository}/tar.gz/${commit}`;
-  for (const location of [terminal, 'https://release-assets.githubusercontent.com/inert-source']) {
-    const calls = [];
-    await assert.rejects(publicBytes(`https://github.com/${repository}/archive/${commit}.tar.gz`, 2, true,
-      { repository, env: { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token' },
-        fetch: async (url, options) => {
-          calls.push(url); assert.equal(options.headers.Authorization, undefined);
-          assert.equal(options.redirect, 'manual');
-          return new Response(null, { status: 302, headers: { Location: location } });
-        } }), /Unapproved release redirect/);
-    assert.deepEqual(calls, [terminal]);
-  }
 });
 test('HTTP denial records phase, host, request-id and quota but neither credentials nor query and never blindly retries', async () => {
   const env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'never-log-fixture-secret' }; let requests = 0;
   const fetch = async () => { requests++; return new Response('failure', { status: 403,
     headers: { 'x-github-request-id': 'ABCD:1234', 'x-ratelimit-limit': '60', 'x-ratelimit-remaining': '0',
       'x-ratelimit-reset': '123', 'x-ratelimit-resource': 'core', 'retry-after': '7' } }); };
-  await assert.rejects(publicBytes('https://api.github.com/repos/polaris-arch/polaris-box?secret=fixture-query', 10, false, { fetch, env }),
+  await assert.rejects(publicBytes('https://api.github.com/repos/polaris-arch/sing-box-polaris?secret=fixture-query', 10, false, { fetch, env }),
     (error) => /Release HTTP 403/.test(error.message) && error.message.includes('stage=public-api host=api.github.com')
       && error.message.includes('x-github-request-id=ABCD:1234') && error.message.includes('x-ratelimit-limit=60')
       && error.message.includes('x-ratelimit-remaining=0') && error.message.includes('x-ratelimit-reset=123')
@@ -938,13 +676,13 @@ test('transport errors and signed asset denials expose only safe phase-host diag
 });
 test('repository public identity remains mandatory without relying on authenticated visibility', async () => withFixture(async (f) => {
   write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f);
-  f.transport.set(f.base, encode({ id: 1407705262, full_name: f.contract.repository, private: true }));
+  f.transport.set(f.base, encode({ id: 1421657509, full_name: f.contract.repository, private: true }));
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], f), /Repository identity differs/);
   assert.deepEqual(resources(f), before);
 }));
 
 const quotaNow = 1791755097242;
-const transportURL = 'https://api.github.com/repos/polaris-arch/polaris-box';
+const transportURL = 'https://api.github.com/repos/polaris-arch/sing-box-polaris';
 const codedTransportError = (code) => new TypeError('never-log-outer-secret', {
   cause: Object.assign(new Error('never-log-cause-address-or-query'), { code }) });
 test('recognized transient API transport gets one same-URL anonymous retry shared across all reads', async () => {
@@ -1031,7 +769,7 @@ test('transport recovery still rejects size and changed public identity without 
   write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f); calls = 0;
   const changed = releasePublicReader({ ...options, fetch: async () => {
     if (++calls === 1) throw codedTransportError('ECONNRESET');
-    return new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true })); } });
+    return new Response(encode({ id: 1421657509, full_name: f.contract.repository, private: true })); } });
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: changed }), /Repository identity differs/);
   assert.equal(calls, 2); assert.deepEqual(resources(f), before);
 }));
@@ -1064,7 +802,7 @@ test('short evidenced primary quota waits beyond reset once and retries the iden
   const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: (s) => reports.push(s),
     fetch: async (url, options) => { calls.push({ url, options });
       return calls.length === 2 ? new Response('ok') : new Response('denied', { status: 403, headers: shortQuotaHeaders }); } });
-  const url = 'https://api.github.com/repos/polaris-arch/polaris-box';
+  const url = 'https://api.github.com/repos/polaris-arch/sing-box-polaris';
   assert.equal((await read(url, 2)).toString(), 'ok');
   assert.deepEqual(waits, [30758]); assert.equal(calls.length, 2);
   assert.deepEqual(calls.map((c) => c.url), [url, url]);
@@ -1079,15 +817,15 @@ test('a second quota denial is terminal without another wait or request', async 
   let calls = 0; const waits = [];
   const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: () => {},
     fetch: async () => { calls++; return new Response('denied', { status: 429, headers: shortQuotaHeaders }); } });
-  await assert.rejects(read('https://api.github.com/repos/polaris-arch/polaris-box', 10), /Release HTTP 429/);
+  await assert.rejects(read('https://api.github.com/repos/polaris-arch/sing-box-polaris', 10), /Release HTTP 429/);
   assert.equal(calls, 2); assert.deepEqual(waits, [30758]);
 });
 test('unknown, expired, excessive, asset and noncanonical denials never consume a retry', async () => {
-  const base = 'https://api.github.com/repos/polaris-arch/polaris-box';
+  const base = 'https://api.github.com/repos/polaris-arch/sing-box-polaris';
   const cases = [
     { status: 401 }, { status: 404 }, { status: 500 }, { asset: true },
-    { url: 'https://github.com/repos/polaris-arch/polaris-box' },
-    { url: 'http://api.github.com/repos/polaris-arch/polaris-box' },
+    { url: 'https://github.com/repos/polaris-arch/sing-box-polaris' },
+    { url: 'http://api.github.com/repos/polaris-arch/sing-box-polaris' },
     { url: base + '?signature=never-log-query' }, { url: base.replace('https://', 'https://fixture-user@') },
     { url: 'https://api.github.com/repos/other/repository' },
     { headers: { 'x-ratelimit-limit': '5000' } }, { headers: { 'x-ratelimit-remaining': '1' } },
@@ -1115,7 +853,7 @@ test('quota recovery still enforces pinned response size and public identity wit
   write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f); calls = 0;
   const changed = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async () => {}, report: () => {},
     fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: shortQuotaHeaders })
-      : new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true })) });
+      : new Response(encode({ id: 1421657509, full_name: f.contract.repository, private: true })) });
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: changed }), /Repository identity differs/);
   assert.equal(calls, 2); assert.deepEqual(resources(f), before);
 }));
@@ -1149,151 +887,21 @@ test('absolute job deadline forbids an overrun, expired requests and a retry aft
   const fetch = async () => { requests++; return new Response('denied', { status: 403, headers: shortQuotaHeaders }); };
   const short = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 30000, fetch,
     sleep: async () => { waits++; }, report: () => {} });
-  await assert.rejects(short('https://api.github.com/repos/polaris-arch/polaris-box', 10), /Release HTTP 403/);
+  await assert.rejects(short('https://api.github.com/repos/polaris-arch/sing-box-polaris', 10), /Release HTTP 403/);
   assert.equal(requests, 1); assert.equal(waits, 0);
   const expired = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow - 1, fetch });
-  await assert.rejects(expired('https://api.github.com/repos/polaris-arch/polaris-box', 10), /job deadline exceeded/);
+  await assert.rejects(expired('https://api.github.com/repos/polaris-arch/sing-box-polaris', 10), /job deadline exceeded/);
   assert.equal(requests, 1);
   let clock = quotaNow; requests = 0;
   const cutoff = quotaNow + 31000;
   const late = releasePublicReader({ now: () => clock, deadlineMs: cutoff, fetch, report: () => {},
     sleep: async () => { waits++; clock = cutoff + 1; } });
-  await assert.rejects(late('https://api.github.com/repos/polaris-arch/polaris-box', 10), /job deadline exceeded/);
+  await assert.rejects(late('https://api.github.com/repos/polaris-arch/sing-box-polaris', 10), /job deadline exceeded/);
   assert.equal(requests, 1); assert.equal(waits, 1);
   for (const deadlineMs of ['bad', NaN, Infinity, quotaNow + 181 * 60000]) {
     assert.throws(() => releasePublicReader({ now: () => quotaNow, deadlineMs, fetch }), /absolute release-consumer deadline/);
   }
 });
-
-const handoffEnv = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_RUN_ID: '123',
-  GITHUB_RUN_ATTEMPT: '1', GITHUB_REF: 'refs/heads/inert', POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' };
-async function handoffFixture(f) {
-  await consumeRelease(f.root, f.manifest, undefined, f);
-  const before = resources(f), bundle = join(f.root, 'core-wire-inputs');
-  const options = { env: handoffEnv, run: f.run, host: 'linux' };
-  const name = createCoreWireHandoff(f.root, f.manifest, bundle, candidate, options);
-  for (const n of ['.release-receipts', 'core-recovery', ...Object.keys(RELEASE_TARGETS)]) rmSync(join(f.root, 'resources', n), { recursive: true });
-  return { before, bundle, options, name };
-}
-test('same-attempt wire handoff runs complete resource verification without repeating public consumption', async () => withFixture(async (f) => {
-  const h = await handoffFixture(f), calls = f.calls.length;
-  assert.equal(h.name, coreWireHandoffName(candidate, { runId: '123', attempt: '1' }));
-  const observation = importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options);
-  assert.equal(observation.candidate, candidate); assert.equal(observation.context.attempt, '1');
-  assert.deepEqual(resources(f), h.before); assert.equal(f.calls.length, calls);
-  for (const [key, target] of Object.entries(RELEASE_TARGETS)) {
-    verifyPackagedRelease(f.root, f.manifest, key, join(f.root, 'resources', key, target.core), f.run, 'linux');
-  }
-}));
-test('handoff rejects old attempts, source, artifact aliases, native mode and tags before resource writes', async () => withFixture(async (f) => {
-  const h = await handoffFixture(f);
-  const cases = [
-    { options: { ...h.options, env: { ...handoffEnv, GITHUB_RUN_ATTEMPT: '2' } } },
-    { options: { ...h.options, env: { ...handoffEnv, GITHUB_RUN_ID: '124' } } },
-    { options: { ...h.options, env: { ...handoffEnv, POLARIS_NATIVE_PAYLOAD_VALIDATION: '1' } } },
-    { options: { ...h.options, env: { ...handoffEnv, GITHUB_REF: 'refs/tags/inert' } } },
-    { candidate: 'd'.repeat(40) }, { name: h.name + '-alias' },
-  ];
-  for (const c of cases) {
-    assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, c.candidate ?? candidate,
-      c.name ?? h.name, c.options ?? h.options)); assert.deepEqual(resources(f), {});
-  }
-}));
-test('actual tar transport preserves executable modes despite artifact outer-file mode reset', async () => withFixture(async (f) => {
-  const h = await handoffFixture(f), packed = join(f.root, 'wire-archive');
-  const pin = packCoreWireHandoff(h.bundle, packed); assert(pin.archive.bytes > 0);
-  assert.equal(pin.archive.memberModes['core-wire-inputs/resources/linux/sing-box'], 0o755);
-  assert.equal(pin.archive.memberModes['core-wire-inputs/handoff.json'], 0o600);
-  for (const n of readdirSync(packed)) fs.chmodSync(join(packed, n), 0o644);
-  const payload = unpackCoreWireHandoff(packed, join(f.root, 'wire-extracted'));
-  assert.equal(fs.statSync(join(payload, 'resources/linux/sing-box')).mode & 0o777, 0o755);
-  importCoreWireHandoff(f.root, f.manifest, payload, candidate, h.name, h.options);
-  assert.deepEqual(resources(f), h.before);
-  const metadata = join(packed, 'archive.json'), frozenMetadata = readFileSync(metadata);
-  for (const field of ['profile', 'sourceArchive', 'wireTransport', 'target', 'memberBytes']) {
-    write(metadata, encode({ ...pin, [field]: 'untrusted domain selection' }));
-    const rejected = join(f.root, `wire-field-${field}`);
-    assert.throws(() => unpackCoreWireHandoff(packed, rejected), /Unexpected wire archive fields/);
-    assert.equal(existsSync(rejected), false);
-  }
-  for (const field of ['profile', 'memberBytes']) {
-    write(metadata, encode({ ...pin, archive: { ...pin.archive, [field]: 'untrusted' } }));
-    const rejected = join(f.root, `wire-record-${field}`);
-    assert.throws(() => unpackCoreWireHandoff(packed, rejected), /Unexpected wire archive record fields/);
-    assert.equal(existsSync(rejected), false);
-  }
-  write(metadata, frozenMetadata);
-  const changedMode = structuredClone(pin); changedMode.archive.memberModes['core-wire-inputs/resources/linux/sing-box'] = 0o644;
-  write(metadata, encode(changedMode));
-  const badMode = join(f.root, 'wire-mode-extracted');
-  assert.throws(() => unpackCoreWireHandoff(packed, badMode)); assert.equal(existsSync(badMode), false);
-  write(metadata, frozenMetadata);
-  const tar = join(packed, pin.archive.name), original = readFileSync(tar);
-  const changed = Buffer.from(original); changed[Math.floor(changed.length / 2)] ^= 1; write(tar, changed);
-  const rejected = join(f.root, 'wire-corrupt-extracted');
-  assert.throws(() => unpackCoreWireHandoff(packed, rejected)); assert.equal(existsSync(rejected), false);
-}));
-test('four bounded native inputs with full legal trees survive aggregate transport and complete import verification',
-  async () => withFixture(async (f) => {
-    const h = await handoffFixture(f), packed = join(f.root, 'wire-large-archive');
-    const pin = packCoreWireHandoff(h.bundle, packed);
-    assert(Object.keys(pin.archive.members).length > 3000);
-    for (const key of Object.keys(RELEASE_TARGETS)) {
-      const prefix = `core-wire-inputs/resources/${key}/`;
-      const count = Object.keys(pin.archive.members).filter((name) => name.startsWith(prefix)).length;
-      assert(count > 762 && count <= 1024);
-    }
-    const payload = unpackCoreWireHandoff(packed, join(f.root, 'wire-large-extracted'));
-    importCoreWireHandoff(f.root, f.manifest, payload, candidate, h.name, h.options);
-    assert.deepEqual(resources(f), h.before);
-  }, { legalMembers: 762 }));
-test('wire producer rejects real empty directories and one oversized platform before creating transport',
-  async () => withFixture(async (f) => {
-    const h = await handoffFixture(f), packed = join(f.root, 'wire-invalid-archive');
-    const unknown = join(h.bundle, 'unexpected-control'); write(unknown, 'inert');
-    assert.throws(() => packCoreWireHandoff(h.bundle, packed), /Unexpected wire handoff payload/);
-    assert.equal(existsSync(packed), false); rmSync(unknown);
-    const empty = join(h.bundle, 'resources/linux/unrecorded-empty'); mkdirSync(empty);
-    assert.throws(() => packCoreWireHandoff(h.bundle, packed), /wire directory inventory differs/);
-    assert.equal(existsSync(packed), false); rmSync(empty, { recursive: true });
-    const proofPath = join(h.bundle, 'handoff.json'), proof = JSON.parse(readFileSync(proofPath));
-    for (let n = 0; n < 1025; n++) {
-      const name = `linux/overflow-${n}`, raw = Buffer.from('inert legal fixture');
-      const path = join(h.bundle, 'resources', name); write(path, raw); fs.chmodSync(path, 0o644);
-      proof.files.push({ name, bytes: raw.length, sha256: digest(raw), mode: 0o644 });
-    }
-    proof.files.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    write(proofPath, encode(proof));
-    assert.throws(() => packCoreWireHandoff(h.bundle, packed), /wire platform member inventory limit/);
-    assert.equal(existsSync(packed), false);
-  }));
-test('handoff closes changed bytes, unsafe modes, links, extra members and changed manifest without writes', async () => withFixture(async (f) => {
-  const h = await handoffFixture(f), core = join(h.bundle, 'resources/linux/sing-box'), original = readFileSync(core);
-  const failed = () => { assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options)); assert.deepEqual(resources(f), {}); };
-  write(core, Buffer.alloc(original.length, 0)); failed(); write(core, original); fs.chmodSync(core, 0o755);
-  fs.chmodSync(core, 0o777); failed(); fs.chmodSync(core, 0o755);
-  const extra = join(h.bundle, 'resources/linux/extra'); write(extra, 'extra'); failed(); rmSync(extra);
-  symlinkSync(core, extra); failed(); rmSync(extra);
-  const recovery = join(h.bundle, 'resources/core-recovery/linux');
-  const inventory = join(recovery, 'inventory.json'), inventoryBytes = readFileSync(inventory);
-  rmSync(inventory); failed(); write(inventory, inventoryBytes);
-  const unknownPlatform = join(h.bundle, 'resources/core-recovery/other'); mkdirSync(unknownPlatform);
-  failed(); rmSync(unknownPlatform, { recursive: true });
-  const manifest = join(f.root, 'src-tauri/core-manifest.json'), raw = readFileSync(manifest);
-  write(manifest, Buffer.concat([raw, Buffer.from(' ')])); failed(); write(manifest, raw);
-}));
-test('handoff does not overwrite existing resources and invalid receipts roll back its own fresh copies', async () => withFixture(async (f) => {
-  const h = await handoffFixture(f); write(join(f.root, 'resources/linux/sing-box'), 'existing'); const before = resources(f);
-  assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options), /fresh resource destinations/);
-  assert.deepEqual(resources(f), before); rmSync(join(f.root, 'resources/linux'), { recursive: true });
-  const proofPath = join(h.bundle, 'handoff.json'), proof = JSON.parse(readFileSync(proofPath));
-  const receipt = join(h.bundle, 'resources/.release-receipts/linux.json'), raw = readFileSync(receipt);
-  const changed = Buffer.from(raw); changed[changed.indexOf(Buffer.from('polaris-app-release-consumption-v1'))] = 'x'.charCodeAt(0); write(receipt, changed);
-  const file = proof.files.find((r) => r.name === '.release-receipts/linux.json'); file.sha256 = digest(changed);
-  const { fingerprint, ...facts } = proof; write(proofPath, encode({ ...facts, fingerprint: digest(portableCanonical(facts)) }));
-  assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options), /consumption receipt differs/);
-  assert.deepEqual(resources(f), {});
-}));
 
 test('final Mac core uses its complete explicit release receipt for both targets without legacy metadata or signing', async () => withFixture(async (f) => {
   await consumeRelease(f.root, f.manifest, ['mac-x64', 'mac-arm64'], { ...f, host: 'darwin' });
@@ -1302,7 +910,7 @@ test('final Mac core uses its complete explicit release receipt for both targets
     const stage = join(f.root, 'final-carrier', key); cpSync(join(f.root, 'resources', key), stage, { recursive: true });
     cpSync(join(f.root, 'resources/core-recovery', key), join(dirname(stage), 'core-recovery', key), { recursive: true });
     const binary = join(stage, 'sing-box'), before = readFileSync(binary);
-    const receipt = verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run);
+    const receipt = verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin');
     assert.equal(receipt.schema, 'polaris-app-release-consumption-v1');
     assert.deepEqual(receipt.producer, f.contract.platforms[key]); assert.deepEqual(readFileSync(binary), before);
     assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
@@ -1316,20 +924,20 @@ test('final Mac recovery verifies delivered archive and inventory instead of int
     cpSync(join(f.root, 'resources', key), payload, { recursive: true });
     cpSync(join(f.root, 'resources/core-recovery', key), recovery, { recursive: true });
     const binary = join(payload, 'sing-box');
-    assert.equal(verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run).platform, key);
+    assert.equal(verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin').platform, key);
     const archive = join(recovery, f.contract.platforms[key].archive.name), original = readFileSync(archive);
     const changed = Buffer.from(original); changed[changed.length - 1] ^= 1; write(archive, changed);
-    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Recovery compressed bytes differ/);
+    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Recovery compressed bytes differ/);
     write(archive, original);
     const inventory = join(recovery, 'inventory.json'), raw = readFileSync(inventory);
     const altered = JSON.parse(raw); altered.platform = key === 'mac-arm64' ? 'mac-x64' : 'mac-arm64'; write(inventory, encode(altered));
-    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Recovery inventory differs/);
+    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Recovery inventory differs/);
     write(inventory, raw); rmSync(archive);
-    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Extra\/missing recovery/);
+    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Extra\/missing recovery/);
     symlinkSync(join(f.root, 'resources/core-recovery', key, f.contract.platforms[key].archive.name), archive);
-    assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run), /Linked or non-regular recovery/);
+    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Linked or non-regular recovery/);
     rmSync(archive); write(archive, original);
-    assert.equal(verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run).platform, key);
+    assert.equal(verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin').platform, key);
     assert.deepEqual(readFileSync(join(f.root, 'resources/core-recovery', key, f.contract.platforms[key].archive.name)), original);
   }
   assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
@@ -1339,10 +947,10 @@ test('Mac release selection rejects invalid or missing release receipts without 
   const core = join(f.root, 'resources/mac-arm64/sing-box');
   write(join(f.root, 'resources/.source-receipts/mac-arm64.json'), 'legacy must not be read');
   for (const desktopRelease of [null, {}, { ...f.manifest.desktopRelease, contractSha256: '0'.repeat(64) }]) {
-    assert.throws(() => verifyMacPackagedCore(f.root, { ...f.manifest, desktopRelease }, 'mac-arm64', core, f.run));
+    assert.throws(() => verifyPackagedCore(f.root, { ...f.manifest, desktopRelease }, 'mac-arm64', core, f.run, 'darwin'));
   }
   const receipt = join(f.root, 'resources/.release-receipts/mac-arm64.json'); rmSync(receipt);
-  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', core, f.run));
+  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', core, f.run, 'darwin'));
   assert.equal(readFileSync(join(f.root, 'resources/.source-receipts/mac-arm64.json'), 'utf8'), 'legacy must not be read');
 }));
 test('final Mac release verification closes changed CDHash, bytes, missing notice and added sidecar', async () => withFixture(async (f) => {
@@ -1350,17 +958,17 @@ test('final Mac release verification closes changed CDHash, bytes, missing notic
   const stage = join(f.root, 'final-carrier/mac-arm64'); cpSync(join(f.root, 'resources/mac-arm64'), stage, { recursive: true });
   cpSync(join(f.root, 'resources/core-recovery/mac-arm64'), join(dirname(stage), 'core-recovery/mac-arm64'), { recursive: true });
   const binary = join(stage, 'sing-box'), raw = readFileSync(binary);
-  write(binary, Buffer.alloc(raw.length)); assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run)); write(binary, raw);
+  write(binary, Buffer.alloc(raw.length)); assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin')); write(binary, raw);
   const wrong = (cmd, args, opts) => {
     const output = f.run(cmd, args, opts);
     return cmd === 'codesign' && args[0] === '--display'
       ? output.replace(/CDHash=([a-f0-9]{40})/, (_match, hash) => `CDHash=${hash[0] === '0' ? '1' : '0'}${hash.slice(1)}`) : output;
   };
-  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, wrong), /signature/);
+  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, wrong, 'darwin'), /signature/);
   const notice = join(stage, 'core-release/NOTICE'); const content = readFileSync(notice); rmSync(notice);
-  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run)); write(notice, content);
+  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin')); write(notice, content);
   write(join(stage, 'libcronet.dylib'), 'extra');
-  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run), /Static carrier contains Cronet sidecar/);
+  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin'), /Static carrier contains Cronet sidecar/);
   assert.deepEqual(readFileSync(binary), raw);
 }));
 
@@ -1391,12 +999,12 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
         cpSync(join(f.root, 'resources', key), payload, { recursive: true });
         cpSync(join(f.root, 'resources/core-recovery', key), join(dirname(payload), 'core-recovery', key), { recursive: true });
         const binary = join(payload, 'sing-box'), original = readFileSync(binary);
-        assert.equal(verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run).platform, key);
+        assert.equal(verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin').platform, key);
         // Canonicalizing only the new temporary root does not admit a linked
         // payload directory, linked core, or the original alias spelling.
         const linkedDirectory = join(mount, `${key}-linked-payload`);
         symlinkSync(payload, linkedDirectory, 'dir');
-        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, join(linkedDirectory, 'sing-box'), f.run), /Linked release ancestor/);
+        assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, join(linkedDirectory, 'sing-box'), f.run, 'darwin'), /Linked release ancestor/);
         const linkedCore = join(mount, `${key}-linked-core`, 'sing-box');
         mkdirSync(dirname(linkedCore)); symlinkSync(binary, linkedCore);
         assert(fs.lstatSync(linkedCore).isSymbolicLink(), 'the adversary must remain a real filesystem link');
@@ -1414,10 +1022,10 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
           assert.equal(command, 'git', 'Final-carrier rejection must precede core inspection');
           return f.run(command, args, options);
         };
-        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, linkedCore, noCoreInspection),
+        assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, linkedCore, noCoreInspection, 'darwin'),
           { message: modeDiffers ? 'Final release core permissions differ' : `Non-regular release path: ${linkedCore}` });
         const aliasBinary = join(mountAlias, `${key}.app/Contents/Resources`, key, 'sing-box');
-        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, aliasBinary, f.run), /Linked release ancestor/);
+        assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, aliasBinary, f.run, 'darwin'), /Linked release ancestor/);
         assert.deepEqual(readFileSync(binary), original);
       }
     }
@@ -1484,7 +1092,7 @@ test('metadata cache is per-reader, bounded to five URLs, and never retains asse
   await read(transportURL + '/releases/0', 2); assert.equal(calls.at(-1).options.headers['If-None-Match'], '"one"');
   await releasePublicReader({ env: {}, fetch, report: () => {} })(transportURL + '/releases/0', 2);
   assert.equal(calls.at(-1).options.headers['If-None-Match'], undefined);
-  const asset = 'https://github.com/polaris-arch/polaris-box/releases/download/inert/core.zip';
+  const asset = 'https://github.com/polaris-arch/sing-box-polaris/releases/download/inert/core.zip';
   await read(asset, 2, true); await read(asset, 2, true);
   assert(calls.slice(-2).every((c) => c.options.headers['If-None-Match'] === undefined && c.options.headers.Authorization === undefined));
 });
@@ -1504,7 +1112,7 @@ test('conditional second snapshot rejects changed public identity and leaves old
     const count = (counts.get(url) ?? 0) + 1; counts.set(url, count); assert(f.transport.has(url));
     if (url === f.base && count === 2) {
       assert.equal(options.headers['If-None-Match'], '"one"');
-      return new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true }), { headers: { etag: '"changed"' } });
+      return new Response(encode({ id: 1421657509, full_name: f.contract.repository, private: true }), { headers: { etag: '"changed"' } });
     }
     assert.equal(options.headers['If-None-Match'], undefined);
     return new Response(f.transport.get(url), { headers: url.startsWith('https://api.github.com/') ? { etag: '"one"' } : {} });
@@ -1546,7 +1154,7 @@ test('all five fresh second-snapshot 304 checks preserve strict receipts without
   assert.deepEqual(receipts.linux.producer, f.contract.platforms.linux);
   assert.equal([...counts].filter(([url]) => url.startsWith('https://api.github.com/')).length, 5);
   assert([...counts].filter(([url]) => url.startsWith('https://api.github.com/')).every(([, count]) => count === 2));
-  assert.equal(counts.get(f.contract.assetIndex.url), 1); assert.equal(counts.get(f.contract.platforms.linux.releaseAsset.url), 1);
+  assert.equal(counts.get(f.contract.platforms.linux.releaseAsset.url), 1);
 }));
 
 
@@ -1616,7 +1224,7 @@ test('conditional cache requires the exact URL and intact bytes even for weak-eq
 test('default native consumer captures codesign stderr/status without exposing the dedicated API token', async () => withFixture(async (f) => {
   const original = { execFileSync: childProcess.execFileSync, spawnSync: childProcess.spawnSync };
   const previous = process.env.POLARIS_RELEASE_API_TOKEN;
-  const key = 'mac-arm64', display = f.contract.platforms[key].signatureObservation.core.codeSignatureInspection;
+  const key = 'mac-arm64', display = f.displays[key];
   let observed = [], scenario = { status: 0, stdout: '', stderr: display };
   process.env.POLARIS_RELEASE_API_TOKEN = 'never_log_native_fixture_secret';
   childProcess.execFileSync = (command, args, settings) => {
@@ -1661,19 +1269,6 @@ test('default native consumer captures codesign stderr/status without exposing t
   }
 }));
 
-
-test('historical producer Go remains closed and cannot be relabeled as final-source policy', () => {
-  const { root, contract } = fixture();
-  try {
-    assert.equal(validateReleaseContract(contract), contract);
-    const wrongGo = structuredClone(contract);
-    wrongGo.platforms.linux.sourceFingerprint.goVersion = 'go1.27.2';
-    assert.throws(() => validateReleaseContract(wrongGo), /source facts|toolchain/);
-    const relabeled = structuredClone(contract);
-    relabeled.sourcePolicy = { sourceCommit: contract.sourceCommit, sourceTree: contract.sourceTree };
-    assert.throws(() => validateReleaseContract(relabeled), /Historical release/);
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});
 
 // Same tag/version is intentionally insufficient: actual contract, archived
 // bytes and acquisition receipts must change together. Native payloads are inert.
@@ -1721,143 +1316,6 @@ test('NA02 unchanged bytes reject setuid/setgid/sticky on final core, sidecar an
     });
   }
 });
-
-// Execute the existing source-proof call site with an injected child process.
-// No archive, native core, network, or full release fixture is executed here.
-function coldSourceCallFixture() {
-  const source = readFileSync(new URL('./release-consumer.mjs', import.meta.url), 'utf8');
-  const helper = source.indexOf('function runColdArchive('), helperEnd = source.indexOf('\nconst CONTRACT_PATH', helper);
-  const entry = source.indexOf('export async function consumeRelease(');
-  const start = source.indexOf("      runColdArchive(run, 'source-archive-validation'", entry);
-  const end = source.indexOf('\n    }', start);
-  assert.ok(helper >= 0 && helperEnd > helper && entry >= 0 && start > entry && end > start);
-  const timeout = Number(source.match(/const LOCAL_ARCHIVE_TIMEOUT_MS = ([0-9_]+);/)[1].replaceAll('_', ''));
-  const invoke = new Function('run', 'contract', 'before', 'sourceFile', 'join', 'dirname', 'fileURLToPath',
-    'moduleURL', 'LOCAL_ARCHIVE_TIMEOUT_MS', source.slice(helper, helperEnd)
-      + source.slice(start, end).replaceAll('import.meta.url', 'moduleURL'));
-  const f = sourceProofCallFixture();
-  const contract = { ...f.contract, platforms: {
-    linux: { sourceIdentity: f.row.sourceIdentity, buildGraph: { localReplacements: [{ module: 'inert-linux' }] } },
-    win: { buildGraph: { localReplacements: [{ module: 'inert-win' }] } },
-  } };
-  const sourceFile = join('inert', 'acquiring', contract.sourceArchive.name);
-  return { contract, before: f.snapshot, sourceFile, run(child) {
-    invoke(child, contract, f.snapshot, sourceFile, join, dirname, fileURLToPath,
-      new URL('./release-consumer.mjs', import.meta.url).href, timeout);
-  } };
-}
-
-test('cold source archive invocation preserves every proof input and bounds its actual child call', () => {
-  const f = coldSourceCallFixture();
-  let calls = 0;
-  f.run((command, args, options) => {
-    calls++;
-    assert.equal(command, PYTHON);
-    assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)), f.sourceFile, '--source-trusted-proofs']);
-    assert.deepEqual(options, { input: JSON.stringify({ sourceArchive: f.contract.sourceArchive,
-      sourceCommit: f.contract.sourceCommit, sourceTree: f.contract.sourceTree,
-      sourceGitlinks: f.before.sourceGitlinks,
-      legalFiles: f.contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })),
-      sourceIdentity: f.contract.platforms.linux.sourceIdentity, trustedSourceSelection:'formal', trustedRows:Object.values(f.contract.platforms).map(({releaseAsset,...row})=>row), trustedProducer:f.contract.producer,
-      buildReplacements: Object.values(f.contract.platforms).flatMap(row => row.buildGraph.localReplacements),
-      sourcePolicy: f.contract.sourcePolicy }), encoding: 'utf8', maxBuffer: 1024 * 1024,
-      timeout: 120_000, killSignal: 'SIGKILL' });
-    return '';
-  });
-  assert.equal(calls, 1);
-});
-
-test('cold source failure reports only bounded child facts and fixed progress, without retries', () => {
-  for (const buffer of [false, true]) {
-    const f = coldSourceCallFixture(); let calls = 0;
-    const secret = 'never_log_cold_source_request_or_token';
-    const stderr = `${secret}\nSOURCE_ARCHIVE_PROOF stage=stdin-read elapsed_ms=2\n`
-      + 'SOURCE_ARCHIVE_PROOF stage=archive-members-verified elapsed_ms=547\n'
-      + `SOURCE_ARCHIVE_PROOF stage=${secret} elapsed_ms=999\n${secret}`;
-    assert.throws(() => f.run((command, args, options) => {
-      calls++; assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
-      throw Object.assign(Error(`${secret} ${options.input} /private/build/path`),
-        { code: 'ETIMEDOUT', status: null, signal: 'SIGKILL', stderr: buffer ? Buffer.from(stderr) : stderr });
-    }), error => {
-      assert.match(error.message, /stage=source-archive-validation; elapsedMs=\d+; timeoutMs=120000; code=ETIMEDOUT; status=unknown; signal=SIGKILL; progress=archive-members-verified@547ms/);
-      assert.doesNotMatch(String(error), /never_log|private\/build|never_log_source_proof_input/);
-      assert.equal(error.cause, undefined);
-      return true;
-    });
-    assert.equal(calls, 1);
-  }
-  const f = coldSourceCallFixture();
-  assert.throws(() => f.run(() => { throw { code: 'never_log_code', status: 'never_log_status',
-    signal: 'never_log_signal', stderr: 'never_log_stderr' }; }),
-    /code=unknown; status=unknown; signal=unknown; progress=unknown/);
-});
-
-function sourceProofCallFixture() {
-  const source = readFileSync(new URL('./release-consumer.mjs', import.meta.url), 'utf8');
-  const entry = source.indexOf('export function verifyPackagedRelease(');
-  const start = source.indexOf('  if (isUpstreamRelease(contract)) {', entry);
-  const end = source.indexOf('\n  return receipt;', start);
-  assert.ok(entry >= 0 && start > entry && end > start);
-  const timeout = Number(source.match(/const LOCAL_ARCHIVE_TIMEOUT_MS = ([0-9_]+);/)[1].replaceAll('_', ''));
-  const invoke = new Function('isUpstreamRelease', 'run', 'contract', 'row', 'snapshot', 'core', 'key',
-    'join', 'dirname', 'fileURLToPath', 'moduleURL', 'LOCAL_ARCHIVE_TIMEOUT_MS', 'performance',
-    source.slice(start, end).replaceAll('import.meta.url', 'moduleURL'));
-  const contract = { sourceArchive: { name: 'inert-source.tar.gz', bytes: 7, sha256: 'a'.repeat(64) },
-    sourceCommit: 'b'.repeat(40), sourceTree: 'c'.repeat(40),
-    legalFiles: [{ path: 'licenses/LICENSE', content: 'never_log_source_proof_input', bytes: 27, sha256: 'e'.repeat(64) }], sourcePolicy: { fixture: true } };
-  const row = { sourceIdentity: { fixture: true }, buildGraph: { localReplacements: [{ fixture: true }] } };
-  const snapshot = { sourceGitlinks: [{ path: 'inert', sha: 'd'.repeat(40) }] };
-  return { contract, row, snapshot, run(key, child, upstream = true) {
-    const ticks = [1000, 121499];
-    return invoke(() => upstream, child, contract, row, snapshot, join('inert', key, 'sing-box'), key,
-      join, dirname, fileURLToPath, new URL('./release-consumer.mjs', import.meta.url).href, timeout,
-      { now: () => ticks.shift() });
-  } };
-}
-
-test('source archive reproof preserves complete inputs and its existing 120-second budget', () => {
-  const f = sourceProofCallFixture();
-  for (const key of Object.keys(RELEASE_TARGETS)) {
-    let calls = 0;
-    f.run(key, (command, args, options) => {
-      calls++;
-      assert.equal(command, PYTHON);
-      assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)),
-        join('inert', key, 'core-release/source', f.contract.sourceArchive.name), '--source-trusted-proofs']);
-      assert.deepEqual(options, { input: JSON.stringify({ sourceArchive: f.contract.sourceArchive,
-        sourceCommit: f.contract.sourceCommit, sourceTree: f.contract.sourceTree,
-        sourceGitlinks: f.snapshot.sourceGitlinks, legalFiles: f.contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })),
-        sourceIdentity: f.row.sourceIdentity, trustedSourceSelection:'formal', trustedRows:[(({releaseAsset,...original})=>original)(f.row)], trustedProducer:f.contract.producer, buildReplacements: f.row.buildGraph.localReplacements,
-        sourcePolicy: f.contract.sourcePolicy }), encoding: 'utf8', maxBuffer: 1024 * 1024,
-        timeout: 120_000, killSignal: 'SIGKILL' });
-      return '';
-    });
-    assert.equal(calls, 1);
-  }
-  f.run('linux', () => assert.fail('Historical release must not enter upstream proof'), false);
-});
-
-test('source archive reproof failures identify platform, archive, stage and elapsed time without retries', () => {
-  const f = sourceProofCallFixture();
-  for (const key of Object.keys(RELEASE_TARGETS)) {
-    for (const failure of [Object.assign(new Error('spawnSync python3 ETIMEDOUT'), { code: 'ETIMEDOUT', status: null, signal: 'SIGKILL' }),
-      Object.assign(new Error('source tree differs'), { status: 7, signal: null }),
-      Object.assign(new Error('spawnSync python3 ENOBUFS'), { code: 'ENOBUFS' }), new Error('source proof rejected')]) {
-      let calls = 0;
-      assert.throws(() => f.run(key, () => { calls++; throw failure; }), error => {
-        assert.equal(error.cause, failure);
-        for (const field of [`platform=${key}`, 'archive=inert-source.tar.gz', 'stage=source-archive-reproof',
-          'elapsedMs=120499', 'timeoutMs=120000', `code=${failure.code ?? 'unknown'}`,
-          `status=${failure.status ?? 'unknown'}`, `signal=${failure.signal ?? 'unknown'}`, failure.message])
-          assert.ok(error.message.includes(field), field);
-        assert.doesNotMatch(error.message, /never_log_source_proof_input/);
-        return true;
-      });
-      assert.equal(calls, 1);
-    }
-  }
-});
-
 
 // Private raw-transport stores only; no new unit writes the host user's cache.
 async function withBlobCache(t, fn, options) {
@@ -2009,7 +1467,6 @@ test('raw cache warm hits preserve fresh metadata/profile/transaction gates afte
         }});
         assert.equal(snapshots,2);assert.deepEqual(resources(f),installed);
         assert.equal(payloadCalls(f).length-networkBefore,mutation==='initial-EIO'?1:0);
-        assert.equal(receipt.linux.adapter.facts.candidate,candidate);
         verifyPackagedRelease(f.root,f.manifest,'linux',join(f.root,'resources/linux/sing-box'),f.run);
       }finally{fs.openSync=originalOpen;syncBuiltinESMExports();}
       // Restore only this test's private inert transport for the next mutation.

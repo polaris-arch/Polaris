@@ -11,6 +11,6 @@
 #   真值在仓根与 resources/data/，由构建重新铺。
 /src/main/assets/_up_/
 
-# libbox.aar 112 MiB，不入库。它由 `scripts/build-libbox.sh` 从 sing-box v1.14.0 tag 现场构建
-# （上游没有为本 pin 发布预编译 aar，故不能像桌面内核那样 fetch）。sha256 收据见该脚本头注。
+# libbox.aar 112 MiB，不入库。它由 `scripts/build-mobile-core.sh android` 按
+# `scripts/mobile-core/source-contract.json` 现场构建（见 scripts/mobile-core/README.md）。
 /libs/

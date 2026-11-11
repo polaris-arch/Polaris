@@ -138,38 +138,18 @@ fn package_workflow_runs_full_gate_after_cronet_and_outbounds_gate() {
         raw.contains("POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}"),
         "package 的真核门必须接收 matrix.label；macos-x64 不能按 arm64 宿主误选核"
     );
-    let cronet_linux = raw
-        .find("run: node scripts/fetch-cronet.mjs --platform=linux")
-        .expect("package.yml 缺 Linux Cronet SO 拉取；Linux 真核门不能初始化 naive");
-    let cronet_windows = raw
-        .find("run: node scripts/fetch-cronet.mjs --platform=win")
-        .expect("package.yml 缺 Windows Cronet DLL 拉取；Windows 真核门不能初始化 naive");
+    let fetch = raw
+        .find("run: node scripts/fetch-core.mjs")
+        .expect("package.yml 缺随包核（含 Cronet sidecar）拉取；真核门不能初始化 naive");
     let outbounds = raw.find(OUTBOUNDS_GATE).expect("package.yml 缺出站真核门");
     let full = raw
         .find(FULL_CONFIG_GATE)
         .expect("package.yml 缺完整配置真核门");
     assert!(
-        cronet_linux < outbounds && cronet_windows < outbounds,
-        "Linux SO 与 Windows DLL 的拉取都必须早于第一道出站真核门"
+        fetch < outbounds,
+        "随包核与 Cronet sidecar 的拉取必须早于第一道出站真核门"
     );
     assert!(outbounds < full, "完整配置门必须位于出站真核门之后");
-    assert!(
-        raw.contains(
-            "- name: Fetch cronet library (Linux, SHA256-pinned)\n        if: runner.os == 'Linux'\n        run: node scripts/fetch-cronet.mjs --platform=linux"
-        ),
-        "package.yml 的 Linux 腿必须只拉 libcronet.so"
-    );
-    assert!(
-        raw.contains(
-            "- name: Fetch cronet library (Windows, SHA256-pinned)\n        if: runner.os == 'Windows'\n        run: node scripts/fetch-cronet.mjs --platform=win"
-        ),
-        "package.yml 的 Windows 腿必须只拉 libcronet.dll"
-    );
-    assert_eq!(
-        raw.matches("run: node scripts/fetch-cronet.mjs").count(),
-        2,
-        "package.yml 只能有 Linux/Windows 两个动态 Cronet 拉取步骤；macOS 的 cronet 静态编入核心"
-    );
     assert_hardened_full_gate_after_outbounds(&raw, "package.yml");
 }
 
@@ -177,26 +157,15 @@ fn package_workflow_runs_full_gate_after_cronet_and_outbounds_gate() {
 #[test]
 fn release_risk_runs_hardened_full_gate_after_cronet_and_outbounds_gate() {
     let raw = workflow("release-risk");
-    let cronet = raw
-        .find("run: node scripts/fetch-cronet.mjs --platform=linux")
-        .expect("release-risk.yml 缺 Linux Cronet SO 拉取；Ubuntu 真核门不能初始化 naive");
+    let fetch = raw.find("run: node scripts/fetch-core.mjs").expect(
+        "release-risk.yml 缺随包核（含 Linux Cronet SO）拉取；Ubuntu 真核门不能初始化 naive",
+    );
     let full = raw
         .find(FULL_CONFIG_GATE)
         .expect("release-risk.yml 缺完整配置真核门");
     assert!(
-        cronet < full,
-        "release-risk 的完整配置门必须位于 Linux Fetch cronet 之后"
-    );
-    assert_eq!(
-        raw.matches("run: node scripts/fetch-cronet.mjs").count(),
-        1,
-        "release-risk 的 Ubuntu 预检只应拉 Linux Cronet SO"
-    );
-    assert!(
-        raw.contains(
-            "- name: Fetch cronet library (Linux)\n        if: needs.classify.outputs.kernel == 'true'\n        run: node scripts/fetch-cronet.mjs --platform=linux"
-        ),
-        "release-risk 的 Ubuntu 预检必须显式只拉 Linux Cronet SO"
+        fetch < full,
+        "release-risk 的完整配置门必须位于 Fetch sing-box core 之后"
     );
     assert!(
         raw.contains("Run mandatory bundled-core gates")

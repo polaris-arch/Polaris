@@ -680,32 +680,6 @@ mod temp_native {
     }
     #[cfg(not(target_os = "android"))]
     impl TempNativeBirthRef {
-        pub(crate) fn verify_census_dispatch(
-            &self,
-            custody: &Arc<()>,
-            birth: &Arc<()>,
-        ) -> Result<(), String> {
-            let binding = self
-                .0
-                .binding
-                .get()
-                .ok_or("Temp original binding missing")?;
-            if binding.login.is_some()
-                || !Arc::ptr_eq(&binding.custody, custody)
-                || !Arc::ptr_eq(&binding.birth, birth)
-            {
-                return Err("Temp census belongs to a foreign custody/birth".into());
-            }
-            if self.0.factory_entered.load(Ordering::SeqCst)
-                && self.0.member.get().is_none()
-                && self.0.no_child.get().is_none()
-            {
-                Err("original Temp factory has not returned".into())
-            } else {
-                Ok(())
-            }
-        }
-
         #[cfg(all(test, not(target_os = "android")))]
         #[cfg(unix)]
         pub(crate) fn replayed_preparation_for_test(&self) -> PreparedTempNativeBirth {
@@ -818,21 +792,6 @@ mod temp_native {
             }
             Ok(())
         }
-        pub(super) fn verify_census_dispatch(
-            &self,
-            registry: &Arc<super::RegistryIdentity>,
-            epoch: u64,
-        ) -> Result<(), String> {
-            self.validate_binding(registry, epoch)?;
-            if self.0.factory_entered.load(Ordering::SeqCst)
-                && self.0.member.get().is_none()
-                && self.0.no_child.get().is_none()
-            {
-                return Err("original Login factory has not returned".into());
-            }
-            Ok(())
-        }
-
         pub(super) fn validate_exit(
             &self,
             registry: &Arc<super::RegistryIdentity>,
@@ -2073,85 +2032,6 @@ pub(crate) enum TsRegistryOwnerState {
     Vacant,
 }
 
-pub(crate) struct LoginProducerCapture<'a> {
-    _gate: tokio::sync::MutexGuard<'a, ()>,
-    view: LoginProducerView,
-}
-
-impl LoginProducerCapture<'_> {
-    pub(crate) fn into_view(self) -> LoginProducerView {
-        self.view
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct LoginProducerView {
-    shared: Arc<Shared>,
-    attempts: Vec<Arc<Attempt>>,
-    entries: Vec<LoginProducerMember>,
-}
-
-#[derive(Clone)]
-struct LoginProducerMember {
-    id: String,
-    epoch: u64,
-    native: Option<LoginNativeBirthRef>,
-    child: Option<LoginChildCustody>,
-    closed: watch::Receiver<Option<Result<(), String>>>,
-}
-
-impl LoginProducerView {
-    pub(crate) fn member_count(&self) -> usize {
-        self.attempts.len() + self.entries.len()
-    }
-
-    pub(crate) fn verify_surrender(&self) -> Result<(), String> {
-        let entries = self
-            .shared
-            .entries
-            .lock()
-            .map_err(|_| "Login registry poisoned")?;
-        for attempt in &self.attempts {
-            if attempt.claimed.load(Ordering::SeqCst)
-                && !attempt.is_finished()
-                && !attempt.process_owned.load(Ordering::SeqCst)
-            {
-                return Err("original Login pipeline has not returned to custody".into());
-            }
-        }
-        for member in &self.entries {
-            if let Some(native) = &member.native {
-                native.verify_census_dispatch(&self.shared.identity, member.epoch)?;
-                if native.terminal(&self.shared.identity, member.epoch).is_ok() {
-                    continue;
-                }
-            }
-            let Some(current) = entries
-                .get(&member.id)
-                .filter(|entry| entry.epoch == member.epoch)
-            else {
-                return Err("Login row disappeared without original native/tail terminal".into());
-            };
-            if !match (&member.native, &current.native) {
-                (Some(a), Some(b)) => a.same(b),
-                (None, None) => true,
-                _ => false,
-            } {
-                return Err("Login original native binding changed".into());
-            }
-            let same_child = match (&member.child, &current._child) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                (None, None) => member.native.is_some(),
-                _ => false,
-            };
-            if !same_child || !matches!(&*member.closed.borrow(), None | Some(Ok(()))) {
-                return Err("original Login custody cannot receive the responsibility".into());
-            }
-        }
-        Ok(())
-    }
-}
-
 /// 瞬态登录核生命周期注册表。持有注入的 spawner/checker/binary-resolver（生产真实现，测试 mock）。
 ///
 /// 支撑：kill-on-relogin、超时自动杀、取消、自然退出 reap。与 `ProxyRuntime` 的常驻代理核隔离。
@@ -2438,33 +2318,6 @@ impl LoginCoreRegistry {
     /// opening the same Tailscale state.
     async fn cancel_and_wait(&self, server_id: &str) -> Result<(), String> {
         self.cancel_login(server_id).await.map(|_| ())
-    }
-
-    pub(crate) async fn pc_producer_view(&self) -> Result<LoginProducerCapture<'_>, String> {
-        let gate = self.start_gate.lock().await;
-        let attempts = self.attempts.shutdown_snapshot()?;
-        let entries = self
-            .shared
-            .entries
-            .lock()
-            .map_err(|_| "Login registry poisoned")?
-            .iter()
-            .map(|(id, entry)| LoginProducerMember {
-                id: id.clone(),
-                epoch: entry.epoch,
-                native: entry.native.clone(),
-                child: entry._child.clone(),
-                closed: entry.closed_rx.clone(),
-            })
-            .collect();
-        Ok(LoginProducerCapture {
-            _gate: gate,
-            view: LoginProducerView {
-                shared: Arc::clone(&self.shared),
-                attempts,
-                entries,
-            },
-        })
     }
 
     pub async fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {

@@ -2,8 +2,8 @@
 # check-vendored-path-sources.sh —— 随仓第三方副本（`[patch]` 指向的路径源）在交叉目标上不得出任何诊断。
 #
 # 用法: scripts/check-vendored-path-sources.sh <target-triple>...
-#   目标清单由调用方给（ci.yml 的 cross job 与 scripts/gate-rust.sh 传同一份，两处由
-#   gate-rust-ci-parity.test.mjs 对拍），本脚本不自带清单，免得多出第三份要跟着改的三元组。
+#   目标清单由调用方给（ci.yml 的 cross job 与 scripts/gate-rust.sh 传同一份），
+#   本脚本不自带清单，免得多出第三份要跟着改的三元组。
 #   调用方须已 `rustup target add` 过这些目标。
 #
 # 守的是什么：

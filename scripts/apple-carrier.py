@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Inspect only C0-observed Apple carriers; this is not Framework/App admission."""
-import importlib.util
-from pathlib import Path
 import re
 import struct
 import sys
 
 sys.dont_write_bytecode = True
-HELPER = Path(__file__).parent / 'libbox-patches/android-source.py'
 MACHO = b'\xcf\xfa\xed\xfe'
 AR = b'!<arch>\n'
 FAT = b'\xca\xfe\xba\xbe'
@@ -23,13 +20,6 @@ TARGETS = {'ios-arm64': (0x100000c, 0, 2, 'arm64', 'iphoneos', None),
 def require(condition, message):
     if not condition:
         raise RuntimeError('Apple carrier: ' + message)
-
-
-def source_helpers():
-    spec = importlib.util.spec_from_file_location('apple_carrier_source', HELPER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def bounds(offset, size, total, label):
@@ -434,133 +424,3 @@ def container(data, helper):
     if data.startswith(MACHO):
         return macho(data, helper)
     raise RuntimeError('Apple carrier: unsupported container format')
-
-
-def inspect_carrier(binary, expected_targets, source_receipt, shared_source, core, build_policy, tools=None, scratch=None):
-    """One producer/cache predicate. C2 must supply the complete observed contract.
-
-    No CLI fallback or artifact admission occurs here. ``tools['targets']`` holds
-    caller-captured SDK/CGO facts; ``scratch`` is reserved and never touched.
-    """
-    helper = source_helpers()
-    helper.validate_source_receipt(source_receipt, shared_source, core)
-    require(all(source_receipt.get(k) == core['sourceBuild'].get(k) for k in
-                ('mainGoModSha256', 'mainGoSumSha256')), 'source main module binding differs')
-    expected_id = helper.provider().source_linker_flag(source_receipt).removeprefix('-buildid=')
-    require(isinstance(expected_targets, (list, tuple)) and expected_targets
-            and all(isinstance(t, str) and t in TARGETS for t in expected_targets)
-            and len(set(expected_targets)) == len(expected_targets), 'target inventory')
-    require(isinstance(build_policy, dict) and build_policy.get('schema') == 'polaris-apple-carrier-contract-v1'
-            and build_policy.get('evidenceScope') == 'carrier-inspection-only'
-            and build_policy.get('sourceReceiptFingerprint') == source_receipt['fingerprint']
-            and isinstance(build_policy.get('targets'), dict)
-            and set(expected_targets) <= set(build_policy['targets']) <= set(TARGETS),
-            'complete observed carrier contract required (C2 pending)')
-    require(isinstance(tools, dict) and isinstance(tools.get('targets'), dict), 'actual SDK/CGO target inputs required')
-    data = binary if isinstance(binary, bytes) else Path(binary).read_bytes()
-    actual = container(data, helper)
-    slices = actual['slices'] if actual['kind'] == 'fat-ar' else [{'ordinal': 0, 'offset': 0, 'bytes': len(data),
-            'archive': actual}]
-    require(len(slices) == len(expected_targets), 'target/slice inventory differs')
-    targets = {}
-    for slice_row in slices:
-        body = slice_row['archive']
-        members = body['members'] if body['kind'] == 'bsd-ar' else [{'ordinal': 0, 'headerOffset': None,
-            'rawName': None, 'name': None, 'payloadOffset': 0, 'bytes': body['bytes'], 'sha256': body['sha256'],
-            'classification': 'code', 'machO': body}]
-        code = [m for m in members if m['classification'] == 'code']
-        cpus = {(m['machO']['cpu'], m['machO']['subCPU']) for m in code}
-        require(len(cpus) == 1, 'mixed member CPU/subCPU')
-        cpu, subcpu = next(iter(cpus))
-        require('cpu' not in slice_row or (cpu, subcpu) == (slice_row['cpu'], slice_row['subCPU']), 'fat header/payload CPU differs')
-        matching = [t for t in expected_targets if TARGETS[t][:2] == (cpu, subcpu)]
-        require(len(matching) == 1 and matching[0] not in targets, 'ambiguous/duplicate target')
-        target = matching[0]
-        _, _, platform, arch, sdk, variant = TARGETS[target]
-        policy = build_policy['targets'][target]
-        require(isinstance(policy, dict) and type(policy.get('carrierCount')) is int and policy['carrierCount'] > 0
-                and helper.match('[0-9a-f]{64}', policy.get('graphFingerprint'))
-                and isinstance(policy.get('buildInfo'), dict) and isinstance(policy.get('externalInputs'), dict),
-                'complete target carrier/graph contract required (C2 pending)')
-        external = policy['externalInputs']
-        require(helper.canonical(tools['targets'].get(target)) == helper.canonical(external), 'actual SDK/CGO input differs')
-        require(external.get('sdk') == sdk and helper.match('[0-9a-f]{64}', external.get('sysrootSha256'))
-                and isinstance(external.get('sdkVersion'), str) and isinstance(external.get('sdkBuild'), str)
-                and type(external.get('minOSRaw')) is int and type(external.get('sdkRaw')) is int
-                and isinstance(external.get('environment'), dict), 'SDK/CGO input contract')
-        env = external['environment']
-        missing_platform = external.get('nativeMembersWithoutPlatform', [])
-        require(isinstance(missing_platform, list)
-                and all(helper.match('[0-9a-f]{64}', value) for value in missing_platform)
-                and len(set(missing_platform)) == len(missing_platform), 'native platform input inventory')
-        require(all(env.get(k) == v for k, v in {'GOOS': 'ios', 'GOARCH': arch, 'CGO_ENABLED': '1'}.items())
-                and all(isinstance(env.get(k), str) and env[k] for k in ('CGO_CFLAGS', 'CGO_CXXFLAGS', 'CGO_LDFLAGS')),
-                'SDK/CGO target environment')
-        helper.partition(policy.get('patchedModules'), core['sourceBuild']['dependencyModules'], 'allowedAbsent')
-        helper.partition(policy.get('transportModules'), list(core['sourceBuild']['transportPins']), 'confirmedAbsent')
-        carriers = []
-        for member in code:
-            obj = member['machO']
-            infos = [s for s in obj['sections'] if 'buildInfo' in s]
-            for observed in obj['platformCommands']:
-                require(observed['platform'] == platform and observed['minOSRaw'] == external['minOSRaw']
-                        and observed['sdkRaw'] in (0, external['sdkRaw']), 'member platform/SDK differs')
-            if not obj['platformCommands']:
-                require(member['sha256'] in missing_platform and not infos,
-                        'member platform missing without external input binding')
-            if not infos:
-                continue
-            require(obj['platformCommands'] and obj['platformCommands'][0]['sdkRaw'] == external['sdkRaw'], 'Go carrier platform/SDK missing')
-            info_section = infos[0]
-            info = info_section['buildInfo']
-            facts = info['parsedBuildInfo']
-            settings = facts['settings']
-            require(facts['goVersion'] == shared_source['goVersion'] and settings.get('GOOS') == 'ios'
-                    and settings.get('GOARCH') == arch and settings.get('CGO_ENABLED') == '1'
-                    and settings.get('-buildmode') == 'c-archive' and settings.get('-compiler') == 'gc'
-                    and settings.get('-trimpath') == 'true'
-                    and settings.get('GOARM64' if arch == 'arm64' else 'GOAMD64') == ('v8.0' if arch == 'arm64' else 'v1')
-                    and not any(k.startswith('vcs') for k in settings), 'Go target BuildInfo differs')
-            tags = settings.get('-tags', '').split(',')
-            require(isinstance(policy.get('effectiveTags'), list) and len(tags) == len(set(tags))
-                    and sorted(tags) == sorted(policy['effectiveTags']) and 'ios' in tags
-                    and ('iossimulator' in tags) == (variant == 'simulator'), 'Go effective tags differ')
-            require(facts['path'] and len([m for m in facts['modules'].values() if m['kind'] == 'mod']) == 1,
-                    'main/path BuildInfo missing')
-            require(helper.canonical(facts) == helper.canonical(policy['buildInfo']), 'complete Go metadata differs')
-            for module, row in facts['modules'].items():
-                require('replacement' not in row or module in core['sourceBuild']['dependencyModules'], 'undeclared module replacement')
-            for dep in shared_source['dependencyPatches']:
-                row = facts['modules'].get(dep['module'])
-                if row is None and dep['module'] in policy['patchedModules']['allowedAbsent']:
-                    continue
-                require(row and row['version'] == dep['upstreamVersion']
-                        and row.get('replacement') == './polaris-dependencies/' + dep['name'], 'patched module provenance differs')
-            for module, version in core['sourceBuild']['transportPins'].items():
-                row = facts['modules'].get(module)
-                require(row is None if module in policy['transportModules']['confirmedAbsent'] else row and row['version'] == version,
-                        'transport module provenance differs')
-            ids = [(s, n) for s in obj['sections'] for n in s.get('buildIDs', [])]
-            id_section, note = ids[0]
-            require(note['value'] == expected_id, 'source BuildID differs')
-            identity = {k: v for k, v in member.items() if k != 'machO'} | {'targetID': target,
-                'containerSha256': actual['sha256'], 'sliceOrdinal': slice_row['ordinal'],
-                'sliceOffset': slice_row['offset'], 'sliceSha256': body['sha256'], 'cpu': cpu,
-                'subCPU': subcpu, 'filetype': obj['filetype']}
-            carriers.append({'memberIdentity': identity, 'buildID': note['value'],
-                'sourceFingerprint': source_receipt['fingerprint'], 'rawBuildInfo': info,
-                'parsedBuildInfo': facts, 'buildInfoFingerprint': info['buildInfoFingerprint'],
-                'loci': {'buildInfo': {k: v for k, v in info_section.items() if k != 'buildInfo'} |
-                         {'containerOffset': slice_row['offset'] + member['payloadOffset'] + info_section['offset']},
-                         'buildID': note | {'segment': id_section['segment'], 'section': id_section['section'],
-                         'containerOffset': slice_row['offset'] + member['payloadOffset'] + note['fileOffset']}}})
-        require(len(carriers) == policy['carrierCount'], 'missing/extra Go carrier')
-        targets[target] = {'architecture': arch, 'variant': variant, 'format': body['kind'],
-                           'sliceOrdinal': slice_row['ordinal'], 'sliceOffset': slice_row['offset'],
-                           'sliceBytes': slice_row['bytes'], 'sliceSha256': body['sha256'],
-                           'sliceHeader': {k: slice_row[k] for k in ('cpu', 'subCPU', 'alignment') if k in slice_row},
-                           'members': members, 'goCarriers': carriers,
-                           'externalInputs': external, 'graphFingerprint': policy['graphFingerprint']}
-    require(set(targets) == set(expected_targets), 'target inventory differs')
-    return {'evidenceScope': 'carrier-inspection-only', 'container': {k: v for k, v in actual.items()
-            if k in ('kind', 'sha256', 'bytes')}, 'targets': targets}

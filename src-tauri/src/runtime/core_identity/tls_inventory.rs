@@ -1,10 +1,11 @@
 //! Source-reviewed support for the expected compiled selection. This data does
 //! not observe installed files, a running process, execution custody or a TLS handshake.
-use crate::runtime::tls_fingerprints::{Capabilities, Module};
+//! Build identity comes from the compiled release contract; the catalog holds only
+//! the stable support table reviewed from `common/tls/fingerprint_profiles.go`.
 use polaris_helper_proto::core_manifest::CoreManifest;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 const CATALOG: &str = include_str!("../../../../scripts/desktop-core/tls-support-catalog.json");
@@ -22,48 +23,7 @@ struct CorePin {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Catalog {
     schema: String,
-    source_commit: String,
-    source_tree: String,
-    version: String,
-    contract_sha256: String,
-    required_go_version: String,
-    source_archive_sha256: String,
-    source_index_sha256: String,
-    source_files: Vec<SourceFile>,
     stable_support: StableSupport,
-    bindings: Vec<Binding>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceFile {
-    path: String,
-    sha256: String,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Binding {
-    platform: String,
-    target: String,
-    core: CorePin,
-    go_version: String,
-    build_tags: String,
-    modules: Vec<Module>,
-    provenance: Provenance,
-}
-#[derive(Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-enum Provenance {
-    #[serde(rename = "observed-cli-metadata")]
-    ObservedCli {
-        #[serde(rename = "stdoutSha256")]
-        stdout_sha256: String,
-        stdout: String,
-    },
-    #[serde(rename = "source-derived-stable-catalog")]
-    SourceDerived {
-        #[serde(rename = "sourceTablePath")]
-        source_table_path: String,
-    },
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -153,70 +113,6 @@ fn hex(value: &str, count: usize) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn module_map(modules: &[Module]) -> Result<BTreeMap<String, Value>, String> {
-    let mut result = BTreeMap::new();
-    for value in serde_json::to_value(modules)
-        .map_err(|_| reject())?
-        .as_array()
-        .ok_or_else(reject)?
-    {
-        let path = value["path"].as_str().ok_or_else(reject)?.to_owned();
-        if result.insert(path, value.clone()).is_some() {
-            return Err(reject());
-        }
-    }
-    Ok(result)
-}
-fn row_modules(row: &Value) -> Result<BTreeMap<String, Value>, String> {
-    let mut modules = BTreeMap::new();
-    for key in ["normalModules", "localReplacements"] {
-        for module in row["buildGraph"][key].as_array().ok_or_else(reject)? {
-            let path = module["module"].as_str().ok_or_else(reject)?;
-            if ![
-                "github.com/refraction-networking/utls",
-                "github.com/metacubex/utls",
-            ]
-            .contains(&path)
-            {
-                continue;
-            }
-            let mut value = json!({"path":path,"version":module["version"],"sum":module["h1"]});
-            if let Some(replacement) = module.get("replacement") {
-                value["replace"] = json!({"path":replacement["module"],"version":replacement["version"],"sum":replacement["h1"]});
-            }
-            if modules.insert(path.into(), value).is_some() {
-                return Err(reject());
-            }
-        }
-    }
-    Ok(modules)
-}
-// Public source references document the reviewed derivation. They are metadata,
-// not an external authentication service: runtime trusts compiled source and
-// matches the selected contract without opening an archive or source file.
-fn validate_source_references(files: &[SourceFile]) -> Result<(), String> {
-    let expected: BTreeSet<&str> = [
-        "cmd/sing-box/cmd_tools_tls_fingerprints.go",
-        "common/tls/fingerprint_capabilities.go",
-        "common/tls/fingerprint_profiles.go",
-        "common/tls/fingerprint_profiles_stub.go",
-        "common/tls/utls_client.go",
-        "common/tls/utls_stub.go",
-        "option/tls.go",
-    ]
-    .into_iter()
-    .collect();
-    let mut paths = BTreeSet::new();
-    for file in files {
-        if !hex(&file.sha256, 64) || !paths.insert(file.path.as_str()) {
-            return Err(reject());
-        }
-    }
-    if paths != expected {
-        return Err(reject());
-    }
-    Ok(())
-}
 fn validate_stable(support: &StableSupport) -> Result<(), String> {
     let ids: BTreeSet<&str> = support.profiles.iter().map(|p| p.id.as_str()).collect();
     let aliases: BTreeSet<&str> = support
@@ -262,78 +158,6 @@ fn validate_stable(support: &StableSupport) -> Result<(), String> {
     }
     Ok(())
 }
-fn validate_binding(binding: &Binding, catalog: &Catalog, row: &Value) -> Result<(), String> {
-    let expected: CorePin = serde_json::from_value(row["core"].clone()).map_err(|_| reject())?;
-    let target = match binding.platform.as_str() {
-        "linux" => "linux/amd64",
-        "win" => "windows/amd64",
-        "mac-x64" => "darwin/amd64",
-        "mac-arm64" => "darwin/arm64",
-        _ => return Err(reject()),
-    };
-    if binding.core != expected
-        || expected.bytes == 0
-        || !hex(&expected.sha256, 64)
-        || binding.target != target
-        || row["target"] != binding.target
-        || row["sourceCommit"] != catalog.source_commit
-        || row["sourceTree"] != catalog.source_tree
-        || row["version"] != catalog.version
-        || row["goVersion"] != binding.go_version
-        || catalog.required_go_version != binding.go_version
-        || row["tags"] != binding.build_tags
-        || !binding.build_tags.split(',').any(|tag| tag == "with_utls")
-        || module_map(&binding.modules)? != row_modules(row)?
-    {
-        return Err(reject());
-    }
-    match &binding.provenance {
-        Provenance::ObservedCli {
-            stdout_sha256,
-            stdout,
-        } => {
-            if !hex(stdout_sha256, 64)
-                || polaris_updater::sha256_hex(stdout.as_bytes()) != *stdout_sha256
-            {
-                return Err(reject());
-            }
-            let doc = Capabilities::parse(stdout).map_err(|_| reject())?;
-            let profiles: Vec<StableProfile> = doc
-                .profiles
-                .into_iter()
-                .map(|p| StableProfile {
-                    id: p.id,
-                    display_name: p.display_name,
-                    selection: p.selection,
-                })
-                .collect();
-            if !doc.enabled
-                || doc.source_commit != catalog.source_commit
-                || doc.source_modified != Some(false)
-                || doc.core_version != catalog.version
-                || format!("{}/{}", doc.os, doc.arch) != binding.target
-                || doc.go_version != binding.go_version
-                || doc.required_go_version != catalog.required_go_version
-                || doc.build_tags != binding.build_tags
-                || module_map(&doc.modules)? != module_map(&binding.modules)?
-                || profiles != catalog.stable_support.profiles
-                || doc.default_fingerprint != catalog.stable_support.default_fingerprint
-                || doc.legacy_chrome_aliases != catalog.stable_support.legacy_chrome_aliases
-                || doc.random_semantics != catalog.stable_support.random_semantics
-                || doc.randomized_semantics != catalog.stable_support.randomized_semantics
-            {
-                return Err(reject());
-            }
-        }
-        Provenance::SourceDerived { source_table_path } => {
-            if source_table_path != "common/tls/fingerprint_profiles.go" {
-                return Err(reject());
-            }
-        }
-    }
-    Ok(())
-}
-
 fn directory_for(
     raw: &str,
     contract_raw: &str,
@@ -345,73 +169,57 @@ fn directory_for(
     }
     let catalog: Catalog = serde_json::from_str(raw).map_err(|_| reject())?;
     let contract: Value = serde_json::from_str(contract_raw).map_err(|_| reject())?;
+    let row = &contract["platforms"][platform];
+    let core: CorePin = serde_json::from_value(row["core"].clone()).map_err(|_| reject())?;
+    let target = match platform {
+        "linux" => "linux/amd64",
+        "win" => "windows/amd64",
+        "mac-x64" => "darwin/amd64",
+        "mac-arm64" => "darwin/arm64",
+        _ => return Err(reject()),
+    };
+    let text = |value: &Value| value.as_str().map(str::to_owned).ok_or_else(reject);
+    let required_go_version = format!("go{}", text(&contract["sourcePolicy"]["goVersion"])?);
+    let build_tags = text(&row["tags"])?;
     if contract["schema"] != "polaris-upstream-native-release-consumer-v1"
         || catalog.schema != "polaris-selected-tls-support-catalog-v1"
-        || !hex(&catalog.source_commit, 40)
-        || !hex(&catalog.source_tree, 40)
-        || !hex(&catalog.contract_sha256, 64)
-        || !hex(&catalog.source_index_sha256, 64)
-        || contract["assetIndex"]["sha256"] != catalog.source_index_sha256
-        || !hex(&catalog.source_archive_sha256, 64)
-        || contract["sourceArchive"]["sha256"] != catalog.source_archive_sha256
-        || catalog.contract_sha256 != polaris_updater::sha256_hex(contract_raw.as_bytes())
-        || contract["sourceCommit"] != catalog.source_commit
-        || contract["sourceTree"] != catalog.source_tree
-        || contract["version"] != catalog.version
-        || catalog.bindings.is_empty()
-        || catalog.bindings.len() > 4
+        || row["target"] != target
+        || row["sourceCommit"] != contract["sourceCommit"]
+        || row["sourceTree"] != contract["sourceTree"]
+        || row["version"] != contract["version"]
+        || row["goVersion"] != required_go_version.as_str()
+        || !build_tags.split(',').any(|tag| tag == "with_utls")
+        || core.bytes == 0
+        || !hex(&core.sha256, 64)
         || selected.platform != platform
-        || selected.version != catalog.version
+        || contract["version"] != selected.version.as_str()
+        || !selected.files.iter().any(|file| {
+            file.name == core.member && file.bytes == core.bytes && file.sha256 == core.sha256
+        })
     {
         return Err(reject());
     }
-    validate_source_references(&catalog.source_files)?;
     validate_stable(&catalog.stable_support)?;
-    let mut seen = BTreeSet::new();
-    let mut found = None;
-    for binding in &catalog.bindings {
-        if !seen.insert(binding.platform.as_str()) {
-            return Err(reject());
-        }
-        validate_binding(binding, &catalog, &contract["platforms"][&binding.platform])?;
-        if binding.platform == platform {
-            if !selected.files.iter().any(|file| {
-                file.name == binding.core.member
-                    && file.bytes == binding.core.bytes
-                    && file.sha256 == binding.core.sha256
-            }) {
-                return Err(reject());
-            }
-            found = Some(binding);
-        }
-    }
-    let binding = found.ok_or_else(reject)?;
-    let (origin, stdout_sha) = match &binding.provenance {
-        Provenance::ObservedCli { stdout_sha256, .. } => {
-            ("observed-cli-metadata", Some(stdout_sha256.clone()))
-        }
-        Provenance::SourceDerived { .. } => ("source-derived-stable-catalog", None),
-    };
-    let (os, arch) = binding.target.split_once('/').ok_or_else(reject)?;
     let support = &catalog.stable_support;
+    let (os, arch) = target.split_once('/').ok_or_else(reject)?;
     Ok(SupportDirectory {
         evidence_kind: KIND,
         selected_spec: Some(SelectedSpec {
             platform: platform.into(),
-            target: binding.target.clone(),
-            source_commit: catalog.source_commit.clone(),
-            source_tree: catalog.source_tree.clone(),
-            version: catalog.version.clone(),
-            contract_sha256: catalog.contract_sha256.clone(),
-            core_bytes: binding.core.bytes,
-            core_sha256: binding.core.sha256.clone(),
-            data_origin: origin,
-            observation_stdout_sha256: stdout_sha,
-            source_archive_sha256: catalog.source_archive_sha256.clone(),
-            source_index_sha256: catalog.source_index_sha256.clone(),
-            go_version: binding.go_version.clone(),
-            required_go_version: catalog.required_go_version.clone(),
-            build_tags: binding.build_tags.clone(),
+            target: target.into(),
+            source_commit: text(&contract["sourceCommit"])?,
+            source_tree: text(&contract["sourceTree"])?,
+            version: selected.version.clone(),
+            contract_sha256: polaris_updater::sha256_hex(contract_raw.as_bytes()),
+            core_bytes: core.bytes,
+            core_sha256: core.sha256,
+            data_origin: "source-derived-stable-catalog",
+            observation_stdout_sha256: None,
+            source_archive_sha256: text(&contract["sourceArchive"]["sha256"])?,
+            source_index_sha256: text(&contract["assetIndex"]["sha256"])?,
+            go_version: required_go_version.clone(),
+            required_go_version,
+            build_tags,
         }),
         document: Some(SupportDocument {
             schema: "polaris-tls-support-directory-v1",
@@ -447,7 +255,6 @@ pub(crate) fn expected_tls_support() -> &'static SupportDirectory {
             super::check_compiled_selection()?;
             if polaris_core_supervisor::selected_core::selection_lane()
                 != polaris_core_supervisor::selected_core::SelectionLane::Formal
-                || super::APP_SOURCE != b"null"
             {
                 return Err(reject());
             }

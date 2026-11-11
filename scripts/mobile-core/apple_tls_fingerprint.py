@@ -196,9 +196,8 @@ def verify(receipt=None):
     if receipt is None:
         receipt = read_receipt(receipt_path)
     require(file_pin(flags, allow_empty=True) == receipt['flags'], 'TLS capability linker flags changed')
-    if 'nativeTun' in receipt:
-        require(file_pin(compiler_args_path(), allow_empty=True) == receipt['nativeTun']['compilerArgs'],
-                'native TUN compiler response file changed')
+    require(file_pin(compiler_args_path(), allow_empty=True) == receipt['nativeTun']['compilerArgs'],
+            'native TUN compiler response file changed')
     executable = Path(os.environ['TARGET_BUILD_DIR']) / os.environ['EXECUTABLE_PATH']
     if receipt['capabilityPresent']:
         symbols = run(['xcrun', 'nm', '--no-llvm-bc', '-gU', executable])
@@ -209,7 +208,7 @@ def verify(receipt=None):
                 'final PacketTunnel TLS capability function is not dynamically discoverable')
     print(json.dumps({'scope': 'actual-final-PacketTunnel-static-link',
                       'capabilityPresent': receipt['capabilityPresent'], 'executable': file_pin(executable),
-                      'nativeTunHeaderABIAvailable': receipt.get('nativeTun', {}).get('present', False),
+                      'nativeTunHeaderABIAvailable': receipt['nativeTun']['present'],
                       'loadedQueryExecuted': False, 'devicePassed': False}))
 
 
@@ -223,8 +222,8 @@ def prepared_inputs():
     require(pin['sha256'] == os.environ['POLARIS_TLS_PREPARED_SHA256'],
             'parent TLS capability receipt changed')
     value = decode(raw)
-    legacy_keys = {'capabilityPresent', 'binary', 'headers', 'flags', 'devicePassed'}
-    require(type(value) is dict and set(value) in (legacy_keys, legacy_keys | {'nativeTun'}) and
+    require(type(value) is dict and
+            set(value) == {'capabilityPresent', 'binary', 'headers', 'flags', 'devicePassed', 'nativeTun'} and
             type(value.get('capabilityPresent')) is bool and value.get('devicePassed') is False,
             'prepared TLS capability receipt structure differs')
     flag_raw, flag_pin = read_pinned(flags, allow_empty=True)
@@ -237,23 +236,13 @@ def prepared_inputs():
     require(flag_raw == expected, 'unexpected TLS capability linker flags')
     present = native_tun_abi_present([content.decode() for content, _ in headers.values()])
     swift_args = root / NATIVE_TUN_ARGS
-    if 'nativeTun' in value:
-        native = value['nativeTun']
-        require(type(native) is dict and set(native) == {'contractVersion', 'present', 'compilerArgs'} and
-                native['contractVersion'] == NATIVE_TUN_CONTRACT and type(native['present']) is bool and
-                native['present'] == present, 'prepared native TUN ABI decision differs from actual headers')
-        require(swift_args.stat().st_size <= 128, 'prepared native TUN compiler arguments exceed budget')
-        swift_raw, swift_pin = read_pinned(swift_args, allow_empty=True)
-        require(swift_pin == native['compilerArgs'], 'parent native TUN compiler response file changed')
-    else:
-        # Original receipts are still readable for actual old headers. They
-        # cannot attest a newly present ABI or reuse stale nonempty arguments.
-        require(not present, 'legacy TLS receipt cannot attest the native TUN ABI')
-        if swift_args.exists() or swift_args.is_symlink():
-            require(swift_args.stat().st_size <= 128, 'legacy native TUN compiler arguments exceed budget')
-            swift_raw = read_pinned(swift_args, allow_empty=True)[0]
-        else:
-            swift_raw = b''
+    native = value['nativeTun']
+    require(type(native) is dict and set(native) == {'contractVersion', 'present', 'compilerArgs'} and
+            native['contractVersion'] == NATIVE_TUN_CONTRACT and type(native['present']) is bool and
+            native['present'] == present, 'prepared native TUN ABI decision differs from actual headers')
+    require(swift_args.stat().st_size <= 128, 'prepared native TUN compiler arguments exceed budget')
+    swift_raw, swift_pin = read_pinned(swift_args, allow_empty=True)
+    require(swift_pin == native['compilerArgs'], 'parent native TUN compiler response file changed')
     require(swift_raw == compiler_args(present), 'unexpected native TUN compiler arguments')
     return flag_raw, swift_raw, raw
 

@@ -444,11 +444,6 @@ pub(super) fn protect_members(
     Ok(protected)
 }
 impl ProtectedMembers {
-    pub(super) fn binary_for_custody(&self) -> std::io::Result<File> {
-        rustix::io::fcntl_dupfd_cloexec(&self.members[self.binary].sealed, 3)
-            .map(File::from)
-            .map_err(std::io::Error::from)
-    }
     #[cfg(test)]
     pub(super) fn counters(&self) -> (u64, u64, u64) {
         self.counters

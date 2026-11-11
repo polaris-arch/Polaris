@@ -313,40 +313,25 @@ def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, ac
             'actual source graph module rows differ')
     declared = {row['Path']: row for row in graph}
     require(len(declared) == len(graph), 'duplicate actual source graph module')
-    reviewed_vendors = {}
-    if 'sourcePolicy' in value:
-        from source_policy import validate_source_policy, verify_vendor_graph
-        policy = validate_source_policy(value['sourcePolicy'], value)
-        meta = policy['metacubex']
-        required_native = {meta['module'], 'github.com/sagernet/sing-tun'}
-        reviewed_vendors = policy.get('vendors', {})
-        if reviewed_vendors:
-            source_row = declared.get(value['goModule'], {})
-            require(source_row.get('Main') is True and isinstance(source_row.get('Dir'), str),
-                    'actual main source graph root differs')
-            verify_vendor_graph(graph, source_row['Dir'], reviewed_vendors)
-        else:
-            local_expected = {meta['module']: meta['replacementPath'],
-                              'github.com/sagernet/sing-tun': './third_party/sing-tun'}
-            local_actual = {name: row['Replace'].get('Path') for name, row in declared.items()
-                            if row.get('Replace') and not row['Replace'].get('Version')}
-            require(local_actual == local_expected, 'actual source graph local replacement inventory differs')
-            for name, path in local_expected.items():
-                expected = declared[name]
-                replacement = expected['Replace']
-                require(expected.get('Sum', '') == '' and replacement.get('Sum', '') == '' and
-                        replacement.get('Version', '') == '', 'local source graph must not invent version or h1')
-                local_replacement_aliases(replacement, declared.get(value['goModule'], {}).get('Dir'), path, name)
-        # The resolved source graph contains all reviewed replacements. Go can
-        # prune unlinked vendors from native BuildInfo; these two remain required.
-        for name in required_native:
-            require(name in facts['modules'], 'required local source module absent from native carrier: ' + name)
-        require(declared[meta['module']].get('Version') == meta['version'], 'actual Meta source graph version differs')
-        actual = facts['modules'].get(meta['module'])
-        require(actual is not None and actual.get('version') == meta['version'] and
-                actual.get('sum', '') == '' and actual.get('replacement') == meta['replacementPath'] and
-                actual.get('replacementVersion') == '(devel)' and actual.get('replacementSum', '') == '',
-                'actual Meta local replacement identity differs; baseline h1 is not a local sum')
+    from source_policy import validate_source_policy, verify_vendor_graph
+    policy = validate_source_policy(value['sourcePolicy'], value)
+    meta = policy['metacubex']
+    required_native = {meta['module'], 'github.com/sagernet/sing-tun'}
+    reviewed_vendors = policy['vendors']
+    source_row = declared.get(value['goModule'], {})
+    require(source_row.get('Main') is True and isinstance(source_row.get('Dir'), str),
+            'actual main source graph root differs')
+    verify_vendor_graph(graph, source_row['Dir'], reviewed_vendors)
+    # The resolved source graph contains all reviewed replacements. Go can
+    # prune unlinked vendors from native BuildInfo; these two remain required.
+    for name in required_native:
+        require(name in facts['modules'], 'required local source module absent from native carrier: ' + name)
+    require(declared[meta['module']].get('Version') == meta['version'], 'actual Meta source graph version differs')
+    actual = facts['modules'].get(meta['module'])
+    require(actual is not None and actual.get('version') == meta['version'] and
+            actual.get('sum', '') == '' and actual.get('replacement') == meta['replacementPath'] and
+            actual.get('replacementVersion') == '(devel)' and actual.get('replacementSum', '') == '',
+            'actual Meta local replacement identity differs; baseline h1 is not a local sum')
     require(value['goModule'] in facts['modules'], 'original core source module absent from native carrier')
     for name, observed in facts['modules'].items():
         # The generated gobind main package is not a source module dependency.
@@ -509,7 +494,7 @@ def hot_jni_contract(exported):
 
 def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
     validate(value)
-    helper = module('formal_mobile_buildinfo', 'scripts/libbox-patches/android-source.py')
+    helper = module('formal_mobile_buildinfo', 'scripts/mobile-core/android-source.py')
     native, scratch = {}, Path(scratch)
     with zipfile.ZipFile(aar) as archive:
         infos = zip_entries(archive)
@@ -728,7 +713,7 @@ def inspect_framework(framework, value, graph, expected_id):
 def _inspect_framework(framework, value, graph, expected_id, reads):
     validate(value)
     framework = Path(framework)
-    helper = module('formal_apple_buildinfo', 'scripts/libbox-patches/android-source.py')
+    helper = module('formal_apple_buildinfo', 'scripts/mobile-core/android-source.py')
     carrier = module('formal_apple_container', 'scripts/apple-carrier.py')
     # Pins used by parsing are reused only within this invocation. A complete
     # fresh inventory at the final boundary detects changes to bytes/modes,

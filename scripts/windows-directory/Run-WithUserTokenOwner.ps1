@@ -1,10 +1,9 @@
 # CI-only owner fixture. The original shell token is never opened for mutation.
-[CmdletBinding(DefaultParameterSetName='ExplicitModeRequired')]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$KernelRoot,
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
-    [Parameter(Mandatory=$true,ParameterSetName='Formal')][switch]$FormalContract,
-    [Parameter(Mandatory=$true,ParameterSetName='Candidate')][string]$CandidateSourceCommit
+    [Parameter(Mandatory=$true)][switch]$FormalContract
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -49,12 +48,8 @@ try {
     # Invalidate the old success pointer BEFORE loading native code or probing.
     Invalidate-ValidationReceipt 'start'
     Save-OwnerAttempt $state
-    if ($PSCmdlet.ParameterSetName -eq 'Candidate') {
-        if ($CandidateSourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact lowercase candidate source SHA required' }
-        $parameters = @{KernelRoot=(Resolve-Path -LiteralPath $KernelRoot).Path;OutputDirectory=$outputRoot;CandidateSourceCommit=$CandidateSourceCommit}
-    } elseif ($PSCmdlet.ParameterSetName -eq 'Formal' -and $FormalContract) {
-        $parameters = @{KernelRoot=(Resolve-Path -LiteralPath $KernelRoot).Path;OutputDirectory=$outputRoot;FormalContract=$true}
-    } else { throw 'Select exactly one explicit candidate source or formal contract' }
+    if (-not $FormalContract) { throw 'Select the explicit formal contract' }
+    $parameters = @{KernelRoot=(Resolve-Path -LiteralPath $KernelRoot).Path;OutputDirectory=$outputRoot;FormalContract=$true}
     $native = Join-Path $PSScriptRoot 'UserTokenOwnerNative.cs'
     $worker = Join-Path $PSScriptRoot 'Run-UserTokenOwnerChild.ps1'
     $target = Join-Path $PSScriptRoot 'Build-And-Test.ps1'

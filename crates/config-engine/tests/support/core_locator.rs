@@ -7,8 +7,8 @@
 //! 都必须从它派生覆盖轴。两个门各写一份平台名单的后果不是「两份都在」，而是其中一份
 //! 悄悄少一格 —— 而且失败信息会把人指向错误的方向（表里没有的平台，红不出来）。
 //!
-//! 而本表自己的 key 列又被 [`assert_matrix_matches_manifest`] 钉在 `src-tauri/core-manifest.json`
-//! 的 `coreArchiveSha256` 键集合上 —— 那才是「随包核有哪几个平台」的权威枚举
+//! 而本表自己的 key 列又被 [`assert_matrix_matches_manifest`] 钉在 `scripts/desktop-core/release-contract.json`
+//! 的 `platforms` 键集合上 —— 那才是「随包核有哪几个平台」的权威枚举
 //! （`scripts/fetch-core.mjs` 按它拉核）。跨 crate 的另一处消费点
 //! `crates/singbox-grpc/proto_wire_check.rs` 读的是同一份 manifest 的同一个字段。
 
@@ -60,7 +60,7 @@ pub struct CoreBuild {
 }
 
 /// 随包核的四个平台 —— 本 crate 唯一一份，且**由 [`assert_matrix_matches_manifest`] 钉在
-/// `src-tauri/core-manifest.json` 上**。
+/// `scripts/desktop-core/release-contract.json` 上**。
 ///
 /// 消费点：`core_build_matrix`（构建面逐平台比对）、`core_dep_fingerprint`（依赖指纹逐平台比对）、
 /// [`bundled_core_candidates_for`]（当前打包目标那一份的路径）。
@@ -114,10 +114,10 @@ pub fn kernel_gate_required() -> bool {
 
 /// 随包核平台枚举的权威真值源（相对仓库根）。
 ///
-/// `coreArchiveSha256` 的**键集合**就是「随包核有哪几个平台」：`scripts/fetch-core.mjs` 按它
-/// 逐平台拉核，缺 pin 即拒绝下载 —— 一个平台要随包，它的键必然先在这里。
+/// 发布合同 `platforms` 的**键集合**就是「随包核有哪几个平台」：`scripts/fetch-core.mjs` 按它
+/// 逐平台拉核，缺行即拒绝下载 —— 一个平台要随包，它的键必然先在这里。
 /// `crates/singbox-grpc/proto_wire_check.rs` 的 wire 契约门读的是同一份文件的同一个字段。
-pub const CORE_MANIFEST_REL: &str = "src-tauri/core-manifest.json";
+pub const CORE_MANIFEST_REL: &str = "scripts/desktop-core/release-contract.json";
 
 /// manifest 声明的随包核平台集合。
 ///
@@ -130,13 +130,13 @@ pub fn manifest_core_platforms() -> BTreeSet<String> {
     let doc: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("{} 不是合法 JSON：{e}", path.display()));
     let obj = doc
-        .get("coreArchiveSha256")
+        .get("platforms")
         .and_then(serde_json::Value::as_object)
-        .unwrap_or_else(|| panic!("{} 里没有对象字段 `coreArchiveSha256`", path.display()));
+        .unwrap_or_else(|| panic!("{} 里没有对象字段 `platforms`", path.display()));
     let keys: BTreeSet<String> = obj.keys().cloned().collect();
     assert!(
         !keys.is_empty(),
-        "{} 的 `coreArchiveSha256` 是空的 —— 平台枚举为空会让逐平台门退化成「没有平台要查」",
+        "{} 的 `platforms` 是空的 —— 平台枚举为空会让逐平台门退化成「没有平台要查」",
         path.display()
     );
     keys
@@ -157,7 +157,7 @@ pub fn assert_matrix_matches_manifest() {
     let only_matrix: Vec<&str> = matrix.difference(&manifest).map(String::as_str).collect();
     assert!(
         only_manifest.is_empty() && only_matrix.is_empty(),
-        "\n随包核平台枚举漂了：CORE_MATRIX 与 {} 的 `coreArchiveSha256` 键集合对不上。\n  \
+        "\n随包核平台枚举漂了：CORE_MATRIX 与 {} 的 `platforms` 键集合对不上。\n  \
          manifest 有、CORE_MATRIX 没有：{}\n  CORE_MATRIX 有、manifest 没有：{}\n\
          真值源是 manifest。加平台 ⇒ 在 CORE_MATRIX 补一行，goos / goarch / cgo / extra_tags / \
          gate_target 逐列确认（照抄别的平台正是本断言要防的事）；\

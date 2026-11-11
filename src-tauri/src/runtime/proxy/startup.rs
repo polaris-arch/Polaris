@@ -1186,7 +1186,7 @@ impl ProxyRuntime {
     /// rediscovered through current while Child/check/desktop locks are held.
     pub(super) fn spawn_direct_native(
         &self,
-        producer: Option<&Arc<super::mesh_apply::owner_proof::ProducerCell>>,
+        producer: Option<&Arc<super::process_supervision::owner_proof::ProducerCell>>,
         birth_generation: u64,
         factory_call: impl FnOnce() -> Result<
             crate::runtime::core_child::Child,
@@ -3920,35 +3920,6 @@ impl ProxyRuntime {
         applied
     }
 
-    /// Capture the ordinary startup value inputs once for an unpublished
-    /// candidate. Port numbers are probes, not reservations. This method does
-    /// not open listeners, write rules, generate twice or invoke a kernel gate.
-    pub(super) fn generate_candidate_deps(
-        &self,
-        config: &UserConfig,
-        raw: &Value,
-    ) -> Result<GenerateConfigDeps, String> {
-        let control_port = control_api_port(config);
-        let ports = self.resolve_start_ports(config, control_port)?;
-        let mut deps = self.generate_deps(
-            ports.api,
-            ports.update_in,
-            ports.subscription_update_in,
-            ports.probe_proxy,
-            &ports.probe_pool,
-            raw,
-            false,
-        );
-        deps.network_canary_port = self.resolve_network_canary_port(
-            config,
-            control_port,
-            ports.api,
-            ports.update_in,
-            ports.subscription_update_in,
-        );
-        Ok(deps)
-    }
-
     /// Read immutable policy input for normal generation, diagnostics and frozen
     /// candidates alike. Parsing/replacement/fallback live in config-engine.
     pub(super) fn node_dns_decoy_override(&self) -> Option<String> {
@@ -4018,7 +3989,7 @@ impl ProxyRuntime {
                 std::env::consts::ARCH,
             ),
             cronet_copy_failed: false,
-            // 随包核恒 pin 在 1.14 带（具体版本见 src-tauri/core-manifest.json 的 bundledCoreVersion，
+            // 随包核恒 pin 在 1.14 带（具体版本见 scripts/desktop-core/release-contract.json 的 version，
             // **勿在此抄具体 alpha/beta 号**：抄一次就漂一次）→ 恒有 services schema。
             // 换核后若允许 <1.14 需按 coreVersionAtLeast 门控（上游 hasManagementApi）——见边界声明。
             has_management_api: true,

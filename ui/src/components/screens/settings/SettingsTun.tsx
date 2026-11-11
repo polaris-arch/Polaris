@@ -311,7 +311,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
                 后缀自动约束，`redirect_iptables.go` / `redirect_nftables_rules.go` **没有平台后缀**，
                 靠首行 `//go:build linux` 约束 —— 这两个只看文件名会误判成"跨平台编译"，
                 必须看 build 约束才下得了结论。
-            升核时按 `core_dep_fingerprint.rs` 的 SING_TUN_PINNED 注释复核。
+            升核时随发布合同复核 sing-tun 的 DNS 模式默认值。
 
             这不只是「拨了不生效的控件」—— 原文案承诺的是「防止绕行泄漏」，一个**安全保证**。
             mac 用户开着它，以为自己有防泄漏保护，实际什么都没装。给出不存在的安全保证比给一个

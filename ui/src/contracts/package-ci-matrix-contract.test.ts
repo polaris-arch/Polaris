@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFile, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -112,17 +112,6 @@ function evaluateActions(expression: string, github: { event_name: string; ref: 
   });
 }
 
-// Match Actions' case-insensitive mode routing; the actual Node admission remains
-// the case-sensitive authority. This is routing, never authorization to run HOT.
-const runtimeModeFunctions = {
-  contains: (haystack: string, needle: string) => String(haystack).toLowerCase().includes(String(needle).toLowerCase()),
-  toJSON: JSON.stringify,
-  diagnosticMode: (mode: unknown) => typeof mode === 'string' && mode.toLowerCase() === 'diagnostic-source',
-};
-const runtimeModeExpression = (expression: string) => expression.replaceAll(
-  "inputs.runtime_config_loopback_input != 'diagnostic-source'", '!diagnosticMode(inputs.runtime_config_loopback_input)',
-);
-
 /** 本仓 ci.yml 会遇到的全部入口（`os` 列：没有该输入的事件按 Actions 语义记作 ''）。 */
 const CI_ENTRIES = [
   { label: 'push main', event_name: 'push', ref: 'refs/heads/main', os: '' },
@@ -185,11 +174,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const check = (source: string) => {
       const job = executable(jobBlock(source, 'test'));
       const early = stepBlock(job, name);
-      const condition = /^ {8}if: (.+)$/m.exec(early);
-      expect(condition).not.toBeNull();
-      for (const value of ['', 'false', 'unknown', 'true'])
-        expect(runInNewContext(condition![1], { needs: { cheap_format: { outputs: { app_native_compile_only: value } } } }))
-          .toBe(value !== 'true');
+      expect(/^ {8}if: (.+)$/m.exec(early)).toBeNull();
       expect(early).not.toMatch(/continue-on-error|always\(\)|\|\| true/);
       const at = job.indexOf(`- name: ${name}\n`);
       for (const prerequisite of ['Install Rust toolchain (preinstalled rustup)', 'Setup Rust cache',
@@ -228,36 +213,28 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // 本条补的就是这条新路径。
     const ci = workflow('ci.yml');
 
-    // Manual candidate and committed formal validation reuse the same App commit; ordinary gates remain mandatory.
+    // Committed formal validation reuses the same App commit; ordinary gates remain mandatory.
     const candidate = executable(jobBlock(ci, 'native_dns_candidate_gates'));
     expect(candidate).toContain('uses: ./.github/workflows/native-dns-candidate.yml');
-    expect(candidate).toContain("formal_release: ${{ needs.cheap_format.outputs.native_dns_formal == 'true' }}");
     const candidateIf = /^\$\{\{ (.+) \}\}$/.exec(foldedJobIf(candidate, 'native_dns_candidate_gates'));
     expect(candidateIf).not.toBeNull();
     const app = 'a'.repeat(40);
-    const manualWorkflow = 'polaris-arch/Polaris/.github/workflows/ci.yml@refs/heads/collab/native-node-dns-20261018';
-    const context = (event: string, workflowRef: string, input = '', selected = '', formal = '', formalApp = '') => ({
-      github: { event_name: event, workflow_ref: workflowRef }, inputs: { native_dns_candidate: input },
-      needs: { cheap_format: { outputs: { native_dns_candidate: selected, native_dns_formal: formal,
-        native_dns_formal_app: formalApp } } },
+    const context = (event: string, formal = '', formalApp = '') => ({
+      github: { event_name: event },
+      needs: { cheap_format: { outputs: { native_dns_formal: formal, native_dns_formal_app: formalApp } } },
     });
     const admissionCases = [
-      { name: 'exact manual candidate', env: context('workflow_dispatch', manualWorkflow, app, app), admitted: true, app },
-      { name: 'candidate differs', env: context('workflow_dispatch', manualWorkflow, app, 'b'.repeat(40)), admitted: false },
-      { name: 'candidate absent', env: context('workflow_dispatch', manualWorkflow), admitted: false },
-      { name: 'candidate wrong event', env: context('push', manualWorkflow, app, app), admitted: false },
-      { name: 'candidate wrong caller', env: context('workflow_dispatch', 'other/workflow', app, app), admitted: false },
-      { name: 'formal flag absent', env: context('push', 'ordinary CI', '', '', '', app), admitted: false },
-      { name: 'formal flag false', env: context('push', 'ordinary CI', '', '', 'false', app), admitted: false },
+      { name: 'formal flag absent', env: context('push', '', app), admitted: false },
+      { name: 'formal flag false', env: context('push', 'false', app), admitted: false },
       ...['push', 'pull_request', 'merge_group', 'workflow_dispatch'].map((event) => ({
-        name: `admitted formal ${event}`, env: context(event, 'ordinary CI', '', '', 'true', app), admitted: true, app,
+        name: `admitted formal ${event}`, env: context(event, 'true', app), admitted: true,
       })),
     ];
     const candidateInput = /^ {6}candidate: \$\{\{ (.+) \}\}$/m.exec(candidate);
     expect(candidateInput).not.toBeNull();
     for (const entry of admissionCases) {
       expect(runInNewContext(candidateIf![1], entry.env), entry.name).toBe(entry.admitted);
-      if (entry.admitted) expect(runInNewContext(candidateInput![1], entry.env), entry.name).toBe(entry.app);
+      if (entry.admitted) expect(runInNewContext(candidateInput![1], entry.env), entry.name).toBe(app);
     }
     for (const entry of admissionCases) {
       for (const nativeRequired of ['', 'true', 'unknown', 'false']) {
@@ -279,7 +256,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       ['- name: Check workspace formatting before native compilation', 'cheap_format'],
       ['- name: Clippy (deny warnings)', 'lint'],
       ['- name: Rustdoc documentation invariants (deny four lints)', 'lint'],
-      ['- name: Resolve core-owned Cronet dependencies', 'lint'],
       ['- name: Cross-check platform targets', 'cross'],
       ['- name: Vendored path sources stay diagnostic-free', 'cross'],
       ['- name: Android impact face must be registered', 'cross'],
@@ -302,8 +278,8 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     for (const [name, block] of [['lint', lint], ['test', test]] as const) {
       const condition = foldedJobIf(block, name);
       expect(condition).toBe(name === 'lint'
-        ? "needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.app_native_compile_only != 'true' && needs.cheap_format.outputs.native_required != 'false'"
-        : "needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.native_required != 'false'");
+        ? "needs.cheap_format.outputs.native_required != 'false'"
+        : "needs.cheap_format.outputs.native_required != 'false'");
       for (const value of ['', 'true', 'unknown', 'false'])
         expect(evaluateActions(condition, CI_ENTRIES[0], value)).toBe(value !== 'false');
       expect(block).toMatch(/^ {4}runs-on: \$\{\{ matrix\.os \}\}$/m);
@@ -315,42 +291,8 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
 
     // The cheap formatter is a required predecessor, never a best-effort probe.
     // It runs for every normal gate event, including non-Linux dispatches.
-    // Explicit source-only dispatch has its own failing admission job. Otherwise,
-    // launcher diagnosis and conflicting SYSTEM requests retain the original routing.
     const requireCheapFormat = (block: string) => {
-      expect(block).not.toMatch(/^ {4}(?:needs|continue-on-error):/m);
-      const conditions = [...block.matchAll(/^ {4}if: \$\{\{ (.*) \}\}$/gm)];
-      expect(block.match(/^ {4}if:/gm) ?? []).toHaveLength(1);
-      expect(conditions).toHaveLength(1);
-      expect(conditions[0][1]).toBe("((contains(toJSON(inputs), '\"runtime_config_loopback_input\"') && inputs.runtime_config_loopback_input != 'diagnostic-source') || (github.event_name == 'workflow_dispatch' && ((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != ''))) || (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
-      for (const event of ['pull_request', 'push', 'merge_group', 'workflow_call', 'workflow_dispatch']) {
-        for (const sourceOnly of [undefined, false, true]) {
-          for (const selected of [undefined, false, true]) {
-            for (const candidate of [undefined, '', 'a'.repeat(40), 'malformed']) {
-              expect(runInNewContext(runtimeModeExpression(conditions[0][1]), {
-                ...runtimeModeFunctions,
-                github: { event_name: event }, inputs: {
-                  runtime_config_source_only: sourceOnly,
-                  windows_launcher_diagnostics: selected, windows_system_candidate: candidate,
-                },
-              })).toBe((event !== 'workflow_dispatch' || sourceOnly !== true)
-                && (event !== 'workflow_dispatch' || selected !== true || !!candidate));
-            }
-          }
-        }
-      }
-      // Non-default raw input must reach failing admission even when a conflicting
-      // source-only/launcher request would otherwise omit the formatter ancestor.
-      for (const event of ['pull_request', 'push', 'workflow_call', 'workflow_dispatch'])
-        for (const mode of [undefined, 'diagnostic-source', 'DIAGNOSTIC-SOURCE', 'formal-release', 'FORMAL-RELEASE', '', 'unknown']) {
-          const rawRequest = mode !== undefined && mode.toLowerCase() !== 'diagnostic-source';
-          expect(runInNewContext(runtimeModeExpression(conditions[0][1]), {
-            ...runtimeModeFunctions, github: { event_name: event }, inputs: {
-              ...(mode === undefined ? {} : { runtime_config_loopback_input: mode }),
-              runtime_config_source_only: true, windows_launcher_diagnostics: true,
-            },
-          })).toBe(rawRequest || event !== 'workflow_dispatch');
-        }
+      expect(block).not.toMatch(/^ {4}(?:needs|continue-on-error|if):/m);
       expect(block).not.toMatch(/^ {8}continue-on-error:/m);
       const stepConditions = [...block.matchAll(/^ {8}if: (.+)$/gm)];
       expect(stepConditions).toHaveLength(1);
@@ -412,161 +354,22 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
   });
 
-  it('RuntimeConfig isolated source and real-loopback dispatches preserve the original default job decisions', () => {
-    const ci = workflow('ci.yml');
-    const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
-    const source = executable(jobBlock(ci, 'runtime_config_source_tests'));
-    const defaults = { runtime_config_loopback_candidate: '', app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
-      native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
-      windows_directory_candidate_source: '', os: 'all', preserve_run: false };
-    type Selection = Partial<typeof defaults> & { runtime_config_loopback_input?: string };
-    const conflicts: Selection[] = [{ windows_launcher_diagnostics: true }, { native_dns_candidate: 'a'.repeat(40) },
-      { windows_system_candidate: 'a'.repeat(40) }, { windows_directory_mode: 'candidate' },
-      { windows_directory_candidate_source: 'a'.repeat(40) }, { os: 'windows-2022' }, { os: 'macos-15' },
-      { windows_launcher_diagnostics: true, windows_system_candidate: 'a'.repeat(40) }];
-    // Compile each actual expression once; exhaustive truth tables should not
-    // create thousands of VM contexts or depend on a relaxed test timeout.
-    const conditions = Object.fromEntries(jobs.map((name) => {
-      const block = executable(jobBlock(ci, name));
-      const line = /^ {4}if: (?!>-)(.+)$/m.exec(block)?.[1].replace(/^\$\{\{ | \}\}$/g, '');
-      const expression = line ?? foldedJobIf(block, name).replace(/^\$\{\{ | \}\}$/g, '');
-      return [name, { needs: /^ {4}needs: (\w+)$/m.exec(block)?.[1],
-        allows: runInNewContext(`(inputs, github, needs) => (${runtimeModeExpression(expression)})`, runtimeModeFunctions) }];
-    }));
-    const decision = (name: string, event: string, selection: Selection, nativeRequired = 'true', formal = 'true', loopbackOutput = '') => {
-      const inputs = { ...defaults, ...selection };
-      return Boolean(conditions[name].allows(inputs,
-        { event_name: event, repository: 'polaris-arch/Polaris',
-          ref: 'refs/heads/collab/dots-audit-remediation-20261017', workflow_ref: 'ordinary CI',
-          event: { inputs: { ...inputs, runtime_config_source_only: 'true' } } },
-        { cheap_format: { outputs: { native_required: nativeRequired, native_dns_formal: formal,
-          native_dns_candidate: '', native_dns_formal_app: 'a'.repeat(40), runtime_config_loopback_only: loopbackOutput } } },
-      ));
-    };
-    const scheduled = (event: string, selection: Selection, nativeRequired = 'true', formal = 'true', loopbackOutput = '', cheapResult = 'success') => {
-      const started = new Set<string>();
-      for (const name of jobs) {
-        const needs = conditions[name].needs;
-        if ((!needs || (started.has(needs) && cheapResult === 'success'))
-          && decision(name, event, selection, nativeRequired, formal, loopbackOutput)) started.add(name);
-      }
-      return [...started];
-    };
-    for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback']) {
-      const header = executable(jobBlock(ci, name)).split('    steps:')[0];
-      expect(header).toMatch(/^ {4}needs: cheap_format$/m);
-      expect(header).not.toMatch(/always\(|cancelled\(|success\(|failure\(|continue-on-error/);
-    }
-    const compileOnly = { ...defaults, app_native_compile_candidate: 'a'.repeat(40), os: 'ubuntu-22.04' };
-    for (const selection of [compileOnly, { ...compileOnly, runtime_config_source_only: true },
-      { ...compileOnly, windows_launcher_diagnostics: true }]) {
-      expect(decision('cheap_format', 'workflow_dispatch', selection)).toBe(true);
-      expect(decision('runtime_config_source_tests', 'workflow_dispatch', selection)).toBe(false);
-      expect(decision('windows_launcher_diagnostics', 'workflow_dispatch', selection)).toBe(false);
-    }
-    const loopback = executable(jobBlock(ci, 'runtime_config_loopback'));
-    const loopbackOnly = { ...defaults, runtime_config_loopback_candidate: 'a'.repeat(40), os: 'ubuntu-22.04', preserve_run: true };
-    expect(scheduled('workflow_dispatch', loopbackOnly, 'true', 'true', 'true'))
-      .toEqual(['cheap_format', 'runtime_config_loopback']);
-    for (const output of ['', 'false', 'unknown', 'TRUE']) {
-      expect(scheduled('workflow_dispatch', loopbackOnly, 'true', 'true', output))
-        .toEqual(['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test']);
-      expect(decision('runtime_config_loopback', 'workflow_dispatch', loopbackOnly, 'true', 'true', output)).toBe(false);
-    }
-    for (const selection of [{}, ...conflicts, { runtime_config_source_only: true },
-      { app_native_compile_candidate: 'a'.repeat(40) }, { runtime_config_loopback_candidate: 'malformed' },
-      { runtime_config_loopback_candidate: ' ' },
-      { app_native_compile_candidate: 'a'.repeat(40), runtime_config_source_only: true, windows_launcher_diagnostics: true }]) {
-      const selected = { ...loopbackOnly, ...selection };
-      expect(decision('cheap_format', 'workflow_dispatch', selected)).toBe(true);
-      expect(decision('runtime_config_source_tests', 'workflow_dispatch', selected)).toBe(false);
-      expect(decision('windows_launcher_diagnostics', 'workflow_dispatch', selected)).toBe(false);
-      for (const outcome of ['failure', 'cancelled', 'skipped'])
-        expect(scheduled('workflow_dispatch', selected, 'true', 'true', 'true', outcome)).toEqual(['cheap_format']);
-    }
-    for (const mode of ['formal-release', 'FORMAL-RELEASE', '', 'unknown']) {
-      const selected = { runtime_config_loopback_input: mode, runtime_config_source_only: true, windows_launcher_diagnostics: true };
-      expect(decision('cheap_format', 'workflow_dispatch', selected)).toBe(true);
-      expect(decision('runtime_config_source_tests', 'workflow_dispatch', selected)).toBe(false);
-      expect(decision('windows_launcher_diagnostics', 'workflow_dispatch', selected)).toBe(false);
-      for (const outcome of ['failure', 'cancelled', 'skipped'])
-        expect(scheduled('workflow_dispatch', selected, 'true', 'true', 'true', outcome)).toEqual(['cheap_format']);
-    }
-    expect(loopback).toContain("if: needs.cheap_format.outputs.runtime_config_loopback_only == 'true'");
-    expect(loopback).toContain('runs-on: ubuntu-22.04');
-    expect(loopback).toContain('permissions:\n      contents: read');
-    expect(loopback).not.toMatch(/strategy:|Swatinem\/rust-cache@|actions\/cache@|fetch-core|prepare-core-identity|continue-on-error|contents: write|actions: write|id-token:|secrets:/);
-    const loopbackAdmission = stepBlock(loopback, 'Admit execution runner for real HOT loopback');
-    expect(loopbackAdmission).toContain('RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}');
-    expect(loopbackAdmission).toContain('run: node scripts/runtime-config-loopback.mjs admit');
-    expect(loopback.indexOf(loopbackAdmission)).toBeLessThan(loopback.indexOf('      - name: Install Rust toolchain'));
-    expect(stepBlock(loopback, 'Run exact real App to paired kernel HOT loopback tests'))
-      .toContain('run: node scripts/runtime-config-loopback.mjs run');
-    const dispatch = ci.split('\n  workflow_dispatch:\n')[1].split('\n  workflow_call:\n')[0];
-    expect([...dispatch.matchAll(/^ {6}([a-z][a-z0-9_]*):$/gm)].map((match) => match[1])).toEqual([
-      'runtime_config_loopback_input',
-      'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
-      'native_dns_candidate', 'windows_system_candidate', 'windows_launcher_diagnostics', 'windows_directory_mode',
-      'windows_directory_candidate_source', 'preserve_run', 'os',
-    ]);
-    expect(dispatch).toMatch(/runtime_config_loopback_input:\n {8}description:.*\n {8}type: choice\n {8}default: diagnostic-source\n {8}options: \[diagnostic-source, formal-release\]/);
-    expect(dispatch).toMatch(/runtime_config_loopback_candidate:\n {8}description:.*\n {8}type: string\n {8}default: ''/);
-    expect(ci.split('\n  workflow_call:\n')[1].split('\njobs:\n')[0]).not.toContain('runtime_config_loopback_candidate');
-    expect(source).not.toMatch(/^ {4}needs:|continue-on-error|fetch-core|sudo/m);
-    expect(source).toContain('runs-on: ubuntu-22.04');
-    expect(source).toContain('run: node scripts/fetch-protoc.mjs');
-    expect(source.match(/^ {8}run: cargo .+$/gm)).toEqual(['        run: cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
-    const input = ci.split('  workflow_dispatch:\n')[1].split('  workflow_call:')[0];
-    expect(input).toMatch(/runtime_config_source_only:\n {8}description: .+\n {8}type: boolean\n {8}default: false/);
-    expect(ci.split('  workflow_call:\n')[1].split('\nconcurrency:')[0]).not.toContain('runtime_config_source_only');
-    const admission = stepBlock(source, 'Admit isolated RuntimeConfig source-only selection');
-    expect(admission).toContain("if: github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true");
-    expect(source.indexOf(admission)).toBeLessThan(source.indexOf('      - name: Install Rust toolchain'));
-    const script = /<<'NODE'\n([\s\S]*?)\n {10}NODE/.exec(admission)![1].replace(/^ {10}/gm, '');
-    const admit = (selection: Selection) => runInNewContext(script, { process: { env: {
-      GITHUB_EVENT_NAME: 'workflow_dispatch', RUNTIME_CONFIG_SOURCE_INPUTS: JSON.stringify({ ...defaults,
-        runtime_config_source_only: true, ...selection }),
-    } } });
-    for (const selection of [{}, { os: 'ubuntu-22.04' }, ...conflicts])
-      expect(scheduled('workflow_dispatch', { ...selection, runtime_config_source_only: true })).toEqual(['runtime_config_source_tests']);
-    expect(() => admit({})).not.toThrow();
-    expect(() => admit({ os: 'ubuntu-22.04' })).not.toThrow();
-    expect(() => admit({ runtime_config_loopback_input: 'diagnostic-source' })).not.toThrow();
-    for (const mode of ['formal-release', 'FORMAL-RELEASE', 'DIAGNOSTIC-SOURCE', '', 'unknown'])
-      expect(() => admit({ runtime_config_loopback_input: mode })).toThrow(/cannot combine/);
-    for (const selection of [...conflicts, { app_native_compile_candidate: 'a'.repeat(40) }, { runtime_config_loopback_candidate: 'a'.repeat(40) }]) expect(() => admit(selection)).toThrow(/cannot combine/);
-    for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
-      for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
-        for (const diagnostic of [false, true]) for (const system of ['', 'a'.repeat(40)])
-          for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-15'])
-            for (const nativeRequired of ['', 'true', 'false']) for (const formal of ['', 'true']) {
-              const ordinary = event !== 'workflow_dispatch' || !diagnostic || system !== '';
-              const native = ordinary && nativeRequired !== 'false';
-              const expected = [ordinary && 'cheap_format', native && formal === 'true' && 'native_dns_candidate_gates',
-                native && 'lint', native && (event !== 'workflow_dispatch' || ['', 'all', 'ubuntu-22.04'].includes(os)) && 'cross',
-                native && 'test', ordinary && 'runtime_config_source_tests', !ordinary && 'windows_launcher_diagnostics'].filter(Boolean);
-              expect(scheduled(event, { runtime_config_source_only: sourceOnly, windows_launcher_diagnostics: diagnostic,
-                windows_system_candidate: system, os }, nativeRequired, formal)).toEqual(expected);
-            }
-  });
-
   it('Rust 缓存键：每个 job 恰一个 rust-cache，键各自独立且是稳定字面量', () => {
     // 三个 job 的 target/ 内容互不通用（clippy metadata / 交叉 check 单元 / dev 全量 codegen）。
     // 共用键 = 谁最后跑完谁覆盖，另外两个下次恢复到的是别人的产物 —— 等于次次冷编。
     const keysOf = (block: string) =>
       [...block.matchAll(/uses: Swatinem\/rust-cache@v2\n {8}with:\n(?: {10}.*\n)*? {10}key: (.+)\n/g)].map((m) => m[1]);
     const ci = workflow('ci.yml');
-    expect(executable(jobBlock(ci, 'runtime_config_loopback'))).not.toMatch(/Swatinem\/rust-cache@|actions\/cache@/);
-    const ciKeys = ['lint', 'cross', 'test', 'runtime_config_source_tests'].map((name) => {
+    const ciKeys = ['lint', 'cross', 'test'].map((name) => {
       const block = executable(jobBlock(ci, name));
       expect(block.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], `${name} job 的 rust-cache 步数`).toHaveLength(1);
       const keys = keysOf(block);
       expect(keys, `${name} job 的 rust-cache 没有显式 key`).toHaveLength(1);
       return keys[0];
     });
-    // 逐字钉住：键是字面量（不含 run_id / sha 之类每次都变的东西 ⇒ 稳定），且四者互不相同。
-    expect(ciKeys).toEqual(['lint', 'cross', 'test', 'runtime-config-source']);
-    expect(ci.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], 'ci.yml 有不属于这四个 job 的 rust-cache').toHaveLength(4);
+    // 逐字钉住：键是字面量（不含 run_id / sha 之类每次都变的东西 ⇒ 稳定），且三者互不相同。
+    expect(ciKeys).toEqual(['lint', 'cross', 'test']);
+    expect(ci.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], 'ci.yml 有不属于这三个 job 的 rust-cache').toHaveLength(3);
 
     const pkg = workflow('package.yml');
     const pkgKeys = keysOf(executable(jobBlock(pkg, 'package')));
@@ -678,33 +481,22 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const pkg = workflow('package.yml');
     const pkgJob = executable(jobBlock(pkg, 'package'));
     expect(pkgJob, '剥注释后 package 块空了 —— 取材面塌了').toMatch(/^\s+if:/m);
-    expect(pkgJob).toContain('needs: [setup, desktop_core]');
-    const coreJob = executable(jobBlock(pkg, 'desktop_core'));
-    expect(coreJob).toContain('needs: setup');
-    expect(coreJob).toContain('uses: ./.github/workflows/desktop-core.yml');
-    expect(coreJob).toContain('candidate: ${{ needs.setup.outputs.candidate }}');
+    expect(pkgJob).toContain('needs: setup');
     expect(pkgJob).toContain("needs.setup.result == 'success'");
-    expect(pkgJob).toContain("needs.desktop_core.result == 'success'");
-    expect(pkgJob).toContain("needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''");
     // 状态函数必须是 `!cancelled()`：`always()` 恒真，run 被取消时在途打包腿不会停，
     // 旧提交的四条腿会把并发组占到跑完（Release Risk run 37638779024 实证，见 package.yml 注释）。
-    // 完整真值表（含取消态）在 scripts/desktop-core-ci-wiring.test.mjs 里按表达式求值。
     for (const [name, block] of [['package', pkgJob], ['core_wire', executable(jobBlock(pkg, 'core_wire'))]] as const) {
       const condition = foldedJobIf(block, name);
       const prefix = '(';
       expect(condition.startsWith(prefix) && condition.endsWith(')'), `${name} 保留正常取消与来源绑定条件`).toBe(true);
       const ordinary = condition.slice(prefix.length, -1);
-      expect(ordinary).toBe("!cancelled() && needs.setup.result == 'success' && (needs.desktop_core.result == 'success' || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))");
+      expect(ordinary).toBe("!cancelled() && needs.setup.result == 'success'");
       expect(condition, `${name} 的 if 里出现了 always() —— 它对取消免疫`).not.toContain('always()');
       for (const cancelled of [false, true]) {
         for (const setup of ['success', 'failure', 'cancelled', 'skipped']) {
-          for (const core of ['success', 'failure', 'cancelled', 'skipped']) for (const artifact of ['', 'bound-artifact']) {
-            const context = { inputs: { core_bundle_artifact: artifact },
-              needs: { setup: { result: setup }, desktop_core: { result: core } }, cancelled: () => cancelled };
-            const expected = !cancelled && setup === 'success' &&
-              (core === 'success' || (core === 'skipped' && artifact !== ''));
-            expect(runInNewContext(condition, context), `${name}: ${JSON.stringify({ cancelled, setup, core, artifact })}`).toBe(expected);
-          }
+          const context = { needs: { setup: { result: setup } }, cancelled: () => cancelled };
+          const expected = !cancelled && setup === 'success';
+          expect(runInNewContext(condition, context), `${name}: ${JSON.stringify({ cancelled, setup })}`).toBe(expected);
         }
       }
     }
@@ -715,14 +507,11 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     ).not.toMatch(/needs\.(ci|ui)\./);
   });
 
-  it('复用 bundle 的真实 setup 前置只接受同 candidate、run 和 attempt', () => {
+  it('真实 setup 前置只接受同 candidate', () => {
     const resolve = stepBlock(jobBlock(workflow('package.yml'), 'setup'), 'Resolve platform matrix');
     expect(resolve).toContain('EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}');
     expect(resolve).toContain('CORE_CANDIDATE: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}');
-    expect(resolve).toContain('CORE_RUN_ID: ${{ github.run_id }}');
-    expect(resolve).toContain('CORE_RUN_ATTEMPT: ${{ github.run_attempt }}');
     expect(resolve).toContain("SYSTEM_CANDIDATE: ${{ inputs.windows_system_candidate || '' }}");
-    expect(resolve).toContain("POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}");
     const runAt = resolve.indexOf('\n        run: |\n');
     const matrixAt = resolve.indexOf('\n          all=', runAt);
     expect(runAt).toBeGreaterThan(0);
@@ -732,17 +521,12 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       .split('\n').map((line) => line.slice(10)).join('\n');
     const candidate = 'a'.repeat(40);
     const base = {
-      CORE_CANDIDATE: candidate, EXPECTED_CANDIDATE: candidate,
-      CORE_RUN_ID: '12', CORE_RUN_ATTEMPT: '3',
-      CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-3`,
-      POLARIS_NATIVE_PAYLOAD_VALIDATION: '0', SYSTEM_CANDIDATE: '',
+      CORE_CANDIDATE: candidate, EXPECTED_CANDIDATE: candidate, SYSTEM_CANDIDATE: '',
     };
     const cases: [string, Record<string, string>, number][] = [
-      ['exact reuse', {}, 0], ['standalone producer', { CORE_BUNDLE_ARTIFACT: '' }, 0],
+      ['exact candidate', {}, 0],
       ['different candidate', { CORE_CANDIDATE: 'b'.repeat(40) }, 1],
       ['malformed candidate', { CORE_CANDIDATE: 'not-a-commit' }, 1],
-      ['previous run', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-11-3` }, 1],
-      ['previous attempt', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-2` }, 1],
     ];
     for (const [name, changed, status] of cases) {
       const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...base, ...changed }, encoding: 'utf8' });
@@ -751,11 +535,11 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const system = {
       ...base, SYSTEM_CANDIDATE: candidate, GITHUB_SHA: candidate,
       GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
-      GITHUB_REF: 'refs/heads/ci/governance', PLATFORM: 'all', PLATFORMS_JSON: '',
+      GITHUB_REF: 'refs/heads/main', PLATFORM: 'all', PLATFORMS_JSON: '',
       VALIDATION_SKIP_QUALITY: 'false',
     };
     const systemCases: [string, Record<string, string>, number][] = [
-      ['SYSTEM exact candidate', {}, 0], ['SYSTEM main', { GITHUB_REF: 'refs/heads/main' }, 0],
+      ['SYSTEM exact candidate', {}, 0],
       ['SYSTEM wrong SHA', { SYSTEM_CANDIDATE: 'b'.repeat(40) }, 1],
       ['SYSTEM malformed SHA', { SYSTEM_CANDIDATE: 'not-a-commit' }, 1],
       ['SYSTEM push', { GITHUB_EVENT_NAME: 'push' }, 1],
@@ -768,47 +552,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     ];
     for (const [name, changed, status] of systemCases) {
       const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...system, ...changed }, encoding: 'utf8' });
-      expect(result.status, `${name}: ${result.stderr}`).toBe(status);
-    }
-    const ref = 'refs/heads/collab/fk02-native-payload-validation-20261010';
-    const native = {
-      ...base, POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true',
-      POLARIS_NO_KERNEL_RUN: '0', GITHUB_SHA: candidate, GITHUB_RUN_ID: '12', GITHUB_RUN_ATTEMPT: '3',
-      GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_REF: ref,
-      GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}`,
-      PLATFORMS_JSON: '["linux","windows"]', VALIDATION_KERNEL: 'true', VALIDATION_UPLOAD: 'true',
-      VALIDATION_LIGHT: 'false', VALIDATION_SKIP_QUALITY: 'true',
-    };
-    const nativeCases: [string, Record<string, string>, number][] = [
-      ['native exact reuse', {}, 0], ['native wrong event', { GITHUB_EVENT_NAME: 'push' }, 1],
-      ['native outside Actions', { GITHUB_ACTIONS: 'false' }, 1],
-      ['native wrong repository', { GITHUB_REPOSITORY: 'other/repo' }, 1],
-      ['native tag', { GITHUB_REF: 'refs/tags/v1.0.0' }, 1],
-      ['native wrong caller', { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/package.yml@${ref}` }, 1],
-      ['native extra platform', { PLATFORMS_JSON: '["linux","windows","macos-x64"]' }, 1],
-      ['native no kernel gate', { VALIDATION_KERNEL: 'false' }, 1],
-      ['native no original artifacts', { VALIDATION_UPLOAD: 'false' }, 1],
-      ['native light build', { VALIDATION_LIGHT: 'true' }, 1],
-      ['native duplicate quality gates', { VALIDATION_SKIP_QUALITY: 'false' }, 1],
-      ['native no bundle', { CORE_BUNDLE_ARTIFACT: '' }, 1],
-      ['native previous attempt', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-2` }, 1],
-    ];
-    // Replay the historical Risk contract against its own exact selection. The
-    // current committed formal default must not inherit that historical exemption.
-    const historicalRoot = mkdtempSync(join(tmpdir(), 'polaris-package-historical-risk-'));
-    onTestFinished(() => rmSync(historicalRoot, { recursive: true, force: true }));
-    for (const directory of ['desktop-core', 'lib'])
-      cpSync(join(REPO_ROOT, 'scripts', directory), join(historicalRoot, 'scripts', directory), { recursive: true });
-    mkdirSync(join(historicalRoot, 'src-tauri'));
-    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-    writeFileSync(join(historicalRoot, 'src-tauri/core-manifest.json'), JSON.stringify({ desktopRelease: manifest.historicalDesktopRelease }));
-    cpSync(join(REPO_ROOT, manifest.historicalDesktopReleaseContractPath),
-      join(historicalRoot, manifest.historicalDesktopRelease.contractPath));
-    const formal = spawnSync('bash', ['-c', script], { cwd: REPO_ROOT, env: { ...process.env, ...native }, encoding: 'utf8' });
-    expect(formal.status, formal.stderr).not.toBe(0);
-    expect(formal.stderr).toContain('Exact committed formal App/caller/run context required');
-    for (const [name, changed, status] of nativeCases) {
-      const result = spawnSync('bash', ['-c', script], { cwd: historicalRoot, env: { ...process.env, ...native, ...changed }, encoding: 'utf8' });
       expect(result.status, `${name}: ${result.stderr}`).toBe(status);
     }
   });
@@ -1639,12 +1382,11 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       android.slice(android.indexOf('\n  workflow_dispatch:'), android.indexOf('\npermissions:')),
     );
     expect(androidDispatch).toMatch(/\n {6}preserve_run:\n {8}type: boolean\n {8}default: false/);
-    expect([...androidDispatch.matchAll(/^ {6}([a-z_]+):$/gm)].map((match) => match[1])).toEqual(['preserve_run', 'hot_consumer_candidate']);
+    expect([...androidDispatch.matchAll(/^ {6}([a-z_]+):$/gm)].map((match) => match[1])).toEqual(['preserve_run']);
     expect(androidDispatch).not.toMatch(/light_build:|publish_release:|release_tag:/);
     expect(androidExecutable).toMatch(/\n {6}light_build:\n(?: {8}(?!default:).*\n)* {8}default: false\n/);
     // 签名发布腿只在 publish_release 为真时跑 ⇒ 在它身上「轻量」必然是 ('1','1') 那一格。
     expect(executable(jobBlock(android, 'release-apk'))).toMatch(/^ {4}if: inputs\.publish_release$/m);
-    // Three formal evidence allowlists remain; the isolated candidate adds only JSON/XML/log evidence.
     const releaseCheck = jobBlock(android, 'release_check');
     const uploaded = executable(stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）'))
       .split('\n')
@@ -1665,56 +1407,10 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(stage1).toContain('>"$stage1_log" 2>&1');
     const validationEvidence = stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）');
     expect(executable(validationEvidence).match(/^ {8}if: (.+)$/m)?.[1])
-      .toBe("always() && (inputs.hot_consumer_candidate || '') == ''");
-    const formalEvidence = [
-      '${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar',
-      '${{ steps.libbox_input.outputs.work }}/staging/stage.aar',
-      '${{ steps.libbox_input.outputs.work }}/*receipt.json',
-      '${{ steps.libbox_input.outputs.work }}/*bind.log',
-      '${{ steps.libbox_input.outputs.work }}/budget-observation.json',
-      '${{ steps.libbox_input.outputs.work }}/cache-binding-observation.json',
-      '${{ steps.libbox_input.outputs.work }}/module-cache-admission-observation.json',
-      'scripts/mobile-core/android-consumption.json',
-      'src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json',
-      '${{ runner.temp }}/*.source-consumption.json',
-    ];
-    // A bind/inspect rejection leaves the real producer staging component in place.
-    // Bind this whitelist to its source-owned path, rather than guessing the final name.
-    const producer = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/producer.py'), 'utf8');
-    expect(producer).toContain("stage_root = private_dir(work / 'staging')");
-    expect(producer).toContain("stage_component = stage_root / ('stage.aar' if args.platform == 'android' else 'Libbox.xcframework')");
-    const ndkObservations = [
-      '~/Code/polaris-mobile-ci/ndk-source.properties',
-      '~/Code/polaris-mobile-ci/sdk-input-observation.json',
-    ];
-    // Match actual payload filename extensions, not the '.so' prefix of
-    // '*.source-consumption.json'. Exact evidence inventories remain required.
-    const isApkOrSoPayload = (path: string) => /(?:^|\/)[^/]*\.(?:apk|so)$/i.test(path.trim());
-    for (const path of ['app-arm64-release.apk', '/work/**/*.apk', '/work/libbox.so', '/work/**/*.so']) {
-      expect(isApkOrSoPayload(path), `actual payload must be refused: ${path}`).toBe(true);
-    }
-    expect(isApkOrSoPayload('${{ runner.temp }}/*.source-consumption.json')).toBe(false);
+      .toBe('always()');
     for (const job of ['release_check', 'release-apk']) {
-      const evidence = executable(stepBlock(jobBlock(android, job), 'Retain actual formal mobile component and original receipts'));
-      const paths = evidence.split('\n').filter(line => line.startsWith(' '.repeat(12))).map(line => line.trim());
-      expect(paths, `${job}: exact formal evidence whitelist`).toEqual(formalEvidence);
-      expect(evidence.match(/^ {8}if: (.+)$/m)?.[1]).toBe(job === 'release_check'
-        ? "always() && steps.libbox_input.outcome == 'success' && (inputs.hot_consumer_candidate || '') == ''"
-        : "always() && steps.libbox_input.outcome == 'success'");
-      expect(evidence).toContain('if-no-files-found: error');
-      expect(evidence).not.toMatch(/\bgh\s+release\b/);
-      expect(paths.filter(isApkOrSoPayload), `${job}: no APK/SO payload in evidence upload`).toEqual([]);
-      const block = jobBlock(android, job);
-      expect(executable(block).match(/uses: actions\/upload-artifact@/g) ?? [], `${job}: exact evidence artifacts`).toHaveLength(job === 'release_check' ? 4 : 3);
-      const observations = executable(stepBlock(block, 'Retain actual NDK input observations even on prepare failure'));
-      const observedPaths = observations.split('\n').filter(line => line.startsWith(' '.repeat(12))).map(line => line.trim());
-      expect(observedPaths, `${job}: exact failure-reachable NDK evidence whitelist`).toEqual(ndkObservations);
-      expect(observations.match(/^ {8}if: (.+)$/m)?.[1]).toBe(job === 'release_check'
-        ? "always() && (inputs.hot_consumer_candidate || '') == ''" : 'always()');
-      expect(observations).not.toMatch(/libbox_input|outputs\.|\bgh\s+release\b/);
-      expect(observations).toContain('name: formal-mobile-ndk-input-${{ github.job }}');
-      expect(observations).toContain('if-no-files-found: error');
-      expect(observedPaths.filter(isApkOrSoPayload), `${job}: no APK/SO in failed prepare evidence`).toEqual([]);
+      // Only the R8 mapping (and, on the signed leg, the release assets) leave the runner.
+      expect(executable(jobBlock(android, job)).match(/uses: actions\/upload-artifact@/g) ?? [], `${job}: exact artifacts`).toHaveLength(1);
     }
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
     // 留存 SDK 与原观察不分发 APK/SO；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
@@ -1796,11 +1492,10 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
           expect(previous, `${name} ${job}：「${next}」排到了它前一步之前`).toBeLessThan(index);
           previous = index;
         }
-        // 发行路径上这一步不能被关掉或忽略失败；Android 只允许隔离显式候选的原样条件。
+        // 发行路径上这一步不能被关掉或忽略失败。
         expect(step).not.toMatch(/^ {8}continue-on-error:/m);
         // 连同缩进续行一起取值，避免首行原样、下一行 `|| true` / `&& false` 绕过精确条件。
-        expect(step.match(/^ {8}if:.*(?:\n(?: {9,}.*|[ \t]*)$)*/gm) ?? []).toEqual(leg === ANDROID
-          ? ["        if: (inputs.hot_consumer_candidate || '') == ''"] : []);
+        expect(step.match(/^ {8}if:.*(?:\n(?: {9,}.*|[ \t]*)$)*/gm) ?? []).toEqual([]);
       }
       expect(count(executable(source)), `${name}：CARGO_PROFILE_ 出现在各 job 的构建权重步之外`).toBe(inSteps);
     }
@@ -1809,50 +1504,5 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(cargoConfig).toContain('[target.x86_64-pc-windows-msvc]');
     expect(cargoConfig, '.cargo/config.toml 出现了 [profile.*] —— 它会改写发行构型而 Cargo.toml 一字不动')
       .not.toMatch(/^\s*\[profile[.\]]/m);
-  });
-});
-
-describe('Android frozen arm64 diagnostic consumer routing', () => {
-  it('nonempty selectors reach admission, while empty defaults keep release routing', () => {
-    const android = workflow('android.yml');
-    const check = jobBlock(android, 'release_check');
-    const expression = check.match(/^ {4}if: (.+)$/m)?.[1];
-    expect(expression).toBe("inputs.publish_release != true || (inputs.hot_consumer_candidate || '') != ''");
-    if (typeof expression !== 'string') throw new Error('Android candidate job condition missing');
-    const evaluate = (source: string, selected: string | undefined, publish: boolean): boolean => {
-      const result: unknown = runInNewContext(source, {
-        inputs: { hot_consumer_candidate: selected, publish_release: publish },
-      });
-      if (typeof result !== 'boolean') throw new Error('Android route did not return a boolean');
-      return result;
-    };
-    for (const selected of [undefined, '', 'bad', ' ', 'a'.repeat(40)]) {
-      for (const publish of [false, true]) {
-        expect(evaluate(expression, selected, publish)).toBe(!publish || !!selected);
-        for (const name of ['Build unsigned release-profile validation APK',
-          'Verify S5 Android network observation and admission unit tests',
-          'Prepare formal mobile source and isolated tools',
-          'Select APK build weight (release profile vs risk-gate light)', 'Setup Rust cache']) {
-          const guard = stepBlock(check, name).match(/^ {8}if: (.+)$/m)?.[1];
-          expect(guard).toBe("(inputs.hot_consumer_candidate || '') == ''");
-          if (typeof guard !== 'string') throw new Error('Exact Android isolation guard missing');
-          expect(evaluate(guard, selected, publish)).toBe(!selected);
-        }
-      }
-    }
-    const admission = stepBlock(check, 'Admit exact Android consumer candidate');
-    expect(admission).toContain('HOT_CONSUMER_INPUTS: ${{ toJSON(inputs) }}');
-    expect(admission).toContain('run: python3 scripts/mobile-core/ci-hot-candidate.py admit');
-    expect(check.indexOf(admission)).toBeLessThan(check.indexOf('uses: actions/setup-node@v7'));
-    expect(check).toContain('run: python3 scripts/mobile-core/test-ci-hot-candidate.py');
-    expect(android).not.toContain('github.event.inputs.hot_consumer_candidate');
-    expect(android).not.toContain('steps.hot_candidate.outputs.mode');
-    const publish = jobBlock(android, 'release-apk');
-    expect(publish).not.toContain('ci-hot-candidate.py build');
-    expect(publish).toContain('ci-hot-candidate.py admit');
-    const evidence = stepBlock(check, 'Retain Android candidate evidence only');
-    expect(evidence).toContain("if: always() && (inputs.hot_consumer_candidate || '') != '' && steps.hot_candidate.outcome == 'success'");
-    expect(evidence).not.toMatch(/\.(aar|apk|aab|jks)\b/);
-    expect(evidence).toContain('if-no-files-found: error');
   });
 });

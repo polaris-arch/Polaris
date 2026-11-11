@@ -4,24 +4,14 @@
 //! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs`），
 //! façade 必须 `pub(crate) use` 再导出（§B.3）。
 
-#[allow(dead_code)] // The managed exact supervisor remains dormant.
 pub(in crate::runtime::proxy) mod direct_custody;
-#[allow(dead_code)] // No production commit bridge exists in this slice.
 mod direct_stop;
+pub(in crate::runtime::proxy) mod owner_proof;
 pub(crate) use direct_custody::DirectCoreSlot;
 use direct_custody::WorkerNonce;
-#[cfg(test)]
-pub(super) use direct_custody::{
-    DirectBirthCloseError, ReserveStoppingError, SlotAdmissionError, StopView, TakeRunningError,
-};
 pub(super) use direct_custody::{HelperStartToken, HelperStopNonce};
 pub(super) use direct_stop::DirectStopIo;
 use direct_stop::NativeStopIo;
-#[cfg(test)]
-pub(super) use direct_stop::{
-    commit_for_test, prepare_direct_stop, prepare_with_io_for_test, CommitDirectStopError,
-    CommitRejected, DirectStopObservation, DirectStopProvenance, PrepareError, StopWaitOutcome,
-};
 
 use std::future::poll_fn;
 use std::path::{Path, PathBuf};
@@ -403,15 +393,16 @@ impl Drop for NativeStopBooking {
 pub(super) struct RunIdentity(pub(super) Arc<RunToken>);
 
 pub(super) struct RunToken {
-    /// Opaque journal correlation, minted once per actual direct Child. The
-    /// Arc is still the live instance proof; this string alone cannot prove a
-    /// process after app restart or establish plan/artifact ownership.
+    /// Opaque test evidence correlation, minted once per actual direct Child.
+    /// The Arc is still the live instance proof.
+    #[cfg(test)]
     persisted_ref: String,
 }
 
 impl RunIdentity {
     pub(super) fn new() -> Self {
         Self(Arc::new(RunToken {
+            #[cfg(test)]
             persisted_ref: format!("direct-{}", uuid::Uuid::new_v4()),
         }))
     }
@@ -420,6 +411,7 @@ impl RunIdentity {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    #[cfg(test)]
     pub(super) fn persisted_ref(&self) -> &str {
         &self.0.persisted_ref
     }
@@ -430,31 +422,11 @@ pub(super) struct DirectCoreRun {
     #[cfg(unix)]
     lost_wait_ownership: bool,
     pub(super) identity: RunIdentity,
-    #[allow(dead_code)] // Read when the managed coordinator's exact stop gate is wired.
-    pub(super) origin: DirectRunOrigin,
     pub(super) main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
-    pub(super) native_members: Option<super::mesh_apply::owner_proof::SealedNativeMembers>,
-}
-
-/// The legacy constructor records Legacy. A future managed coordinator must
-/// guard both spawn and slot assignment before treating Managed facts as
-/// authority; trusted proxy descendants can still reassign this field.
-#[allow(dead_code)] // The managed coordinator is deliberately not enabled yet.
-pub(super) enum DirectRunOrigin {
-    Legacy,
-    Managed(super::mesh_apply::run_birth::ManagedRunFacts),
+    pub(super) native_members: Option<owner_proof::SealedNativeMembers>,
 }
 
 impl DirectCoreRun {
-    #[cfg(test)]
-    pub(super) fn mark_managed_for_test(&mut self) {
-        self.origin = DirectRunOrigin::Managed(
-            super::mesh_apply::run_birth::ManagedRunFacts::fixture_for_test(
-                self.identity.persisted_ref(),
-            ),
-        );
-    }
-
     #[cfg(test)]
     pub(super) fn new(child: impl Into<Child>) -> Self {
         Self::with_identity(child.into(), RunIdentity::new())
@@ -466,7 +438,6 @@ impl DirectCoreRun {
             #[cfg(unix)]
             lost_wait_ownership: false,
             identity,
-            origin: DirectRunOrigin::Legacy,
             main_token: None,
             native_members: None,
         }

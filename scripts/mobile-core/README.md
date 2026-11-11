@@ -1,37 +1,5 @@
 # Formal mobile source and binding input
 
-## Selected alpha.12.6 source input
-
-The selected Polaris App mobile producer input is
-`bfcdf96b244f63e0fe84736ee4a4edd58f6b209e`, tree
-`4c0fdb31d59967f41c808ea6b63f87ca9661c2cf`, annotated tag
-`v1.15.0-polaris-alpha.12.6` / object `8a230c1d34cb4855b261944e2935ce36f9cd14de`.
-The tag object peels directly to this reviewed commit. The complete published
-source tree and its bytes/modes, module files and source-owned libbox declaration
-were checked; a tag alone is not an AAR/XCFramework or App acceptance receipt.
-
-The source contract uses `polaris-reviewed-kernel-source-v3` for the exact ten
-local vendor replacements (2876 files), including the 45-file tfo-go tree
-`97b124004140efa84aeb0f57d9bd41d238f0c9b5`. Actual module versions, replacement
-paths, Git subtree identities and file counts must agree. The source go.mod hash
-is `d16c533c97de535cf38985a62a78993c1b755a8f723a78ea8a0d75d585d7201d`;
-go.sum, the libbox tag declaration and the 355-file Meta replacement tree and
-binding/patch hashes retain their independently checked identities.
-
-This source includes RuntimeCapabilities, retryable runtime persistence and the
-RuntimePersistenceHandler API consumed by the existing App. Generated Java/JNI
-and Objective-C declarations, actual Kotlin/Swift compilation, all four Android
-ABI ELF checks and both Apple slices still require this input's own producer and
-consumer evidence. Source API presence and prior diagnostic outputs do not
-substitute for those checks.
-
-The v3 policy adds the exact reviewed sing-vmess replacement; historical v1 and
-v2/nine-vendor policies retain their original strict meaning, not an optional
-tenth module. The prior alpha.12.2 c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a
-source and its original receipts remain historical and are not rewritten. The prior
-alpha.12.4 / 0cfa source, component observations and f236 App results also retain
-their original identity; none is a new alpha.12.6 component receipt.
-
 Input declarations never issue artifact acceptance: `artifactPins` and
 `producerReceipt` stay null, and `AppAccepted`, `devicePassed` and
 `publicationEligible` stay false even after a build. Real evidence belongs in
@@ -40,16 +8,6 @@ public mobile download URL is invented. Raw kernel All libraries do not replace
 App-built component receipts.
 
 Mobile source admission is independent of desktop public asset availability.
-The selected desktop `nextDelivery` and release contracts must bind the same
-current source identity; their original historical evidence remains unchanged.
-`fixtures/selected-source-contract-a4d.json` preserves the exact old mobile input
-bytes (SHA-256 `d2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0`)
-for historical source assertions; it is not the selected producer input
-or a receipt. Old a4d/c002/fe182 sources and diagnostic results are not relabeled. The prior
-alpha.12.1 source `814da362838e96e54f904836a92c2b0d8c3ae29b`, tree
-`ad574f93026557b49edecb492bd7ecdb851057c1`, and tag object
-`8ecda357ea755a1295336a35ec7eaf1fe2daebc2` retain their original evidence;
-none of those receipts attest the current alpha.12.6 source.
 
 The formal tools remain Go **1.27.2**, with source minimum Go **1.27.0**, and
 gomobile/gobind **v0.1.13** on both platforms. This remains the original
@@ -84,7 +42,7 @@ Formal binding plans are explicit:
 - Tags are copied from the actual source-owned libbox declaration, including
   gvisor, Naive, Tailscale and Apple-only DHCP/low-memory flags. The Go module
   remains `github.com/sagernet/sing-box`; the pinned source repository is
-  `polaris-arch/sing-box-polaris` at `v1.15.0-polaris-alpha.12.6`. Published core
+  `polaris-arch/sing-box-polaris`. Published core
   assets use `sing-box-polaris-*`; formal mobile output remains Libbox.
 - Version is passed through fixed ldflags. `ReadTag`/`git describe`, an upstream
   cache tag, or a reused CLI BuildID cannot provide formal mobile identity.
@@ -103,16 +61,9 @@ license read-only before SDK installation, with stdin closed for package install
 The NDK installer repeats that check before any download or extraction. Missing
 acceptance stops the build; no license is accepted or written automatically.
 The explicitly selected installer uses a separate private versioned stable slot
-and refuses retained slots without deleting them. Legacy no-flags installer
-behavior, beta manifests, archive pins and historical fixtures stay unchanged.
+and refuses retained slots without deleting them.
 The hosted entry retains source.properties and its pinned observation even if a
 later producer step fails. Rust keeps its separate NDK 27.3.13750724.
-
-The earlier stable-r30 migration was toolchain-only on a4d085/alpha.12; its
-source and receipts remain historical. This alpha.12.6 source migration does not
-change that stable profile or claim new-App compatibility, four-ABI production
-results, APK/device acceptance or publication eligibility before actual checks.
-
 
 `plan.py` verifies the input and prints a bind plan. It never executes a build,
 copies an SDK into an App, installs tools, creates a tag or publishes assets.
@@ -121,20 +72,6 @@ must be added by the producer before compiling. `android_sdk.py` prepares the
 scoped SDK view only under a fixed private work slot held by the caller's
 exclusive producer lease. The pure source suites exercise admission without running a native producer;
 those tests are distinct from actual component and App acceptance.
-
-The explicit planning entry is `bash scripts/plan-mobile-core.sh android` or
-`apple`, followed by `--source`, `--gomobile`, `--output`, and Android's
-`--bootclasspath`. Supply the existing exact source checkout and isolated tool
-paths. Planning does not resolve or download an SDK. The legacy Apple
-`ios-libbox.py build` entry, including `--historical` and `--component --phase
-assemble/publish`, is retired and refuses before reading source, policy or tools
-or creating output. The unused `build-libbox-ios.sh` wrapper has been removed;
-use the normal mobile producer below.
-The existing historical `verify` / `check-inputs` and explicit C2/C3 diagnostic
-entries remain available within their original evidence scopes. Historical
-policies and raw receipts are never rewritten or relabeled; the verifier keeps
-the old build-only pins and the fixed pre-retirement b66 historical-only
-producer pin, rather than treating the retired driver as a new producer.
 
 The formal producer entry is now `bash scripts/build-mobile-core.sh android`
 or `apple`, with required `--source`, `--go`, `--gomobile`, `--gobind`, `--work`
@@ -169,43 +106,11 @@ bytes remain original; formal consumption requires the exact current two-target
 inventory, including rejection of an extra Intel simulator entry or member.
 Device arm64 and simulator arm64 are separate platform identities even though
 the CPU is the same.
-Hosted Apple complete-component reuse is an optional optimization for ordinary
-Release Risk main pushes only. `component-cache-key` recomputes source, module,
-actual tool/SDK, producer-code and effective native compilation inputs. The
-exact `apple-go-component-v1` Actions key has no prefix fallback. PR/manual/tag
-executions neither restore nor save this package. Generator tools are installed
-with `-trimpath`; only admitted module-root locations and the generator filename
-header are normalized for comparison. Original receipt paths and BuildIDs are
-never rewritten. Native compilation overrides remain identity inputs; custom or
-unrecognized effective compiler/CGO settings and ambient include/library/config
-paths disable both restore and export, leaving the normal fresh build available. The
-formal Apple execution environment excludes host PKG_CONFIG_PATH search
-extensions (including setup-python's injected directory) before both production
-and verification; this is an actual input boundary, not a cache-path exception.
-Android and other native overrides retain their existing behavior.
-
-The package contains the original receipt, two-slice output, bind log, compiler
-objects, external archives, generated-source and local-replacement closure. It
-is validated before restoring a previously unused historical private-root
-namespace, then all original native/API/output predicates run again. A current
-consumer observation identifies `trusted-main-cache`, retains the original
-producer, and explicitly does not claim historical provider authentication or
-current-run component production. Current evidence retains the complete package,
-so old Actions runs/artifacts are not required for later validation.
-
-The trust boundary is all repository executions allowed to write main-scoped
-Actions caches, as with compiled Rust dependency caches; self-reported hashes
-are integrity checks, not independent producer authentication. Missing, invalid
-or incompatible restored packages rebuild. Current source/tool admission,
-filesystem failures and failures after original installation are fatal. An
-occupied/corrupt immutable cache entry is not overwritten or promoted; until it
-is evicted, consumers may continue rebuilding safely. Export occurs only after
-complete local verification and only for a newly produced component.
 
 Rust download and compiled-dependency keys are independent. Download identity
 retains exact Cargo format/tool bytes and lock/manifests/source configuration.
-Compiled identity conservatively excludes only `android_sdk.py` and the two NDK
-installer/archive files; shared `ci_android.py` and `android-source.py`, unknown
+Compiled identity conservatively excludes only `android_sdk.py` and the NDK
+installer; shared `ci_android.py` and `android-source.py`, unknown
 producer files, Apple workflow, tools, SDK/configuration and flags remain
 relevant. Full producer provenance and final App-product exclusion are unchanged.
 New key versions initially miss. These cache changes do not measure or promise
@@ -333,8 +238,7 @@ The upstream host job must succeed, including original and summary uploads.
 New component/carrier handoff wrappers use v2 with fingerprint-bound
 `carrierScope`/`requiredSlots`; new unsigned-chain v3 reports `validatedSlots`,
 `completeSlots`, and `notRequestedSlots`. A default sim-arm64 slot is not
-requested, never passed. Historical v1 wrappers and unsigned-chain v2 retain
-strict two-carrier semantics and cannot be relabelled device-only. Original
+requested, never passed. Original
 component/App/Rust receipts are retained byte-for-byte.
 Shared component uploads, protobuf setup, cache setup and local verification
 must all succeed before any carrier is selected; a carrier failure does not
@@ -480,8 +384,7 @@ Apple native-input schema v2 stores each complete source-candidate list once
 in `originsByDigest`; each static member keeps its ordinal and digest reference.
 Equal bytes from distinct source paths/archives/ordinals remain distinct rows.
 Producer and consumer reconstruct the table from original pinned files and
-check exact references and per-target multiplicities. Legacy inline v1 inputs
-are verified without rewriting their original receipt. The observed 57b3
+check exact references and per-target multiplicities. The observed 57b3
 152757078-byte envelope was dominated by repeated origin lists; it is not a
 required capacity. Component/link envelopes return to 64MiB, controls/Android
 remain 16MiB. Fingerprints and pretty serialization stream bounded tokens;
@@ -499,179 +402,9 @@ These structural controls do not substitute for actual device-arm64 final
 carrier verification, or sim-arm64 final verification when explicitly requested. Historical Intel simulator observations
 are outside the current contract.
 
-`scripts/libbox-patches` and the old Apple six-patch declarations remain
-historical alpha8 compatibility inputs; their production build entries are retired.
-Both `scripts/build-libbox.sh` and direct `scripts/libbox-patches/build.py`
-refuse before source/tool/cache access or publication and point to
-`bash scripts/build-mobile-core.sh android` with the required arguments above.
-Historical read-only Android receipt predicates remain importable.
-Their raw receipts are not relabeled; the small
-`historical-ci-fragments.json` pins only retired caller fragments for existing
-negative tests. New formal source controls live in `test_inputs.py` and
-`test_outputs.py` and enter the existing host Node gate through
-`mobile-source-unit.test.mjs`. This source-only gate does not compile native
+Formal output controls live in `test_outputs.py` and run in Release Risk through
+unittest discovery. This source-only gate does not compile native
 output, sign/install Apps or publish mobile assets. Running it cannot establish
 component or App acceptance. Input-contract artifact pins/producer receipt stay
 null and AppAccepted/devicePassed/publicationEligible stay false; actual results
 belong in separate original receipts rather than these input declarations.
-
-## Exact-tree main merge evidence reuse
-
-`apple_merge_reuse.py` is an opt-in read-only evidence path for the Release Risk
-workflow's ordinary `push` to `refs/heads/main`. It admits only a same-repository
-PR that GitHub confirms was merged at the current commit: either an exact-head
-fast-forward (`current == PR head == merge_commit_sha`) or the original exact
-two-parent merge (`parents == [PR base, PR head]`). A fast-forward's immediate
-parent need not equal the old PR base. The current commit, PR head, and actual
-executed reusable-workflow commit must have identical Git trees. Source
-checkout, caller/reusable workflow files, source contract and
-producer/consumer/verifier code inventories remain byte-bound. A push without
-that merged-PR proof, a squash/rebase commit differing from the original head,
-fork PR, arbitrary PR claim, tag, simulator request, manual dispatch, merge
-group, incomplete listing or unavailable API selects a full build. Missing a
-matching successful original PR execution contract also selects a full build;
-this does not require creating a PR for other work. Human review and merge authorization remain in the existing workflow;
-no GitHub APPROVED decision or new branch-protection setting is required or
-asserted by a machine receipt. Existing authorized main writers and GitHub's
-run/artifact integrity are the trust boundary: main write access already permits
-changing this verifier.
-
-The main run `39102634576` at `f076d3da055581cdf004d0d5147e712b44065a16`
-selected the full native path. Its legitimate PR 15 fast-forward is incompatible
-with the old two-parent-only verifier; this run is not an observed reuse success.
-The corrected resolver also validates all workflow-output fields before writing,
-including the existing `receipt_sha256` key that the old letters-only check
-rejected. Original producer identities and evidence are never rewritten.
-
-Every eligible Release Risk device-only PR still runs the complete native
-pipeline. Four execution snapshots, before/after frontend+component and
-before/after the carrier, bind actual Node/pnpm, Go/gomobile/gobind, Cargo/rustc,
-Xcode/xcrun/Swift/clang and protoc identities, exact SDK versions/settings,
-selected build environment overrides and source/workflow hashes. Before and
-after observations must agree. Existing Rust receipts additionally bind the
-locked release staticlib command, target, Cargo.lock, iOS configuration, actual
-compiler binaries, link inputs and produced archive. The resulting
-`apple-execution-contract-<run>-<attempt>` artifact is created only after the
-same-run strict unsigned-chain aggregate and all six original artifact uploads
-have succeeded and the effective Cargo inputs are supported. Its small sidecar binds their provider IDs/digests, exact
-internal bytes/inventories and the original source/run/attempt. Standalone,
-manual, main-fallback, merge-group and simulator full builds retain their normal
-aggregate gate without this PR-only eligibility check.
-
-On a later exact-tree merge, the current main verifier obtains the completed
-successful original PR run and exact attempt from GitHub, verifies the real
-workflow execution SHA and same-PR ref/branch, and requires both original Apple
-jobs to have succeeded. It downloads all seven exact-attempt artifacts through
-read-only provider APIs. Provider SHA-256 and size, bounded archive inventories,
-internal file/receipt hashes, tool/SDK/source/input contracts, Rust archive,
-linked archive and IPA bytes must match. Artifact names only select candidates;
-cache hits, filenames, job skipping or successful statuses alone cannot admit
-reuse. Only the Apple reusable caller and its resolver/sealer jobs receive the necessary
-`actions: read`; workflow defaults and native component permissions remain
-`contents: read`. No write scope, new credential or repository setting is added.
-API routes are allowlisted to this repository and exact run/attempt/artifact IDs;
-cross-repository identities are rejected. Storage redirects, receipts, logs and
-artifacts receive no GitHub token. Archives are inspected,
-never installed or executed, and their original absolute paths are treated as
-data only.
-
-The new `apple-merge-reuse-<run>-<attempt>` receipt refers to a single original
-full producer and its artifact IDs/digests. It never edits old producer candidate,
-run, attempt, path or receipt bytes; it never embeds an accumulating provenance
-history or uses another reuse receipt as a producer. The final job validates
-that exact same-run receipt and requires the native job to be skipped only in
-this verified branch. A resolver miss/error or receipt-upload failure runs the
-normal build. A later receipt-check failure makes the gate red; it cannot pass
-as a skipped build. The required Release Risk check name and acceptance of the
-Apple job's successful result remain unchanged.
-
-Old evidence without these snapshots and execution sidecar is intentionally
-ineligible, including PR14 run `39073373973` attempt `2`. It is not backfilled.
-The first PR introducing this code must run a full native build; offline
-fixtures do not replace that integration check. Reuse proves that historical
-execution evidence applies to the same source and workflow contract, not that
-moving `stable` tools were freshly resolved at merge time. A changed workflow,
-source tree, contract or internal/external hash requires a new build.
-
-Scope stays unsigned device-arm64 App plus PacketTunnel compile/link. The shared
-component still has two arm64 slices, which does not imply a simulator carrier
-was run. `devicePassed`, `signatureTrustValidated` and `publicationEligible`
-remain false. Signing, device execution and publication requirements are
-unchanged. `test_apple_merge_reuse.py` exercises complete fixture packages and
-mutates identities, scopes, contracts, actual byte pins, archives, API routes,
-redirect credentials and missing evidence; `apple-ci-impact.test.mjs` exercises
-the full/reuse/fallback workflow result combinations. The existing strict
-same-run consumer/import and aggregate controls remain in the test gate.
-
-
-Execution-input collection and the complete host test gate require Python 3.11+
-with standard-library `tomllib`; both the Release Risk classifier and Apple
-producer explicitly select Python 3.12 and check/report the actual interpreter
-and parser before use. The Apple setup stays after Xcode/SDK host admission.
-The Linux resolver/sealer validates recorded configuration pins and does not
-parse ambient Cargo configuration. A standalone producer without `tomllib`
-remains explicitly ineligible and completes its ordinary full build; it never
-creates a reusable execution sidecar. Unsupported-input controls exercise that
-path separately; the supported snapshot/profile controls require real parsed
-inputs and cannot pass merely because both snapshots became unavailable.
-See https://docs.python.org/3.12/library/tomllib.html . Historical and ordinary
-build-entry requirements are unchanged.
-
-Revision closure and Cargo admission:
-
-- The verifier joins each native receipt pin to both the transported payload and
-  its retained original. Bind logs, every compiler object and external archive,
-  generated-source and framework inventories, local replacement source snapshots,
-  and overlapping retained files must agree in path, bytes, mode and type.
-  Static member/origin tables are recomputed from bounded archive bytes using the
-  existing parser. Original absolute paths are never opened on the verifier host.
-- Execution snapshot v2 binds the Cargo environment before/after each producer
-  phase. The actual Cargo hook also records its effective environment after the
-  source-owned compiler/output/native-flag assignments. Values are length/hash
-  pairs, never raw environment text. Registry tokens/credential providers and
-  HTTP transport settings are omitted, including their hashes; no credential
-  file is read. Wrapper/compiler/linker/runner selectors, alternate lockfiles,
-  ambient compiler flags and unsupported external configuration cannot qualify.
-- Cargo's working-directory/ancestor and Cargo-home configuration locations are
-  checked. Only regular, tracked repository/root-or-src-tauri Cargo configs are
-  admitted and byte-pinned. Includes, external sources, environment injection and
-  unretained tool/flag inputs are refused. The initial flag policy supports the
-  existing tracked static-CRT and debug-strip flags; changing this admission
-  policy needs a reviewed source change. Legacy `config` and `config.toml` are
-  both checked conservatively, including when Cargo would shadow one.
-- `CARGO_BUILD_JOBS` and jobserver/Make FD handles only schedule existing build
-  work and are not semantic pins; the existing native budget still governs them.
-  Temporary paths are not added to the Cargo namespace. No environment variable
-  is cleared or changed for qualification. Main verifies the original Mac
-  execution contract; it does not compare it with the resolver's Linux home,
-  temporary directory, run ID or jobserver descriptors.
-- Unsupported Cargo inputs produce an explicit non-eligibility observation and
-  the ordinary full build continues unchanged. The successful aggregate/chain
-  remains mandatory. Sealing exports `eligible=false` and creates no execution
-  sidecar, so a later main merge rebuilds. A supported contract must upload
-  successfully. Missing/corrupt evidence, unexpected statuses or altered
-  receipt/hash bindings are not silently converted to producer success.
-
-Cargo input/configuration rules are audited against the primary references:
-https://doc.rust-lang.org/cargo/reference/environment-variables.html and
-https://doc.rust-lang.org/cargo/reference/config.html . The bounded, deliberately
-conservative admission policy above is this repository's policy, not a claim
-that every possible Cargo configuration is reusable.
-
-
-Qualification never short-circuits integrity checks. The sealer collects valid
-unavailable observations, validates every remaining snapshot and all comparable
-phase/tool/SDK/environment bindings, then verifies all native/Rust/IPA/link
-originals. It next compares the current chain and all five local summary files
-with the uploaded bytes and checks the provider workflow binding. Only after
-those checks may it return `eligible=false` without a sidecar. Malformed later
-snapshots, missing/changed originals or changed current aggregate inputs remain
-hard failures even when some or all execution observations are unavailable.
-
-
-Carrier execution snapshots enter the existing producer `private_dir` boundary
-before writing either supported or unavailable observations. A fresh carrier slot
-is created with mode 0700 and the current owner; a preexisting wrong-mode/owner
-or redirected slot is rejected, never chmod-repaired. The same slot is admitted
-again by the actual carrier entry. Generic resolver/sealer output parents retain
-their existing semantics; no global directory-permission relaxation is applied.

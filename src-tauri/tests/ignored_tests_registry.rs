@@ -49,9 +49,6 @@ enum Class {
     LiveHostState,
     /// 根本不是测试，是打印工具。用 `#[ignore]` 只为不进默认门。
     NotAGate,
-    /// 被父测试以精确过滤器起出的私有子测试进程，不是可独立验收的门。
-    /// 与 NotAGate 打印工具不同：它是父门负责输入、身份与收尾的执行夹具。
-    PrivateChildFixture,
     /// Native NTFS protocol interoperability with a separately built, pinned Go producer.
     /// This is not a generic sing-box lifecycle test or an ordinary host-state probe.
     NativeWindowsInterop,
@@ -74,7 +71,6 @@ impl Class {
             Class::PublicNetwork => &["公网"],
             Class::LiveHostState => &["route", "proxy"],
             Class::NotAGate => &["非门"],
-            Class::PrivateChildFixture => &["private child fixture"],
             Class::NativeWindowsInterop => &["pinned real Go test producer"],
             Class::PrivilegedWindowsInterop => &["explicit one-shot SYSTEM task runner"],
             Class::NativeWindowsCompilerFixture => &["explicit native whole-PE compiler fixture"],
@@ -87,7 +83,6 @@ impl Class {
             Class::PublicNetwork => "PublicNetwork",
             Class::LiveHostState => "LiveHostState",
             Class::NotAGate => "NotAGate",
-            Class::PrivateChildFixture => "PrivateChildFixture",
             Class::NativeWindowsInterop => "NativeWindowsInterop",
             Class::PrivilegedWindowsInterop => "PrivilegedWindowsInterop",
             Class::NativeWindowsCompilerFixture => "NativeWindowsCompilerFixture",
@@ -119,26 +114,6 @@ const REGISTRY: &[Entry] = &[
         class: Class::NativeWindowsCompilerFixture,
     },
     // ── RealCore：需要真实 sing-box ──
-    Entry {
-        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
-        test: "real_hot_dispatcher_apply_and_status",
-        class: Class::RealCore,
-    },
-    Entry {
-        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
-        test: "real_hot_dispatcher_persistence_retry",
-        class: Class::RealCore,
-    },
-    Entry {
-        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
-        test: "real_hot_public_rpc_contract",
-        class: Class::RealCore,
-    },
-    Entry {
-        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
-        test: "real_hot_dispatcher_rejections_preserve_runtime",
-        class: Class::RealCore,
-    },
     Entry {
         file: "src-tauri/src/runtime/proxy/tests/lifecycle.rs",
         test: "real_core_full_lifecycle",
@@ -237,17 +212,7 @@ const REGISTRY: &[Entry] = &[
         test: "inventory",
         class: Class::NotAGate,
     },
-    // 新增私有子进程夹具与原生 gRPC 契约；每条单独登记，绝不按路径豁免。
-    Entry {
-        file: "crates/core-supervisor/src/exact_spawn/tests/mod.rs",
-        test: "no_network_fixture",
-        class: Class::PrivateChildFixture,
-    },
-    Entry {
-        file: "crates/core-supervisor/src/exact_spawn/tests/mod.rs",
-        test: "unrelated_no_network_fixture",
-        class: Class::PrivateChildFixture,
-    },
+    // 原生 gRPC 契约；每条单独登记，绝不按路径豁免。
     Entry {
         file: "crates/singbox-grpc/tests/native_clash_mode.rs",
         test: "native_core_lists_and_switches_the_two_compiled_modes",
@@ -555,8 +520,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        32,
-        "默认不跑的测试数从 32 变成了 {} —— 这不是自动放行的事：\
+        26,
+        "默认不跑的测试数从 26 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );
@@ -607,7 +572,6 @@ fn class_matches_the_stated_reason() {
         Class::PublicNetwork,
         Class::LiveHostState,
         Class::NotAGate,
-        Class::PrivateChildFixture,
         Class::NativeWindowsCompilerFixture,
     ] {
         assert!(

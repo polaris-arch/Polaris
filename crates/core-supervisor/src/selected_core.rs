@@ -59,9 +59,6 @@ pub const RELEASE_CONTRACT: &str =
 pub const COMPILED_INSTALLATION: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/selected-core-manifest.json"));
 
-pub const COMPILED_VALIDATION_SOURCE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/validation-core-source.json"));
-
 /// Data only; the archive/member hashes still come exclusively from the same
 /// compiled release contract. This inventory cannot grant execution authority.
 pub const COMPILED_RECOVERY_INVENTORY: &[u8] = include_bytes!(concat!(
@@ -70,7 +67,7 @@ pub const COMPILED_RECOVERY_INVENTORY: &[u8] = include_bytes!(concat!(
 ));
 
 pub fn selected_recovery_spec(platform: &str) -> Result<serde_json::Value, String> {
-    if COMPILED_VALIDATION_SOURCE != b"null" || COMPILED_RECOVERY_INVENTORY == b"null" {
+    if COMPILED_RECOVERY_INVENTORY == b"null" {
         return Err("CORE_RECOVERY_UNAVAILABLE: no compiled selected recovery inventory".into());
     }
     recovery_spec_with_contract(
@@ -181,37 +178,12 @@ fn recovery_spec_with_contract(
     )
 }
 
-pub fn compiled_source(compiled: &[u8], platform: &str) -> Result<serde_json::Value, String> {
-    let selected: serde_json::Value =
-        serde_json::from_slice(compiled).map_err(|_| "invalid compiled validation source")?;
-    let manual = selected["schema"] == "polaris-native-dns-compiled-source-v1"
-        && selected["validationOnly"] == true;
-    let temporary = selected["schema"] == "polaris-native-dns-compiled-source-v2"
-        && selected["validationOnly"] == false
-        && selected["purpose"] == "temporary-default"
-        && selected["context"]["mode"] == "temporary-default";
-    if !(manual || temporary)
-        || selected["AppAccepted"] != false
-        || selected["publicationEligible"] != false
-        || !selected["platforms"]
-            .as_array()
-            .is_some_and(|platforms| platforms.iter().any(|value| value == platform))
-    {
-        return Err("compiled validation source selection differs".into());
-    }
-    Ok(selected)
-}
-
-pub fn selected_source_from(compiled: &[u8], platform: &str) -> Result<String, String> {
-    let source = if compiled == b"null" {
-        let contract: serde_json::Value = serde_json::from_str(RELEASE_CONTRACT)
-            .map_err(|_| "invalid compiled source contract")?;
-        contract["platforms"][platform]["sourceCommit"].clone()
-    } else {
-        let selected = compiled_source(compiled, platform)?;
-        selected["sourceCommit"].clone()
-    };
-    let source = source.as_str().ok_or("missing compiled source identity")?;
+fn formal_source_commit(platform: &str) -> Result<String, String> {
+    let contract: serde_json::Value =
+        serde_json::from_str(RELEASE_CONTRACT).map_err(|_| "invalid compiled source contract")?;
+    let source = contract["platforms"][platform]["sourceCommit"]
+        .as_str()
+        .ok_or("missing compiled source identity")?;
     if source.len() != 40
         || !source
             .bytes()
@@ -229,66 +201,30 @@ pub fn selected_source_commit(platform: &str) -> Result<String, String> {
     }
     #[cfg(not(feature = "local-development-selection"))]
     {
-        selected_source_from(COMPILED_VALIDATION_SOURCE, platform)
+        formal_source_commit(platform)
     }
 }
 
 /// Private check-only admission consumes compiled identity, never an environment
 /// digest. Missing/analysis-only installation identities cannot select a profile.
 pub fn selected_check_source(platform: &str) -> Result<(String, String), String> {
-    let selected = selected_manifest(platform)?;
+    selected_manifest(platform)?;
     let source = selected_source_commit(platform)?;
-    let contract_sha256 = if COMPILED_VALIDATION_SOURCE == b"null" {
-        sha256_hex(selected_contract()?.as_bytes())
-    } else {
-        let compiled = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
-        let digest = compiled["bindingSha256"]
-            .as_str()
-            .ok_or("missing compiled check contract")?;
-        if digest != selected.provider_fingerprint {
-            return Err("compiled check contract differs".into());
-        }
-        digest.to_owned()
-    };
-    if contract_sha256.len() != 64
-        || !contract_sha256
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err("invalid compiled check contract".into());
-    }
-    Ok((source, contract_sha256))
+    Ok((source, sha256_hex(selected_contract()?.as_bytes())))
 }
 
-/// Candidate builds resolve the complete verified carrier for both core and
-/// helper. Runtime environment cannot switch this compiled choice or fall back
-/// to an old formal carrier. Dashboard/data resource lookup is unchanged.
-pub fn selected_payload_dirs(_formal: &[&str]) -> Result<Vec<String>, String> {
+/// Runtime environment cannot switch the compiled choice. Dashboard/data
+/// resource lookup is unchanged.
+pub fn selected_payload_dirs(formal: &[&str]) -> Result<Vec<String>, String> {
     #[cfg(feature = "local-development-selection")]
     {
+        let _ = formal;
         development::manifest(current_platform()?)?;
         Ok(vec![".local-development/linux".into()])
     }
     #[cfg(not(feature = "local-development-selection"))]
     {
-        if COMPILED_VALIDATION_SOURCE == b"null" {
-            return Ok(_formal.iter().map(|value| (*value).to_owned()).collect());
-        }
-        let platform = current_platform()?;
-        let selected = selected_manifest(platform)?;
-        if selected.helper_sha256.is_none()
-            || (platform == "win" && selected.cleaner_sha256.is_none())
-        {
-            return Err("CORE_BUNDLE_MISMATCH: candidate carrier is incomplete".into());
-        }
-        let source = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
-        Ok(vec![
-            if source["schema"] == "polaris-native-dns-compiled-source-v2" {
-                platform.to_owned()
-            } else {
-                format!(".native-dns-app/{platform}")
-            },
-        ])
+        Ok(formal.iter().map(|value| (*value).to_owned()).collect())
     }
 }
 
@@ -302,29 +238,18 @@ pub fn selected_manifest(platform: &str) -> Result<CoreManifest, String> {
         if selected.core.platform != platform {
             return Err("CORE_BUNDLE_MISMATCH: compiled platform differs".into());
         }
-        if COMPILED_VALIDATION_SOURCE != b"null" {
-            let source = compiled_source(COMPILED_VALIDATION_SOURCE, platform)?;
-            if source["bindingSha256"].as_str() != Some(selected.core.provider_fingerprint.as_str())
-            {
-                return Err("CORE_BUNDLE_MISMATCH: compiled provider differs".into());
-            }
-        } else {
-            let expected = selected_pure_manifest(platform)?;
-            let selected_id = selected
-                .core
-                .id(sha256_hex)
-                .map_err(|_| "invalid selected formal id")?;
-            let expected_id = expected
-                .id(sha256_hex)
-                .map_err(|_| "invalid expected formal id")?;
-            if selected_id != expected_id {
-                return Err("CORE_BUNDLE_MISMATCH: compiled formal selection differs".into());
-            }
+        let expected = selected_pure_manifest(platform)?;
+        let selected_id = selected
+            .core
+            .id(sha256_hex)
+            .map_err(|_| "invalid selected formal id")?;
+        let expected_id = expected
+            .id(sha256_hex)
+            .map_err(|_| "invalid expected formal id")?;
+        if selected_id != expected_id {
+            return Err("CORE_BUNDLE_MISMATCH: compiled formal selection differs".into());
         }
         return Ok(selected.core);
-    }
-    if COMPILED_VALIDATION_SOURCE != b"null" {
-        return Err("CORE_BUNDLE_MISMATCH: candidate installation identity missing".into());
     }
     #[cfg(feature = "installed-development-selection")]
     {
@@ -381,19 +306,15 @@ pub fn formal_provider_fingerprint(
     contract: &serde_json::Value,
     row: &serde_json::Value,
 ) -> Result<String, String> {
-    if contract["schema"] == "polaris-upstream-native-release-consumer-v1" {
-        if row.get("providerFingerprint").is_some() || row.get("providerIdentity").is_some() {
-            return Err("CORE_BUNDLE_MISMATCH: unverified upstream producer identity".into());
-        }
-        let mut bytes = b"polaris-upstream-native-installation-v1\0".to_vec();
-        bytes.extend_from_slice(raw.as_bytes());
-        Ok(sha256_hex(&bytes))
-    } else {
-        row["providerFingerprint"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| "CORE_BUNDLE_MISMATCH: missing provider".into())
+    if contract["schema"] != "polaris-upstream-native-release-consumer-v1" {
+        return Err("CORE_BUNDLE_MISMATCH: unsupported release contract".into());
     }
+    if row.get("providerFingerprint").is_some() || row.get("providerIdentity").is_some() {
+        return Err("CORE_BUNDLE_MISMATCH: unverified upstream producer identity".into());
+    }
+    let mut bytes = b"polaris-upstream-native-installation-v1\0".to_vec();
+    bytes.extend_from_slice(raw.as_bytes());
+    Ok(sha256_hex(&bytes))
 }
 
 pub fn selected_id(platform: &str) -> Result<CoreId, String> {
@@ -408,9 +329,7 @@ pub fn selected_id(platform: &str) -> Result<CoreId, String> {
 /// same compiled contract's content-only id; all other selections stay strict.
 pub fn selected_installer_id(platform: &str) -> Result<CoreId, String> {
     #[cfg(feature = "formal-selection")]
-    if COMPILED_INSTALLATION == br#"{"schema":"polaris-formal-desktop-unavailable-v1"}"#
-        && COMPILED_VALIDATION_SOURCE == b"null"
-    {
+    if COMPILED_INSTALLATION == br#"{"schema":"polaris-formal-desktop-unavailable-v1"}"# {
         return formal_manifest(platform)?
             .id(sha256_hex)
             .map_err(|reason| format!("CORE_BUNDLE_MISMATCH: {reason}"));

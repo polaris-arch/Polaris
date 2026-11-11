@@ -395,17 +395,7 @@ enum CheckTail {
         path: PathBuf,
         output: Arc<OutputCapture>,
     },
-    #[cfg(target_os = "linux")]
-    OwnedSealedInputs {
-        _binary: File,
-        _config: File,
-        _stdio: NullCheckStdio,
-        command: Option<tokio::process::Command>,
-    },
 }
-
-#[cfg(target_os = "linux")]
-struct NullCheckStdio;
 
 impl CheckTail {
     fn output(&self) -> Option<Arc<OutputCapture>> {
@@ -415,8 +405,6 @@ impl CheckTail {
             Self::PathSnapshot { output, .. } => Some(Arc::clone(output)),
             #[cfg(any(target_os = "macos", windows))]
             Self::MacRoot { output, .. } => Some(Arc::clone(output)),
-            #[cfg(target_os = "linux")]
-            Self::OwnedSealedInputs { .. } => None,
         }
     }
 
@@ -427,8 +415,6 @@ impl CheckTail {
             Self::PathSnapshot { output, .. } => output.validate_finished(),
             #[cfg(any(target_os = "macos", windows))]
             Self::MacRoot { output, .. } => output.validate_finished(),
-            #[cfg(target_os = "linux")]
-            Self::OwnedSealedInputs { .. } => Ok(()),
         }
     }
 
@@ -443,8 +429,6 @@ impl CheckTail {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 result => result,
             },
-            #[cfg(target_os = "linux")]
-            Self::OwnedSealedInputs { .. } => Ok(()),
         }
     }
 
@@ -456,8 +440,6 @@ impl CheckTail {
             #[cfg(any(target_os = "macos", windows))]
             Self::MacRoot { .. } => panic!("Root Check has a private input owner"),
             Self::PathSnapshot { path, .. } => path,
-            #[cfg(target_os = "linux")]
-            Self::OwnedSealedInputs { .. } => panic!("sealed input has no path snapshot"),
         }
     }
 }
@@ -1105,8 +1087,6 @@ impl CheckCustody {
                 CheckTail::MacRoot { .. } => unreachable!("ordinary factory has its own snapshot"),
                 #[cfg(any(target_os = "macos", windows))]
                 CheckTail::MacRemote { .. } => unreachable!("ordinary factory is not remote"),
-                #[cfg(target_os = "linux")]
-                CheckTail::OwnedSealedInputs { .. } => {}
             }
             let copied =
                 File::open(config).and_then(|mut source| io::copy(&mut source, &mut destination));
@@ -1173,269 +1153,6 @@ impl CheckCustody {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    fn queue_owned_sealed_with_owner(
-        &self,
-        mut command: tokio::process::Command,
-        binary: File,
-        mut config: File,
-        io: Arc<dyn CheckIo>,
-        payload: Option<Arc<AdmittedPayload>>,
-        lease_owner: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
-        use std::io::{Seek, SeekFrom};
-        use std::os::fd::AsRawFd;
-        let mut state = self.state.lock().map_err(unknown)?;
-        Self::admit(&state)?;
-        // Production command/owner are minted together inside PreparedExecution;
-        // only private unit fixtures may supply a raw command with no owner.
-        let prepared = (|| -> io::Result<File> {
-            validate_sealed_file(&binary)?;
-            validate_sealed_file(&config)?;
-            use std::os::unix::fs::MetadataExt;
-            let program = command.as_std().get_program().to_string_lossy();
-            if binary.as_raw_fd() < 3
-                || !program
-                    .strip_prefix("/proc/self/fd/")
-                    .is_some_and(|fd| fd.parse::<u32>().is_ok_and(|fd| fd >= 3))
-            {
-                return Err(io::Error::other(
-                    "owned executable is not a private FD command",
-                ));
-            }
-            let source = std::fs::metadata(command.as_std().get_program())?;
-            let owned = binary.metadata()?;
-            if source.dev() != owned.dev() || source.ino() != owned.ino() {
-                return Err(io::Error::other(
-                    "owned executable does not match check command",
-                ));
-            }
-            let input = config.metadata()?;
-            if !input.is_file() || input.len() == 0 || input.len() > 8 * 1024 * 1024 {
-                return Err(io::Error::other("bounded sealed config required"));
-            }
-            config.seek(SeekFrom::Start(0))?;
-            rustix::io::fcntl_dupfd_cloexec(&config, 3)
-                .map(File::from)
-                .map_err(io::Error::from)
-        })();
-        let stdin = match prepared {
-            Ok(stdin) => stdin,
-            Err(error) => return Ok(Err(error.to_string())),
-        };
-        if payload.is_none() {
-            command.env_clear();
-        }
-        command
-            .current_dir("/")
-            .stdin(std::process::Stdio::from(stdin))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let id = NEXT_REQUEST.fetch_add(1, Ordering::SeqCst);
-        let request = CheckRequestRef {
-            id,
-            issuer: Arc::clone(&self.issuer),
-            identity: Arc::new(CheckRequestIdentity),
-        };
-        state.runs.insert(
-            id,
-            CheckRun {
-                payload,
-                lease_owner,
-                completion: Arc::new(CheckCompletion {
-                    terminal: AtomicBool::new(false),
-                    worker_pending: AtomicBool::new(true),
-                }),
-                request: request.clone(),
-                factory: NativeFactoryObservation::PreFactory,
-                native_exited: None,
-                native_terminal: None,
-                child: None,
-                tail: CheckTail::OwnedSealedInputs {
-                    _binary: binary,
-                    _config: config,
-                    _stdio: NullCheckStdio,
-                    command: Some(command),
-                },
-                exit: None,
-                debt: false,
-                lost_wait_ownership: false,
-                io,
-            },
-        );
-        Ok(Ok(request))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn dispatch_owned_sealed(
-        &self,
-        request: &CheckRequestRef,
-    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
-        let mut state = self.state.lock().map_err(unknown)?;
-        if let Err(error) = Self::admit(&state) {
-            drop(state);
-            self.retire(request)?;
-            return Err(error);
-        }
-        let run = self
-            .run_mut(&mut state, request)?
-            .ok_or_else(|| unknown("queued validation request disappeared"))?;
-        if !matches!(run.factory, NativeFactoryObservation::PreFactory) {
-            return Err(unknown("queued validation request was already dispatched"));
-        }
-        let mut command = match &mut run.tail {
-            CheckTail::OwnedSealedInputs { command, .. } => command
-                .take()
-                .ok_or_else(|| unknown("queued check command already dispatched"))?,
-            _ => return Err(unknown("queued request lacks original owned command")),
-        };
-        if let Err(error) = Self::attach_child(run, &mut command) {
-            drop(command);
-            drop(state);
-            self.retire(request)?;
-            return Ok(Err(error));
-        }
-        Ok(Ok(request.clone()))
-    }
-
-    #[cfg(all(target_os = "linux", test))]
-    fn spawn_owned_sealed(
-        &self,
-        command: tokio::process::Command,
-        binary: File,
-        config: File,
-        io: Arc<dyn CheckIo>,
-    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
-        match self.queue_owned_sealed(command, binary, config, io)? {
-            Ok(request) => {
-                let completion =
-                    Arc::clone(&self.state.lock().map_err(unknown)?.runs[&request.id].completion);
-                let result = self.dispatch_owned_sealed(&request);
-                completion.worker_pending.store(false, Ordering::SeqCst);
-                result
-            }
-            Err(error) => Ok(Err(error)),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn supervise_owned_sealed_with_owner(
-        self: &Arc<Self>,
-        command: tokio::process::Command,
-        binary: File,
-        config: File,
-        timeout: Duration,
-        spawned: Option<tokio::sync::oneshot::Sender<u32>>,
-        execution: Option<&PreparedExecution>,
-    ) -> Result<RawCheck, ValidationLifecycleError> {
-        let request = match self.queue_owned_sealed_with_owner(
-            command,
-            binary,
-            config,
-            Arc::new(NativeIo),
-            execution.map(PreparedExecution::payload),
-            execution.and_then(PreparedExecution::lease_owner),
-        )? {
-            Ok(queued) => queued,
-            Err(error) => return Ok(RawCheck::SpawnFailed(error)),
-        };
-        let completion = {
-            let mut state = self.state.lock().map_err(unknown)?;
-            Arc::clone(
-                &self
-                    .run_mut(&mut state, &request)?
-                    .ok_or_else(|| unknown("queued check missing"))?
-                    .completion,
-            )
-        };
-        let custody = Arc::clone(self);
-        let (mut tx, rx) = tokio::sync::oneshot::channel();
-        // Only the coordinator is detached. The original registry owns the
-        // Child and both images before the sole synchronous spawn can return.
-        tokio::spawn(async move {
-            let result = async {
-                if let Err(error) = custody.settle_debts().await {
-                    custody.retire(&request)?;
-                    return Err(error);
-                }
-                if tx.is_closed() {
-                    custody.retire(&request)?;
-                    return Ok(RawCheck::SpawnFailed(
-                        "check caller cancelled before birth".into(),
-                    ));
-                }
-                let request = match custody.dispatch_owned_sealed(&request)? {
-                    Ok(request) => request,
-                    Err(error) => return Ok(RawCheck::SpawnFailed(error)),
-                };
-                let mut booking = CheckBooking {
-                    custody: Arc::clone(&custody),
-                    request: request.clone(),
-                    active: true,
-                };
-                if let Some(notify) = spawned {
-                    let mut state = custody.state.lock().map_err(unknown)?;
-                    if let Some(pid) = custody
-                        .run_mut(&mut state, &request)?
-                        .and_then(|run| run.child.as_ref().and_then(Child::id))
-                    {
-                        let _ = notify.send(pid);
-                    }
-                }
-                let raw = tokio::select! {
-                    biased;
-                    _ = tx.closed() => {
-                        custody.close_confirmed(&request).await?;
-                        RawCheck::SpawnFailed("check caller cancelled".into())
-                    }
-                    _ = tokio::time::sleep(timeout) => {
-                        custody.close_confirmed(&request).await?;
-                        RawCheck::TimedOut { after_secs: timeout.as_secs_f32() }
-                    }
-                    status = custody.wait_exit(&request) => {
-                        let status = status?;
-                        custody.retire(&request)?;
-                        RawCheck::Done {
-                            success: status.success(),
-                            stdout: String::new(),
-                            stderr: String::new(),
-                        }
-                    }
-                };
-                booking.active = false;
-                Ok(raw)
-            }
-            .await;
-            completion.worker_pending.store(false, Ordering::SeqCst);
-            let _ = tx.send(result);
-        });
-        rx.await
-            .map_err(|_| unknown("owned check coordinator did not return"))?
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    fn queue_owned_sealed(
-        &self,
-        command: tokio::process::Command,
-        binary: File,
-        config: File,
-        io: Arc<dyn CheckIo>,
-    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
-        self.queue_owned_sealed_with_owner(command, binary, config, io, None, None)
-    }
-    #[cfg(all(test, target_os = "linux"))]
-    async fn supervise_owned_sealed(
-        self: &Arc<Self>,
-        command: tokio::process::Command,
-        binary: File,
-        config: File,
-        timeout: Duration,
-        spawned: Option<tokio::sync::oneshot::Sender<u32>>,
-    ) -> Result<RawCheck, ValidationLifecycleError> {
-        self.supervise_owned_sealed_with_owner(command, binary, config, timeout, spawned, None)
-            .await
-    }
     async fn run(
         self: &Arc<Self>,
         execution: impl Into<CheckExecutable>,
@@ -1483,63 +1200,6 @@ impl CheckCustody {
         booking.active = false;
         Ok(raw)
     }
-}
-
-#[cfg(target_os = "linux")]
-fn validate_sealed_file(file: &File) -> io::Result<()> {
-    use nix::fcntl::{fcntl, FcntlArg, SealFlag};
-    let seals = SealFlag::F_SEAL_WRITE
-        | SealFlag::F_SEAL_GROW
-        | SealFlag::F_SEAL_SHRINK
-        | SealFlag::F_SEAL_SEAL;
-    let actual = fcntl(file, FcntlArg::F_GET_SEALS).map_err(io::Error::from)?;
-    let flags = fcntl(file, FcntlArg::F_GETFD).map_err(io::Error::from)?;
-    if actual & seals.bits() != seals.bits() || flags & nix::libc::FD_CLOEXEC == 0 {
-        return Err(io::Error::other(
-            "owned check input protection is incomplete",
-        ));
-    }
-    Ok(())
-}
-
-/// Retain a check's actual sealed executable/config in the existing validation
-/// custody. This returns only diagnostic RawCheck and local lifecycle errors;
-/// neither its optional PID notification nor sealed config data grants Run.
-/// ```compile_fail
-/// use std::{fs::File,time::Duration};
-/// fn forge(binary:File,config:File) {
-///   let _ = polaris_core_supervisor::config_gate::supervise_owned_sealed_check(binary,config,Duration::ZERO,None);
-/// }
-/// ```
-#[cfg(target_os = "linux")]
-pub async fn supervise_owned_sealed_check(
-    execution: PreparedExecution,
-    config: File,
-    timeout: Duration,
-    spawned: Option<tokio::sync::oneshot::Sender<u32>>,
-) -> Result<RawCheck, ValidationLifecycleError> {
-    supervise_admitted_sealed_check(Arc::clone(registry()), execution, config, timeout, spawned)
-        .await
-}
-#[cfg(target_os = "linux")]
-async fn supervise_admitted_sealed_check(
-    custody: Arc<CheckCustody>,
-    execution: PreparedExecution,
-    config: File,
-    timeout: Duration,
-    spawned: Option<tokio::sync::oneshot::Sender<u32>>,
-) -> Result<RawCheck, ValidationLifecycleError> {
-    let (command, binary, _) = execution.sealed_check_parts()?;
-    custody
-        .supervise_owned_sealed_with_owner(
-            command,
-            binary,
-            config,
-            timeout,
-            spawned,
-            Some(&execution),
-        )
-        .await
 }
 
 /// A same-issuer reversible admission cutoff. Drop deliberately does not reopen it.

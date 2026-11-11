@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonical, digest } from './desktop-core/source-graph.mjs';
+import { digest } from './desktop-core/source-graph.mjs';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
 
 // `macos-nested-code.sh` 只在 macOS 打包腿上真跑（那里才有 codesign）。这里测的是它的**控制流**：
@@ -16,7 +16,9 @@ import { selectedCoreManifest } from './lib/core-identity.mjs';
 //   · 桩 `codesign --verify`：内容含 SIGNED ⇒ 0；含 BROKEN ⇒ 1 并报「签名无效」；否则 1 并报
 //     「code object is not signed at all」（真 codesign 对未签名文件的原话）；
 //   · 桩 `codesign --sign`：往文件尾追加 SIGNED（`STUB_SIGN_NOOP=1` 时什么都不做）；
-//   · 桩 `codesign` 把每次调用的全部参数记进 `$STUB_LOG`，一行一次。
+//   · 桩 `codesign` 把每次调用的全部参数记进 `$STUB_LOG`，一行一次；
+//   · 桩 `node`：正式发布核验需要真实消费过的发布（Go BuildInfo、收据），本文件射程外，桩直接放行；
+//     设了 `STUB_NODE_REAL` 时转交真 node，用于对实际核验入口的反向对照。
 // 真 codesign 的行为（linker-signed 签名是否过 `--strict`、`--deep` 是否触碰 Resources）不在本文件射程内。
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'macos-nested-code.sh');
 const scriptText = readFileSync(SCRIPT, 'utf8');
@@ -56,6 +58,11 @@ case " $* " in
 esac
 `;
 
+const STUB_NODE = `#!/bin/sh
+if [ -n "\${STUB_NODE_REAL:-}" ]; then exec "$STUB_NODE_REAL" "$@"; fi
+cat > /dev/null
+`;
+
 const ARM_SIGNED = 'MACHO-arm64 SIGNED';
 const ARM_BARE = 'MACHO-arm64 bare';
 const ARM_BROKEN = 'MACHO-arm64 BROKEN';
@@ -74,7 +81,7 @@ function fixture(files, { ref } = {}) {
   writeFileSync(join(root, 'src-tauri/core-manifest.json'), '{}');
   const bin = join(root, 'bin');
   mkdirSync(bin);
-  for (const [name, body] of [['file', STUB_FILE], ['codesign', STUB_CODESIGN]]) {
+  for (const [name, body] of [['file', STUB_FILE], ['codesign', STUB_CODESIGN], ['node', STUB_NODE]]) {
     writeFileSync(join(bin, name), body);
     chmodSync(join(bin, name), 0o755);
   }
@@ -94,15 +101,9 @@ function fixture(files, { ref } = {}) {
   } } };
   const installation = JSON.stringify(selectedCoreManifest(contract, key, '1.0.0-fixture', digest(helper)));
   for (const directory of [dirname(refPath), core]) writeFileSync(join(directory, 'core-manifest.json'), installation);
-  const metadata = join(root, 'resources/.source-receipts');
-  mkdirSync(metadata);
-  const facts = { schema: 'polaris-desktop-core-v1', platform: key, binarySha256: digest(refBytes),
-    macCodeSignature: refBytes.includes('SIGNED') ? { state: 'signed', cdHash: 'a'.repeat(40) } : { state: 'unsigned', cdHash: null } };
-  const receiptPath = join(metadata, `${key}.json`);
-  writeFileSync(receiptPath, JSON.stringify({ ...facts, fingerprint: digest(canonical(facts)) }));
   const log = join(root, 'codesign.log');
   writeFileSync(log, '');
-  return { root, app, core, bin, ref: refPath, receiptPath, log, files };
+  return { root, app, core, bin, ref: refPath, log, files };
 }
 
 const snapshot = (dir) => Object.fromEntries(readdirSync(dir).sort().map((name) => [name, readFileSync(join(dir, name), 'utf8')]));
@@ -154,15 +155,15 @@ test('seal：冻结的 helper/core 只读验签，不发签名命令', behaviour
   });
 });
 
-test('actual nested-code entry rejects malformed explicit release selection instead of reading valid legacy receipt', behaviour, () => {
+test('actual nested-code entry rejects malformed explicit release selection', behaviour, () => {
   withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED }, {}, (fx) => {
-    // The old unconditional source path would succeed with this valid receipt.
+    const real = { STUB_NODE_REAL: process.execPath };
     writeFileSync(join(fx.root, 'src-tauri/core-manifest.json'), JSON.stringify({ desktopRelease: null }));
-    const rejected = run(fx, 'verify');
+    const rejected = run(fx, 'verify', real);
     assert.notEqual(rejected.status, 0); assert.match(rejected.stderr, /[Ee]xplicit|selection|contract/);
     assert.deepEqual(signCalls(fx), []);
     rmSync(join(fx.root, 'src-tauri/core-manifest.json'));
-    const missing = run(fx, 'verify');
+    const missing = run(fx, 'verify', real);
     assert.notEqual(missing.status, 0); assert.match(missing.stderr, /core-manifest\.json/);
     assert.deepEqual(signCalls(fx), []);
   });
@@ -186,7 +187,7 @@ test('seal：arm64 内核没有签名或签名无效必须失败，且不补签�
       const result = run(fx, 'seal');
       assert.equal(result.status, 1, `${core}: ${result.stdout}`);
       assert.match(result.stderr, why);
-      assert.match(result.stderr, /应在内核构建产物那一步签名.*scripts\/core-patches\/README\.md/);
+      assert.match(result.stderr, /应在内核发布产物那一步签名.*fetch-core 收据/);
       assert.deepEqual(signCalls(fx), []);
       assert.equal(readFileSync(join(fx.core, 'sing-box'), 'utf8'), core);
     });
@@ -492,27 +493,4 @@ test('源码面：find 不跟随链接、清单按 NUL 读、路径变量逐条�
   assert.deepEqual(unquoted, [], '路径变量未加引号');
   // 反向对照：判据对一条漏引号的写法确实命中。
   assert.ok(/(^|[\s=(])\$(f|app|res|core_ref|list)\b/.test('  codesign --verify --strict $f'));
-});
-
-test('包内实际state/CDHash必须与源receipt相符；缺receipt及签后改字节拒绝且不补签', behaviour, () => {
-  for (const mutation of ['state', 'cdHash', 'fingerprint', 'hash', 'missing', 'platform']) {
-    withFixture({ 'sing-box': X64_SIGNED, 'polaris-helper': X64_SIGNED }, {}, (fx) => {
-      const receipt = JSON.parse(readFileSync(fx.receiptPath));
-      if (mutation === 'missing') rmSync(fx.receiptPath);
-      else {
-        if (mutation === 'state') receipt.macCodeSignature = { state: 'unsigned', cdHash: null };
-        if (mutation === 'cdHash') receipt.macCodeSignature.cdHash = 'b'.repeat(40);
-        if (mutation === 'hash') receipt.binarySha256 = digest('changed signed bytes');
-        if (mutation === 'platform') receipt.platform = 'mac-arm64';
-        if (mutation !== 'fingerprint') {
-          const { fingerprint: _old, ...facts } = receipt;
-          receipt.fingerprint = digest(canonical(facts));
-        } else receipt.macCodeSignature.cdHash = 'b'.repeat(40);
-        writeFileSync(fx.receiptPath, JSON.stringify(receipt));
-      }
-      const result = run(fx, 'verify');
-      assert.notEqual(result.status, 0, mutation);
-      assert.deepEqual(signCalls(fx), []);
-    });
-  }
 });

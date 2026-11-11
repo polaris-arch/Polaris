@@ -56,7 +56,7 @@ def prepare():
     sdk = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', ''))).resolve(strict=True)
     if os.environ.get('ANDROID_HOME'):
         require(Path(os.environ['ANDROID_HOME']).resolve(strict=True) == sdk, 'conflicting Android SDK roots')
-    installer = [sys.executable, ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py',
+    installer = [sys.executable, ROOT / 'scripts/mobile-core/prepare-ndk-linux.py',
                  '--profile', ROOT / value['android']['ndkArchivePath'], '--sdk', sdk]
     run(installer + ['--check-license-only'])
     tools = private_dir(root / 'tools')

@@ -500,16 +500,15 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
              'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
              'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
-             'scripts/mobile-core/apple_merge_reuse.py',
              'scripts/mobile-core/apple-cache.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
              'scripts/mobile-core/transaction.py',
-             'scripts/libbox-patches/prepare-ndk-linux.py', 'scripts/libbox-patches/ndk-linux-archive.json',
+             'scripts/mobile-core/prepare-ndk-linux.py',
              'scripts/mobile-core/ndk-r30-linux.json',
-             'scripts/libbox-patches/android-source.py', 'scripts/apple-carrier.py')
+             'scripts/mobile-core/android-source.py', 'scripts/apple-carrier.py')
 ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v2'
 ANDROID_UNRELATED_CODE = frozenset({
-    'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/apple_merge_reuse.py',
+    'scripts/mobile-core/apple-cache.py',
     'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/build_apple_app.py',
     'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
@@ -573,81 +572,6 @@ def comparison_binding(value):
         result['producer'] = {**result['producer'], 'files': projected['files'],
                               'comparisonPolicy': projected['policy']}
     return result
-
-
-APPLE_COMPONENT_CACHE_POLICY = 'polaris-apple-complete-component-v1'
-
-
-def apple_cache_binding(binding):
-    """Comparison only: retain original graph/BuildID, normalize owned locations.
-
-    The source/module bytes are independently admitted before this projection.
-    Only Go's Dir/GoMod locations under the fixed source/module roots and the
-    generator executable filename printed by `go version -m` are observational.
-    Unknown fields, graph contents, SDK paths, executable bytes and producer
-    files remain exact. No receipt is changed by this function.
-    """
-    require(binding.get('platform') == 'apple', 'Apple component cache binding required')
-    result = json.loads(json.dumps(binding))
-    graph = result['moduleGraph']
-    mains = [row for row in graph if row.get('Main') is True]
-    require(len(mains) == 1, 'one Apple source graph root required')
-    source = Path(mains[0]['Dir'])
-    require(source.is_absolute() and source.parts[-2:] == ('component', 'build-view'),
-            'Apple graph source must use its fixed component slot')
-    root = source.parent.parent
-    prefixes = ((source, '$SOURCE'), (root / 'cache/go-mod', '$MODULES'))
-    def normalize(row):
-        require(isinstance(row, dict), 'module graph row required')
-        for name in ('Dir', 'GoMod'):
-            if name not in row:
-                continue
-            path = Path(row[name])
-            require(path.is_absolute() and '..' not in path.parts, 'module location must be canonical')
-            matches = [(base, label) for base, label in prefixes if path.is_relative_to(base)]
-            require(len(matches) == 1, 'module location escaped admitted source/cache roots')
-            base, label = matches[0]
-            row[name] = label + '/' + path.relative_to(base).as_posix()
-        if 'Replace' in row:
-            normalize(row['Replace'])
-    for row in graph:
-        normalize(row)
-    for name in ('gomobile', 'gobind'):
-        raw = result['tools']['mobileBuildInfo'][name]
-        prefix = str(root / 'tools' / name) + ': '
-        require(isinstance(raw, str) and raw.startswith(prefix), 'generator observation path differs')
-        result['tools']['mobileBuildInfo'][name] = '$TOOLS/' + name + ': ' + raw[len(prefix):]
-    return comparison_binding(result)
-
-
-def cacheable_native_environment(binding):
-    """External include/library/config paths have no content closure here.
-
-    Preserve custom execution inputs in the fresh producer receipt, but never
-    reuse/export a component using them merely because their path strings match.
-    Unrecognized pinned-Go defaults conservatively choose the fresh build.
-    """
-    native = binding.get('nativeEnvironment', {})
-    if not isinstance(native, dict) or native.get('GODEBUG') != 'gocacheverify=1':
-        return False
-    effective, ambient = native.get('go'), native.get('ambient')
-    if not isinstance(effective, dict) or not isinstance(ambient, dict) or any(ambient.values()):
-        return False
-    defaults = {
-        'CGO_CFLAGS': ('-O2 -g',), 'CGO_CPPFLAGS': ('',), 'CGO_CXXFLAGS': ('-O2 -g',),
-        'CGO_FFLAGS': ('-O2 -g',), 'CGO_LDFLAGS': ('-O2 -g',), 'CC': ('clang',),
-        'CXX': ('clang++',), 'AR': ('ar',), 'PKG_CONFIG': ('pkg-config',), 'CGO_ENABLED': ('1',),
-        'GOEXPERIMENT': ('',), 'GOAMD64': ('', 'v1'), 'GOARM': ('', '7', '7,hardfloat'),
-        'GOARM64': ('', 'v8.0'), 'GO386': ('', 'sse2'), 'GOMIPS': ('', 'hardfloat'),
-        'GOMIPS64': ('', 'hardfloat'), 'GOPPC64': ('', 'power8'), 'GORISCV64': ('', 'rva20u64'),
-        'GO_EXTLINK_ENABLED': ('',), 'GOFIPS140': ('off',), 'GOFLAGS': ('-mod=readonly',),
-        'GOTOOLCHAIN': ('local',),
-    }
-    return set(effective) == set(defaults) and all(effective[name] in values for name, values in defaults.items())
-
-
-def equivalent_apple_cache_binding(original, current):
-    return equivalent_binding(apple_cache_binding(original), apple_cache_binding(current))
 
 
 def component_revalidation_observation(receipt, binding, receipt_pin, reused):

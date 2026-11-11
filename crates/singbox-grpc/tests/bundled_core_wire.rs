@@ -850,8 +850,8 @@ fn every_checked_symbol_has_a_recorded_layout() {
     }
 }
 
-/// **平台枚举的真值源**：随包核有哪几个平台，只由 `src-tauri/core-manifest.json` 的
-/// `coreArchiveSha256` 键集合决定；平台在仓内的路径由 key 推导，不是第二份名单。
+/// **平台枚举的真值源**：随包核有哪几个平台，只由 `scripts/desktop-core/release-contract.json` 的
+/// `platforms` 键集合决定；平台在仓内的路径由 key 推导，不是第二份名单。
 /// 不需要真核，故 CI 上也跑。
 ///
 /// 这条守的是本批要治的那件事：加平台时只改 manifest，覆盖轴自动跟上。反过来，若有人把枚举
@@ -971,7 +971,7 @@ fn vendored_proto_matches_every_bundled_core() {
 
     assert!(
         survey.orphans.is_empty(),
-        "`resources/` 下这些目录里有 sing-box 二进制，但 {} 的 `coreArchiveSha256` 里没有对应平台：{}\n\
+        "`resources/` 下这些目录里有 sing-box 二进制，但 {} 的 `platforms` 里没有对应平台：{}\n\
          孤儿核会被 tauri 的 resources 照样打进包，却没有任何一道逐平台门看过它。\n\
          修复：把该平台补进 manifest（并同步 scripts/fetch-core.mjs 与 config-engine 的 CORE_MATRIX），\
          或者删掉这份没人认领的核。",

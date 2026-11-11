@@ -1,3 +1,0 @@
-# Unified diff context contains intentional leading spaces and blank lines.
-# Check whitespace in the replayed Go source, not in the patch container.
-*.patch -whitespace

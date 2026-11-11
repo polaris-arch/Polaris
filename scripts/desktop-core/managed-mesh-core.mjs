@@ -1,14 +1,12 @@
 // Verify the currently selected published core before the managed-mesh tests
 // execute its version/check/format commands. The production consumer owns all
-// archive, provider, module, BuildID, receipt and App candidate checks.
+// archive, provider, module, BuildID and receipt checks.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadReleaseContract, releaseInstallationContract, verifyPackagedRelease } from './release-consumer.mjs';
-import { isUpstreamRelease } from './upstream-release.mjs';
 import { requireGraph as demand } from './source-graph.mjs';
-import { candidateContext, hasTemporaryDesktop, loadTemporaryDesktopSelection, candidateVersionOutput, verifyCandidatePayload } from './native-dns-candidate.mjs';
 
 export function managedCheckPlatform(host) {
   const key = { 'linux/x64': 'linux', 'win32/x64': 'win',
@@ -17,49 +15,30 @@ export function managedCheckPlatform(host) {
   return key;
 }
 
-export function managedCheckSelection(context, manual) {
-  // A manual acquisition has the original context without a mode field, even
-  // when the same checkout also commits a temporary desktop default.
-  demand(context && typeof context === 'object'
-    && (manual ? !Object.hasOwn(context, 'mode') : context.mode === 'temporary-default'),
-  'Managed check acquisition mode differs from admitted selection');
-  return context.mode === 'temporary-default' ? 'temporary-desktop-default' : 'native-dns-candidate';
+function releaseVersionOutput(row) {
+  demand(typeof row?.version === 'string' && typeof row.goVersion === 'string'
+    && typeof row.target === 'string' && typeof row.tags === 'string'
+    && ['0', '1'].includes(row.buildGraph?.settings?.CGO_ENABLED), 'Release version inputs differ');
+  return `sing-box version ${row.version}\n\nEnvironment: ${row.goVersion} ${row.target}\n`
+    + `Tags: ${row.tags}\nRevision: ${row.sourceCommit}\nCGO: ${row.buildGraph.settings.CGO_ENABLED === '1' ? 'enabled' : 'disabled'}\n`;
 }
 
 export function managedFormalSelection(root, manifest, host) {
-  const contract = loadReleaseContract(root, manifest), upstream = isUpstreamRelease(contract);
-  if (!upstream) demand(host.os === 'linux' && host.arch === 'x64', 'Managed mesh core requires native Linux amd64');
-  const key = upstream ? managedCheckPlatform(host) : 'linux', row = contract.platforms[key];
-  const expected = upstream ? candidateVersionOutput(row) : row.actualVersionOutput;
-  demand(typeof expected === 'string'
-    && expected.split('\n').includes(`sing-box version ${contract.version}`)
+  const contract = loadReleaseContract(root, manifest), key = managedCheckPlatform(host), row = contract.platforms[key];
+  const expected = releaseVersionOutput(row);
+  demand(expected.split('\n').includes(`sing-box version ${contract.version}`)
     && expected.split('\n').includes(`Revision: ${contract.sourceCommit}`), 'Producer version/Revision binding differs');
-  return { contract, upstream, key, row, expected };
+  return { contract, key, row, expected };
 }
 
-export function verifyManagedMeshCore(root, manifest, core, run = execFileSync, host = { os: process.platform, arch: process.arch }, env = process.env) {
-  if (Object.hasOwn(env, 'POLARIS_NATIVE_DNS_CANDIDATE') || hasTemporaryDesktop(manifest)) {
-    const key = managedCheckPlatform(host);
-    const manual = Object.hasOwn(env, 'POLARIS_NATIVE_DNS_CANDIDATE');
-    if (manual) candidateContext(env.CORE_CANDIDATE, env, root, run);
-    else loadTemporaryDesktopSelection(root, manifest);
-    const { binding, row, receipt } = verifyCandidatePayload(root, key, core, run);
-    const selection = managedCheckSelection(receipt.context, manual);
-    const output = run(core, ['version'], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
-    demand(output === candidateVersionOutput(row), 'Candidate managed mesh version/Revision output differs');
-    return { selection, platform: key, version: row.version,
-      sourceCommit: binding.sourceCommit, sourceTree: binding.sourceTree,
-      bindingSha256: receipt.bindingSha256, buildID: row.buildID, coreSha256: row.core.sha256 };
-  }
-  // Historical v1 evidence retains its original scope. A fully verified
-  // upstream formal contract selects its own native row on all four hosts.
-  const { upstream, key, row, expected } = managedFormalSelection(root, manifest, host);
+export function verifyManagedMeshCore(root, manifest, core, run = execFileSync, host = { os: process.platform, arch: process.arch }) {
+  const { key, row, expected } = managedFormalSelection(root, manifest, host);
   verifyPackagedRelease(root, manifest, key, core, run, host.os);
   // execFileSync throws for every nonzero status; wrong bytes are rejected above
   // before even version is executed. Match the full original observation.
   const output = run(core, ['version'], { encoding: 'utf8' });
   demand(output === expected, 'Managed mesh core version output differs');
-  return { ...(upstream ? { selection: 'formal-desktop-default', platform: key } : {}),
+  return { selection: 'formal-desktop-default', platform: key,
     version: row.version, sourceCommit: row.sourceCommit, sourceTree: row.sourceTree,
     providerFingerprint: releaseInstallationContract(root, manifest).platforms[key].providerFingerprint,
     buildID: row.buildID, coreSha256: row.core.sha256 };

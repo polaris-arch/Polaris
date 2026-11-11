@@ -81,7 +81,8 @@ use super::ProxyRuntime;
         let exact = format!("{prefix}{}", "super::".repeat(depth));
         assert_eq!(statement.starts_with(&exact), reaches_facade);
     }
-    let nested = facade_import_prefix("runtime/proxy/mesh_apply/candidate/check.rs").unwrap();
+    let nested =
+        facade_import_prefix("runtime/proxy/process_supervision/owner_proof/tests/mod.rs").unwrap();
     assert_eq!(nested, "use super::super::super::");
     assert_eq!(
         format!("{nested}super::"),

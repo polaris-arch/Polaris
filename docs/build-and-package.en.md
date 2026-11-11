@@ -75,50 +75,40 @@ create a second compatibility layer.
 
 ### Fetching assets (sing-box core / cronet / dashboard)
 
-Current desktop and mobile inputs both select the pinned alpha.12.6 source from [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Desktop release assets and mobile source have separate contracts below. Verify repository, source commit, tag object and digests together; do not mechanically rewrite historical asset URLs or reuse historical receipts.
+Desktop release assets and mobile source have separate contracts below. Verify repository, source commit, tag object and digests together; do not mechanically rewrite historical asset URLs or reuse historical receipts.
 
 Current desktop packaging starts from `desktopRelease` in `src-tauri/core-manifest.json` and consumes the pinned
 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) release through `scripts/desktop-core/release-contract.json`.
-The source commit, tag object, asset index, and digests are pinned. Do not substitute the fork's latest default-branch
-commit, the historical `sourceBuild`, or the mobile `scripts/mobile-core/source-contract.json` for this desktop selection.
+The source commit, tag object, and digests are pinned by the contract. Do not substitute the fork's latest default-branch
+commit or the mobile `scripts/mobile-core/source-contract.json` for this desktop selection.
 These build inputs do not establish native App acceptance or publication of an App candidate.
 
 ```bash
 # Prepare local Linux resources; other platforms: win, mac-x64, mac-arm64
 node scripts/fetch-core.mjs --platform=linux
-node scripts/fetch-cronet.mjs --platform=linux
 node scripts/fetch-dashboard.mjs
 ```
 
 `fetch-core` verifies the pinned release inputs and places resources in `resources/<platform>/`. Linux / Windows
-Cronet libraries must also match their manifest digests; macOS uses static inputs. `fetch-dashboard` obtains the
+Cronet libraries come from the same release archive and must match the contract digests; macOS links Cronet statically. `fetch-dashboard` obtains the
 sing-box dashboard from a fixed commit, verifies the archive byte count and SHA256, and checks the
 post-prune file inventory digest before reuse or installation. Resources are not committed and must be prepared
 before packaging. This build-time fetch is not an in-app online core replacement feature.
 
-#### Release packaging and native acceptance bundles
+#### Release packaging
 
-`.github/workflows/desktop-core.yml` selects its path from the frozen manifest: release-selection mode verifies pinned
-assets on four native platforms; source mode builds from pinned source. The native inputs form a candidate-specific
-bundle, consumed by `package.yml` as follows:
-
-```bash
-node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
-```
-
-Supply `--bundle-dir` and `--candidate` together. The current `desktopRelease` path verifies the native acceptance bundle
-before consuming the pinned assets. A local single-platform download does not replace release acceptance. Use the actual
-artifact name and candidate commit returned by the workflow, never receipts for another commit. The current manifest has
-`desktopRelease`; do not use the old `--producer` example directly. Source production applies only without that selection.
+Each `package.yml` platform leg runs `node scripts/fetch-core.mjs` directly (all four platforms by default); on macOS hosts
+it also observes the release core's codesign and records it in the receipt. A local single-platform download does not
+replace release acceptance.
 
 `tauri.conf.json` has no `build.beforeBundleCommand`; `tauri build` does not prepare these resources for you.
 After fetching, CI runs `node scripts/verify-packaging.mjs confs` to check that resources exist and are nonempty.
 Payload / asset checks and native acceptance are still required. A successful download, digest verification, and runtime
 acceptance are separate checks.
 
-To change the desktop core selection, maintainers must review `desktopRelease`, the release contract and its digest,
-and the actual pinned release assets together. Mobile source manifests and historical source-mode inputs are maintained
-separately. Changing only `bundledCoreVersion` or the old `sourceBuild` does not update the desktop selection.
+To import a new desktop core release, maintainers run `node scripts/desktop-core/import-release.mjs <new release-contract.json>`:
+it replaces the contract and regenerates `desktopRelease` and the kernel paragraphs of NOTICE;
+`node scripts/desktop-core/import-release.mjs --check` and `verify-packaging confs` check that the three stay consistent.
 The core ships with the App; this guide does not expose independent user core upload, online replacement, or rollback.
 
 ### Producing installers
@@ -144,9 +134,6 @@ pnpm --dir ui install --frozen-lockfile
 protoc --version
 export POLARIS_BUILD_ID="$(git rev-parse HEAD)"
 node scripts/fetch-core.mjs --platform="$platform"
-case "$platform" in
-  linux|win) node scripts/fetch-cronet.mjs --platform="$platform" ;;
-esac
 node scripts/fetch-dashboard.mjs
 args=(--target "$target")
 out="target/$target/release"
@@ -268,10 +255,9 @@ The main workflows divide the work (`.github/workflows/`):
   - The Windows and macOS native lint and tests run on pull requests, on manual dispatch, and for releases (a release calls this workflow from `package.yml` and is not published unless all three platforms pass).
   - A change that touches platform-specific branches must have the three platforms dispatched manually before it lands: `gh workflow run ci.yml --ref <branch>`; add `-f os=windows-2022` or `-f os=macos-15` to confirm a single platform. A direct push to `main` does not run those two platforms, so a failure on a native leg stays unseen until the next manual dispatch or release.
 
-  The local mirror is `scripts/gate-rust.sh` (the cross-target gates need `--with-cross`); `scripts/gate-rust-ci-parity.test.mjs` keeps it in step with `ci.yml`. Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
+  The local mirror is `scripts/gate-rust.sh` (the cross-target gates need `--with-cross`). Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
 - **`ui.yml`** — frontend gate: `pnpm run build` (tsc + vite build), vitest, and Playwright; triggered on PRs and pushes to main.
-- **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `desktop-core.yml`, `package.yml`, `android.yml`, and `apple.yml` only for the affected faces. Ordinary desktop and Android risk legs use light builds: installers/APKs are not uploaded or distributable. The separate `native_payload` acceptance path uses the full profile and can upload candidate desktop packages and evidence; these are not public Releases or proof of installation/device acceptance. Check the specific job profile and its actual attachments.
-- **`desktop-core.yml`** — call-only: four native runners verify the pinned release inputs, or build pinned source in source mode, and assemble the candidate bundle.
+- **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `package.yml`, `android.yml`, and `apple.yml` only for the affected faces. Ordinary desktop and Android risk legs use light builds: installers/APKs are not uploaded or distributable.
 - **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`. The release profile produces distributable installers; the light risk profile validates only the packaging chain. On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.
 - **`android.yml`** — call-only or manual: builds a release-profile APK and runs artifact-level checks; release calls produce three formally signed APKs.
 - **`apple.yml`** — selected by the risk gate or manually dispatched: by default verifies unsigned device-ARM64 App / PacketTunnel compilation and linkage; simulator App compilation is explicit opt-in. It does not publish an IPA or establish device installation, NE authorization or VPN runtime acceptance. See the [mobile core guide](../scripts/mobile-core/README.md) for component and evidence constraints.

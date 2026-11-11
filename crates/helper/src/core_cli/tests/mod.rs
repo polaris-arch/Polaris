@@ -141,8 +141,7 @@ fn administrative_self_hash_cannot_select_a_foreign_core_id() {
             let formal_bootstrap = polaris_core_supervisor::selected_core::selection_lane()
                 == polaris_core_supervisor::selected_core::SelectionLane::Formal
                 && polaris_core_supervisor::selected_core::COMPILED_INSTALLATION
-                    == br#"{"schema":"polaris-formal-desktop-unavailable-v1"}"#
-                && polaris_core_supervisor::selected_core::COMPILED_VALIDATION_SOURCE == b"null";
+                    == br#"{"schema":"polaris-formal-desktop-unavailable-v1"}"#;
             if formal_bootstrap {
                 require_compiled_selection(&manifest, platform).unwrap();
                 // A valid self-rehashed manifest is still a foreign selection.

@@ -67,20 +67,3 @@ export function startRuntimeExecutionPolling(options: {
   schedule();
   return () => { cancelled = true; if (timer !== undefined) clearTimeout(timer); };
 }
-
-/** Backward-compatible Core-only caller; host ids never enter transaction fields. */
-export function startRuntimeApplyPolling(options: {
-  transactionId: string;
-  read: (transactionId: string) => Promise<PendingApplyResult>;
-  current: () => boolean;
-  accept: (result: PendingApplyResult) => boolean;
-}): () => void {
-  return startRuntimeExecutionPolling({
-    ...options,
-    execution: { kind: 'core', transactionId: options.transactionId },
-    read: (execution) => {
-      if (execution.kind !== 'core') throw new Error('RUNTIME_APPLY_CORE_REFERENCE_REQUIRED');
-      return options.read(execution.transactionId);
-    },
-  });
-}

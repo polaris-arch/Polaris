@@ -102,7 +102,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # # 刻意的不生效面
 #
 # - **桌面（linux / windows / macos）零影响** —— per-target 段的定义如此，且上面有正反对照。
-# - **`libbox.so` 零影响**：那 80.9 MB 来自 `libbox.aar`，由 `scripts/build-libbox.sh` 走
+# - **`libbox.so` 零影响**：那 80.9 MB 来自 `libbox.aar`，由 `scripts/build-mobile-core.sh android` 走
 #   Go/gomobile 工具链构建，根本不经过 rustc。`scripts/verify-apk.mjs` 数它里面 cronet/naive
 #   的那条判据因此与本段无关 —— 实测改前 cronet=1201 naive=223，改后同。
 #   （判据 ⑥ 的射程**包含** libbox.so，但那是按「包里每一份 .so 都得剥过」派生出来的，

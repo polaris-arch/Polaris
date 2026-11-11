@@ -47,12 +47,12 @@ mod proto_wire_check {
 
     /// 随包核平台枚举的权威真值源（相对仓库根）。
     ///
-    /// `coreArchiveSha256` 的**键集合**就是「随包核有哪几个平台」：`scripts/fetch-core.mjs`
-    /// 按它逐平台拉核，且缺 pin 即拒绝下载 —— 一个平台要随包，它的键必然先在这里。
-    const CORE_MANIFEST_REL: &str = "src-tauri/core-manifest.json";
+    /// 发布合同 `platforms` 的**键集合**就是「随包核有哪几个平台」：`scripts/fetch-core.mjs`
+    /// 按它逐平台拉核，缺行即拒绝下载 —— 一个平台要随包，它的键必然先在这里。
+    const CORE_MANIFEST_REL: &str = "scripts/desktop-core/release-contract.json";
 
-    /// manifest 里持有平台枚举的字段名。
-    const CORE_PLATFORM_FIELD: &str = "coreArchiveSha256";
+    /// 合同里持有平台枚举的字段名。
+    const CORE_PLATFORM_FIELD: &str = "platforms";
 
     /// 随包核平台枚举文件的绝对路径。
     pub fn core_manifest_path() -> PathBuf {
@@ -66,7 +66,7 @@ mod proto_wire_check {
         std::env::var("POLARIS_REQUIRE_KERNEL_GATE").is_ok_and(|v| v == "1")
     }
 
-    /// 随包核平台枚举（manifest `coreArchiveSha256` 的键，按文件里的出现顺序）。
+    /// 随包核平台枚举（发布合同 `platforms` 的键，按文件里的出现顺序）。
     ///
     /// 🔴 **读不到 / 解不出 / 一个键都没有一律 panic**，绝不返回空表：下面的普查按
     /// 「存在即检」过滤，空枚举会退化成「没有平台要查」⇒ 整道门变成恒绿的零信息量摆设。
@@ -213,6 +213,9 @@ mod proto_wire_check {
                     let key = pending
                         .take()
                         .ok_or_else(|| format!("`{field}` 里有个 `:` 前面不是字符串键"))?;
+                    if key.contains('\\') {
+                        return Err("字符串里有转义，本读取器只认朴素 ASCII 键".to_owned());
+                    }
                     if keys.contains(&key) {
                         return Err(format!("`{field}` 里键 `{key}` 出现了两次"));
                     }
@@ -263,9 +266,8 @@ mod proto_wire_check {
                         .ok_or_else(|| "字符串跨了 UTF-8 边界".to_owned())?;
                     return Ok((text.to_owned(), i + 1));
                 }
-                b'\\' => {
-                    return Err("字符串里有转义，本读取器只认朴素 ASCII 键".to_owned());
-                }
+                // 值里的转义原样跳过；键里的转义由调用方拒绝。
+                b'\\' => i += 2,
                 _ => i += 1,
             }
         }

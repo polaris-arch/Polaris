@@ -14,7 +14,7 @@ use polaris_helper_proto::Platform;
 use serde_json::Value;
 use tokio::sync::watch;
 
-use super::mesh_apply::owner_proof::ProducerCell;
+use super::process_supervision::owner_proof::ProducerCell;
 use super::{lifecycle::StartLeg, LocalHttpProxy, ProxyRuntime, ProxyStatus, StartError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,27 +266,11 @@ impl StartupAdmission {
 pub(super) struct NormalStarts {
     current: Option<NormalStart>,
     retained: Vec<NormalStart>,
-    pub(super) pause: Option<Arc<super::mesh_apply::pc_owner_census::PcPauseCustody>>,
 }
 
 impl NormalStarts {
     pub(super) fn as_ref(&self) -> Option<&NormalStart> {
         self.current.as_ref()
-    }
-
-    pub(super) fn assert_unpaused(&self) -> Result<(), String> {
-        if self.pause.is_some() {
-            Err("PC producers are paused".into())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(super) fn producer_refs(&self) -> Vec<Arc<ProducerCell>> {
-        self.retained
-            .iter()
-            .map(|start| Arc::clone(&start.identity))
-            .collect()
     }
 
     pub(super) fn book_restart(
@@ -867,11 +851,10 @@ impl ProxyRuntime {
     pub(crate) fn tailscale_action_lease(
         &self,
     ) -> Result<crate::runtime::config::LegacyStartLease, String> {
-        let starts = self
+        let _starts = self
             .normal_start
             .lock()
             .map_err(|_| "Main admission poisoned")?;
-        starts.assert_unpaused()?;
         self.config
             .lease_legacy_start()
             .map_err(|_| "Managed mesh account retirement requires its managed proof".into())
@@ -943,11 +926,10 @@ impl ProxyRuntime {
         attempt: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
         commit: impl FnOnce(&mut Value) -> Result<(), String>,
     ) -> Result<Value, String> {
-        let starts = self
+        let _starts = self
             .normal_start
             .lock()
             .map_err(|_| "Main admission poisoned")?;
-        starts.assert_unpaused()?;
         let action = || {
             self.gate
                 .with_current_generation(generation, |_| {
@@ -979,8 +961,7 @@ impl ProxyRuntime {
         attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
         poll: impl FnOnce() -> T,
     ) -> Option<T> {
-        let starts = self.normal_start.lock().ok()?;
-        starts.assert_unpaused().ok()?;
+        let _starts = self.normal_start.lock().ok()?;
         attempt
             .while_active(|| self.gate.with_current_generation(generation, |_| poll()))
             .flatten()
@@ -1413,12 +1394,8 @@ impl ProxyRuntime {
                 None,
             ))
         })?;
-        current
-            .assert_unpaused()
-            .and_then(|_| {
-                polaris_core_supervisor::config_gate::assert_check_producer_registration()
-                    .map_err(|e| e.to_string())
-            })
+        polaris_core_supervisor::config_gate::assert_check_producer_registration()
+            .map_err(|e| e.to_string())
             .map_err(|e| Box::new(StartLeg::Finished(Err(StartError::from(e)), None)))?;
         let base = self.core_generation();
         if expected.is_some_and(|expected| expected != base) {
@@ -1596,7 +1573,6 @@ impl ProxyRuntime {
             .normal_start
             .lock()
             .map_err(|_| StartError::from("normal Start completion poisoned".to_owned()))?;
-        current.assert_unpaused().map_err(StartError::from)?;
         polaris_core_supervisor::config_gate::assert_check_producer_registration()
             .map_err(|e| StartError::from(e.to_string()))?;
         // Same publication fence used by Stop/exit claims. The comparison and
@@ -1736,13 +1712,6 @@ impl ProxyRuntime {
         let original = claimed.and_then(|generation| starts.retained.iter().find(|start|
             start.digest == "restart-dispatch" && matches!(&*start.completion.borrow(), NormalStartCompletion::Starting(g) if *g == generation))
             .map(|start| Arc::clone(&start.identity)));
-        if let Err(error) = starts.assert_unpaused() {
-            // This is the original timer continuation returning, not observer Drop.
-            if let Some(original) = original {
-                original.finish_dispatch();
-            }
-            return Err(StartError::from(error));
-        }
         if let Some(original) = original {
             return Ok(original);
         }

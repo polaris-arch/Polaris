@@ -40,7 +40,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appleRequired, mobileUnitTestsOnlyForReleaseRisk } from './apple-ci-impact.mjs';
+import { appleRequired } from './apple-ci-impact.mjs';
 
 export const ALL_PACKAGE_PLATFORMS = Object.freeze([
   'linux',
@@ -74,7 +74,7 @@ const SCOPE_DEPTH = Object.freeze([
   ['src-tauri/', 2],
   ['crates/', 2],
   // `resources/<子树>/`：data/ dashboard/ 与四个平台目录各自一个 scope；
-  // 根下的散文件（.gitkeep / .fetch-stamp.json）按单文件 scope 归一。
+  // 根下的散文件（.gitkeep）按单文件 scope 归一。
   ['resources/', 2],
   ['vendor/', 2],
 ]);
@@ -335,7 +335,7 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     kernel: false,
     platforms: Object.freeze(['linux']),
     why:
-      'linux 腿的随包内核 / libcronet / polaris-helper 落位目录（.gitignore，CI 由 fetch-core、fetch-cronet '
+      'linux 腿的随包内核 / libcronet / polaris-helper 落位目录（.gitignore，CI 由 fetch-core '
       + '与 helper 构建现铺）。只有 tauri.linux.conf.json 引它 ⇒ 只改 linux 包，由该腿的 inventory 白名单逐条对账。'
       + '核本身的版本真值在 core-manifest.json（已单列 kernel:true），这里只是落位目录 ⇒ 不重复挂内核门。',
   },
@@ -505,9 +505,6 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
     '唯一入库的 resources 根文件（.gitignore 的 `!/resources/.gitkeep`），作用只是让 resources/ 目录在 clone 里存在。'
     + '四份 conf 的 bundle.resources 只列 data/ 、dashboard/ 与本平台目录三类条目，**resources/ 根下的散文件不进任何包** '
     + '⇒ 不影响打包（同理它也进不了 inventory 的清点面）。',
-  'resources/.fetch-stamp.json':
-    'scripts/fetch-*.mjs 的本机拉取戳，被 .gitignore 覆盖 ⇒ 永远不会出现在 diff 里、分类器实际判不到它。'
-    + '登记它是为了让完备性门在**已 fetch 过的开发机**上枚举到它时不误红；同样不在任何 bundle.resources 条目内。',
 });
 
 /**
@@ -561,10 +558,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + 'aarch64-linux-android cargo check covers production types, while host tests cover parsing and unknown fallbacks; neither proves on-device HTTP behavior.',
   },
   'scripts/apple-ci-impact.mjs': {
-    why: 'Shared Release Risk Python-test proof now controls Android selection; changing its rules requires the real APK leg.',
-  },
-  'scripts/apple-ci-impact.test.mjs': {
-    why: 'Negative controls for the shared mobile routing proof; rule tests retain both mobile build legs.',
+    why: 'Release Risk mobile selection rules; changing them requires the real APK leg.',
   },
   'scripts/classify-ci-impact.mjs': {
     why: 'Release Risk Android selection and its conservative fallback are owned by this classifier.',
@@ -594,11 +588,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + '必须点亮 Android 编译/链接与打包腿。whole Android crossClippy/check 覆盖目标编译，host decoder '
       + 'tests 与 check-android-bridge.mjs 覆盖原 37 个命令；这些门不签实际 JNI 调用、设备或 NoOwner 语义。',
   },
-  'scripts/core-source-provision.py': {
-    why: '共同 core/dependency source provider 须点亮 Android AAR/APK 来源腿，避免共同来源变更静默沿用桌面豁免。'
-      + 'Android builder 直接消费原 provider checkout，prelookup 与 cached/fresh 共享完整来源和实际工具/SDK 谓词。'
-      + 'Host Node fixtures 覆盖 provider receipt 与来源准入；本登记不证明真实 Android consumer 接线、AAR/APK 重构建或设备行为。',
-  },
+
   'src-tauri/src/runtime/proxy/android_capacity.rs': {
     why: 'Android native admission capacity failures keep their typed identity through the Rust bridge, '
       + 'login checker and speedtest spawn error. APK compilation must include these Android cfg branches '
@@ -677,23 +667,14 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       '`bundle.resources` 就是「哪些资源会被铺进 assets/_up_/」的真值；少一条许可文本 = 分发义务落空，'
       + '而 verify-packaging confs 只能判「conf 里写没写」，判不了「包里到底有没有」。',
   },
-  'scripts/build-libbox.sh': {
-    why:
-      'libbox.aar 的唯一来源。它的坑② 明写「不能靠摘掉 with_naive_outbound 绕过 NDK 报错」—— '
-      + '摘了之后 aar/APK/CI 全绿，只有真机上 naive/H3 静默连不上，唯一能抓到的就是本腿的 so 指纹判据。',
-  },
-  'scripts/mobile-source-unit.test.mjs': {
-    why: 'Formal mobile input/output/cache and transaction counterexamples protect the Android producer and Apple link source boundary.',
-  },
+
   'scripts/mobile-core/': {
     why: 'Formal zero-overlay mobile source, SDK producer, native-input/cache and final-carrier predicates feed the actual Android APK leg; host source tests also cover Apple binding/link controls.',
   },
   'scripts/build-mobile-core.sh': {
     why: 'The explicit formal component entry uses fixed source/tools/reservation slots and must reach the Android packaging/source checks.',
   },
-  'scripts/libbox-patches/': {
-    why: 'libbox 固定来源、工具链、补丁、构建与收据核验同属 AAR 来源；任何改动都须重跑 Android APK 腿。',
-  },
+
   'scripts/build-android-apk.sh': {
     why: '标准 Android 构建入口统一 Rust NDK 并驱动一次 Tauri/Gradle 构建；改坏它会让 APK 腿跳过或混用工具链。',
   },
@@ -748,8 +729,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   },
   'src-tauri/core-manifest.json': {
     why:
-      '`bundledCoreVersion` 是 build-libbox.sh 读的内核版本真值，也是 libbox 缓存键的一部分：'
-      + '换版本 = 换一份 aar，必须重建并重验 so 指纹。',
+      '桌面发布选择；src-tauri 在所有目标（含 aarch64-linux-android）编译期嵌入它，改动须重编 APK。',
   },
   'src-tauri/tauri.conf.json': {
     why: 'base conf：identifier / frontendDist / beforeBuildCommand，android conf 以它为底做 RFC 7396 合并。',
@@ -822,7 +802,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   },
   'scripts/lib/': {
     why:
-      'fetch-protoc.mjs 解 zip 用的共享模块（extract-zip / fetch-stamp），改坏它与改坏 fetch-protoc 后果逐字相同。'
+      'fetch-protoc.mjs 解 zip 用的共享模块（extract-zip），改坏它与改坏 fetch-protoc 后果逐字相同。'
       + '按目录整取，理由同 CORE_PATH_PREFIXES：逐文件枚举会让下一个抽出来的共享模块又落表外。',
   },
   'scripts/tauri-cli.version': {
@@ -920,16 +900,13 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     + 'cargo check --target aarch64-linux-android -p polaris type-checks production parsing and admission, while host updater/tests exercises legacy '
     + 'baseline compatibility and incomplete-source negatives. No JNI, APK resource, Android updater flow or on-device cleanup is verified by this change.',
   'scripts/fetch-core.mjs':
-    'Desktop source producers and four-artifact consumption are invoked by package/release-risk, not android.yml. '
-    + 'Android build-libbox is separately owned and does not invoke desktop fetch-core. Node source-graph fixture tests '
-    + 'cover this desktop control flow; four native source producers and actual embedded buildInfo remain required before packaging.',
+    'Desktop four-artifact release consumption is invoked by package/release-risk, not android.yml. '
+    + 'Android mobile-core is separately owned and does not invoke desktop fetch-core. Node release-consumer fixture tests '
+    + 'cover this desktop control flow; actual embedded buildInfo remains required before packaging.',
   'scripts/desktop-core/':
-    'Desktop-only source producers and four-artifact receipt consumption preserve existing feature/CGO faces. '
-    + 'This directory is not imported by fetch-protoc or Android build-libbox; Android source provisioning is separately owned. '
-    + 'Required host gate-node-test fixtures cover its rejection boundaries, and native desktop producers must provide real embedded buildInfo before packaging.',
-  'scripts/build-desktop-core.test.mjs':
-    'Host Node fixtures for desktop source graph admission and artifact consumption are registered as required in gate-node-test. '
-    + 'The opt-in tiny Go build only verifies embedded row parsing; neither these tests nor an APK build verify full desktop source binaries.',
+    'Desktop-only four-artifact release consumption and receipts. '
+    + 'This directory is not imported by fetch-protoc or Android mobile-core; Android source provisioning is separately owned. '
+    + 'Required host gate-node-test fixtures cover its rejection boundaries.',
   'src-tauri/src/commands/window.rs':
     'app_restart 的共享 Rust 平台派发：Android 保留 QuitState/RestartState 与 request_restart 腿，'
     + '桌面才进入四 producer 的 prepare/commit 门；未新增 JNI 导出、Gradle 或包内资产契约。'
@@ -958,9 +935,6 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     'Android 不申请桌面 managed marker 的 legacy lease，起停仍经 Android 核桥；'
     + 'Android 目标 cargo check 覆盖条件编译，桌面 lifecycle 单测覆盖 lease 准入，'
     + 'APK 构建不执行起停竞态，真机状态转移需设备验证。',
-  'src-tauri/src/runtime/proxy/process_supervision/direct_stop.rs':
-    'S4 本地 Child 精确停止桥在 Android 入口明确 Unsupported；cfg! 两侧在桌面也参加类型检查，'
-    + 'direct_stop 单测覆盖拒绝与精确 Child CAS，Android 目标 cargo check 复核构型；APK 不调用 dormant 桥。',
   'src-tauri/src/runtime/proxy/tests/lifecycle.rs':
     '桌面-only managed marker/legacy lease 生命周期测试，cfg(not android) 不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
@@ -978,13 +952,6 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
   'src-tauri/src/runtime/proxy/tests/recovery.rs':
     '桌面-only legacy admission 与 crash recovery 负例属于 cfg(test) 测试目标，不进入 APK；'
-    + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
-  'src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs':
-    'PC producer 成员封存，暂无运行期消费者（模块带 dead_code 豁免）；Android 没有 temp producer，'
-    + '`member_counts` 的 android 臂恒返 0。Android 目标 cargo check 覆盖条件编译，'
-    + '桌面 cargo test -p polaris --lib 覆盖非 android 臂；APK 构建不执行成员封存。',
-  'src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census/tests/mod.rs':
-    '桌面-only 成员封存与暂停负例属于 cfg(test) 测试目标，不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
   'src-tauri/src/runtime/startup_tasks.rs':
     '桌面自动连接在起核前复核 legacy admission，Android 走独立启动接管腿；'
@@ -1174,17 +1141,16 @@ export function androidRegistrationOf(rawPath) {
   return { key: none, table: 'NO_ANDROID_IMPACT_SCOPES' };
 }
 
-const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/build-desktop-core.test.mjs', 'scripts/core-source-provision.py',
+const CORE_PATHS = new Set(['scripts/fetch-core.mjs',
   // Direct release-risk runtime input inspection binds the actual core before
   // its traffic gate. Changes must retain kernel + desktop packaging signals.
-  'scripts/native-payload-input.mjs',
-  '.github/workflows/desktop-core.yml', 'scripts/desktop-core-ci-wiring.test.mjs']);
+  'scripts/native-payload-input.mjs']);
 
 /**
  * 随包拉取脚本**被导入的共享模块**面。
  *
  * 取的是**前缀（整个目录）**而不是逐文件枚举：`scripts/lib/*.mjs` 全部由 `scripts/fetch-*.mjs`
- * import（extract-zip 解随包内核/cronet/dashboard/protoc 的 zip，fetch-stamp 决定要不要重拉），
+ * import（extract-zip 解 dashboard/protoc 的 zip），
  * 改坏它们与改坏 fetch-core.mjs 本身的后果逐字相同。2026-08-31 前它们两张表都查不到、又不在
  * REGISTRY_ROOTS 内 ⇒ kernel=false platforms=[] 且不进 unregisteredScopes：改随包解包实现零信号，
  * 与本文件头注自称已封堵的 `scripts/fetch-protoc.mjs` fail-open 是同一形态的姊妹腿。
@@ -1192,7 +1158,7 @@ const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs'
  * 逐文件枚举会原样重造这个盲区（下一个抽出来的共享模块又落表外），故按目录整取；
  * 只被非内核脚本引用的将来模块因此被**从严**判为内核门 —— 方向是 fail-closed，可接受。
  */
-const CORE_PATH_PREFIXES = ['scripts/lib/', 'scripts/core-patches/', 'scripts/desktop-core/'];
+const CORE_PATH_PREFIXES = ['scripts/lib/', 'scripts/desktop-core/'];
 
 const SHARED_PACKAGE_PATHS = new Set([
   '.cargo/config.toml',
@@ -1202,17 +1168,16 @@ const SHARED_PACKAGE_PATHS = new Set([
   'Cargo.toml',
   // 🔴 三份许可文本是**同一个判据面**，必须整组登记。此前只有 THIRD-PARTY-LICENSES.md 在表里，
   //    LICENSE / NOTICE 落表外 ⇒ hasPackage=false ⇒ release-risk 的
-  //    `Verify packaging conf invariants` 整步 skip。2026-09-04 给 NOTICE 加了「版本号必须与
-  //    core-manifest 的 bundledCoreVersion 对拍」的门之后，这就成了「门守着 NOTICE，而改 NOTICE
+  //    `Verify packaging conf invariants` 整步 skip。2026-09-04 给 NOTICE 加了「内核段落必须与
+  //    发布合同对拍」的门之后，这就成了「门守着 NOTICE，而改 NOTICE
   //    恰好不触发这道门」—— 门在但没牙。三份都随包分发、都被 verify-packaging.mjs confs 断言，
   //    故三份同进同出。
   'LICENSE',
   'NOTICE',
   'THIRD-PARTY-LICENSES.md',
+  'scripts/mobile-core/source-contract.json',
   'scripts/classify-ci-impact.mjs',
-  'scripts/classify-ci-impact.test.mjs',
   'scripts/gate-node-test.sh',
-  'scripts/ci-workflow-efficiency.test.mjs',
   'scripts/assert-pc-runtime-release.mjs',
   'scripts/assert-pc-runtime-release.test.mjs',
   'scripts/fetch-dashboard.mjs',
@@ -1221,11 +1186,9 @@ const SHARED_PACKAGE_PATHS = new Set([
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
   'scripts/windows-package-integrity.py',
-  'scripts/windows-package-integrity.test.mjs',
   'scripts/windows-package-integrity.test.py',
-  'scripts/fixtures/windows-package-legacy-steps.yml',
   // package.yml 的 macOS 腿真跑它（封印前与最终 dmg 开箱各一次，逐个验包内内核与 helper 的签名）；
-  // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.sh 列为必需测试。
+  // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.sh 执行。
   'scripts/macos-bundler-diagnostics.sh',
   'scripts/macos-bundler-diagnostics.test.mjs',
   'scripts/macos-nested-code.sh',
@@ -1385,15 +1348,6 @@ export function classifyImpact(rawPaths, { forceFull = false } = {}) {
   };
 }
 
-// Only the direct Release Risk main push can omit mobile builds. Keep the
-// path-only API, --full, native CI, PR/manual and other callers conservative.
-export function classifyReleaseRiskImpact(paths, env, event, run = execFileSync) {
-  const result = classifyImpact(paths);
-  if (result.android && mobileUnitTestsOnlyForReleaseRisk(paths, env, event, run))
-    result.android = false;
-  return result;
-}
-
 function stdinPaths() {
   const input = readFileSync(0);
   if (input.length === 0) return [];
@@ -1478,13 +1432,7 @@ function main() {
   }
   const forceFull = process.argv.includes('--full');
   const paths = forceFull ? [] : stdinPaths().filter(Boolean);
-  let result = classifyImpact(paths, { forceFull });
-  if (!forceFull && result.android) {
-    try {
-      result = classifyReleaseRiskImpact(paths, process.env,
-        JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')));
-    } catch { /* Missing/invalid context retains the conservative path result. */ }
-  }
+  const result = classifyImpact(paths, { forceFull });
   // 自曝：未登记 scope 已经按内核门 + 四平台处理，但「为什么这次全量」必须能在日志里读出来。
   for (const scope of result.unregisteredScopes) {
     process.stderr.write(

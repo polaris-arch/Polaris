@@ -1554,16 +1554,6 @@ async fn f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory() {
         .await,
         TempCoreOutcome::Ran { .. }
     ));
-    let view = h.deps.pc_custody.producer_view().unwrap();
-    assert!(
-        view.member_count() >= 2,
-        "original admitted producer and retired native-only birth remain visible"
-    );
-    assert!(
-        view.births.iter().all(|birth| birth.native.is_none()),
-        "ordinary mock close cannot mint native proof"
-    );
-    view.verify_surrender().unwrap();
     cleanup(&h.dir);
 }
 
@@ -1587,7 +1577,6 @@ async fn cancelled_native_dispatch_compacts_only_after_real_retirement_in_either
             producer.birth.lock().unwrap().as_ref().unwrap(),
             &child.birth
         ));
-        let old_view = custody.producer_view().unwrap();
         let weak_birth = Arc::downgrade(&child.birth);
         if retire_first {
             child.close_confirmed().await.unwrap();
@@ -1614,14 +1603,8 @@ async fn cancelled_native_dispatch_compacts_only_after_real_retirement_in_either
         assert!(custody.producers.lock().unwrap().is_empty());
         assert!(custody.retired_births.lock().unwrap().is_empty());
         assert!(custody.current().unwrap().is_none());
-        old_view.verify_surrender().unwrap();
         drop(child);
         drop(producer);
-        assert!(
-            weak_birth.upgrade().is_some(),
-            "old census retains exact evidence"
-        );
-        drop(old_view);
         assert!(
             weak_birth.upgrade().is_none(),
             "global history no longer owns terminal evidence"
@@ -1648,13 +1631,11 @@ async fn cancelled_bound_native_factory_stays_quarantined_until_actual_return_an
     std::fs::write(&path, "owned native stand-in config").unwrap();
     let prepared = TokioLoginCoreSpawner.prepare_temp_native_birth().unwrap();
     let booked = custody.book_native(&prepared, path.clone(), false).unwrap();
-    let old_view = custody.producer_view().unwrap();
     drop(dispatch);
     for _ in 0..3 {
         custody.prune_terminal().unwrap();
         assert_eq!(custody.producers.lock().unwrap().len(), 1);
         assert!(custody.current().unwrap().is_some());
-        assert!(old_view.verify_surrender().is_err());
         assert!(custody.retry_close().await.is_err());
         assert!(path.exists());
     }
@@ -1679,6 +1660,5 @@ async fn cancelled_bound_native_factory_stays_quarantined_until_actual_return_an
     assert!(custody.producers.lock().unwrap().is_empty());
     assert!(custody.retired_births.lock().unwrap().is_empty());
     assert!(!producer.finished.load(Ordering::SeqCst));
-    old_view.verify_surrender().unwrap();
     cleanup(&h.dir);
 }

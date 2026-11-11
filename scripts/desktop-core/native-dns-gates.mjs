@@ -1,12 +1,11 @@
 #!/usr/bin/env node
-// Bounded validation of exact candidate or committed formal inputs; no publication authority.
+// Bounded validation of committed formal inputs; no publication authority.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadReleaseContract, verifyPackagedRelease } from './release-consumer.mjs';
-import { isUpstreamRelease } from './upstream-release.mjs';
 
 export const TARGETS = Object.freeze({
   linux: { host: 'linux', arch: 'x64', target: 'linux', core: 'resources/linux/sing-box', library: 'resources/linux/libcronet.so' },
@@ -21,21 +20,12 @@ const EXCLUDED_DHCP = '⚠ 跳过 dhcp 起核门：不触网前置只在 Linux �
 const requireGate = (ok, message) => { if (!ok) throw Error(message); };
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
-// A strict formal contract is selected only by committed manifest bytes. The
-// historical v1 release and temporary desktop default keep their original routes.
+// A strict formal contract is selected only by committed manifest bytes.
 export function loadFormalGateSelection(root, manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')))) {
-  requireGate(!(Object.hasOwn(manifest, 'desktopTemporary') && Object.hasOwn(manifest, 'desktopRelease')),
-    'One exclusive desktop gate selection required');
-  if (Object.hasOwn(manifest, 'desktopTemporary') || !Object.hasOwn(manifest, 'desktopRelease')) return null;
-  const contract = loadReleaseContract(root, manifest);
-  if (!isUpstreamRelease(contract)) return null;
-  requireGate(manifest.desktopRelease.contractPath === 'scripts/desktop-core/release-contract.json',
-    'Formal gates require the compiled canonical upstream contract path');
-  return contract;
+  return loadReleaseContract(root, manifest);
 }
 
-// The reusable formal route retains the original CI caller's event/ref. Direct
-// manual candidate dispatch still has its separate fixed-branch admission.
+// The reusable formal route retains the original CI caller's event/ref.
 export function formalWorkflowContext(candidate, env = process.env) {
   requireGate(env.GITHUB_ACTIONS === 'true' && env.GITHUB_REPOSITORY === 'polaris-arch/Polaris'
     && env.GITHUB_REPOSITORY_ID === '1347028220' && /^[a-f0-9]{40}$/.test(candidate ?? '')
@@ -101,7 +91,7 @@ export function gatePlan(key, root = process.cwd()) {
   const plan = [
     ...['core_dep_fingerprint', 'core_build_matrix', 'core_schema_surface',
       'kernel_accepts_outbounds', 'kernel_accepts_full_config', 'network_profile_runtime',
-      'subscription_update_guard_runtime', 'mesh_inbound_runtime', 'managed_mesh_emission_runtime']
+      'subscription_update_guard_runtime', 'mesh_inbound_runtime']
       .map((name) => cargo(name, 'polaris-config-engine', '--test', name)),
     cargo('tailscale_login_kernel_check', 'polaris-mesh', '--test', 'tailscale_login_kernel_check'),
     cargo('bundled_core_wire', 'polaris-singbox-grpc', '--test', 'bundled_core_wire', 'vendored_proto_matches_every_bundled_core'),
@@ -129,7 +119,6 @@ export function gatePlan(key, root = process.cwd()) {
 // lifecycle continue to reject a process-wide core-path override.
 export function gateEnvironment(gate, key, root, env) {
   requireGate(TARGETS[key], `Unsupported native platform: ${key}`);
-  if (env.POLARIS_NATIVE_DNS_FORMAL !== '1') return { ...env };
   requireGate(!Object.hasOwn(env, 'POLARIS_SINGBOX_PATH'), 'Formal gates must not inherit a core path override');
   if (gate.id !== 'native_clash_mode') return { ...env };
   const expected = gatePlan(key, root).find((item) => item.id === 'native_clash_mode');
@@ -268,7 +257,7 @@ export function summaryFor(key, env, plan, results = [], failure = null) {
     results[index]?.id === gate.id && results[index].state === 'passed');
   return {
     schema: 'polaris-native-dns-runtime-gates-v1', platform: key,
-    selection: env.POLARIS_NATIVE_DNS_FORMAL === '1' ? 'formal-default' : 'manual-candidate',
+    selection: 'formal-default',
     candidate: env.CORE_CANDIDATE ?? null, runId: env.GITHUB_RUN_ID ?? null,
     attempt: env.GITHUB_RUN_ATTEMPT ?? null, workflowRef: env.GITHUB_WORKFLOW_REF ?? null,
     planSha256: sha256(JSON.stringify(plan)), requiredGates: plan.map((gate) => gate.id),
@@ -296,7 +285,7 @@ async function main() {
     requireGate(summary.schema === 'polaris-native-dns-runtime-gates-v1' && summary.platform === key
       && summary.candidate === process.env.CORE_CANDIDATE && summary.runId === process.env.GITHUB_RUN_ID
       && summary.attempt === process.env.GITHUB_RUN_ATTEMPT
-      && summary.selection === (process.env.POLARIS_NATIVE_DNS_FORMAL === '1' ? 'formal-default' : 'manual-candidate'), 'Summary belongs to another candidate/run/attempt');
+      && summary.selection === 'formal-default', 'Summary belongs to another candidate/run/attempt');
     if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY,
       `### Native DNS candidate: ${key}\n\nMandatory ordinary gates: ${summary.mandatoryGatesPassed ? 'passed' : 'failed or incomplete'}. App/package acceptance: false. Sealed B609 path: unvalidated.\n\n`
       + summary.gates.map((gate) => `- ${gate.id}: ${gate.state}\n`).join('') + (summary.failure ? `\n${summary.failure}\n` : ''));
@@ -307,20 +296,10 @@ async function main() {
   try {
     requireGate(process.env.POLARIS_NO_KERNEL_RUN !== '1', 'Local no-kernel boundary forbids candidate execution');
     requireGate(process.platform === target.host && process.arch === target.arch, 'Native runner architecture differs');
-    const { candidateContext, verifyCandidatePayload, loadCandidate } = await import('./native-dns-candidate.mjs');
-    const formal = process.env.POLARIS_NATIVE_DNS_FORMAL === '1';
-    const context = formal ? formalGateContext(root) : candidateContext(process.env.CORE_CANDIDATE, process.env, root);
-    const binding = formal ? loadFormalGateSelection(root) : loadCandidate(root);
-    const verifyAll = async () => {
-      if (formal) return verifyFormalGatePayloads(root).payloads;
-      const payloads = {};
-      for (const [platform, item] of Object.entries(TARGETS)) {
-        const { row, receipt } = await verifyCandidatePayload(root, platform, join(root, item.core));
-        payloads[platform] = { path: item.core, core: row.core, sidecar: row.sidecar,
-          goVersion: row.goVersion, buildID: row.buildID, bindingSha256: receipt.bindingSha256 };
-      }
-      return payloads;
-    };
+    requireGate(process.env.POLARIS_NATIVE_DNS_FORMAL === '1', 'Committed formal gate selection required');
+    const context = formalGateContext(root);
+    const binding = loadFormalGateSelection(root);
+    const verifyAll = async () => verifyFormalGatePayloads(root).payloads;
     const before = await verifyAll();
     inputEvidence = { schema: 'polaris-native-dns-runtime-inputs-v1', context,
       kernelSourceCommit: binding.sourceCommit, kernelSourceTree: binding.sourceTree,
@@ -330,7 +309,7 @@ async function main() {
     saveInputs();
     const deadline = Date.now() + SERIES_TIMEOUT_MS;
     const env = { ...process.env, POLARIS_REQUIRE_KERNEL_GATE: '1', POLARIS_KERNEL_GATE_TARGET: target.target,
-      ...(formal ? {} : { POLARIS_SINGBOX_PATH: join(root, target.core) }), POLARIS_TEST_CORE: join(root, target.core), CARGO_TERM_COLOR: 'never' };
+      POLARIS_TEST_CORE: join(root, target.core), CARGO_TERM_COLOR: 'never' };
     results = await collectGates(plan, key, async (gate) => {
       const raw = await executeCommand(gate, { root, env: gateEnvironment(gate, key, root, env), directory,
         timeout: Math.min(COMMAND_TIMEOUT_MS, deadline - Date.now()) });

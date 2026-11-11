@@ -56,8 +56,6 @@ use std::time::Duration;
 
 mod check_custody;
 pub use check_custody::run_tls_fingerprint_query;
-#[cfg(target_os = "linux")]
-pub use check_custody::supervise_owned_sealed_check;
 pub use check_custody::{
     assert_check_admission, assert_check_producer_registration, begin_check_shutdown,
     pause_check_producers, pause_idle_check_producers, settle_check_cleanup,

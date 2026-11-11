@@ -1,5 +1,5 @@
 //! Direct desktop Child custody. Ordinary Stop retains its Child through
-//! cancellation/errors; exact-worker Stopping remains permanently reserved.
+//! cancellation/errors.
 
 use std::io;
 use std::process::ExitStatus;
@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use crate::runtime::core_child::Child;
 use crate::runtime::helper::HelperStopTarget;
-use crate::runtime::proxy::mesh_apply::owner_proof::{
+use crate::runtime::proxy::process_supervision::owner_proof::{
     LocalNativeTerminal, NativeExited, ProducerCell, SealedNativeMembers,
 };
-use crate::runtime::proxy::process_supervision::{DirectCoreRun, DirectRunOrigin, RunIdentity};
+use crate::runtime::proxy::process_supervision::{DirectCoreRun, RunIdentity};
 use polaris_core_supervisor::ChildObservation;
 use polaris_helper_proto::{HelperBirthTarget, StartNotAdmitted};
 
@@ -234,113 +234,14 @@ enum StopPhase {
         exit: Option<ExitStatus>,
         native_exit: Option<NativeExited>,
     },
-    Armed {
-        nonce: WorkerNonce,
-    },
-    KillRequested {
-        nonce: WorkerNonce,
-    },
-    Reaped(DirectChildReaped),
-    BirthClosed(DirectChildReaped),
-    RetainedFailure {
-        nonce: WorkerNonce,
-        reason: StopFailure,
-    },
-}
-
-impl StopPhase {
-    fn nonce(&self) -> &WorkerNonce {
-        match self {
-            Self::NativeWait { nonce, .. }
-            | Self::Armed { nonce }
-            | Self::KillRequested { nonce }
-            | Self::RetainedFailure { nonce, .. } => nonce,
-            Self::Reaped(proof) | Self::BirthClosed(proof) => &proof.nonce,
-        }
-    }
-}
-
-/// Private proof minted only by `try_wait Ok(Some)` on the custody Child.
-/// It is not a release permit and cannot be copied to another run.
-struct DirectChildReaped {
-    identity: RunIdentity,
-    nonce: WorkerNonce,
-    status: ExitStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StopFailure {
-    TryWait,
-    StartKill,
-    Timeout,
-    #[cfg(test)]
-    UnarmedFixture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime::proxy) enum SlotAdmissionError {
-    Empty,
-    WrongRun,
-    WrongSlot,
-    Busy,
-    HelperTouched,
-    ManagedOrigin,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StopPoll {
-    Uncommitted,
-    KillRequested,
-    Pending,
-    Reaped,
-    RetainedFailure,
-    Obsolete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime::proxy) enum StopView {
-    Armed,
-    KillRequested,
-    Reaped,
-    BirthClosed,
-    RetainedFailure,
-    Obsolete,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(in crate::runtime::proxy) enum DirectBirthCloseError {
-    Unsupported,
-    WrongRuntime,
-    WrongSlot,
-    WrongRun,
-    HelperTouched,
-    ManagedOrigin,
-    NotReaped,
-    AlreadyClosed,
-    ClaimMismatch,
-    Registry(String),
-    LockPoisoned,
-}
-
-/// This is only an observation of the reservation. Dropping it cannot release
-/// the Child, which remains owned by `DirectCoreSlot::Stopping`.
-pub(in crate::runtime::proxy) struct DirectStoppingObservation {
-    identity: RunIdentity,
-}
-
-impl DirectStoppingObservation {
-    pub(in crate::runtime::proxy) fn same_run(&self, run: &RunIdentity) -> bool {
-        self.identity.same_run(run)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime::proxy) enum ReserveStoppingError {
-    Empty,
-    WrongRun,
     Busy,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime::proxy) enum TakeRunningError {
     Stopping,
@@ -350,14 +251,6 @@ impl DirectCoreSlot {
     #[cfg(test)]
     pub(in crate::runtime::proxy) fn replace_instance_for_test(&mut self) {
         self.instance = Arc::new(SlotInstance);
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime::proxy) fn mark_running_managed_for_test(&mut self) {
-        let SlotState::Running(run) = &mut self.state else {
-            panic!("managed origin fixture requires Running custody");
-        };
-        run.mark_managed_for_test();
     }
 
     /// Must be called under the real Child mutex before a helper IPC can be
@@ -502,6 +395,7 @@ impl DirectCoreSlot {
 
     /// Freeze the token from the actual backend custody before Stop takes or
     /// retires that custody. An empty slot provides no authority to release.
+    #[cfg(test)]
     pub(in crate::runtime::proxy) fn main_token_for_stop(
         &self,
         via_helper: bool,
@@ -804,216 +698,9 @@ impl DirectCoreSlot {
         token
     }
 
-    pub(super) fn backend(&self) -> BackendFence {
-        self.backend
-    }
-
     #[cfg(test)]
     pub(in crate::runtime::proxy) fn helper_touched_for_test(&self) -> bool {
         self.backend == BackendFence::HelperTouched
-    }
-
-    pub(super) fn instance(&self) -> Arc<SlotInstance> {
-        Arc::clone(&self.instance)
-    }
-
-    pub(super) fn admit_exact_stop(
-        &self,
-        expected: &RunIdentity,
-    ) -> Result<(), SlotAdmissionError> {
-        if self.backend != BackendFence::DirectOnly {
-            return Err(SlotAdmissionError::HelperTouched);
-        }
-        match &self.state {
-            SlotState::Empty => Err(SlotAdmissionError::Empty),
-            SlotState::Running(run) if !run.identity.same_run(expected) => {
-                Err(SlotAdmissionError::WrongRun)
-            }
-            SlotState::Running(run) if !matches!(run.origin, DirectRunOrigin::Legacy) => {
-                Err(SlotAdmissionError::ManagedOrigin)
-            }
-            SlotState::Running(_) => Ok(()),
-            SlotState::Stopping(_) => Err(SlotAdmissionError::Busy),
-        }
-    }
-
-    /// Called only after the bridge has validated this same locked slot and
-    /// atomically committed the worker. No fallible operation may follow CAS.
-    pub(super) fn commit_armed_unchecked(&mut self, nonce: WorkerNonce) {
-        let SlotState::Running(run) = std::mem::replace(&mut self.state, SlotState::Empty) else {
-            unreachable!("bridge holds the checked Running slot");
-        };
-        self.state = SlotState::Stopping(DirectStoppingCustody {
-            run,
-            phase: StopPhase::Armed { nonce },
-        });
-    }
-
-    /// Called with the real TS gate and this Child lock held. Registry
-    /// compare-remove is the last fallible step; only then is the exact
-    /// Reaped proof advanced to a permanent non-Empty local terminal state.
-    pub(super) fn close_reaped_birth(
-        &mut self,
-        instance: &Arc<SlotInstance>,
-        expected: &RunIdentity,
-        nonce: &WorkerNonce,
-        release: impl FnOnce(
-            &crate::runtime::tailscale_login_core::MainBirthToken,
-        ) -> Result<bool, String>,
-    ) -> Result<(), DirectBirthCloseError> {
-        if !Arc::ptr_eq(&self.instance, instance) {
-            return Err(DirectBirthCloseError::WrongSlot);
-        }
-        if self.backend != BackendFence::DirectOnly || self.helper_start.is_some() {
-            return Err(DirectBirthCloseError::HelperTouched);
-        }
-        let SlotState::Stopping(custody) = &mut self.state else {
-            return Err(DirectBirthCloseError::NotReaped);
-        };
-        if !custody.run.identity.same_run(expected) || !custody.phase.nonce().same(nonce) {
-            return Err(DirectBirthCloseError::WrongRun);
-        }
-        if !matches!(custody.run.origin, DirectRunOrigin::Legacy) {
-            return Err(DirectBirthCloseError::ManagedOrigin);
-        }
-        let proof = match &custody.phase {
-            StopPhase::Reaped(proof)
-                if proof.identity.same_run(expected) && proof.nonce.same(nonce) =>
-            {
-                proof
-            }
-            StopPhase::BirthClosed(_) => return Err(DirectBirthCloseError::AlreadyClosed),
-            StopPhase::Armed { .. }
-            | StopPhase::KillRequested { .. }
-            | StopPhase::NativeWait { .. }
-            | StopPhase::Reaped(_)
-            | StopPhase::RetainedFailure { .. } => return Err(DirectBirthCloseError::NotReaped),
-        };
-        let closed_phase = StopPhase::BirthClosed(DirectChildReaped {
-            identity: proof.identity.clone(),
-            nonce: proof.nonce.clone(),
-            status: proof.status,
-        });
-        if let Some(token) = &custody.run.main_token {
-            if !release(token).map_err(DirectBirthCloseError::Registry)? {
-                return Err(DirectBirthCloseError::ClaimMismatch);
-            }
-        }
-        custody.phase = closed_phase;
-        custody.run.main_token = None;
-        Ok(())
-    }
-
-    /// One nonblocking exact attempt, always under the worker's TS→Child
-    /// lock order. Neither closure may identify a process by PID.
-    pub(super) fn poll_exact_stop<F, G>(
-        &mut self,
-        instance: &Arc<SlotInstance>,
-        expected: &RunIdentity,
-        nonce: &WorkerNonce,
-        expired: bool,
-        try_wait: F,
-        start_kill: G,
-    ) -> StopPoll
-    where
-        F: FnOnce(&mut Child) -> io::Result<Option<ExitStatus>>,
-        G: FnOnce(&mut Child) -> io::Result<()>,
-    {
-        if !Arc::ptr_eq(&self.instance, instance) {
-            return StopPoll::Obsolete;
-        }
-        let custody = match &mut self.state {
-            SlotState::Running(run) if run.identity.same_run(expected) => {
-                return StopPoll::Uncommitted;
-            }
-            SlotState::Stopping(custody)
-                if custody.run.identity.same_run(expected) && custody.phase.nonce().same(nonce) =>
-            {
-                custody
-            }
-            SlotState::Empty | SlotState::Running(_) | SlotState::Stopping(_) => {
-                return StopPoll::Obsolete;
-            }
-        };
-        let armed = match &custody.phase {
-            StopPhase::NativeWait { .. } => return StopPoll::Obsolete,
-            StopPhase::Armed { .. } => true,
-            StopPhase::KillRequested { .. } => false,
-            StopPhase::Reaped(proof) | StopPhase::BirthClosed(proof) => {
-                debug_assert!(proof.identity.same_run(expected));
-                let _ = proof.status;
-                return StopPoll::Reaped;
-            }
-            StopPhase::RetainedFailure { reason, .. } => {
-                let _ = reason;
-                return StopPoll::RetainedFailure;
-            }
-        };
-        match custody.run.try_wait_with(try_wait) {
-            Ok(Some(status)) => {
-                custody.phase = StopPhase::Reaped(DirectChildReaped {
-                    identity: expected.clone(),
-                    nonce: nonce.clone(),
-                    status,
-                });
-                StopPoll::Reaped
-            }
-            Err(_) => {
-                custody.phase = StopPhase::RetainedFailure {
-                    nonce: nonce.clone(),
-                    reason: StopFailure::TryWait,
-                };
-                StopPoll::RetainedFailure
-            }
-            Ok(None) if expired => {
-                custody.phase = StopPhase::RetainedFailure {
-                    nonce: nonce.clone(),
-                    reason: StopFailure::Timeout,
-                };
-                StopPoll::RetainedFailure
-            }
-            Ok(None) if !armed => StopPoll::Pending,
-            Ok(None) => match custody.run.signal_with(start_kill) {
-                Ok(()) => {
-                    custody.phase = StopPhase::KillRequested {
-                        nonce: nonce.clone(),
-                    };
-                    StopPoll::KillRequested
-                }
-                Err(_) => {
-                    custody.phase = StopPhase::RetainedFailure {
-                        nonce: nonce.clone(),
-                        reason: StopFailure::StartKill,
-                    };
-                    StopPoll::RetainedFailure
-                }
-            },
-        }
-    }
-
-    pub(super) fn view_exact_stop(
-        &self,
-        instance: &Arc<SlotInstance>,
-        expected: &RunIdentity,
-        nonce: &WorkerNonce,
-    ) -> StopView {
-        if !Arc::ptr_eq(&self.instance, instance) {
-            return StopView::Obsolete;
-        }
-        let SlotState::Stopping(custody) = &self.state else {
-            return StopView::Obsolete;
-        };
-        if !custody.run.identity.same_run(expected) || !custody.phase.nonce().same(nonce) {
-            return StopView::Obsolete;
-        }
-        match &custody.phase {
-            StopPhase::NativeWait { .. } => StopView::Obsolete,
-            StopPhase::Armed { .. } => StopView::Armed,
-            StopPhase::KillRequested { .. } => StopView::KillRequested,
-            StopPhase::Reaped(_) => StopView::Reaped,
-            StopPhase::BirthClosed(_) => StopView::BirthClosed,
-            StopPhase::RetainedFailure { .. } => StopView::RetainedFailure,
-        }
     }
 
     pub(in crate::runtime::proxy) fn is_empty(&self) -> bool {
@@ -1042,6 +729,7 @@ impl DirectCoreSlot {
 
     /// A rejected install returns ownership of the still-live Child to the
     /// caller; neither Running nor Stopping can be overwritten.
+    #[cfg(test)]
     pub(in crate::runtime::proxy) fn install_running(
         &mut self,
         run: DirectCoreRun,
@@ -1054,8 +742,8 @@ impl DirectCoreSlot {
         Ok(())
     }
 
-    /// Ordinary Stop may retry its own retained custody, but never takes an
-    /// exact worker's Child or admits two waiters for the same native handle.
+    /// Ordinary Stop may retry its own retained custody, but never admits two
+    /// waiters for the same native handle.
     pub(in crate::runtime::proxy) fn begin_native_stop(
         &mut self,
     ) -> Result<Option<(RunIdentity, WorkerNonce)>, String> {
@@ -1128,10 +816,7 @@ impl DirectCoreSlot {
         };
         let StopPhase::NativeWait {
             exit, native_exit, ..
-        } = &mut custody.phase
-        else {
-            unreachable!("native booking was just checked");
-        };
+        } = &mut custody.phase;
         if let Some(status) = *exit {
             return Poll::Ready(Ok(status));
         }
@@ -1235,43 +920,14 @@ impl DirectCoreSlot {
         nonce: &WorkerNonce,
     ) {
         if let Ok(custody) = self.native_stop_custody(expected, nonce) {
-            if let StopPhase::NativeWait { inflight, .. } = &mut custody.phase {
-                *inflight = false;
-            }
+            let StopPhase::NativeWait { inflight, .. } = &mut custody.phase;
+            *inflight = false;
         }
     }
 
-    /// An Arc-bound transition only. No signal, wait, receipt or release is
-    /// authorized by the observation returned here.
-    #[cfg(test)]
-    pub(in crate::runtime::proxy) fn reserve_stopping_without_worker_for_test(
-        &mut self,
-        expected: &RunIdentity,
-    ) -> Result<DirectStoppingObservation, ReserveStoppingError> {
-        let identity = match &self.state {
-            SlotState::Empty => return Err(ReserveStoppingError::Empty),
-            SlotState::Stopping(_) => return Err(ReserveStoppingError::Busy),
-            SlotState::Running(run) if !run.identity.same_run(expected) => {
-                return Err(ReserveStoppingError::WrongRun);
-            }
-            SlotState::Running(run) => run.identity.clone(),
-        };
-        let SlotState::Running(run) = std::mem::replace(&mut self.state, SlotState::Empty) else {
-            unreachable!("the same mutable slot was just checked as Running");
-        };
-        // Legacy custody test fixture: it cannot be armed by a later worker.
-        self.state = SlotState::Stopping(DirectStoppingCustody {
-            run,
-            phase: StopPhase::RetainedFailure {
-                nonce: WorkerNonce::new(),
-                reason: StopFailure::UnarmedFixture,
-            },
-        });
-        Ok(DirectStoppingObservation { identity })
-    }
-
     /// The legacy Stop path may only extract a Running Child. A Stopping Child
-    /// is reserved for a future exact supervisor and must stay in custody.
+    /// must stay in custody.
+    #[cfg(test)]
     pub(in crate::runtime::proxy) fn take_running_legacy(
         &mut self,
     ) -> Result<Option<DirectCoreRun>, TakeRunningError> {
@@ -1391,11 +1047,6 @@ impl DirectCoreSlot {
     #[cfg(test)]
     pub(in crate::runtime::proxy) fn is_stopping_for_test(&self) -> bool {
         matches!(&self.state, SlotState::Stopping(_))
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime::proxy) fn is_reaped_for_test(&self) -> bool {
-        matches!(&self.state, SlotState::Stopping(custody) if matches!(&custody.phase, StopPhase::Reaped(_) | StopPhase::BirthClosed(_)))
     }
 
     #[cfg(test)]

@@ -91,27 +91,7 @@ on:
         type: boolean
         required: false
         default: true
-      native_validation:
-        type: boolean
-        required: false
-        default: false
       core_candidate:
-        type: string
-        required: false
-        default: ''
-      core_bundle_artifact:
-        type: string
-        required: false
-        default: ''
-      core_wire_input_artifact:
-        type: string
-        required: false
-        default: ''
-      core_wire_input_artifact_id:
-        type: string
-        required: false
-        default: ''
-      core_wire_input_artifact_digest:
         type: string
         required: false
         default: ''
@@ -128,7 +108,6 @@ on:
 # release 写权限只发给发布 DAG 的三个写入 job（job 级 permissions 覆盖本块）。
 permissions:
   contents: read
-  actions: read # current-run handoff API metadata, never artifact mutation
 
 # 打包耗时且产物大：tag/release 不取消在途（保 release 产物完整性）；
 # workflow_dispatch / workflow_call 落在非 tag ref 上，同平台重复触发取消旧跑（减少等待与重复下载）。
@@ -167,13 +146,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         id: checkout
-        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           ref: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@v7
-        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           node-version: '26'
 
@@ -226,13 +205,6 @@ jobs:
           SYSTEM_CANDIDATE: ${{ inputs.windows_system_candidate || '' }}
           CORE_CANDIDATE: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
           EXPECTED_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
-          CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact }}
-          CORE_RUN_ID: ${{ github.run_id }}
-          CORE_RUN_ATTEMPT: ${{ github.run_attempt }}
-          POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
-          VALIDATION_KERNEL: ${{ inputs.run_kernel_gates }}
-          VALIDATION_UPLOAD: ${{ inputs.upload_artifacts }}
-          VALIDATION_LIGHT: ${{ inputs.light_build }}
           VALIDATION_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
         run: |
           set -euo pipefail
@@ -240,26 +212,14 @@ jobs:
             [[ "$SYSTEM_CANDIDATE" =~ ^[a-f0-9]{40}$ ]] || exit 1
             [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || exit 1
             [ "$GITHUB_REPOSITORY" = polaris-arch/Polaris ] || exit 1
-            [[ "$GITHUB_REF" = refs/heads/main || "$GITHUB_REF" = refs/heads/ci/governance ]] || exit 1
+            [ "$GITHUB_REF" = refs/heads/main ] || exit 1
             [ "$SYSTEM_CANDIDATE" = "$GITHUB_SHA" ] || exit 1
             [ "$PLATFORM" = all ] || exit 1
             [ -z "$PLATFORMS_JSON" ] || exit 1
             [ "$VALIDATION_SKIP_QUALITY" != true ] || exit 1
           fi
-          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
-            node scripts/desktop-core/validation-origin.mjs "$CORE_CANDIDATE"
-            [ "$PLATFORMS_JSON" = '["linux","windows"]' ]
-            [ -n "$CORE_BUNDLE_ARTIFACT" ]
-            [ "$VALIDATION_KERNEL" = true ]
-            [ "$VALIDATION_UPLOAD" = true ]
-            [ "$VALIDATION_LIGHT" = false ]
-            [ "$VALIDATION_SKIP_QUALITY" = true ]
-          fi
           [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
           [ "$CORE_CANDIDATE" = "$EXPECTED_CANDIDATE" ]
-          if [ -n "$CORE_BUNDLE_ARTIFACT" ]; then
-            [ "$CORE_BUNDLE_ARTIFACT" = "desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" ]
-          fi
 
           # 全量矩阵 = 单一真值来源。JSON 内只有双引号，故整体用 shell 单引号串包住，
           # 不经 heredoc（免去 terminator 缩进坑），也不做任何 shell 展开。
@@ -320,9 +280,6 @@ jobs:
             echo "candidate=$CORE_CANDIDATE"
           } >> "$GITHUB_OUTPUT"
 
-
-      # Separate step scope: no legacy native-validation env is inherited from
-      # the matrix resolver. Never erase a 0/1 flag to manufacture formal origin.
   ci:
     name: ci gate
     needs: setup
@@ -348,20 +305,6 @@ jobs:
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
     secrets: inherit
 
-  # Risk supplies the verified same-run bundle; standalone Package produces it
-  # once here. An installer subset still consumes the complete four-core set.
-  desktop_core:
-    name: four native source producers
-    needs: setup
-    if: (inputs.core_bundle_artifact == '')
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/desktop-core.yml
-    with:
-      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
-      candidate: ${{ needs.setup.outputs.candidate }}
-
   package:
     name: build installer (${{ matrix.label }})
     # 2026-09-04：打包腿由「串在两门之后」改为「与两门并行」。此前不并行的唯一理由是额度——
@@ -376,8 +319,7 @@ jobs:
     #    但若有人直接从红 run 里下载 artifact，拿到的就是未经门验的包。这是并行拓扑的固有代价，
     #    在 package job 内无法消除：要读 ci/ui 的 result 就必须把它们写进 needs，而 needs 即等待。
     #
-    # setup 必须 success。source job 仅在已有同 run/attempt bundle 输入时允许 skipped；
-    # 显式写状态函数以消除复用依赖的默认 skip 传播，failure/cancelled 仍一律拒绝。
+    # setup 必须 success；failure/cancelled 一律拒绝。
     #
     # 🔴 状态函数是 `!cancelled()`，**不是** `always()`（2026-10-07 改，实测的缺陷）：
     #    取消一次 run 时，GitHub 会对**在途** job 重新求值 `if`，仍为真的 job 不会被取消。
@@ -389,27 +331,15 @@ jobs:
     #    而取消时求值为假 ⇒ 在途打包腿立即停。
     #    只改本 job：发布 DAG 的 `release_desktop` / `release` 仍是 `always()`，它们只在 v* tag 上
     #    可达，而 tag ref 的并发组从不取消在途（见文件头 concurrency 段）。
-    needs: [setup, desktop_core]
+    needs: setup
     if: >-
-      (!cancelled() && needs.setup.result == 'success'
-      && (needs.desktop_core.result == 'success'
-        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != '')))
+      (!cancelled() && needs.setup.result == 'success')
     # W24：helper 与 app 分两次 cargo build，但必须共享同一份构建身份。放 job 级而非某一步，
     # 让 helper staging 与后面的 tauri-action 都继承当前 checkout commit；同 protocol 的旧 helper
     # 才能被新 app 识别为 upgradeable。resolved candidate 在 PR 上为 head，在 tag/dispatch 为 github.sha。
     env:
       POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}
       CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
-      POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
-      CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
-      # Ordinary Risk already acquired/read back these exact four inputs in
-      # this run/attempt. All installers import pinned tar members; Windows
-      # keeps declared POSIX modes in the transport proof and validates native
-      # filesystem projection separately. Standalone Package/tag acquire afresh.
-      CORE_WIRE_INPUT_ARTIFACT: ${{ inputs.core_wire_input_artifact }}
-      CORE_WIRE_INPUT_ARTIFACT_ID: ${{ inputs.core_wire_input_artifact_id }}
-      CORE_WIRE_INPUT_ARTIFACT_DIGEST: ${{ inputs.core_wire_input_artifact_digest }}
-      GH_TOKEN: ${{ github.token }}
       # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
       POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
       # 直接 tag / Package dispatch 保持原行为；release-risk 手动 dispatch 复用本 workflow 时
@@ -750,8 +680,7 @@ jobs:
           fi
 
       # ── 资产就位（供应链防护核心）──
-      # The committed desktop selection drives this unchanged shared consumer.
-      # Release and temporary-default inputs retain distinct provenance schemas;
+      # The committed desktop selection drives this unchanged shared consumer;
       # all four actual cores/Cronet/archive members verify before any installer.
       # 其余 fetch 脚本缺 pin 即 fail（绝不无校验拉可执行资源）。
       - name: Read pinned source Go version
@@ -765,41 +694,13 @@ jobs:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
 
-      - name: Download exact candidate core bundle
-        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.CORE_BUNDLE_ARTIFACT }}
-          path: ${{ runner.temp }}/desktop-core-bundle
-
-      - name: Consume sing-box core bundle
-        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
+      # 不传 --platform = 四平台全量取得并逐份校验（含 Linux/Windows 的 Cronet sidecar）；
+      # darwin 宿主上同时观测两份 Mac 核的 codesign 状态。
+      - name: Fetch sing-box core
         shell: bash
         env:
           POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
-          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
-        run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
-
-      - name: Require current-attempt installer input identity
-        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        shell: bash
-        env:
-          WIRE_INPUTS: ${{ runner.temp }}/installer-core-inputs
-        run: node scripts/desktop-core/wire-input-handoff.mjs check --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
-
-      - name: Download current-attempt preflight installer inputs
-        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        shell: bash
-        env:
-          WIRE_INPUTS: ${{ runner.temp }}/installer-core-inputs
-        run: node scripts/desktop-core/wire-input-handoff.mjs download --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
-
-      - name: Verify and import current-attempt preflight installer inputs
-        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        shell: bash
-        env:
-          WIRE_INPUTS: ${{ runner.temp }}/installer-core-inputs
-        run: node scripts/desktop-core/wire-input-handoff.mjs import --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
+        run: node scripts/fetch-core.mjs
 
       # 四平台 wire descriptor 对拍（`Bundled core gRPC wire contract`）不在本腿：它与宿主平台无关，
       # 2026-10-07 起由下面的 `core_wire` job 全 workflow 只跑一次（依据见该 job 头注）。
@@ -853,17 +754,6 @@ jobs:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test core_build_matrix
 
-      # cronet 仅 Linux/Windows 走动态库，且真核门会在本 runner 初始化 naive：
-      # Linux 必须有同目录 SO，Windows 必须有同目录 DLL；macOS 静态编入 sing-box，绝不下载死重。
-      # 两个 step 分开而非 shell 条件拼参数，令「各矩阵腿取哪种库」可由契约测试逐字锁住。
-      - name: Fetch cronet library (Linux, SHA256-pinned)
-        if: runner.os == 'Linux'
-        run: node scripts/fetch-cronet.mjs --platform=linux
-
-      - name: Fetch cronet library (Windows, SHA256-pinned)
-        if: runner.os == 'Windows'
-        run: node scripts/fetch-cronet.mjs --platform=win
-
       # ── 出站面必须被随包核收得下（本腿是这道门唯一有牙的地方）──
       # config-engine 的 620 条单测全绿、而生成的配置喂给真核是 rc=1 FATAL —— 同一类缺陷因此
       # 出货过两次（Protocol::Http 的 transport、传输层黑名单）。仓里所有 config-gen 的门都停在
@@ -875,10 +765,10 @@ jobs:
       # 成本：随包核实测单次 check ≈13ms × 37 场景，可忽略。
       # 删掉本步会让 `ci_step_still_wired` 那条断言转红（它 grep 本文件）。
       #
-      # 🔴 **必须排在对应平台的「Fetch cronet library」之后**（2026-08-13 实测教训）。此前排在它之前，
+      # 🔴 **必须排在「Fetch sing-box core」之后**（2026-08-13 实测教训，当时 Cronet 由独立步骤拉取）。此前排在它之前，
       # Windows 腿红在 `naive outbound → cronet: library not found. Place libcronet.dll in the
-      # executable directory`：随包核 beta.14 在 **initialize 阶段**就硬要这个库，而它由
-      # `fetch-cronet.mjs` 落到 `resources/win/`（= 核的同目录）。08-05 那次绿是因为旧核不要它，
+      # executable directory`：随包核 beta.14 在 **initialize 阶段**就硬要这个库，而它如今随
+      # 发布归档由 `fetch-core.mjs` 落到 `resources/win/`（= 核的同目录）。08-05 那次绿是因为旧核不要它，
       # 抬核到 beta.14 后才暴露 —— 而 Windows 腿从 08-05 起就没再跑过，缺陷潜伏了一周。
       # 排在之后同时更贴近生产：生产就是把 DLL 放在核旁边。顺序由 `ci_step_order_is_load_bearing`
       # 钉住。
@@ -912,17 +802,6 @@ jobs:
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
 
-      - name: Observe canonical native Cronet and actual core mapping
-        if: inputs.native_validation == true && (runner.os == 'Linux' || runner.os == 'Windows')
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = Linux ]; then
-            python3 scripts/native-payload-proof.py --platform linux --core "$PWD/resources/linux/sing-box" --library "$PWD/resources/linux/libcronet.so" --output native-payload-evidence/source-linux.json
-          else
-            python scripts/native-payload-proof.py --platform win --core "$PWD/resources/win/sing-box.exe" --library "$PWD/resources/win/libcronet.dll" --output native-payload-evidence/source-win.json
-          fi
-
       # 网络场景起核门：真 `run`（只监听 127.0.0.1，不建 TUN）验证环境条件规则的 Start 期引用——
       # `check` 拦不住引用不存在/类型不支持的 DNS server。dhcp 用例只在 Linux 且证明发不出包时跑，其余平台跳过。
       - name: Kernel starts configs with network-profile rules (network-profile runtime gate)
@@ -942,12 +821,6 @@ jobs:
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture --test-threads=1
-
-      - name: Managed mesh multi-answer CONNECT runtime gate
-        if: env.POLARIS_RUN_KERNEL_GATES == '1'
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture
 
       - name: Fetch sing-box dashboard
         run: node scripts/fetch-dashboard.mjs
@@ -1117,7 +990,6 @@ jobs:
             printf 'POLARIS_WINDOWS_INSTALL_ANCHOR=%s\n' "$POLARIS_WINDOWS_INSTALL_ANCHOR" >> "$GITHUB_ENV"
           fi
           # Freeze the actual staged (and on macOS signed) release helper bytes.
-          # Temporary defaults keep this same resources/<platform> App carrier.
           node scripts/prepare-core-identity.mjs --platform="$res_dir"
           printf 'POLARIS_CORE_IDENTITY_FILE=%s/resources/%s/core-manifest.json\n' "$GITHUB_WORKSPACE" "$res_dir" >> "$GITHUB_ENV"
 
@@ -1374,7 +1246,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle_dir="target/${{ matrix.rust_target }}/release/bundle/dmg"
-          # 本腿打进包的那份源内核（`Consume sing-box core bundle` 落盘、已对过回执哈希）。
+          # 本腿打进包的那份源内核（`Fetch sing-box core` 落盘、已对过回执哈希）。
           core_ref="resources/${{ matrix.mac_arch_tag }}/sing-box"
           guide="packaging/macos-dmg-open-guide.txt"
           guide_name="README First.txt"
@@ -1689,54 +1561,6 @@ jobs:
         shell: bash
         run: node scripts/verify-packaging.mjs assets --label windows --dir dist-win
 
-      - name: Verify actual final Linux package payloads
-        if: inputs.native_validation == true && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          debs=(target/release/bundle/deb/*.deb)
-          images=(target/release/bundle/appimage/*.AppImage)
-          [ "${#debs[@]}" -eq 1 ] && [ "${#images[@]}" -eq 1 ]
-          python3 scripts/final-package-receipt.py --platform linux --kind deb --artifact "${debs[0]}" --output native-payload-evidence/final-deb.json
-          python3 scripts/final-package-receipt.py --platform linux --kind AppImage --artifact "${images[0]}" --output native-payload-evidence/final-AppImage.json
-
-      - name: Verify actual installed NSIS and final portable payloads
-        if: inputs.native_validation == true && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $installers = @(Get-ChildItem dist-win/*-setup.exe)
-          $zips = @(Get-ChildItem dist-win/*-Portable.zip)
-          if ($installers.Count -ne 1 -or $zips.Count -ne 1) { throw 'expected exact final NSIS and ZIP' }
-          python scripts/final-package-receipt.py --platform win --kind nsis --artifact $installers[0].FullName --output native-payload-evidence/final-nsis.json
-          if ($LASTEXITCODE -ne 0) { throw 'actual NSIS proof failed' }
-          python scripts/final-package-receipt.py --platform win --kind zip --artifact $zips[0].FullName --output native-payload-evidence/final-zip.json
-          if ($LASTEXITCODE -ne 0) { throw 'actual ZIP proof failed' }
-
-      - name: Upload native payload evidence
-        if: ${{ !cancelled() && inputs.native_validation == true }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: native-payload-proof-${{ env.CORE_CANDIDATE }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
-          path: native-payload-evidence/*.json
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Preserve Windows App stage bytes and failure evidence
-        if: ${{ !cancelled() && inputs.native_validation == true && runner.os == 'Windows' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: native-app-bytes-${{ env.CORE_CANDIDATE }}-${{ github.run_id }}-${{ github.run_attempt }}-windows
-          path: |
-            native-payload-evidence/app-bytes/**
-            target/release/polaris.exe
-            target/release/nsis/x64/installer.nsi
-            dist-win/*.exe
-            dist-win/*-Portable.zip
-          if-no-files-found: error
-          retention-days: 7
-
       # ── 上传产物 ── 每平台一个 artifact；mac 分架构后 label 为 macos-arm64 / macos-x64，故不撞名。
       # 路径以**仓库根 target/** 为准（cargo workspace 根在仓库根，见 Build installers 注释）。
       # 传了 --target 的 mac job 多一层 triple 目录，故 dmg 用 `target/*/release/...` 覆盖。
@@ -1771,21 +1595,11 @@ jobs:
 
   core_wire:
     name: bundled core gRPC wire contract
-    needs: [setup, desktop_core]
+    needs: setup
     if: >-
-      (!cancelled() && needs.setup.result == 'success'
-      && (needs.desktop_core.result == 'success'
-        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != '')))
+      (!cancelled() && needs.setup.result == 'success')
     runs-on: ubuntu-22.04
     timeout-minutes: 120
-    env:
-      CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
-      POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
-      CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
-      CORE_WIRE_INPUT_ARTIFACT: ${{ inputs.core_wire_input_artifact }}
-      CORE_WIRE_INPUT_ARTIFACT_ID: ${{ inputs.core_wire_input_artifact_id }}
-      CORE_WIRE_INPUT_ARTIFACT_DIGEST: ${{ inputs.core_wire_input_artifact_digest }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Set absolute release-consumer job deadline
         shell: bash
@@ -1847,48 +1661,16 @@ jobs:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
 
-      - name: Download exact candidate core bundle
-        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.CORE_BUNDLE_ARTIFACT }}
-          path: ${{ runner.temp }}/desktop-core-bundle
-
-      # 不传 --platform = 四平台全量消费并逐份校验，与打包腿同一条命令。
-      - name: Consume sing-box core bundle
-        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
+      # 不传 --platform = 四平台全量取得并逐份校验，与打包腿同一条命令。
+      - name: Fetch sing-box core
         shell: bash
         env:
           POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
-          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
-        run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
-
-      - name: Require current-attempt wire artifact identity
-        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        shell: bash
-        env:
-          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
-        run: node scripts/desktop-core/wire-input-handoff.mjs check --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
-
-      - name: Download current-attempt preflight wire inputs
-        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        shell: bash
-        env:
-          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
-        run: node scripts/desktop-core/wire-input-handoff.mjs download --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
-
-      - name: Verify and import current-attempt preflight wire inputs
-        id: wire-import
-        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        shell: bash
-        env:
-          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
-        run: node scripts/desktop-core/wire-input-handoff.mjs import --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
+        run: node scripts/fetch-core.mjs
 
       # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
       # REQUIRE 仅限本步，缺任一 manifest 平台时不能以本机允许的 skip 冒充验证通过。
       - name: Bundled core gRPC wire contract (all platforms)
-        if: steps.wire-import.outputs.wire_verified != 'true'
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact

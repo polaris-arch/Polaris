@@ -39,7 +39,7 @@
 //!
 //! - tag 只说明「这块代码**编进来了**」，不说明「它真的能用」。运行期能力仍由起核时的
 //!   `sing-box check`（`runtime/proxy::generate_and_gate`）负责。
-//! - `core-manifest.json` 的 `coreArchiveSha256` 已经逐字节钉住了每个平台的压缩包 ⇒
+//! - 发布合同 `release-contract.json` 已经逐字节钉住了每个平台的压缩包 ⇒
 //!   tag 集**不可能在不动 sha 的情况下漂移**。所以本门只在**换核 bump 那一刻**才有机会红 ——
 //!   那正是它存在的意义（与 `core_dep_fingerprint` / `core_schema_surface` 同一套「换核即自曝」）。
 //! - 盘上缺哪个平台就少看哪个平台；`POLARIS_REQUIRE_KERNEL_GATE=1` 时四份缺一即红

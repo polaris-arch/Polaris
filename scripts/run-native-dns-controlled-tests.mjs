@@ -272,21 +272,18 @@ function nativeBinding(root, directory, env, run) {
     'Consumer was imported from another source checkout');
   const contextBytes = boundedBytes(join(directory, 'context.json'), 1024 * 1024);
   const context = JSON.parse(textBytes(contextBytes)), c = context?.context;
-  const attempt = typeof c?.attempt === 'object' ? c.attempt?.attempt : c?.attempt;
-  const runId = c?.runId ?? c?.attempt?.runId;
   demand(c && c.repository === 'polaris-arch/Polaris' && c.repositoryId === '1347028220'
     && env.GITHUB_REPOSITORY === c.repository && env.GITHUB_REPOSITORY_ID === c.repositoryId
-    && c.candidate === sourceCommit && (!c.tree || c.tree === sourceTree)
-    && /^[1-9][0-9]*$/.test(runId ?? '') && runId === env.GITHUB_RUN_ID
-    && /^[1-9][0-9]*$/.test(attempt ?? '') && attempt === env.GITHUB_RUN_ATTEMPT
+    && c.candidate === sourceCommit && c.tree === sourceTree
+    && /^[1-9][0-9]*$/.test(c.runId ?? '') && c.runId === env.GITHUB_RUN_ID
+    && /^[1-9][0-9]*$/.test(c.attempt ?? '') && c.attempt === env.GITHUB_RUN_ATTEMPT
     && typeof env.GITHUB_WORKFLOW_REF === 'string'
     && ['ci.yml', 'package.yml'].some((name) => env.GITHUB_WORKFLOW_REF === `${c.repository}/.github/workflows/${name}@${env.GITHUB_REF}`)
-    && (!c.workflowRef || c.workflowRef === env.GITHUB_WORKFLOW_REF) && (!c.ref || c.ref === env.GITHUB_REF)
+    && c.workflowRef === env.GITHUB_WORKFLOW_REF && c.ref === env.GITHUB_REF
     && ['linux', 'win', 'mac-x64', 'mac-arm64'].includes(context.platform) && context.platform === env.CORE_PLATFORM
-    && context.selection === (env.POLARIS_NATIVE_DNS_FORMAL === '1' ? 'formal-default'
-      : env.POLARIS_NATIVE_DNS_CANDIDATE === '1' ? 'manual-candidate' : 'temporary-default')
+    && context.selection === 'formal-default' && env.POLARIS_NATIVE_DNS_FORMAL === '1'
     && /^[a-f0-9]{40}$/.test(context.kernelSourceCommit ?? '') && /^[a-f0-9]{40}$/.test(context.kernelSourceTree ?? '')
-    && (context.selection !== 'formal-default' || /^[a-f0-9]{64}$/.test(c.contractSha256 ?? '')),
+    && /^[a-f0-9]{64}$/.test(c.contractSha256 ?? ''),
   'Native summary candidate/run/platform/selection context differs');
   demand(typeof env.POLARIS_CORE_IDENTITY_FILE === 'string' && env.POLARIS_CORE_IDENTITY_FILE.length > 0,
     'Compiled Core manifest authority is missing');
@@ -298,7 +295,7 @@ function nativeBinding(root, directory, env, run) {
   demand(boundedBytes(join(directory, 'compiled-core-manifest.json'), 1024 * 1024).equals(compiledBytes),
     'Preserved compiled Core manifest differs');
   return { repository: c.repository, repositoryId: c.repositoryId, candidate: sourceCommit, sourceTree,
-    runId, attempt, workflowRef: env.GITHUB_WORKFLOW_REF, ref: env.GITHUB_REF, platform: context.platform,
+    runId: c.runId, attempt: c.attempt, workflowRef: env.GITHUB_WORKFLOW_REF, ref: env.GITHUB_REF, platform: context.platform,
     selection: context.selection, kernelSourceCommit: context.kernelSourceCommit, kernelSourceTree: context.kernelSourceTree,
     sourceHashes, context: byteIdentity(contextBytes), compiledManifest: { ...byteIdentity(compiledBytes), id: compiled.id, core: compiled.core } };
 }

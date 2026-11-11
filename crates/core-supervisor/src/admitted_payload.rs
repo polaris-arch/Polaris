@@ -202,12 +202,6 @@ impl SelectedPolicy {
         if !matches!(platform, "linux" | "win" | "mac-arm64" | "mac-x64") {
             return Err(AdmissionError::unsupported_exact_object());
         }
-        if selected_core::COMPILED_VALIDATION_SOURCE != b"null" {
-            return Err(AdmissionError::new(
-                AdmissionErrorKind::UnsupportedCapability,
-                "candidate source has no compiled trusted-execution policy",
-            ));
-        }
         // The executor embeds the selected pure core identity before its own
         // installer/hash carrier exists. Helper/cleaner are installation data,
         // deliberately excluded by CoreManifest::canonical_bytes. Never make a
@@ -626,30 +620,6 @@ impl PreparedExecution {
     }
     pub(crate) fn payload(&self) -> Arc<AdmittedPayload> {
         Arc::clone(&self.payload)
-    }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn sealed_check_parts(
-        &self,
-    ) -> Result<(tokio::process::Command, std::fs::File, Arc<AdmittedPayload>), AdmissionError>
-    {
-        if self.purpose != ExecPurpose::CheckConfig {
-            let mut error = AdmissionError::new(
-                AdmissionErrorKind::UnsupportedCapability,
-                "sealed validation requires CheckConfig purpose",
-            );
-            error.purpose = Some(self.purpose);
-            return Err(error);
-        }
-        let mut command = self.command()?;
-        command
-            .args(["--disable-color", "check", "-c", "/proc/self/fd/0"])
-            .current_dir("/")
-            .kill_on_drop(true);
-        Ok((
-            command,
-            self.payload.protected.binary_for_custody()?,
-            self.payload(),
-        ))
     }
     pub(crate) fn command(&self) -> Result<tokio::process::Command, AdmissionError> {
         self.payload.prepare(self.purpose)?;

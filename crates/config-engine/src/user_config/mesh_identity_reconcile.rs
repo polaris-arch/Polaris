@@ -3,9 +3,8 @@
 
 use super::cidr::normalize_cidr;
 use super::mesh_route_state::{
-    revise_semantic, MeshBindingState, MeshIdentity, MeshIdentityEffect, MeshIdentityEffectStatus,
-    MeshOwnerRef, MeshReservation, MeshReservationOwner, MeshRoutePolicy, MeshRouteState,
-    MeshTarget,
+    revise_semantic, MeshBindingState, MeshIdentity, MeshOwnerRef, MeshReservation,
+    MeshReservationOwner, MeshRoutePolicy, MeshRouteState, MeshTarget,
 };
 use std::collections::BTreeSet;
 
@@ -32,25 +31,6 @@ pub struct ReplacementIdentity<'a> {
     pub epoch: &'a str,
     pub control_authority: &'a str,
     pub self_stable_id: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlledIdentityChange {
-    /// A config edit or selective restore changes identity, without authorizing deletion.
-    ConfigReplacement,
-    /// The user explicitly logs out this identity.
-    Logout,
-    /// The user explicitly replaces this identity and requests old state cleanup.
-    ExplicitReplacement,
-}
-
-/// An effect is a ledger instruction only. S4 must first prove the old main and
-/// temporary owners released the state directory under its lifecycle/state gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateDirectoryOccupant<'a> {
-    Empty,
-    Epoch(&'a str),
-    Unknown,
 }
 
 /// URL authority comparison only folds scheme and host case. Path, port,
@@ -333,112 +313,6 @@ pub fn reconcile_identity_evidence(
         add_replacement(&mut next, server_id, evidence, "status")?;
     }
     revise_semantic(previous, &previous.revision, next)
-}
-
-/// Trusted edit/restore/logout mutation. Only explicit logout or replacement
-/// may create an old-epoch cleanup effect; config changes keep state on disk.
-pub fn reconcile_controlled_identity(
-    previous: &MeshRouteState,
-    policy: &MeshRoutePolicy,
-    owner: &MeshOwnerRef,
-    replacement: Option<ReplacementIdentity<'_>>,
-    cause: ControlledIdentityChange,
-    effect_id: Option<&str>,
-    retirement_scope: RetirementScopeSnapshot<'_>,
-) -> Result<MeshRouteState, String> {
-    previous.validate()?;
-    policy.validate()?;
-    let current = current_identity(previous, &owner.server_id)?.ok_or("mesh identity is absent")?;
-    if current.identity_epoch != owner.identity_epoch {
-        return Err("mesh identity epoch changed".into());
-    }
-    if cause == ControlledIdentityChange::Logout && replacement.is_some() {
-        return Err("logout cannot bind replacement identity".into());
-    }
-    if cause == ControlledIdentityChange::ExplicitReplacement && replacement.is_none() {
-        return Err("explicit replacement requires a new epoch".into());
-    }
-    if cause == ControlledIdentityChange::ConfigReplacement && effect_id.is_some() {
-        return Err("config change cannot authorize state deletion".into());
-    }
-    if cause != ControlledIdentityChange::ConfigReplacement && effect_id.is_none() {
-        return Err("explicit identity cleanup needs an effectId".into());
-    }
-    if let Some(replacement) = replacement {
-        validate_replacement(previous, &owner.server_id, replacement)?;
-    }
-    if effect_id.is_some_and(|id| {
-        id.trim().is_empty()
-            || previous
-                .identity_effects
-                .iter()
-                .any(|effect| effect.effect_id == id)
-    }) {
-        return Err("invalid or reused identity effectId".into());
-    }
-    let mut next = previous.clone();
-    retire(&mut next, policy, owner, retirement_scope)?;
-    if let Some(replacement) = replacement {
-        add_replacement(&mut next, &owner.server_id, replacement, "controlledChange")?;
-    }
-    if let Some(effect_id) = effect_id {
-        next.identity_effects.push(MeshIdentityEffect {
-            effect_id: effect_id.into(),
-            server_id: owner.server_id.clone(),
-            retired_epoch: owner.identity_epoch.clone(),
-            kind: "deleteState".into(),
-            status: MeshIdentityEffectStatus::Pending,
-        });
-    }
-    revise_semantic(previous, &previous.revision, next)?
-        .ok_or_else(|| "identity change did not advance mesh revision".into())
-}
-
-/// Pure exact-target check. `Unknown` always blocks. The S4 caller must hold
-/// the state gate and separately prove that no main or temporary owner runs.
-pub fn check_retired_effect_target<'a>(
-    state: &'a MeshRouteState,
-    effect_id: &str,
-    directory: StateDirectoryOccupant<'_>,
-) -> Result<&'a MeshIdentityEffect, String> {
-    state.validate()?;
-    let effect = state
-        .identity_effects
-        .iter()
-        .find(|effect| effect.effect_id == effect_id)
-        .ok_or("mesh identity effect is absent")?;
-    if effect.status != MeshIdentityEffectStatus::Pending || effect.kind != "deleteState" {
-        return Err("mesh identity effect is not pending deletion".into());
-    }
-    let old = state
-        .identities
-        .iter()
-        .find(|identity| {
-            identity.server_id == effect.server_id
-                && identity.identity_epoch == effect.retired_epoch
-        })
-        .ok_or("retired mesh identity epoch is absent")?;
-    if !matches!(
-        old.binding_state,
-        MeshBindingState::Retiring | MeshBindingState::Retired
-    ) {
-        return Err("mesh identity effect does not name a retired epoch".into());
-    }
-    match directory {
-        StateDirectoryOccupant::Empty => {}
-        StateDirectoryOccupant::Epoch(epoch) if epoch == effect.retired_epoch => {}
-        StateDirectoryOccupant::Epoch(_) | StateDirectoryOccupant::Unknown => {
-            return Err("state directory is not proven to belong to retired epoch".into());
-        }
-    }
-    if state.identities.iter().any(|identity| {
-        identity.server_id == effect.server_id
-            && identity.identity_epoch != effect.retired_epoch
-            && identity.binding_state == MeshBindingState::Bound
-    }) {
-        return Err("new mesh identity already bound to state directory".into());
-    }
-    Ok(effect)
 }
 
 #[cfg(test)]

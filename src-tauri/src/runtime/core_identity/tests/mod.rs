@@ -31,70 +31,10 @@ fn upstream_installation_provider_binds_exact_compiled_contract_in_its_own_domai
         bad[name] = "a".repeat(64).into();
         assert!(formal_provider_fingerprint(raw, &contract, &bad).is_err());
     }
-    let historical = serde_json::json!({"schema":"polaris-box-release-consumer-contract-v1"});
-    assert_eq!(
-        formal_provider_fingerprint(
-            "historical",
-            &historical,
-            &serde_json::json!({"providerFingerprint":"a".repeat(64)})
-        )
-        .unwrap(),
-        "a".repeat(64)
-    );
 }
 
 #[test]
 fn selected_source_is_compiled_not_a_runtime_environment_override() {
-    let formal: serde_json::Value = serde_json::from_str(RELEASE_CONTRACT).unwrap();
-    assert_eq!(
-        selected_source_from(b"null", "win").unwrap(),
-        formal["platforms"]["win"]["sourceCommit"].as_str().unwrap()
-    );
-    let candidate = serde_json::json!({
-        "schema": "polaris-native-dns-compiled-source-v1", "validationOnly": true,
-        "AppAccepted": false, "publicationEligible": false,
-        "platforms": ["linux", "win", "mac-x64", "mac-arm64"],
-        "sourceCommit": "a".repeat(40)
-    });
-    let raw = serde_json::to_vec(&candidate).unwrap();
-    assert_eq!(selected_source_from(&raw, "win").unwrap(), "a".repeat(40));
-    assert!(selected_source_from(&raw, "android").is_err());
-    for field in [
-        "schema",
-        "sourceCommit",
-        "platforms",
-        "validationOnly",
-        "AppAccepted",
-    ] {
-        let mut invalid = candidate.clone();
-        invalid[field] = serde_json::Value::Null;
-        assert!(selected_source_from(&serde_json::to_vec(&invalid).unwrap(), "win").is_err());
-    }
-    let mut temporary = candidate.clone();
-    temporary["schema"] = "polaris-native-dns-compiled-source-v2".into();
-    temporary["validationOnly"] = false.into();
-    temporary["purpose"] = "temporary-default".into();
-    temporary["context"] = serde_json::json!({"mode": "temporary-default"});
-    assert_eq!(
-        selected_source_from(&serde_json::to_vec(&temporary).unwrap(), "win").unwrap(),
-        "a".repeat(40)
-    );
-    for field in [
-        "purpose",
-        "context",
-        "publicationEligible",
-        "sourceCommit",
-        "validationOnly",
-    ] {
-        let mut invalid = temporary.clone();
-        invalid[field] = serde_json::Value::Null;
-        assert!(selected_source_from(&serde_json::to_vec(&invalid).unwrap(), "win").is_err());
-    }
-    assert!(selected_source_from(
-        br#"{"schema":"polaris-temporary-desktop-unavailable-v1"}"#,
-        "win"
-    )
-    .is_err());
     if polaris_core_supervisor::selected_core::selection_lane()
         == polaris_core_supervisor::selected_core::SelectionLane::LocalDevelopment
     {
@@ -103,7 +43,11 @@ fn selected_source_is_compiled_not_a_runtime_environment_override() {
             "local source selection is Linux-only"
         );
     } else {
-        assert!(selected_source_commit("win").is_ok());
+        let formal: serde_json::Value = serde_json::from_str(RELEASE_CONTRACT).unwrap();
+        assert_eq!(
+            selected_source_commit("win").unwrap(),
+            formal["platforms"]["win"]["sourceCommit"].as_str().unwrap()
+        );
     }
 }
 
@@ -138,11 +82,10 @@ fn all_selected_desktop_rows_have_complete_content_identities() {
 }
 
 #[test]
-fn candidate_compiled_identity_verifies_actual_carrier_without_a_runtime_override() {
+fn compiled_identity_verifies_actual_carrier_without_a_runtime_override() {
     if polaris_core_supervisor::selected_core::selection_lane()
         == polaris_core_supervisor::selected_core::SelectionLane::LocalDevelopment
     {
-        assert_eq!(COMPILED_VALIDATION_SOURCE, b"null");
         assert_eq!(
             selected_payload_dirs(&["old-formal-path"]).unwrap(),
             vec![".local-development/linux"]
@@ -159,69 +102,7 @@ fn candidate_compiled_identity_verifies_actual_carrier_without_a_runtime_overrid
         assert!(selected_manifest("mac-arm64").is_err());
         return;
     }
-    if COMPILED_VALIDATION_SOURCE == b"null" {
-        assert_eq!(selected_payload_dirs(&["linux"]).unwrap(), vec!["linux"]);
-        return;
-    }
-    let platform = current_platform().unwrap();
-    let selected = selected_manifest(platform).unwrap();
-    let source: serde_json::Value = serde_json::from_slice(COMPILED_VALIDATION_SOURCE).unwrap();
-    assert_eq!(
-        selected.provider_fingerprint,
-        source["bindingSha256"].as_str().unwrap()
-    );
-    assert_ne!(
-        selected.provider_fingerprint,
-        formal_manifest(platform).unwrap().provider_fingerprint
-    );
-    let dirs = selected_payload_dirs(&["old-formal-path"]).unwrap();
-    let expected_directory = if source["schema"] == "polaris-native-dns-compiled-source-v2" {
-        platform.to_owned()
-    } else {
-        format!(".native-dns-app/{platform}")
-    };
-    assert_eq!(dirs, vec![expected_directory]);
-    let carrier = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../resources")
-        .join(&dirs[0]);
-    let name = if platform == "win" {
-        "sing-box.exe"
-    } else {
-        "sing-box"
-    };
-    assert!(verify_directory_observed(&carrier, &selected)
-        .unwrap()
-        .is_current());
-    assert!(
-        verify_bundled(&carrier.join(name)).is_err(),
-        "old candidate bytes cannot claim the new loader capability"
-    );
-    assert!(selected.helper_sha256.is_some());
-    assert_eq!(selected.cleaner_sha256.is_some(), platform == "win");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Actual compiled selection + actual carrier bytes, with every core
-        // file absent from the maintenance source directory.
-        let private = std::env::temp_dir().join(format!(
-            "polaris-compiled-maintenance-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir(&private).unwrap();
-        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let helper = private.join("polaris-helper");
-        std::fs::copy(carrier.join("polaris-helper"), &helper).unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let utility = maintenance_utility_from(&helper, platform, &selected).unwrap();
-        assert_eq!(Some(utility.helper_sha256), selected.helper_sha256);
-        assert!(selected
-            .files
-            .iter()
-            .all(|file| !private.join(&file.name).exists()));
-        std::fs::write(&helper, b"substituted source").unwrap();
-        assert!(maintenance_utility_from(&helper, platform, &selected).is_err());
-        std::fs::remove_dir_all(private).unwrap();
-    }
+    assert_eq!(selected_payload_dirs(&["linux"]).unwrap(), vec!["linux"]);
 }
 
 #[test]
