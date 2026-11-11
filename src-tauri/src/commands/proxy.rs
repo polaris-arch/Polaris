@@ -334,19 +334,18 @@ pub async fn proxy_apply_pending_changes(
     let result = if let Some(token) = cancel_impact_confirmation {
         state.proxy.cancel_runtime_impact_choice(&token)
     } else if let Some(token) = impact_confirmation {
-        state
-            .proxy
-            .clone()
-            .confirm_runtime_impact_choice(token)
-            .await
+        // 各腿 Box：内联 future 会把命令 future 撑到数百 KiB，Windows 主线程构造时栈溢出。
+        Box::pin(state.proxy.clone().confirm_runtime_impact_choice(token)).await
     } else if let Some(transaction_id) = retry_persistence_transaction_id {
-        state.proxy.retry_runtime_persistence(transaction_id).await
+        Box::pin(state.proxy.retry_runtime_persistence(transaction_id)).await
     } else {
-        state
-            .proxy
-            .clone()
-            .apply_pending_transaction(restart_confirmation)
-            .await
+        Box::pin(
+            state
+                .proxy
+                .clone()
+                .apply_pending_transaction(restart_confirmation),
+        )
+        .await
     };
     Ok(ApiResponse::ok(
         serde_json::to_value(result).map_err(|_| ())?,
@@ -367,15 +366,17 @@ pub async fn proxy_runtime_apply_status(
         transaction_id,
         host_execution_id,
     ) {
+        // 各腿 Box：同 `proxy_apply_pending_changes`，命令 future 须保持 KB 级。
         (true, Some(transaction), None) => {
-            state
-                .proxy
-                .runtime_native_retirement_status(transaction)
-                .await
+            Box::pin(state.proxy.runtime_native_retirement_status(transaction)).await
         }
         (true, _, _) => return Err(()),
-        (false, Some(transaction), None) => state.proxy.runtime_apply_status(transaction).await,
-        (false, None, Some(execution)) => state.proxy.runtime_host_apply_status(execution).await,
+        (false, Some(transaction), None) => {
+            Box::pin(state.proxy.runtime_apply_status(transaction)).await
+        }
+        (false, None, Some(execution)) => {
+            Box::pin(state.proxy.runtime_host_apply_status(execution)).await
+        }
         _ => return Err(()),
     };
     Ok(ApiResponse::ok(

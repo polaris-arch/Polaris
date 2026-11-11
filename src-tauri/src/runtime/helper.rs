@@ -53,14 +53,18 @@ const HELPER_TOKEN_FILE: &str = "helper-client.token";
 /// 故留 15s 余量覆盖偶发慢盘/大 config 校验足矣。
 const HELPER_START_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// helper 停核整次调用的总预算。Linux 的物理 Child 尚未 reap 时会在同一个上层
-/// Stop permit 内轮询；通信错误仍最多补发一次，但所有尝试共用这 1.5 秒截止时间。
+/// 旧 PID 停核整次调用的总预算（exact birth 停核用 [`HELPER_BIRTH_STOP_TIMEOUT`]）。物理 Child
+/// 尚未 reap 时在同一个上层 Stop permit 内轮询；通信错误仍最多补发一次，所有尝试共用同一截止时间。
 ///
 /// stop 携带受管 pid，daemon 侧按 exact child 身份校验，因此同一 pid 的重复请求是幂等的：Linux
 /// 在 native reap 前回 `pending`，之后才回 `stopped/notrunning`；若 helper 已换成新核，则得到
 /// `stop-mismatch` 且不杀。Windows 真机出现过一次 1.5s 默认预算刚过即丢回执，因此保留一次
 /// 通信恢复机会，同时不把所有 helper 命令一并放宽。
 const HELPER_STOP_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// exact birth 停核的总预算：helper 先 TERM、5s 宽限后才 KILL（macOS/Linux helper 同为 5s），
+/// 内核自身关闭也可能耗满 5s；预算短于宽限会在核已退出前报超时并保留运行态（Mac 真机复现）。
+/// 收到 reap 回执即返回，只有持续 `pending` 才会用满。
+const HELPER_BIRTH_STOP_TIMEOUT: Duration = Duration::from_secs(7);
 const HELPER_STOP_MAX_RETRIES: u32 = 1;
 const HELPER_STOP_RETRY_DELAY: Duration = Duration::from_millis(50);
 
@@ -2024,7 +2028,7 @@ impl HelperRuntime {
             HelperStopTarget::Birth(target) => stop_birth_with_client_budget(
                 &client,
                 target,
-                HELPER_STOP_TIMEOUT,
+                HELPER_BIRTH_STOP_TIMEOUT,
                 HELPER_STOP_RETRY_DELAY,
             ),
             HelperStopTarget::Legacy(pid) => stop_core_with_client(&client, Some(pid)),

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { clearHelperInstallFeedback } from './helper-install-session';
+import { clearHelperInstallFeedback, HELPER_UPGRADE_TOAST_KEY } from './helper-install-session';
 import { isValidElement, type ReactElement } from 'react';
 
 const h = vi.hoisted(() => ({
@@ -27,7 +27,7 @@ vi.mock('@/ipc/api-client', () => ({ helperApi: {
   getStatus: vi.fn(), install: vi.fn(), uninstall: vi.fn(),
   onUpgradeable: (f: () => void) => { h.refresh = f; return () => {}; },
 } }));
-vi.mock('@/lib/error-handler', () => ({ toast: { error: vi.fn() } }));
+vi.mock('@/lib/error-handler', () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
 vi.mock('@/lib/confirm-twice', () => ({ useConfirmTwice: () => ({ armed: null, confirmTwice: vi.fn() }) }));
 vi.mock('./settings-logic', () => ({ shellPlatformFromDataOs: () => h.platform }));
 await (await import('@/i18n')).i18nReady;
@@ -105,6 +105,12 @@ it.each(['failed', 'cancelled', 'proxyRunning'])('does not offer stop-and-upgrad
   vi.mocked(helperApi.install).mockResolvedValue({ success: false, errorCode, status: absent } as never);
   click('helper.installAction'); await vi.waitFor(() => expect(h.state[3]).toBe(errorCode));
   expect(button('helper.stopAndUpgradeAction')).toBeUndefined();
+});
+it('a successful upgrade replaces the global upgrade toast through the same key', async () => {
+  await mounted();
+  vi.mocked(helperApi.install).mockResolvedValue({ success: true, status: { ...absent, installed: true, ready: true } } as never);
+  click('helper.installAction');
+  await vi.waitFor(() => expect(toast.success).toHaveBeenCalledExactlyOnceWith('helper.statusInstalled', { key: HELPER_UPGRADE_TOAST_KEY }));
 });
 it('requires the scoped confirmation, deduplicates clicks, and sends the typed mode only once', async () => {
   await deferred(); click('helper.stopAndUpgradeAction'); click('helper.stopAndUpgradeAction');

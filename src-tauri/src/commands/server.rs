@@ -649,10 +649,13 @@ pub async fn server_switch(
             // 后台把完整 D（含此前保存未 Apply 的 DNS/规则）送入运行核。
             emit_config_changed_signal(&app);
             let starting_generation = state.proxy().core_generation();
-            match state
-                .proxy
-                .switch_selected_server_if_current(&server_id, intent_generation)
-                .await
+            // Box：热切 future 达数百 KiB，Windows 主线程（1MB 栈）按值构造命令 future 会栈溢出。
+            match Box::pin(
+                state
+                    .proxy
+                    .switch_selected_server_if_current(&server_id, intent_generation),
+            )
+            .await
             {
                 Ok(outcome) => {
                     let outcome = state.proxy().settle_selected_switch_receipt(

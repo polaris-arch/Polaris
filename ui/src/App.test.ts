@@ -11,6 +11,7 @@
  * 唯一的可观察副作用出口，其余只是模块图谱的一部分，无需关心。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { HELPER_UPGRADE_TOAST_KEY } from './components/screens/settings/helper-install-session';
 
 const { toastErrorMock, toastWarningMock, toastInfoMock, notifyDesktopMock } = vi.hoisted(() => ({
   toastErrorMock: vi.fn(),
@@ -491,6 +492,8 @@ describe('handleHelperUpgradeable（提权助手可升级 → 可操作 toast）
     const [msg, opts] = toastWarningMock.mock.calls[0];
     expect(msg).toBe('helper.statusUpgradeable');
     expect(opts.description).toBe('helper.upgradeDescCard');
+    // 升级成功后由设置页用同 key 的短 toast 顶掉（见 SettingsHelper.migration.test）。
+    expect(opts.key).toBe(HELPER_UPGRADE_TOAST_KEY);
     // 「可操作」不是形容词：没有 actions 的 toast 是 pointer-events:none 的一次性通知，
     // 用户看到「该升级了」却无处可点 —— 那与不提示的差别只有一句空话。
     expect(opts.actions).toHaveLength(1);

@@ -3,6 +3,8 @@ import type { HelperActionErrorCode } from '@/ipc/api-client';
 /** Renderer-session feedback only. Never persisted, never proof of helper custody,
  * and never permission to install/stop. Confirmation remains owned by the mounted page. */
 type Snapshot = Readonly<{ busy: boolean; failure: HelperActionErrorCode | null }>;
+/** 「需升级」toast 的去重键：升级成功后用同 key 的短 toast 顶掉它，不让带动作的旧提示停留满 15s。 */
+export const HELPER_UPGRADE_TOAST_KEY = 'helper-upgradeable';
 let snapshot: Snapshot = { busy: false, failure: null };
 let sequence = 0;
 let active: number | null = null;

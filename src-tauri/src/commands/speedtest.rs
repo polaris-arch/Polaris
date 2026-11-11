@@ -2143,6 +2143,15 @@ async fn run_temp_core_speed_test(
     let proxy = state.proxy.clone();
     let user_config = user_config_for_temp_core(config);
     let (capabilities, proof) = proxy.tls_fingerprint_capabilities_observed().await;
+    if capabilities.binary_sha256.is_none() {
+        log::warn!(
+            "临时核内核哈希缺失：{}；本轮测速结果将显示为已过期",
+            capabilities
+                .unavailable_reason
+                .as_deref()
+                .unwrap_or("未给出原因")
+        );
+    }
     let temp_core_sha256 = capabilities.binary_sha256;
     proxy.remember_temp_core_sha256(temp_core_sha256.clone(), proof);
     let bind_interfaces: BTreeMap<String, String> = servers
@@ -2528,7 +2537,8 @@ pub async fn server_speed_test(
         if ticket.is_some() || cfg!(target_os = "ios") {
             return Ok(ApiResponse::err_with_code("superseded", "superseded"));
         }
-        let response = run_temp_core_speed_test(
+        // 各大腿 Box：命令 future 须保持 KB 级，Windows 主线程（1MB 栈）按值构造它。
+        let response = Box::pin(run_temp_core_speed_test(
             &app,
             &state,
             &config,
@@ -2536,7 +2546,7 @@ pub async fn server_speed_test(
             &run_id,
             guard.cancel(),
             &mut done,
-        )
+        ))
         .await;
         release_then_emit(guard, done, emit_done);
         return Ok(response);
@@ -2553,9 +2563,7 @@ pub async fn server_speed_test(
     let native_results = if native_requested.is_empty() {
         BTreeMap::new()
     } else {
-        proxy
-            .native_measure_requested(&native_requested, guard.cancel())
-            .await
+        Box::pin(proxy.native_measure_requested(&native_requested, guard.cancel())).await
     };
     let native_pending: Vec<String> = native_requested
         .iter()
@@ -2829,7 +2837,7 @@ pub async fn server_speed_test(
     )
     .with_skipped(vec![("notInPool", skipped.len())])
     .with_readback(&readback);
-    let (results, outcome) = drive_fallback_measure(
+    let (results, outcome) = Box::pin(drive_fallback_measure(
         &active,
         &superseded,
         guard.cancel(),
@@ -2863,7 +2871,7 @@ pub async fn server_speed_test(
             readback: &readback,
             attribution: SYSTEM_PATH_ATTRIBUTION,
         },
-    )
+    ))
     .await;
     let mut combined_results = round_results_json(&results);
     if let Some(results) = combined_results.as_object_mut() {

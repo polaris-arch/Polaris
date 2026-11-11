@@ -49,6 +49,7 @@ import { subscriptionErrorDetail } from './domain/subscription-error-text';
 import { isDefinitiveTsLoginFrame } from './domain/tailscale-conn-state';
 import AppShell from './components/layout/AppShell';
 import { createOnceGate } from './components/screens/settings/settings-logic';
+import { HELPER_UPGRADE_TOAST_KEY } from './components/screens/settings/helper-install-session';
 import { useDialogStore } from './components/dialogs/dialog-store';
 import { useNavStore } from './store/nav-store';
 import { useVpnStatusStore } from './store/use-vpn-status-store';
@@ -134,6 +135,7 @@ export function handleHelperUpgradeable(
   if (status.selectedCore?.admission && !coreAdmissionIsDamage(status.selectedCore.admission)) return false;
   if (!helperUpgradeToastGate()) return false;
   toast.warning(t('helper.statusUpgradeable'), {
+    key: HELPER_UPGRADE_TOAST_KEY,
     description: t('helper.upgradeDescCard'),
     actions: [
       {

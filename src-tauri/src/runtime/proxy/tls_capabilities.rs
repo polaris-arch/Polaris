@@ -171,6 +171,8 @@ impl ProxyRuntime {
         client: &polaris_singbox_grpc::SingBoxApiClient,
         pairing: &super::runtime_config::RuntimePairing,
     ) -> Snapshot {
+        // 失败时记下是哪一道绑定，便于真机定位内核哈希缺失（每次起核最多一条）。
+        let mut stage = "birth";
         let result = async {
             use crate::runtime::helper::HelperStopTarget;
             let (start_token, target) = self
@@ -179,8 +181,10 @@ impl ProxyRuntime {
                 .map_err(|_| "Helper child custody unavailable")?
                 .helper_stop_target()
                 .ok_or("Helper birth unavailable")?;
+            stage = "core-id";
             let platform = crate::runtime::core_identity::current_platform()?;
             let core = crate::runtime::core_identity::selected_id(platform)?;
+            stage = "birth";
             let HelperStopTarget::Birth(birth) = target else {
                 return Err("Legacy Helper PID is not execution evidence".into());
             };
@@ -191,10 +195,12 @@ impl ProxyRuntime {
             if !native_helper_birth_matches(self.helper.platform(), &before, birth, &core) {
                 return Err("Helper original birth/selected Core binding unavailable".into());
             }
+            stage = "api-channel";
             let capabilities = client
                 .get_runtime_capabilities()
                 .await
                 .map_err(|_| "Authenticated running capability query unavailable")?;
+            stage = "pairing/incarnation";
             if !super::runtime_config::runtime_pairing_matches(pairing, &capabilities)
                 || capabilities
                     .active
@@ -203,6 +209,7 @@ impl ProxyRuntime {
             {
                 return Err("Running capability incarnation differs".into());
             }
+            stage = "tls-probe-contract";
             let manifest = crate::runtime::core_identity::selected_manifest(platform)?;
             let source = crate::runtime::core_identity::selected_source_commit(platform)?;
             let binary = manifest
@@ -243,6 +250,7 @@ impl ProxyRuntime {
                 arch,
                 &binary.sha256,
             )?;
+            stage = "state-drift";
             let helper = std::sync::Arc::clone(&self.helper);
             let after = tokio::task::spawn_blocking(move || helper.protected_native_core_status())
                 .await
@@ -263,7 +271,12 @@ impl ProxyRuntime {
             Ok::<_, String>(snapshot)
         }
         .await;
-        result.unwrap_or_else(Snapshot::unavailable)
+        result.unwrap_or_else(|reason| {
+            log::warn!(
+                "运行核 TLS 能力自证失败（{stage}，世代 {generation}）：{reason}；内核哈希缺失，测速结果将显示为已过期"
+            );
+            Snapshot::unavailable(reason)
+        })
     }
 }
 

@@ -25,7 +25,7 @@ import { helperActionErrorText } from '@/domain/action-error-text';
 import { coreAdmissionIsDamage, coreAdmissionMessageKey } from '@/domain/core-admission';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
 import { shellPlatformFromDataOs } from './settings-logic';
-import { beginHelperInstall, clearHelperInstallFeedback, completeHelperInstall, helperInstallSnapshot, subscribeHelperInstall } from './helper-install-session';
+import { beginHelperInstall, clearHelperInstallFeedback, completeHelperInstall, HELPER_UPGRADE_TOAST_KEY, helperInstallSnapshot, subscribeHelperInstall } from './helper-install-session';
 
 /** 本页唯一的原地二次确认项（原型 :4234 `helper-uninstall`）。 */
 const UNINSTALL_KEY = 'helper-uninstall';
@@ -170,6 +170,9 @@ export default function SettingsHelper() {
       failure = r.success ? null : r.errorCode ?? 'failed';
       if (r.success) cleanupPending.current = false;
       publishStatus(r.status);
+      if (r.success && r.status.installed && !r.status.upgradeable) {
+        toast.success(t('helper.statusInstalled'), { key: HELPER_UPGRADE_TOAST_KEY });
+      }
       // W10：Rust 侧把所有失败（用户取消/脚本失败/二进制缺失）都装进 success:false 的 ok 应答——
       // 不在这里读出来，任何失败都是零反馈的「点击安装无反应」。信封不 reject，catch 永远等不到它。
       if (!r.success) {
