@@ -3,13 +3,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { KERNEL_REPOSITORIES, kernelRepositoryIdentity, kernelSourceRepository, validateSourceManifest } from './source-graph.mjs';
-import { publicBytes, releaseRepositoryId, validateReleaseContract } from './release-consumer.mjs';
+import { publicBytes, validateReleaseContract } from './release-consumer.mjs';
 const current = 'polaris-arch/sing-box-polaris', historical = 'polaris-arch/polaris-box';
 test('kernel hosting identities are exact and do not invent release identities', () => {
-  assert.deepEqual(kernelRepositoryIdentity(current), { id: 1421657509, branch: 'polaris-main' });
-  assert.deepEqual(kernelRepositoryIdentity(historical), { id: 1407705262, historical: true });
-  assert.equal(releaseRepositoryId({ repository: current }), 1421657509);
-  assert.equal(releaseRepositoryId({ repository: historical }), 1407705262);
   for (const repo of [current + '-other', current + '/', current + '.git', '__proto__', 'SagerNet/sing-box'])
     assert.throws(() => kernelRepositoryIdentity(repo));
   for (const repo of Object.keys(KERNEL_REPOSITORIES)) assert.equal(kernelSourceRepository(`https://github.com/${repo}`), repo);

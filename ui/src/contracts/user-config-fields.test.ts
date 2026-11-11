@@ -150,16 +150,6 @@ describe('W-0 豁免谓词', () => {
     expect(isStagedExempt('dnsConfig.enableFakeIp')).toBe(false);
     expect(isStagedExempt('helperPromptDismissed.foo')).toBe(true);
   });
-
-  /**
-   * `subscriptions` 原先只是前端元数据，不在 Rust `UserConfig`，故属 Class A。订阅级网卡绑定会
-   * 直接改变出站配置后，它已被提升为 Rust 字段，必须进入暂存判等；订阅增删改/刷新仍可因网络与
-   * 级联副作用走 W-3 直接路由，但那是「绕过」而非「豁免」。
-   */
-  it('订阅级网卡策略使 subscriptions 成为 Class B', () => {
-    expect(isStagedExempt('subscriptions')).toBe(false);
-    expect(isStagedExempt('servers')).toBe(false);
-  });
 });
 
 

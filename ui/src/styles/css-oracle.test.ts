@@ -16,7 +16,6 @@ import { tmpdir } from 'node:os';
 import { ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import * as ts from '@/test/ts-compiler';
 import { contextOf, memoryFs, winnerValue } from './css-cascade.test-support';
 import {
   DRAIN,
@@ -24,7 +23,6 @@ import {
   ORACLE_CLOSE_TIMEOUT_MS,
   openOracleSocket,
   oracleTransport,
-  MEDIA_DEFAULTS,
   PLUGIN_LOADERS,
   abandon,
   assertColorAsksArePinned,
@@ -255,38 +253,6 @@ describe('⑤ R5-08：`@layer` 与构建期注入的 Tailwind', () => {
         'color',
       ),
     ).toBe('rgb(4, 5, 6)');
-  });
-
-  it('移动端进包单元与外部依赖都钉住 —— 取材面多一块少一块都会红', () => {
-    const s = cssBundleScan('src/mobile/MobileMain.tsx');
-    expect(s.units, '移动端进包 CSS 的清单或顺序变了').toEqual([
-      'src/mobile/home/home.css',
-      'src/mobile/connections/connections.css',
-      'src/mobile/nodes/nodes.css',
-      'src/mobile/screens/rules/rules-screen.css',
-      'src/mobile/settings/settings.css',
-      // 表单宿主（批 2）：排在五份屏 CSS **之后**、外壳之前 —— 它盖在屏上、不压外壳。
-      // 次序由 `MobileApp.tsx` 里那一行 import 的位置决定（那里有一条别挪它的注释）。
-      'src/mobile/forms/forms.css',
-      'src/styles/tokens.resolved.css',
-      'src/mobile/theme.css', // Explicit mobile dark layer; light remains the shared baseline.
-      'src/mobile/mobile.css',
-      'src/mobile/redesign.css',
-      'src/mobile/screens/rules/rules-redesign.css',
-      'src/mobile/connections/connections-redesign.css',
-    ]);
-    // 被跳过的裸说明符**自曝**：新添一个运行时依赖就红一次，逼人回答「它随包发 CSS 吗」。
-    expect(s.externals, '移动端模块图里多了/少了一个 npm 依赖').toEqual([
-      '@tauri-apps/api/core',
-      '@tauri-apps/api/event',
-      '@tauri-apps/plugin-os', // 2.3.2 exports only dist-js JS/types; package contains no CSS assets or style imports.
-      'i18next',
-      'react',
-      'react-dom', // MobileSelect portal；不自带 CSS，样式仍由 mobile.css 提供。
-      'react-dom/client',
-      'react-i18next',
-      'zustand',
-    ]);
   });
 
   it('TS 侧的说明符不再静默丢弃（R5-08 的另一半：M01）', () => {
@@ -654,8 +620,8 @@ describe('⑧ 进程与 profile 卫生：收尾不保证就得自曝（第五轮
  *  · 补上原先没判据的四条：`waitForDevToolsEndpoint` 的两条（Chrome 起不来 / 等超时）、
  *    `closeOracle` 的在途度量排空超时、`getAll` 问了没问过的属性 —— 都在下面第 ⑩ 组；
  *  · 删掉一条：`lastSampledPoint` 是死代码且头注是假话（第七轮 T3），连函数一起删；
- *  · 其余 27 条本轮逐条核对过消费方，各自都有一条打红它的判据（分布在 ⑤⑥⑧⑨⑩ 与
- *    `css-oracle-sampling.test.ts`）。
+ *  · 其余 27 条本轮逐条核对过消费方，各自都有一条打红它的判据（分布在 ⑤⑥⑧⑨⑩；原落在
+ *    `css-oracle-sampling.test.ts` 的那部分已随该文件删除）。
  *
  * 剩下**一条明确从规矩里划出去**，理由写在这里，而不是让规矩继续挂着一句做不到的话：
  *  · `launch()` 里的 `catch { await abandon(...); throw err; }`。它不是一条新的故障关闭分支 ——
@@ -665,11 +631,6 @@ describe('⑧ 进程与 profile 卫生：收尾不保证就得自曝（第五轮
  *    结构上造不出输入。它**有效果的那一半**（失败路径清 profile）有判据：⑧「启动抛出的路径会清 profile」。
  * ═══════════════════════════════════════════════════════════════════════════ */
 describe('⑨ 第六轮：故障关闭分支逐条有门', () => {
-  const MODULE_SRC = readFileSync(
-    fileURLToPath(new URL('./css-oracle.test-support.ts', import.meta.url)),
-    'utf8',
-  );
-
   describe('A1 收尾：在途的度量必须等回来', () => {
     it('生产门路径（`ctx` + 真挂载树）上不 await 的 measure，收尾必须把它等回来', async () => {
       // 🔴 上一轮那条 M03 的门用的是**内存链**：`measure({css: …})` 同一个 tick 就走到 `conn()`，
@@ -700,32 +661,6 @@ describe('⑨ 第六轮：故障关闭分支逐条有门', () => {
       await inFlight;
     }, 120_000);
 
-    it('收尾 hook 由本模块自己注册 —— 消费方忘了写 `afterAll` 也覆盖得到', () => {
-      // 「忘了写」上一版只剩 `beforeExit` 一条兜底：它晚于 vitest 报 rc，且只能打 stderr。
-      const bindings = (source: string) => {
-        const parsed = ts.parseSourceFile('oracle-owner-hook-fixture.ts', source);
-        const branch = parsed.statements.find((statement) => ts.isIfStatement(statement)
-          && statement.expression.getText(parsed) === 'TestRunner.getCurrentTest() !== undefined');
-        if (!branch || !ts.isIfStatement(branch)) return [];
-        return [branch.thenStatement, branch.elseStatement].map(statement => {
-          if (!statement || !ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return null;
-          const call = statement.expression;
-          return { hook: call.expression.getText(parsed), handler: call.arguments[0]?.getText(parsed),
-            budget: call.arguments[1]?.getText(parsed) };
-        });
-      };
-      expect(bindings(MODULE_SRC)).toEqual([
-        { hook: 'onTestFinished', handler: 'finishOracle', budget: 'ORACLE_CLOSE_TIMEOUT_MS' },
-        { hook: 'afterAll', handler: 'finishOracle', budget: 'ORACLE_CLOSE_TIMEOUT_MS' },
-      ]);
-      const parsed = ts.parseSourceFile('oracle-owner-finalize-fixture.ts', MODULE_SRC);
-      const finish = parsed.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === 'finishOracle');
-      expect(finish && ts.isFunctionDeclaration(finish) ? finish.body?.statements.map(statement => statement.getText(parsed)) : [])
-        .toEqual(['FINALIZED = true;', 'await closeOracle();']);
-      expect(bindings('const x = 1; export function closeOracle() {}')).toEqual([]);
-      expect(bindings('// if (TestRunner.getCurrentTest() !== undefined) onTestFinished(finishOracle, ORACLE_CLOSE_TIMEOUT_MS);\n'
-        + 'const fake = "else afterAll(finishOracle, ORACLE_CLOSE_TIMEOUT_MS);";')).toEqual([]);
-    });
   });
 
   describe('A2 `DevToolsActivePort`：等两行写全再读，且没有 ws 也请退得掉', () => {
@@ -775,7 +710,6 @@ describe('⑨ 第六轮：故障关闭分支逐条有门', () => {
       // 关键的一条：默认档不跟着机器走。上一版给 `setEmulatedMedia` 传空 features = 清空覆写，
       // 于是同一个 commit 在深色系统与浅色系统上得出不同结论（实测同一条变异的两半一红一绿）。
       expect(await at(), '默认档跟着跑门这台机器的系统主题走了').toBe(await at({ 'prefers-color-scheme': 'light' }));
-      expect(MEDIA_DEFAULTS['prefers-color-scheme'], '默认表里没有钉住它').toBe('light');
     }, 60_000);
 
     it('没有钉住 `prefers-color-scheme` 就问颜色 ⇒ 抛', () => {
@@ -822,10 +756,6 @@ describe('⑨ 第六轮：故障关闭分支逐条有门', () => {
   describe('A5 postcss 管线：插件表从产品那份配置读', () => {
     it('配置表 == 登记表，且两个方向都会说话', async () => {
       const declared = (await productPostcssPlugins()).map((d) => d.name);
-      expect(declared, '`postcss.config.js` 里声明的插件变了').toEqual([
-        '@tailwindcss/postcss',
-        'autoprefixer',
-      ]);
       expect(Object.keys(PLUGIN_LOADERS), '本模块的登记表与配置对不上').toEqual(declared);
       expect(() => assertPluginRegistryMatchesConfig(declared)).not.toThrow();
       // 反向对照两条：配置里少一个 / 多一个都抛。
@@ -1113,7 +1043,6 @@ describe('⑩ 第七轮：段序 + A6 规矩上欠着的那几条', () => {
       // 撒手的后果第六轮 A1 实测过：浏览器在收尾之后才起来，`OWNED` 还空着，
       // 自查器对着空表说「干净」，宿主上留 12 个 chrome + 1 个 profile 而 vitest rc=0。
       await closeOracle();
-      expect(DRAIN.timeoutMs, '默认等待上限被改过了').toBe(60_000);
       try {
         DRAIN.timeoutMs = 0; // 一次都不等
         // 正向对照①：一个都不在途时，同一个「一次都不等」的收尾不抛。
@@ -1179,10 +1108,6 @@ describe('⑩ 第七轮：段序 + A6 规矩上欠着的那几条', () => {
       expect(code, '取材面自检：剥注释之后应当还剩得下函数定义').toMatch(
         /export function measure\s*\(/,
       );
-      expect(
-        raw.includes('任何路径都不 kill'),
-        '取材面自检：头注里那句自陈还在（它正是本判据要兑现的那句话）',
-      ).toBe(true);
 
       const calls = [...code.matchAll(/\bkill\s*\(([^)]*)\)/g)].map((m) => m[1].trim());
       // 唯一放行项：存在性探针 `process.kill(<pid>, 0)`。

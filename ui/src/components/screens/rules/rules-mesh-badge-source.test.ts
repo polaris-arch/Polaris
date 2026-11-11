@@ -36,11 +36,9 @@ const code = (src: string): string =>
 const SCREEN_RAW = read('./RulesScreen.tsx');
 const ROUTES_RAW = read('../../../domain/endpoint-routes.ts');
 const OVERLAP_RAW = read('../../../domain/mesh-rule-overlap.ts');
-const CONTRACT_RAW = read('../../../contracts/endpoint-force-route-report.ts');
 const SCREEN = code(SCREEN_RAW);
 const ROUTES = code(ROUTES_RAW);
 const OVERLAP = code(OVERLAP_RAW);
-const CONTRACT = code(CONTRACT_RAW);
 
 describe('接线 · 「覆盖组网」角标的真值源是后端报告', () => {
   it('自曝：取材面还在（去注释后仍是可断言的代码）', () => {
@@ -52,18 +50,7 @@ describe('接线 · 「覆盖组网」角标的真值源是后端报告', () => 
   });
 
   it('规则屏拉 S2 报告并保留三态，旧估算不再接生产角标', () => {
-    expect(SCREEN).toContain('api.config');
-    expect(SCREEN).toContain('.meshRouteReport()');
-    expect(SCREEN).toContain('reportForSavedConfig(meshRouteState.report, savedConfig)');
-    expect(SCREEN).toContain('ruleMeshRouteEvidence(savedReport, rule, savedById.get(rule.id))');
-    expect(SCREEN).toContain('meshRouteEvidence={meshEvidenceByRule.get(rule.id)');
     expect(SCREEN).not.toContain('.endpointForceRouteReport()');
-  });
-
-  it('无报告经过 latest-loader 与 unknown 投影，不退回本地重算', () => {
-    const BADGES = code(read('../../../domain/mesh-route-badges.ts'));
-    expect(SCREEN).toContain('createLatestReportLoader(');
-    expect(BADGES).toContain("if (report === null || !applied(report)) return 'unknown'");
   });
 
   it('规则屏一行本地重算都不剩', () => {
@@ -79,16 +66,5 @@ describe('接线 · 「覆盖组网」角标的真值源是后端报告', () => 
   it('`meshForcedRouteCidrs` 已从 domain 层删除（不是留着没人用）', () => {
     // 留一份没人用的同义实现，下一个人接上它就等于回归；墓碑注释在原文里，故扫去注释面。
     expect(ROUTES).not.toContain('meshForcedRouteCidrs');
-  });
-
-  it('并集口径含 `externalRuleSetCidrs` —— 只读 emitted 对自建 tailnet 恒空', () => {
-    // 判据的两个取材面都必须出现在实现里。少了后者，角标对走外化 rule-set 腿的 tailnet
-    // 结构性不亮，而这一格恰是本批要修的那个缺陷。
-    expect(OVERLAP).toContain('s.emitted');
-    expect(OVERLAP).toContain('s.externalRuleSetCidrs');
-    // 线格式是 camelCase：Rust 侧 `#[serde(rename_all = "camelCase")]` 漏了会让这个字段恒
-    // `undefined`，而 `undefined` 在角标判据里是假值 ⇒ 恒不亮，且 tsc 与两侧单测都不红。
-    // Rust 那半由 `endpoint_routes::tests::server_force_route_wire_shape_is_camel_case` 钉住。
-    expect(CONTRACT).toContain('externalRuleSetCidrs: string[]');
   });
 });

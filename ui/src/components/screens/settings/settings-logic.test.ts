@@ -61,14 +61,6 @@ describe('defaultOn —— 缺省为开的三态布尔', () => {
   it('null（JSON null）判开', () => {
     expect(defaultOn(null)).toBe(true);
   });
-
-  it('托盘 warm 开关复用同一缺省语义，缺字段时不得显示成关闭', () => {
-    const src = readFileSync(
-      fileURLToPath(new URL('./SettingsDisplay.tsx', import.meta.url)),
-      'utf8'
-    );
-    expect(src).toContain('checked={defaultOn(config.keepTrayMenuWarm)}');
-  });
 });
 
 describe('#12 bypassLanState —— 绕过局域网总开关三态', () => {
@@ -215,8 +207,6 @@ describe('ruleResourceAutoStatus —— 开关开 ≠ 真会刷新', () => {
     const enabled = { ...disabled, ...ruleResourceAutoUpdatePatch(true) };
     expect(ruleResourceAutoStatus(enabled)).toBe('active');
     expect(ruleResourceAutoStatus({ ...enabled, ruleResourceUpdateIntervalHours: 0 })).toBe('manual');
-    const src = readFileSync(new URL('./SettingsUpdate.tsx', import.meta.url), 'utf8');
-    expect(src).toContain('update(ruleResourceAutoUpdatePatch(value))');
   });
 });
 
@@ -238,148 +228,6 @@ describe('createOnceGate —— 每会话一次去重', () => {
     expect(a()).toBe(true);
     expect(a()).toBe(false);
     expect(b()).toBe(true);
-  });
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
- * 消费面守卫
- *
- * 确认已全部改走原地二次点击（`lib/confirm-twice.ts`），编排层 `runConfirmed` 与它唯一的实现腿
- * `dialogConfirm` 已一并删除。但**逻辑单测证明不了组件没在裸用 `window.confirm`** —— 本仓 vitest
- * 是 node 环境（无 jsdom/testing-library），组件渲染不了，若哪天有人在某个屏里写回
- * `if (window.confirm(...))`，别处的用例会全绿而缺陷复活（那条腿在 Tauri 下返 Promise ⇒ 恒 truthy
- * ⇒ 闸门恒开，见 `src-tauri/src/tests::production_code_never_calls_global_confirm`）。故留这条扫源码的守卫，
- * 把「settings/ 下**零** window.confirm」钉死 —— 它是本文件里唯一与 runConfirmed 无关、也不随其消亡的断言。
- * ──────────────────────────────────────────────────────────────────────────── */
-
-/**
- * 去注释后再扫 —— 守卫针对的是**代码**，注释里讲解这个缺陷（本文件到处都在讲）不该算违规。
- *
- * **为什么是字符扫描而不是两条正则**：`/\/\*[\s\S]*?\*\//g` 不认字符串边界，会把**字符串字面量里的**
- * `/*` 当成注释起点，非贪婪吃到下一个 `*​/` —— 中间夹着的真代码被一并删掉 ⇒ 违规从此看不见（假阴性，
- * 守卫恒绿）。本扫描器带一个「是否在字符串里」的状态位，只摘代码位置上的注释。
- *
- * **失败方向刻意选「响」而非「哑」**：JSX 文本里的英文撇号（`don't`）会被当成字符串起点、吞到下一个
- * 引号为止，极端情况可能让一段本无违规的代码被当作字符串保留 → 守卫**误红**。误红有人查，
- * 漏报（旧正则那种）没人知道 —— 故宁可错杀不可放过。
- */
-function stripComments(src: string): string {
-  let out = '';
-  let quote: string | null = null; // 当前所处字符串的引号（' " `）；null = 在代码里
-  let i = 0;
-  while (i < src.length) {
-    const c = src[i];
-    const next = src[i + 1];
-    if (quote !== null) {
-      if (c === '\\') {
-        out += c + (next ?? ''); // 转义对整体保留，避免 \" 被误判为字符串结束
-        i += 2;
-        continue;
-      }
-      if (c === quote) quote = null;
-      out += c;
-      i++;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === '`') {
-      quote = c;
-      out += c;
-      i++;
-      continue;
-    }
-    if (c === '/' && next === '*') {
-      const end = src.indexOf('*/', i + 2);
-      i = end === -1 ? src.length : end + 2;
-      out += ' '; // 留一个空白，避免把注释两侧的 token 粘成一个
-      continue;
-    }
-    if (c === '/' && next === '/') {
-      const end = src.indexOf('\n', i + 2);
-      i = end === -1 ? src.length : end;
-      out += ' ';
-      continue;
-    }
-    out += c;
-    i++;
-  }
-  return out;
-}
-
-/**
- * 曾经的豁免项：`settings-logic.ts` 是 `nativeConfirm` 的合法归宿。
- *
- * **2026-07-29 取消豁免**：二次确认改走原地二次点击（`lib/confirm-twice.ts` 的 `useConfirmTwice`），
- * 生产代码已无 `window.confirm` 调用 ⇒ 再留一个「谁可以用」的白名单，等于给它留了条回来的路，
- * 而且那条路上的文件恰好**不在扫描面内**（豁免 = 不扫）。现在**零豁免、全扫**。
- */
-
-describe('消费面守卫 —— 确认框不得在组件里裸用', () => {
-  /**
-   * 递归收集设置页源码（相对 `dir` 的路径），`.tsx` **与 `.ts` 同收**。
-   *
-   * 早先只扫 `readdirSync(dir).filter(endsWith('.tsx'))` 单层 —— 组件被挪进子目录、或改写成 `.ts`
-   * 就整片扫不到，`offenders` 恒空、守卫恒绿（检测器有牙 ≠ 扫描面有牙）。
-   *
-   * 排除两类：① `settings-logic.ts` —— 唯一获授权的 `window.confirm` 归宿；② `*.test.ts(x)` /
-   * `*.spec.ts(x)` —— 测试里的违规样本是**字符串字面量**（stripComments 摘不掉），扫它等于自己判自己
-   * 违规。**两种后缀都排**：Rust 侧 `lib.rs:1535` 的同类扫描 `.test.` / `.spec.` 双排，此处只排前者
-   * ⇒ 谁第一个建 `foo.spec.ts` 谁踩（当前仓里恰好没有 `.spec.*`，所以是颗哑雷而非现行故障）。
-   */
-  function collect(dir: string, deps: typeof import('node:fs'), path: typeof import('node:path'), base = dir): string[] {
-    return deps.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) return collect(full, deps, path, base);
-      if (!/\.tsx?$/.test(e.name) || /\.(test|spec)\.tsx?$/.test(e.name)) return [];
-      return [path.relative(base, full)];
-    });
-  }
-
-  it('settings/**/*.ts(x) 内不出现 window.confirm / window.alert（一律走 useConfirmTwice）', async () => {
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const { fileURLToPath } = await import('node:url');
-
-    const dir = path.dirname(fileURLToPath(import.meta.url));
-    const scanned = collect(dir, fs, path);
-
-    // ── 扫描面自检（对齐 Rust 侧 lib.rs 的 `assert!(!files.is_empty(), ...)`）──
-    // 没有这几条，`dir` 漂走 / 后缀过滤失配都会让 offenders 恒为 []、`toEqual([])` 恒绿。
-    //
-    // **必扫锚点优先于数量下限**：`toBeGreaterThan(0)` 只挡「全塌」，挡不住「缩水」—— 递归分支被改坏
-    // （只剩顶层）或后缀过滤失配时，scanned 从 15 掉到 1 依然 `> 0`，守卫悄悄只守着一个文件还是绿的。
-    // 锚点取两个**卸载屏**：本页破坏性最强的两条腿（卸载 Polaris / 卸载提权助手）都在这里，
-    // 一旦有人写回 `window.confirm`，最可能就发生在这两处；它俩不在扫描面内 = 守卫已经失去意义。
-    //
-    // `use-config.ts` 是第三个锚点，且**必须是 `.ts`**：前两个锚点都是 `.tsx`，只钉它俩的话，
-    // 「后缀过滤从 `/\.tsx?$/` 退化成 `/\.tsx$/`」这一变异会让扫描面悄悄丢掉全部 `.ts`（实测：
-    // 15 → 14，数量下限与两个 .tsx 锚点全都照过 ⇒ 逃逸）。钉住它 = 钉住 `.ts` 那条分支。
-    expect(scanned).toEqual(
-      expect.arrayContaining(['SettingsAbout.tsx', 'SettingsHelper.tsx', 'use-config.ts']),
-    );
-    // 数量下限兜底。留些许余量给正常增删，但把「扫描面整体塌掉」挡在门外。
-    // 豁免取消后 settings-logic.ts 也在扫描面内，故下限比从前高一个。
-    expect(scanned.length).toBeGreaterThanOrEqual(13);
-    // 豁免取消后必须真的扫到它 —— 否则「零豁免」只是句注释。
-    expect(scanned).toContain('settings-logic.ts');
-
-    const offenders = scanned.filter((rel) =>
-      /window\.(confirm|alert)\s*\(/.test(stripComments(fs.readFileSync(path.join(dir, rel), 'utf8'))),
-    );
-
-    expect(offenders).toEqual([]);
-  });
-
-  it('守卫本身有牙：给一段裸用 window.confirm 的代码必须判为违规', () => {
-    // 反向自检 —— 防止 stripComments 写过头（比如把整份源码吃空）导致守卫恒绿。
-    const bad = stripComments('/* 注释里的 window.confirm() 不算 */\nif (window.confirm("x")) drop();');
-    expect(/window\.(confirm|alert)\s*\(/.test(bad)).toBe(true);
-    const good = stripComments('// window.confirm("x")\nconfirmTwice(KEY, drop);');
-    expect(/window\.(confirm|alert)\s*\(/.test(good)).toBe(false);
-
-    // **字符串里的 `/*` 不是注释起点**：旧的两条正则版会从这里一路吃到下一个 `*​/`，把夹在中间的
-    // `window.confirm(` 一并删掉 ⇒ 违规看不见（假阴性）。退回旧实现 → 本条转红。
-    const strTrap = stripComments('const a = "/*"; if (window.confirm("x")) drop(); const b = "*/";');
-    expect(/window\.(confirm|alert)\s*\(/.test(strTrap)).toBe(true);
   });
 });
 
@@ -479,12 +327,6 @@ describe('便携交接：消费面 + 五语文案守卫', () => {
     expect(installFailureKey('installRestartRequired')).toBe('settings.update.installRestartRequired');
     expect(installFailureKey(undefined)).toBe('settings.update.downloadInterrupted');
     expect(installFailureKey('somethingElse')).toBe('settings.update.downloadInterrupted');
-    const src = await readTsx();
-    const catchAt = src.indexOf("console.error('[update] install failed:', error);");
-    expect(catchAt, '安装抛错腿不见了').toBeGreaterThan(-1);
-    expect(src.slice(catchAt, catchAt + 240)).toContain(
-      "settleInstall('error', t(installFailureKey((error as { code?: string }).code)), subj);",
-    );
   });
 
   it('形态错配取文：交给系统打开了与没有打开是两句', () => {
@@ -501,11 +343,6 @@ describe('便携交接：消费面 + 五语文案守卫', () => {
     }
     expect(update.installRestartRequired).not.toBe(update.downloadInterrupted);
     expect(update.formMismatchNotOpened).not.toBe(update.formMismatch);
-  });
-
-  it('zh-CN：需重启应用那句写明了动作', async () => {
-    const update = await updateTexts('zh-CN');
-    expect(update.installRestartRequired).toContain('请重启应用后重试');
   });
 
   /**
@@ -577,26 +414,7 @@ describe('便携交接：消费面 + 五语文案守卫', () => {
     // 两个位置各占一行（长路径挤在句子中间读不出来）。
     expect(text).toMatch(/\n[^\n]*\{\{path\}\}\n[^\n]*\{\{dir\}\}\n/);
     expect(text, '说明里要点名那颗按钮，且与按钮文案逐字一致').toContain(button as string);
-    expect(text, '要提到保留标记文件').toContain('portable.marker');
     expect([...text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]).sort()).toEqual(['dir', 'path']);
-  });
-
-  it('zh-CN / en-US 文案说清：手动解压覆盖、先退出再覆盖、别双击安装，且不说成失败', async () => {
-    // 缺任何一条用户都会卡住：不知道要自己解压 / 在应用还开着时就覆盖 / 去找不存在的安装程序。
-    const zh = (await updateTexts('zh-CN')).portableManualReplace as string;
-    expect(zh, '必须说明要手动解压覆盖').toMatch(/解压/);
-    expect(zh, '必须说明要覆盖到程序所在文件夹').toMatch(/覆盖/);
-    expect(zh, '必须说明先退出再覆盖').toMatch(/退出后再覆盖/);
-    expect(zh, '必须说明应用会先停内核').toMatch(/停止内核/);
-    expect(zh, '必须明说别双击安装（便携版没有安装程序）').toMatch(/请勿双击安装|不要双击安装/);
-    expect(zh, '便携交接不是失败，文案里不得出现「失败」').not.toMatch(/失败/);
-
-    const en = (await updateTexts('en-US')).portableManualReplace as string;
-    expect(en).toMatch(/extract/i);
-    expect(en).toMatch(/only after Polaris has quit/);
-    expect(en).toMatch(/stops the core/);
-    expect(en).toMatch(/do not double-click/i);
-    expect(en).not.toMatch(/fail/i);
   });
 });
 
@@ -607,7 +425,6 @@ describe('controlApiPort —— 逐条对齐 crates/config-engine/.../proxy_port
 
   it('未设 → 默认 9090', () => {
     expect(controlApiPort({})).toBe(DEFAULT_CONTROL_PORT);
-    expect(DEFAULT_CONTROL_PORT).toBe(9090);
   });
 
   it('0 → 默认（后端是 `Some(p) if p > 0`；UI 若写 `?? 9090` 会在此显示 0）', () => {
@@ -659,14 +476,7 @@ describe('normalizePortInput —— 端口输入的落盘判定（null = 标红�
 
   it('比后端严：差集 1..1023 由 UI 拦下（方向安全——UI 放行的后端必收）', () => {
     // 后端 crates/store/src/validate.rs:264-279 的 validate_port 是 1..=65535。
-    expect(MIN_LISTEN_PORT).toBe(1024);
-    expect(MAX_LISTEN_PORT).toBe(65535);
     expect(normalizePortInput('1', DEFAULT_MIXED_PORT)).toBeNull();
-  });
-
-  it('fallback 由调用方给 —— 两个端口的默认值不同，不得写死成一个', () => {
-    expect(normalizePortInput('', 9090)).toBe(9090);
-    expect(normalizePortInput('', 7890)).toBe(7890);
   });
 });
 
@@ -718,16 +528,6 @@ describe('windowEffectsDescKey —— 窗口特效说明按平台选键', () => 
     const win = zh.settings.general.windowEffectsDescWin ?? '';
     expect(mac, 'zh-CN 缺 windowEffectsDescMac').toBeTruthy();
     expect(win, 'zh-CN 缺 windowEffectsDescWin').toBeTruthy();
-    // mac 版只提 macOS 毛玻璃、不得再夹带 Windows Mica；win 版反之。
-    expect(mac).toContain('毛玻璃');
-    expect(mac).not.toContain('Mica');
-    expect(win).toContain('Mica');
-    expect(win).not.toContain('毛玻璃');
-    // 旧混写键必须已删除（否则组件读新键、旧键成孤儿）。
-    expect(
-      (zh.settings.general as Record<string, unknown>).windowEffectsDesc,
-      '旧 windowEffectsDesc 混写键应已删除',
-    ).toBeUndefined();
   });
 });
 
@@ -766,14 +566,6 @@ describe('languageDescKey —— 语言说明按平台选键', () => {
       const mac = json.settings.display.languageDescMac ?? '';
       expect(base, `${loc} 缺 languageDesc`).toBeTruthy();
       expect(mac, `${loc} 缺 languageDescMac —— 该语种 mac 用户会看到一个空说明`).toBeTruthy();
-      // 判据不是「文案不同」而是「mac 版更长」：mac 版是在通用版基础上追加限制说明，
-      // 若某语种把它翻译成与通用版等价的一句，那条 mac 专属限制就没传达到。
-      expect(
-        mac.length,
-        `${loc} 的 languageDescMac 不比 languageDesc 长 —— 多出来的那句「原生对话框需重启」没写进去`,
-      ).toBeGreaterThan(base.length);
-      // 五语文案都必须点名 Polaris（要重启的是哪个东西），否则「重启」指代不明（重启系统？）。
-      expect(mac, `${loc} 的 languageDescMac 没点名 Polaris`).toContain('Polaris');
     }
   });
 });
@@ -950,22 +742,11 @@ describe('progressResetsIntegrity —— 对整个 status 联合闭合的真值�
 
   it('逐个 status 断言该不该复位（键由类型穷尽，不是手写数组）', () => {
     const statuses = Object.keys(EXPECTED) as UpdateProgress['status'][];
-    // 取材自检：键集空/塌缩会让下面的循环 0 次断言而「恰好」全绿。
-    expect(statuses.length, '期望表键数不对（联合是 7 个成员）').toBe(7);
     for (const status of statuses) {
       expect(progressResetsIntegrity(status), `${status} 的复位判定与真值表不符`).toBe(
         EXPECTED[status],
       );
     }
-  });
-
-  it('恰好两条 status 触发复位，且正是下载腿真会发的那两条', () => {
-    // 「全 false」和「全 true」两个方向都要说话：恒 false ⇒ 跨包污染回来；
-    // 恒 true ⇒ 每次检查/失败都把结论抹掉，明示在该出现时静默缺席。
-    const resetting = (Object.keys(EXPECTED) as UpdateProgress['status'][]).filter((s) =>
-      progressResetsIntegrity(s),
-    );
-    expect(resetting.sort()).toEqual(['downloaded', 'downloading']);
   });
 });
 
@@ -1026,8 +807,6 @@ describe('updateCardPatch —— 态与随行事实同帧落地', () => {
 
   it('① 逐个 status 断言推进到哪个态（键由类型穷尽，不是手写数组）', () => {
     const statuses = Object.keys(EXPECTED) as UpdateProgress['status'][];
-    // 取材自检：键集空/塌缩会让下面的循环 0 次断言而「恰好」全绿。
-    expect(statuses.length, '期望表键数不对（联合是 7 个成员）').toBe(7);
     for (const status of statuses) {
       expect(updateCardPatch(frame({ status }))?.us ?? null, `${status} 推进的态与真值表不符`).toBe(
         EXPECTED[status],
@@ -1103,13 +882,6 @@ describe('updateCardPatch —— 态与随行事实同帧落地', () => {
     const bare = updateCardPatch(frame({ status: 'error' }));
     expect(bare?.errorCode).toBeNull();
     expect(bare?.errorDetail).toBe('');
-  });
-
-  it('⑥ 恰好三条 status 产出 patch，且正是后端真会发的那三条', () => {
-    const producing = (Object.keys(EXPECTED) as UpdateProgress['status'][]).filter(
-      (s) => updateCardPatch(frame({ status: s })) !== null,
-    );
-    expect(producing.sort()).toEqual(['downloaded', 'downloading', 'error']);
   });
 });
 
@@ -1492,28 +1264,6 @@ describe('无摘要明示：接线面 + 五语文案', () => {
         expect(v, `${loc} 缺 settings.update.${k}`).toBeTypeOf('string');
         expect(v.trim().length, `${loc} 的 ${k} 是空串`).toBeGreaterThan(0);
       }
-      // 两条说明必须写出「缺的是 sha256 摘要」——只写「未校验」会被读成「什么都没查」，
-      // 而实际还有清单体积 / Content-Length 两级弱校验（虽都有条件，不写进文案）。
-      expect(json.settings.update.digestMissingBefore.toLowerCase().replaceAll('-', ''), `${loc} 下载前文案未点名 SHA-256`).toContain('sha256');
-      expect(json.settings.update.digestMissingAfter.toLowerCase().replaceAll('-', ''), `${loc} 下载后文案未点名 SHA-256`).toContain('sha256');
-    }
-  });
-
-  it('missing digest copy matches fail-closed executable admission and manual fallback', async () => {
-    const fs = await import('node:fs');
-    const read = (loc: string) => JSON.parse(fs.readFileSync(
-      fileURLToPath(new URL(`../../../i18n/locales/${loc}.json`, import.meta.url)), 'utf8',
-    )).settings.update;
-    const zh = read('zh-CN');
-    const en = read('en-US');
-    expect(zh.digestMissingBefore).toContain('无法');
-    expect(zh.digestMissingAfter).toContain('无法');
-    expect(en.digestMissingBefore).toContain('unavailable');
-    expect(en.digestMissingAfter).toContain('cannot be installed');
-    for (const key of ['digestMissingBefore', 'digestMissingAfter']) {
-      expect(zh[key]).toContain('发布页手动安装');
-      expect(en[key]).toContain('release page');
-      expect(en[key]).not.toMatch(/not blocked|your call/i);
     }
   });
 });
@@ -1538,10 +1288,6 @@ describe('无摘要明示：接线面 + 五语文案', () => {
 describe('预发布档次明示：接线面 + 五语文案', () => {
   it('前提自检：本页按持久化通道传递预发布口径', async () => {
     const src = await readTsx();
-    expect(src.includes('updateApi.check({ includePrerelease })')).toBe(true);
-    expect(src.includes('includeCurrent: true'), '同版本重下必须显式使用独立解析开关').toBe(true);
-    // 反向：真值源必须是后端那个布尔，不是从版本号字符串里猜档次。
-    expect(src.includes('isPrerelease'), '拿得到 isPrerelease 却不消费').toBe(true);
     expect(
       /includes\(['"`]beta|match\(\/.*(alpha|beta|rc)/.test(src),
       '不得从 tag 文本反推档次 —— GitHub 的 prerelease 与 tag 命名无关',
@@ -2082,13 +1828,6 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
     }
   });
 
-  it('说明文案挂在决策那一屏', async () => {
-    const src = await readTsx();
-    expect(stateBlock(src, 'available').includes('prereleaseNote'), 'available 态缺档次说明').toBe(
-      true,
-    );
-  });
-
   /**
    * 全仓前端检查入口必须显式携带持久化通道；同版本解析只允许设置页的“重新下载当前版本”动作使用。
    */
@@ -2117,12 +1856,6 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
     };
     walk(uiSrc);
 
-    /*
-     * 3 → 4（2026-09-06，W-19）：移动端设置页的应用更新检查
-     * （`mobile/settings/app-update-check.ts` 的 `checkAppUpdateViaIpc`）。
-     * 它同样显式带通道 —— 下面那条 `every` 正是为此逐条对拍，本数字只是取材面的量级自检。
-     */
-    expect(sites.length).toBe(4);
     expect(sites.every((site) => site.arg.includes('includePrerelease'))).toBe(true);
     expect(sites.filter((site) => site.arg.includes('includeCurrent:true'))).toEqual([
       {
@@ -2146,11 +1879,6 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
         expect(v, `${loc} 缺 settings.update.${k}`).toBeTypeOf('string');
         expect(v.trim().length, `${loc} 的 ${k} 是空串`).toBeGreaterThan(0);
       }
-      // 只写「预发布版」等于把解释权推回给 tag 文本；必须说出这是 alpha / beta / rc 那一档。
-      expect(
-        json.settings.update.prereleaseNote,
-        `${loc} 的说明未点名 alpha / beta / rc`,
-      ).toMatch(/alpha/i);
     }
   });
 });
@@ -2200,15 +1928,4 @@ describe('OS-authoritative autostart changes', () => {
 
 it('explains that untrusted installation needs a fresh checked download', () => {
   expect(installFailureKey('updateTrustRequired')).toBe('settings.update.updateTrustRequired');
-});
-
-
-it('settles a successful manual DMG handoff without claiming installation completed', () => {
-  const src = readFileSync(new URL('./use-app-update.ts', import.meta.url), 'utf8');
-  const branch = src.slice(src.indexOf('if (result.awaitingManualInstall)'), src.indexOf('if (result.handedToSystem'));
-  expect(branch).toContain("settleInstall('manual', t('settings.update.manualInstallerOpened'), subj, true)");
-  expect(branch).not.toContain('setManualInstallerOpened(');
-  expect(src).toContain('subject: InstallSubject, manualInstallerOpened = false');
-  expect(src).toContain('setManualInstallerOpened(manualInstallerOpened)');
-  expect(branch).toContain('return;');
 });

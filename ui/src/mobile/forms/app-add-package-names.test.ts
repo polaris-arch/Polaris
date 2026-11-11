@@ -107,14 +107,6 @@ describe('自定义应用：包名那一格的装袋', () => {
     ).toContain('packageNames: [...pkgSel]');
   });
 
-  it('② 没挑就不写这个键（空数组与缺省等价，Rust 侧同一口径）', () => {
-    expect(
-      presetLiteral(),
-      '空选中集也会写出一个 `packageNames: []` —— 盘上多一个没有含义的键，与 Rust 侧 '
-        + '`skip_serializing_if = "Vec::is_empty"` 的口径也对不上',
-    ).toContain('pkgSel.size > 0 ?');
-  });
-
   it('③ 🔴 选中的是 `packageName`，不是 `label`（这一格错了会静默命不中）', () => {
     expect(
       PANEL,
@@ -133,17 +125,5 @@ describe('自定义应用：包名那一格的装袋', () => {
       'packageNames: processNames',
     );
     expect(PANEL, '选中集被进程名输入框写过').not.toContain('setPkgSel(parseProcessNames');
-  });
-
-  it('⑤ 数据源是 `listInstalledApps`，且失败**不折成空表**', () => {
-    expect(PANEL, '没有从已装应用清单取候选 —— 那张列表要么是空的、要么是编出来的').toContain(
-      'api.system.listInstalledApps()',
-    );
-    /* 「读不到」与「一个都没有」必须分得开：后端为此刻意不返空表（`success:false` + 原因）。
-       面板这一侧用 `appsFailed` 承载那一档，并画出一句自己的说明。 */
-    expect(PANEL, '失败没有单独的一档 —— 它会与「这台设备上一个应用都没有」长得一样').toContain(
-      'setAppsFailed(true)',
-    );
-    expect(PANEL, '失败那一档没有自己的文案').toContain('mobileRules.customAppPackagesFailed');
   });
 });

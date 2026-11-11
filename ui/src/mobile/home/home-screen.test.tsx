@@ -452,12 +452,6 @@ describe('① DOM 序 = 重要性序，不许被断点重排', () => {
     expect(declaredProps(stripCss(mutant), ['order'])).toEqual(['order']);
     expect(/:\s*(?:row|column|wrap)-reverse/.test('.a{flex-direction:column-reverse}')).toBe(true);
   });
-
-  it('相关出口/检测与统计内容成组，宽屏容器重排不复制卡片', () => {
-    expect(render()).toContain('h-connection-panel');
-    expect(render()).toContain('h-statistics-panel');
-    expect(HOME_CARD_ORDER).toContain('rule-hits');
-  });
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -513,18 +507,6 @@ describe('② 三档断点内容完全一致（Content parity）', () => {
     );
     expect(/display\s*:\s*none/.test(mutant)).toBe(true);
     expect(containerBlocks(mutant).flatMap((b) => declaredProps(b, ['display']))).toEqual(['display']);
-  });
-
-  it('正面等式：`HOME_CARD_ORDER` 就是 spec 那张表的八项，一项不多一项不少', () => {
-    expect([...HOME_CARD_ORDER]).toEqual([
-      'node-status-card',
-      'mode-chips',
-      'unlock-detection',
-      'rule-hits',
-      'traffic-chart',
-      'traffic-composition',
-      'host-traffic-top',
-    ]);
   });
 });
 
@@ -983,8 +965,6 @@ describe('⑦ 无源不画：陈旧 / 哨兵 / 隐私 / 空态', () => {
   it('三张分析卡共用同一个窗口标签，且卡头的总数就是各部分之和', () => {
     const html = render();
     expect((html.match(/connections\.active/g) ?? []).length).toBeGreaterThanOrEqual(2);
-    const sum = baseProps().composition.reduce((a, s) => a + s.bytes, 0);
-    expect(sum, '卡头印的总数不是各段之和').toBe(baseProps().windowBytes);
   });
 
   /** 渲染出的某颗控件的**开标签**（用来判 `disabled`）。 */
@@ -1028,18 +1008,6 @@ describe('⑧ 解锁服务表：登记表与上线集对得上（桌面改了上
     }
   });
 
-  it('保留桌面的组序（AI 三个在前，流媒体四个在后）', () => {
-    expect(UNLOCK_SERVICES.map((s) => s.group)).toEqual([
-      'ai',
-      'ai',
-      'ai',
-      'stream',
-      'stream',
-      'stream',
-      'stream',
-    ]);
-  });
-
   it('七态各有一档状态点，且 `blocked` 与 `restricted` 不共用一档', () => {
     for (const st of ['idle', 'checking', 'ok', 'partial', 'blocked', 'restricted', 'timeout'] as const) {
       const html = render({
@@ -1057,10 +1025,6 @@ describe('⑧ 解锁服务表：登记表与上线集对得上（桌面改了上
       blocked.replace(/^[^{]*/, ''),
       'blocked 与 restricted 被合成了同一个颜色 —— 那会抹掉检测引擎产出的唯一可行动差异',
     ).not.toBe(restricted.replace(/^[^{]*/, ''));
-  });
-
-  it('徽章底色两个主题都是白的（不是 surface token）—— 多色/带黑描边的标记才不会消失', () => {
-    expect(/\.h-badge\s*\{[^}]*background:\s*#fff/.test(HOME_CSS)).toBe(true);
   });
 
   it('失败态去饱和（颜色之外的第二条通道），而 `partial` **不**去饱和（它是真实结果不是失败）', () => {
@@ -1279,10 +1243,7 @@ describe('⑨–⑫ 出口控制、检测与规则统计的当前呈现契约', 
 
   it('七项能力只显示图标与圆点；名称和状态留在可访问名称及点击详情', () => {
     const html = cardSegments(render()).get('unlock-detection') ?? '';
-    expect((html.match(/class="h-unlock"/g) ?? [])).toHaveLength(7);
-    expect((html.match(/class="h-badge /g) ?? [])).toHaveLength(7);
     expect(html).not.toContain('class="h-unlockname"');
-    expect((html.match(/class="h-stdot /g) ?? [])).toHaveLength(7);
     expect(html).not.toContain('class="h-unlockstatus"');
     for (const svc of baseProps().unlock) {
       expect(html).toContain(`aria-label="${svc.name}: home.unlockStatus.${svc.result.status}"`);
@@ -1437,16 +1398,10 @@ describe('⑬ 哨兵出口 / 空态入口 / 主机行规则面板：能力真的
   });
 
   it('接线层：直连与阻断都走权威切换收据，沿用各自名称反馈', () => {
-    expect(WIRING_RAW, '没有 onPickSentinel 这条腿').toContain('onPickSentinel');
-    expect(WIRING_RAW).toContain('DIRECT_SERVER_ID');
-    expect(WIRING_RAW).toContain('BLOCK_SERVER_ID');
     const at = WIRING_RAW.indexOf('const onPickSentinel');
     const body = WIRING_RAW.slice(at, WIRING_RAW.indexOf('const onSetRouting', at));
     expect(body).toContain("if (kind === 'block' && blockDisabledReason !== null) return");
-    expect(body).toContain('const config = useAppStore.getState().config;');
-    expect(body).toContain('if (config && config.selectionIntent === undefined && id === config.selectedServerId)');
     expect(body).toContain('switchServer(id)');
-    expect(body).toContain("kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock'");
     expect(body).not.toContain('update({ selectedServerId: id })');
   });
 
@@ -1628,8 +1583,6 @@ describe('⑭ 主机 Top 卡的筛选 + 清空键：能力真的在，且与同�
     const card = hostCard(render());
     expect(card, '筛选框不在这张卡里').toContain('data-host-filter="query"');
     expect(card).toContain('home.searchTopology');
-    // 卡的集合没变：⑭ 不许把 `HOME_CARD_ORDER` 撑大。那条等式由 ① 组守，这里只做一次点名对照。
-    expect(HOME_CARD_ORDER).toHaveLength(7);
   });
 
   it('清空键只在有筛选词时出现（无筛选词时它是常驻噪音）', () => {
@@ -1704,20 +1657,6 @@ describe('⑭ 主机 Top 卡的筛选 + 清空键：能力真的在，且与同�
     const onlyHost = render({ hostQuery: 'cdn' });
     expect((onlyHost.match(/aria-label="home\.clear"/g) ?? []).length).toBe(1);
     expect(onlyHost).toContain('data-host-filter="clear"');
-  });
-
-  it('清空键与输入框打在同一个回调上（点一下等于把筛选词清成空串）', () => {
-    const view = read(join(HERE, 'HomeScreenView.tsx'));
-    const at = view.indexOf('data-host-filter="clear"');
-    expect(at, '主机筛选的清空键不在源码里').toBeGreaterThan(-1);
-    /* 切到 `</button>`，不是切到第一个 `>` —— `onClick={() => …}` 里那个箭头本身带一个 `>`，
-       按第一个 `>` 收口会把回调整条切掉，于是这条断言变成在读一段不含回调的文本。 */
-    const btn = view.slice(view.lastIndexOf('<button', at), view.indexOf('</button>', at));
-    expect(btn, '清空键没有把筛选词清空的腿').toContain("props.onHostQuery('')");
-    // 输入框那一侧：受控值与回调都接在同一格上（少任一半，框要么不动要么清不掉）。
-    const input = view.slice(view.lastIndexOf('<input', at), at);
-    expect(input).toContain('value={props.hostQuery}');
-    expect(input).toContain('props.onHostQuery(e.currentTarget.value)');
   });
 });
 

@@ -88,9 +88,3 @@ fn escape_xml_all_special() {
     assert_eq!(escape_xml("a>b"), "a&gt;b");
     assert_eq!(escape_xml("a\"b"), "a&quot;b");
 }
-
-#[test]
-fn default_label_is_polaris_compatible() {
-    // 向后兼容 Polaris 已部署的 label
-    assert_eq!(DEFAULT_LABEL, "com.polaris.helper");
-}

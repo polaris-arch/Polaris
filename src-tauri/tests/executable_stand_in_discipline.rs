@@ -220,12 +220,6 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
         1,
         "断言生产代码生成的脚本文本，不落盘",
     ),
-    (
-        "src-tauri/src/test_support/tests/mod.rs",
-        Kind::Copy,
-        2,
-        "复制 .rs 源文件做取材面副本",
-    ),
 ];
 
 /// 这些文件里的共用办法调用数下限：防「调用点全没了，三条判据在空集上恒真」。

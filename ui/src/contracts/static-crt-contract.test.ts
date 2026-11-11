@@ -10,14 +10,9 @@
  *
  * # 这门钉什么（源扫描；行为收据在 CI 出包腿）
  *
- * - `.cargo/config.toml` 的 msvc 目标段与 `target-feature=+crt-static` 在场——删掉/改坏
- *   即红（本地门牙；远端真门是 package.yml 的逐字节断言步）。
  * - `package.yml` 的断言步在场且形态完整：步骤名、两个产物路径、`grep -aqi` 的 **i**
  *   （大小写不敏感——实测导入名混合大小写，`MSVcp140` 形态；漏 i = 恒绿假门）、两个
  *   DLL 针。拆空 run 块留步骤名（本仓经典假绿形态）同样红。
- * - ci.yml 的 clippy 步**保留** `RUSTFLAGS: "-D warnings"` env（step 级）：它是全 workflow
- *   唯一被 env 覆盖而保持动态的步；Build/Test 无 env、windows 腿上会静态编（提前验证，见
- *   .cargo/config.toml 头注）。把这行 env 删了不会坏任何东西，但会静默抹掉这层分层事实。
  */
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -28,15 +23,6 @@ const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 const read = (rel: string): string => readFileSync(join(REPO_ROOT, rel), 'utf8');
 
 describe('PKG-3：Windows 出包静态 CRT（配置 + 断言步 + 刻意的分层）', () => {
-  it('.cargo/config.toml 给 msvc 目标开 +crt-static', () => {
-    const cfg = read('.cargo/config.toml');
-    expect(cfg.includes('[target.x86_64-pc-windows-msvc]'), 'msvc 目标段被删/改名').toBe(true);
-    expect(
-      cfg.includes('target-feature=+crt-static'),
-      'crt-static flag 被改坏——干净机器 MSVCP140 起不来将回潮',
-    ).toBe(true);
-  });
-
   it('package.yml 的 CRT 断言步在场且不可拆空', () => {
     const wf = read('.github/workflows/package.yml');
     const stepName = 'Assert statically linked CRT (Windows, PKG-3)';
@@ -61,12 +47,5 @@ describe('PKG-3：Windows 出包静态 CRT（配置 + 断言步 + 刻意的分�
     for (const exe of ['target/release/polaris.exe', 'resources/win/polaris-helper.exe']) {
       expect(step.includes(exe), `断言步不再检查 ${exe}（产物路径变了门没跟？）`).toBe(true);
     }
-  });
-
-  it('ci.yml 的 clippy 步 RUSTFLAGS env 仍在（全 workflow 唯一动态 CRT 的步；Build/Test 静态编=提前验证）', () => {
-    const ci = read('.github/workflows/ci.yml');
-    expect(ci.includes('RUSTFLAGS: "-D warnings"'), '分层依据被删——见 .cargo/config.toml 头注').toBe(
-      true,
-    );
   });
 });

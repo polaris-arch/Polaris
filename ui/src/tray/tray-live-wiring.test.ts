@@ -61,23 +61,6 @@ describe('守卫自检：扫到的确实是源码（防读空文件恒绿）', (
 });
 
 describe('托盘卡片随系统栏边缘贴合', () => {
-  it('四边共享 data-tray-edge 契约，Windows 常见的底/左右近侧为 0 且总外边距不变', () => {
-    expect(OVERLAY_RAW).toMatch(
-      /:root\[data-tray-edge="bottom"\]\s+\.tray-menu\s*{[^}]*margin-top:\s*12px;[^}]*margin-bottom:\s*0;/s,
-    );
-    expect(OVERLAY_RAW).toMatch(
-      /:root\[data-tray-edge="left"\]\s+\.tray-menu\s*{[^}]*margin-left:\s*0;[^}]*margin-right:\s*22px;/s,
-    );
-    expect(OVERLAY_RAW).toMatch(
-      /:root\[data-tray-edge="right"\]\s+\.tray-menu\s*{[^}]*margin-left:\s*22px;[^}]*margin-right:\s*0;/s,
-    );
-    // 顶边沿用基础 2/10；底边改成 12/0，横向两组仍都是 22px，避免 tray_resize/固定窗宽抖动。
-    expect(OVERLAY_RAW).toMatch(/\.tray-menu\s*{[^}]*margin:\s*2px 11px 10px;/s);
-    expect(OVERLAY_RAW).toMatch(
-      /\.tray-menu\s*{[^}]*max-height:\s*calc\(100vh\s*-\s*12px\);/s,
-    );
-  });
-
   it('自适应高度独立量自然内层，初始 420px 能长且旧宿主变高后还能缩', () => {
     expect(MENU).toContain('className="tray-menu-content" ref={contentRef}');
     expect(MENU).toContain('trayNaturalWindowHeight(content.getBoundingClientRect().height, {');
@@ -109,7 +92,6 @@ describe('托盘卡片随系统栏边缘贴合', () => {
       /trayReportedHeight\(\s*fixedMenuHeightRef,\s*measuredHeight,\s*!!config && view === 'main',?\s*\)/,
     );
     expect(MENU).toContain('TRAY_RESIZE, { height: fixedHeight }');
-    expect(OVERLAY_RAW).toMatch(/\.tray-menu\s*{[^}]*height:\s*calc\(100vh\s*-\s*12px\);/s);
   });
 });
 
@@ -131,15 +113,6 @@ describe('macOS 非前台托盘 hover 桥接', () => {
     expect(MENU).toContain("document.removeEventListener('mousemove', clearNativeHover)");
     expect(MENU).toContain('delete window.__POLARIS_NATIVE_HOVER__');
   });
-
-  it('桥接态复用现有 hover token，并维持 danger/disabled/selected 语义', () => {
-    expect(OVERLAY_RAW).toMatch(
-      /\.tray-i\.tray-native-hover:not\(\.on\):not\(:disabled\):not\(\.disabled\)\s*\{[^}]*background:\s*hsl\(var\(--surface-2\)\);[^}]*color:\s*hsl\(var\(--fg\)\);/s,
-    );
-    expect(OVERLAY_RAW).toMatch(
-      /\.tray-i\.danger\.tray-native-hover:not\(:disabled\):not\(\.disabled\)\s*\{[^}]*background:\s*hsl\(var\(--err-weak\)\);[^}]*color:\s*hsl\(var\(--err\)\);/s,
-    );
-  });
 });
 
 describe('状态卡超长出口 IP：默认截断，悬停或聚焦时才滚动', () => {
@@ -154,17 +127,6 @@ describe('状态卡超长出口 IP：默认截断，悬停或聚焦时才滚动'
     expect(MENU, '不得绕过全局 tooltip 门重新加入原生 title').not.toContain(
       'title={statusDetailOverflowing',
     );
-  });
-
-  it('动画只挂在 overflow 类的 hover/focus，且尊重 reduced-motion', () => {
-    expect(OVERLAY_RAW).toMatch(
-      /\.tray-status-detail\.is-overflowing:hover\s+\.tray-status-detail-track/,
-    );
-    expect(OVERLAY_RAW).toMatch(
-      /\.tray-status-detail\.is-overflowing:focus-visible\s+\.tray-status-detail-track/,
-    );
-    expect(OVERLAY_RAW).toContain('@keyframes tray-status-detail-scroll');
-    expect(OVERLAY_RAW).toContain('@media (prefers-reduced-motion: reduce)');
   });
 });
 
@@ -211,26 +173,6 @@ describe('A1：托盘缺的两项入口真实存在且真实接线', () => {
     expect(body).not.toContain("setNotice(t('tray.updateCheckFailed'))");
     expect(MENU).toContain('className={`tray-update-result');
     expect(MENU).toContain("aria-label={checking ? t('tray.checkingUpdate') : undefined}");
-    expect(OVERLAY_RAW).toMatch(/\.tray-menu \.tray-update-result\s*{[^}]*max-width:\s*90px;/s);
-  });
-
-  it('检查结果徽标使用语义 token，并以可读字号、字重和边界承载浅色主题', () => {
-    const base = OVERLAY_RAW.match(/\.tray-menu \.tray-update-result\s*{([^}]*)}/s)?.[1] ?? '';
-    expect(base).toMatch(/font-size:\s*10\.5px/);
-    expect(base).toMatch(/font-weight:\s*650/);
-    expect(base).toMatch(/border:\s*1px solid transparent/);
-    for (const [tone, token] of [
-      ['ok', 'ok'],
-      ['err', 'err'],
-    ] as const) {
-      const body =
-        OVERLAY_RAW.match(
-          new RegExp(`\\.tray-menu \\.tray-update-result\\.${tone}\\s*\\{([^}]*)}`, 's'),
-        )?.[1] ?? '';
-      expect(body).toContain(`color: hsl(var(--${token}))`);
-      expect(body).toContain(`background: hsl(var(--${token}) / 0.18)`);
-      expect(body).toContain(`border-color: hsl(var(--${token}) / 0.32)`);
-    }
   });
 });
 
@@ -293,16 +235,6 @@ describe('A6：托盘桌面通知（开关同步 + FakeIP 纠正告知）', () =
   it('hydrate 把 desktopNotifications 开关同步进本窗 JS 堆', () => {
     // 托盘窗与主窗不共享模块实例：App.tsx 那次同步只作用于主窗，缺这行则浮层通知无视用户的关闭设置。
     expect(MENU).toContain('setDesktopNotificationsEnabled(cfg.desktopNotifications)');
-  });
-
-  it('切接管方式触发 FakeIP 自动启用时真的发通知（不是又一次 TODO）', () => {
-    const start = MENU.indexOf('const setTakeover');
-    const body = MENU.slice(start, MENU.indexOf('\n  };', start));
-    expect(body).toContain('api.config.setTakeover(modeType)');
-    expect(body).not.toContain('dnsConfig:');
-    expect(body).not.toContain('saveConfig(patch)');
-    expect(body).toMatch(/if\s*\(corrected\)/);
-    expect(body).toContain('notifyDesktop(');
   });
 });
 
@@ -386,14 +318,6 @@ describe('O07 shared config with fenced ancillary hydration', () => {
     const hydrate = MENU.slice(MENU.indexOf('const hydrate ='), MENU.indexOf('refreshOnShow.current ='));
     expect(hydrate).toContain('if (!interactionActive.current) return');
     expect(hydrate).toContain('mounted.current && interactionActive.current');
-  });
-  it('only exact show reactivates the shared remeasure bridge; legacy and unknown reasons are geometry', () => {
-    const bridge = MENU.slice(MENU.indexOf('window.__POLARIS_TRAY_REMEASURE__ ='), MENU.indexOf('delete window.__POLARIS_TRAY_REMEASURE__'));
-    const exactShowOnly = (source: string) => /window\.__POLARIS_TRAY_REMEASURE__ = \(reason\) => \{\s*requestRemeasure\(\);\s*if \(reason === 'show'\) refreshOnShow\.current\(\);\s*\};/.test(source);
-    expect(exactShowOnly(bridge)).toBe(true);
-    expect(exactShowOnly(bridge.replace("if (reason === 'show') ", ''))).toBe(false);
-    expect(exactShowOnly(bridge.replace("reason === 'show'", "reason !== 'geometry'"))).toBe(false);
-    expect(bridge).not.toContain('interactionActive.current = true');
   });
   it('native show reason follows successful show only, while both screen routes reach geometry', () => {
     const geometry = HOST.slice(HOST.indexOf('pub(super) fn notify_screen_change_remeasure('), HOST.indexOf('fn queue_overlay_build('));

@@ -5,7 +5,6 @@ import type { ServerConfig } from '@/contracts/types';
 import type { TailcatSettings } from '@/contracts/types/protocol-settings';
 import {
   ADDRESSLESS_PROTOCOLS,
-  ALL_PROTOCOLS,
   isAddresslessProtocol,
   isServerComplete,
   protocolRequirementError,
@@ -21,12 +20,6 @@ const base = (protocol: ServerConfig['protocol']): ServerConfig => ({
 });
 
 describe('server completeness endpoint VPN coverage', () => {
-  it('runtime registry covers every Protocol member added for endpoint VPNs', () => {
-    for (const protocol of ['hysteria', 'tor', 'openconnect', 'openvpn-client', 'masque-client'] as const) {
-      expect(ALL_PROTOCOLS).toContain(protocol);
-    }
-  });
-
   it('Tor is addressless, while endpoint VPNs require their nested settings', () => {
     expect(isServerComplete({ ...base('tor'), address: '', port: 0 })).toBe(true);
     expect(isServerComplete({

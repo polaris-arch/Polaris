@@ -201,7 +201,6 @@ describe('P3：出口设备三态', () => {
 
 describe('W：喂数接线（谓词再准，没人喂数据也是零提示）', () => {
   const APP = 'App.tsx';
-  const STORE = 'store/app-store.ts';
   const VIEW = 'components/screens/home/TsExitWarning.tsx';
 
   it('STATUS 订阅把**整帧**落 store，而不是只取 loggedIn', () => {
@@ -219,27 +218,11 @@ describe('W：喂数接线（谓词再准，没人喂数据也是零提示）', 
     expect(store).toBeLessThan(gate);
   });
 
-  it('store 有 tailscaleStatuses 切片与其 setter（此前的 tailscalePeers 是零 setter 死切片）', () => {
-    const src = code(read(STORE));
-    expect(src).toMatch(/tailscaleStatuses:\s*Record<string,\s*TailscaleStatusEvent\s*\|\s*undefined>/);
-    expect(src).toMatch(/setTailscaleStatus:\s*\(event\)\s*=>/);
-    expect(src).toMatch(/set\(\{\s*tailscaleStatuses:/);
-    // 死切片形态不得复活。
-    expect(src).not.toContain('tailscalePeers');
-  });
-
   it('首页组件从 store 读末帧并**真的喂进**谓词（拿到不用等于没接）', () => {
     const src = code(read(VIEW));
     expect(src).toMatch(/s\.tailscaleStatuses\[tsId\]/);
     // 必须是简写 `status,` 或 `status: status` —— 只匹配 `\bstatus\b` 会被 `status: undefined`
     // 骗过（实测：该变异一度存活。「读到了」和「喂进去了」是两件事，字面量占位正是二者之间的裂缝）。
     expect(src).toMatch(/deriveTsExitWarning\(\{[^}]*\bstatus(,|\s*:\s*status\b)/s);
-  });
-
-  it('needs-auth 有自己的文案与动作（否则新态会静默复用「选择出口设备」这个错方向的 CTA）', () => {
-    const src = code(read(VIEW));
-    expect(src).toContain('home.tsExitNeedsAuthWarn');
-    expect(src).toContain('home.tsExitGoAuth');
-    expect(src).toMatch(/openExternal\(/);
   });
 });

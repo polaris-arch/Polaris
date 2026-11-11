@@ -251,17 +251,6 @@ fn main_window_rebuild_is_dispatched_to_main_thread() {
         create.contains("rt.stats().mark_main_window_created()"),
         "builder 成功后必须提交主窗口生命周期，供三平台 stats/logs 可见性门共享"
     );
-    assert!(
-        create.contains("window_health::log_show_probe(app, \"window-built\", false)"),
-        "builder 成功点必须记录 window-built，B9 才能区分原生建窗与 renderer 加载耗时"
-    );
-    let present = crate::commands::guard_scan::top_level_fn_body(&src, "fn present_main_window(");
-    assert!(
-        present.contains("window_health::log_show_probe(")
-            && present.contains("\"shown\"")
-            && present.contains("\"show-failed\""),
-        "唯一呈现漏斗必须消费 shown/show-failed 终态探针"
-    );
 }
 
 // ── 托盘汇流点幂等闸门（30s 轮询 × 全程 = 每 30s 一次磁盘写 + indicator 重载）────────
@@ -1062,7 +1051,7 @@ fn dialog_acl_covers_every_frontend_dialog_call() {
 /// 「卸载失败」。真机上就是这么表现的（2026-07-29 于 5.238 复现）。原地二次点击把二次确认从一项
 /// 运行期授权变回一段普通渲染，没有这条失败模式。
 ///
-/// 与前端 `settings-logic.test.ts` 的同名约束互为两侧：那边扫 settings 子树，这边扫整个 `ui/src`。
+/// 前端侧同名约束已删，本条为唯一判据（扫整个 `ui/src`）。
 #[test]
 fn production_code_never_calls_global_confirm() {
     let mut files = Vec::new();

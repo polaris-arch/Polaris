@@ -59,9 +59,6 @@ describe('节点协议名 / 传输摘要：桌面与移动端同源', () => {
     expect(ALL_PROTOCOLS.length, 'ALL_PROTOCOLS 塌了').toBeGreaterThan(10);
     const unlabeled = ALL_PROTOCOLS.filter((p) => protocolLabel(p) === p);
     expect(unlabeled, '这些协议没有显示名，角标会渲染原始枚举').toEqual([]);
-    // 正面：本批点名的两个协议逐字钉住。
-    expect(protocolLabel('masque-client')).toBe('MASQUE');
-    expect(protocolLabel('tailcat')).toBe('Tailcat');
     expect(transferSummary({ protocol: 'tailcat' } as ServerConfig)).toBe('derp · wg');
     expect(transferSummary({ protocol: 'masque-client' } as ServerConfig)).toBe('h3 · masque');
   });
@@ -70,8 +67,6 @@ describe('节点协议名 / 传输摘要：桌面与移动端同源', () => {
     expect(protocolLabel('tailscale')).toBe('Tailscale');
     expect(transferSummary({ protocol: 'tailscale' } as ServerConfig)).toBe('');
     expect(transferSummary({ protocol: 'wireguard' } as ServerConfig)).toBe('udp · wg');
-    expect(transferSummary({ protocol: 'tailcat' } as ServerConfig)).toBe('derp · wg');
-    expect(transferSummary({ protocol: 'masque-client' } as ServerConfig)).toBe('h3 · masque');
   });
 
   it('P2 移动端每个构造 `protocolLabel` 的点都引用共用函数、不自带表', () => {

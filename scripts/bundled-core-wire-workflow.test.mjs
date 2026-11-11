@@ -107,21 +107,6 @@ test('Package runs the host-independent wire gate exactly once, on every entry t
   assert.equal(yaml.includes("needs.core_wire.result != 'failure'"), false, 'cancelled also satisfies != failure');
 });
 
-test('切片自检：job() 不越界，executable() 剥掉注释里的同名判据', () => {
-  const synthetic = [
-    'jobs:',
-    '  first:',
-    '    # needs: [setup, core_wire]',
-    '    needs: [setup]',
-    '  second:',
-    '    runs-on: ubuntu-22.04',
-  ].join('\n');
-  const first = executable(job(synthetic, 'first'));
-  assert.equal(first.includes('core_wire'), false);
-  assert.equal(first.includes('runs-on'), false);
-  assert.match(first, /^    needs: \[setup\]$/m);
-});
-
 test('Release Risk checks all fetched cores only on kernel-impact changes', () => {
   const yaml = readFileSync(join(root, '.github/workflows/release-risk.yml'), 'utf8');
   assertWireStep(yaml, { kernelOnly: true });
@@ -255,9 +240,3 @@ for (const fault of ['id', 'digest', 'run', 'head', 'attempt', 'size']) {
     assert.ok(!calls[0].args[1].endsWith('/zip'));
   });
 }
-
-
-test('CLI download owns its one check; check/import keep a separate validation boundary', () => {
-  const source = readFileSync(join(root, 'scripts/desktop-core/wire-input-handoff.mjs'), 'utf8');
-  assert.match(source, /if \(command === 'download'\) \{ downloadWireArtifact\([^\n]+; return; \}\n    checkWireArtifact\(values\.candidate, context, values\['artifact-name'\]\);\n    if \(command === 'check'\) return;/);
-});

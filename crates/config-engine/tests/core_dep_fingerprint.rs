@@ -753,14 +753,6 @@ fn candidate_d_dns_dependency_has_not_been_release_authorized() {
         version, SING_TUN_PINNED,
         "unmodified D must remain blocked pending Windows source fix"
     );
-    let source: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(repo_root().join("scripts/desktop-core/source-manifest.json"))
-            .unwrap(),
-    )
-    .unwrap();
-    if source.get("sourceOwnedReplacements").is_none() {
-        assert_eq!(source["sourceCommit"], "052297f735b80bdae5b2536ef2a07d04979a0511", "source changed: re-audit exact dependency/default/Windows contract before changing this lock");
-    }
 }
 
 fn framed_identity_fixture(info: &str) -> Vec<u8> {

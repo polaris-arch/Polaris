@@ -19,14 +19,6 @@ fn default_config_paths_match_design() {
 }
 
 #[test]
-fn default_constants_match_strings() {
-    // 常量是 wire/运维契约（改名 = 断 systemd unit 引用）。
-    assert_eq!(DEFAULT_SOCK_PATH, "/run/polaris/helper.sock");
-    assert_eq!(DEFAULT_AUTH_FILE, "/var/lib/polaris/authorized-uids");
-    assert_eq!(DEFAULT_CORE_DIR, "/usr/local/lib/polaris/core");
-}
-
-#[test]
 fn server_config_can_override_paths() {
     let cfg = ServerConfig {
         sock_path: PathBuf::from("/tmp/test.sock"),
@@ -203,9 +195,6 @@ fn ambient_caps_match_go_set_and_l16_constants() {
     assert_eq!(caps[1], caps::Capability::CAP_NET_RAW);
     assert_eq!(caps[2], caps::Capability::CAP_NET_BIND_SERVICE);
     // L16 数值常量 == 内核 cap 号 == caps crate 的 index()（Go helper.go:52-54）。
-    assert_eq!(CAP_NET_BIND_SERVICE_NUM, 10);
-    assert_eq!(CAP_NET_ADMIN_NUM, 12);
-    assert_eq!(CAP_NET_RAW_NUM, 13);
     assert_eq!(
         caps::Capability::CAP_NET_BIND_SERVICE.index(),
         CAP_NET_BIND_SERVICE_NUM

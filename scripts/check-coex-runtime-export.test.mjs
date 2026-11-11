@@ -107,8 +107,7 @@ test('the explicit eight-path policy retains the full raw diff, original values 
   const oldBytes = canonical(original); const newBytes = canonical(current);
   const result = compareExportStates(original, current, controlledWindow());
   assertCompletePartition(result);
-  assert.equal(TEMPORAL_PATHS.length, 8); assert.equal(new Set(TEMPORAL_PATHS).size, 8);
-  assert.equal(result.policyVersion, 'coex-ci-acquisition-unix-v1');
+  assert.equal(new Set(TEMPORAL_PATHS).size, 8);
   assert.equal(result.status, 'passed');
   assert.deepEqual(result.stateDifferences, stateDifferences(original, current));
   assert.equal(result.stateDifferences.length, 8);

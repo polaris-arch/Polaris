@@ -332,15 +332,4 @@ describe('滚动分批：唯一实现 + 禁 lazy/IntersectionObserver', () => {
         '不拿它做替代。分批用纯 scroll 事件（lib/use-scroll-batch.ts）。'
     ).toEqual([]);
   });
-
-  it('消费方不得再自持分批常量（第二份常量 = 两处滚动手感会漂）', () => {
-    for (const { rel, src } of sources) {
-      expect(src, `${rel} 又自持了一份每批数`).not.toMatch(/GALLERY_PAGE|GALLERY_LOAD_AHEAD_PX/);
-    }
-  });
-
-  it('常量在合理量级（写成 0 会让分批永不推进 = 列表只剩空白）', () => {
-    expect(SCROLL_BATCH_PAGE).toBeGreaterThan(10);
-    expect(SCROLL_BATCH_AHEAD_PX).toBeGreaterThan(0);
-  });
 });

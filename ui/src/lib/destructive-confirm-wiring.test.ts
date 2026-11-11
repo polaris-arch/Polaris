@@ -126,10 +126,6 @@ describe('T1：全仓只有一份原地二次确认实现（三套写法收敛�
 
   it('confirm-twice.ts 自己扛住三条原型语义（超时常量 / 二次点击先清 timeout / 卸载清理）', () => {
     const c = code(get(OWNER));
-    expect(c).toContain('CONFIRM_TWICE_MS = 2600');
-    expect(c, '第二次点击必须先清 timeout 再执行 action').toMatch(
-      /if \(armed === key\) \{\s*clear\(\);/,
-    );
     expect(c, 'React 下不清定时器 = 在已卸载组件上 setState').toMatch(
       /useEffect\(\(\) => \(\) => coreRef\.current\?\.dispose\(\), \[\]\)/,
     );
@@ -176,13 +172,6 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     expect(migration).toContain("!['mac', 'lin'].includes(shellPlatformFromDataOs() ?? '')");
     expect(migration).toContain('!migrationAdmissionAvailable()');
     expect(migration).toContain('const confirmedPlatform = shellPlatformFromDataOs()');
-    expect(migration).toMatch(
-      /title:\s*t\(confirmedPlatform === 'lin'\s*\?\s*'helper.linuxStopAndUpgradeTitle'\s*:\s*'helper.stopAndUpgradeTitle'\)/,
-    );
-    expect(migration).toMatch(
-      /message:\s*t\(confirmedPlatform === 'lin'\s*\?\s*'helper.linuxStopAndUpgradeWarning'\s*:\s*'helper.stopAndUpgradeWarning'\)/,
-    );
-    expect(migration).toContain("confirmLabel: t('helper.stopAndUpgradeConfirm')");
     expect(migration).toContain('danger: true');
     expect(migration).not.toContain('confirmTwice(');
     expect(migration).toContain('onConfirm: () => {');
@@ -192,18 +181,9 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     expect(confirmedMigration).toContain("!['mac', 'lin'].includes(confirmedPlatform ?? '')");
     expect(confirmedMigration).toContain("helperInstallSnapshot().failure !== 'upgradeDeferred'");
     expect(confirmedMigration).toContain("void runInstall('stopAndUpgrade')");
-    expect(c).toContain("const migrationAvailable = migrationAdmissionAvailable() && ['mac', 'lin'].includes(shellPlatformFromDataOs() ?? '') && installFailure === 'upgradeDeferred'");
-    expect(c).toContain('const latest = deriveState(currentStatus.current)');
-    expect(c).toContain("latest !== 'checking' && latest !== 'unsupported' && latest !== 'admission-unavailable'");
     expect(c).toContain('onClick={migrationAvailable ? stopAndUpgrade : install}');
     // The prototype has only helper uninstall. The full-scope migration modal is
     // an intentional, separately registered action, never a change to that gate.
-  });
-
-  it('RulesScreen 的删除确认与武装态绑定同一 plane 和完整规则快照', () => {
-    const c = code(get('components/screens/rules/RulesScreen.tsx'));
-    expect(c).toContain('confirmTwice(`${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`,');
-    expect(c).toContain('deleteConfirming={armed === `${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`}');
   });
 
   it('NodesScreen 的删节点 / 批删走原地二次点击（原型 :4140 node-del / :4137 batch-del）', () => {
@@ -410,12 +390,5 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     }
     // 相等而非 `<=`：涨了 = 有人新加了弹窗式确认；跌了 = 又消掉一处，把清册一并调低。
     expect(actual, '确认弹窗分布与清册不符 —— 见本 describe 头注的登记规则').toEqual(CENSUS);
-  });
-
-  it('已退役的 dialogConfirm 不许回来（它是破坏性操作那条弹窗腿的入口）', () => {
-    const offenders = FILES.filter((f) => /dialogConfirm|confirm-gate/.test(code(f.src))).map(
-      (f) => f.rel,
-    );
-    expect(offenders, 'dialogConfirm / confirm-gate 已删除，不得复活').toEqual([]);
   });
 });

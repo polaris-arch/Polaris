@@ -435,7 +435,6 @@ test('bash 3.2 兼容的静态面：bash -n 通过，bash 4+ 才有的写法对�
   assert.ok(all.length > 80, `代码面只有 ${all.length} 行`);
   assert.ok(all.includes('set -euo pipefail'));
 
-  assert.ok(BASH4_ONLY.length >= 18, `写法表缩水了：${BASH4_ONLY.length}`);
   for (const [pattern, what, sample] of BASH4_ONLY) {
     assert.ok(pattern.test(sample), `判据「${what}」匹不到它自己的样例 ${sample}`);
     assert.deepEqual(all.filter((line) => pattern.test(line)), [], `用了 bash 4+ 才有的 ${what}`);

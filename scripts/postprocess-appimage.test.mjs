@@ -143,15 +143,6 @@ test('缺 GTK hook 时短路返回，不再声称 GIO 契约成立', (t) => {
   ]);
 });
 
-test('冲突库清单本身是判据的一部分：四项且逐字锁定', () => {
-  assert.deepEqual([...APPIMAGE_HOST_WAYLAND_LIBS], [
-    'libwayland-client.so.0',
-    'libwayland-cursor.so.0',
-    'libwayland-egl.so.1',
-    'libwayland-server.so.0',
-  ]);
-});
-
 // Current official Tauri GTK template uses MODULE_DIR directly; it can render a
 // doubled slash because gio's giomoduledir is absolute. Both forms stay in AppDir.
 for (const rhs of [BUNDLED_GIO, `"$APPDIR//${GIO_RELATIVE}"`]) {

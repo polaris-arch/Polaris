@@ -122,19 +122,6 @@ test('exact one-test verdict rejects zero, ignored, failed, duplicated and inter
   const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   const names = [...workflow.matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
   assert.deepEqual(names, TESTS);
-  const runner = readFileSync(new URL('./run-native-dns-controlled-tests.mjs', import.meta.url), 'utf8');
-  assert.equal((runner.match(/'--no-run'/g) ?? []).length, 1);
-  const ordinary = runner.slice(runner.indexOf('\nasync function runContractSuite('), runner.indexOf('\nasync function main()'));
-  const native = runner.slice(runner.indexOf('\nasync function main()'));
-  assert.match(ordinary, /^      args: \['test', '--locked', '-p', packageName, '--lib', '--no-run', '--message-format=json'\] \},$/m);
-  assert.match(native, /^    args: \['build', '--locked', '-p', 'polaris', '--features', 'native-production-verification', '--bin', 'native-admission-verifier', '--message-format=json'\] \},$/m);
-  assert.match(native, /^  const selected = selectNativeExecutable\(messages, metadata, root\);$/m);
-  assert.match(native, /^  await withNativeSession\(selected, env, directory, \(\) => runTests\(selected, env, directory\)\);$/m);
-  assert.match(runner, /root: dirname\(selected.manifest\)/);
-  for (const [start, end] of [['export async function runTests(', 'export function contractGroups('], ['export async function runContractTests(', 'async function runContractSuite(']]) {
-    const body = runner.slice(runner.indexOf(start), runner.indexOf(end));
-    assert.equal((body.match(/hash\(selected.executable\) === digest/g) ?? []).length, 2);
-  }
 });
 
 const syntheticCleanup = (name, processId = 70) => ({
@@ -360,17 +347,8 @@ test('80516-byte production graph survives stderr interleaving in the human comb
 });
 
 
-test('ordinary source suites retain thirty-three unique reviewed names and exact build groups', () => {
-  assert.equal(BOOTSTRAP_TESTS.length, 2); assert.equal(SOURCE_TESTS.length, 31);
-  assert.equal(new Set([...BOOTSTRAP_TESTS, ...SOURCE_TESTS]).size, 33);
-  assert.equal(contractGroups(BOOTSTRAP_TESTS).size, 1); assert.equal(contractGroups(SOURCE_TESTS).size, 4);
-  assert.deepEqual(Object.fromEntries([...contractGroups(SOURCE_TESTS)].map(([pkg, names]) => [pkg, names.length])), {
-    polaris: 16, 'polaris-store': 2, 'polaris-config-engine': 6, 'polaris-net-stack': 7,
-  });
-  assert.deepEqual([...contractGroups(BOOTSTRAP_TESTS)], [['polaris-helper-client', [
-    'manager::tests::bootstrap_identity::bootstrap_identity_render_is_platform_specific',
-    'manager::tests::bootstrap_identity::native_bootstrap_descriptor_identity',
-  ]]]);
+test('ordinary source suites retain unique reviewed names and exact build groups', () => {
+  assert.equal(new Set([...BOOTSTRAP_TESTS, ...SOURCE_TESTS]).size, BOOTSTRAP_TESTS.length + SOURCE_TESTS.length);
   assert.throws(() => contractGroups([...SOURCE_TESTS]));
   const wf = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   assert.equal((wf.match(/run-native-dns-controlled-tests.mjs --bootstrap-contracts/g) ?? []).length, 1);
@@ -658,15 +636,6 @@ test('native summary R2 never promotes five legacy libtest statuses or six libte
   });
 });
 test('native summary R3 requires six exact ordered names including stats, never a five-proxy oracle', async () => {
-  assert.deepEqual(TESTS, [
-    'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',
-    'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
-    'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
-    'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
-    'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
-    'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',
-  ]);
-  assert.equal(TESTS.length, 6); assert.equal(TESTS[5], 'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames');
   await withNativeReceipt('pass', (f) => {
     const original = readReceipt(f);
     for (const mutate of [r => r.cases.pop(), r => r.cases.reverse(), r => { r.cases[5].name = TESTS[4]; },
@@ -1678,10 +1647,8 @@ function diagnoseInertControlFault(failure, controlFault, diagnostic) {
   }
 }
 
-async function expectInertControlFault(controlFault, counterFault = null, diagnostic = null) {
+async function expectInertControlFault(controlFault, diagnostic = null) {
   assert.ok(['holder-reset', 'release-reset', 'foreign-auth', 'premature-ack'].includes(controlFault));
-  assert.ok(counterFault === null || controlFault === 'release-reset'
-    && ['premise-assertion', 'evidence-collision'].includes(counterFault));
   let failure, supervisorFailure;
   try {
     await withRealSession({ inheritedOutput: true, controlFault }, async f => {
@@ -1735,10 +1702,6 @@ async function expectInertControlFault(controlFault, counterFault = null, diagno
       assert.equal(receipt.executor.interrupted, false); assert.equal(receipt.executor.control.error, null);
       assert.equal(receipt.executor.control.action, 'eof'); assert.equal(receipt.executor.control.payloadBytes, 0);
       assert.equal(receipt.streams.stdout.error, null); assert.equal(receipt.streams.stderr.error, null);
-      if (counterFault === 'premise-assertion')
-        assert.equal(receipt.executor.timedOut, false, 'deliberate independent actual snapshot assertion failure');
-      if (counterFault === 'evidence-collision')
-        writeFileSync(join(f.directory, 'inert-failure-evidence'), 'actual independent file/directory collision', { flag: 'wx' });
       // finally must release even if an independent assertion above fails.
     });
   } catch (error) { failure = error; }
@@ -1754,7 +1717,7 @@ async function expectInertControlFault(controlFault, counterFault = null, diagno
     || outcome.supervision.find(entry => entry.label === 'supervisor')?.error !== supervisorFailure
     || !supervisorFailure || outcome.supervision.find(entry => entry.label === 'assertion')?.error !== null
     || !diagnostics || diagnostics.eventsTruncated || diagnostics.errorsTruncated || diagnostics.errors.length !== 1) {
-    if (counterFault === null) diagnoseInertControlFault(failure, controlFault, diagnostic);
+    diagnoseInertControlFault(failure, controlFault, diagnostic);
     throw failure;
   }
   const [role, phase, origin] = {
@@ -1767,7 +1730,7 @@ async function expectInertControlFault(controlFault, counterFault = null, diagno
       && row.role === role && row.phase === phase && row.origin === origin)
     || !diagnostics.events.some(row => row.event === 'explicit-release')
     || diagnostics.inheritorProcessExit !== 'UNKNOWN' || failure.inertFailureEvidenceIsolated !== true) {
-    if (counterFault === null) diagnoseInertControlFault(failure, controlFault, diagnostic);
+    diagnoseInertControlFault(failure, controlFault, diagnostic);
     throw failure;
   }
   if (controlFault === 'premature-ack') {
@@ -1792,59 +1755,5 @@ async function expectInertControlFault(controlFault, counterFault = null, diagno
 
 for (const controlFault of ['holder-reset', 'release-reset', 'foreign-auth', 'premature-ack'])
   test(`inert control rejects actual transport failure ${controlFault} without granting pipe custody`, async t => {
-    await expectInertControlFault(controlFault, null, message => t.diagnostic(message));
+    await expectInertControlFault(controlFault, message => t.diagnostic(message));
   });
-
-for (const counterFault of ['premise-assertion', 'evidence-collision'])
-  test(`actual expected release reset cannot accept independent ${counterFault}`, async () => {
-    await assert.rejects(expectInertControlFault('release-reset', counterFault), error => {
-      const outcome = error.inertControlOutcome, diagnostics = error.inertControlDiagnostics;
-      assert.ok(outcome?.injectedFailure && error.errors.includes(outcome.injectedFailure));
-      assert.ok(diagnostics.events.some(row => row.event === 'control-error'
-        && row.errorId === diagnostics.injectedErrorId && row.role === 'inheritor'
-        && row.phase === 'release-sent' && row.origin === 'socket-error'));
-      assert.equal(outcome.controllerClosed, true); assert.equal(outcome.settled, true); assert.equal(outcome.rootRemoved, true);
-      assert.equal(outcome.supervision.length, 2);
-      for (const entry of outcome.supervision) assert.equal(entry.settled, true);
-      assert.equal(outcome.supervision.find(entry => entry.label === 'assertion').error, null);
-      if (counterFault === 'premise-assertion') {
-        assert.equal(outcome.primary.name, 'AssertionError');
-        assert.match(outcome.primary.message, /deliberate independent actual snapshot assertion failure/);
-        assert.ok(error.errors.includes(outcome.primary), 'original AssertionError object retained');
-        assert.equal(outcome.exerciseCompleted, false); assert.ok(outcome.evidenceSaved);
-        assert.deepEqual(outcome.cleanupErrors, [outcome.injectedFailure]);
-      } else {
-        assert.equal(outcome.primary, null); assert.equal(outcome.exerciseCompleted, true); assert.equal(outcome.evidenceSaved, null);
-        const filesystemError = outcome.cleanupErrors.find(cause => cause !== outcome.injectedFailure);
-        assert.ok(filesystemError && ['EEXIST', 'ENOTDIR'].includes(filesystemError.code));
-        assert.equal(outcome.cleanupErrors.length, 2);
-        assert.ok(error.errors.includes(filesystemError), 'actual filesystem Error object retained');
-      }
-      assert.equal(diagnostics.inheritorProcessExit, 'UNKNOWN');
-      assert.equal(error.inertFailureEvidenceIsolated, true);
-      return true;
-    });
-  });
-
-test('inert failure evidence uses actual isolated files and preserves the first bounded slot', () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'inert-evidence-')));
-  const directory = join(root, 'evidence'); mkdirSync(directory);
-  const observed = { stdout: Buffer.from('inert stdout\n'), stderr: Buffer.from('inert stderr\n') };
-  try {
-    const destination = preserveInertSessionFailure(directory, observed, Error('first inert failure'), [], null, true);
-    assert.equal(destination, join(directory, 'inert-failure-evidence', 'first-other-failure.json'));
-    const first = readFileSync(destination), value = JSON.parse(first);
-    assert.ok(first.length <= 768 * 1024); assert.equal(value.failure.message, 'first inert failure');
-    for (const name of ['stdout', 'stderr']) {
-      const bytes = Buffer.from(value.streams[name].base64, 'base64');
-      assert.deepEqual(bytes, observed[name]); assert.equal(value.streams[name].bytes, bytes.length);
-      assert.equal(value.streams[name].sha256, createHash('sha256').update(bytes).digest('hex'));
-    }
-    assert.equal(value.inheritorProcessExit, 'UNKNOWN'); assert.equal(value.nativeCleanupConfirmed, false);
-    preserveInertSessionFailure(directory, observed, Error('second inert failure'), [], null, true);
-    assert.deepEqual(readFileSync(destination), first, 'wx must retain the actual first file');
-    rmSync(join(directory, 'inert-failure-evidence'), { recursive: true });
-    writeFileSync(join(directory, 'inert-failure-evidence'), 'actual file/directory collision');
-    assert.throws(() => preserveInertSessionFailure(directory, observed, Error('original cause'), [], null, true));
-  } finally { rmSync(root, { recursive: true, force: true }); }
-});

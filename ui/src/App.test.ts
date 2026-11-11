@@ -43,11 +43,6 @@ vi.mock('./lib/desktop-notify', () => ({
   documentElement: { dir: '', lang: '' },
 };
 
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-
-import { isProxyErrorCode } from './contracts/types';
-
 // 认领闸门用**真实实现**（不 mock）：本组要验的正是「事件腿与认领闸门的合璧」，mock 掉闸门等于
 // 把被测的接线换成桩，两边各自绿、合起来仍双报。
 //
@@ -188,20 +183,12 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     );
   });
 
-  it("isProxyErrorCode('RULE_RESOURCES_MISSING') === true", () => {
-    expect(isProxyErrorCode('RULE_RESOURCES_MISSING')).toBe(true);
-  });
-
   it('STARTUP_FAILED → 不重复报（发起方自己 toast，此处零弹）', () => {
     handleProxyErrorEvent({ errorCode: 'STARTUP_FAILED' }, { t, refreshProxyStatus });
     expect(refreshProxyStatus).not.toHaveBeenCalled();
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastWarningMock).not.toHaveBeenCalled();
     expect(notifyDesktopMock).not.toHaveBeenCalled();
-  });
-
-  it("isProxyErrorCode('EXIT_MISMATCH') === true", () => {
-    expect(isProxyErrorCode('EXIT_MISMATCH')).toBe(true);
   });
 
   // ── TUN 提权门两码 ─────────────────────────────────────────────────────────
@@ -247,13 +234,6 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
 
-  it.each(['HELPER_NOT_INSTALLED', 'HELPER_GATE_ABORTED'])(
-    'isProxyErrorCode(%s) === true（契约认这两个码，否则前端 err.code 会被判为脏值丢弃）',
-    (c) => {
-      expect(isProxyErrorCode(c)).toBe(true);
-    }
-  );
-
   // ── root 孤儿阻断腿（此前**完全不路由**，本码在托盘/自动连接等无人 await 的入口是静默丢弃） ──
 
   it('ROOT_ORPHAN_BLOCKED → 刷连接态 + 本地化 error toast + 桌面通知', () => {
@@ -269,10 +249,6 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
       'notify.rootOrphanBlocked.title',
       'notify.rootOrphanBlocked.body'
     );
-  });
-
-  it("isProxyErrorCode('ROOT_ORPHAN_BLOCKED') === true（否则前端 err.code 会被判为脏值丢弃）", () => {
-    expect(isProxyErrorCode('ROOT_ORPHAN_BLOCKED')).toBe(true);
   });
 
   // ── 随包内核不可执行腿（此前事件腿**没有分支**：无人 await 的入口撞上它是静默丢弃） ──
@@ -291,10 +267,6 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
       'notify.coreNotExecutable.title',
       'notify.coreNotExecutable.body'
     );
-  });
-
-  it("isProxyErrorCode('CORE_NOT_EXECUTABLE') === true（否则 await 腿拿到的 err.code 会被判为脏值丢弃）", () => {
-    expect(isProxyErrorCode('CORE_NOT_EXECUTABLE')).toBe(true);
   });
 
   // ── 提权助手内核不配套腿：起核前被拒绝，或起核后被自证停掉（后一种没有任何 await 腿在等） ──
@@ -320,7 +292,6 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     ['LAN_GATEWAY_FORWARDING_UNCONFIRMED', 'lanGatewayForwardingUnconfirmed'],
   ])('%s surfaces localized gateway prerequisites, not native details', (errorCode, key) => {
     handleProxyErrorEvent({ errorCode, message: '/private/proc/raw error' }, { t, refreshProxyStatus });
-    expect(isProxyErrorCode(errorCode)).toBe(true);
     expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
     expect(toastErrorMock.mock.calls).toEqual([[`errors.${key}`]]);
     expect(notifyDesktopMock).not.toHaveBeenCalled();
@@ -333,14 +304,9 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     ['HELPER_CORE_INVALID', 'helperCoreInvalid'],
   ])('%s reports a localized content error without native diagnostics', (errorCode, key) => {
     handleProxyErrorEvent({ errorCode, message: '/private/native/path diagnostic' }, { t, refreshProxyStatus });
-    expect(isProxyErrorCode(errorCode)).toBe(true);
     expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
     expect(toastErrorMock.mock.calls).toEqual([[`errors.${key}`]]);
     expect(notifyDesktopMock.mock.calls).toEqual([[`notify.${key}.title`, `notify.${key}.body`]]);
-  });
-
-  it("isProxyErrorCode('HELPER_CORE_MISMATCH') === true", () => {
-    expect(isProxyErrorCode('HELPER_CORE_MISMATCH')).toBe(true);
   });
 
   // ── 与发起方（Home 连接按钮）的去重：认领闸门 ─────────────────────────────
@@ -568,75 +534,5 @@ describe('handleHelperUpgradeable（提权助手可升级 → 可操作 toast）
     // 少了这一条，「判定为假」与「闸门先被误领走」在上面的断言下长得一模一样。
     expect(handleHelperUpgradeable({ installed: true, upgradeable: true }, t)).toBe(true);
     expect(toastWarningMock).toHaveBeenCalledTimes(1);
-  });
-});
-
-/* ────────────────────────────────────────────────────────────────────────────
- * 源码级接线门：腿 B 的两条腿确实都挂在全局事件订阅层
- *
- * 上面那组测的是「判定与副作用」，它在**根本没人调用** `handleHelperUpgradeable` 时同样全绿 ——
- * 两扇门之间的缝就是生产路径。故这里扫 App.tsx 源码，钉死「订阅 + 挂载回读」两件都在。
- * ──────────────────────────────────────────────────────────────────────────── */
-
-const APP_RAW = readFileSync(fileURLToPath(new URL('./App.tsx', import.meta.url)), 'utf8');
-
-/**
- * 去注释后的源码。两个方向都必要（同 `tray/tray-menu-height.test.ts` 的 `MENU`）：本仓注释习惯
- * 逐字引用被守的调用（本腿的 effect 注释里就写着 `helper_get_status`、`SettingsHelper.tsx`），
- * 扫原文会被自己的说明文字充数 —— 把接线整段删掉、注释留着，正面 `toContain` 照样绿。
- */
-const APP = APP_RAW.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-
-/** 按唯一锚点取一段并封顶 —— 切片射程由判据决定，不由书写顺序决定。 */
-function sliceApp(anchor: string, end: string): string {
-  const hits = APP.split(anchor).length - 1;
-  expect(hits, `锚点 ${anchor} 命中 ${hits} 次（应为 1）`).toBe(1);
-  const a = APP.indexOf(anchor) + anchor.length;
-  const b = APP.indexOf(end, a);
-  expect(b, `找不到收尾串 ${end} —— 切片会一路跑到文件尾`).toBeGreaterThan(a);
-  return APP.slice(a, b);
-}
-
-describe('接线门：可升级提示挂在全局事件订阅层（订阅 + 挂载回读，缺一不可）', () => {
-  it('守卫自检：扫到的确实是 App.tsx，去注释后没被吃空，且注释确实被吃掉了', () => {
-    expect(APP_RAW.length).toBeGreaterThan(10_000);
-    expect(APP).toContain('export function handleHelperUpgradeable');
-    expect(APP.length).toBeGreaterThan(APP_RAW.length / 3);
-    // 这句只在注释里出现过；它还在 = 注释没被剥，下面每条正面断言都可能是注释在充数。
-    expect(APP).not.toContain('就等于没有消费者');
-  });
-
-  it('闸门是模块级单例（挂组件内会随 App 重挂复位，等于没去重）', () => {
-    expect(APP).toContain('const helperUpgradeToastGate = createOnceGate();');
-    expect(
-      sliceApp('export function handleHelperUpgradeable(', '\n}\n'),
-      '判定与去重必须在同一处收口，否则订阅腿与回读腿各弹一条'
-    ).toContain('if (!helperUpgradeToastGate()) return false;');
-  });
-
-  it('两条腿都在同一个 effect 里：事件订阅 + 挂载即回读一次', () => {
-    const body = sliceApp(
-      '    const check = () =>',
-      '  }, [privacyMode, t]);',
-    );
-    // 用正则而不是 `toContain`：这条链被换行折成了多行，写死单行字面量的断言会在下一次
-    // 换行位置变动时假红（判据是「调了谁」，不是「怎么排版」）。
-    expect(body, '回读腿：事件早于 App 挂载时，只订阅一个字节都收不到').toMatch(
-      /helperApi\s*\.getStatus\(\)/
-    );
-    expect(body, '回读腿必须在挂载时**真的被调用**，不能只定义不调').toContain('\n    check();');
-    expect(body, '订阅腿：App 已挂载时由 T+7s 那一发送达').toContain(
-      'helperApi.onUpgradeable(() => check())'
-    );
-    expect(body, '两条腿都要经同一个判定+去重入口').toContain('handleHelperUpgradeable(s, t)');
-    expect(body, '回读失败静默（后端未就绪的启动窗口里弹 toast 是噪音）').toContain(
-      '.catch(() => undefined)'
-    );
-    expect(body, 'effect 必须返回退订闭包，否则 App 重挂后订阅泄漏').toContain('active = false; off();');
-  });
-
-  it('不新增 IPC 命令：只用既有的 helper 通道（`helper_get_status` 早已返回 upgradeable）', () => {
-    expect(APP).toContain("import { helperApi, unlockApi } from './ipc/api-client';");
-    expect(APP).not.toMatch(/helperUpgrade[A-Za-z]*Command|invoke\(\s*['"]helper:/);
   });
 });

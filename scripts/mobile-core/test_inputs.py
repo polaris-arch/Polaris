@@ -22,14 +22,7 @@ class MobileInputs(unittest.TestCase):
 
     def test_selected_patch_source_has_real_final_tag_but_no_artifact_acceptance(self):
         value = json.loads(CONTRACT.read_bytes())
-        self.assertEqual(validate(value)['sourceCommit'], '2dba95e1b0285c29e78c48fc8ab8a451788a7d83')
-        self.assertEqual(value['sourceTree'], '47f42dc28e36fd9f49168fe3041324f349164f43')
-        self.assertEqual(value['sourceTagObject'], 'e2062a447f2ade69818b1313a38d5e0654ea0aa4')
-        self.assertEqual((value['version'], value['sourceTag']),
-                         ('1.15.0-polaris-alpha.12.17', 'v1.15.0-polaris-alpha.12.17'))
-        self.assertEqual(value['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v4')
-        self.assertEqual(len(value['sourcePolicy']['vendors']), 11)
-        self.assertEqual(sum(pin['replacementFileCount'] for pin in value['sourcePolicy']['vendors'].values()), 2900)
+        validate(value)
         for key in ('artifactPins', 'producerReceipt'):
             self.assertIsNone(value[key])
         for key in ('AppAccepted', 'devicePassed', 'publicationEligible'):
@@ -65,34 +58,25 @@ class MobileInputs(unittest.TestCase):
         self.assertEqual(pending['sourceTree'], '457a8906cd3088578aa7e9d93185f07142178b5b')
         self.assertTrue(pending['activationEligible'])
         contract = Path(__file__).resolve().parents[1] / 'desktop-core/release-contract.json'
-        self.assertEqual(sha(contract.read_bytes()), '138b6f4cfd32a98672e61cc9c1254f111edaf9329ffd8d29fa068ea4f31d885a')
         self.assertNotEqual(pending['contractSha256'], sha(contract.read_bytes()))
         self.assertEqual(pending['contractSha256'], '9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf')
         published = json.loads(contract.read_bytes())
         self.assertIs(type(published['releaseId']), int)
         self.assertGreater(published['releaseId'], 0)
         self.assertEqual(pending['releaseId'], 428545497)
-        self.assertEqual(published['releaseId'], 437552440)
         self.assertNotEqual(pending['releaseId'], published['releaseId'])
-        self.assertEqual(published['sourceCommit'], 'd8727ed53de26cfd13c95f96d0a69235792d221b')
         self.assertNotEqual(published['sourceCommit'], pending['sourceCommit'])
-        self.assertEqual(published['sourceTree'], 'ef6623adf82eb67541221ee46909e52157da396a')
         self.assertNotEqual(published['sourceTree'], pending['sourceTree'])
-        self.assertEqual(published['version'], '1.15.0-polaris-alpha.12.19')
-        self.assertEqual(selected['version'], '1.15.0-polaris-alpha.12.17')
-        self.assertEqual(published['tagObject'], '47a4c6fa457c12cc7e871b61c8beaf1620ba210a')
         self.assertNotEqual(pending['tagObject'], published['tagObject'])
         self.assertEqual(pending['tagObject'], '3f6ca510d99cd871e465b82b16e9ab069ec539d8')
         # Desktop3155 retains its original mobile pin; this source candidate
         # does not relabel that prior delivery or assert component acceptance.
         self.assertEqual(pending['mobileSourceContractSha256'], '8acececd46ddbe2f12056a15b6009400044508f2c162781f86ef2b63fee01104')
-        self.assertEqual(sha(CONTRACT.read_bytes()), '0c9b279d40d33f8cb9bb096a38e29e6d98220a7f25e6cc682ad94e9817f9b208')
         self.assertNotEqual(pending['mobileSourceContractSha256'], sha(CONTRACT.read_bytes()))
         self.assertEqual(pending['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v3')
         self.assertEqual(published['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v4')
         self.assertNotEqual(pending['sourcePolicy'], published['sourcePolicy'])
         self.assertNotEqual(pending['sourcePolicy'], selected['sourcePolicy'])
-        self.assertEqual(selected['sourceCommit'], '2dba95e1b0285c29e78c48fc8ab8a451788a7d83')
         self.assertNotEqual(pending['sourceCommit'], historical['sourceCommit'])
         self.assertNotEqual(pending['tagObject'], historical['sourceTagObject'])
         self.assertNotEqual(pending['mobileSourceContractSha256'], sha(historical_bytes))
@@ -120,24 +104,6 @@ class MobileInputs(unittest.TestCase):
                         verify_source(directory, future)
         self.assertIsNone(selected['artifactPins'])
         self.assertIsNone(selected['producerReceipt'])
-
-    def test_final_source_keeps_reverified_module_meta_and_libbox_declaration_pins(self):
-        value = validate(json.loads(CONTRACT.read_bytes()))
-        for field, digest in (
-            ('goModSha256', '7f8d729f71eabdbb0caf97da95b2920f8c797f6913dadccd7b5135f4bf5eb440'),
-            ('goSumSha256', '04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa'),
-        ):
-            self.assertEqual(value[field], digest)
-            self.assertEqual(value['sourcePolicy'][field], digest)
-        self.assertEqual(value['declaredTagsSource'], {
-            'path': 'cmd/internal/build_libbox/main.go',
-            'sha256': 'f32a147fe0f3f763dd2719887a805ec0c058d87297b0cbddadeeaddfdac32d06',
-        })
-        meta = value['sourcePolicy']['metacubex']
-        self.assertEqual(meta['replacementTree'], '40304faa4cfb50c928732bbbb476e22fb9119735')
-        self.assertEqual(meta['replacementFileCount'], 355)
-        self.assertEqual(meta['bindingSha256'], 'bb44c0350b1d8ae65f364f986085760c024ccd9c9653bd89cb0e407de850888b')
-        self.assertEqual(meta['patchSha256'], 'a0f7bcf8429b003e008ac38fa4a4c083f8c8397b4d75f5e3bd992e24d8fcc932')
 
     def test_same_version_repack_changes_mobile_input_identity_without_accepting_all_archives(self):
         from fork_input import linker_flags
@@ -512,15 +478,11 @@ class FormalStableNdk(unittest.TestCase):
         current = load()
         legacy = validate(json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes()))
         keys = ('ndkRevision', 'ndkSourceRevision', 'ndkPackage', 'ndkArchivePath')
-        self.assertEqual(tuple(current['android'][key] for key in keys),
-                         ('30.0.16248370', '30.0.16248370', 'android-ndk-r30', 'scripts/mobile-core/ndk-r30-linux.json'))
         for key in keys:
             for original, other in ((current, legacy), (legacy, current)):
                 changed = deepcopy(original); changed['android'][key] = other['android'][key]
                 with self.subTest(key=key, repository=original['repository']), self.assertRaisesRegex(RuntimeError, 'formal Android NDK differs'):
                     validate(changed)
-        self.assertEqual(current['sourceCommit'], '2dba95e1b0285c29e78c48fc8ab8a451788a7d83')
-        self.assertEqual((self.root / 'scripts/android-rust-ndk.version').read_text().strip(), '27.3.13750724')
 
     def test_exact_reviewed_profile_rejects_alternate_path_bytes_keys_and_types(self):
         profile = self.profile

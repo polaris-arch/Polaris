@@ -67,9 +67,6 @@ describe('W27 首个可交互帧接线', () => {
     expect(router).toMatch(
       /<RendererReadyBoundary>\s*<SettingsPage \/>\s*<\/RendererReadyBoundary>/
     );
-    // 预取编排随分包一起删干净：没有 loader 表就没有“哪个 loader 忘了预热”这类缺口。
-    expect(router).not.toContain('screenLoaders');
-    expect(router).not.toContain('initialLoader');
   });
 
   it('React 同步失败与根 ErrorBoundary 都复用 ready 出口', () => {

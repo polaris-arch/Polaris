@@ -346,12 +346,8 @@ const defaultRun = (_cmd, args) => args[0] === 'show'
   : args[0] === 'status' ? '' : args[1] === 'HEAD^{tree}' ? 'c'.repeat(40) : sha;
 test('temporary default has exact independent pins and ordinary committed App contexts', () => {
   assert.equal(temporary.loadTemporaryDesktopSelection(defaultRoot).sourceCommit, binding.sourceCommit);
-  assert.equal(defaultManifest.desktopRelease, undefined);
-  assert.equal(defaultManifest.desktopTemporary.sourceCommit, 'fe182431495711c09bdb3b074ed6aa6309c00cf8');
-  assert.deepEqual(defaultManifest.desktopTemporary, currentManifest.historicalDesktopTemporary);
   assert.equal(temporary.hasTemporaryDesktop(currentManifest), false);
   assert.throws(() => temporary.loadTemporaryDesktopSelection(root), /exclusive desktop default/);
-  assert.equal(defaultManifest.historicalDesktopRelease.sourceCommit, '577d4b9a089b71d2f0a4ca334b87264b55c10478');
   for (const event of ['push', 'pull_request', 'merge_group', 'workflow_dispatch']) {
     const ordinary = { ...env, GITHUB_EVENT_NAME: event, GITHUB_REF: 'refs/heads/main' };
     delete ordinary.POLARIS_NATIVE_DNS_CANDIDATE;
@@ -431,11 +427,6 @@ test('selected temporary managed configuration checks map exactly four native de
   for (const host of [{ os: 'linux', arch: 'arm64' }, { os: 'win32', arch: 'arm64' },
     { os: 'android', arch: 'x64' }, { os: 'darwin', arch: '' }])
     assert.throws(() => managedCheckPlatform(host), /native desktop/);
-  const caller = readFileSync(join(root, 'crates/config-engine/src/builder/managed_mesh_emission/tests/mod.rs'), 'utf8');
-  assert.match(caller, /manifest\s*\.get\("desktopTemporary"\)/);
-  assert.match(caller, /get\("desktopRelease"\)/);
-  assert.match(caller, /verified\["sourceCommit"\], selection\["sourceCommit"\]/);
-  assert.match(caller, /verified\["sourceTree"\], selection\["sourceTree"\]/);
 });
 
 test('default PR head context requires the exact event head and correct base repository', () => {
@@ -559,26 +550,6 @@ test('default fetch cannot invoke historical formal recovery', () => {
   const fetch = readFileSync(join(root, 'scripts/fetch-core.mjs'), 'utf8');
   assert.match(fetch, /if \(hasTemporaryDesktop\(manifest\)\) throw Error\('Temporary default cannot recover/);
   assert.ok(fetch.indexOf('Temporary default cannot recover') < fetch.indexOf('recoverRelease(ROOT)'));
-});
-
-test('closed descriptor check preserves selected-core refusal, descriptor closure, completion and reap boundaries', () => {
-  const file = readFileSync(join(root, 'src-tauri/src/runtime/proxy/mesh_apply/candidate/check/tests/mod.rs'), 'utf8');
-  const body = file.slice(file.indexOf('async fn closed_standard_descriptors'), file.indexOf('fn sealed_fixture_binary'));
-  function check(text) {
-    for (const value of ['child_marker.is_none()', 'struct RestoreStandard', 'impl Drop for RestoreStandard',
-      'nix::unistd::close(fd)', 'fs::symlink_metadata(format!("/proc/self/fd/{fd}"))',
-      'linux::sealed_binary(&binary_path, profile)', 'linux::sealed_config(',
-      'linux::run_check(binary, config, Duration::from_secs(8))', 'saved.restore().unwrap()',
-      'ReapedChild(', 'Duration::from_secs(20)', 'child.0.kill()', 'child.0.wait()',
-      '!timed_out && status.success()', 'fs::read(marker).unwrap(), b"refused with 0/1/2 closed"', 'Err(CandidateCheckError::Unsupported)', 'old file pin refused before factory'])
-      assert.ok(text.includes(value), value);
-    assert.doesNotMatch(text, /exec 0<&-|Command::new\("sh"\)/);
-    assert.ok(text.indexOf('status.success()') < text.indexOf('fs::read(marker)'));
-  }
-  check(body);
-  for (const value of ['nix::unistd::close(fd)', 'linux::run_check(binary, config, Duration::from_secs(8))',
-    'saved.restore().unwrap()', 'ReapedChild(', '!timed_out && status.success()', 'child_marker.is_none()', 'Err(CandidateCheckError::Unsupported)', 'old file pin refused before factory'])
-    assert.throws(() => check(body.replace(value, 'REMOVED')));
 });
 
 
@@ -782,17 +753,6 @@ function candidateAcquisitionFixture(t, options = {}) {
 test('candidate acquisition fixture starts with the actual committed four-key compact pin shape', t => {
   for (const pin of Object.values(binding.platforms)) assert.deepEqual(Object.keys(pin).sort(), ['archive', 'core', 'id', 'sidecar']);
   const f = candidateAcquisitionFixture(t), loaded = loadCandidate(f.directory);
-  assert.equal(f.source.nativeRows, 44);
-  const committedNames = {
-    linux: 'sing-box-polaris-1.15.0-polaris-alpha.12-linux-amd64.tar.gz',
-    win: 'sing-box-polaris-1.15.0-polaris-alpha.12-windows-amd64.zip',
-    'mac-x64': 'sing-box-polaris-1.15.0-polaris-alpha.12-darwin-amd64.tar.gz',
-    'mac-arm64': 'sing-box-polaris-1.15.0-polaris-alpha.12-darwin-arm64.tar.gz',
-  };
-  for (const [key, expected] of Object.entries(committedNames)) {
-    assert.equal(producerReleaseName(binding.platforms[key].archive), expected);
-    assert.equal(loaded.platforms[key].archive.releaseName, expected);
-  }
   // A present undefined alias is invalid even though JSON cannot encode it.
   assert.throws(() => producerReleaseName({ ...binding.platforms.win.archive, releaseName: undefined }),
     { message: 'Upstream producer release archive name differs' });

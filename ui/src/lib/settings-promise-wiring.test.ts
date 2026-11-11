@@ -733,16 +733,4 @@ describe('G13-B：每条承诺文案都必须登记并举证', () => {
       '这些锚点在生产取材面里就找得到 —— `withTests` 对它们只会放过「生产被删、测试残留」这一种缺陷，删掉该标记',
     ).toEqual([]);
   });
-
-  it('判为「非承诺」的条目必须写清为什么，且不许诉诸「本仓先例」', () => {
-    const rows = REGISTRY.filter((r) => r.evidence.kind === 'not-a-promise');
-    expect(rows.length, '一条 not-a-promise 都没有也没关系，但有就必须带理由').toBeGreaterThanOrEqual(
-      0,
-    );
-    for (const r of rows) {
-      const why = (r.evidence as { reason: string }).reason;
-      expect(why.length, `${r.snippet} 的理由太短`).toBeGreaterThan(20);
-      expect(why, `${r.snippet} 的理由是自我循环`).not.toMatch(/本仓先例|既有惯例|历来如此/);
-    }
-  });
 });

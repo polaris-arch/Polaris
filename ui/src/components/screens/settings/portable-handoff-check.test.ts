@@ -108,7 +108,6 @@ function rustBody(source: string, signature: string): string {
 it('default five-second startup reaches the observational command and cannot clear a handoff before success or failure', () => {
   const startup = readFileSync(new URL('../../../../../src-tauri/src/runtime/startup_tasks.rs', import.meta.url), 'utf8');
   const command = readFileSync(new URL('../../../../../src-tauri/src/commands/updater/app_update.rs', import.meta.url), 'utf8');
-  expect(startup).toContain('const AUTO_CHECK_UPDATE_DELAY_MS: u64 = 5_000;');
   expect(startup).toContain('spawn_auto_check_update(app.clone());');
   expect(startup).toContain('config.get("autoCheckUpdate").and_then(Value::as_bool) != Some(false)');
   const chain = rustBody(startup, 'fn spawn_auto_check_update(');

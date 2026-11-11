@@ -4,15 +4,11 @@
 //! 正确的 UnlockStatus。所有 HTTP 经 `ScriptedHttp` mock，零网络。
 
 use async_trait::async_trait;
-use polaris_unlock::endpoints::{
-    ChatgptEndpoints, ClaudeEndpoints, DisneyEndpoints, GeminiEndpoints, GrokEndpoints,
-    NetflixEndpoints, SpotifyEndpoints, TiktokEndpoints, UA,
-};
+use polaris_unlock::endpoints::{GrokEndpoints, UA};
 use polaris_unlock::types::UnlockStatus;
 use polaris_unlock::{
     check_chatgpt, check_claude, check_disney, check_gemini, check_grok, check_netflix,
-    check_spotify, check_tiktok, HttpMethod, RedirectHop, UnlockHttp, UnlockRequest,
-    UnlockResponse,
+    check_spotify, check_tiktok, RedirectHop, UnlockHttp, UnlockRequest, UnlockResponse,
 };
 use std::sync::Mutex;
 
@@ -683,20 +679,6 @@ async fn checker_requests_carry_user_agent() {
     assert!(seen
         .iter()
         .any(|u| u.contains("netflix.com/title/70143836")));
-}
-
-// 防 unused（仅作引用锚点，对齐 Polaris endpoints 常量导出存在性）
-#[test]
-fn endpoints_constants_compile() {
-    let _ = ChatgptEndpoints::COOKIE_URL;
-    let _ = ClaudeEndpoints::HOME_URL;
-    let _ = GeminiEndpoints::AVAILABLE_MARKER;
-    let _ = NetflixEndpoints::OH_NO_MARKER;
-    let _ = DisneyEndpoints::BEARER;
-    let _ = GrokEndpoints::APP_MARKER;
-    let _ = TiktokEndpoints::STORE_REGION_URL;
-    let _ = SpotifyEndpoints::SIGNUP_URL;
-    let _: HttpMethod = HttpMethod::Get;
 }
 
 #[tokio::test]

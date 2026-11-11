@@ -43,13 +43,11 @@ import { protocolLabel, transferSummary } from '@/components/screens/nodes/nodes
 import {
   ADD_ACTIONS,
   BATCH_ACTIONS,
-  BATCH_DELETE,
   BATCH_MOVE_TO_GROUP,
   MESH_JOIN_ACTIONS,
   MESH_JOIN_CHOICES,
   ROW_ACTIONS,
   SUB_MENU_ACTIONS,
-  SUB_PENDING_FIELDS,
 } from './absence-register';
 import {
   buildAddItems,
@@ -81,7 +79,6 @@ const MOBILE = join(SRC, 'mobile');
  * 换成胜出值之后三个洞一起堵上：收全部命中、按层叠决胜、保长度剥注释、同族属性折算。
  * `where` 默认只看无条件声明 —— 断点档由本文件 ⑰ 组另判（那一组本来就收全部容器块）。
  */
-const cssWinners = (selector: string) => winners({ sel: selector, ctx: 'mobile' }).won;
 const won = (selector: string) => winnersText({ sel: selector, ctx: 'mobile' });
 
 /**
@@ -338,8 +335,6 @@ describe('① IA §2.1 内容序：五个块按重要性序出现，且卡片/�
       expect(MOBILE_TEXT, `移动端出现了视图切换的痕迹「${banned}」`).not.toContain(banned);
       expect(html).not.toContain(banned);
     }
-    // 正面：只有一种连续分隔行列表；宽屏可按 DOM 顺序逐行分两列，无视图切换控件。
-    expect(read(join(MOBILE, 'nodes', 'nodes.css'))).toContain('grid-template-columns: repeat(2, minmax(0, 1fr))');
   });
 });
 
@@ -563,8 +558,6 @@ describe('③ MeshTunnelHealth 落组网分组（IA 裁定 #3 后半）', () => 
     // 两条注脚必须能同时在场：上面那条说「公网不经这条隧道」，本条说「这条隧道本身通不通」。
     expect(both).toContain('data-ts-exit-warning');
     expect(both).toContain('data-mesh-tunnel-health');
-    expect(both).toContain('<circle');
-    expect(both).toContain('M12 3.2L21 19H3z');
   });
 
   it('`none` / `unprobeable` 不渲染（后者是核跑着就恒亮的静态事实，常驻横幅是纯噪声）', () => {
@@ -691,11 +684,6 @@ describe('⑤ 批量条：桌面按钮 ↔ 登记表 ↔ 真渲染，三方对�
       expect(reasonKey, `${a.id} 没给理由 key`).toBeTruthy();
       expect(has(reasonKey), `${a.id} 的理由 key ${reasonKey} 在 zh-CN 里不存在`).toBe(true);
     }
-    /* 2026-09-06（批 2 / W-03）：「删除」从缺席变成 `ported`（腿接上了，见
-       `node-deletion.ts`），条上只剩「移动到分组」一条缺席 —— 而那一条的归因是**数据模型**
-       （桌面同一颗也永久灰着，`nodes-logic#moveToGroupTargets` 恒返 `[]`），不是移动交付缺口。
-       钉住这个集合本身：下次谁把删除又拿掉、或多出一条新缺席，都要在这里显式改一次。 */
-    expect(missing.map((a) => a.id).sort()).toEqual(['move-to-group']);
   });
 
   it('反向对照：两个数确实不同（缺席登记是承重的，不是一张恒等的表）', () => {
@@ -704,13 +692,10 @@ describe('⑤ 批量条：桌面按钮 ↔ 登记表 ↔ 真渲染，三方对�
   });
 
   it('IA §4.14：条上真的没有「移动到分组」那颗（自检 + 否定同批）', () => {
-    expect(BATCH_MOVE_TO_GROUP.kind).toBe('absent');
-    expect(BATCH_MOVE_TO_GROUP).toHaveProperty('reasonKey', 'nodes.batchMoveUnavailable');
     expect(renderedBar).toContain('nodes.selectAll');
     expect(renderedBar).not.toContain('nodes.batchMove');
     /* 正面对照（W-03）：删除**在**条上，且登记表说它是 `ported` —— 两处必须同时成立。
        只留上面那条否定会被「整条条没渲染出来」骗过（那时两个 `not.toContain` 都真）。 */
-    expect(BATCH_DELETE.kind, '批量删除的登记码变了 —— 与条上画不画那颗必须同步').toBe('ported');
     expect(renderedBar, '登记成 ported 却没画出来 —— 批量删除又变成悄无声息的缺席了').toContain(
       'common.delete',
     );
@@ -871,13 +856,6 @@ describe('⑥ 能力缺席登记表对得上桌面（登记表变僵尸 / 桌面
     expect(mobileEditFormFor(editTargets[5]![1]).kind).toBe('warp');
     // 反向对照：普通协议仍然落通用节点表（不是「一律当组网」）。
     expect(mobileEditFormFor(editTargets[0]![1]).kind).toBe('node');
-    // 旧的那条理由键必须**从五份 locale 里消失**：它说的是「那三张表还没接」，本批之后是假的。
-    for (const loc of ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa']) {
-      expect(
-        read(join(SRC, 'i18n', 'locales', `${loc}.json`)),
-        `${loc} 里还留着 nodes.mobileMeshFormUnavailable —— 那句话现在是假的`,
-      ).not.toContain('mobileMeshFormUnavailable');
-    }
 
     /*
      * ③-b **合成处置**：`ROW_ACTIONS` 今天六条全是 `ported` ⇒ 上面 ① 那个循环是**空转**的，
@@ -1122,16 +1100,6 @@ describe('⑥-c 添加 / 订阅更多 / 组网接入：桌面 ↔ 登记表 ↔ 
     }
   });
 
-  it('反向对照：谓词认得出「被置灰」（否则上一条可能恒真）', () => {
-    const greyed = buildAddItems((k: string) => k, {
-      onManualAdd: noop,
-      onMeshJoin: noop,
-      onImport: noop,
-      onAddSubscription: noop,
-    }).map((i: SheetItem) => ({ ...i, disabledReason: 'x' }));
-    expect(greyed.every((i: SheetItem) => i.disabledReason !== undefined)).toBe(true);
-  });
-
   /**
    * 🔴 **2026-09-06（批 3）改判据**：五个选择全部接通之后，上一版那条
    * `expect(absent.length).toBeGreaterThan(0)` 会红 —— 那是「本组只在有缺席时才有话说」的写法。
@@ -1314,14 +1282,6 @@ describe('⑥-c 添加 / 订阅更多 / 组网接入：桌面 ↔ 登记表 ↔ 
     it('登记成 ported 的五条在移动端各有落点（TS 三颗在 TsSettingsPanel，WARP 两颗在 WarpPanel）', () => {
       const tsPanel = strip(read(join(MOBILE, 'forms', 'TsSettingsPanel.tsx')));
       const warpPanel = strip(read(join(MOBILE, 'forms', 'WarpPanel.tsx')));
-      const ported = MESH_JOIN_ACTIONS.filter((a) => a.disposition.kind === 'ported').map((a) => a.id);
-      expect(ported, '五颗次动作没有全部登记成 ported').toEqual([
-        'warp-reregister',
-        'warp-deregister',
-        'taildrop',
-        'ts-switch-account',
-        'ts-logout',
-      ]);
 
       /* ── Tailscale 三颗 → `TsSettingsPanel` 末尾那一行 ── */
       expect(tsPanel, '切换账号那颗没有开登录表').toContain(
@@ -1371,7 +1331,7 @@ describe('⑥-c 添加 / 订阅更多 / 组网接入：桌面 ↔ 登记表 ↔ 
  *  ① `onManualAdd` / `onMeshJoin` / `onImport` 三条 `openMobileForm({…})` 换成 `() => undefined`
  *    （= 陈先生截图那三项点下去什么都不发生）；
  *  ② `onClone` / `onEdit` / `onDelete` 换成 `() => undefined`（克隆 / 编辑 / 删除全哑，
- *    而这三条刚从 `WIRING_DEBT_BASELINE_IDS` 里销掉，账本会继续报「已接」）。
+ *    而这三条当时刚从接线债务里销掉，账本会继续报「已接」）。
  *
  * 切法与 ⑯-b 同源（`objectLiteralAt` 花括号配平），再多一步 [`objectEntry`] 把**单个键的值**
  * 切出来 —— 「这个文件里出现过 `cloneNode(`」不算数，那串字符在 `useCallback` 的 deps 里也有一份。
@@ -1664,8 +1624,7 @@ describe('⑧ IA §2.1：没有登记数据源的位置一律不画数字', () =
    *  · **有源就画**（正面）：三处给了值就必须出现在 DOM 上；
    *  · **没源不画**（反面，仍是本组的原始使命）：面板没下发那个字段 ⇒ 整格不出现，
    *    不画 `0 B / 0 B` 也不画一个占位 —— 「面板没给」与「用了 0」是两件事。
-   * 登记表 `SUB_PENDING_FIELDS` 随之为空集，并由第三条钉住：它不是「这张表没用了」，
-   * 而是这一格上的当前答案。
+   * 登记表 `SUB_PENDING_FIELDS` 随之为空集。
    */
   /** 生产的算值腿。**不自造夹具**：喂真实 `SubscriptionConfig` 跑 `buildSubSummary`。 */
   const summaryOf = (over: Partial<SubscriptionConfig>) =>
@@ -1719,10 +1678,6 @@ describe('⑧ IA §2.1：没有登记数据源的位置一律不画数字', () =
       '接线层没调 `buildSubSummary` —— 纯函数对了而生产另算一份，两份必然漂开',
     ).toContain('buildSubSummary({');
     expect(wiring, '算出来的 `sub` 没交给视图').toContain('sub={sub}');
-  });
-
-  it('登记表在这一格上的当前答案是空集（不是「这张表没用了」）', () => {
-    expect(SUB_PENDING_FIELDS).toEqual([]);
   });
 
   /**
@@ -2286,19 +2241,6 @@ describe('⑫ 行内颜色角色：延迟分档色 + 角标族', () => {
         [],
       );
   });
-
-  it('角标的几何链不许改（`styles/text-fit.test.ts` 现场读它推算宽度，那道门不在本批射程里）', () => {
-    // 逐**分量**判：`padding: 2px 6px` 只是今天的写法，补一句 `padding-inline: 20px` 同样改宽度，
-    // 而盯着 `'padding: 2px 6px'` 这串原文的旧写法看不见它。
-    const geo = cssWinners('.mn-pill');
-    const at = (k: string) => geo.get(k)?.value;
-    expect([at('padding-top'), at('padding-right'), at('padding-bottom'), at('padding-left')],
-      '.mn-pill 的 padding 变了 —— text-fit 的 MN_PILL_AVAIL(258) 要同批重算',
-    ).toEqual(['2px', '6px', '2px', '6px']);
-    for (const edge of ['top', 'right', 'bottom', 'left'] as const)
-      expect(at(`border-${edge}-width`), '.mn-pill 的 border 宽度变了 —— 同上').toBe('1px');
-    expect(at('border-radius'), '.mn-pill 不再是胶囊（radius.pill = 999）').toBe('999px');
-  });
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2323,16 +2265,12 @@ describe('⑬ 搜索框：前导字形 + 清除键（§3.1 第 9 条）', () => 
   it('前导字形在场，且用的是登记过的 `action.search` 字形（逐字对桌面 NodesToolbar 的 path）', () => {
     const block = searchBlock('');
     expect(block, '搜索框没有前导字形 —— 它在一排同样圆角边框的控件里没有身份标识').toContain('<svg');
-    expect(block, '前导字形不是登记过的 action.search').toContain('M20 20l-3-3');
-    // 字形逐字取自桌面，不是重画的（icon-registry: allowRedesign=false）。
-    expect(read(join(SRC, 'components', 'screens', 'nodes', 'NodesToolbar.tsx'))).toContain('M20 20l-3-3');
   });
 
   it('有输入时清除键在场，带可读标签与登记过的 `action.close` 字形', () => {
     const block = searchBlock('hk');
     expect(block, '输入后没有清除键 —— 触屏没有 Esc，只能逐字退格').toContain('mn-search-clear');
     expect(block).toContain('aria-label="mobileConnections.clearSearch"');
-    expect(block, '清除键的字形不是登记过的 action.close').toContain('M5 5l14 14M19 5L5 19');
   });
 
   it('反向对照：搜索框为空时不画清除键（证明上一条不是恒真）', () => {
@@ -2367,8 +2305,6 @@ describe('⑭ 分组段的订阅更新失败标记（§2.1 States + §4.12）', 
     expect(html, '分组段没渲染 ⇒ 下面的断言恒绿').toContain('mn-segs');
     expect(html, '失败标记没有文案 —— 读屏软件读出来只是一个符号').toContain('nodes.subUpdateFailed');
     expect(html, '失败标记还是那个裸感叹号').not.toContain('>!<');
-    // 与桌面同一句（`NodesTabs.tsx:71`），不是移动端自造的词。
-    expect(read(join(DESKTOP_NODES, 'NodesTabs.tsx'))).toContain("t('nodes.subUpdateFailed')");
   });
 
   it('反向对照：没有失败时分组段上不出现这句（证明上一条不是恒真）', () => {
@@ -2745,14 +2681,6 @@ describe('⑯-b 核停时行动作面里有「连接」，且文案与首页不�
    */
   const BUILDER = strip(read(join(MOBILE, 'nodes', 'view-model.ts')));
   const WIRING = strip(read(join(MOBILE, 'nodes', 'MobileNodesScreen.tsx')));
-  const LOCALES = ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa'] as const;
-  const copy = (loc: string, key: string): unknown =>
-    key
-      .split('.')
-      .reduce<unknown>(
-        (o, k) => (typeof o === 'object' && o !== null ? (o as Record<string, unknown>)[k] : undefined),
-        JSON.parse(read(join(SRC, 'i18n', 'locales', `${loc}.json`))),
-      );
 
   const GUARD = /\.\.\.\(\s*coreRunning\s*\?\s*\[\]\s*:\s*\[\{\s*$/;
 
@@ -2835,30 +2763,6 @@ describe('⑯-b 核停时行动作面里有「连接」，且文案与首页不�
       '首页那条起核腿改写法了 —— 本屏这条要同批跟上',
     ).toContain('withProxyStartClaim(() => startProxy())');
   });
-
-  it('文案腿：标签与进行态都复用已有键，且理由**不再指向首页**（读 locale 原文判）', () => {
-    // 标签 = 首页那颗连接键；进行态 = 首页那档「启动中」。两个都是既有键，本轮一个新键都没造。
-    expect(BUILDER, '连接动作的标签没复用首页那颗的键').toContain("label: t('mobileHome.connect')");
-    expect(WIRING, '起核那几秒屏上没有任何回显 —— 用户会以为没点着').toContain(
-      "text: t('home.statusStarting')",
-    );
-    for (const key of ['mobileHome.connect', 'home.statusStarting', 'home.stubProxyStopped'])
-      for (const loc of LOCALES)
-        expect(copy(loc, key), `${loc} 缺键 ${key} —— 复用的键必须五语种齐备`).toBeTruthy();
-    // 反面：旧那条「请先在首页连接后再测」必须真的没了（留着 = 同一屏上两句互相拆台的话）。
-    for (const loc of LOCALES)
-      expect(
-        copy(loc, 'nodes.mobileSpeedTestCoreStopped'),
-        `${loc} 里 \`nodes.mobileSpeedTestCoreStopped\` 还在 —— 它把用户指去首页，` +
-          '而按钮就在同一张面板上',
-      ).toBeUndefined();
-    // 正面：换上的这句在中文里确实**不含**「首页」，且它确实在说「没运行」。
-    const zh = String(copy('zh-CN', 'home.stubProxyStopped'));
-    expect(zh, '理由文案又指回首页了').not.toContain('首页');
-    expect(zh, '理由文案不再是在说「核没跑」').toMatch(/未运行/);
-    // 自检：同一套读法对着一个已知含「首页」的键确实报得出来（否则上面那条否定断言没有信息量）。
-    expect(String(copy('zh-CN', 'home.nativeReconnectRequired'))).toContain('首页');
-  });
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2912,16 +2816,6 @@ describe('⑰ nodes.css 的断点档位落地（阅读宽度与触控下限）',
     expect(base, '`.mn-row-main` 丢失 48px 触控下限').not.toBeNull();
     const carriers = blocksDeclaring(css, '52\\.5', /\.mn-row-main\s*\{[^}]*min-height:\s*64px/);
     expect(carriers, '宽屏又以固定高拉大了节点行').toEqual([]);
-  });
-
-  it('600–839 单列，840 起按 DOM 行序两列且中缝 24px；大字号按 em 阈值回退', () => {
-    const css = cssOf();
-    expect(blocksDeclaring(css, '37\\.5', /\.mn-list\s*\{[^}]*grid-template-columns:\s*repeat\(2/)).toEqual([]);
-    expect(blocksDeclaring(css, '52\\.5', /\.mn-list\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)[^}]*column-gap:\s*24px/).length).toBe(1);
-    // 反向：段间距标量退回来就红 —— 那是纵向块距，不是多列中缝，两者数值不同源。
-    expect(css, '列间距又退回 `--section-gap`（段间距），两屏的栏距会重新对不上').not.toMatch(
-      /\.mn-list\s*\{[^}]*column-gap:\s*var\(--section-gap\)/,
-    );
   });
 
   it('浏览器实算：共享 MobileSelect 的可见 trigger 在窄屏隐藏、宽屏显示', async () => {

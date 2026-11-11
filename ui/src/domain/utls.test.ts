@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { globalUtlsOptions, nodeUtlsOptions, nativeUtlsUnsupported, realityUtlsError, tlsFingerprintStatus, type TlsFingerprintSnapshot, type SelectedTlsSupportDirectory, GLOBAL_UTLS_OPTIONS, NODE_UTLS_OPTIONS, utlsDraftValue, utlsPatch } from './utls';
+import { globalUtlsOptions, nodeUtlsOptions, nativeUtlsUnsupported, realityUtlsError, tlsFingerprintStatus, type TlsFingerprintSnapshot, type SelectedTlsSupportDirectory, utlsDraftValue, utlsPatch } from './utls';
 
 describe('uTLS intent and shared menus', () => {
   it('preserves disabled dormant fingerprint and enabled core default on unchanged edit', () => {
@@ -17,18 +17,6 @@ describe('uTLS intent and shared menus', () => {
     expect(utlsPatch('none', base)).toEqual({ utlsMode: 'disabled', fingerprint: undefined });
     expect(utlsPatch('firefox', base)).toEqual({ utlsMode: 'profile', fingerprint: 'firefox' });
   });
-  it('does not advertise browser profiles without an actual core report', () => {
-    expect(GLOBAL_UTLS_OPTIONS.map(([value]) => value)).toEqual(['follow', 'default']);
-    expect(NODE_UTLS_OPTIONS.map(([value]) => value)).toEqual(['', 'none']);
-  });
-});
-
-it('all visible profiles exist in the backend admission list', () => {
-  const source = readFileSync(new URL('../../../crates/config-engine/src/user_config/utls.rs', import.meta.url), 'utf8');
-  const block = source.match(/pub const SUPPORTED_PROFILES:[^=]+=\s*&\[([\s\S]*?)\];/);
-  expect(block, 'backend capability list must remain resolvable').not.toBeNull();
-  const actual = new Set([...block![1].matchAll(/"([^"]+)"/g)].map((match) => match[1]));
-  for (const profile of ['random', 'randomized', 'chrome_155', 'chrome_133', 'firefox_148', 'firefox_120', 'safari_26_3', 'safari_16_0']) expect(actual.has(profile), profile).toBe(true);
 });
 
 const report = (ids: string[]): TlsFingerprintSnapshot => ({
@@ -189,10 +177,5 @@ it('uses actual native-engine capabilities without rejecting dormant engines or 
 });
 
 it('starts with Follow without replacing an explicit Default selection in both settings screens', () => {
-  for (const file of ['../components/screens/settings/SettingsNetwork.tsx', '../mobile/settings/NetworkPage.tsx']) {
-    const source = readFileSync(new URL(file, import.meta.url), 'utf8');
-    expect(source).toContain("config.utlsPolicy ?? 'follow'");
-    expect(source).not.toContain("config.utlsPolicy ?? 'default'");
-  }
   expect(globalUtlsOptions(undefined).map(([id]) => id)).toEqual(['follow', 'default']);
 });

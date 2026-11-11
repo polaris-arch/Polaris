@@ -6,7 +6,7 @@ use super::placement::{
     overlay_physical_size, overlay_xy, physical_tray_rect, resolve_tray_edge,
     tray_edge_boot_script, ScreenArea, TrayEdge,
 };
-use super::window::{TRAY_EDGE_GAP_LOGICAL, TRAY_MAX_HEIGHT_LOGICAL, TRAY_WIDTH};
+use super::window::{TRAY_EDGE_GAP_LOGICAL, TRAY_WIDTH};
 use super::*;
 use crate::i18n::{t, Lang};
 use tauri::{PhysicalPosition, PhysicalSize};
@@ -114,16 +114,6 @@ fn platform_tray_gap_scales_from_logical_pixels() {
     let expected = if cfg!(target_os = "windows") { 12 } else { 1 };
     assert_eq!(TRAY_EDGE_GAP_LOGICAL.round() as i32, expected);
     assert_eq!((TRAY_EDGE_GAP_LOGICAL * 2.0).round() as i32, expected * 2);
-}
-
-#[test]
-fn platform_tray_height_cap_leaves_no_windows_transparent_tail() {
-    let expected = if cfg!(target_os = "windows") {
-        700.0
-    } else {
-        720.0
-    };
-    assert_eq!(TRAY_MAX_HEIGHT_LOGICAL, expected);
 }
 
 #[test]

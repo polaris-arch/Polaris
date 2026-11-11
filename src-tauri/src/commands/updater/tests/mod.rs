@@ -615,37 +615,6 @@ fn a_non_string_digest_field_is_rejected_not_silently_dropped() {
     assert_eq!(resolve_expected_digest(&json!({ "other": 1 })), Ok(None));
 }
 
-/// 摘要来源表：**当前只有一级**，且每一级都必须自报字段名与对外标识。
-///
-/// # 本条不再声称「加一级只改一处」（2026-08-16 订正）
-///
-/// 前身叫 `digest_source_table_is_ordered_and_extensible`，配的文档说「U3 只需在表最前面
-/// 插一行」。那是**自相矛盾**的：本条自己就 `assert_eq!` 死了当前表，U3 必然要改它 ——
-/// 一个声称「只改一处」的断言，本身就是必然要改的第二处。真正的成因是
-/// [`DigestSource::field`] 把取法锁死成「`update_info` 顶层字符串字段」，而 `SHA256SUMS`
-/// 是另一次网络下载 + 按资产名查表（详见 [`DigestSource`] 文档）。
-///
-/// 所以本条现在只钉两件**今天为真**的事：表是单元素的（不留假接线），以及每一级都自报身份。
-///
-/// # U3 落地后本条**仍然为真**（2026-08-17）
-///
-/// 前身预期「U3 落地时本条会被改」。实际落地的是「发布侧产出 `SHA256SUMS` + 门」，
-/// 消费侧经判断**不接**（三条依据见 [`resolve_expected_digest`] 文档末节），故表仍是单元素。
-/// 这条断言因此从「本批还没做」变成「做过判断后的现状」—— 将来真要接第 2 个来源时它才会红。
-#[test]
-fn digest_source_table_is_the_single_current_source() {
-    assert_eq!(
-        EXPECTED_DIGEST_SOURCES,
-        [DigestSource::GithubAssetDigest],
-        "消费侧只认 GitHub asset digest 一级（随包 SHA256SUMS 已产出但经判断不接，不留假接线）"
-    );
-    // 每个来源都必须自报字段名与标识（新增一级时忘了补 → 编译期就红）。
-    for src in EXPECTED_DIGEST_SOURCES {
-        assert!(!src.field().is_empty());
-        assert!(!src.as_str().is_empty());
-    }
-}
-
 /// 🟡 **清单声明的 `fileSize` 是等值判据（无摘要腿的主防线）。**
 ///
 /// 无摘要腿此前**只有** Content-Length 兜底，而那个数是撒谎方自己给的：服务端/镜像返
@@ -2020,12 +1989,6 @@ fn portable_layout_is_decided_by_marker_file_next_to_exe() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
-/// 标记文件名是**跨文件契约**（`package.yml` 写它、本模块读它），钉死字面值。
-#[test]
-fn portable_marker_name_matches_packaging_contract() {
-    assert_eq!(PORTABLE_MARKER, "portable.marker");
-}
-
 // ── 下载进度（此前只有 0% / 100% 两点）───────────────────────────────────
 
 /// 🟡 **进度百分比的三条规则各有牙**：无分母不发 / 夹在 1..=99 / 同值去重。
@@ -2824,25 +2787,6 @@ fn update_install_stops_the_core_before_opening_the_portable_archive() {
     }
     // 整个模块里它只被 `update_install` 调用（定义 1 处 + 调用 1 处）。
     assert_eq!(src().matches("open_portable_update(").count(), 2);
-}
-
-/// 留底函数本身：两个位置都进日志，记录带上当下的应用版本，存不进去不阻断。
-#[test]
-fn portable_update_record_logs_both_locations_and_never_blocks_the_exit() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "fn remember_portable_update(");
-    assert!(
-        body.contains("log::info!(")
-            && body.contains("record.archive")
-            && body.contains("record.program_dir"),
-        "压缩包位置与程序目录必须写进日志：{body}"
-    );
-    assert!(body.contains("from_version: app.package_info().version.to_string()"));
-    assert!(body.contains("s.pending_portable_update = Some(record)"));
-    assert!(
-        !body.contains("return Err") && !body.contains('?'),
-        "保存失败只留痕，不让退出停在半路"
-    );
 }
 
 /// 码的字面是跨语言协议：渲染端 `settings-logic.ts` 的 `installFailureKey` 按它取

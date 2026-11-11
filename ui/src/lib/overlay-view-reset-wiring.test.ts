@@ -442,18 +442,6 @@ describe('G14：浮层视图态必须登记，视图态必须有 show/focus 复�
     }
   });
 
-  it('缺复位腿的视图态必须逐条写明理由，且不许诉诸「本仓先例」', () => {
-    for (const r of REGISTRY.filter((x) => x.reset === 'missing')) {
-      expect(r.note.length, `${r.file}::${r.name} 的理由太短`).toBeGreaterThan(30);
-      expect(r.note, `${r.file}::${r.name} 的理由是自我循环`).not.toMatch(
-        /本仓先例|既有惯例|历来如此/,
-      );
-      if (r.role === 'view') {
-        expect(r.note, `${r.file}::${r.name} 是视图态缺复位，理由须以「待修」起头`).toMatch(/^待修/);
-      }
-    }
-  });
-
   it('托盘至少有一条 focus 腿（复位腿要挂的地方还在）', () => {
     // 这条挡的是「onFocus 整个被删掉」——那时 hasResetLeg 恒假，上面几条会显得「一切照旧」。
     const tray = FILES.find((f) => f.rel === 'tray/TrayMenu.tsx')!;

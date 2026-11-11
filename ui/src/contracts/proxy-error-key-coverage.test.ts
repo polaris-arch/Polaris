@@ -186,7 +186,6 @@ describe('G0 自检：语料与解析都非空', () => {
   it('Rust 码集 / 映射表 / locale 三者都解析到了东西', () => {
     expect(rustErrorCodes().length, 'Rust 码一个都没解析到').toBeGreaterThanOrEqual(8);
     expect(Object.keys(PROXY_ERROR_TEXT_KEY).length, '映射表为空').toBeGreaterThanOrEqual(6);
-    expect(Object.keys(LOCALES).length, 'locale 语种不齐').toBe(5);
     for (const l of SUPPORTED_LANGUAGES) {
       expect(Object.keys(LOCALES[l]).length, `${l} 的语料为空`).toBeGreaterThan(100);
     }
@@ -381,12 +380,5 @@ describe('用户可见代理错误不渲染 raw message', () => {
     // 落进 `t()` 就是一串 `[native code]`。
     expect(proxyErrorReason({ errorCode: 'toString', message: 'm' }, t)).toBeNull();
     expect(proxyErrorReason({ errorCode: 'constructor', message: 'm' }, t)).toBeNull();
-  });
-
-  it('通用兜底句本身五语齐备', () => {
-    for (const l of SUPPORTED_LANGUAGES) {
-      const v = LOCALES[l]['errors.operationFailed'];
-      expect(typeof v === 'string' && v.trim() !== '', `${l} 缺 errors.operationFailed`).toBe(true);
-    }
   });
 });

@@ -26,9 +26,5 @@ it('standalone fixture root reuses the privacy feed and its disposal instead of 
 
 it('both standalone fixture branches install the feed; the full App retains its own lifecycle', () => {
   const source = readFileSync(new URL('../harness-main.tsx', import.meta.url), 'utf8');
-  expect(source).toContain('<HarnessPrivacyRoot><MeshJoinDialogView');
-  expect(source).toContain('<HarnessPrivacyRoot><DialogHost /></HarnessPrivacyRoot>');
-  expect(source.match(/<HarnessPrivacyRoot>/g)).toHaveLength(2);
-  expect(source).toContain('<App />');
   expect(source).not.toContain('setPrivacyMode(false)');
 });

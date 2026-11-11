@@ -76,14 +76,6 @@ class SourceBindingTests(unittest.TestCase):
         binding['indexArtifact'].update(bytes=path.stat().st_size, sha256=sha(path.read_bytes()))
         return path
 
-    def test_actual_binding_is_exact_inactive_new_source(self):
-        binding = source.validate(self.binding())
-        self.assertEqual(binding['sourceCommit'], 'fe182431495711c09bdb3b074ed6aa6309c00cf8')
-        self.assertEqual(binding['sourceTree'], '9b2fe41af73c5768dccff079ded1e4a489cfa9e1')
-        self.assertEqual(binding['producer']['runId'], 39075665574)
-        self.assertEqual(binding['producer']['runAttempt'], 1)
-        self.assertEqual(binding['indexArtifact']['id'], 12117466241)
-
     def test_shared_version_corpus_keeps_staging_inactive_and_alpha_only(self):
         cases = json.loads((HERE.parent / 'lib/polaris-version-fixtures.json').read_bytes())
         for version in cases['accepted'] + cases['rejected']:

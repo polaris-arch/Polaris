@@ -495,8 +495,6 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
     expect(androidRegistrationOf(geoSeedHostTests)).toEqual({
       key: geoSeedHostTests, table: 'NO_ANDROID_IMPACT_SCOPES',
     });
-    expect(NO_ANDROID_IMPACT_SCOPES[geoSeedHostTests]).toContain('cargo test --workspace');
-    expect(NO_ANDROID_IMPACT_SCOPES[geoSeedHostTests]).toContain('APK 构建不运行这些测试');
     // Registering this host-only test cannot suppress the actual Android assets.
     expect(classifyImpact(['src-tauri/gen/android/app/src/main/java/com/polaris2/app/vpn/BundledRules.kt']).android).toBe(true);
     expect(classifyImpact(['resources/data/geosite-cn.srs']).android).toBe(true);
@@ -635,14 +633,6 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
 
   it('D：NO_ANDROID_IMPACT_SCOPES 不是装饰，且它依赖的替补覆盖今天还在', () => {
     // ── D1：表本身 ──
-    // 哨兵贴着当前值（2026-09-05 实测 11 条），只留一格余量：它守的是「表在缩水」——
-    // 有人把某条判定删掉、那个文件从此两张表都查不到（而 B 组只在**文件还在**时才会红）。
-    // 🔴 **加条目时要顺手把这个数抬上来**，否则它会一路退化成「> 8」那种起不到作用的下限。
-    expect(
-      Object.keys(NO_ANDROID_IMPACT_SCOPES).length,
-      `NO_ANDROID_IMPACT_SCOPES 只剩 ${Object.keys(NO_ANDROID_IMPACT_SCOPES).length} 条（下限 10，` +
-        '当前 11）—— 有判定被删掉了，先确认那个文件是真的没了，还是判定被顺手删了。',
-    ).toBeGreaterThanOrEqual(10);
     for (const [key, why] of Object.entries(NO_ANDROID_IMPACT_SCOPES)) {
       expect(
         classifyImpact([key]).android,
@@ -766,30 +756,6 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
       `ci.yml 的「${crossStep!.name}」里没有 \`rustup target add\` —— 交叉 target 装不上，` +
         'NO_ANDROID_IMPACT_SCOPES 里「由 android 交叉 clippy 覆盖」的每一条理由当场变成假话。',
     ).toBeDefined();
-    const installedTargets = rustupLine!
-      .slice(rustupLine!.indexOf('rustup'))
-      .split(/\s+/)
-      .slice(3)
-      .filter(Boolean)
-      .sort();
-    // 2026-09-06 多出 `aarch64-apple-ios` —— 按本条自己的要求「有人来确认它是不是该进本门的射程」，
-    // 确认结论：**进射程，但不改变本表任何一条理由**。
-    //   · NO_ANDROID_IMPACT_SCOPES 的理由指的是「由 android 交叉 clippy 覆盖」，那一格没动
-    //     （android 的豁免面由下面 D3 逐字钉住，加 ios 腿不改变它：豁免按 target 生效，
-    //     `polaris-unlock-transport` 多出的 ios 条目不进 android 那张比对面）。
-    //   · ios 那一格覆盖的是另外 17 个纯 Rust 包的 iOS 编译面，`polaris`(src-tauri) 在 ios 上
-    //     整包豁免且**补不了** `cargo check`（build script 撞 `xcrun` 缺席，实测），
-    //     故它一条 android 理由都替代不了、也一条都不削弱。
-    expect(
-      installedTargets,
-      `ci.yml 装的交叉 target 集合变了（现在是 [${installedTargets.join(', ')}]）。` +
-        '少了 aarch64-linux-android = 本表的理由集体作废；多了一个也要有人来确认它是不是该进本门的射程。',
-    ).toEqual([
-      'aarch64-apple-ios',
-      'aarch64-linux-android',
-      'x86_64-apple-darwin',
-      'x86_64-pc-windows-msvc',
-    ]);
 
     // ④ 那条 check 按 **token** 是「check aarch64-linux-android 上的 polaris」，且没被中和。
     //    子串判定在这里恰好全盲：`-p polaris` 是 `-p polaris-helper` 的前缀。

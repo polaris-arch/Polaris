@@ -142,14 +142,6 @@ fn reviewed_directory_matches_exact_expected_core_without_observing_installed_fi
             "source-derived-stable-catalog"
         );
         assert!(value["selectedSpec"]["observationStdoutSha256"].is_null());
-        assert_eq!(value["document"]["profiles"].as_array().unwrap().len(), 16);
-        assert_eq!(
-            value["document"]["legacyChromeAliases"]
-                .as_array()
-                .unwrap()
-                .len(),
-            5
-        );
         for field in [
             "identity",
             "binarySha256",
@@ -373,25 +365,9 @@ fn capability_document_schema_modules_target_version_and_inventory_are_bound() {
 #[test]
 fn historical_observed_stdout_cannot_claim_current_s19_cli_provenance() {
     let history = observed_catalog();
-    for (index, platform, expected_sha) in [
-        (
-            0,
-            "linux",
-            "801967de5b95cba408d56d160ce6888082222f194301bcb80728a7bfa635ca1e",
-        ),
-        (
-            1,
-            "mac-arm64",
-            "eda9a1e8fa5d90c15c2f813664483d5b967337aa1b7d0578849875ece800f7a0",
-        ),
-    ] {
+    for (index, platform) in [(0, "linux"), (1, "mac-arm64")] {
         load_observed(&history, platform).unwrap();
         let observation = &history["bindings"][index]["provenance"];
-        assert_eq!(observation["stdoutSha256"], expected_sha);
-        assert_eq!(
-            polaris_updater::sha256_hex(observation["stdout"].as_str().unwrap().as_bytes()),
-            expected_sha
-        );
         let mut invalid_hash = history.clone();
         invalid_hash["bindings"][index]["provenance"]["stdoutSha256"] = json!("0".repeat(64));
         assert!(load_observed(&invalid_hash, platform).is_err());

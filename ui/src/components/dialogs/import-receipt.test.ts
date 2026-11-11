@@ -112,19 +112,4 @@ describe('导入回执接线', () => {
     expect(refresh.length, 'addBulk 之后必须 loadConfig(true) 刷 store').toBe(1);
     expect(textOf(refresh[0].arguments[0])).toBe('true');
   });
-
-  it('两个回执键五语齐备（G6 已零容忍，这里只钉「本门用到的这两条」）', async () => {
-    const locales = ['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'];
-    for (const L of locales) {
-      const json = JSON.parse(
-        readFileSync(join(HERE, '..', '..', 'i18n', 'locales', `${L}.json`), 'utf8')
-      ) as { nodes?: Record<string, unknown> };
-      for (const k of ['importOk', 'importStagedOk']) {
-        expect(typeof json.nodes?.[k], `${L} 缺 nodes.${k}`).toBe('string');
-        expect(String(json.nodes?.[k]), `${L} 的 nodes.${k} 必须带 {{count}}`).toContain(
-          '{{count}}'
-        );
-      }
-    }
-  });
 });

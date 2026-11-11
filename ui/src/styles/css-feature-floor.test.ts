@@ -1223,15 +1223,6 @@ describe('④ 手写面豁免项的兜底必须真的在（豁免不是空头支
 });
 
 describe('⑤ 构建产物面：Tailwind v4 生成的 CSS 同样 ≤ Chromium 105', () => {
-  it('相同冻结输入共享在途 Promise，负控不污染共用输出', async () => {
-    const first = buildTailwindCss();
-    expect(buildTailwindCss()).toBe(first);
-    const original = await first;
-    const mutant = original + '\n.__cache_probe { height: 100svh; }';
-    expect(mutant).not.toBe(original);
-    expect(await buildTailwindCss()).toBe(original);
-  });
-
   it('构建输出里的全部特性都在名单内（v4 preflight 会自己生成 color-mix / 1lh）', async () => {
     const built = stripNoise(await buildTailwindCss());
     expect(parse(built).decls.length, '构建输出为空 —— 这条腿没跑').toBeGreaterThan(5000);

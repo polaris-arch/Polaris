@@ -96,19 +96,17 @@
  *
  * 那张表两个方向各有一段自检，**两段的强度必须写出来**（第七轮 T1 / T2）：
  *  · **实际 ⊆ 声明**：`measureOnce` 发命令之前过一遍 [`assertPointDeclared`]。这是一条**运行期自检**，
- *    **它自己没有判据** —— 函数本身有正反对照（`css-oracle-sampling.test.ts`「有牙」那条），
+ *    **它自己没有判据** —— 函数本身的正反对照随 `css-oracle-sampling.test.ts` 一起删了，
  *    但「`measureOnce` 真的调用了它」这条**接线**没人守：把那一行删掉，全量照样全绿。
- *  · **声明 ⊆ 实际**：`css-oracle-sampling.test.ts` 判的是**调用点源码里有没有那个字面量**，
- *    不是运行期有没有真采过。采样者被 `skip` 掉、或那条 `measure(...)` 断言被注掉一半，
- *    只要 `viewport: {…}` / `media: {…}` 这几行还在源码里，声明照旧全绿。
+ *  · **声明 ⊆ 实际**：**没有自检**（原先只读调用点源码的 `css-oracle-sampling.test.ts` 已删除）。
  *
  * 所以这里**不写**「两个方向都有门」—— 上一版就是这么写的，而那两扇门之间的缝正好是生产路径。
  * 两条都进了下面那张「抓不到的形态」表。
  *
  * 🔴 这张表是**按轴**的，不是按（链 × 轴）的：它答不出「桌面那条链采过 dark 吗」。
  * 今天桌面链确实采了 `prefers-color-scheme` 的两个取值（`window-drag-region.test.ts` 的 dark 腿，
- * 第七轮 T6 补的），钉住这一点的判据只有一条、且读的是那个文件的**源码**
- * （`css-oracle-sampling.test.ts`「桌面链的 dark 腿还在」）。其余（链 × 轴）格子没有判据。
+ * 第七轮 T6 补的），但钉住这一点的判据（原 `css-oracle-sampling.test.ts`，读源码）已删除。
+ * （链 × 轴）格子今天都没有判据。
  *
  * 采样面之外的条件档 **今天没有判据**（不是「通过了」）。哪些形态谁都抓不到 ⇒ 见下面那张表。
  *
@@ -118,8 +116,8 @@
  * |------|--------|
  * | 只在**未采样条件档**下才出现的覆写（`@media (max-width:380px)`、`dir=rtl`、`data-*` 的其它取值、`prefers-contrast` …） | **没人守**。静态模型按定义只看无条件档；本裁判只看 [`SAMPLED_FACE`] 那几个点。两者的**并集**才是覆盖面，并集之外今天是空的。 |
  * | 「实际 ⊆ 声明」那条**接线**：`measureOnce` 里的 `assertPointDeclared(point)` 这一行 | **没人守**（第七轮 T1）。函数自己有正反对照，接线没有 —— 本轮实测把那一行注掉，全量 239 文件 / 4019 条照样 rc=0 全绿，没有任何东西会说话。处置是把这句话说窄，不是再给它造一层门。 |
- * | 「声明 ⊆ 实际」那条门的**判定对象**：它读的是调用点**源码里的字面量**，不是运行期真采过 | **没人守**（第七轮 T2）。本轮实测把桌面那整个 `describe` 改成 `describe.skip`（一次度量都不发），`css-oracle-sampling.test.ts` 9/9 照旧全绿 —— 只要那几行对象字面量还留在源码里。 |
- * | （链 × 轴）这一格：**某条链**在某条轴上到底采了哪几个取值 | 只有一条：「桌面链的 dark 腿还在」（读源码，第七轮 T6）。[`SAMPLED_FACE`] 本身是按轴声明的，其余格子**没人守**。 |
+ * | 「声明 ⊆ 实际」这个方向 | **没人守**。原先读调用点源码字面量的 `css-oracle-sampling.test.ts` 已删除。 |
+ * | （链 × 轴）这一格：**某条链**在某条轴上到底采了哪几个取值 | **没人守**。[`SAMPLED_FACE`] 本身是按轴声明的。 |
  * | 构建期注入、而 **TS/CSS 模块图看不见**的 CSS（运行期 `<link>`、宿主 `.html` 之外注入的 `<style>`、平台侧注入） | 宿主 `.html` 里的 `<head><style>` 由 [`hostSkeleton`] 接住并进链（第六轮 A4）；`<link rel=stylesheet>` 出现在宿主 `.html` 的**任何位置**（`<head>` 与 `<body>` 都算）⇒ **抛**（第七轮 T4 把扫描面从 `<head>` 扩到整份文档）。**其余没人守** —— 运行期注入的样式本模块看不见。 |
  * | 运行期 **JS 改的内联样式 / class**（`useEffect`、事件处理器、动画帧） | **没人守**。本模块喂的是 `renderToStaticMarkup` 的静态 HTML，JS 不跑。组件级行为断言（各屏 `*.test.tsx` 的非 CSS 组）守的是 props→markup，不是 CSS 结果。 |
  * | 交互态 `:hover` / `:focus` / `:active` / `:focus-visible` | **没人守**。CDP 有 `CSS.forcePseudoState`，本模块没接。 |
@@ -1214,8 +1212,7 @@ export const effectiveMedia = (media?: Readonly<Record<string, string>>): Record
  * 只把采到的那几个点写成一张表，两个方向各有一段自检，**强度各不相同**（第七轮 T1 / T2）：
  *  · **实际 ⊆ 声明**：`measureOnce` 拿实际发出去的点过 [`assertPointDeclared`]。运行期自检，
  *    **这条接线自己没有判据** —— 删掉那一行不会有任何东西说话。
- *  · **声明 ⊆ 实际**：`css-oracle-sampling.test.ts` 从**全部调用点的源码**里把字面量提出来与本表对拍。
- *    它判的是**源码**，不是运行期：采样者被 `skip` 掉而源码原样留着 ⇒ 照旧全绿。
+ *  · **声明 ⊆ 实际**：没有自检（原先读源码对拍的 `css-oracle-sampling.test.ts` 已删除）。
  *
  * 本表按**轴**声明，不按（链 × 轴）：它答不出「桌面链采过 dark 吗」。
  * 表外的条件档 **今天没有判据**。哪些形态谁都抓不到，见本文件头注那张表。
@@ -1274,7 +1271,7 @@ export function assertPointDeclared(point: SampledPoint, face = SAMPLED_FACE): v
       '要采这一档：把取值补进 `SAMPLED_FACE`。\n' +
       '⚠️ 别把这条自检读成「采样面被守着」：本函数自己有正反对照，但\n' +
       '   ·「`measureOnce` 真的调用了它」这条接线**没有判据**（注掉那一行，全量照样全绿）；\n' +
-      '   ·`css-oracle-sampling.test.ts` 判的是**调用点源码里有没有那个字面量**，不是运行期真采过\n' +
+      '   ·原 `css-oracle-sampling.test.ts`（已删）判的只是**调用点源码里有没有那个字面量**，不是运行期真采过\n' +
       '     （把采样者 `describe.skip` 掉，那道门仍然全绿）。\n' +
       '   两条都在头注「🔴 本裁判抓不到的形态」表里，别在这里读出比那张表更强的结论。',
   );
@@ -1501,7 +1498,7 @@ export function measure(input: OracleInput, asks: readonly Ask[]): Promise<Measu
  *
  * 只有一个消费方 —— [`assertPointDeclared`]，`measureOnce` 在发命令之前拿它过一遍。
  * 🔴 上一版这里还挂着一个 `lastSampledPoint()`，头注写着「B1 那道门拿它从**运行期**取实际值、
- * 而不是从源码里正则」。那是假话：`css-oracle-sampling.test.ts` 做的正是后者（读源码），
+ * 而不是从源码里正则」。那是假话：当时的 `css-oracle-sampling.test.ts`（现已删除）做的正是后者（读源码），
  * 而且全仓零消费方。假声明 + 死代码，两条理由各自都够，本轮删掉。
  */
 export interface SampledPoint {

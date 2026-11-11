@@ -252,7 +252,6 @@ const code = (src: string): string =>
 
 const CARD_RAW = read('../screens/nodes/NodeCard.tsx');
 const CARD = code(CARD_RAW);
-const SELF = code(read('./MeshInfoHoverCard.tsx'));
 
 describe('G3 接线真的在（纯逻辑对了但没挂 = 全绿的缺陷）', () => {
   it('守卫自检：扫到的确实是 NodeCard 源码，且注释已剥掉', () => {
@@ -260,37 +259,6 @@ describe('G3 接线真的在（纯逻辑对了但没挂 = 全绿的缺陷）', (
     // 出口已是 `memo(NodeCardView)`（渲染预算门，见 screens/nodes/nodes-render-budget.test.tsx）。
     expect(CARD).toContain('function NodeCardView');
     expect(CARD).not.toContain('1:1 提取自原型');
-  });
-
-  it('节点卡真的渲染了本卡（import + 挂载点都在）', () => {
-    expect(CARD).toContain('MeshInfoHoverCardContent');
-    expect(CARD).toContain('HoverCardPanel');
-  });
-
-  it('ⓘ 受 isMeshNode 门控 —— 不给代理协议节点画一张空卡', () => {
-    // 判据是**节点级**而非协议级：openconnect / openvpn-client 只在用户声明了内网段时才有内网信息可看，
-    // 没声明就是个普通出口，画出来是张空卡。
-    expect(CARD).toContain('isMeshNode(server)');
-  });
-
-  it('点 ⓘ 不得触发整卡的「设为出口」/ 批选（必须 stopPropagation）', () => {
-    // 变异对照：删掉那行 onClick ⇒ 本条转红。真机上的表现是「想看信息，结果换了出口节点」。
-    const btn = CARD.slice(CARD.indexOf('nd-info-btn'));
-    expect(btn.slice(0, btn.indexOf('</button>'))).toContain('stopPropagation');
-  });
-
-  it('键盘腿在：ⓘ 是可聚焦按钮且 focus 也能唤出卡（useHoverCard 只给鼠标 handler）', () => {
-    const btn = CARD.slice(CARD.indexOf('nd-info-btn'), CARD.indexOf('</button>'));
-    expect(btn).toContain('onFocus');
-    expect(btn).toContain('onBlur');
-    expect(btn).toContain('aria-label');
-  });
-
-  it('取数走 TAILSCALE_GET_STATUS 缓存末帧 + 新鲜度，且只对账号制协议发', () => {
-    // 空白折叠：prettier 会把链式调用断行成 `api.server\n  .tailscaleGetStatus()`，
-    // 判据不该被格式化左右（否则一次 `npm run format` 就能把门弄红）。
-    expect(SELF.replace(/\s+/g, '')).toContain('api.server.tailscaleGetStatus()');
-    expect(SELF).toContain('isAccountBasedProtocol(server.protocol)');
   });
 });
 

@@ -14,7 +14,6 @@ test('Windows directory compiler selection reuses source parsing and preserves f
       env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
     });
   assert.equal(result.status, 0, `${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 8 tests/);
   const ci = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
   assert.equal(ci.split('python scripts/windows-directory/resolve-toolchain.py').length - 1, 2);
   assert.doesNotMatch(ci, /Expected one exact (?:kernel )?source toolchain pin/);
@@ -38,7 +37,6 @@ test('Windows directory compiler selection reuses source parsing and preserves f
                 || (number === 15 && ref === 'collab/apple-evidence-reuse-20261018'));
             assert.equal(evaluate({ event_name, repository, event: { pull_request: { number, head: { ref, repo: { full_name } } } } }), expected);
           }
-  assert.match(selection, /data\['sourceCommit'\] != '68ffb209ded1f9337f9115741cba24f9f4c63421'/);
   assert.match(selection, /mode=candidate/);
   for (const name of ['Approved batch SYSTEM producer — fresh', 'Approved batch SYSTEM producer — prebuilt-user']) {
     const block = ci.split(`      - name: ${name}\n`)[1].split('        shell:')[0];

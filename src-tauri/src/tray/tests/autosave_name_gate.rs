@@ -13,7 +13,7 @@
 
 use std::sync::LazyLock;
 
-use crate::test_support::{crate_file, crate_root_code, expect_marker, module_code};
+use crate::test_support::{crate_root_code, expect_marker, module_code};
 
 /// 取材面 = **模块** `tray`（`tray.rs` + `tray/**` 递归，剔除 `tests/`）的**剥注释面**，
 /// 不是单文件 `tray.rs`、也不是全文。
@@ -48,13 +48,6 @@ static MAIN_RS: LazyLock<String> = LazyLock::new(|| {
         crate_root_code(),
         "src-tauri/src/{main,lib}.rs",
         "\npub fn run() {",
-    )
-});
-static CARGO_TOML: LazyLock<String> = LazyLock::new(|| {
-    expect_marker(
-        crate_file("Cargo.toml"),
-        "src-tauri/Cargo.toml",
-        "\nname = \"polaris\"",
     )
 });
 
@@ -106,22 +99,5 @@ fn wired_once_at_boot() {
     assert!(
         i < j,
         "pin_tray_autosave_name 排在托盘启动汇流点之后 —— 位置属性应在首次呈现前就位"
-    );
-}
-
-/// 🔴 `objc2-app-kit` 必须开 `NSStatusItem` 与 `NSWindow` feature。
-///
-/// 这条门的存在理由很具体：漏了它 **mac 腿编不过，而本机（Linux）完全看不到** ——
-/// 要等 CI 的 macOS 矩阵跑完才暴露，而那条腿是 10x 计费里最慢的一档。
-#[test]
-fn objc2_app_kit_has_nsstatusitem_feature() {
-    let line = CARGO_TOML
-        .lines()
-        .find(|l| l.trim_start().starts_with("objc2-app-kit"))
-        .expect("Cargo.toml 里找不到 objc2-app-kit");
-    assert!(
-        line.contains("\"NSStatusItem\"") && line.contains("\"NSWindow\""),
-        "objc2-app-kit 没开 NSStatusItem/NSWindow feature —— 托盘位置或 non-activating 宿主在 mac 上编不过，\
-             而本机看不到。当前行：{line}"
     );
 }

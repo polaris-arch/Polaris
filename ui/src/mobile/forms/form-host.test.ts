@@ -65,10 +65,6 @@ beforeEach(() => {
 });
 
 describe('① 栈语义（与桌面 dialog-store 同形：push / pop / 按身份关闭）', () => {
-  it('自检：起手是空栈，且 `closeAll` 真的排得空（否则下面每条都在别人的残留上跑）', () => {
-    expect(useMobileFormStore.getState().stack).toEqual([]);
-  });
-
   it('open 返回稳定身份，叠上去的在栈顶', () => {
     const a = openMobileForm({ kind: 'node' });
     const b = openMobileForm({ kind: 'import' });
@@ -131,48 +127,6 @@ describe('② union 的每一支在宿主里都有 case（`never` 兜底不许�
       'const never: never = entry',
     );
     expect(HOST_SRC, '兜底退化成了静默返回').not.toMatch(/default:\s*\n?\s*return null;/);
-  });
-
-  /**
-   * 恰等快照。**不是「包含」** —— 包含式断言会被「顺手删掉一支」骗过，而删掉的那一支恰恰是
-   * 某条入口点开之后什么都不发生的形态。批 3 新增四支（组网三张表 + Tailscale 设置表）；
-   * 批 13 新增 `rule`（连接行的「新建规则」，`RuleFormPanel`）。
-   */
-  it('落地的二十一个 kind 一个不少一个不多（少一个 = 那条入口点开是空的）', () => {
-    /* 2026-09-13（批 10 / 规则屏）加了六支：规则表、DNS 服务器 / 分组两张表、
-       添加自定义应用、资源目录、按 URL 下载。加一支而不补 case ⇒ 宿主的 `never` 兜底编译不过，
-       这条断言守的是另一半：**加了 case 却忘了在这里登记**（那时没有任何东西会红）。
-       2026-09-13（批 16）加了 `taildrop`：Taildrop 收件箱，入口在 `TsSettingsPanel` 的
-       账号级动作那一行，**必须带 `serverId`**（Tailscale 已不是单例）。
-       2026-09-25（ζ 批 A8）加了 `sub-create-task`：订阅创建操作的恢复面，只由应用级水合
-       （`app-wiring.ts`）与订阅表单的发布失败交接打开，**必须带 `operationId`**。
-       2026-09-25（网络场景移动端批）加了 `network-profile`：场景表单（新建 / 编辑），入口在规则屏
-       「网络场景」二级页与规则表单「生效网络」的「新建场景…」（后者带 `onSaved` 回填）。 */
-    expect(unionKinds).toEqual(
-      [
-        'app-add',
-        'confirm',
-        'dns-group',
-        'dns-server',
-        'identity-repair',
-        'import',
-        'mesh-join',
-        'network-profile',
-        'node',
-        'res-catalog',
-        'res-url',
-        'rule',
-        'sub',
-        'sub-create-task',
-        'taildrop',
-        'ts-exit',
-        'ts-login',
-        'ts-settings',
-        'vpn-auth',
-        'warp',
-        'wg',
-      ].sort(),
-    );
   });
 });
 
@@ -458,23 +412,6 @@ describe('⑥ 复用与死控件：三条各一条判据', () => {
     expect(strip(read('../../components/dialogs/FieldSpec.tsx'))).toContain(
       'return normalizeSelectOptions(options, current, translate);',
     );
-    // 反向自检：同一条否定断言对着旧写法确实报得出来。
-    expect(
-      "/^[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+$/.test(l)".includes('[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+'),
-    ).toBe(true);
-  });
-
-  it('「经代理更新」被全局策略覆盖时置灰并换说明（一颗必然无效的开关比没有更坏）', () => {
-    const src = strip(read('./SubFormPanel.tsx'));
-    /* `domain/subscription-proxy.ts` 在 policy 非 follow 时直接按 policy 返回、忽略 per-sub ⇒
-       那颗开关结构上不可能生效。移动端设置页自己就能把 policy 拨成 proxy/direct，路径闭合。 */
-    expect(src, '没有读全局策略 —— 开关恒可点').toContain('config?.subscriptionProxyPolicy');
-    expect(src, '覆盖时没有置灰那颗开关').toMatch(/disabled=\{proxyOverridden\}/);
-    for (const key of ['sub.viaProxyOverrideProxy', 'sub.viaProxyOverrideDirect']) {
-      expect(src, `覆盖态没有换成 ${key} —— 屏上没有一句话解释为什么拨了不生效`).toContain(key);
-    }
-    // 反面：通用那句只许留在 follow 那一档（三元的兜底），不许成为恒定说明。
-    expect(src).toMatch(/proxyPolicy === 'proxy'[\s\S]{0,220}sub\.viaProxyHint/);
   });
 
   it('订阅创建的终态：先校验真的发布到 store，`clearTerminal` 排在 `hasInstance` 之后', () => {

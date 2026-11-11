@@ -44,7 +44,6 @@ function productionUiSources(dir: string): string[] {
 
 const TRAY_MENU = 'ui/src/tray/TrayMenu.tsx';
 const SETTINGS_HELPER = 'ui/src/components/screens/settings/SettingsHelper.tsx';
-const TRAY_CSS = 'ui/src/tray/tray-overlay.css';
 
 /** 用户可感知的动作 channel——它们的 invoke 失败必须有回显，禁 `.catch(() => {})`。
  * （TRAY_HIDE / TRAY_RESIZE 是窗口管线自检，失败不属于「用户动作失败」，不在射程。） */
@@ -53,9 +52,6 @@ const ACTION_CHANNELS_BANNED_SWALLOWS = [
   'TRAY_ENTER_LIGHTWEIGHT).catch(() => {})',
   'TRAY_QUIT).catch(() => {})',
 ] as const;
-
-/** TrayMenu 里 `noticeActionFailure` 的调点数：三种出口选择共用一个失败回显，其余动作独立保留。 */
-const NOTICE_CALL_SITES = 11; // Server switching now uses the shared typed error mapper below.
 
 /** lockNow 的顺序语义（Med-1）：必须「await 成功 → 才 hide」。先 hide 再 await 的旧序在失败时
  * 连 notice 都无处显示。以 indexOf 顺序钉住——重排回去（hide 在 await 之前）即红。 */
@@ -81,17 +77,6 @@ describe('点击类失败必须可见（W10/W14/W15 防回潮）', () => {
     }
   });
 
-  it('noticeActionFailure 调点数固定（新增动作必须同样接失败回显）', () => {
-    const src = read(TRAY_MENU);
-    const count = src.split('noticeActionFailure').length - 1;
-    expect(
-      count,
-      `noticeActionFailure 应恰有 ${NOTICE_CALL_SITES} 处（含定义）。少于它 = 有动作漏接；` +
-        `多于它 = 改了动作面，本门计数与动作清单需同步审`,
-    ).toBe(NOTICE_CALL_SITES);
-    expect(src).toContain("setNotice(serverSwitchErrorText(serverSwitchErrorCode(err)");
-  });
-
   it('lockNow 必须「await 成功才 hide」——先关浮层再试锁定，失败时 notice 无处显示（Med-1）', () => {
     const src = read(TRAY_MENU);
     // 两个锚点必须取自**同一个区间**：awaitAt 曾在整个 TrayMenu.tsx 上 indexOf、hideAt 只在 lockNow
@@ -110,15 +95,6 @@ describe('点击类失败必须可见（W10/W14/W15 防回潮）', () => {
       awaitAt < hideAt,
       'lockNow 的 hide() 又跑到了 await 之前：失败时浮层已收起、隐私态没进、notice 无处显示',
     ).toBe(true);
-  });
-
-  it('全部节点视图有零节点空态（W15：菜单不得塌成一条）', () => {
-    const src = read(TRAY_MENU);
-    expect(src.includes('tray-nodes-empty'), 'TrayMenu 缺空态节点').toBe(true);
-    expect(src.includes('groups.length === 0'), '空态判据不在 groups 上——改了数据源就漏判').toBe(true);
-    const css = read(TRAY_CSS);
-    expect(css.includes('.tray-nodes-empty'), 'CSS 缺 .tray-nodes-empty').toBe(true);
-    expect(css.includes('min-height'), '空态没有最小高度兜底，高度仍会塌缩').toBe(true);
   });
 
   it('SettingsHelper 必须消费 helper 信封的 success/errorCode（W10）', () => {

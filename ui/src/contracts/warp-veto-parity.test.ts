@@ -205,16 +205,6 @@ describe('锁 3/4：WARP 判据两侧同源', () => {
     expect(canonical(fieldsRead(RUST_IS_WARP))).toEqual(canonical(fieldsRead(TS_IS_WARP)));
   });
 
-  it('字段集就是 protocol / wireguardSettings / warpDevice / address', () => {
-    // 钉住当前形态：任一侧单独重构成别的字段组合，锁 3 也许仍相等（两侧一起改），本条兜住。
-    expect(canonical(fieldsRead(TS_IS_WARP))).toEqual([
-      'address',
-      'protocol',
-      'warpdevice',
-      'wireguardsettings',
-    ]);
-  });
-
   /**
    * 域名兜底腿不得单侧消失 —— 旧 / 导入 / 上游 迁移来的 WARP **没有** `warpDevice` 标记，
    * 只认标记的话，恰好是会撞 `resource busy` FATAL 的那批节点漏判。

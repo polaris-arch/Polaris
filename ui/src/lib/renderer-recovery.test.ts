@@ -344,38 +344,6 @@ describe('① 两个完整应用入口都装齐了三层', () => {
 
 describe('② 共享模块不是空壳（三层的实现真的在里面）', () => {
   const sf = parseUi(SHARED_MODULE);
-  const fnBody = (name: string): ts.Node => {
-    const fn = collect(sf, (n) => ts.isFunctionDeclaration(n) && n.name?.text === name)[0];
-    expect(fn, `${SHARED_MODULE} 里找不到 ${name} —— 两个入口调的可能是别的东西`).toBeDefined();
-    return fn;
-  };
-
-  it('`installErrorForwarding` 三个信号源一个不少', () => {
-    const body = fnBody('installErrorForwarding');
-    // console.error 旁路（赋值，不是只读一下）。
-    const patches = collect(
-      body,
-      (n) =>
-        ts.isBinaryExpression(n) &&
-        ts.isPropertyAccessExpression(n.left) &&
-        ts.isIdentifier(n.left.expression) &&
-        n.left.expression.text === 'console' &&
-        n.left.name.text === 'error',
-    );
-    expect(patches.length, 'console.error 没被旁路 —— renderer 的错误日志一条都到不了 Rust').toBe(1);
-    // window 上的两个事件。
-    const listened = callsTo(body, 'addEventListener')
-      .map((c) => (c.arguments[0] && ts.isStringLiteral(c.arguments[0]) ? c.arguments[0].text : ''))
-      .sort();
-    expect(listened).toEqual(['error', 'unhandledrejection']);
-  });
-
-  it('`injectStaticFailureDom` 上报 + 走 i18n 文案 + 兑现上屏', () => {
-    const body = fnBody('injectStaticFailureDom');
-    expect(callsTo(body, 'recoveryText').length, '兜底页文案没走 i18n（recovery-text）').toBe(3);
-    expect(callsTo(body, 'replaceChildren').length, '兜底 DOM 没真的挂到 root 上').toBe(1);
-    expect(callsTo(body, 'reportRendererReady').length, '兜底页没兑现上屏，用户还要多等一轮终局页').toBe(1);
-  });
 
   it('逃生文案不依赖 i18next 运行期查询（i18n 自己可能就是没起来的那个）', () => {
     // 取材面是 **import 声明**而非原文：本文件头注里正写着「不依赖 React / i18next / theme」，

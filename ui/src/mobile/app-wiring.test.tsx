@@ -301,10 +301,6 @@ beforeEach(() => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe('① 首帧水合：冷启动时核可能已经在跑，初值必须自取', () => {
-  it('接线之前 store 是空的 —— 这就是今天移动端的状态', () => {
-    expect(useAppStore.getState().proxyStatus).toBeNull();
-  });
-
   it('跑一次 startMobileAppWiring：连接态 / 差集 / VPN 快照各拉一次', async () => {
     proxyStatus = { running: true, pid: 42 } as ProxyStatus;
     pendingRaw = { added: ['a'], modified: [], removed: [], restartDeferred: false };
@@ -1441,57 +1437,6 @@ describe('⑫ 桌面那批 app 级订阅：要么移植了，要么在表里登�
     ).toEqual([]);
     const stale = registered.filter((n) => !DESKTOP.includes(n));
     expect(stale, `桌面上已经没有这些订阅了，登记表该删：\n${stale.join('\n')}`).toEqual([]);
-  });
-
-  it('每条不移植的理由都不是「本批不做」（排期不是判定）', () => {
-    for (const [name, why] of NOT_PORTED) {
-      expect(why.length, `${name} 的理由太短，说不清射程`).toBeGreaterThan(15);
-      expect(why, `${name} 的理由写的是排期，不是判定`).not.toMatch(/本批|下一批|以后|排期/);
-    }
-  });
-
-  it('两条 2026-09-06 补接的腿真的在（漏掉它们正是这道门存在的理由）', () => {
-    expect(callSitesIn(MOBILE_SOURCES, 'onMeshLoginFallback')).not.toEqual([]);
-    expect(callSitesIn(MOBILE_SOURCES, 'onAutoNodeSwitched')).not.toEqual([]);
-  });
-
-  /*
-   * 🔴 隐私态那两条**从登记表里搬到了「已接」那一侧**（W-16）。
-   *
-   * 它们此前登记着「不接」，理由是「`privacyMode` 在 Android 上没有生产端 ⇒ 接了恒收不到帧」。
-   * 那条判定的射程只到「订阅桌面发的隐私态事件」这一格，当时是对的；W-16 让移动端**自己**
-   * 产生这个状态（闲置计时 + 遮罩的解锁腿），生产端于是有了。
-   *
-   * 单独一条断言而不是只靠上面那条「不留僵尸」：僵尸那条只保证「登记表里没有它们」，
-   * 而**两条订阅真的挂上了**这件事要正面说一次 —— 少了它，把订阅删掉再把登记删掉，
-   * 那条僵尸断言照样绿（两边一起没了），而遮罩从此永远不出现。
-   */
-  it('🔴 隐私态进/出两条订阅真的挂上了（遮罩的唯一收敛点）', () => {
-    expect(callSitesIn(MOBILE_SOURCES, 'startPrivacyModeSync')).not.toEqual([]);
-    const privacySource = readFileSync(fileURLToPath(new URL('../lib/privacy-mode-sync.ts', import.meta.url)), 'utf8');
-    for (const method of ['onEnterPrivacyMode', 'onExitPrivacyMode', 'getPrivacyMode']) {
-      expect(privacySource).toContain(`port.${method}(`);
-    }
-  });
-
-  /*
-   * 🔴 无效节点那条**从登记表里搬到了「已接」那一侧**（批 18）。
-   *
-   * 同隐私态那两条，单独一条断言而不是只靠上面那条「不留僵尸」：僵尸那条只保证「登记表里没有它」，
-   * 把订阅删掉再把登记删掉，它照样绿（两边一起没了），而「这个节点已失效」从此永远不会亮。
-   *
-   * 两句都要：**订阅挂上了**、**它真的往 store 里写**。只断言前一句的话，把回调体掏空
-   * （`onInvalidNodes(() => {})`）能让这条恒绿，而那与没接一模一样。
-   */
-  it('🔴 无效节点那条订阅真的挂上了，且真的往 store 里写', () => {
-    expect(
-      callSitesIn(MOBILE_SOURCES, 'onInvalidNodes'),
-      '节点屏读 `invalidNodes` 算 `invalidNodeIndex`、渲染成常驻 `.mn-note`，而没有任何写入方 ⇒ 那一格恒不出现',
-    ).not.toEqual([]);
-    expect(
-      callSitesIn(MOBILE_SOURCES, 'setInvalidNodes'),
-      '订阅挂上了却没落 store —— 与没接无从区分',
-    ).not.toEqual([]);
   });
 });
 

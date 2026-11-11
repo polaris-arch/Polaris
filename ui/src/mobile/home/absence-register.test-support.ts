@@ -338,33 +338,4 @@ export const HOME_PARITY: ScreenParityRegister = {
       note: '拓扑图右键面板整块（新建规则 / 合并进已有规则）。它住在 `components/` 下但渲染 `rules.*` 屏级文案 ⇒ 按 ⓪ 组那条判据它是这一屏的**内容**，进 `extraBlockSources`。移动端对应 `RuleSubjectPanel`：同一层弹层里的三个视图（菜单 / 新建 / 合并），判据与变换整套复用 `rule-append.ts` 的纯函数。逐颗的处置见 actions 面同名两条。',
     },
   ],
-
-  /**
-   * 桌面首页的具名数据槽基线（22 个）。器，不是对差面**（见 `parity-registry.ts` 的字段注释）。
-   * 桌面加一个槽 ⇒ 这条不等 ⇒ 红 ⇒ 逼一次「移动端要不要画」的决定。
-   */
-  slotBaseline: [
-    'connect-btn',
-    'connect-ic',
-    'cur-addr',
-    'cur-node',
-    'cur-proto',
-    'exit-flag',
-    'home-meta',
-    'home-mode-line',
-    'home-node-dd',
-    'home-runtime',
-    'home-uptime',
-    'linkGrad',
-    'nm-search-inp',
-    'node-menu',
-    'node-trigger',
-    's-home',
-    'sankey-fallback',
-    'sankey-stub',
-    'sankey-wrap',
-    'topo-card',
-    'unlock-row',
-    'unlock-ts',
-  ],
 };

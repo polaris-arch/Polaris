@@ -1217,29 +1217,4 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '侧栏的分组标题。移动端根页与各二级页用 `SettingsGroup` 的 `header` 承担同一件事。',
     },
   ],
-
-  /**
-   * 桌面设置屏的具名数据槽基线（74 个）。**变更探测器，不是对差面**。
-   * 桌面加一行带 id 的设置槽 ⇒ 这条不等 ⇒ 红 ⇒ 逼一次「移动端要不要有」的显式决定。
-   */
-  slotBaseline: [
-    // Windows 五来源槽与上面 Source/Field 的当前 provider 缺席登记同属一批。
-    'adapters', 'addresses', 'ras', 'routes4', 'routes6',
-    'app-update-card', 'auto-dl-swt', 'backup-block', 'backup-master',
-    'browser-doh-list', 'browser-doh-swt', 'bypass-lan-swt', 'cidr-bypass-off-note', 'cidr-list',
-    'control-port-input', 'core-info-card', 'disable-log-file-swt', 'dns-bootstrap-row',
-    'dns-connection-resolution', 'dns-custom-list', 'dns-input-domestic', 'dns-input-remote',
-    'dns-optimistic-swt', 'dns-preset-domestic', 'dns-preset-remote', 'dns-single-resolver',
-    'dns-timeout-input', 'fakeip-filter-list', 'fakeip-filter-swt', 'fakeip-swt',
-    'fold-browser-doh', 'fold-bypass', 'fold-env-others', 'fold-fakeip-filter',
-    'fold-inbound-exclude', 'fold-mac-filter', 'fold-neighbor-domains', 'fold-route-exclude',
-    'gh-custom-input', 'gh-mirror-sel', 'hc-btm-btn', 'hc-btm-desc', 'hc-btm-title',
-    'hc-daemon-desc', 'hc-daemon-name', 'helper-card', 'inbound-cidr-list', 'inbound-lin-warn',
-    'ipv6-swt', 'le-bypass', 'mac-filter-list', 'mac-filter-mode', 'main-session-via-proxy-swt',
-    'mgmt-block', 'mixed-port-input', 'neighbor-domain-list', 'race-doh-count', 'race-ups',
-    'res-auto-swt', 'set-graphics', 'set-hwaccel', 'set-lan-gateway', 'set-mac-filter', 'set-strict-route',
-    'set-window-effects', 'speed-test-concurrency-input', 'speed-test-metered-seg',
-    'speed-test-url-input', 'term-env', 'tun-anchor-tx', 'tun-mtu',
-    'tun-nat-type', 'webrtc-note', 'webrtc-row', 'webrtc-seg',
-  ],
 };

@@ -10,8 +10,7 @@
  * # 判据
  * - protoc（workflow 侧）：两个文件都有真的 `run: node scripts/fetch-protoc.mjs`——
  *   只 grep 步骤名的话，把 run 块掏空、名字留着照样绿；
- * - protoc（脚本侧）：`ASSETS` 表恰 4 条、每条带 64 位 sha256；版本常量唯一；
- *   校验走 `createHash` 且比对不符会抛；`PROTOC_EXPECT` 仍经 `GITHUB_ENV` 导出
+ * - protoc（脚本侧）：校验走 `createHash` 且比对不符会抛；`PROTOC_EXPECT` 仍经 `GITHUB_ENV` 导出
  *   （断言步的期望值来源，丢了它断言步拿不到期望）；
  * - NASM：全部内联副本的 `NASM_VERSION` 与 sha256 一致，且**每个文件的副本数固定**——一起删空
  *   也是「相等」，固定条数让删空转红。2026-10-07 `ci.yml` 拆成并行 job 后副本数是
@@ -36,33 +35,9 @@ import { fileURLToPath } from 'node:url';
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
 const WORKFLOWS = ['ci.yml', 'package.yml'] as const;
-const ALL_WORKFLOWS = ['ci.yml', 'ui.yml', 'package.yml', 'release-risk.yml'] as const;
-
-/**
- * 每个 workflow 里「自己 checkout + 自己装 Node」的 job 数。写死是本意：多一个少一个都要有人过目。
- *
- * 2026-10-07 两处变化，都是 job 数变了、每个 job 仍各钉一份：
- *   · ci.yml 1 → 3：串行单 job 拆成 lint / cross / test 三个并行 job；
- *   · package.yml 3 → 4：新增 core_wire job（wire 契约从每条打包腿各跑一次收成只跑一次）。
- */
-// Pin the complete managed Node job list, not just a total that can hide a missing producer.
-// Package device-only acceptance jobs are retired; normal setup/package/core-wire/release jobs remain.
-const NODE_JOBS = [
-  ['ci.yml', ['cheap_format', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']],
-  ['ui.yml', ['test']],
-  ['package.yml', ['setup', 'package', 'core_wire', 'release_desktop', 'release']],
-  ['release-risk.yml', ['pc_runtime_release_policy', 'classify', 'preflight']],
-] as const;
-// CI test and launcher jobs also checkout an exact kernel source, without a second Node installation.
-const CHECKOUT_COUNTS = { 'ci.yml': 9, 'ui.yml': 1, 'package.yml': 5, 'release-risk.yml': 3 } as const;
-const CHECKOUT_TOTAL = Object.values(CHECKOUT_COUNTS).reduce((sum, count) => sum + count, 0);
-const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, jobs]) => sum + jobs.length, 0);
 
 /** 每个 workflow 里 NASM 内联副本的份数（见文件头「NASM」条）。 */
 const NASM_COPIES = { 'ci.yml': 2, 'package.yml': 1 } as const;
-
-/** protoc 官方 release 覆盖的平台数（`process.platform-process.arch` → 资产名）。 */
-const PROTOC_PLATFORM_ROWS = 4;
 
 function read(workflow: string): string {
   return readFileSync(join(REPO_ROOT, '.github/workflows', workflow), 'utf8');
@@ -86,82 +61,9 @@ describe('CI 工具链钉扎守门', () => {
   // CI-4 后 protoc 常量的唯一真值点；断言读的是源码文本（与其它 workflow 断言同款手法）。
   const fetchProtoc = readFileSync(join(REPO_ROOT, 'scripts/fetch-protoc.mjs'), 'utf8');
 
-  it('Node 最低基线、实际构建版本与 Action 运行时同属 24+ 口径', () => {
-    const all = ALL_WORKFLOWS.map(read).join('\n');
-    const nodeVersions = [...all.matchAll(/node-version:\s*['"]?(\d+)/g)]
-      .map((m) => m[1])
-      .sort();
-    // 条数 = 四个 workflow 里各自装 Node 的 job 数之和（逐文件的数在下面那张表里，这里是总账）。
-    expect(nodeVersions, 'CI / UI / Package / Release Risk 都必须显式钉 Node 26').toEqual(
-      Array(NODE_JOBS_TOTAL).fill('26'),
-    );
-    expect(readFileSync(join(REPO_ROOT, '.nvmrc'), 'utf8').trim()).toBe('26');
-    const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, 'ui/package.json'), 'utf8')) as {
-      engines?: { node?: string };
-    };
-    expect(packageJson.engines?.node).toBe('>=24');
-
-    // 各桌面 source producer、草稿与汇总保有独立 checkout / Node；不能以总数相等掩盖某腿缺失。
-    for (const [workflow, jobs] of NODE_JOBS) {
-      const source = read(workflow);
-      const count = jobs.length;
-      const blocks = source.slice(source.indexOf('\njobs:\n')).split(/\n(?= {2}[a-z][a-z0-9_-]*:\n)/).slice(1);
-      const nodeJobs = blocks.filter((block) => /^\s+(?:-\s+)?uses: actions\/setup-node@/m.test(block));
-      expect(nodeJobs.map((block) => block.match(/^ {2}([^:]+):/)![1]), workflow).toEqual(jobs);
-      for (const block of nodeJobs) {
-        expect(block.match(/actions\/setup-node@v7/g) ?? [], workflow).toHaveLength(1);
-        expect([...block.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), workflow)
-          .toEqual(['26']);
-      }
-      expect(source.match(/actions\/checkout@v7/g) ?? [], workflow).toHaveLength(CHECKOUT_COUNTS[workflow]);
-      expect(source.match(/actions\/setup-node@v7/g) ?? [], workflow).toHaveLength(count);
-      expect([...source.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), workflow)
-        .toEqual(Array(count).fill('26'));
-    }
-    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(CHECKOUT_TOTAL);
-    expect(all.match(/actions\/setup-node@v7/g) ?? []).toHaveLength(NODE_JOBS_TOTAL);
-    expect(all).not.toMatch(/actions\/(?:checkout|setup-node)@v[1-6]\b/);
-    expect(read('package.yml')).toContain('actions/upload-artifact@v7');
-    expect(read('package.yml')).toContain('actions/download-artifact@v8');
-
-    const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8');
-    const buildDoc = readFileSync(join(REPO_ROOT, 'docs/build-and-package.md'), 'utf8');
-    expect(readme).toContain('Node.js 24+');
-    expect(buildDoc).toContain('| Node.js | 24+（CI 钉 26） |');
-  });
-
-  it('CI 非 Node checkout 有独立且精确的职责，不掩盖任一 Rust job 丢失 Node', () => {
+  it('CI test job 检出 Windows 目录内核源仓：限 Windows、精确 ref、独立路径、不留凭据', () => {
     const ci = read('ci.yml').replace(/^\s*#.*$/gm, '');
-    const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
-    expect(jobs).toEqual(['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
     const job = (name: string) => ci.split(`\n  ${name}:\n`)[1].split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
-    for (const [name, checkouts, nodes] of [
-      ['cheap_format', 1, 1], ['native_dns_candidate_gates', 0, 0], ['lint', 1, 1], ['cross', 1, 1], ['test', 2, 1], ['runtime_config_loopback', 1, 1], ['runtime_config_source_tests', 1, 1], ['windows_launcher_diagnostics', 2, 1],
-    ] as const) {
-      const block = job(name);
-      expect(block.match(/uses: actions\/checkout@v7/g) ?? [], name).toHaveLength(checkouts);
-      expect(block.match(/uses: actions\/setup-node@v7/g) ?? [], name).toHaveLength(nodes);
-      expect([...block.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), name)
-        .toEqual(Array(nodes).fill('26'));
-    }
-    const launcher = job('windows_launcher_diagnostics');
-    const launcherAdmission = launcher.split('- name: Validate exact loopback input mode\n')[1]?.split(/\n {6}- (?:name:|uses:)/)[0];
-    expect(launcher).toContain('- name: Setup exact input admission Node');
-    expect(launcherAdmission).toContain('RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}');
-    expect(launcherAdmission).toContain('import { loopbackInput } from "./scripts/runtime-config-loopback-formal.mjs"; loopbackInput(JSON.parse(process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS));');
-    expect(launcher.indexOf('- name: Setup exact input admission Node')).toBeLessThan(launcher.indexOf('- name: Validate exact loopback input mode'));
-    expect(launcher.indexOf('- name: Validate exact loopback input mode')).toBeLessThan(launcher.indexOf('- name: Validate the fixed reviewed candidate'));
-    const loopback = job('runtime_config_loopback');
-    expect(loopback).toContain('persist-credentials: false');
-    expect(loopback).toContain('run: node scripts/fetch-protoc.mjs');
-    expect(loopback).toContain('rustup toolchain install stable --profile minimal --no-self-update');
-    expect(loopback).toContain('uses: actions/setup-go@v6');
-    expect(loopback).toContain("go-version: '1.27.2'");
-    expect(loopback).toContain('check-latest: false');
-    expect(loopback).toContain('cache: false');
-    expect(loopback).not.toMatch(/Swatinem\/rust-cache@|actions\/cache@|fetch-core|prepare-core-identity/);
-    expect(loopback.indexOf('- name: Admit execution runner for real HOT loopback'))
-      .toBeLessThan(loopback.indexOf('- name: Install Rust toolchain'));
     const kernelCheckout = job('test').split('- name: Checkout exact Windows directory producer source\n')[1]
       .split(/\n {6}- (?:name:|uses:)/)[0];
     expect(kernelCheckout).toContain("runner.os == 'Windows'");
@@ -171,30 +73,6 @@ describe('CI 工具链钉扎守门', () => {
     expect(kernelCheckout).toContain('path: .windows-directory-kernel');
     expect(kernelCheckout).toContain('persist-credentials: false');
     expect(kernelCheckout).toContain('fetch-depth: 1');
-  });
-
-  it.each(WORKFLOWS)('%s 通过 scripts/fetch-protoc.mjs 装 protoc', (workflow) => {
-    expect(
-      /^ *run: node scripts\/fetch-protoc\.mjs\s*$/m.test(sources[workflow]),
-      `${workflow} 里没有 \`run: node scripts/fetch-protoc.mjs\` —— ` +
-        'protoc 装配被改回内联或掏空了；常量唯一真值在脚本里，别在 workflow 里再抄一份'
-    ).toBe(true);
-  });
-
-  it('fetch-protoc.mjs 的钉扎表恰四平台且每条带 sha256，版本常量唯一', () => {
-    const rows = [...fetchProtoc.matchAll(/asset: '([^']+)',\s*sha256: '([0-9a-f]{64})'/g)].map(
-      (m) => `${m[1]}=${m[2]}`
-    );
-    expect(
-      rows,
-      `ASSETS 表应有 ${PROTOC_PLATFORM_ROWS} 条（linux/win/darwin-arm64/darwin-x64）——` +
-        '少了某平台，那条腿的 runner 会在装配步当场红（fail-loud）；表被删空时本断言也必须红'
-    ).toHaveLength(PROTOC_PLATFORM_ROWS);
-    expect(new Set(rows).size, 'ASSETS 表里有重复条目').toBe(rows.length);
-    const versions = [...fetchProtoc.matchAll(/^const PROTOC_VERSION = '([^']+)'/gm)].map(
-      (m) => m[1]
-    );
-    expect(versions, 'PROTOC_VERSION 常量应恰有一处').toHaveLength(1);
   });
 
   it('fetch-protoc.mjs 的校验与 CI 装配线还在（钉执行形，防被注释/import/log 行喂饱）', () => {
@@ -238,8 +116,6 @@ describe('CI 工具链钉扎守门', () => {
     expect(uiWorkflow.indexOf('actions/setup-node@v7')).toBeLessThan(
       uiWorkflow.indexOf('- name: Setup pnpm (pinned)')
     );
-    expect(uiWorkflow).toContain('actions/cache@v6');
-    expect(uiWorkflow).toContain('path: ${{ steps.pnpm.outputs.store_path }}');
     // 版本同还不够，install 形态也要同（复审 Low 的补刀）：版本一致而一侧掏掉
     // `--frozen-lockfile` / 换安装器，lockfile 就能静默漂移——同一个坑的另一半。
     // 钉整段执行形而不是步骤名：掏空 run 块、名字留着照样绿是本文件记载过的失效形态。

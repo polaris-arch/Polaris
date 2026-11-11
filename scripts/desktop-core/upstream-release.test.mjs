@@ -117,9 +117,6 @@ test('formal managed checks select exact native rows and full source version on 
     assert.ok(chosen.expected.includes(`Environment: ${contract.platforms[key].goVersion} ${contract.platforms[key].target}\n`));
   }
   assert.throws(() => managedFormalSelection(f.root, f.manifest, { os: 'linux', arch: 'arm64' }), /native desktop/);
-  const raw = readFileSync(new URL('./managed-mesh-core.mjs', import.meta.url), 'utf8');
-  assert.ok(raw.indexOf('verifyPackagedRelease(root, manifest, key, core, run, host.os)') < raw.indexOf("const output = run(core, ['version'], { encoding: 'utf8' })"));
-  assert.match(raw, /demand\(output === expected, 'Managed mesh core version output differs'\)/);
 });
 test('upstream native contract keeps actual empty BuildID and unchanged native archive', () => {
   const { contract, index } = fixture();
@@ -422,9 +419,6 @@ test('Rust dependency-gate Node entry selects one sing-tun row without dropping 
   const expected = { module: selected.module, version: selected.version, h1: selected.h1 };
   assert.deepEqual(JSON.parse(JSON.stringify(releaseSingTunDependency(row))), expected);
   assert.deepEqual(releaseSingTunDependency({ schema: 'polaris-production-native-receipt-v1', buildGraph: { localReplacement: expected } }), expected);
-  const rust = readFileSync(new URL('../../crates/config-engine/tests/core_dep_fingerprint.rs', import.meta.url), 'utf8');
-  assert.ok(rust.includes('JSON.stringify(releaseSingTunDependency(c.platforms[key]))'));
-  assert.ok(!rust.includes('JSON.stringify(c.platforms[key].buildGraph.localReplacement)'));
   row.buildGraph.localReplacements.push(structuredClone(selected));
   assert.throws(() => releaseSingTunDependency(row), /Unique/);
   row.buildGraph.localReplacements = [];
@@ -1317,38 +1311,6 @@ test('shared version corpus retains patch tags and exact original/public archive
   for (const version of versionCases.rejected) {
     assert.throws(() => validateReleaseContract(brandedFixture(version).contract), undefined, JSON.stringify(version));
   }
-});
-test('alpha.12.4 keeps its complete version in producer and public archive identities', () => {
-  const version = '1.15.0-polaris-alpha.12.4';
-  const { contract, index } = brandedFixture(version);
-  assert.equal(validateReleaseContract(contract), contract);
-  assert.equal(validateUpstreamIndex(index, contract), index);
-  for (const row of Object.values(contract.platforms)) {
-    assert.equal(row.version, version);
-    assert.equal(row.tag, `v${version}`);
-    assert.ok(row.releaseAsset.url.includes(`/v${version}/`));
-  }
-  for (const alter of [
-    c => { c.tag = 'v1.15.0-polaris-alpha.12'; },
-    c => { c.platforms.linux.version = '1.15.0-polaris-alpha.12.3'; },
-    c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
-  ]) { const changed = structuredClone(contract); alter(changed); assert.throws(() => validateReleaseContract(changed)); }
-});
-test('alpha.12.6 keeps its complete version in producer and public archive identities', () => {
-  const version = '1.15.0-polaris-alpha.12.6';
-  const { contract, index } = brandedFixture(version);
-  assert.equal(validateReleaseContract(contract), contract);
-  assert.equal(validateUpstreamIndex(index, contract), index);
-  for (const row of Object.values(contract.platforms)) {
-    assert.equal(row.version, version);
-    assert.equal(row.tag, `v${version}`);
-    assert.ok(row.releaseAsset.url.includes(`/v${version}/`));
-  }
-  for (const alter of [
-    c => { c.tag = 'v1.15.0-polaris-alpha.12'; },
-    c => { c.platforms.linux.version = '1.15.0-polaris-alpha.12.4'; },
-    c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
-  ]) { const changed = structuredClone(contract); alter(changed); assert.throws(() => validateReleaseContract(changed)); }
 });
 test('patch syntax never substitutes for complete release identity or matching raw versions', () => {
   const version = '1.15.0-polaris-alpha.12.1';

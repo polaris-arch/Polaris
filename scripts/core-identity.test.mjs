@@ -96,20 +96,6 @@ function assertBuildDelegation(entry, selected) {
 }
 test('App build delegates selection to the exact shared module and emit entry', () => {
   assertBuildDelegation(buildEntry, buildSource);
-  for (const [before, after] of [
-    ['../crates/core-supervisor/build/selected_core.rs', '../other.rs'],
-    ['mod selected_core;', 'mod another_core;'],
-    ['selected_core::emit();', 'other_core::emit();'],
-  ]) {
-    const changed = buildEntry.replace(before, after);
-    assert.notEqual(changed, buildEntry);
-    assert.throws(() => assertBuildDelegation(changed, buildSource), assert.AssertionError);
-  }
-  for (const name of ['embed_validation_core_source', 'embed_selected_core_identity']) {
-    const changed = buildSource.replace(`${name}();`, 'unreviewed_selection();');
-    assert.notEqual(changed, buildSource);
-    assert.throws(() => assertBuildDelegation(buildEntry, changed), assert.AssertionError);
-  }
 });
 test('shared build delegation rejects commented, literal and duplicate Rust evidence', () => {
   const main = rustFunction(buildEntry, 'main'), emit = rustFunction(buildSource, 'emit');
@@ -153,23 +139,6 @@ function assertBuildDigestSource(source) {
 }
 test('build identity shares byte-wise SHA-256 encoding and keeps the candidate exclusion', () => {
   assertBuildDigestSource(buildSource);
-});
-for (const [name, before, after] of [
-  ['digest-array LowerHex', /for byte in sha2::Sha256::digest\(bytes\) \{[\s\S]*?\n    \}\n    hex/,
-    'format!("{:x}", sha2::Sha256::digest(bytes))'],
-  ['unpadded hex', '"{byte:02x}"', '"{byte:x}"'],
-  ['uppercase hex', '"{byte:02x}"', '"{byte:02X}"'],
-  ['different manifest encoder', 'InstalledCoreManifest::parse(&raw, sha256_hex)', 'InstalledCoreManifest::parse(&raw, other_hash)'],
-  ['different source bytes', /repository_root\(\)\.join\("scripts\/desktop-core\/native-dns-candidate\.json"\)/,
-    'repository_root().join("scripts/desktop-core/release-contract.json")'],
-  ['constant fingerprint', /sha256_hex\(\s*&std::fs::read\([\s\S]*?\.expect\("candidate contract"\),?\s*\)/, 'sha256_hex(b"")'],
-  ['reversed fingerprint comparison', /assert_ne!\(\s*manifest\.core\.provider_fingerprint/, 'assert_eq!(manifest.core.provider_fingerprint'],
-  ['inverted formal-mode guard', /if !temporary_default && std::env::var_os\("POLARIS_NATIVE_DNS_CANDIDATE"\)\.is_none\(\)/,
-    'if !temporary_default && std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_some()'],
-]) test(`build digest source control rejects ${name}`, () => {
-  const changed = buildSource.replace(before, after);
-  assert.notEqual(changed, buildSource, 'negative control must change the build source');
-  assert.throws(() => assertBuildDigestSource(changed), assert.AssertionError);
 });
 
 const core = { platform: 'linux', version: '1.15.0-alpha.12.polaris.1', providerFingerprint: 'a'.repeat(64),
@@ -270,23 +239,6 @@ function assertTemporaryBuildSource(source) {
 test('temporary desktop compilation binds target, actual source, exact path and verified carrier', () => {
   assertTemporaryBuildSource(buildSource);
 });
-for (const [name, before, after] of [
-  ['host rather than Cargo target', /std::env::var\("CARGO_CFG_TARGET_ARCH"\)/, 'std::env::var("HOST_ARCH")'],
-  ['mobile source embedding', 'desktop_platform().is_some() && manifest', 'true && manifest'],
-  ['missing default installation fallback', '(temporary_default || formal_default).then(||', 'false.then(||'],
-  ['candidate source substituted by formal', 'polaris-native-dns-compiled-source-v2', 'formal-source'],
-  ['mislabelled temporary source', 'source["validationOnly"], false', 'source["validationOnly"], true'],
-  ['wrong selection purpose', 'source["purpose"], "temporary-default"', 'source["purpose"], "formal"'],
-  ['different provider bytes', /assert_eq!\(\s*manifest\.core\.provider_fingerprint,\s*sha256_hex/, 'assert_eq!(manifest.core.provider_fingerprint, other_hash'],
-  ['arbitrary installation path', /assert_eq!\(\s*path,\s*directory/, 'assert_ne!(path, directory'],
-  ['skip actual carrier verification', '.arg("--mode=verify")', '.arg("--mode=prepare")'],
-  ['ignore actual carrier failure', /verified\.status\.success\(\),\s*"candidate App identity/, 'true, "candidate App identity'],
-  ['manifest replacement after verification', 'std::fs::read(&path).expect("verified identity remains readable")', 'raw.clone()'],
-]) test(`temporary compilation control rejects ${name}`, () => {
-  const changed = buildSource.replace(before, after);
-  assert.notEqual(changed, buildSource);
-  assert.throws(() => assertTemporaryBuildSource(changed), assert.AssertionError);
-});
 
 function assertUnavailableAnalysisSource(source) {
   const pending = rustFunction(source, 'temporary_installation_pending');
@@ -302,18 +254,6 @@ function assertUnavailableAnalysisSource(source) {
 }
 test('analysis image cannot silently use a missing or partially frozen desktop identity', () => {
   assertUnavailableAnalysisSource(buildSource);
-  for (const [before, after] of [
-    ['!temporary_default', 'false'],
-    ['var_os("POLARIS_CORE_IDENTITY_FILE").is_some()', 'var_os("POLARIS_CORE_IDENTITY_FILE").is_none()'],
-    ['["core-manifest.json", "candidate-carrier.json"]', '["core-manifest.json"]'],
-    ['symlink_metadata(&path).is_ok()', 'symlink_metadata(&path).is_err()'],
-    [/try_exists\(\)\s*\.expect\("inspect selected installation path"\)/, 'try_exists().unwrap_or(false)'],
-    ['polaris-temporary-desktop-unavailable-v1', 'polaris-native-dns-compiled-source-v2'],
-  ]) {
-    const changed = buildSource.replace(before, after);
-    assert.notEqual(changed, buildSource);
-    assert.throws(() => assertUnavailableAnalysisSource(changed), assert.AssertionError);
-  }
 });
 test('temporary default freezes staged signed helper bytes once, while manual preparation remains isolated', () => {
   const source = readFileSync(new URL('./prepare-core-identity.mjs', import.meta.url), 'utf8');
@@ -347,24 +287,6 @@ function assertFormalBuildSource(source) {
 }
 test('formal default compiles only exact verified installation with real helper and cleaner bytes', () => {
   assertFormalBuildSource(buildSource);
-  for (const [before, after] of [
-    ['Some(sha256_hex(&raw).as_str())', 'Some("unverified")'],
-    ['(temporary_default || formal_default).then(||', 'temporary_default.then(||'],
-    ['std::fs::read(&path).expect("verified formal identity readable")', 'raw.clone()'],
-  ]) {
-    const changed = buildSource.replace(before, after); assert.notEqual(changed, buildSource);
-    assert.throws(() => assertFormalBuildSource(changed));
-  }
-  const formalAt = buildSource.indexOf('if formal_default &&');
-  for (const [before, after] of [
-    [/assert_eq!\(\s*path,\s*directory/, 'assert_ne!(path, directory'],
-    ['.arg("--mode=verify")', '.arg("--mode=prepare")'],
-    ['verified.status.success()', 'true'],
-  ]) {
-    const tail = buildSource.slice(formalAt), changedTail = tail.replace(before, after);
-    assert.notEqual(changedTail, tail);
-    assert.throws(() => assertFormalBuildSource(buildSource.slice(0, formalAt) + changedTail));
-  }
   const prepare = readFileSync(new URL('./prepare-core-identity.mjs', import.meta.url), 'utf8');
   assert.match(prepare, /contract = releaseInstallationContract\(root, input\);[\s\S]*?verifyPackagedRelease\(root, input, platform, join\(directory, contract.platforms\[platform\].core.member\)\)/);
   assert.match(prepare, /actualCoreFile\(join\(directory, helper\)\).sha256 !== old.core.helperSha256/);

@@ -321,35 +321,4 @@ export const CONNECTIONS_PARITY: ScreenParityRegister = {
       note: '右键面板里「拿这条连接去加规则」那一整块。它住在 `components/` 下却渲染 `rules.*` 屏级文案 ⇒ 按 ⓪ 组那条判据是这一屏的内容，进 `extraBlockSources`。移动端把它落成行动作 sheet 里的一行入口 + 一张逐维铺开两颗（新建 / 加入已有）的二级面板；逐颗的处置见 actions 面同名两条。',
     },
   ],
-
-  /**
-   * 桌面连接屏**两个目录**（connections + logs）的具名数据槽基线。
-   * **变更探测器，不是对差面**。2026-09-06 从 12 涨到 19：涨的七个（`log-*` / `s-logs`）
-   * 是折进来的日志屏本来就有的槽，此前整批不在任何一面上。
-   */
-  slotBaseline: [
-    'conn-close-filtered',
-    'conn-filtered-lbl',
-    'conn-pause-btn',
-    'conn-pause-lbl',
-    'conn-search',
-    'conn-scroll',
-    'conn-table-view',
-    'conn-tbody',
-    'conn-top-view',
-    'log-count',
-    'log-follow-state',
-    'log-legacy-note',
-    'log-privacy-note',
-    'log-search',
-    // 桌面新增失败槽已逐项判为移植：移动 ConnectionsView 的 data-log-stream-error
-    // 由真实监听/水合/搜索失败触发，重试动作见上方 LogsScreen common.retry 条目。
-    'log-stream-error',
-    'log-view',
-    's-connections',
-    's-logs',
-    'top-host-n',
-    'top-hosts',
-    'top-outbounds',
-  ],
 };

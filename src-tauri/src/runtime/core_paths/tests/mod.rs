@@ -8,15 +8,6 @@ fn tmpdir() -> TestDir {
 
 // ── 路径解析纯函数 ──
 
-#[test]
-fn core_filename_is_platform_specific() {
-    assert_eq!(core_filename_for("windows"), "sing-box.exe");
-    assert_eq!(core_filename_for("linux"), "sing-box");
-    assert_eq!(core_filename_for("macos"), "sing-box");
-    // 未知 OS 回落 Unix 名（不 panic、不返空）。
-    assert_eq!(core_filename_for("freebsd"), "sing-box");
-}
-
 /// **跨 crate 等值门（P4 · 拍板 2）**：核文件名在三个 crate 里各有一份字面量，`src-tauri` 是
 /// 唯一同时看得见它们的地方（依赖方向 `src-tauri → polaris-helper` / `polaris-helper-client`，
 /// 先例见 `runtime/proxy/platform_contracts.rs` 直调 `polaris_helper::platform::windows::*`）。
@@ -291,15 +282,6 @@ fn direct_child_rejects_names_that_leave_the_config_root() {
     for name in LEGACY_CORE_STATE_NAMES {
         assert!(direct_child(root, name).is_some(), "{name}");
     }
-}
-
-/// 清理名单的正面钉死：少一项 = 那类残留永远留在用户盘上，且没有任何别的测试会红。
-#[test]
-fn legacy_cleanup_list_is_pinned() {
-    assert_eq!(
-        LEGACY_CORE_STATE_NAMES,
-        ["core_update", "core-staged", "core-promote"]
-    );
 }
 
 fn idle_legacy_cleanup(path: &Path) -> Vec<PathBuf> {

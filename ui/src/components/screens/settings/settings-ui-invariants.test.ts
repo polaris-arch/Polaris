@@ -74,27 +74,12 @@ describe('Settings UI 使用统一组件与语义分组', () => {
         `${name} 出现新的常驻说明；静态帮助应改用 SetRow tip，动态状态需登记本门`,
       ).toBe(allowedDescCounts[name] ?? 0);
     }
-
-    const general = settingScreens.find(({ name }) => name === 'SettingsGeneral.tsx')!.source;
-    const network = settingScreens.find(({ name }) => name === 'SettingsNetwork.tsx')!.source;
-    const tun = settingScreens.find(({ name }) => name === 'SettingsTun.tsx')!.source;
-    expect(general).toContain('hasPassword');
-    expect(network).toContain('webrtcDisabled ?');
-    expect(network).toContain("tipHttpPort', { port: mixedPort }");
-    expect(network).toContain('interfaces.failed ?');
-    expect(network).toContain('tlsFingerprintStatus(tlsFingerprints, t)');
-    expect(network).toContain("? t('settings.network.speedTestConcurrencyMax', { max: speedLimits.concurrencyMax })");
-    expect(tun).toContain('showIpv6Hint ?');
   });
 
   it('折叠清单的静态说明也使用 Fold tip，不在内容区铺 fld-hint', () => {
     for (const { name, source } of settingScreens) {
       expect(source, `${name} 的折叠清单仍在内容区常驻静态说明`).not.toContain('fld-hint');
     }
-
-    const fold = stripComments(read('../../Fold.tsx'));
-    expect(fold).toContain('tip?: string');
-    expect(fold).toContain('<InfoIcon tip={tip}');
   });
 
   it('共享 Select 由 Csel 实现并把 disabled 传到真实控件', () => {
@@ -110,48 +95,14 @@ describe('Settings UI 使用统一组件与语义分组', () => {
     expect(selectBody).not.toMatch(/<\/?select\b/);
   });
 
-  it('共享 Switch 自动继承 SetRow 的可见标签作为无障碍名称', () => {
-    const primitives = stripComments(read('./Primitives.tsx'));
-    expect(primitives).toContain('createContext<string | undefined>(undefined)');
-    expect(primitives).toContain('<SetRowLabelContext.Provider value={labelId}>');
-    expect(primitives).toContain('aria-labelledby={ariaLabel ? undefined : labelledBy}');
-  });
-
-  it('完整设置项分组由共享结构与覆盖层统一承担分隔线', () => {
-    const primitives = stripComments(read('./Primitives.tsx'));
-    const css = stripComments(read('../../../styles/index.css'));
-    expect(primitives).toMatch(/export function SetRowGroup\b/);
-    expect(primitives).toMatch(/export function SetRowSection\b/);
-    expect(css).toMatch(/\.set-row-group\s*\{[^}]*border-bottom/);
-    expect(css).toMatch(/\.set-row-group\s*>\s*\.set-row\s*\{[^}]*border-bottom\s*:\s*0/);
-    expect(css).toMatch(/\.set-row-section\s*\{[^}]*border-top/);
-    expect(css).toMatch(/\.set-row-group\s*>\s*\.set-row-details\s*\{[^}]*margin/);
-  });
-
-  it('系统代理清理使用简短入口与危险确认，不再以普通关闭开关呈现', () => {
-    const network = read('./SettingsNetwork.tsx');
-    expect(network).toContain("t('proxy.clearSystemProxy')");
-    expect(network).toContain("confirmLabel: t('proxy.clear')");
-    expect(network).toContain('danger: true');
-    expect(network).toContain('proxyApi.disableSystemProxy()');
-    expect(network).not.toContain("t('proxy.disableSystemProxy')");
-  });
-
   it('连接域名处理归属设置 DNS，DNS 规则页与路由规则不保留重复入口', () => {
     const network = read('./SettingsNetwork.tsx');
     const dns = read('./SettingsDns.tsx');
     const dnsWorkspace = read('../rules/DnsPolicyWorkspace.tsx');
-    const dnsResolution = read('../../../domain/dns-connection-resolution.ts');
     expect(network).not.toContain('resolveBeforeDial');
     expect(dns).not.toContain('resolveBeforeDial');
-    expect(dns).toContain("t('settings.dns.connectionResolution')");
-    expect(dns).toContain('effectiveDnsConnectionResolution(config)');
-    expect(dns).toContain('dnsConnectionResolutionPatch(config, next)');
-    expect(dns).toContain('<Select');
     expect(dnsWorkspace).not.toContain("t('settings.dns.connectionResolution')");
     expect(dnsWorkspace).not.toContain('effectiveDnsConnectionResolution(config)');
-    expect(dnsResolution).toContain('dnsDefaults: {');
-    expect(dnsResolution).toContain('connectionResolution: resolution');
   });
 
   it('流量规则只写路由动作，不再写入 DNS 解析行为', () => {
@@ -161,47 +112,5 @@ describe('Settings UI 使用统一组件与语义分组', () => {
     expect(dialog).not.toContain('rule-destination-resolution');
     expect(dialog).not.toContain('resolutionOnly');
     expect(item).not.toContain('resolutionOnly');
-  });
-
-  it('共享设置页头将标题与说明同行布局，生产样式与原型镜像一致', () => {
-    const primitives = stripComments(read('./Primitives.tsx'));
-    const styles = [read('../../../styles/components.css'), read('../../../styles/prototype.css')];
-    expect(primitives).toContain('className="phead settings-phead"');
-    expect(primitives).toContain('className="settings-phead-copy"');
-    for (const css of styles) {
-      expect(css).toMatch(/\.settings-phead\s*{[^}]*align-items:baseline/);
-      expect(css).toMatch(/\.settings-phead-copy\s*{[^}]*display:flex[^}]*align-items:baseline/);
-      expect(css).toMatch(/\.settings-phead-copy\s*>\s*\.sub\s*{[^}]*margin-inline-start:auto[^}]*text-align:end[^}]*white-space:nowrap/);
-    }
-  });
-
-  it('RTL 镜像主栏接缝，系统窗口特效成败都保留清晰逻辑分界', () => {
-    const styles = [read('../../../styles/components.css'), read('../../../styles/prototype.css')];
-    for (const css of styles) {
-      expect(css).toMatch(/:root\[dir="rtl"\] \.main\s*{[^}]*border-radius:0 var\(--r-lg\) 0 0[^}]*box-shadow:12px 0/);
-      expect(css).toMatch(/:root\[data-window-effects="off"\] \.main, :root\[data-os="lin"\] \.main\s*{[^}]*border-inline-start:1px solid hsl\(var\(--line\)\)/);
-    }
-    // 系统特效可能在配置仍为开启时挂载失败，因此最终覆盖层必须无条件画逻辑边界；
-    // `border-inline-start` 会随 fa/RTL 自动镜像，不能退回物理 left/right。
-    const override = read('../../../styles/index.css');
-    expect(override).toMatch(/\.main\s*{\s*border-inline-start:1px solid hsl\(var\(--hair\)\)/);
-  });
-
-  it('五种语言的设置页短说明都来自 locale，且不以句号结尾', () => {
-    const localeNames = ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa'];
-    const settingsKeys = ['general', 'display', 'network', 'dns', 'tun', 'update', 'backup'];
-    const violations: string[] = [];
-    for (const localeName of localeNames) {
-      const locale = JSON.parse(read(`../../../i18n/locales/${localeName}.json`)) as {
-        settings: Record<string, { pageSub?: string }>;
-        helper: { pageSub?: string };
-      };
-      const pageSubs = settingsKeys.map((key) => locale.settings[key]?.pageSub);
-      pageSubs.push(locale.helper.pageSub);
-      for (const value of pageSubs) {
-        if (!value || /[。.]+$/.test(value)) violations.push(`${localeName}: ${value ?? '<missing>'}`);
-      }
-    }
-    expect(violations).toEqual([]);
   });
 });

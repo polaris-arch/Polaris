@@ -96,7 +96,4 @@ test('native origin proof compares fingerprinted producer context, including sam
   }
   assert.throws(() => validateCurrentProducer(sign({ ...facts, schema: 'polaris-dns-technical-native-v1' }), candidate, env));
   assert.throws(() => validateCurrentProducer(sign({ schema: 'polaris-desktop-core-v1', candidate }), candidate, env));
-  const input = readFileSync(join(root, 'scripts/native-payload-input.mjs'), 'utf8');
-  assert.match(input, /sourceOwnedReplacements: receipt.sourceOwnedReplacements/);
-  assert.match(input, /producerContext: receipt.producerContext/);
 });

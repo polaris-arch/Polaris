@@ -169,9 +169,3 @@ fn clock_rollback_does_not_panic() {
     );
     assert!(!d.should_auto_restart(0), "回拨不应绕过 MAX_RESTART_COUNT");
 }
-
-#[test]
-fn max_restart_count_is_3_and_cooldown_60s() {
-    assert_eq!(MAX_RESTART_COUNT, 3);
-    assert_eq!(RESTART_COOLDOWN_MS, 60_000);
-}

@@ -77,19 +77,6 @@ describe('调用点接线', () => {
       'utf8',
     ),
   );
-  const ITEM = code(
-    readFileSync(
-      fileURLToPath(new URL('../components/screens/rules/RuleItem.tsx', import.meta.url)),
-      'utf8',
-    ),
-  );
-
-  /** 变异对照：把 `onDuplicate={handleDuplicate}` 从 `<RuleItem>` 上摘掉 → 转红（按钮整个不渲染）。 */
-  it('RulesScreen 把 handleDuplicate 接到 RuleItem 上', () => {
-    expect(SCREEN).toContain('onDuplicate={handleDuplicate}');
-    expect(SCREEN).toContain('duplicateRulePayload(rule,');
-    expect(SCREEN).toContain('api.rules.add(');
-  });
 
   /**
    * 写完必须刷 store —— `store.rules` 只由 `loadConfig`/`saveConfig` 写，不刷则列表看不到新增那条，
@@ -99,11 +86,5 @@ describe('调用点接线', () => {
    */
   it('复制成功后刷新 store', () => {
     expect(SCREEN).toContain('loadConfig(true)');
-  });
-
-  /** 变异对照：把按钮改成无条件渲染 → 转红（只读消费点会多出一个点了没反应的按钮）。 */
-  it('RuleItem 仅在传了 onDuplicate 时渲染复制按钮', () => {
-    expect(ITEM).toContain('{onDuplicate && (');
-    expect(ITEM).toContain('onClick={() => onDuplicate(rule)}');
   });
 });

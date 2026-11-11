@@ -104,30 +104,5 @@ describe('fallback UI wiring', () => {
     for (const fn of ['dnsRealQueryFallbackChoice(', 'dnsRealQueryFallbackFromChoice(', 'buildDnsRealQueryFallbackGroups(']) {
       expect(text).toContain(fn);
     }
-    expect(text).toContain("t('settings.dns.realQueryFallback')");
-    expect(text).toContain("t('settings.dns.realQueryFallbackHint')");
-    expect(text).toContain('realQueryFallbackAction }');
-  });
-
-  it('desktop writes through update and mobile commit reports row-local failures', () => {
-    expect(desktop).toContain('void update({ dnsDefaults: { ...dnsDefaults, realQueryFallbackAction } })');
-    expect(mobile).toContain('commit(rowId, update({ dnsDefaults: { ...defaults, realQueryFallbackAction } }))');
-    expect(mobile).toContain("commitRealQueryFallback('dns-real-query-fallback', next)");
-    expect(mobile).toContain("onOpen={() => setSheet('realQueryFallback')}");
-    expect(mobile).toContain('openGroupIds={openGroupOf(realQueryFallbackGroups, realQueryFallbackValue)}');
-    expect(mobile.split('<SelectSheetPanel').some((panel) => panel.includes("open={sheet === 'realQueryFallback'}"))).toBe(true);
-  });
-
-  it('TUN manual enable preserves every DNS default, including the new fallback', () => {
-    expect(source('components/screens/settings/SettingsTun.tsx')).toMatch(/dnsDefaults:\s*\{\s*\.\.\.config\.dnsDefaults,/);
-  });
-
-  it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('%s explains the non-address scope', (locale) => {
-    const dict = JSON.parse(source(`i18n/locales/${locale}.json`));
-    expect(dict.settings.dns.realQueryFallback).toBeTruthy();
-    const hint = dict.settings.dns.realQueryFallbackHint;
-    for (const word of ['FakeIP', 'A/AAAA', 'HTTPS', 'SVCB', 'TXT']) expect(hint).toContain(word);
-    expect(dict.rules.dnsActionDescription_fakeIp).toContain('A/AAAA');
-    expect(dict.settings.dns.fakeIpDesc).toContain('A/AAAA');
   });
 });

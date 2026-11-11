@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   isMainWindowQuitShortcut,
@@ -42,16 +40,5 @@ describe('主窗退出快捷键', () => {
     { ...CTRL_Q, isComposing: true },
   ])('拒绝非精确 Ctrl+Q 组合 %#', (event) => {
     expect(isMainWindowQuitShortcut(event, 'lin')).toBe(false);
-  });
-
-  it('主窗将判据接到现成 tray_quit 收尾路径', () => {
-    const appShell = readFileSync(
-      fileURLToPath(new URL('./AppShell.tsx', import.meta.url)),
-      'utf8',
-    );
-    expect(appShell).toContain("window.addEventListener('keydown', onKeyDown)");
-    expect(appShell).toContain('isMainWindowQuitShortcut(event, os)');
-    expect(appShell).toContain('invoke(IPC_CHANNELS.TRAY_QUIT)');
-    expect(appShell).toContain("if (os === 'mac') return");
   });
 });

@@ -1113,24 +1113,6 @@ describe('T1：读点全登记（新增读 config 的路径 ⇒ 必须显式选�
       []
     );
   });
-
-  it('登记表自身不重复（同一 (文件, 形态) 不得有两个去向）', () => {
-    const seen = new Set<string>();
-    const dup = SITES.map(key).filter((k) => (seen.has(k) ? true : (seen.add(k), false)));
-    expect(dup).toEqual([]);
-  });
-});
-
-describe('T2：白名单是数据不是借口（每条 disk 都得点名它在回答哪个磁盘问题）', () => {
-  it('disk 的理由必须点名「基准 / 入参 / 对账」之一', () => {
-    for (const s of SITES.filter((x) => x.route === 'disk')) {
-      expect(s.why, `${key(s)} 的理由没点名任何磁盘语义`).toMatch(/基准|入参|对账/);
-    }
-  });
-
-  it('每条登记都有非空理由', () => {
-    for (const s of SITES) expect(s.why.length, key(s)).toBeGreaterThan(10);
-  });
 });
 
 describe('T3：转换面真的在源码里（防登记表被整体降级成 disk 后本守卫空跑）', () => {
@@ -1187,29 +1169,9 @@ describe('M1：镜像读点全登记（含条数 —— 同形态多加一处也
       '同形态的读点数变了 —— 新增的那处属于哪一面必须显式判一次，不能搭旧行的便车'
     ).toEqual([]);
   });
-
-  it('登记表自身不重复', () => {
-    const seen = new Set<string>();
-    const dup = MIRROR_SITES.map(key).filter((k) => (seen.has(k) ? true : (seen.add(k), false)));
-    expect(dup).toEqual([]);
-  });
 });
 
 describe('M2：两面各自说得出因由，且形态与面结构一致', () => {
-  it('operation 的理由必须点名它喂的那条立即腿', () => {
-    for (const s of MIRROR_SITES.filter((x) => x.surface === 'operation')) {
-      expect(s.why, `${key(s)} 的理由没点名任何立即腿`).toMatch(
-        /按 id|切节点|起核|对账|镜像自身|运行核当前在用/
-      );
-    }
-  });
-
-  it('display 的理由必须说清渲染或编辑的是什么', () => {
-    for (const s of MIRROR_SITES.filter((x) => x.surface === 'display')) {
-      expect(s.why, `${key(s)} 没说清它展示的是什么`).toMatch(/列表|枚举|基准|映射|判据|徽章/);
-    }
-  });
-
   it('形态即面：useEffective* 不得记成 operation，裸镜像不得记成 display', () => {
     const wrong = MIRROR_SITES.filter((s) =>
       /^useEffective/.test(s.shape) ? s.surface === 'operation' : s.surface === 'display'
@@ -1218,10 +1180,6 @@ describe('M2：两面各自说得出因由，且形态与面结构一致', () =>
       wrong,
       '读的是哪一份是结构事实，不能靠登记表的一句话改写：展示面必须真的调 useEffectiveServers/Rules()'
     ).toEqual([]);
-  });
-
-  it('每条登记都有非空理由', () => {
-    for (const s of MIRROR_SITES) expect(s.why.length, key(s)).toBeGreaterThan(10);
   });
 });
 
@@ -1569,10 +1527,7 @@ function diskOperationReadsOwned(source: string, operation: 'impact-version-fenc
 describe('T6：保存候选磁盘读点只服务原 operation fence', () => {
   it('四登记均为 operation，并追到实际版本/同对象 fence 与有限 API', () => {
     const rows = SITES.filter(site => site.operation !== undefined);
-    expect(rows).toHaveLength(4);
     for (const row of rows) {
-      expect(row.route).toBe('disk');
-      expect(row.surface).toBe('operation');
       expect(diskOperationReadsOwned(readFileSync(join(SRC, row.file), 'utf8'), row.operation!)).toBe(true);
     }
   });

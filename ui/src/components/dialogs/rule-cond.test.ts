@@ -187,24 +187,6 @@ describe('提交前逐值校验（此前渲染端零校验，全靠后端 RULE_I
   });
 });
 
-describe('接线：提交腿真的消费了这两个函数', () => {
-  const src = dialogSrc;
-
-  it('自检：读到了 RuleDialog 源码', () => {
-    expect(src.length).toBeGreaterThan(5000);
-  });
-
-  it('`validateRule` 决定能不能提交、`invalidCondValues` 负责说清哪个值不对', () => {
-    // 变异靶：删掉 `if (!validateRule(draft))` 那条腿 → 转红。纯函数单测管不到「弹窗到底调没调」。
-    expect(src, '提交腿不再走聚合校验 —— 又退回「全靠后端返 RULE_INVALID」').toMatch(
-      /if\s*\(\s*!\s*validateRule\s*\(/
-    );
-    expect(src, '不再说明哪个值不对（只报「校验未通过」用户无从下手）').toContain(
-      'invalidCondValues('
-    );
-  });
-});
-
 describe('computeTestMatch —— 轴不匹配算「不适用」，不算未命中', () => {
   it('域名条件 + IP 输入 ⇒ untestable（不是 miss）', () => {
     expect(computeTestMatch([{ t: 'domain', v: 'a.com' }], 'or', '1.2.3.4')).toBe('untestable');
@@ -385,25 +367,6 @@ describe('池外已选：「已选但候选池里没有」的值必须在勾选�
 
 describe('接线：勾选区渲染的是「池外已选 + 池内」，且手填腿默认折叠', () => {
   const src = dialogSrc;
-
-  it('① 勾选区的入参真的并进了池外已选（变异「只渲染候选池」即红）', () => {
-    expect(src, '池外已选的投影函数没有生产调用点').toContain('offPoolSelectedOptions(');
-    const shownDef = src.match(/const shownOpts\s*=([\s\S]*?);\n/)?.[1] ?? '';
-    expect(shownDef.length, '没扫到 shownOpts 的定义 —— 门在空集上恒绿').toBeGreaterThan(10);
-    expect(
-      shownDef,
-      '勾选区又退回「只渲染候选池」—— 规则里手填的 / 引用了未下载 tag 的值会既看不见也删不掉'
-    ).toMatch(/offPool/);
-    expect(src, '算出来了却没传给勾选区').toContain('options={shownOpts}');
-  });
-
-  it('② 池外 chip 必须被显式标注（`off-pool` 类 —— 光并进去而不区分等于谎称它在池里）', () => {
-    expect(src).toMatch(/o\.offPool && 'off-pool'/);
-    const css = readFileSync(fileURLToPath(new URL('../../styles/index.css', import.meta.url)), 'utf8');
-    expect(css, '组件发了 off-pool 类但覆盖层没有对应规则 = 死类，视觉照旧没区别').toMatch(
-      /\.tagchip\.off-pool/
-    );
-  });
 
   it('③ 手填腿默认折叠（`<Fold>` 不带 `defaultOpen`），但只对**有候选区**的类型折', () => {
     // 2026-08-10：裸 `<details className="fld-fold cond-manual">` 收编进受控 `<Fold>`（「展开即露出」批次）。

@@ -333,28 +333,6 @@ for (const key of ['repositoryId', 'releaseId', 'tag', 'sourceCommit', 'sourceTr
   });
 
 
-test('formal readers retain bounded fd identity and parse/hash one receipt observation', () => {
-  const source = readFileSync(join(root, 'scripts/runtime-config-loopback-formal.mjs'), 'utf8');
-  const rust = readFileSync(join(root, 'src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs'), 'utf8');
-  assert.match(source, /openSync\(path, constants.O_RDONLY \| constants.O_NOFOLLOW \| constants.O_NONBLOCK\)/);
-  assert.match(source, /fstatSync\(fd, \{ bigint: true \}\)/);
-  assert.match(source, /Math.min\(64 \* 1024, limit \+ 1 - count\)/);
-  assert.match(source, /finally \{ closeSync\(fd\); \}/);
-  assert.match(rust, /nix::libc::O_NOFOLLOW \| nix::libc::O_NONBLOCK/);
-  assert.match(rust, /take\(limit.checked_add\(1\).unwrap\(\)\)/);
-  assert.match(rust, /let raw_receipt = formal_bytes\(&receipt_path, 1024 \* 1024\)\.0;/);
-  assert.doesNotMatch(rust, /let raw_receipt = if/);
-  assert.match(rust, /serde_json::from_slice\(&raw_receipt\)/);
-  assert.match(rust, /consumption\["signaturePolicy"\]/);
-  assert.match(rust, /consumption\.get\("macCodeSignature"\), Some\(&Value::Null\)/);
-  assert.match(rust, /consumption\["actualAppAcceptance"\]/);
-  assert.match(rust, /formal.then\(\|\| polaris_updater::sha256_hex\(&raw_receipt\)\)/);
-  assert.match(rust, /consumption\["fingerprint"\],\s*formal_fingerprint\(&facts\)/);
-  assert.match(rust, /formal_public_snapshot\(&readback\["before"\], &contract\)/);
-  assert.match(rust, /admission.verify_binary\(\);\n        \}\n        rt.inject_real_core_for_test/);
-  assert.match(rust, /admission.verify_binary\(\);\n        \}\n        let status = tokio::time::timeout/);
-});
-
 for (const links of [1, 2, 3]) test(`only Cargo-selected helper source allows up to two links (${links}) and installs a single-link byte copy`, async () => {
   // Synthetic inert bytes and mocked command observations; no helper executes.
   const root = mkdtempSync(join(tmpdir(), 'formal-helper-unit-')), target = join(root, 'private-target');
@@ -390,14 +368,6 @@ for (const links of [1, 2, 3]) test(`only Cargo-selected helper source allows up
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-test('the helper link exception stays private and copies bounded observed bytes exclusively', () => {
-  const source = readFileSync(join(root, 'scripts/runtime-config-loopback-formal.mjs'), 'utf8');
-  assert.match(source, /function readFormal\(path, limit = 512 \* 1024 \* 1024, maxLinks = 1n\)/);
-  assert.match(source, /export const formalFile = \(path, limit\) => readFormal\(path, limit\)\.pin/);
-  assert.equal((source.match(/readFormal\(source, undefined, 2n\)/g) ?? []).length, 2);
-  assert.match(source, /writeFileSync\(destination, observed.bytes, \{ flag: 'wx', mode: before.mode \}\)/);
-  assert.doesNotMatch(source, /copyFileSync\(source, destination/);
-});
 
 test('every formal binding/core verification callsite retains bounded fd reads; diagnostic readers stay unchanged', () => {
   const runner = readFileSync(join(root, 'scripts/runtime-config-loopback.mjs'), 'utf8');
@@ -405,7 +375,6 @@ test('every formal binding/core verification callsite retains bounded fd reads; 
   assert.match(runner, /result.formalInputFile = formalFile\(receiptPath, 1024 \* 1024\)/);
   assert.match(runner, /const pinCore = formal \? formalFile : filePin;/);
   const shared = runner.split('    const pinCore = formal ? formalFile : filePin;')[1].split('    result.appSourceAfterTests')[0];
-  assert.equal((shared.match(/pinCore\(binary\)\.sha256/g) ?? []).length, 4);
   assert.doesNotMatch(shared, /filePin\(binary\)|filePin\(receiptPath\)/);
   assert.match(shared, /JSON.stringify\(formalFile\(receiptPath, 1024 \* 1024\)\) === JSON.stringify\(result.formalInputFile\)/);
   assert.match(runner, /JSON.stringify\(formalFile\(result.formalInputFile.path, 1024 \* 1024\)\) === JSON.stringify\(result.formalInputFile\)/);

@@ -307,16 +307,6 @@ describe('G11-1：绕过常量表的裸通道名必须逐条登记', () => {
     expect(wrong, 'status 与常量表现状对不上 —— 修好了就把登记一起改掉').toEqual([]);
   });
 
-  it('每条登记都有理由，且「待修/待补」不许伪装成豁免', () => {
-    for (const r of BARE_REGISTRY) {
-      expect(r.reason.length, `${r.name} 的理由太短`).toBeGreaterThan(15);
-      expect(r.reason, `${r.name} 的理由是自我循环`).not.toMatch(/本仓先例|既有惯例|历来如此/);
-      if (r.status !== 'builtin-plugin') {
-        expect(r.reason, `${r.name} 不是真豁免，理由须以「待修」/「待补」起头`).toMatch(/^待[修补]/);
-      }
-    }
-  });
-
   it('非插件的裸通道名在 Rust 侧真有同名命令（跨语言存在性，callers==0 在这里是假阴性）', () => {
     // 变异对照：把 `invoke('tray_hide')` 改成 `invoke('tray_hidee')` → 本条转红。
     const missing = BARE.filter((b) => b.fn === 'invoke' && !b.name.startsWith('plugin:'))

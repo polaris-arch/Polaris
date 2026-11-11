@@ -74,20 +74,4 @@ describe('Csel 只由可见触发框展开', () => {
     expect(branch).not.toContain('{labelEl}');
     expect(branch).not.toMatch(/<label\b/);
   });
-
-  it('OpenConnect 字段使用面向用户的“厂商”，不暴露实现术语“方言”', () => {
-    const expected: Record<string, string> = {
-      'zh-CN': '厂商',
-      'zh-TW': '廠商',
-      'en-US': 'Vendor',
-      ru: 'Производитель',
-      fa: 'سازنده',
-    };
-    for (const [locale, label] of Object.entries(expected)) {
-      const dict = JSON.parse(
-        readFileSync(new URL(`../../i18n/locales/${locale}.json`, import.meta.url), 'utf8'),
-      ) as { node: { field: { flavor: string } } };
-      expect(dict.node.field.flavor, locale).toBe(label);
-    }
-  });
 });

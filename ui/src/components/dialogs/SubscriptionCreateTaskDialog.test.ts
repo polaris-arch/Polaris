@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  subscriptionCreateSuccessToastKey,
   subscriptionCreateTaskCloseLocked,
   subscriptionCreatePublicationCanFinalize,
 } from './SubscriptionCreateTaskDialog';
@@ -15,17 +14,6 @@ describe('subscription create recovery task close gate', () => {
     expect(subscriptionCreateTaskCloseLocked({
       phase: 'succeeded', cancelling: false, settling: false,
     })).toBe(true);
-  });
-
-  it('发布失败仍保持 terminal task 可见并改为刷新重试，不允许手动清除', () => {
-    expect(subscriptionCreateTaskCloseLocked({
-      phase: 'succeeded', cancelling: false, settling: false,
-    })).toBe(true);
-  });
-
-  it('provider 部分成功只消费稳定 partial 标记，不展示上游 warning 原文', () => {
-    expect(subscriptionCreateSuccessToastKey(true)).toBe('sub.addedPartial');
-    expect(subscriptionCreateSuccessToastKey(false)).toBe('sub.added');
   });
 
   it('deferred force-load 后若 task 已卸载，不消费 handled；重建可再次发布', () => {

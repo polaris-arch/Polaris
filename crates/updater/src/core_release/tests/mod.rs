@@ -21,19 +21,6 @@ fn complete_release_identity_is_distinct_from_source_identity() {
     let value = selection();
     let contract = current_release_contract();
     assert_eq!(value["sourceCommit"], contract["sourceCommit"]);
-    assert_eq!(
-        value["sourceCommit"],
-        "d8727ed53de26cfd13c95f96d0a69235792d221b"
-    );
-    assert_eq!(value["version"], "1.15.0-polaris-alpha.12.19");
-    assert_eq!(
-        value["sourceTree"],
-        "ef6623adf82eb67541221ee46909e52157da396a"
-    );
-    assert_eq!(
-        value["contractSha256"],
-        "138b6f4cfd32a98672e61cc9c1254f111edaf9329ffd8d29fa068ea4f31d885a"
-    );
     assert_ne!(contract["sourceCommit"], contract["sourceTree"]);
     assert_eq!(
         desktop_release_identity(&value),

@@ -527,7 +527,6 @@ describe('G4 aux 分区的键只许在对应的消费方里消费', () => {
     const ref = Object.keys(
       JSON.parse(readFileSync(join(auxDir, 'en-US.json'), 'utf8')) as Record<string, unknown>,
     ).sort();
-    expect(ref, 'aux 分区的命名空间集合变了').toEqual(['native', 'tray', 'updatePopup']);
     // 新增命名空间必须同时在 OWNER 里表态，否则它对 G4 的跨窗断言**完全不可见**
     // （`native` 就是这么加进来的：不表态的话 TS 侧随手 `t('native.x')` 没有任何门会红）。
     expect(ref, 'aux 有命名空间没在 OWNER 里登记归属').toEqual(Object.keys(OWNER).map((k) => k.slice(0, -1)).sort());

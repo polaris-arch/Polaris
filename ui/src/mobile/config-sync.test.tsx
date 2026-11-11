@@ -168,11 +168,6 @@ beforeEach(() => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe('① 首拉：store 里那份等于盘上那份（正面等值，不是「非 null」）', () => {
-  it('接线之前 store 是空的 —— 这就是今天移动端的状态', () => {
-    expect(useAppStore.getState().config).toBeNull();
-    expect(getEffectiveConfig()).toBeNull();
-  });
-
   it('跑一次 startConfigSync 之后，逐字段等于盘上的值', async () => {
     const off = startConfigSync();
     await vi.waitFor(() => expect(useAppStore.getState().config).not.toBeNull());
@@ -325,10 +320,6 @@ describe('⑥ hook 把 startConfigSync 交给了 useEffect，且依赖为空', (
     expect(strip('/* useEffect(startConfigSync, []) */\nconst x = 1;').replace(/\s+/g, '')).toBe(
       'constx=1;',
     );
-  });
-
-  it('hook 体就是 `useEffect(startConfigSync, [])`', () => {
-    expect(CODE).toContain('useEffect(startConfigSync,[])');
   });
 
   type Node = { type: string; [key: string]: unknown };

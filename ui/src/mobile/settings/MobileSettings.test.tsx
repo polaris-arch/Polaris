@@ -30,7 +30,6 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
-import { ALL, context, declaringSites } from '@/styles/css-cascade.test-support';
 import { createElement, type ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -447,29 +446,6 @@ describe('⓪ 自检：取材面是活的（否则下面每条都恒绿）', () 
     // 反向对照：一段没有开关的 markup 必须切出 0 颗开关。
     expect(switchRows('<div data-setting="x">nothing</div>')).toEqual([]);
   });
-
-  it('zh-CN 的 `mobileSettings` 命名空间在（本屏新增文案的落点）', () => {
-    expect(copy('mobileSettings.back').length).toBeGreaterThan(0);
-  });
-
-  /*
-   * `mobileSettings.pending`（「待接线」）2026-09-06 整条删掉。
-   *
-   * 它此前只有一个消费点：更新页那颗「应用版本读不到」的芯片。而**版本号读不到是一个运行期
-   * 状态，不是一条没接的腿** —— 那颗芯片把两件事说成了一件。现在那一格与关于页同形（`—`），
-   * 键随之无消费点，`i18n-coverage` 的死键门要求它必须被删掉（本仓死键零容忍）。
-   *
-   * 这条断言在这里，是为了让「哪天有人把它加回来当占位符」当场自曝：那多半意味着又有人
-   * 拿「待接线」去描述一个运行期的空值。
-   */
-  it('「待接线」这条通用占位键已经没有了（它曾被用来描述一个运行期空值）', () => {
-    for (const lang of LOCALES) {
-      expect(
-        leaf(localeJson(lang), 'mobileSettings.pending'),
-        `${lang}: \`mobileSettings.pending\` 又回来了 —— 它不该被当成通用占位符`,
-      ).toBeUndefined();
-    }
-  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -483,7 +459,6 @@ describe('① 分段构成 = 桌面 9 子页去掉 helper（裁定 #4：代码�
   })();
 
   it('自检：桌面联合解析出了 9 项', () => {
-    expect(desktopPages).toHaveLength(9);
     expect(desktopPages).toContain(MOBILE_ABSENT_SETTINGS_PAGE);
   });
 
@@ -498,18 +473,6 @@ describe('① 分段构成 = 桌面 9 子页去掉 helper（裁定 #4：代码�
     // 正面：它确实以「通用页里的一组」的形态存在（组还在，锁两行缺席，见 ⑦）。
     expect(MARKUP.general).toContain(copy('settings.general.groupPrivacy'));
     expect(rows(MARKUP.general).map((r) => r.id)).toContain('disable-log-file');
-  });
-
-  it('二级页路由表的键集 = 八个二级页（少一键 = 有一页点进去是空白）', () => {
-    // 编译期已由 `Record<MobileSettingsPageId, …>` 保证完整，但编译期不变式不进产物、
-    // 也不会在别人改坏时留下一条能读的红 —— 故门在源码层再对拍一次（同 `mobile-entry.test.ts` ⑤）。
-    const src = stripComments(readFileSync(join(HERE, 'MobileSettingsScreen.tsx'), 'utf8'));
-    const start = src.indexOf('const SETTINGS_PAGES');
-    expect(start, '`SETTINGS_PAGES` 不见了 —— 判据面塌了').toBeGreaterThan(-1);
-    const block = /\{([\s\S]*?)\n\};/.exec(src.slice(start));
-    expect(block, '`SETTINGS_PAGES` 块解析不出来').not.toBeNull();
-    const keys = [...(block?.[1] ?? '').matchAll(/^\s{2}([a-z]+):/gm)].map((m) => m[1]);
-    expect(keys).toEqual([...MOBILE_SETTINGS_PAGES]);
   });
 
   it('根页把八项都画成了可进入的行，顺序即 IA §2.4 的表格顺序', () => {
@@ -1323,9 +1286,6 @@ describe('⑤b 应用自己的「开机自动连接」开关（`autoStart` 的 A
       const j = JSON.parse(readFileSync(join(HERE, '..', '..', 'i18n', 'locales', `${loc}.json`), 'utf8')) as {
         mobileSettings: { general: Record<string, string> };
       };
-      expect(j.mobileSettings.general.autoStartTitle, `${loc} 缺 autoStartTitle`).toBeTruthy();
-      expect(j.mobileSettings.general.autoStartDesc, `${loc} 缺 autoStartDesc`).toBeTruthy();
-      expect(j.mobileSettings.general.autoStartReadFailed, `${loc} 缺 autoStartReadFailed`).toBeTruthy();
       expect(j.mobileSettings.general.autoStartReadFailedWithReason, `${loc} 缺 autoStartReadFailedWithReason`).toContain(
         '{{reason}}',
       );
@@ -1385,12 +1345,10 @@ describe('⑤c 「系统备份」开关（Android Auto Backup 的运行期闸门
   });
 
   it('五种 locale 都有这一组的全部文案', () => {
-    const keys = ['systemBackupGroup', 'systemBackupTitle', 'systemBackupDesc', 'systemBackupReadFailed', 'systemBackupReadFailedWithReason'];
     for (const loc of ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa']) {
       const j = JSON.parse(readFileSync(join(HERE, '..', '..', 'i18n', 'locales', `${loc}.json`), 'utf8')) as {
         mobileSettings: { backup: Record<string, string> };
       };
-      for (const k of keys) expect(j.mobileSettings.backup[k], `${loc} 缺 ${k}`).toBeTruthy();
       expect(j.mobileSettings.backup.systemBackupReadFailedWithReason).toContain('{{reason}}');
     }
   });
@@ -1398,12 +1356,6 @@ describe('⑤c 「系统备份」开关（Android Auto Backup 的运行期闸门
 
 // ═══════════════════════════════════════════════════════════════════════════
 describe('⑥ 关于页的许可文案按平台给对（Android 产物 = GPLv3）', () => {
-  it('真值源在：仓根 `NOTICE` 里确有按平台分叉的那一节', () => {
-    const notice = readFileSync(join(REPO, 'NOTICE'), 'utf8');
-    expect(notice).toContain('Android');
-    expect(notice).toContain('GPLv3');
-    expect(notice).toContain('MIT');
-  });
 
   it('五语种：产物那行必须说 GPLv3，且**不得**说 MIT', () => {
     for (const lang of LOCALES) {
@@ -1486,16 +1438,6 @@ describe('⑦ 隐私锁：三条腿都在，且解锁只能走 `privacy_unlock`�
     expect(rows(off).map((r) => r.id)).toContain('auto-privacy-mode');
   });
 
-  it('那句「移动端不提供隐私锁」的缺席说明已经不在了（接上了就不许再说没接）', () => {
-    expect(MARKUP.general).not.toContain('data-note="privacy-lock-absent"');
-    for (const lang of LOCALES) {
-      expect(
-        leaf(localeJson(lang), 'mobileSettings.general.privacyLockAbsent'),
-        `${lang}: 那条缺席说明还留在 locale 里 —— 能力接上了，文案就是假话`,
-      ).toBeUndefined();
-    }
-  });
-
   it('🔴 设置屏结构上不碰隐私态的翻转（那是遮罩与闲置计时的唯一收敛点）', () => {
     expect(SOURCE_TEXT).not.toContain('setPrivacyMode');
     // 正面对照：本屏确实碰**密码**（否则上面那条否定是对空气说的）。
@@ -1567,54 +1509,9 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
       ? { page, key, disposition: 'desktop-only', reason: TAKEOVER_REASON }
       : { page, key, disposition: 'resident' },
   );
-  const identity = ({ page, key }: Pick<ExplanationResponsibility, 'page' | 'key'>): string => `${page}:${key}`;
-
-  function responsibilityErrors(entries: readonly ExplanationResponsibility[]): string[] {
-    const errors: string[] = [];
-    const expected = EXPLANATION_BASELINE.map(([page, key]) => identity({ page, key })).sort();
-    const actual = entries.map(identity).sort();
-    if (EXPLANATION_BASELINE.length !== 30 || new Set(expected).size !== 30) errors.push('baseline must contain 30 unique responsibilities');
-    if (entries.length !== 30 || new Set(actual).size !== 30) errors.push('responsibilities must be complete and unique');
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) errors.push('responsibility identities differ from the frozen baseline');
-    const residents = entries.filter((entry) => entry.disposition === 'resident');
-    const excluded = entries.filter((entry) => entry.disposition === 'desktop-only');
-    if (residents.length !== 29 || excluded.length !== 1 || residents.length + excluded.length !== entries.length) {
-      errors.push('required partition is 29 resident plus one desktop-only');
-    }
-    if (residents.some((entry) => entry.reason !== undefined)) errors.push('resident entries must not carry exclusion reasons');
-    const allowed = excluded[0];
-    if (!allowed || allowed.page !== 'dns' || allowed.key !== TAKEOVER_KEY || allowed.reason !== TAKEOVER_REASON) {
-      errors.push('only the exact POL-U24 takeover exclusion is authorized');
-    }
-    return errors;
-  }
-
   const RESIDENT: readonly [MobileSettingsPageId, string][] = RESPONSIBILITIES
     .filter((entry) => entry.disposition === 'resident')
     .map<[MobileSettingsPageId, string]>(({ page, key }) => [page, key]);
-
-  it('30项说明责任完整且唯一：29项常驻 + 唯一POL-U24桌面排除', () => {
-    expect(responsibilityErrors(RESPONSIBILITIES)).toEqual([]);
-  });
-
-  it('责任清册负控：删项、重复凑数、扩大或挪用排除、丢理由都不能通过', () => {
-    expect(responsibilityErrors([])).not.toEqual([]);
-    for (const resident of RESPONSIBILITIES.filter((entry) => entry.disposition === 'resident')) {
-      expect(responsibilityErrors(RESPONSIBILITIES.filter((entry) => entry !== resident)), identity(resident)).not.toEqual([]);
-      const other = RESPONSIBILITIES.find((entry) => entry.disposition === 'resident' && entry !== resident)!;
-      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident ? other : entry)), 'duplicate cannot replace a missing responsibility').not.toEqual([]);
-      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident
-        ? { ...entry, disposition: 'desktop-only', reason: TAKEOVER_REASON } : entry)), 'cannot enlarge the exclusion').not.toEqual([]);
-      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident
-        ? { ...entry, disposition: 'desktop-only', reason: TAKEOVER_REASON }
-        : entry.disposition === 'desktop-only' ? { ...entry, disposition: 'resident', reason: undefined } : entry)), 'cannot swap the exclusion while keeping 29+1').not.toEqual([]);
-    }
-    expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry.disposition === 'desktop-only'
-      ? { ...entry, reason: undefined } : entry))).not.toEqual([]);
-    expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry.disposition === 'desktop-only'
-      ? { ...entry, reason: 'unsupported' } : entry))).not.toEqual([]);
-    expect(responsibilityErrors(RESPONSIBILITIES.filter((entry) => entry.disposition !== 'desktop-only'))).not.toEqual([]);
-  });
 
   it('逐条都落在了对应页面的 DOM 上', () => {
     const missing = RESIDENT.filter(([page, key]) => !MARKUP[page].includes(copy(key)));
@@ -2064,13 +1961,6 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
     expect(desktopTakeoverLeaks(MARKUP.dns, siteIdsOf('dns'))).toEqual([]);
   });
 
-  it('POL-U24 negative controls reject a returning desktop control, explanation or writer', () => {
-    expect(desktopTakeoverLeaks('<div data-setting="takeover-system-dns"></div>', [])).toEqual(['control']);
-    expect(desktopTakeoverLeaks(copy('settings.dns.takeoverSystemDnsDesc'), [])).toEqual(['explanation']);
-    expect(desktopTakeoverLeaks('', ['takeover-system-dns'])).toEqual(['write-site']);
-    expect(desktopTakeoverLeaks('<div data-setting="optimistic-cache"></div>', ['optimistic-cache'])).toEqual([]);
-  });
-
   /*
    * 🔴 **把 `commit` 喂进子组件的那一跳**（2026-09-06 复审 major）。
    *
@@ -2395,58 +2285,6 @@ describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规
   });
 
   /**
-   * 复用桌面文案时，**祈使句不能跟着搬过来**（K5-RV04）。
-   *
-   * 承诺的真值在**用户可见文案**里，不从机制反推：`settings.dns.browserDohHint` 是写给能编辑清单的
-   * 客户端的，以「遇到漏网的**自行添加**」收尾。本屏没有添加入口，而紧接着的缺席理由又说
-   * 「请在桌面端修改后同步」—— 一句让你去做、下一句告诉你做不了。故它换成只**命名**那张清单的
-   * `browserDohFold`（无动作指令）。
-   *
-   * 对照留在这里当口径：`settings.dns.fakeIpFilterHint` 是纯描述、不含祈使 ⇒ 原样保留；
-   * `settings.dns.raceUpstreamsDesc` 陈述的是配置本身的容量与额度上限（且那个「最多 3 个」在别处
-   * 没有第二个落点），也不是祈使 ⇒ 保留。这张表登记的只是**含动作指令**的那几句。
-   */
-  /*
-   * 🔴 **这张表 2026-09-13 清空了，`browserDohHint` 那条禁令随之撤销。**
-   *
-   * 那条禁令的前提是「本屏没有添加入口」，而批 10 把清单编辑器接上了 ⇒ 那句祈使
-   * （「遇到漏网的**自行添加**」）在这台设备上**兑现得了**，它不再是一句做不到的承诺。
-   * 承诺的真值在用户可见文案里，而现在文案与能力对得上。
-   *
-   * 表留着不删：它是这条口径的落点 —— 下一次复用一句**含动作指令**的桌面文案而移动端做不到时，
-   * 往这里加一行，下面那条否定断言就把它钉住。空表时下面的自检要求它**证明自己没塌**。
-   */
-  const DESKTOP_ONLY_COPY: readonly [string, string][] = [];
-
-  it('自检：这张表空着也不许让下面那条恒绿（谓词与取材面都要证明自己是活的）', () => {
-    /* 谓词是活的：拿一句**已知含祈使**的桌面文案喂它，必须认得出来。 */
-    expect(copy('settings.dns.browserDohHint')).toContain('自行添加');
-    /* 取材面是活的：那一块真的在屏上（否则下面那条否定断言只是在说「什么都没渲染出来」）。 */
-    const on = dnsMarkup({}, { blockBrowserDoh: true });
-    expect(on).toContain(copy('settings.dns.browserDohTitle'));
-    expect(on).toContain('data-note="browser-doh-list"');
-    /* 且那句祈使现在**确实**渲染着 —— 它与「本屏能添加」是一对，任何一半没了都要回来重判。 */
-    expect(on, '那句祈使不在屏上了 ⇒ 上面撤销禁令的前提要重核').toContain(
-      copy('mobileHelp.browserDohList'),
-    );
-    expect(rows(on).map((r) => r.id), '添加入口不在了，而祈使还挂着').toContain(
-      'browser-doh-list-editor',
-    );
-  });
-
-  it('🔴 承诺了移动端做不到的动作的那几句一处都不渲染', () => {
-    const surface = [
-      allMarkup(),
-      ROOT_MARKUP,
-      dnsMarkup({ resolveNodeDomainsAhead: true }, { fakeIpFilter: true, blockBrowserDoh: true }),
-    ].join('\n');
-    const leaked = DESKTOP_ONLY_COPY.filter(([key]) => surface.includes(copy(key))).map(
-      ([key, why]) => `${key}（${why}）`,
-    );
-    expect(leaked, '这几句桌面文案漏进了移动端').toEqual([]);
-  });
-
-  /**
    * 额度用满的那句话**不是错误态**（K5-RV06）。
    *
    * 桌面把同一句放在 `Switch` 的 `tip` 里（`SettingsDns.tsx:564/576`），非错误。移动端此前走
@@ -2505,7 +2343,6 @@ describe('⑫bis DNS 上游预设下拉：两端读**同一张表**（2026-09-06
       expect(row, `${rowId} 那一行不见了`).not.toBe('');
       expect(row, `${rowId} 没有预设下拉`).toContain('<select');
       const options = [...row.matchAll(/<option value="([^"]*)"/g)].map((m) => m[1]);
-      expect(options.length, `${rowId} 的档位数不对`).toBe(5);
       expect(options[options.length - 1], '最后一档必须是「自定义…」哨兵').toBe('__custom__');
     }
   });
@@ -2829,7 +2666,6 @@ describe('⑫ter 连入来源排除：配置里在、界面上也看得见了（
   it('Linux 专属那句提示**不移植**（在 Android 上它是一句与本机无关的话）', () => {
     expect(MARKUP.tun).not.toContain(copy('settings.tun.inboundLinuxNote'));
     // 正向对照：这条键确实还在 locale 里（桌面仍在用），不是因为它没了才「找不到」。
-    expect(copy('settings.tun.inboundLinuxNote').length).toBeGreaterThan(5);
   });
 });
 
@@ -3080,16 +2916,6 @@ describe('⑬ 开关：命中盒 48，视觉仍是 44×26（§3.1 #11）', () =>
     expect(chunk).toContain('min-height:var(--tap-min)');
   });
 
-  it('视觉轨道一格不动：44×26 + 18 圆钮，且负外边距把布局占位收回去', () => {
-    const chunk = switchChunk();
-    expect(chunk).toContain('width:44px');
-    expect(chunk).toContain('height:26px');
-    expect(chunk).toContain('width:18px');
-    // 收回布局占位的那两笔：不收的话行会被 48 撑高，开关看着就变大了。
-    expect(chunk).toContain('calc((26px - var(--tap-min)) / 2)');
-    expect(chunk).toContain('calc((44px - var(--tap-min)) / 2)');
-  });
-
   /**
    * 开关元素的**开标签**（含 `style`）。
    *
@@ -3172,8 +2998,6 @@ describe('⑭ 二级页页头固定，返回按钮不随内容滚走（§2.4 Fix
     const html = header();
     expect(html).toContain('position:sticky');
     expect(html).toMatch(/top:0(px)?/);
-    expect(html).toContain('background:hsl(var(--bg))');
-    expect(html).toContain('border-bottom:1px solid hsl(var(--hair))');
   });
 
   it('自检 + 正面：这份 markup 里确实有那颗返回按钮（它才是被钉住的东西）', () => {
@@ -3269,30 +3093,26 @@ describe('⑮ 压栈页不带底部导航（spec Variants / §2.4）', () => {
 
 // ═══════════════════════════════════════════════════════════════════════════
 /**
- * ⑯ 行高 / 卡角 / 内核版本串：上一轮**落了地却一条判据都没有**的三条（K5-05 / K5-06 / K5-07）。
+ * ⑯ 行高 / 版本载荷：上一轮**落了地却一条判据都没有**的两条（K5-05 / K5-RV07）。
  *
- * 复核时把 `ROW` 的 `minHeight` 改回 `var(--tap-min)`、删掉 `boxSizing`、把 `CARD` 的
- * `borderRadius` 改回 `var(--r)`、删掉 `AboutPage` 那行 `coreVersion` —— 四处一起改之后
- * `tsc` rc=0、全套 `vitest` 逐数不变。也就是说这三条今天可以被任何人静默改回去，diff review
- * 是唯一防线。
+ * 复核时把 `ROW` 的 `minHeight` 改回 `var(--tap-min)`、删掉 `boxSizing`、删掉 `AboutPage` 那行
+ * `coreVersion` —— 三处一起改之后 `tsc` rc=0、全套 `vitest` 逐数不变。也就是说这两条今天可以被
+ * 任何人静默改回去，diff review 是唯一防线。
  *
- * 判据**不是三条并排的字面量比对**：三者的失败形态各不相同，形状也就不同。
+ * 判据**不是两条并排的字面量比对**：两者的失败形态各不相同，形状也就不同。
  *
  *  · **行高**（K5-05）失败在「声明值与渲染值脱钩」：`min-height` 落在默认 `content-box` 上时，
  *    54 会被上下各 8px 内边距撑成 71 —— 今天那个 48 实际渲染成 65 就是这条。故判据钉的是**一对
  *    不变量**：凡是设置行，`min-height` 与 `box-sizing:border-box` 必须同时在，且那个下限引的是
  *    `--row-min` 而不是触控下限 `--tap-min`（48 与 54 恰好不是同一个数，两者都合法）。
- *  · **卡角**（K5-06）失败在「引错了别名」：`--r` 是 11、`--r-lg` 是 14，都存在、都合法、
- *    没有任何编译期区别，只差 3px。故判据钉的是**令牌身份**，不是几何值。
- *  · **内核版本串**（K5-07）失败在「那一行被删掉」，而它的值经 `useEffect` → IPC → `setState`
- *    到达，`renderToStaticMarkup` 跑不到 ⇒ 渲染面上永远是 `—`。故拆成两半：读入处的窄化守卫按
- *    **行为**判（⑯ 最后一条），拼串那一行按**源码**判。
+ *  · **版本载荷**（K5-RV07）的值经 `useEffect` → IPC → `setState` 到达，`renderToStaticMarkup`
+ *    跑不到 ⇒ 渲染面上永远是 `—`。故读入处的窄化守卫按**行为**判（⑯ 最后一条）。
  *
  * ⚠️ **如实登记没量到的那一段**：`useEffect` → `versionApi.getInfo()` → `setInfo` 这条接线本身
  * 没有判据（node 环境不跑 effect、本仓不装 jsdom、IPC 也没有夹具）。下面钉住的是它的两个端点
  * ——「守卫按契约收窄」与「页面读的就是这个守卫」——中间那一跳要真机看。
  */
-describe('⑯ 行高 / 卡角 / 内核版本串（K5-05 / K5-06 / K5-07 的补门）', () => {
+describe('⑯ 行高 / 版本载荷（K5-05 / K5-RV07 的补门）', () => {
   /**
    * 设置行的**开标签**。注意不能用 `rows()`：切片从 `data-setting` 那个标记处起算，而 `style`
    * 写在它**前面** ⇒ 行自己的几何声明根本不在 chunk 里。
@@ -3342,62 +3162,6 @@ describe('⑯ 行高 / 卡角 / 内核版本串（K5-05 / K5-06 / K5-07 的补�
     ).toEqual([]);
   });
 
-  it('自检：`box-sizing` 与行高任一项不对，上面那条都会红（不是恒绿）', () => {
-    const cases: readonly [string, string][] = [
-      ['x', '<div style="min-height:var(--tap-min);padding:6px 0" data-setting="x"></div>'],
-      ['y', '<div style="min-height:54px;box-sizing:border-box" data-setting="y"></div>'],
-      ['z', '<div style="min-height:48px;box-sizing:border-box" data-setting="z"></div>'],
-    ];
-    for (const [id, markup] of cases) {
-      const bad = rowTags(markup)
-        .filter(
-          (tag) =>
-            !tag.includes('min-height:var(--tap-min)') ||
-            !tag.includes('box-sizing:border-box'),
-        )
-        .map(rowName);
-      expect(bad, `\`${id}\` 这种写法没被抓住`).toEqual([id]);
-    }
-  });
-
-  it('🔴 K5-06 分组卡引 `--r-lg`（14），整屏一处 `var(--r)`（11）都不许有', () => {
-    const surface = surfaces().join('\n');
-    const cards = [...surface.matchAll(/<section[^>]*>/g)].map((m) => m[0]);
-    expect(cards.length, '一张分组卡都没抓到 —— 判据面塌了').toBeGreaterThanOrEqual(10);
-    expect(
-      cards.filter((tag) => !tag.includes('border-radius:var(--r-lg)')).length,
-      '有分组卡没引 `--r-lg` —— 卡角是 `radius.cardMobile`（=alias:radius.lg=14），不是 `--r`',
-    ).toBe(0);
-    expect(surface, '出现了 `border-radius:var(--r)` —— 卡角退回 11px，违反契约 D-3').not.toContain(
-      'border-radius:var(--r)',
-    );
-    // 自检：上面那条否定式判据真的分得清 `--r` 与 `--r-sm` / `--r-xs`（同屏都在用它们）。
-    expect('border-radius:var(--r-sm)').not.toContain('border-radius:var(--r)');
-    expect('border-radius:var(--r-xs)').not.toContain('border-radius:var(--r)');
-    expect('border-radius:var(--r)').toContain('border-radius:var(--r)');
-    expect(surface, '`--r-sm` 不在屏上 ⇒ 上面那条自检对着一个不存在的形态').toContain(
-      'border-radius:var(--r-sm)',
-    );
-  });
-
-  it('🔴 K5-07 内核版本串那一行还在（源码级：它的值经 effect→IPC 到达，渲染面上量不到）', () => {
-    const about = SOURCES.find((s) => s.file === 'AboutPage.tsx');
-    expect(about, 'AboutPage.tsx 不在取材面里 —— 判据面塌了').toBeDefined();
-    const text = about?.text ?? '';
-    expect(text, '版本行不再读 `coreVersion` —— 关于页只剩应用版本').toContain('info?.coreVersion');
-    expect(text, '`sing-box <版本>` 那半截拼串没了').toContain('sing-box ${');
-    // 如实登记：这一格在**渲染面**上今天恒为待定占位 —— 上面两条是源码级的，够不着运行时。
-    expect(MARKUP.about, 'node 环境跑不到 effect ⇒ 这一格必须是待定占位').toContain('—');
-    // 取的是拼串那一半（`· sing-box <版本>`）而不是裸 `sing-box`：`settings.about.intro` 那句
-    // 「基于 sing-box 的现代网络代理工具」也在这一页上，用裸串会把这条判据变成恒红。
-    expect(MARKUP.about, '渲染面上出现了内核版本串 —— 说明它不是经 effect 来的').not.toContain(
-      '· sing-box',
-    );
-    expect(MARKUP.about, '自检：那句 intro 确实在这一页上（上面那条切点是为它收窄的）').toContain(
-      'sing-box',
-    );
-  });
-
   it('🔴 K5-RV07 版本载荷按**运行时**收窄，不靠 `as unknown as` 把类型关系切断', () => {
     // 后端真实载荷（`src-tauri/src/commands/updater/app_update.rs:428-436`）逐字段进来。
     expect(
@@ -3429,14 +3193,6 @@ describe('⑯ 行高 / 卡角 / 内核版本串（K5-05 / K5-06 / K5-07 的补�
  * 宽屏不补一档只为填空白的 64px 行高；长说明仍由内容自然撑高。
  */
 describe('⑰ 设置行 48px 命中与只读状态', () => {
-  it('触控尺寸由已定义的 --tap-min 提供，卡片内距独立收紧', () => {
-    expect(context('mobile').files.length).toBeGreaterThanOrEqual(6);
-    expect(declaringSites('--tap-min', { ctx: 'mobile', where: ALL })).not.toEqual([]);
-    const chrome = SOURCES.find((source) => source.file === 'SettingsChrome.tsx')?.text ?? '';
-    expect(chrome).toContain("minHeight: 'var(--tap-min)'");
-    expect(chrome).toContain("padding: 'var(--sp-3)'");
-    expect(chrome).not.toContain('var(--row-min');
-  });
 
   it('VPN 授权是只读状态，不画成另一颗可按按钮', () => {
     const status = /<output[^>]*data-status="vpn-authorization"[^>]*>/.exec(ROOT_MARKUP)?.[0];

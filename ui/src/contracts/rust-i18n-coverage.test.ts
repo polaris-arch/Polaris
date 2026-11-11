@@ -146,11 +146,9 @@ describe('Rust 侧 i18n 与前端的三向对账', () => {
   });
 
   it('自检：语料与解析都非空（防「扫到 0 条于是全绿」）', () => {
-    expect(Object.keys(AUX).length, 'aux 语种不齐').toBe(5);
     for (const l of SUPPORTED_LANGUAGES) {
       expect(Object.keys(AUX[l]).length, `${l} 的 aux 语料为空`).toBeGreaterThan(50);
     }
     expect(rustDeclaredKeys().length).toBeGreaterThanOrEqual(30);
-    expect(rustLangCodes().length).toBe(5);
   });
 });

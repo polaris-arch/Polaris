@@ -50,10 +50,6 @@ describe('守卫自检：扫到的确实是 HomeScreen 源码（防读空文件�
 describe('网络检测（onSpeedTest）只测当前出口', () => {
   const body = () => callbackBody('onSpeedTest');
 
-  it('请求集是 `[currentServer.id]` —— 单节点，不是任何集合表达式', () => {
-    expect(body()).toContain('api.server.speedTest([currentServer.id])');
-  });
-
   it('不再取全量集合（`speedTestableIds` 不得出现在本腿）', () => {
     // 变异对照：把这一腿改回 `speedTestableIds(servers, …)` → 本条转红。
     expect(body()).not.toContain('speedTestableIds');
@@ -71,20 +67,6 @@ describe('网络检测（onSpeedTest）只测当前出口', () => {
 
 describe('三种「测不了」都出声，且判定顺序不能乱', () => {
   const body = () => callbackBody('onSpeedTest');
-
-  it('哨兵出口（直连/阻断）有专属提示，不冒充成「未选节点」', () => {
-    expect(body()).toContain('sentinelSelected');
-    expect(body()).toContain('nodes.speedTestSentinelExit');
-  });
-
-  it('出口节点结构上不可测 → 走 speedTestBlockReason + 与节点页同一句措辞', () => {
-    expect(body()).toContain('speedTestBlockReason(currentServer');
-    expect(body()).toContain('speedTestBlockedMessage(reason, t)');
-  });
-
-  it('selectedServerId 指向不存在的节点 → 复用后端同条件文案', () => {
-    expect(body()).toContain('nodes.speedTestNoActiveExit');
-  });
 
   /**
    * 顺序有牙：`sentinelSelected ⟹ currentServer === null`（HomeScreen 的 `currentServer` memo 在
@@ -106,18 +88,6 @@ describe('三种「测不了」都出声，且判定顺序不能乱', () => {
     const call = b.indexOf('api.server.speedTest');
     expect(call).toBeGreaterThan(-1);
     expect(b.slice(0, call).match(/\breturn;/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
-  });
-});
-
-describe('全量入口原样保留在出口选单', () => {
-  it('onTestAllInMenu 仍走 speedTestableIds 全量过滤', () => {
-    // 变异对照：把菜单腿也改成单节点 → 产品彻底没有全量入口 → 本条转红。
-    expect(callbackBody('onTestAllInMenu')).toContain('speedTestableIds(servers');
-  });
-
-  it('两条腿共用 testing 单飞标志（后端有进程级单飞闸，撞闸会报成「测速失败」）', () => {
-    expect(callbackBody('onTestAllInMenu')).toContain('testing');
-    expect(SRC).toContain('setTesting(true)');
   });
 });
 

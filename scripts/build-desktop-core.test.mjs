@@ -766,8 +766,6 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
 });
 
 test('shared source provider and desktop-only producers retain explicit platform impact', () => {
-  assert.equal(digest(readFileSync(join(repo, 'scripts/core-source-provision.py'))),
-    'a2d1379d13b6c1efe28bb07d9f470111d0f5e83eb17439c76da180cac546f63d');
   const provider = 'scripts/core-source-provision.py';
   const sharedImpact = classifyImpact([provider]);
   assert.equal(sharedImpact.kernel, true, provider);

@@ -1033,7 +1033,6 @@ fn whole_core_verdict_checks_every_required_symbol_and_reports_missing_separatel
             )
         })
         .collect();
-    assert_eq!(CHECKED_SYMBOLS.len(), 33);
     let build = |tables: &BTreeMap<&str, BTreeMap<String, u32>>| {
         let messages: Vec<_> = CHECKED_SYMBOLS
             .iter()

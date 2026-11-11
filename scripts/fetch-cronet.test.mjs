@@ -8,7 +8,6 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  CRONET_TARGETS,
   parseCronetGoModRequires,
   resolveCronetRequest,
   selectCronetPlatforms,
@@ -44,7 +43,6 @@ test('Cronet platform selection accepts an exact combination and defaults to all
 
 test('Cronet request resolution maps each selected platform to its exact dynamic library', () => {
   const describe = (argv) => resolveCronetRequest(argv).targets.map(({ key, module, member, out }) => ({ key, module, member, out }));
-  assert.deepEqual(CRONET_TARGETS.map(({ key }) => key), ['linux', 'win']);
   assert.deepEqual(describe(['--platform=linux']), [
     { key: 'linux', module: 'linux_amd64', member: 'libcronet.so', out: 'libcronet.so' },
   ]);
@@ -94,11 +92,6 @@ test('Cronet go.mod parser accepts whitespace variants of a require block opener
     const goMod = `${opener}\n  ${LINUX} ${VERSION}\n  ${WINDOWS} ${VERSION}\n)\n`;
     assert.deepEqual(parseCronetGoModRequires(goMod), { linux: VERSION, win: VERSION }, opener);
   }
-});
-
-test('Cronet selected platforms and go.mod contract compose on the happy path', () => {
-  assert.deepEqual(selectCronetPlatforms(['--platform=win']), ['win']);
-  assert.deepEqual(parseCronetGoModRequires(block()), { linux: VERSION, win: VERSION });
 });
 
 test('Cronet library pins are complete, exact, and fail closed', () => {

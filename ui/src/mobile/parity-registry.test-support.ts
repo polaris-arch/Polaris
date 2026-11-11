@@ -183,13 +183,4 @@ export interface ScreenParityRegister {
    * （2026-09-06 复审 minor：上一版四道接手门里只有 `MobileSettings.test.tsx` 一道被断言存在。）
    */
   readonly slotHandoffGates: readonly Anchor[];
-  /**
-   * 具名数据槽的**基线**（`desktopDirs` 全部文件的 `id="…"` 全集）。
-   *
-   * 🔴 这一格**不是对差面，是变更探测器**，别把它读成「每个数据槽都对过了」：它只回答
-   * 「桌面这一屏的数据槽集合有没有在没人看的情况下变过」。桌面新加一个槽 ⇒ 基线不等 ⇒ 红 ⇒
-   * 逼一次「移动端要不要画」的显式决定。它**答不出**移动端今天画没画其中某一个 ——
-   * 那一格由 `blocks` 面（整块粒度）与各屏自己的渲染门（逐槽粒度）分担，见门的头注「射程自曝」。
-   */
-  readonly slotBaseline: readonly string[];
 }

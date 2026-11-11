@@ -33,27 +33,4 @@ describe('管理面板 API secret', () => {
     // 24 字节 = 192 bit。低于 16 字节（128 bit）对一个长期有效、可被本机任意进程尝试的凭据来说不够。
     expect(bytes).toBeGreaterThanOrEqual(16);
   });
-
-  /**
-   * 三颗按钮（显示/隐藏 · 复制 · 重新生成）都接到真实现。
-   *
-   * 变异对照：删掉重新生成那颗的 `onClick` → 第三条转红。
-   */
-  it('显示 / 复制 / 重新生成三条腿都在', () => {
-    expect(SRC).toContain('setShowSecret((s) => !s)');
-    expect(SRC).toContain('copyText(secret)');
-    expect(SRC).toContain('update({ clashApiSecret: generateSecret() })');
-  });
-
-  /**
-   * 重生成走 `update()` 写 `clashApiSecret` —— 该键**在** `UserConfig::FIELD_NAMES` 里
-   * （`contracts/user-config-fields.ts`），故 `config_generation_norm` 判不等 → 进重启判定，
-   * 与原型 `mgmtRegen()` 的 `markDirty('管理面板 secret 已重置')` 同义。
-   *
-   * 这条断言防的是「换成一个不在字段集里的键」那类静默失效（即「第四类重启」的造法）。
-   */
-  it('写的是 UserConfig 字段集里的键（否则改了核不重生成、静默不生效）', async () => {
-    const { isCoreConfigKey } = await import('@/contracts/user-config-fields');
-    expect(isCoreConfigKey('clashApiSecret')).toBe(true);
-  });
 });

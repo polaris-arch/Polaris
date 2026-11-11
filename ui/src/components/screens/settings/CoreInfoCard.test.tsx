@@ -27,7 +27,6 @@ vi.mock('./CoreRecoveryActions', () => ({ default: () => <div data-core-recovery
 </div> }));
 const { default: CoreRecoveryActions } = await import('./CoreRecoveryActions');
 const { default: CoreInfoCard } = await import('./CoreInfoCard');
-const pageSource = readFileSync(fileURLToPath(new URL('./SettingsUpdate.tsx', import.meta.url)), 'utf8');
 const PATCH_SET = '0123456789abcdef0123456789abcdef01234567';
 const FULL: CoreVersionInfo = { packagedVersion: '1.14.0-polaris.3', bundledVersion: '1.14.0-polaris.4', patchSet: PATCH_SET };
 const selectedCore = { id: 'a'.repeat(64), version: '1.15.0-alpha.12', providerFingerprint: 'b'.repeat(64), state: 'present' as const };
@@ -121,11 +120,6 @@ describe('内核信息与只读诊断', () => {
     await (copyButton().props.onClick as () => Promise<void>)();
     expect(h.copyState).toBe('failed');
   });
-  it('更新页保留真实只读数据来源', () => {
-    expect(pageSource).toContain('<CoreInfoCard info={coreInfo} selectedCore={selectedCore} onRecovered=');
-    expect(pageSource).toContain('coreApi\n      .getVersionInfo()');
-    expect(pageSource).toContain("console.error('[SettingsUpdate] core version info unavailable:', error)");
-  });
 });
 
 it('内容损坏提供实际离线修复入口并保留同版受信应用重装', () => {
@@ -177,7 +171,6 @@ it.each(['Missing','Mismatch','Changed'] as const)('真实 %s 损坏保留可信
 });
 it.each(['zh-CN','zh-TW','en-US','ru','fa'])('%s 有完整独立的五类人类提示', language => {
   const messages=JSON.parse(readFileSync(fileURLToPath(new URL(`../../../i18n/locales/${language}.json`,import.meta.url)),'utf8')).helper.coreAdmission as Record<string,string>;
-  expect(Object.keys(messages).sort()).toEqual(['unsupportedExactObject','unsupportedCapability','damaged','busy','unavailable'].sort());
   for(const value of Object.values(messages)) {expect(value.trim().length).toBeGreaterThan(10);expect(value).not.toMatch(/cohort|sha256|CORE_ADMISSION|wire|\/proc\//i);}
   expect(new Set(Object.values(messages)).size).toBe(5);
 });

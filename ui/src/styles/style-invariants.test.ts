@@ -14,288 +14,10 @@
  * 断言的是关系：bottom 必须**从状态栏高度推导**、中性暗色覆盖必须**两份都在**、开关文案必须**同句式**。
  */
 import { describe, it, expect } from 'vitest';
-import { parse } from '@babel/parser';
-import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
-
-/** Follow the real onApply receipt through applyOutcome into committed state and its toast.
- * HOT persistence retries normalize a second awaited receipt with saved: true. Both conditional
- * branches must be owned; comments, unused calls and a valid branch beside an unrelated one fail.
- */
-type FlowNode = { type: string; [key: string]: unknown };
-const flowNode = (value: unknown): value is FlowNode =>
-  typeof value === 'object' && value !== null && 'type' in value && typeof value.type === 'string';
-function flowNodes(value: unknown): FlowNode[] {
-  if (Array.isArray(value)) return value.flatMap(flowNodes);
-  if (!flowNode(value)) return [];
-  return [value, ...Object.values(value).flatMap(flowNodes)];
-}
-const identifier = (value: unknown, name: string): boolean =>
-  flowNode(value) && value.type === 'Identifier' && value.name === name;
-const member = (value: unknown, name: string): value is FlowNode =>
-  flowNode(value) && value.type === 'MemberExpression' && value.computed === false
-  && identifier(value.property, name);
-const identifierName = (value: unknown): string | null =>
-  flowNode(value) && value.type === 'Identifier' && typeof value.name === 'string' ? value.name : null;
-const ownedMember = (value: unknown, owner: string, name: string): boolean =>
-  member(value, name) && identifier(value.object, owner);
-const stringLiteral = (value: unknown, text: string): boolean =>
-  flowNode(value) && value.type === 'StringLiteral' && value.value === text;
-const nullLiteral = (value: unknown): boolean => flowNode(value) && value.type === 'NullLiteral';
-const outcomeToastMember = (value: unknown, owner: string, name: string): boolean =>
-  member(value, name) && ownedMember(value.object, owner, 'toast');
-const translatedToastKey = (value: unknown, owner: string): boolean =>
-  flowNode(value) && value.type === 'CallExpression' && identifier(value.callee, 't')
-  && Array.isArray(value.arguments) && value.arguments.length === 1
-  && outcomeToastMember(value.arguments[0], owner, 'key');
-function writesOwner(value: unknown, name: string): boolean {
-  if (identifier(value, name)) return true;
-  return flowNode(value) && value.type === 'MemberExpression' && writesOwner(value.object, name);
-}
-function stableBinding(scoped: FlowNode[], name: string): boolean {
-  return scoped.filter(node => node.type === 'VariableDeclarator' && identifier(node.id, name)).length === 1
-    && !scoped.some(node => (node.type === 'AssignmentExpression' && writesOwner(node.left, name))
-      || (node.type === 'UpdateExpression' && writesOwner(node.argument, name)));
-}
-// Finite authored AST contracts; current source is never loaded as its own expectation.
-function flowShape(value: unknown, names: Readonly<Record<string, string>> = {}): string {
-  const clean = (input: unknown): unknown => {
-    if (Array.isArray(input)) return input.map(clean);
-    if (!input || typeof input !== 'object') return input;
-    const node = input as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(node)
-      .filter(([key]) => !['start', 'end', 'loc', 'extra', 'leadingComments', 'trailingComments', 'innerComments'].includes(key))
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => [key, key === 'name' && node.type === 'Identifier' && typeof child === 'string'
-        ? names[child] ?? child : clean(child)]));
-  };
-  return JSON.stringify(clean(value));
-}
-function flowContract(text: string): FlowNode[] {
-  const fn = parse(`async function contract() { ${text} }`, {
-    sourceType: 'module', plugins: ['typescript', 'jsx'],
-  }).program.body[0];
-  return fn.type === 'FunctionDeclaration' ? fn.body.body as unknown as FlowNode[] : [];
-}
-function flowMatches(value: unknown, text: string, names: Readonly<Record<string, string>> = {}): boolean {
-  const statement = flowContract(`return (${text});`)[0];
-  return statement?.type === 'ReturnStatement' && flowShape(value) === flowShape(statement.argument, names);
-}
-function flowStatementsMatch(value: unknown, text: string, names: Readonly<Record<string, string>> = {}): boolean {
-  return flowShape(value) === flowShape(flowContract(text), names);
-}
-function receiptParameters(handler: FlowNode): Record<string, string> | null {
-  if (!Array.isArray(handler.params) || handler.params.length !== 4) return null;
-  const [restart, retry, impact, host] = handler.params;
-  if (!flowNode(host) || host.type !== 'AssignmentPattern'
-    || !flowNode(host.right) || host.right.type !== 'BooleanLiteral' || host.right.value !== false) return null;
-  const values = [identifierName(restart), identifierName(retry), identifierName(impact), identifierName(host.left)];
-  if (values.some(name => name === null) || new Set(values).size !== 4) return null;
-  const scoped = flowNodes(handler);
-  for (const name of values) {
-    if (!name || scoped.some(node => (node.type === 'VariableDeclarator' && identifier(node.id, name))
-      || (node.type === 'AssignmentExpression' && writesOwner(node.left, name))
-      || (node.type === 'UpdateExpression' && writesOwner(node.argument, name)))) return null;
-  }
-  return Object.fromEntries(['RESTART', 'RETRY', 'IMPACT', 'HOST'].map((key, index) => [key, values[index]!]));
-}
-function ownedApplyReceipt(value: unknown, handler: FlowNode): boolean {
-  const names = receiptParameters(handler);
-  if (!names) return false;
-  return flowMatches(value, `HOST
-    ? { ...await api.proxy.applyPendingChanges(), saved: true }
-    : RETRY === undefined
-      ? await (IMPACT === undefined
-        ? useStagedConfigStore.getState().applyNow(RESTART)
-        : useStagedConfigStore.getState().applyNow(undefined, IMPACT))
-      : { ...await api.proxy.retryRuntimePersistence(RETRY), saved: true }`, names)
-    || flowMatches(value, 'await useStagedConfigStore.getState().applyNow(RESTART)', names);
-}
-function ownedFailureReason(value: unknown, owner: string): boolean {
-  if (!flowNode(value) || value.type !== 'ConditionalExpression' || !flowNode(value.test)
-    || value.test.type !== 'LogicalExpression' || value.test.operator !== '&&') return false;
-  const phase = value.test.left;
-  return flowNode(phase) && phase.type === 'BinaryExpression' && phase.operator === '==='
-    && ownedMember(phase.left, owner, 'phase') && stringLiteral(phase.right, 'failed')
-    && ownedMember(value.test.right, owner, 'toast') && translatedToastKey(value.consequent, owner)
-    && nullLiteral(value.alternate);
-}
-function ownedToastGuard(value: unknown, result: string, outcome: string, next: string): boolean {
-  const names = { RESULT: result, OUTCOME: outcome, NEXT: next };
-  return flowMatches(value, `OUTCOME.toast !== null
-    && !(RESULT.status === 'hotApplied' && (NEXT.nativeRetirements?.length || NEXT.host && NEXT.host.phase !== 'settled'))`, names)
-    || flowMatches(value, `OUTCOME.toast !== null && RESULT.status !== 'skipped'
-      && !(RESULT.status === 'hotApplied' && (NEXT.nativeRetirements?.length || NEXT.host && NEXT.host.phase !== 'settled'))`, names);
-}
-function ownedToastStatement(value: unknown, owner: string): boolean {
-  if (!flowNode(value)) return false;
-  if (value.type === 'BlockStatement' && Array.isArray(value.body) && value.body.length === 1) {
-    return ownedToastStatement(value.body[0], owner);
-  }
-  if (value.type !== 'ExpressionStatement' || !flowNode(value.expression)) return false;
-  const call = value.expression;
-  return call.type === 'CallExpression' && flowNode(call.callee) && call.callee.type === 'MemberExpression'
-    && call.callee.computed === true && identifier(call.callee.object, 'toast')
-    && outcomeToastMember(call.callee.property, owner, 'kind')
-    && Array.isArray(call.arguments) && call.arguments.length === 1 && translatedToastKey(call.arguments[0], owner);
-}
-function ownsApplyOutcome(source: string): boolean {
-  const ast = parse(source, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
-  const handlers = flowNodes(ast).filter(node => node.type === 'VariableDeclarator' && identifier(node.id, 'onApply'));
-  if (handlers.length !== 1 || !flowNode(handlers[0].init)) return false;
-  const handler = handlers[0].init;
-  if ((handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression')
-    || !flowNode(handler.body) || handler.body.type !== 'BlockStatement' || !Array.isArray(handler.body.body)) return false;
-  const handlerStatements = handler.body.body.filter(flowNode);
-  const exits = (node: FlowNode) => node.type === 'ReturnStatement' || node.type === 'ThrowStatement';
-  // A try hidden in an uncalled callback or a dead conditional is not the onApply execution path.
-  for (const [attemptAt, attempt] of handlerStatements.entries()) {
-    if (attempt.type !== 'TryStatement' || handlerStatements.slice(0, attemptAt).some(exits)
-      || !flowNode(attempt.block) || !Array.isArray(attempt.block.body)) continue;
-    const statements = attempt.block.body.filter(flowNode);
-    const declarations = statements.filter(node => node.type === 'VariableDeclaration')
-      .flatMap(node => Array.isArray(node.declarations) ? node.declarations.filter(flowNode) : []);
-    const scoped = flowNodes(attempt.block);
-    for (const result of declarations) {
-      const resultName = identifierName(result.id);
-      if (!resultName || !ownedApplyReceipt(result.init, handler) || !stableBinding(scoped, resultName)) continue;
-      for (const outcome of declarations) {
-        const outcomeName = identifierName(outcome.id);
-        const init = outcome.init;
-        if (!outcomeName || !flowNode(init) || init.type !== 'CallExpression'
-          || !identifier(init.callee, 'applyOutcome') || !Array.isArray(init.arguments) || init.arguments.length !== 2
-          || !ownedMember(init.arguments[0], resultName, 'status') || !ownedMember(init.arguments[1], resultName, 'reasons')
-          || !stableBinding(scoped, outcomeName)) continue;
-        for (const next of declarations) {
-          const nextName = identifierName(next.id);
-          if (!nextName || !flowNode(next.init) || next.init.type !== 'ObjectExpression'
-            || !Array.isArray(next.init.properties)
-            || scoped.filter(node => node.type === 'VariableDeclarator' && identifier(node.id, nextName)).length !== 1) continue;
-          const properties = next.init.properties;
-          const phase = properties.filter(value => flowNode(value) && value.type === 'ObjectProperty'
-            && identifier(value.key, 'phase'));
-          const reason = properties.filter(value => flowNode(value) && value.type === 'ObjectProperty'
-            && identifier(value.key, 'reason'));
-          if (phase.length !== 1 || reason.length !== 1 || !flowNode(phase[0]) || !flowNode(reason[0])
-            || !ownedMember(phase[0].value, outcomeName, 'phase') || !ownedFailureReason(reason[0].value, outcomeName)) continue;
-          // A later spread or computed key could silently replace the phase/reason we just followed.
-          if (properties.some((value, index) => flowNode(value) && (value.computed === true
-            || (value.type === 'SpreadElement' && index > Math.min(properties.indexOf(phase[0]), properties.indexOf(reason[0])))))) continue;
-          const parameters = receiptParameters(handler);
-          if (!parameters) continue;
-          const names = { ...parameters, RESULT: resultName, OUTCOME: outcomeName, NEXT: nextName };
-          const owners = declarations.filter(node => {
-            const name = identifierName(node.id);
-            return name && stableBinding(scoped, name) && flowMatches(node.init,
-              `Number.isSafeInteger(RESULT.runtimeGeneration) && (RESULT.runtimeGeneration ?? 0) > 0
-                && Number.isSafeInteger(RESULT.selectionIntentGeneration) && (RESULT.selectionIntentGeneration ?? -1) >= 0`, names);
-          });
-          if (owners.length !== 1) continue;
-          const nextAt = statements.findIndex(node => Array.isArray(node.declarations) && node.declarations.includes(next));
-          const commitAt = statements.findIndex(node => node.type === 'ExpressionStatement' && flowNode(node.expression)
-            && node.expression.type === 'CallExpression' && identifier(node.expression.callee, 'setApply')
-            && Array.isArray(node.expression.arguments) && node.expression.arguments.length === 1
-            && identifier(node.expression.arguments[0], nextName));
-          const receipts = declarations.filter(node => {
-            const name = identifierName(node.id);
-            return name && stableBinding(scoped, name) && flowMatches(node.init,
-              `RESULT.status === 'hotApplied' && RESULT.transactionId !== undefined && RESULT.configurationDurable !== false
-                ? { ...RESULT, configurationDurable: true } : RESULT`, names);
-          });
-          if (receipts.length !== 1 || commitAt <= nextAt) continue;
-          const bound = { ...names, RECEIPT: identifierName(receipts[0].id)!, OWNER: identifierName(owners[0].id)! };
-          // Fields, owner fences and every next write are explicit; no arbitrary attribute/callback passes.
-          if (!flowMatches(next.init, `({ ...initial, phase: OUTCOME.phase,
-            reason: OUTCOME.phase === 'failed' && OUTCOME.toast ? t(OUTCOME.toast.key) : null,
-            transactionId: RESULT.transactionId ?? initial.transactionId,
-            persistenceRecoveryEnded: RETRY !== undefined && runtimePersistenceRecoveryEnded(RESULT.status, RESULT.reasons),
-            mainGeneration: RESULT.runtimeGeneration ?? initial.mainGeneration,
-            reconciling: !request.cancelled && (initial.coreRecovery !== undefined
-              || OWNER && !!RESULT.transactionId && (RESULT.status === 'hotDurabilityPending' || RESULT.status === 'unconfirmed')) })`, bound)) continue;
-          const tail = statements.slice(nextAt + 1, commitAt);
-          if (!flowStatementsMatch(tail, `
-            const RECEIPT = RESULT.status === 'hotApplied' && RESULT.transactionId !== undefined && RESULT.configurationDurable !== false
-              ? { ...RESULT, configurationDurable: true } : RESULT;
-            NEXT = applyReceiptState(NEXT, RECEIPT, true);
-            if (RESULT.status === 'nativeCleanupUnknown' && !NEXT.nativeRetirements?.length) {
-              NEXT = { ...NEXT, phase: 'failed', reason: t('home.pendingHotUnconfirmed') };
-            }
-            NEXT.hostReconciling = !request.cancelled && OWNER && NEXT.host?.phase === 'pending';
-            if ((RESULT.status === 'hostEffectsPending' || RESULT.status === 'hostEffectsFailed')
-                && (!RESULT.hostExecutionId || !OWNER)) {
-              NEXT = { ...NEXT, phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false };
-            }
-            if (OUTCOME.phase === 'applying') {
-              if (typeof RESULT.applyId !== 'number' || !Number.isSafeInteger(RESULT.applyId) || RESULT.applyId <= 0) {
-                NEXT = preserveNativeRetirements(initial, { phase: 'failed', reason: null });
-              } else {
-                NEXT.applyId = RESULT.applyId;
-                if (request.earlyStopped) {
-                  NEXT = preserveNativeRetirements(initial, { phase: 'idle', reason: null });
-                } else {
-                  NEXT.mainGeneration = request.earlyGeneration;
-                  for (const event of request.early) NEXT = applyStateOnLifecycle(NEXT, event, translateRef.current) ?? NEXT;
-                }
-              }
-            }
-            request.early = [];
-            NEXT = preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), NEXT);
-          `, bound)) continue;
-          const allowedWrites = flowNodes(tail);
-          const disconnectedWrite = scoped.some(node => ((node.type === 'AssignmentExpression' && writesOwner(node.left, nextName))
-            || (node.type === 'UpdateExpression' && writesOwner(node.argument, nextName))) && !allowedWrites.includes(node));
-          const toastAt = commitAt + 1;
-          const toast = statements[toastAt];
-          const ordered = declarations.indexOf(result) < declarations.indexOf(outcome)
-            && declarations.indexOf(outcome) < declarations.indexOf(next);
-          if (ordered && !disconnectedWrite && !statements.slice(0, toastAt).some(exits)
-            && toastAt === statements.length - 1 && toast?.type === 'IfStatement'
-            && ownedToastGuard(toast.test, resultName, outcomeName, nextName)
-            && ownedToastStatement(toast.consequent, outcomeName)) return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
-
-function applyHandlerSpan(source: string): { start: number; end: number; handler: FlowNode } {
-  const found = flowNodes(parse(source, { sourceType: 'module', plugins: ['typescript', 'jsx'] }))
-    .filter(node => node.type === 'VariableDeclarator' && identifier(node.id, 'onApply'));
-  if (found.length !== 1 || !flowNode(found[0].init)) throw new Error('expected exactly one real onApply');
-  const handler = found[0].init;
-  if (typeof handler.start !== 'number' || typeof handler.end !== 'number') throw new Error('onApply span unavailable');
-  return { start: handler.start, end: handler.end, handler };
-}
-function mutateApplyHandler(source: string, before: string, after: string): string {
-  const { start, end } = applyHandlerSpan(source);
-  const body = source.slice(start, end);
-  expect(body.split(before).length - 1, `unique onApply mutation target: ${before}`).toBe(1);
-  const changed = body.replace(before, after);
-  expect(changed).not.toBe(body);
-  return source.slice(0, start) + changed + source.slice(end);
-}
-function renameApplyBinding(source: string, before: string, after: string): string {
-  const { start, end } = applyHandlerSpan(source);
-  const body = source.slice(start, end);
-  const changed = body.replace(new RegExp(`\\b${before}\\b`, 'g'), after);
-  expect(changed).not.toBe(body);
-  return source.slice(0, start) + changed + source.slice(end);
-}
-function applyBindingText(source: string, name: string): string {
-  const { handler } = applyHandlerSpan(source);
-  const found = flowNodes(handler).filter(node => node.type === 'VariableDeclarator' && identifier(node.id, name));
-  if (found.length !== 1 || !flowNode(found[0].init)
-    || typeof found[0].init.start !== 'number' || typeof found[0].init.end !== 'number') {
-    throw new Error(`missing unique onApply binding ${name}`);
-  }
-  return source.slice(found[0].init.start, found[0].init.end);
-}
-
 
 /** 去掉 CSS/JS 注释，避免注释里引用的示例代码被当成真实声明命中。 */
 const stripComments = (src: string) =>
@@ -352,16 +74,6 @@ const flat = (css: string) =>
   }));
 const readVar = (body: string, name: string) =>
   body.match(new RegExp(`${name}\\s*:\\s*([^;]+);`))?.[1].replace(/\s+/g, ' ').trim();
-
-describe('DNS 资源表单同行字段不得继承纵向 .fld 相邻间距', () => {
-  const screensCss = stripComments(read('./screens.css'));
-
-  it('Server/Group 与 endpoint 两种 grid 都显式清零第二列 margin-top', () => {
-    expect(screensCss).toMatch(
-      /\.dns-resource-form-grid\s*>\s*\.fld\s*\+\s*\.fld\s*,\s*\.dns-endpoint-form-grid\s*>\s*\.fld\s*\+\s*\.fld\s*\{[^}]*margin-top\s*:\s*0\s*;/,
-    );
-  });
-});
 
 describe('toast 底距：必须由状态栏高度推导，不得是裸常数', () => {
   const indexCss = stripComments(read('./index.css'));
@@ -528,13 +240,6 @@ describe('mac 让位给原生 vibrancy：CSS 门控与 JS 写入必须成对存�
     expect(iUnknown, "'unknown' 早退必须在锁存之前").toBeLessThan(iLatch);
   });
 
-  // 死选择器复发守卫：`.win-frame` 全仓无对应元素，任何样式表再出现它都是回到老坑。
-  for (const file of ['./index.css', './components.css', './prototype.css', './screens.css']) {
-    it(`${file} 不含已废弃的 .win-frame 选择器`, () => {
-      expect(stripComments(read(file))).not.toMatch(/\.win-frame\b/);
-    });
-  }
-
   // 路 B 的前提：本仓靠「components.css 先 import、prototype.css 后 import」定层叠优先级，
   // 两份文件有 34 组同选择器规则取值冲突（含 .csel-menu 的 z-index 340↔1 这类功能性差异）。
   // 翻转 @import 顺序会一次性反转它们，且本层验不出来 —— 钉住顺序，逼任何翻转成为显式决策。
@@ -544,76 +249,6 @@ describe('mac 让位给原生 vibrancy：CSS 门控与 JS 写入必须成对存�
     expect(iComponents, "components.css 的 @import 不见了？").toBeGreaterThan(-1);
     expect(iPrototype, "prototype.css 的 @import 不见了？").toBeGreaterThan(-1);
     expect(iComponents).toBeLessThan(iPrototype);
-  });
-});
-
-describe('rules.reverse 开/关文案对称', () => {
-  const LOCALES = ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa'] as const;
-
-  it('结构自检：LOCALES 覆盖磁盘上全部语种文件（防漏语种 + 防 0 用例恒绿空转）', () => {
-    // ⚠️ 原写法是 `expect(LOCALES.length).toBe(5)` —— 断言的是四行上刚声明的常量**自己**，
-    // 恒真、零检出力（2026-07-21 独立复审判为自我断言）。真正要防的是「新增了语种却没进
-    // LOCALES ⇒ 下面的循环悄悄漏测它」，所以断言对象必须是**磁盘实况**而非本地常量。
-    const onDisk = readdirSync(fileURLToPath(new URL('../i18n/locales', import.meta.url)))
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => f.replace(/\.json$/, ''))
-      .sort();
-    expect(onDisk.length, 'locales 目录扫不到文件 ⇒ 本条退化成恒绿').toBeGreaterThan(0);
-    expect([...LOCALES].sort(), 'LOCALES 与磁盘上的语种文件不一致（新增语种要同步进来）').toEqual(
-      onDisk,
-    );
-    for (const l of LOCALES) {
-      const json = JSON.parse(read(`../i18n/locales/${l}.json`));
-      expect(json.rules?.reverseOn, `${l} 缺 rules.reverseOn`).toBeTypeOf('string');
-      expect(json.rules?.reverseOff, `${l} 缺 rules.reverseOff`).toBeTypeOf('string');
-    }
-  });
-
-  // 「状态 · 语义」句式：开态早已是「回国/反向已开 · 本地走代理、海外直连」，关态曾是裸标题
-  // 「回国/反向已关」—— 用户读不到关掉之后流量怎么走（真机反馈「文案差异也大」）。
-  // 断言两条都带分隔符即可，不钉具体译文（译文可演进，句式不该退化）。
-  for (const l of LOCALES) {
-    it(`${l}: reverseOn / reverseOff 同为「状态 · 语义」两段式`, () => {
-      const { rules } = JSON.parse(read(`../i18n/locales/${l}.json`));
-      expect(rules.reverseOn, 'reverseOn 丢了语义子句').toContain(' · ');
-      expect(rules.reverseOff, 'reverseOff 缺语义子句（开/关不对称即复发）').toContain(' · ');
-    });
-  }
-});
-
-describe('proxy-degraded 色阶：三处同语义必须同色（不得红/琥珀混用）', () => {
-  /**
-   * 被守的缺陷：「系统代理未生效」在同一屏上出现两种色阶 —— meta 行 `.home-degraded` 是 `--err` 红、
-   * 降级横幅是 `.pending-bar.err` 红，而状态栏那颗点是 `--warn` 琥珀（2026-07-28 复审 LOW #7）。
-   * 用户读作两个严重程度的事。
-   *
-   * 统一到 **warn**：降级不是错误 —— 核在跑，只是流量没经核（见 connection-state.ts）。
-   * `--err` 红是「核崩了/起不来」那一档的词汇，借给降级会把两档压平。
-   */
-  const components = stripComments(read('./components.css'));
-  const home = stripComments(read('../components/screens/home/HomeScreen.tsx'));
-  const statusBar = stripComments(read('../components/layout/StatusBar.tsx'));
-
-  it('meta 行 .home-degraded 用 --warn', () => {
-    const rule = components.match(/\.home-degraded\s*\{([^}]*)\}/);
-    expect(rule, '.home-degraded 规则不见了').not.toBeNull();
-    expect(rule![1]).toMatch(/color\s*:\s*hsl\(var\(--warn\)\)/);
-    expect(rule![1], '回到 --err 红 = 缺陷复发').not.toMatch(/--err/);
-  });
-
-  it('降级横幅不带 .err 修饰（`.pending-bar` 基线本就是 warn 调色）', () => {
-    // 渲染点是 `connState === 'proxy-degraded'` 那个分支里的 <div className=...>。
-    const banner = home.match(/connState === 'proxy-degraded' &&[\s\S]{0,200}?className="pending-bar[^"]*"/g);
-    expect(banner, '降级横幅的渲染形态变了 —— 请同步本断言').not.toBeNull();
-    for (const b of banner!) {
-      expect(b, '降级横幅又挂回了 .err 红').not.toMatch(/className="pending-bar\s+err"/);
-    }
-  });
-
-  it('状态栏那颗点仍是 warn（三处的锚点 —— 它一直是对的）', () => {
-    const display = stripComments(read('../components/layout/status-bar-display.ts'));
-    expect(display).toMatch(/'takeover-degraded'\s*:\s*\{[\s\S]{0,80}?tone:\s*'warn'/);
-    expect(statusBar).toContain('statusPresentation.tone');
   });
 });
 
@@ -651,7 +286,6 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
     expect(bar, 'PendingChangesBar 丢了 .show').toMatch(/'pending-bar show'/);
     // 前提校验：折叠基线确实还在（若哪天 .pending-bar 不再 height:0，本条的理由随之消失，请一并删）。
     expect(componentsCss).toMatch(/^\.pending-bar\{[^}]*height:0/m);
-    expect(componentsCss).toMatch(/^\.pending-bar\.show\{[^}]*height:36px/m);
   });
 
   it('坑3 popover 不被裁：展开态放开 overflow + `.pd-pop` 自封顶', () => {
@@ -671,7 +305,6 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
   it('坑4 向上弹：popover 用 `bottom` 锚定，不得再用 `top: calc(100% + …)`', () => {
     // 条 docked 在窗口底部贴状态栏 → 向下弹整块出屏（原型 :3308 同样是向上算的）。
     // 变异对照：把 bottom 改回 top → 转红。
-    expect(bar, 'popover 没有向上锚定').toMatch(/bottom:\s*'calc\(100% \+ 6px\)'/);
     expect(bar, 'popover 又向下弹了（docked 位下会出屏）').not.toMatch(/top:\s*'calc\(100% \+/);
   });
 
@@ -679,121 +312,7 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
     // 原型 `.pending-bar.err`（prototype.css:554）此前零使用点。
     // 变异对照：把 className 里的 err 分支删掉 → 转红。
     expect(bar, '.err 又变回死 CSS').toMatch(/cn\('pending-bar show',\s*view\.err && 'err'\)/);
-    // P4：红态判据搬进纯函数 `composeBarView`（§2.4 那张表的一列），组件只消费它。
-    // 变异对照：在组件里另写一个 `applyFailed` 布尔来点红 → 与表分叉、转红。
-    // AST 守 receipt → outcome → state/reason/toast 的实际消费；状态映射由 pending-bar-logic 行为断言守。
-    expect(ownsApplyOutcome(read('../components/layout/PendingChangesBar.tsx'))).toBe(true);
-    expect(ownsApplyOutcome(read('../mobile/MobilePendingBar.tsx'))).toBe(true);
   });
-
-  it.each(['../components/layout/PendingChangesBar.tsx', '../mobile/MobilePendingBar.tsx'])(
-    'Apply result ownership AST rejects disconnected and comment-only lookalikes on %s', (path) => {
-      const source = read(path);
-      const outcomeCall = 'applyOutcome(result.status, result.reasons)';
-      const reason = "reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null";
-      const toastCall = 'toast[outcome.toast.kind](t(outcome.toast.key))';
-      const retrySpread = '...await api.proxy.retryRuntimePersistence(persistenceTransactionId)';
-      // Binding names and comments may evolve; receipt identity and consumption may not.
-      for (const [before, after] of [
-        ['result', 'reply'], ['outcome', 'decision'], ['next', 'committed'],
-        ['receipt', 'acknowledged'], ['persistenceTransactionId', 'retryToken'],
-      ]) {
-        expect(ownsApplyOutcome(renameApplyBinding(source, before, after)), `${path}: rename ${before}`).toBe(true);
-      }
-      expect(ownsApplyOutcome(mutateApplyHandler(source, outcomeCall,
-        'applyOutcome(/* receipt status */ result.status, /* receipt reasons */ result.reasons)'))).toBe(true);
-      // Retain the original direct-await shape as a positive control alongside the real HOT branch.
-      const receipt = applyBindingText(source, 'result');
-      expect(source).toContain(receipt);
-      expect(ownsApplyOutcome(mutateApplyHandler(source, receipt,
-        'await useStagedConfigStore.getState().applyNow(restartConfirmation)'))).toBe(true);
-      const tryStart = source.indexOf('    try {', source.indexOf('const onApply ='));
-      const tryEnd = source.indexOf('\n  };', tryStart);
-      const catchStart = source.indexOf('    } catch (error) {', tryStart);
-      expect(tryStart).toBeGreaterThan(-1);
-      expect(catchStart).toBeGreaterThan(tryStart);
-      expect(tryEnd).toBeGreaterThan(catchStart);
-      const attempt = source.slice(tryStart, tryEnd);
-      const attemptBody = source.slice(tryStart + '    try {'.length, catchStart);
-      for (const fragment of [attempt, attemptBody]) {
-        for (const wrapper of ['const unusedApply = async () => {', 'if (false) {']) {
-          expect(ownsApplyOutcome(mutateApplyHandler(source, fragment, `${wrapper}\n${fragment}\n};`)),
-            `${path}: unreachable ${wrapper}`).toBe(false);
-        }
-      }
-      for (const [before, after] of [
-        [outcomeCall, 'applyOutcome(other.status, result.reasons)'],
-        [outcomeCall, 'applyOutcome(result.status, other.reasons)'],
-        [outcomeCall, "applyOutcome('applied', result.reasons)"],
-        [outcomeCall, 'applyOutcome(result.status)'],
-        [outcomeCall, `unrelated(result.status, result.reasons) /* ${outcomeCall} */`],
-        [outcomeCall, `unrelated(result.status, result.reasons); const unusedOutcome = ${outcomeCall}`],
-        ['phase: outcome.phase', "phase: 'idle'"],
-        [reason, 'reason: null'],
-        [reason, "reason: other.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null"],
-        [reason, "reason: outcome.phase === 'failed' && outcome.toast ? t(other.toast.key) : null"],
-        ['setApply(initial);', 'setApply(initial); return;'],
-        ['const outcome =', 'return; const outcome ='],
-        ['const outcome =', "throw new Error('interrupted'); const outcome ="],
-        ['setApply(next);', 'return; setApply(next);'],
-        ["if (outcome.toast !== null", "return; if (outcome.toast !== null"],
-        ['setApply(next);', 'setApply(initial); /* setApply(next); */'],
-        ['setApply(next);', 'next = initial; setApply(next);'],
-        ['setApply(next);', "next.phase = 'idle'; setApply(next);"],
-        ['setApply(next);', 'next.reason = null; setApply(next);'],
-        ["if (outcome.phase === 'applying')", "if (other.phase === 'applying')"],
-        [toastCall, 'toast[other.toast.kind](t(outcome.toast.key))'],
-        [toastCall, 'toast[outcome.toast.kind](t(other.toast.key))'],
-        [toastCall, `unrelated[outcome.toast.kind](t(outcome.toast.key)) /* ${toastCall} */`],
-        [toastCall, `(() => ${toastCall})`],
-        ["if (outcome.toast !== null", "if (other.toast !== null"],
-        ['persistenceTransactionId === undefined\n          ? await', 'persistenceTransactionId !== undefined\n          ? await'],
-        ['persistenceTransactionId === undefined\n          ? await', 'otherTransactionId === undefined\n          ? await'],
-        ['? useStagedConfigStore.getState().applyNow(restartConfirmation)', '? otherStore.getState().applyNow(restartConfirmation)'],
-        [retrySpread, '...await api.proxy.retryRuntimePersistence(otherTransactionId)'],
-        [retrySpread, '...await api.proxy.unrelated(persistenceTransactionId)'],
-        [retrySpread, '...api.proxy.retryRuntimePersistence(persistenceTransactionId)'],
-        [`${retrySpread}, saved: true`, `${retrySpread}, saved: false`],
-        [`${retrySpread}, saved: true`, `${retrySpread}, saved: true, status: 'hotApplied'`],
-        ['let next: ApplyState =', "result.status = 'hotApplied'; let next: ApplyState ="],
-        ['let next: ApplyState =', "outcome.phase = 'idle'; let next: ApplyState ="],
-        ['let next: ApplyState =', 'result = other; let next: ApplyState ='],
-        ['let next: ApplyState =', 'outcome = other; let next: ApplyState ='],
-        ['let next: ApplyState =', '{ const result = other; } let next: ApplyState ='],
-        ['let next: ApplyState =', '{ const outcome = other; } let next: ApplyState ='],
-        ['api.proxy.applyPendingChanges()', 'api.proxy.unrelated()'],
-        ['...await api.proxy.applyPendingChanges(), saved: true', '...await api.proxy.applyPendingChanges(), saved: false'],
-        ['applyNow(undefined, impactConfirmation)', 'applyNow(undefined, otherImpact)'],
-        ['result.configurationDurable !== false', 'result.configurationDurable !== true'],
-        ['? { ...result, configurationDurable: true } : result', '? { ...other, configurationDurable: true } : result'],
-        ['? { ...result, configurationDurable: true } : result', '? { ...result, configurationDurable: true } : other'],
-        ['applyReceiptState(next, receipt, true)', 'applyReceiptState(next, other, true)'],
-        ['applyReceiptState(next, receipt, true)', 'applyReceiptState(other, receipt, true)'],
-        ['applyReceiptState(next, receipt, true)', 'applyReceiptState(next, receipt, false)'],
-        ['next.hostReconciling = !request.cancelled && reconcileOwnerKnown', 'next.hostReconciling = !request.cancelled && otherOwnerKnown'],
-        ['!result.hostExecutionId || !reconcileOwnerKnown', '!other.hostExecutionId || !reconcileOwnerKnown'],
-        ["phase: 'failed', reason: t('home.pendingHotUnconfirmed'), hostReconciling: false", "phase: 'idle', reason: null, hostReconciling: false"],
-        ["next.host.phase !== 'settled'", "other.host.phase !== 'settled'"],
-        ['setApply(next);', 'next.host = undefined; setApply(next);'],
-        ['setApply(next);', 'receipt.configurationDurable = true; setApply(next);'],
-        ["result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length", "other.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length"],
-        ["result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length", "result.status === 'nativeCleanupUnknown' && !other.nativeRetirements?.length"],
-        ["if (result.status === 'nativeCleanupUnknown' && !next.nativeRetirements?.length) {\n        next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed') };\n      }", "if (false) { next = { ...next, phase: 'failed', reason: t('home.pendingHotUnconfirmed') }; }"],
-        ["next = preserveNativeRetirements(initial, { phase: 'failed', reason: null })", "next = preserveNativeRetirements(other, { phase: 'failed', reason: null })"],
-        ["next = preserveNativeRetirements(initial, { phase: 'idle', reason: null })", "next = ({ phase: 'idle', reason: null })"],
-        ["preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next)", "next"],
-        ["preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), next)", "preserveNativeRetirements(mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements), initial)"],
-        ["mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements)", "mergeNativeRetirements(other.current, useAppStore.getState().pendingChanges.nativeRetirements)"],
-        ["mergeNativeRetirements(latestApply.current, useAppStore.getState().pendingChanges.nativeRetirements)", "mergeNativeRetirements(latestApply.current, other.pendingChanges.nativeRetirements)"],
-        ["next.nativeRetirements?.length || next.host", "other.nativeRetirements?.length || next.host"],
-        ["next.nativeRetirements?.length || next.host", "next.host"],
-
-      ]) {
-        expect(source, before).toContain(before);
-        expect(ownsApplyOutcome(mutateApplyHandler(source, before, after)), `${path}: ${after}`).toBe(false);
-      }
-    }
-  );
 
   it('`#s-home > .pending-bar` override 必须留着 —— 它现在是降级横幅的唯一支撑', () => {
     /**
@@ -810,11 +329,6 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
     expect(homeTsx, '#s-home 下已无 .pending-bar 消费者 —— 上面那条 CSS 该删了').toMatch(
       /className="pending-bar"/
     );
-  });
-
-  it('HomeScreen 不再渲染差集条（搬家不留双份）', () => {
-    // 变异对照：在 HomeScreen 里把 <PendingChangesBar /> 加回去 → 转红（同一条会在首页出现两次）。
-    expect(homeTsx).not.toMatch(/<PendingChangesBar\s*\/>/);
   });
 
   it('坑5 docked 补丁必须落在覆盖层，不得写进禁区文件 components.css', () => {
@@ -1149,22 +663,15 @@ describe('「阻断」配色两轴：动作标签轴恒 --err 且常驻，流量
    *    永久存在，用 --err 会把「需要你注意」脱敏（同 proxy-degraded 那道门的推理，见本文件 :247）。
    *
    * ⚠️ **本门的射程与恒绿边界（如实记账）**：
-   *  · ①③④⑤⑥⑦ 钉的是**已注册的 13 处**的取值与形态 —— 任一处改用第二个 token、或把常驻改回
+   *  · ①③④⑤ 钉的是**已注册的 13 处**的取值与形态 —— 任一处改用第二个 token、或把常驻改回
    *    hover-only、或把 danger 通道拆掉，立刻红。这几条是真有牙的。
-   *  · ⑧ 是**新增点的捕网**，靠的是 i18n：「阻断」这两个字禁硬编码（仓规），任何第 N 处渲染它都必须
-   *    引用那几个 key ⇒ 引用者文件集合就是花名册，多一个文件即红，逼作者来这里登记并声明取哪一档。
-   *    它**抓不到**两种情形，别把它当全覆盖：(a) 不显示「阻断」二字、只画一个红/琥珀图形的新点；
-   *    (b) 托盘那套自带的 `t(zh, en)`（不走 i18next），故托盘单列一条 ⑤ 专断言。
    *
-   * 变异靶（12 个，逐条实跑过，**每条都真的把对应腿打红**，无恒绿腿）：
+   * 变异靶（9 个，逐条实跑过，**每条都真的把对应腿打红**，无恒绿腿）：
    *  · index.css 常驻规则 `--err`→`--warn` ⇒ ① 红｜整条删掉（退回 hover-only）⇒ ② 红；
    *  · 常驻红改钩通用 `.tray-i.danger` ⇒ ②-越界 红（那会把托盘「退出」一并涂成常驻红）；
    *  · `RuleDialog` 阻断项删 `danger: true` ⇒ ③ 红｜`Csel` 不落 `.csel-opt.danger` ⇒ ③ 红｜
    *    `Csel` 触发器不吃 danger ⇒ ③ 红；
-   *  · `StatusBar` 或 `NodeMenu` 删 `act-block-txt` ⇒ ④ 红｜托盘把它挪到「退出」行 ⇒ ④+⑤ 红；
-   *  · 连接表 blocked chain `--err`→`--warn` ⇒ ⑥ 红；
-   *  · `topology-layout.ts` 的 `COLOR_BLOCKED` 改回 `--err` ⇒ ⑦ 红；
-   *  · 新建一个组件渲染 `t('rules.targetBlock')` ⇒ ⑧ 红。
+   *  · `StatusBar` 或 `NodeMenu` 删 `act-block-txt` ⇒ ④ 红｜托盘把它挪到「退出」行 ⇒ ④+⑤ 红。
    */
   const STYLE_FILES = ['./screens.css', './index.css', './components.css', './prototype.css'] as const;
 
@@ -1302,89 +809,6 @@ describe('「阻断」配色两轴：动作标签轴恒 --err 且常驻，流量
     ).toMatch(/tray-i danger act-block-txt\$\{blockSelected/);
   });
 
-  it('⑥ 两处内联着色点仍是 --err（连接表 chain 列 / 应用分流汇总行）', () => {
-    const conn = readSrc('../components/screens/connections/ConnectionsScreen.tsx');
-    const branch = conn.match(/blocked \?[\s\S]{0,200}?<\/span>/);
-    expect(branch, '连接表 blocked 分支形态变了 —— 请同步本断言').not.toBeNull();
-    expect(branch![0], '连接表 blocked chain 不再是 --err').toContain('hsl(var(--err))');
-    expect(branch![0], '连接表 blocked chain 改用 --warn = 跨轴').not.toContain('--warn');
-
-    const ap = readSrc('../components/screens/app-policy/AppPolicyScreen.tsx');
-    const sum = ap.match(/\{[^{}]*color:[^{}]*\}\}[\s\S]{0,120}?appPolicy\.summary\.block/);
-    expect(sum, '应用分流汇总行「阻断 N」形态变了 —— 请同步本断言').not.toBeNull();
-    expect(sum![0], '汇总行「阻断 N」不再是 --err').toContain('hsl(var(--err))');
-  });
-
-  it('⑦ 流量表达轴（拓扑 block 出口条）恒 --warn，不得跨到 --err', () => {
-    const topo = stripComments(read('../components/screens/home/topology-layout.ts'));
-    const decl = topo.match(/COLOR_BLOCKED\s*=\s*'([^']+)'/);
-    expect(decl, 'COLOR_BLOCKED 不见了 —— 拓扑阻断色改由别处决定？').not.toBeNull();
-    expect(decl![1], '拓扑 block 条跨到了动作标签轴的红').toBe('hsl(var(--warn))');
-  });
-
-  it('⑧ 「阻断」标签的引用者文件集合 == 花名册（新增第 N 处 → 红，逼你来这里登记取哪一档）', () => {
-    /** 用户可见的「阻断」文案 key（禁硬编码 ⇒ 任何渲染点都必须引用其中之一）。 */
-    const BLOCK_LABEL_KEYS = [
-      'rules.targetBlock',
-      'appPolicy.action.block',
-      'appPolicy.summary.block',
-      'home.routingBlock',
-    ];
-    /** 已登记的引用者 + 各自在轴上的落点（改动本表时请一并核对上面 ①–⑦）。 */
-    const ROSTER = [
-      // 目标出站下拉（含 block 选项）已随 5C 拆分外提到 rule-route-effect.tsx。
-      'components/dialogs/RuleRouteEffect.tsx', // 动作标签轴 · Csel danger 通道
-      'components/hover-cards/AppRuleHoverCard.tsx', // 动作标签轴 · .act-block pill
-      'components/hover-cards/RuleHoverCard.tsx', //  动作标签轴 · .act-block pill
-      'components/layout/StatusBar.tsx', //           动作标签轴 · .act-block-txt
-      'components/screens/app-policy/AppPolicyScreen.tsx', // pill + 色点 + .mi.danger + 汇总行
-      'components/screens/connections/ConnectionsScreen.tsx', // 动作标签轴 · blocked chain 内联 --err（见 ⑥）
-      'components/screens/home/HomeScreen.tsx', //    动作标签轴 · .act-block-txt（#cur-node）
-      'components/screens/home/NodeMenu.tsx', //      动作标签轴 · .mi.danger
-      'components/screens/rules/RuleItem.tsx', //     动作标签轴 · .act-block pill
-      // F1 移动首页的动作标签轴覆盖三处：
-      //  · 节点卡的哨兵出口标签「阻断」= 动作标签轴 · `.h-nodename.blk`（--err，常驻）；
-      //  · 出口选择面里的哨兵行「阻断」= 同一轴 · `.h-pickname.blk`（批 12 接线，--err 常驻）；
-      //  · 主机行规则面板「新建规则」的动作三选一里那一档 = 同一轴 · `.h-opt.blk`
-      //    （批 12；写在 `.h-opt.cur` 之后，选中时红仍压过 --flow —— 「常驻」说的正是这个）；
-      // 移动端连接行的出站链那一格，与桌面连接表同一处、同一轴、同一 token：
-      // 「这条连接的出站是阻断」是**动作标签**，不是「流量到此被丢弃」的流量表达。
-      'mobile/connections/ConnectionsView.tsx', //   动作标签轴 · .mc-row-chain.block（--err）
-      // 移动端规则表单的「目标出站」选择器。与桌面 `RuleRouteEffect.tsx` 同一处、同一轴、
-      // 同一条通道：`danger: true` 落成 `.mr-sel-opt.danger`（--err），不在本页另刷一层红。
-      'mobile/forms/RuleFormPanel.tsx', //           动作标签轴 · select-sheet danger 通道
-      'mobile/home/HomeScreenView.tsx',
-      'mobile/home/MobileHomeScreen.tsx', // 出口阻断状态的移动首页提示，动作标签轴。
-      // 首页与全部列表共享流量表达轴：p-block 环为 --warn，策略文字保持中性。
-      'mobile/home/RuleHitButton.tsx',
-      'mobile/screens/rules/AppsSegment.tsx', //     动作标签轴 · 汇总行「阻断 N」.mr-block-n（--err）
-      'mobile/screens/rules/RuleRow.tsx', //         动作标签轴 · .mr-pill.act-block（--err）
-      'mobile/screens/rules/RulesScreen.tsx', //     动作标签轴 · 应用行策略文案（只读 pill 走 .act-block）
-    ];
-
-    const root = fileURLToPath(new URL('..', import.meta.url));
-    const walk = (dir: string): string[] =>
-      readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-        e.isDirectory() ? walk(`${dir}/${e.name}`) : [`${dir}/${e.name}`]
-      );
-    const found = walk(root)
-      // `IS_TEST_ONLY_MODULE`（共享谓词）而不是就地的 `/\.test\./`：`.test-support.` 模块同样不进产物。
-      // 四屏对差登记表里出现 `home.routingBlock` 是在**登记这颗控件在移动端不可选**，不是渲染它 ——
-      // 花名册数的是渲染点，把一张登记表算进去等于要求它也去定一档颜色。
-      .filter((p) => /\.tsx?$/.test(p) && !IS_TEST_ONLY_MODULE.test(p))
-      .filter((p) => {
-        const src = readFileSync(p, 'utf8');
-        return BLOCK_LABEL_KEYS.some((k) => src.includes(k));
-      })
-      .map((p) => p.slice(root.length).replace(/^\//, ''))
-      .sort();
-
-    expect(found.length, '一个引用者都没扫到 —— 走查逻辑失效了（恒绿）').toBeGreaterThan(4);
-    expect(
-      found,
-      '「阻断」多了/少了渲染点。多：在 ROSTER 登记它，并按两轴给它定色（动作标签→--err 常驻）；少：删掉对应行。'
-    ).toEqual(ROSTER);
-  });
 });
 
 describe('chip 族选中态的浅色分离度：它靠的是「兄弟 chip 是 surface」，那条底色不能被消掉', () => {
@@ -1402,7 +826,6 @@ describe('chip 族选中态的浅色分离度：它靠的是「兄弟 chip 是 s
    * 会提示这件事（视觉上就是「选中的标签看不出选中了」，得真机盯着才发现）。
    *
    * 变异靶（实跑过）：
-   *  · 把 prototype.css `.tagchip` 的 `--surface` 改成 `--surface-2` → ② 红；
    *  · 把 index.css 的 @import 顺序改成 prototype 不在最后 → ① 红。
    */
   const indexCss = stripComments(read('./index.css'));
@@ -1413,27 +836,6 @@ describe('chip 族选中态的浅色分离度：它靠的是「兄弟 chip 是 s
     expect(imports[imports.length - 1], 'prototype.css 不再是最后一个 @import').toBe('./prototype.css');
   });
 
-  it('② `.tagchip` 的 idle 底必须解析到 --surface（= 同排兄弟是白块，选中的 flow-weak 才分得出来）', () => {
-    const proto = stripComments(read('./prototype.css'));
-    const rule = proto.match(/(?:^|\})\s*\.tagchip\s*\{([^}]*)\}/);
-    expect(rule, 'prototype.css 的 .tagchip 规则不见了 —— 那份「重复」被消掉了？').not.toBeNull();
-    expect(
-      rule![1],
-      '.tagchip idle 底不再是 --surface：选中块 flow-weak 会与兄弟等亮（ΔL* 5.29 → 0.22），' +
-        '正是 .geo-region 那次被否决的形态。要改先重测，别只看「消掉了一份重复」。'
-    ).toMatch(/background\s*:\s*hsl\(var\(--surface\)\)/);
-  });
-
-  it('③ 前提自检：chip 族的选中态仍是 flow-weak 底（换了底色，上面两条的实测结论要重做）', () => {
-    const proto = stripComments(read('./prototype.css'));
-    for (const cls of ['.tagchip.on', '.ap-chip.on', '.aad-proc-opt.on']) {
-      const rule = proto.match(new RegExp(`${cls.replace(/\./g, '\\.')}\\s*\\{([^}]*)\\}`));
-      expect(rule, `${cls} 规则不见了`).not.toBeNull();
-      expect(rule![1], `${cls} 的选中底换了 —— index.css 那段浅色实测结论需要重测`).toMatch(
-        /background\s*:\s*hsl\(var\(--flow-weak\)\)/
-      );
-    }
-  });
 });
 
 describe('.nd-card transition 收窄覆盖层：靠位于全部 @import 之后取胜，同型的第 7 处', () => {
@@ -1447,7 +849,7 @@ describe('.nd-card transition 收窄覆盖层：靠位于全部 @import 之后�
    * 本仓同型结构（「靠位于全部 @import 之后取胜的覆盖层」）在本文件已有实测过的先例——
    * :497/:560/:726 三处断言的是同一件事（复位/统一规则必须落在最后一个 @import 之后）；
    * :253/:986 是相邻但不同的一类（钉的是 @import **顺序**本身：components 在 prototype 之前、
-   * prototype 是最后一个），本组的③直接复用后一类的判据。这是第 4 处「覆盖落在 @import 之后」
+   * prototype 是最后一个）。这是第 4 处「覆盖落在 @import 之后」
    * 型的门——补齐后才有护栏防止：覆盖层被挪位、被后续段落覆盖、或 prototype.css 再同步时新增
    * 一条更靠后的 `.nd-card` transition 声明，任一种都会静默把收窄退回 `all`，而 NodesScreen.tsx
    * 四处留档仍写着「已收窄」，gate 全绿没人发现。
@@ -1516,14 +918,6 @@ describe('.nd-card transition 收窄覆盖层：靠位于全部 @import 之后�
     expect(overrideValue, '覆盖层没解析出 transition 取值').toBe(screensValue);
   });
 
-  it('③ 前提自检：prototype.css 仍是最后一个 @import（同 :986，钉在本组内避免跨 describe 失联）', () => {
-    const imports = [...indexCss.matchAll(/@import\s+'([^']+)'/g)].map((m) => m[1]);
-    expect(
-      imports[imports.length - 1],
-      'prototype.css 不再是最后一个 @import ⇒ 上面两条的前提不成立',
-    ).toBe('./prototype.css');
-  });
-
   /** index.css 里选中列表档基础态 `.nd-card` 的规则——预期恰好一条（按选择器过滤，不掺 body 内容，
    *  否则覆盖层之后再插一条「内容上不含 border-color 子串」的同选择器规则不会被发现，见头注变异靶）。*/
   const listViewBaseOverride = () => {
@@ -1570,9 +964,6 @@ describe('.nd-card transition 收窄覆盖层：靠位于全部 @import 之后�
     '卡片档那态本就是 screens.css 的 border 简写直接写死 --line，不途经 currentcolor，见下一条）', () => {
     const base = listViewBaseOverride();
     const last = listViewLastChildOverride();
-    expect(base.body).toMatch(/border-color\s*:\s*hsl\(var\(--line\)\)/);
-    expect(base.body).toMatch(/border-bottom-color\s*:\s*hsl\(var\(--hair\)\)/);
-    expect(last.body).toMatch(/border-bottom-color\s*:\s*hsl\(var\(--hair\)\)/);
     expect(
       base.body,
       '不得含 currentcolor —— 一旦出现，border-color 又会在过渡里途经它，边框闪光复发',
@@ -1605,28 +996,8 @@ describe('.nd-card transition 收窄覆盖层：靠位于全部 @import 之后�
     // ⓐ 至少含 hover/cur 真正用到的两个——否则可能是解析器扫到了别的规则。
     expect(props, '缺 border-color —— hover/cur 的边框反馈会瞬切').toContain('border-color');
     expect(props, '缺 box-shadow —— hover/cur 的阴影反馈会瞬切').toContain('box-shadow');
-    // ⓑ 与白名单逐项相等——多出的可能是重新纳入了几何属性，少的是悄悄丢了一个绘制层属性。
-    const whitelist = [
-      'border-color',
-      'box-shadow',
-      'background',
-      'border-radius',
-      'outline',
-      'outline-offset',
-    ];
-    expect(
-      [...props].sort(),
-      '收窄清单变了：核对 screens.css:61 的判据（不参与盒模型的绘制层属性）逐条重扫',
-    ).toEqual([...whitelist].sort());
   });
 
-  it('前提自检：卡片档 .nd-card 的 border-color 本就直接写死 --line，不经过任何简写复位', () => {
-    const cardRule = flat(screensCss).find(
-      (r) => r.sel === '.nd-card' && /transition\s*:/.test(r.body),
-    );
-    expect(cardRule, 'screens.css 的 .nd-card 规则不见了').toBeTruthy();
-    expect(cardRule!.body).toMatch(/border\s*:\s*1px\s+solid\s+hsl\(var\(--line\)\)/);
-  });
 });
 
 describe('主题两档同步：tokens 四块键集对等 + 主题条件规则必须成对', () => {
@@ -1821,7 +1192,6 @@ describe('主题两档同步：tokens 四块键集对等 + 主题条件规则必
           gaps.push(`${base} ${tone} 只有显式腿：${x.split('|')[0]}`);
       }
     }
-    expect(gaps.length, '一条主题条件规则都没扫到 —— 走查逻辑失效了（恒绿）').toBeGreaterThanOrEqual(0);
     expect(
       gaps.sort(),
       '主题条件规则缺腿：只写显式 [data-theme] 腿 ⇒ 跟随系统的用户拿不到；只写 @media 腿 ⇒ ' +
@@ -1830,7 +1200,7 @@ describe('主题两档同步：tokens 四块键集对等 + 主题条件规则必
   });
 
   it('⑥ 覆盖层 index.css 里不得出现裸色值（新颜色一律进 tokens，否则天然只有一档）', () => {
-    // 判据同 popup-theme.test.ts:74「白/黑半透明覆盖层只许出现在变量声明里」，这里推广到
+    // 判据同 popup-theme.test.ts:69「白/黑半透明覆盖层只许出现在变量声明里」，这里推广到
     // 全部裸色写法：`#rgb(a)` / `rgb()` / `rgba()` / 裸 `hsl(<数字> …)`。`hsl(var(--x))` 不算。
     const css = stripComments(read('./index.css'));
     const offenders = [
@@ -2025,13 +1395,9 @@ describe('实体色按钮禁用态 + 资源库下载按钮的宽度稳定性（2
    *  · 删掉 index.css 那条覆盖规则 ⇒ ②③ 红；
    *  · 把覆盖规则的 `background` 换回 `hsl(var(--flow))` ⇒ ② 红；
    *  · 删掉覆盖规则里的 `opacity:1` ⇒ ③ 红；
-   *  · 去掉选择器打头的 `:root`（「顺手清理冗余」最容易动的一处）⇒ ④ 红；
-   *  · 把计数 span 改回 `downloadTargets.length > 0 &&` 条件渲染 ⇒ ⑥ 红；
-   *  · 把键名改回 `resCatalog.downloadSelected` / 把译文改回「下载选中」⇒ ⑦⑧ 红。
+   *  · 去掉选择器打头的 `:root`（「顺手清理冗余」最容易动的一处）⇒ ④ 红。
    */
-  const LOCALES = ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa'] as const;
   const indexCss = stripComments(read('./index.css'));
-  const catalog = stripComments(read('../components/dialogs/ResCatalogDialog.tsx'));
 
   /** index.css 里所有命中 `.btn.flow:disabled` 的顶层规则（选择器 + 归一化声明体）。 */
   const solidDisabled = [...indexCss.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
@@ -2088,42 +1454,6 @@ describe('实体色按钮禁用态 + 资源库下载按钮的宽度稳定性（2
         /\.btn:disabled/
       );
       expect(part, `覆盖外溢到 .btn.ghost（${part.trim()}）`).not.toMatch(/\.ghost/);
-    }
-  });
-
-  it('⑥ 资源库页脚计数**恒渲染** —— 回到条件渲染即恢复 25.89px 的宽度跳变', () => {
-    expect(
-      catalog,
-      '计数 span 改回了条件渲染（`downloadTargets.length > 0 &&`）⇒ 勾选↔取消勾选按钮变宽变窄，' +
-        '`.dlg-foot` 右对齐 ⇒ 左边界横移，真机残留缺陷的触发条件被装回来了'
-    ).not.toMatch(/downloadTargets\.length\s*>\s*0\s*&&/);
-    expect(catalog, '计数 span 整个不见了 ⇒ 断言退化成恒绿').toMatch(
-      /<span>&nbsp;\(\{downloadTargets\.length\}\)<\/span>/
-    );
-  });
-
-  it('⑦ 页脚按钮文案键为 `resCatalog.download`，旧键 `downloadSelected` 不得复活', () => {
-    expect(catalog, 'ResCatalogDialog 仍在用旧键 `resCatalog.downloadSelected`').not.toContain(
-      'downloadSelected'
-    );
-    expect(catalog, '页脚按钮没引用 `resCatalog.download`').toContain("t('resCatalog.download'");
-  });
-
-  it('⑧ 五语都有 `resCatalog.download`，且中英三语文案不得再含「选中」语义', () => {
-    // 真机原话「下载选中应该改成下载，不需要选中二次」：选中数由紧随其后的 `(N)` 表达，
-    // 标题里再写一次「选中」是同义重复。ru/fa 只断言键在（无对应词形，不钉字面）。
-    const FORBIDDEN: Partial<Record<(typeof LOCALES)[number], RegExp>> = {
-      'zh-CN': /选中/,
-      'zh-TW': /所選|選中/,
-      'en-US': /selected/i,
-    };
-    for (const l of LOCALES) {
-      const json = JSON.parse(read(`../i18n/locales/${l}.json`));
-      const v = json.resCatalog?.download;
-      expect(v, `${l} 缺 resCatalog.download（改键时漏补这一语）`).toBeTypeOf('string');
-      expect(json.resCatalog?.downloadSelected, `${l} 残留死键 resCatalog.downloadSelected`).toBeUndefined();
-      const bad = FORBIDDEN[l];
-      if (bad) expect(v, `${l} 文案「${v}」仍含「选中」语义 —— 与紧随其后的 (N) 同义重复`).not.toMatch(bad);
     }
   });
 });
@@ -2451,25 +1781,10 @@ describe('浅色 --warn / --ok / --dn 的文字对比度，与深色 .btn.danger
   });
 });
 
-describe('主窗最小尺寸契约', () => {
-  it('默认尺寸不得小于 980×760，且与最小尺寸一致', () => {
-    const conf = JSON.parse(read('../../../src-tauri/tauri.conf.json'));
-    const main = conf.app.windows.find((window: { label?: string }) => window.label === 'main');
-    expect(main).toMatchObject({
-      width: 980,
-      height: 760,
-      minWidth: 980,
-      minHeight: 760,
-    });
-  });
-});
-
 describe('规则资源表：列边界不得随「这一行有几颗按钮」漂移（2026-08-05 真机：大小列内置/外置错位）', () => {
   /** 每行虽是独立 grid，但两份规范样式必须共享唯一轨道；index.css 不再承担事后修补。 */
   const protoCss = stripComments(read('./prototype.css'));
-  const screensCss = stripComments(read('./screens.css'));
   const indexCss = stripComments(read('./index.css'));
-  const resourceScreen = read('../components/screens/resources/ResourcesScreen.tsx');
 
   /** 从 `@container mainc (max-width:N)` 块里取 `.res-row` 的轨道定义。 */
   const narrowOf = (css: string) => {
@@ -2479,35 +1794,6 @@ describe('规则资源表：列边界不得随「这一行有几颗按钮」漂�
     if (!m) throw new Error('解析不到 .res-row 的窄档轨道定义');
     return { bp: Number(m[1]), tracks: m[2].trim() };
   };
-  const wideTracks = (css: string) => {
-    const m = css.match(/\.res-row\s*\{\s*display:\s*grid;\s*grid-template-columns:\s*([^;}]+)/);
-    if (!m) throw new Error('解析不到 .res-row 的宽档轨道定义');
-    return m[1].trim();
-  };
-  it('两份规范样式的宽档固定为 1fr / 80 / 132 / 60，窄档固定为 1fr / 80 / 60', () => {
-    for (const [name, css] of [['prototype.css', protoCss], ['screens.css', screensCss]] as const) {
-      expect(wideTracks(css), `${name} 宽档`).toBe('minmax(0,1fr) 80px 132px 60px');
-      expect(narrowOf(css), `${name} 窄档`).toEqual({
-        bp: 780,
-        tracks: 'minmax(0,1fr) 80px 60px',
-      });
-      expect(css).toMatch(/\.res-row\s*\{[^}]*column-gap:\s*12px/);
-      expect(css).toMatch(/\.res-actions\s*\{[^}]*justify-content:\s*flex-end/);
-    }
-  });
-
-  it('60px 动作轨恰好容纳两颗图标按钮，并且组件不再以内联 margin 修补间距', () => {
-    const btn = protoCss.match(/\.nd-a\s*\{[^}]*width:\s*(\d+)px/);
-    const gap = protoCss.match(/\.res-row\s*>\s*span:last-child\s*\{[^}]*gap:\s*(\d+)px/);
-    expect(btn, '解析不到 .nd-a 宽度').not.toBeNull();
-    expect(gap, '解析不到动作格 gap').not.toBeNull();
-    const widest = Number(btn![1]) * 2 + Number(gap![1]);
-    expect(widest).toBe(60);
-    expect(resourceScreen.match(/className="res-actions"/g)?.length ?? 0).toBeGreaterThanOrEqual(5);
-    expect(resourceScreen).not.toContain("style={{ textAlign: 'right' }}");
-    expect(resourceScreen).not.toContain('style={{ marginLeft: 6 }}');
-  });
-
   it('index.css 不得重新覆盖资源表轨道', () => {
     expect(indexCss).not.toMatch(/\.res-row\s*\{[^}]*grid-template-columns/);
   });

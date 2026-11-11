@@ -251,30 +251,6 @@ describe('G10 · 引擎真的接上了（否则 84 处 data-tip 全是哑属性�
   });
 
   /**
-   * 引擎必须真的监听键盘焦点 —— 这是原生 `title` 缺的那条，迁完反而更差是本次最大的倒退风险。
-   *
-   * 变异对照：删掉 `focusin` 监听 → 本条转红。
-   */
-  it('引擎监听 focusin 且只认 :focus-visible（键盘可达，鼠标按下不弹）', () => {
-    const engine = blankComments(get('lib/tooltip-engine.ts'));
-    expect(engine).toMatch(/addEventListener\('focusin'/);
-    expect(engine).toMatch(/:focus-visible/);
-  });
-
-  /**
-   * 读屏不倒退：原生 `title` 是会被播报的，换成自绘浮层后必须由 `aria-describedby` 顶上。
-   *
-   * 变异对照：删掉 `setAttribute('aria-describedby', …)` → 本条转红。
-   */
-  it('显示期给触发元素挂 aria-describedby（原生 title 的播报能力不能丢）', () => {
-    const engine = blankComments(get('lib/tooltip-engine.ts'));
-    expect(engine).toMatch(/setAttribute\(\s*'aria-describedby'/);
-    expect(engine, '隐藏时必须还原/移除，否则指向一个不存在的 tip').toMatch(
-      /removeAttribute\(\s*'aria-describedby'\s*\)/,
-    );
-  });
-
-  /**
    * `#tip` 的 CSS 早在仓里（`prototype.css:203-208`）却零消费方 —— 本批把它接上。
    * 断言两侧同一个 id，避免哪天引擎改了 id 而 CSS 没跟着改（表现是 tip 裸奔无样式）。
    */

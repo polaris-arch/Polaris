@@ -38,19 +38,6 @@ describe('account actions say the proxy will be disconnected before it happens',
     before(confirm, 'api.server.tailscaleGetStatus().catch(() => null)', 'tsNodeHoldByRunningCore(proxy, snapshot, serverId)');
     before(confirm, "if (hold !== 'notHeld') {", "title: t('ts.logoutStopTitle'),");
     before(confirm, "message: t(hold === 'held' ? 'ts.logoutStopMessage' : 'ts.logoutStopUnsureMessage'),", 'await logoutNow();');
-    // The stopped-iOS sentence rides on the first confirmation.
-    expect(confirm).toContain("'ts.logoutStartsConnectionNote'");
-  });
-
-  it('the shared pre-notice requires generation-bound applied proof, not STATUS membership', () => {
-    const hold = slice(read('./ts-logout-flow.ts'), 'export function tsNodeHoldByRunningCore(',
-      'export function captureMainCoreOwner(');
-    expect(hold).toContain('snapshot?.mainCoreHold');
-    expect(hold).toContain('proof.mainGeneration !== generation');
-    expect(hold).toContain('Number.isSafeInteger(generation)');
-    expect(hold).toContain('proxy.starting');
-    expect(hold).toContain('proof.serverIds.includes(serverId)');
-    expect(hold).not.toContain('snapshot.statuses.some');
   });
 
   it('the Android entry marks its platform, or the account switch would stay on the renderer leg', () => {
@@ -70,8 +57,6 @@ describe('account actions say the proxy will be disconnected before it happens',
     before(submit, "if (hold !== 'notHeld') {", 'title: t(copy.title),');
     before(submit, "message: t(hold === 'held' ? copy.held : copy.unsure),", 'await submit(true);');
     before(submit, 'await submit(true);', 'const submissionRevision');
-    for (const key of ['ts.switchStopUnsureMessage', 'ts.loginStopTitle', 'ts.loginStopMessage',
-      'ts.loginStopUnsureMessage', 'ts.loginStopConfirm']) expect(submit).toContain(`'${key}'`);
   });
 
   it('desktop account switch offers to stop the holding run and submits again', () => {

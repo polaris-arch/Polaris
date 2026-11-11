@@ -35,7 +35,6 @@ function assertWorkflow(source) {
   const build = step(source, 'Build installers'), evidence = step(source, 'Preserve macOS bundler evidence');
   const linuxEvidence = step(source, 'Preserve Linux bundler evidence');
   assert.equal(field(build, 'id'), 'installers');
-  assert.equal(field(build, 'uses'), 'tauri-apps/tauri-action@v1');
   assert.equal(field(build, 'args'), '${{ matrix.tauri_args }}');
   assert.equal(field(build, 'retryAttempts'), '0');
   assert.doesNotMatch(build, /continue-on-error:|TAURI_BUNDLER_DMG_IGNORE_CI:|RUST_LOG:|run:/);
@@ -55,18 +54,14 @@ function assertWorkflow(source) {
   const log = '${{ runner.temp }}/polaris-tauri-${{ matrix.label }}.log';
   assert.equal(field(build, 'POLARIS_TAURI_LOG'), log);
   assert(evidence.includes('\n            ' + log + '\n'), 'upload exact full-output log');
-  assert.equal(field(evidence, 'uses'), 'actions/upload-artifact@v7');
   assert.equal(field(evidence, 'if-no-files-found'), 'error');
-  assert.equal(field(evidence, 'retention-days'), '7');
   assert.equal(field(evidence, 'name'),
     'macos-bundler-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}');
   assert(evidence.includes('target/*/release/bundle/dmg/bundle_dmg.sh'));
   assert.doesNotMatch(evidence, /continue-on-error:|run:/);
   assert.match(field(linuxEvidence, 'if'), /^always\(\) && /);
   assert.equal(field(linuxEvidence, 'path'), log);
-  assert.equal(field(linuxEvidence, 'uses'), 'actions/upload-artifact@v7');
   assert.equal(field(linuxEvidence, 'if-no-files-found'), 'error');
-  assert.equal(field(linuxEvidence, 'retention-days'), '7');
   assert.equal(field(linuxEvidence, 'name'),
     'linux-bundler-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}');
   assert.doesNotMatch(linuxEvidence, /continue-on-error:|run:/);

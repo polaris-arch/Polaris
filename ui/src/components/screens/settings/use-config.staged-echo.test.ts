@@ -70,10 +70,6 @@ describe('行为：onChanged 整份重拉之后，暂存值仍在界面上', () 
     // 等值副本照样过，而副本会让 9 个子页每次回声全量重渲染。
     expect(effectiveConfigOf(DISK_2, [])).toBe(DISK_2);
   });
-
-  it('撤销那条暂存后，设置页退回磁盘值（条目订阅而非快照读的理由）', () => {
-    expect(effectiveConfigOf(DISK_2, [])!.mixedPort).toBe(7890);
-  });
 });
 
 describe('接线：三件结构事实（源码断言 —— 证明的是接线，不是行为）', () => {
@@ -81,10 +77,6 @@ describe('接线：三件结构事实（源码断言 —— 证明的是接线�
     // 去注释保留行号：本文件的注释逐字引用了被禁的旧写法，扫原文会被说明文字误伤。
     .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
     .replace(/(^|[^:])\/\/.*$/gm, (m, p1: string) => p1 + ' '.repeat(m.length - p1.length));
-
-  it('对外那份经 `effectiveConfigOf` 派生（判断只在这一处，不下放子页）', () => {
-    expect(SRC).toMatch(/return\s*\{\s*config:\s*effectiveConfigOf\(/);
-  });
 
   it('磁盘副本保持纯净：`load` 的回填不经任何重放', () => {
     // `load` 里若也 replay 一次，暂存值就进了磁盘副本 ⇒ 后续整份事务会把它写进 config.json

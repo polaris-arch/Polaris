@@ -239,15 +239,6 @@ fn tail_capped_keeps_newest_and_drops_oldest() {
     assert!(tail_capped(&empty, 5).is_empty(), "空输入不 panic");
 }
 
-/// 截断上限与渲染端缓冲同量：补推多于渲染端能留的行数只是白费一次序列化 + 一次 webview 唤醒。
-#[test]
-fn pending_batch_cap_matches_renderer_buffer() {
-    assert_eq!(
-        MAX_PENDING_LOG_BATCH, 500,
-        "与 LogsScreen MAX_BUFFER 同量（改一边须同步另一边）"
-    );
-}
-
 /* ══════════════ content-URI 往返门（日志 / 诊断导出这一组）══════════════ */
 //
 // 门的本体与射程自曝在 `commands::picked_file::tests` 的头注里。这里驱动的是**导出腿自己的

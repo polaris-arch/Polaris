@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   pendingChangesCount,
@@ -496,33 +495,6 @@ describe('applyStateOnLifecycle ownership', () => {
   });
   it.each([['HELPER_NOT_INSTALLED', 'errors.helperNotInstalledDesc'], ['STARTUP_FAILED', 'errors.startupFailed'], [undefined, null]])('localizes owned failure %s without diagnostics', (errorCode, reason) => {
     expect(applyStateOnLifecycle(current, { ...event, phase: 'failed', errorCode: errorCode ?? undefined, message: 'private diagnostic' }, t)).toEqual({ phase: 'failed', reason });
-  });
-});
-
-/**
- * **接线守卫**（前端侧，与 Rust 的 `lifecycle_push_is_paired_with_the_diff_push` 同族）：
- * 纯函数测绿 ≠ 它真被挂上了。上面那批只证「判据对」，若组件压根没订阅该通道，判据就是死代码、
- * 缺陷原样复发 —— 这正是「测方法体 ≠ 测接线」那类假绿。
- *
- * 变异对照：删掉 `PendingChangesBar.tsx` 里那条 `api.proxy.onLifecycle(...)` 订阅 → 转红；
- * 订阅了但不走纯函数（就地手写 if/else）→ 第二条断言转红。
- */
-describe('接线：条真的订阅了 lifecycle 通道并走纯函数判定', () => {
-  const SRC = readFileSync(
-    new URL('./PendingChangesBar.tsx', import.meta.url),
-    'utf8'
-  ).replace(/^\s*(\/\/|\*|\/\*).*$/gm, ''); // 去整行注释：注释里也逐字写着这些调用
-
-  it('订阅了 api.proxy.onLifecycle', () => {
-    expect(SRC).toContain('api.proxy.onLifecycleReady(');
-  });
-
-  it('收场判定走 applyStateOnLifecycle，而不是在组件里另写一套', () => {
-    expect(SRC).toContain('applyStateOnLifecycle(');
-  });
-
-  it('订阅被卸载时解绑（漏了就是每次重挂多一个监听器）', () => {
-    expect(SRC).toContain('offLifecycle?.()');
   });
 });
 

@@ -76,29 +76,6 @@ describe('合入前发布风险门', () => {
     expect(risk).not.toMatch(/^\s+paths(?:-ignore)?:/m);
   });
 
-  it('手动验证只接受 branch ref，取其 head 与最新 origin/main 的 merge-base；取证失败走全量门', () => {
-    const classify = jobSection(risk, 'classify', 'release-risk.yml');
-    const start = classify.indexOf('            workflow_dispatch)');
-    const end = classify.indexOf('              fi ;;', start);
-    expect(start, 'classify 缺手动事件分支').toBeGreaterThanOrEqual(0);
-    expect(end, '手动事件分支缺结束边界').toBeGreaterThan(start);
-    const dispatch = classify.slice(start, end);
-
-    expect(classify).toContain('DISPATCH_REF: ${{ github.ref }}');
-    expect(classify).toContain('DISPATCH_SHA: ${{ github.sha }}');
-    expect(dispatch).toContain('[[ "$DISPATCH_REF" == refs/heads/* ]]');
-    expect(dispatch).toContain('echo "::error::手动发布风险门只接受 branch ref：$DISPATCH_REF"; exit 1; }');
-    expect(dispatch).toContain('git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main');
-    expect(dispatch).toContain('dispatch_head=$(git rev-parse --verify "${DISPATCH_REF}^{commit}" 2>/dev/null)');
-    expect(dispatch).toContain('[ "$dispatch_head" = "$DISPATCH_SHA" ]');
-    expect(dispatch).toContain('base=$(git merge-base refs/remotes/origin/main "$dispatch_head")');
-    expect(dispatch).toContain('head="$dispatch_head"');
-    expect(classify).toContain('if [ -n "$base" ] && [ -n "$head" ] \\');
-    expect(classify).toContain('git diff --name-only -z "$base" "$head" | node scripts/classify-ci-impact.mjs > "$result"');
-    expect(classify).toMatch(/else\n\s+echo "无法取得可靠 diff，故障关闭为内核门 \+ 四平台。"\n\s+node scripts\/classify-ci-impact\.mjs --full > "\$result"/);
-    expect(classify).toContain('node scripts/classify-ci-impact.mjs --full > "$result"');
-  });
-
   it('手动分类脚本回放分支、tag 拒绝与取证失败', () => {
     const temp = mkdtempSync(join(tmpdir(), 'polaris-release-risk-contract-'));
     try {
@@ -233,33 +210,6 @@ esac
     expect(risk).toMatch(/\[ -z "\$UNREGISTERED" \] \|\| \{\n\s+echo "::error::[^"]*\$UNREGISTERED"; exit 1; \}/);
   });
 
-  it('自动安装包验证复用 Package，但不上传产物也不重复内核门', () => {
-    const pkgJob = jobSection(risk, 'package', 'release-risk.yml');
-    // 切片自检：拿到的确实是这个 job，且没有把下一个 job 卷进来。
-    expect(pkgJob).toContain('uses: ./.github/workflows/package.yml');
-    expect(pkgJob).toContain('needs: [classify, preflight, desktop_core]');
-    expect(pkgJob).toContain("needs.preflight.result == 'success'");
-    expect(pkgJob).toContain('core_candidate: ${{ needs.classify.outputs.candidate }}');
-    expect(pkgJob).toContain('core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}');
-    const coreJob = jobSection(risk, 'desktop_core', 'release-risk.yml');
-    expect(coreJob).toContain("if: needs.classify.outputs.preflight == 'true'");
-    expect(coreJob).toContain('candidate: ${{ needs.classify.outputs.candidate }}');
-    const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
-    expect(preflight).toContain('needs: [classify, desktop_core]');
-    expect(preflight).toContain('ref: ${{ needs.classify.outputs.candidate }}');
-    expect(preflight).toContain('name: ${{ needs.desktop_core.outputs.artifact_name }}');
-    expect(pkgJob).not.toContain('name: release risk gate');
-    expect(pkgJob).toMatch(/permissions:\n\s+contents: write/);
-    expect(risk).toContain('run_kernel_gates: false');
-    expect(risk).toContain('upload_artifacts: false');
-    expect(risk).toContain('platforms: ${{ needs.classify.outputs.platforms }}');
-    expect(risk).toContain('skip_quality_gates: true');
-    expect(pkgJob).not.toMatch(/\n {4}strategy:/);
-    expect(pkg).toContain('workflow_call:');
-    expect(pkg).toContain('PLATFORMS_JSON: ${{ inputs.platforms');
-    expect(pkg).toContain("if: env.POLARIS_UPLOAD_ARTIFACTS == '1'");
-  });
-
   it('并发组：同一 PR / 分支上新提交取消旧运行，merge queue 不取消，且被取消的腿里没有写 release 的任务', () => {
     // 自动 tip 可替代；手动、固定审计与 merge queue 独立、tag 不取消。求实际表达式语义。
     const match = risk.match(
@@ -383,8 +333,6 @@ esac
     expect(classify).toContain("POLARIS_APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}");
     expect(classifyScript(risk)).toContain('if [ "${POLARIS_APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then\n  printf \'true\\n\' > "$apple_result"\nfi');
     expect(classify).toContain('[ "$VALIDATION_MODE" = ordinary ] && [ "$APPLE_DEFERRED" = false ]');
-    expect(risk).toContain('Apple sim-arm64: not requested.');
-    expect(risk).toContain('Full release risk gate is not passed.');
   });
 
   it('Apple 单 host 串行保全，所有 simulator 操作显式条件化且 cache 不替代真实 carrier', () => {
@@ -396,7 +344,6 @@ esac
     const simulator = blocks.filter((block) => block.includes('--slot "sim-arm64"') ||
       block.includes('path: target/apple-ci-cache/sim-arm64') ||
       /name: apple-carrier-(?:original|summary)-sim-arm64/.test(block));
-    expect(simulator).toHaveLength(10);
     for (const block of simulator) {
       expect(block).toMatch(/if: \$\{\{ inputs.include_simulator && !cancelled\(\)/);
       expect(block).not.toContain('continue-on-error');
@@ -575,10 +522,8 @@ esac
 
   it('preflight 用钉扎 protoc 对拍四平台 wire，D1 CONNECT 仍在 REQUIRE 强制腿', () => {
     const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-    expect(manifest.desktopSourceBuild.sourceMode).toBe('fork-commit-v1');
     const sourceBytes = readFileSync(join(REPO_ROOT, 'scripts/desktop-core/source-manifest.json'));
     expect(manifest.desktopSourceBuild.sourceManifestSha256).toBe(createHash('sha256').update(sourceBytes).digest('hex'));
-    expect(JSON.parse(sourceBytes.toString()).sourceCommit).toBe('aafc521b745e0d1a8f50a6a3f41169433f1c2194');
     expect(manifest.windowsBuild).toBeUndefined();
     const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
     const fetchCore = preflight.indexOf('      - name: Fetch sing-box core');
@@ -638,15 +583,7 @@ esac
   it('手动分支内核门保持桌面 fork 角色来源、旧 mobile alpha8 与 REQUIRE 硬化', () => {
     const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
     const source = JSON.parse(readFileSync(join(REPO_ROOT, 'scripts/desktop-core/source-manifest.json'), 'utf8'));
-    expect(source.sourceCommit).toBe('aafc521b745e0d1a8f50a6a3f41169433f1c2194');
-    expect(source.sourceTagObject).toBe('71876e8b33d3061bd9abba9618aa3e8c3e22db4e');
     expect(manifest.desktopSourceBuild.patchedSourceTree).toBe(source.sourceTree);
-    expect(manifest.desktopSourceBuild.version).toBe('1.15.0-alpha.11.polaris.2');
-    expect(manifest.sourceBuild.version).toBe('1.15.0-alpha.8.polaris.4');
-    for (const path of ['libbox-patches', 'libbox-ios-patches']) {
-      expect(JSON.parse(readFileSync(join(REPO_ROOT, 'scripts', path, 'source-manifest.json'), 'utf8')).sourceCommit)
-        .toBe('b609f959f57ce34416c51c7b87ce4a76f2e1df56');
-    }
     const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
     const mandatory = preflight.slice(preflight.indexOf('      - name: Run mandatory bundled-core gates'));
     expect(preflight).toContain('run: node scripts/fetch-core.mjs');

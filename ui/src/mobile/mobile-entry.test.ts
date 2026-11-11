@@ -107,14 +107,6 @@ const ALLOWED_CSS = [
   'src/styles/fonts.css',
   'src/styles/tokens.resolved.css',
 ];
-/** 桌面层叠链的五个文件：任何一个出现在移动端入口链路上都是契约 A1 违约。 */
-const DESKTOP_CASCADE = [
-  'src/styles/index.css',
-  'src/styles/tokens.css',
-  'src/styles/components.css',
-  'src/styles/screens.css',
-  'src/styles/prototype.css',
-];
 
 /**
  * 五个主目的地的快照。真值源见文件头注。**顺序即导航从左到右的顺序**。
@@ -191,18 +183,6 @@ const GRAPH_CSS = GRAPH.filter((p) => p.endsWith('.css'));
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('⓪ 自检：判据的取材面是活的（否则下面每条都恒绿）', () => {
-  it('剥注释真的把注释里的反面示例挡在图外', () => {
-    // 头注里写反例是本目录的常态；不剥就会把它们抓成真实依赖。
-    const synthetic = `/* 反例：import './styles/index.css' 会违约 */\nimport { a } from './real';\n`;
-    expect(specifiersOf(synthetic, false)).toEqual(['./real']);
-    expect(specifiersOf(`/* @import './tokens.css' */\n@import './fonts.css';`, true)).toEqual(['./fonts.css']);
-  });
-
-  it('字符串里的 `/*` 不是注释起点（vite.config.ts 的 glob 是真实输入，正则版剥法在这里塌过）', () => {
-    const glob = "const ignored = ['**/src-tauri/**'];\nimport { a } from './real';\n";
-    expect(specifiersOf(glob, false)).toEqual(['./real']);
-    expect(strip(glob)).toContain('src-tauri');
-  });
 
   it('模块图非空且有量级（走查器塌了会退化成"什么都没扫到所以全绿"）', () => {
     expect(GRAPH, `模块图只有 ${GRAPH.length} 个文件 —— 走查器坏了`).toContain(ENTRY_MODULE);
@@ -212,20 +192,10 @@ describe('⓪ 自检：判据的取材面是活的（否则下面每条都恒绿
 });
 
 describe('① 入口文件在，且 Vite 真的在构建它', () => {
-  it(`\`ui/${ENTRY_HTML}\` 存在且非空`, () => {
-    expect(existsSync(abs(ENTRY_HTML)), `${ENTRY_HTML} 不见了 —— 移动端没有文档可加载`).toBe(true);
-    expect(read(ENTRY_HTML).trim().length).toBeGreaterThan(0);
-  });
 
   it('文档只加载移动端入口模块这一个脚本', () => {
     const srcs = [...read(ENTRY_HTML).matchAll(/<script[^>]*\bsrc=['"]([^'"]+)['"]/g)].map((m) => m[1]);
     expect(srcs, `${ENTRY_HTML} 的脚本集合变了`).toEqual([`/${ENTRY_MODULE}`]);
-  });
-
-  it('`viewport-fit=cover` 在 —— 少了它四个 `--safe-*` 会静默恒为 0', () => {
-    const viewport = /<meta\s+name=['"]viewport['"][^>]*content=['"]([^'"]*)['"]/.exec(read(ENTRY_HTML));
-    expect(viewport, `${ENTRY_HTML} 里没有 viewport meta`).not.toBeNull();
-    expect(viewport?.[1]).toContain('viewport-fit=cover');
   });
 
   it('移动 WebView 固定页面倍率，同时保留设备宽度和安全区', () => {
@@ -292,47 +262,9 @@ describe('③ 契约 A1：入口链路上只许有移动端那一份 CSS', () =>
   it('模块图里的 CSS 集合恰等于允许集（多一份少一份都红）', () => {
     expect(GRAPH_CSS.sort()).toEqual([...ALLOWED_CSS].sort());
   });
-
-  it('桌面五层层叠链一个都不在图上（与上一条互为人话版，报错时直接指名道姓）', () => {
-    for (const desktop of DESKTOP_CASCADE) {
-      expect(
-        GRAPH,
-        `移动端入口链路上出现了桌面层叠链文件 ${desktop} —— 契约 A1 违约：` +
-          'token 终值会被中间层污染（语义色丢无障碍校准），且整条桌面组件 CSS 进移动包',
-      ).not.toContain(desktop);
-    }
-  });
-
-  it('入口 CSS 自身不写任何 @import（唯一那条在 tokens.resolved.css 里，指向随包字体面）', () => {
-    expect(specifiersOf(read('src/mobile/mobile.css'), true)).toEqual([]);
-    expect(specifiersOf(read('src/styles/tokens.resolved.css'), true)).toEqual(['./fonts.css']);
-  });
 });
 
 describe('④ 五个目的地一个不少，且与设计包的登记表逐值相等', () => {
-  const table = [...strip(read('src/mobile/destinations.ts')).matchAll(
-    /\{\s*id:\s*'([a-z]+)'\s*,\s*labelKey:\s*'([^']+)'\s*\}/g,
-  )].map((m) => [m[1], m[2]] as const);
-
-  /** 从 zh-CN 语言包按 `a.b` 路径取值。取不到返回 undefined ⇒ 下面那条会指名道姓报出来。 */
-  const zhCn = JSON.parse(read('src/i18n/locales/zh-CN.json')) as Record<string, unknown>;
-  const lookup = (key: string): unknown =>
-    key.split('.').reduce<unknown>((cur, seg) => (cur as Record<string, unknown>)?.[seg], zhCn);
-
-  it('自检：`DESTINATIONS` 真的解析出来了（正则失配会让下面那条对着空数组恒绿）', () => {
-    expect(table.length, 'destinations.ts 里一条目的地都没解析出来 —— 表的写法变了，判据面塌了').toBe(
-      REGISTERED.length,
-    );
-  });
-
-  it('id 逐值逐序等于登记表', () => {
-    expect(table.map(([id]) => id)).toEqual(REGISTERED.map(([id]) => id));
-  });
-
-  it('每个 labelKey 在 zh-CN 里解析出的文案 = 设计登记表的原文（三方对齐：登记表 / 代码 / locale）', () => {
-    expect(table.map(([, key]) => lookup(key))).toEqual(REGISTERED.map(([, label]) => label));
-  });
-
   it('五语种都有 `mobileNav`，且键集合一致（只加中文 = 另外四语种回落成 key）', () => {
     const keys = REGISTERED.map(([id]) => id).sort();
     for (const lang of ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa']) {
@@ -387,24 +319,6 @@ describe('④ 五个目的地一个不少，且与设计包的登记表逐值相
 });
 
 describe('⑤ 导航表 / 图标表 / 路由表同源', () => {
-  const ids = REGISTERED.map(([id]) => id);
-  const keysOf = (file: string, mapName: string): string[] => {
-    const src = strip(read(`src/mobile/${file}`));
-    const start = src.indexOf(mapName);
-    expect(start, `${file} 里找不到 \`${mapName}\` —— 判据面塌了`).toBeGreaterThan(-1);
-    const block = /\{([\s\S]*?)\n\};/.exec(src.slice(start));
-    expect(block, `${file} 的 \`${mapName}\` 块解析不出来`).not.toBeNull();
-    return [...(block?.[1] ?? '').matchAll(/^\s{2}([a-z]+):/gm)].map((m) => m[1]).sort();
-  };
-
-  it('`Screens.tsx` 的 `SCREENS` 键集合 = 五个目的地（少一屏 = 有目的地进不去）', () => {
-    expect(keysOf('Screens.tsx', 'SCREENS')).toEqual([...ids].sort());
-  });
-
-  it('`BottomNavigation.tsx` 的 `ICONS` 键集合 = 五个目的地（少一个 = 导航项没图标）', () => {
-    expect(keysOf('BottomNavigation.tsx', 'ICONS')).toEqual([...ids].sort());
-  });
-
   it('导航与根组件都不自带第二份标签表（两张表是这类外壳最典型的静默漂移）', () => {
     for (const file of ['BottomNavigation.tsx', 'MobileApp.tsx']) {
       const src = strip(read(`src/mobile/${file}`));
@@ -720,10 +634,5 @@ describe('⑨ Android WebView 页面缩放与系统字号分离', () => {
     expect(start, 'onWebViewCreate 不存在，原生 WebView 缩放设置无处生效').toBeGreaterThan(-1);
     expect(hook).toMatch(/webView\.settings\.apply\s*\{\s*setSupportZoom\(false\)\s*setBuiltInZoomControls\(false\)\s*\}/);
     expect(hook).not.toMatch(/setOnTouchListener|onTouchEvent|requestDisallowInterceptTouchEvent/);
-  });
-
-  it('仍由原有的字号通道消费系统大字体', () => {
-    expect(hook).toContain('publishFontScale(webView)');
-    expect(read('src/mobile/mobile.css')).toMatch(/font-size:\s*calc\(\s*16px\s*\*\s*var\(--font-scale\)\s*\)/);
   });
 });

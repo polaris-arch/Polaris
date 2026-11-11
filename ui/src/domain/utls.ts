@@ -7,10 +7,6 @@ export const NODE_UTLS_OPTIONS: readonly (readonly [string, string])[] = [
   ['none', 'node.utls.disabled'],
 ];
 export const SHADOW_UTLS_OPTIONS = NODE_UTLS_OPTIONS;
-export const GLOBAL_UTLS_OPTIONS: readonly (readonly [string, string])[] = [
-  ['follow', 'settings.utls.follow'],
-  ['default', 'node.utls.default'],
-];
 
 type Intent = Pick<TlsSettings, 'utlsMode' | 'fingerprint'>;
 

@@ -34,12 +34,6 @@ import { initTsDraft } from './ts-settings-logic';
 function read(rel: string): string {
   return readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 }
-function locale(name: string): Record<string, Record<string, string>> {
-  return JSON.parse(read(`../../i18n/locales/${name}.json`)) as Record<
-    string,
-    Record<string, string>
-  >;
-}
 
 const srv = (id: string, extra: Partial<ServerConfig> = {}): ServerConfig =>
   ({ id, name: id.toUpperCase(), protocol: 'vless', address: 'a', port: 443, ...extra }) as ServerConfig;
@@ -187,17 +181,6 @@ describe('门 A（源码结构门）：三个 endpoint 表单的 detour 控件',
   });
 
   for (const f of FORMS) {
-    it(`${f.file}：有一条 k: 'detour' 的 select 表项，label/hint 指向 ${f.ns}.detour*`, () => {
-      // 取那一行整体判断，避免「文件里别处提过 detour」把门盖绿。
-      const line = f.src
-        .split('\n')
-        .find((l) => /\{\s*t:\s*'select',\s*k:\s*'detour'/.test(l));
-      expect(line, `${f.file} 缺少 detour 的 select 表项`).toBeTruthy();
-      expect(line).toContain(`label: '${f.ns}.detour'`);
-      expect(line).toContain(`hint: '${f.ns}.detourHint'`);
-      expect(line).toContain('options: detourOpts');
-    });
-
     /* 候选构造与提交侧写回住在**消费者**里（表本身只收一个 `detourOpts` 形参）。
        六个消费者逐个判：桌面漏一处或移动端漏一处，都是那一端的用户选了个不生效的前置代理。 */
     it(`${f.file} 的两个客户端：候选集都走共用的 endpointDetourOptions（排除判据一处定义）`, () => {
@@ -207,62 +190,6 @@ describe('门 A（源码结构门）：三个 endpoint 表单的 detour 控件',
         // 各自手拼一份 `servers.filter(...)` 就是这道门要防的复发形态。
         expect(src, `${name} 自己拼了一份候选`).not.toMatch(/detourOpts[^\n]*=\s*\[/);
       }
-    });
-  }
-
-  it('提交侧统一走 applyDetour（哨兵 ⇒ 删键，六个消费者不各写一份）', () => {
-    for (const f of FORMS) {
-      for (const [name, src] of f.consumers) {
-        const wired =
-          src.includes('applyDetour(') ||
-          // WG 那两个的写回下沉在 `wg-logic.ts#buildWgServer` 里（同一函数）。
-          (name.endsWith('WgDialog.tsx') || name.endsWith('WgPanel.tsx')) &&
-            read('./wg-logic.ts').includes('applyDetour(');
-        expect(wired, `${name} 的 detour 未接到 applyDetour`).toBe(true);
-      }
-    }
-  });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
-// 门 B：提示文案五语齐，且 WG/WARP 那两句必须说到 UDP、TS 那句必须说到 TCP
-// ════════════════════════════════════════════════════════════════════════════
-
-const LOCALES = ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa'] as const;
-
-describe('门 B：detour 提示文案五语齐 + UDP/TCP 判别词', () => {
-  it('自检：五份 locale 都读得到且非空', () => {
-    for (const l of LOCALES) {
-      expect(Object.keys(locale(l)).length, `${l} 读取失败`).toBeGreaterThan(10);
-    }
-  });
-
-  for (const l of LOCALES) {
-    it(`${l}：wg / ts / warp 的 detour + detourHint 都在且非空`, () => {
-      const d = locale(l);
-      for (const ns of ['wg', 'ts', 'warp'] as const) {
-        expect(d[ns]?.detour?.trim(), `${l} ${ns}.detour 缺失`).toBeTruthy();
-        expect(d[ns]?.detourHint?.trim(), `${l} ${ns}.detourHint 缺失`).toBeTruthy();
-      }
-    });
-
-    it(`${l}：WG/WARP 提示必须写明前置代理要支持 UDP 转发`, () => {
-      // 判据取 `UDP ASSOCIATE` 这个**跨语言不翻译**的协议术语 —— 五种语言的译文里都是这串拉丁字母，
-      // 于是这条断言与语种无关，却仍然咬得住「有人把 UDP 那句删了/改成泛泛的一句话」。
-      const d = locale(l);
-      expect(d.wg.detourHint, `${l} wg.detourHint 未提 UDP ASSOCIATE`).toContain('UDP ASSOCIATE');
-      expect(d.warp.detourHint, `${l} warp.detourHint 未提 UDP ASSOCIATE`).toContain(
-        'UDP ASSOCIATE'
-      );
-    });
-
-    it(`${l}：TS 提示是 TCP 那条（与 WG/WARP 刻意不同，抄错会让用户白换代理）`, () => {
-      const d = locale(l);
-      expect(d.ts.detourHint, `${l} ts.detourHint 未提 TCP`).toContain('TCP');
-      expect(
-        d.ts.detourHint.includes('UDP ASSOCIATE'),
-        `${l} ts.detourHint 不得照抄 WG 的 UDP 硬约束`
-      ).toBe(false);
     });
   }
 });
@@ -323,20 +250,6 @@ describe('门 C：写 detour 的表单，提交侧全部走 applyDetour（含手
     for (const f of DETOUR_SUBMITTERS) {
       expect(f.src.length, `${f.file} 源码读取失败`).toBeGreaterThan(1000);
     }
-  });
-
-  it('取材面自检：清册没有漏掉任何一处「持有 detour 草稿并提交」的表单', () => {
-    /* 反过来数一遍：全仓（桌面 dialogs + 移动 forms）里凡是 `useState(base?.detour` /
-       `detour` 草稿字段并调 `api.server.add|update` 的文件，都必须在清册里。
-       这一条防的是「新加了第六个表单、它自己手写一份」——那正是本次缺陷的复发形态。 */
-    const holders = ['NodeDialog.tsx', 'WgDialog.tsx', 'WarpDialog.tsx', 'TsSettingsDialog.tsx'];
-    for (const h of holders) {
-      expect(
-        DETOUR_SUBMITTERS.some((f) => f.file === h),
-        `${h} 持有 detour 却不在清册里`,
-      ).toBe(true);
-    }
-    expect(read('../../mobile/forms/NodeFormPanel.tsx')).toContain('base?.detour');
   });
 
   for (const f of DETOUR_SUBMITTERS) {

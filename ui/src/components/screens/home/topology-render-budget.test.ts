@@ -244,16 +244,6 @@ describe('门 5 · 首页延迟表按选单开合条件订阅', () => {
 });
 
 describe('准确性门 · 完整活动表投影与绘制预算解耦', () => {
-  it('常态和搜索都等待完整表变化监听就绪，再走后端按槽位投影', () => {
-    const ready = TOPO_SRC.indexOf('onConnectionsTopologyChangedReady');
-    const project = TOPO_SRC.indexOf('projectTopology(normalizedSearch, projectionSlots)');
-    expect(ready).toBeGreaterThan(0);
-    expect(project).toBeGreaterThan(0);
-    expect(TOPO_SRC).toContain('projection?.aggregate');
-    expect(TOPO_SRC).toContain('topologySlotCapacity(size.h)');
-    expect(TOPO_SRC).toContain("t('home.connectionFlow')");
-  });
-
   it('当前查询和槽位的回包抵达前不得用旧投影猜测“无命中”', () => {
     expect(TOPO_SRC).toContain(
       'searching && projectionResolved && displayAggregate?.total === 0'

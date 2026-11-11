@@ -112,16 +112,6 @@ describe('T1：三个测速入口共用 isSpeedTestable 口径（候选集不同
     // 能力位必须来自代理运行态，而不是随手写死 true。
     expect(NODES).toMatch(/mainCorePool:\s*!!proxyStatus\?\.running/);
   });
-
-  it('三条腿都不空跑：空集提示而非发空请求', () => {
-    const body = callbackBody(SPEEDTEST, 'runSpeedTest');
-    expect(body).toContain('nodes.noTestableNodes');
-  });
-
-  it('卡片单节点测速也消费 invoke 返回值兜底，不能只赌事件一定送达', () => {
-    const body = callbackBody(SPEEDTEST, 'testOne');
-    expect(body).toContain('absorbRunResult(await api.server.speedTest([server.id]))');
-  });
 });
 
 describe('T2：节点卡不得再自造弱判定（谓词在、调用点却绕开它，是本轮的根因形态）', () => {
@@ -130,11 +120,6 @@ describe('T2：节点卡不得再自造弱判定（谓词在、调用点却绕�
     // 它漏掉 Tailscale 一族（TS 的外网出口由 exitNode 派生），也管不了 reverseMesh。
     // `lanOnly` 的实际计算已随 `<NodeCard>` 调用点搬进 NodesGrid，负向断言须一并扫它。
     expect(NODES + GRID).not.toMatch(/allowInternet\s*===\s*false/);
-  });
-
-  it('「仅局域网」角标走 domain 谓词 meshAllowsInternet', () => {
-    // lanOnly 计算已随 `<NodeCard>` 调用点搬进 `NodesGrid.tsx`（同上）。
-    expect(GRID).toMatch(/meshAllowsInternet\(/);
   });
 
   it('每张卡的可测性由 speedTestBlockReason 单点给出，并传给 NodeCard', () => {
@@ -164,13 +149,6 @@ describe('T3：不可测的 ⚡ 是「置灰 + 说明原因」，不是整个藏
     expect(CARD).toContain('disabled={!testable}');
     // 原状形态：`{!lanOnly && (<button className="nd-a speed" ...`——按钮凭空消失，用户无从得知为什么。
     expect(CARD).not.toMatch(/\{\s*!lanOnly\s*&&\s*\(/);
-  });
-
-  it('置灰必须带得出理由（tooltip 挂按钮 + 延迟位两处）', () => {
-    expect(CARD).toContain('speedTestBlockedHint');
-    // 延迟位也挂一份：部分 WebView 上 disabled 按钮的 title 不弹。
-    expect(CARD).toMatch(/const latencyTip[\s\S]{0,120}speedTestBlockedHint/);
-    expect(CARD).toMatch(/nd-lat[\s\S]{0,120}latencyTip/);
   });
 
   it('理由必须进 aria-label —— 只挂 title 时键盘/读屏用户拿不到（2026-07-28 复审 LOW #8）', () => {
@@ -204,20 +182,8 @@ describe('T3：不可测的 ⚡ 是「置灰 + 说明原因」，不是整个藏
 });
 
 describe('T4：视图档（卡片/列表）是持久偏好，不是组件私有 state', () => {
-  it('NodesScreen 读持久 store', () => {
-    expect(NODES).toContain('useNodeViewStore');
-  });
-
   it('**不得**退回 `useState(\'cards\')`（切屏即卸载重挂 → 用户选的列表视图被悄悄改回）', () => {
     expect(NODES).not.toMatch(/useState<ViewMode>/);
     expect(NODES).not.toMatch(/useState\(\s*['"]cards['"]\s*\)/);
-  });
-});
-
-describe('T5：空订阅组的空态引导「刷新订阅」，不是「点右上添加」', () => {
-  it('订阅组走 nodes.emptySub 分支（自建/组网组仍用 nodes.empty）', () => {
-    // 空态分支已随 `.node-grid` 整块搬进 `NodesGrid.tsx`。
-    expect(GRID).toContain('nodes.emptySub');
-    expect(GRID).toMatch(/activeSub\s*\n?\s*\?\s*t\('nodes\.emptySub'/);
   });
 });

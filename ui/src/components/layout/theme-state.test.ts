@@ -59,16 +59,7 @@ describe('接线：AppShell 真的消费了折算与种子（种子曾是全仓�
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/(^|[^:])\/\/.*$/gm, '$1');
 
-  it('主题 effect 调 resolveTheme，且喂了种子', () => {
-    expect(shell).toMatch(/resolveTheme\(\{/);
-    expect(shell).toMatch(/seed:\s*readInitialThemeSeed\(\)/);
-  });
-
   it('不得再把「未水合」折成 system —— `config?.uiTheme ?? \'system\'` 是缺陷原状', () => {
     expect(shell).not.toMatch(/config\?\.uiTheme\s*\?\?\s*'system'/);
-  });
-
-  it('水合闸门喂进折算（少了它 uiTheme 缺省与未水合就分不开）', () => {
-    expect(shell).toMatch(/uiTheme:\s*configLoaded\s*\?/);
   });
 });

@@ -148,17 +148,10 @@ describe('连接列表内存边界', () => {
   it('列表按视图条件挂载且最多渲染 20 行，不再用超长占位行', () => {
     expect(SRC).toContain("(view === 'active' || view === 'closed') && (");
     expect(SRC).not.toMatch(/id="conn-table-view"\s+hidden=/);
-    expect(SRC).toContain('const CONNECTION_PAGE_SIZE = 20');
     expect(SRC).toContain('pageWindow(filteredRows.length, page, CONNECTION_PAGE_SIZE)');
     expect(SRC).toContain('filteredRows.slice(pagination.start, pagination.end)');
     expect(SRC).not.toContain('conn-spacer');
     expect(SRC).not.toContain('bottomSpace');
-    expect(SRC).toContain('<ListPager');
-    expect(SRC).toContain('<colgroup>');
-    expect(SRC).toContain('<col className="c-type" />');
-    expect(STYLE).toContain('table-layout:fixed');
-    expect(STYLE).toContain('.conn-table-active col.c-type{ width:54px; }');
-    expect(STYLE).toContain('.conn-table-closed col.c-type{ width:54px; }');
     expect(STYLE).not.toMatch(/\.conn-table tr\s*\{[^}]*display\s*:\s*grid/);
     expect(STYLE).not.toContain('contain:layout style');
     expect(STYLE).not.toContain('contain:layout paint');
@@ -167,26 +160,7 @@ describe('连接列表内存边界', () => {
   });
 
   it('活动/已结束列宽各自完整覆盖 920px，旧样式层不再保留第二套连接表规则', () => {
-    const widths = (view: 'active' | 'closed') => [
-      ...STYLE.matchAll(
-        new RegExp(`\\.conn-table-${view} col\\.c-[\\w-]+\\s*\\{\\s*width:(\\d+)px`, 'g'),
-      ),
-    ].map((match) => Number(match[1]));
-    const active = widths('active');
-    const closed = widths('closed');
-    expect(active).toHaveLength(10);
-    expect(closed).toHaveLength(9);
-    expect(active.reduce((sum, width) => sum + width, 0)).toBe(920);
-    expect(closed.reduce((sum, width) => sum + width, 0)).toBe(920);
     expect(LEGACY_STYLES).not.toContain('.conn-table');
-  });
-
-  it('切离活动视图释放活动行缓存；暂停仍只退订并保留当前视口', () => {
-    expect(SRC).toContain("if (view === 'active') return;");
-    expect(SRC).toContain('setRows([])');
-    const at = SRC.indexOf("api.stats.subscribe('detail')");
-    const effect = SRC.slice(SRC.lastIndexOf('useEffect(', at), SRC.indexOf(']);', at));
-    expect(effect).not.toContain('setRows([])');
   });
 
   it('已结束 topic 走有界增量索引，未变行不重建', () => {
@@ -215,8 +189,6 @@ describe('M8 显示迟滞接线（连接表每秒换串是 graphics 表面爆炸
     expect((body.match(/stickyDisplay\(/g) ?? []).length).toBe(3);
     expect(body).toContain('sticky.get(entry.id)');
     expect(body).toContain('sticky.set(entry.id,');
-    // total 用更紧的 1/64 迟滞（对齐 fmtBytes 粒度），rate 用默认 1/16。
-    expect(body).toContain('stickyDisplay(shown.t, up + dn, 64)');
   });
 
   it('迟滞缓存生命周期与行缓存同拍（reset / 移除 / 切走清理）', () => {

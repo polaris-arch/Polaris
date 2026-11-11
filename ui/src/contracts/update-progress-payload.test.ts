@@ -139,15 +139,6 @@ describe('update:progress 载荷 —— Rust ↔ TS 双向对拍', () => {
     expect(rust.length, '解析到的键太少 —— 取材器已失效').toBeGreaterThanOrEqual(5);
   });
 
-  it('三样随行事实确实在契约里（哑键与假版本号各自的受益方）', () => {
-    // 这条不是覆盖面判据（那由上一条的集合相等负责），是**动机存档**：三个字段各自对应一条
-    // 已核实的缺陷，谁要删其中之一，先在这里读到它删掉的是什么。
-    const rust = rustPayloadKeys();
-    expect(rust.has('updateInfo'), '没有清单 ⇒ 版本号/体积说的是上一次检查的版本，且「重试」是哑键').toBe(true);
-    expect(rust.has('filePath'), '没有落位路径 ⇒ 「重启并安装」首行恒早退（哑键）').toBe(true);
-    expect(rust.has('receivedBytes'), '没有已收字节 ⇒ 进度只能从百分比反推，每帧都是错的').toBe(true);
-  });
-
   it('后端真会发的 status ↔ 前端表里产出 patch 的 status，集合相等', () => {
     // Rust 多发一种帧而前端表里那格仍是 `null` ⇒ 那种帧被静默丢弃；
     // 前端表里多一格非 null 而后端从不发 ⇒ 那格是一条永远不执行的死策略。

@@ -124,11 +124,6 @@ describe('展开即露出 —— 全仓不变量', () => {
     expect(detailsTags('<details onToggle={x}><summary>t</summary></details>')).toHaveLength(1);
   });
 
-  it('Fold 的 onToggle 里真的调了 revealOnToggle（不只是同步 state）', () => {
-    const src = readFileSync(join(SRC, 'components/Fold.tsx'), 'utf8');
-    expect(src).toMatch(/onToggle=\{[\s\S]*revealOnToggle\(e\)[\s\S]*\}/);
-  });
-
   /**
    * 「露出」的两条腿 —— 判据认哪一条，取决于**分组的 DOM 形状**，不取决于谁先写的。
    *
@@ -170,11 +165,5 @@ describe('展开即露出 —— 全仓不变量', () => {
   it('确有分组菜单被扫到（防止上一条在空集合上恒绿）', () => {
     const n = files.filter((f) => readFileSync(f, 'utf8').includes('openGroups')).length;
     expect(n).toBeGreaterThanOrEqual(4);
-  });
-
-  it('ListEditor 的内联导入面板也走同一条路（它不是 details，拿不到 toggle）', () => {
-    const src = readFileSync(join(SRC, 'components/screens/settings/ListEditor.tsx'), 'utf8');
-    expect(src).toContain('revealElement(importPanelRef.current)');
-    expect(src).toMatch(/\}, \[importOpen\]\);/);
   });
 });

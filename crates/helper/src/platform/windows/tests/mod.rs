@@ -5,7 +5,6 @@ use super::*;
 #[test]
 fn proto_version_is_unified_current() {
     assert_eq!(PROTO_VERSION, polaris_helper_proto::proto_version::CURRENT);
-    assert_eq!(PROTO_VERSION, 4);
 }
 
 #[test]
@@ -18,7 +17,6 @@ fn platform_is_win_with_token_line() {
 #[test]
 fn service_name_pipe_name_sddl_match_go_source() {
     // main.go:15 / service.go:16,34
-    assert_eq!(SERVICE_NAME, "PolarisHelper");
-    assert_eq!(PIPE_NAME, r"\\.\pipe\polaris-helper");
+    // 服务名 / 管道名由 `crates/helper-client/src/manager/tests/mod.rs` 守。
     assert_eq!(PIPE_SDDL, "D:(A;;FA;;;SY)(A;;GRGW;;;IU)");
 }

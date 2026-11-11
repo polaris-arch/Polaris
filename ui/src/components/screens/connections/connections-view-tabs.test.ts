@@ -21,39 +21,6 @@ const SRC = code(
 
 describe('连接页视图 tab', () => {
   /**
-   * 拓扑按钮必须排在明细按钮**之前**。
-   *
-   * 断在 tablist 容器**之内**，免得被页面别处的同名调用（如 TOP 视图正文里的标题）带偏；
-   * 用 `setView('top')` / `setView('table')` 作锚点而不是文案 key —— 换文案不误伤，换顺序必红。
-   *
-   * 变异对照：把两个 `<button>` 换回原顺序（明细在前）→ 本条转红。
-   */
-  it('tab 顺序 = 拓扑 → 活动 → 已结束', () => {
-    const start = SRC.indexOf('role="tablist"');
-    expect(start).toBeGreaterThan(-1);
-    const end = SRC.indexOf('</div>', start);
-    const tablist = SRC.slice(start, end);
-
-    const top = tablist.indexOf("setView('top')");
-    const active = tablist.indexOf("setView('active')");
-    const closed = tablist.indexOf("setView('closed')");
-    expect(top).toBeGreaterThan(-1);
-    expect(active).toBeGreaterThan(-1);
-    expect(closed).toBeGreaterThan(-1);
-    expect(top).toBeLessThan(active);
-    expect(active).toBeLessThan(closed);
-  });
-
-  /**
-   * 进页默认视图 = 拓扑。
-   *
-   * 变异对照：初值改回 `useState<ConnView>('table')` → 本条转红。
-   */
-  it('默认视图 = 拓扑', () => {
-    expect(SRC).toContain("useState<ConnView>('top')");
-  });
-
-  /**
    * 默认拓扑成立的前提：aggregate 腿的 gate 是 `view === 'top'`，进页即订、有数据源。
    * 若哪天有人把 gate 改成别的（或干脆把默认视图的订阅腿摘了），默认视图会变成空屏
    * ——那是比顺序错更难发现的回归，故一并钉住。

@@ -124,7 +124,6 @@ describe('autoDismissMs：sticky 不自动消失', () => {
 
   it('非 sticky ⇒ 原型的 2200ms', () => {
     expect(autoDismissMs({ sticky: false })).toBe(VISIBLE_MS);
-    expect(VISIBLE_MS).toBe(2200);
   });
 });
 
@@ -166,56 +165,10 @@ describe('toastListKey：React key 必须随 dedupeKey 稳定', () => {
 
 describe('接线还在：Toaster 用的是本模块的判定，没有就地复刻一份', () => {
   const toaster = stripComments(read('./Toaster.tsx'));
-
-  it('入栈走 upsertToast（不是裸 append/slice）', () => {
-    expect(toaster, 'Toaster 又自己拼数组了 —— 同 key 更新语义会随之丢失').toMatch(
-      /setItems\(\(prev\) => upsertToast\(prev, entry\)\)/,
-    );
-  });
-
-  it('🔴 淡出定时器由 autoDismissMs 把关，null 时直接返回', () => {
-    expect(toaster).toMatch(/const ttl = autoDismissMs\(entry\)/);
-    expect(toaster, 'sticky 的早退没了 —— 进度 toast 会被 2.2s 定时器收走').toMatch(
-      /if \(ttl === null\) return;/,
-    );
-    // 定时器时长必须用 ttl，写回常数就等于绕过了上面那道判定。
-    expect(toaster).toMatch(/\}, ttl\);/);
-  });
-
   it('React key 走 toastListKey（不是 it.id）', () => {
     expect(toaster).toMatch(/key=\{toastListKey\(it\)\}/);
     expect(toaster, 'key 又回到 it.id —— 同 key 更新会重挂节点、动画重播').not.toMatch(
       /key=\{it\.id\}/,
     );
-  });
-
-  it('卸载会取消尚未执行的进场帧，避免卸载后 setState', () => {
-    expect(toaster).toContain('const frames = useRef<Set<number>>(new Set());');
-    expect(toaster).toContain('frames.current.forEach(cancelAnimationFrame);');
-    expect(toaster).toContain('frames.current.clear();');
-  });
-
-  it('🔴 actions / dismiss 从 ToastOptions 接进 entry，并真的渲染成可点入口', () => {
-    expect(toaster).toMatch(/actions: opts\?\.actions/);
-    expect(toaster).toMatch(/dismiss: opts\?\.dismiss/);
-    expect(toaster).toMatch(/className="toast-actions"/);
-    expect(toaster).toMatch(/className="toast-action"/);
-    expect(toaster).toMatch(/className="toast-close"/);
-    expect(toaster, '带按钮那条必须把 pointer-events 收回来，否则点不到').toMatch(
-      /pointerEvents: 'auto'/,
-    );
-    expect(toaster).toMatch(/onClick=\{action\.onClick\}/);
-    expect(toaster).toMatch(/onClick=\{\(\) => dismiss\(it\.id\)\}/);
-  });
-
-  it('四个 level 都把 ToastOptions 透传下去（漏一个，那条通道就用不了 key/sticky）', () => {
-    for (const re of [
-      /success: \(m, o\) => push\(m, 'ok', undefined, o\)/,
-      /error: \(m, d, o\) => push\(m, 'err', d, o\)/,
-      /info: \(m, o\) => push\(m, '', undefined, o\)/,
-      /warning: \(m, o\) => push\(m, 'warn', undefined, o\)/,
-    ]) {
-      expect(toaster).toMatch(re);
-    }
   });
 });

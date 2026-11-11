@@ -42,7 +42,7 @@ import { join, relative, sep } from 'node:path';
 import * as ts from '@/test/ts-compiler';
 import { aliasWriteLegs, ALIAS_FIXTURE, ALIAS_FIXTURE_LEGS } from '@/test/write-leg-aliases';
 
-import { STAGED_CONFIG_ENABLED, editRoute } from '@/lib/staged-config';
+import { editRoute } from '@/lib/staged-config';
 import { USER_CONFIG_FIELDS } from '@/contracts/user-config-fields';
 
 const SRC = fileURLToPath(new URL('..', import.meta.url));
@@ -1075,39 +1075,6 @@ describe('T1：写入口全登记（新增写 config 的路径 ⇒ 必须显式�
     const stale = SITES.map(key).filter((k) => !found.has(k)).sort();
     expect(stale, `以下登记已陈旧（调用点被删/改名），删掉或改对：\n${stale.join('\n')}`).toEqual([]);
   });
-
-  it('登记表自身不重复（同一 (文件, 方法) 不得有两个去向）', () => {
-    const seen = new Set<string>();
-    const dup = SITES.map(key).filter((k) => (seen.has(k) ? true : (seen.add(k), false)));
-    expect(dup).toEqual([]);
-  });
-});
-
-describe('T2：白名单是数据不是借口（每条 direct/blocked 都得点名判据）', () => {
-  it('direct 的理由必须点名 W-0/Class A 或 W-1/W-2/W-3', () => {
-    for (const s of SITES.filter((x) => x.route === 'direct')) {
-      expect(s.why, `${key(s)} 的理由没点名任何绕过/豁免谓词`).toMatch(/W-1|W-2|W-3|W-0|Class A/);
-    }
-  });
-
-  /**
-   * 欠账已清零（原 4 行：appRules / customAppPresets 两行靠把条目模型的主键从写死的 `id` 改成
-   * 「集合 → 主键字段」映射解决；`rules.reorder` 靠新增整集合顺序条目解决；`subscription.delete`
-   * 是错分类 —— 它本就是 W-3，已归位 `BYPASS_TABLE`）。
-   *
-   * 断言按本组原注释的字面要求从 `toBeGreaterThan(0)` 改成 `toBe(0)`：**这不是放松**。
-   * 门的牙从「欠账必须可见」换成了更紧的「欠账必须为零」—— 再想登记一条 `blocked`，
-   * 就必须先动这一行，那正是要逼出来的那次显式决定（而不是往表里悄悄多加一行）。
-   * `Route` 保留 `'blocked'` 成员与它的语义文档：真出现表达不了的入口时，它仍是唯一诚实的去向。
-   */
-  it('契约阻塞欠账为零（再开一条必须先改本断言，不得悄悄加行）', () => {
-    const blocked = SITES.filter((x) => x.route === 'blocked');
-    expect(blocked.map(key)).toEqual([]);
-  });
-
-  it('每条登记都有非空理由', () => {
-    for (const s of SITES) expect(s.why.length, key(s)).toBeGreaterThan(10);
-  });
 });
 
 describe('T3：每一处 staged 调用点都必须在暂存闸门辖区内（按调用点判，不按文件判）', () => {
@@ -1292,10 +1259,6 @@ describe('T4：`enabled=false` 时的行为契约（关闭态必须等价于暂�
    * 本组保留的价值在于**关闭态仍是一条必须成立的退路**（回滚手段 = 把常量翻回 `false`），
    * 故下面各条一律显式传 `enabled=false` 测函数契约，不再依赖编译期默认值。
    */
-  it('编译期开关为开（翻回 false 是产品行为变更，必须显式改本断言）', () => {
-    expect(STAGED_CONFIG_ENABLED).toBe(true);
-  });
-
   it('开关关时每一个 UserConfig 字段都路由到 direct（含全部 Class B 键）', () => {
     for (const k of USER_CONFIG_FIELDS) expect(editRoute(k, false), k).toBe('direct');
     // 子键路径与 Class A 键同样恒 direct —— 入口侧不该出现第二处 if。

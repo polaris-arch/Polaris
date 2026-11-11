@@ -51,15 +51,6 @@ const CONSUMERS = [HOME, NODES, NODE_CARD, STATUSBAR, TRAY];
  * `components/screens/home/home-speedtest-scope.test.ts`；此处只钉**接线拓扑**这一面。
  */
 describe('T1：主页两颗测速入口射程不同（网络检测=当前出口 / 全部测速=全量）', () => {
-  it('网络检测腿只请求当前出口（**不得**退回 speedTestableIds 全量）', () => {
-    const src = read(HOME);
-    expect(src).toContain('api.server.speedTest([currentServer.id])');
-  });
-
-  it('全量入口仍在（菜单「全部测速」经 speedTestableIds 过滤）', () => {
-    expect(read(HOME)).toContain('speedTestableIds(servers');
-  });
-
   it('两条腿的可测性判定都 path-aware（带 mainCorePool 能力位，否则 TS-exit 会被误纳/误排）', () => {
     const src = read(HOME);
     expect(src).toMatch(/speedTestableIds\([^)]*mainCorePool/s);

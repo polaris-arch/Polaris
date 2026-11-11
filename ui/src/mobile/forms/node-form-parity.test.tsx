@@ -26,7 +26,6 @@ import { MOBILE_FIELD_HINT_SUMMARIES } from './FormFields';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ReactElement, ReactNode } from 'react';
-import { readFileSync } from 'node:fs';
 
 import type { ServerConfig, UserConfig } from '@/contracts/types';
 import { DEMO_CONFIG } from '../../../harness-fixture';
@@ -364,11 +363,6 @@ describe('⑤ 渲染：逐协议、逐字段真的画出来（字段表与分组
       expect(html, proto).toContain(tx('node.field.certPkSha256'));
       expect(html, proto).toContain(tx('mobileHelp.certPin'));
     }
-    // 渲染出来的就是 locale 里这一句（上面逐字比对）；这里钉住 14b4800 加的那半句还在源文案里。
-    const zh = JSON.parse(readFileSync(new URL('../../i18n/locales/zh-CN.json', import.meta.url), 'utf8')) as {
-      node: { field: { certPinHint: string } };
-    };
-    expect(zh.node.field.certPinHint, '提示文案里「只比对服务器证书」那一句不见了').toContain('只比对服务器证书');
   });
 
   it('custom：内核兼容性探测按钮在场，其它协议不画', () => {

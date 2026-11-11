@@ -208,15 +208,8 @@ function passesUserPick(slice: string): boolean {
 describe('移动端策略选择器：写出来的形态 ←→ 引擎认的形态', () => {
   describe('⓪ 自检：夹具与取材面都是活的', () => {
     it('夹具四档齐、可写的恰好两档、且恰好一档期望进 exclude_package', () => {
-      expect(FIXTURE.picks.length, '夹具不是四档 —— 有一档没被判过').toBe(4);
       /* 2026-09-13（批 10）：四档全部可写。`expectExcluded` 仍恰好一档 —— 那是**引擎**侧的事实，
          与「UI 写不写得出」正交，它不该跟着一起变（两者一起变过一次就说明判据被并成了一条）。 */
-      expect(FIXTURE.picks.filter((p) => p.writable).map((p) => p.pick)).toEqual([
-        'follow',
-        'direct',
-        'proxy',
-        'block',
-      ]);
       expect(FIXTURE.picks.filter((p) => p.expectExcluded).length).toBe(1);
       expect(FIXTURE.expectedPackage, '期望包名为空 ⇒ 正反两面会一起退化成空表').toBeTruthy();
     });

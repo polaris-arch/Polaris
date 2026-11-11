@@ -99,20 +99,11 @@ fn asset_digest_is_optional_and_parses_when_present() {
 // ── 更新源常量 / URL ──────────────────────────────────────────────────────
 
 #[test]
-fn source_repo_constant_is_the_polaris_repo() {
-    // 更新源仓库是全链路的锚：改错 = 检查更新指向错误的 repo（拉不到或拉到别人的 release）。
-    assert_eq!(APP_UPDATE_REPO, ("polaris-arch", "Polaris"));
+fn releases_api_url_joins_owner_and_repo() {
     assert_eq!(
         github_releases_api_url("polaris-arch", "Polaris"),
         "https://api.github.com/repos/polaris-arch/Polaris/releases"
     );
-    // 便携资产前缀是三处（package.yml 产出 / 本模块选包 / verify-packaging.mjs 断言）
-    // 共用的命名契约，改它必须三处同改，故在此钉死字面值。
-    assert_eq!(PORTABLE_ZIP_SUFFIX, "x64-win-Portable.zip");
-    // Android APK 的尾缀同理，两处（android.yml 的 `release-apk` job 产出 / 本模块选包）
-    // 共用；下面 `the_ci_asset_name_is_exactly_what_the_selector_picks` 从 workflow 原文
-    // 反向对拍一次，这里只钉本侧的字面值。
-    assert_eq!(ANDROID_APK_SUFFIX, "arm64-v8a-android.apk");
 }
 
 #[test]

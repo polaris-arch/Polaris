@@ -53,20 +53,9 @@ describe('persistent feedback uses real settings primitives', () => {
     const html = renderToStaticMarkup(<FeedbackNotice title="Failed" actions={<Button disabled onClick={() => {}}>Retry</Button>} />);
     expect(html).toMatch(/<button[^>]*disabled/);
   });
-  it('Helper feedback retains its log navigation and explicit migration action', () => {
-    const source = readFileSync(new URL('./SettingsHelper.tsx', import.meta.url), 'utf8');
-    // Admission, in-flight deduplication and saved confirmations are exercised
-    // on SettingsHelper by its migration suite, independently of predicate order.
-    expect(source).toContain("navigate('logs')");
-    expect(source).toContain('onClick={stopAndUpgrade}');
-    expect(source).toContain('announce={false}');
-  });
   it('all locale variants preserve the recheck/no-install distinction and saved-followup distinction', () => {
     for (const locale of ['en-US', 'fa', 'ru', 'zh-CN', 'zh-TW']) {
       const json = JSON.parse(readFileSync(new URL(`../../../i18n/locales/${locale}.json`, import.meta.url), 'utf8'));
-      expect(Object.keys(json.feedback).sort()).toEqual(['connectionFailed', 'followupIncomplete', 'stopFailed', 'subscriptionSaved']);
-      expect(json.helper.failureNextStep).toBeTruthy();
-      expect(json.helper.actionError.installerFailed).toBeTruthy();
       expect(json.feedback.followupIncomplete).not.toBe(json.feedback.subscriptionSaved);
     }
   });

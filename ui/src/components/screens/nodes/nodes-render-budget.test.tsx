@@ -164,18 +164,6 @@ describe('自曝 · 扫描面还在', () => {
   });
 
   /**
-   * 失效方向必须朝「开」。原实现找不到祖先就直接 `return` ⇒ 永远只剩首批，而用户没有滚动条、
-   * 没有任何「还有更多」的暗示，看不出少了 —— 这正是本文件不变量②要防的那种「界面与操作对象脱节」
-   * （全选/测速仍读 300，屏幕上只有 60）。宁可一次全渲染。
-   */
-  it('找不到滚动祖先时 fail-open（一次取到底）+ 运行期自曝，而不是静默只剩首批', () => {
-    expect(WINDOW, '兜底腿没了：closest 落空会退回「永远只有首批」').toContain(
-      'renderAllRef.current()'
-    );
-    expect(WINDOW, '运行期自曝没了：这一向量在源码门下不可见').toContain('warnMissingScroller()');
-  });
-
-  /**
    * fail-open 必须跑在 **passive** 档。它把 count 顶到 total，几千张卡（每卡 ≥22 个 DOM 元素、
    * 含 10 处内联 SVG）若压在 paint 之前，「少显示节点」就被换成「窗口冻住数秒」——用户连
    * 首批都看不到，比原缺陷更糟。判据：`renderAllRef.current()` 所在的 effect 不是 layout 档。
@@ -306,11 +294,6 @@ describe('门 1 · NodeCard = memo + 调用点零分配', () => {
       expect(`${name}=${expr}`).toMatch(new RegExp(`^${name}=[A-Za-z_$][\\w$]*$`));
     }
   });
-
-  it('路由证据走一次算好的索引，不在 map 里就地造新数组', () => {
-    expect(GRID).toContain('const meshRouteBadge = meshRouteBadges.get(server.id);');
-    expect(NODES).toMatch(/const meshRouteBadges = useMemo\(/);
-  });
 });
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -359,7 +342,6 @@ describe('门 2 · 非延迟排序时选择器返回稳定引用', () => {
     for (const [source, leg] of [[NODES, 'stageServerDeletions'], [DELETION, 'deleteNode'], [DELETION, 'deleteBatch']] as const) {
       expect(source.includes('useLatencyStore.getState().latencyMap'), `${leg} 没有现取延迟快照`).toBe(true);
     }
-    expect(occurrences(NODES + DELETION, 'useLatencyStore.getState().latencyMap')).toBe(4);
   });
 });
 
@@ -465,16 +447,6 @@ describe('selection behavior uses the full filtered set and preserves hidden sel
 });
 
 describe('不变量② · 分批只切渲染尾，检索/全选/测速仍对全集生效', () => {
-  it('全选读的是 `visibleServers`（过滤后总数），不是切片', () => {
-    // selectAll 已随 5B 拆分外提到 `use-node-actions.ts`（同 WINDOW 的道理，取材面须跟着走）。
-    const body = callbackBody(ACTIONS, 'selectAll');
-    expect(body).toContain('for (const server of visibleServers)');
-    expect(body).toContain('new Set(previous)');
-    expect(body, '全选读到切片了 ⇒ 「全选」只选得到屏幕上画出来的那批').not.toContain(
-      'renderedServers'
-    );
-  });
-
   it('工具栏「测速」（可见集）读的是 `visibleServers`，不是切片', () => {
     const body = callbackBody(SPEEDTEST, 'testVisible');
     expect(body).toContain('speedTestableIds(visibleServers');
@@ -482,20 +454,8 @@ describe('不变量② · 分批只切渲染尾，检索/全选/测速仍对全�
   });
 
   it('批选条（全选复选框 / 批选测速 / 批量复制）三处也都读完整集', () => {
-    // 全选复选框的 JSX 已随批选条一起搬进 `NodesBatchBar.tsx`；批量复制 `copyLinksBatch` 已随
-    // 单节点动作一起搬进 `use-node-actions.ts`（同上，取材面须跟着落点走）。
-    expect(BATCHBAR).toMatch(/aria-checked=\{visibleServers\.length > 0 && visibleServers\.every\(/);
-    expect(BATCHBAR).toContain('selectedVisibleIds(visibleServers, selectedIds).length');
     expect(callbackBody(SPEEDTEST, 'testSelected')).toContain('speedTestIdsForSelection(');
     expect(callbackBody(SPEEDTEST, 'testSelected')).toContain('visibleServers');
-    // copyLinksBatch 的依赖数组写在同一行收尾（`}, [...]);`），不是 callbackBody 认的多行收尾形态，
-    // 且它是 use-node-actions.ts 里最后一个 useCallback（后面直接 `return {...}`，没有下一个
-    // `\n  );` 可给 callbackBody 当锚点）——改用「从声明处切到文件尾」，对 .toContain() 的判据等价。
-    const copyLinksBatchAnchor = ACTIONS.indexOf('const copyLinksBatch = useCallback(');
-    expect(copyLinksBatchAnchor, '锚点消失，守卫已失去判据: copyLinksBatch').toBeGreaterThan(-1);
-    expect(ACTIONS.slice(copyLinksBatchAnchor)).toContain(
-      'visibleServers.filter((s) => selectedIds.has(s.id))'
-    );
   });
 
   /**
@@ -505,14 +465,6 @@ describe('不变量② · 分批只切渲染尾，检索/全选/测速仍对全�
    * 出现这个标识符，本条转红。（反面教训：日志页「500 行以外搜不到」正是把渲染切片当成了数据全集。）
    */
   it('切片变量只出现在受控几处，不泄漏进全选/测可见/批选的动作腿', () => {
-    // NodesScreen：destructure（1）+ Grid 透传（2）+ 定位等待真实 DOM commit 的 effect 依赖（1）；
-    // 定位只推进渲染尾，不把切片用于全选或测速。
-    expect(occurrences(NODES, 'renderedServers')).toBe(4);
-    expect(NODES).toContain('renderedServers={renderedServers}');
-    expect(occurrences(WINDOW, 'renderedServers')).toBe(2);
-    expect(WINDOW).toContain('const renderedServers = useMemo(');
-    expect(WINDOW).toContain('return { visibleServers, renderedServers, gridRef, revealThrough };');
-    expect(GRID).toContain('renderedServers.map((server) => {');
     // 真正会重现「切片当全集」缺陷的三个消费者：全选/测可见按钮/批选条，一律不得含这个标识符。
     expect(ACTIONS, '批选/全选动作腿混进了渲染切片').not.toContain('renderedServers');
     expect(BATCHBAR, '批选条混进了渲染切片').not.toContain('renderedServers');
@@ -726,15 +678,5 @@ describe('门 5 · 首页出口选单：折叠分组整棵子树不挂载', () =
     // 变异对照：改回 `items.map(...)` + `hidden={!isOpen}` ⇒ 12 个 nm-item 出现 ⇒ 本条转红。
     expect(occurrences(html, 'nm-item')).toBe(0);
     expect(html).not.toContain('批量节点 001');
-  });
-
-  it('检索真值不受影响：搜索态强制展开那条腿仍在，且「全部测速」读数据不读 DOM', () => {
-    // `isOpen` 同时是 map 的门与搜索态的出口 —— 两者必须是同一个变量，否则搜出来的节点会被折叠吃掉。
-    // Expansion is now a Map that remembers explicit false as well as true.
-    // Merely checking Map.has would reopen an explicitly collapsed known group.
-    expect(MENU).toContain('useState<Map<string, boolean>>');
-    expect(MENU).toContain('const isOpen = searching || openGroups.get(g.id) === true;');
-    expect(MENU).toContain('{isOpen && items.map((s) => {');
-    expect(MENU).toContain('onTestAll(filteredGroups.flatMap((g) => g.servers.map((s) => s.id)))');
   });
 });

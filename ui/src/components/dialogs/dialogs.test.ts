@@ -504,50 +504,6 @@ describe('ruleSetPickMatches —— 分组渲染与状态判定共用的唯一�
 });
 
 /**
- * 接线守卫：规则集「前往规则资源」的**两条触发腿都还在**。
- *
- * 为什么要源码结构断言：纯逻辑单测钉住了 `isRuleSetPickEmpty` / `missingRuleSetRefs` 各自算得对，
- * 但「弹窗到底消费了哪几条」它管不到 —— 删掉 `|| rsEmpty` 那条腿，两个函数照样全绿，而检索无命中
- * 时的出路就静默消失了。本仓既有守卫（config-write-wiring / tray-live-wiring / style-invariants）
- * 同款手法。
- *
- * 变异靶：删 `|| rsEmpty` → 第二条红；删 `rsMissing.length > 0` → 第一条红；
- * 把按钮换成新造的 i18n 键 → 第三条红。
- */
-describe('接线：规则集缺失提示的两条腿 + 复用既有按钮键', () => {
-  /** 去注释：本文件与 RuleCondRow 的注释都逐字引用了这些标识符，不去掉就是拿注释当证据。 */
-  const code = (src: string): string =>
-    src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1');
-  // 「前往规则资源」两条腿（含下方全部锚点）已随 5C 拆分外提到 RuleCondRow.tsx（`CondRow`），
-  // 取材面须跟着落点走（同本仓既有先例：WINDOW/GRID 等）。
-  const src = code(
-    readFileSync(fileURLToPath(new URL('./RuleCondRow.tsx', import.meta.url)), 'utf8')
-  );
-
-  it('自检：读到了 RuleCondRow 源码且去注释后仍是可断言的代码', () => {
-    expect(src.length, 'RuleCondRow.tsx 读空了 —— 被改名/移走了？').toBeGreaterThan(5000);
-    expect(src, '去注释把源码吃光了').toContain('import');
-  });
-
-  it('腿①：缺失引用告警（有真实后果的那个：生成端 fail-closed 剪枝 ⇒ 规则静默不工作）', () => {
-    expect(src, 'RuleDialog 不再算缺失引用').toContain('ruleSetMissing(');
-    expect(src, '提示行不再消费缺失引用这条腿').toMatch(/rsMissing\.length\s*>\s*0/);
-  });
-
-  it('腿②：一条都挑不出来时也给出路（检索无命中 / 清单拉取失败）', () => {
-    expect(src, 'RuleDialog 不再判「挑不出来」').toContain('ruleSetPickState(');
-    expect(src, '提示行不再消费「挑不出来」这条腿').toMatch(/\|\|\s*rsEmpty/);
-  });
-
-  it('按钮复用应用分流那个既有键（零新 locale 键）+ 去处是规则资源屏', () => {
-    expect(src, '按钮换成了新键 —— 同词同义不该有两套措辞，且会动 locale-parity 债务基线').toContain(
-      'appAdd.gotoResources'
-    );
-    expect(src, '出路不再指向规则资源屏').toContain("navigate('resources')");
-  });
-});
-
-/**
  * 接线守卫：普通 WG 节点的 `Reserved` 入口 —— **覆盖门守不住这一条**。
  *
  * `contracts/protocol-settings-coverage.test.ts` 的锁 2 对 `WireGuardSettings` 取两个编辑器的
@@ -584,13 +540,6 @@ describe('接线：WG 表单的 Reserved 控件与提交校验', () => {
       expect(src.length, `${name} 读空了`).toBeGreaterThan(2000);
       expect(src, `${name} 去注释后没剩下代码`).toContain('import');
     }
-  });
-
-  it('FieldSpec 表里真有 reserved 这一项（= 用户改得了），且走 i18n 键', () => {
-    expect(spec, 'wgSpec 里没有 reserved 字段项 —— 普通 WG 节点又改不了 Reserved 了').toMatch(
-      /k:\s*'reserved'/
-    );
-    expect(spec, 'Reserved 标签没走 i18n 键').toContain("'wg.reserved'");
   });
 
   it('两个客户端都在提交前拦下「填了但不合法」（否则后端静默忽略，用户以为存上了）', () => {

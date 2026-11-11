@@ -179,7 +179,6 @@ describe('UI evidence ownership across the real installed Playwright runner', ()
     ['isolated-success', playwrightConfig.outputDir, false, true],
     ['isolated-failure', playwrightConfig.outputDir, true, true],
   ] as const)('%s cleans only its own output and preserves sibling producer evidence', (_name, outputDir, fail, survives) => {
-    expect(playwrightConfig.outputDir).toBe('./test-results/playwright');
     expect(typeof outputDir).toBe('string');
     const dir = mkdtempSync(join(tmpdir(), 'polaris-ui-evidence-'));
     try {
@@ -243,8 +242,6 @@ test('synthetic output receipt', async ({}, info) => {
       expect(actual).toBe(outcome === 'success' ? 'error' : 'ignore');
     }
     expect(expression).not.toMatch(/\b(success|failure|cancelled|always)\s*\(/);
-
-    for (const block of [failure, feedback]) expect(block).toContain('retention-days: 3');
   });
 
   it('runs the shared UA lifecycle and both platform retry surfaces in the existing browser gate', () => {

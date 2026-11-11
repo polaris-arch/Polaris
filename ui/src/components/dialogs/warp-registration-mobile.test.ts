@@ -82,5 +82,4 @@ it('mobile workers validation uses the desktop predicate before registration or 
   expect(guard).toBeGreaterThan(0);
   expect(guard).toBeLessThan(mobile.indexOf('const r = await api.server.applyWarpLicense'));
   expect(guard).toBeLessThan(mobile.indexOf('const registered = await registerWarpIfSlotFree'));
-  expect(mobile).toContain('workersInputInvalid(draft.workers) && <p className="m-form-err" role="alert">');
 });

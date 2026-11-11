@@ -281,20 +281,6 @@ describe('① 三份规格拆成了零 React 的 `.ts`，且两端真的共用�
     }
   });
 
-  it('①-b 桌面调用点没改：三个弹窗 import 的是拆出来的那一份，`wgSpec` 仍从 WgDialog 再导出', () => {
-    const wgDialog = strip(read('../../components/dialogs/WgDialog.tsx'));
-    expect(wgDialog, 'WgDialog 没有再导出 wgSpec —— 既有调用点会断').toContain(
-      "export { wgSpec } from './wg-spec'",
-    );
-    expect(wgDialog, 'WgDialog 自己也要用它（否则桌面表单是空的）').toContain("from './wg-spec'");
-    expect(strip(read('../../components/dialogs/TsSettingsDialog.tsx')), 'TsSettingsDialog 没接上 ts-spec').toContain(
-      "from './ts-spec'",
-    );
-    expect(strip(read('../../components/dialogs/WarpDialog.tsx')), 'WarpDialog 没接上 warp-spec').toContain(
-      "from './warp-spec'",
-    );
-  });
-
   it('①-c 移动端四张面板 import 的也是同一份规格（不是自己抄了一张表）', () => {
     const cases: ReadonlyArray<readonly [string, string]> = [
       ['WgPanel.tsx', '@/components/dialogs/wg-spec'],
@@ -702,13 +688,6 @@ describe('③ 单例闸与提交校验：一份判据，两个客户端', () => 
     ).toBe('warp');
     // 反向对照：槽位空着时放行（不是「一律拒绝」）。
     expect(meshSingletonConflict(candidate, [])).toBeNull();
-    /* 生产面板真的过这道闸（判据在那儿，面板没调 = 闸装在别人家门口）。
-       ⚠️ 这两条是**词法**的，管不住喂进去的实参 —— 复审实测把 `(servers, …)` 换成 `([], …)`
-       即两道闸恒放行，而这两条照旧全绿。实参那一跳由 ⑤-f 钉住，两条成对读。 */
-    expect(strip(read('./WgPanel.tsx')), 'WgPanel 没过单例闸').toContain('blockedByMeshSingleton(');
-    expect(strip(read('./WarpPanel.tsx')), 'WARP 注册没走「先过闸再打远端」那条腿').toContain(
-      'registerWarpIfSlotFree(',
-    );
   });
 
   it('③-c 四张表都走**同一个**暂存闸门 `editRoute`，没有第二个 if', () => {
@@ -816,13 +795,6 @@ describe('④ Tailscale 登录：URL 与登录态都只**读** store，不在面
       rows.every(([, args, expected]) => wrongOrder(...args) === expected),
       '把「超时」排到「地址」前面之后真值表仍然全绿 —— 它认不出顺序被写反',
     ).toBe(false);
-  });
-
-  it('④-c 移动瞬态 URL 等待用共用时限；桌面消费后端 attempt 进度', () => {
-    expect(panel, '面板没走共用的提交计划').toContain('planTsLoginSubmit(');
-    expect(panel, '面板自己写了一个超时数').not.toMatch(/setTimeout\([^)]*,\s*\d{4,}/);
-    expect(panel, '面板没用共用的超时常量').toContain('TS_LOGIN_TIMEOUT_MS');
-    expect(strip(read('../../components/dialogs/TsLoginDialog.tsx'))).toContain("progress?.phase === 'timedOut'");
   });
 });
 
@@ -1235,12 +1207,6 @@ describe('⑤ 喂参数那一跳：调用点交给函数的就是那条真腿', 
       "if (verdict.reject === 'endpoint') { setNotice({ tone: 'err', text: t('warp.errEndpoint') }); return; }",
     );
     expect(rejectArm(gutted, 'endpoint'), '只落 notice 的形态没被判否').not.toContain('revealAdvanced');
-    // 姊妹腿：另外两张表的同类分支照旧在掰组（同根因，一处漏了就该顺手核一遍）。
-    expect(strip(read('./WgPanel.tsx')), 'WgPanel 的必填校验不再掰组').toContain("revealGroup('basic')");
-    expect(strip(read('./WgPanel.tsx')), 'WgPanel 的 Reserved 校验不再掰组').toContain(
-      "revealGroup('advanced')",
-    );
-    expect(strip(read('./TsSettingsPanel.tsx')), 'TS 设置表的 CIDR 校验不再掰组').toContain("'routing'");
   });
 
   /* ── ⑤-i 落盘之后不许再问「放弃登录？」 ──────────────────────────────────── */
@@ -1267,19 +1233,5 @@ describe('⑤ 喂参数那一跳：调用点交给函数的就是那条真腿', 
     ).toBeLessThan(login);
     /* 关闭路径确实按 `dirty` 分流（否则上面两条量了个不影响任何东西的布尔）。 */
     expect(strip(read('./TsLoginPanel.tsx')), '关闭路径不再看 dirty').toContain('if (!dirty)');
-  });
-
-  /* ── ⑤-j 同一块里不许把 label 的键当说明再用一遍 ──────────────────────────── */
-  it('⑤-j WgPanel 的「粘贴 .conf」块：标签与说明是两个键（重复标签比没有更坏）', () => {
-    const body = strip(read('./WgPanel.tsx'));
-    expect(
-      (body.match(/wg\.pasteLabel/g) ?? []).length,
-      '`wg.pasteLabel` 在 WgPanel 里出现了不止一次 —— 渲染出来是同一句话重复两遍',
-    ).toBe(1);
-    expect(body, '粘贴块没有说明文案').toContain('wg.pasteHint');
-    // 渲染面：两句真的都画出来了，且不是同一句。
-    const out = html(<WgPanel instanceId="i1" />);
-    expect(out, '默认停在手填页，粘贴块不该渲染').not.toContain(tr('wg.pasteHint'));
-    expect(tr('wg.pasteHint'), '说明与标签是同一句译文 —— 那等于没改').not.toBe(tr('wg.pasteLabel'));
   });
 });

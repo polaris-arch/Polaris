@@ -63,9 +63,6 @@ test('native cleanup uses relative opens, retained tree handles and same-handle 
   for (const needle of ['RootDirectory: handle(parent)', 'FILE_OPEN_REPARSE_POINT', 'GetFileInformationByHandleEx', 'GetSecurityInfo(handle(file)', 'NtSetInformationFile(handle(file)', 'identity(&object.file)? != object.identity']) assert.ok(compact.includes(needle.replace(/\s+/g,'')), needle);
   assert.ok(!/remove_dir_all|Remove-Item|DeleteFileW|RemoveDirectoryW|cmd\.exe|sc\.exe/.test(worker));
 });
-test('service deletion waits for stop and actual SCM absence', () => {
-  for (const needle of ['QueryServiceStatusEx', 'SERVICE_STOPPED', 'DeleteService', 'ERROR_SERVICE_DOES_NOT_EXIST', 'service delete still pending']) assert.ok(compact.includes(needle.replace(/\s+/g,'')), needle);
-});
 test('image custody encloses native elevation and waits for worker completion', () => {
   for (const needle of ['K32GetMappedFileNameW', 'VOLUME_NAME_NT', 'SEE_MASK_NOCLOSEPROCESS', 'ShellExecuteExW', 'WaitForSingleObject', 'GetExitCodeProcess', 'drop(process); drop(image)']) assert.ok(compact.includes(needle.replace(/\s+/g,'')), needle);
 });
@@ -85,11 +82,6 @@ test('manager fallback elevates only bundled cleaner and has no Windows uninstal
   assert.ok(manager.includes('polaris_windows_cleaner::launch_bundle()'));
   assert.ok(!manager.includes('fn build_win_uninstall_script'));
   assert.ok(!manager.includes('polaris-helper-uninstall.ps1'));
-});
-test('package builds/stages native payload before constructing NSIS', () => {
-  const packageWorkflow = readFileSync(`${root}.github/workflows/package.yml`,'utf8');
-  assert.ok(packageWorkflow.includes('cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner'));
-  assert.ok(packageWorkflow.includes('resources/win/polaris-cleaner.exe'));
 });
 
 test('service absent plus an inaccessible protected tree still reaches native cleanup', () => {

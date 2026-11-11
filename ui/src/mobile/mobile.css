@@ -68,9 +68,8 @@ body *::-webkit-scrollbar { display: none; }
    * 不需要 —— manifest 的 `dimensions` 只登记了 `indicatorHeight: 2`，**没有登记宽度**，
    * 故指示条宽度的唯一真值源就是原型。
    *
-   * 这段注释**不是**判据：md 那两行仍旧写着 24 与 40（已在 kit 里就地标注为错，但 kit 在
-   * `~/docs` 的 vault 里、不进本仓版本控制）。承重的那半是
-   * `bottom-navigation-kit-conflict.test.ts` —— 把下面两个值改回 md 那一版会当场转红。
+   * md 那两行仍旧写着 24 与 40（已在 kit 里就地标注为错，但 kit 在
+   * `~/docs` 的 vault 里、不进本仓版本控制）。
    */
   --nav-h: 64px;
   --nav-icon: 23px;
@@ -240,8 +239,7 @@ body {
   /* 顶分隔取 `border.subtle`(`--line`)，**不是** `divider.default`(`--hair`)：原型
    * `mobile-home-breakpoints.html:156` 写的是 `border-top:1px solid hsl(var(--line))`，
    * 与 `bottom-navigation.md` 的 Colors/tokens →「Top divider: `divider.default`」冲突
-   * ⇒ 原型胜（kit README）；那一行已在 kit 里就地标注为错，判据在
-   * `bottom-navigation-kit-conflict.test.ts`。
+   * ⇒ 原型胜（kit README）；那一行已在 kit 里就地标注为错。
    * 取 `--hair` 会让这条线重一档（深色 L 28% vs 23%、浅色 L 83% vs 87%），
    * 导航区与内容区之间的切分显得比设计稿更硬。 */
   border-top: 1px solid hsl(var(--line));
@@ -563,7 +561,7 @@ body {
   /* 未选中取 `text.tertiary`(`--fg-faint`)，**不是** `text.secondary`(`--fg-dim`)：原型
    * `mobile-home-breakpoints.html:160` 的 `.nav a{…color:hsl(var(--fg-faint))}` 压过
    * `bottom-navigation.md` 的 Colors/tokens →「Inactive: `text.secondary`」（原型胜，见 kit
-   * README）；那一行已在 kit 里就地标注为错，判据在 `bottom-navigation-kit-conflict.test.ts`。
+   * README）；那一行已在 kit 里就地标注为错。
    * 取 `--fg-dim` 会把四个未选中项抬亮一档（深色 L 66% vs 48%），选中项那抹 `--flow`
    * 与其余四项的明度差被压窄 ——「现在在哪一屏」正是靠这个差一眼读出来的。 */
   color: hsl(var(--fg-faint));

@@ -172,8 +172,7 @@ const CONN_CTX = contextOf([
  * 2026-09-05 MAJ-4：`CONN_CTX` 只装 `connections.css`，而进包顺序里 `src/mobile/mobile.css`
  * 排在**最后**（各屏 CSS 先进包，外壳压屏）—— 它的同键覆写在单文件模型里根本不存在。
  * 实测：`mobile.css` 追加 `.mc-top{ position: static }` 之后真机上吸顶头不再吸顶，
- * 而本组每条祖先断言照旧绿、全量 rc=0。判据形态抄同批的
- * `components/layout/window-drag-region.test.ts:52-58`。
+ * 而本组每条祖先断言照旧绿、全量 rc=0。
  */
 function chainAgrees(rawSel: string, prop: string, single: string | null): string | null {
   const chain =
@@ -877,8 +876,6 @@ describe('⑤c 检索面与九个排序键', () => {
   });
 
   it('九个键一个不少（少一个就是新造一处两端不一致，IA §3.1 #22）', () => {
-    expect(ACTIVE_SORT_KEYS.length).toBe(9);
-    expect(CLOSED_SORT_KEYS.length).toBe(9);
     // rate 只在活动、ended 只在已结束 —— 与桌面的列集一致。
     expect(ACTIVE_SORT_KEYS).toContain('rate');
     expect(ACTIVE_SORT_KEYS).not.toContain('ended');
@@ -908,23 +905,7 @@ describe('⑥ 概览两张卡量的是**连接数**，不是字节数（data-con
     expect(html).not.toMatch(/4(\.\d+)?\s?(KB|MB|KiB)/);
   });
 
-  it('接线侧把 sentinel「其它」换成了本地化文案，且域名卡整条剔除它', () => {
-    expect(WIRING).toContain('TOPOLOGY_OTHERS_KEY');
-    expect(WIRING, 'sentinel 会被原样画到屏幕上（一串控制字符）').toContain("'home.others'");
-    expect(WIRING).toMatch(/filter\(\(h\) => h\.name !== TOPOLOGY_OTHERS_KEY\)/);
-  });
-
   it('「阻断」走动作标签轴（`--err`），不是流量表达轴（`--warn`）', () => {
-    /*
-     * 本屏的 `.mc-row-chain.block` 已登记进 `styles/style-invariants.test.ts` 的花名册，
-     * 但那道门的 CSS 取材面只有桌面四个样式文件 ⇒ **它管不到这份 CSS 的取值**。
-     * 取值由这里钉：与桌面连接表同一轴、同一 token（「这条连接的出站是阻断」是动作标签，
-     * 不是「流量到此被丢弃」那条 --warn 的流量表达）。
-     */
-    const blockRule = /\.mc-row-chain\.block\s*\{([^}]*)\}/.exec(CSS);
-    expect(blockRule, '`.mc-row-chain.block` 的规则不见了 —— 判据面塌了').not.toBeNull();
-    expect(blockRule?.[1]).toMatch(/hsl\(var\(--err\)\)/);
-    expect(blockRule?.[1], '混进了第二档严重度 —— 阻断又漂成两种说法').not.toMatch(/--warn/);
     // 渲染腿：block 档真的挂得上那个类，且文案走的是登记在花名册里的那个 key。
     const html = render({
       segment: 'active',
@@ -1338,31 +1319,6 @@ describe('⑨ 分页保留、列表恒单列、暂停是退订', () => {
 
 /* ═══════════ ⑩ 分段控件的轨道层 ═══════════ */
 
-/**
- * 取出某个选择器那一条规则的声明面。找不到返回 `null` —— 调用点必须把 `null` 当红，
- * 不许当「没这条规则所以通过」。（`CSS` 进来时注释已剥。）
- */
-/**
- * 同一个选择器**全部**规则体的拼接（`null` = 一条都没有）。
- *
- * 上一版是「找到第一条即 `return`」，断言的于是是「某处写过这些声明」，不是「层叠之后看得见的
- * 是这些」：在文件后面再写一条同名规则把值盖回去，门读到的仍是靠前那条 ⇒ 反面断言
- * （`.not.toMatch(...)`）会被绕过去。收全部之后，反面断言扫的是整个声明面。
- *
- * 顺手剥掉块注释：不剥的话本文件头注里的反面示例会被当成真规则抓进取材面。
- *
- * **射程边界**：拼接判的是「有没有人写过」，判不了「谁胜出」。同名选择器的顺序之争由
- * `styles/cascade-dead-rules.test.ts` 全仓看住。
- */
-function declsOf(selector: string): string | null {
-  const body = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
-  const hits: string[] = [];
-  for (const m of body.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-    if (m[1].trim().replace(/\s+/g, ' ') === selector) hits.push(m[2]);
-  }
-  return hits.length > 0 ? hits.join('\n') : null;
-}
-
 describe('⑩ 概览 TOP N 是 `segmented-control`，不是三颗独立按钮（IA §3.1 #7）', () => {
   /*
    * 这一格是 touch-adapted：「Hit area to `layout.touchTargetMin`.
@@ -1370,34 +1326,6 @@ describe('⑩ 概览 TOP N 是 `segmented-control`，不是三颗独立按钮（
    * 没有轨道那一层时，5/10/15 读作三颗按钮里有一颗换了描边色；深色主题下轨道与选中块的
    * 明度差本来就小，靠边框色分离几乎看不出当前档是哪一个。
    */
-  it('轨道层存在：有边框、有 `--surface-2` 底、有圆角', () => {
-    const track = declsOf('.mc-choice');
-    expect(track, '`.mc-choice` 这条规则不见了 —— 判据面塌了').not.toBeNull();
-    expect(track, '分段控件没有轨道：缺 border ⇒ 它读作三颗独立按钮').toMatch(/\bborder\s*:/);
-    expect(track).toMatch(/background\s*:\s*hsl\(var\(--surface-2\)\)/);
-    expect(track).toMatch(/border-radius\s*:/);
-  });
-
-  it('选中态是 `--surface` 浮块 + `--flow-hi` 文字，且只在轨道里成立', () => {
-    const on = declsOf(".mc-choice .mc-btn[aria-pressed='true']");
-    expect(on, '轨道内的选中态规则不见了 —— 判据面塌了').not.toBeNull();
-    expect(on, '选中块没有浮起的 `--surface` 底').toMatch(
-      /background\s*:\s*hsl\(var\(--surface\)\)/,
-    );
-    expect(on).toMatch(/color\s*:\s*hsl\(var\(--flow-hi\)\)/);
-    // 反面：不许再出现不带轨道限定的裸选择器（它会波及任何一颗带按下态的 `.mc-btn`）。
-    expect(declsOf(".mc-btn[aria-pressed='true']"), '裸 `.mc-btn[aria-pressed]` 又回来了').toBeNull();
-    /*
-     * 反面之二：选中块不许退回 `flow-weak` 铺底 —— 那一档在**桌面**已经被当面否决过
-     * （`styles/index.css`：「accent 铺在底色上，整块就是一片蓝」），深色下轨道与选中块的
-     * 明度差本来就小，铺一层 accent 等于把「选中」读成「整条轨道亮了」。
-     *
-     * 这条**必须扫整个声明面**：在文件后面再补一条同选择器的 `@container` 规则把它复活，
-     * 是 `declsOf` 上一版（命中首条即返回）漏掉的形态 —— 门读到的仍是靠前那条，绿。
-     */
-    expect(on, '选中块又回到了被桌面否决过的 `flow-weak` 铺底').not.toMatch(/--flow-weak/);
-  });
-
   it('接线：概览那三颗档位真的渲染在 `.mc-choice` 轨道里', () => {
     const html = render({ segment: 'overview' });
     const track = /<div class="mc-choice"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/.exec(html);

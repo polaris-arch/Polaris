@@ -26,13 +26,11 @@ class ToolchainTests(unittest.TestCase):
     def test_checked_in_formal_contract_without_toolchain(self):
         contract = json.loads((HERE.parent / 'desktop-core/historical-release-contract-577d4b9.json').read_text(encoding='utf-8'))
         source = contract['platforms']['win']['sourceCommit']
-        self.assertEqual(source, '577d4b9a089b71d2f0a4ca334b87264b55c10478')
         self.assertEqual(resolve(MOD, 'formal', source, contract)['selectedCompiler'], 'go1.25.5')
 
     def test_current_upstream_formal_uses_exact_native_producer_fact(self):
         contract = json.loads((HERE.parent / 'desktop-core/release-contract.json').read_text(encoding='utf-8'))
         source = contract['sourceCommit']
-        self.assertEqual(source, 'd8727ed53de26cfd13c95f96d0a69235792d221b')
         mod = b'module github.com/sagernet/sing-box\ngo 1.27.0\ntoolchain go1.27.2\n'
         self.assertEqual(resolve(mod, 'formal', source, contract, 'go1.27.2')['selectedCompiler'], 'go1.27.2')
         for key, bad in [('sourceCommit', 'b' * 40), ('sourceTree', 'b' * 40),

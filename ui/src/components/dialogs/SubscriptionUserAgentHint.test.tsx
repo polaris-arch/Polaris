@@ -105,11 +105,6 @@ it('desktop and mobile share the read model and use their own scanned controls w
     const source = readFileSync(url, 'utf8');
     expect(source).toContain('useSubscriptionUserAgent(ua)');
     expect(source).toContain(`<${hint}`);
-    expect(source).toContain("uaInfo.info.fallbackUserAgent : t('sub.uaPh')");
-    expect(source).toContain("useState(base?.userAgent ?? '')");
-    expect(source).toContain(url.pathname.endsWith('/SubDialog.tsx')
-      ? "ua.trim() || undefined" : "ua.trim() === '' ? undefined : ua.trim()");
-    expect(source).toContain("t('common.optional')");
     expect(source).not.toMatch(/setUa\(.*(?:defaultUserAgent|effectiveUserAgent|fallbackUserAgent)/);
   }
 });

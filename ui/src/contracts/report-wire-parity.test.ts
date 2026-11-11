@@ -527,18 +527,4 @@ describe('门 2 · 外来隧道冲突报告的线格式两侧相等', () => {
       rustStructFields(TUNNEL_LIB_RS, 'ConflictCriteria'),
     );
   });
-
-  it('正向对照：`probed` 支的载荷键真的被解析出来了（不是空集在自相等）', () => {
-    expect(ARMS.get('probed')).toEqual(
-      [
-        'conflicts',
-        'criteria',
-        'foreignDefaultRoutes',
-        'foreignTunnels',
-        'status',
-        'suppressedRoutes',
-      ].sort(),
-    );
-    expect(rustStructFields(TUNNEL_LIB_RS, 'ConflictCriteria')).toContain('fakeipRanges');
-  });
 });

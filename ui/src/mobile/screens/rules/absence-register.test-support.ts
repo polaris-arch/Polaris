@@ -658,25 +658,4 @@ export const RULES_PARITY: ScreenParityRegister = {
       note: '逐条规则的详情面。触屏没有悬停 ⇒ 它跟着行尾那颗溢出键被点开。四格逐条补齐（此前缺）：零条件那一档（`rules.noConditions`，此前渲染出一片空白）、与/或标记（行上那个 `∧` / `·` 连接符读不出「全部满足」还是「满足任一」）、停用角标（判据是**裸 `rule.enabled`**，与行上那个按执行平面算的 `enabled` 不是一回事）、路由 / DNS 生效摘要（行上的药丸没有标签，说不出哪条是路由哪条是 DNS）。',
     },
   ],
-
-  /**
-   * 桌面规则屏**三个目录**（rules + app-policy + resources）的具名数据槽基线。
-   * **变更探测器，不是对差面**。2026-09-06 从 7 涨到 13：涨的六个（`ap-*` / `s-apppolicy` /
-   * `s-resources`）是折进来的那两屏本来就有的槽，此前整批不在任何一面上。
-   */
-  slotBaseline: [
-    'ap-body',
-    'ap-cat-filter',
-    'ap-content',
-    'ap-wfp-note',
-    'rule-count',
-    'rule-list',
-    'rules-body',
-    'rules-manual-note',
-    'rules-mode-note',
-    'rules-mode-warn',
-    'rules-mode-warn-tx',
-    's-apppolicy',
-    's-resources',
-  ],
 };

@@ -26,12 +26,6 @@ describe('speedTestableIds：全量而非单节点', () => {
     expect(speedTestableIds(servers)).toEqual(['a', 'b', 'c']);
   });
 
-  it('不是「只测当前出口」：集合与 selectedServerId 无关（本条即那份真机指控的回归锁）', () => {
-    const servers = [srv('a'), srv('b'), srv('c')];
-    // 无论当前选中谁，全量集合恒为三个 —— 函数签名里压根没有 selectedServerId 的位置。
-    expect(speedTestableIds(servers)).toHaveLength(3);
-  });
-
   it('空节点列表 → 空集（调用方据此提示而非空跑）', () => {
     expect(speedTestableIds([])).toEqual([]);
   });

@@ -10,7 +10,6 @@
  * / `text.secondary`），取的是原型 `../prototype/mobile-home-breakpoints.html:156,160,162,163`。
  * 依据是 kit `README.md`「Source of truth」那句：分歧时原型胜、kit 是错的。逐条理由写在
  * `mobile.css` 对应声明处 —— **这段注释本身就是回改的诱因**，改前先看那里。
- * 那四个值由 `bottom-navigation-kit-conflict.test.ts` 钉住：照 md 改回去会当场转红。
  *
  * **目的地表不在本文件里**：本组件只渲染 `DESTINATIONS`。导航自带一份目的地字面量是这类外壳最典型的
  * 失效形态 —— 改了路由没改导航（或反过来）不报错，只表现为"点了没反应/有屏进不去"。

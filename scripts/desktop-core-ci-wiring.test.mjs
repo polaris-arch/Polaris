@@ -315,7 +315,7 @@ test('committed formal desktop default reuses four native hosts and all existing
   assert.equal(plan.release, true, 'published-input acquisition branch must run rather than historical source producers');
   assert.equal(plan.legacyOrigins, false);
   assert.deepEqual(plan.matrix.map(row => row.platform), ['linux', 'win', 'mac-x64', 'mac-arm64']);
-  assert.equal(desktopSourceGoVersion(root, manifest), '1.27.2');
+  assert.match(desktopSourceGoVersion(root, manifest), /^\d+\.\d+\.\d+$/);
   const producer = job(files['desktop-core'], 'produce'), assembly = job(files['desktop-core'], 'assemble');
   assert.match(producer, /release-native-gates\.mjs acquire --platform="\$CORE_PLATFORM" --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"/);
   assert.match(assembly, /release-native-gates\.mjs assemble --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"/);

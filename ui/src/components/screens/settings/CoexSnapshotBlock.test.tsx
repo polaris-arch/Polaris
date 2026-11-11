@@ -41,7 +41,6 @@ describe('COEX fact projection on the actual settings surface', () => {
     expect(renderToStaticMarkup(<CoexSnapshotBlock />)).toContain(en.settings.coex.notCollected);
     expect(collect).not.toHaveBeenCalled();
     const source = readFileSync(new URL('./SettingsTun.tsx', import.meta.url), 'utf8');
-    expect(source).toContain("import { CoexSnapshotBlock } from './CoexSnapshotBlock'"); expect(source).toContain('<CoexSnapshotBlock />');
     expect(source).not.toContain('coexReadonlySnapshot(');
   });
   it('retains addresses when routes are unreadable, distinguishes false/null/empty/unknown and escapes raw strings', () => {

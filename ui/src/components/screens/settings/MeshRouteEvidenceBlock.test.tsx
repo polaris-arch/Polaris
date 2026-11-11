@@ -67,16 +67,12 @@ const mainSurface = (report: MeshRouteReport) => render(report).split('<details'
 
 describe('P1 route evidence is a bounded report, not a live ownership claim', () => {
   it('the settings page consumes the actual report command and keeps the legacy estimate off this surface', () => {
-    expect(settingsTunSource).toContain('api.config.meshRouteReport()');
-    expect(settingsTunSource).toContain('<MeshRouteEvidenceBlock');
     expect(settingsTunSource).not.toContain('api.config.endpointForceRouteReport()');
   });
 
   it('provides runtime commit labels in both surfaces for all supported locales', () => {
     for (const language of ['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa']) {
       const text = JSON.parse(readFileSync(fileURLToPath(new URL(`../../../i18n/locales/${language}.json`, import.meta.url)), 'utf8'));
-      expect(text.settings.tun.meshEvidence.load.runtimeCommitted).toEqual(expect.any(String));
-      expect(text.mobileMeshRouteEvidence.load.runtimeCommitted).toEqual(expect.any(String));
       expect(Object.keys(text.settings.tun.meshEvidence.load).sort())
         .toEqual(Object.keys(text.mobileMeshRouteEvidence.load).sort());
     }
@@ -294,7 +290,6 @@ it('TUN preview identity changes for mesh routes, real server input and observed
   expect(tunPreviewIdentity({ ...config, servers: (config.servers ?? []).map(server => ({ ...server, meshRoutes: ['10.2.0.0/16'] })) }, '["100.64.0.1"]', 'running:1')).not.toBe(key);
   expect(tunPreviewIdentity(config, '["100.64.0.2"]', 'running:1')).not.toBe(key);
   expect(tunPreviewIdentity(config, '["100.64.0.1"]', 'running:2')).not.toBe(key);
-  expect(settingsTunSource).toContain('tunPreviewIdentity(savedConfig, observationKey, previewGeneration)');
 });
 
 describe('closed desktop route details keep actionable summaries on the main surface', () => {

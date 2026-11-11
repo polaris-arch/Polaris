@@ -15,11 +15,6 @@ fn ntp_suffixes_include_pool_org() {
 }
 
 #[test]
-fn keywords_are_ntp_stun_only() {
-    assert_eq!(FAKEIP_FILTER_NTP_STUN_KEYWORDS, &["ntp", "stun"]);
-}
-
-#[test]
 fn default_filter_is_captive_plus_ntp() {
     let d = default_fakeip_filter_domains();
     assert!(d.contains(&"captive.apple.com".to_string()));

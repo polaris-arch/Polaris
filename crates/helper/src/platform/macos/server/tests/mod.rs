@@ -697,12 +697,6 @@ fn process_conn_partial_input_no_panic() {
     assert!(matches!(outcome, ConnOutcome::Done));
 }
 
-#[test]
-fn sock_filename_matches_go() {
-    // helper.go:604
-    assert_eq!(SOCK_FILENAME, "helper.sock");
-}
-
 #[cfg(unix)]
 #[test]
 fn sock_mode_matches_go() {

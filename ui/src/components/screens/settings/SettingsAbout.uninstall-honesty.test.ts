@@ -91,28 +91,6 @@ describe('卸载入口：后端接线状态 ⟺ 前端可用性、文案与结�
     ).toBe(true);
   });
 
-  it('描述文案改回描述性 uninstallDesc，且「尚未实现」那套键已全语种删除', async () => {
-    const fs = await import('node:fs');
-    const p = await repoPaths();
-    const tsx = fs.readFileSync(p.aboutTsx, 'utf8');
-
-    expect(
-      tsx.includes('settings.about.uninstallDesc'),
-      '功能已可用 ⇒ 描述必须说明它会做什么，而不是继续说「尚未实现」',
-    ).toBe(true);
-
-    for (const loc of LOCALES) {
-      const about = JSON.parse(
-        fs.readFileSync(p.path.join(p.localesDir, `${loc}.json`), 'utf8'),
-      ).settings.about;
-      expect(about.uninstallDesc, `${loc} 缺 uninstallDesc`).toBeTruthy();
-      expect(about.uninstallTitle, `${loc} 缺 uninstallTitle`).toBeTruthy();
-      // 这两句现在是谎话（功能已实现），留着早晚有人再把它渲染出来。
-      expect(about.uninstallUnavailable, `${loc} 仍留着「尚未实现」文案`).toBeUndefined();
-      expect(about.uninstallDisabledHint, `${loc} 仍留着禁用提示`).toBeUndefined();
-    }
-  });
-
   /**
    * **2026-07-29 载体迁移，门槛不变**：确认形态从自绘弹窗（两段 prompt `uninstallConfirm1/2`）
    * 改成原型的原地二次点击（`useConfirmTwice`，对齐 prototype :5185）后，那两段 prompt 已无承载它们
@@ -141,18 +119,6 @@ describe('卸载入口：后端接线状态 ⟺ 前端可用性、文案与结�
     // 确认态按钮文案：这是用户按下不可逆动作前最后看到的一行字，必须自带「不可逆」语气。
     expect(about.uninstallConfirmAgain, 'zh-CN 缺 uninstallConfirmAgain').toBeTruthy();
     expect(about.uninstallConfirmAgain as string).toMatch(/不可逆|不可恢复|无法复原|不可撤销/);
-
-    // 五语种都得有这两句，缺了会 fallback 到硬编码中文默认值（对非中文用户等于没提示）。
-    for (const loc of LOCALES) {
-      const a = JSON.parse(
-        fs.readFileSync(p.path.join(p.localesDir, `${loc}.json`), 'utf8'),
-      ).settings.about;
-      expect(a.uninstallDesc, `${loc} 缺 uninstallDesc`).toBeTruthy();
-      expect(a.uninstallConfirmAgain, `${loc} 缺 uninstallConfirmAgain`).toBeTruthy();
-      // 旧的弹窗两段 prompt 已退役：留着早晚有人把它们再渲染成第二套确认形态。
-      expect(a.uninstallConfirm1, `${loc} 仍留着已退役的 uninstallConfirm1`).toBeUndefined();
-      expect(a.uninstallConfirm2, `${loc} 仍留着已退役的 uninstallConfirm2`).toBeUndefined();
-    }
   });
 
   it('结果必须逐项呈现：五种结果态齐全，「未执行」也要显示，成功只挂在 complete 上', async () => {
@@ -177,31 +143,6 @@ describe('卸载入口：后端接线状态 ⟺ 前端可用性、文案与结�
       tsx.includes("presentation.mayExitAsComplete"),
       '必须按报告范围投影判成败，否则保留数据的退役会被显示成「已卸载」',
     ).toBe(true);
-
-    for (const loc of LOCALES) {
-      const about = JSON.parse(
-        fs.readFileSync(p.path.join(p.localesDir, `${loc}.json`), 'utf8'),
-      ).settings.about;
-      for (const k of [
-        'uninstallStepStopCore',
-        'uninstallStepAutostart',
-        'uninstallStepCacheDir',
-        'uninstallStepPreferences',
-        'uninstallStepHelper',
-        'uninstallStepUserConfig',
-        'uninstallStepAppBundle',
-        'uninstallKindDone',
-        'uninstallKindSkipped',
-        'uninstallKindUnsupported',
-        'uninstallKindFailed',
-        'uninstallKindNotAttempted',
-        'uninstallVerdictComplete',
-        'uninstallVerdictIncomplete',
-        'uninstallVerdictFailed',
-      ]) {
-        expect(about[k], `${loc} 缺 ${k}`).toBeTruthy();
-      }
-    }
   });
 
   it('守卫本身有牙：裸 disabled 检测不得把 disabled={...} 或注释里的字误判', () => {

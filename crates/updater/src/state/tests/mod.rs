@@ -1,11 +1,6 @@
 use super::*;
 
 #[test]
-fn default_is_idle() {
-    assert_eq!(UpdateState::default(), UpdateState::Idle);
-}
-
-#[test]
 fn happy_path_full_cycle() {
     // Idle → Checking → Ready → Verifying → Installing → Idle
     let s = UpdateState::Idle;

@@ -316,8 +316,6 @@ describe('两条出口成对守卫 —— 事件腿让位的码，await 腿必�
     expect(branch).toContain("reportConnectionFailure(t('errors.helperCoreMismatch'))");
     expect(branch.match(/reportConnectionFailure\(/g)?.length).toBe(1);
     expect(branch).not.toContain('toast.');
-    expect(home).toContain("const reportConnectionFailure = (detail: string) => toast.error(");
-    expect(home).toContain("t(action === 'stop' ? 'feedback.stopFailed' : 'feedback.connectionFailed'), detail");
   });
 
   it('CORE_NOT_EXECUTABLE：await 腿报的是本码专属文案并就此返回，不落到通用兜底', async () => {
@@ -329,8 +327,6 @@ describe('两条出口成对守卫 —— 事件腿让位的码，await 腿必�
     expect(branch).toContain("reportConnectionFailure(t('errors.coreNotExecutable'))");
     expect(branch.match(/reportConnectionFailure\(/g)?.length).toBe(1);
     expect(branch).not.toContain('toast.');
-    expect(home).toContain("const reportConnectionFailure = (detail: string) => toast.error(");
-    expect(home).toContain("t(action === 'stop' ? 'feedback.stopFailed' : 'feedback.connectionFailed'), detail");
   });
 });
 

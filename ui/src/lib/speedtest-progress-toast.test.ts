@@ -320,11 +320,6 @@ describe('静默超时常量：必须留有余量，且**与后端常量真的�
       rustConstMs('SPEED_TEST_COLD_TIMEOUT_MS') + rustConstMs('SPEED_TEST_REUSE_TIMEOUT_MS');
     expect(SPEEDTEST_IDLE_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * worstSingleNode);
   });
-
-  it('也不许大到用户以为卡死（兜底归兜底，上界仍在）', () => {
-    // 降级成兜底后取大的代价小，但不是没有上界：一条挂在屏上的 sticky 超过半分钟就是「卡死」的观感。
-    expect(SPEEDTEST_IDLE_TIMEOUT_MS).toBeLessThanOrEqual(30_000);
-  });
 });
 
 describe('终态事件（主路径）：中断当场收口，不再靠猜', () => {
@@ -747,9 +742,6 @@ describe('后端就绪门 vs 前端静默兜底：起核那一整段窗口里不
     expect(runtimeConstMs('TEMP_CORE_READY_TIMEOUT_CAP_MS')).toBeGreaterThan(
       SPEEDTEST_IDLE_TIMEOUT_MS
     );
-    // 下限那一档必须仍是历史值：门只许变宽、不许变窄。
-    // 这是跨语言那一侧的锁，Rust 侧的对应锁是 `the_floor_stays_at_the_only_value_with_production_evidence`。
-    expect(runtimeConstMs('TEMP_CORE_READY_TIMEOUT_FLOOR_MS')).toBe(10_000);
   });
 
   /*

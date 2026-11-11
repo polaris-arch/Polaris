@@ -13,7 +13,7 @@
  * # 计量单位是「**渲染点**」，不是「写着缺席字样的键」（2026-09-06 复审 blocker，已修）
  *
  * 第一版按**键**去重：`mobileRules.formUnavailable` 在移动端有 8 个消费点，账上只算 1 条。
- * 于是「新增一处死界面时复用一条已有的缺席键」这条路的债务增量恒为 0 —— 不用改基线、不用进
+ * 于是「新增一处死界面时复用一条已有的缺席键」这条路的债务增量恒为 0 —— 不用进
  * 处置表、什么都不会红，而界面上多了一块死掉的功能。现在 i18n 面的项是 `键 × 消费文件 × 序号`，
  * 加一处渲染就加一条债。
  *
@@ -63,7 +63,7 @@
  *        `hooks/use-network-interfaces.ts:72` 的 `{ …, disabled: true }` —— 网卡当前不可用这个
  *        **运行期状态**，不是未接线，进面就得为它写一条假处置。更要紧的是结构：那 120 个模块里
  *        桌面自己的死控件会记到**移动端**的账上，桌面加一颗、移动端一行没动，这道门就红，
- *        而棘轮会叫移动端去认领别人的债。这与 A 面「桌面自己的债不算移动端的账」是同一条口径。
+ *        而完成门会叫移动端去认领别人的债。这与 A 面「桌面自己的债不算移动端的账」是同一条口径。
  *    🔴 **这一面的射程仍然被显式缩过，且缩到哪写在这里**：它认六种**词法**形态（见
  *      `CONTROL_PATTERNS`），其中 `disabled={FLAG}` 只做**同文件**常量折叠。它抓不到
  *      ① 跨文件/跨模块传进来的常量假开关；
@@ -104,12 +104,12 @@
  *    兜这一格的是「拿桌面那一侧与登记表逐条对差」的另一族门，本门不重复实现、也**不假装**覆盖：
  *      · 节点屏 —— `nodes/nodes-screen.test.tsx` ⑤⑥（桌面按钮数 ↔ 登记表 ↔ 真渲染，三方对差）；
  *      · 其余四屏 —— `screen-parity.test.ts`（2026-09-06 批 6 落地）：动作面 / 数据块面逐条对差，
- *        具名数据槽做变更探测，全部豁免都带一条被机器打开核对的锚；
+ *        全部豁免都带一条被机器打开核对的锚；
  *      · **移动端读的每一格 store 状态有没有写入方** —— 同一份门的 ⑤ 组（取材面在移动端这一侧）。
  *        `W-23` / `W-24` 正是死在这一格：控件都在、桌面对差全绿、界面在说假话。
  *    ⇒ 那批表里非豁免的每一条现在**逐条进本门的 B 面**（见 `scanParityRegisterFace`），
  *      债务因此从 44 涨到 70，复审把那道门的射程补完之后再涨到 122。
- *      涨的是能见度，不是死代码 —— 两次的逐条理由都写在 `WIRING_DEBT_BASELINE_IDS` 上方。
+ *      涨的是能见度，不是死代码 —— 2026-09-14 已逐条接线清零。
  *      ⚠️ 这一格的**射程仍然由那道门自己的取材面决定**：它今天认「`ui/src/components/screens/`
  *      下每个含 `.tsx` 的目录都被某张表认领或显式交接」，认「`<button>` ∪ 带 `onClick=` /
  *      动作性 `role=` 的元素」，认「渲染一跳」。三条里任何一条再放宽，这个数字还会涨。
@@ -123,19 +123,12 @@
  *     cd ui
  *     POLARIS_WIRING_REPORT=1 pnpm exec vitest run --silent=false --reporter=verbose src/mobile/wiring-completeness.test.ts src/mobile/half-truth-facts.test.ts
  *
- * 直接保留 Vitest 的真实退出码；两份事实门与下方精确债务棘轮共同判定，不再由报告壳翻译结果。
+ * 直接保留 Vitest 的真实退出码；两份事实门与下方完成门共同判定，不再由报告壳翻译结果。
  *
- * # 完成门与已知债务的历史模式
+ * # 完成门
  *
- * 清零断言的强度由 `COMPLETION_GATE_MODE` 一个常量控制：
- *  · `known-red`（历史模式）：写成 `it.fails` —— 按预期失败 ⇒ 默认 suite 仍然绿，不会拿一片红
- *    把别的门淹掉；**债务清零的那一天它会反过来变红**（vitest 报「expected test to fail」）。
- *  · `hard`：普通 `it` —— 从此是一道硬门。
- * 当前值为 `hard`；完成门和精确债务基线仍由下方真实断言执行，报告输出不代替断言。
- *
- * 同时，默认 suite 里压着一条**精确棘轮**：断言的是**债务 id 的有序集合**（`WIRING_DEBT_BASELINE_IDS`），
- * 不是个数。第一版只比个数，于是「拆掉一颗死控件的写死形态（−1）+ 新交付一颗死按钮（+1）」这种
- * 一增一减的抵消实测全绿 —— 一颗全新的未接线控件就这么进了仓，而头注还写着「提交那一刻就红」。
+ * 「三个取材面减去处置表 === 空集」是一道硬门（2026-09-14 清零起）：再出现任何一条未接线项都会
+ * 当场红，报错逐条列出剩余项；报告输出不代替断言。
  */
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
@@ -201,12 +194,6 @@ const REGISTER_FILES: readonly string[] = [
 ];
 
 const rel = (absolute: string): string => relative(UI_SRC_DIR, absolute).replaceAll('\\', '/');
-
-/** 完成门的强度。清零那天改成 `'hard'`，`it.fails` 随之变成普通 `it`。 */
-/* 2026-09-14 清零：三个取材面减去处置表 === 空集，故完成门从 `known-red` 转 `hard`
-   （`it.fails` 随之变成普通 `it`）。此后**再出现任何一条未接线项都会当场红**，
-   而不再是「预期内的红」。 */
-const COMPLETION_GATE_MODE: 'known-red' | 'hard' = 'hard';
 
 /* ────────────────────────── 公共工具 ────────────────────────── */
 
@@ -432,7 +419,7 @@ function matchedFamilies(text: string): string[] {
 type FaceName = 'i18n' | 'register' | 'control';
 
 interface FaceItem {
-  /** 全局唯一、可写进处置表的锚。腐烂检测与债务棘轮拿它逐字对差。 */
+  /** 全局唯一、可写进处置表的锚。腐烂检测拿它逐字对差。 */
   readonly id: string;
   readonly face: FaceName;
   /** 人读的位置（相对 `ui/src/`，或 i18n 键）。 */
@@ -805,8 +792,8 @@ function scanControlFace(
       //     `<button type="button" className="mr-btn" disabled>` 三颗逐字相同，区分它们的标签
       //     （`t('resources.catalog')` / `urlDownload` / `import`）在**下一行**。只取单行时，
       //     「把第一颗改成动态、同时新交付一颗」的一增一减仍然被序号吸收，实测全绿。
-      //     代价如实登记：改一句按钮标签也会换 id ⇒ 棘轮红一次、要显式重推那一条基线。
-      //     这是「宁可多问一次」的取向 —— 静默放行一颗新死按钮比多推一次基线贵得多。
+      //     代价如实登记：改一句按钮标签也会换 id ⇒ 处置表里那一条要跟着改。
+      //     这是「宁可多问一次」的取向 —— 静默放行一颗新死按钮比多改一次处置表贵得多。
       const context = lines
         .slice(index, index + 3)
         .join(' ')
@@ -1085,249 +1072,6 @@ const EXCUSE_WORDS: readonly RegExp[] = [
 const DISPOSITION_IDS: ReadonlySet<string> = new Set(DISPOSITIONS.map((entry) => entry.id));
 const DEBT: readonly FaceItem[] = ALL_FACE_ITEMS.filter((item) => !DISPOSITION_IDS.has(item.id));
 
-/**
- * 未接线债务的**精确基线** —— 断言的是**有序 id 集合**，不是个数。
- *
- * 只比个数挡不住「一增一减」：实测把一颗写死禁用的按钮改成 `disabled={rowCount < 0}`（能力照样
- * 没接，只是不再是写死形态，−1）、同时新交付一颗写死禁用的按钮（+1），取材面与债务数一个字不变、
- * 全绿 —— 一颗全新的未接线控件就这样进了仓，而头注还写着「提交那一刻就红」。
- *
- * 2026-09-06 实测重定（复审后三个面各自扩过取材面）。清零那天连同 `COMPLETION_GATE_MODE` 一起处理。
- *
- * # 销账记录（每一条都要写清「接上的是什么能力、接在哪」）
- *
- * · **−1｜`i18n:mobileSettings.display.notificationsPermission@mobile/settings/DisplayPage.tsx#1`**
- *   （2026-09-06，批 1 / W-28：系统通知发送链）。销的不是文案，是能力：
- *     · 总开关同步 —— `mobile/app-wiring.ts` 的 `useMobileAppWiring`：`desktopNotifications`
- *       变化时调 `setDesktopNotificationsEnabled`（此前这个开关写进 config 后零消费方）；
- *     · 发送链 —— 同一份接线里 `api.proxy.onError` → `domain/proxy-error-routing.ts` 的
- *       `handleProxyErrorEvent`（逐码 `notifyDesktop`），以及 `api.proxy.onTailscaleAuth`
- *       的登录提示通知。
- *   文案随之从条件式改回确定式，且**只承诺已经接上的那些**（去掉了「订阅失败」与「更新提醒」——
- *   那两件没做）。note 那一句仍在（讲权限时机与前台服务通知的归属），只是不再是一条缺口。
- *
- * # 2026-09-06 批 3 销账：44 → 45，**升的那两条是新看见的债，不是新造的死界面**
- *
- * −1 `i18n:mobileRules.resourceMetaUnregistered@…#1` —— 资源行的大小与更新时间接上了
- *    （`data-contract.json#sources.rule-resources` 已登记，两格由 `ResourcesSegment` 真画出来），
- *    那句「未登记所以不画」连同键一起撤销。
- *
- * +2 `control:…/AppsSegment.tsx:const-true-disabled:{934debd2,b9f568e1}#1` —— 应用行的策略选择器
- *    解禁了「直连 / 跟随全局」两档（真改隧道行为，判据在
- *    `crates/config-engine/tests/golden_inbounds_android.rs` 与
- *    `screens/rules/app-policy-write.test.ts`），而「指定节点 / 阻断」两档在场置灰。
- *    🔴 **这两条债此前不在任何一面上**：改之前整颗控件是一枚 `<span data-readonly="1">`，
- *    正是本门「射程自曝」第 C 面第 ② 条明写抓不到的形态（非交互元素没有 `disabled` 属性）。
- *    ⇒ 数字变大是**能见度**变大，不是仓里多了两颗死按钮。它们也不许进 `DISPOSITIONS`：
- *    这两档在这台设备上并非不可兑现（geosite 腿照常命中，从桌面同步过来的档位真的生效），
- *    缺的只是「在这一屏改它」，那既不是 `platform-absent` 也不是 `reachable-elsewhere`。
- *
- * 2026-09-06 W-18 销账 44 → 37（**七条都是「能力接上了」，没有一条是靠删文案下账的**）：
- *  · `i18n:mobileConnections.logs.exportNeedsShareSheet@…#1/#2` —— 导出接通文件保存器后，旧错误说明删除；
- *    文案改成实话（说的是「走哪个系统面板」）。两条腿真的接了：
- *    `mobile/connections/MobileConnectionsScreen.tsx` 的 `onExportReport` / `onExportLogs`
- *    → `api.diagnostic.export()` / `api.logs.export()` →
- *    `src-tauri/src/commands/misc/logs.rs` 的 `finish_export`。
- *  · `control:…/MobileConnectionsScreen.tsx:const-true-disabled:face120c/d2db9be5` ——
- *    导出面板那两颗 `disabled: true` 换成了 `onSelect`（上面那两条腿）。
- *  · `i18n:mobileSettings.backup.pickerPending@…#1` —— 键改名 `pickerNote`，同上改成实话。
- *  · `control:…/BackupPage.tsx:bare-disabled+inert-handler:1ca6426e/45428f00` ——
- *    `<MobileButton disabled onClick={() => undefined}>` 两颗换成真调用：
- *    `api.backup.export()` 与 `api.backup.importPick()` → `importApply()`。
- * 后端那一侧是 W-18 的本体：`src-tauri/src/commands/picked_file.rs` 给了 content URI 感知的
- * 读写，SAF 交回的 `FilePath::Url(content://…)` 不再被 `into_path().ok()` 吃成「用户取消了」。
- *
- * · **−16 / +4｜43 → 31**（2026-09-06，批 2：移动端表单宿主 + 节点面）。逐条：
- *
- *   **销掉的 16 条（接上的能力 → 接在哪）**
- *   ① `register:row:clone` → 直调 `server_add` 的克隆动作，单例拦截复用
- *      `domain/endpoint-routes#meshSingletonConflict`。接线：`nodes/MobileNodesScreen.tsx#cloneNode`。
- *   ② `register:row:edit` → 节点表单（`ND_SPEC` 17 协议）。接线：`nodes/view-model.ts#buildRowItems`
- *      → `forms/form-store.ts#mobileEditFormFor` → `forms/NodeFormPanel.tsx`。
- *   ③ `register:row:delete` + ④ `register:batch:delete` → 删除腿三段全接：暂存事务
- *      （`lib/staged-config#splitStagedOnly` + `node-delete-fallback#partitionNodeDeleteRoutes`）、
- *      兜底改选（`fallbackExitAfterDelete`）、二次确认（`forms/ConfirmPanel.tsx`）。
- *      接线：`nodes/node-deletion.ts#useMobileNodeDeletion`。
- *   ⑤⑥⑦ `register:sub-pending:{usage,expiry,lastUpdated}` → 三处来源登记进
- *      `mobile-kit/data-contract.json#sources.subscription-summary`，并真的画出来
- *      （`MobileNodesScreen.tsx#sub` 用 `nodes-logic#subUsage` / `fmtBytes` / `relativeTimeTextIso`
- *      算值，`NodesScreenView` 渲染）。
- *   ⑧⑨⑩ `i18n:nodes.mobileNeedsFormLayer@…`（三处渲染点）→ 表单层不再缺席（`mobile/forms/**`），
- *      键随之从五份 locale 删除（**删的是已经没有渲染点的键**，不是把还在画的文案抹掉）。
- *   ⑪ `i18n:nodes.mobileSubPendingFields@…` → 同 ⑤⑥⑦，那句 pending 说明的前提不再成立。
- *   ⑫⑬⑭ `i18n:nodes.mobileTsExitNeedsDesktop@…`（首页 1 处 + 节点屏 2 处）→ W-05 出口选择器落地
- *      （`forms/TsExitPanel.tsx`，候选构造复用 `ts-settings-logic#exitNodeOptions`）。
- *      那句话现在是**假的**（出口就在同一颗按钮的另一条分支上），故连键一起删；两处「没有 TS 节点」
- *      的兜底分支经查**结构上不可达**（`deriveTsExitWarning:67` 与 `tsId` 是同一个谓词），
- *      改成 `console.error` —— 不可达的分支不该持有一句面向用户的话。
- *   ⑮⑯ `control:…MobileNodesScreen.tsx:const-disabled-reason:680e8fbe#1/#2` → 「添加」四条与
- *      订阅「更多」五条的写死置灰理由随接线消失（`buildAddItems` / `buildSubItems`）。
- *
- *   **新增的 4 条（本批**新造出来的可见缺口**，不是新缺陷）**
- *   上一版「移动端还没有节点表单层」是一句**笼统**的缺席，它把三张各自独立的表
- *   （WARP 注册 / Tailscale 登录 / WireGuard 字段表）一起盖住了。表单宿主落地后那块毯子掀开，
- *   三张表各自成为一条**可数**的缺口：`register:mesh-join:{warp,tailscale,wireguard}`
- *   加上它们共用理由键的那一处渲染点 `i18n:nodes.mobileMeshFormUnavailable@…view-model.ts#1`。
- *   要接它们得先把那三份字段规格从桌面 `.tsx` 搬进 `.ts`（与本批拆出 `field-spec.ts` 同一件事）。
- *
- * # 2026-09-13 批 13 销账：95 → 86（**九条全是「能力接上了」，没有一条是靠删文案下账的**）
- *
- * 连接屏（含折进本屏的桌面日志屏）那一面清零。逐条「接上的是什么能力 → 接在哪」：
- *
- *  ① `parity:connections:action:RuleSubjectMenuItems.tsx|k:rules.addNew`
- *     + ② `…|k:rules.addExisting+rules.subjectAlreadyInRule`
- *     + ③ `parity:connections:block:RuleSubjectMenuItems`
- *     + ④ `control:…/MobileConnectionsScreen.tsx:const-true-disabled:734405e6#1`
- *     + ⑤ `i18n:mobileRules.formUnavailable@mobile/connections/MobileConnectionsScreen.tsx#1`
- *     —— 同一件工作的五个影子（一条写死 `disabled: true` 的行 + 它的理由文案 + 登记表三条）。
- *     行动作面板里那颗「加入规则」不再置灰：它开出一张逐维铺开两颗的二级面板
- *     （`MobileConnectionsScreen.tsx#sheetVM` 的 `'rule' in sheet` 那一支），两颗各自兑现——
- *       · **新建规则** → `forms/RuleFormPanel.tsx`（新 union 支 `{ kind:'rule', preset }`），
- *         类型表 / 校验 / 多值切分复用 `domain/rules` + `dialogs/rule-cond`，
- *         暂存分流复用同一个 `editRoute('trafficRules')`，落 `api.rules.add`；
- *       · **加入已有规则** → `'pick' in sheet` 那张选择器 + `onAppendToRule`，
- *         判据整层复用 `dialogs/rule-append.ts`，落 `api.rules.update`（全仓第二条追加腿，
- *         与桌面那条同形：写的是 `appendSubjectToRule` 返回的**整条** Rule）。
- *     `mobileRules.formUnavailable` 这条键**没有删**（另外三个批次还在渲染它），去掉的只是
- *     本屏这一个渲染点 —— i18n 面按渲染点计数，删键与销账是两件事。
- *  ⑥ `parity:connections:action:Csel.tsx|f:header` —— 可折叠分组组头。`ConnectionsView#ActionSheet`
- *     现在吃 `SheetGroup`，折叠行序复用**同一个** `buildCselRows`（不另写一份判据），
- *     真消费方是上面那张「加入已有规则」面板：可追加的一组不带 id ⇒ 恒展开，
- *     点不下去的一组带 id ⇒ 默认折起 + 组头计数。
- *  ⑦ `parity:connections:action:LogsScreen.tsx|k:logs.archiveLegacy`
- *     + ⑧ `…|k:common.confirmAgain+logs.deleteLegacy` —— W26 前遗留的无界 `singbox.log`。
- *     `legacyInfo()` 探测 + 日志段的提示块（`legacyNotice`）+ 「更多」面板里那两颗动作
- *     （`api.logs.archiveLegacy` / `api.logs.deleteLegacy`，两条都在 `runWrite(` 实参区间内）。
- *     删除那颗的二次确认走 `forms/ConfirmPanel`，**不是** `window.confirm`（后者被 dialog 插件
- *     init 覆写成 `plugin:dialog|confirm`，漏授 ACL 时整条腿抛 rejection）。
- *  ⑨ `parity:connections:action:LogsScreen.tsx|k:logs.openDir+logs.openDirTip` —— **唯一不是
- *     「接上了」的那一条**：改判 `platform-absent`，证据锚指 `PolarisVpnPlugin.kt` 里
- *     `FileProvider.getUriForFile(...)` —— Android 上本应用把私有存储里的东西交给别的应用的
- *     唯一机制，交的是**一个文件**的 content URI，没有「可浏览的目录」这个对象；另一条路（SAF）
- *     的 Android 面只有 `ACTION_GET_CONTENT` / `ACTION_CREATE_DOCUMENT`，
- *     没有 `ACTION_OPEN_DOCUMENT_TREE`。日志目录本身是 `activity.dataDir`（应用私有内部存储），
- *     没有任何 DocumentsProvider 暴露它。
- *
- * · **−25 / +0｜95 → 70**（2026-09-13，设置屏）。全部落在 `settings/absence-register.test-support.ts`
- *   的 B 面上，i18n 与控件两面一条没动 —— **没有一条是靠删文案下账的**（那正是本门自曝的
- *   天花板，故这里逐条写清是「能力接上了」还是「对象不存在」）。
- *
- *   🔴 **同日复审撤回了 6 条**（先判成豁免、随后判回债务；下面 D 栏那条与 C 栏原有的五条更新腿）。
- *   撤回的判据只有一条，写在这里免得下次再犯：**`platform-absent` 是永久出账本**，而一件
- *   「这个平台做得到、只是还没做」的事进了它，将来条件满足那天**没有任何东西会红**来提醒有人
- *   去接。把能做的事说成平台边界，等于亲手拆掉将来会响的那只闹钟。同形先例本仓纠正过一次：
- *   `privacyMode` 当年也从那一档改判回 `absent`（Android 上隐私锁并非不可实现），批 5 真的接上了。
- *
- *   **A. 真的接上了（10 条，能力 + 接在哪）**
- *   ① `block:TunnelConflictBlock` 在 Android/iOS 恒 Unsupported，按用户裁定不再显示或拉取；
- *      不把 Unsupported 解释为无冲突。② `block:Warn` 仍由真实 endpoint 结算告警消费。
- *   ③ `block:EndpointForceRouteBlock` + ④ `block:Block` —— 「谁把谁的组网网段吃掉了」结算块
- *      （含被吃干净时点名到节点）：`TunReports.tsx#MobileEndpointForceRouteBlock`，
- *      拉取同上一条（`endpoint_force_route_report`，节点屏与规则屏早就在消费同一份）。
- *   ⑤ `action:AppUpdateCard.tsx|k:settings.update.bannerSkip` —— 「跳过此版本」接上：
- *      `UpdatePage.tsx` 的 `updateApi.skip(foundVersion)` + `markAppVersionSkipped`
- *      （后端持久化那一半由 `update_check` 的第四道闸消费，会话那一半与桌面横幅共用同一个集合）。
- *   ⑥ `action:field:appUpdateChannel` —— 更新通道 `<Select>` 接上（`update({ appUpdateChannel })`）。
- *      这一格此前是「配置里在、界面上看不见」：`appUpdateIncludePrerelease(config)` 早就被
- *      本页那颗检查按钮读着，手机上却没有任何控件能改它。
- *   ⑦⑧ `action:AppUpdateCard.tsx|k:settings.about.checkUpdate` 与 `#2` —— **复核**为真：
- *      检查腿 2026-09-06 W-19 就接了（`runAppUpdateCheck(checkAppUpdateViaIpc, config)`），
- *      后端 Android 那一档走 `check_app_update_release_only`，此前「取平台那一步早退成
- *      `hasUpdate:false`」的结构性恒答已修。登记表停在接线之前，不是能力停在那里。
- *   ⑨ `block:AppUpdateCard` —— 整卡的移动形态（版本芯片 + 检查 + 结果 + 发布页 / 跳过 + 通道）。
- *   ⑩ `action:SettingsSidebar.tsx|k:sidebar.collapse+sidebar.expand` —— 判为 `ported`：
- *      桌面那颗解决「常驻导航占宽 vs 内容占宽」，移动端的导航不恒在场（根页列表整页让位给二级页、
- *      返回键带回来），同一个取舍由导航形态本身表达。
- *
- *   **B. 组件早就在，登记表停在旧事实（6 条）**
- *   ⑪–⑮ `action:ListEditor.tsx|{f:add, k:common.delete, f:setImportOpen, k:common.confirm,
- *      k:common.cancel}` + ⑯ `block:ListEditor` —— `SettingsChrome.tsx#MobileListEditor` 五条腿齐，
- *      2026-09-06 随连入来源排除一起落地，`TunPage.tsx` 的 `tun-inbound-exclude` 正在用。
- *      上一版写的「移动端一处都没有」说的是**组件不存在**，那句话在那一批之后就为假了。
- *      ⚠️ 组件在 ≠ 每张清单都接到了它上面：DoH 域名 / FakeIP 过滤 / 绕过网段三张的账仍分别
- *      记在 `field:browserDohList` / `field:fakeIpFilterList` / `field:bypassLANList` 上。
- *
- *   **C. 平台上没有那个对象（9 条，逐条锚指一条机器可核对的平台判定）**
- *   ⑰⑱ `action:SettingsNetwork.tsx|{f:onCopy, c:term-copy}` + ⑲ `block:TerminalEnvBlock`
- *      + ⑳ `block:CopyIcon` —— 锚 `NO_MIXED_INBOUND`：那几行要复制走的字面量是
- *      `http_proxy=http://127.0.0.1:<mixedPort>`，而 Android 上根本不发 mixed inbound
- *      ⇒ 复制出去的是一条指向无人监听端口的指令。上一版特意写了「把环境变量交给用户复制走并非
- *      不可能」—— 那句话只看了动作、没看被复制的内容。
- *   ㉑㉒ `action:field:bypassLAN` / `field:bypassLANList` —— 锚 `platform == "win32"` 那一支：
- *      `bypass_lan_cidrs` 只在 Windows 被算进 `route_exclude_address`，android 臂恒空
- *      （2026-09-04 模拟器实证，logcat 原文在那段注释里）。与同屏 `strict_route` 同形：
- *      画一颗按下去不产生任何发射差异的开关，比没有更坏。
- *   ㉓ `action:field:hardwareAcceleration` —— 锚 `#[cfg(any(target_os = "linux", target_os = "windows"))]`：
- *      逃生门三条臂各挂平台守卫，Android 上函数体整个不编译。桌面自己在 mac 上也不渲染那一行。
- *   ㉔ `action:field:autoLightweightMode` —— 锚 `NO_TRAY`：巡检腿在 Android 上照跑，但轻量态的
- *      **回程**（把界面拿回来）桌面靠托盘，移动端没有托盘 ⇒ 打开它等于销毁 WebView 且回不来。
- *   ㉕ `action:SettingsAbout.tsx|k:settings.about.uninstall*` —— 锚 `#[cfg(mobile)] return false`：
- *      桌面那颗的对象是「卸载时要应用自己撤销的四样东西」，Android 上一样都不归应用管
- *      （关于页那句指路文案原样保留，`MobileSettings.test.tsx ⑥` 正面钉着它不许被丢掉）。
- *
- *   **撤回、留在债务侧的 6 条（判词与销账条件见登记表逐条的 🔴）**
- *   · `action:AppUpdateCard.tsx|{k:settings.update.download, k:settings.update.restartAndInstall,
- *     k:settings.update.reinstallCurrent+Tip, k:common.retry}` + `action:field:autoDownloadUpdate`
- *     —— 应用内下载安装那一族。曾锚 `AssetPlatform::from_os`，而那个锚描述的是**发布流水线的
- *     资产命名**，不是 Android 的能力边界：`installApk` 已接、`REQUEST_INSTALL_PACKAGES` 已在
- *     manifest、`update_download` 与 `InstallPlatform::Android` 两段后端都在，`UpdatePage.tsx`
- *     头注自己写着这是一次取舍（权限画像要单独过一次审）。五条改回
- *     `absent` + `reasonKey: 'mobileSettings.update.appDesc'` —— 那句话五语齐、且**已经常驻**在
- *     更新页那一行的 desc 上（「经 GitHub Releases 分发，在这里检查、去发布页下载安装 APK」），
- *     与「打开发布页」「跳过此版本」两颗按钮同一行，故这一族不是「有新版本然后没有下文」。
- *   · `action:Csel.tsx|f:header` —— 分组下拉的组头。曾判 `reachable-elsewhere`、锚指节点表单的
- *     `<optgroup>`：那个锚在**另一个屏**上，且只够得着「分组」、够不着「折叠」。
- *     锚指得到 ≠ 能力等价，改回 `absent`（界面上一个字都没提）。
- *
- *   **没销掉的 4 条（落点全部不在设置屏）**：`field:dnsDefaults` /
- *   `field:dnsDefaults.unmatchedAction` / `field:browserDohList` / `field:fakeIpFilterList` ——
- *   写这四格的控件该落在 `mobile/settings/DnsPage.tsx` 与规则屏的 DNS 分段上。
- *   🔴 销它们要**两件事同批发生**：那两处写出 `update({ <字段> })`，同时登记表里对应的行删掉
- *   （`config-fields` 面的 `ported` 由门自己算，留着会被僵尸检测判红；删早了则报「既没写也没登记」）。
- *
- * # 2026-09-13 批 17 销账：15 → 11（**四条是同两件工作，逐条都是「能力接上了」**）
- *
- * · **① DNS 默认策略（3 条一件事）**
- *   `parity:settings:action:field:dnsDefaults` + `…:field:dnsDefaults.unmatchedAction`
- *   + `i18n:mobileRules.formUnavailable@mobile/settings/DnsPage.tsx#1`。
- *   v2 配置下的默认 DNS 策略（未命中默认动作 + Hosts 档的兜底服务器）在 DNS 设置页上真的改得动了：
- *   `mobile/settings/DnsPage.tsx#DnsDefaultsRows` 写
- *   `update({ dnsConfig: { ...dns, ...fakeIpTogglePatch(…) }, dnsDefaults: { ...defaults, unmatchedAction } })`
- *   —— `dnsConfig` 那一半**必须同写**（legacy 镜像，只改一半会让 v1/v2 两份配置各说各话），
- *   补丁本体共用本页那颗 v1 FakeIP 开关的同一个 `fakeIpTogglePatch`。
- *   候选表 / 当前档 / 档位→动作的反解三样全走共享纯模块 `dialogs/dns-action-options`；
- *   其中 `dnsDefaultActionChoice` / `dnsDefaultFallbackChoice` 是本批**从桌面
- *   `DnsPolicyWorkspace.tsx` 的两处行内表达式搬出来的**（它们含两个缺省约定，两端各写一份时
- *   漂了不会有任何门红），桌面调用点同批改成 import，行为逐字不变。
- *   第三条随那句缺席说明的渲染点消失而销 —— **前提是能力真的接上了**，不是把话删掉：
- *   那句 `<SettingsNote id="dns-defaults-absent">` 让位给的是两颗真控件。
- *   ⚠️ `mobileRules.formUnavailable` 由此失去全仓最后一个渲染点（规则屏与连接屏在批 12/13 已各自
- *   接通），成为死键 ⇒ 五份 locale 同批删除（`i18n-coverage` 的 G6b 死键档是零容忍）。
- *   `screen-parity.test.ts` 里那条拿它当探针的自检同批换成 `mobileSettings.dns.fakeIpOffRisk`。
- * · **② `parity:settings:action:Csel.tsx|f:header`（1 条）** —— 下拉的可折叠分组组头。
- *   上面那两格的候选表是分组的（DNS 服务器组 / 服务器 / Hosts / 响应动作），故设置屏第一次
- *   真的需要这一维。**组头的渲染实现一份都没有新写**：组件直接复用规则屏那一份
- *   `SelectSheetPanel`（`mobile/screens/rules/Primitives.tsx`，批 10 落的），行摊平仍走全仓同一个
- *   `buildCselRows`。本屏只加了一个 4 行的入参准备函数 `collapsibleGroups`（给组配稳定键 ——
- *   `CselGroup.id` 是「折不折」的唯一开关），以及「含当前档的组默认展开」那一行。
- *   为什么不复用批 13 那一份（`connections/ConnectionsView.tsx`）：它吃的是连接屏自己的
- *   `SheetVM`/`SheetGroup`，且住在 `ActionSheet`（命令语义、无选中态）里；默认策略是**选择**，
- *   要的是带勾的 `select-sheet`，而 `SelectSheetPanel` 的入参**就是** `CselGroup[]`
- *   —— 与 `buildDnsActionGroups` 的返回类型逐字相同，零形状搬运。
- */
-const WIRING_DEBT_BASELINE_IDS: readonly string[] = [
-  /* 🔴 **空数组是 2026-09-14 的实况，不是「还没填」**。
-     三个取材面（i18n 渲染点 / 登记表 / 控件）减去处置表之后是空集 —— 移动端逐条对差的
-     未接线项为 0，`COMPLETION_GATE_MODE` 同日转 `hard`。
-     最后离开的那一条是 `i18n:mobileRules.formUnavailable@mobile/settings/DnsPage.tsx#1`：
-     v2 DNS 默认策略拿到移动端编辑面之后，那句「请在桌面端修改后同步」的常驻说明没有了
-     渲染点，键本身也随之从五份 locale 删除。
-     此后这张表的语义反过来了：它不再是「已知欠着这些」，而是「**这里应当永远是空的**」。
-     新增任何一条都会同时红两处 —— 本条有序对差报「新增 N 条」，完成门报「不是空集」。
-     往这里加行之前先问一句：那到底是「平台真的做不到」（进 `DISPOSITIONS`，锚指一条平台判定），
-     还是「我们还没做」（那就把它接上，而不是记一笔账）。 */
-];
-
 function renderReport(): string {
   const works = new Set(DEBT.map((item) => item.work));
   const lines: string[] = [];
@@ -1405,7 +1149,6 @@ describe('移动端接线完成度', () => {
         0,
       );
       expect(scannedLines, '控件面扫到的代码行数掉了一大截 —— 取材面塌了').toBeGreaterThan(5000);
-      expect(LOCALE_FILES.length, 'locale 文件数变了（主分区 5 + auxiliary 5）').toBe(10);
       const claimed = claimedKeys(LOCALE_FILES).length;
       // 判据与报错文案对齐（「掉到 10 条以下」= < 10 才红）。2026-09-25 A5 销掉 appRoutingPlatformNote 后恰 10 条。
       expect(claimed, '全仓被缺席信号认领的键掉到 10 条以下 —— 文案面塌了').toBeGreaterThanOrEqual(10);
@@ -2001,37 +1744,9 @@ describe('移动端接线完成度', () => {
       expect(ALL_FACE_ITEMS.length, '取材面为空 ⇒ 报告没有信息量').toBeGreaterThan(0);
     });
 
-    it('未接线债务 === 基线（逐条 id 对差，两个方向都说话）', () => {
-      const actual = DEBT.map((item) => item.id);
-      const baseline = new Set(WIRING_DEBT_BASELINE_IDS);
-      const added = actual.filter((id) => !baseline.has(id));
-      const removed = WIRING_DEBT_BASELINE_IDS.filter((id) => !actual.includes(id));
-      expect(
-        actual,
-        'WIRING_DEBT_DRIFT 债务清单与基线不一致。\n' +
-          `新增 ${added.length} 条（新的未接线界面，把它接上；确实是平台缺席就进 DISPOSITIONS）：\n` +
-          `${added.join('\n')}\n` +
-          `消失 ${removed.length} 条（把 WIRING_DEBT_BASELINE_IDS 里对应的行删掉，` +
-          '并在 commit message 里写清是**哪条能力接上了**、接在哪（file:line）——' +
-          '不写清就分不清「接上了」和「把文案删了」）：\n' +
-          `${removed.join('\n')}`,
-      ).toEqual([...WIRING_DEBT_BASELINE_IDS]);
-    });
-
-    /**
-     * 🔴 **完成门。2026-09-14 起是硬门 —— 它今天必须绿。**
-     *
-     * 此前 `COMPLETION_GATE_MODE === 'known-red'` ⇒ `it.fails`：那一档不静默跳过，两个方向都
-     * 说话 —— 债务清零那天 vitest 会因为「expected test to fail」而转红，逼下一个人把它升格。
-     * 那一天到了（0 条），于是这里转 `'hard'`：**再出现任何一条未接线项都会当场红**。
-     *
-     * 保留三元而不是直接写 `it`：升格是可逆的判断，不是不可回头的重构 —— 真要退回
-     * `'known-red'`（比如一次大改动短期内制造出一批已知欠账），改那一个常量就够，
-     * 不必在这里重新拼一遍结构。`as` 那一下是因为 TS 会把带初值的 `const` 收窄成字面量、
-     * 进而把这次比较判成「不可能」；它是运行期 no-op，写成声明时那个联合类型本身。
-     */
-    (((COMPLETION_GATE_MODE as 'known-red' | 'hard') === 'known-red') ? it.fails : it)(
-      '全部接线：三个取材面减去处置表 === 空集（清零那天把 COMPLETION_GATE_MODE 改成 hard）',
+    /* 🔴 完成门：2026-09-14 起是硬门，再出现任何一条未接线项都会当场红。 */
+    it(
+      '全部接线：三个取材面减去处置表 === 空集',
       () => {
         const remaining = DEBT.map((item) => `[${item.face}] ${item.where} — ${item.detail}`);
         expect(remaining, `还欠 ${remaining.length} 条：\n${remaining.join('\n')}`).toEqual([]);

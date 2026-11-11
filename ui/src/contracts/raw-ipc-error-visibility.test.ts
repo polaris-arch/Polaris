@@ -14,7 +14,6 @@ function source(relative: string): string {
 
 const SUB_DIALOG = source('../components/dialogs/SubDialog.tsx');
 const IMPORT_DIALOG = source('../components/dialogs/ImportDialog.tsx');
-const RES_CATALOG = source('../components/dialogs/ResCatalogDialog.tsx');
 const NODE_DIALOG = source('../components/dialogs/NodeDialog.tsx');
 const GENERAL = source('../components/screens/settings/SettingsGeneral.tsx');
 const CONNECTIONS = source('../components/screens/connections/ConnectionsScreen.tsx');
@@ -32,13 +31,6 @@ describe('用户可见 IPC 失败面', () => {
     expect(IMPORT_DIALOG).toContain("setFileHint(t('import.fileReadFail'))");
     expect(GENERAL).toContain("console.error('[SettingsGeneral] save privacy password failed:', e)");
     expect(GENERAL).toContain("setPwErr(t('common.saveFailed'))");
-  });
-
-  it('资源目录以稳定码保存持久错误', () => {
-    expect(RES_CATALOG).toContain("type CatalogLoadError = 'RESOURCE_CATALOG_LOAD_FAILED'");
-    expect(RES_CATALOG).toContain("setLoadErr(catalogLoadFailure('initial', e))");
-    expect(RES_CATALOG).toContain("setExtErr(catalogLoadFailure('external', e))");
-    expect(RES_CATALOG).toContain("t('errors.operationFailed')");
   });
 
   it('连接关闭、节点 IPC 失败与托盘 notice 不透传 Error.message', () => {

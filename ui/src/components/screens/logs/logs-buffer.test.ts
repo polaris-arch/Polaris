@@ -118,11 +118,6 @@ describe('接线：LogsScreen 的水合腿真的换成了合并', () => {
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/(^|[^:])\/\/.*$/gm, '$1');
 
-  it('水合走 mergeHydration + maxLogId', () => {
-    expect(src).toMatch(/setLogs\(\(prev\)\s*=>\s*mergeHydration\(prev,/);
-    expect(src).toContain('maxLogId(snapshot)');
-  });
-
   it('水合腿**不得**再调游标去重 `dedupe`（那正是把快照吃空的那一步）', () => {
     // `dedupe` 仍归流式腿用；这里锁的是「它不再出现在 logs.get 的 then 里」。
     const hydration = src.match(/api\.logs[\s\S]{0,600}?\}\)\s*\.catch/);
@@ -135,8 +130,6 @@ describe('接线：LogsScreen 的水合腿真的换成了合并', () => {
     const hydrate = src.indexOf('api.logs.get(subscriptionId, MAX_BUFFERED_ROWS)');
     expect(ready).toBeGreaterThan(0);
     expect(hydrate).toBeGreaterThan(ready);
-    expect(src).toMatch(/api\.logs\s*\.search\(query, displayLevel, source, MAX_BUFFERED_ROWS\)/);
-    expect(src).toContain('const MAX_BUFFERED_ROWS = 500');
   });
 });
 

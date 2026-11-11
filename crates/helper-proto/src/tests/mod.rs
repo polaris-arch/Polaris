@@ -9,28 +9,19 @@ use super::*;
 // 「必须互异」更是把别人的演进史写成自己的不变量（它会主动阻止本该做的统一）。
 //
 // 新前提：版本号只表达「wire 断代」，平台差异由 `Platform`（帧结构）+ `command`（命令集）表达。
-// 故三平台共用一个 `CURRENT`，下面两测锁的是**统一**而非互异。
-
-#[test]
-fn proto_version_is_unified_v4() {
-    assert_eq!(
-        proto_version::CURRENT,
-        4,
-        "explicit runtime directory must be negotiated before appending Start data"
-    );
-}
+// 故三平台共用一个 `CURRENT`，下面一测锁的是**统一**而非互异。
 
 // 曾有一条 `proto_version_does_not_vary_by_platform`：遍历四个 `Platform` 反复断言
 // `Response::Ok(Pong{ proto_version: CURRENT, .. }).to_wire_line()` 的版本段。**已删** ——
 // 循环变量只出现在断言消息里，`advertised` 由常量 `CURRENT` 算出、与平台无关 ⇒ 四次迭代是同一
-// 个断言的四份副本，语义等价于 `CURRENT == 2`（上面那条已覆盖）；它自称能拦「有人按 Platform
+// 个断言的四份副本，字面量由 linux/handler/tests 的 `wire_forms_match_go_source` 钉住；它自称能拦「有人按 Platform
 // match 返不同值」，可新增的那个函数**根本不会被它调用**，拦不住。
 //
 // 「不得 per-platform 分叉」的真锚点在**分叉真会发生的地方** —— 三个平台各自的 `PROTO_VERSION`
-// 常量（cfg 门控模块，helper-proto 这层遍历不到），每处一条字面量断言：
+// 常量（cfg 门控模块，helper-proto 这层遍历不到）：Linux 一处字面量断言，mac/win 断言等于 `CURRENT`：
 //   · `platform::macos::mod.rs`   `proto_version_is_unified_current`
 //   · `platform::windows::mod.rs` `proto_version_is_unified_current`
-//   · `platform::linux::handler.rs` `wire_forms_match_protocol`（钉死当前 protocol）
+//   · `platform::linux::handler.rs` `wire_forms_match_go_source`（钉死当前 protocol）
 // `to_wire_line` 的 Pong 形态另由 `crates/helper-proto/src/response::to_wire_line_matches_go_source_literals` 覆盖。
 
 #[test]
@@ -43,20 +34,6 @@ fn platform_carries_frame_shape_not_version() {
     assert_eq!(mac, "TOK\nping\n", "mac 带 token 行");
     assert_eq!(linux, "ping\n", "linux 走 SO_PEERCRED，无 token 行");
     assert_ne!(mac, linux, "平台差异体现在帧结构上");
-}
-
-/// Windows helper 会合点的绝对值金标。helper 与 helper-client 都引 [`windows_helper`] 的同一份
-/// 常量，两侧之间不可能再分叉；剩下的风险是「这一份被改了」——而已部署的 helper 服务名、管道名、
-/// 目录都烧在用户机器上（SCM 注册、ImagePath、ACL），改值 = 新 app 找不到旧 helper。故判据写死
-/// 字面量：引常量的话常量一改判据跟着漂。
-#[test]
-fn windows_helper_rendezvous_is_pinned() {
-    assert_eq!(windows_helper::SERVICE_NAME, "PolarisHelper");
-    assert_eq!(windows_helper::PIPE_NAME, r"\\.\pipe\polaris-helper");
-    assert_eq!(
-        windows_helper::DEFAULT_SUPPORT_DIR,
-        r"C:\ProgramData\Polaris"
-    );
 }
 
 /// 受保护核目录的文件名白名单：每个平台只有核与配套库两个**精确名**。字面量写死在这里：

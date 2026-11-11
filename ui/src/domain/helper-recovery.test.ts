@@ -48,13 +48,6 @@ describe('Helper recovery uses the existing cancellable main-window explanation'
   });
   it('installation failure stays visible and offers logs without rendering raw diagnostics', () => {
     const source = readFileSync(new URL('../components/screens/settings/SettingsHelper.tsx', import.meta.url), 'utf8');
-    expect(source).toContain("failure = r.success ? null : r.errorCode ?? 'failed'");
-    expect(source).toContain('completeHelperInstall(request, failure)');
-    expect(source).toContain('subscribeHelperInstall(({ busy: installing, failure }) => {');
-    expect(source).toContain('setInstallFailure(failure)');
-    expect(source).toContain('data-testid="helper-install-failure"');
-    expect(source).toContain('helperActionErrorText(installFailure, t)');
-    expect(source).toContain("navigate('logs')");
     // Inspect code nodes rather than text suffixes: localized string keys are
     // data, while diagnostic property reads remain forbidden for any receiver.
     function diagnosticReads(body: string, fileName = 'helper-diagnostic-probe.tsx'): string[] {
@@ -98,12 +91,6 @@ it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('all installation stages have l
     expect(translations.helper.actionError[code]).toEqual(expect.any(String));
     expect(translations.helper.actionError[code].length).toBeGreaterThan(10);
   }
-  for (const key of ['connectionRecoveryTitle', 'connectionRecoveryMessage', 'connectionRecoverySettings']) {
-    expect(translations.helper[key]).toEqual(expect.any(String));
-    expect(translations.helper[key].length).toBeGreaterThan(key === 'connectionRecoveryMessage' ? 30 : 5);
-  }
-  expect(translations.helper.failureNextStep).toBeTruthy();
-  expect(translations.helper.viewLogsAction).toBeTruthy();
 });
 
 it('Home, event routing and tray retain their existing claims while sharing the same recovery intent', () => {

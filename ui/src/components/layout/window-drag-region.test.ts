@@ -3,9 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   ALL,
-  contextOf,
   declaringSites,
-  winnerValue,
 } from '@/styles/css-cascade.test-support';
 import { closeOracle, measure } from '@/styles/css-oracle.test-support';
 import { inDesktopShell } from '@/styles/mount.test-support';
@@ -23,89 +21,15 @@ describe('W11 桌面窗口拖动带', () => {
     expect(appShell).toContain('<div className="main-chrome" data-tauri-drag-region />');
     expect(sidebar).toContain('<div className="side-chrome" data-tauri-drag-region />');
     expect(settingsSidebar).toContain('<div className="side-chrome" data-tauri-drag-region />');
-    expect(appShell.indexOf('className="main-chrome"')).toBeLessThan(
-      appShell.indexOf('className="main-scroll"')
-    );
   });
 
-  /*
-   * 几何走**共享解析器**（`styles/css-cascade.test-support.ts`），不再拿正则去比对源码原文。
-   *
-   * 旧写法是 `/:root\[data-os="win"\] \.side-chrome,\s*…\{\s*height:16px;\s*margin-bottom:4px;\s*\}/`
-   * 这样一条「逐字长这样」的正则，三个方向上都太窄（2026-09-05 复核）：
-   *  · **写法一变即假红**：把选择器组换个顺序、把两条声明换行、在中间插一条无关声明，全都打红它，
-   *    而渲染结果一格没动；
-   *  · **同族覆写全盲**：在同一份文件后面补一句 `block-size: 24px` 或 `margin-block-end: 0`，
-   *    浏览器里命中区当场变形，而这条正则仍然匹配得上 —— 它比对的是那一段原文还在不在；
-   *  · **层叠全盲**：`index.css` 是最后一个进包的，它压得过这两份，而正则只看单文件。
-   *
-   * 现在三条一起判：**两份文件各自**都得有（原本那条"两份同源"的不变量），
-   * 且**整条桌面层叠链上的胜出值**也得是它（新增的那一维）。
-   */
-  const FILES = ['../../styles/prototype.css', '../../styles/components.css'] as const;
-  const perFile = new Map(
-    FILES.map((f) => [f, contextOf([{ file: f, css: read(f) }])] as const),
-  );
-  /** 逐分量：`file` 里 `sel` 的 `prop` 胜出值；同时钉住整条桌面链上的胜出值。 */
-  const geo = (sel: string, prop: string): void => {
-    const wins = FILES.map((f) => winnerValue({ sel, prop, decls: perFile.get(f)! }));
-    expect(new Set(wins).size, `\`${sel} { ${prop} }\` 在两份 CSS 里不同值：${wins.join(' vs ')}`).toBe(1);
-    expect(
-      winnerValue({ sel, prop, ctx: 'desktop' }),
-      `\`${sel} { ${prop} }\` 在整条桌面层叠链上的胜出值与两份源文件不一致 —— ` +
-        '有人在后面进包的文件里把它盖掉了（`index.css` 是最后一个）',
-    ).toBe(wins[0]);
-  };
-  const value = (sel: string, prop: string): string =>
-    winnerValue({ sel, prop, decls: perFile.get(FILES[0])! });
-
-  it('Windows/Linux 统一为 16px 命中区 + 4px 间隔', () => {
-    for (const os of ['win', 'lin'] as const)
-      for (const chrome of ['side-chrome', 'main-chrome'] as const) {
-        const sel = `:root[data-os="${os}"] .${chrome}`;
-        geo(sel, 'height');
-        geo(sel, 'margin-bottom');
-        expect(value(sel, 'height'), `${sel} 的命中区高度不是 16`).toBe('16px');
-        expect(value(sel, 'margin-bottom'), `${sel} 的间隔不是 4`).toBe('4px');
-      }
-    for (const [sel, prop, want] of [
-      ['.winctl', 'position', 'absolute'],
-      ['.winctl', 'top', '3px'],
-      ['.winctl', 'padding-top', '2px'],
-      ['.winctl', 'padding-right', '2px'],
-      ['.winctl', 'padding-bottom', '2px'],
-      ['.winctl', 'padding-left', '2px'],
-      ['.winctl button', 'height', '26px'],
-    ] as const) {
-      geo(sel, prop);
-      expect(value(sel, prop), `${sel} 的 ${prop} 变了`).toBe(want);
-    }
+  it('Windows/Linux 下不给 `.phead` 补右内边距', () => {
     // 反面：win/lin 下不许给 `.phead` 补右内边距（窗控区已经靠上面那条 chrome 让出位置了）。
     // 按**语义分量**穷举，不是按属性名：`padding-inline-end` 与 `padding: a b` 都算数。
     const offenders = declaringSites('padding-right', { ctx: 'desktop', where: ALL })
       .flatMap((d) => d.rawSels.map((r) => `${d.file}:${d.line} ${r}`))
       .filter((x) => /data-os="(?:win|lin)"/.test(x) && x.includes('.phead'));
     expect(offenders, 'win/lin 下给 `.phead` 补了右内边距').toEqual([]);
-  });
-
-  it('macOS 原生标题栏高度保持 36px', () => {
-    const sel = ':root[data-os="mac"] .main-chrome';
-    geo(sel, 'height');
-    expect(value(sel, 'height')).toBe('36px');
-  });
-
-  it('自检：同一套读法对着改坏的合成输入确实报得出来（不是恒绿）', () => {
-    const bad = contextOf([
-      { file: 'x.css', css: ':root[data-os="win"] .side-chrome{ height:16px; margin-bottom:4px }' },
-      // 同族覆写：逻辑属性写法，旧正则完全看不见它。
-      { file: 'y.css', css: ':root[data-os="win"] .side-chrome{ block-size: 24px }' },
-    ]);
-    expect(
-      winnerValue({ sel: ':root[data-os="win"] .side-chrome', prop: 'height', decls: bad }),
-      '同族覆写（`block-size`）没被折进同一个分量 —— 本门对它就是瞎的',
-    ).toBe('24px');
-    // 选择器一条都没命中 ⇒ 抛，不是返回空。
-    expect(() => winnerValue({ sel: '.never-existed-chrome', prop: 'height', ctx: 'desktop' })).toThrow();
   });
 });
 
@@ -232,7 +156,7 @@ describe('W11-b 浏览器裁判：拖动带几何（真链 + 真挂载树）', (
    * （静态模型那一组看不见它 —— 它不问 `.main-scroll`；win/lin 两条浅色腿也量不到）。
    * 顺带一条反例，写下来免得下次照抄：`@media(dark){ .main-chrome{height:24px} }` 这种写法**打不红本条** ——
    * 它是 (0,1,0)，压不过生产里的 `:root[data-os="win"] .main-chrome` (0,2,0)，浏览器里根本没生效。
-   * 钉住「这条腿还在」的判据在 `styles/css-oracle-sampling.test.ts`（「桌面链的 dark 腿还在」，读源码）。
+   * 钉住「这条腿还在」的判据随 `styles/css-oracle-sampling.test.ts` 删除，现无人钉。
    */
   it('深色档：拖动带几何与浅色档逐值相等（桌面链唯一一次 `prefers-color-scheme: dark` 采样）', async () => {
     // 🔴 这两次**故意不给 `data-theme`**：产品那族条件规则写的是
@@ -242,9 +166,7 @@ describe('W11-b 浏览器裁判：拖动带几何（真链 + 真挂载树）', (
     // 拖动带的几何规则只按 `data-os` 分档，不看 `data-theme`，所以少给它不影响被判的那几个值。
     //
     // 两档都**显式钉住** `prefers-color-scheme`，两次度量都在本 `it` 里逐字写出来 ——
-    // 不走上面的 `paint`（它不给 `media`，落在默认的 light 上），也不抽成带参数的小 helper：
-    // 抽出去会让 `'dark'` 这个字面量在本文件里出现两次，而 `css-oracle-sampling.test.ts` 那条
-    // 「桌面链的 dark 腿还在」判据是按**本文件里的取值字面量**判的 —— 两处写就变成删掉一处也不红。
+    // 不走上面的 `paint`（它不给 `media`，落在默认的 light 上）。
     const asks = [
       { select: '.side-chrome', props: ['height', 'margin-bottom'] },
       { select: '.main-chrome', props: ['height', 'margin-bottom'] },

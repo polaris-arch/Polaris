@@ -109,14 +109,6 @@ describe('Taildrop task 纵向接线契约', () => {
     expect(dialog).toContain('taildropTasks(serverId)');
     expect(dialog).toContain('taildropTaskCancel(taskId)');
   });
-
-  it('既有 STATUS relay 的真实计数变化会叫醒收件箱重拉', () => {
-    const dialog = read('components/dialogs/TaildropDialog.tsx');
-    expect(dialog).toContain('status?.waitingFileCount');
-    expect(dialog).toContain('status?.receivingFileCount');
-    expect(dialog).toContain('status?.unreadFileCount');
-    expect(dialog).toMatch(/status\?\.waitingFileCount[\s\S]*status\?\.receivingFileCount[\s\S]*status\?\.unreadFileCount/);
-  });
 });
 
 

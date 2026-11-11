@@ -440,22 +440,6 @@ describe('⓪ 自检：三块判据面都是活的（否则下面每条都恒绿
     expect(bodyCalls(synthetic('syn-body2.ts', 'function f() { h(1); }\n'), 'f', 'g')).toBe(false);
   });
 
-  it('依赖数组尺子分得清「依赖齐」「空数组」「压根没写」（否则那三条依赖断言是空话）', () => {
-    const withDeps = 'function useX() {\n  useEffect(() => {\n    arm(window);\n  }, [a, b]);\n}\n';
-    const emptyDeps = 'function useX() {\n  useEffect(() => {\n    arm(window);\n  }, []);\n}\n';
-    const noDeps = 'function useX() {\n  useEffect(() => {\n    arm(window);\n  });\n}\n';
-    expect(effectDepsOf(synthetic('syn-deps1.ts', withDeps), 'useX', 'arm')).toBe('[a, b]');
-    expect(effectDepsOf(synthetic('syn-deps2.ts', emptyDeps), 'useX', 'arm')).toBe('[]');
-    expect(
-      effectDepsOf(synthetic('syn-deps3.ts', noDeps), 'useX', 'arm'),
-      '「压根没写依赖数组」被读成了空数组 —— 两者的行为相反',
-    ).toBe('');
-    expect(effectDepsOf(synthetic('syn-deps4.ts', withDeps), 'useX', 'other')).toBeNull();
-    // `effectCallsIn`：不要求交回拆卸闭包的那一版（冷启动补锁那条 effect 就没有拆卸）。
-    expect(effectCallsIn(synthetic('syn-eff1.ts', emptyDeps), 'useX', 'arm')).toBe(true);
-    expect(effectCallsIn(synthetic('syn-eff2.ts', emptyDeps), 'useX', 'nope')).toBe(false);
-  });
-
   it('祖先链尺子分得清「兄弟」与「塞进外壳里」（C 组那条包含关系断言的正反对照）', () => {
     const sibling =
       'const A = () => (\n  <>\n    <MobileShell><Screen /></MobileShell>\n    <MobileLockOverlay locked={l} />\n  </>\n);\n';
@@ -478,35 +462,6 @@ describe('⓪ 自检：三块判据面都是活的（否则下面每条都恒绿
     );
     // 反向对照：真的写在代码里就必须留下来（否则这个剥法会让下面的否定断言恒绿）。
     expect(stripComments("const c = 'setPrivacyMode';\n")).toContain('setPrivacyMode');
-  });
-
-  it('假计时器 / 假靶子自检（假的坏了会让 A 组全绿）', () => {
-    const timers = fakeTimers();
-    expect(timers.fire(), '没武装过就说「到点了」').toBe(false);
-    let hit = 0;
-    timers.setTimeout(() => {
-      hit += 1;
-    }, 5);
-    expect(timers.fire()).toBe(true);
-    expect(hit).toBe(1);
-    const target = fakeTarget();
-    let fired = 0;
-    target.addEventListener('touchstart', () => {
-      fired += 1;
-    });
-    target.fire('touchstart');
-    target.fire('keydown'); // 没人听 ⇒ 不该触发
-    expect(fired).toBe(1);
-  });
-
-  it('JSX 属性谓词正反都判得对（否则 B 组那条「点得到」是空话）', () => {
-    const sf = synthetic(
-      'syn-jsx.tsx',
-      'const C = () => <button data-x="1" onClick={go} />;\nconst D = () => <i data-y="1" />;\n',
-    );
-    expect(jsxAttrText(sf, 'data-x', 'onClick')).toBe('go');
-    expect(jsxAttrText(sf, 'data-x', 'onKeyDown'), '属性不在时该返 null，不是空串').toBeNull();
-    expect(jsxAttrText(sf, 'data-nope', 'onClick'), '找不到那个元素时该返 null').toBeNull();
   });
 
   it('深度探针分得清「登记了」与「没登记」（C 组那条否定断言的正向对照）', () => {

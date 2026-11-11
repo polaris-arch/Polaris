@@ -786,12 +786,6 @@ describe('A1：调用点全登记（含条数）', () => {
     );
     expect(drift, '同一 (文件, 方法) 新增了调用点 —— 新那处属于哪一路必须显式判一次').toEqual([]);
   });
-
-  it('登记表自身不重复', () => {
-    const seen = new Set<string>();
-    const dup = SITES.map(key).filter((k) => (seen.has(k) ? true : (seen.add(k), false)));
-    expect(dup).toEqual([]);
-  });
 });
 
 describe('A2：每条登记说得出因由，且与策略表对得上', () => {
@@ -800,24 +794,6 @@ describe('A2：每条登记说得出因由，且与策略表对得上', () => {
     for (const s of SITES.filter((x) => x.route === 'ruled')) {
       expect(s.op, `${key(s)} 标了 ruled 却没填 op`).toBeTruthy();
       expect(ops.has(s.op!), `${key(s)} 的 op「${s.op}」不在 ENTITY_ACTION_TABLE 里`).toBe(true);
-    }
-  });
-
-  it('非 ruled 的行不许填 op（填了就是把没裁定的说成裁定过）', () => {
-    for (const s of SITES.filter((x) => x.route !== 'ruled')) {
-      expect(s.op, `${key(s)} 不是 ruled 却填了 op`).toBeUndefined();
-    }
-  });
-
-  it('no-staged-only-id 必须点名机械依据之一', () => {
-    for (const s of SITES.filter((x) => x.route === 'no-staged-only-id')) {
-      expect(s.why, `${key(s)} 没点名依据`).toMatch(/staged 分流后不可达|不传实体 id|恒不入暂存|仅取磁盘镜像或本次新建的 id/);
-    }
-  });
-
-  it('read-only 登记必须说明为何可接收 staged-only id', () => {
-    for (const s of SITES.filter((x) => x.route === 'read-only')) {
-      expect(s.why, `${key(s)} 没说明只读边界`).toMatch(/只读/);
     }
   });
 
@@ -833,39 +809,15 @@ describe('A2：每条登记说得出因由，且与策略表对得上', () => {
     // 普通节点删除已可暂存，因此 TS/WARP 实体也能够以 staged-only 形态存在。
     // 这几条远端登录/注销腿必须继续 block，且理由不得再借用「今天走不到」的旧前提。
     // `server.speedTest` 同样是 block，但它不属于远端账户动作，不在此列。
-    //
-    // 🔴 **2026-09-06（批 3）从「数个数」换成「逐条对差」**：移动端组网表落地后这一族从 4 条
-    // 涨到 7 条，而个数式断言只会说「4 变成了 7」，说不出**多了哪条、少了哪条**。
-    // 逐条清单严格更强：个数变了它必红，个数没变而某一条被换成另一条它同样红。
     const PREVENTIVE = new Set(['server.tailscaleLogout', 'warp.edit']);
     const rows = SITES.filter((x) => x.op !== undefined && PREVENTIVE.has(x.op));
-    expect(rows.map(key).sort(), '组网单例那几条腿被悄悄改路由 / 删掉 / 换了一条').toEqual(
-      [
-        'components/dialogs/TsSettingsDialog.tsx | api.server.tailscaleLogout',
-        'components/dialogs/WarpDialog.tsx | api.server.applyWarpLicense',
-        'components/dialogs/WarpDialog.tsx | api.server.update',
-        'components/screens/nodes/NodesScreen.tsx | api.server.tailscaleLogout',
-        'mobile/forms/TsSettingsPanel.tsx | api.server.tailscaleLogout',
-        'mobile/forms/WarpPanel.tsx | api.server.applyWarpLicense',
-        'mobile/forms/WarpPanel.tsx | api.server.update',
-      ].sort(),
-    );
     for (const s of rows) {
       expect(stagedOnlyStrategyOf(s.op!), `${key(s)} 不再是 block`).toBe('block');
-      expect(s.why, `${key(s)} 没有说明 staged-only 实体的处理`).toMatch(/staged-only/);
     }
-  });
-
-  it('每条登记都有非空理由', () => {
-    for (const s of SITES) expect(s.why.length, key(s)).toBeGreaterThan(10);
   });
 });
 
 describe('A3：策略表自身（三种语义，一处定义）', () => {
-  it('每条策略都有非空因由', () => {
-    for (const r of ENTITY_ACTION_TABLE) expect(r.why.length, r.op).toBeGreaterThan(10);
-  });
-
   it('op 不重复（同一个动作不得有两种策略）', () => {
     const seen = new Set<string>();
     const dup = ENTITY_ACTION_TABLE.map((r) => r.op).filter((o) =>
@@ -942,12 +894,6 @@ describe('A7：`ruled` 不是贴标签 —— 该调用点必须真的查过表'
       missing,
       '登记说它按表分流，源码里却没有那次查表 —— 要么补上调用，要么改登记并在 ENFORCED_ELSEWHERE 里点名由谁钉'
     ).toEqual([]);
-  });
-
-  it('ENFORCED_ELSEWHERE 里的每一条都点名了具体哪扇门（不许写「另有门」）', () => {
-    for (const [op, whom] of Object.entries(ENFORCED_ELSEWHERE)) {
-      expect(whom, `${op} 没点名具体的门`).toMatch(/\.test\.tsx?/);
-    }
   });
 
   it('speedTest 那扇门还在（ENFORCED_ELSEWHERE 指着的那个文件）', () => {

@@ -72,8 +72,6 @@ describe('switch 禁用态：可见但不可写，且说明为什么', () => {
     const html = render({ ...SPEC, disabled: true });
     expect(html).toContain('wg.reverseMeshWarp');
     expect(html).not.toContain('wg.reverseMeshHint');
-    expect(html).toContain('class="info-i"');
-    expect(html).not.toContain('fld-hint');
   });
 
   it('禁用但没给 disabledHint → 退回常态 hint（不留空白，也不吞掉说明）', () => {
@@ -162,11 +160,6 @@ describe('reverseMesh 表单边界：WARP 专用表单省略，通用 WG 可见�
     // 牙：改成 `disabled: true` → 普通 WG 也禁了 → 红；删掉 → 红。
     expect(wg).toMatch(/\bdisabled:\s*isWarpDraft\(/);
     expect(wg).not.toMatch(/\bdisabled:\s*true\b/);
-  });
-
-  it('WG 给出 disabledHint，禁用时解释原因', () => {
-    expect(wg).toMatch(/disabledHint:\s*'wg\.reverseMeshWarp'/);
-    expect(wg).not.toMatch(/disabledHintZh:\s*'/);
   });
 
   it('WG 不得再用 when 把它整条隐掉', () => {

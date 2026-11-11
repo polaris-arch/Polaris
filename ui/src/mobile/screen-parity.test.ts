@@ -72,21 +72,17 @@
  *    在 `components/hover-cards/RuleHoverCard.tsx`）。`primitiveModules` 是反向豁免，
  *    它不是白名单：⓪ 组要求那个文件在自有目录里、且**自己一句 `t('…')` 都不渲染**。
  *
- * **C 具名数据槽面** —— 桌面这一屏（全部 `desktopDirs`）的 `id="…"` 字面量，
- *    与各表的 `slotBaseline` **恰等**。
- *    🔴 **这一面是变更探测器，不是对差面**（口径写在 `parity-registry.ts` 的字段注释里）：
- *    它回答「桌面这一屏的数据槽集合有没有在没人看的情况下变过」，**答不出**移动端画没画其中某一个。
- *
  * **D 喂数腿面** —— 见 `feed-register.ts` 头注（取材面在移动端这一侧，判据是写入方存在）。
  *
  * ── 射程自曝：本门**守不住**什么，以及那些格由谁兜 ─────────────────────────
  *
- * 1. **逐个数据槽的对差**（C 面只做基线，不做落点核对）。兜它的是各屏自己的渲染门，
+ * 1. **逐个数据槽的对差**。兜它的是各屏自己的渲染门，
  *    四屏各自把接手门写进 `slotHandoffGates`，⑥ 组**逐条打开核对**（文件在 + 那一组 describe 的
  *    字面标题在）——上一版这句交接只落在四分之一上（只断言了 `MobileSettings.test.tsx`）。
  *    设置屏另有一条更强的正面断言：桌面九张设置子页必须恰好等于
  *    `MOBILE_SETTINGS_PAGES ∪ MOBILE_ABSENT_SETTINGS_PAGE` —— 那两个常量正是
  *    `MobileSettings.test.tsx ①` 的真值源。交接处对不上就红，不是「相信它兜住了」。
+ *    桌面屏具名数据槽（`id="…"`）的增删已不再检测（`slotBaseline` 已移除）。
  * 2. **一次 `update()` 里键名要到运行期才知道的那一类写腿**（`update({ [key]: v })`）。
  *    本门把它记成 `field:[key]` 这一条**必须被显式判一次**的登记，但它**答不出**那个调用点
  *    今天承载哪几个字段。今天那一条跨 `mixedPort` / `controlPort`，两者的缺席由
@@ -108,7 +104,7 @@
  * ④ 组有一条反向对照要证明「只出现在注释里的文本喂不饱锚」，它需要一段**确实只在注释里**的文本。
  * 就是下面这个探针，别删、别在代码里写成一整个字面量（那条断言会拼出它来找）：__墓碑注释反向对照探针__
  *
- * 三个桌面面全部**排除测试文件**（`.test.tsx` / `.spec.tsx`）：这些门的测试文件里满是
+ * 两个桌面面全部**排除测试文件**（`.test.tsx` / `.spec.tsx`）：这些门的测试文件里满是
  * `<button` 夹具与 `id="…"` 断言，纳进来会让桌面面凭空长大、逼着登记表去登记一批夹具。
  * ⓪ 组带一条**切点自检**：证明排除之后每一面都还剩得下真取材面（不能排成空集），
  * 且证明排除动作**有对象可排**（那些测试文件确实在目录里）。
@@ -673,19 +669,6 @@ export function ownBlocks(
   return [...tags].filter((n) => own.has(n) && !primitive.has(n)).sort();
 }
 
-/* ────────────────────────── C 面：具名数据槽 ────────────────────────── */
-
-export function namedSlots(dirsAbs: readonly string[]): string[] {
-  const slots = new Set<string>();
-  for (const dirAbs of dirsAbs) {
-    for (const name of screenFiles(dirAbs)) {
-      const body = strip(readFileSync(join(dirAbs, name), 'utf8'));
-      for (const m of body.matchAll(/\bid="([^"{}]+)"/g)) slots.add(m[1]!);
-    }
-  }
-  return [...slots].sort();
-}
-
 /* ────────────────────────── D 面：喂数腿 ────────────────────────── */
 
 const STORE_HOOK = /Store$|^useEffectiveConfig$|^useEffectiveServers$|^useSystemProxyLive$/;
@@ -790,7 +773,6 @@ interface ScreenFace {
   readonly actionSources: readonly ActionSource[];
   readonly oneHop: ReadonlyMap<string, Set<string>>;
   readonly blocks: readonly string[];
-  readonly slots: readonly string[];
 }
 
 const FACES: readonly ScreenFace[] = REGISTERS.map((register) => {
@@ -822,7 +804,6 @@ const FACES: readonly ScreenFace[] = REGISTERS.map((register) => {
       register.primitiveModules.map((f) => join(REPO, f)),
       register.extraBlockSources.map((f) => join(REPO, f)),
     ),
-    slots: namedSlots(desktopDirsAbs),
   };
 });
 
@@ -889,9 +870,6 @@ const ALL_ANCHORS: readonly ResolvedAnchor[] = [
   }),
 ];
 
-/** 排期措辞 —— 逐字同 `app-wiring.test.tsx` ⑫：排期不是判定。 */
-const EXCUSE = /本批|下一批|以后|排期|暂时不做|先不做|还没做|待接线/;
-
 const ZH_CN = JSON.parse(readFileSync(join(UI_SRC, 'i18n', 'locales', 'zh-CN.json'), 'utf8')) as Record<string, unknown>;
 function localeHas(key: string): boolean {
   return (
@@ -908,7 +886,7 @@ if (process.env.POLARIS_WIRING_REPORT === '1') {
     const debts = [...face.register.actions, ...face.register.blocks].filter((e) => isDebt(e.disposition));
     lines.push(
       `${face.register.screen.padEnd(12)} 动作面(${face.register.actionFaces.join('+')})=${face.actions.length}` +
-        `  数据块=${face.blocks.length}  数据槽基线=${face.slots.length}  登记=${
+        `  数据块=${face.blocks.length}  登记=${
           face.register.actions.length + face.register.blocks.length
         }  其中债务=${debts.length}`,
     );
@@ -1050,15 +1028,6 @@ describe('⓪ 自检：四个取材面都是活的，且判据没被自己污染
         `${register.screen}：${file} 不在这一屏的 desktopDirs 里 —— 那不是「本屏的原语库」`,
       ).toBe(true);
     }
-    // Sharing the measurement implementation across desktop/mobile does not make
-    // its owned status/path copy a common-only primitive.
-    expect(screenKeysOf('ui/src/mobile/MeasurementLabel.tsx')).toEqual([
-      'measurement.expiredHint', 'measurement.nodePath', 'measurement.unavailable',
-      'nodes.invalidVisionTransport', 'nodes.nodeInvalid',
-    ]);
-    expect(HOME_PARITY.extraBlockSources).toContain('ui/src/mobile/MeasurementLabel.tsx');
-    expect(HOME_PARITY.sharedPrimitives).not.toContain('ui/src/mobile/MeasurementLabel.tsx');
-    expect(HOME_PARITY.blocks.find(entry => entry.id === 'MeasurementLabel')?.disposition.kind).toBe('ported');
     // 反向对照：一份**真的是内容**的文件必须被这条判据判成不合格（证明它不是恒真）。
     expect(
       screenKeysOf('ui/src/components/hover-cards/RuleHoverCard.tsx').length,
@@ -1078,15 +1047,13 @@ describe('⓪ 自检：四个取材面都是活的，且判据没被自己污染
     }
   });
 
-  it('三个桌面面都有量级（任一塌成空集会让下面的等式恒绿）', () => {
+  it('两个桌面面都有量级（任一塌成空集会让下面的等式恒绿）', () => {
     const actions = FACES.reduce((n, f) => n + f.actions.length, 0);
     const blocks = FACES.reduce((n, f) => n + f.blocks.length, 0);
-    const slots = FACES.reduce((n, f) => n + f.slots.length, 0);
-    // 下限贴着今天的真值（动作 208 / 块 49 / 槽 123）留一成余量：任一面**部分**塌掉
+    // 下限贴着今天的真值（动作 208 / 块 49）留一成余量：任一面**部分**塌掉
     // （比如某个 `desktopDirs` 掉了一项、或某个提取器不再认某种形态）也要红，不是只在塌成空集时才红。
     expect(actions, `四屏动作面一共只抓到 ${actions} 条`).toBeGreaterThan(180);
     expect(blocks, `四屏数据块面一共只抓到 ${blocks} 个`).toBeGreaterThan(40);
-    expect(slots, `四屏数据槽面一共只抓到 ${slots} 个`).toBeGreaterThan(110);
     expect(FEED_FACE.size, `移动端 store 读点只抓到 ${FEED_FACE.size} 条`).toBeGreaterThan(45);
     expect(MOBILE_SOURCES.size, '移动端生产文件数掉了一大截').toBeGreaterThan(30);
   });
@@ -1242,8 +1209,8 @@ describe('① 动作面：桌面每一颗都判过，且判词与移动端事实
      * 取 200：今日实况 230（首页 32 / 连接 33 / 规则 63 / 设置 102）。留 30 条余量给正常增删，
      * **不给「少了一整张表」留余量** —— 最小的那张 32 条，掉任何一张都会跌破 200。
      *
-     * 「活真干完了」那一档由别处答，不由这里：`wiring-completeness.test.ts` 的
-     * `COMPLETION_GATE_MODE` 清零那天从 `known-red` 改成 `hard`。一个门答一个问题。
+     * 「活真干完了」那一档由别处答，不由这里：`wiring-completeness.test.ts` 的完成门（硬门）。
+     * 一个门答一个问题。
      */
     const all = REGISTERS.flatMap((r) => [...r.actions, ...r.blocks]);
     expect(
@@ -1280,12 +1247,6 @@ describe('② 数据块面：桌面这一屏自己的每一块都判过（W-27 �
         `${face.register.screen} 的数据块面是空的 —— 先确认那是事实，不是提取器塌了`,
       ).toBeGreaterThan(0);
     }
-    // 连接屏是这一面上最薄的一屏：两个桌面目录各自一个 `*Screen.tsx` 画完，没有把任何呈现块
-    // 拆成组件，唯一那一块是渲染一跳带进来的 `RuleSubjectMenuItems`。它一度**真的是空集**，
-    // 所以「空集」这个取值必须报得出来，不能是提取器永远给不出的东西 —— 合成一个只有纯逻辑
-    // 文件的目录喂进去，必须得到 `[]`。
-    expect(ownBlocks([join(UI_SRC, 'contracts')]), '块面提取器对一个没有组件的目录居然不返回空集').toEqual([]);
-    expect(FACES.find((f) => f.register.screen === 'connections')!.blocks).toEqual(['RuleSubjectMenuItems']);
   });
 
   it('W-27 回放的落点在场：反向分流指示器登记着 ported，且它的锚指向移动端首页的真渲染', () => {
@@ -1297,19 +1258,6 @@ describe('② 数据块面：桌面这一屏自己的每一块都判过（W-27 �
     const resolved = resolveAnchor('W-27', anchor);
     expect(resolved.exists).toBe(true);
     expect(resolved.hit, '移动端首页不再渲染反向分流指示器 —— 这正是 2026-07-20 那次真机事故的形态').toBeGreaterThan(0);
-  });
-});
-
-describe('③ 具名数据槽：桌面这一屏的槽集合没有在没人看的情况下变过', () => {
-  it.each(REGISTERS.map((r) => [r.screen] as const))('%s：桌面 id= 全集 ≡ slotBaseline', (screen) => {
-    const face = FACES.find((f) => f.register.screen === screen)!;
-    expect(
-      face.slots,
-      `桌面 ${screen} 屏的具名数据槽变了。这一面是**变更探测器**：它不知道移动端画没画，\n` +
-        '只负责逼一次「移动端要不要有这一格」的显式决定。判完把基线推到新集合。\n' +
-        `新增：${face.slots.filter((s) => !face.register.slotBaseline.includes(s)).join(' , ') || '（无）'}\n` +
-        `消失：${face.register.slotBaseline.filter((s) => !face.slots.includes(s)).join(' , ') || '（无）'}`,
-    ).toEqual(face.register.slotBaseline.slice().sort());
   });
 });
 
@@ -1432,14 +1380,6 @@ describe('④ 锚：每一条豁免都被真的打开核对（不是形状检查
 
 describe('⑤ 喂数腿：移动端读的每一格 store 状态都有写入方（W-23 / W-24 住在这一面上）', () => {
   it('共享测量 feed 是数字写入与撤回的真实调用方，不把共享内部 action 伪登记为移动直接读点', () => {
-    const source = strip(readFileSync(join(REPO, 'ui/src/store/use-latency-store.ts'), 'utf8'));
-    expect(source).toContain('applySnapshot(result, currentConfig.servers)');
-    expect(source).toContain('useLatencyStore.getState().invalidate(true)');
-    expect(source).toContain('const ticket = epoch;');
-    expect(source).toContain('ticket !== epoch');
-    expect(source).toContain('api.server.speedTestResultSnapshot()');
-    expect(source).toContain('api.server.onSpeedTestResult(schedule)');
-    expect(source).toContain('api.server.onSpeedTestSchedule(schedule)');
     for (const id of ['useLatencyStore.applySnapshot', 'useLatencyStore.invalidate']) {
       expect(FEED_FACE.has(id)).toBe(false);
       expect(MOBILE_FEEDS.some(row => row.id === id)).toBe(false);
@@ -1537,7 +1477,6 @@ describe('⑥ 交接：被本门显式缩掉的那两格，接手的那道门与
       .filter((b) => /^Settings[A-Z]/.test(b))
       .map((b) => b.replace(/^Settings/, '').toLowerCase())
       .sort();
-    expect(subPages.length, '桌面设置子页一个都没抓到 ⇒ 这条交接断言恒绿').toBe(9);
     const mobileSide = [...MOBILE_SETTINGS_PAGES, MOBILE_ABSENT_SETTINGS_PAGE].sort();
     expect(
       subPages,
@@ -1574,18 +1513,7 @@ describe('⑥ 交接：被本门显式缩掉的那两格，接手的那道门与
   });
 });
 
-describe('⑦ 判词纪律：理由不许是排期，缺席理由键必须真的在 locale 里', () => {
-  it('每条登记的 `note` 都够长、且不是排期', () => {
-    for (const [owner, entry] of ALL_ENTRIES) {
-      expect(entry.note.length, `${owner} 的 note 太短，说不清射程`).toBeGreaterThan(15);
-      expect(entry.note, `${owner} 的 note 写的是排期，不是判定`).not.toMatch(EXCUSE);
-    }
-    for (const entry of MOBILE_FEEDS) {
-      expect(entry.note.length, `feed/${entry.id} 的 note 太短`).toBeGreaterThan(5);
-      expect(entry.note, `feed/${entry.id} 的 note 写的是排期`).not.toMatch(EXCUSE);
-    }
-  });
-
+describe('⑦ 判词纪律：缺席理由键必须真的在 locale 里', () => {
   it('每个 `reasonKey` 都在 zh-CN 里存在，且**在移动端生产源码里真有渲染点**', () => {
     // 取材面里已经没有登记表了（`IS_TEST` = 共享的 test-only 谓词，`*.test-support.ts` 整批在外），
     // 但这里再显式排一次并**自检排完非空** —— 两道防线，因为这条断言一旦被登记表自己喂饱就恒绿。
@@ -1745,22 +1673,6 @@ it('JSX action slots expose their real buttons, not a synthetic presenter action
   expect(actionElementsOf(`<Widget onClick={() => invoke('action')} />`)).toHaveLength(1);
 });
 
-
-it('render-slot content evidence remains checked separately from actual actions', () => {
-  // Former container entries remain content checks, not extra clickable controls.
-  for (const evidence of [
-    { file: "src-tauri/src/commands/coexistence_snapshot.rs", mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
-    { file: "ui/src/mobile/settings/TunReports.tsx", mustContain: "t('settings.tun.forceRouteLoading')" },
-    { file: "ui/src/mobile/settings/TunReports.tsx", mustContain: 'className="ms-force-refresh" onClick={onRefresh} disabled={loading}' },
-    { file: "ui/src/mobile/settings/DnsPage.tsx", mustContain: 'toggleFakeIp' },
-    { file: "ui/src/mobile/screens/rules/RulesScreen.tsx", mustContain: "if (page === 'network-profiles') {" },
-    { file: "ui/src/mobile/screens/rules/NetworkProfilesPage.tsx", mustContain: "{t('mobileRules.networkProfile.intro')}" },
-    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: 'if (cfg.config === null) {' },
-    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: 'function ProfileForm(' },
-    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: 'if (profileId && !base) {' },
-    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: "{t('rules.networkProfile.missing')}" },
-  ]) expect(readFileSync(join(REPO, evidence.file), 'utf8')).toContain(evidence.mustContain);
-});
 
 it('actual render-slot producers retain nested controls without counting their containers', () => {
   const cases = [

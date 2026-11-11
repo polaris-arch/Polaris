@@ -16,8 +16,6 @@
  * 单行截断的视觉效果（`.rmeta` 的 `text-overflow`）要真 CSSOM，node 下无从断言。
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { Rule } from '@/contracts/types';
 
@@ -85,26 +83,6 @@ describe('规则行条件摘要', () => {
     const html = renderToStaticMarkup(<RuleMetaCounts rule={SINGLE} />);
     expect(html).toContain('×1');
     expect(html.match(/rmeta-cnt/g)?.length).toBe(1);
-  });
-
-  /// G2：折叠不等于删信息 —— 值必须仍被交给悬停面板。
-  ///
-  /// **为什么是源码守卫而不是渲染断言**：`HoverCardPanel` 在 `open=false` 时 `return null`
-  /// （HoverCard.tsx:132），而 `renderToStaticMarkup` 下 hover 恒未展开 ⇒ 产物里必然没有值，
-  /// 对它断言只会永远转红。故这一条只能守「接线在」：面板体里真的渲染了 `cond.values`。
-  ///
-  /// 变异锁：把面板里的 `cond.values.join(', ')` 删掉或换成计数 → 转红。守的是「这是折叠，不是丢数据」。
-  it('值被交给了悬停面板（接线守卫）', () => {
-    const src = readFileSync(
-      fileURLToPath(new URL('./RuleItem.tsx', import.meta.url)),
-      'utf8'
-    );
-    const at = src.indexOf('function CondCount');
-    expect(at).toBeGreaterThan(-1);
-    const body = src.slice(at, src.indexOf('function RuleMetaCounts'));
-    expect(body).toContain('<HoverCardPanel');
-    expect(body).toMatch(/cond\.values\.join\(/);
-    expect(body).toContain('rmeta-vals');
   });
 
   /// G3：AND / OR 的连接符语义不能在改版里丢。

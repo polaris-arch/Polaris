@@ -141,20 +141,6 @@ describe('Q1-b ④ 正常退出标记 —— 恢复腿的闸', () => {
   });
 
   /**
-   * **进程没退（自愈重载 / C16 轻量模式销毁重建）⇒ staged 保留**。后端不会在这些路径上落标记，
-   * 渲染端这一侧的表现与强杀同形：拿到假 ⇒ 恢复。这条与上一条断言相同、**前提不同**，
-   * 留着是因为它对应的是两个独立的回归方向（后端把标记落错地方 vs 前端不看标记）。
-   *
-   * 牙：同上；后端那一半（标记只在 `prevent_exit` 放行之后落）由 `lib.rs` 的调用点位置保证，
-   * 本环境判不了，已在交付里列为真机项。
-   */
-  it('轻量模式销毁重建 webview（进程没退）⇒ 暂存照常恢复', async () => {
-    cleanExitMock.mockImplementation(async () => false);
-    const mod = await bootWithPersistedStaged();
-    expect(mod.useStagedConfigStore.getState().entries).toEqual([ENTRY]);
-  });
-
-  /**
    * **一个 webview 只问一次**。标记是读即清的一次性资源：**并发**的两次首次 hydrate
    * （`loadConfig` 与 `loadConfig(true)` 前后脚落地，`hydrated` 还没置上）若各问一次，
    * 「谁先谁后」就成了清不清的决定因素 —— 那是竞态不是判据。

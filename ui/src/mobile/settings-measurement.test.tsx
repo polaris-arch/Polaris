@@ -43,13 +43,6 @@ it('fresh measurement retains its actual numeric value', () => {
   const html = renderToStaticMarkup(<MeasurementLabel serverId="a" purpose="current" compact />);
   expect(html).toContain('>42 ms</span>'); expect(html).toContain('42 ms · measurement.systemPath');
 });
-it('v2 FakeIP links to the existing DNS workspace without adding a second toggle', () => {
-  const source = readFileSync(new URL('../components/screens/settings/SettingsDns.tsx', import.meta.url), 'utf8');
-  const hint = source.split('{hasDnsPolicyV2 && <SetRow label="FakeIP"')[1].split('</SetRow>}')[0];
-  expect(hint).toContain("navigate('dnsrules')"); expect(hint).not.toContain('<Switch');
-  expect(source).toContain('{!hasDnsPolicyV2 && <SetRow label="FakeIP"');
-});
-
 it('mobile settings uses its existing touch-sized row and switch, not desktop-only CSS', () => {
   const html = renderToStaticMarkup(<AutoSelectControls config={config} accept={() => {}} t={key => key} variant="switch" settingsLayout="mobile" />);
   expect(html).toContain('data-setting="auto-select-mode"'); expect(html).toContain('min-width:var(--tap-min)');

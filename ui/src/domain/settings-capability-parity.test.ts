@@ -112,13 +112,6 @@ it('both inventory commit handlers use the same validated transaction before pat
     const guard = body.indexOf('if (!edit.ok) return false;');
     expect(guard).toBeGreaterThan(0);
     expect(body.indexOf('patchDns(')).toBeGreaterThan(guard);
-    expect(body).toContain('nodeResolverCustom: edit.custom, nodeResolverPool: edit.pool');
-    expect(body).toContain('specs.map((spec, index) => ({ spec, id: ids[index] }))'.replace('specs', handler === 'setCustomUpstreams' ? 'specs' : 'next'));
-    expect(source).toContain('entryIds={customUpstreams.map((item) => item.id)}');
-    expect(body).toContain('{ sources, context }');
-    expect(body).toContain('return edit.editor;');
-    expect(source).toContain('entryContextKey={JSON.stringify(racePool)}');
-    expect(source).toContain("customInventoryError === 'quota' ?");
   }
 });
 

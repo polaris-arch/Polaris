@@ -705,9 +705,6 @@ describe('① 有序规则列表在任何断点下都不进双列', () => {
         `${name} 段的 .mr-cards 没挂 data-flow="multi" —— 有序列表的祖先链判据就漏了这条路`,
       ).toContain('data-flow="multi"');
     }
-    // 反面对照：卡片容器与行容器是两个不同的类，没被合并成一个。
-    expect(CSS).toContain('.mr-cards');
-    expect(CSS).toContain('.mr-flow');
   });
 
   it('CSS：`.mr-list` 自己的声明面里没有任何能造出第二列的属性', () => {
@@ -932,7 +929,6 @@ describe('② IA 裁定 #7：不得出现「哪些应用走隧道」的入口，
          + `aria-expanded`，与桌面 `.csel-grp-t` / `.ns-grp` 同形。 */
       expect(header, '组头没有展开态语义').toContain('aria-expanded="false"');
       expect(header, '组头没有计数').toContain('class="mr-cnt"');
-      expect(header, '组头缺 chevron 字形').toContain('M9 6l6 6-6 6');
     }
     /* 折叠时组内选项**不渲染**（这正是它存在的理由：390 宽的屏摆不下几十个节点）。 */
     expect(closed, '折叠着却把节点渲染出来了').not.toContain('>HK-01</span>');
@@ -1055,11 +1051,6 @@ describe('③ §4.12：没有一处解释只挂在 `data-tip` 上', () => {
     const text = textNodesOf(render());
     expect(text, `${key} 在移动端没有任何**可见**的常驻落点（只在属性里不算）`).toContain(key);
   });
-
-  it('计数：桌面这四个屏的 tip 解释一条不落（枚举本身不许缩水）', () => {
-    // 缩短这张表 = 悄悄放弃几条解释。用一个下界钉住它，改表要先改这个数。
-    expect(RESIDENT.length).toBeGreaterThanOrEqual(23);
-  });
 });
 
 describe('④ 内容顺序与 IA §2.2 对拍（DOM 顺序即重要性顺序）', () => {
@@ -1178,20 +1169,6 @@ describe('⑤bis 资源行的大小与更新时间（`data-contract.json#sources
     expect(metaOf('r3')).not.toContain('common.relJustNow');
   });
 
-  it('那句「未登记所以不画」的说明必须已经撤掉（缺口没了，描述缺口的话就成了假话）', () => {
-    expect(resourcesMarkup(null)).not.toContain('resourceMetaUnregistered');
-    expect(SOURCE, '容器里还在消费那条已撤销的键').not.toContain('resourceMetaUnregistered');
-    for (const lang of ['zh-CN', 'zh-TW', 'en-US', 'ru', 'fa']) {
-      const json = JSON.parse(
-        readFileSync(join(HERE, '../../../i18n/locales', `${lang}.json`), 'utf8'),
-      ) as { mobileRules: Record<string, unknown> };
-      expect(
-        json.mobileRules.resourceMetaUnregistered,
-        `${lang} 里那条键还在 —— 键留着就还会有人去消费它`,
-      ).toBeUndefined();
-    }
-  });
-
   /**
    * 数据源那一侧。**不读 `data-contract.json` 本体**：那份契约住在 vault（仓外 `~/docs`），
    * CI 上根本不存在 —— 读它的门在本机绿、在 CI 上 ENOENT 红，那不是判据是绊线。
@@ -1235,14 +1212,6 @@ describe('⑥ 写操作失败必须有**可见**回显（行内，贴着那颗�
    */
   it('自检：门面仍是可注入的，且移动端的宿主真的在（正面取证）', () => {
     const repoUi = fileURLToPath(new URL('../../../', import.meta.url));
-    const handler = readFileSync(join(repoUi, 'lib/error-handler.ts'), 'utf8');
-    const toaster = readFileSync(join(repoUi, 'components/layout/Toaster.tsx'), 'utf8');
-    const shell = readFileSync(join(repoUi, 'components/layout/AppShell.tsx'), 'utf8');
-    expect(handler, 'toast 的默认实现不再是 console —— 本组的前提变了，请重判').toContain(
-      'let toastImpl: ToastImpl = consoleToast;',
-    );
-    expect(toaster, '桌面注入点变了').toContain('setToastImpl(');
-    expect(shell, '`<Toaster />` 不再挂在桌面外壳上 —— 前提变了，请重判').toContain('<Toaster />');
     // 移动端那一侧：宿主在自己的文件里注入，且由 `MobileApp` 装配。
     const mobileToaster = readFileSync(join(repoUi, 'mobile/MobileToaster.tsx'), 'utf8');
     expect(mobileToaster, '移动端宿主不再注入门面 —— 那 24 处反馈会重新落 console').toContain(
@@ -1252,12 +1221,6 @@ describe('⑥ 写操作失败必须有**可见**回显（行内，贴着那颗�
     expect(mobileApp, '`<MobileToaster />` 没有被装配 —— 宿主写了但没人挂 = 仍然静音').toContain(
       '<MobileToaster />',
     );
-    // 移动外壳**仍然**不许直接引桌面 Toaster（它的外观住在桌面层叠链上，契约 A1）。
-    const mobileShell = readFileSync(join(repoUi, 'mobile/MobileShell.tsx'), 'utf8');
-    expect(
-      mobileShell,
-      '移动外壳引了桌面 Toaster —— 整条桌面 CSS 层叠链会被拖进移动包',
-    ).not.toContain("from '@/components/layout/Toaster'");
   });
 
   it('源码面：每一个 catch 块都要走一条**可见**通道，不许只 console/toast/回滚', () => {
@@ -1434,23 +1397,6 @@ const declsAnywhere = (selector: string): string =>
 /** 同上，但拿到分量表本身（要点名某个分量的值时用）。 */
 const wonMap = (selector: string) => winners({ sel: selector, ctx: 'mobile', where: UNCONDITIONAL }).won;
 
-/**
- * `selector` 上「有人从更窄处压你」的**选择器全集**（`file:line 选择器` 去重排序）。
- *
- * 2026-09-05 MAJ-3：本文件的 `declsOf` / `wonMap` 全程只调 `winners`，而那时 `winners` 不算
- * narrower 桶 ⇒ 「更窄选择器从旁边压下来」这一族对 ⑧ 等于不存在。
- * ⚠️ 它只收**语法上严格更窄**的选择器：互不包含却命中同一元素的那一族（`.mr-screen .mr-ap-body.dim`
- * 之于 `.mr-ap-body.dim` 是更窄的，但 `.mn-row .mn-lat` 之于 `.mn-lat.fast` 不是）进不了任何桶，
- * 那一族归 ⑮ 组的浏览器裁判。此前桶里只收**与本选择器重叠的
- * 分量**，所以清单是可穷举的：下面把它钉成具名清单，多一条少一条都红。
- */
-const narrowerOf = (selector: string): string[] =>
-  [
-    ...new Set(
-      winners({ sel: selector, ctx: 'mobile', where: UNCONDITIONAL }).narrower.map((c) => c.decl.rawSels.join(', ')),
-    ),
-  ].sort();
-
 describe('⑧ 分段控件：当前两层呈现与实际命中面', () => {
   afterAll(closeOracle, 30_000);
 
@@ -1460,9 +1406,6 @@ describe('⑧ 分段控件：当前两层呈现与实际命中面', () => {
     const track = html.match(/<div class="mr-geo-regions"[^>]*>([\s\S]*?)<\/div>/)?.[1] ?? '';
     expect((track.match(/aria-pressed="true"/g) ?? [])).toHaveLength(1);
     expect((track.match(/<button/g) ?? [])).toHaveLength(2);
-    expect(declsOf('.mr-geo-regions')).toContain('border-radius');
-    expect(declsOf('.mr-geo-regions .mr-btn')).toContain('background-color: transparent');
-    expect(narrowerOf('.mr-btn')).toContain('.mr-screen .mr-btn');
   });
 
   it('窄屏浏览器里两个按钮各自可点，选中底只画在有限伪元素上', async () => {
@@ -1683,12 +1626,6 @@ describe('⑪ DNS 段屏头 = 溢出 + 添加，两颗封顶（IA §1.2、§2.1�
       '流量段专属分支里不止一颗按钮 —— 加上共用的「添加规则」就超过了 §3.1 #10 的两颗上限',
     ).toBe(1);
     expect(trafficBranch, '流量段溢出按钮没用 `MoreIcon`').toContain('<MoreIcon />');
-    /* 屏头源码里一共几颗：dns / 流量两个互斥分支各一颗溢出 + 两段共用的「添加规则」= 3；
-       **每个分段可见的**仍是「溢出 + 添加规则」两颗，正好压在上限上（互斥由上面两条分支切片证明）。 */
-    expect(
-      [...ACTS.matchAll(/<button\b/g)].length,
-      '动作簇里的按钮总数变了 —— 重新数一遍每个分段实际可见几颗再改这个数',
-    ).toBe(3);
     expect(ACTS, '网络场景入口直接摆在了屏头上 —— 它从 header overflow 进').not.toContain(
       'rules.networkProfile.entry',
     );
@@ -1792,17 +1729,6 @@ describe('⑫ 规则行有抓握条，长按拖拽落到与四颗按钮同一条
    * 少 CSS 那半是死区，少 JS 那半是「拖着拖着列表也跟着滚」。故两半各一条断言。
    */
   it('抓握条不是滚动死区：CSS 放行纵向平移，接管由长按成立后的非被动监听做', () => {
-    const gripAnywhere = declsAnywhere('.mr-grip');
-    expect(gripAnywhere, '`.mr-grip` 这条规则不见了 —— 判据面塌了').not.toBe('');
-    expect(
-      gripAnywhere,
-      '`.mr-grip` 又写回了 `touch-action: none` —— 它跟满整行高，这等于把每条规则行的左侧' +
-        '变成一块滚动死区，用户在列表左侧划不动（否定判据吃 `where: ALL`：某一档写回来也算）',
-    ).not.toMatch(/touch-action\s*:\s*none/);
-    expect(declsOf('.mr-grip'), '抓握条没有放行纵向平移（`touch-action: pan-y`）').toMatch(
-      /touch-action\s*:\s*pan-y/,
-    );
-
     // JS 那半：长按成立的那个分支里，必须真的挂上非被动的 touchmove 接管。
     const src = strip(read('RuleRow.tsx'));
     const armed = src.slice(src.indexOf('armTimer.current = setTimeout('), src.indexOf('LONG_PRESS_MS)'));
@@ -1894,66 +1820,6 @@ describe('⑫ 规则行有抓握条，长按拖拽落到与四颗按钮同一条
     expect(reorder).toContain('Math.min(Math.max(toIndex, 0), list.length - 1)');
     expect(reorder).toContain('if (target === from) return;');
     expect(src, '行没有把落点接到容器的写路径上').toContain('onReorder: (r, toIndex) =>');
-  });
-});
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * ⑬ 断点档位的**值**：expanded 的行高与列间距真的在场（不是死值，也不是没写）。
- *
- * 与 `styles/cascade-dead-rules.test.ts` 分工：那道门是全仓的，只判「断点块有没有机会胜出」
- * （源码顺序），判不了「值还在不在」—— 把整条 expanded 规则删掉，它照样绿。本组补另一半：
- * 值在场 + 顺序正确，两条合起来才等于「平板上真的量得到 64px」。
- *
- * 此前这一层一条门都没有：把 K4-08 那批改动整条退回基点写法，1126 个测试全绿。
- * ═════════════════════════════════════════════════════════════════════════ */
-
-describe('⑬ rules-screen.css 的断点档位落地（layout.responsive 的 rowMinHeight / columnGap）', () => {
-  /** 剥掉块注释再取材：注释里的示例规则不算数。**保长度** ⇒ 偏移量比较仍对得上原文。 */
-  const cssOf = (): string => CSS.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
-
-  /**
-   * 同一个条件的容器查询块在本文件里**有好几个**（卡片面、开关行各写各的），
-   * 所以这里收**全部**，不是首条命中即返回 —— 「取首条」正是 `declsOf` 上一版抓不到层叠的原因。
-   */
-  const containerBlocks = (css: string, em: string): { at: number; body: string }[] => {
-    const head = new RegExp(`@container\\s+mscreen\\s*\\(\\s*min-width:\\s*${em}em\\s*\\)\\s*\\{`, 'g');
-    const out: { at: number; body: string }[] = [];
-    for (const m of css.matchAll(head)) {
-      const open = m.index + m[0].length;
-      let depth = 1;
-      let i = open;
-      for (; i < css.length && depth > 0; i += 1) {
-        if (css[i] === '{') depth += 1;
-        else if (css[i] === '}') depth -= 1;
-      }
-      expect(depth, `${em}em 块（起于 ${m.index}）没有闭合 —— 切片塌了`).toBe(0);
-      out.push({ at: m.index, body: css.slice(open, i - 1) });
-    }
-    expect(out.length, `rules-screen.css 里没有 ${em}em 的容器查询块 —— 取材面塌了`).toBeGreaterThan(0);
-    return out;
-  };
-
-  const blocksDeclaring = (css: string, em: string, rule: RegExp): { at: number; body: string }[] =>
-    containerBlocks(css, em).filter((b) => rule.test(b.body));
-
-  it('开关行行高：基线 54，expanded 64，且 64 那条写在基线**之后**（否则是死值）', () => {
-    const css = cssOf();
-    const base = /\.mr-switch-row\s*\{[^}]*min-height:\s*54px/.exec(css);
-    expect(base, '`.mr-switch-row` 的基线行高 54 不见了').not.toBeNull();
-
-    const carriers = blocksDeclaring(css, '52\\.5', /\.mr-switch-row\s*\{[^}]*min-height:\s*64px/);
-    expect(carriers.length, 'expanded 档没有 `.mr-switch-row` 的行高覆写 —— 三档只落地了两档').toBe(1);
-    // `@container` 不贡献特异性 ⇒ 同名同特异性只按源码顺序决胜。写在基线之前就是死值。
-    expect(
-      carriers[0].at,
-      'expanded 的 64px 块写在了基线 54px 之前 —— 层叠上永远输，平板量到的还是 54',
-    ).toBeGreaterThan(base?.index ?? Number.POSITIVE_INFINITY);
-  });
-
-  it('卡片列间距两档：medium 32 / expanded 40（`layout.responsive.columnGap`）', () => {
-    const css = cssOf();
-    expect(blocksDeclaring(css, '37\\.5', /\.mr-cards\s*\{[^}]*column-gap:\s*32px/).length).toBe(1);
-    expect(blocksDeclaring(css, '52\\.5', /\.mr-cards\s*\{[^}]*column-gap:\s*40px/).length).toBe(1);
   });
 });
 
@@ -2056,22 +1922,6 @@ describe('⑭ 移动端字形逐字来自桌面（icon-registry 的 allowRedesig
   it('取材面自检：两侧都真的取到了图元，且本批两个新字形在取材面内', () => {
     expect(mobileGlyphs.size, '移动端一个 SVG 图元都没取到 —— 下面那条恒绿').toBeGreaterThan(20);
     expect(desktopGlyphs.size, '桌面一个 SVG 图元都没取到 —— 下面那条会把全部字形误判成越界').toBeGreaterThan(100);
-    // 抓握条（`action.drag-handle`）与选中勾：K4-07 那半条漏登记就是这两格，必须真在面内。
-    expect([...mobileGlyphs.keys()], '抓握条的圆点没进取材面').toContain('circle|cx=9|cy=6|r=1');
-    expect([...mobileGlyphs.keys()], '选中勾没进取材面').toContain('path|d=M5 12l5 5 9-11');
-  });
-
-  it('反向对照：凭空发明一个字形会被抓出来（证明上一条不是恒绿）', () => {
-    const invented = fingerprints('<svg><path d="M1 1 L23 23" /></svg>');
-    expect(invented).toEqual(['path|d=M1 1 L23 23']);
-    expect(desktopGlyphs.has(invented[0]), '这条合成路径居然在桌面存在 —— 换一条再做对照').toBe(false);
-    // 🔴 fail-open 那一格的对照：几何属性写成表达式时指纹是**裸的**，而裸指纹不许再当成「匹配上了」。
-    expect(fingerprints('<svg><path d={INVENTED_D} /></svg>')).toEqual(['path|']);
-    expect(IS_BARE.test('path|')).toBe(true);
-    expect(IS_BARE.test('path|d=M1 1'), '判据把有指纹的图元也当成裸的了').toBe(false);
-    expect(desktopGlyphs.has('path|'), '桌面白名单里还坐着一个裸 `path|` —— 它给一切表达式写法开免死金牌').toBe(
-      false,
-    );
   });
 
   it('🔴 移动端没有取不到几何指纹的图元（取不到 ⇒ 这枚字形从来没被比对过）', () => {

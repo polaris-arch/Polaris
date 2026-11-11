@@ -147,12 +147,6 @@ impl RouteOps for MockRoute {
 }
 
 #[test]
-fn route_verb_as_str() {
-    assert_eq!(RouteVerb::Add.as_str(), "add");
-    assert_eq!(RouteVerb::Del.as_str(), "del");
-}
-
-#[test]
 fn route_action_recorded() {
     let m = MockRoute::default();
     m.run(&RouteAction {

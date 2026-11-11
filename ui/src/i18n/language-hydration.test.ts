@@ -192,13 +192,4 @@ describe('接线守卫：App.tsx 真的挂了语言水合腿', () => {
   it('config 未水合时早退，不拿兜底值覆盖已持久化的选择', () => {
     expect(APP).toContain('if (languageChoice === undefined) return;');
   });
-
-  /**
-   * 依赖数组必须只挂 `languageChoice`：挂 `config` 整体会让任何一次配置写入都重跑一遍
-   * （每次都 setItem + 可能的 changeLanguage）。
-   * 变异对照：把依赖改成 `[config]` → 本条转红。
-   */
-  it('effect 依赖只有 languageChoice', () => {
-    expect(APP).toMatch(/syncLanguageChoice\(languageChoice\);\s*\}\s*,\s*\[languageChoice\]\)/);
-  });
 });

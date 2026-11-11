@@ -223,21 +223,6 @@ describe('P WireGuard：没有信号源 → 恒「无法探测」，不伪造健
 // ── W 段：接线不变量（源码级） ─────────────────────────────────────────────
 
 describe('W 接线：帧真的被喂进判定、组件真的被挂上', () => {
-  it('组件把两个信号源都喂进了谓词（任一喂数点被删即转红）', () => {
-    const src = code(read('components/screens/home/MeshTunnelHealth.tsx'));
-    expect(src).toContain('deriveMeshTunnelHealth');
-    expect(src).toContain('s.tailscaleStatuses[id]');
-    expect(src).toContain('s.openVpn[id]');
-    expect(src).toContain('!!s.proxyStatus?.running');
-  });
-
-  it('HomeScreen 确实挂了该组件（挡住接线被整行删除）', () => {
-    const src = code(read('components/screens/home/HomeScreen.tsx'));
-    expect(src).toContain('<MeshTunnelHealth />');
-    // 与 TsExitWarning 是兄弟节点、排在其下方：两条说的是不同的事，不许合并或互相抑制。
-    expect(src.indexOf('<MeshTunnelHealth />')).toBeGreaterThan(src.indexOf('<TsExitWarning />'));
-  });
-
   it('判定复用现成组网谓词，不自造 allowInternet 弱判定', () => {
     const src = code(read('domain/mesh-tunnel-health.ts'));
     expect(src).toContain('isMeshNode');

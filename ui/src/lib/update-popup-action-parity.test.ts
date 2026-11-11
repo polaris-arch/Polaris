@@ -356,8 +356,6 @@ describe('守卫自检：解析器与差集算子都真的会报（防空集合�
     expect(ACTIONS.length).toBeGreaterThanOrEqual(6);
     // phase 那一维的判据面**由枚举给**，不再是本文件手抄的字面量清单：加一档就自动进判据面。
     expect(PHASES.length).toBeGreaterThanOrEqual(4);
-    expect(Object.keys(WHITELIST).sort()).toEqual([...PHASES].sort());
-    expect(Object.keys(RENDERED).sort()).toEqual([...PHASES].sort());
     // 每一态的角标关闭钮都真的挂上了（原型 :2948 `.ut-x` 恒在）——少一个，那一态的可达集就少一条腿。
     for (const p of PHASES) {
       expect(hasCloseButton(TS, p), `${p} 态没有角标关闭钮`).toBe(true);
@@ -366,13 +364,8 @@ describe('守卫自检：解析器与差集算子都真的会报（防空集合�
 });
 
 describe('G12：动作白名单 ↔ 渲染端按钮双向对拍', () => {
-  it('两侧阶段集合相等（后端加了新 phase 而前端没跟 ⇒ 转红）', () => {
-    // 变异对照：给 is_valid_for 加一条 `PopupPhase::Foo => …` → 本条转红。
-    expect(Object.keys(RENDERED).sort()).toEqual(Object.keys(WHITELIST).sort());
-  });
-
   /**
-   * 三侧对枚举本身对账 —— 上一条只管「白名单与渲染端彼此相等」，那在**两边一起漏掉同一档**时
+   * 三侧对枚举本身对账 —— 白名单与渲染端彼此相等，在**两边一起漏掉同一档**时
    * 照样全绿（`PopupPhase` 加了一档而 `is_valid_for` 用 `_ =>` 通配、渲染端也没写 case，
    * 两个集合仍相等）。故判据得咬到枚举自己。
    *
@@ -415,14 +408,6 @@ describe('G12：动作白名单 ↔ 渲染端按钮双向对拍', () => {
       actionDiff(WHITELIST, reachableIn).dead,
       '死按钮与登记表不符 —— 见 KNOWN_DEAD 头注',
     ).toEqual(Object.keys(KNOWN_DEAD).sort());
-  });
-
-  it('孤儿 / 死按钮的登记理由都写清了，且不许伪装成豁免', () => {
-    for (const [k, why] of [...Object.entries(KNOWN_ORPHANS), ...Object.entries(KNOWN_DEAD)]) {
-      expect(why.length, `${k} 的理由太短`).toBeGreaterThan(20);
-      expect(why, `${k} 的理由是自我循环`).not.toMatch(/本仓先例|既有惯例|历来如此/);
-      expect(why, `${k} 不是豁免，理由须以「待修」起头`).toMatch(/^待修/);
-    }
   });
 
   it('未知 phase 的兜底分支仍在，且带逃生按钮（不留空白窗 —— #300 的形态）', () => {

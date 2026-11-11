@@ -2034,16 +2034,6 @@ async fn session_kills_core_and_removes_config_on_success() {
     cleanup(&h.dir);
 }
 
-/// 配置**落的是独立文件**，绝不是主核的 `singbox-runtime.json`。
-///
-/// **变异锁**：把文件名改成 `singbox-runtime.json` → 转红。那会在主核起来前**覆盖掉主核的运行配置**，
-/// 表现为「测完速再点连接，代理行为莫名其妙」——归因极难。
-#[test]
-fn temp_config_name_is_isolated_from_the_main_core() {
-    assert_eq!(TEMP_CORE_CONFIG_NAME, "speedtest-core.json");
-    assert_ne!(TEMP_CORE_CONFIG_NAME, "singbox-runtime.json");
-}
-
 /// 就绪门失败 → 杀核 + **整批一个数值都不产出**（核没起来 ≠ 每个节点都超时）。
 ///
 /// **变异锁**：把未就绪腿改成「给每个节点记 -1」→ 本测转红：那是伪造 N 次真实测量。

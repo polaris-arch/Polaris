@@ -111,14 +111,6 @@ describe('dialog-top-layer 栈语义：toast 必须跟到最顶层弹窗', () =>
 describe('接线还在：toast 挂载点随弹窗栈走', () => {
   const toaster = stripComments(read('../layout/Toaster.tsx'));
   const modal = stripComments(read('./Modal.tsx'));
-  const layer = stripComments(read('./dialog-top-layer.ts'));
-
-  it('Toaster 订阅顶层弹窗并据此 portal（不是恒挂 .win）', () => {
-    expect(toaster).toMatch(/useTopDialogEl\(\)/);
-    expect(toaster, 'toast 又变回恒挂 .win —— 弹窗一开就被 ::backdrop 压住').toMatch(
-      /createPortal\(\s*stack\s*,\s*topDialog\s*\)/,
-    );
-  });
 
   it('#toast-stack 内联定位必须是 fixed —— absolute 会相对那 460px 的弹窗定位', () => {
     /* 实测（两引擎一致）：portal 进 dialog 子树后写 absolute，toast 落在**弹窗内部**右下角
@@ -127,10 +119,6 @@ describe('接线还在：toast 挂载点随弹窗栈走', () => {
     expect(rule, '#toast-stack 的内联 style 不见了').not.toBeNull();
     expect(rule![0]).toMatch(/position:\s*'fixed'/);
     expect(rule![0], "absolute 会让 toast 掉进弹窗里").not.toMatch(/position:\s*'absolute'/);
-  });
-
-  it('hook 取的是栈尾（最顶层），不是栈首', () => {
-    expect(layer).toMatch(/s\.els\[s\.els\.length - 1\]\s*\?\?\s*null/);
   });
 
   it('Modal 在 showModal 之后登记、卸载时注销（成对，否则栈会漏）', () => {

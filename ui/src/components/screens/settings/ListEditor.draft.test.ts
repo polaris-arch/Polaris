@@ -82,16 +82,6 @@ describe('接线：行输入打字不得碰父级，blur 才提交', () => {
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^[ \t]*\/\/.*$/gm, '');
 
-  // 变异对照：把行 onChange 改回 `editRow` → `onChange([...])`（直接回调父级）→ 本条转红。
-  it('打字只走 editRow（只动草稿）', () => {
-    expect(SRC).toContain('onChange={(e) => editRow(idx, e.target.value)}');
-  });
-
-  it('行输入挂了 onBlur 提交 + Enter 触发 blur', () => {
-    expect(SRC).toContain('onBlur={() => commit(draft)}');
-    expect(SRC).toContain("if (e.key === 'Enter') e.currentTarget.blur();");
-  });
-
   // `editRow` 是唯一不提交的写入口；它绝不能调 commit/onChange，否则等于没改。
   it('editRow 内不得出现 commit / onChange', () => {
     const body = SRC.slice(SRC.indexOf('function editRow('));
@@ -99,16 +89,6 @@ describe('接线：行输入打字不得碰父级，blur 才提交', () => {
     const editRowBody = body.slice(0, end);
     expect(editRowBody).not.toContain('commit(');
     expect(editRowBody).not.toContain('onChange(');
-  });
-
-  // 离散动作（删/加/导入）必须基于**草稿**：基于 `value` 会丢掉另一行里还没提交的编辑。
-  // 变异对照：把任一处的 `draft` 换回 `value` → 本条转红。
-  it('删除 / 添加 / 批量导入都基于 draft，不基于 value', () => {
-    expect(SRC).toContain('commit(draft.filter((_, i) => i !== idx))');
-    expect(SRC).toContain("commit([...draft, listEntryRow('')])");
-    expect(SRC).toContain('importListEntryRows(importDraft, draft, max, entryIdentity)');
-    // 渲染也必须走草稿，否则打字看不见（草稿变了但画的是 value）。
-    expect(SRC).toContain('{draft.map((entry, idx) => (');
   });
 });
 

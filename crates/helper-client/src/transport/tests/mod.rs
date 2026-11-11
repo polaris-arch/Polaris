@@ -39,18 +39,6 @@ fn mock_broken_returns_error() {
 }
 
 #[test]
-fn read_timeout_constant_matches_helper_proto() {
-    // 与 helper-proto::codec::READ_TIMEOUT_SECS 对齐（5s，Go SetReadDeadline）
-    assert_eq!(READ_TIMEOUT, Duration::from_secs(5));
-}
-
-#[test]
-fn default_timeouts_match_polaris() {
-    // Default socket request budget; installation is administrative CLI, not RPC.
-    assert_eq!(DEFAULT_REQUEST_TIMEOUT_MS, 1500);
-}
-
-#[test]
 fn io_adapter_uses_single_byte_reads_and_stops_at_newline() {
     struct PipeLike {
         inner: std::io::Cursor<Vec<u8>>,

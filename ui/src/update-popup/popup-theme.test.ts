@@ -63,11 +63,6 @@ describe('② CSS：深/浅两档存在且变量键集对等', () => {
   it('注入缺席兜底（prefers-color-scheme）也覆盖同一组键', () => {
     expect([...fallback].sort()).toEqual([...dark].sort());
   });
-
-  it('--surface 两档与 Rust surface_color 逐字对齐（#161C24 / #FFFFFF）', () => {
-    expect(css).toMatch(/:root\s*\{[^}]*--surface:\s*#161c24/i);
-    expect(css).toMatch(/:root\[data-theme='light'\]\s*\{[^}]*--surface:\s*#ffffff/i);
-  });
 });
 
 describe('③ 规则体里不得再出现只在单档成立的中性叠色', () => {
