@@ -2015,7 +2015,14 @@ impl ProxyRuntime {
         let local_proxy = if status.running {
             snapshot.and_then(|snapshot| {
                 super::select_local_http_proxy(
-                    status.mixed_port,
+                    if self
+                        .core_via_helper
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        0
+                    } else {
+                        status.mixed_port
+                    },
                     snapshot.probe_proxy_port,
                     snapshot.loopback_auth,
                 )
@@ -2054,7 +2061,14 @@ impl ProxyRuntime {
                             .read()
                             .map_err(|_| MainPrerequisiteError::ReadyUnknown)?;
                         let local_proxy = super::select_local_http_proxy(
-                            status.mixed_port,
+                            if self
+                                .core_via_helper
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                0
+                            } else {
+                                status.mixed_port
+                            },
                             snapshot.as_ref().and_then(|s| s.probe_proxy_port),
                             snapshot.as_ref().and_then(|s| s.loopback_auth.clone()),
                         );

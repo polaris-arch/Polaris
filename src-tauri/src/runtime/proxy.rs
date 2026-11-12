@@ -2144,7 +2144,18 @@ impl ProxyRuntime {
             return None;
         }
         let snap = self.switch_snapshot.read().ok()?.clone()?;
-        select_local_http_proxy(status.mixed_port, snap.probe_proxy_port, snap.loopback_auth)
+        // A Helper core leaves its server-side TIME_WAIT on mixed-in under its own
+        // account; macOS then refuses the next user-owned core that port, so the
+        // App's own probes stay on probe-proxy-in while the core runs via Helper.
+        let mixed_port = if self
+            .core_via_helper
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            0
+        } else {
+            status.mixed_port
+        };
+        select_local_http_proxy(mixed_port, snap.probe_proxy_port, snap.loopback_auth)
     }
 
     /// **临时测速核**的构建环境快照（platform / arch / cronet 可用性）。
