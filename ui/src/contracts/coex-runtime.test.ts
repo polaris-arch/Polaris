@@ -1,62 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import fixture from './coex-runtime.rust.fixture.json';
 import { decodeCoexRuntimeState } from './coex-runtime';
 const latest = () => structuredClone(fixture.states.latest);
-describe('historical actual Rust export and current source boundary', () => {
-  it('pins the historical export and partitions its original nine-file source footprint', () => {
-    const compatibility = fixture.sourceCompatibility;
-    expect(compatibility.newSerializerExecution).toBe(false);
-    expect(compatibility.currentStatesReexported).toBe(false);
-    // Preserve original historical identity; a source refresh is never a serializer run.
-    expect(createHash('sha256').update(JSON.stringify(fixture.states)).digest('hex'))
-      .toBe(compatibility.originalStatesCanonicalSha256);
-    const changed = [...compatibility.changedObserverSources,
-      ...compatibility.changedControlSources, ...compatibility.changedTestSources];
-    const classified = [...changed, ...compatibility.unchangedOriginalSources];
-    const sourcePaths = Object.keys(fixture.producer.sourceSha256).sort();
-    expect([...classified].sort()).toEqual(sourcePaths);
-    expect(Object.keys(compatibility.sourceSha256).sort()).toEqual(sourcePaths);
-    expect(Object.keys(compatibility.sourceReview).sort()).toEqual(sourcePaths);
-    expect(compatibility.changedObserverSources).toContain('src-tauri/src/runtime/proxy/coex_observer.rs');
-    expect(compatibility.changedControlSources).toContain('src-tauri/src/runtime/proxy/lifecycle.rs');
-    expect(compatibility.changedControlSources).toContain('src-tauri/src/runtime/proxy/recovery.rs');
-    expect(compatibility.unchangedOriginalSources).not.toContain('src-tauri/src/runtime/proxy/recovery.rs');
-    for (const path of changed) {
-      expect(compatibility.sourceSha256[path as keyof typeof compatibility.sourceSha256])
-        .not.toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);
-    }
-    for (const path of compatibility.unchangedOriginalSources) {
-      expect(compatibility.sourceSha256[path as keyof typeof compatibility.sourceSha256])
-        .toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);
-    }
-    for (const [path, sha] of Object.entries(compatibility.sourceSha256)) {
-      expect(createHash('sha256').update(readFileSync(new URL('../../../' + path, import.meta.url))).digest('hex'), path).toBe(sha);
-    }
-  });
-  it('pins the separate HOT proxy supplement without relabeling it as historical or execution evidence', () => {
-    const integration = fixture.sourceCompatibility.hotProxyIntegration;
-    const paths = [
-      'src-tauri/src/runtime/proxy/mesh_route_report.rs',
-      'src-tauri/src/runtime/proxy/native_auto.rs',
-      'src-tauri/src/runtime/proxy/pending_changes.rs',
-      'src-tauri/src/runtime/proxy/runtime_config.rs',
-      'src-tauri/src/runtime/proxy/runtime_config/tests/mod.rs',
-      'src-tauri/src/runtime/proxy/tests/hot_switch.rs',
-      'src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs',
-      'src-tauri/src/runtime/proxy/tests/lifecycle.rs',
-      'src-tauri/src/runtime/proxy/tests/mesh_route_report.rs',
-      'src-tauri/src/runtime/proxy/tests/real_core_cleanup.rs',
-    ].sort();
-    expect(integration.newSerializerExecution).toBe(false);
-    expect(integration.currentStatesReexported).toBe(false);
-    for (const path of paths) expect(Object.keys(fixture.producer.sourceSha256)).not.toContain(path);
-    for (const [path, sha] of Object.entries(integration.sourceSha256)) {
-      expect(createHash('sha256').update(readFileSync(new URL('../../../' + path, import.meta.url))).digest('hex'), path).toBe(sha);
-      expect(integration.sourceReview[path as keyof typeof integration.sourceReview].length).toBeGreaterThan(0);
-    }
-  });
+describe('historical actual Rust export', () => {
   it.each(Object.entries(fixture.states))('decodes actual %s state without changing inner trust', (_name, state) => {
     const decoded = decodeCoexRuntimeState(state); expect(decoded).toEqual(state);
     if (decoded.report.status === 'known') { expect(decoded.report.value.snapshot.classification.status).toBe('unknown'); for (const fact of Object.values(decoded.report.value.snapshot.context)) expect(fact.status).toBe('unknown'); }

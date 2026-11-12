@@ -280,42 +280,6 @@ async fn original_hook_ready_drives_worker_event_and_state() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(o.get()["freshness"], "latest");
     assert_eq!(events.lock().unwrap().last().unwrap(), &o.get());
-    // Actual runtime-generated fixture is emitted only under an explicitly supplied test export path.
-    if let Ok(path) = std::env::var("POLARIS_COEX_RUNTIME_FIXTURE") {
-        let mut states = serde_json::Map::new();
-        states.insert("latest".into(), o.get());
-        o.lock().driver = true;
-        o.receipt(3, 1);
-        states.insert("staleBusy".into(), o.get());
-        o.terminal(3, true);
-        states.insert("crashed".into(), o.get());
-        o.claim(4, false);
-        states.insert("stopped".into(), o.get());
-        for partial in [true, false] {
-            let (windows, _, _) = fixture();
-            let mut windows = Arc::try_unwrap(windows).ok().unwrap();
-            windows.collector = Arc::new(move |a| {
-                snapshot::collect_admitted(
-                    a,
-                    polaris_helper_proto::Platform::Win,
-                    WindowsFixture(partial),
-                )
-            });
-            let windows = Arc::new(windows);
-            bind(&windows, 5);
-            run(&windows);
-            states.insert(
-                if partial {
-                    "windowsPartial"
-                } else {
-                    "windowsUnavailable"
-                }
-                .into(),
-                windows.get(),
-            );
-        }
-        std::fs::write(path,serde_json::to_string_pretty(&json!({"provenance":"Actual Observer hooks, original admitted Linux fixture collector, actual runtime serializer; no native API/core/IPC device","states":states})).unwrap()).unwrap();
-    }
 }
 
 struct NoSystemProxy;
@@ -375,36 +339,6 @@ async fn facade_claim_commit_receipt_worker_and_get_state_are_same_production_pa
     assert_eq!(rt.coex_state()["report"]["status"], "unknown");
     assert_eq!(rt.coex_state()["freshness"], "unavailable");
     std::fs::remove_dir_all(dir).unwrap();
-}
-
-struct WindowsFixture(bool);
-impl ObservationSource for WindowsFixture {
-    fn start(&self, _: &Command, _: Duration) -> StartedCommand {
-        panic!("Windows fixture never spawns a command")
-    }
-    fn windows_facts(&self) -> polaris_system_integration::coexistence::windows::WindowsFactInput {
-        use polaris_config_engine::builder::coexistence::Fact;
-        use polaris_system_integration::coexistence::windows::{ReadRows, WindowsFactInput};
-        fn unavailable<T>() -> Fact<T> {
-            Fact::Unknown("fixture permission unavailable".into())
-        }
-        WindowsFactInput {
-            adapters: if self.0 {
-                Fact::Known(ReadRows {
-                    rows: vec![],
-                    complete: Fact::Unknown("fixture completeness unavailable".into()),
-                    compartment: Fact::Unknown("fixture compartment unavailable".into()),
-                    error: Fact::Known(None),
-                })
-            } else {
-                Fact::Unknown("fixture permission unavailable".into())
-            },
-            addresses: unavailable(),
-            routes4: unavailable(),
-            routes6: unavailable(),
-            ras: unavailable(),
-        }
-    }
 }
 
 #[tokio::test]
