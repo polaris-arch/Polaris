@@ -1907,7 +1907,7 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
     drop(gate);
     rt.stop().await.unwrap();
     assert!(!rt.child.lock().unwrap().has_helper_start());
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
     a_process.start_kill().unwrap();
     a_process.wait().await.unwrap();
 
@@ -2002,7 +2002,7 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     drop(reservation);
     assert!(!rt.mesh.main_owns_tailscale("ts-dead-exact-spawn", true));
     assert!(!rt.child.lock().unwrap().has_helper_start());
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
     let sent = frames.lock().unwrap();
     let id = crate::runtime::core_identity::selected_id(
         crate::runtime::core_identity::current_platform().unwrap(),

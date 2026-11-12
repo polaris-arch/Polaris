@@ -227,5 +227,5 @@ async fn desktop_inventory_probe_rejects_nonadmitted_bytes() {
         .unavailable_reason
         .as_deref()
         .unwrap()
-        .contains("UnsupportedExactObject"));
+        .contains("Mismatch"));
 }

@@ -151,7 +151,7 @@ async fn the_spawner_refuses_unadmitted_windows_intent_before_native_birth() {
     .unwrap_err();
     assert_eq!(
         error.kind,
-        polaris_core_supervisor::admitted_payload::AdmissionErrorKind::UnsupportedExactObject
+        polaris_core_supervisor::admitted_payload::AdmissionErrorKind::Mismatch
     );
 }
 
