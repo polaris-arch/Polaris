@@ -5,12 +5,12 @@
   "repository": "polaris-arch/sing-box-polaris",
   "repositoryId": 1421657509,
   "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
-  "version": "1.15.0-polaris-alpha.12.22",
-  "sourceTag": "v1.15.0-polaris-alpha.12.22",
-  "sourceTagObject": "dc2324d26695572a1531dd4b3a11c8e6eba27f96",
-  "sourceCommit": "a7b3d365affe05df7264276244c701282af5964d",
-  "sourceTree": "60e6c9d5886d62f5917ece364f3a8dea7a12e60a",
-  "goModSha256": "7f8d729f71eabdbb0caf97da95b2920f8c797f6913dadccd7b5135f4bf5eb440",
+  "version": "1.15.0-polaris-alpha.12.23",
+  "sourceTag": "v1.15.0-polaris-alpha.12.23",
+  "sourceTagObject": "23d2e2c9f967b1af0de4959cbf5e10fc33dff2bc",
+  "sourceCommit": "b3362e63f96b3630afcbe6aa9be41ce3424d62de",
+  "sourceTree": "8725df67f8596aef618a917c54bfb10ec0553f8d",
+  "goModSha256": "2cfe4073284dfb1561e5a7b8ec361e94bf516bf7cd40fefd7b3ea86f4211c433",
   "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
   "goModule": "github.com/sagernet/sing-box",
   "sourceOverlay": 0,
@@ -21,7 +21,7 @@
   "gobindVersion": "v0.1.13",
   "declaredTagsSource": {
     "path": "cmd/internal/build_libbox/main.go",
-    "sha256": "f32a147fe0f3f763dd2719887a805ec0c058d87297b0cbddadeeaddfdac32d06"
+    "sha256": "c451b790cf46e9c1bb8b3dec882e35f905edd715413b2bfb2cb16c909e84945a"
   },
   "android": {
     "targets": [
@@ -54,7 +54,6 @@
       "with_utls",
       "with_naive_outbound",
       "with_clash_api",
-      "with_usbip",
       "with_openvpn",
       "with_openconnect",
       "badlinkname",
@@ -72,7 +71,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.22-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.23-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -99,7 +98,6 @@
       "with_utls",
       "with_naive_outbound",
       "with_clash_api",
-      "with_usbip",
       "with_openvpn",
       "with_openconnect",
       "badlinkname",
@@ -122,7 +120,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.22-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.23-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -141,10 +139,10 @@
   },
   "sourcePolicy": {
     "schema": "polaris-reviewed-kernel-source-v4",
-    "sourceCommit": "a7b3d365affe05df7264276244c701282af5964d",
-    "sourceTree": "60e6c9d5886d62f5917ece364f3a8dea7a12e60a",
+    "sourceCommit": "b3362e63f96b3630afcbe6aa9be41ce3424d62de",
+    "sourceTree": "8725df67f8596aef618a917c54bfb10ec0553f8d",
     "goVersion": "1.27.2",
-    "goModSha256": "7f8d729f71eabdbb0caf97da95b2920f8c797f6913dadccd7b5135f4bf5eb440",
+    "goModSha256": "2cfe4073284dfb1561e5a7b8ec361e94bf516bf7cd40fefd7b3ea86f4211c433",
     "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
     "goDirective": "1.27.0",
     "toolchain": "go1.27.2",
@@ -190,7 +188,7 @@
       "github.com/sagernet/fswatch": {
         "version": "v0.1.2",
         "replacementPath": "./third_party/fswatch",
-        "replacementTree": "5c887b88e4d68bf5db7924610952d25117d2ec11",
+        "replacementTree": "be04d2d2229de0da0f2c6dbb145c0ee87e64acf4",
         "replacementFileCount": 8
       },
       "github.com/sagernet/sing": {
