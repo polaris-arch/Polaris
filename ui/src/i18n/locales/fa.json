@@ -1897,7 +1897,6 @@
     "configRefreshScopeMismatch": "این پنجره نمی‌تواند هم‌زمان از نشست‌های پیکربندی پنجرهٔ اصلی و سینی سیستم استفاده کند",
     "configRefreshInvalidResponse": "پاسخ پیکربندی نامعتبر است",
     "startupFailed": "شروع sing-box ناموفق بود. لطفاً پیکربندی سرور را بررسی کنید",
-    "helperRuntimeRestartRequired": "برای این تغییر به اجرای محلی، باید Polaris را دوباره راه‌اندازی کنید. از Polaris به روش عادی خارج شوید، آن را دوباره باز کنید و اجرای محلی را دوباره امتحان کنید.",
     "helperNotInstalledTitle": "کمک‌یار نصب نشده یا قدیمی است",
     "helperNotInstalledDesc": "این حالت از هسته محافظت‌شده دستیار استفاده می‌کند. از روند نصب معتبر در تنظیمات دستیار استفاده کنید.",
     "helperNotInstalledAction": "نصب",

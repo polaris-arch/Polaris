@@ -105,7 +105,7 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:surface==='tray'?'tra
   if(cmd==='plugin:event|listen'){const key=++id;listeners.push({id:key,event:args.event,handler:args.handler});return Promise.resolve(key);}
   if(cmd==='plugin:event|unlisten'){const at=listeners.findIndex(l=>l.id===args.eventId);if(at>=0)listeners.splice(at,1);return Promise.resolve();}
   if([C.AUTO_SELECT_ENABLE,C.AUTO_SELECT_DISABLE,C.AUTO_SELECT_SWITCH_NOW,C.SERVER_SWITCH].includes(cmd)){f.calls.push({cmd,args});return new Promise(resolve=>{jobs.push({cmd,args,resolve});if(!f.hold)f.finish(jobs.length-1);});}
-  if(cmd===C.PROXY_START||cmd===C.PROXY_STOP){f.proxyCalls.push(cmd);if(params.has('proxyError'))return Promise.resolve({success:false,error:'synthetic private diagnostic: HELPER_RUNTIME_RESTART_REQUIRED 请重启 /private/fixture-only',code:params.get('proxyError')||undefined});}
+  if(cmd===C.PROXY_START||cmd===C.PROXY_STOP){f.proxyCalls.push(cmd);if(params.has('proxyError'))return Promise.resolve({success:false,error:'synthetic private diagnostic: 请重启 /private/fixture-only',code:params.get('proxyError')||undefined});}
   if(cmd===C.TRAY_HIDE){f.hides.push(args);return Promise.resolve({success:true,data:null});}
   if(cmd==='plugin:notification|is_permission_granted')return Promise.resolve(true);
   if(cmd==='plugin:notification|notify'){f.notifications.push(args);return Promise.resolve();}
@@ -170,7 +170,6 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
  },30000);
  afterAll(async()=>{await browser?.close();await server?.close();});
  for (const [code, expected] of [
-  ['HELPER_RUNTIME_RESTART_REQUIRED', '本次切换到本地运行需要重启 Polaris。请正常退出并重新打开应用，再尝试本地运行。'],
   ['STARTUP_FAILED', 'sing-box 启动失败，请检查服务器配置'],
   ['FUTURE_UNKNOWN_ERROR', 'sing-box 启动失败，请检查服务器配置'],
   ['', 'sing-box 启动失败，请检查服务器配置'],

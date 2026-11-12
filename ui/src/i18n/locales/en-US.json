@@ -1875,7 +1875,6 @@
     "configRefreshScopeMismatch": "This window cannot use both main-window and tray configuration sessions",
     "configRefreshInvalidResponse": "The configuration response is invalid",
     "startupFailed": "sing-box failed to start. Please check the server configuration",
-    "helperRuntimeRestartRequired": "This switch to local execution requires restarting Polaris. Quit Polaris normally, reopen it, then try local execution again.",
     "helperNotInstalledTitle": "Helper not installed or outdated",
     "helperNotInstalledDesc": "This mode uses Helper's protected core. Use the trusted installation flow in Helper settings.",
     "helperNotInstalledAction": "Install",

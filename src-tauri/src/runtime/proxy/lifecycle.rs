@@ -939,23 +939,7 @@ impl ProxyRuntime {
                         || direct_slot.has_helper_start()
                         || (self.core_via_helper.load(Ordering::SeqCst) && !via_helper)
                     {
-                        let mut error = StartError::direct_slot_occupied();
-                        if self.core_via_helper.load(Ordering::SeqCst) && !via_helper {
-                            if let Ok(pid) = self.pid.lock() {
-                                if direct_slot
-                                    .locally_closed_helper_attempt(
-                                        &self.child,
-                                        &self.pid,
-                                        *pid,
-                                        self.gate.generation(),
-                                    )
-                                    .is_some()
-                                {
-                                    error = StartError::helper_runtime_restart_required();
-                                }
-                            }
-                        }
-                        return StartLeg::Finished(Err(error), None);
+                        return StartLeg::Finished(Err(StartError::direct_slot_occupied()), None);
                     }
                     let claim_generation = || {
                         self.claim_generation(

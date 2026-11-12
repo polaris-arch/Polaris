@@ -421,10 +421,6 @@ pub mod code {
     pub const HELPER_CORE_MISMATCH: &str = "HELPER_CORE_MISMATCH";
     /// Another content id/user or pending native custody occupies the helper.
     pub const HELPER_CORE_OCCUPIED: &str = "HELPER_CORE_OCCUPIED";
-    /// This runtime retains its Helper backend fence after an exact local Stop.
-    /// Only a request switching to direct execution needs a normal App restart;
-    /// another Helper birth still follows the existing Helper admission rules.
-    pub const HELPER_RUNTIME_RESTART_REQUIRED: &str = "HELPER_RUNTIME_RESTART_REQUIRED";
     /// The package payload does not match its compiled content identity.
     pub const LAN_GATEWAY_FORWARDING_REQUIRED: &str = "LAN_GATEWAY_FORWARDING_REQUIRED";
     pub const LAN_GATEWAY_FORWARDING_UNCONFIRMED: &str = "LAN_GATEWAY_FORWARDING_UNCONFIRMED";
@@ -612,15 +608,6 @@ impl StartError {
         let mut error = Self::coded(
             "direct Child slot is occupied; the previous core still owns custody",
             code::STARTUP_FAILED,
-        );
-        error.admission_denied = true;
-        error
-    }
-
-    fn helper_runtime_restart_required() -> Self {
-        let mut error = Self::coded(
-            "Helper 本次内核已停止；当前运行时保留后端隔离，请正常重启应用后使用本地模式",
-            code::HELPER_RUNTIME_RESTART_REQUIRED,
         );
         error.admission_denied = true;
         error

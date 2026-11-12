@@ -1875,7 +1875,6 @@
     "configRefreshScopeMismatch": "此窗口不能同时使用主窗口和托盘的配置会话",
     "configRefreshInvalidResponse": "配置响应无效",
     "startupFailed": "sing-box 启动失败，请检查服务器配置",
-    "helperRuntimeRestartRequired": "本次切换到本地运行需要重启 Polaris。请正常退出并重新打开应用，再尝试本地运行。",
     "helperNotInstalledTitle": "helper 未安装或需要升级",
     "helperNotInstalledDesc": "当前模式使用助手的受保护内核，请通过助手设置中的可信安装流程处理。",
     "helperNotInstalledAction": "去安装",

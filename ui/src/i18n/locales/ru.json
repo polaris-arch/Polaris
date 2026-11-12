@@ -1897,7 +1897,6 @@
     "configRefreshScopeMismatch": "В этом окне нельзя одновременно использовать сеансы конфигурации главного окна и трея",
     "configRefreshInvalidResponse": "Недопустимый ответ конфигурации",
     "startupFailed": "sing-box не запустился. Проверьте конфигурацию сервера",
-    "helperRuntimeRestartRequired": "Для этого перехода к локальному запуску нужно перезапустить Polaris. Завершите работу Polaris обычным способом, откройте приложение снова и повторите локальный запуск.",
     "helperNotInstalledTitle": "Помощник не установлен или устарел",
     "helperNotInstalledDesc": "Этот режим использует защищённое ядро Helper. Используйте доверенную установку в настройках Helper.",
     "helperNotInstalledAction": "Установить",

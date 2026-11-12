@@ -1875,7 +1875,6 @@
     "configRefreshScopeMismatch": "此視窗無法同時使用主視窗和系統匣的設定工作階段",
     "configRefreshInvalidResponse": "設定回應無效",
     "startupFailed": "sing-box 啟動失敗，請檢查伺服器設定",
-    "helperRuntimeRestartRequired": "本次切換到本機執行需要重新啟動 Polaris。請正常結束並重新開啟應用程式，再嘗試本機執行。",
     "helperNotInstalledTitle": "helper 未安裝或需要升級",
     "helperNotInstalledDesc": "目前模式使用助手的受保護核心，請透過助手設定中的可信安裝流程處理。",
     "helperNotInstalledAction": "去安裝",
