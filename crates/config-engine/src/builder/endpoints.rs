@@ -13,7 +13,7 @@ use crate::user_config::server_config::{Protocol, ServerConfig};
 /// Taildrop 收件目录相对 `state_dir` 的子目录名。取与内核默认值相同的字面量（`"Taildrop"`），
 /// 差别只在**我们把它锚成绝对路径**、不让它跟着 CWD 漂 —— 见
 /// [`crate::singbox::Endpoint::taildrop_directory`]。
-const TAILDROP_SUBDIR: &str = "Taildrop";
+pub const TAILDROP_SUBDIR: &str = "Taildrop";
 
 /// OpenConnect / OpenVPN 客户端 endpoint 的共享构造器。
 /// 两者的设置结构 serde 名就是 sing-box wire 键，因此整体 flatten 到 `extra`；主核与临时测速核
@@ -382,7 +382,12 @@ pub fn build_tailscale_endpoint(
         // 落在 state_dir 之下而不是与之并列：state_dir 已按节点 id 分好、随节点删除一起清理，
         // 收件目录跟着走即天然隔离；同时它是 state_dir 的**子目录**，peer 送来的文件名不可能
         // 撞上 `tailscaled.state` 这类密钥文件。
-        taildrop_directory: Some(format!("{state_dir}/{TAILDROP_SUBDIR}")),
+        taildrop_directory: Some(
+            std::path::Path::new(state_dir)
+                .join(TAILDROP_SUBDIR)
+                .to_string_lossy()
+                .into_owned(),
+        ),
     };
 
     // exit_node 仅承载全隧道时下发。

@@ -239,8 +239,8 @@ fn network_change_reconciles_dns_then_replans_tun_or_schedules_recovery() {
         .find("self.schedule_restart()")
         .expect("需要重算 TUN 物理接口时必须走现有去抖重启");
     assert!(
-        dns < observe && observe < replan && replan < restart && dns < recovery,
-        "DNS 重灌须先完成，再以接口事实判定是否重规划"
+        observe < dns && dns < replan && replan < restart && dns < recovery,
+        "接口事实先读（网络代次不等 DNS 重灌），DNS 重灌完成后再判定是否重规划"
     );
     assert!(
         body.contains("if !unavailable.is_empty()")

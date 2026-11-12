@@ -91,13 +91,32 @@ impl ProxyRuntime {
     /// 显式绑定失效 fail-closed（保留当前核、告警、不改默认出口）；推断绑定失效或路由变化则重启
     /// TUN，在接口撤销后重新读取真实物理路由。
     async fn handle_network_change(self: &Arc<Self>, impact: NetworkChangeImpact) {
-        // 网络代次先进一格：此刻在飞的测速结果量的是哪张网已经说不清，由测速侧据此作废。
-        self.network_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.revoke_protected_physical_root();
         // 网络场景命中态：旧网络的结果先作废（未知），canary 探测任务被唤醒立即重探。放在最前：
         // 下面几条腿可能 await 很久或调度重启，命中态不该在这期间继续显示旧网络的判定。
         self.invalidate_network_canary();
+        let previous = self
+            .runtime_binding_state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        let observed = self.observe_network_interfaces().await;
+        // 网络代次只在接口事实变了（或读不到、无从比较）时进一格：此刻在飞的测速结果量的是哪张网已经
+        // 说不清，由测速侧据此作废。Windows 的接口参数 / 路由寿命刷新这类通知不改变接口事实，
+        // 无条件进位会把整轮在飞测速误判为「网络发生变化」。判定在 DNS 对账之前、基线随即写回，
+        // 下面任何早退或长 await 都不会让代次滞后或基线过期。
+        if observed.is_none() || observed != previous.interface_fingerprint {
+            let epoch = self
+                .network_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            log::info!("网络接口事实变化 → 网络代次进至 {epoch}");
+        }
+        if let (Some(fingerprint), Ok(mut state)) =
+            (observed.clone(), self.runtime_binding_state.lock())
+        {
+            state.interface_fingerprint = Some(fingerprint);
+        }
         self.reconcile_system_dns_best_effort().await;
         let Some(config) = self
             .current_config
@@ -109,12 +128,6 @@ impl ProxyRuntime {
             self.schedule_network_recovery_refresh();
             return;
         };
-        let previous = self
-            .runtime_binding_state
-            .lock()
-            .map(|state| state.clone())
-            .unwrap_or_default();
-        let observed = self.observe_network_interfaces().await;
         let required = required_bind_interfaces(&config);
         let unavailable = observed
             .as_ref()
@@ -135,9 +148,6 @@ impl ProxyRuntime {
         }
 
         if let Ok(mut state) = self.runtime_binding_state.lock() {
-            if let Some(fingerprint) = observed.clone() {
-                state.interface_fingerprint = Some(fingerprint);
-            }
             state.explicit_unavailable = unavailable.clone();
         }
 
@@ -193,6 +203,18 @@ impl ProxyRuntime {
         token: u64,
         managed_tun_interface: Option<String>,
     ) {
+        // 非 TUN 会话起核时不采接口指纹；这里补一份基线，网络代次才能按「事实是否真变」判定。
+        if self
+            .runtime_binding_state
+            .lock()
+            .is_ok_and(|state| state.interface_fingerprint.is_none())
+        {
+            if let Some(fingerprint) = self.observe_network_interfaces().await {
+                if let Ok(mut state) = self.runtime_binding_state.lock() {
+                    state.interface_fingerprint.get_or_insert(fingerprint);
+                }
+            }
+        }
         let mut consecutive_failures = 0u32;
         loop {
             let started = std::time::Instant::now();

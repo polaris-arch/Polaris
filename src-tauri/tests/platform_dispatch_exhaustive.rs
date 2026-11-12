@@ -3401,8 +3401,8 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/runtime/proxy/pending_changes.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS保留删除journal，不把主App无Child当跨进程资源清理证明。"),
     ("src-tauri/src/runtime/proxy/process_supervision.rs", "target_os = \"android\"", 4, IosSide::DiffersRight, "iOS两停核入口委托NE且保留TS claim，cold host/stale只对账；独立Androidbooking原样保留。"),
     ("src-tauri/src/runtime/proxy/process_supervision.rs", "target_os = \"ios\"", 5, IosSide::DiffersRight, "iOS 原两停核入口/冷对账保留，新增 N typed原实例回执转只读全run/node视图；local原token只在原gate与whole claim/full census终态一致时compare-remove，Observed精确session/request/config/extGen同原run/nonces/canonical scope关闭后才允许继任。pre-Ready不伪造Ready，未知仍保原custody；Android原独立booking/JNI准入不变，不授global NoOwner。"),
-    ("src-tauri/src/runtime/proxy/startup.rs", "any(target_os = \"android\", target_os = \"ios\")", 4, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
-    ("src-tauri/src/runtime/proxy/startup.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 3, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
+    ("src-tauri/src/runtime/proxy/startup.rs", "any(target_os = \"android\", target_os = \"ios\")", 3, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
+    ("src-tauri/src/runtime/proxy/startup.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 2, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"android\")", 3, IosSide::DiffersUndecided, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留。管理API的进程端口退役现为所有平台共用，剩余三处分派的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"ios\")", 1, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"android\"", 7, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留。管理API的ledger/import三处分派已消除，所有平台同进程禁止主端口跨代复用。"),
@@ -3732,9 +3732,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/pending_changes.rs",
         "any(target_os = \"ios\", windows)",
-        2,
+        1,
         IosSide::DiffersRight,
-        "iOS and Windows retain exclusive directory leases until durable journal acknowledgement and reject legacy unbound intents. Each has a distinct platform commit path; Android keeps its explicit unavailable result. Source registration is not a native Stop or SYSTEM interoperability receipt.",
+        "iOS and Windows retain exclusive directory leases until durable journal acknowledgement. Each has a distinct platform commit path; Android keeps its explicit unavailable result. Source registration is not a native Stop or SYSTEM interoperability receipt.",
     ),
 ];
 
@@ -4378,7 +4378,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // This changes no surviving iOS verdict or debt site.
     ("DiffersOnlyInDebug", 6),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 335),
+    // Device acceptance fixes drop the iOS/Windows unbound legacy-intent rejection
+    // in pending_changes (1 Right); its object no longer exists.
+    ("DiffersRight", 334),
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     ("DiffersWrongToday", 140),
@@ -4394,7 +4396,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // R15: one separate debug/feature/desktop session-holder export; no debt changed.
     // Route batch 1 deletes the unused Helper candidate data type, impl and
     // resolver (3 same-side sites). No debt changed.
-    ("WithAndroid", 141),
+    // Deleting the core self-attestation stub retires its desktop spawn and
+    // mobile no-op pair in startup (2 same-side sites). No debt changed.
+    ("WithAndroid", 139),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

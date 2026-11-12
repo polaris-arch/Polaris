@@ -89,7 +89,10 @@ fn ts_endpoint_always_pins_taildrop_directory_under_state_dir() {
         .taildrop_directory
         .as_deref()
         .expect("taildrop_directory 必须下发，不得留给内核相对默认值");
-    assert_eq!(dir, "/fake/ts/t1/Taildrop");
+    assert_eq!(
+        std::path::Path::new(dir),
+        std::path::Path::new("/fake/ts/t1/Taildrop")
+    );
     // 绝对性是本字段存在的**唯一理由**：相对路径会被内核按核进程 CWD 解析。
     assert!(
         dir.starts_with('/') || dir.as_bytes().get(1) == Some(&b':'),

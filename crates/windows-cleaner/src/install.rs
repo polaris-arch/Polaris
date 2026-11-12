@@ -79,7 +79,7 @@ impl Request {
         if !local_path(&self.stage)
             || !local_path(&self.config)
             || CallerIdentity::windows(&self.original_sid).is_none()
-            || self.token.len() != 64
+            || !(32..=128).contains(&self.token.len())
             || !self.token.bytes().all(|b| b.is_ascii_hexdigit())
             || [
                 &self.core_id,

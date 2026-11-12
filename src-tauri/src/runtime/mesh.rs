@@ -444,12 +444,6 @@ impl MeshRuntime {
         _gate: &tokio::sync::MutexGuard<'_, ()>,
         main_alive: bool,
     ) -> std::io::Result<()> {
-        if cfg!(any(target_os = "ios", windows)) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "CleanupUnknown: whole-directory deletion requires bound intent and custody",
-            ));
-        }
         if self.login_registry.state_in_use(server_id, main_alive) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -459,6 +453,13 @@ impl MeshRuntime {
         let dir = self.tailscale_state_dir(server_id)?;
         if !dir.exists() {
             return Ok(());
+        }
+        // 目录从未建出时无物可删；已存在的目录在这两个平台上只能经绑定意图与 custody 删除。
+        if cfg!(any(target_os = "ios", windows)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "CleanupUnknown: whole-directory deletion requires bound intent and custody",
+            ));
         }
 
         // 单路径组件堵住直接逃逸；canonical containment 再堵住 `tailscale` 父目录或目标目录被

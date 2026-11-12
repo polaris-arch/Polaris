@@ -527,15 +527,6 @@ pub(super) fn helper_core_mismatch_message(why: &str) -> String {
     )
 }
 
-pub(super) fn attestation_commit_allowed(
-    current_generation: u64,
-    expected_generation: u64,
-    status: &ProxyStatus,
-    pid: u32,
-) -> bool {
-    current_generation == expected_generation && status.running && status.pid == pid
-}
-
 /// 抹去每轮起核必重新分配的本地端口；其余字段（含用户 mixed 端口、节点、规则、路径、secret）全保留。
 pub(super) fn normalize_kernel_gate_config(value: &mut Value) {
     if let Some(inbounds) = value.get_mut("inbounds").and_then(Value::as_array_mut) {
@@ -1538,7 +1529,6 @@ impl ProxyRuntime {
             pruned_rule_set_tags,
             pruned_env_rules,
             network_canary,
-            binary,
             effective_user_config,
             mesh_route_prepared,
             ready_deadline,
@@ -2236,9 +2226,6 @@ impl ProxyRuntime {
                             pruned_rule_set_tags,
                             pruned_env_rules,
                             network_canary,
-                            // 本次真正解析出的核路径 —— 起核后的内核自证要对账的正是**这一次**的期望值
-                            //（每次尝试都重解析，故必须随本轮结果带出循环，不能在循环外重算）。
-                            binary,
                             // 🔴 内核闸门剥除之后、**真正生成这份 config 的那套 servers**。
                             // 循环外紧接着就用它遮蔽 `user_config`，让出口自证 / 热切快照 / TS 逆表
                             // 三处按 id 反算 tag 时，算的是运行核里真实存在的那套 tag。
@@ -2650,17 +2637,6 @@ impl ProxyRuntime {
         // 放在 A1 之后：二者是正交的两条降级轴（A1 = OS 没把流量导进核；本检查 = 核内部出口指错了），
         // 各自独立 emit，互不遮蔽。纯静态、零 I/O、微秒级 → 不给已经偏慢的起核路径增加任何延迟。
         self.attest_selected_exit(&user_config, &singbox_config);
-        // **内核自证**：核已就绪 → 问系统「这个 pid 实际在跑哪个文件、那个文件是什么版本」，
-        // 与本次期望的核对账，不一致即告警。与上面的出口自证是两条正交轴，且**判据形态刻意不同**：
-        // 出口自证纯静态（意图 vs 意图），本条只吃事实（内核记账 + 真跑一次 version）——
-        // 因为「app 请求 bin=A / helper 实跑 bin=B」这类分叉，静态对账天然看不见（见方法文档血证）。
-        // Android 上没有核二进制可对账（`binary` 是 `IN_PROCESS_CORE_PLACEHOLDER` 占位串，
-        // 不指向任何文件）⇒ 整条自证不挂。挂了只会得到一条恒 `Unobservable` 的噪音，而
-        // 「换核没生效」在 Android 上是换 aar 的事，不由这条链回答。
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        self.spawn_running_core_binary_attestation(pid, binary.clone(), my_gen);
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let _ = &binary;
         // TUN 起来了 → 后台查一次「别人设的系统代理」并提示（只读不动手，见下方方法文档）。
         // 这只是 advisory、不是起核成立条件；Windows 真机首次 `reg query` 曾因系统冷态/安全软件扫描
         // 阻塞约 12s，把它 await 在主链会让网卡与路由早已就绪却仍显示「连接中」。后台腿带世代 +
@@ -2921,6 +2897,26 @@ impl ProxyRuntime {
                 })?;
             if self.gate.generation() != my_gen {
                 return Ok(None);
+            }
+            // 特权内核（root / SYSTEM）在 `-D` 根下首次建的 fake-IP 恢复日志属特权账户，之后直启的
+            // 用户态内核打不开（macOS root 0600；Windows 内核拒绝非 SYSTEM 进程接管 SYSTEM 属主的日志）。
+            // 由 App 以当前用户身份预建空文件（bbolt 对空文件原地初始化）；已存在则不动。
+            let journal = self.config.join("sing-box-hot-fakeip-v1.db");
+            if !journal.exists() {
+                #[cfg(windows)]
+                let created = polaris_helper::core_store::create_current_user_data_file(&journal);
+                #[cfg(not(windows))]
+                let created = {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&journal)
+                };
+                if let Err(error) = created {
+                    log::warn!("预建 fake-IP 恢复日志失败，之后直启内核可能打不开特权内核建的文件: {error}");
+                }
             }
         }
         // Content is installed only by the administrator transaction. Runtime

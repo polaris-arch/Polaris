@@ -1827,7 +1827,8 @@ fn local_import_round_trips_through_the_bundled_core() {
     assert_ne!(ts[0]["state_directory"], ts[1]["state_directory"]);
     for endpoint in &ts {
         let dir = endpoint["state_directory"].as_str().unwrap();
-        assert!(dir.starts_with("/fake/userData/tailscale/"));
+        // 路径按本机分隔符拼接（Windows 为 `\`），按路径组件比较前缀。
+        assert!(std::path::Path::new(dir).starts_with("/fake/userData/tailscale"));
         assert!(endpoint["taildrop_directory"]
             .as_str()
             .unwrap()

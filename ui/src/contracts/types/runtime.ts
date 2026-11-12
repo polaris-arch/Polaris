@@ -83,7 +83,6 @@ export enum ProxyErrorCode {
   SYSTEM_PROXY_FAILED = 'SYSTEM_PROXY_FAILED', // 核心已起但系统代理 networksetup/reg 设置失败（非终态提示）
   SYSTEM_DNS_TAKEOVER_FAILED = 'SYSTEM_DNS_TAKEOVER_FAILED', // Linux 核已起但 systemd-resolved 未接到 Polaris TUN（非终态、显式 DNS 降级提示）
   EXIT_MISMATCH = 'EXIT_MISMATCH', // 核在跑但实际生效出口 ≠ 用户选中节点（静默直连风险，非终态；见 runtime/proxy::attest_effective_exit）
-  CORE_BINARY_MISMATCH = 'CORE_BINARY_MISMATCH', // 核在跑但实际执行的二进制 ≠ 本次期望的核（非终态；见 runtime/proxy::process_supervision 的内核自证）
   RULE_RESOURCES_MISSING = 'RULE_RESOURCES_MISSING', // 核在跑但本地 .srs 缺失/损坏 → 引用它的分流规则被 fail-closed 剪枝（分流降级、未命中规则兜底走代理而非静默直连，非终态；见 runtime/proxy::warn_pruned_rule_resources 与 App.tsx 能力降级腿注释的两个例外）
   NETWORK_PROFILE_RULES_PRUNED = 'NETWORK_PROFILE_RULES_PRUNED', // 核在跑但部分网络场景规则本次未生成（场景失效/探测源本机不可用/R4 剔除 dhcp）或可能永不命中（dhcp 源只写 IPv6 地址段）（非终态；见 runtime/proxy::warn_network_profile_rules）
   AUTO_SWITCH_NEEDS_RESTART = 'AUTO_SWITCH_NEEDS_RESTART', // 自动故障切换已触发、候选也规划出来了，但每个候选都要整核重启 → 这轮一个都没探（非终态；见 runtime/auto_switch::switch_blocked_by_restart）

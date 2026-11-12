@@ -1165,7 +1165,7 @@ impl ProxyRuntime {
 
     /// 停止 sing-box（上游 `proxy:stop`）——**主动停止终态**：停核 ＋ 清系统代理（维度7 #8 对称面）。
     ///
-    /// = [`stop_inner`](Self::stop_inner)（停核 + 清状态/快照）＋ 系统代理收口。
+    /// = 系统代理收口 ＋ [`stop_inner`](Self::stop_inner)（停核 + 清状态/快照）。
     ///
     /// **为什么主动停止必须清系统代理**：系统代理若由我们设置且仍指向刚被杀的本地端口，停核后它就指向
     /// 一个死端口 → 用户全网断连、需手动改回。这是 start 失败腿
@@ -1418,6 +1418,9 @@ impl ProxyRuntime {
             generation,
         )
         .await;
+        // 维度7 #8 对称收口（见方法文档）：先撤系统代理再停核，系统代理不再指向正在关闭的端口。
+        // 世代已在入口认领，换代即让位；marker 门控幂等，失败只记日志不阻断停止。
+        self.clear_system_proxy_if_current(generation).await;
         let committed = self
             .stop_inner(StopClaim::AlreadyClaimed(generation))
             .await?;
@@ -1428,8 +1431,6 @@ impl ProxyRuntime {
             // Stop 完成后旧核已不存在，已保存删除的保护对象随之消失：此刻就是与 Apply/冷启动同级的
             // 安全提交点。只消费后端 journal，**绝不**触碰渲染端尚未保存的 staged 条目。
             self.process_deferred_config_deletions().await;
-            // 维度7 #8 对称收口（见方法文档）：marker 门控幂等，失败只记日志不阻断停止。
-            self.clear_system_proxy_if_current(generation).await;
         }
         #[cfg(target_os = "ios")]
         pending_revoke?;

@@ -656,7 +656,7 @@ async fn deliberate_stop_invokes_system_proxy_clearer() {
 /// 停核腿不可能在这两句之间推进。）
 ///
 /// **变异实跑**：删掉 `stop_inner` 里任一 `stop_superseded` 早退 → 对应断言转红；
-/// 把 `stop` 的 `if self.stop_inner().await?` 改回无条件 `clear_system_proxy()` → 第三条转红。
+/// 把 `stop` 里停核前那次 `clear_system_proxy_if_current` 移到 `stop_inner` 之后改为无条件清 → 第三条转红。
 #[tokio::test]
 async fn superseded_stop_teardown_stands_down_instead_of_clobbering_the_new_session() {
     let (rt, _dir, clears) = test_runtime_recording();
@@ -699,6 +699,13 @@ async fn superseded_stop_teardown_stands_down_instead_of_clobbering_the_new_sess
         spins += 1;
         assert!(spins < 10_000, "停核腿始终没 bump 世代 —— 前置假设已失效");
     }
+    // 停核腿先以旧会话世代撤系统代理、再堵在 exit_route 锁上；等它撤完再换代，断言才不赌时序。
+    let mut waits = 0;
+    while clears.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        waits += 1;
+        assert!(waits < 5_000, "停核腿始终没在停核前撤系统代理");
+    }
     rt.bump_generation(); // ← 新一轮 start 接管（用户重装 helper 后点了连接）
     release.notify_one(); // 放锁：停核腿醒来，撞上换代守卫
     holder.await.expect("占位任务不得 panic");
@@ -717,8 +724,8 @@ async fn superseded_stop_teardown_stands_down_instead_of_clobbering_the_new_sess
     );
     assert_eq!(
         clears.load(Ordering::SeqCst),
-        0,
-        "让位后不得清系统代理：此刻的系统代理属**新会话**，清了 = 用户全网走直连"
+        1,
+        "系统代理只在让位前（仍属旧会话时）清一次；让位后再清 = 清掉新会话的系统代理，用户全网走直连"
     );
     assert!(
         refreshes.lock().unwrap().is_empty(),

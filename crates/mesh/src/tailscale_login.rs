@@ -90,6 +90,16 @@ pub fn build_tailscale_login_config(
         "state_directory".to_string(),
         Value::String(state_dir.to_string_lossy().to_string()),
     );
+    // 与主核同一落点：Windows 内核的受管目录校验要求显式、位于 state 目录之下的 Taildrop 目录。
+    endpoint.insert(
+        "taildrop_directory".to_string(),
+        Value::String(
+            state_dir
+                .join(polaris_config_engine::builder::endpoints::TAILDROP_SUBDIR)
+                .to_string_lossy()
+                .to_string(),
+        ),
+    );
     if let Some(ts) = ts {
         if let Some(key) = ts
             .auth_key

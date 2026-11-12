@@ -132,11 +132,7 @@ export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: P
  * 判据取补集（不在表里的一律算失败）而非正列失败码：漏判一个失败码 ⇒ 条永远停在「应用中…」、
  * 用户没有任何出口；漏判一个非终态码 ⇒ 多一次可点掉的红。两害相权取后者。
  *
- * `CORE_BINARY_MISMATCH` 是**起核后**的内核自证告警（实跑二进制 ≠ 本次期望的核）——核这时已经
- * 起来并在服务流量，只是跑的是旧核。把它误判成「重启没落地」会让条卡死在「应用中…」，而实际上
- * 那次 apply 已经成功了。
- *
- * `AUTO_SWITCH_NEEDS_RESTART` 同理，且与「这一次 apply」更是毫无关系：它由后台自动换节点心跳
+ * `AUTO_SWITCH_NEEDS_RESTART` 与「这一次 apply」毫无关系：它由后台自动换节点心跳
  * 在**核已稳定运行**期间发出（可用节点都要整核重启才能切过去）。算成重启失败会让一次早已成功的
  * apply 事后被判红。
  */
@@ -146,7 +142,6 @@ const CORE_STILL_RUNNING_CODES: ReadonlySet<string> = new Set([
   'EXIT_MISMATCH',
   'RULE_RESOURCES_MISSING',
   'NETWORK_PROFILE_RULES_PRUNED',
-  'CORE_BINARY_MISMATCH',
   'AUTO_SWITCH_NEEDS_RESTART',
 ]);
 

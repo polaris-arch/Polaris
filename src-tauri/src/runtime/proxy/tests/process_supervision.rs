@@ -1158,63 +1158,6 @@ fn windows_stale_core_io_ends_the_scanned_process_and_liveness_follows() {
     );
 }
 
-/// 自证结论的处置：经提权助手起的核上，版本**确定不同**即停核；其余照旧。
-///
-/// 第二个循环钉住告警的单一真值：应用直起的核上，「落告警」当且仅当 `is_alarm()`。
-///
-/// 版本字符串不符、版本不可读均是非终态诊断，不得升级为停核判据。
-#[test]
-fn version_attestation_remains_a_nonfatal_runtime_diagnostic() {
-    use crate::runtime::core_attest::CoreBinaryAttestation as Attestation;
-    let running = PathBuf::from("/var/lib/polaris/core/sing-box");
-    let mismatch = Attestation::VersionMismatch {
-        running: running.clone(),
-        running_version: "sing-box version 1.14.0-alpha.45".into(),
-        expected_version: "sing-box version 1.14.0-beta.3".into(),
-    };
-    let unreadable = Attestation::VersionUnreadable {
-        running: running.clone(),
-        running_version: String::new(),
-        expected_version: "sing-box version 1.14.0-beta.3".into(),
-    };
-    let same_version = Attestation::SameVersion {
-        running,
-        version: "sing-box version 1.14.0-beta.3".into(),
-    };
-    for (attestation, want) in [
-        (&mismatch, AttestationDisposition::Alarm),
-        (&unreadable, AttestationDisposition::Alarm),
-        (
-            &Attestation::Unobservable,
-            AttestationDisposition::Unobserved,
-        ),
-        (&same_version, AttestationDisposition::Pass),
-        (&Attestation::SamePath, AttestationDisposition::Pass),
-    ] {
-        let got = attestation_disposition(attestation);
-        assert_eq!(got, want, "{attestation:?}");
-        assert_eq!(
-            got == AttestationDisposition::Alarm,
-            attestation.is_alarm(),
-            "告警与否只有 is_alarm 一处真值：{attestation:?}"
-        );
-    }
-}
-
-/// 生产自证只发布诊断；不得通过 stop/kill 改变运行出口或内核状态。
-#[test]
-fn runtime_version_diagnostics_do_not_stop_the_proxy() {
-    let attest = method_body(
-        &module_code("runtime/proxy"),
-        "    async fn attest_running_core_binary(",
-    );
-    assert!(attest.contains("match attestation_disposition(&attestation)"));
-    assert!(attest.contains("self.set_nonfatal_error("));
-    assert!(!attest.contains("stop_inner("));
-    assert!(!attest.contains("stop_mismatched_helper_core("));
-    assert!(!attest.contains("kill_core("));
-}
-
 /// 清扫用例里核二进制的路径：文件名是核文件名、写法随宿主（配置目录是宿主上的临时目录，
 /// 判据按配置目录的写法选腿）。
 fn sweep_test_core() -> &'static str {
@@ -3269,51 +3212,6 @@ fn crash_monitor_actually_consults_the_pid_identity() {
     assert!(
         body.contains("ManagedCoreStatus::Stopped"),
         "helper 明确报告 stopped 时必须改判核退出"
-    );
-}
-
-/// D2：内核自证在本地观测取不到时改问 helper —— 但**只在 pid 对得上**时才采信它的 `image=`。
-///
-/// 三条断言各锁一格：
-/// - pid 相同 + 有 image → 采信（Windows 上这是自证从「未能进行」转为可判的唯一材料）；
-/// - pid 不同 → `None`：helper 管着另一个会话的核，拿它的映像对账是在回答另一个问题；
-/// - 无 image（旧 helper / FFI 读失败）→ `None`：读不到就说读不到，不冒充自证通过。
-#[test]
-fn attestation_only_trusts_the_helper_image_for_its_own_pid() {
-    use crate::runtime::helper::ManagedCoreStatus;
-
-    let running = |pid: u32, image: Option<&str>| ManagedCoreStatus::Running {
-        pid,
-        created: Some(133_600_000_000_000_000),
-        image: image.map(ToOwned::to_owned),
-    };
-    let core = r"C:\ProgramData\Polaris\core\sing-box.exe";
-
-    assert_eq!(
-        image_from_managed_status(&running(4242, Some(core)), 4242),
-        Some(std::path::PathBuf::from(core))
-    );
-    assert_eq!(
-        image_from_managed_status(&running(9001, Some(core)), 4242),
-        None,
-        "helper 手里是另一个会话的核 —— 它的映像不能拿来给本代对账"
-    );
-    assert_eq!(image_from_managed_status(&running(4242, None), 4242), None);
-    assert_eq!(
-        image_from_managed_status(&ManagedCoreStatus::Stopped, 4242),
-        None
-    );
-}
-
-/// A PID-reported image is not permission to execute that path as a diagnostic.
-#[test]
-fn attestation_does_not_execute_or_certify_pid_reported_paths() {
-    let source = crate::test_support::crate_code("runtime/proxy/process_supervision.rs");
-    let body = method_body(&source, "    async fn attest_running_core_binary(");
-    assert!(body.contains("attest_core_binary(expected, None, \"\", \"\")"));
-    assert!(!body.contains("first_line("));
-    assert!(
-        body.contains("attestation_commit_allowed(self.gate.generation(), my_gen, &status, pid)")
     );
 }
 

@@ -3563,21 +3563,6 @@ fn kernel_gate_cache_round_trips_atomically_and_corruption_is_a_miss() {
     );
 }
 
-#[test]
-fn background_attestation_only_commits_to_the_same_running_generation_and_pid() {
-    let running = ProxyStatus {
-        running: true,
-        pid: 4245,
-        ..ProxyStatus::default()
-    };
-    assert!(attestation_commit_allowed(7, 7, &running, 4245));
-    assert!(!attestation_commit_allowed(8, 7, &running, 4245));
-    assert!(!attestation_commit_allowed(7, 7, &running, 4246));
-
-    let stopped = ProxyStatus::default();
-    assert!(!attestation_commit_allowed(7, 7, &stopped, 4245));
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_structure_change() {

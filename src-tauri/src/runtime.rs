@@ -19,7 +19,6 @@
 pub(crate) mod auto_select;
 pub mod auto_switch;
 pub mod config;
-pub mod core_attest;
 pub(crate) mod core_identity;
 pub mod core_paths;
 pub(crate) mod core_version;

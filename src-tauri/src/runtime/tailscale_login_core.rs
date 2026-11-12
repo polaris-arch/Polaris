@@ -4747,7 +4747,10 @@ impl LoginCoreRegistry {
                 result = self.checker.check_for_spawn(&binary, &config_path) => match result {
                     Ok(()) => {},
                     Err(ConfigCheckFailure::AndroidCapacityClosed(error)) => return StartLoginOutcome::AndroidCapacityClosed(error),
-                    Err(_) => return StartLoginOutcome::Failed("configurationCheckFailed".into()),
+                    Err(error) => {
+                        log::warn!("Tailscale 登录配置未通过内核检查: {error}");
+                        return StartLoginOutcome::Failed("configurationCheckFailed".into());
+                    }
                 },
             }
         }

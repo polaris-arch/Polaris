@@ -29,7 +29,8 @@
 //! 那道门只落了**一份**夹具，而它在打包腿上是四条腿各跑各的核。单份夹具成立的依据是
 //! 「schema 面四平台恒等」，该结论的一条腿正是**四份核的 tag 集只差 `with_purego` 与 `with_gvisor`**
 //! （2026-08-09 逐条核过上游：`option/` 零 build tag；`include/` 里三对 GOOS/cgo 门控
-//! ——ccm / usbip / resolved——两侧注册的是同一批 option 类型与同一个 type 常量；
+//! ——ccm / usbip / resolved（ccm、usbip 自 1.15.0-alpha.12.23 不再编入，只剩 resolved 生效）——
+//! 两侧注册的是同一批 option 类型与同一个 type 常量；
 //! `with_purego` 在 sing-box 模块内零引用，是依赖层的 tag；`with_gvisor` 自 1.15.0-alpha.7 起
 //! 同样在 sing-box 模块内零引用，只门控 sing-tun 的 TUN 栈实现，不注册任何 option 类型）。
 //! tag 集一旦真的分叉，那份共享夹具的依据就断了 ⇒ 本门的 [`tag_sets_differ_only_by_the_documented_extras`]
@@ -199,7 +200,7 @@ fn every_bundled_core_matches_its_pinned_build_face() {
             .unwrap_or("");
         assert_eq!(
             cgo, core.cgo,
-            "{}: CGO_ENABLED 变了（{} → {cgo}）。darwin 侧靠 cgo 才走真 ccm/usbip 实现，\
+            "{}: CGO_ENABLED 变了（{} → {cgo}）。darwin 侧靠 cgo，\
              linux/win 侧靠 purego —— 这一格翻转会连带改 build tag 的有效分支",
             core.key, core.cgo
         );

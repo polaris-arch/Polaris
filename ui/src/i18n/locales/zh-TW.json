@@ -1881,7 +1881,6 @@
     "helperGateAborted": "已取消安裝提權助手，本次未啟動 TUN 模式代理",
     "tunRouteNotCaptured": "偵測到其他 VPN 佔用預設路由，請先中斷後重試",
     "rootOrphanBlocked": "偵測到殘留的核心行程佔用快取檔案，啟動核心已被阻斷",
-    "coreBinaryMismatch": "目前執行中的核心與本應用程式配套的版本不一致。請重新安裝 Helper，並在日誌中查看詳情",
     "coreNotExecutable": "安裝套件內的核心檔案沒有可執行權限，無法啟動。請重新安裝應用程式。",
     "helperCoreMismatch": "無法驗證選定核心的回執，請前往「設定 › Helper」修復或升級助手。",
     "tunAdapterMissing": "TUN 虛擬網卡未能建立，請檢查 wintun 驅動是否被安全軟體攔截，或重新啟動後重試",

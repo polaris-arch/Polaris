@@ -563,7 +563,7 @@ fn request() -> Request {
         manifest_sha256: "b".repeat(64),
         helper_sha256: "c".repeat(64),
         cleaner_sha256: "d".repeat(64),
-        token: "e".repeat(64),
+        token: "e".repeat(32),
         stage_identity: [0; 3],
         source_identities: vec![],
     }

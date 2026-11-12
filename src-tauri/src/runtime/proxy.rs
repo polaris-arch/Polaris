@@ -413,9 +413,6 @@ pub mod code {
     /// 实际默认出口，与用户落盘的 `selectedServerId` 对账（见 [`attest_effective_exit`](super::startup::attest_effective_exit)）。
     /// 非终态（核在跑），同走 `set_nonfatal_error`。这是「用户以为走代理、实则明文直连」的唯一告警通道。
     pub const EXIT_MISMATCH: &str = "EXIT_MISMATCH";
-    /// Nonfatal diagnostic mismatch, separate from byte/source startup admission.
-    /// Cached or PID-derived pathnames are never executed to produce this verdict.
-    pub const CORE_BINARY_MISMATCH: &str = "CORE_BINARY_MISMATCH";
     /// The pinned Start/status receipt differs from the selected immutable CoreID.
     /// Runtime version strings are diagnostic and never establish this verdict.
     pub const HELPER_CORE_MISMATCH: &str = "HELPER_CORE_MISMATCH";
@@ -1087,6 +1084,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             )
         };
 
+        log::info!(
+            "TUN 提权引导：已弹出{}确认框，等待用户确认（期间界面停在「启动中」）",
+            if status.installed {
+                "修复 helper"
+            } else {
+                "安装 helper"
+            }
+        );
         let confirmed = self
             .app
             .dialog()

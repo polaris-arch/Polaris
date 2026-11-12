@@ -444,13 +444,15 @@ export default function SettingsHelper() {
                   <span>{t('helper.stepRegisterDaemon')}</span>
                 </div>
               </div>
-              <Button variant="flow" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-                  <path d="M12 3v11M8 10l4 4 4-4" />
-                </svg>
-                <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : t('helper.installAction')}</span>
-              </Button>
-              {uninstallButton}
+              <div style={{ display: 'flex', gap: 9, marginTop: 14, flexWrap: 'wrap' }}>
+                <Button variant="flow" size="sm" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+                    <path d="M12 3v11M8 10l4 4 4-4" />
+                  </svg>
+                  <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : t('helper.installAction')}</span>
+                </Button>
+                {uninstallButton}
+              </div>
             </div>
           )}
 

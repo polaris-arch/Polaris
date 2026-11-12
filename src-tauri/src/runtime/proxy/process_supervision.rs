@@ -1,5 +1,5 @@
-//! 进程监管 owner：受管核的杀停（直起 / helper 两腿）、启动期 stale-core 清扫与 root 孤儿提权清扫、
-//! 起核后的内核二进制自证，以及 pid 层的观测原语（信号 / 探活 / 进程身份令牌）。
+//! 进程监管 owner：受管核的杀停（直起 / helper 两腿）、启动期 stale-core 清扫与 root 孤儿提权清扫，
+//! 以及 pid 层的观测原语（信号 / 探活 / 进程身份令牌）。
 //!
 //! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs`），
 //! façade 必须 `pub(crate) use` 再导出（§B.3）。
@@ -14,7 +14,6 @@ pub(super) use direct_stop::DirectStopIo;
 use direct_stop::NativeStopIo;
 
 use std::future::poll_fn;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -28,7 +27,6 @@ use polaris_helper_proto::Platform;
 
 use crate::runtime::helper::{HelperStopOps, HelperStopTarget};
 
-use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
 
 /// A private comparison view. Only the native receipt adapter supplies it in
@@ -75,8 +73,9 @@ fn writer_census_index(runs: &[WriterRunScope]) -> Result<WriterIndex, String> {
         let mut directories = BTreeSet::new();
         for node in &run.nodes {
             if node.tag.is_empty()
-                || !Path::new(&node.directory).is_absolute()
-                || Path::new(&node.directory).join("tailscaled.state") != Path::new(&node.file)
+                || !std::path::Path::new(&node.directory).is_absolute()
+                || std::path::Path::new(&node.directory).join("tailscaled.state")
+                    != std::path::Path::new(&node.file)
                 || !tags.insert(&node.tag)
                 || !directories.insert(&node.directory)
                 || !nodes.insert((node.tag.clone(), node.directory.clone(), node.file.clone()))
@@ -1006,53 +1005,6 @@ impl ProxyRuntime {
         Ok(token)
     }
 
-    /// Runtime version diagnostics must never execute a PID-derived image path.
-    /// Content/source admission remains at the existing resolver/helper boundary.
-    /// Without an owned loaded-image proof, report unknown after the same exact
-    /// generation/PID commit check; matching pathnames are not byte evidence.
-    pub(super) fn spawn_running_core_binary_attestation(
-        self: &Arc<Self>,
-        pid: u32,
-        expected: PathBuf,
-        my_gen: u64,
-    ) {
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            this.attest_running_core_binary(pid, &expected, my_gen)
-                .await;
-            log::info!(
-                "起核后台耗时：内核二进制自证={}ms（pid={pid}）",
-                started.elapsed().as_millis()
-            );
-        });
-    }
-
-    async fn attest_running_core_binary(self: &Arc<Self>, pid: u32, expected: &Path, my_gen: u64) {
-        // Do not reopen expected or a PID-derived path as a new executable.
-        // A future read-only loaded-image diagnostic may refine this unknown,
-        // but a version subprocess cannot attest the already-running object.
-        let attestation = crate::runtime::core_attest::attest_core_binary(expected, None, "", "");
-        let status = self.status();
-        if !attestation_commit_allowed(self.gate.generation(), my_gen, &status, pid) {
-            log::info!(
-                "内核自证完成时启动世代或 pid 已变化 → 丢弃陈旧结论（世代 {my_gen}→{}，pid {pid}→{}）",
-                self.gate.generation(),
-                status.pid
-            );
-            return;
-        }
-        match attestation_disposition(&attestation) {
-            // 非终态：核确在跑，只是版本对不上或读不出 → 保留 running/pid/端口，只落错误两轴 + 广播事件。
-            AttestationDisposition::Alarm => {
-                self.set_nonfatal_error(&attestation.user_message(), code::CORE_BINARY_MISMATCH);
-            }
-            // 「没观测到」既不是通过也不是错误：只留痕，绝不说「通过」。
-            AttestationDisposition::Unobserved => log::warn!("{}", attestation.user_message()),
-            AttestationDisposition::Pass => log::info!("{}", attestation.user_message()),
-        }
-    }
-
     /// 杀核：SIGTERM → 宽限 → owned Child SIGKILL，并确认 native wait。
     ///
     /// Empty = no-op；普通 Stopping 可重试；exact worker 的 Stopping 保持独占。
@@ -1656,32 +1608,6 @@ impl ProxyRuntime {
     }
 }
 
-/// 内核自证的结论怎么处置（纯函数的结果）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AttestationDisposition {
-    /// 实跑的就是期望的那一份（同一文件，或版本相同）。
-    Pass,
-    /// 没观测到：只留痕。
-    Unobserved,
-    /// 核照常运行，落非终态告警。
-    Alarm,
-}
-
-/// 自证结论 → 运行期诊断（纯函数）。
-///
-/// 安装设计稿末尾裁定第 6 条：版本首行与清单的一致性由发布门保证，运行期只作诊断。
-/// 它不能替代受保护内容校验或清单身份比对，也不能单凭字符串差异中止正在运行的代理。
-pub(super) fn attestation_disposition(
-    attestation: &crate::runtime::core_attest::CoreBinaryAttestation,
-) -> AttestationDisposition {
-    use crate::runtime::core_attest::CoreBinaryAttestation as Attestation;
-    match attestation {
-        _ if attestation.is_alarm() => AttestationDisposition::Alarm,
-        Attestation::Unobservable => AttestationDisposition::Unobserved,
-        _ => AttestationDisposition::Pass,
-    }
-}
-
 /// 清不掉的提权孤儿核：给用户的手动收拾办法（按平台，纯函数）。
 ///
 /// Windows 上没有 `sudo` 也没有 `kill`：要在管理员终端里用系统自带的 `taskkill`，每个 pid 各带
@@ -1765,30 +1691,6 @@ impl StaleCoreIo for NativeStaleCoreIo {
             .hold
             .is_running()
             .unwrap_or_else(|| pid_alive(process.pid))
-    }
-}
-
-/// 纯判定：**只有 helper 手里的受管 pid 与本代 pid 相同**才采信它回传的 image。
-///
-/// pid 对不上说明 helper 正管着另一个会话的核 —— 拿它的映像去和本代期望值对账，判等判不等都是
-/// 在回答另一个问题；那种结论比「没观测到」更坏，因为它看起来像事实。
-#[cfg(test)]
-pub(super) fn image_from_managed_status(
-    status: &crate::runtime::helper::ManagedCoreStatus,
-    want_pid: u32,
-) -> Option<PathBuf> {
-    match status {
-        crate::runtime::helper::ManagedCoreStatus::Running { pid, image, .. }
-            if *pid == want_pid =>
-        {
-            image.as_deref().map(PathBuf::from)
-        }
-        crate::runtime::helper::ManagedCoreStatus::NativeBirthRunning { target, image, .. }
-            if target.pid.get() == want_pid =>
-        {
-            image.as_deref().map(PathBuf::from)
-        }
-        _ => None,
     }
 }
 

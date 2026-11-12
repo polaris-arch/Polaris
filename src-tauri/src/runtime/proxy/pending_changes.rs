@@ -316,6 +316,19 @@ impl ProxyRuntime {
         #[cfg(any(target_os = "ios", windows))]
         let mut directory_leases = Vec::new();
         let config_dir = self.config.dir().to_path_buf();
+        // 节点删除收口时一并删掉它的 tailnet rule-set 文件（只由已删节点的 id 派生，无物可删即完成）。
+        let remove_tailnet_rule_file = |server_id: &str| {
+            let path = self.tailnet_rules_dir().join(format!(
+                "{}.json",
+                polaris_config_engine::builder::endpoint_routes::tailnet_rule_file_base(server_id)
+            ));
+            match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    log::warn!("删除 tailnet rule-set 文件失败 {}: {error}", path.display());
+                }
+                _ => {}
+            }
+        };
         let result = self
             .config
             .process_deferred_deletions_scoped(scope, |entry, current| {
@@ -354,15 +367,15 @@ impl ProxyRuntime {
                         )
                     }
                     DeferredConfigDeletion::TailscaleState { server_id } => {
-                        if cfg!(any(target_os = "ios", windows)) {
-                            return Err("CleanupUnknown: unbound legacy directory intent".into());
-                        }
                         match self.mesh.tailscale_logout_under_gate(
                             server_id,
                             gate,
                             self.tailscale_writer_alive(),
                         ) {
-                            Ok(()) => Ok(()),
+                            Ok(()) => {
+                                remove_tailnet_rule_file(server_id);
+                                Ok(())
+                            }
                             // 旧版恶意/损坏配置可能把不安全 id 留进 journal；它不可能对应受管目录，
                             // 安全丢弃该删除意图，避免每次启动永久重试。
                             Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
@@ -413,6 +426,12 @@ impl ProxyRuntime {
                                 format!("CleanupUnknown: directory commit retained: {error}")
                             })?;
                             directory_leases.push(lease);
+                            // 已提交的目录删除在节点同 id 重新加回后仍会走到这里；此时文件属在用节点。
+                            if !crate::runtime::config::deferred_deletion_is_cancelled(
+                                entry, current,
+                            ) {
+                                remove_tailnet_rule_file(&intent.server_id);
+                            }
                             Ok(())
                         }
                         #[cfg(not(any(target_os = "ios", windows)))]

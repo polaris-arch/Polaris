@@ -502,7 +502,11 @@ pub fn build_outbounds_with_runtime_bindings(
                 continue;
             }
 
-            let state_dir = format!("{}/{}", deps.tailscale_state_dir_prefix, server.id);
+            // 按平台分隔符拼接：Windows 内核的受管目录校验拒收含 `/` 的路径。
+            let state_dir = std::path::Path::new(&deps.tailscale_state_dir_prefix)
+                .join(&server.id)
+                .to_string_lossy()
+                .into_owned();
             // 前置代理：TS 侧经它的是控制面 / DERP 的 **TCP** 拨号（异于 WG 的 UDP ASSOCIATE）。
             let detour_tag = resolve_detour_tag(server, config, &id_to_tag);
             let mut ep = build_tailscale_endpoint(

@@ -141,6 +141,10 @@ let refreshReason = 'mount';
 let refreshNeeded = false;
 // Keep the native flight even after disposal: JS invalidation cannot cancel Rust I/O.
 let loadConfigInflight: { session: ConfigSession; epoch: number } | null = null;
+// proxy_get_status 以配置写锁 try_lock 取一致快照：同刻并发的几次读会互相撞成 PROXY_STATUS_WRITER_BUSY。
+// 合并成「在飞一次 + 尾随一次」，尾随那次保证晚到的调用读到它之后的真值。
+let proxyStatusFlight: Promise<void> | null = null;
+let proxyStatusTail: Promise<void> | null = null;
 const configWaiters = new Set<ConfigWaiter>();
 
 function invalidateLoadConfig(reason: string): number {
@@ -602,13 +606,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   /** 从后端重拉连接态。事件驱动的唯一刷新入口（App.tsx 的 proxyStarted/proxyStopped 订阅调它）——
    * `startProxy`/`stopProxy` 自身不写 `proxyStatus`，因为托盘浮层（独立窗口，不共享本 store）也能
    * 触发启停，只有走事件才能让两个窗口收敛到同一真值。失败不抛：连接态刷新失败不该冒泡成 UI 异常。 */
-  refreshProxyStatus: async () => {
-    try {
-      const status = await api.proxy.getStatus();
-      set({ proxyStatus: status ?? null });
-    } catch (err) {
-      console.error('[app-store] refreshProxyStatus failed:', err);
-    }
+  refreshProxyStatus: () => {
+    if (proxyStatusTail) return proxyStatusTail;
+    const run = async () => {
+      try {
+        const status = await api.proxy.getStatus();
+        set({ proxyStatus: status ?? null });
+      } catch (err) {
+        console.error('[app-store] refreshProxyStatus failed:', err);
+      } finally {
+        proxyStatusFlight = null;
+      }
+    };
+    if (!proxyStatusFlight) return (proxyStatusFlight = run());
+    return (proxyStatusTail = proxyStatusFlight.then(() => {
+      proxyStatusTail = null;
+      return (proxyStatusFlight = run());
+    }));
   },
   setTrafficStats: (stats) => set({ trafficStats: stats }),
   setIpInfo: (info) => set((state) => {

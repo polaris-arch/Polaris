@@ -1874,7 +1874,10 @@ fn derive_deferred_deletions(current: &Value, incoming: &Value) -> Vec<DeferredC
     out
 }
 
-fn deferred_deletion_is_cancelled(entry: &DeferredConfigDeletion, current: &Value) -> bool {
+pub(crate) fn deferred_deletion_is_cancelled(
+    entry: &DeferredConfigDeletion,
+    current: &Value,
+) -> bool {
     match entry {
         DeferredConfigDeletion::RuleResource { file_name } => current
             .get("ruleResources")
