@@ -276,7 +276,17 @@ pub async fn proxy_get_status(
 ) -> Result<ApiResponse<ProxyStatus>, ()> {
     Ok(async {
         state.proxy().native_auto_status().await;
-        proxy_status_response(state.proxy())
+        // The snapshot shares the config writer mutex with commit fences and other
+        // status reads; wait out such a brief holder instead of surfacing it.
+        let mut response = proxy_status_response(state.proxy());
+        for _ in 0..50 {
+            if response.code.as_deref() != Some("PROXY_STATUS_WRITER_BUSY") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            response = proxy_status_response(state.proxy());
+        }
+        response
     }
     .await)
 }
