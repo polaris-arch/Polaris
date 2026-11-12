@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { isValidElement, type ReactElement } from 'react';
 import type { CoreVersionInfo } from '@/contracts/types/update';
 
-const h = vi.hoisted(() => ({ copyState: 'idle', enterSettings: vi.fn() }));
+const h = vi.hoisted(() => ({ copyState: 'idle' }));
 vi.mock('react', async original => ({
   ...await original<typeof import('react')>(),
   useState: () => [h.copyState, (value: string) => { h.copyState = value; }],
@@ -21,11 +21,6 @@ vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => {} },
   useTranslation: () => ({ t: translate, i18n: { language: 'zh-CN' } }),
 }));
-vi.mock('@/store/nav-store', () => ({ useNavStore: { getState: () => ({ enterSettings: h.enterSettings }) } }));
-vi.mock('./CoreRecoveryActions', () => ({ default: () => <div data-core-recovery="current-app">
-  {translate('coreRecovery.check')}<a href="#app-update-card">{translate('coreRecovery.reinstall')}</a>
-</div> }));
-const { default: CoreRecoveryActions } = await import('./CoreRecoveryActions');
 const { default: CoreInfoCard } = await import('./CoreInfoCard');
 const PATCH_SET = '0123456789abcdef0123456789abcdef01234567';
 const FULL: CoreVersionInfo = { packagedVersion: '1.14.0-polaris.3', bundledVersion: '1.14.0-polaris.4', patchSet: PATCH_SET };
@@ -42,7 +37,7 @@ function copyButton(core = selectedCore) {
   const tree = CoreInfoCard({ info: FULL, selectedCore: core });
   return nodes(tree).find(n => typeof n.props.onClick === 'function')!;
 }
-beforeEach(() => { h.copyState = 'idle'; h.enterSettings.mockClear(); });
+beforeEach(() => { h.copyState = 'idle'; });
 afterEach(() => { vi.unstubAllGlobals(); });
 
 describe('内核信息与只读诊断', () => {
@@ -122,14 +117,12 @@ describe('内核信息与只读诊断', () => {
   });
 });
 
-it('内容损坏提供实际离线修复入口并保留同版受信应用重装', () => {
+it('内容损坏只提示同版受信应用重装，不提供应用内修复', () => {
   const info = { ...FULL, admission: { state: 'rejected', kind: 'Mismatch', recovery: 'reinstallCurrentApp' } } as CoreVersionInfo;
   const markup=renderToStaticMarkup(<CoreInfoCard info={info}/>);
   expect(markup).toContain('href="#app-update-card"');
   expect(markup).toContain(translate('coreRecovery.reinstall'));
-  expect(markup).toContain(translate('coreRecovery.check'));
-  expect(markup).not.toContain(translate('coreRecovery.restore'));
-  expect(markup).not.toContain('reset');
+  expect(markup.match(/<button\b/g)).toHaveLength(1); // only the diagnostics copy button
 });
 it('未证明的平台能力不把重装当前版本展示成可恢复保证', () => {
   const info = { ...FULL, admission: { state: 'rejected', kind: 'UnsupportedExactObject', recovery: 'reinstallCurrentApp' } } as CoreVersionInfo;
@@ -138,19 +131,6 @@ it('未证明的平台能力不把重装当前版本展示成可恢复保证', (
   expect(markup).not.toContain('选定内容核验失败');
   expect(markup).toContain('href="#app-update-card"');
   expect(markup).toContain(translate('coreRecovery.reinstall'));
-  expect(markup).not.toContain(translate('coreRecovery.restore'));
-});
-it.each(['UnsupportedExactObject', 'UnsupportedCapability', 'LoaderPolicy'] as const)(
-  'data recovery inspection is independent of execution rejection %s', kind => {
-    const info: CoreVersionInfo = { ...FULL, admission: { state: 'rejected', kind, recovery: 'none' } };
-    expect(nodes(CoreInfoCard({ info })).some(node => node.type === CoreRecoveryActions)).toBe(true);
-    expect(h.enterSettings).not.toHaveBeenCalled();
-  },
-);
-it('retains the actual data-restored notice after the refreshed admission card changes', () => {
-  const markup = renderToStaticMarkup(<CoreInfoCard info={{ ...FULL, admission: { state: 'admitted', recovery: 'none' } }} recoveryComplete />);
-  expect(markup).toContain(translate('coreRecovery.restored'));
-  expect(markup).not.toContain(translate('coreRecovery.restore'));
 });
 
 it('缺少能力使用真实检查更新入口，即使收到错误的重装建议也不承诺同版修复', () => {
@@ -160,14 +140,14 @@ it('缺少能力使用真实检查更新入口，即使收到错误的重装建�
   expect(markup).toContain('href="#app-update-card"');
   expect(markup).toContain(translate('settings.about.checkUpdate'));
   expect(markup).not.toContain(translate('settings.update.reinstallCurrent'));
+  expect(markup).not.toContain(translate('coreRecovery.reinstall'));
   expect(markup).not.toContain('private-source');
 });
-it.each(['Missing','Mismatch','Changed'] as const)('真实 %s 损坏保留可信重装并先检查离线恢复', kind => {
+it.each(['Missing','Mismatch','Changed'] as const)('真实 %s 损坏保留可信重装', kind => {
   const info:CoreVersionInfo={...FULL,admission:{state:'rejected',kind,recovery:'reinstallCurrentApp'}};
   const markup=renderToStaticMarkup(<CoreInfoCard info={info}/>);
   expect(markup).toContain('内核文件校验失败，请通过受信修复或重新安装应用。');
   expect(markup).toContain(translate('coreRecovery.reinstall'));
-  expect(markup).toContain(translate('coreRecovery.check'));
 });
 it.each(['zh-CN','zh-TW','en-US','ru','fa'])('%s 有完整独立的五类人类提示', language => {
   const messages=JSON.parse(readFileSync(fileURLToPath(new URL(`../../../i18n/locales/${language}.json`,import.meta.url)),'utf8')).helper.coreAdmission as Record<string,string>;
@@ -181,12 +161,6 @@ it('普通环境IO不把权限或资源错误呈现为内容损坏或重装承�
   expect(markup).toContain(translate('helper.coreAdmission.unavailable'));
   expect(markup).not.toContain(translate('helper.coreAdmission.damaged'));
   expect(markup).not.toContain('href="#app-update-card"');
-});
-
-it('内容损坏接入普通恢复consumer，不在信息卡自动安装或导航助手', () => {
-  const info = { ...FULL, admission: { state: 'rejected', kind: 'Mismatch', recovery: 'reinstallCurrentApp' } } as CoreVersionInfo;
-  expect(nodes(CoreInfoCard({ info })).some(node => node.type === CoreRecoveryActions)).toBe(true);
-  expect(h.enterSettings).not.toHaveBeenCalled();
 });
 
 it.each([undefined, 'Missing', 'Mismatch', 'Changed', 'UnsupportedCapability', 'UnsupportedExactObject'] as const)('source and policy digests have no markup, aria, tooltip or copy exit (%s)', async kind => {
@@ -208,11 +182,4 @@ it.each([undefined, 'Missing', 'Mismatch', 'Changed', 'UnsupportedCapability', '
   expect(markup.replace(details, '')).not.toContain(selectedCore.id);
   expect(markup.replace(details, '')).not.toContain(selectedCore.providerFingerprint);
   expect(JSON.parse(writeText.mock.calls[0][0])).toEqual({ selectedCore: { id: selectedCore.id, providerFingerprint: selectedCore.providerFingerprint, state: 'present' } });
-});
-
-it.each(['Missing', 'Mismatch', 'Changed'] as const)('typed data damage %s reaches the actual offline recovery consumer', kind => {
-  const info: CoreVersionInfo = { ...FULL, admission: { state: 'rejected', kind, recovery: 'reinstallCurrentApp' } };
-  const tree = CoreInfoCard({ info });
-  expect(nodes(tree).some(node => node.type === CoreRecoveryActions)).toBe(true);
-  expect(h.enterSettings).not.toHaveBeenCalled();
 });

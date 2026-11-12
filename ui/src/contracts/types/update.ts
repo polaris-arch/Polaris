@@ -75,10 +75,6 @@ export type PopupAction =
 
 export type CoreAdmissionKind = 'Missing' | 'Mismatch' | 'Changed' | 'UnsupportedExactObject' | 'UnsupportedCapability' | 'LoaderPolicy' | 'Busy' | 'Unknown' | 'Io';
 
-/** Current-app offline data recovery, not execution admission or a connection. */
-export type CoreRecoveryState = 'ready' | 'restored' | 'notNeeded' | 'stopRequired'
-  | 'helperRequired' | 'reinstallRequired' | 'unavailable' | 'pending';
-
 /** `core_get_version_info` 的返回。 */
 export interface CoreVersionInfo {
   admission?: {

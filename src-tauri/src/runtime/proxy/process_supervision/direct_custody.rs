@@ -22,7 +22,6 @@ type ObservationWait = Box<dyn FnMut(&mut Child) -> io::Result<Option<ExitStatus
 pub(crate) struct DirectCoreSlot {
     instance: Arc<SlotInstance>,
     backend: BackendFence,
-    recovery_reserved: bool,
     helper_start: Option<HelperStartAttempt>,
     helper_terminal: Option<LocalHelperTerminal>,
     state: SlotState,
@@ -36,7 +35,6 @@ impl Default for DirectCoreSlot {
         Self {
             instance: Arc::new(SlotInstance),
             backend: BackendFence::DirectOnly,
-            recovery_reserved: false,
             helper_start: None,
             helper_terminal: None,
             state: SlotState::Empty,
@@ -256,29 +254,13 @@ impl DirectCoreSlot {
     /// Must be called under the real Child mutex before a helper IPC can be
     /// queued. This fence is monotone even when that IPC is cancelled or fails.
     pub(in crate::runtime::proxy) fn touch_helper(&mut self) -> Result<(), SlotAdmissionError> {
-        if self.recovery_reserved || matches!(self.state, SlotState::Stopping(_)) {
+        if matches!(self.state, SlotState::Stopping(_)) {
             return Err(SlotAdmissionError::Busy);
         }
         self.backend = BackendFence::HelperTouched;
         Ok(())
     }
 
-    pub(crate) fn reserve_for_recovery(&mut self) -> Result<(), String> {
-        if self.recovery_reserved
-            || !matches!(self.state, SlotState::Empty)
-            || self.helper_start.is_some()
-        {
-            return Err(
-                "CORE_RECOVERY_BUSY: original Child/birth or cleanup is still owned".into(),
-            );
-        }
-        self.backend = BackendFence::HelperTouched;
-        self.recovery_reserved = true;
-        Ok(())
-    }
-    pub(crate) fn release_recovery_reservation(&mut self) {
-        self.recovery_reserved = false;
-    }
     pub(crate) fn touch_helper_for_registry(&mut self) -> Result<(), String> {
         self.touch_helper()
             .map_err(|error| format!("helper mutation rejected by Child custody: {error:?}"))
@@ -720,7 +702,7 @@ impl DirectCoreSlot {
     }
 
     pub(in crate::runtime::proxy) fn empty_for_install(&mut self) -> Option<EmptyDirectSlot<'_>> {
-        if self.is_empty() && !self.recovery_reserved {
+        if self.is_empty() {
             Some(EmptyDirectSlot { slot: self })
         } else {
             None
@@ -734,7 +716,7 @@ impl DirectCoreSlot {
         &mut self,
         run: DirectCoreRun,
     ) -> Result<(), Box<DirectCoreRun>> {
-        if !self.is_empty() || self.recovery_reserved {
+        if !self.is_empty() {
             return Err(Box::new(run));
         }
         self.last_unknown_log = None;
@@ -1067,6 +1049,3 @@ impl DirectCoreSlot {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

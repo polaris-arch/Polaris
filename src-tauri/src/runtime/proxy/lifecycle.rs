@@ -1216,23 +1216,6 @@ impl ProxyRuntime {
             .map(|boundary| boundary.outcome())
     }
 
-    /// Internal current-user data recovery may observe a truly cold App.
-    /// Keep its generation-zero compare inside the existing atomic Stop claim:
-    /// an unconditional bootstrap Stop could instead cancel a successor Start.
-    /// This is not a wire token, privileged-store proof or execution authority.
-    pub(crate) async fn stop_for_user_data_recovery(
-        self: &Arc<Self>,
-        expected: ExpectedCoreStopRequest,
-    ) -> Result<ExpectedCoreStopResult, String> {
-        let status = self.status();
-        if status.running || status.starting || status.pid != 0 {
-            return Err("core recovery requires an already idle App".into());
-        }
-        self.stop_expected_inner(expected, true)
-            .await
-            .map(|boundary| boundary.outcome())
-    }
-
     /// Internal Linux maintenance synchronizes the real initial App generation
     /// through the same selector/state/claim boundary. Generation zero is never
     /// a wire token, old-helper ownership proof or global release receipt. The

@@ -154,7 +154,6 @@ pub(super) struct CoreSelectionObservation {
 #[derive(Clone, Debug)]
 enum SelectionOrigin {
     Bundled(Vec<PathBuf>),
-    Recovered,
     #[cfg(test)]
     Fixture,
 }
@@ -166,20 +165,7 @@ impl CoreSelectionObservation {
     }
     pub(super) fn is_current(&self) -> bool {
         let selected = match &self.origin {
-            SelectionOrigin::Recovered => {
-                crate::runtime::core_identity::user_store::current_candidate()
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some(self.path.as_path())
-            }
             SelectionOrigin::Bundled(candidates) => {
-                if !matches!(
-                    crate::runtime::core_identity::user_store::current_candidate(),
-                    Ok(None)
-                ) {
-                    return false;
-                }
                 #[cfg(any(debug_assertions, test))]
                 if !matches!(dev_core_binary_override(), Ok(None)) {
                     return false;
@@ -256,7 +242,7 @@ fn resolve_bundled_core_binary() -> Result<PathBuf, String> {
     Ok(core)
 }
 
-/// Restoration source lookup grants no execution authority. The existing stage
+/// Candidate lookup grants no execution authority. Helper installation's stage
 /// transaction independently rehashes every member and the selected Helper.
 pub(crate) fn resolve_core_candidate() -> Result<PathBuf, String> {
     resolve_core_candidate_observation().map(|selection| selection.path)
@@ -293,22 +279,6 @@ pub(super) fn resolve_core_candidate_observation() -> Result<CoreSelectionObserv
 pub(super) fn candidate_observation(
     candidates: Vec<PathBuf>,
 ) -> Result<CoreSelectionObservation, String> {
-    candidate_with_recovery(
-        candidates,
-        crate::runtime::core_identity::user_store::current_candidate(),
-    )
-}
-fn candidate_with_recovery(
-    candidates: Vec<PathBuf>,
-    recovered: Result<Option<PathBuf>, String>,
-) -> Result<CoreSelectionObservation, String> {
-    if let Some(path) = recovered? {
-        return Ok(CoreSelectionObservation {
-            path,
-            origin: SelectionOrigin::Recovered,
-            bundle: None,
-        });
-    }
     let path = first_existing_bundle_candidate(&candidates).ok_or_else(||
         "CORE_ADMISSION_Missing: selected packaged payload missing; recovery=ReinstallCurrentApp".to_string())?;
     Ok(CoreSelectionObservation {
@@ -377,6 +347,3 @@ pub(crate) fn resolve_dashboard_serve_dir(config_dir: &std::path::Path) -> Optio
     .and_then(|c| c.parent())
     .map(|p| p.to_string_lossy().into_owned())
 }
-
-#[cfg(all(test, unix))]
-mod tests;

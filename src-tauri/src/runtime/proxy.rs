@@ -74,8 +74,8 @@ mod tunnel_conflict;
 mod unlock_refresh;
 
 pub(crate) use core_binary::{
-    bundle_resource_candidates, bundle_resource_roots, dev_manifest_dir,
-    first_existing_bundle_candidate, resolve_core_binary, resolve_core_candidate,
+    bundle_resource_candidates, dev_manifest_dir, first_existing_bundle_candidate,
+    resolve_core_binary, resolve_core_candidate,
 };
 // B9 跟随面：`resolve_dashboard_serve_dir` 的**唯一**消费者是 `start_inner`，本批随它进
 // `startup.rs`（改走 `super::core_binary::` 直取）⇒ façade 侧再导出零命中。§B.3 把它列进「必须

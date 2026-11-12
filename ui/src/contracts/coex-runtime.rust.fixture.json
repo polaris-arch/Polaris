@@ -797,8 +797,8 @@
     "sourceSha256": {
       "src-tauri/src/runtime/proxy/coex_observer.rs": "f3590eadebb44c3fc7f83aad3e2b645636b4751283cfe02c3df918353d6661b3",
       "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "d2f297979f9ccd112caaeddb9725d1f2413724a43fb213813b8706750d19599f",
-      "src-tauri/src/runtime/proxy.rs": "04a7c68061b8d9ecddfee2167693574db5df9464097501fd8274e8a6f0747f98",
-      "src-tauri/src/runtime/proxy/lifecycle.rs": "8e144a48333d78f03c45d6a32c22d52b9960777e97388d7a6950ec53cb309300",
+      "src-tauri/src/runtime/proxy.rs": "5610f5ad1723eca9781e7f8c801a7b286ab5432d75ee26cea93ac4b141e2856e",
+      "src-tauri/src/runtime/proxy/lifecycle.rs": "e3a5c238f0a0a56c721864ad5fad074c26a64287219d530041ef1d81ead99e56",
       "src-tauri/src/runtime/proxy/startup.rs": "39121f331711d3796dc083d51e0b2719f1644521b030e654175c8b905974e07f",
       "src-tauri/src/runtime/proxy/hot_switch.rs": "be01e0af372610c6cd1ad71aeb07b2f2ecc5a5aee5890782faf44900c1a2e0c1",
       "src-tauri/src/runtime/proxy/recovery.rs": "4f9a9b11d902db65d472efdeea2a530114f6b95cee03fe661c5401cc8a61d659",
@@ -845,7 +845,7 @@
         "src-tauri/src/runtime/proxy/runtime_config.rs": "8312736c574fdca2385590690d845d68bebbf6f57eb095207812b8dfdacbe881",
         "src-tauri/src/runtime/proxy/tests/hot_switch.rs": "a2eccf7451d3688f9b7abd1e7aa46b76540eefdbb901edd310f7aa2fede796d3",
         "src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs": "a7820f917e477b472ad681c45fb52e365e17e13d86e12e4baf1bd6672426f4e6",
-        "src-tauri/src/runtime/proxy/tests/lifecycle.rs": "d50d9d00d52bc9ac7ab853982d8044667e90c7c36519d8113c695cb4da11c206",
+        "src-tauri/src/runtime/proxy/tests/lifecycle.rs": "8244a210b7de8a9eb291ae320571927afd75575ffbc1965cfef3ab25c505d3a3",
         "src-tauri/src/runtime/proxy/tests/mesh_route_report.rs": "b5553567ae991a7d76e80ee10a782de7af883f115a2aa3d6c6b61f2bdecaed7b",
         "src-tauri/src/runtime/proxy/runtime_config/tests/mod.rs": "1edc81d84d10011be6a1e698aed29cb1eecdabc25c34fc8f0af614e431228917",
         "src-tauri/src/runtime/proxy/tests/real_core_cleanup.rs": "f377c78afa55e4cc0f31cb72b4f9b412ecc58884f39561c84257cb59bda36e00"

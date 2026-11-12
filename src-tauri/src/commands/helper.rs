@@ -72,7 +72,6 @@ pub async fn helper_install(
     // Reject forged explicit-mode requests before the guard can stop any local proxy.
     if !mode.supported_on(helper.platform()) {
         return Ok(ApiResponse::ok(HelperActionResult {
-            recovery: None,
             success: false,
             uninstall_effect: None,
             execution_diagnostic: None,
@@ -97,7 +96,6 @@ pub async fn helper_install(
         && helper_install_blocked_by_proxy(proxy_status.running, proxy_status.started_via_helper)
     {
         return Ok(ApiResponse::ok(HelperActionResult {
-            recovery: None,
             success: false,
             uninstall_effect: None,
             execution_diagnostic: None,
@@ -134,7 +132,6 @@ fn linux_legacy_reply(
     outcome: Result<HelperActionResult, String>,
 ) -> HelperActionResult {
     outcome.unwrap_or_else(|error| HelperActionResult {
-        recovery: None,
         success: false,
         uninstall_effect: None,
         execution_diagnostic: None,

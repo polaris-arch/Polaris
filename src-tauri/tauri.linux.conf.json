@@ -4,7 +4,6 @@
     "resources": [
       "core-manifest.json",
       "../resources/linux/",
-      "../resources/core-recovery/linux/",
       "../resources/dashboard/",
       "../THIRD-PARTY-LICENSES.md",
       "../NOTICE",

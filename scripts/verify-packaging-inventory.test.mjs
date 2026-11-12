@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, copyFileSync, cpSync, readdirSync, statSync, symlinkSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync, readdirSync, statSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,20 +20,10 @@ const count = Number(readFileSync(join(repo, 'src-tauri/build.rs'), 'utf8')
 assert.ok(count > 0, 'fixture count must come from the actual build source');
 
 // Inert staging members exercise the actual inventory CLI, not production packages.
-function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo, isStatic = false) {
+function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo) {
   if (selectionRepo === repo) selectionRepo=cleanRepo;
   const root = mkdtempSync(join(tmpdir(), 'polaris-cleaner-inventory-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  if (isStatic) {
-    const original = selectionRepo;
-    selectionRepo = join(root, 'selection');
-    cpSync(join(original, 'scripts'), join(selectionRepo, 'scripts'), { recursive: true, filter: p => !p.includes('node_modules') });
-    for (const name of ['core-manifest.json', 'build.rs', 'tauri.conf.json',
-      'tauri.linux.conf.json', 'tauri.windows.conf.json', 'tauri.macos-x64.conf.json', 'tauri.macos-arm64.conf.json']) {
-      mkdirSync(join(selectionRepo, 'src-tauri'), { recursive: true });
-      copyFileSync(join(original, 'src-tauri', name), join(selectionRepo, 'src-tauri', name));
-    }
-  }
   const core = { linux: 'linux', windows: 'win', 'macos-x64': 'mac-x64', 'macos-arm64': 'mac-arm64' }[label];
   const suffix = label === 'windows' ? '.exe' : '';
   const manifest = JSON.parse(readFileSync(join(selectionRepo, 'src-tauri/core-manifest.json')));
@@ -48,26 +38,21 @@ function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo, 
     `_up_/resources/${core}/core-manifest.json`,
     `_up_/resources/${core}/sing-box${suffix}`, `_up_/resources/${core}/polaris-helper${suffix}`,
     ...(['linux', 'windows'].includes(label) ? [`_up_/resources/${core}/libcronet.${label === 'windows' ? 'dll' : 'so'}`] : []),
-    `_up_/resources/core-recovery/${core}/inventory.json`,
-    `_up_/resources/core-recovery/${core}/${release.platforms[core].archive.name}`,
     ...legalMembers.map((member) => `_up_/resources/${core}/${member}`), ...extra,
   ];
-  const scopes = isStatic ? [selectionRepo] : label === 'windows' ? [root]
+  const scopes = label === 'windows' ? [root]
     : label.startsWith('macos-') ? [join(root, 'macos/Polaris.app/Contents/Resources')]
       : [join(root, 'deb/usr/lib/Polaris'), join(root, 'appimage/Polaris.AppDir/usr/lib/Polaris')];
   for (const scope of scopes) for (const member of members) {
-    if (isStatic && member === 'core-manifest.json') continue; // Keep the real selection JSON.
-    const path = join(scope, isStatic ? member.replace(/^_up_\//, '') : member);
+    const path = join(scope, member);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, 'inert inventory fixture');
   }
-  if (!isStatic) {
-    const main=join(root,label==='linux'?'deb/usr/bin/polaris':label==='windows'?'polaris.exe':'macos/Polaris.app/Contents/MacOS/Polaris');
-    mkdirSync(dirname(main),{recursive:true});writeFileSync(main,'ordinary App outside resources');
-  }
-  mutate(isStatic ? selectionRepo : root);
+  const main=join(root,label==='linux'?'deb/usr/bin/polaris':label==='windows'?'polaris.exe':'macos/Polaris.app/Contents/MacOS/Polaris');
+  mkdirSync(dirname(main),{recursive:true});writeFileSync(main,'ordinary App outside resources');
+  mutate(root);
   const result = spawnSync(process.execPath, [join(selectionRepo, 'scripts/verify-packaging.mjs'), 'inventory', '--label', label,
-    ...(isStatic ? ['--static'] : ['--root', root])], { encoding: 'utf8' });
+    '--root', root], { encoding: 'utf8' });
   return { code: result.status, output: result.stdout + result.stderr };
 }
 const cleaner = '_up_/resources/win/polaris-cleaner.exe';
@@ -265,85 +250,6 @@ test('formal inventory requires exact archived legal paths and rejects temporary
     assert.ok(extra.output.includes(`_up_/resources/win/${member}`), extra.output);
   }
 });
-
-// Exercise the actual registry and binding branch without acquiring native payloads.
-// Exercise the real confs callee with real config JSON; other conf checks need
-// downloaded resources and CI context, while this branch is entirely data-only.
-function recoveryConfFailures(p, mutate = () => {}) {
-  const source = readFileSync(verifier, 'utf8');
-  const start = source.indexOf('function coreDirOf('), end = source.indexOf('function stripYamlComment(', start);
-  assert.ok(start >= 0 && end > start, 'actual conf registration callee boundaries');
-  const helpers = source.slice(start, end);
-  const failures = [];
-  const check = Function('fail', `${helpers}; return checkPlatformResourceEntries;`)(message => failures.push(message));
-  const names = { linux: 'linux', win: 'windows', 'mac-x64': 'macos-x64', 'mac-arm64': 'macos-arm64' };
-  const confName = `tauri.${names[p]}.conf.json`;
-  const res = JSON.parse(readFileSync(join(repo, 'src-tauri', confName))).bundle.resources;
-  const base = JSON.parse(readFileSync(join(repo, 'src-tauri/tauri.conf.json'))).bundle.resources;
-  mutate(res, base);
-  check(confName, res, base, p, Object.keys(names), true);
-  return failures;
-}
-for (const [label, p] of [['linux', 'linux'], ['windows', 'win'], ['macos-x64', 'mac-x64'], ['macos-arm64', 'mac-arm64']]) {
-  test(`real ${p} conf registration admits only one exact recovery subtree`, () => {
-    assert.deepEqual(recoveryConfFailures(p), []);
-    for (const change of ['missing', 'duplicate', 'wrong-platform', 'parent', 'child', 'common-bypass']) {
-      const failures = recoveryConfFailures(p, (res, base) => {
-        const entry = `../resources/core-recovery/${p}/`, index = res.indexOf(entry);
-        if (change === 'missing') res.splice(index, 1);
-        else if (change === 'duplicate') res.push(entry);
-        else if (change === 'common-bypass') base.push('../resources/core-recovery/');
-        else res[index] = change === 'parent' ? '../resources/core-recovery/'
-          : change === 'child' ? entry + 'inventory.json'
-            : `../resources/core-recovery/${p === 'win' ? 'linux' : 'win'}/`;
-      });
-      assert.ok(failures.length > 0, change);
-    }
-  });
-  for (const isStatic of [false, true]) test(`actual ${p} ${isStatic ? 'static' : 'artifact'} inventory requires the two exact recovery data members`, t => {
-    const extras = label === 'windows' ? [cleaner] : [];
-    const good = fixture(t, label, extras, () => {}, repo, isStatic);
-    assert.equal(good.code, 0, good.output);
-    const manifest = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')));
-    const name = loadReleaseContract(repo, manifest).platforms[p].archive.name;
-    const relative = `resources/core-recovery/${p}/`;
-    const scopes = root => isStatic ? [root] : label === 'windows' ? [root]
-      : label.startsWith('macos-') ? [join(root, 'macos/Polaris.app/Contents/Resources')]
-        : [join(root, 'deb/usr/lib/Polaris'), join(root, 'appimage/Polaris.AppDir/usr/lib/Polaris')];
-    for (const missing of [name, 'inventory.json']) {
-      const result = fixture(t, label, extras, root => {
-        for (const scope of scopes(root)) rmSync(join(scope, isStatic ? relative : '_up_/' + relative, missing));
-      }, repo, isStatic);
-      assert.equal(result.code, 1, result.output);
-      assert.match(result.output, /core-recovery-(archive|inventory).*实为 0 份/);
-    }
-    const other = p === 'win' ? 'linux' : 'win', crossPlatform = `resources/core-recovery/${other}/${name}`;
-    const confName = `tauri.${label === 'windows' ? 'windows' : label}.conf.json`;
-    for (const extra of [relative + name + '.backup', relative + 'extra.json', crossPlatform]) {
-      const result = fixture(t, label, [...extras, '_up_/' + extra], root => {
-        if (isStatic && extra === crossPlatform) {
-          // A real unwanted candidate payload: the extra subtree must actually
-          // be mapped before the static inventory can see and reject it.
-          const file = join(root, 'src-tauri', confName), conf = JSON.parse(readFileSync(file));
-          conf.bundle.resources.push(`../resources/core-recovery/${other}/`);
-          writeFileSync(file, JSON.stringify(conf));
-        }
-      }, repo, isStatic);
-      assert.equal(result.code, 1, result.output); assert.match(result.output, /未登记/);
-    }
-    if (isStatic) {
-      const unmapped = fixture(t, label, [...extras, '_up_/' + crossPlatform], () => {}, repo, true);
-      assert.equal(unmapped.code, 0, unmapped.output); // Unmapped source files never enter this package.
-      const duplicate = fixture(t, label, extras, root => {
-        const file = join(root, 'src-tauri', confName);
-        const conf = JSON.parse(readFileSync(file)); conf.bundle.resources.push(`../resources/core-recovery/${p}/`);
-        writeFileSync(file, JSON.stringify(conf));
-      }, repo, true);
-      assert.equal(duplicate.code, 1, duplicate.output);
-      assert.match(duplicate.output, /core-recovery-(archive|inventory).*实为 2 份/);
-    }
-  });
-}
 
 // Other conf checks require downloaded resources; these tests isolate only CI routing.
 function platformBindingFixture(mutate = () => {}) {

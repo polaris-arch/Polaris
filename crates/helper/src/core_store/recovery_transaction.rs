@@ -1,7 +1,6 @@
 //! Candidate-first repair of one selected CoreId. The parent owns policy and
 //! real store/exclusive-lease acquisition; mutation workers never reacquire or
-//! release their caller's locks. The separate cold data diagnostic acquires and
-//! releases its own existing locks, never starts a process or grants authority.
+//! release their caller's locks.
 //! Failure retains the immutable plan and both object identities. A resumed
 //! uncommitted plan retries the same verified candidate; a committed plan only
 //! finishes retirement. Read-only handles are not treated as write exclusion.
@@ -21,89 +20,6 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Non-creating cold observation using the transaction's existing namespace
-/// judge and exact locks. A damaged member is not a selectable/admitted object.
-pub(super) fn selected_recovery_damage(
-    store: &CoreStore,
-    compiled: &polaris_helper_proto::core_manifest::CoreManifest,
-) -> io::Result<Option<bool>> {
-    compiled.validate().map_err(super::invalid)?;
-    let id = compiled
-        .id(crate::core_hash::sha256_hex)
-        .map_err(super::invalid)?;
-    let mut namespace = Namespace::open(store)?;
-    let mutation_path = store.root.join(".core-store.lock");
-    store.owner.check(&mutation_path)?;
-    // Unlike the installer, diagnosis never creates or seals a missing lock.
-    let (mutation, _) = store._root_object.open_regular(".core-store.lock")?;
-    if namespace.identity_at(&mutation_path, false)? != objects::identity(&mutation)? {
-        return Err(invalid("recovery diagnostic mutation object changed"));
-    }
-    super::acquire_lock(&mutation, super::LockRole::StoreMutationExclusive)?;
-    let result = (|| {
-        store.require_no_pending_repair()?;
-        if !store.has_selected_data(&id)? {
-            return Ok(None);
-        }
-        let lease = store.lease_file(&id)?;
-        super::acquire_lock(&lease, super::LockRole::RepairExclusive)?;
-        let observation = (|| {
-            let lease_path = store
-                .root
-                .join("leases")
-                .join(format!("{}.lock", id.as_str()));
-            let receipt_path = store
-                .root
-                .join("manifests")
-                .join(format!("{}.json", id.as_str()));
-            let receipt = namespace.regular(&receipt_path, 64 * 1024)?;
-            let raw = namespace.read(&receipt_path, 64 * 1024)?;
-            if raw.len() as u64 != receipt.bytes
-                || crate::core_hash::sha256_hex(&raw) != receipt.sha256
-            {
-                return Err(invalid("recovery diagnostic receipt changed"));
-            }
-            let manifest = InstalledCoreManifest::parse(&raw, crate::core_hash::sha256_hex)
-                .map_err(invalid)?;
-            if manifest.id != id.as_str() || manifest.core.files != compiled.files {
-                return Err(invalid("recovery diagnostic compiled identity differs"));
-            }
-            let directory = store.root.join("versions").join(id.as_str());
-            namespace.anchor(&directory)?;
-            let payload = namespace.directory(&directory)?;
-            if payload
-                .files
-                .keys()
-                .any(|name| !compiled.files.iter().any(|f| &f.name == name))
-            {
-                return Err(invalid("recovery diagnostic unknown member"));
-            }
-            let damaged = compiled.files.iter().any(|expected| {
-                payload.files.get(&expected.name).is_none_or(|actual| {
-                    actual.bytes != expected.bytes || actual.sha256 != expected.sha256
-                })
-            });
-            // Same held namespace and exact named objects must survive hashing.
-            if namespace.directory(&directory)? != payload
-                || namespace.regular(&receipt_path, 64 * 1024)? != receipt
-                || namespace.identity_at(&lease_path, false)? != objects::identity(&lease)?
-                || namespace.identity_at(&mutation_path, false)? != objects::identity(&mutation)?
-            {
-                return Err(invalid("recovery diagnostic objects changed"));
-            }
-            store.require_no_pending_repair()?;
-            namespace.check()?;
-            Ok(Some(damaged))
-        })();
-        let release = File::unlock(&lease);
-        release?;
-        observation
-    })();
-    let release = File::unlock(&mutation);
-    release?;
-    result
-}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum RecoveryState {

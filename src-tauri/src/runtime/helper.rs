@@ -15,8 +15,6 @@
 
 #![forbid(unsafe_code)]
 
-pub(crate) mod recovery_consumer;
-
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -228,7 +226,6 @@ pub enum HelperActionErrorCode {
     InstallerFailed,
     UpgradeDeferred,
     Failed,
-    RecoveryRequired,
 }
 
 /// Explicit installation intent. Omitted IPC mode remains the non-disruptive ordinary path.
@@ -490,16 +487,7 @@ pub enum HelperRemovalEffect {
 /// + 稳定码。**外层仍是 `ApiResponse::ok`**（IPC 层不失败——用户取消提权是正常流程，非命令错误）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CoreRecoveryReport {
-    pub user: crate::runtime::core_identity::user_store::UserRecoveryState,
-    pub helper_complete: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HelperActionResult {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recovery: Option<CoreRecoveryReport>,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uninstall_effect: Option<HelperRemovalEffect>,
@@ -797,7 +785,6 @@ impl Connector for NeverConnect {
 #[derive(Default)]
 struct CoreMutationFences {
     ever_mutated: bool,
-    recovery_active: bool,
     slots: Vec<Weak<Mutex<DirectCoreSlot>>>,
 }
 
@@ -834,63 +821,6 @@ pub struct HelperRuntime {
     test_connector: Option<Arc<dyn Connector + Sync>>,
 }
 
-struct RecoveryReservation<'a> {
-    helper: &'a HelperRuntime,
-    slots: Vec<Arc<Mutex<DirectCoreSlot>>>,
-    released: bool,
-}
-impl RecoveryReservation<'_> {
-    fn release(&mut self) -> Result<(), String> {
-        if self.released {
-            return Ok(());
-        }
-        let mut registry = self
-            .helper
-            .core_mutation_fences
-            .lock()
-            .map_err(|_| "recovery registry poisoned")?;
-        for slot in &self.slots {
-            slot.lock()
-                .map_err(|_| "original recovery slot poisoned")?
-                .release_recovery_reservation();
-        }
-        registry.recovery_active = false;
-        self.released = true;
-        Ok(())
-    }
-}
-impl Drop for RecoveryReservation<'_> {
-    fn drop(&mut self) {
-        if let Err(error) = self.release() {
-            log::error!("CORE_RECOVERY_BUSY: original reservation remains unknown: {error}");
-        }
-    }
-}
-struct RecoveryCheckPause(Option<polaris_core_supervisor::config_gate::AdmissionPause>);
-impl RecoveryCheckPause {
-    fn acquire() -> Result<Self, String> {
-        polaris_core_supervisor::config_gate::pause_idle_check_producers()
-            .map(|pause| Self(Some(pause)))
-            .map_err(|_| "CORE_RECOVERY_BUSY: validation or cleanup still owns work".into())
-    }
-    fn release(&mut self) -> Result<(), String> {
-        if let Some(pause) = &self.0 {
-            pause
-                .surrender()
-                .map_err(|_| "original validation admission remains unknown")?;
-        }
-        self.0.take();
-        Ok(())
-    }
-}
-impl Drop for RecoveryCheckPause {
-    fn drop(&mut self) {
-        if let Err(error) = self.release() {
-            log::error!("CORE_RECOVERY_BUSY: cannot reopen original validation admission: {error}");
-        }
-    }
-}
-
 impl HelperRuntime {
     pub fn new(dir: PathBuf) -> Self {
         let platform = Platform::current();
@@ -917,9 +847,6 @@ impl HelperRuntime {
             .core_mutation_fences
             .lock()
             .map_err(|_| "helper core fence registry poisoned".to_string())?;
-        if registry.recovery_active {
-            return Err("CORE_RECOVERY_BUSY: explicit recovery owns admission".into());
-        }
         registry.slots.retain(|slot| slot.strong_count() > 0);
         if registry.ever_mutated {
             let live = slot
@@ -941,9 +868,6 @@ impl HelperRuntime {
             .core_mutation_fences
             .lock()
             .map_err(|_| "helper core fence registry poisoned".to_string())?;
-        if registry.recovery_active {
-            return Err("CORE_RECOVERY_BUSY: explicit recovery owns admission".into());
-        }
         registry.ever_mutated = true;
         let mut index = 0;
         while index < registry.slots.len() {
@@ -957,42 +881,6 @@ impl HelperRuntime {
             index += 1;
         }
         Ok(())
-    }
-
-    fn reserve_recovery(&self) -> Result<RecoveryReservation<'_>, String> {
-        let mut registry = self
-            .core_mutation_fences
-            .lock()
-            .map_err(|_| "CORE_RECOVERY_BUSY: registry unknown")?;
-        if registry.recovery_active {
-            return Err("CORE_RECOVERY_BUSY: recovery already active".into());
-        }
-        let mut slots: Vec<Arc<Mutex<DirectCoreSlot>>> = Vec::new();
-        for weak in &registry.slots {
-            let Some(slot) = weak.upgrade() else {
-                continue;
-            };
-            let result = slot
-                .lock()
-                .map_err(|_| "CORE_RECOVERY_BUSY: Child custody unknown".to_string())
-                .and_then(|mut s| s.reserve_for_recovery());
-            if let Err(error) = result {
-                for held in &slots {
-                    if let Ok(mut s) = held.lock() {
-                        s.release_recovery_reservation();
-                    }
-                }
-                return Err(error);
-            }
-            slots.push(slot);
-        }
-        registry.ever_mutated = true;
-        registry.recovery_active = true;
-        Ok(RecoveryReservation {
-            helper: self,
-            slots,
-            released: false,
-        })
     }
 
     #[cfg(test)]
@@ -1248,7 +1136,6 @@ impl HelperRuntime {
         diagnostic: impl Into<String>,
     ) -> HelperActionResult {
         HelperActionResult {
-            recovery: None,
             success: false,
             uninstall_effect: None,
             execution_diagnostic: None,
@@ -1348,23 +1235,13 @@ impl HelperRuntime {
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
         }
-        let mut checks = match RecoveryCheckPause::acquire() {
-            Ok(guard) => guard,
-            Err(e) => return self.action_failed(HelperActionErrorCode::ProxyRunning, e),
-        };
-        let mut reservation = match self.reserve_recovery() {
-            Ok(guard) => guard,
-            Err(e) => return self.action_failed(HelperActionErrorCode::ProxyRunning, e),
-        };
-        let (mut params, stage) = match self.install_params() {
+        let (mut params, _stage) = match self.install_params() {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("helper install assets unavailable: {e}");
                 return self.action_failed(
                     if e.starts_with("CORE_BUNDLE_MISMATCH:") {
                         HelperActionErrorCode::BundleMismatch
-                    } else if e.starts_with("CORE_RECOVERY_CANCELLED:") {
-                        HelperActionErrorCode::Cancelled
                     } else if e.starts_with("CORE_RECOVERY_IO:") {
                         HelperActionErrorCode::Failed
                     } else {
@@ -1375,22 +1252,12 @@ impl HelperRuntime {
             }
         };
         params.linux_legacy_original_proxy = original;
-        let user_recovery =
-            match crate::runtime::core_identity::user_store::install(&self.dir, &stage) {
-                Ok(state) => state,
-                Err(error) => {
-                    let mut result =
-                        self.action_failed(HelperActionErrorCode::RecoveryRequired, error);
-                    result.recovery = Some(CoreRecoveryReport {
-                        user: crate::runtime::core_identity::user_store::UserRecoveryState::Pending,
-                        helper_complete: false,
-                    });
-                    return result;
-                }
-            };
+        if let Err(error) = self.register_core_mutation() {
+            log::warn!("helper install mutation preflight failed: {error}");
+            return self.action_failed(HelperActionErrorCode::Failed, error);
+        }
         let manager = self.manager();
-        let mut result = match manager.install_with_mode(&params, &StdExecutor, mode.manager_mode())
-        {
+        match manager.install_with_mode(&params, &StdExecutor, mode.manager_mode()) {
             Ok(EscalationOutcome::Success) => {
                 // Service readiness and this App's installed content id are
                 // separate receipts, including when a newer helper is retained.
@@ -1404,7 +1271,6 @@ impl HelperRuntime {
                 self.apply_selected_core_status(&mut status);
                 if helper_install_reached_expected_build(&status) {
                     HelperActionResult {
-                        recovery: None,
                         success: true,
                         uninstall_effect: None,
                         execution_diagnostic: None,
@@ -1414,7 +1280,6 @@ impl HelperRuntime {
                     }
                 } else {
                     HelperActionResult {
-                        recovery: None,
                         success: false,
                         uninstall_effect: None,
                         execution_diagnostic: None,
@@ -1448,20 +1313,7 @@ impl HelperRuntime {
                     "helper install operation failed",
                 )
             }
-        };
-        let helper_complete = result.success;
-        if let Err(error) = reservation.release().and_then(|_| checks.release()) {
-            result.success = false;
-            result.error_code = Some(HelperActionErrorCode::RecoveryRequired);
-            result.diagnostic = Some(format!(
-                "CORE_RECOVERY_REQUIRED: admission cleanup unknown: {error}"
-            ));
         }
-        result.recovery = Some(CoreRecoveryReport {
-            user: user_recovery,
-            helper_complete,
-        });
-        result
     }
 
     /// 卸载 helper（上游 `helper:uninstall`）——真流程：HelperManager.uninstall（bootout/删描述符/删二进制/
@@ -1525,7 +1377,6 @@ impl HelperRuntime {
             Ok(
                 outcome @ (MaintenanceOutcome::Removed | MaintenanceOutcome::RetiredDataPreserved),
             ) => HelperActionResult {
-                recovery: None,
                 success: true,
                 uninstall_effect: Some(if outcome == MaintenanceOutcome::RetiredDataPreserved {
                     HelperRemovalEffect::RetiredDataPreserved
@@ -1565,13 +1416,18 @@ impl HelperRuntime {
     fn install_params(
         &self,
     ) -> Result<(InstallParams, crate::runtime::core_identity::InstallStage), String> {
-        let src_binary = resolve_recovery_helper_binary()?;
-        // Explicit repair reads the independent compiled archive. It never
-        // copies a damaged expanded core or chooses a runtime override/cache.
-        let stage = crate::runtime::core_identity::stage_recovery_installation(
+        let src_binary = resolve_helper_binary()?;
+        // The packaged core and Helper are rehashed against the compiled
+        // manifest while copying into a private stage. A damaged package is
+        // rejected; repairing it requires reinstalling the App.
+        let bundled_core = crate::runtime::proxy::resolve_core_candidate()?;
+        let stage = crate::runtime::core_identity::stage_installation(
+            &bundled_core,
             &src_binary,
             &self.dir,
-            &std::sync::atomic::AtomicBool::new(false),
+            &crate::runtime::core_identity::selected_manifest(
+                crate::runtime::core_identity::current_platform()?,
+            )?,
         )?;
         #[cfg(windows)]
         let user_identity = polaris_helper::platform::windows::native_caller::current_user()
@@ -2805,41 +2661,6 @@ fn maintenance_utility() -> Result<MaintenanceUtility, String> {
 /// 逃生门再指一次只会多一个入口、不多一分能力。
 /// 判据不过 ⇒ 记 `ENV_PATH_UNTRUSTED` 并回落兜底腿，**绝不静默**。
 /// 开发态（debug / test）逃生门仍是原样的第一优先级 —— helper 的本地迭代靠它装自编产物。
-fn recovery_helper_from_roots(roots: &[PathBuf], platform: &str) -> Result<PathBuf, String> {
-    let name = if platform == "win" {
-        "polaris-helper.exe"
-    } else {
-        "polaris-helper"
-    };
-    for root in roots {
-        let runtime = root.join(platform);
-        let recovery = root.join("core-recovery").join(platform);
-        // The first actual package owns this explicit attempt. Missing/bad
-        // members there cannot trigger a legacy/cache/other-root retry.
-        for candidate in [&runtime, &recovery] {
-            match std::fs::symlink_metadata(candidate) {
-                Ok(_) => return Ok(runtime.join(name)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-                Err(_) => return Err("CORE_BUNDLE_MISMATCH: current package namespace unavailable; reinstall trusted current app".into()),
-            }
-        }
-    }
-    Err(
-        "CORE_BUNDLE_MISMATCH: no current package recovery source; reinstall trusted current app"
-            .into(),
-    )
-}
-fn resolve_recovery_helper_binary() -> Result<PathBuf, String> {
-    let platform = crate::runtime::core_identity::current_platform()?;
-    let exe = std::env::current_exe()
-        .map_err(|_| "CORE_BUNDLE_MISMATCH: current app location unavailable")?;
-    let roots = crate::runtime::proxy::bundle_resource_roots(
-        exe.parent(),
-        crate::runtime::proxy::dev_manifest_dir(),
-    );
-    recovery_helper_from_roots(&roots, platform)
-}
-
 pub(super) fn resolve_helper_binary() -> Result<PathBuf, String> {
     let filename = if cfg!(windows) {
         "polaris-helper.exe"

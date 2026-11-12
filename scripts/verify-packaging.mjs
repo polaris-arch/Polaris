@@ -79,7 +79,7 @@ import { nsisCoreSweepViolations, nativeSweepViolations } from './lib/nsis-core-
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
 import { verifySelectedCoreManifest } from './lib/core-identity.mjs';
-import { loadReleaseContract, releasePayloadMembers, verifyPackagedCore } from './desktop-core/release-consumer.mjs';
+import { loadReleaseContract, releasePayloadMembers, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
 import { generated } from './desktop-core/import-release.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -232,25 +232,6 @@ function coreDirOf(entry, platforms) {
   const m = /^\.\.\/resources\/([^/]+)(?:\/|$)/.exec(String(entry).replace(/\\/g, '/'));
   if (!m) return null;
   return platforms.includes(m[1]) ? m[1] : null;
-}
-
-// The recovery carrier is platform data, not a common-resource exemption or a
-// directory-wide allowance in the payload inventory below.
-function checkPlatformResourceEntries(confName, res, baseResources, p, platforms, requireRecovery) {
-  const recovery = `../resources/core-recovery/${p}/`;
-  for (const common of baseResources) {
-    if (/^\.\.\/resources\/core-recovery(?:\/|$)/.test(String(common).replace(/\\/g, '/'))) {
-      fail(`tauri.conf.json: base bundle.resources 不得含平台恢复目录 '${common}'`);
-    }
-  }
-  if (requireRecovery && res.filter(entry => entry === recovery).length !== 1) {
-    fail(`src-tauri/${confName}: 本平台恢复目录 '${recovery}' 应恰有 1 份`);
-  }
-  for (const entry of res) {
-    if (baseResources.includes(entry) || coreDirOf(entry, platforms) === p || entry === recovery) continue;
-    fail(`src-tauri/${confName}: bundle.resources 含未登记条目 ${JSON.stringify(entry)} —— `
-      + `只允许 base 公共资源、本平台内核及精确恢复目录 '${recovery}'；其他平台或恢复子项不能借此前缀放行`);
-  }
 }
 
 // ───────────────────── workflow matrix 解析（不变量 D 用）─────────────────────
@@ -559,12 +540,20 @@ function checkConfs() {
     // per-platform conf 的 `bundle.resources` 各加一条 `"../ui/src/"`，`confs` 模式仍 **rc=0**，
     // 整份 `ui/src`（含 194 个测试文件）随四个安装包出货，全链零转红。
     //
-    // 登记表 = base 公共资源 ∪ **本平台**内核条目 ∪ 精确本平台恢复目录。
-    // 内核条目不写死成 `../resources/<p>/` 一种形态：
+    // 登记表 = base 公共资源 ∪ **本平台**内核条目。后者不写死成 `../resources/<p>/` 一种形态：
     // 不变量 B 已明确「同平台多条 / 文件粒度条目」是合法的（`coreDirOf` 认前缀），这里必须同口径，
-    // 否则本条会把 B 认可的合法形态判红。恢复目录只允许唯一完整 subtree，
-    // 不把内核文件粒度规则泛化到恢复前缀；正式来源不得遗漏/重复恢复映射。
-    checkPlatformResourceEntries(confName, res, baseResources, p, platforms, true);
+    // 否则本条会把 B 认可的合法形态判红。跨平台内核条目由 B 拦，落到这里也一样红（双保险）。
+    for (const entry of res) {
+      if (baseResources.includes(entry)) continue;
+      if (coreDirOf(entry, platforms) === p) continue;
+      fail(
+        `src-tauri/${confName}: bundle.resources 含未登记条目 ${JSON.stringify(entry)} —— ` +
+          `per-platform conf 的唯一职责是「base 公共资源 + 本平台内核」，多出来的条目会被 bundler ` +
+          `**整目录递归**铺进这个平台的安装包（源码 / 测试 / 文档都能这样进包，且现有 A/B/C/D 一条都不会红）。\n` +
+          `  登记表：base 公共资源 ${JSON.stringify(baseResources)} ∪ 本平台内核（前缀 '../resources/${p}/'）\n` +
+          `  要新增公共资源：先加进 src-tauri/tauri.conf.json 的 bundle.resources（不变量 A 会要求四份 conf 同步）`
+      );
+    }
 
     // 不变量 C：引用的目录必须真实存在（conf 写对了但目录没 fetch 也要红）。
     for (const entry of res) {
@@ -1987,7 +1976,7 @@ function checkPayload(label, root) {
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
         if (family.what === 'sing-box') {
-          try { verifyPackagedCore(ROOT, readJson(join(SRC_TAURI, 'core-manifest.json')), expected, p); }
+          try { verifyPackagedRelease(ROOT, readJson(join(SRC_TAURI, 'core-manifest.json')), expected, p); }
           catch (error) { fail(`${scope.name}: release artifact/receipt mismatch: ${error.message}`); }
         }
         if (family.what === 'polaris-helper') {
@@ -2184,19 +2173,6 @@ function updaterLinuxCandidates(names, ext) {
  * 代价如实登记：mac/win 腿的检测余量从 1.86 倍放宽到 3.86 倍，那两条腿上「多打进一份
  * ~60 MiB 级死资源」的失误本门不再抓，只能靠 payload 门（单文件口径）兜大头。
  * 真红时先看输出里印的实际字节数再决定是「产物真涨了」还是「门定紧了」，别直接调门。
- *
- * # 改这个值 = 改两处
- *
- * 另一份在 `src-tauri/src/commands/updater/tests/mod.rs`（`PACKAGING_MAX_UPDATE_ASSET_MIB`），
- * 由 `packaging_size_gate_is_mirrored_and_stays_under_the_client_write_gate` **从本文件源码里解析出
- * 这个数值再比数**（不是比文本），两份漂开即转红（D5：维护两份 + 一条一致性测试钉死）。
- * **改这里必须同步改那里**，且那条测试还会拦住「把它调到客户端写入闸之上」——那等于发一个
- * 客户端结构性下不动的包。
- *
- * ⚠️ 那条测试按「`const` + 本常量名 + ` = `」定位，要求**以它开头的行恰有一行**，且该行形态恒为
- * `N * 1024 * 1024;`（允许行首缩进与 `export `）。声明写两遍、把它折成两行、或换成裸字面量，
- * 一律判成「判据取不到」而转红 —— 因为「读到了对的那一行」与「读到了别处一句同形文本」在结果上
- * 无从分辨。注释里出现同形文本**不影响**判据（它不以 marker 起头），故本段可以照常引用它。
  */
 const MAX_UPDATE_ASSET_BYTES = 200 * 1024 * 1024;
 
@@ -2210,7 +2186,7 @@ const mib = (n) => `${(n / 1024 / 1024).toFixed(2)} MiB`;
  * 2026-08-18 二次定标时由 mac-arm64 dmg 的 54,232,313 换成这个新高）。
  *
  * 只用于失败文案：光看「201 MiB > 200 MiB」判不出这是常规漂移还是阶跃回潮，得有个基线才判得了
- * 「涨了多少倍」。它不参与任何断言 —— 参与断言就等于把一个会过期的历史值变成第三份需要维护的常量。
+ * 「涨了多少倍」。它不参与任何断言 —— 参与断言就等于把一个会过期的历史值变成第二份需要维护的常量。
  */
 const MEASURED_MAX_UPDATE_ASSET_BYTES = 128_530_936;
 
@@ -2267,8 +2243,7 @@ function checkUpdateAssetSizes(label, targets, pathOf) {
           `${(size / MEASURED_MAX_UPDATE_ASSET_BYTES).toFixed(2)} 倍 —— 先据此判是常规漂移还是阶跃回潮。\n` +
           `  这道门是**早警**，不是客户端能力上限：客户端绝对写入闸是 512 MiB，走到那儿才炸就等于没警。\n` +
           `  先判定是「产物真的涨了」（查 payload：内核 / cronet / dashboard / 是否误把 WebView2 Runtime 打进主包）\n` +
-          `  还是「上限定紧了」；确属预期增长再同步改两处常量（本文件 MAX_UPDATE_ASSET_BYTES +\n` +
-          `  src-tauri/src/commands/updater/tests/mod.rs 的 PACKAGING_MAX_UPDATE_ASSET_MIB），否则一致性测试会红。`
+          `  还是「上限定紧了」。`
       );
     } else {
       note(`体积：${label} → '${name}' ${mib(size)} ≤ 上限 ${mib(MAX_UPDATE_ASSET_BYTES)}`);
@@ -2910,19 +2885,6 @@ function payloadAllowRules(label, coreDir, srsCount, releaseContract) {
       min: 1,
       max: 1,
       why: 'Naive/H3 出站的 Cronet 动态库，核在 initialize 阶段就要它、且必须与核同目录；缺了那两类节点直接起不来。',
-    });
-  }
-  if (releaseContract) {
-    const recovery = `_up_/resources/core-recovery/${coreDir}/`;
-    for (const [id, name, why] of [
-      ['core-recovery-archive', releaseContract.platforms[coreDir].archive.name,
-        '编译选择同源的原始压缩恢复载体；独立于可变运行副本，只在显式恢复时校验解包。'],
-      ['core-recovery-inventory', 'inventory.json',
-        '原合同绑定的恢复成员尺寸数据；构建时编译选择读取，不增加第二份摘要 allowlist。'],
-    ]) rules.push({
-      id, re: new RegExp(`^${reQuote(recovery + name)}$`), min: 1, max: 1,
-      releaseMember: true, // Downloaded exact inputs: require counts in --static too.
-      why,
     });
   }
   // Legal/source/provenance bytes retain their original reviewed archive paths.

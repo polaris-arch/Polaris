@@ -290,27 +290,6 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: ALL,
     why: '公开 release 消费的构建期原包、合同与 readback 收据；虽不直接入包，随核核验读取其绑定，变化必须触发四桌面打包门。',
   },
-  'resources/core-recovery/': {
-    kernel: true,
-    platforms: ALL,
-    why: '独立恢复原归档及其清单参与编译选择和随包资源；未知平台或共用布局变化保守要求真核门与四桌面包，不能按无影响放行。',
-  },
-  'resources/core-recovery/linux/': {
-    kernel: true, platforms: Object.freeze(['linux']),
-    why: 'Linux 独立恢复原归档与库存只进入 Linux carrier；必须核验该腿的选版字节与恢复资源集合。',
-  },
-  'resources/core-recovery/win/': {
-    kernel: true, platforms: Object.freeze(['windows']),
-    why: 'Windows 独立恢复 ZIP 与库存只进入 Windows carrier；不可漏掉原归档、清单或真实 sidecar。',
-  },
-  'resources/core-recovery/mac-arm64/': {
-    kernel: true, platforms: Object.freeze(['macos-arm64']),
-    why: 'Mac arm64 独立恢复原归档与库存仅进入该架构的签名 carrier。',
-  },
-  'resources/core-recovery/mac-x64/': {
-    kernel: true, platforms: Object.freeze(['macos-x64']),
-    why: 'Mac x64 独立恢复原归档与库存仅进入该架构的签名 carrier。',
-  },
   'resources/data/': {
     kernel: true,
     platforms: ALL,

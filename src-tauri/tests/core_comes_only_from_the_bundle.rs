@@ -449,44 +449,8 @@ const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "runtime/core_identity.rs",
         "\"sing-box\"",
-        2,
-        "Compiled selection binding, selected data and verified installer permission",
-    ),
-    (
-        "runtime/core_identity.rs",
-        "\"sing-box.exe\"",
         1,
-        "Compiled selection data binding on Windows, not an execution provider",
-    ),
-    (
-        "runtime/core_identity/recovery.rs",
-        "\"sing-box\"",
-        1,
-        "Strict compiled-member archive stage, not renderer-supplied payload",
-    ),
-    (
-        "runtime/core_identity/recovery.rs",
-        "\"sing-box.exe\"",
-        1,
-        "Same strict compiled-member archive stage on Windows",
-    ),
-    (
-        "runtime/core_identity/user_store.rs",
-        "\"sing-box\"",
-        1,
-        "Exact compiled-ID persisted data; purpose/platform admission remains separate",
-    ),
-    (
-        "runtime/core_identity/user_store.rs",
-        "\"sing-box.exe\"",
-        1,
-        "Same exact compiled-ID data candidate on Windows",
-    ),
-    (
-        "runtime/core_identity/user_store/windows_native_tests.rs",
-        "\"sing-box.exe\"",
-        2,
-        "Only cfg(all(test, windows)) actual data fixture; module guard checked below",
+        "Verified installer permission",
     ),
     (
         "commands/proxy.rs",
@@ -547,17 +511,6 @@ fn core_path_has_one_source() {
         "\"sing-box.exe\"",
     ];
     let files = app_crate_code();
-    // Scan this exact fixture rather than broadly skipping *_tests.rs. Removing
-    // its test-only module cfg must make the source gate fail.
-    let (_, user_store) = files
-        .iter()
-        .find(|(rel, _)| rel == "runtime/core_identity/user_store.rs")
-        .expect("selected data source missing");
-    let compact: String = user_store.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        compact.contains("#[cfg(all(test,windows))]modwindows_native_tests;"),
-        "Windows fixture must remain guarded by cfg(all(test, windows))"
-    );
     assert!(
         files.len() >= 120,
         "只扫到 {} 个文件 —— 取材面塌了",

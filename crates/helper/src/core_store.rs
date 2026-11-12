@@ -1017,17 +1017,6 @@ impl CoreStore {
         self.verify_objects(id, false)
     }
 
-    /// Explicit cold data-recovery diagnosis, never execution admission.
-    /// None means no selected slot; Some(true) means only known member
-    /// absence/size/hash damage. Namespace, receipt, ACL and occupancy failures
-    /// remain errors. No path or executable owner escapes this observation.
-    pub fn selected_recovery_damage(
-        &self,
-        compiled: &polaris_helper_proto::core_manifest::CoreManifest,
-    ) -> io::Result<Option<bool>> {
-        recovery_transaction::selected_recovery_damage(self, compiled)
-    }
-
     pub fn verify_for_start(&self, id: &CoreId) -> io::Result<VerifiedCore> {
         #[cfg(windows)]
         if self.owner.data.is_some() {

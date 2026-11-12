@@ -894,7 +894,6 @@ fn helper_action_error_codes_serialize_as_frontend_contract() {
         (HelperActionErrorCode::Unsupported, "unsupported"),
         (HelperActionErrorCode::MissingAsset, "missingAsset"),
         (HelperActionErrorCode::BundleMismatch, "bundleMismatch"),
-        (HelperActionErrorCode::RecoveryRequired, "recoveryRequired"),
         (HelperActionErrorCode::NotReady, "notReady"),
         (
             HelperActionErrorCode::InvalidInstallation,
@@ -1522,7 +1521,6 @@ fn execution_diagnostic_is_fixed_non_authoritative_and_bounded() {
 #[test]
 fn helper_execution_optional_field_does_not_change_legacy_action_json() {
     let result = HelperActionResult {
-        recovery: None,
         success: false,
         uninstall_effect: None,
         execution_diagnostic: None,
@@ -1655,56 +1653,6 @@ fn ordinary_status_checks_old_daemon_version_and_never_calls_its_core_status() {
         frames.lock().unwrap()[0].lines().collect::<Vec<_>>(),
         ["TOK", "version"]
     );
-}
-
-#[test]
-fn recovery_reservation_fences_existing_and_new_child_slots_until_its_own_release() {
-    let (runtime, _dir) = runtime();
-    let slot = Arc::new(Mutex::new(DirectCoreSlot::default()));
-    runtime
-        .bind_core_mutation_fence(Arc::downgrade(&slot))
-        .unwrap();
-    let guard = runtime.reserve_recovery().unwrap();
-    assert!(runtime.register_core_mutation().is_err());
-    assert!(runtime.reserve_recovery().is_err());
-    let another = Arc::new(Mutex::new(DirectCoreSlot::default()));
-    assert!(runtime
-        .bind_core_mutation_fence(Arc::downgrade(&another))
-        .is_err());
-    drop(guard);
-    runtime
-        .bind_core_mutation_fence(Arc::downgrade(&another))
-        .unwrap();
-    runtime.reserve_recovery().unwrap();
-}
-#[test]
-fn recovery_source_does_not_skip_a_damaged_current_package_for_legacy_cache_bytes() {
-    let dir = TestDir::new("polaris-recovery-roots-");
-    let current = dir.join("current");
-    let legacy = dir.join("legacy");
-    std::fs::create_dir_all(current.join("core-recovery/linux")).unwrap();
-    std::fs::create_dir_all(legacy.join("linux")).unwrap();
-    std::fs::write(legacy.join("linux/polaris-helper"), b"would be fallback").unwrap();
-    assert_eq!(
-        recovery_helper_from_roots(&[current.clone(), legacy], "linux").unwrap(),
-        current.join("linux/polaris-helper")
-    );
-    assert!(!current.join("linux/polaris-helper").exists());
-}
-#[test]
-fn independent_recovery_target_receipt_never_relabels_helper_cancel_as_global_success() {
-    let (runtime, _dir) = runtime();
-    let mut result =
-        runtime.action_failed(HelperActionErrorCode::Cancelled, "authorization cancelled");
-    result.recovery = Some(CoreRecoveryReport {
-        user: crate::runtime::core_identity::user_store::UserRecoveryState::Installed,
-        helper_complete: false,
-    });
-    let wire = serde_json::to_value(result).unwrap();
-    assert_eq!(wire["success"], false);
-    assert_eq!(wire["errorCode"], "cancelled");
-    assert_eq!(wire["recovery"]["user"], "installed");
-    assert_eq!(wire["recovery"]["helperComplete"], false);
 }
 
 #[test]

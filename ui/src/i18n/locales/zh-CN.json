@@ -1,20 +1,6 @@
 {
   "coreRecovery": {
-    "intro": "断开连接后恢复随包数据；不补足运行支持，不安装助手或自动重连。",
-    "check": "检查离线恢复",
-    "working": "正在核验或恢复，请稍候…",
-    "ready": "随包恢复数据已核验。重置时会再次检查；运行支持仍单独核验，不会自动连接。",
-    "restore": "重置配套内核数据",
-    "confirm": "再次点击确认重置",
-    "restored": "配套内核数据已恢复，不会自动连接。当前环境的运行限制仍然适用。",
-    "notNeeded": "当前内核内容已通过核验，无需重置。",
-    "stopRequired": "内核仍在运行、启动或等待确认退出。请先断开并等待停止完成，再检查恢复。",
-    "helperRequired": "当前模式使用助手的受保护内核，请通过助手设置中的可信安装流程处理。",
-    "helper": "查看助手恢复",
-    "reinstallRequired": "当前恢复源或数据存储条件无法满足。请使用可信安装流程处理，不要重复重置。",
-    "reinstall": "通过可信安装包重新安装",
-    "unavailable": "暂时无法确认恢复条件。未确认恢复成功，请检查权限或可用空间后重试。",
-    "pending": "恢复尚未完成，连接保持断开。请使用可信安装流程处理，不要重复重置。"
+    "reinstall": "通过可信安装包重新安装"
   },
   "feedback": {
     "connectionFailed": "连接失败",
@@ -75,8 +61,7 @@
       "upgradeDeferred": "现有助手未批准安全升级，可能仍在使用中或不支持升级协议。请断开它管理的连接后重新检测；若仍被阻止，请查看日志，确认是否需要旧版迁移。",
       "installerFailed": "Helper 安装命令执行失败。请先查看安装日志中的具体原因，再决定是否重试。",
       "failed": "helper 操作未能完成",
-      "bundleMismatch": "恢复文件与本应用不匹配，请使用可信安装包重新安装相同版本的 Polaris。",
-      "recoveryRequired": "内核恢复尚未完成或收尾未确认。请重试修复；原件与恢复记录已保留。"
+      "bundleMismatch": "恢复文件与本应用不匹配，请使用可信安装包重新安装相同版本的 Polaris。"
     },
     "selectedCoreVersion": "选定内核版本",
     "selectedCoreId": "选定内容标识",
@@ -126,9 +111,6 @@
     "diagnosticsCopyFailed": "未能复制诊断信息，请重试。",
     "protocolUpgradeNeeded": "助手通信协议需要升级",
     "restoreOfflineAction": "离线恢复配套内核",
-    "recoveryPartial": "应用内核已恢复，提权助手修复尚未完成。请重试修复；代理未自动重连。",
-    "recoveryUserUnsupported": "此平台的提权助手修复无法恢复应用私有内核。如有需要，请重新安装可信的同版应用。",
-    "recoveryPending": "内核恢复尚未完成或收尾未确认。请重试修复；原件与恢复记录已保留。",
     "coreAdmissionSupportHint": "需要支持此环境的应用版本，修复助手无法解决。"
   },
   "proxy": {

@@ -1,20 +1,6 @@
 {
   "coreRecovery": {
-    "intro": "中斷連線後還原隨附資料；不會補足執行支援、安裝助手或自動重連。",
-    "check": "檢查離線還原",
-    "working": "正在驗證或還原，請稍候…",
-    "ready": "隨附還原資料已通過驗證。重設時會再次檢查；執行支援仍單獨驗證，不會自動連線。",
-    "restore": "重設配套核心資料",
-    "confirm": "再次點擊確認重設",
-    "restored": "配套核心資料已還原，不會自動連線。目前環境的執行限制仍然適用。",
-    "notNeeded": "目前核心內容已通過驗證，無需重設。",
-    "stopRequired": "核心仍在執行、啟動或等待確認結束。請先中斷連線並等待停止，再檢查還原。",
-    "helperRequired": "目前模式使用助手的受保護核心，請透過助手設定中的可信安裝流程處理。",
-    "helper": "查看助手還原",
-    "reinstallRequired": "目前還原來源或資料儲存條件無法滿足。請使用可信安裝流程處理，不要重複重設。",
-    "reinstall": "透過可信安裝套件重新安裝",
-    "unavailable": "暫時無法確認還原條件。尚未確認還原成功，請檢查權限或可用空間後重試。",
-    "pending": "還原尚未完成，連線保持中斷。請使用可信安裝流程處理，不要重複重設。"
+    "reinstall": "透過可信安裝套件重新安裝"
   },
   "feedback": {
     "connectionFailed": "連線失敗",
@@ -75,8 +61,7 @@
       "upgradeDeferred": "現有助手未批准安全升級，可能仍在使用中或不支援升級協定。請中斷它管理的連線後重新偵測；若仍被阻止，請查看日誌，確認是否需要舊版遷移。",
       "installerFailed": "Helper 安裝命令執行失敗。請先查看安裝日誌中的詳細原因，再決定是否重試。",
       "failed": "helper 操作未能完成",
-      "bundleMismatch": "恢復檔案與本應用不符，請使用可信安裝包重新安裝相同版本的 Polaris。",
-      "recoveryRequired": "核心恢復尚未完成或收尾未確認。請重試修復；原件與恢復記錄已保留。"
+      "bundleMismatch": "恢復檔案與本應用不符，請使用可信安裝包重新安裝相同版本的 Polaris。"
     },
     "selectedCoreVersion": "選定核心版本",
     "selectedCoreId": "選定內容識別",
@@ -126,9 +111,6 @@
     "diagnosticsCopyFailed": "未能複製診斷資訊，請重試。",
     "protocolUpgradeNeeded": "助手通訊協定需要升級",
     "restoreOfflineAction": "離線恢復配套核心",
-    "recoveryPartial": "應用核心已恢復，提權助手修復尚未完成。請重試修復；代理未自動重連。",
-    "recoveryUserUnsupported": "此平台的提權助手修復無法恢復應用私有核心。如有需要，請重新安裝可信的同版應用。",
-    "recoveryPending": "核心恢復尚未完成或收尾未確認。請重試修復；原件與恢復記錄已保留。",
     "coreAdmissionSupportHint": "需要支援此環境的應用版本，修復助手無法解決。"
   },
   "proxy": {

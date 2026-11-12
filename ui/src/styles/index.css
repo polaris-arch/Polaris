@@ -1864,9 +1864,6 @@ body:has(.pending-bar.show) #toast-stack{
 #core-info-card .sr-ctl{ min-width:0; max-width:62%; font-size:13px; line-height:1.5; text-align:end; overflow-wrap:anywhere; }
 .core-admission{ display:grid; gap:12px; margin-bottom:14px; }
 .core-card-note{ margin:12px 0 0; line-height:1.55; }
-.core-recovery{ line-height:1.55; }
-.core-recovery > p{ margin:0; }
-.core-recovery a{ font-size:12px; }
 .core-diagnostic-fields{ margin:12px 0; overflow-wrap:anywhere; }
 .core-diagnostic-fields dd{ margin:4px 0 12px; }
 #core-info-card details .btn{ margin-top:10px; }

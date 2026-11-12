@@ -126,8 +126,8 @@ const [reference, binary, scripts] = process.argv.slice(2);
 const key = basename(dirname(reference));
 const root = resolve(dirname(dirname(reference)), '..');
 const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json'), 'utf8'));
-const { verifyPackagedCore } = await import(pathToFileURL(join(scripts, 'desktop-core/release-consumer.mjs')));
-verifyPackagedCore(root, manifest, key, binary);
+const { verifyPackagedRelease } = await import(pathToFileURL(join(scripts, 'desktop-core/release-consumer.mjs')));
+verifyPackagedRelease(root, manifest, key, binary);
 NODE
 }
 

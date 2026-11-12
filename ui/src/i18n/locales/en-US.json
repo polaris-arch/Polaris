@@ -1,20 +1,6 @@
 {
   "coreRecovery": {
-    "intro": "Disconnect before restoring bundled data. This does not add runtime support, install the Helper or reconnect.",
-    "check": "Check offline recovery",
-    "working": "Checking or restoring. Please wait…",
-    "ready": "Bundled recovery data was verified and will be checked again before reset. Execution support remains a separate check; the app will not reconnect.",
-    "restore": "Reset bundled core data",
-    "confirm": "Click again to confirm reset",
-    "restored": "Core data restored. The app will not reconnect automatically; this environment's execution restrictions still apply.",
-    "notNeeded": "The current core content passed verification. No reset is needed.",
-    "stopRequired": "The core is running, starting, or has not confirmed its exit. Disconnect and wait for it to stop, then check again.",
-    "helperRequired": "This mode uses Helper's protected core. Use the trusted installation flow in Helper settings.",
-    "helper": "View Helper recovery",
-    "reinstallRequired": "The recovery source or data-store requirements cannot be satisfied. Use the trusted installation flow instead of repeatedly resetting.",
-    "reinstall": "Reinstall from a trusted package",
-    "unavailable": "Recovery requirements could not be confirmed. Success has not been confirmed; check permissions or free space and try again.",
-    "pending": "Recovery is incomplete and the connection remains stopped. Use the trusted installation flow rather than repeatedly resetting."
+    "reinstall": "Reinstall from a trusted package"
   },
   "feedback": {
     "connectionFailed": "Connection failed",
@@ -75,8 +61,7 @@
       "upgradeDeferred": "The existing helper did not approve a safe upgrade. It may be busy or lack upgrade support. Disconnect its managed connections and check again; if it remains blocked, check the logs to determine whether a confirmed legacy migration is needed.",
       "installerFailed": "The Helper installation command failed. Check the installation log for the cause before trying again.",
       "failed": "The helper action could not be completed",
-      "bundleMismatch": "Recovery inputs do not match this app. Reinstall the same Polaris version from a trusted package.",
-      "recoveryRequired": "Core recovery is unfinished or its cleanup is unconfirmed. Retry repair; retained originals and recovery records have been preserved."
+      "bundleMismatch": "Recovery inputs do not match this app. Reinstall the same Polaris version from a trusted package."
     },
     "selectedCoreVersion": "Selected core version",
     "selectedCoreId": "Selected content ID",
@@ -126,9 +111,6 @@
     "diagnosticsCopyFailed": "Could not copy diagnostics. Try again.",
     "protocolUpgradeNeeded": "Helper protocol needs an upgrade",
     "restoreOfflineAction": "Restore bundled core offline",
-    "recoveryPartial": "The app core was restored. Helper repair did not finish. Retry repair; no proxy was reconnected.",
-    "recoveryUserUnsupported": "Helper repair does not restore the app’s private core on this platform. Reinstall this trusted app version if needed.",
-    "recoveryPending": "Core recovery is unfinished or its cleanup is unconfirmed. Retry repair; retained originals and recovery records have been preserved.",
     "coreAdmissionSupportHint": "An app version supporting this environment is required. Repairing the Helper will not resolve this."
   },
   "proxy": {

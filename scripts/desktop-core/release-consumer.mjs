@@ -13,7 +13,6 @@ import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature,
 import { isUpstreamRelease, validateUpstreamContract, validateUpstreamRow,
   upstreamMetadata, upstreamPayloadPins, contractPublicAssets } from './upstream-release.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
-import { RECOVERY_RESOURCE, stageRecoveryResource, verifyRecoveryResource } from './recovery.mjs';
 
 const REPO = 'polaris-arch/sing-box-polaris';
 export function releaseRepositoryId(contract) {
@@ -485,11 +484,11 @@ export function recoverRelease(root, options = {}) {
   const work = join(resources, journal.work); regularPath(work, true);
   if (journal.phase !== 'acquiring') {
     demand(['replacing', 'committed'].includes(journal.phase) && Array.isArray(journal.directories)
-      && journal.directories.length >= 2 && journal.directories.length <= 6
+      && journal.directories.length >= 2 && journal.directories.length <= 5
       && new Set(journal.directories.map((r) => r.key)).size === journal.directories.length
       && journal.directories.at(-1).key === '.release-receipts', 'Recovery directory inventory invalid');
     for (const row of journal.directories) {
-      demand((Object.hasOwn(RELEASE_TARGETS, row.key) || ['.release-receipts', RECOVERY_RESOURCE].includes(row.key))
+      demand((Object.hasOwn(RELEASE_TARGETS, row.key) || row.key === '.release-receipts')
         && hex(row.staged, 64) && (row.original === null || hex(row.original, 64)), 'Recovery fingerprint invalid');
       const dest = join(resources, row.key), backup = join(work, `old-${row.key}`);
       if (journal.phase === 'committed') {
@@ -516,7 +515,7 @@ export function recoverRelease(root, options = {}) {
 function replaceDirectories(resources, work, keys, rename) {
   const completed = [];
   try {
-    for (const key of [...keys, RECOVERY_RESOURCE, '.release-receipts']) {
+    for (const key of [...keys, '.release-receipts']) {
       const dest = join(resources, key), backup = join(work, `old-${key}`), stage = join(work, 'stage', key);
       if (existsSync(dest)) { directoryTree(dest); rename(dest, backup); }
       completed.push({ dest, backup, installed: false });
@@ -707,9 +706,6 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     const metadata = join(stage, '.release-receipts'); mkdirSync(metadata);
     const oldMetadata = join(resources, '.release-receipts');
     if (existsSync(oldMetadata)) { directoryTree(oldMetadata); cpSync(oldMetadata, metadata, { recursive: true }); }
-    const recovery = join(stage, RECOVERY_RESOURCE), oldRecovery = join(resources, RECOVERY_RESOURCE);
-    mkdirSync(recovery);
-    if (existsSync(oldRecovery)) { directoryTree(oldRecovery); cpSync(oldRecovery, recovery, { recursive: true }); }
     const receipts = {};
     for (const key of keys) {
       const row = contract.platforms[key], target = RELEASE_TARGETS[key];
@@ -722,11 +718,6 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       runColdArchive(run, 'native-archive-extraction', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, extracted],
         JSON.stringify({ archive: row.archive, root: rootName, target: row.target }));
       const source = verifyExtracted(extracted, rootName, row, key, run, options.host ?? process.platform, signatureRun, contract);
-      // Preserve the exact published compression container in a separate
-      // resource namespace. It commits/rolls back with this same acquisition.
-      const recoveryTarget = join(recovery, key);
-      if (existsSync(recoveryTarget)) rmSync(recoveryTarget, { recursive: true });
-      stageRecoveryResource(recoveryTarget, row, key, manifest.desktopRelease.contractSha256, archive, source);
       const dest = join(stage, key); mkdirSync(dest);
       const existing = join(resources, key);
       if (existsSync(existing)) { directoryTree(existing); cpSync(existing, dest, { recursive: true }); }
@@ -748,7 +739,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     }
     const after = await publicSnapshot(contract, read); same(after, before, 'Release identity changed during acquisition');
     writeFileSync(join(metadata, 'public-readback.json'), JSON.stringify({ schema: 'polaris-app-release-readback-v1', contractSha256: manifest.desktopRelease.contractSha256, before, after }, null, 2) + '\n', { mode: 0o600 });
-    journal.phase = 'replacing'; journal.directories = [...keys, RECOVERY_RESOURCE, '.release-receipts'].map((key) => ({ key,
+    journal.phase = 'replacing'; journal.directories = [...keys, '.release-receipts'].map((key) => ({ key,
       original: existsSync(join(resources, key)) ? directoryFingerprint(join(resources, key)) : null,
       staged: directoryFingerprint(join(stage, key)) }));
     saveJournal(lock, work, journal);
@@ -799,8 +790,6 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     demand(((lstatSync(lib).mode | lstatSync(original).mode) & 0o7000) === 0
       && (lstatSync(lib).mode & 0o7777) === (lstatSync(original).mode & 0o7777), 'Final release library permissions differ');
   } else demand(!readdirSync(dirname(core)).some((n) => /^libcronet\.(so|dll|dylib)$/.test(n)), 'Static carrier contains Cronet sidecar');
-  verifyRecoveryResource(join(root, 'resources', RECOVERY_RESOURCE, key), row, key,
-    manifest.desktopRelease.contractSha256, dirname(source));
   for (const [relative, sha256] of Object.entries(upstreamPayloadPins(contract, row))) {
     if (relative === row.core.member || relative === row.sidecar?.member) continue;
     const original = join(dirname(source), 'core-release', relative), final = join(dirname(core), 'core-release', relative);
@@ -810,16 +799,5 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     demand(((lstatSync(original).mode | lstatSync(final).mode) & 0o7000) === 0
       && (lstatSync(original).mode & 0o7777) === (lstatSync(final).mode & 0o7777), 'Final release notice permissions differ');
   }
-  return receipt;
-}
-
-// Final bundle validation also reproves the delivered recovery bytes rather
-// than borrowing the checkout's good archive when a final resource was omitted.
-export function verifyPackagedCore(root, manifest, key, binary, run = execFileSync, host = process.platform) {
-  const receipt = verifyPackagedRelease(root, manifest, key, binary, run, host);
-  const contract = loadReleaseContract(root, manifest);
-  // A valid outer bundle seal can cover a damaged copy made before sealing.
-  verifyRecoveryResource(join(dirname(dirname(binary)), RECOVERY_RESOURCE, key),
-    contract.platforms[key], key, manifest.desktopRelease.contractSha256, dirname(binary));
   return receipt;
 }

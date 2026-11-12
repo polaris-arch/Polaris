@@ -72,7 +72,6 @@ export default function SettingsHelper() {
   const [busy, setBusy] = useState(helperInstallSnapshot().busy);
   const [installFailure, setInstallFailure] = useState<HelperActionErrorCode | null>(helperInstallSnapshot().failure);
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
-  const [recoveryNotice, setRecoveryNotice] = useState<'partial' | 'unsupported' | 'pending' | null>(null);
   const cleanupPending = useRef(false);
   const installInFlight = useRef(false);
   const migrationConfirmation = useRef<string | null>(null);
@@ -163,10 +162,6 @@ export default function SettingsHelper() {
     let failure: HelperActionErrorCode | null = 'failed';
     try {
       const r = mode === undefined ? await helperApi.install() : await helperApi.install(mode);
-      setRecoveryNotice(previous => !r.recovery ? (r.success ? null : previous)
-        : r.errorCode === 'recoveryRequired' || r.recovery.user === 'pending' ? 'pending'
-        : r.recovery.user === 'unsupported' ? 'unsupported'
-        : !r.recovery.helperComplete ? 'partial' : null);
       failure = r.success ? null : r.errorCode ?? 'failed';
       if (r.success) cleanupPending.current = false;
       publishStatus(r.status);
@@ -531,9 +526,6 @@ export default function SettingsHelper() {
               </div>
             </div>
           )}
-          {recoveryNotice && <p role="status" className="card-sub" data-recovery-state={recoveryNotice}>
-            {t(recoveryNotice === 'partial' ? 'helper.recoveryPartial' : recoveryNotice === 'unsupported' ? 'helper.recoveryUserUnsupported' : 'helper.recoveryPending')}
-          </p>}
           <details className="card-sub" data-testid="helper-diagnostics" style={{ marginTop: 16, minWidth: 0, overflowWrap: 'anywhere' }} onToggle={revealOnToggle}>
             <summary>{t('helper.diagnosticsTitle')}</summary>
             {status && (

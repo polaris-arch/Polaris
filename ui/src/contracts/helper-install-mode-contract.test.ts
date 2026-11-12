@@ -42,7 +42,7 @@ it('explicit manager mode is rejected before input validation, token writes, and
 });
 it('runtime and IPC reject unsupported mode before any staging or proxy-stop guard', () => {
   const install = body(runtime, 'pub fn install_with_mode(', 'pub fn uninstall(');
-  for (const effect of ['self.install_params()', 'self.reserve_recovery()', 'manager.install_with_mode(']) {
+  for (const effect of ['self.install_params()', 'manager.install_with_mode(']) {
     before(install, 'if !mode.supported_on(self.platform)', effect);
   }
   expect(install).toContain('mode.manager_mode()');

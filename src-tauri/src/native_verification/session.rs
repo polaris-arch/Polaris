@@ -1,7 +1,5 @@
 //! Closed verification-session data custody. This module cannot install a provider,
 //! create an execution owner, change the selected contract, or retire a native birth.
-#[cfg(any(target_os = "macos", windows))]
-use super::HelperRuntime;
 use super::CASE_NAMES;
 use polaris_core_supervisor::admitted_payload::{check_selected_capability, ExecPurpose};
 use polaris_helper::core_objects::PayloadDir;
@@ -300,54 +298,6 @@ fn matches_selection(a: &Owner, b: &Owner) -> bool {
     a.session_id.clear();
     a == *b
 }
-fn provider_ready(root: &Path) -> Result<(), String> {
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        let h = HelperRuntime::new(root.to_path_buf());
-        let s = h.status();
-        if !s.installed || !s.ready || s.upgradeable || s.needs_repair {
-            return Err(
-                "installed selected provider or native caller registration unavailable".into(),
-            );
-        }
-        if s.selected_core
-            .as_ref()
-            .is_none_or(|c| c.state != crate::runtime::helper::SelectedCoreState::Present)
-        {
-            return Err("selected CoreID not present in provider".into());
-        }
-        if !provider_idle(root)? {
-            return Err("native provider birth is occupied or unknown".into());
-        }
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let _ = root;
-    }
-    Ok(())
-}
-
-fn provider_idle(root: &Path) -> Result<bool, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        // A plaintext session checkpoint cannot supply this observation.
-        let token = polaris_helper_client::read_token(&root.join("helper-client.token"));
-        #[cfg(target_os = "macos")]
-        let c = polaris_helper_client::check_config::SystemMacCheckClient::system(token)?;
-        #[cfg(windows)]
-        let c = polaris_helper_client::check_config::SystemWindowsCheckClient::system(token)?;
-        Ok(matches!(
-            c.native_birth_status()?,
-            polaris_helper_proto::NativeBirthStatus::Empty
-        ))
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let _ = root;
-        Ok(true)
-    }
-}
-
 /// Long-lived ordinary process holds the one fixed per-user slot. stdin accepts
 /// only the closed teardown action (EOF also tears down); no path/credential input.
 pub(super) fn hold_session() -> Result<(), String> {
@@ -375,23 +325,17 @@ pub(super) fn hold_session() -> Result<(), String> {
     }
     let before = retained_size(&root).map_err(|e| failure("session", "retention-budget", e))?;
     owner.session_id = uuid::Uuid::new_v4().to_string();
-    let ready = provider_ready(&root);
-    // Missing registration/provider produces a preparation descriptor, never an
-    // active session owner. A later explicitly authorized installation may use
-    // this same stable root without deleting/forging a stale native session.
-    if ready.is_ok() {
-        record(
-            &root.join(OWNER),
-            &serde_json::to_value(&owner).map_err(|e| e.to_string())?,
-        )?;
-        for i in 0..CASE_NAMES.len() {
-            create_directory(&root.join(format!("case-{i}")))?;
-        }
+    record(
+        &root.join(OWNER),
+        &serde_json::to_value(&owner).map_err(|e| e.to_string())?,
+    )?;
+    for i in 0..CASE_NAMES.len() {
+        create_directory(&root.join(format!("case-{i}")))?;
     }
     println!(
         "POLARIS_NATIVE_SESSION {}",
-        json!({"schema":"polaris-native-session-v1","state":if ready.is_ok(){"ready"}else{"unmet"},
-        "code":if ready.is_ok(){"ready"}else{"provider-unavailable"},"detail":ready.err(),"processId":std::process::id(),
+        json!({"schema":"polaris-native-session-v1","state":"ready",
+        "code":"ready","detail":null,"processId":std::process::id(),
         "owner":owner,"configRoot":root,"provider":"compiled-platform-production-route","registrationScope":"enforced-by-production-start","executionAuthorized":false,
         "slots":1,"maxRetainedBytes":MAX_RETAINED_BYTES,"retainedBytesBefore":before,"required":true,"publicationEligible":false})
     );
@@ -418,15 +362,13 @@ pub(super) fn hold_session() -> Result<(), String> {
             Err(_) => drained = false,
         }
     }
-    let endpoint_idle = provider_idle(&root).ok();
     let retained = retained_size(&root);
-    let ok =
-        action_ok && drained && (started == 0 || endpoint_idle == Some(true)) && retained.is_ok();
+    let ok = action_ok && drained && retained.is_ok();
     println!(
         "POLARIS_NATIVE_SESSION_TEARDOWN {}",
         json!({"schema":"polaris-native-session-teardown-v1",
         "sessionId":owner.session_id,"processId":std::process::id(),"startedCases":started,
-        "caseDrainCheckpointsMatched":drained,"providerIdle":endpoint_idle,"state":if ok {if started==0 {"retained-unopened"} else {"retained"}} else {"cleanup-unconfirmed"},
+        "caseDrainCheckpointsMatched":drained,"state":if ok {if started==0 {"retained-unopened"} else {"retained"}} else {"cleanup-unconfirmed"},
         "directoryState":"retained","retainedBytes":retained.as_ref().ok(),"maxRetainedBytes":MAX_RETAINED_BYTES,
         "retentionReason":"no descriptor-bound delete API; preserve token, registration-bound root and original case data for explicit owner cleanup",
         "evidenceKind":"data-coordination-only","registrationChanged":false,"providerInstalled":false,"publicationEligible":false})
@@ -482,7 +424,6 @@ impl CaseSession {
                 "compiled selection or native caller differs",
             ));
         }
-        provider_ready(&root).map_err(|e| failure("provider", "provider-unavailable", e))?;
         let case_dir = root.join(format!("case-{i}"));
         private_directory(&case_dir)?;
         let receipt =

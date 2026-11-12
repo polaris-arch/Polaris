@@ -30,7 +30,6 @@
 mod app_update;
 mod app_update_policy;
 mod core_info;
-mod core_recovery;
 mod shared;
 #[path = "updater/uninstall.rs"]
 mod uninstall_command;
@@ -41,7 +40,6 @@ pub use app_update::{
     update_request_install_permission, update_skip, version_get_info,
 };
 pub use core_info::core_get_version_info;
-pub use core_recovery::{core_check_offline_recovery, core_restore_bundled_data};
 pub use uninstall_command::app_uninstall_all;
 
 // 仅供同 crate 的启动任务复用。

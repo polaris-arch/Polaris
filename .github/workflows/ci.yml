@@ -404,30 +404,16 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
 
-      # Non-runtime compilation retains the existing common-resource stager.
-      # Platform Recovery bundles remain mandatory for real native/package jobs.
+      # tauri build.rs 校验 bundle.resources 路径存在。resources/{dashboard,linux,win,mac-*}
+      # 被 .gitignore 排除（仅 .gitkeep + data/ 入库，核/仪表盘运行期 fetch），裸 checkout 无这些
+      # 目录 → build-script 报 "resource path doesn't exist" 而炸。ci 不打包、不需真产物，建空占位
+      # 目录 + .keep 占位文件（防 glob 零匹配）即可让 cargo build/clippy/test 通过。
       - name: Create resource placeholder dirs (tauri build.rs 路径校验)
         shell: bash
         run: |
           for d in dashboard linux win mac-arm64 mac-x64; do
             mkdir -p "resources/$d" && touch "resources/$d/.keep"
           done
-
-      # This job never executes or packages the App. Override only its resource
-      # projection, after Tauri's platform merge; production configs stay intact.
-      - name: Select resources for non-runtime compilation
-        shell: bash
-        run: |
-          node --input-type=module - <<'NODE'
-          import { appendFileSync, readFileSync } from 'node:fs';
-          if (Object.hasOwn(process.env, 'TAURI_CONFIG')) throw new Error('compile-only resource projection requires an unset TAURI_CONFIG');
-          if (!process.env.GITHUB_ENV) throw new Error('missing compile-only job environment');
-          const resources = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8')).bundle.resources;
-          if (!Array.isArray(resources) || resources.length === 0 || resources.some((p) => typeof p !== 'string' || p.includes('core-recovery/'))) {
-            throw new Error('expected common compile-only resource paths');
-          }
-          appendFileSync(process.env.GITHUB_ENV, `TAURI_CONFIG=${JSON.stringify({ bundle: { resources } })}\n`);
-          NODE
 
       # Keep independent crates visible after one fails; failed dependencies still block consumers.
       # The failure exit code, target selection and job budget are unchanged.
@@ -546,22 +532,6 @@ jobs:
           for d in dashboard linux win mac-arm64 mac-x64; do
             mkdir -p "resources/$d" && touch "resources/$d/.keep"
           done
-
-      # This job never executes or packages the App. Override only its resource
-      # projection, after Tauri's platform merge; production configs stay intact.
-      - name: Select resources for non-runtime compilation
-        shell: bash
-        run: |
-          node --input-type=module - <<'NODE'
-          import { appendFileSync, readFileSync } from 'node:fs';
-          if (Object.hasOwn(process.env, 'TAURI_CONFIG')) throw new Error('compile-only resource projection requires an unset TAURI_CONFIG');
-          if (!process.env.GITHUB_ENV) throw new Error('missing compile-only job environment');
-          const resources = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8')).bundle.resources;
-          if (!Array.isArray(resources) || resources.length === 0 || resources.some((p) => typeof p !== 'string' || p.includes('core-recovery/'))) {
-            throw new Error('expected common compile-only resource paths');
-          }
-          appendFileSync(process.env.GITHUB_ENV, `TAURI_CONFIG=${JSON.stringify({ bundle: { resources } })}\n`);
-          NODE
 
       # 平台特定代码在 Linux 腿上的**唯一**检出通道（2026-08-09 新增）。
       #

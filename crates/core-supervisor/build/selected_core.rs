@@ -39,7 +39,6 @@ pub fn emit() {
     }
 
     embed_selected_core_identity();
-    embed_recovery_inventory();
 }
 fn desktop_platform() -> Option<&'static str> {
     match (
@@ -198,26 +197,6 @@ fn embed_selected_core_identity() {
     std::fs::write(output, raw).expect("write compiled selected core identity");
 }
 
-fn embed_recovery_inventory() {
-    let output = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"))
-        .join("selected-core-recovery-inventory.json");
-    let raw = if let Some(platform) = desktop_platform() {
-        let path = repository_root()
-            .join("resources/core-recovery")
-            .join(platform)
-            .join("inventory.json");
-        println!("cargo:rerun-if-changed={}", path.display());
-        match std::fs::read(&path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => b"null".to_vec(),
-            Err(error) => panic!("compiled recovery inventory unavailable: {error}"),
-        }
-    } else {
-        b"null".to_vec()
-    };
-    std::fs::write(output, raw).expect("write compiled recovery inventory");
-}
-
 fn emit_local_development() {
     const {
         assert!(
@@ -281,7 +260,6 @@ fn emit_local_development() {
     for (source, target) in [
         ("selection.json", "local-development-selection.json"),
         ("contract.json", "local-development-contract.json"),
-        ("inventory.json", "selected-core-recovery-inventory.json"),
     ] {
         let path = directory.join(source);
         println!("cargo:rerun-if-changed={}", path.display());

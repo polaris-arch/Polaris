@@ -103,12 +103,6 @@ const NO_MIXED_INBOUND = {
   mustContain: 'Platform::Android | Platform::Ios => false,',
 } as const;
 
-/** 独立 CoreStore 数据只对应桌面 selectedCore；移动端的 libbox 不走此恢复通路。 */
-const NO_MOBILE_SELECTED_CORE_DATA = {
-  file: 'crates/core-supervisor/src/selected_core.rs',
-  mustContain: 'match (std::env::consts::OS, std::env::consts::ARCH) {',
-} as const;
-
 /*
  * 🔴 **这里刻意没有「应用内下载安装」的 platform-absent 常量**（2026-09-13 复审撤回）。
  *
@@ -611,22 +605,6 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '复制助手选定安装内容的 CoreID/providerFingerprint/state；CoreInfoCard 的唯一生产调用方为桌面 SettingsUpdate，移动端设置路由使用独立 UpdatePage/AboutPage，未渲染该卡。后端 current_platform 仅允许四个桌面 target，移动端无 selectedCore；不是将通用内核诊断记为缺席。',
     },
 
-    {
-      id: 'CoreRecoveryActions.tsx|f:confirmTwice',
-      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
-      note: '二次确认只恢复当前桌面编译选定的数据，不更新内核或取得执行许可；移动端平台检查先行拒绝。',
-    },
-    {
-      id: 'CoreRecoveryActions.tsx|k:coreRecovery.check',
-      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
-      note: '检查桌面数据副本与随包恢复源；Android/iOS 无此 selectedCore，命令在数据访问和停机前返回。',
-    },
-    {
-      id: 'CoreRecoveryActions.tsx|k:coreRecovery.helper',
-      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
-      note: '当前桌面接管模式需要助手时转到助手页；不是移动端 VPN 授权入口，也不强制普通模式安装助手。',
-    },
-
     /* ── 提权助手页（移动端没有 helper 进程这个对象）───────────────────────── */
     {
       id: 'SettingsHelper.tsx|k:settings.about.checkUpdate',
@@ -1043,7 +1021,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '提权助手页。移动端没有 helper 进程：隧道来自 `VpnService`，权限来自系统授权弹窗 —— 锚指的就是那个替代对象的后端腿。它的替代不是「助手页的移动版」，而是根页上一行 VPN 授权（回答同一个用户问题、对着完全不同的对象）。',
     },
 
-    /* ── 四个非子页的块 ──────────────────────────────────────────────────── */
+    /* ── 三个非子页的块 ──────────────────────────────────────────────────── */
     {
       id: 'AppUpdateCard',
       disposition: {
@@ -1055,11 +1033,6 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '「打开发布页」/「跳过此版本」）加下面一行更新通道。**三阶段里只少了下载与安装那两段**，' +
         '而那两段在这个平台上没有可下载的资产（逐颗处置见 actions 面 `k:settings.update.download` ' +
         '一族）—— 不是这张卡没移植。',
-    },
-    {
-      id: 'CoreRecoveryActions',
-      disposition: { kind: 'platform-absent', evidence: NO_MOBILE_SELECTED_CORE_DATA },
-      note: '桌面随包数据恢复区；移动端的 libbox 随 APK 安装，不存在该桌面独立数据槽。',
     },
     {
       id: 'CoreInfoCard',

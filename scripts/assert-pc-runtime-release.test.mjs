@@ -192,7 +192,7 @@ function formalPolicyFixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'formal-source-publication-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const paths = ['scripts/assert-pc-runtime-release.mjs', 'scripts/desktop-core/source-graph.mjs',
-    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/recovery.mjs', 'scripts/lib/polaris-version.json',
+    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json',
     'scripts/desktop-core/local-development.mjs',
     'scripts/lib/core-identity.mjs', 'scripts/lib/cronet-payload.mjs', manifestPath,
     'scripts/desktop-core/release-contract.json'];

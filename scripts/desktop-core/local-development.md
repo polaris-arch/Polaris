@@ -13,8 +13,9 @@ lane, member pins, or purposes.
 `scripts/desktop-core/local-development-source.json` is the reviewed source,
 toolchain, target, feature and sidecar recipe. The Core source and the producer
 source are separately pinned clean Git trees. The producer builds the real Core
-from that source, captures actual buildinfo, creates its recovery archive, and
-runs the production protected capability/configuration and Cronet FD probes.
+from that source, captures actual buildinfo, pins its release-shaped archive
+(the archive itself is not kept), and runs the production protected
+capability/configuration and Cronet FD probes.
 It then generates `selected_core/development_config.rs` with exact compiler
 pins. Fixed-slot data in `resources/.local-development/` must match those pins;
 it is not independently authoritative.
@@ -44,8 +45,7 @@ regeneration and compilation; changing runtime data cannot select another Core.
 
 Actual operation admission remains with the existing nonserializable provider,
 protected cohort and fresh operation lease. Warm metadata lookup does not hash
-the payload again. The recovery archive uses the existing exact member and
-inventory validator under the selected resource root.
+the payload again.
 
 Formal preparation, packaging and publication reject the local input schema,
 input slot and compiled local executable marker. The marker is a rejection aid,

@@ -65,12 +65,6 @@ test('unsupported state uses compact warning, spaced actions, original diagnosti
   const version = core.locator('[data-core-info="bundled"]');
   await expect(version).toHaveText('1.15.0-polaris-alpha.12.7');
   expect(await version.evaluate(el => getComputedStyle(el).fontSize)).toBe('13px');
-  const actionRow = core.locator('.core-recovery .feedback-notice-actions');
-  const buttons = await actionRow.locator('button,a').evaluateAll(elements => elements.map(el => {
-    const r=el.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};
-  }));
-  expect(buttons).toHaveLength(2);
-  expect(buttons[1].top >= buttons[0].bottom + 7 || buttons[1].left >= buttons[0].right + 7).toBe(true);
   await core.getByTestId('core-diagnostics').locator('summary').click();
   await expect(core.getByTestId('core-diagnostics')).toContainText('选定内容标识');
   await expect(core).not.toContainText('fixture-patch-set');

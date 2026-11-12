@@ -25,7 +25,6 @@ export type HelperActionErrorCode =
   | 'authorizationLaunchFailed'
   | 'installerFailed'
   | 'upgradeDeferred'
-  | 'recoveryRequired'
   | 'failed';
 
 /** Only an explicit user confirmation may select the disruptive macOS mode. */
@@ -34,8 +33,6 @@ export type HelperInstallMode = 'ordinary' | 'stopAndUpgrade';
 export type HelperRemovalEffect = 'removed' | 'retiredDataPreserved';
 
 export interface HelperActionResult {
-  /** Independent data targets: success still describes Helper readiness. */
-  recovery?: { user: 'installed' | 'alreadyPresent' | 'unsupported' | 'pending'; helperComplete: boolean };
   uninstallEffect?: HelperRemovalEffect;
   success: boolean;
   errorCode?: HelperActionErrorCode;

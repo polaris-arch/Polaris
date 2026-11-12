@@ -1286,8 +1286,6 @@ pub fn run() {
             update_popup_action,
             update_popup_show,
             core_get_version_info,
-            core_check_offline_recovery,
-            core_restore_bundled_data,
             app_uninstall_all,
             // ── 窗口控制（window:* + app + renderer/fatal）──
             window_minimize,

@@ -239,27 +239,3 @@ it.each(['UnsupportedExactObject','UnsupportedCapability','LoaderPolicy','Busy',
     expect(nodes(tree).filter(n=>typeof n.props.onClick==='function').map(n=>text(n.props.children))).not.toContain('settings.about.checkUpdate');
   }
 });
-
-it.each([
-  ['installed', false, 'cancelled', 'helper.recoveryPartial'],
-  ['unsupported', true, undefined, 'helper.recoveryUserUnsupported'],
-  ['pending', false, 'recoveryRequired', 'helper.recoveryPending'],
-] as const)('explicit offline restore reports user target %s independently from helper result', async (user, helperComplete, errorCode, message) => {
-  await mounted(installed);
-  vi.mocked(helperApi.install).mockResolvedValue({ success: helperComplete, status: installed, errorCode, recovery: { user, helperComplete } } as never);
-  click('helper.restoreOfflineAction');
-  await vi.waitFor(() => expect(helperApi.install).toHaveBeenCalledTimes(1));
-  await vi.waitFor(() => expect(text(render())).toContain(message));
-  expect(helperApi.uninstall).not.toHaveBeenCalled();
-});
-
-it('later source rejection does not erase a previously reported independent user-target result', async () => {
-  await mounted(installed);
-  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, status: installed, errorCode: 'cancelled', recovery: { user: 'installed', helperComplete: false } } as never);
-  click('helper.restoreOfflineAction');
-  await vi.waitFor(() => expect(text(render())).toContain('helper.recoveryPartial'));
-  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, status: installed, errorCode: 'bundleMismatch' } as never);
-  click('helper.restoreOfflineAction');
-  await vi.waitFor(() => expect(helperApi.install).toHaveBeenCalledTimes(2));
-  expect(text(render())).toContain('helper.recoveryPartial');
-});

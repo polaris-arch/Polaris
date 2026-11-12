@@ -2,7 +2,7 @@
  * sing-box 内核只读信息卡。
  *
  * 内核随应用一同发布。本卡陈述随包版本与助手选定内容安装状态；
- * 完整身份收进只读诊断；内容损坏可显式核验随包恢复源，或重装可信应用。
+ * 完整身份收进只读诊断；内容损坏时提示重装可信应用。
  *
  * 第一格**不是**「正在运行的内核」的版本：经提权助手运行时（如 TUN 模式）执行的是助手目录里的
  * 那一份，可能与随包文件不同；本卡不对「实际运行的是哪一份」作任何断言。
@@ -14,21 +14,18 @@ import { coreAdmissionIsDamage, coreAdmissionMessageKey } from '@/domain/core-ad
 import type { HelperStatus } from '@/contracts/types/runtime';
 import type { CoreVersionInfo } from '@/contracts/types/update';
 import { Button, SetBlock, SetRow, FeedbackNotice, Pill } from './Primitives';
-import CoreRecoveryActions from './CoreRecoveryActions';
 
 export interface CoreInfoCardProps {
   /** `null` = 还没读到（或读取失败）：两个版本格显示占位。 */
   info: CoreVersionInfo | null;
   selectedCore?: HelperStatus['selectedCore'];
-  onRecovered?: (result: 'restored' | 'notNeeded') => void;
-  recoveryComplete?: boolean;
 }
 
 /**
  * `packagedVersion` 为空串表示后端没能从安装包内的内核文件读出版本；此时显示占位而不是拿
  * 清单声明的版本顶替 —— 两格同值只应来自真实读数。
  */
-export default function CoreInfoCard({ info, selectedCore, onRecovered, recoveryComplete }: CoreInfoCardProps) {
+export default function CoreInfoCard({ info, selectedCore }: CoreInfoCardProps) {
   const { t } = useTranslation();
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const digest = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : null;
@@ -50,13 +47,12 @@ export default function CoreInfoCard({ info, selectedCore, onRecovered, recovery
   }
   return (
     <SetBlock id="core-info-card" header={t('settings.update.coreCard')}>
-      {recoveryComplete && <p role="status" className="card-sub core-card-note">{t('coreRecovery.restored')}</p>}
       {info?.admission?.state === 'rejected' && (
         <div className="core-admission" data-core-admission={info.admission.kind}>
           <FeedbackNotice tone={coreAdmissionIsDamage(info.admission.kind) ? 'error' : 'warning'} title={t(coreAdmissionMessageKey(info.admission.kind))} />
           {((coreAdmissionIsDamage(info.admission.kind) && info.admission.recovery === 'reinstallCurrentApp')
-            || ['UnsupportedExactObject', 'UnsupportedCapability', 'LoaderPolicy'].includes(info.admission.kind ?? '')) && (
-            <CoreRecoveryActions onRecovered={onRecovered} />
+            || ['UnsupportedExactObject', 'LoaderPolicy'].includes(info.admission.kind ?? '')) && (
+            <a className="btn ghost sm" href="#app-update-card">{t('coreRecovery.reinstall')}</a>
           )}
           {info.admission.kind === 'UnsupportedCapability' && (
             <a className="btn ghost sm" href="#app-update-card">{t('settings.about.checkUpdate')}</a>

@@ -4,21 +4,12 @@ use std::path::{Path, PathBuf};
 use polaris_helper_proto::core_manifest::{CoreId, CoreManifest};
 
 pub(crate) use polaris_core_supervisor::selected_core::current_platform;
-mod recovery;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tls_inventory;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) use tls_inventory::expected_tls_support;
-pub(crate) mod user_store;
-pub(crate) use recovery::stage_recovery_installation;
-#[cfg(test)]
-pub(crate) use recovery::tests::Fixture as RecoveryFixture;
 const APP_INSTALLATION: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/selected-core-manifest.json"));
-const APP_RECOVERY: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/selected-core-recovery-inventory.json"
-));
 const APP_DEVELOPMENT: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/local-development-selection.json"
@@ -30,7 +21,6 @@ fn check_compiled_selection() -> Result<(), String> {
         || APP_DEVELOPMENT_CONTRACT
             != polaris_core_supervisor::selected_core::COMPILED_DEVELOPMENT_CONTRACT
         || APP_INSTALLATION != polaris_core_supervisor::selected_core::COMPILED_INSTALLATION
-        || APP_RECOVERY != polaris_core_supervisor::selected_core::COMPILED_RECOVERY_INVENTORY
     {
         return Err(
             "CORE_BUNDLE_MISMATCH: App and execution gate compiled selections differ".into(),
@@ -73,9 +63,6 @@ pub(crate) fn acquire_at(
         recovery: polaris_core_supervisor::admitted_payload::RecoveryAction::ReinstallCurrentApp,
         detail,
     })?;
-    // Keep the data lease during admission. The cached protected cohort itself
-    // retains no store lease; each real operation below reacquires its own.
-    let _data = selected_operation_data(binary, purpose)?;
     polaris_core_supervisor::admitted_payload::admit_selected(
         polaris_core_supervisor::admitted_payload::UntrustedPayload::bundled(binary),
         purpose,
@@ -104,11 +91,7 @@ pub(crate) fn selection_error(detail: String, purpose: ExecPurpose) -> Admission
             .starts_with(&format!("CORE_ADMISSION_{name}:"))
             .then_some(kind)
     })
-    .unwrap_or(if detail.starts_with("CORE_RECOVERY_UNSUPPORTED:") {
-        K::UnsupportedExactObject
-    } else {
-        K::Unknown
-    });
+    .unwrap_or(K::Unknown);
     AdmissionError {
         kind,
         purpose: Some(purpose),
@@ -123,47 +106,11 @@ pub(crate) fn selection_error(detail: String, purpose: ExecPurpose) -> Admission
         detail,
     }
 }
-fn selected_operation_data(
-    binary: &Path,
-    purpose: ExecPurpose,
-) -> Result<Option<polaris_helper::core_store::VerifiedCore>, AdmissionError> {
-    let reject = |detail: String| AdmissionError {
-        kind: polaris_core_supervisor::admitted_payload::AdmissionErrorKind::Changed,
-        purpose: Some(purpose),
-        member: None,
-        recovery:
-            polaris_core_supervisor::admitted_payload::RecoveryAction::RepairHelperInstallation,
-        detail,
-    };
-    let data = user_store::current_data().map_err(|detail| selection_error(detail, purpose))?;
-    if let Some(data) = &data {
-        let expected = data.directory.join(if cfg!(windows) {
-            "sing-box.exe"
-        } else {
-            "sing-box"
-        });
-        if binary != expected {
-            return Err(reject("recovery source selection changed".into()));
-        }
-    }
-    Ok(data)
-}
 pub(crate) fn prepare_admitted(
     payload: &std::sync::Arc<AdmittedPayload>,
     purpose: ExecPurpose,
 ) -> Result<PreparedExecution, AdmissionError> {
-    let data = selected_operation_data(payload.diagnostic_path(), purpose)?;
-    let execution = payload.prepare(purpose)?;
-    // Linux attaches the recovery store lease to its sealed FD execution. The
-    // macOS/Windows ordinary loader hashes and runs the recovered path directly.
-    #[cfg(target_os = "linux")]
-    if let Some(data) = data {
-        let lease = data.execution_lease()?.try_clone()?;
-        return execution.with_store_lease(std::sync::Arc::new(lease));
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = data;
-    Ok(execution)
+    payload.prepare(purpose)
 }
 pub(crate) fn acquire(purpose: ExecPurpose) -> Result<std::sync::Arc<AdmittedPayload>, String> {
     let binary = crate::runtime::proxy::resolve_core_candidate()?;
@@ -248,9 +195,9 @@ pub(crate) fn stage_installation(
     {
         return Err("CORE_BUNDLE_MISMATCH: installation selection differs".into());
     }
-    let parent = recovery::private_stage_parent(config)?;
+    let parent = private_stage_parent(config)?;
     let directory = parent.join(uuid::Uuid::new_v4().to_string());
-    recovery::create_private_directory(&directory)?;
+    create_private_directory(&directory)?;
     let stage = InstallStage {
         directory,
         manifest,
@@ -351,6 +298,53 @@ pub(crate) fn stage_installation(
     output.write_all(&raw).map_err(|error| error.to_string())?;
     output.sync_all().map_err(|error| error.to_string())?;
     Ok(stage)
+}
+
+fn create_private_directory(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        polaris_helper::core_store::create_current_user_data_directory(path)
+            .map_err(|_| "CORE_RECOVERY_IO: private staging unavailable".into())
+    }
+    #[cfg(not(windows))]
+    {
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(path)
+            .map_err(|_| "CORE_RECOVERY_IO: private staging unavailable".into())
+    }
+}
+fn private_stage_parent(config: &Path) -> Result<PathBuf, String> {
+    // Hold/open the existing app-owned root; never chmod a foreign/linked parent.
+    let _root = open_payload_directory(config)?;
+    let parent = config.join("helper-install-stage");
+    if !parent
+        .try_exists()
+        .map_err(|_| "CORE_RECOVERY_IO: staging state unknown")?
+    {
+        create_private_directory(&parent)?;
+    }
+    let meta =
+        std::fs::symlink_metadata(&parent).map_err(|_| "CORE_RECOVERY_IO: staging unavailable")?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err("CORE_RECOVERY_IO: invalid staging directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != nix::unistd::getuid().as_raw() || meta.mode() & 0o7777 != 0o700 {
+            return Err("CORE_RECOVERY_IO: staging owner or privacy differs".into());
+        }
+    }
+    let _held = open_payload_directory(&parent)?;
+    Ok(parent)
 }
 
 fn open_payload_directory(dir: &Path) -> Result<polaris_helper::core_objects::PayloadDir, String> {

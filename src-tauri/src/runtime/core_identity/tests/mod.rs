@@ -368,12 +368,4 @@ fn recovery_selection_classifies_io_busy_and_damage_without_claiming_unsupported
         assert_eq!(error.kind, kind);
         assert_eq!(error.kind.is_payload_damage(), name == "Changed");
     }
-    assert_eq!(
-        selection_error(
-            "CORE_RECOVERY_UNSUPPORTED: user ACL policy absent".into(),
-            ExecPurpose::RunMain
-        )
-        .kind,
-        K::UnsupportedExactObject
-    );
 }

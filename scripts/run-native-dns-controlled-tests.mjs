@@ -365,10 +365,9 @@ export function sessionTeardown(record, preparation, processId) {
     && record.evidenceKind === 'data-coordination-only'
     && record.registrationChanged === false && record.providerInstalled === false
     && ['retained', 'retained-unopened', 'cleanup-unconfirmed'].includes(record.state) && record.directoryState === 'retained'
-    && (record.providerIdle === null || typeof record.providerIdle === 'boolean')
     && Number.isSafeInteger(record.startedCases) && record.startedCases >= 0 && record.startedCases <= TESTS.length,
   'Native teardown differs from the original session');
-  return (record.state === 'retained' && record.providerIdle === true
+  return (record.state === 'retained'
       || record.state === 'retained-unopened' && record.startedCases === 0)
     && record.caseDrainCheckpointsMatched === true
     && Number.isSafeInteger(record.retainedBytes) && record.retainedBytes >= 0

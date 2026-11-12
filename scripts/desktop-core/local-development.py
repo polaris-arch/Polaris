@@ -4,7 +4,7 @@
 This is not a workflow receipt or a signature. Only the explicit Cargo lane
 consumes these fixed build inputs; formal consumers never accept this schema.
 """
-import argparse, fcntl, re, hashlib, importlib, json, os, platform, shutil, stat, subprocess, sys, tarfile
+import argparse, fcntl, re, hashlib, importlib, json, os, platform, shutil, stat, subprocess, sys, tarfile, tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 SLOT=ROOT/'resources/.local-development/linux'
@@ -68,10 +68,6 @@ def contract_for(doc):
  return {'schema':'polaris-local-development-core-contract-v1','version':row['version'],'sourceCommit':row['sourceCommit'],'sourceTree':row['sourceTree'],
          'platforms':{'linux':{**{k:row[k] for k in ['core','sidecar','archive','sourceCommit','sourceTree']},'providerFingerprint':doc['providerFingerprint'],'trustedExecution':doc['policy']}}}
 def binding(doc):return digest(encoded({k:doc[k] for k in ['configurationSha256','context','row','proof']}))
-def inventory_for(contract,contract_bytes,sizes):
- a=contract['platforms']['linux']['archive']
- return {'schema':'polaris-core-recovery-inventory-v1','platform':'linux','contractSha256':digest(contract_bytes),
-         'archive':{'name':a['name'],'format':'tar.gz','bytes':a['bytes'],'sha256':a['sha256'],'root':a['root']},'memberBytes':sizes}
 def same_buildinfo(actual,row):
  go,build,graph=actual;recorded=row['rawBuildInfo'];lines=recorded.splitlines() if type(recorded) is str else []
  # The filename is an observation of the copied object, not execution identity.
@@ -96,12 +92,6 @@ def verify():
  demand(policy==document['policy'] and document['providerFingerprint']==binding(document),'local protected facts/provider differs')
  contract_bytes=raw(SLOT/'contract.json');contract=json.loads(contract_bytes)
  demand(contract_bytes==encoded(contract_for(document)) and document['contractSha256']==digest(contract_bytes),'local compiled contract differs')
- a=row['archive'];archive=SLOT.parent/'core-recovery/linux'/a['name'];demand(encoded(pin(archive))==encoded({k:a[k] for k in ['bytes','sha256']}),'local archive bytes differ')
- root,members=n.read_archive(archive);demand(root==a['root'] and {root+'/'+k:digest(v) for k,v in members.items()}==a['members'],'local archive member closure differs')
- for key in ['core','sidecar']:
-  value=members[row[key]['member']];demand({'bytes':len(value),'sha256':digest(value)}=={k:row[key][k] for k in ['bytes','sha256']},'local recovery payload differs')
- sizes={root+'/'+k:len(v) for k,v in members.items()}
- demand(raw(SLOT/'inventory.json')==encoded(inventory_for(contract,contract_bytes,sizes)),'local recovery inventory differs')
  return document
 
 def collect(args):
@@ -124,14 +114,16 @@ def collect(args):
  version=c['version'];root='sing-box-'+version+'-linux-amd64';name=root+'.tar.gz'
  def normalized(info):
   info.uid=info.gid=info.mtime=0;info.uname=info.gname='';info.mode=0o755 if info.name.endswith('/sing-box') else 0o644;return info
- archive_path=SLOT.parent/'core-recovery/linux'/name;archive_path.parent.mkdir(parents=True,mode=0o700)
- with tarfile.open(archive_path,'w:gz',format=tarfile.PAX_FORMAT) as archive:
-  for source,member in [(SLOT/'sing-box','sing-box'),(SLOT/'libcronet.so','libcronet.so'),(core/'LICENSE','LICENSE'),(core/'release/licenses/TLS-DEPENDENCY-NOTICES.txt','TLS-DEPENDENCY-NOTICES.txt')]:
-   demand(source.is_file(),'required local source notice missing: '+str(source));archive.add(source,arcname=root+'/'+member,recursive=False,filter=normalized)
- actual_root,members=n.read_archive(archive_path)
+ # The producer row still pins its archive; the archive itself is not kept.
+ with tempfile.TemporaryDirectory() as scratch:
+  archive_path=Path(scratch)/name
+  with tarfile.open(archive_path,'w:gz',format=tarfile.PAX_FORMAT) as archive:
+   for source,member in [(SLOT/'sing-box','sing-box'),(SLOT/'libcronet.so','libcronet.so'),(core/'LICENSE','LICENSE'),(core/'release/licenses/TLS-DEPENDENCY-NOTICES.txt','TLS-DEPENDENCY-NOTICES.txt')]:
+    demand(source.is_file(),'required local source notice missing: '+str(source));archive.add(source,arcname=root+'/'+member,recursive=False,filter=normalized)
+  actual_root,members=n.read_archive(archive_path);archive_pin=pin(archive_path)
  row={'version':version,'target':c['target'],'sourceCommit':c['coreSource']['commit'],'sourceTree':c['coreSource']['tree'],'goVersion':go,'tags':','.join(c['tags']),
       'variant':{'linkage':'shared-purego','libc':'','goarm':'','gomips':'','go386':'','legacy':False},'buildGraph':graph,'rawBuildInfo':build,
-      'archive':{'name':name,**pin(archive_path),'root':actual_root,'members':{root+'/'+k:digest(v) for k,v in members.items()}},
+      'archive':{'name':name,**archive_pin,'root':actual_root,'members':{root+'/'+k:digest(v) for k,v in members.items()}},
       'core':{'member':'sing-box',**core_pin},'sidecar':{'member':'libcronet.so',**sidecar_pin}}
  with t.sealed_execution(SLOT/'sing-box',SLOT/'libcronet.so',core_pin,sidecar_pin) as execution:
   caps=t.probe(SLOT/'sing-box',source=c['coreSource']['commit'],version=version,go_version=go,target=c['target'],expected_sha=core_pin['sha256'],expected_modules=t.producer_module_identities(graph),execution=execution)
@@ -147,7 +139,7 @@ def collect(args):
  doc={'schema':'polaris-local-development-selection-v1','configurationSha256':config_hash,'context':context,'row':row,'proof':proof,'policy':policy}
  doc['providerFingerprint']=binding(doc)
  contract=contract_for(doc);contract_bytes=encoded(contract);doc['contractSha256']=digest(contract_bytes)
- for path,value in [('selection.json',doc),('inputs.json',paths),('contract.json',contract),('inventory.json',inventory_for(contract,contract_bytes,{root+'/'+k:len(v) for k,v in members.items()}))]:
+ for path,value in [('selection.json',doc),('inputs.json',paths),('contract.json',contract)]:
   (SLOT/path).write_bytes(encoded(value));os.chmod(SLOT/path,0o600)
  COMPILED.write_text(configuration_source(doc))
  verify()

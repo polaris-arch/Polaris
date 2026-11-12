@@ -1507,8 +1507,7 @@ def contract(root):
     """Read actual publication configuration; private source-shape audits live in tests."""
     conf = json.loads(io_path(regular(root / 'src-tauri/tauri.windows.conf.json')).read_bytes())
     resources = conf['bundle']['resources']; require_legal_resources(resources)
-    required = ['core-manifest.json', '../resources/win/', '../resources/core-recovery/win/',
-                '../resources/dashboard/', '../resources/data/']
+    required = ['core-manifest.json', '../resources/win/', '../resources/dashboard/', '../resources/data/']
     require(all(resources.count(name) == 1 for name in required), 'required Windows resources must occur once')
     require(len(resources) == len(set(resources)) and all(isinstance(name, str) and '*' not in name
             and (name == 'core-manifest.json' or name.startswith('../') and not name[3:].startswith('../'))

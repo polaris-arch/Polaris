@@ -231,26 +231,6 @@ class Integrity(unittest.TestCase):
             'resources/data/geosite.srs': b'SRS current bytes',
         }.items():
             p = root / name; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(content)
-        # The real platform declaration now carries one independent original
-        # archive and inventory. These inert members are data only and cannot
-        # satisfy any compiled installation/admission or execute as a kernel.
-        row = json.loads((ROOT / 'scripts/desktop-core/release-contract.json').read_bytes())['platforms']['win']
-        archive_name = row['archive']['name']
-        archive_root = row['archive']['root']
-        output = io.BytesIO()
-        members = {'sing-box.exe': b'current core', 'libcronet.dll': b'current cronet', 'LICENSE': b'GPLv3 fixture'}
-        with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-            for name, body in members.items(): archive.writestr(archive_root + '/' + name, body)
-        archive_bytes = output.getvalue()
-        recovery = root / 'resources/core-recovery/win'
-        recovery.mkdir(parents=True)
-        (recovery / archive_name).write_bytes(archive_bytes)
-        (recovery / 'inventory.json').write_text(json.dumps({
-            'schema': 'polaris-core-recovery-inventory-v1', 'platform': 'win',
-            'contractSha256': hashlib.sha256(b'inert fixture contract, no execution policy').hexdigest(),
-            'archive': {'name': archive_name, 'bytes': len(archive_bytes), 'sha256': hashlib.sha256(archive_bytes).hexdigest(), 'root': archive_root, 'format': 'zip'},
-            'memberBytes': {name: len(body) for name, body in members.items()},
-        }))
         resources, sources = w.source_inventory(root)
         return {'resources': resources, 'sources': sources,
                 'cargo': {'targetDirectory': str(root / 'target'), 'releaseDirectory': str(root / 'target/release'),

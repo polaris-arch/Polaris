@@ -13,10 +13,9 @@ import test from 'node:test';
 import { digest } from './source-graph.mjs';
 import { consumeRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, verifyPackagedRelease,
-  verifyReleaseCore, verifyPackagedCore, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
+  verifyReleaseCore, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
 import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
-import { verifyRecoveryResource } from './recovery.mjs';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -156,7 +155,7 @@ test('all four release archives keep exact cores, colocated libraries and notice
   assert.equal(Object.keys(receipts).length, 4);
   for (const [key, row] of Object.entries(f.contract.platforms)) {
     const path = join(f.root, 'resources', key, row.core.member);
-    const receipt = verifyPackagedCore(f.root, f.manifest, key, path, f.run);
+    const receipt = verifyPackagedRelease(f.root, f.manifest, key, path, f.run);
     assert.equal(receipt.schema, 'polaris-app-release-consumption-v1');
     assert.deepEqual(receipt.producer, row);
     assert(existsSync(join(dirname(path), 'core-release/LICENSE')));
@@ -166,7 +165,7 @@ test('all four release archives keep exact cores, colocated libraries and notice
   assert(f.calls.every((url) => !url.includes('proxy.golang.org') && !url.includes('raw.githubusercontent.com')));
   assert(!existsSync(join(f.root, 'resources/.source-receipts')));
 }));
-test('normal release consumption preserves each original compressed recovery archive independently', async () => withFixture(async f => {
+test('normal release consumption extracts each original archive with the bounded native extractor', async () => withFixture(async f => {
   const extractions = [];
   const run = (command, args, options) => {
     if (args[1]?.endsWith('release-archive.py')) {
@@ -184,25 +183,6 @@ test('normal release consumption preserves each original compressed recovery arc
   };
   await consumeRelease(f.root, f.manifest, undefined, { ...f, run });
   assert.deepEqual(extractions.sort(), Object.keys(RELEASE_TARGETS).sort());
-  for (const [key, row] of Object.entries(f.contract.platforms)) {
-    const directory = join(f.root, 'resources/core-recovery', key);
-    const archive = join(directory, row.archive.name);
-    assert.deepEqual(readFileSync(archive), f.transport.get(row.releaseAsset.url));
-    if (process.platform !== 'win32') {
-      assert.equal(fs.statSync(archive).mode & 0o7777, 0o644);
-    }
-    const inventory = verifyRecoveryResource(directory, row, key, f.manifest.desktopRelease.contractSha256, join(f.root, 'resources', key));
-    assert.equal(inventory.archive.sha256, row.archive.sha256);
-    assert.equal(inventory.archive.format, key === 'win' ? 'zip' : 'tar.gz');
-    assert.deepEqual(Object.keys(inventory.memberBytes).sort(), Object.keys(row.archive.members).sort());
-    assert.equal(inventory.memberBytes[Object.keys(row.archive.members).find(n => n.endsWith('/' + row.core.member))], row.core.bytes);
-    assert(!Object.hasOwn(inventory, 'members')); // Hash allowlist stays in the selected contract.
-    const runtime = join(f.root, 'resources', key, row.core.member);
-    const pinned = readFileSync(runtime); writeFileSync(runtime, Buffer.alloc(pinned.length));
-    assert.deepEqual(readFileSync(archive), f.transport.get(row.releaseAsset.url));
-    writeFileSync(runtime, pinned);
-    if (!row.sidecar) assert(!Object.keys(inventory.memberBytes).some(n => /libcronet\./.test(n)));
-  }
 }));
 
 test('cold archive failure returns through acquiring finally without retries or replacement', async () => {
@@ -243,68 +223,9 @@ test('cold archive failure returns through acquiring finally without retries or 
     assert(ownedWork); assert(!existsSync(ownedWork));
     assert(!existsSync(join(directory, '.release-consumer.lock')));
     assert.deepEqual(readdirSync(directory).sort(), entries);
-    assert.deepEqual(resources(f), before, 'old payloads, recovery archives, receipts and unrelated work survive');
+    assert.deepEqual(resources(f), before, 'old payloads, receipts and unrelated work survive');
   });
 });
-test('real recovery producer publishes0644 data even when the acquired archive is group/world writable', async () => withFixture(async f => {
-  let observed = false;
-  const run = (command, args, options) => {
-    if (typeof args[1] === 'string' && args[1].endsWith('release-archive.py') && args[3]?.includes('unpacked-linux')) {
-      fs.chmodSync(args[2], 0o666); observed = true;
-    }
-    return f.run(command, args, options);
-  };
-  await consumeRelease(f.root, f.manifest, ['linux'], { ...f, run });
-  assert(observed, 'actual acquisition/extraction path was exercised');
-  const row = f.contract.platforms.linux, archive = join(f.root, 'resources/core-recovery/linux', row.archive.name);
-  assert.deepEqual(readFileSync(archive), f.transport.get(row.releaseAsset.url));
-  if (process.platform !== 'win32') assert.equal(fs.statSync(archive).mode & 0o7777, 0o644);
-}));
-test('production package verification rejects bad recovery bytes, sizes, extras and metadata', async () => withFixture(async f => {
-  await consumeRelease(f.root, f.manifest, ['linux'], f);
-  const row = f.contract.platforms.linux, directory = join(f.root, 'resources/core-recovery/linux');
-  const archive = join(directory, row.archive.name), original = readFileSync(archive);
-  const inventory = join(directory, 'inventory.json'), originalInventory = readFileSync(inventory);
-  const verify = () => verifyPackagedCore(f.root, f.manifest, 'linux', join(f.root, 'resources/linux/sing-box'), f.run);
-  const corrupt = Buffer.from(original); corrupt[0] ^= 1; writeFileSync(archive, corrupt);
-  assert.throws(verify, /Recovery compressed bytes differ/); writeFileSync(archive, original);
-  for (const mutate of [v => { v.contractSha256 = '0'.repeat(64); }, v => { v.memberBytes[Object.keys(v.memberBytes)[0]]++; }, v => { v.authority = true; }]) {
-    const value = JSON.parse(originalInventory); mutate(value); writeFileSync(inventory, JSON.stringify(value));
-    assert.throws(verify, /Recovery inventory differs/);
-  }
-  writeFileSync(inventory, originalInventory); writeFileSync(join(directory, 'extra'), 'unknown');
-  assert.throws(verify, /Extra\/missing recovery/); rmSync(join(directory, 'extra'));
-  rmSync(archive); assert.throws(verify, /Extra\/missing recovery/);
-}));
-test('recovery publication participates in the original rollback and preserves unselected platforms', async () => withFixture(async f => {
-  await consumeRelease(f.root, f.manifest, undefined, f); const original = resources(f);
-  const rename = (from, to) => {
-    if (from.replaceAll('\\', '/').endsWith('/stage/core-recovery')) throw Error('recovery publication rejected');
-    renameSync(from, to);
-  };
-  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, rename }), /recovery publication rejected/);
-  assert.deepEqual(resources(f), original);
-  await consumeRelease(f.root, f.manifest, ['linux'], f);
-  const current = resources(f);
-  for (const key of ['win', 'mac-x64', 'mac-arm64']) {
-    for (const [name, bytes] of Object.entries(original).filter(([name]) => name.startsWith('core-recovery/' + key + '/'))) assert.equal(current[name], bytes);
-  }
-}));
-test('final carrier verification checks its own recovery copy without borrowing the source checkout', async () => withFixture(async f => {
-  await consumeRelease(f.root, f.manifest, ['linux'], f);
-  const carrier = join(f.root, 'final/resources'), row = f.contract.platforms.linux;
-  const directory = join(carrier, 'core-recovery/linux');
-  cpSync(join(f.root, 'resources/linux'), join(carrier, 'linux'), { recursive: true });
-  cpSync(join(f.root, 'resources/core-recovery/linux'), directory, { recursive: true });
-  const verify = () => verifyPackagedCore(f.root, f.manifest, 'linux', join(carrier, 'linux/sing-box'), f.run);
-  assert.equal(verify().platform, 'linux');
-  const archive = join(directory, row.archive.name), original = readFileSync(archive);
-  const corrupt = Buffer.from(original); corrupt[0] ^= 1; write(archive, corrupt);
-  assert.throws(verify, /Recovery compressed bytes differ/); write(archive, original);
-  rmSync(join(directory, 'inventory.json'));
-  assert.throws(verify, /Extra\/missing recovery/);
-  assert.equal(readFileSync(join(f.root, 'resources/core-recovery/linux', row.archive.name)).equals(original), true);
-}));
 test('unknown/duplicate/CLI-only architecture selection rejects without resources writes', async () => withFixture(async (f) => {
   for (const keys of [['linux', 'linux'], ['linux-arm64'], []]) await assert.rejects(consumeRelease(f.root, f.manifest, keys, f));
   assert.deepEqual(resources(f), {}); assert.equal(f.calls.length, 0);
@@ -473,8 +394,7 @@ test('actual inventory CLI admits precisely the release members and rejects miss
       : key === 'win' ? [carrier] : [join(carrier, 'macos/Polaris.app/Contents/Resources')];
     for (const scope of scopes) {
       cpSync(join(f.root, 'src-tauri/core-manifest.json'), join(scope, 'core-manifest.json'), { recursive: true });
-      for (const name of ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md', `resources/${key}`,
-        `resources/core-recovery/${key}`, 'resources/data', 'resources/dashboard']) {
+      for (const name of ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md', `resources/${key}`, 'resources/data', 'resources/dashboard']) {
         mkdirSync(dirname(join(scope, '_up_', name)), { recursive: true });
         cpSync(join(f.root, name), join(scope, '_up_', name), { recursive: true });
       }
@@ -520,23 +440,14 @@ test('Mac consumption and final bundle entry enforce strict native verification 
   assert.deepEqual(receipts[key].macCodeSignature, { state: 'signed', cdHash: '4'.repeat(40) });
   const carrier = join(f.root, 'signature-carrier'), runtime = join(carrier, key);
   cpSync(join(f.root, 'resources', key), runtime, { recursive: true });
-  const recovery = join(carrier, 'core-recovery', key);
-  cpSync(join(f.root, 'resources/core-recovery', key), recovery, { recursive: true });
   const core = join(runtime, 'sing-box'), before = digest(readFileSync(core));
-  assert.equal(verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
-  const archive = join(recovery, f.contract.platforms[key].archive.name), archiveBytes = readFileSync(archive);
-  const corrupt = Buffer.from(archiveBytes); corrupt[0] ^= 1; write(archive, corrupt);
-  assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin'), /Recovery compressed bytes differ/);
-  write(archive, archiveBytes);
-  const inventory = join(recovery, 'inventory.json'), inventoryBytes = readFileSync(inventory); rmSync(inventory);
-  assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin'), /Extra\/missing recovery/);
-  write(inventory, inventoryBytes);
-  for (const run of badRuns) assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, run, 'darwin'), /signature|CDHash/);
+  assert.equal(verifyPackagedRelease(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
+  for (const run of badRuns) assert.throws(() => verifyPackagedRelease(f.root, f.manifest, key, core, run, 'darwin'), /signature|CDHash/);
   const file = join(f.root, 'resources/.release-receipts', `${key}.json`), original = readFileSync(file);
   for (const signature of [undefined, { state: 'invalid', cdHash: '4'.repeat(40) }, { state: 'signed', cdHash: '5'.repeat(40) }, { state: 'unsigned', cdHash: null }]) {
     const value = JSON.parse(original); if (signature === undefined) delete value.macCodeSignature; else value.macCodeSignature = signature;
     const { schema, fingerprint, ...facts } = value; value.fingerprint = digest(portableCanonical(facts)); write(file, encode(value));
-    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin'), /signature|CDHash/);
+    assert.throws(() => verifyPackagedRelease(f.root, f.manifest, key, core, f.run, 'darwin'), /signature|CDHash/);
   }
   write(file, original); assert.equal(digest(readFileSync(core)), before);
   assert(f.inspections.some(([command, flag, strict]) => command === 'codesign' && flag === '--verify' && strict === '--strict'));
@@ -547,9 +458,9 @@ test('unsigned Intel release retains only the existing thin-x86_64 native except
   const key = 'mac-x64', receipts = await consumeRelease(f.root, f.manifest, [key], { ...f, host: 'darwin' });
   assert.deepEqual(receipts[key].macCodeSignature, { state: 'unsigned', cdHash: null });
   const core = join(f.root, 'resources', key, 'sing-box');
-  assert.equal(verifyPackagedCore(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
+  assert.equal(verifyPackagedRelease(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
   const run = (command, args, options) => command === 'file' ? 'Mach-O universal x86_64 arm64' : f.run(command, args, options);
-  assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, core, run, 'darwin'), /thin Intel/);
+  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, key, core, run, 'darwin'), /thin Intel/);
 }, { unsignedIntel: true }));
 test('actual fetch CLI rejects malformed release mode and an incomplete selection', async () => withFixture(async (f) => {
   cpSync(join(repo, 'scripts'), join(f.root, 'scripts'), { recursive: true });
@@ -908,67 +819,39 @@ test('final Mac core uses its complete explicit release receipt for both targets
   assert.equal(existsSync(join(f.root, 'resources/.source-receipts')), false);
   for (const key of ['mac-x64', 'mac-arm64']) {
     const stage = join(f.root, 'final-carrier', key); cpSync(join(f.root, 'resources', key), stage, { recursive: true });
-    cpSync(join(f.root, 'resources/core-recovery', key), join(dirname(stage), 'core-recovery', key), { recursive: true });
     const binary = join(stage, 'sing-box'), before = readFileSync(binary);
-    const receipt = verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin');
+    const receipt = verifyPackagedRelease(f.root, f.manifest, key, binary, f.run, 'darwin');
     assert.equal(receipt.schema, 'polaris-app-release-consumption-v1');
     assert.deepEqual(receipt.producer, f.contract.platforms[key]); assert.deepEqual(readFileSync(binary), before);
     assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
   }
-}));
-test('final Mac recovery verifies delivered archive and inventory instead of intact build resources', async () => withFixture(async (f) => {
-  await consumeRelease(f.root, f.manifest, ['mac-x64', 'mac-arm64'], { ...f, host: 'darwin' });
-  for (const key of ['mac-x64', 'mac-arm64']) {
-    const resources = join(f.root, 'recovery-final', key, 'Contents/Resources/_up_/resources');
-    const payload = join(resources, key), recovery = join(resources, 'core-recovery', key);
-    cpSync(join(f.root, 'resources', key), payload, { recursive: true });
-    cpSync(join(f.root, 'resources/core-recovery', key), recovery, { recursive: true });
-    const binary = join(payload, 'sing-box');
-    assert.equal(verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin').platform, key);
-    const archive = join(recovery, f.contract.platforms[key].archive.name), original = readFileSync(archive);
-    const changed = Buffer.from(original); changed[changed.length - 1] ^= 1; write(archive, changed);
-    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Recovery compressed bytes differ/);
-    write(archive, original);
-    const inventory = join(recovery, 'inventory.json'), raw = readFileSync(inventory);
-    const altered = JSON.parse(raw); altered.platform = key === 'mac-arm64' ? 'mac-x64' : 'mac-arm64'; write(inventory, encode(altered));
-    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Recovery inventory differs/);
-    write(inventory, raw); rmSync(archive);
-    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Extra\/missing recovery/);
-    symlinkSync(join(f.root, 'resources/core-recovery', key, f.contract.platforms[key].archive.name), archive);
-    assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin'), /Linked or non-regular recovery/);
-    rmSync(archive); write(archive, original);
-    assert.equal(verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin').platform, key);
-    assert.deepEqual(readFileSync(join(f.root, 'resources/core-recovery', key, f.contract.platforms[key].archive.name)), original);
-  }
-  assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
 }));
 test('Mac release selection rejects invalid or missing release receipts without using present legacy receipts', async () => withFixture(async (f) => {
   await consumeRelease(f.root, f.manifest, ['mac-arm64'], { ...f, host: 'darwin' });
   const core = join(f.root, 'resources/mac-arm64/sing-box');
   write(join(f.root, 'resources/.source-receipts/mac-arm64.json'), 'legacy must not be read');
   for (const desktopRelease of [null, {}, { ...f.manifest.desktopRelease, contractSha256: '0'.repeat(64) }]) {
-    assert.throws(() => verifyPackagedCore(f.root, { ...f.manifest, desktopRelease }, 'mac-arm64', core, f.run, 'darwin'));
+    assert.throws(() => verifyPackagedRelease(f.root, { ...f.manifest, desktopRelease }, 'mac-arm64', core, f.run, 'darwin'));
   }
   const receipt = join(f.root, 'resources/.release-receipts/mac-arm64.json'); rmSync(receipt);
-  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', core, f.run, 'darwin'));
+  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'mac-arm64', core, f.run, 'darwin'));
   assert.equal(readFileSync(join(f.root, 'resources/.source-receipts/mac-arm64.json'), 'utf8'), 'legacy must not be read');
 }));
 test('final Mac release verification closes changed CDHash, bytes, missing notice and added sidecar', async () => withFixture(async (f) => {
   await consumeRelease(f.root, f.manifest, ['mac-arm64'], { ...f, host: 'darwin' });
   const stage = join(f.root, 'final-carrier/mac-arm64'); cpSync(join(f.root, 'resources/mac-arm64'), stage, { recursive: true });
-  cpSync(join(f.root, 'resources/core-recovery/mac-arm64'), join(dirname(stage), 'core-recovery/mac-arm64'), { recursive: true });
   const binary = join(stage, 'sing-box'), raw = readFileSync(binary);
-  write(binary, Buffer.alloc(raw.length)); assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin')); write(binary, raw);
+  write(binary, Buffer.alloc(raw.length)); assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin')); write(binary, raw);
   const wrong = (cmd, args, opts) => {
     const output = f.run(cmd, args, opts);
     return cmd === 'codesign' && args[0] === '--display'
       ? output.replace(/CDHash=([a-f0-9]{40})/, (_match, hash) => `CDHash=${hash[0] === '0' ? '1' : '0'}${hash.slice(1)}`) : output;
   };
-  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, wrong, 'darwin'), /signature/);
+  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'mac-arm64', binary, wrong, 'darwin'), /signature/);
   const notice = join(stage, 'core-release/NOTICE'); const content = readFileSync(notice); rmSync(notice);
-  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin')); write(notice, content);
+  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin')); write(notice, content);
   write(join(stage, 'libcronet.dylib'), 'extra');
-  assert.throws(() => verifyPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin'), /Static carrier contains Cronet sidecar/);
+  assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'mac-arm64', binary, f.run, 'darwin'), /Static carrier contains Cronet sidecar/);
   assert.deepEqual(readFileSync(binary), raw);
 }));
 
@@ -997,14 +880,13 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
       for (const key of ['mac-x64', 'mac-arm64']) {
         const payload = join(mount, `${key}.app/Contents/Resources`, key);
         cpSync(join(f.root, 'resources', key), payload, { recursive: true });
-        cpSync(join(f.root, 'resources/core-recovery', key), join(dirname(payload), 'core-recovery', key), { recursive: true });
         const binary = join(payload, 'sing-box'), original = readFileSync(binary);
-        assert.equal(verifyPackagedCore(f.root, f.manifest, key, binary, f.run, 'darwin').platform, key);
+        assert.equal(verifyPackagedRelease(f.root, f.manifest, key, binary, f.run, 'darwin').platform, key);
         // Canonicalizing only the new temporary root does not admit a linked
         // payload directory, linked core, or the original alias spelling.
         const linkedDirectory = join(mount, `${key}-linked-payload`);
         symlinkSync(payload, linkedDirectory, 'dir');
-        assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, join(linkedDirectory, 'sing-box'), f.run, 'darwin'), /Linked release ancestor/);
+        assert.throws(() => verifyPackagedRelease(f.root, f.manifest, key, join(linkedDirectory, 'sing-box'), f.run, 'darwin'), /Linked release ancestor/);
         const linkedCore = join(mount, `${key}-linked-core`, 'sing-box');
         mkdirSync(dirname(linkedCore)); symlinkSync(binary, linkedCore);
         assert(fs.lstatSync(linkedCore).isSymbolicLink(), 'the adversary must remain a real filesystem link');
@@ -1022,10 +904,10 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
           assert.equal(command, 'git', 'Final-carrier rejection must precede core inspection');
           return f.run(command, args, options);
         };
-        assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, linkedCore, noCoreInspection, 'darwin'),
+        assert.throws(() => verifyPackagedRelease(f.root, f.manifest, key, linkedCore, noCoreInspection, 'darwin'),
           { message: modeDiffers ? 'Final release core permissions differ' : `Non-regular release path: ${linkedCore}` });
         const aliasBinary = join(mountAlias, `${key}.app/Contents/Resources`, key, 'sing-box');
-        assert.throws(() => verifyPackagedCore(f.root, f.manifest, key, aliasBinary, f.run, 'darwin'), /Linked release ancestor/);
+        assert.throws(() => verifyPackagedRelease(f.root, f.manifest, key, aliasBinary, f.run, 'darwin'), /Linked release ancestor/);
         assert.deepEqual(readFileSync(binary), original);
       }
     }

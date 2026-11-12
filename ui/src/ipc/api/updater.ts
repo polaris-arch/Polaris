@@ -1,6 +1,6 @@
 import { invoke, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { CoreVersionInfo, CoreRecoveryState } from '../../contracts/types/update';
+import type { CoreVersionInfo } from '../../contracts/types/update';
 
 export interface VersionInfo {
   debugReportAvailable?: boolean;
@@ -287,11 +287,5 @@ export const coreApi = {
   },
   async getVersionInfo(): Promise<CoreVersionInfo> {
     return invoke(IPC_CHANNELS.CORE_GET_VERSION_INFO);
-  },
-  async checkOfflineRecovery(): Promise<CoreRecoveryState> {
-    return invoke(IPC_CHANNELS.CORE_CHECK_OFFLINE_RECOVERY);
-  },
-  async restoreBundledData(): Promise<CoreRecoveryState> {
-    return invoke(IPC_CHANNELS.CORE_RESTORE_BUNDLED_DATA);
   },
 };
