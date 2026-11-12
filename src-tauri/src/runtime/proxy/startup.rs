@@ -2898,26 +2898,6 @@ impl ProxyRuntime {
             if self.gate.generation() != my_gen {
                 return Ok(None);
             }
-            // 特权内核（root / SYSTEM）在 `-D` 根下首次建的 fake-IP 恢复日志属特权账户，之后直启的
-            // 用户态内核打不开（macOS root 0600；Windows 内核拒绝非 SYSTEM 进程接管 SYSTEM 属主的日志）。
-            // 由 App 以当前用户身份预建空文件（bbolt 对空文件原地初始化）；已存在则不动。
-            let journal = self.config.join("sing-box-hot-fakeip-v1.db");
-            if !journal.exists() {
-                #[cfg(windows)]
-                let created = polaris_helper::core_store::create_current_user_data_file(&journal);
-                #[cfg(not(windows))]
-                let created = {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&journal)
-                };
-                if let Err(error) = created {
-                    log::warn!("预建 fake-IP 恢复日志失败，之后直启内核可能打不开特权内核建的文件: {error}");
-                }
-            }
         }
         // Content is installed only by the administrator transaction. Runtime
         // status must attest the compiled id before any pinned birth request.
