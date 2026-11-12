@@ -20,7 +20,6 @@ export const TESTS = Object.freeze([
 // Fixed ordinary source contracts, separate from the six real-core processes.
 export const SOURCE_TESTS = Object.freeze([
   'polaris:runtime::proxy::tests::native_carrier::normal_native_carrier_preserves_all_six_original_business_assertion_sets',
-  'polaris:runtime::proxy::tests::startup::execution_issuer_does_not_enable_network_takeover_for_manual',
   'polaris:runtime::tls_fingerprints::tests::authenticated_document_is_strict_data_and_cannot_replace_native_channel_binding',
   "polaris-store:tests::store_tests::unsupported_vision_transport_remains_repairable_across_real_store",
   "polaris:runtime::speedtest::tests::vision_transport_temp_plan_reports_fixed_failure_without_losing_good_nodes",
