@@ -278,7 +278,7 @@ pub(crate) struct CurrentUserData {
     volume: u32,
 }
 impl CurrentUserData {
-    pub(crate) fn open(root: &Path, create: bool) -> io::Result<Self> {
+    pub(crate) fn open(root: &Path) -> io::Result<Self> {
         let process = ProcessIdentity::capture()?;
         let mut parts = root.components();
         let prefix = match parts.next() {
@@ -330,15 +330,6 @@ impl CurrentUserData {
         for (index, name) in names.iter().enumerate() {
             path.push(name);
             let last = index + 1 == names.len();
-            if create && last {
-                match std::fs::symlink_metadata(&path) {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        create_private_directory(&path, &process.sid)?
-                    }
-                    Err(e) => return Err(e),
-                    Ok(_) => {}
-                }
-            }
             let file = open(&path, true, true)?;
             let actual = identity(&file)?;
             if actual.0 != id.0 {
@@ -482,12 +473,6 @@ impl CurrentUserData {
         }
         Ok(())
     }
-    /// Metadata/FileID recheck of the admitted data observation; no hot rescan.
-    pub(crate) fn stamp(&self, path: &Path) -> io::Result<String> {
-        let directory = std::fs::symlink_metadata(path)?.is_dir();
-        let held = open(path, directory, false)?;
-        self.stamp_named_held(&held, path, directory)
-    }
     /// Bind a consumer's actual opened object, not a separately checked name.
     pub(crate) fn stamp_named_held(
         &self,
@@ -514,20 +499,6 @@ impl CurrentUserData {
             i.nNumberOfLinks
         ))
     }
-    /// Do not pretend a directory flush is supported or flush the whole volume.
-    pub(crate) fn barrier(&self) -> io::Result<()> {
-        self.guard()?;
-        if self.anchors.len() < 2 {
-            return Err(changed("data root and parent custody absent"));
-        }
-        // Only the last directory can be created by this scope. Flush its
-        // metadata first and then its parent's new directory entry; flushing
-        // the child alone cannot justify a newly durable recovery namespace.
-        for anchor in self.anchors.iter().rev().take(2) {
-            flush_barrier_file(&open_barrier_anchor(anchor)?)?;
-        }
-        self.guard()
-    }
 }
 
 // Public callers supply only a new leaf, never an owner or security policy.
@@ -537,7 +508,7 @@ pub(crate) fn create_current_user_directory(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| changed("new data parent absent"))?;
-    let scope = CurrentUserData::open(parent, false)?;
+    let scope = CurrentUserData::open(parent)?;
     let leaf = path
         .file_name()
         .ok_or_else(|| changed("new data leaf absent"))?;
@@ -547,7 +518,7 @@ pub(crate) fn create_current_user_file(path: &Path) -> io::Result<File> {
     let parent = path
         .parent()
         .ok_or_else(|| changed("new data parent absent"))?;
-    let scope = CurrentUserData::open(parent, false)?;
+    let scope = CurrentUserData::open(parent)?;
     let leaf = path
         .file_name()
         .ok_or_else(|| changed("new data leaf absent"))?;
@@ -658,30 +629,8 @@ fn judge_anchor(
     .map_err(acl_error)
 }
 
-// Shared by the real transaction precondition and the native capability test.
-// These I/O primitives confer no namespace or execution authority by themselves.
-fn open_barrier_anchor(anchor: &Anchor) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(&anchor.path)?;
-    if identity(&file)? != anchor.id {
-        return Err(changed("user data barrier identity changed"));
-    }
-    Ok(file)
-}
-fn flush_barrier_file(file: &File) -> io::Result<()> {
-    match file.sync_all() {
-        // Preserve the actual native error as the cause, including lastError.
-        Err(e) if matches!(e.raw_os_error(), Some(1 | 6 | 50)) => {
-            Err(io::Error::new(io::ErrorKind::Unsupported, e))
-        }
-        result => result,
-    }
-}
-
+// Test fixture producer: production data scopes never create their root.
+#[cfg(test)]
 fn create_private_directory(path: &Path, sid: &str) -> io::Result<()> {
     let sddl: Vec<u16> = format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
         .encode_utf16()

@@ -353,19 +353,21 @@ fn maintenance_uses_selected_helper_pin_without_core_files_and_rejects_before_ex
 }
 
 #[test]
-fn recovery_selection_classifies_io_busy_and_damage_without_claiming_unsupported_can_be_repaired() {
+fn selection_classifies_only_a_missing_payload_as_damage() {
     use polaris_core_supervisor::admitted_payload::AdmissionErrorKind as K;
-    for (name, kind) in [
-        ("Changed", K::Changed),
-        ("Busy", K::Busy),
-        ("Io", K::Io),
-        ("Unknown", K::Unknown),
+    for (detail, kind) in [
+        (
+            "CORE_ADMISSION_Missing: selected packaged payload missing",
+            K::Missing,
+        ),
+        (
+            "CORE_ADMISSION_Changed: selected payload changed",
+            K::Unknown,
+        ),
+        ("CORE_BUNDLE_MISMATCH: bundled core differs", K::Unknown),
     ] {
-        let error = selection_error(
-            format!("CORE_ADMISSION_{name}: selected recovery unavailable"),
-            ExecPurpose::CheckConfig,
-        );
+        let error = selection_error(detail.to_owned(), ExecPurpose::CheckConfig);
         assert_eq!(error.kind, kind);
-        assert_eq!(error.kind.is_payload_damage(), name == "Changed");
+        assert_eq!(error.kind.is_payload_damage(), kind == K::Missing);
     }
 }

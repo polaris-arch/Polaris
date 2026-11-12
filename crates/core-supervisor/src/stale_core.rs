@@ -48,6 +48,8 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
@@ -69,7 +71,7 @@ pub struct CoreProcess {
     pub raw: String,
     /// 进程属主相对本进程的归类，扫描时与命令行一并读出。
     pub owner: ProcessOwner,
-    /// 扫描时留住的进程把柄（Linux / Windows，见 [`ProcessHold`]）。
+    /// 扫描时留住的进程把柄（Linux / macOS / Windows，见 [`ProcessHold`]）。
     pub hold: ProcessHold,
 }
 
@@ -143,7 +145,8 @@ fn owner_from_token(facts: Option<TokenUserFacts>) -> ProcessOwner {
 /// 扫描时留住的进程把柄。
 ///
 /// Windows retains a query handle plus creation time; Linux retains a pidfd bound to
-/// the same open proc-directory snapshot. Other Unix platforms have no signal authority.
+/// the same open proc-directory snapshot; macOS retains the PID's start time and re-reads it
+/// before each signal. Other Unix platforms have no signal authority.
 /// 一把仅带查询权限的进程句柄，连同当时读到的创建时间。句柄开着期间
 /// 这个 pid 不会被系统分给别的进程，所以宽限期前后说的是同一个进程；结束时另开一把只带结束权限
 /// 的句柄，创建时间对上才动手（`ProcessHold::terminate`，仅 Windows 有）。
@@ -156,6 +159,8 @@ pub struct ProcessHold {
     held: Option<std::sync::Arc<windows::HeldProcess>>,
     #[cfg(target_os = "linux")]
     held: Option<std::sync::Arc<linux::HeldProcess>>,
+    #[cfg(target_os = "macos")]
+    held: Option<std::sync::Arc<macos::HeldProcess>>,
 }
 
 impl std::fmt::Debug for ProcessHold {
@@ -165,7 +170,7 @@ impl std::fmt::Debug for ProcessHold {
 }
 
 impl PartialEq for ProcessHold {
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     fn eq(&self, other: &Self) -> bool {
         match (&self.held, &other.held) {
             (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
@@ -174,7 +179,7 @@ impl PartialEq for ProcessHold {
         }
     }
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     fn eq(&self, _other: &Self) -> bool {
         true
     }
@@ -202,14 +207,13 @@ impl ProcessHold {
 
 impl ProcessHold {
     /// Only a retained native identity can authorize stale-process termination.
-    /// macOS arbitrary process-table entries have no retained Child and remain unresolved.
     #[must_use]
     pub fn has_identity(&self) -> bool {
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
             self.held.is_some()
         }
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         {
             false
         }
@@ -220,11 +224,11 @@ impl ProcessHold {
 impl ProcessHold {
     #[must_use]
     pub fn signal(&self, signal: crate::process_killer::Signal) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             self.held.as_deref().is_some_and(|held| held.signal(signal))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = signal;
             false
@@ -239,7 +243,11 @@ impl ProcessHold {
                 .as_deref()
                 .and_then(linux::HeldProcess::is_running)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            self.held.as_deref().map(macos::HeldProcess::is_running)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             None
         }
@@ -247,7 +255,7 @@ impl ProcessHold {
 }
 
 /// 扫描时与结束前各读一次的创建时间是否指同一个进程：两次都读到且相等。任何一次没读到都不算。
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn same_birth(held: Option<u64>, target: Option<u64>) -> bool {
     matches!((held, target), (Some(held), Some(target)) if held == target)
 }
@@ -644,16 +652,29 @@ pub fn parse_ps_output(stdout: &str, self_pid: u32) -> Vec<CoreProcess> {
 /// macOS 孤儿扫描：`ps -axo pid=,uid=,args=` 全量列进程（`-a` 含他人进程 → **root 起的核也在列**，
 /// 这正是 helper 提权路径遗留的孤儿；`-x` 含无控制终端的后台进程）。
 ///
+/// 本用户的 `run -c` 行另记下进程启动时间（[`ProcessHold`]），结束前按同一 pid 复核；root 的行
+/// 不记，用户态结束不了它们。
+///
 /// **为什么必须有**：此前本函数在非 Linux 恒返空 ⇒ macOS 的启动期清扫是彻底的 no-op ⇒
 /// helper 以 root 遗留的孤儿核永不被发现、永不被清理，一直占着 `cache.db` ⇒ 之后每次起核
 /// 都 `initialize cache-file: timeout`，连切回 systemProxy 也起不来（真机实证的卡死链）。
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn scan_running_cores() -> Vec<CoreProcess> {
+    let scanned = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64);
     let Ok(out) = macos_ps::command(&["-axo", "pid=,uid=,args="]).output() else {
         return Vec::new();
     };
-    parse_ps_output(&String::from_utf8_lossy(&out.stdout), std::process::id())
+    let mut rows = parse_ps_output(&String::from_utf8_lossy(&out.stdout), std::process::id());
+    for row in rows
+        .iter_mut()
+        .filter(|row| row.owner == ProcessOwner::SameUser && row.raw.contains(" run -c "))
+    {
+        row.hold = macos::hold(row.pid, scanned);
+    }
+    rows
 }
 
 /// Windows 孤儿扫描：枚举进程，逐个向系统要命令行（切成 argv）与令牌的用户，并留住句柄。

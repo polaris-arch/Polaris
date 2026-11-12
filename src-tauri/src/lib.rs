@@ -807,10 +807,10 @@ pub fn run() {
             }
 
             // 把现役内核路径注入 UpdaterRuntime（版本读取的探测目标）。Android / iOS 的内核不是
-            // 独立可执行文件，没有可探测的对象。
+            // 独立可执行文件，没有可探测的对象。这里只取路径，整文件哈希留给首次起核。
             #[cfg(desktop)]
-            match runtime::core_identity::acquire(runtime::core_identity::ExecPurpose::CheckConfig) {
-                Ok(core) => app_runtime.updater().with_core_binary(core.diagnostic_path().to_path_buf()),
+            match runtime::proxy::resolve_core_candidate() {
+                Ok(core) => app_runtime.updater().with_core_binary(core),
                 Err(e) => log::warn!("未解析到随包内核，版本读取将报未知：{e}"),
             }
             // ── C1 启动期系统代理崩溃恢复 ──

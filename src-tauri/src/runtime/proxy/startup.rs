@@ -3080,7 +3080,7 @@ impl ProxyRuntime {
                 )
                 .await;
             // Native exit and reservation compare-remove committed together.
-            // The helper backend remains sticky; no platform NoOwner was proved.
+            // No platform NoOwner was proved.
             let _ = confirmed_stopped;
             return Err(message.into());
         }

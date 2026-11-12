@@ -24,6 +24,11 @@ impl WindowsMaintenanceGuard {
     }
 }
 
+/// Anything but a confirmed ordinary process (SYSTEM, impersonating, unreadable).
+pub(super) fn privileged() -> bool {
+    !matches!(issuer::is_system_actor(), Ok(false))
+}
+
 pub(super) fn unavailable() -> AdmissionError {
     AdmissionError::new(
         AdmissionErrorKind::UnsupportedExactObject,
@@ -42,7 +47,7 @@ pub(super) fn protect_members(
     input: &UntrustedPayload,
     policy: &SelectedPolicy,
 ) -> Result<ProtectedMembers, AdmissionError> {
-    if issuer::system_actor().is_err() {
+    if !issuer::is_system_actor()? {
         return super::direct::protect_members(input, policy).map(ProtectedMembers::Direct);
     }
     Ok(ProtectedMembers::Issuer(Arc::new(issuer::issue(

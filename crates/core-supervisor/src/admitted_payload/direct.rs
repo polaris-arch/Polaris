@@ -1,6 +1,7 @@
 //! Ordinary App process on macOS/Windows: one correctness hash of every selected
 //! member against the compiled manifest, then execution by path. Not a security
-//! boundary: a same-user writer can replace the App itself.
+//! boundary: a same-user writer can replace the App itself, so a root or SYSTEM
+//! process never loads through it.
 use super::*;
 use std::io::Read;
 
@@ -20,6 +21,12 @@ pub(super) fn protect_members(
     policy: &SelectedPolicy,
 ) -> Result<DirectMembers, AdmissionError> {
     use sha2::Digest;
+    if super::platform::privileged() {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::UnsupportedExactObject,
+            "by-path loader refused in a root or SYSTEM process",
+        ));
+    }
     let directory = input.binary.parent().ok_or_else(|| {
         AdmissionError::new(AdmissionErrorKind::Mismatch, "missing member directory")
     })?;
@@ -89,3 +96,6 @@ impl DirectMembers {
         tokio::process::Command::new(&self.binary)
     }
 }
+
+#[cfg(test)]
+mod tests;

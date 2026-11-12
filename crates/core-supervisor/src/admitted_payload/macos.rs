@@ -27,6 +27,11 @@ pub(super) fn require_root() -> Result<(), AdmissionError> {
     }
     Ok(())
 }
+#[allow(unsafe_code, reason = "read actual real/effective kernel uid")]
+pub(super) fn privileged() -> bool {
+    // SAFETY: getuid/geteuid have no pointer arguments or side effects.
+    unsafe { nix::libc::getuid() == 0 || nix::libc::geteuid() == 0 }
+}
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct Stamp(u64, u64, u64, i64, i64, i64, i64, u32, u32, u32, u64);
 fn stamp(m: &std::fs::Metadata) -> Stamp {

@@ -163,10 +163,9 @@ it('普通环境IO不把权限或资源错误呈现为内容损坏或重装承�
   expect(markup).not.toContain('href="#app-update-card"');
 });
 
-it.each([undefined, 'Missing', 'Mismatch', 'Changed', 'UnsupportedCapability', 'UnsupportedExactObject'] as const)('source and policy digests have no markup, aria, tooltip or copy exit (%s)', async kind => {
+it.each([undefined, 'Missing', 'Mismatch', 'Changed', 'UnsupportedCapability', 'UnsupportedExactObject'] as const)('source digests have no markup, aria, tooltip or copy exit (%s)', async kind => {
   const sourceTree = 'cafebabecafebabecafebabecafebabecafebabecafe';
-  const policy = 'fedcba98'.repeat(8);
-  const admission = kind ? { state: 'rejected' as const, kind, recovery: 'reinstallCurrentApp' as const, sourceCommit: sourceTree, sourceTree, policySha256: policy } : undefined;
+  const admission = kind ? { state: 'rejected' as const, kind, recovery: 'reinstallCurrentApp' as const, sourceCommit: sourceTree, sourceTree } : undefined;
   const info: CoreVersionInfo = { ...FULL, patchSet: PATCH_SET, admission };
   const markup = renderToStaticMarkup(<CoreInfoCard info={info} selectedCore={selectedCore} />);
   const writeText = vi.fn().mockResolvedValue(undefined);
@@ -174,7 +173,7 @@ it.each([undefined, 'Missing', 'Mismatch', 'Changed', 'UnsupportedCapability', '
   const tree = CoreInfoCard({ info, selectedCore });
   const button = nodes(tree).find(n => typeof n.props.onClick === 'function' && nodes(n.props.children).some(child => child.props.children === translate('helper.copyDiagnostics')))!;
   await (button.props.onClick as () => Promise<void>)();
-  for (const forbidden of [PATCH_SET, sourceTree, policy]) {
+  for (const forbidden of [PATCH_SET, sourceTree]) {
     expect(markup).not.toContain(forbidden);
     expect(writeText.mock.calls[0][0]).not.toContain(forbidden);
   }

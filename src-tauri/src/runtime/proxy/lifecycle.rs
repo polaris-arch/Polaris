@@ -848,9 +848,10 @@ impl ProxyRuntime {
             }
         }
         // A reaped exact helper birth may start another helper birth in this
-        // runtime. The sticky helper route still forbids a direct/no-owner
-        // transition. Invalid configs receive their normal later error unless
-        // a touched helper makes the conservative direct admission fail first.
+        // runtime. The helper route stays until a Stop receipt confirms that
+        // birth exited; before that it forbids a direct/no-owner transition.
+        // Invalid configs receive their normal later error unless an unretired
+        // helper makes the conservative direct admission fail first.
         let via_helper = serde_json::from_value::<UserConfig>(config.clone())
             .ok()
             .is_some_and(|parsed| {

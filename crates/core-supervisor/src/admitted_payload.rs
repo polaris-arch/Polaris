@@ -277,7 +277,6 @@ impl AdmittedPayload {
         Ok(PreparedExecution {
             payload: Arc::clone(self),
             purpose,
-            store_lease: None,
         })
     }
 }
@@ -434,26 +433,8 @@ fn admit_into(
 pub struct PreparedExecution {
     payload: Arc<AdmittedPayload>,
     purpose: ExecPurpose,
-    store_lease: Option<Arc<std::fs::File>>,
 }
 impl PreparedExecution {
-    /// Occupancy data added only after this execution was independently admitted.
-    /// This does not create/change a purpose, policy, payload or execution owner.
-    #[cfg(target_os = "linux")]
-    pub fn with_store_lease(mut self, lease: Arc<std::fs::File>) -> Result<Self, AdmissionError> {
-        self.payload.prepare(self.purpose)?;
-        // Validate through the same existing native attachment primitive. A
-        // dedicated child duplicate is attached again to the actual command.
-        let mut command = self.payload.protected.command()?.into_std();
-        platform::attach_store_lease(&mut command, &lease)?;
-        self.store_lease = Some(lease);
-        Ok(self)
-    }
-    pub(crate) fn lease_owner(&self) -> Option<Arc<dyn Send + Sync>> {
-        self.store_lease
-            .as_ref()
-            .map(|lease| Arc::clone(lease) as Arc<dyn Send + Sync>)
-    }
     pub fn diagnostic_path(&self) -> &Path {
         self.payload.diagnostic_path()
     }
@@ -465,17 +446,10 @@ impl PreparedExecution {
     }
     pub(crate) fn command(&self) -> Result<tokio::process::Command, AdmissionError> {
         self.payload.prepare(self.purpose)?;
-        let command = self.payload.protected.command().map_err(|mut error| {
+        self.payload.protected.command().map_err(|mut error| {
             error.purpose = Some(self.purpose);
             error
-        })?;
-        #[cfg(target_os = "linux")]
-        let mut command = command;
-        #[cfg(target_os = "linux")]
-        if let Some(lease) = &self.store_lease {
-            platform::attach_store_lease(command.as_std_mut(), lease)?;
-        }
-        Ok(command)
+        })
     }
 }
 
@@ -496,10 +470,6 @@ pub(crate) struct ReapOwner(Option<Arc<AdmittedPayload>>, Option<Arc<dyn Send + 
 impl ReapOwner {
     pub(crate) fn new(owner: Option<Arc<AdmittedPayload>>) -> Self {
         Self(owner, None)
-    }
-    pub(crate) fn with_lease(mut self, lease: Option<Arc<dyn Send + Sync>>) -> Self {
-        self.1 = lease;
-        self
     }
     pub(crate) fn reaped(&mut self) {
         self.0.take();

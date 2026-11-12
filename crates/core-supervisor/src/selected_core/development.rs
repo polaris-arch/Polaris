@@ -59,7 +59,6 @@ fn document() -> Result<&'static Value, String> {
                 || row["core"]["sha256"] != pin.core_sha256
                 || row["sidecar"]["bytes"].as_u64() != Some(pin.sidecar_bytes)
                 || row["sidecar"]["sha256"] != pin.sidecar_sha256
-                || value["policy"]["purposes"] != serde_json::json!(pin.purposes)
             {
                 return Err("development compiled facts differ".into());
             }

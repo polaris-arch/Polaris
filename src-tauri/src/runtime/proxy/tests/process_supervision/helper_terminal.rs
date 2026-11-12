@@ -54,7 +54,7 @@ async fn confirmed_terminal_replays_stop_without_ipc_or_releasing_a_new_main_cla
         .unwrap()
         .has_local_helper_terminal_for_test());
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -160,7 +160,41 @@ async fn a_new_helper_attempt_replaces_only_the_old_terminal_and_must_stop_its_o
     let repeated = rt.kill_core_via_helper(ops).await.unwrap();
     assert!(repeated.same(&new_attempt));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
+}
+
+/// TUN (helper) → Stop → system proxy (direct) in one runtime: only an exact Stop receipt
+/// reopens the direct slot; an unconfirmed Stop keeps it fenced.
+// ENV_LOCK spans the starts, as in `stale_sweep_runs_on_every_start_not_only_the_first`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn only_a_confirmed_helper_stop_readmits_a_direct_start() {
+    let (rt, dir) = test_runtime();
+    known_exact_helper_attempt(
+        &rt,
+        exact_helper_target(4242, "00112233445566778899aabbccddeeff"),
+    );
+    let config = serde_json::json!({ "servers": [], "proxyModeType": "systemProxy" });
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Core resolution fails right after the sweep counter: no scan, no signal.
+    std::env::set_var("POLARIS_SINGBOX_PATH", &*dir);
+
+    let (failed, _, _) = RecordingStop::new(Err("helper unreachable".into()));
+    assert!(rt.kill_core_via_helper(failed).await.is_err());
+    let denied = rt
+        .start(config.clone())
+        .await
+        .expect_err("an unconfirmed helper Stop keeps the direct slot fenced");
+    assert!(denied.admission_denied);
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), 0);
+
+    let (ops, _, _) = RecordingStop::new(Ok(()));
+    rt.kill_core_via_helper(ops).await.unwrap();
+    let after = rt.start(config).await;
+    std::env::remove_var("POLARIS_SINGBOX_PATH");
+    drop(_g);
+    assert!(after.is_err_and(|error| !error.admission_denied));
+    assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -277,35 +311,9 @@ pub(crate) async fn helper_terminal_exit_fixture(
         .unwrap()
         .has_local_helper_terminal_for_test());
     assert!(!rt.mesh.main_owns_tailscale("terminal-exit", true));
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
     assert_eq!(frames.lock().unwrap().len(), 1);
     (rt, dir, frames)
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn exact_closed_helper_to_direct_start_requires_restart_without_a_new_birth() {
-    let (rt, _dir, frames) = helper_terminal_exit_fixture(true).await;
-    let generation = rt.gate.generation();
-    for _ in 0..2 {
-        let error = rt.start(local_only_config(free_port())).await.unwrap_err();
-        assert_eq!(error.code, Some(code::HELPER_RUNTIME_RESTART_REQUIRED));
-        assert!(error.admission_denied);
-        assert_eq!(rt.gate.generation(), generation);
-        assert!(!rt.status().running);
-        assert!(rt.core_via_helper.load(Ordering::SeqCst));
-        assert!(rt.child.lock().unwrap().helper_touched_for_test());
-        assert!(rt
-            .child
-            .lock()
-            .unwrap()
-            .has_local_helper_terminal_for_test());
-        assert_eq!(frames.lock().unwrap().len(), 1);
-    }
-    // A repeated local denial does not consume the terminal or weaken normal exit.
-    rt.stop().await.unwrap();
-    rt.shutdown_for_exit().await.unwrap();
-    assert_eq!(frames.lock().unwrap().len(), 1);
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -349,8 +357,7 @@ async fn postflight_rollback_then_second_stop_and_strict_main_exit_are_idempoten
         .unwrap()
         .has_local_helper_terminal_for_test());
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
-    assert!(rt.start(local_only_config(free_port())).await.is_err());
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -17,8 +17,8 @@
 //! ## `unsafe_code` 政策
 //!
 //! crate 根是 `deny`（不是 `forbid`）：默认禁 unsafe；Windows 进程接口的两个模块
-//! （`job_object`、`stale_core::windows`，均为 `cfg(windows)`）在具体 item 上局部放开，每处
-//! 带 `SAFETY` 说明。作业对象与进程命令行读取只有 Win32 / NT 接口可用，没有 std 途径。
+//! （`job_object`、`stale_core::windows`，均为 `cfg(windows)`）与 macOS 的 `stale_core::macos`
+//! 在具体 item 上局部放开，每处带 `SAFETY` 说明。作业对象与进程命令行读取只有 Win32 / NT 接口可用，没有 std 途径。
 //! Linux 准入模块仅在 ACL 观察、child-only FD 配置和 Helper 降权 syscall 的窄函数放开；
 //! 所有分配发生于 fork 前，实际 std/Tokio exec 错误管道与原 Child custody 保留。
 
@@ -39,8 +39,6 @@ pub mod readiness_gate;
 pub mod selected_core;
 pub mod spawner;
 pub mod stale_core;
-#[cfg(all(test, target_os = "linux"))]
-mod tests;
 
 pub use config_gate::{
     assert_check_admission, begin_check_shutdown, decide_peel, parse_kernel_rejection,

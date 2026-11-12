@@ -77,21 +77,12 @@ pub(crate) fn prepare(
 }
 pub(crate) fn selection_error(detail: String, purpose: ExecPurpose) -> AdmissionError {
     use polaris_core_supervisor::admitted_payload::{AdmissionErrorKind as K, RecoveryAction as R};
-    let kind = [
-        ("Missing", K::Missing),
-        ("Mismatch", K::Mismatch),
-        ("Changed", K::Changed),
-        ("Busy", K::Busy),
-        ("Unknown", K::Unknown),
-        ("Io", K::Io),
-    ]
-    .into_iter()
-    .find_map(|(name, kind)| {
-        detail
-            .starts_with(&format!("CORE_ADMISSION_{name}:"))
-            .then_some(kind)
-    })
-    .unwrap_or(K::Unknown);
+    // Candidate selection only reports a missing payload; anything else is unknown.
+    let kind = if detail.starts_with("CORE_ADMISSION_Missing:") {
+        K::Missing
+    } else {
+        K::Unknown
+    };
     AdmissionError {
         kind,
         purpose: Some(purpose),
@@ -112,11 +103,6 @@ pub(crate) fn prepare_admitted(
 ) -> Result<PreparedExecution, AdmissionError> {
     payload.prepare(purpose)
 }
-pub(crate) fn acquire(purpose: ExecPurpose) -> Result<std::sync::Arc<AdmittedPayload>, String> {
-    let binary = crate::runtime::proxy::resolve_core_candidate()?;
-    acquire_at(&binary, purpose).map_err(|e| e.to_string())
-}
-
 #[derive(Debug)]
 pub(crate) struct InstallStage {
     pub(crate) directory: PathBuf,

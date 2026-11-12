@@ -283,86 +283,6 @@ impl OwnerPolicy {
     }
 }
 
-// Public administrative OwnerPolicy remains unchanged. Only these explicit
-// Windows data constructors can mint a native current-process data scope.
-#[cfg(not(windows))]
-type StoreOwner = OwnerPolicy;
-#[cfg(windows)]
-#[derive(Clone)]
-struct StoreOwner {
-    uid: Option<u32>,
-    data: Option<std::sync::Arc<crate::platform::windows::user_data::CurrentUserData>>,
-}
-#[cfg(windows)]
-impl PartialEq for StoreOwner {
-    fn eq(&self, other: &Self) -> bool {
-        self.uid == other.uid
-            && match (&self.data, &other.data) {
-                (None, None) => true,
-                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
-                _ => false,
-            }
-    }
-}
-#[cfg(windows)]
-impl Eq for StoreOwner {}
-#[cfg(windows)]
-impl From<OwnerPolicy> for StoreOwner {
-    fn from(owner: OwnerPolicy) -> Self {
-        Self {
-            uid: owner.uid,
-            data: None,
-        }
-    }
-}
-#[cfg(windows)]
-impl StoreOwner {
-    fn check(&self, path: &Path) -> io::Result<()> {
-        if let Some(data) = &self.data {
-            return data.check(path);
-        }
-        OwnerPolicy { uid: self.uid }.check(path)
-    }
-    fn stamp(&self, path: &Path) -> io::Result<String> {
-        if let Some(data) = &self.data {
-            return data.stamp(path);
-        }
-        object_stamp(path)
-    }
-    fn mode(&self, path: &Path, mode: u32) -> io::Result<()> {
-        if let Some(data) = &self.data {
-            return data.check(path);
-        }
-        private_mode(path, mode)
-    }
-    fn private_dir(&self, path: &Path) -> io::Result<()> {
-        if let Some(data) = &self.data {
-            data.create_directory(path)
-        } else {
-            private_dir(path)
-        }
-    }
-    fn create_file(
-        &self,
-        path: &Path,
-        options: &OpenOptions,
-        write_through: bool,
-    ) -> io::Result<File> {
-        if let Some(data) = &self.data {
-            data.create_file(path, write_through)
-        } else {
-            options.open(path)
-        }
-    }
-    fn seal_dir(&self, path: &Path) -> io::Result<()> {
-        if self.data.is_some() {
-            self.check(path)
-        } else {
-            seal_dir(path)
-        }
-    }
-}
-#[cfg(not(windows))]
 impl OwnerPolicy {
     fn create_file(
         self,
@@ -389,12 +309,12 @@ impl OwnerPolicy {
 pub struct CoreStore {
     root: PathBuf,
     _root_object: PayloadDir,
-    owner: StoreOwner,
+    owner: OwnerPolicy,
 }
 pub struct VerifiedCore {
     admitted: Option<std::sync::Arc<polaris_core_supervisor::admitted_payload::AdmittedPayload>>,
     observation: Vec<(PathBuf, String)>,
-    owner: StoreOwner,
+    owner: OwnerPolicy,
     pub manifest: InstalledCoreManifest,
     pub binary: File,
     pub sidecars: Vec<File>,
@@ -443,9 +363,6 @@ impl VerifiedCore {
             .map_err(Into::into)
     }
     fn copy_with_lease(&self, lease: Option<File>) -> io::Result<Self> {
-        #[cfg(windows)]
-        let owner = self.owner.clone();
-        #[cfg(not(windows))]
         let owner = self.owner;
         Ok(Self {
             admitted: self.admitted.clone(),
@@ -553,8 +470,6 @@ impl VerifiedCore {
             .try_lock_shared()
             .map_err(|error| io::Error::other(error.to_string()))?;
         let owner = OwnerPolicy { uid };
-        #[cfg(windows)]
-        let owner = StoreOwner::from(owner);
         Ok(Self {
             admitted: None,
             observation: Vec::new(),
@@ -693,11 +608,6 @@ impl CoreStore {
         id: &CoreId,
     ) -> io::Result<Option<polaris_core_supervisor::admitted_payload::WindowsMaintenanceGuard>>
     {
-        // Data-only stores never become execution slots. Their normal lease
-        // file and AlreadyPresent RW flush remain unchanged.
-        if self.owner.data.is_some() {
-            return Ok(None);
-        }
         self.owner.check(&self.root.join("leases"))?;
         polaris_core_supervisor::admitted_payload::WindowsMaintenanceGuard::for_store(
             &self.root, id,
@@ -846,10 +756,6 @@ impl CoreStore {
         let path = dir.join(format!("{}.lock", id.as_str()));
         self.owner.check(&path)?;
         let (file, _) = objects.open_regular(&format!("{}.lock", id.as_str()))?;
-        #[cfg(windows)]
-        if let Some(data) = &self.owner.data {
-            data.stamp_named_held(&file, &path, false)?;
-        }
         Ok(file)
     }
     fn mutation_lock(&self) -> io::Result<MutationLock> {
@@ -877,21 +783,6 @@ impl CoreStore {
                 windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
             );
         }
-        #[cfg(windows)]
-        let file = if let Some(data) = &self.owner.data {
-            match data.create_file(&path, false) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    // Existing locks are observed as-is, never re-owned. Do
-                    // not let the fallback recreate a concurrently lost name.
-                    options.create(false).open(&path)?
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            options.open(&path)?
-        };
-        #[cfg(not(windows))]
         let file = options.open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(invalid("invalid store lock"));
@@ -899,47 +790,13 @@ impl CoreStore {
         #[cfg(windows)]
         self.owner.mode(&path, 0o600)?;
         self.owner.check(&path)?;
-        #[cfg(windows)]
-        if let Some(data) = &self.owner.data {
-            data.stamp_named_held(&file, &path, false)?;
-        }
         acquire_lock(&file, LockRole::StoreMutationExclusive)?;
         Ok(MutationLock::new(file))
     }
     pub fn open(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
-        #[cfg(windows)]
-        let owner = StoreOwner::from(owner);
         Self::open_scoped(root, owner)
     }
-    #[cfg(windows)]
-    pub fn open_current_user_data(root: &Path) -> io::Result<Self> {
-        let data = std::sync::Arc::new(crate::platform::windows::user_data::CurrentUserData::open(
-            root, false,
-        )?);
-        Self::open_scoped(
-            data.root(),
-            StoreOwner {
-                uid: None,
-                data: Some(data.clone()),
-            },
-        )
-    }
-    #[cfg(windows)]
-    pub fn initialize_current_user_data(root: &Path) -> io::Result<Self> {
-        let data = std::sync::Arc::new(crate::platform::windows::user_data::CurrentUserData::open(
-            root, true,
-        )?);
-        // Probe the actual barrier before any child publication or transaction.
-        data.barrier()?;
-        Self::initialize_scoped(
-            data.root(),
-            StoreOwner {
-                uid: None,
-                data: Some(data.clone()),
-            },
-        )
-    }
-    fn open_scoped(root: &Path, owner: StoreOwner) -> io::Result<Self> {
+    fn open_scoped(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
         owner.check(root)?;
         let object = PayloadDir::open(root, owner.uid)?;
         for name in ["versions", "manifests", ".staging", ".trash", "leases"] {
@@ -956,22 +813,13 @@ impl CoreStore {
 
     /// Administrative installer only. Runtime status/open never creates directories.
     pub fn initialize(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
-        #[cfg(windows)]
-        let owner = StoreOwner::from(owner);
         Self::initialize_scoped(root, owner)
     }
-    fn initialize_scoped(root: &Path, owner: StoreOwner) -> io::Result<Self> {
+    fn initialize_scoped(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
         owner.check(root)?;
         let _root = PayloadDir::open(root, owner.uid)?;
         for name in ["versions", "manifests", ".staging", ".trash", "leases"] {
             let child = root.join(name);
-            #[cfg(windows)]
-            let created = if owner.data.is_some() {
-                owner.private_dir(&child)
-            } else {
-                fs::create_dir(&child)
-            };
-            #[cfg(not(windows))]
             let created = fs::create_dir(&child);
             match created {
                 Ok(()) => {
@@ -985,46 +833,7 @@ impl CoreStore {
         Self::open_scoped(root, owner)
     }
 
-    /// Non-creating selected slot probe. Any partial slot or journal remains
-    /// selected damage/debt, never permission to fall back to package bytes.
-    pub fn has_selected_data(&self, id: &CoreId) -> io::Result<bool> {
-        self.require_no_pending_repair()?;
-        Ok(
-            object_present(&self.root.join("versions").join(id.as_str()))?
-                || object_present(
-                    &self
-                        .root
-                        .join("manifests")
-                        .join(format!("{}.json", id.as_str())),
-                )?
-                || object_present(
-                    &self
-                        .root
-                        .join("leases")
-                        .join(format!("{}.lock", id.as_str())),
-                )?,
-        )
-    }
-    /// Data only: exact receipt, held members and a new shared occupancy lease.
-    /// The caller must independently compare compiled selection and admit its
-    /// real purpose using the sole execution factory.
-    pub fn selected_data(&self, id: &CoreId) -> io::Result<VerifiedCore> {
-        self.require_no_pending_repair()?;
-        // This remains a data observation, not content/execution admission.
-        // Installation hashes under its lease; the execution factory owns
-        // purpose-specific content admission. Do not rescan payloads on each
-        // current-user metadata observation.
-        self.verify_objects(id, false)
-    }
-
     pub fn verify_for_start(&self, id: &CoreId) -> io::Result<VerifiedCore> {
-        #[cfg(windows)]
-        if self.owner.data.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "current-user data store does not grant execution",
-            ));
-        }
         use polaris_core_supervisor::admitted_payload::UntrustedPayload;
         #[cfg(not(target_os = "macos"))]
         use polaris_core_supervisor::admitted_payload::{admit_selected, ExecPurpose};
@@ -1126,13 +935,6 @@ impl CoreStore {
         let name = format!("{}.json", id.as_str());
         self.owner.check(&manifests.join(&name))?;
         let (file, length) = manifest_objects.open_regular(&name)?;
-        #[cfg(windows)]
-        let mut native_observations = Vec::new();
-        #[cfg(windows)]
-        if let Some(data) = &self.owner.data {
-            let path = manifests.join(&name);
-            native_observations.push((path.clone(), data.stamp_named_held(&file, &path, false)?));
-        }
         if length > 64 * 1024 {
             return Err(invalid("manifest too large"));
         }
@@ -1170,12 +972,6 @@ impl CoreStore {
         for expected in &manifest.core.files {
             self.owner.check(&directory.join(&expected.name))?;
             let (mut file, length) = objects.open_regular(&expected.name)?;
-            #[cfg(windows)]
-            if let Some(data) = &self.owner.data {
-                let path = directory.join(&expected.name);
-                native_observations
-                    .push((path.clone(), data.stamp_named_held(&file, &path, false)?));
-            }
             if length != expected.bytes {
                 return Err(invalid("payload size differs"));
             }
@@ -1211,22 +1007,10 @@ impl CoreStore {
             .into_iter()
             .map(|p| Ok((p.clone(), self.owner.stamp(&p)?)))
             .collect::<io::Result<Vec<_>>>()?;
-        #[cfg(windows)]
-        for held in &native_observations {
-            if !observation.contains(held) {
-                return Err(invalid(
-                    "opened recovery data differs from named observation",
-                ));
-            }
-        }
-        #[cfg(windows)]
-        let owner = self.owner.clone();
-        #[cfg(not(windows))]
-        let owner = self.owner;
         Ok(VerifiedCore {
             admitted: None,
             observation,
-            owner,
+            owner: self.owner,
             manifest,
             binary: binary.ok_or_else(|| invalid("missing binary"))?,
             sidecars,
@@ -1287,14 +1071,6 @@ impl CoreStore {
     ) -> io::Result<InstallOutcome> {
         #[cfg(not(windows))]
         let _ = source_sid;
-        #[cfg(windows)]
-        let source_sid = if let Some(data) = &self.owner.data {
-            data.guard()?;
-            data.barrier()?;
-            Some(data.sid())
-        } else {
-            source_sid
-        };
         let mutation = self.mutation_lock()?;
         manifest
             .validate(crate::core_hash::sha256_hex)

@@ -368,8 +368,8 @@ async fn exact_helper_main_mismatch_retains_custody_then_retries_production_birt
         .has_local_helper_terminal_for_test());
     assert_eq!(*rt.pid.lock().unwrap(), None);
     assert!(
-        rt.core_via_helper.load(Ordering::SeqCst),
-        "native birth exit does not attest platform NoOwner"
+        !rt.core_via_helper.load(Ordering::SeqCst),
+        "the exact receipt retires the helper route"
     );
     assert_eq!(
         *frames.lock().unwrap(),
@@ -1685,13 +1685,12 @@ async fn exact_stop_permit_binds_birth_and_keeps_managed_gate() {
     assert!(rt.pid.lock().unwrap().is_none());
     assert!(!rt.child.lock().unwrap().has_helper_start());
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
-    assert!(rt.start(local_only_config(free_port())).await.is_err());
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn reaped_exact_birth_allows_same_helper_start_leg_but_not_direct_start() {
+async fn reaped_exact_birth_allows_the_helper_start_leg_again() {
     use super::super::lifecycle::StartLeg;
 
     let (rt, _dir, _prompts) = test_runtime_installed_helper(false, false);
@@ -1701,17 +1700,10 @@ async fn reaped_exact_birth_allows_same_helper_start_leg_but_not_direct_start() 
     rt.kill_core_via_helper(ops as Arc<dyn HelperStopOps>)
         .await
         .unwrap();
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
 
     let before = rt.gate.generation();
-    assert!(rt.start(local_only_config(free_port())).await.is_err());
-    assert_eq!(
-        rt.gate.generation(),
-        before,
-        "direct admission stays closed"
-    );
-
     // Both explicit Stop→Start and the restart/Apply start leg pass this same
     // admission. The test helper has no daemon socket, so the subsequent
     // read-only capability probe fails before a new helper attempt is booked.
@@ -1727,7 +1719,7 @@ async fn reaped_exact_birth_allows_same_helper_start_leg_but_not_direct_start() 
         .await;
     assert!(matches!(guarded, StartLeg::Finished(Err(_), _)));
     assert!(!rt.child.lock().unwrap().has_helper_start());
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
 }
 
@@ -1772,7 +1764,7 @@ async fn reaped_exact_start_releases_only_its_reserved_main_claim() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop(reservation);
     assert!(!rt.mesh.main_owns_tailscale("ts-reaped-exact", true));
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
     assert!(rt.child.lock().unwrap().helper_touched_for_test());
 }
 
@@ -2113,7 +2105,7 @@ async fn exact_not_admitted_target_can_stop_but_unknown_without_target_cannot() 
         *ops.targets.lock().unwrap(),
         [HelperStopTarget::Birth(target)]
     );
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
 
     let (unknown, _dir) = test_runtime();
     let attempt = unknown.register_helper_start_backend().unwrap();
@@ -2402,7 +2394,7 @@ async fn acknowledged_stop_keeps_exclusive_permit_through_final_clear() {
         .unwrap());
     drop(permit);
     assert!(rt.pid.lock().unwrap().is_none());
-    assert!(rt.core_via_helper.load(Ordering::SeqCst));
+    assert!(!rt.core_via_helper.load(Ordering::SeqCst));
 }
 
 // ─── 停核的受管 pid 身份：app 侧下发 + 记账收口 ────────────────────────────────

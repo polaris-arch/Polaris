@@ -215,16 +215,6 @@ impl<'a> Publication<'a> {
         // Sync actual directory handles up to the existing root, never a volume
         // device, and do not turn an unsupported barrier into success.
         let parents = store.root.ancestors().skip(1);
-        // The native user-data constructor can create only the last component;
-        // all higher ancestors already exist. Only its immediately enclosing
-        // entry changed. Do not request write access/flush on untouched Windows
-        // system ancestors (or a volume) to publish a private data directory.
-        #[cfg(windows)]
-        let parents = parents.take(if store.owner.data.is_some() {
-            1
-        } else {
-            usize::MAX
-        });
         for parent in parents {
             checkpoint(Point::PublicationParentSync)?;
             self.namespace.sync(parent)?;

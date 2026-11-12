@@ -342,7 +342,7 @@ impl SingBoxSpawner for TokioSpawner {
         let stderr = child.stderr.take();
         // Install the lifetime owner before calling user drainage code. A
         // synchronous Drain panic still leaves an owned Child to reap.
-        let child = CustodiedChild::admitted(child, Arc::clone(&owner), execution.lease_owner());
+        let child = CustodiedChild::admitted(child, Arc::clone(&owner));
         if let StdioPolicy::Drain(sink) = stdio {
             sink(
                 boxed_stream(stdout, Arc::clone(&owner)),
@@ -390,7 +390,6 @@ mod tests;
 pub struct CustodiedChild {
     child: Option<Child>,
     owner: Option<Arc<AdmittedPayload>>,
-    lease_owner: Option<Arc<dyn Send + Sync>>,
 }
 impl std::fmt::Debug for CustodiedChild {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -400,43 +399,26 @@ impl std::fmt::Debug for CustodiedChild {
     }
 }
 impl CustodiedChild {
-    fn admitted(
-        child: Child,
-        owner: Arc<AdmittedPayload>,
-        lease_owner: Option<Arc<dyn Send + Sync>>,
-    ) -> Self {
+    fn admitted(child: Child, owner: Arc<AdmittedPayload>) -> Self {
         Self {
             child: Some(child),
             owner: Some(owner),
-            lease_owner,
         }
     }
     pub fn id(&self) -> Option<u32> {
         self.child.as_ref().and_then(Child::id)
     }
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let result = self.child.as_mut().expect("retained child").try_wait();
-        if matches!(result, Ok(Some(_))) {
-            self.lease_owner.take();
-        }
-        result
+        self.child.as_mut().expect("retained child").try_wait()
     }
     pub fn start_kill(&mut self) -> std::io::Result<()> {
         self.child.as_mut().expect("retained child").start_kill()
     }
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let result = self.child.as_mut().expect("retained child").wait().await;
-        if result.is_ok() {
-            self.lease_owner.take();
-        }
-        result
+        self.child.as_mut().expect("retained child").wait().await
     }
     pub async fn kill(&mut self) -> std::io::Result<()> {
-        let result = self.child.as_mut().expect("retained child").kill().await;
-        if result.is_ok() {
-            self.lease_owner.take();
-        }
-        result
+        self.child.as_mut().expect("retained child").kill().await
     }
     pub fn streams_drained(&self) -> bool {
         self.child
@@ -458,8 +440,7 @@ impl Drop for CustodiedChild {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let mut owner =
-                crate::admitted_payload::ReapOwner::new(owner).with_lease(self.lease_owner.take());
+            let mut owner = crate::admitted_payload::ReapOwner::new(owner);
             runtime.spawn(async move {
                 if child.wait().await.is_ok() {
                     owner.reaped();
@@ -470,9 +451,6 @@ impl Drop for CustodiedChild {
             // owners until process exit rather than falsely releasing custody.
             if let Some(owner) = owner {
                 std::mem::forget(owner);
-            }
-            if let Some(lease) = self.lease_owner.take() {
-                std::mem::forget(lease);
             }
         }
     }

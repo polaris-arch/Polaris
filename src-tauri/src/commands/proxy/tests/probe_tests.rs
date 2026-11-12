@@ -184,36 +184,6 @@ fn start_err_response_preserves_structured_code() {
     assert_eq!(r.error.as_deref(), Some("已取消"));
 }
 
-/// The real local-terminal admission failure must survive the actual command
-/// adapter and JSON envelope. Its diagnostic text is not a classifier.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn helper_runtime_restart_required_reaches_the_serialized_ipc_envelope() {
-    use crate::runtime::proxy::{code, tests::helper_terminal_exit_fixture};
-    let (runtime, _dir, frames) = helper_terminal_exit_fixture(true).await;
-    let mut error = runtime
-        .start(serde_json::json!({
-            "servers": [],
-            "selectedServerId": "__direct__",
-            "proxyMode": "direct",
-            "proxyModeType": "manual",
-            "mixedPort": 19999,
-            "clashApiSecret": "fixture-management-secret"
-        }))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, Some(code::HELPER_RUNTIME_RESTART_REQUIRED));
-    assert!(error.admission_denied);
-    error.message = "diagnostic text may change independently of the public code".into();
-    let wire = serde_json::to_value(start_err_response(error)).unwrap();
-    assert_eq!(wire["success"], false);
-    assert_eq!(wire["code"], "HELPER_RUNTIME_RESTART_REQUIRED");
-    assert!(wire.get("data").is_none());
-    assert_eq!(frames.lock().unwrap().len(), 1);
-    runtime.shutdown_for_exit().await.unwrap();
-    assert_eq!(frames.lock().unwrap().len(), 1);
-}
-
 // ── Android 腿：libbox `CheckConfig` 判定 → 探测三态（`probe_check_from_gate`）──
 
 #[test]

@@ -1,13 +1,8 @@
 use super::*;
 
 #[tokio::test]
-async fn initialization_exits_retire_unregistered_plans_but_keep_actual_child_and_lease() {
-    if crate::tests::isolated_lease_case(
-        "admitted_payload::tests::initialization_exits_retire_unregistered_plans_but_keep_actual_child_and_lease",
-    ) {
-        return;
-    }
-    use std::fs::{self, OpenOptions};
+async fn initialization_exits_retire_unregistered_plans_but_keep_actual_child() {
+    use std::fs;
     let directories = ["versions", "manifests", ".staging", ".trash", "leases"];
     for failure in std::iter::once("root").chain(directories) {
         let payload = fixture(b"#!/bin/sh\nread line\nexit 0\n");
@@ -21,19 +16,7 @@ async fn initialization_exits_retire_unregistered_plans_but_keep_actual_child_an
             .with_extension("init-fault");
         fs::create_dir(&root).unwrap();
         let _cleanup = FixtureDirectory(root.clone());
-        let lease_path = root.join("live-child.lease");
-        let lease = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&lease_path)
-            .unwrap();
-        lease.try_lock_shared().unwrap();
-        let live = payload
-            .prepare(ExecPurpose::RunMain)
-            .unwrap()
-            .with_store_lease(Arc::new(lease))
-            .unwrap();
+        let live = payload.prepare(ExecPurpose::RunMain).unwrap();
         let mut command = live.command().unwrap();
         command
             .stdin(std::process::Stdio::piped())
@@ -76,19 +59,8 @@ async fn initialization_exits_retire_unregistered_plans_but_keep_actual_child_an
         };
         assert!(fs::read(blocker).unwrap().starts_with(b"retain unknown"));
         assert!(child.try_wait().unwrap().is_none());
-        let probe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lease_path)
-            .unwrap();
-        assert!(matches!(
-            probe.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
         drop(child.stdin.take());
         assert!(child.wait().await.unwrap().success());
-        probe.try_lock().unwrap();
-        probe.unlock().unwrap();
     }
 }
 
@@ -126,61 +98,6 @@ fn explicit_retirement_revokes_queued_plans_without_turning_data_into_admission(
     assert!(payload.prepare(ExecPurpose::RunMain).is_err());
 }
 
-#[tokio::test]
-async fn operation_lease_survives_native_exec_and_idle_admission_does_not_retain_it() {
-    if crate::tests::isolated_lease_case(
-        "admitted_payload::tests::operation_lease_survives_native_exec_and_idle_admission_does_not_retain_it",
-    ) {
-        return;
-    }
-    let payload = fixture(b"#!/bin/sh\nread line\nexit 0\n");
-    let path = std::env::temp_dir().join(format!(
-        "polaris-operation-lease-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let lease = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .unwrap();
-    lease.try_lock_shared().unwrap();
-    let execution = payload
-        .prepare(ExecPurpose::RunMain)
-        .unwrap()
-        .with_store_lease(Arc::new(lease))
-        .unwrap();
-    let mut command = execution.command().unwrap();
-    command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn().unwrap();
-    drop(command);
-    drop(execution);
-    let probe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
-    assert!(matches!(
-        probe.try_lock(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ));
-    drop(child.stdin.take());
-    assert!(child.wait().await.unwrap().success());
-    probe.try_lock().unwrap();
-    probe.unlock().unwrap();
-    assert!(
-        payload.is_current(),
-        "cached admission remains an execution cohort, not a store occupancy owner"
-    );
-    std::fs::remove_file(path).unwrap();
-}
 use crate::{SingBoxSpawner, SpawnRequest, StdioPolicy, TokioSpawner};
 
 #[test]

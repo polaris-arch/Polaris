@@ -1326,9 +1326,11 @@ impl ProxyRuntime {
         // operation follows successful registry compare-remove.
         child.commit_helper_terminal(terminal);
         *g = None;
-        // The exact ACK proves only that this helper birth was natively
-        // reaped. It does not prove that helper-owned side effects or other
-        // births are absent, so it cannot open the managed/no-owner gate.
+        // The exact ACK proves that this runtime's only helper attempt was natively reaped,
+        // so the slot may host a direct core again; unconfirmed stops never reach here and
+        // keep the helper route. It does not prove that helper-owned side effects or births
+        // outside this runtime are absent, so it is still no managed/no-owner proof.
+        self.core_via_helper.store(false, Ordering::SeqCst);
         Ok(true)
     }
 
@@ -1435,7 +1437,6 @@ impl ProxyRuntime {
             .collect();
         if !unresolved.is_empty() {
             // No signal and no escalation to a broader helper sweep without exact custody.
-            // In particular, arbitrary macOS ps rows cannot authorize kill(PID).
             let message = format!("无法确认遗留内核进程的身份（PID {unresolved:?}），未发送终止信号。请关闭相关程序或重启系统后重试。");
             self.set_error(&message, code::STARTUP_FAILED);
             return Err(StartError::coded(message, code::STARTUP_FAILED));
@@ -1722,7 +1723,8 @@ pub(super) trait StaleCoreIo: Send + Sync {
 
 pub(super) struct NativeStaleCoreIo;
 
-/// Unix: retained pidfd only; platforms without exact stale custody refuse before signaling.
+/// Unix: retained pidfd (Linux) or re-checked start time (macOS); platforms without exact
+/// stale custody refuse before signaling.
 #[cfg(unix)]
 impl StaleCoreIo for NativeStaleCoreIo {
     fn has_identity(&self, process: &CoreProcess) -> bool {

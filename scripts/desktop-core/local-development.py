@@ -60,13 +60,12 @@ def configuration_source(doc):
        'sidecar_bytes':r['sidecar']['bytes'],'sidecar_sha256':r['sidecar']['sha256'],
        'selection_sha256':digest(encoded(doc)),'contract_sha256':doc['contractSha256']}
  fields=[key+':'+json.dumps(value) for key,value in pins.items()]
- fields.append('purposes:&'+json.dumps(doc['policy']['purposes']))
  return base+'pub const COMPILED:Option<DevelopmentSelection>=Some(DevelopmentSelection{'+','.join(fields)+'});\n'
 
 def contract_for(doc):
  row=doc['row']
  return {'schema':'polaris-local-development-core-contract-v1','version':row['version'],'sourceCommit':row['sourceCommit'],'sourceTree':row['sourceTree'],
-         'platforms':{'linux':{**{k:row[k] for k in ['core','sidecar','archive','sourceCommit','sourceTree']},'providerFingerprint':doc['providerFingerprint'],'trustedExecution':doc['policy']}}}
+         'platforms':{'linux':{**{k:row[k] for k in ['core','sidecar','archive','sourceCommit','sourceTree']},'providerFingerprint':doc['providerFingerprint']}}}
 def binding(doc):return digest(encoded({k:doc[k] for k in ['configurationSha256','context','row','proof']}))
 def same_buildinfo(actual,row):
  go,build,graph=actual;recorded=row['rawBuildInfo'];lines=recorded.splitlines() if type(recorded) is str else []

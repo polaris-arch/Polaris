@@ -146,28 +146,24 @@ impl<'a> Namespace<'a> {
         }
         #[cfg(windows)]
         {
-            if let Some(data) = &self.store.owner.data {
-                data.check_held(&file, directory)?;
-            } else {
-                use crate::platform::windows::coreacl::judge_object;
-                use crate::platform::windows::winproc::file_security;
-                let security = file_security(&file)?;
-                if !judge_object("repair-object", &security).is_empty() {
-                    return Err(invalid("repair object ACL differs"));
+            use crate::platform::windows::coreacl::judge_object;
+            use crate::platform::windows::winproc::file_security;
+            let security = file_security(&file)?;
+            if !judge_object("repair-object", &security).is_empty() {
+                return Err(invalid("repair object ACL differs"));
+            }
+            if directory {
+                // A parent can be non-writable while an INHERIT_ONLY ACE would
+                // expose its new children before sealing. Reuse the existing
+                // ACL judge on that grant as effective; never rewrite the ACL.
+                let mut child_security = security;
+                if let Some(aces) = child_security.dacl.as_mut() {
+                    for ace in aces {
+                        ace.flags &= !crate::platform::windows::coreacl::ACE_FLAG_INHERIT_ONLY;
+                    }
                 }
-                if directory {
-                    // A parent can be non-writable while an INHERIT_ONLY ACE would
-                    // expose its new children before sealing. Reuse the existing
-                    // ACL judge on that grant as effective; never rewrite the ACL.
-                    let mut child_security = security;
-                    if let Some(aces) = child_security.dacl.as_mut() {
-                        for ace in aces {
-                            ace.flags &= !crate::platform::windows::coreacl::ACE_FLAG_INHERIT_ONLY;
-                        }
-                    }
-                    if !judge_object("repair-child-inheritance", &child_security).is_empty() {
-                        return Err(invalid("repair parent grants unsafe child writes"));
-                    }
+                if !judge_object("repair-child-inheritance", &child_security).is_empty() {
+                    return Err(invalid("repair parent grants unsafe child writes"));
                 }
             }
             if !directory && link_count(&file)? != 1 {
@@ -286,13 +282,6 @@ impl<'a> Namespace<'a> {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        #[cfg(windows)]
-        if self.store.owner.data.is_some() {
-            self.store.owner.private_dir(path)?;
-        } else {
-            builder.create(path)?;
-        }
-        #[cfg(not(windows))]
         builder.create(path)?;
         *created = Some(identity(&open_nofollow(path, true)?)?);
         self.store.owner.mode(path, 0o700)?;
@@ -471,9 +460,6 @@ impl<'a> Namespace<'a> {
 
 #[cfg(windows)]
 fn validate_windows_ancestors(store: &CoreStore) -> io::Result<()> {
-    if let Some(data) = &store.owner.data {
-        return data.guard();
-    }
     use crate::platform::windows::{coreacl, winproc};
     let mut path = PathBuf::new();
     let mut count = 0usize;

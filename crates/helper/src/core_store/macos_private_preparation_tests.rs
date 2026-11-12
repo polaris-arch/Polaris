@@ -16,7 +16,7 @@ fn private_generation_root_change_refreshes_data_without_minting_admission() {
         .unwrap();
     let id = CoreId::parse(&manifest.id).unwrap();
     let mutation = store.lock_store_mutation().unwrap();
-    let data = store.selected_data(&id).unwrap();
+    let data = store.verify_objects(&id, false).unwrap();
     assert!(data.data_is_current());
     fs::create_dir(store.root.join(".execution-owned-fixture")).unwrap();
     assert!(!data.data_is_current());
@@ -49,7 +49,7 @@ fn private_root_refresh_cannot_hide_selected_member_changes() {
         .unwrap();
     let id = CoreId::parse(&manifest.id).unwrap();
     let mutation = store.lock_store_mutation().unwrap();
-    let data = store.selected_data(&id).unwrap();
+    let data = store.verify_objects(&id, false).unwrap();
     fs::create_dir(store.root.join(".execution-owned-fixture")).unwrap();
     fs::write(data.directory.join("sing-box"), b"changed").unwrap();
     assert!(store

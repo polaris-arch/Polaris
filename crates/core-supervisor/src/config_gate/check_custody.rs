@@ -406,13 +406,6 @@ impl CheckExecutable {
             Self::Fixture(_) => None,
         }
     }
-    fn lease_owner(&self) -> Option<Arc<dyn Send + Sync>> {
-        match self {
-            Self::Admitted(e) => e.lease_owner(),
-            #[cfg(test)]
-            Self::Fixture(_) => None,
-        }
-    }
     fn command(&self, check: bool) -> Result<tokio::process::Command, ValidationLifecycleError> {
         match self {
             Self::Admitted(e) => {
@@ -438,7 +431,6 @@ impl CheckExecutable {
 
 struct CheckRun {
     payload: Option<Arc<AdmittedPayload>>,
-    lease_owner: Option<Arc<dyn Send + Sync>>,
     completion: Arc<CheckCompletion>,
     request: CheckRequestRef,
     factory: NativeFactoryObservation,
@@ -577,9 +569,6 @@ impl Drop for CheckRun {
         if self.has_child() && self.native_terminal.is_none() {
             if let Some(owner) = self.payload.take() {
                 std::mem::forget(owner);
-            }
-            if let Some(lease) = self.lease_owner.take() {
-                std::mem::forget(lease);
             }
         }
         #[cfg(unix)]
@@ -881,7 +870,6 @@ impl CheckCustody {
         });
         let run = CheckRun {
             payload: execution.owner(),
-            lease_owner: execution.lease_owner(),
             completion: Arc::new(CheckCompletion::default()),
             request: request.clone(),
             factory: NativeFactoryObservation::PreFactory,

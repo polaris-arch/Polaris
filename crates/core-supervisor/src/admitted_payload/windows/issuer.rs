@@ -44,6 +44,18 @@ fn owned(h: HANDLE) -> io::Result<OwnedHandle> {
 }
 
 pub(super) fn system_actor() -> io::Result<()> {
+    if is_system_actor()? {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "execution issuer requires the SYSTEM primary token",
+    ))
+}
+
+/// Whether this process acts with the SYSTEM primary token. An impersonating
+/// thread or an unreadable token is an error, never an ordinary process.
+pub(super) fn is_system_actor() -> io::Result<bool> {
     let mut thread = ptr::null_mut();
     // SAFETY: query only this thread; no impersonation token may issue a cohort.
     if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut thread) } != 0 {
@@ -86,19 +98,12 @@ pub(super) fn system_actor() -> io::Result<()> {
         )
     })?;
     // SAFETY: successful query initialized TOKEN_USER and its contained SID.
-    if unsafe {
+    Ok(unsafe {
         IsWellKnownSid(
             (*(buf.as_ptr().cast::<TOKEN_USER>())).User.Sid,
             WinLocalSystemSid,
         )
-    } == 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "execution issuer requires the SYSTEM primary token",
-        ));
-    }
-    Ok(())
+    } != 0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
