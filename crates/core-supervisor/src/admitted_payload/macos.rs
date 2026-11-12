@@ -1,4 +1,4 @@
-//! Closed Root Helper CheckConfig/RunMain. A read-only FD to an old data inode is not a
+//! Closed Root Helper RunMain. A read-only FD to an old data inode is not a
 //! protection claim: each cold owner creates and hashes its own private inode.
 use super::*;
 use crate::protected_install_path::{no_extended_acl, ProtectedPath};
@@ -10,11 +10,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
-mod check_input;
-pub(crate) use check_input::{require_check_debt_absent, CheckSnapshot};
-
-const MAX_MEMBER: u64 = 96 * 1024 * 1024;
-const LOADER: &str = "macos-root-private-v1";
 fn rejected(kind: AdmissionErrorKind, detail: &str) -> AdmissionError {
     AdmissionError::new(kind, detail)
 }
@@ -133,8 +128,14 @@ impl Drop for Generation {
         }
     }
 }
+/// Root Helper RunMain owns a private copy; the ordinary App hashes and runs by path.
 #[derive(Debug)]
-pub(super) struct ProtectedMembers {
+pub(super) enum ProtectedMembers {
+    Root(Box<RootMembers>),
+    Direct(super::direct::DirectMembers),
+}
+#[derive(Debug)]
+pub(super) struct RootMembers {
     // Field order closes the member before retiring its exact private directory.
     binary: Member,
     source: ProtectedPath,
@@ -201,13 +202,10 @@ fn copy_checked(
     expected: &polaris_helper_proto::core_manifest::CoreFile,
 ) -> Result<(), AdmissionError> {
     use sha2::Digest;
-    if expected.bytes == 0
-        || expected.bytes > MAX_MEMBER
-        || source.metadata()?.len() != expected.bytes
-    {
+    if expected.bytes == 0 || source.metadata()?.len() != expected.bytes {
         return Err(rejected(
             AdmissionErrorKind::Mismatch,
-            "selected Core size exceeds fixed stream budget",
+            "selected Core size differs",
         ));
     }
     source.seek(SeekFrom::Start(0))?;
@@ -400,16 +398,22 @@ pub(super) fn protect_members(
     input: &UntrustedPayload,
     policy: &SelectedPolicy,
 ) -> Result<ProtectedMembers, AdmissionError> {
+    if !input.root_helper {
+        return super::direct::protect_members(input, policy).map(ProtectedMembers::Direct);
+    }
+    protect_root_members(input, policy).map(|root| ProtectedMembers::Root(Box::new(root)))
+}
+fn protect_root_members(
+    input: &UntrustedPayload,
+    policy: &SelectedPolicy,
+) -> Result<RootMembers, AdmissionError> {
     require_root()?;
-    if !input.root_helper
-        || policy.loader != LOADER
-        || policy.purposes != [ExecPurpose::CheckConfig, ExecPurpose::RunMain]
-        || policy.manifest.files.len() != 1
+    if policy.manifest.files.len() != 1
         || input.binary.file_name() != Some(std::ffi::OsStr::new("sing-box"))
     {
         return Err(rejected(
             AdmissionErrorKind::UnsupportedCapability,
-            "only compiled root Helper CheckConfig/RunMain are admitted",
+            "only compiled root Helper RunMain is admitted",
         ));
     }
     let directory = input
@@ -483,7 +487,7 @@ pub(super) fn protect_members(
         file,
         path: generation.path.join("sing-box"),
     };
-    let protected = ProtectedMembers {
+    let protected = RootMembers {
         binary,
         source,
         source_stamp,
@@ -503,17 +507,33 @@ pub(super) fn protect_members(
     Ok(protected)
 }
 impl ProtectedMembers {
-    pub(super) fn check_snapshot(&self) -> Result<CheckSnapshot, AdmissionError> {
-        require_root()?;
-        self.generation.parent.unchanged()?;
-        CheckSnapshot::create(ProtectedPath::open(&self.generation.parent.path, true)?)
-    }
-    pub(super) fn check_debt_absent(&self) -> Result<(), AdmissionError> {
-        require_root()?;
-        self.generation.parent.unchanged()?;
-        require_check_debt_absent(&self.generation.parent.path)
-    }
     pub(super) fn is_current(&self) -> bool {
+        match self {
+            Self::Root(root) => root.is_current(),
+            Self::Direct(direct) => direct.is_current(),
+        }
+    }
+    pub(super) fn command(&self) -> Result<tokio::process::Command, AdmissionError> {
+        match self {
+            Self::Root(_) => Err(rejected(
+                AdmissionErrorKind::UnsupportedCapability,
+                "root Helper plans cannot use the ordinary spawner",
+            )),
+            Self::Direct(direct) => Ok(direct.command()),
+        }
+    }
+    pub(super) fn root(&self) -> Result<&RootMembers, AdmissionError> {
+        match self {
+            Self::Root(root) => Ok(root.as_ref()),
+            Self::Direct(_) => Err(rejected(
+                AdmissionErrorKind::UnsupportedCapability,
+                "ordinary App admission cannot use the root Helper factory",
+            )),
+        }
+    }
+}
+impl RootMembers {
+    fn is_current(&self) -> bool {
         // Metadata, namespace and protection only. No warm content hashing.
         self.binary.current()
             && self.generation.current()
@@ -525,12 +545,6 @@ impl ProtectedMembers {
                 .is_ok_and(|m| stamp(&m) == self.source_stamp)
             && self.system.iter().all(|p| p.unchanged().is_ok())
             && self.lease.unchanged().is_ok()
-    }
-    pub(super) fn command(&self) -> Result<tokio::process::Command, AdmissionError> {
-        Err(rejected(
-            AdmissionErrorKind::UnsupportedCapability,
-            "root Helper plans cannot use the ordinary spawner",
-        ))
     }
     pub(super) fn root_command(&self) -> Result<std::process::Command, AdmissionError> {
         require_root()?;

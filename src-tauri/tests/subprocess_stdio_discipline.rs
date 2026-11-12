@@ -248,12 +248,6 @@ struct PipedSite {
 /// 写不出来说明这条腿还没想清楚谁来读它。
 const PIPED_SITES: &[PipedSite] = &[
     PipedSite {
-        file: "crates/core-supervisor/src/admitted_payload.rs",
-        anchor: "impl MacCheckInput {",
-        kind: SiteKind::Producer,
-        drain_forms: &[],
-    },
-    PipedSite {
         file: "crates/helper/src/linux_legacy_maintenance.rs",
         anchor: "fn utility(",
         kind: SiteKind::Sink,
@@ -472,22 +466,7 @@ struct Passthrough {
 }
 
 /// 只登记真实的逐流透传；每项必须继续覆盖实际取读端，排空仍由登记的消费者负责。
-const PIPE_PASSTHROUGH: [Passthrough; 7] = [
-    Passthrough {
-        file: "crates/core-supervisor/src/admitted_payload/windows.rs",
-        anchor: "pub(crate) fn take_stdout(",
-        reason: "WindowsCheckChild moves its exact stdout File while retaining native child/cohort/lease custody; the shared Check dispatcher takes both streams before handing them to bounded-retention EOF workers, exact field and custody contracts checked below",
-    },
-    Passthrough {
-        file: "crates/core-supervisor/src/admitted_payload/windows.rs",
-        anchor: "pub(crate) fn take_stderr(",
-        reason: "WindowsCheckChild moves its distinct stderr File to the stderr EOF worker without replacing or dropping native child/cohort/lease custody; exact individual field and dual-stream contracts checked below",
-    },
-    Passthrough {
-        file: "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
-        anchor: "fn helper_check_request(",
-        reason: "The private shared Root/SYSTEM Check dispatcher commits the opaque child before handing both OwnedReaders to bounded EOF threads; exact platform wrappers, factory, consumer, wait and join contract are checked below",
-    },
+const PIPE_PASSTHROUGH: [Passthrough; 4] = [
     Passthrough {
         file: "crates/core-supervisor/src/admitted_payload.rs",
         anchor: "impl StdCustodiedChild {",
@@ -841,17 +820,6 @@ fn offsets_of(haystack: &str, needle: &str) -> Vec<usize> {
 
 /// 该文件里被登记覆盖的全部块区间（注册表 1 + 注册表 2 + 透传表）。
 fn covered_ranges(index: &BTreeMap<&str, &Scanned>, rel: &str) -> Vec<(usize, usize)> {
-    if matches!(
-        rel,
-        "crates/core-supervisor/src/admitted_payload.rs"
-            | "crates/core-supervisor/src/config_gate/check_custody/macos.rs"
-            | "crates/core-supervisor/src/admitted_payload/windows.rs"
-    ) {
-        assert!(
-            mac_check_stdio_custody_is_complete(index),
-            "Root Check pipe/guard/actual-wait/join closure drift"
-        );
-    }
     if matches!(
         rel,
         "crates/core-supervisor/src/admitted_payload/macos.rs"
@@ -1370,9 +1338,6 @@ fn every_piped_site_is_registered_and_drains_before_it_waits() {
         }
 
         if site.kind == SiteKind::Producer {
-            if site.anchor == "impl MacCheckInput {" {
-                assert!(mac_check_stdio_custody_is_complete(&index));
-            }
             if site.file == "crates/core-supervisor/src/admitted_payload/macos.rs" {
                 assert!(
                     platform_factory_stdio_custody_is_complete(&index),
@@ -2363,164 +2328,6 @@ fn utility_child_preserves_both_readers_and_actual_child_on_all_terminal_paths()
     }
 }
 
-fn mac_check_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) -> bool {
-    let compact = |body: &str| {
-        body.chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-    };
-    let factory = compact(block_of(
-        file_of(index, "crates/core-supervisor/src/admitted_payload.rs"),
-        "impl MacCheckInput {",
-    ));
-    for needle in [
-        "macos::require_root()?;",
-        "execution.purpose!=ExecPurpose::CheckConfig",
-        "Arc::ptr_eq(p,&execution.payload)",
-        "execution.payload.prepare(ExecPurpose::CheckConfig)?;",
-        "self.snapshot.path()?",
-        "macos::attach_store_lease(&mutcommand,&self.lease,&execution.payload.protected.lease,)?",
-        "letchild=command.spawn()?;",
-        "child:Some(child)",
-        "owner:Some(execution.payload)",
-        "lease_owner:Some(leaseasArc<dynSend+Sync>)",
-        "stdout(std::process::Stdio::piped())",
-        "stderr(std::process::Stdio::piped())",
-    ] {
-        if !factory.contains(needle) {
-            return false;
-        }
-    }
-    let remote = file_of(
-        index,
-        "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
-    );
-    let mac_wrapper = compact(block_of(remote, "pub fn macos_helper_check_request("));
-    let windows_wrapper = compact(block_of(remote, "pub fn windows_helper_check_request("));
-    if !mac_wrapper.contains("helper_check_request(CallerIdentity::Unix(uid),request)")
-        || !windows_wrapper.contains("if!matches!(owner,CallerIdentity::Windows(_))")
-        || !windows_wrapper.contains("helper_check_request(owner,request)")
-    {
-        return false;
-    }
-    let commit = compact(block_of(remote, "fn helper_check_request("));
-    if !commit.contains("uid:CallerIdentity,") || !commit.contains("m.uid==uid&&m.key==*key") {
-        return false;
-    }
-    let mut previous = 0;
-    for needle in [
-        "letchild=input.spawn();",
-        "run.mac_child=Some(child)",
-        "letstdout=child.take_stdout();",
-        "letstderr=child.take_stderr();",
-        "output.read_root(stdout,false)",
-        "output.read_root(stderr,true)",
-    ] {
-        let Some(at) = commit.find(needle) else {
-            return false;
-        };
-        if at < previous {
-            return false;
-        }
-        previous = at;
-    }
-    let drain = compact(block_of(remote, "fn read_root<R:"));
-    for needle in [
-        "std::thread::Builder::new()",
-        "pipe.read(&mutbuffer)",
-        "Ok(0)=>break",
-        "OUTPUT_BYTES.saturating_sub(kept.len())",
-        "kept.extend_from_slice(&buffer[..n.min(remaining)])",
-        "overflow|=n>remaining",
-        "tasks[slot].blocking=Some(h)",
-    ] {
-        if !drain.contains(needle) {
-            return false;
-        }
-    }
-    let owner = file_of(
-        index,
-        "crates/core-supervisor/src/config_gate/check_custody.rs",
-    );
-    let wait = compact(block_of(owner, "fn poll_exit("));
-    if !wait.contains("self.mac_child.as_mut()")
-        || !wait.contains("child.try_wait()")
-        || !wait.contains("self.cache_native_exit(exit,NativeExitSource::TryWait)")
-    {
-        return false;
-    }
-    let joined = compact(block_of(owner, "async fn finished("));
-    if !joined.contains("task.blocking.as_ref().is_some_and(|h|h.is_finished())")
-        || !joined.contains("h.join()")
-    {
-        return false;
-    }
-    let retire = compact(block_of(owner, "fn retire(&self, request:"));
-    for needle in [
-        "run.validate_retirement()",
-        "run.tail.retire()",
-        "state.runs.remove(&request.id)",
-        "completion.terminal.store(true,Ordering::SeqCst)",
-    ] {
-        if !retire.contains(needle) {
-            return false;
-        }
-    }
-    true
-}
-
-#[test]
-fn root_check_guard_and_each_owned_stream_are_real_source_obligations() {
-    let surface = scan_surface();
-    assert!(mac_check_stdio_custody_is_complete(&surface_by_path(
-        &surface
-    )));
-    for (file, old, new) in [
-        (
-            "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
-            "output.read_root(stderr, true)",
-            "output.read_root(stdout, true)",
-        ),
-        (
-            "crates/core-supervisor/src/admitted_payload.rs",
-            "owner: Some(execution.payload)",
-            "owner: None",
-        ),
-        (
-            "crates/core-supervisor/src/config_gate/check_custody.rs",
-            "h.join()",
-            "drop(h)",
-        ),
-        (
-            "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
-            "helper_check_request(CallerIdentity::Unix(uid), request)",
-            "helper_check_request(caller_identity(), request)",
-        ),
-    ] {
-        assert!(
-            file_of(&surface_by_path(&surface), file)
-                .masked
-                .contains(old),
-            "negative control must mutate the actual bound source"
-        );
-        let mutated: Vec<Scanned> = surface
-            .iter()
-            .map(|s| Scanned {
-                rel: s.rel.clone(),
-                masked: if s.rel == file {
-                    s.masked.replace(old, new)
-                } else {
-                    s.masked.clone()
-                },
-            })
-            .collect();
-        assert!(
-            !mac_check_stdio_custody_is_complete(&surface_by_path(&mutated)),
-            "Root Check regression was not refused: {file}: {old}"
-        );
-    }
-}
-
 fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) -> bool {
     let compact = |body: &str| {
         body.chars()
@@ -2545,7 +2352,7 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
     let factory = compact(block_of(payload, "pub fn spawn_macos_root_helper_main("));
     for needle in [
         "macos::configure_main_command(&mutcommand,config,working_directory,pipe);",
-        "macos::attach_store_lease(&mutcommand,store_lease,&self.payload.protected.lease)?",
+        "macos::attach_store_lease(&mutcommand,store_lease,&root.lease)?",
         "letchild=command.spawn()?;",
         "child:Some(child)",
         "owner:Some(self.payload)",
@@ -2630,18 +2437,6 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
         index,
         "crates/core-supervisor/src/admitted_payload/windows.rs",
     );
-    for (anchor, field) in [
-        ("pub(crate) fn take_stdout(", "stdout"),
-        ("pub(crate) fn take_stderr(", "stderr"),
-    ] {
-        if compact(block_of(windows, anchor))
-            != format!(
-                "pub(crate)fntake_{field}(&mutself)->Option<File>{{self.child.{field}.take()}}"
-            )
-        {
-            return false;
-        }
-    }
     let parts = compact(block_of(windows, "impl WindowsStartedChild {"));
     if !parts
         .contains("(self.pid,self.process,self.stdout.expect(),self.stderr.expect(),self.custody,)")
@@ -2735,21 +2530,6 @@ fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
             "self.stdout.expect(",
         ),
         (
-            "crates/core-supervisor/src/admitted_payload/windows.rs",
-            "self.child.stdout.take()",
-            "self.child.stderr.take()",
-        ),
-        (
-            "crates/core-supervisor/src/admitted_payload/windows.rs",
-            "self.child.stderr.take()",
-            "self.child.stdout.take()",
-        ),
-        (
-            "crates/core-supervisor/src/admitted_payload/windows.rs",
-            "self.child.stderr.take()",
-            "None",
-        ),
-        (
             "crates/helper/src/platform/macos/server.rs",
             "birth.attach_log_custody(log_custody)",
             "drop(log_custody)",
@@ -2806,6 +2586,5 @@ fn recovery_root_is_explicit_main_data_under_existing_factories() {
         "fn fixed_arguments(",
     );
     assert!(windows.contains("(ExecPurpose::RunMain, Some(directory))"));
-    assert!(windows.contains("(ExecPurpose::CheckConfig, None)"));
     assert!(!windows.contains("extra_args"));
 }

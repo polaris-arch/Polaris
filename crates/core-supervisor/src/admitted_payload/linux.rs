@@ -41,7 +41,6 @@ pub(super) fn with_hook<R>(hook: Hook, action: impl FnOnce() -> R) -> R {
     action()
 }
 
-const MAX_MEMBER: u64 = 96 * 1024 * 1024;
 fn stamp(m: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64, u32, u32, u32, u64) {
     (
         m.dev(),
@@ -241,12 +240,6 @@ pub(super) fn protect_members(
             "unexpected selected executable name",
         ));
     }
-    if policy.loader != "linux-sealed-fd-v1" {
-        return Err(AdmissionError::new(
-            AdmissionErrorKind::LoaderPolicy,
-            "sealed FD policy required",
-        ));
-    }
     let dir = input.binary.parent().ok_or_else(|| {
         AdmissionError::new(AdmissionErrorKind::Mismatch, "missing member directory")
     })?;
@@ -258,12 +251,6 @@ pub(super) fn protect_members(
     let mut sidecar = None;
     for expected in &policy.manifest.files {
         let member = (|| -> Result<Member, AdmissionError> {
-            if expected.bytes > MAX_MEMBER {
-                return Err(AdmissionError::new(
-                    AdmissionErrorKind::Mismatch,
-                    "selected member exceeds fixed stream budget",
-                ));
-            }
             let mut source = open_source(&dir.join(&expected.name), false)?;
             if source.source.metadata()?.len() != expected.bytes {
                 return Err(AdmissionError::new(

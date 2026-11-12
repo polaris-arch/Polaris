@@ -4,6 +4,8 @@ use polaris_helper_proto::core_manifest::{CoreId, CoreManifest};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(any(target_os = "macos", windows))]
+mod direct;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -21,8 +23,6 @@ use unsupported as platform;
 #[cfg(windows)]
 use windows as platform;
 #[cfg(windows)]
-pub(crate) use windows::{WindowsCheckChild, WindowsCheckInput};
-#[cfg(windows)]
 pub use windows::{WindowsChildCustody, WindowsMaintenanceGuard, WindowsStartedChild};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,15 +34,6 @@ pub enum ExecPurpose {
     RunSpeedtest,
 }
 impl ExecPurpose {
-    fn contract_name(self) -> &'static str {
-        match self {
-            Self::CheckConfig => "check-config-v1",
-            Self::TlsInventory => "tls-inventory-v1",
-            Self::RunMain => "run-main-v1",
-            Self::RunLogin => "run-login-v1",
-            Self::RunSpeedtest => "run-speedtest-v1",
-        }
-    }
     pub(crate) fn is_run(self) -> bool {
         matches!(self, Self::RunMain | Self::RunLogin | Self::RunSpeedtest)
     }
@@ -183,10 +174,6 @@ struct SelectedPolicy {
     id: CoreId,
     source: String,
     tree: String,
-    digest: String,
-    purposes: Vec<ExecPurpose>,
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-    loader: String,
 }
 impl SelectedPolicy {
     fn compiled() -> Result<Self, AdmissionError> {
@@ -217,7 +204,6 @@ impl SelectedPolicy {
         )
         .map_err(|e| AdmissionError::new(AdmissionErrorKind::Mismatch, e.to_string()))?;
         let row = &contract["platforms"][platform];
-        let policy = &row["trustedExecution"];
         let source = row["sourceCommit"].as_str().ok_or_else(|| {
             AdmissionError::new(AdmissionErrorKind::Mismatch, "missing selected source")
         })?;
@@ -227,112 +213,12 @@ impl SelectedPolicy {
             .ok_or_else(|| {
                 AdmissionError::new(AdmissionErrorKind::Mismatch, "missing selected tree")
             })?;
-        let declaration = Self::declaration(policy, source, tree, platform)?;
         Ok(Self {
             manifest,
             id,
             source: source.into(),
             tree: tree.into(),
-            digest: sha256_hex(&serde_json::to_vec(policy).expect("policy JSON")),
-            purposes: declaration.0,
-            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            loader: declaration.1,
         })
-    }
-    fn declaration(
-        policy: &serde_json::Value,
-        source: &str,
-        tree: &str,
-        platform: &str,
-    ) -> Result<(Vec<ExecPurpose>, String), AdmissionError> {
-        // Only a future compiled, source-bound Helper/private-cohort selection
-        // can reach the Windows issuer. The current release has no such policy.
-        // An arbitrary path, receipt or environment never supplies this value.
-        if platform == "win" {
-            #[cfg(windows)]
-            return windows::declaration(policy, source, tree);
-            #[cfg(not(windows))]
-            return Err(AdmissionError::new(
-                AdmissionErrorKind::UnsupportedExactObject,
-                "Windows exact-object execution is unavailable on this host",
-            ));
-        }
-        const FIELDS: [&str; 5] = ["schema", "sourceCommit", "sourceTree", "loader", "purposes"];
-        if !policy.as_object().is_some_and(|object| {
-            object.len() == FIELDS.len() && FIELDS.iter().all(|key| object.contains_key(*key))
-        }) {
-            return Err(AdmissionError::new(
-                AdmissionErrorKind::UnsupportedCapability,
-                "trusted-execution v1 fields differ",
-            ));
-        }
-        if policy["schema"] != "polaris-trusted-execution-v1"
-            || policy["sourceCommit"] != source
-            || policy["sourceTree"] != tree
-        {
-            return Err(AdmissionError::new(
-                AdmissionErrorKind::UnsupportedCapability,
-                "selected source has no exact trusted-execution policy",
-            ));
-        }
-        let loader = policy["loader"].as_str().ok_or_else(|| {
-            AdmissionError::new(AdmissionErrorKind::LoaderPolicy, "missing loader policy")
-        })?;
-        if platform == "linux" && loader != "linux-sealed-fd-v1" {
-            return Err(AdmissionError::new(
-                AdmissionErrorKind::LoaderPolicy,
-                "explicit sealed FD loader required",
-            ));
-        }
-        if matches!(platform, "mac-arm64" | "mac-x64")
-            && (loader != "macos-root-private-v1"
-                || policy["purposes"] != serde_json::json!(["check-config-v1", "run-main-v1"]))
-        {
-            return Err(AdmissionError::new(
-                AdmissionErrorKind::LoaderPolicy,
-                "Mac private execution requires exact root Helper CheckConfig/RunMain purposes",
-            ));
-        }
-        let declared = policy["purposes"].as_array().ok_or_else(|| {
-            AdmissionError::new(
-                AdmissionErrorKind::UnsupportedCapability,
-                "missing execution purposes",
-            )
-        })?;
-        let mut purposes = Vec::new();
-        for purpose in [
-            ExecPurpose::CheckConfig,
-            ExecPurpose::TlsInventory,
-            ExecPurpose::RunMain,
-            ExecPurpose::RunLogin,
-            ExecPurpose::RunSpeedtest,
-        ] {
-            if declared
-                .iter()
-                .any(|v| v.as_str() == Some(purpose.contract_name()))
-            {
-                purposes.push(purpose);
-            }
-        }
-        if purposes.len() != declared.len() {
-            return Err(AdmissionError::new(
-                AdmissionErrorKind::UnsupportedCapability,
-                "unknown or repeated execution purpose",
-            ));
-        }
-        Ok((purposes, loader.to_owned()))
-    }
-    fn allows(&self, purpose: ExecPurpose) -> Result<(), AdmissionError> {
-        if self.purposes.contains(&purpose) {
-            Ok(())
-        } else {
-            let mut error = AdmissionError::new(
-                AdmissionErrorKind::UnsupportedCapability,
-                "selected source does not support this execution purpose",
-            );
-            error.purpose = Some(purpose);
-            Err(error)
-        }
     }
 }
 
@@ -360,9 +246,6 @@ impl AdmittedPayload {
     pub fn source_tree(&self) -> &str {
         &self.policy.tree
     }
-    pub fn policy_digest(&self) -> &str {
-        &self.policy.digest
-    }
     pub fn diagnostic_path(&self) -> &Path {
         &self.candidate.binary
     }
@@ -383,10 +266,6 @@ impl AdmittedPayload {
         self: &Arc<Self>,
         purpose: ExecPurpose,
     ) -> Result<PreparedExecution, AdmissionError> {
-        self.policy.allows(purpose).map_err(|mut e| {
-            e.purpose = Some(purpose);
-            e
-        })?;
         if !self.is_current() {
             let mut error = AdmissionError::new(
                 AdmissionErrorKind::Changed,
@@ -409,35 +288,10 @@ static SLOT: OnceLock<Mutex<Option<Arc<AdmittedPayload>>>> = OnceLock::new();
 /// Read-only compiled capability hint for UI/preflight. It cannot produce an
 /// owner, prove filesystem identity, or authorize a native birth.
 pub fn check_selected_capability(purpose: ExecPurpose) -> Result<(), AdmissionError> {
-    #[cfg(target_os = "macos")]
-    {
-        // A compiled hint describes the Root Helper route, never an ordinary owner.
-        check_macos_root_helper_capability(purpose)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        SelectedPolicy::compiled()
-            .and_then(|p| p.allows(purpose))
-            .map_err(|mut e| {
-                e.purpose = Some(purpose);
-                e
-            })
-    }
-}
-/// Static capability only. Actual preparation still requires the closed Root provider.
-#[cfg(target_os = "macos")]
-pub fn check_macos_root_helper_capability(purpose: ExecPurpose) -> Result<(), AdmissionError> {
-    if !matches!(purpose, ExecPurpose::CheckConfig | ExecPurpose::RunMain) {
-        let mut error = AdmissionError::unsupported_exact_object();
-        error.purpose = Some(purpose);
-        return Err(error);
-    }
-    SelectedPolicy::compiled()
-        .and_then(|p| p.allows(purpose))
-        .map_err(|mut e| {
-            e.purpose = Some(purpose);
-            e
-        })
+    SelectedPolicy::compiled().map(|_| ()).map_err(|mut e| {
+        e.purpose = Some(purpose);
+        e
+    })
 }
 pub fn invalidate_selected() {
     invalidate_slot(SLOT.get_or_init(Default::default));
@@ -482,22 +336,12 @@ pub fn admit_selected(
     input: UntrustedPayload,
     purpose: ExecPurpose,
 ) -> Result<Arc<AdmittedPayload>, AdmissionError> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = input;
-        let mut error = AdmissionError::unsupported_exact_object();
-        error.purpose = Some(purpose);
-        Err(error)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        admit_locked(
-            SLOT.get_or_init(Default::default),
-            input,
-            purpose,
-            SelectedPolicy::compiled,
-        )
-    }
+    admit_locked(
+        SLOT.get_or_init(Default::default),
+        input,
+        purpose,
+        SelectedPolicy::compiled,
+    )
 }
 /// The existing privileged Helper's RunMain entry. Input paths are still data:
 /// the provider requires actual root credentials, a protected CoreStore chain,
@@ -556,7 +400,6 @@ fn admit_into(
             }
             && payload.is_current()
         {
-            payload.policy.allows(purpose)?;
             return Ok(Arc::clone(payload));
         }
     }
@@ -565,7 +408,6 @@ fn admit_into(
             .store(true, std::sync::atomic::Ordering::Release);
     }
     let policy = load()?;
-    policy.allows(purpose)?;
     let protected = platform::protect_members(&input, &policy)?;
     let payload = Arc::new(AdmittedPayload {
         policy,
@@ -736,26 +578,6 @@ impl PreparedExecution {
 }
 #[cfg(target_os = "macos")]
 impl PreparedExecution {
-    pub(crate) fn macos_check_input(
-        self,
-        lease: &std::fs::File,
-    ) -> Result<MacCheckInput, AdmissionError> {
-        macos::require_root()?;
-        if self.purpose != ExecPurpose::CheckConfig || !self.payload.candidate.root_helper {
-            return Err(AdmissionError::unsupported_exact_object());
-        }
-        self.payload.prepare(self.purpose)?;
-        // Reuse the existing independently verified shared-occupancy primitive.
-        // This command is never spawned; no caller-supplied owner is accepted.
-        let mut command = self.payload.protected.root_command()?;
-        let lease = macos::attach_store_lease(&mut command, lease, &self.payload.protected.lease)?;
-        let snapshot = self.payload.protected.check_snapshot()?;
-        Ok(MacCheckInput {
-            execution: Some(self),
-            snapshot,
-            lease,
-        })
-    }
     /// Data arguments are limited to the existing Helper run/config/log path.
     /// No mutable command or environment escapes this purpose-bound factory.
     pub fn spawn_macos_root_helper_main(
@@ -795,11 +617,10 @@ impl PreparedExecution {
             ));
         }
         self.payload.prepare(self.purpose)?;
-        self.payload.protected.check_debt_absent()?;
-        let mut command = self.payload.protected.root_command()?;
+        let root = self.payload.protected.root()?;
+        let mut command = root.root_command()?;
         macos::configure_main_command(&mut command, config, working_directory, pipe);
-        let native_lease =
-            macos::attach_store_lease(&mut command, store_lease, &self.payload.protected.lease)?;
+        let native_lease = macos::attach_store_lease(&mut command, store_lease, &root.lease)?;
         self.payload.prepare(self.purpose)?;
         let lease_owner = Arc::new((native_lease, lease_owner)) as Arc<dyn Send + Sync>;
         let child = command.spawn()?;
@@ -811,73 +632,6 @@ impl PreparedExecution {
     }
 }
 
-/// No public constructor, raw Child extraction or erased-owner substitution.
-#[cfg(target_os = "macos")]
-pub(crate) struct MacCheckInput {
-    execution: Option<PreparedExecution>,
-    snapshot: macos::CheckSnapshot,
-    lease: Arc<std::fs::File>,
-}
-#[cfg(target_os = "macos")]
-impl MacCheckInput {
-    pub(crate) fn append(&mut self, offset: usize, bytes: &[u8]) -> Result<(), AdmissionError> {
-        self.snapshot.append(offset, bytes)
-    }
-    pub(crate) fn seal(&mut self, len: usize, digest: &[u8; 32]) -> Result<(), AdmissionError> {
-        self.snapshot.seal(len, digest)
-    }
-    pub(crate) fn retire(&mut self) -> Result<(), AdmissionError> {
-        self.snapshot.retire()
-    }
-    pub(crate) fn spawn(&mut self) -> Result<StdCustodiedChild, AdmissionError> {
-        macos::require_root()?;
-        let execution = self
-            .execution
-            .take()
-            .ok_or_else(AdmissionError::unsupported_exact_object)?;
-        let slot = SLOT.get_or_init(Default::default).lock().map_err(|_| {
-            AdmissionError::new(
-                AdmissionErrorKind::Unknown,
-                "admission slot poisoned before Check birth",
-            )
-        })?;
-        if execution.purpose != ExecPurpose::CheckConfig
-            || !execution.payload.candidate.root_helper
-            || !slot
-                .as_ref()
-                .is_some_and(|p| Arc::ptr_eq(p, &execution.payload))
-        {
-            return Err(AdmissionError::unsupported_exact_object());
-        }
-        execution.payload.prepare(ExecPurpose::CheckConfig)?;
-        let mut command = execution.payload.protected.root_command()?;
-        command
-            .args(["--disable-color", "check", "-c"])
-            .arg(self.snapshot.path()?)
-            .current_dir("/")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let lease = macos::attach_store_lease(
-            &mut command,
-            &self.lease,
-            &execution.payload.protected.lease,
-        )?;
-        execution.payload.prepare(ExecPurpose::CheckConfig)?;
-        let child = command.spawn()?;
-        Ok(StdCustodiedChild {
-            child: Some(child),
-            owner: Some(execution.payload),
-            lease_owner: Some(lease as Arc<dyn Send + Sync>),
-        })
-    }
-}
-
-/// A fixed private input left by a dead daemon is Unknown, never auto-recovered.
-#[cfg(target_os = "macos")]
-pub fn assert_macos_root_check_idle(store: &Path) -> Result<(), AdmissionError> {
-    macos::require_check_debt_absent(store)
-}
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct StdCustodiedChild {
     lease_owner: Option<Arc<dyn Send + Sync>>,
@@ -959,7 +713,7 @@ impl Drop for FixtureDirectory {
     }
 }
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn fixture(bytes: &[u8], purposes: Vec<ExecPurpose>) -> Arc<AdmittedPayload> {
+pub(crate) fn fixture(bytes: &[u8]) -> Arc<AdmittedPayload> {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1001,9 +755,6 @@ pub(crate) fn fixture(bytes: &[u8], purposes: Vec<ExecPurpose>) -> Arc<AdmittedP
         manifest,
         source: "b".repeat(40),
         tree: "c".repeat(40),
-        digest: "d".repeat(64),
-        purposes,
-        loader: "linux-sealed-fd-v1".into(),
     };
     let candidate = UntrustedPayload::bundled(directory.join("sing-box"));
     let protected = platform::protect_members(&candidate, &policy).unwrap();
@@ -1018,14 +769,3 @@ pub(crate) fn fixture(bytes: &[u8], purposes: Vec<ExecPurpose>) -> Arc<AdmittedP
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
-
-#[cfg(all(test, not(windows)))]
-#[test]
-fn foreign_windows_declaration_is_explicitly_unsupported() {
-    let error = SelectedPolicy::declaration(&serde_json::Value::Null, "", "", "win")
-        .expect_err("a foreign Windows declaration cannot grant execution");
-    assert_eq!(error.kind, AdmissionErrorKind::UnsupportedExactObject);
-}
-
-#[cfg(windows)]
-pub(crate) use windows::check_correlation as windows_check_correlation;

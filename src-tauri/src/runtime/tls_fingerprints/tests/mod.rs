@@ -261,10 +261,9 @@ fn authenticated_document_is_strict_data_and_cannot_replace_native_channel_bindi
     let mut proof = document();
     proof["sourceCommit"] = source.clone().into();
     proof["sourceModified"] = false.into();
-    let parse = |raw: &str, expected: &Value| {
-        Snapshot::from_authenticated_document(raw, expected, &source, "linux", "amd64", &sha)
-    };
-    assert!(parse(&proof.to_string(), &proof).is_ok());
+    let parse =
+        |raw: &str| Snapshot::from_authenticated_document(raw, &source, "linux", "amd64", &sha);
+    assert!(parse(&proof.to_string()).is_ok());
     for field in [
         "sourceCommit",
         "sourceModified",
@@ -277,22 +276,14 @@ fn authenticated_document_is_strict_data_and_cannot_replace_native_channel_bindi
     ] {
         let mut changed = proof.clone();
         changed[field] = serde_json::Value::Null;
-        assert!(parse(&changed.to_string(), &proof).is_err(), "{field}");
+        assert!(parse(&changed.to_string()).is_err(), "{field}");
     }
-    for expected in [Value::Null, serde_json::json!({}), {
-        let mut x = proof.clone();
-        x["modules"][0]["sum"] = "h1:different".into();
-        x
-    }] {
-        assert!(parse(&proof.to_string(), &expected).is_err());
-    }
-    assert!(parse("", &proof).is_err());
+    assert!(parse("").is_err());
     let mut unknown = proof.clone();
     unknown["extraPolicy"] = true.into();
-    assert!(parse(&unknown.to_string(), &proof).is_err());
+    assert!(parse(&unknown.to_string()).is_err());
     assert!(Snapshot::from_authenticated_document(
         &proof.to_string(),
-        &proof,
         &source,
         "darwin",
         "arm64",

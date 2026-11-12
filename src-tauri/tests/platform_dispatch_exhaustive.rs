@@ -270,36 +270,6 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         1,
         "SystemWindowsCheckClient::system is Windows-only and fixes the installed SYSTEM-authenticated pipe. Mac/Linux/Android/iOS/Other cannot construct this issuer; a token or generic injected stream cannot supply SYSTEM completion authority.",
     ),
-    (
-        "crates/helper-client/src/check_config.rs",
-        "if !matches!(self.platform(), Platform::Mac | Platform::Win)",
-        2,
-        "Both the typed exchange and Begin admission reject Linux/Android/iOS/Other before connecting. Only Mac/Windows enter their own closed Root/SYSTEM CheckConfig protocol; no unsupported platform obtains an execution owner or ordinary fallback.",
-    ),
-    (
-        "crates/helper-client/src/check_config.rs",
-        "Response::Ok(ResponseKind::MacCheck(reply)) if self.platform() == Platform::Mac && reply.key().core == core && expected.as_ref().is_none_or(|k| k == reply.key()) =>",
-        1,
-        "Only a Mac reply on a Mac client with the exact CoreId and optional original CheckKey can be accepted. Windows has a separate response family; Linux/Android/iOS/Other fail before transport, and a cross-platform reply never becomes completion authority.",
-    ),
-    (
-        "crates/helper-client/src/check_config.rs",
-        "Response::Ok(ResponseKind::WindowsCheck(reply)) if self.platform() == Platform::Win && reply.key().core == core && expected.as_ref().is_none_or(|k| k == reply.key()) =>",
-        1,
-        "Only the Windows response family on a Windows client may match the exact CoreId/CheckKey. Mac cannot consume a Windows reply; Linux/mobile/Other are rejected before transport. This generic wire data is still not a production retirement issuer.",
-    ),
-    (
-        "crates/helper-client/src/check_config.rs",
-        ")) if self.platform() == Platform::Mac && key.core == expected_core =>",
-        1,
-        "A Mac Begin reply must retain the expected CoreId and Mac response family. The preceding allowlist rejects Linux/Android/iOS/Other; Windows must receive its own Begun family and cannot borrow this Mac branch.",
-    ),
-    (
-        "crates/helper-client/src/check_config.rs",
-        ")) if self.platform() == Platform::Win && key.core == expected_core =>",
-        1,
-        "A Windows Begin reply must retain the expected CoreId and Windows response family. Mac uses its separate branch; Linux/Android/iOS/Other never send Begin. A mismatched or unknown reply keeps admission/cleanup unconfirmed rather than releasing custody.",
-    ),
     ("crates/helper-client/src/manager.rs", "let script = if self.platform == Platform::Linux", 1,
      "Linux uninstall carries the responsible-user baseline/config only into its finite dispatcher. Mac keeps retirement and Windows keeps the native cleaner; unsupported/mobile platforms are rejected before this site."),
     ("src-tauri/src/runtime/helper.rs", "if self.platform != Platform::Linux", 1,
@@ -577,15 +547,9 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/startup.rs",
-        "if matches!(platform, Platform::Mac | Platform::Win) || (platform == Platform::Linux && mode.effective_on(platform).is_tun())",
+        "if mode.effective_on(platform).is_tun() && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)",
         1,
-        "execution_route uses the closed Root/SYSTEM provider on Mac/Windows even in manual mode; Linux uses its helper only for TUN and retains direct sealed-FD admission otherwise. Android/iOS/Other do not obtain a desktop Helper route, and native mobile admission remains separate.",
-    ),
-    (
-        "src-tauri/src/runtime/proxy/startup.rs",
-        "mode.effective_on(self.helper.platform()).is_tun() && matches!( self.helper.platform(), Platform::Mac | Platform::Win | Platform::Linux )",
-        1,
-        "The inline cfg(test) business-fixture adapter retains its existing desktop TUN path-spawn boundary. Android/iOS/Other remain outside the helper allowlist. It is counted because production-file text is scanned; the normal-library acceptance carrier does not compile cfg(test), and the fixture cannot mint production execution authority.",
+        "execution_route sends only desktop TUN through the privileged Helper; system proxy/manual run as the ordinary user (Linux sealed FD, Mac/Windows hashed path). Android/iOS/Other do not obtain a desktop Helper route, and native mobile admission remains separate.",
     ),
     // ═══════════════════════════════════════════════════════════════════════
     // 2026-09-06 新进取材面的八处：`impl Platform` 块里写作 `Self::<Variant>` 的形态。
@@ -773,8 +737,8 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     (
         "src-tauri/src/runtime/proxy/startup.rs",
         "if matches!(self.helper.platform(), Platform::Mac | Platform::Win)",
-        2,
-        "Two distinct sites: production core_binary_for_start carries selected candidate data to the closed Mac/Windows issuer, and accepting a helper birth requires NativeBirth capability. Linux keeps its direct sealed-FD/helper LinuxBirth paths; Android/iOS/Other do not acquire desktop Helper execution or a pathname credential from either site.",
+        1,
+        "Accepting a helper birth requires NativeBirth capability on Mac/Windows. Linux keeps its LinuxBirth path; Android/iOS/Other do not acquire desktop Helper execution from this site.",
     ),
 
 ];
@@ -1653,19 +1617,11 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
-    (
-        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
-        "\"win\" => \"windowsExecution\", \"mac-x64\" | \"mac-arm64\" => \"macosExecution\", \"linux\" => \"sealedExecution\", _ => return Err(\"No platform execution report\".into()),",
-        1,
-        "This selects the expected proof field for the exact selected desktop source-contract row. Linux sealedExecution is distinct from Mac/Windows native Helper evidence; Android/iOS/unknown rows return an error. A selected row, CLI inventory or unknown string cannot mint running Helper authority.",
-    ),
 
     ("src-tauri/src/runtime/core_identity/tls_inventory.rs", "\"linux\" => \"linux/amd64\", \"win\" => \"windows/amd64\", \"mac-x64\" => \"darwin/amd64\", \"mac-arm64\" => \"darwin/arm64\", _ => return Err(reject()),", 1,
      "The compiled selected-support directory binds each of its four desktop rows to the exact target. Android/iOS/unknown platform strings reject rather than inherit a desktop target; the module is desktop-only, and this catalog mapping grants no execution or loaded-container evidence."),
     ("crates/core-supervisor/src/admitted_payload.rs", "if !matches!(platform, \"linux\" | \"win\" | \"mac-arm64\" | \"mac-x64\")", 1,
-     "SelectedPolicy::declaration has a closed four-desktop-row vocabulary. iOS/Android/new platforms reject before loader/purpose or physical admission; this does not authorize Windows or Mac execution."),
-    ("crates/core-supervisor/src/admitted_payload.rs", "if platform == \"linux\" && loader != \"linux-sealed-fd-v1\"", 1,
-     "The recognized Linux row additionally requires its exact sealed-fd loader. Other accepted rows retain their own platform admission; unknown/mobile rows have already failed the closed platform vocabulary."),
+     "SelectedPolicy::read_compiled has a closed four-desktop-row vocabulary. iOS/Android/new platforms reject before physical admission."),
     ("crates/core-supervisor/src/selected_core/development.rs", "if platform != \"linux\"", 1,
      "The explicit compile-time local-development lane supports Linux only. Windows/Mac/mobile/unknown cannot consume local receipts or acquire Formal/purpose authority; the ordinary default lane is unchanged."),
     ("crates/helper/src/linux_legacy_maintenance.rs", "require( selected.id == request.id && selected.core.platform == \"linux\" && selected.core.helper_sha256.as_deref() == Some(request.helper_sha.as_str()), \"selected manifest/pin differs\", )?", 1,
@@ -2514,13 +2470,6 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
-    (
-        "src-tauri/src/runtime/proxy/core_binary.rs",
-        "any( not(test), all(debug_assertions, desktop, feature = \"native-production-verification\") )",
-        3,
-        IosSide::WithAndroid,
-        "The Helper candidate data type, its impl and resolver follow their actual consumers: normal startup remains present on every production target; lib-test includes them only for the debug desktop native acceptance carrier. Android/iOS production remain same-side and neither receives desktop execution authority. Release lib-test and ordinary business fixtures do not retain an unused acceptance resolver.",
-    ),
     (
         "src-tauri/src/runtime/proxy.rs",
         "desktop",
@@ -4070,48 +4019,6 @@ fn cfg_evaluator_answers_both_ways() {
 }
 
 #[test]
-fn helper_candidate_scope_matches_normal_and_debug_native_consumers() {
-    let source = polaris_source_probe::repo_file!("src-tauri/src/runtime/proxy/core_binary.rs");
-    let predicates = cfg_predicates(&mask_comments(&source));
-    let native: Vec<_> = predicates
-        .iter()
-        .filter(|predicate| predicate.contains("feature = \"native-production-verification\""))
-        .collect();
-    assert_eq!(
-        native.len(),
-        3,
-        "type, impl and resolver must share the actual consumer scope"
-    );
-    for predicate in native {
-        for test in [false, true] {
-            for debug_assertions in [false, true] {
-                for native_production_verification in [false, true] {
-                    for (target_os, desktop) in [
-                        ("linux", true),
-                        ("macos", true),
-                        ("windows", true),
-                        ("android", false),
-                        ("ios", false),
-                    ] {
-                        let env = CfgEnv {
-                            target_os,
-                            debug_assertions,
-                            mobile: !desktop,
-                            desktop,
-                            test,
-                            native_production_verification,
-                        };
-                        let expected = !test
-                            || (debug_assertions && desktop && native_production_verification);
-                        assert_eq!(eval_cfg(predicate, env), Some(expected), "{predicate}: os={target_os}, test={test}, debug={debug_assertions}, feature={native_production_verification}");
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn independent_check_admission_excludes_ios_ne_but_retains_desktop_gate() {
     let source =
         std::fs::read_to_string(repo_root().join("src-tauri/src/runtime/proxy/startup.rs"))
@@ -4485,7 +4392,9 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // obsolete TLS wrapper retires two. Standalone debug carrier attributes do
     // not mention the mobile axis. No existing debt site changes.
     // R15: one separate debug/feature/desktop session-holder export; no debt changed.
-    ("WithAndroid", 144),
+    // Route batch 1 deletes the unused Helper candidate data type, impl and
+    // resolver (3 same-side sites). No debt changed.
+    ("WithAndroid", 141),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

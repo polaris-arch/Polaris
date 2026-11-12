@@ -93,13 +93,6 @@ pub struct SpawnedCore {
 /// macOS helper 的服务 bundle —— 把所有外部依赖（token 存储、命令执行、child 状态）打包成一个 trait，
 /// 便于测试注入 mock、生产注入真实实现。
 pub trait MacServices: Send + Sync {
-    fn check_config(
-        &self,
-        _uid: u32,
-        _request: &polaris_helper_proto::check_config::CheckRequest,
-    ) -> Result<polaris_helper_proto::check_config::CheckReply, SpawnError> {
-        Err(SpawnError::NotImplemented)
-    }
     fn upgrade_admission(&self, _close: bool) -> bool {
         false
     }
@@ -305,25 +298,6 @@ pub fn dispatch_from_peer(
     // 其余命令在「临界区」内处理 —— 这里用 child() mutex 体现互斥语义
     // （实际生产由 server 层在调 dispatch 前后包 mu；本函数内部对 child 状态的访问仍走 mutex）
     match req {
-        Request::MacCheck(request) => {
-            let Some(uid) = peer_uid else {
-                return Response::Err(ProtoError::new(ErrorCode::Auth));
-            };
-            if !services.native_caller_allowed(Some(uid), Some(request.core())) {
-                return Response::Err(ProtoError::new(ErrorCode::Auth));
-            }
-            match services.check_config(uid, request) {
-                Ok(reply) => Response::Ok(ResponseKind::MacCheck(reply)),
-                Err(SpawnError::NotImplemented) => Response::Err(ProtoError::with_detail(
-                    ErrorCode::Unknown,
-                    "helper-check-unsupported",
-                )),
-                Err(SpawnError::Failed(error)) => Response::Err(ProtoError::with_detail(
-                    ErrorCode::BadArgs,
-                    error.replace(['\r', '\n'], " "),
-                )),
-            }
-        }
         Request::PrepareHelperUpgrade | Request::CancelHelperUpgrade => {
             if peer_uid != Some(0) {
                 return Response::Err(ProtoError::new(ErrorCode::Auth));
@@ -497,8 +471,7 @@ pub fn dispatch_from_peer(
             Response::Err(ProtoError::new(ErrorCode::Unknown))
         }
         // 以下命令不属于 mac helper 谱系（LinuxStart/IfaceMetric/Uninstall）
-        Request::WindowsCheck(_)
-        | Request::LinuxStart(_)
+        Request::LinuxStart(_)
         | Request::LinuxStartPinned(_)
         | Request::LinuxStop { .. }
         | Request::LinuxStartBirth(_)

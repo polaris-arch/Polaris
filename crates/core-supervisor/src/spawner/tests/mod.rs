@@ -74,14 +74,7 @@ mod process;
 fn only_admitted_main_with_explicit_absolute_utf8_directory_gets_recovery_root() {
     use crate::admitted_payload::{fixture, ExecPurpose};
     let directory = PathBuf::from("/explicit state/测试");
-    let payload = fixture(
-        b"#!/bin/sh\nexit 0\n",
-        vec![
-            ExecPurpose::RunMain,
-            ExecPurpose::RunLogin,
-            ExecPurpose::RunSpeedtest,
-        ],
-    );
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     for purpose in [
         ExecPurpose::RunMain,
         ExecPurpose::RunLogin,

@@ -520,7 +520,6 @@ fn closed_native_configuration_scope(
         && c.contains(&names)
         && run.contains("DIRECTORY.set(dir.clone()).map_err(|_|\"onecaseperprocess\")?;")
         && run.contains("RUNTIME.set(runtime.clone()).map_err(|_|\"onecaseperprocess\")?;")
-        && c.contains("ProxyModeType::Manual.effective_on(runtime.helper.platform())")
         && c.contains("obj.insert(\"proxyModeType\".into(),serde_json::json!(\"manual\"));")
         && c.contains("\"proxyModeType\":\"manual\",")
         && !c.contains("\"allowLan\"") && !c.contains("allow_lan")
@@ -586,7 +585,6 @@ fn assert_native_scope_controls(faces: &[String; 7]) {
         (2,"let session = session::CaseSession::open(case)?;","let session = unbound_session();"),
         (2,"serde_json::json!(\"manual\")","serde_json::json!(\"tun\")"),
         (2,"\"proxyModeType\": \"manual\"","\"proxyModeType\": \"systemProxy\""),
-        (2,".effective_on(runtime.helper.platform())",".without_platform_projection()"),
         (2,"runtime.shutdown_for_exit()","pretend_cleanup()"),
         (2,"polaris_core_supervisor::shutdown_checks_for_exit()","pretend_check_cleanup()"),
         (3,"polaris_updater::sha256_hex(caller()?.as_bytes())","polaris_updater::sha256_hex(b\"another-caller\")"),

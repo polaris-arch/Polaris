@@ -32,6 +32,7 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(any(target_os = "macos", windows))]
 pub mod check_config;
 pub mod client;
 pub mod connector;

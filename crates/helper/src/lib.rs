@@ -78,7 +78,6 @@ pub mod core_cli;
 pub mod core_hash;
 pub mod core_objects;
 pub mod core_store;
-pub mod exact_start;
 pub mod helper_policy;
 pub mod legacy_use;
 pub mod line_io;

@@ -87,7 +87,6 @@ export interface CoreVersionInfo {
     recovery: 'none' | 'reinstallCurrentApp';
     coreId?: string;
     sourceCommit?: string;
-    policySha256?: string;
   };
   /**
    * 对安装包里的内核文件执行 `version` 读到的版本；读不到时为空串（不回落到清单声明的版本）。

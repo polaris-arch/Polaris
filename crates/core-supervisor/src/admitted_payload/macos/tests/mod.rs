@@ -32,19 +32,7 @@ fn expected(bytes: &[u8]) -> polaris_helper_proto::core_manifest::CoreFile {
     }
 }
 #[test]
-fn root_scope_cannot_be_selected_by_an_ordinary_input_or_purpose() {
-    for purpose in [
-        ExecPurpose::CheckConfig,
-        ExecPurpose::TlsInventory,
-        ExecPurpose::RunMain,
-        ExecPurpose::RunLogin,
-        ExecPurpose::RunSpeedtest,
-    ] {
-        let error =
-            admit_selected(UntrustedPayload::bundled("/missing/sing-box"), purpose).unwrap_err();
-        assert_eq!(error.kind, AdmissionErrorKind::UnsupportedExactObject);
-        assert_eq!(error.purpose, Some(purpose));
-    }
+fn root_scope_cannot_be_selected_by_an_ordinary_process() {
     if require_root().is_err() {
         assert_eq!(
             admit_macos_root_helper_main(UntrustedPayload::bundled("/missing/sing-box"))
@@ -53,40 +41,6 @@ fn root_scope_cannot_be_selected_by_an_ordinary_input_or_purpose() {
             AdmissionErrorKind::UnsupportedExactObject
         );
     }
-}
-#[test]
-fn root_policy_is_exactly_check_main_and_five_fields() {
-    let source = "a".repeat(40);
-    let tree = "b".repeat(40);
-    let valid = serde_json::json!({"schema":"polaris-trusted-execution-v1",
-        "sourceCommit":source,"sourceTree":tree,"loader":"macos-root-private-v1",
-        "purposes":["check-config-v1","run-main-v1"]});
-    assert!(SelectedPolicy::declaration(&valid, &source, &tree, "mac-arm64").is_ok());
-    for platform in ["mac-arm64", "mac-x64"] {
-        for loader in ["linux-sealed-fd-v1", "macos-path-v1", ""] {
-            let mut bad = valid.clone();
-            bad["loader"] = serde_json::json!(loader);
-            assert!(SelectedPolicy::declaration(&bad, &source, &tree, platform).is_err());
-        }
-        for purposes in [
-            serde_json::json!([]),
-            serde_json::json!(["run-main-v1"]),
-            serde_json::json!(["run-main-v1", "check-config-v1"]),
-            serde_json::json!(["run-main-v1", "run-login-v1"]),
-            serde_json::json!(["check-config-v1"]),
-            serde_json::json!(["run-main-v1", "run-main-v1"]),
-        ] {
-            let mut bad = valid.clone();
-            bad["purposes"] = purposes;
-            assert!(SelectedPolicy::declaration(&bad, &source, &tree, platform).is_err());
-        }
-    }
-    let mut extra = valid.clone();
-    extra["root"] = serde_json::json!(true);
-    assert!(SelectedPolicy::declaration(&extra, &source, &tree, "mac-arm64").is_err());
-    let mut other = valid.clone();
-    other["sourceTree"] = serde_json::json!("c".repeat(40));
-    assert!(SelectedPolicy::declaration(&other, &source, &tree, "mac-arm64").is_err());
 }
 #[test]
 fn private_copy_is_a_new_inode_and_old_writer_cannot_change_its_bytes() {
@@ -139,7 +93,7 @@ fn private_copy_checks_actual_output_and_bounded_length() {
         AdmissionErrorKind::Mismatch
     );
     let mut oversized = expected(b"different");
-    oversized.bytes = MAX_MEMBER + 1;
+    oversized.bytes += 1;
     assert_eq!(
         copy_checked(&mut input, &mut copy, &oversized)
             .unwrap_err()

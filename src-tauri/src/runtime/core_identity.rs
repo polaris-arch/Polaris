@@ -154,18 +154,15 @@ pub(crate) fn prepare_admitted(
 ) -> Result<PreparedExecution, AdmissionError> {
     let data = selected_operation_data(payload.diagnostic_path(), purpose)?;
     let execution = payload.prepare(purpose)?;
+    // Linux attaches the recovery store lease to its sealed FD execution. The
+    // macOS/Windows ordinary loader hashes and runs the recovered path directly.
+    #[cfg(target_os = "linux")]
     if let Some(data) = data {
-        #[cfg(target_os = "linux")]
-        {
-            let lease = data.execution_lease()?.try_clone()?;
-            return execution.with_store_lease(std::sync::Arc::new(lease));
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = data;
-            return Err(AdmissionError::unsupported_exact_object());
-        }
+        let lease = data.execution_lease()?.try_clone()?;
+        return execution.with_store_lease(std::sync::Arc::new(lease));
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = data;
     Ok(execution)
 }
 pub(crate) fn acquire(purpose: ExecPurpose) -> Result<std::sync::Arc<AdmittedPayload>, String> {

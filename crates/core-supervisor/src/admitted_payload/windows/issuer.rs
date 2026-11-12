@@ -14,11 +14,9 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::*;
 
-pub(super) mod check_input;
 mod spawn;
 pub(super) use spawn::{spawn, ChildCustody};
 
-const MAX_IMAGE: u64 = 96 * 1024 * 1024;
 fn error(text: &'static str) -> AdmissionError {
     AdmissionError::new(AdmissionErrorKind::LoaderPolicy, text)
 }
@@ -305,7 +303,7 @@ fn private_parent(f: &File) -> io::Result<()> {
 }
 
 #[derive(Debug)]
-pub(super) struct Cohort {
+pub(in crate::admitted_payload) struct Cohort {
     root: PathBuf,
     final_exe: PathBuf,
     final_sidecar: PathBuf,
@@ -317,9 +315,6 @@ pub(super) struct Cohort {
     _birth_data_lease: File,
 }
 impl Cohort {
-    pub(super) fn root_directory(&self) -> PathBuf {
-        self.root.clone()
-    }
     pub(super) fn is_current(&self) -> bool {
         system_actor().is_ok()
             && self.files.iter().all(|(p, f, id)| {
@@ -415,15 +410,6 @@ pub(super) fn issue(
         }
     }
     private_parent(parents.last().ok_or_else(unavailable)?)?;
-    // A predecessor's private Check snapshot is durable Unknown debt. Never
-    // delete or adopt it during a new cohort issue.
-    if !matches!(fs::symlink_metadata(support.join(".validation-check")), Err(e) if e.kind() == io::ErrorKind::NotFound)
-    {
-        return Err(AdmissionError::new(
-            AdmissionErrorKind::Unknown,
-            "SYSTEM Check input/custody remains unconfirmed",
-        ));
-    }
     let descriptor = Descriptor::private()?;
     let sa = descriptor.attributes();
     // Keep the real existing StartShared lock across marker creation/open and
@@ -525,10 +511,7 @@ pub(super) fn issue(
         ));
     }
     for member in &policy.manifest.files {
-        if !["sing-box.exe", "libcronet.dll"].contains(&member.name.as_str())
-            || member.bytes == 0
-            || member.bytes > MAX_IMAGE
-        {
+        if !["sing-box.exe", "libcronet.dll"].contains(&member.name.as_str()) || member.bytes == 0 {
             return Err(error("unsupported Windows executable cohort"));
         }
         let source = guard(&version.join(&member.name), false)?;

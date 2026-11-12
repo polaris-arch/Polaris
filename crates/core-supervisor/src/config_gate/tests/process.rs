@@ -7,9 +7,7 @@ use crate::{
 fn execution() -> crate::admitted_payload::PreparedExecution {
     use crate::admitted_payload::{fixture, ExecPurpose};
     let bytes = polaris_source_probe::crate_bytes!("src/config_gate/tests/check-probe.sh");
-    fixture(&bytes, vec![ExecPurpose::CheckConfig])
-        .prepare(ExecPurpose::CheckConfig)
-        .unwrap()
+    fixture(&bytes).prepare(ExecPurpose::CheckConfig).unwrap()
 }
 
 // Production validation custody is process-wide and deliberately refuses new

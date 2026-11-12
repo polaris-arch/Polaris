@@ -62,11 +62,6 @@ pub use check_custody::{
     shutdown_checks_for_exit, with_check_admission, with_check_producer_registration,
     AdmissionPause, CheckProducerView, ValidationLifecycleError,
 };
-#[cfg(target_os = "macos")]
-pub use check_custody::{
-    begin_macos_helper_check, macos_helper_check_request, request_macos_checks_shutdown,
-    run_macos_helper_check,
-};
 
 /// 单次 `sing-box check` 的超时。
 ///
@@ -522,9 +517,3 @@ pub fn verdict_from_libbox_check(result: Result<Option<String>, String>) -> Conf
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(windows)]
-pub use check_custody::{
-    begin_windows_helper_check, request_windows_checks_shutdown, run_windows_helper_check,
-    windows_helper_check_request,
-};

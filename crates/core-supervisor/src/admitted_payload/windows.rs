@@ -1,5 +1,5 @@
 //! SYSTEM Helper admission requires fresh private objects, a closed loader
-//! namespace and an atomic native factory. Ordinary App admission is refused.
+//! namespace and an atomic native factory. The ordinary App hashes and runs by path.
 use super::*;
 use std::fs::File;
 use std::os::windows::io::OwnedHandle;
@@ -10,8 +10,6 @@ use std::os::windows::io::OwnedHandle;
 )]
 mod issuer;
 mod pe;
-
-const LOADER: &str = "windows-helper-private-cohort-v1";
 
 /// Occupancy only, never an execution credential. CoreStore calls this AFTER
 /// its normal exclusive id.lock and BEFORE any repair/GC/retention publication.
@@ -33,53 +31,36 @@ pub(super) fn unavailable() -> AdmissionError {
     )
 }
 
+/// SYSTEM Helper RunMain owns a private cohort; the ordinary App hashes and runs by path.
 #[derive(Debug)]
-pub(super) struct ProtectedMembers {
-    inner: Arc<issuer::Cohort>,
-}
-
-pub(super) fn declaration(
-    value: &serde_json::Value,
-    source: &str,
-    tree: &str,
-) -> Result<(Vec<ExecPurpose>, String), AdmissionError> {
-    const FIELDS: [&str; 5] = ["schema", "sourceCommit", "sourceTree", "loader", "purposes"];
-    if !value
-        .as_object()
-        .is_some_and(|o| o.len() == 5 && FIELDS.iter().all(|k| o.contains_key(*k)))
-        || value["schema"] != "polaris-trusted-execution-v1"
-        || value["sourceCommit"] != source
-        || value["sourceTree"] != tree
-        || value["loader"] != LOADER
-        || value["purposes"] != serde_json::json!(["check-config-v1", "run-main-v1"])
-    {
-        return Err(unavailable());
-    }
-    Ok((
-        vec![ExecPurpose::CheckConfig, ExecPurpose::RunMain],
-        LOADER.into(),
-    ))
+pub(super) enum ProtectedMembers {
+    Issuer(Arc<issuer::Cohort>),
+    Direct(super::direct::DirectMembers),
 }
 
 pub(super) fn protect_members(
     input: &UntrustedPayload,
     policy: &SelectedPolicy,
 ) -> Result<ProtectedMembers, AdmissionError> {
-    if policy.loader != LOADER
-        || policy.purposes != [ExecPurpose::CheckConfig, ExecPurpose::RunMain]
-    {
-        return Err(unavailable());
+    if issuer::system_actor().is_err() {
+        return super::direct::protect_members(input, policy).map(ProtectedMembers::Direct);
     }
-    Ok(ProtectedMembers {
-        inner: Arc::new(issuer::issue(input, policy)?),
-    })
+    Ok(ProtectedMembers::Issuer(Arc::new(issuer::issue(
+        input, policy,
+    )?)))
 }
 impl ProtectedMembers {
     pub(super) fn is_current(&self) -> bool {
-        self.inner.is_current()
+        match self {
+            Self::Issuer(cohort) => cohort.is_current(),
+            Self::Direct(direct) => direct.is_current(),
+        }
     }
     pub(super) fn command(&self) -> Result<tokio::process::Command, AdmissionError> {
-        Err(unavailable())
+        match self {
+            Self::Issuer(_) => Err(unavailable()),
+            Self::Direct(direct) => Ok(direct.command()),
+        }
     }
 }
 
@@ -131,11 +112,14 @@ impl PreparedExecution {
             return Err(unavailable());
         }
         self.payload.prepare(self.purpose)?;
+        let ProtectedMembers::Issuer(cohort) = &self.payload.protected else {
+            return Err(unavailable());
+        };
         if self.purpose != ExecPurpose::RunMain {
             return Err(unavailable());
         }
         issuer::spawn(
-            &self.payload.protected.inner,
+            cohort,
             config,
             cwd,
             ExecPurpose::RunMain,
@@ -146,130 +130,3 @@ impl PreparedExecution {
 
 #[cfg(test)]
 mod tests;
-
-/// Check child custody never exposes a process handle or mutable native command.
-pub(crate) struct WindowsCheckChild {
-    child: WindowsStartedChild,
-}
-#[allow(
-    unsafe_code,
-    reason = "wait and terminate only the retained exact Check process HANDLE"
-)]
-impl WindowsCheckChild {
-    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        use std::os::windows::{io::AsRawHandle, process::ExitStatusExt};
-        use windows_sys::Win32::{
-            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
-            System::Threading::{GetExitCodeProcess, WaitForSingleObject},
-        };
-        match unsafe { WaitForSingleObject(self.child.process.as_raw_handle(), 0) } {
-            WAIT_TIMEOUT => Ok(None),
-            WAIT_OBJECT_0 => {
-                let mut code = 0;
-                if unsafe { GetExitCodeProcess(self.child.process.as_raw_handle(), &mut code) } == 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(Some(std::process::ExitStatus::from_raw(code)))
-            }
-            _ => Err(std::io::Error::last_os_error()),
-        }
-    }
-    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
-        if unsafe {
-            windows_sys::Win32::System::Threading::TerminateProcess(
-                self.child.process.as_raw_handle(),
-                1,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    pub(crate) fn take_stdout(&mut self) -> Option<File> {
-        self.child.stdout.take()
-    }
-    pub(crate) fn take_stderr(&mut self) -> Option<File> {
-        self.child.stderr.take()
-    }
-}
-pub(crate) struct WindowsCheckInput {
-    execution: Option<PreparedExecution>,
-    snapshot: issuer::check_input::CheckSnapshot,
-}
-impl WindowsCheckInput {
-    pub(crate) fn append(&mut self, offset: usize, bytes: &[u8]) -> Result<(), AdmissionError> {
-        self.snapshot.append(offset, bytes)
-    }
-    pub(crate) fn seal(&mut self, len: usize, digest: &[u8; 32]) -> Result<(), AdmissionError> {
-        self.snapshot.seal(len, digest)
-    }
-    pub(crate) fn retire(&mut self) -> Result<(), AdmissionError> {
-        self.snapshot.retire()
-    }
-    pub(crate) fn spawn(&mut self) -> Result<WindowsCheckChild, AdmissionError> {
-        let execution = self.execution.take().ok_or_else(unavailable)?;
-        let slot = SLOT
-            .get_or_init(Default::default)
-            .lock()
-            .map_err(|_| unavailable())?;
-        if !slot
-            .as_ref()
-            .is_some_and(|p| Arc::ptr_eq(p, &execution.payload))
-            || execution.purpose != ExecPurpose::CheckConfig
-        {
-            return Err(unavailable());
-        }
-        execution.payload.prepare(ExecPurpose::CheckConfig)?;
-        let input = self.snapshot.input()?;
-        let cwd = execution.payload.protected.inner.root_directory();
-        let child = issuer::spawn(
-            &execution.payload.protected.inner,
-            input,
-            &cwd,
-            ExecPurpose::CheckConfig,
-            None,
-        )?;
-        Ok(WindowsCheckChild { child })
-    }
-}
-impl PreparedExecution {
-    pub(crate) fn windows_check_input(
-        self,
-        _lease: &File,
-    ) -> Result<WindowsCheckInput, AdmissionError> {
-        if self.purpose != ExecPurpose::CheckConfig {
-            return Err(unavailable());
-        }
-        self.payload.prepare(self.purpose)?;
-        let snapshot =
-            issuer::check_input::CheckSnapshot::create(Arc::clone(&self.payload.protected.inner))?;
-        Ok(WindowsCheckInput {
-            execution: Some(self),
-            snapshot,
-        })
-    }
-}
-
-#[allow(
-    unsafe_code,
-    reason = "OS CSPRNG produces correlation data, never an execution credential"
-)]
-pub(crate) fn check_correlation() -> Result<polaris_helper_proto::HelperBirthToken, AdmissionError>
-{
-    let mut bytes = [0u8; 16];
-    if unsafe {
-        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
-            std::ptr::null_mut(),
-            bytes.as_mut_ptr(),
-            bytes.len() as u32,
-            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    } != 0
-    {
-        return Err(unavailable());
-    }
-    Ok(polaris_helper_proto::HelperBirthToken::from_bytes(bytes))
-}

@@ -154,13 +154,13 @@ it('retains the actual data-restored notice after the refreshed admission card c
 });
 
 it('缺少能力使用真实检查更新入口，即使收到错误的重装建议也不承诺同版修复', () => {
-  const info: CoreVersionInfo = { ...FULL, admission: { state: 'rejected', kind: 'UnsupportedCapability', recovery: 'reinstallCurrentApp', sourceCommit: 'private-source-sha', policySha256: 'private-policy-sha' } };
+  const info: CoreVersionInfo = { ...FULL, admission: { state: 'rejected', kind: 'UnsupportedCapability', recovery: 'reinstallCurrentApp', sourceCommit: 'private-source-sha' } };
   const markup=renderToStaticMarkup(<CoreInfoCard info={info}/>);
   expect(markup).toContain('内核缺少此功能所需的支持，请更新应用。');
   expect(markup).toContain('href="#app-update-card"');
   expect(markup).toContain(translate('settings.about.checkUpdate'));
   expect(markup).not.toContain(translate('settings.update.reinstallCurrent'));
-  expect(markup).not.toContain('private-source');expect(markup).not.toContain('private-policy');
+  expect(markup).not.toContain('private-source');
 });
 it.each(['Missing','Mismatch','Changed'] as const)('真实 %s 损坏保留可信重装并先检查离线恢复', kind => {
   const info:CoreVersionInfo={...FULL,admission:{state:'rejected',kind,recovery:'reinstallCurrentApp'}};

@@ -313,7 +313,6 @@ fn fixed_arguments(
                 "\\".repeat(trailing)
             ))
         }
-        (ExecPurpose::CheckConfig, None) => Ok("--disable-color check -c stdin".into()),
         _ => Err(unavailable()),
     }
 }
@@ -326,9 +325,6 @@ pub(in super::super) fn spawn(
     runtime_directory: Option<&Path>,
 ) -> Result<WindowsStartedChild, AdmissionError> {
     system_actor()?;
-    if purpose == ExecPurpose::RunMain {
-        super::check_input::require_debt_absent(owner)?;
-    }
     if !owner.is_current() || !cwd.is_absolute() {
         return Err(error("Windows plan changed before spawn"));
     }

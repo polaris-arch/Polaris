@@ -17,7 +17,6 @@
 
 use crate::platform::windows::logic;
 use crate::platform::windows::ops::{NetTableOps, ProcOps};
-mod check_config;
 mod native_birth;
 use crate::token::{is_authed_constant_time, TokenStore};
 use native_birth::{stop_locked, NativeCustody};
@@ -340,8 +339,7 @@ where
     ) -> HandleOutcome {
         let _reservation = if matches!(
             &req,
-            Request::WindowsCheck(_)
-                | Request::NativeStartPinned(_)
+            Request::NativeStartPinned(_)
                 | Request::Cleanup
                 | Request::PrepareHelperUpgrade
                 | Request::CancelHelperUpgrade
@@ -391,13 +389,6 @@ where
             }
         }
         match req {
-            Request::WindowsCheck(request) => self.handle_check_config(&request, peer),
-            Request::MacCheck(_) => {
-                HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
-                    polaris_helper_proto::ErrorCode::Unknown,
-                    "helper-check-unsupported",
-                )))
-            }
             Request::PrepareHelperUpgrade | Request::CancelHelperUpgrade => {
                 if !peer.is_some_and(|peer| peer.administrator) {
                     return HandleOutcome::AuthFailed;
@@ -789,12 +780,6 @@ where
         }
         if state.native.is_some() || state.pid.is_some() || !self.proc.native_custody_empty() {
             return Err("helper child custody is not confirmed empty".into());
-        }
-        #[cfg(windows)]
-        if !polaris_core_supervisor::config_gate::request_windows_checks_shutdown()
-            .map_err(|e| e.to_string())?
-        {
-            return Err("SYSTEM Check shutdown remains unconfirmed".into());
         }
         Ok(())
     }

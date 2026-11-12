@@ -884,43 +884,7 @@ fn native_decoder_refuses_old_pinned_payload_and_wrong_v3_marker() {
 }
 
 #[test]
-fn check_chunk_decoder_and_dispatch_fail_closed_without_peer_or_platform_factory() {
-    use polaris_helper_proto::check_config::{CheckRequest, CHUNK_BYTES, COMMAND};
-    let request = CheckRequest::Begin {
-        core: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
-        bytes: 8 * 1024 * 1024,
-        sha256: [1; 32],
-    };
-    let mut args = Vec::new();
-    request.write_args(&mut args);
-    assert_eq!(
-        decode_request(COMMAND, &mut args.clone().into_iter()).unwrap(),
-        Request::MacCheck(request.clone())
-    );
-    args.push("extra".into());
-    assert!(decode_request(COMMAND, &mut args.into_iter()).is_err());
-    let services = TestServices::pinned_fixture("token");
-    for uid in [None, Some(1001)] {
-        let response = dispatch_from_peer(
-            &services,
-            &test_config(),
-            "token",
-            &Request::MacCheck(request.clone()),
-            uid,
-        );
-        assert!(matches!(response, polaris_helper_proto::Response::Err(_)));
-    }
-    let response = dispatch_from_peer(
-        &services,
-        &test_config(),
-        "token",
-        &Request::MacCheck(request),
-        Some(1000),
-    );
-    assert!(
-        matches!(response,polaris_helper_proto::Response::Err(e) if e.code==polaris_helper_proto::ErrorCode::Unknown)
-    );
-    assert_eq!(services.runner_calls(), 0);
+fn frame_reader_rejects_an_oversized_frame() {
     let mut frame = FrameReader {
         reader: std::io::Cursor::new(vec![b'x'; polaris_helper_proto::codec::MAX_FRAME_BYTES + 1]),
         bytes: 0,
@@ -932,5 +896,4 @@ fn check_chunk_decoder_and_dispatch_fail_closed_without_peer_or_platform_factory
         frame.bytes,
         polaris_helper_proto::codec::MAX_FRAME_BYTES + 1
     );
-    const { assert!(CHUNK_BYTES * 2 < MAX_WIRE_LINE_BYTES) };
 }

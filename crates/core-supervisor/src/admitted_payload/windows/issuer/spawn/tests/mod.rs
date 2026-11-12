@@ -148,11 +148,7 @@ fn native_atomic_job_close_is_fail_stop_without_post_spawn_assign() {
 }
 
 #[test]
-fn fixed_check_and_run_argv_are_separate_and_inventory_has_no_factory() {
-    assert_eq!(
-        fixed_arguments(ExecPurpose::CheckConfig, None).unwrap(),
-        "--disable-color check -c stdin"
-    );
+fn fixed_run_argv_is_the_only_factory() {
     assert_eq!(
         fixed_arguments(
             ExecPurpose::RunMain,
@@ -161,6 +157,7 @@ fn fixed_check_and_run_argv_are_separate_and_inventory_has_no_factory() {
         .unwrap(),
         r#"run -c stdin -D "C:\Users\测试 Account\Polaris""#
     );
+    assert!(fixed_arguments(ExecPurpose::CheckConfig, None).is_err());
     assert!(fixed_arguments(ExecPurpose::TlsInventory, None).is_err());
 }
 

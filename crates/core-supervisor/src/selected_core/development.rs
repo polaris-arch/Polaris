@@ -127,7 +127,6 @@ pub(super) fn manifest(platform: &str) -> Result<CoreManifest, String> {
         || contract["version"] != d["row"]["version"]
         || row["core"] != d["row"]["core"]
         || row["sidecar"] != d["row"]["sidecar"]
-        || row["trustedExecution"] != d["policy"]
         || row["providerFingerprint"] != d["providerFingerprint"]
         || row["sourceCommit"] != d["context"]["coreSource"]["commit"]
         || row["sourceTree"] != d["context"]["coreSource"]["tree"]

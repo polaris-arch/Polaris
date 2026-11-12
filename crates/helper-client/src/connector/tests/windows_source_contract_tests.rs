@@ -182,12 +182,15 @@ fn compact_code(raw: &str) -> String {
         .collect()
 }
 
-fn mac_system_route_is_closed(connector: &str, check: &str, registry: &str, app: &str) -> bool {
+fn mac_system_route_is_closed(connector: &str, check: &str, app: &str) -> bool {
     let c = compact_code(connector);
     let h = compact_code(check);
-    let r = compact_code(registry);
     let a = compact_code(app);
-    let Some(app_check) = balanced_block(&a, "pub(crate)asyncfncheck_config(&self,config:&Path,)->Result<polaris_core_supervisor::RawCheck,String>{") else {
+    // The macOS/Windows definition precedes its unsupported-platform twin.
+    let Some(app_status) = a
+        .split("pub(crate)fnprotected_native_core_status(&self)->Result<ManagedCoreStatus,String>{")
+        .nth(1)
+    else {
         return false;
     };
     let Some(root) = balanced_block(&c, "implConnectorforMacRootConnector{") else {
@@ -202,41 +205,23 @@ fn mac_system_route_is_closed(connector: &str, check: &str, registry: &str, app:
     let Some(ready) = root.find("Ok(Box::new(connection))") else {
         return false;
     };
-    for (owner, issuer, platform, operation, digest) in [
-        (
-            "SystemMacCheckClient",
-            "MacRootConnector",
-            "Mac",
-            "run_macos_check",
-            "sha256",
-        ),
-        (
-            "SystemWindowsCheckClient",
-            "WindowsSystemConnector",
-            "Win",
-            "run_windows_check",
-            "digest",
-        ),
+    for (owner, issuer, platform) in [
+        ("SystemMacCheckClient", "MacRootConnector", "Mac"),
+        ("SystemWindowsCheckClient", "WindowsSystemConnector", "Win"),
     ] {
         let Some(client) = balanced_block(&h, &format!("impl{owner}{{")) else {
             return false;
         };
         if !h.contains(&format!("pubstruct{owner}{{client:HelperClient,}}"))
-            || client.matches("pub").count() != 4
+            || client.matches("pub").count() != 2
             || !client.contains("pubfnsystem(token:String)->Result<Self,String>{")
             || !client.contains("pubfnnative_birth_status(&self,)->Result<polaris_helper_proto::response::NativeBirthStatus,String>{")
-            || !client.contains("pubfnrun_check(&self,core:CoreId,config:&[u8],digest:[u8;32],cancel:&AtomicBool,)->Result<HelperCheckOutput,HelperCheckFailure>{")
-            || !client.contains(&format!("pubfn{operation}(&self,core:CoreId,config:&[u8],{digest}:[u8;32],cancel:&AtomicBool,)->Result<HelperCheckOutput,HelperCheckFailure>{{"))
             || !client.contains(&format!("Box::new(crate::connector::{issuer}),Platform::{platform},token,"))
             || client.contains("Box<dyn")
             || h.contains(&format!("From<HelperClient>for{owner}"))
             || h.contains(&format!("Dereffor{owner}"))
         { return false; }
     }
-    let aliases: String = polaris_source_probe::mask_comments(registry)
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
     auth < ready
         && root.contains("UnixConnector::new(crate::manager::InstallPaths::mac().socket)")
         && root.contains(".connect_stream_until(deadline)?")
@@ -246,30 +231,20 @@ fn mac_system_route_is_closed(connector: &str, check: &str, registry: &str, app:
         && c.contains("pub(crate)structWindowsSystemConnector;")
         && windows.contains("crate::windows_pipe::WinPipeStream::connect_system()")
         && !windows.contains("PipeConnector")
-        && r.matches("typeSystemCheckClient=").count() == 2
-        && aliases.contains("#[cfg(target_os=\"macos\")]typeSystemCheckClient=polaris_helper_client::check_config::SystemMacCheckClient;")
-        && aliases.contains("#[cfg(windows)]typeSystemCheckClient=polaris_helper_client::check_config::SystemWindowsCheckClient;")
-        && r.contains("pubasyncfnrun_macos_helper_check(client:SystemCheckClient,")
-        && app_check.contains("letclient=polaris_helper_client::check_config::SystemMacCheckClient::system(read_token(&self.token_path()),)?;")
-        && app_check.contains("letclient=polaris_helper_client::check_config::SystemWindowsCheckClient::system(read_token(&self.token_path()),)?;")
-        && app_check.contains("ifself.never_connect||self.test_connector.is_some(){returnErr(")
+        && app_status.contains("letclient=polaris_helper_client::check_config::SystemMacCheckClient::system(read_token(&self.token_path()),)?;")
+        && app_status.contains("letclient=polaris_helper_client::check_config::SystemWindowsCheckClient::system(read_token(&self.token_path()),)?;")
+        && app_status.contains("ifself.never_connect||self.test_connector.is_some(){returnErr(")
 }
 
 #[test]
-fn generic_same_key_wire_data_cannot_become_production_check_retirement() {
+fn generic_wire_data_cannot_become_the_production_system_client() {
     let connector = polaris_source_probe::crate_source!("connector.rs");
     let check = polaris_source_probe::crate_source!("check_config.rs");
-    let registry = polaris_source_probe::repo_file_in(
-        env!("CARGO_MANIFEST_DIR"),
-        "crates/core-supervisor/src/config_gate/check_custody/macos.rs",
-    );
     let app = polaris_source_probe::repo_file_in(
         env!("CARGO_MANIFEST_DIR"),
         "src-tauri/src/runtime/helper.rs",
     );
-    assert!(mac_system_route_is_closed(
-        &connector, &check, &registry, &app
-    ));
+    assert!(mac_system_route_is_closed(&connector, &check, &app));
     for (slot, old, new) in [
         (
             0,
@@ -294,43 +269,24 @@ fn generic_same_key_wire_data_cannot_become_production_check_retirement() {
         ),
         (
             2,
-            "client: SystemCheckClient,",
-            "client: polaris_helper_client::HelperClient,",
-        ),
-        (
-            3,
             "polaris_helper_client::check_config::SystemMacCheckClient::system(",
             "self.build_client(",
         ),
         (1, "impl SystemMacCheckClient {", "impl UntrustedClient {"),
-        (1, "    pub fn run_macos_check(", "    pub fn caller_transport("),
         (1, "    pub fn native_birth_status(", "    fn native_birth_status("),
         (1, "impl SystemWindowsCheckClient {", "impl SystemWindowsCheckClient {\n    pub fn from_client(client: HelperClient) -> Self { Self { client } }"),
         (1, "Box::new(crate::connector::WindowsSystemConnector)", "caller_supplied_connector"),
-        (2, "#[cfg(windows)]\ntype SystemCheckClient", "#[cfg(unix)]\ntype SystemCheckClient"),
-        (2, "type SystemCheckClient = polaris_helper_client::check_config::SystemWindowsCheckClient;", "type SystemCheckClient = polaris_helper_client::check_config::SystemMacCheckClient;"),
-        (3, "polaris_helper_client::check_config::SystemWindowsCheckClient::system(", "self.build_client("),
-        (3, "if self.never_connect || self.test_connector.is_some()", "if false"),
+        (2, "polaris_helper_client::check_config::SystemWindowsCheckClient::system(", "self.build_client("),
+        (2, "if self.never_connect || self.test_connector.is_some()", "if false"),
     ] {
-        let mut faces = [
-            connector.clone(),
-            check.clone(),
-            registry.clone(),
-            app.clone(),
-        ];
+        let mut faces = [connector.clone(), check.clone(), app.clone()];
         assert!(
             faces[slot].contains(old),
             "negative control must bind actual source: {old}"
         );
         faces[slot] = faces[slot].replacen(old, new, 1);
-        if slot == 3 {
-            assert!(
-                faces[slot].contains(old),
-                "the neighboring status query must remain as a decoy: {old}"
-            );
-        }
         assert!(
-            !mac_system_route_is_closed(&faces[0], &faces[1], &faces[2], &faces[3]),
+            !mac_system_route_is_closed(&faces[0], &faces[1], &faces[2]),
             "caller IO/peer/path/accessor regression was not denied: {old}"
         );
     }

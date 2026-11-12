@@ -7,9 +7,7 @@ use crate::{SingBoxSpawner, SpawnRequest, StdioPolicy, TokioSpawner};
 fn execution() -> crate::admitted_payload::PreparedExecution {
     use crate::admitted_payload::{fixture, ExecPurpose};
     let bytes = polaris_source_probe::crate_bytes!("src/spawner/tests/argv-probe.sh");
-    fixture(&bytes, vec![ExecPurpose::RunMain])
-        .prepare(ExecPurpose::RunMain)
-        .unwrap()
+    fixture(&bytes).prepare(ExecPurpose::RunMain).unwrap()
 }
 
 /// 灌多少字节到 stderr。1 MiB ≫ Linux 64 KiB / macOS 16 KiB 的管道容量，没人读必卡死。

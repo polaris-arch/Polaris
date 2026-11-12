@@ -42,14 +42,13 @@ pub async fn core_get_version_info(
         );
         // Admission diagnostics never run an unknown executable to ask its
         // version. Recovery links use the existing verified App reinstall flow.
-        let admission = core_admission_info(
-            cfg!(target_os = "macos"),
+        info["admission"] = core_admission_info(
             polaris_core_supervisor::admitted_payload::check_selected_capability(
                 crate::runtime::core_identity::ExecPurpose::CheckConfig,
             ),
             || match crate::runtime::proxy::resolve_core_candidate() {
             Ok(path)=>match crate::runtime::core_identity::acquire_at(&path,crate::runtime::core_identity::ExecPurpose::CheckConfig) {
-                Ok(payload)=>json!({"state":"admitted","coreId":payload.id().as_str(),"sourceCommit":payload.source_commit(),"policySha256":payload.policy_digest(),"recovery":"none"}),
+                Ok(payload)=>json!({"state":"admitted","coreId":payload.id().as_str(),"sourceCommit":payload.source_commit(),"recovery":"none"}),
                 Err(error)=>json!({"state":"rejected","kind":format!("{:?}",error.kind),"recovery":match error.recovery {polaris_core_supervisor::admitted_payload::RecoveryAction::ReinstallCurrentApp=>"reinstallCurrentApp",_=>"none"}}),
             },
             Err(error)=> {
@@ -58,9 +57,6 @@ pub async fn core_get_version_info(
             },
             },
         );
-        if let Some(admission) = admission {
-            info["admission"] = admission;
-        }
         info
     })
     .await;
@@ -70,22 +66,18 @@ pub async fn core_get_version_info(
     })
 }
 
-/// A successful static macOS capability describes the Root Helper route, not
-/// admission of an executable in this ordinary App process. Its live status is
-/// reported by the Helper card; absence here never claims runtime admission.
+/// A static capability refusal is reported without attempting admission.
 pub(super) fn core_admission_info(
-    helper_owns_execution: bool,
     capability: Result<(), polaris_core_supervisor::admitted_payload::AdmissionError>,
     direct: impl FnOnce() -> Value,
-) -> Option<Value> {
+) -> Value {
     match capability {
-        Err(error) => Some(json!({
+        Err(error) => json!({
             "state": "rejected",
             "kind": format!("{:?}", error.kind),
             "recovery": "none",
-        })),
-        Ok(()) if helper_owns_execution => None,
-        Ok(()) => Some(direct()),
+        }),
+        Ok(()) => direct(),
     }
 }
 

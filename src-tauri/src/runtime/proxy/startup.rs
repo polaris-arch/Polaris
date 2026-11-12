@@ -79,7 +79,6 @@ use polaris_config_engine::user_config::ProxyModeType;
 use polaris_core_supervisor::port_bookkeeping::{
     FreePortProvider, PrimaryApiPortLedger, ResolvedPort, TokioPortProvider,
 };
-#[cfg(not(any(target_os = "macos", windows)))]
 use polaris_core_supervisor::run_config_check;
 use polaris_core_supervisor::{
     core_ready_budget_ms, core_startup_estimate_ms, decide_peel, wait_for_core_ready,
@@ -644,10 +643,8 @@ pub enum HelperGateDecision {
 
 /// **C6-5 起核路由决策（纯函数）**：是否经提权 helper 起核（而非 [`TokioSpawner`] 直起）。
 ///
-/// 判据按平台执行发行者区分：macOS/Windows 始终经 helper；Linux 仅 TUN 经 helper。
-/// Execution route is separate from network takeover. macOS/Windows use the
-/// existing closed Root/SYSTEM provider for selected CheckConfig and RunMain,
-/// including manual/no-TUN. Linux manual retains direct sealed-FD admission.
+/// 判据：三桌面平台只有 TUN 经 helper；系统代理 / 手动由 App 以用户身份直起
+/// （Linux 为 sealed-FD，macOS/Windows 为哈希核对后按路径执行）。
 /// Mobile/unknown platform behavior remains on its existing direct/libbox route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ExecutionRoute {
@@ -655,8 +652,8 @@ pub(super) enum ExecutionRoute {
     PrivilegedHelper,
 }
 pub(super) fn execution_route(mode: ProxyModeType, platform: Platform) -> ExecutionRoute {
-    if matches!(platform, Platform::Mac | Platform::Win)
-        || (platform == Platform::Linux && mode.effective_on(platform).is_tun())
+    if mode.effective_on(platform).is_tun()
+        && matches!(platform, Platform::Mac | Platform::Win | Platform::Linux)
     {
         ExecutionRoute::PrivilegedHelper
     } else {
@@ -827,30 +824,11 @@ impl ProxyRuntime {
     }
 
     fn helper_execution_for_start(&self, mode: ProxyModeType) -> bool {
-        // Unit business fixtures retain their ordinary path-spawn boundary.
-        // They do not exercise or mint production admission. The separate
-        // normal-library driver contains no cfg(test) branch.
-        #[cfg(test)]
-        {
-            mode.effective_on(self.helper.platform()).is_tun()
-                && matches!(
-                    self.helper.platform(),
-                    Platform::Mac | Platform::Win | Platform::Linux
-                )
-        }
-        #[cfg(not(test))]
-        {
-            should_start_via_helper(mode, self.helper.platform())
-        }
+        should_start_via_helper(mode, self.helper.platform())
     }
 
-    /// Production helper paths carry candidate data only; direct paths require admission.
     #[cfg(not(test))]
     pub(super) fn core_binary_for_start(&self) -> Result<PathBuf, String> {
-        if matches!(self.helper.platform(), Platform::Mac | Platform::Win) {
-            return super::core_binary::resolve_helper_candidate_data()
-                .map(|data| data.into_path());
-        }
         resolve_core_binary()
     }
 
@@ -948,19 +926,6 @@ impl ProxyRuntime {
         // 下面两条腿共用：分两次取不仅多付一次调用，还会让两条腿看到不一致的世界
         // （例如「判未装 → 弹安装框」与「判已装 → 弹升级框」同时成立）。
         let status = self.helper.status();
-        // Extending the existing issuer to manual/no-TUN does not authorize
-        // an installer or a new elevation prompt. Keep the explicit settings action.
-        if !mode.effective_on(self.helper.platform()).is_tun() {
-            if status.installed {
-                return Ok(());
-            }
-            self.set_error(HELPER_NOT_INSTALLED_MSG, code::HELPER_NOT_INSTALLED);
-            return Err(StartError::coded(
-                HELPER_NOT_INSTALLED_MSG,
-                code::HELPER_NOT_INSTALLED,
-            ));
-        }
-
         // ── 腿 2：**已装** → 起核本身没有障碍，唯一可能要做的是「可升级」的温和提示。
         //
         // 本腿的返回类型是 `()`，结构上产不出 `Err` —— 那正是「永不阻断」这条决策的落点：
@@ -4377,18 +4342,8 @@ impl ProxyRuntime {
         if let Some(verdict) = self.business_kernel_check_result(binary, config) {
             return verdict;
         }
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            let _ = binary; // Core identity comes from the compiled selection, not this data path.
-            return self
-                .helper
-                .check_config(config)
-                .await
-                .map(polaris_core_supervisor::config_gate::decide_verdict);
-        }
         // The default in every build still requires the sole real admission
         // factory. A mock verdict is neither a Prepared nor a native birth.
-        #[cfg(not(any(target_os = "macos", windows)))]
         run_config_check(
             crate::runtime::core_identity::prepare(
                 binary,

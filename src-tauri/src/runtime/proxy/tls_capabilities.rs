@@ -220,18 +220,6 @@ impl ProxyRuntime {
             if capabilities.tls_fingerprint_capabilities_json.is_empty() {
                 return Err("Running core has no TLS capability report".into());
             }
-            let contract: serde_json::Value =
-                serde_json::from_str(polaris_core_supervisor::selected_core::selected_contract()?)
-                    .map_err(|e| e.to_string())?;
-            let row = &contract["platforms"][platform];
-            let proof_field = match platform {
-                "win" => "windowsExecution",
-                "mac-x64" | "mac-arm64" => "macosExecution",
-                "linux" => "sealedExecution",
-                _ => return Err("No platform execution report".into()),
-            };
-            let expected_doc =
-                &row["finalPackageCronetSmoke"][proof_field]["tlsProbe"]["capabilities"];
             let arch = match std::env::consts::ARCH {
                 "x86_64" => "amd64",
                 "aarch64" => "arm64",
@@ -244,7 +232,6 @@ impl ProxyRuntime {
             };
             let mut snapshot = Snapshot::from_authenticated_document(
                 &capabilities.tls_fingerprint_capabilities_json,
-                expected_doc,
                 &source,
                 os,
                 arch,

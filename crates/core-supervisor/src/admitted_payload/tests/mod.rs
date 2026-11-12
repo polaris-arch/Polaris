@@ -10,10 +10,7 @@ async fn initialization_exits_retire_unregistered_plans_but_keep_actual_child_an
     use std::fs::{self, OpenOptions};
     let directories = ["versions", "manifests", ".staging", ".trash", "leases"];
     for failure in std::iter::once("root").chain(directories) {
-        let payload = fixture(
-            b"#!/bin/sh\nread line\nexit 0\n",
-            vec![ExecPurpose::CheckConfig, ExecPurpose::RunMain],
-        );
+        let payload = fixture(b"#!/bin/sh\nread line\nexit 0\n");
         let check = payload.prepare(ExecPurpose::CheckConfig).unwrap();
         let run = payload.prepare(ExecPurpose::RunMain).unwrap();
         let root = payload
@@ -98,7 +95,7 @@ async fn initialization_exits_retire_unregistered_plans_but_keep_actual_child_an
 #[test]
 fn retirement_on_exit_also_runs_on_unwind_and_success() {
     for unwind in [false, true] {
-        let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+        let payload = fixture(b"#!/bin/sh\nexit 0\n");
         let queued = payload.prepare(ExecPurpose::RunMain).unwrap();
         let slot = Mutex::new(Some(payload));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -119,7 +116,7 @@ fn retirement_on_exit_also_runs_on_unwind_and_success() {
 
 #[test]
 fn explicit_retirement_revokes_queued_plans_without_turning_data_into_admission() {
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let execution = payload.prepare(ExecPurpose::RunMain).unwrap();
     payload
         .retired
@@ -136,10 +133,7 @@ async fn operation_lease_survives_native_exec_and_idle_admission_does_not_retain
     ) {
         return;
     }
-    let payload = fixture(
-        b"#!/bin/sh\nread line\nexit 0\n",
-        vec![ExecPurpose::RunMain],
-    );
+    let payload = fixture(b"#!/bin/sh\nread line\nexit 0\n");
     let path = std::env::temp_dir().join(format!(
         "polaris-operation-lease-{}-{}",
         std::process::id(),
@@ -191,7 +185,7 @@ use crate::{SingBoxSpawner, SpawnRequest, StdioPolicy, TokioSpawner};
 
 #[test]
 fn warm_issue_reuses_same_protected_cohort_and_changed_source_evicts_before_failure() {
-    let original = fixture(b"#!/bin/sh\necho selected\n", vec![ExecPurpose::RunMain]);
+    let original = fixture(b"#!/bin/sh\necho selected\n");
     let mut slot = None;
     let input = original.candidate.clone();
     let first = admit_into(&mut slot, input.clone(), ExecPurpose::RunMain, || {
@@ -235,10 +229,7 @@ fn warm_issue_reuses_same_protected_cohort_and_changed_source_evicts_before_fail
 
 #[tokio::test]
 async fn prepared_factory_executes_sealed_original_after_namespace_race() {
-    let payload = fixture(
-        b"#!/bin/sh\nprintf 'original:%s:%s:%s' \"$1\" \"$2\" \"$3\"\n",
-        vec![ExecPurpose::RunMain],
-    );
+    let payload = fixture(b"#!/bin/sh\nprintf 'original:%s:%s:%s' \"$1\" \"$2\" \"$3\"\n");
     let execution = payload.prepare(ExecPurpose::RunMain).unwrap();
     let mut command = execution.command().unwrap();
     command.args(["run", "-c", "marker"]);
@@ -256,11 +247,7 @@ async fn prepared_factory_executes_sealed_original_after_namespace_race() {
 
 #[test]
 fn purpose_cannot_upgrade_check_only_or_inventory_to_run() {
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::CheckConfig]);
-    assert_eq!(
-        payload.prepare(ExecPurpose::RunMain).unwrap_err().kind,
-        AdmissionErrorKind::UnsupportedCapability
-    );
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let execution = payload.prepare(ExecPurpose::CheckConfig).unwrap();
     let error = TokioSpawner::new()
         .spawn(SpawnRequest::new(execution, "unused", StdioPolicy::Discard))
@@ -276,7 +263,7 @@ fn purpose_cannot_upgrade_check_only_or_inventory_to_run() {
 
 #[tokio::test]
 async fn native_command_clears_ambient_environment_and_only_injects_internal_selector() {
-    let payload = fixture(b"#!/bin/sh\nenv\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nenv\n");
     let execution = payload.prepare(ExecPurpose::RunMain).unwrap();
     let mut command = execution.command().unwrap();
     let output = command.output().await.unwrap();
@@ -293,10 +280,7 @@ async fn native_command_clears_ambient_environment_and_only_injects_internal_sel
 
 #[tokio::test]
 async fn validation_rejects_wrong_purpose_before_birth() {
-    let payload = fixture(
-        b"#!/bin/sh\nexit 0\n",
-        vec![ExecPurpose::CheckConfig, ExecPurpose::TlsInventory],
-    );
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let config =
         std::env::temp_dir().join(format!("polaris-admit-check-{}.json", std::process::id()));
     std::fs::write(&config, b"{}").unwrap();
@@ -316,7 +300,7 @@ async fn validation_rejects_wrong_purpose_before_birth() {
 
 #[test]
 fn compiled_selection_never_accepts_foreign_same_named_files_or_disk_manifest() {
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let error = admit_selected(payload.candidate.clone(), ExecPurpose::RunMain).unwrap_err();
     assert!(matches!(
         error.kind,
@@ -338,7 +322,7 @@ fn compiled_selection_never_accepts_foreign_same_named_files_or_disk_manifest() 
 #[test]
 fn invalid_source_kinds_and_wrong_members_never_create_an_execution() {
     use std::os::unix::fs::symlink;
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let binary = payload.diagnostic_path();
     let original = binary.with_extension("original");
     std::fs::rename(binary, &original).unwrap();
@@ -355,7 +339,7 @@ fn invalid_source_kinds_and_wrong_members_never_create_an_execution() {
 
 #[test]
 fn same_size_replacement_invalidates_without_issuing_old_owner() {
-    let payload = fixture(b"#!/bin/sh\necho original\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\necho original\n");
     let path = payload.diagnostic_path();
     let modified = std::fs::metadata(path).unwrap().modified().unwrap();
     let replacement = path.with_extension("replacement");
@@ -375,7 +359,6 @@ fn same_size_replacement_invalidates_without_issuing_old_owner() {
 async fn tls_inventory_reuses_same_admitted_cohort_and_preserves_query_arguments() {
     let payload = fixture(
         b"#!/bin/sh\n[ \"$1 $2\" = 'tools tls-fingerprints' ] || exit 9\nprintf inventory\n",
-        vec![ExecPurpose::TlsInventory],
     );
     let before = payload.protected.counters();
     let raw = crate::run_tls_fingerprint_query(
@@ -392,7 +375,7 @@ async fn tls_inventory_reuses_same_admitted_cohort_and_preserves_query_arguments
 
 #[test]
 fn prepared_handles_remain_parent_cloexec_and_only_child_duplicates_are_inherited() {
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let plan = payload.prepare(ExecPurpose::RunMain).unwrap();
     let command = plan.command().unwrap();
     let selector = command
@@ -413,7 +396,7 @@ fn prepared_handles_remain_parent_cloexec_and_only_child_duplicates_are_inherite
 
 #[tokio::test]
 async fn child_and_independent_stdio_tails_retain_the_same_admitted_owner_until_real_reap() {
-    let payload = fixture(b"#!/bin/sh\nprintf owned\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nprintf owned\n");
     let weak = Arc::downgrade(&payload);
     let (send, receive) = tokio::sync::oneshot::channel();
     let request = SpawnRequest::new(
@@ -441,7 +424,7 @@ async fn child_and_independent_stdio_tails_retain_the_same_admitted_owner_until_
 
 #[test]
 fn replaced_parent_directory_cannot_issue_the_prior_cohort() {
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let dir = payload.diagnostic_path().parent().unwrap().to_path_buf();
     let moved = dir.with_extension("moved");
     std::fs::rename(&dir, &moved).unwrap();
@@ -458,7 +441,7 @@ fn replaced_parent_directory_cannot_issue_the_prior_cohort() {
 #[test]
 fn sealed_members_keep_required_access_after_helper_uid_drop_and_mode_change_invalidates() {
     use std::os::unix::fs::PermissionsExt;
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let command = payload
         .prepare(ExecPurpose::RunMain)
         .unwrap()
@@ -497,7 +480,7 @@ fn sealed_members_keep_required_access_after_helper_uid_drop_and_mode_change_inv
 fn copy_stage_foreign_write_through_old_fd_is_detected_by_only_post_seal_hash() {
     use linux::AdmissionStage;
     use std::os::unix::fs::FileExt;
-    let original = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let original = fixture(b"#!/bin/sh\nexit 0\n");
     let mut slot = None;
     let wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = wrote.clone();
@@ -539,7 +522,7 @@ fn copy_stage_foreign_write_through_old_fd_is_detected_by_only_post_seal_hash() 
 fn seals_precede_the_only_hash_and_block_even_preexisting_writable_descriptors() {
     use linux::AdmissionStage;
     use std::os::unix::fs::FileExt;
-    let original = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let original = fixture(b"#!/bin/sh\nexit 0\n");
     let old = std::rc::Rc::new(std::cell::RefCell::new(None::<std::fs::File>));
     let held = old.clone();
     let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -647,7 +630,7 @@ impl Drop for SharedWriteMap {
 #[test]
 fn existing_writable_mapping_prevents_sealing_and_never_issues_an_owner() {
     use linux::AdmissionStage;
-    let original = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let original = fixture(b"#!/bin/sh\nexit 0\n");
     let mapping = std::rc::Rc::new(std::cell::RefCell::new(None::<SharedWriteMap>));
     let held = mapping.clone();
     let mut slot = None;
@@ -684,7 +667,7 @@ fn existing_writable_mapping_prevents_sealing_and_never_issues_an_owner() {
 #[test]
 fn pre_seal_size_change_is_refused_on_the_same_object() {
     use linux::AdmissionStage;
-    let original = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let original = fixture(b"#!/bin/sh\nexit 0\n");
     let error = linux::with_hook(
         Box::new(|stage, name, file| {
             if name == "sing-box" && stage == AdmissionStage::BeforeSeal {
@@ -701,7 +684,7 @@ fn pre_seal_size_change_is_refused_on_the_same_object() {
 #[test]
 fn interrupted_copy_cannot_publish_partial_authority_and_clean_retry_rehashes_once() {
     use linux::AdmissionStage;
-    let original = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let original = fixture(b"#!/bin/sh\nexit 0\n");
     let mut slot = None;
     let error = linux::with_hook(
         Box::new(|stage, _, _| {
@@ -736,7 +719,7 @@ fn interrupted_copy_cannot_publish_partial_authority_and_clean_retry_rehashes_on
 #[test]
 fn concurrent_cold_requests_use_the_same_single_flight_and_one_complete_hash_per_member() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let original = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let original = fixture(b"#!/bin/sh\nexit 0\n");
     let slot = Arc::new(Mutex::new(None));
     let barrier = Arc::new(std::sync::Barrier::new(4));
     let cold = Arc::new(AtomicUsize::new(0));
@@ -774,7 +757,7 @@ fn link_ancestor_and_fifo_damage_have_a_real_reinstall_classification() {
     use std::os::unix::fs::symlink;
     for name in ["sing-box", "libcronet.so"] {
         for fifo in [false, true] {
-            let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+            let payload = fixture(b"#!/bin/sh\nexit 0\n");
             let victim = payload.diagnostic_path().parent().unwrap().join(name);
             let original = victim.with_extension("held-original");
             std::fs::rename(&victim, &original).unwrap();
@@ -800,7 +783,7 @@ fn link_ancestor_and_fifo_damage_have_a_real_reinstall_classification() {
             );
         }
     }
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+    let payload = fixture(b"#!/bin/sh\nexit 0\n");
     let directory = payload.diagnostic_path().parent().unwrap();
     let linked = directory.with_extension("linked-ancestor");
     symlink(directory, &linked).unwrap();
@@ -824,7 +807,7 @@ fn permission_failure_remains_environment_io_without_a_reinstall_promise() {
         return; // root bypasses DAC; no privileged mutation is needed by this test
     }
     for name in ["sing-box", "libcronet.so"] {
-        let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::RunMain]);
+        let payload = fixture(b"#!/bin/sh\nexit 0\n");
         let member = payload.diagnostic_path().parent().unwrap().join(name);
         let original = std::fs::metadata(&member).unwrap().permissions();
         std::fs::set_permissions(&member, std::fs::Permissions::from_mode(0o0)).unwrap();
@@ -899,10 +882,7 @@ fn lease_exec_survives_parent_daemon_exit() {
             .open(control.join("lease"))
             .unwrap();
         lease.try_lock_shared().unwrap();
-        let payload = fixture(
-            b"#!/bin/sh\nexec /bin/sleep 20\n",
-            vec![ExecPurpose::RunMain],
-        );
+        let payload = fixture(b"#!/bin/sh\nexec /bin/sleep 20\n");
         let plan = payload.prepare(ExecPurpose::RunMain).unwrap();
         let mut command = plan.command().unwrap().into_std();
         command
@@ -960,7 +940,7 @@ fn lease_exec_survives_parent_daemon_exit() {
     // A denied credential transition keeps the ordinary Command exec-error
     // pipe and cannot publish a successful Child or change the parent flags.
     {
-        let payload = fixture(b"#!/bin/sh\nexit 99\n", vec![ExecPurpose::RunMain]);
+        let payload = fixture(b"#!/bin/sh\nexit 99\n");
         let held = OpenOptions::new()
             .read(true)
             .write(true)
@@ -986,7 +966,7 @@ fn lease_exec_survives_parent_daemon_exit() {
         );
     }
     {
-        let payload = fixture(b"#!/bin/sh\nexit 99\n", vec![ExecPurpose::RunMain]);
+        let payload = fixture(b"#!/bin/sh\nexit 99\n");
         let plan = payload.prepare(ExecPurpose::RunMain).unwrap();
         let mut command = plan.command().unwrap().into_std();
         let mut bad = OpenOptions::new()
@@ -1083,54 +1063,6 @@ fn lease_exec_survives_parent_daemon_exit() {
         nix::fcntl::fcntl(&lease, nix::fcntl::FcntlArg::F_GETFD).unwrap() & nix::libc::FD_CLOEXEC,
         0
     );
-}
-
-#[test]
-fn check_only_capability_cannot_issue_tls_inventory() {
-    let payload = fixture(b"#!/bin/sh\nexit 0\n", vec![ExecPurpose::CheckConfig]);
-    let error = payload.prepare(ExecPurpose::TlsInventory).unwrap_err();
-    assert_eq!(error.kind, AdmissionErrorKind::UnsupportedCapability);
-    assert_eq!(error.purpose, Some(ExecPurpose::TlsInventory));
-}
-
-#[test]
-fn trusted_execution_v1_rejects_unknown_or_missing_fields_and_keeps_row_binding() {
-    let source = "a".repeat(40);
-    let tree = "b".repeat(40);
-    let policy = serde_json::json!({"schema":"polaris-trusted-execution-v1","sourceCommit":source.clone(),"sourceTree":tree.clone(),"loader":"linux-sealed-fd-v1","purposes":["tls-inventory-v1"]});
-    let (purposes, _) = SelectedPolicy::declaration(&policy, &source, &tree, "linux").unwrap();
-    assert_eq!(purposes, vec![ExecPurpose::TlsInventory]);
-    for extra in ["version", "coreSHA", "capabilityHash", "futureField"] {
-        let mut changed = policy.clone();
-        changed[extra] = serde_json::json!("ignored-before");
-        assert_eq!(
-            SelectedPolicy::declaration(&changed, &source, &tree, "linux")
-                .unwrap_err()
-                .kind,
-            AdmissionErrorKind::UnsupportedCapability
-        );
-    }
-    for key in ["schema", "sourceCommit", "sourceTree", "loader", "purposes"] {
-        let mut changed = policy.clone();
-        changed.as_object_mut().unwrap().remove(key);
-        assert!(SelectedPolicy::declaration(&changed, &source, &tree, "linux").is_err());
-    }
-    for (field, value) in [
-        ("sourceCommit", "c".repeat(40)),
-        ("sourceTree", "d".repeat(40)),
-    ] {
-        let mut changed = policy.clone();
-        changed[field] = serde_json::json!(value);
-        assert!(SelectedPolicy::declaration(&changed, &source, &tree, "linux").is_err());
-    }
-    for purposes in [
-        serde_json::json!(["tls-inventory-v1", "tls-inventory-v1"]),
-        serde_json::json!(["unknown-purpose"]),
-    ] {
-        let mut changed = policy.clone();
-        changed["purposes"] = purposes;
-        assert!(SelectedPolicy::declaration(&changed, &source, &tree, "linux").is_err());
-    }
 }
 
 #[test]

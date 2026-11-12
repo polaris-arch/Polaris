@@ -172,21 +172,11 @@ fn core_version_info_never_substitutes_the_bundled_version_for_a_failed_probe() 
 }
 
 #[test]
-fn helper_owned_core_info_does_not_attempt_or_claim_app_admission() {
-    assert_eq!(
-        core_admission_info(true, Ok(()), || panic!("ordinary App must not admit")),
-        None
-    );
-}
-
-#[test]
-fn helper_owned_core_info_retains_static_capability_refusal() {
+fn core_info_retains_static_capability_refusal() {
     let refused = core_admission_info(
-        true,
         Err(polaris_core_supervisor::admitted_payload::AdmissionError::unsupported_exact_object()),
         || panic!("static refusal must not attempt direct admission"),
-    )
-    .unwrap();
+    );
     assert_eq!(refused["state"], "rejected");
     assert_eq!(refused["kind"], "UnsupportedExactObject");
     assert_eq!(refused["recovery"], "none");
@@ -195,10 +185,7 @@ fn helper_owned_core_info_retains_static_capability_refusal() {
 #[test]
 fn direct_core_info_retains_actual_admission_result() {
     let refused = json!({"state":"rejected","kind":"Changed","recovery":"reinstallCurrentApp"});
-    assert_eq!(
-        core_admission_info(false, Ok(()), || refused.clone()),
-        Some(refused)
-    );
+    assert_eq!(core_admission_info(Ok(()), || refused.clone()), refused);
 }
 
 // ── 下载单飞（H2）───────────────────────────────────────────────────────

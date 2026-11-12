@@ -51,16 +51,8 @@ fn real_core_runtime() -> (Arc<ProxyRuntime>, PathBuf, PathBuf, ()) {
         .get()
         .expect("driver owns acceptance data directory")
         .clone();
-    let path = if super::startup::should_start_via_helper(
-        polaris_config_engine::user_config::ProxyModeType::Manual
-            .effective_on(runtime.helper.platform()),
-        runtime.helper.platform(),
-    ) {
-        super::core_binary::resolve_helper_candidate_data().map(|data| data.into_path())
-    } else {
-        super::core_binary::resolve_core_binary()
-    }
-    .expect("compiled selected candidate unavailable");
+    let path =
+        super::core_binary::resolve_core_binary().expect("compiled selected candidate unavailable");
     (runtime, dir, path, ())
 }
 fn send_signal(pid: u32, _signal: polaris_core_supervisor::Signal) {

@@ -108,20 +108,6 @@ pub fn decode_request<I: Iterator<Item = String>>(
         return Err(DecodeError::LineTooLong);
     }
     match command {
-        polaris_helper_proto::check_config::COMMAND => {
-            // At most five argument lines; reject any tail rather than projecting
-            // a longer request onto an earlier exact operation.
-            let mut args = Vec::new();
-            while let Some(arg) = checked_line(lines, None)? {
-                if args.len() == 5 {
-                    return Err(DecodeError::MissingArg("exact Check frame"));
-                }
-                args.push(arg);
-            }
-            polaris_helper_proto::check_config::CheckRequest::parse(&args)
-                .map(Request::MacCheck)
-                .ok_or(DecodeError::MissingArg("typed Check frame"))
-        }
         polaris_helper_proto::command::common::PREPARE_HELPER_UPGRADE
         | polaris_helper_proto::command::common::CANCEL_HELPER_UPGRADE => {
             if checked_line(lines, None)?.is_some() {
@@ -366,14 +352,10 @@ pub fn process_connection_from_peer<R: Read, W: Write>(
     let mut lines_iter = LineIter {
         buf: &mut buf,
         too_long: false,
-        read_failed: false,
     };
     let decoded = decode_request(&command, &mut lines_iter);
     if lines_iter.too_long {
         return write_line_too_long(&mut writer);
-    }
-    if lines_iter.read_failed && command == polaris_helper_proto::check_config::COMMAND {
-        return ConnOutcome::IoError("helper frame read failed before its exact boundary".into());
     }
     if buf.get_ref().over_limit {
         return write_line_too_long(&mut writer);
@@ -424,7 +406,6 @@ impl<R: Read> Read for FrameReader<R> {
 struct LineIter<'a, R: BufRead> {
     buf: &'a mut R,
     too_long: bool,
-    read_failed: bool,
 }
 
 impl<R: BufRead> Iterator for LineIter<'_, R> {
@@ -437,10 +418,7 @@ impl<R: BufRead> Iterator for LineIter<'_, R> {
                 self.too_long = true;
                 None
             }
-            Err(BoundedLineError::Io(_)) => {
-                self.read_failed = true;
-                None
-            }
+            Err(BoundedLineError::Io(_)) => None,
         }
     }
 }
@@ -688,14 +666,7 @@ mod sys {
             self.native.close_admission();
             let deadline = Instant::now() + Duration::from_secs(8);
             loop {
-                let checks = polaris_core_supervisor::config_gate::request_macos_checks_shutdown()
-                    .map_err(|e| e.to_string())?;
-                let input_clean =
-                    polaris_core_supervisor::admitted_payload::assert_macos_root_check_idle(
-                        Path::new(&self.config.core_dir),
-                    )
-                    .is_ok();
-                if self.native.shutdown_complete()? && checks && input_clean {
+                if self.native.shutdown_complete()? {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
@@ -710,58 +681,7 @@ mod sys {
     }
 
     impl MacServices for DaemonServices {
-        fn check_config(
-            &self,
-            uid: u32,
-            request: &polaris_helper_proto::check_config::CheckRequest,
-        ) -> Result<polaris_helper_proto::check_config::CheckReply, SpawnError> {
-            use polaris_helper_proto::check_config::CheckRequest;
-            match request {
-                CheckRequest::Begin {
-                    core,
-                    bytes,
-                    sha256,
-                } => {
-                    let verified =
-                        crate::pinned_core::verify(Path::new(&self.config.core_dir), core)
-                            .map_err(|e| SpawnError::Failed(e.to_string()))?;
-                    let execution = verified
-                        .prepare(
-                            polaris_core_supervisor::admitted_payload::ExecPurpose::CheckConfig,
-                        )
-                        .map_err(|e| SpawnError::Failed(e.to_string()))?;
-                    let lease = verified
-                        .execution_lease()
-                        .map_err(|e| SpawnError::Failed(e.to_string()))?;
-                    let mut entropy = [0; 16];
-                    std::fs::File::open("/dev/urandom")
-                        .and_then(|mut f| f.read_exact(&mut entropy))
-                        .map_err(|e| SpawnError::Failed(e.to_string()))?;
-                    polaris_core_supervisor::config_gate::begin_macos_helper_check(
-                        execution,
-                        lease,
-                        uid,
-                        core.clone(),
-                        *bytes,
-                        *sha256,
-                        HelperBirthToken::from_bytes(entropy),
-                    )
-                    .map_err(|e| SpawnError::Failed(e.to_string()))
-                }
-                _ => polaris_core_supervisor::config_gate::macos_helper_check_request(uid, request)
-                    .map_err(|e| SpawnError::Failed(e.to_string())),
-            }
-        }
         fn upgrade_admission(&self, close: bool) -> bool {
-            if close
-                && (polaris_core_supervisor::config_gate::assert_check_admission().is_err()
-                    || polaris_core_supervisor::admitted_payload::assert_macos_root_check_idle(
-                        Path::new(&self.config.core_dir),
-                    )
-                    .is_err())
-            {
-                return false;
-            }
             self.native.upgrade_admission(close)
         }
         fn token_for_peer(&self, uid: Option<u32>) -> String {
@@ -788,10 +708,6 @@ mod sys {
             params: &polaris_helper_proto::core_protocol::PinnedStartParams,
             uid: u32,
         ) -> Result<NativeBirthStart, SpawnError> {
-            polaris_core_supervisor::admitted_payload::assert_macos_root_check_idle(Path::new(
-                &self.config.core_dir,
-            ))
-            .map_err(|e| SpawnError::Failed(e.to_string()))?;
             let owner = polaris_helper_proto::core_protocol::CallerIdentity::Unix(uid);
             let conf =
                 crate::user_control::conf_dir(Path::new(&self.config.support_dir), &owner)
@@ -827,11 +743,6 @@ mod sys {
         }
         fn native_custody_active(&self) -> bool {
             self.native.active()
-                || polaris_core_supervisor::config_gate::assert_check_admission().is_err()
-                || polaris_core_supervisor::admitted_payload::assert_macos_root_check_idle(
-                    Path::new(&self.config.core_dir),
-                )
-                .is_err()
         }
         // Old clients are rejected before any forwarding/cache/spawn, rather than stranded
         // after a successful legacy Start with no exact native Stop authority.

@@ -847,10 +847,6 @@ mod unix {
 
     fn replace_test_capture(run: &mut CheckRun, replacement: Arc<OutputCapture>) {
         match &mut run.tail {
-            #[cfg(target_os = "macos")]
-            CheckTail::MacRoot { .. } | CheckTail::MacRemote { .. } => {
-                panic!("ordinary fixture has no Helper input")
-            }
             CheckTail::PathSnapshot { output, .. } => *output = replacement,
         }
     }

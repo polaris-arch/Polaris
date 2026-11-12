@@ -354,14 +354,10 @@ fn desktop_takeover_decisions_still_differ_between_stored_modes() {
             tun.via_helper,
             "{platform:?}: TUN keeps its real privileged issuer"
         );
-        match platform {
-            Platform::Mac | Platform::Win => assert!(
-                system_proxy.via_helper && manual.via_helper,
-                "{platform:?}: execution uses the closed OS issuer independently of takeover"
-            ),
-            Platform::Linux => assert!(!system_proxy.via_helper && !manual.via_helper),
-            _ => unreachable!("this matrix contains desktop platforms only"),
-        }
+        assert!(
+            !system_proxy.via_helper && !manual.via_helper,
+            "{platform:?}: non-TUN runs directly as the ordinary user"
+        );
         assert!(!manual.tun_route_gate && !manual.probe_wintun);
         assert!(
             !system_proxy.tun_route_gate && tun.tun_route_gate,
