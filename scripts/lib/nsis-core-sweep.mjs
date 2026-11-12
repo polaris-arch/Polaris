@@ -8,9 +8,9 @@ export const NSIS_SWEEP_HOOKS = ['NSIS_HOOK_PREINSTALL', 'NSIS_HOOK_PREUNINSTALL
 export const NSIS_SWEEP_TAILS = ['_up_\\resources\\win\\sing-box.exe', 'resources\\win\\sing-box.exe'];
 export const NSIS_SWEEP_LINES = [
   'InitPluginsDir', 'StrCpy $R6 $OUTDIR', 'SetOutPath "$PLUGINSDIR"',
-  'File /oname=polaris-cleaner.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"',
+  'File /oname=polaris-helper-setup.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"',
   'SetOutPath $R6',
-  `nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\\polaris-cleaner.exe" --sweep-installed-cores'`,
+  `nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\\polaris-helper-setup.exe" --sweep-installed-cores'`,
 ];
 export const NSIS_SWEEP_OPERATORS = [
   ['strip-extended-prefix', 'path.starts_with(&ext)'],

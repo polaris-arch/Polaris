@@ -220,7 +220,7 @@ class Integrity(unittest.TestCase):
         for name, content in {
             'LICENSE': b'MIT notice', 'NOTICE': b'Core source offer', 'THIRD-PARTY-LICENSES.md': b'Complete licenses',
             'resources/win/core-manifest.json': b'{"compiled":"selected fixture pin"}\n',
-            'resources/win/polaris-helper.exe': b'current helper', 'resources/win/polaris-cleaner.exe': b'current cleaner',
+            'resources/win/polaris-helper.exe': b'current helper', 'resources/win/polaris-helper-setup.exe': b'current cleaner',
             'resources/win/sing-box.exe': b'current core', 'resources/win/libcronet.dll': b'current cronet',
             # Legitimate source/legal/runtime scripts must survive exact inventory.
             'resources/win/core-release/source/runtime.sh': b'#!/bin/sh\n: legal archived source\n',
@@ -265,7 +265,7 @@ class Integrity(unittest.TestCase):
             'extra empty dir': lambda p: p.update({'unknown/': b''}),
             'missing manifest': lambda p: p.pop('resources/win/core-manifest.json'),
             'missing source archive': lambda p: p.pop('resources/win/core-release/source/runtime.sh'),
-            'missing cleaner': lambda p: p.pop('resources/win/polaris-cleaner.exe'),
+            'missing cleaner': lambda p: p.pop('resources/win/polaris-helper-setup.exe'),
             'old App new name': lambda p: p.update({'polaris.exe': b'old app renamed current'}),
             'old helper new name': lambda p: p.update({'resources/win/polaris-helper.exe': b'old helper new'}),
             'same-size stale core': lambda p: p.update({'resources/win/sing-box.exe': b'x' * len(p['resources/win/sing-box.exe'])}),
@@ -496,9 +496,9 @@ class Integrity(unittest.TestCase):
             root = Path(tmp); state, app = self.fixture(root); expected = w.carrier_inventory(state, app, 'nsis')
             plugins = {'$PLUGINSDIR/System.dll': w.byte_facts(b'toolchain plugin')}
             original_plugins = copy.deepcopy(plugins)
-            cleaner = expected['$R6/_up_/resources/win/polaris-cleaner.exe']
-            current = {**expected, **plugins, '$PLUGINSDIR/polaris-cleaner.exe': cleaner, 'uninstall.exe': w.byte_facts(b'generated stub')}
-            nested = {**plugins, '$PLUGINSDIR/polaris-cleaner.exe': cleaner}
+            cleaner = expected['$R6/_up_/resources/win/polaris-helper-setup.exe']
+            current = {**expected, **plugins, '$PLUGINSDIR/polaris-helper-setup.exe': cleaner, 'uninstall.exe': w.byte_facts(b'generated stub')}
+            nested = {**plugins, '$PLUGINSDIR/polaris-helper-setup.exe': cleaner}
             mutations = {
                 'valid': lambda a, b: None,
                 'old App': lambda a, b: a.update({'$R6/polaris.exe': w.byte_facts(b'old App')}),
@@ -511,10 +511,10 @@ class Integrity(unittest.TestCase):
                 'extra App': lambda a, b: a.update({'backup/polaris.exe': a['$R6/polaris.exe']}),
                 'wrong plugin': lambda a, b: a.update({'$PLUGINSDIR/System.dll': w.byte_facts(b'other plugin')}),
                 'renamed plugin': lambda a, b: a.update({'$PLUGINSDIR/other.dll': w.byte_facts(b'other')}),
-                'missing installer cleaner': lambda a, b: a.pop('$PLUGINSDIR/polaris-cleaner.exe'),
-                'old installer cleaner': lambda a, b: a.update({'$PLUGINSDIR/polaris-cleaner.exe': w.byte_facts(b'old cleaner')}),
-                'missing uninstall cleaner': lambda a, b: b.pop('$PLUGINSDIR/polaris-cleaner.exe'),
-                'old uninstall cleaner': lambda a, b: b.update({'$PLUGINSDIR/polaris-cleaner.exe': w.byte_facts(b'old cleaner')}),
+                'missing installer cleaner': lambda a, b: a.pop('$PLUGINSDIR/polaris-helper-setup.exe'),
+                'old installer cleaner': lambda a, b: a.update({'$PLUGINSDIR/polaris-helper-setup.exe': w.byte_facts(b'old cleaner')}),
+                'missing uninstall cleaner': lambda a, b: b.pop('$PLUGINSDIR/polaris-helper-setup.exe'),
+                'old uninstall cleaner': lambda a, b: b.update({'$PLUGINSDIR/polaris-helper-setup.exe': w.byte_facts(b'old cleaner')}),
                 'extra uninstaller member': lambda a, b: b.update({'$PLUGINSDIR/debug.ps1': w.byte_facts(b'old')}),
             }
             errors = {

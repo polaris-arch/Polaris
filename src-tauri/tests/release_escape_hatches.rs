@@ -2216,7 +2216,7 @@ fn sweep_selector_contract_is_complete(source: &str, nsis: &str) -> bool {
         .filter(|line| !line.is_empty() && !line.starts_with(';'))
         .collect();
     let setter = r#"System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'"#;
-    let invoke = r#"nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\polaris-cleaner.exe" --sweep-installed-cores'"#;
+    let invoke = r#"nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\polaris-helper-setup.exe" --sweep-installed-cores'"#;
     let Some(exec) = lines.iter().position(|line| *line == invoke) else {
         return false;
     };

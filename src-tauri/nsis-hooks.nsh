@@ -1,4 +1,4 @@
-!define POLARIS_NATIVE_CLEANER_PAYLOAD "${__FILEDIR__}\..\resources\win\polaris-cleaner.exe"
+!define POLARIS_NATIVE_CLEANER_PAYLOAD "${__FILEDIR__}\..\resources\win\polaris-helper-setup.exe"
 ; Polaris NSIS 安装/卸载钩子 —— 安装/卸载动文件前结束映像位于本安装目录内的内核进程；
 ; 安装前清旧资源；安装成功后归一化运行形态；卸载时清外置到 ProgramData 的提权 helper 服务。
 ;
@@ -233,9 +233,9 @@
   ; This PRE operation never elevates or invokes the ProgramData deletion role.
   StrCpy $R6 $OUTDIR
   SetOutPath "$PLUGINSDIR"
-  File /oname=polaris-cleaner.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"
+  File /oname=polaris-helper-setup.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"
   SetOutPath $R6
-  nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\polaris-cleaner.exe" --sweep-installed-cores'
+  nsExec::Exec /TIMEOUT=30000 '"$PLUGINSDIR\polaris-helper-setup.exe" --sweep-installed-cores'
   Pop $R4 ; native: 0 complete; 1 observation failed; 2 unconfirmed exit; 3 volume root; timeout/error remain unconfirmed
   Pop $R9
   System::Call 'kernel32::SetEnvironmentVariable(t "POLARIS_SWEEP_ROOT", t R9)'
@@ -376,9 +376,9 @@
       InitPluginsDir
       StrCpy $R6 $OUTDIR
       SetOutPath "$PLUGINSDIR"
-      File /oname=polaris-cleaner.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"
+      File /oname=polaris-helper-setup.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"
       SetOutPath $R6
-      nsExec::ExecToStack '"$PLUGINSDIR\polaris-cleaner.exe" --launch'
+      nsExec::ExecToStack '"$PLUGINSDIR\polaris-helper-setup.exe" --launch'
       Pop $R7
       Pop $R5
       ; 0 complete; 2 custody/ancestor refusal; 3 partial cleanup;

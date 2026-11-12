@@ -188,7 +188,7 @@ test('candidate carrier cannot synthesize missing helper or Windows cleaner hash
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const hash = (value) => createHash('sha256').update(value).digest('hex');
   const files = { 'sing-box.exe': 'inert core', 'libcronet.dll': 'inert companion',
-    'polaris-helper.exe': 'same build helper', 'polaris-cleaner.exe': 'same build cleaner' };
+    'polaris-helper.exe': 'same build helper', 'polaris-helper-setup.exe': 'same build cleaner' };
   const pin = (member) => ({ member, bytes: Buffer.byteLength(files[member]), sha256: hash(files[member]) });
   const contract = { version: '1.15.0-polaris-alpha.12', platforms: { win: {
     providerFingerprint: hash('distinct temporary candidate contract'), core: pin('sing-box.exe'), sidecar: pin('libcronet.dll') } } };
@@ -196,10 +196,10 @@ test('candidate carrier cannot synthesize missing helper or Windows cleaner hash
   assert.throws(() => writeSelectedCoreManifest(root, contract, 'win', '1.0.0'), /ENOENT/);
   writeFileSync(join(root, 'polaris-helper.exe'), files['polaris-helper.exe']);
   assert.throws(() => writeSelectedCoreManifest(root, contract, 'win', '1.0.0'), /ENOENT/);
-  writeFileSync(join(root, 'polaris-cleaner.exe'), files['polaris-cleaner.exe']);
+  writeFileSync(join(root, 'polaris-helper-setup.exe'), files['polaris-helper-setup.exe']);
   const selected = writeSelectedCoreManifest(root, contract, 'win', '1.0.0');
   assert.equal(selected.core.helperSha256, hash(files['polaris-helper.exe']));
-  assert.equal(selected.core.cleanerSha256, hash(files['polaris-cleaner.exe']));
+  assert.equal(selected.core.cleanerSha256, hash(files['polaris-helper-setup.exe']));
   verifySelectedCoreManifest(root, root, 'win');
   for (const name of Object.keys(files)) {
     writeFileSync(join(root, name), 'other source/build');
@@ -248,6 +248,6 @@ test('formal default compiles only exact verified installation with real helper 
   const prepare = readFileSync(new URL('./prepare-core-identity.mjs', import.meta.url), 'utf8');
   assert.match(prepare, /contract = releaseInstallationContract\(root, input\);[\s\S]*?verifyPackagedRelease\(root, input, platform, join\(directory, contract.platforms\[platform\].core.member\)\)/);
   assert.match(prepare, /actualCoreFile\(join\(directory, helper\)\).sha256 !== old.core.helperSha256/);
-  assert.match(prepare, /actualCoreFile\(join\(directory, 'polaris-cleaner.exe'\)\).sha256 !== old.core.cleanerSha256/);
+  assert.match(prepare, /actualCoreFile\(join\(directory, 'polaris-helper-setup.exe'\)\).sha256 !== old.core.cleanerSha256/);
 });
 

@@ -387,7 +387,7 @@ test('actual inventory CLI admits precisely the release members and rejects miss
     const conf = `tauri.${key === 'linux' ? 'linux' : key === 'win' ? 'windows' : key === 'mac-arm64' ? 'macos-arm64' : 'macos-x64'}.conf.json`;
     copyFileSync(join(repo, 'src-tauri', conf), join(f.root, 'src-tauri', conf));
     write(join(f.root, 'resources', key, key === 'win' ? 'polaris-helper.exe' : 'polaris-helper'), 'inert');
-    if (key === 'win') write(join(f.root, 'resources/win/polaris-cleaner.exe'), 'inert');
+    if (key === 'win') write(join(f.root, 'resources/win/polaris-helper-setup.exe'), 'inert');
     writeSelectedCoreManifest(join(f.root, 'resources', key), releaseInstallationContract(f.root, f.manifest), key, '1.0.0-fixture');
     const carrier = join(f.root, 'inventory-carrier', key);
     const scopes = key === 'linux' ? [join(carrier, 'deb/usr/lib/Polaris'), join(carrier, 'appimage/Polaris.AppDir/usr/lib/Polaris')]

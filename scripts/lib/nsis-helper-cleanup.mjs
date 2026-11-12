@@ -3,14 +3,14 @@
 import { nsisMacroLines } from './nsis-core-sweep.mjs';
 
 export const HELPER_CLEANUP_HOOK = 'NSIS_HOOK_POSTUNINSTALL';
-export const NATIVE_PAYLOAD = 'polaris-cleaner.exe';
+export const NATIVE_PAYLOAD = 'polaris-helper-setup.exe';
 export const HELPER_CLEANUP_LINES = [
   'InitPluginsDir',
   'StrCpy $R6 $OUTDIR',
   'SetOutPath "$PLUGINSDIR"',
-  'File /oname=polaris-cleaner.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"',
+  'File /oname=polaris-helper-setup.exe "${POLARIS_NATIVE_CLEANER_PAYLOAD}"',
   'SetOutPath $R6',
-  'nsExec::ExecToStack \'"$PLUGINSDIR\\polaris-cleaner.exe" --launch\'',
+  'nsExec::ExecToStack \'"$PLUGINSDIR\\polaris-helper-setup.exe" --launch\'',
   'Pop $R7',
   'Pop $R5',
 ];
@@ -20,7 +20,7 @@ export function nsisHelperCleanupViolations(source) {
   if (!macro) return [`missing ${HELPER_CLEANUP_HOOK}`];
   const code = macro.map((line) => line.trim()).filter((line) => line && !line.startsWith(';'));
   const failures = [];
-  if (!source.startsWith('!define POLARIS_NATIVE_CLEANER_PAYLOAD "${__FILEDIR__}\\..\\resources\\win\\polaris-cleaner.exe"\n')) failures.push("payload must resolve at hook include time");
+  if (!source.startsWith('!define POLARIS_NATIVE_CLEANER_PAYLOAD "${__FILEDIR__}\\..\\resources\\win\\polaris-helper-setup.exe"\n')) failures.push("payload must resolve at hook include time");
   const start = code.indexOf(HELPER_CLEANUP_LINES[0]);
   if (start < 0 || HELPER_CLEANUP_LINES.some((line, i) => code[start+i] !== line)) {
     failures.push('embedded native payload/execution block differs');

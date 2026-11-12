@@ -190,7 +190,7 @@ pub(crate) fn stage_installation(
     };
     let cleaner = if platform == "win" {
         Some((
-            "polaris-cleaner.exe",
+            "polaris-helper-setup.exe",
             None,
             selected
                 .cleaner_sha256
@@ -249,7 +249,7 @@ pub(crate) fn stage_installation(
                 &path,
                 fs::Permissions::from_mode(
                     if name == helper_name
-                        || name == "polaris-cleaner.exe"
+                        || name == "polaris-helper-setup.exe"
                         || name.starts_with("sing-box")
                     {
                         0o700

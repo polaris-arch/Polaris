@@ -1457,9 +1457,8 @@ fn windows_payload_directory_is_absolute_even_when_rendered_on_unix() {
     );
     let script = build_win_install_script(&InstallPaths::win(), &p, &"a".repeat(64));
     assert!(script.contains(r"--source', 'C:\Users\u\Polaris\stage'"));
-    assert!(
-        script.contains(r"Copy-Item -LiteralPath 'C:\Users\u\Polaris\stage\polaris-cleaner.exe'")
-    );
+    assert!(script
+        .contains(r"Copy-Item -LiteralPath 'C:\Users\u\Polaris\stage\polaris-helper-setup.exe'"));
     assert!(script.contains("Check-Hash $cleaner $selection.core.cleanerSha256"));
     assert!(script.contains("foreach ($path in $replaceObjects)"));
     assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));

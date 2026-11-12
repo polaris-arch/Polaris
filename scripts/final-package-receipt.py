@@ -243,7 +243,7 @@ def nsis_install(artifact, destination, root):
             and conf['bundle']['windows']['certificateThumbprint'] is None, 'reviewed NSIS install/signature policy differs')
     # Disposable runner preconditions prevent an old installation/update/uninstall path.
     code = r'''$ErrorActionPreference='Stop'
-if (Get-Process -Name polaris,sing-box,polaris-helper,polaris-cleaner -ErrorAction SilentlyContinue) { throw 'existing Polaris/core process' }
+if (Get-Process -Name polaris,sing-box,polaris-helper,polaris-helper-setup -ErrorAction SilentlyContinue) { throw 'existing Polaris/core process' }
 if (Get-Service -Name PolarisHelper -ErrorAction SilentlyContinue) { throw 'existing Polaris helper service' }
 $roots=@('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
 foreach($r in $roots) { if(Test-Path $r) { foreach($p in Get-ChildItem $r) { $v=Get-ItemProperty $p.PSPath; if($v.DisplayName -match '(?i)polaris' -or $v.InstallLocation -match '(?i)polaris') { throw 'existing Polaris install registry entry' } } } }

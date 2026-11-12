@@ -982,8 +982,8 @@ jobs:
           if [ "${{ matrix.label }}" = windows ]; then
             POLARIS_WINDOWS_INSTALL_ANCHOR="$(node scripts/prepare-core-identity.mjs --platform=win --mode=maintenance-anchor --helper-binary=resources/win/polaris-helper.exe)"
             export POLARIS_WINDOWS_INSTALL_ANCHOR
-            cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner "$@"
-            cp "$output_dir/polaris-cleaner.exe" resources/win/polaris-cleaner.exe
+            cargo build --release -p polaris-windows-cleaner --bin polaris-helper-setup "$@"
+            cp "$output_dir/polaris-helper-setup.exe" resources/win/polaris-helper-setup.exe
             printf 'POLARIS_WINDOWS_INSTALL_ANCHOR=%s\n' "$POLARIS_WINDOWS_INSTALL_ANCHOR" >> "$GITHUB_ENV"
           fi
           # Freeze the actual staged (and on macOS signed) release helper bytes.
@@ -1115,7 +1115,7 @@ jobs:
           rc=0
           # ⚠️ windows 腿的 tauri_args 不带 --target（mac 腿才带）⇒ polaris.exe 在宿主位
           # target/release/；helper 步虽带 --target 但只编 helper。两路径勿混。
-          for exe in "target/release/polaris.exe" "resources/win/polaris-helper.exe" "resources/win/polaris-cleaner.exe"; do
+          for exe in "target/release/polaris.exe" "resources/win/polaris-helper.exe" "resources/win/polaris-helper-setup.exe"; do
             if [ ! -f "$exe" ]; then
               echo "::error::待检产物不存在：$exe（构建产物路径变了？门需同步）"
               rc=1

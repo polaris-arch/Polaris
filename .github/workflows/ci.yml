@@ -1007,14 +1007,14 @@ jobs:
             cp target/debug/polaris-helper.exe native-dns-ci-evidence/polaris-helper.exe
             POLARIS_WINDOWS_INSTALL_ANCHOR="$(node scripts/prepare-core-identity.mjs --platform=win --directory="$POLARIS_CORE_CARRIER_DIR" --mode=maintenance-anchor --helper-binary=native-dns-ci-evidence/polaris-helper.exe)"
             export POLARIS_WINDOWS_INSTALL_ANCHOR
-            cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner 2>&1 | tee native-dns-ci-evidence/cleaner-build.log
+            cargo build --locked -p polaris-windows-cleaner --bin polaris-helper-setup 2>&1 | tee native-dns-ci-evidence/cleaner-build.log
             printf 'POLARIS_WINDOWS_INSTALL_ANCHOR=%s\n' "$POLARIS_WINDOWS_INSTALL_ANCHOR" >> "$GITHUB_ENV"
           fi
           helper=polaris-helper
           [ "$RUNNER_OS" != Windows ] || helper=polaris-helper.exe
           cp "target/debug/$helper" "$POLARIS_CORE_CARRIER_DIR/$helper"
           if [ "$RUNNER_OS" = Windows ]; then
-            cp target/debug/polaris-cleaner.exe "$POLARIS_CORE_CARRIER_DIR/polaris-cleaner.exe"
+            cp target/debug/polaris-helper-setup.exe "$POLARIS_CORE_CARRIER_DIR/polaris-helper-setup.exe"
           fi
           if [ "$RUNNER_OS" = macOS ]; then
             if ! codesign --verify --strict "$POLARIS_CORE_CARRIER_DIR/$helper"; then

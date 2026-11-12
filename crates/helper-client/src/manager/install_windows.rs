@@ -25,7 +25,7 @@ $icacls = "$env:SystemRoot\System32\icacls.exe"
 $support = '{support}'
 $coreDir = '{core}'
 $helperDst = '{destination}'
-$cleanerDst = Join-Path $support 'polaris-cleaner.exe'
+$cleanerDst = Join-Path $support 'polaris-helper-setup.exe'
 $record = Join-Path $support 'helper-installed.json'
 $service = '{service}'
 $identity = '{identity}'
@@ -186,7 +186,7 @@ try {{
   Secure-Directory $tx $false
   $utility = Join-Path $tx 'polaris-helper.exe'
   $manifest = Join-Path $tx 'core-manifest.json'
-  $cleaner = Join-Path $tx 'polaris-cleaner.exe'
+  $cleaner = Join-Path $tx 'polaris-helper-setup.exe'
   Copy-Item -LiteralPath '{helper}' -Destination $utility
   Copy-Item -LiteralPath '{manifest}' -Destination $manifest
   Seal-File $utility
@@ -195,7 +195,7 @@ try {{
   Check-Hash $manifest '{manifest_hash}'
   $selection = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
   if ($selection.id -cne '{core_id}' -or $selection.core.platform -cne 'win' -or $selection.core.cleanerSha256 -cnotmatch '^[0-9a-f]{{64}}$') {{ throw 'invalid sealed Windows installation selection' }}
-  Copy-Item -LiteralPath '{payload}\polaris-cleaner.exe' -Destination $cleaner
+  Copy-Item -LiteralPath '{payload}\polaris-helper-setup.exe' -Destination $cleaner
   Seal-File $cleaner
   Check-Hash $cleaner $selection.core.cleanerSha256
   $tokenFile = Join-Path $tx 'user-token'

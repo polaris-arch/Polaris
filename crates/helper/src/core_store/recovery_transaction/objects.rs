@@ -469,7 +469,15 @@ fn validate_windows_ancestors(store: &CoreStore) -> io::Result<()> {
             return Err(invalid("invalid repair store ancestry"));
         }
         path.push(component);
-        if !path.is_absolute() {
+        // OS-managed ancestors such as C:\ and C:\ProgramData let users add
+        // entries but not rename or delete the admin-owned Polaris directory, so
+        // judging starts at the store's parent, the directory Polaris creates.
+        if !path.is_absolute()
+            || store
+                .root
+                .parent()
+                .is_some_and(|parent| parent.starts_with(&path) && parent != path)
+        {
             continue;
         }
         let file = open_nofollow(&path, true)?;

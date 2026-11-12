@@ -25,7 +25,7 @@ export function verifySelectedCoreManifest(directory, sourceDirectory, platform)
   for (const file of value.core.files) actualCoreFile(join(directory, file.name), file);
   if (platform === 'win') {
     demand(hex(value.core.cleanerSha256), 'actual cleaner pin required');
-    demand(actualCoreFile(join(directory, 'polaris-cleaner.exe')).sha256 === value.core.cleanerSha256, 'final cleaner bytes differ from compiled pin');
+    demand(actualCoreFile(join(directory, 'polaris-helper-setup.exe')).sha256 === value.core.cleanerSha256, 'final cleaner bytes differ from compiled pin');
   } else demand(value.core.cleanerSha256 === null || value.core.cleanerSha256 === undefined, 'unexpected cleaner');
   return value;
 }
@@ -78,7 +78,7 @@ export function writeSelectedCoreManifest(directory, contract, platform, appVers
   const dir = lstatSync(directory); demand(dir.isDirectory() && !dir.isSymbolicLink(), 'payload directory required');
   const helper = platform === 'win' ? 'polaris-helper.exe' : 'polaris-helper';
   const helperSha256 = actualCoreFile(join(directory, helper)).sha256;
-  const cleanerSha256 = platform === 'win' ? actualCoreFile(join(directory, 'polaris-cleaner.exe')).sha256 : null;
+  const cleanerSha256 = platform === 'win' ? actualCoreFile(join(directory, 'polaris-helper-setup.exe')).sha256 : null;
   const manifest = selectedCoreManifest(contract, platform, appVersion, helperSha256, cleanerSha256);
   for (const expected of manifest.core.files) actualCoreFile(join(directory, expected.name), expected);
   writeManifest(directory, manifest);

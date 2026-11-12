@@ -158,7 +158,7 @@ def source_inventory(root):
     validate_names([(name, False) for name in result])
     for name in ['core-manifest.json', '_up_/LICENSE', '_up_/NOTICE', '_up_/THIRD-PARTY-LICENSES.md',
                  '_up_/resources/win/core-manifest.json', '_up_/resources/win/polaris-helper.exe',
-                 '_up_/resources/win/polaris-cleaner.exe', '_up_/resources/win/sing-box.exe',
+                 '_up_/resources/win/polaris-helper-setup.exe', '_up_/resources/win/sing-box.exe',
                  '_up_/resources/win/libcronet.dll']:
         require(name in result and result[name]['bytes'] > 0, 'required source missing: ' + name)
     require(sum(row['bytes'] for row in result.values()) <= MAX_TOTAL, 'source inventory total budget exceeded')
@@ -833,8 +833,8 @@ def plugin_inventory(root):
 def nsis_inventory(root, tool, archive, expected, scratch):
     # Keep the full $R6 payload and $PLUGINSDIR tool namespaces distinct.
     auxiliary = dict(plugin_inventory(root))
-    cleaner = '$PLUGINSDIR/polaris-cleaner.exe'
-    pinned_cleaner = expected['$R6/_up_/resources/win/polaris-cleaner.exe']
+    cleaner = '$PLUGINSDIR/polaris-helper-setup.exe'
+    pinned_cleaner = expected['$R6/_up_/resources/win/polaris-helper-setup.exe']
     require(cleaner not in auxiliary, 'cleaner must bind to the frozen application input')
     auxiliary[cleaner] = pinned_cleaner
     uninstaller = 'uninstall.exe'

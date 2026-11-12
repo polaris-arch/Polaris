@@ -22,7 +22,7 @@ assert.ok(count > 0, 'fixture count must come from the actual build source');
 // Inert staging members exercise the actual inventory CLI, not production packages.
 function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo) {
   if (selectionRepo === repo) selectionRepo=cleanRepo;
-  const root = mkdtempSync(join(tmpdir(), 'polaris-cleaner-inventory-'));
+  const root = mkdtempSync(join(tmpdir(), 'polaris-helper-setup-inventory-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const core = { linux: 'linux', windows: 'win', 'macos-x64': 'mac-x64', 'macos-arm64': 'mac-arm64' }[label];
   const suffix = label === 'windows' ? '.exe' : '';
@@ -55,7 +55,7 @@ function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo) 
     '--root', root], { encoding: 'utf8' });
   return { code: result.status, output: result.stdout + result.stderr };
 }
-const cleaner = '_up_/resources/win/polaris-cleaner.exe';
+const cleaner = '_up_/resources/win/polaris-helper-setup.exe';
 
 test('actual Windows inventory admits exactly the fixed cleaner artifact', (t) => {
   const r = fixture(t, 'windows', [cleaner]);
@@ -67,7 +67,7 @@ test('actual Windows inventory requires the cleaner even when helper and service
   assert.equal(r.code, 1, r.output);
   assert.match(r.output, /native-cleaner.*恰 1 份.*实为 0 份/);
 });
-for (const member of ['_up_/resources/win/unknown.exe', '_up_/resources/win/polaris-cleaner-backup.exe', '_up_/resources/win/nested/polaris-cleaner.exe']) {
+for (const member of ['_up_/resources/win/unknown.exe', '_up_/resources/win/polaris-helper-setup-backup.exe', '_up_/resources/win/nested/polaris-helper-setup.exe']) {
   test(`actual Windows inventory rejects extra executable: ${member}`, (t) => {
     const r = fixture(t, 'windows', [cleaner, member]);
     assert.equal(r.code, 1, r.output);
@@ -76,7 +76,7 @@ for (const member of ['_up_/resources/win/unknown.exe', '_up_/resources/win/pola
   });
 }
 test('renamed cleaner cannot satisfy its required inventory slot', (t) => {
-  const r = fixture(t, 'windows', ['_up_/resources/win/polaris-cleaner.EXE']);
+  const r = fixture(t, 'windows', ['_up_/resources/win/polaris-helper-setup.EXE']);
   assert.equal(r.code, 1, r.output);
   assert.match(r.output, /native-cleaner.*实为 0 份/);
   assert.match(r.output, /未登记/);
@@ -86,7 +86,7 @@ test('Linux inventory remains valid without a Windows cleaner', (t) => {
   assert.equal(r.code, 0, r.output);
 });
 test('Windows cleaner never becomes an allowed Linux payload', (t) => {
-  const r = fixture(t, 'linux', ['_up_/resources/linux/polaris-cleaner.exe']);
+  const r = fixture(t, 'linux', ['_up_/resources/linux/polaris-helper-setup.exe']);
   assert.equal(r.code, 1, r.output);
   assert.match(r.output, /未登记/);
 });
@@ -101,14 +101,14 @@ function windowsPayloadFixture(t, options = {}) {
   writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(manifest));
   const source = join(root, 'resources/win'), staging = join(root, 'staging/_up_/resources/win');
   mkdirSync(source, { recursive: true }); mkdirSync(staging, { recursive: true });
-  for (const name of ['sing-box.exe', 'polaris-helper.exe', 'polaris-cleaner.exe', 'libcronet.dll']) {
+  for (const name of ['sing-box.exe', 'polaris-helper.exe', 'polaris-helper-setup.exe', 'libcronet.dll']) {
     const content = name === 'libcronet.dll' ? bytes : Buffer.from(name);
     writeFileSync(join(source, name), content); writeFileSync(join(staging, name), content);
   }
   const pin = name => { const value = readFileSync(join(source, name)); return { member: name, bytes: value.length, sha256: createHash('sha256').update(value).digest('hex') }; };
   const installation = JSON.stringify(selectedCoreManifest({ version: '1.0.0-fixture', platforms: { win: {
     providerFingerprint: 'a'.repeat(64), core: pin('sing-box.exe'), sidecar: pin('libcronet.dll'),
-  } } }, 'win', '1.0.0-fixture', pin('polaris-helper.exe').sha256, pin('polaris-cleaner.exe').sha256));
+  } } }, 'win', '1.0.0-fixture', pin('polaris-helper.exe').sha256, pin('polaris-helper-setup.exe').sha256));
   for (const directory of [source, staging]) writeFileSync(join(directory, 'core-manifest.json'), installation);
   const run = () => { const result = spawnSync(process.execPath, [join(root, 'scripts/verify-packaging.mjs'), 'payload', '--label', 'windows', '--root', join(root, 'staging')], { encoding: 'utf8' }); return { code: result.status, output: result.stdout + result.stderr }; };
   return { root, source: join(source, 'libcronet.dll'), payload: join(staging, 'libcronet.dll'), bytes, run };

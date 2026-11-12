@@ -7,7 +7,7 @@
 pub const SERVICE: &str = "PolarisHelper";
 pub const SUPPORT_PARENT: &str = r"C:\ProgramData";
 pub const SUPPORT_LEAF: &str = "Polaris";
-pub const IMAGE_NAME: &str = "polaris-cleaner.exe";
+pub const IMAGE_NAME: &str = "polaris-helper-setup.exe";
 
 pub mod install;
 

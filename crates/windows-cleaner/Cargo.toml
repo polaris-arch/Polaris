@@ -25,7 +25,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [[bin]]
-name = "polaris-cleaner"
+name = "polaris-helper-setup"
 path = "src/main.rs"
 
 [dev-dependencies]

@@ -343,7 +343,20 @@ fn object_stamp(path: &Path) -> io::Result<String> {
             m.gid()
         ))
     }
-    #[cfg(not(unix))]
+    // Like the Unix stamp, leave out the access time: NTFS updates it when the
+    // publication barrier re-reads the receipt.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Ok(format!(
+            "{}:{}:{}:{}",
+            m.file_attributes(),
+            m.creation_time(),
+            m.last_write_time(),
+            m.file_size()
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Ok(format!("{:?}", m))
     }

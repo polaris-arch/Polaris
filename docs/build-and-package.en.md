@@ -153,8 +153,8 @@ case "$platform" in
     fi
     codesign --verify --strict "resources/$platform/$helper" ;;
   win)
-    cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner
-    cp "$out/polaris-cleaner.exe" resources/win/polaris-cleaner.exe ;;
+    cargo build --release -p polaris-windows-cleaner --bin polaris-helper-setup
+    cp "$out/polaris-helper-setup.exe" resources/win/polaris-helper-setup.exe ;;
 esac
 node scripts/prepare-core-identity.mjs --platform="$platform"
 export POLARIS_CORE_IDENTITY_FILE="$PWD/resources/$platform/core-manifest.json"

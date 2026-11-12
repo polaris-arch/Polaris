@@ -33,11 +33,11 @@ for (const needle of ['${If} $UpdateMode <> 1', '${If} $R7 != 0', '${If} $R7 == 
 test('missing hook fails rather than vacuously passing', () => assert.ok(failures(hook.replace('!macro NSIS_HOOK_POSTUNINSTALL', '!macro OTHER')).length));
 test('embedded executable stays independent of the removed app directory', () => {
   const body = hook.slice(hook.indexOf('!macro NSIS_HOOK_POSTUNINSTALL'));
-  assert.ok(body.includes('File /oname=polaris-cleaner.exe'));
+  assert.ok(body.includes('File /oname=polaris-helper-setup.exe'));
   assert.ok(!body.includes('$INSTDIR'));
 });
 test('payload filename/role substitution is rejected', () => {
-  for (const [from,to] of [['--launch','--worker'],['/oname=polaris-cleaner.exe','/oname=other.exe']]) {
+  for (const [from,to] of [['--launch','--worker'],['/oname=polaris-helper-setup.exe','/oname=other.exe']]) {
     assert.ok(failures(mutateHook(from,to)).length);
   }
 });

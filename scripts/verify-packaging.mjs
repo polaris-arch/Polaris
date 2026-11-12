@@ -1712,8 +1712,8 @@ const PAYLOAD_FAMILIES = [
       'app 仍能启动，故不装 TUN 试一次发现不了',
   },
   {
-    what: 'polaris-cleaner',
-    names: new Set(['polaris-cleaner.exe']),
+    what: 'polaris-helper-setup',
+    names: new Set(['polaris-helper-setup.exe']),
     requiredLabels: new Set(['windows']),
     consequence: 'Native helper removal / embedded NSIS fallback unavailable',
   },
@@ -2870,7 +2870,7 @@ function payloadAllowRules(label, coreDir, srsCount, releaseContract) {
   if (label === 'windows') {
     rules.push({
       id: 'native-cleaner',
-      re: /^_up_\/resources\/win\/polaris-cleaner\.exe$/,
+      re: /^_up_\/resources\/win\/polaris-helper-setup\.exe$/,
       min: 1,
       max: 1,
       why: 'Windows 固定 native cleaner：manager 卸载与 NSIS 嵌入 payload 同源，缺失时 helper 缺失/旧版的 UAC 卸载兜底无法完成；只允许这一精确文件，不放行其他 exe。',
