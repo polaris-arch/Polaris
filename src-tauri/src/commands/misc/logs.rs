@@ -3,7 +3,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -279,6 +279,27 @@ fn ts_ms_to_iso(ts_ms: u128) -> String {
         .ok()
         .and_then(polaris_stats_engine::created_at_to_rfc3339)
         .unwrap_or_else(|| ts_ms.to_string())
+}
+
+/// 提权助手近期日志（导出专用，仅用户导出时拉取一次）：行首 epoch 毫秒折成 ISO，凭据打码同 app 日志。
+async fn helper_log_tail(state: &State<'_, AppRuntime>) -> String {
+    let helper = Arc::clone(&state.helper);
+    let text = tokio::task::spawn_blocking(move || helper.recent_logs())
+        .await
+        .unwrap_or_else(|e| format!("(读取助手日志失败：{e})"));
+    let text: String = text
+        .lines()
+        .map(|line| {
+            match line
+                .split_once(' ')
+                .and_then(|(ms, rest)| Some((ms.parse::<u128>().ok()?, rest)))
+            {
+                Some((ms, rest)) => format!("{} {rest}\n", ts_ms_to_iso(ms)),
+                None => format!("{line}\n"),
+            }
+        })
+        .collect();
+    polaris_stats_engine::redact_log_secrets(&text)
 }
 
 /// 惰性起唯一日志推送任务。无订阅时真正休眠；有订阅但窗口隐藏时降到 1s 可见性巡检且不推进游标；
@@ -885,6 +906,7 @@ pub async fn diagnostic_export(
         )
     };
     let singbox_log_tail = read_core_log_tail(&dir, LOG_TAIL_BYTES);
+    let helper_log_tail = helper_log_tail(&state).await;
 
     let status = state.proxy().status();
     // 报告里这一格必须是**核实际在跑的级别**，不是盘上写的那个。
@@ -973,6 +995,7 @@ pub async fn diagnostic_export(
         extra_addresses: Vec::new(),
         app_log_tail,
         singbox_log_tail,
+        helper_log_tail,
         hint,
     };
     let markdown = polaris_stats_engine::assemble_diagnostic_report(&source);
@@ -1052,6 +1075,7 @@ pub async fn logs_export(
     let dir = state.config().dir().to_path_buf();
     let app_log = read_managed_tail(&dir.join("logs").join("polaris.log"), LOG_TAIL_BYTES);
     let singbox_log = read_core_log_tail(&dir, LOG_TAIL_BYTES);
+    let helper_log = helper_log_tail(&state).await;
 
     // 节点身份打码：日志原文含节点域名/IP/节点名 —— 与诊断报告共用同一套标识符收集 + 替换，不另写一份。
     let ids = match state.config().load_full() {
@@ -1064,7 +1088,8 @@ pub async fn logs_export(
 要附到公开 issue 请改用「诊断报告」导出。\n\n\
 生成时间：{}\n\n\
 ## app.log（近期）\n\n```text\n{}\n```\n\n\
-## sing-box logs（近期）\n\n```text\n{}\n```\n",
+## sing-box logs（近期）\n\n```text\n{}\n```\n\n\
+## helper logs（近期）\n\n```text\n{}\n```\n",
         now_iso8601(),
         if app_log.is_empty() {
             "(空)"
@@ -1075,6 +1100,11 @@ pub async fn logs_export(
             "(空)"
         } else {
             &singbox_log
+        },
+        if helper_log.is_empty() {
+            "(空)"
+        } else {
+            &helper_log
         },
     );
     let redacted = polaris_stats_engine::redact::redact_identifiers(&body, &ids);

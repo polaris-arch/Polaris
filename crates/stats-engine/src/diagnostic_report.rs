@@ -74,6 +74,8 @@ pub struct DiagnosticReportInput {
     pub redacted_singbox_config: Value,
     pub app_log_tail: String,
     pub singbox_log_tail: String,
+    /// 提权助手近期日志（已打码凭据；读不到时为一行原因）。
+    pub helper_log_tail: String,
     /// 节点标识符 → 占位符：构建末尾在全报告统一替换，打码节点身份，保留形态与跨段相关性。
     pub node_identifiers: Vec<NodeIdentifier>,
     /// 当前级别不含连接明细（>info）且日志疑似有连接/DNS 错误 → 提示把日志级别切到 DEBUG 复现。
@@ -188,6 +190,11 @@ pub fn build_diagnostic_report(input: &DiagnosticReportInput) -> String {
     lines.push(fence("text", &input.singbox_log_tail));
     lines.push(String::new());
 
+    lines.push("## helper logs（近期）".into());
+    lines.push(String::new());
+    lines.push(fence("text", &input.helper_log_tail));
+    lines.push(String::new());
+
     // 末尾在全报告（配置块 + 日志 + 运行态）统一打码节点标识符，跨段占位一致便于关联诊断。
     redact_identifiers(&lines.join("\n"), &input.node_identifiers)
 }
@@ -219,6 +226,7 @@ pub struct DiagnosticReportSource {
     pub extra_addresses: Vec<String>,
     pub app_log_tail: String,
     pub singbox_log_tail: String,
+    pub helper_log_tail: String,
     pub hint: Option<String>,
 }
 
@@ -244,6 +252,7 @@ pub fn assemble_diagnostic_report(src: &DiagnosticReportSource) -> String {
         },
         app_log_tail: src.app_log_tail.clone(),
         singbox_log_tail: src.singbox_log_tail.clone(),
+        helper_log_tail: src.helper_log_tail.clone(),
         node_identifiers: crate::redact::collect_report_node_identifiers(
             &src.user_config,
             &src.singbox_config,

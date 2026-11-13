@@ -83,6 +83,7 @@ pub mod legacy_use;
 pub mod line_io;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux_legacy_maintenance;
+pub mod log_ring;
 pub mod pinned_core;
 pub mod process_lease;
 pub mod token;

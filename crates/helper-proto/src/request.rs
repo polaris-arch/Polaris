@@ -235,6 +235,8 @@ pub enum Request {
     },
     /// `cleanup`（无参数行）。
     Cleanup,
+    /// `helper-logs`（无参数行，只读）。
+    HelperLogs,
     /// `freeport <port>`（行3/行2 = 端口字符串）。
     FreePort {
         port: u16,
@@ -312,6 +314,7 @@ impl Request {
             Self::NativeStatusBirth => command::common::NATIVE_STATUS_BIRTH,
             Self::NativeStopBirth { .. } => command::common::NATIVE_STOP_BIRTH,
             Self::Cleanup => command::common::CLEANUP,
+            Self::HelperLogs => command::common::HELPER_LOGS,
             Self::FreePort { .. } => command::common::FREEPORT,
             Self::Start(_) => command::common::START,
             Self::LinuxStart(_) => command::linux::START_REAP_SAFE,
@@ -362,6 +365,7 @@ impl Request {
             | Self::LinuxDnsSnapshot
             | Self::NativeStatusBirth
             | Self::Cleanup
+            | Self::HelperLogs
             | Self::FlushDns
             | Self::WindowsFlushDnsNative
             | Self::MacProxyCompareCapability

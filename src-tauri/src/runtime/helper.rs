@@ -1960,6 +1960,27 @@ impl HelperRuntime {
         }
     }
 
+    /// 用户导出日志/诊断报告时读取助手近期日志（只读，仅导出时调用）。读不到时折成一行原因，不中断导出。
+    pub(crate) fn recent_logs(&self) -> String {
+        if !self.supported() {
+            return "(当前平台无提权助手)".to_owned();
+        }
+        if !self.manager().is_installed() {
+            return "(提权助手未安装)".to_owned();
+        }
+        match self
+            .build_client()
+            .and_then(|client| client.send(&Request::HelperLogs).map_err(|e| e.to_string()))
+        {
+            Ok(Response::Ok(ResponseKind::HelperLogs(text))) => text,
+            Ok(Response::Err(error)) if is_unknown_command_reply(&error) => {
+                "(助手版本过旧，无法读取日志)".to_owned()
+            }
+            Ok(other) => format!("(读取助手日志失败：{})", other.to_wire_line()),
+            Err(error) => format!("(助手不可达：{error})"),
+        }
+    }
+
     /// C7：经 root/SYSTEM helper 刷系统 DNS 缓存（mac `flush-dns`：dscacheutil + HUP mDNSResponder 两层全清）。
     ///
     /// 契约（对齐 上游 `HelperManager.flushDns`）：**永不抛** —— 通信/协议失败收敛为 `ok:false`，调用方

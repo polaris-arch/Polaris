@@ -370,6 +370,7 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
             pid: polaris_helper_proto::parse_stop_pid(next_line()),
         },
         command::common::CLEANUP => Request::Cleanup,
+        command::common::HELPER_LOGS if args.is_empty() => Request::HelperLogs,
         command::common::FREEPORT => {
             let port = parse_port(next_line())?;
             Request::FreePort { port }

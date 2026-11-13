@@ -281,7 +281,32 @@ where
                 exit_after: false,
             };
         };
-        FrameReply::from_outcome(self.dispatch(req, peer))
+        // 起核/升级的准入结论（起核成功另在 spawn 处记 pid 与内核 id；birth 令牌的 Debug 已打码）。
+        let conclusion = matches!(
+            req,
+            Request::NativeStartPinned(_)
+                | Request::PrepareHelperUpgrade
+                | Request::CancelHelperUpgrade
+        )
+        .then(|| req.command_name());
+        let outcome = self.dispatch(req, peer);
+        if let Some(command) = conclusion.filter(|_| {
+            !matches!(
+                outcome,
+                HandleOutcome::Respond(Response::Ok(ResponseKind::PinnedStart {
+                    start: polaris_helper_proto::core_protocol::PinnedBirthStart::Native(
+                        polaris_helper_proto::NativeBirthStart::Started { .. }
+                    ),
+                    ..
+                }))
+            )
+        }) {
+            log::info!(
+                owner = peer.map(|peer| peer.identity.key()).as_deref();
+                "{command} -> {outcome:?}"
+            );
+        }
+        FrameReply::from_outcome(outcome)
     }
 
     fn registered_token(&self, peer: &crate::user_control::NativePeer) -> std::io::Result<String> {
@@ -377,6 +402,7 @@ where
                     Request::Ping
                         | Request::Version
                         | Request::CoreStatus { .. }
+                        | Request::HelperLogs
                         | Request::NativeStopBirth { .. }
                 )
             {
@@ -416,6 +442,9 @@ where
                 )))
             }
             Request::NativeStartPinned(params) => self.handle_native_pinned(&params, peer),
+            Request::HelperLogs => HandleOutcome::Respond(Response::Ok(ResponseKind::HelperLogs(
+                crate::log_ring::read(peer.map(|peer| peer.identity.key()).as_deref()),
+            ))),
             Request::Ping => HandleOutcome::Respond(Response::Ok(ResponseKind::Pong(
                 // Go helper.go:179: Windows Getuid()=-1 破坏正则，固定发 0。
                 polaris_helper_proto::Pong::current(0),

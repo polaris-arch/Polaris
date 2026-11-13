@@ -540,7 +540,12 @@ fn native_reap_tombstone_serves_late_stop_but_not_restarted_helper() {
         "late old Stop must not signal a successor with a reused PID"
     );
     assert!(matches!(successor.reap_fact(), LocalReapFact::Pending));
-    assert!(!successor.custody.lock().unwrap().termination_started);
+    assert!(successor
+        .custody
+        .lock()
+        .unwrap()
+        .termination_started
+        .is_none());
     assert_ne!(old_target, successor_target);
 
     let restarted = AmbientCapsSpawner::new(Arc::new(Mutex::new(HandlerState::new())));

@@ -37,6 +37,9 @@ pub mod common {
     pub const NATIVE_STOP_BIRTH: &str = "stop-native-birth-safe";
     /// `OK cleaned`（兜底清所有锁定二进制实例 + 摘 child）。
     pub const CLEANUP: &str = "cleanup";
+    /// `OK helper-logs <json-string>`：只读取 helper 内存日志里属主为调用方或全局的记录。
+    /// 兼容扩展，不提升协议版本：旧 helper 回裸 `ERR unknown`。
+    pub const HELPER_LOGS: &str = "helper-logs";
     /// `OK free` / `OK killed <pids>` / `OK foreign <names>` / `ERR bad-port`（按端口定位 LISTEN 持有者）。
     pub const FREEPORT: &str = "freeport";
     /// `OK route`（出口托管接口装 ifscope/per-iface 路由，mac proto v7 / win proto v2）。

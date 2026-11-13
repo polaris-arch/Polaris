@@ -16,7 +16,7 @@ pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Operations are made only while this exact Child's lock is held.
 pub(super) trait NativeChild: Send {
-    fn try_wait(&mut self) -> io::Result<bool>;
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
     fn terminate(&mut self) -> io::Result<()>;
     fn kill(&mut self) -> io::Result<()>;
 }
@@ -384,6 +384,11 @@ impl NativeCustody {
         if owned.wait_identity_lost {
             return;
         }
+        // Lifecycle records only: owner and the TERM instant derived from the existing deadline.
+        let owner = birth.core.get().map(|(_, uid)| *uid);
+        let term_sent = owned
+            .term_deadline
+            .and_then(|deadline| deadline.checked_sub(STOP_GRACE));
         let requested = birth.stop_requested.swap(false, Ordering::AcqRel);
         if requested {
             owned.phase = if owned.native_exited {
@@ -396,11 +401,17 @@ impl NativeCustody {
         }
         if !owned.native_exited {
             match owned.child.try_wait() {
-                Ok(true) => {
+                Ok(Some(status)) => {
                     owned.native_exited = true;
                     owned.phase = Phase::NativeExitedTailPending;
+                    log::info!(
+                        owner = owner;
+                        "core exited pid={} {status} term_to_exit_ms={:?}",
+                        birth.target.pid,
+                        term_sent.map(|t| now.saturating_duration_since(t).as_millis())
+                    );
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => {
                     #[cfg(unix)]
                     if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
@@ -421,6 +432,11 @@ impl NativeCustody {
                         return;
                     }
                     owned.term_deadline = Some(now + STOP_GRACE);
+                    log::info!(
+                        owner = owner;
+                        "core stop requested: TERM sent pid={}",
+                        birth.target.pid
+                    );
                 } else if owned.term_deadline.is_some_and(|deadline| now >= deadline)
                     && !owned.kill_sent
                 {
@@ -430,6 +446,12 @@ impl NativeCustody {
                         return;
                     }
                     owned.kill_sent = true;
+                    log::info!(
+                        owner = owner;
+                        "core stop grace expired: KILL sent pid={} term_to_kill_ms={:?}",
+                        birth.target.pid,
+                        term_sent.map(|t| now.saturating_duration_since(t).as_millis())
+                    );
                 }
             }
             return;
@@ -462,6 +484,12 @@ impl NativeCustody {
                 slot.stopped.pop_front();
             }
             slot.current = None;
+            log::info!(
+                owner = owner;
+                "core retired pid={} term_to_retire_ms={:?}",
+                birth.target.pid,
+                term_sent.map(|t| t.elapsed().as_millis())
+            );
         }
     }
 }

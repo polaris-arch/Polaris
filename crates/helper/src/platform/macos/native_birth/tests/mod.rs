@@ -31,12 +31,16 @@ impl Drop for Child {
     }
 }
 impl NativeChild for Child {
-    fn try_wait(&mut self) -> io::Result<bool> {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
         self.0.waits.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = *self.0.wait_error.lock().unwrap() {
             return Err(io::Error::from_raw_os_error(error));
         }
-        Ok(self.0.exited.load(Ordering::SeqCst))
+        Ok(self
+            .0
+            .exited
+            .load(Ordering::SeqCst)
+            .then(|| std::os::unix::process::ExitStatusExt::from_raw(0)))
     }
     fn terminate(&mut self) -> io::Result<()> {
         self.0.terms.fetch_add(1, Ordering::SeqCst);

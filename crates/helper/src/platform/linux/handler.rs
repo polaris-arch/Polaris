@@ -199,6 +199,15 @@ pub fn handle<P, S, D, SD>(
         return;
     }
 
+    if command == cmd::HELPER_LOGS {
+        let caller = polaris_helper_proto::core_protocol::CallerIdentity::Unix(cred.uid).key();
+        let response = Response::Ok(ResponseKind::HelperLogs(crate::log_ring::read(Some(
+            &caller,
+        ))));
+        let _ = conn.write_line(&response.to_wire_line());
+        return;
+    }
+
     if matches!(
         command.as_str(),
         lcmd::RESOLVED_DNS_SNAPSHOT | lcmd::RESOLVED_DNS_COMPARE
@@ -645,16 +654,19 @@ fn dispatch_locked<P, S, D, SD>(
                     BirthAdmission::Admitted
                 )
             {
+                log::info!(owner = cred.uid; "{command} -> helper-upgrade-busy");
                 let _ = conn.write_line("ERR helper-upgrade-busy");
                 return;
             }
             state.child = None;
             state.upgrade_closed = command == cmd::PREPARE_HELPER_UPGRADE;
-            let _ = conn.write_line(if state.upgrade_closed {
+            let receipt = if state.upgrade_closed {
                 "OK helper-upgrade-admitted"
             } else {
                 "OK helper-upgrade-cancelled"
-            });
+            };
+            log::info!(owner = cred.uid; "{command} -> {receipt}");
+            let _ = conn.write_line(receipt);
         }
         cmd::CORE_STATUS => {
             let (Ok(Some(id)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict())
@@ -1201,6 +1213,7 @@ fn handle_start<P, S, D, SD>(
                 matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))) {
                 LinuxBirthStart::NotAdmittedPending { target }
             } else { LinuxBirthStart::Already { target } };
+            log::info!(owner = cred.uid; "start not admitted: {result:?}");
             let _ = conn.write_line(&birth_start_line(Some(id), result));
             return;
         }
@@ -1214,6 +1227,7 @@ fn handle_start<P, S, D, SD>(
                 }
                 (target, _) => LinuxBirthStart::NotAdmittedUnknown { target },
             };
+            log::info!(owner = cred.uid; "start not admitted: {result:?}");
             let _ = conn.write_line(&birth_start_line(Some(id), result));
             return;
         }
@@ -1308,6 +1322,7 @@ fn handle_start<P, S, D, SD>(
             }
         }
         Err(SpawnError::Spawn { detail }) => {
+            log::info!(owner = cred.uid; "start failed: {detail}");
             let _ = conn.write_line(&format!("ERR start {detail}"));
         }
     }

@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::process::ExitStatus;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::platform::accept_retry::{LogThrottle, ACCEPT_LOG_INTERVAL};
 use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
@@ -294,7 +294,8 @@ impl ChildWaiter for Child {
 struct ChildCustody {
     child: Box<dyn ChildWaiter>,
     phase: LocalReapFact,
-    termination_started: bool,
+    /// Instant the single TERM/KILL worker was admitted (also the exit-timing origin).
+    termination_started: Option<Instant>,
 }
 
 /// The Child and its terminal phase share one per-birth mutex. A signal checks
@@ -339,7 +340,7 @@ impl ChildSlot {
             custody: Mutex::new(ChildCustody {
                 child,
                 phase: LocalReapFact::Pending,
-                termination_started: false,
+                termination_started: None,
             }),
             cv: Condvar::new(),
         })
@@ -376,6 +377,12 @@ impl ChildSlot {
         match custody.child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
+                log::info!(
+                    owner = self.handle.owner_uid;
+                    "core exited pid={} {status} term_to_exit_ms={:?}",
+                    self.handle.pid,
+                    custody.termination_started.map(|t| t.elapsed().as_millis())
+                );
                 custody.phase = LocalReapFact::Reaped(HelperBirthReaped {
                     birth: self.handle.clone(),
                     status,
@@ -412,8 +419,8 @@ impl ChildSlot {
             LocalReapFact::Reaped(_) => (StopReap::Reaped, false),
             LocalReapFact::Unknown => (StopReap::Unknown, false),
             LocalReapFact::Pending => {
-                let start_worker = !custody.termination_started;
-                custody.termination_started = true;
+                let start_worker = custody.termination_started.is_none();
+                custody.termination_started.get_or_insert_with(Instant::now);
                 (StopReap::Pending, start_worker)
             }
         }
@@ -465,11 +472,27 @@ fn terminate_slot(slot: &ChildSlot) {
     let grace = Duration::from_secs(TERMINATE_GRACE_SECS);
     terminate_child(
         || {
-            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGTERM));
+            if let Ok(true) =
+                slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGTERM))
+            {
+                log::info!(
+                    owner = slot.handle.owner_uid;
+                    "core stop requested: TERM sent pid={}",
+                    slot.handle.pid
+                );
+            }
         },
         || slot.wait_exited(grace),
         || {
-            let _ = slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL));
+            if let Ok(true) =
+                slot.signal_if_live(|pid| send_signal(pid, nix::sys::signal::Signal::SIGKILL))
+            {
+                log::info!(
+                    owner = slot.handle.owner_uid;
+                    "core stop grace expired: KILL sent pid={}",
+                    slot.handle.pid
+                );
+            }
         },
     );
 }
@@ -904,6 +927,11 @@ impl AmbientCapsSpawner {
             })?;
         let pid = child.id();
         let process_ms = crate::elapsed_ms(process_started);
+        log::info!(
+            owner = req.uid;
+            "core started pid={pid} core={}",
+            admitted.manifest.id.get(..12).unwrap_or_default()
+        );
 
         let log_handoff_started = std::time::Instant::now();
         if let Some(log) = pinned_log {

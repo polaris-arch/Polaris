@@ -285,6 +285,8 @@ pub enum ResponseKind {
     NativeBirthStop(NativeBirthStop),
     /// `OK cleaned`（cleanup）。
     Cleaned,
+    /// `OK helper-logs <json-string>`（helper-logs）：已按调用方过滤的日志正文，每条一行。
+    HelperLogs(String),
     /// `OK route`（route-add / route-del）。
     Route,
     /// `OK free` / `OK killed <pids>` / `OK foreign <names>`（freeport）。
@@ -560,6 +562,10 @@ fn ok_kind_to_wire(kind: &ResponseKind) -> String {
         | ResponseKind::NativeBirthStatus(_)
         | ResponseKind::NativeBirthStop(_) => native_birth::to_wire(kind),
         ResponseKind::Cleaned => "OK cleaned".to_owned(),
+        ResponseKind::HelperLogs(text) => format!(
+            "OK helper-logs {}",
+            serde_json::to_string(text).expect("log text is a JSON string")
+        ),
         ResponseKind::Route => "OK route".to_owned(),
         ResponseKind::FreePort(fp) => free_port_to_wire(fp),
         ResponseKind::Installed => "OK installed".to_owned(),
@@ -759,6 +765,13 @@ fn parse_ok(rest: &str) -> ResponseKind {
             })
         }
         "cleaned" => ResponseKind::Cleaned,
+        "helper-logs" => match serde_json::from_str(tail) {
+            Ok(text) => ResponseKind::HelperLogs(text),
+            Err(_) => ResponseKind::OkRaw {
+                token: token.to_owned(),
+                rest: tail.to_owned(),
+            },
+        },
         "route" => ResponseKind::Route,
         "free" => ResponseKind::FreePort(FreePort::Free),
         "killed" => ResponseKind::FreePort(FreePort::Killed {

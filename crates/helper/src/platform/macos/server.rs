@@ -167,6 +167,7 @@ pub fn decode_request<I: Iterator<Item = String>>(
             pid: parse_stop_pid(&optional_line(lines)?),
         }),
         "cleanup" => Ok(Request::Cleanup),
+        polaris_helper_proto::command::common::HELPER_LOGS => Ok(Request::HelperLogs),
         "flush-dns" => Ok(Request::FlushDns),
         "system-proxy-transaction" => {
             let payload_hex = required_line(lines, "payload_hex")?.trim().to_owned();
@@ -372,6 +373,23 @@ pub fn process_connection_from_peer<R: Read, W: Write>(
         }
     };
     let resp = dispatch_from_peer(services, config, &token, &req, peer_uid);
+    // 起核/升级的准入结论（起核成功另在 spawn 处记 pid 与内核 id；birth 令牌的 Debug 已打码）。
+    if matches!(
+        req,
+        Request::NativeStartPinned(_)
+            | Request::PrepareHelperUpgrade
+            | Request::CancelHelperUpgrade
+    ) && !matches!(
+        resp,
+        polaris_helper_proto::Response::Ok(polaris_helper_proto::ResponseKind::PinnedStart {
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Native(
+                polaris_helper_proto::NativeBirthStart::Started { .. }
+            ),
+            ..
+        })
+    ) {
+        log::info!(owner = peer_uid; "{} -> {resp:?}", req.command_name());
+    }
     write_response(&mut writer, &resp)
 }
 
@@ -485,8 +503,8 @@ mod sys {
 
     struct OwnedNativeChild(polaris_core_supervisor::admitted_payload::StdCustodiedChild);
     impl NativeChild for OwnedNativeChild {
-        fn try_wait(&mut self) -> std::io::Result<bool> {
-            self.0.try_wait().map(|status| status.is_some())
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.0.try_wait()
         }
         fn terminate(&mut self) -> std::io::Result<()> {
             // Unix signal is synchronous under the same Child lock after a native poll.
@@ -610,6 +628,12 @@ mod sys {
             let birth = self
                 .native
                 .publish(target, Box::new(OwnedNativeChild(child)));
+            log::info!(
+                owner = uid;
+                "core started pid={} core={}",
+                target.pid,
+                id.as_str().get(..12).unwrap_or_default()
+            );
             birth.attach_core(core, uid);
             admission.1 = true;
             #[cfg(all(test, target_os = "macos"))]

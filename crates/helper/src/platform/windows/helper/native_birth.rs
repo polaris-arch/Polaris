@@ -28,6 +28,11 @@ pub(super) fn cache_exit<P: ProcOps>(
         .native
         .as_ref()
         .and_then(|native| native.owner.clone());
+    log::info!(
+        owner = owner.as_ref().map(|owner| owner.key()).as_deref();
+        "core retired pid={}",
+        target.pid
+    );
     state.terminal.push_back((target, owner));
     if state.terminal.len() > 16 {
         state.terminal.pop_front();
@@ -307,6 +312,11 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                 return start_response(NativeBirthStart::NotAdmittedUnknown { target: None });
             };
             let target = HelperBirthTarget { pid, birth };
+            log::info!(
+                owner = peer.identity.key().as_str();
+                "core started pid={pid} core={}",
+                core.manifest.id.get(..12).unwrap_or_default()
+            );
             state.pid = Some(started.pid);
             state.native = Some(NativeCustody {
                 target,

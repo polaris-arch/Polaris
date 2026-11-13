@@ -32,8 +32,8 @@ hex = "0.4"
 semver = "1"
 # thiserror = win 的 HelperError/HandlerError + linux 的 ServerError/SpawnError 枚举 derive。
 thiserror = "2"
-# log = win SCM 服务日志 + winproc 旁路 stderr 的 facade（生产侧由 host 接管）。
-log = "0.4"
+# log = 三平台 daemon 日志 facade；daemon 自装 `log_ring` 内存环形缓冲（kv 承载记录属主，无新增依赖）。
+log = { version = "0.4", features = ["kv"] }
 
 # ===== macOS 专用 =====
 # nix = sysctl/syscall 的安全封装（移植自 Go `syscall.SYS___SYSCTL` / `proc_starttime_darwin.go`）。

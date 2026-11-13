@@ -49,6 +49,7 @@ request_samples! {
     Stop => Request::Stop { pid: Some(4242) },
     LinuxStop => Request::LinuxStop { pid: Some(4242) },
     Cleanup => Request::Cleanup,
+    HelperLogs => Request::HelperLogs,
     FreePort => Request::FreePort { port: 9090 },
     Start => Request::Start(StartParams {
         cfg: r"C:\Users\polaris\config\config.json".to_owned(),

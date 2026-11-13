@@ -355,6 +355,11 @@ pub fn dispatch_from_peer(
             Response::Ok(ResponseKind::NativeBirthStop(services.native_stop(*target)))
         }
         Request::NativeStartBirth(_) => Response::Err(ProtoError::new(ErrorCode::Unknown)),
+        Request::HelperLogs => Response::Ok(ResponseKind::HelperLogs(crate::log_ring::read(
+            peer_uid
+                .map(|uid| polaris_helper_proto::core_protocol::CallerIdentity::Unix(uid).key())
+                .as_deref(),
+        ))),
         Request::Ping => {
             // helper.go:422-423: OK pong uid=<n> v<ver>
             Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(

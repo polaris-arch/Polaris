@@ -654,25 +654,38 @@ impl ProcOps for WinProcOps {
         if first != NativeChildPoll::Running {
             return first;
         }
+        let term_sent = std::time::Instant::now();
         if !child.term_requested {
             // The HANDLE remains owned and unreaped while sending this compatibility signal.
             child.term_requested = true;
             if send_ctrl_break(child.pid).is_err() {
                 let _ = send_ctrl_break_via_child_console(child.pid);
             }
+            log::info!("core stop requested: CTRL_BREAK sent pid={}", child.pid);
             let graceful = native_wait(child, 2000);
             if graceful != NativeChildPoll::Running {
+                log::info!(
+                    "core stop after CTRL_BREAK pid={} {graceful:?} term_to_exit_ms={}",
+                    child.pid,
+                    term_sent.elapsed().as_millis()
+                );
                 return graceful;
             }
         }
         if !child.kill_requested {
             if terminate_handle(child.handle.as_raw_handle().cast()).is_err() {
+                log::warn!("core stop TerminateProcess unconfirmed pid={}", child.pid);
                 return match native_wait(child, 0) {
                     NativeChildPoll::Exited => NativeChildPoll::Exited,
                     _ => NativeChildPoll::Unknown,
                 };
             }
             child.kill_requested = true;
+            log::info!(
+                "core stop grace expired: TerminateProcess sent pid={} ms={}",
+                child.pid,
+                term_sent.elapsed().as_millis()
+            );
         }
         // TerminateProcess acceptance is not exit. Keep HANDLE custody through timeout/error.
         native_wait(child, 2000)

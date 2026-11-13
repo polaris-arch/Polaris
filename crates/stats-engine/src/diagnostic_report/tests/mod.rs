@@ -244,6 +244,7 @@ fn 红线_端到端_报告不含任何明文密钥() {
             "dial tokyo.example.com ok\nTLS to cdn.example.com\n东京节点甲 up\nts-host-name joined"
                 .into(),
         singbox_log_tail: "lookup custom.example.com SERVFAIL\npeer 1.2.3.4 handshake".into(),
+        helper_log_tail: String::new(),
         node_identifiers: collect_node_identifiers(&user_config, &[]),
         hint: None,
     };
@@ -385,6 +386,7 @@ fn 全协议族_source() -> DiagnosticReportSource {
 ts-host-alpha joined tailnet\nresolved to 203.0.113.77".into(),
             singbox_log_tail: "lookup snell.example.com SERVFAIL\nhandshake nested-sni.example.com failed\n\
 peer 162.159.192.1 up\nws-a.example.com 200".into(),
+            helper_log_tail: String::new(),
             hint: None,
         }
 }
