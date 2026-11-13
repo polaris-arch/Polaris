@@ -128,6 +128,8 @@
   --pending-bar-h: 36px;
   --toast-gap: var(--sp-4);
   --shadow-pop: 0 18px 40px -16px hsl(var(--shadow)/0.6);
+  /* 卡片轻阴影（桌面 index.css「卡片统一观感」段）；深色两条腿各覆盖一次透明度。 */
+  --shadow-card: 0 1px 3px hsl(var(--shadow)/0.16);
 
   /* ── 字体栈（主题无关）──
    * `--sans` 已含 `Noto Sans CJK SC`（契约 B）：其余三个中文族只在 Apple / Windows 上存在，
@@ -202,6 +204,7 @@
     --indigo: 236 64% 32%;
     --logo-tile: 213 26% 88%;
     --logo-tile-bd: 214 18% 72%;
+    --shadow-card: 0 1px 3px hsl(var(--shadow)/0.6);
   }
 }
 
@@ -242,4 +245,5 @@
   --indigo: 236 64% 32%;
   --logo-tile: 213 26% 88%;
   --logo-tile-bd: 214 18% 72%;
+  --shadow-card: 0 1px 3px hsl(var(--shadow)/0.6);
 }

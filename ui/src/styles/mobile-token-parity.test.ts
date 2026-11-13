@@ -246,6 +246,7 @@ const LIGHT: Record<string, string> = {
   '--sans':
     "-apple-system, 'Segoe UI Variable', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Microsoft YaHei', system-ui, sans-serif",
   '--shadow': '216 45% 20%',
+  '--shadow-card': '0 1px 3px hsl(var(--shadow)/0.16)',
   '--shadow-pop': '0 18px 40px -16px hsl(var(--shadow)/0.6)',
   '--sp-1': '4px',
   '--sp-2': '8px',
@@ -291,6 +292,7 @@ const DARK: Record<string, string> = {
   '--ok-weak': '154 40% 14%',
   '--ring': '195 90% 60%',
   '--shadow': '224 80% 1%',
+  '--shadow-card': '0 1px 3px hsl(var(--shadow)/0.6)',
   '--surface': '219 32% 10.5%',
   '--surface-2': '218 26% 14%',
   '--surface-3': '217 22% 19.5%',

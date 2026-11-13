@@ -743,31 +743,44 @@ h1[tabindex='-1']:focus-visible { outline: none; }
 /* 旧日志提示的动作成组：正文可换行，归档/删除保持在右侧同一行；窄宽时由 mode-warn 自身换行。 */
 .legacy-log-actions{ margin-inline-start:auto; display:flex; align-items:center; gap:8px; flex:none; }
 
-/* 应用分流卡分组 + 卡片浅色主题区分度修复（真机截图确认：分组头与卡面、卡片与页面背景在浅色下
- * 发灰糊成一片；深色本已有明显层次差，不受影响，只加浅色覆盖）。
- * 浅色下 --surface(100%L)/--bg(96%L)/--surface-2(94%L) 彼此仅差 2-6 个百分点，--line(87%L) 边框
- * 与这些背景的反差都不够——`.ap-group`/`.app-card` 原样保留 --line 描边在深色够用，浅色下换更深一档
- * 的 --hair（既有 token，`.ap-group-head`/`.ap-row` 分隔线已在用，语义就是「比 line 更强的分隔」）；
- * 分组头背景从透明度混合的 surface-2/0.55 换成 --surface-3 实色（与其身处的近白背景拉开更明显的
- * 面积色差）；卡片补一圈贴合阴影（复用 --shadow token，量级与 hover-card/ub-ico 已有阴影同源）让白卡
- * 从近白背景里"浮"出来，而非只靠一条边框线。只覆盖浅色，深色维持 prototype.css 原值不动。 */
-@media (prefers-color-scheme: light){
-  :root:not([data-theme="dark"]) .ap-group{ border-color:hsl(var(--hair)); background:hsl(var(--surface-2)/0.5); }
-  :root:not([data-theme="dark"]) .ap-group-head{ background:hsl(var(--surface-3)); }
-  :root:not([data-theme="dark"]) .app-card{ border-color:hsl(var(--hair)); box-shadow:0 1px 3px hsl(var(--shadow)/0.16); }
-}
-:root[data-theme="light"] .ap-group{ border-color:hsl(var(--hair)); background:hsl(var(--surface-2)/0.5); }
-:root[data-theme="light"] .ap-group-head{ background:hsl(var(--surface-3)); }
-:root[data-theme="light"] .app-card{ border-color:hsl(var(--hair)); box-shadow:0 1px 3px hsl(var(--shadow)/0.16); }
+/* 卡片统一观感：深描边（--hair）+ 轻阴影（--shadow-card），两档主题同一原则（用户拍板）。
+ * 范围 = 承载内容 / 可点选的成块容器：`.card`（首页连接卡/拓扑、路由 geo、DNS 策略与资源卡、日志工具条、
+ * 连接页、设置分组/Helper/更新/关于）、节点卡 `.nd-card`、节点列表档容器、订阅信息条 `.sub-info`、
+ * 应用分流 `.ap-group`/`.app-card`、添加接入选择卡 `.mesh-col`。输入框、分段控件、出口节点框等
+ * 「凹陷输入槽」与浮层（菜单/弹窗/#tip，后者自带 ID 级 border/box-shadow）不在此列。
+ * 只写 (0,1,0) 基础态：`.nd-card:hover/.cur`、`.mesh-col:hover` 等 (0,2,0) 高亮态照旧胜出，不被压平；
+ * 列表档的行由 `#s-nodes.nodes-list-view .nd-card` 关掉阴影（见下方 F1 那条）。
+ * 阴影按主题取不同透明度：深色的 --shadow 近黑，0.16 在深底上不可见，故单独一档。 */
+:root{ --shadow-card:0 1px 3px hsl(var(--shadow)/0.16); }
+@media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){ --shadow-card:0 1px 3px hsl(var(--shadow)/0.6); } }
+:root[data-theme="dark"]{ --shadow-card:0 1px 3px hsl(var(--shadow)/0.6); }
+.card, .nd-card, .sub-info, .app-card, .ap-group, .mesh-col,
+#s-nodes.nodes-list-view .node-grid{ border-color:hsl(var(--hair)); box-shadow:var(--shadow-card); }
 
-/* 接入选择卡（`.mesh-col`，添加接入弹窗）浅色修正：基线底色 --surface-2/0.5 在深色里比弹窗面
- * (--surface) 更亮 = 「浮起的可点卡」；浅色里 --surface-2 比白色 --surface 更暗 = 读成「凹陷/禁用的
- * 输入槽」（与出口节点框、分段控件同一种底），白弹窗上一排灰块即用户反馈的不协调。浅色下回到与
- * `.card` 同层的 --surface 白底、靠 --line 描边成卡；hover 仍走基线的 --surface-2 反馈。只覆盖浅色。 */
+/* 浅色：卡片一律白底（--surface）。原本灰底的两处——`.mesh-col`（--surface-2/0.5，在白弹窗上读成
+ * 「凹陷/禁用的输入槽」）与 `.ap-group`（--surface-2/0.16）——回到白底，靠描边 + 阴影成卡；分组头保留
+ * --surface-3 色带区分组头与卡面。`.mesh-col` 只覆盖非 hover 态，hover 仍走基线 --surface-2 反馈。
+ * 深色底色保持原值不动。 */
 @media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]) .ap-group{ background:hsl(var(--surface)); }
+  :root:not([data-theme="dark"]) .ap-group-head{ background:hsl(var(--surface-3)); }
   :root:not([data-theme="dark"]) .mesh-col:not(:hover){ background:hsl(var(--surface)); }
 }
+:root[data-theme="light"] .ap-group{ background:hsl(var(--surface)); }
+:root[data-theme="light"] .ap-group-head{ background:hsl(var(--surface-3)); }
 :root[data-theme="light"] .mesh-col:not(:hover){ background:hsl(var(--surface)); }
+
+/* 深色：卡片悬停 / 选中的 flow 高亮补强。基线 flow/0.42-0.45 描边在白底上反差足，深底上几乎看不出；
+ * 提高描边不透明度、选中环加粗一档，悬停的接入卡补一层 flow 淡染（基线 --surface-2/0.85 与常态
+ * --surface-2/0.5 在深色里只差 1 个百分点亮度）。`.cur` 悬停仍保持选中描边（:not(.cur)）。浅色不动。 */
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]) .nd-card:hover:not(.cur){ border-color:hsl(var(--flow)/0.75); }
+  :root:not([data-theme="light"]) .nd-card.cur{ box-shadow:0 0 0 2px hsl(var(--ring)/0.6); }
+  :root:not([data-theme="light"]) .mesh-col:hover{ border-color:hsl(var(--flow)/0.75); background:hsl(var(--flow)/0.08); }
+}
+:root[data-theme="dark"] .nd-card:hover:not(.cur){ border-color:hsl(var(--flow)/0.75); }
+:root[data-theme="dark"] .nd-card.cur{ box-shadow:0 0 0 2px hsl(var(--ring)/0.6); }
+:root[data-theme="dark"] .mesh-col:hover{ border-color:hsl(var(--flow)/0.75); background:hsl(var(--flow)/0.08); }
 
 /* ══════════ 状态栏高度单一真值 + toast 底距推导 ══════════
  * 真机反馈「toast 为什么不是自适应位置，举例底部信息栏为什么差那么多」的根因修复。
@@ -925,7 +938,7 @@ body:has(.pending-bar.show) #toast-stack{
  * 这两行后面也会把颜色重新复位成 currentcolor。
  * style-invariants.test.ts 钉住「这两条覆盖落在 @import 之后」+「恰好一条」+「取值不含
  * currentcolor」+「规则体内不含 border/border-bottom 简写」。 */
-#s-nodes.nodes-list-view .nd-card{ border-color:hsl(var(--line)); border-bottom-color:hsl(var(--hair)); }
+#s-nodes.nodes-list-view .nd-card{ border-color:hsl(var(--line)); border-bottom-color:hsl(var(--hair)); box-shadow:none; }
 #s-nodes.nodes-list-view .nd-card:last-child{ border-bottom-color:hsl(var(--hair)); }
 
 /* 能力检测徽章合并成一行（陈先生 2026-07-30：腾一行给连接拓扑）。
