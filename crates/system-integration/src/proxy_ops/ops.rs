@@ -827,8 +827,8 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
 
     fn requires_original_snapshot(&self) -> bool {
         #[cfg(target_os = "macos")]
-        if self.uses_native_macos() && self.macos_writer.is_some() {
-            return true;
+        if self.uses_native_macos() {
+            return self.macos_writer.is_some();
         }
         false
     }
