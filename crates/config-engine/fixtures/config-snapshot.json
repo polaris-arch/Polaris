@@ -22120,6 +22120,11 @@
                 "server": "1.12.12.12",
                 "server_port": 443,
                 "path": "/dns-query"
+              },
+              {
+                "server": "192.168.1.1",
+                "tag": "dns-node-native-2-0",
+                "type": "udp"
               }
             ],
             "rules": [
@@ -22155,7 +22160,25 @@
                   "a.example.com",
                   ".a.example.com"
                 ],
-                "server": "dns-domestic"
+                "server": "dns-domestic",
+                "timeout": "1500ms",
+                "action": "evaluate",
+                "tag": "dns-lan-eval-0"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-0",
+                "response_rcode": "NOERROR"
+              },
+              {
+                "domain": [
+                  "a.example.com"
+                ],
+                "domain_suffix": [
+                  "a.example.com",
+                  ".a.example.com"
+                ],
+                "server": "dns-lan"
               },
               {
                 "domain": [
@@ -22227,7 +22250,36 @@
                   "ntp",
                   "stun"
                 ],
-                "server": "dns-domestic"
+                "server": "dns-domestic",
+                "timeout": "1500ms",
+                "action": "evaluate",
+                "tag": "dns-lan-eval-6"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-6",
+                "response_rcode": "NOERROR"
+              },
+              {
+                "domain_suffix": [
+                  "ntp.org",
+                  ".ntp.org",
+                  "time.windows.com",
+                  ".time.windows.com",
+                  "time.apple.com",
+                  ".time.apple.com",
+                  "time.cloudflare.com",
+                  ".time.cloudflare.com",
+                  "time.nist.gov",
+                  ".time.nist.gov",
+                  "time.android.com",
+                  ".time.android.com"
+                ],
+                "domain_keyword": [
+                  "ntp",
+                  "stun"
+                ],
+                "server": "dns-lan"
               },
               {
                 "query_type": [
@@ -22243,7 +22295,23 @@
                   "AAAA"
                 ],
                 "rule_set": "geosite-cn",
-                "server": "dns-domestic"
+                "server": "dns-domestic",
+                "timeout": "1500ms",
+                "action": "evaluate",
+                "tag": "dns-lan-eval-10"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-10",
+                "response_rcode": "NOERROR"
+              },
+              {
+                "query_type": [
+                  "A",
+                  "AAAA"
+                ],
+                "rule_set": "geosite-cn",
+                "server": "dns-lan"
               },
               {
                 "query_type": [
@@ -22251,6 +22319,56 @@
                   "AAAA"
                 ],
                 "server": "dns-remote"
+              },
+              {
+                "server": "dns-domestic",
+                "timeout": "1500ms",
+                "action": "evaluate",
+                "tag": "dns-lan-eval-14"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-14",
+                "response_rcode": "NOERROR"
+              },
+              {
+                "server": "dns-lan"
+              },
+              {
+                "resolver_policy": "direct-lan-fallback",
+                "timeout": "1500ms",
+                "disable_cache": true,
+                "disable_optimistic_cache": true,
+                "action": "evaluate",
+                "server": "dns-domestic",
+                "tag": "dns-lan-eval-17"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-17",
+                "response_rcode": "NOERROR",
+                "resolver_policy": "direct-lan-fallback"
+              },
+              {
+                "resolver_policy": "direct-lan-fallback",
+                "timeout": "1500ms",
+                "disable_cache": true,
+                "disable_optimistic_cache": true,
+                "action": "evaluate",
+                "server": "dns-lan",
+                "tag": "dns-lan-eval-19"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-19",
+                "response_rcode": "NOERROR",
+                "resolver_policy": "direct-lan-fallback"
+              },
+              {
+                "action": "respond",
+                "mode": "fallback",
+                "fallback_rcode": "SERVFAIL",
+                "resolver_policy": "direct-lan-fallback"
               },
               {
                 "domain_suffix": [
@@ -22375,6 +22493,52 @@
               },
               {
                 "resolver_policy": "node-bootstrap",
+                "action": "evaluate",
+                "server": "dns-node-native-2-0",
+                "tag": "node-native-2-0-response",
+                "timeout": "1500ms",
+                "disable_cache": true,
+                "disable_optimistic_cache": true
+              },
+              {
+                "resolver_policy": "node-bootstrap",
+                "action": "respond",
+                "match_response": "node-native-2-0-response",
+                "response_class": "hit",
+                "race": true,
+                "response_reject_ip_cidr": [
+                  "31.13.0.0/16",
+                  "66.220.0.0/16",
+                  "69.63.0.0/16",
+                  "69.171.0.0/16",
+                  "157.240.0.0/16",
+                  "173.252.0.0/16",
+                  "179.60.192.0/22",
+                  "185.60.216.0/22",
+                  "104.244.40.0/21",
+                  "199.59.148.0/22",
+                  "202.160.128.0/22",
+                  "162.125.0.0/16",
+                  "185.45.7.0/24",
+                  "45.114.11.0/24",
+                  "8.7.198.45/32",
+                  "46.82.174.68/32",
+                  "59.24.3.173/32",
+                  "93.46.8.89/32",
+                  "203.98.7.65/32",
+                  "2a03:2880::/29"
+                ]
+              },
+              {
+                "resolver_policy": "node-bootstrap",
+                "action": "respond",
+                "match_response": "node-native-2-0-response",
+                "response_class": "empty",
+                "race": true,
+                "mode": "defer"
+              },
+              {
+                "resolver_policy": "node-bootstrap",
                 "action": "respond",
                 "mode": "fallback",
                 "fallback_rcode": "SERVFAIL"
@@ -22419,7 +22583,12 @@
             {
               "type": "direct",
               "tag": "direct",
-              "domain_resolver": "dns-domestic"
+              "domain_resolver": {
+                "mode": "rules",
+                "policy": "direct-lan-fallback",
+                "strategy": "ipv4_only",
+                "timeout": "2s"
+              }
             }
           ],
           "route": {

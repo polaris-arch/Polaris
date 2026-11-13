@@ -345,39 +345,59 @@ fn append_dns_policy_action(
             let members: Vec<_> = group
                 .members
                 .iter()
-                .map(|id| (id, dns_server_tag(id)))
-                .filter(|(_, tag)| emitted_server_tags.contains(tag))
+                .map(|id| dns_server_tag(id))
+                .filter(|tag| emitted_server_tags.contains(tag))
                 .collect();
-            for (index, (_, server_tag)) in members.iter().enumerate() {
-                // This sequence is append-only across rules, OR/environment variants and
-                // fallbacks. Allocate by emitted position, never by reusable group ID.
-                let response_tag = format!("dns-eval-{}", out.len());
-                let mut evaluate = dns_rule_from_matcher(matcher.clone());
-                evaluate.action = Some("evaluate".into());
-                evaluate.server = Some(server_tag.clone());
-                evaluate.tag = Some(response_tag.clone());
-                if group.mode == DnsServerGroupMode::Race && index > 0 {
-                    evaluate.speculative = Some(true);
-                }
-                out.push(evaluate);
-
-                let mut respond = DnsRule {
-                    action: Some("respond".into()),
-                    match_response: Some(serde_json::Value::String(response_tag)),
-                    response_rcode: Some("NOERROR".into()),
-                    ..Default::default()
-                };
-                if group.mode == DnsServerGroupMode::Race {
-                    respond.race = Some(true);
-                }
-                out.push(respond);
-            }
+            push_evaluate_chain(
+                out,
+                &dns_rule_from_matcher(matcher.clone()),
+                &members,
+                group.mode == DnsServerGroupMode::Race,
+                "dns-eval-",
+            );
             if let Some(fallback) = group.fallback_server_id.as_deref() {
                 push_server(out, matcher, fallback);
             }
         }
     }
 }
+
+/// DNS Server Group 的 evaluate→respond 链（Fallback / Race）；LAN 回退复用同一形态。
+///
+/// `base` 携带匹配条件与查询选项。respond 不复制匹配条件（靠 match_response 与本份 evaluate
+/// 联动），只继承 resolver_policy 以留在同一作用域。tag 按 `out` 的发射位置分配：同一序列只追加
+/// （跨规则、OR/环境变体与 fallback），`prefix` 区分互不相干的序列，绝不按可复用的组 ID 分配。
+fn push_evaluate_chain(
+    out: &mut Vec<DnsRule>,
+    base: &DnsRule,
+    servers: &[String],
+    race: bool,
+    prefix: &str,
+) {
+    for (index, server) in servers.iter().enumerate() {
+        let response_tag = format!("{prefix}{}", out.len());
+        let mut evaluate = base.clone();
+        evaluate.action = Some("evaluate".into());
+        evaluate.server = Some(server.clone());
+        evaluate.tag = Some(response_tag.clone());
+        if race && index > 0 {
+            evaluate.speculative = Some(true);
+        }
+        out.push(evaluate);
+
+        out.push(DnsRule {
+            resolver_policy: base.resolver_policy.clone(),
+            action: Some("respond".into()),
+            match_response: Some(serde_json::Value::String(response_tag)),
+            response_rcode: Some("NOERROR".into()),
+            race: race.then_some(true),
+            ..Default::default()
+        });
+    }
+}
+
+/// direct 出站的 resolver policy：dns-domestic 失败时回退 dns-lan（仅 dns-lan 存在时生成）。
+pub const DIRECT_LAN_FALLBACK_POLICY: &str = "direct-lan-fallback";
 
 // ───────────────────────── 依赖注入 ─────────────────────────
 
@@ -2166,6 +2186,60 @@ pub fn build_dns_config(
                 ..Default::default()
             },
         );
+    }
+
+    // 本地网络阻断国内 DoH/DoT 时回退接管前的系统 DNS：每条路由到 dns-domestic 的规则（含 final）
+    // 改写为 Fallback 组同形链 evaluate dns-domestic → respond NOERROR → route dns-lan；原位改写，
+    // 相对优先级不变。dns-domestic 自身的 domain_resolver 不能用 rules 模式，回退只能做在查询这层。
+    // dns-remote 不回退：境外查询不能明文交给本地解析器。tag 用独立前缀，避开组按旧位置分配的 tag。
+    if lan_resolver.is_some() {
+        if dns_config.final_server.as_deref() == Some("dns-domestic") {
+            dns_rules.push(DnsRule {
+                server: Some("dns-domestic".into()),
+                ..Default::default()
+            });
+        }
+        let mut chained = Vec::with_capacity(dns_rules.len() + 8);
+        for mut rule in dns_rules {
+            if rule.server.as_deref() == Some("dns-domestic")
+                && matches!(rule.action.as_deref(), None | Some("route"))
+            {
+                let mut evaluate = rule.clone();
+                evaluate.timeout = Some(crate::node_dns::CANDIDATE_TIMEOUT.into());
+                push_evaluate_chain(
+                    &mut chained,
+                    &evaluate,
+                    &["dns-domestic".into()],
+                    false,
+                    "dns-lan-eval-",
+                );
+                rule.server = Some("dns-lan".into());
+            }
+            chained.push(rule);
+        }
+        // direct 出站拨号解析（generate 绑定本 policy）：同一回退顺序，按 node_dns 范式关候选缓存。
+        let policy = DnsRule {
+            resolver_policy: Some(DIRECT_LAN_FALLBACK_POLICY.into()),
+            timeout: Some(crate::node_dns::CANDIDATE_TIMEOUT.into()),
+            disable_cache: Some(true),
+            disable_optimistic_cache: Some(true),
+            ..Default::default()
+        };
+        push_evaluate_chain(
+            &mut chained,
+            &policy,
+            &["dns-domestic".into(), "dns-lan".into()],
+            false,
+            "dns-lan-eval-",
+        );
+        chained.push(DnsRule {
+            resolver_policy: policy.resolver_policy,
+            action: Some("respond".into()),
+            mode: Some("fallback".into()),
+            fallback_rcode: Some("SERVFAIL".into()),
+            ..Default::default()
+        });
+        dns_rules = chained;
     }
 
     // 探针也不能把本地名称送到公共 DNS；用户规则之间的相对优先级保持原样。

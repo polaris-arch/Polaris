@@ -596,6 +596,30 @@ fn generate_base_config(
         }),
         services: None,
     };
+    // dns-lan 存在时 direct 拨号解析改走 DNS builder 生成的回退 policy（dns-domestic → dns-lan）。
+    // strategy 与顶层 dns.strategy 同值，保留 #57 对目标站点 AAAA 的抑制。
+    if singbox
+        .dns
+        .as_ref()
+        .is_some_and(|dns| dns.servers.iter().any(|server| server.tag == "dns-lan"))
+    {
+        if let Some(direct) = singbox
+            .outbounds
+            .iter_mut()
+            .find(|outbound| outbound.tag == crate::user_config::dns_constants::DIRECT_TAG)
+        {
+            direct.domain_resolver = Some(crate::singbox::DomainResolver::Rules {
+                mode: "rules".into(),
+                policy: crate::builder::dns::DIRECT_LAN_FALLBACK_POLICY.into(),
+                strategy: if cfg.enable_ipv6.unwrap_or(false) {
+                    crate::singbox::DomainStrategy::PreferIpv4
+                } else {
+                    crate::singbox::DomainStrategy::Ipv4Only
+                },
+                timeout: crate::node_dns::LOOKUP_TIMEOUT.into(),
+            });
+        }
+    }
 
     // ── 10. endpoints 注入顶层（L3575-3577）─────────────────────────────────────
     if !pending_endpoints.is_empty() {

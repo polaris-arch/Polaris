@@ -6,7 +6,7 @@ pub mod upstream;
 use crate::singbox::{DnsConfig, DnsRule, DnsServer, DomainResolver, DomainStrategy, OneOrMany};
 use crate::user_config::{LogLevel, UserConfig};
 use polaris_helper_proto::Platform;
-use upstream::{plan_upstreams, UpstreamKind};
+use upstream::{plan_upstreams, ResolveUpstream, UpstreamKind};
 
 pub const POLICY: &str = "node-bootstrap";
 pub const CANDIDATE_TIMEOUT: &str = "1500ms";
@@ -63,7 +63,7 @@ pub fn append_policy(
     dns: &mut DnsConfig,
     log: fn(LogLevel, &str),
 ) {
-    let Some(plan) = plan_upstreams(
+    let Some(mut plan) = plan_upstreams(
         config.dns_config.as_ref(),
         config
             .proxy_mode_type
@@ -71,6 +71,18 @@ pub fn append_policy(
     ) else {
         return;
     };
+    // dns-lan（接管前的私网系统解析器，明文 UDP、物理网卡直连）作最末一级兜底：与自定义 UDP
+    // 上游同形，不是 OS system 解析，故不触 INV-1 的 TUN 递归。
+    if let Some(lan) = dns.servers.iter().find(|server| server.tag == "dns-lan") {
+        plan.tier2.push(ResolveUpstream {
+            id: lan.tag.clone(),
+            kind: UpstreamKind::Udp,
+            ip: lan.server.clone(),
+            port: lan.server_port,
+            path: None,
+            tier: 2,
+        });
+    }
     let decoys = decoy_policy_cidrs(decoy_override, log);
     // The caller puts these two canonical LAN rules at the front. Legacy
     // Tailscale preferred_by uses the DNS transport's current preferred-domain

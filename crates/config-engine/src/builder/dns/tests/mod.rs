@@ -465,6 +465,73 @@ fn lan_resolver_adds_dns_lan_udp() {
 }
 
 #[test]
+fn domestic_queries_fall_back_to_dns_lan_only_when_it_exists() {
+    let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps_false());
+    let rules = c.rules.as_ref().unwrap();
+    assert!(rules
+        .iter()
+        .any(|r| r.server.as_deref() == Some("dns-domestic")));
+    assert!(!rules.iter().any(|r| r.server.as_deref() == Some("dns-lan")
+        || r.resolver_policy.as_deref() == Some(DIRECT_LAN_FALLBACK_POLICY)));
+
+    let mut deps = deps_false();
+    deps.lan_resolver_for_dns = Some("192.168.1.1".into());
+    let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps);
+    let rules = c.rules.as_ref().unwrap();
+    let (plain, scoped): (Vec<_>, Vec<_>) = rules.iter().partition(|r| r.resolver_policy.is_none());
+    // 每条发往 dns-domestic 的查询（含 final 兜底）：evaluate → respond NOERROR → 同条件 route dns-lan。
+    let evaluates: Vec<_> = plain
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.server.as_deref() == Some("dns-domestic"))
+        .collect();
+    assert!(!evaluates.is_empty());
+    for (i, evaluate) in &evaluates {
+        assert_eq!(evaluate.action.as_deref(), Some("evaluate"));
+        let respond = plain[i + 1];
+        assert_eq!(respond.action.as_deref(), Some("respond"));
+        assert_eq!(
+            respond.match_response.as_ref().and_then(|v| v.as_str()),
+            evaluate.tag.as_deref()
+        );
+        assert_eq!(respond.response_rcode.as_deref(), Some("NOERROR"));
+        let lan = plain[i + 2];
+        assert_eq!(lan.server.as_deref(), Some("dns-lan"));
+        assert_eq!(lan.domain, evaluate.domain);
+        assert_eq!(lan.rule_set, evaluate.rule_set);
+    }
+    let last = plain.last().unwrap();
+    assert!(
+        last.server.as_deref() == Some("dns-lan")
+            && last.domain.is_none()
+            && last.rule_set.is_none()
+    );
+    // dns-remote 不回退。
+    assert!(plain
+        .iter()
+        .filter(|r| r.server.as_deref() == Some("dns-remote"))
+        .all(|r| r.action.is_none()));
+    // direct 出站的 policy：domestic → lan，末尾唯一 fallback。
+    let direct: Vec<_> = scoped
+        .iter()
+        .filter(|r| r.resolver_policy.as_deref() == Some(DIRECT_LAN_FALLBACK_POLICY))
+        .collect();
+    let servers: Vec<_> = direct.iter().filter_map(|r| r.server.as_deref()).collect();
+    assert_eq!(servers, ["dns-domestic", "dns-lan"]);
+    assert_eq!(direct.last().unwrap().mode.as_deref(), Some("fallback"));
+    // 节点解析策略：dns-lan 为最末一级候选。
+    let last_node = c
+        .servers
+        .iter()
+        .rfind(|s| s.tag.starts_with("dns-node-native-"))
+        .unwrap();
+    assert_eq!(
+        (last_node.type_field.as_deref(), last_node.server.as_deref()),
+        (Some("udp"), Some("192.168.1.1"))
+    );
+}
+
+#[test]
 fn node_domain_rule1_emits_when_server_has_domain() {
     // 节点 address=域名 → rule1 含 domain + domain_suffix（exact + .suffix）。
     let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps_false());

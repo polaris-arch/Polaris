@@ -159,6 +159,18 @@
 //! - **验收**：变换前仅此 1/37 case 红（route.rules 期望 18、实际 19）；变换后 37/37 diff=0。
 //!   完整生成行为回归见 `builder::generate::tests::legacy_userspace_mesh_local_mapping_is_inbound_scoped_and_independent_of_lan_bypass`。
 //!
+//! **第十一次例外（2026-11-13，国内 DNS 失败回退 dns-lan）**：本地网络阻断 DoH/DoT 时，路由到
+//! `dns-domestic` 的查询回退接管前的系统 DNS。只在生成 `dns-lan` 时生效，射程恰为
+//! `DNS lanResolverForDns 注入` 这 1 个 case，其余 36 个场景零变化。
+//! - **变换**（脚本按规则独立改写，未从 Rust 输出重录）：① 非 policy 规则中 `server=="dns-domestic"`
+//!   且 action 为空/route 的 3 条，加上 final 对应的一条无条件规则，各改写为
+//!   evaluate(dns-domestic, timeout 1500ms, tag `dns-lan-eval-<位置>`，位置不计最前两条 LAN 保护)、respond NOERROR、原条件 route
+//!   `dns-lan`；随后追加 `direct-lan-fallback` policy（domestic→lan 两级 evaluate/respond + fallback）。
+//!   ② `node-bootstrap` policy 在 fallback 前追加 tier2 候选 `dns-node-native-2-0`（udp 192.168.1.1，
+//!   规则形状同 tier1 第 0 位），servers 追加该条。③ `direct` 出站 `domain_resolver` 改为
+//!   `{mode:rules, policy:direct-lan-fallback, strategy:ipv4_only, timeout:2s}`。
+//! - **验收**：变换前仅此 1/37 红（dns.rules 期望 19、实际 36）；变换后 37/37 diff=0。
+//!
 //! # 重生方式（不要在本仓手搓）
 //!
 //! 导出器在 **上游仓**：`scripts/export-config-snapshot-fixtures.test.ts`。重生要求 上游 主工作树
