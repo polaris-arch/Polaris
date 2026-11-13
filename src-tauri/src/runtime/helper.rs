@@ -1211,7 +1211,7 @@ impl HelperRuntime {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            true
+            self.platform == Platform::Linux
         }
     }
 
