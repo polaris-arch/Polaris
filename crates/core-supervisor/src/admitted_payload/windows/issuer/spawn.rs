@@ -23,11 +23,14 @@ pub(super) fn hold_system_imports(
     let system = system32()?;
     // Private selected Cronet is the sole non-OS dependency. Every other
     // accepted import must exist in the native System32 trust boundary, never
-    // ambient CWD/PATH. Unknown/API-set/SxS/delay forms stay unsupported.
+    // ambient CWD/PATH. The single API set Cronet imports is held as its
+    // System32 host; other API-set, SxS and delay forms stay unsupported.
     const OS: &[&str] = &[
         "kernel32.dll",
         "ntdll.dll",
         "advapi32.dll",
+        "dbghelp.dll",
+        "combase.dll",
         "user32.dll",
         "shell32.dll",
         "ws2_32.dll",
@@ -50,7 +53,11 @@ pub(super) fn hold_system_imports(
         if name == "libcronet.dll" {
             continue;
         }
-        if !OS.contains(&name.as_str()) {
+        let name = match name.as_str() {
+            "api-ms-win-core-winrt-l1-1-0.dll" => "combase.dll",
+            name => name,
+        };
+        if !OS.contains(&name) {
             return Err(error("Windows import is outside the supported closure"));
         }
         let f = guard(&system.join(name), false)?;
