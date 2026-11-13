@@ -383,7 +383,7 @@ class Integrity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); _, app = self.fixture(root)
             binary = root / 'target/release/polaris.exe'; binary.parent.mkdir(parents=True); binary.write_bytes(app)
-            alias = binary.parent / 'deps/polaris.exe'; alias.parent.mkdir(); os.link(binary, alias)
+            alias = binary.parent / 'build/polaris/0/out/polaris.exe'; alias.parent.mkdir(parents=True); os.link(binary, alias)
             before = w.cargo_app_identity(root)[1]
             stage = root / 'private'; stage.mkdir()
             staged, captured = w.compiled_app(root, staging=stage)
@@ -400,7 +400,7 @@ class Integrity(unittest.TestCase):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp); _, app = self.fixture(root)
                 binary = root / 'target/release/polaris.exe'; binary.parent.mkdir(parents=True); binary.write_bytes(app)
-                deps = binary.parent / 'deps'; deps.mkdir()
+                deps = binary.parent / 'build/polaris/0/out'; deps.mkdir(parents=True)
                 if fault == 'unknown-alias': os.link(binary, root / 'unknown.exe')
                 elif fault == 'different-deps':
                     os.link(binary, root / 'unknown.exe'); (deps / 'polaris.exe').write_bytes(app)
@@ -560,7 +560,7 @@ class Integrity(unittest.TestCase):
                     + ''.join('  File /a "/oname=' + name + '" "' + source + '"\n' for name, source in state['sources'].items())
                     + 'SectionEnd\n')
             script.write_text(text); w.verify_generated_script(root, state)
-            deps = release / 'deps'; deps.mkdir(); os.link(release / 'polaris.exe', deps / 'polaris.exe')
+            deps = release / 'build/polaris/0/out'; deps.mkdir(parents=True); os.link(release / 'polaris.exe', deps / 'polaris.exe')
             w.verify_generated_script(root, state)
             for mutation in [text.replace('VERSION "1.0.0"', 'VERSION "0.9.0"'),
                              text.replace('  File "${MAINBINARYSRCPATH}"', '  File "${MAINBINARYSRCPATH}"\n  File "${MAINBINARYSRCPATH}"'),
@@ -1208,7 +1208,7 @@ class WindowsLongPaths(unittest.TestCase):
             self.assertEqual(w.zip_inventory(archive, w.carrier_inventory(state, app, 'zip')),
                              w.carrier_inventory(state, app, 'zip'))
             binary = native / 'target/release/polaris.exe'; binary.parent.mkdir(parents=True); binary.write_bytes(app)
-            alias = binary.parent / 'deps/polaris.exe'; alias.parent.mkdir(); os.link(binary, alias)
+            alias = binary.parent / 'build/polaris/0/out/polaris.exe'; alias.parent.mkdir(parents=True); os.link(binary, alias)
             before = w.cargo_app_identity(root)[1]
             stage = native / 'private'; stage.mkdir()
             staged, captured = w.compiled_app(root, staging=root / 'private')
@@ -1429,7 +1429,7 @@ class CargoContexts(unittest.TestCase):
                     self.assertEqual(state['cargo']['targetDirectory'], str(directory))
                     self.assertEqual(state['cargo']['releaseDirectory'], str(release))
                     binary = release / 'polaris.exe'; binary.write_bytes(app)
-                    (release / 'deps').mkdir(); os.link(binary, release / 'deps/polaris.exe')
+                    (release / 'build/polaris/0/out').mkdir(parents=True); os.link(binary, release / 'build/polaris/0/out/polaris.exe')
                     self.assertEqual(w.cargo_app_identity(root, state)[0], binary)
                     self.assertEqual(w.compiled_app(root, state=state)[1], app)
                     installer = release / 'bundle/nsis/Polaris_1.0.0_x64-setup.exe'

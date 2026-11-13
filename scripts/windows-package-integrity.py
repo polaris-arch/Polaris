@@ -907,7 +907,7 @@ def verify_generated_script(root, state, *, sources=None):
 
 
 def cargo_app_identity(root, state=None):
-    """Admit only the fixed Cargo output and its sole known deps hardlink."""
+    """Admit only the fixed Cargo output and its sole known build-dir hardlink."""
     app_path = (Path(state['cargo']['releaseDirectory']) if state is not None else root / 'target/release') / 'polaris.exe'
     for path in [app_path, *app_path.parents]:
         value = io_path(path).lstat()
@@ -915,14 +915,19 @@ def cargo_app_identity(root, state=None):
                 'link/reparse Cargo input: ' + str(path))
     value = io_path(app_path).stat()
     require(stat.S_ISREG(value.st_mode) and 0 < value.st_size <= MAX_FILE and value.st_nlink in (1, 2),
-            'bounded Cargo App with at most its known deps link required')
+            'bounded Cargo App with at most its known build-dir link required')
     if value.st_nlink == 2:
-        alias = app_path.parent / 'deps/polaris.exe'
-        for path in [alias, alias.parent]:
-            other = io_path(path).lstat()
-            require(not stat.S_ISLNK(other.st_mode) and not (getattr(other, 'st_file_attributes', 0) & 0x400),
-                    'link/reparse Cargo deps alias')
-        require(io_path(alias).samefile(io_path(app_path)) and io_path(alias).stat().st_nlink == 2, 'unexpected Cargo App hardlink')
+        # Cargo 1.100 keeps the unit output at build/<package>/<hash>/out; stale
+        # hashes from earlier builds may remain beside the live one.
+        aliases = []
+        for alias in io_path(app_path.parent / 'build/polaris').glob('*/out/polaris.exe'):
+            for path in [alias, *alias.parents[:4]]:
+                other = io_path(path).lstat()
+                require(not stat.S_ISLNK(other.st_mode) and not (getattr(other, 'st_file_attributes', 0) & 0x400),
+                        'link/reparse Cargo build-dir alias')
+            if io_path(alias).samefile(io_path(app_path)):
+                aliases.append(alias)
+        require(len(aliases) == 1 and io_path(aliases[0]).stat().st_nlink == 2, 'unexpected Cargo App hardlink')
     return app_path, app_identity(value)
 
 

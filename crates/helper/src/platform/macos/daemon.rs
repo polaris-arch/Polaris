@@ -55,7 +55,6 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> MacConfig {
 ///
 /// 非 mac 编译（本模块的 `test` 分支在 Linux CI 上）只走占位分支保证类型检查通过；
 /// 生产 mac 二进制走 [`run`]。
-#[must_use]
 pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCode {
     let argv: Vec<_> = argv.collect();
     if let Err(error) =

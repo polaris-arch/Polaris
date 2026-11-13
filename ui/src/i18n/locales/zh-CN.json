@@ -1778,6 +1778,7 @@
     "createTaskPhaseParsing": "正在解析订阅…",
     "createTaskPhaseCommitting": "正在保存订阅…",
     "createTaskFailed": "添加订阅失败",
+    "createProxyRequired": "全局策略要求订阅经代理拉取，但当前代理不可用。请先连接代理后重试。",
     "addedPartial": "订阅已添加；部分提供者未能导入，请稍后刷新订阅。",
     "autoUpdate": "自动更新",
     "preview": {

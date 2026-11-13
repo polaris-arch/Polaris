@@ -12,6 +12,8 @@ export type SubscriptionErrorTranslate = (
 export interface SubscriptionErrorTextInput {
   errorKind?: SubscriptionErrorKind;
   httpStatus?: number;
+  /** 订阅创建终态的稳定码；无 errorKind 时按它选文案。 */
+  code?: string;
   /** 更新结果/进度事件沿用 `error`；预检结果沿用 `message`。两者都必须已在后端脱敏。 */
   error?: string;
   message?: string;
@@ -31,6 +33,11 @@ export function subscriptionErrorDetail(
     return t(SUBSCRIPTION_ERROR_I18N_KEY[kind].detail, {
       status: data.httpStatus ?? '',
     });
+  }
+  if (data.code === 'SUBSCRIPTION_CREATE_PROXY_REQUIRED') return t('sub.createProxyRequired');
+  if (data.code === 'SUBSCRIPTION_CREATE_EMPTY') return t('sub.preview.emptyDetail');
+  if (data.code === 'SUBSCRIPTION_CREATE_CONFIG_CHANGED' || data.code === 'SUBSCRIPTION_CREATE_PROXY_CHANGED') {
+    return t('home.pendingHotConflict');
   }
   return t(fallbackKey);
 }

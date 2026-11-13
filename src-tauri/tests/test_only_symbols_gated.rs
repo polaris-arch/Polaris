@@ -302,10 +302,7 @@ fn eval_cfg(expr: &str) -> bool {
         }
     }
     let flat: String = e.chars().filter(|ch| !ch.is_whitespace()).collect();
-    if flat == "test" || flat == "feature=\"test-utils\"" {
-        return false;
-    }
-    true
+    flat != "test" && flat != "feature=\"test-utils\""
 }
 
 fn split_top_level(s: &str) -> Vec<String> {

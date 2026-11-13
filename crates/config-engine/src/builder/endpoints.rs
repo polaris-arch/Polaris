@@ -432,7 +432,8 @@ pub fn build_tailscale_endpoint(
     if !adv_tags.is_empty() {
         ep.advertise_tags = Some(adv_tags);
     }
-    ep.ssh_server = if ts.ssh_server == Some(true) {
+    // Windows 内核的受管目录拒收开了 SSH 的 Tailscale endpoint（整份配置失败），故不发射。
+    ep.ssh_server = if ts.ssh_server == Some(true) && platform != "win32" {
         Some(true)
     } else {
         None

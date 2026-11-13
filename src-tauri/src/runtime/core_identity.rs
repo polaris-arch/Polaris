@@ -508,6 +508,13 @@ impl BundleObservation {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Self { files })
     }
+    #[cfg_attr(
+        not(windows),
+        allow(
+            clippy::needless_bool,
+            reason = "the Windows file identity check follows the stamp check"
+        )
+    )]
     pub(crate) fn is_current(&self) -> bool {
         self.files.iter().all(|observed| {
             if !observed

@@ -1,5 +1,5 @@
 import { needsHelperRecovery, revealHelperRecovery } from '@/domain/helper-recovery';
-import { proxyErrorText } from '@/domain/proxy-error-text';
+import { proxyErrorReason, proxyErrorText } from '@/domain/proxy-error-text';
 import { useQualifiedLatencies } from '@/mobile/use-qualified-latencies';
 import { serverSwitchErrorCode, serverSwitchErrorText } from '@/domain/action-error-text';
 import { configuredExitId } from '@/domain/actual-exit';
@@ -637,7 +637,8 @@ export function HomeScreen() {
         return;
       }
       reportConnectionFailure(
-        action === 'stop' ? t('home.stopProxyFailed') : t('errors.startupFailed'),
+        action === 'stop' ? t('home.stopProxyFailed')
+          : proxyErrorReason({ errorCode: code as string | undefined }, key => t(key)) ?? t('errors.startupFailed'),
       );
     } finally {
       setBusy(false);

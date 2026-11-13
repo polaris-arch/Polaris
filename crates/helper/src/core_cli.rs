@@ -459,7 +459,17 @@ pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
             }
             Err(error) => {
                 eprintln!("helper administration: {error}");
-                std::process::ExitCode::FAILURE
+                // 75 = helper replied ERR, so Prepare definitely did not admit; any
+                // other failure (transport, timeout, odd reply) has unknown outcome.
+                if args[0] == "prepare-upgrade"
+                    && error
+                        .get_ref()
+                        .is_some_and(|e| e.is::<polaris_helper_proto::Error>())
+                {
+                    std::process::ExitCode::from(75)
+                } else {
+                    std::process::ExitCode::FAILURE
+                }
             }
         });
     }

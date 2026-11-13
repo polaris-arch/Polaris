@@ -36,9 +36,9 @@
  *
  * rc：0 = 全部已登记；1 = 有 Android 专属文件没登记；2 = **自曝**（取材面塌了，红的不是仓库而是这道门）。
  *
- * # 🔴 为什么必须按 unit 定向取 `.d`，不许 glob `deps/*.d`
+ * # 🔴 为什么必须按 unit 定向取 `.d`，不许 glob `build/<pkg>/<hash>/out/*.d`
  *
- * `.d` 会腐烂：`target/` 被 `Swatinem/rust-cache` 跨 run 缓存，同一个 crate 在 deps/ 下会同时躺着
+ * `.d` 会腐烂：`target/` 被 `Swatinem/rust-cache` 跨 run 缓存，同一个 crate 在 build-dir 下会同时躺着
  * check / build / clippy / test 四种 mode、以及历史 config 留下的孤儿 `.d`。本机实测撞到过一份
  * `polaris_lib-*.d` 里挂着**磁盘上早已不存在**的 `src-tauri/src/android_tls/ax3_child.rs`，
  * 直到下一次 check 才被改写。glob 的后果是 **fail-open**：host 侧多收一条陈旧记录，差集就少一条。
@@ -191,11 +191,11 @@ function unitsOf(logPath, members) {
     }
     artifacts += 1;
     packages.add(name);
-    // 只认 `deps/` 下那份产物：uplift 出来的副本不带 hash、也没有配套 `.d`。
+    // 只认 build-dir（`build/<pkg>/<hash>/out/`）下那份产物：uplift 出来的副本不带 hash、也没有配套 `.d`。
     let hit = false;
     for (const file of msg.filenames ?? []) {
       const dir = dirname(file);
-      if (basename(dir) !== 'deps') continue;
+      if (basename(dir) !== 'out') continue;
       const stem = basename(file).replace(/\.[^.]+$/, '');
       for (const candidate of [stem, stem.replace(/^lib/, '')]) {
         const dPath = join(dir, `${candidate}.d`);

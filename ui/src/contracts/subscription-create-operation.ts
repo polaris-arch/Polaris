@@ -15,7 +15,9 @@ export interface SubscriptionCreateError {
   /** IPC 字段与 subscription preview/update 统一为 errorKind。 */
   errorKind?: SubscriptionErrorKind;
   httpStatus?: number;
-  /** Diagnostics are log-only; UI maps `errorKind` to localized copy. */
+  /** Stable backend outcome code, e.g. `SUBSCRIPTION_CREATE_PROXY_REQUIRED`. */
+  code?: string;
+  /** Diagnostics are log-only; UI maps `errorKind` / `code` to localized copy. */
   message?: string;
 }
 

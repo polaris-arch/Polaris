@@ -68,7 +68,6 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> ServerConfig {
 ///
 /// Linux helper 全程 async（tokio）：`peer_cred()` 取 SO_PEERCRED、accept 循环、信号收割都在 runtime 内。
 /// 本函数建多线程 runtime 并 `block_on` `async_main`（对齐 Go 的 goroutine 并发模型）。
-#[must_use]
 pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> ExitCode {
     let argv: Vec<_> = argv.collect();
     if let Err(error) =

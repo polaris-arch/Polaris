@@ -235,16 +235,18 @@ export interface TsLoginExecution {
   cancel: () => Promise<void>;
 }
 
-const RETIREMENT_REASONS = ['mainCoreChanged', 'mainCoreInUse', 'staleLoginCoreAlive', 'cancelled', 'nativeRetirementUnknown',
+const LOGIN_FAILED_REASONS = ['mainCoreChanged', 'mainCoreInUse', 'staleLoginCoreAlive', 'cancelled', 'nativeRetirementUnknown',
   'profileBindingUnknown', 'stateRevisionChanged', 'candidateConfigurationChanged',
   'retainedAuthKeyUnavailable', 'retainedAuthKeyAuthorityChanged', 'credentialRevisionChanged',
-  'invalidCredentialIntent', 'credentialCommitUnknown'];
+  'invalidCredentialIntent', 'credentialCommitUnknown',
+  'coreUnavailable', 'configurationCheckFailed', 'configWriteFailed', 'processStartFailed', 'processExited',
+  'statusSubscriptionFailed', 'statusStreamEnded', 'invalidAuthUrl', 'authorizationTimedOut', 'tooManyLogins'];
 
 /** Only this code's exact finite reason literals are safe to consume from error.message. */
 export function tsLoginErrorReason(error: unknown): string | undefined {
   if (!error || typeof error !== 'object' || !('code' in error)) return undefined;
   if (error.code === 'TAILSCALE_LOGIN_FAILED' && 'message' in error && typeof error.message === 'string'
-    && RETIREMENT_REASONS.includes(error.message)) return error.message;
+    && LOGIN_FAILED_REASONS.includes(error.message)) return error.message;
   if (typeof error.code === 'string' && ['ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED',
     'IOS_FOREGROUND_REQUIRED', 'IOS_VPN_PERMISSION_DENIED', 'IOS_READY_UNKNOWN', 'IOS_START_CANCELLED',
     'readyUnknown', 'unsavedConfiguration', 'configurationPending', 'superseded', 'targetNotInMain'].includes(error.code)) return error.code;

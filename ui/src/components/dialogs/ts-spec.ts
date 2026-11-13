@@ -18,6 +18,7 @@
 import type { FieldSpec, SelectOption } from './field-spec';
 import { EXIT_CUSTOM } from './ts-settings-logic';
 import { ON_DEMAND_FIELD } from './on-demand-field';
+import { shellPlatformFromDataOs } from '@/components/screens/settings/settings-logic';
 
 export function tsMainSpec(
   exitOpts: readonly SelectOption[],
@@ -63,7 +64,8 @@ export const TS_ADV_SPEC: FieldSpec[] = [
   // 越界口径同 relayServerPort（见其注释）。
   { t: 'number', k: 'listenPort', label: 'ts.listenPort', hint: 'ts.listenPortHint', ph: '41641', mono: true, opt: true },
   { t: 'number', k: 'relayServerPort', label: 'ts.relayPort', ph: '0', mono: true, opt: true },
-  { t: 'switch', k: 'sshServer', label: 'ts.ssh', hint: 'ts.sshHint' },
+  // Windows 内核拒收开了 SSH 的 Tailscale endpoint，后端已不发射（builder/endpoints.rs），此处不再给开关。
+  { t: 'switch', k: 'sshServer', label: 'ts.ssh', hint: 'ts.sshHint', when: () => shellPlatformFromDataOs() !== 'win' },
   // P4b 按名解析：与 acceptDefaultResolvers 强联动。后端 `accept_default_resolvers` **只在 resolveByName
   // 为真的分支里被读**（builder/dns.rs:1069，选节点的谓词就是 resolve_by_name==Some(true)）—— 故此前
   // 「接受 DNS（MagicDNS）」那个常显开关是**恒无效**的：resolveByName 无处可设 ⇒ dns-tailscale server 永不发射。

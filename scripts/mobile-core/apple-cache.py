@@ -29,8 +29,9 @@ REGISTRY_MAX_BYTES = 2 * 1024 ** 3
 HEADROOM = 1024 ** 3
 SAMPLE_LIMIT, SAMPLE_PATH_BYTES = 64, 1024
 # Actual Cargo.toml package=polaris and lib=polaris_lib. Keep all their compiled
-# outputs in the original target, including the hashed static archive in deps.
-APP_ENTRY = re.compile(r'^(?:lib)?polaris(?:_lib)?(?:-[0-9a-f]{16}(?:\.|$)|\.)')
+# outputs in the original target, including the hashed static archive in deps
+# and the Cargo 1.100 build-dir unit directory build/polaris.
+APP_ENTRY = re.compile(r'^(?:lib)?polaris(?:_lib)?(?:-[0-9a-f]{16}(?:\.|$)|\.|$)')
 APPLE_RUST_BUILD_CODE_POLICY = 'polaris-apple-rust-build-code-v1'
 APPLE_RUST_UNRELATED_CODE = frozenset({
     'scripts/mobile-core/android_sdk.py',

@@ -1778,6 +1778,7 @@
     "createTaskPhaseParsing": "Parsing subscription…",
     "createTaskPhaseCommitting": "Saving subscription…",
     "createTaskFailed": "Could not add subscription",
+    "createProxyRequired": "Global policy requires subscriptions to be fetched through the proxy, but the proxy is unavailable. Connect the proxy and retry.",
     "addedPartial": "Subscription added. Some providers could not be imported; refresh it later.",
     "autoUpdate": "Auto Update",
     "preview": {

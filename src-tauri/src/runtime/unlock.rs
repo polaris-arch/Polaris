@@ -1272,17 +1272,14 @@ impl UnlockRuntime {
         };
         // lastSnapshot 同步（补测复过的 timeout 已是可信终态，供 S-gate/force-min）；TTL cache 恒写（含 timeout
         // 由 R3 短 TTL 兜底，2min 后可再自然重检）。
-        if !self.commit_epoch(sink, epoch0, |fence| {
+        self.commit_epoch(sink, epoch0, |fence| {
             self.set_last_snapshot_locked(Some(snapshot.clone()));
             self.store_locked(snapshot.clone(), t, ttl);
             for (id, result) in &fresh {
                 sink.progress_committed(fence, id, result);
             }
             sink.updated_committed(fence, &snapshot);
-        }) {
-            return false;
-        }
-        true
+        })
     }
 }
 

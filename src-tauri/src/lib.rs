@@ -725,6 +725,16 @@ pub fn run() {
                 });
             // 确保目录存在（首次启动）。
             let _ = std::fs::create_dir_all(&config_dir);
+            // Helper 要求该目录组/他人不可写（helper core_objects::check_owner，同为 linux/macos），
+            // 不能随 umask（Ubuntu 默认 0002 → 0775）；已存在的目录同样收紧。
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &config_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+            }
             // 日志 sink 必须最先装：在此之前所有 log::* 都是静默 no-op（`log` 只是门面）。
             logging::init(&config_dir);
             log::info!(

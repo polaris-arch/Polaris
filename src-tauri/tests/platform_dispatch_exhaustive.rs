@@ -1706,6 +1706,14 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
         "同上一条，TS endpoint 的 `system_interface_name`。两处是同一条判据的两个下发点。",
     ),
     (
+        "crates/config-engine/src/builder/endpoints.rs",
+        "ep.ssh_server = if ts.ssh_server == Some(true) && platform != \"win32\"",
+        1,
+        "未知平台 → 照用户开关下发 `ssh_server`。只有 Windows 核在受管目录下拒收 SSH 文件写入方\
+         （activation_windows.go），下发即整份配置被拒；未知平台若同样拒收，后果是带 SSH 的 TS 节点\
+         被 config_gate 剥掉，不影响其它节点。",
+    ),
+    (
         "crates/config-engine/src/builder/generate.rs",
         "if platform.eq_ignore_ascii_case(\"darwin\")",
         1,

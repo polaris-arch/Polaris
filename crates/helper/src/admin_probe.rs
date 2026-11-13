@@ -118,17 +118,15 @@ pub fn upgrade_admission(support: &Path, close: bool) -> io::Result<()> {
     let response = client
         .send_with_timeout(&request, Duration::from_secs(5))
         .map_err(|_| io::Error::other("upgrade admission unavailable"))?;
-    let accepted = matches!(
-        (close, response),
+    match (close, response) {
         (true, Response::Ok(ResponseKind::HelperUpgradeAdmitted))
-            | (false, Response::Ok(ResponseKind::HelperUpgradeCancelled))
-    );
-    if accepted {
-        Ok(())
-    } else {
-        Err(io::Error::other(
+        | (false, Response::Ok(ResponseKind::HelperUpgradeCancelled)) => Ok(()),
+        // Every helper ERR reply precedes the admission write (all platforms), so
+        // carrying the wire error lets the CLI report a definite non-admission.
+        (_, Response::Err(error)) => Err(io::Error::other(error)),
+        _ => Err(io::Error::other(
             "helper busy, unknown or legacy upgrade admission unsupported",
-        ))
+        )),
     }
 }
 

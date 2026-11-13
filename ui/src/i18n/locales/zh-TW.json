@@ -1778,6 +1778,7 @@
     "createTaskPhaseParsing": "正在解析訂閱…",
     "createTaskPhaseCommitting": "正在儲存訂閱…",
     "createTaskFailed": "新增訂閱失敗",
+    "createProxyRequired": "全域策略要求訂閱經代理擷取，但目前代理無法使用。請先連線代理後重試。",
     "addedPartial": "訂閱已新增；部分提供者未能匯入，請稍後重新整理訂閱。",
     "autoUpdate": "自動更新",
     "preview": {
