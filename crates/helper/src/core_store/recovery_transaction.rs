@@ -215,6 +215,11 @@ impl<'a> Publication<'a> {
         // Sync actual directory handles up to the existing root, never a volume
         // device, and do not turn an unsupported barrier into success.
         let parents = store.root.ancestors().skip(1);
+        // The Windows installer pins every ancestor with read-only sharing, so a
+        // write-access flush there is a sharing violation. The store never
+        // creates its root on Windows, so no ancestor entry changed here.
+        #[cfg(windows)]
+        let parents = parents.take(0);
         for parent in parents {
             checkpoint(Point::PublicationParentSync)?;
             self.namespace.sync(parent)?;

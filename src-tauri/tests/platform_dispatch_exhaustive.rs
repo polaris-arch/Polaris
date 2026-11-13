@@ -274,6 +274,8 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
      "Linux uninstall carries the responsible-user baseline/config only into its finite dispatcher. Mac keeps retirement and Windows keeps the native cleaner; unsupported/mobile platforms are rejected before this site."),
     ("src-tauri/src/runtime/helper.rs", "if self.platform != Platform::Linux", 1,
      "Linux legacy routing returns false on every other platform; only the Linux compilation reads fixed Linux metadata. This is routing, never root receipt authority."),
+    ("src-tauri/src/runtime/helper.rs", "self.platform == Platform::Linux", 1,
+     "Non-Linux compilations cannot read Linux helper metadata, so legacy maintenance is reported only for Platform::Linux; Mac/Win/Android/iOS/Other return false and gain no maintenance route."),
     ("src-tauri/src/runtime/helper.rs", "let outcome = if self.platform == Platform::Linux && original.is_some()", 1,
      "Only Linux forwards a captured exact user baseline to its existing maintenance entry. Mac/Windows keep their previous result scope and unsupported/mobile platforms are already rejected."),
     ("src-tauri/src/runtime/helper.rs", "if platform != Platform::Linux", 1,
