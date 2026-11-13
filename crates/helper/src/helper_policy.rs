@@ -1,7 +1,7 @@
 //! Administrative version/byte receipt. No installed executable is invoked.
 use crate::{core_objects::PayloadDir, core_store::OwnerPolicy};
 use polaris_helper_proto::core_manifest::InstalledHelperRecord;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -116,26 +116,41 @@ pub fn record(binary: &Path, metadata: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::other("helper metadata parent unavailable"))?;
     OwnerPolicy::privileged().check(parent)?;
-    let temporary = parent.join(format!(".helper-record-{}.new", std::process::id()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
+    // The Windows installer pins this parent with read-only sharing for its whole
+    // transaction, so a rename into it is a sharing violation. That transaction
+    // snapshots and restores this record, so Windows writes it in place.
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644);
-    }
-    let result = (|| {
-        let mut file = options.open(&temporary)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(metadata)?;
         file.write_all(&record.to_json().map_err(io::Error::other)?)?;
         file.sync_all()?;
-        #[cfg(windows)]
-        crate::platform::windows::winproc::seal_store_object(&temporary, false)?;
-        fs::rename(&temporary, metadata)
-    })();
-    if temporary.try_exists()? {
-        let _ = fs::remove_file(temporary);
+        crate::platform::windows::winproc::seal_store_object(metadata, false)
     }
-    result
+    #[cfg(not(windows))]
+    {
+        let temporary = parent.join(format!(".helper-record-{}.new", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let result = (|| {
+            let mut file = options.open(&temporary)?;
+            file.write_all(&record.to_json().map_err(io::Error::other)?)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, metadata)
+        })();
+        if temporary.try_exists()? {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
+    }
 }
 #[cfg(test)]
 mod tests;
