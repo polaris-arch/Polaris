@@ -760,6 +760,15 @@ h1[tabindex='-1']:focus-visible { outline: none; }
 :root[data-theme="light"] .ap-group-head{ background:hsl(var(--surface-3)); }
 :root[data-theme="light"] .app-card{ border-color:hsl(var(--hair)); box-shadow:0 1px 3px hsl(var(--shadow)/0.16); }
 
+/* 接入选择卡（`.mesh-col`，添加接入弹窗）浅色修正：基线底色 --surface-2/0.5 在深色里比弹窗面
+ * (--surface) 更亮 = 「浮起的可点卡」；浅色里 --surface-2 比白色 --surface 更暗 = 读成「凹陷/禁用的
+ * 输入槽」（与出口节点框、分段控件同一种底），白弹窗上一排灰块即用户反馈的不协调。浅色下回到与
+ * `.card` 同层的 --surface 白底、靠 --line 描边成卡；hover 仍走基线的 --surface-2 反馈。只覆盖浅色。 */
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]) .mesh-col:not(:hover){ background:hsl(var(--surface)); }
+}
+:root[data-theme="light"] .mesh-col:not(:hover){ background:hsl(var(--surface)); }
+
 /* ══════════ 状态栏高度单一真值 + toast 底距推导 ══════════
  * 真机反馈「toast 为什么不是自适应位置，举例底部信息栏为什么差那么多」的根因修复。
  *

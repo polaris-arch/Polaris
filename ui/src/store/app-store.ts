@@ -400,6 +400,8 @@ export interface AppState {
 
   // ── 跨屏一次性意图（Home 空状态 → Nodes 页自动唤起对应对话框）──
   serverPageAction: ServerPageAction | null;
+  // ── 一次性意图：用户已在确认框确认「立即生效」→ 待应用条直接走应用流程（消费点 PendingChangesBar）──
+  applyRequested: boolean;
   // ── 跨屏一次性意图（设置页「在主页切换 →」→ Home 页高亮落点，原型 :4052）──
 
   // ── 动作 ──
@@ -438,6 +440,7 @@ export interface AppState {
   /** 当前配置删除节点后统一驱逐所有以 serverId 为键的派生状态。 */
   retainServerIds: (serverIds: readonly string[]) => void;
   setServerPageAction: (action: ServerPageAction | null) => void;
+  setApplyRequested: (requested: boolean) => void;
   reset: () => void;
 }
 
@@ -488,6 +491,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   privacyMode: true,
   tailscaleStatuses: {},
   serverPageAction: null,
+  applyRequested: false,
 
   loadConfig: async (force?: boolean) => {
     try { await refreshConfig({ fresh: force, reason: force ? 'reload' : 'load' }); }
@@ -859,6 +863,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   /** 置/清跨屏一次性意图。消费方读到后立刻 `setServerPageAction(null)`（见类型注释）。 */
   setServerPageAction: (action) => set({ serverPageAction: action }),
+  setApplyRequested: (requested) => set({ applyRequested: requested }),
 
   /** 同上，首页版（消费点 HomeScreen 的高亮 effect）。 */
 
@@ -888,6 +893,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       tailscaleStatuses: {},
       // 一次性跨屏意图是瞬时态：reset 后没人再该被它弹窗/高亮。
       serverPageAction: null,
+      applyRequested: false,
           // 登录中的瞬时态随 reset 清掉；tailscaleLoginStates 刻意不清——它是缓存/state 文件支撑的持久登录态，
       // 不随一次 app 状态重置而「变成未登录」。
       tailscaleAuthUrls: {},

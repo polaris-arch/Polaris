@@ -31,7 +31,9 @@ describe('desktop impact consent disclosure', () => {
     const onConfirm = vi.fn(), onDismiss = vi.fn();
     const modal = ImpactApplyDialog({ prompt: value, onConfirm, onDismiss }) as ReactElement<ModalProps>;
     expect(modal.type).toBe(Modal);
-    const summary = modal.props.children as ReactElement<{ prompt: ImpactDisclosure }>;
+    const body = modal.props.children as ReactElement<{ className: string; children: ReactElement<{ prompt: ImpactDisclosure }> }>;
+    expect(body.props.className).toBe('card-sub');
+    const summary = body.props.children;
     expect(summary.type).toBe(ImpactApplySummary);
     expect(Object.keys(summary.props.prompt).sort()).toEqual(['coreImpacts', 'hostEffects']);
     expect(summary.props.prompt).toEqual({ coreImpacts: value.coreImpacts, hostEffects: value.hostEffects });

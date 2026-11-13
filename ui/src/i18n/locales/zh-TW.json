@@ -856,7 +856,8 @@
     },
     "proxyMode": {
       "confirmTitle": "確認切換代理模式",
-      "confirmDesc": "切換接管方式將重新啟動代理以套用，期間會短暫中斷目前連線。",
+      "confirmDesc": "切換接管方式將立即套用，期間可能重新啟動代理並短暫中斷目前連線。",
+      "confirmPendingNote": "另有已儲存、尚未套用的變更將一併生效。",
       "confirmBtn": "確認切換",
       "failUpdate": "儲存設定失敗",
       "fakeIpAutoEnabled": "已隨 TUN 模式自動啟用 FakeIP（建議）。可在 設定 → DNS 中關閉。"

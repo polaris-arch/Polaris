@@ -9,6 +9,14 @@ describe('safe restart reasons and locale parity', () => {
     expect(restartReasonKeys([{ code: 'arbitrary instruction', path: 'password=secret' }])).toEqual(['home.restartApplyStructural']);
     expect(restartReasonKeys([{ code: 'structuralChange', path: 'password=secret' }])).toEqual(['home.restartApplyStructural']);
   });
+  it('maps host-effect planner restart codes', () => {
+    expect(restartReasonKeys([{ code: 'HOST_CARRIER_TRANSITION_REQUIRES_RESTART', path: 'proxyModeType' }])).toEqual(['home.restartApplyTun']);
+    for (const code of ['HOST_PHYSICAL_BASELINE_UNAVAILABLE', 'LINUX_DNS_EXACT_CAPTURE_UNAVAILABLE', 'HOST_DNS_EXACT_CAPTURE_UNAVAILABLE',
+      'HOST_DNS_TAKEOVER_UNSUPPORTED', 'HOST_PROXY_EXACT_CAPTURE_UNAVAILABLE']) {
+      expect(restartReasonKeys([{ code, path: 'systemProxy' }])).toEqual(['home.restartApplyHostEffects']);
+    }
+    expect(restartReasonKeys([{ code: 'structuralChange', path: 'inbounds.network-canary.listen_port' }])).toEqual(['home.restartApplyListener']);
+  });
   it('maps only the exact DNS host-restart pair to the shared field-specific explanation', () => {
     const dnsReason = { code: 'hostEffectsRequireRestart', path: 'dnsConfig.takeoverSystemDns' };
     expect(restartReasonKeys([dnsReason])).toEqual(['home.restartApplyDnsAutoSource']);

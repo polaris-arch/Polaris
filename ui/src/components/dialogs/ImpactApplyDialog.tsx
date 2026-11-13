@@ -17,6 +17,8 @@ export function ImpactApplyDialog({ prompt, onDismiss, onConfirm }: {
       <button type="button" className="btn flow" disabled={disclosure.blocked}
         onClick={() => { if (!disclosure.blocked) onConfirm(); }}>{t('home.impactApplyConfirm')}</button>
     </>}>
-    <ImpactApplySummary prompt={{ coreImpacts: prompt.coreImpacts, hostEffects: prompt.hostEffects }} />
+    <div className="card-sub" style={{ marginTop: -2, lineHeight: 1.6 }}>
+      <ImpactApplySummary prompt={{ coreImpacts: prompt.coreImpacts, hostEffects: prompt.hostEffects }} />
+    </div>
   </Modal>;
 }

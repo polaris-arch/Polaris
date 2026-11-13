@@ -856,7 +856,8 @@
     },
     "proxyMode": {
       "confirmTitle": "Confirm Proxy Mode Change",
-      "confirmDesc": "Switching the takeover mode restarts the proxy to apply it, briefly dropping the current connection.",
+      "confirmDesc": "Switching the takeover mode applies it immediately and may restart the proxy, briefly dropping the current connection.",
+      "confirmPendingNote": "Other saved changes that have not been applied yet will take effect at the same time.",
       "confirmBtn": "Confirm Switch",
       "failUpdate": "Failed to save settings",
       "fakeIpAutoEnabled": "FakeIP was enabled automatically for TUN mode (recommended). You can turn it off in Settings → DNS."

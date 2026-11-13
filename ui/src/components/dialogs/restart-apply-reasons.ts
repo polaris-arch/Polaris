@@ -14,6 +14,15 @@ export function restartReasonKeys(reasons: PendingApplyResult['reasons']): strin
       keys.add('home.restartApplyPersistenceOwner');
       continue;
     }
+    // Host-effect planner refusals (dns_takeover.rs host_rejection) arrive with their own codes.
+    if (reason.code === 'HOST_CARRIER_TRANSITION_REQUIRES_RESTART') {
+      keys.add('home.restartApplyTun');
+      continue;
+    }
+    if (/^(HOST|LINUX)_(PHYSICAL_BASELINE|DNS_EXACT_CAPTURE|PROXY_EXACT_CAPTURE)_UNAVAILABLE$|^HOST_DNS_TAKEOVER_UNSUPPORTED$/.test(reason.code)) {
+      keys.add('home.restartApplyHostEffects');
+      continue;
+    }
     if (reason.code === 'hostEffectsRequireRestart') {
       keys.add(reason.path === 'dnsConfig.takeoverSystemDns'
         ? 'home.restartApplyDnsAutoSource'
@@ -27,7 +36,7 @@ export function restartReasonKeys(reasons: PendingApplyResult['reasons']): strin
     if (reason.code !== 'structuralChange') continue;
     const path = reason.path;
     if (/^(tun|inbounds\.tun)(\.|$)/.test(path)) keys.add('home.restartApplyTun');
-    else if (/^(mixedPort|listenPort|inbounds\.listen_port)$/.test(path)) keys.add('home.restartApplyListener');
+    else if (/^(mixedPort|listenPort|inbounds(\.[^.]+)?\.listen_port)$/.test(path)) keys.add('home.restartApplyListener');
     else if (/^(networkNamespace|network_namespace|netns)$/.test(path)) keys.add('home.restartApplyNamespace');
     else if (/^(services|service)(\.|$)/.test(path)) keys.add('home.restartApplyServices');
     else if (/^(cachePath|cacheFile\.path|experimental\.cache_file\.path)$/.test(path)) keys.add('home.restartApplyCache');

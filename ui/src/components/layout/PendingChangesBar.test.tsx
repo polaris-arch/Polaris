@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
     proxyStatus: { running: true, mainGeneration: 7 }, config: null as Record<string, unknown> | null,
     nativeRetirementEndedBeforeGeneration: 0, confirmNativeRetirementEnd: vi.fn(),
     servers: [] as Array<{ id: string; name: string }>, setPendingChanges: vi.fn(),
+    applyRequested: false, setApplyRequested: vi.fn(),
   },
 }));
 vi.mock('react', async original => ({
@@ -120,6 +121,7 @@ beforeEach(() => {
   h.app.nativeRetirementEndedBeforeGeneration = 0;
   h.app.pendingChanges = { added: ['node'], modified: [], removed: [], restartDeferred: false };
   h.app.proxyStatus = { running: true, mainGeneration: 7 };
+  h.app.applyRequested = false;
   h.app.setPendingChanges.mockImplementation(pending => { h.app.pendingChanges = pending; });
   h.pendingRead.mockImplementation(async () => h.app.pendingChanges);
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
@@ -130,6 +132,23 @@ beforeEach(() => {
   h.hostRead.mockRejectedValue(new Error('Host status unavailable'));
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe('pre-confirmed apply request', () => {
+  it('applies the saved candidate and confirms its restart token without a second prompt or draft save', async () => {
+    h.app.applyRequested = true;
+    h.app.setApplyRequested.mockImplementation(requested => { h.app.applyRequested = requested; });
+    h.freshApply.mockResolvedValueOnce({ ok: false, status: 'restartRequired', restartConfirmation: 'restart-token',
+      reasons: [{ code: 'HOST_CARRIER_TRANSITION_REQUIRES_RESTART', path: 'proxyModeType' }] });
+    h.applyNow.mockResolvedValueOnce({ saved: true, ok: true, status: 'applied', applyId: 3, runtimeGeneration: 7 });
+    renderBar();
+    await microtasks();
+    renderBar();
+    expect(h.app.setApplyRequested).toHaveBeenCalledExactlyOnceWith(false);
+    expect(h.freshApply).toHaveBeenCalledExactlyOnceWith();
+    expect(h.applyNow).toHaveBeenCalledExactlyOnceWith('restart-token');
+    expect(h.states[1]).toBeNull();
+  });
+});
 
 describe('desktop host execution and four-account feedback', () => {
   it('polls HostOnly without a transaction and retains the bar at D=R until a physical receipt', async () => {

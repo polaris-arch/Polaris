@@ -109,6 +109,7 @@ export default function PendingChangesBar() {
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
   const conflict = useStagedConfigStore((s) => s.conflict);
+  const applyRequested = useAppStore((s) => s.applyRequested);
   /** B 维度里属于「这一次 apply」的那部分。`reason` 只在 `failed` 时有意义。 */
   const [apply, setApplyState] = useState<ApplyState>({
     phase: 'idle',
@@ -292,7 +293,6 @@ export default function PendingChangesBar() {
         onDismiss={() => useStagedConfigStore.getState().dismissConflict()}
       />
     );
-  if (!view.visible && restartPrompt === null && impactChoice.prompt === null) return conflictDialog;
 
   /** n===0 而差集腿仍有活 ⇒ 唯一可能是 `restartDeferred`：明细里没有 id 可列，给一行说明。 */
   const configOnly = n === 0 && hasPendingWork(pending);
@@ -301,7 +301,7 @@ export default function PendingChangesBar() {
     await useStagedConfigStore.getState().save();
   };
 
-  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string, impactConfirmation?: string, hostRetry = false) => {
+  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string, impactConfirmation?: string, hostRetry = false, preconfirmed = false) => {
     if (applyRequest.current?.awaitingReply || apply.phase === 'applying'
         || apply.host?.phase === 'pending' && !apply.host.superseded) return;
     if (hostRetry && useStagedConfigStore.getState().entries.length > 0) return;
@@ -345,7 +345,7 @@ export default function PendingChangesBar() {
           reason: null, reconciling: !!initial.coreRecovery });
         return;
       }
-      const result = hostRetry
+      const result = hostRetry || preconfirmed
         // Fresh Plan/confirmation for the saved candidate; never save drafts or replay a Core transaction.
         ? { ...await api.proxy.applyPendingChanges(), saved: true }
         : persistenceTransactionId === undefined
@@ -400,6 +400,8 @@ export default function PendingChangesBar() {
           setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
           return;
         }
+        // The user already accepted the interruption in the originating dialog: use this exact token, no second prompt.
+        if (preconfirmed) return void onApply(result.restartConfirmation);
         setRestartPrompt({ token: result.restartConfirmation, reasons: result.reasons ?? [] });
         setApply(hostDebt ? { ...initial, phase: initial.coreRecovery ? 'durabilityPending' : 'idle',
           reason: null, reconciling: !!initial.coreRecovery } : preserveNativeRetirements(initial, { phase: 'idle', reason: null }));
@@ -491,6 +493,14 @@ export default function PendingChangesBar() {
     }
   };
 
+  // 确认框已确认「立即生效」的一次性请求：直接应用已保存候选（不保存草稿），跳过「立即应用」与重启二次确认。
+  useEffect(() => {
+    if (!applyRequested) return;
+    useAppStore.getState().setApplyRequested(false);
+    void onApply(undefined, undefined, undefined, false, true);
+  }, [applyRequested]);
+  if (!view.visible && restartPrompt === null && impactChoice.prompt === null) return conflictDialog;
+
   /** 转圈只挂在「正在跑的那颗」上：保存在飞 → 保存钮，重启在飞 → 立即应用钮。 */
   const spins = (id: BarActionId): boolean =>
     (id === 'save' && saveStatus === 'saving') || (id === 'apply' && apply.phase === 'applying');
@@ -563,7 +573,7 @@ export default function PendingChangesBar() {
       {detailOpen && (
         <div className="pd-pop" style={{ bottom: 'calc(100% + 6px)', left: 0 }} role="group">
           {view.titleKey === 'home.pendingNativeCleanupUnknown' && (
-            <div style={{ padding: '6px 8px', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
+            <div className="card-sub" style={{ padding: '6px 8px', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
               <b>{t(view.titleKey)}</b>
               {view.accountDetailKeys?.map(key => <p key={key}>{t(key)}</p>)}
               <p>{t('home.pendingNativeCleanupDetail')}</p>

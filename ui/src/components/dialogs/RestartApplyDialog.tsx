@@ -22,8 +22,11 @@ export function RestartApplyDialog({ prompt, onDismiss, onConfirm }: {
           {t('home.restartApplyConfirm')}
         </button>
       </>}>
-      <p>{t('home.restartApplyDescription')}</p>
-      <ul>{restartReasonKeys(prompt.reasons).map((key) => <li key={key}>{t(key)}</li>)}</ul>
+      {/* 正文字号对齐 ConfirmDialog（`.card-sub`）：裸 <p>/<ul> 会继承 16px 浏览器默认字号。 */}
+      <div className="card-sub" style={{ marginTop: -2, lineHeight: 1.6 }}>
+        <p>{t('home.restartApplyDescription')}</p>
+        <ul>{restartReasonKeys(prompt.reasons).map((key) => <li key={key}>{t(key)}</li>)}</ul>
+      </div>
     </Modal>
   );
 }

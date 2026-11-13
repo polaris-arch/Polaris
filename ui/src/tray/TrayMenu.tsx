@@ -566,8 +566,8 @@ export default function TrayMenu() {
   };
 
   // 与首页复用后端最新配置事务；只发送用户选择的mode，不发送托盘旧DNS快照。
-  // 直接落盘不弹「已连接会重启」确认（浮层无 dialog 层，对齐 上游 托盘 onChangeProxyModeType 的直切语义；
-  // 已连接切换会瞬断当前连接，属托盘直切既定取舍）。
+  // 只落盘、不应用（浮层无 dialog 层，无从承载重启/影响确认）：已连接时新接管方式进入主窗待应用条，
+  // 须在主窗「立即应用」后才生效；未连接则下次连接生效。
   const setTakeover = async (modeType: ProxyModeType) => {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
     const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
