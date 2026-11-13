@@ -264,6 +264,8 @@ pub(super) struct RuntimeConfigBaseline {
     protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
     deps: GenerateConfigDeps,
     generated: SingBoxConfig,
+    /// 起核前（TUN 建立前）经物理网卡探得 Bootstrap DoH 端点被 RST/拒绝/超时。只报不通，未知按 false。
+    pub(super) doh_blocked: bool,
 }
 
 impl RuntimeConfigBaseline {
@@ -1131,6 +1133,19 @@ impl ProxyRuntime {
         crate::runtime::route_binding::runtime_binding_targets_reusable(trusted, new, plan)
     }
 
+    /// Bootstrap DoH 被阻断时的快照投影：运行配置带 `dns-lan` 回退 → `fallback`，不带 → `unprotected`；
+    /// 未阻断 / 核未运行 → `None`。
+    pub(crate) fn doh_blocked_notice(&self) -> Option<&'static str> {
+        let baseline = self.runtime_config_baseline.read().ok()?;
+        let baseline = baseline.as_ref().filter(|b| b.doh_blocked)?;
+        let fallback = baseline
+            .generated
+            .dns
+            .as_ref()
+            .is_some_and(|dns| dns.servers.iter().any(|server| server.tag == "dns-lan"));
+        Some(if fallback { "fallback" } else { "unprotected" })
+    }
+
     pub(super) fn capture_runtime_config_baseline(
         &self,
         generation: u64,
@@ -1162,6 +1177,7 @@ impl ProxyRuntime {
                 protected_physical_root: None,
                 deps,
                 generated,
+                doh_blocked: false,
             });
         }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
@@ -2497,6 +2513,7 @@ impl ProxyRuntime {
                 protected_physical_root,
                 deps: pending.deps.clone(),
                 generated: pending.generated.clone(),
+                doh_blocked: baseline.as_ref().is_some_and(|b| b.doh_blocked),
             });
             if let Ok(mut status) = self.status.write() {
                 status.mixed_port = pending

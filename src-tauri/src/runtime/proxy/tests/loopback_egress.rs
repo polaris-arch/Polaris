@@ -293,6 +293,12 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
         "管理 API 端口就绪探测（gRPC 管理口，不是代理入站，自带 secret）",
     ),
     (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "start_inner",
+        None,
+        "起核前 Bootstrap DoH 端点 TCP 握手探测：直连 IP 字面量，不经本机代理入站、不发任何请求",
+    ),
+    (
         "crates/singbox-grpc/src/h2c.rs",
         "connect_h2c",
         None,

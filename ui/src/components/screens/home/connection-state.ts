@@ -48,7 +48,12 @@
  * 不代表还有未接线的消费方。
  */
 
-import { ProxyErrorCode, type ProxyModeType, type ProxyReachability } from '@/contracts/types';
+import {
+  ProxyErrorCode,
+  type IpInfoSnapshot,
+  type ProxyModeType,
+  type ProxyReachability,
+} from '@/contracts/types';
 
 /**
  * 三态：
@@ -194,4 +199,15 @@ export function deriveExitReachabilityNotice({
   proxyReachability: ProxyReachability | undefined;
 }): ExitReachabilityNotice {
   return connected && hasNode && proxyReachability === 'unreachable' ? 'unavailable' : 'hidden';
+}
+
+/** 首页加密 DNS 阻断提示门：仅已连接且起核前探测明确不通时显示；未连接、未探完、探测正常一律隐藏。 */
+export function deriveDohBlockedNotice({
+  connected,
+  dohBlocked,
+}: {
+  connected: boolean;
+  dohBlocked: IpInfoSnapshot['dohBlocked'];
+}): 'hidden' | NonNullable<IpInfoSnapshot['dohBlocked']> {
+  return connected && dohBlocked ? dohBlocked : 'hidden';
 }

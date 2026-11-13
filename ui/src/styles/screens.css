@@ -502,6 +502,10 @@
    删掉它那条横幅会塌成 height:0 + overflow:hidden 的隐形元素（docked 基线），不是"恢复原型形态"。───── */
 #s-home > .pending-bar{ flex:none; height:auto; overflow:visible; margin-bottom:14px; padding:9px 13px;
   border:1px solid hsl(var(--warn)/0.4); border-radius:var(--r); }
+/* 提示级（如加密 DNS 已回退系统 DNS）：走 --flow 信息色，不与警示横幅争视觉权重。 */
+#s-home > .pending-bar.info{ background:hsl(var(--flow-weak)); border-color:hsl(var(--flow)/0.4); }
+#s-home > .pending-bar.info .pb-ic{ background:hsl(var(--flow)); color:#fff; }
+#s-home > .pending-bar.info .pb-tx b{ color:hsl(var(--flow)); }
 
 /* ───── LAYOUT：常驻应用更新横幅（AppUpdateBanner）。类名沿用 上游的 `.app-update-banner`/`.aub-*`；
    这族 class 在 prototype.css / components.css（禁区不可改）里不存在，故在此以最小样式补齐

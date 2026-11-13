@@ -189,6 +189,7 @@ fn declare_scheduled_refresh(delay_ms: u64) -> (u64, Value) {
             obj.remove("loading");
             obj.remove("error");
             obj.remove("proxyBlocked");
+            obj.remove("dohBlocked");
         }
         state.publish(stopped, true)
     };
@@ -398,12 +399,19 @@ pub(in crate::commands) async fn run_bound_ipinfo<G: ManualBindingGuard>(
         http: &proxy,
         guard: &guard,
     };
-    let snapshot = bound_ipinfo_round(
+    let mut snapshot = bound_ipinfo_round(
         &guard,
         || fetch_ipip_ipinfo(&direct),
         || fetch_trace_ipinfo(&proxy),
     )
     .await?;
+    // 手点检测整帧替换缓存，须带上同一份起核前 DoH 结论，否则横幅会被手点抹掉。
+    if let Some(notice) = app
+        .try_state::<AppRuntime>()
+        .and_then(|state| state.proxy().doh_blocked_notice())
+    {
+        snapshot["dohBlocked"] = json!(notice);
+    }
     guard.validate().await?;
     let snapshot = commit_bound_ipinfo(&guard, &snapshot)?;
     guard.check()?;
@@ -661,6 +669,7 @@ async fn build_ipinfo_snapshot(
     direct_http: &HttpRuntime,
     status: &ProxyStatus,
     local_proxy: Option<&LocalHttpProxy>,
+    doh_blocked: Option<&'static str>,
     post_connect: bool,
 ) -> Value {
     let (direct, direct_err) = match with_ipinfo_retry(
@@ -701,6 +710,10 @@ async fn build_ipinfo_snapshot(
     });
     if let Some(e) = direct_err {
         snap["error"] = json!(e);
+    }
+    // Bootstrap DoH 阻断（起核前探得）：有 dns-lan 回退 → fallback，没有 → unprotected。
+    if let Some(notice) = doh_blocked.filter(|_| status.running) {
+        snap["dohBlocked"] = json!(notice);
     }
     snap
 }
@@ -768,6 +781,8 @@ struct IpinfoProbeInputs {
     status: ProxyStatus,
     /// 探测时刻的本机 http 代理入站（端口 + 凭据；与 `status` 同一时点取）。
     local_proxy: Option<LocalHttpProxy>,
+    /// Bootstrap DoH 阻断投影（未阻断 → `None`）。
+    doh_blocked: Option<&'static str>,
     /// 运行时 R 配置（伴测取真实出口 `selectedServerId` / 测速 URL）；停核时可读磁盘 D。
     config: Value,
 }
@@ -786,6 +801,7 @@ fn ipinfo_probe_inputs(state: &AppRuntime) -> IpinfoProbeInputs {
         http: state.http().clone(),
         status,
         local_proxy: state.proxy().local_http_proxy(),
+        doh_blocked: state.proxy().doh_blocked_notice(),
         config,
     }
 }
@@ -838,10 +854,17 @@ async fn probe_publish_ipinfo(
         http,
         status,
         local_proxy,
+        doh_blocked,
         config,
     } = inputs;
-    let snap =
-        build_ipinfo_snapshot(http.as_ref(), &status, local_proxy.as_ref(), post_connect).await;
+    let snap = build_ipinfo_snapshot(
+        http.as_ref(),
+        &status,
+        local_proxy.as_ref(),
+        doh_blocked,
+        post_connect,
+    )
+    .await;
 
     // 探测期间（含重试，最长 20s）可能已有更新的腿排上并落地。旧腿返回当前权威帧，
     // 不把失效结果当作手动响应，也不污染缓存、广播或伴测。

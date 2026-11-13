@@ -412,6 +412,8 @@ export interface IpInfoSnapshot {
   /** TS API 直判出口无效、不探测的终态；非空=选中 TS 出口未广告 / exit peer 离线。状态栏据此显「出口无效」，
    *  真探测发生（proxy 探到值或走真链探测）即清空——与 error（探测失败）互斥语义：blocked=没探（已知无效）。 */
   proxyBlocked?: ProxyExitBlock;
+  /** 起核前探得 Bootstrap DoH 被阻断：fallback=国内域名已回退系统 DNS，unprotected=无回退。未阻断/未知时缺省。 */
+  dohBlocked?: 'fallback' | 'unprotected';
 }
 
 export interface ApiResponse<T = unknown> {

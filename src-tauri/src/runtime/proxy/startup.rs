@@ -1334,6 +1334,44 @@ impl ProxyRuntime {
         self.netenv_dhcp_suppressed.store(false, Ordering::SeqCst);
         let preflight_ms = t_preflight.elapsed().as_millis();
         log::info!("起核耗时：配置解析+网卡绑定前置校验={preflight_ms}ms");
+        // Bootstrap DoH 阻断探测：TUN 尚未建立，App socket 走物理网卡，与提权门/配置生成并行；首次 spawn
+        // 前收割，未完成即未知。只把 RST/拒绝/超时算阻断，其它错误（无网等）不报，免得与断网混淆。
+        let mut doh_probe = user_config
+            .dns_servers
+            .iter()
+            .find(|server| {
+                server.id == polaris_config_engine::user_config::BUILTIN_BOOTSTRAP_DNS_ID
+                    && polaris_config_engine::user_config::is_valid_bootstrap_dns_resource(server)
+            })
+            .and_then(|server| {
+                use polaris_config_engine::user_config::DnsServerKind;
+                let port = match server.kind {
+                    DnsServerKind::Https => 443,
+                    DnsServerKind::Tls => 853,
+                    _ => return None,
+                };
+                let endpoint = server.endpoint.as_ref()?;
+                let ip: std::net::IpAddr =
+                    endpoint.host.trim().trim_matches(['[', ']']).parse().ok()?;
+                let target = (ip, endpoint.port.unwrap_or(port));
+                Some(tokio::spawn(async move {
+                    match tokio::time::timeout(
+                        Duration::from_millis(1_500),
+                        tokio::net::TcpStream::connect(target),
+                    )
+                    .await
+                    {
+                        Err(_) => true,
+                        Ok(Err(error)) => matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                        ),
+                        Ok(Ok(_)) => false,
+                    }
+                }))
+            });
+        let mut doh_blocked = false;
 
         // ── C6-5 TUN 提权引导门（**全入口唯一汇流点**，移植 上游 `maybePromptHelperGate`）──────
         // 置于 config 生成/写盘/端口解析之前（最早 bail，未装时零副作用）。**必须在此、不可在命令层**：
@@ -1837,6 +1875,11 @@ impl ProxyRuntime {
             // late fence ensures the legacy path does not intentionally spawn
             // after observing a managed document.
             self.admit_legacy_start()?;
+            // 已完成的任务 abort 无效、照常取回结果；未完成的被取消 ⇒ 未知。
+            if let Some(probe) = doh_probe.take() {
+                probe.abort();
+                doh_blocked = probe.await.unwrap_or(false);
+            }
             let t_spawn = std::time::Instant::now();
             let main_claim_token = main_reservation.claim_token();
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -2499,6 +2542,15 @@ impl ProxyRuntime {
                 user_config.clone(),
                 runtime_pairing,
             );
+            if let Some(baseline) = self
+                .runtime_config_baseline
+                .write()
+                .ok()
+                .as_deref_mut()
+                .and_then(Option::as_mut)
+            {
+                baseline.doh_blocked = doh_blocked;
+            }
             self.bind_runtime_api_control(my_gen, runtime_api_control);
             self.commit_coex_current_config(config.clone());
             // The final endpoint set was claimed before native/libbox startup. Keep that claim

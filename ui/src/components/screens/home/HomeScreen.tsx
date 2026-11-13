@@ -42,6 +42,7 @@ import {
 } from './connect-button-state';
 import { createTopicSubscription } from '@/lib/topic-subscription';
 import {
+  deriveDohBlockedNotice,
   deriveExitReachabilityNotice,
   deriveTakeoverConnState,
 } from './connection-state';
@@ -329,6 +330,10 @@ export function HomeScreen() {
     connected: connState === 'connected',
     hasNode: !!currentServer?.id,
     proxyReachability: ipInfo?.proxyReachability,
+  });
+  const dohBlockedNotice = deriveDohBlockedNotice({
+    connected: connState === 'connected',
+    dohBlocked: ipInfo?.dohBlocked,
   });
   /** 空状态：一个节点都没有、且没选哨兵出口（直连/阻断都是有效出口配置，不算空）。 */
   const emptyState = servers.length === 0 && !sentinelSelected;
@@ -1063,6 +1068,38 @@ export function HomeScreen() {
             <b>{t('home.proxyExitUnavailable')}</b>
             <div>{t('home.proxyExitUnavailableHint')}</div>
           </div>
+        </div>
+      )}
+
+      {dohBlockedNotice !== 'hidden' && (
+        <div
+          className={cn('pending-bar', dohBlockedNotice === 'fallback' && 'info')}
+          role={dohBlockedNotice === 'fallback' ? 'status' : 'alert'}
+        >
+          <span className="pb-ic" aria-hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M10.3 3.9 2.4 18a1.9 1.9 0 0 0 1.7 2.9h15.8A1.9 1.9 0 0 0 21.6 18L13.7 3.9a1.9 1.9 0 0 0-3.4 0Z" strokeLinejoin="round" />
+              <path d="M12 9v4" strokeLinecap="round" />
+              <circle cx="12" cy="16.6" r="0.9" fill="currentColor" stroke="none" />
+            </svg>
+          </span>
+          <div className="pb-tx pb-static">
+            <b>{t('home.dohBlocked')}</b>
+            <div>
+              {t(
+                dohBlockedNotice === 'fallback'
+                  ? 'home.dohBlockedFallbackHint'
+                  : 'home.dohBlockedUnprotectedHint'
+              )}
+            </div>
+          </div>
+          {dohBlockedNotice === 'unprotected' && (
+            <div className="pb-acts">
+              <button type="button" className="btn ghost sm" onClick={() => enterSettings('dns')}>
+                {t('settings.section.dns')}
+              </button>
+            </div>
+          )}
         </div>
       )}
 

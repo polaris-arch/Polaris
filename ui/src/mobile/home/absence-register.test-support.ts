@@ -146,6 +146,14 @@ export const HOME_PARITY: ScreenParityRegister = {
       note: '「分流策略」标签行右边那颗齿轮，同样只是通往网络设置页的捷径。',
     },
     {
+      id: 'HomeScreen.tsx|k:settings.section.dns',
+      disposition: {
+        kind: 'reachable-elsewhere',
+        mobile: { file: 'ui/src/mobile/settings/settings-pages.ts', mustContain: "dns: 'DNS'" },
+      },
+      note: '加密 DNS 阻断（无 dns-lan 回退）横幅上的「DNS 设置」，只是通往 DNS 设置页的捷径。',
+    },
+    {
       id: 'HomeScreen.tsx|f:onRoutingChange',
       disposition: {
         kind: 'ported',
