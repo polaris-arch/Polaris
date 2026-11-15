@@ -1497,7 +1497,8 @@ impl ProxyRuntime {
                 } | ClassifiedSwitch::Unchanged
             );
             if graph_change {
-                let result = self.apply_runtime_candidate(new_config.clone()).await;
+                // 隔离大事务 future，避免普通 selector 热切也携带其内联状态机。
+                let result = Box::pin(self.apply_runtime_candidate(new_config.clone())).await;
                 return Self::runtime_result_outcome(&result);
             }
         }

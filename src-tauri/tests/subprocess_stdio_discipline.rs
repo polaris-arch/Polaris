@@ -2352,7 +2352,8 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
     let factory = compact(block_of(payload, "pub fn spawn_macos_root_helper_main("));
     for needle in [
         "macos::configure_main_command(&mutcommand,config,working_directory,pipe);",
-        "macos::attach_store_lease(&mutcommand,store_lease,&root.lease)?",
+        "letnative_lease=macos::attach_store_lease(&mutcommand,store_lease,&root.lease)?;",
+        "letlease_owner=Arc::new((native_lease,lease_owner))asArc<dynSend+Sync>;",
         "letchild=command.spawn()?;",
         "child:Some(child)",
         "owner:Some(self.payload)",
@@ -2446,7 +2447,7 @@ fn platform_factory_stdio_custody_is_complete(index: &BTreeMap<&str, &Scanned>) 
     let win_helper = file_of(index, "crates/helper/src/platform/windows/winproc/win.rs");
     let spawn = compact(block_of(win_helper, "fn spawn_tracked("));
     for needle in [
-        ".spawn_windows_main(file,Path::new(&cwd),&runtime_directory)?",
+        ".spawn_windows_main(file,&runtime_directory.path,&config_directory)?",
         "let(pid,handle,stdout,stderr,execution_custody)=child.into_parts();",
         "_execution_custody:execution_custody",
         "spawn_pipe_loggers_with_preopened_files_custodied(stdout,stderr,files,",
@@ -2585,6 +2586,9 @@ fn recovery_root_is_explicit_main_data_under_existing_factories() {
         ),
         "fn fixed_arguments(",
     );
-    assert!(windows.contains("(ExecPurpose::RunMain, Some(directory))"));
+    assert!(windows.contains("let (runtime, resources) = match (purpose, directories)"));
+    assert!(windows.contains("(ExecPurpose::RunMain, Some(directories)) => directories"));
+    assert!(windows.contains("quoted(runtime)?"));
+    assert!(windows.contains("quoted(resources)?"));
     assert!(!windows.contains("extra_args"));
 }

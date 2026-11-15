@@ -152,10 +152,10 @@ impl<'a> Namespace<'a> {
             if !judge_object("repair-object", &security).is_empty() {
                 return Err(invalid("repair object ACL differs"));
             }
-            if directory {
-                if !judge_child_inheritance("repair-child-inheritance", &security).is_empty() {
-                    return Err(invalid("repair parent grants unsafe child writes"));
-                }
+            if directory
+                && !judge_child_inheritance("repair-child-inheritance", &security).is_empty()
+            {
+                return Err(invalid("repair parent grants unsafe child writes"));
             }
             if !directory && link_count(&file)? != 1 {
                 return Err(invalid("repair object has multiple links"));
