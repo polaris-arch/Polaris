@@ -59,7 +59,7 @@ const ROW: CSSProperties = {
 const ROW_FIRST: CSSProperties = { ...ROW, borderTop: 'none' };
 
 const ROW_TEXT: CSSProperties = {
-  flex: '1 1 auto',
+  flex: '1 1 0',
   minWidth: 0,
   display: 'flex',
   flexDirection: 'column',
@@ -614,24 +614,27 @@ export function SettingsPushRow({
   desc,
   onOpen,
   first,
+  current,
 }: {
   id: string;
   label: string;
   desc?: ReactNode;
   onOpen: () => void;
   first?: boolean;
+  current?: boolean;
 }): ReactElement {
   return (
     <button
       type="button"
       data-push={id}
+      aria-current={current ? 'page' : undefined}
       onClick={onOpen}
       style={{
         ...(first === true ? ROW_FIRST : ROW),
         width: '100%',
         margin: 0,
         textAlign: 'start',
-        background: 'none',
+        background: current ? 'hsl(var(--flow-weak))' : 'none',
         borderLeft: 'none',
         borderRight: 'none',
         borderBottom: 'none',
@@ -700,7 +703,7 @@ export function SettingsStatusRow({
   );
 }
 
-/** 页头（二级页带返回）。`h1` 每屏只有一个，与 IA「screen header」同一格。 */
+/** 页头（窄窗二级页带返回）；并列布局的分类与详情各保留自己的标题。 */
 export function SettingsHeader({
   title,
   onBack,

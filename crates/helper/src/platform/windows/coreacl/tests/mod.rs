@@ -54,6 +54,10 @@ const PATH_DIR: &str = r"C:\ProgramData\Polaris\core";
 #[test]
 fn the_locked_down_target_state_is_not_weakened() {
     assert_eq!(judge_object(PATH_DIR, &locked_down_fixture()), vec![]);
+    assert_eq!(
+        judge_child_inheritance(PATH_DIR, &locked_down_fixture()),
+        vec![]
+    );
 }
 
 /// `Users:(RX)` 不算写类权 —— 掩码层面直接钉住（`(F)` 整值并进掩码就会让这条红）。
@@ -281,6 +285,10 @@ fn an_inherit_only_write_grant_is_not_a_grant_on_the_object() {
     ace.flags = ACE_FLAG_INHERIT_ONLY | 0x3; // (OI)(CI)(IO)
     sec.dacl.as_mut().unwrap().push(ace);
     assert_eq!(judge_object(PATH_DIR, &sec), vec![]);
+    assert!(matches!(
+        &judge_child_inheritance(PATH_DIR, &sec)[..],
+        [AclFinding { issue: AclIssue::WritableBySid { sid, .. }, .. }] if sid == SID_A_USER
+    ));
 }
 
 /// 反向对照：同一条 ACE 去掉 `INHERIT_ONLY` 立刻判放宽 —— 上一条的「放行」不是因为判据瞎了。
@@ -468,6 +476,13 @@ fn an_inherit_only_unparsed_ace_is_ignored() {
         flags: ACE_FLAG_INHERIT_ONLY,
     });
     assert_eq!(judge_object(PATH_DIR, &sec), vec![]);
+    assert!(matches!(
+        &judge_child_inheritance(PATH_DIR, &sec)[..],
+        [AclFinding {
+            issue: AclIssue::UnparsedAce { ace_type: 9 },
+            ..
+        }]
+    ));
 }
 
 // ===== 定位信息 =====

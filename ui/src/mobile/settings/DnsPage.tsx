@@ -547,7 +547,10 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
                   entryIds={customUpstreams.map((item) => item.id)}
                   entryContextKey={JSON.stringify(racePool)}
                   onChange={commitCustomUpstreams}
-                  onValidate={(next) => setInvalidCustom(next.filter((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec)))}
+                  onValidate={(next) => {
+                    setCustomInventoryError(null);
+                    setInvalidCustom(next.filter((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec)));
+                  }}
                   entryIdentity={dnsUpstreamIdentity}
                   placeholder="https://1.1.1.1/dns-query"
                   ariaLabel={t('settings.dns.addCustomDoh')}

@@ -105,8 +105,8 @@ impl PreparedExecution {
     pub fn spawn_windows_main(
         &self,
         config: File,
-        cwd: &Path,
         runtime_directory: &Path,
+        resource_directory: &Path,
     ) -> Result<WindowsStartedChild, AdmissionError> {
         // Serialize queued-plan recheck through ResumeThread with replacement/
         // retirement. No future may outlive this gate by retaining a Command.
@@ -126,9 +126,9 @@ impl PreparedExecution {
         issuer::spawn(
             cohort,
             config,
-            cwd,
+            runtime_directory,
             ExecPurpose::RunMain,
-            Some(runtime_directory),
+            Some((runtime_directory, resource_directory)),
         )
     }
 }

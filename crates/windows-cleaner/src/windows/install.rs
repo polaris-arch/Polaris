@@ -1884,6 +1884,18 @@ impl Ops for Installer {
             OsStr::new("--source-owner"),
             OsStr::new(&format!("s{}", self.request.original_sid)),
         ])?;
+        // prepare may have just created Polaris and its core root, and core-install
+        // flushes only inside the root on Windows. The utility's strict chain is
+        // released now, so persist both directory entries with our own write handle.
+        for directory in [SUPPORT, r"C:\ProgramData\Polaris\core"] {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(directory)?
+                .sync_all()?;
+        }
         Ok(())
     }
     fn selection(&mut self) -> io::Result<Selection> {
@@ -1994,14 +2006,28 @@ impl Ops for Installer {
     fn replace_payload(&mut self) -> io::Result<()> {
         self.files
             .replace_payload(&self.request.helper_sha256, &self.request.cleaner_sha256)?;
-        self.checked(&[
+        let record = self.checked(&[
             OsStr::new("helper-record"),
             OsStr::new("--binary"),
             OsStr::new(BINARY),
             OsStr::new("--metadata"),
             OsStr::new(r"C:\ProgramData\Polaris\helper-installed.json"),
         ])?;
-        Ok(())
+        // The utility only emits the receipt. With its strict chain released,
+        // publish atomically like a rollback: private temporary + ReplaceFileW,
+        // then seal and verify; an interruption never leaves a truncated receipt.
+        let backup = self.tx()?.join("helper-installed.json");
+        create_private_file(&backup, record.as_bytes())?;
+        self.files.restore_snapshot(
+            &Snapshot {
+                path: self.files.support_path.join("helper-installed.json"),
+                backup,
+                present: true,
+                hash: Some(hex::encode(sha2::Sha256::digest(record.as_bytes()))),
+                sddl: None,
+            },
+            false,
+        )
     }
     // SAFETY: fresh-only state-machine branch, fixed service/account/command;
     // the exact returned SCM object owns every subsequent config/rollback call.

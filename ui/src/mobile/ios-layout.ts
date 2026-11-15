@@ -1,6 +1,6 @@
 /** UIKit regions use physical WebView points. These helpers never partition the scroll/list DOM. */
 export interface LayoutRect { x: number; y: number; width: number; height: number }
-export interface ReservedRegion extends LayoutRect { kind: 'division' | 'occlusion' }
+export interface ReservedRegion extends LayoutRect { kind: 'division' | 'occlusion'; orientation?: 'horizontal' | 'vertical' }
 export interface IosViewportValue {
   width: number;
   height: number;
@@ -17,6 +17,7 @@ export interface IosViewportFrame extends LayoutRect { scale: number }
 declare global {
   interface Window {
     __polarisIosViewport?: { value: IosViewportValue; sequence: number };
+    __polarisAndroidViewport?: { value: IosViewportValue; sequence: number };
   }
 }
 
@@ -41,6 +42,44 @@ export function readIosViewport(value: unknown): IosViewportValue | null {
   return { width: v.width, height: v.height, ...insets,
     verticalBarSide: v.verticalBarSide === 'left' || v.verticalBarSide === 'right' ? v.verticalBarSide : 'unspecified',
     reservedRegions };
+}
+
+/** Active native divisions share the existing reserved-region CSS coordinates,
+ * including visual viewport offsets/zoom, before navigation and page padding. */
+export function applyNativeFoldLayout(value: IosViewportValue | null): void {
+  const root = document.documentElement;
+  const visual = window.visualViewport;
+  const viewport: IosViewportFrame = { x: visual?.offsetLeft ?? 0, y: visual?.offsetTop ?? 0,
+    width: visual?.width ?? window.innerWidth, height: visual?.height ?? window.innerHeight, scale: visual?.scale || 1 };
+  const division = value ? iosRegionsInCss(value, root.clientWidth, viewport).find((r) => r.kind === 'division') : undefined;
+  const factor = value ? root.clientWidth / value.width / viewport.scale : 0;
+  const horizontal = division && (division.orientation === 'horizontal' ||
+    (division.orientation !== 'vertical' && division.width > division.height));
+  const origin = horizontal ? viewport.y : viewport.x;
+  const start = division ? horizontal ? division.y : division.x : 0;
+  const gap = division ? horizontal ? division.height : division.width : 0;
+  const limit = value ? origin + (horizontal ? value.height : value.width) * factor : 0;
+  const posture = division && finite(factor) && factor > 0 && finite(start) && finite(gap) && finite(limit) && start > origin && start + gap < limit
+    ? horizontal ? 'tabletop' : 'book' : '';
+  const previous = `${root.dataset.foldPosture ?? ''}:${root.style.getPropertyValue('--fold-start')}:${root.style.getPropertyValue('--fold-end')}`;
+  if (posture) {
+    root.dataset.foldPosture = posture;
+    root.style.setProperty('--fold-start', `${start}px`);
+    root.style.setProperty('--fold-end', `${start + gap}px`);
+    root.style.setProperty('--fold-gap', `${gap}px`);
+  } else {
+    delete root.dataset.foldPosture;
+    for (const key of ['--fold-start', '--fold-end', '--fold-gap']) root.style.removeProperty(key);
+  }
+  const next = `${root.dataset.foldPosture ?? ''}:${root.style.getPropertyValue('--fold-start')}:${root.style.getPropertyValue('--fold-end')}`;
+  if (next !== previous) window.dispatchEvent(new Event('polaris-fold-layout-change'));
+}
+
+/** Android publishes HALF_OPENED divisions in WebView pixels, through the same
+ * raw viewport shape as UIKit. No native report means ordinary window layout. */
+export function installAndroidFoldLayout(): () => void {
+  if (document.documentElement.dataset.mobileOs !== 'android') return () => {};
+  return installNativeLayout(false);
 }
 
 /** Recompute from raw UIKit points after WebKit settles or zooms, even at the
@@ -69,7 +108,7 @@ export function refreshNativeViewportCss(): { width: number; height: number } | 
 export function iosRegionsInCss(value: IosViewportValue, layoutWidth: number, viewport: IosViewportFrame): ReservedRegion[] {
   const factor = layoutWidth / value.width / viewport.scale;
   if (!finite(factor) || factor <= 0) return [];
-  return value.reservedRegions.map((r) => ({ kind: r.kind,
+  return value.reservedRegions.map((r) => ({ ...r,
     x: viewport.x + r.x * factor, y: viewport.y + r.y * factor,
     width: r.width * factor, height: r.height * factor }));
 }
@@ -131,7 +170,7 @@ export function avoidReserved(
   return candidates.find((c) => !regions.some((r) => intersectsReserved(c.frame, r))) ?? null;
 }
 
-const TARGETS = '.m-nav,.m-pending-slot,.m-toast-host,.h-sheet,.mn-sheet,.m-form-panel';
+const TARGETS = '.m-nav,.m-pending-slot,.m-toast-host,.h-sheet,.mn-sheet,.m-form-panel,.m-select-panel';
 const OWNED = ['--ios-region-left', '--ios-region-top', '--ios-region-bottom', '--ios-region-width', '--ios-region-height', '--ios-region-align'];
 const rectOf = (el: Element): LayoutRect => {
   const r = el.getBoundingClientRect();
@@ -147,7 +186,13 @@ const actionRect = (el: HTMLElement): LayoutRect => {
 /** Install only on the native iOS entry. All adjustment stays in existing nodes and containing blocks. */
 export function installIosLayout(onApplied: () => void = () => {}): () => void {
   if (document.documentElement.dataset.mobileOs !== 'ios') return () => {};
+  return installNativeLayout(true, onApplied);
+}
+
+/** Native chrome/panels share avoidance; connect-action repair remains iOS-only. */
+function installNativeLayout(ios: boolean, onApplied: () => void = () => {}): () => void {
   const root = document.documentElement;
+  const event = ios ? 'polaris-ios-viewport-change' : 'polaris-android-viewport-change';
   const tracked = new Set<HTMLElement>();
   let raf = 0, disposed = false, nativeSequence = -1, critical = false;
   let criticalRow: HTMLElement | null = null;
@@ -164,7 +209,7 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
   };
   const resize = new ResizeObserver(schedule);
   const refreshTargets = (): void => {
-    const next = new Set(document.querySelectorAll<HTMLElement>(TARGETS));
+    const next = new Set(document.querySelectorAll<HTMLElement>(ios ? TARGETS : '.m-nav,.m-pending-slot,.m-form-panel,.m-select-panel'));
     for (const el of tracked) if (!next.has(el)) { resize.unobserve(el); clear(el); tracked.delete(el); }
     for (const el of next) if (!tracked.has(el)) { tracked.add(el); resize.observe(el); }
   };
@@ -176,14 +221,15 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
   function update(): void {
     raf = 0;
     if (disposed) return;
-    const snapshot = window.__polarisIosViewport;
+    const snapshot = ios ? window.__polarisIosViewport : window.__polarisAndroidViewport;
     if (snapshot && snapshot.sequence < nativeSequence) return;
-    const value = root.dataset.iosLayoutSource === 'uikit-viewport' ? readIosViewport(snapshot?.value) : null;
-    refreshNativeViewportCss();
-    if (snapshot && snapshot.sequence !== nativeSequence) { nativeSequence = snapshot.sequence; critical = true; }
+    const value = !ios || root.dataset.iosLayoutSource === 'uikit-viewport' ? readIosViewport(snapshot?.value) : null;
+    applyNativeFoldLayout(value);
+    if (ios) refreshNativeViewportCss();
+    if (snapshot && snapshot.sequence !== nativeSequence) { nativeSequence = snapshot.sequence; critical = ios; }
     const visual = window.visualViewport;
     const scale = visual?.scale || 1;
-    const nativeBottom = Number.parseFloat(getComputedStyle(root).getPropertyValue('--ios-keyboard-visible-bottom'));
+    const nativeBottom = ios ? Number.parseFloat(getComputedStyle(root).getPropertyValue('--ios-keyboard-visible-bottom')) : NaN;
     const viewport: IosViewportFrame = { x: visual?.offsetLeft ?? 0, y: visual?.offsetTop ?? 0,
       width: visual?.width ?? window.innerWidth,
       height: Math.max(0, Math.min(visual?.height ?? window.innerHeight, Number.isFinite(nativeBottom) ? nativeBottom / scale : Infinity)), scale };
@@ -205,7 +251,7 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
       if (!target.width || !target.height || !regions.some((r) => intersectsReserved(target, r))) continue;
       const isNav = el.matches('.m-nav'), isPending = el.matches('.m-pending-slot');
       const rail = isNav && getComputedStyle(el).flexDirection === 'column';
-      const owner = el.matches('.m-form-panel,.mn-sheet') ? el.parentElement
+      const owner = el.matches('.m-form-panel,.mn-sheet,.m-select-panel') ? el.parentElement
         : el.closest<HTMLElement>('.m-scroll') ?? document.querySelector<HTMLElement>('.m-scroll');
       let bounds = owner ? intersectRects(rectOf(owner), viewport) : null;
       if (bounds && el.matches('.mn-sheet')) {
@@ -219,18 +265,20 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
             : Math.min(bottom(target), bottom(viewport)) - viewport.y };
       }
       if (!bounds) { el.dataset.iosReservedUnresolved = 'true'; continue; }
-      if (el.matches('.m-form-panel')) {
+      if (el.matches('.m-form-panel,.m-select-panel')) {
         const style = getComputedStyle(owner!);
         const top = Number.parseFloat(style.paddingTop) || 0, low = Number.parseFloat(style.paddingBottom) || 0;
         bounds = { ...bounds, y: bounds.y + top, height: Math.max(0, bounds.height - top - low) };
       }
       const panel = el.matches('.m-form-panel');
+      const select = el.matches('.m-select-panel');
       const panelStyle = getComputedStyle(el);
       const footer = panel ? el.querySelector<HTMLElement>('.m-form-foot') : null;
       const buttons = footer?.querySelectorAll('button').length ?? 0;
       const padding = (Number.parseFloat(panelStyle.paddingLeft) || 0) + (Number.parseFloat(panelStyle.paddingRight) || 0);
       const gap = footer ? Number.parseFloat(getComputedStyle(footer).gap) || 0 : 0;
-      const minimumWidth = rail ? target.width : panel ? Math.min(target.width, padding + buttons * 48 + Math.max(0, buttons - 1) * gap) : Math.min(48, target.width);
+      const minimumWidth = rail ? target.width : panel ? Math.min(target.width, padding + buttons * 48 + Math.max(0, buttons - 1) * gap)
+        : select ? Math.min(target.width, padding + 48) : Math.min(48, target.width);
       const minimumHeight = Math.max(Math.min(48, target.height), Number.parseFloat(panelStyle.minHeight) || 0);
       const result = avoidReserved(target, bounds, regions, { width: minimumWidth, height: minimumHeight });
       if (!result) { el.dataset.iosReservedUnresolved = 'true'; continue; }
@@ -244,7 +292,7 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
       const bottomAnchor = fixedOwner ? bottom(target) + (Number.parseFloat(panelStyle.bottom) || 0) : bottom(origin);
       el.style.setProperty('--ios-region-left', `${Math.max(0, frame.x - (isNav || isPending ? target.x : leftAnchor))}px`);
       el.style.setProperty('--ios-region-top', `${Math.max(0, frame.y - target.y)}px`);
-      const anchorBottom = isNav || isPending ? bottom(target) : panel ? bottom(bounds) : bottomAnchor;
+      const anchorBottom = isNav || isPending ? bottom(target) : panel && ios ? bottom(bounds) : bottomAnchor;
       el.style.setProperty('--ios-region-bottom', `${Math.max(0, anchorBottom - bottom(frame))}px`);
       el.style.setProperty('--ios-region-width', `${frame.width}px`);
       el.style.setProperty('--ios-region-height', `${available.height}px`);
@@ -259,7 +307,7 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
       }
       changed = true;
     }
-    if (critical && regions.length && !document.querySelector('.m-form-panel,.h-sheet,.mn-sheet')) {
+    if (ios && critical && regions.length && !document.querySelector('.m-form-panel,.m-select-panel,.h-sheet,.mn-sheet')) {
       const action = document.querySelector<HTMLElement>('[data-write-control="connect"]');
       const scroller = action?.closest<HTMLElement>('.m-scroll');
       if (action && scroller) {
@@ -310,10 +358,10 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
     if (changed) onApplied();
   }
   const focus = (event: FocusEvent): void => {
-    if (event.target instanceof Element && event.target.closest('[data-write-control="connect"]')) critical = true;
+    if (ios && event.target instanceof Element && event.target.closest('[data-write-control="connect"]')) critical = true;
     schedule();
   };
-  window.addEventListener('polaris-ios-viewport-change', schedule);
+  window.addEventListener(event, schedule);
   window.addEventListener('resize', schedule);
   window.visualViewport?.addEventListener('resize', schedule);
   window.visualViewport?.addEventListener('scroll', schedule);
@@ -326,10 +374,11 @@ export function installIosLayout(onApplied: () => void = () => {}): () => void {
     for (const el of tracked) clear(el);
     if (criticalRow) clear(criticalRow);
     if (criticalAction) delete criticalAction.dataset.iosReservedUnresolved;
-    window.removeEventListener('polaris-ios-viewport-change', schedule);
+    window.removeEventListener(event, schedule);
     window.removeEventListener('resize', schedule);
     window.visualViewport?.removeEventListener('resize', schedule);
     window.visualViewport?.removeEventListener('scroll', schedule);
     document.removeEventListener('focusin', focus);
+    applyNativeFoldLayout(null);
   };
 }

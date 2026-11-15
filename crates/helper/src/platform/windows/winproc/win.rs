@@ -7,7 +7,7 @@
 //（OpenProcess/TerminateProcess/CreateProcessW/...）必须 unsafe。每处 unsafe 块附 SAFETY 理由。
 use crate::platform::windows::coreacl::{self, ObjectSecurity};
 use crate::platform::windows::logic::{
-    eq_ignore_ascii_case_path, filepath_base, filepath_dir, filter_listen_pids, is_locked_singbox,
+    eq_ignore_ascii_case_path, filepath_base, filter_listen_pids, is_locked_singbox,
     local_port_from_net_order, AF_INET, AF_INET6, MIB_TCP_STATE_LISTEN,
     TCP_TABLE_OWNER_PID_LISTENER,
 };
@@ -133,6 +133,7 @@ struct ManagedChild {
     kill_requested: bool,
     log_custody: Option<polaris_log_budget::PipeLogCustody>,
     _execution_custody: polaris_core_supervisor::admitted_payload::WindowsChildCustody,
+    _runtime_directory: RuntimeDirectory,
 }
 
 /// Windows FFI 生产实现（对应 Go `winproc.go` 全部原语）。
@@ -157,12 +158,66 @@ impl WinProcOps {
     }
 }
 
-/// Lifetime ends only after CreateProcess has inherited the exact file and
-/// opened original CWD. Prefix handles deny rename while resolving descendants.
+/// Lifetime ends only after CreateProcess has inherited the exact file.
+/// Prefix handles deny rename while resolving descendants.
 struct ConfinedConfig {
     file: File,
-    runtime_directory: PathBuf,
+    config_directory: PathBuf,
     _directories: Vec<File>,
+}
+
+#[derive(Debug)]
+struct RuntimeDirectory {
+    path: PathBuf,
+    _directories: Vec<File>,
+}
+
+fn open_runtime_directory(
+    support_dir: &str,
+    owner: &polaris_helper_proto::core_protocol::CallerIdentity,
+) -> std::io::Result<RuntimeDirectory> {
+    let support = Path::new(support_dir);
+    if !support.is_absolute() {
+        return Err(std::io::Error::other(
+            "absolute helper support directory required",
+        ));
+    }
+    let users = support.join("users");
+    let user = users.join(owner.key());
+    let mut directories = Vec::new();
+    // The admitted factory already holds support's OS-managed ancestors. These
+    // exact descendants stay pinned beside the child until native retirement.
+    for path in [support, users.as_path(), user.as_path()] {
+        let held = open_directory_no_reparse(path)?;
+        let security = file_security(&held)?;
+        if !coreacl::judge_object("runtime-ancestor", &security).is_empty()
+            || (path == user.as_path()
+                && !coreacl::judge_child_inheritance("runtime-parent", &security).is_empty())
+        {
+            return Err(std::io::Error::other(
+                "untrusted runtime directory parent ACL",
+            ));
+        }
+        directories.push(held);
+    }
+    let path = user.join("runtime");
+    match std::fs::create_dir(&path) {
+        Ok(()) => seal_store_object(&path, false)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let held = open_directory_no_reparse(&path)?;
+    let security = file_security(&held)?;
+    if !coreacl::judge_object("runtime", &security).is_empty()
+        || !coreacl::judge_child_inheritance("runtime-children", &security).is_empty()
+    {
+        return Err(std::io::Error::other("untrusted runtime directory ACL"));
+    }
+    directories.push(held);
+    Ok(RuntimeDirectory {
+        path,
+        _directories: directories,
+    })
 }
 
 fn open_confined_config(
@@ -229,7 +284,7 @@ fn open_confined_config(
     }
     Ok(ConfinedConfig {
         file,
-        runtime_directory: PathBuf::from(registered),
+        config_directory: PathBuf::from(registered),
         _directories: directories,
     })
 }
@@ -355,11 +410,11 @@ impl WinProcOps {
     fn spawn_tracked(
         &self,
         singbox_bin: &str,
-        cfg: &str,
         log_path: &str,
-        _fwd: bool,
         birth: HelperBirthToken,
         config: ConfinedConfig,
+        support_dir: &str,
+        owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
         use polaris_core_supervisor::admitted_payload::{
             admit_selected, ExecPurpose, UntrustedPayload,
@@ -385,9 +440,10 @@ impl WinProcOps {
         // Bytes remain same-account mutable; this is not a frozen snapshot.
         let ConfinedConfig {
             file,
-            runtime_directory,
+            config_directory,
             _directories,
         } = config;
+        let runtime_directory = open_runtime_directory(support_dir, owner)?;
         // SYSTEM helper 必须在 spawn 前固定日志对象。每级目录 handle 都拒绝 reparse 且不共享
         // DELETE，直到 current/.1 两个 file object 都打开；之后轮转只操作这两个 handle。
         // 安全打开失败只关闭日志能力，pipe 仍会被排空，不阻断核心启动。
@@ -402,14 +458,11 @@ impl WinProcOps {
                 }
             }
         };
-        // Preserve the registered configuration CWD for relative data paths;
-        // native loader selection and the cleared environment are factory-owned.
-        let cwd =
-            filepath_dir(cfg).ok_or_else(|| std::io::Error::other("configuration CWD required"))?;
         let process_started = Instant::now();
         // The factory fixes the admitted image, argv, cleared environment,
         // physical guards and fail-stop job before the first instruction.
-        let child = execution.spawn_windows_main(file, Path::new(&cwd), &runtime_directory)?;
+        let child =
+            execution.spawn_windows_main(file, &runtime_directory.path, &config_directory)?;
         let process_ms = crate::elapsed_ms(process_started);
         let (pid, handle, stdout, stderr, execution_custody) = child.into_parts();
         let stdout = Some(stdout);
@@ -432,6 +485,7 @@ impl WinProcOps {
             kill_requested: false,
             log_custody: None,
             _execution_custody: execution_custody,
+            _runtime_directory: runtime_directory,
         });
         // Native job membership was mandatory and atomic inside the factory.
         let job_ms = 0;
@@ -621,10 +675,11 @@ impl ProcOps for WinProcOps {
         params: &StartParams,
         birth: HelperBirthToken,
         conf_dir: &str,
+        support_dir: &str,
         owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
         let config = open_confined_config(&params.cfg, conf_dir, owner)?;
-        self.spawn_tracked(bin, &params.cfg, &params.log, params.fwd, birth, config)
+        self.spawn_tracked(bin, &params.log, birth, config, support_dir, owner)
     }
 
     fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
@@ -640,7 +695,11 @@ impl ProcOps for WinProcOps {
         native_wait(child, 0)
     }
 
-    fn stop_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+    fn stop_native_child(
+        &self,
+        target: HelperBirthTarget,
+        owner: Option<&polaris_helper_proto::core_protocol::CallerIdentity>,
+    ) -> NativeChildPoll {
         let Ok(mut guard) = self.managed.lock() else {
             return NativeChildPoll::Unknown;
         };
@@ -654,6 +713,8 @@ impl ProcOps for WinProcOps {
         if first != NativeChildPoll::Running {
             return first;
         }
+        // 停核记录与起核/退役同属该内核属主，其他用户经 helper-logs 不可见。
+        let owner = owner.map(polaris_helper_proto::core_protocol::CallerIdentity::key);
         let term_sent = std::time::Instant::now();
         if !child.term_requested {
             // The HANDLE remains owned and unreaped while sending this compatibility signal.
@@ -661,10 +722,15 @@ impl ProcOps for WinProcOps {
             if send_ctrl_break(child.pid).is_err() {
                 let _ = send_ctrl_break_via_child_console(child.pid);
             }
-            log::info!("core stop requested: CTRL_BREAK sent pid={}", child.pid);
+            log::info!(
+                owner = owner.as_deref();
+                "core stop requested: CTRL_BREAK sent pid={}",
+                child.pid
+            );
             let graceful = native_wait(child, 2000);
             if graceful != NativeChildPoll::Running {
                 log::info!(
+                    owner = owner.as_deref();
                     "core stop after CTRL_BREAK pid={} {graceful:?} term_to_exit_ms={}",
                     child.pid,
                     term_sent.elapsed().as_millis()
@@ -674,7 +740,11 @@ impl ProcOps for WinProcOps {
         }
         if !child.kill_requested {
             if terminate_handle(child.handle.as_raw_handle().cast()).is_err() {
-                log::warn!("core stop TerminateProcess unconfirmed pid={}", child.pid);
+                log::warn!(
+                    owner = owner.as_deref();
+                    "core stop TerminateProcess unconfirmed pid={}",
+                    child.pid
+                );
                 return match native_wait(child, 0) {
                     NativeChildPoll::Exited => NativeChildPoll::Exited,
                     _ => NativeChildPoll::Unknown,
@@ -682,6 +752,7 @@ impl ProcOps for WinProcOps {
             }
             child.kill_requested = true;
             log::info!(
+                owner = owner.as_deref();
                 "core stop grace expired: TerminateProcess sent pid={} ms={}",
                 child.pid,
                 term_sent.elapsed().as_millis()

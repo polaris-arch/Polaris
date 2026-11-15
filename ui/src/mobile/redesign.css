@@ -30,7 +30,7 @@
 .m-shell .mn-act.primary:active::before { background: hsl(var(--flow) / .18); }
 .m-form-layer button.m-form-btn:active { opacity: 1; }
 .m-form-layer .m-form-btn:not(.primary):not(.danger):active::before { background: hsl(var(--surface-2)); }
-.m-form-layer .m-form-btn.primary:active::before { background: hsl(var(--flow)); border-color: hsl(var(--fg) / .35); }
+.m-form-layer .m-form-btn.primary:active::before { background: hsl(var(--mobile-action-fill)); border-color: hsl(var(--fg) / .35); }
 .m-form-layer .m-form-btn.danger:active::before { background: hsl(var(--err)); border-color: hsl(var(--bg) / .35); }
 .m-form-layer .m-form-seg > button.on:active::before { background: hsl(var(--surface-2)); }
 .m-shell button.m-pending-btn:not(:disabled):active { opacity: 1; }
@@ -49,12 +49,12 @@
   border: 0; background: transparent; color: #00141d; font: 600 var(--mobile-control-font)/1.2 var(--sans);
   white-space: nowrap; cursor: pointer;
 }
-.h-connect-action::before { content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0; border: 1px solid transparent; border-radius: 8px; background: hsl(var(--flow)); }
+.h-connect-action::before { content: ''; position: absolute; z-index: -1; inset: var(--mobile-action-inset) 0; border: 1px solid transparent; border-radius: 8px; background: hsl(var(--mobile-action-fill)); }
 .h-connect-action .h-acticon { width: 17px; height: 17px; }
 .h-connect-action.is-disconnect { color: hsl(var(--err)); }
 .h-connect-action.is-disconnect::before { border-color: hsl(var(--err) / .38); background: hsl(var(--surface)); }
 .m-shell button.h-connect-action.is-connect:not(:disabled):active { opacity: 1; }
-.h-connect-action.is-connect:not(:disabled):active::before { background: hsl(var(--flow)); border-color: hsl(var(--fg) / .35); }
+.h-connect-action.is-connect:not(:disabled):active::before { background: hsl(var(--mobile-action-fill)); border-color: hsl(var(--fg) / .35); }
 .h-connect-action.is-disconnect:not(:disabled):active::before { background: hsl(var(--err-weak)); }
 .h-connect-action:disabled { opacity: .62; cursor: default; }
 .h-connect-action:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
@@ -77,6 +77,21 @@
   border-color: hsl(var(--err) / .22);
 }
 .h-card { padding: 14px; border-radius: 10px; box-shadow: none; }
+/* Content containers share the desktop card finish; inner sections stay flat. */
+.h-connection-panel, .h-statistics-panel, .h-flow > .h-card,
+.mn-sub, .mn-list, .m-shell .mr-screen .mr-card, .mr-screen .mr-list, .mr-screen .mr-flow,
+.mc .mc-body[data-segment='overview'], .mc .mc-logview,
+.ms-flow .ms-card { box-shadow: var(--shadow-card); }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) :is(.h-connection-panel, .h-statistics-panel, .h-statistics-left, .h-statistics-panel > .h-card, .h-flow > .h-card,
+    .mn-sub, .mn-list, .mr-screen .mr-card, .mr-screen .mr-list, .mr-screen .mr-flow,
+    .mc .mc-body[data-segment='overview'], .mc .mc-logview) { border-color: hsl(var(--hair)); }
+  :root:not([data-theme='dark']) .ms-flow .ms-card { border-color: hsl(var(--hair)) !important; }
+}
+:root[data-theme='light'] :is(.h-connection-panel, .h-statistics-panel, .h-statistics-left, .h-statistics-panel > .h-card, .h-flow > .h-card,
+  .mn-sub, .mn-list, .mr-screen .mr-card, .mr-screen .mr-list, .mr-screen .mr-flow,
+  .mc .mc-body[data-segment='overview'], .mc .mc-logview) { border-color: hsl(var(--hair)); }
+:root[data-theme='light'] .ms-flow .ms-card { border-color: hsl(var(--hair)) !important; }
 .h-cardhead { margin-bottom: 8px; }
 .h-cardtitle { font-size: .875rem; font-weight: 650; }
 .h-flag { width: 34px; height: 34px; border-radius: 8px; }
@@ -184,11 +199,11 @@
   .h-connection-panel > .h-card { border-top: 0; border-radius: 0 10px 10px 0; }
   /* Statistics groups keep their natural heights; the longer TOP list must not
      stretch the chart/composition background into an empty matching column. */
-  .h-statistics-panel { align-items: start; gap: 16px; border: 0; border-radius: 0; background: transparent; }
-  .h-statistics-left { border: 1px solid hsl(var(--line)); border-radius: 10px; background: hsl(var(--surface)); }
+  .h-statistics-panel { align-items: start; gap: 16px; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+  .h-statistics-left { border: 1px solid hsl(var(--line)); border-radius: 10px; background: hsl(var(--surface)); box-shadow: var(--shadow-card); }
   .h-statistics-left > .h-card:first-child { border-radius: 10px 10px 0 0; }
   .h-statistics-left > .h-card:last-child { border-radius: 0 0 10px 10px; }
-  .h-statistics-panel > .h-card { border: 1px solid hsl(var(--line)); border-radius: 10px; }
+  .h-statistics-panel > .h-card { border: 1px solid hsl(var(--line)); border-radius: 10px; box-shadow: var(--shadow-card); }
 }
 
 /* Node rows are a continuous list, with origin tabs as compact navigation. */
@@ -314,7 +329,7 @@
 .h-emptyact { color: hsl(var(--fg)); }
 .m-settings-btn.primary, .m-form-btn.primary, .h-sheetsubmit { font-weight: 600; }
 .m-settings-btn.primary { color: #00141d; }
-.m-settings-btn.primary::before, .h-sheetsubmit::before { border-color: transparent; background: hsl(var(--flow)); }
+.m-settings-btn.primary::before, .h-sheetsubmit::before { border-color: transparent; background: hsl(var(--mobile-action-fill)); }
 .m-settings-btn:disabled { opacity: .5; cursor: default; }
 .m-settings-btn:focus-visible, .m-settings-list-remove:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
 .m-shell .m-settings-btn:not(.primary):not(:disabled):active::before,
@@ -332,7 +347,7 @@
   background: hsl(var(--surface-2));
 }
 .m-form-btn.primary { background: transparent; color: #00141d; box-shadow: none; }
-.m-form-btn.primary::before { border-color: transparent; background: hsl(var(--flow)); }
+.m-form-btn.primary::before { border-color: transparent; background: hsl(var(--mobile-action-fill)); }
 .m-form-btn.danger { background: transparent; color: hsl(var(--bg)); }
 .m-form-btn.danger::before { border-color: transparent; background: hsl(var(--err)); }
 .m-form-row { gap: 4px; }

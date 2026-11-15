@@ -65,7 +65,7 @@ pub(super) fn stop_locked<P: ProcOps>(
         };
     }
     current.stopping = true;
-    match proc.stop_native_child(requested) {
+    match proc.stop_native_child(requested, current.owner.as_ref()) {
         NativeChildPoll::Exited if cache_exit(state, proc, requested) => {
             NativeBirthStop::Stopped { target: requested }
         }
@@ -303,6 +303,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                 p,
                 birth,
                 conf_dir,
+                &self.support_dir,
                 &peer.identity,
             ) {
                 Ok(started) => started,

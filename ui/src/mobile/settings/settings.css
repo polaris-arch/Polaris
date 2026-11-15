@@ -1,5 +1,5 @@
 /*
- * 设置屏的**两列列流**（K5-02）。
+ * 设置屏的分类 / 详情布局与分组列流。
  *
  * # 为什么是屏级 CSS，而不是继续走内联
  *
@@ -33,6 +33,25 @@
   flex-direction: column;
   gap: var(--section-gap);
 }
+
+/* Keep both page shells in place so resizing never reparents an active editor. */
+.ms-layout { min-width: 0; width: var(--settings-fold-width, 100%); margin-left: var(--settings-fold-offset, 0px); margin-right: auto; }
+.ms-categories, .ms-detail { min-width: 0; }
+.ms-layout > [hidden] { display: none; }
+.m-shell[data-settings-layout='split'] .m-scroll { overflow: hidden; }
+.m-shell[data-settings-layout='split'] .m-page { height: 100%; }
+.ms-layout[data-split='true'] {
+  display: grid;
+  grid-template-columns: var(--settings-fold-columns, minmax(12rem, 16rem) minmax(0, 1fr));
+  gap: var(--settings-fold-gap, var(--sp-6));
+  height: 100%;
+  min-height: 0;
+}
+.ms-layout[data-split='true'] > section { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+:root[dir='rtl'][data-fold-posture='book'] .ms-layout[data-split='true'] > .ms-categories { grid-column: 2; grid-row: 1; }
+:root[dir='rtl'][data-fold-posture='book'] .ms-layout[data-split='true'] > .ms-detail { grid-column: 1; grid-row: 1; }
+.ms-layout[data-split='true'] .ms-flow { display: flex; flex-direction: column; column-count: auto; width: 100%; margin-inline: 0; }
+.ms-layout[data-split='true'] .ms-card { margin-bottom: 0; }
 
 /*
  * 一张卡不许被列断开：跨两列的卡读起来是两张残卡，而这里的每张卡都是一个语义分组。

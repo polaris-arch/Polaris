@@ -616,7 +616,10 @@ fn generate_base_config(
                 } else {
                     crate::singbox::DomainStrategy::Ipv4Only
                 },
-                timeout: crate::node_dns::LOOKUP_TIMEOUT.into(),
+                timeout: format!(
+                    "{}ms",
+                    2 * crate::builder::dns::lan_fallback_timeout_ms(&cfg)
+                ),
             });
         }
     }
@@ -854,6 +857,9 @@ fn prune_unresolved_dns_rule_sets(dns: &mut DnsConfig, defined: &BTreeSet<String
     };
     let mut pruned = BTreeSet::new();
     rules.retain_mut(|rule| retain_defined_dns_rule_sets(rule, defined, &mut pruned));
+    if !pruned.is_empty() {
+        crate::builder::dns::retain_bound_responds(rules);
+    }
     pruned.into_iter().collect()
 }
 

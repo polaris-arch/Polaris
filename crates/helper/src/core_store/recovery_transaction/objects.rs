@@ -146,23 +146,14 @@ impl<'a> Namespace<'a> {
         }
         #[cfg(windows)]
         {
-            use crate::platform::windows::coreacl::judge_object;
+            use crate::platform::windows::coreacl::{judge_child_inheritance, judge_object};
             use crate::platform::windows::winproc::file_security;
             let security = file_security(&file)?;
             if !judge_object("repair-object", &security).is_empty() {
                 return Err(invalid("repair object ACL differs"));
             }
             if directory {
-                // A parent can be non-writable while an INHERIT_ONLY ACE would
-                // expose its new children before sealing. Reuse the existing
-                // ACL judge on that grant as effective; never rewrite the ACL.
-                let mut child_security = security;
-                if let Some(aces) = child_security.dacl.as_mut() {
-                    for ace in aces {
-                        ace.flags &= !crate::platform::windows::coreacl::ACE_FLAG_INHERIT_ONLY;
-                    }
-                }
-                if !judge_object("repair-child-inheritance", &child_security).is_empty() {
+                if !judge_child_inheritance("repair-child-inheritance", &security).is_empty() {
                     return Err(invalid("repair parent grants unsafe child writes"));
                 }
             }

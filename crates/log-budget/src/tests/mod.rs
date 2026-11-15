@@ -291,3 +291,115 @@ fn open_tightens_current_and_rotated_permissions() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[cfg(unix)]
+fn assert_fifo_operation_rejected(
+    fifo: &Path,
+    operation: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+) {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+    use std::time::Duration;
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || done_tx.send(operation()).unwrap());
+    let result = match done_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(result) => result,
+        Err(error) => {
+            // Unblock a regressed blocking open so the failing test leaves no stuck worker.
+            let _peer = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo);
+            worker.join().unwrap();
+            panic!("log operation blocked on FIFO: {error}");
+        }
+    };
+    worker.join().unwrap();
+    assert!(result.is_err(), "non-regular log object was accepted");
+    let metadata = std::fs::symlink_metadata(fifo).unwrap();
+    assert!(metadata.file_type().is_fifo());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+}
+
+#[cfg(unix)]
+#[test]
+fn path_opens_reject_fifo_without_peer_or_permission_changes() {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    for (label, operation) in [
+        (
+            "fresh",
+            (|path: &Path| RotatingFile::open(path, 8, OpenMode::Fresh).map(drop))
+                as fn(&Path) -> std::io::Result<()>,
+        ),
+        ("trim", |path| trim_file_to_tail(path, 8)),
+        ("append-no-reader", |path| open_append(path).map(drop)),
+        ("append-with-reader", |path| {
+            let _reader = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)?;
+            open_append(path).map(drop)
+        }),
+        ("read", |path| read_file_tail(path, 8).map(drop)),
+    ] {
+        let dir = temp_dir(label);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("core.log");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = fifo.clone();
+        assert_fifo_operation_rejected(&fifo, move || operation(&path));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn current_and_rotated_fifo_cannot_block_rotation_or_tail_reads() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    for replace_rotated in [false, true] {
+        let dir = temp_dir("rotate-fifo");
+        let path = dir.join("core.log");
+        let mut writer = RotatingFile::open(&path, 4, OpenMode::Append).unwrap();
+        writer.write_chunk(b"live").unwrap();
+        let fifo = if replace_rotated {
+            rotated_path(&path)
+        } else {
+            path.clone()
+        };
+        if fifo.exists() {
+            std::fs::remove_file(&fifo).unwrap();
+        }
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let fresh_path = path.clone();
+        assert_fifo_operation_rejected(&fifo, move || {
+            RotatingFile::open(&fresh_path, 4, OpenMode::Fresh).map(drop)
+        });
+        assert_fifo_operation_rejected(&fifo, move || writer.write_chunk(b"x"));
+
+        let regular = if replace_rotated {
+            path.clone()
+        } else {
+            rotated_path(&path)
+        };
+        std::fs::write(&regular, b"safe").unwrap();
+        assert_eq!(read_rotated_tail(&path, 16).unwrap(), b"safe");
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

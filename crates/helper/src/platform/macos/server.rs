@@ -344,6 +344,14 @@ pub fn process_connection_from_peer<R: Read, W: Write>(
         ));
         return write_response(&mut writer, &resp);
     }
+    // helper-logs 无参数行、只读日志环（自带锁），不进全局 `command_mu`：响应可达数十 KiB，
+    // 超出 AF_UNIX 发送缓冲时对端不读就会阻塞写，持锁写会让一个已鉴权连接卡住全部命令。
+    if command == polaris_helper_proto::command::common::HELPER_LOGS {
+        return write_response(
+            &mut writer,
+            &dispatch_from_peer(services, config, &token, &Request::HelperLogs, peer_uid),
+        );
+    }
 
     // Freeport's native-slot check and PID-based cleanup share Start's command lock.
     // Otherwise it could observe an empty slot, then kill a newly published owned Child.
@@ -900,16 +908,19 @@ mod sys {
                             Ok(w) => w,
                             Err(_) => return,
                         };
+                        // 读写共用同一请求预算：对端不读响应时，每次阻塞写至多等剩余预算（零预算
+                        // 设置失败即断开），不无限占住连接许可或命令锁。
+                        let budget = READ_TIMEOUT.saturating_sub(accepted_at.elapsed());
+                        if writer.set_write_timeout(Some(budget)).is_err() {
+                            return;
+                        }
                         // 对端 uid 由内核给出（`LOCAL_PEERCRED`）。token 仍是鉴权边界；uid 只用来
                         // 约束 install-core 的源文件属主。
                         let peer_uid = nix::unistd::getpeereid(&s)
                             .ok()
                             .map(|(uid, _gid)| uid.as_raw());
                         let _ = process_connection_from_peer(
-                            crate::line_io::DeadlineStream::new(
-                                s,
-                                READ_TIMEOUT.saturating_sub(accepted_at.elapsed()),
-                            ),
+                            crate::line_io::DeadlineStream::new(s, budget),
                             writer,
                             svc.as_ref(),
                             svc.config(),

@@ -76,11 +76,13 @@ fn exact_preopened_writer_revoke_leaves_open_pipe_draining_without_late_writes()
 fn writer_revoke_waits_for_in_progress_write_and_poison_stays_unknown() {
     let dir = temp_dir("custody-inflight-write");
     let path = dir.join("core.log");
-    let custody = PipeLogCustody {
-        writer: Arc::new(Mutex::new(Some(PipeLogWriter::Path(
-            RotatingFile::open(&path, 64, OpenMode::Append).unwrap(),
-        )))),
-    };
+    let custody = spawn_pipe_loggers_with_file::<std::io::Empty, std::io::Empty, _>(
+        None,
+        None,
+        &path,
+        64,
+        |_| {},
+    );
     let (held_tx, held_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();

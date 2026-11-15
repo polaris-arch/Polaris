@@ -55,7 +55,7 @@ async function fixture(options: { side?: string; dir?: string; platform?: string
     for (const edge of ['t','r','b','l']) document.documentElement.style.setProperty(`--safe-${edge}`, '0px');
     (window as unknown as { __polarisIosViewport: unknown }).__polarisIosViewport = { sequence: 1, value: { width: 800, height: 800, verticalBarSide: 'unspecified', reservedRegions: [] } };
   });
-  await page.addScriptTag({ type: 'module', content: `${runtime}\nimport.meta.hot = { dispose: (callback) => { window.__disposeLayout = callback; } };\nconst isTauri = () => true; const platform = () => ${JSON.stringify(options.platform ?? 'ios')};\n${entry}` });
+  await page.addScriptTag({ type: 'module', content: `${runtime}\nimport.meta.hot = { dispose: (callback) => { window.__disposeLayout = callback; } };\nconst isTauri = () => true; const platform = () => ${JSON.stringify(options.platform ?? 'ios')};\n${entry}\nif (platform() === 'android') import.meta.hot.dispose(installAndroidFoldLayout());` });
   await settle(page);
   return page;
 }
@@ -176,7 +176,7 @@ describe('local UIKit reserved-region consumption', () => {
     }
   });
 
-  it('a horizontal division shortens only the rail and preserves the same scroll node and position', async () => {
+  it('tabletop keeps content, pending actions and navigation above the fold without replacing the scroll node', async () => {
     const page = await fixture({ side: 'right' });
     try {
       const before = await page.locator('.m-scroll').boundingBox();
@@ -184,9 +184,60 @@ describe('local UIKit reserved-region consumption', () => {
       const value: ReservedRegion[] = [{ kind: 'division', x: 0, y: 400, width: 800, height: 0 }];
       await regions(page, value);
       expect(await overlaps(page, '.m-nav', value)).toBe(false);
-      expect(await page.locator('.m-scroll').boundingBox()).toEqual(before);
+      for (const selector of ['.m-shell', '.m-scroll', '.m-pending-slot', '.m-nav']) {
+        const bounds = (await page.locator(selector).boundingBox())!;
+        expect(bounds.y + bounds.height).toBeLessThanOrEqual(400);
+      }
+      expect(await page.locator('html').getAttribute('data-fold-posture')).toBe('tabletop');
       expect(await page.evaluate(() => (window as unknown as { savedScroll: Element }).savedScroll === document.querySelector('.m-scroll'))).toBe(true);
       expect(await page.locator('.m-scroll').evaluate((el) => el.scrollTop)).toBe(250);
+      await regions(page, []);
+      expect(await page.locator('html').getAttribute('data-fold-posture')).toBeNull();
+      expect(await page.locator('.m-scroll').boundingBox()).toEqual(before);
+    } finally { await page.close(); }
+  });
+
+  it.each(['ios','android'])('%s tabletop bounds existing overlays and lock controls while the opaque privacy scrim stays full screen', async (platform) => {
+    const page = await fixture({ platform, withForm: true });
+    try {
+      await page.setViewportSize({ width: 1100, height: 800 });
+      await page.evaluate((os) => {
+        document.body.insertAdjacentHTML('beforeend', '<div class="m-select-layer"><button>Select</button></div><div data-overlay="privacy-lock" style="position:fixed;inset:0;background:hsl(var(--bg));z-index:90"><div class="m-lock-viewport"><div class="m-lock-content"><input value="lock draft"></div></div></div>');
+        const snapshot = { sequence: 2, value: { width: 2200, height: 1600,
+          verticalBarSide: 'unspecified' as const,
+          reservedRegions: [{ kind: 'division' as const, x: 0, y: 780, width: 2200, height: 40 }] } };
+        if (os === 'ios') window.__polarisIosViewport = snapshot;
+        else window.__polarisAndroidViewport = snapshot;
+        window.dispatchEvent(new Event(`polaris-${os}-viewport-change`));
+      }, platform);
+      await settle(page);
+      expect(await page.locator('html').getAttribute('data-fold-posture')).toBe('tabletop');
+      for (const selector of ['.m-shell','.m-nav','.m-pending-slot','.m-form-layer','.m-select-layer','.m-lock-viewport']) {
+        const bounds = (await page.locator(selector).boundingBox())!;
+        expect(bounds.y + bounds.height).toBeLessThanOrEqual(390);
+      }
+      expect(await page.locator('[data-overlay="privacy-lock"]').boundingBox()).toEqual({ x: 0, y: 0, width: 1100, height: 800 });
+      await page.evaluate((os) => {
+        if (os === 'ios') {
+          window.__polarisIosViewport!.value.keyboardVisibleBottom = 600;
+          Object.defineProperty(window.visualViewport!, 'height', { configurable: true, get: () => 300 });
+        } else document.documentElement.style.setProperty('--m-vv-height', '300px');
+        window.dispatchEvent(new Event(`polaris-${os}-viewport-change`));
+      }, platform);
+      await settle(page);
+      for (const selector of ['.m-shell','.m-form-layer','.m-select-layer','.m-lock-viewport']) {
+        const bounds = (await page.locator(selector).boundingBox())!;
+        expect(bounds.y + bounds.height).toBeLessThanOrEqual(300);
+      }
+      await page.evaluate((os) => {
+        const snapshot = os === 'ios' ? window.__polarisIosViewport! : window.__polarisAndroidViewport!;
+        snapshot.value.reservedRegions = [];
+        snapshot.sequence += 1;
+        window.dispatchEvent(new Event(`polaris-${os}-viewport-change`));
+      }, platform);
+      await settle(page);
+      expect(await page.locator('html').getAttribute('data-fold-posture')).toBeNull();
+      expect(await page.locator('#draft').inputValue()).toBe('original');
     } finally { await page.close(); }
   });
 
@@ -446,11 +497,13 @@ describe('local UIKit reserved-region consumption', () => {
       const result = await page.evaluate(() => {
         const css = getComputedStyle(document.documentElement);
         return { top: css.getPropertyValue('--safe-t'), keyboard: css.getPropertyValue('--ios-keyboard-visible-bottom'),
+          fold: Number.parseFloat(css.getPropertyValue('--fold-start')),
           height: Number.parseFloat(css.getPropertyValue('--ios-form-viewport-height')),
           gap: Number.parseFloat(css.getPropertyValue('--ios-form-viewport-bottom-gap')) };
       });
       expect(result.top).toBe('62px');
       expect(result.keyboard).toBe('477px');
+      expect(result.fold).toBeCloseTo(mapped[0].x, 5);
       expect(result.height).toBeCloseTo(Math.min(446.96875, 477 / scale), 5);
       expect(result.gap).toBeCloseTo(874 / scale - result.height, 5);
       const panel = (await page.locator('.m-form-panel').boundingBox())!;

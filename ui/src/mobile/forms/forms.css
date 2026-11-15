@@ -606,53 +606,61 @@
 
 /* The same panel and draft remain mounted. Its own free region can be smaller
  * than the full keyboard layer, so short-panel behavior follows that region. */
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-adjusted] {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-adjusted] {
   width: var(--ios-region-width);
   max-height: var(--ios-region-height);
   margin-left: var(--ios-region-left);
   margin-bottom: var(--ios-region-bottom);
   align-self: var(--ios-region-align, start);
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-adjusted] .m-form-btn {
+:root[data-mobile-os='android'] .m-form-panel[data-ios-reserved-adjusted] {
+  position: absolute;
+  left: var(--ios-region-left);
+  bottom: var(--ios-region-bottom);
+  margin: 0;
+}
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-adjusted] .m-form-btn {
   min-width: var(--tap-min);
   overflow-wrap: anywhere;
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-adjusted] .m-form-title {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-adjusted] .m-form-title {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short] {
   height: 100%;
   padding-top: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-grip { display: none; }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-head {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short] .m-form-grip { display: none; }
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short] .m-form-head {
   position: static;
   padding-bottom: 0;
   border-bottom: 0;
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-body {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short] .m-form-body {
   flex: none;
   min-height: var(--tap-min);
   overflow-y: visible;
   padding: var(--sp-1) 0;
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-foot {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short] .m-form-foot {
   min-height: var(--tap-min);
   padding-top: 0;
-  padding-bottom: 0;
   border-top: 0;
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-btn { min-height: var(--tap-min); }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] textarea {
+:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short] .m-form-foot {
+  padding-bottom: 0;
+}
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short] .m-form-btn { min-height: var(--tap-min); }
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short] textarea {
   min-height: var(--tap-min);
   max-height: max(var(--tap-min), calc(var(--ios-region-height) - var(--sp-2)));
   overflow-y: auto;
 }
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-tiny] .m-form-foot,
-:root[data-mobile-os='ios'] .m-form-panel[data-ios-reserved-short]:has(textarea:focus) .m-form-foot {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-tiny] .m-form-foot,
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-form-panel[data-ios-reserved-short]:has(textarea:focus) .m-form-foot {
   position: static;
 }
 

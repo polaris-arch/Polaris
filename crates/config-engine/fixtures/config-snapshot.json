@@ -385,7 +385,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -1153,7 +1153,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -1928,7 +1928,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -2703,7 +2703,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -3471,7 +3471,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -4218,7 +4218,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "password": "pw",
               "tls": {
@@ -5015,7 +5015,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "password": "pw",
               "tls": {
@@ -5824,7 +5824,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "password": "pw",
               "tls": {
@@ -6602,7 +6602,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "method": "aes-256-gcm",
               "password": "sspw"
@@ -7366,7 +7366,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -8174,7 +8174,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -8944,7 +8944,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -9715,7 +9715,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -9729,7 +9729,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -10876,7 +10876,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "system": false,
               "mtu": 1408,
@@ -11379,7 +11379,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "password": "p",
               "up_mbps": 100,
@@ -11404,7 +11404,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "password": "p",
@@ -11425,7 +11425,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "security": "auto",
@@ -11441,7 +11441,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "password": "p",
               "idle_session_timeout": "30s",
@@ -11464,7 +11464,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "version": 4,
               "psk": "psk",
@@ -11481,7 +11481,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "version": 6,
               "psk": "psk",
@@ -11498,7 +11498,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "username": "u",
               "password": "p",
@@ -11513,7 +11513,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "username": "u",
               "password": "p"
@@ -12319,7 +12319,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp",
@@ -12347,7 +12347,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "method": "aes-256-gcm",
               "password": "p",
@@ -12388,7 +12388,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               }
             }
           ],
@@ -13157,7 +13157,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp",
@@ -13178,7 +13178,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "security": "auto",
@@ -13895,7 +13895,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -14609,7 +14609,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -15330,7 +15330,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -16093,7 +16093,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -16870,7 +16870,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp",
@@ -17666,7 +17666,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp",
@@ -18444,7 +18444,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "username": "u",
               "password": "p",
@@ -19226,7 +19226,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "user": "root",
               "password": "pw",
@@ -20001,7 +20001,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -20780,7 +20780,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -21589,7 +21589,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -22123,7 +22123,7 @@
               },
               {
                 "server": "192.168.1.1",
-                "tag": "dns-node-native-2-0",
+                "tag": "dns-node-native-3-0",
                 "type": "udp"
               }
             ],
@@ -22160,15 +22160,20 @@
                   "a.example.com",
                   ".a.example.com"
                 ],
-                "server": "dns-domestic",
-                "timeout": "1500ms",
+                "timeout": "3000ms",
                 "action": "evaluate",
+                "server": "dns-domestic",
                 "tag": "dns-lan-eval-0"
               },
               {
                 "action": "respond",
                 "match_response": "dns-lan-eval-0",
                 "response_rcode": "NOERROR"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-0",
+                "response_rcode": "NXDOMAIN"
               },
               {
                 "domain": [
@@ -22250,15 +22255,20 @@
                   "ntp",
                   "stun"
                 ],
-                "server": "dns-domestic",
-                "timeout": "1500ms",
+                "timeout": "3000ms",
                 "action": "evaluate",
-                "tag": "dns-lan-eval-6"
+                "server": "dns-domestic",
+                "tag": "dns-lan-eval-7"
               },
               {
                 "action": "respond",
-                "match_response": "dns-lan-eval-6",
+                "match_response": "dns-lan-eval-7",
                 "response_rcode": "NOERROR"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-7",
+                "response_rcode": "NXDOMAIN"
               },
               {
                 "domain_suffix": [
@@ -22295,15 +22305,20 @@
                   "AAAA"
                 ],
                 "rule_set": "geosite-cn",
-                "server": "dns-domestic",
-                "timeout": "1500ms",
+                "timeout": "3000ms",
                 "action": "evaluate",
-                "tag": "dns-lan-eval-10"
+                "server": "dns-domestic",
+                "tag": "dns-lan-eval-12"
               },
               {
                 "action": "respond",
-                "match_response": "dns-lan-eval-10",
+                "match_response": "dns-lan-eval-12",
                 "response_rcode": "NOERROR"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-12",
+                "response_rcode": "NXDOMAIN"
               },
               {
                 "query_type": [
@@ -22321,24 +22336,7 @@
                 "server": "dns-remote"
               },
               {
-                "server": "dns-domestic",
-                "timeout": "1500ms",
-                "action": "evaluate",
-                "tag": "dns-lan-eval-14"
-              },
-              {
-                "action": "respond",
-                "match_response": "dns-lan-eval-14",
-                "response_rcode": "NOERROR"
-              },
-              {
-                "server": "dns-lan"
-              },
-              {
-                "resolver_policy": "direct-lan-fallback",
-                "timeout": "1500ms",
-                "disable_cache": true,
-                "disable_optimistic_cache": true,
+                "timeout": "3000ms",
                 "action": "evaluate",
                 "server": "dns-domestic",
                 "tag": "dns-lan-eval-17"
@@ -22346,22 +22344,84 @@
               {
                 "action": "respond",
                 "match_response": "dns-lan-eval-17",
+                "response_rcode": "NOERROR"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-17",
+                "response_rcode": "NXDOMAIN"
+              },
+              {
+                "server": "dns-lan"
+              },
+              {
+                "domain_suffix": [
+                  "local",
+                  "254.169.in-addr.arpa",
+                  "8.e.f.ip6.arpa",
+                  "9.e.f.ip6.arpa",
+                  "a.e.f.ip6.arpa",
+                  "b.e.f.ip6.arpa"
+                ],
+                "server": "dns-mdns",
+                "resolver_policy": "direct-lan-fallback",
+                "action": "route"
+              },
+              {
+                "domain_suffix": [
+                  "arpa",
+                  "lan",
+                  "home.arpa",
+                  "home",
+                  "internal"
+                ],
+                "domain_regex": [
+                  "^[^.]+\\.?$"
+                ],
+                "server": "dns-lan",
+                "resolver_policy": "direct-lan-fallback",
+                "action": "route"
+              },
+              {
+                "resolver_policy": "direct-lan-fallback",
+                "timeout": "3000ms",
+                "disable_cache": true,
+                "disable_optimistic_cache": true,
+                "action": "evaluate",
+                "server": "dns-domestic",
+                "tag": "dns-lan-eval-23"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-23",
                 "response_rcode": "NOERROR",
                 "resolver_policy": "direct-lan-fallback"
               },
               {
+                "action": "respond",
+                "match_response": "dns-lan-eval-23",
+                "response_rcode": "NXDOMAIN",
+                "resolver_policy": "direct-lan-fallback"
+              },
+              {
                 "resolver_policy": "direct-lan-fallback",
-                "timeout": "1500ms",
+                "timeout": "3000ms",
                 "disable_cache": true,
                 "disable_optimistic_cache": true,
                 "action": "evaluate",
                 "server": "dns-lan",
-                "tag": "dns-lan-eval-19"
+                "tag": "dns-lan-eval-26"
               },
               {
                 "action": "respond",
-                "match_response": "dns-lan-eval-19",
+                "match_response": "dns-lan-eval-26",
                 "response_rcode": "NOERROR",
+                "resolver_policy": "direct-lan-fallback"
+              },
+              {
+                "action": "respond",
+                "match_response": "dns-lan-eval-26",
+                "response_rcode": "NXDOMAIN",
                 "resolver_policy": "direct-lan-fallback"
               },
               {
@@ -22494,8 +22554,8 @@
               {
                 "resolver_policy": "node-bootstrap",
                 "action": "evaluate",
-                "server": "dns-node-native-2-0",
-                "tag": "node-native-2-0-response",
+                "server": "dns-node-native-3-0",
+                "tag": "node-native-3-0-response",
                 "timeout": "1500ms",
                 "disable_cache": true,
                 "disable_optimistic_cache": true
@@ -22503,7 +22563,7 @@
               {
                 "resolver_policy": "node-bootstrap",
                 "action": "respond",
-                "match_response": "node-native-2-0-response",
+                "match_response": "node-native-3-0-response",
                 "response_class": "hit",
                 "race": true,
                 "response_reject_ip_cidr": [
@@ -22532,7 +22592,7 @@
               {
                 "resolver_policy": "node-bootstrap",
                 "action": "respond",
-                "match_response": "node-native-2-0-response",
+                "match_response": "node-native-3-0-response",
                 "response_class": "empty",
                 "race": true,
                 "mode": "defer"
@@ -22565,7 +22625,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -22587,7 +22647,7 @@
                 "mode": "rules",
                 "policy": "direct-lan-fallback",
                 "strategy": "ipv4_only",
-                "timeout": "2s"
+                "timeout": "6000ms"
               }
             }
           ],
@@ -23371,7 +23431,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -24167,7 +24227,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -24950,7 +25010,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -25703,7 +25763,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -26306,7 +26366,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -27151,7 +27211,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -27942,7 +28002,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"
@@ -28721,7 +28781,7 @@
                 "mode": "rules",
                 "policy": "node-bootstrap",
                 "strategy": "prefer_ipv4",
-                "timeout": "2s"
+                "timeout": "4500ms"
               },
               "uuid": "uuid-1",
               "packet_encoding": "xudp"

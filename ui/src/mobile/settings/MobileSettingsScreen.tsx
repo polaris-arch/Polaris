@@ -5,10 +5,10 @@
  * §4 的能力缺席登记；产品裁定：`~/docs/polaris/design/polaris-mobile-ia-adjudications-2026-09-04.md`。
  * 落地说明：`~/docs/polaris/design/polaris-mobile-screen-settings-2026-09-04.md`。
  *
- * # 根页 + 压栈二级页，**不做 split view**（收敛 §2.3 / 裁定 #6）
+ * # 窄窗根页 + 压栈二级页；宽窗为分类 + 详情
  *
- * 理由不是「平板没做完」：D-4 已定「底部导航三档都保留」「三档内容完全一致」。split view 会让
- * 「返回」在 compact 下是弹栈、在 expanded 下是换右栏 —— **同一个屏两套导航模型**。
+ * 选中页仍复用外壳的同一格状态。宽窗保留主导航，窄窗详情才登记返回层；切换宽度与姿态只改
+ * 两个稳定容器的布局，不搬动详情组件，避免未提交输入随布局变化丢失。
  *
  * # 栈状态住在外壳，不在本屏、也不进 `nav-store`
  *
@@ -73,7 +73,7 @@
  * 把 `unknown` 折成 `denied` 会把用户指去系统设置里授予一个可能已经给过的权限。
  */
 
-import { useCallback, useEffect, useState, useSyncExternalStore, type ReactElement } from 'react';
+import { useCallback, useContext, useEffect, useState, useSyncExternalStore, type ReactElement } from 'react';
 import { useDismissableLayer } from '../back-stack';
 import { useTranslation } from 'react-i18next';
 import type { UserConfig } from '@/contracts/types';
@@ -87,7 +87,7 @@ import {
   subscribeAppVersionSkipped,
 } from '@/components/layout/app-update-banner';
 import { vpnApi, type VpnAuthState } from '@/ipc/api/vpn';
-import { setPushedPage, usePushedPage } from '../MobileShell';
+import { SettingsLayoutContext, setPushedPage, usePushedPage } from '../MobileShell';
 import { AboutPage } from './AboutPage';
 import { BackupPage } from './BackupPage';
 import { DisplayPage } from './DisplayPage';
@@ -152,7 +152,8 @@ const SETTINGS_PAGES: Record<MobileSettingsPageId, (props: MobileSettingsPagePro
 
 export function MobileSettingsScreen(): ReactElement {
   const { t } = useTranslation();
-  const { page, setPage } = useSettingsStack();
+  const twoPane = useContext(SettingsLayoutContext);
+  const { page, setPage } = useSettingsStack(twoPane);
   const { config, loading, error, update, reload } = useConfig();
   const { errors, commit, report } = useWriteFeedback(t);
   const vpnAuth = useVpnAuthState();
@@ -175,13 +176,8 @@ export function MobileSettingsScreen(): ReactElement {
     return isTitleKey(title) ? t(title) : title;
   };
 
-  const header = (
+  const noticeBlock = (
     <>
-      <SettingsHeader
-        title={page === null ? t('mobileNav.settings') : titleOf(page)}
-        backLabel={t('mobileSettings.back')}
-        onBack={page === null ? undefined : () => setPage(null)}
-      />
       {/* 被截下来的弹窗。跟着页头走（根页与压栈页都在）：触发它的那次配置变更可能在任何一页发生，
           只画在根页 = 用户正停在 DNS 页时照样什么都看不到。文案取弹窗自己的 title/message，
           不另起一句 —— 另起一句就是同一条消息的第二份真值。 */}
@@ -232,10 +228,26 @@ export function MobileSettingsScreen(): ReactElement {
 
   return (
     <WriteErrorsContext.Provider value={errors}>
-      {header}
-      {/* 列流容器（`./settings.css`）：compact 是 flex 纵列，medium/expanded 起两列 multicol。
-          页头不进来 —— 它是 sticky 的，卷进列流会跟着分列。 */}
-      <div className="ms-flow">{body}</div>
+      <div className="ms-layout" data-split={twoPane}>
+        <section className="ms-categories" hidden={!twoPane && page !== null}>
+          <SettingsHeader title={t('mobileNav.settings')} backLabel={t('mobileSettings.back')} />
+          {page === null && noticeBlock}
+          <div className="ms-flow">
+            {twoPane
+              ? <SettingsRoot onOpen={setPage} vpnAuth={vpnAuth} appUpdate={appUpdate} selectedPage={page ?? undefined} />
+              : page === null ? body : null}
+          </div>
+        </section>
+        <section className="ms-detail" hidden={page === null}>
+          <SettingsHeader
+            title={page === null ? t('mobileNav.settings') : titleOf(page)}
+            backLabel={t('mobileSettings.back')}
+            onBack={twoPane || page === null ? undefined : () => setPage(null)}
+          />
+          {page !== null && noticeBlock}
+          <div className="ms-flow">{page !== null && body}</div>
+        </section>
+      </div>
     </WriteErrorsContext.Provider>
   );
 }
@@ -249,7 +261,7 @@ export function MobileSettingsScreen(): ReactElement {
  * 抽成 hook 是为了让**接线**本身可判：判据把栈写成 `dns` 之后渲染整棵生产树，导航该消失、
  * DNS 页该出现 —— 两件事都是行为断言，不是「源码里出现过 `usePushedPage` 这个词」。
  */
-function useSettingsStack(): {
+function useSettingsStack(twoPane: boolean): {
   page: MobileSettingsPageId | null;
   setPage: (next: MobileSettingsPageId | null) => void;
 } {
@@ -257,11 +269,15 @@ function useSettingsStack(): {
   const setPage = useCallback((next: MobileSettingsPageId | null) => {
     setPushedPage('settings', next);
   }, []);
-  const page = raw !== null && isSettingsPageId(raw) ? raw : null;
+  const selected = raw !== null && isSettingsPageId(raw) ? raw : null;
+  const page = selected ?? (twoPane ? 'general' : null);
+  useEffect(() => {
+    if (twoPane && selected === null) setPage('general');
+  }, [twoPane, selected, setPage]);
   /* 系统返回键在二级页上 = 回根页，与页头那颗返回按钮同一个动作、同一个闭包。
      登记在**栈这一层**而不是页头组件上：返回的语义是「退掉这一层」，与页头画不画得出来无关。
-     弹层比它登记得晚（子树后渲染）⇒ LIFO 保证先关弹层、再退页。 */
-  useDismissableLayer(page !== null, () => setPage(null));
+     收窄窗口时父导航层可能晚于已有弹层激活，固定从栈底插入，保证先关弹层、再退页。 */
+  useDismissableLayer(page !== null && !twoPane, () => setPage(null), 'bottom');
   return { page, setPage };
 }
 
@@ -415,6 +431,7 @@ export function SettingsRoot({
   onOpen,
   vpnAuth,
   appUpdate,
+  selectedPage,
 }: {
   onOpen: (id: MobileSettingsPageId) => void;
   /** 系统 VPN 授权状态。**由屏组件读来**（`useVpnAuthState`），本列表保持无 IPC 依赖。 */
@@ -424,6 +441,7 @@ export function SettingsRoot({
    * （`useAppUpdateEntry`）—— 本列表不碰 IPC、不碰会话态，判据才能把它单独渲染出来逐行对拍。
    */
   appUpdate: string | null;
+  selectedPage?: MobileSettingsPageId;
 }): ReactElement {
   const { t } = useTranslation();
   const isIOS = typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios';
@@ -464,6 +482,7 @@ export function SettingsRoot({
               id={id}
               first={index === 0}
               label={titleOf(id)}
+              current={selectedPage === id}
               onOpen={() => onOpen(id)}
             />
           ))}

@@ -745,6 +745,7 @@ pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEn
             });
     }
     if let Some(rules) = cfg.dns.as_mut().and_then(|dns| dns.rules.as_mut()) {
+        let before = rules.len();
         rules.retain(|rule| match dns_rule_bad_ref(&servers, rule) {
             Some(err) => {
                 record(err);
@@ -752,6 +753,9 @@ pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEn
             }
             None => true,
         });
+        if rules.len() < before {
+            crate::builder::dns::retain_bound_responds(rules);
+        }
     }
     pruned
 }

@@ -217,7 +217,8 @@ impl<'a> Publication<'a> {
         let parents = store.root.ancestors().skip(1);
         // The Windows installer pins every ancestor with read-only sharing, so a
         // write-access flush there is a sharing violation. The store never
-        // creates its root on Windows, so no ancestor entry changed here.
+        // creates its root on Windows; the installer that may have just created
+        // the root and its parent flushes those entries after this utility exits.
         #[cfg(windows)]
         let parents = parents.take(0);
         for parent in parents {

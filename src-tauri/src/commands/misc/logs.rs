@@ -281,7 +281,7 @@ fn ts_ms_to_iso(ts_ms: u128) -> String {
         .unwrap_or_else(|| ts_ms.to_string())
 }
 
-/// 提权助手近期日志（导出专用，仅用户导出时拉取一次）：行首 epoch 毫秒折成 ISO，凭据打码同 app 日志。
+/// 提权助手近期日志（导出专用，仅用户导出时拉取一次）：行首 13 位 epoch 毫秒 + 空格折成 ISO（续行原样），凭据打码同 app 日志。
 async fn helper_log_tail(state: &State<'_, AppRuntime>) -> String {
     let helper = Arc::clone(&state.helper);
     let text = tokio::task::spawn_blocking(move || helper.recent_logs())
@@ -292,6 +292,7 @@ async fn helper_log_tail(state: &State<'_, AppRuntime>) -> String {
         .map(|line| {
             match line
                 .split_once(' ')
+                .filter(|(ms, _)| ms.len() == 13 && ms.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|(ms, rest)| Some((ms.parse::<u128>().ok()?, rest)))
             {
                 Some((ms, rest)) => format!("{} {rest}\n", ts_ms_to_iso(ms)),

@@ -34,7 +34,7 @@ function App(){
  return <><MobileShell active="home" onSelect={()=>{}} toastHost={<MobileToaster/>}><p>Screen fixture</p></MobileShell>{formClosed?<p>Form closed</p>:<FormSheet title="Editing fixture" closeLabel="Close form" cancelLabel="Cancel edit" submitLabel="Save" onSubmit={()=>{}} onRequestClose={()=>setFormClosed(true)}>
   <input aria-label="Fixture text" />
   <button onClick={()=>setActionOpen(true)}>Open actions</button>
-  {actionOpen && <ActionSheet title="Rule actions" closeLabel="Close actions" onClose={()=>setActionOpen(false)} actions={[{id:'first',label:'First action'},{id:'last',label:'Last action'}]} body={<MobileInfo title="Nested explanation" summary="Nested details" details={<p>Top-layer details</p>}/>} />
+  {actionOpen && <ActionSheet title="Rule actions" closeLabel="Close actions" onClose={()=>setActionOpen(false)} actions={[{id:'first',label:'First action'},{id:'last',label:'Last action'}]} body={<MobileInfo title="Nested explanation" summary="Nested details" details={<p>Top-layer details</p>}/>} />}
   <MobileSelect aria-label="Simple choice" value={value} onChange={event=>setValue(event.currentTarget.value)}>{options.map(option=><option key={option.id} value={option.id}>{option.label}</option>)}</MobileSelect>
   <SelectSheetTrigger label="Grouped choice" value={value} options={options} open={open} onOpen={()=>setOpen(true)}/>
   <SelectSheetPanel label="Grouped choice" value={value} groups={groups} openGroupIds={defaults} open={open} onClose={()=>setOpen(false)} onSelect={id=>{setValue(id);setOpen(false);}} closeLabel="Close choice" note={<MobileInfo title="Choice explanation" summary="Short explanation" details={<p>Complete explanation</p>}/>}/>

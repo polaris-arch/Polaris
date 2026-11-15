@@ -353,6 +353,7 @@ fn append_dns_policy_action(
                 &dns_rule_from_matcher(matcher.clone()),
                 &members,
                 group.mode == DnsServerGroupMode::Race,
+                &["NOERROR"],
                 "dns-eval-",
             );
             if let Some(fallback) = group.fallback_server_id.as_deref() {
@@ -365,13 +366,15 @@ fn append_dns_policy_action(
 /// DNS Server Group 的 evaluate→respond 链（Fallback / Race）；LAN 回退复用同一形态。
 ///
 /// `base` 携带匹配条件与查询选项。respond 不复制匹配条件（靠 match_response 与本份 evaluate
-/// 联动），只继承 resolver_policy 以留在同一作用域。tag 按 `out` 的发射位置分配：同一序列只追加
-/// （跨规则、OR/环境变体与 fallback），`prefix` 区分互不相干的序列，绝不按可复用的组 ID 分配。
+/// 联动），只继承 resolver_policy 以留在同一作用域；`rcodes` 中每个响应码各发一条 respond，其余
+/// 结果落到下一级。tag 按 `out` 的发射位置分配：同一序列只追加（跨规则、OR/环境变体与 fallback），
+/// `prefix` 区分互不相干的序列，绝不按可复用的组 ID 分配。
 fn push_evaluate_chain(
     out: &mut Vec<DnsRule>,
     base: &DnsRule,
     servers: &[String],
     race: bool,
+    rcodes: &[&str],
     prefix: &str,
 ) {
     for (index, server) in servers.iter().enumerate() {
@@ -385,15 +388,44 @@ fn push_evaluate_chain(
         }
         out.push(evaluate);
 
-        out.push(DnsRule {
-            resolver_policy: base.resolver_policy.clone(),
-            action: Some("respond".into()),
-            match_response: Some(serde_json::Value::String(response_tag)),
-            response_rcode: Some("NOERROR".into()),
-            race: race.then_some(true),
-            ..Default::default()
-        });
+        for rcode in rcodes {
+            out.push(DnsRule {
+                resolver_policy: base.resolver_policy.clone(),
+                action: Some("respond".into()),
+                match_response: Some(serde_json::Value::String(response_tag.clone())),
+                response_rcode: Some((*rcode).into()),
+                race: race.then_some(true),
+                ..Default::default()
+            });
+        }
     }
+}
+
+/// 剪枝删掉 evaluate 后，match_response 仍指向其 tag 的 respond 会让内核以 `undefined evaluate tag`
+/// 整核 FATAL（主规则与 policy 组同校验）；与被剪的 evaluate 一并删除。
+pub(crate) fn retain_bound_responds(rules: &mut Vec<DnsRule>) {
+    let tags: BTreeSet<String> = rules
+        .iter()
+        .filter(|rule| rule.action.as_deref() == Some("evaluate"))
+        .filter_map(|rule| rule.tag.clone())
+        .collect();
+    rules.retain(|rule| {
+        rule.match_response
+            .as_ref()
+            .and_then(|tag| tag.as_str())
+            .is_none_or(|tag| tags.contains(tag))
+    });
+}
+
+/// dns-lan 回退链里 dns-domestic 的 evaluate 超时（毫秒）：用户 DNS 超时与 3s 取小，未设为 3s。
+/// direct 出站 policy 的总预算按「domestic + dns-lan」各一份计。
+pub fn lan_fallback_timeout_ms(config: &UserConfig) -> i64 {
+    config
+        .dns_config
+        .as_ref()
+        .and_then(|dns| dns.dns_timeout_ms)
+        .filter(|n| n.is_finite() && *n > 0.0)
+        .map_or(3000, |n| (n.round() as i64).clamp(1, 3000))
 }
 
 /// direct 出站的 resolver policy：dns-domestic 失败时回退 dns-lan（仅 dns-lan 存在时生成）。
@@ -2189,7 +2221,8 @@ pub fn build_dns_config(
     }
 
     // 本地网络阻断国内 DoH/DoT 时回退接管前的系统 DNS：每条路由到 dns-domestic 的规则（含 final）
-    // 改写为 Fallback 组同形链 evaluate dns-domestic → respond NOERROR → route dns-lan；原位改写，
+    // 改写为 Fallback 组同形链 evaluate dns-domestic → respond NOERROR/NXDOMAIN → route dns-lan；
+    // 只有传输失败/超时/SERVFAIL/REFUSED 才明文回退，过滤型 DoH 的 NXDOMAIN 拦截不被绕过。原位改写，
     // 相对优先级不变。dns-domestic 自身的 domain_resolver 不能用 rules 模式，回退只能做在查询这层。
     // dns-remote 不回退：境外查询不能明文交给本地解析器。tag 用独立前缀，避开组按旧位置分配的 tag。
     if lan_resolver.is_some() {
@@ -2199,28 +2232,36 @@ pub fn build_dns_config(
                 ..Default::default()
             });
         }
+        let timeout = format!("{}ms", lan_fallback_timeout_ms(config));
         let mut chained = Vec::with_capacity(dns_rules.len() + 8);
         for mut rule in dns_rules {
             if rule.server.as_deref() == Some("dns-domestic")
                 && matches!(rule.action.as_deref(), None | Some("route"))
             {
                 let mut evaluate = rule.clone();
-                evaluate.timeout = Some(crate::node_dns::CANDIDATE_TIMEOUT.into());
+                evaluate.timeout = Some(timeout.clone());
                 push_evaluate_chain(
                     &mut chained,
                     &evaluate,
                     &["dns-domestic".into()],
                     false,
+                    &["NOERROR", "NXDOMAIN"],
                     "dns-lan-eval-",
                 );
                 rule.server = Some("dns-lan".into());
             }
             chained.push(rule);
         }
-        // direct 出站拨号解析（generate 绑定本 policy）：同一回退顺序，按 node_dns 范式关候选缓存。
+        // direct 出站拨号解析（generate 绑定本 policy）：同一回退顺序，按 node_dns 范式关候选缓存；
+        // 首部按 node_dns::replace_protections 复制 scoped LAN 保护，内部名不先发给公网 DoH。
+        chained.extend(lan_rules.iter().cloned().map(|mut rule| {
+            rule.resolver_policy = Some(DIRECT_LAN_FALLBACK_POLICY.into());
+            rule.action = Some("route".into());
+            rule
+        }));
         let policy = DnsRule {
             resolver_policy: Some(DIRECT_LAN_FALLBACK_POLICY.into()),
-            timeout: Some(crate::node_dns::CANDIDATE_TIMEOUT.into()),
+            timeout: Some(timeout),
             disable_cache: Some(true),
             disable_optimistic_cache: Some(true),
             ..Default::default()
@@ -2230,6 +2271,7 @@ pub fn build_dns_config(
             &policy,
             &["dns-domestic".into(), "dns-lan".into()],
             false,
+            &["NOERROR", "NXDOMAIN"],
             "dns-lan-eval-",
         );
         chained.push(DnsRule {

@@ -494,11 +494,13 @@ export default function PendingChangesBar() {
   };
 
   // 确认框已确认「立即生效」的一次性请求：直接应用已保存候选（不保存草稿），跳过「立即应用」与重启二次确认。
+  // onApply 守卫不放行（已有 apply 在飞等）时不换 applyRequest，意图保留到守卫状态变化后再消费。
   useEffect(() => {
     if (!applyRequested) return;
-    useAppStore.getState().setApplyRequested(false);
+    const current = applyRequest.current;
     void onApply(undefined, undefined, undefined, false, true);
-  }, [applyRequested]);
+    if (applyRequest.current !== current) useAppStore.getState().setApplyRequested(false);
+  }, [applyRequested, apply.phase, apply.host?.phase, apply.host?.superseded]);
   if (!view.visible && restartPrompt === null && impactChoice.prompt === null) return conflictDialog;
 
   /** 转圈只挂在「正在跑的那颗」上：保存在飞 → 保存钮，重启在飞 → 立即应用钮。 */

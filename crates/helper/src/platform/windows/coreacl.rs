@@ -398,6 +398,19 @@ pub fn judge_object(path: &str, sec: &ObjectSecurity) -> Vec<AclFinding> {
     out
 }
 
+/// Check the grants a new child could inherit before creating privileged data.
+/// This only normalizes the inspected descriptor; it never changes the real ACL.
+#[must_use]
+pub fn judge_child_inheritance(path: &str, sec: &ObjectSecurity) -> Vec<AclFinding> {
+    let mut child_security = sec.clone();
+    if let Some(aces) = child_security.dacl.as_mut() {
+        for ace in aces {
+            ace.flags &= !ACE_FLAG_INHERIT_ONLY;
+        }
+    }
+    judge_object(path, &child_security)
+}
+
 /// 判整组对象（目录 + 每个白名单文件），并按 Q9 把「放宽」与「读不到」分进两个篮子。
 ///
 /// **覆盖面是目录 + 每个文件**：目录锁得住、文件被单独 `/grant` 放宽，照样是可注入的核

@@ -48,7 +48,7 @@ import { disableNativeContextMenu } from '@/lib/native-context-menu';
 import { injectStaticFailureDom, installErrorForwarding } from '@/lib/renderer-recovery';
 import { reportRendererReady } from '@/lib/renderer-ready';
 import { MobileApp } from './MobileApp';
-import { installIosLayout, refreshNativeViewportCss } from './ios-layout';
+import { installAndroidFoldLayout, installIosLayout, refreshNativeViewportCss } from './ios-layout';
 import { DebugReportButton } from './DebugReportButton';
 import '../styles/tokens.resolved.css';
 import './theme.css';
@@ -61,9 +61,11 @@ import './connections/connections-redesign.css';
 installErrorForwarding();
 disableNativeContextMenu();
 
-// Android carries its own marker only for routing account actions; every layout
-// rule below and in CSS matches 'ios' exactly.
-if (isTauri() && platform() === 'android') document.documentElement.dataset.mobileOs = 'android';
+if (isTauri() && platform() === 'android') {
+  document.documentElement.dataset.mobileOs = 'android';
+  const disposeLayout = installAndroidFoldLayout();
+  import.meta.hot?.dispose(disposeLayout);
+}
 
 // Keep the iOS layout switch out of desktop and Android. Tauri's OS plugin
 // reports the target at build time, so this is ready before the first render.
@@ -87,6 +89,8 @@ if (isTauri() && platform() === 'ios') {
       const height = Math.max(0, Math.min(
         viewport.height,
         Number.isFinite(nativeBottom) ? nativeBottom / scale : Infinity,
+        document.documentElement.dataset.foldPosture === 'tabletop'
+          ? Number.parseFloat(style.getPropertyValue('--fold-start')) - viewport.offsetTop : Infinity,
       ));
       style.setProperty('--ios-form-viewport-height', `${height}px`);
       style.setProperty('--ios-form-viewport-top', `${viewport.offsetTop}px`);
@@ -132,6 +136,7 @@ if (isTauri() && platform() === 'ios') {
     viewport.addEventListener('scroll', schedule);
     window.addEventListener('resize', schedule);
     window.addEventListener('polaris-ios-viewport-change', schedule);
+    window.addEventListener('polaris-fold-layout-change', schedule);
     document.addEventListener('focusin', schedule);
     const disposeLayout = installIosLayout(schedule);
     schedule();
@@ -141,6 +146,7 @@ if (isTauri() && platform() === 'ios') {
       viewport.removeEventListener('scroll', schedule);
       window.removeEventListener('resize', schedule);
       window.removeEventListener('polaris-ios-viewport-change', schedule);
+      window.removeEventListener('polaris-fold-layout-change', schedule);
       document.removeEventListener('focusin', schedule);
       disposeLayout();
     });

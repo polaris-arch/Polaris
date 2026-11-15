@@ -100,20 +100,16 @@ function subscribeLayers(onChange: () => void): () => void {
  * 同 `key` 再登记 = 同一个组件重渲染：只就地刷新 `dismiss`（否则 `dismissTop` 调到的是上一帧的
  * `onClose`，闭包里捕获的是过期 state），**层序保持不变** —— 重渲染不该把一层顶到最上面。
  *
- * ⚠️ 由此得出的一条前提，记在这里免得下一个人踩：**层序 = 首次激活的时序**，不是渲染时序。
- * 今天两处「浅层后激活」的路径都自愈，靠的都是同一个偶然前提 —— 那层弹层在同一批里被关掉：
- * 规则屏 DNS 溢出面板走 `setDnsViewsSheet(false)` + `setPage(…)` 同批，节点屏「更多」面板里的
- * 批选入口走 `SheetRow`（先 `onSelect()` 再 `onDone()`）。哪天有人让弹层在推子页 / 进模式态时
- * **留着**，层序就反了：上面那层活着，返回却先关掉底下那层。真要收的话，收在
- * 「重新激活时置顶」这条语义上（本函数分不出「重渲染」与「重新激活」，故不能在这里判）。
+ * 普通弹层按首次激活顺序入栈；父导航层可指定 bottom，在布局变化后才激活时仍位于已有弹层下方。
+ * position 只决定新层从哪端插入，同 key 重渲染不重排。
  */
-export function pushDismissable(key: string, dismiss: DismissFn): () => void {
+export function pushDismissable(key: string, dismiss: DismissFn, position: 'top' | 'bottom' = 'top'): () => void {
   const existing = layers.find((l) => l.key === key);
   const layer = existing ?? { key, dismiss };
   if (existing !== undefined) {
     existing.dismiss = dismiss;
   } else {
-    layers = [...layers, layer];
+    layers = position === 'bottom' ? [layer, ...layers] : [...layers, layer];
     notifyLayers();
   }
   return () => {
@@ -190,7 +186,7 @@ export function useDismissableDepth(): number {
  * 以后新弹层复用同一个组件就自动带上，而「忘了登记」的表现降级成
  * 「这一层不吃返回」，不再是「整个 App 退出」。
  */
-export function useDismissableLayer(active: boolean, dismiss: DismissFn): void {
+export function useDismissableLayer(active: boolean, dismiss: DismissFn, position: 'top' | 'bottom' = 'top'): void {
   const key = useId();
   const latest = useRef(dismiss);
   latest.current = dismiss;
@@ -203,7 +199,7 @@ export function useDismissableLayer(active: boolean, dismiss: DismissFn): void {
 
   // 渲染期登记 / 退订（见文件头注「必须发生在渲染期」）。
   if (active) {
-    off.current = pushDismissable(key, forward.current);
+    off.current = pushDismissable(key, forward.current, position);
   } else {
     off.current?.();
     off.current = null;
@@ -214,6 +210,6 @@ export function useDismissableLayer(active: boolean, dismiss: DismissFn): void {
     /* StrictMode 把 effect 跑成 setup → cleanup → setup：第一次 cleanup 会把渲染期登记的那一层摘掉，
        必须由第二次 setup 补回来，否则组件还挂着而层已经不在表上（返回键落空）。
        `pushDismissable` 幂等，故非 StrictMode 下这次调用只是刷新闭包。 */
-    return pushDismissable(key, forward.current as DismissFn);
-  }, [active, key]);
+    return pushDismissable(key, forward.current as DismissFn, position);
+  }, [active, key, position]);
 }

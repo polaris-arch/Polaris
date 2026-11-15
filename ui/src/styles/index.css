@@ -759,16 +759,29 @@ h1[tabindex='-1']:focus-visible { outline: none; }
 
 /* 浅色：卡片一律白底（--surface）。原本灰底的两处——`.mesh-col`（--surface-2/0.5，在白弹窗上读成
  * 「凹陷/禁用的输入槽」）与 `.ap-group`（--surface-2/0.16）——回到白底，靠描边 + 阴影成卡；分组头保留
- * --surface-3 色带区分组头与卡面。`.mesh-col` 只覆盖非 hover 态，hover 仍走基线 --surface-2 反馈。
+ * --surface-3 色带区分组头与卡面。`.mesh-col` 悬停取改前的常态底 --surface-2/0.5：基线 0.85 会糊掉卡内浅蓝图标底。
  * 深色底色保持原值不动。 */
 @media (prefers-color-scheme: light){
   :root:not([data-theme="dark"]) .ap-group{ background:hsl(var(--surface)); }
   :root:not([data-theme="dark"]) .ap-group-head{ background:hsl(var(--surface-3)); }
   :root:not([data-theme="dark"]) .mesh-col:not(:hover){ background:hsl(var(--surface)); }
+  :root:not([data-theme="dark"]) .mesh-col:hover{ background:hsl(var(--surface-2)/0.5); }
 }
 :root[data-theme="light"] .ap-group{ background:hsl(var(--surface)); }
 :root[data-theme="light"] .ap-group-head{ background:hsl(var(--surface-3)); }
 :root[data-theme="light"] .mesh-col:not(:hover){ background:hsl(var(--surface)); }
+:root[data-theme="light"] .mesh-col:hover{ background:hsl(var(--surface-2)/0.5); }
+
+/* 浅色白底行的悬停同取 --surface-2/0.5 叠白一档。`.rule-item` 常态白底不透明，基线悬停 --surface-2/0.55
+ * 是半透明、直接透出页面底色（实测白 → rgb 238,242,246），卡内浅蓝类型图标底几乎被吃掉；故把 0.5 叠在
+ * --surface 上而非页面底上。节点列表档行父级本就白底，0.55 → 0.5 即可。:118-121 的 AA 花名册按 0.55 算，
+ * 悬停变浅后对比只升不降。`.dragging` 自带底色，不被悬停覆盖。深色不动。 */
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]) .rule-item:hover:not(.dragging){ background:linear-gradient(hsl(var(--surface-2)/0.5), hsl(var(--surface-2)/0.5)) hsl(var(--surface)); }
+  :root:not([data-theme="dark"]) #s-nodes.nodes-list-view .nd-card:hover{ background:hsl(var(--surface-2)/0.5); }
+}
+:root[data-theme="light"] .rule-item:hover:not(.dragging){ background:linear-gradient(hsl(var(--surface-2)/0.5), hsl(var(--surface-2)/0.5)) hsl(var(--surface)); }
+:root[data-theme="light"] #s-nodes.nodes-list-view .nd-card:hover{ background:hsl(var(--surface-2)/0.5); }
 
 /* 深色：卡片悬停 / 选中的 flow 高亮补强。基线 flow/0.42-0.45 描边在白底上反差足，深底上几乎看不出；
  * 提高描边不透明度、选中环加粗一档，悬停的接入卡补一层 flow 淡染（基线 --surface-2/0.85 与常态
@@ -1897,3 +1910,6 @@ body:has(.pending-bar.show) #toast-stack{
 
 .sb-count[data-stats-available="false"] .rate-dn,
 .sb-count[data-stats-available="false"] .rate-up{ color:hsl(var(--fg-dim)); }
+
+/* 规则行操作区：20px 开关与 27px 图标按钮同排，原型未设 align-items ⇒ 开关贴顶，比按钮中线高 3.5px。 */
+.rule-acts{ align-items:center; }

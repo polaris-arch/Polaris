@@ -178,7 +178,12 @@ fn declare_scheduled_refresh(delay_ms: u64) -> (u64, Value) {
     let seq = declare_schedule_locked();
     let snapshot = if delay_ms > 0 {
         state.pending_seq = Some(seq);
-        state.publish(pending_ipinfo_snapshot(), false)
+        // 整帧替换须带上可见帧的起核前 DoH 结论，否则出口刷新窗口内横幅闪隐。
+        let mut pending = pending_ipinfo_snapshot();
+        if let Some(notice) = state.visible.get("dohBlocked") {
+            pending["dohBlocked"] = notice.clone();
+        }
+        state.publish(pending, false)
     } else {
         state.pending_seq = None;
         let mut stopped = state.cache.clone().unwrap_or_else(empty_ipinfo_snapshot);
@@ -219,6 +224,9 @@ fn finish_scheduled_probe(ticket: u64) -> Option<Value> {
         if state.visible.get("loading") == Some(&json!(true)) {
             let mut empty = empty_ipinfo_snapshot();
             empty["updatedAt"] = json!(u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX));
+            if let Some(notice) = state.visible.get("dohBlocked") {
+                empty["dohBlocked"] = notice.clone();
+            }
             return Some(state.publish(empty, true));
         }
     }

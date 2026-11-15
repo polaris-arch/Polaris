@@ -143,6 +143,43 @@ fn pinned_log_path_rejects_directory_owned_by_another_uid() {
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
+#[test]
+fn pinned_log_path_rejects_fifo_parent_without_blocking_and_keeps_symlink_policy() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let linked = dir.path().join("linked");
+    std::os::unix::fs::symlink(dir.path(), &linked).unwrap();
+    assert!(pin_log_path(&linked.join("core.log"), uid).is_ok());
+    let fifo = dir.path().join("fifo-parent");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let log_path = fifo.join("core.log");
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        done_tx.send(pin_log_path(&log_path, uid).is_err()).unwrap();
+    });
+    let rejected = match done_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(rejected) => rejected,
+        Err(error) => {
+            let _peer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&fifo);
+            worker.join().unwrap();
+            panic!("log parent open blocked on FIFO: {error}");
+        }
+    };
+    worker.join().unwrap();
+    assert!(rejected);
+}
+
 /// The production spawner has no shared-filesystem precondition: its first
 /// refusal is the per-request log directory check, which fails here before any
 /// fork, so no child or slot is created.
@@ -451,6 +488,7 @@ fn scripted_slot(pid: u32, steps: Vec<std::io::Result<Option<ExitStatus>>>) -> A
         Box::new(ScriptedWaiter {
             steps: steps.into(),
         }),
+        None,
     )
 }
 
@@ -467,6 +505,7 @@ fn exact_scripted_slot(
         Box::new(ScriptedWaiter {
             steps: steps.into(),
         }),
+        None,
     )
 }
 
@@ -852,6 +891,7 @@ fn native_wait_and_signal_serialize_at_birth_lock() {
             entered: entered_tx,
             release: release_rx,
         }),
+        None,
     );
     let for_reaper = Arc::clone(&slot);
     let reaper = std::thread::spawn(move || for_reaper.reap_fact());
@@ -1133,4 +1173,85 @@ fn shutdown_tail_counter_does_not_certify_live_reader() {
     assert!(!group.wait(Duration::ZERO));
     drop(tail);
     assert!(group.wait(Duration::ZERO));
+}
+
+#[test]
+fn native_reap_revokes_old_writer_before_successor_without_waiting_for_pipe_eof() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::mpsc;
+
+    struct ControlledReader {
+        chunks: mpsc::Receiver<Vec<u8>>,
+        next_read: mpsc::Sender<()>,
+    }
+    impl Read for ControlledReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.next_read.send(()).unwrap();
+            let bytes = self.chunks.recv().unwrap();
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("core.log");
+    std::fs::write(&path, b"prior").unwrap();
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(state);
+    let (chunks_tx, chunks_rx) = mpsc::channel();
+    let (reads_tx, reads_rx) = mpsc::channel();
+    let reader = PinnedReader {
+        inner: ControlledReader {
+            chunks: chunks_rx,
+            next_read: reads_tx,
+        },
+        _directory: Arc::new(File::open(dir.path()).unwrap()),
+        _tail: ReapTail::new(&spawner.reaps),
+    };
+    let log_custody = polaris_log_budget::spawn_pipe_loggers_with_file(
+        Some(reader),
+        None::<io::Empty>,
+        &path,
+        64,
+        |opened| assert!(opened.is_some()),
+    );
+    assert!(
+        std::fs::read(&path).unwrap().is_empty(),
+        "Fresh is synchronous"
+    );
+    reads_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    chunks_tx.send(b"old-live".to_vec()).unwrap();
+    reads_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let slot = exact_scripted_slot(4242, 1, vec![Ok(Some(ExitStatus::from_raw(0)))]);
+    slot.custody.lock().unwrap().log_custody = Some(log_custody);
+    let target = slot.handle.target().unwrap();
+    spawner.slots.lock().unwrap().push(slot);
+    assert_eq!(spawner.stop_birth(&target), StopReap::Reaped);
+    assert!(spawner.reaped_birth(&target));
+    assert!(!spawner.has_exact_birth());
+    assert_eq!(spawner.scan_birth_admission(None), BirthAdmission::Admitted);
+    assert!(
+        !spawner.wait_reaps(Duration::ZERO),
+        "reader has not reached EOF"
+    );
+
+    let successor = polaris_log_budget::spawn_pipe_loggers_with_file(
+        None::<io::Empty>,
+        None::<io::Empty>,
+        &path,
+        64,
+        |opened| assert!(opened.is_some()),
+    );
+    std::fs::write(&path, b"new-live").unwrap();
+    chunks_tx.send(b"late-old".to_vec()).unwrap();
+    reads_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new-live");
+    assert_eq!(
+        std::fs::read(path.with_extension("log.1")).unwrap(),
+        b"old-live"
+    );
+    successor.revoke().unwrap();
+    chunks_tx.send(Vec::new()).unwrap();
+    assert!(spawner.wait_reaps(Duration::from_secs(2)));
 }

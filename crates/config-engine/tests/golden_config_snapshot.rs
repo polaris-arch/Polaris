@@ -171,6 +171,19 @@
 //!   `{mode:rules, policy:direct-lan-fallback, strategy:ipv4_only, timeout:2s}`。
 //! - **验收**：变换前仅此 1/37 红（dns.rules 期望 19、实际 36）；变换后 37/37 diff=0。
 //!
+//! **第十二次例外（2026-11-13，dns-lan 回退链复审修复）**：射程同第十一次，仅 `DNS lanResolverForDns 注入`。
+//! - **变换**（脚本在第十一次结果上独立改写，未从 Rust 输出重录）：① 4 条 domestic 链各在 respond
+//!   NOERROR 后加 respond NXDOMAIN（NXDOMAIN 是终答，不明文回退），evaluate timeout 1500ms→3000ms
+//!   （用户未设 DNS 超时，取 3s），tag 按新位置重编；② `direct-lan-fallback` 首部插入最前两条 LAN 保护的
+//!   scoped 副本（加 resolver_policy、action=route），两级候选同样 3000ms + NOERROR/NXDOMAIN 两条 respond；
+//!   ③ `node-bootstrap` 里 dns-lan 候选由 `node-native-2-0` 改编号为 `node-native-3-0`（独占 tier3，形状不变），
+//!   servers 同步改 tag；④ `direct` 出站 `domain_resolver.timeout` 2s→6000ms（domestic + dns-lan 两份）。
+//! - **验收**：变换后 37/37 diff=0。
+//!
+//! **节点 DNS 总预算同步（2026-11-15）**：仅将 `node-bootstrap` 的 `domain_resolver.timeout`
+//! 从 2s 改为 4500ms（三个串行 tier 各 1500ms），避免前两级超时后 dns-lan 无预算启动。
+//! 金样只机械替换该 policy 的 timeout；direct-lan-fallback 的 6000ms 保持原值。
+//!
 //! # 重生方式（不要在本仓手搓）
 //!
 //! 导出器在 **上游仓**：`scripts/export-config-snapshot-fixtures.test.ts`。重生要求 上游 主工作树

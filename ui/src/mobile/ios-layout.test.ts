@@ -1,10 +1,50 @@
 import { describe, expect, it, vi } from 'vitest';
-import { avoidReserved, intersectsReserved, iosRegionsInCss, readIosViewport, refreshNativeViewportCss, type LayoutRect, type ReservedRegion } from './ios-layout';
+import { applyNativeFoldLayout, avoidReserved, intersectsReserved, iosRegionsInCss, readIosViewport, refreshNativeViewportCss, type LayoutRect, type ReservedRegion } from './ios-layout';
 
 const bounds: LayoutRect = { x: 0, y: 0, width: 800, height: 600 };
 const region = (over: Partial<ReservedRegion> = {}): ReservedRegion => ({ kind: 'division', x: 400, y: 0, width: 0, height: 600, ...over });
 
 describe('UIKit points and reserved geometry', () => {
+  it('derives posture only from native divisions, scales coordinates and clears them when unfolded', () => {
+    const properties = new Map<string, string>();
+    const root = { clientWidth: 800, dataset: {} as Record<string, string>, style: {
+      getPropertyValue: (key: string) => properties.get(key) ?? '',
+      setProperty: (key: string, value: string) => properties.set(key, value),
+      removeProperty: (key: string) => properties.delete(key),
+    } };
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal('document', { documentElement: root });
+    vi.stubGlobal('window', { dispatchEvent });
+    try {
+      const value = readIosViewport({ width: 400, height: 400,
+        reservedRegions: [region({ x: 190, width: 20, height: 400 })] })!;
+      applyNativeFoldLayout(value);
+      expect(root.dataset.foldPosture).toBe('book');
+      expect(properties.get('--fold-start')).toBe('380px');
+      expect(properties.get('--fold-end')).toBe('420px');
+      expect(properties.get('--fold-gap')).toBe('40px');
+      applyNativeFoldLayout(value);
+      expect(dispatchEvent).toHaveBeenCalledTimes(1);
+      value.reservedRegions = [region({ x: 0, y: 200, width: 400, height: 0 })];
+      applyNativeFoldLayout(value);
+      expect(root.dataset.foldPosture).toBe('tabletop');
+      expect(properties.get('--fold-start')).toBe('400px');
+      vi.stubGlobal('window', { dispatchEvent, visualViewport: { offsetLeft: 35, offsetTop: 80, scale: 2 } });
+      value.reservedRegions = [region({ x: 200, width: 0, height: 400 })];
+      applyNativeFoldLayout(value);
+      expect(root.dataset.foldPosture).toBe('book');
+      expect(properties.get('--fold-start')).toBe('235px');
+      value.reservedRegions = [];
+      applyNativeFoldLayout(value);
+      expect(root.dataset.foldPosture).toBeUndefined();
+      expect(properties.size).toBe(0);
+      root.clientWidth = 1200;
+      applyNativeFoldLayout(null);
+      expect(root.dataset.foldPosture).toBeUndefined();
+      expect(dispatchEvent).toHaveBeenCalledTimes(4);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it('converts points once, preserving zero division and visual viewport offsets', () => {
     const value = readIosViewport({ width: 400, height: 800, verticalBarSide: 'left', reservedRegions: [region({ x: 200, height: 800 })] })!;
     expect(iosRegionsInCss(value, 800, { x: 35, y: 80, width: 400, height: 600, scale: 2 })).toEqual([

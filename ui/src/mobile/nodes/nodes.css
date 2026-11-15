@@ -357,6 +357,19 @@
 
 /* ═══════════ ⑤ 注脚（TsExitWarning / 组网隧道健康 / 行内反馈）═══════════ */
 
+.identity-recovery {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  color: hsl(var(--fg-dim));
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.identity-recovery > p { margin: 0; }
+
 /*
  * `notice-banner`（§3.1 第 1 条）：满幅的「图标 + 文字（+ 动作）」条。
  * 三档语气保持三档 —— 合并会丢掉「未生效」「此处不适用」「已关掉」之间的区别。

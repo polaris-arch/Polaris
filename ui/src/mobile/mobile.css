@@ -505,7 +505,7 @@ body {
 .m-pending-primary {
   color: #00141d;
 }
-.m-pending-primary::before { border-color: transparent; background: hsl(var(--flow)); }
+.m-pending-primary::before { border-color: transparent; background: hsl(var(--mobile-action-fill)); }
 
 /* 武装态：翻实心红 + 换文案（同桌面 `.btn.confirming` 的两条动作）。 */
 .m-pending-confirming {
@@ -688,6 +688,13 @@ body {
   border-radius: 16px 16px 0 0;
   background: hsl(var(--surface)); box-shadow: var(--shadow-sheet); overflow-wrap: anywhere;
 }
+:root .m-select-panel[data-ios-reserved-adjusted] {
+  position: absolute;
+  left: var(--ios-region-left);
+  bottom: var(--ios-region-bottom);
+  width: var(--ios-region-width);
+  max-height: var(--ios-region-height);
+}
 .m-select-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .m-select-head h2 { margin: 0; min-width: 0; font-size: 1rem; line-height: 1.35; max-height: 2.7em; overflow-y: auto; overflow-wrap: anywhere; }
 .m-select-panel button {
@@ -718,6 +725,7 @@ body {
   padding-bottom: var(--safe-b);
   --ios-rail-w: 80px;
   --rail-edge-safe: var(--safe-r);
+  --m-navigation-rail-side: none;
 }
 
 :root[data-mobile-os='ios'][dir='rtl'] .m-shell {
@@ -764,6 +772,13 @@ body {
 :root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-shell,
 :root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'] .m-shell {
   grid-template-rows: minmax(0, 1fr) auto;
+  --m-navigation-rail-side: right;
+}
+
+/* Expose the existing rail geometry even on a pushed page, so responsive
+ * settings can decide whether two panes fit before restoring navigation. */
+:root[data-mobile-os='ios'][dir='rtl']:not([data-ios-vertical-bar-side='left']):not([data-ios-vertical-bar-side='right']):is([data-ios-horizontal-size-class='regular'], [data-ios-vertical-size-class='compact']) .m-shell {
+  --m-navigation-rail-side: left;
 }
 
 :root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-shell[data-navigation='visible'],
@@ -821,6 +836,12 @@ body {
 
 /* UIKit resolves leading/trailing to a physical side. Grid line numbering
  * follows dir, so the RTL rules below keep that same physical side. */
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'] .m-shell {
+  --m-navigation-rail-side: left;
+}
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='right'] .m-shell {
+  --m-navigation-rail-side: right;
+}
 :root[data-mobile-os='ios']:is([data-ios-vertical-bar-side='left'], [data-ios-vertical-bar-side='right']) .m-shell[data-navigation='visible'] {
   grid-template-rows: minmax(0, 1fr) auto;
   grid-template-columns: minmax(0, 1fr) max-content;
@@ -892,8 +913,8 @@ body {
 
 /* Reserved geometry adjusts only the colliding chrome in its existing flow or
  * containing block. The scroll/page dimensions are never assigned a safe pane. */
-:root[data-mobile-os='ios'] .m-nav[data-ios-reserved-adjusted],
-:root[data-mobile-os='ios'] .m-pending-slot[data-ios-reserved-adjusted] {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-nav[data-ios-reserved-adjusted],
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-pending-slot[data-ios-reserved-adjusted] {
   width: var(--ios-region-width);
   max-height: var(--ios-region-height);
   margin-bottom: var(--ios-region-bottom);
@@ -902,13 +923,13 @@ body {
   overflow-y: auto;
   box-sizing: border-box;
 }
-:root[data-mobile-os='ios'] .m-nav[data-ios-reserved-adjusted='true'] { flex-wrap: wrap; }
-:root[data-mobile-os='ios'] .m-nav[data-ios-reserved-adjusted='rail'] {
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-nav[data-ios-reserved-adjusted='true'] { flex-wrap: wrap; }
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-nav[data-ios-reserved-adjusted='rail'] {
   align-self: start;
   margin-top: var(--ios-region-top);
   margin-bottom: 0;
 }
-:root[data-mobile-os='ios'] .m-pending-slot[data-ios-reserved-adjusted] .m-pending { flex-wrap: wrap; }
+:root:is([data-mobile-os='ios'], [data-mobile-os='android']) .m-pending-slot[data-ios-reserved-adjusted] .m-pending { flex-wrap: wrap; }
 :root[data-mobile-os='ios'] .m-toast-host[data-ios-reserved-adjusted] {
   left: var(--ios-region-left);
   right: auto;
@@ -994,4 +1015,29 @@ body {
   .m-toast-dismissible .m-toast-actions { grid-row: 2; grid-column: 1; max-width: 100%; }
   .m-toast-dismissible .m-toast-action { flex: 1 1 0; min-width: var(--tap-min); }
   .m-toast-dismissible .m-toast-close { grid-row: 2; grid-column: 2; align-self: start; }
+}
+
+/* Only active native divisions select tabletop. Keep the complete app and its
+   overlays above the fold; the lower display belongs to the system keyboard. */
+:root[data-fold-posture='tabletop'] .m-shell {
+  height: min(var(--m-vv-height, 100%), calc(var(--fold-start) - var(--m-vv-top, 0px)));
+  padding-bottom: 0;
+}
+:root[data-fold-posture='tabletop'] .m-nav {
+  max-height: min(var(--m-vv-height, 100%), calc(var(--fold-start) - var(--m-vv-top, 0px)));
+}
+:root[data-fold-posture='tabletop'] .m-form-layer,
+:root[data-fold-posture='tabletop'] .m-select-layer,
+:root[data-fold-posture='tabletop'] .m-lock-viewport {
+  height: min(var(--m-vv-height, 100%), calc(var(--fold-start) - var(--m-vv-top, 0px)));
+  bottom: auto;
+}
+:root[data-mobile-os='ios'][data-fold-posture='tabletop'] .m-form-layer,
+:root[data-mobile-os='ios'][data-fold-posture='tabletop'] .m-select-layer,
+:root[data-mobile-os='ios'][data-fold-posture='tabletop'] .m-lock-viewport {
+  top: var(--ios-form-viewport-top, 0px);
+  height: var(--ios-form-viewport-height, var(--fold-start));
+}
+:root[data-mobile-os='ios'][data-fold-posture='tabletop'] .m-shell {
+  height: min(calc(var(--ios-form-viewport-height, 100%) + var(--ios-form-viewport-top, 0px)), var(--fold-start));
 }

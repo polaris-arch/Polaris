@@ -293,6 +293,7 @@ impl ChildWaiter for Child {
 
 struct ChildCustody {
     child: Box<dyn ChildWaiter>,
+    log_custody: Option<polaris_log_budget::PipeLogCustody>,
     phase: LocalReapFact,
     /// Instant the single TERM/KILL worker was admitted (also the exit-timing origin).
     termination_started: Option<Instant>,
@@ -324,21 +325,27 @@ impl ChildSlot {
     fn from_admitted_child(
         child: polaris_core_supervisor::admitted_payload::StdCustodiedChild,
         handle: CoreHandle,
+        log_custody: Option<polaris_log_budget::PipeLogCustody>,
     ) -> Arc<Self> {
         debug_assert_eq!(child.id(), handle.pid);
-        Self::with_waiter(handle, Box::new(child))
+        Self::with_waiter(handle, Box::new(child), log_custody)
     }
     #[cfg(test)]
     fn from_child(child: Child, handle: CoreHandle) -> Arc<Self> {
         debug_assert_eq!(child.id(), handle.pid);
-        Self::with_waiter(handle, Box::new(child))
+        Self::with_waiter(handle, Box::new(child), None)
     }
 
-    fn with_waiter(handle: CoreHandle, child: Box<dyn ChildWaiter>) -> Arc<Self> {
+    fn with_waiter(
+        handle: CoreHandle,
+        child: Box<dyn ChildWaiter>,
+        log_custody: Option<polaris_log_budget::PipeLogCustody>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             handle,
             custody: Mutex::new(ChildCustody {
                 child,
+                log_custody,
                 phase: LocalReapFact::Pending,
                 termination_started: None,
             }),
@@ -354,7 +361,7 @@ impl ChildSlot {
                 Ok(None)
             }
         }
-        Self::with_waiter(CoreHandle::new(pid), Box::new(PendingWaiter))
+        Self::with_waiter(CoreHandle::new(pid), Box::new(PendingWaiter), None)
     }
 
     #[cfg(test)]
@@ -377,6 +384,16 @@ impl ChildSlot {
         match custody.child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
+                // Every Stop/admission/reaper path shares this terminal fact. Revoke this
+                // birth's writer before exposing Reaped; inherited pipes may keep draining.
+                if let Some(log_custody) = &custody.log_custody {
+                    if let Err(error) = log_custody.revoke() {
+                        log::error!("helper log writer revocation unconfirmed: {error}");
+                        custody.phase = LocalReapFact::Unknown;
+                        self.cv.notify_all();
+                        return;
+                    }
+                }
                 log::info!(
                     owner = self.handle.owner_uid;
                     "core exited pid={} {status} term_to_exit_ms={:?}",
@@ -557,7 +574,7 @@ struct PinnedLogPath {
 }
 
 fn pin_log_path(path: &Path, uid: u32) -> std::io::Result<PinnedLogPath> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "log path has no parent")
@@ -568,7 +585,10 @@ fn pin_log_path(path: &Path, uid: u32) -> std::io::Result<PinnedLogPath> {
             "log path has no file name",
         )
     })?;
-    let directory = File::open(parent)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NONBLOCK)
+        .open(parent)?;
     let metadata = directory.metadata()?;
     if !metadata.is_dir() || metadata.uid() != uid {
         return Err(std::io::Error::new(
@@ -934,9 +954,9 @@ impl AmbientCapsSpawner {
         );
 
         let log_handoff_started = std::time::Instant::now();
-        if let Some(log) = pinned_log {
-            // 与 Windows 已验证形态一致：pipe 所有权先交后台，日志裁剪/轮转/open/fchown 不再阻塞
-            // helper 回复。线程持有读端，child 不会在 writer 就绪前收到 broken pipe。
+        let log_custody = pinned_log.map(|log| {
+            // 同步初始化本 birth 的 Fresh writer，避免迟到初始化轮转后继会话的日志。
+            // reader 后台排空；ChildSlot 退休前只撤销 writer，不等待 pipe EOF。
             let stdout = child.take_stdout().map(|inner| PinnedReader {
                 inner,
                 _directory: Arc::clone(&log.directory),
@@ -948,28 +968,25 @@ impl AmbientCapsSpawner {
                 _tail: ReapTail::new(&self.reaps),
             });
             let owned_log_path = log.path;
-            let directory = log.directory;
+            let _directory = log.directory;
             let uid = req.uid;
             let gid = req.gid;
-            std::thread::spawn(move || {
-                // 保持 directory fd 至少活到 writer 同步打开；两个 PinnedReader 再把它持到管道排空，
-                // 覆盖运行期轮转对 `/proc/self/fd/<n>` 的后续重开。
-                let _directory = directory;
-                polaris_log_budget::spawn_pipe_loggers_with_file(
-                    stdout,
-                    stderr,
-                    &owned_log_path,
-                    polaris_log_budget::DEFAULT_GENERATION_BYTES,
-                    |opened| {
-                        // helper 自身是 root，创建出的文件需归还对端属主；直接作用于 writer 已打开的
-                        // 同一 fd，不再按用户可写路径二次 open，避免路径替换让属主修正打到别的 inode。
-                        if let Some(file) = opened {
-                            let _ = std::os::unix::fs::fchown(file, Some(uid), Some(gid));
-                        }
-                    },
-                );
-            });
-        }
+            // directory fd 至少持到同步打开完成；两个 PinnedReader 再持到管道排空，
+            // 覆盖运行期轮转对 `/proc/self/fd/<n>` 的后续重开。
+            polaris_log_budget::spawn_pipe_loggers_with_file(
+                stdout,
+                stderr,
+                &owned_log_path,
+                polaris_log_budget::DEFAULT_GENERATION_BYTES,
+                |opened| {
+                    // helper 自身是 root，创建出的文件需归还对端属主；直接作用于 writer 已打开的
+                    // 同一 fd，不再按用户可写路径二次 open，避免路径替换让属主修正打到别的 inode。
+                    if let Some(file) = opened {
+                        let _ = std::os::unix::fs::fchown(file, Some(uid), Some(gid));
+                    }
+                },
+            )
+        });
         let log_handoff_ms = crate::elapsed_ms(log_handoff_started);
 
         let handle = match req.birth {
@@ -985,7 +1002,7 @@ impl AmbientCapsSpawner {
             Some(core) => handle.with_core(core, req.uid),
             None => handle,
         };
-        let slot = ChildSlot::from_admitted_child(child, handle.clone());
+        let slot = ChildSlot::from_admitted_child(child, handle.clone(), log_custody);
         self.slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

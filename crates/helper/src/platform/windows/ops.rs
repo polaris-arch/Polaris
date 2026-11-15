@@ -137,6 +137,7 @@ pub trait ProcOps: Send + Sync {
         _params: &StartParams,
         _birth: HelperBirthToken,
         _conf_dir: &str,
+        _support_dir: &str,
         _owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
         Err(std::io::Error::new(
@@ -149,7 +150,12 @@ pub trait ProcOps: Send + Sync {
         NativeChildPoll::Unknown
     }
     /// Termination ACK is insufficient; success requires a native HANDLE wait.
-    fn stop_native_child(&self, _target: HelperBirthTarget) -> NativeChildPoll {
+    /// `owner` only attributes the stop lifecycle log records to the core's owner.
+    fn stop_native_child(
+        &self,
+        _target: HelperBirthTarget,
+        _owner: Option<&polaris_helper_proto::core_protocol::CallerIdentity>,
+    ) -> NativeChildPoll {
         NativeChildPoll::Unknown
     }
     /// Retire only an exact native object whose exit was successfully cached.
@@ -611,6 +617,7 @@ impl ProcOps for MockProcOps {
         params: &StartParams,
         birth: HelperBirthToken,
         _conf_dir: &str,
+        _support_dir: &str,
         _owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
         assert!(
@@ -655,7 +662,11 @@ impl ProcOps for MockProcOps {
         }
         poll
     }
-    fn stop_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
+    fn stop_native_child(
+        &self,
+        target: HelperBirthTarget,
+        _owner: Option<&polaris_helper_proto::core_protocol::CallerIdentity>,
+    ) -> NativeChildPoll {
         if *self.inner.native_target.lock().unwrap() != Some(target) {
             return NativeChildPoll::Unknown;
         }

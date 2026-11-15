@@ -41,6 +41,7 @@ document.documentElement.dataset.theme = 'dark';
 createRoot(document.getElementById('root')).render(<App />);
 `;
 let server: ViteDevServer; let browser: Browser; let origin: string;
+const invalidUpstream = 'Use a literal IP address with HTTPS, TLS or UDP. TLS upstreams cannot include paths or extra parameters.';
 describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('N1 real component transaction regressions', () => {
   beforeAll(async () => {
     server = await createServer({ root, server: { host: '127.0.0.1', port: 0 }, plugins: [{
@@ -92,15 +93,15 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('N1 real component tra
       expect(await page.evaluate(() => (window as any).__n1.writes[0].patch.dnsConfig.nodeResolverPool)).toEqual([]);
       const input = page.locator('[data-list-editor="race-custom-entries"] input').first();
       await input.fill('invalid host'); await input.blur();
-      await page.getByText(/invalid host/).first().waitFor();
+      await page.getByText(invalidUpstream, { exact: true }).waitFor();
       expect(await page.evaluate(() => (window as any).__n1.writes.length)).toBe(1);
       await input.fill('https://1.1.1.1/A'); await input.blur();
-      expect(await page.getByText(/invalid host/).count()).toBe(0);
+      expect(await page.getByText(invalidUpstream, { exact: true }).count()).toBe(0);
       expect(await page.evaluate(() => (window as any).__n1.writes.length)).toBe(1);
       await input.fill('invalid host'); await input.blur();
-      await page.getByText(/invalid host/).first().waitFor();
+      await page.getByText(invalidUpstream, { exact: true }).waitFor();
       await input.fill('https://1.1.1.1/A'); await input.blur();
-      expect(await page.getByText(/invalid host/).count()).toBe(0);
+      expect(await page.getByText(invalidUpstream, { exact: true }).count()).toBe(0);
 
     } finally { await page.close(); }
   });
@@ -128,6 +129,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('N1 real component tra
         await page.evaluate(()=>(window as any).__n1.writes[0].resolve());
         await page.evaluate(()=>(window as any).__n1.writes[1].reject(new Error('B failed')));
         await page.waitForFunction(()=>Object.keys((window as any).__n1.feedback).length===1);
+        if(kind==='language')await page.waitForFunction(()=>(window as any).__n1.language()==='zh-CN');
         expect(await page.evaluate(kind=>kind==='theme'?document.documentElement.dataset.theme:(window as any).__n1.language(),kind)).toBe(kind==='theme'?'light':'zh-CN');
         // New isolated page retains the global application even after the page component exits.
         await page.goto(origin+'/__n1');
@@ -135,6 +137,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('N1 real component tra
         await page.evaluate(()=>(window as any).__n1.hide());
         await page.getByText('Page closed').waitFor();
         await page.evaluate(()=>(window as any).__n1.writes[0].resolve());
+        if(kind==='language')await page.waitForFunction(()=>(window as any).__n1.language()==='zh-CN');
         expect(await page.evaluate(kind=>kind==='theme'?document.documentElement.dataset.theme:(window as any).__n1.language(),kind)).toBe(kind==='theme'?'light':'zh-CN');
         await page.evaluate(()=>(window as any).__n1.show());
         await page.locator('[data-setting="theme"]').waitFor();
@@ -174,10 +177,10 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('N1 real component tra
       await editor.getByRole('button').filter({hasText:/Add/}).first().click();
       const input=editor.locator('input').nth(1);
       await input.fill('invalid-added-host');await input.blur();
-      await page.getByText(/invalid-added-host/).first().waitFor();
+      await page.getByText(invalidUpstream, { exact: true }).waitFor();
       const writes=await page.evaluate(()=>(window as any).__n1.writes.length);
       await editor.locator('button.m-settings-list-remove').nth(1).click();
-      expect(await page.getByText(/invalid-added-host/).count()).toBe(0);
+      expect(await page.getByText(invalidUpstream, { exact: true }).count()).toBe(0);
       expect(await page.evaluate(()=>(window as any).__n1.writes.length)).toBe(writes);
     }finally{await page.close();}
   });

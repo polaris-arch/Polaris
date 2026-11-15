@@ -78,7 +78,7 @@ import {
   type BackOutcome,
 } from './MobileApp';
 import { DEFAULT_DESTINATION, type DestinationId } from './destinations';
-import { MobileShell, setPushedPage } from './MobileShell';
+import { MobileShell, SettingsLayoutContext, setPushedPage } from './MobileShell';
 import { Scrim } from './home/HomeScreenView';
 import { Sheet as NodesSheet } from './nodes/NodesScreenView';
 import { ActionSheet as ConnectionsSheet } from './connections/ConnectionsView';
@@ -1187,5 +1187,12 @@ describe('④ 二级页：无底部导航，且系统返回键退得回来', () 
     expect(html, '渲染出来的不是关于页').toContain('data-external=');
     expect(dismissTop()).toBe(true);
     expect(shell('settings', <MobileSettingsScreen />)).toContain('class="m-nav"');
+  });
+
+  it('设置分类与详情并列时，选中详情不占系统返回层', () => {
+    useAppStore.setState({ config: {} as unknown as UserConfig });
+    setPushedPage('settings', 'about');
+    expect(depthAfter(<SettingsLayoutContext.Provider value={true}><MobileSettingsScreen /></SettingsLayoutContext.Provider>)).toBe(0);
+    expect(dismissTop()).toBe(false);
   });
 });

@@ -13,11 +13,20 @@ import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.window.layout.FoldingFeature
+import androidx.window.layout.WindowInfoTracker
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.util.Locale
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * web 层往原生投递生效主题用的 JS 对象名（`addWebMessageListener` 注入到 `window` 上）。
@@ -286,6 +295,12 @@ class MainActivity : TauriActivity() {
    * 字号没有等价的系统回调可借（`Configuration` 变化不经过 inset 通道），只能自己拿着。
    */
   private var webViewTarget: WebView? = null
+  private var foldFeature: FoldingFeature? = null
+  private var foldViewportScript: ScriptHandler? = null
+  private var foldViewportSequence = 0L
+  private val foldLayoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+    webViewTarget?.let { publishFoldViewport(it) }
+  }
 
   fun notifyLibboxReady() {
     runOnUiThread {
@@ -310,6 +325,29 @@ class MainActivity : TauriActivity() {
     // 在文档起始脚本跑到时接管。理由见类头注「冷启动那一格由谁负责」。
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    lifecycleScope.launch {
+      repeatOnLifecycle(Lifecycle.State.STARTED) {
+        try {
+          WindowInfoTracker.getOrCreate(this@MainActivity).windowLayoutInfo(this@MainActivity).collect { info ->
+            foldFeature = info.displayFeatures.filterIsInstance<FoldingFeature>()
+              .firstOrNull { it.state == FoldingFeature.State.HALF_OPENED }
+            webViewTarget?.let { publishFoldViewport(it) }
+          }
+        } finally {
+          foldFeature = null
+          webViewTarget?.let { publishFoldViewport(it) }
+        }
+      }
+    }
+  }
+
+  override fun onDestroy() {
+    webViewTarget?.removeOnLayoutChangeListener(foldLayoutListener)
+    foldViewportScript?.remove()
+    foldViewportScript = null
+    foldFeature = null
+    webViewTarget = null
+    super.onDestroy()
   }
 
   /**
@@ -331,7 +369,10 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     val host = insetHost()
     insetTarget = host
+    webViewTarget?.removeOnLayoutChangeListener(foldLayoutListener)
     webViewTarget = webView
+    webView.addOnLayoutChangeListener(foldLayoutListener)
+    publishFoldViewport(webView)
     // The app has its own responsive layout and system-font-scale path. Disable only WebView page
     // gestures (pinch / double tap); do not intercept touch events, scrolling, or input focus.
     webView.settings.apply {
@@ -557,6 +598,43 @@ class MainActivity : TauriActivity() {
       // 允许面用 `*`：装载的只可能是本应用自己的文档（打包态 `tauri.localhost`、
       // dev 档是 devUrl），而写死其中一个会让另一档静默失效；载荷只有四个 CSS 长度值。
       safeAreaScript = WebViewCompat.addDocumentStartJavaScript(webView, js, setOf("*"))
+    }
+  }
+
+  /** FoldingFeature bounds use window pixels; subtract the actual WebView origin.
+   * FLAT/no feature publishes no division, so unfold clears the web posture. */
+  private fun publishFoldViewport(webView: WebView) {
+    if (webView.width <= 0 || webView.height <= 0) return
+    val regions = JSONArray()
+    foldFeature?.let { feature ->
+      val origin = IntArray(2)
+      webView.getLocationInWindow(origin)
+      val bounds = feature.bounds
+      val left = (bounds.left - origin[0]).coerceAtLeast(0)
+      val top = (bounds.top - origin[1]).coerceAtLeast(0)
+      val right = (bounds.right - origin[0]).coerceAtMost(webView.width)
+      val bottom = (bounds.bottom - origin[1]).coerceAtMost(webView.height)
+      if (right >= left && bottom >= top && (right > left || bottom > top)) {
+        regions.put(JSONObject().put("kind", "division").put("x", left).put("y", top)
+          .put("orientation", if (feature.orientation == FoldingFeature.Orientation.HORIZONTAL) "horizontal" else "vertical")
+          .put("width", right - left).put("height", bottom - top))
+      }
+    }
+    val value = JSONObject().put("width", webView.width).put("height", webView.height)
+      .put("reservedRegions", regions)
+    val sequence = ++foldViewportSequence
+    val js = """
+      (() => {
+        const value = $value, sequence = $sequence;
+        if (window.__polarisAndroidViewport?.sequence > sequence) return;
+        window.__polarisAndroidViewport = {value, sequence};
+        window.dispatchEvent(new Event('polaris-android-viewport-change'));
+      })();
+    """.trimIndent()
+    webView.evaluateJavascript(js, null)
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+      foldViewportScript?.remove()
+      foldViewportScript = WebViewCompat.addDocumentStartJavaScript(webView, js, setOf("*"))
     }
   }
 

@@ -40,7 +40,7 @@ impl NativeChild for Child {
             .0
             .exited
             .load(Ordering::SeqCst)
-            .then(|| std::os::unix::process::ExitStatusExt::from_raw(0)))
+            .then(std::process::ExitStatus::default))
     }
     fn terminate(&mut self) -> io::Result<()> {
         self.0.terms.fetch_add(1, Ordering::SeqCst);

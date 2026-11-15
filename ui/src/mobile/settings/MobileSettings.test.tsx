@@ -62,7 +62,8 @@ import { collapsibleGroups, DnsPage, openGroupOf } from './DnsPage';
 import { GeneralPage } from './GeneralPage';
 import { NetworkPage } from './NetworkPage';
 import { MobileSettingsScreen, SettingsRoot, watchVpnAuth, type VisibilityTarget } from './MobileSettingsScreen';
-import { MobileShell, setPushedPage } from '../MobileShell';
+import { MobileShell, SettingsLayoutContext, setPushedPage } from '../MobileShell';
+import { clearDismissables, dismissTop } from '../back-stack';
 import { SettingsHeader } from './SettingsChrome';
 import { useAppStore } from '@/store/app-store';
 import type { VpnAuthState } from '@/ipc/api/vpn';
@@ -955,10 +956,10 @@ function SettingsRoot({ vpnAuth }) {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-describe('② 不做 split view（收敛 §2.3 / 裁定 #6）', () => {
+describe('② 分类与详情组件保持各自职责', () => {
   it('根页只有进入行、没有设置控件；二级页只有设置控件、没有进入行', () => {
-    // 两侧同时成立 ⇒ 结构上不可能出现「左栏目录 + 右栏内容」的双栏形态。
-    expect(switchRows(ROOT_MARKUP), '根页出现了设置控件 —— 那是 split view 的形状').toEqual([]);
+    // 两种布局复用同一组分类和详情组件，分类本身不承担设置编辑。
+    expect(switchRows(ROOT_MARKUP), '分类组件出现了设置控件').toEqual([]);
     for (const id of MOBILE_SETTINGS_PAGES) {
       expect(MARKUP[id], `${id} 页里出现了根页的进入行`).not.toContain('data-push=');
     }
@@ -3072,6 +3073,60 @@ describe('⑮ 压栈页不带底部导航（spec Variants / §2.4）', () => {
     expect(screenTree()).not.toContain('class="m-nav"');
     setPushedPage('settings', null);
     expect(screenTree()).toContain('class="m-nav"');
+  });
+
+  it('宽窗沿用选中页，同时显示分类和详情且不画弹栈返回', () => {
+    reset();
+    useAppStore.setState({ config: CONFIG as unknown as UserConfig });
+    setPushedPage('settings', 'dns');
+    const html = render(createElement(SettingsLayoutContext.Provider, { value: true }, createElement(MobileSettingsScreen)));
+    expect(html).toContain('data-split="true"');
+    expect(html).toContain('data-push="dns" aria-current="page"');
+    expect(html).toContain('data-setting="connection-resolution"');
+    expect(html).not.toContain('data-back="settings"');
+    reset();
+  });
+
+  it('宽窗初入默认显示通用详情，窄窗初入仍只显示分类', () => {
+    reset();
+    useAppStore.setState({ config: CONFIG as unknown as UserConfig });
+    const wide = render(createElement(SettingsLayoutContext.Provider, { value: true }, createElement(MobileSettingsScreen)));
+    expect(wide).toContain('data-push="general" aria-current="page"');
+    expect(wide).toContain('data-setting="auto-connect"');
+    expect(screenTree()).not.toContain('data-setting="auto-connect"');
+    reset();
+  });
+
+  it('宽窗已有选择面板后收窄，返回先关面板，再退出设置详情', () => {
+    reset();
+    clearDismissables();
+    useAppStore.setState({ config: CONFIG as unknown as UserConfig });
+    setPushedPage('settings', 'dns');
+    let panelClosed = false;
+    const tree = (twoPane: boolean, open: boolean): string => render(
+      createElement(SettingsLayoutContext.Provider, { value: twoPane },
+        createElement('div', null,
+          createElement(MobileSettingsScreen),
+          createElement(SelectSheetPanel, {
+            label: 'DNS', options: [], value: '', open,
+            onClose: () => { panelClosed = true; }, onSelect: () => undefined,
+            closeLabel: copy('common.close'),
+          }),
+        ),
+      ),
+    );
+    try {
+      expect(tree(true, true)).toContain('role="dialog"');
+      expect(tree(false, true)).toContain('data-back="settings"');
+      expect(dismissTop()).toBe(true);
+      expect(panelClosed).toBe(true);
+      expect(tree(false, false)).toContain('data-setting="connection-resolution"');
+      expect(dismissTop()).toBe(true);
+      expect(tree(false, false)).toContain('data-push="dns"');
+    } finally {
+      clearDismissables();
+      reset();
+    }
   });
 
   it('反向对照：别的目的地压着栈不影响本目的地的导航（外壳读的是当前那一格）', () => {

@@ -34,9 +34,7 @@ fn pending_stop_and_commit_are_serialized_under_one_lock() {
     let declare = body("fn declare_scheduled_refresh(");
     let lock = declare.find("ipinfo_state().lock()").unwrap();
     let seq = declare.find("declare_schedule_locked()").unwrap();
-    let pending = declare
-        .find("state.publish(pending_ipinfo_snapshot(), false)")
-        .unwrap();
+    let pending = declare.find("state.publish(pending, false)").unwrap();
     let stop = declare.find("state.publish(stopped, true)").unwrap();
     assert!(lock < seq && seq < pending && seq < stop);
     assert!(

@@ -20,13 +20,13 @@ export function IdentityRecoveryEntry({ onOpen }: { onOpen: () => void }) {
     );
     return () => { current = false; };
   }, [publication, retry]);
-  if (status === 'conflict') return <div role="alert">
+  if (status === 'conflict') return <div role="alert" className="identity-recovery">
     <p>{t('identityRepair.ambiguous')}</p>
-    <button type="button" className="btn" onClick={onOpen}>{t('identityRepair.review')}</button>
+    <button type="button" className="btn m-settings-btn" onClick={onOpen}>{t('identityRepair.review')}</button>
   </div>;
-  if (status === 'failed') return <div role="status">
+  if (status === 'failed') return <div role="status" className="identity-recovery">
     <p>{t('identityRepair.loadFailed')}</p>
-    <button type="button" className="btn" onClick={() => setRetry(value => value + 1)}>{t('identityRepair.reload')}</button>
+    <button type="button" className="btn m-settings-btn" onClick={() => setRetry(value => value + 1)}>{t('identityRepair.reload')}</button>
   </div>;
   return null;
 }

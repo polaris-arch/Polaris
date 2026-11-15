@@ -306,6 +306,12 @@ fn native_platform_capability_and_stop_require_their_own_exact_receipt_family() 
                 wire == "ERR unknown",
                 "{wire}"
             );
+            assert_eq!(
+                matches!(probed, Err(BirthCapabilityError::SlotOccupied(_))),
+                wire.starts_with("OK native-birth-status unknown")
+                    || wire.starts_with("OK native-birth-status stopping"),
+                "{wire}"
+            );
             assert_eq!(*frames.lock().unwrap(), ["TOK\nstatus-native-birth-safe\n"]);
         }
         let target = birth_target(4242, "00112233445566778899aabbccddeeff");

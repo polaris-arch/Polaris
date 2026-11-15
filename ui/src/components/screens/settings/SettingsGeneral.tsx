@@ -140,10 +140,10 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
           故全页无 disabled 标记。（原注写「仍未接通的 autoPrivacyMode …已接线」自相矛盾，是接线落地后
           没跟着改的陈述残留，一并订正。） */}
       <SetBlock header={t('settings.general.groupStartup')}>
-        <SetRow label={t('settings.general.autoStartTitle')}>
+        <SetRow label={t('settings.general.autoStartTitle')} ctrlStyle={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {autoStart === null && <Button variant="ghost" size="sm" onClick={() => void readAutoStart()}>{t('common.retry')}</Button>}
           <Switch checked={autoStart ?? false} indeterminate={autoStart === null}
             disabled={autoStartBusy || autoStart === null} onChange={toggleAutoStart} />
-          {autoStart === null && <Button variant="ghost" size="sm" onClick={() => void readAutoStart()}>{t('common.retry')}</Button>}
         </SetRow>
         <SetRow
           label={t('settings.general.silentStart')}

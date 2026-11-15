@@ -1335,7 +1335,7 @@ impl ProxyRuntime {
         let preflight_ms = t_preflight.elapsed().as_millis();
         log::info!("起核耗时：配置解析+网卡绑定前置校验={preflight_ms}ms");
         // Bootstrap DoH 阻断探测：TUN 尚未建立，App socket 走物理网卡，与提权门/配置生成并行；首次 spawn
-        // 前收割，未完成即未知。只把 RST/拒绝/超时算阻断，其它错误（无网等）不报，免得与断网混淆。
+        // 前收割。只把 RST/拒绝/超时算阻断，其它错误（无网等）算未知，免得与断网混淆。
         let mut doh_probe = user_config
             .dns_servers
             .iter()
@@ -1875,9 +1875,9 @@ impl ProxyRuntime {
             // late fence ensures the legacy path does not intentionally spawn
             // after observing a managed document.
             self.admit_legacy_start()?;
-            // 已完成的任务 abort 无效、照常取回结果；未完成的被取消 ⇒ 未知。
+            // 不 abort：探测自带 1.5s 超时，未完成时只等「探测起点 + 1.5s」的剩余时间；正常网络早已
+            // 完成，只有黑洞型阻断会多等。
             if let Some(probe) = doh_probe.take() {
-                probe.abort();
                 doh_blocked = probe.await.unwrap_or(false);
             }
             let t_spawn = std::time::Instant::now();

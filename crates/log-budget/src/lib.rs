@@ -284,13 +284,15 @@ pub fn spawn_pipe_loggers<O, E>(
 /// Linux 特权 helper 用它对 writer 已打开的同一 fd 执行 `fchown`；不能在外层按路径再次 `open`，否则
 /// 用户可写目录中的路径替换会让“日志写入对象”和“root 修正属主对象”分叉。writer 打不开时回调收到
 /// `None`，随后仍会排空 pipe，保持基础函数的不卡 child 语义。
+/// 初始化同步完成；返回的 writer custody 可在原 Child 退休前撤销，不等待 reader EOF。
 pub fn spawn_pipe_loggers_with_file<O, E, F>(
     stdout: Option<O>,
     stderr: Option<E>,
     path: impl Into<PathBuf>,
     generation_bytes: u64,
     after_open: F,
-) where
+) -> PipeLogCustody
+where
     O: Read + Send + 'static,
     E: Read + Send + 'static,
     F: FnOnce(Option<&File>),
@@ -298,7 +300,8 @@ pub fn spawn_pipe_loggers_with_file<O, E, F>(
     let writer = RotatingFile::open(path.into(), generation_bytes, OpenMode::Fresh).ok();
     after_open(writer.as_ref().map(|opened| &opened.file));
     let shared = Arc::new(Mutex::new(writer.map(PipeLogWriter::Path)));
-    spawn_pipe_readers(stdout, stderr, shared);
+    spawn_pipe_readers(stdout, stderr, Arc::clone(&shared));
+    PipeLogCustody { writer: shared }
 }
 
 /// 使用特权侧预开的 current/`.1` 文件持续排空 child stdout/stderr。
@@ -504,8 +507,8 @@ fn trim_file_to_tail(path: &Path, max_bytes: u64) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+    let meta = regular_file_metadata(&file)?;
     secure_file_permissions(&file)?;
-    let meta = file.metadata()?;
     if meta.len() <= max_bytes {
         return Ok(());
     }
@@ -528,7 +531,7 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     options.read(true);
     no_follow(&mut options);
     let mut file = options.open(path)?;
-    let len = file.metadata()?.len();
+    let len = regular_file_metadata(&file)?.len();
     let take = len.min(max_bytes);
     file.seek(SeekFrom::Start(len.saturating_sub(take)))?;
     let cap = usize::try_from(take).unwrap_or(usize::MAX);
@@ -547,6 +550,7 @@ fn open_append(path: &Path) -> std::io::Result<File> {
     }
     no_follow(&mut options);
     let file = options.open(path)?;
+    regular_file_metadata(&file)?;
     // `mode` only governs newly created files. Older releases may have left 0644 logs; tighten the
     // already-open fd before any caller writes a byte so secrets never regain a world-readable window.
     secure_file_permissions(&file)?;
@@ -564,11 +568,22 @@ fn secure_file_permissions(_: &File) -> std::io::Result<()> {
     Ok(())
 }
 
+fn regular_file_metadata(file: &File) -> std::io::Result<std::fs::Metadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "log object is not a regular file",
+        ));
+    }
+    Ok(metadata)
+}
+
 fn reject_symlink(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
+        Ok(meta) if !meta.is_file() => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("refusing symlink log path: {}", path.display()),
+            format!("refusing non-regular log path: {}", path.display()),
         )),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -579,7 +594,7 @@ fn reject_symlink(path: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn no_follow(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
 }
 
 #[cfg(not(unix))]

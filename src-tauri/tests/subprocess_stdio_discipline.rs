@@ -2496,7 +2496,7 @@ fn admitted_helper_stdio_preserves_both_streams_and_native_lease() {
         "child.take_stdout()",
         "child.take_stderr()",
         "spawn_pipe_loggers_with_file(",
-        "ChildSlot::from_admitted_child(child, handle.clone())",
+        "ChildSlot::from_admitted_child(child, handle.clone(), log_custody)",
     ] {
         assert!(
             spawn.contains(needle),

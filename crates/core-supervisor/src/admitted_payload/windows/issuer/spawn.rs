@@ -199,7 +199,7 @@ fn create_suspended(
     cwd: &Path,
     guards: &[&File],
     purpose: ExecPurpose,
-    runtime_directory: Option<&Path>,
+    directories: Option<(&Path, &Path)>,
 ) -> Result<Suspended, AdmissionError> {
     let job = new_job()?;
     let (stdout, out_write) = pipe()?;
@@ -231,8 +231,8 @@ fn create_suspended(
     let environment: Vec<u16> = env.encode_utf16().collect();
     let application = wide(image)?;
     let cwd = wide(cwd)?;
-    // Typed purpose owns argv; only the verified registered state directory is data.
-    let args = fixed_arguments(purpose, runtime_directory)?;
+    // Typed purpose owns argv; runtime and registered resource roots are only data.
+    let args = fixed_arguments(purpose, directories)?;
     let mut command = wide(format!("\"{}\" {args}", image.display()))?;
     let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -303,25 +303,30 @@ impl Drop for Suspended {
 
 fn fixed_arguments(
     purpose: ExecPurpose,
-    runtime_directory: Option<&Path>,
+    directories: Option<(&Path, &Path)>,
 ) -> Result<String, AdmissionError> {
-    match (purpose, runtime_directory) {
-        (ExecPurpose::RunMain, Some(directory)) if directory.is_absolute() => {
-            let directory = directory.to_str().ok_or_else(unavailable)?;
-            // Ordinary Windows paths cannot contain quotes/control bytes. Never
-            // splice arbitrary argv; double terminal slashes before the closing
-            // quote so a drive root and paths with spaces remain one operand.
-            if directory.contains(['"', '\0', '\r', '\n']) {
-                return Err(unavailable());
-            }
-            let trailing = directory.len() - directory.trim_end_matches('\\').len();
-            Ok(format!(
-                "run -c stdin -D \"{directory}{}\"",
-                "\\".repeat(trailing)
-            ))
+    let (runtime, resources) = match (purpose, directories) {
+        (ExecPurpose::RunMain, Some(directories)) => directories,
+        _ => return Err(unavailable()),
+    };
+    let quoted = |directory: &Path| {
+        if !directory.is_absolute() {
+            return Err(unavailable());
         }
-        _ => Err(unavailable()),
-    }
+        let directory = directory.to_str().ok_or_else(unavailable)?;
+        // Double terminal slashes before the closing quote so a drive root and
+        // paths with spaces remain one operand; neither path can inject argv.
+        if directory.contains(['"', '\0', '\r', '\n']) {
+            return Err(unavailable());
+        }
+        let trailing = directory.len() - directory.trim_end_matches('\\').len();
+        Ok(format!("\"{directory}{}\"", "\\".repeat(trailing)))
+    };
+    Ok(format!(
+        "run -c stdin -D {} --resource-directory {}",
+        quoted(runtime)?,
+        quoted(resources)?
+    ))
 }
 
 pub(in super::super) fn spawn(
@@ -329,7 +334,7 @@ pub(in super::super) fn spawn(
     config: File,
     cwd: &Path,
     purpose: ExecPurpose,
-    runtime_directory: Option<&Path>,
+    directories: Option<(&Path, &Path)>,
 ) -> Result<WindowsStartedChild, AdmissionError> {
     system_actor()?;
     if !owner.is_current() || !cwd.is_absolute() {
@@ -351,7 +356,7 @@ pub(in super::super) fn spawn(
         cwd,
         &guards,
         purpose,
-        runtime_directory,
+        directories,
     )?;
     // The process is suspended and already in its job with inherited guards.
     // A changed plan is cancelled without permitting its first instruction.

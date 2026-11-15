@@ -445,8 +445,14 @@ pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
                             crate::helper_policy::policy(Path::new(&args[2]), Path::new(&args[4]))?
                         ))
                     } else {
-                        crate::helper_policy::record(Path::new(&args[2]), Path::new(&args[4]))?;
-                        Ok("helper-record-written".to_owned())
+                        let json =
+                            crate::helper_policy::record(Path::new(&args[2]), Path::new(&args[4]))?;
+                        // Windows 由安装器在本进程退出后原子发布这份回执（stdout 即 JSON）。
+                        if cfg!(windows) {
+                            String::from_utf8(json).map_err(io::Error::other)
+                        } else {
+                            Ok("helper-record-written".to_owned())
+                        }
                     }
                 }
                 _ => unreachable!(),

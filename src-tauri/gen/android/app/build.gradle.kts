@@ -274,6 +274,7 @@ dependencies {
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
+    implementation("androidx.window:window:1.5.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.lifecycle:lifecycle-process:2.10.0")
     // Shared JVM test sources call Tauri Android's public ObjectMapper API.

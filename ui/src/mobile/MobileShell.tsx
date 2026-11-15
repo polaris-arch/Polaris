@@ -43,7 +43,7 @@
  * 控件旁边随时插得进一条警示，这就是它需要的全部结构条件。
  */
 
-import { useRef, useSyncExternalStore, type ReactElement, type ReactNode } from 'react';
+import { createContext, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactElement, type ReactNode } from 'react';
 import { BottomNavigation } from './BottomNavigation';
 import type { DestinationId } from './destinations';
 
@@ -97,6 +97,9 @@ export function usePushedPage(destination: DestinationId): string | null {
   return useSyncExternalStore(subscribePushStack, read, read);
 }
 
+/** The shell measures the usable screen after safe areas and the navigation rail. */
+export const SettingsLayoutContext = createContext(false);
+
 export function MobileShell({
   active,
   onSelect,
@@ -113,57 +116,119 @@ export function MobileShell({
   toastHost?: ReactNode;
 }): ReactElement {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const [twoPaneSettings, setTwoPaneSettings] = useState(false);
+  useLayoutEffect(() => {
+    if (active !== 'settings') {
+      setTwoPaneSettings(false);
+      return;
+    }
+    const viewport = viewportRef.current;
+    const page = pageRef.current;
+    if (!viewport || !page) return;
+    const root = document.documentElement;
+    const measure = (): void => {
+      const rect = page.getBoundingClientRect();
+      const style = getComputedStyle(page);
+      const rootStyle = getComputedStyle(root);
+      const shell = viewport.parentElement!;
+      const shellStyle = getComputedStyle(shell);
+      const railSide = shellStyle.getPropertyValue('--m-navigation-rail-side').trim();
+      // Measure the same usable width before and after a pushed page restores its rail.
+      const hiddenRail = shell.dataset.navigation === 'hidden' && (railSide === 'left' || railSide === 'right');
+      const railWidth = hiddenRail
+        ? parseFloat(shellStyle.getPropertyValue('--ios-rail-w')) + parseFloat(rootStyle.getPropertyValue(railSide === 'left' ? '--safe-l' : '--safe-r')) + 1
+        : 0;
+      const pageWidth = Math.min(rect.width, viewport.clientWidth - railWidth);
+      const font = parseFloat(rootStyle.fontSize);
+      const left = rect.left + (railSide === 'left' ? railWidth : 0) + (rect.width - railWidth - pageWidth) / 2 + parseFloat(style.paddingLeft);
+      const width = pageWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      // Leave room for the category list and an editable detail column; large text falls back naturally.
+      let split = width >= 42 * font;
+      for (const property of ['--settings-fold-columns', '--settings-fold-gap', '--settings-fold-offset', '--settings-fold-width']) page.style.removeProperty(property);
+      if (root.dataset.foldPosture === 'book') {
+        const start = parseFloat(rootStyle.getPropertyValue('--fold-start'));
+        const end = parseFloat(rootStyle.getPropertyValue('--fold-end'));
+        if (Number.isFinite(start) && Number.isFinite(end)) {
+          const before = Math.max(0, Math.min(width, start - left - 8));
+          const afterStart = Math.max(0, Math.min(width, end - left + 8));
+          const after = width - afterStart;
+          split = before >= 12 * font && after >= 20 * font;
+          if (split) {
+            page.style.setProperty('--settings-fold-columns', root.dir === 'rtl' ? `minmax(0, 1fr) ${before}px` : `${before}px minmax(0, 1fr)`);
+            page.style.setProperty('--settings-fold-gap', `${afterStart - before}px`);
+          } else {
+            // A single pane uses the current page bounds rather than a hypothetical rail.
+            const compactLeft = rect.left + parseFloat(style.paddingLeft);
+            const compactWidth = rect.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+            const compactBefore = Math.max(0, Math.min(compactWidth, start - compactLeft - 8));
+            const compactAfterStart = Math.max(0, Math.min(compactWidth, end - compactLeft + 8));
+            const compactAfter = compactWidth - compactAfterStart;
+            page.style.setProperty('--settings-fold-offset', `${compactAfter > compactBefore ? compactAfterStart : 0}px`);
+            page.style.setProperty('--settings-fold-width', `${Math.max(compactBefore, compactAfter)}px`);
+          }
+        }
+      }
+      setTwoPaneSettings(split);
+    };
+    measure();
+    const resize = new ResizeObserver(measure);
+    resize.observe(viewport);
+    resize.observe(page);
+    const appearance = new MutationObserver(measure);
+    appearance.observe(root, { attributes: true, attributeFilter: ['style', 'dir', 'data-fold-posture', 'data-ios-horizontal-size-class', 'data-ios-vertical-size-class', 'data-ios-vertical-bar-side'] });
+    window.addEventListener('polaris-fold-layout-change', measure);
+    return () => {
+      resize.disconnect();
+      appearance.disconnect();
+      window.removeEventListener('polaris-fold-layout-change', measure);
+    };
+  }, [active]);
   /** 当前目的地是否停在二级页。只看**当前**这一格：别的目的地还压着栈不影响本屏的导航。 */
-  const pushed = usePushedPage(active) !== null;
+  const pushed = usePushedPage(active) !== null && !(active === 'settings' && twoPaneSettings);
 
-  /**
-   * spec「Interaction」：Re-tapping the active item returns that stack to its root **or** scrolls it
-   * to top（`bottom-navigation.md`「Interaction」）。两半之间是 **or**，而「回根页」那一半
-   * **从导航上够不着**：同一份 spec 的「Variants」规定压栈的二级页不画底部导航，本组件下面那行
-   * `!pushed && <BottomNavigation …>` 正是它的落实 ⇒ 栈非空时这个回调根本没有触发入口。
-   * 故这里兑现的「滚到顶」就是可达的全部，不是半截（此前的注释把它记成了欠账，是误记）。
-   * 在这条路上补一句 `setPushedPage(active, null)` 只会得到一次恒为 no-op 的写 + 一轮多余的订阅通知。
-   *
-   * 「退掉栈顶那一层」今天有自己的入口：系统返回键（`back-stack.ts` → `MobileApp` 的返回处理器）。
-   * 滚动容器归外壳、屏自己拿不到它，故滚到顶这条只能落在这里。
-   */
+  /* 重按当前主导航滚到顶部；并列设置滚动详情栏。compact 压栈页的返回由 back-stack 处理。 */
   const handleSelect = (id: DestinationId): void => {
     if (id === active) {
-      scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+      const target = twoPaneSettings ? pageRef.current?.querySelector('.ms-detail') : scrollRef.current;
+      target?.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
     onSelect(id);
   };
 
   return (
-    <div className="m-shell" data-responsive-scope="mchrome" data-navigation={pushed ? 'hidden' : 'visible'}>
-      {/* 不滚动的边界承接断点和屏内 fixed 弹层；内层只滚动正文。字号继续继承根缩放。 */}
-      <div className="m-screen-viewport">
-        <div className="m-scroll" ref={scrollRef}>
-          <div className="m-page">{children}</div>
+    <SettingsLayoutContext.Provider value={twoPaneSettings}>
+      <div className="m-shell" data-responsive-scope="mchrome" data-navigation={pushed ? 'hidden' : 'visible'} data-settings-layout={twoPaneSettings ? 'split' : 'compact'}>
+        {/* 不滚动的边界承接断点和屏内 fixed 弹层；内层只滚动正文。字号继续继承根缩放。 */}
+        <div className="m-screen-viewport" ref={viewportRef}>
+          <div className="m-scroll" ref={scrollRef}>
+            <div className="m-page" ref={pageRef}>{children}</div>
+          </div>
+        </div>
+        {/* 停靠区（不滚）：待应用条槽位在上、底部导航在下。 */}
+        <div
+          className="m-dock"
+          /* 压栈页上导航不渲染，但停靠区**本体留着**：`--safe-b` 那段手势条留白是它给的，
+             整块拿掉会让二级页的最后一行压在手势条底下。它此时不该再画成一根条 ⇒ 底色与顶分隔
+             线就地取消（外壳 CSS 已定稿，这两笔只能内联；`.m-pending-slot:empty` 那条仍生效）。 */
+          style={pushed ? { background: 'none', borderTop: 'none' } : undefined}
+        >
+          {/* toast 宿主。**停靠区的 `absolute` 子元素**（`bottom:100%`，见 `mobile.css`）：
+              ① 不占布局 ⇒ toast 进出场不会把滚动区挤得跳一下；
+              ② 压栈的二级页上导航不渲染、**停靠区本体仍在**（`--safe-b` 那段留白是它给的），
+                 故宿主跟着留下，此时贴的是手势条上沿而不是导航上沿 —— 不需要第二套定位。 */}
+          {toastHost}
+          {/* 待应用/待保存条槽位（IA 裁定 #2）。空槽零 DOM 零高度，与桌面那条"差集为空即 return null"
+              同一口径 —— 条自己在无事可做时返 null，槽位随之 `:empty`。 */}
+          <div className="m-pending-slot" data-slot="pending-changes">
+            {pendingBar}
+          </div>
+          {/* spec「Variants」/ IA §2.4：压栈的二级页上不重复画底部导航（栈状态见 [`usePushedPage`]）。 */}
+          {!pushed && <BottomNavigation active={active} onSelect={handleSelect} />}
         </div>
       </div>
-      {/* 停靠区（不滚）：待应用条槽位在上、底部导航在下。 */}
-      <div
-        className="m-dock"
-        /* 压栈页上导航不渲染，但停靠区**本体留着**：`--safe-b` 那段手势条留白是它给的，
-           整块拿掉会让二级页的最后一行压在手势条底下。它此时不该再画成一根条 ⇒ 底色与顶分隔
-           线就地取消（外壳 CSS 已定稿，这两笔只能内联；`.m-pending-slot:empty` 那条仍生效）。 */
-        style={pushed ? { background: 'none', borderTop: 'none' } : undefined}
-      >
-        {/* toast 宿主。**停靠区的 `absolute` 子元素**（`bottom:100%`，见 `mobile.css`）：
-            ① 不占布局 ⇒ toast 进出场不会把滚动区挤得跳一下；
-            ② 压栈的二级页上导航不渲染、**停靠区本体仍在**（`--safe-b` 那段留白是它给的），
-               故宿主跟着留下，此时贴的是手势条上沿而不是导航上沿 —— 不需要第二套定位。 */}
-        {toastHost}
-        {/* 待应用/待保存条槽位（IA 裁定 #2）。空槽零 DOM 零高度，与桌面那条"差集为空即 return null"
-            同一口径 —— 条自己在无事可做时返 null，槽位随之 `:empty`。 */}
-        <div className="m-pending-slot" data-slot="pending-changes">
-          {pendingBar}
-        </div>
-        {/* spec「Variants」/ IA §2.4：压栈的二级页上不重复画底部导航（栈状态见 [`usePushedPage`]）。 */}
-        {!pushed && <BottomNavigation active={active} onSelect={handleSelect} />}
-      </div>
-    </div>
+    </SettingsLayoutContext.Provider>
   );
 }

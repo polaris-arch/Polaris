@@ -10,7 +10,8 @@ use upstream::{plan_upstreams, ResolveUpstream, UpstreamKind};
 
 pub const POLICY: &str = "node-bootstrap";
 pub const CANDIDATE_TIMEOUT: &str = "1500ms";
-pub const LOOKUP_TIMEOUT: &str = "2s";
+// 三个串行 tier 共享总预算，须允许最后的 dns-lan 候选启动。
+pub const LOOKUP_TIMEOUT: &str = "4500ms";
 
 pub fn enabled(config: &UserConfig) -> bool {
     config
@@ -63,7 +64,7 @@ pub fn append_policy(
     dns: &mut DnsConfig,
     log: fn(LogLevel, &str),
 ) {
-    let Some(mut plan) = plan_upstreams(
+    let Some(plan) = plan_upstreams(
         config.dns_config.as_ref(),
         config
             .proxy_mode_type
@@ -71,18 +72,22 @@ pub fn append_policy(
     ) else {
         return;
     };
-    // dns-lan（接管前的私网系统解析器，明文 UDP、物理网卡直连）作最末一级兜底：与自定义 UDP
-    // 上游同形，不是 OS system 解析，故不触 INV-1 的 TUN 递归。
-    if let Some(lan) = dns.servers.iter().find(|server| server.tag == "dns-lan") {
-        plan.tier2.push(ResolveUpstream {
+    // dns-lan（接管前的私网系统解析器，明文 UDP、物理网卡直连）独占最末一级 tier3：非 speculative，
+    // 排在 tier2 全部 respond 之后，不与用户选定的 tier2 解析器竞速。与自定义 UDP 上游同形，
+    // 不是 OS system 解析，故不触 INV-1 的 TUN 递归。
+    let tier3: Vec<ResolveUpstream> = dns
+        .servers
+        .iter()
+        .filter(|server| server.tag == "dns-lan")
+        .map(|lan| ResolveUpstream {
             id: lan.tag.clone(),
             kind: UpstreamKind::Udp,
             ip: lan.server.clone(),
             port: lan.server_port,
             path: None,
-            tier: 2,
-        });
-    }
+            tier: 3,
+        })
+        .collect();
     let decoys = decoy_policy_cidrs(decoy_override, log);
     // The caller puts these two canonical LAN rules at the front. Legacy
     // Tailscale preferred_by uses the DNS transport's current preferred-domain
@@ -104,7 +109,7 @@ pub fn append_policy(
         )
         .collect();
     let rules = dns.rules.get_or_insert_with(Vec::new);
-    for (tier, candidates) in [(1, &plan.tier1), (2, &plan.tier2)] {
+    for (tier, candidates) in [(1, &plan.tier1), (2, &plan.tier2), (3, &tier3)] {
         for (index, candidate) in candidates.iter().enumerate() {
             let server_tag = format!("dns-node-native-{tier}-{index}");
             let response_tag = format!("node-native-{tier}-{index}-response");

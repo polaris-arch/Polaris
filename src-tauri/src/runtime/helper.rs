@@ -2449,9 +2449,11 @@ fn require_native_birth_capability_with_client(
         Ok(Response::Ok(ResponseKind::NativeBirthStatus(
             NativeBirthStatus::Empty | NativeBirthStatus::Running { .. },
         ))) => Ok(()),
-        Ok(Response::Ok(ResponseKind::NativeBirthStatus(status))) => Err(Unavailable(format!(
-            "helper native birth 起核未获准：既有 custody={status:?}，等待同birth native Stop后重试"
-        ))),
+        Ok(Response::Ok(ResponseKind::NativeBirthStatus(status))) => {
+            Err(BirthCapabilityError::SlotOccupied(format!(
+                "helper native birth 起核未获准：既有 custody={status:?}，等待同birth native Stop后重试"
+            )))
+        }
         Ok(Response::Err(error)) if is_helper_slot_occupied(&error) => {
             Err(BirthCapabilityError::SlotOccupied(
                 "HELPER_CORE_OCCUPIED: helper resource is occupied by an existing core".into(),

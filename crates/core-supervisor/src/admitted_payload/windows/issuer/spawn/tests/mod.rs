@@ -50,7 +50,7 @@ fn native_case(cancel: bool) {
         &root,
         &[&held, &marker_guard],
         ExecPurpose::RunMain,
-        Some(&root),
+        Some((&root, &root)),
     )
     .unwrap();
     // The actual factory, including HANDLE_LIST/JOB_LIST/mitigations, has run.
@@ -152,10 +152,13 @@ fn fixed_run_argv_is_the_only_factory() {
     assert_eq!(
         fixed_arguments(
             ExecPurpose::RunMain,
-            Some(Path::new(r"C:\Users\测试 Account\Polaris"))
+            Some((
+                Path::new(r"C:\ProgramData\Polaris\users\sSID\runtime"),
+                Path::new(r"C:\Users\测试 Account\Polaris"),
+            ))
         )
         .unwrap(),
-        r#"run -c stdin -D "C:\Users\测试 Account\Polaris""#
+        r#"run -c stdin -D "C:\ProgramData\Polaris\users\sSID\runtime" --resource-directory "C:\Users\测试 Account\Polaris""#
     );
     assert!(fixed_arguments(ExecPurpose::CheckConfig, None).is_err());
     assert!(fixed_arguments(ExecPurpose::TlsInventory, None).is_err());
@@ -164,8 +167,12 @@ fn fixed_run_argv_is_the_only_factory() {
 #[test]
 fn recovery_directory_cannot_become_extra_windows_arguments_or_check_state() {
     assert_eq!(
-        fixed_arguments(ExecPurpose::RunMain, Some(Path::new(r"C:\"))).unwrap(),
-        r#"run -c stdin -D "C:\\""#
+        fixed_arguments(
+            ExecPurpose::RunMain,
+            Some((Path::new(r"C:\"), Path::new(r"D:\")))
+        )
+        .unwrap(),
+        r#"run -c stdin -D "C:\\" --resource-directory "D:\\""#
     );
     for root in [
         r"relative",
@@ -173,7 +180,12 @@ fn recovery_directory_cannot_become_extra_windows_arguments_or_check_state() {
         "C:\\bad\nroot",
         "C:\\bad\0root",
     ] {
-        assert!(fixed_arguments(ExecPurpose::RunMain, Some(Path::new(root))).is_err());
+        for directories in [
+            (Path::new(root), Path::new(r"C:\resources")),
+            (Path::new(r"C:\runtime"), Path::new(root)),
+        ] {
+            assert!(fixed_arguments(ExecPurpose::RunMain, Some(directories)).is_err());
+        }
     }
     assert!(fixed_arguments(ExecPurpose::RunMain, None).is_err());
     for purpose in [
@@ -182,6 +194,10 @@ fn recovery_directory_cannot_become_extra_windows_arguments_or_check_state() {
         ExecPurpose::RunSpeedtest,
         ExecPurpose::TlsInventory,
     ] {
-        assert!(fixed_arguments(purpose, Some(Path::new(r"C:\state"))).is_err());
+        assert!(fixed_arguments(
+            purpose,
+            Some((Path::new(r"C:\state"), Path::new(r"C:\resources")))
+        )
+        .is_err());
     }
 }

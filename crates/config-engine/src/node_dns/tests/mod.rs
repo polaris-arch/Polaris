@@ -114,7 +114,7 @@ fn frozen_wire_contract_and_tier_barriers() {
     }
     assert_eq!(
         serde_json::to_value(resolver()).unwrap(),
-        serde_json::json!({"mode":"rules", "policy":"node-bootstrap", "strategy":"prefer_ipv4", "timeout":"2s"})
+        serde_json::json!({"mode":"rules", "policy":"node-bootstrap", "strategy":"prefer_ipv4", "timeout":"4500ms"})
     );
 }
 
@@ -337,5 +337,8 @@ fn dot_is_a_native_tls_candidate_with_unchanged_policy_and_no_sidecar() {
     assert!(evaluations
         .iter()
         .all(|r| r.timeout.as_deref() == Some("1500ms")));
-    assert_eq!(serde_json::to_value(resolver()).unwrap()["timeout"], "2s");
+    assert_eq!(
+        serde_json::to_value(resolver()).unwrap()["timeout"],
+        "4500ms"
+    );
 }

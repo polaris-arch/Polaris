@@ -234,7 +234,7 @@
   border-color: transparent;
   color: #00141d;
 }
-.mr-screen .mr-btn.flow::before { background: hsl(var(--flow)); border-color: hsl(var(--flow)); }
+.mr-screen .mr-btn.flow::before { background: hsl(var(--mobile-action-fill)); border-color: hsl(var(--mobile-action-fill)); }
 .mr-screen .mr-btn.flow:not(:disabled):active { opacity: 1; }
 .mr-screen .mr-btn.flow:not(:disabled):active::before { filter: none; border-color: hsl(var(--fg) / .35); }
 
@@ -427,7 +427,7 @@
 }
 .mr-screen .rc-action svg { width: 16px; height: 16px; }
 .mr-screen .rc-action-primary { background: transparent; border-color: transparent; color: #00141d; }
-.mr-screen .rc-action-primary::before { background: hsl(var(--flow)); border-color: hsl(var(--flow)); }
+.mr-screen .rc-action-primary::before { background: hsl(var(--mobile-action-fill)); border-color: hsl(var(--mobile-action-fill)); }
 .mr-screen .rc-action-primary:not(:disabled):active { opacity: 1; }
 .mr-screen .rc-action-primary:not(:disabled):active::before { filter: none; border-color: hsl(var(--fg) / .35); }
 .mr-screen .rc-action:not(.rc-action-primary):not(:disabled):active::before { background: hsl(var(--surface-2)); }

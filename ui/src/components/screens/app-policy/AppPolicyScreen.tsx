@@ -475,7 +475,7 @@ export function AppPolicyScreen() {
             onChange={(v) => setCategory(v as AppCategory)}
             options={sortedCats.map((c) => ({ value: c.key, label: c.label }))}
           />
-          <label className="input">
+          <label className="input search-box">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} style={{ width: 15, color: 'hsl(var(--fg-faint))' }}>
               <circle cx="11" cy="11" r="7" />
               <path d="M20 20l-3-3" />
