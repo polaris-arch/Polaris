@@ -126,7 +126,7 @@ jobs:
           printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8\n" | sudo install -D -m 644 /dev/stdin /etc/systemd/resolved.conf.d/public-dns.conf
           sudo systemctl restart systemd-resolved
           pnpm exec playwright install --with-deps chromium
-          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts src/hooks/use-subscription-user-agent.browser.test.tsx src/components/screens/settings/tun-preview.browser.test.ts src/mobile/settings/platform-settings.browser.test.tsx src/mobile/connections/log-recovery.browser.test.tsx --maxWorkers=1
+          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/mobile/home/picker-speed.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts src/hooks/use-subscription-user-agent.browser.test.tsx src/components/screens/settings/tun-preview.browser.test.ts src/mobile/settings/platform-settings.browser.test.tsx src/mobile/connections/log-recovery.browser.test.tsx --maxWorkers=1
           pnpm exec playwright test --config playwright.config.ts
 
       - name: Browser form failure evidence (mock fixture only)

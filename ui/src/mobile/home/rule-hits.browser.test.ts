@@ -29,7 +29,7 @@ const fixture=window.__ruleHits={back:dismissTop,picked:null};
 function App(){
  const [ruleHits,setHits]=useState(hits), [form,setForm]=useState(false); fixture.setHits=setHits; fixture.openForm=()=>setForm(true);
  const props={t:(key,options)=>i18n.t(key,options),writeErrors:{},core:'stopped',connState:'disconnected',node:{kind:'direct'},
-  onToggleConnect:noop,onNetworkCheck:noop,tsExitWarning:'none',onTsExitAction:noop,
+  onToggleConnect:noop,onNetworkCheck:noop,networkCheckBusy:false,networkCheckTip:'网络检测',tsExitWarning:'none',onTsExitAction:noop,
   pickerOpen:false,onOpenPicker:noop,onClosePicker:noop,pickerQuery:'',onPickerQuery:noop,pickRows:[],onUseAsExit:noop,onPickSentinel:noop,
   blockDisabledReason:null,noServers:false,onAddServer:noop,onAddSubscription:noop,routing:'smart',reverseRouting:false,onSetRouting:noop,
   exitRegion:{kind:'unknown'},exitFlagSrc:null,exitIsDirect:true,exitProbing:false,exitIp:null,

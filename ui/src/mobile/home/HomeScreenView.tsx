@@ -689,13 +689,13 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
               <span className="h-latency-actions">
                 {props.node.kind === 'node' && (
                   <button type="button" className="h-latency-action" onClick={props.latencyCheck.onRunCurrent}
-                    disabled={props.latencyCheck.blocked !== null || (props.latencyCheck.busy || props.latencyCheck.busyKind !== null)}
+                    disabled={props.networkCheckBusy || props.latencyCheck.blocked !== null || (props.latencyCheck.busy || props.latencyCheck.busyKind !== null)}
                     aria-busy={props.latencyCheck.busyKind === 'current'}>
                     {t('mobileHome.currentSpeedTest')}
                   </button>
                 )}
                 <button type="button" className="h-latency-action" onClick={props.latencyCheck.onRunAll}
-                  disabled={props.latencyCheck.allUnavailable !== null || (props.latencyCheck.busy || props.latencyCheck.busyKind !== null)}
+                  disabled={props.networkCheckBusy || props.latencyCheck.allUnavailable !== null || (props.latencyCheck.busy || props.latencyCheck.busyKind !== null)}
                   aria-busy={props.latencyCheck.busyKind === 'all'}>
                   {props.latencyCheck.busyKind === 'all' ? t('mobileHome.allSpeedTestBusy') : t('mobileHome.allSpeedTest')}
                 </button>
@@ -869,11 +869,12 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                 className="h-check-btn"
                 data-write-control="network-check"
                 onClick={props.onNetworkCheck}
-                disabled={props.unlockRunning || props.exitProbing}
-                aria-busy={props.unlockRunning || props.exitProbing}
+                disabled={props.networkCheckBusy}
+                aria-busy={props.networkCheckBusy}
+                title={props.networkCheckTip}
               >
                 {/* 陈旧结果保留圆点，但时间戳必须**如实变老**，不许悄悄重渲染成刚测过。 */}
-                {props.unlockRunning || props.exitProbing
+                {props.networkCheckBusy
                   ? t('home.unlockStatus.checking')
                   : t('mobileHome.checkNow')}
               </button>

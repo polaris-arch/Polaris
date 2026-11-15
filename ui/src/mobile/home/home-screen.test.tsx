@@ -207,6 +207,8 @@ const baseProps = (over: Partial<HomeScreenViewProps> = {}): HomeScreenViewProps
   },
   onToggleConnect: () => {},
   onNetworkCheck: () => {},
+  networkCheckBusy: false,
+  networkCheckTip: '网络检测（延迟 · 解锁 · 出口信息）',
   latencyCheck: {
     busyKind: null, error: null, feedback: null, blocked: null,
     blockedStatus: 'mobileHome.notApplicable', allUnavailable: null,
@@ -986,10 +988,10 @@ describe('⑦ 无源不画：陈旧 / 哨兵 / 隐私 / 空态', () => {
     }
   });
 
-  it('检测在飞时两颗检测入口都不可点（重入 = 排一次多余的检测）', () => {
-    const html = render({ unlockRunning: true });
+  it('手动检测在飞时不能重入，后台服务检测不阻断延迟入口', () => {
+    const html = render({ networkCheckBusy: true });
     expect(openTagOf(html, 'network-check')).toContain('disabled');
-    const idle = render({ unlockRunning: false });
+    const idle = render({ unlockRunning: true, exitProbing: true, networkCheckBusy: false });
     expect(openTagOf(idle, 'network-check')).not.toContain('disabled');
   });
 

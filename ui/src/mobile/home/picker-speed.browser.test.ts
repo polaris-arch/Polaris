@@ -89,7 +89,7 @@ function App(){
  const [query,setQuery]=useState('');const [open,setOpen]=useState(true);
  const props={t,writeErrors:{},core:'running',connState:'connected',
   node:{kind:'node',name:'Selected fixture',protocolLabel:'VMess',flagSrc:null,latencyMs:24,latencyStale:false},
-  onToggleConnect:noop,onNetworkCheck:noop,
+  onToggleConnect:noop,onNetworkCheck:noop,networkCheckBusy:false,networkCheckTip:'网络检测',
   latencyCheck:{busyKind:null,error:null,feedback:null,blocked:null,blockedStatus:'mobileHome.notApplicable',allUnavailable:null,onRunCurrent:noop,onRunAll:noop},
   tsExitWarning:'none',onTsExitAction:noop,pickerOpen:open,onOpenPicker:()=>setOpen(true),onClosePicker:()=>setOpen(false),
   pickerQuery:query,onPickerQuery:setQuery,
@@ -154,30 +154,33 @@ useAppStore.setState({config,servers:config.servers,selectedServerId:'node-a',sw
 }});
 createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);
 `;
-const networkEntry = sentinelEntry.replace("import { api } from '/src/ipc';", "import { api, unlockApi } from '/src/ipc';\nimport { MobileToaster } from '/src/mobile/MobileToaster';\nimport { MeasurementStartNotice } from '/src/mobile/MeasurementStartNotice';").replace(
+const networkEntry = sentinelEntry.replace("import { api } from '/src/ipc';", "import { api, unlockApi } from '/src/ipc';\nimport { HomeScreen } from '/src/components/screens/home/HomeScreen';\nimport { MobileToaster } from '/src/mobile/MobileToaster';\nimport { MeasurementStartNotice } from '/src/mobile/MeasurementStartNotice';").replace(
   "createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);",
   `
-document.documentElement.dataset.mobileOs = new URLSearchParams(location.search).get('os') || 'ios';
+const params=new URLSearchParams(location.search);
+if(params.get('surface')!=='desktop')document.documentElement.dataset.mobileOs = params.get('os') || 'ios';
 const net=window.__networkTest={manual:[],raw:[],speeds:[],cancels:[],mainStarts:0,mainStops:0,
  status:{running:false,mainGeneration:6},requestId:null,finish:null,
  state:()=>useAppStore.getState(),setSelection(id){useAppStore.setState({selectedServerId:id});},cancelReject:null,leave:null,
- setStatus(status){net.status=status;useAppStore.getState().setProxyStatus(status);}};
+ hold:false,pending:{},release(kind){net.pending[kind]?.();delete net.pending[kind];},
+ setUnlock(patch){useAppStore.getState().setUnlock(patch);},
+ setStatus(status){net.status={actualServerId:status.running?'node-a':null,...status};useAppStore.getState().setProxyStatus(net.status);}};
 const ip={revision:5,direct:null,proxy:null,updatedAt:123};
 const unlock={results:{},checkedAt:123,egress:null};
 useAppStore.setState({proxyStatus:net.status,ipInfo:{revision:0,direct:null,proxy:null,updatedAt:0}});
 api.proxy.getStatus=async()=>net.status;
 api.proxy.start=async()=>{net.mainStarts++;};api.proxy.stop=async()=>{net.mainStops++;};
-api.ipInfo.get=async()=>{net.raw.push('ip');return ip;};
-unlockApi.run=async()=>{net.raw.push('unlock');return unlock;};
+api.ipInfo.get=async()=>{net.raw.push('ip');if(net.hold)await new Promise(resolve=>{net.pending.ip=resolve;});return ip;};
+unlockApi.run=async()=>{net.raw.push('unlock');if(net.hold)await new Promise(resolve=>{net.pending.unlock=resolve;});return {...unlock,checkedAt:Date.now()};};
 unlockApi.cancelManualCheck=id=>{net.cancels.push(id);return new Promise((_resolve,reject)=>{net.cancelReject=reject;});};
 unlockApi.manualCheck=(requestId,force)=>new Promise(resolve=>{
  net.manual.push({requestId,force});net.requestId=requestId;
  net.finish=(ipError,unlockError)=>resolve({context:{requestId,mainGeneration:7,startTime:123},
   ipInfo:ipError?{error:{code:ipError}}:{data:ip},unlock:unlockError?{error:{code:unlockError}}:{data:unlock}});
 });
-api.server.speedTest=async ids=>{net.speeds.push(ids);return {runId:'1',results:{'node-a':24},outcome:'completed',notInPool:[],tsNotReady:[],
- measurementContext:{runId:'1',requestId:'speed-1',mainGeneration:7,startTime:123}};};
-function Host(){const [home,setHome]=React.useState(true);net.leave=()=>setHome(false);return <>{home?<MobileHomeScreen/>:<p>Other screen</p>}<MobileToaster/><MeasurementStartNotice/></>;}
+api.server.speedTest=async ids=>{net.speeds.push(ids);const runId=String(net.speeds.length);if(net.hold)await new Promise(resolve=>{net.pending.speed=resolve;});return {runId,results:{'node-a':24},outcome:'completed',notInPool:[],tsNotReady:[],
+ measurementContext:{runId,requestId:'speed-'+runId,mainGeneration:7,startTime:123}};};
+function Host(){const [home,setHome]=React.useState(true);net.leave=()=>setHome(false);return <>{home?(params.get('surface')==='desktop'?<HomeScreen/>:<MobileHomeScreen/>):<p>Other screen</p>}<MobileToaster/><MeasurementStartNotice/></>;}
 createRoot(document.getElementById('root')).render(<Host/>);
 `,
 );
@@ -192,7 +195,7 @@ const ts={...config.servers[0],protocol:'tailscale',tailscaleSettings:{exitNode:
 const auth=window.__authWarning={opens:[],panels:()=>useMobileFormStore.getState().stack,
  reset(){auth.opens=[];useMobileFormStore.setState({stack:[]});},
  attempt(phase,url){useTailscaleLoginProgressStore.getState().begin('node-a','B');useTailscaleLoginProgressStore.getState().apply({serverId:'node-a',attemptId:'B',phase,url,mainGeneration:7,identityEpoch:'epoch-B'});}};
-useAppStore.setState({config:{...config,servers:[ts]},servers:[ts],proxyStatus:{running:true,mainGeneration:7,startTime:123},
+useAppStore.setState({config:{...config,servers:[ts]},servers:[ts],proxyStatus:{running:true,actualServerId:'node-a',mainGeneration:7,startTime:123},
  tailscaleStatuses:{'node-a':{serverId:'node-a',nodeName:'fixture',backendState:'NeedsLogin',loggedIn:false,expired:false,peers:[],tailscaleIPs:[],authURL:'https://login.example/status-A'}},
  tailscaleAuthUrls:{'node-a':'https://login.example/store-A'}});
 api.config.meshRouteReport=async()=>null;api.system.openExternal=async url=>{auth.opens.push(url);};
@@ -242,6 +245,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     await page.getByRole('button',{name:'开关列表'}).click();await page.getByRole('button',{name:'开关列表'}).click();
     expect(await page.locator('[data-picker-node]').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-picker-node')))).toEqual(['sub-a']);
     await page.getByRole('button',{name:'无当前节点'}).click();
+    await page.getByRole('button',{name:'开关列表'}).click();await page.getByRole('button',{name:'开关列表'}).click();
     await page.waitForFunction(()=>document.querySelectorAll('[data-picker-node]').length===0);
     await page.close();
   },30_000);
@@ -423,6 +427,10 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
       await page.getByRole('dialog').getByRole('button',{name:'确认',exact:true}).click();
       await page.waitForFunction(()=>(window as any).__networkTest.manual.length===1);
       expect(await button.isDisabled()).toBe(true);
+      for(const action of await page.locator('.h-latency-action').all()) {
+        expect(await action.isDisabled()).toBe(true);
+        await action.evaluate(el=>(el as HTMLButtonElement).click());
+      }
       expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.raw,n.speeds,n.mainStarts,n.mainStops];})).toEqual([[],[],0,0]);
       await page.evaluate(()=>{const n=(window as any).__networkTest;n.setStatus({running:true,mainGeneration:7,startTime:123});n.finish(null,'targetTimedOut');});
       await page.locator('[data-write-error="network-check"]').waitFor();
@@ -457,6 +465,53 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
       await page.locator('[data-write-control="network-check"]').click();
       await page.waitForFunction(()=>(window as any).__networkTest.raw.length===2);
       expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.manual,n.raw,n.speeds,n.mainStarts,n.mainStops];})).toEqual([[],['ip','unlock'],[],0,0]);
+    } finally {await page.close();}
+  },30_000);
+  it.each(['desktop','android','ios'])('%s background or cooling service checks leave latency available without reentry',async surface=>{
+    const page=await browser.newPage({viewport:{width:surface==='desktop'?1100:390,height:844}});
+    page.setDefaultTimeout(7000);
+    try {
+      await page.goto(origin+'/__network?surface='+surface+'&os='+surface);
+      const button=page.locator(surface==='desktop'?'#network-check-radar':'[data-write-control="network-check"]');
+      await button.waitFor();
+      await page.evaluate(()=>{const n=(window as any).__networkTest;n.hold=true;n.setStatus({running:true,mainGeneration:7,startTime:123});n.setUnlock({running:false,lastRunAt:Date.now()});});
+      await page.waitForFunction(()=>!!document.querySelector('[data-tip*="冷却"], [title*="冷却"]'));
+      for(const background of [false,true]) {
+        if(background)await page.evaluate(()=>(window as any).__networkTest.setUnlock({running:true,lastRunAt:null}));
+        expect(await button.isDisabled()).toBe(false);
+        await button.evaluate(el=>{(el as HTMLButtonElement).click();(el as HTMLButtonElement).click();});
+        if(surface==='ios')await page.getByRole('dialog').getByRole('button',{name:'确认',exact:true}).click();
+        const count=background?2:1;
+        await page.waitForFunction(expected=>(window as any).__networkTest.speeds.length===expected,count);
+        expect(await button.isDisabled()).toBe(true);
+        expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.manual,n.raw,n.cancels];})).toEqual([[],[],[]]);
+        await page.evaluate(()=>(window as any).__networkTest.release('speed'));
+        await page.waitForFunction(selector=>!(document.querySelector(selector) as HTMLButtonElement).disabled,surface==='desktop'?'#network-check-radar':'[data-write-control="network-check"]');
+      }
+      expect(await page.evaluate(()=>(window as any).__networkTest.state().unlock.running)).toBe(true);
+    } finally {await page.close();}
+  },30_000);
+  it.each(['desktop','android'])('%s manual network action stays busy until latency, services and IP all settle',async surface=>{
+    const page=await browser.newPage({viewport:{width:surface==='desktop'?1100:390,height:844}});
+    page.setDefaultTimeout(7000);
+    const selector=surface==='desktop'?'#network-check-radar':'[data-write-control="network-check"]';
+    try {
+      await page.goto(origin+'/__network?surface='+surface+'&os=android');
+      const button=page.locator(selector);await button.waitFor();
+      await page.evaluate(()=>{const n=(window as any).__networkTest;n.hold=true;n.setStatus({running:true,mainGeneration:7,startTime:123});n.setUnlock({running:false,lastRunAt:Date.now()-15_001});});
+      await button.evaluate(el=>{(el as HTMLButtonElement).click();(el as HTMLButtonElement).click();});
+      await page.waitForFunction(()=>{const n=(window as any).__networkTest;return n.raw.length===2&&n.speeds.length===1;});
+      await page.evaluate(()=>{const n=(window as any).__networkTest;n.release('speed');n.release('unlock');});
+      expect(await button.isDisabled()).toBe(true);
+      await button.evaluate(el=>(el as HTMLButtonElement).click());
+      expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.raw.length,n.speeds.length,n.cancels.length];})).toEqual([2,1,0]);
+      await page.evaluate(()=>(window as any).__networkTest.release('ip'));
+      await page.waitForFunction(selector=>!(document.querySelector(selector) as HTMLButtonElement).disabled,selector);
+      await button.click();
+      await page.waitForFunction(()=>(window as any).__networkTest.speeds.length===2);
+      expect(await page.evaluate(()=>(window as any).__networkTest.raw)).toEqual(['ip','unlock']);
+      await page.evaluate(()=>(window as any).__networkTest.release('speed'));
+      await page.waitForFunction(selector=>!(document.querySelector(selector) as HTMLButtonElement).disabled,selector);
     } finally {await page.close();}
   },30_000);
   it('a rejected exact network cancellation remains visible globally after Home has left',async()=>{

@@ -182,6 +182,8 @@ export interface HomeScreenViewProps {
   readonly node: NodeIdentity;
   readonly onToggleConnect: () => void;
   readonly onNetworkCheck: () => void;
+  readonly networkCheckBusy: boolean;
+  readonly networkCheckTip: string;
   /** Measured node latency; independent from IP and service reachability. */
   readonly latencyCheck?: LatencyCheckVM;
   /** 出口警示（IA 裁定 #3）。本屏能切出口 ⇒ 本屏必须有它。 */

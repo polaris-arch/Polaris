@@ -285,6 +285,8 @@ describe('③ 反向分流指示器（真机 2026-07-20 §1.4 的移植）', () 
       node: { kind: 'none' },
       onToggleConnect: () => undefined,
       onNetworkCheck: () => undefined,
+      networkCheckBusy: false,
+      networkCheckTip: '网络检测',
       tsExitWarning: null,
       onTsExitAction: () => undefined,
       pickerOpen: false,

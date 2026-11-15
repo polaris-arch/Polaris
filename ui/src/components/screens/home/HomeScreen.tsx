@@ -69,6 +69,7 @@ import { FlagImg } from '@/components/FlagImg';
 import { speedTestableIds } from '@/domain/endpoint-routes';
 import { useLatencyStore } from '@/store/use-latency-store';
 import { useSystemProxyLive } from '@/store/use-system-proxy-live';
+import { unlockCooldownRemaining, useUnlockCooldown } from '@/hooks/use-unlock-cooldown';
 import { isReverseRegionRouting } from '@/domain/region-routing';
 import {
   ENABLED_SERVICE_IDS,
@@ -84,14 +85,6 @@ import {
 } from '../shared/speedtest-feedback';
 import { speedTestBlockReason } from '@/components/screens/nodes/nodes-logic';
 import { hasPendingWork } from '@/components/layout/pending-bar-logic';
-
-/**
- * 手动网络检测冷却窗（置灰刷新钮）。与后端 force 硬下限 `FORCE_MIN_MS`
- * （`src-tauri/src/runtime/unlock.rs:83`，判定在 `:583` `force && last_at != 0 && now-last_at < FORCE_MIN_MS`）
- * **同值 15s**：本常量是前端的即时反馈（钮置灰 + tooltip），后端那道才是绕过 UI 也挡得住的硬下限。
- * 两者取值必须一致——前端更短会让用户点了却被后端静默吞成缓存返回。
- */
-const UNLOCK_COOLDOWN_MS = 15_000;
 
 /* ── 解锁检测服务展示名（对齐原型 UNLOCK_SVCS，分 AI / 流媒体两组）── */
 interface UnlockSvcMeta {
@@ -257,12 +250,13 @@ export function HomeScreen() {
   const [connectError, setConnectError] = useState(false);
   /** 测速中：临时显示 spinner。 */
   const [testing, setTesting] = useState(false);
+  const speedTestInFlight = useRef(false);
+  const networkCheckInFlight = useRef(false);
+  const [networkChecking, setNetworkChecking] = useState(false);
   /** 分流策略切换在飞（契约 L21 的 `routingBusy`）：置灰 seg2 + 单飞守卫，见 onRoutingChange。 */
   const [routingBusy, setRoutingBusy] = useState(false);
   /** 批量结果落库（invoke 返回值兜底同步，补事件丢失）。 */
   const applyLatencyResults = useLatencyStore((s) => s.applyLatencyResults);
-  /** 网络检测冷却态（置灰刷新钮 + tooltip 说明）：见 UNLOCK_COOLDOWN_MS 的 DESIGN-REVIEW。 */
-  const [unlockCooldown, setUnlockCooldown] = useState(false);
   /** 出口节点选单开合（原型 #node-menu，恢复内联下拉而非跳转节点页）。 */
   const [nodeMenuOpen, setNodeMenuOpen] = useState(false);
   const nodeDdRef = useRef<HTMLDivElement>(null);
@@ -299,6 +293,7 @@ export function HomeScreen() {
   /** **核在跑**——本页所有「能不能做这件事」的门都用它（解锁检测要核在跑才有出口可测、测速的
    *  `mainCorePool` 能力位、圆钮该显示断开动作、运行时长在走）。这些能力与系统代理设没设上无关。 */
   const connected = !!proxyStatus?.running;
+  const unlockCooldown = useUnlockCooldown(connected ? unlock.lastRunAt : null);
   /** 系统代理**活态**（地面真相）：读**共享 store**，轮询驱动唯一挂在 App.tsx 顶层。
    *  与状态栏**同一份活态**——两处各起一份轮询会双倍 exec `networksetup`/`gsettings`/`reg`，
    *  且两条链不同相时会出现「首页说未生效、状态栏还亮绿灯」这种自相矛盾（本页的降级横幅与状态栏的
@@ -418,27 +413,6 @@ export function HomeScreen() {
       );
     });
   }, [t]);
-
-  /* ── 网络检测冷却（15s）：由 unlock.lastRunAt 派生，窗内置灰刷新钮。停代理（!connected）即灭
-   * （钮本就 disabled，避免重连后陈旧 lastRunAt 误锁）。DESIGN-REVIEW 见 UNLOCK_COOLDOWN_MS。 */
-  useEffect(() => {
-    const lastRunAt = unlock.lastRunAt;
-    if (!connected || lastRunAt == null) {
-      setUnlockCooldown(false);
-      return;
-    }
-    const elapsed = Date.now() - lastRunAt;
-    // lastRunAt 是后端/持久化 epoch 戳，不能换 performance.now。若墙钟回拨，旧冷却窗立即作废；
-    // 否则 setTimeout 会被排到“时钟追上旧值”之后，刷新按钮可能冻结数小时。
-    const remaining = elapsed < 0 ? 0 : UNLOCK_COOLDOWN_MS - elapsed;
-    if (remaining <= 0) {
-      setUnlockCooldown(false);
-      return;
-    }
-    setUnlockCooldown(true);
-    const id = setTimeout(() => setUnlockCooldown(false), remaining);
-    return () => clearTimeout(id);
-  }, [connected, unlock.lastRunAt]);
 
   /* ── 连接流需求生命周期 ──
    * 首页持有的是 topology topic：它同时声明「保持共享连接流」与「要完整表变化信号」两件事，
@@ -680,6 +654,7 @@ export function HomeScreen() {
    * 单节点不该弹「测速完成」）⇒ 改成单节点后本腿**成功路径零 toast**，反馈由按钮自身的 spinner
    * （`testing`）承担。`notInPoolMessage` 仍保留：那不是进度播报，是「这个节点根本没被测」的如实回报。 */
   const onSpeedTest = useCallback(async () => {
+    if (speedTestInFlight.current) return;
     if (sentinelSelected) {
       toast.info(
         t('nodes.speedTestSentinelExit')
@@ -695,6 +670,7 @@ export function HomeScreen() {
       toast.info(speedTestBlockedMessage(reason, t));
       return;
     }
+    speedTestInFlight.current = true;
     setTesting(true);
     try {
       // 返回值兜底同步（事件丢失时补齐）+ 如实回报缺席节点（notInPool / tsNotReady）。
@@ -707,6 +683,7 @@ export function HomeScreen() {
       console.error('[home] speedtest failed:', err);
       toast.error(speedTestErrorMessage(err, t));
     } finally {
+      speedTestInFlight.current = false;
       setTesting(false);
     }
   }, [sentinelSelected, currentServer, connected, applyLatencyResults, t]);
@@ -769,7 +746,7 @@ export function HomeScreen() {
    * 与首页圆钮 `onSpeedTest` **共用两样东西**，少任一样都会退回复审报的形态：
    *  ① 共用 `testing` 标志 —— 不共用则「菜单批量进行中，主测速按钮仍可点」：第二次请求撞后端单飞闸，
    *     返 `CODE_IN_FLIGHT` + 弹错误 toast。用户看见的是「测速失败」，实际只是自己撞了自己。
-   *     反向同理，故进函数先看 `testing`。
+   *     反向同理，故入口共用同步在飞守卫。
    *  ② 共用 `speedTestableIds` 口径 —— 菜单给的是「当前可见（含搜索过滤）」的全部 id，其中可能含
    *     **结构上不可测**的节点（reverseMesh 走 OS default / custom endpoint 无 gate 真值 /
    *     TS-mesh-only 是公网黑洞）。它们必返 `-1`，而 `-1` 在 UI 上读作「真实超时」而非「未测」
@@ -777,7 +754,7 @@ export function HomeScreen() {
    * 过滤后为空 → 提示而非空跑（同 `onSpeedTest`）。 */
   const onTestAllInMenu = useCallback(
     async (ids: string[]) => {
-      if (ids.length === 0 || testing) return;
+      if (ids.length === 0 || speedTestInFlight.current || networkCheckInFlight.current) return;
       // 菜单只决定「测哪些**可见**节点」，不决定「哪些**结构上**可测」——后者是 speedTestableIds 的职责。
       const testable = new Set(speedTestableIds(servers, { mainCorePool: connected }));
       const target = ids.filter((id) => testable.has(id));
@@ -785,6 +762,7 @@ export function HomeScreen() {
         toast.info(t('nodes.noTestableNodes'));
         return;
       }
+      speedTestInFlight.current = true;
       setTesting(true);
       try {
         // 如实回报缺席节点：未入运行核测速池的节点（订阅新增/改址后未重启核）本轮不会被测。
@@ -796,10 +774,11 @@ export function HomeScreen() {
         console.error('[home] test all failed:', err);
         toast.error(speedTestErrorMessage(err, t));
       } finally {
+        speedTestInFlight.current = false;
         setTesting(false);
       }
     },
-    [servers, connected, testing, applyLatencyResults, t]
+    [servers, connected, applyLatencyResults, t]
   );
 
   /* ── 网络检测：解锁重检（force 绕 TTL）+ 出口 IP 强制重探（契约要求刷新钮同时驱动两者——
@@ -808,6 +787,8 @@ export function HomeScreen() {
    * 出口 IP 中间态/终值经 EVENT_IP_INFO_UPDATED 事件链回流 store，此处不回写返回值。 */
   const onUnlockRefresh = useCallback(async () => {
     if (!connected) return;
+    const latest = useAppStore.getState().unlock;
+    if (latest.running || unlockCooldownRemaining(latest.lastRunAt) > 0) return;
     beginUnlockCheck();
     const requestedState = useAppStore.getState().unlock;
     const lifetime = unlockRequestLifetime.current;
@@ -815,7 +796,7 @@ export function HomeScreen() {
       && useAppStore.getState().unlock === requestedState;
     // 本轮由用户亲手发起 → 放行 onUpdated 里的「网络检测完成」toast（原型 :3649）。
     unlockUserRequested.current = true;
-    void ipInfoApi.get(true, true).catch((err) => {
+    const ipProbe = ipInfoApi.get(true, true).catch((err) => {
       console.error('[home] exit ip reprobe failed:', err);
     });
     try {
@@ -833,6 +814,8 @@ export function HomeScreen() {
       toast.error(
         t('home.unlockCheckFail'),
       );
+    } finally {
+      await ipProbe;
     }
   }, [connected, beginUnlockCheck, applyUnlockSnapshot, setUnlock, t]);
 
@@ -845,9 +828,17 @@ export function HomeScreen() {
    *   仍可测延迟这条能力弄丢；
    * - 解锁 + 出口 IP 走 `onUnlockRefresh`，它自带 `if (!connected) return`：这两项的结论以
    *   「经当前出口」为前提，核没跑就无出口可测，跑了只会得到假结论。
-   * 故断开态点它 = 只测延迟，连接态点它 = 三件事全做。不另加分支，两个既有腿各自的门就是判据。 */
+   * 服务检测在飞或冷却时只测延迟。手动整轮单飞，直到本轮发出的请求全部落定。 */
   const onNetworkCheck = useCallback(async () => {
-    await Promise.allSettled([onSpeedTest(), onUnlockRefresh()]);
+    if (networkCheckInFlight.current || speedTestInFlight.current) return;
+    networkCheckInFlight.current = true;
+    setNetworkChecking(true);
+    try {
+      await Promise.allSettled([onSpeedTest(), onUnlockRefresh()]);
+    } finally {
+      networkCheckInFlight.current = false;
+      setNetworkChecking(false);
+    }
   }, [onSpeedTest, onUnlockRefresh]);
 
   /* 接管模式及 FakeIP-TUN 修正在后端最新配置事务内一次完成。 */
@@ -1224,13 +1215,15 @@ export function HomeScreen() {
                     原先分散在解锁区那颗 `.ub-detect` 上的能力整体并过来，那颗随之删除。
                     图标同步换成雷达（原 ⚡ 只表达「测速」，撑不起合并后的语义）。 */}
                 <button
+                  id="network-check-radar"
                   className="icon-btn"
                   onClick={() => void onNetworkCheck()}
-                  disabled={testing || unlockCooldown}
-                  data-tip={unlockCooldown ? t('home.unlockCooldown') : t('home.networkCheckTip')}
-                  aria-label={unlockCooldown ? t('home.unlockCooldown') : t('home.networkCheckTip')}
+                  disabled={testing || networkChecking}
+                  aria-busy={testing || networkChecking}
+                  data-tip={testing || networkChecking ? t('home.unlockStatus.checking') : connected && unlock.running ? t('home.unlockRunningLatencyOnly') : unlockCooldown ? t('home.unlockCooldown') : t('home.networkCheckTip')}
+                  aria-label={testing || networkChecking ? t('home.unlockStatus.checking') : connected && unlock.running ? t('home.unlockRunningLatencyOnly') : unlockCooldown ? t('home.unlockCooldown') : t('home.networkCheckTip')}
                 >
-                  {testing ? (
+                  {testing || networkChecking ? (
                     <span className="spinner" />
                   ) : (
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -1297,12 +1290,7 @@ export function HomeScreen() {
                   </span>
                 </div>
               </div>
-              {/* 原 `.ub-detect`「网络检测」按钮已删（陈先生 2026-07-30 裁定：与出口行那颗合并）。
-                  它的三道防连点闸门随之由合并后那颗承担，语义一字未改：
-                  ①前端 15s 冷却（`unlockCooldown`，由 lastRunAt 派生）；②后端 `run_lock` 单飞串行；
-                  ③后端 `FORCE_MIN_MS` 15s 硬下限（脚本绕过前端也挡得住）。
-                  **仍不因 `unlock.running` 禁用**：那是「检测卡在检测中」时用户唯一的自救入口，
-                  用 running 锁它等于把死锁焊死（真机反馈过的一条）。 */}
+              {/* 服务检测在飞/冷却只限制服务请求，延迟仍可手动测；手动整轮在飞时不重入。 */}
             </div>
           </div>
 

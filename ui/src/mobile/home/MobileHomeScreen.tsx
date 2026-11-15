@@ -2,6 +2,7 @@ import { prepareRuleAppend } from '@/lib/use-rule-append';
 import { useQualifiedLatencies } from '../use-qualified-latencies';
 import { requestIOSMeasurementConsent } from '../MeasurementStartNotice';
 import { configuredExitId } from '@/domain/actual-exit';
+import { unlockCooldownRemaining, useUnlockCooldown } from '@/hooks/use-unlock-cooldown';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * 移动端「首页」的**接线层**：读 store、订阅事件流、发 IPC，把结果整形成 `view-model.ts` 的 props。
@@ -193,6 +194,7 @@ export function MobileHomeScreen(): ReactElement {
   const loadConfig = useAppStore((s) => s.loadConfig);
 
   const proxyRunning = proxyStatus?.running === true;
+  const unlockCooldown = useUnlockCooldown(proxyRunning ? unlock.lastRunAt : null);
   const routing = (config?.proxyMode ?? 'smart') as ProxyMode;
   const latencyCheck = useHomeSpeedTest({
     servers,
@@ -518,7 +520,7 @@ export function MobileHomeScreen(): ReactElement {
    * 只监听事件会在那些路径上永远停在「检测中」（这条逐字取自桌面 `HomeScreen.tsx:774`）。
    */
   const runNetworkCheck = useCallback(() => {
-    if (checkRun.current.busy) return;
+    if (checkRun.current.busy || latencyCheck.view.busy) return;
     checkRun.current.busy = true;
     const generation = ++checkRun.current.generation;
     const startedRunning = useAppStore.getState().proxyStatus?.running === true;
@@ -526,7 +528,10 @@ export function MobileHomeScreen(): ReactElement {
     const startedServerId = useAppStore.getState().selectedServerId;
     const startedRouting = getEffectiveConfig()?.proxyMode ?? 'smart';
     const startedConfig = JSON.stringify(getEffectiveConfig());
-    const requestId = normalMainRequired ? crypto.randomUUID() : null;
+    const latestUnlock = useAppStore.getState().unlock;
+    const latencyOnly = startedRunning
+      && (latestUnlock.running || unlockCooldownRemaining(latestUnlock.lastRunAt) > 0);
+    const requestId = normalMainRequired && !latencyOnly ? crypto.randomUUID() : null;
     checkRun.current.requestId = requestId;
     checkRun.current.backendRequested = false;
     setManualCheckBusy(true);
@@ -535,6 +540,10 @@ export function MobileHomeScreen(): ReactElement {
       && checkRun.current.generation === generation
       && useAppStore.getState().unlock === requestedUnlockState;
     void runWrite('network-check', async () => {
+      if (latencyOnly) {
+        await latencyCheck.runCurrent();
+        return;
+      }
       if (requestId) {
         if (!await requestIOSMeasurementConsent()) return;
         if (!checkRun.current.alive || checkRun.current.generation !== generation
@@ -567,6 +576,7 @@ export function MobileHomeScreen(): ReactElement {
       const [ip, services] = await Promise.allSettled([
         api.ipInfo.get(true, true),
         unlockApi.run(true),
+        latencyCheck.runCurrent(),
       ] as const);
       const currentState = useAppStore.getState();
       const current = currentState.proxyStatus;
@@ -795,11 +805,14 @@ export function MobileHomeScreen(): ReactElement {
       connState={connState}
       node={node}
       onToggleConnect={onToggleConnect}
-      onNetworkCheck={() => {
-        runNetworkCheck();
-        if (!normalMainRequired) void latencyCheck.runCurrent();
+      onNetworkCheck={runNetworkCheck}
+      networkCheckBusy={manualCheckBusy || latencyCheck.view.busy === true}
+      networkCheckTip={proxyRunning && unlock.running ? t('home.unlockRunningLatencyOnly') : unlockCooldown ? t('home.unlockCooldown') : t('home.networkCheckTip')}
+      latencyCheck={{
+        ...latencyCheck.view,
+        onRunCurrent: () => { if (!checkRun.current.busy) latencyCheck.view.onRunCurrent(); },
+        onRunAll: () => { if (!checkRun.current.busy) latencyCheck.view.onRunAll(); },
       }}
-      latencyCheck={latencyCheck.view}
       tsExitWarning={tsExitWarning}
       onTsExitAction={onTsExitAction}
       pickerOpen={pickerOpen}

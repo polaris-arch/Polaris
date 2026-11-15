@@ -78,7 +78,7 @@ const TIMEOUT_TTL_MS: u64 = 2 * 60 * 1000;
 pub const WARM_RECHECK_DELAY_MS: u64 = 5_000;
 
 /// **force 硬下限**（item 5，上游 `FORCE_MIN_MS`）：force 绕 TTL，但仍防手点连发触发对端限频。
-/// **FX-ui 已加前端 15s 冷却灰态；本常量是后端硬下限**，双保险对齐（脚本/自动化绕过前端仍受此限）。
+/// 前端在此窗口只测延迟、跳过服务检测；本常量仍保护绕过前端的调用。
 const FORCE_MIN_MS: u64 = 15_000;
 
 /// **就绪门退避 schedule**（item 2，上游 `READINESS_BACKOFF_SCHEDULE_MS`）：核刚 running 时 mixed inbound
@@ -696,7 +696,7 @@ impl UnlockRuntime {
     /// + 2 次 trace）。在这条腿上置 0 会同时击穿两道防连点闸门：
     ///  - 后端 [`FORCE_MIN_MS`] 硬下限的 `force && last_at != 0` 守卫失效 ⇒ 连点 force 全部放行；
     ///  - 丢弃腿不 emit UPDATED ⇒ 前端 `unlock.lastRunAt` 停在陈旧/null ⇒ `unlockCooldown`
-    ///    （`HomeScreen.tsx` 由 `lastRunAt` 派生的 15s 灰态）永不武装。
+    ///    （前端由 `lastRunAt` 派生的 15s 服务检测冷却）永不武装。
     ///
     /// 于是在漂移出口上刷新按钮**两侧都不受限流**，而这**恰好是后端已在自跑的时候** —— 对端限频风险最高
     /// 的那一刻反而门户大开。保留 `last_run_at` 即恢复后端那道闸门；前端那道由熔断落终态时的 UPDATED
