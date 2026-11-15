@@ -1453,7 +1453,7 @@ impl ProxyRuntime {
             .and_then(|s| s.pending.clone());
         let mut host_retry_only = false;
         if let Some(pending) = pending {
-            let result = self.reconcile_runtime_operation(&client, pending).await;
+            let result = Box::pin(self.reconcile_runtime_operation(&client, pending)).await;
             let superseded = result
                 .reasons
                 .iter()
@@ -2049,8 +2049,7 @@ impl ProxyRuntime {
         {
             return self.remember_runtime_result(self.prepare_runtime_impact_choice(pending));
         }
-        self.execute_prepared_runtime_candidate(client, pending, None)
-            .await
+        Box::pin(self.execute_prepared_runtime_candidate(client, pending, None)).await
     }
 
     async fn execute_prepared_runtime_candidate(
@@ -2202,7 +2201,7 @@ impl ProxyRuntime {
                     Err(error) => *error,
                 }
             }
-            Err(_) => self.reconcile_runtime_operation(&client, pending).await,
+            Err(_) => Box::pin(self.reconcile_runtime_operation(&client, pending)).await,
         };
         result.transaction_id = Some(transaction_id);
         result.runtime_generation = Some(generation);
@@ -3202,7 +3201,7 @@ impl ProxyRuntime {
             Ok(candidate) => candidate,
             Err(_) => return RuntimeApplyResult::status("rejected"),
         };
-        self.apply_runtime_candidate(candidate).await
+        Box::pin(self.apply_runtime_candidate(candidate)).await
     }
 
     // The local D/R/generation/intent checks occur AFTER the protocol await too.
