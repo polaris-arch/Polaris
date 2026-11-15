@@ -1286,6 +1286,22 @@ impl HelperRuntime {
                         status,
                     }
                 } else {
+                    log::warn!(
+                        "helper install readiness failed: code=notReady installed={} ready={} \
+                         upgradeable={} needs_repair={} protocol={:?} expected_protocol={} \
+                         selected_core_state={:?} selected_core_admission={:?}",
+                        status.installed,
+                        status.ready,
+                        status.upgradeable,
+                        status.needs_repair,
+                        status.version,
+                        status.expected_protocol_version,
+                        status.selected_core.as_ref().map(|core| core.state),
+                        status
+                            .selected_core
+                            .as_ref()
+                            .and_then(|core| core.admission.as_deref()),
+                    );
                     HelperActionResult {
                         success: false,
                         uninstall_effect: None,
