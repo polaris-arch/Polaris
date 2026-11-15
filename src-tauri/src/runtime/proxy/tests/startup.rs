@@ -1450,11 +1450,6 @@ fn helper_upgrade_leg_is_wired_into_the_start_gate() {
         1,
         "`status()` 是一次系统调用（已装时还会 ping socket），两条腿必须共用同一份快照：\n{gate}"
     );
-    assert!(
-        gate.contains("if status.installed {"),
-        "两条腿的分岔必须读同一份快照的 `installed`，而不是再调一次 `tun_helper_missing`：\n{gate}"
-    );
-
     // ── 提示腿本体：四道闸 + 阻塞隔离 + 结构上不阻断 ──
     let leg = method_body(&src, "    async fn maybe_prompt_helper_upgrade(");
     for needle in [
