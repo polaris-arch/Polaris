@@ -33,7 +33,7 @@ import { useAppStore } from './app-store';
 import { configBaseVersion, configContentDigest } from '@/lib/staged-config';
 import type { ServerConfig } from '@/contracts/types';
 import type { MeasurementProjection, MeasurementSnapshot } from '@/contracts/measurement-display';
-import { projectMeasurement } from '@/domain/measurement-display';
+import { projectMeasurement, UNMEASURED_PROJECTION } from '@/domain/measurement-display';
 import { validMeasurementSnapshot } from '@/domain/measurement-snapshot';
 
 /**
@@ -117,10 +117,10 @@ export const useLatencyStore = create<LatencyState>((set) => ({
       latencyMap: stableMap(previous.latencyMap, Object.fromEntries(values)), testedAt: stableMap(previous.testedAt, Object.fromEntries(stamps)) };
   }),
   invalidate: (readFailed = false) => set(previous => {
-    const expire = (values: Record<string, MeasurementProjection>) => Object.fromEntries(Object.entries(values)
-      .map(([id, value]) => [id, value.state === 'success' || value.state === 'failed'
-        ? { ...value, state: 'expired' as const, latency: undefined } : value]));
-    return { snapshot: null, readError: readFailed, latencyMap: {}, projections: expire(previous.projections), currentProjections: expire(previous.currentProjections) };
+    const withdraw = (values: Record<string, MeasurementProjection>) => Object.fromEntries(Object.entries(values)
+      .map(([id, value]) => [id, value.state === 'success' || value.state === 'failed' || value.state === 'expired'
+        ? UNMEASURED_PROJECTION : value]));
+    return { snapshot: null, readError: readFailed, latencyMap: {}, testedAt: {}, projections: withdraw(previous.projections), currentProjections: withdraw(previous.currentProjections) };
   }),
   retainServerIds: ids => set(previous => {
     const keep = new Set(ids);

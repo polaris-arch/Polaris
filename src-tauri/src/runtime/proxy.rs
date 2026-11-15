@@ -531,6 +531,8 @@ pub mod code {
     ///
     /// 终态（核已自行退出，走 [`set_error`](super::ProxyRuntime::set_error)）。
     pub const TUN_ADDRESS_UNAVAILABLE: &str = "TUN_ADDRESS_UNAVAILABLE";
+    /// The core's selected library loader failed; this is not a readiness timeout.
+    pub const CORE_LIBRARY_LOAD_FAILED: &str = "CORE_LIBRARY_LOAD_FAILED";
 }
 
 /// [`code::HELPER_NOT_INSTALLED`] 的用户可见兜底文案（zh）。command 前置拦截与 runtime preflight

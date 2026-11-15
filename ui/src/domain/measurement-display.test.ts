@@ -12,7 +12,7 @@ describe('five-state, purpose-aware measurement projection', () => {
   it('distinguishes real success/failure, missing, expired, and planned pause', () => {
     const snapshot = measurementFixture(config, { a: 40 });
     expect(projectMeasurement(snapshot, server, 1500)).toMatchObject({ state: 'success', latency: 40 });
-    expect(projectMeasurement(snapshot, server, 2001)).toMatchObject({ state: 'expired', latency: undefined });
+    expect(projectMeasurement(snapshot, server, 2001)).toMatchObject({ state: 'expired', latency: 40 });
     snapshot.rows = {}; expect(projectMeasurement(snapshot, server, 1500).state).toBe('unmeasured');
     snapshot.schedule = { state: 'paused', reason: 'metered', subscriptions: { sub: { periodMinutes: 30 } }, stalled: false };
     expect(projectMeasurement(snapshot, server, 1500).state).toBe('paused');
@@ -33,13 +33,20 @@ describe('five-state, purpose-aware measurement projection', () => {
       identity: { ...snapshot.rows.a.candidate!.identity, run: '2', path: 'system', origin: 'companion' } };
     expect(projectMeasurement(snapshot, server, 1500, 'candidate').latency).toBe(40);
     expect(projectMeasurement(snapshot, server, 1500, 'current')).toMatchObject({ latency: 5, purpose: 'system' });
-    expect(measurementText(projectMeasurement(snapshot, server, 1500, 'current'), key => key)).toContain('measurement.systemPath');
+    expect(measurementText(projectMeasurement(snapshot, server, 1500, 'current'), key => key)).toBe('5 ms');
   });
   it('backend identity exclusions cannot be made green by a recently received numeric value', () => {
     const snapshot = measurementFixture(config, { a: 1 });
-    snapshot.rows.a.candidate!.state = 'expired'; snapshot.rows.a.candidate!.reason = 'nodeChanged';
-    expect(projectMeasurement(snapshot, server, 1500)).toMatchObject({ state: 'expired', latency: undefined });
-    expect(projectMeasurement(measurementFixture(config, { a: 1 }), server, 999).state).toBe('expired');
+    snapshot.rows.a.candidate!.state = 'expired';
+    for (const reason of ['nodeChanged', 'instanceChanged', 'networkChanged', 'foregroundChanged', 'urlChanged', 'configurationChanged', 'connectionChanged', 'identityUnknown']) {
+      snapshot.rows.a.candidate!.reason = reason;
+      expect(projectMeasurement(snapshot, server, 1500)).toEqual({ state: 'unmeasured' });
+      expect(projectMeasurement(snapshot, server, 1500, 'current')).toEqual({ state: 'unmeasured' });
+    }
+    snapshot.rows.a.candidate!.reason = 'expired';
+    expect(projectMeasurement(snapshot, server, 1500)).toMatchObject({ state: 'expired', latency: 1 });
+    expect(projectMeasurement(measurementFixture(config, { a: 1 }), server, 999)).toEqual({ state: 'unmeasured' });
+    expect(projectMeasurement(snapshot, server, Number.NaN)).toEqual({ state: 'unmeasured' });
   });
   it('rejects malformed snapshots and path/identity mismatches', () => {
     const snapshot = measurementFixture(config, { a: 1 }); expect(validMeasurementSnapshot(snapshot)).toBe(true);
@@ -66,17 +73,44 @@ describe('Rust producer display IPC interoperability', () => {
     candidate.reason = 'connectionChanged';
     expect(validMeasurementSnapshot(changed)).toBe(true);
     expect(projectMeasurement(changed as import('@/contracts/measurement-display').MeasurementSnapshot,
-      producerFixture.server as ServerConfig,1001)).toMatchObject({state:'expired',latency:undefined});
+      producerFixture.server as ServerConfig,1001)).toEqual({state:'unmeasured'});
   });
 });
 
-it('native HTTP preserves source and timestamp, expires without extending on read', () => {
+it('native HTTP preserves source and timestamp, expires without extending on read, and owns pending candidates', () => {
   const snapshot = measurementFixture(config, { a: 40 });
   const app = snapshot.rows.a.candidate!;
   snapshot.rows.a.nativeHttp = { ...app, latency: 70, identity: { ...app.identity, path: 'nativeHttp', origin: 'nativeAuto', metric: 'native_http_v1', run: '1000' } };
   expect(validMeasurementSnapshot(snapshot)).toBe(true);
   expect(projectMeasurement(snapshot, server, 1500)).toMatchObject({ latency: 70, purpose: 'nativeHttp', measuredAt: 1000 });
-  expect(projectMeasurement(snapshot, server, 2001)).toMatchObject({ state: 'expired', latency: undefined, measuredAt: 1000 });
+  expect(projectMeasurement(snapshot, server, 2001)).toMatchObject({ state: 'expired', latency: 70, measuredAt: 1000 });
   snapshot.rows.a.nativeHttp.identity.metric = 'warm_ttfb_v1';
   expect(validMeasurementSnapshot(snapshot)).toBe(false);
+  snapshot.rows.a.nativeHttp = null;
+  expect(validMeasurementSnapshot(snapshot)).toBe(true);
+  expect(projectMeasurement(snapshot, server, 1500)).toEqual({ state: 'unmeasured' });
+  expect(projectMeasurement(snapshot, server, 1500, 'current')).toMatchObject({ state: 'success', latency: 40, purpose: 'candidate' });
+  delete snapshot.rows.a.candidate;
+  expect(projectMeasurement(snapshot, server, 1500, 'current')).toEqual({ state: 'unmeasured' });
+  const malformed = structuredClone(snapshot) as any;
+  malformed.rows.a.selected = null;
+  expect(validMeasurementSnapshot(malformed)).toBe(false);
+});
+
+it('shows the original result with expiry, without routine source labels', () => {
+  const snapshot = measurementFixture(config, { a: 40 });
+  const record = snapshot.rows.a.candidate!;
+  record.disconnected = true;
+  record.identity.instance = { kind: 'temp' };
+  record.identity.context = 'disconnected';
+  expect(measurementText(projectMeasurement(snapshot, server, 1500), key => key)).toBe('40 ms');
+  expect(measurementText(projectMeasurement(snapshot, server, 2001), key => key)).toBe('40 ms · measurement.expired');
+  record.state = 'failed'; record.latency = null;
+  record.failure = { phase: 'measure', kind: 'timeout' };
+  expect(measurementText(projectMeasurement(snapshot, server, 1500), key => key)).toBe('nodes.timeout');
+  expect(measurementText(projectMeasurement(snapshot, server, 2001), key => key)).toBe('nodes.timeout · measurement.expired');
+  record.state = 'expired'; record.reason = 'expired';
+  expect(measurementText(projectMeasurement(snapshot, server, 1500), key => key)).toBe('nodes.timeout · measurement.expired');
+  record.failure.kind = 'transport';
+  expect(measurementText(projectMeasurement(snapshot, server, 1500), key => key)).toBe('measurement.failed · measurement.expired');
 });

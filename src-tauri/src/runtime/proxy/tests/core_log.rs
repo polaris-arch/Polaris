@@ -543,11 +543,45 @@ fn login_diagnostics_hide_exact_headscale_key_api_secret_and_auth_url() {
 #[tokio::test]
 async fn handed_off_pipe_still_classifies_normal_and_oversized_fatal_lines() {
     use tokio::io::AsyncWriteExt;
-    for (oversized, token, expected) in [
-        (false, "FATAL ", Some(CoreFatalKind::DhcpMonitorMissing)),
-        (true, "FATAL ", Some(CoreFatalKind::DhcpMonitorMissing)),
-        (false, "INFO ", None),
-        (true, "INFO ", None),
+    for (oversized, token, cause, expected) in [
+        (
+            false,
+            "FATAL ",
+            DHCP_MONITOR_MISSING_TOKEN,
+            Some(CoreFatalKind::DhcpMonitorMissing),
+        ),
+        (
+            true,
+            "FATAL ",
+            DHCP_MONITOR_MISSING_TOKEN,
+            Some(CoreFatalKind::DhcpMonitorMissing),
+        ),
+        (false, "INFO ", DHCP_MONITOR_MISSING_TOKEN, None),
+        (true, "INFO ", DHCP_MONITOR_MISSING_TOKEN, None),
+        (
+            false,
+            "FATAL ",
+            "cronet: failed to load selected library",
+            Some(CoreFatalKind::CronetLoadFailed),
+        ),
+        (
+            true,
+            "FATAL ",
+            "cronet: failed to load selected library",
+            Some(CoreFatalKind::CronetLoadFailed),
+        ),
+        (
+            false,
+            "INFO ",
+            "cronet: failed to load selected library",
+            None,
+        ),
+        (
+            true,
+            "INFO ",
+            "cronet: failed to load selected library",
+            None,
+        ),
     ] {
         let (mut writer, reader) = tokio::io::duplex(1024);
         let fatal: CoreFatalSlot = Arc::new(std::sync::Mutex::new(None));
@@ -562,7 +596,7 @@ async fn handed_off_pipe_still_classifies_normal_and_oversized_fatal_lines() {
         if oversized {
             line.extend(vec![b'x'; 70 * 1024]);
         }
-        line.extend_from_slice(DHCP_MONITOR_MISSING_TOKEN.as_bytes());
+        line.extend_from_slice(cause.as_bytes());
         line.push(b'\n');
         tokio::time::timeout(Duration::from_secs(5), async {
             writer.write_all(&line).await.unwrap();

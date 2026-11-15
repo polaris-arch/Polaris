@@ -100,6 +100,7 @@ export enum ProxyErrorCode {
   HELPER_CORE_MISMATCH = 'HELPER_CORE_MISMATCH', // 选定 CoreID 与助手内容或起核回执不符；版本首行仅作诊断
   BINARY_NOT_FOUND = 'BINARY_NOT_FOUND', // 退出码 127
   CRONET_LIB_MISSING = 'CRONET_LIB_MISSING', // 'cronet: library not found' / dlopen 失败（naive 出站缺/坏 libcronet → 整核 FATAL，自愈冷路径触发）
+  CORE_LIBRARY_LOAD_FAILED = 'CORE_LIBRARY_LOAD_FAILED', // Selected core component failed to load before readiness.
   HELPER_NOT_INSTALLED = 'HELPER_NOT_INSTALLED', // TUN 需提权 helper 但未安装、且引导门内也没能装上 → 渲染端引导去「设置 › Helper」，不抛裸 socket ENOENT
   HELPER_GATE_ABORTED = 'HELPER_GATE_ABORTED', // TUN 提权引导门弹出后用户点了「取消」→ 中性告知「已取消、未启动」，**不得**复用 HELPER_NOT_INSTALLED 的「去安装」引导（用户刚拒绝过，再催一遍是无视其选择）
   TUN_ROUTE_NOT_CAPTURED = 'TUN_ROUTE_NOT_CAPTURED', // TUN 模式起核就绪后 post-flight 判定「应走代理的公网目的」出口 grace 内始终未从 baseline 切走（其他 VPN 占默认路由 / 我方路由装失败）→ 硬闸拒绝标 connected，避免「假报已连接、连接数 0」（见 runtime/proxy::verify_tun_route_captured）

@@ -229,7 +229,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
       } catch (error) { await captureFailure(page, error); throw error; }
       finally { await page.close(); }
     });
-    it(mode + ': five states and disconnected/not-included labels use the same stored record', async () => {
+    it(mode + ': five states preserve old values and keep source details out of the label', async () => {
       const page = await browser.newPage({ viewport: { width: mode==='mobile'?390:1100, height:844 } });
       try {
         await openFixture(page, mode, mode + '-measurement-states');
@@ -237,9 +237,10 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
         await expect.poll(() => page.locator('[data-measurement-state="success"]').count()).toBeGreaterThan(0);
         expect(await page.locator('[data-measurement-state="failed"]').count()).toBeGreaterThan(0);
         expect(await page.locator('[data-measurement-state="unmeasured"]').count()).toBeGreaterThan(0);
-        for (const [kind,state,text] of [['expired','expired','过期'],['paused','paused','暂停'],['notIncluded','unmeasured','未纳入'],['disconnected','success','未连接测量']]) {
+        for (const [kind,state,text] of [['expired','expired','40 ms · 已过期'],['paused','paused','暂停'],['notIncluded','unmeasured','未测'],['disconnected','success','40 ms']]) {
           await page.evaluate(kind => (window as any).__measurement.publish(kind), kind);
           await expect.poll(() => page.locator('[data-measurement-state="'+state+'"]').allTextContents()).toContainEqual(expect.stringContaining(text));
+          expect((await page.locator('[data-measurement-state]').allTextContents()).join(' ')).not.toContain('未连接测量');
         }
       } catch (error) { await captureFailure(page, error); throw error; }
       finally { await page.close(); }
@@ -259,7 +260,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
       await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="success"]').count()).toBe(1);
       await page.evaluate(()=>(window as any).__measurement.editSelected());
       await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="unmeasured"]').count()).toBe(1);
-      expect(await page.locator('.h-latency-value').innerText()).toContain('未纳入');
+      expect(await page.locator('.h-latency-value').innerText()).toContain('未测');
+      expect(await page.locator('.h-latency-value [data-measurement-state]').getAttribute('data-tip')).toContain('未纳入');
       expect(await page.locator('.h-latency-value').innerText()).not.toContain('40 ms');
     } catch (error) { await captureFailure(page, error); throw error; }
     finally {await page.close();}
@@ -269,11 +271,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
     try {
       await openFixture(page, 'tray-language', 'tray-language');
       await page.evaluate(()=>(window as any).__measurement.publish('notIncluded'));
-      await expect.poll(()=>page.locator('[data-measurement-state]').innerText()).toContain('未纳入');
+      await expect.poll(()=>page.locator('[data-measurement-state]').innerText()).toBe('未测');
       await page.evaluate(()=>(window as any).__measurement.language());
       await expect.poll(()=>page.locator('[data-tray-language]').getAttribute('data-tray-language')).toBe('en-US');
       const text=await page.locator('[data-measurement-state]').innerText();
-      expect(text).not.toContain('未纳入');expect(text).toContain('Not included');
+      expect(text).not.toContain('未测');expect(text).toBe('Unmeasured');
     } catch (error) { await captureFailure(page, error); throw error; }
     finally {await page.close();}
   });

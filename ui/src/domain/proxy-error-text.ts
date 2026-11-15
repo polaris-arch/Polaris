@@ -21,6 +21,7 @@ export interface ProxyErrorTextInput {
 export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   VISION_TRANSPORT_UNSUPPORTED: 'nodes.invalidVisionTransport',
   STARTUP_FAILED: 'errors.startupFailed',
+  CORE_LIBRARY_LOAD_FAILED: 'errors.coreLibraryLoadFailed',
   NODE_RESOLVER_UNSUPPORTED: 'errors.nodeResolverUnsupported',
   SPEED_TEST_URL_INVALID: 'errors.speedTestUrlInvalid',
   IOS_SESSION_ACTIVE: 'errors.iosSessionActive',

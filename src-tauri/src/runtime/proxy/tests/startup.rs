@@ -2208,6 +2208,30 @@ fn core_fatal_rejects_non_tun_address_failures() {
 }
 
 #[test]
+fn core_fatal_classifies_selected_cronet_load_failure_without_os_message_or_path() {
+    for suffix in ["The parameter is incorrect.", "参数错误。"] {
+        let line = format!(
+            "FATAL create service: initialize outbound[1]: cronet: failed to load selected library C:\\private\\libcronet.dll: {suffix}"
+        );
+        assert_eq!(
+            scan_core_fatal(&line),
+            Some(CoreFatalKind::CronetLoadFailed)
+        );
+        assert_eq!(scan_core_fatal(&line.replacen("FATAL", "INFO", 1)), None);
+    }
+    assert_eq!(
+        scan_core_fatal("FATAL initialize outbound[1]: cronet: unrelated request failure"),
+        None
+    );
+    let (message, error_code) = settle_start_failure(
+        "C:\\private\\libcronet.dll: readiness timeout".into(),
+        Some(CoreFatalKind::CronetLoadFailed),
+    );
+    assert_eq!(error_code, code::CORE_LIBRARY_LOAD_FAILED);
+    assert!(!message.contains("private") && !message.contains("timeout"));
+}
+
+#[test]
 fn scan_core_fatal_takes_first_hit_in_block() {
     let block = format!(
         "+0800 INFO router: loaded rule-set\n{}\n+0800 FATAL sing-box did not close!\n",

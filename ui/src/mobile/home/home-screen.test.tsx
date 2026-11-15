@@ -926,12 +926,12 @@ describe('⑥ 活动连接聚合：按字节、口径与后端同源', () => {
  * ═════════════════════════════════════════════════════════════════════════ */
 
 describe('⑦ 无源不画：陈旧 / 哨兵 / 隐私 / 空态', () => {
-  it('延迟陈旧**渲染成陈旧**，不许印成一个数', () => {
+  it('延迟过期保留旧值并明确标注', () => {
     const html = render({
       node: { kind: 'node', name: 'HK03', protocolLabel: 'VLESS', flagSrc: null, latencyMs: 42, latencyStale: true },
     });
     expect(html).toContain('measurement.expired');
-    expect(html).not.toContain('42 ms');
+    expect(html).toContain('42 ms · measurement.expired');
   });
 
   it('哨兵选择不是节点：直连 / 阻断各有如实标签，且不画协议与旗', () => {
@@ -1285,9 +1285,9 @@ describe('⑨–⑫ 出口控制、检测与规则统计的当前呈现契约', 
     expect(measured).toContain('class="h-latency-reason">连接后可测当前出口</span>');
     expect(measured).toMatch(/<button[^>]*disabled=""[^>]*>mobileHome\.currentSpeedTest<\/button>/);
     expect(stopped(null)).toContain('data-measurement-state="failed"');
-    expect(stopped(null)).toContain('measurement.failed');
+    expect(stopped(null)).toContain('nodes.timeout');
     expect(stopped(85,true)).toContain('data-measurement-state="expired"');
-    expect(stopped(85,true)).not.toContain('85 ms');
+    expect(stopped(85,true)).toContain('85 ms · measurement.expired');
     expect(stopped(undefined)).toContain('data-measurement-state="unmeasured"');
   });
 

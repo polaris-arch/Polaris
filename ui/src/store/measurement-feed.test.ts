@@ -51,18 +51,39 @@ describe('one authoritative ledger feed', () => {
     expect(useLatencyStore.getState().latencyMap).toEqual({ a: 88 });
   });
   it('lifecycle invalidation withdraws green data immediately; failed readback cannot restore it', async () => {
-    vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(measurementFixture(config, { a: 30 }));
+    const snapshot = measurementFixture(config, { a: 30, b: null, c: 50 });
+    snapshot.rows.c.candidate!.state = 'expired'; snapshot.rows.c.candidate!.reason = 'expired';
+    vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(snapshot);
     cleanup = subscribeLatencyEvents(); await tick();
     vi.mocked(api.server.speedTestResultSnapshot).mockRejectedValue(new Error('unavailable'));
     handlers.lifecycle?.(); expect(useLatencyStore.getState().latencyMap).toEqual({});
-    expect(useLatencyStore.getState().projections.a.state).toBe('expired'); await tick();
+    expect(useLatencyStore.getState().projections.a).toEqual({ state: 'unmeasured' });
+    expect(useLatencyStore.getState().projections.b).toEqual({ state: 'unmeasured' });
+    expect(useLatencyStore.getState().currentProjections.a).toEqual({ state: 'unmeasured' });
+    expect(useLatencyStore.getState().projections.c).toEqual({ state: 'unmeasured' });
+    expect(useLatencyStore.getState().testedAt).toEqual({}); await tick();
     expect(useLatencyStore.getState().latencyMap).toEqual({});
+    expect(useLatencyStore.getState().readError).toBe(true);
   });
   it('raw late events only wake the ledger and cannot overwrite a newer stored result', async () => {
-    vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(measurementFixture(config, { a: 88 }, '9'));
+    const snapshot = measurementFixture(config, { a: 88, b: null }, '9');
+    snapshot.rows.b.nativeHttp = null;
+    vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(snapshot);
     cleanup = subscribeLatencyEvents(); await tick();
+    expect(useLatencyStore.getState().projections.b).toEqual({ state: 'unmeasured' });
+    expect(useLatencyStore.getState().latencyMap).toEqual({ a: 88 });
     const previous = useLatencyStore.getState().latencyMap;
     handlers.result?.(); await tick(); expect(useLatencyStore.getState().latencyMap).toBe(previous);
+  });
+  it('retains expired values for display while excluding them from latency selection', () => {
+    const snapshot = measurementFixture(config, { a: 30, b: null });
+    useLatencyStore.getState().applySnapshot(snapshot, config.servers, 2001);
+    expect(useLatencyStore.getState().projections.a).toMatchObject({ state: 'expired', latency: 30 });
+    expect(useLatencyStore.getState().projections.b).toMatchObject({ state: 'expired', failure: { kind: 'timeout' } });
+    expect(useLatencyStore.getState().latencyMap).toEqual({});
+    useLatencyStore.getState().invalidate();
+    expect(useLatencyStore.getState().projections.a).toEqual({ state: 'unmeasured' });
+    expect(useLatencyStore.getState().currentProjections.b).toEqual({ state: 'unmeasured' });
   });
   it('reference-counts listeners and rejects responses after complete window teardown', async () => {
     let resolve!: (snapshot: ReturnType<typeof measurementFixture>) => void;

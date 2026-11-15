@@ -199,6 +199,36 @@ fn final_path(f: &File) -> io::Result<PathBuf> {
     Ok(PathBuf::from(text))
 }
 
+fn sidecar_load_path(file: &File) -> io::Result<PathBuf> {
+    let mut buf = vec![0u16; 32768];
+    // LoadLibraryEx(DLL_LOAD_DIR | SYSTEM32) rejects the volume GUID spelling.
+    // Obtain its DOS spelling from the held file, never by guessing a drive.
+    let n = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            VOLUME_NAME_DOS,
+        )
+    } as usize;
+    if n == 0 || n >= buf.len() {
+        return Err(io::Error::other("sidecar DOS path unavailable"));
+    }
+    let path = PathBuf::from(String::from_utf16(&buf[..n]).map_err(io::Error::other)?);
+    if !matches!(path.components().next(), Some(std::path::Component::Prefix(p))
+        if matches!(p.kind(), std::path::Prefix::VerbatimDisk(_)))
+    {
+        return Err(io::Error::other("local sidecar DOS path required"));
+    }
+    let reopened = guard(&path, false)?;
+    if identity(&reopened, true)? != identity(file, true)?
+        || final_path(&reopened)? != final_path(file)?
+    {
+        return Err(io::Error::other("sidecar load path identity changed"));
+    }
+    Ok(path)
+}
+
 struct Descriptor(PSECURITY_DESCRIPTOR);
 impl Descriptor {
     fn private() -> io::Result<Self> {
@@ -557,11 +587,10 @@ pub(super) fn issue(
         if identity(&file, true)? != born {
             return Err(error("issued image identity changed"));
         }
-        let final_name = final_path(&file)?;
         if member.name == "sing-box.exe" {
-            cohort.final_exe = final_name;
+            cohort.final_exe = final_path(&file)?;
         } else {
-            cohort.final_sidecar = final_name;
+            cohort.final_sidecar = sidecar_load_path(&file)?;
         }
         cohort.files.push((path, file, born));
     }

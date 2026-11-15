@@ -13,7 +13,8 @@ export interface MeasurementRecord {
 }
 export interface MeasurementRows {
   candidate?: MeasurementRecord;
-  nativeHttp?: MeasurementRecord;
+  /** null keeps native candidate ownership while its first sample is pending. */
+  nativeHttp?: MeasurementRecord | null;
   system?: MeasurementRecord;
   selected?: MeasurementRecord;
   notIncluded?: string;
@@ -37,6 +38,7 @@ export interface MeasurementSnapshot {
 export interface MeasurementProjection {
   state: MeasurementState;
   latency?: number;
+  failure?: SpeedTestFailure;
   measuredAt?: number;
   notIncluded?: string;
   disconnected?: boolean;

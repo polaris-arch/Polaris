@@ -19,6 +19,7 @@ export function validMeasurementSnapshot(value: unknown): value is MeasurementSn
     || !object(value.rows) || Object.keys(value.rows).length > 16384) return false;
   return Object.values(value.rows).every(row => object(row) && Object.entries(row).every(([purpose, record]) => {
     if (purpose === 'notIncluded') return typeof record === 'string';
+    if (purpose === 'nativeHttp' && record === null) return true;
     if (!['candidate', 'system', 'selected', 'nativeHttp'].includes(purpose) || !object(record) || !object(record.identity)) return false;
     const identity = record.identity;
     return ['success', 'failed', 'expired'].includes(String(record.state))

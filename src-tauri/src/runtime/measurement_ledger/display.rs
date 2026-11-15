@@ -184,10 +184,10 @@ impl MeasurementLedger {
                 Some("identityUnknown")
             } else if changed_config {
                 Some("configurationChanged")
-            } else if stale.is_some() {
-                stale.map(stale_code)
             } else if changed_connection {
                 Some("connectionChanged")
+            } else if stale.is_some() {
+                stale.map(stale_code)
             } else {
                 None
             };

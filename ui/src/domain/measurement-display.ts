@@ -10,6 +10,8 @@ export function projectMeasurement(
   purpose: 'candidate' | 'current' = 'candidate',
 ): MeasurementProjection {
   const rows: MeasurementRows | undefined = Object.prototype.hasOwnProperty.call(snapshot.rows, server.id) ? snapshot.rows[server.id] : undefined;
+  // Native owns candidate quality; a pending first sample cannot reuse App history.
+  if (purpose === 'candidate' && rows?.nativeHttp === null) return UNMEASURED;
   // App runs have their own ordering. Select their latest record first, then
   // compare original sample timestamps across engines (never mixed sort keys).
   const appRecord = [rows?.candidate, rows?.system, rows?.selected]
@@ -26,11 +28,13 @@ export function projectMeasurement(
     && Object.prototype.hasOwnProperty.call(snapshot.schedule.subscriptions ?? {}, server.subscriptionId);
   if (paused) return { state: 'paused', reason: snapshot.schedule.reason, measuredAt: record?.identity.measuredAt };
   if (!record) return UNMEASURED;
-  const expired = record.state === 'expired' || !Number.isFinite(now)
-    || now < record.identity.measuredAt || now > record.expiresAt;
+  // A different measurement context needs a new sample, not a TTL warning.
+  if (!Number.isFinite(now) || now < record.identity.measuredAt
+    || record.state === 'expired' && record.reason && record.reason !== 'expired') return UNMEASURED;
+  const expired = record.state === 'expired' || now > record.expiresAt;
   return {
     state: expired ? 'expired' : record.state,
-    latency: !expired && record.state === 'success' ? record.latency ?? undefined : undefined,
+    latency: record.latency ?? undefined, failure: record.failure ?? undefined,
     measuredAt: record.identity.measuredAt, disconnected: record.disconnected,
     purpose: record.identity.path, reason: record.reason, bindingMismatch: record.bindingMismatch,
   };
@@ -39,13 +43,10 @@ export function projectMeasurement(
 export function measurementText(
   result: MeasurementProjection, t: (key: string, vars?: Record<string, unknown>) => string,
 ): string {
-  const state = result.state === 'success' && result.latency !== undefined
-    ? `${result.latency} ms` : t(`measurement.${result.state}`);
-  const notes = [result.notIncluded && t('measurement.notIncluded'),
-    result.disconnected && t('measurement.disconnected'),
-    result.purpose === 'nativeHttp' && t('measurement.nativeHttp'),
-    result.purpose === 'system' && t('measurement.systemPath'),
-    result.purpose === 'selected' && t('measurement.selectedPath'),
-    result.bindingMismatch && t('measurement.bindingMismatch')].filter(Boolean);
-  return [state, ...notes].join(' · ');
+  const state = (result.state === 'success' || result.state === 'expired') && result.latency !== undefined
+    ? `${result.latency} ms`
+    : result.state === 'failed' || result.state === 'expired'
+      ? t(result.failure?.kind === 'timeout' ? 'nodes.timeout' : 'measurement.failed')
+      : t(`measurement.${result.state}`);
+  return result.state === 'expired' ? `${state} · ${t('measurement.expired')}` : state;
 }

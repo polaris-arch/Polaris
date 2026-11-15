@@ -31,31 +31,49 @@ fn fixture() -> &'static PathBuf {
         println!("ATOMIC_FACTORY_FIXTURE {}",serde_json::json!({"compiler":compiler.get_program(),"source":source,"argv":argv,"image":image,"bytes":bytes.len(),"sha256":sha256_hex(&bytes)}));image
     })
 }
-fn native_case(cancel: bool) {
+fn native_case(cancel: bool, load_sidecar: bool) {
     let root = directory();
     let image = root.join("owned.exe");
     fs::copy(fixture(), &image).unwrap();
     let held = guard(&image, false).unwrap();
     let before = identity(&held, true).unwrap();
+    let sidecar = root.join("libcronet.dll");
+    let held_sidecar = load_sidecar.then(|| {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/win/libcronet.dll");
+        fs::copy(source, &sidecar).unwrap();
+        guard(&sidecar, false).unwrap()
+    });
+    let load_path = held_sidecar
+        .as_ref()
+        .map(sidecar_load_path)
+        .transpose()
+        .unwrap();
     let id = CoreId::parse(&"a".repeat(64)).unwrap();
     fs::create_dir(root.join("leases")).unwrap();
     let marker = occupancy_path(&root, &id);
     fs::write(&marker, []).unwrap();
     let marker_guard = guard(&marker, false).unwrap();
+    let guards: Vec<&File> = [&held, &marker_guard]
+        .into_iter()
+        .chain(held_sidecar.iter())
+        .collect();
     let (input, mut control) = pipe().unwrap();
     let mut child = create_suspended(
         &image,
-        &root.join("unused.dll"),
+        load_path.as_deref().unwrap_or(&sidecar),
         &input,
         &root,
-        &[&held, &marker_guard],
+        &guards,
         ExecPurpose::RunMain,
         Some((&root, &root)),
     )
     .unwrap();
+    drop(guards);
     // The actual factory, including HANDLE_LIST/JOB_LIST/mitigations, has run.
     // Child is not yet allowed its first instruction and already owns this guard.
     drop(held);
+    drop(held_sidecar);
     drop(marker_guard);
     drop(input);
     assert_eq!(
@@ -83,6 +101,17 @@ fn native_case(cancel: bool) {
         .read_exact(&mut ready)
         .unwrap();
     assert_eq!(&ready, b"ready");
+    if load_sidecar {
+        control.write_all(b"l").unwrap();
+        let mut loaded = [0; 6];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut loaded)
+            .unwrap();
+        assert_eq!(&loaded, b"loaded");
+    }
     let process = child.process.as_ref().unwrap();
     assert_eq!(
         unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
@@ -134,17 +163,25 @@ fn native_case(cancel: bool) {
     drop(reopened);
     drop(child);
     fs::remove_file(&image).unwrap();
+    if load_sidecar {
+        fs::remove_file(&sidecar).unwrap();
+    }
     fs::remove_file(&marker).unwrap();
     fs::remove_dir(root.join("leases")).unwrap();
     fs::remove_dir(&root).unwrap();
 }
 #[test]
 fn native_atomic_guard_and_job_survive_parent_file_release_until_actual_wait() {
-    native_case(false);
+    native_case(false, false);
 }
 #[test]
 fn native_atomic_job_close_is_fail_stop_without_post_spawn_assign() {
-    native_case(true);
+    native_case(true, false);
+}
+
+#[test]
+fn native_atomic_child_loads_real_cronet_with_held_dos_path_and_restricted_search() {
+    native_case(false, true);
 }
 
 #[test]

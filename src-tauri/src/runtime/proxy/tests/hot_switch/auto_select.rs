@@ -1890,6 +1890,15 @@ async fn native_wrong_endpoint_dirty_connection_and_missing_history_stay_pending
             .unwrap();
         assert!(!global.confirmed, "{source}");
         assert_eq!(global.state, "pending", "{source}");
+        if matches!(source, "history" | "missing") {
+            let rows = rt.native_measurement_rows(
+                &desired,
+                crate::runtime::subscription_scheduler::now_ms(),
+                Some(&"a".repeat(64)),
+            );
+            assert_eq!(rows.get("node-a"), Some(&Value::Null));
+            assert_eq!(rows.get("node-b"), Some(&Value::Null));
+        }
         assert!(sink.calls().is_empty());
         if source == "missing" {
             assert_eq!(status.actual_server_id, None);

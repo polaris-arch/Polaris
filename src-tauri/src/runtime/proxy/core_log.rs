@@ -473,6 +473,7 @@ const CORE_LOG_LINE_LIMIT: usize = 64 * 1024;
 const FATAL_TOKEN_OVERLAP: usize = 64;
 const TUN_CONFIGURE_TOKEN: &str = "configure tun interface";
 const ADDRESS_STEP_TOKENS: &[&str] = &["set ipv4 address", "set ipv6 address", "add address "];
+const CRONET_LOAD_FAILED_TOKEN: &str = "cronet: failed to load selected library";
 
 #[derive(Default)]
 struct FatalLineFacts {
@@ -480,6 +481,7 @@ struct FatalLineFacts {
     dhcp: bool,
     tun: bool,
     address: bool,
+    cronet: bool,
 }
 
 impl FatalLineFacts {
@@ -489,6 +491,7 @@ impl FatalLineFacts {
         self.dhcp |= text.contains(DHCP_MONITOR_MISSING_TOKEN);
         self.tun |= text.contains(TUN_CONFIGURE_TOKEN);
         self.address |= ADDRESS_STEP_TOKENS.iter().any(|token| text.contains(token));
+        self.cronet |= text.contains(CRONET_LOAD_FAILED_TOKEN);
     }
 
     fn classify(&self) -> Option<CoreFatalKind> {
@@ -503,6 +506,9 @@ impl FatalLineFacts {
         }
         if self.address {
             evidence.push_str(ADDRESS_STEP_TOKENS[0]);
+        }
+        if self.cronet {
+            evidence.push_str(CRONET_LOAD_FAILED_TOKEN);
         }
         classify_core_fatal_line(
             &evidence,
@@ -722,6 +728,8 @@ fn strip_level_prefix(s: &str) -> &str {
 /// 不是我方 message 的关键字 —— 后者就是 [`code`] 模块头注说的「猜 message = 伪造分类」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoreFatalKind {
+    /// The selected Cronet library failed to load before the core became ready.
+    CronetLoadFailed,
     /// 给 TUN 网卡装地址这一步失败（地址被占 / 系统拒绝分配）→ [`code::TUN_ADDRESS_UNAVAILABLE`]。
     TunAddressUnavailable,
     /// 网络场景 dhcp transport（`dns-netenv`）在 Start 阶段要 network monitor 而没有（非 TUN 且
@@ -779,6 +787,9 @@ pub(super) fn classify_core_fatal_line(line: &str, level: log::Level) -> Option<
     if line.contains(DHCP_MONITOR_MISSING_TOKEN) {
         return Some(CoreFatalKind::DhcpMonitorMissing);
     }
+    if line.contains(CRONET_LOAD_FAILED_TOKEN) {
+        return Some(CoreFatalKind::CronetLoadFailed);
+    }
     // 外层包装必须在：单看 `add address` 会把任何提到该词的行都算上。
     if !line.contains(TUN_CONFIGURE_TOKEN) {
         return None;
@@ -828,6 +839,11 @@ pub(super) fn settle_start_failure(
     fatal: Option<CoreFatalKind>,
 ) -> (String, &'static str) {
     match fatal {
+        Some(CoreFatalKind::CronetLoadFailed) => (
+            "内核组件加载失败，代理未启动。请更新应用及系统助手；若仍失败，请查看启动日志。"
+                .to_string(),
+            code::CORE_LIBRARY_LOAD_FAILED,
+        ),
         Some(CoreFatalKind::TunAddressUnavailable) => (
             TUN_ADDRESS_UNAVAILABLE_MSG.to_string(),
             code::TUN_ADDRESS_UNAVAILABLE,

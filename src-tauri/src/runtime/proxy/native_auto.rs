@@ -1391,18 +1391,19 @@ impl ProxyRuntime {
             .collect();
         let mut rows = serde_json::Map::new();
         for id in owned {
+            let Some(sample) = samples.get(id.as_str()).copied() else {
+                // Native owns this candidate even before its first real sample.
+                rows.insert(id, Value::Null);
+                continue;
+            };
             let cap = caps.get(&id).copied().unwrap_or(30 * 60_000);
-            let sample = samples.get(id.as_str()).copied();
-            let measured_at = sample.map_or(0, |sample| sample.measured_at);
+            let measured_at = sample.measured_at;
             let expires_at = measured_at.saturating_add(cap);
-            let current = sample.is_some()
-                && emission_digest.is_some()
-                && now >= measured_at
-                && now <= expires_at;
+            let current = emission_digest.is_some() && now >= measured_at && now <= expires_at;
             rows.insert(id.clone(),json!({
                 "state": if current {"success"} else {"expired"},
-                "reason": if sample.is_none() {Some("identityUnknown")} else if !current {Some("expired")} else {None},
-                "latency":sample.map(|sample|sample.latency_ms), "failure":null,
+                "reason": if emission_digest.is_none() || now < measured_at {Some("identityUnknown")} else if !current {Some("expired")} else {None},
+                "latency":sample.latency_ms, "failure":null,
                 "disconnected":false,"bindingMismatch":false,"expiresAt":expires_at,
                 "identity":{
                     "run":measured_at.to_string(),"seq":0,"origin":"nativeAuto","scope":null,

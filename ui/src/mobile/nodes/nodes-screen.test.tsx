@@ -1770,10 +1770,10 @@ describe('⑨ 空态四档齐（IA §2.1 States 前四行）', () => {
     expect(seen.size).toBe(4);
   });
 
-  it('延迟陈旧渲染成「陈旧」而不是一个数（IA §2.1：never as a number）', () => {
+  it('延迟过期显示旧值与过期标记', () => {
     const html = render({ rows: [row('s', { latencyMs: 42, latencyStale: true })] });
     expect(html).toContain('measurement.expired');
-    expect(html).not.toContain('42 ms');
+    expect(html).toContain('42 ms · measurement.expired');
   });
 });
 
@@ -2171,7 +2171,7 @@ describe('⑫ 行内颜色角色：延迟分档色 + 角标族', () => {
 
   it('文案与档位色同源：写着「超时」的那一格必须是 dead，不是中性色', () => {
     const html = render({ rows: [row('x', { latencyMs: null })] });
-    expect(html).toContain('measurement.failed');
+    expect(html).toContain('nodes.timeout');
     expect(html).toContain('class="mn-lat dead"');
     // 反向对照：陈旧那一格写的是「陈旧」且色退回 none —— 两句话不许互相拆台。
     const stale = render({ rows: [row('x', { latencyMs: 42, latencyStale: true })] });
@@ -3160,7 +3160,7 @@ describe('mobile consequence badges with the real two-action row width', () => {
     it(`${viewport.width}px: short non-numeric status uses its own line without overflow`, async () => {
       const translated = translatedFor('zh-CN');
       const html = render({ t: translated, rows: [row('short-status', { latencyMs: null })] });
-      expect(html).toContain(translated('measurement.failed'));
+      expect(html).toContain(translated('nodes.timeout'));
       const m = await measure({ ctx: 'mobile', html: inMobileShell(html, 'nodes'), viewport }, [
         { select: '.mn-row-copy', props: ['width'] },
         { select: '.mn-lat.dead', props: ['text-align'] },

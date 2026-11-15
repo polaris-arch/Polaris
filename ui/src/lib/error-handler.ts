@@ -112,6 +112,7 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.HELPER_CORE_MISMATCH:
     case ProxyErrorCode.BINARY_NOT_FOUND:
     case ProxyErrorCode.CRONET_LIB_MISSING:
+    case ProxyErrorCode.CORE_LIBRARY_LOAD_FAILED:
     case ProxyErrorCode.SYSTEM_INTERFACE_REQUIRES_HELPER:
     case ProxyErrorCode.MESH_INBOUND_SYSTEM_INTERFACE:
     case ProxyErrorCode.HELPER_NOT_INSTALLED:

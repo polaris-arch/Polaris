@@ -17,6 +17,7 @@ export function MeasurementLabel({ serverId, purpose = 'candidate', displayedSer
   });
   const saved = useAppStore(state => state.config?.servers.find(server => server.id === serverId));
   const paused = useLatencyStore(state => state.snapshot?.schedule.state === 'paused'
+    && state.snapshot.rows[serverId]?.nativeHttp === undefined
     && !!saved?.subscriptionId && Object.prototype.hasOwnProperty.call(state.snapshot.schedule.subscriptions ?? {}, saved.subscriptionId));
   const pauseReason = useLatencyStore(state => state.snapshot?.schedule.reason);
   const readError = useLatencyStore(state => state.readError);
@@ -24,10 +25,16 @@ export function MeasurementLabel({ serverId, purpose = 'candidate', displayedSer
   const visible: MeasurementProjection = displayedServer && (!saved || configCanonicalText(displayedServer) !== configCanonicalText(saved))
     ? { state: 'unmeasured' as const, notIncluded: 'displayedEdit' } : projected;
   const incompatible = (displayedServer ?? saved) && visionTransportReason((displayedServer ?? saved)!);
-  const detail = incompatible ? t('nodes.invalidVisionTransport') : readError ? t('measurement.unavailable') : measurementText(visible, t)
-    + (purpose === 'current' && visible.purpose === 'candidate' ? ` · ${t('measurement.nodePath')}` : '');
-  const text = incompatible ? t('nodes.nodeInvalid') : compact && !readError ? measurementText({ ...visible, disconnected: false, purpose: undefined,
-    notIncluded: undefined, bindingMismatch: false }, t) : detail;
-  return <span data-tip={incompatible ? detail : compact ? detail + (visible.state === 'expired' ? ` · ${t('measurement.expiredHint')}` : '') : undefined} data-measurement-state={visible.state} data-measurement-purpose={visible.purpose ?? purpose}
+  const text = incompatible ? t('nodes.nodeInvalid') : readError ? t('measurement.unavailable') : measurementText(visible, t);
+  const detail = incompatible ? t('nodes.invalidVisionTransport') : readError ? undefined : [
+    visible.notIncluded && t('measurement.notIncluded'),
+    visible.purpose === 'nativeHttp' && t('measurement.nativeHttp'),
+    visible.purpose === 'system' && t('measurement.systemPath'),
+    visible.purpose === 'selected' && t('measurement.selectedPath'),
+    purpose === 'current' && visible.purpose === 'candidate' && t('measurement.nodePath'),
+    visible.bindingMismatch && t('measurement.bindingMismatch'),
+    visible.state === 'expired' && t('measurement.expiredHint'),
+  ].filter(Boolean).join(' · ') || undefined;
+  return <span data-tip={compact && detail && !incompatible ? `${text} · ${detail}` : detail} data-measurement-state={visible.state} data-measurement-purpose={visible.purpose ?? purpose}
     style={{ overflowWrap: 'anywhere', minWidth: 0 }}>{text}</span>;
 }
