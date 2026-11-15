@@ -216,11 +216,18 @@ function startMeasurementFeed(pollEnabled: boolean): () => void {
       const currentProxyStatus = useAppStore.getState().proxyStatus;
       if (!alive || ticket !== epoch || !currentConfig || configBaseVersion(currentConfig) !== version
         || connectionKey(currentProxyStatus) !== context) return;
-      if (!validMeasurementSnapshot(result)
-        || result.configVersion !== version || result.frontendConfigDigest !== digest || !result.consistent
+      if (!validMeasurementSnapshot(result)) {
+        useLatencyStore.getState().invalidate(true); return;
+      }
+      // Lifecycle/config publications can reach this window after the snapshot.
+      // A changing context withdraws old samples without claiming an IPC failure.
+      if (result.configVersion !== version || !result.consistent
         || currentProxyStatus?.running === true && (result.generation !== currentProxyStatus.mainGeneration
           || result.startTime !== (currentProxyStatus.startTime ?? null))
         || currentProxyStatus?.running === false && result.generation !== null) {
+        useLatencyStore.getState().invalidate(); return;
+      }
+      if (result.frontendConfigDigest !== digest) {
         useLatencyStore.getState().invalidate(true); return;
       }
       const prior = useLatencyStore.getState().snapshot;

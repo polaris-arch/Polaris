@@ -29,7 +29,7 @@ import { MeasurementLabel } from '@/mobile/MeasurementLabel';
  * 识别不到 → 不画（不回退地球：原型的 globe 兜底会让「没识别出来」看起来像「在某个未知国家」）。
  */
 
-import { Fragment, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { Fragment, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import { groupServersBySubscription, defaultOpenGroupIds } from '@/domain/server-grouping';
@@ -167,6 +167,21 @@ function OpenNodeMenu({
   const groupLabel = (g: { isManual: boolean; isMesh?: boolean; name: string }) =>
     g.isManual ? t('nodes.tab.manual') : g.isMesh ? t('nodes.tab.mesh') : g.name;
 
+  const menuRef = useRef<HTMLDivElement>(null);
+  const revealedSelection = useRef(false);
+  useLayoutEffect(() => {
+    if (revealedSelection.current) return;
+    const menu = menuRef.current;
+    const selected = menu?.querySelector<HTMLElement>('[aria-selected="true"]');
+    if (!menu || !selected) return;
+    const row = selected.getBoundingClientRect();
+    const bounds = menu.getBoundingClientRect();
+    // Center within this menu so its sticky search/footer cannot cover the row.
+    // Reveal once per opening (including async hydration), not while browsing.
+    menu.scrollTop += Math.max(0, row.top - bounds.top - menu.clientTop - (menu.clientHeight - row.height) / 2);
+    revealedSelection.current = true;
+  }, [groups, selectedServerId]);
+
   const scheduleReveal = useRevealAfterCommit();
   const toggleGroup = (id: string) => {
     setOpenGroups((prev) => {
@@ -186,7 +201,7 @@ function OpenNodeMenu({
 
 
   return (
-    <div className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')}>
+    <div ref={menuRef} className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')}>
       <div className="nm-search" hidden={totalCount < 8}>
         <input
           className="input"

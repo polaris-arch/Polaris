@@ -8,7 +8,7 @@ describe('tray switch receipt', () => {
     ['applied', true, null],
     ['pending', false, 'tray.switchPending:HK'],
     ['restarting', false, 'tray.switchRestarting:HK'],
-    ['notRunning', false, 'tray.switchSavedForNextStart:HK'],
+    ['notRunning', false, null],
     ['deferred', false, 'tray.switchRequiresApply:HK'],
     ['superseded', false, null],
   ] as const)('%s controls closing and notice', (status, close, notice) => {

@@ -75,6 +75,33 @@ describe('one authoritative ledger feed', () => {
     const previous = useLatencyStore.getState().latencyMap;
     handlers.result?.(); await tick(); expect(useLatencyStore.getState().latencyMap).toBe(previous);
   });
+  it.each(['backend-first', 'frontend-first'] as const)('normal stop is unmeasured while %s context publications converge', async order => {
+    const running = measurementFixture(config, { a: 30 });
+    const stopped = { ...measurementFixture(config, {}, '2'), generation: null, startTime: null, emissionDigest: null };
+    vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(running);
+    cleanup = subscribeLatencyEvents(); await tick();
+    expect(useLatencyStore.getState().latencyMap).toEqual({ a: 30 });
+
+    if (order === 'backend-first') vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(stopped);
+    else useAppStore.setState({ proxyStatus: { running: false } as never });
+    handlers.lifecycle?.(); await tick();
+    expect(useLatencyStore.getState().readError).toBe(false);
+    expect(useLatencyStore.getState().latencyMap).toEqual({});
+    expect(useLatencyStore.getState().projections.a).toEqual({ state: 'unmeasured' });
+
+    vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue(stopped);
+    useAppStore.setState({ proxyStatus: { running: false } as never });
+    handlers.result?.(); await tick();
+    expect(useLatencyStore.getState().snapshot).toBe(stopped);
+    expect(useLatencyStore.getState().readError).toBe(false);
+  });
+  it('a snapshot taken across a lifecycle transition is withdrawn without a read error', async () => {
+    vi.mocked(api.server.speedTestResultSnapshot).mockResolvedValue({ ...measurementFixture(config, {}), consistent: false });
+    cleanup = subscribeLatencyEvents(); await tick();
+    expect(useLatencyStore.getState().snapshot).toBeNull();
+    expect(useLatencyStore.getState().latencyMap).toEqual({});
+    expect(useLatencyStore.getState().readError).toBe(false);
+  });
   it('retains expired values for display while excluding them from latency selection', () => {
     const snapshot = measurementFixture(config, { a: 30, b: null });
     useLatencyStore.getState().applySnapshot(snapshot, config.servers, 2001);
@@ -102,6 +129,7 @@ describe('one authoritative ledger feed', () => {
     expect(useLatencyStore.getState().latencyMap).toEqual({});
     result.consistent = true; delete (result.rows.a.candidate as unknown as Record<string, unknown>).identity;
     handlers.result?.(); await tick(); expect(useLatencyStore.getState().latencyMap).toEqual({});
+    expect(useLatencyStore.getState().readError).toBe(true);
   });
   it('rejects an incorrect full content digest even when the short edit version agrees', async () => {
     const result = measurementFixture(config, { a: 1 }); result.frontendConfigDigest = 'e'.repeat(64);

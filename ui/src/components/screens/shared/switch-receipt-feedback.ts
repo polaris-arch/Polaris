@@ -11,7 +11,7 @@ export function switchReceiptFeedback(
     case 'applied': return { tone: 'success', text: t('home.switchedToast', { node }) };
     case 'pending': return { tone: 'info', text: t('home.switchPending', { node }) };
     case 'restarting': return { tone: 'info', text: t('home.switchRestarting', { node }) };
-    case 'notRunning': return { tone: 'info', text: t('home.switchSavedForNextStart', { node }) };
+    case 'notRunning': return null;
     case 'deferred': return { tone: 'warning', text: t('home.switchRequiresApply', { node }) };
     case 'superseded': return null;
   }

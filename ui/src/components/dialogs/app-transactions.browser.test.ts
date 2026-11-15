@@ -1088,6 +1088,32 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     await page.close();
   }));
 
+  it('node menu reveals the selected row on opening and leaves other groups collapsed', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
+    const page = await browser.newPage({ locale: 'en-US' });
+    await openFixture(page, origin + '/__transactions?mode=node-menu');
+    await page.evaluate(`window.__transactions.menuPatch({
+      servers:Array.from({length:30},(_,i)=>({id:'node-'+i,name:'Loop '+i,protocol:'socks',address:'127.0.0.1',port:1,subscriptionId:i===0?'other':'fixture'})),
+      subscriptions:[{id:'other',name:'Other group',url:'https://other.invalid'},{id:'fixture',name:'Selected group',url:'https://fixture.invalid'}],
+      selectedServerId:'node-29'
+    })`);
+    expect(await page.evaluate('window.__transactions.menuSnapshot()')).toEqual([{label: 'Other group', expanded: 'false'}, {label: 'Selected group', expanded: 'true'}]);
+    const menu = page.locator('#node-menu');
+    const selectionVisible = () => menu.evaluate(el => {
+      const row = el.querySelector('[aria-selected="true"]')!.getBoundingClientRect();
+      const search = el.querySelector('.nm-search')!.getBoundingClientRect();
+      const footer = el.querySelector('.nm-foot')!.getBoundingClientRect();
+      return el.scrollTop > 0 && row.top >= search.bottom && row.bottom <= footer.top;
+    });
+    expect(await selectionVisible()).toBe(true);
+    await menu.evaluate(el => { el.scrollTop = 0; });
+    await page.evaluate('window.__transactions.menuEqualConfig()');
+    expect(await menu.evaluate(el => el.scrollTop)).toBe(0);
+    await page.evaluate('window.__transactions.menuPatch({open:false})');
+    await page.evaluate('window.__transactions.menuPatch({open:true})');
+    expect(await selectionVisible()).toBe(true);
+    await page.close();
+  }));
+
   it('node menu initializes async groups before commit and preserves explicit choices across config/status publications', async (fixtureContext) => runFixtureCase(fixtureContext, browser, async (browser) => {
     const page = await browser.newPage({ locale: 'en-US' });
     await openFixture(page, origin + '/__transactions?mode=node-menu');

@@ -447,7 +447,7 @@ export default function SettingsHelper() {
               <div style={{ display: 'flex', gap: 9, marginTop: 14, flexWrap: 'wrap' }}>
                 <Button variant="flow" size="sm" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-                    <path d="M12 3v11M8 10l4 4 4-4" />
+                    <path d="M12 6v12M8 14l4 4 4-4" />
                   </svg>
                   <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : t('helper.installAction')}</span>
                 </Button>
@@ -480,7 +480,7 @@ export default function SettingsHelper() {
               <div style={{ display: 'flex', gap: 9, marginTop: 14 }}>
                 <Button variant="flow" size="sm" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
-                    <path d="M12 3v11M8 10l4 4 4-4" />
+                    <path d="M12 6v12M8 14l4 4 4-4" />
                   </svg>
                   <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : status?.selectedCore?.state === 'absent' ? t('helper.installSelectedCoreAction') : t('helper.upgradeHelperAction')}</span>
                 </Button>

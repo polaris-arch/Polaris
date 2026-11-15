@@ -107,7 +107,7 @@ import {
   speedTestErrorMessage,
 } from '@/components/screens/shared/speedtest-feedback';
 import { serverSwitchErrorCode, serverSwitchErrorText } from '@/domain/action-error-text';
-import { mobileSwitchReceiptFeedback } from '../mobile-switch-feedback';
+import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';
 import { initialNodesTab } from '@/components/screens/nodes/initial-tab';
 import { canCloneServer, meshSingletonConflict } from '@/domain/endpoint-routes';
 import { editRoute } from '@/lib/staged-config';
@@ -292,7 +292,7 @@ export function MobileNodesScreen(): ReactElement {
         async () => {
           const receipt = await switchServer(row.server.id);
           if (!receipt) return;
-          const feedback = mobileSwitchReceiptFeedback(receipt, row.server.name, t);
+          const feedback = switchReceiptFeedback(receipt, row.server.name, t);
           if (feedback?.tone === 'success') {
             setNotice(undefined);
             toast.success(feedback.text);

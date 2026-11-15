@@ -1,6 +1,6 @@
 import type { ServerSwitchReceipt } from '@/contracts/server-switch';
 
-type NoticeKey = 'tray.switchPending' | 'tray.switchRestarting' | 'tray.switchSavedForNextStart' | 'tray.switchRequiresApply';
+type NoticeKey = 'tray.switchPending' | 'tray.switchRestarting' | 'tray.switchRequiresApply';
 
 /** The tray stays visible while a saved choice is not confirmed in the running core. */
 export function traySwitchFeedback(
@@ -12,7 +12,7 @@ export function traySwitchFeedback(
     case 'applied': return { close: true, notice: null };
     case 'pending': return { close: false, notice: t('tray.switchPending', { node }) };
     case 'restarting': return { close: false, notice: t('tray.switchRestarting', { node }) };
-    case 'notRunning': return { close: false, notice: t('tray.switchSavedForNextStart', { node }) };
+    case 'notRunning': return { close: false, notice: null };
     case 'deferred': return { close: false, notice: t('tray.switchRequiresApply', { node }) };
     case 'superseded': return { close: false, notice: null };
   }

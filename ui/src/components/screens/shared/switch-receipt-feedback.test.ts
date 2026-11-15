@@ -10,13 +10,12 @@ describe('server switch receipt feedback', () => {
     [{ status: 'applied' }, 'success', 'home.switchedToast'],
     [{ status: 'pending' }, 'info', 'home.switchPending'],
     [{ status: 'restarting' }, 'info', 'home.switchRestarting'],
-    [{ status: 'notRunning' }, 'info', 'home.switchSavedForNextStart'],
     [{ status: 'deferred', reason: 'nodeRequiresApply' }, 'warning', 'home.switchRequiresApply'],
   ] as const)('%s reports only its confirmed state', (receipt, tone, text) => {
     expect(switchReceiptFeedback(receipt as ServerSwitchReceipt, 'HK', t)).toEqual({ tone, text });
   });
 
-  it('superseded selection never emits a stale success', () => {
-    expect(switchReceiptFeedback({ status: 'superseded' }, 'HK', t)).toBeNull();
+  it.each(['notRunning', 'superseded'] as const)('%s selection needs no toast', status => {
+    expect(switchReceiptFeedback({ status }, 'HK', t)).toBeNull();
   });
 });
