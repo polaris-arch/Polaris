@@ -503,6 +503,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
       await page.waitForFunction(()=>{const n=(window as any).__networkTest;return n.raw.length===2&&n.speeds.length===1;});
       await page.evaluate(()=>{const n=(window as any).__networkTest;n.release('speed');n.release('unlock');});
       expect(await button.isDisabled()).toBe(true);
+      if(surface==='desktop') {
+        await page.locator('#node-trigger').click();
+        expect(await page.locator('#node-menu').getByRole('button',{name:'全部测速',exact:true}).isDisabled()).toBe(true);
+        await page.locator('#node-trigger').click();
+      }
       await button.evaluate(el=>(el as HTMLButtonElement).click());
       expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.raw.length,n.speeds.length,n.cancels.length];})).toEqual([2,1,0]);
       await page.evaluate(()=>(window as any).__networkTest.release('ip'));

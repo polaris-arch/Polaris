@@ -1202,6 +1202,7 @@ export function HomeScreen() {
                     onPickDirect={onPickDirectExit}
                     onPickBlock={onPickBlockExit}
                     blockDisabledReason={blockDisabledReason}
+                    testBusy={testing || networkChecking}
                     onTestAll={onTestAllInMenu}
                     onManage={() => {
                       setNodeMenuOpen(false);

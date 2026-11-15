@@ -67,6 +67,7 @@ export interface NodeMenuProps {
   onPickBlock: () => void;
   /** 非 null = 「阻断」项禁用并以此为 tooltip 原因（直连模式下阻断不生效）。 */
   blockDisabledReason: string | null;
+  testBusy?: boolean;
   onTestAll: (ids: string[]) => void;
   onManage: () => void;
 }
@@ -91,6 +92,7 @@ function OpenNodeMenu({
   onPickDirect,
   onPickBlock,
   blockDisabledReason,
+  testBusy,
   onTestAll,
   onManage,
 }: NodeMenuProps) {
@@ -331,6 +333,8 @@ function OpenNodeMenu({
         <button
           type="button"
           className="btn sm"
+          disabled={testBusy}
+          aria-busy={testBusy}
           onClick={() => onTestAll(filteredGroups.flatMap((g) => g.servers.map((s) => s.id)))}
         >
           <span>{t('nodes.testAll')}</span>

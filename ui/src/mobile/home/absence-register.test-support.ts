@@ -97,7 +97,7 @@ export const HOME_PARITY: ScreenParityRegister = {
       note: '出口节点选择器。移动端是整张节点卡按下去开一张 sheet（`.h-sheet`），复用桌面同一条 tip 键。',
     },
     {
-      id: 'HomeScreen.tsx|k:home.networkCheckTip+home.unlockCooldown',
+      id: 'HomeScreen.tsx|#network-check-radar',
       disposition: {
         kind: 'ported',
         mobile: { file: 'ui/src/mobile/home/HomeScreenView.tsx', mustContain: 'data-write-control="network-check"' },

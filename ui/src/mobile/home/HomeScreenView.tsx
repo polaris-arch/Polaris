@@ -871,7 +871,7 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                 onClick={props.onNetworkCheck}
                 disabled={props.networkCheckBusy}
                 aria-busy={props.networkCheckBusy}
-                title={props.networkCheckTip}
+                data-tip={props.networkCheckTip}
               >
                 {/* 陈旧结果保留圆点，但时间戳必须**如实变老**，不许悄悄重渲染成刚测过。 */}
                 {props.networkCheckBusy
