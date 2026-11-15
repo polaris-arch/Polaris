@@ -975,9 +975,8 @@ pub(crate) fn notify_menu_response_failure<T>(
 /// produce a localized system notification. A superseded request is owned by its successor.
 pub(crate) fn native_exit_selection_notice(status: &str) -> Option<&'static str> {
     match status {
-        "applied" | "superseded" => None,
+        "applied" | "superseded" | "notRunning" => None,
         "pending" => Some(crate::i18n::key::TRAY_SWITCH_PENDING),
-        "notRunning" => Some(crate::i18n::key::TRAY_SWITCH_SAVED_FOR_NEXT_START),
         "deferred" => Some(crate::i18n::key::TRAY_SWITCH_REQUIRES_APPLY),
         _ => Some(crate::i18n::key::NATIVE_UNKNOWN_ERROR),
     }

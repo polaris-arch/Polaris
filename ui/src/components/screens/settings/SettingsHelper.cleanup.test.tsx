@@ -101,6 +101,7 @@ it.each([
   ['none', absent],
   ['needs-repair', { ...absent, needsRepair: true }],
   ['needs-upgrade', { ...absent, upgradeable: true }],
+  ['needs-core', { ...installed, ready: false, selectedCore: { state: 'absent' } }],
   ['installed', installed],
   ['needs-btm', { ...installed, backgroundDisabled: true }],
 ] as const)('failed install in %s exposes exactly one status-only recovery action', async (expectedState, resultStatus) => {
@@ -120,6 +121,21 @@ it.each([
   expect(helperApi.install).toHaveBeenCalledTimes(1);
   expect(helperApi.uninstall).not.toHaveBeenCalled();
   expect(h.state[3]).toBe('installerFailed');
+});
+it('missing core offers core installation without claiming the helper needs an upgrade', async () => {
+  await mounted();
+  const missingCore = { ...installed, ready: false, selectedCore: { state: 'absent' } };
+  vi.mocked(helperApi.getStatus).mockResolvedValue(missingCore as never);
+  h.refresh!();
+  await vi.waitFor(() => expect(h.state[1]).toBe('needs-core'));
+  expect(text(render())).toContain('helper.coreInstallDesc');
+  expect(text(render())).not.toContain('helper.statusUpgradeable');
+  expect(text(render())).not.toContain('helper.upgradeHelperAction');
+  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, errorCode: 'cancelled', status: missingCore } as never);
+  click('helper.installSelectedCoreAction');
+  await vi.waitFor(() => expect(h.state[3]).toBe('cancelled'));
+  expect(h.state[1]).toBe('needs-core');
+  expect(helperApi.install).toHaveBeenCalledExactlyOnceWith();
 });
 it('failed status recovery retains the install cause and never retries installation', async () => {
   await mounted(absent);

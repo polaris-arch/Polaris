@@ -940,6 +940,49 @@ async fn helper_gate_proceed_without_successful_install_still_blocks() {
     );
 }
 
+#[tokio::test]
+async fn missing_core_requires_install_and_readback_even_with_an_installed_helper() {
+    use crate::runtime::helper::{SelectedCoreSnapshot, SelectedCoreState};
+    for upgradeable in [false, true] {
+        for decision in [HelperGateDecision::Abort, HelperGateDecision::Proceed] {
+            let dir = fresh_test_dir();
+            let mut status = installed_helper_status(upgradeable);
+            status.ready = false;
+            status.selected_core = Some(SelectedCoreSnapshot {
+                id: "a".repeat(64),
+                version: "1.15.0".into(),
+                provider_fingerprint: "b".repeat(64),
+                state: SelectedCoreState::Absent,
+                admission: None,
+            });
+            let rt = test_runtime_in_on(
+                dir.clone(),
+                HelperRuntime::with_forced_status_for_tests(dir.clone(), status),
+            );
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let upgrades = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+                helper_gate_calls: Arc::clone(&calls),
+                helper_gate_decision: decision,
+                helper_upgrade_prompts: Arc::clone(&upgrades),
+                ..Default::default()
+            }));
+            let error = rt.run_helper_gate(ProxyModeType::Tun).await.unwrap_err();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(upgrades.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                error.code,
+                Some(if decision == HelperGateDecision::Abort {
+                    code::HELPER_GATE_ABORTED
+                } else {
+                    code::HELPER_NOT_INSTALLED
+                })
+            );
+            assert!(!rt.status().running);
+        }
+    }
+}
+
 /// **非 TUN 不弹门**：systemProxy 起核绝不因 helper 未装而弹框（弹了就是每次连接都骚扰）。
 /// 变异有牙：删 `run_helper_gate` 首行的 `should_start_via_helper` 短路 → calls 变 1，红
 /// （该短路此前写作 `!self.tun_helper_missing(mode)`，「已装但可升级」腿引入后改成直接判平台/模式 +

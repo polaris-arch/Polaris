@@ -1064,7 +1064,7 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             let _ = w.set_focus();
         }
 
-        // 文案分流：已装但不可用 = 修复（多为 proto 升级 / 描述符失效），未装 = 安装。
+        // 分开说明安装 Core、升级助手、修复和首次安装，授权范围与实际动作一致。
         // **不提供「本次用系统授权启动」**：Polaris 尚无 osascript/UAC/setcap 回退腿，给这个按钮 = 撒谎。
         //
         // 语言从 `config.language` 来（[`crate::i18n::app_lang`]）而**不是**由前端传下来：本门的
@@ -1072,28 +1072,34 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
         // 与托盘原生菜单的 `tray_toggle` —— 两条都没有前端在场，前端手上那份 i18next 递不进来。
         use crate::i18n::{key, t};
         let lang = crate::i18n::app_lang(&self.app);
-        let (message, detail, confirm) = if status.installed {
-            (
-                key::NATIVE_HELPER_REPAIR_TITLE,
-                key::NATIVE_HELPER_REPAIR_BODY,
-                key::NATIVE_HELPER_REPAIR_CONFIRM,
-            )
-        } else {
-            (
-                key::NATIVE_HELPER_INSTALL_TITLE,
-                key::NATIVE_HELPER_INSTALL_BODY,
-                key::NATIVE_HELPER_INSTALL_CONFIRM,
-            )
-        };
-
-        log::info!(
-            "TUN 提权引导：已弹出{}确认框，等待用户确认（期间界面停在「启动中」）",
-            if status.installed {
-                "修复 helper"
+        let (message, detail, confirm) =
+            if status.installed && !status.upgradeable && status.selected_core_missing() {
+                (
+                    key::NATIVE_CORE_INSTALL_TITLE,
+                    key::NATIVE_CORE_INSTALL_BODY,
+                    key::NATIVE_CORE_INSTALL_CONFIRM,
+                )
+            } else if status.installed && status.upgradeable {
+                (
+                    key::NATIVE_HELPER_UPGRADE_TITLE,
+                    key::NATIVE_HELPER_UPGRADE_BODY,
+                    key::NATIVE_HELPER_UPGRADE_CONFIRM,
+                )
+            } else if status.installed {
+                (
+                    key::NATIVE_HELPER_REPAIR_TITLE,
+                    key::NATIVE_HELPER_REPAIR_BODY,
+                    key::NATIVE_HELPER_REPAIR_CONFIRM,
+                )
             } else {
-                "安装 helper"
-            }
-        );
+                (
+                    key::NATIVE_HELPER_INSTALL_TITLE,
+                    key::NATIVE_HELPER_INSTALL_BODY,
+                    key::NATIVE_HELPER_INSTALL_CONFIRM,
+                )
+            };
+
+        log::info!("TUN 提权引导：已弹出 {message} 确认框，等待用户确认");
         let confirmed = self
             .app
             .dialog()

@@ -364,7 +364,6 @@ pub mod key {
     /// 直连模式下无效。
     pub const TRAY_NO_EFFECT_IN_DIRECT: &str = "tray.noEffectInDirect";
     pub const TRAY_SWITCH_PENDING: &str = "tray.switchPending";
-    pub const TRAY_SWITCH_SAVED_FOR_NEXT_START: &str = "tray.switchSavedForNextStart";
     pub const TRAY_SWITCH_REQUIRES_APPLY: &str = "tray.switchRequiresApply";
     /// 接管方式子菜单标题。
     pub const TRAY_GROUP_TAKEOVER: &str = "tray.groupTakeover";
@@ -454,6 +453,10 @@ pub mod key {
     pub const NATIVE_HELPER_INSTALL_BODY: &str = "native.helperInstallBody";
     /// 未装 helper：确认按钮。
     pub const NATIVE_HELPER_INSTALL_CONFIRM: &str = "native.helperInstallConfirm";
+    /// 兼容助手已在位，仅安装当前选定内核。
+    pub const NATIVE_CORE_INSTALL_TITLE: &str = "native.coreInstallTitle";
+    pub const NATIVE_CORE_INSTALL_BODY: &str = "native.coreInstallBody";
+    pub const NATIVE_CORE_INSTALL_CONFIRM: &str = "native.coreInstallConfirm";
     /// 已装但不可用：标题。
     pub const NATIVE_HELPER_REPAIR_TITLE: &str = "native.helperRepairTitle";
     /// 已装但不可用：正文。

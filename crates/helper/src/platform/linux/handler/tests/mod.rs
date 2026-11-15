@@ -1492,16 +1492,16 @@ fn resolved_dns_failure_keeps_structured_error_detail() {
 
 #[test]
 fn wire_forms_match_go_source() {
-    // v3 requires the pinned execution discriminator; build remains diagnostic.
-    assert_eq!(PROTO_VERSION, 4);
+    // The reusable-helper generation retains the existing wire frame shape.
+    assert_eq!(PROTO_VERSION, 5);
     assert_eq!(
         Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(0))).to_wire_line(),
         format!(
-            "OK pong uid=0 v4 build={}",
+            "OK pong uid=0 v5 build={}",
             polaris_helper_proto::build_identity::current()
         )
     );
-    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 4");
+    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 5");
     assert_eq!("OK stopped", "OK stopped");
     assert_eq!("OK running 12345", "OK running 12345");
     assert_eq!("OK notrunning", "OK notrunning");

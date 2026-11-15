@@ -278,15 +278,15 @@ export interface HelperStatus {
   supported: boolean;
   /** helper 二进制 + LaunchDaemon plist 是否在位 */
   installed: boolean;
-  /** socket ping 成功且协议版本 ≥ 最低可用（可零提权驱动 TUN） */
+  /** 助手握手可用且当前选定内核已通过受保护存储校验 */
   ready: boolean;
-  /** 可用但有新版 helper（v5 install-core）：proto ≥ 最低可用但 < 期望 → 温和提示可升级（非故障，不强制重装） */
+  /** 助手兼容版本低于当前要求；选定内核缺失不代表助手需要升级 */
   upgradeable: boolean;
   /** 协议版本（ping/version 返回），未就绪为 null */
   version: number | null;
   /** 当前 app 期望的 shared protocol 版本；由后端单一真值下发 */
   expectedProtocolVersion: number;
-  /** 已安装 helper 自报的构建身份；旧 helper 不带该字段，并会被判为可升级 */
+  /** 已安装 helper 自报的构建身份；缺省或差异只用于诊断 */
   helperBuildId?: string | null;
   /** 当前 app 随包 helper 的期望构建身份，用于 app/helper 同包对账 */
   expectedBuildId: string;

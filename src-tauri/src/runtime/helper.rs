@@ -125,9 +125,9 @@ pub struct HelperStatusSnapshot {
     pub supported: bool,
     /// helper 二进制 + 描述符（plist/unit/SCM）是否在位。
     pub installed: bool,
-    /// socket ping 成功且 proto ≥ 最低可用（可零提权驱动 TUN）。
+    /// 助手握手可用，且当前选定 CoreID 已通过受保护存储校验。
     pub ready: bool,
-    /// 协议需升级，或当前选定 CoreID 尚未安装。构建身份差异只供诊断。
+    /// 助手兼容版本需要升级；Core 缺失与构建身份差异不改变此字段。
     pub upgradeable: bool,
     /// 协议版本（ping/version 返回），未就绪为缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +151,14 @@ pub struct HelperStatusSnapshot {
     /// plist 烧录的 sing-box 路径（诊断展示）——真机门 → 恒 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_singbox_path: Option<String>,
+}
+
+impl HelperStatusSnapshot {
+    pub(crate) fn selected_core_missing(&self) -> bool {
+        self.selected_core
+            .as_ref()
+            .is_some_and(|core| core.state == SelectedCoreState::Absent)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -183,7 +191,6 @@ fn project_selected_core_status(
         Ok(CoreStatus::Present { .. }) => (SelectedCoreState::Present, None),
         Ok(CoreStatus::Absent { .. }) => {
             status.ready = false;
-            status.upgradeable = true;
             (SelectedCoreState::Absent, None)
         }
         Ok(CoreStatus::Invalid { reason, .. }) => {

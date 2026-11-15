@@ -1912,22 +1912,8 @@ impl Ops for Installer {
             _ => Err(error("invalid helper policy output")),
         }
     }
-    fn retained_capability(&mut self, old: Option<State>) -> io::Result<()> {
-        if old == Some(State::Running) {
-            self.fixed_probe("admin-probe")?;
-        } else {
-            let c = Chain::open(Path::new(SUPPORT), None)?;
-            let f = child(
-                c.last(),
-                OsStr::new("polaris-helper.exe"),
-                false,
-                false,
-                null_mut(),
-            )?;
-            if hash(&f)? != self.request.helper_sha256 {
-                return Err(error("stopped retained helper capability unavailable"));
-            }
-        }
+    fn retained_capability(&mut self) -> io::Result<()> {
+        self.fixed_probe("admin-probe")?;
         Ok(())
     }
     fn same_registration(&mut self) -> io::Result<bool> {
@@ -1950,15 +1936,29 @@ impl Ops for Installer {
         );
         Ok(read_bounded(&f, 65536)? == expected.as_bytes())
     }
-    fn retain_probe(&mut self) -> io::Result<bool> {
-        let (_, code) = self.utility(&[
-            OsStr::new("retain-probe"),
-            OsStr::new("--support"),
-            OsStr::new(SUPPORT),
-            OsStr::new("--id"),
-            OsStr::new(&self.request.core_id),
-        ])?;
-        Ok(code == 0)
+    fn retain_probe(&mut self, wait_until_ready: bool) -> io::Result<bool> {
+        // SCM Running precedes the pipe listener. Match the existing service
+        // startup budget, but never retry an unknown native utility outcome.
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, code) = self.utility(&[
+                OsStr::new("retain-probe"),
+                OsStr::new("--support"),
+                OsStr::new(SUPPORT),
+                OsStr::new("--id"),
+                OsStr::new(&self.request.core_id),
+            ])?;
+            if code == 0 {
+                return Ok(true);
+            }
+            if !wait_until_ready
+                || Instant::now() >= until
+                || status(self.svc()?)? != SERVICE_RUNNING
+            {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     fn snapshot(&mut self, replace: bool) -> io::Result<()> {
         self.files.snapshot(replace)

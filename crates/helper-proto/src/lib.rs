@@ -307,9 +307,9 @@ pub mod core_payload {
     }
 }
 
-/// 协议版本（**三平台统一**，单一常量）。
+/// 助手兼容版本（**三平台统一**，覆盖 wire 契约和必须升级的行为修复）。
 pub mod proto_version {
-    /// 当前 wire 协议版本，mac/win/linux 共用。
+    /// 当前兼容版本，mac/win/linux 共用；不随 App/Core 版本或构建身份递增。
     ///
     /// 唯一定义点：helper 侧的 `ping`/`version` 响应与 client 侧的握手期望都读它 → 结构上不可能分叉。
     /// v2 uses immutable content ids and rejects all runtime installation and
@@ -319,7 +319,11 @@ pub mod proto_version {
     pub const MIN_TRUSTED_EXECUTION: u32 = 3;
     /// v4 adds the optional explicit runtime-directory data to pinned Linux Start.
     pub const MIN_EXPLICIT_RUNTIME_DIRECTORY: u32 = 4;
-    pub const CURRENT: u32 = MIN_EXPLICIT_RUNTIME_DIRECTORY;
+    /// v5 establishes the reusable-helper baseline, including held DOS-path
+    /// resource loading on Windows. Older v4 builds did not all contain that fix.
+    /// Future mandatory helper behavior/security changes must advance this value;
+    /// new App builds or Core payloads alone must not.
+    pub const CURRENT: u32 = 5;
 }
 
 /// 当前安装包内 app/helper 的共同构建身份。

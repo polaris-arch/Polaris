@@ -851,8 +851,8 @@ impl ProxyRuntime {
     }
 
     /// TUN 经 helper 起核的前置校验（R27.3）：当前模式需要提权 helper（TUN@mac/win/linux）**且** helper
-    /// 尚未安装 → `true`（阻断起核，回结构化 [`code::HELPER_NOT_INSTALLED`]）。systemProxy/manual 或
-    /// helper 已装 → `false`（放行走正常起核）。
+    /// 或选定内核尚未就绪 → `true`（阻断起核，回结构化 [`code::HELPER_NOT_INSTALLED`]）。
+    /// 直起模式不受此门影响。
     ///
     /// **为什么必须前置**（根因）：未装 helper 时直起 `spawn_core_via_helper` → `helper.start_core` →
     /// `UnixConnector::connect` 拿到 `ENOENT`，用户只看到裸 `connect .../helper.sock: No such file
@@ -869,7 +869,7 @@ impl ProxyRuntime {
     /// 「点连接按钮」一条腿，托盘切模式 / 启动自动连接 / switchMode 去抖重启全绕过它（§K7「门开在别处
     /// 却当全域门」）。别再据本注释以为命令层还有一道门：门只有 `start_inner` 汇流点那一道。
     pub(super) fn tun_helper_missing(&self, mode: ProxyModeType) -> bool {
-        self.helper_execution_for_start(mode) && !self.helper.status().installed
+        self.helper_execution_for_start(mode) && !self.helper.status().ready
     }
 
     /// **TUN 提权引导门**（起核汇流点；移植 上游 `ProxyManager.maybePromptHelperGate`，:1475-1497）。
@@ -879,8 +879,9 @@ impl ProxyRuntime {
     /// | 情形 | 结果 |
     /// |---|---|
     /// | 非 TUN / 平台无 helper 实现 | `Ok(())` 放行（零弹框、零系统调用） |
-    /// | 已装且是随包那一版 | `Ok(())` 放行（一次 `status()`，零弹框） |
-    /// | **已装但可升级** | 温和提示腿（[`maybe_prompt_helper_upgrade`](Self::maybe_prompt_helper_upgrade)），**恒 `Ok(())`** |
+    /// | 助手兼容且选定内核已安装 | `Ok(())` 放行（一次 `status()`，零弹框） |
+    /// | **已装但可升级，选定内核不缺失** | 温和提示腿（[`maybe_prompt_helper_upgrade`](Self::maybe_prompt_helper_upgrade)），**恒 `Ok(())`** |
+    /// | 助手已装，但选定内核缺失 | 授权安装内核，取消或安装未就绪时阻断 |
     /// | 需要门但被非交互抑制（崩溃自愈） | `Err` + [`code::HELPER_NOT_INSTALLED`] |
     /// | 需要门但 emitter 未接线（单测 / setup 前） | `Err` + [`code::HELPER_NOT_INSTALLED`] |
     /// | 用户取消 | `Err` + [`code::HELPER_GATE_ABORTED`] |
@@ -917,16 +918,16 @@ impl ProxyRuntime {
         // 下面两条腿共用：分两次取不仅多付一次调用，还会让两条腿看到不一致的世界
         // （例如「判未装 → 弹安装框」与「判已装 → 弹升级框」同时成立）。
         let status = self.helper.status();
-        // ── 腿 2：**已装** → 起核本身没有障碍，唯一可能要做的是「可升级」的温和提示。
+        // 已装助手不能代签新 Core 已就位。缺失 Core 必须走下面的授权安装与复检。
         //
         // 本腿的返回类型是 `()`，结构上产不出 `Err` —— 那正是「永不阻断」这条决策的落点：
         // 把一次本来能成功的 TUN 起核变成失败，比「继续用旧 helper 起核」这个原缺陷严重得多。
-        if status.installed {
+        if status.installed && !status.selected_core_missing() {
             self.maybe_prompt_helper_upgrade(mode, &status).await;
             return Ok(());
         }
 
-        // ── 腿 1：**未装** → 阻断式引导门（判定 → 弹框 → 就地授权安装 → 复检）。
+        // 助手未装或选定 Core 缺失：阻断式引导门（确认 → 授权安装 → 复检）。
         // 非交互（崩溃自愈）→ 退回本门引入前的行为：类型化终态，不打扰用户。
         // 读 task-local：只有**当前调用链**被 `with_helper_gate_suppressed` 包住才为真；并发的用户手动
         // 起核跑在另一个任务里，读不到本标记 ⇒ 照常弹引导（A2 修的正是这条）。

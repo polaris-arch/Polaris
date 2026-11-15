@@ -193,9 +193,9 @@ pub trait Ops {
     fn prepare(&mut self) -> io::Result<()>;
     fn install_core(&mut self) -> io::Result<()>;
     fn selection(&mut self) -> io::Result<Selection>;
-    fn retained_capability(&mut self, old: Option<State>) -> io::Result<()>;
+    fn retained_capability(&mut self) -> io::Result<()>;
     fn same_registration(&mut self) -> io::Result<bool>;
-    fn retain_probe(&mut self) -> io::Result<bool>;
+    fn retain_probe(&mut self, wait_until_ready: bool) -> io::Result<bool>;
     fn snapshot(&mut self, replace: bool) -> io::Result<()>;
     /// false is a definite busy/deferred reply; Err may have reserved admission.
     fn admit(&mut self) -> io::Result<bool>;
@@ -262,8 +262,10 @@ pub fn run(ops: &mut impl Ops) -> i32 {
         stage = 84;
         let retain = ops.selection()? == Selection::Retain;
         if retain {
-            ops.retained_capability(old)?;
-            if old == Some(State::Running) && ops.same_registration()? && ops.retain_probe()? {
+            if old == Some(State::Running) {
+                ops.retained_capability()?;
+            }
+            if old == Some(State::Running) && ops.same_registration()? && ops.retain_probe(false)? {
                 return Ok(()); // Still runs production finish below.
             }
         }
@@ -297,6 +299,17 @@ pub fn run(ops: &mut impl Ops) -> i32 {
         }
         ops.revalidate()?;
         ops.start()?;
+        if retain {
+            // A stopped compatible helper may differ from this App's bundle.
+            // Its protected receipt admitted the bytes; only the live daemon
+            // can attest readiness for the newly installed selected CoreID.
+            stage = 84;
+            if !ops.retain_probe(true)? {
+                return Err(io::Error::other(
+                    "retained helper selected core unavailable",
+                ));
+            }
+        }
         tx.admitted = false;
         Ok(())
     })();

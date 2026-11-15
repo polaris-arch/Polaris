@@ -164,14 +164,14 @@ impl Ops for Fake {
             Selection::Replace
         })
     }
-    fn retained_capability(&mut self, _: Option<State>) -> io::Result<()> {
+    fn retained_capability(&mut self) -> io::Result<()> {
         self.step("capability")
     }
     fn same_registration(&mut self) -> io::Result<bool> {
         self.step("same-registration")?;
         Ok(self.same_user_registration)
     }
-    fn retain_probe(&mut self) -> io::Result<bool> {
+    fn retain_probe(&mut self, _: bool) -> io::Result<bool> {
         self.step("retain-probe")?;
         Ok(self.ready)
     }
@@ -694,5 +694,31 @@ fn core_only_retention_requires_same_registration_and_live_selected_id_ready() {
             std::fs::read_to_string(f.p("registration")).unwrap(),
             "original registration"
         );
+    }
+}
+
+#[test]
+fn stopped_retained_helper_is_started_and_its_core_readiness_is_required() {
+    for ready in [false, true] {
+        let mut f = Fake::new(false);
+        f.retained = true;
+        f.fail_activation = false;
+        f.ready = ready;
+        assert_eq!(run(&mut f), if ready { 0 } else { 84 });
+        assert_eq!(
+            f.state,
+            if ready {
+                State::Running
+            } else {
+                State::Stopped
+            }
+        );
+        assert!(!f.trace.contains(&"replace"));
+        assert!(!f.trace.contains(&"capability"));
+        let start = f.trace.iter().position(|op| *op == "activation").unwrap();
+        let proof = f.trace.iter().position(|op| *op == "retain-probe").unwrap();
+        assert!(proof > start);
+        assert_eq!(f.trace.contains(&"restore-registration"), !ready);
+        assert!(!f.keep && !f.tx_present());
     }
 }

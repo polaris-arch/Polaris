@@ -1587,6 +1587,27 @@ fn linux_legacy_routing_is_not_receipt_authority_or_a_service_start() {
 }
 
 #[test]
+fn missing_selected_core_does_not_upgrade_a_compatible_helper() {
+    use polaris_helper_proto::{core_manifest::CoreId, core_protocol::CoreStatus};
+    let id = CoreId::parse(&"a".repeat(64)).unwrap();
+    for upgradeable in [false, true] {
+        let mut status = HelperStatusSnapshot {
+            installed: true,
+            ready: true,
+            upgradeable,
+            ..Default::default()
+        };
+        assert_eq!(
+            project_selected_core_status(&mut status, Ok(CoreStatus::Absent { id: id.clone() })),
+            (SelectedCoreState::Absent, None)
+        );
+        assert!(!status.ready);
+        assert!(!status.needs_repair);
+        assert_eq!(status.upgradeable, upgradeable);
+    }
+}
+
+#[test]
 fn typed_execution_unavailability_never_becomes_helper_damage_or_fake_repair() {
     use polaris_core_supervisor::admitted_payload::AdmissionErrorKind as K;
     use polaris_helper_proto::core_protocol::CoreStatus;

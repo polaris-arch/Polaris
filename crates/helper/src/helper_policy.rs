@@ -20,6 +20,26 @@ pub fn may_replace(
         .map_err(|_| io::Error::other("invalid candidate helper version"))?;
     Ok(old <= new && protocol <= candidate_protocol)
 }
+
+fn replacement_policy(
+    version: &str,
+    protocol: u32,
+    candidate: &str,
+    candidate_protocol: u32,
+) -> io::Result<&'static str> {
+    let replace_allowed = may_replace(version, protocol, candidate, candidate_protocol)?;
+    if protocol >= candidate_protocol {
+        // The compatibility generation owns required helper changes. App/Core
+        // releases and diagnostic build identities do not replace a usable helper.
+        Ok("retain")
+    } else if replace_allowed {
+        Ok("replace")
+    } else {
+        Err(io::Error::other(
+            "newer helper is incompatible; downgrade refused",
+        ))
+    }
+}
 fn hash(path: &Path) -> io::Result<String> {
     use sha2::Digest;
     let parent = path
@@ -83,29 +103,12 @@ pub fn policy(binary: &Path, metadata: &Path) -> io::Result<&'static str> {
     if record.sha256 != actual {
         return Err(io::Error::other("installed helper receipt differs"));
     }
-    if record.version == env!("CARGO_PKG_VERSION")
-        && record.protocol == polaris_helper_proto::proto_version::CURRENT
-        && actual == hash(&std::env::current_exe()?)?
-    {
-        // Adding another immutable core does not require replacing identical
-        // helper bytes or interrupting its active owner. Build identity is not
-        // a version/upgrade criterion.
-        return Ok("retain");
-    }
-    if may_replace(
+    replacement_policy(
         &record.version,
         record.protocol,
         env!("CARGO_PKG_VERSION"),
         polaris_helper_proto::proto_version::CURRENT,
-    )? {
-        Ok("replace")
-    } else if record.protocol >= polaris_helper_proto::proto_version::CURRENT {
-        Ok("retain")
-    } else {
-        Err(io::Error::other(
-            "newer helper is incompatible; downgrade refused",
-        ))
-    }
+    )
 }
 /// Returns the receipt JSON. Windows only returns it: the installer pins this parent
 /// with read-only sharing while this utility runs, so it publishes the receipt itself

@@ -39,6 +39,7 @@ type HelperState =
   | 'cleanup-pending'
   | 'installing'
   | 'needs-upgrade'
+  | 'needs-core'
   | 'needs-btm'
   | 'needs-repair'
   | 'admission-unavailable';
@@ -57,6 +58,7 @@ function deriveState(s: HelperStatus | null, cleanupPending = false): HelperStat
   // backgroundDisabled（macOS BTM 登录项被禁）比 needsRepair 更具体，需先判（contract: runtime.ts:167）。
   if (s.backgroundDisabled) return 'needs-btm';
   if (s.needsRepair) return 'needs-repair';
+  if (s.installed && s.selectedCore?.state === 'absent') return 'needs-core';
   if (s.ready) return s.installed ? 'installed' : 'needs-repair';
   if (s.installed) return 'needs-repair';
   return 'none';
@@ -466,23 +468,24 @@ export default function SettingsHelper() {
             </div>
           )}
 
-          {state === 'needs-upgrade' && (
-            <div className="helper-state" data-s="needs-upgrade">
+          {(state === 'needs-upgrade' || state === 'needs-core') && (
+            <div className="helper-state" data-s={state}>
               <div className="hc-status">
                 <Dot variant="err" style={{ background: 'hsl(var(--warn))' }} />
-                <b style={{ color: 'hsl(var(--warn))' }}>{t('helper.statusUpgradeable')}</b>
-                <Pill variant="warn" style={{ marginLeft: 'auto' }}>
-                  {t(status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent'
-                    : status?.version != null && status.version < status.expectedProtocolVersion ? 'helper.protocolUpgradeNeeded' : 'helper.statusUpgradeable')}
-                </Pill>
+                <b style={{ color: 'hsl(var(--warn))' }}>{t(state === 'needs-core' ? 'helper.coreState.absent' : 'helper.statusUpgradeable')}</b>
+                {state === 'needs-upgrade' && (
+                  <Pill variant="warn" style={{ marginLeft: 'auto' }}>
+                    {t('helper.protocolUpgradeNeeded')}
+                  </Pill>
+                )}
               </div>
-              <div className="card-sub">{t('helper.upgradeDescCard')}</div>
+              <div className="card-sub">{t(state === 'needs-core' ? 'helper.coreInstallDesc' : 'helper.upgradeDescCard')}</div>
               <div style={{ display: 'flex', gap: 9, marginTop: 14 }}>
                 <Button variant="flow" size="sm" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
                     <path d="M12 6v12M8 14l4 4 4-4" />
                   </svg>
-                  <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : status?.selectedCore?.state === 'absent' ? t('helper.installSelectedCoreAction') : t('helper.upgradeHelperAction')}</span>
+                  <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : state === 'needs-core' ? t('helper.installSelectedCoreAction') : t('helper.upgradeHelperAction')}</span>
                 </Button>
               </div>
             </div>

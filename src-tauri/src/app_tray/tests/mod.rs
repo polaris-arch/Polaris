@@ -593,7 +593,7 @@ fn sentinel_selection_keeps_cascading_node_groups_available() {
 }
 
 #[test]
-fn native_exit_selection_receipts_distinguish_applied_pending_and_saved() {
+fn native_exit_selection_receipts_keep_pending_but_silence_disconnected_selection() {
     use crate::i18n::key;
     assert_eq!(native_exit_selection_notice("applied"), None);
     assert_eq!(native_exit_selection_notice("superseded"), None);
@@ -601,10 +601,7 @@ fn native_exit_selection_receipts_distinguish_applied_pending_and_saved() {
         native_exit_selection_notice("pending"),
         Some(key::TRAY_SWITCH_PENDING)
     );
-    assert_eq!(
-        native_exit_selection_notice("notRunning"),
-        Some(key::TRAY_SWITCH_SAVED_FOR_NEXT_START)
-    );
+    assert_eq!(native_exit_selection_notice("notRunning"), None);
     assert_eq!(
         native_exit_selection_notice("deferred"),
         Some(key::TRAY_SWITCH_REQUIRES_APPLY)
