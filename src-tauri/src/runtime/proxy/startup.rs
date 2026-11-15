@@ -1636,16 +1636,15 @@ impl ProxyRuntime {
 
             // 起核前的内核闸门：生成 → 写盘 → check → 剥掉内核点名拒收的节点 → 重来，直到内核收下。
             // 首次/结构变更仍真跑 check；同一核 + 同一最终生成配置命中已接受身份时为 0 次。
-            let gate = match self
-                .generate_and_gate_with_runtime_bindings(
-                    &user_config,
-                    &deps,
-                    &config_path,
-                    binary_res.as_deref().ok(),
-                    &mut kernel_peeled,
-                    &runtime_binding_plan.bindings,
-                )
-                .await
+            let gate = match Box::pin(self.generate_and_gate_with_runtime_bindings(
+                &user_config,
+                &deps,
+                &config_path,
+                binary_res.as_deref().ok(),
+                &mut kernel_peeled,
+                &runtime_binding_plan.bindings,
+            ))
+            .await
             {
                 Ok(g) => g,
                 // 🔴 生成失败也要先把「闸门此前剥掉了谁」推给渲染端，再走终态。

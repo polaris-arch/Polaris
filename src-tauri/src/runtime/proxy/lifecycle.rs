@@ -1103,7 +1103,7 @@ impl ProxyRuntime {
         }
         self.gate.begin();
         let t_start_inner = std::time::Instant::now();
-        let r = self.start_inner(config, my_gen, &_tailscale_gate).await;
+        let r = Box::pin(self.start_inner(config, my_gen, &_tailscale_gate)).await;
         let start_inner_ms = t_start_inner.elapsed().as_millis();
         let t_terminal_settle = std::time::Instant::now();
         // end 恒执行（成功/失败/让位三路），否则 depth 永不归零 → 后续 apply 全被误判 deferred。

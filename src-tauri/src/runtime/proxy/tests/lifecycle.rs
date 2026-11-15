@@ -215,7 +215,7 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
     );
     let started = method_body(&src, "    async fn start_guarded_with_attribution(");
     let inner_return = started
-        .find("let r = self.start_inner(config, my_gen, &_tailscale_gate).await;")
+        .find("let r = Box::pin(self.start_inner(config, my_gen, &_tailscale_gate)).await;")
         .expect("start 包装必须等待 start_inner 完整事务");
     let drop_inflight = started
         .find("drop(inflight);")
@@ -2094,7 +2094,7 @@ fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
         .find("self.gate.generation()!=requested_generation")
         .unwrap();
     let inner = compact
-        .find("self.start_inner(config,my_gen,&_tailscale_gate).await")
+        .find("Box::pin(self.start_inner(config,my_gen,&_tailscale_gate)).await")
         .unwrap();
     assert!(
         gate < early_fence && early_fence < sweep && sweep < inner,

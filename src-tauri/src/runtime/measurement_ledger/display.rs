@@ -246,7 +246,6 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     let network = proxy.network_epoch();
     let ledger = global();
     let foreground = ledger.foreground_epoch();
-    let ledger_version = ledger.version();
     let view = LedgerView::new(
         &config,
         generation,
@@ -264,6 +263,8 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     let emission_digest =
         generation.and_then(|generation| proxy.ready_main_emission_digest(generation));
     let connections = crate::runtime::node_fingerprints::measurement_connections_json(&config);
+    // Rows are copied under one ledger lock. Later results belong to the next
+    // refresh; they do not invalidate this snapshot's unchanged runtime context.
     let mut rows = ledger.display_rows(
         &view.read(&cap, ledger, now),
         emission_digest.as_deref(),
@@ -298,8 +299,7 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
         && network == proxy.network_epoch()
         && foreground == ledger.foreground_epoch()
         && emission_digest
-            == generation.and_then(|generation| proxy.ready_main_emission_digest(generation))
-        && ledger_version == ledger.version();
+            == generation.and_then(|generation| proxy.ready_main_emission_digest(generation));
     ApiResponse::ok(json!({
         "schema": "polaris-measurement-display-v1", "process": process_identity(),
         "revision": REVISION.fetch_add(1, Ordering::AcqRel).to_string(),
