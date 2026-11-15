@@ -3,9 +3,7 @@
 //! 读 fixtures/log.json（TS 导出的 180 cases），逐条用 Rust build_log_config 生成，
 //! 与当前 producer output 逐字节 diff（serde_json 规范化后字符串比较）。SC02保留disabled TUN的host output元数据，原180业务组合全部保留。
 //!
-//! fixture 来源：scripts/export-log-fixtures.mts（内联 Polaris singbox-log-builder.ts 逻辑）。
-//! 这是 B1 对拍脚手架的首条通路；后续 builder（dns/route/outbounds/inbounds/custom-rules）
-//! 各加自己的 fixture 导出器 + 对拍 test 模块。
+//! fixture 保留迁移期 singbox-log-builder.ts 的固定输出，当前回归直接读取已提交 JSON。
 
 use polaris_config_engine::builder::{build_log_config, LogBuildDeps, LogConfigInput, Platform};
 use polaris_config_engine::user_config::{LogLevel, ProxyModeType};
@@ -56,7 +54,7 @@ fn log_builder_matches_polaris_golden() {
             privacy_mode: case.privacy_mode,
             // proto Platform::parse 兼容 "darwin"/"win32"/"linux"；未知 → Other（log builder 视同 Linux）。
             platform: Platform::parse(&case.platform),
-            // 与 export-log-fixtures.mts FAKE_LOG_PATH 一致。
+            // 与固定 fixture 的 output 路径一致。
             log_file_path: Some("/fake/singbox.log"),
         };
 
@@ -77,10 +75,7 @@ fn log_builder_matches_polaris_golden() {
         checked, 180,
         "original full producer matrix must remain intact"
     );
-    assert!(
-        !fixture.cases.is_empty(),
-        "fixture 为空——导出器未跑或路径错"
-    );
+    assert!(!fixture.cases.is_empty(), "fixture 为空或路径错误");
     assert!(
         failures.is_empty(),
         "{}/{} cases 对拍失败:\n{}",

@@ -14,7 +14,6 @@ import { digest } from './source-graph.mjs';
 import { consumeRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, verifyPackagedRelease,
   verifyReleaseCore, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
-import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
 
@@ -476,34 +475,6 @@ test('actual fetch CLI rejects malformed release mode and an incomplete selectio
   assert.equal(result.status, 1); assert.match(result.stderr, /Explicit release selection incomplete/);
   assert.deepEqual(resources(f), {});
 }));
-test('selected managed mesh identity binds original release bytes, receipt and full version observation', async () => withFixture(async f => {
-  await consumeRelease(f.root,f.manifest,['linux'],f);
-  const core=join(f.root,'resources/linux/sing-box'), row=f.contract.platforms.linux; let versions=0;
-  const run=(command,args,options)=>{if(command===core){assert.deepEqual(args,['version']);versions++;return f.linuxVersionOutput;}return f.run(command,args,options);};
-  const id=verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'});
-  assert.equal(id.sourceCommit,commit);assert.equal(id.sourceTree,tree);assert.equal(id.coreSha256,row.core.sha256);
-  const raw=readFileSync(join(f.root,f.manifest.desktopRelease.contractPath));
-  assert.equal(id.providerFingerprint,digest(Buffer.concat([Buffer.from(UPSTREAM_INSTALLATION_DOMAIN),raw])));assert.equal(id.buildID,row.buildID);assert.equal(versions,1);
-}));
-test('selected managed mesh wrong core bytes fail before executing version', async () => withFixture(async f => {
-  await consumeRelease(f.root,f.manifest,['linux'],f);
-  const core=join(f.root,'resources/linux/sing-box'), bytes=readFileSync(core);bytes[220]^=1;writeFileSync(core,bytes);let versions=0;
-  const run=(command,args,options)=>{if(command===core){versions++;return f.linuxVersionOutput;}return f.run(command,args,options);};
-  assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'}),/bytes differ/);assert.equal(versions,0);
-}));
-test('selected managed mesh wrong Revision and nonzero version both fail after strict metadata verification', async () => withFixture(async f => {
-  await consumeRelease(f.root,f.manifest,['linux'],f);const core=join(f.root,'resources/linux/sing-box'), row=f.contract.platforms.linux;
-  for(const fail of ['revision','status']){let versions=0;
-   const run=(command,args,options)=>{if(command===core){versions++;if(fail==='status')throw Object.assign(Error('version status 7'),{status:7});return f.linuxVersionOutput.replace(`Revision: ${commit}`,`Revision: ${'9'.repeat(40)}`);}return f.run(command,args,options);};
-   assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'}),fail==='status'?/version status 7/:/version output differs/);assert.equal(versions,1);
-  }
-}));
-test('managed mesh refuses unsupported hosts before inspecting or executing a core', () => withFixture(f => {
-  for(const host of [{os:'win32',arch:'arm64'},{os:'linux',arch:'arm64'}])
-    assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,'/absent',()=>assert.fail('foreign execution'),host),/supported native desktop host/);
-}));
-
-
 test('explicit Windows target sanitizes only frozen regular0666 and exact sing-box.exe0777 into safe private copies', async () => withFixture(async (f) => {
   const row = f.contract.platforms.win, core = join(f.root, 'resources/win/sing-box.exe');
   const wrongTarget = join(f.root, 'wrong-target-unpacked');

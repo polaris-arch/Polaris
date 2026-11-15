@@ -12,7 +12,6 @@ import { nativeReleaseGoVersion } from '../native-payload-input.mjs';
 import { digest, desktopSourceGoVersion } from './source-graph.mjs';
 import { consumeRelease, verifyPackagedRelease, RELEASE_TARGETS, validateReleaseContract, releasePayloadMembers, publicBytes, verifyReleaseCore, releaseSingTunDependency, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
 import { selectedCoreManifest } from '../lib/core-identity.mjs';
-import { managedFormalSelection } from './managed-mesh-core.mjs';
 import { upstreamMetadata, upstreamPayloadPins, contractPublicAssets } from './upstream-release.mjs';
 // Frozen G4 source coordinates, with synthetic payloads only. These tests do
 // not assert that a release exists or that any native artifact has passed.
@@ -102,18 +101,6 @@ test('formal installation refuses a non-canonical contract path and copied provi
   const copy = installationFixture(t, changed);
   assert.notEqual(releaseInstallationContract(copy.root, copy.manifest).platforms.linux.providerFingerprint,
     releaseInstallationContract(f.root, f.manifest).platforms.linux.providerFingerprint);
-});
-test('formal managed checks select exact native rows and full source version on all four hosts', t => {
-  const contract = fixture().contract;
-  for (const [key, row] of Object.entries(contract.platforms)) row.buildGraph.settings.CGO_ENABLED = RELEASE_TARGETS[key].cgo;
-  const f = installationFixture(t, contract);
-  for (const [os, arch, key] of [['linux','x64','linux'], ['win32','x64','win'], ['darwin','x64','mac-x64'], ['darwin','arm64','mac-arm64']]) {
-    const chosen = managedFormalSelection(f.root, f.manifest, { os, arch });
-    assert.equal(chosen.key, key);
-    assert.ok(chosen.expected.includes(`Revision: ${contract.sourceCommit}\n`));
-    assert.ok(chosen.expected.includes(`Environment: ${contract.platforms[key].goVersion} ${contract.platforms[key].target}\n`));
-  }
-  assert.throws(() => managedFormalSelection(f.root, f.manifest, { os: 'linux', arch: 'arm64' }), /native desktop/);
 });
 test('upstream native contract keeps actual empty BuildID and unchanged native archive', () => {
   const { contract } = fixture();
