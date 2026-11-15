@@ -588,7 +588,6 @@
     "switchedToast": "{{node}} · تغییر یافت",
     "switchPending": "{{node}} · ذخیره شد؛ تغییر اتصال در حال اعمال است",
     "switchRestarting": "{{node}} · ذخیره شد؛ اتصال برای تکمیل جابه‌جایی دوباره راه‌اندازی می‌شود",
-    "switchSavedForNextStart": "{{node}} · ذخیره شد؛ هنگام اتصال بعدی اعمال می‌شود",
     "switchRequiresApply": "{{node}} · ذخیره شد؛ پیش از استفاده تغییرات معلق را اعمال کنید",
     "takeoverManual": "محلی",
     "takeoverMethod": "روش تسلط",

@@ -566,7 +566,6 @@
     "switchedToast": "{{node}} · switched",
     "switchPending": "{{node}} · saved; applying connection change",
     "switchRestarting": "{{node}} · saved; restarting the connection to complete the switch",
-    "switchSavedForNextStart": "{{node}} · saved for the next connection",
     "switchRequiresApply": "{{node}} · saved; apply pending changes before use",
     "takeoverManual": "Local",
     "takeoverMethod": "Takeover",

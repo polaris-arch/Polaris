@@ -588,7 +588,6 @@
     "switchedToast": "{{node}} · переключено",
     "switchPending": "{{node}} · сохранено, изменение соединения применяется",
     "switchRestarting": "{{node}} · сохранено; соединение перезапускается для завершения переключения",
-    "switchSavedForNextStart": "{{node}} · сохранено для следующего подключения",
     "switchRequiresApply": "{{node}} · сохранено; примените ожидающие изменения",
     "takeoverManual": "Локально",
     "takeoverMethod": "Перехват",

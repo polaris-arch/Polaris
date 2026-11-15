@@ -1537,7 +1537,6 @@ const TRAY_SLOT: Record<
   'tray.noTestableNodes': 'NOTE',
   'tray.checkingUpdate': 'NOTE',
   'tray.switchPending': 'NOTE',
-  'tray.switchSavedForNextStart': 'NOTE',
   'tray.switchRequiresApply': 'NOTE',
   // 检查结果不再占 tray-note 新行，而是检查更新按钮右侧的固定宽短徽标。
   'tray.upToDate': 'BADGE',
