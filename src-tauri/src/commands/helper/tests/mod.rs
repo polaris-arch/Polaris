@@ -457,7 +457,9 @@ fn linux_legacy_guard_keeps_real_release_unknowns_before_any_root_body() {
     );
     assert!(guard.contains("valid.load(Ordering::SeqCst)"));
     assert!(!guard.contains("proxy.stop().await"));
-    assert!(source.contains("ProxyMarkerRead::Missing => return Ok(None)"));
+    // Without a takeover the live setting is the baseline, unless it is a manual proxy.
+    assert!(source.contains("ProxyMarkerRead::Missing => {"));
+    assert!(source.contains(r#"if live.mode == "'manual'" {"#));
     assert!(source.contains("responsible gsettings session domain is unsupported or unknown"));
 }
 
