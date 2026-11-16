@@ -249,14 +249,15 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     await page.waitForFunction(()=>document.querySelectorAll('[data-picker-node]').length===0);
     await page.close();
   },30_000);
-  it('sorts only within each group, preserves folding, and restores config order when switched off',async()=>{
+  it('sorts only within each group, preserves folding, and restores natural name order when switched off',async()=>{
     const page=await browser.newPage({viewport:{width:390,height:844}});await page.goto(origin+'/__picker-speed');
     await page.locator('.h-pick-group').first().waitFor();
     await page.evaluate(()=>(window as any).__pickerTest.showExtra());
     await page.locator('[data-group-id="manual"]').click();
     const ids=()=>page.locator('[data-picker-node]').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-picker-node')));
     const groups=()=>page.locator('.h-pick-group').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-group-id')));
-    expect((await ids()).slice(0,8)).toEqual(['manual','orphan','slow','fast','zero','stale','fail','unknown']);
+    const nameOrder=['fail','fast',...Array.from({length:14},(_,i)=>'filler-'+i),'manual','orphan','slow','stale','unknown','zero','sub-a'];
+    expect(await ids()).toEqual(nameOrder);
     expect(await groups()).toEqual(['manual','mesh','first','second']);
     const sort=page.getByRole('switch',{name:'按延迟排序'});
     expect(await sort.getAttribute('aria-checked')).toBe('false');
@@ -269,7 +270,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     expect(await page.locator('[data-group-id="manual"]').getAttribute('aria-expanded')).toBe('true');
     expect(await page.evaluate(()=>localStorage.getItem('polaris.nodeSortByLatency'))).toBe('true');
     await sort.click();
-    expect((await ids()).slice(0,8)).toEqual(['manual','orphan','slow','fast','zero','stale','fail','unknown']);
+    expect(await ids()).toEqual(nameOrder);
     await page.close();
   },30_000);
   it('keeps the heading and search reachable while a long picker list scrolls on all mobile widths and themes',async()=>{
