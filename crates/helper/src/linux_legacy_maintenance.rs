@@ -1107,8 +1107,11 @@ impl Journal {
         self.ownmask()?;
         namespaces()?;
         shared_manager_view()?;
+        // systemd 259 reports the mask path itself rather than /dev/null; ownmask()
+        // has just bound that path to /dev/null.
         require(
-            property("LoadState")? == "masked" && property("FragmentPath")? == "/dev/null",
+            property("LoadState")? == "masked"
+                && matches!(property("FragmentPath")?.as_str(), "/dev/null" | UNIT),
             "manager has not loaded ownmask",
         )?;
         empty_hooks()?;
