@@ -124,13 +124,22 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
         std::fs::remove_dir(&lock_path).unwrap();
         std::fs::rename(saved, lock_path).unwrap();
     }
-    // Observe the actual typed execution refusal after the original data checks.
-    // Its safe reason may differ by host/policy; Busy cannot prove this premise.
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        status_with_owner(Some(&root), &id, owner),
+        CoreStatus::Present {
+            id: id.clone(),
+            version: manifest.core.version.clone(),
+        }
+    );
+    // A protected installed identity is eligible independently of the Helper's
+    // compiled selection. Actual missing bytes must still produce typed damage.
+    std::fs::remove_file(root.join("versions").join(id.as_str()).join("libcronet.so")).unwrap();
     let error = store.verify_for_start(&id).unwrap_err();
     let admission = error
         .get_ref()
         .and_then(|source| source.downcast_ref::<AdmissionError>())
-        .expect("inert installed bytes must reach typed execution admission");
+        .expect("missing installed bytes must report typed admission damage");
     assert_ne!(admission.kind, AdmissionErrorKind::Busy);
     assert_eq!(admission.purpose, Some(ExecPurpose::RunMain));
     assert_eq!(
@@ -143,11 +152,14 @@ fn status_distinguishes_uninstalled_id_from_missing_installed_bytes() {
     // A rejected status admission must not retain a shared execution lease
     // and permanently prevent the real existing repair transaction.
     store.install(&manifest, &source, Some(uid), None).unwrap();
-    std::fs::remove_file(root.join("versions").join(id.as_str()).join("libcronet.so")).unwrap();
-    assert!(matches!(
+    #[cfg(target_os = "linux")]
+    assert_eq!(
         status_with_owner(Some(&root), &id, owner),
-        CoreStatus::Invalid { .. }
-    ));
+        CoreStatus::Present {
+            id: id.clone(),
+            version: manifest.core.version.clone(),
+        }
+    );
     std::fs::remove_file(root.join("manifests").join(format!("{}.json", id.as_str()))).unwrap();
     assert!(matches!(
         status_with_owner(Some(&root), &id, owner),
