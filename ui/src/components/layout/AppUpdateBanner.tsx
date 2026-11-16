@@ -99,8 +99,16 @@ export default function AppUpdateBanner() {
       </div>
       {/* 主动作只做**导航**，不在横幅里直接起下载：下载/安装是有进度、有 advisory 二次确认、
           有便携版手动替换分支的一整套状态机（`SettingsUpdate` 的 7 态），横幅这么窄的条塞不下，
-          塞一半会让用户在没有进度与失败反馈的地方触发长耗时下载。 */}
-      <Button variant="flow" size="sm" onClick={() => enterSettings('update')}>
+          塞一半会让用户在没有进度与失败反馈的地方触发长耗时下载。点了即已处理，本会话收起
+          （同关闭按钮）；更新页自带完整入口，下次启动仍会提示。 */}
+      <Button
+        variant="flow"
+        size="sm"
+        onClick={() => {
+          markAppVersionDismissed(version);
+          enterSettings('update');
+        }}
+      >
         <span>{t('settings.update.bannerAction')}</span>
       </Button>
       <Button
