@@ -1087,14 +1087,14 @@ fn uninstall_scripts_preserve_stable_lease_and_platform_cleanup_contracts() {
     let mac = uninstall_unix::build_mac_uninstall_script(&InstallPaths::mac(), &utility);
     assert!(mac.contains("admin migration-stop --journal"));
     assert!(mac.contains("admin migration-recheck --journal"));
-    assert!(mac.contains("stopped-retired-data-preserved"));
-    assert!(!mac.contains("rm -rf \"$SUPPORT\""));
+    assert!(mac.contains("stopped-removed"));
+    assert!(mac.contains("rm -f \"$LOCK\"\nrmdir \"$SUPPORT\""));
     let lin = uninstall_unix::build_linux_uninstall_script(&InstallPaths::linux(), &utility);
     assert!(lin.contains("systemctl --system disable --now \"$SERVICE\""));
     assert!(lin.contains("rm -rf \"$INSTALLDIR\" \"$RUNTIMEDIR\""));
+    assert!(!lin.contains("rm -f \"$LOCK\""));
     for script in [mac, lin] {
         assert!(script.contains("admin lease-acquire --lock \"$LOCK\" --fd 9"));
-        assert!(!script.contains("rm -f \"$LOCK\""));
         assert!(!script.contains("rm -rf \"$SUPPORT\""));
     }
 }

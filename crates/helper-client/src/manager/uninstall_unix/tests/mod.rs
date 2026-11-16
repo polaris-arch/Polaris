@@ -20,7 +20,10 @@ fn maintenance_reuses_sealing_lease_and_existing_guard_binding() {
         assert!(script.contains("polaris-helper-upgrade-v1"));
         assert!(script.contains("printf '%s' \"$DEST\" > \"$TXDIR/transaction-destination\""));
         assert!(!script.contains("rm -rf \"$SUPPORT\""));
-        assert!(!script.contains("rm -f \"$LOCK\""));
+        // Only a completed macOS uninstall unlinks the lease, after its last admin call.
+        let unlink = script.find("rm -f \"$LOCK\"");
+        assert_eq!(unlink.is_some(), script.contains("MAINTENANCE_MAC=1"));
+        assert!(unlink.is_none_or(|at| script.rfind("admin ").unwrap() < at));
         assert!(!script.contains("lease-release"));
         assert!(
             script.find("admin lease-acquire").unwrap() < script.find("TXDIR=$(mktemp").unwrap()
@@ -65,7 +68,7 @@ fn maintenance_reuses_sealing_lease_and_existing_guard_binding() {
 
 #[cfg(unix)]
 #[test]
-fn mac_retirement_inert_shell_preserves_inodes_and_failure_evidence() {
+fn mac_uninstall_inert_shell_removes_data_only_after_proved_retirement() {
     use std::os::unix::fs::MetadataExt;
     for failure in [
         "",
@@ -170,16 +173,23 @@ mv() {{
             String::from_utf8_lossy(&output.stdout).contains("polaris-helper-uninstall-ok"),
             succeeds
         );
+        if succeeds {
+            // Stop and retirement proved: the whole support directory goes, lease last.
+            assert!(!support.exists(), "{failure}");
+            assert!(!helper.exists());
+            assert!(!descriptor.exists());
+            continue;
+        }
         assert_eq!(std::fs::metadata(&lease).unwrap().ino(), lease_id);
-        assert_eq!(
-            std::fs::read_to_string(support.join("user-data")).unwrap(),
-            "preserved user state"
-        );
         let journals: Vec<_> = std::fs::read_dir(&support)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.is_dir())
             .collect();
+        assert_eq!(
+            std::fs::read_to_string(support.join("user-data")).unwrap(),
+            "preserved user state"
+        );
         if matches!(failure, "lease-acquire" | "preflight") {
             assert!(journals.is_empty());
             assert_eq!(std::fs::metadata(&helper).unwrap().ino(), helper_id);
@@ -187,35 +197,14 @@ mv() {{
         } else {
             assert_eq!(journals.len(), 1, "{failure}");
             let journal = &journals[0];
-            if succeeds {
-                assert_eq!(
-                    std::fs::metadata(journal.join("helper.original"))
-                        .unwrap()
-                        .ino(),
-                    helper_id
-                );
-                assert_eq!(
-                    std::fs::metadata(journal.join("descriptor.original"))
-                        .unwrap()
-                        .ino(),
-                    descriptor_id
-                );
-                assert_eq!(
-                    journal.join("record.original").exists(),
-                    failure != "no-record"
-                );
-                assert!(!helper.exists());
-                assert!(!descriptor.exists());
+            assert!(journal.join("recovery-required").exists());
+            assert_eq!(std::fs::metadata(&descriptor).unwrap().ino(), descriptor_id);
+            let helper_path = if failure == "move-descriptor" {
+                journal.join("helper.original")
             } else {
-                assert!(journal.join("recovery-required").exists());
-                assert_eq!(std::fs::metadata(&descriptor).unwrap().ino(), descriptor_id);
-                let helper_path = if failure == "move-descriptor" {
-                    journal.join("helper.original")
-                } else {
-                    helper.clone()
-                };
-                assert_eq!(std::fs::metadata(helper_path).unwrap().ino(), helper_id);
-            }
+                helper.clone()
+            };
+            assert_eq!(std::fs::metadata(helper_path).unwrap().ino(), helper_id);
         }
         if matches!(failure, "lease-acquire" | "old-journal") {
             assert!(!std::fs::read_to_string(root.join("trace"))

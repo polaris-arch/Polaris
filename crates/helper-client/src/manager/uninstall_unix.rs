@@ -1,6 +1,7 @@
 //! Explicit Unix maintenance uses the installer's sealed utility and stable
 //! inherited lease. macOS retirement preserves evidence rather than restarting
-//! or deleting an installation when closure cannot be proved.
+//! or deleting an installation when closure cannot be proved; once closure and
+//! retirement are proved, uninstall removes the whole support directory.
 use super::install_unix::{sealed_bootstrap, secure_directory_functions, LEASE_OPEN, SET_PHASE};
 use super::{shell_quote, InstallPaths, MaintenanceUtility, LINUX_STATE_DIR, MAC_SUPPORT_DIR};
 
@@ -128,16 +129,29 @@ FINAL_STATE=retirement-incomplete
 retire_original "$DEST" helper "$HELPER_ID"
 retire_original "$DESCRIPTOR" descriptor "$DESCRIPTOR_ID"
 if [ -n "$RECORD_ID" ]; then retire_original "$RECORD" record "$RECORD_ID"; fi
-# No activation, rollback, pid signaling, core removal or support cleanup.
-# Archive only this completed transaction, retaining every original inode and
-# the bound stop receipts. Archived receipts never authorize a later action.
+# No activation, rollback or pid signaling. With the stop proved and the
+# originals retired, uninstall removes the cores, execution copies, user
+# tokens, record and earlier retirement archives. Unfinished journals of
+# other operations stay as evidence and keep the directory.
+set_phase uninstall-removal
+FINAL_STATE=removal-incomplete
+for OBJECT in "$SUPPORT"/* "$SUPPORT"/.[!.]* "$SUPPORT"/..?*; do
+  [ -e "$OBJECT" ] || [ -L "$OBJECT" ] || continue
+  case "$OBJECT" in
+    "$LOCK"|"$TXDIR"|"$SUPPORT"/helper-upgrade.*|"$SUPPORT"/helper-admission.*) continue;;
+  esac
+  rm -rf "$OBJECT"
+done
 set_phase uninstall-completed
-RETIRED="$SUPPORT/helper-retired.${TXDIR##*.}"
-[ ! -e "$RETIRED" ] && [ ! -L "$RETIRED" ] || exit 75
-mv "$TXDIR" "$RETIRED"
-TXDIR="$RETIRED"
+rm -rf "$TXDIR"
+TXDIR=''
 admin sync-install-path --path "$SUPPORT"
-FINAL_STATE=stopped-retired-data-preserved
+# The lease goes last and while still held: an operation that opened the old
+# inode then fails its identity check rather than sharing the lease with one
+# that creates a new inode. Nothing after this validates the lease.
+rm -f "$LOCK"
+rmdir "$SUPPORT" 2>/dev/null || :
+FINAL_STATE=stopped-removed
 FINISHED=1
 "#;
 
