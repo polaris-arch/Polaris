@@ -306,12 +306,8 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
 
     // mac 各网络服务是独立的 networksetup 进程、互不依赖：并行执行，免得每个服务逐个等。
     fn read_dns_all(&self, targets: &[String]) -> Vec<Result<Vec<String>, SystemIntegrationError>> {
-        match self
-            .runner
-            .as_sync()
-            .filter(|_| matches!(self.platform, Platform::Mac))
-        {
-            Some(runner) => each_parallel(targets.iter(), |t| {
+        match (self.platform, self.runner.as_sync()) {
+            (Platform::Mac, Some(runner)) => each_parallel(targets.iter(), |t| {
                 runner
                     .run(
                         &Command::new("networksetup", ["-getdnsservers", t.as_str()]),
@@ -320,7 +316,15 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
                     .map(|out| parse_mac_get_dns_servers(&out.stdout))
                     .map_err(SystemIntegrationError::dns)
             }),
-            None => targets.iter().map(|t| self.read_dns(t)).collect(),
+            (
+                Platform::Mac
+                | Platform::Win
+                | Platform::Linux
+                | Platform::Other
+                | Platform::Android
+                | Platform::Ios,
+                _,
+            ) => targets.iter().map(|t| self.read_dns(t)).collect(),
         }
     }
 
@@ -328,12 +332,8 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
         &self,
         writes: &[(&String, &Vec<String>)],
     ) -> Vec<Result<(), SystemIntegrationError>> {
-        match self
-            .runner
-            .as_sync()
-            .filter(|_| matches!(self.platform, Platform::Mac))
-        {
-            Some(runner) => each_parallel(writes.iter(), |(t, ips)| {
+        match (self.platform, self.runner.as_sync()) {
+            (Platform::Mac, Some(runner)) => each_parallel(writes.iter(), |(t, ips)| {
                 runner
                     .run(
                         &Command::new("networksetup", mac_set_dns_args(t, ips)),
@@ -342,7 +342,15 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
                     .map(drop)
                     .map_err(SystemIntegrationError::dns)
             }),
-            None => writes
+            (
+                Platform::Mac
+                | Platform::Win
+                | Platform::Linux
+                | Platform::Other
+                | Platform::Android
+                | Platform::Ios,
+                _,
+            ) => writes
                 .iter()
                 .map(|(t, ips)| self.apply_dns(t, ips))
                 .collect(),
