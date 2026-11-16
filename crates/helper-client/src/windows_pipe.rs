@@ -8,8 +8,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE,
-    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -19,13 +19,21 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_TYPE_MESSAGE};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
+const _: () = assert!(
+    polaris_helper_proto::windows_helper::PIPE_CLIENT_ACCESS
+        == windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA
+            | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA
+            | windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES
+            | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+            | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE
+);
+
 fn is_peer_gone(error: u32) -> bool {
     error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED
 }
 
 pub(crate) struct WinPipeStream {
     handle: OwnedHandle,
-    system_peer: Option<OwnedHandle>,
     read_timeout: Duration,
     message_pipe: bool,
 }
@@ -42,7 +50,7 @@ impl WinPipeStream {
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                polaris_helper_proto::windows_helper::PIPE_CLIENT_ACCESS,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -56,7 +64,6 @@ impl WinPipeStream {
         let mut stream = Self {
             // SAFETY: new valid exclusively owned CreateFileW handle.
             handle: unsafe { OwnedHandle::from_raw_handle(handle.cast()) },
-            system_peer: None,
             read_timeout: crate::transport::READ_TIMEOUT,
             message_pipe: false,
         };
@@ -79,91 +86,48 @@ impl WinPipeStream {
     }
 
     pub(crate) fn connect_system() -> io::Result<Self> {
-        use windows_sys::Win32::Security::*;
-        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        };
-        let mut stream = Self::connect(Path::new(r"\\.\pipe\polaris-helper"))?;
-        let mut pid = 0;
-        if unsafe { GetNamedPipeServerProcessId(stream.raw(), &mut pid) } == 0 || pid == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let process = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
-        if process.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let process = unsafe { OwnedHandle::from_raw_handle(process) };
-        let mut token = std::ptr::null_mut();
-        if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = unsafe { OwnedHandle::from_raw_handle(token) };
-        let mut bytes = 0;
-        unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenUser,
-                std::ptr::null_mut(),
-                0,
-                &mut bytes,
-            );
-        }
-        if bytes < std::mem::size_of::<TOKEN_USER>() as u32 || bytes > 65536 {
-            return Err(io::Error::other("SYSTEM Helper token size unavailable"));
-        }
-        let mut storage = vec![0u64; (bytes as usize).div_ceil(8)];
-        if unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenUser,
-                storage.as_mut_ptr().cast(),
-                bytes,
-                &mut bytes,
-            )
-        } == 0
-            || unsafe {
-                IsWellKnownSid(
-                    (*(storage.as_ptr().cast::<TOKEN_USER>())).User.Sid,
-                    WinLocalSystemSid,
-                )
-            } == 0
-        {
-            return Err(io::Error::other("Helper pipe server is not LocalSystem"));
-        }
-        let mut kind: TOKEN_TYPE = 0;
-        let mut written = 0;
-        if unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenType,
-                (&mut kind as *mut TOKEN_TYPE).cast(),
-                std::mem::size_of::<TOKEN_TYPE>() as u32,
-                &mut written,
-            )
-        } == 0
-            || kind != TokenPrimary
-        {
-            return Err(io::Error::other("Helper server primary token unavailable"));
-        }
-        let mut current = 0;
-        if unsafe { GetNamedPipeServerProcessId(stream.raw(), &mut current) } == 0 || current != pid
-        {
-            return Err(io::Error::other("Helper pipe server identity changed"));
-        }
-        // Keep the original process object alive with this pipe. PID reuse cannot
-        // substitute a new primary token after the endpoint observation.
-        if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } != WAIT_TIMEOUT {
-            return Err(io::Error::other("Helper server process already exited"));
-        }
-        stream.system_peer = Some(process);
+        let stream = Self::connect(Path::new(polaris_helper_proto::windows_helper::PIPE_NAME))?;
+        stream.require_system_security()?;
         Ok(stream)
+    }
+
+    fn require_system_security(&self) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // Authenticate the connected object, not its name or a recyclable PID.
+        // Ordinary desktop users cannot open a SYSTEM service process/token.
+        let error = unsafe {
+            GetSecurityInfo(
+                self.raw(),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // owner and dacl borrow the descriptor until LocalFree below.
+        let matches = unsafe { system_pipe_security_matches(owner, dacl) };
+        unsafe { LocalFree(descriptor) };
+        if !matches? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Helper pipe lacks SYSTEM-only server authority; update the installed Helper",
+            ));
+        }
+        // The retained pipe handle pins this object. Only SYSTEM can create its
+        // server instances or change its descriptor; disconnect cannot rebind a
+        // client handle to another server. No process-query permission is needed.
+        Ok(())
     }
 
     fn raw(&self) -> HANDLE {
@@ -181,13 +145,6 @@ impl WinPipeStream {
         write: bool,
         deadline: Instant,
     ) -> io::Result<usize> {
-        if self.system_peer.as_ref().is_some_and(
-            |peer| unsafe { WaitForSingleObject(peer.as_raw_handle(), 0) } != WAIT_TIMEOUT,
-        ) {
-            return Err(io::Error::other(
-                "Authenticated Helper server process exited",
-            ));
-        }
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -257,13 +214,6 @@ impl WinPipeStream {
         // obtain the byte count from OVERLAPPED, not the asynchronous call's out argument.
         if unsafe { GetOverlappedResult(self.raw(), &operation, &mut transferred, 0) } == 0 {
             return Err(io::Error::last_os_error());
-        }
-        if self.system_peer.as_ref().is_some_and(
-            |peer| unsafe { WaitForSingleObject(peer.as_raw_handle(), 0) } != WAIT_TIMEOUT,
-        ) {
-            return Err(io::Error::other(
-                "Authenticated Helper server process exited",
-            ));
         }
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -345,5 +295,164 @@ impl ConnectionStream for WinPipeStream {
         // supplies the request boundary; clients retain byte-mode response reads.
         // Never FlushFileBuffers here (would introduce another peer-controlled wait).
         Ok(())
+    }
+}
+
+/// Authenticate the immutable server authority of the connected pipe object.
+///
+/// # Safety
+/// owner/dacl must belong to a live, OS-validated security descriptor.
+#[allow(
+    unsafe_code,
+    reason = "compares borrowed OS ACLs and frees the expected SDDL descriptor"
+)]
+unsafe fn system_pipe_security_matches(
+    owner: windows_sys::Win32::Security::PSID,
+    dacl: *const windows_sys::Win32::Security::ACL,
+) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, IsWellKnownSid, WinLocalSystemSid,
+    };
+    if owner.is_null() || dacl.is_null() || unsafe { IsWellKnownSid(owner, WinLocalSystemSid) } == 0
+    {
+        return Ok(false);
+    }
+    let expected: Vec<u16> = polaris_helper_proto::windows_helper::PIPE_SDDL
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            expected.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut expected_dacl = std::ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    let valid = unsafe {
+        GetSecurityDescriptorDacl(descriptor, &mut present, &mut expected_dacl, &mut defaulted)
+    } != 0
+        && present != 0
+        && !expected_dacl.is_null();
+    // Exact ACL equality also rejects NULL, extra trustees, and the old generic
+    // write grant (which lets Interactive Users create a spoof server instance).
+    let matches = valid
+        && unsafe {
+            (*dacl).AclSize == (*expected_dacl).AclSize
+                && std::slice::from_raw_parts(dacl.cast::<u8>(), (*dacl).AclSize as usize)
+                    == std::slice::from_raw_parts(
+                        expected_dacl.cast::<u8>(),
+                        (*expected_dacl).AclSize as usize,
+                    )
+        };
+    unsafe { LocalFree(descriptor) };
+    Ok(matches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "owns and inspects converted native test descriptors"
+    )]
+    fn system_pipe_descriptor_rejects_spoofable_server_authority() {
+        for (sddl, accepted) in [
+            (polaris_helper_proto::windows_helper::PIPE_SDDL, true),
+            ("O:SYD:(A;;FA;;;SY)(A;;GRGW;;;IU)", false),
+            ("O:BAD:(A;;FA;;;SY)(A;;0x120083;;;IU)", false),
+            ("O:SYD:(A;;FA;;;SY)(A;;0x120083;;;IU)(A;;FA;;;BU)", false),
+            ("O:SYD:NO_ACCESS_CONTROL", false),
+            ("O:SYD:", false),
+        ] {
+            let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut descriptor = std::ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        wide.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let mut owner = std::ptr::null_mut();
+            let mut dacl = std::ptr::null_mut();
+            let mut defaulted = 0;
+            let mut present = 0;
+            assert_ne!(
+                unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) },
+                0
+            );
+            assert_ne!(
+                unsafe {
+                    GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+                },
+                0
+            );
+            let result = unsafe { system_pipe_security_matches(owner, dacl) };
+            unsafe { LocalFree(descriptor) };
+            assert_eq!(result.unwrap(), accepted, "{sddl}");
+        }
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "owns an isolated native pipe with the current user's default ACL"
+    )]
+    fn connected_user_pipe_cannot_supply_system_evidence() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+        };
+        use windows_sys::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
+        };
+        let name = format!(r"\\.\pipe\polaris-auth-negative-{}", std::process::id());
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let server = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(
+            server,
+            INVALID_HANDLE_VALUE,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let _server = unsafe { OwnedHandle::from_raw_handle(server) };
+        let client = WinPipeStream::connect(Path::new(&name)).unwrap();
+        assert_eq!(
+            client.require_system_security().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }

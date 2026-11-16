@@ -5817,6 +5817,15 @@ fn speed_probe_targets_carry_running_core_fingerprints() {
         "必须带出 **5 维** dirty 表：带成全维表 → 与测速「新」侧公式不同 → 恒不等 → 全员恒 dirty"
     );
     assert_eq!(t.id_to_tag.get("id-a").map(String::as_str), Some("东京 03"));
+    rt.switch_snapshot
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .probe_pool_ports
+        .clear();
+    assert!(rt.speed_probe_targets().is_none());
+    assert_eq!(rt.speed_node_fingerprints(), t.fingerprints);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -32,7 +32,7 @@ import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 import { Fragment, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
-import { groupServersBySubscription, defaultOpenGroupIds } from '@/domain/server-grouping';
+import { groupServersBySubscription, defaultOpenGroupIds, sortServersByName } from '@/domain/server-grouping';
 import { isBlockSelection, isDirectSelection } from '@/domain/direct-selection';
 import { sortServersByLatency } from '@/domain/server-latency-sort';
 import { useNodeSortStore } from '@/store/use-node-sort-store';
@@ -263,9 +263,10 @@ function OpenNodeMenu({
 
       {filteredGroups.map((g) => {
         const isOpen = searching || openGroups.get(g.id) === true;
-        let items = g.servers;
         // 委托 domain 的单一比较器（与 Nodes 工具栏同口径：无测速结果恒沉底，不随方向翻转）。
-        if (latencySort) items = sortServersByLatency(items, (id) => latencies[id]);
+        const items = latencySort
+          ? sortServersByLatency(g.servers, (id) => latencies[id])
+          : sortServersByName(g.servers);
         return (
           <Fragment key={g.id}>
             <button

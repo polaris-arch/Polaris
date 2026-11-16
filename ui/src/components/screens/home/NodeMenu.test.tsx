@@ -30,6 +30,16 @@ describe('NodeMenu initial render (not a browser lifecycle substitute)', () => {
     expect(html).toContain('aria-expanded="false"');
     expect(html).not.toContain('role="option"');
   });
+  it('places appended MASQUE nodes beside their numbered name family', () => {
+    const servers = ['JP10', 'JP01', 'JP02', 'JP01-MASQUE'].map((name, index): NodeMenuProps['servers'][number] => ({
+      ...props.servers[0], id: name, name, protocol: index === 3 ? 'masque-client' : 'vless',
+    }));
+    const html = renderToStaticMarkup(<NodeMenu {...props} servers={servers} selectedServerId="JP01" />);
+    const positions = ['JP01', 'JP01-MASQUE', 'JP02', 'JP10'].map(name => html.indexOf(`>${name}<`));
+    expect(positions.every(position => position >= 0)).toBe(true);
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+    expect(servers.map(server => server.name)).toEqual(['JP10', 'JP01', 'JP02', 'JP01-MASQUE']);
+  });
   it('retains the closed target identity for the parent aria-controls', () => {
     const html = renderToStaticMarkup(<NodeMenu {...props} open={false} />);
     expect(html).toContain('id="node-menu"');

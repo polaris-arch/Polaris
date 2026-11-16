@@ -85,19 +85,9 @@ pub const PLATFORM: polaris_helper_proto::Platform = polaris_helper_proto::Platf
 // helper-client（装卸脚本、连管道、`sc` 起停）必须与本侧逐字一致，故两侧共引同一份（构造上单源）。
 // sc.exe stop/delete 与自毁旁路均引用 `SERVICE_NAME`；`DEFAULT_SUPPORT_DIR` 是 `--support` 默认值，
 // `helper.token` 落此目录（SYSTEM 私有，ACL 由安装期设定）。
-pub use polaris_helper_proto::windows_helper::{DEFAULT_SUPPORT_DIR, PIPE_NAME, SERVICE_NAME};
-
-/// 命名管道 SDDL（纵深防御；token 仍是主鉴权边界，`helper-win/service.go:34`）。
-///
-/// `D:(A;;FA;;;SY)(A;;GRGW;;;IU)`：
-/// - `D:` DACL 起始。
-/// - `(A;;FA;;;SY)` Allow / FILE_ALL_ACCESS / SYSTEM —— 服务本体（LocalSystem）完全控制管道。
-/// - `(A;;GRGW;;;IU)` Allow / GENERIC_READ+GENERIC_WRITE / Interactive Users —— 桌面登录用户可连接读写。
-///
-/// 选 IU（交互登录用户）而非 BU/AU：Polaris GUI 由当前桌面登录用户运行，IU 精确覆盖「本机交互会话」，
-/// 不授予服务账户/远程会话/网络登录。GENERIC_READ|WRITE 足以连接管道 + ReadFile/WriteFile，
-/// 不授予 FILE_ALL_ACCESS（无需改 ACL/删管道）。
-pub const PIPE_SDDL: &str = "D:(A;;FA;;;SY)(A;;GRGW;;;IU)";
+pub use polaris_helper_proto::windows_helper::{
+    DEFAULT_SUPPORT_DIR, PIPE_NAME, PIPE_SDDL, SERVICE_NAME,
+};
 
 #[cfg(test)]
 mod tests;

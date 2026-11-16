@@ -1,6 +1,13 @@
 import type { ServerConfig, SubscriptionConfig } from '../contracts/types';
 import { landsInEndpoints } from './endpoint-routes';
 
+const nodeNameOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+/** Keep protocol variants in the same name family without changing import order. */
+export function sortServersByName<T extends { name: string }>(servers: readonly T[]): T[] {
+  return [...servers].sort((a, b) => nodeNameOrder.compare(a.name, b.name));
+}
+
 /**
  * 节点分组（自建 + 组网 + 各订阅），供节点选择器 / 节点列表页 tab / 任意需要「分组」展示处共用，
  * **单一真值**——杜绝各处各自分组导致「列表页归组网、下拉归自建」的口径漂移。

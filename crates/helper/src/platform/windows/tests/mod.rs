@@ -18,5 +18,5 @@ fn platform_is_win_with_token_line() {
 fn service_name_pipe_name_sddl_match_go_source() {
     // main.go:15 / service.go:16,34
     // 服务名 / 管道名由 `crates/helper-client/src/manager/tests/mod.rs` 守。
-    assert_eq!(PIPE_SDDL, "D:(A;;FA;;;SY)(A;;GRGW;;;IU)");
+    assert_eq!(PIPE_SDDL, "O:SYG:SYD:P(A;;FA;;;SY)(A;;0x120083;;;IU)");
 }

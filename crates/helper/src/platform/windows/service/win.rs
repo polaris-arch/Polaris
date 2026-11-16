@@ -2,7 +2,7 @@
 //!
 //! 实现两件事：
 //! 1. **命名管道监听**（`service.go:37-44` `listen` + `service.go:48-57` `serve`）：创建 SDDL 防护的命名管道
-//!    （`\\.\pipe\polaris-helper`，SDDL=`D:(A;;FA;;;SY)(A;;GRGW;;;IU)`），accept 循环，每连接一个线程跑//!    [`crate::platform::windows::helper::WinHelper::handle`]。
+//!    （`\\.\pipe\polaris-helper`，SYSTEM 拥有且独占建实例权限），accept 循环，每连接一个线程跑//!    [`crate::platform::windows::helper::WinHelper::handle`]。
 //! 2. **SCM 服务托管**（`service.go:64-93` `Execute` + `main.go:39-42`）：注册服务控制处理器，
 //!    STOP/SHUTDOWN closes admission and the listener, then retains native custody
 //!    while retrying close. Only confirmed native exit and writer revoke allow Stopped.

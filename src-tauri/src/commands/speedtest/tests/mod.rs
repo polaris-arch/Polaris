@@ -3222,11 +3222,26 @@ async fn fallback_result_carries_a_system_path_identity() {
 /// 出口伴测：身份块齐全、运行号在身份块里，事件顶层**不带** `runId`，既有两个字段原样。
 #[test]
 fn companion_result_has_identity_but_no_top_level_run_id() {
-    let payload = companion_result_payload(
+    let ledger = Box::leak(Box::new(MeasurementLedger::new()));
+    let fingerprints = BTreeMap::from([("srv".to_owned(), "running-node".to_owned())]);
+    let connections = crate::runtime::node_fingerprints::MeasurementConnections {
+        main: BTreeMap::from([("srv".to_owned(), "running-connection".to_owned())]),
+        temp: BTreeMap::new(),
+    };
+    let digest = "a".repeat(64);
+    let mut events = RunEvents::new(
         "43",
         &request(SpeedTestOrigin::Companion, MeasurePath::System, &["srv"]),
         main_instance(),
         Some("cfg-digest".to_string()),
+        fingerprints.clone(),
+        None,
+    )
+    .with_core_binary_sha256(Some(digest.clone()))
+    .with_connection_fingerprints(connections.main.clone())
+    .with_ledger(ledger);
+    let payload = companion_result_payload(
+        &mut events,
         "srv",
         66,
         Some(2),
@@ -3247,7 +3262,22 @@ fn companion_result_has_identity_but_no_top_level_run_id() {
     assert_eq!(identity["path"], json!("system"));
     assert_eq!(identity["context"], json!("connected"));
     assert_eq!(identity["networkEpoch"], json!(2));
-    assert_eq!(identity["coreBinarySha256"], Value::Null);
+    assert_eq!(identity["coreBinarySha256"], digest);
+    assert_eq!(identity["nodeFingerprint"], "running-node");
+    let context = crate::runtime::measurement_ledger::ReadContext {
+        core_binary_sha256: Some(Some(&digest)),
+        main_generation: Some(7),
+        fingerprints: &fingerprints,
+        main_connections: &connections.main,
+        network_epoch: Some(2),
+        url_digest: identity["urlDigest"].as_str().unwrap(),
+        now_ms: identity["measuredAt"].as_u64().unwrap(),
+        foreground_epoch: None,
+        freshness_cap_ms: &|_, _| 1000,
+    };
+    let rows = ledger.display_rows(&context, Some("cfg-digest"), &connections);
+    assert_eq!(rows["srv"]["system"]["state"], "success");
+    assert_eq!(rows["srv"]["system"]["latency"], 66);
 }
 
 /// 非手动来源只发逐节点结果：进度与终态被盖章出口丢弃，结果顶层不带 `runId`。
@@ -6093,7 +6123,7 @@ fn companion_result_follows_the_same_attribution() {
             Arc::new(NoWitness),
             SpeedBindingContext::default(),
         );
-        companion_result_payload(
+        let mut events = RunEvents::new(
             "44",
             &request(
                 SpeedTestOrigin::Companion,
@@ -6102,6 +6132,11 @@ fn companion_result_follows_the_same_attribution() {
             ),
             main_instance(),
             None,
+            BTreeMap::new(),
+            None,
+        );
+        companion_result_payload(
+            &mut events,
             "srv",
             66,
             None,

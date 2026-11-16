@@ -242,6 +242,13 @@ pub mod windows_helper {
     pub const SERVICE_NAME: &str = "PolarisHelper";
     /// 命名管道路径（上游 `helper-win/service.go:16`，`const pipeName`）。
     pub const PIPE_NAME: &str = r"\\.\pipe\polaris-helper";
+    /// Client data/attribute reads, data writes, READ_CONTROL and SYNCHRONIZE.
+    /// GENERIC_WRITE also grants FILE_CREATE_PIPE_INSTANCE, allowing a client to
+    /// become a server under the same name. Neither side may use that grant.
+    pub const PIPE_CLIENT_ACCESS: u32 = 0x0012_0083;
+    /// SYSTEM owns the pipe object and alone may create instances or change its
+    /// security. Clients authenticate this descriptor on their connected handle.
+    pub const PIPE_SDDL: &str = "O:SYG:SYD:P(A;;FA;;;SY)(A;;0x120083;;;IU)";
     /// helper 的 support 目录（上游 `helper-win/main.go:21` 的 `--support` 默认值）：
     /// helper.exe 外置副本、`helper.token`、受保护核目录都落在它下面。
     pub const DEFAULT_SUPPORT_DIR: &str = r"C:\ProgramData\Polaris";

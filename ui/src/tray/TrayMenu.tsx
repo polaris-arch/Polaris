@@ -38,6 +38,7 @@ import type {
 import {
   groupServersBySubscription,
   defaultOpenGroupIds,
+  sortServersByName,
   type ServerGroup,
 } from '@/domain/server-grouping';
 import {
@@ -1190,7 +1191,7 @@ export default function TrayMenu() {
             {groups.map((g) => {
               const items = sortByLatency
                 ? sortServersByLatency(g.servers, (id) => latencies[id])
-                : g.servers;
+                : sortServersByName(g.servers);
               const groupOpen = !!openGroups.get(g.id);
               return (
                 <Fragment key={g.id}>

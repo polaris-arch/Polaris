@@ -52,10 +52,8 @@
 //!   此时运行核对该出口**已让位到直连**（`login_fallback`），经其槽量到的是**直连** RTT —— 记进该节点名下
 //!   即失真数值；连不通则记假 `-1`。判据见 [`ts_node_ready`]。
 //!
-//! **回退腿（`probe_pool_ports` 为空）无 dirty 门 —— 已知残留**：该腿唯一真测的活跃出口若已编辑未生效，
-//! 经混合口量到的同样是旧参数出口。补它需要「池未注入时也能读到运行核指纹快照」的公开只读面
-//! （`speed_probe_targets()` 在 `pool_ports` 空时返 `None`），属 `runtime/proxy.rs` 的只读面扩张，不在本批
-//! 射程。该腿本身是端口分配失败才走的降级路径（极少见），故按已知有界残留登记，不静默。
+//! 回退腿与出口伴测也从运行核快照取节点及连接身份，不依赖探针池端口。已编辑未应用的参数
+//! 不能替旧核的测量盖章；账本仍按实际测量身份判断结果是否适用于当前配置。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -2797,8 +2795,7 @@ pub async fn server_speed_test(
         ));
     };
     // 本腿经本机代理入站出网。路径由实际用的入站定：`mixed-in` 走用户的完整路由与 DNS，记
-    // `system`；`probe-proxy-in` 钉到选中出口、不经用户规则，记 `selected`。池未注入时读不到起核
-    // 指纹快照（见模块文档「已知残留」）⇒ 节点指纹留空。
+    // `system`；`probe-proxy-in` 钉到选中出口、不经用户规则，记 `selected`。
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Manual,
         targets: manual_requested,
@@ -2821,7 +2818,7 @@ pub async fn server_speed_test(
             start_time: status.start_time,
         },
         proxy.ready_main_emission_digest(gen0),
-        BTreeMap::new(),
+        proxy.speed_node_fingerprints(),
         context.clone(),
     )
     .with_core_binary_sha256(proxy.measurement_core_sha256())
@@ -4600,6 +4597,16 @@ pub(crate) fn spawn_warm_rtt_probe(
         start_time: proxy.status().start_time,
     };
     let config_digest = proxy.ready_main_emission_digest(generation);
+    let mut events = RunEvents::new(
+        &run_id,
+        &request,
+        instance,
+        config_digest,
+        proxy.speed_node_fingerprints(),
+        None,
+    )
+    .with_core_binary_sha256(proxy.measurement_core_sha256())
+    .with_connection_fingerprints(proxy.speed_measurement_fingerprints());
     tauri::async_runtime::spawn(async move {
         let network_epoch0 = proxy.network_epoch();
         let readback = Readback::open(
@@ -4644,10 +4651,7 @@ pub(crate) fn spawn_warm_rtt_probe(
                 return;
             }
             let payload = companion_result_payload(
-                &run_id,
-                &request,
-                instance,
-                config_digest,
+                &mut events,
                 &active_id,
                 latency,
                 network_epoch,
@@ -4666,12 +4670,8 @@ pub(crate) fn spawn_warm_rtt_probe(
 ///
 /// 走用户规则的伴测被规则分流到别处时（叶子出站不是选中节点），结果归属「系统路径」本身：
 /// 照常入账，但返回 `None`，不写任何节点的延迟。
-#[allow(clippy::too_many_arguments)]
 fn companion_result_payload(
-    run_id: &str,
-    request: &SpeedTestRequest,
-    instance: CoreInstance,
-    config_digest: Option<String>,
+    events: &mut RunEvents,
     active_id: &str,
     latency: u32,
     network_epoch: Option<u64>,
@@ -4688,16 +4688,7 @@ fn companion_result_payload(
         );
         SYSTEM_PATH_ID
     };
-    // 池未必在（伴测不依赖探针池）⇒ 与回退腿同一条残留：读不到起核指纹快照，节点指纹留空。
-    RunEvents::new(
-        run_id,
-        request,
-        instance,
-        config_digest,
-        BTreeMap::new(),
-        None,
-    )
-    .stamp(
+    events.stamp(
         EVENT_SPEED_TEST_RESULT,
         MeasurementEvent::Result(NodeResult::new(
             owner,

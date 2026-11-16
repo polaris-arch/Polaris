@@ -3,7 +3,7 @@ import { autoSelectTarget } from '@/domain/auto-select-target';
 import { MeasurementLabel } from '../MeasurementLabel';
 import { Fragment, useMemo, useState, type ReactElement, type ReactNode } from 'react';
 import type { SubscriptionConfig } from '@/contracts/types';
-import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
+import { defaultOpenGroupIds, groupServersBySubscription, sortServersByName } from '@/domain/server-grouping';
 import { revealSiblingGroup, useRevealAfterCommit } from '@/components/reveal';
 import { latLevel } from '@/components/screens/shared/format';
 import { sortServersByLatency } from '@/domain/server-latency-sort';
@@ -43,7 +43,7 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
     return { ...group, servers: sortByLatency ? sortServersByLatency(filtered, id => {
       const row = byId.get(id);
       return row && !row.latencyStale ? row.latencyMs : null;
-    }) : filtered };
+    }) : sortServersByName(filtered) };
   }).filter(group => group.servers.length > 0);
   const scheduleReveal = useRevealAfterCommit();
   if (shown.length === 0) return <>{autoSelectControls}<p className="h-empty">{t('mobileHome.noMatchingNode')}</p></>;

@@ -2065,6 +2065,19 @@ impl ProxyRuntime {
         }
     }
 
+    /// Measurement identity is available even when no probe-pool port was allocated.
+    pub(crate) fn speed_node_fingerprints(&self) -> BTreeMap<String, String> {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|snapshot| snapshot.dirty_fingerprints.clone())
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn speed_measurement_fingerprints(&self) -> BTreeMap<String, String> {
         self.switch_snapshot
             .read()
