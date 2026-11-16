@@ -438,7 +438,7 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
         .map(|(id, _)| id.as_str())
         .collect::<std::collections::HashSet<_>>();
 
-    let nodes = config
+    let mut nodes = config
         .get("servers")
         .and_then(serde_json::Value::as_array)
         .into_iter()
@@ -480,6 +480,38 @@ pub(crate) fn tray_menu_config_projection(config: &serde_json::Value) -> TrayMen
             })
         })
         .collect::<Vec<_>>();
+
+    // 与 WebView 节点选择器同样按名称排序：忽略大小写，数字段按数值比较。
+    // 保留稳定排序，让同名节点仍沿用原次序；不改订阅组的配置顺序。
+    nodes.sort_by(|a, b| {
+        let mut a = a.node.name.chars().flat_map(char::to_lowercase).peekable();
+        let mut b = b.node.name.chars().flat_map(char::to_lowercase).peekable();
+        loop {
+            let order = match (a.peek(), b.peek()) {
+                (Some(left), Some(right)) if left.is_ascii_digit() && right.is_ascii_digit() => {
+                    let left = a
+                        .clone()
+                        .take_while(char::is_ascii_digit)
+                        .skip_while(|digit| *digit == '0');
+                    let right = b
+                        .clone()
+                        .take_while(char::is_ascii_digit)
+                        .skip_while(|digit| *digit == '0');
+                    while a.next_if(char::is_ascii_digit).is_some() {}
+                    while b.next_if(char::is_ascii_digit).is_some() {}
+                    left.clone()
+                        .count()
+                        .cmp(&right.clone().count())
+                        .then_with(|| left.cmp(right))
+                }
+                (Some(_), Some(_)) => a.next().cmp(&b.next()),
+                _ => return a.next().cmp(&b.next()),
+            };
+            if !order.is_eq() {
+                return order;
+            }
+        }
+    });
 
     let mut manual = Vec::new();
     let mut mesh = Vec::new();

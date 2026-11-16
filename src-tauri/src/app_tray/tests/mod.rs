@@ -533,7 +533,10 @@ fn native_node_projection_builds_cascading_groups_without_losing_nodes() {
             { "id": "manual", "name": "自建", "protocol": "vless" },
             { "id": "mesh", "name": "企业 VPN", "protocol": "openconnect" },
             { "id": "orphan", "name": "孤儿", "protocol": "trojan", "subscriptionId": "gone" },
-            { "id": "sub-node", "name": "订阅节点", "protocol": "shadowsocks", "subscriptionId": "sub-a" }
+            { "id": "sub-node", "name": "订阅节点", "protocol": "shadowsocks", "subscriptionId": "sub-a" },
+            { "id": "jp10", "name": "Jp10", "protocol": "vless", "subscriptionId": "sub-a" },
+            { "id": "jp02", "name": "Jp02", "protocol": "vless", "subscriptionId": "sub-a" },
+            { "id": "jp2-masque", "name": "jp2-MASQUE", "protocol": "masque", "subscriptionId": "sub-a" }
         ]
     }));
 
@@ -548,12 +551,12 @@ fn native_node_projection_builds_cascading_groups_without_losing_nodes() {
                 label: TrayMenuGroupLabel::Manual,
                 nodes: vec![
                     TrayMenuNode {
-                        id: "manual".into(),
-                        name: "自建".into()
-                    },
-                    TrayMenuNode {
                         id: "orphan".into(),
                         name: "孤儿".into()
+                    },
+                    TrayMenuNode {
+                        id: "manual".into(),
+                        name: "自建".into()
                     },
                 ],
             },
@@ -566,10 +569,24 @@ fn native_node_projection_builds_cascading_groups_without_losing_nodes() {
             },
             TrayMenuGroup {
                 label: TrayMenuGroupLabel::Subscription("订阅 A&B".into()),
-                nodes: vec![TrayMenuNode {
-                    id: "sub-node".into(),
-                    name: "订阅节点".into()
-                }],
+                nodes: vec![
+                    TrayMenuNode {
+                        id: "jp02".into(),
+                        name: "Jp02".into()
+                    },
+                    TrayMenuNode {
+                        id: "jp2-masque".into(),
+                        name: "jp2-MASQUE".into()
+                    },
+                    TrayMenuNode {
+                        id: "jp10".into(),
+                        name: "Jp10".into()
+                    },
+                    TrayMenuNode {
+                        id: "sub-node".into(),
+                        name: "订阅节点".into()
+                    },
+                ],
             },
         ],
         "原生菜单须按自建、组网、订阅顺序级联，并保留孤儿节点；空订阅不显示"
