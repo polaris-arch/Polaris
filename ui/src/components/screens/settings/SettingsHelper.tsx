@@ -351,14 +351,14 @@ export default function SettingsHelper() {
             <div data-testid="helper-install-failure" className="helper-state">
               <FeedbackNotice title={t('helper.installFail')} detail={helperActionErrorText(installFailure, t)}
                 hint={t(shellPlatformFromDataOs() === 'lin' ? 'helper.linuxForwardOnlyRecovery' : 'helper.failureNextStep')} announce={false} actions={<>
-              {/* Recovery remains status-only. States already exposing recheck below
-                  keep their single action; none/repair/upgrade failures need it here. */}
+              {/* Recovery remains status-only. States already exposing recheck or
+                  stop-and-upgrade below keep that single action; others need it here. */}
               {!['checking', 'installed', 'cleanup-pending', 'needs-btm', 'admission-unavailable'].includes(state) && (
                 <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}>
                   <span>{t('helper.recheck')}</span>
                 </Button>
               )}
-              {migrationAvailable && (
+              {migrationAvailable && !['none', 'needs-upgrade', 'needs-core', 'needs-repair'].includes(state) && (
                 <Button size="sm" className="danger" disabled={busy} onClick={stopAndUpgrade}>
                   {t('helper.stopAndUpgradeAction')}
                 </Button>
