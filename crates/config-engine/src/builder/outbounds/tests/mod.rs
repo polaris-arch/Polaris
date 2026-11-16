@@ -1286,18 +1286,20 @@ fn on_demand_reaches_every_endpoint_leg() {
             "{name}：on_demand 在序列化后丢了"
         );
 
-        // ② 未设置 ⇒ **一个键都不发**（与本字段出现之前逐字节等价）。
+        // ② 未设置 ⇒ **一个键都不发**（与本字段出现之前逐字节等价）；非组网 MASQUE 缺省按需。
+        let expected = (protocol == Protocol::MasqueClient).then_some(true);
         let result = build_single(endpoint_node_for(protocol, None));
         let ep = result
             .pending_endpoints
             .iter()
             .find(|e| e.tag == "E1")
             .unwrap();
-        assert_eq!(ep.on_demand, None, "{name}：未设置却发了 on_demand");
+        assert_eq!(ep.on_demand, expected, "{name}：未设置时 on_demand 不符");
         let json = serde_json::to_value(ep).unwrap();
-        assert!(
-            json.get("on_demand").is_none(),
-            "{name}：未设置却在 JSON 里出现 on_demand —— 会改动金样字节"
+        assert_eq!(
+            json.get("on_demand"),
+            expected.map(serde_json::Value::Bool).as_ref(),
+            "{name}：未设置时 JSON 里的 on_demand 不符 —— 会改动金样字节"
         );
     }
 }

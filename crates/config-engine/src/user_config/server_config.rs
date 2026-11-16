@@ -638,7 +638,7 @@ pub struct ServerConfig {
     ///
     /// `None` ⇒ 不下发该键 ⇒ 内核默认 `false` ⇒ 与本字段出现之前逐字节等价（金样零 delta）。
     /// 默认不开是有意的：开启会改变「节点状态角标」与 Taildrop 的语义（挂起中的节点不在 tailnet 上），
-    /// 默认开等于给存量用户换语义。
+    /// 默认开等于给存量用户换语义。例外是非组网 MASQUE：`None` 时按 `true` 下发（见 `builder::outbounds`）。
     #[serde(rename = "onDemand", skip_serializing_if = "Option::is_none")]
     pub on_demand: Option<bool>,
     /// 用户声明的「经该节点可达的内网段」（CIDR）。**仅 [`declares_mesh_routes`] 命中的 endpoint 腿

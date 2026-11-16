@@ -22,7 +22,7 @@ use crate::user_config::dns_constants::{
     is_block_selection, is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
 };
 use crate::user_config::log_level::LogLevel;
-use crate::user_config::server_config::{lands_in_endpoints, Protocol, ServerConfig};
+use crate::user_config::server_config::{is_mesh_node, lands_in_endpoints, Protocol, ServerConfig};
 
 /// 「detour 级联剔除」的 reason 判别符（`InvalidNodeInfo.reason` 的稳定机器 token）。
 ///
@@ -593,6 +593,12 @@ pub fn build_outbounds_with_runtime_bindings(
                 Ok(mut endpoint) => {
                     apply_bind_interface(&mut endpoint.extra, bind_interface.as_deref());
                     apply_on_demand(&mut endpoint, server);
+                    // 未设置时 MASQUE 缺省按需：内核只让被选择器选中的成员保持会话，其余挂起、
+                    // 首笔流量再建，免得每次起核为全部节点建 HTTP/3 会话、对不可达节点反复重试。
+                    // 组网节点保持常连，其网段与状态上报依赖已建立的隧道。
+                    if server.on_demand.is_none() && !is_mesh_node(server) {
+                        endpoint.on_demand = Some(true);
+                    }
                     pending_endpoints.push(endpoint);
                     node_tags.push(tag);
                 }
