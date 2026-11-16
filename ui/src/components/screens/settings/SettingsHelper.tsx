@@ -359,7 +359,7 @@ export default function SettingsHelper() {
                 </Button>
               )}
               {migrationAvailable && (
-                <Button variant="ghost" size="sm" disabled={busy} onClick={stopAndUpgrade}>
+                <Button size="sm" className="danger" disabled={busy} onClick={stopAndUpgrade}>
                   {t('helper.stopAndUpgradeAction')}
                 </Button>
               )}

@@ -1880,6 +1880,9 @@ body:has(.pending-bar.show) #toast-stack{
 .feedback-notice-hint{ margin:6px 0 0; font-size:11.5px; line-height:1.55; color:hsl(var(--fg-dim)); }
 .feedback-notice-actions{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
 .feedback-notice-actions .btn{ max-width:100%; height:auto; min-height:28px; white-space:normal; text-align:start; }
+/* Transparent ghost buttons vanish into the tinted notice; give them the card surface and the notice tone. */
+.feedback-notice-actions .btn.ghost{ background:hsl(var(--surface)); border-color:hsl(var(--err)/.45); color:hsl(var(--err)); }
+.feedback-notice-actions .btn.ghost:hover{ background:hsl(var(--err)/.1); }
 
 /* A dismissible diagnostic keeps its full detail scrollable without pushing the
    close button outside the viewport. Ordinary short notifications are unchanged. */
@@ -1896,6 +1899,8 @@ body:has(.pending-bar.show) #toast-stack{
 :root[data-theme="dark"] .toast.warn{ background:hsl(var(--warn-weak)); color:hsl(var(--warn)); border-color:hsl(var(--warn)/.35); }
 .feedback-notice.warning{ background:hsl(var(--warn-weak)); border-color:hsl(var(--warn)/.3); }
 .feedback-notice.warning .feedback-notice-title{ color:hsl(var(--warn)); }
+.feedback-notice.warning .feedback-notice-actions .btn.ghost{ border-color:hsl(var(--warn)/.45); color:hsl(var(--warn)); }
+.feedback-notice.warning .feedback-notice-actions .btn.ghost:hover{ background:hsl(var(--warn)/.1); }
 #core-info-card .sr-ctl{ min-width:0; max-width:62%; font-size:13px; line-height:1.5; text-align:end; overflow-wrap:anywhere; }
 .core-admission{ display:grid; gap:12px; margin-bottom:14px; }
 .core-card-note{ margin:12px 0 0; line-height:1.55; }

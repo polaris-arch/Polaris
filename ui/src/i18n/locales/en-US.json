@@ -87,7 +87,7 @@
     "linuxStopAndUpgradeTitle": "Stop Linux Helper and upgrade?",
     "linuxStopAndUpgradeWarning": "This attempts to stop connections managed by polaris-helper.service, including other app sessions, and install the selected package. Unverified ownership or network restoration blocks maintenance. A failure after Helper is disabled may leave it disabled until Repair. Connections are not automatically restarted. Other proxy or VPN sessions may remain active.",
     "linuxForwardOnlyRecovery": "Legacy maintenance may have left Helper disabled. Use Repair with the selected package and inspect the logs if ownership or network restoration remains unverified. Other proxy or VPN sessions may still be active.",
-    "stopAndUpgradeAction": "Stop connections and upgrade…",
+    "stopAndUpgradeAction": "Stop connections and upgrade",
     "stopAndUpgradeTitle": "Stop com.polaris.helper and upgrade?",
     "stopAndUpgradeWarning": "This will stop com.polaris.helper and all connections it manages, including connections from other app sessions. Those connections will be interrupted. Polaris will then request administrator authorization to upgrade the helper. Continue only if you agree to stop all of these connections.",
     "stopAndUpgradeConfirm": "Stop all managed connections and upgrade",

@@ -87,7 +87,7 @@
     "linuxStopAndUpgradeTitle": "停止 Linux Helper 并升级？",
     "linuxStopAndUpgradeWarning": "此操作会尝试停止 polaris-helper.service 管理的连接（包括其他应用会话），并安装当前选定的软件包。无法确认归属或网络恢复时会中止维护。Helper 停用后的失败可能使其继续停用，需要执行“修复”。连接不会自动重启；其他代理或 VPN 会话可能仍在运行。",
     "linuxForwardOnlyRecovery": "旧版维护可能使 Helper 保持停用。请使用当前选定的软件包执行“修复”；若归属或网络恢复仍未确认，请查看日志。其他代理或 VPN 会话可能仍在运行。",
-    "stopAndUpgradeAction": "停止连接并升级…",
+    "stopAndUpgradeAction": "停止连接并升级",
     "stopAndUpgradeTitle": "停止 com.polaris.helper 并升级？",
     "stopAndUpgradeWarning": "这会停止 com.polaris.helper 及其管理的所有连接，包括其他应用会话的连接。这些连接将被中断，随后 Polaris 会请求管理员授权以升级助手。只有同意停止上述所有连接时才继续。",
     "stopAndUpgradeConfirm": "停止所有受管连接并升级",
