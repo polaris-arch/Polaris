@@ -371,7 +371,7 @@ impl VerifiedCore {
         }
         self.admitted
             .as_ref()
-            .ok_or_else(|| invalid("no compiled execution admission"))?
+            .ok_or_else(|| invalid("no installed execution admission"))?
             .prepare(purpose)
             .map_err(Into::into)
     }
@@ -847,9 +847,9 @@ impl CoreStore {
     }
 
     pub fn verify_for_start(&self, id: &CoreId) -> io::Result<VerifiedCore> {
-        use polaris_core_supervisor::admitted_payload::UntrustedPayload;
-        #[cfg(not(target_os = "macos"))]
-        use polaris_core_supervisor::admitted_payload::{admit_selected, ExecPurpose};
+        use polaris_core_supervisor::admitted_payload::{
+            admit_installed_helper_main, UntrustedPayload,
+        };
         #[cfg(target_os = "macos")]
         let _mutation = self
             .lock_store_mutation()
@@ -862,12 +862,8 @@ impl CoreStore {
         } else {
             "sing-box"
         });
-        #[cfg(target_os = "macos")]
-        let admission = polaris_core_supervisor::admitted_payload::admit_macos_root_helper_main(
-            UntrustedPayload::bundled(binary),
-        );
-        #[cfg(not(target_os = "macos"))]
-        let admission = admit_selected(UntrustedPayload::bundled(binary), ExecPurpose::RunMain);
+        let admission =
+            admit_installed_helper_main(UntrustedPayload::bundled(binary), &core.manifest.core);
         let admitted = admission.map_err(|mut error| {
             use polaris_core_supervisor::admitted_payload::{AdmissionErrorKind, RecoveryAction};
             if matches!(
@@ -881,7 +877,7 @@ impl CoreStore {
             io::Error::from(error)
         })?;
         if admitted.id() != id {
-            return Err(invalid("compiled core selection differs"));
+            return Err(invalid("installed core selection differs"));
         }
         #[cfg(target_os = "macos")]
         {

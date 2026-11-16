@@ -418,7 +418,7 @@ fn protect_root_members(
     {
         return Err(rejected(
             AdmissionErrorKind::UnsupportedCapability,
-            "only compiled root Helper RunMain is admitted",
+            "only installed root Helper RunMain is admitted",
         ));
     }
     let directory = input
@@ -433,7 +433,7 @@ fn protect_root_members(
     {
         return Err(rejected(
             AdmissionErrorKind::Mismatch,
-            "execution input is not the compiled CoreStore selection",
+            "execution input is not the installed CoreStore selection",
         ));
     }
     let store = versions
@@ -453,7 +453,7 @@ fn protect_root_members(
     if expected.name != "sing-box" {
         return Err(rejected(
             AdmissionErrorKind::Mismatch,
-            "unexpected compiled member",
+            "unexpected installed member",
         ));
     }
     let mut output = File::from(

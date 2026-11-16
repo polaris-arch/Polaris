@@ -124,6 +124,9 @@ fn same_id_fixture_body() {
         InstallOutcome::AlreadyPresent
     );
     let id = CoreId::parse(&manifest.id).unwrap();
+    #[cfg(target_os = "linux")]
+    let verified = store.verify_for_start(&id).unwrap();
+    #[cfg(not(target_os = "linux"))]
     let verified = store.verify_objects(&id, true).unwrap();
     assert_eq!(verified.manifest.id, manifest.id);
     fs::write(
@@ -135,6 +138,8 @@ fn same_id_fixture_body() {
     )
     .unwrap();
     assert!(store.verify_objects(&id, true).is_err());
+    #[cfg(target_os = "linux")]
+    assert!(store.verify_for_start(&id).is_err());
     // A damaged active version cannot be replaced beneath a held lazy-sidecar lease.
     assert!(store
         .install(&manifest, source.path(), Some(uid), None)

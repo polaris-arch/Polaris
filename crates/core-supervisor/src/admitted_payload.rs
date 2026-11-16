@@ -342,23 +342,49 @@ pub fn admit_selected(
         SelectedPolicy::compiled,
     )
 }
-/// The existing privileged Helper's RunMain entry. Input paths are still data:
-/// the provider requires actual root credentials, a protected CoreStore chain,
-/// the compiled id and a fresh, private, independently copied execution cohort.
-#[cfg(target_os = "macos")]
-pub fn admit_macos_root_helper_main(
-    mut input: UntrustedPayload,
+/// The Helper's RunMain entry after CoreStore has verified the protected
+/// installation record and acquired its version lease. Only the administrator
+/// installer may publish that record; callers must never supply an App manifest.
+/// The provider still verifies the exact bytes and owns the execution objects.
+pub fn admit_installed_helper_main(
+    input: UntrustedPayload,
+    manifest: &CoreManifest,
 ) -> Result<Arc<AdmittedPayload>, AdmissionError> {
+    #[cfg(target_os = "macos")]
     macos::require_root().map_err(|mut error| {
         error.purpose = Some(ExecPurpose::RunMain);
         error
     })?;
-    input.root_helper = true;
+    #[cfg(target_os = "macos")]
+    let input = UntrustedPayload {
+        root_helper: true,
+        ..input
+    };
     admit_locked(
         SLOT.get_or_init(Default::default),
         input,
         ExecPurpose::RunMain,
-        SelectedPolicy::compiled,
+        || {
+            let platform = crate::selected_core::current_platform()
+                .map_err(|e| AdmissionError::new(AdmissionErrorKind::UnsupportedExactObject, e))?;
+            if manifest.platform != platform {
+                return Err(AdmissionError::new(
+                    AdmissionErrorKind::Mismatch,
+                    "installed core platform differs",
+                ));
+            }
+            let id = manifest
+                .id(sha256_hex)
+                .map_err(|e| AdmissionError::new(AdmissionErrorKind::Mismatch, e))?;
+            Ok(SelectedPolicy {
+                manifest: manifest.clone(),
+                id,
+                // Installation records bind content, not source provenance.
+                // Do not attribute another Core to this Helper's build.
+                source: String::new(),
+                tree: String::new(),
+            })
+        },
     )
 }
 
@@ -385,8 +411,12 @@ fn admit_into(
     purpose: ExecPurpose,
     load: impl FnOnce() -> Result<SelectedPolicy, AdmissionError>,
 ) -> Result<Arc<AdmittedPayload>, AdmissionError> {
+    let policy = load();
     if let Some(payload) = slot.as_ref() {
         if payload.candidate.binary == input.binary
+            && policy
+                .as_ref()
+                .is_ok_and(|policy| payload.id() == &policy.id)
             && {
                 #[cfg(target_os = "macos")]
                 {
@@ -406,7 +436,7 @@ fn admit_into(
         old.retired
             .store(true, std::sync::atomic::Ordering::Release);
     }
-    let policy = load()?;
+    let policy = policy?;
     let protected = platform::protect_members(&input, &policy)?;
     let payload = Arc::new(AdmittedPayload {
         policy,

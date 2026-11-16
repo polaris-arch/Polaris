@@ -124,13 +124,22 @@ fn warm_issue_reuses_same_protected_cohort_and_changed_source_evicts_before_fail
     );
     for _ in 0..30 {
         let next = admit_into(&mut slot, input.clone(), ExecPurpose::RunMain, || {
-            panic!("warm cohort reconstructed")
+            Ok(original.policy.clone())
         })
         .unwrap();
         assert!(Arc::ptr_eq(&first, &next));
         next.prepare(ExecPurpose::RunMain).unwrap();
         assert_eq!(next.protected.counters(), cold);
     }
+    let mut changed = original.policy.clone();
+    changed.manifest.version = "another-installed-core".into();
+    changed.id = changed.manifest.id(sha256_hex).unwrap();
+    let next = admit_into(&mut slot, input.clone(), ExecPurpose::RunMain, || {
+        Ok(changed)
+    })
+    .unwrap();
+    assert_ne!(first.id(), next.id());
+    assert!(first.prepare(ExecPurpose::RunMain).is_err());
     std::fs::write(&input.binary, b"#!/bin/sh\necho replaced\n").unwrap();
     let error = admit_into(&mut slot, input, ExecPurpose::RunMain, || {
         Ok(original.policy.clone())
@@ -142,6 +151,7 @@ fn warm_issue_reuses_same_protected_cohort_and_changed_source_evicts_before_fail
         "failed replacement must not lend old cohort"
     );
     assert!(first.prepare(ExecPurpose::RunMain).is_err());
+    assert!(next.prepare(ExecPurpose::RunMain).is_err());
 }
 
 #[tokio::test]
@@ -218,11 +228,16 @@ async fn validation_rejects_wrong_purpose_before_birth() {
 #[test]
 fn compiled_selection_never_accepts_foreign_same_named_files_or_disk_manifest() {
     let payload = fixture(b"#!/bin/sh\nexit 0\n");
+    let installed =
+        admit_installed_helper_main(payload.candidate.clone(), &payload.policy.manifest).unwrap();
+    assert_eq!(installed.id(), payload.id());
+    assert!(installed.source_commit().is_empty());
     let error = admit_selected(payload.candidate.clone(), ExecPurpose::RunMain).unwrap_err();
     assert!(matches!(
         error.kind,
         AdmissionErrorKind::Mismatch | AdmissionErrorKind::UnsupportedCapability
     ));
+    assert!(installed.prepare(ExecPurpose::RunMain).is_err());
     let error = admit_selected(
         UntrustedPayload::bundled("/nonexistent-selected/sing-box"),
         ExecPurpose::RunMain,
@@ -635,27 +650,20 @@ fn interrupted_copy_cannot_publish_partial_authority_and_clean_retry_rehashes_on
 
 #[test]
 fn concurrent_cold_requests_use_the_same_single_flight_and_one_complete_hash_per_member() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let original = fixture(b"#!/bin/sh\nexit 0\n");
     let slot = Arc::new(Mutex::new(None));
     let barrier = Arc::new(std::sync::Barrier::new(4));
-    let cold = Arc::new(AtomicUsize::new(0));
     let threads = (0..4)
         .map(|_| {
-            let (slot, barrier, cold, input, policy) = (
+            let (slot, barrier, input, policy) = (
                 slot.clone(),
                 barrier.clone(),
-                cold.clone(),
                 original.candidate.clone(),
                 original.policy.clone(),
             );
             std::thread::spawn(move || {
                 barrier.wait();
-                admit_locked(&slot, input, ExecPurpose::RunMain, || {
-                    cold.fetch_add(1, Ordering::SeqCst);
-                    Ok(policy)
-                })
-                .unwrap()
+                admit_locked(&slot, input, ExecPurpose::RunMain, || Ok(policy)).unwrap()
             })
         })
         .collect::<Vec<_>>();
@@ -663,7 +671,6 @@ fn concurrent_cold_requests_use_the_same_single_flight_and_one_complete_hash_per
         .into_iter()
         .map(|t| t.join().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(cold.load(Ordering::SeqCst), 1);
     assert!(owners.iter().all(|owner| Arc::ptr_eq(owner, &owners[0])));
     assert_eq!(owners[0].protected.counters().0, 2);
     assert_eq!(owners[0].protected.counters().2, 2);

@@ -330,9 +330,11 @@ pub mod proto_version {
     /// resource loading on Windows. Older v4 builds did not all contain that fix.
     /// v6 requires SYSTEM-owned Windows pipes with client-only Interactive access,
     /// so ordinary App processes can authenticate without opening a SYSTEM token.
+    /// v7 admits installed Core content from protected installation records,
+    /// allowing compatible Helpers to run a Core newer than their own build.
     /// Future mandatory helper behavior/security changes must advance this value;
     /// new App builds or Core payloads alone must not.
-    pub const CURRENT: u32 = 6;
+    pub const CURRENT: u32 = 7;
 }
 
 /// 当前安装包内 app/helper 的共同构建身份。

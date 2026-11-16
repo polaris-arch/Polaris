@@ -35,9 +35,12 @@ fn expected(bytes: &[u8]) -> polaris_helper_proto::core_manifest::CoreFile {
 fn root_scope_cannot_be_selected_by_an_ordinary_process() {
     if require_root().is_err() {
         assert_eq!(
-            admit_macos_root_helper_main(UntrustedPayload::bundled("/missing/sing-box"))
-                .unwrap_err()
-                .kind,
+            admit_installed_helper_main(
+                UntrustedPayload::bundled("/missing/sing-box"),
+                &SelectedPolicy::compiled().unwrap().manifest,
+            )
+            .unwrap_err()
+            .kind,
             AdmissionErrorKind::UnsupportedExactObject
         );
     }
