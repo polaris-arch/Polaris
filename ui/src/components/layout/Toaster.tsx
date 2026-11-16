@@ -41,6 +41,8 @@
  * 两条形态约束由 `toast-queue.ts` 钉死，不在本组件复刻：① 带 actions 的 toast **一定有出路**
  * （`autoDismissMs` 让 actions 压过 sticky，返回有限停留）；② 停留时长明显长于 2.2s（否则按钮点不到）。
  * 本组件只负责渲染动作与关闭按钮，并把该条的 `pointer-events` 收回来（栈整体是 none，不然按钮点不着）。
+ * 点了动作即关掉该条：用户已经看到并处理了它，不该再等停留时长耗尽。动作若同步以同 key 再报，
+ * upsert 换了新 id，按旧 id 的离场移除不会误伤新条。
  * 样式落在 `styles/index.css`（`prototype.css`/`components.css` 是冻结原型，禁改）。
  * 判定全在 `toast-queue.ts`（纯逻辑，可单测——本组件在 node 环境的 vitest 里测不了）；
  * 「持续状态该 sticky」与 `SettingsTun.tsx:164`「一次性通知不该用 toast 承载常驻风险」为何不冲突，
@@ -199,7 +201,10 @@ export function Toaster() {
                   key={action.label}
                   type="button"
                   className="toast-action"
-                  onClick={action.onClick}
+                  onClick={() => {
+                    dismiss(it.id);
+                    action.onClick();
+                  }}
                 >
                   {action.label}
                 </button>
