@@ -450,6 +450,11 @@ fn systemctl(args: &[&str]) -> io::Result<String> {
 fn property(key: &str) -> io::Result<String> {
     let argument = format!("--property={key}");
     let raw = systemctl(&["--system", "show", "--all", &argument, SERVICE])?;
+    // systemd 259 prints no record for an empty exec/list property (ExecStartPre,
+    // EnvironmentFiles, ...) even with --all; that absence is the empty value.
+    if raw.is_empty() {
+        return Ok(raw);
+    }
     let line = raw.strip_suffix('\n').unwrap_or(&raw);
     require(
         !line.contains(['\n', '\r']) && line.starts_with(&format!("{key}=")),
