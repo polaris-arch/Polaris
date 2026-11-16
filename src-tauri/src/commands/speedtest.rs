@@ -78,6 +78,7 @@ use polaris_config_engine::builder::level_to_string;
 use polaris_config_engine::builder::outbounds::effective_proxy_bind_interface;
 use polaris_config_engine::singbox::InboundUser;
 use polaris_config_engine::user_config::app_config::UserConfig;
+use polaris_config_engine::user_config::dns_constants::DIRECT_TAG;
 use polaris_config_engine::user_config::proxy_ports::control_api_port;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_config_engine::user_config::LogLevel;
@@ -4003,7 +4004,7 @@ where
         superseded,
         cancel,
         network_epoch,
-        select_slot,
+        &select_slot,
         measure,
         emit,
         pool_ports,
@@ -4015,6 +4016,11 @@ where
     // 终态发出之前，读回用的连接事件流已经关闭。
     readback.close().await;
     emit_speed_test_done(emit, outcome_of(reason), &results, &intended, reason);
+    // 槽交回 direct：按需连接的端点只在被选中时保持会话，槽停在被测节点上会让它一直连着
+    // （不可达的还一直重试），直到下一轮或内核重启。失败无害：槽本就只在测速时被换选。
+    let slots = waves.iter().map(Vec::len).max().unwrap_or(0);
+    futures::future::join_all((0..slots).map(|slot| select_slot(slot, DIRECT_TAG.to_owned())))
+        .await;
     (results, reason)
 }
 
