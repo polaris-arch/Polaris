@@ -433,8 +433,8 @@ fn same_protocol_with_different_build_identity_does_not_force_a_helper_replaceme
 }
 
 #[test]
-fn old_v2_helper_is_not_runtime_ready_and_offers_real_upgrade() {
-    for version in [0, 1, 2] {
+fn older_helpers_offer_real_upgrade_without_treating_compatible_versions_as_damaged() {
+    for version in [0, 1, 2, 5] {
         let paths = InstallPaths::mac();
         let mut sysops = MockSysOps::default();
         sysops.exists_paths.insert(paths.binary.clone());
@@ -452,9 +452,9 @@ fn old_v2_helper_is_not_runtime_ready_and_offers_real_upgrade() {
             Platform::Mac,
             "TOK",
         ));
-        assert!(!status.ready);
+        assert_eq!(status.ready, version >= MIN_USABLE_PROTO);
         assert!(status.upgradeable);
-        assert!(status.needs_repair);
+        assert_eq!(status.needs_repair, version < MIN_USABLE_PROTO);
     }
 }
 

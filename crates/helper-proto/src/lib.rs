@@ -328,9 +328,11 @@ pub mod proto_version {
     pub const MIN_EXPLICIT_RUNTIME_DIRECTORY: u32 = 4;
     /// v5 establishes the reusable-helper baseline, including held DOS-path
     /// resource loading on Windows. Older v4 builds did not all contain that fix.
+    /// v6 requires SYSTEM-owned Windows pipes with client-only Interactive access,
+    /// so ordinary App processes can authenticate without opening a SYSTEM token.
     /// Future mandatory helper behavior/security changes must advance this value;
     /// new App builds or Core payloads alone must not.
-    pub const CURRENT: u32 = 5;
+    pub const CURRENT: u32 = 6;
 }
 
 /// 当前安装包内 app/helper 的共同构建身份。
