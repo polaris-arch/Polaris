@@ -1242,6 +1242,7 @@ impl HelperRuntime {
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
         }
+        let started = std::time::Instant::now();
         let (mut params, _stage) = match self.install_params() {
             Ok(p) => p,
             Err(e) => {
@@ -1259,6 +1260,7 @@ impl HelperRuntime {
             }
         };
         params.linux_legacy_original_proxy = original;
+        let staged = started.elapsed();
         if let Err(error) = self.register_core_mutation() {
             log::warn!("helper install mutation preflight failed: {error}");
             return self.action_failed(HelperActionErrorCode::Failed, error);
@@ -1266,6 +1268,7 @@ impl HelperRuntime {
         let manager = self.manager();
         match manager.install_with_mode(&params, &StdExecutor, mode.manager_mode()) {
             Ok(EscalationOutcome::Success) => {
+                let elevated = started.elapsed();
                 // Service readiness and this App's installed content id are
                 // separate receipts, including when a newer helper is retained.
                 let mut status = match self.build_client() {
@@ -1275,6 +1278,13 @@ impl HelperRuntime {
                     ),
                     Err(_) => self.status(),
                 };
+                log::info!(
+                    "helper 安装耗时：暂存={}ms 提权安装={}ms 就绪={}ms（暂存含内核={}）",
+                    staged.as_millis(),
+                    (elevated - staged).as_millis(),
+                    (started.elapsed() - elevated).as_millis(),
+                    params.bundled_core.exists()
+                );
                 self.apply_selected_core_status(&mut status);
                 if helper_install_reached_expected_build(&status) {
                     HelperActionResult {
@@ -1444,6 +1454,17 @@ impl HelperRuntime {
         // manifest while copying into a private stage. A damaged package is
         // rejected; repairing it requires reinstalling the App.
         let bundled_core = crate::runtime::proxy::resolve_core_candidate()?;
+        // A Helper reporting this exact Core as stored is upgraded without
+        // restaging it; any other answer, including no Helper, stages it in full.
+        let core = match self.core_status() {
+            Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. }) => false,
+            Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid { reason, .. }) => {
+                reason
+                    != polaris_core_supervisor::admitted_payload::AdmissionErrorKind::UnsupportedExactObject
+                        .status_token()
+            }
+            _ => true,
+        };
         let stage = crate::runtime::core_identity::stage_installation(
             &bundled_core,
             &src_binary,
@@ -1451,6 +1472,7 @@ impl HelperRuntime {
             &crate::runtime::core_identity::selected_manifest(
                 crate::runtime::core_identity::current_platform()?,
             )?,
+            core,
         )?;
         #[cfg(windows)]
         let user_identity = polaris_helper::platform::windows::native_caller::current_user()

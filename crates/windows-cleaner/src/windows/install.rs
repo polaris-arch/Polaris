@@ -536,6 +536,11 @@ impl Source {
                 (IMAGE_NAME, request.cleaner_sha256.as_str(), None),
             ])
         {
+            // Core members are absent when the Helper already stores this
+            // exact Core; core-install then keeps it and never reads them.
+            if bytes.is_some() && !entry_present(&path.join(name))? {
+                continue;
+            }
             let file = child(chain.last(), OsStr::new(name), false, false, null_mut())?;
             security(&file, Some(&request.original_sid), false)?;
             if hash(&file)? != expected
@@ -692,6 +697,7 @@ pub fn launch_install(mut request: Request) -> io::Result<InstallOutcome> {
     execute.lpFile = executable.as_ptr();
     execute.lpParameters = args.as_ptr();
     execute.nShow = SW_HIDE;
+    let started = std::time::Instant::now();
     let result = if unsafe { ShellExecuteExW(&mut execute) } == 0 {
         let e = io::Error::last_os_error();
         if e.raw_os_error() == Some(ERROR_CANCELLED as i32) {
@@ -705,11 +711,18 @@ pub fn launch_install(mut request: Request) -> io::Result<InstallOutcome> {
         std::mem::forget((source, image, request_chain, request_file, created));
         return Ok(InstallOutcome::Completed(87));
     } else {
+        // NOASYNC returns once the elevated worker exists, i.e. after consent.
+        let consented = started.elapsed();
         let process = OwnedHandle(execute.hProcess);
         if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
             std::mem::forget((process, source, image, request_chain, request_file, created));
             return Ok(InstallOutcome::Completed(87));
         }
+        log::info!(
+            "native installation timing: consent={}ms worker={}ms",
+            consented.as_millis(),
+            (started.elapsed() - consented).as_millis()
+        );
         let mut code = 0;
         if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
             Ok(InstallOutcome::Completed(87))

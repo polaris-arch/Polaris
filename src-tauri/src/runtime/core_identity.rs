@@ -116,11 +116,14 @@ impl Drop for InstallStage {
 
 /// Private, bounded, complete copy for the explicit administrator transaction.
 /// Start/status never invokes this function and never transports payload bytes.
+/// Without `core`, the Core members stay out of the stage: the running Helper
+/// already holds this exact Core, and core-install keeps it without reading.
 pub(crate) fn stage_installation(
     binary: &Path,
     helper: &Path,
     config: &Path,
     selected: &CoreManifest,
+    core: bool,
 ) -> Result<InstallStage, String> {
     use polaris_helper_proto::core_manifest::InstalledCoreManifest;
     #[cfg(unix)]
@@ -138,7 +141,9 @@ pub(crate) fn stage_installation(
     if helper.parent() != Some(source) {
         return Err("CORE_BUNDLE_MISMATCH: helper belongs to another payload".into());
     }
-    verify_directory(source, selected)?;
+    if core {
+        verify_directory(source, selected)?;
+    }
     let helper_name = if platform == "win" {
         "polaris-helper.exe"
     } else {
@@ -203,6 +208,7 @@ pub(crate) fn stage_installation(
     for (name, expected_bytes, expected_hash) in selected
         .files
         .iter()
+        .filter(|_| core)
         .map(|file| (file.name.as_str(), Some(file.bytes), file.sha256.as_str()))
         .chain(std::iter::once((helper_name, None, expected_helper)))
         .chain(cleaner)
