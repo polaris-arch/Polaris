@@ -265,6 +265,20 @@ async fn absolute_deadline_covers_initial_dns_guard() {
     )
     .await;
     assert_eq!(result.unwrap_err().reason, SafeFetchRejectReason::Timeout);
+
+    // DNS 与响应已就绪、期限也已到达时，结果不能抢在超时前被接受。
+    let result = safe_redirect_fetch_until(
+        opts(
+            &fetch,
+            &MockLookup {
+                private: HashMap::new(),
+            },
+            "https://ready-dns.example/sub",
+        ),
+        Instant::now(),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().reason, SafeFetchRejectReason::Timeout);
 }
 
 struct SlowRedirectFetch {

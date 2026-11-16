@@ -199,15 +199,19 @@ pub async fn safe_redirect_fetch_until<H: HttpClient, L: DnsLookup>(
         .timeout_ms
         .map(|ms| Instant::now() + std::time::Duration::from_millis(ms));
     let deadline = configured.map_or(deadline, |d| d.min(deadline));
-    tokio::time::timeout_at(
+    match tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
         safe_redirect_fetch_inner(opts, Some(deadline)),
     )
     .await
-    .map_err(|_| SafeFetchError {
-        reason: SafeFetchRejectReason::Timeout,
-        message: "request timeout: absolute network deadline exceeded".to_string(),
-    })?
+    {
+        // timeout_at 优先轮询响应；两者同时就绪时仍须遵守调用方的绝对期限。
+        Ok(result) if Instant::now() < deadline => result,
+        _ => Err(SafeFetchError {
+            reason: SafeFetchRejectReason::Timeout,
+            message: "request timeout: absolute network deadline exceeded".to_string(),
+        }),
+    }
 }
 
 async fn safe_redirect_fetch_inner<H: HttpClient, L: DnsLookup>(
