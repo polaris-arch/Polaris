@@ -237,6 +237,25 @@ it('a responding channel alone does not claim service files are installed', asyn
   expect(text(render())).not.toContain('helper.statusInstalled');
 });
 
+it('an outdated Helper rejecting the selected Core still offers the normal explicit upgrade', async () => {
+  const outdated = { ...installed, ready: false, upgradeable: true, version: 6, expectedProtocolVersion: 7,
+    selectedCore: { state: 'unavailable', admission: 'UnsupportedExactObject' } };
+  vi.mocked(helperApi.getStatus).mockResolvedValue(outdated as never);
+  render(); h.cleanup = h.effect!();
+  await vi.waitFor(() => expect(h.state[1]).toBe('needs-upgrade'));
+  expect(helperApi.install).not.toHaveBeenCalled();
+  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, errorCode: 'cancelled', status: outdated } as never);
+  click('helper.upgradeHelperAction');
+  await vi.waitFor(() => expect(h.state[3]).toBe('cancelled'));
+  expect(helperApi.install).toHaveBeenCalledExactlyOnceWith();
+  expect(h.state[1]).toBe('needs-upgrade');
+  // Cleanup debt still takes priority over a required upgrade after status refresh.
+  h.refs[0].current = true;
+  h.refresh!();
+  await vi.waitFor(() => expect(h.state[1]).toBe('cleanup-pending'));
+  expect(helperApi.install).toHaveBeenCalledTimes(1);
+});
+
 it.each(['UnsupportedExactObject','UnsupportedCapability','LoaderPolicy','Busy','Unknown','Io'] as const)('typed %s unavailability never offers ineffective repair', async admission => {
   const selectedCore={id:'a'.repeat(64),providerFingerprint:'b'.repeat(64),version:'selected-friendly-version',state:'unavailable',admission};
   vi.mocked(helperApi.getStatus).mockResolvedValue({...installed,ready:false,selectedCore} as never);

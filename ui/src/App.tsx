@@ -38,7 +38,6 @@ import { subscribeSpeedTestProgressToast } from './lib/speedtest-progress-toast'
 import { useSystemProxyLivePolling } from './store/use-system-proxy-live';
 import { api } from './ipc';
 import { helperApi, unlockApi } from './ipc/api-client';
-import { coreAdmissionIsDamage } from './domain/core-admission';
 import { toast } from './lib/error-handler';
 import { useIdlePrivacyLock } from './lib/use-idle-privacy-lock';
 import { initTooltips } from './lib/tooltip-engine';
@@ -131,8 +130,6 @@ export function handleHelperUpgradeable(
   // 判据与后端 `startup_tasks::should_notify_helper_upgradeable` 同口径（`installed && upgradeable`）：
   // 未装是「去安装」轴（归起核门与 HomeScreen 的 HELPER_NOT_INSTALLED 分支），不是本腿的事。
   if (!status?.installed || !status.upgradeable) return false;
-  // A non-repairable execution refusal is not fixed by installing the Helper.
-  if (status.selectedCore?.admission && !coreAdmissionIsDamage(status.selectedCore.admission)) return false;
   if (!helperUpgradeToastGate()) return false;
   toast.warning(t('helper.statusUpgradeable'), {
     key: HELPER_UPGRADE_TOAST_KEY,

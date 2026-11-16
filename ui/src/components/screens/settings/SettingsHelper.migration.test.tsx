@@ -113,7 +113,12 @@ it('a successful upgrade replaces the global upgrade toast through the same key'
   await vi.waitFor(() => expect(toast.success).toHaveBeenCalledExactlyOnceWith('helper.statusInstalled', { key: HELPER_UPGRADE_TOAST_KEY }));
 });
 it('requires the scoped confirmation, deduplicates clicks, and sends the typed mode only once', async () => {
-  await deferred(); click('helper.stopAndUpgradeAction'); click('helper.stopAndUpgradeAction');
+  await deferred();
+  vi.mocked(helperApi.getStatus).mockResolvedValue({ ...absent, installed: true, upgradeable: true,
+    selectedCore: { state: 'unavailable', admission: 'UnsupportedExactObject' } } as never);
+  h.refresh!();
+  await vi.waitFor(() => expect(h.state[1]).toBe('needs-upgrade'));
+  click('helper.stopAndUpgradeAction'); click('helper.stopAndUpgradeAction');
   expect(useDialogStore.getState().stack).toHaveLength(1);
   expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
   const prompt = confirmation();
@@ -223,7 +228,7 @@ it('a Mac confirmation cannot authorize the different Linux forward-only mainten
 });
 
 it.each([
-  { name: 'unsupported platform', status: { ...absent, supported: false }, state: 'unsupported', cleanupPending: false },
+  { name: 'unsupported platform', status: { ...absent, supported: false, installed: true, upgradeable: true }, state: 'unsupported', cleanupPending: false },
   ...['UnsupportedExactObject', 'UnsupportedCapability', 'Busy'].map(admission => ({
     name: admission, status: { ...absent, selectedCore: { admission } }, state: 'admission-unavailable', cleanupPending: false,
   })),

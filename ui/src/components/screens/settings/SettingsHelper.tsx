@@ -53,8 +53,9 @@ function deriveState(s: HelperStatus | null, cleanupPending = false): HelperStat
   if (!s) return 'checking';
   if (!s.supported) return 'unsupported';
   if (cleanupPending) return 'cleanup-pending';
-  if (s.selectedCore?.admission && !coreAdmissionIsDamage(s.selectedCore.admission)) return 'admission-unavailable';
+  // An outdated Helper can reject the selected Core until the Helper is upgraded.
   if (s.upgradeable) return 'needs-upgrade';
+  if (s.selectedCore?.admission && !coreAdmissionIsDamage(s.selectedCore.admission)) return 'admission-unavailable';
   // backgroundDisabled（macOS BTM 登录项被禁）比 needsRepair 更具体，需先判（contract: runtime.ts:167）。
   if (s.backgroundDisabled) return 'needs-btm';
   if (s.needsRepair) return 'needs-repair';

@@ -500,10 +500,10 @@ describe('handleHelperUpgradeable（提权助手可升级 → 可操作 toast）
     expect(opts.actions[0].label).toBe('helper.upgradeToastAction');
   });
 
-  it.each(['UnsupportedExactObject', 'UnsupportedCapability', 'LoaderPolicy', 'Busy', 'Unknown'])('no upgrade-only toast for %s, without consuming the later actionable notice', (admission) => {
-    expect(handleHelperUpgradeable({ installed: true, upgradeable: true, selectedCore: { admission } }, t)).toBe(false);
+  it.each(['UnsupportedExactObject', 'UnsupportedCapability', 'LoaderPolicy', 'Busy', 'Unknown'])('%s does not hide a required Helper upgrade or invent one for a compatible Helper', (admission) => {
+    expect(handleHelperUpgradeable({ installed: true, upgradeable: false, selectedCore: { admission } }, t)).toBe(false);
     expect(toastWarningMock).not.toHaveBeenCalled();
-    expect(handleHelperUpgradeable({ installed: true, upgradeable: true, selectedCore: { admission: 'Mismatch' } }, t)).toBe(true);
+    expect(handleHelperUpgradeable({ installed: true, upgradeable: true, selectedCore: { admission } }, t)).toBe(true);
     toastWarningMock.mock.calls[0][1].actions[0].onClick();
     expect(useNavStore.getState().settingsScreen).toBe('helper');
   });
