@@ -3602,7 +3602,6 @@ fn kernel_gate_cache_round_trips_atomically_and_corruption_is_a_miss() {
         binary_path: dir.join("sing-box").to_string_lossy().into_owned(),
         binary_len: 42,
         binary_sha256: "b".repeat(64),
-        binary_modified_ns: 123,
         config_sha256: "a".repeat(64),
     };
     persist_kernel_gate_cache(&path, &record).expect("原子落盘应成功");
@@ -4692,7 +4691,6 @@ fn accepted_config_cache_changes_when_core_bytes_change_with_same_path_size_and_
     let after = kernel_gate_cache_record(&core, &config).unwrap();
     assert_eq!(before.binary_path, after.binary_path);
     assert_eq!(before.binary_len, after.binary_len);
-    assert_eq!(before.binary_modified_ns, after.binary_modified_ns);
     assert_ne!(before.binary_sha256, after.binary_sha256);
     assert_ne!(before, after);
 }

@@ -514,7 +514,6 @@ pub(super) struct KernelGateCacheRecord {
     pub(super) binary_path: String,
     pub(super) binary_len: u64,
     pub(super) binary_sha256: String,
-    pub(super) binary_modified_ns: u64,
     pub(super) config_sha256: String,
 }
 
@@ -573,12 +572,6 @@ fn kernel_gate_cache_record_with_digest(
     digest: &str,
 ) -> Option<KernelGateCacheRecord> {
     let metadata = std::fs::metadata(binary).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
-    let modified_ns = u64::try_from(modified.as_nanos()).ok()?;
     let binary_path = binary
         .canonicalize()
         .unwrap_or_else(|_| binary.to_path_buf())
@@ -592,7 +585,6 @@ fn kernel_gate_cache_record_with_digest(
         binary_path,
         binary_len: metadata.len(),
         binary_sha256: digest.to_owned(),
-        binary_modified_ns: modified_ns,
         config_sha256: polaris_updater::verify::sha256_hex(&normalized),
     })
 }
