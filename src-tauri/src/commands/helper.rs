@@ -148,21 +148,33 @@ fn linux_proxy_original(directory: &std::path::Path) -> Result<Option<[String; 1
         polaris_system_integration::StdMarkerFs,
         path.to_string_lossy().into_owned(),
     );
-    let marker = match marker.read_checked() {
-        ProxyMarkerRead::CurrentValidated(marker) => marker,
-        // This supplies no release authority. Only an existing root-private,
-        // same-action journal may provide the missing baseline on recovery.
-        ProxyMarkerRead::Missing => return Ok(None),
+    let original = match marker.read_checked() {
+        ProxyMarkerRead::CurrentValidated(marker) => marker
+            .exact_original
+            .and_then(|value| value.linux_gsettings)
+            .ok_or("responsible-user complete Linux proxy baseline is unavailable")?,
+        // No takeover is recorded, so a live setting without a manual proxy is
+        // the user's own. A manual one may be a leftover whose original is
+        // unknown. Root rereads the user against it at every step either way,
+        // and a recovery first rechecks its journaled baseline.
+        ProxyMarkerRead::Missing => {
+            use polaris_system_integration::proxy_ops::{SystemProxyOps, SystemProxyOpsImpl};
+            let live = SystemProxyOpsImpl::new(polaris_system_integration::StdCommandRunner)
+                .capture_transaction_snapshot()
+                .map_err(|error| error.to_string())?
+                .linux_gsettings
+                .ok_or("actual responsible-user Linux proxy readback is unavailable")?;
+            if live.mode == "'manual'" {
+                return Err("responsible-user exact proxy baseline is unknown".into());
+            }
+            live
+        }
         _ => {
-            // A new App's empty session or missing/legacy marker cannot establish
+            // A new App's empty session or legacy marker cannot establish
             // the previous responsible user's complete restoration baseline.
             return Err("responsible-user exact proxy baseline is unknown".into());
         }
     };
-    let original = marker
-        .exact_original
-        .and_then(|value| value.linux_gsettings)
-        .ok_or("responsible-user complete Linux proxy baseline is unavailable")?;
     let values = linux_proxy_values(original);
     let home = linux_user_session_domain(directory)?;
     Ok(Some([
