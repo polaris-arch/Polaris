@@ -57,6 +57,10 @@ pub struct CommandOutput {
 /// 契约：非零退出 / 超时 / spawn 失败 → `Err(原因)`（对齐上游 `execFileAsync` reject）。
 pub trait CommandRunner {
     fn run(&self, cmd: &Command, timeout: Duration) -> Result<CommandOutput, String>;
+    /// 可跨线程共享时给出自身，供互不依赖的命令并行；缺省 `None` 即逐个执行。
+    fn as_sync(&self) -> Option<&(dyn CommandRunner + Sync)> {
+        None
+    }
 }
 
 /// `try_wait` 自适应轮询窗口。std 无 `wait_timeout`，而本 crate **禁止引入新依赖**（`wait-timeout` /
@@ -428,6 +432,9 @@ impl CommandRunner for StdCommandRunner {
     fn run(&self, cmd: &Command, timeout: Duration) -> Result<CommandOutput, String> {
         // 操作结果兼容层，不提供 NoOwner；后续 S1 必须直接消费 run_observed 并保原 pending。
         self.run_observed(cmd, timeout).into_legacy_result()
+    }
+    fn as_sync(&self) -> Option<&(dyn CommandRunner + Sync)> {
+        Some(self)
     }
 }
 

@@ -1146,7 +1146,9 @@ fn live_dns_does_not_overwrite_foreign_values_during_compensation() {
     let result = c.apply_effect(&plan, "foreign");
     assert_eq!(result.outcome, TakeoverOutcome::RecoveryPending);
     assert_eq!(c.ops.dns_state.borrow()["A"], vec!["9.9.9.9"]);
-    assert_eq!(c.ops.apply_calls.borrow().len(), 1);
+    // 写是整批的：B 已写，回读失败后按原值补偿回去；A 的外来值不被覆盖。
+    assert_eq!(c.ops.apply_calls.borrow().len(), 3);
+    assert_eq!(c.ops.dns_state.borrow()["B"], plan.before["B"]);
     assert!(c.has_marker());
     assert_eq!(c.marker.read().unwrap().original, plan.before);
 }

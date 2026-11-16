@@ -138,6 +138,42 @@ pub trait SystemDnsOps {
     /// 读生效解析器候选 IP（含 DHCP 下发的；方案B 用）。无法读 → `[]`。
     fn read_effective_resolvers(&self)
         -> Result<Vec<String>, crate::error::SystemIntegrationError>;
+    /// 逐目标 [`Self::read_dns`]，结果与 `targets` 同序。
+    fn read_dns_all(
+        &self,
+        targets: &[String],
+    ) -> Vec<Result<Vec<String>, crate::error::SystemIntegrationError>> {
+        targets.iter().map(|t| self.read_dns(t)).collect()
+    }
+    /// 逐目标 [`Self::apply_dns`]，结果与 `writes` 同序。
+    fn apply_dns_all(
+        &self,
+        writes: &[(&String, &Vec<String>)],
+    ) -> Vec<Result<(), crate::error::SystemIntegrationError>> {
+        writes
+            .iter()
+            .map(|(t, ips)| self.apply_dns(t, ips))
+            .collect()
+    }
+}
+
+/// 每项一个线程执行 `op`，结果按输入顺序返回。
+fn each_parallel<I: Send, T: Send>(
+    items: impl Iterator<Item = I>,
+    op: impl Fn(I) -> T + Sync,
+) -> Vec<T> {
+    let op = &op;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items.map(|item| scope.spawn(move || op(item))).collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
 }
 
 /// 接管请求/结果辅助。
@@ -265,6 +301,51 @@ impl<R: CommandRunner> SystemDnsOps for SystemDnsOpsImpl<R> {
             | Platform::Other
             | Platform::Android
             | Platform::Ios => Ok(()),
+        }
+    }
+
+    // mac 各网络服务是独立的 networksetup 进程、互不依赖：并行执行，免得每个服务逐个等。
+    fn read_dns_all(&self, targets: &[String]) -> Vec<Result<Vec<String>, SystemIntegrationError>> {
+        match self
+            .runner
+            .as_sync()
+            .filter(|_| matches!(self.platform, Platform::Mac))
+        {
+            Some(runner) => each_parallel(targets.iter(), |t| {
+                runner
+                    .run(
+                        &Command::new("networksetup", ["-getdnsservers", t.as_str()]),
+                        DNS_CMD_TIMEOUT,
+                    )
+                    .map(|out| parse_mac_get_dns_servers(&out.stdout))
+                    .map_err(SystemIntegrationError::dns)
+            }),
+            None => targets.iter().map(|t| self.read_dns(t)).collect(),
+        }
+    }
+
+    fn apply_dns_all(
+        &self,
+        writes: &[(&String, &Vec<String>)],
+    ) -> Vec<Result<(), SystemIntegrationError>> {
+        match self
+            .runner
+            .as_sync()
+            .filter(|_| matches!(self.platform, Platform::Mac))
+        {
+            Some(runner) => each_parallel(writes.iter(), |(t, ips)| {
+                runner
+                    .run(
+                        &Command::new("networksetup", mac_set_dns_args(t, ips)),
+                        DNS_CMD_TIMEOUT,
+                    )
+                    .map(drop)
+                    .map_err(SystemIntegrationError::dns)
+            }),
+            None => writes
+                .iter()
+                .map(|(t, ips)| self.apply_dns(t, ips))
+                .collect(),
         }
     }
 
@@ -523,12 +604,12 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         &self,
         targets: &[String],
     ) -> Result<BTreeMap<String, Vec<String>>, SystemIntegrationError> {
-        let mut current = BTreeMap::new();
-        for t in targets {
-            let ips = self.ops.read_dns(t)?;
-            current.insert(t.clone(), ips);
-        }
-        Ok(current)
+        targets
+            .iter()
+            .cloned()
+            .zip(self.ops.read_dns_all(targets))
+            .map(|(t, ips)| Ok((t, ips?)))
+            .collect()
     }
 
     /// Read-only exact recipe. DHCP is an empty static list, never a failed read.
@@ -813,25 +894,33 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         let owned_raw = Some(intent);
         let mut attempted = Vec::new();
         let result: Result<(), String> = (|| {
-            for (name, target) in &prepared.target {
-                if !self.raw_matches(&owned_raw) {
-                    return Err("DNS intent replaced before mutation".into());
-                }
+            // 各服务互不依赖：读核对、写、读回各成一批（mac 生产实现批内并行）。
+            // 读核对整批在任何写之前，任一服务漂移都不会留下半途写入。
+            if !self.raw_matches(&owned_raw) {
+                return Err("DNS intent replaced before mutation".into());
+            }
+            let names: Vec<String> = prepared.target.keys().cloned().collect();
+            let mut writes = Vec::new();
+            for ((name, target), current) in
+                prepared.target.iter().zip(self.ops.read_dns_all(&names))
+            {
                 let before = prepared
                     .before
                     .get(name)
                     .ok_or("DNS target outside prepared scope")?;
-                let current = self.ops.read_dns(name).map_err(|e| e.to_string())?;
-                if &current != before {
+                if current.map_err(|e| e.to_string())? != *before {
                     return Err("DNS service changed before mutation".into());
                 }
                 if before != target {
-                    attempted.push(name.clone());
-                    self.ops
-                        .apply_dns(name, target)
-                        .map_err(|e| e.to_string())?;
+                    writes.push((name, target));
                 }
-                if self.ops.read_dns(name).map_err(|e| e.to_string())? != *target {
+            }
+            attempted.extend(writes.iter().map(|(name, _)| (*name).clone()));
+            for applied in self.ops.apply_dns_all(&writes) {
+                applied.map_err(|e| e.to_string())?;
+            }
+            for (target, current) in prepared.target.values().zip(self.ops.read_dns_all(&names)) {
+                if current.map_err(|e| e.to_string())? != *target {
                     return Err("DNS target read-back mismatch".into());
                 }
             }
