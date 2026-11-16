@@ -80,7 +80,7 @@ const uiLayoutFixture = new URLSearchParams(location.search).has('ui-layout-fixt
 const uiLayoutAdmission = new URLSearchParams(location.search).get('admission') === 'unsupported';
 const uiLayoutVersion = '1.15.0-polaris-alpha.12.7';
 const uiLayoutHelper = {
-  supported: true, installed: true, ready: false, upgradeable: true, version: 2,
+  supported: true, installed: true, ready: false, upgradeable: !uiLayoutAdmission, version: uiLayoutAdmission ? 2 : 1,
   expectedProtocolVersion: 2, expectedBuildId: 'fixture-app', helperBuildId: 'fixture-old-helper',
   loaded: null, needsRepair: false, backgroundDisabled: false, pathMismatch: false, installedSingboxPath: null,
   selectedCore: { id: 'fixture-core', version: uiLayoutVersion, providerFingerprint: 'fixture-provider',
