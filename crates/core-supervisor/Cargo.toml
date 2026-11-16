@@ -24,7 +24,7 @@ nix = { version = "0.31.3", features = ["fs"] }
 rustix = { version = "1.1.4", features = ["fs", "process", "event"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { version = "0.31.3", features = ["fs"] }
+nix = { version = "0.31.3", features = ["fs", "mman"] }
 # The existing typed client is consumed inside the existing validation registry;
 # a caller-supplied boolean/owner callback cannot retire a remote Check producer.
 polaris-helper-client = { path = "../helper-client" }
@@ -44,6 +44,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
+    "Win32_System_Memory",
     "Win32_System_Threading",
     "Wdk_System_Threading",
 ] }

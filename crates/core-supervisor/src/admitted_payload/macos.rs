@@ -3,6 +3,7 @@
 use super::*;
 use crate::protected_install_path::{no_extended_acl, ProtectedPath};
 use nix::fcntl::{openat, OFlag};
+use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::stat::{fchmod, mkdirat, Mode};
 use nix::unistd::{unlinkat, UnlinkatFlags};
 use std::fs::File;
@@ -87,7 +88,8 @@ impl Generation {
 }
 impl Drop for Generation {
     fn drop(&mut self) {
-        // Never sweep a previous daemon's generation or a replaced namespace.
+        // Only this generation, never a replaced namespace; an ended daemon's
+        // leftovers are retired by the next daemon's first generation.
         // The last execution/reader owner reaches here only after actual wait.
         if !self.current() {
             log::warn!("private Core generation cleanup unconfirmed: namespace changed");
@@ -180,6 +182,35 @@ fn create_generation(parent: ProtectedPath) -> Result<Generation, AdmissionError
     // construction. We reject rather than chmod/chown/normalize an old object.
     parent.unchanged()?;
     no_extended_acl(&parent.file)?;
+    static STALE: std::sync::Once = std::sync::Once::new();
+    // A generation never outlives its daemon, and this daemon owns none yet:
+    // retire leftovers of ended daemons. Only root's private directory is
+    // emptied of its member; any other content keeps the directory.
+    STALE.call_once(|| {
+        for row in std::fs::read_dir(&parent.path)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = row.file_name();
+            if !name.to_string_lossy().starts_with(".execution-") {
+                continue;
+            }
+            let Ok(fd) = openat(
+                &parent.file,
+                name.as_os_str(),
+                open_flags(true),
+                Mode::empty(),
+            ) else {
+                continue;
+            };
+            let stale = File::from(fd);
+            if private_mode(&stale, true, 0o700).is_ok() {
+                let _ = unlinkat(&stale, "sing-box", UnlinkatFlags::NoRemoveDir);
+                let _ = unlinkat(&parent.file, name.as_os_str(), UnlinkatFlags::RemoveDir);
+            }
+        }
+    });
     let mut entropy = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut entropy)?;
     let name = format!(".execution-{}", lowercase_hex(&entropy));
@@ -485,6 +516,33 @@ fn protect_root_members(
     );
     private_mode(&file, false, 0o500)?;
     validate_macho(&mut file)?;
+    // The first exec of a fresh copy waits on the system code assessment; an
+    // executable view triggers it now, off the start path. No code runs.
+    #[allow(unsafe_code, reason = "mmap/munmap are libc FFI")]
+    if let Ok(image) = file.try_clone() {
+        std::thread::spawn(move || {
+            let Some(length) = image
+                .metadata()
+                .ok()
+                .and_then(|m| std::num::NonZeroUsize::new(m.len() as usize))
+            else {
+                return;
+            };
+            // SAFETY: private read/execute view of our sealed copy, unmapped at once.
+            if let Ok(view) = unsafe {
+                mmap(
+                    None,
+                    length,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                    MapFlags::MAP_PRIVATE,
+                    &image,
+                    0,
+                )
+            } {
+                let _ = unsafe { munmap(view, length.get()) };
+            }
+        });
+    }
     generation.directory.sync_all()?;
     generation.stamp = stamp(&generation.directory.metadata()?);
     let binary = Member {

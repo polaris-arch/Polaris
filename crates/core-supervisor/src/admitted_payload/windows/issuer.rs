@@ -11,6 +11,7 @@ use windows_sys::Win32::Security::Authorization::*;
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READONLY, SEC_IMAGE};
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::*;
 
@@ -350,6 +351,23 @@ pub(in crate::admitted_payload) struct Cohort {
     _birth_data_lease: File,
 }
 impl Cohort {
+    /// Builds each image section from the already held handle, then closes it.
+    pub(super) fn prewarm(&self) {
+        for (_, file, _) in &self.files {
+            // SAFETY: read-only image section over a live owned handle; no code runs.
+            let section = unsafe {
+                CreateFileMappingW(
+                    file.as_raw_handle(),
+                    ptr::null(),
+                    PAGE_READONLY | SEC_IMAGE,
+                    0,
+                    0,
+                    ptr::null(),
+                )
+            };
+            let _ = owned(section);
+        }
+    }
     pub(super) fn is_current(&self) -> bool {
         system_actor().is_ok()
             && self.files.iter().all(|(p, f, id)| {
@@ -502,6 +520,25 @@ pub(super) fn issue(
     {
         return Err(error("issuer random unavailable"));
     }
+    static STALE: std::sync::Once = std::sync::Once::new();
+    // A cohort never outlives its issuing process, and none is owned here yet:
+    // leftovers of ended processes are retired. An executing image cannot be
+    // deleted, so a still-running orphan keeps its directory.
+    STALE.call_once(|| {
+        for row in fs::read_dir(support).into_iter().flatten().flatten() {
+            let stale = row.path();
+            if row.file_name().to_string_lossy().starts_with(".execution-")
+                && row.metadata().is_ok_and(|m| {
+                    m.is_dir() && m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                })
+            {
+                for member in ["sing-box.exe", "libcronet.dll"] {
+                    let _ = fs::remove_file(stale.join(member));
+                }
+                let _ = fs::remove_dir(&stale);
+            }
+        }
+    });
     let root = support.join(format!(".execution-{}", lowercase_hex(&random)));
     // SAFETY: CREATE_NEW directory with a private birth SD; never adopt existing.
     check(unsafe { CreateDirectoryW(wide(&root)?.as_ptr(), &sa) })?;

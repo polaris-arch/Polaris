@@ -50,9 +50,12 @@ pub(super) fn protect_members(
     if !issuer::is_system_actor()? {
         return super::direct::protect_members(input, policy).map(ProtectedMembers::Direct);
     }
-    Ok(ProtectedMembers::Issuer(Arc::new(issuer::issue(
-        input, policy,
-    )?)))
+    let cohort = Arc::new(issuer::issue(input, policy)?);
+    // The first CreateProcess of a fresh copy waits on its antimalware scan;
+    // mapping the images now moves that wait off the start path.
+    let warm = Arc::clone(&cohort);
+    std::thread::spawn(move || warm.prewarm());
+    Ok(ProtectedMembers::Issuer(cohort))
 }
 impl ProtectedMembers {
     pub(super) fn is_current(&self) -> bool {
