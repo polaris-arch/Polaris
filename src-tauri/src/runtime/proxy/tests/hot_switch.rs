@@ -5065,11 +5065,16 @@ async fn desktop_tun_reassert_settles_without_delayed_flush() {
     let uc: UserConfig = serde_json::from_value(cfg).unwrap();
     let my_gen = rt.gate.generation();
 
-    rt.spawn_reassert_selector_selection(uc, my_gen, 0);
-    assert!(
-        !rt.network_settle.is_settled(),
-        "spawn 返回前必须同步接棒，不能等后台 task 获得调度后才关门"
-    );
+    {
+        // Hold the continuation until the gate assertion: another Tauri worker may
+        // otherwise finish reassert and legitimately release it before spawn returns.
+        let _continuation = inval.lock().unwrap();
+        rt.spawn_reassert_selector_selection(uc, my_gen, 0);
+        assert!(
+            !rt.network_settle.is_settled(),
+            "spawn 返回前必须同步接棒，不能等后台 task 获得调度后才关门"
+        );
+    }
     for _ in 0..100 {
         if !inval.lock().unwrap().is_empty() {
             break;
@@ -5962,8 +5967,8 @@ fn every_generation_input_key_is_visible_to_norm() {
     assert_eq!(
         param_use_count(&deps, "config"),
         RAW_CONFIG_READERS.len(),
-        "`generate_deps` 里对原始 config 的取值点数目变了。取值点必须由 RAW_CONFIG_READERS 登记的 reader \
-             覆盖；新增或更改取值点须同步对应守卫，\
+        "`generate_deps` 里对原始 config 的取值点数目变了。取值点须由 RAW_CONFIG_READERS 登记的 reader \
+             或由专项守卫精确登记的内联投影覆盖；新增或更改取值点须同步对应守卫，\
              否则它读的键会逃过本守卫 —— 那正是「第四类重启」的生成方式。当前体：\n{deps}"
     );
     for reader in RAW_CONFIG_READERS {
