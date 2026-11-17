@@ -1145,7 +1145,7 @@ const inModeledNamespace = (lower: string) =>
 /**
  * 落在已建模命名空间、但**明确不进族模型**的属性。
  *
- * 白名单纪律（抄 `contracts/test-only-exports.test.ts`）：每条**必须恰好在 corpus 里命中至少一次**，
+ * 白名单条目必须在 corpus 里实际命中，
  * 命中 0 次 = 守的东西没了、条目成免死金牌 —— 由 `css-cascade.test.ts` 的自检钉住。
  */
 export const OUT_OF_FAMILY_MODEL: readonly string[] = [

@@ -8,9 +8,8 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// 认领态（`inFlight` / `claimedUntil`）是模块级单例、跨用例存活。复位**不走生产模块导出的
-// `reset*()`**：那种钩子进产物、是公开契约、生产零调用点（见 `contracts/test-only-exports.test.ts`）。
-// 改成每个用例 `vi.resetModules()` + 动态 import 取一份全新模块实例。
+// 认领态（`inFlight` / `claimedUntil`）是模块级单例。每个用例通过
+// `vi.resetModules()` + 动态 import 取独立实例，避免跨用例共享状态。
 let withProxyStartClaim: typeof import('./proxy-start-claim')['withProxyStartClaim'];
 let isProxyStartClaimed: typeof import('./proxy-start-claim')['isProxyStartClaimed'];
 
