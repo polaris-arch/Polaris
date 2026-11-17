@@ -148,6 +148,8 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     "pipe_to_log_with_secrets_owned(",
     "drain(",
     "lines()",
+    // Linux exit inventory: bounded stdout read before waiting; stderr is null.
+    "read_to_end(",
     // 直接读到 EOF。**这一条今天没有任何生产站点在用**，它在集合里是因为它是 `resolvectl` 那条腿在
     // 修复前用的排空形态：那条腿真的读了管道，只是读在 `try_wait` 轮询**之后**。次序腿的历史真缺陷
     // 回放（`the_order_leg_is_red_on_the_historical_resolvectl_defect`）要能登记它，才谈得上「排空
@@ -330,6 +332,13 @@ const PIPED_SITES: &[PipedSite] = &[
     // `core-supervisor::config_gate::run_check_raw`（本表第一条），src-tauri 侧不再开这两根管道，
     // 故条目随站点一起消失 —— **不是把判据放宽**：G3 的扫描面对差仍覆盖这两个文件，任何一处新写的
     // `Stdio::piped()` 不登记就当场红。
+    PipedSite {
+        file: "src-tauri/src/runtime/mesh.rs",
+        anchor: "async fn read_linux_exit_route_inventory(",
+        kind: SiteKind::Sink,
+        // 4 MiB + 1 sentinel byte; timeout/error kills the child, cancellation uses kill_on_drop.
+        drain_forms: &["read_to_end("],
+    },
     PipedSite {
         file: "src-tauri/src/runtime/proxy/network_monitor.rs",
         anchor: "async fn route_network_watcher_once(",
