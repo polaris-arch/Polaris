@@ -161,13 +161,12 @@ async fn linux_add_returns_true_when_all_succeed() {
     assert!(run_linux_route_seq("add", cmds, run).await);
 }
 
-/// del 腿全程 best-effort：即便**每条**都失败也返 true（clear 是幂等收尾，installed 已被 take）。
-/// 变异：把 del 也纳入门（首条失败即 false）→ 本测转红。
+/// Deletion tries every command but must retain debt on any unconfirmed failure.
 #[tokio::test]
-async fn linux_del_stays_best_effort_true_even_when_every_command_fails() {
+async fn linux_del_reports_failure_but_attempts_every_command() {
     let cmds = linux_route_argv("del", "polaris-ts", &["0.0.0.0/0".into()]);
     let (run, calls) = scripted_runner(vec![false, false]);
-    assert!(run_linux_route_seq("del", cmds, run).await);
+    assert!(!run_linux_route_seq("del", cmds, run).await);
     assert_eq!(calls.lock().unwrap().len(), 2, "del 腿逐条跑完，不短路");
 }
 
@@ -265,4 +264,71 @@ fn pick_tailnet_iface_falls_back_to_address_when_no_baseline() {
     // 无任何 tailnet 地址 → None。
     let none = vec![("utun5".to_string(), vec!["10.0.0.2".to_string()])];
     assert_eq!(pick_tailnet_iface(&none, None), None);
+}
+
+#[test]
+fn linux_delete_absence_is_narrowly_idempotent() {
+    let delete = vec!["rule".into(), "del".into()];
+    let add = vec!["rule".into(), "add".into()];
+    let absent = b"RTNETLINK answers: No such file or directory\n";
+    assert!(ip_delete_already_absent(&delete, absent));
+    assert!(!ip_delete_already_absent(&add, absent));
+    for message in [b"RTNETLINK answers: Operation not permitted".as_slice(), b"Cannot find device", b"unknown failure"] {
+        assert!(!ip_delete_already_absent(&delete, message));
+    }
+}
+
+#[test]
+fn linux_disappeared_interface_requires_routes_and_policy_rule_absence() {
+    let cidrs = vec!["0.0.0.0/0".into()];
+    let empty = serde_json::json!([]);
+    assert!(linux_exit_route_inventory_absent(&empty, &empty, "polaris-ts", &cidrs));
+    let leftover_rule = serde_json::json!([{"table":7732,"oif":"polaris-ts"}]);
+    assert!(!linux_exit_route_inventory_absent(&empty, &leftover_rule, "polaris-ts", &cidrs));
+    let leftover_route = serde_json::json!([{"table":7732,"dst":"default","dev":"polaris-ts"}]);
+    assert!(!linux_exit_route_inventory_absent(&leftover_route, &empty, "polaris-ts", &cidrs));
+    let other = serde_json::json!([{"table":254,"dst":"default","dev":"eth0"}]);
+    assert!(linux_exit_route_inventory_absent(&other, &empty, "polaris-ts", &cidrs));
+    assert!(!linux_exit_route_inventory_absent(&serde_json::json!({}), &empty, "polaris-ts", &cidrs));
+    assert!(!linux_exit_route_inventory_absent(&empty, &serde_json::json!([{"oif":"polaris-ts"}]), "polaris-ts", &cidrs));
+}
+
+#[test]
+fn linux_cleanup_unknown_relevant_table_remains_debt() {
+    let empty = serde_json::json!([]);
+    let cidrs = vec!["0.0.0.0/0".to_string()];
+    for table in [serde_json::Value::Null, serde_json::json!({}), serde_json::json!("garbage"), serde_json::json!("18446744073709551616"), serde_json::json!(4294967296_u64), serde_json::json!("4294967296"), serde_json::json!(-1)] {
+        let route = serde_json::json!([{"dev":"polaris-ts", "dst":"default", "table":table}]);
+        let rule = serde_json::json!([{"oif":"polaris-ts", "table":table}]);
+        assert!(!linux_exit_route_inventory_absent(&route, &empty, "polaris-ts", &cidrs));
+        assert!(!linux_exit_route_inventory_absent(&empty, &rule, "polaris-ts", &cidrs));
+    }
+    let missing = serde_json::json!([{"dev":"polaris-ts", "dst":"default"}]);
+    assert!(!linux_exit_route_inventory_absent(&missing, &empty, "polaris-ts", &cidrs));
+    for table in [serde_json::json!(254), serde_json::json!("254")] {
+        let route = serde_json::json!([{"dev":"polaris-ts", "dst":"default", "table":table}]);
+        let rule = serde_json::json!([{"oif":"polaris-ts", "table":table}]);
+        assert!(linux_exit_route_inventory_absent(&route, &rule, "polaris-ts", &cidrs));
+    }
+}
+
+#[test]
+fn linux_inventory_query_requires_detailed_numeric_tables() {
+    for family in ["-4", "-6"] {
+        let args = linux_exit_route_inventory_args(family);
+        assert_eq!(args[0], vec![family, "-j", "-N", "-details", "route", "show", "table", "all"]);
+        assert_eq!(args[1], vec![family, "-j", "-N", "-details", "rule", "show"]);
+    }
+    // iproute2's detailed numeric output explicitly identifies the main table.
+    // The default destination alone must not make this an owned table-7732 route.
+    let main = serde_json::json!([{
+        "type":"unicast", "dst":"default", "gateway":"192.0.2.1",
+        "dev":"eth0", "table":"254", "protocol":"3", "scope":"0", "flags":[]
+    }]);
+    let rules = serde_json::json!([{"priority":32766, "src":"all", "table":"254"}]);
+    let cidrs = vec!["0.0.0.0/0".to_string()];
+    assert!(linux_exit_route_inventory_absent(&main, &rules, "polaris-ts", &cidrs));
+    let mut missing_table = main;
+    missing_table[0].as_object_mut().unwrap().remove("table");
+    assert!(!linux_exit_route_inventory_absent(&missing_table, &rules, "polaris-ts", &cidrs));
 }

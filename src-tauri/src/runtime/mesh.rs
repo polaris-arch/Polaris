@@ -1229,9 +1229,9 @@ impl MeshRuntime {
     ///
     /// **先 cancel 再排队**：这正是「点停止最长卡 18s」的修法 —— 取消信号必须走锁外通道发出去，
     /// 在飞的 macOS 反查轮询在一个周期（1.5s）内收手，本方法随即拿到锁。
-    pub async fn exit_route_clear(&self) {
+    pub async fn exit_route_clear(&self) -> bool {
         self.exit_route_cancel.cancel();
-        self.exit_route.lock().await.clear().await;
+        self.exit_route.lock().await.clear().await
     }
 
     /// TS 出口 re-advertise 恢复腿的重申（上游 `reassert`，R3）。
@@ -1254,8 +1254,8 @@ impl MeshRuntime {
         mgr.reassert(config, enable_ipv6, token).await;
     }
 
-    /// 崩溃 / 非正常拆除的同步内存态复位（上游 `resetState`）：内核接口随进程消失、其路由已自动失效，
-    /// 故不发删命令，仅清残留 `installed`（防下次 reconcile 误判已装 → 黑洞）。
+    /// 崩溃 / 非正常拆除：撤销 installed 断言但保留待核清理身份。
+    /// 后续 clear/reconcile 核验路由与策略规则；进程消失不等于清理完成。
     pub async fn exit_route_reset_state(&self) {
         // 崩溃拆除同样是「在飞那轮已作废」：不抢占的话，这条同步复位要排在 18s 轮询后面，
         // 而崩溃恢复腿正等着它把内存态清干净才敢重起核。
@@ -1523,15 +1523,22 @@ impl ExitRouteOp for HelperExitRouteOp {
             // （真·全败）；而单条 `route replace` 失败（如 v6 cidr 在关掉 IPv6 的机器上）不代表整腿失败，
             // 此时仍标 installed 才能让 clear 把已装的那部分收回去（否则泄漏）。
             // add 腿首条即 `rule add`（见 [`linux_route_argv`] 的构造顺序，由单测钉死）。
-            // del 腿维持 best-effort true：clear 是幂等收尾，返 false 只会多一条 warn，不改变状态。
+            // del 腿尝试全部命令，但仅全成功/明确不存在才确认清理；失败保留重试依据。
             //
             // 判定与执行分离（[`run_linux_route_seq`]）：真 `ip` 调用是真机门（本机绝不 spawn），
             // 而「哪条是门、失败后跳不跳、del 腿返什么」是可测的纯编排 —— 单测注入假 runner 覆盖。
             Platform::Linux => {
-                run_linux_route_seq(op, linux_route_argv(op, iface, cidrs), |argv| async move {
+                let commands_ok = run_linux_route_seq(op, linux_route_argv(op, iface, cidrs), |argv| async move {
                     run_ip_command(&argv).await
                 })
-                .await
+                .await;
+                if op == "del" {
+                    // Even a vanished interface can leave an oif policy rule. Query
+                    // both independently; missing-device stderr is not evidence.
+                    verify_linux_exit_route_absent(iface, cidrs).await
+                } else {
+                    commands_ok
+                }
             }
             // `Other`（未知平台）：与 Android 同答 false，**不 spawn**（2026-09-05 从 Linux 臂里摘出）。
             //
@@ -1799,15 +1806,17 @@ fn pick_tailnet_iface(
 /// - `op == "add"`：**首条即 `ip rule add`**（[`linux_route_argv`] 的构造顺序，由 `linux_add_argv_starts_with_rule_add` 钉死）。
 ///   它失败 ⇒ 表 7732 永不被查中 ⇒ 后续 `route replace` 全是白跑 ⇒ 立即 break 并返 `false`（不标 installed）。
 ///   它成功 ⇒ 后续逐条 best-effort（单条 cidr 失败不否定整腿：仍需标 installed 才能在 clear 时收回已装部分）。
-/// - `op != "add"`（del）：全程 best-effort，恒 `true`（clear 是幂等收尾，返 false 只多一条 warn）。
+/// - `op != "add"`（del）：尝试全部命令；任何未确认失败都返回 false，保留清理依据。
 async fn run_linux_route_seq<F, Fut>(op: &str, cmds: Vec<Vec<String>>, run: F) -> bool
 where
     F: Fn(Vec<String>) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
     let is_add = op == "add";
+    let mut all_ok = true;
     for (idx, argv) in cmds.into_iter().enumerate() {
         let ok = run(argv).await;
+        all_ok &= ok;
         if is_add && idx == 0 && !ok {
             log::warn!(
                 "出口路由:Linux `ip rule add` 失败(ip 缺失/无 CAP_NET_ADMIN/内核无策略路由?) → 不标 installed,跳过后续 route 命令"
@@ -1815,7 +1824,106 @@ where
             return false;
         }
     }
+    is_add || all_ok
+}
+
+// Parse only successful, structured inventories. Unknown shapes remain cleanup debt.
+fn linux_exit_route_inventory_absent(
+    routes: &serde_json::Value,
+    rules: &serde_json::Value,
+    iface: &str,
+    cidrs: &[String],
+) -> bool {
+    let (Some(routes), Some(rules)) = (routes.as_array(), rules.as_array()) else {
+        return false;
+    };
+    let numeric_table = |table: &serde_json::Value| {
+        table.as_u64().or_else(|| {
+            table.as_str().and_then(|value| {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    None
+                } else {
+                    value.parse::<u64>().ok()
+                }
+            })
+        }).filter(|table| *table <= u64::from(u32::MAX))
+    };
+    for route in routes {
+        let Some(object) = route.as_object() else {
+            return false;
+        };
+        let destination = object.get("dst").and_then(serde_json::Value::as_str);
+        let relevant = object.get("dev").and_then(serde_json::Value::as_str) == Some(iface)
+            || destination.is_some_and(|destination| {
+                cidrs.iter().any(|cidr| {
+                    cidr == destination
+                        || (destination == "default" && (cidr == "0.0.0.0/0" || cidr == "::/0"))
+                })
+            });
+        match object.get("table").and_then(&numeric_table) {
+            Some(7732) => {
+                if destination.is_none() || relevant {
+                    return false;
+                }
+            }
+            Some(_) => {} // A known different table cannot contain our route.
+            None if relevant => return false,
+            None => {} // Unrelated inventory does not establish or disprove our ownership.
+        }
+    }
+    for rule in rules {
+        let Some(object) = rule.as_object() else {
+            return false;
+        };
+        if object.get("oif").and_then(serde_json::Value::as_str) != Some(iface) {
+            continue;
+        }
+        match object.get("table").and_then(&numeric_table) {
+            Some(7732) | None => return false,
+            Some(_) => {} // Only a verified different numeric table may be ignored.
+        }
+    }
     true
+}
+
+// Details is required: iproute2 otherwise omits table=254 on main-table routes.
+// Numeric output avoids local table aliases; both inventories must be authoritative.
+fn linux_exit_route_inventory_args(family: &str) -> [Vec<&str>; 2] {
+    [
+        vec![family, "-j", "-N", "-details", "route", "show", "table", "all"],
+        vec![family, "-j", "-N", "-details", "rule", "show"],
+    ]
+}
+
+async fn verify_linux_exit_route_absent(iface: &str, cidrs: &[String]) -> bool {
+    for family in ["-4", "-6"] {
+        let mut inventories = Vec::new();
+        for args in linux_exit_route_inventory_args(family) {
+            let output = match tokio::process::Command::new("ip")
+                .env("LC_ALL", "C").args(args).output().await {
+                Ok(output) if output.status.success() => output,
+                _ => return false,
+            };
+            let value = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            inventories.push(value);
+        }
+        if !linux_exit_route_inventory_absent(&inventories[0], &inventories[1], iface, cidrs) {
+            return false;
+        }
+    }
+    true
+}
+
+// Only the exact kernel absence result for a deletion is idempotent success.
+// Permission errors, missing executables/devices and unknown failures retain debt.
+fn ip_delete_already_absent(argv: &[String], stderr: &[u8]) -> bool {
+    argv.iter().any(|arg| arg == "del")
+        && std::str::from_utf8(stderr).is_ok_and(|text| {
+            text.trim() == "RTNETLINK answers: No such file or directory"
+        })
 }
 
 /// 运行 `ip <argv>`，**返回是否真的成功**（退出码 0）。Linux 出口路由手术（app CAP_NET_ADMIN）。**真机门**。
@@ -1824,8 +1932,9 @@ where
 /// （见 [`HelperExitRouteOp::run_route`] 的 Linux 分支）。`ip` 不在 PATH（`Err`）与非零退出
 /// （无 CAP_NET_ADMIN / 语法错 / 内核不支持）都返 `false`。
 async fn run_ip_command(argv: &[String]) -> bool {
-    match tokio::process::Command::new("ip").args(argv).output().await {
+    match tokio::process::Command::new("ip").env("LC_ALL", "C").args(argv).output().await {
         Ok(o) if o.status.success() => true,
+        Ok(o) if ip_delete_already_absent(argv, &o.stderr) => true,
         Ok(o) => {
             log::debug!(
                 "出口路由 ip {} → 非零退出({:?})",

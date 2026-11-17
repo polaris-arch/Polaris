@@ -5000,3 +5000,61 @@ async fn linux_dns_disable_requires_confirmed_restore() {
     runtime.set_test_dns_restore(Arc::new(|| Ok(())));
     assert!(runtime.restore_system_dns_checked().await);
 }
+
+#[tokio::test]
+async fn linux_dns_failure_runs_mesh_teardown_before_publishing_failure() {
+    for supersede in [false, true] {
+        let (runtime, _directory) = test_runtime();
+        let acquired = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let holder = {
+            let mesh = Arc::clone(&runtime.mesh);
+            let acquired = Arc::clone(&acquired);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                mesh.occupy_exit_route_lock_for_test(acquired, release).await;
+            })
+        };
+        acquired.notified().await;
+        let generation = runtime.gate.generation();
+        // Model the outer Start transaction. Nested Stop must leave it balanced.
+        runtime.gate.begin();
+        let rollback = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let held = runtime.mesh.tailscale_state_gate().await;
+                runtime.reject_linux_dns_start(generation, &held).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.gate.depth() < 2 && !rollback.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(!rollback.is_finished(), "failure must wait for mesh route cleanup");
+        if supersede {
+            runtime.gate.bump_generation();
+            *runtime.status.write().unwrap() = ProxyStatus {
+                running: true,
+                pid: 5678,
+                main_generation: runtime.gate.generation(),
+                ..ProxyStatus::default()
+            };
+        }
+        release.notify_one();
+        holder.await.unwrap();
+        let outcome = rollback.await.unwrap();
+        assert_eq!(runtime.gate.depth(), 1, "nested rollback must balance its gate");
+        if supersede {
+            assert!(outcome.is_ok());
+            assert!(runtime.status().running);
+            assert_eq!(runtime.status().pid, 5678);
+            assert!(runtime.status().error.is_none());
+        } else {
+            assert!(outcome.is_err());
+            assert!(!runtime.status().running);
+            assert_eq!(runtime.status().error_code.as_deref(), Some(code::SYSTEM_DNS_TAKEOVER_FAILED));
+        }
+        runtime.finish_lifecycle(LifecycleKind::Start);
+    }
+}

@@ -2904,15 +2904,22 @@ impl ProxyRuntime {
     /// Fail the same startup generation without erasing retryable controller debt.
     /// Cold DNS receipts currently require core_running(), so this runs after the
     /// internal running publication but before startup can return Ready successfully.
-    async fn reject_linux_dns_start(
+    pub(super) async fn reject_linux_dns_start<'a>(
         self: &Arc<Self>,
         generation: u64,
-        ts_gate: &tokio::sync::MutexGuard<'_, ()>,
+        ts_gate: &'a tokio::sync::MutexGuard<'a, ()>,
     ) -> Result<ProxyStatus, StartError> {
         if self.gate.generation() != generation {
             return Ok(self.status());
         }
-        let stopped = self.kill_core_and_release_main(ts_gate).await;
+        // DNS runs after mesh route installation. Reuse the complete stop
+        // teardown under the already held gate: process-only retirement leaves
+        // policy rules, watchers and runtime baselines alive after startup fails.
+        let stopped = match self.stop_inner_under_gate(generation, ts_gate).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => return Ok(self.status()),
+            Err(error) => Err(error),
+        };
         match self.publish_linux_dns_start_failure(generation, stopped) {
             Some(message) => Err(StartError::coded(message, code::SYSTEM_DNS_TAKEOVER_FAILED)),
             None => Ok(self.status()),
@@ -2933,7 +2940,7 @@ impl ProxyRuntime {
         let reason = "Linux Helper DNS takeover was not confirmed";
         let (message, retired) = match stopped {
             Ok(()) => (reason.to_string(), true),
-            Err(error) => (format!("{reason}; Core cleanup unconfirmed: {error}"), false),
+            Err(error) => (format!("{reason}; startup cleanup unconfirmed: {error}"), false),
         };
         if retired {
             self.revoke_tailnet_context();

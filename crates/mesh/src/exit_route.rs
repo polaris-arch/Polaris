@@ -333,6 +333,8 @@ pub struct MeshExitRouteManager<O, L> {
     log: L,
     platform: Platform,
     installed: Option<InstalledRoute>,
+    // Failed deletion custody, not evidence that the route remains installed.
+    cleanup_pending: Option<InstalledRoute>,
     reconciling: bool,
     pending: Option<(bool, Option<MeshExitRoutePlan>)>, // (enable_ipv6, plan)
     baseline_utuns: Option<HashSet<String>>,
@@ -363,6 +365,7 @@ where
             log,
             platform,
             installed: None,
+            cleanup_pending: None,
             reconciling: false,
             pending: None,
             baseline_utuns: None,
@@ -462,7 +465,7 @@ where
             }
             _ => false,
         };
-        if same_plan {
+        if same_plan && self.cleanup_pending.is_none() {
             // 无变更。
             return ReconcileOutcome {
                 installed: self.installed.clone(),
@@ -470,7 +473,9 @@ where
             };
         }
         // 先清旧。
-        self.clear_inner().await;
+        if !self.clear_inner().await {
+            return ReconcileOutcome { installed: self.installed.clone(), changed: false };
+        }
         // 再装新。
         if let Some(p) = plan {
             self.apply(&p, token).await;
@@ -502,6 +507,9 @@ where
             };
         }
         let plan = plan_mesh_exit_route(config, enable_ipv6);
+        if self.cleanup_pending.is_some() {
+            return self.reconcile(config, enable_ipv6, token).await;
+        }
         // 重申也可能撞上切节点/切模式后的旧安装态；身份或 CIDR 变了须先清旧再对账。
         match (plan.as_ref(), self.installed.as_ref()) {
             (None, None) => {
@@ -536,18 +544,18 @@ where
     }
 
     /// 停核 / teardown：清理已装的出口路由。上游 `clear`。
-    pub async fn clear(&mut self) {
+    pub async fn clear(&mut self) -> bool {
         if !mesh_system_supported_on_platform(self.platform) {
-            return;
+            return self.installed.is_none() && self.cleanup_pending.is_none();
         }
-        self.clear_inner().await;
+        self.clear_inner().await
     }
 
     /// clear 的核心逻辑（含 macOS BUG2 防误删：接口已消失 → 跳过 route delete）。
-    async fn clear_inner(&mut self) {
-        let cur = match self.installed.take() {
+    async fn clear_inner(&mut self) -> bool {
+        let cur = match self.cleanup_pending.take().or_else(|| self.installed.take()) {
             Some(c) => c,
-            None => return,
+            None => return true,
         };
         // macOS BUG2 防误删：停核时 sing-box 拆除 TS utun，其 ifscope 路由随接口自动消失。此时若再对
         // 已不存在的 iface 发 route delete，macOS 会落到 main 表、误删主 TUN 的拆半默认。故接口已消失 → 跳过。
@@ -561,7 +569,7 @@ where
                         cur.iface
                     ),
                 );
-                return;
+                return true;
             }
         }
         let ok = self.op.run_route("del", &cur.iface, &cur.cidrs).await;
@@ -575,13 +583,19 @@ where
                 "warn",
                 &format!("出口路由清理失败(best-effort): {}", cur.iface),
             );
+            self.cleanup_pending = Some(cur);
         }
+        ok
     }
 
     /// 崩溃 / giveUp 等非正常拆除的同步内存态复位。上游 `resetState`。
-    /// 内核接口随进程销毁、其路由已自动消失，故无需发删命令；但必须清掉残留 installed。
+    /// 不再把进程消失视为清理证明；移交为待核清理，后续 clear/reconcile 验证并重试。
     pub fn reset_state(&mut self) {
-        self.installed = None;
+        // Process/interface disappearance does not prove policy rules were removed.
+        if let Some(installed) = self.installed.take() {
+            debug_assert!(self.cleanup_pending.is_none());
+            self.cleanup_pending = Some(installed);
+        }
     }
 
     /// 装路由（apply）。上游 `apply`。

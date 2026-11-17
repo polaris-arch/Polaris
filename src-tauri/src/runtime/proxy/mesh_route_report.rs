@@ -784,7 +784,9 @@ impl ProxyRuntime {
                     .exit_route_reconcile(&config, config.enable_ipv6.unwrap_or(false))
                     .await
             }
-            None => self.mesh.exit_route_clear().await,
+            None => {
+                let _ = self.mesh.exit_route_clear().await;
+            }
         }
     }
 }

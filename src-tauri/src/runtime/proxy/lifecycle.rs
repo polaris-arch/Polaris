@@ -1588,7 +1588,7 @@ impl ProxyRuntime {
         }
         // C5：停核 → TS 内核接口随之拆除 → 清理出口路由（真装过才发 route del；未装成 / 测试构造
         // `enabled=false` 下 installed 恒 None → clear_inner 早退 = 纯 no-op）。
-        self.mesh.exit_route_clear().await;
+        let mesh_cleanup_confirmed = self.mesh.exit_route_clear().await;
         if self.stop_superseded(my_gen, "exit_route_clear") {
             self.finish_lifecycle(LifecycleKind::Stop);
             return Ok(None);
@@ -1658,6 +1658,9 @@ impl ProxyRuntime {
             *g = None;
         }
         self.finish_lifecycle(LifecycleKind::Stop);
+        if !mesh_cleanup_confirmed {
+            return Err("Core stopped; mesh exit route cleanup remains unconfirmed and retryable".into());
+        }
         Ok(Some(my_gen))
     }
 

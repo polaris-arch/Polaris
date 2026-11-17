@@ -840,3 +840,45 @@ async fn failed_native_candidate_route_does_not_publish_installed_state() {
     reconcile_now(&mut mgr, &cfg, false).await;
     assert!(mgr.installed().is_none());
 }
+
+#[tokio::test]
+async fn failed_delete_retains_cleanup_custody_without_claiming_installed() {
+    let op = mock_with_iface("polaris-ts");
+    let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
+    let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Linux);
+    reconcile_now(&mut mgr, &cfg, false).await;
+    *op.route_ok.lock().unwrap() = false;
+    mgr.clear().await;
+    assert!(mgr.installed().is_none(), "partial deletion is not installed proof");
+    assert!(mgr.cleanup_pending.is_some());
+    mgr.reset_state();
+    assert!(mgr.cleanup_pending.is_some(), "crash reset must not erase delete debt");
+    let adds_before = op.routes.lock().unwrap().iter().filter(|r| r.0 == "add").count();
+    reconcile_now(&mut mgr, &cfg, false).await;
+    assert_eq!(op.routes.lock().unwrap().iter().filter(|r| r.0 == "add").count(), adds_before,
+        "must not install over an unretired owner");
+    *op.route_ok.lock().unwrap() = true;
+    mgr.clear().await;
+    assert!(mgr.cleanup_pending.is_none());
+    let calls = op.routes.lock().unwrap().len();
+    mgr.clear().await;
+    assert_eq!(op.routes.lock().unwrap().len(), calls, "confirmed deletion is not repeated");
+}
+
+#[tokio::test]
+async fn crash_reset_converts_installed_owner_to_retryable_cleanup() {
+    let op = mock_with_iface("polaris-ts");
+    let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
+    let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Linux);
+    reconcile_now(&mut mgr, &cfg, false).await;
+    assert!(mgr.installed().is_some());
+    mgr.reset_state();
+    assert!(mgr.installed().is_none());
+    assert!(mgr.cleanup_pending.is_some());
+    *op.route_ok.lock().unwrap() = false;
+    assert!(!mgr.clear().await);
+    assert!(mgr.cleanup_pending.is_some());
+    *op.route_ok.lock().unwrap() = true;
+    assert!(mgr.clear().await);
+    assert!(mgr.cleanup_pending.is_none());
+}
