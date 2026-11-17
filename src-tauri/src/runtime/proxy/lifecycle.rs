@@ -1612,12 +1612,23 @@ impl ProxyRuntime {
         if let Ok(mut state) = self.runtime_binding_state.lock() {
             *state = RuntimeBindingState::default();
         }
-        // C7：停核 → 还原系统 DNS（best-effort；无 marker → 惰性；Linux per-link revert 幂等）。
+        // C7：停核 → 严格确认系统 DNS 还原（无 marker → 惰性；未确认则保留恢复债）。
         // 对齐 上游 `stopSystemDns`（restoreDns）。放在刷缓存之前：先把系统解析器还原，再清缓存里的旧记录。
-        self.restore_system_dns_best_effort().await;
+        let dns_cleanup_confirmed = self.restore_system_dns_checked().await;
         if self.stop_superseded(my_gen, "restore_system_dns") {
             self.finish_lifecycle(LifecycleKind::Stop);
             return Ok(None);
+        }
+        // The process has definitely retired. Even on a cleanup-debt error,
+        // expected Stop/restart/exit must retire its dead system-proxy endpoint.
+        // Do not run this on kill failure or after a successor owns the generation.
+        if !mesh_cleanup_confirmed || !dns_cleanup_confirmed {
+            self.clear_system_proxy_under_gate_if_current(my_gen, _tailscale_gate.guard())
+                .await;
+            if self.stop_superseded(my_gen, "cleanup_debt_system_proxy") {
+                self.finish_lifecycle(LifecycleKind::Stop);
+                return Ok(None);
+            }
         }
         // C7：停核尾刷 OS DNS 缓存（fire-and-forget，对齐 上游 `flushOsDnsCacheBestEffort('stop')`）。
         self.flush_os_dns_cache_best_effort("stop");
@@ -1658,10 +1669,12 @@ impl ProxyRuntime {
             *g = None;
         }
         self.finish_lifecycle(LifecycleKind::Stop);
-        if !mesh_cleanup_confirmed {
-            return Err("Core stopped; mesh exit route cleanup remains unconfirmed and retryable".into());
+        match (mesh_cleanup_confirmed, dns_cleanup_confirmed) {
+            (true, true) => Ok(Some(my_gen)),
+            (false, true) => Err("Core stopped; mesh exit route cleanup remains unconfirmed and retryable".into()),
+            (true, false) => Err("Core stopped; system DNS cleanup remains unconfirmed and retryable".into()),
+            (false, false) => Err("Core stopped; mesh exit route and system DNS cleanup remain unconfirmed and retryable".into()),
         }
-        Ok(Some(my_gen))
     }
 
     /// 停核拆除腿的换代让位判据（见 [`stop_inner`](Self::stop_inner) 的换代守卫段）。

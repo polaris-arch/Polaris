@@ -2989,3 +2989,77 @@ async fn linux_helper_watchdog_timeout_retains_real_gates_through_every_terminal
         );
     }
 }
+
+#[tokio::test]
+async fn stopped_core_dns_cleanup_failure_is_reported_and_retried() {
+    let (rt, _dir) = test_runtime();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cleanup_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let observed_attempts = Arc::clone(&attempts);
+    let observed_pending = Arc::clone(&cleanup_pending);
+    rt.set_test_dns_restore(Arc::new(move || {
+        let attempt = observed_attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            // Model a controller retaining its marker after a failed restore.
+            Err("synthetic restore failure; marker retained".into())
+        } else {
+            observed_pending.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }));
+    let error = rt.stop_inner(StopClaim::Request(None)).await.unwrap_err();
+    assert!(error.contains("Core stopped; system DNS cleanup"));
+    assert!(!rt.status().running);
+    assert_eq!(rt.status().pid, 0);
+    assert_eq!(rt.gate.depth(), 0);
+    assert!(cleanup_pending.load(Ordering::SeqCst));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    // A repeated stop still restores DNS even though the Core is already stopped.
+    assert!(rt.stop_inner(StopClaim::Request(None)).await.unwrap().is_some());
+    assert!(!rt.status().running);
+    assert_eq!(rt.status().pid, 0);
+    assert_eq!(rt.gate.depth(), 0);
+    assert!(!cleanup_pending.load(Ordering::SeqCst));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn expected_stop_dns_debt_still_clears_dead_system_proxy() {
+    let (rt, _dir, calls) = test_runtime_recording();
+    rt.bump_generation();
+    let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&restores);
+    rt.set_test_dns_restore(Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Err("synthetic DNS cleanup debt".into())
+    }));
+    let expected = owned_stop_request(&rt);
+    let error = rt.stop_expected(expected).await.unwrap_err();
+    assert!(error.contains("system DNS cleanup"), "unexpected error: {error}");
+    assert_eq!(restores.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!rt.status().running);
+    assert_eq!(rt.status().pid, 0);
+    assert_eq!(rt.gate.depth(), 0);
+}
+
+#[tokio::test]
+async fn restart_dns_debt_still_clears_dead_system_proxy() {
+    let (rt, _dir, calls) = test_runtime_recording();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&restores);
+    rt.set_test_dns_restore(Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Err("synthetic DNS cleanup debt".into())
+    }));
+    let error = rt.restart(post_admission_failure_config()).await.unwrap_err();
+    assert!(error.to_string().contains("system DNS cleanup"), "unexpected error: {error}");
+    assert_eq!(restores.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!rt.status().running);
+    assert_eq!(rt.status().pid, 0);
+    assert_eq!(rt.gate.depth(), 0);
+}

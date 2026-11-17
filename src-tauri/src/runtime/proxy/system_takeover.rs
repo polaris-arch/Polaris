@@ -446,6 +446,26 @@ impl ProxyRuntime {
             .await;
     }
 
+    /// A confirmed retired Core may still have DNS/mesh cleanup debt. Its callers
+    /// must not leave a system proxy pointing at the dead port when returning Err.
+    /// The caller already owns the state gate; never acquire it a second time.
+    pub(super) async fn clear_system_proxy_under_gate_if_current(
+        &self,
+        generation: u64,
+        _state_gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) {
+        if self.gate.generation() != generation {
+            return;
+        }
+        let gate = Arc::clone(&self.gate);
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        self.system_proxy
+            .clear_when(blocking_lease, move || {
+                gate.try_generation() == Some(generation)
+            })
+            .await;
+    }
+
     /// marker 门控的公开清理 facade，供 stop、失败腿与 command 复用。
     pub async fn clear_system_proxy(&self) -> bool {
         let blocking_lease = self.config.retain_active_legacy_start_lease();
