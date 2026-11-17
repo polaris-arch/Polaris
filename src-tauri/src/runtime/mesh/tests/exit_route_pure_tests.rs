@@ -410,3 +410,35 @@ fn linux_inventory_query_requires_detailed_numeric_tables() {
         &cidrs
     ));
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_inventory_capture_rejects_incomplete_output_and_reaps_timeout() {
+    for (script, expected) in [
+        ("printf '[]'", Some(serde_json::json!([]))),
+        ("printf '[]'; exit 1", None),
+        ("printf '['", None),
+        ("head -c 4194305 /dev/zero", None),
+    ] {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", script]);
+        assert_eq!(read_linux_exit_route_inventory(command).await, expected);
+    }
+    let directory = crate::test_support::TestDir::new("linux-inventory-timeout");
+    let pid_file = directory.path().join("pid");
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 30"])
+        .env("PID_FILE", &pid_file);
+    let started = std::time::Instant::now();
+    assert!(read_linux_exit_route_inventory(command).await.is_none());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    assert!(!tokio::process::Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .unwrap()
+        .success());
+}

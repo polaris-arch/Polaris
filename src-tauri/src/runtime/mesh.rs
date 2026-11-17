@@ -1891,8 +1891,8 @@ fn linux_exit_route_inventory_absent(
     true
 }
 
-// Details is required: iproute2 otherwise omits table=254 on main-table routes.
-// Numeric output avoids local table aliases; both inventories must be authoritative.
+// Keep all-table inventory: an absent dedicated table may make a targeted dump
+// fail rather than return []. Numeric details distinguish relevant table identities.
 fn linux_exit_route_inventory_args(family: &str) -> [Vec<&str>; 2] {
     [
         vec![
@@ -1902,22 +1902,50 @@ fn linux_exit_route_inventory_args(family: &str) -> [Vec<&str>; 2] {
     ]
 }
 
+// A failed, oversized or timed-out query is unknown, never proof of cleanup.
+async fn read_linux_exit_route_inventory(
+    mut command: tokio::process::Command,
+) -> Option<serde_json::Value> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    const MAX_BYTES: u64 = 4 * 1024 * 1024;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let query = async {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        if bytes.len() as u64 > MAX_BYTES || !child.wait().await.ok()?.success() {
+            return None;
+        }
+        serde_json::from_slice(&bytes).ok()
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), query).await;
+    // kill_on_drop also covers cancellation by the caller. On normal failure,
+    // kill and reap explicitly; do not leave a producer blocked on a full pipe.
+    if !matches!(result, Ok(Some(_))) {
+        let _ = child.kill().await;
+    }
+    result.ok().flatten()
+}
+
 async fn verify_linux_exit_route_absent(iface: &str, cidrs: &[String]) -> bool {
     for family in ["-4", "-6"] {
         let mut inventories = Vec::new();
         for args in linux_exit_route_inventory_args(family) {
-            let output = match tokio::process::Command::new("ip")
-                .env("LC_ALL", "C")
-                .args(args)
-                .output()
-                .await
-            {
-                Ok(output) if output.status.success() => output,
-                _ => return false,
-            };
-            let value = match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                Ok(value) => value,
-                Err(_) => return false,
+            let mut command = tokio::process::Command::new("ip");
+            command.env("LC_ALL", "C").args(args);
+            let Some(value) = read_linux_exit_route_inventory(command).await else {
+                return false;
             };
             inventories.push(value);
         }

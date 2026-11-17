@@ -5961,9 +5961,9 @@ fn every_generation_input_key_is_visible_to_norm() {
     // ① 通道封闭：每个登记 reader 恰好接收一次 config，未知 reader 必须失败。
     assert_eq!(
         param_use_count(&deps, "config"),
-        RAW_CONFIG_READERS.len() + 1, // Inline typed Linux DNS ownership projection below.
+        RAW_CONFIG_READERS.len(),
         "`generate_deps` 里对原始 config 的取值点数目变了。取值点必须由 RAW_CONFIG_READERS 登记的 reader \
-             或下方逐项约束的 inline Linux DNS ownership 投影覆盖；新增或更改取值点须同步对应守卫，\
+             覆盖；新增或更改取值点须同步对应守卫，\
              否则它读的键会逃过本守卫 —— 那正是「第四类重启」的生成方式。当前体：\n{deps}"
     );
     for reader in RAW_CONFIG_READERS {
@@ -5974,15 +5974,8 @@ fn every_generation_input_key_is_visible_to_norm() {
         );
     }
 
-    // The inline typed reader is a separate, closed projection, not a blanket
-    // exemption for arbitrary config reads. Keep its full expression registered.
-    let compact: String = deps.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(compact.contains(
-        "linux_resolved_external:serde_json::from_value::<UserConfig>(config.clone()).map(|typed|{linux_helper_resolved_owner(self.helper.platform(),typed.proxy_mode_type)}).unwrap_or(false),"
-    ));
-
     // ② 登记在册的读法读了哪些键。
-    let mut keys = std::collections::BTreeSet::from(["proxyModeType".to_owned()]);
+    let mut keys = std::collections::BTreeSet::new();
     for reader in RAW_CONFIG_READERS {
         match *reader {
             "log_axes_from_config" => {

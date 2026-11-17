@@ -1613,6 +1613,9 @@ impl ProxyRuntime {
                 &config,
                 takeover_active,
             );
+            // Reuse the validated startup mode instead of decoding the full config again.
+            deps.linux_resolved_external =
+                linux_helper_resolved_owner(self.helper.platform(), user_config.proxy_mode_type);
             // 网络场景 canary 探针口：与上面几个口同轮分配（重试腿换口自愈）；无场景不分配。
             deps.network_canary_port = self.resolve_network_canary_port(
                 &user_config,
@@ -4031,11 +4034,8 @@ impl ProxyRuntime {
         // A2/C13：日志两轴跟随 config（此前硬编码 Info + 不落 disableLogFile）。
         let (log_level, disable_log_file) = log_axes_from_config(config);
         GenerateConfigDeps {
-            linux_resolved_external: serde_json::from_value::<UserConfig>(config.clone())
-                .map(|typed| {
-                    linux_helper_resolved_owner(self.helper.platform(), typed.proxy_mode_type)
-                })
-                .unwrap_or(false),
+            // Startup supplies ownership from its already validated UserConfig.
+            linux_resolved_external: false,
             platform: platform_tag().to_string(),
             arch: std::env::consts::ARCH.to_string(),
             node_dns_decoy_override: self.node_dns_decoy_override(),

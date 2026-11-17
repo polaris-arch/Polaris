@@ -4945,6 +4945,10 @@ fn manual_runs_directly_without_network_takeover() {
 
 #[test]
 fn resolved_external_is_fixed_by_linux_helper_execution_route() {
+    let source = crate::test_support::crate_code("runtime/proxy/startup.rs");
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("deps.linux_resolved_external=linux_helper_resolved_owner(self.helper.platform(),user_config.proxy_mode_type);"));
+    assert!(!compact.contains("serde_json::from_value::<UserConfig>(config.clone())"));
     use crate::runtime::proxy::startup::linux_helper_resolved_owner;
     use polaris_config_engine::user_config::proxy_mode::ProxyModeType;
     for platform in [
