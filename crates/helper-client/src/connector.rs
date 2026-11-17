@@ -264,7 +264,12 @@ impl ConnectionStream for UnixConnStream {
 
     fn shutdown(&mut self) -> io::Result<()> {
         // Polaris sock.end(frame)：半关闭写端，通知 helper「请求已发完」。
-        self.stream.shutdown(std::net::Shutdown::Write)
+        // A fast peer can reply and close before XNU performs this shutdown.
+        // Its buffered response must still pass the ordinary frame validation.
+        match self.stream.shutdown(std::net::Shutdown::Write) {
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            result => result,
+        }
     }
 }
 

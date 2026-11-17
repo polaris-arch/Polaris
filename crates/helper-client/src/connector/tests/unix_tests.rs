@@ -4,8 +4,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::thread;
 
-/// 起一个单次 accept 的 UnixListener（tempdir 内的本地 IPC socket，**非宿主网络** —— 不碰
-/// netns/veth/iptables/TUN，等同临时文件，安全隔离），读请求帧、回预置响应。
+/// 起一个单次 accept 的本地 UnixListener，读完整请求帧、回预置响应。
 fn spawn_echo_server(
     path: PathBuf,
     response: &'static [u8],
@@ -14,27 +13,12 @@ fn spawn_echo_server(
     let listener = UnixListener::bind(&path).unwrap();
     thread::spawn(move || {
         let (mut conn, _) = listener.accept().unwrap();
-        // 读到 EOF（client shutdown(Write) 触发）或读满一小段。
+        // 读到 client shutdown(Write)，确认完整请求后再回响应。
         let mut got = Vec::new();
-        let mut chunk = [0u8; 256];
-        loop {
-            match conn.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    got.extend_from_slice(&chunk[..n]);
-                    // 请求帧以 `\n` 结尾；client 半关闭后我们读到 EOF，但也可提前在收到整帧后停。
-                    if got.contains(&b'\n') {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        // 慢响应用例里 client 可能已因超时先关连接（EPIPE）——这是被测的预期结局，
-        // 不是夹具故障，故不 unwrap（否则 join 会把预期结局报成测试崩溃）。
+        conn.read_to_end(&mut got).unwrap();
+        // 慢响应用例里 client 可能已因超时先关连接（EPIPE）。
         thread::sleep(delay);
         let _ = conn.write_all(response);
-        // 回完即 drop → client 读到响应 + EOF。
         got
     })
 }
@@ -136,23 +120,28 @@ fn caller_budget_is_the_real_bound_when_helper_is_slow() {
 
 #[test]
 fn buffered_response_survives_peer_close_after_write_shutdown() {
-    let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
-    peer.write_all(b"OK pong uid=0 v9\n").unwrap();
-    drop(peer);
-    let mut conn = UnixConnStream {
-        stream,
-        read_timeout: Duration::from_secs(1),
-    };
-    // Both halves are closed before setting the caller budget. macOS refuses
-    // SO_RCVTIMEO here, but must still deliver the complete buffered response.
-    conn.set_read_timeout(Duration::from_millis(200)).unwrap();
-    let mut response = Vec::new();
-    assert_eq!(
-        conn.read_until_timeout(&mut response).unwrap(),
-        b"OK pong uid=0 v9\n".len()
-    );
-    assert_eq!(response, b"OK pong uid=0 v9\n");
+    for shutdown_before_reply in [true, false] {
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        if shutdown_before_reply {
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        peer.write_all(b"OK pong uid=0 v9\n").unwrap();
+        drop(peer);
+        let mut conn = UnixConnStream {
+            stream,
+            read_timeout: Duration::from_secs(1),
+        };
+        conn.shutdown().unwrap();
+        // A closed peer must not hide the response behind a socket option or
+        // half-close error, whichever side completed shutdown first.
+        conn.set_read_timeout(Duration::from_millis(200)).unwrap();
+        let mut response = Vec::new();
+        assert_eq!(
+            conn.read_until_timeout(&mut response).unwrap(),
+            b"OK pong uid=0 v9\n".len()
+        );
+        assert_eq!(response, b"OK pong uid=0 v9\n");
+    }
 }
 
 #[test]
@@ -164,6 +153,7 @@ fn closed_peer_without_a_response_reports_eof_not_a_socket_option_error() {
         stream,
         read_timeout: Duration::from_secs(1),
     };
+    conn.shutdown().unwrap();
     conn.set_read_timeout(Duration::from_millis(200)).unwrap();
     assert_eq!(conn.read_until_timeout(&mut Vec::new()).unwrap(), 0);
 }
