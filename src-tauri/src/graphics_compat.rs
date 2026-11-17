@@ -101,21 +101,20 @@ pub fn read_config_raw(config_dir: &Path) -> Option<String> {
 // ── Windows：经 WebView2 API 下发的启动参数 ─────────────────────────────────────────────────
 //
 // wry 在 `additional_browser_args` 为 `Some` 时**整体替换**它自己拼的默认串，不是追加
-// （`wry-0.55.1/src/webview2/mod.rs:294` `pl_attrs.additional_browser_args.unwrap_or_else(|| { 默认串 })`；
-// `wry-0.55.1/src/lib.rs:1706-1709` 注释要求调用方自己补回默认参数）。所以关硬件加速时传的串 =
+// （`wry-0.57.2/src/webview2/mod.rs:309` `pl_attrs.additional_browser_args.unwrap_or_else(|| { 默认串 })`；
+// `wry-0.57.2/src/lib.rs:1790-1793` 注释要求调用方自己补回默认参数）。所以关硬件加速时传的串 =
 // **Polaris 实际建窗属性下 wry 会拼出的默认串** + ` --disable-gpu`。逐项推导：
 //
 // 1. `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`：无条件项
-//    （`wry-0.55.1/src/webview2/mod.rs:297`）。丢了它 = 静默打开 mini menu 与 SmartScreen。
-// 2. `--autoplay-policy=no-user-gesture-required`：`attributes.autoplay` 为 true 时追加（`mod.rs:300-302`）。
-//    Polaris 恒为 true：wry 默认 `autoplay: true`（`wry-0.55.1/src/lib.rs:843`）；tauri-runtime-wry 从
-//    `WebViewBuilder::new_with_web_context` 起建（`tauri-runtime-wry-2.11.4/src/lib.rs:4816`，该构造器
-//    `..Default::default()`，`wry-0.55.1/src/lib.rs:882-886`），且 tauri / tauri-runtime-wry / tauri-utils
-//    三个 crate 的 `src/` 里 `autoplay` 零命中 —— 没有任何一层会把它关掉。207 普通权限实测默认命令行
-//    里确有该项（正向对照）。
-// 3. `--proxy-server=...`：**不含**。只在 `attributes.proxy_config` 为 `Some` 时追加（`mod.rs:304-321`），
-//    而它只由 tauri 的 `proxy_url` 喂入（`tauri-runtime-wry-2.11.4/src/lib.rs:5047-5051`），默认 `None`
-//    （`tauri-runtime-2.11.3/src/webview.rs:525`）；`tauri.conf.json` 未声明 `proxyUrl`，四个建窗点也都不调
+//    （`wry-0.57.2/src/webview2/mod.rs:312`）。丢了它 = 静默打开 mini menu 与 SmartScreen。
+// 2. `--autoplay-policy=no-user-gesture-required`：`attributes.autoplay` 为 true 时追加（`mod.rs:315-317`）。
+//    Polaris 恒为 true：wry 默认 `autoplay: true`（`wry-0.57.2/src/lib.rs:881`）；tauri-runtime-wry 从
+//    `WebViewBuilder::new_with_web_context` 起建（`tauri-runtime-wry-2.12.4/src/lib.rs:4740`，该构造器
+//    `..Default::default()`，`wry-0.57.2/src/lib.rs:921-925`），runtime 未调用 `with_autoplay`。
+//    207 在首次复核版本上的普通权限实测默认命令行里确有该项（历史正向对照）。
+// 3. `--proxy-server=...`：**不含**。只在 `attributes.proxy_config` 为 `Some` 时追加（`mod.rs:319-336`），
+//    而它只由 tauri 的 `proxy_url` 喂入（`tauri-runtime-wry-2.12.4/src/lib.rs:4984-4988`），默认 `None`
+//    （`tauri-runtime-2.12.3/src/webview.rs:532`）；`tauri.conf.json` 未声明 `proxyUrl`，四个建窗点也都不调
 //    `.proxy_url(`（`tests/window_build_sites.rs` 守着：谁加了代理，这里的固定串就会把它吞掉）。
 //
 // 本串随依赖版本漂移的门：[`WEBVIEW2_DEFAULT_ARGS_REVIEWED_AGAINST`]。
@@ -139,9 +138,11 @@ const WEBVIEW2_ARGS_HARDWARE_ACCELERATION_OFF: &str =
 /// 由 tauri-runtime-wry 怎么建 builder 决定 —— 推导依赖两者。
 // 2026-09-14 首次复核：wry 0.55.1 `src/webview2/mod.rs:294-322`、`src/lib.rs:843,882-886`；
 // tauri-runtime-wry 2.11.4 `src/lib.rs:4816,5047-5057`（autoplay 零命中）。
+// 2026-11-17 复核：新版默认参数拼接块、runtime 的 proxy 分支与首次版本逐字相同；
+// autoplay 仍默认 true，runtime 仍未调用 with_autoplay。版本和源码位置见上方推导。
 #[cfg(test)]
 pub(crate) const WEBVIEW2_DEFAULT_ARGS_REVIEWED_AGAINST: [(&str, &str); 2] =
-    [("wry", "0.55.1"), ("tauri-runtime-wry", "2.11.4")];
+    [("wry", "0.57.2"), ("tauri-runtime-wry", "2.12.4")];
 
 /// 纯判定：由「是否禁用硬件加速」给出建窗时应传的 `additional_browser_args`。
 ///
@@ -153,8 +154,8 @@ pub(crate) const WEBVIEW2_DEFAULT_ARGS_REVIEWED_AGAINST: [(&str, &str); 2] =
 ///   同样的属性拼出同一个默认串），要么全是同一个 `Some`。
 ///
 /// 平台无关：非 Windows 上 tauri 只把值存进 `WebviewAttributes`，唯一的消费点在 `#[cfg(windows)]` 块里
-/// （`tauri-runtime-wry-2.11.4/src/lib.rs:5054-5057`；builder 方法本身不设 cfg，
-/// `tauri-2.11.5/src/webview/webview_window.rs:1015`、`tauri-2.11.5/src/webview/mod.rs:956`，文档标
+/// （`tauri-runtime-wry-2.12.4/src/lib.rs:4991-4994`；builder 方法本身不设 cfg，
+/// `tauri-2.12.6/src/webview/webview_window.rs:1080`、`tauri-2.12.6/src/webview/mod.rs:1033`，文档标
 /// 「macOS / Linux / Android / iOS: Unsupported」）→ 空操作，调用点无需平台门控。
 pub fn webview2_browser_args_for(disable_hardware_acceleration: bool) -> Option<&'static str> {
     disable_hardware_acceleration.then_some(WEBVIEW2_ARGS_HARDWARE_ACCELERATION_OFF)

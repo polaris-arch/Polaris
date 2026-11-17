@@ -5962,8 +5962,9 @@ fn every_generation_input_key_is_visible_to_norm() {
     assert_eq!(
         param_use_count(&deps, "config"),
         RAW_CONFIG_READERS.len() + 1, // Inline typed Linux DNS ownership projection below.
-        "`generate_deps` 里对原始 config 的取值点数目变了。新增取值点必须登记进 RAW_CONFIG_READERS，\
-             否则它读的键逃过本守卫 —— 那正是「第四类重启」的生成方式。当前体：\n{deps}"
+        "`generate_deps` 里对原始 config 的取值点数目变了。取值点必须由 RAW_CONFIG_READERS 登记的 reader \
+             或下方逐项约束的 inline Linux DNS ownership 投影覆盖；新增或更改取值点须同步对应守卫，\
+             否则它读的键会逃过本守卫 —— 那正是「第四类重启」的生成方式。当前体：\n{deps}"
     );
     for reader in RAW_CONFIG_READERS {
         let name = reader;
