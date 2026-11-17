@@ -7,8 +7,8 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::support::{node_platform, now_iso8601, today_yyyy_mm_dd};
 use crate::commands::picked_file::{
-    classify, display_of, read_picked_to_string, with_picked_gateway_blocking, write_picked, FileGateway,
-    FilePath, PickedTarget,
+    classify, display_of, read_picked_to_string, with_picked_gateway_blocking, write_picked,
+    FileGateway, FilePath, PickedTarget,
 };
 use crate::i18n::{key, t};
 use crate::response::ApiResponse;

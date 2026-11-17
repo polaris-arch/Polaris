@@ -652,7 +652,10 @@ fn own_helper_is_ready_and_not_upgradeable() {
     // 这是 min_usable / expected_proto 两个阈值的**汇合断言**，任一改坏都会红。
     let v = std::hint::black_box(polaris_helper_proto::proto_version::CURRENT);
     assert!(v >= MIN_USABLE_PROTO, "自家 helper 必须判 ready");
-    assert!(v >= expected_proto(Platform::current()), "自家 helper 不该被判为可升级");
+    assert!(
+        v >= expected_proto(Platform::current()),
+        "自家 helper 不该被判为可升级"
+    );
 }
 
 // ===== 装卸流程（install/uninstall）=====
@@ -2365,7 +2368,9 @@ fn windows_v7_requires_behavior_upgrade_but_new_build_ids_do_not() {
     ] {
         let paths = InstallPaths::win();
         let mut sysops = MockSysOps::default();
-        sysops.registered_services.insert(paths.service_label.into());
+        sysops
+            .registered_services
+            .insert(paths.service_label.into());
         let (manager, _dir) = manager_with_token(Platform::Win, sysops);
         let connector = MockConnector {
             streams: Arc::new(Mutex::new(vec![MockStream::with_response(

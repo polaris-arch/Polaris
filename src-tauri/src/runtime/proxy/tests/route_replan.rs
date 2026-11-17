@@ -959,7 +959,6 @@ fn android_interface_snapshot_keeps_real_names_and_availability() {
     assert_eq!(unavailable.missing, BTreeSet::from(["missing0".to_owned()]));
 }
 
-
 /// Five warm starts must not enqueue an all-live close after readiness. Advancing
 /// time across both the old 1.5s deadline and generation changes cannot resurrect
 /// such a job; explicit management and selector-switch close paths remain tested

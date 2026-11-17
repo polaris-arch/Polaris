@@ -4948,10 +4948,18 @@ fn resolved_external_is_fixed_by_linux_helper_execution_route() {
     use crate::runtime::proxy::startup::linux_helper_resolved_owner;
     use polaris_config_engine::user_config::proxy_mode::ProxyModeType;
     for platform in [
-        Platform::Linux, Platform::Mac, Platform::Win,
-        Platform::Android, Platform::Ios, Platform::Other,
+        Platform::Linux,
+        Platform::Mac,
+        Platform::Win,
+        Platform::Android,
+        Platform::Ios,
+        Platform::Other,
     ] {
-        for mode in [ProxyModeType::Tun, ProxyModeType::SystemProxy, ProxyModeType::Manual] {
+        for mode in [
+            ProxyModeType::Tun,
+            ProxyModeType::SystemProxy,
+            ProxyModeType::Manual,
+        ] {
             let expected = matches!(platform, Platform::Linux) && mode == ProxyModeType::Tun;
             assert_eq!(linux_helper_resolved_owner(platform, mode), expected);
         }
@@ -4972,7 +4980,10 @@ fn linux_dns_failure_publication_preserves_new_generation_and_unretired_identity
     assert!(failed.unwrap().contains("cleanup unconfirmed"));
     assert!(runtime.status().running);
     assert_eq!(runtime.status().pid, 1234);
-    assert_eq!(runtime.status().error_code.as_deref(), Some(code::SYSTEM_DNS_TAKEOVER_FAILED));
+    assert_eq!(
+        runtime.status().error_code.as_deref(),
+        Some(code::SYSTEM_DNS_TAKEOVER_FAILED)
+    );
 
     runtime.gate.bump_generation();
     let successor = runtime.gate.generation();
@@ -4982,14 +4993,21 @@ fn linux_dns_failure_publication_preserves_new_generation_and_unretired_identity
         main_generation: successor,
         ..ProxyStatus::default()
     };
-    assert!(runtime.publish_linux_dns_start_failure(generation, Ok(())).is_none());
+    assert!(runtime
+        .publish_linux_dns_start_failure(generation, Ok(()))
+        .is_none());
     assert!(runtime.status().running);
     assert_eq!(runtime.status().pid, 5678);
     assert!(runtime.status().error.is_none());
-    assert!(runtime.publish_linux_dns_start_failure(successor, Ok(())).is_some());
+    assert!(runtime
+        .publish_linux_dns_start_failure(successor, Ok(()))
+        .is_some());
     assert!(!runtime.status().running);
     assert_eq!(runtime.status().pid, 0);
-    assert_eq!(runtime.status().error_code.as_deref(), Some(code::SYSTEM_DNS_TAKEOVER_FAILED));
+    assert_eq!(
+        runtime.status().error_code.as_deref(),
+        Some(code::SYSTEM_DNS_TAKEOVER_FAILED)
+    );
 }
 
 #[tokio::test]
@@ -5012,7 +5030,8 @@ async fn linux_dns_failure_runs_mesh_teardown_before_publishing_failure() {
             let acquired = Arc::clone(&acquired);
             let release = Arc::clone(&release);
             tokio::spawn(async move {
-                mesh.occupy_exit_route_lock_for_test(acquired, release).await;
+                mesh.occupy_exit_route_lock_for_test(acquired, release)
+                    .await;
             })
         };
         acquired.notified().await;
@@ -5030,8 +5049,13 @@ async fn linux_dns_failure_runs_mesh_teardown_before_publishing_failure() {
             while runtime.gate.depth() < 2 && !rollback.is_finished() {
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
-        assert!(!rollback.is_finished(), "failure must wait for mesh route cleanup");
+        })
+        .await
+        .unwrap();
+        assert!(
+            !rollback.is_finished(),
+            "failure must wait for mesh route cleanup"
+        );
         if supersede {
             runtime.gate.bump_generation();
             *runtime.status.write().unwrap() = ProxyStatus {
@@ -5044,7 +5068,11 @@ async fn linux_dns_failure_runs_mesh_teardown_before_publishing_failure() {
         release.notify_one();
         holder.await.unwrap();
         let outcome = rollback.await.unwrap();
-        assert_eq!(runtime.gate.depth(), 1, "nested rollback must balance its gate");
+        assert_eq!(
+            runtime.gate.depth(),
+            1,
+            "nested rollback must balance its gate"
+        );
         if supersede {
             assert!(outcome.is_ok());
             assert!(runtime.status().running);
@@ -5053,7 +5081,10 @@ async fn linux_dns_failure_runs_mesh_teardown_before_publishing_failure() {
         } else {
             assert!(outcome.is_err());
             assert!(!runtime.status().running);
-            assert_eq!(runtime.status().error_code.as_deref(), Some(code::SYSTEM_DNS_TAKEOVER_FAILED));
+            assert_eq!(
+                runtime.status().error_code.as_deref(),
+                Some(code::SYSTEM_DNS_TAKEOVER_FAILED)
+            );
         }
         runtime.finish_lifecycle(LifecycleKind::Start);
     }

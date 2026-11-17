@@ -474,7 +474,10 @@ where
         }
         // 先清旧。
         if !self.clear_inner().await {
-            return ReconcileOutcome { installed: self.installed.clone(), changed: false };
+            return ReconcileOutcome {
+                installed: self.installed.clone(),
+                changed: false,
+            };
         }
         // 再装新。
         if let Some(p) = plan {
@@ -553,7 +556,11 @@ where
 
     /// clear 的核心逻辑（含 macOS BUG2 防误删：接口已消失 → 跳过 route delete）。
     async fn clear_inner(&mut self) -> bool {
-        let cur = match self.cleanup_pending.take().or_else(|| self.installed.take()) {
+        let cur = match self
+            .cleanup_pending
+            .take()
+            .or_else(|| self.installed.take())
+        {
             Some(c) => c,
             None => return true,
         };

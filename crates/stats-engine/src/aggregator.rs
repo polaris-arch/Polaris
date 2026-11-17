@@ -690,7 +690,11 @@ impl OrderedConnections {
 
     fn values(&self) -> impl Iterator<Item = &ConnectionEntry> {
         self.order.values().map(|id| {
-            &self.entries.get(id).expect("ordered connection index is consistent").1
+            &self
+                .entries
+                .get(id)
+                .expect("ordered connection index is consistent")
+                .1
         })
     }
 
@@ -717,8 +721,10 @@ impl OrderedConnections {
             let previous = std::mem::take(&mut self.order);
             for (sequence, (_, key)) in previous.into_iter().enumerate() {
                 let sequence = sequence as u128;
-                self.entries.get_mut(&key)
-                    .expect("ordered connection index is consistent").0 = sequence;
+                self.entries
+                    .get_mut(&key)
+                    .expect("ordered connection index is consistent")
+                    .0 = sequence;
                 self.order.insert(sequence, key);
             }
             self.next_sequence = self.entries.len() as u128;
@@ -964,10 +970,12 @@ impl StatsAggregator {
                     // 流断了、连接页空了，而根因是一个算术溢出，日志里什么都没有。
                     // 内核异常/协议漂移送来一个畸形 delta 不该有这种放大倍数。
                     updated.upload = Some(apply_connection_delta(
-                        updated.upload.unwrap_or(0), ev.uplink_delta,
+                        updated.upload.unwrap_or(0),
+                        ev.uplink_delta,
                     ));
                     updated.download = Some(apply_connection_delta(
-                        updated.download.unwrap_or(0), ev.downlink_delta,
+                        updated.download.unwrap_or(0),
+                        ev.downlink_delta,
                     ));
                     let counters = ConnectionCounters {
                         id: id.clone(),

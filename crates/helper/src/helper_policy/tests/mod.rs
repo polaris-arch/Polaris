@@ -35,7 +35,8 @@ fn compatible_helpers_survive_app_releases_but_required_fixes_upgrade() {
 
 #[test]
 fn windows_exact_object_fix_advances_once_then_reuses_compatible_helper() {
-    let current = polaris_helper_proto::proto_version::for_platform(polaris_helper_proto::Platform::Win);
+    let current =
+        polaris_helper_proto::proto_version::for_platform(polaris_helper_proto::Platform::Win);
     assert_eq!(
         current, 8,
         "the exact-object fix requires a new compatibility generation"

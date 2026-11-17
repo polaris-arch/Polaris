@@ -3017,7 +3017,11 @@ async fn stopped_core_dns_cleanup_failure_is_reported_and_retried() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     // A repeated stop still restores DNS even though the Core is already stopped.
-    assert!(rt.stop_inner(StopClaim::Request(None)).await.unwrap().is_some());
+    assert!(rt
+        .stop_inner(StopClaim::Request(None))
+        .await
+        .unwrap()
+        .is_some());
     assert!(!rt.status().running);
     assert_eq!(rt.status().pid, 0);
     assert_eq!(rt.gate.depth(), 0);
@@ -3037,7 +3041,10 @@ async fn expected_stop_dns_debt_still_clears_dead_system_proxy() {
     }));
     let expected = owned_stop_request(&rt);
     let error = rt.stop_expected(expected).await.unwrap_err();
-    assert!(error.contains("system DNS cleanup"), "unexpected error: {error}");
+    assert!(
+        error.contains("system DNS cleanup"),
+        "unexpected error: {error}"
+    );
     assert_eq!(restores.load(Ordering::SeqCst), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(!rt.status().running);
@@ -3055,8 +3062,14 @@ async fn restart_dns_debt_still_clears_dead_system_proxy() {
         observed.fetch_add(1, Ordering::SeqCst);
         Err("synthetic DNS cleanup debt".into())
     }));
-    let error = rt.restart(post_admission_failure_config()).await.unwrap_err();
-    assert!(error.to_string().contains("system DNS cleanup"), "unexpected error: {error}");
+    let error = rt
+        .restart(post_admission_failure_config())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("system DNS cleanup"),
+        "unexpected error: {error}"
+    );
     assert_eq!(restores.load(Ordering::SeqCst), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(!rt.status().running);

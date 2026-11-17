@@ -273,7 +273,11 @@ fn linux_delete_absence_is_narrowly_idempotent() {
     let absent = b"RTNETLINK answers: No such file or directory\n";
     assert!(ip_delete_already_absent(&delete, absent));
     assert!(!ip_delete_already_absent(&add, absent));
-    for message in [b"RTNETLINK answers: Operation not permitted".as_slice(), b"Cannot find device", b"unknown failure"] {
+    for message in [
+        b"RTNETLINK answers: Operation not permitted".as_slice(),
+        b"Cannot find device",
+        b"unknown failure",
+    ] {
         assert!(!ip_delete_already_absent(&delete, message));
     }
 }
@@ -282,33 +286,91 @@ fn linux_delete_absence_is_narrowly_idempotent() {
 fn linux_disappeared_interface_requires_routes_and_policy_rule_absence() {
     let cidrs = vec!["0.0.0.0/0".into()];
     let empty = serde_json::json!([]);
-    assert!(linux_exit_route_inventory_absent(&empty, &empty, "polaris-ts", &cidrs));
+    assert!(linux_exit_route_inventory_absent(
+        &empty,
+        &empty,
+        "polaris-ts",
+        &cidrs
+    ));
     let leftover_rule = serde_json::json!([{"table":7732,"oif":"polaris-ts"}]);
-    assert!(!linux_exit_route_inventory_absent(&empty, &leftover_rule, "polaris-ts", &cidrs));
+    assert!(!linux_exit_route_inventory_absent(
+        &empty,
+        &leftover_rule,
+        "polaris-ts",
+        &cidrs
+    ));
     let leftover_route = serde_json::json!([{"table":7732,"dst":"default","dev":"polaris-ts"}]);
-    assert!(!linux_exit_route_inventory_absent(&leftover_route, &empty, "polaris-ts", &cidrs));
+    assert!(!linux_exit_route_inventory_absent(
+        &leftover_route,
+        &empty,
+        "polaris-ts",
+        &cidrs
+    ));
     let other = serde_json::json!([{"table":254,"dst":"default","dev":"eth0"}]);
-    assert!(linux_exit_route_inventory_absent(&other, &empty, "polaris-ts", &cidrs));
-    assert!(!linux_exit_route_inventory_absent(&serde_json::json!({}), &empty, "polaris-ts", &cidrs));
-    assert!(!linux_exit_route_inventory_absent(&empty, &serde_json::json!([{"oif":"polaris-ts"}]), "polaris-ts", &cidrs));
+    assert!(linux_exit_route_inventory_absent(
+        &other,
+        &empty,
+        "polaris-ts",
+        &cidrs
+    ));
+    assert!(!linux_exit_route_inventory_absent(
+        &serde_json::json!({}),
+        &empty,
+        "polaris-ts",
+        &cidrs
+    ));
+    assert!(!linux_exit_route_inventory_absent(
+        &empty,
+        &serde_json::json!([{"oif":"polaris-ts"}]),
+        "polaris-ts",
+        &cidrs
+    ));
 }
 
 #[test]
 fn linux_cleanup_unknown_relevant_table_remains_debt() {
     let empty = serde_json::json!([]);
     let cidrs = vec!["0.0.0.0/0".to_string()];
-    for table in [serde_json::Value::Null, serde_json::json!({}), serde_json::json!("garbage"), serde_json::json!("18446744073709551616"), serde_json::json!(4294967296_u64), serde_json::json!("4294967296"), serde_json::json!(-1)] {
+    for table in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!("garbage"),
+        serde_json::json!("18446744073709551616"),
+        serde_json::json!(4294967296_u64),
+        serde_json::json!("4294967296"),
+        serde_json::json!(-1),
+    ] {
         let route = serde_json::json!([{"dev":"polaris-ts", "dst":"default", "table":table}]);
         let rule = serde_json::json!([{"oif":"polaris-ts", "table":table}]);
-        assert!(!linux_exit_route_inventory_absent(&route, &empty, "polaris-ts", &cidrs));
-        assert!(!linux_exit_route_inventory_absent(&empty, &rule, "polaris-ts", &cidrs));
+        assert!(!linux_exit_route_inventory_absent(
+            &route,
+            &empty,
+            "polaris-ts",
+            &cidrs
+        ));
+        assert!(!linux_exit_route_inventory_absent(
+            &empty,
+            &rule,
+            "polaris-ts",
+            &cidrs
+        ));
     }
     let missing = serde_json::json!([{"dev":"polaris-ts", "dst":"default"}]);
-    assert!(!linux_exit_route_inventory_absent(&missing, &empty, "polaris-ts", &cidrs));
+    assert!(!linux_exit_route_inventory_absent(
+        &missing,
+        &empty,
+        "polaris-ts",
+        &cidrs
+    ));
     for table in [serde_json::json!(254), serde_json::json!("254")] {
         let route = serde_json::json!([{"dev":"polaris-ts", "dst":"default", "table":table}]);
         let rule = serde_json::json!([{"oif":"polaris-ts", "table":table}]);
-        assert!(linux_exit_route_inventory_absent(&route, &rule, "polaris-ts", &cidrs));
+        assert!(linux_exit_route_inventory_absent(
+            &route,
+            &rule,
+            "polaris-ts",
+            &cidrs
+        ));
     }
 }
 
@@ -316,8 +378,14 @@ fn linux_cleanup_unknown_relevant_table_remains_debt() {
 fn linux_inventory_query_requires_detailed_numeric_tables() {
     for family in ["-4", "-6"] {
         let args = linux_exit_route_inventory_args(family);
-        assert_eq!(args[0], vec![family, "-j", "-N", "-details", "route", "show", "table", "all"]);
-        assert_eq!(args[1], vec![family, "-j", "-N", "-details", "rule", "show"]);
+        assert_eq!(
+            args[0],
+            vec![family, "-j", "-N", "-details", "route", "show", "table", "all"]
+        );
+        assert_eq!(
+            args[1],
+            vec![family, "-j", "-N", "-details", "rule", "show"]
+        );
     }
     // iproute2's detailed numeric output explicitly identifies the main table.
     // The default destination alone must not make this an owned table-7732 route.
@@ -327,8 +395,18 @@ fn linux_inventory_query_requires_detailed_numeric_tables() {
     }]);
     let rules = serde_json::json!([{"priority":32766, "src":"all", "table":"254"}]);
     let cidrs = vec!["0.0.0.0/0".to_string()];
-    assert!(linux_exit_route_inventory_absent(&main, &rules, "polaris-ts", &cidrs));
+    assert!(linux_exit_route_inventory_absent(
+        &main,
+        &rules,
+        "polaris-ts",
+        &cidrs
+    ));
     let mut missing_table = main;
     missing_table[0].as_object_mut().unwrap().remove("table");
-    assert!(!linux_exit_route_inventory_absent(&missing_table, &rules, "polaris-ts", &cidrs));
+    assert!(!linux_exit_route_inventory_absent(
+        &missing_table,
+        &rules,
+        "polaris-ts",
+        &cidrs
+    ));
 }

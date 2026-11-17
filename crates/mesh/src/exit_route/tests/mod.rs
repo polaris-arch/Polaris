@@ -849,20 +849,44 @@ async fn failed_delete_retains_cleanup_custody_without_claiming_installed() {
     reconcile_now(&mut mgr, &cfg, false).await;
     *op.route_ok.lock().unwrap() = false;
     mgr.clear().await;
-    assert!(mgr.installed().is_none(), "partial deletion is not installed proof");
+    assert!(
+        mgr.installed().is_none(),
+        "partial deletion is not installed proof"
+    );
     assert!(mgr.cleanup_pending.is_some());
     mgr.reset_state();
-    assert!(mgr.cleanup_pending.is_some(), "crash reset must not erase delete debt");
-    let adds_before = op.routes.lock().unwrap().iter().filter(|r| r.0 == "add").count();
+    assert!(
+        mgr.cleanup_pending.is_some(),
+        "crash reset must not erase delete debt"
+    );
+    let adds_before = op
+        .routes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.0 == "add")
+        .count();
     reconcile_now(&mut mgr, &cfg, false).await;
-    assert_eq!(op.routes.lock().unwrap().iter().filter(|r| r.0 == "add").count(), adds_before,
-        "must not install over an unretired owner");
+    assert_eq!(
+        op.routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == "add")
+            .count(),
+        adds_before,
+        "must not install over an unretired owner"
+    );
     *op.route_ok.lock().unwrap() = true;
     mgr.clear().await;
     assert!(mgr.cleanup_pending.is_none());
     let calls = op.routes.lock().unwrap().len();
     mgr.clear().await;
-    assert_eq!(op.routes.lock().unwrap().len(), calls, "confirmed deletion is not repeated");
+    assert_eq!(
+        op.routes.lock().unwrap().len(),
+        calls,
+        "confirmed deletion is not repeated"
+    );
 }
 
 #[tokio::test]

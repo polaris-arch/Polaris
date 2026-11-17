@@ -656,7 +656,9 @@ pub(super) fn should_start_via_helper(mode: ProxyModeType, platform: Platform) -
 pub(super) fn linux_helper_resolved_owner(platform: Platform, mode: ProxyModeType) -> bool {
     match platform {
         Platform::Linux => should_start_via_helper(mode, platform),
-        Platform::Mac | Platform::Win | Platform::Android | Platform::Ios | Platform::Other => false,
+        Platform::Mac | Platform::Win | Platform::Android | Platform::Ios | Platform::Other => {
+            false
+        }
     }
 }
 
@@ -2940,7 +2942,10 @@ impl ProxyRuntime {
         let reason = "Linux Helper DNS takeover was not confirmed";
         let (message, retired) = match stopped {
             Ok(()) => (reason.to_string(), true),
-            Err(error) => (format!("{reason}; startup cleanup unconfirmed: {error}"), false),
+            Err(error) => (
+                format!("{reason}; startup cleanup unconfirmed: {error}"),
+                false,
+            ),
         };
         if retired {
             self.revoke_tailnet_context();
@@ -4028,10 +4033,7 @@ impl ProxyRuntime {
         GenerateConfigDeps {
             linux_resolved_external: serde_json::from_value::<UserConfig>(config.clone())
                 .map(|typed| {
-                    linux_helper_resolved_owner(
-                        self.helper.platform(),
-                        typed.proxy_mode_type,
-                    )
+                    linux_helper_resolved_owner(self.helper.platform(), typed.proxy_mode_type)
                 })
                 .unwrap_or(false),
             platform: platform_tag().to_string(),
@@ -4239,7 +4241,9 @@ impl ProxyRuntime {
         runtime_bind_interfaces: &BTreeMap<String, String>,
     ) -> Result<GateOutcome, String> {
         if deps.linux_resolved_external && binary.is_none() {
-            return Err("Linux Helper resolved ownership requires a checkable selected Core".into());
+            return Err(
+                "Linux Helper resolved ownership requires a checkable selected Core".into(),
+            );
         }
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;

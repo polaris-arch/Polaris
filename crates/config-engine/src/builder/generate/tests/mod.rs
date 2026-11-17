@@ -2504,7 +2504,10 @@ fn external_resolved_owner_is_linux_tun_only_and_keeps_dns_mode() {
             if inbound["type"] == "tun" && platform == "linux" {
                 assert_eq!(inbound["linux_resolved_external"], true);
                 owner_count += 1;
-                inbound.as_object_mut().unwrap().remove("linux_resolved_external");
+                inbound
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("linux_resolved_external");
             } else {
                 assert!(inbound.get("linux_resolved_external").is_none());
             }

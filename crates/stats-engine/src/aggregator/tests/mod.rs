@@ -1694,8 +1694,14 @@ fn ordered_connections_preserve_indexmap_mutation_semantics() {
             }
         }
         assert_eq!(actual.len(), reference.len());
-        assert_eq!(actual.keys().collect::<Vec<_>>(), reference.keys().collect::<Vec<_>>());
-        assert_eq!(actual.values().collect::<Vec<_>>(), reference.values().collect::<Vec<_>>());
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            reference.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual.values().collect::<Vec<_>>(),
+            reference.values().collect::<Vec<_>>()
+        );
         assert_eq!(actual.entries.len(), actual.order.len());
     }
 }
@@ -1715,11 +1721,17 @@ fn ordered_connections_rollover_preserves_recency_and_lookup() {
     actual.insert("B".into(), b);
     assert_eq!(actual.next_sequence, u128::MAX);
     actual.insert("D".into(), conn("D", None, None));
-    assert_eq!(actual.keys().map(String::as_str).collect::<Vec<_>>(), ["B", "C", "A", "D"]);
+    assert_eq!(
+        actual.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["B", "C", "A", "D"]
+    );
     assert_eq!(actual.get("B").unwrap().upload, Some(42));
     assert_eq!(actual.next_sequence, 4);
     actual.remove("C");
-    assert_eq!(actual.keys().map(String::as_str).collect::<Vec<_>>(), ["B", "A", "D"]);
+    assert_eq!(
+        actual.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["B", "A", "D"]
+    );
     actual.clear();
     assert_eq!(actual.next_sequence, 0);
     assert!(actual.order.is_empty());
@@ -1791,5 +1803,8 @@ fn negative_connection_update_matches_emitted_counters_and_recency() {
     assert_eq!(entry.download, Some(0));
     assert_eq!(counters.upload, 0);
     assert_eq!(counters.download, 0);
-    assert_eq!(agg.conn_map.keys().map(String::as_str).collect::<Vec<_>>(), ["B", "A"]);
+    assert_eq!(
+        agg.conn_map.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["B", "A"]
+    );
 }

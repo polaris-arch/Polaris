@@ -1528,9 +1528,11 @@ impl ExitRouteOp for HelperExitRouteOp {
             // 判定与执行分离（[`run_linux_route_seq`]）：真 `ip` 调用是真机门（本机绝不 spawn），
             // 而「哪条是门、失败后跳不跳、del 腿返什么」是可测的纯编排 —— 单测注入假 runner 覆盖。
             Platform::Linux => {
-                let commands_ok = run_linux_route_seq(op, linux_route_argv(op, iface, cidrs), |argv| async move {
-                    run_ip_command(&argv).await
-                })
+                let commands_ok = run_linux_route_seq(
+                    op,
+                    linux_route_argv(op, iface, cidrs),
+                    |argv| async move { run_ip_command(&argv).await },
+                )
                 .await;
                 if op == "del" {
                     // Even a vanished interface can leave an oif policy rule. Query
@@ -1838,15 +1840,18 @@ fn linux_exit_route_inventory_absent(
         return false;
     };
     let numeric_table = |table: &serde_json::Value| {
-        table.as_u64().or_else(|| {
-            table.as_str().and_then(|value| {
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    None
-                } else {
-                    value.parse::<u64>().ok()
-                }
+        table
+            .as_u64()
+            .or_else(|| {
+                table.as_str().and_then(|value| {
+                    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                        None
+                    } else {
+                        value.parse::<u64>().ok()
+                    }
+                })
             })
-        }).filter(|table| *table <= u64::from(u32::MAX))
+            .filter(|table| *table <= u64::from(u32::MAX))
     };
     for route in routes {
         let Some(object) = route.as_object() else {
@@ -1890,7 +1895,9 @@ fn linux_exit_route_inventory_absent(
 // Numeric output avoids local table aliases; both inventories must be authoritative.
 fn linux_exit_route_inventory_args(family: &str) -> [Vec<&str>; 2] {
     [
-        vec![family, "-j", "-N", "-details", "route", "show", "table", "all"],
+        vec![
+            family, "-j", "-N", "-details", "route", "show", "table", "all",
+        ],
         vec![family, "-j", "-N", "-details", "rule", "show"],
     ]
 }
@@ -1900,7 +1907,11 @@ async fn verify_linux_exit_route_absent(iface: &str, cidrs: &[String]) -> bool {
         let mut inventories = Vec::new();
         for args in linux_exit_route_inventory_args(family) {
             let output = match tokio::process::Command::new("ip")
-                .env("LC_ALL", "C").args(args).output().await {
+                .env("LC_ALL", "C")
+                .args(args)
+                .output()
+                .await
+            {
                 Ok(output) if output.status.success() => output,
                 _ => return false,
             };
@@ -1921,9 +1932,8 @@ async fn verify_linux_exit_route_absent(iface: &str, cidrs: &[String]) -> bool {
 // Permission errors, missing executables/devices and unknown failures retain debt.
 fn ip_delete_already_absent(argv: &[String], stderr: &[u8]) -> bool {
     argv.iter().any(|arg| arg == "del")
-        && std::str::from_utf8(stderr).is_ok_and(|text| {
-            text.trim() == "RTNETLINK answers: No such file or directory"
-        })
+        && std::str::from_utf8(stderr)
+            .is_ok_and(|text| text.trim() == "RTNETLINK answers: No such file or directory")
 }
 
 /// 运行 `ip <argv>`，**返回是否真的成功**（退出码 0）。Linux 出口路由手术（app CAP_NET_ADMIN）。**真机门**。
@@ -1932,7 +1942,12 @@ fn ip_delete_already_absent(argv: &[String], stderr: &[u8]) -> bool {
 /// （见 [`HelperExitRouteOp::run_route`] 的 Linux 分支）。`ip` 不在 PATH（`Err`）与非零退出
 /// （无 CAP_NET_ADMIN / 语法错 / 内核不支持）都返 `false`。
 async fn run_ip_command(argv: &[String]) -> bool {
-    match tokio::process::Command::new("ip").env("LC_ALL", "C").args(argv).output().await {
+    match tokio::process::Command::new("ip")
+        .env("LC_ALL", "C")
+        .args(argv)
+        .output()
+        .await
+    {
         Ok(o) if o.status.success() => true,
         Ok(o) if ip_delete_already_absent(argv, &o.stderr) => true,
         Ok(o) => {
