@@ -382,3 +382,24 @@ fn local_backup_rejects_symlink_without_changing_its_target() {
     );
     assert_eq!(std::fs::read_to_string(&existing).unwrap(), "keep");
 }
+
+#[tokio::test]
+async fn backup_background_parser_preserves_formats_and_errors() {
+    for raw in [
+        r#"{"version":"1.2","platform":"linux","config":{"servers":[]}}"#,
+        r#"{"servers":[{"id":"one"}]}"#,
+        r#"{"unrelated":true}"#,
+        "not json",
+    ] {
+        let expected = parse_backup_content(raw);
+        let actual = parse_backup_off_thread(raw.to_owned()).await;
+        match (expected, actual) {
+            (Ok(expected), Ok(actual)) => {
+                assert_eq!(actual.config, expected.config);
+                assert_eq!(actual.platform, expected.platform);
+            }
+            (Err(expected), Err(actual)) => assert_eq!(actual, expected),
+            _ => panic!("background parsing changed backup acceptance"),
+        }
+    }
+}

@@ -1765,3 +1765,23 @@ fn modern_dns_restore_cannot_bypass_protected_resource_save_admission() {
     assert!(crate::ConfigStore::canonicalize_for_save(&valid.config).is_ok());
     assert_eq!(valid.config["dnsDefaults"]["directServerId"], "custom");
 }
+
+#[test]
+fn backup_wrapper_transfer_preserves_large_config_and_platform() {
+    let config = json!({"servers": [{"id": "large", "name": "x".repeat(1024 * 1024)}]});
+    let raw = json!({"version": "1.2", "config": config, "platform": "linux"}).to_string();
+    let parsed = parse_backup_content(&raw).unwrap();
+    assert_eq!(parsed.config, config);
+    assert_eq!(parsed.platform.as_deref(), Some("linux"));
+}
+
+#[test]
+fn backup_wrapper_transfer_preserves_truthiness_and_legacy_fallback() {
+    // False/null config continues to fall back to a bare legacy object if servers exists.
+    for config in [Value::Null, json!(false), json!(0), json!("")] {
+        let original = json!({"version": "1.2", "config": config, "servers": []});
+        let parsed = parse_backup_content(&original.to_string()).unwrap();
+        assert_eq!(parsed.config, original);
+        assert_eq!(parsed.platform, None);
+    }
+}

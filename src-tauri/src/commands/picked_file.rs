@@ -457,3 +457,21 @@ where
 // cfg 门仍在，测试专用符号照旧进不了生产构建。
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Run user-selected file work on the blocking pool for both paths and URIs.
+/// Backup files may live on slow/network filesystems even on desktop. This is
+/// deliberately separate from the legacy dispatcher so other callers retain
+/// their scheduling behavior. This does not impose a file-size/time budget.
+pub async fn with_picked_gateway_blocking<R, T, F>(
+    app: &AppHandle<R>,
+    picked: Option<FilePath>,
+    work: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    R: Runtime,
+    T: Send + 'static,
+    F: FnOnce(&dyn FileGateway, Option<FilePath>) -> T + Send + 'static,
+{
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || work(&PluginFiles::new(&app), picked)).await
+}

@@ -901,15 +901,16 @@ pub struct ParsedBackup {
 /// # Errors
 /// 坏 JSON → `invalid_json`；既非新格式也非旧格式 → `invalid_format`。
 pub fn parse_backup_content(raw: &str) -> Result<ParsedBackup, &'static str> {
-    let parsed: Value = serde_json::from_str(raw).map_err(|_| "invalid_json")?;
+    let mut parsed: Value = serde_json::from_str(raw).map_err(|_| "invalid_json")?;
     if truthy(parsed.get("version")) && truthy(parsed.get("config")) {
-        return Ok(ParsedBackup {
-            config: parsed["config"].clone(),
-            platform: parsed
-                .get("platform")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        });
+        let platform = parsed
+            .get("platform")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // Transfer the potentially large tree; do not duplicate it while the input
+        // and wrapper are still alive. The truthiness/legacy format rules are unchanged.
+        let config = parsed.get_mut("config").expect("checked config").take();
+        return Ok(ParsedBackup { config, platform });
     }
     if parsed.get("servers").is_some() {
         // 旧版直接导出的 UserConfig（TS 判据 `parsed.servers !== undefined`）

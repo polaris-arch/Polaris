@@ -7,7 +7,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::support::{node_platform, now_iso8601, today_yyyy_mm_dd};
 use crate::commands::picked_file::{
-    classify, display_of, read_picked_to_string, with_picked_gateway, write_picked, FileGateway,
+    classify, display_of, read_picked_to_string, with_picked_gateway_blocking, write_picked, FileGateway,
     FilePath, PickedTarget,
 };
 use crate::i18n::{key, t};
@@ -185,7 +185,7 @@ fn read_import_source(gateway: &dyn FileGateway, picked: Option<FilePath>) -> Im
 /// （剥掉 scheme 后 `Url::parse` 失败 ⇒ 落 `Path` ⇒ `std::fs::read_to_string` 一个相对路径 ⇒ ENOENT）。
 ///
 /// 入参刻意是 **`&str` 而不是已解析的 [`FilePath`]**：解析本身就是判据的一部分，缝外先解析
-/// 一次只是为了决定派不派线程（见 [`with_picked_gateway`]）。
+/// 一次用于验证路径/URI 的往返，读取均在阻塞线程池执行。
 ///
 /// 这道缝同时钉住桌面侧唯一没被断言过的分流点：`FilePath::from_str` 把**单字母 scheme** 留给
 /// Windows 盘符（`C:\…` ⇒ `Path`，`tauri-plugin-fs-2.5.1/src/file_path.rs:189-196`），
@@ -246,10 +246,10 @@ pub async fn backup_export(
             return Ok(ApiResponse::ok(backup_failure("serializeFailed")));
         }
     };
-    // URI 支的插件 I/O 是同步阻塞的、且上游拿不到 fd 时会 panic ⇒ 经 `with_picked_gateway`
-    // 派线程（桌面那一支仍原地跑）。`JoinError` 不许 `unwrap()`：那会把 panic 变回一个永不
+    // URI 支的插件 I/O 是同步阻塞的、且上游拿不到 fd 时会 panic ⇒ 经 `with_picked_gateway_blocking`
+    // 派线程（桌面路径同样派到阻塞池）。`JoinError` 不许 `unwrap()`：那会把 panic 变回一个永不
     // settle 的 promise，`BackupPage.tsx` 的 `setBusy(false)` 写在 `finally` 里，一起冻住。
-    let payload = with_picked_gateway(&app, target, move |gateway, target| {
+    let payload = with_picked_gateway_blocking(&app, target, move |gateway, target| {
         finish_export(gateway, target, &body)
     })
     .await
@@ -288,12 +288,22 @@ async fn import_interface_names_from(
     }
 }
 
+// JSON parsing is CPU work proportional to the selected file. Keep it off the
+// async executor too; ownership releases the raw buffer before returning the tree.
+async fn parse_backup_off_thread(
+    raw: String,
+) -> Result<polaris_store::backup::ParsedBackup, &'static str> {
+    tokio::task::spawn_blocking(move || parse_backup_content(&raw))
+        .await
+        .unwrap_or(Err("invalid_json"))
+}
+
 /// 上游 `BACKUP_IMPORT_PICK`：弹文件框 + 解析 → 返回含哪些类 + 各类数量（**不 apply**）。
 #[tauri::command]
 pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()> {
     let picked = ask_open_path(&app).await;
-    // 同 `backup_export`：URI 支派线程 + `JoinError` 收成 readFailed，不留永不 settle 的 promise。
-    let source = with_picked_gateway(&app, picked, read_import_source)
+    // 同 `backup_export`：路径和 URI 均派线程，`JoinError` 收成 readFailed。
+    let source = with_picked_gateway_blocking(&app, picked, read_import_source)
         .await
         .unwrap_or_else(|e| {
             log::warn!("[backup] import pick task join failed: {e}");
@@ -308,7 +318,7 @@ pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()
         }
         ImportSource::Loaded { raw, file_path } => (raw, file_path),
     };
-    let parsed = match parse_backup_content(&raw) {
+    let parsed = match parse_backup_off_thread(raw).await {
         Ok(p) => p,
         Err(code) => {
             log::warn!("[backup] import preview parse rejected: {code}");
@@ -377,9 +387,9 @@ pub async fn backup_import_apply(
         return Ok(ApiResponse::ok(backup_failure("invalidArgs")));
     }
     // 前端回传的是 `backup_import_pick` 给出的那个字符串。分流与判据都住在 [`read_apply_source`]；
-    // 这里先解析一次，只为让 `with_picked_gateway` 知道该不该把它派到阻塞线程池。
+    // 路径和 URI 的读取均派到阻塞线程池。
     let target = FilePath::from_str(&file_path).expect("FilePath::from_str 是 Infallible");
-    let raw = match with_picked_gateway(&app, Some(target), move |gateway, _| {
+    let raw = match with_picked_gateway_blocking(&app, Some(target), move |gateway, _| {
         read_apply_source(gateway, &file_path)
     })
     .await
@@ -391,7 +401,7 @@ pub async fn backup_import_apply(
             return Ok(ApiResponse::ok(backup_failure("readFailed")));
         }
     };
-    let parsed = match parse_backup_content(&raw) {
+    let parsed = match parse_backup_off_thread(raw).await {
         Ok(p) => p,
         Err(code) => {
             log::warn!("[backup] import apply parse rejected: {code}");
