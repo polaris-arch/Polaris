@@ -583,7 +583,7 @@ fn unit_bytes_allowed(bytes: &[u8]) -> bool {
     }
     start
 }
-fn empty_hooks() -> io::Result<()> {
+fn empty_hooks(masked: bool) -> io::Result<()> {
     for key in [
         "ExecStartPre",
         "ExecStartPost",
@@ -617,8 +617,11 @@ fn empty_hooks() -> io::Result<()> {
         ("Slice", "system.slice"),
         ("DynamicUser", "no"),
     ] {
+        let actual = property(key)?;
+        // A masked unit can lose its Slice association while its existing
+        // process remains in the checked ControlGroup below (systemd 259).
         require(
-            property(key)? == expected,
+            actual == expected || (masked && key == "Slice" && actual.is_empty()),
             "foreign effective unit configuration",
         )?;
     }
@@ -679,7 +682,7 @@ fn old_scope(directory: &Directory) -> io::Result<(Vec<u8>, String)> {
         property("LoadState")? == "loaded" && property("FragmentPath")? == UNIT,
         "old fixed regular unit is not loaded",
     )?;
-    empty_hooks()?;
+    empty_hooks(false)?;
     require(
         allowed_start(&property("ExecStart")?),
         "effective ExecStart outside fixed legacy allowlist",
@@ -1114,7 +1117,7 @@ impl Journal {
                 && matches!(property("FragmentPath")?.as_str(), "/dev/null" | UNIT),
             "manager has not loaded ownmask",
         )?;
-        empty_hooks()?;
+        empty_hooks(true)?;
         self.ownmask()
     }
     fn close_fenced(&self) -> io::Result<()> {
@@ -1579,12 +1582,32 @@ fn prepare(request: &Request, lease: &Arc<ProtectedPath>) -> io::Result<Journal>
             "cross-action/user journal",
         )?;
         if request.action == Action::Install {
-            require(
-                journal.get("utility")? == request.helper_sha
-                    && journal.get("id")? == request.id
-                    && journal.get("manifest")? == request.manifest_sha,
-                "recovery candidate differs from selected pin",
-            )?;
+            if journal.get("utility")? != request.helper_sha
+                || journal.get("id")? != request.id
+                || journal.get("manifest")? != request.manifest_sha
+            {
+                // An explicitly selected repair may resume a failed fence, but
+                // must never replace a candidate whose staging already began.
+                require(
+                    matches!(
+                        journal.phase()?,
+                        Phase::Prepared | Phase::FenceIntent | Phase::StoppedFenced
+                    ),
+                    "recovery candidate differs after staging began",
+                )?;
+                if journal.phase()? != Phase::Prepared {
+                    journal.ownmask()?;
+                }
+                preflight_selected_policy(request)?;
+                journal
+                    .fields
+                    .insert("utility".into(), request.helper_sha.clone());
+                journal.fields.insert("id".into(), request.id.clone());
+                journal
+                    .fields
+                    .insert("manifest".into(), request.manifest_sha.clone());
+                journal.save()?;
+            }
         }
         return Ok(journal);
     }
@@ -2055,7 +2078,7 @@ fn activate(journal: &mut Journal) -> io::Result<()> {
         property("LoadState")? == "loaded" && property("FragmentPath")? == UNIT,
         "new unit not loaded",
     )?;
-    empty_hooks()?;
+    empty_hooks(false)?;
     require(
         allowed_start(&property("ExecStart")?),
         "new effective ExecStart differs",
