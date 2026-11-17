@@ -1,4 +1,7 @@
-//! TUN 起核就绪后的连接 flush（逼旧连接重连，落到代理链上）。
+//! TUN 起核就绪后的移动端兼容连接 flush。
+//!
+//! 桌面端不再自动 flush：延迟快照不能区分旧直连和刚建立的正确代理连接，
+//! 会在已宣告就绪后中断 TLS。显式关闭连接和切换节点的精准断连不受影响。
 //!
 //! # 为什么逐条 `CloseConnection` 而不是 `CloseAllConnections`
 //!
@@ -13,8 +16,8 @@
 //! `trafficManager.Connection(id).Close()`，只关路由连接、不碰拨号器 socket —— 这正是 flush 的本意。
 //! 实现复用 [`close_live_connections`]（与连接页「关闭全部」同一 helper）。
 //!
-//! **已知代价**：快照与逐条关闭之间新建的连接不在快照里，不会被关。可接受 —— flush 只针对
-//! 起核**前**遗留、经 TUN 重新入表的连接，它们在 1.5s 延迟窗口内早已进表、必在快照里。
+//! 移动端兼容路径仍有既有代价：快照无法证明连接早于接管，新建连接也可能被关闭。
+//! 不得将该路径用作桌面旧连接的来源证明；本轮不改变移动端生命周期。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -57,7 +60,8 @@ pub(super) enum FlushOutcome {
 const CONNECTION_FLUSH_DELAY_MS: u64 = 1500;
 
 impl ProxyRuntime {
-    /// **#9**：TUN 起核就绪后延迟一次连接 flush（`spawn_crash_monitor` 的世代范式）。
+    /// 移动端兼容路径：延迟一次连接 flush；桌面返回 false，不创建任务。
+    /// 返回值表示是否创建任务，不表示关闭连接已经完成。
     ///
     /// 为什么需要：app 在 TUN 建立**之前**发起的连接已经泄漏成真实 IP，起核后它们的后续包仍走物理
     /// 网卡直出 —— 用户看到「已连接」，实际那几条连接从未进过代理。延迟一小段后逐条关闭活连接
@@ -69,7 +73,8 @@ impl ProxyRuntime {
     /// 代价是逐条关闭也会重置 flush 之前用户新建的正确连接（app 自行重连、短暂抖动）——
     /// 属「启用代理即断开现有连接」的固有代价，用单次短窗口把误伤面压到最小。
     ///
-    /// **两条守卫都在 [`flush_connections_once`](Self::flush_connections_once) 里**，本方法只负责
+    /// 桌面禁用守卫在本方法最前；移动端两条运行守卫在
+    /// [`flush_connections_once`](Self::flush_connections_once) 里，其余部分只负责
     /// 「等一段时间再问一次」。刻意不在这里预先判 TUN 早退：判据留在**单一决策点**上，才能被单测直接
     /// 覆盖到；非 TUN 时多出的那个 sleep 任务在 1.5s 后自行退场，代价可忽略。
     ///
@@ -80,7 +85,19 @@ impl ProxyRuntime {
         mode: ProxyModeType,
         my_gen: u64,
         api_port: u16,
-    ) {
+    ) -> bool {
+        // No connection-level provenance proves that a live desktop connection
+        // predates takeover. A delayed all-live snapshot therefore cannot be a
+        // safe stale-connection cleanup (Mac warm-start TLS regression). Do not
+        // create a timer or hold the network-settle gate for that operation.
+        if matches!(
+            self.helper.platform(),
+            polaris_helper_proto::Platform::Mac
+                | polaris_helper_proto::Platform::Win
+                | polaris_helper_proto::Platform::Linux
+        ) {
+            return false;
+        }
         let me = Arc::clone(self);
         // 与 ReassertSettledGuard 的 guard 重叠接棒：本行先 +1，前者随后 Drop -1，门全程不归零。
         // 接管方式取**本平台生效值**（见 [`Self::flush_connections_once`] 守卫①的说明）。
@@ -114,6 +131,7 @@ impl ProxyRuntime {
                 skipped => log::debug!("TUN 起核连接 flush 跳过：{skipped:?}"),
             }
         });
+        true
     }
 
     /// 生产入口：以真实 gRPC 管理 API 调 [`flush_connections_with`](Self::flush_connections_with)。

@@ -20,7 +20,7 @@
 //! - [`aggregate_signature`] = aggregateSignature（connections-aggregate.ts:99）。
 
 use polaris_config_engine::builder::is_probe_pool_inbound_tag;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::types::{
     ConnectionAggFlow, ConnectionAggHost, ConnectionAggOutbound, ConnectionCounters,
@@ -233,8 +233,8 @@ pub fn trim_connection(c: &SingBoxConnection) -> ConnectionEntry {
         rule_id: None,
         rule_name: None,
         metadata: metadata_non_empty.then_some(metadata),
-        upload: Some(c.uplink_total as u64),
-        download: Some(c.downlink_total as u64),
+        upload: Some(c.uplink_total.max(0) as u64),
+        download: Some(c.downlink_total.max(0) as u64),
         start: created_at_to_rfc3339(c.created_at),
     }
 }
@@ -653,6 +653,83 @@ fn push_escaped(out: &mut String, s: &str) {
     }
 }
 
+/// Preserve the signed wire counter ceiling, but never cast a negative result
+/// into an enormous unsigned total. Also normalize a legacy out-of-range value.
+fn apply_connection_delta(total: u64, delta: i64) -> u64 {
+    (total.min(i64::MAX as u64) as i64)
+        .saturating_add(delta)
+        .max(0) as u64
+}
+
+/// Ordered keyed storage without shifting every surviving entry on removal.
+/// Existing-key insertion preserves position; remove + insert touches recency.
+/// Mutations are O(log n), ordered iteration remains O(n) expected.
+#[derive(Default)]
+struct OrderedConnections {
+    entries: HashMap<String, (u128, ConnectionEntry)>,
+    order: BTreeMap<u128, String>,
+    next_sequence: u128,
+}
+
+impl OrderedConnections {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, id: &str) -> Option<&ConnectionEntry> {
+        self.entries.get(id).map(|(_, entry)| entry)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.order.values()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &ConnectionEntry> {
+        self.order.values().map(|id| {
+            &self.entries.get(id).expect("ordered connection index is consistent").1
+        })
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.next_sequence = 0;
+    }
+
+    fn remove(&mut self, id: &str) -> Option<ConnectionEntry> {
+        let (sequence, entry) = self.entries.remove(id)?;
+        self.order.remove(&sequence);
+        Some(entry)
+    }
+
+    fn insert(&mut self, id: String, entry: ConnectionEntry) {
+        if let Some((_, existing)) = self.entries.get_mut(&id) {
+            *existing = entry;
+            return;
+        }
+        if self.next_sequence == u128::MAX {
+            // Preserve order on counter rollover, without retaining tombstones.
+            // usize fits u128; a live table cannot exhaust this sequence space.
+            let previous = std::mem::take(&mut self.order);
+            for (sequence, (_, key)) in previous.into_iter().enumerate() {
+                let sequence = sequence as u128;
+                self.entries.get_mut(&key)
+                    .expect("ordered connection index is consistent").0 = sequence;
+                self.order.insert(sequence, key);
+            }
+            self.next_sequence = self.entries.len() as u128;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.order.insert(sequence, id.clone());
+        self.entries.insert(id, (sequence, entry));
+    }
+}
+
 // ── 有状态聚合器（StatsService.ts onStatus / onConnectionEvents）─────────────────
 
 /// 维护 connMap + TrafficStats snapshot 的有状态聚合器。
@@ -661,12 +738,12 @@ fn push_escaped(out: &mut String, s: &str) {
 /// [`crate::resubscribe`]）。帧经 [`StatsAggregator::on_status`] / [`StatsAggregator::on_connection_events`]
 /// 注入；状态经 [`StatsAggregator::snapshot`] / [`StatsAggregator::entries`] 取。
 ///
-/// connMap 用 [`IndexMap`](indexmap::IndexMap)（保持插入序，支持 LRU：UPDATE 时 delete+set 把活跃条目移到末尾，#167）。
+/// connMap 用双索引有序表（保持插入序，UPDATE 时 remove+insert 移到末尾；删除不搬移其余条目）。
 /// key = 连接 id。
 pub struct StatsAggregator {
     snapshot: TrafficStats,
     /// 连接事件只在入表时裁剪一次；不保留 gRPC 原始对象中 UI/拓扑永远不会读取的字段。
-    conn_map: indexmap::IndexMap<String, ConnectionEntry>,
+    conn_map: OrderedConnections,
     /// 仅从已启动核的配置建立；给新连接冻结身份，配置后续保存不回写旧条目。
     named_rules: BTreeMap<String, RuleIdentity>,
     /// max conn map size（OOM 安全网，默认 [`MAX_CONN_MAP_SIZE`]；测试可注入小值）。
@@ -694,7 +771,7 @@ impl StatsAggregator {
     pub fn with_max_conn_map_size(max_conn_map_size: usize) -> Self {
         Self {
             snapshot: TrafficStats::zeroed(),
-            conn_map: indexmap::IndexMap::new(),
+            conn_map: OrderedConnections::new(),
             named_rules: BTreeMap::new(),
             max_conn_map_size,
             last_status: None,
@@ -845,8 +922,9 @@ impl StatsAggregator {
         }
         // OOM 安全网：超硬上限按插入序（最旧、最可能是漏删死连接）驱逐。
         while self.conn_map.len() > self.max_conn_map_size {
-            if let Some(first) = self.conn_map.keys().next().cloned() {
-                self.conn_map.shift_remove(&first);
+            let oldest = self.conn_map.keys().next().cloned();
+            if let Some(first) = oldest {
+                self.conn_map.remove(&first);
                 change.remove(first);
             } else {
                 break;
@@ -871,27 +949,26 @@ impl StatsAggregator {
         };
         match ev.kind {
             ConnectionEventType::Closed => {
-                self.conn_map.shift_remove(&id);
+                self.conn_map.remove(&id);
                 change.remove(id);
             }
             ConnectionEventType::Update => {
                 // UPDATE 帧只带 delta（connection 通常为 null）→ 累加到既有条目 totals。
                 // 漏收 NEW（UPDATE 先到）时 ev.connection 兜底补建。
                 // LRU 近似（#167）：delete+set 把活跃条目移到插入序末尾，使迭代序首部恒为「最久未更新」。
-                if let Some(existing) = self.conn_map.shift_remove(&id) {
+                if let Some(existing) = self.conn_map.remove(&id) {
                     let mut updated = existing;
                     // `saturating_add` 而非 `+`：本字段现在是**我们自己跨小时累加**出来的
                     // （轮询时代每拍都从内核重新读全量 total，我们从不累加，故溢出不可能）。
                     // 长驻流下 `+` 一旦溢出，debug 构建直接 panic 掉整条 relay 任务 ——
                     // 流断了、连接页空了，而根因是一个算术溢出，日志里什么都没有。
                     // 内核异常/协议漂移送来一个畸形 delta 不该有这种放大倍数。
-                    updated.upload = Some(
-                        (updated.upload.unwrap_or(0) as i64).saturating_add(ev.uplink_delta) as u64,
-                    );
-                    updated.download = Some(
-                        (updated.download.unwrap_or(0) as i64).saturating_add(ev.downlink_delta)
-                            as u64,
-                    );
+                    updated.upload = Some(apply_connection_delta(
+                        updated.upload.unwrap_or(0), ev.uplink_delta,
+                    ));
+                    updated.download = Some(apply_connection_delta(
+                        updated.download.unwrap_or(0), ev.downlink_delta,
+                    ));
                     let counters = ConnectionCounters {
                         id: id.clone(),
                         upload: updated.upload.unwrap_or(0),

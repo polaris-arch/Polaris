@@ -409,19 +409,19 @@ fn file_information(file: &File) -> std::io::Result<BY_HANDLE_FILE_INFORMATION> 
 impl WinProcOps {
     fn spawn_tracked(
         &self,
-        singbox_bin: &str,
+        core: &crate::core_store::VerifiedCore,
         log_path: &str,
         birth: HelperBirthToken,
         config: ConfinedConfig,
         support_dir: &str,
         owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
-        use polaris_core_supervisor::admitted_payload::{
-            admit_selected, ExecPurpose, UntrustedPayload,
-        };
-        let execution =
-            admit_selected(UntrustedPayload::bundled(singbox_bin), ExecPurpose::RunMain)?
-                .prepare(ExecPurpose::RunMain)?;
+        use polaris_core_supervisor::admitted_payload::ExecPurpose;
+        // CoreStore already admitted the protected installation manifest and
+        // retained its version lease. Re-admitting via the Helper's compiled
+        // selection rejects a compatible independently upgraded Core and replaces
+        // the admitted slot. Preserve the installed owner through native birth.
+        let execution = core.prepare(ExecPurpose::RunMain)?;
         let mut custody = self
             .managed
             .lock()
@@ -671,7 +671,7 @@ impl ProcOps for WinProcOps {
 
     fn start_native_singbox(
         &self,
-        bin: &str,
+        core: &crate::core_store::VerifiedCore,
         params: &StartParams,
         birth: HelperBirthToken,
         conf_dir: &str,
@@ -679,7 +679,7 @@ impl ProcOps for WinProcOps {
         owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
         let config = open_confined_config(&params.cfg, conf_dir, owner)?;
-        self.spawn_tracked(bin, &params.log, birth, config, support_dir, owner)
+        self.spawn_tracked(core, &params.log, birth, config, support_dir, owner)
     }
 
     fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {

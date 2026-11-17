@@ -958,3 +958,28 @@ fn android_interface_snapshot_keeps_real_names_and_availability() {
     assert_eq!(unavailable.down, BTreeSet::from(["rmnet0".to_owned()]));
     assert_eq!(unavailable.missing, BTreeSet::from(["missing0".to_owned()]));
 }
+
+
+/// Five warm starts must not enqueue an all-live close after readiness. Advancing
+/// time across both the old 1.5s deadline and generation changes cannot resurrect
+/// such a job; explicit management and selector-switch close paths remain tested
+/// separately above and in switch-engine.
+#[tokio::test(start_paused = true)]
+async fn desktop_warm_starts_never_schedule_destructive_connection_flush() {
+    for platform in [Platform::Mac, Platform::Linux, Platform::Win] {
+        let (rt, _dir) = test_runtime_on(platform);
+        *rt.status.write().unwrap() = ProxyStatus {
+            running: true,
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            let generation = rt.gate.generation();
+            assert!(!rt.schedule_connection_flush(ProxyModeType::Tun, generation, 0));
+            assert!(rt.network_settle.is_settled());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            rt.bump_generation();
+            tokio::task::yield_now().await;
+            assert!(rt.network_settle.is_settled());
+        }
+    }
+}

@@ -131,9 +131,11 @@ pub trait ProcOps: Send + Sync {
     /// Reuse the validated start request; caller identity, registered config root
     /// and OS-minted birth remain separate from client-controlled arguments.
     /// Parent custody is acquired by the caller before invoking this method.
+    /// The installed Core owner carries its manifest-bound admission and lease;
+    /// a pathname must not reselect the Helper build's bundled Core identity.
     fn start_native_singbox(
         &self,
-        _bin: &str,
+        _core: &crate::core_store::VerifiedCore,
         _params: &StartParams,
         _birth: HelperBirthToken,
         _conf_dir: &str,
@@ -613,7 +615,7 @@ impl ProcOps for MockProcOps {
     }
     fn start_native_singbox(
         &self,
-        bin: &str,
+        core: &crate::core_store::VerifiedCore,
         params: &StartParams,
         birth: HelperBirthToken,
         _conf_dir: &str,
@@ -624,6 +626,10 @@ impl ProcOps for MockProcOps {
             self.inner.native_target.lock().unwrap().is_none(),
             "mock owned object cannot be overwritten"
         );
+        let binary = core.directory.join("sing-box.exe");
+        let bin = binary
+            .to_str()
+            .ok_or_else(|| std::io::Error::other("invalid core path"))?;
         let start = self.start_singbox(bin, &params.cfg, &params.log, params.fwd)?;
         *self.inner.native_target.lock().unwrap() = Some(HelperBirthTarget {
             pid: std::num::NonZeroU32::new(start.pid).unwrap(),

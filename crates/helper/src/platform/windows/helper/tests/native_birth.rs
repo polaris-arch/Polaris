@@ -608,7 +608,7 @@ fn shutdown_cannot_guess_empty_from_missing_upper_entry_or_legacy_pid() {
     let h = make_helper(ops.clone(), MockNetTableOps::new());
     let birth = ops.mint_native_birth().unwrap();
     ops.start_native_singbox(
-        "bin",
+        &h.test_context.as_ref().unwrap().core,
         &StartParams {
             cfg: "cfg".into(),
             log: String::new(),
@@ -894,7 +894,7 @@ fn windows_native_config_uses_verified_object_without_path_reopen() {
         .find("open_confined_config(&params.cfg, conf_dir, owner)?")
         .unwrap();
     let spawned = native_start
-        .find("self.spawn_tracked(bin, &params.log, birth, config, support_dir, owner)")
+        .find("self.spawn_tracked(core, &params.log, birth, config, support_dir, owner)")
         .unwrap();
     assert!(confined < spawned);
     let gate = source
@@ -927,6 +927,14 @@ fn windows_native_config_uses_verified_object_without_path_reopen() {
         "execution.spawn_windows_main(file, &runtime_directory.path, &config_directory)?"
     ));
     assert!(spawn.contains("_execution_custody: execution_custody"));
+    // A compatible Helper may predate the installed Core. Native execution must
+    // retain CoreStore's manifest-bound admission, not choose the build's Core.
+    assert!(spawn.contains("core.prepare(ExecPurpose::RunMain)?"));
+    assert!(!spawn.contains("admit_selected"));
+    assert!(!spawn.contains("UntrustedPayload"));
+    let dispatch = polaris_source_probe::crate_source!("platform/windows/helper/native_birth.rs");
+    let dispatch = polaris_source_probe::mask_comments(&dispatch);
+    assert!(dispatch.contains("self.proc.start_native_singbox(\n                &core,"));
     assert!(!spawn.contains("cmd.spawn()"));
     assert!(!spawn.contains("cmd.args([\"run\", \"-c\", cfg])"));
 }

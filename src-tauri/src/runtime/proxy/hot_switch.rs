@@ -2885,7 +2885,8 @@ impl ProxyRuntime {
         // 模式取**核实际启动的那份配置**（与 flush 自身守卫同源），在 move 前抄下。
         let mode = user_config.proxy_mode_type;
         // TUN 成功腿在 public start guard 归还前同步接棒；该 guard 经 reassert 的 finally 守卫延续到
-        // schedule_connection_flush 接棒。非 TUN 没有无差别 RST，不额外延长稳定门。
+        // 移动端 schedule_connection_flush 接棒；桌面不再延迟关闭全部活跃连接，
+        // reassert 完成即释放此门。非 TUN 不额外延长稳定门。
         // 接管方式取**本平台生效值**（[`ProxyModeType::effective_on`]），与下游 flush 自身的守卫同源：
         // 两边不同源就会出现「门开着但稳定期没延长」或反之，而 Android 上存盘缺省值恰好是 `systemProxy`。
         let network_settle = mode
@@ -2934,7 +2935,8 @@ impl ProxyRuntime {
     /// 无守卫。但 Polaris 这两条都带 `running:true` 参数，而「校正在飞时核已被停/换」这个窗口是**把它们
     /// 从主链挪进异步续延才产生的**（原来就在主链上、紧跟 status 提交，不存在这个窗口）。不守卫等于亲手
     /// 造一个「核已停却广播 running:true / 对着死核排一次 4s 后的出口探测」的假信号。
-    /// **连接 flush 也必须排在校正之后**（上游的「时序修 E」，逐字同源）：flush 对快照里的全部活连接
+    /// **移动端兼容 flush 必须排在校正之后**；桌面自动 flush 已禁用，
+    /// 因延迟快照无法辨别旧直连和新建正确连接。移动端 flush 对快照里的全部活连接
     /// 逐条 `CloseConnection`，被 RST 的连接会**立刻重连**——重连走的是重连那一刻的 selector。
     /// flush 若早于校正落定，这批重连全部按 cache_file 的旧选择建链，本 bug 的症状在这个窄窗里
     /// 原样复现，而且是**我们亲手把用户所有连接踢过去的**，比自然漂移更糟。

@@ -1658,3 +1658,138 @@ fn update_recency_survives_repeated_eviction_and_bulk_reset() {
         ["Y", "Z"]
     );
 }
+
+#[test]
+fn ordered_connections_preserve_indexmap_mutation_semantics() {
+    let mut actual = OrderedConnections::new();
+    let mut reference = indexmap::IndexMap::<String, ConnectionEntry>::new();
+    let mut random = 7_u64;
+    for step in 0..4000 {
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let id = format!("c{}", (random >> 32) % 53);
+        match random % 7 {
+            0 | 1 | 2 => {
+                let mut entry = conn(&id, None, None);
+                entry.upload = Some(step);
+                actual.insert(id.clone(), entry.clone());
+                reference.insert(id, entry);
+            }
+            3 => {
+                assert_eq!(actual.remove(&id), reference.shift_remove(&id));
+            }
+            4 | 5 => {
+                let moved = actual.remove(&id);
+                let expected = reference.shift_remove(&id);
+                assert_eq!(moved, expected);
+                if let Some(entry) = moved {
+                    actual.insert(id.clone(), entry.clone());
+                    reference.insert(id, entry);
+                }
+            }
+            _ => {
+                if step % 101 == 0 {
+                    actual.clear();
+                    reference.clear();
+                }
+            }
+        }
+        assert_eq!(actual.len(), reference.len());
+        assert_eq!(actual.keys().collect::<Vec<_>>(), reference.keys().collect::<Vec<_>>());
+        assert_eq!(actual.values().collect::<Vec<_>>(), reference.values().collect::<Vec<_>>());
+        assert_eq!(actual.entries.len(), actual.order.len());
+    }
+}
+
+#[test]
+fn ordered_connections_rollover_preserves_recency_and_lookup() {
+    let mut actual = OrderedConnections::new();
+    for id in ["A", "B", "C"] {
+        actual.insert(id.into(), conn(id, None, None));
+    }
+    let a = actual.remove("A").unwrap();
+    actual.insert("A".into(), a);
+    actual.next_sequence = u128::MAX;
+    // Duplicate NEW replaces the payload in place, even at rollover.
+    let mut b = conn("B", None, None);
+    b.upload = Some(42);
+    actual.insert("B".into(), b);
+    assert_eq!(actual.next_sequence, u128::MAX);
+    actual.insert("D".into(), conn("D", None, None));
+    assert_eq!(actual.keys().map(String::as_str).collect::<Vec<_>>(), ["B", "C", "A", "D"]);
+    assert_eq!(actual.get("B").unwrap().upload, Some(42));
+    assert_eq!(actual.next_sequence, 4);
+    actual.remove("C");
+    assert_eq!(actual.keys().map(String::as_str).collect::<Vec<_>>(), ["B", "A", "D"]);
+    actual.clear();
+    assert_eq!(actual.next_sequence, 0);
+    assert!(actual.order.is_empty());
+    assert!(actual.entries.is_empty());
+}
+
+#[test]
+fn ordered_connections_churn_has_one_order_entry_per_live_connection() {
+    let mut actual = OrderedConnections::new();
+    for i in 0..10_000 {
+        let id = format!("c{i}");
+        actual.insert(id.clone(), conn(&id, None, None));
+    }
+    for _ in 0..3 {
+        for i in 0..10_000 {
+            let id = format!("c{i}");
+            let entry = actual.remove(&id).unwrap();
+            actual.insert(id, entry);
+        }
+        assert_eq!(actual.len(), 10_000);
+        assert_eq!(actual.order.len(), 10_000);
+        assert_eq!(actual.keys().next().map(String::as_str), Some("c0"));
+        assert_eq!(actual.keys().last().map(String::as_str), Some("c9999"));
+    }
+}
+
+#[test]
+fn connection_counters_reject_negative_unsigned_wraparound() {
+    let mut raw = raw_conn("negative", 1_000_000_000, 0, 0, "P");
+    raw.uplink_total = -1;
+    raw.downlink_total = i64::MIN;
+    let entry = trim_connection(&raw);
+    assert_eq!(entry.upload, Some(0));
+    assert_eq!(entry.download, Some(0));
+    assert_eq!(apply_connection_delta(0, -1), 0);
+    assert_eq!(apply_connection_delta(10, -3), 7);
+    assert_eq!(apply_connection_delta(10, -11), 0);
+    assert_eq!(apply_connection_delta(10, i64::MIN), 0);
+    assert_eq!(apply_connection_delta(i64::MAX as u64, 1), i64::MAX as u64);
+    assert_eq!(apply_connection_delta(u64::MAX, 0), i64::MAX as u64);
+}
+
+#[test]
+fn negative_connection_update_matches_emitted_counters_and_recency() {
+    let mut agg = StatsAggregator::with_max_conn_map_size(2);
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            events: vec![new_ev("A"), new_ev("B")],
+            ..Default::default()
+        },
+        0,
+    );
+    let change = agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            events: vec![SingBoxConnectionEvent {
+                kind: ConnectionEventType::Update,
+                id: "A".into(),
+                uplink_delta: i64::MIN,
+                downlink_delta: -1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        1,
+    );
+    let counters = change.counters.get("A").unwrap();
+    let entry = agg.entry("A").unwrap();
+    assert_eq!(entry.upload, Some(0));
+    assert_eq!(entry.download, Some(0));
+    assert_eq!(counters.upload, 0);
+    assert_eq!(counters.download, 0);
+    assert_eq!(agg.conn_map.keys().map(String::as_str).collect::<Vec<_>>(), ["B", "A"]);
+}

@@ -5054,10 +5054,10 @@ async fn continuation_runs_strictly_after_reassert_puts() {
     );
 }
 
-/// TUN 成功腿须把稳定门从 selector 校正**无缝交接**给延迟 flush：校正续延已经发生时仍不能放行
-/// 订阅；flush 因世代变化跳过后才放行。删任一接棒 guard 都会让中间断言或最终等待转红。
+/// Desktop startup holds the settle gate during reassert, then releases it without
+/// scheduling destructive delayed cleanup of newly established connections.
 #[tokio::test]
-async fn tun_reassert_hands_network_settle_gate_to_delayed_flush() {
+async fn desktop_tun_reassert_settles_without_delayed_flush() {
     let mut cfg = reassert_config("node-a");
     cfg["proxyModeType"] = serde_json::json!("tun");
     let (rt, _dir, _sink, inval, _refresh, _fb) =
@@ -5080,15 +5080,18 @@ async fn tun_reassert_hands_network_settle_gate_to_delayed_flush() {
         !inval.lock().unwrap().is_empty(),
         "前提：selector 续延已发生"
     );
-    assert!(
-        !rt.network_settle.is_settled(),
-        "reassert guard 退场后必须由延迟 flush guard 继续占门"
-    );
-
-    rt.bump_generation(); // 令 1.5s 后的 flush 走无网络的 superseded 腿。
+    // Invalidation occurs inside ReassertSettledGuard::drop, before its settle
+    // guard field is released. It is not a completion barrier for another thread.
     tokio::time::timeout(Duration::from_secs(3), rt.wait_for_network_settled())
         .await
-        .expect("flush 跳过后稳定门应放行");
+        .expect("desktop reassert completion releases the settle gate");
+    assert!(
+        rt.network_settle.is_settled(),
+        "desktop reassert must not hand off to a delayed destructive flush"
+    );
+
+    rt.bump_generation(); // A later generation must not be held by old startup work.
+    assert!(rt.network_settle.is_settled());
 }
 
 /// **不变式⑥**：reassert 中途 panic → 续延**仍必须跑**（= 上游 `.finally()` 的语义）。
