@@ -2110,11 +2110,21 @@ fn activate(journal: &mut Journal) -> io::Result<()> {
     )?;
     require(policy == "retain", "new installed receipt is not exact")?;
     let id = CoreId::parse(journal.get("id")?).map_err(rejected)?;
-    crate::admin_probe::retained_ready(Path::new(SUPPORT), &id)?;
-    require(
-        image_identity(pid, &installed.file)? == image && decimal(&property("MainPID")?)? == pid,
-        "new process changed during Ready/CoreStatus",
-    )?;
+    // Type=simple is active before the new process has opened its socket. Wait
+    // for native readiness within the same activation deadline and birth.
+    loop {
+        let ready = crate::admin_probe::retained_ready(Path::new(SUPPORT), &id);
+        require(
+            image_identity(pid, &installed.file)? == image
+                && decimal(&property("MainPID")?)? == pid,
+            "new process changed during Ready/CoreStatus",
+        )?;
+        match ready {
+            Ok(()) => break,
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
     fresh_release(journal)?;
     actual_unit.unchanged()?;
     require(
