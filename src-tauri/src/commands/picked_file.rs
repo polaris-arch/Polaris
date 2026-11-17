@@ -90,7 +90,7 @@
 //!    收成一个 `JoinError`，调用方翻成稳定错误码，命令**照常回话** —— 而不是让前端那个 `await`
 //!    永不 settle、把写在 `finally` 里的 `setBusy(false)` 一起冻住，按钮永久禁用还不报错。
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use tauri::{AppHandle, Manager, Runtime};
@@ -350,22 +350,6 @@ pub fn stream_into_picked(
                 .open_for_write(&uri, overwrite_opts())
                 .map_err(opened)?;
             copy_counted(source, &mut *writer)
-        }
-    }
-}
-
-/// 读用户选中的目标（UTF-8 全文）。
-pub fn read_picked_to_string(
-    gateway: &dyn FileGateway,
-    target: &FilePath,
-) -> std::io::Result<String> {
-    match classify(target) {
-        // 桌面原路：与改动前逐字相同的一次 `std::fs::read_to_string`。
-        PickedTarget::Path(path) => std::fs::read_to_string(path),
-        PickedTarget::Uri(uri) => {
-            let mut buf = String::new();
-            gateway.open(&uri, read_opts())?.read_to_string(&mut buf)?;
-            Ok(buf)
         }
     }
 }

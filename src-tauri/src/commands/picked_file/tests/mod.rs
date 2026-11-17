@@ -55,8 +55,8 @@ use std::str::FromStr as _;
 use std::sync::Mutex;
 
 use super::{
-    classify, display_of, file_name_of, open_picked_for_read, read_picked_to_string,
-    stream_into_picked, write_picked, FileGateway, FilePath, PickedTarget,
+    classify, display_of, file_name_of, open_picked_for_read, stream_into_picked, write_picked,
+    FileGateway, FilePath, PickedTarget,
 };
 use crate::commands::guard_scan::top_level_fn_body;
 use crate::test_support::{crate_code, TestDir};
@@ -464,6 +464,12 @@ fn streaming_into_a_local_path_never_touches_the_gateway() {
 }
 
 /* ══════════════ ③ 读：正负两侧 ══════════════ */
+
+fn read_picked_to_string(gateway: &dyn FileGateway, target: &FilePath) -> std::io::Result<String> {
+    let mut body = String::new();
+    open_picked_for_read(gateway, target)?.read_to_string(&mut body)?;
+    Ok(body)
+}
 
 #[test]
 fn reading_a_content_uri_goes_through_the_gateway_and_really_returns_bytes() {
