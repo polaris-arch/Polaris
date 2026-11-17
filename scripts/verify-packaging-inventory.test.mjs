@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync, readdirSync, statSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, after } from 'node:test';
-import { copyPackagingSource, writeFormalAssets } from './lib/formal-package-fixtures.test.mjs';
+import { copyPackagingSource, writeFormalAssets } from './lib/formal-package-fixtures.mjs';
 import { cronetFixture, fixtureContract, fixtureManifest } from './lib/cronet-payload.test.mjs';
 import { assetNames } from './release-assets.mjs';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
@@ -308,15 +308,15 @@ test('actual Linux assets entry rejects compressed Local App despite clean ROOT 
   const version=JSON.parse(readFileSync(join(cleanRepo,'src-tauri/tauri.conf.json'))).version;
   const names=assetNames(version,'linux');writeFormalAssets(root,names);
   // Replace the actual App in a real deb, preserving complete inert Formal Helper resources.
-  const mutate=spawnSync('python3',['-B','-c',`import subprocess,tempfile
-from pathlib import Path
-import sys
-p=Path(sys.argv[1])
-with tempfile.TemporaryDirectory() as t:
- subprocess.run(['dpkg-deb','--raw-extract',str(p),t],check=True)
- (Path(t)/'usr/bin/polaris').write_bytes(b'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1')
- subprocess.run(['dpkg-deb','--build','--root-owner-group',t,str(p)],check=True)`,join(root,names.find(n=>n.endsWith('.deb')))],{encoding:'utf8'});
-  assert.equal(mutate.status,0,mutate.stderr);
+  const deb = join(root, names.find(n => n.endsWith('.deb')));
+  const stage = mkdtempSync(join(root, 'deb-mutation-'));
+  try {
+    execFileSync('dpkg-deb', ['--raw-extract', deb, stage]);
+    writeFileSync(join(stage, 'usr/bin/polaris'), 'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1');
+    execFileSync('dpkg-deb', ['--build', '--root-owner-group', stage, deb]);
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
   writeFileSync(join(root,'SHA256SUMS'),names.map(n=>createHash('sha256').update(readFileSync(join(root,n))).digest('hex')+'  '+n).join('\n')+'\n');
   const r=spawnSync(process.execPath,[verifier,'assets','--label','linux','--dir',root],{encoding:'utf8'});
   assert.equal(r.status,1,r.stdout+r.stderr);assert.match(r.stdout+r.stderr,/LocalDevelopmentSelection executable/);

@@ -6,7 +6,6 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
 import { verifyDashboardArchive, dashboardInventory, dashboardFresh } from './fetch-dashboard.mjs';
-import { seedMatches } from './assert-r8-evidence.mjs';
 
 test('D01 authentic bytes required; login HTML and same-size mutation rejected', () => {
   const bytes = Buffer.from('pinned bytes');
@@ -39,9 +38,4 @@ test('D02 bounded attempts, retry window and child; caller cannot expand hard ti
   });
   assert.throws(() => boundedDownload('http://example.invalid'));
   assert.throws(() => boundedDownload('https://example.invalid',{},()=>{throw Error('timeout');}), /timeout/);
-});
-test('NA04 exact declaring class and full JNI overload; layout only normalized', () => {
-  const owner='com.polaris2.app.RustWebView', expected=[owner,'java.lang.String getCookies(java.lang.String)'];
-  assert.equal(seedMatches(`${owner}: java.lang.String getCookies( java.lang.String );`,expected),true);
-  for (const row of [`${owner}$Nested: java.lang.String getCookies(java.lang.String)`, `prefix.${owner}: java.lang.String getCookies(java.lang.String)`, `${owner}: java.lang.String getCookies()`, `${owner}: void getCookies(java.lang.String)`]) assert.equal(seedMatches(row,expected),false);
 });

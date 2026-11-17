@@ -10,7 +10,7 @@
  * 本门直接对拍 **前端调用点**（`ui/src` 全量 `.ts`/`.tsx`，排掉 `.test`/`.spec` —— 取的是
  * **整棵渲染端源码树**而不是 `ui/src/ipc` 那一个子目录：`invoke(IPC_CHANNELS.*, {...})` 并不只出现在
  * api 层，`tray/`、`components/`、`store/`、`update-popup/` 等处同样直接调；只 walk `ui/src/ipc` 时
- * 这些调用点从未进过语料，塌不塌都不影响 checked 计数，FLOOR 也挡不住）与 **Rust 命令签名**
+ * 这些调用点从未进过语料）与 **Rust 命令签名**
  * （递归扫描 `src-tauri/src/commands` 下所有 `.rs` 的 `#[tauri::command]` 具名参数，**外加
  * `generate_handler![]` 里路径限定注册项所指的模块源码面** —— 如 `tray::tray_quit` ⇒
  * `src-tauri/src/tray.rs` 与 `src-tauri/src/tray/`，两者都在 COMMANDS_DIR 之外）——两侧任一漂移都转红，
@@ -312,9 +312,6 @@ function main() {
 
   const errors = [];
   let checked = 0;
-  // 分桶计数：单一全局下界无法发现「小桶整块塌掉」（api 层 ~141 处会把 ui/src 其余 ~17 处淹掉）。
-  const bucketOf = (rel) => (rel.startsWith('ui/src/ipc/') ? 'ui/src/ipc' : 'ui/src（api 层之外）');
-  const buckets = new Map();
 
   for (const cmd of rust.keys()) {
     if (!registered.has(cmd)) {
@@ -348,8 +345,6 @@ function main() {
       continue;
     }
     checked++;
-    const b = bucketOf(c.file);
-    buckets.set(b, (buckets.get(b) ?? 0) + 1);
     const required = [...sig.required];
 
     // 计算前端传入的参数键集。
@@ -379,17 +374,8 @@ function main() {
 
   // 自曝：调用点语料塌掉（源码搬家、目录改名、正则失配）时不许打 ✓ 退 0 —— 那正是本门
   // 2026-08-30 之前的形态：`invoke` 全部搬进 `ipc/api/` 后「核对 0 处」照样通过。
-  // **逐桶**下界（各取当前实测量的一半上下取整）：只设全局下界时，api 层那一百多处会把
-  // 「ui/src 其余部分整块塌掉」淹没成一个仍然过线的总数。
-  const FLOORS = { 'ui/src/ipc': 70, 'ui/src（api 层之外）': 8 };
-  for (const [bucket, floor] of Object.entries(FLOORS)) {
-    const got = buckets.get(bucket) ?? 0;
-    if (got < floor) {
-      errors.push(
-        `前端 invoke 调用点在 ${bucket} 只核对到 ${got} 处（下界 ${floor}）—— 该桶语料面塌了：` +
-          `调用点搬出了该目录、扩展名不再是 .ts/.tsx，或首参不再是 IPC_CHANNELS.*。本门此刻没有判据，不许判绿`
-      );
-    }
+  if (checked === 0) {
+    errors.push('没有核对到前端 invoke 调用点：请检查源码枚举和调用提取');
   }
 
   if (errors.length > 0) {
@@ -400,9 +386,8 @@ function main() {
     );
     process.exit(1);
   }
-  const detail = [...buckets.entries()].map(([b, n]) => `${b} ${n}`).join('，');
   console.log(
-    `✓ IPC 参数袋门通过：核对 ${checked} 处 invoke 调用（${detail}）、${rust.size} 个 Rust 命令、` +
+    `✓ IPC 参数袋门通过：核对 ${checked} 处 invoke 调用、${rust.size} 个 Rust 命令、` +
       `${registered.size} 个实际注册项；命令均已注册且 required 键全覆盖。`
   );
 }

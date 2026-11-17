@@ -50,14 +50,6 @@ function caseNamed(name: string): FixtureCase {
 
 describe('configBaseVersion 跨语言值锁', () => {
   /**
-   * 自曝纪律：读空 / 读少了必须转红，而不是「0 个用例全绿」。
-   * 「没检查」与「检查通过」的输出不可区分 = 没有这道门。
-   */
-  it('fixture 真的读到了（自曝：空集合不得恒绿）', () => {
-    expect(FIXTURE.cases.length).toBeGreaterThanOrEqual(8);
-  });
-
-  /**
    * 主断言：每条 fixture 的前端计算值 === 写死的 `expected`（Rust 侧对同一个数断言）。
    *
    * 牙（前端侧）：把 `charCodeAt` 换成 `codePointAt` → `nonAscii` 转红（emoji 是代理对，

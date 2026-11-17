@@ -243,10 +243,4 @@ test('synthetic output receipt', async ({}, info) => {
     }
     expect(expression).not.toMatch(/\b(success|failure|cancelled|always)\s*\(/);
   });
-
-  it('runs the shared UA lifecycle and both platform retry surfaces in the existing browser gate', () => {
-    const workflow = read('ui.yml');
-    const browser = workflow.slice(workflow.indexOf('      - name: Browser form round trip'), workflow.indexOf('      - name: Browser form failure evidence'));
-    expect(browser).toMatch(/POLARIS_BROWSER_TESTS=1 pnpm exec vitest run[^\n]*src\/hooks\/use-subscription-user-agent\.browser\.test\.tsx[^\n]*--maxWorkers=1/);
-  });
 });

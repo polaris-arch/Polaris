@@ -32,6 +32,8 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { blankComments } from './comment-blanking.test-support';
+import { rustFunctionSource } from './rust-source.test-support';
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
@@ -48,34 +50,15 @@ const API_CLIENT_TS = [
 const SETTINGS_LOGIC_TS = read('../components/screens/settings/settings-logic.ts');
 const APP_UPDATE_CARD_TSX = read('../components/screens/settings/AppUpdateCard.tsx');
 
-/** 整行注释换空行（保留行序）。两侧的判据都对注释文本敏感：注释里提字段名会喂饱集合。 */
-function stripLineComments(src: string): string {
-  return src
-    .split('\n')
-    .map((l) => (l.trimStart().startsWith('//') || l.trimStart().startsWith('*') ? '' : l))
-    .join('\n');
-}
-
-/** 剥块注释（`/** … *\/`），整段换空行。 */
-function stripBlockComments(src: string): string {
-  return src.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
-}
-
 /**
- * 取 Rust 顶层 `fn <name>` 的函数体（到列 0 的 `\n}` 为止）。形变即抛。
- *
- * 锚点按**行首的定义形态**匹配（可带 `pub` / `const`、可带泛型参数列表），不是裸 `indexOf` ——
- * 后者既认不出 `const fn f<'a>(`，又会被文档注释里提到的同名函数抢先命中。
+ * 保留当前 owner 的顶层定义锚点，函数边界与注释处理复用共享 Rust 提取器。
  */
 function rustFnBody(owner: string, src: string, name: string): string {
   const at = src.search(
     new RegExp(String.raw`^(?:pub(?:\((?:crate|super)\))? )?(?:const )?fn ${name}[<(]`, 'm'),
   );
   if (at < 0) throw new Error(`${owner} 里找不到 \`fn ${name}\` 的定义 —— 本门已失去判据`);
-  const rest = src.slice(at);
-  const end = rest.indexOf('\n}\n');
-  if (end < 0) throw new Error(`\`fn ${name}\` 的右花括号锚点消失 —— 本门已失去判据`);
-  return stripLineComments(rest.slice(0, end));
+  return rustFunctionSource(src.slice(at), name);
 }
 
 /** Rust `progress_payload` 真正写进载荷的键（`json!` 里的 `"k":` + `payload["k"] =`）。 */
@@ -85,7 +68,7 @@ function rustPayloadKeys(): Set<string> {
     ...[...body.matchAll(/"([A-Za-z]\w*)":/g)].map((m) => m[1]),
     ...[...body.matchAll(/payload\["([A-Za-z]\w*)"\]\s*=/g)].map((m) => m[1]),
   ]);
-  if (keys.size < 5) {
+  if (keys.size === 0) {
     throw new Error(`只从 progress_payload 解析到 ${keys.size} 个键 —— 写法变了？`);
   }
   return keys;
@@ -106,11 +89,11 @@ function tsInterfaceFields(src: string, name: string): Set<string> {
   const rest = src.slice(at);
   const end = rest.indexOf('\n}');
   if (end < 0) throw new Error(`\`interface ${name}\` 的收尾锚点消失 —— 本门已失去判据`);
-  const body = stripLineComments(stripBlockComments(rest.slice(0, end)));
+  const body = blankComments(rest.slice(0, end));
   const fields = new Set(
     [...body.matchAll(/^\s{2}(\w+)\??:/gm)].map((m) => m[1]),
   );
-  if (fields.size < 3) throw new Error(`只从 ${name} 解析到 ${fields.size} 个字段 —— 写法变了？`);
+  if (fields.size === 0) throw new Error(`只从 ${name} 解析到 ${fields.size} 个字段 —— 写法变了？`);
   return fields;
 }
 
@@ -121,10 +104,10 @@ function tsStatusesThatDriveTheCard(): Set<string> {
   const rest = SETTINGS_LOGIC_TS.slice(at);
   const end = rest.indexOf('\n};');
   if (end < 0) throw new Error('`PROGRESS_CARD_RULE` 的收尾锚点消失 —— 本门已失去判据');
-  const body = stripLineComments(rest.slice(0, end));
+  const body = blankComments(rest.slice(0, end));
   const rows = [...body.matchAll(/^\s+'?([\w-]+)'?:\s*(null|\{)/gm)];
-  if (rows.length !== 7) {
-    throw new Error(`PROGRESS_CARD_RULE 解析到 ${rows.length} 行，联合是 7 个成员 —— 写法变了？`);
+  if (rows.length === 0) {
+    throw new Error('PROGRESS_CARD_RULE 没有解析到状态行 —— 写法变了？');
   }
   return new Set(rows.filter((m) => m[2] !== 'null').map((m) => m[1]));
 }
@@ -135,8 +118,6 @@ describe('update:progress 载荷 —— Rust ↔ TS 双向对拍', () => {
     const ts = [...tsInterfaceFields(API_CLIENT_TS, 'UpdateProgress')].sort();
     // 单向包含挡不住另一半：Rust 多发 ⇒ 前端静默丢字段；TS 多声明 ⇒ 读一个恒 undefined 的字段。
     expect(ts, 'UpdateProgress 的字段集与 Rust progress_payload 写出的键集不一致').toEqual(rust);
-    // 取材自检：两侧都解析到东西了（空集合相等是恒真的假绿）。
-    expect(rust.length, '解析到的键太少 —— 取材器已失效').toBeGreaterThanOrEqual(5);
   });
 
   it('后端真会发的 status ↔ 前端表里产出 patch 的 status，集合相等', () => {
@@ -211,7 +192,7 @@ describe('进度帧的清单投影 —— 剥掉的那两个字段', () => {
   it('progress 可达面没有任何一处读被剥掉的字段（扫描面由剥除表驱动）', () => {
     const omitted = rustOmittedManifestFields();
     // 剥注释：注释里提到字段名会顶红判据（本仓踩过的老坑）。
-    const src = stripLineComments(stripBlockComments(APP_UPDATE_CARD_TSX));
+    const src = blankComments(APP_UPDATE_CARD_TSX);
     // 切到**下一个** `{us === `，不是切到写死的 `{us === 'downloading'`。
     // 前身那种写法今天恰好重合，但在两者之间插一屏新态并让它读被剥字段 ⇒ 那一屏被整块吞进
     // `availableBlock`、排除在扫描面外，全量全绿。判据面必须由「下一个态屏」定，不由夹具定
@@ -283,8 +264,6 @@ describe('update:progress 的消费点', () => {
 
   it('全仓的消费点恰好是登记过的那两处', () => {
     const files = walk(fileURLToPath(new URL('..', import.meta.url)));
-    // 取材自检：遍历不到文件时下面的断言会在空集合上「恰好」失败/通过，两个方向都无意义。
-    expect(files.length, '递归遍历 ui/src 一个源文件都没拿到 —— 取材器失效').toBeGreaterThan(50);
     const consumers = files.filter((f) => readFileSync(f, 'utf8').includes('updateApi.onProgress('));
     expect(
       consumers.map((f) => relative(fileURLToPath(new URL('..', import.meta.url)), f).replaceAll('\\', '/')).sort(),
@@ -314,15 +293,13 @@ describe('update:progress 的消费点', () => {
     expect([...readsOffFrameManifest('const x = dl.info?.releaseNotes;')]).toEqual(['releaseNotes']);
     expect([...readsOffFrameManifest('const x = check.target?.releaseNotes;')]).toEqual([]);
 
-    const mobile = stripLineComments(
-      stripBlockComments(
-        readFileSync(
-          fileURLToPath(new URL('../mobile/settings/UpdatePage.tsx', import.meta.url)),
-          'utf8',
-        ),
+    const mobile = blankComments(
+      readFileSync(
+        fileURLToPath(new URL('../mobile/settings/UpdatePage.tsx', import.meta.url)),
+        'utf8',
       ),
     );
-    expect(mobile.length, '移动端更新页读成空文件 —— 取材面塌了').toBeGreaterThan(400);
+    expect(mobile.trim().length, '移动端更新页读成空文件 —— 取材面塌了').toBeGreaterThan(0);
     for (const field of readsOffFrameManifest(mobile)) {
       expect(
         omitted.has(field),

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { fixtureZip } from './lib/formal-package-fixtures.mjs';
 import { aapt2Path, apkPermissions, permissionViolations, APK_PERMISSION_REGISTRY, APK_DECLARED_PERMISSIONS } from './verify-apk.mjs';
 const uri='http://schemas.android.com/apk/res/android', name=APK_DECLARED_PERMISSIONS[0].name;
 // Source-version-bound format contract; not represented as captured AAPT2 output.
@@ -38,8 +39,8 @@ test('NA05 real SDK AAPT2 reads original compiled manifest and permission-only b
  const root=mkdtempSync(join(tmpdir(),'aapt2-acquisition-'));
  try {for(const value of [2,0,1,0x12]){
    const bytes=Buffer.from(raw);bytes.writeUInt32LE(value,level.dataOffset);
-   const manifest=join(root,'AndroidManifest.xml'), apk=join(root,'manifest-only.apk');writeFileSync(manifest,bytes);
-   execFileSync(process.platform==='win32'?'python':'python3',['-c','import sys,zipfile; z=zipfile.ZipFile(sys.argv[2],"w"); z.write(sys.argv[1],"AndroidManifest.xml"); z.close()',manifest,apk]);
+   const apk=join(root,'manifest-only.apk');
+   writeFileSync(apk,fixtureZip([{name:'AndroidManifest.xml',data:bytes}]));
    const result=apkPermissions(apk,{bin});assert.ok(result);assert.equal(result.packageName,meta.packageName);
    assert.equal(result.declaredProtectionLevels[originalName],value);assert.deepEqual(result.declared,[originalName]);
    assert.ok(permissionViolations(result).some(x=>x.includes('applicationId'))); // SFA is not relabeled as App evidence.

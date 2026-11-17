@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { copyPackagingSource, writeFormalAssets } from './lib/formal-package-fixtures.test.mjs';
+import { copyPackagingSource, writeFormalAssets } from './lib/formal-package-fixtures.mjs';
 import { fileURLToPath } from 'node:url';
 import { assetNames, assetMatches, verifyAbiNames, verifyAndroidDigests } from './release-assets.mjs';
 

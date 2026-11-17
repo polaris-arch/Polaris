@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deflateRawSync } from 'node:zlib';
+import { fixtureZip } from './lib/formal-package-fixtures.mjs';
 
 import {
   ABIS,
@@ -252,28 +252,7 @@ function hits(violations, needle) {
 }
 
 function oneEntryZip(name, method = 8) {
-  const filename = Buffer.from(name);
-  const payload = Buffer.from('native-library-payload'.repeat(8));
-  const packed = method === 8 ? deflateRawSync(payload) : payload;
-  const local = Buffer.alloc(30);
-  local.writeUInt32LE(0x04034b50);
-  local.writeUInt16LE(method, 8);
-  local.writeUInt32LE(packed.length, 18);
-  local.writeUInt32LE(payload.length, 22);
-  local.writeUInt16LE(filename.length, 26);
-  const central = Buffer.alloc(46);
-  central.writeUInt32LE(0x02014b50);
-  central.writeUInt16LE(method, 10);
-  central.writeUInt32LE(packed.length, 20);
-  central.writeUInt32LE(payload.length, 24);
-  central.writeUInt16LE(filename.length, 28);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50);
-  eocd.writeUInt16LE(1, 8);
-  eocd.writeUInt16LE(1, 10);
-  eocd.writeUInt32LE(central.length + filename.length, 12);
-  eocd.writeUInt32LE(local.length + filename.length + packed.length, 16);
-  return Buffer.concat([local, filename, packed, central, filename, eocd]);
+  return fixtureZip([{ name, data: 'native-library-payload'.repeat(8), method }]);
 }
 
 test('native ZIP metadata accepts DEFLATE at an unaligned data offset and rejects STORE', () => {

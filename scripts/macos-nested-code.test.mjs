@@ -432,8 +432,7 @@ const BASH4_ONLY = [
 
 test('bash 3.2 兼容的静态面：bash -n 通过，bash 4+ 才有的写法对脚本代码面零命中（不等于在 3.2 上跑过）', behaviour, () => {
   const all = codeLines(scriptText.split(/\r?\n/));
-  // 取材面自检：代码面取到了，且脚本确实开着 set -u（上表最后一条的前提）。
-  assert.ok(all.length > 80, `代码面只有 ${all.length} 行`);
+  // 脚本必须开着 set -u（上表最后一条的前提），不约束实现行数。
   assert.ok(all.includes('set -euo pipefail'));
 
   for (const [pattern, what, sample] of BASH4_ONLY) {

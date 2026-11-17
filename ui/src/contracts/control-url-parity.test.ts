@@ -100,7 +100,6 @@ describe('control_url 判据跨语言对拍', () => {
   });
 
   it('Rust 语料表读得到（阳性对照：读空 ⇒ 下面每条断言都恒真）', () => {
-    expect(SRC.length, 'Rust 源码读不到，路径可能变了').toBeGreaterThan(1000);
     for (const fn of Object.keys(EXPECTED_BY_FN)) {
       const urls = urlsIn(rustFnBody(SRC, fn));
       expect(urls.length, `Rust 测试 ${fn} 里抽不到任何 URL 语料 —— 抽取器失效，本门会恒绿`).

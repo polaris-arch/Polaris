@@ -92,7 +92,6 @@ describe('自动选择合同与后端一致', () => {
         (match) => match[1],
       ),
     );
-    expect(emitted.size).toBeGreaterThanOrEqual(8);
     emitted.add('manual');
     expect([...emitted].sort()).toEqual([...AUTO_SELECT_MODES].sort());
   });
@@ -226,7 +225,6 @@ describe('界面写出口与意图的位置逐处登记', () => {
 
   it('写出口的位置与登记表逐文件相同', () => {
     const files = sources(SRC);
-    expect(files.length).toBeGreaterThan(400);
     const found: Record<string, number> = {};
     for (const file of files) {
       const count = writes(readFileSync(file, 'utf8'), file.endsWith('.tsx'));

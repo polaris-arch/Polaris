@@ -60,7 +60,7 @@ it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('explicit migration confirmatio
   const { helper } = JSON.parse(readFileSync(new URL(`../i18n/locales/${locale}.json`, import.meta.url), 'utf8'));
   for (const key of ['stopAndUpgradeAction', 'stopAndUpgradeTitle', 'stopAndUpgradeWarning', 'stopAndUpgradeConfirm', 'linuxStopAndUpgradeTitle', 'linuxStopAndUpgradeWarning', 'linuxForwardOnlyRecovery']) {
     expect(helper[key]).toEqual(expect.any(String));
-    expect(helper[key].length).toBeGreaterThan(5);
+    expect(helper[key].trim().length).toBeGreaterThan(0);
   }
   expect(helper.stopAndUpgradeTitle).toContain('com.polaris.helper');
   expect(helper.stopAndUpgradeWarning).toContain('com.polaris.helper');

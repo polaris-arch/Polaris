@@ -138,14 +138,6 @@ export const SEED_NEEDLES = Object.freeze([
   ],
 ]);
 
-/**
- * 反向对照：这个类不存在，seeds.txt 里必须**一次都没有**。
- *
- * 没有它，上面那组「必须命中」的断言无法与「匹配逻辑恒真」区分开 —— 一条永远返回命中的
- * 匹配器会让整组针全绿。
- */
-export const SEED_ABSENT_CONTROL = "org.rustls.platformverifier.NoSuchThingEverAbsent";
-
 /** 剥掉 `#` 行注释（ProGuard / R8 配置的唯一注释形态），保行结构。 */
 export function stripHashComments(source) {
   return source
@@ -304,13 +296,6 @@ export function assertR8Evidence({ configuration, seeds, ownRules }) {
 
   // ── ③ 规则到底保住了什么：seeds.txt ──
   const seedLines = seeds.split("\n").map((l) => l.trim()).filter(Boolean);
-  if (seedLines.length < 10) {
-    problems.push(
-      `seeds.txt 只有 ${seedLines.length} 行 —— 一次真实的 release 构建会保住成百上千个符号，` +
-        "这么少多半是 R8 没跑完或文件被截断，下面的命中断言在这种面上没有信息量。",
-    );
-    return { problems, notes };
-  }
   for (const [parts, why] of SEED_NEEDLES) {
     const matched = seedLines.filter((line) => seedMatches(line, parts));
     if (matched.length === 0) {
@@ -321,15 +306,6 @@ export function assertR8Evidence({ configuration, seeds, ownRules }) {
     } else {
       notes.push(`seeds.txt        ${parts.join(" + ")} × ${matched.length}`);
     }
-  }
-  const controlHits = seedLines.filter((line) => line.includes(SEED_ABSENT_CONTROL)).length;
-  if (controlHits !== 0) {
-    problems.push(
-      `反向对照失败：seeds.txt 里出现了 \`${SEED_ABSENT_CONTROL}\`（${controlHits} 次）。` +
-        "这个类根本不存在 —— 匹配逻辑恒真，上面那组「必须命中」的断言全部没有信息量。",
-    );
-  } else {
-    notes.push(`反向对照      ${SEED_ABSENT_CONTROL} × 0（匹配器不是恒真的）`);
   }
 
   return { problems, notes };

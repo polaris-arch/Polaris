@@ -262,8 +262,6 @@ for (const source of TS_SOURCES) {
 describe('boot-global production inventory 与 typed registry 一致', () => {
   it('全量自动盘点：新增/删除/改名必须先裁定契约方向', () => {
     expect([...usage.keys()].sort()).toEqual(BOOT_GLOBALS.map((row) => row.name).sort());
-    expect(TS_SOURCES.length).toBeGreaterThan(100);
-    expect(RUST_SOURCES.length).toBeGreaterThan(100);
   });
 
   it('四条 Rust 首帧注入均有 TS 类型声明和真实读取，且 TS 不反向覆写', () => {

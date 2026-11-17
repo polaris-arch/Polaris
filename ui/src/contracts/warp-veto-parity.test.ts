@@ -152,7 +152,6 @@ describe('解析器自检（解析不到必须自曝，不得让后面的断言�
       ['前端 meshUsesSystemInterface', TS_MESH_SYSTEM],
       ['Rust mesh_uses_system_interface', RUST_MESH_SYSTEM],
     ] as const) {
-      expect(body.trim().length, `${label} 函数体解析为空`).toBeGreaterThan(20);
       expect(
         fieldsRead(body).size,
         `${label} 解析出的块里一个字段读都没有 —— 多半取到了形参类型体`

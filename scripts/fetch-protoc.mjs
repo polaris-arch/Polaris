@@ -8,11 +8,8 @@
  *
  * # 为什么有这个脚本（2026-08-18，CI-4）
  *
- * 此前 protoc 的「固定版本 + 四平台 URL + 四个 sha256」常量在 `ci.yml` 与 `package.yml`
- * **各内联一份**，靠 `workflow-toolchain-pin-parity.test.ts` 对拍防漂。收敛到脚本后常量只有
- * 一处，对拍对象消失，该测试的 protoc 部分退休（NASM 部分仍在——它还是两份）。
- * 与 `fetch-core` / `fetch-dashboard` 同形：**不是引入新概念，
- * 是回到仓里已有的概念**。
+ * protoc 的版本、四平台 URL 和 sha256 在此统一维护。安装时校验下载摘要，
+ * CI 随后检查 PATH 上实际工具的版本，与 fetch-core / fetch-dashboard 共用下载逻辑。
  *
  * 相比内联 bash 步还消掉两个平台分支：
  *   · sha256 校验走 node 的 `createHash` —— `sha256sum`（Linux）/ `shasum -a 256`（macOS）

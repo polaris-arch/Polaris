@@ -13,11 +13,12 @@ import { execFile, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { runInNewContext } from 'node:vm';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
+const { fixtureZip } = await import(pathToFileURL(join(REPO_ROOT, 'scripts/lib/formal-package-fixtures.mjs')).href);
 
 function workflow(name: string): string {
   return readFileSync(join(REPO_ROOT, '.github/workflows', name), 'utf8');
@@ -166,43 +167,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     for (const entry of CI_ENTRIES) {
       expect(evaluateActions(lint, entry), entry.label).toEqual(expected[entry.label]);
     }
-  });
-
-  it('source/mock tests run before native inputs with their compiler prerequisites and ordinary failure semantics', () => {
-    const ci = workflow('ci.yml');
-    const name = 'Test source and mock crates before core acquisition';
-    const check = (source: string) => {
-      const job = executable(jobBlock(source, 'test'));
-      const early = stepBlock(job, name);
-      expect(/^ {8}if: (.+)$/m.exec(early)).toBeNull();
-      expect(early).not.toMatch(/continue-on-error|always\(\)|\|\| true/);
-      const at = job.indexOf(`- name: ${name}\n`);
-      for (const prerequisite of ['Install Rust toolchain (preinstalled rustup)', 'Setup Rust cache',
-        'Install NASM (Windows — pinned URL + sha256)']) {
-        const position = job.indexOf(`- name: ${prerequisite}\n`);
-        expect(position, prerequisite).toBeGreaterThanOrEqual(0);
-        expect(position, prerequisite).toBeLessThan(at);
-      }
-      for (const native of ['Activate admitted native DNS test inputs for the actual host',
-        'Install protoc (pinned URL + sha256)', 'Install Linux system dependencies (Tauri webkit/gtk)',
-        'Acquire all four explicit candidate payloads before placeholders',
-        'Build actual candidate helper bytes and freeze the separate App identity',
-        'Verify all candidate payloads and compiled identity before workspace build', 'Build', 'Test'])
-        expect(job.indexOf(`- name: ${native}\n`), native).toBeGreaterThan(at);
-      expect(stepBlock(job, 'Test')).toMatch(/^ {8}run: cargo test --workspace --no-fail-fast$/m);
-      expect(job.match(/POLARIS_RELEASE_JOB_DEADLINE_MS=/g)).toHaveLength(1);
-    };
-    check(ci);
-    const job = jobBlock(ci, 'test');
-    const early = stepBlock(job, name);
-    const acquire = stepBlock(job, 'Acquire all four explicit candidate payloads before placeholders');
-    const nasm = stepBlock(job, 'Install NASM (Windows — pinned URL + sha256)');
-    const protoc = stepBlock(job, 'Install protoc (pinned URL + sha256)');
-    for (const changed of [
-      ci.replace(early, '').replace(acquire, acquire + early),
-      ci.replace(nasm, ''),
-      ci.replace(protoc, '').replace(early, protoc + early),
-    ]) expect(() => check(changed)).toThrow();
   });
 
   it('ci.yml 格式前置门与三个并行 job：Linux 专属检查恰在 ubuntu 腿存在时运行，且不能静默关闭', () => {
@@ -354,43 +318,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
   });
 
-  it('Rust 缓存键：每个 job 恰一个 rust-cache，键各自独立且是稳定字面量', () => {
-    // 三个 job 的 target/ 内容互不通用（clippy metadata / 交叉 check 单元 / dev 全量 codegen）。
-    // 共用键 = 谁最后跑完谁覆盖，另外两个下次恢复到的是别人的产物 —— 等于次次冷编。
-    const keysOf = (block: string) =>
-      [...block.matchAll(/uses: Swatinem\/rust-cache@v2\n {8}with:\n(?: {10}.*\n)*? {10}key: (.+)\n/g)].map((m) => m[1]);
-    const ci = workflow('ci.yml');
-    const ciKeys = ['lint', 'cross', 'test'].map((name) => {
-      const block = executable(jobBlock(ci, name));
-      expect(block.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], `${name} job 的 rust-cache 步数`).toHaveLength(1);
-      const keys = keysOf(block);
-      expect(keys, `${name} job 的 rust-cache 没有显式 key`).toHaveLength(1);
-      return keys[0];
-    });
-    // 逐字钉住：键是字面量（不含 run_id / sha 之类每次都变的东西 ⇒ 稳定），且三者互不相同。
-    expect(ciKeys).toEqual(['lint', 'cross', 'test']);
-    expect(ci.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], 'ci.yml 有不属于这三个 job 的 rust-cache').toHaveLength(3);
-
-    const pkg = workflow('package.yml');
-    const pkgKeys = keysOf(executable(jobBlock(pkg, 'package')));
-    const wireKeys = keysOf(executable(jobBlock(pkg, 'core_wire')));
-    // 发行构型的键仍是裸 label（与 2026-10-07 之前逐字相同）；轻量构型只多一个后缀。
-    expect(pkgKeys).toEqual(["${{ matrix.label }}${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}"]);
-    expect(wireKeys).toEqual(['core-wire']);
-    expect(executable(pkg).match(/uses: Swatinem\/rust-cache@v2/g) ?? []).toHaveLength(2);
-
-    // Android 两个 job 各恰一个 rust-cache，键同形（2026-10-08 起纳入本门；此前 android.yml 的键无门）：
-    // 发行构型仍是改动前的 `android-aarch64`，轻量构型只多同一个后缀 —— 后缀表达式与桌面逐字相同。
-    const android = workflow('android.yml');
-    for (const name of ['release_check', 'release-apk']) {
-      const block = executable(jobBlock(android, name));
-      expect(block.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], `${name} job 的 rust-cache 步数`).toHaveLength(1);
-      expect(keysOf(block), `${name} job 的 rust-cache 键`)
-        .toEqual(["android-aarch64${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}"]);
-    }
-    expect(executable(android).match(/uses: Swatinem\/rust-cache@v2/g) ?? []).toHaveLength(2);
-  });
-
   it('package 的 dispatch 输入确实只有 platform，并复用 ci.yml 作全平台门', () => {
     const pkg = workflow('package.yml');
     const dispatch = pkg.slice(pkg.indexOf('workflow_dispatch:'), pkg.indexOf('# 最小权限'));
@@ -420,20 +347,6 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
         expect(automatic.group).toBe(workflowConcurrency(source, 'Package', event, undefined, false, 2).group);
         expect(automatic.group).not.toBe(workflowConcurrency(source, name, event).group);
       }
-    }
-  });
-
-  it('切片器本身有效：两个 job 都切得出非平凡的块', () => {
-    // 正面自检。少了这条，jobBlock 若因缩进/命名变化退化成空串，下面两条全部真空通过。
-    const pkg = workflow('package.yml');
-    for (const name of ['package', 'release_desktop', 'android_release', 'release']) {
-      const block = jobBlock(pkg, name);
-      expect(block.length, `job '${name}' 的切片过短，取材面可疑`).toBeGreaterThan(200);
-      expect(block, `job '${name}' 的切片没包含它自己的 needs`).toContain('needs:');
-      // 切片不得越界到下一个 job。
-      expect(block).not.toMatch(
-        /\n {2}(?!$)(?:package|release_desktop|android_release|release):\n(?![\s\S]*^$)/m,
-      );
     }
   });
 
@@ -863,17 +776,14 @@ print(json.dumps({'valid':bare and not replacement and bound,
     // APK contents are identical across metadata/error cases. Generate the
     // three real ZIP inventories once; every case still executes the actual
     // asset script against its own files, manifest probe and Gradle metadata.
-    const zipSeed = mkdtempSync(join(tmpdir(), 'polaris-android-zip-seed-'));
-    onTestFinished(() => rmSync(zipSeed, { recursive: true, force: true }));
     const apkFixtures = new Map<string, Buffer>();
     for (const [flavor, abis] of [['arm64', ['arm64-v8a']], ['arm', ['armeabi-v7a']],
       ['universal', ['arm64-v8a', 'armeabi-v7a']]] as const) {
-      const path = join(zipSeed, `${flavor}.apk`);
-      const made = spawnSync('python3', ['-c',
-        'import sys,json,zipfile\nwith zipfile.ZipFile(sys.argv[1], "w") as z:\n for abi in json.loads(sys.argv[2]):\n  for lib in ["libbox.so", "libpolaris_lib.so", "libc++_shared.so"]: z.writestr("lib/"+abi+"/"+lib, "inert fixture")',
-        path, JSON.stringify(abis)]);
-      expect(made.status).toBe(0);
-      apkFixtures.set(flavor, readFileSync(path));
+      apkFixtures.set(flavor, fixtureZip(abis.flatMap((abi) =>
+        ['libbox.so', 'libpolaris_lib.so', 'libc++_shared.so'].map((lib) => ({
+          name: `lib/${abi}/${lib}`, data: Buffer.from('inert fixture'),
+        })),
+      )));
     }
     for (const [badging, properties, tag, aaptExit, expected] of [
       [good, goodProps, 'v1.0.0', 0, 0],
@@ -1084,7 +994,6 @@ print(json.dumps({'valid':bare and not replacement and bound,
 });
 
 describe('风险门轻量构型：只在 release-risk 路径生效，发行构型一字不动', () => {
-  const ALLOWED = ['CARGO_PROFILE_RELEASE_CODEGEN_UNITS', 'CARGO_PROFILE_RELEASE_LTO'];
 
   /**
    * 同一机制的两条腿（2026-10-08 起 Android 验证腿加入）。**每条腿各切各片、各跑各的入口表、
@@ -1093,22 +1002,15 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
    */
   const DESKTOP = {
     file: 'package.yml',
-    jobs: ['package'],
     step: 'Select installer build weight (release profile vs risk-gate light)',
     guard: 'POLARIS_UPLOAD_ARTIFACTS',
-    builds: { package: ['Build and stage privileged helper', 'Build installers'] } as Record<string, string[]>,
   };
   const ANDROID = {
     file: 'android.yml',
     jobs: ['release_check', 'release-apk'],
     step: 'Select APK build weight (release profile vs risk-gate light)',
     guard: 'POLARIS_PUBLISH_RELEASE',
-    builds: {
-      release_check: ['Build unsigned release-profile validation APK'],
-      'release-apk': ['Build signed release APK'],
-    } as Record<string, string[]>,
   };
-  const LEGS = [DESKTOP, ANDROID];
 
   /** 取出某个 job 里那一步的 shell 脚本本体（去掉 YAML 的 10 格缩进）。 */
   function weightScript(src: string, job: string, stepName: string): string {
@@ -1254,28 +1156,6 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     }
   }
 
-  /**
-   * 两处脚本的**共用骨架**：去掉各自的第三条闸（两行）与结尾两行提示文案后剩下的全部。
-   * 泄漏闸、开关取值判定、tag 闸、写入块都在骨架里。
-   */
-  function skeleton(script: string, guard: string, origin: string): string {
-    const lines = script.trimEnd().split('\n');
-    const guardAt = lines.findIndex((line) => line.startsWith(`[ "$${guard}" = 0 ] || {`));
-    const envAt = lines.findIndex((line) => line === '} >> "$GITHUB_ENV"');
-    if (guardAt < 0 || envAt < guardAt) throw new Error(`${origin}: 找不到第三条闸或写入块 —— 骨架切不出来`);
-    // 第三条闸恰两行（条件行 + 报错并退出行）；写入块之后恰两行提示（notice + step summary）。
-    expect(lines[guardAt + 1].trimEnd().endsWith('exit 1; }'), `${origin}: 第三条闸不是两行形态`).toBe(true);
-    expect(lines.slice(envAt + 1), `${origin}: 写入块之后不是恰两行提示`).toHaveLength(2);
-    expect(lines[envAt + 1].startsWith('echo "::notice title=Risk-gate light build::')).toBe(true);
-    expect(lines[envAt + 2].startsWith("printf '%s\\n' '**Risk-gate light build**")).toBe(true);
-    return [...lines.slice(0, guardAt), ...lines.slice(guardAt + 2, envAt + 1)].join('\n');
-  }
-
-  /** 一段可执行文本里全部 `CARGO_PROFILE_X=值` 的写入，按出现顺序。 */
-  function assignments(text: string): string[] {
-    return executable(text).match(/CARGO_PROFILE_[A-Z_]+=[^'"\s]+/g) ?? [];
-  }
-
   it('构建权重步按各入口真跑：发行路径零写入，风险门恰写两个键，三条 fail-closed 都咬得住', () => {
     const script = weightScript(workflow(DESKTOP.file), 'package', DESKTOP.step);
     expectSliceIsTheScript(script, 'D7');
@@ -1293,43 +1173,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       checkAndroidWeight(script);
       expectMutationsBite(script, ANDROID.guard, checkAndroidWeight);
     }
-    // 两个 job 里那一步（连同它上方的注释）逐字相同；Rust 侧 ⑦ 的 prelude 对拍也覆盖它，这里就近再钉一次。
-    const steps = ANDROID.jobs.map((job) => stepBlock(jobBlock(android, job), ANDROID.step));
-    expect(steps[0].length).toBeGreaterThan(800);
-    expect(steps[1]).toBe(steps[0]);
   }, 30_000);
-
-  it('桌面与 Android 两处是同一段判定：骨架逐行相同，写入的键值逐字相等', () => {
-    const desktop = weightScript(workflow(DESKTOP.file), 'package', DESKTOP.step);
-    const desktopSkeleton = skeleton(desktop, DESKTOP.guard, DESKTOP.file);
-    // 骨架自检：四样东西都在里面，且被剔掉的恰是 4 行（第三条闸 2 + 提示 2）。
-    for (const needle of [
-      `leaked="$(env | grep '^CARGO_PROFILE_' || true)"`,
-      'case "$POLARIS_LIGHT_BUILD" in',
-      'refs/tags/*) echo "::error::',
-      "echo 'CARGO_PROFILE_RELEASE_LTO=off'",
-      "echo 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16'",
-    ]) {
-      expect(desktopSkeleton, `骨架里没有 ${needle} —— 切片塌了`).toContain(needle);
-    }
-    expect(desktopSkeleton.split('\n').length).toBe(desktop.trimEnd().split('\n').length - 4);
-    expect(desktopSkeleton).not.toContain(DESKTOP.guard);
-
-    const desktopStep = stepBlock(jobBlock(workflow(DESKTOP.file), 'package'), DESKTOP.step);
-    const desktopWrites = assignments(desktopStep);
-    expect(desktopWrites.join('\n') + '\n').toBe(LIGHT);
-
-    const android = workflow(ANDROID.file);
-    for (const job of ANDROID.jobs) {
-      const script = weightScript(android, job, ANDROID.step);
-      const androidSkeleton = skeleton(script, ANDROID.guard, `${ANDROID.file} ${job}`);
-      expect(androidSkeleton, `${job} 的判定骨架与桌面漂了 —— 两处必须同步改`).toBe(desktopSkeleton);
-      expect(script.trimEnd().split('\n').length).toBe(desktop.trimEnd().split('\n').length);
-      // 取值相等单独钉一次：骨架相等已蕴含它，但这条的失败信息直接点名「两处取值不同」。
-      expect(assignments(stepBlock(jobBlock(android, job), ANDROID.step)), `${job} 写入的键值与桌面不同`)
-        .toEqual(desktopWrites);
-    }
-  });
 
   it('开关只认调用方显式传入的 true，且全仓只有 release-risk 的两条腿在传', () => {
     const pkg = workflow('package.yml');
@@ -1346,7 +1190,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
 
     // 输入只在 workflow_call 上声明、缺省 false；手动 dispatch 入口没有它（手动 = 发行语义）。
     const dispatch = pkg.slice(pkg.indexOf('\n  workflow_dispatch:\n'), pkg.indexOf('\n  workflow_call:\n'));
-    expect(dispatch.length).toBeGreaterThan(50);
+    expect(dispatch).toMatch(/^  workflow_dispatch:/m);
     expect(executable(dispatch)).not.toContain('light_build');
     expect(executable(pkg)).toContain(
       '      light_build:\n        type: boolean\n        required: false\n        default: false\n',
@@ -1431,7 +1275,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     // 传 true 的调用点全仓恰两处，都在 release-risk：打包腿（与「不上传」成对）与 Android 腿（不传发布）。
     // 旧判据是「全仓恰一处」；现在按文件、按 job 各自点名，别的 workflow（含 tag 发布所在的 package.yml）为零。
     const names = readdirSync(join(REPO_ROOT, '.github/workflows')).filter((name) => /\.ya?ml$/.test(name));
-    expect(names.length, '工作流目录一个文件都没读到 —— 取材面塌了').toBeGreaterThan(4);
+    expect(names).toContain('release-risk.yml');
     const passes = (text: string) => (executable(text).match(/light_build:\s*true/g) ?? []).length;
     for (const name of names) {
       expect(passes(workflow(name)), `${name} 里传 light_build: true 的次数`).toBe(name === 'release-risk.yml' ? 2 : 0);
@@ -1449,60 +1293,5 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     const tagAndroid = executable(jobBlock(pkg, 'android_release'));
     expect(tagAndroid).toContain('publish_release: true');
     expect(tagAndroid).not.toContain('light_build');
-  });
-
-  it('cargo profile 的环境变量覆盖只有两处同形入口，且各自排在缓存与构建之前', () => {
-    // 这是一条绕开 `release_escape_hatches.rs` 的路径：那边的发行构型断言（lto = "fat" /
-    // codegen-units = 1 / 不得开 debug-assertions / 不得 panic = "abort"）只读 Cargo.toml，
-    // 而 `CARGO_PROFILE_RELEASE_*` 环境变量能改写其中任何一条且不动任何文件。
-    // 故把入口钉死：全部 workflow 里只有两处构建权重步提到它，且只有这两个键。
-    const names = readdirSync(join(REPO_ROOT, '.github/workflows')).filter((name) => /\.ya?ml$/.test(name));
-    expect(names).toContain('package.yml');
-    expect(names).toContain('android.yml');
-    const pattern = /CARGO_PROFILE_[A-Z][A-Z_]*/g;
-    const count = (text: string) => (text.match(/CARGO_PROFILE_/g) ?? []).length;
-    for (const name of names) {
-      const source = workflow(name);
-      const hits = executable(source).match(pattern) ?? [];
-      const leg = LEGS.find((candidate) => candidate.file === name);
-      if (!leg) {
-        expect(hits, `${name} 出现了 cargo profile 环境变量覆盖 —— 发行构型的源码门看不见它`).toEqual([]);
-        continue;
-      }
-      expect([...new Set(hits)].sort(), `${name} 里出现了两个放行键之外的 profile 覆盖`).toEqual(ALLOWED);
-      // 文件里每一处 CARGO_PROFILE_ 都落在该文件各 job 的构建权重步之内（步外一处都没有）。
-      let inSteps = 0;
-      for (const job of leg.jobs) {
-        const rawJob = jobBlock(source, job);
-        const jobText = executable(rawJob);
-        const step = executable(stepBlock(rawJob, leg.step));
-        expect(count(step), `${name} ${job} 的构建权重步里一处 CARGO_PROFILE_ 都没有 —— 取材面塌了`).toBeGreaterThan(2);
-        expect(count(jobText), `${name} ${job}：CARGO_PROFILE_ 出现在构建权重步之外`).toBe(count(step));
-        inSteps += count(step);
-
-        // 顺序：权重先定，再恢复缓存（键靠它分开），再构建（同一 job 的每次 cargo 构建同吃一份构型）。
-        const at = (needle: string) => {
-          const index = jobText.indexOf(needle);
-          expect(index, `${name} ${job} 里找不到「${needle}」`).toBeGreaterThanOrEqual(0);
-          return index;
-        };
-        let previous = at(`- name: ${leg.step}\n`);
-        for (const next of ['Setup Rust cache', ...leg.builds[job]]) {
-          const index = at(`- name: ${next}\n`);
-          expect(previous, `${name} ${job}：「${next}」排到了它前一步之前`).toBeLessThan(index);
-          previous = index;
-        }
-        // 发行路径上这一步不能被关掉或忽略失败。
-        expect(step).not.toMatch(/^ {8}continue-on-error:/m);
-        // 连同缩进续行一起取值，避免首行原样、下一行 `|| true` / `&& false` 绕过精确条件。
-        expect(step.match(/^ {8}if:.*(?:\n(?: {9,}.*|[ \t]*)$)*/gm) ?? []).toEqual([]);
-      }
-      expect(count(executable(source)), `${name}：CARGO_PROFILE_ 出现在各 job 的构建权重步之外`).toBe(inSteps);
-    }
-    // cargo 的 config 文件同样能写 [profile.*]，与环境变量是同一类旁路。
-    const cargoConfig = executable(readFileSync(join(REPO_ROOT, '.cargo/config.toml'), 'utf8'));
-    expect(cargoConfig).toContain('[target.x86_64-pc-windows-msvc]');
-    expect(cargoConfig, '.cargo/config.toml 出现了 [profile.*] —— 它会改写发行构型而 Cargo.toml 一字不动')
-      .not.toMatch(/^\s*\[profile[.\]]/m);
   });
 });

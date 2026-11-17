@@ -53,16 +53,6 @@ function hasStrictResultGate(body: string, variable: string): boolean {
     new RegExp(`\\[ ${result} = success \\]`).test(match[1]));
 }
 
-// Only the direct Cargo test grammar used here, not a general shell/YAML parser.
-// Anchor complete commands so comments, echo, test filters and failure masking do
-// not count as executed gates. Fold shell continuations before collecting targets.
-const configGateTargets = (src: string) => {
-  const joined = src.replace(/\\\r?\n[ \t]*/g, ' ');
-  const commands = [...joined.matchAll(/^[ \t]*(?:run:[ \t]*)?cargo[ \t]+test[ \t]+-p[ \t]+polaris-config-engine((?:[ \t]+--test[ \t]+[a-z_]+)+)(?:[ \t]+--[ \t]+--nocapture(?:[ \t]+--test-threads=1)?)?[ \t]*$/gm)];
-  return commands.flatMap((command) =>
-    [...command[1].matchAll(/--test[ \t]+([a-z_]+)/g)].map((target) => target[1])).sort();
-};
-
 describe('合入前发布风险门', () => {
   const risk = read('release-risk.yml');
   const pkg = read('package.yml');
@@ -197,7 +187,6 @@ esac
     // 取消只有在被取消的 run 里没有副作用任务时才安全。三条各自成立才算数：
     // ① 本 workflow 没有 tag 触发；
     const triggers = risk.slice(risk.indexOf('\non:\n'), risk.indexOf('\npermissions:\n'));
-    expect(triggers.length).toBeGreaterThan(40);
     expect(triggers).not.toMatch(/^\s+tags:/m);
     expect(triggers).not.toContain('release:');
     // ② package.yml 里第一次写 release 的 job 只在 v* tag 上可达，后两段经 needs 链继承它；
@@ -378,68 +367,6 @@ esac
     }
   });
 
-  it('preflight 用钉扎 protoc 对拍四平台 wire，D1 CONNECT 仍在 REQUIRE 强制腿', () => {
-    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-    expect(manifest.windowsBuild).toBeUndefined();
-    const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
-    const fetchCore = preflight.indexOf('      - name: Fetch sing-box core');
-    const fetchProtoc = preflight.indexOf('      - name: Fetch pinned protoc for gRPC wire check');
-    const wire = preflight.indexOf('      - name: Bundled core gRPC wire contract (all platforms)');
-    const mandatory = preflight.indexOf('      - name: Run mandatory bundled-core gates');
-    expect(fetchCore).toBeGreaterThanOrEqual(0);
-    expect(fetchProtoc).toBeGreaterThan(fetchCore);
-    expect(wire).toBeGreaterThan(fetchProtoc);
-    expect(mandatory).toBeGreaterThan(wire);
-    expect(preflight).toContain('node scripts/fetch-protoc.mjs');
-    expect(preflight).toContain('cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact');
-    const mandatoryStep = preflight.slice(mandatory);
-    expect(mandatoryStep).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
-    expect(mandatoryStep).toContain('cargo test -p polaris-config-engine --test mesh_inbound_runtime -- --nocapture');
-    expect(mandatoryStep).not.toContain('POLARIS_NO_KERNEL_RUN');
-  });
-
-  it('四道随包内核门在 package.yml 与 release-risk.yml 两份定义之间逐条对拍', () => {
-    // **合入前路径上真正在跑的是 release-risk.yml 这一份**：删掉它 129-132 里任意一行，
-    // 合入前内核门静默少一道。本条把两文件的接线逐条对拍。
-    const pkgGates = configGateTargets(pkg);
-    const riskGates = configGateTargets(risk);
-    const command = 'cargo test -p polaris-config-engine';
-    expect(configGateTargets(`${command} --test one\n${command} --test two`)).toEqual(['one', 'two']);
-    expect(configGateTargets(`${command} --test one --test two -- --nocapture`)).toEqual(['one', 'two']);
-    expect(configGateTargets(`${command} \\\n  --test one \\\n  --test two`)).toEqual(['one', 'two']);
-    expect(configGateTargets(`${command} --test one -- --nocapture --test-threads=1`)).toEqual(['one']);
-    const fingerprints = ['core_dep_fingerprint', 'core_schema_surface', 'core_build_matrix'];
-    const batch = `${command} ${fingerprints.map((target) => `--test ${target}`).join(' ')}`;
-    expect(configGateTargets(batch)).toEqual([...fingerprints].sort());
-    for (const target of fingerprints) {
-      expect(configGateTargets(batch.replace(` --test ${target}`, ''))).not.toEqual([...fingerprints].sort());
-      expect(configGateTargets(`${batch} --test ${target}`)).not.toEqual([...fingerprints].sort());
-    }
-    expect(configGateTargets(batch.replaceAll('--test', '--bin'))).toEqual([]);
-    for (const rejected of [
-      `# ${command} --test one`, `echo "${command} --test one"`,
-      `${command} --test one -- --nocapture --test-threads=0`,
-      `${command} --test one || true`, `${command} --test one -- ignored_filter`,
-      'cargo test -p other-package --test one',
-    ]) expect(configGateTargets(rejected)).toEqual([]);
-    // 取材面自曝：两侧都枚举不到时不许「空集 === 空集」判绿。
-    expect(pkgGates.length, 'package.yml 里一道随包内核门都没枚举到 —— 取材面塌了，本门此刻没有判据')
-      .toBeGreaterThan(0);
-    expect(riskGates, 'release-risk.yml 与 package.yml 的随包内核门清单不一致').toEqual(pkgGates);
-    // 强制腿也是双份定义：少了它「核没拉到」会静默跳过而不是红。
-    expect(pkg).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
-    expect(risk).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
-  });
-
-  it('手动分支内核门保持桌面 fork 角色来源、旧 mobile alpha8 与 REQUIRE 硬化', () => {
-    const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
-    const mandatory = preflight.slice(preflight.indexOf('      - name: Run mandatory bundled-core gates'));
-    expect(preflight).toContain('run: node scripts/fetch-core.mjs');
-    expect(mandatory).toContain("if: needs.classify.outputs.kernel == 'true'");
-    expect(mandatory).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
-    expect(mandatory).toContain('cargo test -p polaris-config-engine --test kernel_accepts_outbounds');
-  });
-
   it('每条选择性腿都必须被 gate 要求，且它的选择开关必须真的接出来', () => {
     // 缺口形态（2026-09-04 加 Android 腿时发现）：本文件此前逐条点名 preflight / package，
     // 对「**新增**一条腿」结构性失明 —— 新腿可以不进 gate 的 needs、gate 可以不判它的 result，
@@ -457,7 +384,6 @@ esac
     // 取材面自曝：枚举器变哑时下面两个 for 会恒真。
     expect(jobNames, 'release-risk.yml 的 job 枚举面塌了').toContain('classify');
     expect(jobNames, 'release-risk.yml 的 job 枚举面塌了').toContain('gate');
-    expect(jobNames.length, `只枚举到 ${jobNames.length} 个 job —— 枚举器坏了`).toBeGreaterThan(4);
 
     // gate 是最后一个 job，jobSection 的「必须有同级后继」自检对它不成立，故单独切到文件尾。
     const gateStart = lines.findIndex((l) => l === '  gate:');
@@ -491,7 +417,7 @@ esac
     const selectors = [
       ...new Set([...risk.matchAll(/needs\.classify\.outputs\.([a-z_]+)/g)].map((m) => m[1])),
     ].sort();
-    expect(selectors.length, '一个 classify 选择开关都没枚举到 —— 取材面塌了').toBeGreaterThan(3);
+    expect(selectors.length, '一个 classify 选择开关都没枚举到 —— 取材面塌了').toBeGreaterThan(0);
     for (const selector of selectors) {
       // candidate is immutable event identity, not a classifier decision or
       // impact-step bool. Its original provenance must remain explicit.

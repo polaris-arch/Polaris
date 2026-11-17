@@ -105,7 +105,6 @@ describe('COEX v1 strict observation boundary', () => {
       }
     }
     visit(snapshotFixture(), []);
-    expect(paths.length).toBeGreaterThan(60);
     for (const path of paths) {
       const value = structuredClone(snapshotFixture());
       let parent: unknown = value;

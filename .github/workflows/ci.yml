@@ -325,9 +325,7 @@ jobs:
       # 全量构建过，这些系统依赖一直缺 → clippy/build 在 build-script 阶段就炸。
       #
       # ── protoc：钉扎常量与版本依据的唯一真值在 scripts/fetch-protoc.mjs（2026-08-18，CI-4）──
-      # 此前「固定版本 + 四平台 URL + sha256」在本文件与 package.yml 各内联一份、靠对拍测试防漂；
-      # 收敛到脚本后只剩一处，对拍测试的 protoc 部分随之退休（NASM 仍内联：本文件 lint / test 两个
-      # job 各一份 + package.yml 一份，三份对拍照旧）。
+      # 安装脚本校验下载摘要，下方断言 PATH 上实际工具的版本。
       # 版本为什么是 35.1、为什么升版本零行为差、sha256 从哪来、被替掉的 arduino/setup-protoc@v3
       # 两个外部失效点 —— 全部在脚本头注，改版本先读它。sha 校验走 node createHash、解压走
       # lib/extract-zip.mjs（三平台 CI 已绿），与 shell 是 bash 还是 pwsh 彻底解耦。
@@ -938,7 +936,6 @@ jobs:
 
       # protoc 的钉扎真值与实证见 lint；Windows NASM 已为前面的无核测试安装。
       # NASM 常量现在全仓三处内联（本文件 lint / test 两处 + package.yml 一处），必须同时改；
-      # 三处逐字相等由 `ui/src/contracts/workflow-toolchain-pin-parity.test.ts` 对拍。
       - name: Install protoc (pinned URL + sha256)
         run: node scripts/fetch-protoc.mjs
 

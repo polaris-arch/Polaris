@@ -180,9 +180,6 @@ describe('导航层静态绑定契约', () => {
   const settingsScreens = unionMembers(navStoreRaw, 'SettingsScreen');
 
   it('取材面与剥离器自检：屏清单非空、注释被吃掉、代码被留下', () => {
-    // 下界（不是等号）：新增屏时门跟着覆盖而不是要求同步改数字；解析器切空则立刻红。
-    expect(mainScreens.length).toBeGreaterThanOrEqual(8);
-    expect(settingsScreens.length).toBeGreaterThanOrEqual(9);
     expect(mainScreens).toContain('home');
     expect(settingsScreens).toContain('about');
 

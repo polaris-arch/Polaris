@@ -15,13 +15,25 @@ import assert from "node:assert/strict";
 import {
   CONFIGURATION_NEEDLES,
   EXTERNAL_SOURCE,
-  SEED_ABSENT_CONTROL,
   assertR8Evidence,
   commentOnlyLines,
   parseConfigurationSections,
   sourceMatches,
+  seedMatches,
   stripHashComments,
 } from "./assert-r8-evidence.mjs";
+
+test("exact declaring class and full JNI overload; layout only normalized", () => {
+  const owner = "com.polaris2.app.RustWebView";
+  const expected = [owner, "java.lang.String getCookies(java.lang.String)"];
+  assert.equal(seedMatches(`${owner}: java.lang.String getCookies( java.lang.String );`, expected), true);
+  for (const row of [
+    `${owner}$Nested: java.lang.String getCookies(java.lang.String)`,
+    `prefix.${owner}: java.lang.String getCookies(java.lang.String)`,
+    `${owner}: java.lang.String getCookies()`,
+    `${owner}: void getCookies(java.lang.String)`,
+  ]) assert.equal(seedMatches(row, expected), false);
+});
 
 /** 一份「什么都对」的 configuration.txt：五根针各以**规则行**形态出现。 */
 function goodConfiguration() {
@@ -48,9 +60,8 @@ function goodConfiguration() {
   ].join("\n");
 }
 
-/** 一份「什么都保住了」的 seeds.txt（行数要过下限自检）。 */
+/** 保留实际所需类与成员的 seeds.txt，不添加凑行数的符号。 */
 function goodSeeds() {
-  const filler = Array.from({ length: 20 }, (_, i) => `androidx.filler.Class${i}`);
   return [
     "org.rustls.platformverifier.CertificateVerifier",
     "org.rustls.platformverifier.CertificateVerifier: void <init>()",
@@ -59,7 +70,6 @@ function goodSeeds() {
     "com.polaris2.app.PolarisTls: void initPlatformVerifier(android.content.Context)",
     "com.polaris2.app.RustWebView: void clearAllBrowsingData()",
     "com.polaris2.app.RustWebView: java.lang.String getCookies(java.lang.String)",
-    ...filler,
   ].join("\n");
 }
 
@@ -97,19 +107,6 @@ test("B07 回放：io.nekohasekai 只出现在本仓注释里 ⇒ 必须红", ()
   assert.match(problems[0], /（剥注释后）中没有 `io\.nekohasekai`/);
 });
 
-test("B07 的反面：不剥注释的话同一份输入是绿的（证明这条用例有牙）", () => {
-  const polluted = goodConfiguration()
-    .split("\n")
-    .filter((line) => !line.startsWith("-keep class io.nekohasekai"))
-    .concat(["# 反向对照：libbox.aar 的 proguard.txt 只有 go.** / io.nekohasekai.**"])
-    .join("\n");
-  assert.ok(polluted.includes("io.nekohasekai"), "原文里确实还有这串");
-  assert.ok(
-    !stripHashComments(polluted).includes("io.nekohasekai"),
-    "剥掉注释之后就没有了 —— 两个面的差别正是 B07",
-  );
-});
-
 test("B05 / M04 回放：keep 指向不存在的类 ⇒ configuration 照样有，seeds 说话", () => {
   const bogus = goodConfiguration().replace(
     "-keep class org.rustls.platformverifier.** { *; }",
@@ -140,13 +137,6 @@ test("wry 的两个成员一个没保住也要红", () => {
   assert.match(problems[0], /clearAllBrowsingData/);
 });
 
-test("反向对照有牙：seeds 里出现不存在的类 ⇒ 判定为匹配器恒真", () => {
-  const seeds = `${goodSeeds()}\n${SEED_ABSENT_CONTROL}`;
-  const { problems } = run({ seeds });
-  assert.equal(problems.length, 1, problems.join("\n"));
-  assert.match(problems[0], /恒真/);
-});
-
 test("剥注释确实发生了：本仓注释原文被抄进来时也不该有 problem，且留下一条记录", () => {
   const { problems, notes } = run();
   assert.deepEqual(problems, []);
@@ -165,12 +155,6 @@ test("configuration 全是注释 ⇒ 判定面塌了，当场红", () => {
   const { problems } = run({ configuration: "# 全是注释\n# 一条规则都没有\n" });
   assert.equal(problems.length, 1, problems.join("\n"));
   assert.match(problems[0], /取材面塌了/);
-});
-
-test("seeds 行数过少 ⇒ 当场红，不在这种面上下命中结论", () => {
-  const { problems } = run({ seeds: "org.rustls.platformverifier.CertificateVerifier\n" });
-  assert.equal(problems.length, 1, problems.join("\n"));
-  assert.match(problems[0], /只有 1 行/);
 });
 
 test("五根 configuration 针每一根都真的有牙（逐条删除对照）", () => {

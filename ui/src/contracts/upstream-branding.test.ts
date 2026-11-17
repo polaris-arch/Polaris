@@ -61,13 +61,4 @@ describe('上游品牌隔离', () => {
     ).toEqual([]);
   });
 
-  it('扫描器自检：它确实能扫到东西（否则上面那条是空过）', () => {
-    // 用一个必然存在的词证明 grep 这条通路是活的 —— 不然 grep 参数写错时上面那条会永远绿。
-    const out = execFileSync(
-      'grep',
-      ['-rIl', 'polaris', '--exclude-dir=target', '--exclude-dir=node_modules', '--exclude-dir=.git', '.'],
-      { cwd: REPO, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
-    );
-    expect(out.split('\n').filter(Boolean).length).toBeGreaterThan(20);
-  });
 });

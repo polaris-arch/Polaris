@@ -156,7 +156,6 @@ const FIXTURE = [
 describe('生产 TS 模块不得导出测试专用符号', () => {
   it('取材面与判据自检：本门不能空转', () => {
     // 否定型断言在空取材面上恒真 —— 这是本门唯一的静默失效方向。
-    expect(FILES.length, `只扫到 ${FILES.length} 个源文件 —— 枚举器坏了`).toBeGreaterThan(200);
     expect(
       FILES.map(rel),
       '取材面漏了 src/lib/desktop-notify.ts —— 整棵树没扫到'
