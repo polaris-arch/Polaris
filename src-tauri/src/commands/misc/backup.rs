@@ -7,7 +7,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::support::{node_platform, now_iso8601, today_yyyy_mm_dd};
 use crate::commands::picked_file::{
-    classify, display_of, read_picked_to_string, with_picked_gateway_blocking, write_picked,
+    classify, display_of, open_picked_for_read, with_picked_gateway_blocking, write_picked,
     FileGateway, FilePath, PickedTarget,
 };
 use crate::i18n::{key, t};
@@ -15,7 +15,7 @@ use crate::response::ApiResponse;
 use crate::runtime::AppRuntime;
 use polaris_store::backup::{
     build_backup_info, count_category, detect_categories, mesh_routing_owner_dependencies,
-    parse_backup_content, pick_categories, sanitize_unavailable_interface_bindings, BackupCategory,
+    parse_backup_value, pick_categories, sanitize_unavailable_interface_bindings, BackupCategory,
     BACKUP_CATEGORIES, BACKUP_FILE_VERSION, SHARED_DEPENDENCY_CONFLICT,
 };
 
@@ -86,7 +86,7 @@ async fn ask_open_path(app: &AppHandle) -> Option<FilePath> {
         .set_title(t(lang, key::NATIVE_BACKUP_IMPORT_TITLE));
     // Android dialog 把已知扩展转成 MIME、丢弃未知扩展和 "*"；保留 json
     // filter 会把本应用导出的 .polaris-backup 从系统选择器里隐藏。无 filter
-    // 时插件明确使用 */*；文件正文仍由 parse_backup_content 校验。
+    // 时插件明确使用 */*；文件正文仍由备份解析器校验。
     #[cfg(not(target_os = "android"))]
     let picker = picker
         .add_filter(t(lang, key::NATIVE_BACKUP_FILE_TYPE), &["polaris-backup"])
@@ -154,8 +154,13 @@ enum ImportSource {
     Cancelled,
     /// 选中了，但读不出来。
     ReadFailed,
-    /// 读到了正文，外加回给前端的目标标识（`backup_import_apply` 拿它二次打开同一个文档）。
-    Loaded { raw: String, file_path: String },
+    /// 文件可读，但不是支持的 UTF-8 JSON 备份。
+    InvalidFormat,
+    /// 已解析备份，外加回给前端的目标标识（`backup_import_apply` 拿它二次打开同一个文档）。
+    Loaded {
+        parsed: polaris_store::backup::ParsedBackup,
+        file_path: String,
+    },
 }
 
 /// 导入腿的**读取段**。抽出来的理由与 [`finish_export`] 相同。
@@ -163,15 +168,13 @@ fn read_import_source(gateway: &dyn FileGateway, picked: Option<FilePath>) -> Im
     let Some(target) = picked else {
         return ImportSource::Cancelled;
     };
-    match read_picked_to_string(gateway, &target) {
-        Ok(raw) => ImportSource::Loaded {
-            raw,
+    match read_backup(gateway, &target) {
+        Ok(parsed) => ImportSource::Loaded {
+            parsed,
             file_path: display_of(&target),
         },
-        Err(e) => {
-            log::warn!("[backup] import read failed: {e}");
-            ImportSource::ReadFailed
-        }
+        Err("readFailed") => ImportSource::ReadFailed,
+        Err(_) => ImportSource::InvalidFormat,
     }
 }
 
@@ -190,11 +193,12 @@ fn read_import_source(gateway: &dyn FileGateway, picked: Option<FilePath>) -> Im
 /// 这道缝同时钉住桌面侧唯一没被断言过的分流点：`FilePath::from_str` 把**单字母 scheme** 留给
 /// Windows 盘符（`C:\…` ⇒ `Path`，`tauri-plugin-fs-2.5.1/src/file_path.rs:189-196`），
 /// Unix 绝对路径则因 `Url::parse` 直接失败而落 `Path`。
-fn read_apply_source(gateway: &dyn FileGateway, file_path: &str) -> Result<String, ()> {
+fn read_apply_source(
+    gateway: &dyn FileGateway,
+    file_path: &str,
+) -> Result<polaris_store::backup::ParsedBackup, &'static str> {
     let source = FilePath::from_str(file_path).expect("FilePath::from_str 是 Infallible");
-    read_picked_to_string(gateway, &source).map_err(|e| {
-        log::warn!("[backup] import apply read failed: {e}");
-    })
+    read_backup(gateway, &source)
 }
 
 /// 上游 `BACKUP_EXPORT`：选择性导出（按 categories）。
@@ -288,14 +292,21 @@ async fn import_interface_names_from(
     }
 }
 
-// JSON parsing is CPU work proportional to the selected file. Keep it off the
-// async executor too; ownership releases the raw buffer before returning the tree.
-async fn parse_backup_off_thread(
-    raw: String,
+// Both import legs run this on the existing blocking dispatcher. Decode from
+// the file instead of retaining an additional full UTF-8 input alongside the tree.
+fn read_backup(
+    gateway: &dyn FileGateway,
+    target: &FilePath,
 ) -> Result<polaris_store::backup::ParsedBackup, &'static str> {
-    tokio::task::spawn_blocking(move || parse_backup_content(&raw))
-        .await
-        .unwrap_or(Err("invalid_json"))
+    let file = open_picked_for_read(gateway, target).map_err(|_| "readFailed")?;
+    let value = serde_json::from_reader(std::io::BufReader::new(file)).map_err(|error| {
+        if error.is_io() {
+            "readFailed"
+        } else {
+            "invalidFormat"
+        }
+    })?;
+    parse_backup_value(value).map_err(|_| "invalidFormat")
 }
 
 /// 上游 `BACKUP_IMPORT_PICK`：弹文件框 + 解析 → 返回含哪些类 + 各类数量（**不 apply**）。
@@ -309,23 +320,19 @@ pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()
             log::warn!("[backup] import pick task join failed: {e}");
             ImportSource::ReadFailed
         });
-    let (raw, file_path) = match source {
+    let (parsed, file_path) = match source {
         ImportSource::Cancelled => return Ok(ApiResponse::ok(json!({ "canceled": true }))),
         ImportSource::ReadFailed => {
             return Ok(ApiResponse::ok(
                 json!({ "canceled": false, "errorCode": "readFailed" }),
             ))
         }
-        ImportSource::Loaded { raw, file_path } => (raw, file_path),
-    };
-    let parsed = match parse_backup_off_thread(raw).await {
-        Ok(p) => p,
-        Err(code) => {
-            log::warn!("[backup] import preview parse rejected: {code}");
+        ImportSource::InvalidFormat => {
             return Ok(ApiResponse::ok(
                 json!({ "canceled": false, "errorCode": "invalidFormat" }),
-            ));
+            ))
         }
+        ImportSource::Loaded { parsed, file_path } => (parsed, file_path),
     };
     let available = detect_categories(&parsed.config);
     let blocked_categories: Vec<BackupCategory> = available
@@ -389,23 +396,16 @@ pub async fn backup_import_apply(
     // 前端回传的是 `backup_import_pick` 给出的那个字符串。分流与判据都住在 [`read_apply_source`]；
     // 路径和 URI 的读取均派到阻塞线程池。
     let target = FilePath::from_str(&file_path).expect("FilePath::from_str 是 Infallible");
-    let raw = match with_picked_gateway_blocking(&app, Some(target), move |gateway, _| {
+    let parsed = match with_picked_gateway_blocking(&app, Some(target), move |gateway, _| {
         read_apply_source(gateway, &file_path)
     })
     .await
     {
-        Ok(Ok(raw)) => raw,
-        Ok(Err(())) => return Ok(ApiResponse::ok(backup_failure("readFailed"))),
+        Ok(Ok(parsed)) => parsed,
+        Ok(Err(code)) => return Ok(ApiResponse::ok(backup_failure(code))),
         Err(e) => {
             log::warn!("[backup] import apply task join failed: {e}");
             return Ok(ApiResponse::ok(backup_failure("readFailed")));
-        }
-    };
-    let parsed = match parse_backup_off_thread(raw).await {
-        Ok(p) => p,
-        Err(code) => {
-            log::warn!("[backup] import apply parse rejected: {code}");
-            return Ok(ApiResponse::ok(backup_failure("invalidFormat")));
         }
     };
     if selected.contains(&BackupCategory::MeshRouting)

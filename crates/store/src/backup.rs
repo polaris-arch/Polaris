@@ -885,7 +885,7 @@ fn arr_or_empty(src: &Value, key: &str) -> Value {
 pub const BACKUP_FILE_VERSION: &str = "1.2";
 
 /// 解析结果：备份 config（Partial）+ 导出平台。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedBackup {
     /// 备份里的 config（选择性导出后可能只含部分类别字段）。
     pub config: Value,
@@ -901,7 +901,14 @@ pub struct ParsedBackup {
 /// # Errors
 /// 坏 JSON → `invalid_json`；既非新格式也非旧格式 → `invalid_format`。
 pub fn parse_backup_content(raw: &str) -> Result<ParsedBackup, &'static str> {
-    let mut parsed: Value = serde_json::from_str(raw).map_err(|_| "invalid_json")?;
+    parse_backup_value(serde_json::from_str(raw).map_err(|_| "invalid_json")?)
+}
+
+/// Parse an already decoded backup without cloning its configuration tree.
+///
+/// # Errors
+/// Returns `invalid_format` when neither supported backup shape is present.
+pub fn parse_backup_value(mut parsed: Value) -> Result<ParsedBackup, &'static str> {
     if truthy(parsed.get("version")) && truthy(parsed.get("config")) {
         let platform = parsed
             .get("platform")

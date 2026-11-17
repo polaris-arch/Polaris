@@ -1,4 +1,5 @@
 use super::*;
+use polaris_store::backup::parse_backup_content;
 
 #[test]
 fn shared_backup_dependency_conflict_has_its_stable_ui_code() {
@@ -174,7 +175,7 @@ fn importing_from_a_content_uri_is_not_reported_as_cancelled_and_really_reads() 
     assert_eq!(
         outcome,
         ImportSource::Loaded {
-            raw: "{\"version\":\"1.1\",\"config\":{}}".to_string(),
+            parsed: parse_backup_content("{\"version\":\"1.1\",\"config\":{}}").unwrap(),
             file_path: SAF_URI.to_string(),
         },
         "URI 目标必须真的读到正文，且回执是能二次打开的那个 URI"
@@ -187,13 +188,13 @@ fn importing_from_a_local_path_still_goes_through_std_fs() {
     // 桌面负侧：只喂**裸路径**。
     let dir = TestDir::new("polaris-backup-import-path");
     let src = dir.path().join("in.polaris-backup");
-    std::fs::write(&src, "{\"version\":\"1.0\"}").unwrap();
+    std::fs::write(&src, "{\"version\":\"1.0\",\"config\":{}}").unwrap();
     let gateway = RecordingGateway::new(dir.path().join("must-stay-untouched"));
 
     assert_eq!(
         read_import_source(&gateway, Some(desktop_target(&src))),
         ImportSource::Loaded {
-            raw: "{\"version\":\"1.0\"}".to_string(),
+            parsed: parse_backup_content("{\"version\":\"1.0\",\"config\":{}}").unwrap(),
             file_path: src.to_string_lossy().into_owned(),
         }
     );
@@ -232,7 +233,7 @@ fn reapplying_a_content_uri_goes_through_the_gateway_and_really_reads() {
 
     assert_eq!(
         read_apply_source(&gateway, &echoed).expect("content URI 必须读得出来"),
-        "{\"version\":\"1.1\",\"config\":{}}"
+        parse_backup_content("{\"version\":\"1.1\",\"config\":{}}").unwrap()
     );
     assert_eq!(
         gateway.calls(),
@@ -246,14 +247,14 @@ fn reapplying_a_desktop_path_never_touches_the_gateway() {
     // 桌面负侧：`backup_import_pick` 在桌面回的是 `path.to_string_lossy()`，原样喂回来。
     let dir = TestDir::new("polaris-backup-apply-path");
     let src = dir.path().join("in.polaris-backup");
-    std::fs::write(&src, "{\"version\":\"1.0\"}").unwrap();
+    std::fs::write(&src, "{\"version\":\"1.0\",\"config\":{}}").unwrap();
     let gateway = RecordingGateway::new(dir.path().join("must-stay-untouched"));
 
     let echoed = crate::commands::picked_file::display_of(&desktop_target(&src));
     assert_eq!(echoed, src.to_string_lossy().as_ref());
     assert_eq!(
         read_apply_source(&gateway, &echoed).expect("桌面路径必须读得出来"),
-        "{\"version\":\"1.0\"}"
+        parse_backup_content("{\"version\":\"1.0\",\"config\":{}}").unwrap()
     );
     assert!(
         gateway.calls().is_empty(),
@@ -383,23 +384,26 @@ fn local_backup_rejects_symlink_without_changing_its_target() {
     assert_eq!(std::fs::read_to_string(&existing).unwrap(), "keep");
 }
 
-#[tokio::test]
-async fn backup_background_parser_preserves_formats_and_errors() {
+#[test]
+fn backup_stream_parser_preserves_formats_and_errors() {
+    let dir = TestDir::new("polaris-backup-stream");
+    let path = dir.path().join("backup");
+    let gateway = RecordingGateway::new(path.clone());
     for raw in [
         r#"{"version":"1.2","platform":"linux","config":{"servers":[]}}"#,
         r#"{"servers":[{"id":"one"}]}"#,
         r#"{"unrelated":true}"#,
         "not json",
     ] {
-        let expected = parse_backup_content(raw);
-        let actual = parse_backup_off_thread(raw.to_owned()).await;
-        match (expected, actual) {
-            (Ok(expected), Ok(actual)) => {
-                assert_eq!(actual.config, expected.config);
-                assert_eq!(actual.platform, expected.platform);
-            }
-            (Err(expected), Err(actual)) => assert_eq!(actual, expected),
-            _ => panic!("background parsing changed backup acceptance"),
+        std::fs::write(&path, raw).unwrap();
+        let expected = parse_backup_content(raw).map_err(|_| "invalidFormat");
+        for target in [desktop_target(&path), saf_file_path()] {
+            assert_eq!(read_backup(&gateway, &target), expected);
         }
     }
+    std::fs::write(&path, [0xff]).unwrap();
+    assert_eq!(
+        read_backup(&gateway, &desktop_target(&path)),
+        Err("invalidFormat")
+    );
 }

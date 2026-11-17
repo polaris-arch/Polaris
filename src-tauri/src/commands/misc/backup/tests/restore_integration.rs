@@ -267,12 +267,13 @@ fn all_legacy_categories_survive_export_preview_apply_and_reopen() {
         finish_export(&gateway, Some(desktop_target(&backup_path)), &body)["success"],
         true
     );
-    let ImportSource::Loaded { raw, file_path } =
-        read_import_source(&gateway, Some(desktop_target(&backup_path)))
+    let ImportSource::Loaded {
+        parsed: preview,
+        file_path,
+    } = read_import_source(&gateway, Some(desktop_target(&backup_path)))
     else {
         panic!("exported document must be readable for preview");
     };
-    let preview = parse_backup_content(&raw).unwrap();
     assert_eq!(detect_categories(&preview.config), legacy_categories);
     for category in &legacy_categories {
         assert!(
@@ -280,8 +281,7 @@ fn all_legacy_categories_survive_export_preview_apply_and_reopen() {
             "{category:?}"
         );
     }
-    let apply_raw = read_apply_source(&gateway, &file_path).unwrap();
-    let parsed = parse_backup_content(&apply_raw).unwrap();
+    let parsed = read_apply_source(&gateway, &file_path).unwrap();
     let saved = crate::commands::config::backup_import_save_core(
         &target_manager,
         &parsed.config,
