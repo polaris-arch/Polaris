@@ -159,6 +159,18 @@ node scripts/prepare-core-identity.mjs --platform="$platform" --mode=verify
 
 helper、Windows cleaner 和 App 必须共享同一 `POLARIS_BUILD_ID`。macOS 的 helper 先做 ad-hoc 密封，再生成安装身份；这不是 Developer ID 签名或公证。`prepare-core-identity.mjs` 冻结实际随包字节，App 编译消费同一清单；后续改动 helper/内核字节必须重新准备并重编 App，不能只替换文件。缺少身份输入时分析构建可能产生不可用占位，不应把编译通过当作可安装运行的完整包。正式发布还需同一候选的原生验收包、payload/assets/inventory、签名与完整发布 DAG；本地步骤不替代这些门禁。`verify-packaging.mjs confs` 会检查四个平台的资源目录，需要全部四套资源准备齐全；它不是此单平台构建步骤的一部分。
 
+#### 本地快速验收包
+
+要在测试机上验证改动又不想等 `package.yml` 时，在对应宿主上运行：
+
+```bash
+node scripts/local-package.mjs --platform=linux      # Linux 宿主，出 deb
+node scripts/local-package.mjs --platform=win        # Linux 宿主，经 cargo-xwin 交叉编译 NSIS
+node scripts/local-package.mjs --platform=mac-arm64  # Apple 芯片 macOS 宿主，出已 ad-hoc 密封的 .app
+```
+
+脚本按上面的顺序准备资源、helper 与安装身份，并补做 Windows 静态 CRT 检查与 macOS bundle 密封。它使用轻量构型（`lto=off`、`codegen-units=16`），产物只供测试机安装，不得分发，也不替代 CI 与正式发布门禁。Windows 交叉编译另需 `cargo-xwin`、`nsis`、`lld`、`llvm` 与 `ninja`，首次运行会下载微软 CRT/SDK（即接受其许可）；Tauri 官方把这条路径列为后备方案，Windows 专属的输入冻结与首编证据仍只在 CI 上做。
+
 产物落在**仓库根**的 `target/release/bundle/`（本仓是 cargo workspace，workspace 根在仓库根，
 故**不是** `src-tauri/target/`）；传了 `--target <triple>` 时再下沉一层：`target/<triple>/release/bundle/`。
 

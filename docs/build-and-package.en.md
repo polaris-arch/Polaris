@@ -164,6 +164,18 @@ node scripts/prepare-core-identity.mjs --platform="$platform" --mode=verify
 
 The helper, Windows cleaner and App must share one `POLARIS_BUILD_ID`. Seal the macOS helper ad hoc before freezing its identity; this is not Developer ID signing or notarization. `prepare-core-identity.mjs` freezes the actual bundled bytes, and App compilation consumes that same manifest. If helper/core bytes change later, prepare the identity and rebuild the App rather than replacing files alone. With no identity input, analysis builds may produce an unavailable placeholder; successful compilation alone is not a usable installer. Formal publication additionally requires same-candidate native acceptance bundles, payload/assets/inventory checks, signing and the complete release DAG. These local steps do not replace those gates. `verify-packaging.mjs confs` checks resources for all four platforms and requires all four resource sets; it is not part of this single-platform recipe.
 
+#### Quick local acceptance installers
+
+To check a change on test machines without waiting for `package.yml`, run on the matching host:
+
+```bash
+node scripts/local-package.mjs --platform=linux      # Linux host, deb
+node scripts/local-package.mjs --platform=win        # Linux host, NSIS cross-built via cargo-xwin
+node scripts/local-package.mjs --platform=mac-arm64  # Apple silicon macOS host, ad hoc sealed .app
+```
+
+The script follows the order above to prepare resources, helper and installation identity, and adds the Windows static-CRT check and the macOS bundle seal. It uses a light build (`lto=off`, `codegen-units=16`): the output is for installing on test machines only, must not be distributed, and replaces neither CI nor the formal release gates. The Windows cross build additionally needs `cargo-xwin`, `nsis`, `lld`, `llvm` and `ninja`; its first run downloads the Microsoft CRT/SDK, which accepts their license. Tauri documents this path as a fallback, and the Windows-only input freeze and first-build evidence still run only in CI.
+
 Artifacts land in `target/release/bundle/` at the **repository root** (this repo is a cargo workspace whose root is the repository root, so **not** `src-tauri/target/`). When `--target <triple>` is passed, they go one level deeper: `target/<triple>/release/bundle/`.
 
 | Platform | Artifact | Form |
