@@ -1208,15 +1208,23 @@ impl ProxyRuntime {
 
     /// C7：停核/启动自愈尾还原系统 DNS（best-effort）。无 marker（fresh / 已还原）→ 惰性。
     pub(super) async fn restore_system_dns_best_effort(self: &Arc<Self>) {
+        let _ = self.restore_system_dns_checked().await;
+    }
+
+    pub(super) async fn restore_system_dns_checked(self: &Arc<Self>) -> bool {
         let this = Arc::clone(self);
         let blocking_lease = self.config.retain_active_legacy_start_lease();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             let _blocking_lease = blocking_lease;
             this.restore_system_dns_locked()
         })
         .await
         {
-            log::error!("系统 DNS 还原 spawn_blocking join 失败: {e}");
+            Ok(restored) => restored,
+            Err(error) => {
+                log::error!("系统 DNS 还原 spawn_blocking join 失败: {error}");
+                false
+            }
         }
     }
 

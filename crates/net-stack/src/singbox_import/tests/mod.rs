@@ -1743,6 +1743,7 @@ fn generate_import_on_platform(
     }))
     .expect("导入产物反序列化成 UserConfig 失败");
     let deps = GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: platform.into(),
         arch: arch.into(),
         node_dns_decoy_override: None,

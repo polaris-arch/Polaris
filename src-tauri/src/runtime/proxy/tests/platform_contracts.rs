@@ -409,6 +409,7 @@ fn android_config_actually_contains_the_naive_outbound() {
 
     fn deps_for(platform: &str, has_cronet: bool) -> GenerateConfigDeps {
         GenerateConfigDeps {
+            linux_resolved_external: false,
             platform: platform.to_string(),
             arch: "aarch64".into(),
             node_dns_decoy_override: None,

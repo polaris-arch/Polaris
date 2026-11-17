@@ -1,33 +1,9 @@
 use super::*;
 
-// ── protoVersion 契约（**前提已换**）─────────────────────────────────────────
-//
-// 旧测 `proto_versions_match_polaris` / `platforms_are_distinct` 断言 9/5/1 且三者互异，前提是
-// 「三平台各自演进的独立谱系必须原样移植」。那个前提是 **上游的历史包袱**：9/5/1 只是三套独立
-// Go module 各自加过多少次功能的计数，唯一用途是让新 client 认出机器上那代旧 helper。Polaris 是
-// 全新产品 + 全新 Rust helper，**不存在任何一代旧 Polaris helper 需要被认出** ⇒ 三谱系无对象、
-// 「必须互异」更是把别人的演进史写成自己的不变量（它会主动阻止本该做的统一）。
-//
-// 新前提：版本号只表达「wire 断代」，平台差异由 `Platform`（帧结构）+ `command`（命令集）表达。
-// 故三平台共用一个 `CURRENT`，下面一测锁的是**统一**而非互异。
-
-// 曾有一条 `proto_version_does_not_vary_by_platform`：遍历四个 `Platform` 反复断言
-// `Response::Ok(Pong{ proto_version: CURRENT, .. }).to_wire_line()` 的版本段。**已删** ——
-// 循环变量只出现在断言消息里，`advertised` 由常量 `CURRENT` 算出、与平台无关 ⇒ 四次迭代是同一
-// 个断言的四份副本，字面量由 linux/handler/tests 的 `wire_forms_match_go_source` 钉住；它自称能拦「有人按 Platform
-// match 返不同值」，可新增的那个函数**根本不会被它调用**，拦不住。
-//
-// 「不得 per-platform 分叉」的真锚点在**分叉真会发生的地方** —— 三个平台各自的 `PROTO_VERSION`
-// 常量（cfg 门控模块，helper-proto 这层遍历不到）：Linux 一处字面量断言，mac/win 断言等于 `CURRENT`：
-//   · `platform::macos::mod.rs`   `proto_version_is_unified_current`
-//   · `platform::windows::mod.rs` `proto_version_is_unified_current`
-//   · `platform::linux::handler.rs` `wire_forms_match_go_source`（钉死当前 protocol）
-// `to_wire_line` 的 Pong 形态另由 `crates/helper-proto/src/response::to_wire_line_matches_go_source_literals` 覆盖。
-
+// Shared framing remains unchanged by target-specific mandatory behavior fixes.
+// Native advertisement and platform requirements are tested independently below.
 #[test]
-fn platform_carries_frame_shape_not_version() {
-    // 推翻旧前提的正面表述：三平台**唯一**的协议差异是帧结构（token 行有无），不是版本号。
-    // 同一个 Request 在 mac/linux 下编出的帧不同 —— 差异由 Platform 承载，版本号无需分叉。
+fn platform_carries_frame_shape_independently_of_behavior_generation() {
     let req = Request::Ping;
     let mac = String::from_utf8(codec::encode(Platform::Mac, "TOK", &req)).unwrap();
     let linux = String::from_utf8(codec::encode(Platform::Linux, "", &req)).unwrap();
@@ -263,4 +239,15 @@ fn end_to_end_start_roundtrip() {
         String::from_utf8(linux_bytes).unwrap(),
         "start-reap-safe\n/core/sing-box\n/tmp/c.json\n\n0\n"
     );
+}
+
+#[test]
+fn native_advertisement_matches_target_behavior_generation() {
+    assert_eq!(
+        proto_version::CURRENT,
+        proto_version::for_platform(Platform::current())
+    );
+    assert_eq!(proto_version::for_platform(Platform::Win), 8);
+    assert_eq!(proto_version::for_platform(Platform::Mac), 7);
+    assert_eq!(proto_version::for_platform(Platform::Linux), 7);
 }

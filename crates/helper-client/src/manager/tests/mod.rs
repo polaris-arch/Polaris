@@ -624,9 +624,9 @@ fn clear_token_removes_file() {
 // 的 9/5/1。那前提对 Polaris 不成立（无旧版 helper 需被认出），已随常量统一一并推翻。
 
 #[test]
-fn expected_proto_is_unified_current() {
+fn expected_proto_matches_native_advertisement() {
     assert_eq!(
-        expected_proto(),
+        expected_proto(Platform::current()),
         polaris_helper_proto::proto_version::CURRENT
     );
 }
@@ -652,7 +652,7 @@ fn own_helper_is_ready_and_not_upgradeable() {
     // 这是 min_usable / expected_proto 两个阈值的**汇合断言**，任一改坏都会红。
     let v = std::hint::black_box(polaris_helper_proto::proto_version::CURRENT);
     assert!(v >= MIN_USABLE_PROTO, "自家 helper 必须判 ready");
-    assert!(v >= expected_proto(), "自家 helper 不该被判为可升级");
+    assert!(v >= expected_proto(Platform::current()), "自家 helper 不该被判为可升级");
 }
 
 // ===== 装卸流程（install/uninstall）=====
@@ -2353,4 +2353,62 @@ fn linux_ownmask_routing_hint_never_performs_implicit_legacy_recovery() {
     assert!(script.contains("readlink -- \"$DESCRIPTOR\""));
     assert!(script.contains("HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY"));
     assert!(!script.contains("linux-legacy-install"));
+}
+
+#[test]
+fn windows_v7_requires_behavior_upgrade_but_new_build_ids_do_not() {
+    let current = polaris_helper_proto::proto_version::for_platform(Platform::Win);
+    for (version, build, upgradeable) in [
+        (7, "pre-exact-object-fix", true),
+        (current, "older-app-build", false),
+        (current + 1, "newer-compatible-build", false),
+    ] {
+        let paths = InstallPaths::win();
+        let mut sysops = MockSysOps::default();
+        sysops.registered_services.insert(paths.service_label.into());
+        let (manager, _dir) = manager_with_token(Platform::Win, sysops);
+        let connector = MockConnector {
+            streams: Arc::new(Mutex::new(vec![MockStream::with_response(
+                format!("OK pong uid=0 v{version} build={build}\n").into_bytes(),
+            )])),
+        };
+        let status = manager.compute_status_with_client(&HelperClient::new(
+            Box::new(connector),
+            Platform::Win,
+            "TOK",
+        ));
+        assert!(status.installed);
+        assert!(
+            status.ready,
+            "compatible old helper is upgradeable, not damaged"
+        );
+        assert_eq!(status.upgradeable, upgradeable);
+        assert!(!status.needs_repair);
+        assert_eq!(status.build_id.as_deref(), Some(build));
+    }
+}
+
+#[test]
+fn windows_behavior_upgrade_keeps_mac_and_linux_v7_status_compatible() {
+    for platform in [Platform::Mac, Platform::Linux] {
+        let paths = InstallPaths::for_platform(platform);
+        let mut sysops = MockSysOps::default();
+        sysops.exists_paths.insert(paths.binary);
+        sysops.exists_paths.insert(paths.descriptor.unwrap());
+        let (manager, _dir) = manager_with_token(platform, sysops);
+        let connector = MockConnector {
+            streams: Arc::new(Mutex::new(vec![MockStream::with_response(
+                b"OK pong uid=0 v7 build=retained-helper\n".to_vec(),
+            )])),
+        };
+        let status = manager.compute_status_with_client(&HelperClient::new(
+            Box::new(connector),
+            platform,
+            "TOK",
+        ));
+        assert!(status.installed);
+        assert!(status.ready);
+        assert!(!status.upgradeable);
+        assert!(!status.needs_repair);
+    }
 }

@@ -338,14 +338,10 @@ impl HelperManager {
     }
 }
 
-/// 本 build 期望的 protoVersion（**与平台无关**）。
-///
-/// 上游 这里按平台分三支（mac=9 / win=5 / linux=1），因为它的三套 Go helper 各自演进。Polaris 三
-/// 平台共用一个 `helper-proto` crate、helper 也是同一份 Rust 代码按 target 编译 ⇒ 期望值只有一个。
-/// 保留成函数（而非内联常量）是为了留住 `upgradeable` 的语义：装着的 helper 比本 build 期望的旧 →
-/// 提示可升级；`CURRENT` 将来 +1 时这条自动生效。
-fn expected_proto() -> u32 {
-    polaris_helper_proto::proto_version::CURRENT
+/// Target-platform compatibility requirement. A Windows-only behavior repair
+/// must not replace a usable Mac/Linux helper; build identities remain diagnostic.
+fn expected_proto(platform: Platform) -> u32 {
+    polaris_helper_proto::proto_version::for_platform(platform)
 }
 
 /// ping helper 取 protoVersion + build identity（移植自 上游 `sendCommand(['ping'], 1500)` + 正则提取）。
@@ -390,7 +386,7 @@ impl HelperManager {
         };
         let proto_version = handshake.proto_version;
         let ready = proto_version >= MIN_USABLE_PROTO;
-        let expected_proto = expected_proto();
+        let expected_proto = expected_proto(self.platform);
         // B3: a newer compatible helper serves multiple App/core versions.
         // Build id remains diagnostic; App overlays its own core-status id proof.
         let upgradeable = proto_version < expected_proto;

@@ -11,6 +11,7 @@ use crate::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
 /// 构造最小 GenerateConfigDeps（Linux、无 probe、FS 全 false）。
 fn deps_default() -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: "linux".into(),
         arch: "x64".into(),
         node_dns_decoy_override: None,
@@ -2484,4 +2485,34 @@ fn all_full_generators_accept_custom_defaults_and_unused_disabled_dns() {
         &BTreeMap::new()
     )
     .is_ok());
+}
+
+#[test]
+fn external_resolved_owner_is_linux_tun_only_and_keeps_dns_mode() {
+    for platform in ["linux", "darwin", "win32", "android", "ios", "unknown"] {
+        let mut config = base_config();
+        config.proxy_mode_type = ProxyModeType::Tun;
+        let mut deps = deps_default();
+        deps.platform = platform.into();
+        let ordinary = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        deps.linux_resolved_external = true;
+        let external = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        let mut actual = serde_json::to_value(&external).unwrap();
+        let expected = serde_json::to_value(&ordinary).unwrap();
+        let mut owner_count = 0;
+        for inbound in actual["inbounds"].as_array_mut().unwrap() {
+            if inbound["type"] == "tun" && platform == "linux" {
+                assert_eq!(inbound["linux_resolved_external"], true);
+                owner_count += 1;
+                inbound.as_object_mut().unwrap().remove("linux_resolved_external");
+            } else {
+                assert!(inbound.get("linux_resolved_external").is_none());
+            }
+        }
+        assert_eq!(owner_count, usize::from(platform == "linux"));
+        assert_eq!(
+            actual, expected,
+            "DNS hijack and all other config must stay unchanged"
+        );
+    }
 }

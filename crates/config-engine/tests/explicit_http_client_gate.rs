@@ -162,6 +162,7 @@ fn violations(cfg: &Value) -> Vec<String> {
 /// 生成依赖：管理 API 与 dashboard 一律打开（金样默认 false，本门必须打开才碰得到 services）。
 fn gate_deps(platform: &str, serve_dir: Option<String>) -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: platform.to_string(),
         arch: "x86_64".into(),
         node_dns_decoy_override: None,

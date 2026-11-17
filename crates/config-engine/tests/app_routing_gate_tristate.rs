@@ -132,6 +132,7 @@ fn config_with_gate(gate: Option<bool>) -> UserConfig {
 
 fn deps(platform: &str) -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: platform.into(),
         arch: "x86_64".into(),
         node_dns_decoy_override: None,

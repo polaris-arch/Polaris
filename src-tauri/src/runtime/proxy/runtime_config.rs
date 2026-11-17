@@ -1590,6 +1590,9 @@ impl ProxyRuntime {
                 super::dns_takeover::dns_takeover_enabled(&candidate),
             );
         }
+        // Ownership is fixed for this running generation. Host DNS enable/disable
+        // is handled by the checked host-effect transaction, never an IPC snapshot.
+        deps.linux_resolved_external = baseline.deps.linux_resolved_external;
         if let Some(endpoint) = baseline.management.as_ref() {
             deps.tailscale_api_port = endpoint.port;
         }

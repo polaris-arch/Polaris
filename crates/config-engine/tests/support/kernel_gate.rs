@@ -153,6 +153,7 @@ pub fn outbound_deps(case: &SnapshotCase) -> GenerateConfigDeps {
 #[allow(dead_code)] // 见上；出站门的手造场景复用此冻结依赖。
 pub fn outbound_deps_for(platform: &str) -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: platform.into(),
         arch: "x86_64".into(),
         node_dns_decoy_override: None,
@@ -207,6 +208,7 @@ pub fn full_config_deps(case: &SnapshotCase, temp: &TempDir) -> GenerateConfigDe
     );
     let tmp = temp.path();
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: case.platform.clone(),
         arch: "x86_64".into(),
         node_dns_decoy_override: None,

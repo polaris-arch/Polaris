@@ -4312,6 +4312,7 @@ fn probe_pool_allocation_falls_back_to_sixteen_slots_before_giving_up() {
 
 fn probe_pool_generate_deps(slots: u16) -> polaris_config_engine::builder::GenerateConfigDeps {
     polaris_config_engine::builder::GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: "linux".into(),
         arch: "x64".into(),
         node_dns_decoy_override: None,
@@ -4940,4 +4941,62 @@ fn manual_runs_directly_without_network_takeover() {
             platform
         ));
     }
+}
+
+#[test]
+fn resolved_external_is_fixed_by_linux_helper_execution_route() {
+    use crate::runtime::proxy::startup::linux_helper_resolved_owner;
+    use polaris_config_engine::user_config::proxy_mode::ProxyModeType;
+    for platform in [
+        Platform::Linux, Platform::Mac, Platform::Win,
+        Platform::Android, Platform::Ios, Platform::Other,
+    ] {
+        for mode in [ProxyModeType::Tun, ProxyModeType::SystemProxy, ProxyModeType::Manual] {
+            let expected = matches!(platform, Platform::Linux) && mode == ProxyModeType::Tun;
+            assert_eq!(linux_helper_resolved_owner(platform, mode), expected);
+        }
+    }
+}
+
+#[test]
+fn linux_dns_failure_publication_preserves_new_generation_and_unretired_identity() {
+    let (runtime, _directory) = test_runtime();
+    let generation = runtime.gate.generation();
+    *runtime.status.write().unwrap() = ProxyStatus {
+        running: true,
+        pid: 1234,
+        main_generation: generation,
+        ..ProxyStatus::default()
+    };
+    let failed = runtime.publish_linux_dns_start_failure(generation, Err("stop failed".into()));
+    assert!(failed.unwrap().contains("cleanup unconfirmed"));
+    assert!(runtime.status().running);
+    assert_eq!(runtime.status().pid, 1234);
+    assert_eq!(runtime.status().error_code.as_deref(), Some(code::SYSTEM_DNS_TAKEOVER_FAILED));
+
+    runtime.gate.bump_generation();
+    let successor = runtime.gate.generation();
+    *runtime.status.write().unwrap() = ProxyStatus {
+        running: true,
+        pid: 5678,
+        main_generation: successor,
+        ..ProxyStatus::default()
+    };
+    assert!(runtime.publish_linux_dns_start_failure(generation, Ok(())).is_none());
+    assert!(runtime.status().running);
+    assert_eq!(runtime.status().pid, 5678);
+    assert!(runtime.status().error.is_none());
+    assert!(runtime.publish_linux_dns_start_failure(successor, Ok(())).is_some());
+    assert!(!runtime.status().running);
+    assert_eq!(runtime.status().pid, 0);
+    assert_eq!(runtime.status().error_code.as_deref(), Some(code::SYSTEM_DNS_TAKEOVER_FAILED));
+}
+
+#[tokio::test]
+async fn linux_dns_disable_requires_confirmed_restore() {
+    let (runtime, _directory) = test_runtime();
+    runtime.set_test_dns_restore(Arc::new(|| Err("cleanup remains pending".into())));
+    assert!(!runtime.restore_system_dns_checked().await);
+    runtime.set_test_dns_restore(Arc::new(|| Ok(())));
+    assert!(runtime.restore_system_dns_checked().await);
 }

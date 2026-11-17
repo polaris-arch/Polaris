@@ -30,6 +30,9 @@ pub struct Inbound {
     /// Output-only DNS mode; mobile and automatic routing keep the audited core default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_mode: Option<TunDnsMode>,
+    /// Linux Helper owns resolved setup/revert; packet DNS hijack remains enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linux_resolved_external: Option<bool>,
     /// auto_redirect（1.10+）：Linux nftables 改善 TUN 路由/性能。P6 LAN 网关按 MAC 过滤时必发。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_redirect: Option<bool>,

@@ -131,6 +131,9 @@ fn dashboard_http_client(singbox: &SingBoxConfig) -> HttpClient {
 /// 对拍：FS 路径注入固定假路径（如 "/fake/cache.db"），回调为 no-op。生产由 ProxyManager 等价层填真值。
 #[derive(Debug, Clone)]
 pub struct GenerateConfigDeps {
+    /// Runtime selected Linux Helper execution as the resolved owner. False for
+    /// exported configs and non-Helper paths; not a successful takeover receipt.
+    pub linux_resolved_external: bool,
     /// process.platform（neighbor match / mesh system 门控 / log output 谓词）。
     pub platform: String,
     /// 编译目标 arch（outbound tls_spoof 门控）。
@@ -542,7 +545,20 @@ fn generate_base_config(
         observed_tailnet_addresses: deps.observed_tailnet_addresses.clone(),
         loopback_auth: deps.loopback_auth.clone(),
     };
-    let inbounds = build_inbounds(config, Some(resolved_ips), &inbounds_deps);
+    let mut inbounds = build_inbounds(config, Some(resolved_ips), &inbounds_deps);
+    for inbound in &mut inbounds {
+        inbound.linux_resolved_external = match Platform::parse(&deps.platform) {
+            Platform::Linux if inbound.type_field == "tun" && deps.linux_resolved_external => {
+                Some(true)
+            }
+            Platform::Linux
+            | Platform::Mac
+            | Platform::Win
+            | Platform::Android
+            | Platform::Ios
+            | Platform::Other => None,
+        };
+    }
 
     // ── 8. buildRouteConfig（L3543-3557）────────────────────────────────────────
     let route_deps = RouteConfigDeps {

@@ -16,6 +16,7 @@ use polaris_stats_engine::RuleIdentity;
 
 fn deps() -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: "linux".into(),
         arch: "x64".into(),
         node_dns_decoy_override: None,

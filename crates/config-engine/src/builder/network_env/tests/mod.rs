@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 fn deps(platform: &str, takeover: bool, custom_rules_dir: &str) -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: platform.into(),
         arch: "x64".into(),
         node_dns_decoy_override: None,

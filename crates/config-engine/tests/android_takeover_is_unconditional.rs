@@ -42,6 +42,7 @@ const MODES: [ProxyModeType; 3] = [
 
 fn deps(platform: &str) -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: platform.to_owned(),
         arch: "aarch64".into(),
         node_dns_decoy_override: None,

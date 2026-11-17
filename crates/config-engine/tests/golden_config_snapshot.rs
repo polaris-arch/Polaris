@@ -329,6 +329,7 @@ fn generate_config_matches_polaris_snapshot() {
             scenario_deps(&case.name);
         // 构造 deps：对齐 config-snapshot.test.ts snap() 的默认注入值。
         let deps = GenerateConfigDeps {
+            linux_resolved_external: false,
             platform: case.platform.clone(),
             arch: "x86_64".into(),
             node_dns_decoy_override: None,
@@ -482,6 +483,7 @@ fn resource_missing_world_never_falls_back_to_plaintext_direct() {
         let (probe_direct_port, probe_proxy_port, update_in_port, lan_resolver_for_dns) =
             scenario_deps(&case.name);
         let deps = GenerateConfigDeps {
+            linux_resolved_external: false,
             platform: case.platform.clone(),
             arch: "x86_64".into(),
             node_dns_decoy_override: None,
@@ -713,6 +715,7 @@ fn builtin_res_ref_survives_into_generated_config() {
         .push(rule_set_rule("r-ai", "res:builtin:geosite-category-ai"));
 
     let deps = GenerateConfigDeps {
+        linux_resolved_external: false,
         // 金样同款「.srs 都在」的世界（真机播种后的常态）。
         is_valid_srs_fn: snapshot_is_valid_srs,
         ..scenario_deps_base()
@@ -789,6 +792,7 @@ fn builtin_res_ref_missing_srs_emits_warn_through_production_wiring() {
 
     let config = smart_config_with_rule_set_ref("res:builtin:geosite-netflix");
     let deps = GenerateConfigDeps {
+        linux_resolved_external: false,
         is_valid_srs_fn: |_| false, // 首装态：一个 .srs 都不在
         log: capture,
         ..scenario_deps_base()
@@ -857,6 +861,7 @@ fn rule_set_rule(id: &str, value: &str) -> polaris_config_engine::user_config::r
 /// 上面两条手写场景共用的 deps 基线（与本文件金样门同值；调用方按需覆盖 `is_valid_srs_fn` / `log`）。
 fn scenario_deps_base() -> GenerateConfigDeps {
     GenerateConfigDeps {
+        linux_resolved_external: false,
         platform: "linux".into(),
         arch: "x86_64".into(),
         node_dns_decoy_override: None,
@@ -1025,6 +1030,7 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
         let (probe_direct_port, probe_proxy_port, update_in_port, lan_resolver_for_dns) =
             scenario_deps(&case.name);
         let deps = GenerateConfigDeps {
+            linux_resolved_external: false,
             platform: case.platform.clone(),
             arch: "x86_64".into(),
             node_dns_decoy_override: None,

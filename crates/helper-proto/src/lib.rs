@@ -16,16 +16,18 @@
 //!    的设计纪律（`helper.go:18`）。serde 用于把 [`Request`]/[`Response`] 暴露给 core 侧的 IPC 层
 //!    （Tauri command 经 serde_json 序列化到 renderer），与 wire 形态解耦。
 //!
-//! ## protoVersion 三平台统一演进（不移植 上游的三谱系）
+//! ## protoVersion：共享协议基线与按平台的必要行为升级
 //!
-//! 三平台共用一个 [`proto_version::CURRENT`]。旧 v2 只保证内容 id 与退役路径帧；
-//! v3 要求执行者自己的准入工厂，并在现有 pinned Start 参数中携带固定标记。
-//! v4 仅扩展 Linux pinned Start 的显式状态目录数据；新 App 对 v3 helper 仍发原帧。
-//! Version 只作兼容性提示；实际 Start 必须在同一帧拒绝旧执行者，并核实当前对象。
+//! [`proto_version::for_platform`] 定义目标平台要求，原生 helper 的
+//! [`proto_version::CURRENT`]、握手与安装收据取相同目标代数。
+//! v3 要求执行者自己的准入工厂，v4 扩展 Linux pinned Start 的状态目录，
+//! v7 支持已安装 Core 内容记录；本次 Windows exact-object 行为修复要求 v8，
+//! Mac/Linux 保持 v7，不能因 Windows 修复而替换未受影响的平台 helper。
+//! App/Core 版本及构建身份改变不递增行为代数，后续兼容 Core 更新继续复用 helper。
+//! Version 仅作兼容性提示；实际 Start 仍须核实执行者与当前对象。
 //!
-//! 平台差异不再靠版本号表达，而是由 [`Platform`] 承载（mac/win 有 token 行、linux 走 SO_PEERCRED；
-//! 命令集差异由 [`command`] 常量 + 各平台 handler 的 `case` 覆盖面表达）——本 crate 是三平台**共用**
-//! 的单一 crate，编译期就保证 core 与 helper 引用同一份定义，版本号本就无需分叉。
+//! [`Platform`] 继续承载帧结构与命令覆盖差异；平台行为代数由同一 shared crate
+//! 显式穷举，不再用一个平台的必要升级强迫其他平台升级。
 //!
 //! Linux resolved 接管在正式发布前作为 v1 的向后兼容命令扩展加入；旧开发版 helper 收到未知命令时，
 //! app 会明确提示升级并把 DNS 接管标为降级，绝不静默假成功。能力判断依赖实际命令结果，不滥用版本号。
@@ -314,9 +316,9 @@ pub mod core_payload {
     }
 }
 
-/// 助手兼容版本（**三平台统一**，覆盖 wire 契约和必须升级的行为修复）。
+/// 助手兼容版本：共享 wire 基线，平台行为修复只升级受影响的平台。
 pub mod proto_version {
-    /// 当前兼容版本，mac/win/linux 共用；不随 App/Core 版本或构建身份递增。
+    /// 兼容代数不随 App/Core 版本或构建身份递增。
     ///
     /// 唯一定义点：helper 侧的 `ping`/`version` 响应与 client 侧的握手期望都读它 → 结构上不可能分叉。
     /// v2 uses immutable content ids and rejects all runtime installation and
@@ -332,9 +334,33 @@ pub mod proto_version {
     /// so ordinary App processes can authenticate without opening a SYSTEM token.
     /// v7 admits installed Core content from protected installation records,
     /// allowing compatible Helpers to run a Core newer than their own build.
-    /// Future mandatory helper behavior/security changes must advance this value;
+    pub const BASELINE: u32 = 7;
+    /// v8 includes the Windows exact-object native birth fix: validate the image
+    /// through a retained path handle and accept an empty (inherited) environment.
+    /// Windows v7 receipts must not retain the pre-fix helper for this release.
+    /// Future mandatory behavior fixes advance the affected target requirement;
     /// new App builds or Core payloads alone must not.
-    pub const CURRENT: u32 = 7;
+    pub const WINDOWS_EXACT_OBJECT: u32 = 8;
+
+    /// Required generation for the target platform, including cross-target clients.
+    pub const fn for_platform(platform: crate::Platform) -> u32 {
+        match platform {
+            crate::Platform::Win => WINDOWS_EXACT_OBJECT,
+            crate::Platform::Mac | crate::Platform::Linux => BASELINE,
+            // Mobile targets have no privileged desktop helper. Keep the shared
+            // wire baseline without claiming Windows native execution support.
+            crate::Platform::Android | crate::Platform::Ios => BASELINE,
+            // Unknown targets do not inherit the Windows-specific requirement.
+            crate::Platform::Other => BASELINE,
+        }
+    }
+
+    /// Native helper advertisement and installer receipt use the same generation.
+    #[cfg(windows)]
+    pub const CURRENT: u32 = WINDOWS_EXACT_OBJECT;
+    /// Unaffected platforms retain the reusable v7 helper generation.
+    #[cfg(not(windows))]
+    pub const CURRENT: u32 = BASELINE;
 }
 
 /// 当前安装包内 app/helper 的共同构建身份。

@@ -652,6 +652,14 @@ pub(super) fn should_start_via_helper(mode: ProxyModeType, platform: Platform) -
     execution_route(mode, platform) == ExecutionRoute::PrivilegedHelper
 }
 
+/// Select the resolved owner before TUN creation. This is intent, not a takeover receipt.
+pub(super) fn linux_helper_resolved_owner(platform: Platform, mode: ProxyModeType) -> bool {
+    match platform {
+        Platform::Linux => should_start_via_helper(mode, platform),
+        Platform::Mac | Platform::Win | Platform::Android | Platform::Ios | Platform::Other => false,
+    }
+}
+
 /// **已装 helper「该不该提示升级」的纯判定**（与 [`should_start_via_helper`] 同层，形态照
 /// `startup_tasks::should_notify_helper_upgradeable`）。
 ///
@@ -2747,7 +2755,16 @@ impl ProxyRuntime {
             .is_tun()
             && dns_takeover != Some(false)
         {
-            self.set_system_dns_best_effort().await;
+            let dns_applied = self.set_system_dns_best_effort().await;
+            if deps.linux_resolved_external && !dns_applied {
+                // The checked controller already persisted its typed receipt and any
+                // cleanup debt. Never transfer ownership back to Core on failure.
+                return self.reject_linux_dns_start(my_gen, ts_gate).await;
+            }
+        } else if deps.linux_resolved_external {
+            if !self.restore_system_dns_checked().await {
+                return self.reject_linux_dns_start(my_gen, ts_gate).await;
+            }
         } else {
             self.restore_system_dns_best_effort().await;
         }
@@ -2882,6 +2899,62 @@ impl ProxyRuntime {
             &new_status,
         )?;
         Ok(new_status)
+    }
+
+    /// Fail the same startup generation without erasing retryable controller debt.
+    /// Cold DNS receipts currently require core_running(), so this runs after the
+    /// internal running publication but before startup can return Ready successfully.
+    async fn reject_linux_dns_start(
+        self: &Arc<Self>,
+        generation: u64,
+        ts_gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<ProxyStatus, StartError> {
+        if self.gate.generation() != generation {
+            return Ok(self.status());
+        }
+        let stopped = self.kill_core_and_release_main(ts_gate).await;
+        match self.publish_linux_dns_start_failure(generation, stopped) {
+            Some(message) => Err(StartError::coded(message, code::SYSTEM_DNS_TAKEOVER_FAILED)),
+            None => Ok(self.status()),
+        }
+    }
+
+    /// Publish only while the failed start still owns the generation. Do not call
+    /// set_error here: it takes the same publication lock recursively.
+    pub(super) fn publish_linux_dns_start_failure(
+        &self,
+        generation: u64,
+        stopped: Result<(), String>,
+    ) -> Option<String> {
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() != generation {
+            return None;
+        }
+        let reason = "Linux Helper DNS takeover was not confirmed";
+        let (message, retired) = match stopped {
+            Ok(()) => (reason.to_string(), true),
+            Err(error) => (format!("{reason}; Core cleanup unconfirmed: {error}"), false),
+        };
+        if retired {
+            self.revoke_tailnet_context();
+            if let Ok(mut route) = self.mesh_route_run.write() {
+                *route = None;
+            }
+        }
+        if let Ok(mut status) = self.status.write() {
+            if retired {
+                *status = ProxyStatus::default();
+            }
+            // Failed retirement retains PID/ports/custody for an ordinary Stop.
+            status.error = Some(message.clone());
+            status.error_code = Some(code::SYSTEM_DNS_TAKEOVER_FAILED.into());
+        }
+        // The controller's receipt/marker/cleanup debt remains authoritative.
+        log::error!("{message}");
+        if let Some(emitter) = self.error_emitter.get() {
+            emitter.emit_proxy_error(&message, code::SYSTEM_DNS_TAKEOVER_FAILED);
+        }
+        Some(message)
     }
 
     /// The post-Ready route-failure transaction. Local helper retirement must
@@ -3946,6 +4019,14 @@ impl ProxyRuntime {
         // A2/C13：日志两轴跟随 config（此前硬编码 Info + 不落 disableLogFile）。
         let (log_level, disable_log_file) = log_axes_from_config(config);
         GenerateConfigDeps {
+            linux_resolved_external: serde_json::from_value::<UserConfig>(config.clone())
+                .map(|typed| {
+                    linux_helper_resolved_owner(
+                        self.helper.platform(),
+                        typed.proxy_mode_type,
+                    )
+                })
+                .unwrap_or(false),
             platform: platform_tag().to_string(),
             arch: std::env::consts::ARCH.to_string(),
             node_dns_decoy_override: self.node_dns_decoy_override(),
@@ -4150,6 +4231,9 @@ impl ProxyRuntime {
         peeled: &mut BTreeMap<String, InvalidNode>,
         runtime_bind_interfaces: &BTreeMap<String, String>,
     ) -> Result<GateOutcome, String> {
+        if deps.linux_resolved_external && binary.is_none() {
+            return Err("Linux Helper resolved ownership requires a checkable selected Core".into());
+        }
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
@@ -4249,6 +4333,11 @@ impl ProxyRuntime {
                     ));
                 }
                 PeelStep::Stop(why) => {
+                    if deps.linux_resolved_external {
+                        return Err(format!(
+                            "Linux Helper resolved ownership requires a compatible Core: {why}"
+                        ));
+                    }
                     log::warn!("起核内核闸门停止剥离（放行到 spawn，由内核自己报错）：{why}");
                     return Ok(GateOutcome::assemble(
                         gen_out, effective, json, peeled, checks_run, None,
@@ -4278,6 +4367,12 @@ impl ProxyRuntime {
                 &already_peeled,
             ) {
                 PeelTarget::Unattributable => {
+                    if deps.linux_resolved_external {
+                        return Err(format!(
+                            "Core rejected Linux Helper resolved ownership configuration: {}",
+                            rejection.detail
+                        ));
+                    }
                     log::warn!(
                         "起核内核闸门：内核拒收但该下标不对应任何节点，放行到 spawn —— {}",
                         rejection.detail
@@ -4287,6 +4382,12 @@ impl ProxyRuntime {
                     ));
                 }
                 PeelTarget::Stalled { tag } => {
+                    if deps.linux_resolved_external {
+                        return Err(format!(
+                            "Core validation stalled for Linux Helper resolved ownership: {}",
+                            rejection.detail
+                        ));
+                    }
                     log::warn!(
                         "起核内核闸门：节点「{tag}」已剥除却仍被内核点名，停止剥离并放行 —— {}",
                         rejection.detail
