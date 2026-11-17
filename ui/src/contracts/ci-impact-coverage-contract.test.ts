@@ -35,7 +35,7 @@
  *   失败形态是多要求登记一个脚本，而不是漏掉一个。
  */
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -108,7 +108,9 @@ function scopeKeys(relDir: string, root = REPO_ROOT): string[] {
 function scopesOnDisk(): string[] {
   const srcTauri = scopeKeys('src-tauri').filter((key) => key !== 'src-tauri/src/');
   return [
-    ...REGISTRY_ROOTS.filter((root) => root !== 'src-tauri/').flatMap((root) => scopeKeys(root.slice(0, -1))),
+    ...REGISTRY_ROOTS.filter((root) => root !== 'src-tauri/' &&
+      (root !== 'vendor/' || existsSync(join(REPO_ROOT, root))))
+      .flatMap((root) => scopeKeys(root.slice(0, -1))),
     ...srcTauri,
     ...scopeKeys('src-tauri/src'),
   ].sort();
@@ -310,7 +312,6 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       // resources/data/ 的 28 个 .srs 入库且进四个包（见分类器的 PACKAGE_IMPACT_SCOPES）；
       // 它掉出枚举面 = 整个 resources/ 登记根没被扫到，那正是 2026-08-30 前的 fail-open 形态。
       'resources/data/',
-      'vendor/swift-rs/',
     ]) {
       expect(onDisk, `枚举结果里没有 ${known} —— 枚举器的取材面漏了整棵树`).toContain(known);
     }

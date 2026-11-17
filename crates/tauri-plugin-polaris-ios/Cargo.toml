@@ -7,13 +7,13 @@ links = "tauri-plugin-polaris-ios"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 polaris-mesh = { path = "../mesh" }
-tauri = { version = "2", default-features = false, features = ["wry"] }
+tauri = { version = "2.12.6", default-features = false, features = ["wry"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["time", "rt"] }
 
 [build-dependencies]
-tauri-plugin = { version = "2", features = ["build"] }
+tauri-plugin = { version = "2.7.3", features = ["build"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]

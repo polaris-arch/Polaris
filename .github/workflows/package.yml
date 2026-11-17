@@ -416,7 +416,7 @@ jobs:
         id: pnpm
         shell: bash
         env:
-          PNPM_VERSION: '11.24.0'
+          PNPM_VERSION: '12.21.0'
         run: |
           set -euo pipefail
           npm install -g "pnpm@${PNPM_VERSION}"
@@ -433,8 +433,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm-store.outputs.store_path }}
-          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
+          key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
 
       - name: Install UI dependencies
         run: pnpm --dir ui install --frozen-lockfile
@@ -465,8 +465,9 @@ jobs:
           flags=''
           for t in ${extra//,/ }; do flags="$flags --target $t"; done
           # shellcheck disable=SC2086  # 词分割是本意：空值时这个 flag 整体消失，与被替掉的 action 同构
-          rustup toolchain install stable --profile minimal --no-self-update $flags
-          rustup default stable
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --no-self-update $flags
+          rustup default "$toolchain"
           [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
@@ -1621,8 +1622,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --no-self-update
+          rustup default "$toolchain"
           [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv

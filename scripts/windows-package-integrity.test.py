@@ -469,7 +469,7 @@ class Integrity(unittest.TestCase):
                 self.assertEqual(w.tauri_identity(root), {'entry': entry, 'version': 'tauri-cli ' + w.final.TAURI_CLI_VERSION,
                                                        'tool': w.cargo_tool(entry)})
                 probe.assert_called_once_with([entry, '--version'], timeout=30, text=True)
-            for output in ['tauri-cli 2.12.3', 'tauri-cli 2.12.1\nextra', '2.12.1']:
+            for output in ['tauri-cli 2.12.3', 'tauri-cli 2.12.5\nextra', '2.12.5']:
                 with self.subTest(output=output), patch.object(w.shutil, 'which', return_value=entry), \
                      patch.object(w.subprocess, 'check_output', return_value=output), self.assertRaises(ValueError):
                     w.tauri_identity(root)
@@ -1386,7 +1386,7 @@ class CargoContexts(unittest.TestCase):
         fake_tauri = root / 'inert-tauri.exe'; fake_tauri.write_bytes(b'inert Tauri routing identity')
         with patch.dict(os.environ), patch.object(w, 'cargo_output', side_effect=output), \
              patch.object(w, 'run_tauri', side_effect=tauri), \
-             patch.object(w, 'tauri_identity', return_value={'entry': str(fake_tauri), 'version': 'tauri-cli 2.12.1'}), \
+             patch.object(w, 'tauri_identity', return_value={'entry': str(fake_tauri), 'version': 'tauri-cli 2.12.5'}), \
              patch.object(w, 'find_sevenzip', return_value=('7z', '26.05')), \
              patch.object(w, 'verified_sources', side_effect=w.source_inventory), \
              patch.object(w.subprocess, 'check_output', side_effect=lambda argv, **k: fixture.diff if 'diff' in argv else fixture.head + '\n'):

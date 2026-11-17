@@ -2,7 +2,7 @@
   "name": "polaris-ui",
   "private": true,
   "version": "1.0.0",
-  "packageManager": "pnpm@11.24.0",
+  "packageManager": "pnpm@12.21.0",
   "type": "module",
   "description": "Polaris 前端（React + Zustand + Vite + Tailwind，Conduit/Aurora 设计系统）",
   "engines": {
@@ -16,8 +16,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-os": "2.3.2",
+    "@tauri-apps/api": "^2.12.5",
+    "@tauri-apps/plugin-os": "2.4.0",
     "clsx": "^2.1.1",
     "i18next": "^26.4.0",
     "react": "^19.2.8",

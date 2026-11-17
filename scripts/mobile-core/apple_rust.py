@@ -22,8 +22,8 @@ from budget import reservation
 SWIFT_BRIDGES = ('_init_plugin_dialog', '_init_plugin_notification', '_init_plugin_polaris_ios',
                  '_init_plugin_shell', '_log_stdout', '_on_webview_created',
                  '_register_plugin', '_run_plugin_command')
-SWIFT_EXPORT_POLICY = ('vendor/swift-rs/src-rs/build.rs', 'vendor/swift-rs/src-rs/ios_exports.rs',
-                       'crates/tauri-plugin-polaris-ios/ios/Sources/VpnPlugin.swift')
+# Locked upstream Tauri/plugins now declare their C entry points public.
+SWIFT_EXPORT_POLICY = ('Cargo.lock', 'crates/tauri-plugin-polaris-ios/ios/Sources/VpnPlugin.swift')
 CARGO_TIMING_BYTES = 4 * 1024 ** 2
 
 

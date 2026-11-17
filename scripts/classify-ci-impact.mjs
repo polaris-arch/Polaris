@@ -115,11 +115,6 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: ALL,
     why: '正式发布资产命名与最终摘要清单由构建、聚合及更新器对拍消费；改动须重验全部桌面包的名称、资产集合和校验和。',
   },
-  'vendor/swift-rs/': {
-    kernel: false,
-    platforms: ALL,
-    why: 'Cargo crates.io patch 使用的本地 Swift/Rust 桥源码；库及构建脚本可能改变桌面 Tauri 产物，须保留四平台打包门。',
-  },
   'crates/config-engine/': {
     kernel: true,
     platforms: NO_LEG,
@@ -210,6 +205,11 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     kernel: false,
     platforms: ALL,
     why: '主二进制的依赖与 feature 面，四平台的包都变。',
+  },
+  'rust-toolchain.toml': {
+    kernel: false,
+    platforms: ALL,
+    why: '固定 Rust 编译器与组件，影响所有平台的原生构建。',
   },
   'src-tauri/build.rs': {
     kernel: false,
@@ -715,6 +715,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   },
   'src-tauri/build.rs': { why: '构建期资源校验与 productName 注入，决定 Android 侧能否走完 tauri 那一步。' },
   'src-tauri/Cargo.toml': { why: 'app crate 的依赖与 feature 面，决定 aarch64-linux-android 能否交叉编译出 .so。' },
+  'rust-toolchain.toml': { why: '固定 Android Rust 编译器与组件。' },
   'Cargo.lock': { why: '同上，且它是 THIRD-PARTY-LICENSES.md 的生成输入（本腿逐字节对拍那份）。' },
   // ── 四条**冗余保留**的资源键（2026-09-05 重写理由；键不动，理由改成实话）──
   //
@@ -1141,6 +1142,7 @@ const CORE_PATH_PREFIXES = ['scripts/lib/', 'scripts/desktop-core/'];
 
 const SHARED_PACKAGE_PATHS = new Set([
   '.cargo/config.toml',
+  'rust-toolchain.toml',
   '.github/workflows/package.yml',
   '.github/workflows/release-risk.yml',
   'Cargo.lock',

@@ -73,7 +73,7 @@ jobs:
         id: pnpm
         shell: bash
         env:
-          PNPM_VERSION: '11.24.0'
+          PNPM_VERSION: '12.21.0'
         run: |
           set -euo pipefail
           npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
@@ -87,8 +87,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
-          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
+          key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -109,7 +109,8 @@ jobs:
       - name: Third-party licenses up to date
         working-directory: .
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --no-self-update
           node scripts/gen-third-party-licenses.mjs --check
 
       - name: Test

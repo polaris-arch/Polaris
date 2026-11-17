@@ -39,15 +39,15 @@ class NativeContract(unittest.TestCase):
         return bytes(data)
 
     def test_exact_nsis_bundle_transform_and_zip_identity(self):
-        source = self.inert_app(); expected = final.expected_windows_app(source, 'nsis', '2.12.1')
+        source = self.inert_app(); expected = final.expected_windows_app(source, 'nsis', '2.12.5')
         self.assertEqual(len(source), len(expected))
         self.assertEqual(expected, source[:512] + final.BUNDLE_NSS + source[512+len(final.BUNDLE_UNK):])
-        self.assertEqual(final.expected_windows_app(source, 'zip', '2.12.1'), source)
+        self.assertEqual(final.expected_windows_app(source, 'zip', '2.12.5'), source)
         self.assertEqual(final.byte_differences(source, expected), [{'offset': 536, 'endExclusive': 539, 'beforeHex': '554e4b', 'afterHex': '4e5353'}])
         for data in [self.inert_app(b''), self.inert_app(final.BUNDLE_NSS), self.inert_app(final.BUNDLE_PREFIX+b'MSI'),
                      source+final.BUNDLE_UNK]:
             with self.subTest(source=data[-25:]), self.assertRaisesRegex(ValueError, 'unique unpatched'):
-                final.expected_windows_app(data, 'nsis', '2.12.1')
+                final.expected_windows_app(data, 'nsis', '2.12.5')
         for kind in ['nsis','zip']:
             with self.assertRaisesRegex(ValueError, 'unreviewed Tauri CLI'):
                 final.expected_windows_app(source, kind, '2.11.4')
@@ -60,8 +60,8 @@ class NativeContract(unittest.TestCase):
         for offset,token in other: source[offset:offset+len(token)]=token
         source=bytes(source)
         nsis=source[:512]+b'__TAURI_BUNDLE_TYPE_VAR_NSS'+source[539:]
-        self.assertEqual(final.expected_windows_app(source,'nsis','2.12.1'),nsis)
-        self.assertEqual(final.expected_windows_app(source,'zip','2.12.1'),source)
+        self.assertEqual(final.expected_windows_app(source,'nsis','2.12.5'),nsis)
+        self.assertEqual(final.expected_windows_app(source,'zip','2.12.5'),source)
         signature={'status':'NotSigned','signerThumbprint':None}
         with tempfile.TemporaryDirectory() as tmp, patch.object(final,'windows_signature',return_value=signature):
             root=Path(tmp);app=root/'polaris.exe'
@@ -79,7 +79,7 @@ class NativeContract(unittest.TestCase):
                         self.assertEqual((root/kind/'actual.exe').read_bytes(),bytes(changed))
 
     def test_app_byte_gate_rejects_other_mutations_and_retains_complete_failure_bytes(self):
-        source = self.inert_app(); expected = final.expected_windows_app(source, 'nsis', '2.12.1')
+        source = self.inert_app(); expected = final.expected_windows_app(source, 'nsis', '2.12.5')
         signature = {'status':'NotSigned','signerThumbprint':None}
         with tempfile.TemporaryDirectory() as tmp, patch.object(final, 'windows_signature', return_value=signature):
             root=Path(tmp); app=root/'polaris.exe'
@@ -117,9 +117,9 @@ class NativeContract(unittest.TestCase):
     def test_app_baseline_binds_runtime_version_generated_nsis_input_and_portable_member(self):
         source=self.inert_app()+final.BUNDLE_NSS+final.BUNDLE_PREFIX+b'MSI'; signature={'status':'NotSigned','signerThumbprint':None}
         with tempfile.TemporaryDirectory() as tmp, patch.object(final,'windows_signature',return_value=signature), \
-                patch.object(final,'pwsh',return_value=b'tauri-cli 2.12.1\n') as cli:
+                patch.object(final,'pwsh',return_value=b'tauri-cli 2.12.5\n') as cli:
             root=Path(tmp); (root/'target/release/nsis/x64').mkdir(parents=True)
-            (root/'scripts').mkdir(); (root/'scripts/tauri-cli.version').write_text('2.12.1\n')
+            (root/'scripts').mkdir(); (root/'scripts/tauri-cli.version').write_text('2.12.5\n')
             app=root/'target/release/polaris.exe'; app.write_bytes(source)
             script=root/'target/release/nsis/x64/installer.nsi'
             script.write_text(f'!define MAINBINARYSRCPATH "{app}"\n  File "${{MAINBINARYSRCPATH}}"\n',encoding='utf-8-sig')
@@ -127,29 +127,29 @@ class NativeContract(unittest.TestCase):
             with zipfile.ZipFile(archive,'w') as z: z.writestr('polaris.exe',source)
             evidence={}; directory=root/'evidence'
             observed, expected=final.windows_app_baseline(root,'nsis',directory,evidence)
-            self.assertEqual(observed,source); self.assertEqual(expected,final.expected_windows_app(source,'nsis','2.12.1'))
+            self.assertEqual(observed,source); self.assertEqual(expected,final.expected_windows_app(source,'nsis','2.12.5'))
             self.assertEqual((directory/'source.exe').read_bytes(),source)
             self.assertEqual((directory/'portable.exe').read_bytes(),source)
             self.assertEqual((directory/'installer.nsi').read_bytes(),script.read_bytes())
             self.assertEqual(evidence['generatedNSISMainFileInput']['inputPath'],str(app))
-            for runtime in [b'tauri-cli 2.11.4\n',b'tauri-cli 2.12.1\nextra']:
+            for runtime in [b'tauri-cli 2.11.4\n',b'tauri-cli 2.12.5\nextra']:
                 cli.return_value=runtime
                 with self.assertRaisesRegex(ValueError,'actual Tauri CLI'):
                     final.windows_app_baseline(root,'nsis',directory,{})
-            cli.return_value=b'tauri-cli 2.12.1\n'
+            cli.return_value=b'tauri-cli 2.12.5\n'
             (root/'scripts/tauri-cli.version').write_text('2.11.4\n')
             with self.assertRaisesRegex(ValueError,'unreviewed Tauri CLI'):
                 final.windows_app_baseline(root,'nsis',directory,{})
-            (root/'scripts/tauri-cli.version').write_text('2.12.1\n')
+            (root/'scripts/tauri-cli.version').write_text('2.12.5\n')
             script.write_text('!define MAINBINARYSRCPATH "different.exe"\n  File "${MAINBINARYSRCPATH}"\n')
             with self.assertRaises(ValueError): final.windows_app_baseline(root,'nsis',directory,{})
 
     def test_final_nsis_actual_failure_retains_bytes_before_temporary_cleanup_and_blocks_native(self):
-        source=self.inert_app(); expected=final.expected_windows_app(source,'nsis','2.12.1')
+        source=self.inert_app(); expected=final.expected_windows_app(source,'nsis','2.12.5')
         signature={'status':'NotSigned','signerThumbprint':None}
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); (root/'target/release/nsis/x64').mkdir(parents=True); (root/'scripts').mkdir()
-            (root/'scripts/tauri-cli.version').write_text('2.12.1\n')
+            (root/'scripts/tauri-cli.version').write_text('2.12.5\n')
             app=root/'target/release/polaris.exe'; app.write_bytes(source)
             (root/'target/release/nsis/x64/installer.nsi').write_text(
                 f'!define MAINBINARYSRCPATH "{app}"\n  File "${{MAINBINARYSRCPATH}}"\n',encoding='utf-8-sig')
@@ -164,7 +164,7 @@ class NativeContract(unittest.TestCase):
                 (destination/'libcronet.dll').write_bytes(b'not loaded')
             with patch.object(final,'ci_context',return_value={'candidate':'c'*40,'runId':'900','attempt':'1'}), \
                     patch.object(final,'windows_signature',return_value=signature), \
-                    patch.object(final,'pwsh',return_value=b'tauri-cli 2.12.1\n'), \
+                    patch.object(final,'pwsh',return_value=b'tauri-cli 2.12.5\n'), \
                     patch.object(final,'nsis_install',side_effect=install_fixture) as installer, \
                     patch.object(final,'prove',side_effect=AssertionError('native proof must not run')) as native_proof:
                 with self.assertRaisesRegex(ValueError,'exact carrier-stage'):

@@ -18,7 +18,7 @@ name = "polaris_lib"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7.5", features = [] }
 # build.rs 从 tauri.conf.json 读 productName 注入编译期（productName 的唯一真值）。
 # **Cargo.lock 零新增**：serde_json 已是本包的 [dependencies]（lock 按包名合并三类依赖），
 # 且 tauri-build 自己就依赖它 ⇒ host 侧本来就要编一份，此处不新增任何编译量。
@@ -32,7 +32,7 @@ sha2 = "0.11"
 
 [dependencies]
 regex = { workspace = true }
-tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri = { version = "2.12.6", features = ["tray-icon", "image-png", "macos-private-api"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["full"] }
@@ -44,13 +44,13 @@ uuid = { version = "1", features = ["v4"] }
 
 # ── Tauri 2 原生插件（替代 Electron 的 dialog/shell/notification/autostart/os 能力）──
 # 这些是 Electron 原生能力，无对应 domain crate，直接用 Tauri 官方插件。
-tauri-plugin-shell = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-notification = "2"
-tauri-plugin-autostart = "2"
-tauri-plugin-os = "2"
-tauri-plugin-process = "2"
-tauri-plugin-fs = "2"
+tauri-plugin-shell = "2.6.0"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-notification = "2.8.1"
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-os = "2.4.0"
+tauri-plugin-process = "2.4.0"
+tauri-plugin-fs = "2.7.1"
 
 # ── domain crates（18 crate 装配）──
 # 纯逻辑/trait crate；src-tauri 在 runtime/ 注入真实实现（tokio runtime / std::fs / 真 socket）。
@@ -91,8 +91,8 @@ futures.workspace = true
 # window-vibrancy = B6 窗口铬：macOS vibrancy（Sidebar）/ Windows Mica；per-platform，非目标平台 no-op。
 # 0.6.x 对齐 tauri 2.11 的 raw-window-handle 0.6 / objc2。Linux 刻意不启用任何特效（白屏逃生门路径）。
 window-vibrancy = "0.8"
-tauri-plugin-single-instance = "2.4.3"
-tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-window-state = "2.5.0"
 polaris-unlock-transport = { version = "1.0.0", path = "../crates/unlock-transport" }
 # 已有 `rustls` 的 tokio 适配层（**不是**新 HTTP 客户端：只把 rustls 的同步状态机包成 AsyncRead/Write）。
 # **唯一**消费点：测速 CONNECT 隧道对 https 目标在隧道上做 TLS 握手（`runtime/speedtest_tunnel.rs`）。
@@ -164,7 +164,7 @@ windows-sys = { version = "0.61", features = [
 # Reuse the workspace's existing protobuf codec for the real loopback readback
 # peer. No new package/version or production dependency is introduced.
 tonic-prost = "0.14"
-tauri = { version = "2", features = ["test"] }
+tauri = { version = "2.12.6", features = ["test"] }
 # test-utils = 取 polaris-updater 的跨 crate 测试替身（MockFs / MockFailOp）。
 # 只在 dev-dependency 上开：resolver = "2" 下 `cargo build --workspace` / 打包不会带上它。
 polaris-updater = { path = "../crates/updater", features = ["test-utils"] }

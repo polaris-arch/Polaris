@@ -64,9 +64,17 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}
+      - name: Install pinned Rust toolchain
+        env:
+          RUST_TARGETS: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --no-self-update --target "$RUST_TARGETS"
+          rustup default "$toolchain"
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
       - name: Exact tool/source and declared arm64 carrier configuration admission
         run: python3 -B scripts/mobile-core/ci_apple.py prepare
       - name: Execute pure Swift lifecycle, monitor and G4 receipt seams
@@ -92,15 +100,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install --prefix "$RUNNER_TEMP/polaris-pnpm" --no-audit --no-fund pnpm@11.24.0
+          npm install --prefix "$RUNNER_TEMP/polaris-pnpm" --no-audit --no-fund pnpm@12.21.0
           export PATH="$RUNNER_TEMP/polaris-pnpm/node_modules/.bin:$PATH"
           echo "$RUNNER_TEMP/polaris-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
           echo "PNPM_STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
       - uses: actions/cache@v5
         with:
           path: ${{ env.PNPM_STORE_PATH }}
-          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
+          key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
       - name: Locked frontend dependencies
         run: pnpm --dir ui install --frozen-lockfile
       - name: Frontend resources and admitted two-slice arm64 component

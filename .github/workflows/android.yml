@@ -223,7 +223,7 @@ jobs:
         id: pnpm
         shell: bash
         env:
-          PNPM_VERSION: '11.24.0'
+          PNPM_VERSION: '12.21.0'
         run: |
           set -euo pipefail
           npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
@@ -237,8 +237,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
-          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
+          key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
 
       # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
       - name: Install UI dependencies
@@ -257,8 +257,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android,armv7-linux-androideabi
-          rustup default stable
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --no-self-update --target aarch64-linux-android,armv7-linux-androideabi
+          rustup default "$toolchain"
           echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
@@ -711,7 +712,7 @@ jobs:
         id: pnpm
         shell: bash
         env:
-          PNPM_VERSION: '11.24.0'
+          PNPM_VERSION: '12.21.0'
         run: |
           set -euo pipefail
           npm install -g --prefix "$RUNNER_TEMP/pnpm" "pnpm@${PNPM_VERSION}"
@@ -725,8 +726,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
-          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
+          key: ${{ runner.os }}-node26-pnpm12.21.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm12.21.0-
 
       # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
       - name: Install UI dependencies
@@ -745,8 +746,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android,armv7-linux-androideabi
-          rustup default stable
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --no-self-update --target aarch64-linux-android,armv7-linux-androideabi
+          rustup default "$toolchain"
           echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv

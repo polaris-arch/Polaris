@@ -97,18 +97,18 @@ def windows_signature(path):
     return native.observe_unsigned_windows(path)
 
 
-TAURI_CLI_VERSION = '2.12.1'
+TAURI_CLI_VERSION = '2.12.5'
 BUNDLE_PREFIX = b'__TAURI_BUNDLE_TYPE_VAR_'
 BUNDLE_UNK = BUNDLE_PREFIX + b'UNK'
 BUNDLE_NSS = BUNDLE_PREFIX + b'NSS'
-TAURI_PATCH_SOURCE = 'https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.1/crates/tauri-bundler/src/bundle.rs'
+TAURI_PATCH_SOURCE = 'https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.5/crates/tauri-bundler/src/bundle.rs'
 
 
 def expected_windows_app(source, kind, version):
     require(version == TAURI_CLI_VERSION, 'unreviewed Tauri CLI app transform version')
     require(kind in ['nsis', 'zip'], 'unknown Windows app carrier')
     if kind == 'zip': return source
-    # Fixed 2.12.1 bundler: patch first UNK token to NSS, bundle, restore source.
+    # Fixed 2.12.5 bundler: patch first UNK token to NSS, bundle, restore source.
     # Refuse ambiguity rather than accepting its first-match behavior generally.
     # Runtime comparison constants (NSS/MSI/etc.) share the prefix and remain
     # ordinary protected bytes. Only the patch target UNK must be unique.

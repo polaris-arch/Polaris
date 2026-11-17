@@ -260,7 +260,7 @@ esac
       expect(block).toContain('default: false');
     }
     expect(apple).toContain("POLARIS_APPLE_SCOPE: ${{ inputs.include_simulator && 'device-and-simulator' || 'device-only' }}");
-    expect(apple).toContain("targets: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}");
+    expect(apple).toContain("RUST_TARGETS: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}");
     const rootInput = risk.slice(risk.indexOf('      apple_include_simulator:'), risk.indexOf('      defer_apple:'));
     expect(rootInput).toContain('type: boolean');
     expect(rootInput).toContain('default: false');
