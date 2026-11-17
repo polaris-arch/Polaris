@@ -188,7 +188,7 @@ fn start_leg_dns_takeover_gate_reads_the_switch() {
             .is_tun()
             && dns_takeover != Some(false)
         {
-            self.set_system_dns_best_effort().await;";
+            let dns_applied = self.set_system_dns_best_effort().await;";
     const ELSE_LEG: &str = "\
         } else {
             self.restore_system_dns_best_effort().await;
@@ -197,6 +197,14 @@ fn start_leg_dns_takeover_gate_reads_the_switch() {
         body.contains(GATE),
         "起核尾 DNS 接管门必须是「TUN 且用户未显式关」的合取（1:1 上游 ProxyManager.ts:1103），\
              且必须钉在 start_inner 方法体内——挪去别的方法不算接线"
+    );
+    assert!(body.contains("if deps.linux_resolved_external && !dns_applied {"));
+    assert!(body.contains("} else if deps.linux_resolved_external {"));
+    assert!(body.contains("if !self.restore_system_dns_checked().await {"));
+    assert_eq!(
+        body.matches("return self.reject_linux_dns_start(my_gen, ts_gate).await;")
+            .count(),
+        2
     );
     assert!(
         body.contains(ELSE_LEG),

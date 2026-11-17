@@ -90,13 +90,13 @@ impl ProxyRuntime {
         // predates takeover. A delayed all-live snapshot therefore cannot be a
         // safe stale-connection cleanup (Mac warm-start TLS regression). Do not
         // create a timer or hold the network-settle gate for that operation.
-        if matches!(
-            self.helper.platform(),
+        match self.helper.platform() {
             polaris_helper_proto::Platform::Mac
-                | polaris_helper_proto::Platform::Win
-                | polaris_helper_proto::Platform::Linux
-        ) {
-            return false;
+            | polaris_helper_proto::Platform::Win
+            | polaris_helper_proto::Platform::Linux => return false,
+            polaris_helper_proto::Platform::Android => {}
+            polaris_helper_proto::Platform::Ios => {}
+            polaris_helper_proto::Platform::Other => {}
         }
         let me = Arc::clone(self);
         // 与 ReassertSettledGuard 的 guard 重叠接棒：本行先 +1，前者随后 Drop -1，门全程不归零。

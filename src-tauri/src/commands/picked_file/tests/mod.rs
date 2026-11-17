@@ -590,8 +590,13 @@ fn every_uri_leg_hands_its_blocking_io_off_the_async_task() {
     // `subscription/tests/wiring_gate.rs::local_file_picker_never_blocks_a_tokio_worker_on_std_fs`。
     for (file, anchor) in URI_LEGS {
         let body = top_level_fn_body(&crate_code(file), anchor);
+        let dispatcher = if *file == "commands/misc/backup.rs" {
+            "with_picked_gateway_blocking("
+        } else {
+            "with_picked_gateway("
+        };
         assert!(
-            body.contains("with_picked_gateway("),
+            body.contains(dispatcher),
             "{file} 的 `{anchor}` 必须经 with_picked_gateway 派线程（URI 支是同步阻塞的）"
         );
         assert!(
@@ -600,8 +605,8 @@ fn every_uri_leg_hands_its_blocking_io_off_the_async_task() {
         );
     }
 
-    // 生产侧构造网关的地方只剩 `with_picked_gateway` 自己（两臂各一处）与 subscription 那条
-    // 自带 `spawn_blocking` 的腿（一处）。多出一处 = 有人新开了一条没派线程的腿。
+    // 生产侧构造网关为 legacy dispatcher 两臂、blocking dispatcher 一处，
+    // 以及 subscription 自带 spawn_blocking 的一处；新增构造必须显式登记。
     // 取材面把**所有**碰过文件框的模块都列进来，别只数已知的那两个 —— 否则新腿写在第三个
     // 文件里时这条断言一声不吭。
     const GATEWAY_OWNERS: [&str; 2] = ["commands/picked_file.rs", "commands/subscription.rs"];
@@ -623,10 +628,19 @@ fn every_uri_leg_hands_its_blocking_io_off_the_async_task() {
         }
     }
     assert_eq!(
-        seen, 3,
-        "生产侧构造网关的地方应恰好三处（with_picked_gateway 两臂各一 + subscription 的 \
-         spawn_blocking 支一处）—— 数目变了说明有腿绕过了这道门，请连同 URI_LEGS 一起更新"
+        seen, 4,
+        "生产侧构造网关的地方应恰好四处（with_picked_gateway 两臂各一 + \
+         with_picked_gateway_blocking 一处 + subscription 的 spawn_blocking 支一处）—— 数目变了说明有腿绕过了这道门，请连同 URI_LEGS 一起更新"
     );
+
+    let blocking_helper = top_level_fn_body(
+        &crate_code("commands/picked_file.rs"),
+        "pub async fn with_picked_gateway_blocking<R, T, F>(",
+    );
+    assert_eq!(blocking_helper.matches("PluginFiles::new(").count(), 1);
+    assert!(blocking_helper.contains(
+        "tokio::task::spawn_blocking(move || work(&PluginFiles::new(&app), picked)).await"
+    ));
 
     // `with_picked_gateway` 自己：`spawn_blocking` 必须落在 URI 那一臂**区间内**。
     // 只断言它「在函数里某处出现过」，等于允许把 open 写在臂外而 spawn_blocking 用在别处 ——

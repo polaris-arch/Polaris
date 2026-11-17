@@ -1668,7 +1668,7 @@ fn ordered_connections_preserve_indexmap_mutation_semantics() {
         random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
         let id = format!("c{}", (random >> 32) % 53);
         match random % 7 {
-            0 | 1 | 2 => {
+            0..=2 => {
                 let mut entry = conn(&id, None, None);
                 entry.upload = Some(step);
                 actual.insert(id.clone(), entry.clone());

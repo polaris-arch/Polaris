@@ -163,7 +163,9 @@ async fn r4_regeneration_drops_netenv_and_reports_it() {
             .is_some_and(|d| d.servers.iter().any(|s| s.tag == "dns-netenv"))
     };
 
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
+    let mut deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
+    // Generation-only fixture: no selected Core or Helper DNS ownership.
+    deps.linux_resolved_external = false;
     let before = rt
         .generate_and_gate(&user_config, &deps, &path, None, &mut BTreeMap::new())
         .await
@@ -179,7 +181,9 @@ async fn r4_regeneration_drops_netenv_and_reports_it() {
     );
 
     assert!(rt.suppress_netenv_after_fatal(Some(CoreFatalKind::DhcpMonitorMissing)));
-    let deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
+    let mut deps = rt.generate_deps(0, 0, 0, None, &[], &cfg, false);
+    // Generation-only fixture: no selected Core or Helper DNS ownership.
+    deps.linux_resolved_external = false;
     let after = rt
         .generate_and_gate(&user_config, &deps, &path, None, &mut BTreeMap::new())
         .await

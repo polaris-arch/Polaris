@@ -54,7 +54,9 @@ async fn final_gate_inline_absorption_keeps_unemitted_request() {
         server["tailscaleSettings"]["routes"] = serde_json::json!(["10.44.0.0/24"]);
     }
     let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let mut deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    // Metadata-only fixture: no selected Core or Helper DNS ownership.
+    deps.linux_resolved_external = false;
     let core_path = dir.join("core.json");
     let mut peeled = BTreeMap::new();
     let gate = rt
@@ -156,7 +158,9 @@ async fn final_gate_external_reads_retained_file_not_new_observation_projection(
     let rule_before = std::fs::read_to_string(&rule_path).unwrap();
     assert!(!rule_before.contains("100.64.0.0/10"));
     assert!(rule_before.contains("32.0.0.28/32"));
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let mut deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    // Metadata-only fixture: no selected Core or Helper DNS ownership.
+    deps.linux_resolved_external = false;
     let core_path = dir.join("core.json");
     let mut peeled = BTreeMap::new();
     let gate = rt
@@ -275,7 +279,9 @@ async fn dns_owner_exists_without_any_force_route_claimant() {
     let (mut raw, _) = ts_config(&["ts-dns-only"], true);
     raw["servers"][0]["tailscaleSettings"]["alwaysRouteSubnets"] = serde_json::Value::Bool(false);
     let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let mut deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    // Metadata-only fixture: no selected Core or Helper DNS ownership.
+    deps.linux_resolved_external = false;
     let core_path = dir.join("core.json");
     let mut peeled = BTreeMap::new();
     let gate = rt
@@ -329,7 +335,9 @@ async fn dns_only_metadata_gate(
     let (mut raw, _) = ts_config(&["ts-dns-only"], true);
     raw["servers"][0]["tailscaleSettings"]["alwaysRouteSubnets"] = serde_json::Value::Bool(false);
     let config: UserConfig = serde_json::from_value(raw.clone()).unwrap();
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    let mut deps = rt.generate_deps(9090, 0, 0, None, &[], &raw, false);
+    // Metadata-only fixture: no selected Core or Helper DNS ownership.
+    deps.linux_resolved_external = false;
     rt.generate_and_gate_with_runtime_bindings(
         &config,
         &deps,
