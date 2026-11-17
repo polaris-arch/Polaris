@@ -1582,8 +1582,11 @@ fn prepare(request: &Request, lease: &Arc<ProtectedPath>) -> io::Result<Journal>
             "cross-action/user journal",
         )?;
         if request.action == Action::Install {
+            require(
+                journal.get("id")? == request.id,
+                "recovery core differs from selected pin",
+            )?;
             if journal.get("utility")? != request.helper_sha
-                || journal.get("id")? != request.id
                 || journal.get("manifest")? != request.manifest_sha
             {
                 // An explicitly selected repair may resume a failed fence, but
@@ -1602,7 +1605,6 @@ fn prepare(request: &Request, lease: &Arc<ProtectedPath>) -> io::Result<Journal>
                 journal
                     .fields
                     .insert("utility".into(), request.helper_sha.clone());
-                journal.fields.insert("id".into(), request.id.clone());
                 journal
                     .fields
                     .insert("manifest".into(), request.manifest_sha.clone());
