@@ -5,11 +5,11 @@
   "repository": "polaris-arch/sing-box-polaris",
   "repositoryId": 1421657509,
   "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
-  "version": "1.15.0-polaris-alpha.12.28",
-  "sourceTag": "v1.15.0-polaris-alpha.12.28",
-  "sourceTagObject": "6eb2a29dc946512028c51c2febf4bdd78a50cc6d",
-  "sourceCommit": "f2cccbe8f44f54becbba7af5e8c5169ac1d634b5",
-  "sourceTree": "802908c443fb1e0d9f8aabce6c051852c0722128",
+  "version": "1.15.0-polaris-alpha.12.31",
+  "sourceTag": "v1.15.0-polaris-alpha.12.31",
+  "sourceTagObject": "207870619a8f70b8ba001db27eb81321115a8239",
+  "sourceCommit": "3f918c9756aa9375f0ddc59ee265deb2987a2efc",
+  "sourceTree": "1b81db7485a1d83ae587477814cc90ba2dfe4f11",
   "goModSha256": "3cc97ef8b91fa1c004c1ebe6a766541448af4adb0944f0fb264245271b69b1d7",
   "goSumSha256": "ff594892cdee872304a2f495e59fae65c3746010ede67c8f03218a9cc0ea82fd",
   "goModule": "github.com/sagernet/sing-box",
@@ -71,7 +71,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.28-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.31-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -120,7 +120,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-polaris-alpha.12.28-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12.31-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -139,8 +139,8 @@
   },
   "sourcePolicy": {
     "schema": "polaris-reviewed-kernel-source-v4",
-    "sourceCommit": "f2cccbe8f44f54becbba7af5e8c5169ac1d634b5",
-    "sourceTree": "802908c443fb1e0d9f8aabce6c051852c0722128",
+    "sourceCommit": "3f918c9756aa9375f0ddc59ee265deb2987a2efc",
+    "sourceTree": "1b81db7485a1d83ae587477814cc90ba2dfe4f11",
     "goVersion": "1.27.2",
     "goModSha256": "3cc97ef8b91fa1c004c1ebe6a766541448af4adb0944f0fb264245271b69b1d7",
     "goSumSha256": "ff594892cdee872304a2f495e59fae65c3746010ede67c8f03218a9cc0ea82fd",
@@ -164,7 +164,7 @@
       "github.com/sagernet/sing-tun": {
         "version": "v0.9.7-0.20261013140216-9ffa5391a2ad",
         "replacementPath": "./third_party/sing-tun",
-        "replacementTree": "29567e35d908ee81c82061dccc8815e51011fc33",
+        "replacementTree": "eec993dd02f937a27f457cdf922755c6759386a9",
         "replacementFileCount": 267
       },
       "github.com/sagernet/tailscale": {
