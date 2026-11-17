@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const legs = {
@@ -30,12 +31,15 @@ if (!protoc) throw Error('fetch-protoc.mjs did not report its bin directory');
 env.PATH = protoc + delimiter + env.PATH;
 
 run('pnpm', ['--dir', 'ui', 'install', '--frozen-lockfile']);
-// fetch-core consults the anonymous GitHub API (60 requests/hour) even when resources are current.
-// Reusing them is safe: identity preparation below rejects any byte that differs from the pin.
-try { run('node', ['scripts/fetch-core.mjs', `--platform=${platform}`]); } catch { console.warn('fetch-core failed; reusing existing resources/ for identity verification'); }
+const res = `resources/${platform}`;
+// fetch-core spends ten anonymous GitHub API requests (60/hour per IP) even when resources are current,
+// so it only runs when the offline receipt and pinned-byte check that identity preparation repeats fails.
+try {
+  verifyPackagedRelease(root, JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json'), 'utf8')), platform,
+    join(root, res, platform === 'win' ? 'sing-box.exe' : 'sing-box'));
+} catch { run('node', ['scripts/fetch-core.mjs', `--platform=${platform}`]); }
 run('node', ['scripts/fetch-dashboard.mjs']);
 mkdirSync(join(root, 'resources/data'), { recursive: true });
-const res = `resources/${platform}`;
 // An earlier local package leaves its identity and helpers here; package.yml starts without them.
 for (const name of ['core-manifest.json', leg.helper, 'polaris-helper-setup.exe']) rmSync(join(root, res, name), { force: true });
 const target = leg.target ? ['--target', leg.target] : [];
