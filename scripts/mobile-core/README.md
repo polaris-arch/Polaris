@@ -9,7 +9,7 @@ App-built component receipts.
 
 Mobile source admission is independent of desktop public asset availability.
 
-The formal tools remain Go **1.27.2**, with source minimum Go **1.27.0**, and
+The formal tools use Go **1.27.4**, with source minimum Go **1.27.0**, and
 gomobile/gobind **v0.1.13** on both platforms. This remains the original
 `polaris-mobile-fork-input-v1` input schema. Consumption requires its own
 `polaris-mobile-component-v1` receipt, exact sourceContract/nativeInputs,
@@ -118,7 +118,7 @@ a speedup for a genuinely cold build or the final App crate.
 
 Before that input is frozen, exact remote module versions already covered by
 the source `go.sum` are admitted into the same module cache if their directories
-are missing. The pinned Go1.27.2's `go list -m -json` reports those directories according to
+are missing. The pinned Go toolchain's `go list -m -json` reports those directories according to
 cache availability; a cold graph must not be frozen and then change merely
 because the original bind populated the cache. Download admission uses one
 fixed `module-cache-admission/admission.mod` plus `.sum` copy (each at most 1MiB,

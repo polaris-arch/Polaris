@@ -1228,14 +1228,15 @@ class FormalOutputs(unittest.TestCase):
     def relocated_android_observations(self):
         name = 'jni/arm64-v8a/libbox.so'
         body = '\tpath\tgobind\n\tdep\texample.org/module\tv1.2.3\th1:fixed\n'
+        build_info = ': go' + self.value['goVersion'] + '\n' + body
         original = {'format': 'AAR', 'artifact': {'bytes': 123, 'sha256': 'a' * 64},
                     'nativeLibraries': {name: {'bytes': 42, 'sha256': 'b' * 64,
-                        'goBuildInfo': '/producer/scratch/jni_arm64-v8a_libbox.so: go1.27.2\n' + body,
+                        'goBuildInfo': '/producer/scratch/jni_arm64-v8a_libbox.so' + build_info,
                         'parsedBuildInfo': self.facts(), 'buildID': 'original-build-id',
                         'jniExports': ['JNI_OnLoad'], 'needed': ['libc.so']}},
                     'javaInterfaces': {'Libbox': 'original API'}}
         observed = deepcopy(original)
-        observed['nativeLibraries'][name]['goBuildInfo'] = '/consumer/work/jni_arm64-v8a_libbox.so: go1.27.2\n' + body
+        observed['nativeLibraries'][name]['goBuildInfo'] = '/consumer/work/jni_arm64-v8a_libbox.so' + build_info
         return name, original, observed
 
     def test_component_identity_ignores_only_the_exact_go_invocation_filename_and_preserves_raw(self):
@@ -1258,8 +1259,9 @@ class FormalOutputs(unittest.TestCase):
         ]:
             wrong = deepcopy(observed); mutate(wrong)
             self.assertNotEqual(component_output_identity(original), component_output_identity(wrong))
-        for header in ['relative/jni_arm64-v8a_libbox.so: go1.27.2',
-                       '/consumer/work/other.so: go1.27.2',
+        version = ': go' + self.value['goVersion']
+        for header in ['relative/jni_arm64-v8a_libbox.so' + version,
+                       '/consumer/work/other.so' + version,
                        '/consumer/work/jni_arm64-v8a_libbox.so: go1.25.6']:
             wrong = deepcopy(observed)
             wrong['nativeLibraries'][name]['goBuildInfo'] = header + '\n\tpath\tgobind\n'

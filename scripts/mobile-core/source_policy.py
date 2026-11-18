@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 
 
+GO_VERSION = '1.27.4'
+
 # Names and source-owned paths are schema, not mutable source selections. Tree,
 # version and byte facts belong to the explicitly reviewed caller declaration.
 VENDOR_DIRECTORIES = {
@@ -20,6 +22,7 @@ VENDOR_DIRECTORIES = {
     'github.com/database64128/tfo-go/v2': 'tfo-go',
     'github.com/sagernet/sing-vmess': 'sing-vmess',
     'github.com/libp2p/go-nat': 'go-nat',
+    'github.com/google/nftables': 'google-nftables',
 }
 
 
@@ -48,8 +51,8 @@ def validate_source_policy(policy, context):
             policy['schema'] == 'polaris-reviewed-kernel-source-v4', 'complete explicit declaration required')
     for key in ('sourceCommit', 'sourceTree'):
         require(hexadecimal(policy[key], 40) and policy[key] == context.get(key), key + ' differs')
-    require(policy['goDirective'] == '1.27.0' and policy['goVersion'] == '1.27.2' and
-            policy['toolchain'] == 'go1.27.2', 'exact Go directive/toolchain required')
+    require(policy['goDirective'] == '1.27.0' and policy['goVersion'] == GO_VERSION and
+            policy['toolchain'] == 'go' + GO_VERSION, 'exact Go directive/toolchain required')
     for key in ('goModSha256', 'goSumSha256'):
         require(hexadecimal(policy[key], 64) and
                 (key not in context or context[key] == policy[key]), key + ' differs')
@@ -93,7 +96,7 @@ def validate_vendors(vendors):
 
 def verify_vendor_module_declarations(raw, vendors):
     directives, dependencies, replacements = source_module_declarations(raw)
-    require(directives == {'module': 'github.com/sagernet/sing-box', 'go': '1.27.0', 'toolchain': 'go1.27.2'},
+    require(directives == {'module': 'github.com/sagernet/sing-box', 'go': '1.27.0', 'toolchain': 'go' + GO_VERSION},
             'kernel Go directives differ')
     local = {}
     for name, (version, target) in replacements.items():

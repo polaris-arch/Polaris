@@ -888,6 +888,7 @@ def admitted_binding(args, value, work, cache, producer_identity, initial_source
         env = tool_environment(args.go, args.gomobile, args.gobind, cache, scratch,
                                sdk=sdk, ndk=Path(args.ndk).resolve(), jdk=Path(args.jdk).resolve())
         env['CGO_LDFLAGS'] = '-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'
+        env['CGO_LDFLAGS_ALLOW'] = r'^-l:libcronet\.a$'
     else:
         require(os.uname().sysname == 'Darwin', 'formal Apple bind requires a Mac host')
         jar = None
