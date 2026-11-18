@@ -537,11 +537,12 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
           是因为形态与「生效排除面」同源（后端跑真判据读回来），不是因为它属于 TUN。 */}
       <CoexSnapshotBlock />
       <div data-testid="tunnel-conflict-report">
-        <Button variant="ghost" size="sm" disabled={tunnelConflictState.loading}
-          onClick={() => tunnelConflictLoader.refresh()}>
-          {t(tunnelConflictState.loading ? 'common.loading' : 'common.refresh')}
-        </Button>
-        <TunnelConflictBlock report={tunnelConflictState.report} />
+        <TunnelConflictBlock report={tunnelConflictState.report} headerAction={
+          <Button variant="ghost" size="sm" disabled={tunnelConflictState.loading}
+            onClick={() => tunnelConflictLoader.refresh()}>
+            {t(tunnelConflictState.loading ? 'common.loading' : 'common.refresh')}
+          </Button>
+        } />
       </div>
       <MeshRouteEvidenceBlock
         report={meshRouteState.report}

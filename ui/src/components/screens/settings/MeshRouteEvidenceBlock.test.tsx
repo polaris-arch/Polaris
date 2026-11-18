@@ -293,6 +293,20 @@ it('TUN preview identity changes for mesh routes, real server input and observed
 });
 
 describe('closed desktop route details keep actionable summaries on the main surface', () => {
+  it('keeps long preview notices and each node’s ranges behind their own disclosures', () => {
+    const report = clone();
+    report.snapshot.scope = 'preview';
+    for (const serverId of ['fourth', 'fifth']) {
+      report.snapshot.candidates.push({ ...report.snapshot.candidates[0], serverId });
+      report.results.push({ ...report.results[0], serverId });
+    }
+    report.totalCandidateCount = report.snapshot.candidates.length;
+    const html = render(report);
+    expect(mainSurface(report).match(/data-mesh-route-summary="preview"/g)).toHaveLength(3);
+    expect(html).toContain('<summary>其余路由提示 (2)</summary>');
+    expect(html.match(/<details class="tun-details mesh-route-node">/g)).toHaveLength(5);
+  });
+
   it('names the affected node and earlier owner and distinguishes none from partial', () => {
     const report = runningReport();
     const main = mainSurface(report);

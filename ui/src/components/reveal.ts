@@ -68,11 +68,15 @@ function prefersReducedMotion(): boolean {
 export function revealElement(el: HTMLElement): void {
   const sc = scrollableAncestor(el);
   if (!sc) return;
-  const delta = computeRevealDelta(el.getBoundingClientRect(), sc.getBoundingClientRect());
+  const element = el.getBoundingClientRect();
+  const top = sc.getBoundingClientRect().top + sc.clientTop;
+  const delta = computeRevealDelta(element, { top, bottom: top + sc.clientHeight });
   if (delta <= 0) return;
   // jsdom 无 scrollBy —— 单测里渲染真实组件时不该因此炸。几何计算已由 computeRevealDelta 单独覆盖。
   if (typeof sc.scrollBy !== 'function') return;
-  sc.scrollBy({ top: delta, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+  // Round toward the revealed content on integral scroll offsets, within the heading.
+  const distance = Math.min(Math.ceil(delta), Math.floor(element.top - top));
+  if (distance > 0) sc.scrollBy({ top: distance, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
 }
 
 /**

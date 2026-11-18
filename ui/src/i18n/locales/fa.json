@@ -1231,6 +1231,7 @@
         "notRecorded": "ثبت نشده",
         "unknownNode": "گره ناشناخته",
         "technical": "جزئیات فنی",
+        "moreSummaries": "سایر اعلان‌های مسیر",
         "unresolvedIds": "شناسه‌های گره شناسایی‌نشده",
         "dnsOwner": "گره مسئول تفکیک نام در این گزارش",
         "precedingExceptions": "قواعدی که ممکن است زودتر اعمال شوند",

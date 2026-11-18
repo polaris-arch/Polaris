@@ -1209,6 +1209,7 @@
         "notRecorded": "Not recorded",
         "unknownNode": "Unknown node",
         "technical": "Technical details",
+        "moreSummaries": "More route notices",
         "unresolvedIds": "Unresolved node identifiers",
         "dnsOwner": "Current name-resolution handler in this report",
         "precedingExceptions": "Rules that may take precedence",

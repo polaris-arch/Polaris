@@ -136,7 +136,7 @@ test('bottom Windows source reveals committed content in its actual scroll conta
     if (!scroller) throw new Error('actual Windows source has no scrollable ancestor');
     const container = scroller.getBoundingClientRect();
     const content = element.getBoundingClientRect();
-    return { top: content.top, bottom: content.bottom, containerTop: container.top, containerBottom: container.bottom, fields: element.querySelectorAll(':scope > .card-sub').length };
+    return { top: content.top, bottom: content.bottom, containerTop: container.top, containerBottom: container.bottom, fields: element.querySelectorAll(':scope > .tun-details-body > .card-sub').length };
   });
   const before = await measure();
   expect(before.fields).toBe(0);
@@ -147,7 +147,7 @@ test('bottom Windows source reveals committed content in its actual scroll conta
   await expect.poll(async () => (await measure()).fields).toBe(4);
   await expect.poll(async () => {
     const rect = await measure();
-    return rect.bottom <= rect.containerBottom + 1 && rect.top >= rect.containerTop - 1;
-  }).toBe(true);
+    return Math.max(rect.bottom - rect.containerBottom, rect.containerTop - rect.top);
+  }).toBeLessThanOrEqual(1);
   expect((await commands(page)).map(c => c.command)).toEqual(['coex_runtime_get_state']);
 });

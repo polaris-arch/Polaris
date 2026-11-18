@@ -1209,6 +1209,7 @@
         "notRecorded": "未記錄",
         "unknownNode": "未知節點",
         "technical": "技術詳情",
+        "moreSummaries": "其餘路由提示",
         "unresolvedIds": "無法識別的節點識別碼",
         "dnsOwner": "本報告中的名稱解析承接節點",
         "precedingExceptions": "可能先於本層命中的規則",

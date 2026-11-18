@@ -9,6 +9,8 @@ import { revealOnToggle } from '@/components/reveal';
 import { InfoIcon } from '@/components/InfoIcon';
 import { SetBlock } from './Primitives';
 
+const VISIBLE_SUMMARIES = 3;
+
 export interface MeshRouteEvidenceBlockProps {
   report: MeshRouteReport | null;
   servers: readonly ServerConfig[];
@@ -96,8 +98,8 @@ export function MeshRouteEvidenceBlock({
   );
 
   return (
-    <SetBlock header={
-      <div className="mesh-route-heading">
+    <SetBlock className="tun-report" header={
+      <div className="tun-report-heading">
         <span className="sr-title"><span>{meshText('title')}</span><InfoIcon tip={meshText('hint')} /></span>
         {onRefresh && (
           <button type="button" className="btn ghost sm" onClick={onRefresh} disabled={loading}>
@@ -143,108 +145,126 @@ export function MeshRouteEvidenceBlock({
           )}
           {summaries.length > 0 && (
             <div className="mesh-route-summary" role="status">
-              {summaries.map(({ id, kind, text }) => (
+              {summaries.slice(0, VISIBLE_SUMMARIES).map(({ id, kind, text }) => (
                 <div className="warn-line" data-mesh-route-summary={kind} key={id}>{text}</div>
               ))}
             </div>
           )}
+          {summaries.length > VISIBLE_SUMMARIES && (
+            <details className="tun-details mesh-route-details" onToggle={revealOnToggle}>
+              <summary>{meshText('moreSummaries')} ({summaries.length - VISIBLE_SUMMARIES})</summary>
+              <div className="tun-details-body">
+                {summaries.slice(VISIBLE_SUMMARIES).map(({ id, kind, text }) => (
+                  <div className="warn-line" data-mesh-route-summary={kind} key={id}>{text}</div>
+                ))}
+              </div>
+            </details>
+          )}
           <details className="tun-details mesh-route-details" onToggle={revealOnToggle}>
             <summary>{meshText('technical')}</summary>
-            <div className="card-sub">{meshText('configSource.' + report.snapshot.configSource)}</div>
-            <div className="card-sub">{meshText('candidateCount')}: {report.snapshot.candidates.length} / {report.totalCandidateCount}</div>
-            {report.snapshot.precedingExceptions.length === 0 && <div className="card-sub">
-              {meshText('precedingExceptions')}: {meshText('noneReported')}
-            </div>}
-            <div className="card-sub">{meshText('version')}: <span className="mono">{report.snapshot.configVersion ?? meshText('notRecorded')}</span></div>
-            <div className="card-sub">{meshText('generation')}: {report.snapshot.runGeneration ?? meshText('notRecorded')}</div>
-            {diagnosticIds.length > 0 && (
-              <div className="card-sub">{meshText('unresolvedIds')}: {' '}
-                <span className="mono">{diagnosticIds.join(', ')}</span>
-              </div>
-            )}
+            <div className="tun-details-body">
+              <div className="card-sub">{meshText('configSource.' + report.snapshot.configSource)}</div>
+              <div className="card-sub">{meshText('candidateCount')}: {report.snapshot.candidates.length} / {report.totalCandidateCount}</div>
+              {report.snapshot.precedingExceptions.length === 0 && <div className="card-sub">
+                {meshText('precedingExceptions')}: {meshText('noneReported')}
+              </div>}
+              <div className="card-sub">{meshText('version')}: <span className="mono">{report.snapshot.configVersion ?? meshText('notRecorded')}</span></div>
+              <div className="card-sub">{meshText('generation')}: {report.snapshot.runGeneration ?? meshText('notRecorded')}</div>
+              {diagnosticIds.length > 0 && (
+                <div className="card-sub">{meshText('unresolvedIds')}: {' '}
+                  <span className="mono">{diagnosticIds.join(', ')}</span>
+                </div>
+              )}
+            </div>
           </details>
           <details className="tun-details mesh-route-details" onToggle={revealOnToggle}>
-            <summary>{meshText('details')}</summary>
+            <summary>{meshText('details')} ({rows.length})</summary>
             <ol className="mesh-route-nodes">
               {rows.map(({ candidate, resolution }) => (
                 <li key={candidate.serverId}>
-                  <div className="mesh-route-node-title">
-                    <b>{nameOf(candidate.serverId)}</b>
-                    <span>{meshText(`leg.${candidate.leg}`)}</span>
-                    <span>{meshText('coverage')}: {resolution ? meshText(`coverageValue.${resolution.coverage}`) : meshText('unavailable')}</span>
-                  </div>
-                  <div className="card-sub">{meshText('engagedReason')}: {meshText(engagedKey(candidate.engagedReason))}</div>
-                  {!candidate.generated && (
-                    <div className="card-sub">
-                      {meshText('generationFailed')} {' '}
-                      {invalidNodeReasonText(candidate.generationReason ?? '', (key) => t(key))}
-                    </div>
-                  )}
-                  {candidate.configuredCidrs.length > 0 && (
-                    <>
-                      <div className="card-sub">{meshText('configured')}</div>
-                      {plain(candidate.configuredCidrs)}
-                    </>
-                  )}
-                  {candidate.observedHosts.length > 0 && (
-                    <>
-                      <div className="card-sub">{meshText('observed')}</div>
-                      {plain(candidate.observedHosts)}
-                    </>
-                  )}
-                  {candidate.referencedFile && (
-                    <>
-                      <div className="card-sub">{meshText('referencedFile')}: {sampledAt(candidate.referencedFile.sampledAtMs) ?? meshText('notRecorded')}</div>
-                      {candidate.referencedFile.cidrs === null
-                        ? <div className="card-sub">{meshText('fileUnknown')}</div>
-                        : candidate.referencedFile.cidrs.length === 0
+                  <details className="tun-details mesh-route-node" onToggle={revealOnToggle}>
+                    <summary>
+                      <span className="mesh-route-node-title">
+                        <b>{nameOf(candidate.serverId)}</b>
+                        <span>{meshText(`leg.${candidate.leg}`)}</span>
+                        <span>{meshText('coverage')}: {resolution ? meshText(`coverageValue.${resolution.coverage}`) : meshText('unavailable')}</span>
+                      </span>
+                    </summary>
+                    <div className="tun-details-body">
+                      <div className="card-sub">{meshText('engagedReason')}: {meshText(engagedKey(candidate.engagedReason))}</div>
+                      {!candidate.generated && (
+                        <div className="card-sub">
+                          {meshText('generationFailed')} {' '}
+                          {invalidNodeReasonText(candidate.generationReason ?? '', (key) => t(key))}
+                        </div>
+                      )}
+                      {candidate.configuredCidrs.length > 0 && (
+                        <>
+                          <div className="card-sub">{meshText('configured')}</div>
+                          {plain(candidate.configuredCidrs)}
+                        </>
+                      )}
+                      {candidate.observedHosts.length > 0 && (
+                        <>
+                          <div className="card-sub">{meshText('observed')}</div>
+                          {plain(candidate.observedHosts)}
+                        </>
+                      )}
+                      {candidate.referencedFile && (
+                        <>
+                          <div className="card-sub">{meshText('referencedFile')}: {sampledAt(candidate.referencedFile.sampledAtMs) ?? meshText('notRecorded')}</div>
+                          {candidate.referencedFile.cidrs === null
+                            ? <div className="card-sub">{meshText('fileUnknown')}</div>
+                            : candidate.referencedFile.cidrs.length === 0
+                              ? <div className="card-sub">{meshText('knownEmpty')}</div>
+                              : plain(candidate.referencedFile.cidrs)}
+                        </>
+                      )}
+                      <div className="card-sub">{meshText('requested')}</div>
+                      {resolution === null || candidate.matchCidrs === null
+                        ? <div className="card-sub">{meshText('unknownRanges')}</div>
+                        : resolution.requested.length === 0
                           ? <div className="card-sub">{meshText('knownEmpty')}</div>
-                          : plain(candidate.referencedFile.cidrs)}
-                    </>
-                  )}
-                  <div className="card-sub">{meshText('requested')}</div>
-                  {resolution === null || candidate.matchCidrs === null
-                    ? <div className="card-sub">{meshText('unknownRanges')}</div>
-                    : resolution.requested.length === 0
-                      ? <div className="card-sub">{meshText('knownEmpty')}</div>
-                      : sourced(resolution.requested)}
-                  <div className="card-sub">{meshText('effective')}</div>
-                  {resolution?.effective === null || resolution?.effective === undefined
-                    ? <div className="card-sub">{meshText('unknownRanges')}</div>
-                    : resolution.effective.length === 0
-                      ? <div className="card-sub">{meshText('knownEmpty')}</div>
-                      : plain(resolution.effective)}
-                  {resolution && resolution.blockedBy.length > 0 && (
-                    <>
-                      <div className="card-sub">{meshText('blockedBy')}</div>
-                      <ul className="cidr-eff-list">
-                        {resolution.blockedBy.map((block, index) => (
-                          <li key={`${block.serverId}-${block.cidr}-${index}`}>
-                            <span className="mono">{block.cidr}</span> → {nameOf(block.serverId)} ·{' '}
-                            {meshText(`relation.${block.relation}`)} ·{' '}
-                            {block.confirmed ? meshText('confirmedHere') : meshText('unconfirmed')}
-                          </li>
-                        ))}
-                      </ul>
-                    </>
-                  )}
-                  {resolution && resolution.invalid.length > 0 && (
-                    <div className="card-sub">{meshText('invalid')}: {resolution.invalid.join(', ')}</div>
-                  )}
-                  {resolution && resolution.excludedCatchAll.length > 0 && (
-                    <div className="card-sub">{meshText('excludedCatchAll')}: {resolution.excludedCatchAll.join(', ')}</div>
-                  )}
-                  {[...candidate.unknownReasons, ...(resolution?.unknownReasons ?? [])].length > 0 && (
-                    <div className="card-sub">{meshText('unknownReasons')}: {' '}
-                      {[...new Set([...candidate.unknownReasons, ...(resolution?.unknownReasons ?? [])])]
-                        .map((reason) => meshText(unknownKey(reason))).join(' · ')}
+                          : sourced(resolution.requested)}
+                      <div className="card-sub">{meshText('effective')}</div>
+                      {resolution?.effective === null || resolution?.effective === undefined
+                        ? <div className="card-sub">{meshText('unknownRanges')}</div>
+                        : resolution.effective.length === 0
+                          ? <div className="card-sub">{meshText('knownEmpty')}</div>
+                          : plain(resolution.effective)}
+                      {resolution && resolution.blockedBy.length > 0 && (
+                        <>
+                          <div className="card-sub">{meshText('blockedBy')}</div>
+                          <ul className="cidr-eff-list">
+                            {resolution.blockedBy.map((block, index) => (
+                              <li key={`${block.serverId}-${block.cidr}-${index}`}>
+                                <span className="mono">{block.cidr}</span> → {nameOf(block.serverId)} ·{' '}
+                                {meshText(`relation.${block.relation}`)} ·{' '}
+                                {block.confirmed ? meshText('confirmedHere') : meshText('unconfirmed')}
+                              </li>
+                            ))}
+                          </ul>
+                        </>
+                      )}
+                      {resolution && resolution.invalid.length > 0 && (
+                        <div className="card-sub">{meshText('invalid')}: {resolution.invalid.join(', ')}</div>
+                      )}
+                      {resolution && resolution.excludedCatchAll.length > 0 && (
+                        <div className="card-sub">{meshText('excludedCatchAll')}: {resolution.excludedCatchAll.join(', ')}</div>
+                      )}
+                      {[...candidate.unknownReasons, ...(resolution?.unknownReasons ?? [])].length > 0 && (
+                        <div className="card-sub">{meshText('unknownReasons')}: {' '}
+                          {[...new Set([...candidate.unknownReasons, ...(resolution?.unknownReasons ?? [])])]
+                            .map((reason) => meshText(unknownKey(reason))).join(' · ')}
+                        </div>
+                      )}
                     </div>
-                  )}
+                  </details>
                 </li>
               ))}
             </ol>
             {report.snapshot.candidates.length === 0 && (
-              <div className="card-sub">{meshText('noCandidates')}</div>
+              <div className="tun-details-body">{meshText('noCandidates')}</div>
             )}
           </details>
         </>

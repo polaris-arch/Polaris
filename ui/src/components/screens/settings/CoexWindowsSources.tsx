@@ -6,7 +6,7 @@ import type { CoexWindowsSnapshot, WindowsReference, WindowsSource, WindowsRoute
 type Text = (key: string) => string;
 function Field<T>({ label, value, show, t }: { label: string; value: Fact<T>; show: (v: T) => ReactNode; t: Text }) {
   return <div className="card-sub"><b>{label}: </b>{value.status === 'known' ? show(value.value) : <>
-    <span>{t('settings.coex.unknown')}</span><details onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
+    <span>{t('settings.coex.unknown')}</span><details onToggle={revealOnToggle}><summary className="coex-reason">{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
   </>}</div>;
 }
 function Source<T>({ id, label, value, show, t }: { id: string; label: string; value: WindowsSource<T>; show: (v: T) => ReactNode; t: Text }) {
@@ -14,13 +14,13 @@ function Source<T>({ id, label, value, show, t }: { id: string; label: string; v
   const scheduleReveal = useRevealAfterCommit();
   const count = value.rows.status === 'known' ? value.rows.value.length : 0;
   const current = Math.min(page, Math.max(0, Math.ceil(count / 20) - 1)); const start = current * 20;
-  return <details data-coex-source={id} open={open} onToggle={(event) => {
+  return <details className="tun-details" data-coex-source={id} open={open} onToggle={(event) => {
     const details = event.currentTarget;
     // Row content mounts with open: measure only after React commits it.
     scheduleReveal(details.open ? () => revealElement(details) : null);
     setOpen(details.open);
   }}>
-    <summary>{label}</summary>{open && <>
+    <summary>{label}</summary>{open && <div className="tun-details-body">
       <Field label={t('settings.coex.completeness')} value={value.complete} t={t} show={(v) => t(v ? 'settings.coex.true' : 'settings.coex.false')} />
       <Field label={t('settings.coex.compartment')} value={value.compartment} t={t} show={(v) => <span className="mono">{v}</span>} />
       <Field label={t('settings.coex.sourceError')} value={value.error} t={t} show={(v) => v === null ? t('settings.coex.noSourceError') : <span className="mono">{v}</span>} />
@@ -28,13 +28,13 @@ function Source<T>({ id, label, value, show, t }: { id: string; label: string; v
         <div>{t('settings.coex.total')}: {rows.length}</div>{rows.length === 0 ? <div>{t('settings.coex.observedEmpty')}</div> : <>
           <div>{t('settings.coex.displayed')}: {start + 1}–{Math.min(start + 20, rows.length)} / {rows.length}</div>
           <ol start={start + 1}>{rows.slice(start, start + 20).map((v, index) => <li key={start + index}>{show(v)}</li>)}</ol>
-          {rows.length > 20 && <div>
+          {rows.length > 20 && <div className="coex-fact-pages">
             <button type="button" className="btn ghost sm" disabled={current === 0} onClick={() => setPage(current - 1)}>{t('settings.coex.previous')}</button>
             <button type="button" className="btn ghost sm" disabled={start + 20 >= rows.length} onClick={() => setPage(current + 1)}>{t('settings.coex.next')}</button>
           </div>}
         </>}
       </>} />
-    </>}
+    </div>}
   </details>;
 }
 /** Both snapshot schemas explicitly leave these five context fields Unknown. */
@@ -46,7 +46,7 @@ export function CoexUnconfirmedContext({ snapshot, t }: {
     <div className="card-sub" data-coex-unconfirmed>
       <span>{t('settings.coex.unconfirmedSummary')}</span>
       <details onToggle={revealOnToggle}>
-        <summary>{t('settings.coex.reason')}</summary>
+        <summary className="coex-reason">{t('settings.coex.reason')}</summary>
         {([
           [t('settings.coex.classification'), snapshot.classification],
           [t('settings.coex.phase'), snapshot.context.observationPhase],

@@ -6,6 +6,7 @@ import type { MeshRouteReport, MeshRouteResolution, MeshRouteUnknownReason, Sour
 type RouteState = 'unavailable' | 'legacy' | 'previous' | 'preview' | 'pending' | 'empty' | 'absent' | 'noRequested' | 'bootstrapOverlap' | 'full' | 'partial' | 'none' | 'unknown';
 
 const section: CSSProperties = { display: 'grid', gap: 6, minWidth: 0, marginBottom: 16 };
+const detailBody: CSSProperties = { display: 'grid', gap: 8, paddingBlockStart: 8 };
 const heading: CSSProperties = { margin: 0, fontSize: '0.875rem', color: 'hsl(var(--fg))' };
 const line: CSSProperties = { margin: 0, fontSize: '0.75rem', lineHeight: 1.5, overflowWrap: 'anywhere' };
 const list: CSSProperties = { margin: 0, paddingInlineStart: 18, fontSize: '0.75rem', lineHeight: 1.5, overflowWrap: 'anywhere' };
@@ -160,72 +161,76 @@ export function MobileMeshRouteEvidence({ report, serverId, nameOf, previous = f
     {results.map((result: MeshRouteResolution) => {
       const candidate = candidates.get(result.serverId);
       const noPrivateRanges = result.requested.length === 0 && result.effective?.length === 0;
-      return <section key={result.serverId} style={section}>
-        <h3 style={heading}>{nameOf(result.serverId)}</h3>
-        <p style={line}>{contextMismatch
-          ? t('mobileMeshRouteEvidence.runningResult', { result: t(noPrivateRanges
-            ? 'mobileMeshRouteEvidence.noRequested' : `mobileMeshRouteEvidence.coverage.${result.coverage}`) })
-          : t(noPrivateRanges ? 'mobileMeshRouteEvidence.noRequested' : `mobileMeshRouteEvidence.coverage.${result.coverage}`)}</p>
-        {!noPrivateRanges && !loaded && <p style={line}>{t('mobileMeshRouteEvidence.coverageCaveat')}</p>}
-        {candidate && <p style={line}>{t(`mobileMeshRouteEvidence.leg.${candidate.leg}`)} · {candidate.generated
-          ? t('mobileMeshRouteEvidence.generated') : t('mobileMeshRouteEvidence.notGenerated')}</p>}
-        <h4 style={heading}>{t('mobileMeshRouteEvidence.requested')}</h4>
-        {result.requested.length === 0
-          ? <p style={line}>{t('mobileMeshRouteEvidence.noRequested')}</p>
-          : <ul style={list}>{result.requested.map(({ cidr, source }, index) =>
-            <li key={`${cidr}:${source}:${index}`}><span style={mono}>{cidr}</span> · {t(sourceKey(source))}</li>)}</ul>}
-        {!noPrivateRanges && <>
-          <h4 style={heading}>{t(loaded ? 'mobileMeshRouteEvidence.loadedRanges' : 'mobileMeshRouteEvidence.calculatedRanges')}</h4>
-          {result.effective === null
-            ? <p style={line}>{t('mobileMeshRouteEvidence.effectiveUnknown')}</p>
-            : <Ranges values={result.effective} emptyKey={loaded
-              ? 'mobileMeshRouteEvidence.zeroEffective' : 'mobileMeshRouteEvidence.zeroCalculated'} />}
-        </>}
-        {result.blockedBy.length > 0 && <>
-          <h4 style={heading}>{t('mobileMeshRouteEvidence.blockedTitle')}</h4>
-          <ul style={list}>{result.blockedBy.map((blocked, index) => <li key={`${blocked.serverId}:${blocked.cidr}:${index}`}>
-            <span style={mono}>{blocked.cidr}</span> · {t(loaded && blocked.confirmed &&
-              !result.requested.some((range) => range.source === 'bootstrap')
-              ? 'mobileMeshRouteEvidence.blockedConfirmed' : 'mobileMeshRouteEvidence.blockedCandidate',
-              { node: nameOf(blocked.serverId) })}
-          </li>)}</ul>
-        </>}
-        {result.excludedCatchAll.length > 0 && <p style={line}>{t('mobileMeshRouteEvidence.catchAllExcluded', {
-          cidrs: result.excludedCatchAll.join(', '),
-        })}</p>}
-        {candidate && <details onToggle={revealOnToggle}>
-          <summary>{t('mobileMeshRouteEvidence.sourceDetails')}</summary>
-          <p style={line}>{t(`mobileMeshRouteEvidence.engaged.${['alwaysRouteSubnets', 'selected', 'ruleTargeted'].includes(candidate.engagedReason)
-            ? candidate.engagedReason : 'other'}`)}</p>
-          <p style={line}>{t('mobileMeshRouteEvidence.configured')}</p>
-          <Ranges values={candidate.configuredCidrs} emptyKey="mobileMeshRouteEvidence.noRanges" />
-          <p style={line}>{t('mobileMeshRouteEvidence.observed')}</p>
-          <Ranges values={candidate.observedHosts} emptyKey="mobileMeshRouteEvidence.noObservation" />
-          {candidate.referencedFile !== null && <p style={line}>{candidate.referencedFile.readError !== null
-            ? t('mobileMeshRouteEvidence.fileReadFailed')
-            : t('mobileMeshRouteEvidence.fileSampled', { time: candidate.referencedFile.sampledAtMs === null
-              ? t('mobileMeshRouteEvidence.timeUnknown') : new Date(candidate.referencedFile.sampledAtMs).toLocaleString() })}</p>}
-          {candidate.referencedFile?.cidrs && <Ranges values={candidate.referencedFile.cidrs} emptyKey="mobileMeshRouteEvidence.noRanges" />}
-        </details>}
-        {(result.unknownReasons.length > 0 || result.invalid.length > 0 || (candidate?.unknownReasons.length ?? 0) > 0) && <>
-          <h4 style={heading}>{t('mobileMeshRouteEvidence.uncertainReasons')}</h4>
-          <ul style={list}>{[...new Set([...result.unknownReasons, ...(candidate?.unknownReasons ?? [])])].map((reason) =>
-            <li key={reason}>{reasonText(t, reason)}</li>)}
-          {result.invalid.map((cidr, index) => <li key={`${cidr}:${index}`}><span style={mono}>{cidr}</span> · {t('mobileMeshRouteEvidence.invalid')}</li>)}</ul>
-        </>}
-      </section>;
+      return <details key={result.serverId} style={{ marginBottom: 12, overflowWrap: 'anywhere' }} onToggle={revealOnToggle}>
+        <summary style={heading}>{nameOf(result.serverId)}</summary>
+        <div style={detailBody}>
+          <p style={line}>{contextMismatch
+            ? t('mobileMeshRouteEvidence.runningResult', { result: t(noPrivateRanges
+              ? 'mobileMeshRouteEvidence.noRequested' : `mobileMeshRouteEvidence.coverage.${result.coverage}`) })
+            : t(noPrivateRanges ? 'mobileMeshRouteEvidence.noRequested' : `mobileMeshRouteEvidence.coverage.${result.coverage}`)}</p>
+          {!noPrivateRanges && !loaded && <p style={line}>{t('mobileMeshRouteEvidence.coverageCaveat')}</p>}
+          {candidate && <p style={line}>{t(`mobileMeshRouteEvidence.leg.${candidate.leg}`)} · {candidate.generated
+            ? t('mobileMeshRouteEvidence.generated') : t('mobileMeshRouteEvidence.notGenerated')}</p>}
+          <h4 style={heading}>{t('mobileMeshRouteEvidence.requested')}</h4>
+          {result.requested.length === 0
+            ? <p style={line}>{t('mobileMeshRouteEvidence.noRequested')}</p>
+            : <ul style={list}>{result.requested.map(({ cidr, source }, index) =>
+              <li key={`${cidr}:${source}:${index}`}><span style={mono}>{cidr}</span> · {t(sourceKey(source))}</li>)}</ul>}
+          {!noPrivateRanges && <>
+            <h4 style={heading}>{t(loaded ? 'mobileMeshRouteEvidence.loadedRanges' : 'mobileMeshRouteEvidence.calculatedRanges')}</h4>
+            {result.effective === null
+              ? <p style={line}>{t('mobileMeshRouteEvidence.effectiveUnknown')}</p>
+              : <Ranges values={result.effective} emptyKey={loaded
+                ? 'mobileMeshRouteEvidence.zeroEffective' : 'mobileMeshRouteEvidence.zeroCalculated'} />}
+          </>}
+          {result.blockedBy.length > 0 && <>
+            <h4 style={heading}>{t('mobileMeshRouteEvidence.blockedTitle')}</h4>
+            <ul style={list}>{result.blockedBy.map((blocked, index) => <li key={`${blocked.serverId}:${blocked.cidr}:${index}`}>
+              <span style={mono}>{blocked.cidr}</span> · {t(loaded && blocked.confirmed &&
+                !result.requested.some((range) => range.source === 'bootstrap')
+                ? 'mobileMeshRouteEvidence.blockedConfirmed' : 'mobileMeshRouteEvidence.blockedCandidate',
+                { node: nameOf(blocked.serverId) })}
+            </li>)}</ul>
+          </>}
+          {result.excludedCatchAll.length > 0 && <p style={line}>{t('mobileMeshRouteEvidence.catchAllExcluded', {
+            cidrs: result.excludedCatchAll.join(', '),
+          })}</p>}
+          {candidate && <details onToggle={revealOnToggle}>
+            <summary>{t('mobileMeshRouteEvidence.sourceDetails')}</summary>
+            <p style={line}>{t(`mobileMeshRouteEvidence.engaged.${['alwaysRouteSubnets', 'selected', 'ruleTargeted'].includes(candidate.engagedReason)
+              ? candidate.engagedReason : 'other'}`)}</p>
+            <p style={line}>{t('mobileMeshRouteEvidence.configured')}</p>
+            <Ranges values={candidate.configuredCidrs} emptyKey="mobileMeshRouteEvidence.noRanges" />
+            <p style={line}>{t('mobileMeshRouteEvidence.observed')}</p>
+            <Ranges values={candidate.observedHosts} emptyKey="mobileMeshRouteEvidence.noObservation" />
+            {candidate.referencedFile !== null && <p style={line}>{candidate.referencedFile.readError !== null
+              ? t('mobileMeshRouteEvidence.fileReadFailed')
+              : t('mobileMeshRouteEvidence.fileSampled', { time: candidate.referencedFile.sampledAtMs === null
+                ? t('mobileMeshRouteEvidence.timeUnknown') : new Date(candidate.referencedFile.sampledAtMs).toLocaleString() })}</p>}
+            {candidate.referencedFile?.cidrs && <Ranges values={candidate.referencedFile.cidrs} emptyKey="mobileMeshRouteEvidence.noRanges" />}
+          </details>}
+          {(result.unknownReasons.length > 0 || result.invalid.length > 0 || (candidate?.unknownReasons.length ?? 0) > 0) && <>
+            <h4 style={heading}>{t('mobileMeshRouteEvidence.uncertainReasons')}</h4>
+            <ul style={list}>{[...new Set([...result.unknownReasons, ...(candidate?.unknownReasons ?? [])])].map((reason) =>
+              <li key={reason}>{reasonText(t, reason)}</li>)}
+            {result.invalid.map((cidr, index) => <li key={`${cidr}:${index}`}><span style={mono}>{cidr}</span> · {t('mobileMeshRouteEvidence.invalid')}</li>)}</ul>
+          </>}
+        </div>
+      </details>;
     })}
     <details style={{ ...line, marginBottom: 12 }} onToggle={revealOnToggle}>
-      <summary>{t('mobileMeshRouteEvidence.reportNotes')}</summary>
-      <p style={line}>{t('mobileMeshRouteEvidence.layerBoundary')}</p>
-      <p style={line}>{t('mobileMeshRouteEvidence.singleDns')}</p>
-      <p style={line}>{t('mobileMeshRouteEvidence.precedingExceptions')}</p>
-      {s.precedingExceptions.length > 0 && <ul style={list}>{s.precedingExceptions.map((reason, index) =>
-        <li key={`${reason}:${index}`}>{reason === 'customRuleMayOverride'
-          ? t('mobileMeshRouteEvidence.customRule')
-          : reason === 'appRuleMayOverride'
-            ? t('mobileMeshRouteEvidence.appRule')
-            : t('mobileMeshRouteEvidence.otherException')}</li>)}</ul>}
+      <summary style={heading}>{t('mobileMeshRouteEvidence.reportNotes')}</summary>
+      <div style={detailBody}>
+        <p style={line}>{t('mobileMeshRouteEvidence.layerBoundary')}</p>
+        <p style={line}>{t('mobileMeshRouteEvidence.singleDns')}</p>
+        <p style={line}>{t('mobileMeshRouteEvidence.precedingExceptions')}</p>
+        {s.precedingExceptions.length > 0 && <ul style={list}>{s.precedingExceptions.map((reason, index) =>
+          <li key={`${reason}:${index}`}>{reason === 'customRuleMayOverride'
+            ? t('mobileMeshRouteEvidence.customRule')
+            : reason === 'appRuleMayOverride'
+              ? t('mobileMeshRouteEvidence.appRule')
+              : t('mobileMeshRouteEvidence.otherException')}</li>)}</ul>}
+      </div>
     </details>
   </div>;
 }

@@ -29,7 +29,7 @@ export function renderCoexFacts(
       <b>{label}: </b>
       {value.status === 'known' ? show(value.value) : <>
         <span>{t('settings.coex.unknown')}</span>
-        <details onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
+        <details onToggle={revealOnToggle}><summary className="coex-reason">{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
       </>}
     </div>
   );
@@ -44,7 +44,7 @@ export function renderCoexFacts(
         {known.length === 0 ? <div>{t('settings.coex.observedEmpty')}</div> : <>
           <div>{t('settings.coex.displayed')}: {start + 1}–{Math.min(start + PAGE_SIZE, known.length)} / {known.length}</div>
           <ol start={start + 1}>{known.slice(start, start + PAGE_SIZE).map((row, index) => <li key={start + index}>{show(row)}</li>)}</ol>
-          {known.length > PAGE_SIZE && <div>
+          {known.length > PAGE_SIZE && <div className="coex-fact-pages">
             <button type="button" className="btn ghost sm" disabled={page === 0} onClick={() => paginate(field, page - 1)}>{t('settings.coex.previous')}</button>
             <button type="button" className="btn ghost sm" disabled={start + PAGE_SIZE >= known.length} onClick={() => paginate(field, page + 1)}>{t('settings.coex.next')}</button>
           </div>}
@@ -65,11 +65,11 @@ export function renderCoexFacts(
     {fact(t('settings.coex.interfaces'), snapshot.objects, (objects) => <>
       <span>{t('settings.coex.total')}: {objects.length}</span>
       {objects.length === 0 && <div>{t('settings.coex.observedEmpty')}</div>}
-      {objects.map((object, index) => <details key={index} open={expanded === index} data-coex-interface onToggle={revealOnToggle}>
+      {objects.map((object, index) => <details key={index} className="tun-details" open={expanded === index} data-coex-interface onToggle={revealOnToggle}>
         <summary onClick={(event) => { event.preventDefault(); select(expanded === index ? null : index); }}>
           <span className="mono">{object.interface}</span>
         </summary>
-        {expanded === index && <>
+        {expanded === index && <div className="tun-details-body">
           {fact(t('settings.coex.tunnel'), object.tunnel, boolean)}
           {fact(t('settings.coex.virtualization'), object.virtualization, boolean)}
           {fact(t('settings.coex.identity'), object.stableIdentity, (id) => id === null ? t('settings.coex.noIdentity') : <span className="mono">{id}</span>)}
@@ -87,7 +87,7 @@ export function renderCoexFacts(
             {fact(t('settings.coex.selector'), row.selectorScope, (v) => v.kind === 'global' ? t('settings.coex.global') : <>{t('settings.coex.limited')}: <span className="mono">{v.selector}</span></>)}
             {fact(t('settings.coex.association'), row.appliesToObject, boolean)}
           </>)}
-        </>}
+        </div>}
       </details>)}
     </>)}
   </div>;
@@ -170,23 +170,25 @@ export function CoexSnapshotBlock() {
   };
   const snapshot = state?.report.status === 'known' ? state.report.value.snapshot : null;
   const loading = state?.activity === 'running' || state?.activity === 'runningWithPending';
-  return <section data-coex-snapshot aria-label={t('settings.coex.title')} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
-    <SetBlock header={<span className="sr-title">
-      <span>{t('settings.coex.title')}</span>
-      <InfoIcon tip={t('settings.coex.hint')} />
-    </span>}>
+  return <section data-coex-snapshot aria-label={t('settings.coex.title')}>
+    <SetBlock className="tun-report" header={<div className="tun-report-heading">
+      <span className="sr-title">
+        <span>{t('settings.coex.title')}</span>
+        <InfoIcon tip={t('settings.coex.hint')} />
+      </span>
       <button type="button" className="btn ghost sm" onClick={() => { void collect(); }} disabled={!state && !error}>
         {loading ? t('settings.coex.loading') : error || snapshot?.schemaVersion === 2 ? t('settings.coex.retry') : t('settings.coex.collect')}
       </button>
+    </div>}>
       <div className="card-sub" role="status" aria-live="polite">
         {error ? t('settings.coex.unavailable') : state ? t(`settings.coex.${state.freshness}`) : t('settings.coex.notCollected')}
         {state && state.activity !== 'idle' ? ` · ${t('settings.coex.busy')}` : null}
         {state?.pending.status === 'known' ? ` · ${t('settings.coex.queued')}` : null}
       </div>
-      {state?.reason.status === 'known' && state.freshness !== 'latest' && <details className="card-sub" onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary>{t(`settings.coex.runtimeReasons.${state.reason.value.code}`)}</details>}
+      {state?.reason.status === 'known' && state.freshness !== 'latest' && <details className="card-sub" onToggle={revealOnToggle}><summary className="coex-reason">{t('settings.coex.reason')}</summary>{t(`settings.coex.runtimeReasons.${state.reason.value.code}`)}</details>}
       {error && <div className="card-sub" role="alert">
         {error.malformed ? t('settings.coex.malformed') : t('settings.coex.failed')}
-        <details onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary><span className="mono">{error.detail}</span></details>
+        <details onToggle={revealOnToggle}><summary className="coex-reason">{t('settings.coex.reason')}</summary><span className="mono">{error.detail}</span></details>
       </div>}
       {snapshot && renderCoexFacts(snapshot, (key) => t(key), expanded, pages,
         (index) => { setExpanded(index); setPages(FIRST_PAGES); },

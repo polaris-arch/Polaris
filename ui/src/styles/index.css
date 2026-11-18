@@ -1760,19 +1760,34 @@ body:has(.pending-bar.show) #toast-stack{
  * ⚠️ **未做视觉验收**：本条是按既有语汇做的结构对齐，没有在真机上逐档看过浅色/深色两套的实际观感。
  * 下一轮真机时补一次目视确认。 */
 .tun-details{ border:1px solid hsl(var(--line)); border-radius:var(--r-sm); overflow:hidden; }
-.tun-details summary{ display:flex; padding:9px 11px; background:hsl(var(--surface-2)/0.5); color:hsl(var(--fg-dim)); }
-.tun-details[open] summary{ color:hsl(var(--fg)); border-bottom:1px solid hsl(var(--line)); }
+.tun-details > summary{ display:flex; padding:9px 11px; background:hsl(var(--surface-2)/0.5); color:hsl(var(--fg-dim)); }
+.tun-details > summary::before{ flex:none; transform:none; }
+.tun-details[open] > summary{ color:hsl(var(--fg)); border-bottom:1px solid hsl(var(--line)); }
+.tun-details[open] > summary::before{ transform:rotate(90deg); }
 .tun-details-body{ margin-top:0; padding:11px; }
 
-/* Saved-config mesh settlement: compact per-node rows inside a native keyboard-accessible details. */
-.mesh-route-heading{ display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; }
-.tun-details.mesh-route-details{ margin-top:10px; }
-.mesh-route-nodes{ list-style:none; padding:4px 11px 11px; margin:0; display:flex; flex-direction:column; gap:10px; }
-.mesh-route-nodes > li{ border-top:1px solid hsl(var(--line)); padding-top:8px; min-width:0; }
-.mesh-route-node-title{ display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 8px; font-size:11.5px; }
+.tun-report{ display:grid; gap:8px; min-width:0; padding-bottom:14px; overflow-wrap:anywhere; }
+.tun-report > .set-block-h{ margin-bottom:0; padding-bottom:8px; }
+.tun-report-heading{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px 12px; }
+.tun-report-heading > .btn{ flex:none; }
+.tun-report .tun-details{ margin:0; }
+.tun-report .tun-details > summary{ font-size:11.5px; }
+[data-coex-facts]{ display:grid; gap:8px; }
+[data-coex-snapshot] .coex-reason{
+  display:list-item; margin-top:4px; padding:0; background:none; border:0;
+  color:hsl(var(--fg-dim)); font:inherit; list-style:revert; cursor:pointer;
+}
+[data-coex-snapshot] .coex-reason::before{ content:none; }
+.coex-fact-pages{ display:flex; flex-wrap:wrap; gap:8px; }
+
+.tun-report > .mesh-route-warning{ margin:0; }
+.mesh-route-summary{ display:grid; gap:6px; }
+.mesh-route-nodes{ list-style:none; padding:11px; margin:0; display:grid; gap:6px; }
+.mesh-route-nodes > li{ min-width:0; }
+.mesh-route-node-title{ display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 8px; }
 .mesh-route-node-title b{ color:hsl(var(--fg)); }
+.mesh-route-node .cidr-eff-list{ margin-top:0; }
 .mesh-route-observation{ color:hsl(var(--fg-dim)); }
-.mesh-route-nodes .mono{ overflow-wrap:anywhere; }
 
 /* ── 导入弹窗的解析结果预览（#83）─────────────────────────────────────────────────────────
  * 后端一直在返回 `stats`（imported / unsupported / skipped / failed）与 `warnings`，

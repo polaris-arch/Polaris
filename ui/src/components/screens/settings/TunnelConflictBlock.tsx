@@ -76,15 +76,19 @@ function kindLabel(kind: TunnelConflictKind, t: TFunction): string {
 export interface TunnelConflictBlockProps {
   /** `null` = 还没拉到 / 拉取失败。与「探过了没冲突」同样不许混为一谈。 */
   report: TunnelConflictReport | null;
+  headerAction?: ReactNode;
 }
 
-export function TunnelConflictBlock({ report }: TunnelConflictBlockProps) {
+export function TunnelConflictBlock({ report, headerAction }: TunnelConflictBlockProps) {
   const { t } = useTranslation();
   return (
-    <SetBlock header={<span className="sr-title">
-      <span>{t('settings.tun.tunnelConflictBlock')}</span>
-      <InfoIcon tip={t('settings.tun.tunnelConflictHint')} />
-    </span>}>
+    <SetBlock className="tun-report" header={<div className="tun-report-heading">
+      <span className="sr-title">
+        <span>{t('settings.tun.tunnelConflictBlock')}</span>
+        <InfoIcon tip={t('settings.tun.tunnelConflictHint')} />
+      </span>
+      {headerAction}
+    </div>}>
       {report === null ? (
         <div className="card-sub">{t('settings.tun.tunnelConflictUnavailable')}</div>
       ) : report.status === 'notProbed' ? (
