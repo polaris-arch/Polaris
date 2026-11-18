@@ -602,87 +602,73 @@ pub fn merge_categories(
         result = Value::Object(Map::new());
     }
 
-    let cur_servers = servers(current).to_vec();
-    let bak_servers = servers(backup).to_vec();
-    let mut new_servers: Vec<Value> = Vec::new();
-
-    let take = |src: &[Value], cat: NodeCategory| -> Vec<Value> {
-        src.iter()
-            .filter(|s| classify_server(s) == cat)
-            .cloned()
-            .collect()
-    };
-
-    // manualNodes / meshNodes：各自整类替换 / 空跳过 / 未选保留
-    for cat in [NodeCategory::Manual, NodeCategory::Mesh] {
-        let cur_nodes = take(&cur_servers, cat);
-        let bak_nodes = take(&bak_servers, cat);
-        if !sel(cat.as_backup()) {
-            new_servers.extend(cur_nodes); // 未选：保留
-        } else if !bak_nodes.is_empty() {
-            new_servers.extend(bak_nodes); // 替换
-        } else {
-            new_servers.extend(cur_nodes); // 空跳过：保留 current
+    let mut new_servers = Vec::new();
+    for cat in [
+        NodeCategory::Manual,
+        NodeCategory::Mesh,
+        NodeCategory::Subscription,
+    ] {
+        let belongs = |server: &&Value| classify_server(server) == cat;
+        if sel(cat.as_backup()) {
+            let before = new_servers.len();
+            new_servers.extend(servers(backup).iter().filter(belongs).cloned());
+            // 订阅源和展开节点整类恢复；只有源或只有离线节点也算有数据。
+            let is_subscription = cat == NodeCategory::Subscription;
+            if new_servers.len() > before
+                || (is_subscription && arr_len(backup, "subscriptions") > 0)
+            {
+                if is_subscription {
+                    let subs = backup
+                        .get("subscriptions")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Array(Vec::new()));
+                    set(&mut result, "subscriptions", subs);
+                }
+                continue;
+            }
             skipped.push(cat.as_backup());
         }
-    }
-
-    // subscriptions：订阅源字段 + 订阅节点一体处理（离线也能恢复）
-    let cur_sub_nodes = take(&cur_servers, NodeCategory::Subscription);
-    let bak_sub_nodes = take(&bak_servers, NodeCategory::Subscription);
-    if sel(BackupCategory::Subscriptions) {
-        let has_data = arr_len(backup, "subscriptions") > 0 || !bak_sub_nodes.is_empty();
-        if has_data {
-            new_servers.extend(bak_sub_nodes);
-            let subs = backup
-                .get("subscriptions")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new()));
-            set(&mut result, "subscriptions", subs);
-        } else {
-            new_servers.extend(cur_sub_nodes); // 空跳过：保留
-            skipped.push(BackupCategory::Subscriptions);
-        }
-    } else {
-        new_servers.extend(cur_sub_nodes); // 未选：保留订阅节点 + result.subscriptions 已 = current
+        new_servers.extend(servers(current).iter().filter(belongs).cloned());
     }
     set(&mut result, "servers", Value::Array(new_servers));
 
-    // 流量规则独立整类替换；旧字段同步为回滚兼容镜像。
-    if sel(BackupCategory::CustomRules) {
+    if sel(BackupCategory::CustomRules) || sel(BackupCategory::DnsRules) {
         let normalized = normalize_policy_backup(backup);
-        let has_data = traffic_rule_len(&normalized) > 0 || arr_len(backup, "customRuleSets") > 0;
-        if has_data {
-            let policies = arr_or_empty(&normalized, "trafficRules");
-            set(&mut result, "trafficRules", policies.clone());
-            set(&mut result, "policyRules", policies.clone());
-            set(&mut result, "customRules", policies);
-            set(
-                &mut result,
-                "routeRuleOrder",
-                arr_or_empty(&normalized, "routeRuleOrder"),
-            );
-        } else {
-            skipped.push(BackupCategory::CustomRules);
+        // 流量规则独立整类替换；旧字段同步为回滚兼容镜像。
+        if sel(BackupCategory::CustomRules) {
+            let has_data =
+                traffic_rule_len(&normalized) > 0 || arr_len(backup, "customRuleSets") > 0;
+            if has_data {
+                let policies = arr_or_empty(&normalized, "trafficRules");
+                set(&mut result, "trafficRules", policies.clone());
+                set(&mut result, "policyRules", policies.clone());
+                set(&mut result, "customRules", policies);
+                set(
+                    &mut result,
+                    "routeRuleOrder",
+                    arr_or_empty(&normalized, "routeRuleOrder"),
+                );
+            } else {
+                skipped.push(BackupCategory::CustomRules);
+            }
         }
-    }
 
-    // DNS 规则拥有独立生命周期；旧共享备份先在内存中拆分再导入。
-    if sel(BackupCategory::DnsRules) {
-        let normalized = normalize_policy_backup(backup);
-        if dns_rule_len(&normalized) > 0 {
-            set(
-                &mut result,
-                "dnsRules",
-                arr_or_empty(&normalized, "dnsRules"),
-            );
-            set(
-                &mut result,
-                "dnsRuleOrder",
-                arr_or_empty(&normalized, "dnsRuleOrder"),
-            );
-        } else {
-            skipped.push(BackupCategory::DnsRules);
+        // DNS 规则拥有独立生命周期；旧共享备份先在内存中拆分再导入。
+        if sel(BackupCategory::DnsRules) {
+            if dns_rule_len(&normalized) > 0 {
+                set(
+                    &mut result,
+                    "dnsRules",
+                    arr_or_empty(&normalized, "dnsRules"),
+                );
+                set(
+                    &mut result,
+                    "dnsRuleOrder",
+                    arr_or_empty(&normalized, "dnsRuleOrder"),
+                );
+            } else {
+                skipped.push(BackupCategory::DnsRules);
+            }
         }
     }
 

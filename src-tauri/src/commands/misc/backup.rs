@@ -320,7 +320,7 @@ pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()
             log::warn!("[backup] import pick task join failed: {e}");
             ImportSource::ReadFailed
         });
-    let (parsed, file_path) = match source {
+    let (mut parsed, file_path) = match source {
         ImportSource::Cancelled => return Ok(ApiResponse::ok(json!({ "canceled": true }))),
         ImportSource::ReadFailed => {
             return Ok(ApiResponse::ok(
@@ -342,19 +342,27 @@ pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()
         .collect();
     let mesh_routing_owner_server_ids = mesh_routing_owner_dependencies(&parsed.config);
     let interface_names = import_interface_names().await;
-    let mut counts = serde_json::Map::new();
+    let counts: serde_json::Map<_, _> = available
+        .iter()
+        .map(|cat| {
+            (
+                cat.as_str().to_string(),
+                json!(count_category(&parsed.config, *cat)),
+            )
+        })
+        .collect();
     let mut unavailable_interface_bindings = serde_json::Map::new();
-    for cat in &available {
-        counts.insert(
-            cat.as_str().to_string(),
-            json!(count_category(&parsed.config, *cat)),
-        );
-        let mut preview = parsed.config.clone();
-        let missing = interface_names.as_ref().map_or(0, |names| {
-            sanitize_unavailable_interface_bindings(&mut preview, names, std::slice::from_ref(cat))
-        });
-        if missing > 0 {
-            unavailable_interface_bindings.insert(cat.as_str().to_string(), json!(missing));
+    if let Some(names) = interface_names {
+        // 预览独占这份配置。各类别清理各自的绑定，应用时会重新打开备份。
+        for cat in &available {
+            let missing = sanitize_unavailable_interface_bindings(
+                &mut parsed.config,
+                &names,
+                std::slice::from_ref(cat),
+            );
+            if missing > 0 {
+                unavailable_interface_bindings.insert(cat.as_str().to_string(), json!(missing));
+            }
         }
     }
     Ok(ApiResponse::ok(json!({
