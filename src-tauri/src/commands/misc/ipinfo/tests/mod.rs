@@ -119,6 +119,7 @@ async fn android_post_connect_reuses_an_early_success_and_keeps_the_late_retry()
     ] {
         let started = tokio::time::Instant::now();
         let mut starts = Vec::new();
+        let mut published = Vec::new();
         let (direct, proxy) = probe_post_connect_ipinfo(
             async {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -137,11 +138,17 @@ async fn android_post_connect_reuses_an_early_success_and_keeps_the_late_retry()
                     Ok(json!({ "ip": "192.0.2.2" }))
                 }
             },
+            |proxy| published.push((started.elapsed(), proxy.clone())),
         )
         .await;
         assert_eq!(direct.unwrap()["ip"], "192.0.2.1");
         assert_eq!(proxy["ip"], "192.0.2.2");
         assert_eq!(starts, expected_starts);
+        if early_success && early_delay < 5 {
+            assert_eq!(published, vec![(Duration::from_secs(early_delay), proxy)]);
+        } else {
+            assert!(published.is_empty());
+        }
         assert_eq!(started.elapsed(), Duration::from_secs(5));
     }
 }
@@ -904,9 +911,39 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
         "手点终态不得取消自动长热身排程"
     );
     let (landed, landed_seq) = begin_scheduled_probe(new_ticket, true).unwrap();
-    let final_frame =
-        commit_ipinfo_snapshot(landed, landed_seq, &snap_with_proxy("7.7.7.7", "SG")).unwrap();
-    assert!(final_frame["revision"].as_u64() > newer_pending["revision"].as_u64());
+    let status = ProxyStatus {
+        running: true,
+        ..Default::default()
+    };
+    let local = LocalHttpProxy {
+        port: 31002,
+        auth: None,
+        inbound: crate::runtime::proxy::LocalInbound::ProbeProxy,
+    };
+    let proxy = json!({ "ip": "7.7.7.7", "countryCode": "SG" });
+    let mut early = ipinfo_snapshot(&status, Some(&local), Some("fallback"), None, proxy.clone());
+    early["loading"] = json!(true);
+    let early_frame = commit_ipinfo_snapshot(landed, landed_seq, &early).unwrap();
+    assert!(early_frame["revision"].as_u64() > manual_frame["revision"].as_u64());
+    assert!(early_frame["direct"].is_null());
+    assert!(early_frame.get("error").is_none());
+    assert_eq!(early_frame["proxyReachability"], "reachable");
+    assert_eq!(early_frame["dohBlocked"], "fallback");
+    assert_eq!(peek_ipinfo_snapshot(), early_frame);
+    assert_eq!(cached_snapshot(), manual_frame);
+    assert_eq!(fresh_cached_snapshot(), Some(early_frame.clone()));
+
+    let complete = ipinfo_snapshot(
+        &status,
+        Some(&local),
+        Some("fallback"),
+        Some(Ok(json!({ "ip": "9.9.9.9", "countryCode": "CN" }))),
+        proxy,
+    );
+    let final_frame = commit_ipinfo_snapshot(landed, landed_seq, &complete).unwrap();
+    assert!(final_frame["revision"].as_u64() > early_frame["revision"].as_u64());
+    assert_eq!(final_frame["proxy"], early_frame["proxy"]);
+    assert_eq!(final_frame["direct"]["ip"], "9.9.9.9");
     assert_eq!(
         final_frame,
         peek_ipinfo_snapshot(),
@@ -915,17 +952,12 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
     assert!(finish_scheduled_probe(new_ticket).is_none());
 
     // 停核同步清代理并写缓存，旧在飞探测不能在新版后落地。
-    let (old_epoch, old_seq) = probe_start();
     let (stop_ticket, stopped) = declare_scheduled_refresh(0);
     assert!(stopped["proxy"].is_null());
     assert_eq!(stopped, peek_ipinfo_snapshot());
     assert_eq!(stopped, cached_snapshot());
     assert!(stopped["revision"].as_u64() > final_frame["revision"].as_u64());
-    assert!(!commit_test_snapshot(
-        old_epoch,
-        old_seq,
-        &snap_with_proxy("8.8.8.8", "HK")
-    ));
+    assert!(!commit_test_snapshot(landed, landed_seq, &complete));
     let (stop_epoch, stop_seq) = begin_scheduled_probe(stop_ticket, false).unwrap();
     let (_, restarted_pending) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
     assert!(

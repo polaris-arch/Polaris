@@ -68,7 +68,7 @@ const IPINFO_UNREACHABLE_RETRY_MAX_MS: u64 = 60_000;
 static IPINFO_STATE: OnceLock<Mutex<IpinfoState>> = OnceLock::new();
 
 struct IpinfoState {
-    /// 仅存真实终态，供非 force 的 TTL 短路；pending 不能毒化此缓存。
+    /// 仅存完整探测结果，供非 force 的 TTL 短路；部分结果只更新可见帧。
     cache: Option<Value>,
     /// 最近一次权威发布帧。事件、peek 与手动响应复用其中的 revision。
     visible: Value,
@@ -308,7 +308,8 @@ fn commit_ipinfo_snapshot(epoch: u64, seq: u64, snap: &Value) -> Option<Value> {
     if !ipinfo_probe_is_current(epoch, seq) {
         return None;
     }
-    Some(state.publish(snap.clone(), true))
+    let complete = snap.get("loading").and_then(Value::as_bool) != Some(true);
+    Some(state.publish(snap.clone(), complete))
 }
 
 struct ManualIpinfoBinding<'a, G> {
@@ -658,6 +659,7 @@ where
 async fn probe_post_connect_ipinfo<D, P, PFut>(
     direct: D,
     mut proxy: P,
+    on_early_proxy: impl FnOnce(&Value),
 ) -> (Result<Value, String>, Value)
 where
     D: std::future::Future<Output = Result<Value, String>>,
@@ -670,7 +672,13 @@ where
     let (direct, early_proxy) = tokio::select! {
         biased;
         direct = &mut direct => (direct, None),
-        proxy = proxy() => (direct.await, proxy.ok()),
+        proxy = proxy() => {
+            let proxy = proxy.ok();
+            if let Some(value) = &proxy {
+                on_early_proxy(value);
+            }
+            (direct.await, proxy)
+        },
     };
     let proxy = match early_proxy {
         Some(value) => value,
@@ -709,6 +717,7 @@ async fn build_ipinfo_snapshot(
     local_proxy: Option<&LocalHttpProxy>,
     doh_blocked: Option<&'static str>,
     post_connect: bool,
+    publish_early: impl FnOnce(&Value),
 ) -> Value {
     let direct = with_ipinfo_retry(
         || fetch_ipip_ipinfo(direct_http),
@@ -720,7 +729,7 @@ async fn build_ipinfo_snapshot(
     let (direct, proxy) = if let Some(lp) = local_proxy.filter(|_| status.running) {
         match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
             Ok(p) if post_connect && cfg!(target_os = "android") => {
-                probe_post_connect_ipinfo(direct, || fetch_trace_ipinfo(&p)).await
+                probe_post_connect_ipinfo(direct, || fetch_trace_ipinfo(&p), publish_early).await
             }
             Ok(p) => {
                 let (attempts, retry_ms) = if post_connect {
@@ -742,9 +751,20 @@ async fn build_ipinfo_snapshot(
     } else {
         (direct.await, Value::Null)
     };
+    ipinfo_snapshot(status, local_proxy, doh_blocked, Some(direct), proxy)
+}
+
+fn ipinfo_snapshot(
+    status: &ProxyStatus,
+    local_proxy: Option<&LocalHttpProxy>,
+    doh_blocked: Option<&'static str>,
+    direct: Option<Result<Value, String>>,
+    proxy: Value,
+) -> Value {
     let (direct, direct_err) = match direct {
-        Ok(value) => (value, None),
-        Err(error) => (Value::Null, Some(error)),
+        Some(Ok(value)) => (value, None),
+        Some(Err(error)) => (Value::Null, Some(error)),
+        None => (Value::Null, None),
     };
     let mut snap = json!({
         "direct": direct,
@@ -901,47 +921,55 @@ async fn probe_publish_ipinfo(
         doh_blocked,
         config,
     } = inputs;
+    let publish = |snap, warm_rtt| {
+        // 早到的代理帧和最终双腿帧走同一道闸；旧腿只读当前权威帧。
+        let Some(snap) = commit_ipinfo_snapshot(epoch, seq, &snap) else {
+            return (peek_ipinfo_snapshot(), false);
+        };
+        crate::events::broadcast(
+            app,
+            crate::events::channel::EVENT_IP_INFO_UPDATED,
+            snap.clone(),
+        );
+
+        // IP 先显、延迟后到。伴测沿用开探时的配置和世代/排程线，异步完成时再次验票。
+        let proxy_probed = snap.get("proxy").is_some_and(|v| !v.is_null());
+        if warm_rtt {
+            crate::commands::speedtest::spawn_warm_rtt_probe(
+                app,
+                &config,
+                proxy_probed,
+                status.running,
+                local_proxy.clone(),
+                epoch,
+                seq,
+            );
+        }
+        (snap, true)
+    };
+
+    let mut early_published = false;
     let snap = build_ipinfo_snapshot(
         http.as_ref(),
         &status,
         local_proxy.as_ref(),
         doh_blocked,
         post_connect,
+        |proxy| {
+            // 让代理结果立即可见，直连仍在检测，完整缓存保持不变。
+            let mut early = ipinfo_snapshot(
+                &status,
+                local_proxy.as_ref(),
+                doh_blocked,
+                None,
+                proxy.clone(),
+            );
+            early["loading"] = json!(true);
+            early_published = publish(early, true).1;
+        },
     )
     .await;
-
-    // 探测期间（含重试，最长 20s）可能已有更新的腿排上并落地。旧腿返回当前权威帧，
-    // 不把失效结果当作手动响应，也不污染缓存、广播或伴测。
-    let Some(snap) = commit_ipinfo_snapshot(epoch, seq, &snap) else {
-        return (peek_ipinfo_snapshot(), false);
-    };
-    crate::events::broadcast(
-        app,
-        crate::events::channel::EVENT_IP_INFO_UPDATED,
-        snap.clone(),
-    );
-
-    // FX-warmttfb 出口伴测：代理出口探测成功那刻（隧道已热）→ fire-and-forget 补测活跃出口 warm RTT + 广播
-    // EVENT_SPEED_TEST_RESULT，让切节点后 UI 延迟徽标自动刷新（对齐 上游 IpInfoService.onProxyProbeSuccess，
-    // 置于广播之后触发保「IP 先显、延迟后到」）。探测失败（proxy=null）/ 直连 / 核未运行 → 门控内不 fire。
-    // **延迟格是本腿的下游**：出口 IP 不自动探 ⇒ 伴测永不跑 ⇒ 延迟恒 `—`。两格同一条链、一次点亮。
-    //
-    // `epoch` + `seq` 一路传下去：伴测的 `serverId` 取自**开探时刻**的 config 快照，而测量本身是异步的
-    // （fire-and-forget，秒级）。中途起停 / 热切会换掉出口，不复查就把新出口的 RTT 记到旧节点 id 上
-    // —— 本批把伴测从「点一次才跑」改成「每次起停/热切都跑」后，这条路径的可达性显著上升。
-    // 两条判据都必须传：只传世代时，「更新的腿已排程但还在睡（尚未领号）」这一整个 4s 窗口里复查恒真。
-    let proxy_probed = snap.get("proxy").is_some_and(|v| !v.is_null());
-    crate::commands::speedtest::spawn_warm_rtt_probe(
-        app,
-        &config,
-        proxy_probed,
-        status.running,
-        local_proxy,
-        epoch,
-        seq,
-    );
-
-    (snap, true)
+    publish(snap, !early_published)
 }
 
 /// 收敛窗口占位快照：direct/proxy 双 null + `loading:true`。
