@@ -35,7 +35,7 @@ APP_ENTRY = re.compile(r'^(?:lib)?polaris(?:_lib)?(?:-[0-9a-f]{16}(?:\.|$)|\.|$)
 APPLE_RUST_BUILD_CODE_POLICY = 'polaris-apple-rust-build-code-v1'
 APPLE_RUST_UNRELATED_CODE = frozenset({
     'scripts/mobile-core/android_sdk.py',
-    'scripts/mobile-core/prepare-ndk-linux.py',
+    'scripts/mobile-core/prepare-ndk-linux.mjs',
 })
 
 

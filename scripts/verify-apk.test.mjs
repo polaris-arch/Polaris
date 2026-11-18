@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { fixtureZip } from './lib/formal-package-fixtures.mjs';
 
 import {
@@ -28,6 +33,48 @@ import {
 
 /** 夹具默认造缺省 ABI（arm64-v8a）的包；`ABI` 这个名字保留下来只是为了少改一堆现有用例。 */
 const ABI = DEFAULT_ABI;
+
+test('formal Android SDK preparation requires existing license and exact archive bytes', {
+  skip: process.platform !== 'linux',
+}, () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-ndk-admission-'));
+  const profile = fileURLToPath(new URL('./mobile-core/ndk-r30-linux.json', import.meta.url));
+  const policy = JSON.parse(readFileSync(profile));
+  const script = fileURLToPath(new URL('./mobile-core/prepare-ndk-linux.mjs', import.meta.url));
+  const sdk = join(fixture.path, 'sdk'), work = join(fixture.path, 'work');
+  const licenses = join(sdk, 'licenses'), license = join(licenses, policy.licenseId);
+  mkdirSync(licenses, { recursive: true });
+  mkdirSync(work, { mode: 0o700 });
+  const run = (...args) => {
+    const child = spawnSync(process.execPath, [script, '--profile', profile, '--sdk', sdk, ...args],
+      { encoding: 'utf8', timeout: 5000 });
+    assert.ifError(child.error);
+    return child;
+  };
+  const licenseOnly = '--check-license-only';
+  assert.equal(run(licenseOnly).status, 1);
+  assert.deepEqual(readdirSync(licenses), []);
+  writeFileSync(license, 'different-license\n');
+  assert.match(run(licenseOnly).stderr, /license is not already accepted/);
+  const accepted = policy.licenseSha1 + '\r\n';
+  writeFileSync(license, accepted);
+  assert.equal(run(licenseOnly).status, 0);
+  assert.equal(run(licenseOnly, work).status, 1);
+  assert.deepEqual(readdirSync(work), []);
+  const archive = join(fixture.path, 'unexpected.zip');
+  writeFileSync(archive, 'unexpected bytes');
+  const failed = run(work, archive);
+  assert.equal(failed.status, 1);
+  assert.equal(failed.stdout, '');
+  assert.match(failed.stderr, /archive size\/type differs/);
+  const target = join(work, 'polaris-mobile-ndk-' + policy.ndkRevision);
+  assert.deepEqual(readdirSync(target), []);
+  assert.match(run(work, archive).stderr, /retained formal NDK slot refused/);
+  const alias = join(fixture.path, 'work-alias');
+  symlinkSync(work, alias);
+  assert.match(run(alias, archive).stderr, /cannot be redirected/);
+  assert.equal(readFileSync(license, 'utf8'), accepted);
+});
 
 /**
  * `verify-apk.mjs` 的判据本体测试。

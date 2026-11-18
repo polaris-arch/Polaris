@@ -503,7 +503,7 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
              'scripts/mobile-core/apple-cache.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
              'scripts/mobile-core/transaction.py',
-             'scripts/mobile-core/prepare-ndk-linux.py',
+             'scripts/mobile-core/prepare-ndk-linux.mjs',
              'scripts/mobile-core/ndk-r30-linux.json',
              'scripts/mobile-core/android-source.py', 'scripts/apple-carrier.py')
 ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v2'
@@ -525,14 +525,19 @@ def android_build_code(identity, policy=ANDROID_BUILD_CODE_POLICY):
     """One reviewed projection for cache lookup and reuse, never provenance."""
     require(policy == ANDROID_BUILD_CODE_POLICY, 'unknown Android build code policy')
     files = identity.get('files') if isinstance(identity, dict) else None
-    require(isinstance(files, dict) and set(PRODUCER_FILES) <= set(files),
+    require(isinstance(files, dict), 'original producer code inventory is missing')
+    missing = set(PRODUCER_FILES) - files.keys()
+    # Retained receipts can describe the previous installer. Keep its exact
+    # file pin so migration causes a cache miss and the old pair is preserved.
+    require(not missing or (missing == {'scripts/mobile-core/prepare-ndk-linux.mjs'}
+                            and 'scripts/mobile-core/prepare-ndk-linux.py' in files),
             'complete original producer code inventory required')
     for name, pin in files.items():
         require(isinstance(name, str) and isinstance(pin, dict) and set(pin) == {'bytes', 'sha256'} and
                 type(pin['bytes']) is int and pin['bytes'] > 0 and isinstance(pin['sha256'], str) and
                 re.fullmatch('[0-9a-f]{64}', pin['sha256']), 'producer code file pin differs')
     # Unknown extra files stay relevant; only these four Apple-only entries are
-    # omitted. The original nineteen-file identity is not edited or replaced.
+    # omitted. The original file inventory is not edited or replaced.
     return {'policy': policy, 'files': {name: pin for name, pin in files.items()
                                       if name not in ANDROID_UNRELATED_CODE}}
 

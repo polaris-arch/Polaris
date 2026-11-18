@@ -15,7 +15,7 @@ from artifacts import check_buildinfo, component_output_identity, framework_entr
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
-from producer import compiler_fact, equivalent_binding, executable_driver_identity
+from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
 from transaction import install, recover
 import artifacts
 from producer import write_json
@@ -920,6 +920,17 @@ class FormalOutputs(unittest.TestCase):
         current['producer']['files']['code']['sha256'] = 'changed'
         self.assertFalse(equivalent_binding(original, current))
 
+        original['platform'] = 'android'
+        original['producer']['files'] = {name: {'bytes': 4, 'sha256': '1' * 64} for name in PRODUCER_FILES}
+        current = deepcopy(original)
+        current['producer']['candidate'] = 'new'
+        self.assertTrue(equivalent_binding(original, current))
+        inventory = original['producer']['files']
+        inventory['scripts/mobile-core/prepare-ndk-linux.py'] = inventory.pop('scripts/mobile-core/prepare-ndk-linux.mjs')
+        before = deepcopy(original)
+        self.assertFalse(equivalent_binding(original, current))
+        self.assertEqual(original, before)
+
     def test_pair_validation_failure_restores_both_original_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1115,11 +1126,11 @@ class FormalOutputs(unittest.TestCase):
                             'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
                             'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']]:
                         return ''
-                    installer = [str(ROOT / 'scripts/mobile-core/prepare-ndk-linux.py'), '--profile',
+                    installer = ['node', str(ROOT / 'scripts/mobile-core/prepare-ndk-linux.mjs'), '--profile',
                                  str(ROOT / value['android']['ndkArchivePath']), '--sdk', str(sdk)]
-                    if command[1:] == installer + ['--check-license-only']:
+                    if command == installer + ['--check-license-only']:
                         return ''
-                    if command[1:] == installer + [str(root)]:
+                    if command == installer + [str(root)]:
                         return str(ndk)
                     self.fail('unexpected external operation: ' + repr(command))
 

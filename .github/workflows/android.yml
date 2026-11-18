@@ -373,7 +373,7 @@ jobs:
             src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
-          python3 scripts/mobile-core/prepare-ndk-linux.py --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
+          node scripts/mobile-core/prepare-ndk-linux.mjs --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
           libbox_platform="$(node -p 'require("./scripts/mobile-core/source-contract.json").android.bootclasspath.platform')"
           "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform" </dev/null
 
@@ -862,7 +862,7 @@ jobs:
             src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
-          python3 scripts/mobile-core/prepare-ndk-linux.py --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
+          node scripts/mobile-core/prepare-ndk-linux.mjs --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
           libbox_platform="$(node -p 'require("./scripts/mobile-core/source-contract.json").android.bootclasspath.platform')"
           "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform" </dev/null
 
