@@ -82,7 +82,17 @@ fn open_absolute(path: &Path) -> io::Result<OwnedFd> {
     }
     Ok(fd)
 }
-fn open_locked(control: &OwnedFd, name: &str, exclusive: bool) -> io::Result<OwnedFd> {
+struct DirectoryLock(OwnedFd);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly share our open file description even
+        // with CLOEXEC. Release this locally owned lock before closing our fd.
+        let _ = rustix::io::retry_on_intr(|| fs::flock(&self.0, FlockOperation::Unlock));
+    }
+}
+
+fn open_locked(control: &OwnedFd, name: &str, exclusive: bool) -> io::Result<DirectoryLock> {
     let fd = fs::openat(
         control,
         name,
@@ -104,6 +114,7 @@ fn open_locked(control: &OwnedFd, name: &str, exclusive: bool) -> io::Result<Own
             FlockOperation::NonBlockingLockShared
         },
     )?;
+    let lock = DirectoryLock(fd);
     if !same(
         &fs::statat(control, name, AtFlags::SYMLINK_NOFOLLOW)?,
         device_id(&stat),
@@ -111,7 +122,7 @@ fn open_locked(control: &OwnedFd, name: &str, exclusive: bool) -> io::Result<Own
     ) {
         return Err(unknown());
     }
-    Ok(fd)
+    Ok(lock)
 }
 fn read_marker_at(control: &OwnedFd, name: &str) -> io::Result<DirectoryMarker> {
     let fd = fs::openat(
@@ -142,11 +153,11 @@ pub(crate) struct DirectoryLease {
     exclusive: bool,
     root: OwnedFd,
     control: OwnedFd,
-    _lock: OwnedFd,
+    _lock: DirectoryLock,
     #[cfg(any(target_os = "ios", test))]
     lifetime_name: String,
-    _admission: Option<OwnedFd>,
-    _selection_admission: Option<OwnedFd>,
+    _admission: Option<DirectoryLock>,
+    _selection_admission: Option<DirectoryLock>,
     marker_name: String,
     #[cfg(any(target_os = "ios", test))]
     stem: String,
@@ -164,7 +175,7 @@ impl DirectoryLease {
         #[cfg(not(target_os = "ios"))]
         Self::acquire_root(config, server_id, exclusive, "tailscale")
     }
-    fn admission(config: &Path, root_name: &str) -> io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+    fn admission(config: &Path, root_name: &str) -> io::Result<(OwnedFd, OwnedFd, DirectoryLock)> {
         let parent = open_absolute(config)?;
         match fs::mkdirat(&parent, root_name, Mode::RWXU) {
             Ok(()) => fs::fsync(&parent)?,
@@ -328,7 +339,7 @@ impl DirectoryLease {
         server_id: &str,
         exclusive: bool,
         root_name: &str,
-        selected: (OwnedFd, OwnedFd, OwnedFd),
+        selected: (OwnedFd, OwnedFd, DirectoryLock),
     ) -> io::Result<Self> {
         let raw_stem = format!(
             "sha256-{}",

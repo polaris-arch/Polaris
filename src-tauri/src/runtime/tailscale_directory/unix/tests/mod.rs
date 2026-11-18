@@ -1,7 +1,4 @@
 use super::*;
-// A child spawned while a parallel test holds a lease inherits that descriptor,
-// keeping its flock until exec. Spawning tests write-lock; lease tests read-lock.
-static SPAWN_EXCLUSION: std::sync::RwLock<()> = std::sync::RwLock::new(());
 fn acquire_physical(config: &Path, id: &str, exclusive: bool) -> io::Result<DirectoryLease> {
     DirectoryLease::acquire_root(config, id, exclusive, "tailscale-g4-v1")
 }
@@ -27,7 +24,6 @@ impl Drop for Fixture {
 }
 #[test]
 fn mapped_selection_preserves_legacy_and_never_creates_a_node_during_planning() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     assert_eq!(
         DirectoryLease::actual_directory(&fixture.0, "new").unwrap(),
@@ -47,7 +43,6 @@ fn mapped_selection_preserves_legacy_and_never_creates_a_node_during_planning() 
 }
 #[test]
 fn physical_intent_is_not_logical_alias_and_poison_revokes_every_retry() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     let lease = DirectoryLease::acquire_root(&fixture.0, "node", true, "tailscale-g4-v1").unwrap();
     lease.create_new().unwrap();
@@ -74,7 +69,6 @@ fn physical_intent_is_not_logical_alias_and_poison_revokes_every_retry() {
 }
 #[test]
 fn unsafe_open_domain_preserves_connections_without_minting_snapshot() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     let lease = DirectoryLease::acquire_root(&fixture.0, "node", true, "tailscale-g4-v1").unwrap();
     lease.create_new().unwrap();
@@ -101,7 +95,6 @@ fn child_shared_owner() {
 #[test]
 fn actual_child_process_lease_blocks_parent_until_release() {
     use std::io::BufRead;
-    let _spawn = SPAWN_EXCLUSION.write().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -123,14 +116,35 @@ fn actual_child_process_lease_blocks_parent_until_release() {
             break;
         }
     }
-    assert!(acquire_physical(&fixture.0, "node", true).is_err());
+    assert!(matches!(
+        acquire_physical(&fixture.0, "node", true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
     child.stdin.take().unwrap().write_all(b"release\n").unwrap();
     assert!(child.wait().unwrap().success());
     assert!(acquire_physical(&fixture.0, "node", true).is_ok());
 }
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_a_lease_unlocks_while_inherited_descriptors_remain_open() {
+    let fixture = Fixture::new();
+    fixture.create();
+    let lease = acquire_physical(&fixture.0, "node", true).unwrap();
+    // A fork copies these open descriptions until exec closes the inherited
+    // descriptors. Keep equivalent copies open without racing a child scheduler.
+    let inherited_admission =
+        rustix::io::fcntl_dupfd_cloexec(&lease._admission.as_ref().unwrap().0, 0).unwrap();
+    let inherited_lifetime = rustix::io::fcntl_dupfd_cloexec(&lease._lock.0, 0).unwrap();
+    assert!(matches!(
+        acquire_physical(&fixture.0, "node", true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    drop(lease);
+    acquire_physical(&fixture.0, "node", true).unwrap();
+    drop((inherited_admission, inherited_lifetime));
+}
 #[test]
 fn shared_owner_blocks_exclusive_retirement() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let shared = acquire_physical(&fixture.0, "node", false).unwrap();
@@ -140,7 +154,6 @@ fn shared_owner_blocks_exclusive_retirement() {
 }
 #[test]
 fn new_scope_epoch_invalidates_old_receipt_even_after_its_lease_exits() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let lease = acquire_physical(&fixture.0, "node", true).unwrap();
@@ -154,7 +167,6 @@ fn new_scope_epoch_invalidates_old_receipt_even_after_its_lease_exits() {
 }
 #[test]
 fn marked_deletion_is_idempotent_but_recreated_object_is_not_deleted() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let lease = acquire_physical(&fixture.0, "node", true).unwrap();
@@ -173,7 +185,6 @@ fn marked_deletion_is_idempotent_but_recreated_object_is_not_deleted() {
 }
 #[test]
 fn missing_or_replaced_stamp_never_authorizes_an_open_directory() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let lease = acquire_physical(&fixture.0, "node", true).unwrap();
@@ -186,7 +197,6 @@ fn missing_or_replaced_stamp_never_authorizes_an_open_directory() {
 }
 #[test]
 fn retiring_missing_stamp_never_moves_original_even_with_reused_inode() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let lease = acquire_physical(&fixture.0, "node", true).unwrap();
@@ -211,7 +221,6 @@ fn retiring_missing_stamp_never_moves_original_even_with_reused_inode() {
 }
 #[test]
 fn two_directory_batch_releases_admission_but_keeps_both_lifetimes_until_ack() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let second = acquire_physical(&fixture.0, "second", true).unwrap();
@@ -237,7 +246,6 @@ fn two_directory_batch_releases_admission_but_keeps_both_lifetimes_until_ack() {
 }
 #[test]
 fn final_unlink_crash_resumes_but_never_removes_new_content() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     let lease = acquire_physical(&fixture.0, "node", true).unwrap();
@@ -265,7 +273,6 @@ fn final_unlink_crash_resumes_but_never_removes_new_content() {
 }
 #[test]
 fn legacy_unmarked_directory_is_never_adopted() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     std::fs::create_dir(fixture.0.join("tailscale-g4-v1/node")).unwrap();
     let lease = acquire_physical(&fixture.0, "node", true).unwrap();
@@ -274,7 +281,6 @@ fn legacy_unmarked_directory_is_never_adopted() {
 }
 #[test]
 fn target_symlink_is_rejected_but_valid_special_ids_still_connect() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     for id in ["Node", "NÖDE", "no\u{0308}de", ".polaris-directory-control"] {
         // Each spelling is independently valid; case/Unicode aliases may name the
         // same directory on macOS and must not be created twice in one fixture.
@@ -290,7 +296,6 @@ fn target_symlink_is_rejected_but_valid_special_ids_still_connect() {
 }
 #[test]
 fn filesystem_case_and_unicode_aliases_share_the_original_lifetime_lock() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     for (original, alias) in [("Node", "node"), ("NÖDE", "NO\u{0308}DE")] {
         let lease = acquire_physical(&fixture.0, original, true).unwrap();
@@ -321,7 +326,6 @@ fn filesystem_case_and_unicode_aliases_share_the_original_lifetime_lock() {
 }
 #[test]
 fn replaced_target_is_legacy_connectable_but_not_bound_to_stale_marker() {
-    let _spawn = SPAWN_EXCLUSION.read().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     fixture.create();
     std::fs::rename(

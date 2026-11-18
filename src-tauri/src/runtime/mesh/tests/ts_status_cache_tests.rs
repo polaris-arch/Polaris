@@ -275,17 +275,18 @@ async fn bound_auth_projection_rejects_changed_revision_without_mutation() {
     std::fs::write(&file, auth_sealed()).unwrap();
     let expected: serde_json::Value = serde_json::from_slice(&auth_expected()).unwrap();
     let gate = mesh.tailscale_state_gate().await;
-    assert!(mesh
+    let error = mesh
         .tailscale_retire_auth_under_gate(
             "srv-1",
             &gate,
             None,
             polaris_mesh::tailscale_state::AuthProjectionProvenance::BoundFingerprint(
-                expected["profileFingerprint"].as_str().unwrap()
+                expected["profileFingerprint"].as_str().unwrap(),
             ),
-            Some(&"0".repeat(64))
+            Some(&"0".repeat(64)),
         )
-        .is_err());
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(std::fs::read(&file).unwrap(), auth_sealed());
     mesh.tailscale_retire_auth_under_gate(
         "srv-1",
@@ -298,17 +299,18 @@ async fn bound_auth_projection_rejects_changed_revision_without_mutation() {
     )
     .unwrap();
     let retired = std::fs::read(&file).unwrap();
-    assert!(mesh
+    let error = mesh
         .tailscale_retire_auth_under_gate(
             "srv-1",
             &gate,
             None,
             polaris_mesh::tailscale_state::AuthProjectionProvenance::BoundFingerprint(
-                expected["profileFingerprint"].as_str().unwrap()
+                expected["profileFingerprint"].as_str().unwrap(),
             ),
-            Some(&polaris_updater::sha256_hex(&retired))
+            Some(&polaris_updater::sha256_hex(&retired)),
         )
-        .is_err());
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(std::fs::read(&file).unwrap(), retired);
 }
 
