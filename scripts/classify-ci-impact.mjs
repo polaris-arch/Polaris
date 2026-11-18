@@ -601,6 +601,10 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
     why: 'Android 的临时核测速/系统接口拒绝分支会进入 APK 中的新 Rust cdylib；'
       + '需真编 Android 目标与重包，确认 cfg 分支、错误码和测速回执随产物发布，不能靠桌面测速测试代替。',
   },
+  'src-tauri/src/commands/misc/ipinfo.rs': {
+    why: 'Android 独有的连接后出口 IP 探测分支进入 APK 的 Rust cdylib；'
+      + '改动须触发 Android 编译和打包，自动探测时序由设备验收确认。',
+  },
   'src-tauri/gen/android/': {
     why:
       '入库的 Gradle 工程本体。`app/build.gradle.kts` 的 androidResources.ignoreAssetsPatterns 正是'
