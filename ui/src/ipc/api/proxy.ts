@@ -143,6 +143,10 @@ export const proxyApi = {
     return listen(IPC_CHANNELS.EVENT_PROXY_STOPPED, listener);
   },
 
+  onAndroidStatusChangedReady(listener: () => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_ANDROID_PROXY_STATUS_CHANGED, listener);
+  },
+
   /** 主进程各 emit 点 payload 形状不一，message 优先 / error 兜底。 */
   onError(
     listener: (data: {

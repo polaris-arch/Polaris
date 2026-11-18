@@ -605,6 +605,9 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
     why: 'Android 独有的连接后出口 IP 探测分支进入 APK 的 Rust cdylib；'
       + '改动须触发 Android 编译和打包，自动探测时序由设备验收确认。',
   },
+  'src-tauri/src/events.rs': {
+    why: 'Android 代理启停期间的状态重读事件由 APK 中的 Rust 运行时发出；改动须触发 Android 编译和打包。',
+  },
   'src-tauri/gen/android/': {
     why:
       '入库的 Gradle 工程本体。`app/build.gradle.kts` 的 androidResources.ignoreAssetsPatterns 正是'

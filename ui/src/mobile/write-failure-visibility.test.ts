@@ -154,6 +154,7 @@ const updateLegs = (src: string): RegExp[] => [
  */
 const READ_CALLS: readonly string[] = [
   'api.ipInfo.onUpdated',
+  'api.proxy.onAndroidStatusChangedReady',
   'unlockApi.onProgress',
   'unlockApi.onUpdated',
   'unlockApi.onInvalidated',

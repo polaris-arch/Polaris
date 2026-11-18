@@ -269,6 +269,7 @@ export const IPC_CHANNELS = {
   // 事件 (主进程 -> 渲染进程)
   EVENT_PROXY_STARTED: 'event:proxyStarted',
   EVENT_PROXY_STOPPED: 'event:proxyStopped',
+  EVENT_ANDROID_PROXY_STATUS_CHANGED: 'event:androidProxyStatusChanged',
   EVENT_PROXY_ERROR: 'event:proxyError',
   // runtime 生命周期结局（`{phase:'ready'|'stopped'|'failed', errorCode?, message?}`）。
   //

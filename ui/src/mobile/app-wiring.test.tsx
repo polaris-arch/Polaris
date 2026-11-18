@@ -92,6 +92,7 @@ let pendingRaw: unknown = { added: [], modified: [], removed: [], restartDeferre
 let vpnSnapshot: VpnStatusSnapshot = { connected: false, openConnect: [], openVpn: [] };
 
 const getStatusMock = vi.fn(async () => proxyStatus);
+const registerAndroidStatusMock = vi.fn(async (listener: () => void) => channel<void>('androidStatusChanged')(listener));
 const getPendingMock = vi.fn(async () => pendingRaw);
 const vpnGetStatusMock = vi.fn(async () => vpnSnapshot);
 const tailscaleStateExistsMock = vi.fn(async (_ids: string[]) => ({}) as Record<string, boolean>);
@@ -143,6 +144,7 @@ vi.mock('@/ipc', async () => ({
       getPendingChanges: () => getPendingMock(),
       onStarted: channel<void>('started'),
       onStopped: channel<void>('stopped'),
+      onAndroidStatusChangedReady: (listener: () => void) => registerAndroidStatusMock(listener),
       onLifecycle: channel<{ phase: string }>('lifecycle'),
       onLifecycleReady: async (fn: () => void) => channel('lifecycle')(fn),
       onStartedReady: async (fn: () => void) => channel('started')(fn),
@@ -283,6 +285,7 @@ beforeEach(() => {
   vpnSnapshot = { connected: false, openConnect: [], openVpn: [] };
   offSpy.mockClear();
   getStatusMock.mockClear();
+  registerAndroidStatusMock.mockClear();
   getPendingMock.mockClear();
   vpnGetStatusMock.mockClear();
   tailscaleStateExistsMock.mockClear();
@@ -331,6 +334,46 @@ describe('① 首帧水合：冷启动时核可能已经在跑，初值必须自
     expect(useAppStore.getState().pendingChanges.added).toEqual(['a']);
     expect(useVpnStatusStore.getState().connected).toBe(true);
     off();
+  });
+
+  it('Android 监听登记后读到起核中，晚到的关闭只更新连接态', async () => {
+    vi.stubGlobal('document', {
+      documentElement: { dataset: { mobileOs: 'android' } },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    let finishRegistration!: () => void;
+    registerAndroidStatusMock.mockImplementationOnce(async (listener) => {
+      await new Promise<void>((resolve) => { finishRegistration = resolve; });
+      return channel<void>('androidStatusChanged')(listener);
+    });
+    const off = startMobileAppWiring(t);
+    try {
+      expect(getStatusMock).not.toHaveBeenCalled();
+      proxyStatus = { running: false, starting: true };
+      emit('androidStatusChanged', undefined);
+      finishRegistration();
+      await settle();
+      expect(useAppStore.getState().proxyStatus).toEqual(proxyStatus);
+
+      proxyStatus = { running: true };
+      emit('lifecycle', { phase: 'ready' });
+      await settle();
+      expect(useAppStore.getState().proxyStatus).toEqual(proxyStatus);
+      const priorUnlock = useAppStore.getState().unlock;
+      const priorPendingReads = getPendingMock.mock.calls.length;
+
+      proxyStatus = { running: false };
+      emit('androidStatusChanged', undefined);
+      await settle();
+      expect(useAppStore.getState().proxyStatus).toEqual(proxyStatus);
+      expect(useAppStore.getState().unlock).toBe(priorUnlock);
+      expect(getPendingMock).toHaveBeenCalledTimes(priorPendingReads);
+    } finally {
+      off();
+      vi.unstubAllGlobals();
+    }
+    expect(bus.get('androidStatusChanged')?.size).toBe(0);
   });
 
   it('回前台重拉连接态，通知权限关闭仍能看到原生重连原因', async () => {

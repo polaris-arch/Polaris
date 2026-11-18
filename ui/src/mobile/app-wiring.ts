@@ -211,18 +211,29 @@ export function hydrateTailscaleStates(serverIds: readonly string[]): void {
  */
 export function startMobileAppWiring(t: WiringT): () => void {
   const store = () => useAppStore.getState();
-
-  /* ── ① 首帧水合 ─────────────────────────────────────────────────────────────
-     少这一拍，冷启动进来看到的是「未连接」，直到用户手动点一次启停或等满 30s 兜底。
-     Android 上这一档特别常见：VPN 服务是前台服务，进程被系统回收后 WebView 重建，核还在跑。 */
-  void store().refreshProxyStatus();
-  pullPendingChanges();
-
   const offs: Array<() => void> = [];
+  let live = true;
+
+  // Android can start or close its tunnel before the WebView finishes registering.
+  if (typeof document !== 'undefined' && document.documentElement?.dataset.mobileOs === 'android') {
+    const refreshStatus = () => {
+      if (live) void store().refreshProxyStatus();
+    };
+    void api.proxy.onAndroidStatusChangedReady(refreshStatus).then((off) => {
+      if (!live) {
+        off();
+        return;
+      }
+      offs.push(off);
+      refreshStatus();
+    }, refreshStatus);
+  } else {
+    void store().refreshProxyStatus();
+  }
+  pullPendingChanges();
 
   // The backend owns connection-triggered probes. force=true here would cancel its
   // longer post-connect IP warmup and start a second unlock run before debounce.
-  let live = true;
   offs.push(api.ipInfo.onUpdated((snapshot) => store().setIpInfo(snapshot)));
   let unlockFeedRevision = 0;
   offs.push(

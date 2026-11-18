@@ -35,6 +35,9 @@ pub mod channel {
     // 代理生命周期
     pub const EVENT_PROXY_STARTED: &str = "event:proxyStarted";
     pub const EVENT_PROXY_STOPPED: &str = "event:proxyStopped";
+    /// Android 界面重读代理状态的空载荷通知。
+    #[cfg(target_os = "android")]
+    pub const EVENT_ANDROID_PROXY_STATUS_CHANGED: &str = "event:androidProxyStatusChanged";
     pub const EVENT_PROXY_ERROR: &str = "event:proxyError";
     pub const EVENT_PROXY_INVALID_NODES: &str = "proxy:invalid-nodes";
     // R2 待应用差集 PUSH：`switch_mode` 落盘后单点推 `{added, modified}`。`modified` 由运行核快照与当前

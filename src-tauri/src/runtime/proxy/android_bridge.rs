@@ -794,8 +794,11 @@ mod handle {
                 tauri::ipc::Channel::new(|body| {
                     if let tauri::ipc::InvokeResponseBody::Json(json) = body {
                         if let Ok(event) = serde_json::from_str::<TerminalEvent>(&json) {
-                            if let Ok(mut state) = observation().lock() {
-                                state.observe(event);
+                            let advanced = observation()
+                                .lock()
+                                .is_ok_and(|mut state| state.observe(event));
+                            if advanced {
+                                super::publish_status_invalidation();
                             }
                         }
                     }
@@ -803,6 +806,18 @@ mod handle {
                 })
             })
             .clone()
+    }
+}
+
+/// Ask the Android WebView to reread the projected status.
+pub(super) fn publish_status_invalidation() {
+    #[cfg(target_os = "android")]
+    if let Some(plugin) = plugin() {
+        crate::events::broadcast(
+            plugin.app(),
+            crate::events::channel::EVENT_ANDROID_PROXY_STATUS_CHANGED,
+            (),
+        );
     }
 }
 

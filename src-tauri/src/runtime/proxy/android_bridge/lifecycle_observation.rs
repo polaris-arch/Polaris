@@ -62,14 +62,16 @@ impl Observation {
         true
     }
 
-    pub fn observe(&mut self, event: TerminalEvent) {
+    /// Returns whether the confirmed current run advanced to another terminal state.
+    pub fn observe(&mut self, event: TerminalEvent) -> bool {
         let target = AndroidExactTarget {
             run_id: event.run_id,
             birth_nonce: event.birth_nonce,
         };
         if !target.is_valid() {
-            return;
+            return false;
         }
+        let previous = self.current.as_ref().and_then(|run| run.terminal);
         for run in [&mut self.current, &mut self.pending].into_iter().flatten() {
             if run.id != target.run_id
                 || run.birth.as_ref().is_some_and(|b| b != &target.birth_nonce)
@@ -81,6 +83,7 @@ impl Observation {
                 run.terminal = Some(event.state);
             }
         }
+        self.current.as_ref().and_then(|run| run.terminal) != previous
     }
 
     pub fn target(&self) -> Option<AndroidExactTarget> {

@@ -279,9 +279,21 @@ impl ProxyLifecycleEvent {
 /// 在飞起核计数守卫：`start` 的任一出口（Ok / Err / `?` 早退 / panic 展开）都归还计数，
 /// 杜绝「计数卡死 → `ProxyStatus::starting` 永久为真 → 连接按钮永远显示成取消」。
 struct InflightGuard(Arc<AtomicU32>);
+impl InflightGuard {
+    fn begin(inflight: &Arc<AtomicU32>) -> Self {
+        let guard = Self(Arc::clone(inflight));
+        if guard.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            super::android_bridge::publish_status_invalidation();
+        }
+        guard
+    }
+}
+
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if self.0.fetch_sub(1, Ordering::SeqCst) == 1 {
+            super::android_bridge::publish_status_invalidation();
+        }
     }
 }
 
@@ -988,8 +1000,7 @@ impl ProxyRuntime {
         // stale 清扫本身就能停数秒（真机事故里正是它撞上杀不动的 root 孤儿），那段时间用户看到的是
         // 「转圈但 running:false」，托盘若据 running 决策就会在此叠第二次 start。Guard 的 Drop 保证
         // 下面 `?` 早退（清扫 → ROOT_ORPHAN_BLOCKED）也归还计数。
-        self.start_inflight.fetch_add(1, Ordering::SeqCst);
-        let inflight = InflightGuard(Arc::clone(&self.start_inflight));
+        let inflight = InflightGuard::begin(&self.start_inflight);
         // Freeze transient-login ownership before stale-process scanning. Without this gate a
         // transient child could be spawned before its PID is registered while the sweep scans it,
         // then be mistaken for an orphan at the exclusion check.
