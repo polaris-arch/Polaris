@@ -209,7 +209,7 @@ fn import_cancel_and_import_read_failure_stay_distinguishable() {
     assert_eq!(read_import_source(&gateway, None), ImportSource::Cancelled);
     assert_eq!(
         read_import_source(&gateway, Some(saf_file_path())),
-        ImportSource::ReadFailed,
+        ImportSource::Failed("readFailed"),
         "读不出来是 readFailed，不是 cancelled —— 两者混同正是本批修掉的缺陷"
     );
 }
@@ -405,5 +405,67 @@ fn backup_stream_parser_preserves_formats_and_errors() {
     assert_eq!(
         read_backup(&gateway, &desktop_target(&path)),
         Err("invalidFormat")
+    );
+}
+
+#[test]
+fn backup_export_uses_pretty_json_then_compact_json_at_the_limit() {
+    let mut backup = json!({"servers": []});
+    assert_eq!(encode_backup(&backup).unwrap(), "{\n  \"servers\": []\n}");
+
+    let overhead = r#"{"servers":[""]}"#.len();
+    backup["servers"] = Value::Array(vec![Value::String(
+        "x".repeat(MAX_BACKUP_BYTES as usize - overhead),
+    )]);
+    let encoded = encode_backup(&backup).unwrap();
+    assert_eq!(encoded.len(), MAX_BACKUP_BYTES as usize);
+    assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), backup);
+    drop(encoded);
+
+    backup["extra"] = Value::Bool(true);
+    assert_eq!(encode_backup(&backup), Err("fileTooLarge"));
+}
+
+#[test]
+fn backup_export_buffer_caps_growth_and_rejects_oversized_writes() {
+    use std::io::Write as _;
+
+    let limit = MAX_BACKUP_BYTES as usize;
+    let mut output = BackupBuffer(Vec::new());
+    let chunk = vec![b'x'; limit / 2 + 1];
+    output.write_all(&chunk).unwrap();
+    output.write_all(b"x").unwrap();
+    assert!(output.0.capacity() <= limit);
+    assert_eq!(
+        output.write_all(&chunk).unwrap_err().kind(),
+        io::ErrorKind::FileTooLarge
+    );
+    assert_eq!(output.0.len(), chunk.len() + 1);
+}
+
+#[test]
+fn backup_import_rejects_one_byte_over_the_limit_for_path_and_saf() {
+    use std::io::Write as _;
+
+    let dir = TestDir::new("polaris-backup-bound");
+    let path = dir.path().join("backup");
+    let gateway = RecordingGateway::new(path.clone());
+    let mut file = std::fs::File::create(&path).unwrap();
+    let document = br#"{"servers":[]}"#;
+    file.write_all(document).unwrap();
+    std::io::copy(
+        &mut std::io::repeat(b' ').take(MAX_BACKUP_BYTES - document.len() as u64),
+        &mut file,
+    )
+    .unwrap();
+    assert!(read_backup(&gateway, &desktop_target(&path)).is_ok());
+    file.write_all(b" ").unwrap();
+    assert_eq!(
+        read_import_source(&gateway, Some(saf_file_path())),
+        ImportSource::Failed("fileTooLarge")
+    );
+    assert_eq!(
+        read_apply_source(&gateway, path.to_str().unwrap()).unwrap_err(),
+        "fileTooLarge"
     );
 }

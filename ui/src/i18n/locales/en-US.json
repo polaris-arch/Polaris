@@ -2017,6 +2017,7 @@
       "serializeFailed": "Could not prepare the backup file",
       "writeFailed": "Could not write the backup file",
       "readFailed": "Could not read the backup file",
+      "fileTooLarge": "The backup exceeds the 16 MiB limit",
       "invalidFormat": "This is not a valid Polaris backup file",
       "invalidArgs": "Choose at least one category to restore",
       "sharedDependencyConflict": "The selected categories conflict with shared resources used by unselected categories. No changes were saved. Review your category selection and try again.",

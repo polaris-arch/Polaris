@@ -2017,6 +2017,7 @@
       "serializeFailed": "無法準備備份檔案",
       "writeFailed": "無法寫入備份檔案",
       "readFailed": "無法讀取備份檔案",
+      "fileTooLarge": "備份檔案超過 16 MiB 上限",
       "invalidFormat": "這不是有效的 Polaris 備份檔案",
       "invalidArgs": "請至少選擇一個要復原的類別",
       "sharedDependencyConflict": "所選類別與未選類別使用的共用資源衝突，未儲存任何變更。請檢查類別選擇後重試。",

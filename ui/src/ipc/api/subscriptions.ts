@@ -16,6 +16,7 @@ export type BackupErrorCode =
   | 'serializeFailed'
   | 'writeFailed'
   | 'readFailed'
+  | 'fileTooLarge'
   | 'invalidFormat'
   | 'invalidArgs'
   | 'sharedDependencyConflict'

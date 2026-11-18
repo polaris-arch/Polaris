@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::{self, BufReader, Read};
 use std::str::FromStr as _;
 
 use serde_json::{json, Value};
@@ -18,6 +19,8 @@ use polaris_store::backup::{
     parse_backup_value, pick_categories, sanitize_unavailable_interface_bindings, BackupCategory,
     BACKUP_CATEGORIES, BACKUP_FILE_VERSION, SHARED_DEPENDENCY_CONFLICT,
 };
+
+const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 把前端传来的类别串解析成枚举；空 / None → 全选。
 /// 未知类别忽略，以兼容版本差异。
@@ -120,6 +123,47 @@ fn finish_export(gateway: &dyn FileGateway, picked: Option<FilePath>, body: &str
     })
 }
 
+struct BackupBuffer(Vec<u8>);
+
+impl io::Write for BackupBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let limit = MAX_BACKUP_BYTES as usize;
+        if bytes.len() > limit - self.0.len() {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        let needed = self.0.len() + bytes.len();
+        if needed > self.0.capacity() {
+            // Grow geometrically without asking Vec to reserve beyond the limit.
+            let capacity = (self.0.capacity() * 2).max(needed).min(limit);
+            self.0.reserve_exact(capacity - self.0.len());
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_backup(backup: &Value) -> Result<String, &'static str> {
+    let mut output = BackupBuffer(Vec::new());
+    serde_json::to_writer_pretty(&mut output, backup)
+        .or_else(|error| {
+            if error.io_error_kind() != Some(io::ErrorKind::FileTooLarge) {
+                return Err(error);
+            }
+            // Compatibility projections can be much larger when indented.
+            output.0.clear();
+            serde_json::to_writer(&mut output, backup)
+        })
+        .map_err(|error| match error.io_error_kind() {
+            Some(io::ErrorKind::FileTooLarge) => "fileTooLarge",
+            _ => "serializeFailed",
+        })?;
+    String::from_utf8(output.0).map_err(|_| "serializeFailed")
+}
+
 /// Bare-path backups contain credentials: stage privately beside the destination,
 /// then publish a complete file. URI targets (including file URLs) keep provider semantics.
 fn write_backup(gateway: &dyn FileGateway, target: &FilePath, body: &str) -> Result<(), String> {
@@ -152,10 +196,8 @@ fn write_backup(gateway: &dyn FileGateway, target: &FilePath, body: &str) -> Res
 enum ImportSource {
     /// 用户按了取消。**只有这一种情形**才是取消（改动前 content URI 也会落到这里）。
     Cancelled,
-    /// 选中了，但读不出来。
-    ReadFailed,
-    /// 文件可读，但不是支持的 UTF-8 JSON 备份。
-    InvalidFormat,
+    /// 交给现有备份错误提示的稳定错误码。
+    Failed(&'static str),
     /// 已解析备份，外加回给前端的目标标识（`backup_import_apply` 拿它二次打开同一个文档）。
     Loaded {
         parsed: polaris_store::backup::ParsedBackup,
@@ -173,8 +215,7 @@ fn read_import_source(gateway: &dyn FileGateway, picked: Option<FilePath>) -> Im
             parsed,
             file_path: display_of(&target),
         },
-        Err("readFailed") => ImportSource::ReadFailed,
-        Err(_) => ImportSource::InvalidFormat,
+        Err(code) => ImportSource::Failed(code),
     }
 }
 
@@ -236,20 +277,18 @@ pub async fn backup_export(
         "config": picked,
     });
 
-    let default_name = format!("polaris-backup-{}.polaris-backup", today_yyyy_mm_dd());
-    let target = ask_save_path(&app, &default_name).await;
-    // 序列化仍在选完之后：用户按了取消就不必白跑一趟 pretty-print（与改动前次序一致）。
-    // 但 `target` 为 None **现在只意味着真取消**，不再兼任「content URI 转不出路径」。
-    if target.is_none() {
-        return Ok(ApiResponse::ok(backup_failure("cancelled")));
-    }
-    let body = match serde_json::to_string_pretty(&backup) {
-        Ok(s) => s,
+    // Android's create-document picker can allocate a destination before it
+    // returns. Validate the final bytes first so a failed export leaves no file.
+    let body = match tauri::async_runtime::spawn_blocking(move || encode_backup(&backup)).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(code)) => return Ok(ApiResponse::ok(backup_failure(code))),
         Err(e) => {
-            log::warn!("[backup] export serialization failed: {e}");
+            log::warn!("[backup] export serialization task join failed: {e}");
             return Ok(ApiResponse::ok(backup_failure("serializeFailed")));
         }
     };
+    let default_name = format!("polaris-backup-{}.polaris-backup", today_yyyy_mm_dd());
+    let target = ask_save_path(&app, &default_name).await;
     // URI 支的插件 I/O 是同步阻塞的、且上游拿不到 fd 时会 panic ⇒ 经 `with_picked_gateway_blocking`
     // 派线程（桌面路径同样派到阻塞池）。`JoinError` 不许 `unwrap()`：那会把 panic 变回一个永不
     // settle 的 promise，`BackupPage.tsx` 的 `setBusy(false)` 写在 `finally` 里，一起冻住。
@@ -299,7 +338,14 @@ fn read_backup(
     target: &FilePath,
 ) -> Result<polaris_store::backup::ParsedBackup, &'static str> {
     let file = open_picked_for_read(gateway, target).map_err(|_| "readFailed")?;
-    let value = serde_json::from_reader(std::io::BufReader::new(file)).map_err(|error| {
+    // The additional byte detects oversized documents from both files and SAF,
+    // even when the provider reports no size or the source grows during parsing.
+    let mut input = BufReader::new(file.take(MAX_BACKUP_BYTES + 1));
+    let value = serde_json::from_reader(&mut input);
+    if input.get_ref().limit() == 0 {
+        return Err("fileTooLarge");
+    }
+    let value = value.map_err(|error| {
         if error.is_io() {
             "readFailed"
         } else {
@@ -318,18 +364,13 @@ pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()
         .await
         .unwrap_or_else(|e| {
             log::warn!("[backup] import pick task join failed: {e}");
-            ImportSource::ReadFailed
+            ImportSource::Failed("readFailed")
         });
     let (mut parsed, file_path) = match source {
         ImportSource::Cancelled => return Ok(ApiResponse::ok(json!({ "canceled": true }))),
-        ImportSource::ReadFailed => {
+        ImportSource::Failed(code) => {
             return Ok(ApiResponse::ok(
-                json!({ "canceled": false, "errorCode": "readFailed" }),
-            ))
-        }
-        ImportSource::InvalidFormat => {
-            return Ok(ApiResponse::ok(
-                json!({ "canceled": false, "errorCode": "invalidFormat" }),
+                json!({ "canceled": false, "errorCode": code }),
             ))
         }
         ImportSource::Loaded { parsed, file_path } => (parsed, file_path),

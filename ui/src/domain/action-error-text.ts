@@ -36,6 +36,7 @@ export function backupErrorText(
     case 'serializeFailed': return t('backupImport.error.serializeFailed');
     case 'writeFailed': return t('backupImport.error.writeFailed');
     case 'readFailed': return t('backupImport.error.readFailed');
+    case 'fileTooLarge': return t('backupImport.error.fileTooLarge');
     case 'invalidFormat': return t('backupImport.error.invalidFormat');
     case 'invalidArgs': return t('backupImport.error.invalidArgs');
     case 'sharedDependencyConflict': return t('backupImport.error.sharedDependencyConflict');
