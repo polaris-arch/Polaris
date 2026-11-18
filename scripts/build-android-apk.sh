@@ -41,4 +41,16 @@ if [[ "$(tauri --version)" != "tauri-cli $cli_version" ]]; then
   exit 1
 fi
 cd "$repo_root"
+
+# Bind the default mobile config at the shared entry point, including calls outside CI.
+explicit_config=false
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    -c*|--config|--config=*) explicit_config=true; break ;;
+  esac
+done
+if ! "$explicit_config"; then
+  set -- --config "$repo_root/src-tauri/tauri.android.conf.json" "$@"
+fi
 exec tauri android build "$@"

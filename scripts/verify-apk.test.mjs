@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fixtureZip } from './lib/formal-package-fixtures.mjs';
@@ -74,6 +74,42 @@ test('formal Android SDK preparation requires existing license and exact archive
   symlinkSync(work, alias);
   assert.match(run(alias, archive).stderr, /cannot be redirected/);
   assert.equal(readFileSync(license, 'utf8'), accepted);
+});
+
+test('Android build entry passes its default config and preserves an explicit override', {
+  skip: process.platform !== 'linux',
+}, () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-android-config-'));
+  const script = fileURLToPath(new URL('./build-android-apk.sh', import.meta.url));
+  const config = fileURLToPath(new URL('../src-tauri/tauri.android.conf.json', import.meta.url));
+  const ndk = join(fixture.path, 'ndk');
+  const revision = readFileSync(new URL('./android-rust-ndk.version', import.meta.url), 'utf8').trim();
+  mkdirSync(join(ndk, 'build/cmake'), { recursive: true });
+  writeFileSync(join(ndk, 'source.properties'), `Pkg.Revision = ${revision}\n`);
+  writeFileSync(join(ndk, 'build/cmake/android.toolchain.cmake'), '');
+  const version = readFileSync(new URL('./tauri-cli.version', import.meta.url), 'utf8').trim();
+  writeFileSync(join(fixture.path, 'tauri'), `#!/usr/bin/env bash
+if [[ "$1" == --version ]]; then
+  printf '%s\n' "tauri-cli $TEST_TAURI_VERSION"
+else
+  printf '%s\n' "$@"
+fi
+`, { mode: 0o700 });
+  const env = { ...process.env, PATH: fixture.path + delimiter + process.env.PATH,
+    ANDROID_NDK_HOME: ndk, NDK_HOME: ndk, ANDROID_NDK_ROOT: ndk, TEST_TAURI_VERSION: version };
+  const args = ['--apk', '--split-per-abi', '--target', 'aarch64', '--ci'];
+  const override = '--config=custom.json';
+  for (const [input, expected] of [
+    [args, ['--config', config, ...args]],
+    [[...args, override], [...args, override]],
+    [[...args, '-c', 'custom.json'], [...args, '-c', 'custom.json']],
+    [[...args, '--', override], ['--config', config, ...args, '--', override]],
+  ]) {
+    const child = spawnSync('bash', [script, ...input], { env, cwd: fixture.path, encoding: 'utf8', timeout: 5000 });
+    assert.ifError(child.error);
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(child.stdout.trimEnd().split('\n'), ['android', 'build', ...expected]);
+  }
 });
 
 /**

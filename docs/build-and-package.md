@@ -211,8 +211,8 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
 `android.yml` 在桌面草稿通过后构建三个正式签名 APK：
 
 ```bash
-bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
-bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci
+bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci
 ```
 
 两次调用分别产出 `arm64Release` / `armRelease` 与 `universalRelease`；全部使用完整 Rust release

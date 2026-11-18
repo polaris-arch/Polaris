@@ -461,8 +461,7 @@ jobs:
           marker="$RUNNER_TEMP/release-stage1-start"
           touch "$marker"
           stage1_log="$RUNNER_TEMP/release-stage1.log"
-          if bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \
-              --config src-tauri/tauri.android.conf.json >"$stage1_log" 2>&1; then
+          if bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci >"$stage1_log" 2>&1; then
             echo '::error::unsigned release validation stage1 unexpectedly bypassed the signing guard'
             exit 1
           fi
@@ -1002,10 +1001,8 @@ jobs:
         run: |
           set -euo pipefail
           # Split APKs and the ARM-only universal are separate AGP flavors, all with full release settings.
-          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci \
-            --config src-tauri/tauri.android.conf.json
-          bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci \
-            --config src-tauri/tauri.android.conf.json
+          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci
+          bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci
 
           for abi in arm64-v8a armeabi-v7a; do
             jni="src-tauri/gen/android/app/src/main/jniLibs/$abi"

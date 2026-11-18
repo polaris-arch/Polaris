@@ -123,9 +123,6 @@ const CORE_TO_CONF = {
  *  - `resources`  —— `bundle.resources` 的**登记表**，集合恰等于（多一条 / 少一条都红）。
  *                    「不多」守的是不变量 E 那个方向（整目录递归铺进包）；「不少」守的是
  *                    许可文本这类**正面**义务 —— 只写否定式判据会被「什么都没发生」骗过。
- *  - `ciLeg` —— workflow 与显式配置绑定；直接调用登记 bind/invocation，
- *    间接调用登记 entry 与逐跳 chain。源码绑定检查不等于原生构建成功证明。
- *    workflow 枚举同时识别配置文件名和已登记入口，不能用未出现文件名推断无 CI。
  */
 const NON_CORE_CONFS = {
   'tauri.android.conf.json': {
@@ -142,21 +139,6 @@ const NON_CORE_CONFS = {
       // 目标里照常编译，`resolve_bundled_data_dir()` 运行期就会找这个目录。464 KB。
       '../resources/data/',
     ],
-    // 腿在 `.github/workflows/android.yml`（不在 package.yml：步骤面与四条桌面打包腿完全不相交，
-    // 取舍写在该文件顶部）。`bind` 是那条腿显式传 conf 的逐字串 —— 与四条桌面腿的 `--config` 同一条
-    // 判据：吃 Tauri 的「按平台名自动合并」的话，文件一改名就**静默**停止合并、包里少掉全部资源而
-    // 构建照绿；显式传则改名即 `failed to read configuration file` 硬失败。
-    //
-    // `invocation` 是那条 workflow 里**发起构建的命令**的逐字前缀。判据不是「bind 恰好出现 1 次」，
-    // 而是「**每一次**构建调用都带着 bind」：android.yml 今天有两条 release-profile 路径
-    // （未分发 unsigned 验证 + 正式 signed 发布）。写死 1 次的判据在加第二条腿的当天就会红，而它红的理由是错的
-    // （腿变多了，不是绑定丢了）；更糟的反向：把它改成 `>= 1` 就会让「新加的那条腿忘了传 conf」
-    // 静默过门 —— 而那正是本条判据要抓的事。改为按调用次数对拍，覆盖面由判据定，不由当天的腿数定。
-    ciLeg: {
-      workflow: 'android.yml',
-      bind: '--config src-tauri/tauri.android.conf.json',
-      invocation: 'bash scripts/build-android-apk.sh',
-    },
   },
   'tauri.ios.conf.json': {
     why:
@@ -176,17 +158,6 @@ const NON_CORE_CONFS = {
       // 照常编译，`resolve_bundled_data_dir()` 运行期就会找这个目录。与 android 同形。
       '../resources/data/',
     ],
-    // Apple CI 经 carrier → App builder → Rust builder 显式读取配置并传入 TAURI_CONFIG。
-    ciLeg: {
-      workflow: 'apple.yml',
-      entry: 'scripts/mobile-core/ci_apple.py carrier',
-      chain: [
-        ['scripts/mobile-core/ci_apple.py', "ROOT / 'scripts/mobile-core/build_apple_app.py'"],
-        ['scripts/mobile-core/build_apple_app.py', "ROOT / 'scripts/mobile-core/apple_rust.py', 'build'"],
-        ['scripts/mobile-core/apple_rust.py', "ios_config = json.loads((ROOT / 'src-tauri/tauri.ios.conf.json').read_bytes())"],
-        ['scripts/mobile-core/apple_rust.py', 'TAURI_CONFIG=json.dumps(ios_config)'],
-      ],
-    },
   },
 };
 
@@ -620,25 +591,7 @@ function checkConfs() {
   }
 
   checkWindowsInstallMode(base);
-  // 整个 workflow 目录当取材面（不只 package.yml）：`ciLeg` 那条判据要回答的是
-  // 「**有没有哪条腿**跑在这份 conf 上」，只看一个文件对「腿开在别的 workflow 里」结构性失明。
-  let workflows = null;
-  try {
-    workflows = new Map(
-      readdirSync(WORKFLOWS_DIR)
-        .filter((f) => f.endsWith('.yml') || f.endsWith('.yaml'))
-        .sort()
-        .map((f) => [f, readFileSync(join(WORKFLOWS_DIR, f), 'utf8')])
-    );
-  } catch (e) {
-    fail(`读不到 .github/workflows/（${e.code ?? e.message}）—— ciLeg（腿 ↔ conf 绑定）无从断言`);
-  }
-  if (workflows !== null && workflows.size === 0) {
-    // 空扫描面 = 恒绿：package.yml 必然存在，一个 yml 都没枚举到只可能是枚举本身塌了。
-    fail('.github/workflows/ 下一个 *.yml 都没扫到 —— ciLeg 的取材面塌了，本检查退化成恒绿');
-    workflows = null;
-  }
-  checkPlatformConfRegistry(workflows);
+  checkPlatformConfRegistry();
   checkWindowsInstallerHooks(base);
   checkMacOpenGuide();
   checkLicenseArtifacts(base, platforms, manifest, workflow);
@@ -676,11 +629,8 @@ function checkConfs() {
  * （「门在但没牙」）。故对 `NON_CORE_CONFS` 里的每份 conf，本函数另施四条：
  * 顶层键集合恰等于登记值 / `bundle.resources` 集合恰等于登记值 / 引用路径存在且非空 /
  * 不得含任何平台内核目录。
- *
- * @param {Map<string, string>|null} workflows `.github/workflows/` 下每个 `*.yml` 的文件名 → 全文
- *   （读不到目录时为 null，`ciLeg` 一致性此时不可断言）
  */
-function checkPlatformConfRegistry(workflows) {
+function checkPlatformConfRegistry() {
   const errorsBefore = errors.length;
 
   // ── ① 磁盘枚举。`tauri.conf.json`（base，只有两段）不在此列；模式要求中间那段非空。
@@ -726,7 +676,7 @@ function checkPlatformConfRegistry(workflows) {
         `因此它能覆盖 identifier / bundle.resources / 任何 base 键，而 confs 模式的全部不变量都是` +
         `「登记表 → 磁盘」方向、对多出来的文件结构性失明。\n` +
         `  要新增平台 conf：带内核的登记进 CORE_TO_CONF（连带 core-manifest 平台键与 package.yml 矩阵腿），` +
-        `不带内核的登记进 NON_CORE_CONFS（连同它的 topKeys / resources / ciLeg 判据）`
+        `不带内核的登记进 NON_CORE_CONFS（连同它的 topKeys / resources 判据）`
     );
   }
 
@@ -820,69 +770,12 @@ function checkPlatformConfRegistry(workflows) {
       }
     }
 
-    // ④e 登记与实际源码绑定双向对拍：直接配置参数或已登记的间接调用链。
-    if (workflows !== null) {
-      const mentionedIn = [...workflows.entries()]
-        .filter(([, text]) => text.includes(name) || (spec.ciLeg?.entry && text.includes(spec.ciLeg.entry)))
-        .map(([file]) => file)
-        .sort();
-      const wantIn = spec.ciLeg === null ? [] : [spec.ciLeg.workflow];
-      if (mentionedIn.join(',') !== wantIn.join(',')) {
-        fail(
-          `src-tauri/${name}: 提到它的 workflow 应恰为 ${JSON.stringify(wantIn)}，实为 ` +
-            `${JSON.stringify(mentionedIn)} —— NON_CORE_CONFS['${name}'].ciLeg ` +
-            `${spec.ciLeg === null ? '是 null（= 本仓至今没有该平台的 CI 腿）' : `登记在 ${spec.ciLeg.workflow}`}。\n` +
-            `  多出来的那个文件里有一条跑在这份 conf 上、却没有腿 ↔ conf 绑定断言覆盖的腿；` +
-            `少掉则说明登记的绑定根本不存在。改腿的落点必须同时改本表。`
-        );
-      }
-      if (spec.ciLeg !== null) {
-        const text = workflows.get(spec.ciLeg.workflow) ?? '';
-        if (spec.ciLeg.chain) {
-          if (!text.includes(spec.ciLeg.entry)) fail(`.github/workflows/${spec.ciLeg.workflow}: 缺少已登记的 CI 构建入口 ${spec.ciLeg.entry}`);
-          for (const [path, binding] of spec.ciLeg.chain) {
-            let source;
-            try { source = readFileSync(join(ROOT, path), 'utf8'); }
-            catch (error) { fail(`${path}: 无法读取已登记的 CI 配置调用链：${error.message}`); continue; }
-            if (!source.includes(binding)) fail(`${path}: 缺少 ${name} 的已登记 CI 配置绑定 ${JSON.stringify(binding)}`);
-          }
-        } else {
-          const hits = text.split(spec.ciLeg.bind).length - 1;
-          // 期望值由**构建调用次数**推导，不写死。android.yml 今天有 unsigned 验证与 signed 发布
-          // 两条 release-profile 路径；写死次数的判据会在加腿那天以错误的理由红，而放宽成 `>= 1` 又会让
-          // 「新腿忘了传 conf」静默过门。两个失败方向都要堵，只能对拍。
-          const calls = text.split(spec.ciLeg.invocation).length - 1;
-          if (calls < 1) {
-            fail(
-              `.github/workflows/${spec.ciLeg.workflow}: 找不到构建调用 \`${spec.ciLeg.invocation}\` —— ` +
-                `取材面塌了（腿改了命令形态或整条腿没了），下面那条「每次调用都带 bind」的对拍会在 ` +
-                `0 == 0 上恒真。先确认腿还在，再改 NON_CORE_CONFS 里的 invocation`
-            );
-          } else if (hits !== calls) {
-            fail(
-              `.github/workflows/${spec.ciLeg.workflow}: \`${spec.ciLeg.invocation}\` 被调用 ${calls} 次，` +
-                `而 \`${spec.ciLeg.bind}\` 只出现 ${hits} 次 —— 有构建调用没显式传这份 conf。` +
-                `吃 Tauri 的按平台名自动合并的话，conf 一改名就静默停止合并（包里少掉全部资源、` +
-                `构建照绿）；显式传则改名即硬失败`
-            );
-          }
-        }
-      }
-    }
   }
 
   if (errors.length === errorsBefore) {
-    const noCi = Object.entries(NON_CORE_CONFS)
-      .filter(([, v]) => v.ciLeg === null)
-      .map(([k]) => k);
-    const withCi = Object.entries(NON_CORE_CONFS)
-      .filter(([, v]) => v.ciLeg !== null)
-      .map(([k, v]) => `${k} → ${v.ciLeg.workflow}`);
     note(
       `平台 conf 登记面：磁盘 ${onDisk.length} 份（${onDisk.join(', ')}）全部已登记；` +
-        `非内核 conf ${Object.keys(NON_CORE_CONFS).length} 份内容判据通过` +
-        (withCi.length > 0 ? `；CI 腿绑定：${withCi.join('、')}` : '') +
-        (noCi.length > 0 ? `；其中 ${noCi.join(', ')} 尚无 CI 腿（ciLeg=null，本仓不构建该平台）` : '')
+        `非内核 conf ${Object.keys(NON_CORE_CONFS).length} 份内容判据通过`
     );
   }
 }

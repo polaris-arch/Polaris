@@ -215,8 +215,8 @@ Desktop sidecar downloads do not supply mobile bindings. The current common inpu
 After desktop draft checks, `android.yml` builds three signed release APKs:
 
 ```bash
-bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
-bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci
+bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci
 ```
 
 These build `arm64Release` / `armRelease` and `universalRelease`. Every flavor uses the full Rust release
