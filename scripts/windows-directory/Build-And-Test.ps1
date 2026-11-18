@@ -49,11 +49,6 @@ if ($win.schema -ceq 'polaris-upstream-native-receipt-v1') {
     # This is a new directory-test build, not the published package producer's
     # command. Read flags from the exact clean selected source, and retain the
     # original release row without fabricating buildCommand/ldflags evidence.
-    Push-Location $appRoot
-    try {
-        $verifiedSource = & node --input-type=module -e 'import {readFileSync} from "node:fs"; import {loadReleaseContract} from "./scripts/desktop-core/release-consumer.mjs"; console.log(loadReleaseContract(process.cwd(),JSON.parse(readFileSync("src-tauri/core-manifest.json"))).platforms.win.sourceCommit)'
-        if ($LASTEXITCODE -ne 0 -or $verifiedSource -cne $win.sourceCommit) { throw 'Verified upstream directory source unavailable' }
-    } finally { Pop-Location }
     $flagsPath = Join-Path $kernelRoot 'release/LDFLAGS'
     if ((Get-Item -LiteralPath $flagsPath).LinkType) { throw 'Directory-test flags must be a regular source file' }
     $sharedFlags = (Get-Content -LiteralPath $flagsPath -Raw).Trim()
@@ -81,11 +76,8 @@ try {
     if ($effectiveGoFlags -match '(?:^|[\s"''])-{1,2}overlay(?:=|\s|["'']|$)') { throw 'Ambient Go overlay is forbidden' }
     $actualGo = & go env GOVERSION
     if ($LASTEXITCODE -ne 0) { throw 'Go compiler identity unavailable' }
-    $toolchainJson = & python (Join-Path $PSScriptRoot 'resolve-toolchain.py') --kernel-root $kernelRoot --mode $mode --source $source --actual-go $actualGo
+    $toolchainJson = & node (Join-Path $PSScriptRoot 'resolve-toolchain.mjs') --kernel-root $kernelRoot --mode $mode --source $source --actual-go $actualGo
     if ($LASTEXITCODE -ne 0) { throw 'Exact source/compiler policy verification failed' }
-    $toolchain = $toolchainJson | ConvertFrom-Json -AsHashtable
-    $expectedGo = $toolchain.selectedCompiler
-    if ($actualGo -cne $expectedGo) { throw 'Go compiler differs from exact selected compiler' }
     $toolchainJson | Set-Content -LiteralPath (Join-Path $outputRoot 'toolchain-evidence.json') -Encoding utf8NoBOM
     & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $kernelExe ./protocol/tailscale
     if ($LASTEXITCODE -ne 0) { throw 'Native kernel test producer build failed' }

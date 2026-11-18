@@ -1150,7 +1150,7 @@ jobs:
         id: windows_directory_go
         shell: pwsh
         run: |
-          python scripts/windows-directory/resolve-toolchain.py --kernel-root .windows-directory-kernel --mode '${{ steps.windows_directory_source.outputs.mode }}' --source '${{ steps.windows_directory_source.outputs.source }}' --github-output $env:GITHUB_OUTPUT
+          node scripts/windows-directory/resolve-toolchain.mjs --kernel-root .windows-directory-kernel --mode '${{ steps.windows_directory_source.outputs.mode }}' --source '${{ steps.windows_directory_source.outputs.source }}' --github-output $env:GITHUB_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw 'Exact kernel compiler policy resolution failed' }
       - name: Setup exact kernel Go toolchain
         id: windows_directory_go_setup
