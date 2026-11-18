@@ -56,7 +56,7 @@ import { subscribeMobileSpeedTestProgress } from './use-mobile-speed-test';
  * | 助手可升级（`handleHelperUpgradeable`） | 不接 | 提权助手是桌面对象，Android 上没有这条腿 |
  * | 系统代理残留 | 不接 | 同 `useSystemProxyLivePolling`（无系统代理这个对象） |
  * | 无效节点（`onInvalidNodes`） | **已接**（2026-09-13，批 18） | ⚠️ 这一行**曾经**写着「不接」，理由是「移动端节点屏没有『标灰无效节点』这一格呈现（`setInvalidNodes` 在移动可达面上零读点）」—— 那句话是假的：`nodes/MobileNodesScreen.tsx` 一直在读 `invalidNodes` 并拿它算 `invalidNodeIndex`，`nodes/NodesScreenView.tsx` 也一直把理由渲染成常驻 `.mn-note`。真实形态是 W-23 那一档：**读点在、写入方一个都没有** ⇒「这个节点已失效」那一格恒不出现，不是坏了，是永远不会亮。这条账 2026-09-06 记在 `feed-register.test-support.ts` 的 `useAppStore.invalidNodes` 上，本批销掉 |
- * | 出口 IP（`onIpInfoUpdated` + peek） | **已接** | Rust 在起核后排程长热身检测；移动端在 app 级持续接事件，切页也不丢终态。手动按钮才调用 force |
+ * | 出口 IP（`onIpInfoUpdated` + peek） | **已接** | 应用级订阅就绪后读取当前快照，随后持续接收 Rust 起核后探测的结果。手动按钮才调用 force |
  * | 解锁检测三条订阅 + 冷水合 | **已接** | Rust 的 invalidate 会去抖自跑；app 级持续接 progress / updated / invalidated，切页也不丢终态 |
  * | `event:configChanged` → `loadConfig(true)` | **已在别处** | `config-sync.ts` |
  *
@@ -224,11 +224,6 @@ export function startMobileAppWiring(t: WiringT): () => void {
   // longer post-connect IP warmup and start a second unlock run before debounce.
   let live = true;
   offs.push(api.ipInfo.onUpdated((snapshot) => store().setIpInfo(snapshot)));
-  void api.ipInfo.peek().then((snapshot) => {
-    // The same backend revision orders cold hydration against any live event,
-    // including stop/restart frames with identical wall-clock timestamps.
-    if (live) store().setIpInfo(snapshot);
-  }).catch(() => {});
   let unlockFeedRevision = 0;
   offs.push(
     unlockApi.onProgress((progress) => {

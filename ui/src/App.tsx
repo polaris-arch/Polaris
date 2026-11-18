@@ -445,20 +445,8 @@ export default function App() {
   // 主窗漏订则多 webview 的状态栏 IP 各自停在自取的旧值、互不同步（这正是本仓 IP 不同步的根因）。
   // 交给 store 按后端 revision 接收，StatusBar 消费 store.ipInfo 随之收敛到同一真值。
   //
-  // 订阅之外还要 peek 一次水合（零探测读后端快照）：窗口重建时上一帧可能早已发过。
-  // 异步 peek 与事件的先后由 store 的权威 revision 排序，不能以空值或 updatedAt 推断新旧。
-  useEffect(() => {
-    const off = api.ipInfo.onUpdated((snap) => useAppStore.getState().setIpInfo(snap));
-    api.ipInfo
-      .peek()
-      .then((snap) => {
-        useAppStore.getState().setIpInfo(snap);
-      })
-      .catch(() => {
-        /* 非 Tauri（浏览器预览）忽略 */
-      });
-    return off;
-  }, []);
+  // 订阅就绪后读取当前快照；store 按后端 revision 合并水合与实时事件。
+  useEffect(() => api.ipInfo.onUpdated((snap) => useAppStore.getState().setIpInfo(snap)), []);
 
   // 测速结果数据面 —— 与下面的解锁数据面**同一个理由**：必须挂 app 级，不能挂业务屏。
   //

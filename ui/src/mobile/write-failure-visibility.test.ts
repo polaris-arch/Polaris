@@ -154,7 +154,6 @@ const updateLegs = (src: string): RegExp[] => [
  */
 const READ_CALLS: readonly string[] = [
   'api.ipInfo.onUpdated',
-  'api.ipInfo.peek',
   'unlockApi.onProgress',
   'unlockApi.onUpdated',
   'unlockApi.onInvalidated',

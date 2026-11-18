@@ -1,4 +1,4 @@
-import { invoke, listen } from '../ipc-client';
+import { invoke, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { IpInfoSnapshot } from '../../contracts/types';
 
@@ -17,7 +17,28 @@ export const ipInfoApi = {
     return invoke(IPC_CHANNELS.IP_INFO_GET, { peek: true });
   },
 
+  /** 先等事件登记完成，再零探测读快照，避免窗口重建时漏掉两者之间的更新。 */
   onUpdated(listener: (snap: IpInfoSnapshot) => void): () => void {
-    return listen(IPC_CHANNELS.EVENT_IP_INFO_UPDATED, listener);
+    let disposed = false;
+    let off: (() => void) | undefined;
+    const accept = (snapshot: IpInfoSnapshot) => {
+      if (!disposed) listener(snapshot);
+    };
+    const hydrate = () => {
+      if (!disposed) return ipInfoApi.peek().then(accept).catch(() => {});
+    };
+    void listenReady(IPC_CHANNELS.EVENT_IP_INFO_UPDATED, accept).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      off = unlisten;
+      return hydrate();
+    }, hydrate);
+    return () => {
+      disposed = true;
+      off?.();
+      off = undefined;
+    };
   },
 };

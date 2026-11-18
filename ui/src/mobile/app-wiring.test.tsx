@@ -53,6 +53,7 @@ import type { TaildropTaskSnapshot } from '@/contracts/taildrop';
 import * as ts from '@/test/ts-compiler';
 import { measurementFixture, measurementServer } from '@/store/measurement-fixture.test-support';
 import { configContentDigest } from '@/lib/staged-config';
+import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import type { MeasurementSnapshot } from '@/contracts/measurement-display';
 import {
   CALL_SITE_FIXTURE,
@@ -114,15 +115,29 @@ const exitProbeMock = vi.fn(async () => ({direct:null,proxy:null,updatedAt:1,rev
 const unlockCheckMock = vi.fn(async () => ({results:{},checkedAt:1,blockedReason:'not-running'}));
 const unlockGetMock = vi.fn(async (): Promise<UnlockSnapshot | null> => null);
 const ipPeekMock = vi.fn(async (): Promise<IpInfoSnapshot> => ({direct:null,proxy:null,updatedAt:0,revision:0}));
+const registerIpMock = vi.fn(async (handler: (snapshot: IpInfoSnapshot) => void) => channel<IpInfoSnapshot>('ipInfo')(handler));
 
-vi.mock('@/ipc', () => ({
+vi.mock('@/ipc/ipc-client', async (load) => {
+  const client = await load<typeof import('@/ipc/ipc-client')>();
+  return {
+    ...client,
+    invoke: (cmd: string, args?: Record<string, unknown>) => cmd === IPC_CHANNELS.IP_INFO_GET
+      ? args?.peek ? ipPeekMock() : exitProbeMock()
+      : client.invoke(cmd, args),
+    listenReady: (event: string, handler: (snapshot: IpInfoSnapshot) => void) => event === IPC_CHANNELS.EVENT_IP_INFO_UPDATED
+      ? registerIpMock(handler)
+      : client.listenReady(event, handler),
+  };
+});
+
+vi.mock('@/ipc', async () => ({
   unlockApi: {
     run: () => unlockCheckMock(), get: () => unlockGetMock(),
     onProgress: channel('unlockProgress'), onUpdated: channel('unlockUpdated'),
     onInvalidated: channel('unlockInvalidated'),
   },
   api: {
-    ipInfo: {get: () => exitProbeMock(), peek: () => ipPeekMock(), onUpdated: channel('ipInfo')},
+    ipInfo: (await import('@/ipc/api/ip-info')).ipInfoApi,
     proxy: {
       getStatus: () => getStatusMock(),
       getPendingChanges: () => getPendingMock(),
@@ -297,6 +312,7 @@ beforeEach(() => {
   unlockCheckMock.mockClear();
   unlockGetMock.mockClear();
   ipPeekMock.mockClear();
+  registerIpMock.mockClear();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1621,12 +1637,35 @@ describe('连接后检测由 Rust 排程，应用级事件跨页接收', () => {
     let resolvePeek!: (snapshot: IpInfoSnapshot) => void;
     ipPeekMock.mockImplementationOnce(() => new Promise((resolve) => { resolvePeek = resolve; }));
     const off = startMobileAppWiring(t);
+    await settle();
     const stopped: IpInfoSnapshot = { direct: null, proxy: null, updatedAt: 100, revision: 2, loading: false };
     emit('ipInfo', stopped);
     resolvePeek({ direct: null, proxy: null, updatedAt: 101, revision: 1, loading: true });
     await settle();
     expect(useAppStore.getState().ipInfo).toEqual(stopped);
     off();
+  });
+
+  it('等出口 IP 事件登记完成再水合，接住登记期间产生的结果', async () => {
+    let register!: () => void;
+    registerIpMock.mockImplementationOnce((handler) => new Promise((resolve) => {
+      register = () => resolve(channel<IpInfoSnapshot>('ipInfo')(handler));
+    }));
+    let current = ipFrame(1, true);
+    ipPeekMock.mockImplementationOnce(async () => current);
+    const off = startMobileAppWiring(t);
+    try {
+      await settle();
+      expect(ipPeekMock).not.toHaveBeenCalled();
+      current = ipFrame(2, false);
+      emit('ipInfo', current);
+      expect(useAppStore.getState().ipInfo).toBeNull();
+      register();
+      await settle();
+      expect(useAppStore.getState().ipInfo).toEqual(current);
+    } finally {
+      off();
+    }
   });
 
   it('同毫秒事件按后端版本前进；清空后仍拒绝旧帧和同版回填', async () => {
