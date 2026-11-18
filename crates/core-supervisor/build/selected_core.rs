@@ -285,11 +285,9 @@ fn emit_local_development() {
         root.join("scripts/desktop-core/local-development.mjs")
             .display()
     );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("scripts/desktop-core/local-development.py")
-            .display()
-    );
+    for name in ["inputs.json", "sing-box", "libcronet.so"] {
+        println!("cargo:rerun-if-changed={}", directory.join(name).display());
+    }
     println!(
         "cargo:rerun-if-changed={}",
         root.join("scripts/desktop-core/local-development-source.json")

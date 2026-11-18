@@ -5,8 +5,8 @@
   },
   "goVersion": "go1.27.4",
   "producerSource": {
-    "commit": "b7353dc605c5f47af77bd9c6758f9a4a586f09f2",
-    "tree": "b1ad39b2bfd30b295f8abdd7b8ccdb2eb8cb843a"
+    "commit": "28ba18a05ba6e198ff5d03b6e9c439d8e1c6aff2",
+    "tree": "d4583dd0edec170ce4defad870285402644545e2"
   },
   "schema": "polaris-local-development-source-v1",
   "sidecar": {

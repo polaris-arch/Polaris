@@ -26,7 +26,7 @@ else demand(!flags.has('helper-binary'), 'Helper override is only a producer anc
 const selection = flags.get('selection') ?? 'formal';
 if (selection === 'local-development') {
   demand(platform === 'linux' && !flags.has('helper-binary'), 'Local development selection is Linux-only');
-  prepareLocalInstallation(root, directory, mode);
+  await prepareLocalInstallation(root, directory, mode);
   console.log('Verified compiled local development installation');
   process.exit(0);
 }

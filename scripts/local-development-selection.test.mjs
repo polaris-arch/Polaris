@@ -11,7 +11,10 @@ import { fileURLToPath } from 'node:url';
 import { crc32 } from 'node:zlib';
 import { inspectFormalArtifact, inspectPortableZip, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
-import { LOCAL_MARKER, compilerSelectionSource, localReceipt, rejectLocalDistribution, prepareLocalInstallation } from './desktop-core/local-development.mjs';
+import {
+  LOCAL_MARKER, collectLocalSelection, compilerSelectionSource, localDirectory, localReceipt, prepareLocalInstallation,
+  rejectLocalDistribution, verifyLocalSelection,
+} from './desktop-core/local-development.mjs';
 import { selectedCoreManifest, writeSelectedCoreManifest } from './lib/core-identity.mjs';
 import { createHash } from 'node:crypto';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -30,8 +33,8 @@ test('removing local receipts cannot turn a compiled local Helper into a Formal 
   writeFileSync(join(stage, 'polaris-helper'), Buffer.concat([Buffer.from('owned-negative-fixture\0'), LOCAL_MARKER]));
   assert.throws(() => rejectLocalDistribution(root, stage), /LocalDevelopmentSelection executable/);
 }));
-test('an alternate directory cannot borrow local installation semantics', () => fixture((root) => {
-  assert.throws(() => prepareLocalInstallation(root, join(root, 'resources/linux'), 'prepare'), /Fixed local development/);
+test('an alternate directory cannot borrow local installation semantics', () => fixture(async (root) => {
+  await assert.rejects(prepareLocalInstallation(root, join(root, 'resources/linux'), 'prepare'), /Fixed local development/);
 }));
 test('local compiler pins bind the exact selection bytes and both source trees', () => {
   const coreSource = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
@@ -89,6 +92,106 @@ test('local receipts retain Python byte identity and reject altered authorities'
   assert.throws(() => verify({ selection: selection.replace('87724295,', '87724295.0,') }), /exact integer/);
   assert.throws(() => localReceipt(template, { ...facts, draft: JSON.stringify({ ...document, workflow: {} }) }), /selection shape differs/);
 });
+test('local collect admits the source, verifies the staged receipt, and publishes one fixed slot', { skip: process.platform !== 'linux' || process.arch !== 'x64' }, () => fixture(async (root) => {
+  const lane = ['GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'POLARIS_NATIVE_DNS_CANDIDATE', 'CORE_CANDIDATE'];
+  const environment = new Map([...lane, 'PATH', 'GOFLAGS', 'GIT_DIR'].map(key => [key, process.env[key]]));
+  for (const key of lane) delete process.env[key];
+  try {
+    const source = join(root, 'source'), bin = join(root, 'bin'), compiler = join(root, 'crates/core-supervisor/src/selected_core/development_config.rs');
+    const config = join(root, 'scripts/desktop-core/local-development-source.json');
+    const stage = localDirectory(root), fail = join(root, 'deny-verification');
+    for (const directory of [source, bin, dirname(compiler), dirname(config), join(root, 'resources')]) mkdirSync(directory, { recursive: true });
+    const git = (...args) => execFileSync('git', args, { cwd: source, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    git('init', '--object-format=sha1');
+    writeFileSync(join(source, 'main.go'), 'package main');
+    writeFileSync(join(source, '.gitignore'), 'ignored.go\n');
+    git('add', '.');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-m', 'Fixture');
+    const identity = { commit: git('rev-parse', 'HEAD'), tree: git('rev-parse', 'HEAD^{tree}') };
+    const template = 'existing Rust definitions\npub const COMPILED: previous\n';
+    writeFileSync(compiler, template);
+    const core = { member: 'sing-box', bytes: 4, sha256: hash('core') };
+    const sidecar = { member: 'libcronet.so', bytes: 7, sha256: hash('sidecar') };
+    const recipe = { schema: 'polaris-local-development-source-v1', coreSource: identity, producerSource: identity,
+      tags: ['with_purego'], goVersion: 'go1.27.4', version: '1.15.0-polaris-dev.fixture', target: 'linux/amd64',
+      sidecar: { bytes: sidecar.bytes, sha256: sidecar.sha256, version: '154.0.8037.49' } };
+    writeFileSync(config, JSON.stringify({ ...recipe, runId: 42 }));
+    const inputs = { 'core-source': source, 'producer-source': source, core: join(root, 'fresh-core'), sidecar: join(root, 'sidecar') };
+    writeFileSync(inputs.sidecar, 'sidecar');
+    await assert.rejects(collectLocalSelection(root, inputs), /configuration shape/);
+    writeFileSync(config, JSON.stringify(recipe));
+    const paths = { schema: 'polaris-local-development-inputs-v1', coreSourceRoot: source, producerSourceRoot: source };
+    const policy = { purposes: ['CheckConfig'] };
+    const row = { version: recipe.version, target: recipe.target, sourceCommit: identity.commit, sourceTree: identity.tree,
+      goVersion: recipe.goVersion, tags: recipe.tags.join(','), variant: {}, buildGraph: {}, rawBuildInfo: 'observed',
+      archive: {}, core, sidecar, finalPackageCronetSmoke: {} };
+    const draft = { schema: 'polaris-local-development-selection-v1', configurationSha256: hash(readFileSync(config)),
+      context: { schema: 'polaris-local-development-execution-context-v1', coreSource: identity, producerSource: identity,
+        host: { os: 'linux', arch: 'amd64' } }, row, proof: {}, policy };
+    writeFileSync(join(bin, 'go'), [
+      '#!' + process.execPath,
+      'const { existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");',
+      'const assert = require("node:assert/strict"), { join } = require("node:path");',
+      'assert.equal(process.cwd(), ' + JSON.stringify(source) + ');',
+      'assert.equal(process.env.GOFLAGS, ""); assert.equal(process.env.GIT_DIR, undefined);',
+      'const args = process.argv.slice(2);',
+      'if (args[0] === "version") { console.log("go version go1.27.4 linux/amd64"); process.exit(); }',
+      'assert.deepEqual(args.slice(0, 4), ["run","-mod=readonly","./cmd/internal/ci","local-native"]);',
+      'assert.equal(args[args.indexOf("--recipe") + 1], ' + JSON.stringify(config) + ');',
+      'assert.equal(args[args.indexOf("--recipe-sha256") + 1], ' + JSON.stringify(draft.configurationSha256) + ');',
+      'const slot = args[args.indexOf("--output") + 1];',
+      'if (args[4] === "collect") {',
+      '  assert.equal(existsSync(slot), false); mkdirSync(slot);',
+      '  assert.equal(existsSync(' + JSON.stringify(stage) + '), false);',
+      '  writeFileSync(join(slot,"inputs.json"), ' + JSON.stringify(JSON.stringify(paths)) + ');',
+      '  for (const [name, data] of [["sing-box","core"],["libcronet.so","sidecar"]]) writeFileSync(join(slot,name), data);',
+      '  console.log(' + JSON.stringify(JSON.stringify(draft)) + ');',
+      '} else {',
+      '  assert.equal(args[4], "verify");',
+      '  assert.equal(JSON.parse(readFileSync(join(slot, "selection.json"))).schema, "polaris-local-development-selection-v1");',
+      '  if (existsSync(' + JSON.stringify(fail) + ')) { console.error("fixture verification denied"); process.exit(1); }',
+      '  console.log(JSON.stringify({schema:"polaris-local-development-selection-v1",verified:true}));',
+      '}',
+    ].join('\n'), { mode: 0o700 });
+    process.env.PATH = bin + ':' + process.env.PATH;
+    process.env.GOFLAGS = '-overlay=/bad.json';
+    process.env.GIT_DIR = join(root, 'foreign-git');
+    // The fixture's own Git operations use its actual repository.
+    const setIndex = (...args) => execFileSync('git', ['--git-dir=.git', ...args], { cwd: source, stdio: 'pipe' });
+    process.env.GITHUB_ACTIONS = '';
+    await assert.rejects(collectLocalSelection(root, inputs), /workflow\/candidate mode/);
+    delete process.env.GITHUB_ACTIONS;
+    for (const flag of ['assume-unchanged', 'skip-worktree']) {
+      setIndex('update-index', '--' + flag, 'main.go');
+      await assert.rejects(collectLocalSelection(root, inputs), /hidden\/skip-worktree/);
+      setIndex('update-index', '--no-' + flag, 'main.go');
+    }
+    for (const filename of ['ignored.go', 'untracked.go', 'main.go']) {
+      writeFileSync(join(source, filename), 'dirty');
+      await assert.rejects(collectLocalSelection(root, inputs), /source is dirty/);
+      if (filename === 'main.go') writeFileSync(join(source, filename), 'package main');
+      else rmSync(join(source, filename));
+    }
+    writeFileSync(fail, 'mark verify failure');
+    await assert.rejects(collectLocalSelection(root, inputs), /fixture verification denied/);
+    assert.equal(readFileSync(compiler, 'utf8'), template);
+    assert.equal(existsSync(dirname(stage)), false);
+    rmSync(fail);
+    const collected = await collectLocalSelection(root, inputs);
+    assert.deepEqual(collected.policy, policy);
+    assert.deepEqual(readdirSync(dirname(stage)), ['linux']);
+    const selection = readFileSync(join(stage, 'selection.json'));
+    assert.equal(readFileSync(compiler, 'utf8'), compilerSelectionSource(template, selection));
+    assert.equal((await verifyLocalSelection(root)).platforms.linux.providerFingerprint, collected.providerFingerprint);
+    await assert.rejects(collectLocalSelection(root, inputs), /refuses to overwrite/);
+    assert.deepEqual(readFileSync(join(stage, 'selection.json')), selection);
+  } finally {
+    for (const [key, value] of environment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}));
 test('the existing final installation collector freezes actual Helper bytes without a CoreId self-reference', () => fixture((root) => {
   const core = Buffer.from('owned core fixture'), sidecar = Buffer.from('owned sidecar fixture');
   const contract = { version: '1.15.0-polaris-dev.control', platforms: { linux: { providerFingerprint: 'a'.repeat(64),
