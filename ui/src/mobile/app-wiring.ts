@@ -255,8 +255,7 @@ export function startMobileAppWiring(t: WiringT): () => void {
 
 
   /* ── ② 连接态：proxyStarted / proxyStopped → 重拉真值 ──────────────────────
-     不在 store 的 `startProxy`/`stopProxy` 里直接写 `proxyStatus`（`app-store.ts:396` 的既定结论），
-     故这里是移动端 `proxyStatus` 的**唯一**事件驱动刷新点。顺带 pull 一次差集：重启落地后
+     首页操作通过 store 主动读回；系统、托盘或其他入口触发的启停由这里刷新。顺带 pull 一次差集：重启落地后
      起核快照刷新，PUSH 的重启腿留下的 `added` 由这一拍清掉。 */
   offs.push(
     api.proxy.onStarted(() => {

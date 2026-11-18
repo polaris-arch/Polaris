@@ -139,6 +139,8 @@ let configScope: ConfigScope | null = null;
 let configSession: ConfigSession | null = null;
 let requestedEpoch = 0;
 let publicationSerial = 0;
+let proxyStatusRead = 0;
+let appliedProxyStatusRead = 0;
 let refreshReason = 'mount';
 let refreshNeeded = false;
 // Keep the native flight even after disposal: JS invalidation cannot cancel Rust I/O.
@@ -559,6 +561,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 后端 pending marker 还有同样的 fail-closed 闸，本检查用于避免一次可预期的启动报错。
       if (useStagedConfigStore.getState().entries.length > 0) return;
       await api.proxy.start();
+      await get().refreshProxyStatus();
     } finally {
       set({ proxyStarting: false });
     }
@@ -568,6 +571,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ proxyStopping: true });
     try {
       await api.proxy.stop();
+      await get().refreshProxyStatus();
     } finally {
       set({ proxyStopping: false });
     }
@@ -605,12 +609,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setProxyStatus: (status) => set({ proxyStatus: status }),
 
-  /** 从后端重拉连接态。事件驱动的唯一刷新入口（App.tsx 的 proxyStarted/proxyStopped 订阅调它）——
-   * `startProxy`/`stopProxy` 自身不写 `proxyStatus`，因为托盘浮层（独立窗口，不共享本 store）也能
-   * 触发启停，只有走事件才能让两个窗口收敛到同一真值。失败不抛：连接态刷新失败不该冒泡成 UI 异常。 */
+  /** 启停读回与各窗口的生命周期事件共用后端状态。刷新失败留给后续事件补齐。 */
   refreshProxyStatus: async () => {
+    const read = ++proxyStatusRead;
     try {
       const status = await api.proxy.getStatus();
+      // A delayed event read must not overwrite a newer read that already settled.
+      if (read <= appliedProxyStatusRead) return;
+      appliedProxyStatusRead = read;
       set({ proxyStatus: status ?? null });
     } catch (err) {
       console.error('[app-store] refreshProxyStatus failed:', err);
@@ -871,6 +877,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   reset: () => {
     invalidateLoadConfig('reset');
+    appliedProxyStatusRead = proxyStatusRead;
     set({
       config: null,
       configPublication: null,

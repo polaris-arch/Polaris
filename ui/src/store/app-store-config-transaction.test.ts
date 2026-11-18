@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SaveOutcome, UserConfig } from '@/contracts/types';
+import type { ProxyStatus, SaveOutcome, UserConfig } from '@/contracts/types';
 
 const CONFIG = {
   proxyMode: 'smart',
@@ -21,6 +21,7 @@ const patchMock = vi.fn(async (patch: Partial<UserConfig>) => ({ ...CONFIG, ...p
 const pendingMarkerMock = vi.fn(async (_pending: boolean) => undefined);
 const startMock = vi.fn(async () => undefined);
 const stopMock = vi.fn(async () => undefined);
+const statusMock = vi.fn(async (): Promise<ProxyStatus> => ({ running: false }));
 const switchMock = vi.fn(async (_serverId: string) => undefined);
 const cleanExitMock = vi.fn(async () => false);
 const configSignals = new Set<() => void>();
@@ -41,7 +42,7 @@ vi.mock('@/ipc', () => ({
     proxy: {
       start: () => startMock(),
       stop: () => stopMock(),
-      getStatus: vi.fn(),
+      getStatus: () => statusMock(),
     },
     server: {
       switch: (serverId: string) => switchMock(serverId),
@@ -92,6 +93,8 @@ beforeEach(async () => {
   pendingMarkerMock.mockClear();
   startMock.mockClear();
   stopMock.mockClear();
+  statusMock.mockReset();
+  statusMock.mockResolvedValue({ running: false });
   switchMock.mockClear();
   cleanExitMock.mockClear();
   cleanExitMock.mockImplementation(async () => false);
@@ -164,6 +167,29 @@ describe('配置保存与下一次启动的事务边界', () => {
     expect(useStagedConfigStore.getState().saveStatus).toBe('saveFailed');
   });
 
+  it('连接保留启动中直到读回新状态，较早发起的断开快照不可覆盖它', async () => {
+    useAppStore.getState().setProxyStatus({ running: false });
+    let finishOldRead!: (status: ProxyStatus) => void;
+    let finishStartRead!: (status: ProxyStatus) => void;
+    statusMock
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOldRead = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishStartRead = resolve; }));
+    const oldRead = useAppStore.getState().refreshProxyStatus();
+    const starting = useAppStore.getState().startProxy();
+    await vi.waitFor(() => expect(statusMock).toHaveBeenCalledTimes(2));
+    expect(startMock).toHaveBeenCalledOnce();
+    expect(useAppStore.getState().proxyStarting).toBe(true);
+
+    finishStartRead({ running: true, mainGeneration: 1 });
+    await starting;
+    expect(useAppStore.getState().proxyStarting).toBe(false);
+    expect(useAppStore.getState().proxyStatus?.running).toBe(true);
+
+    finishOldRead({ running: false });
+    await oldRead;
+    expect(useAppStore.getState().proxyStatus?.running).toBe(true);
+  });
+
   it('连接前保存在途时产生新编辑，保留新草稿并拒绝按旧批次启动', async () => {
     seed([ENTRY]);
     let finishSave!: (outcome: SaveOutcome) => void;
@@ -192,10 +218,12 @@ describe('配置保存与下一次启动的事务边界', () => {
 
   it('停止代理不是保存或放弃：未保存草稿原样保留', async () => {
     seed([ENTRY]);
+    useAppStore.getState().setProxyStatus({ running: true });
 
     await useAppStore.getState().stopProxy();
 
     expect(stopMock).toHaveBeenCalledTimes(1);
+    expect(useAppStore.getState().proxyStatus?.running).toBe(false);
     expect(saveMock).not.toHaveBeenCalled();
     expect(useStagedConfigStore.getState().entries).toEqual([ENTRY]);
   });
