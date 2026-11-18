@@ -20,12 +20,22 @@ export const DESKTOP_TARGETS = Object.freeze({
   'mac-arm64': { goos: 'darwin', goarch: 'arm64', cgo: '1', extras: ['with_gvisor'] },
 });
 export const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
-export function canonical(value) {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
+export function canonical(value, indentation = 0) {
+  const separator = indentation ? ': ' : ':';
+  const format = (open, close, entries, depth) => {
+    if (!indentation || !entries.length) return open + entries.join(',') + close;
+    const inner = '\n' + ' '.repeat(indentation * (depth + 1));
+    return open + inner + entries.join(',' + inner) + '\n' + ' '.repeat(indentation * depth) + close;
+  };
+  const encode = (entry, depth) => {
+    if (Array.isArray(entry)) return format('[', ']', entry.map((item) => encode(item, depth + 1)), depth);
+    if (entry && typeof entry === 'object') {
+      const fields = Object.keys(entry).sort().map((key) => JSON.stringify(key) + separator + encode(entry[key], depth + 1));
+      return format('{', '}', fields, depth);
+    }
+    return JSON.stringify(entry);
+  };
+  return encode(value, 0);
 }
 export function requireGraph(condition, message) {
   if (!condition) throw new Error(message);

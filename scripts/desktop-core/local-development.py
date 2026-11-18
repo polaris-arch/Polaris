@@ -50,15 +50,11 @@ def sources(c,paths):
  demand(n.ROOT==producer and hasattr(n,'derive_local_trusted_execution'),'local producer implementation differs')
  return core,n,t
 
-def compiler_source(selection):
- return subprocess.check_output(['node',ROOT/'scripts/desktop-core/local-development.mjs','compiler-pins'],
-                                input=selection,timeout=30).decode()
+def local_receipt(recipe,recipe_hash,**receipt):
+ request=json.dumps({'recipe':recipe,'recipeSha256':recipe_hash,**receipt}).encode()
+ return json.loads(subprocess.check_output(['node',ROOT/'scripts/desktop-core/local-development.mjs','receipt'],
+                                          input=request,timeout=30))
 
-def contract_for(doc):
- row=doc['row']
- return {'schema':'polaris-local-development-core-contract-v1','version':row['version'],'sourceCommit':row['sourceCommit'],'sourceTree':row['sourceTree'],
-         'platforms':{'linux':{**{k:row[k] for k in ['core','sidecar','archive','sourceCommit','sourceTree']},'providerFingerprint':doc['providerFingerprint']}}}
-def binding(doc):return digest(encoded({k:doc[k] for k in ['configurationSha256','context','row','proof']}))
 def same_buildinfo(actual,row):
  go,build,graph=actual;recorded=row['rawBuildInfo'];lines=recorded.splitlines() if type(recorded) is str else []
  # The filename is an observation of the copied object, not execution identity.
@@ -66,23 +62,14 @@ def same_buildinfo(actual,row):
 
 def verify():
  c,config_hash=configuration();paths=json.loads(raw(SLOT/'inputs.json'));core,n,t=sources(c,paths)
- document_raw=raw(SLOT/'selection.json');document=json.loads(document_raw)
- demand(document_raw==encoded(document),'local selection is not the exact producer encoding')
- demand(closed(document,['schema','configurationSha256','context','row','proof','policy','providerFingerprint','contractSha256']) and document['schema']=='polaris-local-development-selection-v1','local selection shape differs')
- demand(COMPILED.read_text()==compiler_source(document_raw),'generated facts differ from the immutable Rust compiler configuration')
- demand(document['configurationSha256']==config_hash,'local compiler configuration changed')
- row=document['row'];proof=document['proof']
- demand(closed(row,['version','target','sourceCommit','sourceTree','goVersion','tags','variant','buildGraph','rawBuildInfo','archive','core','sidecar','finalPackageCronetSmoke']),'local producer row shape differs')
- demand(row['version']==c['version'] and row['goVersion']==c['goVersion'] and row['target']==c['target'] and row['tags']==','.join(c['tags']),'local build declaration differs')
- demand(document['context']['coreSource']==c['coreSource'] and document['context']['producerSource']==c['producerSource'],'local source context differs')
+ selection=raw(SLOT/'selection.json').decode()
+ local_receipt(c,config_hash,selection=selection,contract=raw(SLOT/'contract.json').decode())
+ document=json.loads(selection);row=document['row'];proof=document['proof']
  for key,name in [('core','sing-box'),('sidecar','libcronet.so')]:
   actual=pin(SLOT/name);demand(row[key]=={'member':name,**actual},'final local member differs')
- demand(row['sidecar']=={'member':'libcronet.so','bytes':c['sidecar']['bytes'],'sha256':c['sidecar']['sha256']},'local sidecar is not the compiled trusted input')
  demand(same_buildinfo(n.buildinfo(SLOT/'sing-box'),row),'local actual buildinfo differs')
  policy=n.derive_local_trusted_execution(row,proof,document['context'],core)
- demand(policy==document['policy'] and document['providerFingerprint']==binding(document),'local protected facts/provider differs')
- contract_bytes=raw(SLOT/'contract.json');contract=json.loads(contract_bytes)
- demand(contract_bytes==encoded(contract_for(document)) and document['contractSha256']==digest(contract_bytes),'local compiled contract differs')
+ demand(policy==document['policy'],'local protected facts differ')
  return document
 
 def collect(args):
@@ -128,14 +115,12 @@ def collect(args):
  context={'schema':'polaris-local-development-execution-context-v1','coreSource':c['coreSource'],'producerSource':c['producerSource'],'host':{'os':'linux','arch':'amd64'}}
  policy=n.derive_local_trusted_execution(row,proof,context,core)
  doc={'schema':'polaris-local-development-selection-v1','configurationSha256':config_hash,'context':context,'row':row,'proof':proof,'policy':policy}
- doc['providerFingerprint']=binding(doc)
- contract=contract_for(doc);contract_bytes=encoded(contract);doc['contractSha256']=digest(contract_bytes)
- selection_bytes=encoded(doc)
- for path,data in [('selection.json',selection_bytes),('inputs.json',encoded(paths)),('contract.json',contract_bytes)]:
+ material=local_receipt(c,config_hash,draft=json.dumps(doc))
+ for path,data in [('selection.json',material['selection'].encode()),('inputs.json',encoded(paths)),('contract.json',material['contract'].encode())]:
   (SLOT/path).write_bytes(data);os.chmod(SLOT/path,0o600)
- COMPILED.write_text(compiler_source(selection_bytes))
+ COMPILED.write_text(material['compiled'])
  verify()
- print(json.dumps({'schema':doc['schema'],'coreSource':c['coreSource'],'producerSource':c['producerSource'],'providerFingerprint':doc['providerFingerprint'],'policy':policy},sort_keys=True))
+ print(json.dumps({'schema':doc['schema'],'coreSource':c['coreSource'],'producerSource':c['producerSource'],'providerFingerprint':material['providerFingerprint'],'policy':policy},sort_keys=True))
 if __name__=='__main__':
  parser=argparse.ArgumentParser();parser.add_argument('mode',choices=['collect','verify']);
  for key in ['core-source','producer-source','core','sidecar']:parser.add_argument('--'+key,type=Path)

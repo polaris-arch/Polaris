@@ -54,8 +54,8 @@ export const RELEASE_TARGETS = Object.freeze({
 const hex = (v, n) => typeof v === 'string' && new RegExp(`^[a-f0-9]{${n}}$`).test(v);
 const positive = (v) => Number.isSafeInteger(v) && v > 0;
 const same = (a, b, message) => demand(canonical(a) === canonical(b), message);
-// Match producer Python json.dumps(sort_keys=True, separators=(',', ':'), ensure_ascii=True).
-export const portableCanonical = (v) => canonical(v).replace(/[\u007f-\uffff]/g,
+// Match the producer's sorted, ASCII JSON, with compact separators by default.
+export const portableCanonical = (v, indentation = 0) => canonical(v, indentation).replace(/[\u007f-\uffff]/g,
   (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 const json = (path) => JSON.parse(readFileSync(path, 'utf8'));
 

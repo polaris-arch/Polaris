@@ -10,6 +10,8 @@ import { digest, requireGraph as demand } from './source-graph.mjs';
 export const LOCAL_MARKER = Buffer.from('POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1');
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const compiledSelection = 'crates/core-supervisor/src/selected_core/development_config.rs';
+const selectionSchema = 'polaris-local-development-selection-v1';
+const contractSchema = 'polaris-local-development-core-contract-v1';
 export const localDirectory = (base) => join(base, 'resources/.local-development/linux');
 const selectionExecutable = (path) => /^(?:polaris|Polaris|polaris-helper)(?:\.exe)?$/.test(path.replaceAll('\\', '/').split('/').at(-1));
 export function rejectLocalExecutables(paths) {
@@ -61,12 +63,72 @@ export function compilerSelectionSource(template, selectionBytes) {
     'pub const COMPILED:Option<DevelopmentSelection>=Some(DevelopmentSelection{' + fields + '});\n';
 }
 
+// The pinned producer's quantities (member sizes, seals and process results)
+// are exact integers. Keep the sorted two-space ASCII encoding of v1 receipts.
+const receiptJson = (value) => portableCanonical(value, 2) + '\n';
+const closed = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) &&
+  Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+
+export function localReceipt(template, { recipe, recipeSha256, draft, selection, contract }) {
+  const verifying = selection !== undefined;
+  let document;
+  try {
+    document = JSON.parse(verifying ? selection : draft, (_, value, context) => {
+      if (typeof value === 'number') {
+        demand(Number.isSafeInteger(value) && /^(0|-?[1-9][0-9]*)$/.test(context.source),
+          'local receipt quantity is not an exact integer');
+      }
+      return value;
+    });
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new Error('invalid local receipt JSON');
+  }
+  if (verifying) demand(selection === receiptJson(document), 'local selection is not the exact producer encoding');
+  const fields = ['schema', 'configurationSha256', 'context', 'row', 'proof', 'policy'];
+  if (verifying) fields.push('providerFingerprint', 'contractSha256');
+  demand(closed(document, fields) && document.schema === selectionSchema, 'local selection shape differs');
+  const { configurationSha256, context, row, proof, policy } = document;
+  demand(configurationSha256 === recipeSha256, 'local compiler configuration changed');
+  demand(closed(row, ['version', 'target', 'sourceCommit', 'sourceTree', 'goVersion', 'tags', 'variant',
+    'buildGraph', 'rawBuildInfo', 'archive', 'core', 'sidecar', 'finalPackageCronetSmoke']), 'local producer row shape differs');
+  demand(row.version === recipe.version && row.goVersion === recipe.goVersion && row.target === recipe.target &&
+    row.tags === recipe.tags.join(','), 'local build declaration differs');
+  demand(closed(context, ['schema', 'coreSource', 'producerSource', 'host']) &&
+    context.schema === 'polaris-local-development-execution-context-v1' &&
+    portableCanonical(context.coreSource) === portableCanonical(recipe.coreSource) &&
+    portableCanonical(context.producerSource) === portableCanonical(recipe.producerSource) &&
+    portableCanonical(context.host) === '{"arch":"amd64","os":"linux"}' &&
+    row.sourceCommit === recipe.coreSource.commit && row.sourceTree === recipe.coreSource.tree,
+  'local source context differs');
+  demand(closed(row.sidecar, ['member', 'bytes', 'sha256']) && row.sidecar.member === 'libcronet.so' &&
+    row.sidecar.bytes === recipe.sidecar.bytes && row.sidecar.sha256 === recipe.sidecar.sha256,
+  'local sidecar is not the compiled trusted input');
+
+  const providerFingerprint = digest(receiptJson({ configurationSha256, context, row, proof }));
+  const { version, sourceCommit, sourceTree, archive, core, sidecar } = row;
+  const contractBytes = receiptJson({ schema: contractSchema, version, sourceCommit, sourceTree,
+    platforms: { linux: { core, sidecar, archive, sourceCommit, sourceTree, providerFingerprint } } });
+  const contractSha256 = digest(contractBytes);
+  if (verifying) {
+    demand(document.providerFingerprint === providerFingerprint, 'local protected facts/provider differs');
+    demand(contract === contractBytes && document.contractSha256 === contractSha256, 'local compiled contract differs');
+    demand(template.replace(/\r\n?/g, '\n') === compilerSelectionSource(template, selection),
+      'generated facts differ from the immutable Rust compiler configuration');
+    return null;
+  }
+  const selectionBytes = receiptJson({ schema: selectionSchema, configurationSha256, context, row, proof, policy,
+    providerFingerprint, contractSha256 });
+  return { selection: selectionBytes, contract: contractBytes, compiled: compilerSelectionSource(template, selectionBytes),
+    providerFingerprint };
+}
+
 export function verifyLocalSelection(base = root, installation = false) {
   const directory = localDirectory(base);
   // Fixed code and fixed input slot. No env selector or receipt chooses Cargo's lane.
   execFileSync('python3', [join(base, 'scripts/desktop-core/local-development.py'), 'verify'], { cwd: base, env: { ...process.env, GOENV: 'off', GOTOOLCHAIN: 'local', GOWORK: 'off', GOPROXY: 'off', GOSUMDB: 'off', PYTHONDONTWRITEBYTECODE: '1' }, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 ** 2 });
   const contract = JSON.parse(readFileSync(join(directory, 'contract.json')));
-  demand(contract.schema === 'polaris-local-development-core-contract-v1' && Object.keys(contract.platforms).join() === 'linux', 'Local contract is Linux-only');
+  demand(contract.schema === contractSchema && Object.keys(contract.platforms).join() === 'linux', 'Local contract is Linux-only');
   if (installation) {
     const appVersion = JSON.parse(readFileSync(join(base, 'src-tauri/tauri.conf.json'))).version;
     const expected = selectedCoreManifest(contract, 'linux', appVersion);
@@ -98,8 +160,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const [mode, ...args] = process.argv.slice(2);
   if (mode === 'collect') {
     execFileSync('python3', [join(root, 'scripts/desktop-core/local-development.py'), 'collect', ...args], { cwd: root, stdio: 'inherit' });
-  } else if (mode === 'compiler-pins' && args.length === 0) {
-    process.stdout.write(compilerSelectionSource(readFileSync(join(root, compiledSelection), 'utf8'), readFileSync(0)));
+  } else if (mode === 'receipt' && args.length === 0) {
+    const material = localReceipt(readFileSync(join(root, compiledSelection), 'utf8'), JSON.parse(readFileSync(0)));
+    process.stdout.write(JSON.stringify(material));
   } else {
     demand(args.length === 0 && ['verify', 'verify-installation'].includes(mode), 'Expected local collect/verify/verify-installation');
     const contract = verifyLocalSelection(root, mode === 'verify-installation');

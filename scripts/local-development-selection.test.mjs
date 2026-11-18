@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { inspectFormalArtifact, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
-import { LOCAL_MARKER, compilerSelectionSource, rejectLocalDistribution, prepareLocalInstallation } from './desktop-core/local-development.mjs';
+import { LOCAL_MARKER, compilerSelectionSource, localReceipt, rejectLocalDistribution, prepareLocalInstallation } from './desktop-core/local-development.mjs';
 import { selectedCoreManifest, writeSelectedCoreManifest } from './lib/core-identity.mjs';
 import { createHash } from 'node:crypto';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -50,6 +50,42 @@ test('local compiler pins bind the exact selection bytes and both source trees',
   document.policy.purposes.push('RunMain');
   const changed = Buffer.from(JSON.stringify(document, null, 2) + '\n');
   assert.equal(compilerSelectionSource(template, changed), expected.replace(hash(original), hash(changed)));
+});
+test('local receipts retain Python byte identity and reject altered authorities', () => {
+  const coreSource = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+  const producerSource = { commit: 'c'.repeat(40), tree: 'd'.repeat(40) };
+  const context = { schema: 'polaris-local-development-execution-context-v1', coreSource, producerSource,
+    host: { os: 'linux', arch: 'amd64' } };
+  const core = { member: 'sing-box', bytes: 87724295, sha256: '1'.repeat(64) };
+  const sidecar = { member: 'libcronet.so', bytes: 12370520, sha256: '2'.repeat(64) };
+  const archive = { name: 'sing-box-test-linux-amd64.tar.gz', bytes: 456789, sha256: '3'.repeat(64),
+    root: 'sing-box-test-linux-amd64',
+    members: { 'sing-box-test-linux-amd64/sing-box': core.sha256, 'sing-box-test-linux-amd64/libcronet.so': sidecar.sha256 } };
+  const recipe = { coreSource, producerSource, tags: ['with_purego'], goVersion: 'go1.27.2',
+    version: '1.15.0-polaris-dev.control', target: 'linux/amd64', sidecar };
+  const row = { version: recipe.version, target: recipe.target, sourceCommit: coreSource.commit, sourceTree: coreSource.tree,
+    goVersion: recipe.goVersion, tags: recipe.tags.join(','), variant: {}, buildGraph: { settings: { GOOS: 'linux' }, normalModules: [] },
+    rawBuildInfo: 'sing-box: go1.27.2\n', archive, core, sidecar, finalPackageCronetSmoke: { status: 'passed' } };
+  const proof = { coreSeals: 15, sidecarSeals: 15, tlsProbe: { coreBytes: core.bytes,
+    configurationChecks: [{ output: '连接\u007f🛠\t"\\\n', exitCode: -9, expectedPass: false }] } };
+  const recipeSha256 = '0'.repeat(64);
+  const document = { schema: 'polaris-local-development-selection-v1', configurationSha256: recipeSha256,
+    context, row, proof, policy: { purposes: ['CheckConfig'] } };
+  const template = 'existing Rust definitions\npub const COMPILED:previous selection';
+  const facts = { recipe, recipeSha256 };
+  const { selection, contract, compiled, providerFingerprint } = localReceipt(template, { ...facts, draft: JSON.stringify(document) });
+  // Golden hashes from the previous Python producer's exact v1 JSON encoding.
+  assert.equal(providerFingerprint, '5c784edfb284bbeb196c91f3b388b01d1241d3d2b10a4c95420edbc82a6bf7f6');
+  assert.equal(hash(contract), '8fad6e2942564c7488060803f46076535cc98ec4ffd24e8982502614008b9e6c');
+  assert.equal(hash(selection), 'ae44abeb39a82fccc0c63068a4749ab66d2d3f8103d8f28bbc939921b67fe89f');
+  const verify = (input = {}) => localReceipt(compiled, { ...facts, selection, contract, ...input });
+  assert.equal(verify(), null);
+  assert.throws(() => verify({ selection: selection + '\n' }), /exact producer encoding/);
+  assert.throws(() => verify({ contract: contract + '\n' }), /compiled contract differs/);
+  assert.throws(() => verify({ selection: selection.replace(providerFingerprint, '4'.repeat(64)) }), /protected facts\/provider differs/);
+  assert.throws(() => verify({ selection: selection.replace(producerSource.tree, '4'.repeat(40)) }), /source context differs/);
+  assert.throws(() => verify({ selection: selection.replace('87724295,', '87724295.0,') }), /exact integer/);
+  assert.throws(() => localReceipt(template, { ...facts, draft: JSON.stringify({ ...document, workflow: {} }) }), /selection shape differs/);
 });
 test('the existing final installation collector freezes actual Helper bytes without a CoreId self-reference', () => fixture((root) => {
   const core = Buffer.from('owned core fixture'), sidecar = Buffer.from('owned sidecar fixture');
