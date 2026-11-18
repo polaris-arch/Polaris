@@ -12,16 +12,6 @@ class LocalCompilerInputs(unittest.TestCase):
    for key,value in [('runId',42),('validationOnly',False),('lane','Formal'),('purpose','RunMain')]:
     p.write_text(json.dumps({**original,key:value}))
     with self.subTest(key=key),patch.object(n,'CONFIG',p),self.assertRaisesRegex(ValueError,'configuration shape'):n.configuration()
- def test_the_generated_compiler_configuration_binds_policy_bytes_and_every_source_revision(self):
-  proof={'configurationSha256':'0'*64,'context':{'coreSource':{'commit':'a'*40,'tree':'b'*40},'producerSource':{'commit':'c'*40,'tree':'d'*40}},
-         'row':{'target':'linux/amd64','goVersion':'go1.27.2','tags':'with_purego','core':{'bytes':7,'sha256':'1'*64},'sidecar':{'bytes':11,'sha256':'2'*64}},
-         'policy':{'purposes':['CheckConfig']},'contractSha256':'3'*64}
-  before=n.configuration_source(proof)
-  proof['policy']['purposes'].append('RunMain')
-  after=n.configuration_source(proof)
-  self.assertNotEqual(before,after)
-  self.assertIn('producer_commit:"'+('c'*40)+'"',after)
-  self.assertIn('source_commit:"'+('a'*40)+'"',after)
  def test_copy_filename_is_not_build_identity_but_all_actual_settings_still_are(self):
   graph={'settings':{'vcs.revision':'a'*40,'CGO_ENABLED':'0'}}
   recorded={'goVersion':'go1.27.2','rawBuildInfo':'original: go1.27.2\n\tbuild\tCGO_ENABLED=0\n','buildGraph':graph}

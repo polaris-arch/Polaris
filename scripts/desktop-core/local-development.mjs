@@ -5,9 +5,11 @@ import { readFileSync, existsSync, lstatSync, openSync, fstatSync, readSync, clo
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { selectedCoreManifest, verifySelectedCoreManifest, actualCoreFile, writeSelectedCoreManifest } from '../lib/core-identity.mjs';
-import { requireGraph as demand } from './source-graph.mjs';
+import { portableCanonical } from './release-consumer.mjs';
+import { digest, requireGraph as demand } from './source-graph.mjs';
 export const LOCAL_MARKER = Buffer.from('POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1');
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const compiledSelection = 'crates/core-supervisor/src/selected_core/development_config.rs';
 export const localDirectory = (base) => join(base, 'resources/.local-development/linux');
 const selectionExecutable = (path) => /^(?:polaris|Polaris|polaris-helper)(?:\.exe)?$/.test(path.replaceAll('\\', '/').split('/').at(-1));
 export function rejectLocalExecutables(paths) {
@@ -35,6 +37,28 @@ export function rejectLocalExecutables(paths) {
 export function rejectLocalDistribution(base, directory) {
   demand(!existsSync(join(base, 'resources/.local-development')), 'Formal distribution rejects local development compiler inputs');
   if (directory) rejectLocalExecutables(['polaris-helper', 'polaris', 'Polaris', 'polaris-helper.exe', 'polaris.exe', 'Polaris.exe'].map(name => join(directory,name)).filter(existsSync));
+}
+
+export function compilerSelectionSource(template, selectionBytes) {
+  const { context, row, contractSha256 } = JSON.parse(selectionBytes);
+  const pins = {
+    source_commit: context.coreSource.commit,
+    source_tree: context.coreSource.tree,
+    producer_commit: context.producerSource.commit,
+    producer_tree: context.producerSource.tree,
+    target: row.target,
+    go_version: row.goVersion,
+    tags: row.tags,
+    core_bytes: row.core.bytes,
+    core_sha256: row.core.sha256,
+    sidecar_bytes: row.sidecar.bytes,
+    sidecar_sha256: row.sidecar.sha256,
+    selection_sha256: digest(selectionBytes),
+    contract_sha256: contractSha256,
+  };
+  const fields = Object.entries(pins).map(([name, value]) => name + ':' + portableCanonical(value)).join(',');
+  return template.replace(/\r\n?/g, '\n').split('pub const COMPILED:', 1)[0] +
+    'pub const COMPILED:Option<DevelopmentSelection>=Some(DevelopmentSelection{' + fields + '});\n';
 }
 
 export function verifyLocalSelection(base = root, installation = false) {
@@ -74,6 +98,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const [mode, ...args] = process.argv.slice(2);
   if (mode === 'collect') {
     execFileSync('python3', [join(root, 'scripts/desktop-core/local-development.py'), 'collect', ...args], { cwd: root, stdio: 'inherit' });
+  } else if (mode === 'compiler-pins' && args.length === 0) {
+    process.stdout.write(compilerSelectionSource(readFileSync(join(root, compiledSelection), 'utf8'), readFileSync(0)));
   } else {
     demand(args.length === 0 && ['verify', 'verify-installation'].includes(mode), 'Expected local collect/verify/verify-installation');
     const contract = verifyLocalSelection(root, mode === 'verify-installation');

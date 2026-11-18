@@ -50,17 +50,9 @@ def sources(c,paths):
  demand(n.ROOT==producer and hasattr(n,'derive_local_trusted_execution'),'local producer implementation differs')
  return core,n,t
 
-def configuration_source(doc):
- base=COMPILED.read_text().split('pub const COMPILED:')[0]
- c=doc['context'];r=doc['row']
- pins={'source_commit':c['coreSource']['commit'],'source_tree':c['coreSource']['tree'],
-       'producer_commit':c['producerSource']['commit'],'producer_tree':c['producerSource']['tree'],
-       'target':r['target'],'go_version':r['goVersion'],'tags':r['tags'],
-       'core_bytes':r['core']['bytes'],'core_sha256':r['core']['sha256'],
-       'sidecar_bytes':r['sidecar']['bytes'],'sidecar_sha256':r['sidecar']['sha256'],
-       'selection_sha256':digest(encoded(doc)),'contract_sha256':doc['contractSha256']}
- fields=[key+':'+json.dumps(value) for key,value in pins.items()]
- return base+'pub const COMPILED:Option<DevelopmentSelection>=Some(DevelopmentSelection{'+','.join(fields)+'});\n'
+def compiler_source(selection):
+ return subprocess.check_output(['node',ROOT/'scripts/desktop-core/local-development.mjs','compiler-pins'],
+                                input=selection,timeout=30).decode()
 
 def contract_for(doc):
  row=doc['row']
@@ -77,7 +69,7 @@ def verify():
  document_raw=raw(SLOT/'selection.json');document=json.loads(document_raw)
  demand(document_raw==encoded(document),'local selection is not the exact producer encoding')
  demand(closed(document,['schema','configurationSha256','context','row','proof','policy','providerFingerprint','contractSha256']) and document['schema']=='polaris-local-development-selection-v1','local selection shape differs')
- demand(COMPILED.read_text()==configuration_source(document),'generated facts differ from the immutable Rust compiler configuration')
+ demand(COMPILED.read_text()==compiler_source(document_raw),'generated facts differ from the immutable Rust compiler configuration')
  demand(document['configurationSha256']==config_hash,'local compiler configuration changed')
  row=document['row'];proof=document['proof']
  demand(closed(row,['version','target','sourceCommit','sourceTree','goVersion','tags','variant','buildGraph','rawBuildInfo','archive','core','sidecar','finalPackageCronetSmoke']),'local producer row shape differs')
@@ -138,9 +130,10 @@ def collect(args):
  doc={'schema':'polaris-local-development-selection-v1','configurationSha256':config_hash,'context':context,'row':row,'proof':proof,'policy':policy}
  doc['providerFingerprint']=binding(doc)
  contract=contract_for(doc);contract_bytes=encoded(contract);doc['contractSha256']=digest(contract_bytes)
- for path,value in [('selection.json',doc),('inputs.json',paths),('contract.json',contract)]:
-  (SLOT/path).write_bytes(encoded(value));os.chmod(SLOT/path,0o600)
- COMPILED.write_text(configuration_source(doc))
+ selection_bytes=encoded(doc)
+ for path,data in [('selection.json',selection_bytes),('inputs.json',encoded(paths)),('contract.json',contract_bytes)]:
+  (SLOT/path).write_bytes(data);os.chmod(SLOT/path,0o600)
+ COMPILED.write_text(compiler_source(selection_bytes))
  verify()
  print(json.dumps({'schema':doc['schema'],'coreSource':c['coreSource'],'producerSource':c['producerSource'],'providerFingerprint':doc['providerFingerprint'],'policy':policy},sort_keys=True))
 if __name__=='__main__':

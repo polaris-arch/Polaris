@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { inspectFormalArtifact, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
-import { LOCAL_MARKER, rejectLocalDistribution, prepareLocalInstallation } from './desktop-core/local-development.mjs';
+import { LOCAL_MARKER, compilerSelectionSource, rejectLocalDistribution, prepareLocalInstallation } from './desktop-core/local-development.mjs';
 import { selectedCoreManifest, writeSelectedCoreManifest } from './lib/core-identity.mjs';
 import { createHash } from 'node:crypto';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
@@ -31,6 +31,26 @@ test('removing local receipts cannot turn a compiled local Helper into a Formal 
 test('an alternate directory cannot borrow local installation semantics', () => fixture((root) => {
   assert.throws(() => prepareLocalInstallation(root, join(root, 'resources/linux'), 'prepare'), /Fixed local development/);
 }));
+test('local compiler pins bind the exact selection bytes and both source trees', () => {
+  const coreSource = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+  const producerSource = { commit: 'c'.repeat(40), tree: 'd'.repeat(40) };
+  const contractSha256 = 'e'.repeat(64);
+  const core = { bytes: 7, sha256: '1'.repeat(64) };
+  const sidecar = { bytes: 11, sha256: '2'.repeat(64) };
+  const document = { context: { coreSource, producerSource }, row: { target: 'linux/amd64', goVersion: 'go1.27.2',
+    tags: 'with_purego', core, sidecar }, policy: { purposes: ['CheckConfig'] }, contractSha256 };
+  const template = 'existing Rust definitions\r\npub const COMPILED:previous selection';
+  const original = Buffer.from(JSON.stringify(document, null, 2) + '\n');
+  const expected = 'existing Rust definitions\npub const COMPILED:Option<DevelopmentSelection>=Some(DevelopmentSelection{' +
+    'source_commit:"' + coreSource.commit + '",source_tree:"' + coreSource.tree + '",producer_commit:"' + producerSource.commit +
+    '",producer_tree:"' + producerSource.tree + '",target:"linux/amd64",go_version:"go1.27.2",tags:"with_purego",core_bytes:7,core_sha256:"' +
+    core.sha256 + '",sidecar_bytes:11,sidecar_sha256:"' + sidecar.sha256 + '",selection_sha256:"' + hash(original) +
+    '",contract_sha256:"' + contractSha256 + '"});\n';
+  assert.equal(compilerSelectionSource(template, original), expected);
+  document.policy.purposes.push('RunMain');
+  const changed = Buffer.from(JSON.stringify(document, null, 2) + '\n');
+  assert.equal(compilerSelectionSource(template, changed), expected.replace(hash(original), hash(changed)));
+});
 test('the existing final installation collector freezes actual Helper bytes without a CoreId self-reference', () => fixture((root) => {
   const core = Buffer.from('owned core fixture'), sidecar = Buffer.from('owned sidecar fixture');
   const contract = { version: '1.15.0-polaris-dev.control', platforms: { linux: { providerFingerprint: 'a'.repeat(64),
