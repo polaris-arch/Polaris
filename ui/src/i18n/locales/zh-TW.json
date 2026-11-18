@@ -494,6 +494,7 @@
     "pendingGroupStaged": "待儲存 · 尚未寫入",
     "pendingIgnoreBtn": "忽略",
     "pendingResetBtn": "重設",
+    "pendingRevertSavedSettings": "撤銷代理設定和連接埠變更",
     "pendingResetConfirm": "放棄全部未儲存變更？",
     "pendingRetryBtn": "重試",
     "pendingRetrySaveBtn": "重試儲存",

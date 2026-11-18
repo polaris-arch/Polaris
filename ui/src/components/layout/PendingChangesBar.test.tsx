@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   pendingEffects: [] as Array<() => void>,
   applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
   retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(),
+  armed: null as string | null, revertSaved: vi.fn(),
   lifecycleReady: vi.fn(), offLifecycle: vi.fn(), statusRead: vi.fn(),
   app: {
     pendingChanges: { added: ['node'], modified: [] as string[], removed: [] as string[], restartDeferred: false } as PendingNodeChanges,
@@ -41,7 +42,15 @@ vi.mock('react', async original => ({
   },
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
-vi.mock('@/lib/confirm-twice', () => ({ useConfirmTwice: () => ({ armed: null, confirmTwice: vi.fn() }) }));
+vi.mock('@/lib/confirm-twice', () => ({
+  useConfirmTwice: () => ({
+    armed: h.armed,
+    confirmTwice: (key: string, action: () => void) => {
+      if (h.armed === key) { h.armed = null; action(); }
+      else h.armed = key;
+    },
+  }),
+}));
 vi.mock('@/components/dialogs/StagedConflictDialog', () => ({ StagedConflictDialog: () => null }));
 vi.mock('@/components/dialogs/RestartApplyDialog', () => ({ RestartApplyDialog: () => null }));
 vi.mock('@/components/dialogs/ImpactApplyDialog', () => ({ ImpactApplyDialog: () => null }));
@@ -51,6 +60,7 @@ vi.mock('@/ipc', () => ({ api: { proxy: {
   runtimeNativeRetirementStatus: h.nativeRead,
   retryRuntimePersistence: h.retryPersistence, getPendingChanges: h.pendingRead,
   cancelRuntimeImpact: h.cancelImpact, getStatus: h.statusRead,
+  revertSavedSettings: h.revertSaved,
 } } }));
 vi.mock('@/store/app-store', () => ({
   normalizePendingChanges: (pending: unknown) => pending,
@@ -66,7 +76,7 @@ import PendingChangesBar from './PendingChangesBar';
 import { ImpactApplyDialog } from '@/components/dialogs/ImpactApplyDialog';
 import { toast } from '@/lib/error-handler';
 
-type Props = { children?: ReactNode; onClick?: () => void; disabled?: boolean; onConfirm?: () => void };
+type Props = { children?: ReactNode; className?: string; onClick?: () => void; disabled?: boolean; onConfirm?: () => void };
 function elements(node: ReactNode): ReactElement<Props>[] {
   if (Array.isArray(node)) return node.flatMap(elements);
   if (!isValidElement<Props>(node)) return [];
@@ -117,6 +127,7 @@ async function begin(result: PendingApplyResult): Promise<void> {
 
 beforeEach(() => {
   unmount(); vi.resetAllMocks(); h.states = []; h.refs = [];
+  h.armed = null;
   h.app.config = null;
   h.app.nativeRetirementEndedBeforeGeneration = 0;
   h.app.pendingChanges = { added: ['node'], modified: [], removed: [], restartDeferred: false };
@@ -132,6 +143,20 @@ beforeEach(() => {
   h.hostRead.mockRejectedValue(new Error('Host status unavailable'));
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+it('keeps the confirmation armed only for the saved settings the user saw', async () => {
+  h.revertSaved.mockResolvedValue(true);
+  h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'original' };
+  click('home.pendingRevertSavedSettings');
+  expect(button('common.confirm').props.className).toContain('confirming');
+  h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'later' };
+  click('home.pendingRevertSavedSettings');
+  expect(h.revertSaved).not.toHaveBeenCalled();
+  click('common.confirm');
+  await microtasks();
+  expect(h.revertSaved).toHaveBeenCalledOnce();
+  expect(h.revertSaved).toHaveBeenCalledWith('later');
+});
 
 describe('pre-confirmed apply request', () => {
   it('applies the saved candidate and confirms its restart token without a second prompt or draft save', async () => {

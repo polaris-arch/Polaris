@@ -1979,6 +1979,74 @@ fn pending_changes_contract_has_exactly_six_typed_fields() {
     );
 }
 
+#[tokio::test]
+async fn revert_saved_proxy_settings_requires_the_current_receipt_and_preserves_other_edits() {
+    let (rt, _dir, sink, mut running) = explicit_selection_fixture();
+    running["controlPort"] = 9090.into();
+    running["configSchemaVersion"] = 4.into();
+    running["dnsConfig"]["enableFakeIp"] = false.into();
+    running["dnsDefaults"]["unmatchedAction"] =
+        serde_json::json!({"type": "server", "serverId": "builtin-domestic"});
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_snapshot(&rt, &running);
+    let mut saved = running.clone();
+    saved["selectedServerId"] = "node-b".into();
+    saved["mixedPort"] = 9090.into();
+    saved["dnsConfig"]["enableFakeIp"] = true.into();
+    saved["dnsDefaults"]["unmatchedAction"] = serde_json::json!({"type": "fakeIp"});
+    saved["dnsDefaults"]["realQueryFallbackAction"] =
+        serde_json::json!({"type": "server", "serverId": "builtin-domestic"});
+    rt.config.save_full(&saved).unwrap();
+    assert_eq!(rt.config.current().unwrap()["controlPort"], 9091);
+    let original = rt.pending_changes().saved_settings_revert_token.unwrap();
+    saved["servers"][1]["name"] = "New name".into();
+    rt.config.save_full(&saved).unwrap();
+
+    assert!(!rt.revert_saved_proxy_settings(&original).await);
+    let old_generation = rt.pending_changes().saved_settings_revert_token.unwrap();
+    rt.gate.bump_generation();
+    assert!(!rt.revert_saved_proxy_settings(&old_generation).await);
+    let token = rt.pending_changes().saved_settings_revert_token.unwrap();
+    assert!(rt.revert_saved_proxy_settings(&token).await);
+    assert!(!rt.revert_saved_proxy_settings(&token).await);
+    let desired = rt.config.current().unwrap();
+    assert_eq!(desired["selectedServerId"], "node-a");
+    assert_eq!(desired["mixedPort"], running["mixedPort"]);
+    assert_eq!(desired["controlPort"], 9090);
+    assert_eq!(desired["dnsConfig"]["enableFakeIp"], false);
+    assert_eq!(
+        desired["dnsDefaults"]["unmatchedAction"],
+        running["dnsDefaults"]["unmatchedAction"]
+    );
+    assert_eq!(
+        desired["dnsDefaults"]["realQueryFallbackAction"],
+        saved["dnsDefaults"]["realQueryFallbackAction"]
+    );
+    assert_eq!(desired["servers"][1]["name"], "New name");
+    assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
+    assert!(sink.calls().is_empty());
+    assert!(rt.pending_changes().saved_settings_revert_token.is_none());
+
+    saved["controlPort"] = 19090.into();
+    rt.config.save_full(&saved).unwrap();
+    let mut running_with_removed_resolver = running.clone();
+    running_with_removed_resolver["dnsDefaults"]["unmatchedAction"] =
+        serde_json::json!({"type": "server", "serverId": "removed-resolver"});
+    mark_running_with_snapshot(&rt, &running_with_removed_resolver);
+    let token = rt.pending_changes().saved_settings_revert_token.unwrap();
+    assert!(rt.revert_saved_proxy_settings(&token).await);
+    let desired = rt.config.current().unwrap();
+    assert_eq!(desired["mixedPort"], running["mixedPort"]);
+    assert_eq!(desired["controlPort"], 9090);
+    assert_eq!(desired["dnsConfig"]["enableFakeIp"], true);
+    assert_eq!(
+        desired["dnsDefaults"]["unmatchedAction"],
+        saved["dnsDefaults"]["unmatchedAction"]
+    );
+    assert!(rt.pending_changes().saved_settings_revert_token.is_none());
+}
+
 /// **基线四态**（T1-19）：无快照 / 有快照无变化 / 空 servers / 读不到当前配置。
 /// 全部走「空差集」，且**绝不 panic**。
 ///
@@ -1994,6 +2062,7 @@ fn pending_changes_baseline_states_are_all_empty() {
         restart_deferred: false,
         pending_apply: false,
         restart_required: false,
+        saved_settings_revert_token: None,
         native_retirements: vec![],
     };
 
@@ -4113,6 +4182,7 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
             restart_deferred: false,
             pending_apply: false,
             restart_required: false,
+            saved_settings_revert_token: None,
             native_retirements: vec![],
         },
         "重启落地后差集必须为空 —— 非空 = 条上继续挂「立即应用」，用户再点也清不掉"

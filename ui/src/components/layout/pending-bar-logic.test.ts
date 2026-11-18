@@ -251,6 +251,13 @@ describe('composeBarView：A=clean 那四行', () => {
     expect(v.titleVars).toEqual({});
   });
 
+  it('只在保存设置可撤销且未在应用时提供撤销', () => {
+    const input = { savedSettingsRevertAvailable: true };
+    expect(ids({ ...input, pendingPhase: 'pending' })).toContain('revertSaved');
+    expect(ids({ ...input, pendingPhase: 'applyFailed' })).toContain('revertSaved');
+    expect(ids({ ...input, pendingPhase: 'applying' })).toEqual(['apply']);
+  });
+
   // 变异对照：把 apply 的 disabled 改成 false → 转红（用户能在重启在飞时再点一次，连点叠 force-restart）。
   it('clean × applying → 「应用中…」+ 按钮在位但禁用', () => {
     const v = composeBarView(barInput({ pendingPhase: 'applying' }));

@@ -494,6 +494,7 @@
     "pendingGroupStaged": "Unsaved — not written to disk yet",
     "pendingIgnoreBtn": "Dismiss",
     "pendingResetBtn": "Reset",
+    "pendingRevertSavedSettings": "Revert proxy and port changes",
     "pendingResetConfirm": "Discard all unsaved changes?",
     "pendingRetryBtn": "Retry",
     "pendingRetrySaveBtn": "Retry save",

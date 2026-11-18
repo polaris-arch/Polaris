@@ -56,6 +56,8 @@ pub struct PendingChangesSummary {
     pub restart_deferred: bool,
     pub pending_apply: bool,
     pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_settings_revert_token: Option<String>,
     /// Independent original native owners; K/D equality and host acceptance
     /// cannot discharge a verified physical listener-retirement failure.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -178,6 +180,7 @@ impl ProxyRuntime {
             restart_deferred: false,
             pending_apply: native_pending,
             restart_required: false,
+            saved_settings_revert_token: None,
             native_retirements: native_retirements.clone(),
         };
         let Some(snap) = self.startup_snapshot.read().ok().and_then(|g| g.clone()) else {
@@ -248,6 +251,9 @@ impl ProxyRuntime {
             added,
             modified,
             removed,
+            saved_settings_revert_token: applied
+                .as_ref()
+                .and_then(|running| self.saved_settings_revert_token(&current, running)),
             restart_deferred: non_node_pending
                 || selected_pending
                 || self.host_effect_pending()

@@ -73,6 +73,7 @@ import { toast } from '@/lib/error-handler';
 
 const ACTION_LABEL: Record<BarActionId, string> = {
   reset: 'home.pendingResetBtn',
+  revertSaved: 'home.pendingRevertSavedSettings',
   save: 'home.pendingSaveBtn',
   apply: 'home.pendingApplyBtn',
   retryApply: 'home.pendingRetryBtn',
@@ -89,6 +90,7 @@ const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply',
 
 /** 「重置」的原地二次确认 key（同桌面 `PendingChangesBar` 的 `RESET_KEY`）。 */
 const RESET_KEY = 'mobile-reset-pending';
+const REVERT_SAVED_KEY = 'mobile-revert-saved-proxy-settings:';
 
 export function MobilePendingBar(): ReactElement | null {
   const { t } = useTranslation();
@@ -249,6 +251,7 @@ export function MobilePendingBar(): ReactElement | null {
     configurationDurable: apply.configurationDurable,
     coreCommitted: coreRunning && apply.mainGeneration === coreGeneration && apply.coreState === 'committed',
     configurationPending: pending.restartDeferred,
+    savedSettingsRevertAvailable: !!pending.savedSettingsRevertToken,
     persistenceRetrying: apply.persistenceRetrying,
     persistenceOwnerPending: !!apply.coreRecovery && apply.coreRecovery.selectionIntentGeneration === undefined,
     persistenceOnly: apply.persistenceOnly,
@@ -425,6 +428,19 @@ export function MobilePendingBar(): ReactElement | null {
           }
         });
         return;
+      case 'revertSaved': {
+        const token = pending.savedSettingsRevertToken;
+        if (!token) return;
+        confirmTwice(REVERT_SAVED_KEY + token, async () => {
+          try {
+            if (!await api.proxy.revertSavedSettings(token)) throw new Error('Saved settings changed');
+            setApply(state => state.phase === 'failed' ? dismissApplyState(state) : state);
+          } catch {
+            toast.error(t('common.saveFailed'));
+          }
+        });
+        return;
+      }
       case 'save':
       case 'retrySave':
         void useStagedConfigStore.getState().save();
@@ -468,7 +484,8 @@ export function MobilePendingBar(): ReactElement | null {
       </div>
       <div className="m-pending-acts">
         {view.actions.map((a) => {
-          const arming = a.id === 'reset' && armed === RESET_KEY;
+          const arming = (a.id === 'reset' && armed === RESET_KEY)
+            || (a.id === 'revertSaved' && armed === REVERT_SAVED_KEY + pending.savedSettingsRevertToken);
           return (
             <button
               key={a.id}

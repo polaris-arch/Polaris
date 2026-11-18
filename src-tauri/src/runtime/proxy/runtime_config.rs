@@ -3171,6 +3171,63 @@ impl ProxyRuntime {
         });
     }
 
+    pub(super) fn saved_settings_revert_token(
+        &self,
+        desired: &Value,
+        running: &Value,
+    ) -> Option<String> {
+        let generation = self.gate.generation();
+        self.gate
+            .with_current_generation(generation, |live| {
+                if live.is_busy() || !self.saved_settings_revert_ready() {
+                    return None;
+                }
+                saved_settings_revert_token(generation, desired, running)
+            })
+            .flatten()
+    }
+
+    pub(crate) async fn revert_saved_proxy_settings(&self, token: &str) -> bool {
+        use crate::runtime::config::Decision;
+
+        let _serial = self.switch_serial.lock().await;
+        let _publication = self.gate.lock_generation_publication();
+        let generation = self.gate.generation();
+        self.gate
+            .with_current_generation(generation, |live| {
+                if live.is_busy() || !self.saved_settings_revert_ready() {
+                    return false;
+                }
+                let Some(running) = self.current_config_snapshot() else {
+                    return false;
+                };
+                let result = self.config.try_update_saved(|desired| {
+                    if saved_settings_receipt(generation, desired, &running) != token {
+                        return Decision::Skip(());
+                    }
+                    let Some(restored) = restored_proxy_settings(desired, &running) else {
+                        return Decision::Skip(());
+                    };
+                    *desired = restored;
+                    Decision::Write(())
+                });
+                matches!(result, Ok(((), Some(_))))
+            })
+            .unwrap_or(false)
+    }
+
+    fn saved_settings_revert_ready(&self) -> bool {
+        self.core_running()
+            && self
+                .pending_force_restart
+                .try_read()
+                .is_ok_and(|pending| pending.is_none())
+            && self
+                .runtime_config_apply
+                .try_lock()
+                .is_ok_and(|state| state.pending.is_none())
+    }
+
     /// User choice is bound to the exact candidate, running projection, generation
     /// and selection intent. Confirmation cannot silently apply a later edit.
     pub(crate) async fn apply_pending_transaction(
@@ -3551,6 +3608,111 @@ impl ProxyRuntime {
             _ => SwitchOutcome::Deferred,
         }
     }
+}
+
+const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[
+    "proxyMode",
+    "proxyModeType",
+    "selectedServerId",
+    polaris_store::SELECTION_INTENT_KEY,
+    "mixedPort",
+    "controlPort",
+    "httpPort",
+    "allowLan",
+    "tunConfig",
+];
+
+fn revertible_proxy_settings<'a>(
+    desired: &'a Value,
+    running: &'a Value,
+) -> impl Iterator<Item = &'static str> + 'a {
+    // Only restore the selection pair if its running target still exists.
+    use polaris_config_engine::user_config::dns_constants::{
+        is_block_selection, is_direct_selection,
+    };
+    let selection_available = running
+        .get("selectedServerId")
+        .and_then(Value::as_str)
+        .is_none_or(|id| {
+            is_direct_selection(Some(id))
+                || is_block_selection(Some(id))
+                || desired
+                    .get("servers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes
+                            .iter()
+                            .any(|node| node.get("id").and_then(Value::as_str) == Some(id))
+                    })
+        });
+    REVERTIBLE_PROXY_SETTINGS
+        .iter()
+        .copied()
+        .filter(move |key| {
+            desired.get(key) != running.get(key)
+                && (selection_available
+                    || !matches!(
+                        *key,
+                        "selectedServerId" | polaris_store::SELECTION_INTENT_KEY
+                    ))
+        })
+}
+
+fn restore_value(document: &mut serde_json::Map<String, Value>, key: &str, value: Option<&Value>) {
+    if let Some(value) = value {
+        document.insert(key.to_owned(), value.clone());
+    } else {
+        document.remove(key);
+    }
+}
+
+fn restored_proxy_settings(desired: &Value, running: &Value) -> Option<Value> {
+    let action_path = "/dnsDefaults/unmatchedAction";
+    let restore_dns = desired.get("dnsConfig") != running.get("dnsConfig")
+        || desired.pointer(action_path) != running.pointer(action_path);
+    let mut settings = revertible_proxy_settings(desired, running).peekable();
+    if !restore_dns && settings.peek().is_none() {
+        return None;
+    }
+    let mut candidate = desired.clone();
+    let output = candidate.as_object_mut()?;
+    for key in settings {
+        restore_value(output, key, running.get(key));
+    }
+    if restore_dns {
+        restore_value(output, "dnsConfig", running.get("dnsConfig"));
+        if let Some(action) = running.pointer(action_path) {
+            output
+                .entry("dnsDefaults")
+                .or_insert_with(|| serde_json::json!({}))["unmatchedAction"] = action.clone();
+        } else if let Some(defaults) = output.get_mut("dnsDefaults").and_then(Value::as_object_mut)
+        {
+            defaults.remove("unmatchedAction");
+        }
+        // The running default action may refer to a resolver that was deleted.
+        if polaris_store::validate::validate_for_save(&candidate).is_err() {
+            let output = candidate.as_object_mut()?;
+            restore_value(output, "dnsConfig", desired.get("dnsConfig"));
+            restore_value(output, "dnsDefaults", desired.get("dnsDefaults"));
+        }
+    }
+    (candidate != *desired).then_some(candidate)
+}
+
+fn saved_settings_revert_token(
+    generation: u64,
+    desired: &Value,
+    running: &Value,
+) -> Option<String> {
+    restored_proxy_settings(desired, running)?;
+    Some(saved_settings_receipt(generation, desired, running))
+}
+
+fn saved_settings_receipt(generation: u64, desired: &Value, running: &Value) -> String {
+    use polaris_config_engine::builder::orchestration::stable_stringify;
+
+    let input = stable_stringify(&serde_json::json!([generation, desired, running]));
+    polaris_updater::sha256_hex(input.as_bytes())
 }
 
 /// Preview of changed host/service controls, not mere TUN/cache presence.

@@ -343,7 +343,7 @@ export type StagedPhase = 'clean' | 'staged' | 'saving' | 'saveFailed';
 /** 维度 B：pending（磁盘 vs 运行核）。 */
 export type PendingPhase = 'none' | 'pending' | 'applying' | 'applyFailed' | 'durabilityPending';
 
-export type BarActionId = 'reset' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave' | 'retryPersistence' | 'retryHost' | 'checkHost' | 'checkNative';
+export type BarActionId = 'reset' | 'revertSaved' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave' | 'retryPersistence' | 'retryHost' | 'checkHost' | 'checkNative';
 
 /** `disabled` 与「不出现」是两回事：表里的「禁用」要求按钮仍在位（否则条会在重启期间抖一下）。 */
 export interface BarAction {
@@ -393,6 +393,7 @@ export interface BarInput {
   configurationDurable?: boolean;
   coreCommitted?: boolean;
   configurationPending?: boolean;
+  savedSettingsRevertAvailable?: boolean;
   persistenceOnly?: boolean;
   /** Confirmed regeneration supersession ends this original recovery, not durability. */
   persistenceRecoveryEnded?: boolean;
@@ -530,7 +531,7 @@ export function composeBarView(input: BarInput): BarView {
           titleKey: pendingCount === 0 ? 'home.pendingBarConfigOnly' : 'home.pendingBarTitle',
           titleVars: pendingCount === 0 ? {} : { count: pendingCount },
           detailKey: 'home.pendingDetailTip',
-          actions: gateApply([act('apply')]),
+          actions: gateApply([...(coreRunning && input.savedSettingsRevertAvailable ? [act('revertSaved')] : []), act('apply')]),
         };
       case 'applying':
         return {
@@ -547,7 +548,7 @@ export function composeBarView(input: BarInput): BarView {
           err: true,
           ...applyFailedTitle,
           detailKey: 'home.pendingDetailTip',
-          actions: gateApply([act('retryApply'), act('dismissApply')]),
+          actions: gateApply([...(coreRunning && input.savedSettingsRevertAvailable ? [act('revertSaved')] : []), act('retryApply'), act('dismissApply')]),
         };
     }
   }

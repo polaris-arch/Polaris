@@ -1005,8 +1005,7 @@ impl ConfigManager {
         if cache.as_ref() != Some(expected) {
             return Err(StoreError::validation("runtime desired owner superseded"));
         }
-        let bytes = std::fs::read(&self.path).map_err(|error| StoreError::Io(error.to_string()))?;
-        let persisted: Value = serde_json::from_slice(&bytes).map_err(StoreError::from_parse)?;
+        let (persisted, bytes) = self.read_saved_document()?;
         if &persisted != expected {
             return Err(StoreError::validation(
                 "runtime durable desired owner superseded",
@@ -1017,6 +1016,12 @@ impl ConfigManager {
             polaris_updater::sha256_hex(&bytes),
             config_version(expected),
         ))
+    }
+
+    fn read_saved_document(&self) -> Result<(Value, Vec<u8>), StoreError> {
+        let bytes = std::fs::read(&self.path).map_err(|error| StoreError::Io(error.to_string()))?;
+        let document = serde_json::from_slice(&bytes).map_err(StoreError::from_parse)?;
+        Ok((document, bytes))
     }
 
     /// Warm saved-state commit fence. This shares the real writer mutex, never loads or
@@ -1642,6 +1647,27 @@ impl ConfigManager {
         f: impl FnOnce(&mut Value) -> Decision<R>,
     ) -> Result<(R, Option<Value>), StoreError> {
         self.update_with_cleanup(false, f)
+    }
+
+    /// An approved replacement targets the exact saved document and must
+    /// skip load-time migration. A writer may be waiting for the caller's
+    /// runtime claim, so refuse a contended write lock immediately.
+    pub(crate) fn try_update_saved<R>(
+        &self,
+        f: impl FnOnce(&mut Value) -> Decision<R>,
+    ) -> Result<(R, Option<Value>), StoreError> {
+        deny_inside_projection("try_update_saved");
+        let _guard = self
+            .write_lock
+            .try_lock()
+            .map_err(|_| StoreError::validation("saved commit unavailable"))?;
+        let (mut saved, _) = self.read_saved_document()?;
+        match f(&mut saved) {
+            Decision::Skip(result) => Ok((result, None)),
+            Decision::Write(result) => self
+                .save_full_under_write_lock(&saved)
+                .map(|value| (result, Some(value))),
+        }
     }
 
     /// Subscription metadata edit: save first, then synchronously supersede refresh ownership

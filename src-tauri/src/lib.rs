@@ -1197,6 +1197,7 @@ pub fn run() {
             proxy_stop,
             proxy_get_status,
             proxy_get_pending_changes,
+            proxy_revert_saved_settings,
             proxy_apply_pending_changes,
             proxy_runtime_apply_status,
             kernel_probe_outbound,

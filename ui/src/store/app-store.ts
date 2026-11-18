@@ -67,6 +67,7 @@ export interface PendingChangesState {
   removed: string[];
   /** 「保存只持久化」延后的非节点结构性变更（三个数组看不见它，见 `PendingNodeChanges`）。 */
   restartDeferred: boolean;
+  savedSettingsRevertToken?: string;
   nativeRetirements?: PendingNodeChanges['nativeRetirements'];
 }
 
@@ -87,6 +88,7 @@ export function normalizePendingChanges(
     modified: raw?.modified ?? [],
     removed: raw?.removed ?? [],
     restartDeferred: raw?.restartDeferred ?? false,
+    ...(raw?.savedSettingsRevertToken ? { savedSettingsRevertToken: raw.savedSettingsRevertToken } : {}),
     ...(raw?.nativeRetirements === undefined ? {} : { nativeRetirements: raw.nativeRetirements }),
   };
 }

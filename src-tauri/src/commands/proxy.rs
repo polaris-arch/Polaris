@@ -362,6 +362,22 @@ pub async fn proxy_apply_pending_changes(
     ))
 }
 
+/// Restore reversible saved proxy settings from the running generation.
+#[tauri::command]
+pub async fn proxy_revert_saved_settings(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    token: String,
+) -> Result<ApiResponse<bool>, ()> {
+    let reverted = state.proxy().revert_saved_proxy_settings(&token).await;
+    if reverted {
+        crate::commands::config::emit_config_changed_signal(&app);
+    }
+    // A stale receipt must replace the confirmation shown on both clients.
+    state.proxy().push_pending_changes();
+    Ok(ApiResponse::ok(reverted))
+}
+
 /// Observe an existing transaction without resubmission or restart. Native-only
 /// checks cannot enter the original D owner's automatic acknowledgement path.
 #[tauri::command]

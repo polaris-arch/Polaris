@@ -101,6 +101,10 @@ export const proxyApi = {
   },
 
   /** Explicit same-transaction persistence recovery; never saves or reapplies D. */
+  async revertSavedSettings(token: string): Promise<boolean> {
+    return invoke(IPC_CHANNELS.PROXY_REVERT_SAVED_SETTINGS, { token });
+  },
+
   async retryRuntimePersistence(transactionId: string): Promise<PendingApplyResult> {
     return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { retryPersistenceTransactionId: transactionId });
   },

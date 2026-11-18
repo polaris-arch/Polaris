@@ -20,6 +20,7 @@ export const IPC_CHANNELS = {
   // §2 待应用差集（pull 模型，configChanged/STARTED/STOPPED 后拉）：节点集相对运行核快照的增/改/删差集，供动作条汇总
   // + 待入池/待生效徽标数据源。核未运行（无快照）→ 空差集（动作条隐藏）。
   PROXY_GET_PENDING_CHANGES: 'proxy_get_pending_changes',
+  PROXY_REVERT_SAVED_SETTINGS: 'proxy_revert_saved_settings',
   // §2 动作条「立即应用」：把 Rust 侧最新 config force-restart 入核（复用 F11 applyConfigForcingRestart，绕 P2-A/B defer）。
   PROXY_APPLY_PENDING_CHANGES: 'proxy_apply_pending_changes',
   PROXY_RUNTIME_APPLY_STATUS: 'proxy_runtime_apply_status',

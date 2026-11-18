@@ -24,6 +24,8 @@ const h = vi.hoisted(() => ({
   pendingRead: vi.fn(),
   freshApply: vi.fn(),
   cancelImpact: vi.fn(),
+  confirmTwice: vi.fn(),
+  revertSaved: vi.fn(),
   realReconciliation: false,
   lifecycleReady: vi.fn(),
   offLifecycle: vi.fn(),
@@ -62,7 +64,7 @@ vi.mock('react', async (original) => ({
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('@/lib/confirm-twice', () => ({
-  useConfirmTwice: () => ({ armed: null, confirmTwice: vi.fn() }),
+  useConfirmTwice: () => ({ armed: null, confirmTwice: h.confirmTwice }),
 }));
 // Existing restart tests isolate observation; host cases exercise the real shared hook and selectors.
 vi.mock('@/components/layout/use-runtime-apply-reconciliation', async (original) => {
@@ -80,6 +82,7 @@ vi.mock('@/ipc', () => ({ api: { proxy: {
   getPendingChanges: h.pendingRead,
   applyPendingChanges: h.freshApply,
   cancelRuntimeImpact: h.cancelImpact,
+  revertSavedSettings: h.revertSaved,
   getStatus: h.statusRead,
 } } }));
 vi.mock('@/store/app-store', () => ({
@@ -101,6 +104,7 @@ vi.mock('@/lib/error-handler', () => ({
 import { MobilePendingBar } from './MobilePendingBar';
 import { FormSheet } from './forms/FormSheet';
 import { clearDismissables, dismissTop } from './back-stack';
+import { toast } from '@/lib/error-handler';
 
 async function microtasks(): Promise<void> {
   for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -179,6 +183,21 @@ beforeEach(() => {
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('mobile pending restart and write feedback', () => {
+  it('reports a failed revert and offers confirmation again without entering apply retry', async () => {
+    h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'original' };
+    h.revertSaved.mockResolvedValueOnce(false);
+    h.confirmTwice.mockImplementationOnce((_key, action) => action());
+    click('home.pendingRevertSavedSettings');
+    await microtasks();
+    expect(h.revertSaved).toHaveBeenCalledWith('original');
+    expect(toast.error).toHaveBeenCalledWith('common.saveFailed');
+    expect(markup(renderBar())).not.toContain('home.pendingRetryBtn');
+    h.app.pendingChanges = { ...h.app.pendingChanges, savedSettingsRevertToken: 'current' };
+    click('home.pendingRevertSavedSettings');
+    expect(h.confirmTwice).toHaveBeenLastCalledWith(expect.stringContaining('current'), expect.any(Function));
+    expect(h.applyNow).not.toHaveBeenCalled();
+  });
+
   it('uses the mobile sheet and trusted reasons, without applying the restart while opening it', async () => {
     const sheet = await openRestartSheet();
     expect(sheet.props.compact).toBe(true);

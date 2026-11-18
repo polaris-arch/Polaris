@@ -363,6 +363,8 @@ interface ScreenFeedback {
   readonly shape: Shape;
   /** 罩住写腿的那个符号。 */
   readonly mechanism: string;
+  /** An individual write can report through a different visible channel. */
+  readonly reporterByCall?: Readonly<Record<string, string>>;
   /**
    * 机制自身的「有牙」判据：
    * - `behavioral` —— 机制是个纯工厂，下面直接拿一个必然 reject 的 op 驱动它（最强的一档）。
@@ -378,6 +380,7 @@ const FEEDBACK: readonly ScreenFeedback[] = [
     dir: 'mobile/MobilePendingBar.tsx',
     shape: 'reporter',
     mechanism: 'setApply',
+    reporterByCall: { 'api.proxy.revertSavedSettings': 'toast.error' },
     teeth: { file: 'mobile/MobilePendingBar.tsx', decl: 'onApply', channel: 'setApply', needsCatch: true },
     why: '持久化重试与显式应用共用 onApply；失败进入 failed 态，经 composeBarView 渲染为常驻错误条与重试入口（行为门：MobilePendingBar.test.tsx）',
   },
@@ -641,7 +644,9 @@ function uncoveredByReporter(sf: ts.SourceFile, reporter: string, offsets: reado
       return (
         c !== undefined &&
         (collectNodes(c, ts.isCallExpression) as ts.CallExpression[]).some(
-          (call) => calleeNameOf(call) === reporter
+          (call) => reporter.includes('.')
+            ? call.expression.getText(sf) === reporter
+            : calleeNameOf(call) === reporter
         )
       );
     })
@@ -767,7 +772,7 @@ describe('② 每一处写调用都被它那个屏的已登记机制罩住', () 
       if (sites.length === 0) continue;
       const screen = screenOf(f.file);
       if (!screen) continue; // 由 ① 负责报，这里不重复
-      const offsets = sites.map((s) => s.index);
+      const offsets = sites.filter(s => !screen.reporterByCall?.[s.text]).map(s => s.index);
       const bad = new Set(
         screen.shape === 'wrapper'
           ? uncoveredByWrapper(parse(f.file), screen.mechanism, offsets)
@@ -775,6 +780,12 @@ describe('② 每一处写调用都被它那个屏的已登记机制罩住', () 
             ? uncoveredByDelegate(parse(f.file), offsets)
             : uncoveredByReporter(parse(f.file), screen.mechanism, offsets)
       );
+      for (const s of sites) {
+        const reporter = screen.reporterByCall?.[s.text];
+        if (reporter && uncoveredByReporter(parse(f.file), reporter, [s.index]).length) {
+          bad.add(s.index);
+        }
+      }
       for (const s of sites) if (bad.has(s.index)) escaped.push(`${s.file}:${s.line} ${s.text}`);
     }
     expect(

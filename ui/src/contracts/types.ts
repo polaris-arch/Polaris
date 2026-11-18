@@ -536,6 +536,7 @@ export interface PendingNodeChanges {
    * 需要重启才生效。条上必须把它算进「有没有东西待应用」，否则「保存」在 UI 上完全无痕。
    */
   restartDeferred: boolean;
+  savedSettingsRevertToken?: string;
   nativeRetirements?: NativeRetirementDebt[];
 }
 

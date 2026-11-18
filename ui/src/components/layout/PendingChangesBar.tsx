@@ -72,6 +72,7 @@ import {
 
 const ACTION_LABEL: Record<BarActionId, string> = {
   reset: 'home.pendingResetBtn',
+  revertSaved: 'home.pendingRevertSavedSettings',
   save: 'home.pendingSaveBtn',
   apply: 'home.pendingApplyBtn',
   retryApply: 'home.pendingRetryBtn',
@@ -94,6 +95,7 @@ const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply',
  * 其余动作（保存/应用/重试/忽略）都不销毁用户输入，不该分摊弹窗疲劳。
  */
 const RESET_KEY = 'reset-pending';
+const REVERT_SAVED_KEY = 'revert-saved-proxy-settings:';
 
 export default function PendingChangesBar() {
   const { t } = useTranslation();
@@ -275,6 +277,7 @@ export default function PendingChangesBar() {
     configurationDurable: apply.configurationDurable,
     coreCommitted: coreRunning && apply.mainGeneration === coreGeneration && apply.coreState === 'committed',
     configurationPending: pending.restartDeferred,
+    savedSettingsRevertAvailable: !!pending.savedSettingsRevertToken,
     persistenceRetrying: apply.persistenceRetrying,
     persistenceOwnerPending: !!apply.coreRecovery && apply.coreRecovery.selectionIntentGeneration === undefined,
     persistenceOnly: apply.persistenceOnly,
@@ -466,6 +469,20 @@ export default function PendingChangesBar() {
         // 原地二次点击（`lib/confirm-twice.ts`），不弹窗 —— 见 RESET_KEY 头注。
         confirmTwice(RESET_KEY, () => useStagedConfigStore.getState().reset());
         return;
+      case 'revertSaved': {
+        const token = pending.savedSettingsRevertToken;
+        if (!token) return;
+        confirmTwice(REVERT_SAVED_KEY + token, () => {
+          void api.proxy.revertSavedSettings(token).then(
+            reverted => {
+              if (reverted) setApply(state => state.phase === 'failed' ? dismissApplyState(state) : state);
+              else toast.error(t('common.saveFailed'));
+            },
+            () => toast.error(t('common.saveFailed')),
+          );
+        });
+        return;
+      }
       case 'save':
       case 'retrySave':
         void onSave();
@@ -550,7 +567,8 @@ export default function PendingChangesBar() {
       <div className="pb-acts">
         {view.actions.map((a) => {
           // 武装态：翻实心红（`.btn.confirming`）+ 换文案，与原型 confirmTwice 对文字按钮的两条动作一致。
-          const arming = a.id === 'reset' && armed === RESET_KEY;
+          const arming = (a.id === 'reset' && armed === RESET_KEY)
+            || (a.id === 'revertSaved' && armed === REVERT_SAVED_KEY + pending.savedSettingsRevertToken);
           return (
             <button
               key={a.id}
@@ -564,7 +582,8 @@ export default function PendingChangesBar() {
               onClick={() => runAction(a.id)}
             >
               {spins(a.id) && <span className="spinner" />}
-              {arming ? t('home.pendingResetConfirm') : t(a.id === 'dismissApply' && apply.persistenceRecoveryEnded ? 'home.pendingExitPersistenceRecoveryBtn' : ACTION_LABEL[a.id])}
+              {arming ? t(a.id === 'reset' ? 'home.pendingResetConfirm' : 'common.confirm')
+                : t(a.id === 'dismissApply' && apply.persistenceRecoveryEnded ? 'home.pendingExitPersistenceRecoveryBtn' : ACTION_LABEL[a.id])}
             </button>
           );
         })}
