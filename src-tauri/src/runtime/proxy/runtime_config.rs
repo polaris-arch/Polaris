@@ -1391,6 +1391,7 @@ impl ProxyRuntime {
     pub(super) async fn apply_runtime_candidate(
         self: &Arc<Self>,
         candidate: Value,
+        expected_desired: Option<&Value>,
     ) -> RuntimeApplyResult {
         let generation = self.gate.generation();
         let intent = self.selector_reconcile.intent_generation();
@@ -1407,6 +1408,9 @@ impl ProxyRuntime {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
             }
         };
+        if expected_desired.is_some_and(|expected| expected != &desired) {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
         let baseline = self
             .runtime_config_baseline
             .read()
@@ -3204,7 +3208,7 @@ impl ProxyRuntime {
             Ok(candidate) => candidate,
             Err(_) => return RuntimeApplyResult::status("rejected"),
         };
-        Box::pin(self.apply_runtime_candidate(candidate)).await
+        Box::pin(self.apply_runtime_candidate(candidate, None)).await
     }
 
     // The local D/R/generation/intent checks occur AFTER the protocol await too.

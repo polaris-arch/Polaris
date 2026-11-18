@@ -1721,6 +1721,33 @@ async fn explicit_selection_dirty_target_is_deferred_without_put_and_pending_bar
     assert!(!rt.pending_changes().restart_deferred);
 }
 
+#[test]
+fn selected_outbound_admission_copies_only_the_new_target() {
+    use super::super::hot_switch::append_selected_outbound;
+
+    let mut running = two_node_config(7891, "node-a");
+    let mut saved = running.clone();
+    saved["mixedPort"] = 17891.into();
+    saved["servers"][1]["port"] = 29002.into();
+    let mut clone = running["servers"][0].clone();
+    clone["id"] = "cloned-exit".into();
+    clone["name"] = "Node A copy".into();
+    let mut mesh = clone.clone();
+    mesh["id"] = "new-mesh".into();
+    mesh["protocol"] = "tailscale".into();
+    saved["servers"]
+        .as_array_mut()
+        .unwrap()
+        .extend([clone.clone(), mesh]);
+
+    let mut expected = running.clone();
+    expected["servers"].as_array_mut().unwrap().push(clone);
+    assert!(append_selected_outbound(&mut running, &saved, "cloned-exit").is_some());
+    assert!(append_selected_outbound(&mut running, &saved, "node-b").is_none());
+    assert!(append_selected_outbound(&mut running, &saved, "new-mesh").is_none());
+    assert_eq!(running, expected);
+}
+
 #[tokio::test]
 async fn explicit_selection_busy_replays_latest_id_but_stop_discards_it() {
     let (rt, _dir, _sink, running) = explicit_selection_fixture();

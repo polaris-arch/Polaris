@@ -37,6 +37,9 @@ use polaris_config_engine::user_config::dns_constants::{
     is_block_selection, is_direct_selection, DIRECT_TAG, PROXY_SELECTOR_TAG,
 };
 use polaris_config_engine::user_config::rule::RuleAction;
+use polaris_config_engine::user_config::server_config::{
+    is_mesh_node, lands_in_endpoints, ServerConfig,
+};
 use polaris_config_engine::user_config::ProxyModeType;
 use polaris_core_supervisor::LifecycleKind;
 use polaris_helper_proto::Platform;
@@ -745,6 +748,36 @@ pub(super) fn attest_runtime_selection(
     }
 }
 
+/// A manual selection can admit one new outbound without copying the saved graph.
+/// Existing nodes keep their running values and endpoint ownership uses explicit Apply.
+pub(super) fn append_selected_outbound<'a>(
+    runtime: &mut Value,
+    desired: &'a Value,
+    server_id: &str,
+) -> Option<&'a Value> {
+    let running = runtime.get_mut("servers")?.as_array_mut()?;
+    if running
+        .iter()
+        .any(|node| node.get("id").and_then(Value::as_str) == Some(server_id))
+    {
+        return None;
+    }
+    let node = desired
+        .get("servers")
+        .and_then(Value::as_array)
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(server_id))
+        })?;
+    let typed = serde_json::from_value::<ServerConfig>(node.clone()).ok()?;
+    if is_mesh_node(&typed) || lands_in_endpoints(typed.protocol) {
+        return None;
+    }
+    running.push(node.clone());
+    Some(node)
+}
+
 impl ProxyRuntime {
     async fn clash_mode_status(&self) -> Option<ClashModeStatus> {
         #[cfg(test)]
@@ -1323,8 +1356,8 @@ impl ProxyRuntime {
         )
     }
 
-    /// 显式选择只获授权改运行态的 selectedServerId。磁盘 D 中其它保存未 Apply 的改动
-    /// 不得借一次选择进入 R；目标不是当前运行成员或参数已变时交给明确的 Apply。
+    /// 显式选择只下发出口意图及尚未进入 R 的普通目标节点。修改已有运行节点、
+    /// 选择未应用的组网端点及 D 中其它未应用的改动仍走显式 Apply。
     pub async fn switch_selected_server_if_current(
         self: &Arc<Self>,
         server_id: &str,
@@ -1370,9 +1403,7 @@ impl ProxyRuntime {
             Some(actual.get(server_id) == Some(expected))
         }) == Some(true);
         let staged = self.config.staged_node_mask();
-        if !clean_member
-            || (staged.pending && (!staged.scope_known || staged.node_ids.contains(server_id)))
-        {
+        if staged.pending && (!staged.scope_known || staged.node_ids.contains(server_id)) {
             self.defer_selected_switch("目标节点尚未在运行核中，或节点修改尚未应用");
             return Ok(Some(SwitchOutcome::Deferred));
         }
@@ -1386,6 +1417,26 @@ impl ProxyRuntime {
             Value::String(server_id.to_string()),
         );
         object.remove(polaris_store::SELECTION_INTENT_KEY);
+        if !clean_member {
+            if let Some(node) = append_selected_outbound(&mut projected, &latest, server_id) {
+                let result = Box::pin(self.apply_runtime_candidate(projected, Some(&latest))).await;
+                let outcome = Self::runtime_result_outcome(&result);
+                // Apply can first settle a retained receipt for another candidate.
+                if outcome == SwitchOutcome::HotSwitched
+                    && !self.current_config_snapshot().is_some_and(|running| {
+                        running.get("selectedServerId").and_then(Value::as_str) == Some(server_id)
+                            && running["servers"]
+                                .as_array()
+                                .is_some_and(|nodes| nodes.contains(node))
+                    })
+                {
+                    return Ok(Some(SwitchOutcome::Pending));
+                }
+                return Ok(Some(outcome));
+            }
+            self.defer_selected_switch("目标节点尚未在运行核中，或节点修改尚未应用");
+            return Ok(Some(SwitchOutcome::Deferred));
+        }
         // Auto and a concrete node are distinct user exits, even at the same leaf.
         // Retain dormant native groups until the next authorized structural reload.
         if let Some(outcome) = self
@@ -1498,7 +1549,7 @@ impl ProxyRuntime {
             );
             if graph_change {
                 // 隔离大事务 future，避免普通 selector 热切也携带其内联状态机。
-                let result = Box::pin(self.apply_runtime_candidate(new_config.clone())).await;
+                let result = Box::pin(self.apply_runtime_candidate(new_config.clone(), None)).await;
                 return Self::runtime_result_outcome(&result);
             }
         }
