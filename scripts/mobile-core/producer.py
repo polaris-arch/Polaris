@@ -498,7 +498,7 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
              'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
-             'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
+             'scripts/mobile-core/apple-admission.mjs', 'scripts/mobile-core/apple_handoff.py',
              'scripts/mobile-core/apple-cache.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
              'scripts/mobile-core/transaction.py',
@@ -510,7 +510,8 @@ ANDROID_UNRELATED_CODE = frozenset({
     'scripts/mobile-core/apple-cache.py',
     'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/build_apple_app.py',
-    'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
+    'scripts/mobile-core/apple-admission.mjs', 'scripts/mobile-core/apple_admission.py',
+    'scripts/mobile-core/apple_handoff.py',
 })
 
 
@@ -526,17 +527,18 @@ def android_build_code(identity, policy=ANDROID_BUILD_CODE_POLICY):
     files = identity.get('files') if isinstance(identity, dict) else None
     require(isinstance(files, dict), 'original producer code inventory is missing')
     missing = set(PRODUCER_FILES) - files.keys()
-    # Retained receipts can describe the previous installer. Keep its exact
-    # file pin so migration causes a cache miss and the old pair is preserved.
-    require(not missing or (missing == {'scripts/mobile-core/prepare-ndk-linux.mjs'}
-                            and 'scripts/mobile-core/prepare-ndk-linux.py' in files),
-            'complete original producer code inventory required')
+    # Retained receipts can describe the previous installer or Apple inspector.
+    if 'scripts/mobile-core/prepare-ndk-linux.py' in files:
+        missing.discard('scripts/mobile-core/prepare-ndk-linux.mjs')
+    if 'scripts/mobile-core/apple_admission.py' in files:
+        missing.discard('scripts/mobile-core/apple-admission.mjs')
+    require(not missing, 'complete original producer code inventory required')
     for name, pin in files.items():
         require(isinstance(name, str) and isinstance(pin, dict) and set(pin) == {'bytes', 'sha256'} and
                 type(pin['bytes']) is int and pin['bytes'] > 0 and isinstance(pin['sha256'], str) and
                 re.fullmatch('[0-9a-f]{64}', pin['sha256']), 'producer code file pin differs')
-    # Unknown extra files stay relevant; only these four Apple-only entries are
-    # omitted. The original file inventory is not edited or replaced.
+    # Unknown extra files stay relevant; only enumerated Apple-only entries
+    # are omitted. The original file inventory is not edited or replaced.
     return {'policy': policy, 'files': {name: pin for name, pin in files.items()
                                       if name not in ANDROID_UNRELATED_CODE}}
 

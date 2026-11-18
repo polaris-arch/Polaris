@@ -240,7 +240,7 @@ def app_identity(*, status_log=None):
                  'scripts/verify-apk.mjs', 'scripts/assert-r8-evidence.mjs',
                  'scripts/release-assets.mjs', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/apple_handoff.py',
-                 'scripts/mobile-core/apple_admission.py']}}
+                 'scripts/mobile-core/apple-admission.mjs']}}
 
 
 def materialize_android(component, receipt_path, tools, work, cache):
