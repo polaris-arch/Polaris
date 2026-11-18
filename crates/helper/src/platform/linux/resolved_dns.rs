@@ -257,11 +257,11 @@ fn set_footprint(before: &Settings) -> Vec<Settings> {
     values.push(value.clone());
     value.dns_over_tls = "no".into();
     values.push(value.clone());
+    value.default_route = true;
+    values.push(value.clone());
     value.servers = vec![polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP.into()];
     values.push(value.clone());
     value.domains = vec![ROUTE_ALL_DOMAIN.into()];
-    values.push(value.clone());
-    value.default_route = true;
     values.push(value);
     values
 }
@@ -467,13 +467,14 @@ fn compare_with(
         vec![
             vec!["dnssec", &index, "no"],
             vec!["dnsovertls", &index, "no"],
+            // Freeze DefaultRoute before a new DNS server can change its inferred value.
+            vec!["default-route", &index, "yes"],
             vec![
                 "dns",
                 &index,
                 polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
             ],
             vec!["domain", &index, ROUTE_ALL_DOMAIN],
-            vec!["default-route", &index, "yes"],
         ]
     } else {
         vec![vec!["revert", &index]]

@@ -2398,7 +2398,8 @@ fn unix_status_only_offers_required_helper_behavior_upgrade() {
     for (platform, version, upgradeable) in [
         (Platform::Mac, 7, false),
         (Platform::Linux, 7, true),
-        (Platform::Linux, 8, false),
+        (Platform::Linux, 8, true),
+        (Platform::Linux, 9, false),
     ] {
         let paths = InstallPaths::for_platform(platform);
         let mut sysops = MockSysOps::default();

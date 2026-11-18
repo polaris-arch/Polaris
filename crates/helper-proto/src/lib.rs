@@ -21,8 +21,8 @@
 //! [`proto_version::for_platform`] 定义目标平台要求，原生 helper 的
 //! [`proto_version::CURRENT`]、握手与安装收据取相同目标代数。
 //! v3 要求执行者自己的准入工厂，v4 扩展 Linux pinned Start 的状态目录，
-//! v7 支持已安装 Core 内容记录；本次 Windows exact-object 行为修复要求 v8，
-//! Mac/Linux 保持 v7，不能因 Windows 修复而替换未受影响的平台 helper。
+//! v7 支持已安装 Core 内容记录，也是 macOS 的要求。
+//! Windows exact-object 行为修复要求 v8，Linux 的 DNS 接管行为修复要求 v9。
 //! App/Core 版本及构建身份改变不递增行为代数，后续兼容 Core 更新继续复用 helper。
 //! Version 仅作兼容性提示；实际 Start 仍须核实执行者与当前对象。
 //!
@@ -341,14 +341,15 @@ pub mod proto_version {
     /// Future mandatory behavior fixes advance the affected target requirement;
     /// new App builds or Core payloads alone must not.
     pub const WINDOWS_EXACT_OBJECT: u32 = 8;
-    /// Linux v8 retires DNS ownership after proving the previous TUN link is gone.
-    pub const LINUX_DNS_LINK_RETIREMENT: u32 = 8;
+    /// Linux v8 retires DNS ownership after the previous TUN link is gone.
+    /// Linux v9 pins the default DNS route before setting the server.
+    pub const LINUX_CHECKED_DNS_TAKEOVER: u32 = 9;
 
     /// Required generation for the target platform, including cross-target clients.
     pub const fn for_platform(platform: crate::Platform) -> u32 {
         match platform {
             crate::Platform::Win => WINDOWS_EXACT_OBJECT,
-            crate::Platform::Linux => LINUX_DNS_LINK_RETIREMENT,
+            crate::Platform::Linux => LINUX_CHECKED_DNS_TAKEOVER,
             crate::Platform::Mac => BASELINE,
             // Mobile targets have no privileged desktop helper. Keep the shared
             // wire baseline without claiming Windows native execution support.
@@ -363,7 +364,7 @@ pub mod proto_version {
     pub const CURRENT: u32 = WINDOWS_EXACT_OBJECT;
     /// The Linux helper must include the resolved-link ownership fix.
     #[cfg(target_os = "linux")]
-    pub const CURRENT: u32 = LINUX_DNS_LINK_RETIREMENT;
+    pub const CURRENT: u32 = LINUX_CHECKED_DNS_TAKEOVER;
     /// Unaffected platforms retain the reusable v7 helper generation.
     #[cfg(not(any(windows, target_os = "linux")))]
     pub const CURRENT: u32 = BASELINE;

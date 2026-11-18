@@ -11,6 +11,7 @@ struct MockResolvedState {
     retired_link: Option<LinkIdentity>,
     settings: Settings,
     baseline: Settings,
+    default_route_explicit: bool,
     calls: Vec<Vec<String>>,
     fail_mutation: Option<String>,
     bad_readback_after_write: bool,
@@ -40,6 +41,7 @@ impl MockRunner {
                 retired_link: None,
                 settings: baseline.clone(),
                 baseline,
+                default_route_explicit: false,
                 calls: vec![],
                 fail_mutation: None,
                 bad_readback_after_write: false,
@@ -121,10 +123,21 @@ impl ResolvectlRunner for MockRunner {
         match args[0] {
             "dnssec" => state.settings.dnssec = args[2].into(),
             "dnsovertls" => state.settings.dns_over_tls = args[2].into(),
-            "dns" => state.settings.servers = vec![args[2].into()],
+            "dns" => {
+                state.settings.servers = vec![args[2].into()];
+                if !state.default_route_explicit {
+                    state.settings.default_route = true;
+                }
+            }
             "domain" => state.settings.domains = vec![args[2].into()],
-            "default-route" => state.settings.default_route = args[2] == "yes",
-            "revert" => state.settings = state.baseline.clone(),
+            "default-route" => {
+                state.settings.default_route = args[2] == "yes";
+                state.default_route_explicit = true;
+            }
+            "revert" => {
+                state.settings = state.baseline.clone();
+                state.default_route_explicit = false;
+            }
             _ => return Err("unexpected mutation".into()),
         }
         if state.bad_readback_after_write {
@@ -151,9 +164,9 @@ fn takeover_sets_and_attests_the_managed_link() {
     assert_eq!(mutations.len(), 5);
     assert_eq!(mutations[0], ["dnssec", "7", "no"]);
     assert_eq!(mutations[1], ["dnsovertls", "7", "no"]);
-    assert_eq!(mutations[2], ["dns", "7", CONTROLLED_DNS_IP]);
-    assert_eq!(mutations[3], ["domain", "7", ROUTE_ALL_DOMAIN]);
-    assert_eq!(mutations[4], ["default-route", "7", "yes"]);
+    assert_eq!(mutations[2], ["default-route", "7", "yes"]);
+    assert_eq!(mutations[3], ["dns", "7", CONTROLLED_DNS_IP]);
+    assert_eq!(mutations[4], ["domain", "7", ROUTE_ALL_DOMAIN]);
     let state = runner.state.lock().unwrap();
     assert!(state.settings.controlled());
     let final_reads = &state.calls[state.calls.len() - 5..];

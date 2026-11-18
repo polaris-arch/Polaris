@@ -36,11 +36,11 @@ fn compatible_helpers_survive_app_releases_but_required_fixes_upgrade() {
 #[test]
 fn platform_behavior_fixes_advance_once_then_reuse_compatible_helpers() {
     use polaris_helper_proto::{proto_version, Platform};
-    for platform in [Platform::Win, Platform::Linux] {
+    for (platform, expected) in [(Platform::Win, 8), (Platform::Linux, 9)] {
         let current = proto_version::for_platform(platform);
-        assert_eq!(current, 8, "{platform:?}");
+        assert_eq!(current, expected, "{platform:?}");
         assert_eq!(
-            replacement_policy("1.0.0", 7, "1.0.0", current).unwrap(),
+            replacement_policy("1.0.0", current - 1, "1.0.0", current).unwrap(),
             "replace"
         );
         assert_eq!(
@@ -51,7 +51,7 @@ fn platform_behavior_fixes_advance_once_then_reuse_compatible_helpers() {
             replacement_policy("1.1.0", current + 1, "1.0.0", current).unwrap(),
             "retain"
         );
-        assert!(replacement_policy("1.1.0", 7, "1.0.0", current).is_err());
+        assert!(replacement_policy("1.1.0", current - 1, "1.0.0", current).is_err());
     }
 }
 
