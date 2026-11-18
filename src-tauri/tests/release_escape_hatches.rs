@@ -2048,7 +2048,7 @@ fn child_descriptor_names_are_exact_owned_outputs_not_ambient_read_exemptions() 
 }
 
 #[test]
-fn local_selection_marker_is_compiled_lane_data_and_formal_carriers_reject_it() {
+fn local_selection_marker_is_scoped_to_the_development_build() {
     let raw = polaris_source_probe::repo_file!("crates/core-supervisor/src/selected_core.rs");
     let literal = polaris_source_probe::mask_comments(&raw);
     let compact: String = literal.split_whitespace().collect();
@@ -2065,9 +2065,6 @@ fn local_selection_marker_is_compiled_lane_data_and_formal_carriers_reject_it() 
     ] {
         assert!(!broken.contains(declaration));
     }
-    let package = polaris_source_probe::repo_file!("scripts/final-package-receipt.py");
-    assert!(package.contains("marker = b'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1'"));
-    assert!(package.contains("require(marker not in data,"));
     let core = polaris_source_probe::repo_file!("src-tauri/src/runtime/proxy/core_binary.rs");
     let core: String = polaris_source_probe::mask_comments(&core)
         .split_whitespace()

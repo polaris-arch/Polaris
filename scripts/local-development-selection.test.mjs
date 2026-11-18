@@ -128,7 +128,9 @@ test('compressed ZIP and APK selection checks executable bytes and archive paths
     const asset = join(root, 'fixture.' + extension);
     const helper = extension === 'zip' ? [{ name: 'polaris-helper.exe', data: 'helper', method: 8 }] : [];
     for (const marked of [false, true]) {
-      const data = Buffer.concat([Buffer.alloc(65530), marked ? LOCAL_MARKER : Buffer.from('app')]);
+      // Use the bytes emitted by the Rust build, independently of the scanner's constant.
+      const payload = Buffer.from(marked ? 'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1' : 'app');
+      const data = Buffer.concat([Buffer.alloc(65530), payload]);
       writeFileSync(asset, fixtureZip([{ name: app, data, method: 8 }, ...helper]));
       const result = await inspect(asset, marked ? markerError : undefined);
       if (!marked) {
