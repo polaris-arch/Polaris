@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync, readdirSync, statSync, symlinkSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync, readdirSync, statSync, symlinkSync, renameSync, linkSync, realpathSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,6 +56,68 @@ function fixture(t, label, extra = [], mutate = () => {}, selectionRepo = repo) 
   return { code: result.status, output: result.stdout + result.stderr };
 }
 const cleaner = '_up_/resources/win/polaris-helper-setup.exe';
+
+test('actual Windows configuration gate requires explicit unique resources and a bounded single-link configuration', (t) => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'polaris-windows-package-conf-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  copyPackagingSource(repo, root);
+  mkdirSync(join(root, '.github/workflows'), { recursive: true });
+  cpSync(join(repo, '.github/workflows/package.yml'), join(root, '.github/workflows/package.yml'));
+  const config = join(root, 'src-tauri/tauri.windows.conf.json');
+  const original = readFileSync(config, 'utf8');
+  const template = JSON.parse(original);
+  const resources = template.bundle.resources;
+  const run = () => {
+    const result = spawnSync(process.execPath, [join(root, 'scripts/verify-packaging.mjs'), 'confs'],
+      { encoding: 'utf8', env: { ...process.env, PATH: '' } });
+    assert.ifError(result.error);
+    return { status: result.status, output: result.stdout + result.stderr };
+  };
+  const reject = (error) => {
+    const result = run();
+    assert.equal(result.status, 1, result.output);
+    if (typeof error === 'string') assert.ok(result.output.includes(error), result.output);
+    else assert.match(result.output, error);
+  };
+  assert.doesNotMatch(run().output, /Windows 发布资源|单链接文件|spawnSync python/);
+  for (const entry of ['core-manifest.json', '../resources/win/', '../resources/dashboard/', '../resources/data/']) {
+    template.bundle.resources = resources.filter(name => name !== entry);
+    writeFileSync(config, JSON.stringify(template));
+    reject(`Windows 发布资源缺少 '${entry}'`);
+  }
+  for (const entry of ['../resources/win/', '../resources/win/*', '../../outside', 'relative', 7]) {
+    template.bundle.resources = [...resources, entry];
+    writeFileSync(config, JSON.stringify(template));
+    reject(/Windows 发布资源必须是显式且唯一的映射/);
+  }
+  writeFileSync(config, original);
+  if (process.platform !== 'win32') {
+    truncateSync(config, 512 * 1024 ** 2 + 1);
+    reject(/Windows 发布配置必须是大小受限的单链接文件/);
+    writeFileSync(config, original);
+  }
+  const hardLink = join(root, 'hardlink');
+  linkSync(config, hardLink);
+  reject(/Windows 发布配置必须是大小受限的单链接文件/);
+  if (process.platform !== 'win32') {
+    rmSync(config);
+    symlinkSync(hardLink, config);
+    reject(/Non-regular release path: .*tauri.windows.conf.json/);
+    rmSync(config);
+    renameSync(hardLink, config);
+  } else {
+    rmSync(hardLink);
+  }
+  const directory = join(root, 'src-tauri'), moved = join(root, 'redirected');
+  renameSync(directory, moved);
+  if (process.platform === 'win32') {
+    symlinkSync(moved, directory, 'junction');
+    reject(/Windows package configuration contains a reparse point: .*src-tauri/);
+  } else {
+    symlinkSync(moved, directory, 'dir');
+    reject(/Linked release ancestor: .*src-tauri/);
+  }
+});
 
 test('actual Windows inventory admits exactly the fixed cleaner artifact', (t) => {
   const r = fixture(t, 'windows', [cleaner]);

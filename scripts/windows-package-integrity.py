@@ -1508,22 +1508,9 @@ def verify_existing_zip(root, archive):
     return zip_inventory(archive, carrier_inventory(state, app, 'zip'))
 
 
-def contract(root):
-    """Read actual publication configuration; private source-shape audits live in tests."""
-    conf = json.loads(io_path(regular(root / 'src-tauri/tauri.windows.conf.json')).read_bytes())
-    resources = conf['bundle']['resources']; require_legal_resources(resources)
-    required = ['core-manifest.json', '../resources/win/', '../resources/dashboard/', '../resources/data/']
-    require(all(resources.count(name) == 1 for name in required), 'required Windows resources must occur once')
-    require(len(resources) == len(set(resources)) and all(isinstance(name, str) and '*' not in name
-            and (name == 'core-manifest.json' or name.startswith('../') and not name[3:].startswith('../'))
-            for name in resources), 'explicit unique Windows resource mapping required')
-    return {'schema': 'polaris-windows-package-config-v1', 'legalFiles': list(PUBLIC_LEGAL_FILES),
-            'platform': 'win', 'resources': resources, 'formats': ['nsis', 'zip']}
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['prepare', 'produce', 'capture', 'assemble', 'contract'])
+    parser.add_argument('action', choices=['prepare', 'produce', 'capture', 'assemble'])
     parser.add_argument('--state', help='owned state printed by prepare; replaces the workflow environment lookup')
     parser.add_argument('--target', choices=['x86_64-pc-windows-msvc'], help='actual native Cargo build target used by Tauri')
     forwarded = []
@@ -1538,8 +1525,7 @@ def main():
     if args.target:
         require(args.action == 'prepare', '--target is only valid for prepare')
         os.environ['POLARIS_WINDOWS_PACKAGE_TARGET'] = args.target
-    result = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)
-    if args.action == 'contract': print(json.dumps(result, sort_keys=True))
+    {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble}[args.action](ROOT)
 
 
 if __name__ == '__main__': main()

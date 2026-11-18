@@ -79,7 +79,7 @@ import { nsisCoreSweepViolations, nativeSweepViolations } from './lib/nsis-core-
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
 import { verifySelectedCoreManifest } from './lib/core-identity.mjs';
-import { loadReleaseContract, releasePayloadMembers, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
+import { loadReleaseContract, regularPath, releasePayloadMembers, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
 import { generated } from './desktop-core/import-release.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -397,6 +397,7 @@ function checkConfs() {
     fail('tauri.conf.json: bundle.resources 缺失或不是数组');
     return;
   }
+  const desktopResources = new Map([['tauri.conf.json', baseResources]]);
 
   // 【已删除：Rust 常量 ↔ productName 对拍】Linux 运行时按 `<root>/usr/bin` 反推
   // `<root>/usr/lib/<productName>/_up_/resources`，此前 Rust 侧存了第二份字面量
@@ -451,9 +452,27 @@ function checkConfs() {
     }
     let conf;
     try {
+      if (p === 'win') {
+        if (process.platform === 'win32') {
+          // libuv exposes symbolic links but not every Win32 reparse attribute.
+          const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell/v1.0/powershell.exe');
+          execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', `
+            $ErrorActionPreference = 'Stop'
+            for ($path = $env:POLARIS_WINDOWS_PACKAGE_CONF; $path; $path = [IO.Path]::GetDirectoryName($path)) {
+              if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) {
+                throw ('Windows package configuration contains a reparse point: ' + $path)
+              }
+            }
+          `], { env: { ...process.env, POLARIS_WINDOWS_PACKAGE_CONF: confPath }, timeout: 30_000, maxBuffer: 1024 * 1024 });
+        }
+        const info = regularPath(confPath);
+        if (info.nlink !== 1 || info.size > 512 * 1024 ** 2) {
+          throw new InputError(`src-tauri/${confName}: Windows 发布配置必须是大小受限的单链接文件`);
+        }
+      }
       conf = readJson(confPath, `平台 '${p}' 的不变量 A/B/C（公共资源不丢 / 恰含本平台内核 / 路径存在）无从断言`);
     } catch (e) {
-      fail(e.message);
+      fail(e.stderr?.toString().trim() || e.message);
       continue;
     }
 
@@ -485,6 +504,18 @@ function checkConfs() {
       // 混入 map 形态会让不变量 A/B 的判据失效。故这是**本仓房规**，不是 Tauri 的限制。
       fail(`src-tauri/${confName}: bundle.resources 缺失或不是数组 —— 本仓只用数组形态（RFC 7396 数组整体替换是按平台筛内核的机制本身；Tauri 的 map 形态在此不受支持）`);
       continue;
+    }
+    desktopResources.set(confName, res);
+
+    if (p === 'win') {
+      for (const entry of ['core-manifest.json', '../resources/win/', '../resources/dashboard/', '../resources/data/']) {
+        if (!res.includes(entry)) fail(`src-tauri/${confName}: Windows 发布资源缺少 '${entry}'`);
+      }
+      if (res.length !== new Set(res).size || res.some(entry => typeof entry !== 'string' || entry.includes('*') ||
+        (entry !== 'core-manifest.json' && (!entry.startsWith('../') || entry.slice(3).startsWith('../'))))) {
+        fail(`src-tauri/${confName}: Windows 发布资源必须是显式且唯一的映射`);
+        continue;
+      }
     }
 
     // 不变量 A：公共项必须**逐条**出现在每个平台 conf 里。
@@ -594,7 +625,7 @@ function checkConfs() {
   checkPlatformConfRegistry();
   checkWindowsInstallerHooks(base);
   checkMacOpenGuide();
-  checkLicenseArtifacts(base, platforms, manifest, workflow);
+  checkLicenseArtifacts(desktopResources);
   if (workflow !== null) {
     checkNamesOnlyDiscipline(workflow);
     checkLinuxAppImagePostprocess(workflow);
@@ -780,14 +811,9 @@ function checkPlatformConfRegistry() {
   }
 }
 
-/**
- * 随包分发的三份许可文本（**资源根相对路径 `_up_/` 那三份**）。
- * 顺序即断言顺序，无其它语义；`../` 形态是 conf 里的写法，`_up_` 形态见 [`resourceRelpath`]。
- */
-const LICENSE_CONF_ENTRIES = ['../LICENSE', '../NOTICE', '../THIRD-PARTY-LICENSES.md'];
-
-/** portable zip 里那三份的文件名（zip 是平铺结构，没有 `_up_` 前缀）。 */
+/** 三份分发许可文本，`../` 前缀是配置里的资源映射写法。 */
 const LICENSE_BASENAMES = ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md'];
+const LICENSE_CONF_ENTRIES = LICENSE_BASENAMES.map((name) => '../' + name);
 
 /** workflow 里某个 step 的**正文**（不含 step 名那行），找不到返回 null。 */
 function workflowStepBody(workflow, stepName) {
@@ -800,7 +826,7 @@ function workflowStepBody(workflow, stepName) {
 }
 
 /**
- * 许可文本的**整条分发链**：登记进包 → 文本本身与真值对拍 → 便携腿（另一条腿）也带上。
+ * 核对各平台的许可资源声明，以及许可文本与发布合同的一致性。
  *
  * 存在理由（2026-09-04，开箱实证）：`Polaris_1.0.0_amd64.deb` 解包后，包内 license 类文件只有
  * `_up_/THIRD-PARTY-LICENSES.md` 与面板自带的 OFL —— **`LICENSE` 与 `NOTICE` 都不在包里**，
@@ -815,25 +841,10 @@ function workflowStepBody(workflow, stepName) {
  * 这正是「只写否定式判据会被『什么都没发生』骗过」的实例，故这里对 base 与四份平台 conf
  * **各自**做正面断言：三个条目各恰 1 条（少 = 不进包，多 = 重复铺）。
  */
-function checkLicenseArtifacts(base, platforms, manifest, workflow) {
+function checkLicenseArtifacts(desktopResources) {
   const errorsBefore = errors.length;
   // ── ① 正面断言：五份 conf 各自都把三份许可文本登记为「恰 1 条」。
-  const confTargets = [['tauri.conf.json', base.bundle?.resources]];
-  for (const p of platforms) {
-    const confName = CORE_TO_CONF[p];
-    if (!confName) continue;
-    const confPath = join(SRC_TAURI, confName);
-    if (!existsSync(confPath)) continue; // 缺 conf 由不变量本体判红，这里不重复报
-    let conf;
-    try {
-      conf = readJson(confPath, `平台 '${p}' 的许可文本登记无从断言`);
-    } catch {
-      continue;
-    }
-    confTargets.push([confName, conf.bundle?.resources]);
-  }
-  for (const [confName, res] of confTargets) {
-    if (!Array.isArray(res)) continue; // 同上：形态错误由不变量本体判红
+  for (const [confName, res] of desktopResources) {
     for (const entry of LICENSE_CONF_ENTRIES) {
       const n = res.filter((e) => e === entry).length;
       if (n !== 1) {
@@ -890,31 +901,11 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
     }
   }
 
-  // ── ⑥ Windows publication configuration. Source-shape/workflow audits belong
-  // to the existing tests; actual complete payload inventories belong to assets.
-  if (workflow !== null) {
-    try {
-      const result = JSON.parse(execFileSync(process.platform === 'win32' ? 'python' : 'python3',
-        [join(ROOT, 'scripts/windows-package-integrity.py'), 'contract'],
-        { cwd: ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 }));
-      if (result.schema !== 'polaris-windows-package-config-v1'
-          || JSON.stringify(result.legalFiles) !== JSON.stringify(LICENSE_BASENAMES)
-          || result.platform !== 'win' || !Array.isArray(result.resources)
-          || JSON.stringify(result.formats) !== JSON.stringify(['nsis', 'zip'])) {
-        throw new Error('actual Windows publication configuration differs');
-      }
-    } catch (error) {
-      fail(`Windows 发布配置/许可声明未闭合：${error.stderr?.toString().trim() || error.message}`);
-    }
-  }
-
-  // 与 conf 那条 note 同口径：失败时不得打这句（它字面断言「三份都登记了、版本对上了、便携腿也带了」）。
-  if (errors.length === errorsBefore) {
+  if (errors.length === errorsBefore && desktopResources.size === Object.keys(CORE_TO_CONF).length + 1) {
     note(
-      `许可文本分发链：${LICENSE_BASENAMES.join(' / ')} 在 base + ${platforms.length} 份平台 conf 里各恰 1 条；` +
+      `许可文本配置：${LICENSE_BASENAMES.join(' / ')} 在 base + ${desktopResources.size - 1} 份平台 conf 里各恰 1 条；` +
         `NOTICE 内核段落 = 发布合同生成结果，版权行与 LICENSE 逐字一致，` +
-        `mere-aggregation 作为**未经检验的立场**并附 GNU FAQ 出处；Windows 普通 assemble 已接完整 source-map 与实际ZIP全集/SHA/size门` +
-        `${workflow === null ? '（⚠️ workflow 读不到，便携腿这一半未验）' : ''}`
+        `mere-aggregation 作为**未经检验的立场**并附 GNU FAQ 出处`
     );
   }
 }

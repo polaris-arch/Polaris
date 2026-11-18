@@ -70,11 +70,13 @@ export function releasePlatforms(argv) {
 
 export function regularPath(path, directory = false) {
   let at = resolve(path);
-  demand(directory ? lstatSync(at).isDirectory() : lstatSync(at).isFile(), `Non-regular release path: ${at}`);
+  const info = lstatSync(at);
+  demand(directory ? info.isDirectory() : info.isFile(), `Non-regular release path: ${at}`);
   for (at = dirname(at);;) {
     demand(lstatSync(at).isDirectory(), `Linked release ancestor: ${at}`);
     const parent = dirname(at); if (parent === at) break; at = parent;
   }
+  return info;
 }
 function checkedBytes(path, pin) {
   regularPath(path); const bytes = readFileSync(path);

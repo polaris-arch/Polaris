@@ -487,7 +487,6 @@ class Integrity(unittest.TestCase):
                 conf = root / 'src-tauri/tauri.windows.conf.json'; value = json.loads(conf.read_text())
                 value['bundle']['resources'].remove('../' + name); conf.write_text(json.dumps(value))
                 with self.assertRaises(ValueError): w.source_inventory(root)
-                with self.assertRaises(ValueError): w.contract(root)
 
     def test_streamed_unknown_sizes_are_valid_but_literal_member_bytes_are_exact(self):
         with tempfile.TemporaryDirectory() as tmp:
