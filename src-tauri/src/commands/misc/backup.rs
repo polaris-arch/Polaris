@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::str::FromStr as _;
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use super::support::{node_platform, now_iso8601, today_yyyy_mm_dd};
@@ -394,10 +394,24 @@ pub async fn backup_import_apply(
         return Ok(ApiResponse::ok(backup_failure("invalidArgs")));
     }
     // 前端回传的是 `backup_import_pick` 给出的那个字符串。分流与判据都住在 [`read_apply_source`]；
-    // 路径和 URI 的读取均派到阻塞线程池。
+    // 路径、URI 和配置预检的读取都在同一个阻塞任务里。
     let target = FilePath::from_str(&file_path).expect("FilePath::from_str 是 Infallible");
+    let restore_mesh = selected.contains(&BackupCategory::MeshRouting);
+    let read_app = app.clone();
     let parsed = match with_picked_gateway_blocking(&app, Some(target), move |gateway, _| {
-        read_apply_source(gateway, &file_path)
+        let parsed = read_apply_source(gateway, &file_path)?;
+        if restore_mesh
+            && (parsed.config.get("meshRouting").is_some()
+                || parsed.config.get("meshRoutePolicy").is_some())
+        {
+            return Err("meshRoutingRequiresTrustedRestore");
+        }
+        // 事务内仍以最新盘值为基准。这里保留已有的配置读取错误码。
+        if let Err(e) = read_app.state::<AppRuntime>().config().load_full() {
+            log::warn!("[backup] import failed to load config: {e}");
+            return Err("configLoadFailed");
+        }
+        Ok(parsed)
     })
     .await
     {
@@ -408,21 +422,6 @@ pub async fn backup_import_apply(
             return Ok(ApiResponse::ok(backup_failure("readFailed")));
         }
     };
-    if selected.contains(&BackupCategory::MeshRouting)
-        && (parsed.config.get("meshRouting").is_some()
-            || parsed.config.get("meshRoutePolicy").is_some())
-    {
-        return Ok(ApiResponse::ok(backup_failure(
-            "meshRoutingRequiresTrustedRestore",
-        )));
-    }
-
-    // 保留 configLoadFailed 语义；事务内会以最新盘值再次读取并按类别合并。
-    if let Err(e) = state.config().load_full() {
-        log::warn!("[backup] import failed to load config: {e}");
-        return Ok(ApiResponse::ok(backup_failure("configLoadFailed")));
-    }
-
     // 网卡名属于设备本地资源。桌面端用实际库存检查导入绑定；Android
     // 只有当前可绑定的 Network 列表，不能以其缺席清空用户指定的接口。
     // 具体清理在 backup_import_save_core 的事务内、按真正导入类别执行。
