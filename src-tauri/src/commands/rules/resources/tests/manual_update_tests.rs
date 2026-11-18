@@ -1,4 +1,4 @@
-use super::super::*;
+use super::{super::*, EMPTY_SRS_V1, EMPTY_SRS_V2};
 
 #[test]
 fn pure_builtin_manual_update_has_every_builtin_target() {
@@ -34,12 +34,14 @@ use polaris_net_stack::safe_redirect::{FetchInit, MinimalResponse};
 struct PausedResourceHttp {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    body: &'static [u8],
 }
 impl PausedResourceHttp {
     fn new() -> Self {
         Self {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            body: EMPTY_SRS_V1,
         }
     }
 }
@@ -49,7 +51,7 @@ impl HttpClient for PausedResourceHttp {
         self.release.notified().await;
         Ok(MinimalResponse {
             status: 200,
-            body: b"SRS-new".to_vec(),
+            body: self.body.to_vec(),
             ..Default::default()
         })
     }
@@ -83,7 +85,7 @@ fn registered_fixture() -> (TestDir, ConfigManager, RuleResource) {
     let resource: RuleResource = serde_json::from_value(json!({
         "id":format!("res_{}", new_uuid()), "name":"Original", "category":"custom",
         "sourceUrl":"https://example.com/original.srs", "fileName":"original.srs",
-        "format":"binary", "size":7, "downloadedAt":"before"
+        "format":"binary", "size":EMPTY_SRS_V2.len(), "downloadedAt":"before"
     }))
     .unwrap();
     manager
@@ -94,7 +96,7 @@ fn registered_fixture() -> (TestDir, ConfigManager, RuleResource) {
         .unwrap();
     let res_dir = dir.path().join("rule-resource");
     std::fs::create_dir_all(&res_dir).unwrap();
-    std::fs::write(res_dir.join(&resource.file_name), b"SRS-old").unwrap();
+    std::fs::write(res_dir.join(&resource.file_name), EMPTY_SRS_V2).unwrap();
     (dir, manager, resource)
 }
 fn guarded_test_commit(
@@ -195,6 +197,40 @@ async fn unchanged_registered_refresh_commits_before_done_and_rejects_older_meta
     let (dir, manager, resource) = registered_fixture();
     let res_dir = dir.path().join("rule-resource");
     let plan = plan_from_resource(&resource);
+    let invalid = PausedResourceHttp {
+        body: b"SRS",
+        ..PausedResourceHttp::new()
+    };
+    invalid.release.notify_one();
+    let reject_sink = ResourceSink::default();
+    let before = manager.load_full().unwrap();
+    let rejected = download_registered_resource(
+        &reject_sink,
+        &invalid,
+        &ResourcePublicLookup,
+        &plan,
+        &res_dir,
+        |_, _| panic!("malformed resource cannot publish or update metadata"),
+    )
+    .await;
+    assert!(matches!(
+        rejected,
+        DownloadOutcome::Failed {
+            code: ERR_RESOURCE_DOWNLOAD_FAILED,
+            ..
+        }
+    ));
+    assert_eq!(manager.load_full().unwrap(), before);
+    assert_eq!(
+        std::fs::read(res_dir.join(&resource.file_name)).unwrap(),
+        EMPTY_SRS_V2
+    );
+    assert_eq!(reject_sink.statuses(), ["downloading", "error"]);
+    assert_eq!(
+        std::fs::read_dir(res_dir.join(".update")).unwrap().count(),
+        0
+    );
+
     let http = PausedResourceHttp::new();
     http.release.notify_one();
     let sink = ResourceSink::default();
@@ -207,13 +243,13 @@ async fn unchanged_registered_refresh_commits_before_done_and_rejects_older_meta
         |downloaded, staged| {
             assert_eq!(
                 std::fs::read(res_dir.join(&resource.file_name)).unwrap(),
-                b"SRS-old"
+                EMPTY_SRS_V2
             );
             assert_eq!(sink.statuses(), ["downloading"]);
             guarded_test_commit(&manager, &resource, downloaded, staged, &res_dir)?;
             assert_eq!(
                 std::fs::read(res_dir.join(&resource.file_name)).unwrap(),
-                b"SRS-new"
+                EMPTY_SRS_V1
             );
             assert_eq!(
                 manager.load_full().unwrap()["ruleResources"][0]["downloadedAt"],
@@ -241,7 +277,7 @@ async fn unchanged_registered_refresh_commits_before_done_and_rejects_older_meta
     assert!(guarded_test_commit(&manager, &resource, &resource, &stale, &res_dir).is_err());
     assert_eq!(
         std::fs::read(res_dir.join(&resource.file_name)).unwrap(),
-        b"SRS-new"
+        EMPTY_SRS_V1
     );
 }
 
@@ -305,7 +341,7 @@ async fn registered_refresh_cancellation_drops_network_and_staging_without_commi
     assert_eq!(sink.statuses(), ["downloading", "cancelled"]);
     assert_eq!(
         std::fs::read(res_dir.join(&resource.file_name)).unwrap(),
-        b"SRS-old"
+        EMPTY_SRS_V2
     );
     assert_eq!(
         std::fs::read_dir(res_dir.join(".update")).unwrap().count(),

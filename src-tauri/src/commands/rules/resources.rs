@@ -2014,22 +2014,80 @@ fn resolve_registered_resource(resources: &[Value], id: &str) -> Result<RuleReso
     parse_resource_entry(entry)
 }
 
-/// 内容 sanity：binary 校 SRS 魔数（与 route.rs / rule_resources_list 同口径）；source 校 JSON 对象。
+fn source_rule_set_version(body: &[u8]) -> serde_json::Result<u8> {
+    use serde::de::{Error as _, MapAccess, Visitor};
+    use serde::Deserializer;
+
+    struct RuleSetEnvelope;
+
+    impl<'de> Visitor<'de> for RuleSetEnvelope {
+        type Value = u8;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a source rule-set object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<u8, A::Error> {
+            let mut version = 0;
+            // Core 解码按原顺序处理字段和重复键。Go SimpleFold 对这两个字段还把 ſ 与 s 视为等价。
+            while let Some(key) = map.next_key::<String>()? {
+                // 逐字段保留 Value 的 JSON 字符串检查，包括规则内部和未知字段。
+                let value: Value = map.next_value()?;
+                if key.eq_ignore_ascii_case("version") || key.eq_ignore_ascii_case("verſion") {
+                    // Go 的 null 保留已读到的非指针数值。
+                    if !value.is_null() {
+                        version = value
+                            .as_u64()
+                            .and_then(|number| u8::try_from(number).ok())
+                            .ok_or_else(|| {
+                                A::Error::custom("rule-set version must be an unsigned byte")
+                            })?;
+                    }
+                } else if (key.eq_ignore_ascii_case("rules") || key.eq_ignore_ascii_case("ruleſ"))
+                    && !value.is_null()
+                    && !value.is_array()
+                {
+                    return Err(A::Error::custom("rule-set rules must be an array or null"));
+                }
+            }
+            Ok(version)
+        }
+    }
+
+    let mut input = serde_json::Deserializer::from_slice(body);
+    let version = input.deserialize_map(RuleSetEnvelope)?;
+    input.end()?;
+    Ok(version)
+}
+
+/// 下载内容的结构检查先于文件替换。Core 加载时负责完整解码、资源预算与规则语义。
 fn validate_resource_bytes(format: RuleResourceFormat, body: &[u8]) -> Result<(), String> {
+    // 与 Core constant.RuleSetVersionCurrent 的已支持版本对齐。
+    const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u8> = 1..=5;
     if body.is_empty() {
         return Err("下载内容为空".to_string());
     }
     match format {
         RuleResourceFormat::Binary => {
-            if body.len() < 3 || !is_valid_srs_bytes([body[0], body[1], body[2]]) {
-                return Err("下载内容不是有效的 .srs 规则集（SRS 魔数校验失败）".to_string());
+            // SRS 头占 4 字节，zlib 头尾占 6 字节，压缩至少一字节的规则计数需要 3 字节。
+            if body.len() < 13 || !is_valid_srs_bytes([body[0], body[1], body[2]]) {
+                return Err("下载内容缺少完整的 .srs 规则集结构".to_string());
+            }
+            if !SUPPORTED_VERSIONS.contains(&body[3]) {
+                return Err(format!("下载内容的 .srs 版本不受支持: {}", body[3]));
+            }
+            let zlib_header = u16::from_be_bytes([body[4], body[5]]);
+            if body[4] & 0x0f != 8 || body[4] >> 4 > 7 || !zlib_header.is_multiple_of(31) {
+                return Err("下载内容的 .srs 压缩头无效".to_string());
             }
         }
-        RuleResourceFormat::Source => match serde_json::from_slice::<Value>(body) {
-            Ok(v) if v.is_object() => {}
-            Ok(_) => return Err("下载内容不是 JSON 对象（sing-box 源规则集须为对象）".to_string()),
-            Err(e) => return Err(format!("下载内容不是合法 JSON: {e}")),
-        },
+        RuleResourceFormat::Source => {
+            let version = source_rule_set_version(body)
+                .map_err(|e| format!("下载内容的 JSON 源规则集结构无效: {e}"))?;
+            if !SUPPORTED_VERSIONS.contains(&version) {
+                return Err("下载内容缺少受支持的源规则集版本".to_string());
+            }
+        }
     }
     Ok(())
 }

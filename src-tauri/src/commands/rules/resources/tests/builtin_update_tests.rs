@@ -1,4 +1,4 @@
-use super::super::*;
+use super::{super::*, EMPTY_SRS_V1, EMPTY_SRS_V2};
 use crate::test_support::TestDir;
 use polaris_net_stack::safe_redirect::{FetchInit, MinimalResponse};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,14 +64,14 @@ impl RecordingSink {
 fn fixture() -> (ResourcePlan, TestDir) {
     let plan = plan_from_builtin(&find_builtin("geosite-cn").unwrap());
     let dir = TestDir::new("polaris-builtin-test-");
-    std::fs::write(dir.join(&plan.file_name), b"SRS-old").unwrap();
+    std::fs::write(dir.join(&plan.file_name), EMPTY_SRS_V2).unwrap();
     (plan, dir)
 }
 
 #[tokio::test]
 async fn builtin_update_commits_live_and_metadata_before_done() {
     let (plan, dir) = fixture();
-    let client = TestHttp::new(200, b"SRS-new");
+    let client = TestHttp::new(200, EMPTY_SRS_V1);
     let sink = RecordingSink::default();
     let saved = AtomicUsize::new(0);
     let outcome = update_builtin_resource(
@@ -84,7 +84,7 @@ async fn builtin_update_commits_live_and_metadata_before_done() {
             publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
             assert_eq!(
                 std::fs::read(dir.join(&plan.file_name)).unwrap(),
-                b"SRS-new"
+                EMPTY_SRS_V1
             );
             assert!(!resource.downloaded_at.is_empty());
             assert_eq!(sink.statuses(), ["downloading"]);
@@ -108,7 +108,7 @@ async fn builtin_update_commits_live_and_metadata_before_done() {
 
 #[tokio::test]
 async fn builtin_http_or_invalid_content_failure_preserves_live() {
-    for (status, body) in [(500, b"SRS-new".as_slice()), (200, b"<html>".as_slice())] {
+    for (status, body) in [(500, EMPTY_SRS_V1), (200, b"<html>"), (200, b"SRS\x07\x08")] {
         let (plan, dir) = fixture();
         let sink = RecordingSink::default();
         let client = TestHttp::new(status, body);
@@ -117,10 +117,16 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
                 panic!("下载失败不能保存元数据")
             })
             .await;
-        assert!(matches!(outcome, DownloadOutcome::Failed { .. }));
+        assert!(matches!(
+            outcome,
+            DownloadOutcome::Failed {
+                code: ERR_RESOURCE_DOWNLOAD_FAILED,
+                ..
+            }
+        ));
         assert_eq!(
             std::fs::read(dir.join(&plan.file_name)).unwrap(),
-            b"SRS-old"
+            EMPTY_SRS_V2
         );
         assert_eq!(sink.statuses(), ["downloading", "error"]);
         assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
@@ -134,7 +140,7 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
     let sink = RecordingSink::default();
     let outcome = update_builtin_resource(
         &sink,
-        &TestHttp::new(200, b"SRS-new"),
+        &TestHttp::new(200, EMPTY_SRS_V1),
         &PublicLookup,
         &plan,
         &dir,
@@ -155,7 +161,7 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
 #[tokio::test]
 async fn builtin_same_tag_updates_are_serialized_and_cleanup_isolated() {
     let (plan, dir) = fixture();
-    let client = TestHttp::new(200, b"SRS-new");
+    let client = TestHttp::new(200, EMPTY_SRS_V1);
     let first = RecordingSink::default();
     let second = RecordingSink::default();
     let saved = AtomicUsize::new(0);
@@ -174,7 +180,7 @@ async fn builtin_same_tag_updates_are_serialized_and_cleanup_isolated() {
     assert_eq!(saved.load(Ordering::SeqCst), 2);
     assert_eq!(
         std::fs::read(dir.join(&plan.file_name)).unwrap(),
-        b"SRS-new"
+        EMPTY_SRS_V1
     );
     assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
     std::fs::remove_dir_all(dir.path()).unwrap();
@@ -258,7 +264,7 @@ fn failed_reset_persistence_conservatively_cancels_old_work_without_file_deletio
     std::fs::write(&path, b"SRS-stale").unwrap();
     let live = dir.join(&plan.file_name);
     assert!(publish_builtin_file(&active, &path, &live).is_err());
-    assert_eq!(std::fs::read(&live).unwrap(), b"SRS-old");
+    assert_eq!(std::fs::read(&live).unwrap(), EMPTY_SRS_V2);
     let successor = BuiltinUpdateOperation::begin(&plan.id);
     assert!(successor.is_current());
     drop(active);
@@ -308,7 +314,7 @@ impl HttpClient for PausedHttp {
         self.resume.notified().await;
         Ok(MinimalResponse {
             status: 200,
-            body: b"SRS-new".to_vec(),
+            body: EMPTY_SRS_V1.to_vec(),
             ..Default::default()
         })
     }
@@ -373,7 +379,7 @@ async fn cancelling_paused_download_cleans_only_its_stage_and_releases_gate() {
     }
     assert_eq!(
         std::fs::read(dir.join(&plan.file_name)).unwrap(),
-        b"SRS-old"
+        EMPTY_SRS_V2
     );
     assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
     assert!(builtin_update_lock(&plan.id).download.try_lock().is_ok());
@@ -433,8 +439,8 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
         assert!(!failure_dir.join(".update").exists());
         assert!(!metadata_dir.join(".update").exists());
         paused.resume.notify_one();
-        let failure_client = TestHttp::new(500, b"SRS-new");
-        let metadata_client = TestHttp::new(200, b"SRS-new");
+        let failure_client = TestHttp::new(500, EMPTY_SRS_V1);
+        let metadata_client = TestHttp::new(200, EMPTY_SRS_V1);
         tokio::join!(
             update_builtin_resource(
                 &failure_sink,
@@ -492,16 +498,16 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
     assert_eq!(metadata_sink.statuses(), ["downloading", "error"]);
     assert_eq!(
         std::fs::read(success_dir.join(&success_plan.file_name)).unwrap(),
-        b"SRS-new"
+        EMPTY_SRS_V1
     );
     assert_eq!(
         std::fs::read(failure_dir.join(&failure_plan.file_name)).unwrap(),
-        b"SRS-old"
+        EMPTY_SRS_V2
     );
     // Metadata failure is not a rollback claim: the injected publisher ran.
     assert_eq!(
         std::fs::read(metadata_dir.join(&metadata_plan.file_name)).unwrap(),
-        b"SRS-new"
+        EMPTY_SRS_V1
     );
     for dir in [&success_dir, &failure_dir, &metadata_dir] {
         assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
@@ -632,7 +638,7 @@ async fn builtin_fixture_early_stage_failure_cannot_leave_notification_peer_wait
     assert_eq!(sink.statuses(), ["error"]);
     assert_eq!(
         std::fs::read(dir.join(&plan.file_name)).unwrap(),
-        b"SRS-old"
+        EMPTY_SRS_V2
     );
     assert_eq!(
         std::fs::read(dir.join(".update")).unwrap(),
@@ -676,7 +682,7 @@ async fn timed_out_fixture_clears_only_its_cancel_registration_after_stage_drop(
     assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
     assert_eq!(
         std::fs::read(dir.join(&plan.file_name)).unwrap(),
-        b"SRS-old"
+        EMPTY_SRS_V2
     );
     assert_eq!(sink.statuses(), ["downloading"]);
 }

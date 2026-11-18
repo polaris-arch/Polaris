@@ -1,4 +1,4 @@
-use super::super::*;
+use super::{super::*, EMPTY_SRS_V1, EMPTY_SRS_V2};
 
 #[test]
 fn plan_from_catalog_id_resolves_mrd_url_and_filename() {
@@ -62,17 +62,67 @@ fn sanitize_stem_blocks_traversal_and_separators() {
 }
 
 #[test]
-fn validate_bytes_enforces_srs_magic_and_json_object() {
-    // binary: 需 SRS 魔数。
-    assert!(validate_resource_bytes(RuleResourceFormat::Binary, b"SRS\x01\x02").is_ok());
-    assert!(validate_resource_bytes(RuleResourceFormat::Binary, b"<html>").is_err());
-    assert!(validate_resource_bytes(RuleResourceFormat::Binary, b"").is_err());
-    // source: 需 JSON 对象。
-    assert!(
-        validate_resource_bytes(RuleResourceFormat::Source, br#"{"version":1,"rules":[]}"#).is_ok()
-    );
-    assert!(validate_resource_bytes(RuleResourceFormat::Source, b"[1,2,3]").is_err());
-    assert!(validate_resource_bytes(RuleResourceFormat::Source, b"not json").is_err());
+fn validate_bytes_checks_rule_set_envelopes() {
+    let mut binary = EMPTY_SRS_V1.to_vec();
+    for version in 1..=5 {
+        binary[3] = version;
+        assert!(validate_resource_bytes(RuleResourceFormat::Binary, &binary).is_ok());
+        let source = format!(r#"{{"version":{version},"rules":[]}}"#);
+        assert!(validate_resource_bytes(RuleResourceFormat::Source, source.as_bytes()).is_ok());
+    }
+    for version in [0, 6, 7] {
+        binary[3] = version;
+        assert!(validate_resource_bytes(RuleResourceFormat::Binary, &binary).is_err());
+    }
+    binary.copy_from_slice(EMPTY_SRS_V1);
+    binary[4] = 0;
+    for malformed in [
+        b"".as_slice(),
+        b"<html>",
+        b"SRS",
+        b"SRS\x01\x02",
+        b"SRS\x01\x78\x9c\x03\x00\x00\x00\x00\x01",
+        &binary,
+    ] {
+        assert!(validate_resource_bytes(RuleResourceFormat::Binary, malformed).is_err());
+    }
+    for source in [
+        r#"{"version":1}"#,
+        r#"{"version":1,"rules":null}"#,
+        r#"{"Version":3,"Rules":[]}"#,
+        r#"{"Version":6,"version":3}"#,
+        r#"{"version":6,"Version":3}"#,
+        r#"{"version":6,"version":3}"#,
+        r#"{"version":3,"Version":null}"#,
+        r#"{"version":3,"version":null}"#,
+        r#"{"ver\u017fion":3,"Rule\u017f":[]}"#,
+    ] {
+        assert!(
+            validate_resource_bytes(RuleResourceFormat::Source, source.as_bytes()).is_ok(),
+            "{source}"
+        );
+    }
+    for malformed in [
+        "[1,2,3]",
+        "not json",
+        "{}",
+        r#"{"version":0}"#,
+        r#"{"version":6}"#,
+        r#"{"version":1,"rules":{}}"#,
+        r#"{"version":3,"Rules":{}}"#,
+        r#"{"version":3,"Version":6}"#,
+        r#"{"version":256,"Version":3}"#,
+        r#"{"version":"invalid","version":3}"#,
+        r#"{"version":3,"Rules":{},"rules":[]}"#,
+        r#"{"version":3,"rules":{},"rules":[]}"#,
+        r#"{"version":3,"rules":[{"domain":"\uD800"}]}"#,
+        r#"{"version":3} {}"#,
+    ] {
+        assert!(
+            validate_resource_bytes(RuleResourceFormat::Source, malformed.as_bytes()).is_err(),
+            "{malformed}"
+        );
+    }
 }
 
 #[test]
@@ -260,10 +310,8 @@ mod loopback {
     }
 
     #[tokio::test]
-    async fn fetches_srs_over_loopback_and_validates_magic() {
-        let mut srs = b"SRS".to_vec();
-        srs.extend_from_slice(&[0x01, 0x00, 0xde, 0xad]);
-        let addr = spawn_once("200 OK", srs);
+    async fn fetches_srs_over_loopback_and_validates_structure() {
+        let addr = spawn_once("200 OK", EMPTY_SRS_V1.to_vec());
         // 真 client，DNS 钉定：传输落回环 server；guard 判定对象是公网 IP → 放行（guard 真跑）。
         let client = HttpRuntime::with_resolve_overrides(&[("res.example.com", addr)]).unwrap();
         let lookup = FixedLookup("93.184.216.34");
@@ -275,7 +323,7 @@ mod loopback {
         )
         .await
         .expect("回环 SRS 下载应成功");
-        assert_eq!(&bytes[..3], b"SRS");
+        assert_eq!(bytes, EMPTY_SRS_V1);
     }
 
     #[tokio::test]
@@ -332,9 +380,7 @@ mod loopback {
 
     #[tokio::test]
     async fn download_and_store_writes_file_and_reports_existed_before() {
-        let mut srs = b"SRS".to_vec();
-        srs.extend_from_slice(&[0x07, 0x08]);
-        let addr = spawn_once("200 OK", srs.clone());
+        let addr = spawn_once("200 OK", EMPTY_SRS_V1.to_vec());
         let client = HttpRuntime::with_resolve_overrides(&[("res.example.com", addr)]).unwrap();
         let lookup = FixedLookup("93.184.216.34");
         let dir = std::env::temp_dir().join(format!("polaris-resdl-{}", std::process::id()));
@@ -355,9 +401,9 @@ mod loopback {
                 existed_before,
             } => {
                 assert!(!existed_before, "首次下载 existedBefore 应为 false");
-                assert_eq!(resource.size, srs.len() as u64);
+                assert_eq!(resource.size, EMPTY_SRS_V1.len() as u64);
                 let landed = std::fs::read(dir.join("geosite-test.srs")).expect("文件应落盘");
-                assert_eq!(landed, srs, "落盘字节须与下载字节一致");
+                assert_eq!(landed, EMPTY_SRS_V1, "落盘字节须与下载字节一致");
             }
             DownloadOutcome::Failed { message, .. } => panic!("应成功，实得: {message}"),
             DownloadOutcome::Cancelled => panic!("未取消却报了取消"),
@@ -433,9 +479,7 @@ mod loopback {
     /// **变异锁**：把 `download_with_progress` 开头那帧 `downloading` 删掉 → 本断言转红。
     #[tokio::test]
     async fn live_mode_emits_downloading_and_done_frames() {
-        let mut srs = b"SRS".to_vec();
-        srs.extend_from_slice(&[0x11, 0x22]);
-        let addr = spawn_once("200 OK", srs);
+        let addr = spawn_once("200 OK", EMPTY_SRS_V1.to_vec());
         let client = HttpRuntime::with_resolve_overrides(&[("res.example.com", addr)]).unwrap();
         let sink = ModedRecordingSink {
             mode: ProgressMode::Live,
@@ -469,9 +513,7 @@ mod loopback {
     /// → 帧数变 2 → 本断言转红。
     #[tokio::test]
     async fn silent_mode_emits_nothing_but_still_downloads() {
-        let mut srs = b"SRS".to_vec();
-        srs.extend_from_slice(&[0x33, 0x44]);
-        let addr = spawn_once("200 OK", srs.clone());
+        let addr = spawn_once("200 OK", EMPTY_SRS_V1.to_vec());
         let client = HttpRuntime::with_resolve_overrides(&[("res.example.com", addr)]).unwrap();
         let sink = ModedRecordingSink {
             mode: ProgressMode::Silent,
@@ -492,7 +534,7 @@ mod loopback {
             sink.inner.statuses()
         );
         let landed = std::fs::read(dir.join("silent-res.srs")).expect("静默腿仍须真落盘");
-        assert_eq!(landed, srs);
+        assert_eq!(landed, EMPTY_SRS_V1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -523,12 +565,8 @@ mod loopback {
     /// 收不到请求、原址 server 被打，`landed` 内容变成 DIRECT 的字节 → 断言转红。
     #[tokio::test]
     async fn mirror_is_tried_first_when_gh_proxy_configured() {
-        let mut mirror_body = b"SRS".to_vec();
-        mirror_body.extend_from_slice(b"MIRROR");
-        let mut direct_body = b"SRS".to_vec();
-        direct_body.extend_from_slice(b"DIRECT");
-        let mirror = spawn_once("200 OK", mirror_body.clone());
-        let direct = spawn_once("200 OK", direct_body);
+        let mirror = spawn_once("200 OK", EMPTY_SRS_V1.to_vec());
+        let direct = spawn_once("200 OK", EMPTY_SRS_V2.to_vec());
         let client = HttpRuntime::with_resolve_overrides(&[
             ("mirror.example.com", mirror),
             ("raw.githubusercontent.com", direct),
@@ -544,7 +582,7 @@ mod loopback {
         );
         let landed = std::fs::read(dir.join("gh-hit.srs")).expect("须落盘");
         assert_eq!(
-            landed, mirror_body,
+            landed, EMPTY_SRS_V1,
             "落盘的必须是镜像返回的字节（= 走了镜像）"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -556,10 +594,8 @@ mod loopback {
     /// → 结果变 `Failed`、文件不落盘 → 本断言转红。
     #[tokio::test]
     async fn falls_back_to_origin_when_mirror_fails() {
-        let mut direct_body = b"SRS".to_vec();
-        direct_body.extend_from_slice(b"DIRECT");
         let mirror = spawn_once("500 Server Error", b"boom".to_vec());
-        let direct = spawn_once("200 OK", direct_body.clone());
+        let direct = spawn_once("200 OK", EMPTY_SRS_V2.to_vec());
         let client = HttpRuntime::with_resolve_overrides(&[
             ("mirror.example.com", mirror),
             ("raw.githubusercontent.com", direct),
@@ -573,7 +609,7 @@ mod loopback {
             "镜像失败须回退原址，不得直接判失败"
         );
         let landed = std::fs::read(dir.join("gh-fb.srs")).expect("回退腿也须真落盘");
-        assert_eq!(landed, direct_body);
+        assert_eq!(landed, EMPTY_SRS_V2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
