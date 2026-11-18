@@ -426,6 +426,12 @@ pub mod code {
     pub const HELPER_CORE_ABSENT: &str = "HELPER_CORE_ABSENT";
     /// Installed content failed the protected store's file verification.
     pub const HELPER_CORE_INVALID: &str = "HELPER_CORE_INVALID";
+    /// The helper rejected its execution policy independently of storage verification.
+    pub const CORE_ADMISSION_EXACT_OBJECT: &str = "CORE_ADMISSION_EXACT_OBJECT";
+    pub const CORE_ADMISSION_UNSUPPORTED_CAPABILITY: &str = "CORE_ADMISSION_UNSUPPORTED_CAPABILITY";
+    pub const CORE_ADMISSION_LOADER_POLICY: &str = "CORE_ADMISSION_LOADER_POLICY";
+    pub const CORE_ADMISSION_BUSY: &str = "CORE_ADMISSION_BUSY";
+    pub const CORE_ADMISSION_UNAVAILABLE: &str = "CORE_ADMISSION_UNAVAILABLE";
     /// **随包内核不可执行**：安装包里的内核文件没有可执行权限，应用直起内核前即拒绝。
     ///
     /// 终态（核没起）。单列一个码而不落进 [`STARTUP_FAILED`]：成因是安装包损坏或被改过权限，

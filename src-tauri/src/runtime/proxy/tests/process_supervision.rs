@@ -1961,6 +1961,82 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pinned_helper_preserves_execution_refusal_and_distinguishes_missing_core() {
+    let id = crate::runtime::core_identity::selected_id(
+        crate::runtime::core_identity::current_platform().unwrap(),
+    )
+    .unwrap();
+    let id_text = id.as_str();
+    let version = format!("OK {}\n", polaris_helper_proto::proto_version::CURRENT);
+    for (mut replies, expected) in [
+        (
+            vec![format!("OK core-absent {id_text}\n")],
+            code::HELPER_CORE_ABSENT,
+        ),
+        (
+            vec![format!("OK core-invalid {id_text} admission-changed\n")],
+            code::HELPER_CORE_INVALID,
+        ),
+        (
+            vec![format!("OK core-invalid {id_text} admission-unsupported-exact-object\n")],
+            code::CORE_ADMISSION_EXACT_OBJECT,
+        ),
+        (
+            vec![
+                format!("OK core-present {id_text} 1.15.0\n"),
+                version.clone(),
+                "ERR start CORE_ADMISSION_UnsupportedExactObject: unsupported issuer; recovery=None\n"
+                    .to_owned(),
+            ],
+            code::CORE_ADMISSION_EXACT_OBJECT,
+        ),
+    ] {
+        replies.insert(0, version.clone());
+        let reaches_start = replies.len() > 2;
+        let (rt, dir, frames) = birth_daemon_runtime(replies);
+        *rt.selected_core_ready_fixture.lock().unwrap() = None;
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let mut reservation = rt
+            .mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints": []}),
+                &gate,
+                rt.mesh.mint_tailscale_main_birth(),
+            )
+            .await
+            .unwrap();
+        let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
+        let error = rt
+            .spawn_core_via_helper(
+                &dir.join("not-executed-core"),
+                &dir.join("config.json"),
+                &user_config,
+                rt.gate.generation(),
+                &mut reservation,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Some(expected), "{error}");
+        if expected == code::CORE_ADMISSION_EXACT_OBJECT {
+            assert!(error.message.starts_with("CORE_ADMISSION_UnsupportedExactObject:"));
+        }
+        assert!(rt.pid.lock().unwrap().is_none());
+        let sent = frames.lock().unwrap();
+        assert_eq!(sent.len(), if reaches_start { 4 } else { 2 });
+        assert_eq!(sent[1], format!("core-status\n{id_text}\n"));
+        if reaches_start {
+            assert_eq!(
+                sent[3],
+                pinned_birth_start_frame(&id, &dir, &dir.join("config.json"))
+            );
+        } else {
+            assert!(!rt.child.lock().unwrap().has_helper_start());
+        }
+    }
+}
+
 /// A legacy birth receipt or a different CoreID may identify a process to stop,
 /// but cannot attest a selected Start. Keep the production rejection/cleanup leg
 /// as the negative control for the pinned positive transport fixtures above.

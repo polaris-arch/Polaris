@@ -310,6 +310,20 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     expect(notifyDesktopMock.mock.calls).toEqual([[`notify.${key}.title`, `notify.${key}.body`]]);
   });
 
+  it.each([
+    ['CORE_ADMISSION_EXACT_OBJECT', 'unsupportedExactObject'],
+    ['CORE_ADMISSION_UNSUPPORTED_CAPABILITY', 'unsupportedCapability'],
+    ['CORE_ADMISSION_LOADER_POLICY', 'unavailable'],
+    ['CORE_ADMISSION_BUSY', 'busy'],
+    ['CORE_ADMISSION_UNAVAILABLE', 'unavailable'],
+  ])('%s reuses the Helper admission text for both notifications', (errorCode, key) => {
+    handleProxyErrorEvent({ errorCode, message: '/private/native/path diagnostic' }, { t, refreshProxyStatus });
+    const body = `helper.coreAdmission.${key}`;
+    expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
+    expect(toastErrorMock.mock.calls).toEqual([[body]]);
+    expect(notifyDesktopMock.mock.calls).toEqual([['notify.proxyError.title', body]]);
+  });
+
   // ── 与发起方（Home 连接按钮）的去重：认领闸门 ─────────────────────────────
   //
   // 这三码（HELPER 两码 + ROOT_ORPHAN_BLOCKED）是后端**双出口**（emit 事件 + 让 api.proxy.start

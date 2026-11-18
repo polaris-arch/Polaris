@@ -1559,11 +1559,12 @@ async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {
         .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
         .await
         .expect_err("确认不了配套 ⇒ 必须拒绝");
-    assert_eq!(error.code, Some(code::HELPER_CORE_MISMATCH), "{error}");
-    assert!(
-        error.message.contains("设置 › Helper") && error.message.contains("重新安装或升级"),
-        "诊断文案须带可执行的下一步：{error}"
+    assert_eq!(
+        error.code,
+        Some(code::CORE_ADMISSION_UNAVAILABLE),
+        "{error}"
     );
+    assert!(error.message.starts_with("CORE_ADMISSION_Unknown:"));
     assert!(
         !rt.child.lock().unwrap().has_helper_start(),
         "不得建立 Start custody：起核请求根本不该发出"

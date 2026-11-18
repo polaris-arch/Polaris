@@ -110,6 +110,11 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.BINARY_NOT_EXECUTABLE:
     case ProxyErrorCode.CORE_NOT_EXECUTABLE:
     case ProxyErrorCode.HELPER_CORE_MISMATCH:
+    case ProxyErrorCode.CORE_ADMISSION_EXACT_OBJECT:
+    case ProxyErrorCode.CORE_ADMISSION_UNSUPPORTED_CAPABILITY:
+    case ProxyErrorCode.CORE_ADMISSION_LOADER_POLICY:
+    case ProxyErrorCode.CORE_ADMISSION_BUSY:
+    case ProxyErrorCode.CORE_ADMISSION_UNAVAILABLE:
     case ProxyErrorCode.BINARY_NOT_FOUND:
     case ProxyErrorCode.CRONET_LIB_MISSING:
     case ProxyErrorCode.CORE_LIBRARY_LOAD_FAILED:

@@ -1672,9 +1672,8 @@ fn ordinary_status_checks_old_daemon_version_and_never_calls_its_core_status() {
             b"OK 2\n".to_vec(),
         )],
     );
-    assert!(
-        matches!(query_core_status(&client,&id),Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid{reason,..}) if reason==polaris_core_supervisor::admitted_payload::AdmissionErrorKind::UnsupportedCapability.status_token())
-    );
+    assert!(matches!(query_core_status(&client, &id), Err(reason)
+            if reason == "HELPER_CORE_MISMATCH: installed helper execution protocol is too old"));
     assert_eq!(connects.load(Ordering::SeqCst), 1);
     assert_eq!(
         frames.lock().unwrap()[0].lines().collect::<Vec<_>>(),

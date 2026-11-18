@@ -7,6 +7,8 @@
  * `contracts/proxy-error-key-coverage.test.ts` 锁定。
  */
 
+import { coreAdmissionMessageKey } from './core-admission';
+
 /** `t(key, fallback?)` 的最小结构。 */
 export type ProxyErrorTranslate = (key: string, fallback?: string) => string;
 
@@ -43,6 +45,11 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   HELPER_CORE_ABSENT: 'errors.helperCoreAbsent',
   HELPER_CORE_INVALID: 'errors.helperCoreInvalid',
   HELPER_CORE_MISMATCH: 'errors.helperCoreMismatch',
+  CORE_ADMISSION_EXACT_OBJECT: coreAdmissionMessageKey('UnsupportedExactObject'),
+  CORE_ADMISSION_UNSUPPORTED_CAPABILITY: coreAdmissionMessageKey('UnsupportedCapability'),
+  CORE_ADMISSION_LOADER_POLICY: coreAdmissionMessageKey('LoaderPolicy'),
+  CORE_ADMISSION_BUSY: coreAdmissionMessageKey('Busy'),
+  CORE_ADMISSION_UNAVAILABLE: coreAdmissionMessageKey('Unknown'),
   RULE_RESOURCES_MISSING: 'home.ruleResourcesMissing',
   NETWORK_PROFILE_RULES_PRUNED: 'home.networkProfileRulesPruned',
   AUTO_SWITCH_NEEDS_RESTART: 'errors.autoSwitchNeedsRestart',

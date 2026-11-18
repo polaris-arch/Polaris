@@ -1530,13 +1530,18 @@ impl HelperRuntime {
         match self.core_status()? {
             polaris_helper_proto::core_protocol::CoreStatus::Present { .. } => Ok(()),
             polaris_helper_proto::core_protocol::CoreStatus::Absent { .. } => {
-                Err("HELPER_CORE_ABSENT: 提权助手尚未安装本版本配套内核，请更新提权助手".into())
+                Err("HELPER_CORE_ABSENT: selected core has not been installed".into())
             }
             polaris_helper_proto::core_protocol::CoreStatus::Invalid { reason, .. } => {
-                if let Some(kind)=polaris_core_supervisor::admitted_payload::AdmissionErrorKind::from_status_token(&reason).filter(|k|!k.is_payload_damage()) {
+                if let Some(kind) =
+                    polaris_core_supervisor::admitted_payload::AdmissionErrorKind::from_status_token(
+                        &reason,
+                    )
+                    .filter(|kind| !kind.is_payload_damage())
+                {
                     return Err(format!("CORE_ADMISSION_{kind:?}: helper rejected the selected execution capability"));
                 }
-                Err("HELPER_CORE_INVALID: 配套内核校验失败，请重新安装提权助手".into())
+                Err("HELPER_CORE_INVALID: installed selected core failed verification".into())
             }
         }
     }
@@ -1602,6 +1607,13 @@ impl HelperRuntime {
                 ..
             })) => return Ok(HelperStartResult::BirthRejected(target)),
             Response::Err(error) => {
+                // Existing Helpers send the bounded admission marker in the Start
+                // error detail. Preserve it for the App's error-code projection.
+                if error.code == polaris_helper_proto::ErrorCode::Start
+                    && error.detail.starts_with("CORE_ADMISSION_")
+                {
+                    return Err(error.detail);
+                }
                 return Err(format_helper_mutation_error(
                     self.platform,
                     "pinned 起核",
@@ -2785,13 +2797,11 @@ fn query_core_status(
     match client.send_with_timeout(&Request::Version, Duration::from_secs(5)) {
         Ok(Response::Ok(ResponseKind::Version { proto_version }))
             if proto_version >= polaris_helper_proto::proto_version::MIN_TRUSTED_EXECUTION => {}
-        Ok(Response::Ok(ResponseKind::Version { .. })) => return Ok(CoreStatus::Invalid {
-            id: id.clone(),
-            reason:
-                polaris_core_supervisor::admitted_payload::AdmissionErrorKind::UnsupportedCapability
-                    .status_token()
-                    .into(),
-        }),
+        Ok(Response::Ok(ResponseKind::Version { .. })) => {
+            return Err(
+                "HELPER_CORE_MISMATCH: installed helper execution protocol is too old".into(),
+            );
+        }
         _ => {
             return Err(
                 "CORE_ADMISSION_Unknown: helper execution protocol could not be observed".into(),
@@ -2813,7 +2823,7 @@ fn query_core_status(
             }
             Ok(status)
         }
-        _ => Err("HELPER_CORE_MISMATCH: pinned content status unavailable; update helper".into()),
+        _ => Err("CORE_ADMISSION_Unknown: pinned content status unavailable".into()),
     }
 }
 

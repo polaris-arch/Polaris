@@ -245,6 +245,19 @@ export function handleProxyErrorEvent(
     if (!isProxyStartClaimed()) toast.error(proxyErrorText(data, t));
     return;
   }
+  if (data.errorCode === 'CORE_ADMISSION_EXACT_OBJECT' ||
+      data.errorCode === 'CORE_ADMISSION_UNSUPPORTED_CAPABILITY' ||
+      data.errorCode === 'CORE_ADMISSION_LOADER_POLICY' ||
+      data.errorCode === 'CORE_ADMISSION_BUSY' ||
+      data.errorCode === 'CORE_ADMISSION_UNAVAILABLE') {
+    void refreshProxyStatus();
+    if (isProxyStartClaimed()) return;
+    const message = proxyErrorText(data, t);
+    toast.error(message);
+    void notifyDesktop(t('notify.proxyError.title'), message);
+    return;
+  }
+
   const contentErrorNotification: Readonly<Record<string, string>> = {
     CORE_BUNDLE_MISMATCH: 'coreBundleMismatch',
     HELPER_CORE_OCCUPIED: 'helperCoreOccupied',

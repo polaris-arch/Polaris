@@ -526,6 +526,29 @@ pub(super) fn helper_core_mismatch_message(why: &str) -> String {
     )
 }
 
+fn helper_core_admission_code(detail: &str) -> Option<&'static str> {
+    use polaris_core_supervisor::admitted_payload::AdmissionErrorKind as Kind;
+
+    // The Start reply carries the enum's diagnostic form. Normalize its
+    // leading marker to the same bounded kind parser used for CoreStatus.
+    let marker = detail.strip_prefix("CORE_ADMISSION_")?.split_once(':')?.0;
+    let mut token = String::from("admission");
+    for character in marker.chars() {
+        if character.is_ascii_uppercase() {
+            token.push('-');
+        }
+        token.push(character.to_ascii_lowercase());
+    }
+    Some(match Kind::from_status_token(&token)? {
+        Kind::UnsupportedExactObject => code::CORE_ADMISSION_EXACT_OBJECT,
+        Kind::UnsupportedCapability => code::CORE_ADMISSION_UNSUPPORTED_CAPABILITY,
+        Kind::LoaderPolicy => code::CORE_ADMISSION_LOADER_POLICY,
+        Kind::Busy => code::CORE_ADMISSION_BUSY,
+        Kind::Unknown | Kind::Io => code::CORE_ADMISSION_UNAVAILABLE,
+        Kind::Missing | Kind::Mismatch | Kind::Changed => return None,
+    })
+}
+
 /// 抹去每轮起核必重新分配的本地端口；其余字段（含用户 mixed 端口、节点、规则、路径、secret）全保留。
 pub(super) fn normalize_kernel_gate_config(value: &mut Value) {
     if let Some(inbounds) = value.get_mut("inbounds").and_then(Value::as_array_mut) {
@@ -3051,17 +3074,17 @@ impl ProxyRuntime {
         if let Err(why) = selected_ready {
             // Prefixes are emitted by our selected-id status adapter, never by
             // parsing a core's version output or arbitrary native diagnostics.
-            let error_code = if why.starts_with("HELPER_CORE_ABSENT:") {
-                code::HELPER_CORE_ABSENT
-            } else if why.starts_with("HELPER_CORE_INVALID:") {
-                code::HELPER_CORE_INVALID
-            } else if why.starts_with("CORE_BUNDLE_MISMATCH:") {
-                code::CORE_BUNDLE_MISMATCH
-            } else {
-                code::HELPER_CORE_MISMATCH
+            let error_code = match why.split_once(':').map(|(prefix, _)| prefix) {
+                Some("HELPER_CORE_ABSENT") => code::HELPER_CORE_ABSENT,
+                Some("HELPER_CORE_INVALID") => code::HELPER_CORE_INVALID,
+                Some("CORE_BUNDLE_MISMATCH") => code::CORE_BUNDLE_MISMATCH,
+                _ => helper_core_admission_code(&why).unwrap_or(code::HELPER_CORE_MISMATCH),
             };
-            let message = helper_core_mismatch_message(&why);
-            self.set_error(&message, error_code);
+            let message = if error_code == code::HELPER_CORE_MISMATCH {
+                helper_core_mismatch_message(&why)
+            } else {
+                why
+            };
             return Err(StartError::coded(message, error_code));
         }
         // The lease can reject before any helper operation is queued.
@@ -3168,7 +3191,12 @@ impl ProxyRuntime {
             Err(error) if error.starts_with("HELPER_CORE_OCCUPIED:") => {
                 return Err(StartError::coded(error, code::HELPER_CORE_OCCUPIED));
             }
-            Err(e) => return Err(e.into()),
+            Err(error) => {
+                return Err(match helper_core_admission_code(&error) {
+                    Some(code) => StartError::coded(error, code),
+                    None => error.into(),
+                });
+            }
         };
         let pid = target.pid();
         // The blocking worker already published pid under Child→pid, even if
