@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::Duration;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::response::ApiResponse;
@@ -7,6 +8,9 @@ use crate::runtime::AppRuntime;
 
 /// sing-box 官方面板内窗口 label（单例：已存在则聚焦复用，对齐 上游 `dashboardWindow`）。
 const DASHBOARD_WINDOW_LABEL: &str = "singbox-dashboard";
+// The preload (including the credential) and the navigation boundary are fixed
+// at creation. Serialize opening and remember only a digest of the preload.
+static DASHBOARD_PRELOAD: tokio::sync::Mutex<Option<String>> = tokio::sync::Mutex::const_new(None);
 
 /// 上游 `OPEN_SINGBOX_DASHBOARD`：打开 sing-box 官方面板（应用内 webview 窗，dashboard #55）。
 ///
@@ -48,47 +52,54 @@ const DASHBOARD_WINDOW_LABEL: &str = "singbox-dashboard";
 )]
 #[tauri::command]
 pub async fn open_singbox_dashboard(app: AppHandle, locale: Option<String>) -> ApiResponse<Value> {
-    let info = app.state::<AppRuntime>().proxy().dashboard_connection();
-    if !info.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        return ApiResponse::ok(json!({ "ok": false }));
-    }
-    // 已有面板窗 → 聚焦复用（对齐 上游「已存在则 focus」，不重复开窗）。
-    if let Some(win) = app.get_webview_window(DASHBOARD_WINDOW_LABEL) {
-        let _ = win.set_focus();
-        return ApiResponse::ok(json!({ "ok": true }));
-    }
-    let url = info
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let api_url = info
-        .get("apiUrl")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let secret = info
-        .get("secret")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if url.is_empty() || api_url.is_empty() {
-        return ApiResponse::ok(json!({ "ok": false }));
-    }
-    // 面板后端 url 用 host:port（无协议前缀），与面板归一化（去 http:// 前缀 + 去尾斜杠）后的存量格式一致。
-    let bare = api_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .to_string();
-    let script = build_dashboard_preload_script(
-        &bare,
-        &secret,
-        map_locale_to_dashboard_lang(locale.as_deref()),
-    );
-
-    let parsed = match url.parse::<tauri::Url>() {
-        Ok(u) => u,
-        Err(e) => return ApiResponse::err(format!("面板 URL 非法：{e}")),
+    let mut active_preload = DASHBOARD_PRELOAD.lock().await;
+    let (parsed, api_url, script, preload) = loop {
+        let info = app.state::<AppRuntime>().proxy().dashboard_connection();
+        if info["ok"] != true {
+            return ApiResponse::ok(json!({ "ok": false }));
+        }
+        let url = info["url"].as_str().unwrap_or_default();
+        let api_url = info["apiUrl"].as_str().unwrap_or_default();
+        let secret = info["secret"].as_str().unwrap_or_default();
+        if url.is_empty() || api_url.is_empty() {
+            return ApiResponse::ok(json!({ "ok": false }));
+        }
+        let parsed = match url.parse::<tauri::Url>() {
+            Ok(u) => u,
+            Err(e) => return ApiResponse::err(format!("面板 URL 非法：{e}")),
+        };
+        // 面板存储用 host:port。
+        let bare = api_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let script = build_dashboard_preload_script(
+            bare,
+            secret,
+            map_locale_to_dashboard_lang(locale.as_deref()),
+        );
+        let preload = polaris_updater::sha256_hex(script.as_bytes());
+        let Some(win) = app.get_webview_window(DASHBOARD_WINDOW_LABEL) else {
+            break (parsed, api_url.to_owned(), script, preload);
+        };
+        if active_preload.as_ref() == Some(&preload) {
+            let _ = win.set_focus();
+            return ApiResponse::ok(json!({ "ok": true }));
+        }
+        if let Err(e) = win.destroy() {
+            return ApiResponse::err(format!("关闭旧面板窗失败：{e}"));
+        }
+        // destroy queues the close. Wait until Tauri releases the label, then
+        // read the current Core endpoint again before building its replacement.
+        if tokio::time::timeout(Duration::from_secs(2), async {
+            while app.get_webview_window(DASHBOARD_WINDOW_LABEL).is_some() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            return ApiResponse::err("关闭旧面板窗超时");
+        }
     };
     // 仅允许停留在本地 api service 源（`http://127.0.0.1:<port>/…`）；跨源 http(s) 拦下。内部 scheme 放行。
     let allowed_prefix = format!("{api_url}/");
@@ -114,21 +125,9 @@ pub async fn open_singbox_dashboard(app: AppHandle, locale: Option<String>) -> A
     if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
         builder = builder.additional_browser_args(args);
     }
-    let win = builder.build();
-    match win {
-        Ok(_) => ApiResponse::ok(json!({ "ok": true })),
-        // 快速双击：async 之后两个请求可能都越过上面的查重，后到的那个在 tauri 的 label 登记处
-        // 被拒（`manager/webview.rs::prepare_webview` → `WebviewLabelAlreadyExists`，
-        // `manager/window.rs::prepare_window` → `WindowLabelAlreadyExists`，经 `?` 原样上抛）。
-        // 窗已由先到的请求建出 = 用户要的结果已经成立，按「已存在则聚焦」处理，不回假错误。
-        // 射程：先到者已走完 `attach_window`/`attach_webview` 登记（`window/mod.rs::build_internal`，
-        // 投递建窗消息后即同步登记，不等主线程）。两者**同时**越过 `prepare_*` 的那段微秒级窗口不在此覆盖。
-        Err(
-            tauri::Error::WindowLabelAlreadyExists(_) | tauri::Error::WebviewLabelAlreadyExists(_),
-        ) => {
-            if let Some(win) = app.get_webview_window(DASHBOARD_WINDOW_LABEL) {
-                let _ = win.set_focus();
-            }
+    match builder.build() {
+        Ok(_) => {
+            *active_preload = Some(preload);
             ApiResponse::ok(json!({ "ok": true }))
         }
         Err(e) => ApiResponse::err(format!("建面板窗失败：{e}")),

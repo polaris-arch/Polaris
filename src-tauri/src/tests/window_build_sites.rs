@@ -247,15 +247,6 @@ fn every_registered_build_site_keeps_its_entry_discipline() {
         "`open_singbox_dashboard` 签名正上方必须是 `#[tauri::command]`（它是面板窗的 IPC 入口；\
          不再是 command 就换了入口形态，需重新裁定线程纪律）"
     );
-    let body = top_level_fn_body(dashboard, sig);
-    for variant in ["WindowLabelAlreadyExists", "WebviewLabelAlreadyExists"] {
-        assert!(
-            body.contains(variant),
-            "面板 build() 失败时必须把 `tauri::Error::{variant}` 当「已存在则聚焦」处理：async 之后\
-             快速双击的两个请求都能越过查重，后到者会撞 label 冲突，回错误信封就是一条假失败 toast"
-        );
-    }
-
     // ── 更新弹窗：`show_update_popup` 的每个调用点在 async fn 内或 spawn 内 ──
     let popup_calls = call_sites(&files, "show_update_popup");
     assert!(
