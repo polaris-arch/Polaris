@@ -1513,26 +1513,11 @@ impl ExitRouteOp for HelperExitRouteOp {
             return false; // 诚实：不假装 OS 路由已装（管理器不标 installed）
         }
         match self.platform {
-            // Linux：app 自身 CAP_NET_ADMIN，独立表 + oif 规则。
-            //
-            // **返回值由 `ip rule add` 的退出码决定，不再无条件 true**：`run_ip_command` 吞掉全部错误
-            // （`ip` 不在 PATH / 无 CAP_NET_ADMIN / 内核无 policy routing 全落同一条 best-effort 路径），
-            // 恒 true 会让状态机把「一条都没装上」记成 `installed` —— 后果有二：① 用户以为 System 出口
-            // 已生效，实则公网 unreachable；② clear 时对**不存在**的路由发 del（噪音，且掩盖真实失败）。
-            // 门取 `rule add` 而非「全部命令」：规则装不上 ⇒ 表 7732 永不被查中 ⇒ 里面的路由一条都不生效
-            // （真·全败）；而单条 `route replace` 失败（如 v6 cidr 在关掉 IPv6 的机器上）不代表整腿失败，
-            // 此时仍标 installed 才能让 clear 把已装的那部分收回去（否则泄漏）。
-            // add 腿首条即 `rule add`（见 [`linux_route_argv`] 的构造顺序，由单测钉死）。
-            // del 腿尝试全部命令，但仅全成功/明确不存在才确认清理；失败保留重试依据。
-            //
-            // 判定与执行分离（[`run_linux_route_seq`]）：真 `ip` 调用是真机门（本机绝不 spawn），
-            // 而「哪条是门、失败后跳不跳、del 腿返什么」是可测的纯编排 —— 单测注入假 runner 覆盖。
+            // 独立表 7732 的策略规则按地址族生效；部分安装也必须保留清理责任。
             Platform::Linux => {
-                let commands_ok = run_linux_route_seq(
-                    op,
-                    linux_route_argv(op, iface, cidrs),
-                    |argv| async move { run_ip_command(&argv).await },
-                )
+                let commands_ok = run_linux_route_seq(op, iface, cidrs, |argv| async move {
+                    run_ip_command(&argv).await
+                })
                 .await;
                 if op == "del" {
                     // Even a vanished interface can leave an oif policy rule. Query
@@ -1666,51 +1651,6 @@ where
     None
 }
 
-/// Linux 出口路由 argv 序列（独立表 [`LINUX_EXIT_TABLE`] + oif 规则，绝不碰 main 表 → 不抢 sing-box）。
-/// Polaris runRoute linux 1:1：
-/// - add：`rule add oif <iface> table T priority P` + 逐 cidr `route replace <cidr> dev <iface> table T`；
-/// - del：逐 cidr `route del <cidr> dev <iface> table T` + `rule del oif <iface> table T priority P`。
-///
-/// 纯函数（无副作用），供单测/变异；执行由 [`run_ip_command`] 逐条 best-effort 跑（真机门）。
-fn linux_route_argv(op: &str, iface: &str, cidrs: &[String]) -> Vec<Vec<String>> {
-    let rule = |verb: &str| {
-        vec![
-            "rule".to_string(),
-            verb.to_string(),
-            "oif".to_string(),
-            iface.to_string(),
-            "table".to_string(),
-            LINUX_EXIT_TABLE.to_string(),
-            "priority".to_string(),
-            LINUX_EXIT_RULE_PRIORITY.to_string(),
-        ]
-    };
-    let route = |verb: &str, cidr: &str| {
-        vec![
-            "route".to_string(),
-            verb.to_string(),
-            cidr.to_string(),
-            "dev".to_string(),
-            iface.to_string(),
-            "table".to_string(),
-            LINUX_EXIT_TABLE.to_string(),
-        ]
-    };
-    let mut cmds = Vec::new();
-    if op == "add" {
-        cmds.push(rule("add"));
-        for c in cidrs {
-            cmds.push(route("replace", c));
-        }
-    } else {
-        for c in cidrs {
-            cmds.push(route("del", c));
-        }
-        cmds.push(rule("del"));
-    }
-    cmds
-}
-
 /// `ifconfig -l` 输出 → utun 接口名集合（`^utun\d+$`）。上游 `listUtuns`。纯函数。
 fn parse_utun_list(stdout: &str) -> HashSet<String> {
     stdout
@@ -1801,31 +1741,69 @@ fn pick_tailnet_iface(
         .map(|(n, _)| n.clone())
 }
 
-/// Linux 出口路由命令序列的执行编排 + **返回值判定**（`run` 注入 ⇒ 本机可测，绝不 spawn 真 `ip`）。
-///
-/// 语义（对齐 [`HelperExitRouteOp::run_route`] Linux 分支的注释）：
-/// - `op == "add"`：**首条即 `ip rule add`**（[`linux_route_argv`] 的构造顺序，由 `linux_add_argv_starts_with_rule_add` 钉死）。
-///   它失败 ⇒ 表 7732 永不被查中 ⇒ 后续 `route replace` 全是白跑 ⇒ 立即 break 并返 `false`（不标 installed）。
-///   它成功 ⇒ 后续逐条 best-effort（单条 cidr 失败不否定整腿：仍需标 installed 才能在 clear 时收回已装部分）。
-/// - `op != "add"`（del）：尝试全部命令；任何未确认失败都返回 false，保留清理依据。
-async fn run_linux_route_seq<F, Fut>(op: &str, cmds: Vec<Vec<String>>, run: F) -> bool
+/// 每个地址族先装策略规则，再装表内路由；删除时先删路由，最后删该族规则。
+/// 当后续操作失败时，已安装的规则仍需要 clear。删除后的实际状态由库存查询确认。
+async fn run_linux_route_seq<F, Fut>(op: &str, iface: &str, cidrs: &[String], run: F) -> bool
 where
     F: Fn(Vec<String>) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let is_add = op == "add";
+    let adding = op == "add";
+    let mut installed = false;
     let mut all_ok = true;
-    for (idx, argv) in cmds.into_iter().enumerate() {
-        let ok = run(argv).await;
-        all_ok &= ok;
-        if is_add && idx == 0 && !ok {
-            log::warn!(
-                "出口路由:Linux `ip rule add` 失败(ip 缺失/无 CAP_NET_ADMIN/内核无策略路由?) → 不标 installed,跳过后续 route 命令"
-            );
-            return false;
+    for family in ["-4", "-6"] {
+        let mut routes = cidrs
+            .iter()
+            .filter(|cidr| cidr.contains(':') == (family == "-6"))
+            .peekable();
+        if routes.peek().is_none() {
+            continue;
+        }
+        let rule = || {
+            [
+                family,
+                "rule",
+                op,
+                "oif",
+                iface,
+                "table",
+                LINUX_EXIT_TABLE,
+                "priority",
+                LINUX_EXIT_RULE_PRIORITY,
+            ]
+            .map(str::to_owned)
+            .into()
+        };
+        if adding {
+            if !run(rule()).await {
+                log::warn!("出口路由: Linux ip {family} rule add 失败，跳过该族路由");
+                return installed;
+            }
+            installed = true;
+        }
+        let verb = if adding { "replace" } else { "del" };
+        for cidr in routes {
+            let args = [
+                family,
+                "route",
+                verb,
+                cidr.as_str(),
+                "dev",
+                iface,
+                "table",
+                LINUX_EXIT_TABLE,
+            ];
+            all_ok &= run(args.map(str::to_owned).into()).await;
+        }
+        if !adding {
+            all_ok &= run(rule()).await;
         }
     }
-    is_add || all_ok
+    if adding {
+        installed
+    } else {
+        all_ok
+    }
 }
 
 // Parse only successful, structured inventories. Unknown shapes remain cleanup debt.
