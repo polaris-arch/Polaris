@@ -341,12 +341,15 @@ pub mod proto_version {
     /// Future mandatory behavior fixes advance the affected target requirement;
     /// new App builds or Core payloads alone must not.
     pub const WINDOWS_EXACT_OBJECT: u32 = 8;
+    /// Linux v8 retires DNS ownership after proving the previous TUN link is gone.
+    pub const LINUX_DNS_LINK_RETIREMENT: u32 = 8;
 
     /// Required generation for the target platform, including cross-target clients.
     pub const fn for_platform(platform: crate::Platform) -> u32 {
         match platform {
             crate::Platform::Win => WINDOWS_EXACT_OBJECT,
-            crate::Platform::Mac | crate::Platform::Linux => BASELINE,
+            crate::Platform::Linux => LINUX_DNS_LINK_RETIREMENT,
+            crate::Platform::Mac => BASELINE,
             // Mobile targets have no privileged desktop helper. Keep the shared
             // wire baseline without claiming Windows native execution support.
             crate::Platform::Android | crate::Platform::Ios => BASELINE,
@@ -358,8 +361,11 @@ pub mod proto_version {
     /// Native helper advertisement and installer receipt use the same generation.
     #[cfg(windows)]
     pub const CURRENT: u32 = WINDOWS_EXACT_OBJECT;
+    /// The Linux helper must include the resolved-link ownership fix.
+    #[cfg(target_os = "linux")]
+    pub const CURRENT: u32 = LINUX_DNS_LINK_RETIREMENT;
     /// Unaffected platforms retain the reusable v7 helper generation.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     pub const CURRENT: u32 = BASELINE;
 }
 

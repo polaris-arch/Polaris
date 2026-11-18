@@ -2394,8 +2394,12 @@ fn windows_v7_requires_behavior_upgrade_but_new_build_ids_do_not() {
 }
 
 #[test]
-fn windows_behavior_upgrade_keeps_mac_and_linux_v7_status_compatible() {
-    for platform in [Platform::Mac, Platform::Linux] {
+fn unix_status_only_offers_required_helper_behavior_upgrade() {
+    for (platform, version, upgradeable) in [
+        (Platform::Mac, 7, false),
+        (Platform::Linux, 7, true),
+        (Platform::Linux, 8, false),
+    ] {
         let paths = InstallPaths::for_platform(platform);
         let mut sysops = MockSysOps::default();
         sysops.exists_paths.insert(paths.binary);
@@ -2403,7 +2407,7 @@ fn windows_behavior_upgrade_keeps_mac_and_linux_v7_status_compatible() {
         let (manager, _dir) = manager_with_token(platform, sysops);
         let connector = MockConnector {
             streams: Arc::new(Mutex::new(vec![MockStream::with_response(
-                b"OK pong uid=0 v7 build=retained-helper\n".to_vec(),
+                format!("OK pong uid=0 v{version} build=retained-helper\n").into_bytes(),
             )])),
         };
         let status = manager.compute_status_with_client(&HelperClient::new(
@@ -2413,7 +2417,7 @@ fn windows_behavior_upgrade_keeps_mac_and_linux_v7_status_compatible() {
         ));
         assert!(status.installed);
         assert!(status.ready);
-        assert!(!status.upgradeable);
+        assert_eq!(status.upgradeable, upgradeable);
         assert!(!status.needs_repair);
     }
 }

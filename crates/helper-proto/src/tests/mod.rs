@@ -249,5 +249,5 @@ fn native_advertisement_matches_target_behavior_generation() {
     );
     assert_eq!(proto_version::for_platform(Platform::Win), 8);
     assert_eq!(proto_version::for_platform(Platform::Mac), 7);
-    assert_eq!(proto_version::for_platform(Platform::Linux), 7);
+    assert_eq!(proto_version::for_platform(Platform::Linux), 8);
 }

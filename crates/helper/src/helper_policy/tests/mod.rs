@@ -34,42 +34,34 @@ fn compatible_helpers_survive_app_releases_but_required_fixes_upgrade() {
 }
 
 #[test]
-fn windows_exact_object_fix_advances_once_then_reuses_compatible_helper() {
-    let current =
-        polaris_helper_proto::proto_version::for_platform(polaris_helper_proto::Platform::Win);
-    assert_eq!(
-        current, 8,
-        "the exact-object fix requires a new compatibility generation"
-    );
-    // This must use the production platform generation, not two hand-written version numbers: otherwise
-    // reverting the advertised generation to v7 would leave this regression green.
-    assert_eq!(
-        replacement_policy("1.0.0", 7, "1.0.0", current).unwrap(),
-        "replace"
-    );
-    assert_eq!(
-        replacement_policy("1.0.0", current, "1.1.0", current).unwrap(),
-        "retain"
-    );
-    assert_eq!(
-        replacement_policy("1.1.0", current + 1, "1.0.0", current).unwrap(),
-        "retain"
-    );
-    // A real compatibility fix still cannot silently downgrade a newer binary.
-    assert!(replacement_policy("1.1.0", 7, "1.0.0", current).is_err());
+fn platform_behavior_fixes_advance_once_then_reuse_compatible_helpers() {
+    use polaris_helper_proto::{proto_version, Platform};
+    for platform in [Platform::Win, Platform::Linux] {
+        let current = proto_version::for_platform(platform);
+        assert_eq!(current, 8, "{platform:?}");
+        assert_eq!(
+            replacement_policy("1.0.0", 7, "1.0.0", current).unwrap(),
+            "replace"
+        );
+        assert_eq!(
+            replacement_policy("1.0.0", current, "1.1.0", current).unwrap(),
+            "retain"
+        );
+        assert_eq!(
+            replacement_policy("1.1.0", current + 1, "1.0.0", current).unwrap(),
+            "retain"
+        );
+        assert!(replacement_policy("1.1.0", 7, "1.0.0", current).is_err());
+    }
 }
 
 #[test]
-fn windows_behavior_fix_does_not_replace_other_platform_v7_helpers() {
-    for platform in [
-        polaris_helper_proto::Platform::Mac,
-        polaris_helper_proto::Platform::Linux,
-    ] {
-        let required = polaris_helper_proto::proto_version::for_platform(platform);
-        assert_eq!(required, 7);
-        assert_eq!(
-            replacement_policy("1.0.0", 7, "1.1.0", required).unwrap(),
-            "retain"
-        );
-    }
+fn platform_behavior_fixes_preserve_the_macos_v7_helper() {
+    let required =
+        polaris_helper_proto::proto_version::for_platform(polaris_helper_proto::Platform::Mac);
+    assert_eq!(required, 7);
+    assert_eq!(
+        replacement_policy("1.0.0", 7, "1.1.0", required).unwrap(),
+        "retain"
+    );
 }
