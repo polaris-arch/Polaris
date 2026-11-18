@@ -44,30 +44,10 @@ class LocalCompilerInputs(unittest.TestCase):
 
 
 # Actual owned compressed fixtures. No App/Helper code is executed.
-import os, shutil, subprocess, zipfile, sys
+import zipfile
 artifact_spec=importlib.util.spec_from_file_location('package',Path(__file__).resolve().parents[1]/'final-package-receipt.py')
 package=importlib.util.module_from_spec(artifact_spec);artifact_spec.loader.exec_module(package)
 class FormalArtifactSelection(unittest.TestCase):
- marker=b'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1'
- def stage(self,root,local=False):
-  for name,data in [('usr/bin/polaris',b'ordinary App'+(self.marker if local else b'')),('usr/lib/Polaris/_up_/resources/linux/polaris-helper',b'ordinary Helper')]:
-   p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(data)
- def test_actual_compressed_zip_and_apk_members_not_source_or_digest_labels(self):
-  with tempfile.TemporaryDirectory() as tmp:
-   root=Path(tmp)
-   for local in [False,True]:
-    archive=root/('local.zip' if local else 'formal.zip')
-    with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED) as z:
-     z.writestr('polaris.exe',b'a'*65530+(self.marker if local else b'ordinary App'))
-     z.writestr('_up_/resources/win/polaris-helper.exe',b'ordinary Helper')
-    if local:
-     with self.assertRaisesRegex(ValueError,'LocalDevelopmentSelection executable'):package.reject_local_selection(archive)
-     child=subprocess.run([sys.executable,'-B',str(Path(package.__file__)),'--reject-local-selection',str(archive)],capture_output=True)
-     self.assertNotEqual(child.returncode,0);self.assertIn(b'LocalDevelopmentSelection executable',child.stderr)
-    else:self.assertEqual(len(package.reject_local_selection(archive)['checkedExecutables']),2)
-   apk=root/'a.apk'
-   with zipfile.ZipFile(apk,'w') as z:z.writestr('lib/arm64-v8a/libpolaris_lib.so',self.marker)
-   with self.assertRaisesRegex(ValueError,'LocalDevelopmentSelection'):package.reject_local_selection(apk)
  def test_nonproc_snapshot_checks_growth_and_deadline_before_each_write(self):
   # Real retained source and scratch writes; force only the non-proc branch.
   # Growth and elapsed time arrive after the first bounded block is written.
@@ -113,39 +93,4 @@ class FormalArtifactSelection(unittest.TestCase):
     self.assertEqual(state['written'],len(frozen) if fault=='none' else 65536)
     self.assertLessEqual(state['written'],len(frozen))
     if fault!='none':self.assertEqual(state['reads'],2)
- def test_zip_alias_and_expansion_budget_fail_before_payload(self):
-  with tempfile.TemporaryDirectory() as tmp:
-   for name in ['../polaris.exe','polaris.exe/../polaris.exe','Polaris.exe.']:
-    archive=Path(tmp)/'bad.zip'
-    with zipfile.ZipFile(archive,'w') as z:z.writestr(name,b'body')
-    with self.subTest(name=name),self.assertRaises(ValueError):package.reject_local_selection(archive)
- @unittest.skipUnless(sys.platform=='linux','real Linux container tooling integration')
- def test_actual_deb_and_appimage_accept_formal_and_reject_local(self):
-  self.assertIsNotNone(shutil.which('dpkg-deb'));self.assertIsNotNone(shutil.which('mksquashfs'))
-  with tempfile.TemporaryDirectory() as tmp:
-   root=Path(tmp)
-   for local in [False,True]:
-    stage=root/('local' if local else 'formal');self.stage(stage,local)
-    control=stage/'DEBIAN';control.mkdir();(control/'control').write_text('Package: polaris-control\nVersion: 1.0\nArchitecture: amd64\nMaintainer: Polaris <test@example.invalid>\nDescription: inert source regression\n')
-    deb=root/(stage.name+'.deb');subprocess.run(['dpkg-deb','--build','--root-owner-group',str(stage),str(deb)],check=True,capture_output=True)
-    image=root/(stage.name+'.AppImage');subprocess.run(['mksquashfs',str(stage),str(image),'-noappend','-processors','1','-quiet'],check=True,capture_output=True)
-    for asset in [deb,image]:
-     with self.subTest(asset=asset.name):
-      if local:
-       with self.assertRaisesRegex(ValueError,'LocalDevelopmentSelection executable'):package.reject_local_selection(asset)
-      else:self.assertTrue(package.reject_local_selection(asset)['checkedExecutables'])
- @unittest.skipUnless(sys.platform=='linux','POSIX owned executable backend control, not native NSIS/DMG evidence')
- def test_nsis_and_dmg_reader_checks_actual_stdout_and_waits_without_install(self):
-  # Controlled 7-Zip backend is a source control, not real NSIS/DMG acceptance.
-  from unittest.mock import patch
-  with tempfile.TemporaryDirectory() as tmp:
-   root=Path(tmp);tool=root/'7zz'
-   tool.write_text('#!'+sys.executable+'\nimport sys\nfrom pathlib import Path\na=sys.argv\nif a[1]=="i":print("7-Zip 24.09\\nNsis");sys.exit(0)\np=Path(a[-1]) if a[1]=="l" else Path(a[-2])\nif a[1]=="l":\n print("Type = "+("Nsis" if p.read_bytes().startswith(b"Nsis") else "HFS")+"\\n----------\\nPath = polaris.exe\\nSize = "+str(len(p.read_bytes()))+"\\n\\nPath = polaris-helper.exe\\nSize = 6")\nelse:sys.stdout.buffer.write(p.read_bytes() if a[-1]=="polaris.exe" else b"Helper")\n');tool.chmod(0o700)
-   for extension in ['.exe','.dmg']:
-    for local in [False,True]:
-     artifact=root/('carrier'+extension);artifact.write_bytes((b'Nsis' if extension=='.exe' else b'HFS')+(self.marker if local else b'App'))
-     with self.subTest(extension=extension,local=local),patch.dict(os.environ,{'PATH':str(root)+os.pathsep+os.environ['PATH']}):
-      if local:
-       with self.assertRaisesRegex(ValueError,'LocalDevelopmentSelection executable'):package.reject_local_selection(artifact)
-      else:self.assertEqual(len(package.reject_local_selection(artifact)['checkedExecutables']),2)
 if __name__=='__main__':unittest.main()

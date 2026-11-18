@@ -111,16 +111,44 @@ test('Linux formal packages keep case-distinct paths and bind the exact executab
   for (const name of ['../outside', 'usr//bad', 'bad:name', 'bad\\name', 'bad\x01name', 'trailing.', 'CON', 'e\u0301']) {
     tarMembers([...base, { name }], /unsafe ZIP member|non-canonical ZIP path|Windows ZIP (?:path alias|device name)/);
   }
-
-  const zip = join(root, 'windows.zip');
-  writeFileSync(zip, fixtureZip([{ name: 'Polaris.exe', data: app }, { name: 'polaris.exe', data: app },
-    { name: 'polaris-helper.exe', data: helper }]));
-  inspect(zip, /duplicate\/alias member/);
 }));
 
-test('formal DMG selection reads HFS and APFS executable data forks through the carrier reader', { skip: process.platform === 'win32' }, () => fixture(root => {
+test('compressed ZIP and APK selection checks executable bytes and archive paths', () => fixture(root => {
+  const markerError = /LocalDevelopmentSelection executable/;
+  for (const [extension, app] of [['zip', 'polaris.exe'], ['apk', 'lib/arm64-v8a/libpolaris_lib.so']]) {
+    const asset = join(root, 'fixture.' + extension);
+    const helper = extension === 'zip' ? [{ name: 'polaris-helper.exe', data: 'helper', method: 8 }] : [];
+    for (const marked of [false, true]) {
+      const data = Buffer.concat([Buffer.alloc(65530), marked ? LOCAL_MARKER : Buffer.from('app')]);
+      writeFileSync(asset, fixtureZip([{ name: app, data, method: 8 }, ...helper]));
+      const result = inspect(asset, marked ? markerError : undefined);
+      if (!marked) {
+        assert.equal(result.checkedExecutables.length, 1 + helper.length);
+        assert.equal(result.checkedExecutables.find(row => row.member === app).sha256, hash(data));
+      }
+    }
+  }
+  const zip = join(root, 'windows.zip');
+  for (const [name, error] of [['Polaris.exe', /duplicate\/alias member/],
+    ['../polaris.exe', /unsafe ZIP member|non-canonical ZIP path/],
+    ['polaris.exe/../polaris.exe', /unsafe ZIP member|non-canonical ZIP path/],
+    ['Polaris.exe.', /Windows ZIP path alias/]]) {
+    writeFileSync(zip, fixtureZip([name, 'polaris.exe', 'polaris-helper.exe'].map(name => ({ name, data: 'entry' }))));
+    inspect(zip, error);
+  }
+}));
+
+test('formal DMG and NSIS selection reads executable bytes through the carrier reader', { skip: process.platform === 'win32' }, () => fixture(root => {
   const directory = join(root, 'assets'), asset = join(directory, 'fixture.dmg');
-  const env = writeFormalAssets(directory, ['fixture.dmg']);
+  const env = writeFormalAssets(directory, ['fixture.dmg', 'fixture.exe']);
+  for (const path of [asset, join(directory, 'fixture.exe')]) {
+    const carrier = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(inspect(path, undefined, env).checkedExecutables.length, 2);
+    const appName = Object.keys(carrier.files).find(name => name.endsWith('polaris') || name.endsWith('polaris.exe'));
+    carrier.files[appName] = LOCAL_MARKER.toString();
+    writeFileSync(path, JSON.stringify(carrier));
+    inspect(path, /LocalDevelopmentSelection executable/, env);
+  }
   const reserved = 'Path = .HFS+ Private Directory Data\r\nFolder = +\nSize = ';
   const helper = 'Path = Contents/polaris-helper\nSize = 6\nMode = -rw-r--r--\nSymbolic Link = ';
   const backing = 'Path = Contents/target\nSize = 3';
