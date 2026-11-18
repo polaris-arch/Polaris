@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  appendFileSync, existsSync, fstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync,
-  symlinkSync, writeFileSync,
+  appendFileSync, existsSync, fstatSync, linkSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync,
+  symlinkSync, truncateSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { inspectFormalArtifact, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
+import { fileURLToPath } from 'node:url';
+import { crc32 } from 'node:zlib';
+import { inspectFormalArtifact, inspectPortableZip, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
 import { LOCAL_MARKER, compilerSelectionSource, localReceipt, rejectLocalDistribution, prepareLocalInstallation } from './desktop-core/local-development.mjs';
 import { selectedCoreManifest, writeSelectedCoreManifest } from './lib/core-identity.mjs';
@@ -211,6 +213,91 @@ test('compressed ZIP and APK selection checks executable bytes and archive paths
     writeFileSync(zip, fixtureZip([{ name: 'polaris.exe', data: 'app', flags }, { name: 'polaris-helper.exe', data: 'helper' }]));
     await inspect(zip, /encrypted\/patched member/);
   }
+}));
+
+test('portable ZIP readback verifies every byte and the exact frozen member inventory', () => fixture(async root => {
+  const archive = join(root, 'windows-portable.zip');
+  const payload = {
+    'polaris.exe': 'original App', 'portable.marker': '便携版标记', 'core-manifest.json': '{}',
+    LICENSE: 'license', NOTICE: 'notice', 'THIRD-PARTY-LICENSES.md': 'third party license',
+    'resources/win/core-manifest.json': '{"core":true}', 'resources/win/core-release/source/runtime.sh': 'signed source',
+    'resources/win/polaris-helper.exe': 'helper', 'resources/win/polaris-helper-setup.exe': 'cleaner',
+    'resources/win/sing-box.exe': 'exact core', 'resources/win/libcronet.dll': 'release Cronet',
+    'resources/dashboard/assets/current.js': 'dashboard', 'resources/data/geosite.srs': 'rule-set',
+    'resources/许可证/straße.txt': 'Unicode path',
+  };
+  const expected = Object.fromEntries(Object.entries(payload).map(([name, data]) => [name, {
+    bytes: Buffer.byteLength(data), sha256: hash(data),
+  }]));
+  const entries = Object.entries(payload).map(([name, data]) => ({ name, data, method: 8, flags: name.includes('许可证') ? 0x800 : 0 }));
+  const write = (rows) => writeFileSync(archive, fixtureZip(rows));
+  write([...entries, { name: 'resources/', data: '', mode: 0o040755 }]);
+  const reader = fileURLToPath(new URL('./lib/formal-package-selection.mjs', import.meta.url));
+  const output = execFileSync(process.execPath, [reader, 'portable-zip'], { input: JSON.stringify({ archive, expected }) });
+  assert.deepEqual(JSON.parse(output), expected);
+  for (const name of Object.keys(payload)) {
+    write(entries.filter(row => row.name !== name));
+    await assert.rejects(inspectPortableZip(archive, expected), /member set differs/, name);
+    write(entries.map(row => row.name === name ? { ...row, data: Buffer.alloc(expected[name].bytes, 120) } : row));
+    await assert.rejects(inspectPortableZip(archive, expected), /member SHA\/size differs/, name);
+  }
+  for (const name of ['resources/dashboard/screenshot.png', 'old-debug.ps1', 'resources', 'POLARIS.EXE', 'polaris.exe.',
+    'resources//win/extra', 'resources\\win\\extra', '../outside', 'unknown/', 'Resources/', 'resources/COM².txt',
+    'resources/许可证/STRASSE.txt', 'resources/e\u0301.txt', 'resources/a\0b.txt']) {
+    write([...entries, { name, data: '', flags: 0x800 }]);
+    await assert.rejects(inspectPortableZip(archive, expected), /member|directory|ZIP path|device name/, name);
+  }
+  for (const row of [{ ...entries[0] }, { name: 'resources/', data: 'nonzero', mode: 0o040755 },
+    { name: 'unexpected-link', data: 'polaris.exe', mode: 0o120777 }, { name: 'special', data: '', mode: 0o010644 }]) {
+    write([...entries, row]);
+    await assert.rejects(inspectPortableZip(archive, expected), /duplicate entry|unregistered ZIP directory|nonregular member/, row.name);
+  }
+  const crcMismatch = fixtureZip([{ name: 'LICENSE', data: 'license' }]);
+  crcMismatch[30 + 'LICENSE'.length] ^= 1;
+  writeFileSync(archive, crcMismatch);
+  await assert.rejects(inspectPortableZip(archive, { LICENSE: expected.LICENSE }), /ZIP member CRC differs/);
+  const alias = join(root, 'hardlink.zip');
+  linkSync(archive, alias);
+  await assert.rejects(inspectPortableZip(archive, { LICENSE: expected.LICENSE }), /single-link|byte budget or regular file/);
+}));
+
+test('portable ZIP readback rejects alternate entry names and enforces three byte and count bounds', () => fixture(async root => {
+  const zip = join(root, 'limits.zip');
+  const entry = { name: 'NOTICE', data: 'notice' };
+  const expected = { NOTICE: { bytes: 6, sha256: hash(entry.data) } };
+  const original = fixtureZip([entry]);
+  const eocd = original.length - 22, central = original.readUInt32LE(eocd + 16);
+  const unicode = Buffer.concat([Buffer.from([0x75, 0x70, 10, 0, 1]), Buffer.alloc(4), Buffer.from('ALIAS')]);
+  unicode.writeUInt32LE(crc32(Buffer.from(entry.name)), 5);
+  original.writeUInt16LE(unicode.length, central + 30);
+  original.writeUInt32LE(original.readUInt32LE(eocd + 12) + unicode.length, eocd + 12);
+  writeFileSync(zip, Buffer.concat([original.subarray(0, eocd), unicode, original.subarray(eocd)]));
+  await assert.rejects(inspectPortableZip(zip, expected), /Unicode path differs from original/);
+
+  const differingEncoding = fixtureZip([{ name: 'é', data: '', flags: 0x800 }]);
+  differingEncoding.writeUInt16LE(0, 6);
+  writeFileSync(zip, differingEncoding);
+  await assert.rejects(inspectPortableZip(zip, {}), /local and central headers differ/);
+
+  const limit = 512 * 1024 ** 2;
+  writeFileSync(zip, fixtureZip([entry]));
+  truncateSync(zip, limit + 1);
+  await assert.rejects(inspectPortableZip(zip, expected), /byte budget/);
+  const oversized = (count, bytes) => {
+    const data = fixtureZip(Array.from({ length: count }, (_, i) => ({ name: `file-${i}`, data: '' })));
+    let at = data.readUInt32LE(data.length - 22 + 16);
+    for (let i = 0; i < count; i++) {
+      data.writeUInt32LE(bytes, at + 24);
+      at += 46 + data.readUInt16LE(at + 28);
+    }
+    return data;
+  };
+  writeFileSync(zip, oversized(1, limit + 1));
+  await assert.rejects(inspectPortableZip(zip, { 'file-0': {} }), /oversized ZIP member/);
+  writeFileSync(zip, oversized(5, limit));
+  await assert.rejects(inspectPortableZip(zip, {}), /expanded budget/);
+  writeFileSync(zip, oversized(10001, 0));
+  await assert.rejects(inspectPortableZip(zip, {}), /entry limit/);
 }));
 
 test('the formal carrier snapshot rejects growth and expiry before writing the next block', () => fixture(async root => {

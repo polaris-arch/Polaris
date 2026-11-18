@@ -21,7 +21,6 @@ import time
 import tempfile
 import unittest
 from unittest.mock import patch
-import warnings
 import zipfile
 
 os.sys.dont_write_bytecode = True
@@ -53,72 +52,6 @@ class Integrity(unittest.TestCase):
         return {'resources': resources, 'sources': sources,
                 'cargo': {'targetDirectory': str(root / 'target'), 'releaseDirectory': str(root / 'target/release'),
                           'target': None, 'profile': 'release'}}, b'MZ inert App ' + w.BUNDLE_UNK + b' ' + (root / 'resources/win/core-manifest.json').read_bytes()
-
-    def zip(self, root, expected, state, app, fault=None):
-        archive = root / 'carrier.zip'
-        payload = {name[5:] if name.startswith('_up_/') else name: Path(source).read_bytes() for name, source in state['sources'].items()}
-        payload.update({'polaris.exe': app, 'portable.marker': w.MARKER})
-        if fault: fault(payload)
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', UserWarning)
-            with zipfile.ZipFile(archive, 'w') as z:
-                for name, content in payload.items(): z.writestr(name, content)
-        return archive
-
-    def test_real_zip_complete_legal_resource_positive(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); state, app = self.fixture(root)
-            expected = w.carrier_inventory(state, app, 'zip')
-            archive = self.zip(root, expected, state, app)
-            self.assertEqual(w.zip_inventory(archive, expected), expected)
-            self.assertIn('resources/win/core-release/source/runtime.sh', expected)
-            self.assertIn('core-manifest.json', expected)
-            self.assertEqual(expected['polaris.exe'], w.byte_facts(app))
-            self.assertNotEqual(w.carrier_inventory(state, app, 'nsis')['$R6/polaris.exe'], expected['polaris.exe'])
-
-    def test_zip_full_set_and_every_byte_negative_matrix(self):
-        mutations = {
-            'residual script': lambda p: p.update({'old-debug.ps1': b'old'}),
-            'residual screenshot': lambda p: p.update({'resources/dashboard/screenshot.png': b'old'}),
-            'extra empty dir': lambda p: p.update({'unknown/': b''}),
-            'missing manifest': lambda p: p.pop('resources/win/core-manifest.json'),
-            'missing source archive': lambda p: p.pop('resources/win/core-release/source/runtime.sh'),
-            'missing cleaner': lambda p: p.pop('resources/win/polaris-helper-setup.exe'),
-            'old App new name': lambda p: p.update({'polaris.exe': b'old app renamed current'}),
-            'old helper new name': lambda p: p.update({'resources/win/polaris-helper.exe': b'old helper new'}),
-            'same-size stale core': lambda p: p.update({'resources/win/sing-box.exe': b'x' * len(p['resources/win/sing-box.exe'])}),
-            'stale Cronet': lambda p: p.update({'resources/win/libcronet.dll': b'old-old cronet'}),
-            'stale dashboard': lambda p: p.update({'resources/dashboard/assets/current.js': b'obsolete dashboard'}),
-            'stale rules': lambda p: p.update({'resources/data/geosite.srs': b'SRS old-old bytes'}),
-            'empty license': lambda p: p.update({'LICENSE': b''}),
-            'stale marker': lambda p: p.update({'portable.marker': b'wrong marker'}),
-            'case alias': lambda p: p.update({'POLARIS.EXE': p['polaris.exe']}),
-            'trailing dot alias': lambda p: p.update({'polaris.exe.': p['polaris.exe']}),
-            'file directory alias': lambda p: p.update({'resources': b'file'}),
-            'backslash alias': lambda p: p.update({'resources\\win\\extra': b'file'}),
-            'repeated separator': lambda p: p.update({'resources//win/extra': b'file'}),
-            'path escape': lambda p: p.update({'../outside': b'file'}),
-        }
-        for name, fault in mutations.items():
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp); state, app = self.fixture(root); expected = w.carrier_inventory(state, app, 'zip')
-                archive = self.zip(root, expected, state, app, fault)
-                with self.assertRaises(ValueError): w.zip_inventory(archive, expected)
-
-    def test_zip_duplicate_member_and_symlink(self):
-        for fault in ['duplicate', 'symlink', 'fifo']:
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp); state, app = self.fixture(root); expected = w.carrier_inventory(state, app, 'zip')
-                archive = self.zip(root, expected, state, app)
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore', UserWarning)
-                    with zipfile.ZipFile(archive, 'a') as z:
-                        if fault == 'duplicate': z.writestr('polaris.exe', app)
-                        else:
-                            info = zipfile.ZipInfo('unexpected-link')
-                            info.external_attr = (stat.S_IFLNK if fault == 'symlink' else stat.S_IFIFO) << 16
-                            z.writestr(info, b'polaris.exe')
-                with self.assertRaises(ValueError): w.zip_inventory(archive, expected)
 
     def test_installer_candidate_identity_and_count(self):
         cases = [[], ['Polaris_0.9.0_x64-setup.exe'], ['Polaris_1.0.0_x64-setup.exe', 'Polaris_0.9.0_x64-setup.exe'],
@@ -441,13 +374,10 @@ class Integrity(unittest.TestCase):
                 self.assertTrue(all(child.poll() is not None for child in children), 'every exact owned child must have exited/joined')
 
 
-    def test_three_legal_members_cannot_disappear_from_config_or_actual_zip(self):
+    def test_three_legal_members_cannot_disappear_from_config(self):
         for name in ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md']:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp); state, app = self.fixture(root)
-                expected = w.carrier_inventory(state, app, 'zip')
-                archive = self.zip(root, expected, state, app, lambda payload: payload.pop(name))
-                with self.assertRaises(ValueError): w.zip_inventory(archive, expected)
+                root = Path(tmp); self.fixture(root)
                 conf = root / 'src-tauri/tauri.windows.conf.json'; value = json.loads(conf.read_text())
                 value['bundle']['resources'].remove('../' + name); conf.write_text(json.dumps(value))
                 with self.assertRaises(ValueError): w.source_inventory(root)
@@ -946,7 +876,7 @@ class WindowsLongPaths(unittest.TestCase):
                                 for source in sources.values()), 'logical source maps must stay unprefixed')
             state = {'resources': resources, 'sources': sources, 'owner': str(root)}
             archive = root / 'portable.zip'; w.build_portable(root, state, app, archive)
-            self.assertEqual(w.zip_inventory(archive, w.carrier_inventory(state, app, 'zip')),
+            self.assertEqual(w.portable_readback(archive, w.carrier_inventory(state, app, 'zip')),
                              w.carrier_inventory(state, app, 'zip'))
             binary = native / 'target/release/polaris.exe'; binary.parent.mkdir(parents=True); binary.write_bytes(app)
             alias = binary.parent / 'build/polaris/0/out/polaris.exe'; alias.parent.mkdir(parents=True); os.link(binary, alias)
@@ -1198,8 +1128,6 @@ class CargoContexts(unittest.TestCase):
                     self.assertEqual(len(builds), 1); self.assertIn('--release', builds[0])
                     self.assertEqual('--target' in builds[0], target is not None)
                     self.assertEqual(len(list((root / 'dist-win').glob('*'))), 2)
-                    self.assertEqual(w.verify_existing_zip(root, root / 'dist-win/Polaris_1.0.0_x64-win-Portable.zip'),
-                                     receipt['portableObserved'])
                     # A retained old root/release App is never a fallback.
                     os.link(binary, release / 'third.exe')
                     with self.assertRaises(ValueError): w.cargo_app_identity(root, state)

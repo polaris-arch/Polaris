@@ -3,13 +3,14 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   closeSync, constants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync,
-  readSync, rmSync, writeSync,
+  readFileSync, readSync, rmSync, writeSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, extname, join, posix, resolve } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { fileURLToPath } from 'node:url';
 import { createInflateRaw, crc32 } from 'node:zlib';
 import { LOCAL_MARKER } from '../desktop-core/local-development.mjs';
 import { requireGraph as demand } from '../desktop-core/source-graph.mjs';
@@ -53,8 +54,7 @@ function identityMatches(left, right, sameView) {
       : (left.mode & FILE_TYPE) === (right.mode & FILE_TYPE));
 }
 
-function artifactStat(path, remaining) {
-  rejectWindowsReparsePoints(path, 'Windows package artifact', Math.min(30_000, remaining()));
+function regularArtifactStat(path) {
   for (let parent = dirname(path);;) {
     demand(lstatSync(parent, statOptions).isDirectory(), `formal asset linked ancestor: ${parent}`);
     const next = dirname(parent);
@@ -244,7 +244,7 @@ function resolveMember(records, name) {
   return target;
 }
 
-function selectedMembers(records, suffix, caseSensitive = false) {
+function validateRecords(records, caseSensitive = false) {
   const normalized = new Map(), parents = new Set();
   let expanded = 0;
   for (const [name, row] of records) {
@@ -257,6 +257,10 @@ function selectedMembers(records, suffix, caseSensitive = false) {
     demand(expanded <= MAX_TOTAL, 'formal archive expanded budget exceeded');
   }
   demand(Array.from(parents).every(parent => normalized.get(parent) !== false), 'formal archive file/directory alias collision');
+}
+
+function selectedMembers(records, suffix, caseSensitive = false) {
+  validateRecords(records, caseSensitive);
   const selected = [];
   for (const [member, row] of records) {
     const memberRole = role(member, suffix);
@@ -285,34 +289,45 @@ function observer(name, expected, charge, copies = 1) {
   };
 }
 
-async function scanZip(read, length, suffix, charge, signal) {
+function zipRecords(read, length, strictMetadata = false) {
   const records = new Map();
-  for (const [raw, entry] of readZipEntries(length, read, { zip64: true, maxEntries: MAX_MEMBERS, decodeName: zipName })) {
+  for (const [raw, entry] of readZipEntries(length, read, {
+    zip64: true, maxEntries: MAX_MEMBERS, decodeName: zipName, strictMetadata,
+  })) {
     const directory = raw.endsWith('/'), type = entry.mode & 0o170000;
     demand([0, 0o040000, 0o100000].includes(type), 'formal ZIP alias/link or nonregular member');
     const name = directory ? raw.slice(0, -1) : raw;
     insertRecord(records, name, { kind: directory ? 'dir' : 'file', bytes: entry.uncompressedSize, entry });
   }
+  return records;
+}
+
+async function readZipMember(read, entry, consume, signal) {
+  demand(!(entry.flags & 0x61) && [0, 8].includes(entry.method), 'formal ZIP encrypted/patched member or unsupported compression');
+  const input = fileBlocks(read, entry.dataOffset, entry.compressedSize);
+  let checksum = 0;
+  const receive = block => { consume(block); checksum = crc32(block, checksum); };
+  if (entry.method === 0) {
+    for (const block of input) receive(block);
+  } else {
+    const inflater = createInflateRaw();
+    await pipeline(Readable.from(input), inflater, new Writable({
+      write(block, _encoding, done) {
+        try { receive(block); done(); } catch (error) { done(error); }
+      },
+    }), { signal });
+    demand(inflater.bytesWritten === entry.compressedSize, 'formal ZIP compressed size differs');
+  }
+  demand(checksum === entry.crc32, 'formal ZIP member CRC differs');
+}
+
+async function scanZip(read, length, suffix, charge, signal) {
+  const records = zipRecords(read, length);
   const checked = [];
   for (const { member, role, target } of selectedMembers(records, suffix)) {
     const { entry, bytes } = records.get(target);
-    demand(!(entry.flags & 0x61) && [0, 8].includes(entry.method), 'formal ZIP encrypted/patched member or unsupported compression');
     const output = observer(member, bytes, charge);
-    const input = fileBlocks(read, entry.dataOffset, entry.compressedSize);
-    let checksum = 0;
-    const consume = block => { output.consume(block); checksum = crc32(block, checksum); };
-    if (entry.method === 0) {
-      for (const block of input) consume(block);
-    } else {
-      const inflater = createInflateRaw();
-      await pipeline(Readable.from(input), inflater, new Writable({
-        write(block, _encoding, done) {
-          try { consume(block); done(); } catch (error) { done(error); }
-        },
-      }), { signal });
-      demand(inflater.bytesWritten === entry.compressedSize, 'formal ZIP compressed size differs');
-    }
-    demand(checksum === entry.crc32, 'formal ZIP member CRC differs');
+    await readZipMember(read, entry, output.consume, signal);
     checked.push({ member, role, ...output.finish() });
   }
   return checked;
@@ -607,7 +622,8 @@ export async function inspectFormalArtifact(input, {
   };
   const artifact = resolve(input);
   const suffix = extname(artifact);
-  const before = artifactStat(artifact, remaining);
+  rejectWindowsReparsePoints(artifact, 'Windows package artifact', Math.min(30_000, remaining()));
+  const before = regularArtifactStat(artifact);
   const fd = openSync(artifact, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   let temporary;
   process.once('SIGINT', interrupt);
@@ -666,4 +682,69 @@ export function verifyFormalArtifactBytes(path, checked) {
       && identityMatches(fstatSync(fd, statOptions), opened, true)
       && identityMatches(lstatSync(path, statOptions), before, true), 'Inspected artifact object differs from distribution bytes');
   } finally { closeSync(fd); }
+}
+
+// The Windows producer guards native reparse tags and passes its frozen member map.
+export async function inspectPortableZip(input, expected) {
+  demand(expected && typeof expected === 'object' && !Array.isArray(expected), 'invalid portable ZIP inventory');
+  const names = Object.keys(expected), directories = new Set();
+  demand(names.length <= MAX_MEMBERS, 'portable ZIP expected member count budget exceeded');
+  for (const name of names) {
+    for (let parent = posix.dirname(name); parent !== '.' && parent !== '/'; parent = posix.dirname(parent)) {
+      directories.add(parent);
+    }
+  }
+  const artifact = resolve(input), deadline = performance.now() + DEADLINE_MS;
+  const remaining = () => {
+    const timeout = deadline - performance.now();
+    demand(timeout > 0, 'portable ZIP inspection deadline exceeded');
+    return Math.ceil(timeout);
+  };
+  const before = regularArtifactStat(artifact);
+  demand(before.nlink === 1n, 'portable ZIP requires a single-link archive');
+  const fd = openSync(artifact, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const opened = fstatSync(fd, statOptions);
+    demand(opened.isFile() && identityMatches(opened, before, process.platform !== 'win32'), 'portable ZIP replaced before open');
+    const read = (at, count) => readSource(fd, at, count, remaining);
+    const records = zipRecords(read, Number(opened.size), true);
+    validateRecords(records);
+    const actual = new Map();
+    for (const [name, { kind, bytes, entry }] of records) {
+      if (kind === 'dir') {
+        demand(directories.has(name) && bytes === 0, 'unregistered ZIP directory: ' + name);
+        continue;
+      }
+      demand(Object.hasOwn(expected, name) && bytes <= MAX_FILE, 'unregistered/oversized ZIP member: ' + name);
+      const pin = expected[name];
+      demand(pin && Object.keys(pin).length === 2 && bytes === pin.bytes, 'final member SHA/size differs: ' + name);
+      const hash = createHash('sha256');
+      let size = 0;
+      await readZipMember(read, entry, block => {
+        remaining();
+        size += block.length;
+        demand(size <= bytes, 'ZIP expanded size differs');
+        hash.update(block);
+      });
+      const sha256 = hash.digest('hex');
+      demand(size === bytes && sha256 === pin.sha256, 'final member SHA/size differs: ' + name);
+      actual.set(name, { bytes: size, sha256 });
+    }
+    demand(actual.size === names.length, 'final member set differs');
+    demand(identityMatches(fstatSync(fd, statOptions), opened, true)
+      && identityMatches(regularArtifactStat(artifact), before, true), 'portable ZIP changed during inspection');
+    return Object.fromEntries(actual);
+  } finally { closeSync(fd); }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    demand(process.argv.length === 3 && process.argv[2] === 'portable-zip', 'expected portable-zip request');
+    const { archive, expected } = JSON.parse(utf8.decode(readFileSync(0)));
+    const observed = await inspectPortableZip(archive, expected);
+    console.log(JSON.stringify(observed));
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
 }

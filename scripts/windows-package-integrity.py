@@ -425,28 +425,15 @@ def exact(actual, expected):
         require(actual[name] == expected[name], 'final member SHA/size differs: ' + name)
 
 
-def zip_inventory(archive, expected):
-    with zipfile.ZipFile(io_path(regular(archive))) as stream:
-        members = stream.infolist()
-        validate_names([(m.filename, m.is_dir()) for m in members])
-        require(sum(m.file_size for m in members) <= MAX_TOTAL, 'ZIP expanded budget exceeded')
-        directories = {'/'.join(name.split('/')[:i]) + '/' for name in expected for i in range(1, len(name.split('/')))}
-        actual = {}
-        for member in members:
-            require(member.filename == member.orig_filename and '\0' not in member.orig_filename, 'ZIP NUL name')
-            mode = member.external_attr >> 16
-            require(not stat.S_ISLNK(mode) and (stat.S_IFMT(mode) in [0, stat.S_IFREG, stat.S_IFDIR]), 'ZIP special file')
-            if member.is_dir():
-                require(member.filename in directories and member.file_size == 0, 'unregistered ZIP directory')
-                continue
-            require(member.filename in expected and member.file_size <= MAX_FILE, 'unregistered/oversized ZIP member: ' + member.filename)
-            digest = hashlib.sha256(); size = 0
-            with stream.open(member) as content:
-                for block in iter(lambda: content.read(1024 * 1024), b''):
-                    size += len(block); require(size <= member.file_size, 'ZIP expanded size differs'); digest.update(block)
-            actual[member.filename] = {'bytes': size, 'sha256': digest.hexdigest()}
-        exact(actual, expected)
-        return actual
+def portable_readback(archive, expected):
+    scanner = Path(__file__).resolve().with_name('lib') / 'formal-package-selection.mjs'
+    # Extended Windows paths and native reparse tags stay in the producer's custody.
+    request = {'archive': str(regular(archive)), 'expected': expected}
+    result = subprocess.run(['node', str(scanner), 'portable-zip'], input=json.dumps(request).encode(),
+                            capture_output=True, timeout=EXTRACT_TIMEOUT + 5)
+    require(result.returncode == 0, result.stderr.decode('utf-8', errors='replace').strip())
+    regular(archive)
+    return json.loads(result.stdout)
 
 
 def nsis_listing(text):
@@ -908,7 +895,6 @@ def build_portable(root, state, app, destination):
         expected = carrier_inventory(state, app, 'zip'); exact(tree(staging), expected)
         with zipfile.ZipFile(io_path(destination), 'x', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
             for name in sorted(expected): archive.write(io_path(staging / name), name)
-    zip_inventory(destination, expected)
 
 
 def verify_generated_script(root, state, *, sources=None):
@@ -1490,7 +1476,7 @@ def assemble(root):
             'completed publication App/context changed')
     exact(tree(root / 'dist-win'), receipt['carriers'])
     portable = root / 'dist-win' / f"Polaris_{state['version']}_x64-win-Portable.zip"
-    exact(zip_inventory(portable, carrier_inventory(state, app, 'zip')), receipt['portableObserved'])
+    exact(portable_readback(portable, carrier_inventory(state, app, 'zip')), receipt['portableObserved'])
 
 
 def assemble_carriers(root, state, app_path, app, source_path, source_identity, *, sources=None):
@@ -1512,6 +1498,8 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity, 
     require(cargo_app_identity(root, state)[1] == source_identity, 'Cargo App changed during carrier inspection')
     require(byte_facts(compiled_app(root, state=state)[1]) == state['cargoArtifact']['firstApp']
             and cargo_app_identity(root, state)[1] == source_identity, 'original-byte-mismatch during carrier inspection')
+    portable_expected = carrier_inventory(state, app, 'zip')
+    portable_observed = portable_readback(portable, portable_expected)
     evidence = root / 'windows-package-evidence'; io_path(evidence).mkdir(exist_ok=True)
     receipt = {'schema': 'polaris-windows-static-carriers-v1', 'candidate': state['candidate'],
                'ownedStage': {'path': state['owner'], 'retainedPreviousOutputBytes': state['retainedPreviousOutputBytes'],
@@ -1522,24 +1510,11 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity, 
                                     'privateSingleLinkSnapshot': byte_facts(app)},
                'tauriCLI': cli, 'cargoContext': state['cargo'], 'cargoArtifact': state['cargoArtifact'],
                'nsisExpected': carrier_inventory(state, app, 'nsis'), 'nsisObserved': observed,
-               'portableExpected': carrier_inventory(state, app, 'zip'),
-               'portableObserved': zip_inventory(portable, carrier_inventory(state, app, 'zip')),
+               'portableExpected': portable_expected, 'portableObserved': portable_observed,
                'carriers': {p.name: facts(p) for p in [installer, portable]},
                'nativeInstallation': 'not performed by static carrier gate'}
     io_path(evidence / 'static-carriers.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
     print('Actual final NSIS + portable complete member/SHA/size inventories verified')
-
-
-def verify_existing_zip(root, archive):
-    state = load_state(root, readback=True)
-    _, app = compiled_app(root, state=state)
-    _, identity = cargo_app_identity(root, state)
-    receipt = json.loads(io_path(regular(root / 'windows-package-evidence/static-carriers.json')).read_bytes())
-    require(receipt['candidate'] == state['candidate'] and receipt['cargoContext'] == state['cargo']
-            and receipt['sourceApp'] == byte_facts(app)
-            and receipt['cargoArtifact']['identity'] == list(identity),
-            'Cargo release input changed after carrier assembly')
-    return zip_inventory(archive, carrier_inventory(state, app, 'zip'))
 
 
 def main():

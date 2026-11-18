@@ -1,3 +1,5 @@
+import { crc32 } from 'node:zlib';
+
 export function parseZipEntries(buf, options) {
   return readZipEntries(buf.length, (start, length) => buf.subarray(start, start + length), options);
 }
@@ -5,7 +7,7 @@ export function parseZipEntries(buf, options) {
 // The formal carrier scan reads from a retained file. APK and native-release
 // callers can continue using their existing byte buffer.
 export function readZipEntries(length, read, {
-  zip64 = false, maxEntries = 65535, decodeName = (bytes) => bytes.toString('utf8'),
+  zip64 = false, maxEntries = 65535, decodeName = (bytes) => bytes.toString('utf8'), strictMetadata = false,
 } = {}) {
   const need = (ok, why) => { if (!ok) throw new Error(`ZIP: ${why}`); };
   const chunk = (at, size) => {
@@ -64,24 +66,34 @@ export function readZipEntries(length, read, {
     const name = decodeName(nameBytes, flags);
     need(!entries.has(name), `duplicate entry ${name}`);
     let local = header.readUInt32LE(42), compressedSize = header.readUInt32LE(20), uncompressedSize = header.readUInt32LE(24);
-    if ([local, compressedSize, uncompressedSize].includes(0xffffffff)) {
-      need(zip64, 'ZIP64 is unsupported for APK');
+    const extendedSizes = [local, compressedSize, uncompressedSize].includes(0xffffffff);
+    need(!extendedSizes || zip64, 'ZIP64 is unsupported for APK');
+    if (strictMetadata) need(header[6] <= 63, 'unsupported ZIP extraction version');
+    if (extendedSizes || strictMetadata) {
       const extras = chunk(p + 46 + nameLength, extraLength);
       let found = false;
       for (let extra = 0; extra + 4 <= extraLength;) {
         const tag = extras.readUInt16LE(extra), bytes = extras.readUInt16LE(extra + 2), end = extra + 4 + bytes;
-        need(end <= extraLength, 'ZIP64 extra field bounds differ');
-        if (tag === 1) {
+        need(end <= extraLength, 'ZIP extra field bounds differ');
+        if (tag === 1 && extendedSizes && !found) {
           let at = extra + 4;
           const value = () => { need(at + 8 <= end, 'truncated ZIP64 field'); const n = integer64(extras, at); at += 8; return n; };
           if (uncompressedSize === 0xffffffff) uncompressedSize = value();
           if (compressedSize === 0xffffffff) compressedSize = value();
           if (local === 0xffffffff) local = value();
-          found = true; break;
+          found = true;
+          if (!strictMetadata) break;
+        }
+        if (tag === 0x7075 && strictMetadata) {
+          const data = extras.subarray(extra + 4, end);
+          need(data.length >= 5, 'truncated ZIP Unicode path');
+          if (data[0] === 1 && data.readUInt32LE(1) === crc32(nameBytes) && data.length > 5) {
+            need(decodeName(data.subarray(5), 0x800) === name, 'ZIP Unicode path differs from original');
+          }
         }
         extra = end;
       }
-      need(found, 'ZIP64 extra field missing');
+      need(!extendedSizes || found, 'ZIP64 extra field missing');
     }
     local += base;
     const method = header.readUInt16LE(10);
@@ -91,8 +103,10 @@ export function readZipEntries(length, read, {
     const localNameLength = localHeader.readUInt16LE(26);
     const dataOffset = local + 30 + localNameLength + localHeader.readUInt16LE(28);
     need(dataOffset + compressedSize <= start, `${name}: data extends beyond central directory`);
-    need(localHeader.readUInt16LE(8) === method && localNameLength === nameLength
-      && chunk(local + 30, localNameLength).equals(nameBytes), `${name}: local and central headers differ`);
+    const localName = chunk(local + 30, localNameLength);
+    need(localHeader.readUInt16LE(8) === method && localName.equals(nameBytes)
+      && (!strictMetadata || decodeName(localName, localHeader.readUInt16LE(6)) === name),
+      `${name}: local and central headers differ`);
     entries.set(name, { method, compressedSize, uncompressedSize, dataOffset, localOffset: local,
       flags, crc32: header.readUInt32LE(16), mode: header.readUInt32LE(38) >>> 16 });
     p += entryLength;
