@@ -18,15 +18,17 @@ ABI = {'arm64-v8a': (2, 183, 'arm64'), 'armeabi-v7a': (1, 40, 'arm'),
        'x86': (1, 3, '386'), 'x86_64': (2, 62, 'amd64')}
 APPLE = {'ios-arm64': (0x100000c, 2, 'arm64', None),
          'ios-arm64-simulator': (0x100000c, 7, 'arm64', 'simulator')}
-MAX_ARTIFACT = 1024 ** 3
-MAX_RECEIPT = 16 * 1024 ** 2
+RECEIPT_POLICY = decode(Path(__file__).with_name('receipt-policy.json').read_bytes())
+_RECEIPT_LIMITS = RECEIPT_POLICY['receipt']
+MAX_ARTIFACT = _RECEIPT_LIMITS['artifactBytes']
+MAX_RECEIPT = _RECEIPT_LIMITS['controlBytes']
 # Normalized origins remove the measured member x candidate expansion;
 # preserve a finite envelope, not the rejected 256MiB capacity workaround.
-MAX_APPLE_RECEIPT = 64 * 1024 ** 2
-MAX_APPLE_LINK_RECEIPT = 64 * 1024 ** 2
-MAX_JSON_NODES = 500000
-MAX_JSON_DEPTH = 64
-MAX_JSON_STRING = 1024 ** 2
+MAX_APPLE_RECEIPT = _RECEIPT_LIMITS['appleComponentBytes']
+MAX_APPLE_LINK_RECEIPT = _RECEIPT_LIMITS['appleLinkBytes']
+MAX_JSON_NODES = _RECEIPT_LIMITS['nodes']
+MAX_JSON_DEPTH = _RECEIPT_LIMITS['depth']
+MAX_JSON_STRING = _RECEIPT_LIMITS['stringChars']
 
 
 def receipt_shape(value, maximum):
@@ -44,14 +46,14 @@ def receipt_shape(value, maximum):
             active.add(id(item))
             if isinstance(item, dict):
                 for key, child in item.items():
-                    require(isinstance(key, str) and len(key) <= 4096, 'receipt JSON key budget')
+                    require(isinstance(key, str) and len(key) <= _RECEIPT_LIMITS['keyChars'], 'receipt JSON key budget')
                     walk(key, depth + 1); walk(child, depth + 1)
             else:
                 for child in item: walk(child, depth + 1)
             active.remove(id(item))
         else:
             require(item is None or isinstance(item, (bool, int, float)), 'unsupported receipt JSON value')
-            require(not isinstance(item, int) or item.bit_length() <= 256, 'receipt JSON integer budget')
+            require(not isinstance(item, int) or item.bit_length() <= _RECEIPT_LIMITS['integerBits'], 'receipt JSON integer budget')
             require(not isinstance(item, float) or math.isfinite(item), 'nonfinite receipt JSON')
     walk(value, 0)
 

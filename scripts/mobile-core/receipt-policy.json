@@ -1,0 +1,82 @@
+{
+  "receipt": {
+    "artifactBytes": 1073741824,
+    "controlBytes": 16777216,
+    "appleComponentBytes": 67108864,
+    "appleLinkBytes": 67108864,
+    "nodes": 500000,
+    "depth": 64,
+    "stringChars": 1048576,
+    "keyChars": 4096,
+    "integerBits": 256
+  },
+  "gitStatus": {
+    "stdoutBytes": 16384,
+    "stderrBytes": 1024,
+    "seconds": 10
+  },
+  "appleScopes": {
+    "device-only": [
+      "device-arm64"
+    ],
+    "device-and-simulator": [
+      "device-arm64",
+      "sim-arm64"
+    ]
+  },
+  "sourceFiles": {
+    "producer": [
+      "scripts/mobile-core/source-contract.json",
+      "scripts/mobile-core/fork_input.py",
+      "scripts/mobile-core/source_policy.py",
+      "scripts/mobile-core/source-admission.mjs",
+      "scripts/mobile-core/plan.py",
+      "scripts/lib/polaris-version.json",
+      "scripts/mobile-core/artifacts.py",
+      "scripts/mobile-core/producer.py",
+      "scripts/mobile-core/budget.py",
+      "scripts/mobile-core/ci_android.py",
+      "scripts/mobile-core/consume.py",
+      "scripts/mobile-core/carriers.py",
+      "scripts/mobile-core/apple_rust.py",
+      "scripts/mobile-core/apple_tls_fingerprint.py",
+      "scripts/mobile-core/ci_apple.py",
+      "scripts/mobile-core/apple-admission.mjs",
+      "scripts/mobile-core/apple_handoff.py",
+      "scripts/mobile-core/apple-cache.py",
+      "scripts/mobile-core/build_apple_app.py",
+      "scripts/mobile-core/native_inputs.py",
+      "scripts/mobile-core/transaction.py",
+      "scripts/mobile-core/prepare-ndk-linux.mjs",
+      "scripts/mobile-core/ndk-r30-linux.json",
+      "scripts/mobile-core/android-source.py",
+      "scripts/apple-carrier.py"
+    ],
+    "consumer": [
+      "scripts/mobile-core/consume.py",
+      "scripts/mobile-core/artifacts.py",
+      "scripts/mobile-core/fork_input.py",
+      "scripts/mobile-core/source_policy.py",
+      "scripts/mobile-core/carriers.py",
+      "scripts/mobile-core/source-contract.json",
+      "scripts/mobile-core/source-admission.mjs",
+      "scripts/mobile-core/transaction.py",
+      "scripts/lib/polaris-version.json",
+      "scripts/mobile-core/native_inputs.py",
+      "src-tauri/gen/apple/project.yml",
+      "src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj",
+      "scripts/verify-apk.mjs",
+      "scripts/assert-r8-evidence.mjs",
+      "scripts/release-assets.mjs",
+      "scripts/mobile-core/apple_rust.py",
+      "scripts/mobile-core/apple_tls_fingerprint.py",
+      "scripts/mobile-core/ci_apple.py",
+      "scripts/mobile-core/build_apple_app.py",
+      "scripts/mobile-core/apple_handoff.py",
+      "scripts/mobile-core/apple-admission.mjs"
+    ],
+    "shared": [
+      "scripts/mobile-core/receipt-policy.json"
+    ]
+  }
+}

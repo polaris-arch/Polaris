@@ -11,7 +11,7 @@ import stat
 import shutil
 import zipfile
 
-from artifacts import file_pin, read_receipt, receipt_digest, tree_inventory
+from artifacts import RECEIPT_POLICY, file_pin, read_receipt, receipt_digest, tree_inventory
 from fork_input import ROOT, decode, load, require
 from producer import lease, private_dir, producer_code, run, write_json
 
@@ -21,7 +21,7 @@ MAX_FILES, MAX_BYTES = 65536, 4 * 1024 ** 3
 
 # Closed execution profiles. Component receipts still prove both Libbox slices;
 # these profiles describe only the App + PacketTunnel carrier obligations.
-SCOPES = {'device-only': ('device-arm64',), 'device-and-simulator': SLOTS}
+SCOPES = {name: tuple(slots) for name, slots in RECEIPT_POLICY['appleScopes'].items()}
 
 
 def required_slots(scope=None):
@@ -485,84 +485,3 @@ def carrier_summary(root, slot):
             shutil.copyfileobj(original, output)
         require(file_pin(source) == expected and file_pin(summary / name) == expected,
                 'original summary bytes changed during export')
-
-
-def validate_aggregate(folder, *, scope, expected_context, expected_producer, expected_app, expected_source_contract):
-    """Pure historical-or-current evidence check; never rewrites producer identity.
-
-    The current-run entry below supplies current identities. A separate merge
-    verifier must prove eligibility before supplying historical expectations.
-    """
-    require(isinstance(scope, str) and scope in SCOPES, 'explicit aggregate scope required')
-    slots = required_slots(scope)
-    folder = Path(folder)
-    require({p.name for p in folder.iterdir()} == {'component', *slots},
-            'aggregate requires exactly component and declared carrier slots')
-    rows = {}
-    current_app = expected_app
-    compiler_identity = None
-    transport = read_receipt(folder / 'component' / 'component-transport.json')
-    manifest_path = folder / 'component' / 'component-handoff.json'
-    require(transport.get('schema') == 'polaris-apple-handoff-transport-v1' and
-            transport['context'] == expected_context and file_pin(manifest_path) == transport['manifest'] and
-            transport['fingerprint'] == receipt_digest({k: v for k, v in transport.items() if k != 'fingerprint'}),
-            'aggregate component run differs')
-    manifest = read_receipt(manifest_path)
-    validate_scope_record(manifest, 'component-handoff', scope)
-    require(manifest['App'] == expected_producer and manifest['sourceContract'] == expected_source_contract and
-            manifest['context'] == expected_context and manifest['producerJob'] == 'component' and
-            manifest['fingerprint'] == receipt_digest({k: v for k, v in manifest.items() if k != 'fingerprint'}),
-            'aggregate original component/source differs')
-    for slot in slots:
-        row = read_receipt(folder / slot / ('carrier-' + slot + '.json'))
-        validate_scope_record(row, 'carrier-handoff', scope)
-        require(row['slot'] == slot and
-                row['context'] == expected_context and row['componentTransport'] == transport and
-                row.get('devicePassed') is False and row.get('signatureTrustValidated') is False and
-                row.get('publicationEligible') is False and
-                row['fingerprint'] == receipt_digest({k: v for k, v in row.items() if k != 'fingerprint'}),
-                'aggregate slot/context/component/scope differs')
-        require(file_pin(folder / slot / 'summary-app-carrier.json') == row['receiptPin'] and
-                read_receipt(folder / slot / 'summary-app-carrier.json') == row['receipt'],
-                'aggregate original carrier receipt bytes differ')
-        receipt = row['receipt']
-        rust_path = folder / slot / 'summary-rust-receipt.json'
-        require(file_pin(rust_path) == {k: receipt['rustInput'][k] for k in ('bytes', 'sha256')},
-                'aggregate original Rust receipt bytes differ')
-        rust = read_receipt(rust_path)
-        require(rust['schema'] == 'polaris-formal-apple-rust-v1' and rust['App'] == current_app and
-                rust['fingerprint'] == receipt_digest({k: v for k, v in rust.items() if k != 'fingerprint'}) and
-                rust['target'] == {'device-arm64': 'aarch64-apple-ios', 'sim-arm64': 'aarch64-apple-ios-sim'}[slot] and
-                rust['linkInputSha256'] == receipt['linkInputSha256'] and rust['devicePassed'] is False,
-                'aggregate Rust target/App/link identity differs')
-        if compiler_identity is None:
-            compiler_identity = {'tools': rust['tools'], 'rustc': rust['rustc']}
-        require(compiler_identity == {'tools': rust['tools'], 'rustc': rust['rustc']},
-                'aggregate actual Rust tool bytes/version differ')
-        require(receipt.get('schema') == 'polaris-mobile-apple-carrier-v1' and
-                receipt['fingerprint'] == receipt_digest({k: v for k, v in receipt.items() if k != 'fingerprint'}) and
-                receipt['App'] == current_app and
-                receipt['producerCandidate'] == expected_producer['candidate'] and
-                receipt['componentFingerprint'] == manifest['componentFingerprint'] and
-                receipt['selectedTarget'] == {'device-arm64': 'ios-arm64', 'sim-arm64': 'ios-arm64-simulator'}[slot] and
-                receipt.get('AppCarrierValidated') is True and receipt.get('AppAccepted') is False and
-                receipt.get('devicePassed') is False and receipt.get('signatureTrustValidated') is False,
-                'aggregate actual carrier identity/scope differs')
-        rows[slot] = row
-    require({p.name for p in folder.iterdir()} == {'component', *slots}, 'aggregate contains extra slot')
-    facts = {'schema': 'polaris-apple-unsigned-chain-v3', 'context': expected_context, 'App': expected_producer,
-             'componentTransport': transport, 'carriers': rows, 'completeSlots': list(slots),
-             'devicePassed': False, 'signatureTrustValidated': False, 'publicationEligible': False,
-             **scope_fields(scope), 'validatedSlots': list(slots),
-             'notRequestedSlots': [slot for slot in SLOTS if slot not in slots]}
-    facts['fingerprint'] = receipt_digest(facts)
-    return facts
-
-
-def aggregate(folder, output, *, scope):
-    require(isinstance(scope, str) and scope in SCOPES, 'explicit aggregate scope required')
-    from consume import app_identity
-    facts = validate_aggregate(folder, scope=scope, expected_context=context(),
-                               expected_producer=producer_code(), expected_app=app_identity(),
-                               expected_source_contract=load())
-    write_json(output, facts)

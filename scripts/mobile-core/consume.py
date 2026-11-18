@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import git_environment, require_git_root, ROOT, canonical, load, require, sha
-from artifacts import receipt_digest, component_output_identity, file_pin, inspect_aar, inspect_framework, read_receipt
+from artifacts import RECEIPT_POLICY, receipt_digest, component_output_identity, file_pin, inspect_aar, inspect_framework, read_receipt
 from producer import ACTIVE_FDS, lease, run, write_json
 from budget import group_alive, register_group
 
@@ -59,8 +59,11 @@ def verify_original(component, receipt_path, platform, tools, scratch):
     return receipt
 
 
-STATUS_BYTES, STATUS_STDERR_BYTES, STATUS_PATHS, STATUS_PATH_BYTES = 16384, 1024, 64, 512
-STATUS_HASH_BYTES, STATUS_REPORT_BYTES, STATUS_SECONDS = 1024 ** 2, 65536, 10
+STATUS_BYTES = RECEIPT_POLICY['gitStatus']['stdoutBytes']
+STATUS_STDERR_BYTES = RECEIPT_POLICY['gitStatus']['stderrBytes']
+STATUS_SECONDS = RECEIPT_POLICY['gitStatus']['seconds']
+STATUS_PATHS, STATUS_PATH_BYTES = 64, 512
+STATUS_HASH_BYTES, STATUS_REPORT_BYTES = 1024 ** 2, 65536
 # Only these reviewed names may be displayed. Unknown names have opaque hashes.
 STATUS_DISPLAY_PATHS = frozenset({
     'Cargo.toml', 'Cargo.lock', '.gitignore', 'src-tauri/tauri.ios.conf.json',
@@ -229,18 +232,9 @@ def app_identity(*, status_log=None):
     require(observation['complete'] and observation['clean'],
             'App consumer source is not frozen; observationComplete=' + str(observation['complete']) +
             '; observedPaths=' + str(len(observation['paths'])) + '; reason=' + str(observation['reason']))
+    source_files = RECEIPT_POLICY['sourceFiles']
     return {'candidate': run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip(),
-            'consumerCode': {name: file_pin(ROOT / name) for name in
-                ['scripts/mobile-core/consume.py', 'scripts/mobile-core/artifacts.py',
-                 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py', 'scripts/mobile-core/carriers.py',
-                 'scripts/mobile-core/source-contract.json', 'scripts/mobile-core/source-admission.mjs', 'scripts/mobile-core/transaction.py',
-                 'scripts/lib/polaris-version.json',
-                 'scripts/mobile-core/native_inputs.py', 'src-tauri/gen/apple/project.yml',
-                 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj',
-                 'scripts/verify-apk.mjs', 'scripts/assert-r8-evidence.mjs',
-                 'scripts/release-assets.mjs', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
-             'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/apple_handoff.py',
-                 'scripts/mobile-core/apple-admission.mjs']}}
+            'consumerCode': {name: file_pin(ROOT / name) for name in (*source_files['consumer'], *source_files['shared'])}}
 
 
 def materialize_android(component, receipt_path, tools, work, cache):

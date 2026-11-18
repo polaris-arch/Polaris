@@ -27,7 +27,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import git_environment, require_git_root, ROOT, canonical, load, require, sha, verify_source, tool_environment
 from plan import plan
-from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
+from artifacts import RECEIPT_POLICY, receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
 from budget import group_alive, register_group, reservation, native_capacity, native_environment
 
 ACTIVE_FDS = []
@@ -491,21 +491,7 @@ def tool_facts(args, value, env):
     return paths, result
 
 
-PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py',
-             'scripts/mobile-core/source-admission.mjs',
-             'scripts/mobile-core/plan.py',
-                 'scripts/lib/polaris-version.json',
-             'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
-             'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
-             'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
-             'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
-             'scripts/mobile-core/apple-admission.mjs', 'scripts/mobile-core/apple_handoff.py',
-             'scripts/mobile-core/apple-cache.py',
-             'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
-             'scripts/mobile-core/transaction.py',
-             'scripts/mobile-core/prepare-ndk-linux.mjs',
-             'scripts/mobile-core/ndk-r30-linux.json',
-             'scripts/mobile-core/android-source.py', 'scripts/apple-carrier.py')
+PRODUCER_FILES = tuple(RECEIPT_POLICY['sourceFiles']['producer'])
 ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v2'
 ANDROID_UNRELATED_CODE = frozenset({
     'scripts/mobile-core/apple-cache.py',
@@ -518,8 +504,9 @@ ANDROID_UNRELATED_CODE = frozenset({
 
 def producer_code():
     require(not run(['git', 'status', '--porcelain=v1', '--untracked-files=all'], cwd=ROOT), 'App author source must be frozen')
+    names = (*PRODUCER_FILES, *RECEIPT_POLICY['sourceFiles']['shared'])
     return {'candidate': run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip(),
-            'files': {name: file_pin(ROOT / name) for name in PRODUCER_FILES}}
+            'files': {name: file_pin(ROOT / name) for name in names}}
 
 
 def android_build_code(identity, policy=ANDROID_BUILD_CODE_POLICY):

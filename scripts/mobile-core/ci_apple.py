@@ -678,15 +678,10 @@ def retire_slot(slot):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot'])
-    parser.add_argument('--scope', choices=('device-only', 'device-and-simulator'))
+    parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import', 'import-local', 'carrier', 'evidence', 'retire-slot'])
     parser.add_argument('--handoff', type=Path)
     parser.add_argument('--slot', choices=[slot for slot, _ in CARRIERS])
-    parser.add_argument('--summaries', type=Path)
-    parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    if args.scope is not None:
-        require(scope_fields(args.scope) == scope_fields(), 'CLI/environment Apple scope differs')
     required_slots()  # Reject unknown environment scope before work or evidence.
     if args.action == 'import':
         require(args.handoff is not None, 'handoff folder required')
@@ -694,11 +689,6 @@ if __name__ == '__main__':
     elif args.action == 'carrier':
         require(args.slot is not None, 'exact slot required')
         carrier(args.slot)
-    elif args.action == 'aggregate':
-        require(args.summaries is not None and args.output is not None, 'aggregate inputs/output required')
-        from apple_handoff import aggregate
-        require(args.scope is not None, 'explicit aggregate scope required')
-        aggregate(args.summaries, args.output, scope=args.scope)
     elif args.action == 'evidence':
         evidence(publish_env=True, slot=args.slot)
     elif args.action == 'retire-slot':

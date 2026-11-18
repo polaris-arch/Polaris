@@ -1,13 +1,96 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
 import { verifyDashboardArchive, dashboardInventory, dashboardFresh } from './fetch-dashboard.mjs';
 import { inspectAppleArchitecture } from './mobile-core/apple-admission.mjs';
 import { validateMobileSource } from './mobile-core/source-admission.mjs';
+
+test('same-run Apple aggregate preserves original Python wire bytes for both declared scopes', { skip: process.platform !== 'linux' }, () => {
+  const repo = fileURLToPath(new URL('../', import.meta.url));
+  const handoff = 'scripts/mobile-core/apple-aggregate.mjs';
+  const policy = JSON.parse(readFileSync(join(repo, 'scripts/mobile-core/receipt-policy.json')));
+  const folder = mkdtempSync(join(tmpdir(), 'polaris-apple-aggregate-')), checkout = join(folder, 'checkout');
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  const options = { env, cwd: checkout, stdio: ['ignore', 'pipe', 'pipe'] };
+  try {
+    const imports = execFileSync('git', ['ls-files', '-z', '--', 'scripts/desktop-core', 'scripts/lib'], { ...options, cwd: repo, encoding: 'utf8' });
+    for (const name of new Set([handoff, ...Object.values(policy.sourceFiles).flat(), ...imports.split('\0').filter(Boolean)])) {
+      const path = join(checkout, name);
+      mkdirSync(dirname(path), { recursive: true });
+      copyFileSync(join(repo, name), path);
+    }
+    const git = (...args) => execFileSync('git', args, { ...options, encoding: 'utf8' }).trim();
+    git('init', '-q'); git('add', '-A');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'same-run fixture');
+    Object.assign(env, { GITHUB_ACTIONS: 'true', GITHUB_RUN_ID: '731', GITHUB_RUN_ATTEMPT: '2',
+      GITHUB_REPOSITORY: 'fixture/Polaris', POLARIS_APP_CANDIDATE: git('rev-parse', 'HEAD') });
+    for (const scope of Object.keys(policy.appleScopes)) {
+      env.POLARIS_APPLE_SCOPE = scope;
+      const summaries = join(folder, scope), expected = join(folder, scope + '.expected'), output = join(folder, scope + '.actual');
+      execFileSync('python3', ['-B', '-c', `
+import sys
+from pathlib import Path
+sys.path.insert(0, 'scripts/mobile-core')
+from apple_handoff import context, scope_fields
+from artifacts import file_pin, receipt_digest
+from consume import app_identity
+from fork_input import load
+from producer import producer_code, write_json
+
+folder, output = map(Path, sys.argv[1:])
+def signed(path, facts):
+    facts['fingerprint'] = receipt_digest(facts)
+    write_json(path, facts)
+    return facts
+
+scope, run, app, producer = scope_fields(), context(), app_identity(), producer_code()
+flags = dict(devicePassed=False, signatureTrustValidated=False, publicationEligible=False)
+component = folder / 'component'; component.mkdir(parents=True)
+manifest = component / 'component-handoff.json'
+signed(manifest, dict(schema='polaris-apple-component-handoff-v2', **scope, context=run, App=producer,
+                      sourceContract=load(), producerJob='component', componentFingerprint='component'))
+transport = signed(component / 'component-transport.json', dict(schema='polaris-apple-handoff-transport-v1',
+                   context=run, manifest=file_pin(manifest)))
+carriers = {}
+for slot in scope['requiredSlots']:
+    sim = slot == 'sim-arm64'
+    stage = folder / slot; stage.mkdir()
+    rust_path, receipt_path = stage / 'summary-rust-receipt.json', stage / 'summary-app-carrier.json'
+    signed(rust_path, dict(schema='polaris-formal-apple-rust-v1', App=app, target='aarch64-apple-ios' + ('-sim' if sim else ''),
+                          linkInputSha256='link', devicePassed=False, tools={'pythonEqual':120.0 if sim else 120}, rustc='actual rustc'))
+    receipt = signed(receipt_path, dict(schema='polaris-mobile-apple-carrier-v1', App=app, producerCandidate=run['candidate'],
+                     componentFingerprint='component', selectedTarget='ios-arm64' + ('-simulator' if sim else ''), AppCarrierValidated=True,
+                     AppAccepted=False, devicePassed=False, signatureTrustValidated=False, rustInput=file_pin(rust_path), linkInputSha256='link',
+                     wire={'𐀀':[2**255,-2**255,1e-7,-0.0,5e-324], '\\ue000':'许可证\\x7f\\u2028'}))
+    carriers[slot] = signed(stage / ('carrier-' + slot + '.json'), dict(schema='polaris-apple-carrier-handoff-v2', **scope,
+                            context=run, slot=slot, componentTransport=transport, receiptPin=file_pin(receipt_path), receipt=receipt, **flags))
+required = scope['requiredSlots']
+signed(output, dict(schema='polaris-apple-unsigned-chain-v3', context=run, App=producer, componentTransport=transport, carriers=carriers,
+                   completeSlots=required, **flags, **scope, validatedSlots=required,
+                   notRequestedSlots=[slot for slot in ['device-arm64','sim-arm64'] if slot not in required]))
+if len(required) == 2:
+    transport_path = component / 'component-transport.json'
+    transport_path.write_bytes(transport_path.read_text().encode('utf-32'))
+`, summaries, expected], options);
+      const args = [handoff, '--scope', scope, '--summaries', summaries, '--output', output];
+      execFileSync(process.execPath, args, options);
+      assert.deepEqual(readFileSync(output), readFileSync(expected), scope);
+      appendFileSync(join(summaries, 'device-arm64', 'summary-rust-receipt.json'), ' ');
+      rmSync(output);
+      const damaged = spawnSync(process.execPath, args, { ...options, encoding: 'utf8' });
+      assert.equal(damaged.status, 1);
+      assert.match(damaged.stderr, /aggregate original Rust receipt bytes differ/);
+      assert.equal(existsSync(output), false);
+      assert.equal(existsSync(output + '.tmp'), false);
+    }
+  } finally { rmSync(folder, { recursive: true, force: true }); }
+});
 
 test('D01 authentic bytes required; login HTML and same-size mutation rejected', () => {
   const bytes = Buffer.from('pinned bytes');

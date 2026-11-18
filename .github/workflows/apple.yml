@@ -298,6 +298,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
       - uses: actions/download-artifact@v8
         with:
           name: apple-component-manifest-${{ github.run_id }}-${{ github.run_attempt }}
@@ -319,7 +322,7 @@ jobs:
           set -euo pipefail
           [ "$COMPONENT_RESULT" = success ] || {
             echo "::error::Apple component/carrier/original upload chain did not complete: $COMPONENT_RESULT"; exit 1; }
-          python3 -B scripts/mobile-core/ci_apple.py aggregate --scope "$POLARIS_APPLE_SCOPE" --summaries "$RUNNER_TEMP/apple-chain" --output "$RUNNER_TEMP/apple-chain.json"
+          node scripts/mobile-core/apple-aggregate.mjs --scope "$POLARIS_APPLE_SCOPE" --summaries "$RUNNER_TEMP/apple-chain" --output "$RUNNER_TEMP/apple-chain.json"
           printf '%s\n' 'device-arm64: unsigned App + PacketTunnel compile/link passed.' >> "$GITHUB_STEP_SUMMARY"
           if [ "$POLARIS_APPLE_SCOPE" = device-and-simulator ]; then
             printf '%s\n' 'sim-arm64: unsigned App + PacketTunnel compile/link passed (requested).' >> "$GITHUB_STEP_SUMMARY"
