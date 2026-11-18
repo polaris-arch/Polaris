@@ -143,6 +143,8 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
 
   /* ── app-store：运行态 ───────────────────────────────────────────────── */
   { id: 'useAppStore.proxyStatus', role: 'state', disposition: fed(PROXY_STATUS_FED), note: '连接态。**唯一**写入口是 refreshProxyStatus（startProxy/stopProxy 故意不写，托盘等别的入口也能启停）。' },
+  { id: 'useAppStore.proxyStarting', role: 'state', disposition: fed({ file: 'ui/src/store/app-store.ts', mustContain: 'set({ proxyStarting: true })' }), note: '连接操作在途，切回首页时继续显示连接中。' },
+  { id: 'useAppStore.proxyStopping', role: 'state', disposition: fed({ file: 'ui/src/store/app-store.ts', mustContain: 'set({ proxyStopping: true })' }), note: '断开操作在途，切回首页时继续显示停止中。' },
   { id: 'useAppStore.pendingChanges', role: 'state', disposition: fed(PENDING_FED), note: '待应用差集。PUSH 帧写，另有三档由 pull 兜底。' },
   /* ── 2026-09-06 合并态补登：批 2（表单宿主）与批 5（隐私锁）新增的读点。
         b6 分叉在那两批合入之前，故它的表里没有它们 —— 门抓到的正是这个差。 ── */
