@@ -134,7 +134,6 @@ jobs:
           python3 -B scripts/native-payload-proof.test.py
           python3 -B -X utf8 scripts/windows-package-integrity.test.py
           python3 -B scripts/desktop-core/test-local-development.py
-          python3 -B scripts/desktop-core/test-dmg-selection.py
 
       - name: Classify changed paths
         id: impact

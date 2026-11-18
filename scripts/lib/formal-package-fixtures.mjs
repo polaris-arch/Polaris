@@ -62,6 +62,15 @@ export function copyPackagingSource(original, root) {
   mkdirSync(join(root,'src-tauri'),{recursive:true});
   for (const name of ['core-manifest.json','build.rs','tauri.conf.json','tauri.linux.conf.json','tauri.windows.conf.json','tauri.macos-x64.conf.json','tauri.macos-arm64.conf.json']) copyFileSync(join(original,'src-tauri',name),join(root,'src-tauri',name));
 }
+export function writeLinuxFixture(stage, path) {
+  if (path.endsWith('.deb')) {
+    mkdirSync(join(stage, 'DEBIAN'), { recursive: true });
+    writeFileSync(join(stage, 'DEBIAN/control'), 'Package: polaris-control\nVersion: 1.0\nArchitecture: amd64\nMaintainer: Polaris <test@example.invalid>\nDescription: inert source regression\n');
+    execFileSync('dpkg-deb', ['--build', '--root-owner-group', stage, path], { stdio: 'pipe', timeout: 30_000 });
+  } else {
+    execFileSync('mksquashfs', [stage, path, '-noappend', '-processors', '1', '-quiet'], { stdio: 'pipe', timeout: 30_000 });
+  }
+}
 export function writeFormalAssets(directory, names) {
   mkdirSync(directory, { recursive: true });
   for (const name of names) {
@@ -85,13 +94,7 @@ export function writeFormalAssets(directory, names) {
           mkdirSync(dirname(path), { recursive: true });
           writeFileSync(path, data);
         }
-        if (name.endsWith('.deb')) {
-          mkdirSync(join(stage, 'DEBIAN'));
-          writeFileSync(join(stage, 'DEBIAN/control'), 'Package: polaris-control\nVersion: 1.0\nArchitecture: amd64\nMaintainer: Polaris <test@example.invalid>\nDescription: inert source regression\n');
-          execFileSync('dpkg-deb', ['--build', '--root-owner-group', stage, path], { stdio: 'ignore' });
-        } else {
-          execFileSync('mksquashfs', [stage, path, '-noappend', '-processors', '1', '-quiet'], { stdio: 'ignore' });
-        }
+        writeLinuxFixture(stage, path);
       } finally {
         rmSync(stage, { recursive: true, force: true });
       }
@@ -105,7 +108,8 @@ const args = process.argv.slice(2);
 if (args[0] === 'i') { console.log('7-Zip 24.09\\nNsis'); process.exit(0); }
 const record = JSON.parse(readFileSync(args[0] === 'l' ? args.at(-1) : args.at(-2), 'utf8'));
 if (args[0] === 'l') {
-  console.log('Type = ' + record.kind + '\\n----------\\n' + Object.entries(record.files)
+  if (record.listing !== undefined) process.stdout.write(record.listing);
+  else console.log('Type = ' + record.kind + '\\n----------\\n' + Object.entries(record.files)
     .map(([name, value]) => 'Path = ' + name + '\\nSize = ' + Buffer.byteLength(value)).join('\\n\\n'));
 } else process.stdout.write(record.files[args.at(-1)]);
 `, { mode: 0o700 });
