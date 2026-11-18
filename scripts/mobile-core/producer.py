@@ -26,7 +26,6 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import git_environment, require_git_root, ROOT, canonical, load, require, sha, verify_source, tool_environment
-from android_sdk import prepare_view
 from plan import plan
 from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
 from budget import group_alive, register_group, reservation, native_capacity, native_environment
@@ -493,7 +492,7 @@ def tool_facts(args, value, env):
 
 
 PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py',
-             'scripts/mobile-core/plan.py', 'scripts/mobile-core/android_sdk.py',
+             'scripts/mobile-core/plan.py',
                  'scripts/lib/polaris-version.json',
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
@@ -884,7 +883,9 @@ def admitted_binding(args, value, work, cache, producer_identity, initial_source
     source_observation = verify_source(source, value, generator_outputs=True)
     require(source_observation == initial_source, 'source changed during admission')
     if args.platform == 'android':
-        sdk, jar = prepare_view(work, args.sdk, args.ndk, value['android'])
+        sdk, jar = json.loads(run(['node', ROOT / 'scripts/mobile-core/prepare-ndk-linux.mjs',
+                                   '--prepare-view', '--profile', ROOT / value['android']['ndkArchivePath'],
+                                   '--sdk', args.sdk, '--ndk', args.ndk, work]))
         env = tool_environment(args.go, args.gomobile, args.gobind, cache, scratch,
                                sdk=sdk, ndk=Path(args.ndk).resolve(), jdk=Path(args.jdk).resolve())
         env['CGO_LDFLAGS'] = '-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'

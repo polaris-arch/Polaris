@@ -34,7 +34,7 @@ SAMPLE_LIMIT, SAMPLE_PATH_BYTES = 64, 1024
 APP_ENTRY = re.compile(r'^(?:lib)?polaris(?:_lib)?(?:-[0-9a-f]{16}(?:\.|$)|\.|$)')
 APPLE_RUST_BUILD_CODE_POLICY = 'polaris-apple-rust-build-code-v1'
 APPLE_RUST_UNRELATED_CODE = frozenset({
-    'scripts/mobile-core/android_sdk.py',
+    'scripts/mobile-core/android_sdk.py',  # Historical producer inventory.
     'scripts/mobile-core/prepare-ndk-linux.mjs',
 })
 
@@ -49,8 +49,7 @@ def apple_rust_build_code(identity, policy=APPLE_RUST_BUILD_CODE_POLICY):
         require(isinstance(name, str) and isinstance(pin, dict) and set(pin) == {'bytes', 'sha256'} and
                 type(pin['bytes']) is int and pin['bytes'] > 0 and isinstance(pin['sha256'], str) and
                 re.fullmatch('[0-9a-f]{64}', pin['sha256']), 'producer code file pin differs')
-    # android_sdk has imports/function definitions only; its calls and the NDK
-    # installer/archive belong to the Android branch. ci_android.prepare_source
+    # The NDK installer and SDK view belong to the Android branch. ci_android.prepare_source
     # and android-source's native parsers ARE used by Apple and stay relevant.
     # Unknown future producer entries stay relevant by default.
     return {'policy': policy, 'files': {name: dict(pin) for name, pin in files.items()

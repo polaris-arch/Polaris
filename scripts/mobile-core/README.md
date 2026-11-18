@@ -68,8 +68,8 @@ later producer step fails. Rust keeps its separate NDK 27.3.13750724.
 `plan.py` verifies the input and prints a bind plan. It never executes a build,
 copies an SDK into an App, installs tools, creates a tag or publishes assets.
 Plan fingerprints bind source and target declarations; actual tool identities
-must be added by the producer before compiling. `android_sdk.py` prepares the
-scoped SDK view only under a fixed private work slot held by the caller's
+must be added by the producer before compiling. `prepare-ndk-linux.mjs` prepares
+the scoped SDK view only under a fixed private work slot held by the caller's
 exclusive producer lease. The pure source suites exercise admission without running a native producer;
 those tests are distinct from actual component and App acceptance.
 
@@ -109,10 +109,11 @@ the CPU is the same.
 
 Rust download and compiled-dependency keys are independent. Download identity
 retains exact Cargo format/tool bytes and lock/manifests/source configuration.
-Compiled identity conservatively excludes only `android_sdk.py` and the NDK
-installer; shared `ci_android.py` and `android-source.py`, unknown
-producer files, Apple workflow, tools, SDK/configuration and flags remain
-relevant. Full producer provenance and final App-product exclusion are unchanged.
+Compiled identity excludes the Android-only NDK installer and SDK view, including
+the historical implementation. It retains shared `ci_android.py` and
+`android-source.py`, unknown producer files, the Apple workflow, tools, SDK,
+configuration and flags. The full provenance records all producer files. The
+cache excludes final App outputs.
 New key versions initially miss. These cache changes do not measure or promise
 a speedup for a genuinely cold build or the final App crate.
 

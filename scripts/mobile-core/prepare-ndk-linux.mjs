@@ -3,13 +3,14 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempDisposableSync, openSync,
-  readFileSync, readSync, realpathSync, renameSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+  readFileSync, readSync, realpathSync, readdirSync, renameSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const formalProfile = fileURLToPath(new URL('./ndk-r30-linux.json', import.meta.url));
 const formalProfileSha256 = 'db468c29e87569f09ca04dc3b3d2137554124cf755ebdf68371cfdff466f6a30';
+const archivePath = relative(fileURLToPath(new URL('../..', import.meta.url)), formalProfile);
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
@@ -19,6 +20,94 @@ function realPath(input, directory = false) {
   const stat = lstatSync(path);
   assert.ok(directory ? stat.isDirectory() : stat.isFile(), 'formal NDK input type differs: ' + path);
   return path;
+}
+
+function ndkProperties(raw) {
+  const values = new Map();
+  for (const line of utf8.decode(raw).split(/\r\n?|\n/)) {
+    if (!line.trim() || /^[#!]/.test(line.trimStart())) continue;
+    const assignment = line.indexOf('=');
+    assert.ok(assignment >= 0, 'NDK source.properties field malformed');
+    const key = line.slice(0, assignment).trim();
+    assert.ok(key && !values.has(key), 'NDK source.properties duplicate/empty key');
+    values.set(key, line.slice(assignment + 1).trim());
+  }
+  const revision = values.get('Pkg.Revision');
+  assert.ok(revision && /^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha|beta|rc)[0-9]+)?$/.test(revision),
+    'NDK source.properties revision malformed/missing');
+  return { revision, baseRevision: values.get('Pkg.BaseRevision') ?? null, releaseName: values.get('Pkg.ReleaseName') };
+}
+
+function validateNdkProperties({ revision, baseRevision, releaseName }, profile) {
+  assert.ok(revision === profile.ndkSourceRevision && baseRevision === profile.ndkRevision
+    && releaseName === profile.ndkPackage.slice('android-ndk-'.length), 'actual pinned NDK revision/base/release differs');
+}
+
+function retain(path, raw) {
+  const existing = lstatSync(path, { throwIfNoEntry: false });
+  if (existing) {
+    assert.ok(existing.isFile() && readFileSync(path).equals(raw), 'previous NDK source observation differs: ' + path);
+  } else {
+    writeFileSync(path, raw, { flag: 'wx' });
+  }
+}
+
+export function observeNdkInput(root, ndk, profile, profileBytes) {
+  const path = realPath(join(realpathSync(ndk), 'source.properties'));
+  const raw = readFileSync(path);
+  retain(join(root, 'ndk-source.properties'), raw);
+  const parsed = ndkProperties(raw);
+  const { revision, baseRevision } = parsed;
+  // Preserve the compact sorted UTF-8 bytes used in hosted tool receipts.
+  const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object'
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+  const facts = { schema: 'polaris-mobile-ndk-input-observation-v1', path,
+    sourceProperties: { bytes: raw.length, sha256: sha256(raw) }, revision, requiredRevision: profile.ndkSourceRevision,
+    baseRevision, requiredBaseRevision: profile.ndkRevision, package: profile.ndkPackage, archivePath,
+    archiveContract: { bytes: profileBytes.length, sha256: sha256(profileBytes) },
+    devicePassed: false, publicationEligible: false };
+  facts.fingerprint = sha256(canonical(facts));
+  retain(join(root, 'sdk-input-observation.json'), Buffer.from(canonical(facts)));
+  assert.ok(readFileSync(path).equals(raw), 'NDK source.properties changed during observation');
+  validateNdkProperties(parsed, profile);
+  return facts;
+}
+
+function privateSlot(path, message) {
+  const info = lstatSync(path);
+  assert.ok(info.isDirectory() && info.uid === process.getuid() && (info.mode & 0o7777) === 0o700, message);
+}
+
+function sdkLink(link, target) {
+  const info = lstatSync(link, { throwIfNoEntry: false });
+  if (!info) symlinkSync(target, link, 'dir');
+  else assert.ok(info.isSymbolicLink() && realpathSync(link) === target, 'retained SDK link differs: ' + link);
+}
+
+export function prepareSdkView(work, sdk, ndk, profile, bootclasspath) {
+  [work, sdk, ndk] = [work, sdk, ndk].map(path => realpathSync(path));
+  privateSlot(work, 'fixed private caller-owned work slot required');
+  validateNdkProperties(ndkProperties(readFileSync(join(ndk, 'source.properties'))), profile);
+  const jar = join(sdk, 'platforms', bootclasspath.platform, 'android.jar');
+  assert.ok(statSync(jar, { throwIfNoEntry: false })?.isFile() && sha256(readFileSync(jar)) === bootclasspath.sha256,
+    'actual Android bootclasspath differs');
+  // The caller still holds the exclusive producer lease on this fixed view.
+  const view = join(work, 'android-sdk-view');
+  if (!lstatSync(view, { throwIfNoEntry: false })) mkdirSync(view, { mode: 0o700 });
+  privateSlot(view, 'SDK view must be a private real directory');
+  const sdkDirs = ['platforms', 'build-tools', 'platform-tools'];
+  assert.ok(readdirSync(view).every(name => name === 'ndk' || sdkDirs.includes(name)), 'unexpected SDK view entry');
+  for (const name of sdkDirs) {
+    const target = join(sdk, name);
+    assert.ok(statSync(target, { throwIfNoEntry: false })?.isDirectory(), 'actual SDK directory missing: ' + name);
+    sdkLink(join(view, name), target);
+  }
+  const ndks = join(view, 'ndk');
+  if (!lstatSync(ndks, { throwIfNoEntry: false })) mkdirSync(ndks, { mode: 0o700 });
+  assert.ok(lstatSync(ndks).isDirectory() && readdirSync(ndks).every(name => name === profile.ndkRevision),
+    'SDK view may contain only the pinned NDK; ambient NDK28 is forbidden');
+  sdkLink(join(ndks, profile.ndkRevision), ndk);
+  return [view, jar];
 }
 
 function unpackArchive(download, temp, profile) {
@@ -68,10 +157,10 @@ function unpackArchive(download, temp, profile) {
 
 function main() {
   const { values, positionals } = parseArgs({
-    options: { profile: { type: 'string' }, sdk: { type: 'string' }, 'check-license-only': { type: 'boolean' } },
+    options: { profile: { type: 'string' }, sdk: { type: 'string' }, ndk: { type: 'string' },
+      'check-license-only': { type: 'boolean' }, 'prepare-view': { type: 'boolean' } },
     allowPositionals: true,
   });
-  assert.ok(process.platform === 'linux', 'formal NDK preparation requires Linux');
   assert.ok(values.profile && values.sdk, 'explicit formal NDK profile and SDK required');
   const profilePath = realPath(values.profile);
   assert.equal(profilePath, formalProfile, 'exact reviewed formal NDK profile required');
@@ -81,6 +170,13 @@ function main() {
   const profile = JSON.parse(utf8.decode(profileBytes));
   const [root, localArchive] = positionals;
   const licenseOnly = values['check-license-only'];
+  if (values['prepare-view']) {
+    assert.ok(!licenseOnly && values.ndk && positionals.length === 1, 'SDK view requires a private work slot and explicit NDK');
+    const { android } = JSON.parse(readFileSync(new URL('./source-contract.json', import.meta.url)));
+    console.log(JSON.stringify(prepareSdkView(root, values.sdk, values.ndk, profile, android.bootclasspath)));
+    return;
+  }
+  assert.ok(!values.ndk && process.platform === 'linux', 'formal NDK preparation requires Linux');
   assert.ok(licenseOnly ? positionals.length === 0 : root && positionals.length <= 2,
     'license check cannot prepare a slot; extraction requires an explicit private runner slot');
   const sdk = realPath(values.sdk, true);
@@ -89,9 +185,8 @@ function main() {
     'standard Android SDK license is not already accepted');
   if (licenseOnly) return;
 
-  const work = realPath(root, true), info = lstatSync(work);
-  assert.ok(info.uid === process.getuid() && (info.mode & 0o7777) === 0o700,
-    'formal NDK root must be current-user private');
+  const work = realPath(root, true);
+  privateSlot(work, 'formal NDK root must be current-user private');
   const target = join(work, 'polaris-mobile-ndk-' + profile.ndkRevision);
   assert.ok(!lstatSync(target, { throwIfNoEntry: false }),
     'retained formal NDK slot refused; fresh private runner slot required');
@@ -108,12 +203,15 @@ function main() {
     const unpacked = unpackArchive(download, join(scratch.path, 'unpacked'), profile);
     renameSync(unpacked, ndk);
   }
+  observeNdkInput(work, ndk, profile, profileBytes);
   console.log(ndk);
 }
 
-try {
-  main();
-} catch (error) {
-  console.error('libbox NDK preparation failed: ' + error.message);
-  process.exitCode = 1;
+if (import.meta.main) {
+  try {
+    main();
+  } catch (error) {
+    console.error('libbox NDK preparation failed: ' + error.message);
+    process.exitCode = 1;
+  }
 }

@@ -12,7 +12,6 @@ import zipfile
 
 from fork_input import ROOT, canonical, load, sha
 from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_hot_contract, objc_validation_getter_contract, tree_inventory, zip_entries
-from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
 from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
@@ -1052,69 +1051,17 @@ class FormalOutputs(unittest.TestCase):
                 with self.assertRaises(OSError):
                     os.fstat(fd)
 
-    def test_actual_ndk_properties_spacing_keeps_exact_pin_and_rejects_duplicate_or_other_revision(self):
-        # Matches the observed fixed archive's full revision and distinct base revision.
-        self.assertEqual(revision_from_properties('Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\n'),
-                         self.value['android']['ndkSourceRevision'])
-        self.assertEqual(revision_from_properties('Pkg.Revision=30.0.16138531\n'), '30.0.16138531')
-        for bad in ['Pkg.Revision = 30.0.16138531\nPkg.Revision=30.0.16138531',
-                    'Pkg.Revision=30.0.16138531\n Pkg.Revision = 27.3.13750724',
-                    'Pkg.Revision = 30.0.16138531 trailing', 'Pkg.Desc = Android NDK']:
-            with self.subTest(properties=bad), self.assertRaises(RuntimeError):
-                revision_from_properties(bad)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            work = root / 'work'; work.mkdir(mode=0o700)
-            sdk, ndk = root / 'sdk', root / 'ndk'; ndk.mkdir()
-            profile = deepcopy(self.value['android'])
-            for name in ['platforms/' + profile['bootclasspath']['platform'], 'build-tools', 'platform-tools']:
-                (sdk / name).mkdir(parents=True)
-            jar = sdk / 'platforms' / profile['bootclasspath']['platform'] / 'android.jar'
-            jar.write_bytes(b'actual controlled bootclasspath')
-            profile['bootclasspath']['sha256'] = sha(jar.read_bytes())
-            properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\nPkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n'
-            (ndk / 'source.properties').write_bytes(properties)
-            observation = observe_ndk_input(root, ndk, profile)
-            self.assertEqual((root / 'ndk-source.properties').read_bytes(), properties)
-            self.assertEqual(observation['revision'], profile['ndkSourceRevision'])
-            self.assertEqual(observation['baseRevision'], profile['ndkRevision'])
-            self.assertFalse(observation['publicationEligible'])
-            view, actual_jar = prepare_view(work, sdk, ndk, profile)
-            self.assertEqual(actual_jar, jar)
-            self.assertEqual((view / 'ndk' / profile['ndkRevision']).resolve(), ndk)
-            (ndk / 'source.properties').write_text('Pkg.Revision = 27.3.13750724\n')
-            with self.assertRaisesRegex(RuntimeError, 'revision/base/release differs'):
-                prepare_view(work, sdk, ndk, profile)
-            with self.assertRaisesRegex(RuntimeError, 'observation differs'):
-                observe_ndk_input(root, ndk, profile)
-            self.assertEqual((root / 'ndk-source.properties').read_bytes(), properties)
-            for bad in [properties.replace(b'Pkg.Revision = 30.0.16248370', b'Pkg.Revision = 30.0.16248370-beta3'),
-                        properties.replace(b'Pkg.BaseRevision = 30.0.16248370', b'Pkg.BaseRevision = 30.0.0'),
-                        properties.replace(b'= r30', b'= r30-rc1')]:
-                (ndk / 'source.properties').write_bytes(bad)
-                with self.assertRaisesRegex(RuntimeError, 'revision/base/release differs'):
-                    prepare_view(work, sdk, ndk, profile)
-            (ndk / 'source.properties').write_bytes(properties)
-            jar.write_bytes(b'wrong bootclasspath')
-            with self.assertRaisesRegex(RuntimeError, 'bootclasspath differs'):
-                prepare_view(work, sdk, ndk, profile)
-
-    def test_prepare_refusal_retains_ndk_inputs_without_success_outputs(self):
-        from fork_input import load
+    def test_prepare_refusal_never_emits_success_outputs(self):
         value = load()
-        properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\nPkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n'
-        # Execute the real prepare/observe path, with all external tool operations
-        # controlled. Both admission refusal and a later source refusal happen
-        # before emit_outputs, so the work output cannot be the evidence root.
-        for admission_refuses in [True, False]:
-            with self.subTest(admission_refuses=admission_refuses), tempfile.TemporaryDirectory() as temporary:
+        for installer_refuses in [True, False]:
+            with self.subTest(installer_refuses=installer_refuses), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
-                ndk = root / 'ndk'; ndk.mkdir()
-                raw = properties.replace(b'30.0.16248370', b'30.0.16138531-beta3') if admission_refuses else properties
-                (ndk / 'source.properties').write_bytes(raw)
-                jdk = root / 'jdk'; jdk.mkdir()
-                sdk = root / 'sdk'; sdk.mkdir()
+                sdk, ndk, jdk = (root / name for name in ('sdk', 'ndk', 'jdk'))
+                for path in (sdk, ndk, jdk):
+                    path.mkdir()
                 output, environment = root / 'github-output', root / 'github-env'
+                installer = ['node', str(ROOT / 'scripts/mobile-core/prepare-ndk-linux.mjs'), '--profile',
+                             str(ROOT / value['android']['ndkArchivePath']), '--sdk', str(sdk)]
 
                 def controlled_run(args, **kwargs):
                     command = [str(arg) for arg in args]
@@ -1126,43 +1073,32 @@ class FormalOutputs(unittest.TestCase):
                             'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
                             'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']]:
                         return ''
-                    installer = ['node', str(ROOT / 'scripts/mobile-core/prepare-ndk-linux.mjs'), '--profile',
-                                 str(ROOT / value['android']['ndkArchivePath']), '--sdk', str(sdk)]
                     if command == installer + ['--check-license-only']:
                         return ''
                     if command == installer + [str(root)]:
+                        if installer_refuses:
+                            raise RuntimeError('controlled NDK refusal')
                         return str(ndk)
                     self.fail('unexpected external operation: ' + repr(command))
 
-                reason = 'revision/base/release differs' if admission_refuses else 'controlled source refusal'
+                reason = 'controlled NDK refusal' if installer_refuses else 'controlled source refusal'
                 with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'JAVA_HOME_17_X64': str(jdk),
                         'ANDROID_SDK_ROOT': str(sdk), 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(environment)}, clear=True), \
-                        patch('ci_android.load', return_value=value), \
                         patch('ci_android.location', return_value=root), \
                         patch('ci_android.producer_code', return_value={'files': []}), \
-                        patch('ci_android.native_capacity', return_value=
-                              {'jobCap': 1, 'scope': 'inert prepare test; not runner observation'}), \
-                        patch('ci_android.native_environment', side_effect=lambda env, observation: (dict(env),
-                              {'jobCap': 1, 'scope': 'inert prepare test; not runner observation'})), \
+                        patch('ci_android.native_capacity', return_value={'jobCap': 1}), \
+                        patch('ci_android.native_environment', side_effect=lambda env, observation: (dict(env), observation)), \
                         patch('ci_android.run', side_effect=controlled_run), \
                         patch('ci_android.prepare_source', side_effect=RuntimeError('controlled source refusal')) as source, \
-                        patch('ci_android.emit_outputs') as emit, self.assertRaisesRegex(RuntimeError, reason):
+                        self.assertRaisesRegex(RuntimeError, reason):
                     prepare()
-                emit.assert_not_called()
-                if admission_refuses:
+                if installer_refuses:
                     source.assert_not_called()
                 else:
                     source.assert_called_once()
                 self.assertFalse(output.exists())
                 self.assertFalse(environment.exists())
                 self.assertFalse((root / 'tools.json').exists())
-                self.assertEqual((root / 'ndk-source.properties').read_bytes(), raw)
-                observation = json.loads((root / 'sdk-input-observation.json').read_bytes())
-                self.assertEqual(observation['sourceProperties']['sha256'], sha(raw))
-                self.assertEqual(observation['revision'], revision_from_properties(raw.decode()))
-                self.assertEqual(observation['requiredRevision'], value['android']['ndkSourceRevision'])
-                self.assertFalse(observation['devicePassed'])
-                self.assertFalse(observation['publicationEligible'])
 
     def test_framework_declares_exact_device_and_simulator_architectures(self):
         device = {'SupportedPlatform': 'ios', 'SupportedArchitectures': ['arm64']}

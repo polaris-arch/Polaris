@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempDisposableSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { fixtureZip } from './lib/formal-package-fixtures.mjs';
+import { observeNdkInput, prepareSdkView } from './mobile-core/prepare-ndk-linux.mjs';
 
 import {
   ABIS,
@@ -74,6 +76,77 @@ test('formal Android SDK preparation requires existing license and exact archive
   symlinkSync(work, alias);
   assert.match(run(alias, archive).stderr, /cannot be redirected/);
   assert.equal(readFileSync(license, 'utf8'), accepted);
+});
+
+test('formal NDK evidence retains original bytes and the SDK view admits only the reviewed inputs', {
+  skip: process.platform !== 'linux',
+}, () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-ndk-input-'));
+  const profileBytes = readFileSync(new URL('./mobile-core/ndk-r30-linux.json', import.meta.url));
+  const profile = JSON.parse(profileBytes);
+  const pin = bytes => createHash('sha256').update(bytes).digest('hex');
+  const root = fixture.path, work = join(root, 'work'), sdk = join(root, 'sdk'), ndk = join(root, 'ndk');
+  const bootclasspath = { platform: 'android-36', sha256: pin('controlled bootclasspath') };
+  const jar = join(sdk, 'platforms', bootclasspath.platform, 'android.jar');
+  const file = join(ndk, 'source.properties');
+  const stable = `Pkg.Desc = Android NDK\nPkg.Revision = ${profile.ndkSourceRevision}\n`
+    + `Pkg.BaseRevision = ${profile.ndkRevision}\nPkg.ReleaseName = r30\n`;
+  assert.equal(Buffer.byteLength(stable), profile.sourcePropertiesBytes);
+  assert.equal(pin(stable), profile.sourcePropertiesSha256);
+  mkdirSync(work, { mode: 0o700 });
+  mkdirSync(ndk);
+  mkdirSync(join(sdk, 'platforms', bootclasspath.platform), { recursive: true });
+  mkdirSync(join(sdk, 'build-tools'));
+  mkdirSync(join(sdk, 'platform-tools'));
+  mkdirSync(join(sdk, 'ndk', '28.0.0'), { recursive: true });
+  writeFileSync(jar, 'controlled bootclasspath');
+  writeFileSync(file, stable);
+  const observed = observeNdkInput(root, ndk, profile, profileBytes);
+  assert.deepEqual(observeNdkInput(root, ndk, profile, profileBytes), observed);
+  assert.deepEqual(JSON.parse(readFileSync(join(root, 'sdk-input-observation.json'))), observed);
+  assert.equal(readFileSync(join(root, 'ndk-source.properties'), 'utf8'), stable);
+  assert.deepEqual(observed.sourceProperties, { bytes: Buffer.byteLength(stable), sha256: pin(stable) });
+  assert.deepEqual(observed.archiveContract, { bytes: profileBytes.length, sha256: pin(profileBytes) });
+  assert.equal(observed.revision, profile.ndkSourceRevision);
+  assert.equal(observed.baseRevision, profile.ndkRevision);
+  assert.equal(observed.devicePassed, false);
+  assert.equal(observed.publicationEligible, false);
+
+  const view = prepareSdkView(work, sdk, ndk, profile, bootclasspath);
+  assert.equal(view[1], jar);
+  assert.deepEqual(prepareSdkView(work, sdk, ndk, profile, bootclasspath), view);
+  const selected = join(view[0], 'ndk');
+  assert.deepEqual(readdirSync(selected), [profile.ndkRevision]);
+  assert.equal(realpathSync(join(selected, profile.ndkRevision)), ndk);
+  const preview = stable.replace(profile.ndkSourceRevision, '30.0.16138531-beta3');
+  writeFileSync(file, preview);
+  assert.throws(() => observeNdkInput(root, ndk, profile, profileBytes), /previous NDK source observation differs/);
+  assert.equal(readFileSync(join(root, 'ndk-source.properties'), 'utf8'), stable);
+  const refused = join(root, 'refused');
+  mkdirSync(refused);
+  assert.throws(() => observeNdkInput(refused, ndk, profile, profileBytes), /revision\/base\/release differs/);
+  assert.equal(readFileSync(join(refused, 'ndk-source.properties'), 'utf8'), preview);
+  const refusedReceipt = JSON.parse(readFileSync(join(refused, 'sdk-input-observation.json')));
+  assert.equal(refusedReceipt.revision, '30.0.16138531-beta3');
+  assert.equal(refusedReceipt.requiredRevision, profile.ndkSourceRevision);
+  assert.equal(refusedReceipt.publicationEligible, false);
+
+  for (const [raw, error] of [
+    [preview, /revision\/base\/release differs/],
+    [stable.replace(profile.ndkSourceRevision, profile.ndkSourceRevision + '-beta3'), /revision\/base\/release differs/],
+    [stable.replace(`Pkg.BaseRevision = ${profile.ndkRevision}`, 'Pkg.BaseRevision = 30.0.0'), /revision\/base\/release differs/],
+    [stable.replace('Pkg.ReleaseName = r30', 'Pkg.ReleaseName = r30-rc1'), /revision\/base\/release differs/],
+    [stable + `Pkg.Revision=${profile.ndkSourceRevision}\n`, /duplicate\/empty key/],
+    [stable.replace(`Pkg.Revision = ${profile.ndkSourceRevision}`, 'Pkg.Revision = 30.0.16138531 trailing'), /revision malformed\/missing/],
+  ]) {
+    writeFileSync(file, raw);
+    assert.throws(() => prepareSdkView(work, sdk, ndk, profile, bootclasspath), error);
+  }
+  writeFileSync(file, stable);
+  mkdirSync(join(selected, '28.0.0'));
+  assert.throws(() => prepareSdkView(work, sdk, ndk, profile, bootclasspath), /only the pinned NDK/);
+  writeFileSync(jar, 'wrong bootclasspath');
+  assert.throws(() => prepareSdkView(work, sdk, ndk, profile, bootclasspath), /bootclasspath differs/);
 });
 
 test('Android build entry passes its default config and preserves an explicit override', {
