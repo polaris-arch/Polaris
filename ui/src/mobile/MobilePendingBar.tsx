@@ -433,7 +433,10 @@ export function MobilePendingBar(): ReactElement | null {
         if (!token) return;
         confirmTwice(REVERT_SAVED_KEY + token, async () => {
           try {
-            if (!await api.proxy.revertSavedSettings(token)) throw new Error('Saved settings changed');
+            if (!await api.proxy.revertSavedSettings(token)) {
+              toast.error(t('common.saveFailed'));
+              return;
+            }
             setApply(state => state.phase === 'failed' ? dismissApplyState(state) : state);
           } catch {
             toast.error(t('common.saveFailed'));

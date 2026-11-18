@@ -7,6 +7,7 @@
  *    （真机反馈「点了没反应」，正是第二批要修的病）。
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { proxyErrorReason } from '@/domain/proxy-error-text';
 
 // 认领态（`inFlight` / `claimedUntil`）是模块级单例。每个用例通过
 // `vi.resetModules()` + 动态 import 取独立实例，避免跨用例共享状态。
@@ -276,9 +277,15 @@ describe('两条出口成对守卫 —— 事件腿让位的码，await 腿必�
     const gated = claimGatedCodes(routing);
     expect(gated).toContain('CORE_NOT_EXECUTABLE');
     expect(gated).toContain('HELPER_CORE_MISMATCH');
-    const unhandled = gated.filter(
-      (c) => !(c in NOT_ON_DESKTOP_HOME) && !leg.includes(`code === ProxyErrorCode.${c}`),
+    const reportsMappedReason = leg.replace(/\s+/g, ' ').trimEnd().endsWith(
+      "reportConnectionFailure( action === 'stop' ? t('home.stopProxyFailed') "
+      + ': proxyErrorReason({ errorCode: code as string | undefined }, key => t(key)) ??',
     );
+    const unhandled = gated.filter((code) => {
+      if (code in NOT_ON_DESKTOP_HOME || leg.includes(`code === ProxyErrorCode.${code}`)) return false;
+      return !(code.startsWith('CORE_ADMISSION_') && reportsMappedReason
+        && proxyErrorReason({ errorCode: code }, key => key)?.startsWith('helper.coreAdmission.'));
+    });
     expect(
       unhandled,
       '事件腿在认领期内对这些码让位，Home 的 await 腿却没有分支 —— 认领期内用户只会看到通用的启动失败',
