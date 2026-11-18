@@ -233,7 +233,7 @@ const TEXT_ONLY: &[Entry] = &[
     },
     Entry {
         name: "POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1",
-        reason: "A cfg(local-development-selection) byte marker retained by selection_lane/black_box and rejected in actual Formal package members by final-package-receipt.py. It is neither an environment read nor runtime execution authority; exact cfg/constant/consumer and negative mutations are checked below.",
+        reason: "A cfg(local-development-selection) byte marker retained by selection_lane/black_box and rejected in actual Formal package members by scripts/lib/formal-package-selection.mjs. It is neither an environment read nor runtime execution authority; exact cfg/constant/consumer and negative mutations are checked below.",
     },
 
     Entry {

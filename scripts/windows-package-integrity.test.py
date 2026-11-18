@@ -52,7 +52,7 @@ class Integrity(unittest.TestCase):
         resources, sources = w.source_inventory(root)
         return {'resources': resources, 'sources': sources,
                 'cargo': {'targetDirectory': str(root / 'target'), 'releaseDirectory': str(root / 'target/release'),
-                          'target': None, 'profile': 'release'}}, b'MZ inert App ' + w.final.BUNDLE_UNK + b' ' + (root / 'resources/win/core-manifest.json').read_bytes()
+                          'target': None, 'profile': 'release'}}, b'MZ inert App ' + w.BUNDLE_UNK + b' ' + (root / 'resources/win/core-manifest.json').read_bytes()
 
     def zip(self, root, expected, state, app, fault=None):
         archive = root / 'carrier.zip'
@@ -279,12 +279,12 @@ class Integrity(unittest.TestCase):
     def test_tauri_probe_runs_the_resolved_entry_and_rejects_other_versions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); scripts = root / 'scripts'; scripts.mkdir()
-            declaration = scripts / 'tauri-cli.version'; declaration.write_text(w.final.TAURI_CLI_VERSION + '\n')
+            declaration = scripts / 'tauri-cli.version'; declaration.write_text(w.TAURI_CLI_VERSION + '\n')
             entry = str(root / 'official-tauri.cmd')
             Path(entry).write_bytes(b'inert selected CLI identity, never executed')
             with patch.object(w.shutil, 'which', return_value=entry), \
-                 patch.object(w.subprocess, 'check_output', return_value='tauri-cli ' + w.final.TAURI_CLI_VERSION + '\n') as probe:
-                self.assertEqual(w.tauri_identity(root), {'entry': entry, 'version': 'tauri-cli ' + w.final.TAURI_CLI_VERSION,
+                 patch.object(w.subprocess, 'check_output', return_value='tauri-cli ' + w.TAURI_CLI_VERSION + '\n') as probe:
+                self.assertEqual(w.tauri_identity(root), {'entry': entry, 'version': 'tauri-cli ' + w.TAURI_CLI_VERSION,
                                                        'tool': w.cargo_tool(entry)})
                 probe.assert_called_once_with([entry, '--version'], timeout=30, text=True)
             for output in ['tauri-cli 2.12.3', 'tauri-cli 2.12.5\nextra', '2.12.5']:
@@ -1342,7 +1342,7 @@ class CargoContexts(unittest.TestCase):
                     def mutate():
                         if mode == 'pristine': return
                         if mode == 'temporary patch restored':
-                            binary.write_bytes(app.replace(w.final.BUNDLE_UNK, w.final.BUNDLE_NSS))
+                            binary.write_bytes(app.replace(w.BUNDLE_UNK, w.BUNDLE_NSS))
                             self.assertEqual(binary.stat().st_ino, inode)
                             binary.write_bytes(app)
                         else:

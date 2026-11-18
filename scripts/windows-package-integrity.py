@@ -10,7 +10,6 @@ import ctypes
 from contextlib import ExitStack, contextmanager
 import hashlib
 import hmac
-import importlib.util
 import json
 import ntpath
 import os
@@ -23,14 +22,15 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import zipfile
 
 os.sys.dont_write_bytecode = True
-_spec = importlib.util.spec_from_file_location('final_package', Path(__file__).with_name('final-package-receipt.py'))
-final = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(final)
-require = final.require
 ROOT = Path(__file__).resolve().parents[1]
+TAURI_CLI_VERSION = '2.12.5'
+BUNDLE_PREFIX = b'__TAURI_BUNDLE_TYPE_VAR_'
+BUNDLE_UNK = BUNDLE_PREFIX + b'UNK'
+BUNDLE_NSS = BUNDLE_PREFIX + b'NSS'
 MAX_FILE = 512 * 1024 ** 2
 MAX_TOTAL = 2 * 1024 ** 3
 MAX_MEMBERS = 10000
@@ -46,6 +46,25 @@ MARKER = ("Polaris portable edition marker - DO NOT DELETE.\n"
           "'Check for updates' offers the portable zip instead of the NSIS installer.\n"
           "Deleting it makes Polaris think it was installed, and it will then offer an\n"
           "installer that creates a SECOND, separate copy of the app.\n").encode()
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def expected_windows_app(source, kind, version):
+    require(version == TAURI_CLI_VERSION, 'unreviewed Tauri CLI app transform version')
+    require(kind in ['nsis', 'zip'], 'unknown Windows app carrier')
+    if kind == 'zip': return source
+    # Fixed 2.12.5 bundler: patch first UNK token to NSS, bundle, restore source.
+    # Refuse ambiguity rather than accepting its first-match behavior generally.
+    # Runtime comparison constants (NSS/MSI/etc.) share the prefix and remain
+    # ordinary protected bytes. Only the patch target UNK must be unique.
+    require(source.count(BUNDLE_UNK) == 1,
+            'NSIS source requires one unique unpatched bundle token')
+    offset = source.index(BUNDLE_UNK)
+    return source[:offset] + BUNDLE_NSS + source[offset + len(BUNDLE_UNK):]
 
 
 def io_path(path):
@@ -96,7 +115,22 @@ def byte_facts(data):
 
 
 def key(name, directory=False):
-    return final.windows_zip_key(name, directory)
+    # ZIP paths are canonical POSIX names, then compared with Windows aliases.
+    # Reject first: extractall otherwise normalizes dot/repeated separators and
+    # Windows trims trailing dots/spaces, allowing overwrite before counting.
+    require(isinstance(name, str) and name and '\\' not in name and ':' not in name
+            and not name.startswith('/'), 'unsafe ZIP member')
+    path = name[:-1] if directory and name.endswith('/') else name
+    parts = path.split('/')
+    require(parts and all(part and part not in ['.', '..'] for part in parts)
+            and name == '/'.join(parts) + ('/' if directory else ''), 'non-canonical ZIP path')
+    for part in parts:
+        require(part == part.rstrip(' .') and not any(ord(c) < 32 for c in part)
+                and not any(c in '<>"|?*' for c in part)
+                and unicodedata.normalize('NFC', part) == part, 'Windows ZIP path alias')
+        base = part.split('.', 1)[0].upper()
+        require(not re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])', base), 'Windows ZIP device name')
+    return '/'.join(part.casefold() for part in parts)
 
 
 def validate_names(rows):
@@ -375,7 +409,7 @@ def load_state(root, *, readback=False):
 def carrier_inventory(state, app, kind):
     result = {(name[5:] if kind == 'zip' and name.startswith('_up_/') else name): row
               for name, row in state['resources'].items()}
-    result['polaris.exe'] = byte_facts(final.expected_windows_app(app, kind, final.TAURI_CLI_VERSION))
+    result['polaris.exe'] = byte_facts(expected_windows_app(app, kind, TAURI_CLI_VERSION))
     if kind == 'zip': result['portable.marker'] = byte_facts(MARKER)
     # The pinned CLI 2.12.1 sets its install destination through $R6. 7-Zip
     # preserves that variable root; only ZIP removes the existing _up_ prefix.
@@ -978,7 +1012,7 @@ def tauri_identity(root):
     version = io_path(regular(root / 'scripts/tauri-cli.version')).read_text().strip()
     executable = tauri_command()
     actual = subprocess.check_output([executable, '--version'], timeout=30, text=True).strip()
-    require(version == final.TAURI_CLI_VERSION and actual == 'tauri-cli ' + version, 'unreviewed App transform tool')
+    require(version == TAURI_CLI_VERSION and actual == 'tauri-cli ' + version, 'unreviewed App transform tool')
     return {'entry': executable, 'version': actual, 'tool': cargo_tool(executable)}
 
 
