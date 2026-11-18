@@ -32,14 +32,16 @@ fi
 export ANDROID_NDK_HOME="$selected" NDK_HOME="$selected" ANDROID_NDK_ROOT="$selected"
 
 cli_version="$(cat "$repo_root/scripts/tauri-cli.version")"
-if ! command -v tauri >/dev/null 2>&1; then
+if ! cli="$(command -v tauri)"; then
   echo "Global Tauri CLI is missing; run npm install -g @tauri-apps/cli@$cli_version" >&2
   exit 1
 fi
-if [[ "$(tauri --version)" != "tauri-cli $cli_version" ]]; then
+cli="$(cd "$(dirname "$cli")" && pwd -P)/$(basename "$cli")"
+if [[ "$("$cli" --version)" != "tauri-cli $cli_version" ]]; then
   echo "Global Tauri CLI must be $cli_version; run npm install -g @tauri-apps/cli@$cli_version" >&2
   exit 1
 fi
+export POLARIS_TAURI_CLI="$cli"
 cd "$repo_root"
 
 # Bind the default mobile config at the shared entry point, including calls outside CI.
@@ -53,4 +55,4 @@ done
 if ! "$explicit_config"; then
   set -- --config "$repo_root/src-tauri/tauri.android.conf.json" "$@"
 fi
-exec tauri android build "$@"
+exec "$cli" android build "$@"

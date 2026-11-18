@@ -19,17 +19,20 @@ open class BuildTask : DefaultTask() {
         val target = target ?: throw GradleException("target cannot be null")
         val release = release ?: throw GradleException("release cannot be null")
         val tauriDir = File(project.projectDir, rootDirRel).canonicalFile
-        // The Android project lives under src-tauri, while the only package.json and
-        // installed Tauri CLI live in ui/. Keep src-tauri as the CLI working directory.
-        val cli = File(tauriDir, "../ui/node_modules/@tauri-apps/cli/tauri.js").canonicalFile
-        if (!cli.isFile) {
-            throw GradleException("Tauri CLI is missing at $cli; install the ui/ dependencies first")
+        val launcher = project.providers.environmentVariable("POLARIS_TAURI_CLI").orNull
+        val command = if (launcher != null) {
+            listOf(launcher)
+        } else {
+            val cli = File(tauriDir, "../ui/node_modules/@tauri-apps/cli/tauri.js").canonicalFile
+            if (!cli.isFile) {
+                throw GradleException("Tauri CLI is missing at $cli; use scripts/build-android-apk.sh or install the IDE CLI")
+            }
+            listOf("node", cli.absolutePath)
         }
 
         project.exec {
             workingDir(tauriDir)
-            executable("node")
-            args(cli.absolutePath, "android", "android-studio-script")
+            commandLine(command + listOf("android", "android-studio-script"))
             if (project.logger.isEnabled(LogLevel.DEBUG)) {
                 args("-vv")
             } else if (project.logger.isEnabled(LogLevel.INFO)) {

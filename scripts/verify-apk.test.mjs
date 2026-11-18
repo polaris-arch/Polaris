@@ -150,7 +150,7 @@ test('formal NDK evidence retains original bytes and the SDK view admits only th
   assert.throws(() => prepareSdkView(work, sdk, ndk, profile, bootclasspath), /bootclasspath differs/);
 });
 
-test('Android build entry passes its default config and preserves an explicit override', {
+test('Android build entry passes the verified launcher and preserves config overrides', {
   skip: process.platform !== 'linux',
 }, () => {
   using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-android-config-'));
@@ -166,7 +166,7 @@ test('Android build entry passes its default config and preserves an explicit ov
 if [[ "$1" == --version ]]; then
   printf '%s\n' "tauri-cli $TEST_TAURI_VERSION"
 else
-  printf '%s\n' "$@"
+  printf '%s\n' "$POLARIS_TAURI_CLI" "$@"
 fi
 `, { mode: 0o700 });
   const env = { ...process.env, PATH: fixture.path + delimiter + process.env.PATH,
@@ -182,7 +182,9 @@ fi
     const child = spawnSync('bash', [script, ...input], { env, cwd: fixture.path, encoding: 'utf8', timeout: 5000 });
     assert.ifError(child.error);
     assert.equal(child.status, 0, child.stderr);
-    assert.deepEqual(child.stdout.trimEnd().split('\n'), ['android', 'build', ...expected]);
+    assert.deepEqual(child.stdout.trimEnd().split('\n'), [
+      realpathSync(join(fixture.path, 'tauri')), 'android', 'build', ...expected,
+    ]);
   }
 });
 
