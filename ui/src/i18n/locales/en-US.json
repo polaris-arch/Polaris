@@ -849,8 +849,6 @@
       "mgmtBlock": "Management dashboard",
       "mgmtEnable": "Enable the management API and built-in dashboard",
       "mgmtEnableDesc": "Off by default. Exposes the sing-box control API on 127.0.0.1 for the built-in dashboard",
-      "mgmtPort": "Listen port",
-      "mgmtPortDesc": "Assigned automatically by default; you can pin it",
       "mgmtSecret": "API secret",
       "mgmtSecretDesc": "Generated automatically and checked when the dashboard loads",
       "copySecret": "Copy API secret",

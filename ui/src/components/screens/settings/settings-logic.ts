@@ -62,9 +62,6 @@ export function bypassLanState(config: BypassLanConfigLike): BypassLanState {
 /** 默认混合端口。对齐 Rust `config-engine::user_config::proxy_ports::DEFAULT_MIXED_PORT`。 */
 export const DEFAULT_MIXED_PORT = 7890;
 
-/** 默认 clash_api 控制端口。对齐 Rust `proxy_ports.rs:12 DEFAULT_CONTROL_PORT`。 */
-export const DEFAULT_CONTROL_PORT = 9090;
-
 export interface PortConfigLike {
   mixedPort?: number | null;
   httpPort?: number | null;
@@ -86,20 +83,6 @@ export function localProxyPort(config: PortConfigLike): number {
   const http = config.httpPort;
   if (typeof http === 'number' && http > 0) return http;
   return DEFAULT_MIXED_PORT;
-}
-
-export interface ControlPortConfigLike {
-  controlPort?: number | null;
-}
-
-/**
- * clash_api 控制端口。**逐条对齐** `proxy_ports.rs:36-42 control_api_port`：`controlPort > 0` → 用之，
- * 否则 `DEFAULT_CONTROL_PORT`。此前 UI 写 `config.controlPort ?? 9090` —— `??` 挡不住 0，
- * 与 `localProxyPort` 当初那条缺陷同型（UI 显 0 而后端已回退 9090）。
- */
-export function controlApiPort(config: ControlPortConfigLike): number {
-  const p = config.controlPort;
-  return typeof p === 'number' && p > 0 ? p : DEFAULT_CONTROL_PORT;
 }
 
 /**

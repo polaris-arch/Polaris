@@ -43,13 +43,11 @@ import { ListEditor } from './ListEditor';
 import {
   bypassLanState,
   localProxyPort,
-  controlApiPort,
   normalizePortInput,
   shellPlatformFromDataOs,
   splitTerminalEnvByPlatform,
   showsUnixPersistenceTip,
   DEFAULT_MIXED_PORT,
-  DEFAULT_CONTROL_PORT,
   type TerminalEnvGroup,
 } from './settings-logic';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -132,7 +130,6 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
   // 此前写 `config.mixedPort ?? 7890`，丢了两条 httpPort 回退路径，导致「说明文字里的端口对、
   // 复制出去的命令端口错」（见 settings-logic.ts::localProxyPort 注释）。
   const mixedPort = localProxyPort(config);
-  const controlPort = controlApiPort(config);
   // 生效清单由 `config:get` 边界注入（27 条 `DEFAULT_BYPASS_LAN`，Rust 单一真值源）。
   // 此处此前有一份三条的前端兜底常量 —— 与内核默认分叉，且本屏同样有 ListEditor 回写，
   // 逐字符 onChange 会把那三条当用户清单持久化。见 domain/effective-config 模块头。
@@ -166,7 +163,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
     ));
   }
 
-  /* ── 两个端口 + 测速端点：本地草稿 + onBlur 提交（同 `SettingsDns` 已落地的模式）────────────
+  /* ── 混合代理端口和测速端点：本地草稿 + onBlur 提交 ────────────────────────────────
    * 逐键写盘的代价在这里最大：**代理运行中**每敲一个字符落一次盘 → 触发一次整核重启评估，且中间态
    * 恒为 `7` / `78` / `789` 这类特权或非法端口（后端 `store/validate.rs:264-279` 只挡 1..65535，
    * 中间态照落）。故一律「输入进草稿 → blur/Enter 才校验落盘」，非法标红且不写 config。
@@ -175,49 +172,40 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
    * 用户：种子快照 `seededRef` 即这道守卫——草稿 ≠ 上次种子 = 用户已改过，保留草稿；相等 = 未动过，
    * 跟随新配置。 */
   const [mixedPortDraft, setMixedPortDraft] = useState(String(mixedPort));
-  const [controlPortDraft, setControlPortDraft] = useState(String(controlPort));
   const [speedUrlDraft, setSpeedUrlDraft] = useState(config.speedTestUrl ?? '');
-  const [portErr, setPortErr] = useState<{ mixed?: boolean; control?: boolean }>({});
+  const [portErr, setPortErr] = useState(false);
   // Derive from the visible draft: hydration and local edits cannot leave a stale warning.
   const speedUrlErr = invalidSpeedUrl(speedUrlDraft);
   const seededRef = useRef({
     mixed: String(mixedPort),
-    control: String(controlPort),
     speedUrl: config.speedTestUrl ?? '',
   });
   useEffect(() => {
     const snap = {
       mixed: String(mixedPort),
-      control: String(controlPort),
       speedUrl: config.speedTestUrl ?? '',
     };
     const prev = seededRef.current;
     setMixedPortDraft((cur) => (cur !== prev.mixed ? cur : snap.mixed));
-    setControlPortDraft((cur) => (cur !== prev.control ? cur : snap.control));
     setSpeedUrlDraft((cur) => (adoptSpeedTestUrlDraft(cur, prev.speedUrl, snap.speedUrl)));
     seededRef.current = snap;
-  }, [mixedPort, controlPort, config.speedTestUrl]);
+  }, [mixedPort, config.speedTestUrl]);
 
   /**
    * 提交一个端口：非法 → 标红、保留输入待修正、**不落盘**；清空 → 回默认；无变化 → 不写（免无谓重启）。
    *
-   * 合法区间取 `normalizePortInput` 的 1024..65535（上游 `network-settings.tsx:219` 同口径，
-   * 见该函数注释）。`controlPort` 与 `mixedPort` 撞口由后端 `validate.rs:229-250` 自动避让，
-   * **UI 不重复实现避让**——两处各写一套只会在「后端改了避让策略」时静默分叉。
+   * 合法区间取 `normalizePortInput` 的 1024..65535。
    */
-  function commitPort(key: 'mixedPort' | 'controlPort', raw: string) {
-    const isMixed = key === 'mixedPort';
-    const next = normalizePortInput(raw, isMixed ? DEFAULT_MIXED_PORT : DEFAULT_CONTROL_PORT);
-    const slot = isMixed ? 'mixed' : 'control';
+  function commitPort(raw: string) {
+    const next = normalizePortInput(raw, DEFAULT_MIXED_PORT);
     if (next === null) {
-      setPortErr((p) => ({ ...p, [slot]: true }));
+      setPortErr(true);
       return;
     }
-    setPortErr((p) => ({ ...p, [slot]: false }));
-    if (isMixed) setMixedPortDraft(String(next));
-    else setControlPortDraft(String(next));
-    if (next === (isMixed ? mixedPort : controlPort)) return;
-    void update({ [key]: next });
+    setPortErr(false);
+    setMixedPortDraft(String(next));
+    if (next === mixedPort) return;
+    void update({ mixedPort: next });
   }
 
   /** 提交测速端点：非法 → 标红、保留输入、**不落盘**；清空 → 删字段（后端回落默认）。 */
@@ -393,18 +381,18 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             value={mixedPortDraft}
             onChange={(e) => {
               setMixedPortDraft(e.currentTarget.value);
-              if (portErr.mixed) setPortErr((p) => ({ ...p, mixed: false }));
+              if (portErr) setPortErr(false);
             }}
-            onBlur={() => commitPort('mixedPort', mixedPortDraft)}
+            onBlur={() => commitPort(mixedPortDraft)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') e.currentTarget.blur();
             }}
-            aria-invalid={portErr.mixed || undefined}
-            style={portErr.mixed ? { borderColor: 'hsl(var(--err))' } : undefined}
+            aria-invalid={portErr || undefined}
+            style={portErr ? { borderColor: 'hsl(var(--err))' } : undefined}
             className="mono"
             aria-label={t('settings.network.mixedPort')}
           />
-          {portErr.mixed && <div className="err-line">{t('settings.advanced.localPortRange')}</div>}
+          {portErr && <div className="err-line">{t('settings.advanced.localPortRange')}</div>}
         </SetRow>
         <SetRow label={t('settings.network.allowLan')}>
           <Switch checked={!!config.allowLan} onChange={(v) => void update({ allowLan: v })} />
@@ -670,35 +658,6 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
           </SetRow>
           {mgmtEnabled && (
             <div className="mgmt-detail">
-            {/* 同混合端口：草稿 + onBlur 提交。与 mixedPort 撞口时后端自动避让（validate.rs:229-250），
-                此处只做范围校验，不复刻避让逻辑。 */}
-            <SetRow
-              label={t('settings.network.mgmtPort')}
-              tip={t('settings.network.mgmtPortDesc')}
-              align="start"
-              ctrlStyle={{ minWidth: 120, display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'stretch' }}
-            >
-              <TextInput
-                id="control-port-input"
-                inputMode="numeric"
-                value={controlPortDraft}
-                onChange={(e) => {
-                  setControlPortDraft(e.currentTarget.value);
-                  if (portErr.control) setPortErr((p) => ({ ...p, control: false }));
-                }}
-                onBlur={() => commitPort('controlPort', controlPortDraft)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') e.currentTarget.blur();
-                }}
-                aria-invalid={portErr.control || undefined}
-                style={portErr.control ? { borderColor: 'hsl(var(--err))' } : undefined}
-                className="mono"
-                aria-label={t('settings.network.mgmtPort')}
-              />
-              {portErr.control && (
-                <div className="err-line">{t('settings.advanced.localPortRange')}</div>
-              )}
-            </SetRow>
             <SetRow
               label={t('settings.network.mgmtSecret')}
               tip={t('settings.network.mgmtSecretDesc')}

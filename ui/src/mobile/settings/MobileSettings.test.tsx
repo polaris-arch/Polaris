@@ -977,7 +977,6 @@ describe('③ 不出现「允许局域网访问管理 API」开关（裁定 #9 �
     for (const key of [
       'settings.network.mgmtBlock',
       'settings.network.mgmtEnable',
-      'settings.network.mgmtPort',
       'settings.network.allowLan',
       'settings.advanced.localPort',
       'settings.network.mixedPort',

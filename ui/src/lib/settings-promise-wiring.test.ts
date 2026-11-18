@@ -463,14 +463,6 @@ const REGISTRY: readonly PromiseRow[] = [
     },
   },
   {
-    snippet: '默认自动分配，可固定',
-    evidence: {
-      kind: 'anchor',
-      file: 'crates/store/src/validate.rs',
-      needle: 'obj.insert("controlPort".into()',
-    },
-  },
-  {
     snippet: '自动生成，加载面板时校验',
     evidence: {
       kind: 'anchor',

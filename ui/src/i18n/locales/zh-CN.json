@@ -849,8 +849,6 @@
       "mgmtBlock": "管理面板",
       "mgmtEnable": "启用管理 API 与内嵌面板",
       "mgmtEnableDesc": "默认关闭。在 127.0.0.1 暴露 sing-box 控制 API，供内嵌面板使用",
-      "mgmtPort": "监听端口",
-      "mgmtPortDesc": "默认自动分配，可固定",
       "mgmtSecret": "API 密钥",
       "mgmtSecretDesc": "自动生成，加载面板时校验",
       "copySecret": "复制 API 密钥",

@@ -797,11 +797,10 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
 
     /* ══════════════ `config-fields` 面：桌面这一屏 `update({…})` 写出去的每个字段 ══════════════ */
 
-    /* ── 计算键与嵌套子字段（上一版的正则一条都抓不到）───────────────────────── */
     {
-      id: 'field:[key]',
+      id: 'field:mixedPort',
       disposition: { kind: 'adjudicated-out', enforcedBy: MGMT_API_ADJUDICATED },
-      note: '`SettingsNetwork.tsx` 的 `commitPort` 那个漏斗：一个调用点用计算键写 `mixedPort` / `controlPort` 两个字段。键名要到运行期才知道，故它作为一条**必须显式判一次**的登记进面。两个字段在移动端都不存在（Android 不发 mixed inbound、管理 API 整族裁定不提供），`MobileSettings.test.tsx ③` 在源码面与文案面各钉一次。',
+      note: 'Android 不生成桌面的 mixed inbound。',
     },
     {
       id: 'field:dnsConfig.enableFakeIp',

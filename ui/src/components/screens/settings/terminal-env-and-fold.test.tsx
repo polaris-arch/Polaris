@@ -335,17 +335,13 @@ describe('端口输入不再逐键落盘（结构 + 渲染）', () => {
     throw new Error(`${inputId} 的 onChange 块没有配平的 }`);
   }
 
-  it('两个端口的 onChange 处理器体内**没有任何 update( 调用**（不止是没有对象字面量写法）', () => {
+  it('混合端口先更新草稿，失焦时提交', () => {
     // 代理运行中每键落盘 = 每个字符触发一次整核重启评估，且中间态是 `7`/`78`/`789` 这类非法端口。
     // 唯一的落盘入口必须是 onBlur → commitPort。
-    for (const id of ['mixed-port-input', 'control-port-input']) {
-      const body = onChangeBodyOf(id);
-      expect(body, `${id} 的 onChange 里出现了 update( —— 逐键落盘回归`).not.toMatch(/\bupdate\s*\(/);
-      // 前提自检：切出来的确实是那个处理器体（草稿 setter 必在里面），而不是空串恒绿。
-      expect(body).toMatch(/set\w*PortDraft\(/);
-    }
-    expect(netSrc).toContain("onBlur={() => commitPort('mixedPort'");
-    expect(netSrc).toContain("onBlur={() => commitPort('controlPort'");
+    const body = onChangeBodyOf('mixed-port-input');
+    expect(body).toContain('setMixedPortDraft(');
+    expect(body).not.toMatch(/\bupdate\s*\(/);
+    expect(netSrc).toContain('onBlur={() => commitPort(mixedPortDraft)}');
   });
 
   it('commitPort 的合法性判定**只**来自 normalizePortInput（不并行复刻一套范围判定）', () => {
@@ -362,7 +358,7 @@ describe('端口输入不再逐键落盘（结构 + 渲染）', () => {
     // ② 返回值就是判定结果：null → 标红不落盘；非 null → 落盘的就是它。
     expect(body).toMatch(/const next = normalizePortInput\(/);
     expect(body).toMatch(/if \(next === null\)/);
-    expect(body).toMatch(/update\(\{\s*\[key\]:\s*next\s*\}\)/);
+    expect(body).toMatch(/update\(\{\s*mixedPort:\s*next\s*\}\)/);
     // ③ 函数体内不得再出现第二个范围判定的来源（复刻式判定会让 settings-logic 的单测变成假绿）。
     //    只在 commitPort 体内扫，不再全文扫 —— 全文扫正是那条误伤面过宽的旧断言。
     expect(body).not.toMatch(/\d{3,5}\s*(<=?|>=?)|(<=?|>=?)\s*\d{3,5}/);
@@ -377,16 +373,11 @@ describe('端口输入不再逐键落盘（结构 + 渲染）', () => {
     expect(html).not.toMatch(/id="mixed-port-input"[^>]*type="number"/);
   });
 
-  it('渲染：管理面板关闭时不渲染控制端口输入（开启才有这一行）', () => {
+  it('管理面板通过复制连接提供当前地址', () => {
     dataOs.value = 'mac';
-    expect(render({}, SettingsNetwork)).not.toContain('id="control-port-input"');
-    expect(render({ singboxDashboard: true }, SettingsNetwork)).toContain('id="control-port-input"');
-  });
-
-  it('渲染：控制端口按 controlApiPort 口径回显（0 → 9090，而非显示 0）', () => {
-    dataOs.value = 'mac';
-    const html = render({ singboxDashboard: true, controlPort: 0 }, SettingsNetwork);
-    expect(html).toMatch(/id="control-port-input"[^>]*value="9090"/);
+    const html = render({ singboxDashboard: true, controlPort: 9090 }, SettingsNetwork);
+    expect(html).toContain('settings.network.copyDashboardConnection');
+    expect(html).not.toContain('id="control-port-input"');
   });
 });
 

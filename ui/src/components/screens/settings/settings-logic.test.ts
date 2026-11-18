@@ -26,11 +26,9 @@ import {
   showsHardwareAccelRow,
   languageDescKey,
   windowEffectsDescKey,
-  controlApiPort,
   normalizePortInput,
   MANUAL_INTERVAL_HOURS,
   DEFAULT_MIXED_PORT,
-  DEFAULT_CONTROL_PORT,
   MIN_LISTEN_PORT,
   STAGED_SETTING_SECTION_LABELS,
   MAX_LISTEN_PORT,
@@ -418,28 +416,10 @@ describe('便携交接：消费面 + 五语文案守卫', () => {
   });
 });
 
-describe('controlApiPort —— 逐条对齐 crates/config-engine/.../proxy_ports.rs:36-42', () => {
-  it('controlPort > 0 用之', () => {
-    expect(controlApiPort({ controlPort: 9091 })).toBe(9091);
-  });
-
-  it('未设 → 默认 9090', () => {
-    expect(controlApiPort({})).toBe(DEFAULT_CONTROL_PORT);
-  });
-
-  it('0 → 默认（后端是 `Some(p) if p > 0`；UI 若写 `?? 9090` 会在此显示 0）', () => {
-    expect(controlApiPort({ controlPort: 0 })).toBe(DEFAULT_CONTROL_PORT);
-  });
-
-  it('null（JSON null）→ 默认', () => {
-    expect(controlApiPort({ controlPort: null })).toBe(DEFAULT_CONTROL_PORT);
-  });
-});
-
 describe('normalizePortInput —— 端口输入的落盘判定（null = 标红不落盘）', () => {
   it('空串 / 纯空白 → 回默认（「清空即回默认」，同 DNS 两栏）', () => {
     expect(normalizePortInput('', DEFAULT_MIXED_PORT)).toBe(7890);
-    expect(normalizePortInput('   ', DEFAULT_CONTROL_PORT)).toBe(9090);
+    expect(normalizePortInput('   ', DEFAULT_MIXED_PORT)).toBe(7890);
   });
 
   it('区间内的纯数字放行（含两端边界）', () => {
