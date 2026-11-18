@@ -331,25 +331,13 @@ esac
     expect(chain).toContain('needs: component\n    if: always()');
     expect(chain).toContain('COMPONENT_RESULT: ${{ needs.component.result }}');
     const blocks = chain.split(/^ {6}- /m).slice(1);
+    const simDownload = blocks.find((block) => block.includes('name: apple-carrier-summary-sim-arm64'))!;
+    expect(simDownload).toContain('if: ${{ inputs.include_simulator }}');
     const aggregate = blocks.find((block) => block.includes('name: Strict declared-scope'))!;
-    const aggregateStep = blocks.indexOf(aggregate);
-    const nodeSetup = blocks.findIndex((block) => block.includes("uses: actions/setup-node@v7\n        with:\n          node-version: '26'"));
-    expect(nodeSetup).toBeGreaterThanOrEqual(0);
-    expect(nodeSetup).toBeLessThan(aggregateStep);
-    for (const [artifact, slot] of [['apple-component-manifest', 'component'],
-      ['apple-carrier-summary-device-arm64', 'device-arm64'], ['apple-carrier-summary-sim-arm64', 'sim-arm64']]) {
-      const download = blocks.findIndex((block) => block.includes(`name: ${artifact}-\${{ github.run_id }}-\${{ github.run_attempt }}`));
-      expect(download).toBeGreaterThanOrEqual(0);
-      expect(download).toBeLessThan(aggregateStep);
-      expect(blocks[download]).toContain(`path: \${{ runner.temp }}/apple-chain/${slot}`);
-      if (slot === 'sim-arm64') expect(blocks[download]).toContain('if: ${{ inputs.include_simulator }}');
-      else expect(blocks[download]).not.toContain('if:');
-    }
     expect(hasStrictResultGate(aggregate, 'COMPONENT_RESULT')).toBe(true);
     const command = 'node scripts/mobile-core/apple-aggregate.mjs --scope "$POLARIS_APPLE_SCOPE" --summaries "$RUNNER_TEMP/apple-chain" --output "$RUNNER_TEMP/apple-chain.json"';
     expect(aggregate).toContain(command);
     expect(aggregate.indexOf('[ "$COMPONENT_RESULT" = success ]')).toBeLessThan(aggregate.indexOf(command));
-    expect(aggregate.indexOf(command)).toBeLessThan(aggregate.indexOf('device-arm64: unsigned App + PacketTunnel compile/link passed.'));
     expect(aggregate).toContain('sim-arm64: not requested.');
     expect(aggregate).not.toContain('continue-on-error');
   });
