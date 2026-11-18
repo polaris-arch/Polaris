@@ -326,19 +326,16 @@ class FormalOutputs(unittest.TestCase):
         self.assertEqual(observed['unknown'], ['cpu', 'load', 'memory'])
         self.assertIsNone(observed['estimatedMemoryJobCap'])
         self.assertEqual(observed['memoryEstimateRisk'], 'unknown-memory')
-        # The same sampled limits apply before either a fresh build or a cache
-        # lookup. Neither path may be denied by an unmeasured per-job estimate.
-        for phase in ('fresh', 'cache-hit'):
-            for memory in (0, 1024 ** 3, 3 * 1024 ** 3 - 1):
-                with self.subTest(phase=phase, memory=memory):
-                    facts.update(logicalCPUs=8, load1=0, availableMemoryBytes=memory)
-                    limited = capacity_limit(facts)
-                    self.assertEqual(limited['estimatedMemoryJobCap'], 0)
-                    self.assertEqual(limited['memoryJobCap'], 1)
-                    self.assertEqual(limited['memoryEstimateRisk'], 'below-unmeasured-single-job-estimate')
-                    child, applied = native_environment({}, limited)
-                    self.assertEqual(child, {'CARGO_BUILD_JOBS': '1', 'GOMAXPROCS': '1'})
-                    self.assertIsNone(applied['peakRSSBytes'])
+        for memory in (0, 1024 ** 3, 3 * 1024 ** 3 - 1):
+            with self.subTest(memory=memory):
+                facts.update(logicalCPUs=8, load1=0, availableMemoryBytes=memory)
+                limited = capacity_limit(facts)
+                self.assertEqual(limited['estimatedMemoryJobCap'], 0)
+                self.assertEqual(limited['memoryJobCap'], 1)
+                self.assertEqual(limited['memoryEstimateRisk'], 'below-unmeasured-single-job-estimate')
+                child, applied = native_environment({}, limited)
+                self.assertEqual(child, {'CARGO_BUILD_JOBS': '1', 'GOMAXPROCS': '1'})
+                self.assertIsNone(applied['peakRSSBytes'])
         child, applied = native_environment({}, observed)
         self.assertEqual(child, {'CARGO_BUILD_JOBS': '1', 'GOMAXPROCS': '1'})
         self.assertEqual(applied['unknown'], ['cpu', 'load', 'memory'])

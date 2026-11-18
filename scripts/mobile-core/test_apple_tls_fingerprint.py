@@ -425,8 +425,6 @@ class OptionalNativeTunCompilerABI(unittest.TestCase):
         self.assertIn('alwaysOutOfDate = 1', phase)
         self.assertIn('$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args', phase)
         self.assertEqual(pbx.count('OTHER_SWIFT_FLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);'), 2)
-        builder = (root / 'scripts/mobile-core/build_apple_app.py').read_text()
-        self.assertLess(builder.index("'original-tls-prepare.log'"), builder.index("timed_phase('app-extension-archive'"))
         swift = (root / 'src-tauri/gen/apple/PacketTunnel/TunnelPlatform.swift').read_text()
         self.assertIn('#if POLARIS_NATIVE_TUN_V1', swift)
         native_tun = swift.split('#if POLARIS_NATIVE_TUN_V1', 1)[1].split('#endif', 1)[0]

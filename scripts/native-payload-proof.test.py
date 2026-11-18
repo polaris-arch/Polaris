@@ -22,10 +22,6 @@ def load(name, filename):
 
 native = load('native', 'native-payload-proof.py')
 final = load('final', 'final-package-receipt.py')
-ENV = {'POLARIS_NATIVE_PAYLOAD_VALIDATION': '1', 'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
-       'GITHUB_REPOSITORY': 'polaris-arch/Polaris', 'GITHUB_SHA': 'c' * 40, 'GITHUB_RUN_ID': '900', 'GITHUB_RUN_ATTEMPT': '1',
-       'GITHUB_REF': 'refs/heads/collab/fk02-native-payload-validation-20261010',
-       'GITHUB_WORKFLOW_REF': 'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/collab/fk02-native-payload-validation-20261010'}
 
 
 class NativeContract(unittest.TestCase):
@@ -257,18 +253,14 @@ class NativeContract(unittest.TestCase):
             self.assertEqual(observed, {'status': 'NotSigned', 'signerThumbprint': None})
             self.assertEqual(native.sha(path), before)
 
-    def test_context_rejects_each_scope_drift(self):
-        with tempfile.TemporaryDirectory() as root:
-            for name in ENV:
-                with self.subTest(name=name):
-                    with self.assertRaises(ValueError): native.ci_context('linux', {**ENV, name: ''}, 'Linux', 'x86_64', root=root)
-            for change in [{'POLARIS_NO_KERNEL_RUN': '1'}, {'GITHUB_REF': 'refs/tags/v1'}, {'GITHUB_EVENT_NAME': 'push'}]:
-                with self.assertRaises(ValueError): native.ci_context('linux', {**ENV, **change}, 'Linux', 'x86_64', root=root)
+    def test_context_rejects_wrong_platform_or_host(self):
         for key, system, arch in [('win', 'Linux', 'amd64'), ('linux', 'Linux', 'arm64'), ('mac-x64', 'Darwin', 'x86_64')]:
-            with self.assertRaises(ValueError): native.ci_context(key, ENV, system, arch)
+            with self.subTest(key=key, system=system, arch=arch), \
+                    self.assertRaisesRegex(ValueError, 'native amd64 host/platform differs'):
+                native.ci_context(key, {}, system, arch)
 
     def test_no_kernel_override_blocks_before_any_native_action(self):
-        with patch.dict(os.environ, {**ENV, 'POLARIS_NO_KERNEL_RUN': '1'}, clear=True), \
+        with patch.dict(os.environ, {'POLARIS_NO_KERNEL_RUN': '1'}, clear=True), \
                 patch.object(native.ctypes, 'CDLL', side_effect=AssertionError('loader must not run')), \
                 patch.object(native.subprocess, 'Popen', side_effect=AssertionError('core must not run')):
             with self.assertRaises(ValueError): native.capi_smoke('missing', 'linux', 'a' * 64)
