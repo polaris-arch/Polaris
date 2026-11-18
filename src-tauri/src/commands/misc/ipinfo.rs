@@ -283,8 +283,8 @@ pub(crate) fn ipinfo_probe_is_current(epoch: u64, seq: u64) -> bool {
 ///
 /// # 为什么闸必须在**探测之后**再查一次
 ///
-/// [`build_ipinfo_snapshot`] 最长跑 `IPINFO_PROBE_BUDGET_MS × 2 = 20s`（direct + proxy 两腿串行，
-/// 各含定额重试、各自封顶），而排程间隔只有 [`IPINFO_SETTLE_DELAY_MS`] = 4s ——
+/// [`build_ipinfo_snapshot`] 最长跑 `IPINFO_PROBE_BUDGET_MS × 2 = 20s`（direct 和 proxy 各自封顶），
+/// 而排程间隔只有 [`IPINFO_SETTLE_DELAY_MS`] = 4s ——
 /// **探测窗口远大于排程间隔**（移植重试后差距进一步拉大），先发起的慢腿完全可能在后
 /// 发起的快腿之后落地。只在探测**前**查闸挡不住这段窗口，旧腿会同时污染可见快照与广播。
 ///
@@ -655,6 +655,36 @@ where
     .unwrap_or_else(|_| Err(format!("ipinfo: 探测预算 {IPINFO_PROBE_BUDGET_MS}ms 耗尽")))
 }
 
+async fn probe_post_connect_ipinfo<D, P, PFut>(
+    direct: D,
+    mut proxy: P,
+) -> (Result<Value, String>, Value)
+where
+    D: std::future::Future<Output = Result<Value, String>>,
+    P: FnMut() -> PFut,
+    PFut: std::future::Future<Output = Result<Value, String>>,
+{
+    tokio::pin!(direct);
+    // Reuse a successful early answer. If direct finishes first, cancel the
+    // pending early attempt and start the normal proxy retry window.
+    let (direct, early_proxy) = tokio::select! {
+        biased;
+        direct = &mut direct => (direct, None),
+        proxy = proxy() => (direct.await, proxy.ok()),
+    };
+    let proxy = match early_proxy {
+        Some(value) => value,
+        None => with_ipinfo_retry(
+            proxy,
+            IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
+            IPINFO_PROXY_POST_CONNECT_RETRY_MS,
+        )
+        .await
+        .unwrap_or(Value::Null),
+    };
+    (direct, proxy)
+}
+
 /// 构造出口 IP 快照：direct（经直连传输层单点）+ proxy（经本机混合端口，核未运行 → null）。
 ///
 /// `post_connect` = 本腿是否跑在**隧道热身窗口**里（起核 / 热切，即走选路收敛延迟那些腿）：
@@ -680,35 +710,41 @@ async fn build_ipinfo_snapshot(
     doh_blocked: Option<&'static str>,
     post_connect: bool,
 ) -> Value {
-    let (direct, direct_err) = match with_ipinfo_retry(
+    let direct = with_ipinfo_retry(
         || fetch_ipip_ipinfo(direct_http),
         IPINFO_DIRECT_ATTEMPTS,
         IPINFO_DIRECT_RETRY_MS,
-    )
-    .await
-    {
-        Ok(v) => (v, None),
-        Err(e) => (Value::Null, Some(e)),
-    };
-    let (proxy_attempts, proxy_retry_ms) = if post_connect {
-        (
-            IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
-            IPINFO_PROXY_POST_CONNECT_RETRY_MS,
-        )
-    } else {
-        (IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS)
-    };
+    );
     // 代理出口经本机 http 代理入站探（桌面 `mixed-in`；Android 没有 mixed 入站，走 `probe-proxy-in`
     // 并带本次起核的凭据 —— 此前无条件读 `mixed_port`，Android 上连向一个不存在的口，出口 IP 恒空）。
-    let proxy = if let Some(lp) = local_proxy.filter(|_| status.running) {
+    let (direct, proxy) = if let Some(lp) = local_proxy.filter(|_| status.running) {
         match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
-            Ok(p) => with_ipinfo_retry(|| fetch_trace_ipinfo(&p), proxy_attempts, proxy_retry_ms)
-                .await
-                .unwrap_or(Value::Null),
-            Err(_) => Value::Null,
+            Ok(p) if post_connect && cfg!(target_os = "android") => {
+                probe_post_connect_ipinfo(direct, || fetch_trace_ipinfo(&p)).await
+            }
+            Ok(p) => {
+                let (attempts, retry_ms) = if post_connect {
+                    (
+                        IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
+                        IPINFO_PROXY_POST_CONNECT_RETRY_MS,
+                    )
+                } else {
+                    (IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS)
+                };
+                let direct = direct.await;
+                let proxy = with_ipinfo_retry(|| fetch_trace_ipinfo(&p), attempts, retry_ms)
+                    .await
+                    .unwrap_or(Value::Null);
+                (direct, proxy)
+            }
+            Err(_) => (direct.await, Value::Null),
         }
     } else {
-        Value::Null
+        (direct.await, Value::Null)
+    };
+    let (direct, direct_err) = match direct {
+        Ok(value) => (value, None),
+        Err(error) => (Value::Null, Some(error)),
     };
     let mut snap = json!({
         "direct": direct,

@@ -110,6 +110,42 @@ async fn failed_pinned_proxy_never_falls_back_to_the_direct_result() {
     assert_eq!(result["error"], "ipInfoFailed");
 }
 
+#[tokio::test(start_paused = true)]
+async fn android_post_connect_reuses_an_early_success_and_keeps_the_late_retry() {
+    for (early_delay, early_success, expected_starts) in [
+        (1, true, vec![0]),
+        (1, false, vec![0, 5]),
+        (8, true, vec![0, 5]),
+    ] {
+        let started = tokio::time::Instant::now();
+        let mut starts = Vec::new();
+        let (direct, proxy) = probe_post_connect_ipinfo(
+            async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(json!({ "ip": "192.0.2.1" }))
+            },
+            || {
+                let first = starts.is_empty();
+                starts.push(started.elapsed().as_secs());
+                async move {
+                    if first {
+                        tokio::time::sleep(Duration::from_secs(early_delay)).await;
+                        if !early_success {
+                            return Err("tunnel still warming".to_string());
+                        }
+                    }
+                    Ok(json!({ "ip": "192.0.2.2" }))
+                }
+            },
+        )
+        .await;
+        assert_eq!(direct.unwrap()["ip"], "192.0.2.1");
+        assert_eq!(proxy["ip"], "192.0.2.2");
+        assert_eq!(starts, expected_starts);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+}
+
 #[tokio::test]
 async fn stop_or_configuration_change_between_ip_legs_prevents_proxy_io() {
     for code in ["superseded", "configurationPending"] {
@@ -625,7 +661,7 @@ fn probe_start() -> (u64, u64) {
 /// # 缺陷长相
 ///
 /// 世代闸原先**只在探测「之前」查一次**，而 [`build_ipinfo_snapshot`] 最长跑
-/// `IPINFO_PROBE_BUDGET_MS × 2 = 20s`（direct + proxy 两腿串行，各含定额重试），排程间隔却只有 4s ——
+/// `IPINFO_PROBE_BUDGET_MS × 2 = 20s`（direct 和 proxy 各自封顶），排程间隔却只有 4s ——
 /// **探测窗口远大于排程间隔**，先发起的慢腿完全可能在后发起的快腿之后落地，同时污染
 /// `IPINFO_CACHE` 与广播。且 `delay_ms == 0` 的停核腿连那一次都不查。
 ///
