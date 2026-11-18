@@ -922,6 +922,8 @@ print(json.dumps({'valid':bare and not replacement and bound,
         `set -euo pipefail\nsleep() { :; }\n${guard.replace(/^ {10}/gm, '')}`], {
         env: { ...process.env, GH_TOKEN: 'localhost-fixture-not-a-secret',
           GH_CONFIG_DIR: fixture, TMPDIR: fixture, NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1',
+          // The fixture uses a synthetic token, so gh must not wait on the user's desktop keyring.
+          DBUS_SESSION_BUS_ADDRESS: `unix:path=${join(fixture, 'no-session-bus')}`,
           api_url: `http://127.0.0.1:${address.port}/release`, name, expected,
           expected_sha: sha, android_asset: 'Polaris_1.0.0_arm64-v8a-android.apk', tag: 'v1.0.0' },
         encoding: 'utf8',
