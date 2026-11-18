@@ -20,7 +20,8 @@ use support::core_locator::{
     bundled_core_candidates_for, command_for_core_target, kernel_gate_target, target_needs_rosetta,
 };
 use support::kernel_gate::{
-    check, core_or_skip, full_config_deps, load_cases, FixtureRatchet, SnapshotCase,
+    check, core_fatal_message, core_or_skip, full_config_deps, load_cases, FixtureRatchet,
+    SnapshotCase,
 };
 use tempfile::tempdir;
 
@@ -94,6 +95,36 @@ fn bundled_core_target_resolution_contract() {
         command.get_args().collect::<Vec<_>>(),
         ["-x86_64", "resources/mac-x64/sing-box"]
     );
+}
+
+#[test]
+fn core_fatal_diagnostic_allows_elapsed_seconds_to_vary() {
+    let expected = "initialize outbound[1]: invalid uuid: uuid: incorrect UUID length";
+    for elapsed in ["0000", "0001", "10000"] {
+        let diagnostic = format!("FATAL[{elapsed}] {expected}");
+        assert_eq!(core_fatal_message(&diagnostic), Some(expected));
+    }
+    for prefix in [
+        "ERROR[0001] ",
+        "FATAL[001] ",
+        "FATAL[00001] ",
+        "FATAL[00a1] ",
+        "FATAL[0001]",
+        "INFO[0000] another message\nFATAL[0001] ",
+    ] {
+        let diagnostic = format!("{prefix}{expected}");
+        assert_eq!(core_fatal_message(&diagnostic), None, "{diagnostic}");
+    }
+    for message in [
+        "start outbound[1]: invalid uuid: uuid: incorrect UUID length",
+        "initialize outbound[0]: invalid uuid: uuid: incorrect UUID length",
+        "initialize outbound[1]: invalid uuid: uuid: invalid UUID format",
+        "initialize outbound[1]: invalid uuid: uuid: incorrect UUID length\nanother error",
+    ] {
+        let diagnostic = format!("FATAL[0001] {message}");
+        assert_eq!(core_fatal_message(&diagnostic), Some(message));
+        assert_ne!(core_fatal_message(&diagnostic), Some(expected));
+    }
 }
 
 /// 全量 37 个 fixture 必须逐一生成、使用真实 `.srs` 资源并由同一凭据棘轮判定。
@@ -274,7 +305,7 @@ fn full_config_gate_rejects_missing_srs_path_mutation() {
     let (ok, diag) = check(&core, &path);
     assert!(!ok, "缺失的 .srs 路径被核收下，本完整配置门没有牙");
     assert!(
-        diag.trim() == "FATAL[0000] initial runtime source preparation failed",
+        core_fatal_message(&diag) == Some("initial runtime source preparation failed"),
         "变异没有因缺失 .srs 转红，拒绝原因不可信：{diag}"
     );
     value = original;

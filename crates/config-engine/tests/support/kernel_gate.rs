@@ -259,32 +259,38 @@ fn real_srs(path: &str) -> bool {
     is_valid_srs_file(Path::new(path))
 }
 
-/// 允许的唯一 initialize 凭据 artifact。每项锁**整条**随包 1.14 `check` 诊断，而非只认
-/// 一个子串：同一 fixture 冒出另一个 initialize 错误、或在既有原因后再拼尾因，都会不匹配并转红。
+/// 允许的 initialize 凭据 artifact。每项精确匹配随包 `check` 的完整 FATAL 消息。
 #[derive(Clone, Copy)]
 pub struct FixtureCredentialArtifact {
     pub name: &'static str,
-    pub diagnostic: &'static str,
+    pub message: &'static str,
 }
 
 pub const FIXTURE_CREDENTIAL_ARTIFACTS: &[FixtureCredentialArtifact] = &[
     FixtureCredentialArtifact {
         name: "多协议 outbound",
-        diagnostic: "FATAL[0000] initialize outbound[1]: invalid uuid: uuid: incorrect UUID length",
+        message: "initialize outbound[1]: invalid uuid: uuid: incorrect UUID length",
     },
     FixtureCredentialArtifact {
         name: "vless reality + shadowsocks shadow-tls",
-        diagnostic: "FATAL[0000] initialize outbound[0]: invalid public_key",
+        message: "initialize outbound[0]: invalid public_key",
     },
     FixtureCredentialArtifact {
         name: "抗封增强（ECH+TLS fragment+multiplex）",
-        diagnostic: "FATAL[0000] initialize outbound[0]: invalid ECH configs pem",
+        message: "initialize outbound[0]: invalid ECH configs pem",
     },
     FixtureCredentialArtifact {
         name: "ssh outbound",
-        diagnostic: "FATAL[0000] initialize outbound[0]: parse private key: ssh: no key found",
+        message: "initialize outbound[0]: parse private key: ssh: no key found",
     },
 ];
+
+/// Core's text logger pads elapsed seconds to a minimum of four digits.
+pub fn core_fatal_message(diagnostic: &str) -> Option<&str> {
+    let (seconds, message) = diagnostic.strip_prefix("FATAL[")?.split_once("] ")?;
+    let valid_width = seconds.len() == 4 || (seconds.len() > 4 && !seconds.starts_with('0'));
+    (valid_width && seconds.bytes().all(|byte| byte.is_ascii_digit())).then_some(message)
+}
 
 pub fn is_decode_stage(diag: &str) -> bool {
     diag.contains("decode config at")
@@ -310,9 +316,10 @@ impl FixtureRatchet {
             self.decode_failures.push(format!("  · {name} → {diag}"));
             return;
         }
+        let message = core_fatal_message(diag);
         match FIXTURE_CREDENTIAL_ARTIFACTS
             .iter()
-            .find(|artifact| artifact.name == name && artifact.diagnostic == diag)
+            .find(|artifact| artifact.name == name && message == Some(artifact.message))
         {
             Some(artifact) => *self.artifacts_seen.entry(artifact.name).or_default() += 1,
             None => self
