@@ -1752,13 +1752,6 @@ where
     let mut installed = false;
     let mut all_ok = true;
     for family in ["-4", "-6"] {
-        let mut routes = cidrs
-            .iter()
-            .filter(|cidr| cidr.contains(':') == (family == "-6"))
-            .peekable();
-        if routes.peek().is_none() {
-            continue;
-        }
         let rule = || {
             [
                 family,
@@ -1774,15 +1767,20 @@ where
             .map(str::to_owned)
             .into()
         };
-        if adding {
-            if !run(rule()).await {
-                log::warn!("出口路由: Linux ip {family} rule add 失败，跳过该族路由");
-                return installed;
-            }
-            installed = true;
-        }
         let verb = if adding { "replace" } else { "del" };
-        for cidr in routes {
+        let mut has_routes = false;
+        for cidr in cidrs {
+            if cidr.contains(':') != (family == "-6") {
+                continue;
+            }
+            if adding && !has_routes {
+                if !run(rule()).await {
+                    log::warn!("出口路由: Linux ip {family} rule add 失败，跳过该族路由");
+                    return installed;
+                }
+                installed = true;
+            }
+            has_routes = true;
             let args = [
                 family,
                 "route",
@@ -1795,7 +1793,7 @@ where
             ];
             all_ok &= run(args.map(str::to_owned).into()).await;
         }
-        if !adding {
+        if !adding && has_routes {
             all_ok &= run(rule()).await;
         }
     }
