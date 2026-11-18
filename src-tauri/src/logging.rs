@@ -559,19 +559,19 @@ pub fn set_level(level: &str) {
     };
     // 诊断期间配置仍允许修改，但只能更新「关闭诊断后恢复到哪里」；实际门槛保持至少 Debug。
     // 否则任意一次全量配置保存（即使只改主题）都会把诊断会话静默打回 Info。
-    let effective = {
-        let mut base = diagnostic_base();
-        if base.is_some() {
-            *base = Some(filter);
-            diagnostic_level(filter)
-        } else {
-            filter
-        }
+    // 基线和实时门槛在同一把锁下更新，避免与诊断开关交错时发布过期级别。
+    let mut base = diagnostic_base();
+    let effective = if base.is_some() {
+        *base = Some(filter);
+        diagnostic_level(filter)
+    } else {
+        filter
     };
     if log::max_level() == effective {
         return; // 幂等：config 保存常带全量字段，级别没变时不刷屏。
     }
     log::set_max_level(effective);
+    drop(base);
     log::info!("应用日志级别已切到 {effective}（sing-box 侧需重启内核生效）");
 }
 
