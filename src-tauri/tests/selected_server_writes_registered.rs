@@ -246,7 +246,7 @@ const WRITES: &[(&str, &[Site])] = &[
             (
                 Class::Projection,
                 "copy_selection_projection",
-                "将已准备选择的 selectedServerId/selectionIntent 一同复制或移除到运行快照，不独立选择出口",
+                "将已准备选择的 selectedServerId/selectionIntent 一同复制或移除到内存候选，不独立选择出口。撤销候选的落盘入口单独登记在 GENERIC",
             ),
             (
                 Class::Projection,
@@ -286,6 +286,11 @@ const OTHER: &[(&str, usize, &str)] = &[
 
 /// 不提键名的通用写入口：(文件, 函数签名起笔, 说明)。
 const GENERIC: &[(&str, &str, &str)] = &[
+    (
+        "src-tauri/src/runtime/proxy/runtime_config.rs",
+        "pub(crate) async fn revert_saved_proxy_settings(",
+        "用户确认撤销；在保存凭据和运行世代相符时，候选通过 copy_selection_projection 成对恢复运行快照中的出口和意图。原出口已删除时跳过恢复该对字段",
+    ),
     (
         "src-tauri/src/commands/config.rs",
         "fn config_save_core(",

@@ -3613,8 +3613,6 @@ impl ProxyRuntime {
 const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[
     "proxyMode",
     "proxyModeType",
-    "selectedServerId",
-    polaris_store::SELECTION_INTENT_KEY,
     "mixedPort",
     "controlPort",
     "httpPort",
@@ -3622,15 +3620,12 @@ const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[
     "tunConfig",
 ];
 
-fn revertible_proxy_settings<'a>(
-    desired: &'a Value,
-    running: &'a Value,
-) -> impl Iterator<Item = &'static str> + 'a {
+fn running_selection_available(desired: &Value, running: &Value) -> bool {
     // Only restore the selection pair if its running target still exists.
     use polaris_config_engine::user_config::dns_constants::{
         is_block_selection, is_direct_selection,
     };
-    let selection_available = running
+    running
         .get("selectedServerId")
         .and_then(Value::as_str)
         .is_none_or(|id| {
@@ -3644,17 +3639,6 @@ fn revertible_proxy_settings<'a>(
                             .iter()
                             .any(|node| node.get("id").and_then(Value::as_str) == Some(id))
                     })
-        });
-    REVERTIBLE_PROXY_SETTINGS
-        .iter()
-        .copied()
-        .filter(move |key| {
-            desired.get(key) != running.get(key)
-                && (selection_available
-                    || !matches!(
-                        *key,
-                        "selectedServerId" | polaris_store::SELECTION_INTENT_KEY
-                    ))
         })
 }
 
@@ -3670,11 +3654,22 @@ fn restored_proxy_settings(desired: &Value, running: &Value) -> Option<Value> {
     let action_path = "/dnsDefaults/unmatchedAction";
     let restore_dns = desired.get("dnsConfig") != running.get("dnsConfig")
         || desired.pointer(action_path) != running.pointer(action_path);
-    let mut settings = revertible_proxy_settings(desired, running).peekable();
-    if !restore_dns && settings.peek().is_none() {
+    let restore_selection = (desired.get("selectedServerId") != running.get("selectedServerId")
+        || desired.get(polaris_store::SELECTION_INTENT_KEY)
+            != running.get(polaris_store::SELECTION_INTENT_KEY))
+        && running_selection_available(desired, running);
+    let mut settings = REVERTIBLE_PROXY_SETTINGS
+        .iter()
+        .copied()
+        .filter(|key| desired.get(key) != running.get(key))
+        .peekable();
+    if !restore_dns && !restore_selection && settings.peek().is_none() {
         return None;
     }
     let mut candidate = desired.clone();
+    if restore_selection {
+        super::hot_switch::copy_selection_projection(&mut candidate, running);
+    }
     let output = candidate.as_object_mut()?;
     for key in settings {
         restore_value(output, key, running.get(key));
