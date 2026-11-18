@@ -1,7 +1,6 @@
 // Shared helpers for the committed desktop release consumer.
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { loadReleaseContract } from './release-consumer.mjs';
 
 // Hosting identity only. These records do not select a release or assert that
@@ -30,10 +29,6 @@ export function canonical(value) {
 }
 export function requireGraph(condition, message) {
   if (!condition) throw new Error(message);
-}
-export function verifyHash(file, expected) {
-  requireGraph(/^[a-f0-9]{64}$/.test(expected ?? '') && digest(readFileSync(file)) === expected,
-    `SHA-256 mismatch: ${file}`);
 }
 const same = (left, right) => canonical(left) === canonical(right);
 
@@ -98,43 +93,4 @@ export function observeMacCodeSignature(binary, key, run = spawnSync) {
   }
   validateMacCodeSignature(signature, key);
   return signature;
-}
-
-// `go version -m` reads build information without executing the target binary.
-// Local replacements use the following => row; a version alone is insufficient.
-export function parseBuildInfo(raw) {
-  const lines = String(raw).trimEnd().split(/\r?\n/);
-  const goVersion = /: go(\d+\.\d+\.\d+)$/.exec(lines.shift() ?? '')?.[1];
-  requireGraph(goVersion, 'Missing native Go build information');
-  const modules = new Map();
-  const settings = new Map();
-  let previous;
-  for (const line of lines) {
-    // Go prints a tab-only separator after a local replacement block.
-    if (line === '\t') { previous = undefined; continue; }
-    const parts = line.split('\t');
-    requireGraph(parts[0] === '', 'Malformed native Go build information');
-    const [, kind, value, version] = parts;
-    if (kind === 'dep' || kind === 'mod') {
-      requireGraph(value && version && !modules.has(value), 'Duplicate/malformed embedded module');
-      previous = { kind, version, ...(parts[4] ? { sum: parts[4] } : {}) };
-      modules.set(value, previous);
-    } else if (kind === '=>') {
-      requireGraph(previous && value && !previous.replacement, 'Unbound/duplicate embedded replacement');
-      previous.replacement = value;
-      if (version) previous.replacementVersion = version;
-      if (parts[4]) previous.replacementSum = parts[4];
-      previous = undefined;
-    } else if (kind === 'build') {
-      const split = value?.indexOf('=') ?? -1;
-      requireGraph(split > 0, 'Malformed embedded build setting');
-      const key = value.slice(0, split);
-      requireGraph(!settings.has(key), 'Duplicate embedded build setting');
-      let setting = value.slice(split + 1);
-      if (setting.startsWith('"')) setting = JSON.parse(setting);
-      settings.set(key, setting);
-      previous = undefined;
-    } else if (kind !== 'path') throw new Error('Unsupported native Go build information row');
-  }
-  return { goVersion, modules, settings };
 }
