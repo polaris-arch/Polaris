@@ -32,34 +32,19 @@ def android(apk, abi, r8, component, receipt_path, tools, scratch):
             'actual materialized App input changed')
     current = app_identity()
     require(current == material['App'], 'App candidate changed after SDK materialization')
-    selected = ['arm64-v8a', 'armeabi-v7a'] if abi == 'universal' else [abi]
-    require(set(selected) <= {'arm64-v8a', 'armeabi-v7a'}, 'published App architecture scope differs')
-    run(['node', ROOT / 'scripts/release-assets.mjs', 'abis', apk, abi], cwd=ROOT)
+    pins = {name: {'bytes': row['bytes'], 'sha256': row['sha256']}
+            for name, row in receipt['output']['nativeLibraries'].items()}
+    payload = json.loads(run(['node', ROOT / 'scripts/verify-apk.mjs', '--sdk-payload', apk, abi,
+                              json.dumps(pins)], cwd=ROOT))
     run(['node', ROOT / 'scripts/assert-r8-evidence.mjs', r8], cwd=ROOT)
-    for target in selected:
+    for target in payload['selectedABIs']:
         run(['node', ROOT / 'scripts/verify-apk.mjs', apk, '--abi', target], cwd=ROOT)
-    with zipfile.ZipFile(apk) as archive:
-        zip_entries(archive)
-        embedded = {n.split('/')[1]: sha(archive.read(n)) for n in archive.namelist()
-                    if re.fullmatch(r'lib/[^/]+/libbox\.so', n)}
-        require(set(embedded) == set(selected), 'APK embedded SDK ABI inventory differs')
-        for target in selected:
-            require(embedded[target] == receipt['output']['nativeLibraries']['jni/' + target + '/libbox.so']['sha256'],
-                    'APK native bytes differ from verified original AAR')
-        runtime = {}
-        for name, original in receipt['output']['nativeLibraries'].items():
-            if name.split('/')[1] in selected:
-                destination = name.replace('jni/', 'lib/', 1)
-                require(destination in archive.namelist() and sha(archive.read(destination)) == original['sha256'],
-                        'APK lost/changed a same-package SDK runtime input')
-                runtime[destination] = original['sha256']
     require(app_identity() == current and read_receipt(input_path) == material,
             'consumer input changed during final carrier inspection')
     return {'schema': 'polaris-mobile-android-carrier-v1', 'App': current,
             'producerCandidate': receipt['input']['producer']['candidate'],
             'componentFingerprint': receipt['fingerprint'], 'componentReceiptSha256': file_pin(receipt_path)['sha256'],
-            'apk': file_pin(apk), 'selectedABIs': selected, 'embeddedLibboxSha256': embedded,
-            'embeddedRuntimeSha256': runtime,
+            'apk': file_pin(apk), **payload,
             'r8Files': {p.relative_to(r8).as_posix(): file_pin(p) for p in Path(r8).rglob('*') if p.is_file()},
             'AppCarrierValidated': True, 'AppAccepted': False, 'devicePassed': False, 'signatureTrustValidated': False}
 

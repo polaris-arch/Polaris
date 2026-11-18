@@ -30,6 +30,7 @@ import {
   parseZipEntries,
   permissionViolations,
   strippedReport,
+  verifySdkPayload,
   zipOverheadBound,
 } from './verify-apk.mjs';
 
@@ -410,6 +411,49 @@ function hits(violations, needle) {
 function oneEntryZip(name, method = 8) {
   return fixtureZip([{ name, data: 'native-library-payload'.repeat(8), method }]);
 }
+
+test('formal APK SDK payload matches selected AAR bytes and preserves the carrier receipt fields', () => {
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'polaris-apk-sdk-'));
+  const apk = join(fixture.path, 'app.apk');
+  const selectedABIs = ['arm64-v8a', 'armeabi-v7a'];
+  const libraries = ['libbox.so', 'libpolaris_lib.so', 'libc++_shared.so', 'libsupport.so'];
+  const entries = selectedABIs.flatMap((abi) => libraries.map((library) => {
+    const name = `lib/${abi}/${library}`;
+    return { name, data: name, method: 8 };
+  }));
+  const embeddedRuntimeSha256 = Object.fromEntries(entries
+    .filter(({ name }) => /\/(libbox|libsupport)\.so$/.test(name))
+    .map(({ name, data }) => [name, createHash('sha256').update(data).digest('hex')]));
+  const embeddedLibboxSha256 = Object.fromEntries(selectedABIs.map((abi) => [abi, embeddedRuntimeSha256[`lib/${abi}/libbox.so`]]));
+  const pins = Object.fromEntries(Object.entries(embeddedRuntimeSha256).map(([name, sha256]) => [
+    name.replace(/^lib\//, 'jni/'), { bytes: Buffer.byteLength(name), sha256 },
+  ]));
+  pins['jni/x86/libbox.so'] = { bytes: 12, sha256: '0'.repeat(64) };
+  writeFileSync(apk, fixtureZip(entries));
+  const script = fileURLToPath(new URL('./verify-apk.mjs', import.meta.url));
+  const child = spawnSync(process.execPath, [script, '--sdk-payload', apk, 'universal', JSON.stringify(pins)], { encoding: 'utf8' });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), { selectedABIs, embeddedLibboxSha256, embeddedRuntimeSha256 });
+
+  const verify = (rows, flavor = 'universal') => {
+    writeFileSync(apk, fixtureZip(rows));
+    return verifySdkPayload(apk, flavor, pins);
+  };
+  assert.throws(() => verify(entries, 'arm64-v8a'), /actual ABI set differs/);
+  assert.throws(() => verify(entries.filter(({ name }) => !name.endsWith('/libsupport.so'))), /missing.*libsupport/);
+  const changed = entries.map((entry) => entry.name === 'lib/armeabi-v7a/libsupport.so'
+    ? { ...entry, data: 'x'.repeat(entry.data.length) } : entry);
+  assert.throws(() => verify(changed), /native bytes differ.*libsupport/);
+  assert.throws(() => verify([...entries, entries[0]]), /duplicate entry/);
+  assert.throws(() => verify([...entries, { name: '../outside', data: 'fixture' }]), /unsafe APK ZIP member/);
+
+  const badCrc = fixtureZip(entries);
+  const central = badCrc.readUInt32LE(badCrc.length - 6);
+  badCrc.writeUInt32LE(0, central + 16);
+  writeFileSync(apk, badCrc);
+  assert.throws(() => verifySdkPayload(apk, 'universal', pins), /size or CRC differs/);
+});
 
 test('native ZIP metadata accepts DEFLATE at an unaligned data offset and rejects STORE', () => {
   const name = `lib/${ABI}/libpolaris_lib.so`;

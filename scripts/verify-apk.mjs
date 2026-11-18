@@ -72,10 +72,13 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, readSync, statSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseZipEntries } from './lib/zip-archive.mjs';
+import { crc32, inflateRawSync } from 'node:zlib';
+import { parseZipEntries, readZipEntries } from './lib/zip-archive.mjs';
+import { verifyAbiNames } from './release-assets.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -1072,7 +1075,66 @@ function readMemberUncached(apk, name) {
   return execFileSync('unzip', ['-p', apk, name], { maxBuffer: 1024 * 1024 * 1024 });
 }
 
+// The source consumer supplies pins from its revalidated original AAR receipt.
+export function verifySdkPayload(apk, flavor, nativePins) {
+  const fd = openSync(apk, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const file = fstatSync(fd);
+    if (!file.isFile() || file.size === 0 || file.size > 1024 ** 3) throw new Error('bounded regular APK required');
+    const read = (offset, length) => {
+      const bytes = Buffer.allocUnsafe(length);
+      if (readSync(fd, bytes, 0, length, offset) !== length) throw new Error('truncated APK ZIP bytes');
+      return bytes;
+    };
+    const entries = readZipEntries(file.size, read, { zip64: true, maxEntries: 65536 });
+    const selectedABIs = verifyAbiNames([...entries.keys()], flavor);
+    let expandedBytes = 0;
+    for (const [name, entry] of entries) {
+      if (name.startsWith('/') || /[\\\0]/.test(name) || name.split('/').includes('..')
+        || (entry.flags & 1) || (entry.mode & 0o170000) === 0o120000) {
+        throw new Error('unsafe APK ZIP member');
+      }
+      expandedBytes += entry.uncompressedSize;
+      if (expandedBytes > 2 * 1024 ** 3) throw new Error('expanded APK ZIP too large');
+    }
+
+    const embeddedRuntimeSha256 = {};
+    for (const [source, expected] of Object.entries(nativePins)) {
+      const match = /^jni\/([^/]+)\/([^/]+\.so)$/.exec(source);
+      if (!match) throw new Error(`invalid AAR SDK member pin: ${source}`);
+      const [, abi, library] = match;
+      if (!selectedABIs.includes(abi)) continue;
+      const name = `lib/${abi}/${library}`;
+      const entry = entries.get(name);
+      if (!entry || ![0, 8].includes(entry.method)) throw new Error(`missing or unsupported APK SDK member: ${name}`);
+      if (entry.uncompressedSize !== expected.bytes) throw new Error(`APK SDK member size differs: ${name}`);
+      const packed = read(entry.dataOffset, entry.compressedSize);
+      const bytes = entry.method === 0 ? packed : inflateRawSync(packed, { maxOutputLength: expected.bytes + 1 });
+      if (bytes.length !== expected.bytes || crc32(bytes) !== entry.crc32) {
+        throw new Error(`APK SDK member size or CRC differs: ${name}`);
+      }
+      const actual = createHash('sha256').update(bytes).digest('hex');
+      if (actual !== expected.sha256) throw new Error(`APK native bytes differ from verified original AAR: ${name}`);
+      embeddedRuntimeSha256[name] = actual;
+    }
+    const embeddedLibboxSha256 = Object.fromEntries(selectedABIs.map((abi) => {
+      const digest = embeddedRuntimeSha256[`lib/${abi}/libbox.so`];
+      if (!digest) throw new Error(`verified original AAR has no libbox pin for: ${abi}`);
+      return [abi, digest];
+    }));
+    return { selectedABIs, embeddedLibboxSha256, embeddedRuntimeSha256 };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function main() {
+  if (process.argv[2] === '--sdk-payload') {
+    const [, , , apk, flavor, pins] = process.argv;
+    if (process.argv.length !== 6) throw new Error('usage: verify-apk.mjs --sdk-payload <apk> <flavor> <native pins JSON>');
+    console.log(JSON.stringify(verifySdkPayload(apk, flavor, JSON.parse(pins))));
+    return;
+  }
   let apk;
   let abi;
   try {
