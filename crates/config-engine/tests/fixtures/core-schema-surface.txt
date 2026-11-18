@@ -1620,6 +1620,7 @@ Inbound[tun].include_uid_range
 Inbound[tun].interface_name
 Inbound[tun].iproute2_rule_index
 Inbound[tun].iproute2_table_index
+Inbound[tun].linux_resolved_external
 Inbound[tun].loopback_address
 Inbound[tun].mtu
 Inbound[tun].multi_queue
