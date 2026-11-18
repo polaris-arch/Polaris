@@ -355,8 +355,12 @@ impl ResolvedDnsOps for ResolvectlDnsOps {
             .owned_link
             .lock()
             .map_err(|_| "resolved owner poisoned")?;
-        if owner.as_ref().is_some_and(|owned| owned.link != expected.0) {
-            return Err("resolved link belongs to a different retained owner".into());
+        if let Some(previous) = owner.as_ref().filter(|owned| owned.link != expected.0) {
+            if !enabled || !self.runner.link_gone(&previous.link)? {
+                return Err("resolved link belongs to a different retained owner".into());
+            }
+            // The retained settings belong to the retired kernel object.
+            *owner = None;
         }
         if let Some(owned) = owner.as_ref() {
             if !owned.footprint.contains(&expected.1) {

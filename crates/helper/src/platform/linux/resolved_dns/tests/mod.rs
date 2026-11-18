@@ -8,6 +8,7 @@ struct MockRunner {
 struct MockResolvedState {
     exists: bool,
     link: LinkIdentity,
+    retired_link: Option<LinkIdentity>,
     settings: Settings,
     baseline: Settings,
     calls: Vec<Vec<String>>,
@@ -36,6 +37,7 @@ impl MockRunner {
                     netns_inode: 9,
                     tun_flags: 1,
                 },
+                retired_link: None,
                 settings: baseline.clone(),
                 baseline,
                 calls: vec![],
@@ -78,7 +80,8 @@ impl ResolvectlRunner for MockRunner {
     }
     fn link_gone(&self, expected: &LinkIdentity) -> Result<bool, String> {
         let state = self.state.lock().unwrap();
-        Ok(!state.exists && expected == &state.link)
+        Ok((!state.exists && expected == &state.link)
+            || state.retired_link.as_ref() == Some(expected))
     }
     fn pin_link(&self, expected: &LinkIdentity) -> Result<std::fs::File, String> {
         assert_eq!(expected, &self.state.lock().unwrap().link);
@@ -257,6 +260,37 @@ fn checked_revert_rejects_successor_and_foreign_values_but_accepts_original_obje
     ops.revert(TUN_INTERFACE_NAME).unwrap();
     assert_eq!(runner.mutations().len(), before);
     assert!(ops.owned_link.lock().unwrap().is_none());
+}
+
+#[test]
+fn checked_takeover_retires_only_an_absent_owner_before_admitting_the_new_link() {
+    let runner = MockRunner::healthy();
+    let ops = runner.ops();
+    let (original, _) = ops.snapshot().unwrap();
+    ops.takeover(TUN_INTERFACE_NAME, CONTROLLED_DNS_IP).unwrap();
+    {
+        let mut state = runner.state.lock().unwrap();
+        state.link.sysfs_inode += 1;
+        state.settings = state.baseline.clone();
+    }
+    let successor = ops.snapshot().unwrap();
+    let mutation_count = runner.mutations().len();
+    assert!(ops.compare(&successor, true).is_err());
+    assert_eq!(runner.mutations().len(), mutation_count);
+
+    {
+        let mut state = runner.state.lock().unwrap();
+        state.retired_link = Some(original);
+        state.settings.servers = vec!["192.0.2.1".into()];
+    }
+    let configured_successor = ops.snapshot().unwrap();
+    assert!(ops.compare(&configured_successor, true).is_err());
+    assert_eq!(runner.mutations().len(), mutation_count);
+    runner.state.lock().unwrap().settings = successor.1.clone();
+
+    let (_, settings) = ops.compare(&successor, true).unwrap();
+    assert!(settings.controlled());
+    assert_eq!(ops.original_settings(), Some(successor.1));
 }
 
 #[test]
