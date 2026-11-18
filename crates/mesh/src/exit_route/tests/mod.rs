@@ -8,7 +8,7 @@ type RouteLog = Vec<(String, String, Vec<String>)>; // (op, iface, cidrs)
 #[derive(Default, Clone)]
 struct MockOp {
     routes: Arc<Mutex<RouteLog>>,
-    utuns: Arc<Mutex<HashSet<String>>>,
+    utuns: Arc<Mutex<Option<HashSet<String>>>>,
     tailnet_iface: Arc<Mutex<Option<String>>>,
     route_ok: Arc<Mutex<bool>>,
     /// 记录 `find_tailnet_iface` 最近一次收到的 baseline（验证时序 diff 锚点确被 apply 透传）。
@@ -42,7 +42,7 @@ impl ExitRouteOp for MockOp {
             .push((op.to_string(), iface.to_string(), cidrs.to_vec()));
         *self.route_ok.lock().unwrap()
     }
-    async fn list_utuns(&self) -> HashSet<String> {
+    async fn list_utuns(&self) -> Option<HashSet<String>> {
         self.utuns.lock().unwrap().clone()
     }
     async fn find_tailnet_iface(
@@ -414,15 +414,15 @@ async fn clear_macos_skips_delete_when_iface_gone() {
     let op = MockOp::default();
     *op.route_ok.lock().unwrap() = true;
     *op.tailnet_iface.lock().unwrap() = Some("utun9".to_string());
-    op.utuns.lock().unwrap().insert("utun9".to_string());
+    *op.utuns.lock().unwrap() = Some(HashSet::from(["utun9".to_string()]));
     let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Mac);
     reconcile_now(&mut mgr, &cfg, false).await;
     assert_eq!(mgr.installed().unwrap().iface, "utun9");
     op.routes.lock().unwrap().clear();
     // 模拟停核：utun9 消失。
-    op.utuns.lock().unwrap().clear();
-    mgr.clear().await;
+    *op.utuns.lock().unwrap() = Some(HashSet::new());
+    assert!(mgr.clear().await);
     assert!(mgr.installed().is_none());
     // 未发 route del（接口已消失→跳过）。
     assert!(op.routes.lock().unwrap().is_empty());
@@ -433,13 +433,17 @@ async fn clear_macos_deletes_when_iface_still_present() {
     let op = MockOp::default();
     *op.route_ok.lock().unwrap() = true;
     *op.tailnet_iface.lock().unwrap() = Some("utun9".to_string());
-    op.utuns.lock().unwrap().insert("utun9".to_string());
+    *op.utuns.lock().unwrap() = Some(HashSet::from(["utun9".to_string()]));
     let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Mac);
     reconcile_now(&mut mgr, &cfg, false).await;
     op.routes.lock().unwrap().clear();
-    // utun9 仍在 → clear 发 route del。
-    mgr.clear().await;
+    let present = op.utuns.lock().unwrap().take();
+    assert!(!mgr.clear().await);
+    assert!(op.routes.lock().unwrap().is_empty());
+    // 枚举恢复后，仍能按原 utun 删除。
+    *op.utuns.lock().unwrap() = present;
+    assert!(mgr.clear().await);
     assert!(mgr.installed().is_none());
     assert!(op.routes.lock().unwrap().iter().any(|r| r.0 == "del"));
 }
@@ -473,13 +477,17 @@ async fn reassert_macos_reinstalls_when_iface_disappeared() {
     let op = MockOp::default();
     *op.route_ok.lock().unwrap() = true;
     *op.tailnet_iface.lock().unwrap() = Some("utun9".to_string());
-    op.utuns.lock().unwrap().insert("utun9".to_string());
+    *op.utuns.lock().unwrap() = Some(HashSet::from(["utun9".to_string()]));
     let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Mac);
     reconcile_now(&mut mgr, &cfg, false).await;
     op.routes.lock().unwrap().clear();
+    *op.utuns.lock().unwrap() = None;
+    assert!(!reassert_now(&mut mgr, &cfg, false).await.changed);
+    assert_eq!(mgr.installed().unwrap().iface, "utun9");
+    assert!(op.routes.lock().unwrap().is_empty());
     // utun9 消失 → reassert 复位重装（find_tailnet_iface 仍返 utun9）。
-    op.utuns.lock().unwrap().clear();
+    *op.utuns.lock().unwrap() = Some(HashSet::new());
     let out = reassert_now(&mut mgr, &cfg, false).await;
     assert!(out.changed);
     assert!(mgr.installed().is_some());
@@ -505,7 +513,7 @@ async fn snapshot_baseline_is_threaded_to_apply_find_iface() {
     let op = MockOp::default();
     *op.route_ok.lock().unwrap() = true;
     *op.tailnet_iface.lock().unwrap() = Some("utun9".to_string());
-    op.utuns.lock().unwrap().insert("utun3".to_string()); // 基线快照读到 {utun3}
+    *op.utuns.lock().unwrap() = Some(HashSet::from(["utun3".to_string()])); // 基线快照读到 {utun3}
     let cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Mac);
     mgr.snapshot_baseline().await; // baseline = {utun3}

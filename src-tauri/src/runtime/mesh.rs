@@ -1493,7 +1493,7 @@ const LINUX_EXIT_RULE_PRIORITY: &str = "7732";
 /// - **Windows**：`MeshExitRouteManager` 入口已 no-op（禁 System），本 op 不到达该分派。
 ///
 /// **`enabled` 闸门**：`false`（`MeshRuntime::new` 测试/未接线默认，`helper=None`）→ 三方法诚实 no-op
-/// （`run_route`→false / `find_tailnet_iface`→None / `list_utuns`→空），**绝不 spawn 任何进程**（本机 Linux
+/// （`run_route`→false / `find_tailnet_iface`→None / `list_utuns`→None），**绝不 spawn 任何进程**（本机 Linux
 /// 开发/单测安全，杜绝改宿主网络）。`true`（`MeshRuntime::new_with_helper` 生产）→ 真 OS 手术。
 struct HelperExitRouteOp {
     /// mac/win route 手术经此 helper（root/SYSTEM `route -ifscope`）。Linux 不用（直接 `ip`）；禁用态 = None。
@@ -1596,14 +1596,13 @@ impl ExitRouteOp for HelperExitRouteOp {
         }
     }
 
-    async fn list_utuns(&self) -> HashSet<String> {
+    async fn list_utuns(&self) -> Option<HashSet<String>> {
         if !self.enabled || self.platform != Platform::Mac {
-            return HashSet::new(); // 仅 macOS 有动态 utun 需快照；禁用态一律空
+            return None;
         }
-        match run_command_stdout("ifconfig", &["-l"]).await {
-            Some(out) => parse_utun_list(&out),
-            None => HashSet::new(),
-        }
+        run_command_stdout("ifconfig", &["-l"])
+            .await
+            .map(|out| parse_utun_list(&out))
     }
 
     async fn find_tailnet_iface(
@@ -2000,7 +1999,9 @@ async fn run_command_stdout(program: &str, args: &[&str]) -> Option<String> {
         .output()
         .await
         .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// 出口路由日志：转发到 `log` crate（对齐 [`LogWarpLog`] 的 info/warn/error 最小面）。

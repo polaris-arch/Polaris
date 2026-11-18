@@ -280,7 +280,7 @@ impl ExitRouteCancel {
 /// 实现方负责：
 /// - macOS：`route add/del -ifscope <iface> -net <cidr>` 经 helper(root)；
 /// - Linux：独立表 7732 + oif 规则，`ip route/rule`（CAP_NET_ADMIN，app 自身）；
-/// - `list_utuns`：macOS ifconfig -l 解析（其它平台返回空集）；
+/// - `list_utuns`：macOS ifconfig -l 解析（未枚举返回 None）；
 /// - `find_tailnet_iface`：macOS 按时序 diff + tailnet 100.x 地址反查 utun；其它平台返逻辑名。
 ///
 /// 全部永不 panic（Polaris 一致：catch→忽略/日志）。本 crate 消费 bool / Option。
@@ -289,8 +289,8 @@ pub trait ExitRouteOp: Send + Sync {
     /// 装/删路由。返回 ok=true 表成功。op="add"|"del"。
     async fn run_route(&self, op: &str, iface: &str, cidrs: &[String]) -> bool;
 
-    /// 列出当前 utun 接口名集合（macOS；其它平台返空）。上游 `listUtuns`。
-    async fn list_utuns(&self) -> HashSet<String>;
+    /// 列出当前 utun 接口名集合；未枚举或查询失败返 None。上游 `listUtuns`。
+    async fn list_utuns(&self) -> Option<HashSet<String>>;
 
     /// 反查 TS 内核接口名。macOS = 按时序 diff+tailnet 地址反查；其它平台返 logical_name 本身。
     /// 返 None = 未找到（上游 `resolveIface` 轮询超时）。
@@ -391,7 +391,7 @@ where
         if self.platform != Platform::Mac {
             return;
         }
-        self.baseline_utuns = Some(self.op.list_utuns().await);
+        self.baseline_utuns = self.op.list_utuns().await;
     }
 
     /// 对齐到目标态：起核就绪 / 切节点 / 切模式后调用（fire-and-forget，绝不抛）。
@@ -528,8 +528,12 @@ where
         // macOS：installed.iface 是否已消失。
         if self.platform == Platform::Mac {
             if let Some(cur) = &self.installed {
-                let utuns = self.op.list_utuns().await;
-                if !utuns.contains(&cur.iface) {
+                if self
+                    .op
+                    .list_utuns()
+                    .await
+                    .is_some_and(|utuns| !utuns.contains(&cur.iface))
+                {
                     self.log.log(
                         "info",
                         &format!("出口路由重申:接口 {} 已不在 → 复位重装", cur.iface),
@@ -556,18 +560,18 @@ where
 
     /// clear 的核心逻辑（含 macOS BUG2 防误删：接口已消失 → 跳过 route delete）。
     async fn clear_inner(&mut self) -> bool {
-        let cur = match self
-            .cleanup_pending
-            .take()
-            .or_else(|| self.installed.take())
-        {
-            Some(c) => c,
-            None => return true,
+        self.reset_state();
+        let Some(cur) = self.cleanup_pending.as_ref() else {
+            return true;
         };
         // macOS BUG2 防误删：停核时 sing-box 拆除 TS utun，其 ifscope 路由随接口自动消失。此时若再对
         // 已不存在的 iface 发 route delete，macOS 会落到 main 表、误删主 TUN 的拆半默认。故接口已消失 → 跳过。
         if self.platform == Platform::Mac {
-            let utuns = self.op.list_utuns().await;
+            let Some(utuns) = self.op.list_utuns().await else {
+                self.log
+                    .log("warn", "出口路由清理:无法确认 utun 接口清单,保留待核路由");
+                return false;
+            };
             if !utuns.contains(&cur.iface) {
                 self.log.log(
                     "info",
@@ -576,6 +580,7 @@ where
                         cur.iface
                     ),
                 );
+                self.cleanup_pending = None;
                 return true;
             }
         }
@@ -585,17 +590,17 @@ where
                 "info",
                 &format!("出口路由已清理: {} {}", cur.iface, cur.cidrs.join(",")),
             );
+            self.cleanup_pending = None;
         } else {
             self.log.log(
                 "warn",
                 &format!("出口路由清理失败(best-effort): {}", cur.iface),
             );
-            self.cleanup_pending = Some(cur);
         }
         ok
     }
 
-    /// 崩溃 / giveUp 等非正常拆除的同步内存态复位。上游 `resetState`。
+    /// 拆除前将已装路由移交给可重试的清理状态。崩溃 / giveUp 也走这一步。
     /// 不再把进程消失视为清理证明；移交为待核清理，后续 clear/reconcile 验证并重试。
     pub fn reset_state(&mut self) {
         // Process/interface disappearance does not prove policy rules were removed.

@@ -69,7 +69,7 @@ async fn disabled_exit_route_op_is_honest_noop() {
             .is_none(),
         "禁用 op 反查内核接口恒 None"
     );
-    assert!(op.list_utuns().await.is_empty(), "禁用 op utun 集恒空");
+    assert!(op.list_utuns().await.is_none(), "禁用 op 不采集 utun");
 }
 
 // ── 取消令牌接线（MED：点停止最长卡 18s）────────────────────────────────────────────

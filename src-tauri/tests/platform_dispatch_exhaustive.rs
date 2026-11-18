@@ -514,7 +514,7 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         "src-tauri/src/runtime/mesh.rs",
         "if !self.enabled || self.platform != Platform::Mac",
         1,
-        "list_utuns。Android → 返空集，正确（无 utun 概念）。",
+        "list_utuns。Android → None（无 utun 概念）。",
     ),
     (
         "src-tauri/src/runtime/mesh.rs",
