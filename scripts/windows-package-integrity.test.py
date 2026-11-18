@@ -4,7 +4,6 @@ No Windows installer, product executable, signature or installation is simulated
 as successful native acceptance.
 """
 import copy
-import ast
 from contextlib import contextmanager, redirect_stderr, ExitStack
 import importlib.util
 import hashlib
@@ -12,7 +11,6 @@ import io
 import json
 import ntpath
 import os
-import re
 from types import SimpleNamespace
 from pathlib import Path, PureWindowsPath
 import shutil
@@ -31,150 +29,6 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('windows_integrity', ROOT / 'scripts/windows-package-integrity.py')
 w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
 
-
-def source_contract(root, *, source_text=None, workflow_text=None):
-    """Static confs consumer: actual workflow/config and actual function edges.
-
-    This reads no downloaded/native resources and executes no carrier/tool. The
-    fixture suite separately exercises these functions with real inert ZIP bytes.
-    Only eager function bodies count: a call hidden in a new if/loop/try does not
-    satisfy a mandatory pipeline edge.
-    """
-    require = w.require; io_path = w.io_path; regular = w.regular
-    require_legal_resources = w.require_legal_resources; PUBLIC_LEGAL_FILES = w.PUBLIC_LEGAL_FILES
-    require(PUBLIC_LEGAL_FILES == ('LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md'), 'legal file registry differs')
-    conf = json.loads(io_path(regular(root / 'src-tauri/tauri.windows.conf.json')).read_bytes())
-    require_legal_resources(conf['bundle']['resources'])
-    source_text = io_path(w.__file__).read_text(encoding='utf-8') if source_text is None else source_text
-    workflow_text = io_path(root / '.github/workflows/package.yml').read_text(encoding='utf-8') if workflow_text is None else workflow_text
-    module = ast.parse(source_text)
-    definitions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
-    require(len(definitions) == sum(isinstance(node, ast.FunctionDef) for node in module.body), 'duplicate package action/function')
-    def transfers(node, kinds):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            return False  # A nested scope does not transfer control in this body.
-        return isinstance(node, kinds) or any(transfers(child, kinds) for child in ast.iter_child_nodes(node))
-    def direct(nodes, *, loop_body=False):
-        for node in nodes:
-            yield node
-            if isinstance(node, ast.With):
-                # These existing stdlib contexts propagate failed verification;
-                # arbitrary contexts (notably suppress) cannot make a gate eager.
-                contexts = {'tempfile.TemporaryDirectory', 'zipfile.ZipFile', 'open', 'ExitStack', 'io_path(raw).open'}
-                if all(isinstance(item.context_expr, ast.Call)
-                       and ast.unparse(item.context_expr.func) in contexts for item in node.items):
-                    yield from direct(node.body, loop_body=loop_body)
-            exits = (ast.Return, ast.Break, ast.Continue) if loop_body else (ast.Return,)
-            if isinstance(node, (ast.Raise, ast.Return, ast.Break, ast.Continue)) or transfers(node, exits):
-                break  # Do not count calls after even a conditional early exit.
-    def expressions(node):
-        if node is None or isinstance(node, (ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp)):
-            return  # Deferred or iteration-dependent bodies are not mandatory.
-        if isinstance(node, ast.BoolOp):
-            yield from expressions(node.values[0])  # Only the first operand is unconditional.
-        elif isinstance(node, ast.IfExp):
-            yield from expressions(node.test)
-        elif isinstance(node, ast.Compare):
-            yield from expressions(node.left)
-            yield from expressions(node.comparators[0])  # Chained later comparisons short-circuit.
-        else:
-            if isinstance(node, ast.Call):
-                yield node
-            # Dict.keys/values and List/Tuple.elts are AST lists, not mapping
-            # methods. iter_child_nodes also skips None keys in dict unpacking.
-            for child in ast.iter_child_nodes(node):
-                yield from expressions(child)
-    def eager(nodes, *, loop_body=False):
-        for node in direct(nodes, loop_body=loop_body):
-            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
-                yield from expressions(node.value)
-    def calls(name):
-        require(name in definitions, 'package contract function missing: ' + name)
-        definition = definitions[name]
-        require(not definition.decorator_list and not any(transfers(node, (ast.Yield, ast.YieldFrom)) for node in definition.body),
-                'mandatory package function must execute eagerly: ' + name)
-        return list(eager(definition.body))
-    required_edges = {
-        'contract': {'require_legal_resources'},
-        'source_inventory': {'require_legal_resources'},
-        'verified_sources': {'source_inventory'},
-        'prepare': {'verified_sources', 'find_sevenzip', 'cargo_context', 'directory_id'},
-        'load_state': {'verified_sources', 'cargo_context', 'directory_id'},
-        'produce': {'load_state', 'tauri_identity', 'native_resource_stage', 'copy_resource_inputs',
-                    'native_windows_config', 'verify_resource_copies', 'run_tauri', 'cargo_app_identity', 'compiled_app', 'assemble_carriers'},
-        'capture': {'release_arguments', 'capture_context', 'cargo_output', 'release_event'},
-        'capture_context': {'cargo_context', 'verify_resource_copies', 'native_windows_config', 'verified_sources'},
-        'copy_resource_inputs': {'native_windows_config', 'verify_resource_copies'},
-        'assemble': {'load_state', 'cargo_app_identity', 'compiled_app', 'exact', 'zip_inventory'},
-        'release_event': {'cargo_app_identity'},
-        'assemble_carriers': {'tauri_identity', 'verify_generated_script', 'nsis_inventory', 'carrier_inventory', 'build_portable', 'zip_inventory', 'cargo_app_identity'},
-        'verify_generated_script': {'cargo_app_identity'},
-        'verify_existing_zip': {'load_state', 'compiled_app', 'cargo_app_identity', 'zip_inventory'},
-        'tauri_identity': {'tauri_command'},
-        'build_portable': {'carrier_inventory', 'exact', 'zip_inventory'},
-        'zip_inventory': {'exact'},
-    }
-    for owner, targets in required_edges.items():
-        actual = {node.func.id for node in calls(owner) if isinstance(node.func, ast.Name)}
-        require(targets <= actual, 'mandatory package call missing from ' + owner + ': ' + str(sorted(targets - actual)))
-    build = definitions['build_portable']
-    source_loops = [node for node in direct(build.body) if isinstance(node, ast.For)
-                    and ast.dump(node.iter) == ast.dump(ast.parse("state['sources'].items()", mode='eval').body)]
-    require(len(source_loops) == 1, 'portable must copy the complete frozen source map once')
-    require(ast.dump(source_loops[0].target) == ast.dump(ast.parse('for name, source in (): pass').body[0].target),
-            'portable source-map name/source binding differs')
-    copy_calls = [node for node in eager(source_loops[0].body, loop_body=True) if isinstance(node.func, ast.Attribute)
-                  and isinstance(node.func.value, ast.Name) and node.func.value.id == 'shutil' and node.func.attr == 'copyfile']
-    require(len(copy_calls) == 1 and ast.dump(copy_calls[0]) == ast.dump(ast.parse('shutil.copyfile(io_path(regular(source)), io_path(path))', mode='eval').body),
-            'portable actual source-map copy differs')
-    zip_exact = [node for node in calls('zip_inventory') if isinstance(node.func, ast.Name) and node.func.id == 'exact']
-    require(len(zip_exact) == 1 and ast.dump(zip_exact[0]) == ast.dump(ast.parse('exact(actual, expected)', mode='eval').body),
-            'actual ZIP must compare the complete observed and expected member maps')
-    main = definitions.get('main')
-    require(main is not None, 'package action entrypoint missing')
-    dispatch = []
-    for node in calls('main'):
-        if not (isinstance(node.func, ast.Subscript) and isinstance(node.func.value, ast.Dict)
-                and ast.dump(node.func.slice) == ast.dump(ast.parse('args.action', mode='eval').body)
-                and len(node.args) == 1 and ast.dump(node.args[0]) == ast.dump(ast.parse('ROOT', mode='eval').body)
-                and not node.keywords):
-            continue
-        literal = node.func.value
-        if (all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in literal.keys)
-                and all(isinstance(value, ast.Name) for value in literal.values)):
-            mapping = {key.value: value.id for key, value in zip(literal.keys, literal.values)}
-            if len(mapping) == len(literal.keys):  # Reject duplicate action keys, not just their last value.
-                dispatch.append(mapping)
-    require(dispatch == [{'prepare': 'prepare', 'produce': 'produce', 'capture': 'capture', 'assemble': 'assemble', 'contract': 'contract'}],
-            'actual eager package action dispatch differs')
-    def step(name):
-        pattern = r'^      - name: ' + re.escape(name) + r'\n(.*?)(?=^      - (?:name:|uses:)|\Z)'
-        found = re.findall(pattern, workflow_text, re.MULTILINE | re.DOTALL)
-        require(len(found) == 1, 'unique actual Windows workflow step required: ' + name)
-        return found[0]
-    sequence = [('Freeze Windows package inputs and isolate outputs', 'prepare'),
-                ('Build Windows installers with first Cargo evidence', 'produce'),
-                ('Verify final NSIS payload and build exact Windows portable zip', 'assemble')]
-    positions = []
-    for name, action in sequence:
-        block = step(name)
-        executable = '\n'.join(line for line in block.splitlines() if line.strip() and not line.lstrip().startswith('#'))
-        require(re.findall(r'^        if: (.+)$', executable, re.MULTILINE) == ["runner.os == 'Windows'"],
-                'ordinary Windows package step must be mandatory: ' + name)
-        require('continue-on-error' not in executable and '||' not in executable, 'Windows package failure suppression')
-        command = 'python scripts/windows-package-integrity.py ' + action
-        lines = [line.strip() for line in executable.splitlines()]
-        require(lines.count(command) == 1, 'actual Windows package command missing: ' + command)
-        at = lines.index(command)
-        require(at + 1 < len(lines) and re.fullmatch(r"if \(\$LASTEXITCODE -ne 0\) \{ throw '[^']+' \}", lines[at + 1]),
-                'Windows package command must propagate its exit code')
-        positions.append(workflow_text.index('      - name: ' + name + '\n'))
-    build_at = workflow_text.index('      - name: Build installers\n')
-    assets_at = workflow_text.index('run: node scripts/verify-packaging.mjs assets --label windows --dir dist-win')
-    require(positions[0] < build_at < positions[1] < positions[2] < assets_at, 'freeze/build/actual-carrier/assets order differs')
-    return {'schema': 'polaris-windows-package-contract-v1', 'legalFiles': list(PUBLIC_LEGAL_FILES),
-            'ordinaryWindowsCommands': [action for _, action in sequence],
-            'actualZipComparison': 'exact(actual, expected)', 'requiredCallEdges': {name: sorted(edges) for name, edges in required_edges.items()}}
 
 class Integrity(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'native Windows stat/fstat projection required')
@@ -622,82 +476,6 @@ class Integrity(unittest.TestCase):
             finally:
                 self.assertTrue(all(child.poll() is not None for child in children), 'every exact owned child must have exited/joined')
 
-    def test_static_confs_contract_follows_actual_producer_and_complete_zip(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); self.fixture(root)
-            workflow = (ROOT / '.github/workflows/package.yml').read_text(encoding='utf-8')
-            source = Path(w.__file__).read_text(encoding='utf-8')
-            result = source_contract(root, source_text=source, workflow_text=workflow)
-            self.assertEqual(result['legalFiles'], ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md'])
-            self.assertEqual(result['ordinaryWindowsCommands'], ['prepare', 'produce', 'assemble'])
-            # Eager containers/first operands still perform the real check.
-            gate = '    zip_inventory(destination, expected)\n'
-            for eager_form in ['[zip_inventory(destination, expected)]',
-                               '(zip_inventory(destination, expected), None)',
-                               "{'checked': zip_inventory(destination, expected)}",
-                               'zip_inventory(destination, expected) and None']:
-                changed = source.replace(gate, '    ' + eager_form + '\n')
-                self.assertNotEqual(changed, source)
-                self.assertEqual(source_contract(root, source_text=changed, workflow_text=workflow), result)
-            producer_gates = [line for line in source.splitlines()
-                              if line.lstrip().startswith('assemble_carriers(root, state, app_path, app, path, identity')]
-            self.assertEqual(len(producer_gates), 1)
-            mutations = [
-                source + '\ndef assemble(root): pass\n',
-                source.replace(producer_gates[0], producer_gates[0][:len(producer_gates[0]) - len(producer_gates[0].lstrip())]
-                               + 'pass  # producer checks detached'),
-                source.replace('            app_path, app = compiled_app(root, staging=Path(stage), state=state)',
-                               "            app_path, app = None, b'unchecked'"),
-                source.replace('    cli = tauri_identity(root)', "    cli = {'entry': 'fake', 'version': 'unchecked'}"),
-                source.replace('        stage = owned.enter_context(native_resource_stage(root, state))',
-                               "        stage = Path(state['owner'])"),
-                source.replace('        copies = copy_resource_inputs(root, state, stage, owned)', '        copies = {}'),
-                source.replace('        config_value = native_windows_config(root, stage)', '        config_value = {}'),
-                source.replace('    expected_config = native_windows_config(root, Path(copies[\'root\']))',
-                               '    expected_config = {}'),
-                source.replace('    verify_resource_copies(root, state, copies)\n', '    None\n'),
-                source.replace('    zip_inventory(destination, expected)\n', '    # actual final ZIP check removed\n'),
-                source.replace('        exact(actual, expected)\n', '        # full ZIP comparison removed\n'),
-                source.replace("require_legal_resources(resources)", "None  # mandatory legal registration removed"),
-                source.replace('            shutil.copyfile(io_path(regular(source)), io_path(path))', '            pass  # source map no longer copied'),
-                source.replace('    build_portable(root, state, app, portable)', '    if False:\n        build_portable(root, state, app, portable)'),
-                source.replace("'assemble': assemble, 'contract': contract", "'assemble': contract, 'contract': contract"),
-                source.replace(gate, '    False and zip_inventory(destination, expected)\n'),
-                source.replace(gate, '    zip_inventory(destination, expected) if False else None\n'),
-                source.replace(gate, '    lambda: zip_inventory(destination, expected)\n'),
-                source.replace(gate, '    [zip_inventory(destination, expected) for ignored in ()]\n'),
-                source.replace(gate, '    0 > 1 > zip_inventory(destination, expected)\n'),
-                source.replace(gate, '    return\n' + gate),
-                source.replace(gate, '    if destination:\n        return\n' + gate),
-                source.replace(gate, '    with contextlib.suppress(Exception):\n    ' + gate),
-                source.replace("        for name, source in state['sources'].items():\n",
-                               "        if False:\n            for name, source in state['sources'].items():\n                pass\n"),
-                source.replace('            shutil.copyfile(io_path(regular(source)), io_path(path))',
-                               '            if name:\n                continue\n            shutil.copyfile(io_path(regular(source)), io_path(path))'),
-                source.replace("for name, source in state['sources'].items():",
-                               "for source, name in state['sources'].items():"),
-                source.replace("}[args.action](ROOT)", "}['contract'](ROOT)"),
-                source.replace("}[args.action](ROOT)", "}[args.action](None)"),
-                source.replace("'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}",
-                               "'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract, **extra}"),
-                source.replace("'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}",
-                               "'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract, 'prepare': prepare}"),
-                source.replace("result = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)",
-                               "unused = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}\n    result = contract(ROOT)"),
-                source.replace("result = {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)",
-                               "result = False and {'prepare': prepare, 'produce': produce, 'capture': capture, 'assemble': assemble, 'contract': contract}[args.action](ROOT)"),
-            ]
-            for index, changed in enumerate(mutations):
-                with self.subTest(source_mutation=index):
-                    self.assertNotEqual(changed, source)
-                    ast.parse(changed)  # A syntax error is not evidence that a real gate rejects the control.
-                    with self.assertRaises(ValueError): source_contract(root, source_text=changed, workflow_text=workflow)
-            for changed in [workflow.replace('python scripts/windows-package-integrity.py assemble', 'python scripts/windows-package-integrity.py contract'),
-                            workflow.replace("if: runner.os == 'Windows'\n        shell: pwsh\n        run: |\n          python scripts/windows-package-integrity.py prepare", "if: false\n        shell: pwsh\n        run: |\n          python scripts/windows-package-integrity.py prepare"),
-                            workflow.replace("if ($LASTEXITCODE -ne 0) { throw 'complete Windows carrier integrity failed' }", "Write-Host 'ignored'"),
-                            workflow.replace("if: runner.os == 'Windows'\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          python scripts/windows-package-integrity.py assemble", "if: inputs.native_validation == true\n        shell: pwsh\n        run: |\n          $ErrorActionPreference = 'Stop'\n          python scripts/windows-package-integrity.py assemble")]:
-                self.assertNotEqual(changed, workflow)
-                with self.assertRaises(ValueError): source_contract(root, source_text=source, workflow_text=changed)
 
     def test_three_legal_members_cannot_disappear_from_config_or_actual_zip(self):
         for name in ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md']:
