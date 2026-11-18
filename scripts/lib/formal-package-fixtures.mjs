@@ -4,7 +4,8 @@ import { cpSync, mkdirSync, copyFileSync, writeFileSync, mkdtempSync, rmSync } f
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { crc32, deflateRawSync } from 'node:zlib';
+import { createRequire } from 'node:module';
+import { crc32, deflateRawSync, gzipSync } from 'node:zlib';
 
 export function fixtureZip(entries) {
   const localEntries = [], centralEntries = [];
@@ -42,6 +43,17 @@ export function fixtureZip(entries) {
   eocd.writeUInt32LE(central.length, 12);
   eocd.writeUInt32LE(offset, 16);
   return Buffer.concat([...localEntries, central, eocd]);
+}
+export function fixtureTar(entries) {
+  const { Header, Pax } = createRequire(new URL('../../ui/package.json', import.meta.url))('tar');
+  const blocks = [];
+  for (const { name, data = '', mode = 0o644, type = 'File', linkpath = '' } of entries) {
+    const payload = Buffer.from(data);
+    const header = new Header({ path: name, size: payload.length, mode, type, linkpath });
+    if (header.encode()) blocks.push(new Pax({ path: name, size: payload.length, mode, linkpath }).encode());
+    blocks.push(header.block, payload, Buffer.alloc((512 - payload.length % 512) % 512));
+  }
+  return gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
 }
 export function copyPackagingSource(original, root) {
   mkdirSync(join(root, 'scripts'), { recursive: true });

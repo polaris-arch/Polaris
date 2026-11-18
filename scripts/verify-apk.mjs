@@ -75,6 +75,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseZipEntries } from './lib/zip-archive.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -257,48 +258,7 @@ export function deadByteReport({ names, fileSize, entriesCompressedTotal }) {
 }
 
 /** APK uses ordinary ZIP entries; compare both headers instead of trusting a textual listing. */
-export function parseZipEntries(buf) {
-  const need = (ok, why) => { if (!ok) throw new Error(`APK ZIP: ${why}`); };
-  let eocd = -1;
-  for (let p = buf.length - 22; p >= Math.max(0, buf.length - 22 - 65535); p--) {
-    if (buf.readUInt32LE(p) === 0x06054b50 && p + 22 + buf.readUInt16LE(p + 20) === buf.length) {
-      eocd = p;
-      break;
-    }
-  }
-  need(eocd >= 0, 'EOCD missing or truncated');
-  need(buf.readUInt16LE(eocd + 4) === 0 && buf.readUInt16LE(eocd + 6) === 0, 'split ZIP is unsupported');
-  const count = buf.readUInt16LE(eocd + 10);
-  const size = buf.readUInt32LE(eocd + 12);
-  const start = buf.readUInt32LE(eocd + 16);
-  need(count !== 0xffff && size !== 0xffffffff && start !== 0xffffffff, 'ZIP64 is unsupported for APK');
-  need(count === buf.readUInt16LE(eocd + 8) && start + size <= eocd, 'central directory bounds differ');
-  const entries = new Map();
-  let p = start;
-  for (let i = 0; i < count; i++) {
-    need(p + 46 <= start + size && buf.readUInt32LE(p) === 0x02014b50, 'central entry missing or truncated');
-    const nameLength = buf.readUInt16LE(p + 28);
-    const length = 46 + nameLength + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32);
-    need(p + length <= start + size, 'central entry extends beyond directory');
-    const nameBytes = buf.subarray(p + 46, p + 46 + nameLength);
-    const name = nameBytes.toString('utf8');
-    need(!entries.has(name), `duplicate entry ${name}`);
-    const local = buf.readUInt32LE(p + 42);
-    const method = buf.readUInt16LE(p + 10);
-    const compressedSize = buf.readUInt32LE(p + 20);
-    const uncompressedSize = buf.readUInt32LE(p + 24);
-    need(local + 30 <= start && buf.readUInt32LE(local) === 0x04034b50, `${name}: local header missing`);
-    const localNameLength = buf.readUInt16LE(local + 26);
-    const dataOffset = local + 30 + localNameLength + buf.readUInt16LE(local + 28);
-    need(dataOffset + compressedSize <= start, `${name}: data extends beyond central directory`);
-    need(buf.readUInt16LE(local + 8) === method && localNameLength === nameLength &&
-      buf.subarray(local + 30, local + 30 + localNameLength).equals(nameBytes), `${name}: local and central headers differ`);
-    entries.set(name, { method, compressedSize, uncompressedSize, dataOffset });
-    p += length;
-  }
-  need(p === start + size, 'central directory length differs');
-  return entries;
-}
+export { parseZipEntries };
 
 /**
  * `.so` 里被认定为「调试信息」的节区名前缀。两种拼写都要：

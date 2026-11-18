@@ -10,12 +10,15 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { gzipSync } from 'node:zlib';
 import { digest } from './source-graph.mjs';
 import { consumeRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, verifyPackagedRelease,
   verifyReleaseCore, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
+import { fixtureTar, fixtureZip } from '../lib/formal-package-fixtures.mjs';
+import { extractNativeArchive } from './release-archive.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const PYTHON = process.platform === 'win32' ? 'python' : 'python3';
@@ -39,7 +42,7 @@ function metadata(row) {
     + Object.entries(g.settings).map(([k, v]) => `\tbuild\t${k}=${v}\n`).join('');
 }
 function fixture(options = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'polaris-release-fixture-'));
+  const root = fs.realpathSync(mkdtempSync(join(tmpdir(), 'polaris-release-fixture-')));
   const transport = new Map(), calls = [], displays = {};
   const repository = 'polaris-arch/sing-box-polaris', goVersion = 'go1.26.8';
   const legal = (path, content) => ({ path, content, bytes: Buffer.byteLength(content), sha256: digest(content) });
@@ -64,19 +67,12 @@ function fixture(options = {}) {
     if (t.sidecar) files[t.sidecar] = sidecarBytes;
     files.SHA256SUMS = Buffer.from(Object.keys(files).sort().map((n) => `${digest(files[n])}  ${n}\n`).join(''));
     const archiveFile = join(root, 'inputs', rootName + t.suffix);
-    write(join(root, 'members.json'), encode(Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, b.toString('base64')]))));
     mkdirSync(dirname(archiveFile), { recursive: true });
-    execFileSync(PYTHON, ['-B', '-c', `import base64,io,json,sys,tarfile,zipfile
-members=json.load(open(sys.argv[1])); path=sys.argv[2]; zip_mode=int(sys.argv[3]); core_mode=int(sys.argv[4])
-if path.endswith('.zip'):
- with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as z:
-  for name,value in members.items():
-   info=zipfile.ZipInfo(name);info.external_attr=((core_mode if name.endswith('/sing-box.exe') else 0) or zip_mode or (0o100755 if name.endswith('sing-box.exe') else 0o100644))<<16;z.writestr(info,base64.b64decode(value))
-else:
- with tarfile.open(path,'w:gz') as z:
-  for name,value in members.items():
-   b=base64.b64decode(value);info=tarfile.TarInfo(name);info.size=len(b);info.mode=0o755 if name.endswith('/sing-box') else 0o644;z.addfile(info,io.BytesIO(b))
-`, join(root, 'members.json'), archiveFile, String(options.windowsZipMode ?? 0), String(options.windowsCoreMode ?? 0)]);
+    const entries = Object.entries(files).map(([name, data]) => ({ name: rootName + '/' + name, data,
+      mode: t.suffix === '.zip' ? (name === 'sing-box.exe' && options.windowsCoreMode)
+        || options.windowsZipMode || (name === 'sing-box.exe' ? 0o100755 : 0o100644)
+        : name === 'sing-box' ? 0o755 : 0o644 }));
+    writeFileSync(archiveFile, t.suffix === '.zip' ? fixtureZip(entries) : fixtureTar(entries));
     const bytes = readFileSync(archiveFile), releaseAsset = asset(`sing-box-polaris-${version.replace('-polaris-', '-')}-${t.os}-${t.arch}${t.suffix}`, bytes, 20 + Object.keys(contract.platforms).length);
     const row = { schema: 'polaris-upstream-native-receipt-v1', id: rootName, target: `${t.os}/${t.arch}`,
       variant: { linkage: t.sidecar ? 'shared-purego' : 'static-cgo', libc: '', goarm: '', gomips: '', go386: '', legacy: false },
@@ -131,7 +127,8 @@ else:
       if (display.includes('code object is not signed at all')) return { status: 1, stderr: display };
       return '';
     }
-    assert(['python3', 'python'].includes(command), 'Target execution prohibited'); return execFileSync(command, args, options);
+    assert(command === process.execPath && args[0]?.endsWith('release-archive.mjs'), 'Target execution prohibited');
+    return execFileSync(command, args, options);
   };
   const linux = contract.platforms.linux;
   const linuxVersionOutput = `sing-box version ${version}\n\nEnvironment: ${goVersion} ${linux.target}\nTags: ${linux.tags}\n`
@@ -167,8 +164,8 @@ test('all four release archives keep exact cores, colocated libraries and notice
 test('normal release consumption extracts each original archive with the bounded native extractor', async () => withFixture(async f => {
   const extractions = [];
   const run = (command, args, options) => {
-    if (args[1]?.endsWith('release-archive.py')) {
-      assert.equal(command, PYTHON);
+    if (args[0]?.endsWith('release-archive.mjs')) {
+      assert.equal(command, process.execPath);
       assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
       assert.equal(options.encoding, 'utf8'); assert.equal(options.maxBuffer, 1024 * 1024);
       const request = JSON.parse(options.input);
@@ -196,7 +193,7 @@ test('cold archive failure returns through acquiring finally without retries or 
     const downloads = f.calls.filter(url => url === f.contract.platforms[key].releaseAsset.url).length;
     let archiveCalls = 0, replacements = 0, ownedWork;
     const run = (command, args, options) => {
-      if (args[1]?.endsWith('release-archive.py')) {
+      if (args[0]?.endsWith('release-archive.mjs')) {
         archiveCalls++;
         assert.equal(options.timeout, 120_000); assert.equal(options.killSignal, 'SIGKILL');
         const journal = JSON.parse(readFileSync(join(directory, '.release-consumer.lock'), 'utf8'));
@@ -478,7 +475,7 @@ test('actual fetch CLI rejects malformed release mode and an incomplete selectio
 test('explicit Windows target sanitizes only frozen regular0666 and exact sing-box.exe0777 into safe private copies', async () => withFixture(async (f) => {
   const row = f.contract.platforms.win, core = join(f.root, 'resources/win/sing-box.exe');
   const wrongTarget = join(f.root, 'wrong-target-unpacked');
-  const rejected = spawnSync(PYTHON, ['-B', join(repo, 'scripts/desktop-core/release-archive.py'),
+  const rejected = spawnSync(process.execPath, [join(repo, 'scripts/desktop-core/release-archive.mjs'),
     join(f.root, 'inputs', row.archive.name), wrongTarget], { encoding: 'utf8',
     input: JSON.stringify({ archive: row.archive, root: row.archive.name.slice(0, -4), target: 'linux/amd64' }) });
   assert.notEqual(rejected.status, 0); assert(!existsSync(wrongTarget));
@@ -1086,7 +1083,7 @@ test('default native consumer captures codesign stderr/status without exposing t
       observed.push(['stdout-only', ...args]);
       return ''; // This reproduces the broken wrapper's lost successful stderr.
     }
-    return ['python', 'python3'].includes(command) ? original.execFileSync(command, args, settings)
+    return command === process.execPath && args[0]?.endsWith('release-archive.mjs') ? original.execFileSync(command, args, settings)
       : f.run(command, args, settings);
   };
   childProcess.spawnSync = (command, args, settings) => {
@@ -1194,7 +1191,7 @@ const payloadCalls = (f) => f.calls.filter((url) => Object.values(f.contract.pla
 
 test('raw cache cold and warm preserve all four actual payloads, inspections and two public snapshots', async t => withBlobCache(t, async f => {
   const inspections = [], run = f.run;
-  f.run = (...args) => { if (args[0] === 'go' || args[1][1]?.endsWith('release-archive.py')) inspections.push(args); return run(...args); };
+  f.run = (...args) => { if (args[0] === 'go' || args[1][0]?.endsWith('release-archive.mjs')) inspections.push(args); return run(...args); };
   const cold = await consumeRelease(f.root, f.manifest, undefined, f), coldTree = resources(f), firstInspections = inspections.length;
   const coldCalls = f.calls.length, coldPayloads = payloadCalls(f).length;
   const warm = await consumeRelease(f.root, f.manifest, undefined, f);
@@ -1401,3 +1398,117 @@ test('raw cache unavailable filesystem or ancestry keeps normal acquisition and 
   assert.equal(payloadCalls(f).length-n,f.cacheSupported?0:1);
   assert.equal(f.cacheReports.includes('Release blob cache hit'),f.cacheSupported);
 }));
+
+function nativeArchiveFixture(directory, entries, kind, changeBytes = bytes => bytes) {
+  const area = mkdtempSync(join(directory, 'native-')), archive = join(area, kind === 'zip' ? 'native.zip' : 'native.tar.gz');
+  const modes = { File: 0o100000, Directory: 0o040000, SymbolicLink: 0o120000, CharacterDevice: 0o020000, FIFO: 0o010000 };
+  entries = entries.map(entry => ({ data: 'inert', mode: 0o644, type: 'File', ...entry }));
+  const raw = kind === 'zip' ? fixtureZip(entries.map(entry => ({ ...entry,
+    name: entry.type === 'Directory' ? entry.name + '/' : entry.name, mode: entry.mode | modes[entry.type] }))) : fixtureTar(entries);
+  const bytes = changeBytes(raw);
+  writeFileSync(archive, bytes);
+  const files = entries.filter(entry => entry.type !== 'Directory');
+  return { archive, destination: join(area, 'unpacked'), root: 'sing-box-fixture', record: {
+    bytes: bytes.length, sha256: digest(bytes),
+    members: Object.fromEntries(files.map(entry => [entry.name, digest(entry.data)])),
+    memberModes: Object.fromEntries(files.map(entry => [entry.name, entry.mode & 0o777])),
+  } };
+}
+
+test('native archive byte, namespace, permission and type admission precedes all writes', async () => {
+  const directory = fs.realpathSync(mkdtempSync(join(tmpdir(), 'polaris-archive-boundary-'))), root = 'sing-box-fixture';
+  const core = { name: root + '/sing-box', mode: 0o755 };
+  const check = async (entries, kind, { accept = false, changeRecord = () => {}, changeBytes, error } = {}) => {
+    const f = nativeArchiveFixture(directory, entries, kind, changeBytes);
+    changeRecord(f.record);
+    const extract = () => extractNativeArchive(f.archive, f.destination, f.record, f.root);
+    if (accept) {
+      await extract();
+      assert.equal(readFileSync(join(f.destination, core.name), 'utf8'), 'inert');
+    } else {
+      await assert.rejects(extract, error);
+      assert(!existsSync(f.destination), 'failed archive wrote an extraction tree');
+    }
+  };
+  try {
+    for (const kind of ['zip', 'tar']) {
+      await check([core], kind, { accept: true });
+      for (const name of ['../outside', '/absolute', root + '/../../outside', root + '/a\\b', root + '/NUL.txt',
+        root + '/COM1', root + '/name.', root + '/stream:ads', root + '//empty', root + '/./dot', root + '/white space', 'wrong-root/sing-box']) {
+        await check([{ name }], kind);
+      }
+      for (const entries of [[core, core], [{ name: root + '/a' }, { name: root + '/A' }],
+        [{ name: root + '/a' }, { name: root + '/a/b' }], [{ name: root + '/a' }, { name: root + '/A/b' }],
+        [{ name: root + '/a/f' }, { name: root + '/A/g' }]]) await check(entries, kind);
+      for (const mode of [0o4755, 0o2755, 0o1755, 0o777, 0o664]) await check([{ ...core, mode }], kind);
+      for (const type of ['SymbolicLink', 'CharacterDevice', 'FIFO', ...(kind === 'tar' ? ['Link'] : [])]) {
+        await check([{ ...core, type, data: '', linkpath: core.name }], kind);
+      }
+      for (const changeRecord of [record => { record.bytes++; }, record => { record.sha256 = '0'.repeat(64); },
+        record => { record.members = {}; },
+        record => { record.members[core.name] = digest('different bytes'); },
+        record => { record.members[root + '/missing'] = digest('inert'); record.memberModes[root + '/missing'] = 0o644; },
+        record => { record.members = { [root + '/unexpected']: digest('inert') }; delete record.memberModes; },
+        record => { record.memberModes = null; }, record => { record.memberModes[core.name] = 0o644; }]) {
+        await check([core], kind, { changeRecord });
+      }
+    }
+    await check([{ name: core.name + '\0YZ', mode: 0o755 }], 'zip', { error: /raw NUL ZIP member name/ });
+    const truncated = nativeArchiveFixture(directory, [core], 'zip');
+    writeFileSync(truncated.archive, 'truncated inert');
+    for (const bytes of [1, Buffer.byteLength('truncated inert')]) {
+      await assert.rejects(() => extractNativeArchive(truncated.archive, truncated.destination,
+        { bytes, sha256: '0'.repeat(64) }, root), /archive bytes differ/);
+      assert(!existsSync(truncated.destination));
+    }
+    await check([core], 'zip', { changeBytes: bytes => {
+      const central = bytes.readUInt32LE(bytes.length - 6); bytes[central + 16] ^= 1; return bytes;
+    }, error: /CRC/ });
+    await check([core], 'tar', { changeBytes: gzipSync, error: /nested TAR compression/ });
+    const zip64 = (bytes, count, sentinels) => {
+      const end = bytes.length - 22, record = Buffer.alloc(76), ending = Buffer.from(bytes.subarray(end));
+      record.writeUInt32LE(0x06064b50); record.writeBigUInt64LE(44n, 4);
+      record.writeUInt16LE(45, 12); record.writeUInt16LE(45, 14);
+      record.writeBigUInt64LE(BigInt(count), 24); record.writeBigUInt64LE(BigInt(count), 32);
+      record.writeBigUInt64LE(BigInt(ending.readUInt32LE(12)), 40); record.writeBigUInt64LE(BigInt(ending.readUInt32LE(16)), 48);
+      record.writeUInt32LE(0x07064b50, 56); record.writeBigUInt64LE(BigInt(end), 64); record.writeUInt32LE(1, 72);
+      if (sentinels) {
+        ending.writeUInt16LE(65535, 8); ending.writeUInt16LE(65535, 10);
+        ending.writeUInt32LE(0xffffffff, 12); ending.writeUInt32LE(0xffffffff, 16);
+      }
+      return Buffer.concat([bytes.subarray(0, end), record, ending]);
+    };
+    for (const sentinels of [true, false]) await check([core], 'zip', { accept: true, changeBytes: bytes => zip64(bytes, 1, sentinels) });
+    await check([core], 'zip', { changeBytes: bytes => zip64(bytes, 2, false) });
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('native archive inventory bounds and closed CLI requests preserve private output ownership', async () => {
+  const directory = fs.realpathSync(mkdtempSync(join(tmpdir(), 'polaris-native-archive-limits-'))), root = 'sing-box-fixture';
+  const extract = f => extractNativeArchive(f.archive, f.destination, f.record, f.root);
+  try {
+    const entries = Array.from({ length: 1024 }, (_, number) => [
+      { name: `${root}/d${number}`, type: 'Directory', data: '', mode: 0o700 }, { name: `${root}/d${number}/file` },
+    ]).flat();
+    await extract(nativeArchiveFixture(directory, entries, 'tar'));
+    const excessiveEntries = nativeArchiveFixture(directory, [{ name: root, type: 'Directory', data: '', mode: 0o700 }, ...entries], 'tar');
+    await assert.rejects(() => extract(excessiveEntries), /entry limit/); assert(!existsSync(excessiveEntries.destination));
+    const excessiveFiles = nativeArchiveFixture(directory, [...entries, { name: root + '/extra' }], 'zip');
+    await assert.rejects(() => extract(excessiveFiles), /member inventory limit/); assert(!existsSync(excessiveFiles.destination));
+    const f = nativeArchiveFixture(directory, [{ name: root + '/sing-box', mode: 0o755 }], 'tar');
+    const request = { root, archive: f.record }, worker = join(repo, 'scripts/desktop-core/release-archive.mjs');
+    const cli = (destination, flags = [], extra = {}) => spawnSync(process.execPath, [worker, f.archive, destination, ...flags], {
+      input: JSON.stringify({ ...request, ...extra }), encoding: 'utf8', timeout: 10_000,
+    });
+    const valid = cli(f.destination); assert.equal(valid.status, 0, valid.stderr);
+    assert.equal(readFileSync(join(f.destination, root, 'sing-box'), 'utf8'), 'inert');
+    for (const flag of ['--wire-handoff', '--unknown-profile']) {
+      const destination = join(directory, flag.slice(2)), result = cli(destination, [flag]);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /unexpected native archive arguments/); assert(!existsSync(destination));
+    }
+    for (const extra of [{ wire_handoff: true }, { profile: '--wire-handoff' }, { validateOnly: true }]) {
+      const destination = join(directory, Object.keys(extra)[0]), result = cli(destination, [], extra);
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /unexpected archive request fields/); assert(!existsSync(destination));
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

@@ -67,6 +67,12 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
+      - name: Install Node dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "$(node -p "require('./ui/package.json').packageManager")"
+          pnpm --dir ui install --frozen-lockfile --ignore-scripts
       - name: Verify exact formal context
         run: |
           set -euo pipefail

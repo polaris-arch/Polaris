@@ -1611,6 +1611,13 @@ jobs:
         with:
           node-version: '26'
 
+      - name: Install Node dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "$(node -p "require('./ui/package.json').packageManager")"
+          pnpm --dir ui install --frozen-lockfile --ignore-scripts
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'

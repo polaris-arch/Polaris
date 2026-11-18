@@ -32,7 +32,7 @@ const LOCAL_ARCHIVE_TIMEOUT_MS = 120_000;
 function runColdArchive(run, stage, args, input) {
   const started = performance.now();
   try {
-    return run(process.platform === 'win32' ? 'python' : 'python3', args,
+    return run(process.execPath, args,
       { input, encoding: 'utf8', maxBuffer: 1024 * 1024,
         timeout: LOCAL_ARCHIVE_TIMEOUT_MS, killSignal: 'SIGKILL' });
   } catch (error) {
@@ -715,7 +715,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       writeFileSync(archive, bytes, { flag: 'wx' });
       cacheWrites.push({ pin: row.releaseAsset, file: archive });
       const extracted = join(work, `unpacked-${key}`), rootName = validateRow(contract, key, row);
-      runColdArchive(run, 'native-archive-extraction', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, extracted],
+      runColdArchive(run, 'native-archive-extraction', [join(dirname(fileURLToPath(import.meta.url)), 'release-archive.mjs'), archive, extracted],
         JSON.stringify({ archive: row.archive, root: rootName, target: row.target }));
       const source = verifyExtracted(extracted, rootName, row, key, run, options.host ?? process.platform, signatureRun, contract);
       const dest = join(stage, key); mkdirSync(dest);

@@ -98,6 +98,13 @@ jobs:
         with:
           node-version: '26'
 
+      - name: Install Node dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "$(node -p "require('./ui/package.json').packageManager")"
+          pnpm --dir ui install --frozen-lockfile --ignore-scripts
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -126,7 +133,6 @@ jobs:
           python3 -B -m unittest discover -s scripts/mobile-core -p 'test_*.py'
           python3 -B scripts/native-payload-proof.test.py
           python3 -B -X utf8 scripts/windows-package-integrity.test.py
-          python3 -B scripts/desktop-core/test-release-archive.py
           python3 -B scripts/desktop-core/test-local-development.py
           python3 -B scripts/desktop-core/test-dmg-selection.py
 
@@ -215,6 +221,13 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
+
+      - name: Install Node dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "$(node -p "require('./ui/package.json').packageManager")"
+          pnpm --dir ui install --frozen-lockfile --ignore-scripts
 
       - uses: actions/setup-python@v6
         with:

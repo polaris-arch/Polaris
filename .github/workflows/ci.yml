@@ -801,6 +801,13 @@ jobs:
         with:
           node-version: '26'
 
+      - name: Install Node dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "$(node -p "require('./ui/package.json').packageManager")"
+          pnpm --dir ui install --frozen-lockfile --ignore-scripts
+
       # 判据与逐条理由见 lint job 同名步上方那段。本 job 不装 rustfmt / clippy 组件（不跑那两条门）。
       - name: Install Rust toolchain (preinstalled rustup)
         shell: bash

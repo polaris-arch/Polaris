@@ -37,6 +37,7 @@
     "autoprefixer": "^10.4.0",
     "postcss": "^8.5.26",
     "tailwindcss": "^4.3.3",
+    "tar": "7.5.23",
     "typescript": "^7.0.2",
     "vite": "^8.2.2",
     "vitest": "^4.1.11"
