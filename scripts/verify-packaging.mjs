@@ -458,12 +458,15 @@ function checkConfs() {
           const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell/v1.0/powershell.exe');
           execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', `
             $ErrorActionPreference = 'Stop'
+            [Console]::OutputEncoding = [Text.Encoding]::UTF8
             for ($path = $env:POLARIS_WINDOWS_PACKAGE_CONF; $path; $path = [IO.Path]::GetDirectoryName($path)) {
               if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) {
-                throw ('Windows package configuration contains a reparse point: ' + $path)
+                [Console]::Error.WriteLine('Windows package configuration contains a reparse point: ' + $path)
+                exit 1
               }
             }
-          `], { env: { ...process.env, POLARIS_WINDOWS_PACKAGE_CONF: confPath }, timeout: 30_000, maxBuffer: 1024 * 1024 });
+          `], { env: { ...process.env, POLARIS_WINDOWS_PACKAGE_CONF: confPath },
+            stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 });
         }
         const info = regularPath(confPath);
         if (info.nlink !== 1 || info.size > 512 * 1024 ** 2) {
