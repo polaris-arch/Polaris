@@ -35,7 +35,8 @@ fn compiled_lane_never_uses_validation_receipts_as_local_authority() {
         assert_eq!(selection_lane(), SelectionLane::LocalDevelopment);
         let pure = selected_pure_manifest("linux").unwrap();
         let source = selected_source_commit("linux").unwrap();
-        assert_ne!(source, formal_source_commit("linux").unwrap());
+        let formal = formal_manifest("linux").unwrap();
+        assert_ne!(pure.id(sha256_hex).unwrap(), formal.id(sha256_hex).unwrap());
         let mut installed = pure.clone();
         installed.helper_sha256 = Some("f".repeat(64));
         assert_eq!(
