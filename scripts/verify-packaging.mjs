@@ -74,6 +74,7 @@ import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { macOpenGuideViolations } from './lib/macos-open-guide.mjs';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
+import { inspectFormalArtifact, rejectWindowsReparsePoints, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
 import { verifyCronetPayload } from './lib/cronet-payload.mjs';
 import { nsisCoreSweepViolations, nativeSweepViolations } from './lib/nsis-core-sweep.mjs';
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
@@ -453,21 +454,7 @@ function checkConfs() {
     let conf;
     try {
       if (p === 'win') {
-        if (process.platform === 'win32') {
-          // libuv exposes symbolic links but not every Win32 reparse attribute.
-          const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell/v1.0/powershell.exe');
-          execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', `
-            $ErrorActionPreference = 'Stop'
-            [Console]::OutputEncoding = [Text.Encoding]::UTF8
-            for ($path = $env:POLARIS_WINDOWS_PACKAGE_CONF; $path; $path = [IO.Path]::GetDirectoryName($path)) {
-              if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) {
-                [Console]::Error.WriteLine('Windows package configuration contains a reparse point: ' + $path)
-                exit 1
-              }
-            }
-          `], { env: { ...process.env, POLARIS_WINDOWS_PACKAGE_CONF: confPath },
-            stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 });
-        }
+        rejectWindowsReparsePoints(confPath, 'Windows package configuration');
         const info = regularPath(confPath);
         if (info.nlink !== 1 || info.size > 512 * 1024 ** 2) {
           throw new InputError(`src-tauri/${confName}: Windows 发布配置必须是大小受限的单链接文件`);
@@ -2236,7 +2223,7 @@ function checkSha256Sums(names, pathOf, namesOnly) {
   }
 }
 
-function checkAssets(label, dir, namesOnly = false) {
+async function checkAssets(label, dir, namesOnly = false) {
   const abs = resolve(ROOT, dir);
   if (!existsSync(abs)) {
     fail(`assets 模式：目录不存在 ${abs}`);
@@ -2257,11 +2244,12 @@ function checkAssets(label, dir, namesOnly = false) {
   const pathOf = (n) => paths.find((p) => basename(p) === n);
   if (!namesOnly) for (const path of paths.filter(p => /\.(?:exe|zip|dmg|deb|AppImage|apk)$/.test(p))) {
     try {
-      const checked = JSON.parse(execFileSync(process.platform === 'win32' ? 'python' : 'python3',
-        [join(ROOT, 'scripts/final-package-receipt.py'), '--reject-local-selection', path],
-        { encoding: 'utf8', stdio: ['ignore','pipe','pipe'], maxBuffer: 1024 * 1024, timeout: 200000 }));
-      if (!Number.isSafeInteger(checked.artifactBytes) || checked.artifactBytes !== statSync(path).size || !/^[a-f0-9]{64}$/.test(checked.artifactSha256) || checked.artifactSha256 !== createHash('sha256').update(readFileSync(path)).digest('hex')) throw new Error('Inspected artifact object differs from distribution bytes');
-    } catch (error) { fail(`Formal asset object check failed: ${path}: ${error.stderr?.toString() || error.message}`); }
+      const checked = await inspectFormalArtifact(path);
+      verifyFormalArtifactBytes(path, checked);
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
+      fail(`Formal asset object check failed: ${path}: ${error.stderr?.toString() || error.message}`);
+    }
   }
 
   // Pin version, spelling and inventory together; old-name copies and unregistered assets fail closed.
@@ -3035,7 +3023,7 @@ function argOf(flag) {
 const mode = process.argv[2];
 rejectLocalDistribution(ROOT);
 try {
-  runMode();
+  await runMode();
 } catch (e) {
   // 输入侧读取失败：转成一条**可读的**违反，而不是把 `node:fs` / `JSON.parse` 裸栈甩进 CI 日志。
   // 退出码不变（仍走下面的 errors.length > 0 → exit 1），只是让人看得出哪个文件、哪条不变量因此断不了。
@@ -3043,7 +3031,7 @@ try {
   else throw e;
 }
 
-function runMode() {
+async function runMode() {
   const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'));
   try { loadReleaseContract(ROOT, manifest); }
   catch (error) { fail(`Desktop release admission failed: ${error.message}`); return; }
@@ -3070,7 +3058,7 @@ switch (mode) {
   }
   case 'assets':
     // `--names-only`：只跑命名口径（发布后那一遍喂的是同名空文件），见文件头。
-    checkAssets(argOf('--label'), argOf('--dir') ?? '.', process.argv.includes('--names-only'));
+    await checkAssets(argOf('--label'), argOf('--dir') ?? '.', process.argv.includes('--names-only'));
     break;
   case 'inventory': {
     // `--root` / `--static` **二选一必填**：漏传一律硬失败，不回落到某个「差不多」的根，也不静默跳过。

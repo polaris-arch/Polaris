@@ -1,6 +1,6 @@
 // Shared inert fixtures. Linux/ZIP containers are real; 7-Zip-only formats use
 // an explicit controlled backend, never native package/signature evidence.
-import { cpSync, mkdirSync, copyFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, copyFileSync, writeFileSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -10,13 +10,14 @@ import { crc32, deflateRawSync, gzipSync } from 'node:zlib';
 export function fixtureZip(entries) {
   const localEntries = [], centralEntries = [];
   let offset = 0;
-  for (const { name, data, mode = 0o100644, method = 0 } of entries) {
+  for (const { name, data, mode = 0o100644, method = 0, flags = 0 } of entries) {
     const filename = Buffer.from(name), payload = Buffer.from(data);
     const packed = method === 8 ? deflateRawSync(payload) : payload;
     const crc = crc32(payload);
     const local = Buffer.alloc(30), central = Buffer.alloc(46);
     local.writeUInt32LE(0x04034b50);
     local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
     local.writeUInt16LE(method, 8);
     local.writeUInt32LE(crc, 14);
     local.writeUInt32LE(packed.length, 18);
@@ -25,6 +26,7 @@ export function fixtureZip(entries) {
     central.writeUInt32LE(0x02014b50);
     central.writeUInt16LE(3 << 8 | 20, 4);
     central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(flags, 8);
     central.writeUInt16LE(method, 10);
     central.writeUInt32LE(crc, 16);
     central.writeUInt32LE(packed.length, 20);
@@ -47,10 +49,11 @@ export function fixtureZip(entries) {
 export function fixtureTar(entries) {
   const { Header, Pax } = createRequire(new URL('../../ui/package.json', import.meta.url))('tar');
   const blocks = [];
-  for (const { name, data = '', mode = 0o644, type = 'File', linkpath = '' } of entries) {
+  for (const { name, data = '', mode = 0o644, type = 'File', linkpath = '', pax, globalPax } of entries) {
     const payload = Buffer.from(data);
     const header = new Header({ path: name, size: payload.length, mode, type, linkpath });
-    if (header.encode()) blocks.push(new Pax({ path: name, size: payload.length, mode, linkpath }).encode());
+    if (globalPax) blocks.push(new Pax(globalPax, true).encode());
+    if (header.encode() || pax) blocks.push(new Pax({ path: name, size: payload.length, mode, linkpath, ...pax }).encode());
     blocks.push(header.block, payload, Buffer.alloc((512 - payload.length % 512) % 512));
   }
   return gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
@@ -58,7 +61,15 @@ export function fixtureTar(entries) {
 export function copyPackagingSource(original, root) {
   mkdirSync(join(root, 'scripts'), { recursive: true });
   for (const dir of ['desktop-core', 'lib']) cpSync(join(original, 'scripts', dir), join(root, 'scripts', dir), { recursive: true, filter: p => !p.includes('__pycache__') && !p.includes('node_modules') });
-  for (const name of ['verify-packaging.mjs','postprocess-appimage.mjs','release-assets.mjs','final-package-receipt.py','windows-package-integrity.py','native-payload-proof.py']) copyFileSync(join(original, 'scripts', name),join(root,'scripts',name));
+  for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs', 'release-assets.mjs']) {
+    copyFileSync(join(original, 'scripts', name), join(root, 'scripts', name));
+  }
+  if (process.platform === 'linux') {
+    const require = createRequire(join(original, 'ui/package.json'));
+    const modules = join(root, 'ui/node_modules');
+    mkdirSync(modules, { recursive: true });
+    symlinkSync(dirname(require.resolve('tar/package.json')), join(modules, 'tar'), 'dir');
+  }
   mkdirSync(join(root,'src-tauri'),{recursive:true});
   for (const name of ['core-manifest.json','build.rs','tauri.conf.json','tauri.linux.conf.json','tauri.windows.conf.json','tauri.macos-x64.conf.json','tauri.macos-arm64.conf.json']) copyFileSync(join(original,'src-tauri',name),join(root,'src-tauri',name));
 }
@@ -111,7 +122,11 @@ if (args[0] === 'l') {
   if (record.listing !== undefined) process.stdout.write(record.listing);
   else console.log('Type = ' + record.kind + '\\n----------\\n' + Object.entries(record.files)
     .map(([name, value]) => 'Path = ' + name + '\\nSize = ' + Buffer.byteLength(value)).join('\\n\\n'));
-} else process.stdout.write(record.files[args.at(-1)]);
+} else {
+  const isNsis = record.kind === 'Nsis' || record.listing?.includes('Type = Nsis');
+  if (!args.includes('-spd') || (!isNsis && !args.includes('-sns-'))) process.exit(22);
+  process.stdout.write(record.files[args.at(-1)]);
+}
 `, { mode: 0o700 });
   return { ...process.env, PATH: tools + ':' + process.env.PATH };
 }

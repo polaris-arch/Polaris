@@ -31,42 +31,6 @@ w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
 
 
 class Integrity(unittest.TestCase):
-    @unittest.skipUnless(os.name == 'nt', 'native Windows stat/fstat projection required')
-    def test_formal_asset_windows_opened_identity_and_same_view_guards(self):
-        # Real ZIP and actual product reader; projections only exercise the
-        # retained-object guards, never simulate a native installer or policy.
-        for fault in ['none', 'foreign inode', 'opened size', 'fd ctime', 'fd mtime', 'fd links']:
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
-                artifact = Path(tmp) / 'formal.zip'
-                bodies = {'application/polaris.exe': b'inert ordinary App',
-                          '_up_/resources/win/polaris-helper.exe': b'inert ordinary Helper'}
-                with zipfile.ZipFile(artifact, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-                    for name, body in bodies.items(): archive.writestr(name, body)
-                original = os.fstat; calls = 0
-                def projected(fd):
-                    nonlocal calls
-                    calls += 1
-                    value = original(fd)
-                    fields = {name: getattr(value, name) for name in
-                              ['st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns']}
-                    fields['st_ctime_ns'] += 100
-                    if fault == 'foreign inode': fields['st_ino'] += 1
-                    if fault == 'opened size': fields['st_size'] += 1
-                    if calls == 2:
-                        field = {'fd ctime': 'st_ctime_ns', 'fd mtime': 'st_mtime_ns', 'fd links': 'st_nlink'}.get(fault)
-                        if field: fields[field] += 1
-                    return SimpleNamespace(**fields)
-                with patch.object(os, 'fstat', side_effect=projected):
-                    if fault == 'none':
-                        result = w.final.reject_local_selection(artifact)
-                        self.assertEqual(result['artifactSha256'], hashlib.sha256(artifact.read_bytes()).hexdigest())
-                        self.assertEqual({row['member']: row['sha256'] for row in result['checkedExecutables']},
-                                         {name: hashlib.sha256(body).hexdigest() for name, body in bodies.items()})
-                    else:
-                        message = 'replaced before open' if fault in ['foreign inode', 'opened size'] else 'changed during actual object check'
-                        with self.assertRaisesRegex(ValueError, message): w.final.reject_local_selection(artifact)
-                self.assertEqual(calls, 1 if fault in ['foreign inode', 'opened size'] else 2)
-
     def fixture(self, root):
         (root / 'src-tauri').mkdir()
         (root / 'src-tauri/tauri.windows.conf.json').write_bytes((ROOT / 'src-tauri/tauri.windows.conf.json').read_bytes())

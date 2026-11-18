@@ -1761,6 +1761,11 @@ jobs:
         with:
           node-version: '26'
 
+      - name: Install locked archive reader for desktop asset verification
+        run: |
+          npm install --global "$(node -p "require('./ui/package.json').packageManager")"
+          pnpm --dir ui install --frozen-lockfile --ignore-scripts
+
       - name: Require selected formal release source policy
         run: node scripts/assert-pc-runtime-release.mjs
 
@@ -2118,6 +2123,11 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
+
+      - name: Install locked archive reader for combined asset verification
+        run: |
+          npm install --global "$(node -p "require('./ui/package.json').packageManager")"
+          pnpm --dir ui install --frozen-lockfile --ignore-scripts
 
       - name: Require selected formal release source policy
         run: node scripts/assert-pc-runtime-release.mjs

@@ -1,18 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  appendFileSync, existsSync, fstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync,
+  symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { inspectFormalArtifact, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
 import { LOCAL_MARKER, rejectLocalDistribution, prepareLocalInstallation } from './desktop-core/local-development.mjs';
 import { selectedCoreManifest, writeSelectedCoreManifest } from './lib/core-identity.mjs';
 import { createHash } from 'node:crypto';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
-function fixture(action) {
-  const root = mkdtempSync(join(tmpdir(), 'polaris-local-selection-'));
-  try { action(root); } finally { rmSync(root, { recursive: true, force: true }); }
+async function fixture(action) {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'polaris-local-selection-'));
+  try { await action(root); } finally { rmSync(root, { recursive: true, force: true }); }
 }
 test('Formal package and publisher reject local input slots, including a receipt without binaries', () => fixture((root) => {
   rejectLocalDistribution(root);
@@ -43,20 +46,16 @@ test('the existing final installation collector freezes actual Helper bytes with
   assert.equal(second.core.helperSha256, hash(Buffer.from('second actual owned Helper')));
 }));
 
-const receipt = fileURLToPath(new URL('./final-package-receipt.py', import.meta.url));
-function inspect(asset, expectedError, env = process.env) {
-  const { status, stdout, stderr } = spawnSync('python3', ['-B', receipt, '--reject-local-selection', asset],
-    { encoding: 'utf8', timeout: 30_000, env });
+async function inspect(asset, expectedError) {
+  const result = inspectFormalArtifact(asset);
   if (expectedError) {
-    assert.equal(status, 1, stderr);
-    assert.match(stderr, expectedError);
+    await assert.rejects(result, expectedError);
     return;
   }
-  assert.equal(status, 0, stderr);
-  return JSON.parse(stdout);
+  return result;
 }
 
-test('Linux formal packages keep case-distinct paths and bind the exact executable members', { skip: process.platform !== 'linux' }, () => fixture(root => {
+test('Linux formal packages keep case-distinct paths and bind the exact executable members', { skip: process.platform !== 'linux' }, () => fixture(async root => {
   const app = 'inert namespace App', helper = 'inert namespace Helper';
   const upper = 'usr/bin/Polaris', lower = 'usr/bin/polaris';
   const helperPath = 'usr/lib/Polaris/_up_/resources/linux/polaris-helper';
@@ -80,7 +79,7 @@ test('Linux formal packages keep case-distinct paths and bind the exact executab
     for (const ext of ['AppImage', 'deb']) {
       const asset = join(root, 'fixture.' + ext);
       writeLinuxFixture(stage, asset);
-      const result = inspect(asset, error);
+      const result = await inspect(asset, error);
       if (error) continue;
       assert.equal(result.artifactSha256, hash(readFileSync(asset)));
       assert.deepEqual(Object.fromEntries(result.checkedExecutables.map(row => [row.member, row.sha256])),
@@ -93,27 +92,37 @@ test('Linux formal packages keep case-distinct paths and bind the exact executab
   writeFileSync(join(root, 'debian-binary'), '2.0\n');
   writeFileSync(join(root, 'control.tar.gz'), fixtureTar([{ name: 'control', data: readFileSync(join(stage, 'DEBIAN/control')) }]));
   const deb = join(root, 'members.deb');
-  function tarMembers(rows, error) {
+  async function tarMembers(rows, error) {
     writeFileSync(join(root, 'data.tar.gz'), fixtureTar(rows));
     execFileSync('ar', ['rcs', deb, 'debian-binary', 'control.tar.gz', 'data.tar.gz'], { cwd: root, timeout: 30_000 });
     return inspect(deb, error);
   }
   const base = [{ name: upper, data: app }, { name: helperPath, data: helper }];
   const link = (name, linkpath) => ({ name, type: 'Link', linkpath });
-  assert.equal(tarMembers([...base, link(lower, upper)]).checkedExecutables.length, 3);
+  assert.equal((await tarMembers([...base, link(lower, upper)])).checkedExecutables.length, 3);
+  const paxPath = 'usr/' + 'long-directory'.repeat(13) + '/Polaris';
+  const pax = await tarMembers([{ name: paxPath, data: app }, base[1],
+    { name: 'raw/backing', data: 'different ordinary file' },
+    { ...link(lower, 'raw/backing'), pax: { linkpath: paxPath } }]);
+  assert.deepEqual(Object.fromEntries(pax.checkedExecutables.map(row => [row.member, row.sha256])),
+    { [paxPath]: hash(app), [lower]: hash(app), [helperPath]: hash(helper) });
+  const global = await tarMembers([{ name: 'raw/app', data: app, globalPax: { path: upper } },
+    { name: 'raw/helper', data: helper, pax: { path: helperPath } }]);
+  assert.deepEqual(Object.fromEntries(global.checkedExecutables.map(row => [row.member, row.sha256])),
+    { [upper]: hash(app), [helperPath]: hash(helper) });
   for (const target of ['usr/bin/POLARIS', 'USR/bin/Polaris', '../../../outside', 'usr\\bin\\Polaris', '/usr/bin/Polaris']) {
-    tarMembers([...base, link(lower, target)], target === 'usr/bin/POLARIS' || target === 'USR/bin/Polaris'
+    await tarMembers([...base, link(lower, target)], target === 'usr/bin/POLARIS' || target === 'USR/bin/Polaris'
       ? /link target absent/ : /link escapes archive/);
   }
-  tarMembers([base[1], link(lower, upper), link(upper, lower)], /link cycle/);
-  tarMembers([...base, { name: upper }], /duplicate\/member count/);
-  tarMembers([...base, { name: upper + '/child' }], /file\/directory alias collision/);
+  await tarMembers([base[1], link(lower, upper), link(upper, lower)], /link cycle/);
+  await tarMembers([...base, { name: upper }], /duplicate\/member count/);
+  await tarMembers([...base, { name: upper + '/child' }], /file\/directory alias collision/);
   for (const name of ['../outside', 'usr//bad', 'bad:name', 'bad\\name', 'bad\x01name', 'trailing.', 'CON', 'e\u0301']) {
-    tarMembers([...base, { name }], /unsafe ZIP member|non-canonical ZIP path|Windows ZIP (?:path alias|device name)/);
+    await tarMembers([...base, { name }], /unsafe ZIP member|non-canonical ZIP path|Windows ZIP (?:path alias|device name)/);
   }
 }));
 
-test('compressed ZIP and APK selection checks executable bytes and archive paths', () => fixture(root => {
+test('compressed ZIP and APK selection checks executable bytes and archive paths', () => fixture(async root => {
   const markerError = /LocalDevelopmentSelection executable/;
   for (const [extension, app] of [['zip', 'polaris.exe'], ['apk', 'lib/arm64-v8a/libpolaris_lib.so']]) {
     const asset = join(root, 'fixture.' + extension);
@@ -121,7 +130,7 @@ test('compressed ZIP and APK selection checks executable bytes and archive paths
     for (const marked of [false, true]) {
       const data = Buffer.concat([Buffer.alloc(65530), marked ? LOCAL_MARKER : Buffer.from('app')]);
       writeFileSync(asset, fixtureZip([{ name: app, data, method: 8 }, ...helper]));
-      const result = inspect(asset, marked ? markerError : undefined);
+      const result = await inspect(asset, marked ? markerError : undefined);
       if (!marked) {
         assert.equal(result.checkedExecutables.length, 1 + helper.length);
         assert.equal(result.checkedExecutables.find(row => row.member === app).sha256, hash(data));
@@ -134,55 +143,163 @@ test('compressed ZIP and APK selection checks executable bytes and archive paths
     ['polaris.exe/../polaris.exe', /unsafe ZIP member|non-canonical ZIP path/],
     ['Polaris.exe.', /Windows ZIP path alias/]]) {
     writeFileSync(zip, fixtureZip([name, 'polaris.exe', 'polaris-helper.exe'].map(name => ({ name, data: 'entry' }))));
-    inspect(zip, error);
+    await inspect(zip, error);
+  }
+  const bytes = fixtureZip([{ name: 'polaris.exe', data: 'app' }, { name: 'polaris-helper.exe', data: 'helper' }]);
+  bytes[30 + 'polaris.exe'.length] ^= 1;
+  writeFileSync(zip, bytes);
+  await inspect(zip, /ZIP member CRC differs/);
+  for (const flags of [1, 0x20, 0x40]) {
+    writeFileSync(zip, fixtureZip([{ name: 'polaris.exe', data: 'app', flags }, { name: 'polaris-helper.exe', data: 'helper' }]));
+    await inspect(zip, /encrypted\/patched member/);
   }
 }));
 
-test('formal DMG and NSIS selection reads executable bytes through the carrier reader', { skip: process.platform === 'win32' }, () => fixture(root => {
+test('the formal carrier snapshot rejects growth and expiry before writing the next block', () => fixture(async root => {
+  const app = Buffer.alloc(65536 + 17, 97), helper = Buffer.from('ordinary Helper');
+  const bytes = fixtureZip([{ name: 'polaris.exe', data: app }, { name: 'polaris-helper.exe', data: helper }]);
+  for (const fault of ['none', 'growth', 'deadline']) {
+    const asset = join(root, fault + '.zip');
+    writeFileSync(asset, bytes);
+    let snapshot, observed, reads = 0;
+    const result = inspectFormalArtifact(asset, {
+      retainedPath(_fd, temporary) { snapshot = join(temporary, 'carrier.zip'); return null; },
+      clock: () => fault === 'deadline' && reads === 2 ? 180_001 : 0,
+      readFrom(fd, offset, requested) {
+        const buffer = Buffer.alloc(requested);
+        const count = readSync(fd, buffer, 0, requested, offset);
+        reads++;
+        if (reads === 1 && fault === 'growth') appendFileSync(asset, Buffer.alloc(65536));
+        if (reads === 2) observed = statSync(snapshot).size;
+        return buffer.subarray(0, count);
+      },
+    });
+    if (fault === 'none') {
+      const checked = await result;
+      assert.equal(checked.artifactSha256, hash(bytes));
+      assert.deepEqual(checked.checkedExecutables.map(row => row.sha256), [hash(app), hash(helper)]);
+      verifyFormalArtifactBytes(asset, checked);
+      writeFileSync(asset, Buffer.from(bytes.map((byte, index) => index === 0 ? byte ^ 1 : byte)));
+      assert.throws(() => verifyFormalArtifactBytes(asset, checked), /differs from distribution bytes/);
+    } else {
+      await assert.rejects(result, fault === 'growth' ? /snapshot byte budget exceeded/ : /inspection deadline exceeded/);
+      assert.equal(reads, 2);
+    }
+    assert.equal(observed, 65536);
+    assert.equal(existsSync(snapshot), false);
+  }
+}));
+
+test('formal carrier scan binds the opened identity and compares like stat views', () => fixture(async root => {
+  const app = Buffer.from('inert ordinary App'), helper = Buffer.from('inert ordinary Helper');
+  const bytes = fixtureZip([{ name: 'polaris.exe', data: app }, { name: 'polaris-helper.exe', data: helper }]);
+  const asset = join(root, 'carrier.zip');
+  writeFileSync(asset, bytes);
+  for (const fault of ['none', 'ino', 'size', 'ctimeNs', 'mtimeNs', 'nlink']) {
+    let calls = 0;
+    const result = inspectFormalArtifact(asset, {
+      openedStat(fd) {
+        calls++;
+        const value = fstatSync(fd, { bigint: true });
+        // Windows pathname and descriptor views can project different ctime.
+        if (process.platform === 'win32') value.ctimeNs += 100n;
+        const fieldIsInitial = fault === 'ino' || fault === 'size';
+        if (fault !== 'none' && calls === (fieldIsInitial ? 1 : 2)) value[fault]++;
+        return value;
+      },
+    });
+    const badOpen = ['ino', 'size'].includes(fault);
+    if (fault === 'none') {
+      const checked = await result;
+      assert.equal(checked.artifactSha256, hash(bytes));
+      assert.deepEqual(checked.checkedExecutables.map(row => row.sha256), [hash(app), hash(helper)]);
+    } else {
+      await assert.rejects(result, badOpen ? /replaced before open/ : /changed during actual object check/);
+    }
+    assert.equal(calls, badOpen ? 1 : 2);
+  }
+}));
+
+test('interrupting a formal ZIP scan discards its private snapshot', { skip: process.platform === 'win32' }, () => fixture(root => {
+  const asset = join(root, 'carrier.zip'), name = 'polaris.exe';
+  writeFileSync(asset, fixtureZip([{ name, data: Buffer.alloc(8 * 1024 ** 2), method: 8 },
+    { name: 'polaris-helper.exe', data: 'ordinary Helper' }]));
+  const source = new URL('./lib/formal-package-selection.mjs', import.meta.url).href;
+  const read = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import { readSync } from 'node:fs';
+    import { inspectFormalArtifact } from ${JSON.stringify(source)};
+    await inspectFormalArtifact(process.argv[1], {
+      retainedPath: () => null,
+      readFrom(fd, offset, length, remaining) {
+        remaining();
+        if (offset === ${30 + name.length}) process.kill(process.pid, 'SIGINT');
+        const block = Buffer.alloc(length);
+        return block.subarray(0, readSync(fd, block, 0, length, offset));
+      },
+    });
+  `, asset], { env: { ...process.env, TMPDIR: root }, encoding: 'utf8', timeout: 10_000 });
+  assert.ifError(read.error);
+  assert.equal(read.status, 1, read.stderr);
+  assert.match(read.stderr, /AbortError/);
+  assert.deepEqual(readdirSync(root), ['carrier.zip']);
+}));
+
+test('formal DMG and NSIS selection reads executable bytes through the carrier reader', { skip: process.platform === 'win32' }, () => fixture(async root => {
   const directory = join(root, 'assets'), asset = join(directory, 'fixture.dmg');
   const env = writeFormalAssets(directory, ['fixture.dmg', 'fixture.exe']);
-  for (const path of [asset, join(directory, 'fixture.exe')]) {
-    const carrier = JSON.parse(readFileSync(path, 'utf8'));
-    assert.equal(inspect(path, undefined, env).checkedExecutables.length, 2);
-    const appName = Object.keys(carrier.files).find(name => name.endsWith('polaris') || name.endsWith('polaris.exe'));
-    carrier.files[appName] = LOCAL_MARKER.toString();
-    writeFileSync(path, JSON.stringify(carrier));
-    inspect(path, /LocalDevelopmentSelection executable/, env);
+  const originalPath = process.env.PATH;
+  process.env.PATH = env.PATH;
+  try {
+    for (const path of [asset, join(directory, 'fixture.exe')]) {
+      const carrier = JSON.parse(readFileSync(path, 'utf8'));
+      assert.equal((await inspect(path)).checkedExecutables.length, 2);
+      const appName = Object.keys(carrier.files).find(name => name.endsWith('polaris') || name.endsWith('polaris.exe'));
+      carrier.files[appName] = LOCAL_MARKER.toString();
+      writeFileSync(path, JSON.stringify(carrier));
+      await inspect(path, /LocalDevelopmentSelection executable/);
+    }
+    const reserved = 'Path = .HFS+ Private Directory Data\r\nFolder = +\nSize = ';
+    const helper = 'Path = Contents/polaris-helper\nSize = 6\nMode = -rw-r--r--\nSymbolic Link = ';
+    const backing = 'Path = Contents/target\nSize = 3';
+    const files = { 'Contents/polaris-helper': 'helper', 'Contents/target': 'app' };
+    function listing(records, contents = files, newline = '\n', type = 'HFS') {
+      writeFileSync(asset, JSON.stringify({ files: contents, listing: ['Type = ' + type, '----------', records.join('\n\n'), ''].join('\n').replaceAll('\n', newline) }));
+    }
+    for (const [type, newline, dir, link, contents] of [
+      ['HFS', '\n', 'Folder = +', '', { ...files, 'Contents/Polaris': 'target' }],
+      ['APFS', '\r\n', 'Mode = drwxr-xr-x', '\nSymbolic Link = target', files],
+    ]) {
+      listing([reserved, 'Path = Contents\n' + dir + '\nSize = ', helper, backing,
+        'Path = Contents/Polaris\nMode = lrwxr-xr-x\nSize = 6' + link], contents, newline, type);
+      const result = await inspect(asset);
+      assert.deepEqual(Object.fromEntries(result.checkedExecutables.map(row => [row.member, row.sha256])),
+        { 'Contents/Polaris': hash('app'), 'Contents/polaris-helper': hash('helper') });
+      assert.equal(result.expandedExecutableBytes, type === 'HFS' ? 15 : 9);
+    }
+    const inner = JSON.stringify({ kind: 'HFS', files: { 'Contents/Polaris': 'app', 'Contents/polaris-helper': 'helper' } });
+    writeFileSync(asset, JSON.stringify({ kind: 'Dmg', files: { 'volume.hfs': inner } }));
+    const wrapped = await inspect(asset);
+    assert.equal(wrapped.expandedExecutableBytes, Buffer.byteLength(inner) + 9);
+    assert.deepEqual(wrapped.checkedExecutables.map(row => row.sha256), [hash('app'), hash('helper')]);
+    for (const [record, error] of [
+      ['Path = Polaris\nSize = ', /member size differs/],
+      ['Path = Polaris\nSize = x', /member size differs/],
+      ['Path = Polaris\nSize = 3\nPath = other', /duplicate formal 7-Zip property/],
+      ['Path = Polaris\nSize = 3\ninjected newline', /invalid formal DMG property line/],
+      ['Path = Polaris\nSize = 3\nMode = prw-------', /nonregular member/],
+      ['Path = Polaris\nSize = 3\nFolder = +\nSymbolic Link = target', /directory\/link conflict/],
+      ['Path = Polaris\nSize = 3\n\nPath = Polaris\nSize = 3', /duplicate member/],
+      ['Path = .HFS+ Private Directory Data\r\nSize = 3', /invalid HFS metadata directory/],
+      ['Path = Other\r\nSize = 0', /Windows ZIP path alias/],
+      ['Path = Polaris\nSize = 0', /unresolved hard-linked/],
+    ]) {
+      listing([record, helper]);
+      await inspect(asset, error);
+    }
+    // Reserved filesystem records still consume the actual production entry budget.
+    listing([...Array(10000).fill(reserved), helper]);
+      await inspect(asset, /member count budget/);
+  } finally {
+    process.env.PATH = originalPath;
   }
-  const reserved = 'Path = .HFS+ Private Directory Data\r\nFolder = +\nSize = ';
-  const helper = 'Path = Contents/polaris-helper\nSize = 6\nMode = -rw-r--r--\nSymbolic Link = ';
-  const backing = 'Path = Contents/target\nSize = 3';
-  const files = { 'Contents/polaris-helper': 'helper', 'Contents/target': 'app' };
-  function listing(records, contents = files, newline = '\n', type = 'HFS') {
-    writeFileSync(asset, JSON.stringify({ files: contents, listing: ['Type = ' + type, '----------', records.join('\n\n'), ''].join('\n').replaceAll('\n', newline) }));
-  }
-  for (const [type, newline, dir, link, contents] of [
-    ['HFS', '\n', 'Folder = +', '', { ...files, 'Contents/Polaris': 'target' }],
-    ['APFS', '\r\n', 'Mode = drwxr-xr-x', '\nSymbolic Link = target', files],
-  ]) {
-    listing([reserved, 'Path = Contents\n' + dir + '\nSize = ', helper, backing,
-      'Path = Contents/Polaris\nMode = lrwxr-xr-x\nSize = 6' + link], contents, newline, type);
-    const result = inspect(asset, undefined, env);
-    assert.deepEqual(Object.fromEntries(result.checkedExecutables.map(row => [row.member, row.sha256])),
-      { 'Contents/Polaris': hash('app'), 'Contents/polaris-helper': hash('helper') });
-    assert.equal(result.expandedExecutableBytes, type === 'HFS' ? 15 : 9);
-  }
-  for (const [record, error] of [
-    ['Path = Polaris\nSize = ', /member size differs/],
-    ['Path = Polaris\nSize = x', /member size differs/],
-    ['Path = Polaris\nSize = 3\nPath = other', /duplicate formal 7-Zip property/],
-    ['Path = Polaris\nSize = 3\ninjected newline', /invalid formal DMG property line/],
-    ['Path = Polaris\nSize = 3\nMode = prw-------', /nonregular member/],
-    ['Path = Polaris\nSize = 3\nFolder = +\nSymbolic Link = target', /directory\/link conflict/],
-    ['Path = Polaris\nSize = 3\n\nPath = Polaris\nSize = 3', /duplicate member/],
-    ['Path = .HFS+ Private Directory Data\r\nSize = 3', /invalid HFS metadata directory/],
-    ['Path = Other\r\nSize = 0', /Windows ZIP path alias/],
-    ['Path = Polaris\nSize = 0', /unresolved hard-linked/],
-  ]) {
-    listing([record, helper]);
-    inspect(asset, error, env);
-  }
-  // Reserved filesystem records still consume the actual production entry budget.
-  listing([...Array(10000).fill(reserved), helper]);
-  inspect(asset, /member count budget/, env);
 }));

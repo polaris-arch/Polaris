@@ -133,18 +133,29 @@ export function restoreCoreSeed(appDir, sourceRoot = ROOT) {
     [APPIMAGE_HELPER_MEMBER]: helperIdentity, [INSTALL_MANIFEST_MEMBER]: installationIdentity };
 }
 
-// Read SquashFS with a host tool, never execute the AppImage runtime. A magic
-// occurrence alone is not proof: every candidate is validated, and exactly one
-// valid filesystem must exist before extracting the exact non-wildcard members.
+// A magic occurrence alone is not proof. Use overlapping blocks so readers
+// bound to a retained descriptor can search without buffering the carrier.
+export function appImageFilesystems(length, read, valid) {
+  const offsets = [];
+  const blockSize = 64 * 1024;
+  for (let start = 0; start < length; start += blockSize) {
+    const bytes = read(start, Math.min(blockSize + 3, length - start));
+    for (let at = bytes.indexOf('hsqs'); at >= 0 && at < blockSize; at = bytes.indexOf('hsqs', at + 4)) {
+      if (valid(start + at)) offsets.push(start + at);
+    }
+  }
+  return offsets;
+}
+
+// Read SquashFS with a host tool, never execute the AppImage runtime.
 export function verifyAppImageMembers(artifact, expected, unsquashfs = 'unsquashfs') {
   if (!lstatSync(artifact).isFile()) throw new Error('AppImage 必须是普通文件，不能为软链');
   const bytes = readFileSync(artifact);
-  const offsets = [];
-  for (let offset = bytes.indexOf('hsqs'); offset !== -1; offset = bytes.indexOf('hsqs', offset + 4)) {
+  const offsets = appImageFilesystems(bytes.length, (at, count) => bytes.subarray(at, at + count), offset => {
     const probe = spawnSync(unsquashfs, ['-s', '-offset', String(offset), artifact], { encoding: 'utf8' });
     if (probe.error) throw probe.error;
-    if (probe.status === 0) offsets.push(offset);
-  }
+    return probe.status === 0;
+  });
   if (offsets.length !== 1) throw new Error(`AppImage 应恰有一个有效 SquashFS，实为 ${offsets.length}`);
   const work = mkdtempSync(join(tmpdir(), 'polaris-appimage-payload-'));
   try {
