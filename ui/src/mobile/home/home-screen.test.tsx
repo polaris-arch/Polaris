@@ -1672,10 +1672,12 @@ describe('首页路由和检测分行', () => {
       expect(html).toContain(`aria-pressed="true">home.routing${mode[0].toUpperCase() + mode.slice(1)}`);
     }
   });
-  it('出口 IP 与检测按钮位于检测卡，IPv6 保持完整', () => {
-    const html = cardSegments(render({exitIp: '2001:db8:1234:5678:90ab:cdef:1234:5678'})).get('unlock-detection')!;
+  it('出口 IP 与检测按钮位于检测卡，保留检测状态和完整的 IPv6', () => {
+    const html = cardSegments(render({ exitIp: '2001:db8:1234:5678:90ab:cdef:1234:5678', exitProbing: true })).get('unlock-detection')!;
     expect(html).toContain('data-write-control="network-check"');
-    expect(html).toContain('2001:db8:1234:5678:90ab:cdef:1234:5678');
+    expect(html).toContain('class="h-exit-address">2001:db8:1234:5678:90ab:cdef:1234:5678</span>');
     expect(html).toContain('mobileHome.checkNow');
+    expect(render({ exitIp: null, exitProbing: true })).toContain('class="h-exit-address">home.unlockStatus.checking</span>');
+    expect(render({ exitIp: null, exitProbing: false })).toContain('class="h-exit-address">home.unlockStatus.idle</span>');
   });
 });

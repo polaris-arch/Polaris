@@ -883,7 +883,9 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
         >
           <div className="h-exit-info" aria-live="polite">
             <span className="h-exit-label">{t('mobileHome.exitIp')}</span>
-            <span className="h-exit-address">{props.exitIp ?? t('home.unlockStatus.idle')}</span>
+            <span className="h-exit-address">
+              {props.exitIp ?? t(props.exitProbing ? 'home.unlockStatus.checking' : 'home.unlockStatus.idle')}
+            </span>
             {props.exitFlagSrc !== null && <img className="h-exit-flag" src={props.exitFlagSrc} alt="" aria-hidden="true" />}
             <span>{props.exitRegion.kind === 'flag' ? props.exitRegion.code.toUpperCase()
               : props.exitRegion.kind === 'text' ? props.exitRegion.region : ''}</span>

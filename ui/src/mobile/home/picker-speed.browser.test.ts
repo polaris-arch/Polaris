@@ -167,7 +167,7 @@ const net=window.__networkTest={manual:[],raw:[],speeds:[],cancels:[],mainStarts
  setStatus(status){net.status={actualServerId:status.running?'node-a':null,...status};useAppStore.getState().setProxyStatus(net.status);}};
 const ip={revision:5,direct:null,proxy:null,updatedAt:123};
 const unlock={results:{},checkedAt:123,egress:null};
-useAppStore.setState({proxyStatus:net.status,ipInfo:{revision:0,direct:null,proxy:null,updatedAt:0}});
+useAppStore.setState({privacyMode:false,proxyStatus:net.status,ipInfo:{revision:0,direct:null,proxy:null,updatedAt:0}});
 api.proxy.getStatus=async()=>net.status;
 api.proxy.start=async()=>{net.mainStarts++;};api.proxy.stop=async()=>{net.mainStops++;};
 api.ipInfo.get=async()=>{net.raw.push('ip');if(net.hold)await new Promise(resolve=>{net.pending.ip=resolve;});return ip;};
@@ -484,6 +484,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
         if(surface==='ios')await page.getByRole('dialog').getByRole('button',{name:'确认',exact:true}).click();
         const count=background?2:1;
         await page.waitForFunction(expected=>(window as any).__networkTest.speeds.length===expected,count);
+        if(surface!=='desktop')expect(await page.locator('.h-exit-address').innerText()).toBe('未检测');
         expect(await button.isDisabled()).toBe(true);
         expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.manual,n.raw,n.cancels];})).toEqual([[],[],[]]);
         await page.evaluate(()=>(window as any).__networkTest.release('speed'));

@@ -914,9 +914,7 @@ async fn probe_publish_ipinfo(
 /// 不发的话，起核 / 热切后的收敛窗口里状态栏会继续显示**上一个出口**的 IP 与旗面 —— 把旧出口冒充成
 /// 新出口，比留空更糟（与「不得用入口域名派生出口位置」是同一条纪律）。
 ///
-/// ⚠️ **UI 表现仍是「置空」（`—`），不是可见的「检测中」文案**：`loading:true` 无展示消费方；
-/// `HomeScreen` 只消费同帧的 `proxyReachability` 来避免在收敛窗口误亮「不可达」，状态栏仍只读出口信息。
-/// 这符合用户已裁的「未探到就留空」。别让 StatusBar 消费 `loading` —— 那是在实现一个已被否掉的状态。
+/// 移动首页用 `loading` 标记「检测中」。桌面状态栏只读出口信息，探测完成前显示 `—`。
 fn pending_ipinfo_snapshot() -> Value {
     json!({
         "direct": Value::Null,

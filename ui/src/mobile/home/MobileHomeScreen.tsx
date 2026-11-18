@@ -840,7 +840,7 @@ export function MobileHomeScreen(): ReactElement {
         exitRegion.kind === 'flag' ? (countryCodeToFlagAsset(exitRegion.code)?.src ?? null) : null
       }
       exitIsDirect={!proxyRunning || directRoute}
-      exitProbing={ipInfo?.loading === true || manualCheckBusy}
+      exitProbing={ipInfo?.loading === true}
       exitIp={privacyMode ? '••••' : (proxyRunning && !directRoute ? ipInfo?.proxy?.ip : ipInfo?.direct?.ip) ?? null}
       onSetRouting={onSetRouting}
       unlock={visibleUnlockVms}
