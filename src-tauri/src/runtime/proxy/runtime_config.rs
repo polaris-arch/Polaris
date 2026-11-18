@@ -1,6 +1,7 @@
 //! Additive, capability-negotiated configuration transactions. A failed transaction
 //! never authorizes a core restart. Startup facts are retained, not reallocated.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path};
 use std::sync::{atomic::Ordering, Arc};
 
 use super::hot_switch::SwitchOutcome;
@@ -18,7 +19,7 @@ use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_config_engine::user_config::UserConfig;
 use polaris_helper_proto::Platform;
 use polaris_singbox_grpc::{daemon, Endpoint, RuntimeConfigError, SingBoxApiClient};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub(crate) mod api_handoff;
 pub(crate) mod host_effects;
@@ -3176,13 +3177,29 @@ impl ProxyRuntime {
         desired: &Value,
         running: &Value,
     ) -> Option<String> {
+        if self.has_uncommitted_rule_content() {
+            return None;
+        }
         let generation = self.gate.generation();
         self.gate
             .with_current_generation(generation, |live| {
                 if live.is_busy() || !self.saved_settings_revert_ready() {
                     return None;
                 }
-                saved_settings_revert_token(generation, desired, running)
+                self.config
+                    .try_preview_saved_revert(desired, running, |removed_resources| {
+                        let restored = restored_proxy_settings(
+                            desired,
+                            running,
+                            removed_resources,
+                            self.config.dir(),
+                        )?;
+                        Some(saved_settings_receipt(
+                            generation, desired, running, &restored,
+                        ))
+                    })
+                    .ok()
+                    .flatten()
             })
             .flatten()
     }
@@ -3192,6 +3209,10 @@ impl ProxyRuntime {
 
         let _serial = self.switch_serial.lock().await;
         let _publication = self.gate.lock_generation_publication();
+        // A watcher may have accepted a file whose content is absent from R.
+        if self.has_uncommitted_rule_content() {
+            return false;
+        }
         let generation = self.gate.generation();
         self.gate
             .with_current_generation(generation, |live| {
@@ -3201,16 +3222,25 @@ impl ProxyRuntime {
                 let Some(running) = self.current_config_snapshot() else {
                     return false;
                 };
-                let result = self.config.try_update_saved(|desired| {
-                    if saved_settings_receipt(generation, desired, &running) != token {
-                        return Decision::Skip(());
-                    }
-                    let Some(restored) = restored_proxy_settings(desired, &running) else {
-                        return Decision::Skip(());
-                    };
-                    *desired = restored;
-                    Decision::Write(())
-                });
+                let result =
+                    self.config
+                        .try_update_saved(&running, |desired, removed_resources| {
+                            let Some(restored) = restored_proxy_settings(
+                                desired,
+                                &running,
+                                removed_resources,
+                                self.config.dir(),
+                            ) else {
+                                return Decision::Skip(());
+                            };
+                            if saved_settings_receipt(generation, desired, &running, &restored)
+                                != token
+                            {
+                                return Decision::Skip(());
+                            }
+                            *desired = restored;
+                            Decision::Write(())
+                        });
                 matches!(result, Ok(((), Some(_))))
             })
             .unwrap_or(false)
@@ -3618,6 +3648,26 @@ const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[
     "httpPort",
     "allowLan",
     "tunConfig",
+    "dnsConfig",
+];
+
+// Restore both rule planes and their shared dependencies in the same write.
+// Older documents use the compatibility rule collections instead of trafficRules.
+const REVERTIBLE_POLICIES: &[&str] = &[
+    "customRules",
+    "policyRules",
+    "trafficRules",
+    "routeRuleOrder",
+    "regionRouting",
+    "appRoutingEnabled",
+    "appRules",
+    "customAppPresets",
+    "networkProfiles",
+    "dnsRules",
+    "dnsRuleOrder",
+    "dnsServers",
+    "dnsServerGroups",
+    "dnsDefaults",
 ];
 
 fn running_selection_available(desired: &Value, running: &Value) -> bool {
@@ -3650,20 +3700,111 @@ fn restore_value(document: &mut serde_json::Map<String, Value>, key: &str, value
     }
 }
 
-fn restored_proxy_settings(desired: &Value, running: &Value) -> Option<Value> {
-    let action_path = "/dnsDefaults/unmatchedAction";
-    let restore_dns = desired.get("dnsConfig") != running.get("dnsConfig")
-        || desired.pointer(action_path) != running.pointer(action_path);
+fn restore_rule_remarks(restored: &mut Value, saved: &Value) {
+    let remarks: BTreeMap<_, _> = saved
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| Some((rule.get("id")?.as_str()?, rule.get("remarks"))))
+        .collect();
+    for rule in restored
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object_mut)
+    {
+        if let Some(remark) = rule
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| remarks.get(id))
+        {
+            restore_value(rule, "remarks", *remark);
+        }
+    }
+}
+
+fn rule_resource_file_survives(resource: &Value, rule_dir: &Path) -> Option<()> {
+    use polaris_config_engine::user_config::builtin_geo_rulesets::is_valid_srs_file;
+
+    let name = Path::new(resource.get("fileName").and_then(Value::as_str)?);
+    let mut parts = name.components();
+    if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some() {
+        return None;
+    }
+    let path = rule_dir.join(name);
+    (path.is_file()
+        && (resource.get("format").and_then(Value::as_str) != Some("binary")
+            || is_valid_srs_file(&path)))
+    .then_some(())
+}
+
+fn rule_resource_required(config: &UserConfig, id: &str, config_dir: &Path) -> bool {
+    use polaris_config_engine::user_config::{
+        builtin_geo_rulesets::{find_builtin, is_valid_srs_file},
+        is_resource_referenced,
+        rule::RuleType,
+        rules::rule_conditions,
+        RefScanInput,
+    };
+
+    let traffic = config.effective_traffic_rules();
+    let dns = config.effective_dns_rules();
+    // The compiler resolves geo tags through the seeded file before consulting
+    // a same-tag download. An explicit res:<id> still names the downloaded row.
+    if let Some(builtin) = find_builtin(id) {
+        if !is_valid_srs_file(&config_dir.join("rules").join(builtin.file_name)) {
+            return true;
+        }
+    } else if is_resource_referenced(
+        id,
+        &RefScanInput {
+            custom_rules: traffic,
+            app_rules: &config.app_rules,
+            custom_app_presets: &config.custom_app_presets,
+        },
+    ) || is_resource_referenced(
+        id,
+        &RefScanInput {
+            custom_rules: dns,
+            ..RefScanInput::default()
+        },
+    ) {
+        return true;
+    }
+
+    // Core-facing matchers also accept rule-set values with surrounding spaces.
+    traffic
+        .iter()
+        .chain(dns)
+        .filter(|rule| rule.enabled)
+        .any(|rule| {
+            rule_conditions(rule).iter().any(|condition| {
+                condition.type_field == RuleType::RuleSet
+                    && condition
+                        .values
+                        .iter()
+                        .any(|value| value.trim().strip_prefix("res:") == Some(id))
+            })
+        })
+}
+
+fn restored_proxy_settings(
+    desired: &Value,
+    running: &Value,
+    removed_resources: &[(&str, Option<Value>)],
+    config_dir: &Path,
+) -> Option<Value> {
     let restore_selection = (desired.get("selectedServerId") != running.get("selectedServerId")
         || desired.get(polaris_store::SELECTION_INTENT_KEY)
             != running.get(polaris_store::SELECTION_INTENT_KEY))
         && running_selection_available(desired, running);
     let mut settings = REVERTIBLE_PROXY_SETTINGS
         .iter()
+        .chain(REVERTIBLE_POLICIES)
         .copied()
         .filter(|key| desired.get(key) != running.get(key))
         .peekable();
-    if !restore_dns && !restore_selection && settings.peek().is_none() {
+    if !restore_selection && removed_resources.is_empty() && settings.peek().is_none() {
         return None;
     }
     let mut candidate = desired.clone();
@@ -3673,40 +3814,126 @@ fn restored_proxy_settings(desired: &Value, running: &Value) -> Option<Value> {
     let output = candidate.as_object_mut()?;
     for key in settings {
         restore_value(output, key, running.get(key));
+        if matches!(
+            key,
+            "trafficRules" | "dnsRules" | "policyRules" | "customRules"
+        ) {
+            if let (Some(restored), Some(saved)) = (output.get_mut(key), desired.get(key)) {
+                restore_rule_remarks(restored, saved);
+            }
+        }
     }
-    if restore_dns {
-        restore_value(output, "dnsConfig", running.get("dnsConfig"));
-        if let Some(action) = running.pointer(action_path) {
-            output
-                .entry("dnsDefaults")
-                .or_insert_with(|| serde_json::json!({}))["unmatchedAction"] = action.clone();
-        } else if let Some(defaults) = output.get_mut("dnsDefaults").and_then(Value::as_object_mut)
+    let mut unavailable = Vec::new();
+    if !removed_resources.is_empty() {
+        // The store writer fences both refresh publication and file cleanup.
+        let rule_dir = super::startup::rule_resource_dir(config_dir);
+        for &(id, ref resource) in removed_resources {
+            if let Some(resource) = resource.as_ref().filter(|record| {
+                record.get("id").and_then(Value::as_str) == Some(id)
+                    && rule_resource_file_survives(record, &rule_dir).is_some()
+            }) {
+                output
+                    .entry("ruleResources")
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                    .as_array_mut()?
+                    .push(resource.clone());
+            } else {
+                unavailable.push(id);
+            }
+        }
+    }
+    if candidate == *desired {
+        return None;
+    }
+    // Servers and subscriptions retain their latest contents. Refuse to undo
+    // policy edits if that would bring back an explicit target since deleted.
+    let restore_policy = REVERTIBLE_POLICIES
+        .iter()
+        .any(|key| desired.get(key) != candidate.get(key));
+    if restore_policy || !unavailable.is_empty() {
+        let restored = UserConfig::deserialize(&candidate).ok()?;
+        if unavailable
+            .iter()
+            .any(|id| rule_resource_required(&restored, id, config_dir))
         {
-            defaults.remove("unmatchedAction");
+            return None;
         }
-        // The running default action may refer to a resolver that was deleted.
-        if polaris_store::validate::validate_for_save(&candidate).is_err() {
-            let output = candidate.as_object_mut()?;
-            restore_value(output, "dnsConfig", desired.get("dnsConfig"));
-            restore_value(output, "dnsDefaults", desired.get("dnsDefaults"));
+        if restore_policy {
+            let missing = missing_policy_targets(&restored);
+            if !missing.is_empty() {
+                let saved = UserConfig::deserialize(desired).ok()?;
+                if !missing.is_subset(&missing_policy_targets(&saved)) {
+                    return None;
+                }
+            }
         }
     }
-    (candidate != *desired).then_some(candidate)
+    polaris_store::validate::validate_for_save(&candidate).ok()?;
+    Some(candidate)
 }
 
-fn saved_settings_revert_token(
+fn missing_policy_targets<'a>(
+    config: &'a UserConfig,
+) -> BTreeSet<(&'static str, &'a str, &'static str, &'a str)> {
+    use polaris_config_engine::user_config::auto_select::AutoSelectTarget;
+    use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
+    use polaris_config_engine::user_config::rule::RuleAction;
+
+    let nodes: BTreeSet<_> = config
+        .servers
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect();
+    let subscriptions: BTreeSet<_> = config
+        .subscriptions
+        .iter()
+        .map(|sub| sub.id.as_str())
+        .collect();
+    let mut missing = BTreeSet::new();
+    let mut check = |plane, owner, node: Option<&'a str>, auto: Option<&'a AutoSelectTarget>| {
+        if let Some(node) = node.filter(|id| !is_sentinel_selection(Some(id))) {
+            if !nodes.contains(node) {
+                missing.insert((plane, owner, "node", node));
+            }
+        }
+        if let Some(AutoSelectTarget::Subscription { subscription_id }) = auto {
+            if !subscriptions.contains(subscription_id.as_str()) {
+                missing.insert((plane, owner, "subscription", subscription_id.as_str()));
+            }
+        }
+    };
+    for rule in config.effective_traffic_rules() {
+        if rule.enabled && rule.route_action() == Some(RuleAction::Proxy) {
+            check(
+                "traffic",
+                rule.id.as_str(),
+                rule.route_target_server_id(),
+                rule.route_target_auto_select(),
+            );
+        }
+    }
+    for rule in &config.app_rules {
+        if rule.enabled && rule.action == RuleAction::Proxy {
+            check(
+                "app",
+                rule.app_id.as_str(),
+                rule.target_server_id.as_deref(),
+                rule.target_auto_select.as_ref(),
+            );
+        }
+    }
+    missing
+}
+
+fn saved_settings_receipt(
     generation: u64,
     desired: &Value,
     running: &Value,
-) -> Option<String> {
-    restored_proxy_settings(desired, running)?;
-    Some(saved_settings_receipt(generation, desired, running))
-}
-
-fn saved_settings_receipt(generation: u64, desired: &Value, running: &Value) -> String {
+    restored: &Value,
+) -> String {
     use polaris_config_engine::builder::orchestration::stable_stringify;
 
-    let input = stable_stringify(&serde_json::json!([generation, desired, running]));
+    let input = stable_stringify(&serde_json::json!([generation, desired, running, restored]));
     polaris_updater::sha256_hex(input.as_bytes())
 }
 

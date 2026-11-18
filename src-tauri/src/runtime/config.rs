@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -486,6 +486,10 @@ impl std::fmt::Debug for DeferredConfigDeletion {
 struct DeferredDeletionJournal {
     version: u8,
     entries: Vec<DeferredConfigDeletion>,
+    // Exact registrations for saved-settings revert. File names remain the
+    // cleanup identity because multiple resources may point to the same file.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    removed_rule_resources: BTreeMap<String, Value>,
 }
 
 impl Default for DeferredDeletionJournal {
@@ -493,6 +497,7 @@ impl Default for DeferredDeletionJournal {
         Self {
             version: DEFERRED_DELETIONS_VERSION,
             entries: Vec::new(),
+            removed_rule_resources: BTreeMap::new(),
         }
     }
 }
@@ -1122,13 +1127,13 @@ impl ConfigManager {
         // 清洗前入参求差集，就会出现“磁盘实体没了、删除 journal 却从未记录”的永久资产泄漏。
         let canonical = self.canonicalize_untrusted_under_write_lock(config)?;
         let mut additions = derive_deferred_deletions(current, &canonical);
-        additions.extend_from_slice(explicit);
+        additions.entries.extend_from_slice(explicit);
         if mesh_guard::has_managed_fields(&canonical) {
             // The legacy deletion record contains only serverId. A managed
             // identity is (serverId, epoch); deleting by the old journal can
             // erase a newly bound epoch after replacement/recovery. S3c owns
             // exact-epoch effects, so this path must not stage TS state work.
-            additions.retain(|entry| {
+            additions.entries.retain(|entry| {
                 !matches!(
                     entry,
                     DeferredConfigDeletion::TailscaleState { .. }
@@ -1353,27 +1358,21 @@ impl ConfigManager {
             .deferred_delete_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.stage_deferred_deletions_locked(current, incoming)
-    }
-
-    #[cfg(test)]
-    fn stage_deferred_deletions_locked(
-        &self,
-        current: &Value,
-        incoming: &Value,
-    ) -> Result<(), StoreError> {
         self.stage_deferred_deletion_entries_locked(derive_deferred_deletions(current, incoming))
     }
 
     fn stage_deferred_deletion_entries_locked(
         &self,
-        additions: Vec<DeferredConfigDeletion>,
+        additions: DeferredDeletionJournal,
     ) -> Result<(), StoreError> {
-        if additions.is_empty() {
+        if additions.entries.is_empty() {
             return Ok(());
         }
         let mut journal = self.load_deferred_deletions_locked()?;
-        for entry in additions {
+        journal
+            .removed_rule_resources
+            .extend(additions.removed_rule_resources);
+        for entry in additions.entries {
             // Bind only newly created intents, never upgrade a historical serverId-only
             // journal by guessing which current filesystem object it referred to.
             #[cfg(any(target_os = "ios", windows))]
@@ -1501,7 +1500,7 @@ impl ConfigManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // 在两把事务锁内重读磁盘真值；不用 cache，外部编辑/迁移同样必须参与取消判定。
         let current = self.load_full_under_write_lock()?;
-        let journal = self.load_deferred_deletions_locked()?;
+        let mut journal = self.load_deferred_deletions_locked()?;
         let mut summary = DeferredDeletionSummary::default();
         let mut remaining = Vec::new();
         for entry in journal.entries {
@@ -1563,11 +1562,69 @@ impl ConfigManager {
                 }
             }
         }
-        self.save_deferred_deletions_locked(&DeferredDeletionJournal {
-            version: DEFERRED_DELETIONS_VERSION,
-            entries: remaining,
-        })?;
+        let retained_files: BTreeSet<_> = remaining
+            .iter()
+            .filter_map(|entry| match entry {
+                DeferredConfigDeletion::RuleResource { file_name } => Some(file_name.as_str()),
+                _ => None,
+            })
+            .collect();
+        journal.removed_rule_resources.retain(|_, resource| {
+            resource
+                .get("fileName")
+                .and_then(Value::as_str)
+                .is_some_and(|file_name| retained_files.contains(file_name))
+        });
+        journal.version = DEFERRED_DELETIONS_VERSION;
+        journal.entries = remaining;
+        self.save_deferred_deletions_locked(&journal)?;
         Ok(summary)
+    }
+
+    /// Preview under the same nonblocking writer fence used to authorize revert.
+    pub(crate) fn try_preview_saved_revert<T>(
+        &self,
+        expected: &Value,
+        running: &Value,
+        preview: impl FnOnce(&[(&str, Option<Value>)]) -> Option<T>,
+    ) -> Result<Option<T>, StoreError> {
+        self.try_with_saved_commit(|saved| {
+            if saved != expected {
+                return Err(StoreError::validation("revert desired owner changed"));
+            }
+            let removed = self.removed_rule_resources_under_write_lock(saved, running)?;
+            let candidate = preview(&removed);
+            if candidate.is_some() && self.read_saved_document()?.0 != *saved {
+                return Err(StoreError::validation(
+                    "revert durable desired owner changed",
+                ));
+            }
+            Ok(candidate)
+        })?
+    }
+
+    fn removed_rule_resources_under_write_lock<'a>(
+        &self,
+        saved: &Value,
+        running: &'a Value,
+    ) -> Result<Vec<(&'a str, Option<Value>)>, StoreError> {
+        if saved.get("ruleResources") == running.get("ruleResources") {
+            return Ok(Vec::new());
+        }
+        let missing = removed_collection_entries(running, saved, "ruleResources");
+        if missing.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _deletions = self
+            .deferred_delete_lock
+            .try_lock()
+            .map_err(|_| StoreError::validation("revert deletion proof unavailable"))?;
+        let journal = self.load_deferred_deletions_locked()?;
+        Ok(missing
+            .into_iter()
+            .filter_map(|resource| resource.get("id").and_then(Value::as_str))
+            .map(|id| (id, journal.removed_rule_resources.get(id).cloned()))
+            .collect())
     }
 
     /// **原子读改写** —— 把「读一份配置 → 改它 → 落盘」变成一个不可分割的动作。
@@ -1654,7 +1711,8 @@ impl ConfigManager {
     /// runtime claim, so refuse a contended write lock immediately.
     pub(crate) fn try_update_saved<R>(
         &self,
-        f: impl FnOnce(&mut Value) -> Decision<R>,
+        running: &Value,
+        f: impl FnOnce(&mut Value, &[(&str, Option<Value>)]) -> Decision<R>,
     ) -> Result<(R, Option<Value>), StoreError> {
         deny_inside_projection("try_update_saved");
         let _guard = self
@@ -1662,7 +1720,8 @@ impl ConfigManager {
             .try_lock()
             .map_err(|_| StoreError::validation("saved commit unavailable"))?;
         let (mut saved, _) = self.read_saved_document()?;
-        match f(&mut saved) {
+        let removed = self.removed_rule_resources_under_write_lock(&saved, running)?;
+        match f(&mut saved, &removed) {
             Decision::Skip(result) => Ok((result, None)),
             Decision::Write(result) => self
                 .save_full_under_write_lock(&saved)
@@ -1854,8 +1913,9 @@ fn warp_credentials(server: &Value) -> Option<(&str, &str)> {
     ))
 }
 
-fn derive_deferred_deletions(current: &Value, incoming: &Value) -> Vec<DeferredConfigDeletion> {
-    let mut out = Vec::new();
+fn derive_deferred_deletions(current: &Value, incoming: &Value) -> DeferredDeletionJournal {
+    let mut journal = DeferredDeletionJournal::default();
+    let out = &mut journal.entries;
     for server in removed_collection_entries(current, incoming, "servers") {
         let Some(server_id) = server.get("id").and_then(Value::as_str) else {
             continue;
@@ -1888,6 +1948,11 @@ fn derive_deferred_deletions(current: &Value, incoming: &Value) -> Vec<DeferredC
             out.push(DeferredConfigDeletion::RuleResource {
                 file_name: file_name.to_string(),
             });
+            if let Some(id) = resource.get("id").and_then(Value::as_str) {
+                journal
+                    .removed_rule_resources
+                    .insert(id.to_owned(), resource.clone());
+            }
         }
     }
     for preset in removed_collection_entries(current, incoming, "customAppPresets") {
@@ -1897,7 +1962,7 @@ fn derive_deferred_deletions(current: &Value, incoming: &Value) -> Vec<DeferredC
             });
         }
     }
-    out
+    journal
 }
 
 pub(crate) fn deferred_deletion_is_cancelled(

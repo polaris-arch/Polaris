@@ -408,6 +408,7 @@ fn managed_mode_never_executes_legacy_server_id_only_ts_deletion() {
         entries: vec![DeferredConfigDeletion::TailscaleState {
             server_id: "ts-1".into(),
         }],
+        ..DeferredDeletionJournal::default()
     };
     std::fs::write(
         mgr.deferred_deletions_path(),
@@ -1049,7 +1050,7 @@ fn derive_deferred_deletions_covers_only_irreversible_assets() {
         "ruleResources": [],
         "customAppPresets": []
     });
-    let entries = derive_deferred_deletions(&current, &incoming);
+    let entries = derive_deferred_deletions(&current, &incoming).entries;
     assert_eq!(
         entries.len(),
         4,

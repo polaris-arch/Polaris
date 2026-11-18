@@ -516,7 +516,7 @@
     "pendingGroupStaged": "Не сохранено · ещё не записано на диск",
     "pendingIgnoreBtn": "Пропустить",
     "pendingResetBtn": "Сбросить",
-    "pendingRevertSavedSettings": "Отменить изменения прокси и портов",
+    "pendingRevertSavedSettings": "Отменить неприменённые настройки и правила",
     "pendingResetConfirm": "Отменить все несохранённые изменения?",
     "pendingRetryBtn": "Повторить",
     "pendingRetrySaveBtn": "Повторить сохранение",
