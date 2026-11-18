@@ -40,7 +40,7 @@ import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
  * 从 `components/screens/**` 引入的全部是 `.ts` 的纯函数 / 纯逻辑（`connection-state.ts`、
  * `format.ts`）。桌面 `.tsx` 一个都不引 —— 那是契约 A1 与节点屏那道门共同钉死的边界。
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 /* 本屏自己的样式面。外壳的 `mobile.css` 已定稿且不属本线射程，故另开一份并在
    `../mobile-entry.test.ts` 的契约 A1 允许集里登记 —— 那道门是**集合恰等**，
    多一份少一份都红，所以「加一份 CSS」必须是一次显式登记，不能悄悄进链路。 */
@@ -160,12 +160,15 @@ function checkedLabel(t: (k: string, o?: Record<string, unknown>) => string, at:
 export function MobileHomeScreen(): ReactElement {
   const { t, i18n } = useTranslation();
   const [writeErrors, setWriteErrors] = useState<WriteErrors>({});
-  /** 连接/断开在飞（后端只投影 `starting`，「停止中」没有对应字段，由这里补）。 */
-  const [connectBusy, setConnectBusy] = useState<'starting' | 'stopping' | null>(null);
+  const mounted = useRef(false);
   const [manualCheckBusy, setManualCheckBusy] = useState(false);
   const checkRun = useRef({ generation: 0, busy: false, alive: true, backendRequested: false, requestId: null as string | null });
   const normalMainRequired = manualSpeedTestCaps(false).normalMainRequired === true;
   const runWrite = useMemo(() => createRunWrite(setWriteErrors, t), [t]);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   /* ── store ───────────────────────────────────────────────────────────────── */
   const servers = useEffectiveServers();
@@ -173,6 +176,8 @@ export function MobileHomeScreen(): ReactElement {
   const diskServers = useAppStore((s) => s.servers);
   const selectedServerId = useAppStore((s) => s.selectedServerId);
   const proxyStatus = useAppStore((s) => s.proxyStatus);
+  const proxyStarting = useAppStore((s) => s.proxyStarting);
+  const proxyStopping = useAppStore((s) => s.proxyStopping);
   const ipInfo = useAppStore((s) => s.ipInfo);
   const unlock = useAppStore((s) => s.unlock);
   const privacyMode = useAppStore((s) => s.privacyMode);
@@ -295,13 +300,13 @@ export function MobileHomeScreen(): ReactElement {
    * 用户再点一下就**在已有起核腿之上再叠一次 start**（那句话是 `ProxyStatus.starting` 的字段注释
    * 逐字写的，托盘浮层为此专门读它）。
    *
-   * 「停止中」后端没有对应字段，故由本屏自己的在飞标记补上 —— 断开同样不是瞬时的。
+   * 全局 store 的启停标记覆盖保存、命令和状态读回，在切页重挂载时也有效。
    * `errorCode` 排在 `running` 之后：成功起核会清空它，跑着的时候那个码是上一轮的陈旧记录。
    */
   const core: CoreLifecycle =
-    proxyStatus?.starting === true || connectBusy === 'starting'
+    proxyStatus?.starting === true || proxyStarting
       ? 'starting'
-      : connectBusy === 'stopping'
+      : proxyStopping
         ? 'stopping'
         : proxyRunning
           ? 'running'
@@ -508,11 +513,11 @@ export function MobileHomeScreen(): ReactElement {
    * **删掉这层包裹即回归双报**（`lib/proxy-start-claim.test.ts` 的消费面守卫钉着它）。
    */
   const onToggleConnect = useCallback(() => {
-    const stopping = proxyRunning;
-    setConnectBusy(stopping ? 'stopping' : 'starting');
-    void runWrite('connect', () =>
-      stopping ? stopProxy() : withProxyStartClaim(() => startProxy()),
-    ).finally(() => setConnectBusy(null));
+    void runWrite(
+      'connect',
+      () => proxyRunning ? stopProxy() : withProxyStartClaim(() => startProxy()),
+      () => mounted.current,
+    );
   }, [runWrite, proxyRunning, startProxy, stopProxy]);
 
   /**

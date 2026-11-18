@@ -4,8 +4,7 @@ import { chromium, type Browser, type Page } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-// IPC doubles prove wiring only: mount both production screens and keep the real
-// app-store switchServer/write queue/readback, rather than substituting a handler.
+// Mount both production screens and retain the real app-store actions and readback.
 const root = path.resolve(import.meta.dirname, '../../..');
 const entry = `
 import React from 'react';
@@ -32,10 +31,12 @@ const intent=params.get('intent')||'auto';
 const servers=['a','b'].map(id=>({id:'node-'+id,name:'Fixture '+id,protocol:'socks',address:'fixture.invalid',port:1}));
 let disk={selectedServerId:selected,proxyMode:'smart',servers,subscriptions:[]};
 if(intent!=='manual') disk.selectionIntent=intent==='null'?null:intent==='false'?false:intent==='empty'?'':intent==='unknown'?{mode:'future',scope:'unknown'}:{mode:'auto',scope:'subscription',subscriptionId:'sub-a'};
-let commandGate,readGate;
+let commandGate,readGate,proxyActionGate;
+let proxyRunning=false;
 const fixture=window.__manual={trace:[],messages:[],armed:false,failCommand:false,failRead:false,holdCommand:false,holdRead:false,
  state:()=>({config:useAppStore.getState().config,selected:useAppStore.getState().selectedServerId}),
  effective:()=>getEffectiveConfig(),disk:()=>disk,releaseCommand:()=>commandGate?.(),releaseRead:()=>readGate?.(),
+ releaseProxyAction:error=>proxyActionGate(error),
  missingConfig(){useAppStore.setState({config:null});},
  publish(config){disk=config;useAppStore.setState({config,servers:config.servers,selectedServerId:config.selectedServerId});},
  draft(value){useStagedConfigStore.setState({enabled:true,hydrated:true,baseline:disk,entries:[{id:'intent-draft',kind:'setting',entityPath:['selectionIntent'],nextValue:value,label:'intent fixture'}]});},
@@ -60,10 +61,24 @@ windowApi.startupConfigFlags=async()=>({});
 api.config.meshRouteReport=async()=>null;
 api.stats.onStatsUpdated=()=>()=>{};api.stats.onConnectionsDetail=()=>()=>{};
 api.stats.subscribe=async()=>{};api.stats.unsubscribe=async()=>{};
-setToastImpl({success:text=>fixture.messages.push(['success',text]),info:text=>fixture.messages.push(['info',text]),warning:text=>fixture.messages.push(['warning',text])});
+const runProxyAction=async(action)=>{
+ try {
+  await new Promise((resolve,reject)=>{
+   proxyActionGate=error=>error ? reject(new Error(error)) : resolve();
+   fixture.pendingProxyAction=action;
+  });
+  proxyRunning=action==='start';
+ } finally { fixture.pendingProxyAction=null; }
+};
+api.proxy.start=()=>runProxyAction('start');
+api.proxy.stop=()=>runProxyAction('stop');
+api.proxy.getStatus=async()=>({running:proxyRunning,starting:false});
+setToastImpl({success:text=>fixture.messages.push(['success',text]),info:text=>fixture.messages.push(['info',text]),warning:text=>fixture.messages.push(['warning',text]),error:text=>fixture.messages.push(['error',text])});
 useStagedConfigStore.setState({enabled:false,hydrated:true,entries:[]});
 useAppStore.setState({config:structuredClone(disk),servers,selectedServerId:selected,proxyStatus:{running:false},invalidNodes:[]});
-createRoot(document.getElementById('root')).render(<main className="mobile-root">{params.get('screen')==='nodes'?<MobileNodesScreen/>:<MobileHomeScreen/>}</main>);
+const root=createRoot(document.getElementById('root'));
+fixture.showScreen=(screen)=>root.render(<main className="mobile-root">{screen==='nodes'?<MobileNodesScreen/>:<MobileHomeScreen/>}</main>);
+fixture.showScreen(params.get('screen'));
 `;
 
 type Route = 'home-node' | 'home-direct' | 'home-block' | 'nodes-node';
@@ -120,6 +135,37 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile explicit manua
     browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
+
+  it('keeps Home busy through a remount while a proxy action awaits the bridge', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    try {
+      await page.goto(`${origin}/__manual?screen=home&intent=manual`);
+      const connect = page.locator('[data-write-control="connect"]');
+      const stopFailure = 'fixture stop not confirmed';
+      for (const { action, busy, settled, error } of [
+        { action: 'start', busy: 'starting', settled: 'running' },
+        { action: 'stop', busy: 'stopping', settled: 'running', error: stopFailure },
+        { action: 'stop', busy: 'stopping', settled: 'stopped' },
+      ]) {
+        await connect.click();
+        await page.waitForFunction(action => (window as any).__manual.pendingProxyAction === action, action);
+        await page.locator(`.h-runchip.s-${busy}`).waitFor();
+
+        await page.evaluate(() => (window as any).__manual.showScreen('nodes'));
+        await connect.waitFor({ state: 'detached' });
+        await page.evaluate(() => (window as any).__manual.showScreen('home'));
+        await connect.waitFor();
+        expect(await page.locator(`.h-runchip.s-${busy}`).count()).toBe(1);
+        expect(await connect.isDisabled()).toBe(true);
+
+        await page.evaluate(error => (window as any).__manual.releaseProxyAction(error), error);
+        await page.locator(`.h-runchip.s-${settled}`).waitFor();
+        expect(await connect.isEnabled()).toBe(true);
+      }
+      const messages = await page.evaluate(() => (window as any).__manual.messages);
+      expect(messages).toEqual([['error', expect.stringContaining(stopFailure)]]);
+    } finally { await page.close(); }
+  });
 
   for (const route of routes) {
     it(`${route}: Auto + current exit switches once and adopts the complete readback`, async () => {
