@@ -6,26 +6,6 @@ from pathlib import Path
 import re
 
 
-GO_VERSION = '1.27.4'
-
-# Names and source-owned paths are schema, not mutable source selections. Tree,
-# version and byte facts belong to the explicitly reviewed caller declaration.
-VENDOR_DIRECTORIES = {
-    'github.com/sagernet/sing-tun': 'sing-tun',
-    'github.com/sagernet/tailscale': 'tailscale',
-    'github.com/metacubex/utls': 'metacubex-utls',
-    'github.com/sagernet/cronet-go': 'cronet-go',
-    'github.com/sagernet/fswatch': 'fswatch',
-    'github.com/sagernet/sing': 'sing',
-    'github.com/sagernet/sing-quic': 'sing-quic',
-    'github.com/sagernet/wireguard-go': 'wireguard-go',
-    'github.com/database64128/tfo-go/v2': 'tfo-go',
-    'github.com/sagernet/sing-vmess': 'sing-vmess',
-    'github.com/libp2p/go-nat': 'go-nat',
-    'github.com/google/nftables': 'google-nftables',
-}
-
-
 def require(condition, reason):
     if not condition:
         raise RuntimeError('reviewed source policy: ' + reason)
@@ -44,60 +24,12 @@ def hexadecimal(value, width):
     return isinstance(value, str) and re.fullmatch('[0-9a-f]{%d}' % width, value) is not None
 
 
-def validate_source_policy(policy, context):
-    fields = {'schema', 'sourceCommit', 'sourceTree', 'goDirective', 'goVersion', 'toolchain',
-              'goModSha256', 'goSumSha256', 'metacubex', 'vendors'}
-    require(isinstance(policy, dict) and set(policy) == fields and
-            policy['schema'] == 'polaris-reviewed-kernel-source-v4', 'complete explicit declaration required')
-    for key in ('sourceCommit', 'sourceTree'):
-        require(hexadecimal(policy[key], 40) and policy[key] == context.get(key), key + ' differs')
-    require(policy['goDirective'] == '1.27.0' and policy['goVersion'] == GO_VERSION and
-            policy['toolchain'] == 'go' + GO_VERSION, 'exact Go directive/toolchain required')
-    for key in ('goModSha256', 'goSumSha256'):
-        require(hexadecimal(policy[key], 64) and
-                (key not in context or context[key] == policy[key]), key + ' differs')
-    meta = policy['metacubex']
-    fields = {'module', 'version', 'replacementPath', 'replacementTree', 'replacementFileCount',
-              'bindingPath', 'bindingSha256', 'patchPath', 'patchSha256',
-              'upstreamCommit', 'upstreamH1', 'upstreamZipSha256'}
-    require(isinstance(meta, dict) and set(meta) == fields and
-            meta['module'] == 'github.com/metacubex/utls' and meta['version'] == 'v1.8.8' and
-            meta['replacementPath'] == './third_party/metacubex-utls' and
-            type(meta['replacementFileCount']) is int and meta['replacementFileCount'] == 355 and
-            meta['bindingPath'] == 'release/dependency-sources/metacubex-utls-replacement.json' and
-            meta['patchPath'] == 'release/dependency-sources/metacubex-utls-reality-alpn.patch',
-            'exact Meta source declaration required')
-    require(hexadecimal(meta['replacementTree'], 40) and hexadecimal(meta['upstreamCommit'], 40) and
-            all(hexadecimal(meta[key], 64) for key in ('bindingSha256', 'patchSha256', 'upstreamZipSha256')) and
-            isinstance(meta['upstreamH1'], str) and re.fullmatch(r'h1:[A-Za-z0-9+/]{43}=', meta['upstreamH1']),
-            'Meta source hashes/baseline sum differ')
-    validate_vendors(policy['vendors'])
-    require(policy['vendors'][meta['module']] == {key: meta[key] for key in
-            ('version', 'replacementPath', 'replacementTree', 'replacementFileCount')},
-            'Meta and reviewed-vendor declarations disagree')
-    return policy
-
-
-def validate_vendors(vendors):
-    require(isinstance(vendors, dict) and set(vendors) == set(VENDOR_DIRECTORIES),
-            'exact reviewed vendor names required')
-    fields = {'version', 'replacementPath', 'replacementTree', 'replacementFileCount'}
-    for name, pin in vendors.items():
-        require(isinstance(pin, dict) and set(pin) == fields,
-                'complete vendor declaration required: ' + name)
-        require(pin['replacementPath'] == './third_party/' + VENDOR_DIRECTORIES[name] and
-                hexadecimal(pin['replacementTree'], 40) and type(pin['replacementFileCount']) is int and
-                0 < pin['replacementFileCount'] <= 65536, 'invalid vendor pin: ' + name)
-        require(isinstance(pin['version'], str) and
-                re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', pin['version']),
-                'explicit vendor module version required: ' + name)
-    return vendors
-
-
-def verify_vendor_module_declarations(raw, vendors):
+def verify_vendor_module_declarations(raw, policy):
     directives, dependencies, replacements = source_module_declarations(raw)
-    require(directives == {'module': 'github.com/sagernet/sing-box', 'go': '1.27.0', 'toolchain': 'go' + GO_VERSION},
-            'kernel Go directives differ')
+    require(directives == {'module': 'github.com/sagernet/sing-box',
+                           'go': policy['goDirective'], 'toolchain': policy['toolchain']},
+            'actual Go/module directives differ')
+    vendors = policy['vendors']
     local = {}
     for name, (version, target) in replacements.items():
         if len(target) == 1:
@@ -107,7 +39,7 @@ def verify_vendor_module_declarations(raw, vendors):
             'exact reviewed local replacements required')
     for name, pin in vendors.items():
         require(dependencies.get(name) == pin['version'], 'actual vendor dependency version differs: ' + name)
-    return directives, dependencies, replacements
+    return dependencies
 
 
 def git_object(kind, raw):
@@ -280,28 +212,23 @@ def source_module_declarations(raw):
     return values, dependencies, replacements
 
 
-def verify_source_policy_files(policy, context, files, actual_meta_tree, *, vendor_modes=None, vendor_trees=None):
+def verify_source_policy_files(policy, files, actual_meta_tree, *, vendor_modes=None, vendor_trees=None):
     """Require every declared vendor's bytes/modes/tree plus the Meta proof.
 
     Link entries contain the link-target bytes, never followed file contents.
     Archive callers without that complete evidence fail closed rather than
     treating a Meta-only inventory as a complete reviewed-vendor source proof.
     """
-    validate_source_policy(policy, context)
     meta = policy['metacubex']
     vendors = policy['vendors']
     reviewed_vendors = verify_vendor_files(vendors, files, vendor_modes, vendor_trees)
     require(actual_meta_tree == meta['replacementTree'], 'actual Meta subtree differs')
     for name, key in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
         require(name in files and sha(files[name]) == policy[key], 'actual ' + name + ' differs')
-    directives, dependencies, _ = source_module_declarations(files['go.mod'])
-    require(directives == {'module': 'github.com/sagernet/sing-box',
-                           'go': policy['goDirective'], 'toolchain': policy['toolchain']},
-            'actual Go/module directives differ')
+    dependencies = verify_vendor_module_declarations(files['go.mod'], policy)
     require(dependencies.get(meta['module']) == meta['version'] and
             dependencies.get('github.com/sagernet/gomobile') == 'v0.1.13',
             'actual Meta/generator dependency version differs')
-    verify_vendor_module_declarations(files['go.mod'], vendors)
     require(meta['bindingPath'] in files and sha(files[meta['bindingPath']]) == meta['bindingSha256'],
             'actual Meta binding differs')
     binding = decode_binding(files[meta['bindingPath']])

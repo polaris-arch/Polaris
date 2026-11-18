@@ -492,6 +492,7 @@ def tool_facts(args, value, env):
 
 
 PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py',
+             'scripts/mobile-core/source-admission.mjs',
              'scripts/mobile-core/plan.py',
                  'scripts/lib/polaris-version.json',
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
@@ -527,6 +528,9 @@ def android_build_code(identity, policy=ANDROID_BUILD_CODE_POLICY):
     files = identity.get('files') if isinstance(identity, dict) else None
     require(isinstance(files, dict), 'original producer code inventory is missing')
     missing = set(PRODUCER_FILES) - files.keys()
+    # A retained receipt can predate the separate source admission module.
+    # Its original inventory still takes part in comparison and causes a miss.
+    missing.discard('scripts/mobile-core/source-admission.mjs')
     # Retained receipts can describe the previous installer or Apple inspector.
     if 'scripts/mobile-core/prepare-ndk-linux.py' in files:
         missing.discard('scripts/mobile-core/prepare-ndk-linux.mjs')

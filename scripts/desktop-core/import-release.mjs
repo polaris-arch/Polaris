@@ -149,10 +149,12 @@ async function importRelease(tag) {
   for (const platform of [mobile.android, mobile.apple]) platform.outputName = platform.outputName.replace(mobile.version, version);
   Object.assign(mobile, { version, sourceTag: tag, sourceTagObject: tagObject, sourceCommit, sourceTree,
     goModSha256: sourcePolicy.goModSha256, goSumSha256: sourcePolicy.goSumSha256, goVersion: sourcePolicy.goVersion, sourcePolicy });
+  const { validateMobileSource } = await import('../mobile-core/source-admission.mjs');
+  validateMobileSource(mobile);
+  const mobileJson = json(mobile);
+  demand(Buffer.byteLength(mobileJson) <= 65536, 'mobile input contract is too large');
   writeFileSync(join(ROOT, CONTRACT_PATH), json(contract));
-  writeFileSync(join(ROOT, MOBILE_PATH), json(mobile));
-  // Mobile input admission belongs to its Python consumer.
-  execFileSync('python3', ['-B', join(ROOT, 'scripts/mobile-core/fork_input.py'), '--go-version']);
+  writeFileSync(join(ROOT, MOBILE_PATH), mobileJson);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

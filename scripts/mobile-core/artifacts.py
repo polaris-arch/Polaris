@@ -313,8 +313,8 @@ def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, ac
             'actual source graph module rows differ')
     declared = {row['Path']: row for row in graph}
     require(len(declared) == len(graph), 'duplicate actual source graph module')
-    from source_policy import validate_source_policy, verify_vendor_graph
-    policy = validate_source_policy(value['sourcePolicy'], value)
+    from source_policy import verify_vendor_graph
+    policy = validate(value)['sourcePolicy']
     meta = policy['metacubex']
     required_native = {meta['module'], 'github.com/sagernet/sing-tun'}
     reviewed_vendors = policy['vendors']

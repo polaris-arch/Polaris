@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
 import { verifyDashboardArchive, dashboardInventory, dashboardFresh } from './fetch-dashboard.mjs';
 import { inspectAppleArchitecture } from './mobile-core/apple-admission.mjs';
+import { validateMobileSource } from './mobile-core/source-admission.mjs';
 
 test('D01 authentic bytes required; login HTML and same-size mutation rejected', () => {
   const bytes = Buffer.from('pinned bytes');
@@ -39,6 +40,29 @@ test('D02 bounded attempts, retry window and child; caller cannot expand hard ti
   });
   assert.throws(() => boundedDownload('http://example.invalid'));
   assert.throws(() => boundedDownload('https://example.invalid',{},()=>{throw Error('timeout');}), /timeout/);
+});
+
+test('formal mobile declaration admits the fixed source and rejects platform, policy and acceptance drift', () => {
+  const value = JSON.parse(readFileSync(new URL('./mobile-core/source-contract.json', import.meta.url)));
+  assert.equal(validateMobileSource(value), value);
+  const meta = 'github.com/metacubex/utls';
+  const mutations = [
+    [(row) => { row.sourceTag = 'v' + row.version.replace('-alpha.', '-beta.'); }, /source tag\/version differs/],
+    [(row) => { row.android.abis.pop(); }, /four-ABI/],
+    [(row) => { row.apple.tags = [...row.android.tags]; }, /Apple target-only tags/],
+    [(row) => { row.android.outputName += '/escaped.aar'; }, /basename cannot escape/],
+    [(row) => { row.android.outputName += '\\escaped.aar'; }, /basename cannot escape/],
+    [(row) => { row.sourceOverlay = false; }, /zero-overlay/],
+    [(row) => { row.AppAccepted = true; }, /cannot issue artifact acceptance/],
+    [(row) => { row.sourcePolicy.sourceTree = '0'.repeat(40); }, /reviewed source policy: sourceTree differs/],
+    [(row) => { delete row.sourcePolicy.vendors[meta]; }, /exact reviewed vendor names/],
+    [(row) => { row.sourcePolicy.vendors[meta].replacementFileCount++; }, /Meta and reviewed-vendor declarations disagree/],
+  ];
+  for (const [mutate, expected] of mutations) {
+    const changed = structuredClone(value);
+    mutate(changed);
+    assert.throws(() => validateMobileSource(changed), expected);
+  }
 });
 
 test('Apple architecture admission rechecks the explicit extension and retains sanitized observations', () => {

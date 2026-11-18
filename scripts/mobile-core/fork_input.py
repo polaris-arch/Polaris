@@ -7,18 +7,14 @@ promote a diagnostic AAR/framework or a CLI receipt into App acceptance.
 import hashlib
 import os
 import json
+from functools import lru_cache
 from pathlib import Path
 import re
 import subprocess
-from source_policy import validate_source_policy, verify_source_policy_files, verify_vendor_sources
+from source_policy import verify_source_policy_files, verify_vendor_sources
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(__file__).with_name('source-contract.json')
-# Shared desktop/mobile grammar; this entry retains its existing alpha-only scope.
-POLARIS_VERSION = re.compile(json.loads((ROOT / 'scripts/lib/polaris-version.json').read_bytes())['pattern'])
-ANDROID_TARGETS = ['android/arm64', 'android/arm', 'android/386', 'android/amd64']
-APPLE_TARGETS = ['ios/arm64', 'iossimulator/arm64']
-ANDROID_ABIS = ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']
 
 
 def require(condition, reason):
@@ -47,56 +43,17 @@ def decode(raw, maximum=65536):
                       parse_constant=lambda _: (_ for _ in ()).throw(RuntimeError('nonfinite input')))
 
 
+@lru_cache(maxsize=8)
+def admit_declaration(raw):
+    result = subprocess.run(['node', Path(__file__).with_name('source-admission.mjs')],
+                            input=raw, capture_output=True, timeout=30)
+    require(result.returncode == 0,
+            result.stderr.decode(errors='replace').strip() or 'formal mobile source declaration rejected')
+
+
 def validate(value):
-    require(value.get('schema') == 'polaris-mobile-fork-input-v1' and value.get('role') == 'mobile',
-            'formal mobile source role is required')
-    require(value.get('repository') == 'polaris-arch/sing-box-polaris' and value.get('repositoryId') == 1421657509
-            and value.get('sourceURL') == 'https://github.com/polaris-arch/sing-box-polaris', 'mobile source repository differs')
-    require(value.get('goModule') == 'github.com/sagernet/sing-box', 'file branding must not rename the Go module')
-    for key, width in [('sourceCommit', 40), ('sourceTree', 40), ('sourceTagObject', 40),
-                       ('goModSha256', 64), ('goSumSha256', 64)]:
-        require(isinstance(value.get(key), str) and re.fullmatch('[0-9a-f]{%d}' % width, value[key]),
-                'actual immutable source field required: ' + key)
-    version = value.get('version')
-    version_match = POLARIS_VERSION.fullmatch(version) if isinstance(version, str) else None
-    require(version_match and version_match[3] == 'alpha' and
-            value.get('sourceTag') == 'v' + version, 'mobile source tag/version differs')
-    policy = validate_source_policy(value.get('sourcePolicy'), value)
-    require(type(value.get('sourceOverlay')) is int and value['sourceOverlay'] == 0 and
-            value.get('patches') == [] and value.get('dependencyPatches') == [],
-            'formal mobile source must be zero-overlay')
-    require(value.get('goVersion') == policy['goVersion'] and
-            value.get('gomobileVersion') == value.get('gobindVersion') == 'v0.1.13',
-            'formal generator must match the actual source module and API')
-    require(value.get('artifactPins') is None and value.get('producerReceipt') is None and
-            value.get('AppAccepted') is False and value.get('devicePassed') is False and
-            value.get('publicationEligible') is False, 'input declarations cannot issue artifact acceptance')
-    android, apple = value['android'], value['apple']
-    require(android['targets'] == ANDROID_TARGETS and android['abis'] == ANDROID_ABIS and
-            android['minimumAPI'] == 24 and android['minimumLoadAlignment'] == 16384 and
-            android['javaMajor'] == 17 and android['legacyAPI21Enabled'] is False,
-            'formal Android requires one API24/four-ABI AAR and no legacy variant')
-    require(tuple(android.get(key) for key in ('ndkRevision', 'ndkSourceRevision', 'ndkPackage', 'ndkArchivePath')) ==
-            ('30.0.16248370', '30.0.16248370', 'android-ndk-r30', 'scripts/mobile-core/ndk-r30-linux.json'),
-            'formal Android NDK differs')
-    require(apple['targets'] == APPLE_TARGETS and
-            apple['slices'] == ['ios-arm64', 'ios-arm64-simulator'] and
-            apple['minimumOS'] == '15.0' and apple['appMinimumOS'] == '17.0' and
-            apple['macOSTvOSIncluded'] is False, 'formal Apple requires exactly two arm64 iOS platform slices')
-    require(apple['frameworkName'] == 'Libbox.xcframework' and
-            android['libname'] == apple['libname'] == 'box' and android['javaPackage'] == 'io.nekohasekai',
-            'existing SDK bindings must be retained')
-    for platform in [android, apple]:
-        tags = platform['tags']
-        require(isinstance(tags, list) and tags and len(tags) == len(set(tags)) and
-                all(isinstance(tag, str) and re.fullmatch('[a-z0-9_]+', tag) for tag in tags) and
-                {'with_gvisor', 'with_naive_outbound', 'with_tailscale', 'with_clash_api'} <= set(tags),
-                'formal mobile feature tags differ')
-        require(platform['outputName'].startswith('polaris-box-' + value['version'] + '-'),
-                'mobile asset filename must use the polaris-box prefix')
-        require(Path(platform['outputName']).name == platform['outputName'], 'asset basename cannot escape output slot')
-    require(set(apple['tags']) == set(android['tags']) | {'with_dhcp', 'grpcnotrace', 'with_low_memory'},
-            'Apple target-only tags differ')
+    # Reuse only an identical complete declaration within this process.
+    admit_declaration(canonical(value))
     return value
 
 
@@ -139,7 +96,7 @@ def verify_source(source, value, *, generator_outputs=False):
             'source checkout must be exact and clean before mobile bind')
     for name, key in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
         require(sha((source / name).read_bytes()) == value[key], 'source module bytes differ')
-    policy = validate_source_policy(value['sourcePolicy'], value)
+    policy = value['sourcePolicy']
     module = (source / 'go.mod').read_text()
     directive = policy['goDirective']
     require(re.search(r'^module\s+' + re.escape(value['goModule']) + r'\s*$', module, re.M) and
@@ -175,7 +132,7 @@ def verify_source(source, value, *, generator_outputs=False):
             'sourceTree': value['sourceTree'], 'sourceTag': value['sourceTag'],
             'sourceTagObject': value['sourceTagObject'], 'sourceOverlay': 0,
             'inputContractSha256': sha(canonical(value)), 'artifactAcceptance': False,
-            'reviewedSource': verify_source_policy_files(policy, value, files, git(source, 'rev-parse', 'HEAD:' + prefix),
+            'reviewedSource': verify_source_policy_files(policy, files, git(source, 'rev-parse', 'HEAD:' + prefix),
                                                          vendor_modes=modes, vendor_trees=trees)}
 
 
