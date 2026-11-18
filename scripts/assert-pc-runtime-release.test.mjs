@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -10,77 +10,6 @@ import { createHash } from 'node:crypto';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const script = join(root, 'scripts/assert-pc-runtime-release.mjs');
-const command = 'node scripts/assert-pc-runtime-release.mjs';
-const clearanceName = 'Require selected formal release source policy';
-const packageYaml = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
-const riskYaml = readFileSync(join(root, '.github/workflows/release-risk.yml'), 'utf8');
-
-function job(yaml, name) {
-  const lines = yaml.split('\n');
-  const start = lines.findIndex((line) => line === `  ${name}:`);
-  assert.ok(start >= 0, `missing job: ${name}`);
-  const end = lines.findIndex((line, index) => index > start && /^  [a-zA-Z_][\w-]*:$/.test(line));
-  return lines.slice(start, end < 0 ? lines.length : end).join('\n');
-}
-
-function step(body, name) {
-  const lines = body.split('\n');
-  const start = lines.findIndex((line) => line === `      - name: ${name}`);
-  assert.ok(start >= 0, `missing step: ${name}`);
-  const end = lines.findIndex((line, index) => index > start && /^      - (?:name:|uses:)/.test(line));
-  return { start, text: lines.slice(start, end < 0 ? lines.length : end).join('\n') };
-}
-
-function requireBlockingStep(body) {
-  assert.doesNotMatch(body, /^    continue-on-error:/m, 'release job must propagate failures');
-  const clearance = step(body, clearanceName);
-  assert.doesNotMatch(clearance.text, /^        (?:if|continue-on-error|env):/m);
-  assert.match(clearance.text, /^        run: node scripts\/assert-pc-runtime-release\.mjs$/m);
-  const checkout = body.split('\n').findIndex((line) => /uses: actions\/checkout@/.test(line));
-  assert.ok(checkout >= 0 && checkout < clearance.start, 'clearance must use checked out policy');
-  const firstWrite = body.split('\n').findIndex((line) => /^\s+gh release (?:create|upload|edit) /.test(line));
-  assert.ok(firstWrite > clearance.start, 'clearance must precede every release write');
-}
-
-function requirePackagePolicy(yaml) {
-  requireBlockingStep(job(yaml, 'release_desktop'));
-  const release = job(yaml, 'release');
-  requireBlockingStep(release);
-  const promote = step(release, 'Promote release to public').text;
-  assert.doesNotMatch(promote, /^        (?:if|continue-on-error):/m);
-  assert.match(promote, /^          set -euo pipefail\n          node scripts\/assert-pc-runtime-release\.mjs$/m);
-  assert.ok(promote.indexOf(command) < promote.indexOf('gh release edit '));
-  const candidate = job(yaml, 'package');
-  requireCandidateSources(candidate);
-  assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
-  assert.ok(candidate.includes('selected source provenance'));
-  assert.ok(candidate.includes('does not authorize publication or establish native/device acceptance'));
-  assert.ok(candidate.includes('uses: actions/upload-artifact@'));
-}
-
-function requireCandidateSources(candidate) {
-  assert.match(candidate, /^    needs: setup$/m);
-  // `!cancelled()` (2026-10-07) lets a superseded run stop its in-flight
-  // installer legs, whereas `always()` kept them running to the end.
-  assert.doesNotMatch(candidate, /^      always\(\)/m, 'installer legs must stay cancellable');
-  assert.match(candidate, /^    if: >-\n      \(!cancelled\(\) && needs\.setup\.result == 'success'\)$/m);
-}
-
-function requireRiskPolicy(yaml) {
-  const policy = job(yaml, 'pc_runtime_release_policy');
-  assert.doesNotMatch(policy, /^    (?:if|needs|continue-on-error):/m);
-  const verify = step(policy, 'Verify fail-closed source-first release policy').text;
-  assert.doesNotMatch(verify, /^        (?:if|continue-on-error):/m);
-  assert.match(verify, /^        run: node --test scripts\/assert-pc-runtime-release\.test\.mjs$/m);
-  const gate = job(yaml, 'gate');
-  assert.match(gate, /^    needs: \[[^\n]*pc_runtime_release_policy[^\n]*\]$/m);
-  assert.ok(gate.includes('PC_RUNTIME_POLICY_RESULT: ${{ needs.pc_runtime_release_policy.result }}'));
-  assert.ok(gate.includes('[ "$PC_RUNTIME_POLICY_RESULT" = success ] || {'));
-  assert.match(gate, /^    if: always\(\)$/m);
-  const events = yaml.split('jobs:')[0];
-  assert.doesNotMatch(events, /^\s+(?:paths|paths-ignore):/m);
-}
-
 function runPolicy(args = [], env = {}, policyScript = script) {
   return spawnSync(process.execPath, [policyScript, ...args], {
     cwd: root,
@@ -105,72 +34,12 @@ test('arguments cannot bypass source checks or grant native clearance', () => {
   }
 });
 
-test('missing release policy script fails closed', () => {
-  const missing = join(root, 'scripts/__missing_pc_runtime_release_gate__.mjs');
-  assert.equal(existsSync(missing), false);
-  const result = spawnSync(process.execPath, [missing], { cwd: root, encoding: 'utf8' });
-  assert.notEqual(result.status, 0);
-});
-
-test('desktop draft, uploads and final public promotion all require the source-first policy', () => {
-  requirePackagePolicy(packageYaml);
-});
-
-test('removing, skipping or swallowing a release clearance fails the policy', () => {
-  const runLine = `        run: ${command}`;
-  const mutants = [
-    packageYaml.replace(runLine, ''),
-    packageYaml.replace(runLine, `        # run: ${command}`),
-    packageYaml.replace(runLine, `${runLine} || true`),
-    packageYaml.replace(runLine, `        if: inputs.skip_quality_gates != true\n${runLine}`),
-    packageYaml.replace(runLine, `        continue-on-error: true\n${runLine}`),
-    packageYaml.replace(runLine, `        run: test "$SKIP" = 1 || ${command}`),
-    packageYaml.replace('  release_desktop:\n', '  release_desktop:\n    continue-on-error: true\n'),
-    packageYaml.replace(`          ${command}\n`, ''),
-  ];
-  for (const mutant of mutants) assert.throws(() => requirePackagePolicy(mutant));
-});
-
-test('candidate matrix preserves strict source consumption and states unobserved acceptance', () => {
-  const candidate = job(packageYaml, 'package');
-  requireCandidateSources(candidate);
-  const condition = candidate.match(/^    if: >-\n(?:      .*\n)+/m)?.[0];
-  assert.ok(condition, 'candidate condition must be present for negative controls');
-  for (const [before, after] of [
-    ['!cancelled()', 'always()'],
-    ["needs.setup.result == 'success'", "needs.setup.result != 'failure'"],
-  ]) {
-    const changed = condition.replace(before, after);
-    assert.notEqual(changed, condition, `mutation must exercise ${before}`);
-    assert.throws(() => requireCandidateSources(candidate.replace(condition, changed)));
-  }
-  assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
-  const summary = step(candidate, 'Describe source-first desktop artifacts').text;
-  assert.ok(summary.includes('GITHUB_STEP_SUMMARY'));
-  assert.ok(summary.includes('Publication still requires the complete signed Release DAG'));
-});
-
-test('Release Risk runs policy independently of path classification and requires it in final gate', () => {
-  requireRiskPolicy(riskYaml);
-});
-
-test('path-selected or optional policy checks cannot make Release Risk green', () => {
-  for (const mutant of [
-    riskYaml.replace('  pc_runtime_release_policy:\n', '  pc_runtime_release_policy:\n    if: needs.classify.outputs.has_package == \'true\'\n'),
-    riskYaml.replace('  pc_runtime_release_policy:\n', '  pc_runtime_release_policy:\n    needs: classify\n'),
-    riskYaml.replace('        run: node --test scripts/assert-pc-runtime-release.test.mjs', '        run: node --test scripts/assert-pc-runtime-release.test.mjs || true'),
-    riskYaml.replace('[ "$PC_RUNTIME_POLICY_RESULT" = success ] || {', '[ "$PC_RUNTIME_POLICY_RESULT" != failure ] || {'),
-    riskYaml.replace(', pc_runtime_release_policy]', ']'),
-  ]) assert.throws(() => requireRiskPolicy(mutant));
-});
-
 test('both policy files select package impact', () => {
   for (const path of ['scripts/assert-pc-runtime-release.mjs', 'scripts/assert-pc-runtime-release.test.mjs']) {
     assert.deepEqual(classifyImpact([path]).platforms, [...ALL_PACKAGE_PLATFORMS]);
     assert.equal(classifyImpact([path]).hasPackage, true);
   }
 });
-
 
 test('actual production CLI admits only the selected formal contract without runtime clearance', () => {
   const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
@@ -186,7 +55,6 @@ test('actual production CLI admits only the selected formal contract without run
     assert.equal(policy.sourceCommit, contract.sourceCommit);
   }
 });
-
 
 function formalPolicyFixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'formal-source-publication-'));

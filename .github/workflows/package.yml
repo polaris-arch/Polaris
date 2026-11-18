@@ -1766,8 +1766,7 @@ jobs:
 
       # Validate before using the tag in an artifact glob; never admit glob metacharacters.
       - name: Require literal release artifact tag
-        run: |
-          node --input-type=module -e 'import assert from "node:assert/strict"; import { assetNames } from "./scripts/release-assets.mjs"; const tag = process.env.GITHUB_REF_NAME; assert.match(tag, /^v/); assetNames(tag.slice(1), "release");'
+        run: node scripts/release-assets.mjs validate-tag
 
       # Only this tag’s four desktop transport artifacts, never evidence artifacts.
       # 四个 artifact 合并落进 dist-release/。
@@ -2125,8 +2124,7 @@ jobs:
 
       # Validate before using the tag in an artifact glob; never admit glob metacharacters.
       - name: Require literal release artifact tag
-        run: |
-          node --input-type=module -e 'import assert from "node:assert/strict"; import { assetNames } from "./scripts/release-assets.mjs"; const tag = process.env.GITHUB_REF_NAME; assert.match(tag, /^v/); assetNames(tag.slice(1), "release");'
+        run: node scripts/release-assets.mjs validate-tag
 
       - name: Verify release identity is still the same draft
         id: release_identity

@@ -56,12 +56,16 @@ export function verifyAndroidDigests(version, verified, sums) {
 function main() {
   const [mode, ...args] = process.argv.slice(2);
   if (mode === 'names' && args.length === 2) console.log(assetNames(...args).join('\n'));
-  else if (mode === 'abis' && args.length === 2) {
+  else if (mode === 'validate-tag' && args.length === 0) {
+    const tag = process.env.GITHUB_REF_NAME;
+    assert.match(tag, /^v/, 'release artifact tag must start with v');
+    assetNames(tag.slice(1), 'release');
+  } else if (mode === 'abis' && args.length === 2) {
     const names = execFileSync('unzip', ['-Z1', args[0]], { encoding: 'utf8' }).trimEnd().split('\n');
     verifyAbiNames(names, args[1]);
     console.log(`APK ABI inventory verified: ${args[1]}`);
   } else if (mode === 'android-digests' && args.length === 3) {
     verifyAndroidDigests(args[0], JSON.parse(args[1]), readFileSync(args[2], 'utf8'));
-  } else throw new Error('usage: release-assets.mjs names <version> <label> | abis <apk> <flavor> | android-digests <version> <JSON> <SHA256SUMS>');
+  } else throw new Error('usage: release-assets.mjs names <version> <label> | validate-tag | abis <apk> <flavor> | android-digests <version> <JSON> <SHA256SUMS>');
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
