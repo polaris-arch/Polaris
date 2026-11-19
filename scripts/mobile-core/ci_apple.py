@@ -6,7 +6,6 @@ import json
 import hashlib
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import subprocess
@@ -18,7 +17,7 @@ import zipfile
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from artifacts import MAX_ARTIFACT, MAX_RECEIPT, file_pin, read_pinned, read_receipt, receipt_chunks
+from artifacts import MAX_ARTIFACT, MAX_RECEIPT, file_pin, read_receipt, receipt_chunks
 from ci_android import prepare_source
 from consume import materialize_apple_resources
 from fork_input import ROOT, canonical, decode, load, require, sha
@@ -154,48 +153,6 @@ def admit():
     print('APPLE_RUNNER_TOOL_ADMISSION=' + json.dumps(facts, sort_keys=True), flush=True)
 
 
-def inspect_apple_architecture(root, env):
-    slots = required_slots()
-    project = ROOT / 'src-tauri/gen/apple/polaris.xcodeproj'
-    config = ROOT / 'src-tauri/tauri.ios.conf.json'
-    inputs = [project / 'project.pbxproj', project / 'xcshareddata/xcschemes/polaris_iOS.xcscheme', config]
-    config_bytes, config_pin = read_pinned(config)
-    minimum = json.loads(config_bytes)['bundle']['iOS']['minimumSystemVersion']
-    require(isinstance(minimum, str) and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?', minimum),
-            'explicit iOS deployment version required')
-    pins = [file_pin(path) for path in inputs[:-1]] + [config_pin]
-
-    def inspect(query, slot, command, scheme=None):
-        raw = run(command, cwd=ROOT, env=env, observation_fd=1,
-                  observation_phase='build-settings-admission', observation_slot=slot).encode()
-        require(len(raw) <= 2 * 1024 ** 2, 'Apple build-settings response exceeds observation bound')
-        result = subprocess.run(['node', ROOT / 'scripts/mobile-core/apple-admission.mjs', slot, query,
-                                 minimum, json.dumps(scheme)], input=raw, capture_output=True, timeout=30)
-        require(result.returncode == 0, 'Apple build-settings inspector failed')
-        checked = json.loads(result.stdout)
-        if 'observation' in checked:
-            write_json(root / f'build-settings-{slot}-{query}.json', checked['observation'])
-        require('error' not in checked, checked.get('error'))
-        return checked['admission']
-
-    observations = {}
-    for slot in slots:
-        sdk, destination = (('iphoneos', 'iOS') if slot == 'device-arm64'
-                            else ('iphonesimulator', 'iOS Simulator'))
-        common = ['-project', project, '-configuration', 'release', '-sdk', sdk,
-                  '-showBuildSettings', '-json', 'ARCHS=arm64', 'ONLY_ACTIVE_ARCH=YES',
-                  'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO']
-        scheme = inspect('scheme', slot, ['xcodebuild', '-scheme', 'polaris_iOS', '-destination',
-                                         'generic/platform=' + destination, *common])
-        observations[slot] = inspect('extension', slot,
-                                     ['xcodebuild', '-target', 'polaris_PacketTunnel', *common], scheme)
-    require([file_pin(path) for path in inputs] == pins, 'Apple admission inputs changed during inspection')
-    write_json(root / 'build-settings-admission.json', {
-        'schema': 'polaris-apple-build-settings-admission-v2', 'slots': observations,
-        'requiredSlots': list(slots), 'observedSlots': list(observations), 'inputPins': pins,
-        'scope': 'resolved configuration only; no compiler/carrier/device acceptance'})
-
-
 def prepare():
     value = load()
     identity = producer_code()
@@ -203,7 +160,8 @@ def prepare():
     expected = os.environ['POLARIS_APP_CANDIDATE']
     require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
     developer, env, xcode = selected_apple_tools(value)
-    inspect_apple_architecture(root, env)
+    subprocess.run(['node', ROOT / 'scripts/mobile-core/apple-admission.mjs', '--build-settings', root],
+                   cwd=ROOT, env=env, check=True)
     tools = private_dir(root / 'tools')
     tool_cache = private_dir(root / 'tool-cache')
     go = Path(shutil.which('go')).resolve(strict=True)

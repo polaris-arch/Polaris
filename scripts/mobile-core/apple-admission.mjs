@@ -1,10 +1,15 @@
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync,
+  realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { loadavg } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { decode, pinned, readBoundedInput, receiptLimit, receiptPolicy } from './source-admission.mjs';
+import { characters, decode, pinned, readBoundedInput, ReceiptFloat, receiptLimit, receiptPolicy } from './source-admission.mjs';
 
+const limits = receiptPolicy.receipt;
 const SDKS = new Map([['device-arm64', 'iphoneos'], ['sim-arm64', 'iphonesimulator']]);
 const APP = 'polaris_iOS';
 const EXTENSION = 'polaris_PacketTunnel';
@@ -19,6 +24,117 @@ class AdmissionError extends Error {}
 
 function requireSetting(condition, message) {
   if (!condition) throw new AdmissionError(message);
+}
+
+function floatText(n) {
+  if (Object.is(n, -0)) return '-0.0';
+  if (n === 0) return '0.0';
+  const [coefficient, power = '0'] = Math.abs(n).toString().split('e');
+  const decimal = coefficient.indexOf('.');
+  const digits = coefficient.replace('.', '');
+  const leading = digits.search(/[1-9]/);
+  const exponent = Number(power) + (decimal < 0 ? coefficient.length : decimal) - leading - 1;
+  const significant = digits.slice(leading).replace(/0+$/, '');
+  const sign = n < 0 ? '-' : '';
+  if (exponent < -4 || exponent >= 16) {
+    return sign + significant[0] + (significant.length > 1 ? '.' + significant.slice(1) : '') +
+      'e' + (exponent < 0 ? '-' : '+') + String(Math.abs(exponent)).padStart(2, '0');
+  }
+  const point = exponent + 1;
+  if (point <= 0) return sign + '0.' + '0'.repeat(-point) + significant;
+  if (point >= significant.length) return sign + significant.padEnd(point, '0') + '.0';
+  return sign + significant.slice(0, point) + '.' + significant.slice(point);
+}
+
+function codepointOrder(left, right) {
+  for (let at = 0; at < Math.min(left.length, right.length);) {
+    const a = left.codePointAt(at), b = right.codePointAt(at);
+    if (a !== b) return a - b;
+    at += a > 0xffff ? 2 : 1;
+  }
+  return left.length - right.length;
+}
+
+function serialize(value, maximum, pretty, consume = () => {}) {
+  let bytes = 0, nodes = 0, stringChars = 0, buffer = '';
+  function push(token) {
+    bytes += Buffer.byteLength(token);
+    requireSetting(bytes <= maximum, 'receipt JSON byte budget');
+    buffer += token;
+    if (buffer.length >= 64 * 1024) { consume(buffer); buffer = ''; }
+  }
+  function encode(entry, depth, isKey = false) {
+    requireSetting(++nodes <= limits.nodes && depth <= limits.depth, 'receipt JSON node/depth budget');
+    if (entry instanceof ReceiptFloat) push(floatText(entry.value));
+    else if (typeof entry === 'string') {
+      const length = characters(entry);
+      stringChars += length;
+      requireSetting(length <= (isKey ? limits.keyChars : limits.stringChars) && stringChars <= maximum, 'receipt JSON string budget');
+      requireSetting(pretty || entry.isWellFormed(), 'invalid Unicode in receipt JSON');
+      const quoted = JSON.stringify(entry);
+      push(pretty ? quoted.replace(/[\u007f-\uffff]/g, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')) : quoted);
+    } else if (Array.isArray(entry) || isObject(entry)) {
+      const array = Array.isArray(entry);
+      const keys = array ? entry.keys() : Object.keys(entry).sort(codepointOrder);
+      push(array ? '[' : '{');
+      let first = true;
+      for (const key of keys) {
+        if (!first) push(',');
+        if (pretty) push('\n' + ' '.repeat(2 * (depth + 1)));
+        if (!array) { encode(key, depth + 1, true); push(pretty ? ': ' : ':'); }
+        encode(entry[key], depth + 1);
+        first = false;
+      }
+      if (pretty && !first) push('\n' + ' '.repeat(2 * depth));
+      push(array ? ']' : '}');
+    } else if (typeof entry === 'bigint') push(entry.toString());
+    else if (entry === null || typeof entry === 'boolean' || Number.isSafeInteger(entry)) push(JSON.stringify(entry));
+    else throw new Error('unsupported receipt JSON value');
+  }
+  encode(value, 0);
+  if (pretty) push('\n');
+  if (buffer) consume(buffer);
+  return bytes;
+}
+
+export function fingerprint(value) {
+  const hash = createHash('sha256');
+  serialize(value, receiptLimit(value), false, chunk => hash.update(chunk));
+  return hash.digest('hex');
+}
+
+export function writeReceipt(path, facts) {
+  const maximum = receiptLimit(facts);
+  let size;
+  try { size = serialize(facts, maximum, true); }
+  catch (error) {
+    console.error(JSON.stringify({ schema: 'polaris-receipt-size-observation-v1', phase: 'bounded-serialization-rejected',
+      path, maximumBytes: maximum, error: error.message, scope: 'no full serialized bytes produced or installed' }));
+    throw error;
+  }
+  console.error(JSON.stringify({
+    schema: 'polaris-receipt-size-observation-v1', phase: 'serialize-before-install',
+    path, bytes: size, maximumBytes: maximum, receiptSchema: facts.schema,
+    canonicalValueBytesByTopLevelField: Object.fromEntries(Object.entries(facts).map(([key, value]) =>
+      [key, serialize(value, maximum, false)])),
+    scope: 'actual serialized size; not installation or carrier acceptance',
+  }));
+  const temporary = path + '.tmp';
+  const fd = openSync(temporary, 'wx');
+  try {
+    try {
+      const written = serialize(facts, maximum, true, chunk => {
+        const bytes = Buffer.from(chunk);
+        for (let at = 0; at < bytes.length;) at += writeSync(fd, bytes, at, bytes.length - at);
+      });
+      requireSetting(written === size, 'receipt changed during serialization');
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(temporary, path);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
 }
 
 function isObject(value) {
@@ -141,6 +257,133 @@ export function inspectAppleArchitecture(raw, { slot, query, minimum, scheme }) 
     if (!(error instanceof AdmissionError)) throw error;
     return query === 'scheme' ? { observation, admission: error.message } : { observation, error: error.message };
   }
+}
+
+const XCODE_RESPONSE_BYTES = 2 * 1024 ** 2;
+const XCODE_DEADLINE_MS = 3600 * 1000;
+const XCODE_TERMINATION_MS = 10 * 1000;
+const xcodeDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+function runXcodeSettings(args, { repo, env, slot }) {
+  return new Promise((complete, reject) => {
+    const started = performance.now();
+    const child = spawn('xcodebuild', args, { cwd: repo, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = [];
+    let stdoutBytes = 0, stderrBytes = 0, stderrTail = Buffer.alloc(0);
+    let failure, terminateTimer, heartbeat;
+
+    const observe = event => {
+      const processRunning = child.exitCode === null && child.signalCode === null;
+      writeSync(1, 'APPLE_TOOL_PROGRESS=' + JSON.stringify({
+        event, phase: 'build-settings-admission', slot, pid: child.pid,
+        elapsedSeconds: Math.round(performance.now() - started) / 1000,
+        stdoutBytes, stderrBytes, processRunning, load1: Math.round(loadavg()[0] * 1000) / 1000,
+        peakRSSBytes: null, scope: 'direct process/pipe bytes only; no descendant liveness or acceptance',
+      }) + '\n');
+    };
+
+    function signalGroup(signal) {
+      if (!child.pid) return false;
+      try { process.kill(-child.pid, signal); return true; }
+      catch (error) {
+        if (error.code !== 'ESRCH') failure ??= new Error('Xcode build-settings process group retirement failed');
+        return false;
+      }
+    }
+
+    function stop(cause) {
+      if (failure) return;
+      failure = cause;
+      signalGroup('SIGTERM');
+      terminateTimer = setTimeout(() => signalGroup('SIGKILL'), XCODE_TERMINATION_MS);
+    }
+
+    function progress(event) {
+      try { observe(event); } catch (error) { stop(error); }
+    }
+
+    const interrupt = () => stop(new Error('Apple build-settings observation interrupted'));
+    const deadline = setTimeout(() => stop(new Error('Apple build-settings observation deadline exceeded')), XCODE_DEADLINE_MS);
+    process.on('SIGTERM', interrupt);
+    process.on('SIGINT', interrupt);
+    child.once('spawn', () => {
+      progress('start');
+      progress('waiting');
+      heartbeat = setInterval(() => { if (!failure) progress('waiting'); }, 30 * 1000);
+    });
+    child.on('error', stop);
+    child.stdout.on('error', stop);
+    child.stderr.on('error', stop);
+    child.stdout.on('data', chunk => {
+      stdoutBytes += chunk.length;
+      // Normalizing CRLF can shrink the source by at most half.
+      if (stdoutBytes > 2 * XCODE_RESPONSE_BYTES) stop(new Error('Apple build-settings response exceeds observation bound'));
+      else if (!failure) output.push(chunk);
+    });
+    child.stderr.on('data', chunk => {
+      stderrBytes += chunk.length;
+      stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-4 * 8192);
+    });
+    child.once('close', (code) => {
+      clearTimeout(deadline);
+      clearTimeout(terminateTimer);
+      clearInterval(heartbeat);
+      process.off('SIGTERM', interrupt);
+      process.off('SIGINT', interrupt);
+      if (signalGroup(0)) {
+        failure ??= new Error('native session still owns descendants; Apple build-settings rejected');
+        signalGroup('SIGKILL');
+      }
+      if (failure) { reject(failure); return; }
+      try {
+        observe('end');
+        requireSetting(code === 0, 'actual tool failed (xcodebuild): ' + stderrTail.toString('utf8').slice(-8192));
+        complete(Buffer.from(xcodeDecoder.decode(Buffer.concat(output)).replace(/\r\n?/g, '\n')));
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+async function admitResolvedSettings(repo, output, env) {
+  const scope = env.POLARIS_APPLE_SCOPE ?? 'device-only';
+  requireSetting(Object.hasOwn(receiptPolicy.appleScopes, scope), 'unknown Apple carrier scope');
+  const slots = receiptPolicy.appleScopes[scope];
+  const project = join(repo, 'src-tauri/gen/apple/polaris.xcodeproj');
+  const config = join(repo, 'src-tauri/tauri.ios.conf.json');
+  const inputs = [join(project, 'project.pbxproj'), join(project, 'xcshareddata/xcschemes/polaris_iOS.xcscheme'), config];
+  const { bytes, pin: configPin } = pinned(config, limits.artifactBytes);
+  const minimum = decode(bytes, limits.artifactBytes)?.bundle?.iOS?.minimumSystemVersion;
+  requireSetting(typeof minimum === 'string' && /^[0-9]+\.[0-9]+(?:\.[0-9]+)?$/.test(minimum),
+    'explicit iOS deployment version required');
+  const inputPins = [...inputs.slice(0, -1).map(path => pinned(path, limits.artifactBytes).pin), configPin];
+
+  async function inspect(query, slot, command, scheme) {
+    const raw = await runXcodeSettings(command, { repo, env, slot });
+    requireSetting(raw.length <= XCODE_RESPONSE_BYTES, 'Apple build-settings response exceeds observation bound');
+    const checked = inspectAppleArchitecture(raw, { slot, query, minimum, scheme });
+    if (checked.observation) writeReceipt(join(output, 'build-settings-' + slot + '-' + query + '.json'), checked.observation);
+    requireSetting(!Object.hasOwn(checked, 'error'), checked.error);
+    return checked.admission;
+  }
+
+  const observations = {};
+  for (const slot of slots) {
+    const sdk = SDKS.get(slot), destination = sdk === 'iphoneos' ? 'iOS' : 'iOS Simulator';
+    const common = ['-project', project, '-configuration', 'release', '-sdk', sdk,
+      '-showBuildSettings', '-json', 'ARCHS=arm64', 'ONLY_ACTIVE_ARCH=YES',
+      'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO'];
+    const scheme = await inspect('scheme', slot, ['-scheme', APP, '-destination', 'generic/platform=' + destination, ...common]);
+    observations[slot] = await inspect('extension', slot, ['-target', EXTENSION, ...common], scheme);
+  }
+  requireSetting(inputs.every((path, i) => matchesPin(inputPins[i], pinned(path, limits.artifactBytes).pin)),
+    'Apple admission inputs changed during inspection');
+  writeReceipt(join(output, 'build-settings-admission.json'), {
+    schema: 'polaris-apple-build-settings-admission-v2', slots: observations,
+    requiredSlots: slots, observedSlots: Object.keys(observations), inputPins,
+    scope: 'resolved configuration only; no compiler/carrier/device acceptance',
+  });
 }
 
 const NATIVE_TUN_ARGS = 'PolarisNativeTunCompiler.args';
@@ -440,17 +683,18 @@ function tlsCompilerResponse(action, env) {
 
 const entry = process.argv[1];
 if (entry && basename(entry) === 'apple-admission.mjs' && realpathSync(entry) === fileURLToPath(import.meta.url)) {
-  const [, , slot, query, minimum, scheme] = process.argv;
-  if (slot === '--tls-link') {
-    try {
-      const result = tlsCompilerResponse(query, process.env);
+  const [, , mode, action, ...extra] = process.argv;
+  try {
+    if (mode === '--tls-link') {
+      const result = tlsCompilerResponse(action, process.env);
       if (result !== undefined) console.log(JSON.stringify(result));
-    } catch (error) {
-      console.error(error.message);
-      process.exitCode = 1;
+    } else {
+      requireSetting(mode === '--build-settings' && isAbsolute(action ?? '') && extra.length === 0,
+        'Apple build-settings requires one absolute output directory');
+      await admitResolvedSettings(fileURLToPath(new URL('../../', import.meta.url)), action, process.env);
     }
-  } else {
-    const result = inspectAppleArchitecture(readFileSync(0), { slot, query, minimum, scheme: JSON.parse(scheme) });
-    process.stdout.write(JSON.stringify(result));
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
   }
 }

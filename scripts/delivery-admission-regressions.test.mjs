@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
@@ -259,5 +259,125 @@ test('Apple architecture admission rechecks the explicit extension and retains s
     assert.match(inspect([row(extension, { ARCHS: 'arm64 arm64' })], 'extension', rejected.admission).error,
       /duplicate-token/);
     assert.match(inspect([extensionRow], 'extension', rejected.admission).error, /unknown-token/);
+  }
+});
+
+
+test('Apple settings entry pins inputs, probes both targets and preserves bounded observation receipts', {
+  skip: process.platform === 'win32',
+}, () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'polaris-apple-settings-')));
+  try {
+    const repo = join(directory, 'checkout'), output = join(directory, 'output'), bin = join(directory, 'bin');
+    const project = join(repo, 'src-tauri/gen/apple/polaris.xcodeproj');
+    const projectFile = join(project, 'project.pbxproj');
+    const schemeFile = join(project, 'xcshareddata/xcschemes/polaris_iOS.xcscheme');
+    const config = join(repo, 'src-tauri/tauri.ios.conf.json');
+    const trace = join(directory, 'xcode-calls.jsonl');
+    const script = join(repo, 'scripts/mobile-core/apple-admission.mjs');
+    const developer = '/fixture/selected Xcode/Contents/Developer';
+    for (const name of [bin, output, dirname(schemeFile), dirname(script), join(repo, 'scripts/lib')]) {
+      mkdirSync(name, { recursive: true });
+    }
+    for (const name of ['apple-admission.mjs', 'source-admission.mjs', 'receipt-policy.json', '../lib/polaris-version.json']) {
+      copyFileSync(new URL('./mobile-core/' + name, import.meta.url), join(dirname(script), name));
+    }
+    writeFileSync(projectFile, 'fixed project bytes\n');
+    writeFileSync(schemeFile, 'fixed scheme bytes\n');
+    writeFileSync(config, JSON.stringify({ bundle: { iOS: { minimumSystemVersion: '17.0' } } }));
+    const inputs = [projectFile, schemeFile, config];
+    const pin = bytes => ({ bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+    const expectedPins = inputs.map(path => pin(readFileSync(path)));
+
+    writeFileSync(join(bin, 'xcodebuild'), '#!' + process.execPath + '\n' + String.raw`
+const fs = require('node:fs');
+const args = process.argv.slice(2), sdk = args[args.indexOf('-sdk') + 1];
+const extension = args[0] === '-target';
+const { FIXTURE_MODE, FIXTURE_TRACE, DEVELOPER_DIR } = process.env;
+const settings = {
+  ARCHS: FIXTURE_MODE === 'wrong-arch' && !extension ? 'withheld/path' : 'arm64',
+  VALID_ARCHS: 'arm64', EXCLUDED_ARCHS: !extension && sdk === 'iphoneos' ? 'x86_64' : '',
+  PLATFORM_NAME: sdk, SDKROOT: sdk, CONFIGURATION: 'release', IPHONEOS_DEPLOYMENT_TARGET: '17.0',
+  PRIVATE_VALUE: '/never/retain/full/settings',
+};
+const normalized = JSON.stringify([{ target: args[1], buildSettings: settings }], null, 2) + '\n';
+fs.appendFileSync(FIXTURE_TRACE, JSON.stringify({ args, cwd: process.cwd(), DEVELOPER_DIR, normalized }) + '\n');
+if (FIXTURE_MODE === 'drift' && extension) fs.appendFileSync(args[args.indexOf('-project') + 1] + '/project.pbxproj', 'drift');
+if (FIXTURE_MODE === 'oversize') process.stdout.write('x'.repeat(2 * 1024 ** 2 + 1));
+else process.stdout.write(normalized.replace(/\n/g, '\r\n'));
+`, { mode: 0o700 });
+    const invoke = (scope, mode, location) => spawnSync(process.execPath, [script, '--build-settings', location], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: { ...process.env, POLARIS_APPLE_SCOPE: scope, DEVELOPER_DIR: developer, FIXTURE_MODE: mode, FIXTURE_TRACE: trace,
+        PATH: bin + delimiter + process.env.PATH },
+    });
+    const recorded = () => readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const receipt = (location, name) => JSON.parse(readFileSync(join(location, name), 'utf8'));
+    const runs = [
+      ['device-and-simulator', [['device-arm64', 'iphoneos', 'iOS'], ['sim-arm64', 'iphonesimulator', 'iOS Simulator']]],
+      ['device-only', [['device-arm64', 'iphoneos', 'iOS']]],
+    ];
+    for (const [scope, targets] of runs) {
+      const location = join(output, scope);
+      mkdirSync(location);
+      const previousCalls = existsSync(trace) ? recorded().length : 0;
+      const result = invoke(scope, 'valid', location);
+      assert.equal(result.status, 0, result.stderr);
+      const calls = recorded().slice(previousCalls);
+      assert.equal(calls.length, 2 * targets.length);
+      const progress = result.stdout.trim().split('\n').map(line => {
+        assert.match(line, /^APPLE_TOOL_PROGRESS=/);
+        return JSON.parse(line.slice('APPLE_TOOL_PROGRESS='.length));
+      });
+      assert.equal(progress.filter(row => row.event === 'end').length, calls.length);
+      assert.ok(progress.every(row => row.phase === 'build-settings-admission' && row.peakRSSBytes === null));
+      assert.match(result.stderr, /"phase":"serialize-before-install"/);
+
+      const checked = receipt(location, 'build-settings-admission.json');
+      const slots = targets.map(([slot]) => slot);
+      assert.equal(checked.schema, 'polaris-apple-build-settings-admission-v2');
+      assert.deepEqual(checked.requiredSlots, slots);
+      assert.deepEqual(checked.observedSlots, slots);
+      assert.deepEqual(checked.inputPins, expectedPins);
+      for (const [index, [slot, sdk, destination]] of targets.entries()) {
+        const common = ['-project', project, '-configuration', 'release', '-sdk', sdk, '-showBuildSettings', '-json',
+          'ARCHS=arm64', 'ONLY_ACTIVE_ARCH=YES', 'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO'];
+        const [scheme, extension] = calls.slice(2 * index, 2 * index + 2);
+        assert.deepEqual(scheme.args, ['-scheme', 'polaris_iOS', '-destination', 'generic/platform=' + destination, ...common]);
+        assert.deepEqual(extension.args, ['-target', 'polaris_PacketTunnel', ...common]);
+        assert.deepEqual(Object.keys(checked.slots[slot]), ['polaris_PacketTunnel', 'polaris_iOS']);
+        for (const [query, call] of [['scheme', scheme], ['extension', extension]]) {
+          assert.equal(call.cwd, repo);
+          assert.equal(call.DEVELOPER_DIR, developer);
+          const observed = receipt(location, 'build-settings-' + slot + '-' + query + '.json');
+          assert.deepEqual(observed.normalizedResponseText, pin(Buffer.from(call.normalized)));
+          assert.equal(observed.componentAccepted, false);
+          assert.equal(observed.devicePassed, false);
+          assert.doesNotMatch(JSON.stringify(observed), /never\/retain/);
+        }
+      }
+    }
+
+    for (const [mode, error, queryCount] of [
+      ['wrong-arch', /unresolved Apple architecture setting/, 2],
+      ['oversize', /response exceeds observation bound/, 1],
+      ['drift', /inputs changed during inspection/, 2],
+    ]) {
+      const location = join(output, mode);
+      mkdirSync(location);
+      const previousCalls = recorded().length;
+      const result = invoke('device-only', mode, location);
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, error);
+      assert.equal(recorded().length - previousCalls, queryCount);
+      assert.equal(existsSync(join(location, 'build-settings-admission.json')), false);
+      if (mode !== 'oversize') {
+        assert.equal(receipt(location, 'build-settings-device-arm64-extension.json').devicePassed, false);
+      }
+      if (mode === 'wrong-arch') assert.doesNotMatch(result.stderr, /withheld\/path/);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
