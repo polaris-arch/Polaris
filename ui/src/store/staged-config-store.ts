@@ -461,6 +461,11 @@ async function performSaveLocked(
     return false;
   }
   set({ saveStatus: 'saving' });
+  const isCurrentDraft = () => {
+    const current = get();
+    return current.entries === entries && current.baseline === baseline;
+  };
+  const finishFailedSave = () => set({ saveStatus: isCurrentDraft() ? 'saveFailed' : 'idle' });
 
   // ① 拉磁盘现值。**必须重新拉**：store 里的 `baseVersion` 只在 configChanged 广播到达时才刷，
   //    而 §Q8 明确记着有一条**不广播**的落盘（订阅验证器）。拿没刷过的版本当基准 = 漏检。
@@ -469,11 +474,11 @@ async function performSaveLocked(
     disk = await api.config.get();
   } catch (err) {
     console.error('[staged-config] load current config before save failed:', err);
-    set({ saveStatus: 'saveFailed' });
+    finishFailedSave();
     return false;
   }
   // Edits made while this read was in flight need their own full conflict check.
-  if (get().entries !== entries || get().baseline !== baseline) {
+  if (!isCurrentDraft()) {
     set({ saveStatus: 'idle' });
     return false;
   }
@@ -484,7 +489,9 @@ async function performSaveLocked(
 
   // ② 冲突集：只在磁盘确实变过时才算（没变 ⇒ 恒空，省一趟 O(条目数) 的子树序列化）。
   if (diskVersion !== configBaseVersion(baseline)) {
-    const clashes = conflictingEntries(baseline, disk, entries);
+    const clashes = conflictingEntries(baseline, disk, entries).filter(({ entityPath }) =>
+      entitySnapshot(disk, entityPath) !== entitySnapshot(merged, entityPath)
+    );
     if (clashes.length > 0) {
       // ④ 有冲突 ⇒ 弹窗，交给用户逐条选。`saveStatus` 退回 idle：条被弹窗盖住，不该同时转圈。
       set({
@@ -508,34 +515,44 @@ async function performSaveLocked(
   //    `baseVersion=diskVersion` 是最后一道 TOCTOU 闸：从上面那次 `config.get()` 到这次写盘之间
   //    若又有人写了盘，后端会判 conflict 并一个字节都不写。
   let outcome;
+  let observedAtDispatch: UserConfig | null;
   try {
     // pending marker 是草稿正文的 write-ahead 保险：先确保“有未保存草稿”已落到后端，再写 config。
     // 后端不在提交点盲清这个 bit（它不知道在途期间是否又有下一批）；成功回包后由
     // `persist(outcome.config, remaining)` 按实际剩余条目收账。回包丢失只会保守地多拦一次，不会误启动。
     await flushStagedPendingSync();
-    if (get().entries !== entries || get().baseline !== baseline) {
+    if (!isCurrentDraft()) {
       set({ saveStatus: 'idle' });
       return false;
     }
+    observedAtDispatch = get().latestSavedConfig;
     outcome = await api.config.save(merged, true, diskVersion, autoApply);
   } catch (err) {
     console.error('[staged-config] save failed:', err);
-    set({ saveStatus: 'saveFailed' });
+    finishFailedSave();
     return false;
   }
   if (outcome.status === 'conflict') {
     // 后端判冲突 = 上面那两句之间盘又被改了。**不自动重试**：重试一次就得防重试两次，
     // 而「点[重试保存]」本身就会把整条腿（含冲突检出）从头跑一遍，那是更诚实也更可控的出口。
-    set({ saveStatus: 'saveFailed' });
+    finishFailedSave();
     return false;
   }
   // 成功 ⇒ 本次捕获且期间未变化的意图已经**是**磁盘现值，留着只会让计数虚高。
   // 保存 IPC 在途期间仍可继续编辑；新 id 或同 id 新版本不属于本次提交，绝不能被旧回包清掉。
-  const remaining = remainingEntriesAfterCommit(entries, get().entries);
+  const current = get();
+  // The native Save can finish its hot leg after another writer has published a new disk snapshot.
+  const observedDuringSave = current.latestSavedConfig !== observedAtDispatch;
+  const latestSaved = observedDuringSave ? current.latestSavedConfig ?? outcome.config : outcome.config;
+  const committedEntries = observedDuringSave
+    ? entries.filter((entry) => current.entries.includes(entry)
+      || entitySnapshot(latestSaved, entry.entityPath) === entitySnapshot(outcome.config, entry.entityPath))
+    : entries;
+  const remaining = remainingEntriesAfterCommit(committedEntries, current.entries);
   // New/revised intents have not approved changes found on disk by this save.
   // Keep their original comparison base; the next save rechecks them conservatively.
-  const remainingBaseline = remaining.length > 0 ? get().baseline : outcome.config;
-  const saveRevision = get().completedSaveRevision + 1;
+  const remainingBaseline = remaining.length > 0 ? current.baseline : latestSaved;
+  const saveRevision = current.completedSaveRevision + 1;
   const savedRuntimeApply = outcome.runtimeApply === undefined ? undefined : {
     ...outcome.runtimeApply,
     saveRevision,
@@ -556,8 +573,8 @@ async function performSaveLocked(
     ...(savedRuntimeApply === undefined ? {} : { savedRuntimeApply }),
     conflict: null,
     conflictBaseline: null,
-    baseVersion: outcome.version,
-    latestSavedConfig: outcome.config,
+    baseVersion: observedDuringSave ? current.baseVersion : outcome.version,
+    latestSavedConfig: latestSaved,
     baseline: remainingBaseline,
   });
   persist(remainingBaseline, remaining);

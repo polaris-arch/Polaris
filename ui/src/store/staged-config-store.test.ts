@@ -1158,6 +1158,89 @@ describe('冲突弹窗的落定（resolveConflict / dismissConflict）', () => {
 
 
 describe('save snapshot ownership across awaited reads/writes', () => {
+  it('accepts an identical saved intent after another writer sets the same value', async () => {
+    const store = useStagedConfigStore.getState();
+    const original = { ...CONFIG, logLevel: 'info' } as UserConfig;
+    const disk = { ...original, logLevel: 'warn' } as UserConfig;
+    store.hydrate(original);
+    store.stage({ id: 'setting:logLevel', kind: 'setting', entityPath: ['logLevel'], label: 'Log level', nextValue: 'warn' });
+    getMock.mockResolvedValue(disk);
+    await expect(store.save()).resolves.toBe(true);
+    expect(useStagedConfigStore.getState().conflict).toBeNull();
+    expect(saveMock).toHaveBeenCalledExactlyOnceWith(disk, true, configBaseVersion(disk), true);
+  });
+
+  it.each(['warn', 'info'] as const)('retains a newer disk observation of %s when an earlier save reply arrives late', async (level) => {
+    const store = useStagedConfigStore.getState();
+    const original = { ...CONFIG, logLevel: 'info' } as UserConfig;
+    const committed = { ...original, logLevel: 'debug' } as UserConfig;
+    const disk = { ...original, logLevel: level } as UserConfig;
+    const draft = { id: 'setting:logLevel', kind: 'setting', entityPath: ['logLevel'], label: 'Log level' } as const;
+    store.hydrate(original);
+    store.stage({ ...draft, nextValue: 'debug' });
+    getMock.mockResolvedValue(original);
+    let release!: (outcome: SaveOutcome) => void;
+    saveMock.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = store.save();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    store.hydrate(disk);
+    release({ status: 'saved', config: committed, version: configBaseVersion(committed) });
+    await expect(pending).resolves.toBe(true);
+    expect(useStagedConfigStore.getState()).toMatchObject({
+      baseVersion: configBaseVersion(disk), baseline: disk, entries: [],
+    });
+
+    getMock.mockResolvedValue(disk);
+    store.stage({ ...draft, nextValue: 'error' });
+    await expect(store.save()).resolves.toBe(true);
+    expect(saveMock).toHaveBeenLastCalledWith({ ...disk, logLevel: 'error' }, true, configBaseVersion(disk), true);
+  });
+
+  it('keeps a renewed identical draft after its earlier save was superseded', async () => {
+    const store = useStagedConfigStore.getState();
+    const original = { ...CONFIG, logLevel: 'info' } as UserConfig;
+    const saved = { ...original, logLevel: 'debug' } as UserConfig;
+    const disk = { ...original, logLevel: 'warn' } as UserConfig;
+    const draft = { id: 'setting:logLevel', kind: 'setting', entityPath: ['logLevel'], label: 'Log level', nextValue: 'debug' } as const;
+    store.hydrate(original);
+    store.stage(draft);
+    getMock.mockResolvedValue(original);
+    let release!: (outcome: SaveOutcome) => void;
+    saveMock.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const pending = store.save();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    store.hydrate(disk);
+    store.reset();
+    store.stage({ ...draft });
+    release({ status: 'saved', config: saved, version: configBaseVersion(saved) });
+    await expect(pending).resolves.toBe(true);
+    expect(useStagedConfigStore.getState()).toMatchObject({ entries: [draft], baseline: disk });
+  });
+
+  it.each(['read failure', 'write conflict', 'write failure'] as const)(
+    'does not restore a save error after reset on %s',
+    async (failure) => {
+      seedStaged();
+      let finish!: () => void;
+      if (failure === 'read failure') {
+        getMock.mockImplementationOnce(() => new Promise((_, reject) => { finish = () => reject(new Error('read failed')); }));
+      } else {
+        saveMock.mockImplementationOnce(() => new Promise((resolve, reject) => {
+          finish = failure === 'write conflict'
+            ? () => resolve({ status: 'conflict', diskVersion: 'later' })
+            : () => reject(new Error('write failed'));
+        }));
+      }
+      const store = useStagedConfigStore.getState();
+      const pending = store.save();
+      await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+      store.reset();
+      finish();
+      await expect(pending).resolves.toBe(false);
+      expect(useStagedConfigStore.getState()).toMatchObject({ entries: [], conflict: null, saveStatus: 'idle' });
+    }
+  );
+
   it('binds operation labels and the canonical log level to changes in the committed Save', async () => {
     const disk = { ...CONFIG, logLevel: 'info' } as UserConfig;
     getMock.mockResolvedValue(disk);
