@@ -14,6 +14,9 @@ const h = vi.hoisted(() => ({
   applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
   retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(), runtimeLevel: vi.fn(),
   savedRuntimeApply: null as SavedRuntimeApply | null,
+  saveStatus: 'idle' as 'idle' | 'saving' | 'saveFailed',
+  stagedEntries: [] as Array<{ id: string; label: string }>,
+  save: vi.fn(),
   completedSaveRevision: undefined as number | undefined,
   baseVersion: undefined as string | undefined,
   armed: null as string | null, revertSaved: vi.fn(),
@@ -84,7 +87,9 @@ vi.mock('@/store/app-store', () => ({
 }));
 vi.mock('@/store/staged-config-store', async () => {
   const { withConfigWriteLock } = await import('@/lib/config-write-lock');
-  const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow,
+  const state = { conflict: null, applyNow: h.applyNow, save: h.save,
+    get entries() { return h.stagedEntries; },
+    get saveStatus() { return h.saveStatus; },
     get savedRuntimeApply() { return h.savedRuntimeApply; },
     get completedSaveRevision() { return h.completedSaveRevision; },
     get baseVersion() { return h.baseVersion; } };
@@ -156,6 +161,8 @@ beforeEach(() => {
   unmount(); vi.resetAllMocks(); h.states = []; h.refs = [];
   h.armed = null;
   h.savedRuntimeApply = null;
+  h.saveStatus = 'idle';
+  h.stagedEntries = [];
   h.completedSaveRevision = undefined;
   h.baseVersion = undefined;
   h.app.config = null;
@@ -176,6 +183,26 @@ beforeEach(() => {
   h.hostRead.mockRejectedValue(new Error('Host status unavailable'));
 });
 afterEach(() => { unmount(); if (vi.isFakeTimers()) vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+it('hides an ordinary running Save and its tentative pending push, and restores explicit actions on settlement', () => {
+  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: false };
+  h.stagedEntries = [{ id: 'draft', label: 'Edit rule' }];
+  const previousSaveButton = button('home.pendingSaveBtn');
+  h.saveStatus = 'saving';
+  h.app.pendingChanges = { ...h.app.pendingChanges, restartDeferred: true };
+  expect(renderBar()).toBeNull();
+  previousSaveButton.props.onClick?.();
+  expect(h.save).not.toHaveBeenCalled();
+  expect(h.applyNow).not.toHaveBeenCalled();
+
+  h.saveStatus = 'saveFailed';
+  expect(markup()).toContain('home.pendingSaveFailed');
+  expect(button('home.pendingRetrySaveBtn').props.disabled).toBe(false);
+  h.saveStatus = 'idle';
+  h.stagedEntries = [];
+  expect(markup()).toContain('home.pendingBarConfigOnly');
+  expect(button('home.pendingApplyBtn').props.disabled).toBe(false);
+});
 
 it.each([
   [7, 'committed', 'debug', 'Current core log level is DEBUG.'],

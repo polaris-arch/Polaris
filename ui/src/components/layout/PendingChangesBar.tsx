@@ -41,7 +41,7 @@ import { useAppStore } from '@/store/app-store';
 import { dispatchSavedApply, useStagedConfigStore, type ApplyNowResult } from '@/store/staged-config-store';
 import { StagedConflictDialog } from '@/components/dialogs/StagedConflictDialog';
 import { api } from '@/ipc';
-import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
+import { usePendingConfigurationDuringSave, useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
 import { RestartApplyDialog, type RestartPrompt } from '@/components/dialogs/RestartApplyDialog';
 import { ImpactApplyDialog } from '@/components/dialogs/ImpactApplyDialog';
 import { useImpactConfirmation } from '@/components/dialogs/use-impact-confirmation';
@@ -106,6 +106,8 @@ export default function PendingChangesBar() {
   const servers = useAppStore((s) => s.servers);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
+  const quietSave = coreRunning && saveStatus === 'saving';
+  const visiblePending = usePendingConfigurationDuringSave(pending, quietSave, coreGeneration);
   const conflict = useStagedConfigStore((s) => s.conflict);
   const applyRequested = useAppStore((s) => s.applyRequested);
   /** B 维度里属于「这一次 apply」的那部分。`reason` 只在 `failed` 时有意义。 */
@@ -144,7 +146,7 @@ export default function PendingChangesBar() {
   const [detailOpen, setDetailOpen] = useState(false);
   const { armed, confirmTwice } = useConfirmTwice();
   const barRef = useRef<HTMLDivElement>(null);
-  const n = pendingChangesCount(pending);
+  const n = pendingChangesCount(visiblePending);
 
   /* 点外部 / Esc 关闭（对齐首页出口选单、节点页 add-menu 的既有模式）。 */
   useEffect(() => {
@@ -237,7 +239,7 @@ export default function PendingChangesBar() {
 
   const view = composeBarView({
     stagedPhase: stagedPhaseOf(saveStatus, stagedEntries.length),
-    pendingPhase: pendingPhaseOf(apply.phase, pending),
+    pendingPhase: pendingPhaseOf(apply.phase, visiblePending),
     stagedCount: stagedEntries.length,
     pendingCount: n,
     applyError: apply.reason,
@@ -249,8 +251,8 @@ export default function PendingChangesBar() {
     nativeChecking: apply.nativeChecking,
     configurationDurable: apply.configurationDurable,
     coreCommitted: coreRunning && apply.mainGeneration === coreGeneration && apply.coreState === 'committed',
-    configurationPending: pending.restartDeferred,
-    savedSettingsRevertAvailable: !!pending.savedSettingsRevertToken,
+    configurationPending: visiblePending.restartDeferred,
+    savedSettingsRevertAvailable: !!visiblePending.savedSettingsRevertToken,
     persistenceRetrying: apply.persistenceRetrying,
     persistenceOwnerPending: !!apply.coreRecovery && apply.coreRecovery.selectionIntentGeneration === undefined,
     persistenceOnly: apply.persistenceOnly,
@@ -271,7 +273,7 @@ export default function PendingChangesBar() {
     );
 
   /** n===0 而差集腿仍有活 ⇒ 唯一可能是 `restartDeferred`：明细里没有 id 可列，给一行说明。 */
-  const configOnly = n === 0 && hasPendingWork(pending);
+  const configOnly = n === 0 && hasPendingWork(visiblePending);
 
   const onSave = async () => {
     await useStagedConfigStore.getState().save();
@@ -447,6 +449,7 @@ export default function PendingChangesBar() {
   };
 
   const runAction = (id: BarActionId): void => {
+    if (useStagedConfigStore.getState().saveStatus === 'saving') return;
     switch (id) {
       case 'reset':
         // 原地二次点击（`lib/confirm-twice.ts`），不弹窗 —— 见 RESET_KEY 头注。
@@ -513,9 +516,9 @@ export default function PendingChangesBar() {
 
   // 三组顺序 = 计数口径顺序（pendingChangesCount），保证「条上的数字 = popover 行数」逐项对得上。
   const groups: { key: string; labelKey: string; ids: string[] }[] = [
-    { key: 'added', labelKey: 'home.pendingGroupAdded', ids: pending?.added ?? [] },
-    { key: 'modified', labelKey: 'home.pendingGroupModified', ids: pending?.modified ?? [] },
-    { key: 'removed', labelKey: 'home.pendingGroupRemoved', ids: pending?.removed ?? [] },
+    { key: 'added', labelKey: 'home.pendingGroupAdded', ids: visiblePending.added ?? [] },
+    { key: 'modified', labelKey: 'home.pendingGroupModified', ids: visiblePending.modified ?? [] },
+    { key: 'removed', labelKey: 'home.pendingGroupRemoved', ids: visiblePending.removed ?? [] },
   ].filter((g) => g.ids.length > 0);
 
   return (
@@ -551,7 +554,7 @@ export default function PendingChangesBar() {
         {view.actions.map((a) => {
           // 武装态：翻实心红（`.btn.confirming`）+ 换文案，与原型 confirmTwice 对文字按钮的两条动作一致。
           const arming = (a.id === 'reset' && armed === RESET_KEY)
-            || (a.id === 'revertSaved' && armed === REVERT_SAVED_KEY + pending.savedSettingsRevertToken);
+            || (a.id === 'revertSaved' && armed === REVERT_SAVED_KEY + visiblePending.savedSettingsRevertToken);
           return (
             <button
               key={a.id}
@@ -585,7 +588,7 @@ export default function PendingChangesBar() {
           )}
           {/* 待保存组：逐条可撤销（FR-3）+ 逐条标生效类别（FR-9）。撤销走「移除后重放」，
               效果等价于「这一条从未加入过」。 */}
-          {stagedEntries.length > 0 && (
+          {!quietSave && stagedEntries.length > 0 && (
             <div>
               <div className="pd-h">{t('home.pendingGroupStaged')}</div>
               {stagedEntries.map((e) => (

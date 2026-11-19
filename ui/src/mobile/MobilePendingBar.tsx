@@ -42,7 +42,7 @@ import { useEffect, useRef, useState, type Dispatch, type SetStateAction, type R
 import { useTranslation } from 'react-i18next';
 
 import { api } from '@/ipc';
-import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
+import { usePendingConfigurationDuringSave, useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
 import { restartReasonKeys, type RestartPrompt } from '@/components/dialogs/restart-apply-reasons';
 import { FormSheet } from './forms/FormSheet';
 import { ImpactApplySummary, impactApplyDisclosure } from '@/shared/ImpactApplySummary';
@@ -101,6 +101,8 @@ export function MobilePendingBar(): ReactElement | null {
   const coreGeneration = useAppStore((s) => s.proxyStatus?.mainGeneration);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
+  const quietSave = coreRunning && saveStatus === 'saving';
+  const visiblePending = usePendingConfigurationDuringSave(pending, quietSave, coreGeneration);
   const conflict = useStagedConfigStore((s) => s.conflict);
   const [apply, setApplyState] = useState<ApplyState>({
     phase: 'idle',
@@ -237,12 +239,12 @@ export function MobilePendingBar(): ReactElement | null {
     );
   }
 
-  const pendingPhase = pendingPhaseOf(apply.phase, pending);
+  const pendingPhase = pendingPhaseOf(apply.phase, visiblePending);
   const view = composeBarView({
     stagedPhase: stagedPhaseOf(saveStatus, stagedEntries.length),
     pendingPhase,
     stagedCount: stagedEntries.length,
-    pendingCount: pendingChangesCount(pending),
+    pendingCount: pendingChangesCount(visiblePending),
     applyError: apply.reason,
     coreRunning,
     coreGeneration,
@@ -252,8 +254,8 @@ export function MobilePendingBar(): ReactElement | null {
     nativeChecking: apply.nativeChecking,
     configurationDurable: apply.configurationDurable,
     coreCommitted: coreRunning && apply.mainGeneration === coreGeneration && apply.coreState === 'committed',
-    configurationPending: pending.restartDeferred,
-    savedSettingsRevertAvailable: !!pending.savedSettingsRevertToken,
+    configurationPending: visiblePending.restartDeferred,
+    savedSettingsRevertAvailable: !!visiblePending.savedSettingsRevertToken,
     persistenceRetrying: apply.persistenceRetrying,
     persistenceOwnerPending: !!apply.coreRecovery && apply.coreRecovery.selectionIntentGeneration === undefined,
     persistenceOnly: apply.persistenceOnly,
@@ -430,6 +432,7 @@ export function MobilePendingBar(): ReactElement | null {
   };
 
   const runAction = (id: BarActionId): void => {
+    if (useStagedConfigStore.getState().saveStatus === 'saving') return;
     switch (id) {
       case 'reset':
         confirmTwice(RESET_KEY, () => {
@@ -489,18 +492,18 @@ export function MobilePendingBar(): ReactElement | null {
       aria-live="polite"
     >
       <div className="m-pending-text">
-        <b>{armed === RESET_KEY ? t('home.pendingResetShortConfirm') : t(view.titleKey, view.titleVars)}</b>
+        <b>{!quietSave && armed === RESET_KEY ? t('home.pendingResetShortConfirm') : t(view.titleKey, view.titleVars)}</b>
         {view.accountDetailKeys?.map(key => <span className="m-pending-detail" key={key}>{t(key)}</span>)}
         {view.detailKey !== '' && (apply.nativeRetirements?.length || pending.nativeRetirements?.length || apply.host && apply.host.phase !== 'settled') ? (
           <span className="m-pending-detail">{t(view.detailKey)}</span>
-        ) : saveStatus !== 'saving' && pendingPhase === 'pending' && (
+        ) : view.titleKey !== 'home.pendingSaving' && pendingPhase === 'pending' && (
           <span className="m-pending-detail">{t('home.pendingSavedStillNeedsApply')}</span>
         )}
       </div>
       <div className="m-pending-acts">
         {view.actions.map((a) => {
           const arming = (a.id === 'reset' && armed === RESET_KEY)
-            || (a.id === 'revertSaved' && armed === REVERT_SAVED_KEY + pending.savedSettingsRevertToken);
+            || (a.id === 'revertSaved' && armed === REVERT_SAVED_KEY + visiblePending.savedSettingsRevertToken);
           return (
             <button
               key={a.id}
