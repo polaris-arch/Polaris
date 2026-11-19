@@ -84,8 +84,10 @@ pub use stale::{ProcessStaleLoginSweeper, StaleLoginCoreSweeper};
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
+#[cfg(any(test, not(target_os = "android")))]
+use polaris_core_supervisor::StdioPolicy;
 use polaris_core_supervisor::{
-    run_check_raw, PortAllocator, PortExclusions, RawCheck, SpawnError, SpawnRequest, StdioPolicy,
+    run_check_raw, PortAllocator, PortExclusions, RawCheck, SpawnError, SpawnRequest,
     CONFIG_CHECK_TIMEOUT,
 };
 use polaris_mesh::tailscale_login::{
@@ -95,6 +97,7 @@ use polaris_mesh::tailscale_login::{
 use polaris_singbox_grpc::{daemon, Endpoint, ReconnectConfig, SingBoxApiClient};
 
 use crate::events::broadcast;
+#[cfg(not(target_os = "android"))]
 use crate::runtime::proxy::core_log::pipe_to_log_with_secrets_owned;
 #[cfg(not(target_os = "android"))]
 use crate::runtime::proxy::resolve_core_binary;
@@ -380,7 +383,7 @@ type BinaryResolver = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 /// 瞬态登录核子进程抽象。生产用 `crate::runtime::core_child::Child` 包装；测试用内存 duplex 假子进程，
 /// 使整条编排（spawn/emit/register/timeout/cancel/reap）可在无真进程无网络下驱动。
 ///
-/// **这里没有取管道的方法**：两条流的去向在 [`SpawnRequest`] 的 [`StdioPolicy`] 里一次说清，
+/// **这里没有取管道的方法**：两条流的去向在 [`SpawnRequest`] 的 [`polaris_core_supervisor::StdioPolicy`] 里一次说清，
 /// spawner 在返回之前就把读端交给了排空回调。child 只剩生命周期职责 —— 「拿到了 child 却忘记
 /// 去读它的管道」这条路已经不存在。
 #[async_trait]
@@ -1581,6 +1584,7 @@ impl LoginStdioDrain {
             tasks: std::sync::OnceLock::new(),
         })
     }
+    #[cfg(not(target_os = "android"))]
     fn install(&self, handles: [tokio::task::JoinHandle<std::io::Result<()>>; 2]) {
         let tasks = handles.map(|handle| LoginDrainTask {
             handle,
@@ -1591,6 +1595,7 @@ impl LoginStdioDrain {
             "original Login drain installed twice"
         );
     }
+    #[cfg(not(target_os = "android"))]
     fn complete(&self, stream: usize, result: Result<(), String>) {
         self.streams.send_modify(|streams| {
             if streams[stream].is_none() {
@@ -1647,12 +1652,14 @@ struct LoginDrainTask {
     handle: tokio::task::JoinHandle<std::io::Result<()>>,
     result: Option<Result<(), String>>,
 }
+#[cfg(not(target_os = "android"))]
 struct LoginDrainReader<R> {
     reader: R,
     drain: Arc<LoginStdioDrain>,
     stream: usize,
     completed: bool,
 }
+#[cfg(not(target_os = "android"))]
 impl<R> LoginDrainReader<R> {
     fn new(reader: R, drain: Arc<LoginStdioDrain>, stream: usize) -> Self {
         Self {
@@ -1663,6 +1670,7 @@ impl<R> LoginDrainReader<R> {
         }
     }
 }
+#[cfg(not(target_os = "android"))]
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LoginDrainReader<R> {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -1687,6 +1695,7 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LoginDrainReader<
         result
     }
 }
+#[cfg(not(target_os = "android"))]
 impl<R> Drop for LoginDrainReader<R> {
     fn drop(&mut self) {
         if !self.completed {
@@ -4768,16 +4777,6 @@ impl LoginCoreRegistry {
         // 两条流的去向在**请求里**一次说清：spawner 在返回之前就把读端交给这个回调，核从起来的
         // 第一毫秒起就有人读它。**纯诊断**：登录 URL 与登录成功都只认 STATUS 流（见模块头），
         // 这两条流不是任何判据的来源。target 用本腿自己的，不与主核混（见 `LOGIN_CORE_LOG_TARGET`）。
-        let secrets: Vec<String> = [
-            Some(api.secret.clone()),
-            server
-                .tailscale_settings
-                .as_ref()
-                .and_then(|ts| ts.auth_key.as_deref().map(str::trim).map(str::to_owned)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
         let prepared = self.spawner.prepare_temp_native_birth();
         let native = match prepared
             .as_ref()
@@ -4788,37 +4787,51 @@ impl LoginCoreRegistry {
             Err(_) => return StartLoginOutcome::Failed("processStartFailed".into()),
         };
         let drain = native.as_ref().map(|_| LoginStdioDrain::new());
-        let log_drain = drain.clone().unwrap_or_else(LoginStdioDrain::new);
-        let execution_request = crate::runtime::core_execution::run_request(
-            &binary,
-            crate::runtime::core_identity::ExecPurpose::RunLogin,
-            &config_path,
-            StdioPolicy::drain(move |stdout, stderr| {
-                let stdout = LoginDrainReader::new(stdout, log_drain.clone(), 0);
-                let stderr = LoginDrainReader::new(stderr, log_drain.clone(), 1);
-                let out = pipe_to_log_with_secrets_owned(
-                    stdout,
-                    LOGIN_CORE_LOG_TARGET,
-                    None,
-                    None,
-                    secrets.clone(),
-                );
-                let err = pipe_to_log_with_secrets_owned(
-                    stderr,
-                    LOGIN_CORE_LOG_TARGET,
-                    None,
-                    None,
-                    secrets,
-                );
-                log_drain.install([out, err]);
-            }),
-        );
-        let mut req = match execution_request {
-            Ok(req) => req,
-            Err(error) => return StartLoginOutcome::Failed(error.to_string()),
+        #[cfg(target_os = "android")]
+        let req = crate::runtime::core_execution::android_libbox_request(&binary, &config_path);
+        #[cfg(not(target_os = "android"))]
+        let req = {
+            let mut secrets = vec![api.secret.clone()];
+            if let Some(key) = server
+                .tailscale_settings
+                .as_ref()
+                .and_then(|ts| ts.auth_key.as_deref())
+            {
+                secrets.push(key.trim().to_owned());
+            }
+            let log_drain = drain.clone().unwrap_or_else(LoginStdioDrain::new);
+            let execution_request = crate::runtime::core_execution::run_request(
+                &binary,
+                crate::runtime::core_identity::ExecPurpose::RunLogin,
+                &config_path,
+                StdioPolicy::drain(move |stdout, stderr| {
+                    let stdout = LoginDrainReader::new(stdout, log_drain.clone(), 0);
+                    let stderr = LoginDrainReader::new(stderr, log_drain.clone(), 1);
+                    let out = pipe_to_log_with_secrets_owned(
+                        stdout,
+                        LOGIN_CORE_LOG_TARGET,
+                        None,
+                        None,
+                        secrets.clone(),
+                    );
+                    let err = pipe_to_log_with_secrets_owned(
+                        stderr,
+                        LOGIN_CORE_LOG_TARGET,
+                        None,
+                        None,
+                        secrets,
+                    );
+                    log_drain.install([out, err]);
+                }),
+            );
+            let mut req = match execution_request {
+                Ok(req) => req,
+                Err(error) => return StartLoginOutcome::Failed(error.to_string()),
+            };
+            req.extra_args = vec!["--disable-color".to_string()];
+            req.working_dir = Some(user_data.to_path_buf());
+            req
         };
-        req.extra_args = vec!["--disable-color".to_string()];
-        req.working_dir = Some(user_data.to_path_buf());
         if self.closing.load(Ordering::SeqCst) {
             return StartLoginOutcome::Cancelled;
         }

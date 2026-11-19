@@ -18,6 +18,21 @@ class TransientLoginHostStateTest {
     @get:Rule val temporary = TemporaryFolder()
     private fun await(latch: CountDownLatch) = assertTrue(latch.await(2, TimeUnit.SECONDS))
 
+    @Test fun productionCacheMatchesOnlyTheOriginalAttempt() {
+        val root = temporary.newFolder("app-data")
+        val config = File(root, "polaris").apply { check(mkdir()) }
+        val id = "tailscale-login-node_1-3"
+        val original = File(config, "$id.cache.db").apply { check(createNewFile()) }
+        val other = File(config, "tailscale-login-node_1-4.cache.db").apply { check(createNewFile()) }
+        val wrongDirectory = temporary.newFile(original.name)
+        assertEquals(original.canonicalFile, TransientLoginHost.requireAttemptCache(root, id, original.path))
+        for (path in listOf(other.path, wrongDirectory.path, original.name)) {
+            assertTrue(runCatching { TransientLoginHost.requireAttemptCache(root, id, path) }.isFailure)
+        }
+        assertTrue(original.delete())
+        assertTrue(runCatching { TransientLoginHost.requireAttemptCache(root, id, original.path) }.isFailure)
+    }
+
     private class Queue {
         private val tasks = ArrayDeque<() -> Unit>()
         var failure: Throwable? = null

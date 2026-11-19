@@ -6,9 +6,6 @@ import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.SystemProxyStatus
 import android.util.Log
-import android.system.Os
-import android.system.ErrnoException
-import android.system.OsConstants
 import java.io.File
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -27,7 +24,7 @@ internal object TransientLoginHost {
         schedule = { delay, action -> timer.schedule(action, delay, TimeUnit.MILLISECONDS); Unit },
         parseDirectories = ::stateDirectories,
         requireSupported = SystemEndpointGuard::requireSupported,
-        createEngine = { id, config, directories, close -> LibboxEngine(id, config, directories, close) },
+        createEngine = { id, config, _, close -> LibboxEngine(id, config, close) },
         logFailure = { stage, failure, reason ->
             Log.w("PolarisLogin", "transient failure stage=$stage type=${failure.javaClass.simpleName} reason=$reason")
         },
@@ -53,7 +50,7 @@ internal object TransientLoginHost {
         }.toSet()
     }
 
-    private class LibboxEngine(id: String, config: String, private val stateDirectories: Set<String>,
+    private class LibboxEngine(private val id: String, config: String,
         private val requestClose: () -> Unit) : TransientLoginHostState.Engine {
         private var config: String? = config
         private var server: CommandServer? = null
@@ -87,11 +84,7 @@ internal object TransientLoginHost {
             AndroidNativeValidation.check(validationTicket, value)
             stage("cache")
             val cachePath = JSONObject(value).optJSONObject("experimental")?.optJSONObject("cache_file")?.optString("path").orEmpty()
-            val createdCache = File(cachePath).canonicalFile
-            check(createdCache.parent in stateDirectories && createdCache.name.matches(Regex("login-cache-[0-9]+\\.db"))) { "Android 登录缓存路径未隔离" }
-            // Cache Initialize precedes endpoint Initialize; a first login has no TS directory yet.
-            ensurePrivateDirectory(requireNotNull(createdCache.parentFile))
-            cache = createdCache
+            cache = requireAttemptCache(PolarisApplication.application.dataDir, id, cachePath)
             val createdNetwork = TransientLoginNetwork()
             network = createdNetwork
             stage("network")
@@ -118,14 +111,17 @@ internal object TransientLoginHost {
         }
     }
 
-    private fun ensurePrivateDirectory(directory: File) {
-        if (directory.isDirectory) return // Keep existing permissions and user state.
-        check(!directory.exists()) { "Android 登录缓存父路径不是目录" }
-        directory.parentFile?.let { ensurePrivateDirectory(it) }
-        try { Os.mkdir(directory.path, 448) } // 0700, supported by every app minSdk.
-        catch (error: ErrnoException) {
-            if (error.errno != OsConstants.EEXIST || !directory.isDirectory) throw error
+    private val attemptId = Regex("tailscale-login-[A-Za-z0-9_-]+-[0-9]+")
+
+    /** Match the cache Rust creates beside the config for this exact login instance. */
+    internal fun requireAttemptCache(dataDir: File, id: String, path: String): File {
+        check(attemptId.matches(id)) { "Android 登录缓存实例标识无效" }
+        val expected = File(dataDir.canonicalFile, "polaris/$id.cache.db")
+        val supplied = File(path)
+        check(supplied.isAbsolute && supplied.name == expected.name && supplied.canonicalFile == expected && supplied.isFile) {
+            "Android 登录缓存路径未隔离"
         }
+        return expected
     }
 
     private class LoginHandler(private val requestClose: () -> Unit) : CommandServerHandler {

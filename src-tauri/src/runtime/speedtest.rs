@@ -77,9 +77,8 @@ use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_core_supervisor::port_bookkeeping::TokioPortProvider;
 use polaris_core_supervisor::{
     core_startup_estimate_ms, wait_for_core_ready, CoreReadyDeps, CoreReadyOutcome, PortAllocator,
-    PortExclusions, SpawnError, SpawnRequest, StdioPolicy, WaitForCoreReadyOptions,
-    CORE_READY_SAFETY_FACTOR, CORE_STARTUP_BASELINE_FIXED_MS, CORE_STARTUP_PER_NAIVE_MS,
-    CORE_STARTUP_PER_NODE_US,
+    PortExclusions, SpawnError, SpawnRequest, WaitForCoreReadyOptions, CORE_READY_SAFETY_FACTOR,
+    CORE_STARTUP_BASELINE_FIXED_MS, CORE_STARTUP_PER_NAIVE_MS, CORE_STARTUP_PER_NODE_US,
 };
 
 use crate::commands::speedtest::{
@@ -89,12 +88,15 @@ use crate::commands::speedtest::{
 use crate::events::channel::EVENT_SPEED_TEST_RESULT;
 use crate::events::channel::{EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS};
 use crate::logging::SPEEDTEST_CORE_TARGET;
+#[cfg(any(test, not(target_os = "android")))]
 use crate::runtime::proxy::core_log::pipe_to_log;
 #[cfg(target_os = "android")]
 use crate::runtime::proxy::send_signal;
 use crate::runtime::proxy::{pid_alive, CoreBuildEnv};
 #[cfg(target_os = "android")]
 use polaris_core_supervisor::Signal;
+#[cfg(any(test, not(target_os = "android")))]
+use polaris_core_supervisor::StdioPolicy;
 // 瞬态核的进程原语**复用** `tailscale_login_core` 已建好的那一套（spawn → 装箱 child → SIGTERM/宽限/
 // SIGKILL/reap）。名字带 "Login" 是历史包袱，语义是「瞬态 sing-box 子进程」，与本腿逐字相同；再写一套
 // 进程管理只会多一份要各自维护的收割纪律（而收割写漏的表现是孤儿核，静默且持久）。
@@ -3080,23 +3082,29 @@ impl TempCoreSession {
         //
         // fire-and-forget：排空任务的生命周期由**流的 EOF** 决定（核被 `terminate()` 收掉 → 管道
         // 关闭 → 任务自然结束），不需要句柄；它也**不是任何判据的来源**，纯诊断出口。
-        let execution_request = crate::runtime::core_execution::run_request(
-            &binary,
-            crate::runtime::core_identity::ExecPurpose::RunSpeedtest,
-            &config_path,
-            StdioPolicy::drain(|stdout, stderr| {
-                pipe_to_log(stdout, SPEEDTEST_CORE_TARGET, None, None);
-                pipe_to_log(stderr, SPEEDTEST_CORE_TARGET, None, None);
-            }),
-        );
-        let mut req = match execution_request {
-            Ok(req) => req,
-            Err(error) => return BatchOutcome::CleanupUnknown(error.to_string()),
+        #[cfg(target_os = "android")]
+        let req = crate::runtime::core_execution::android_libbox_request(&binary, &config_path);
+        #[cfg(not(target_os = "android"))]
+        let req = {
+            let execution_request = crate::runtime::core_execution::run_request(
+                &binary,
+                crate::runtime::core_identity::ExecPurpose::RunSpeedtest,
+                &config_path,
+                StdioPolicy::drain(|stdout, stderr| {
+                    pipe_to_log(stdout, SPEEDTEST_CORE_TARGET, None, None);
+                    pipe_to_log(stderr, SPEEDTEST_CORE_TARGET, None, None);
+                }),
+            );
+            let mut req = match execution_request {
+                Ok(req) => req,
+                Err(error) => return BatchOutcome::CleanupUnknown(error.to_string()),
+            };
+            // 核输出进日志 sink（非 TTY）；不加 flag 会混入 ANSI 转义。CWD 设可写 config 目录，
+            // 理由同主核 spawner（GUI 从 launchd 拉起时父进程 CWD=`/` 只读）。
+            req.extra_args = vec!["--disable-color".to_string()];
+            req.working_dir = Some(deps.config_dir.clone());
+            req
         };
-        // 核输出进日志 sink（非 TTY）；不加 flag 会混入 ANSI 转义。CWD 设可写 config 目录，
-        // 理由同主核 spawner（GUI 从 launchd 拉起时父进程 CWD=`/` 只读）。
-        req.extra_args = vec!["--disable-color".to_string()];
-        req.working_dir = Some(deps.config_dir.clone());
         #[cfg(not(target_os = "android"))]
         if deps.pc_custody.closing.load(Ordering::SeqCst) {
             return BatchOutcome::CleanupUnknown("应用退出中，测速临时核禁止重新启动".into());

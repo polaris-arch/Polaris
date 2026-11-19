@@ -23,6 +23,13 @@ pub(crate) fn run_request(
         Ok(SpawnRequest::unadmitted_intent(binary, config, stdio))
     }
 }
+
+/// The Android bridge consumes only the config. This request cannot launch an OS process.
+#[cfg(target_os = "android")]
+pub(crate) fn android_libbox_request(binary: &Path, config: &Path) -> SpawnRequest {
+    SpawnRequest::unadmitted_intent(binary, config, StdioPolicy::Discard)
+}
+
 #[cfg(not(test))]
 pub(crate) use polaris_core_supervisor::TokioSpawner;
 
