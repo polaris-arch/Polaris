@@ -31,9 +31,23 @@ fn exit_ip_probe_requires_unique_manual_leaf_and_the_exact_core_receipt() {
     snapshot.static_detours.insert("leaf".into(), "hop".into());
     assert!(pinned_exit_ip_leaf(&config, &snapshot).is_none());
 
+    let mut caps = paired_capabilities();
+    let active = caps.active.clone().unwrap();
+    caps.control_revision = 8;
+    assert!(!exit_ip_graph_matches(&caps, &active, 8));
+    caps.exit_ip_probe_version = EXIT_IP_PROBE_VERSION;
+    assert!(exit_ip_graph_matches(&caps, &active, 8));
+    assert!(exit_ip_graph_matches(&caps, &active, 7));
+    assert!(!exit_ip_graph_matches(&caps, &active, 9));
+    caps.active.as_mut().unwrap().applied_revision += 1;
+    assert!(!exit_ip_graph_matches(&caps, &active, 8));
+    caps.active.as_mut().unwrap().applied_revision -= 1;
+    caps.active.as_mut().unwrap().effective_digest = "d".repeat(64);
+    assert!(!exit_ip_graph_matches(&caps, &active, 8));
+
     let request = daemon::ProbeExitIpRequest {
         version: EXIT_IP_PROBE_VERSION,
-        expected: paired_capabilities().active,
+        expected: Some(active),
         expected_control_revision: 8,
         leaf_tag: "leaf".into(),
     };

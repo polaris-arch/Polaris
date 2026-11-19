@@ -785,13 +785,20 @@ where
     HELPER_GATE_INTERACTIVE.scope(false, fut).await
 }
 
+struct StartupRuntimePairing {
+    pairing: super::runtime_config::RuntimePairing,
+    control: Arc<SingBoxApiClient>,
+    active: Option<polaris_singbox_grpc::daemon::RuntimeIdentity>,
+    control_revision: u64,
+}
+
 impl ProxyRuntime {
     async fn confirm_startup_runtime_pairing(
         &self,
         generated: &SingBoxConfig,
         generation: u64,
         deadline: std::time::Instant,
-    ) -> Result<(super::runtime_config::RuntimePairing, Arc<SingBoxApiClient>), String> {
+    ) -> Result<StartupRuntimePairing, String> {
         use super::runtime_config::{observe_runtime_pairing, RuntimePairingError};
         let failure = || "CORE_BUNDLE_MISMATCH: 配套内核运行协议或实例未确认".to_owned();
         let service = generated
@@ -820,7 +827,14 @@ impl ProxyRuntime {
                     .await
                     .map_err(|_| failure())?;
                 match observe_runtime_pairing(&capabilities) {
-                    Ok(pairing) => return Ok((pairing, Arc::new(client))),
+                    Ok(pairing) => {
+                        return Ok(StartupRuntimePairing {
+                            pairing,
+                            control: Arc::new(client),
+                            active: capabilities.active,
+                            control_revision: capabilities.control_revision,
+                        });
+                    }
                     Err(RuntimePairingError::Starting) => {
                         sleep_unless_superseded_on(
                             &self.gate,
@@ -2524,7 +2538,12 @@ impl ProxyRuntime {
         // TCP readiness is not protocol admission. Query the authenticated API
         // of this exact start before publishing any running/baseline state. This
         // consumes the remaining existing ready budget, never a fresh retry budget.
-        let (runtime_pairing, runtime_api_control) = match self
+        let StartupRuntimePairing {
+            pairing: runtime_pairing,
+            control: runtime_api_control,
+            active: runtime_active,
+            control_revision: runtime_control_revision,
+        } = match self
             .confirm_startup_runtime_pairing(&singbox_config, my_gen, ready_deadline)
             .await
         {
@@ -2665,6 +2684,8 @@ impl ProxyRuntime {
                 .and_then(Option::as_mut)
             {
                 baseline.doh_blocked = doh_blocked;
+                baseline.observed_active = runtime_active;
+                baseline.observed_control_revision = runtime_control_revision;
             }
             self.bind_runtime_api_control(my_gen, runtime_api_control);
             self.commit_coex_current_config(config.clone());

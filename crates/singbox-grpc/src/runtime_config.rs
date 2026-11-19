@@ -7,6 +7,8 @@ use tonic::{transport::Channel, Request};
 
 /// Bounded request and response envelopes, including effective configuration text.
 pub const RUNTIME_CONFIG_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+// Core v1 bounds trace_body at 8 KiB and the identity/tag at 2 KiB combined.
+const EXIT_IP_PROBE_MAX_RESPONSE_BYTES: usize = 12 * 1024;
 
 // Plan validates the full candidate and may fetch remote rule sources, even
 // for a small edit. This budget applies only to preparation.
@@ -71,7 +73,9 @@ impl SingBoxApiClient {
         request: daemon::ProbeExitIpRequest,
         budget: Duration,
     ) -> Result<daemon::ProbeExitIpResponse, ExitIpProbeError> {
-        let mut client = self.runtime_config_client();
+        let mut client = self
+            .runtime_config_client()
+            .max_decoding_message_size(EXIT_IP_PROBE_MAX_RESPONSE_BYTES);
         let request = self.runtime_config_request(request, budget);
         match self
             .unary_with_deadline(budget, client.probe_exit_ip(request))

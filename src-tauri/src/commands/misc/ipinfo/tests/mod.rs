@@ -149,7 +149,7 @@ async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
             8,
         ),
         (
-            FirstProxyAttempt::Completed,
+            FirstProxyAttempt::Completed(None),
             5,
             1,
             true,
@@ -157,15 +157,7 @@ async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
             Some(1),
             5,
         ),
-        (
-            FirstProxyAttempt::Unconfirmed,
-            8,
-            1,
-            false,
-            vec![4, 9],
-            None,
-            9,
-        ),
+        (FirstProxyAttempt::Unconfirmed, 8, 1, false, vec![], None, 8),
     ] {
         let started = tokio::time::Instant::now();
         let mut starts = Vec::new();
@@ -193,7 +185,14 @@ async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
         )
         .await;
         assert_eq!(direct.unwrap()["ip"], "192.0.2.1");
-        assert_eq!(proxy["ip"], "192.0.2.2");
+        if expected_starts.is_empty() {
+            assert!(
+                proxy.is_null(),
+                "uncertain native drain cannot start a legacy proxy"
+            );
+        } else {
+            assert_eq!(proxy["ip"], "192.0.2.2");
+        }
         assert_eq!(starts, expected_starts);
         assert_eq!(
             published,
@@ -955,7 +954,7 @@ async fn stale_probe_leg_must_not_overwrite_newer_leg() {
     assert!(newer_pending["revision"].as_u64() > pending["revision"].as_u64());
     assert!(begin_scheduled_probe(ticket, true).is_none());
     assert_eq!(peek_ipinfo_snapshot(), newer_pending);
-    assert!(finish_scheduled_probe(ticket).is_none());
+    assert!(finish_scheduled_probe(ticket, None).is_none());
     assert_eq!(peek_ipinfo_snapshot(), newer_pending);
 
     let (manual_epoch, manual_seq) = begin_manual_probe();
@@ -1006,7 +1005,7 @@ async fn stale_probe_leg_must_not_overwrite_newer_leg() {
         peek_ipinfo_snapshot(),
         "终态与 peek 必须是同一权威帧"
     );
-    assert!(finish_scheduled_probe(new_ticket).is_none());
+    assert!(finish_scheduled_probe(new_ticket, None).is_none());
 
     // 停核同步清代理并写缓存，旧在飞探测不能在新版后落地。
     let (stop_ticket, stopped) = declare_scheduled_refresh(0);
@@ -1114,7 +1113,7 @@ async fn stale_probe_leg_must_not_overwrite_newer_leg() {
     assert_eq!(attempts.get(), 1);
     assert!(started.elapsed() < Duration::from_millis(IPINFO_PROXY_POST_CONNECT_RETRY_MS));
     assert!(!ipinfo_probe_is_current(epoch, seq));
-    assert!(finish_scheduled_probe(ticket).is_none());
+    assert!(finish_scheduled_probe(ticket, None).is_none());
     assert_eq!(peek_ipinfo_snapshot(), stopped);
 
     // A blocked verdict cancels even a task that has not first been polled.
@@ -1152,7 +1151,7 @@ async fn stale_probe_leg_must_not_overwrite_newer_leg() {
     let retained = commit_ipinfo_snapshot(epoch, seq, &early).unwrap();
     let (manual_epoch, manual_seq) = begin_manual_probe();
     assert!(commit_ipinfo_snapshot(epoch, seq, &complete).is_none());
-    let terminal = finish_scheduled_probe(ticket).expect("retired ticket closes its partial");
+    let terminal = finish_scheduled_probe(ticket, None).expect("retired ticket closes its partial");
     assert_eq!(terminal["proxy"], retained["proxy"]);
     assert_eq!(terminal["updatedAt"], retained["updatedAt"]);
     assert_eq!(terminal["loading"], json!(false));
@@ -1160,4 +1159,22 @@ async fn stale_probe_leg_must_not_overwrite_newer_leg() {
     assert_eq!(fresh_cached_snapshot(), Some(terminal.clone()));
     assert_eq!(peek_ipinfo_snapshot(), terminal);
     assert!(commit_ipinfo_snapshot(manual_epoch, manual_seq, &complete).is_some());
+
+    // A rejected Core receipt cannot become terminal through the legacy
+    // finalizer, including when a settle episode returns to idle.
+    let (ticket, _) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
+    let (epoch, seq) = begin_scheduled_probe(ticket, true).unwrap();
+    let partial = commit_ipinfo_snapshot(epoch, seq, &early).unwrap();
+    let rejected = partial["revision"].as_u64();
+    let terminal = finish_scheduled_probe(ticket, rejected).unwrap();
+    assert!(terminal["proxy"].is_null());
+    assert_eq!(terminal["proxyReachability"], "unknown");
+    assert_eq!(fresh_cached_snapshot(), Some(terminal));
+
+    let (ticket, _) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
+    let (epoch, seq) = begin_scheduled_probe(ticket, true).unwrap();
+    let legacy = commit_ipinfo_snapshot(epoch, seq, &early).unwrap();
+    let terminal = finish_scheduled_probe(ticket, rejected).unwrap();
+    assert_eq!(terminal["proxy"], legacy["proxy"]);
+    assert_eq!(terminal["updatedAt"], legacy["updatedAt"]);
 }

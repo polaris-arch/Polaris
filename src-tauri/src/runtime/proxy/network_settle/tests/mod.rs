@@ -6,6 +6,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn waits_for_last_overlapping_leg() {
     let gate = Arc::new(NetworkSettleGate::default());
+    let previous_epoch = gate.settled_epoch().unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(50), gate.wait())
             .await
@@ -15,6 +16,8 @@ async fn waits_for_last_overlapping_leg() {
 
     let start_leg = gate.begin("test-start");
     let tun_flush_leg = gate.begin("test-flush");
+    assert!(gate.settled_epoch().is_none());
+    assert_eq!(gate.with_settled_epoch(previous_epoch, || true), None);
     let waiter_gate = Arc::clone(&gate);
     let waiter = tokio::spawn(async move { waiter_gate.wait().await });
     tokio::task::yield_now().await;
@@ -33,4 +36,7 @@ async fn waits_for_last_overlapping_leg() {
         .expect("最后一腿退场后等待者应立即醒")
         .expect("等待任务不应 panic");
     assert!(gate.is_settled());
+    assert_eq!(gate.with_settled_epoch(previous_epoch, || true), None);
+    let current_epoch = gate.settled_epoch().unwrap();
+    assert_eq!(gate.with_settled_epoch(current_epoch, || true), Some(true));
 }

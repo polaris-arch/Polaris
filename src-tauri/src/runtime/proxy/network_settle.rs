@@ -1,7 +1,6 @@
 //! Polaris 自身后台网络请求与代理起核/TUN flush 之间的稳定门。
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
@@ -13,13 +12,27 @@ use tokio::sync::Notify;
 /// 退场，等待者才可继续。
 #[derive(Default)]
 pub(super) struct NetworkSettleGate {
-    pending: AtomicU32,
+    state: Mutex<SettleState>,
     changed: Notify,
+}
+
+#[derive(Default)]
+struct SettleState {
+    pending: u32,
+    epoch: u64,
 }
 
 impl NetworkSettleGate {
     pub(super) fn begin(self: &Arc<Self>, leg: &'static str) -> NetworkSettleGuard {
-        let pending = self.pending.fetch_add(1, Ordering::SeqCst) + 1;
+        let pending = {
+            let mut state = self.state.lock().expect("network settle lock poisoned");
+            state.pending += 1;
+            state.epoch = state
+                .epoch
+                .checked_add(1)
+                .expect("network settle epoch exhausted");
+            state.pending
+        };
         log::debug!("代理网络稳定门占用：leg={leg} pending={pending}");
         NetworkSettleGuard {
             gate: Arc::clone(self),
@@ -28,11 +41,28 @@ impl NetworkSettleGate {
     }
 
     pub(super) fn is_settled(&self) -> bool {
-        self.pending.load(Ordering::SeqCst) == 0
+        self.pending() == 0
     }
 
     pub(super) fn pending(&self) -> u32 {
-        self.pending.load(Ordering::SeqCst)
+        self.state
+            .lock()
+            .expect("network settle lock poisoned")
+            .pending
+    }
+
+    pub(super) fn settled_epoch(&self) -> Option<u64> {
+        let state = self.state.try_lock().ok()?;
+        (state.pending == 0).then_some(state.epoch)
+    }
+
+    pub(super) fn with_settled_epoch<T>(
+        &self,
+        epoch: u64,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = self.state.try_lock().ok()?;
+        (state.pending == 0 && state.epoch == epoch).then(commit)
     }
 
     /// 等到全部在飞起核与 TUN post-start flush 退场。
@@ -60,11 +90,18 @@ pub(super) struct NetworkSettleGuard {
 
 impl Drop for NetworkSettleGuard {
     fn drop(&mut self) {
-        let previous = self.gate.pending.fetch_sub(1, Ordering::SeqCst);
-        debug_assert!(previous > 0, "网络稳定门计数不得下溢");
-        let pending = previous.saturating_sub(1);
+        let pending = {
+            let mut state = self
+                .gate
+                .state
+                .lock()
+                .expect("network settle lock poisoned");
+            debug_assert!(state.pending > 0, "网络稳定门计数不得下溢");
+            state.pending = state.pending.saturating_sub(1);
+            state.pending
+        };
         log::debug!("代理网络稳定门归还：leg={} pending={pending}", self.leg);
-        if previous == 1 {
+        if pending == 0 {
             self.gate.changed.notify_waiters();
         }
     }

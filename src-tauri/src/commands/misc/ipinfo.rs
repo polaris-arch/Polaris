@@ -250,7 +250,7 @@ fn begin_scheduled_probe(ticket: u64, delayed: bool) -> Option<(u64, u64)> {
     Some((epoch, seq))
 }
 
-fn finish_scheduled_probe(ticket: u64) -> Option<Value> {
+fn finish_scheduled_probe(ticket: u64, rejected_partial: Option<u64>) -> Option<Value> {
     let mut state = ipinfo_state().lock().unwrap();
     if state.pending_seq == Some(ticket) {
         state.pending_seq = None;
@@ -261,6 +261,7 @@ fn finish_scheduled_probe(ticket: u64) -> Option<Value> {
             // when the old automatic direct leg loses its right to publish.
             if proxy_ip(&state.visible).is_some()
                 && snapshot_has_proxy_reachability(&state.visible, "reachable")
+                && state.visible["revision"].as_u64() != rejected_partial
             {
                 let mut terminal = state.visible.clone();
                 terminal["loading"] = json!(false);
@@ -712,7 +713,7 @@ where
 #[derive(Clone, Copy)]
 enum FirstProxyAttempt {
     NotAttempted,
-    Completed,
+    Completed(Option<u64>),
     Unconfirmed,
 }
 
@@ -723,12 +724,13 @@ enum ProxyProbe<'a> {
         runtime: &'a ProxyRuntime,
         route: &'a RuntimeExitIpRoute,
         trace: Value,
+        observed_at: u64,
     },
 }
 
 async fn probe_post_connect_ipinfo<D, P, PFut>(
     direct: D,
-    mut proxy: P,
+    proxy: P,
     first: FirstProxyAttempt,
     on_early_proxy: impl FnOnce(&Value),
 ) -> (Result<Value, String>, Value)
@@ -737,24 +739,14 @@ where
     P: FnMut() -> PFut,
     PFut: std::future::Future<Output = Result<Value, String>>,
 {
-    let mut defer_first = matches!(first, FirstProxyAttempt::Unconfirmed);
-    let attempts = IPINFO_PROXY_POST_CONNECT_ATTEMPTS
-        - u32::from(matches!(first, FirstProxyAttempt::Completed));
-    let proxy = with_ipinfo_retry(
-        || {
-            // The client timed out or lost the transport without a drain receipt.
-            // Spend this slot on the original backoff before a loopback request.
-            let attempt = (!std::mem::take(&mut defer_first)).then(&mut proxy);
-            async move {
-                match attempt {
-                    Some(attempt) => attempt.await,
-                    None => Err("ipinfo: 探测结束未获确认".into()),
-                }
-            }
-        },
-        attempts,
-        IPINFO_PROXY_POST_CONNECT_RETRY_MS,
-    );
+    let attempts = match first {
+        FirstProxyAttempt::NotAttempted => IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
+        FirstProxyAttempt::Completed(_) => IPINFO_PROXY_POST_CONNECT_ATTEMPTS - 1,
+        // A canceled RPC can retain a native connection after its caller exits.
+        // This ticket finishes direct-only unless Core confirmed the drain.
+        FirstProxyAttempt::Unconfirmed => return (direct.await, Value::Null),
+    };
+    let proxy = with_ipinfo_retry(proxy, attempts, IPINFO_PROXY_POST_CONNECT_RETRY_MS);
     // Keep the same proxy future running even when the direct leg finishes first.
     tokio::pin!(direct, proxy);
     let (direct, proxy) = tokio::select! {
@@ -844,7 +836,13 @@ async fn build_ipinfo_snapshot(
     } else {
         (direct.await, Value::Null)
     };
-    ipinfo_snapshot(status, local_proxy, doh_blocked, Some(direct), proxy)
+    let tested_proxy = local_proxy.filter(|_| {
+        !matches!(
+            probe_kind,
+            ProxyProbe::PostConnect(FirstProxyAttempt::Unconfirmed)
+        )
+    });
+    ipinfo_snapshot(status, tested_proxy, doh_blocked, Some(direct), proxy)
 }
 
 fn ipinfo_snapshot(
@@ -925,7 +923,7 @@ pub async fn ipinfo_get(
     let has_real_exit = ipinfo_config_has_real_exit(&inputs.config);
     // 手点腿吃**常规**重试预算：用户已在等一个即时答复，隧道热身那套 4×4s 会让按钮看起来卡住。
     // 与 上游 一致（手点走 `refresh(true, true)` → 常规腿，非 post-connect）。
-    let (snapshot, committed) =
+    let (snapshot, committed, _) =
         probe_publish_ipinfo(&app, inputs, epoch, seq, ProxyProbe::Standard).await;
     if committed && ipinfo_probe_is_current(epoch, seq) {
         schedule_unreachable_ipinfo_recheck(&app, &snapshot, seq, has_real_exit);
@@ -1009,7 +1007,7 @@ async fn probe_publish_ipinfo(
     epoch: u64,
     seq: u64,
     probe_kind: ProxyProbe<'_>,
-) -> (Value, bool) {
+) -> (Value, bool, Option<u64>) {
     let IpinfoProbeInputs {
         http,
         status,
@@ -1017,7 +1015,10 @@ async fn probe_publish_ipinfo(
         doh_blocked,
         config,
     } = inputs;
-    let publish = |snap, warm_rtt| {
+    let publish = |mut snap: Value, warm_rtt| {
+        if let ProxyProbe::Verified { observed_at, .. } = &probe_kind {
+            snap["updatedAt"] = json!(observed_at);
+        }
         // 早到的代理帧和最终双腿帧走同一道闸；旧腿只读当前权威帧。
         let commit = || commit_ipinfo_snapshot(epoch, seq, &snap);
         let committed = match &probe_kind {
@@ -1057,7 +1058,7 @@ async fn probe_publish_ipinfo(
         (snap, true)
     };
 
-    let mut early_published = false;
+    let mut early_revision = None;
     let snap = build_ipinfo_snapshot(
         http.as_ref(),
         &status,
@@ -1075,11 +1076,15 @@ async fn probe_publish_ipinfo(
                 proxy.clone(),
             );
             early["loading"] = json!(true);
-            early_published = publish(early, true).1;
+            let (early, committed) = publish(early, true);
+            if committed {
+                early_revision = early["revision"].as_u64();
+            }
         },
     )
     .await;
-    publish(snap, !early_published)
+    let (snapshot, committed) = publish(snap, early_revision.is_none());
+    (snapshot, committed, early_revision)
 }
 
 /// 收敛窗口占位快照：direct/proxy 双 null + `loading:true`。
@@ -1187,7 +1192,7 @@ fn schedule_unreachable_ipinfo_recheck(
             {
                 return;
             }
-            let (snapshot, committed) =
+            let (snapshot, committed, _) =
                 probe_publish_ipinfo(&app, inputs, epoch, seq, ProxyProbe::Standard).await;
             if !committed || !ipinfo_probe_is_current(epoch, seq) {
                 return;
@@ -1297,22 +1302,24 @@ async fn try_first_proxy_probe(
     let trace = match result {
         Ok(trace) => trace,
         Err(ExitIpProbeError::NotAttempted) => return (false, FirstProxyAttempt::NotAttempted),
-        Err(ExitIpProbeError::CompletedFailure) => return (false, FirstProxyAttempt::Completed),
+        Err(ExitIpProbeError::CompletedFailure) => {
+            return (false, FirstProxyAttempt::Completed(None))
+        }
         Err(ExitIpProbeError::Unknown) => return (false, FirstProxyAttempt::Unconfirmed),
     };
     let Some(inputs) = app
         .try_state::<AppRuntime>()
         .map(|state| ipinfo_probe_inputs(&state))
     else {
-        return (false, FirstProxyAttempt::Completed);
+        return (false, FirstProxyAttempt::Completed(None));
     };
     if !inputs.status.running
         || !ipinfo_probe_is_current(epoch, seq)
         || runtime.with_pinned_exit_ip_route(&route, || ()).is_none()
     {
-        return (false, FirstProxyAttempt::Completed);
+        return (false, FirstProxyAttempt::Completed(None));
     }
-    let (_, committed) = probe_publish_ipinfo(
+    let (_, committed, partial) = probe_publish_ipinfo(
         app,
         inputs,
         epoch,
@@ -1321,10 +1328,11 @@ async fn try_first_proxy_probe(
             runtime: &runtime,
             route: &route,
             trace,
+            observed_at: u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX),
         },
     )
     .await;
-    (committed, FirstProxyAttempt::Completed)
+    (committed, FirstProxyAttempt::Completed(partial))
 }
 
 fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_on_recovery: bool) {
@@ -1374,7 +1382,7 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
                 } else {
                     ProxyProbe::Standard
                 };
-                let (snapshot, committed) =
+                let (snapshot, committed, _) =
                     probe_publish_ipinfo(&app, inputs, epoch, seq, probe_kind).await;
                 if committed && ipinfo_probe_is_current(epoch, seq) {
                     if recheck_unlock_on_recovery {
@@ -1388,7 +1396,14 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
                 }
             }
         }
-        if let Some(frame) = finish_scheduled_probe(ticket) {
+        // A failed guarded completion can leave its earlier fast frame
+        // visible. Finalize a newer legacy partial normally, but do not
+        // promote the old fast frame after its route proof was rejected.
+        let rejected_partial = match first_attempt {
+            FirstProxyAttempt::Completed(partial) if !already_published => partial,
+            _ => None,
+        };
+        if let Some(frame) = finish_scheduled_probe(ticket, rejected_partial) {
             crate::events::broadcast(&app, crate::events::channel::EVENT_IP_INFO_UPDATED, frame);
         }
     }));

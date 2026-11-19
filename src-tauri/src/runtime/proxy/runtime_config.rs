@@ -50,11 +50,12 @@ struct ExitIpLeaf {
 pub(crate) struct RuntimeExitIpRoute {
     generation: u64,
     intent: u64,
+    settle_epoch: u64,
     leaf: ExitIpLeaf,
     pairing: RuntimePairing,
     api_epoch: Arc<ApiRelayEpoch>,
     control: Arc<SingBoxApiClient>,
-    baseline_active: Option<daemon::RuntimeIdentity>,
+    baseline_active: daemon::RuntimeIdentity,
     baseline_control_revision: u64,
 }
 
@@ -103,6 +104,19 @@ fn verified_exit_ip_trace(
         && response.control_revision == request.expected_control_revision
         && response.leaf_tag == request.leaf_tag)
         .then_some(response.trace_body)
+}
+
+fn exit_ip_graph_matches(
+    capabilities: &daemon::RuntimeCapabilities,
+    active: &daemon::RuntimeIdentity,
+    control_revision: u64,
+) -> bool {
+    // The graph identity belongs to the App's published R. Selector-only writes
+    // may advance control without replacing the graph; Core rechecks that exact
+    // current revision and the actual leaf before it opens the probe connection.
+    capabilities.exit_ip_probe_version == EXIT_IP_PROBE_VERSION
+        && capabilities.active.as_ref() == Some(active)
+        && capabilities.control_revision >= control_revision
 }
 
 fn runtime_plan_ticket_is_live(expires_at_unix_milli: i64) -> bool {
@@ -359,8 +373,8 @@ pub(super) struct RuntimeConfigBaseline {
     pub(super) api_log_handoff: Option<super::core_log::CoreLogHandoff>,
     pub(super) generation: u64,
     committed_transaction: Option<String>,
-    observed_active: Option<daemon::RuntimeIdentity>,
-    observed_control_revision: u64,
+    pub(super) observed_active: Option<daemon::RuntimeIdentity>,
+    pub(super) observed_control_revision: u64,
     pub(super) pairing: RuntimePairing,
     physical_route_config: UserConfig,
     protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
@@ -536,6 +550,7 @@ impl ProxyRuntime {
     pub(crate) fn pinned_exit_ip_route(&self) -> Option<RuntimeExitIpRoute> {
         let generation = self.gate.try_idle_generation()?;
         let intent = self.selector_reconcile.intent_generation();
+        let settle_epoch = self.network_settle.settled_epoch()?;
         let leaf = self.current_exit_ip_leaf()?;
         let route = {
             let baseline = self.runtime_config_baseline.try_read().ok()?;
@@ -549,11 +564,12 @@ impl ProxyRuntime {
             RuntimeExitIpRoute {
                 generation,
                 intent,
+                settle_epoch,
                 leaf,
                 pairing: baseline.pairing.clone(),
                 api_epoch: baseline.api_epoch.clone(),
                 control: control.clone(),
-                baseline_active: baseline.observed_active.clone(),
+                baseline_active: baseline.observed_active.clone()?,
                 baseline_control_revision: baseline.observed_control_revision,
             }
         };
@@ -578,7 +594,6 @@ impl ProxyRuntime {
                 || self.gate.try_idle_generation() != Some(route.generation)
                 || !self.core_running()
                 || self.selector_reconcile.is_required()
-                || self.network_settle_pending() != 0
                 || route.api_epoch.is_closed()
                 || !route.control.captured_transport_live()
                 || self.current_exit_ip_leaf().as_ref() != Some(&route.leaf)
@@ -593,9 +608,12 @@ impl ProxyRuntime {
                     .control
                     .as_ref()
                     .is_some_and(|control| Arc::ptr_eq(control, &route.control))
-                && baseline.observed_active == route.baseline_active
+                && baseline.observed_active.as_ref() == Some(&route.baseline_active)
                 && baseline.observed_control_revision == route.baseline_control_revision)
-                .then(claim)
+                .then(|| {
+                    self.network_settle
+                        .with_settled_epoch(route.settle_epoch, claim)
+                })?
         })?
     }
 
@@ -606,13 +624,16 @@ impl ProxyRuntime {
         let caps = paired_runtime_capabilities(&route.control, &route.pairing)
             .await
             .ok()?;
-        if caps.exit_ip_probe_version != EXIT_IP_PROBE_VERSION {
+        if !exit_ip_graph_matches(
+            &caps,
+            &route.baseline_active,
+            route.baseline_control_revision,
+        ) {
             return None;
         }
-        let identity = caps.active?;
         self.with_pinned_exit_ip_route(route, || daemon::ProbeExitIpRequest {
             version: EXIT_IP_PROBE_VERSION,
-            expected: Some(identity),
+            expected: Some(route.baseline_active.clone()),
             expected_control_revision: caps.control_revision,
             leaf_tag: route.leaf.tag.clone(),
         })

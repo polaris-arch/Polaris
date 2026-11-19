@@ -85,7 +85,9 @@ fn scheduler_publishes_before_sleep_then_finishes_its_own_ticket() {
         .find("begin_scheduled_probe(ticket, delay_ms > 0)")
         .unwrap();
     let probe = scheduler.find("probe_publish_ipinfo(").unwrap();
-    let finish = scheduler.find("finish_scheduled_probe(ticket)").unwrap();
+    let finish = scheduler
+        .find("finish_scheduled_probe(ticket, rejected_partial)")
+        .unwrap();
     assert!(
         declare < deadline
             && deadline < broadcast
