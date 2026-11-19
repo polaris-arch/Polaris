@@ -203,18 +203,24 @@ fn manual_all_wires_real_builtin_registry_and_one_deferred_batch_broadcast() {
     assert!(body.contains("ProgressMode::Live"));
     assert_eq!(body.matches("BroadcastMode::Deferred").count(), 2);
     assert!(!body.contains("BroadcastMode::Immediate"));
-    assert_eq!(body.matches("broadcast_config_changed(").count(), 1);
-    assert!(body.contains("let mut changed = false"));
+    assert_eq!(body.matches("changes.publish(").count(), 1);
+    assert!(!body.contains("broadcast_config_changed("));
     assert!(body.contains("download_registered_resource("));
     assert!(body.contains("persist_registered_resource("));
-    assert!(body.contains("changed |= matches!(&outcome, DownloadOutcome::Stored { .. })"));
-    assert!(body.contains("changed |= result.get(\"ok\").and_then(Value::as_bool) == Some(true)"));
-    assert!(body.contains("if changed {"));
     // 空外置表没有 return，全部内置项仍需出现在逐项结果数组中。
     let external = body.find("for entry in &raw_entries").unwrap();
     let builtin = body.find("for builtin in builtins").unwrap();
     assert!(!body[external..builtin].contains("return"));
     assert!(body[builtin..].contains("results.push(result)"));
+    let catalog = crate::commands::guard_scan::top_level_fn_body(
+        &source,
+        "pub async fn rule_resources_download(",
+    );
+    assert_eq!(catalog.matches("changes.publish(").count(), 1);
+    assert!(!catalog.contains("broadcast_config_changed("));
+    assert!(
+        catalog.find("results.push(outcome").unwrap() < catalog.find("changes.publish(").unwrap()
+    );
 }
 
 #[test]
@@ -424,6 +430,7 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
                 staged,
                 &success_dir.join(&success_plan.file_name),
             )
+            .map(|_| ())
         },
     );
     let peers = async {

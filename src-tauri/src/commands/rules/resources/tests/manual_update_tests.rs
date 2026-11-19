@@ -109,7 +109,7 @@ fn guarded_test_commit(
     let (result, _) = manager
         .update(|cfg| {
             match commit_registered_resource(cfg, expected, downloaded, staged, res_dir) {
-                Ok(()) => Decision::Write(Ok(())),
+                Ok(_) => Decision::Write(Ok(())),
                 Err(error) => Decision::Skip(Err(error)),
             }
         })
@@ -373,6 +373,61 @@ fn registered_refresh_paths_share_staged_transaction_commit_instead_of_upsert() 
             < delete.find("cancel_inflight(&id)").unwrap()
     );
     assert!(delete.find("cancel_inflight(&id)").unwrap() < delete.find("arr.retain(").unwrap());
+}
+
+#[test]
+fn only_changed_runtime_resources_request_apply_and_batches_keep_the_last_commit() {
+    let (dir, manager, resource) = registered_fixture();
+    let mut config = manager.load_full().unwrap();
+    let res_dir = dir.path().join("rule-resource");
+    let live = res_dir.join(&resource.file_name);
+    let stage = res_dir.join("fixture.srs");
+    let mut downloaded = resource.clone();
+    downloaded.downloaded_at = "after".into();
+    let mut batch = ResourceChanges::default();
+    assert_eq!(batch, ResourceChanges::None);
+
+    let rule = json!({
+        "id": "active", "type": "ruleSet", "values": [format!("res:{}", resource.id)],
+        "action": "block", "enabled": true,
+    });
+    config["proxyMode"] = json!("smart");
+    config["trafficRules"] = json!([rule]);
+    std::fs::write(&stage, EMPTY_SRS_V2).unwrap();
+    let apply =
+        commit_registered_resource(&mut config, &resource, &downloaded, &stage, &res_dir).unwrap();
+    assert!(!apply);
+    assert!(
+        stage.is_file(),
+        "equal content must not replace the live file"
+    );
+    assert_eq!(config["ruleResources"][0]["downloadedAt"], "after");
+    batch.record(config.clone(), apply);
+    assert_eq!(batch, ResourceChanges::Refresh);
+
+    config["proxyMode"] = json!("global");
+    assert!(!resource_affects_runtime(&config, &resource));
+    config["proxyMode"] = json!("smart");
+    config["trafficRules"][0]["enabled"] = json!(false);
+    assert!(!resource_affects_runtime(&config, &resource));
+    config["trafficRules"][0]["enabled"] = json!(true);
+    std::fs::write(&stage, EMPTY_SRS_V1).unwrap();
+    let apply =
+        commit_registered_resource(&mut config, &downloaded, &resource, &stage, &res_dir).unwrap();
+    assert!(apply);
+    assert_eq!(std::fs::read(&live).unwrap(), EMPTY_SRS_V1);
+    batch.record(config.clone(), apply);
+    assert_eq!(batch, ResourceChanges::Apply(config.clone()));
+
+    config["proxyMode"] = json!("direct");
+    config["dnsRules"] = json!([{
+        "id": "active-dns", "type": "ruleSet",
+        "values": [format!(" res:{} ", resource.id)], "action": "direct",
+        "effects": {"dns": {"resolver": "direct", "answerMode": "real"}}, "enabled": true,
+    }]);
+    assert!(resource_affects_runtime(&config, &resource));
+    batch.record(config.clone(), false);
+    assert_eq!(batch, ResourceChanges::Apply(config));
 }
 
 #[test]

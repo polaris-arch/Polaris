@@ -33,6 +33,7 @@ use polaris_config_engine::user_config::builtin_geo_rulesets::{
     builtin_geo_rulesets, builtin_id_for,
 };
 
+use crate::commands::rules::ResourceChanges;
 use crate::runtime::subscription_scheduler::{
     elapsed_or_clock_rollback, now_ms, rfc3339_to_epoch_ms, BackoffTracker,
 };
@@ -345,6 +346,7 @@ impl RuleResourceScheduler {
         };
 
         let (mut ok_count, mut failures) = (0usize, Vec::new());
+        let mut changes = ResourceChanges::default();
         for id in plan.external_ids {
             // 走既有下载核心而非直接调下载函数：命令层已收口「条目解析 / 落盘 / persist + 广播」，
             // 绕过它就得在这里复刻一份必然漂移的副本。
@@ -356,9 +358,13 @@ impl RuleResourceScheduler {
             let state = app.state::<AppRuntime>();
             // The shared core stages bytes and verifies the original record in its config
             // commit; a delete/source edit during await cannot resurrect or overwrite it.
-            let resp =
-                crate::commands::rules::rule_resources_redownload_silent(app, &state, id.clone())
-                    .await;
+            let resp = crate::commands::rules::rule_resources_redownload_silent(
+                app,
+                &state,
+                id.clone(),
+                &mut changes,
+            )
+            .await;
             let data = resp.ok().and_then(|r| r.data).unwrap_or(Value::Null);
             let ok = data.get("ok").and_then(Value::as_bool) == Some(true);
             let mut inner = lock_inner(&self.inner);
@@ -387,8 +393,7 @@ impl RuleResourceScheduler {
         // 与已登记资源共用同一个总开关和同一个间隔（`auto_update_interval_ms`）——
         // 「我关了自动更新」必须对两类都成立。退避表也共用，键用 `builtin:<tag>`（= 它的资源 id，
         // 与前端列表里那一行同名），故不会与已登记资源的 id 撞键。
-        let builtin_ok = self
-            .run_builtin_geo(app, plan.builtin_tags, now, reason)
+        self.run_builtin_geo(app, plan.builtin_tags, now, reason, &mut changes)
             .await;
 
         // ── 整批收尾：广播一次（而不是批内每条各广播一次）──
@@ -401,12 +406,7 @@ impl RuleResourceScheduler {
         // 收口在此处广播一次。
         //
         // **一条都没成功就不广播**：配置没变，广播等于凭空给核一次无谓的 switch_mode 判定。
-        if ok_count > 0 || builtin_ok > 0 {
-            match app.state::<AppRuntime>().config().current() {
-                Ok(latest) => crate::commands::config::broadcast_config_changed(app, &latest),
-                Err(e) => log::warn!("[{reason}] 整批更新已落盘，但读回配置广播失败: {e}"),
-            }
-        }
+        changes.publish(app);
 
         if !failures.is_empty() {
             log::warn!(
@@ -428,17 +428,17 @@ impl RuleResourceScheduler {
     /// 落位安全性由 `rule_resources_update_builtin` 自己保证（下到 `.update/` 暂存 + 原子 rename），
     /// 故一次失败绝不会破坏正在生效的那份副本。
     ///
-    /// 返回**本轮成功更新的条数** —— 调用方据此决定收尾要不要广播一次配置变更
-    /// （见 `run_due_updates` 的整批收尾段；一条都没成功就不该白给核一次 `switch_mode`）。
+    /// 只记录已提交的结果，交给 `run_due_updates` 统一通知。
     async fn run_builtin_geo(
         &self,
         app: &tauri::AppHandle,
         due: Vec<String>,
         now: u64,
         reason: &str,
-    ) -> usize {
+        changes: &mut ResourceChanges,
+    ) {
         if due.is_empty() {
-            return 0;
+            return;
         }
         let (mut ok_count, mut failures) = (0usize, Vec::new());
         for tag in due {
@@ -447,6 +447,7 @@ impl RuleResourceScheduler {
                 app,
                 &state,
                 tag.clone(),
+                changes,
             )
             .await;
             let data = resp.ok().and_then(|r| r.data).unwrap_or(Value::Null);
@@ -475,7 +476,6 @@ impl RuleResourceScheduler {
                 failures.join("；")
             );
         }
-        ok_count
     }
 
     /// 资源库目录（catalog）随自动更新一并刷新 —— 移植 上游

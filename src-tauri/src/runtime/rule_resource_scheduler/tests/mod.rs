@@ -485,8 +485,7 @@ fn scheduler_actually_wires_the_catalog_refresh_leg() {
 ///
 /// 守两件事，缺一即回归：
 /// ① 两条后台静默腿必须传 `BroadcastMode::Deferred`（改回 `Immediate` 或删掉参数 → 转红）；
-/// ② 批次收尾必须有且只有一处广播，且**门控在「本轮真有成功」上**（去掉 `ok_count`/`builtin_ok`
-///    门 → 转红：一条都没更新还广播，等于凭空给核一次无谓的 `switch_mode`）。
+/// ② 只在批次收尾发布已提交资源的通知。
 #[test]
 fn one_refresh_round_broadcasts_exactly_once() {
     let rules = crate_code("commands/rules/resources.rs");
@@ -494,10 +493,7 @@ fn one_refresh_round_broadcasts_exactly_once() {
         "pub async fn rule_resources_redownload_silent(",
         "pub async fn rule_resources_update_builtin_silent(",
     ] {
-        let at = rules
-            .find(silent_fn)
-            .unwrap_or_else(|| panic!("找不到 {silent_fn}"));
-        let body = &rules[at..at + 400];
+        let body = crate::commands::guard_scan::top_level_fn_body(&rules, silent_fn);
         assert!(
             body.contains("BroadcastMode::Deferred"),
             "{silent_fn} 是后台批量腿，必须延后广播，否则一轮 33 次 switch_mode"
@@ -506,18 +502,12 @@ fn one_refresh_round_broadcasts_exactly_once() {
 
     let body = fn_body("async fn run_due_updates(");
     assert_eq!(
-        body.matches("broadcast_config_changed(").count(),
+        body.matches("changes.publish(").count(),
         1,
         "整批只准广播一次（多于一次 = 风暴回归；零次 = 变更永远进不了运行中的核）"
     );
-    let at = body
-        .find("broadcast_config_changed(")
-        .expect("上一条断言已保证存在");
-    let head = &body[..at];
-    assert!(
-        head.contains("if ok_count > 0 || builtin_ok > 0"),
-        "收尾广播必须门控在『本轮真有成功』上，否则空轮也白给核一次 switch_mode"
-    );
+    assert!(!body.contains("broadcast_config_changed("));
+    assert!(body.find(".run_builtin_geo(").unwrap() < body.find("changes.publish(").unwrap());
 }
 
 #[test]

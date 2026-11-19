@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{json, Value};
 use tauri::{AppHandle, State};
 
-use crate::commands::config::broadcast_config_changed;
+use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
 use crate::commands::rules::new_uuid;
 use crate::events::{broadcast, channel::EVENT_RULE_RESOURCE_PROGRESS};
 use crate::response::ApiResponse;
@@ -680,13 +680,14 @@ pub async fn rule_resources_redownload_silent(
     app: &AppHandle,
     state: &AppRuntime,
     id: String,
+    changes: &mut ResourceChanges,
 ) -> Result<ApiResponse<Value>, ()> {
     redownload_with_mode(
         app,
         state,
         id,
         ProgressMode::Silent,
-        BroadcastMode::Deferred,
+        BroadcastMode::Deferred(changes),
     )
     .await
 }
@@ -697,7 +698,7 @@ async fn redownload_with_mode(
     state: &AppRuntime,
     id: String,
     mode: ProgressMode,
-    broadcast: BroadcastMode,
+    broadcast: BroadcastMode<'_>,
 ) -> Result<ApiResponse<Value>, ()> {
     let cfg = match state.config().current() {
         Ok(c) => c,
@@ -754,7 +755,7 @@ pub async fn rule_resources_update_all(
 
     let (raw_entries, builtins) = manual_update_targets(raw_entries);
     let mut results: Vec<Value> = Vec::with_capacity(raw_entries.len() + builtins.len());
-    let mut changed = false;
+    let mut changes = ResourceChanges::default();
     for entry in &raw_entries {
         // Preserve a truthful per-item failure for malformed entries.
         let existing = match parse_resource_entry(entry) {
@@ -782,12 +783,11 @@ pub async fn rule_resources_update_all(
                     &existing,
                     resource,
                     staged,
-                    BroadcastMode::Deferred,
+                    BroadcastMode::Deferred(&mut changes),
                 )
             },
         )
         .await;
-        changed |= matches!(&outcome, DownloadOutcome::Stored { .. });
         results.push(outcome.into_value(&plan));
     }
     for builtin in builtins {
@@ -797,7 +797,7 @@ pub async fn rule_resources_update_all(
             &state,
             tag.clone(),
             ProgressMode::Live,
-            BroadcastMode::Deferred,
+            BroadcastMode::Deferred(&mut changes),
         )
         .await
         {
@@ -816,15 +816,9 @@ pub async fn rule_resources_update_all(
                 ERR_RESOURCE_DOWNLOAD_FAILED,
             ),
         };
-        changed |= result.get("ok").and_then(Value::as_bool) == Some(true);
         results.push(result);
     }
-    if changed {
-        match state.config().current() {
-            Ok(latest) => broadcast_config_changed(&app, &latest),
-            Err(e) => log::warn!("手动批量资源更新已落盘，但读回配置广播失败: {e}"),
-        }
-    }
+    changes.publish(&app);
     Ok(ApiResponse::ok(results))
 }
 
@@ -864,6 +858,7 @@ pub async fn rule_resources_download(
     let refreshed_catalog = read_catalog_cache(&res_dir).map_or_else(Vec::new, |(items, _)| items);
 
     let mut results: Vec<Value> = Vec::with_capacity(items.len());
+    let mut changes = ResourceChanges::default();
     let initial = match state.config().current() {
         Ok(config) => config,
         Err(error) => return Ok(ApiResponse::err(format!("读取资源初始状态失败: {error}"))),
@@ -901,12 +896,12 @@ pub async fn rule_resources_download(
                         staged,
                         &res_dir,
                     ) {
-                        Ok(()) => Decision::Write(Ok(())),
+                        Ok(apply) => Decision::Write(Ok(apply)),
                         Err(error) => Decision::Skip(Err(error)),
                     }
                 }) {
-                    Ok((Ok(()), Some(config))) => {
-                        broadcast_config_changed(&app, &config);
+                    Ok((Ok(apply), Some(config))) => {
+                        changes.record(config, apply);
                         Ok(())
                     }
                     Ok((Err(error), _)) => Err(error),
@@ -917,6 +912,7 @@ pub async fn rule_resources_download(
             .await;
         results.push(outcome.into_value(&plan));
     }
+    changes.publish(&app);
     Ok(ApiResponse::ok(results))
 }
 
@@ -1199,13 +1195,14 @@ pub async fn rule_resources_update_builtin_silent(
     app: &AppHandle,
     state: &AppRuntime,
     tag: String,
+    changes: &mut ResourceChanges,
 ) -> Result<ApiResponse<Value>, ()> {
     update_builtin_with_mode(
         app,
         state,
         tag,
         ProgressMode::Silent,
-        BroadcastMode::Deferred,
+        BroadcastMode::Deferred(changes),
     )
     .await
 }
@@ -1216,7 +1213,7 @@ async fn update_builtin_with_mode(
     state: &AppRuntime,
     tag: String,
     mode: ProgressMode,
-    broadcast: BroadcastMode,
+    broadcast: BroadcastMode<'_>,
 ) -> Result<ApiResponse<Value>, ()> {
     let Some(b) = find_builtin(&tag) else {
         return Ok(ApiResponse::ok(err_result(
@@ -1325,6 +1322,86 @@ fn resource_record<'a>(config: &'a Value, id: &str) -> Option<&'a Value> {
         .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
 }
 
+fn same_resource_bytes(staged: &Path, live: &Path) -> bool {
+    let Ok(info) = std::fs::symlink_metadata(live) else {
+        return false;
+    };
+    let size = info.len();
+    if !info.is_file() || size > RULE_RESOURCE_MAX_BYTES as u64 {
+        return false;
+    }
+    let read = |path: &Path| -> std::io::Result<Vec<u8>> {
+        let info = std::fs::symlink_metadata(path)?;
+        if !info.is_file() || info.len() != size {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let mut bytes = Vec::with_capacity(size as usize);
+        std::fs::File::open(path)?
+            .take(size + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != size {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok(bytes)
+    };
+    matches!((read(staged), read(live)), (Ok(left), Ok(right)) if left == right)
+}
+
+// Match the enabled routing planes. Bundled geo catalog entries can also be
+// pulled in implicitly as a repair when the seeded copy is unavailable.
+fn resource_affects_runtime(config: &Value, downloaded: &RuleResource) -> bool {
+    use polaris_config_engine::user_config::rule::{Rule, RuleType};
+    use polaris_config_engine::user_config::{rule_conditions, ProxyMode};
+
+    let Ok(config) = serde_json::from_value::<UserConfig>(config.clone()) else {
+        return true;
+    };
+    let smart = config.proxy_mode == ProxyMode::Smart;
+    let legacy_resolution = config.config_schema_version.unwrap_or(0) < 4;
+    let traffic = config.effective_traffic_rules().iter().filter(|rule| {
+        smart && (rule.route_action().is_some() || rule.bypass_fakeip == Some(true))
+            || (legacy_resolution
+                && rule
+                    .effects
+                    .as_ref()
+                    .and_then(|effects| effects.route.as_ref())
+                    .is_some_and(|route| route.enabled && route.destination_resolution.is_some()))
+    });
+    let dns = config
+        .effective_dns_rules()
+        .iter()
+        .filter(|rule| rule.dns_effect().is_some());
+    let rules: Vec<Rule> = traffic
+        .chain(dns)
+        .filter(|rule| rule.enabled)
+        .cloned()
+        .collect();
+    let refs = RefScanInput {
+        custom_rules: &rules,
+        app_rules: if smart && config.app_routing_enabled != Some(false) {
+            &config.app_rules
+        } else {
+            &[]
+        },
+        custom_app_presets: &config.custom_app_presets,
+    };
+    let affects = |id: &str| {
+        (config.proxy_mode != ProxyMode::Direct && is_bundled_geo_tag(id))
+            || !enumerate_resource_refs(id, &refs).is_empty()
+            // The DNS compiler trims operands before resolving an explicit res: reference.
+            || rules.iter().any(|rule| {
+                rule_conditions(rule).into_iter().any(|condition| {
+                    condition.type_field == RuleType::RuleSet
+                        && condition.values.iter().any(|value| value.trim().strip_prefix("res:") == Some(id))
+                })
+            })
+    };
+    affects(&downloaded.id)
+        || config.rule_resources.iter().any(|resource| {
+            sanitize_file_stem(&resource.file_name) == downloaded.file_name && affects(&resource.id)
+        })
+}
+
 /// Existing and initially absent identities are checked before publishing staged bytes.
 /// Caller holds ConfigRuntime's writer throughout this check and publication.
 fn commit_download_resource(
@@ -1333,7 +1410,7 @@ fn commit_download_resource(
     downloaded: &RuleResource,
     staged: &Path,
     res_dir: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if resource_record(config, &downloaded.id) != expected {
         return Err("资源在下载期间已变化，旧下载已丢弃，请重试".into());
     }
@@ -1345,10 +1422,30 @@ fn commit_download_resource(
     {
         return Err("规则资源列表无效".into());
     }
-    std::fs::rename(staged, res_dir.join(&downloaded.file_name))
-        .map_err(|error| format!("替换资源文件失败: {error}"))?;
+    let old =
+        expected.and_then(|record| serde_json::from_value::<RuleResource>(record.clone()).ok());
+    let apply = publish_download_file(config, old.as_ref(), downloaded, staged, res_dir)?;
     upsert_rule_resources(config, std::slice::from_ref(downloaded));
-    Ok(())
+    Ok(apply)
+}
+
+fn publish_download_file(
+    config: &Value,
+    expected: Option<&RuleResource>,
+    downloaded: &RuleResource,
+    staged: &Path,
+    res_dir: &Path,
+) -> Result<bool, String> {
+    let live = res_dir.join(&downloaded.file_name);
+    let same_bytes = same_resource_bytes(staged, &live);
+    let same_identity = expected.is_some_and(|old| {
+        old.file_name == downloaded.file_name && old.format == downloaded.format
+    });
+    let apply = !(same_bytes && same_identity) && resource_affects_runtime(config, downloaded);
+    if !same_bytes {
+        std::fs::rename(staged, live).map_err(|error| format!("替换资源文件失败: {error}"))?;
+    }
+    Ok(apply)
 }
 
 /// Called only inside ConfigManager::update. An absent or changed record is never upserted,
@@ -1360,16 +1457,16 @@ fn commit_registered_resource(
     downloaded: &RuleResource,
     staged: &Path,
     res_dir: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let resources = config
-        .get_mut("ruleResources")
-        .and_then(Value::as_array_mut)
+        .get("ruleResources")
+        .and_then(Value::as_array)
         .ok_or_else(|| "资源已删除，旧下载已丢弃".to_owned())?;
-    let current = resources
-        .iter_mut()
-        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(expected.id.as_str()))
+    let index = resources
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(expected.id.as_str()))
         .ok_or_else(|| "资源已删除，旧下载已丢弃".to_owned())?;
-    if serde_json::from_value::<RuleResource>(current.clone())
+    if serde_json::from_value::<RuleResource>(resources[index].clone())
         .ok()
         .as_ref()
         != Some(expected)
@@ -1377,10 +1474,9 @@ fn commit_registered_resource(
         return Err("资源在下载期间已变化，旧下载已丢弃，请重试".to_owned());
     }
     let replacement = serde_json::to_value(downloaded).map_err(|error| error.to_string())?;
-    std::fs::rename(staged, res_dir.join(&downloaded.file_name))
-        .map_err(|error| format!("替换资源文件失败: {error}"))?;
-    *current = replacement;
-    Ok(())
+    let apply = publish_download_file(config, Some(expected), downloaded, staged, res_dir)?;
+    config["ruleResources"][index] = replacement;
+    Ok(apply)
 }
 
 fn persist_registered_resource(
@@ -1389,19 +1485,17 @@ fn persist_registered_resource(
     expected: &RuleResource,
     downloaded: &RuleResource,
     staged: &Path,
-    broadcast: BroadcastMode,
+    broadcast: BroadcastMode<'_>,
 ) -> Result<(), String> {
     let res_dir = state.config().dir().join("rule-resource");
     match state.config().update(|config| {
         match commit_registered_resource(config, expected, downloaded, staged, &res_dir) {
-            Ok(()) => Decision::Write(Ok(())),
+            Ok(apply) => Decision::Write(Ok(apply)),
             Err(error) => Decision::Skip(Err(error)),
         }
     }) {
-        Ok((Ok(()), Some(config))) => {
-            if broadcast == BroadcastMode::Immediate {
-                broadcast_config_changed(app, &config);
-            }
+        Ok((Ok(apply), Some(config))) => {
+            broadcast.record(app, config, apply);
             Ok(())
         }
         Ok((Err(error), None)) => Err(error),
@@ -1580,11 +1674,15 @@ fn publish_builtin_file(
     operation: &BuiltinUpdateOperation,
     staged: &Path,
     live: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if !operation.is_current() {
         return Err("内置资源更新已被重置取消".to_owned());
     }
-    std::fs::rename(staged, live).map_err(|error| format!("替换生效副本失败: {error}"))
+    if same_resource_bytes(staged, live) {
+        return Ok(false);
+    }
+    std::fs::rename(staged, live).map_err(|error| format!("替换生效副本失败: {error}"))?;
+    Ok(true)
 }
 
 /// 记「该内置 tag 已网络更新过」：`config.builtinGeoMeta[tag].updatedAt = <ISO>`。
@@ -1598,7 +1696,7 @@ fn persist_builtin_geo_updated(
     state: &AppRuntime,
     tag: &str,
     updated_at: &str,
-    broadcast: BroadcastMode,
+    broadcast: BroadcastMode<'_>,
     paths: (&Path, &Path),
     operation: &BuiltinUpdateOperation,
 ) -> Result<(), String> {
@@ -1609,9 +1707,10 @@ fn persist_builtin_geo_updated(
         };
         // The writer also fences deferred cleanup. No live path is touched until
         // admission, and no reset/cleanup can interleave publication and metadata.
-        if let Err(error) = publish_builtin_file(operation, staged, live) {
-            return Decision::Skip(Err(error));
-        }
+        let apply = match publish_builtin_file(operation, staged, live) {
+            Ok(apply) => apply,
+            Err(error) => return Decision::Skip(Err(error)),
+        };
         let meta = obj
             .entry("builtinGeoMeta")
             .or_insert_with(|| json!({}))
@@ -1625,13 +1724,10 @@ fn persist_builtin_geo_updated(
                 json!({ tag: { "updatedAt": updated_at } }),
             );
         }
-        Decision::Write(Ok(()))
+        Decision::Write(Ok(apply))
     }) {
-        // Deferred：批次拥有者收尾统一广播（见 [`BroadcastMode`]）。落盘已完成，跳过的只是通知。
-        Ok((Ok(()), Some(cfg))) => {
-            if broadcast == BroadcastMode::Immediate {
-                broadcast_config_changed(app, &cfg);
-            }
+        Ok((Ok(apply), Some(cfg))) => {
+            broadcast.record(app, cfg, apply);
             Ok(())
         }
         Ok((Err(error), None)) => Err(error),
@@ -2226,26 +2322,46 @@ pub enum ProgressMode {
     Silent,
 }
 
-/// 配置广播时机。**与 [`ProgressMode`] 正交**：那个管「UI 要不要看到进度条」，本枚举管
-/// 「这次落盘要不要立刻进核」——`broadcast_config_changed` 不只是 emit 给渲染端，它同时
-/// `spawn(switch_mode)` 把变更送进运行核（见该函数文档）。
-///
-/// # 为什么必须可延后（真机实证 2026-08-02）
-///
-/// 后台保鲜一轮会更新已登记资源和内置 geo；逐条广播曾让一轮启动补更
-/// 打出 **33 次 `switch_mode`**（真机日志 11 秒内 35 条 `switchMode：核未运行 → 仅更新配置`）。
-/// 核没跑时只是刷屏；**核在跑时每条都进热切换/去抖重启判定** —— 每次启动补更与每 30 分钟巡检
-/// 都在反复触发运行中的核。而这一轮的语义本就是「一批」：批内每条的中间态没有任何消费者
-/// 需要看见。
-///
-/// 落盘仍**逐条**（每条各自 `save_full`）：磁盘真值随下随记，批次中途崩溃只丢已下载条目的
-/// 更新标记，下一轮自愈；把落盘也攒到最后反而放大了丢失窗口。延后的只是广播。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BroadcastMode {
-    /// 单条更新（用户手点）→ 落盘后立即广播，变更即刻进核。
+/// Batch publication describes only resources that actually committed.
+#[derive(Default, PartialEq, Eq, Debug)]
+pub(crate) enum ResourceChanges {
+    #[default]
+    None,
+    Refresh,
+    Apply(Value),
+}
+
+impl ResourceChanges {
+    fn record(&mut self, saved: Value, apply: bool) {
+        *self = if apply || matches!(self, Self::Apply(_)) {
+            Self::Apply(saved)
+        } else {
+            Self::Refresh
+        };
+    }
+
+    pub(crate) fn publish(self, app: &AppHandle) {
+        match self {
+            Self::None => {}
+            Self::Refresh => emit_config_changed_signal(app),
+            Self::Apply(saved) => broadcast_config_changed(app, &saved),
+        }
+    }
+}
+
+enum BroadcastMode<'a> {
     Immediate,
-    /// 批量更新（后台调度一轮）→ 只落盘不广播，由**批次拥有者**结束时统一广播一次。
-    Deferred,
+    Deferred(&'a mut ResourceChanges),
+}
+
+impl BroadcastMode<'_> {
+    fn record(self, app: &AppHandle, config: Value, apply: bool) {
+        match self {
+            Self::Immediate if apply => broadcast_config_changed(app, &config),
+            Self::Immediate => emit_config_changed_signal(app),
+            Self::Deferred(changes) => changes.record(config, apply),
+        }
+    }
 }
 
 /// 进度落点（注入式：生产走 `AppHandle` 广播，单测走记录器 → 「静默腿真的一帧不发」可被断言）。

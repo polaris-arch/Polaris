@@ -16,7 +16,7 @@ pub use network_profiles::{network_profile_builtin_dhcp_status, network_profile_
 pub(crate) use resources::{
     remove_builtin_rule_resource_files, remove_rule_resource_file,
     rule_resource_file_is_referenced, rule_resources_redownload_silent,
-    rule_resources_update_builtin_silent,
+    rule_resources_update_builtin_silent, ResourceChanges,
 };
 pub use resources::{
     rule_resources_cancel, rule_resources_delete, rule_resources_download,
