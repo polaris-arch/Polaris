@@ -1216,7 +1216,7 @@ fn schedule_unreachable_ipinfo_recheck(
 /// [`ProxyErrorEmitter::schedule_exit_ip_refresh`](crate::runtime::proxy::ProxyErrorEmitter::schedule_exit_ip_refresh)）。
 ///
 /// `delay_ms > 0` ⇒ 同步落地并广播 pending（UI 立即置空成 `—`），保留原探测时点。
-/// 稳定门退场后可提前请求已认证内核的精确代理出口。
+/// 移动端可在稳定门退场后提前请求已认证内核的精确代理出口。
 /// `delay_ms == 0` ⇒ 同步发布代理出口已消失的终态，防旧出口跨停核/重启窗口回填。
 ///
 /// # 🟠 按开探顺序发号：[`begin_scheduled_probe`] 在各条腿发请求时取票
@@ -1425,11 +1425,17 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
     let app = app.clone();
     tauri::async_runtime::spawn(run_automatic_ipinfo_probe(ticket, async move {
         let post_connect = delay_ms == IPINFO_SETTLE_DELAY_MS;
-        let (already_published, first_attempt) = if post_connect && !recheck_unlock_on_recovery {
-            try_first_proxy_probe(&app, ticket, fallback_at).await
-        } else {
-            (false, FirstProxyAttempt::NotAttempted)
-        };
+        // A lost terminal receipt cannot authorize a second proxy request.
+        // Keep the desktop HTTP schedule until Core can confirm drain after a lost receipt.
+        let (already_published, first_attempt) =
+            if cfg!(any(target_os = "android", target_os = "ios"))
+                && post_connect
+                && !recheck_unlock_on_recovery
+            {
+                try_first_proxy_probe(&app, ticket, fallback_at).await
+            } else {
+                (false, FirstProxyAttempt::NotAttempted)
+            };
         let mut rejected_partial = match first_attempt {
             FirstProxyAttempt::Completed(partial) if !already_published => partial,
             _ => None,

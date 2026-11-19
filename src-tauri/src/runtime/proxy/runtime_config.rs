@@ -668,6 +668,9 @@ impl ProxyRuntime {
         route: &RuntimeExitIpRoute,
         claim: impl FnOnce() -> T,
     ) -> Option<T> {
+        // A switch can own the new intent while the old running route is
+        // still published. Match the switch lock order without waiting.
+        let _switch = self.switch_serial.try_lock().ok()?;
         self.selector_reconcile.try_with_intent_claim(|intent| {
             let _publication = self.gate.try_lock_generation_publication()?;
             if intent != route.intent

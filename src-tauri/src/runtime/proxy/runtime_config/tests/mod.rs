@@ -78,20 +78,29 @@ fn exit_ip_probe_requires_unique_manual_leaf_and_the_exact_core_receipt() {
 }
 
 #[cfg(not(target_os = "android"))]
-#[test]
-fn exit_ip_http_fallback_uses_the_dedicated_port_and_rejects_stale_graphs() {
+#[tokio::test]
+async fn exit_ip_routes_reject_active_switch_and_stale_graphs() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
     let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     let generation = pending.generation;
     runtime.status.write().unwrap().mixed_port = 7890;
-    runtime.capture_runtime_config_baseline(
-        generation,
-        pending.deps.clone(),
-        pending.generated.clone(),
-        pending.typed.clone(),
-        pending.pairing.clone(),
-    );
+    let receipt = committed_ts_receipt(&pending);
+    let active = receipt.active.clone();
+    let (_fixture, server) = native_retirement_rpc_peer(&runtime, &pending, receipt).await;
+    runtime
+        .runtime_config_baseline
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .observed_active = active;
+    *runtime.current_config.write().unwrap() = Some(json!({
+        "proxyMode": "smart",
+        "selectedServerId": "p",
+        "servers": [{"id":"p"}],
+    }));
     *runtime.switch_snapshot.write().unwrap() = Some(super::super::hot_switch::SwitchSnapshot {
+        id_to_tag: BTreeMap::from([("p".into(), "leaf".into())]),
         probe_proxy_port: Some(31002),
         ..Default::default()
     });
@@ -100,9 +109,17 @@ fn exit_ip_http_fallback_uses_the_dedicated_port_and_rejects_stale_graphs() {
     assert_eq!(route.proxy.inbound, super::super::LocalInbound::ProbeProxy);
     assert!(runtime.exit_ip_http_route(generation + 1).is_none());
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), Some(()));
+    let pinned = runtime.pinned_exit_ip_route().unwrap();
+    let switch = runtime.switch_serial.try_lock().unwrap();
+    assert!(runtime.pinned_exit_ip_route().is_none());
+    assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), None);
+    assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    drop(switch);
+    assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), Some(()));
 
     runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), None);
     assert!(runtime.exit_ip_http_route(generation).is_none());
 
     runtime
@@ -115,10 +132,12 @@ fn exit_ip_http_fallback_uses_the_dedicated_port_and_rejects_stale_graphs() {
     pending.published = true;
     runtime.runtime_config_apply.lock().unwrap().pending = Some(pending);
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    assert_eq!(runtime.with_pinned_exit_ip_route(&pinned, || ()), None);
     let route = runtime.exit_ip_http_route(generation).unwrap();
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), Some(()));
     runtime.set_login_fallback(true, Some("pending-login".into()));
     assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    server.abort();
 }
 
 pub(super) fn paired_capabilities() -> daemon::RuntimeCapabilities {
