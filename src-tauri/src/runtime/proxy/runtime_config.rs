@@ -59,6 +59,12 @@ pub(crate) struct RuntimeExitIpRoute {
     baseline_control_revision: u64,
 }
 
+#[derive(Debug)]
+pub(crate) enum ExitIpCapabilitiesError {
+    Unavailable,
+    Mismatch,
+}
+
 fn pinned_exit_ip_leaf(
     config: &Value,
     snapshot: &super::hot_switch::SwitchSnapshot,
@@ -620,18 +626,22 @@ impl ProxyRuntime {
     pub(crate) async fn prepare_pinned_exit_ip(
         &self,
         route: &RuntimeExitIpRoute,
-    ) -> Option<daemon::ProbeExitIpRequest> {
-        let caps = paired_runtime_capabilities(&route.control, &route.pairing)
+    ) -> Result<daemon::ProbeExitIpRequest, ExitIpCapabilitiesError> {
+        let caps = route
+            .control
+            .get_runtime_capabilities()
             .await
-            .ok()?;
-        if !exit_ip_graph_matches(
-            &caps,
-            &route.baseline_active,
-            route.baseline_control_revision,
-        ) {
-            return None;
+            .map_err(|_| ExitIpCapabilitiesError::Unavailable)?;
+        if !runtime_pairing_matches(&route.pairing, &caps)
+            || !exit_ip_graph_matches(
+                &caps,
+                &route.baseline_active,
+                route.baseline_control_revision,
+            )
+        {
+            return Err(ExitIpCapabilitiesError::Mismatch);
         }
-        self.with_pinned_exit_ip_route(route, || daemon::ProbeExitIpRequest {
+        Ok(daemon::ProbeExitIpRequest {
             version: EXIT_IP_PROBE_VERSION,
             expected: Some(route.baseline_active.clone()),
             expected_control_revision: caps.control_revision,

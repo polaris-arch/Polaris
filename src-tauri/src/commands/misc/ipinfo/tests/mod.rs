@@ -111,6 +111,43 @@ async fn failed_pinned_proxy_never_falls_back_to_the_direct_result() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn first_proxy_claim_absorbs_local_contention_within_its_old_cutoff() {
+    let started = Instant::now();
+    let mut attempts = Vec::new();
+    let receipt = retry_first_proxy_local_claim(started + Duration::from_secs(4), || {
+        attempts.push(started.elapsed());
+        (attempts.len() == 3).then_some("fixed receipt")
+    })
+    .await;
+    assert_eq!(receipt, Some("fixed receipt"));
+    assert_eq!(
+        attempts,
+        [
+            Duration::ZERO,
+            FIRST_PROXY_LOCAL_CLAIM_INTERVAL,
+            FIRST_PROXY_LOCAL_CLAIM_INTERVAL * 2,
+        ]
+    );
+
+    let started = Instant::now();
+    let cutoff = started + FIRST_PROXY_LOCAL_CLAIM_INTERVAL;
+    let mut attempts = 0;
+    let receipt = retry_first_proxy_local_claim(cutoff, || {
+        attempts += 1;
+        (attempts == 2).then_some("late receipt")
+    })
+    .await;
+    assert_eq!(receipt, None);
+    assert_eq!(attempts, 1);
+    tokio::time::sleep_until(cutoff).await;
+    assert_eq!(
+        retry_first_proxy_local_claim(cutoff, || Some(())).await,
+        None
+    );
+    assert_eq!(Instant::now(), cutoff);
+}
+
+#[tokio::test(start_paused = true)]
 async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
     for (
         prior,

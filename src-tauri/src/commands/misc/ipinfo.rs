@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::response::ApiResponse;
 use crate::runtime::http::{app_user_agent, HttpRuntime, SystemDnsLookup};
@@ -61,6 +62,8 @@ const IPINFO_TTL_MS: u128 = 15_000;
 /// selector 的 PUT 才刚落，出口隧道未必已能跑流量 —— 立刻探会打到旧出口或直接失败。停核腿无此问题
 /// （出口已确定性消失），故用 0。
 pub const IPINFO_SETTLE_DELAY_MS: u64 = 4_000;
+const FIRST_PROXY_LOCAL_CLAIM_ATTEMPTS: usize = 3;
+const FIRST_PROXY_LOCAL_CLAIM_INTERVAL: Duration = Duration::from_millis(75);
 
 /// 出口明确不可达后的按需自愈退避。只在失败终态存续期间运行；任意更新事件都会通过排程线取消旧腿。
 const IPINFO_UNREACHABLE_RETRY_INITIAL_MS: u64 = 15_000;
@@ -1256,10 +1259,33 @@ pub fn schedule_network_recovery_refresh(app: &AppHandle) {
     schedule_ipinfo_refresh_inner(app, IPINFO_SETTLE_DELAY_MS, true);
 }
 
+/// Retry only the nonblocking local checks, within the original fallback window.
+async fn retry_first_proxy_local_claim<T>(
+    fallback_at: Instant,
+    mut claim: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    for attempt in 0..FIRST_PROXY_LOCAL_CLAIM_ATTEMPTS {
+        if attempt != 0 {
+            let retry_at = Instant::now() + FIRST_PROXY_LOCAL_CLAIM_INTERVAL;
+            if retry_at >= fallback_at {
+                return None;
+            }
+            tokio::time::sleep_until(retry_at).await;
+        }
+        if Instant::now() >= fallback_at {
+            return None;
+        }
+        if let Some(claimed) = claim() {
+            return Some(claimed);
+        }
+    }
+    None
+}
+
 async fn try_first_proxy_probe(
     app: &AppHandle,
     ticket: u64,
-    fallback_at: tokio::time::Instant,
+    fallback_at: Instant,
 ) -> (bool, FirstProxyAttempt) {
     let Some(runtime) = app
         .try_state::<AppRuntime>()
@@ -1267,18 +1293,55 @@ async fn try_first_proxy_probe(
     else {
         return (false, FirstProxyAttempt::NotAttempted);
     };
-    let prepared = tokio::time::timeout_at(fallback_at, async {
-        runtime.wait_for_network_settled().await;
-        let route = runtime.pinned_exit_ip_route()?;
-        let request = runtime.prepare_pinned_exit_ip(&route).await?;
-        Some((route, request))
-    })
-    .await;
-    let Ok(Some((route, request))) = prepared else {
+    #[cfg(debug_assertions)]
+    let settle_started = Instant::now();
+    if tokio::time::timeout_at(fallback_at, runtime.wait_for_network_settled())
+        .await
+        .is_err()
+    {
+        ipinfo_stage!("stage=first_proxy_fallback ticket={ticket} reason=settle_deadline");
+        return (false, FirstProxyAttempt::NotAttempted);
+    }
+    ipinfo_stage!(
+        "stage=first_proxy_settled ticket={ticket} elapsed_ms={}",
+        settle_started.elapsed().as_millis()
+    );
+    let Some(route) =
+        retry_first_proxy_local_claim(fallback_at, || runtime.pinned_exit_ip_route()).await
+    else {
+        ipinfo_stage!("stage=first_proxy_fallback ticket={ticket} reason=initial_local_claim");
         return (false, FirstProxyAttempt::NotAttempted);
     };
-    let budget = fallback_at.saturating_duration_since(tokio::time::Instant::now());
+    let request =
+        match tokio::time::timeout_at(fallback_at, runtime.prepare_pinned_exit_ip(&route)).await {
+            Ok(Ok(request)) => request,
+            Ok(Err(_reason)) => {
+                ipinfo_stage!(
+                    "stage=first_proxy_fallback ticket={ticket} reason=capabilities_{_reason:?}"
+                );
+                return (false, FirstProxyAttempt::NotAttempted);
+            }
+            Err(_) => {
+                ipinfo_stage!(
+                    "stage=first_proxy_fallback ticket={ticket} reason=capabilities_deadline"
+                );
+                return (false, FirstProxyAttempt::NotAttempted);
+            }
+        };
+    // Keep the exact captured graph, control receipt, selector and settle epoch.
+    // A stale receipt cannot qualify through a retry or a second capability read.
+    if retry_first_proxy_local_claim(fallback_at, || {
+        runtime.with_pinned_exit_ip_route(&route, || ())
+    })
+    .await
+    .is_none()
+    {
+        ipinfo_stage!("stage=first_proxy_fallback ticket={ticket} reason=confirmed_local_claim");
+        return (false, FirstProxyAttempt::NotAttempted);
+    }
+    let budget = fallback_at.saturating_duration_since(Instant::now());
     if budget.is_zero() {
+        ipinfo_stage!("stage=first_proxy_fallback ticket={ticket} reason=dispatch_deadline");
         return (false, FirstProxyAttempt::NotAttempted);
     }
     let Some((epoch, seq)) = begin_scheduled_probe(ticket, true) else {
@@ -1301,7 +1364,12 @@ async fn try_first_proxy_probe(
     );
     let trace = match result {
         Ok(trace) => trace,
-        Err(ExitIpProbeError::NotAttempted) => return (false, FirstProxyAttempt::NotAttempted),
+        Err(ExitIpProbeError::NotAttempted) => {
+            ipinfo_stage!(
+                "stage=first_proxy_fallback ticket={ticket} reason=dispatch_not_admitted"
+            );
+            return (false, FirstProxyAttempt::NotAttempted);
+        }
         Err(ExitIpProbeError::CompletedFailure) => {
             return (false, FirstProxyAttempt::Completed(None))
         }
@@ -1344,7 +1412,7 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
         None
     };
     let (ticket, frame) = declare_scheduled_refresh(delay_ms);
-    let fallback_at = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
+    let fallback_at = Instant::now() + Duration::from_millis(delay_ms);
     ipinfo_stage!(
         "stage=schedule ticket={ticket} revision={} delay_ms={delay_ms} recovery={recheck_unlock_on_recovery}",
         frame["revision"].as_u64().unwrap_or_default()
