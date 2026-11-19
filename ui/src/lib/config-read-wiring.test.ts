@@ -351,6 +351,18 @@ const SITES: readonly Site[] = [
 
   // ── 与后端对账 / 重放基准 ──
   {
+    file: 'components/screens/home/HomeScreen.tsx',
+    shape: '{config:savedConfig,updateProxyMode}=useAppStore.getState()',
+    route: 'disk',
+    why: '分流模式切换的去重基准是点击时已保存的模式，暂存预览与旧的 React 快照都不能证明写入已完成',
+  },
+  {
+    file: 'mobile/home/MobileHomeScreen.tsx',
+    shape: '{config:savedConfig,updateProxyMode}=useAppStore.getState()',
+    route: 'disk',
+    why: '分流模式切换优先比较尚在处理的最新意图，没有待处理意图时才与点击时已保存的模式比较',
+  },
+  {
     file: 'mobile/home/MobileHomeScreen.tsx',
     shape: 'useAppStore.getState().config',
     route: 'disk',
