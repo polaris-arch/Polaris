@@ -1859,6 +1859,7 @@ pub(crate) enum SpeedtestStartError {
 pub(crate) enum LoginStartError {
     Failed(String),
     CapacityClosed(CapacityClosed),
+    CleanupUnknown { capacity: Option<CapacityClosed> },
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -2053,11 +2054,19 @@ pub(crate) async fn start_transient_login(
             BridgeCallError::TaskFailed(_) => "Android 独立登录启动桥投递失败".to_owned(),
         })
     });
-    if result.is_err() {
-        // Also closes a start callback that arrives after the bridge budget expired.
-        let _ = close_transient_login(instance_id).await;
+    if let Err(error) = result {
+        // Close also fences a Start invocation that has not reached Kotlin yet.
+        return match close_transient_login(instance_id).await {
+            Ok(()) => Err(error),
+            Err(_) => Err(LoginStartError::CleanupUnknown {
+                capacity: match error {
+                    LoginStartError::CapacityClosed(capacity) => Some(capacity),
+                    _ => None,
+                },
+            }),
+        };
     }
-    result.map(|_| ())
+    Ok(())
 }
 
 #[cfg(target_os = "android")]

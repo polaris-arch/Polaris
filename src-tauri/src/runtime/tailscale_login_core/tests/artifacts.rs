@@ -322,6 +322,174 @@ async fn cache_cleanup_failure_retains_config_and_claim_after_child_has_closed()
     std::fs::remove_dir_all(user_data).unwrap();
 }
 
+struct FailedNativeStart {
+    close_attempts: AtomicUsize,
+    close_allowed: AtomicBool,
+    start_gate: Option<(tokio::sync::Notify, tokio::sync::Notify)>,
+}
+
+#[async_trait]
+impl LoginCoreSpawner for Arc<FailedNativeStart> {
+    async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        prepared_artifacts(&request.config);
+        if let Some((entered, release)) = &self.start_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        Ok(Box::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl LoginCoreChild for Arc<FailedNativeStart> {
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    fn take_start_failure(&mut self) -> Option<StartLoginOutcome> {
+        Some(StartLoginOutcome::Failed("processStartFailed".into()))
+    }
+
+    async fn wait(&mut self) {
+        panic!("a failed start has no status observer");
+    }
+
+    async fn terminate(&mut self) {
+        panic!("only a confirmed native close retires a failed start");
+    }
+
+    async fn close_confirmed(&mut self) -> Result<(), String> {
+        self.close_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.close_allowed.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("fixture native close unconfirmed".into())
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_native_start_retains_attempt_until_the_exact_close_is_confirmed() {
+    let user_data = temp_ud();
+    let native = Arc::new(FailedNativeStart {
+        close_attempts: AtomicUsize::new(0),
+        close_allowed: AtomicBool::new(false),
+        start_gate: None,
+    });
+    let subscriber = fake_subscriber(false);
+    let registry = LoginCoreRegistry::with_deps(
+        Arc::new(native.clone()),
+        Arc::new(FakeChecker { ok: true }),
+        subscriber.clone(),
+        Arc::new(|| Ok(PathBuf::from("/fake/sing-box"))),
+        Duration::from_secs(60),
+    );
+    registry.prepare("ts1", "failed-start").await.unwrap();
+    let outcome = registry
+        .start_attempt(
+            &ts_server("ts1", "Tailscale"),
+            &user_data,
+            request("failed-start"),
+            &offline,
+            Arc::new(FakeEmitter::default()),
+        )
+        .await;
+    assert!(matches!(outcome, StartLoginOutcome::Failed(reason) if reason == "processStartFailed"));
+    assert!(subscriber.seen.lock().unwrap().is_empty());
+    let receipt = registry.login_progress("ts1", "failed-start").unwrap();
+    assert_eq!(receipt.phase, "failed");
+    assert_eq!(receipt.reason.as_deref(), Some("processStartFailed"));
+
+    let config = sole_login_config(&user_data);
+    let cache = login_cache_path(&config);
+    let original = registry.prepared_attempt_for_test("ts1", "failed-start");
+    assert!(original.process_owned.load(Ordering::SeqCst));
+    assert!(config.is_file() && cache.is_file());
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(native.close_attempts.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(native.close_attempts.load(Ordering::SeqCst), 1);
+
+    assert!(registry
+        .cancel_attempt("ts1", "failed-start")
+        .await
+        .is_err());
+    assert_eq!(native.close_attempts.load(Ordering::SeqCst), 2);
+    assert!(registry.shared.contains("ts1"));
+    assert!(config.is_file() && cache.is_file());
+    assert!(original.process_owned.load(Ordering::SeqCst));
+
+    native.close_allowed.store(true, Ordering::SeqCst);
+    registry.shutdown_for_exit().await.unwrap();
+    assert!(!registry.shared.contains("ts1"));
+    assert!(!config.exists() && !cache.exists());
+    assert!(!original.process_owned.load(Ordering::SeqCst));
+    std::fs::remove_dir_all(user_data).unwrap();
+}
+
+#[tokio::test]
+async fn cancel_during_failed_native_start_joins_publication_and_checks_close() {
+    let user_data = temp_ud();
+    let native = Arc::new(FailedNativeStart {
+        close_attempts: AtomicUsize::new(0),
+        close_allowed: AtomicBool::new(false),
+        start_gate: Some(Default::default()),
+    });
+    let registry = Arc::new(LoginCoreRegistry::with_deps(
+        Arc::new(native.clone()),
+        Arc::new(FakeChecker { ok: true }),
+        fake_subscriber(false),
+        Arc::new(|| Ok(PathBuf::from("/fake/sing-box"))),
+        Duration::from_secs(60),
+    ));
+    registry.prepare("ts1", "late-start").await.unwrap();
+    let launch = {
+        let registry = registry.clone();
+        let user_data = user_data.clone();
+        tokio::spawn(async move {
+            registry
+                .start_attempt(
+                    &ts_server("ts1", "Tailscale"),
+                    &user_data,
+                    request("late-start"),
+                    &offline,
+                    Arc::new(FakeEmitter::default()),
+                )
+                .await
+        })
+    };
+    let (entered, release) = native.start_gate.as_ref().unwrap();
+    entered.notified().await;
+    let config = sole_login_config(&user_data);
+    let cache = login_cache_path(&config);
+    let original = registry.prepared_attempt_for_test("ts1", "late-start");
+    let cancel = {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.cancel_attempt("ts1", "late-start").await })
+    };
+    original.cancellation().await;
+    assert!(!cancel.is_finished());
+    release.notify_one();
+
+    let cancelled = tokio::time::timeout(Duration::from_secs(2), cancel)
+        .await
+        .expect("cancel must return the close failure")
+        .unwrap();
+    assert_eq!(cancelled.unwrap_err(), "fixture native close unconfirmed");
+    assert!(matches!(
+        launch.await.unwrap(),
+        StartLoginOutcome::Failed(reason) if reason == "processStartFailed"
+    ));
+    assert!(registry.shared.contains("ts1"));
+    assert!(config.is_file() && cache.is_file());
+
+    native.close_allowed.store(true, Ordering::SeqCst);
+    registry.cancel_attempt("ts1", "late-start").await.unwrap();
+    assert!(!config.exists() && !cache.exists());
+    std::fs::remove_dir_all(user_data).unwrap();
+}
+
 #[test]
 fn stale_pair_cleanup_preserves_live_pair_unpaired_files_and_state() {
     let user_data = temp_ud();

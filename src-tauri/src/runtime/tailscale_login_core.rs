@@ -394,6 +394,11 @@ pub trait LoginCoreChild: Send {
     /// [`LoginCoreRegistry::inflight_login_pids`] 据此喂 `ProxyRuntime::cleanup_stale_cores`
     /// 的排除表 —— 返错 pid 会让清扫放过一个真孤儿，返 `None` 只会让本核在飞时失去保护。
     fn pid(&self) -> Option<u32>;
+    /// A failed native start may still own a service that needs a confirmed close.
+    #[cfg(any(target_os = "android", test))]
+    fn take_start_failure(&mut self) -> Option<StartLoginOutcome> {
+        None
+    }
     /// An opaque fact from this exact native-bound temporary Child, never ordinary Close Ok.
     fn native_exit(&self) -> Option<NativeTransientExit> {
         None
@@ -1282,12 +1287,15 @@ struct AndroidLoginCoreChild {
     instance_id: String,
     config_digest: String,
     closed: bool,
+    start_failure: Option<StartLoginOutcome>,
 }
 
 #[cfg(target_os = "android")]
 #[async_trait]
 impl LoginCoreSpawner for AndroidLoginCoreSpawner {
     async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        use crate::runtime::proxy::android_bridge::{start_transient_login, LoginStartError};
+
         let instance_id = req
             .config
             .file_stem()
@@ -1304,19 +1312,25 @@ impl LoginCoreSpawner for AndroidLoginCoreSpawner {
             instance_id,
             config_digest: polaris_updater::sha256_hex(config.as_bytes()),
             closed: false,
+            start_failure: None,
         };
-        crate::runtime::proxy::android_bridge::start_transient_login(&child.instance_id, &config)
-            .await
-            .map_err(|error| match error {
-                crate::runtime::proxy::android_bridge::LoginStartError::Failed(message) => {
-                    failure(message)
-                }
-                crate::runtime::proxy::android_bridge::LoginStartError::CapacityClosed(error) => {
-                    error.spawn_error()
-                }
-            })?;
-        // Android's native factory has copied the config into its own service. No snapshot is written.
-        child.closed = false;
+        match start_transient_login(&child.instance_id, &config).await {
+            Ok(()) => {}
+            Err(LoginStartError::CleanupUnknown { capacity }) => {
+                child.start_failure = Some(capacity.map_or_else(
+                    || StartLoginOutcome::Failed("processStartFailed".into()),
+                    StartLoginOutcome::AndroidCapacityClosed,
+                ));
+            }
+            Err(LoginStartError::Failed(message)) => {
+                child.closed = true;
+                return Err(failure(message));
+            }
+            Err(LoginStartError::CapacityClosed(error)) => {
+                child.closed = true;
+                return Err(error.spawn_error());
+            }
+        }
         Ok(Box::new(child))
     }
 }
@@ -1336,6 +1350,9 @@ impl Drop for AndroidLoginCoreChild {
 #[cfg(target_os = "android")]
 #[async_trait]
 impl LoginCoreChild for AndroidLoginCoreChild {
+    fn take_start_failure(&mut self) -> Option<StartLoginOutcome> {
+        self.start_failure.take()
+    }
     fn android_tailscale_instance(&self) -> Option<(&str, &str)> {
         Some((&self.instance_id, &self.config_digest))
     }
@@ -2509,6 +2526,16 @@ impl LoginCoreRegistry {
         let closed = self
             .cancel_matching_login(server_id, Some(attempt_id))
             .await?;
+        #[cfg(any(target_os = "android", test))]
+        let closed = if !closed && attempt.is_some() {
+            // A cancelled Start may still be joining the native bridge. Acquire the
+            // publication gate before concluding that the original has no close owner.
+            drop(self.state_gate().await);
+            self.cancel_matching_login(server_id, Some(attempt_id))
+                .await?
+        } else {
+            closed
+        };
         #[cfg(target_os = "android")]
         if let Some(original) = &attempt {
             if let Some(action) = original.android_action()? {
@@ -3710,6 +3737,11 @@ impl LoginCoreRegistry {
             .await
         };
         if !attempt.is_finished() {
+            let original_child_retained = || {
+                self.shared.guard().get(&requested.id).is_some_and(|entry| {
+                    entry.attempt_id == request.attempt_id && entry._child.is_some()
+                })
+            };
             match &outcome {
                 StartLoginOutcome::Started => {}
                 StartLoginOutcome::InMainCore => {
@@ -3738,7 +3770,9 @@ impl LoginCoreRegistry {
                         Some(crate::runtime::proxy::code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED),
                         None,
                     );
-                    attempt.finish();
+                    if !original_child_retained() {
+                        attempt.finish();
+                    }
                 }
                 StartLoginOutcome::PrerequisiteFailed { code, .. } => {
                     emitter.progress(
@@ -3758,7 +3792,9 @@ impl LoginCoreRegistry {
                         Some(reason),
                         None,
                     );
-                    attempt.finish();
+                    if !original_child_retained() {
+                        attempt.finish();
+                    }
                 }
             }
         }
@@ -4903,7 +4939,8 @@ impl LoginCoreRegistry {
                 result
             }
         };
-        let child = match spawned {
+        #[allow(unused_mut, reason = "Android may return a cleanup-only handle")]
+        let mut child = match spawned {
             Ok(c) => c,
             Err(error) => {
                 if let Some(native) = native {
@@ -4936,6 +4973,9 @@ impl LoginCoreRegistry {
                 return StartLoginOutcome::Failed("processStartFailed".into());
             }
         };
+
+        #[cfg(any(target_os = "android", test))]
+        let start_failure = child.take_start_failure();
 
         // Register before the STATUS subscription awaits: a concurrent main-core start can
         // see this child and must wait for its confirmed close.
@@ -5025,6 +5065,11 @@ impl LoginCoreRegistry {
         };
         config_guard.disarm();
         attempt.process_owned.store(true, Ordering::SeqCst);
+        #[cfg(any(target_os = "android", test))]
+        if let Some(outcome) = start_failure {
+            tokio::spawn(cleanup_failed_login_start(ctx, child, cancel_rx));
+            return outcome;
+        }
         let (ready_tx, ready_rx) = oneshot::channel();
         tokio::spawn(subscribe_and_supervise(
             ctx,
@@ -5151,6 +5196,49 @@ async fn finish_login_tail(
         remove_login_config_confirmed(&ctx.config_path)?;
         ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn cleanup_failed_login_start(
+    ctx: SuperviseCtx,
+    child: LoginChildCustody,
+    mut cancel_rx: mpsc::UnboundedReceiver<()>,
+) {
+    let SuperviseCtx {
+        shared,
+        attempt,
+        server_id,
+        config_path,
+        epoch,
+        emitter,
+        closed_tx,
+        ..
+    } = ctx;
+    drop(emitter);
+    let registry = Arc::downgrade(&shared);
+    drop(shared);
+    // Kotlin also retries its original close. Recheck once, then wait for an explicit
+    // cancel, relogin or exit through the same registered close channel.
+    tokio::select! {
+        _ = cancel_rx.recv() => {},
+        () = tokio::time::sleep(Duration::from_secs(5)) => {},
+    }
+    while let Some(shared) = registry.upgrade() {
+        let result = match child.lock().await.close_confirmed().await {
+            Ok(()) => remove_login_config_confirmed(&config_path),
+            Err(error) => Err(error),
+        };
+        let complete = result.is_ok();
+        if complete {
+            shared.remove_if_epoch(&server_id, epoch);
+            attempt.finish();
+        }
+        drop(shared);
+        closed_tx.send_replace(Some(result));
+        if complete || cancel_rx.recv().await.is_none() {
+            return;
+        }
     }
 }
 
