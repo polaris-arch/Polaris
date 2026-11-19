@@ -2,6 +2,7 @@ import { chromium, type Browser } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { DIRECT_SERVER_ID } from '../../domain/direct-selection';
 
 const root = path.resolve(import.meta.dirname, '../../..');
 const entry = `
@@ -24,7 +25,7 @@ const mode = new URLSearchParams(location.search).get('mode');
 const node = { id: 'node-a', name: '测试节点', protocol: 'vless', address: '198.51.100.7', port: 443 };
 const warp = { id: 'warp-1', name: 'WARP', protocol: 'wireguard', address: 'engage.cloudflareclient.com', port: 2408 };
 const tailscale = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: {} };
-const test = window.__nodeToastTest = { failCopy: true, writes: [], opened: 0, deleted: 0 };
+const test = window.__nodeToastTest = { failCopy: true, writes: [], opened: 0, deleted: 0, switched: [], hotOnlyDeletes: 0 };
 test.entries = () => useStagedConfigStore.getState().entries;
 test.forms = () => useMobileFormStore.getState().stack.map(form => ({kind: form.kind, serverId: form.serverId}));
 test.selected = () => useAppStore.getState().selectedServerId;
@@ -39,10 +40,20 @@ api.server.tailscaleStateExists = async ids => {
   return { [ids[0]]: mode === 'ts-account-existing' };
 };
 const server = mode?.startsWith('warp') ? warp : mode?.startsWith('ts-') ? tailscale : node;
-useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
-  selectedServerId: '', invalidNodes: [], proxyStatus: { running: mode?.startsWith('warp') === true || mode?.startsWith('ts-') === true },
-  switchServer: async () => ({ status: mode === 'ts-restarting' ? 'restarting' : 'applied' }) });
+const saved = { servers: [server], subscriptions: [], selectedServerId: ${JSON.stringify(DIRECT_SERVER_ID)} };
+useAppStore.setState({ servers: saved.servers, config: saved,
+  invalidNodes: [], proxyStatus: { running: mode?.startsWith('warp') === true || mode?.startsWith('ts-') === true },
+  switchServer: async id => { test.switched.push(id); return { status: mode === 'ts-restarting' ? 'restarting' : 'applied' }; } });
 useStagedConfigStore.setState({ enabled: mode === 'warp-staged', entries: [] });
+if (mode === 'warp-staged') {
+  useStagedConfigStore.getState().hydrate(saved);
+  api.config.get = async () => saved;
+  api.config.save = async (config, _deferRestart, _baseVersion, _autoApply, hotOnly) => {
+    if (hotOnly !== true || config.servers.some(server => server.id === warp.id)) throw Error('unexpected WARP deletion candidate');
+    test.hotOnlyDeletes++;
+    return { status: 'needsManual' };
+  };
+}
 function WarpDeleteHarness() {
   const deletion = useMobileNodeDeletion({
     t: key => key,
@@ -112,10 +123,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile node copy comp
       await page.waitForFunction(() => (window as any).__nodeToastTest.entries?.().length === 1);
       const result = await page.evaluate(() => {
         const test = (window as any).__nodeToastTest;
-        return { opened: test.opened, deleted: test.deleted, entries: test.entries() };
+        return { opened: test.opened, deleted: test.deleted, entries: test.entries(), hotOnlyDeletes: test.hotOnlyDeletes };
       });
       expect(result.opened).toBe(0);
       expect(result.deleted).toBe(0);
+      expect(result.hotOnlyDeletes).toBe(1);
       expect(result.entries).toMatchObject([{ id: 'server:warp-1', nextValue: null }]);
       expect(await page.locator('.m-toast-ok').count()).toBe(0);
     } finally { await page.close(); }
@@ -171,7 +183,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile node copy comp
       expect(await page.evaluate(() => (window as any).__nodeToastTest.forms())).toEqual([
         { kind: 'ts-login', serverId: 'ts-1' },
       ]);
-      expect(await page.evaluate(() => (window as any).__nodeToastTest.selected())).toBe('');
+      expect(await page.evaluate(() => (window as any).__nodeToastTest.selected())).toBe(DIRECT_SERVER_ID);
+      expect(await page.evaluate(() => (window as any).__nodeToastTest.switched)).toEqual([]);
     } finally { await page.close(); }
   }, 30_000);
 });

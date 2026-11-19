@@ -22,7 +22,7 @@ let disk = { mixedPort: 7890, controlPort: 9090, logLevel: 'info', desktopNotifi
  servers: [], subscriptions: [], selectedServerId: '__direct__', proxyMode: 'smart', proxyModeType: 'manual' };
 let counter=0, app, ids=['a','b'], mounted=true;
 const handlers=new Map(), listeners=[], registrations=[], cleanupWaiters=new Map();
-const f=window.__config={hooks:{}, cleanups:{}, reads:[], writes:[], updates:[], toasts:[], prompts:0, cleanReads:0,
+const f=window.__config={hooks:{}, cleanups:{}, reads:[], writes:[], hotOnlyPorts:[], updates:[], toasts:[], prompts:0, cleanReads:0,
  holdReads:params.has('holdReads'), holdWrites:false, readFail:false, holdReady:params.has('holdReady'),
  state:()=>useAppStore.getState().config, disk:()=>disk, staged:()=>useStagedConfigStore.getState().entries,
  listenerCount:()=>listeners.filter(l=>l.event===C.EVENT_CONFIG_CHANGED).length,
@@ -56,6 +56,12 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:'main'},currentWebvie
    const index=f.reads.push({snapshot,resolve,reject,done:false})-1;
    if(!f.holdReads)queueMicrotask(()=>f.finishRead(index,f.readFail));
   });}
+  if(cmd===C.CONFIG_SAVE){
+   const port=args.config?.mixedPort;
+   if(args.hotOnly!==true||typeof port!=='number'||port===disk.mixedPort)return Promise.reject(Error('unexpected config save'));
+   f.hotOnlyPorts.push(port);
+   return Promise.resolve({success:true,data:{status:'needsManual'}});
+  }
   if(cmd===C.CONFIG_PATCH){return new Promise((resolve,reject)=>{
    const index=f.writes.push({patch:args.patch,resolve,reject,done:false})-1;
    if(!f.holdWrites)queueMicrotask(()=>f.finishWrite(index));
@@ -85,7 +91,7 @@ app=createRoot(document.getElementById('root'));render();
 `;
 let server: ViteDevServer, browser: Browser, origin: string;
 const read = (page: Page) => page.evaluate(() => { const f=(window as any).__config;return {
-  hooks:f.snapshot(), reads:f.reads.length,writes:f.writes.map((j:any)=>j.patch),updates:f.updates,
+  hooks:f.snapshot(), reads:f.reads.length,writes:f.writes.map((j:any)=>j.patch),hotOnlyPorts:f.hotOnlyPorts,updates:f.updates,
   state:f.state(),disk:f.disk(),staged:f.staged(),toasts:f.toasts,prompts:f.prompts,
   listeners:f.listenerCount(),registrations:f.registrationCount,loading:f.loading(),
 }; });
@@ -191,9 +197,14 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('real mounted useConfi
     const page=await open('staged');try{await ready(page);
       await page.evaluate(()=>(window as any).__config.update('a',{mixedPort:8000}));
       await expect.poll(async()=>(await read(page)).hooks.a.config.mixedPort).toBe(8000);
-      expect((await read(page)).writes).toHaveLength(0);expect((await read(page)).prompts).toBe(0);
+      const staged=await read(page);
+      expect(staged.hotOnlyPorts).toEqual([8000]);expect(staged.disk.mixedPort).toBe(7890);
+      expect(staged.writes).toHaveLength(0);expect(staged.prompts).toBe(0);
+      await page.evaluate(()=>(window as any).__config.undo('setting:mixedPort'));
+      await expect.poll(async()=>(await read(page)).hooks.a.config.mixedPort).toBe(7890);
       await page.evaluate(()=>{const f=(window as any).__config;f.holdWrites=true;f.update('a',{mixedPort:8001,controlPort:9001});});
       await expect.poll(async()=>(await read(page)).writes.length).toBe(1);
+      expect((await read(page)).hotOnlyPorts).toEqual([8000,8001]);
       expect((await read(page)).writes[0]).toEqual({controlPort:9001});
       await page.evaluate(()=>(window as any).__config.finishWrite(0,true));
       await expect.poll(async()=>(await read(page)).updates[1].settled).toBe(true);
