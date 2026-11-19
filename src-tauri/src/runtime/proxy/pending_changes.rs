@@ -314,24 +314,28 @@ impl ProxyRuntime {
                 runtime.get("selectedServerId") != current.get("selectedServerId")
             });
         let non_node_pending = !executing_exact_edit
-            && applied
-                .as_ref()
-                .and_then(|runtime| {
-                    if selection_owned
-                        && current.get(polaris_store::SELECTION_INTENT_KEY).is_none()
-                        && runtime.get(polaris_store::SELECTION_INTENT_KEY).is_some()
-                    {
-                        // The same explicit selection owns closing its Auto intent.
-                        let mut projected = runtime.clone();
-                        projected
-                            .as_object_mut()?
-                            .remove(polaris_store::SELECTION_INTENT_KEY);
-                        non_node_runtime_debt(&projected, current, self.helper.platform())
-                    } else {
-                        non_node_runtime_debt(runtime, current, self.helper.platform())
-                    }
-                })
-                .unwrap_or(deferred);
+            && if desired.is_none() && saved.is_none() {
+                deferred
+            } else {
+                applied
+                    .as_ref()
+                    .and_then(|runtime| {
+                        if selection_owned
+                            && current.get(polaris_store::SELECTION_INTENT_KEY).is_none()
+                            && runtime.get(polaris_store::SELECTION_INTENT_KEY).is_some()
+                        {
+                            // The same explicit selection owns closing its Auto intent.
+                            let mut projected = runtime.clone();
+                            projected
+                                .as_object_mut()?
+                                .remove(polaris_store::SELECTION_INTENT_KEY);
+                            non_node_runtime_debt(&projected, current, self.helper.platform())
+                        } else {
+                            non_node_runtime_debt(runtime, current, self.helper.platform())
+                        }
+                    })
+                    .unwrap_or(deferred)
+            };
         let host_pending = self.host_effect_pending();
         let rule_content_pending = self.has_uncommitted_rule_content();
         let pending_apply = !added.is_empty()

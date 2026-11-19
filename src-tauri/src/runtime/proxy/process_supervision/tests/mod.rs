@@ -69,8 +69,9 @@ fn ios_managed_start_keeps_logical_bytes_off_shared_disk_and_fallback_revokes_fi
     );
     assert!(startup.contains("start_managed_prepared(&start)"));
     let startup_compact: String = startup.split_whitespace().collect();
-    assert!(startup_compact
-        .contains("#[cfg(not(target_os=\"ios\"))]write_private_runtime_config(config_path,&json)"));
+    assert!(startup_compact.contains(
+        "if!matches!(Platform::parse(&deps.platform),Platform::Android|Platform::Ios){write_private_runtime_config(config_path,&json)",
+    ));
     assert!(!startup_compact.contains("std::fs::write(config_path,&json)"));
     let login = polaris_source_probe::crate_source_in(
         env!("CARGO_MANIFEST_DIR"),
