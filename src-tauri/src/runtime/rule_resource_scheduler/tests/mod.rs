@@ -579,5 +579,5 @@ fn background_and_builtin_downloads_acquire_exclusive_staging_before_fetch() {
     assert!(create.contains("std::fs::create_dir(&path)"));
     assert!(create.contains("ErrorKind::AlreadyExists => continue"));
     assert!(!create.contains("create_dir_all(&path)"));
-    assert!(create.contains("Ok(()) => return Ok(Self(path))"));
+    assert!(create.contains("Ok(()) => return Ok(Self(path, AtomicBool::new(false)))"));
 }
