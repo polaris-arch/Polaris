@@ -25,6 +25,7 @@ use polaris_singbox_grpc::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::Instant;
 pub(crate) mod api_handoff;
 pub(crate) mod host_effects;
 mod impact_confirmation;
@@ -61,6 +62,7 @@ pub(crate) struct RuntimeExitIpRoute {
 
 #[derive(Debug)]
 pub(crate) enum ExitIpCapabilitiesError {
+    Deadline,
     Unavailable,
     Mismatch,
 }
@@ -626,7 +628,11 @@ impl ProxyRuntime {
     pub(crate) async fn prepare_pinned_exit_ip(
         &self,
         route: &RuntimeExitIpRoute,
+        cutoff: Instant,
     ) -> Result<daemon::ProbeExitIpRequest, ExitIpCapabilitiesError> {
+        if Instant::now() >= cutoff {
+            return Err(ExitIpCapabilitiesError::Deadline);
+        }
         let caps = route
             .control
             .get_runtime_capabilities()
@@ -653,11 +659,17 @@ impl ProxyRuntime {
         &self,
         route: &RuntimeExitIpRoute,
         request: daemon::ProbeExitIpRequest,
-        budget: Duration,
+        cutoff: Instant,
     ) -> Result<Vec<u8>, ExitIpProbeError> {
         if request.leaf_tag != route.leaf.tag
             || self.with_pinned_exit_ip_route(route, || ()).is_none()
         {
+            return Err(ExitIpProbeError::NotAttempted);
+        }
+        // The final local gate can consume the remaining time. Never give Core
+        // a transport budget measured before that guard or past the cutoff.
+        let budget = cutoff.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
             return Err(ExitIpProbeError::NotAttempted);
         }
         let response = route.control.probe_exit_ip(request.clone(), budget).await?;

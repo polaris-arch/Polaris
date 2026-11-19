@@ -1312,22 +1312,26 @@ async fn try_first_proxy_probe(
         ipinfo_stage!("stage=first_proxy_fallback ticket={ticket} reason=initial_local_claim");
         return (false, FirstProxyAttempt::NotAttempted);
     };
-    let request =
-        match tokio::time::timeout_at(fallback_at, runtime.prepare_pinned_exit_ip(&route)).await {
-            Ok(Ok(request)) => request,
-            Ok(Err(_reason)) => {
-                ipinfo_stage!(
-                    "stage=first_proxy_fallback ticket={ticket} reason=capabilities_{_reason:?}"
-                );
-                return (false, FirstProxyAttempt::NotAttempted);
-            }
-            Err(_) => {
-                ipinfo_stage!(
-                    "stage=first_proxy_fallback ticket={ticket} reason=capabilities_deadline"
-                );
-                return (false, FirstProxyAttempt::NotAttempted);
-            }
-        };
+    let request = match tokio::time::timeout_at(
+        fallback_at,
+        runtime.prepare_pinned_exit_ip(&route, fallback_at),
+    )
+    .await
+    {
+        Ok(Ok(request)) => request,
+        Ok(Err(_reason)) => {
+            ipinfo_stage!(
+                "stage=first_proxy_fallback ticket={ticket} reason=capabilities_{_reason:?}"
+            );
+            return (false, FirstProxyAttempt::NotAttempted);
+        }
+        Err(_) => {
+            ipinfo_stage!(
+                "stage=first_proxy_fallback ticket={ticket} reason=capabilities_deadline"
+            );
+            return (false, FirstProxyAttempt::NotAttempted);
+        }
+    };
     // Keep the exact captured graph, control receipt, selector and settle epoch.
     // A stale receipt cannot qualify through a retry or a second capability read.
     if retry_first_proxy_local_claim(fallback_at, || {
@@ -1339,8 +1343,7 @@ async fn try_first_proxy_probe(
         ipinfo_stage!("stage=first_proxy_fallback ticket={ticket} reason=confirmed_local_claim");
         return (false, FirstProxyAttempt::NotAttempted);
     }
-    let budget = fallback_at.saturating_duration_since(Instant::now());
-    if budget.is_zero() {
+    if Instant::now() >= fallback_at {
         ipinfo_stage!("stage=first_proxy_fallback ticket={ticket} reason=dispatch_deadline");
         return (false, FirstProxyAttempt::NotAttempted);
     }
@@ -1352,7 +1355,7 @@ async fn try_first_proxy_probe(
     let at = std::time::Instant::now();
     let result = tokio::time::timeout_at(
         fallback_at,
-        runtime.probe_pinned_exit_ip(&route, request, budget),
+        runtime.probe_pinned_exit_ip(&route, request, fallback_at),
     )
     .await
     .unwrap_or(Err(ExitIpProbeError::Unknown))
