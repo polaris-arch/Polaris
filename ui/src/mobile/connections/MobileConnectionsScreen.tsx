@@ -425,6 +425,7 @@ export function MobileConnectionsScreen(): ReactElement {
   logsRef.current = logs;
   const pendingRef = useRef<LogRow[]>([]);
   const pendingSearchRef = useRef<LogSearchSnapshot | null>(null);
+  const hydratedSearchKeyRef = useRef<string | null>(null);
   const lastIdRef = useRef(-1);
   const logReadEpoch = useRef(0);
   const lastUserScrollAtRef = useRef<number | null>(null);
@@ -548,6 +549,7 @@ export function MobileConnectionsScreen(): ReactElement {
     if (segment !== 'logs') return;
     const key = logSearchKey;
     if (pendingSearchRef.current?.key !== key) pendingSearchRef.current = null;
+    if (hydratedSearchKeyRef.current !== key) hydratedSearchKeyRef.current = null;
     if (!logQuery) {
       setLogSnapshot(null);
       setLogSearchFailed(false);
@@ -563,7 +565,13 @@ export function MobileConnectionsScreen(): ReactElement {
         .then((batch) => {
           if (!alive || epoch !== logReadEpoch.current) return;
           if (!Array.isArray(batch)) throw new Error('LOG_SEARCH_SNAPSHOT_INVALID');
-          setLogSnapshot((previous) => mergeSearchSnapshot(previous, { key, rows: batch }, MAX_BUFFERED_ROWS));
+          const next = { key, rows: batch };
+          if (!followRef.current && hydratedSearchKeyRef.current === key) {
+            pendingSearchRef.current = mergeSearchSnapshot(pendingSearchRef.current, next, MAX_BUFFERED_ROWS);
+          } else {
+            hydratedSearchKeyRef.current = key;
+            setLogSnapshot((previous) => mergeSearchSnapshot(previous, next, MAX_BUFFERED_ROWS));
+          }
           setLogSearchFailed(false);
         })
         .catch((err) => {

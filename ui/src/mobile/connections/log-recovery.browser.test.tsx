@@ -191,8 +191,21 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile log ownership 
       const noise = Array.from({ length: 500 }, (_, index) => row(502 + index, 'unrelated'));
       await page.evaluate(rows => (window as any).__mobileLogRecovery.listeners[0].callback(rows), noise);
       await page.locator('[data-log-jump] .mc-cnt').getByText('500', { exact: true }).waitFor();
+      const latest = row(1002, 'matching 1002');
+      await page.getByRole('tab', { name: 'Overview', exact: true }).click();
+      await page.getByRole('tab', { name: 'Logs', exact: true }).click();
+      await hydrate(page, 1, [...noise.slice(1), latest]);
+      await page.waitForFunction(() => (window as any).__mobileLogRecovery.searches.length === 2);
+      await page.evaluate(async rows => {
+        (window as any).__mobileLogRecovery.searches[1].resolve(rows);
+        for (let frame = 0; frame < 2; frame++) await new Promise(requestAnimationFrame);
+      }, [...rows.slice(2), row(501, 'matching 501'), latest]);
+      expect(await lines.allTextContents()).toEqual(history);
+      await page.getByText('461–480 of 500', { exact: true }).waitFor();
+
       await page.locator('[data-log-jump]').click();
       await page.getByText('matching 501', { exact: true }).waitFor();
+      await page.getByText('matching 1002', { exact: true }).waitFor();
       await page.getByText('481–500 of 500', { exact: true }).waitFor();
       expect(await lines.count()).toBe(20);
     } finally { await page.close(); }
