@@ -32,6 +32,7 @@ export function backupErrorText(
 ): string {
   switch (code) {
     case 'cancelled': return t('backupImport.error.cancelled');
+    case 'busy': return t('backupImport.error.busy');
     case 'configLoadFailed': return t('backupImport.error.configLoadFailed');
     case 'serializeFailed': return t('backupImport.error.serializeFailed');
     case 'writeFailed': return t('backupImport.error.writeFailed');

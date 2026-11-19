@@ -2018,6 +2018,7 @@
       "writeFailed": "无法写入备份文件",
       "readFailed": "无法读取备份文件",
       "fileTooLarge": "备份文件超过 16 MiB 上限",
+      "busy": "另一个备份操作正在进行，请在操作完成后重试。",
       "invalidFormat": "这不是有效的 Polaris 备份文件",
       "invalidArgs": "请至少选择一个要恢复的类别",
       "sharedDependencyConflict": "所选类别与未选类别使用的共享资源冲突，未保存任何更改。请检查类别选择后重试。",

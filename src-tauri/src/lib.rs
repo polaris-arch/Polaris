@@ -644,6 +644,8 @@ pub fn run() {
     // Tauri setup 之后才有；ProxyRuntime 在 `AppRuntime::new` 里就造好了，够不着。
     #[cfg(target_os = "android")]
     let builder = builder.plugin(runtime::proxy::android_bridge::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(commands::misc::android_backup_picker_plugin());
     #[cfg(target_os = "ios")]
     let builder = builder.plugin(tauri_plugin_polaris_ios::init());
     let builder = builder

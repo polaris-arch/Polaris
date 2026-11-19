@@ -1,16 +1,20 @@
 use std::collections::BTreeSet;
 use std::io::{self, BufReader, Read};
 use std::str::FromStr as _;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::{Mutex, MutexGuard};
 
 use super::support::{node_platform, now_iso8601, today_yyyy_mm_dd};
 use crate::commands::picked_file::{
     classify, display_of, open_picked_for_read, with_picked_gateway_blocking, write_picked,
     FileGateway, FilePath, PickedTarget,
 };
+#[cfg(not(target_os = "android"))]
 use crate::i18n::{key, t};
 use crate::response::ApiResponse;
 use crate::runtime::AppRuntime;
@@ -21,6 +25,55 @@ use polaris_store::backup::{
 };
 
 const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
+static BACKUP_OPERATION: Mutex<()> = Mutex::const_new(());
+
+// The native picker and blocking jobs can outlive their awaiting IPC future.
+type BackupOperation = Arc<MutexGuard<'static, ()>>;
+
+fn try_start_backup_operation() -> Option<BackupOperation> {
+    BACKUP_OPERATION.try_lock().ok().map(Arc::new)
+}
+
+#[cfg(target_os = "android")]
+struct AndroidBackupPicker(tauri::plugin::PluginHandle<tauri::Wry>);
+
+#[cfg(target_os = "android")]
+pub(crate) fn android_backup_picker_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("polaris-backup-picker")
+        .setup(|app, api| {
+            let picker = api.register_android_plugin("com.polaris2.app", "BackupPickerPlugin")?;
+            app.manage(AndroidBackupPicker(picker));
+            Ok(())
+        })
+        .build()
+}
+
+#[cfg(target_os = "android")]
+async fn ask_android_path(
+    app: &AppHandle,
+    default_name: Option<&str>,
+    operation: &BackupOperation,
+) -> Option<FilePath> {
+    #[derive(serde::Deserialize)]
+    struct Picked {
+        file: Option<FilePath>,
+    }
+
+    let picker = app.try_state::<AndroidBackupPicker>()?.0.clone();
+    let payload = json!({ "defaultName": default_name });
+    let operation = Arc::clone(operation);
+    // Keep the slot through the exact native reply even if the command stops awaiting it.
+    let picked = tauri::async_runtime::spawn(async move {
+        let _operation = operation;
+        picker
+            .run_mobile_plugin_async::<Picked>("pickFile", payload)
+            .await
+    })
+    .await
+    .ok()?
+    .ok()?;
+    picked.file
+}
 
 /// 把前端传来的类别串解析成枚举；空 / None → 全选。
 /// 未知类别忽略，以兼容版本差异。
@@ -64,9 +117,15 @@ fn pick_checked_categories(
 /// `FilePath::Url(content://…)`，改动前那句 `.and_then(|p| p.into_path().ok())` 对它恒得 `None`，
 /// 于是「选好了保存位置」与「按了取消」在调用方眼里一模一样 —— 用户导出备份，什么都没发生。
 /// 两种形态各自怎么读写见 `commands::picked_file`。
-async fn ask_save_path(app: &AppHandle, default_name: &str) -> Option<FilePath> {
+#[cfg(not(target_os = "android"))]
+async fn ask_save_path(
+    app: &AppHandle,
+    default_name: &str,
+    operation: &BackupOperation,
+) -> Option<FilePath> {
     let lang = crate::i18n::app_lang(app);
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let operation = Arc::clone(operation);
     app.dialog()
         .file()
         .set_title(t(lang, key::NATIVE_BACKUP_EXPORT_TITLE))
@@ -74,31 +133,43 @@ async fn ask_save_path(app: &AppHandle, default_name: &str) -> Option<FilePath> 
         .add_filter(t(lang, key::NATIVE_BACKUP_FILE_TYPE), &["polaris-backup"])
         .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"])
         .save_file(move |p| {
+            let _operation = operation;
             let _ = tx.send(p);
         });
     rx.await.ok().flatten()
 }
 
+#[cfg(target_os = "android")]
+async fn ask_save_path(
+    app: &AppHandle,
+    default_name: &str,
+    operation: &BackupOperation,
+) -> Option<FilePath> {
+    ask_android_path(app, Some(default_name), operation).await
+}
+
 /// 弹「打开文件」框，返回用户选定的**目标**（取消 → None）。理由同 [`ask_save_path`]。
-async fn ask_open_path(app: &AppHandle) -> Option<FilePath> {
+#[cfg(not(target_os = "android"))]
+async fn ask_open_path(app: &AppHandle, operation: &BackupOperation) -> Option<FilePath> {
     let lang = crate::i18n::app_lang(app);
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let picker = app
-        .dialog()
+    let operation = Arc::clone(operation);
+    app.dialog()
         .file()
-        .set_title(t(lang, key::NATIVE_BACKUP_IMPORT_TITLE));
-    // Android dialog 把已知扩展转成 MIME、丢弃未知扩展和 "*"；保留 json
-    // filter 会把本应用导出的 .polaris-backup 从系统选择器里隐藏。无 filter
-    // 时插件明确使用 */*；文件正文仍由备份解析器校验。
-    #[cfg(not(target_os = "android"))]
-    let picker = picker
+        .set_title(t(lang, key::NATIVE_BACKUP_IMPORT_TITLE))
         .add_filter(t(lang, key::NATIVE_BACKUP_FILE_TYPE), &["polaris-backup"])
         .add_filter(t(lang, key::NATIVE_JSON_FILE_TYPE), &["json"])
-        .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"]);
-    picker.pick_file(move |p| {
-        let _ = tx.send(p);
-    });
+        .add_filter(t(lang, key::NATIVE_ALL_FILES), &["*"])
+        .pick_file(move |p| {
+            let _operation = operation;
+            let _ = tx.send(p);
+        });
     rx.await.ok().flatten()
+}
+
+#[cfg(target_os = "android")]
+async fn ask_open_path(app: &AppHandle, operation: &BackupOperation) -> Option<FilePath> {
+    ask_android_path(app, None, operation).await
 }
 
 /// 导出腿的**落盘段** —— 保存框回话之后的全部逻辑。
@@ -253,6 +324,9 @@ pub async fn backup_export(
     state: State<'_, AppRuntime>,
     categories: Option<Vec<String>>,
 ) -> Result<ApiResponse<Value>, ()> {
+    let Some(operation) = try_start_backup_operation() else {
+        return Ok(ApiResponse::ok(backup_failure("busy")));
+    };
     let config = match state.config().load_full() {
         Ok(c) => c,
         Err(e) => {
@@ -279,7 +353,13 @@ pub async fn backup_export(
 
     // Android's create-document picker can allocate a destination before it
     // returns. Validate the final bytes first so a failed export leaves no file.
-    let body = match tauri::async_runtime::spawn_blocking(move || encode_backup(&backup)).await {
+    let encode_operation = Arc::clone(&operation);
+    let body = match tauri::async_runtime::spawn_blocking(move || {
+        let _operation = encode_operation;
+        encode_backup(&backup)
+    })
+    .await
+    {
         Ok(Ok(body)) => body,
         Ok(Err(code)) => return Ok(ApiResponse::ok(backup_failure(code))),
         Err(e) => {
@@ -288,11 +368,12 @@ pub async fn backup_export(
         }
     };
     let default_name = format!("polaris-backup-{}.polaris-backup", today_yyyy_mm_dd());
-    let target = ask_save_path(&app, &default_name).await;
+    let target = ask_save_path(&app, &default_name, &operation).await;
     // URI 支的插件 I/O 是同步阻塞的、且上游拿不到 fd 时会 panic ⇒ 经 `with_picked_gateway_blocking`
     // 派线程（桌面路径同样派到阻塞池）。`JoinError` 不许 `unwrap()`：那会把 panic 变回一个永不
     // settle 的 promise，`BackupPage.tsx` 的 `setBusy(false)` 写在 `finally` 里，一起冻住。
     let payload = with_picked_gateway_blocking(&app, target, move |gateway, target| {
+        let _operation = operation;
         finish_export(gateway, target, &body)
     })
     .await
@@ -358,14 +439,23 @@ fn read_backup(
 /// 上游 `BACKUP_IMPORT_PICK`：弹文件框 + 解析 → 返回含哪些类 + 各类数量（**不 apply**）。
 #[tauri::command]
 pub async fn backup_import_pick(app: AppHandle) -> Result<ApiResponse<Value>, ()> {
-    let picked = ask_open_path(&app).await;
+    let Some(operation) = try_start_backup_operation() else {
+        return Ok(ApiResponse::ok(
+            json!({ "canceled": false, "errorCode": "busy" }),
+        ));
+    };
+    let picked = ask_open_path(&app, &operation).await;
     // 同 `backup_export`：路径和 URI 均派线程，`JoinError` 收成 readFailed。
-    let source = with_picked_gateway_blocking(&app, picked, read_import_source)
-        .await
-        .unwrap_or_else(|e| {
-            log::warn!("[backup] import pick task join failed: {e}");
-            ImportSource::Failed("readFailed")
-        });
+    let read_operation = Arc::clone(&operation);
+    let source = with_picked_gateway_blocking(&app, picked, move |gateway, picked| {
+        let _operation = read_operation;
+        read_import_source(gateway, picked)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("[backup] import pick task join failed: {e}");
+        ImportSource::Failed("readFailed")
+    });
     let (mut parsed, file_path) = match source {
         ImportSource::Cancelled => return Ok(ApiResponse::ok(json!({ "canceled": true }))),
         ImportSource::Failed(code) => {
@@ -442,12 +532,17 @@ pub async fn backup_import_apply(
     if file_path.is_empty() || selected.is_empty() {
         return Ok(ApiResponse::ok(backup_failure("invalidArgs")));
     }
+    let Some(operation) = try_start_backup_operation() else {
+        return Ok(ApiResponse::ok(backup_failure("busy")));
+    };
     // 前端回传的是 `backup_import_pick` 给出的那个字符串。分流与判据都住在 [`read_apply_source`]；
     // 路径、URI 和配置预检的读取都在同一个阻塞任务里。
     let target = FilePath::from_str(&file_path).expect("FilePath::from_str 是 Infallible");
     let restore_mesh = selected.contains(&BackupCategory::MeshRouting);
     let read_app = app.clone();
+    let read_operation = Arc::clone(&operation);
     let parsed = match with_picked_gateway_blocking(&app, Some(target), move |gateway, _| {
+        let _operation = read_operation;
         let parsed = read_apply_source(gateway, &file_path)?;
         if restore_mesh
             && (parsed.config.get("meshRouting").is_some()

@@ -12,6 +12,7 @@ import type {
 
 export type BackupErrorCode =
   | 'cancelled'
+  | 'busy'
   | 'configLoadFailed'
   | 'serializeFailed'
   | 'writeFailed'

@@ -9,6 +9,9 @@ import android.view.View
 import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -22,6 +25,7 @@ import androidx.webkit.ScriptHandler
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import app.tauri.plugin.Invoke
 import java.util.Locale
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -279,6 +283,17 @@ private const val THEME_PROBE_JS =
  * 同一个 androidx.webkit，不引新依赖。
  */
 class MainActivity : TauriActivity() {
+  private val backupFilePicker by viewModels<BackupFilePicker>()
+  private lateinit var backupFileLauncher: ActivityResultLauncher<Intent>
+
+  internal fun pickBackupFile(defaultName: String?, invoke: Invoke) {
+    if (isFinishing || isDestroyed || !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+      invoke.reject("The backup picker needs an active Polaris window")
+      return
+    }
+    backupFilePicker.launch(backupFileLauncher, defaultName, invoke)
+  }
+
   /** 上一次注册的文档起始脚本；inset 变了要先撤旧的，否则同一份文档会被灌进两组值。 */
   private var safeAreaScript: ScriptHandler? = null
 
@@ -325,6 +340,12 @@ class MainActivity : TauriActivity() {
     // 在文档起始脚本跑到时接管。理由见类头注「冷启动那一格由谁负责」。
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    backupFileLauncher = activityResultRegistry.register(
+      backupFilePicker.registryKey,
+      this,
+      ActivityResultContracts.StartActivityForResult(),
+      backupFilePicker::complete,
+    )
     lifecycleScope.launch {
       repeatOnLifecycle(Lifecycle.State.STARTED) {
         try {

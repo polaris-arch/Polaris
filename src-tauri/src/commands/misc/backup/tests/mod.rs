@@ -30,6 +30,31 @@ fn backup_failure_exposes_only_the_stable_error_code() {
     assert!(payload.get("diagnostic").is_none());
 }
 
+#[tokio::test]
+async fn backup_operation_remains_busy_until_native_work_finishes() {
+    let operation = try_start_backup_operation().unwrap();
+    let picker = Arc::clone(&operation);
+    drop(operation);
+    assert!(try_start_backup_operation().is_none());
+    drop(picker);
+
+    let operation = try_start_backup_operation().unwrap();
+    let worker_operation = Arc::clone(&operation);
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (finish, work) = std::sync::mpsc::channel();
+    let worker = tokio::task::spawn_blocking(move || {
+        let _operation = worker_operation;
+        started.send(()).unwrap();
+        let _ = work.recv();
+    });
+    waiting.await.unwrap();
+    drop(operation);
+    assert!(try_start_backup_operation().is_none());
+    finish.send(()).unwrap();
+    worker.await.unwrap();
+    assert!(try_start_backup_operation().is_some());
+}
+
 #[test]
 fn selected_invalid_mesh_policy_fails_export_before_file_picker() {
     let mut config = polaris_store::store::default_config();
