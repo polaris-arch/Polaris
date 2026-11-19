@@ -37,7 +37,8 @@ class MainNativeAdmissionWiringTest {
         val reload = service.substringAfter("private fun serviceReload(expectedAttempt:").substringBefore("private fun setReloadError(")
         assertTrue(reload.contains("AndroidNativeMain.controls.reload("))
         assertFalse(reload.contains("AndroidNativeMain.construct(attempt)"))
-        assertTrue(reload.contains("TransientLoginHost.withMainConfig(attempt, config, { isReloadCurrent(attempt, server) })"))
+        assertTrue(reload.contains("TransientLoginHost.withMainReload(attempt, config,"))
+        assertTrue(reload.contains("allowed = { isReloadCurrent(attempt, server) }"))
         assertTrue(serviceStart.contains("LegacySystemStartFence.admitCurrentRequest(request, VpnBridge::currentStartRequest)"))
         assertTrue(serviceStart.contains("service.stopSelfResult(startId)"))
         assertFalse(serviceStart.contains("service.stopSelf()"))
@@ -308,7 +309,8 @@ class MainNativeAdmissionWiringTest {
 
     @Test fun productionScopedSnapshotsUseTheSameServerBeforeHandleLossAndAreIndependentOfDebugWitness() {
         val observer = service.substringAfter("private fun observeNativeInput(").substringBefore("private fun isReloadCurrent(")
-        assertTrue(observer.contains("checkNotNull(attempt.tailscaleStore).invoke(config, { AndroidTailscaleStoreCustody.export(server) }, nativeCall)"))
+        assertTrue(observer.contains("checkNotNull(attempt.tailscaleStore).invoke(config, { AndroidTailscaleStoreCustody.export(server) },"))
+        assertTrue(observer.contains("startupReceipt = { it }, action = nativeCall)"))
         val close = service.substringAfter("private fun stopService(").substringBefore("private fun onAttemptClosed(")
         assertTrue(close.contains("synchronized(attempt.operationLock)"))
         assertTrue(close.indexOf("server?.closeService()") < close.indexOf("attempt.tailscaleStore?.closed"))

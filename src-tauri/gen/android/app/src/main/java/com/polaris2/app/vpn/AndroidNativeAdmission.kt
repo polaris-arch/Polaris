@@ -725,6 +725,7 @@ internal class AndroidTailscaleStoreCustody internal constructor(
     }
     private var runs = emptyList<Run>()
     private var currentDigest = ""
+    private var currentStartRunNonces: List<String>? = null
     private var payload = ""
     private var unknown = false
     private var terminal = false
@@ -733,38 +734,49 @@ internal class AndroidTailscaleStoreCustody internal constructor(
     private var runtimeStateFiles = emptySet<String>()
 
     /** Captures both sides of this exact call even when JNI throws. No capture error replaces it. */
-    fun <T> invoke(config: String, export: () -> String, action: () -> T): T {
+    fun <T> invoke(config: String, export: () -> String, startupReceipt: (T) -> String? = { null }, action: () -> T): T {
         fun coldExport(requireTerminal: Boolean): String {
             val runtimeHistory = ledger.runtimeWriterHistory(ticket, birthNonce)
             return projectColdExport(export(), runtimeHistory, requireTerminal)
         }
         val digest = digest(config)
         val before = runCatching { parseRuns(coldExport(requireTerminal = false)) }.getOrNull()
-        synchronized(this) {
+        val original = synchronized(this) {
             if (before == null || !sameRuns(before, runs) || terminal) unknown = true
+            runs
         }
         var returned = false
-        try { return action().also { returned = true } }
+        var receipt: String? = null
+        try {
+            return action().also {
+                receipt = startupReceipt(it)
+                returned = true
+            }
+        }
         finally {
             val raw = runCatching { coldExport(requireTerminal = returned) }.getOrNull()
             val after = raw?.let { runCatching { parseRuns(it) }.getOrNull() }
-            val projected = synchronized(this) {
-                val fresh = after?.filter { next -> runs.none { it.nonce == next.nonce } }.orEmpty()
-                if (after != null && fresh.size == 1 && fresh[0].digest == digest && runs.all { it in after }) runs + fresh else runs
+            val originalNonces = original.mapTo(mutableSetOf()) { it.nonce }
+            val typed = receipt
+            val added = when {
+                !returned -> null
+                typed == null -> after?.filter { it.nonce !in originalNonces }
+                    ?.takeIf { it.size == 1 && it.single().digest == digest }
+                else -> runCatching { parseStartupCohort(typed, digest) }.getOrNull()
             }
+            val next = added?.let { original + it }?.takeIf { candidate ->
+                after != null && added.none { it.nonce in originalNonces } && sameRuns(after, candidate)
+            }
+            val group = if (typed != null) next?.drop(original.size)?.map { it.nonce } else null
             val admitted = raw != null && raw.toByteArray(Charsets.UTF_8).size <= MAX_BYTES &&
-                snapshotBytes(raw, projected, if (returned) digest else synchronized(this) { currentDigest }, false)?.let { ledger.admitScopedBytes(ticket, it) } == true
+                snapshotBytes(raw, next ?: original, if (returned) digest else synchronized(this) { currentDigest }, group, false)
+                    ?.let { ledger.admitScopedBytes(ticket, it) } == true
             synchronized(this) {
-                val old = runs.associateBy { it.nonce }
-                val fresh = after?.filter { !old.containsKey(it.nonce) }.orEmpty()
-                if (!returned || before == null || after == null || fresh.size != 1 ||
-                    fresh.any { it.digest != digest } ||
-                    old.values.any { original -> after.none { it == original } }) unknown = true
-                if (after != null && fresh.size == 1 && fresh[0].digest == digest &&
-                    old.values.all { original -> after.any { it == original } } && admitted) runs = runs + fresh
+                if (!returned || next == null || !admitted) unknown = true
+                if (next != null && admitted) runs = next
                 if (returned) currentDigest = digest
+                currentStartRunNonces = group.takeUnless { unknown }
                 if (admitted) payload = checkNotNull(raw)
-                else unknown = true
             }
             ledger.scopedChanged(ticket)
         }
@@ -777,9 +789,9 @@ internal class AndroidTailscaleStoreCustody internal constructor(
         val parsed = raw?.let { runCatching { parseRuns(it) }.getOrNull() }
         val nativeComplete = raw?.let { runCatching { terminalComplete(it) }.getOrDefault(false) } == true
         val censusComplete = raw?.let { runCatching { censusComplete(it) }.getOrDefault(false) } == true
-        val originalRuns = synchronized(this) { runs }
+        val (originalRuns, digest, group) = synchronized(this) { Triple(runs, currentDigest, currentStartRunNonces) }
         val admitted = raw != null && raw.toByteArray(Charsets.UTF_8).size <= MAX_BYTES &&
-            snapshotBytes(raw, originalRuns, synchronized(this) { currentDigest }, true)?.let { ledger.admitScopedBytes(ticket, it) } == true
+            snapshotBytes(raw, originalRuns, digest, group, true)?.let { ledger.admitScopedBytes(ticket, it) } == true
         synchronized(this) {
             if (parsed == null || runs.isEmpty() || !sameRuns(parsed, runs)) unknown = true
             if (admitted) payload = checkNotNull(raw)
@@ -793,21 +805,23 @@ internal class AndroidTailscaleStoreCustody internal constructor(
         ledger.scopedChanged(ticket)
     }
 
-    @Synchronized fun wire(): JSONObject = wireValue(runs, currentDigest, payload, unknown, terminal)
+    @Synchronized fun wire(): JSONObject = wireValue(runs, currentDigest, payload, currentStartRunNonces, unknown, terminal)
 
-    private fun wireValue(originalRuns: List<Run>, digest: String, raw: String, historyUnknown: Boolean, closed: Boolean): JSONObject = JSONObject()
+    private fun wireValue(originalRuns: List<Run>, digest: String, raw: String, group: List<String>?,
+                          historyUnknown: Boolean, closed: Boolean): JSONObject = JSONObject()
         .put("contractVersion", "polaris-android-ts-store-custody-v1")
         .put("producerKind", ticket.kind.name).put("processNonce", ledger.processNonce)
         .put("nativeTicketId", ticket.id).put("logicalInstanceId", ticket.logicalId)
         .put("mainBirthNonce", birthNonce).put("actualConfigDigest", digest)
         .put("originalObservedRuns", JSONArray(originalRuns.map { it.json() }))
         .put("historyUnknown", historyUnknown).put("terminal", closed).put("storeRetirement", raw)
+        .also { if (group != null) it.put("currentStartRunNonces", JSONArray(group)) }
 
-    private fun snapshotBytes(raw: String, originalRuns: List<Run>, digest: String, closed: Boolean): Int? {
+    private fun snapshotBytes(raw: String, originalRuns: List<Run>, digest: String, group: List<String>?, closed: Boolean): Int? {
         val historyBytes = JSONArray(originalRuns.map { it.json() }).toString().toByteArray(Charsets.UTF_8).size
         // Check both parts before composing an envelope; JSON escaping is included in the exact final bound.
         if (historyBytes > MAX_BYTES || raw.toByteArray(Charsets.UTF_8).size > MAX_BYTES - historyBytes) return null
-        val bytes = wireValue(originalRuns, digest, raw, false, closed).toString().toByteArray(Charsets.UTF_8).size
+        val bytes = wireValue(originalRuns, digest, raw, group, false, closed).toString().toByteArray(Charsets.UTF_8).size
         return bytes.takeIf { it <= MAX_BYTES }
     }
 
@@ -816,6 +830,7 @@ internal class AndroidTailscaleStoreCustody internal constructor(
             binding.getString("processNonce") == ledger.processNonce && binding.getString("producerKind") == ticket.kind.name &&
             binding.getString("nativeTicketId") == ticket.id && binding.getString("logicalInstanceId") == ticket.logicalId &&
             binding.getString("mainBirthNonce") == birthNonce && binding.getString("actualConfigDigest") == currentDigest &&
+            sameJson(binding.opt("currentStartRunNonces"), currentStartRunNonces?.let { JSONArray(it) }) &&
             sameRuns(observedRuns(binding.getJSONArray("originalObservedRuns")), runs)
     }.getOrDefault(false)
 
@@ -863,12 +878,30 @@ internal class AndroidTailscaleStoreCustody internal constructor(
             return root
         }
 
+        private fun parseRun(instance: JSONObject): Run =
+            Run(instance.getString("runNonce"), instance.getString("configDigest"), scopes(instance.getJSONArray("nodes")))
+                .also { check(hex64(it.nonce) && hex64(it.digest)) }
+
         internal fun parseRuns(raw: String): List<Run> {
             val instances = storeReceipt(raw).getJSONArray("instances")
-            return (0 until instances.length()).map { index ->
-                val instance = instances.getJSONObject(index)
-                Run(instance.getString("runNonce"), instance.getString("configDigest"), scopes(instance.getJSONArray("nodes")))
-            }.also { check(it.map { run -> run.nonce }.toSet().size == it.size && it.all { run -> hex64(run.nonce) && hex64(run.digest) }) }
+            return (0 until instances.length()).map { parseRun(instances.getJSONObject(it)) }
+                .also { check(it.map { run -> run.nonce }.toSet().size == it.size) }
+        }
+
+        /** The exact Start return admits the new membership. The after-export alone cannot classify it. */
+        private fun parseStartupCohort(raw: String, digest: String): List<Run> {
+            check(raw.toByteArray(Charsets.UTF_8).size <= MAX_BYTES)
+            val cohort = JSONObject(raw)
+            check(cohort.keys().asSequence().toSet() == setOf("contractVersion", "censusComplete", "parent", "initialChildren"))
+            check(cohort.get("contractVersion") == "polaris-ts-startup-cohort-v1" && cohort.get("censusComplete") == true)
+            val parent = parseRun(cohort.getJSONObject("parent"))
+            val children = cohort.getJSONArray("initialChildren")
+            check(parent.digest == digest && children.length() < MAX_RUNS && (children.length() == 0 || parent.scopes.isEmpty()))
+            val runs = (0 until children.length()).map { parseRun(children.getJSONObject(it)) }
+            val childScopes = runs.map { it.scopes.single() }
+            check(childScopes.map { it.tag }.toSet().size == childScopes.size &&
+                childScopes.map { it.file }.toSet().size == childScopes.size)
+            return (runs + parent).also { check(it.map { run -> run.nonce }.toSet().size == it.size) }
         }
 
         /** Prove the full original census before projecting exact child rows out of the cold v1 wire. */

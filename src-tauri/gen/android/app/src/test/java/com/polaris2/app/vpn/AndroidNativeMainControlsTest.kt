@@ -420,7 +420,7 @@ class AndroidNativeMainControlsTest {
         assertTrue(reload.contains("allowed = { isReloadCurrent(attempt, server) }"))
         assertFalse(reload.contains("AndroidNativeMain.construct("))
         val native = reload.substringAfter("nativeReload = { server, config ->").substringBefore("setError =")
-        assertTrue(native.contains("server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(),"))
+        assertTrue(native.contains("AndroidRuntimeTailscaleBridge.startMain(server, config, OverrideOptions(), persistence)"))
         assertTrue(native.contains("SystemStart.requireLegacyAllowed(service)"))
         assertTrue(producer.indexOf("reserve(ledger,") < producer.indexOf("target()"))
         assertTrue(producer.indexOf("target()") < producer.indexOf("loadConfig()"))

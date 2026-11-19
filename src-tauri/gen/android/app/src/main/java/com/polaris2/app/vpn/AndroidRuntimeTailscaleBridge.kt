@@ -1,6 +1,8 @@
 package com.polaris2.app.vpn
 
 import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.RuntimePersistenceHandler
 import java.io.File
 import java.io.IOException
 import java.lang.reflect.InvocationTargetException
@@ -18,6 +20,19 @@ internal object AndroidRuntimeTailscaleBridge {
 
     internal data class ControlledDirectories(val state: RuntimeTailscaleStatePaths, val taildrop: String) {
         val paths: Set<String> get() = setOf(state.canonical, taildrop)
+    }
+
+    /** An absent symbol alone selects the legacy call. A present method is never retried. */
+    fun startMain(server: CommandServer, config: String, options: OverrideOptions, handler: RuntimePersistenceHandler): String? {
+        val methods = server.javaClass.methods.filter { it.name == "startOrReloadServiceWithTailscaleStartup" }
+        if (methods.isEmpty()) {
+            server.startOrReloadServiceWithRetryableRuntimePersistence(config, options, handler)
+            return null
+        }
+        val method = methods.single()
+        check(method.returnType == String::class.java &&
+            method.parameterTypes.contentEquals(arrayOf(String::class.java, OverrideOptions::class.java, RuntimePersistenceHandler::class.java)))
+        return invoke(server, method, config, options, handler) as String
     }
 
     fun register(server: CommandServer, owner: MainKernelAttempt<CommandServer>, dataDir: File, current: () -> Boolean) {

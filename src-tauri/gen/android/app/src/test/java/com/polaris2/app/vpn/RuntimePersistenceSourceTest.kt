@@ -10,7 +10,7 @@ class RuntimePersistenceSourceTest {
 
     @Test fun startupAndReloadCaptureFreshEpochOnTheSameAttempt() {
         val box = source("BoxService")
-        assertEquals(2, Regex("server\\.startOrReloadServiceWithRetryableRuntimePersistence\\(").findAll(box).count())
+        assertEquals(2, Regex("AndroidRuntimeTailscaleBridge\\.startMain\\(").findAll(box).count())
         assertFalse(box.contains("server.startOrReloadService(config, OverrideOptions())"))
         val handler = box.substringAfter("private fun runtimePersistenceHandler").substringBefore("/** Same operationLock")
         for (guard in listOf("mainAttempt === attempt", "commandServer === server", "runtimePersistenceEpoch == epoch",
@@ -29,7 +29,7 @@ class RuntimePersistenceSourceTest {
         val box = source("BoxService")
         val reload = box.substringAfter("nativeReload = { server, config ->").substringBefore("setError =")
         assertTrue(reload.indexOf("expectedReloadConfig = config") < reload.indexOf("observeNativeInput("))
-        assertTrue(reload.contains("startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(), persistence)"))
+        assertTrue(reload.contains("AndroidRuntimeTailscaleBridge.startMain(server, config, OverrideOptions(), persistence)"))
         val claim = box.substringAfter("private fun runtimePersistenceHandler(").substringBefore("return object : RuntimePersistenceHandler")
         val lock = claim.indexOf("synchronized(this)")
         val read = claim.indexOf("VpnBridge.currentConfig() ?: SystemStart.load(service)")

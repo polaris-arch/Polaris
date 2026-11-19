@@ -188,6 +188,7 @@ class AndroidNativeAdmissionTest {
         }
         val active = custody.wire()
         assertFalse(active.getBoolean("historyUnknown"))
+        assertFalse(active.has("currentStartRunNonces"))
         assertEquals(ScopedNativeFixture.digest("reload"), active.getString("actualConfigDigest"))
         assertEquals(2, active.getJSONArray("originalObservedRuns").length())
         custody.closed {
@@ -197,6 +198,145 @@ class AndroidNativeAdmissionTest {
         assertTrue(custody.matches(active))
         assertEquals(true, custody.closedRelation(ScopedNativeFixture.file("replacement")))
         assertEquals(null, custody.closedRelation("${warm.stateDirectory}/tailscaled.state"))
+    }
+
+    @Test fun typedStartupObservesOriginalParentAndInitialPhysicalChild() {
+        val ledger = bounded(20)
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        val custody = ledger.bindTailscaleStore(ticket, "birth")
+        assertTrue(ledger.enterBirth(ticket))
+        val rawConfig = "original input"
+        val parent = ScopedNativeFixture.run("a", rawConfig, emptyList())
+        val child = ScopedNativeFixture.run("b", "frozen construction with resolved inputs", listOf("first"))
+        var native = ScopedNativeFixture.export()
+        custody.invoke(rawConfig, { native }, startupReceipt = { it }) {
+            native = ScopedNativeFixture.export(parent, child)
+            ScopedNativeFixture.cohort(parent, child)
+        }
+        val active = custody.wire()
+        assertFalse(active.getBoolean("historyUnknown"))
+        assertEquals(ScopedNativeFixture.digest(rawConfig), active.getString("actualConfigDigest"))
+        assertEquals(listOf("b".repeat(64), "a".repeat(64)), active.getJSONArray("currentStartRunNonces").let {
+            listOf(it.getString(0), it.getString(1))
+        })
+        assertEquals("a".repeat(64), active.getJSONArray("originalObservedRuns").getJSONObject(1).getString("runNonce"))
+        val wrongOrder = JSONObject(active.toString()).put("currentStartRunNonces", org.json.JSONArray(listOf("a".repeat(64), "b".repeat(64))))
+        val withoutGroup = JSONObject(active.toString()).also { it.remove("currentStartRunNonces") }
+        assertFalse(custody.matches(wrongOrder))
+        assertFalse(custody.matches(withoutGroup))
+        custody.closed { ScopedNativeFixture.export(ScopedNativeFixture.retired(child), ScopedNativeFixture.retired(parent)) }
+        assertTrue(custody.matches(active))
+        assertEquals(true, custody.closedRelation(ScopedNativeFixture.file("first")))
+        assertEquals(false, custody.closedRelation(ScopedNativeFixture.file("unrelated")))
+    }
+
+    @Test fun typedReloadRetainsWarmCloseAndAdmitsItsReplacementPhysicalWriterAsInitial() {
+        val ledger = bounded(20)
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        val custody = ledger.bindTailscaleStore(ticket, "birth")
+        assertTrue(ledger.enterBirth(ticket))
+        val parent = ScopedNativeFixture.run("a", "empty graph", emptyList())
+        var native = ScopedNativeFixture.export()
+        custody.invoke("empty graph", { native }, startupReceipt = { it }) {
+            native = ScopedNativeFixture.export(parent)
+            ScopedNativeFixture.cohort(parent)
+        }
+        val warm = runtimeWriterScope(1)
+        assertTrue(ledger.retainRuntimeWriter(ticket, "birth", warm))
+        native = ScopedNativeFixture.export(parent, runtimeStoreRun(warm, warm.stateDirectory, false))
+        val replacementParent = ScopedNativeFixture.run("b", "configuration including warm endpoint", emptyList())
+        val replacementChild = runtimeStoreRun(warm, warm.stateDirectory, false)
+            .put("runNonce", "c".repeat(64)).put("configDigest", ScopedNativeFixture.digest("replacement physical input"))
+        val retiredParent = ScopedNativeFixture.retired(parent)
+        val retiredWarm = runtimeStoreRun(warm, warm.stateDirectory, true)
+        custody.invoke("configuration including warm endpoint", { native }, startupReceipt = { it }) {
+            assertTrue(ledger.settleRuntimeWriter(ticket, "birth", warm, true))
+            native = ScopedNativeFixture.export(retiredParent, retiredWarm, replacementParent, replacementChild)
+            ScopedNativeFixture.cohort(replacementParent, replacementChild)
+        }
+        val active = custody.wire()
+        assertFalse(active.getBoolean("historyUnknown"))
+        assertEquals(3, active.getJSONArray("originalObservedRuns").length())
+        assertEquals(2, active.getJSONArray("currentStartRunNonces").length())
+        assertEquals("c".repeat(64), active.getJSONArray("currentStartRunNonces").getString(0))
+        assertEquals(AndroidNativeAdmission.RuntimeWriterOutcome.ClosedConfirmed, ledger.runtimeWriterHistory(ticket, "birth", warm)?.outcome)
+        custody.closed {
+            ScopedNativeFixture.export(retiredParent, retiredWarm,
+                ScopedNativeFixture.retired(replacementChild), ScopedNativeFixture.retired(replacementParent))
+        }
+        assertTrue(custody.matches(active))
+        assertFalse(custody.wire().getBoolean("historyUnknown"))
+        assertEquals(null, custody.closedRelation("${warm.stateDirectory}/tailscaled.state"))
+        assertEquals(false, custody.closedRelation(ScopedNativeFixture.file("unrelated")))
+    }
+
+    @Test fun typedEmptyReloadRetainsBothEarlierEmptyParentsEvenWithTheSameInput() {
+        val ledger = bounded(20)
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        val custody = ledger.bindTailscaleStore(ticket, "birth")
+        assertTrue(ledger.enterBirth(ticket))
+        val config = "unchanged empty graph"
+        val history = mutableListOf<JSONObject>()
+        var native = ScopedNativeFixture.export()
+        for (nonce in listOf("a", "b", "c")) {
+            val parent = ScopedNativeFixture.run(nonce, config, emptyList())
+            custody.invoke(config, { native }, startupReceipt = { it }) {
+                native = ScopedNativeFixture.export(*(history + parent).toTypedArray())
+                ScopedNativeFixture.cohort(parent)
+            }
+            history.add(ScopedNativeFixture.retired(parent))
+        }
+        val active = custody.wire()
+        assertFalse(active.getBoolean("historyUnknown"))
+        assertEquals(3, active.getJSONArray("originalObservedRuns").length())
+        assertEquals("c".repeat(64), active.getJSONArray("currentStartRunNonces").getString(0))
+        custody.closed { ScopedNativeFixture.export(*history.toTypedArray()) }
+        assertTrue(custody.matches(active))
+        assertEquals(false, custody.closedRelation(ScopedNativeFixture.file("unrelated")))
+    }
+
+    @Test fun typedStartupCannotAdoptAParallelForeignScopeOrFallBackFromInvalidCohort() {
+        for (scenario in listOf("foreign parallel row", "incomplete cohort", "wrong child digest",
+            "wrong child scope", "empty reply", "native exception")) {
+            val ledger = bounded(20)
+            val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+            val custody = ledger.bindTailscaleStore(ticket, "birth")
+            assertTrue(ledger.enterBirth(ticket))
+            val foreign = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "parallel")
+            ledger.bindTailscaleStore(foreign, "other-birth")
+            assertTrue(ledger.enterBirth(foreign))
+            val foreignScope = runtimeWriterScope(2).copy(configDigest = ScopedNativeFixture.digest("configuration"))
+            assertTrue(ledger.retainRuntimeWriter(foreign, "other-birth", foreignScope))
+            val parent = ScopedNativeFixture.run("a", "configuration", emptyList())
+            val child = ScopedNativeFixture.run("b", "frozen", listOf("first"))
+            val foreignRow = runtimeStoreRun(foreignScope, foreignScope.stateDirectory, false)
+            var native = ScopedNativeFixture.export()
+            var calls = 0
+            val nativeFailure = IllegalStateException("original native result is unknown")
+            val result = runCatching {
+                custody.invoke("configuration", { native }, startupReceipt = { it }) {
+                    calls++
+                    native = when (scenario) {
+                        "foreign parallel row" -> ScopedNativeFixture.export(parent, child, foreignRow)
+                        "wrong child digest" -> ScopedNativeFixture.export(parent, ScopedNativeFixture.run("b", "different frozen", listOf("first")))
+                        "wrong child scope" -> ScopedNativeFixture.export(parent, ScopedNativeFixture.run("b", "frozen", listOf("other")))
+                        else -> ScopedNativeFixture.export(parent)
+                    }
+                    when (scenario) {
+                        "native exception" -> throw nativeFailure
+                        "empty reply" -> ""
+                        "incomplete cohort" -> JSONObject(ScopedNativeFixture.cohort(parent)).put("censusComplete", false).toString()
+                        else -> ScopedNativeFixture.cohort(parent, child)
+                    }
+                }
+            }
+            assertEquals(scenario, 1, calls)
+            assertEquals(scenario, nativeFailure.takeIf { scenario == "native exception" }, result.exceptionOrNull())
+            val active = custody.wire()
+            assertTrue(scenario, active.getBoolean("historyUnknown"))
+            assertFalse(scenario, active.has("currentStartRunNonces"))
+            assertEquals(scenario, 0, active.getJSONArray("originalObservedRuns").length())
+        }
     }
 
     @Test fun terminalProjectionRejectsUnmatchedOrIncompleteNativeRows() {
@@ -992,6 +1132,9 @@ internal object ScopedNativeFixture {
     fun export(vararg runs: org.json.JSONObject) = org.json.JSONObject()
         .put("contractVersion", "polaris-ts-auth-writer-retirement-v1").put("globalCleanupEvidence", "CleanupUnknown")
         .put("instances", org.json.JSONArray(runs.toList())).toString()
+    fun cohort(parent: JSONObject, vararg children: JSONObject) = JSONObject()
+        .put("contractVersion", "polaris-ts-startup-cohort-v1").put("censusComplete", true)
+        .put("parent", parent).put("initialChildren", org.json.JSONArray(children.toList())).toString()
     fun closedOwner(ledger: AndroidNativeAdmission, logical: String): Pair<AndroidNativeAdmission.Ticket, AndroidTailscaleStoreCustody> {
         val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Login, logical)
         check(ledger.enterBirth(ticket))

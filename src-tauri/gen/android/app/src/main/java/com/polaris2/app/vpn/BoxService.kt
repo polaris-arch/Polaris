@@ -292,7 +292,7 @@ class BoxService(
                         check(isStarting(attempt)) { "起核已被停核接管" }
                         SystemStart.requireLegacyAllowed(service)
                         observeNativeInput(attempt, server, config, { isStarting(attempt) }) {
-                            server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(),
+                            AndroidRuntimeTailscaleBridge.startMain(server, config, OverrideOptions(),
                                 runtimePersistenceHandler(attempt, server))
                         }
                         admitRuntimeProtocol(attempt, server) { isStarting(attempt) }
@@ -433,7 +433,7 @@ class BoxService(
                 // together. A HOT receipt committed since loadConfig must never be lost.
                 val persistence = runtimePersistenceHandler(attempt, server, expectedReloadConfig = config)
                 observeNativeInput(attempt, server, config, { isReloadCurrent(attempt, server) }) {
-                    server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(), persistence)
+                    AndroidRuntimeTailscaleBridge.startMain(server, config, OverrideOptions(), persistence)
                 }
                 try {
                     AndroidRuntimeTailscaleBridge.requireReloadRetirement(attempt)
@@ -530,7 +530,7 @@ class BoxService(
     /** Same operationLock as JNI. Digest/current lookups are outside the short observer gate. */
     private fun observeNativeInput(
         attempt: MainKernelAttempt<CommandServer>, server: CommandServer, config: String,
-        current: () -> Boolean, nativeCall: () -> Unit,
+        current: () -> Boolean, nativeCall: () -> String?,
     ) {
         val token = if (BuildConfig.DEBUG) runCatching {
             check(Thread.holdsLock(attempt.operationLock))
@@ -539,7 +539,8 @@ class BoxService(
         }.getOrNull() else null
         if (BuildConfig.DEBUG && token == null) runCatching { DebugAppliedInputs.witness.seal(attempt) }
         try {
-            checkNotNull(attempt.tailscaleStore).invoke(config, { AndroidTailscaleStoreCustody.export(server) }, nativeCall)
+            checkNotNull(attempt.tailscaleStore).invoke(config, { AndroidTailscaleStoreCustody.export(server) },
+                startupReceipt = { it }, action = nativeCall)
             if (token != null) runCatching {
                 DebugAppliedInputs.witness.returned(token, current() && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt))
             }

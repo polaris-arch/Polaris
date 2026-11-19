@@ -123,7 +123,7 @@ class RuntimeProtocolAdmissionTest {
     @Test fun everyNativeBirthQueriesBeforeReadinessAndFailureClosesOnlyItsAttempt() {
         val box = File("src/main/java/com/polaris2/app/vpn/BoxService.kt").readText()
         val start = box.substringAfter("private fun startKernel(").substringBefore("// ── CommandServerHandler")
-        val birth = start.indexOf("server.startOrReloadServiceWithRetryableRuntimePersistence(")
+        val birth = start.indexOf("AndroidRuntimeTailscaleBridge.startMain(")
         val admission = start.indexOf("admitRuntimeProtocol(attempt, server)")
         val ready = start.indexOf("state = ServiceState.Started")
         assertTrue(birth >= 0 && birth < admission && admission < ready)
@@ -131,7 +131,7 @@ class RuntimeProtocolAdmissionTest {
         assertTrue(start.contains("check(attempt.runtimeAdmission != null)"))
         assertTrue(start.contains("if (current) stopService(attempt)"))
         val reload = box.substringAfter("nativeReload = { server, config ->").substringBefore("setError =")
-        val nativeReload = reload.indexOf("startOrReloadServiceWithRetryableRuntimePersistence(")
+        val nativeReload = reload.indexOf("AndroidRuntimeTailscaleBridge.startMain(")
         val retirement = reload.indexOf("AndroidRuntimeTailscaleBridge.requireReloadRetirement(attempt)")
         val reloadAdmission = reload.indexOf("admitRuntimeProtocol(attempt, server)")
         assertTrue(nativeReload >= 0 && nativeReload < retirement && retirement < reloadAdmission)
