@@ -342,7 +342,19 @@ async fn malformed_remote_response_fails_and_leaves_cache_intact() {
 
 #[test]
 fn malformed_cache_file_is_rejected_wholesale() {
+    use crate::runtime::rule_resource_scheduler::catalog_refresh_due;
+
     let dir = tmp_dir("badcache");
+    let now = 1_700_000_000_001;
+    let due = |last_attempt| {
+        catalog_refresh_due(
+            &json!({}),
+            now,
+            cached_catalog_fetched_at(&dir),
+            last_attempt,
+        )
+    };
+    assert!(due(0));
     std::fs::create_dir_all(&dir).unwrap();
     let ok_items: Vec<Value> = (0..60)
         .map(|i| {
@@ -361,6 +373,7 @@ fn malformed_cache_file_is_rejected_wholesale() {
     let (items, at) = read_catalog_cache(&dir).expect("合法缓存必须可读");
     assert_eq!(items.len(), 60);
     assert_eq!(at, 1_700_000_000_000i64);
+    assert!(!due(0));
 
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -368,14 +381,17 @@ fn malformed_cache_file_is_rejected_wholesale() {
         .unwrap();
     let padding = CATALOG_CACHE_MAX_BYTES as u64 - file.metadata().unwrap().len();
     std::io::copy(&mut std::io::repeat(b' ').take(padding), &mut file).unwrap();
-    assert_eq!(read_catalog_cache(&dir).unwrap().0.len(), 60);
+    assert!(!due(0));
     std::io::copy(&mut std::io::repeat(b' ').take(1), &mut file).unwrap();
     drop(file);
     assert_eq!(cached_or_builtin_catalog(&dir).source, "builtin");
+    assert!(due(0));
+    assert!(!due(now));
 
     // schemaVersion 不符 → 整份作废（不做迁移）。
-    write(&json!({ "schemaVersion": 2, "fetchedAt": 1i64, "items": ok_items }));
+    write(&json!({ "schemaVersion": 2, "fetchedAt": at, "items": ok_items }));
     assert!(read_catalog_cache(&dir).is_none());
+    assert!(due(0));
 
     // fetchedAt 缺失 / 非正 → 作废（否则 UI 会显示 1970）。
     write(&json!({ "schemaVersion": 1, "items": ok_items }));
@@ -418,6 +434,7 @@ fn malformed_cache_file_is_rejected_wholesale() {
     std::fs::remove_file(catalog_cache_path(&dir)).unwrap();
     assert!(read_catalog_cache(&dir).is_none());
     assert_eq!(cached_or_builtin_catalog(&dir).source, "builtin");
+    assert!(due(0));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

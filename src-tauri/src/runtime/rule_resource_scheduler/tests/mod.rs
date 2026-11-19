@@ -419,31 +419,6 @@ fn catalog_refresh_shares_the_master_switch_and_interval() {
     assert!(catalog_refresh_due(&long, NOW, NOW - 25 * HOUR, 0));
 }
 
-#[test]
-fn cached_catalog_fetched_at_reads_zero_on_any_defect() {
-    // 目录不存在 / 文件不是 JSON / 无 fetchedAt / fetchedAt 非正整数 → 一律 0（=立即到期）。
-    // 这是「宁可多刷一次，也不因缓存损坏永久停刷」的取向。
-    let dir = std::env::temp_dir().join(format!("polaris-cat-{}", now_ms()));
-    assert_eq!(cached_catalog_fetched_at(&dir), 0, "目录不存在");
-    std::fs::create_dir_all(&dir).unwrap();
-    for (body, why) in [
-        ("not json", "非 JSON"),
-        ("{}", "无 fetchedAt"),
-        (r#"{"fetchedAt":"x"}"#, "fetchedAt 非数"),
-        (r#"{"fetchedAt":-1}"#, "fetchedAt 负数"),
-    ] {
-        std::fs::write(dir.join(CATALOG_CACHE_FILE), body).unwrap();
-        assert_eq!(cached_catalog_fetched_at(&dir), 0, "{why}");
-    }
-    std::fs::write(
-        dir.join(CATALOG_CACHE_FILE),
-        r#"{"fetchedAt":1700000000000}"#,
-    )
-    .unwrap();
-    assert_eq!(cached_catalog_fetched_at(&dir), 1_700_000_000_000);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 /* ── 接线守卫（变异锁）：纯函数全对、但没人调它 = 用户拿不到刷新 ───────────────── */
 
 /// 取具名函数体（从签名起到下一个同缩进的 `\n    }` 为止，够本文件用）。
@@ -464,6 +439,7 @@ fn scheduler_actually_wires_the_catalog_refresh_leg() {
         "每轮更新必须带上资源库目录刷新（上游 RuleResourceScheduler.ts:110-123）"
     );
     let leg = fn_body("async fn refresh_catalog_if_due(");
+    assert!(leg.contains("cached_catalog_fetched_at(res_dir)"));
     assert!(
         leg.contains("catalog_refresh_due("),
         "变异锁：删掉节流判定 = 每 30min 白打一次 GitHub 三跳"
@@ -561,19 +537,6 @@ fn catalog_refresh_reads_disk_before_taking_the_lock() {
     assert!(
         !in_lock.contains("cached_catalog_fetched_at("),
         "持锁期间又读了一次盘"
-    );
-}
-
-#[test]
-fn catalog_cache_file_name_mirrors_rules_rs() {
-    // 本文件只读 peek `fetchedAt`，文件名是 `commands/rules/resources.rs` 那份写入口的镜像。
-    // 那边改名而这边没跟 → 节流基准恒 0 → 每轮重打远端。此断言让重命名当场转红。
-    let rules = crate_code("commands/rules/resources.rs");
-    assert!(
-        rules.contains(&format!(
-            r#"CATALOG_CACHE_FILE: &str = "{CATALOG_CACHE_FILE}""#
-        )),
-        "commands/rules/resources.rs 的 catalog 缓存文件名已变，本文件的只读镜像常量必须同步"
     );
 }
 

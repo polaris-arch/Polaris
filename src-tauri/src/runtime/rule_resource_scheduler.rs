@@ -33,7 +33,9 @@ use polaris_config_engine::user_config::builtin_geo_rulesets::{
     builtin_geo_rulesets, builtin_id_for,
 };
 
-use crate::commands::rules::{ProgressMode, RegisteredResourceBatch, ResourceChanges};
+use crate::commands::rules::{
+    cached_catalog_fetched_at, ProgressMode, RegisteredResourceBatch, ResourceChanges,
+};
 use crate::runtime::subscription_scheduler::{
     elapsed_or_clock_rollback, now_ms, rfc3339_to_epoch_ms, BackoffTracker,
 };
@@ -44,15 +46,6 @@ const STARTUP_DELAY_MS: u64 = 12_000; // 启动延迟，错开订阅调度器的
 const BACKOFF_BASE_MS: u64 = 10 * 60_000; // 退避基数 10 分钟
 const BACKOFF_MAX_MS: u64 = 6 * 60 * 60_000; // 退避上限 6 小时
 const DEFAULT_INTERVAL_HOURS: u64 = 12;
-
-/// 资源库目录缓存文件名 —— **只读镜像** `commands::rules` 的私有常量 `CATALOG_CACHE_FILE`
-/// （同在 `<userData>/rule-resource/`）。
-///
-/// 这里只 peek `fetchedAt` 做节流，**写入仍只在 `commands/rules.rs` 一处**（本调度器不碰缓存落盘）。
-/// 为什么不改调 `rule_resources_get_catalog` 拿 `fetchedAt`：那个 command 刻意恒返内置精选表
-/// （`fetchedAt: null`，理由见其文档「内置 tab 语义」），拿它节流等于每轮都判到期 —— 恰是本节流
-/// 要避免的每 30min 白打 GitHub。两处文件名漂移由单测 `catalog_cache_file_name_mirrors_rules_rs` 守。
-const CATALOG_CACHE_FILE: &str = "catalog.json";
 
 /// 纯决策：本轮自动更新的间隔（ms）；`None` = **整条自动更新腿本轮都不跑**。
 ///
@@ -113,17 +106,6 @@ pub fn catalog_refresh_due(
     };
     let last = cached_fetched_at_ms.max(last_attempt_ms);
     elapsed_or_clock_rollback(now_ms, last, interval_ms)
-}
-
-/// peek 磁盘 catalog 缓存的 `fetchedAt`（epoch ms）——**只读**，任何一环不过即 0（= 没这条记录，
-/// 由 [`catalog_refresh_due`] 判成立即到期）。不复刻 `commands::rules` 那套逐条自洽校验：本函数
-/// 只为节流取一个时间戳，缓存内容合不合法由那边的读取腿把关（它才是消费者）。
-fn cached_catalog_fetched_at(res_dir: &Path) -> u64 {
-    std::fs::read(res_dir.join(CATALOG_CACHE_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-        .and_then(|v| v.get("fetchedAt").and_then(Value::as_u64))
-        .unwrap_or(0)
 }
 
 /// 纯决策：从 config + now + 退避状态 + 「文件在不在」选出本轮该重下载的资源 id（声明序）。

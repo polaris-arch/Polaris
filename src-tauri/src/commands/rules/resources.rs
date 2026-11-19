@@ -510,6 +510,11 @@ fn read_catalog_cache(res_dir: &Path) -> Option<(Vec<RuleResourceCatalogItem>, i
     (items.len() >= CATALOG_MIN_ITEMS).then_some((items, fetched_at))
 }
 
+/// A missing or invalid catalog contributes no freshness to the scheduler.
+pub(crate) fn cached_catalog_fetched_at(res_dir: &Path) -> u64 {
+    read_catalog_cache(res_dir).map_or(0, |(_, fetched_at)| fetched_at as u64)
+}
+
 /// 原子写缓存（唯一后缀 tmp → rename）。
 ///
 /// 唯一后缀（pid + 单调序）而非固定名：本 command 无 inflight 保护、IPC 层无去抖，多窗口/后台调度腿

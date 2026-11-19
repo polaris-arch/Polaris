@@ -14,7 +14,7 @@ pub use crud::{app_presets_list, rules_add, rules_delete, rules_reorder, rules_u
 pub use icons::{rule_resources_icon_galleries, rule_resources_refresh_icon_galleries};
 pub use network_profiles::{network_profile_builtin_dhcp_status, network_profile_resolved_sources};
 pub(crate) use resources::{
-    remove_builtin_rule_resource_files, remove_rule_resource_file,
+    cached_catalog_fetched_at, remove_builtin_rule_resource_files, remove_rule_resource_file,
     rule_resource_file_is_referenced, rule_resources_redownload_silent,
     rule_resources_update_builtin_silent, ProgressMode, RegisteredResourceBatch, ResourceChanges,
 };
