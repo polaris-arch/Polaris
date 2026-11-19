@@ -44,17 +44,6 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push') }}
 
 jobs:
-  pc_runtime_release_policy:
-    name: Source-first release policy
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '26'
-      - name: Verify fail-closed source-first release policy
-        run: node --test scripts/assert-pc-runtime-release.test.mjs
-
   classify:
     name: classify release impact
     runs-on: ubuntu-22.04
@@ -119,11 +108,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y squashfs-tools
 
-      - name: Test release impact classifier
+      - name: Test release contracts
         # 走 gate-node-test.sh 而不是直接 `node --test`：后者指向空目录/文件被移走/错误
         # cwd 时是 rc=0 静默判绿（scripts/gate-node-test.sh 顶部注释有实测）；本机全量门单
         # （vault SoT §12.3c）调用的是同一份脚本，两处判据共用一份实现，不各自漂移。
-        run: bash scripts/gate-node-test.sh
+        run: test -f scripts/assert-pc-runtime-release.test.mjs && bash scripts/gate-node-test.sh
 
       - name: Classify changed paths
         id: impact
@@ -354,12 +343,11 @@ jobs:
 
   gate:
     name: release risk gate
-    needs: [classify, preflight, package, android, apple, pc_runtime_release_policy]
+    needs: [classify, preflight, package, android, apple]
     if: always()
     runs-on: ubuntu-22.04
     env:
       CLASSIFY_RESULT: ${{ needs.classify.result }}
-      PC_RUNTIME_POLICY_RESULT: ${{ needs.pc_runtime_release_policy.result }}
       PREFLIGHT_REQUIRED: ${{ needs.classify.outputs.preflight }}
       PREFLIGHT_RESULT: ${{ needs.preflight.result }}
       PACKAGE_REQUIRED: ${{ needs.classify.outputs.has_package }}
@@ -382,8 +370,6 @@ jobs:
           fi
           [ "$CLASSIFY_RESULT" = success ] || {
             echo "::error::影响分类失败：$CLASSIFY_RESULT"; exit 1; }
-          [ "$PC_RUNTIME_POLICY_RESULT" = success ] || {
-            echo "::error::PC runtime 发布阻断策略未通过：$PC_RUNTIME_POLICY_RESULT"; exit 1; }
           # 未登记的影响面（落在 crates/ 或 src-tauri/ 内、两张登记表都查不到的 scope）当场红并点名。
           # 为什么这条门开在这里，而不是只靠 ui.yml 的 vitest 完备性门：
           #   1) 独立性 —— ui.yml 挂了、被 skip、或 required check 集合被改，那条门就没牙；

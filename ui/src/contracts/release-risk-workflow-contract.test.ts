@@ -129,10 +129,15 @@ esac
     }
   });
 
-  it('路径判据由仓库脚本持有，最终 required check 始终运行', () => {
-    expect(risk).toContain('node scripts/classify-ci-impact.mjs');
-    expect(risk).toContain('name: release risk gate');
-    expect(risk).toMatch(/\n  gate:[\s\S]*?\n    if: always\(\)/);
+  it('发布合同和路径判据共用 classify，最终 required check 始终验收它的结果', () => {
+    const classify = jobSection(risk, 'classify', 'release-risk.yml');
+    expect(classify).toContain('run: test -f scripts/assert-pc-runtime-release.test.mjs && bash scripts/gate-node-test.sh');
+    expect(classify).toContain('node scripts/classify-ci-impact.mjs');
+    const gate = risk.slice(risk.indexOf('\n  gate:'));
+    expect(gate).toContain('name: release risk gate');
+    expect(gate).toContain('if: always()');
+    expect(gate).toContain('CLASSIFY_RESULT: ${{ needs.classify.result }}');
+    expect(hasStrictResultGate(gate, 'CLASSIFY_RESULT')).toBe(true);
   });
 
   it('gate 对「未登记影响面」有牙：分类器自曝的 scope 必须当场红并点名', () => {
