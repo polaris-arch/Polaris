@@ -197,6 +197,7 @@ impl RuntimeConfigService for Mock {
         request: Request<daemon::ApplyRuntimeConfigRequest>,
     ) -> Result<Response<daemon::RuntimeConfigOperation>, Status> {
         self.check(&request)?;
+        assert_eq!(request.metadata().get("grpc-timeout").unwrap(), "20000000u");
         assert_eq!(request.into_inner(), apply_request());
         if self.stall_apply {
             std::future::pending::<()>().await;
