@@ -281,6 +281,7 @@ pub(super) struct ApiProjectionPlan {
     owner: std::sync::Weak<super::super::prerequisite::ReadyMainCore>,
     original: String,
     current: String,
+    pub(super) targets: Arc<BTreeMap<String, String>>,
 }
 #[derive(Clone)]
 pub(super) struct ApiSavedProjection {
@@ -290,6 +291,60 @@ pub(super) struct ApiSavedProjection {
     active: daemon::RuntimeIdentity,
     epoch: Arc<ApiRelayEpoch>,
     endpoint: ApiEndpoint,
+    targets: Arc<BTreeMap<String, String>>,
+}
+
+impl ApiSavedProjection {
+    pub(super) fn after_graph_commit(
+        baseline: &RuntimeConfigBaseline,
+        core: &Arc<super::super::prerequisite::ReadyMainCore>,
+        pending: &PendingOperation,
+        current: String,
+        active: &daemon::RuntimeIdentity,
+    ) -> Option<Self> {
+        if core.generation != pending.generation || !core.is_committed() {
+            return None;
+        }
+        let endpoint = baseline.management.as_ref()?;
+        if let Some(handoff) = &pending.api_handoff {
+            let proof = handoff.published_projection()?;
+            return (proof.current == current
+                && &proof.active == active
+                && &proof.endpoint == endpoint
+                && Arc::ptr_eq(&proof.epoch, &baseline.api_epoch)
+                && proof.owner.ptr_eq(&Arc::downgrade(core)))
+            .then_some(proof);
+        }
+        Some(Self {
+            owner: Arc::downgrade(core),
+            original: core.saved_digest.clone(),
+            current,
+            active: active.clone(),
+            epoch: baseline.api_epoch.clone(),
+            endpoint: endpoint.clone(),
+            targets: pending.targets.clone(),
+        })
+    }
+}
+
+impl RuntimeConfigBaseline {
+    fn matches_ready_api_view(&self, view: &super::super::prerequisite::ReadyMainAPIView) -> bool {
+        !self.api_epoch.is_closed()
+            && Arc::ptr_eq(&view.epoch, &self.api_epoch)
+            && self
+                .management
+                .as_ref()
+                .is_some_and(|e| e.port == view.port && e.secret == view.secret)
+            && match (&view.active, &self.api_saved_projection) {
+                (None, None) => true,
+                (Some(active), Some(p)) => {
+                    &p.active == active
+                        && p.current == view.saved_digest
+                        && Arc::ptr_eq(&p.targets, &view.targets)
+                }
+                _ => false,
+            }
+    }
 }
 struct Verifier {
     key: Mutex<[u8; 32]>,
@@ -387,6 +442,7 @@ impl ApiChannelHandoff {
             active,
             epoch: self.next_epoch.clone(),
             endpoint: self.endpoint.clone(),
+            targets: p.targets.clone(),
         })
     }
 }
@@ -553,7 +609,7 @@ impl ProxyRuntime {
         if core.generation != baseline.generation || !core.is_committed() {
             return None;
         }
-        let original = if let Some(p) = baseline.api_saved_projection.as_ref() {
+        let (original, targets) = if let Some(p) = baseline.api_saved_projection.as_ref() {
             if p.current != old_digest
                 || !p
                     .owner
@@ -564,17 +620,18 @@ impl ProxyRuntime {
             {
                 return None;
             }
-            p.original.clone()
+            (p.original.clone(), p.targets.clone())
         } else {
             if core.saved_digest != old_digest {
                 return None;
             }
-            old_digest
+            (old_digest, core.targets.clone())
         };
         Some(ApiProjectionPlan {
             owner: Arc::downgrade(&core),
             original,
             current: new_digest,
+            targets,
         })
     }
     pub(in crate::runtime::proxy) async fn runtime_management_client(
@@ -659,7 +716,7 @@ impl ProxyRuntime {
             return None;
         }
         let endpoint = b.management.as_ref()?;
-        let active = if let Some(p) = b.api_saved_projection.as_ref() {
+        let (active, targets) = if let Some(p) = b.api_saved_projection.as_ref() {
             if p.original != core.saved_digest
                 || p.current != current_saved
                 || !p
@@ -671,7 +728,7 @@ impl ProxyRuntime {
             {
                 return None;
             }
-            Some(p.active.clone())
+            (Some(p.active.clone()), p.targets.clone())
         } else {
             if current_saved != core.saved_digest
                 || endpoint.port != core.status.clash_api_port
@@ -679,7 +736,7 @@ impl ProxyRuntime {
             {
                 return None;
             }
-            None
+            (None, core.targets.clone())
         };
         Some(super::super::prerequisite::ReadyMainAPIView {
             port: endpoint.port,
@@ -687,6 +744,7 @@ impl ProxyRuntime {
             saved_digest: current_saved.into(),
             epoch: b.api_epoch.clone(),
             active,
+            targets,
         })
     }
     pub(in crate::runtime::proxy) fn api_ticket_view_is_current(
@@ -703,18 +761,7 @@ impl ProxyRuntime {
             return view.is_none();
         };
         let Some(v) = view else { return false };
-        !b.api_epoch.is_closed()
-            && Arc::ptr_eq(&v.epoch, &b.api_epoch)
-            && b.management
-                .as_ref()
-                .is_some_and(|e| e.port == port && e.secret == secret)
-            && match &v.active {
-                None => b.api_saved_projection.is_none(),
-                Some(active) => b
-                    .api_saved_projection
-                    .as_ref()
-                    .is_some_and(|p| &p.active == active),
-            }
+        v.port == port && v.secret == secret && b.matches_ready_api_view(v)
     }
     pub(in crate::runtime::proxy) fn managed_api_call(
         &self,
@@ -767,17 +814,7 @@ impl ProxyRuntime {
         let endpoint = b.management.as_ref().ok_or(())?;
         if let Some(ticket) = ticket {
             let view = ticket.api_view.as_ref().ok_or(())?;
-            if !Arc::ptr_eq(&view.epoch, &b.api_epoch)
-                || view.port != endpoint.port
-                || view.secret != endpoint.secret
-                || match &view.active {
-                    None => b.api_saved_projection.is_some(),
-                    Some(active) => b
-                        .api_saved_projection
-                        .as_ref()
-                        .is_none_or(|p| &p.active != active),
-                }
-            {
+            if !b.matches_ready_api_view(view) {
                 return Err(());
             }
         }
@@ -1034,6 +1071,7 @@ impl ProxyRuntime {
             // Endpoint, epoch and the verified API-only view are one publication.
             // A normal producer must never see the new tuple without its alias.
             b.api_saved_projection = Some(projection);
+            b.api_handed_off = true;
             b.management = Some(h.endpoint.clone());
             b.api_epoch = h.next_epoch.clone();
             b.control = Some(Arc::new(client));

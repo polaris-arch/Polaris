@@ -1313,6 +1313,10 @@ pub(super) fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> Pend
         ..Default::default()
     };
     let tailnet_bindings = rt.tailnet_bindings(&raw, &generated);
+    let targets = Arc::new(super::super::prerequisite::final_targets(
+        &typed,
+        &serde_json::to_value(&generated).unwrap(),
+    ));
     *rt.status.write().unwrap() = crate::runtime::proxy::ProxyStatus {
         running: true,
         main_generation: generation,
@@ -1333,6 +1337,7 @@ pub(super) fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> Pend
         candidate: raw,
         typed,
         generated,
+        targets,
         deps,
         plan,
         network_canary: None,
@@ -2033,7 +2038,7 @@ fn tailnet_restart_choice_rejects_stopped_busy_and_stale_owners() {
     }
 }
 
-fn committed_ts_receipt(pending: &PendingOperation) -> daemon::RuntimeConfigOperation {
+pub(super) fn committed_ts_receipt(pending: &PendingOperation) -> daemon::RuntimeConfigOperation {
     let mut active = pending.plan.expected.clone().unwrap();
     active.applied_revision += 1;
     active.effective_digest = pending.plan.candidate_digest.clone();

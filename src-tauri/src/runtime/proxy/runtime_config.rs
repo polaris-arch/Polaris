@@ -284,6 +284,7 @@ pub(super) struct RuntimeConfigBaseline {
     control: Option<Arc<SingBoxApiClient>>,
     api_epoch: Arc<ApiRelayEpoch>,
     api_saved_projection: Option<api_handoff::ApiSavedProjection>,
+    api_handed_off: bool,
     pub(super) api_log_handoff: Option<super::core_log::CoreLogHandoff>,
     pub(super) generation: u64,
     committed_transaction: Option<String>,
@@ -306,9 +307,7 @@ impl RuntimeConfigBaseline {
     }
 
     pub(super) fn core_log_relay_initial_history(&self, generation: u64) -> bool {
-        self.generation == generation
-            && !self.api_epoch.is_closed()
-            && self.api_saved_projection.is_none()
+        self.generation == generation && !self.api_epoch.is_closed() && !self.api_handed_off
     }
 }
 
@@ -567,6 +566,7 @@ struct PendingOperation {
     candidate: Value,
     typed: UserConfig,
     generated: SingBoxConfig,
+    targets: Arc<BTreeMap<String, String>>,
     deps: GenerateConfigDeps,
     plan: daemon::RuntimeConfigPlan,
     network_canary: Option<polaris_config_engine::builder::network_env::NetworkCanaryPlan>,
@@ -1340,6 +1340,7 @@ impl ProxyRuntime {
                 control: None,
                 api_epoch: Arc::default(),
                 api_saved_projection: None,
+                api_handed_off: false,
                 api_log_handoff: None,
                 generation,
                 committed_transaction: None,
@@ -2427,6 +2428,7 @@ impl ProxyRuntime {
             Ok(intents) => intents,
             Err(_) => return decline(RuntimeApplyResult::status("rejected")),
         };
+        let targets = Arc::new(super::prerequisite::final_targets(&typed, &content));
         let config_content = match serde_json::to_string(&content) {
             Ok(value) => value,
             Err(_) => return decline(RuntimeApplyResult::status("rejected")),
@@ -2582,7 +2584,10 @@ impl ProxyRuntime {
                 );
                 return decline(result);
             }
-            let Some(projection) = self.api_saved_projection_for(&candidate, &baseline) else {
+            let Some(projection) = self
+                .api_saved_projection_for(&candidate, &baseline)
+                .filter(|projection| projection.targets == targets)
+            else {
                 let result = restart_choice(
                     &candidate,
                     "structuralChange",
@@ -2677,6 +2682,7 @@ impl ProxyRuntime {
             candidate,
             typed,
             generated,
+            targets,
             deps,
             plan,
             network_canary,
@@ -3161,6 +3167,7 @@ impl ProxyRuntime {
         let mut committed_tailnet_token = None;
         let mut tailnet_context_changed = false;
         let mut host_execution = None;
+        let saved_digest = super::prerequisite::digest(&pending.candidate).ok();
         let publish = || {
             if !self.protected_runtime_publication_current(pending) {
                 return false;
@@ -3174,14 +3181,15 @@ impl ProxyRuntime {
             let Ok(mut startup) = self.startup_snapshot.write() else {
                 return false;
             };
+            let ready = self.ready_main.read().ok().and_then(|ready| ready.clone());
             let Ok(mut baseline) = self.runtime_config_baseline.write() else {
                 return false;
             };
-            if !baseline.as_ref().is_some_and(|baseline| {
+            let Some(previous) = baseline.as_ref().filter(|baseline| {
                 baseline.generation == pending.generation && baseline.pairing == pending.pairing
-            }) {
+            }) else {
                 return false;
-            }
+            };
             let Ok(mut binding_state) = self.runtime_binding_state.lock() else {
                 return false;
             };
@@ -3238,7 +3246,7 @@ impl ProxyRuntime {
                 &pending.deps,
             ));
             *startup = Some(pending.candidate.clone());
-            let protected_physical_root = baseline.as_ref().and_then(|previous| {
+            let protected_physical_root = (|| {
                 let owner = previous.protected_physical_root.as_ref()?;
                 if protected_generated_policy_compatible(&previous.generated, &pending.generated) {
                     Some(Arc::clone(owner))
@@ -3248,30 +3256,27 @@ impl ProxyRuntime {
                     owner.revoke();
                     None
                 }
+            })();
+            let api_saved_projection = active.as_ref().and_then(|active| {
+                api_handoff::ApiSavedProjection::after_graph_commit(
+                    previous,
+                    ready.as_ref()?,
+                    pending,
+                    saved_digest.clone()?,
+                    active,
+                )
             });
             *baseline = Some(RuntimeConfigBaseline {
-                management: baseline.as_ref().and_then(|b| b.management.clone()),
-                control: baseline.as_ref().and_then(|b| b.control.clone()),
-                api_epoch: baseline
-                    .as_ref()
-                    .map(|b| b.api_epoch.clone())
-                    .unwrap_or_default(),
-                api_saved_projection: pending
-                    .api_handoff
-                    .as_ref()
-                    .and_then(|h| h.published_projection())
-                    .or_else(|| {
-                        baseline
-                            .as_ref()
-                            .and_then(|baseline| baseline.api_saved_projection.clone())
-                    }),
-                api_log_handoff: baseline.as_ref().and_then(|b| b.api_log_handoff.clone()),
+                management: previous.management.clone(),
+                control: previous.control.clone(),
+                api_epoch: previous.api_epoch.clone(),
+                api_saved_projection,
+                api_handed_off: previous.api_handed_off,
+                api_log_handoff: previous.api_log_handoff.clone(),
                 generation: pending.generation,
-                committed_transaction: transaction_id.map(str::to_owned).or_else(|| {
-                    baseline
-                        .as_ref()
-                        .and_then(|baseline| baseline.committed_transaction.clone())
-                }),
+                committed_transaction: transaction_id
+                    .map(str::to_owned)
+                    .or_else(|| previous.committed_transaction.clone()),
                 observed_active: active.clone(),
                 observed_control_revision: control_revision,
                 pairing: pending.pairing.clone(),
@@ -3279,7 +3284,7 @@ impl ProxyRuntime {
                 protected_physical_root,
                 deps: pending.deps.clone(),
                 generated: pending.generated.clone(),
-                doh_blocked: baseline.as_ref().is_some_and(|b| b.doh_blocked),
+                doh_blocked: previous.doh_blocked,
             });
             if let Ok(mut status) = self.status.write() {
                 status.mixed_port = pending

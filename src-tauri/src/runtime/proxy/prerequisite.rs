@@ -144,7 +144,7 @@ pub(super) struct ReadyMainCore {
     pub(super) saved_digest: String,
     emission_digest: String,
     diagnostic_secret_keys: BTreeSet<String>,
-    targets: BTreeMap<String, String>,
+    pub(super) targets: Arc<BTreeMap<String, String>>,
     pub(super) status: ProxyStatus,
     pub(super) api_secret: String,
     probe_ports: Vec<u16>,
@@ -169,6 +169,7 @@ pub(super) struct ReadyMainAPIView {
     pub(super) saved_digest: String,
     pub(super) epoch: Arc<super::runtime_config::api_handoff::ApiRelayEpoch>,
     pub(super) active: Option<polaris_singbox_grpc::daemon::RuntimeIdentity>,
+    pub(super) targets: Arc<BTreeMap<String, String>>,
 }
 
 /// Producer-only fields; bools, events and cached status cannot mint this value.
@@ -205,12 +206,21 @@ impl ReadyMainTicket {
         self.core.status.start_time
     }
     pub(crate) fn target_tag(&self, id: &str) -> Option<&str> {
-        self.binding
-            .target_ids
-            .iter()
-            .any(|target| target == id)
-            .then(|| self.core.targets.get(id).map(String::as_str))
-            .flatten()
+        if !self.binding.target_ids.iter().any(|target| target == id) {
+            return None;
+        }
+        let targets = self
+            .api_view
+            .as_ref()
+            .map_or(&self.core.targets, |view| &view.targets);
+        let tag = targets.get(id)?;
+        // A graph receipt cannot replace the original native TS state claim.
+        if self.binding.action == NormalMainAction::TailscaleLogin
+            && self.core.targets.get(id) != Some(tag)
+        {
+            return None;
+        }
+        Some(tag)
     }
     pub(crate) fn request_id(&self) -> &str {
         &self.binding.request_id
@@ -431,7 +441,7 @@ pub(super) fn merge_tailscale_candidate(
     Ok(())
 }
 
-fn final_targets(effective: &UserConfig, emitted: &Value) -> BTreeMap<String, String> {
+pub(super) fn final_targets(effective: &UserConfig, emitted: &Value) -> BTreeMap<String, String> {
     let tags: BTreeSet<&str> = ["outbounds", "endpoints"]
         .iter()
         .flat_map(|key| {
@@ -533,7 +543,7 @@ fn check_binding(
         .binding
         .target_ids
         .iter()
-        .any(|id| !ticket.core.targets.contains_key(id))
+        .any(|id| ticket.target_tag(id).is_none())
     {
         return Err(MainPrerequisiteError::TargetMissing);
     }
@@ -1232,6 +1242,8 @@ impl ProxyRuntime {
         port: u16,
         secret: String,
     ) -> (Arc<Self>, ReadyMainTicket, crate::test_support::TestDir) {
+        use polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG;
+
         let (runtime, directory) = tests::runtime();
         // This fixture reaches the real config builder and deferred Taildrop
         // consumer. Its selected local node and emitted topology must agree;
@@ -1258,13 +1270,23 @@ impl ProxyRuntime {
             &deps,
         )
         .unwrap();
+        let mut status = original.status.clone();
+        status.mixed_port = generated
+            .inbounds
+            .iter()
+            .find(|inbound| inbound.tag == MIXED_INBOUND_TAG && inbound.type_field == "mixed")
+            .and_then(|inbound| inbound.listen_port)
+            .unwrap_or(0);
+        *runtime.status.write().unwrap() = status.clone();
+        *runtime.switch_snapshot.write().unwrap() =
+            Some(Self::build_switch_snapshot(&typed, &generated, &deps));
         runtime
             .capture_ready_main(
                 runtime.core_generation(),
                 &saved,
                 &typed,
                 &serde_json::to_value(&generated).unwrap(),
-                &original.status,
+                &status,
             )
             .unwrap();
         let core = runtime.ready_main.read().unwrap().clone().unwrap();
@@ -1473,7 +1495,7 @@ impl ProxyRuntime {
                 &serde_json::to_value(effective)
                     .map_err(|error| StartError::from(error.to_string()))?,
             ),
-            targets: final_targets(effective, emitted),
+            targets: Arc::new(final_targets(effective, emitted)),
             status: status.clone(),
             api_secret: crate::runtime::management_api::clash_api_secret_in(saved),
             probe_ports: self

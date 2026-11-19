@@ -27,7 +27,7 @@ fn ticket() -> ReadyMainTicket {
         saved_digest: digest(&saved).unwrap(),
         emission_digest: "final-emission".into(),
         diagnostic_secret_keys: BTreeSet::new(),
-        targets: BTreeMap::from([("second".into(), "Second".into())]),
+        targets: Arc::new(BTreeMap::from([("second".into(), "Second".into())])),
         status: ProxyStatus {
             running: true,
             clash_api_port: 9876,
@@ -71,6 +71,37 @@ fn final_emission_includes_unselected_ts_and_excludes_peeled_targets() {
         ),
         Err(MainPrerequisiteError::TargetMissing)
     );
+    let projected = Arc::new(final_targets(
+        &parsed,
+        &serde_json::json!({"endpoints":[{"type":"tailscale","tag":"First"}]}),
+    ));
+    assert_eq!(projected.get("first").map(String::as_str), Some("First"));
+    ticket.api_view = Some(ReadyMainAPIView {
+        port: ticket.core.status.clash_api_port,
+        secret: ticket.core.api_secret.clone(),
+        saved_digest: ticket.binding.saved_digest.clone(),
+        epoch: Arc::default(),
+        active: None,
+        targets: projected,
+    });
+    assert_eq!(ticket.target_tag("first"), None, "no startup TS claim");
+    ticket.binding.target_ids = vec!["second".into()];
+    assert_eq!(
+        ticket.target_tag("second"),
+        None,
+        "removed from the running graph"
+    );
+    assert_eq!(
+        check_binding(
+            &ticket,
+            7,
+            true,
+            false,
+            &ticket.binding.saved_digest,
+            Some(&ticket.core)
+        ),
+        Err(MainPrerequisiteError::TargetMissing)
+    );
 }
 
 #[test]
@@ -98,7 +129,7 @@ fn ready_capture_uses_final_effective_ids_after_same_name_target_is_peeled() {
     let core = runtime.ready_main.read().unwrap().clone().unwrap();
     assert_eq!(
         core.targets,
-        BTreeMap::from([("second".into(), "X".into())])
+        Arc::new(BTreeMap::from([("second".into(), "X".into())]))
     );
     assert!(
         !core.targets.contains_key("first"),
@@ -502,7 +533,7 @@ pub(super) fn ready_for_at(
         saved_digest: digest(&saved).unwrap(),
         emission_digest: "observed-final-emission".into(),
         diagnostic_secret_keys: BTreeSet::new(),
-        targets: BTreeMap::new(),
+        targets: Arc::default(),
         status: status.clone(),
         api_secret,
         probe_ports: vec![],
@@ -1502,6 +1533,7 @@ async fn bound_selector_epoch_cancel_unwinds_actual_rpc_before_reused_tuple_can_
             saved_digest: ticket.binding.saved_digest.clone(),
             epoch: epoch.clone(),
             active: None,
+            targets: ticket.core.targets.clone(),
         });
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (resume, resumed) = tokio::sync::oneshot::channel();

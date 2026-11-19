@@ -163,7 +163,7 @@ async fn cancelled_join_waiter_keeps_owned_task_for_retry() {
 
 #[derive(Clone)]
 struct ReadyApiFixture {
-    caps: daemon::RuntimeCapabilities,
+    caps: Arc<std::sync::RwLock<daemon::RuntimeCapabilities>>,
 }
 #[polaris_singbox_grpc::tonic::async_trait]
 impl daemon::runtime_config_service_server::RuntimeConfigService for ReadyApiFixture {
@@ -175,7 +175,7 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for ReadyApiFix
         polaris_singbox_grpc::tonic::Status,
     > {
         Ok(polaris_singbox_grpc::tonic::Response::new(
-            self.caps.clone(),
+            self.caps.read().unwrap().clone(),
         ))
     }
     async fn plan_runtime_config(
@@ -231,7 +231,7 @@ impl daemon::runtime_config_service_server::RuntimeConfigService for ReadyApiFix
 
 async fn ready_api_peer(
     listener: tokio::net::TcpListener,
-    caps: daemon::RuntimeCapabilities,
+    caps: Arc<std::sync::RwLock<daemon::RuntimeCapabilities>>,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<(), polaris_singbox_grpc::tonic::transport::Error>>,
@@ -279,7 +279,7 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
             .as_ref()
             .map_or(old_port, |l| l.local_addr().unwrap().port());
         let mut peers = Vec::new();
-        let (rt, mut old_ticket, _directory) =
+        let (rt, mut startup_ticket, _directory) =
             ProxyRuntime::ready_api_commit_fixture_for_test(old_port, "old".into());
         let old = rt.config.current().unwrap();
         *rt.current_config.write().unwrap() = Some(old.clone());
@@ -292,8 +292,8 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
         )
         .unwrap();
         let caps = super::super::tests::paired_capabilities();
-        let active = caps.active.clone().unwrap();
         let pairing = observe_runtime_pairing(&caps).unwrap();
+        let caps = Arc::new(std::sync::RwLock::new(caps));
         let generation = rt.core_generation();
         rt.capture_runtime_config_baseline(generation, deps, generated, typed, pairing);
         let core = rt.ready_main.read().unwrap().clone().unwrap();
@@ -313,9 +313,62 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
                 .unwrap();
         old_control.get_runtime_capabilities().await.unwrap();
         rt.bind_runtime_api_control(generation, Arc::new(old_control));
-        old_ticket.api_view = rt.api_view_for_ready_ticket(&core, &core.saved_digest);
-        assert!(old_ticket.api_view.is_some());
-        assert!(rt.check_ready_main(&old_ticket).is_ok());
+        startup_ticket.api_view = rt.api_view_for_ready_ticket(&core, &core.saved_digest);
+        assert!(startup_ticket.api_view.is_some());
+        assert!(rt.check_ready_main(&startup_ticket).is_ok());
+        let before_graph = old;
+        let mut old = before_graph.clone();
+        old["logLevel"] = serde_json::json!("debug");
+        rt.config
+            .save_full_deferred_cleanup(&before_graph, &old)
+            .unwrap();
+        let old = rt.config.current().unwrap();
+        let status = rt.status();
+        let mut pending = super::super::tests::ts_pending_raw_fixture(&rt, old.clone());
+        pending.saved_revision = Some(rt.config.saved_revision());
+        *rt.status.write().unwrap() = status;
+        let action = || {
+            let binding = ActionBinding::new(
+                NormalMainAction::TailscaleLogin,
+                "verify-current-ts".into(),
+                &old,
+                vec!["taildrop-node".into()],
+                None,
+            )
+            .unwrap();
+            rt.await_normal_main(binding)
+        };
+        let saved_digest = super::super::super::prerequisite::digest(&old).unwrap();
+        assert!(rt.api_view_for_ready_ticket(&core, &saved_digest).is_none());
+        let receipt = super::super::tests::committed_ts_receipt(&pending);
+        let mut wrong = receipt.clone();
+        wrong.candidate_digest = "other-graph".into();
+        assert_eq!(
+            rt.settle_runtime_operation(&pending, wrong).await.status,
+            "unconfirmed"
+        );
+        assert!(rt.api_view_for_ready_ticket(&core, &saved_digest).is_none());
+        let active = receipt.active.clone().unwrap();
+        assert_eq!(
+            rt.settle_runtime_operation(&pending, receipt).await.status,
+            "hotApplied"
+        );
+        assert_eq!(rt.core_generation(), generation);
+        assert!(rt.readback_endpoint(Some(&startup_ticket)).is_none());
+        assert_eq!(
+            action().await.err(),
+            Some(MainPrerequisiteError::ApiViewStale)
+        );
+        caps.write().unwrap().active = Some(active.clone());
+        let old_ticket = action().await.unwrap();
+        assert_eq!(old_ticket.target_tag("taildrop-node"), Some("emitted-node"));
+        assert!(rt
+            .runtime_config_baseline
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .core_log_relay_initial_history(generation));
         let original_readback = rt.readback_binding(Some(&old_ticket)).unwrap();
         assert_eq!(original_readback.port, old_port);
         assert!(Arc::ptr_eq(
@@ -335,7 +388,7 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
                 .unwrap()
         };
         let mut mixed = next.clone();
-        mixed["logLevel"] = serde_json::json!("debug");
+        mixed["logLevel"] = serde_json::json!("warn");
         assert!(rt
             .api_saved_projection_for(
                 &mixed,
@@ -354,6 +407,7 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
             };
             b.api_epoch = epoch.clone();
             b.management = Some(endpoint.clone());
+            b.api_handed_off = true;
             b.api_saved_projection = Some(ApiSavedProjection {
                 owner: plan.owner,
                 original: plan.original,
@@ -361,14 +415,10 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
                 active: active.clone(),
                 epoch,
                 endpoint,
+                targets: plan.targets,
             });
         }
-        *rt.status.write().unwrap() = crate::runtime::proxy::ProxyStatus {
-            running: true,
-            clash_api_port: port,
-            main_generation: generation,
-            ..Default::default()
-        };
+        rt.status.write().unwrap().clash_api_port = port;
         assert!(matches!(
             rt.check_ready_main(&old_ticket),
             Err(MainPrerequisiteError::ApiViewStale)
@@ -384,10 +434,10 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
         control.get_runtime_capabilities().await.unwrap();
         rt.bind_runtime_api_control(generation, Arc::new(control));
         let binding = ActionBinding::new(
-            NormalMainAction::ManualNetworkCheck,
+            NormalMainAction::TailscaleLogin,
             "renew-api".into(),
             &next,
-            vec![],
+            vec!["taildrop-node".into()],
             None,
         )
         .unwrap();
@@ -395,6 +445,14 @@ async fn normal_producer_renews_only_confirmed_same_core_api_view() {
         assert_eq!(renewed.generation(), generation);
         assert_eq!(renewed.api_port(), port);
         assert_eq!(renewed.api_secret(), new_secret);
+        assert_eq!(renewed.target_tag("taildrop-node"), Some("emitted-node"));
+        assert!(!rt
+            .runtime_config_baseline
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .core_log_relay_initial_history(generation));
         let readback = rt.readback_binding(Some(&renewed)).unwrap();
         assert_eq!(readback.port, port);
         assert_eq!(readback.secret, new_secret);
@@ -626,7 +684,9 @@ async fn deferred_native_save_callback_does_not_borrow_and_resumes_with_fresh_co
         polaris_singbox_grpc::tonic::transport::Server::builder()
             .serve_with_incoming_shutdown(
                 daemon::runtime_config_service_server::RuntimeConfigServiceServer::new(
-                    ReadyApiFixture { caps },
+                    ReadyApiFixture {
+                        caps: Arc::new(caps.into()),
+                    },
                 ),
                 incoming,
                 async {

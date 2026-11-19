@@ -150,7 +150,7 @@ impl RunningPeer {
         let service = Peer {
             runtime: daemon::runtime_config_service_server::RuntimeConfigServiceServer::new(
                 ReadyApiFixture {
-                    caps: super::super::super::tests::paired_capabilities(),
+                    caps: Arc::new(super::super::super::tests::paired_capabilities().into()),
                 },
             ),
             state: state.clone(),
