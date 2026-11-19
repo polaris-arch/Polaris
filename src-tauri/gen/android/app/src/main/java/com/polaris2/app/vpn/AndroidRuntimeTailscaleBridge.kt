@@ -16,6 +16,10 @@ internal object AndroidRuntimeTailscaleBridge {
     private const val LIBBOX = "io.nekohasekai.libbox"
     private val hex64 = Regex("[0-9a-f]{64}")
 
+    internal data class ControlledDirectories(val state: RuntimeTailscaleStatePaths, val taildrop: String) {
+        val paths: Set<String> get() = setOf(state.canonical, taildrop)
+    }
+
     fun register(server: CommandServer, owner: MainKernelAttempt<CommandServer>, dataDir: File, current: () -> Boolean) {
         val setter = server.javaClass.methods.singleOrNull {
             it.name == "setRuntimeTailscalePlatform" && it.parameterTypes.size == 1
@@ -51,18 +55,18 @@ internal object AndroidRuntimeTailscaleBridge {
                     if (!validTag(tag)) return@runCatching false
                     val state = args[1] as String
                     val taildrop = args[2] as String
-                    val paths = controlledDirectories(dataDir, state, taildrop) ?: return@runCatching false
-                    TransientLoginHost.validateRuntimeDirectories(owner, paths) {
+                    val directories = controlledDirectories(dataDir, state, taildrop) ?: return@runCatching false
+                    TransientLoginHost.validateRuntimeDirectories(owner, directories.paths) {
                         currentIncarnation() == incarnation &&
-                            ledger.canRetainRuntimeWriter(ticket, owner.birthNonce, incarnation, tag, state, taildrop)
+                            ledger.canRetainRuntimeWriter(ticket, owner.birthNonce, incarnation, tag, state, taildrop, directories.state)
                     }
                 }.getOrDefault(false)
                 claim -> {
                     val scope = readScope(checkNotNull(args[0]))
-                    val paths = if (validScope(scope)) controlledDirectories(dataDir, scope.stateDirectory, scope.taildropDirectory)
+                    val directories = if (validScope(scope)) controlledDirectories(dataDir, scope.stateDirectory, scope.taildropDirectory)
                         else null
-                    paths != null && TransientLoginHost.claimRuntimeDirectories(owner, scope, paths,
-                        retainScope = { ledger.retainRuntimeWriter(ticket, owner.birthNonce, scope) },
+                    directories != null && TransientLoginHost.claimRuntimeDirectories(owner, scope, directories.paths,
+                        retainScope = { ledger.retainRuntimeWriter(ticket, owner.birthNonce, scope, directories.state) },
                         allowed = { currentIncarnation() == scope.incarnation })
                 }
                 release -> {
@@ -172,7 +176,7 @@ internal object AndroidRuntimeTailscaleBridge {
             .also { check(validScope(it)) }
     }
 
-    internal fun controlledDirectories(dataDir: File, stateDirectory: String, taildropDirectory: String): Set<String>? {
+    internal fun controlledDirectories(dataDir: File, stateDirectory: String, taildropDirectory: String): ControlledDirectories? {
         if (stateDirectory.length > 4096 || taildropDirectory.length > 4096 ||
             '$' in stateDirectory || '$' in taildropDirectory) return null
         val state = File(stateDirectory)
@@ -182,11 +186,12 @@ internal object AndroidRuntimeTailscaleBridge {
             id.any { it.isISOControl() || it == '\\' || it == ':' }) return null
         val relative = "polaris/tailscale/$id"
         return try {
+            val nominal = File(dataDir, relative)
             val canonical = File(dataDir.canonicalFile, relative)
             val canonicalTaildrop = File(canonical, "Taildrop")
-            if ((state != File(dataDir, relative) && state != canonical) || taildrop != File(state, "Taildrop") ||
+            if ((state != nominal && state != canonical) || taildrop != File(state, "Taildrop") ||
                 state.canonicalFile != canonical || taildrop.canonicalFile != canonicalTaildrop) null
-            else setOf(canonical.path, canonicalTaildrop.path)
+            else ControlledDirectories(RuntimeTailscaleStatePaths(canonical.path, nominal.path), canonicalTaildrop.path)
         } catch (_: IOException) {
             null
         }

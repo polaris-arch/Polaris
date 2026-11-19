@@ -715,7 +715,7 @@ class TransientLoginHostStateTest {
         val state = File(root, "polaris/tailscale/node").apply { check(mkdirs()) }
         val taildrop = File(state, "Taildrop")
         val paths = setOf(state.path, taildrop.path)
-        assertEquals(paths, AndroidRuntimeTailscaleBridge.controlledDirectories(root, state.path, taildrop.path))
+        assertEquals(paths, AndroidRuntimeTailscaleBridge.controlledDirectories(root, state.path, taildrop.path)?.paths)
         val legacy = org.json.JSONObject().put("type", "tailscale").put("state_directory", state.path)
         val config = org.json.JSONObject().put("endpoints", org.json.JSONArray().put(legacy))
         assertEquals(TailscaleDirectoryClaims(setOf(state.path), false), TransientLoginHost.tailscaleDirectoryClaims(config.toString()))

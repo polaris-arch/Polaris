@@ -9,6 +9,10 @@ import org.json.JSONObject
 
 internal data class TailscaleDirectoryClaims(val paths: Set<String>, val resolved: Boolean = true)
 
+internal data class RuntimeTailscaleStatePaths(val canonical: String, val nominal: String) {
+    val files: Set<String> get() = setOf("$canonical/tailscaled.state", "$nominal/tailscaled.state")
+}
+
 internal data class RuntimeTailscaleWriterScope(
     val incarnation: String,
     val resourceSequence: Long,

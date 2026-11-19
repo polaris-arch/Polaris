@@ -64,7 +64,7 @@ class AndroidNativeAdmissionTest {
         ledger.bindTailscaleStore(main, "birth")
         val original = runtimeWriterScope(1)
         fun canRetain() = ledger.canRetainRuntimeWriter(main, "birth", original.incarnation, original.tag,
-            original.stateDirectory, original.taildropDirectory)
+            original.stateDirectory, original.taildropDirectory, RuntimeTailscaleStatePaths(original.stateDirectory, original.stateDirectory))
         assertFalse(canRetain())
         assertTrue(ledger.enterBirth(main))
         assertTrue(canRetain())
@@ -125,11 +125,123 @@ class AndroidNativeAdmissionTest {
         assertTrue(runCatching { read(binding(first).put("extra", true)) }.isFailure)
     }
 
+    @Test fun confirmedRuntimeHistoryKeepsColdTargetsAvailableAndBlocksOnlyItsWarmAliases() {
+        val ledger = bounded(20)
+        val main = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        val custody = ledger.bindTailscaleStore(main, "birth")
+        assertTrue(ledger.enterBirth(main))
+        val oldCold = ScopedNativeFixture.run("c", "cold", listOf("old"))
+        var native = ScopedNativeFixture.export()
+        custody.invoke("cold", { native }) { native = ScopedNativeFixture.export(oldCold) }
+        val coldBinding = custody.wire()
+        val writer = runtimeWriterScope(1)
+        val state = RuntimeTailscaleStatePaths("/canonical/tailscale/node-1", writer.stateDirectory)
+        val aborted = runtimeWriterScope(2)
+        assertTrue(ledger.retainRuntimeWriter(main, "birth", writer, state))
+        assertTrue(ledger.retainRuntimeWriter(main, "birth", aborted))
+        assertTrue(ledger.settleRuntimeWriter(main, "birth", writer, true))
+        assertTrue(ledger.settleRuntimeWriter(main, "birth", aborted, false))
+        assertTrue(coldBinding.similar(custody.wire()))
+
+        custody.closed { ScopedNativeFixture.export(ScopedNativeFixture.retired(oldCold), runtimeStoreRun(writer, state.canonical, true)) }
+        assertTrue(ledger.unknown(main))
+        assertTrue(custody.matches(coldBinding))
+        assertFalse(custody.wire().getBoolean("historyUnknown"))
+        val coldProof = custody.wire().getString("storeRetirement")
+        assertEquals(1, AndroidTailscaleStoreCustody.parseRuns(coldProof).size)
+        assertTrue(AndroidTailscaleStoreCustody.terminalComplete(coldProof))
+        assertEquals(true, custody.closedRelation(ScopedNativeFixture.file("old")))
+        assertEquals(false, custody.closedRelation(ScopedNativeFixture.file("unrelated")))
+        for (file in state.files) {
+            assertEquals(null, custody.closedRelation(file))
+            assertTrue(runCatching { ledger.tailscaleTargetAction(custody.wire(), file, "warm", "begin") }.isFailure)
+        }
+
+        val (_, unrelated) = ScopedNativeFixture.closedOwner(ledger, "unrelated")
+        val file = ScopedNativeFixture.file("one")
+        val opened = ledger.tailscaleTargetAction(unrelated.wire(), file, "cold-target", "begin").getJSONArray("entries")
+        val mainRow = (0 until opened.length()).map(opened::getJSONObject).single { it.getString("nativeTicketId") == main.id }
+        assertEquals(false, mainRow.getBoolean("related"))
+        assertTrue(ledger.tailscaleTargetAction(unrelated.wire(), file, "cold-target", "finish").getBoolean("released"))
+    }
+
+    @Test fun strictReloadKeepsWarmHistorySeparateFromTheReplacementColdRun() {
+        val ledger = bounded(20)
+        val main = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        val custody = ledger.bindTailscaleStore(main, "birth")
+        assertTrue(ledger.enterBirth(main))
+        val oldCold = ScopedNativeFixture.run("c", "cold", listOf("old"))
+        val newCold = ScopedNativeFixture.run("d", "reload", listOf("replacement"))
+        val warm = runtimeWriterScope(1)
+        val unused = runtimeWriterScope(2)
+        var native = ScopedNativeFixture.export()
+        custody.invoke("cold", { native }) { native = ScopedNativeFixture.export(oldCold) }
+        assertTrue(ledger.retainRuntimeWriter(main, "birth", warm))
+        assertTrue(ledger.retainRuntimeWriter(main, "birth", unused))
+        native = ScopedNativeFixture.export(oldCold, runtimeStoreRun(warm, warm.stateDirectory, false),
+            runtimeStoreRun(unused, null, false))
+        custody.invoke("reload", { native }) {
+            assertTrue(ledger.settleRuntimeWriter(main, "birth", warm, true))
+            assertTrue(ledger.settleRuntimeWriter(main, "birth", unused, false))
+            native = ScopedNativeFixture.export(ScopedNativeFixture.retired(oldCold), runtimeStoreRun(warm, warm.stateDirectory, true),
+                runtimeStoreRun(unused, null, true), newCold)
+        }
+        val active = custody.wire()
+        assertFalse(active.getBoolean("historyUnknown"))
+        assertEquals(ScopedNativeFixture.digest("reload"), active.getString("actualConfigDigest"))
+        assertEquals(2, active.getJSONArray("originalObservedRuns").length())
+        custody.closed {
+            ScopedNativeFixture.export(ScopedNativeFixture.retired(oldCold), runtimeStoreRun(warm, warm.stateDirectory, true),
+                runtimeStoreRun(unused, null, true), ScopedNativeFixture.retired(newCold))
+        }
+        assertTrue(custody.matches(active))
+        assertEquals(true, custody.closedRelation(ScopedNativeFixture.file("replacement")))
+        assertEquals(null, custody.closedRelation("${warm.stateDirectory}/tailscaled.state"))
+    }
+
+    @Test fun terminalProjectionRejectsUnmatchedOrIncompleteNativeRows() {
+        for (scenario in listOf("foreign-empty", "wrong-path", "wrong-digest", "unconfirmed", "no-acquisition-with-node")) {
+            val ledger = bounded(20)
+            val main = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+            val custody = ledger.bindTailscaleStore(main, "birth")
+            assertTrue(ledger.enterBirth(main))
+            val cold = ScopedNativeFixture.run("c", "cold", listOf("old"))
+            var native = ScopedNativeFixture.export()
+            custody.invoke("cold", { native }) { native = ScopedNativeFixture.export(cold) }
+            val warm = runtimeWriterScope(1)
+            assertTrue(ledger.retainRuntimeWriter(main, "birth", warm))
+            if (scenario != "unconfirmed") assertTrue(ledger.settleRuntimeWriter(main, "birth", warm, scenario != "no-acquisition-with-node"))
+            val warmRow = runtimeStoreRun(warm, if (scenario == "wrong-path") "/different" else warm.stateDirectory, true)
+            if (scenario == "wrong-digest") warmRow.put("configDigest", "9".repeat(64))
+            val rows = mutableListOf(ScopedNativeFixture.retired(cold), warmRow)
+            if (scenario == "foreign-empty") rows.add(runtimeStoreRun(runtimeWriterScope(2), null, true))
+            custody.closed { ScopedNativeFixture.export(*rows.toTypedArray()) }
+            assertTrue(scenario, custody.wire().getBoolean("historyUnknown"))
+            assertEquals(scenario, null, custody.closedRelation(ScopedNativeFixture.file("old")))
+        }
+    }
+
+    private fun runtimeStoreRun(scope: RuntimeTailscaleWriterScope, directory: String?, terminal: Boolean): JSONObject {
+        val row = ScopedNativeFixture.run("0", "runtime", emptyList(), terminal)
+            .put("runNonce", scope.runNonce).put("configDigest", scope.configDigest)
+        if (directory != null) {
+            if (terminal) row.put("terminal", "SealedDrained")
+            val node = ScopedNativeFixture.node(scope.tag).put("stateDirectory", directory).put("stateFile", "$directory/tailscaled.state")
+            if (terminal) node.put("writerState", "SealedDrained")
+            row.getJSONArray("nodes").put(node)
+        }
+        return row
+    }
+
     private fun runtimeWriterScope(sequence: Int): RuntimeTailscaleWriterScope {
         val directory = "/data/polaris/tailscale/node-$sequence"
         return RuntimeTailscaleWriterScope("incarnation", sequence.toLong(), 7, sequence.toString(16).padStart(64, '0'),
             "b".repeat(64), "ts-node-$sequence", directory, "$directory/Taildrop")
     }
+
+    private fun AndroidNativeAdmission.retainRuntimeWriter(ticket: AndroidNativeAdmission.Ticket, birthNonce: String,
+        scope: RuntimeTailscaleWriterScope): Boolean =
+        retainRuntimeWriter(ticket, birthNonce, scope, RuntimeTailscaleStatePaths(scope.stateDirectory, scope.stateDirectory))
 
     @Test fun metadataCountsOwnerOperationAndUnseenCloseAndClosesAtTheBoundary() {
         val ledger = bounded(4)

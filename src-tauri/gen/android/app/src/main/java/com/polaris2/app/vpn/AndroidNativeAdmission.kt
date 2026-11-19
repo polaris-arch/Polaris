@@ -74,7 +74,11 @@ internal class AndroidNativeAdmission(
     enum class Kind { Main, Login, Speedtest, CheckConfig, TargetlessStop, TargetlessReload }
     enum class State { Reserved, BirthEntered, CancelledBeforeBirth, ClosedExact, Completed, Unknown, ValidationCleanupUnknown }
     internal enum class RuntimeWriterOutcome { Held, ClosedConfirmed, NoAcquisition }
-    internal data class RuntimeWriterHistory(val scope: RuntimeTailscaleWriterScope, val outcome: RuntimeWriterOutcome)
+    internal data class RuntimeWriterHistory(
+        val scope: RuntimeTailscaleWriterScope,
+        val statePaths: RuntimeTailscaleStatePaths,
+        val outcome: RuntimeWriterOutcome,
+    )
     data class Ticket(val id: String, val kind: Kind, val logicalId: String)
     data class Entry(val ticket: Ticket, val state: State,
         internal val store: AndroidTailscaleStoreCustody? = null,
@@ -263,20 +267,23 @@ internal class AndroidNativeAdmission(
 
     internal fun canRetainRuntimeWriter(
         ticket: Ticket, birthNonce: String, incarnation: String, tag: String, stateDirectory: String, taildropDirectory: String,
+        statePaths: RuntimeTailscaleStatePaths,
     ): Boolean {
-        val bytes = runtimeWriterBytes(incarnation, tag, stateDirectory, taildropDirectory)
+        val bytes = runtimeWriterBytes(incarnation, tag, stateDirectory, taildropDirectory, statePaths)
         return synchronized(lock) { runtimeWriterAdmissionLocked(ticket, birthNonce, bytes) != null }
     }
 
-    internal fun retainRuntimeWriter(ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope): Boolean {
-        val bytes = runtimeWriterBytes(scope.incarnation, scope.tag, scope.stateDirectory, scope.taildropDirectory)
+    internal fun retainRuntimeWriter(
+        ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope, statePaths: RuntimeTailscaleStatePaths,
+    ): Boolean {
+        val bytes = runtimeWriterBytes(scope.incarnation, scope.tag, scope.stateDirectory, scope.taildropDirectory, statePaths)
         return synchronized(lock) {
             val entry = runtimeWriterAdmissionLocked(ticket, birthNonce, bytes) ?: return@synchronized false
             if (entry.runtimeWriters.containsKey(scope.runNonce) ||
                 entry.runtimeWriters.values.any {
                     it.scope.incarnation == scope.incarnation && it.scope.resourceSequence == scope.resourceSequence
                 }) return@synchronized false
-            val original = RuntimeWriterHistory(scope, RuntimeWriterOutcome.Held)
+            val original = RuntimeWriterHistory(scope, statePaths, RuntimeWriterOutcome.Held)
             entries[ticket.id] = entry.copy(
                 runtimeWriters = entry.runtimeWriters + (scope.runNonce to original),
                 runtimeWriterBytes = entry.runtimeWriterBytes + bytes,
@@ -312,8 +319,8 @@ internal class AndroidNativeAdmission(
         runtimeWriterHistoryLocked(ticket, birthNonce, scope)?.takeIf { it.outcome != RuntimeWriterOutcome.Held }
     }
 
-    internal fun hasRuntimeStoreHistory(ticket: Ticket, birthNonce: String): Boolean = synchronized(lock) {
-        runtimeMainEntryLocked(ticket, birthNonce)?.runtimeWriters?.values?.any { it.outcome != RuntimeWriterOutcome.NoAcquisition } == true
+    internal fun runtimeWriterHistory(ticket: Ticket, birthNonce: String): List<RuntimeWriterHistory> = synchronized(lock) {
+        runtimeMainEntryLocked(ticket, birthNonce)?.runtimeWriters?.values.orEmpty().toList()
     }
 
     internal fun hasHeldRuntimeWriter(ticket: Ticket, birthNonce: String): Boolean = synchronized(lock) {
@@ -330,10 +337,13 @@ internal class AndroidNativeAdmission(
         }
 
     /** Reserve the same worst-case wire size before the Core assigns a nonce, sequence or generation. */
-    private fun runtimeWriterBytes(incarnation: String, tag: String, stateDirectory: String, taildropDirectory: String): Int {
+    private fun runtimeWriterBytes(
+        incarnation: String, tag: String, stateDirectory: String, taildropDirectory: String, statePaths: RuntimeTailscaleStatePaths,
+    ): Int {
         val digest = "0".repeat(64)
         val largestScope = RuntimeTailscaleWriterScope(incarnation, -1L, -1L, digest, digest, tag, stateDirectory, taildropDirectory)
         return JSONObject().put("scope", largestScope.json()).put("outcome", RuntimeWriterOutcome.ClosedConfirmed.name)
+            .put("stateFiles", JSONArray(statePaths.files))
             .toString().toByteArray(Charsets.UTF_8).size
     }
 
@@ -720,18 +730,23 @@ internal class AndroidTailscaleStoreCustody internal constructor(
     private var terminal = false
     private var nativeTerminalComplete = false
     private var nativeCensusComplete = false
+    private var runtimeStateFiles = emptySet<String>()
 
     /** Captures both sides of this exact call even when JNI throws. No capture error replaces it. */
     fun <T> invoke(config: String, export: () -> String, action: () -> T): T {
+        fun coldExport(requireTerminal: Boolean): String {
+            val runtimeHistory = ledger.runtimeWriterHistory(ticket, birthNonce)
+            return projectColdExport(export(), runtimeHistory, requireTerminal)
+        }
         val digest = digest(config)
-        val before = runCatching { parseRuns(export()) }.getOrNull()
+        val before = runCatching { parseRuns(coldExport(requireTerminal = false)) }.getOrNull()
         synchronized(this) {
             if (before == null || !sameRuns(before, runs) || terminal) unknown = true
         }
         var returned = false
         try { return action().also { returned = true } }
         finally {
-            val raw = runCatching(export).getOrNull()
+            val raw = runCatching { coldExport(requireTerminal = returned) }.getOrNull()
             val after = raw?.let { runCatching { parseRuns(it) }.getOrNull() }
             val projected = synchronized(this) {
                 val fresh = after?.filter { next -> runs.none { it.nonce == next.nonce } }.orEmpty()
@@ -757,22 +772,23 @@ internal class AndroidTailscaleStoreCustody internal constructor(
 
     /** Call after the original closeService, before closeServer/handle clear and after pending Start joins. */
     fun closed(export: () -> String) {
-        val raw = runCatching(export).getOrNull()
+        val runtimeHistory = ledger.runtimeWriterHistory(ticket, birthNonce)
+        val raw = runCatching { projectColdExport(export(), runtimeHistory, requireTerminal = true) }.getOrNull()
         val parsed = raw?.let { runCatching { parseRuns(it) }.getOrNull() }
         val nativeComplete = raw?.let { runCatching { terminalComplete(it) }.getOrDefault(false) } == true
         val censusComplete = raw?.let { runCatching { censusComplete(it) }.getOrDefault(false) } == true
-        val runtimeStoreHistory = ledger.hasRuntimeStoreHistory(ticket, birthNonce)
         val originalRuns = synchronized(this) { runs }
         val admitted = raw != null && raw.toByteArray(Charsets.UTF_8).size <= MAX_BYTES &&
             snapshotBytes(raw, originalRuns, synchronized(this) { currentDigest }, true)?.let { ledger.admitScopedBytes(ticket, it) } == true
         synchronized(this) {
-            // A runtime child is a separate immutable scope, not a replacement whole-configuration run.
-            if (runtimeStoreHistory || parsed == null || runs.isEmpty() || !sameRuns(parsed, runs)) unknown = true
+            if (parsed == null || runs.isEmpty() || !sameRuns(parsed, runs)) unknown = true
             if (admitted) payload = checkNotNull(raw)
             else unknown = true
             terminal = true
             nativeTerminalComplete = nativeComplete
             nativeCensusComplete = censusComplete
+            runtimeStateFiles = runtimeHistory.filter { it.outcome == AndroidNativeAdmission.RuntimeWriterOutcome.ClosedConfirmed }
+                .flatMap { it.statePaths.files }.toSet()
         }
         ledger.scopedChanged(ticket)
     }
@@ -808,6 +824,8 @@ internal class AndroidTailscaleStoreCustody internal constructor(
     @Synchronized fun closedRelation(file: String): Boolean? {
         if (unknown || !terminal || runs.isEmpty() || !hex64(currentDigest)) return null
         if (!nativeCensusComplete) return null
+        // Legacy v1 has only whole-configuration membership and cannot authorize a warm file.
+        if (file in runtimeStateFiles) return null
         if (!containsOriginalFile(file)) return false
         return if (nativeTerminalComplete) true else null
     }
@@ -837,16 +855,72 @@ internal class AndroidTailscaleStoreCustody internal constructor(
             val value = array.getJSONObject(index)
             Run(value.getString("runNonce"), value.getString("configDigest"), scopes(value.getJSONArray("scopes")))
         }.also { check(it.map { run -> run.nonce }.toSet().size == it.size && it.all { run -> hex64(run.nonce) && hex64(run.digest) }) }
-        internal fun parseRuns(raw: String): List<Run> {
+        private fun storeReceipt(raw: String): JSONObject {
             check(raw.toByteArray(Charsets.UTF_8).size <= MAX_BYTES)
             val root = JSONObject(raw)
             check(root.getString("contractVersion") == "polaris-ts-auth-writer-retirement-v1" && root.getString("globalCleanupEvidence") == "CleanupUnknown")
-            val instances = root.getJSONArray("instances")
-            check(instances.length() <= MAX_RUNS)
+            check(root.getJSONArray("instances").length() <= MAX_RUNS)
+            return root
+        }
+
+        internal fun parseRuns(raw: String): List<Run> {
+            val instances = storeReceipt(raw).getJSONArray("instances")
             return (0 until instances.length()).map { index ->
                 val instance = instances.getJSONObject(index)
                 Run(instance.getString("runNonce"), instance.getString("configDigest"), scopes(instance.getJSONArray("nodes")))
             }.also { check(it.map { run -> run.nonce }.toSet().size == it.size && it.all { run -> hex64(run.nonce) && hex64(run.digest) }) }
+        }
+
+        /** Prove the full original census before projecting exact child rows out of the cold v1 wire. */
+        private fun projectColdExport(
+            raw: String, history: List<AndroidNativeAdmission.RuntimeWriterHistory>, requireTerminal: Boolean,
+        ): String {
+            if (history.isEmpty()) return raw
+            val envelope = storeReceipt(raw)
+            val native = envelope.getJSONArray("instances")
+            val original = history.associateBy { it.scope.runNonce }.toMutableMap()
+            val cold = JSONArray()
+            val seen = mutableSetOf<String>()
+            for (index in 0 until native.length()) {
+                val instance = native.getJSONObject(index)
+                val nonce = instance.getString("runNonce")
+                check(seen.add(nonce))
+                val child = original.remove(nonce)
+                if (child == null) cold.put(instance)
+                else verifyRuntimeStore(child, instance, requireTerminal)
+            }
+            check(original.values.none {
+                it.outcome == AndroidNativeAdmission.RuntimeWriterOutcome.ClosedConfirmed ||
+                    requireTerminal && it.outcome == AndroidNativeAdmission.RuntimeWriterOutcome.Held
+            })
+            return envelope.put("instances", cold).toString()
+        }
+
+        private fun verifyRuntimeStore(
+            child: AndroidNativeAdmission.RuntimeWriterHistory, instance: JSONObject, requireTerminal: Boolean,
+        ) {
+            check(instance.getString("configDigest") == child.scope.configDigest)
+            val nodes = instance.getJSONArray("nodes")
+            val terminal = instance.getString("terminal")
+            val complete = instance.get("censusComplete") == true
+            if (child.outcome == AndroidNativeAdmission.RuntimeWriterOutcome.NoAcquisition) {
+                check(terminal == "NoStoreConstruction" && complete && nodes.length() == 0)
+                return
+            }
+            val held = child.outcome == AndroidNativeAdmission.RuntimeWriterOutcome.Held
+            if (held) {
+                check(!requireTerminal)
+                if (nodes.length() == 0) {
+                    check(terminal == "Unknown" && !complete)
+                    return
+                }
+            }
+            val directory = child.statePaths.canonical
+            check(scopes(nodes) == listOf(Scope(child.scope.tag, directory, "$directory/tailscaled.state")))
+            if (!held) {
+                check(complete && terminal in KNOWN_WRITERS &&
+                    nodes.getJSONObject(0).getString("writerState") == terminal)
+            }
         }
         /** Older AAR absence cannot create a receipt; ordinary operation still runs. */
         internal fun censusComplete(raw: String): Boolean {
