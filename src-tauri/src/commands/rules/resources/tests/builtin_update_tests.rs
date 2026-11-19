@@ -80,7 +80,7 @@ async fn builtin_update_commits_live_and_metadata_before_done() {
         &PublicLookup,
         &plan,
         &dir,
-        async |resource, staged, operation| {
+        async |resource, staged, operation, _| {
             publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
             assert_eq!(
                 std::fs::read(dir.join(&plan.file_name)).unwrap(),
@@ -118,7 +118,7 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
             &PublicLookup,
             &plan,
             &dir,
-            async |_, _, _| panic!("下载失败不能保存元数据"),
+            async |_, _, _, _| panic!("下载失败不能保存元数据"),
         )
         .await;
         assert!(matches!(
@@ -140,7 +140,12 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
 
 #[tokio::test]
 async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
-    for previous in [Some(EMPTY_SRS_V2), None, Some(EMPTY_SRS_V1)] {
+    for (previous, capture_fails) in [
+        (Some(EMPTY_SRS_V2), false),
+        (None, false),
+        (Some(EMPTY_SRS_V1), false),
+        (Some(EMPTY_SRS_V2), true),
+    ] {
         let (plan, dir) = fixture();
         let live = dir.join(&plan.file_name);
         if let Some(bytes) = previous {
@@ -157,7 +162,12 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
             intent: 0,
             revision,
         };
-        manager.fail_next_config_persist_for_test();
+        let expected_error = if capture_fails {
+            "保留更新前的生效副本失败"
+        } else {
+            manager.fail_next_config_persist_for_test();
+            "injected config persistence failure"
+        };
         let sink = RecordingSink::default();
         let outcome = update_builtin_resource(
             &sink,
@@ -165,12 +175,16 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
             &PublicLookup,
             &plan,
             &dir,
-            async |resource, staged, operation| {
+            async |resource, staged, operation, stage| {
+                if capture_fails {
+                    // Both exclusive ways to retain the old bytes must fail here.
+                    std::fs::create_dir(staged.with_extension("previous")).unwrap();
+                }
                 save_resource_change(
                     &manager,
                     "geosite-cn",
                     &resource.downloaded_at,
-                    (staged, &live),
+                    (staged, &live, stage),
                     operation,
                     owner,
                 )
@@ -182,10 +196,7 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
         let result = outcome.into_value(&plan);
         assert_eq!(result["ok"], false);
         assert_eq!(result["errorCode"], ERR_RESOURCE_WRITE_FAILED);
-        assert!(result["error"]
-            .as_str()
-            .unwrap()
-            .contains("injected config persistence failure"));
+        assert!(result["error"].as_str().unwrap().contains(expected_error));
         assert_eq!(sink.statuses(), ["downloading", "error"]);
         assert_eq!(std::fs::read(manager.path()).unwrap(), before);
         assert_eq!(manager.saved_revision(), revision);
@@ -200,6 +211,27 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
     }
 }
 
+#[test]
+fn failed_builtin_restore_keeps_the_preimage_after_stage_drop() {
+    let (plan, dir) = fixture();
+    let live = dir.join(&plan.file_name);
+    let stage = ResourceStageDir::create(&dir).unwrap();
+    let staged = stage.0.join(&plan.file_name);
+    std::fs::write(&staged, EMPTY_SRS_V1).unwrap();
+    let operation = BuiltinUpdateOperation::begin(&format!("restore-failure-{}", new_uuid()));
+    let change = publish_builtin_file(&operation, &staged, &live).unwrap();
+    let backup = staged.with_extension("previous");
+
+    // A regular file cannot atomically replace a directory on any target.
+    std::fs::remove_file(&live).unwrap();
+    std::fs::create_dir(&live).unwrap();
+    let error = change.restore(&live, &stage).unwrap_err();
+    drop(stage);
+
+    assert!(error.contains(backup.to_string_lossy().as_ref()));
+    assert_eq!(std::fs::read(backup).unwrap(), EMPTY_SRS_V2);
+}
+
 #[tokio::test]
 async fn builtin_same_tag_updates_are_serialized_and_cleanup_isolated() {
     let (plan, dir) = fixture();
@@ -207,7 +239,10 @@ async fn builtin_same_tag_updates_are_serialized_and_cleanup_isolated() {
     let first = RecordingSink::default();
     let second = RecordingSink::default();
     let saved = AtomicUsize::new(0);
-    let persist = async |_: &RuleResource, staged: &Path, operation: &BuiltinUpdateOperation| {
+    let persist = async |_: &RuleResource,
+                         staged: &Path,
+                         operation: &BuiltinUpdateOperation,
+                         _: &ResourceStageDir| {
         publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
         saved.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -385,7 +420,7 @@ async fn download_paused_across_reset_cannot_publish_or_mark_metadata_done() {
         &PublicLookup,
         &plan,
         &dir,
-        async |_, staged, operation| {
+        async |_, staged, operation, _| {
             publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
             saved.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -422,7 +457,7 @@ async fn cancelling_paused_download_cleans_only_its_stage_and_releases_gate() {
             &PublicLookup,
             &plan,
             &dir,
-            async |_, _, _| panic!("cancelled download must not publish"),
+            async |_, _, _, _| panic!("cancelled download must not publish"),
         );
         tokio::pin!(update);
         tokio::select! {
@@ -471,7 +506,7 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
         &PublicLookup,
         &success_plan,
         &success_dir,
-        async |_, staged, operation| {
+        async |_, staged, operation, _| {
             publish_builtin_file(
                 operation,
                 staged,
@@ -502,7 +537,7 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
                 &PublicLookup,
                 &failure_plan,
                 &failure_dir,
-                async |_, _, _| panic!("failed fetch must never publish or persist"),
+                async |_, _, _, _| panic!("failed fetch must never publish or persist"),
             ),
             update_builtin_resource(
                 &metadata_sink,
@@ -510,7 +545,7 @@ async fn concurrent_builtin_fixtures_keep_failure_live_and_stage_cleanup_isolate
                 &PublicLookup,
                 &metadata_plan,
                 &metadata_dir,
-                async |_, staged, operation| {
+                async |_, staged, operation, _| {
                     publish_builtin_file(
                         operation,
                         staged,
@@ -687,7 +722,7 @@ async fn builtin_fixture_early_stage_failure_cannot_leave_notification_peer_wait
         &PublicLookup,
         &plan,
         &dir,
-        async |_, _, _| panic!("stage failure must not publish"),
+        async |_, _, _, _| panic!("stage failure must not publish"),
     );
     let result = tokio::time::timeout(std::time::Duration::from_millis(25), async {
         tokio::join!(update, client.entered.notified())
@@ -725,7 +760,7 @@ async fn timed_out_fixture_clears_only_its_cancel_registration_after_stage_drop(
             &PublicLookup,
             &plan,
             &dir,
-            async |_, _, _| panic!("paused download cannot publish"),
+            async |_, _, _, _| panic!("paused download cannot publish"),
         ),
     )
     .await;

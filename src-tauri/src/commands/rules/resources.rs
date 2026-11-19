@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -1188,7 +1189,7 @@ async fn update_builtin_with_mode(
         &SystemDnsLookup,
         &plan,
         &builtin_runtime_dir(state),
-        async |resource, staged, operation| {
+        async |resource, staged, operation, stage| {
             let _publication = state.config().lock_builtin_rule_publication().await;
             persist_builtin_geo_updated(
                 app,
@@ -1196,7 +1197,11 @@ async fn update_builtin_with_mode(
                 &b.tag,
                 &resource.downloaded_at,
                 broadcast,
-                (staged, &builtin_runtime_dir(state).join(&plan.file_name)),
+                (
+                    staged,
+                    &builtin_runtime_dir(state).join(&plan.file_name),
+                    stage,
+                ),
                 operation,
             )
         },
@@ -1595,7 +1600,7 @@ fn builtin_update_lock(id: &str) -> std::sync::Arc<BuiltinUpdateGate> {
     lock
 }
 
-struct ResourceStageDir(std::path::PathBuf);
+struct ResourceStageDir(PathBuf, AtomicBool);
 impl ResourceStageDir {
     fn create(res_dir: &Path) -> std::io::Result<Self> {
         Self::create_with(res_dir, new_uuid)
@@ -1609,17 +1614,23 @@ impl ResourceStageDir {
             // A guessed name is not ownership. Only successful exclusive creation may
             // construct the cleanup guard; collisions never open or remove that path.
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
+                Ok(()) => return Ok(Self(path, AtomicBool::new(false))),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
         }
     }
+
+    fn retain_for_recovery(&self) {
+        self.1.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for ResourceStageDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.1.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
         // The shared .update parent was not exclusively acquired. Leave it alone.
     }
 }
@@ -1640,12 +1651,17 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     lookup: &L,
     plan: &ResourcePlan,
     runtime_dir: &Path,
-    persist: impl AsyncFnOnce(&RuleResource, &Path, &BuiltinUpdateOperation) -> Result<(), String>,
+    persist: impl AsyncFnOnce(
+        &RuleResource,
+        &Path,
+        &BuiltinUpdateOperation,
+        &ResourceStageDir,
+    ) -> Result<(), String>,
 ) -> DownloadOutcome {
     // Capture before awaiting the keyed gate: reset retires queued requests too.
     let operation = BuiltinUpdateOperation::begin(&plan.id);
     let _guard = operation.gate.download.lock().await;
-    // 同盘且每次独立目录；取消/失败/函数退出均清理自己的暂存，不碰其他在途下载。
+    // 同盘且每次独立目录。恢复旧副本失败时保留这一份暂存，其他退出路径均清理自己的目录。
     let stage = match ResourceStageDir::create(runtime_dir) {
         Ok(stage) => stage,
         Err(error) => {
@@ -1671,7 +1687,13 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     };
     let live = runtime_dir.join(&plan.file_name);
     let existed_before = live.is_file();
-    let committed = persist(&resource, &stage.0.join(&plan.file_name), &operation).await;
+    let committed = persist(
+        &resource,
+        &stage.0.join(&plan.file_name),
+        &operation,
+        &stage,
+    )
+    .await;
     match committed {
         Ok(()) => {
             emit_resource_progress(
@@ -1704,7 +1726,6 @@ enum BuiltinFileChange {
     Unchanged,
     Created,
     Replaced(PathBuf),
-    RestoreUnavailable(io::Error),
 }
 
 impl BuiltinFileChange {
@@ -1734,14 +1755,15 @@ impl BuiltinFileChange {
         Ok(Self::Replaced(backup))
     }
 
-    fn restore(&self, live: &Path) -> Result<(), String> {
+    fn restore(&self, live: &Path, stage: &ResourceStageDir) -> Result<(), String> {
         match self {
             Self::Unchanged => Ok(()),
-            Self::Created => std::fs::remove_file(live),
-            Self::Replaced(backup) => std::fs::rename(backup, live),
-            Self::RestoreUnavailable(error) => return Err(error.to_string()),
+            Self::Created => std::fs::remove_file(live).map_err(|error| error.to_string()),
+            Self::Replaced(backup) => std::fs::rename(backup, live).map_err(|error| {
+                stage.retain_for_recovery();
+                format!("{error}。旧副本保留在 {}", backup.display())
+            }),
         }
-        .map_err(|error| error.to_string())
     }
 }
 
@@ -1758,7 +1780,7 @@ fn publish_builtin_file(
         return Ok(BuiltinFileChange::Unchanged);
     }
     let previous = BuiltinFileChange::capture(staged, live)
-        .unwrap_or_else(BuiltinFileChange::RestoreUnavailable);
+        .map_err(|error| format!("保留更新前的生效副本失败: {error}"))?;
     std::fs::rename(staged, live).map_err(|error| format!("替换生效副本失败: {error}"))?;
     Ok(previous)
 }
@@ -1775,7 +1797,7 @@ fn persist_builtin_geo_updated(
     tag: &str,
     updated_at: &str,
     broadcast: BroadcastMode<'_>,
-    paths: (&Path, &Path),
+    paths: (&Path, &Path, &ResourceStageDir),
     operation: &BuiltinUpdateOperation,
 ) -> Result<(), String> {
     let owner = StagedSaveOwner::capture(state.proxy(), 0);
@@ -1795,11 +1817,11 @@ fn save_resource_change(
     manager: &ConfigManager,
     tag: &str,
     updated_at: &str,
-    paths: (&Path, &Path),
+    paths: (&Path, &Path, &ResourceStageDir),
     operation: &BuiltinUpdateOperation,
     owner: StagedSaveOwner,
 ) -> Result<ResourceSave, StoreError> {
-    let (staged, live) = paths;
+    let (staged, live, stage) = paths;
     let (result, candidate, revision) = manager.update_with_cleanup_revision_on_save_error(
         false,
         |cfg| {
@@ -1827,7 +1849,7 @@ fn save_resource_change(
             let Ok((_, change)) = result else {
                 return error;
             };
-            match change.restore(live) {
+            match change.restore(live, stage) {
                 Ok(()) => error,
                 Err(restore_error) => StoreError::Io(format!(
                     "配置未保存，无法恢复更新前的生效副本，规则资源可重试。保存错误为 {error}，恢复错误为 {restore_error}"
