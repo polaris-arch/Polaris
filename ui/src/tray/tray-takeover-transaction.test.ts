@@ -38,13 +38,14 @@ describe('tray proxy mode feedback', () => {
   );
   const modeFixture = (updateMode: (mode: string) => Promise<unknown>) => {
     const setNotice = vi.fn();
+    const interaction = { current: 1 };
     const change = make(
-      { config: { updateMode } }, { current: 1 }, { current: 1 }, { current: true }, { current: true },
+      { config: { updateMode } }, { current: 1 }, interaction, { current: true }, { current: true },
       { current: 0 }, withConfigWriteLock, setNotice,
       [{ v: 'global', k: 'tray.modeGlobal' }, { v: 'smart', k: 'tray.modeSmart' }],
       vi.fn(), (key: string) => key,
     );
-    return { change, setNotice };
+    return { change, setNotice, interaction };
   };
 
   it.each([
@@ -60,22 +61,23 @@ describe('tray proxy mode feedback', () => {
     expect(setNotice.mock.calls).toEqual(expected);
   });
 
-  it('saves a reversal after the in-flight mode without showing the older result', async () => {
+  it.each([false, true])('preserves a queued reversal after the tray loses focus: %s', async (blur) => {
     let finishFirst!: () => void;
     const firstReceipt = new Promise<void>((resolve) => { finishFirst = resolve; });
     const updateMode = vi.fn(async (mode: string) => {
       if (mode === 'global') await firstReceipt;
       return { status: 'saved', savedOffline: true };
     });
-    const { change, setNotice } = modeFixture(updateMode);
+    const { change, setNotice, interaction } = modeFixture(updateMode);
     const first = change('global');
     await Promise.resolve();
     expect(updateMode.mock.calls).toEqual([['global']]);
     const second = change('smart');
     expect(updateMode.mock.calls).toEqual([['global']]);
+    if (blur) interaction.current += 1;
     finishFirst();
     await Promise.all([first, second]);
     expect(updateMode.mock.calls).toEqual([['global'], ['smart']]);
-    expect(setNotice.mock.calls).toEqual([['tray.modeSmart']]);
+    expect(setNotice.mock.calls).toEqual(blur ? [] : [['tray.modeSmart']]);
   });
 });

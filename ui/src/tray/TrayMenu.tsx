@@ -563,7 +563,7 @@ export default function TrayMenu() {
     const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current
       && operation === interactionEpoch.current && intent === modeIntent.current;
     return withConfigWriteLock(async () => {
-      if (!current()) return;
+      if (intent !== modeIntent.current) return;
       try {
         const result = await api.config.updateMode(mode);
         if (!current()) return;
