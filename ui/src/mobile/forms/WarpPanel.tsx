@@ -31,9 +31,7 @@ import { applyOnDemand } from '@/components/dialogs/on-demand-field';
  *    在提交边界收口，不能只靠「界面没展示」假定旧配置里不存在）；
  *  · **前置代理候选 / 写回** —— `detour-options#endpointDetourOptions` / `#applyDetour`
  *    （空值与哨兵 ⇒ **删键**，不写字面量 `'direct'`）；
- *  · **暂存 staged-only 拦截**（编辑态）—— `lib/staged-config#splitStagedOnly`：
- *    `applyWarpLicense` 改的是远端账户等级、`update` 改的是一台**已注册**的设备，
- *    盘上没有这个节点时两者都没有作用对象。
+ *  · **普通编辑**沿用节点配置保存；许可证升级与直接保存需要盘上已有节点。
  *
  * # 「重新注册 / 注销」收在编辑态的末尾（2026-09-13 批 16 接通）
  *
@@ -72,10 +70,11 @@ import { buildWarpSettings, workersInputInvalid } from '@/components/dialogs/wg-
 import { buildRegisteredWarpServer, saveRegisteredWarp, type WarpRegistrationAttempt } from '@/components/dialogs/warp-registration';
 import { findWarpNode } from '@/domain/warp';
 import { registerWarpIfSlotFree } from '@/domain/mesh-singleton-guard';
-import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
+import { editRoute, splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
+import { useStagingActive } from '@/store/use-staging-active';
 import { useMobileNodeDeletion } from '../nodes/node-deletion';
 import { MobileFields } from './FormFields';
 import { FormSheet } from './FormSheet';
@@ -97,6 +96,8 @@ export function WarpPanel({
   const servers = useEffectiveServers();
   const diskServers = useAppStore((s) => s.servers);
   const loadConfig = useAppStore((s) => s.loadConfig);
+  const stagingEnabled = useStagingActive();
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const interfaces = useNetworkInterfaces();
 
@@ -266,24 +267,16 @@ export function WarpPanel({
     let attempt = registration;
     try {
       if (isEdit && editNode !== undefined) {
-        /* ── 编辑腿 ─────────────────────────────────────────────────────────
-           `block`（ENTITY_ACTION_TABLE）：`applyWarpLicense` 改的是远端账户等级、
-           `update` 改的是一台**已注册**的设备 —— 盘上没有这个节点，两者都没有作用对象。 */
-        const stagedOnly = stagedOnlyIds(servers, diskServers);
-        const split = splitStagedOnly(
-          'warp.edit',
-          [editNode.id],
-          stagedOnly,
-          stagedEntries,
-          'servers',
-        );
-        if (split.blocked.length > 0) {
-          /* 「还不能做」不是错误：走 info，文案自述完整（同桌面 `WarpDialog#doEdit`）。 */
+        const upgradeLicense = plan === 'plus' ? license.trim() : '';
+        const route = upgradeLicense ? 'direct' : editRoute('servers', stagingEnabled);
+        if (route === 'direct' && splitStagedOnly(
+          'warp.edit', [editNode.id], stagedOnlyIds(servers, diskServers), stagedEntries, 'servers',
+        ).blocked.length > 0) {
           setNotice({ tone: 'info', text: t('home.stagedOnlyBlocked') });
           return;
         }
-        if (plan === 'plus' && license.trim()) {
-          const r = await api.server.applyWarpLicense(editNode.id, license.trim());
+        if (upgradeLicense) {
+          const r = await api.server.applyWarpLicense(editNode.id, upgradeLicense);
           if (!r.ok) {
             /* `no-credentials` 那支文案自述完整；其余套 `warp.errLicense`
                （`r.error` 是后端原始串、不自述，也不外泄给用户）。 */
@@ -305,10 +298,22 @@ export function WarpPanel({
         applyOnDemand(next, draft.onDemand);
         if (bindInterface) next.bindInterface = bindInterface;
         else delete next.bindInterface;
+        const label = `${t('warp.editTitle')} ${next.name}`;
+        if (route === 'staged') {
+          const result = await submitEdit({
+            id: `server:${next.id}`,
+            kind: 'server',
+            label,
+            entityPath: ['servers', next.id],
+            nextValue: next,
+          });
+          if (result !== 'ignored') closeInstance(instanceId);
+          return;
+        }
         await api.server.update(next);
         await loadConfig(true);
         closeInstance(instanceId);
-        toast.success(`${t('warp.editTitle')} ${next.name} · ${t('common.saved')}`);
+        toast.success(`${label} · ${t('common.saved')}`);
         return;
       }
 

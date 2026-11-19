@@ -6,7 +6,7 @@
  *    → 拿 `WarpWireGuardDraft` 草稿 → 用名称与少量高级项覆盖后 `api.server.add` 落为 WireGuard 节点
  *    （registerWarp 本身只返草稿不落盘，见 warp.rs / warp.ts 头注释 + server.rs:320）。
  *  - **编辑态**（edit 真）：预填现有 WARP 节点；WARP+ 许可经 `api.server.applyWarpLicense`（REAL，原地升级免重建），
- *    名称与高级参数改动经 `api.server.update`。
+ *    普通名称与高级参数改动沿用节点配置保存路径。
  *
  * 名称/许可保持连续任务流，低频 WireGuard 参数只放一个高级折叠区，不为内部字段强造分组。
  * 参数继续走 D2 FieldSpec 表 + FieldRenderer（§1.4 多字段驱动，复用节点表单同一渲染器）。
@@ -18,7 +18,8 @@ import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
-import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
+import { useStagingActive } from '@/store/use-staging-active';
+import { editRoute, splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 import { api } from '@/ipc';
 import type { ServerConfig, WireGuardSettings } from '@/contracts/types';
 import { findWarpNode } from '@/domain/warp';
@@ -70,6 +71,8 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
   const closeInstance = useDialogStore((state) => state.closeInstance);
   const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const loadConfig = useAppStore((s) => s.loadConfig);
+  const stagingEnabled = useStagingActive();
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   /** staged-only 差集的两个入参（展示面 effective + 操作面磁盘镜像），判据与节点卡同一函数。 */
   const diskServers = useAppStore((s) => s.servers);
@@ -175,32 +178,20 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
 
   const doEdit = async (ep: { host: string; port: number }) => {
     if (!editNode) return;
-    // `block`（ENTITY_ACTION_TABLE）：applyWarpLicense 改的是远端账户等级、update 改的是一台
-    // **已注册**的设备 —— 盘上没有这个节点，两者都没有作用对象。
-    const split = splitStagedOnly(
-      'warp.edit',
-      [editNode.id],
-      stagedOnly,
-      stagedEntries,
-      'servers'
-    );
-    if (split.blocked.length > 0) {
-      // 同 NodesScreen:687 / TsSettingsDialog：「还不能做」走 info 单参，文案自述完整。
-      toast.info(
-        t('home.stagedOnlyBlocked')
-      );
-      throw new Error('staged-only-blocked');
+    const upgradeLicense = plan === 'plus' ? license.trim() : '';
+    // 远端许可证升级保持独立调用，普通节点编辑使用共享配置保存。
+    const route = upgradeLicense ? 'direct' : editRoute('servers', stagingEnabled);
+    if (route === 'direct' && splitStagedOnly(
+      'warp.edit', [editNode.id], stagedOnly, stagedEntries, 'servers',
+    ).blocked.length > 0) {
+      toast.info(t('home.stagedOnlyBlocked'));
+      return;
     }
-    if (plan === 'plus' && license.trim()) {
-      const r = await api.server.applyWarpLicense(editNode.id, license.trim());
+    if (upgradeLicense) {
+      const r = await api.server.applyWarpLicense(editNode.id, upgradeLicense);
       if (!r.ok) {
-        // r.error 是后端原始串（非自述）⇒ 套 title；no-credentials 那支本身自述，单参。
-        if (r.error === 'no-credentials') {
-          toast.error(t('warp.errNoCreds'));
-        } else {
-          toast.error(t('warp.errLicense'));
-        }
-        throw new Error('applyLicense-failed');
+        toast.error(t(r.error === 'no-credentials' ? 'warp.errNoCreds' : 'warp.errLicense'));
+        return;
       }
     }
     const settings = settingsOverride(editNode.wireguardSettings ?? {});
@@ -216,7 +207,22 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
     const bindInterface = String(draft.bindInterface ?? '').trim();
     if (bindInterface) server.bindInterface = bindInterface;
     else delete server.bindInterface;
+    const label = `${t('warp.editTitle')} ${server.name}`;
+    if (route === 'staged') {
+      const result = await submitEdit({
+        id: `server:${server.id}`,
+        kind: 'server',
+        label,
+        entityPath: ['servers', server.id],
+        nextValue: server,
+      });
+      if (result !== 'ignored') close();
+      return;
+    }
     await api.server.update(server);
+    void loadConfig(true);
+    close();
+    toast.success(`${label} · ${t('common.saved')}`);
   };
 
   const handleSubmit = async () => {
@@ -256,9 +262,6 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
     try {
       if (isEdit) {
         await doEdit(ep!);
-        void loadConfig(true);
-        close();
-        toast.success(`${t('warp.editTitle')} ${name.trim()} · ${t('common.saved')}`);
       } else {
         const registered = await doRegister(ep);
         if (registered) {
@@ -267,9 +270,7 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
       }
     } catch (e) {
       console.error('[WarpDialog] save failed:', e);
-      if (!(e instanceof Error && e.message === 'applyLicense-failed')) {
-        toast.error(t('common.saveFailed'));
-      }
+      toast.error(t('common.saveFailed'));
     } finally {
       setSubmitting(false);
     }

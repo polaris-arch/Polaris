@@ -7,13 +7,20 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 // A real Chromium mount exercises React state, native fieldset disabling and the form's API wiring.
 // Only synthetic credentials and local API replacements are used; no backend or Cloudflare request.
 const registered = JSON.parse(readFileSync(new URL('../../../../crates/mesh/src/warp/tests/registration-draft.json', import.meta.url), 'utf8'));
+const existing = JSON.parse(readFileSync(new URL('../../../../crates/mesh/src/warp/tests/registration-server.json', import.meta.url), 'utf8'));
 const root = path.resolve(import.meta.dirname, '../../..');
 const entry = `
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import { mockIPC } from '@tauri-apps/api/mocks';
+import { WarpDialog } from '/src/components/dialogs/WarpDialog';
+import { useDialogStore } from '/src/components/dialogs/dialog-store';
 import { WarpPanel } from '/src/mobile/forms/WarpPanel';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { useAppStore } from '/src/store/app-store';
+import { useStagedConfigStore } from '/src/store/staged-config-store';
+import { configBaseVersion } from '/src/lib/staged-config';
+import { setToastImpl } from '/src/lib/error-handler';
 import { api } from '/src/ipc';
 import { systemApi } from '/src/ipc/api-client';
 import { i18nReady } from '/src/i18n';
@@ -22,7 +29,8 @@ import '/src/mobile/mobile.css';
 import '/src/mobile/forms/forms.css';
 import '/src/mobile/redesign.css';
 await i18nReady;
-const test = window.__warpTest = { mode: new URLSearchParams(location.search).get('mode'), registers: 0, adds: 0, refreshes: 0, ids: [], nodes: [], release: undefined };
+const params = new URLSearchParams(location.search);
+const test = window.__warpTest = { mode: params.get('mode'), registers: 0, adds: 0, refreshes: 0, ids: [], nodes: [], release: undefined, writes: [], toasts: [] };
 systemApi.listNetworkInterfaces = async () => [];
 api.server.registerWarp = async () => { test.registers++; return ${JSON.stringify(registered)}; };
 api.server.add = async (server) => {
@@ -30,21 +38,62 @@ api.server.add = async (server) => {
   if (test.mode === 'save-pending') await new Promise(resolve => { test.release = resolve; });
   if (test.mode === 'save-reject' && test.adds === 1) throw new Error('synthetic response lost');
 };
-useAppStore.setState({ servers: [], config: { servers: [], subscriptions: [] }, loadConfig: async () => {
-  test.refreshes++;
-  if (test.mode === 'refresh-reject' && test.refreshes === 1) throw new Error('synthetic refresh failed');
-  if (test.mode === 'readback-missing' && test.refreshes === 1) return;
-  useAppStore.setState({ servers: test.nodes });
-}});
-const instanceId = useMobileFormStore.getState().open({ kind: 'warp' });
-test.openForms = () => useMobileFormStore.getState().stack.map(form => form.kind);
-createRoot(document.getElementById('root')).render(<main className="mobile-root"><WarpPanel instanceId={instanceId} /></main>);
+const root = createRoot(document.getElementById('root'));
+if (test.mode?.startsWith('edit-')) {
+  let disk = { servers: [${JSON.stringify(existing)}], subscriptions: [] };
+  mockIPC((command, args) => {
+    if (command === 'config_get') return { success: true, data: structuredClone(disk) };
+    if (command === 'app_take_clean_exit_flag') return { success: true, data: false };
+    if (command === 'config_set_staged_pending') return { success: true };
+    if (command === 'config_save') {
+      if (args.hotOnly !== true || args.baseVersion !== configBaseVersion(disk)) {
+        throw new Error('Expected versioned automatic config_save');
+      }
+      test.writes.push([command, args.config.servers[0].id, args.config.servers[0].name]);
+      if (test.mode === 'edit-refused') return { success: true, data: { status: 'rejected' } };
+      if (test.mode === 'edit-manual') return { success: true, data: { status: 'needsManual' } };
+      disk = structuredClone(args.config);
+      return { success: true, data: { status: 'saved', version: configBaseVersion(disk), config: structuredClone(disk) } };
+    }
+    throw new Error('Unexpected IPC: ' + command);
+  }, { shouldMockEvents: true });
+  api.server.applyWarpLicense = async (id, license) => {
+    test.writes.push(['license', id, license]);
+    return { ok: true, warpPlus: true };
+  };
+  api.server.update = async (node) => {
+    test.writes.push(['update', node.id, node.name]);
+    if (test.mode === 'edit-license-save-refused') throw new Error('synthetic local save rejected');
+    disk = { ...disk, servers: [node] };
+  };
+  setToastImpl({ success: () => test.toasts.push('success'), error: () => test.toasts.push('error') });
+  await useAppStore.getState().loadConfig();
+  useAppStore.getState().setPrivacyMode(false);
+  useStagedConfigStore.setState({ enabled: test.mode !== 'edit-direct' });
+  const desktop = params.get('surface') === 'desktop';
+  const store = desktop ? useDialogStore : useMobileFormStore;
+  const Panel = desktop ? WarpDialog : WarpPanel;
+  const instanceId = store.getState().open({ kind: 'warp', edit: true });
+  test.isOpen = () => store.getState().hasInstance(instanceId);
+  test.drafts = () => useStagedConfigStore.getState().entries.map(entry => entry.id);
+  root.render(<main className={desktop ? undefined : 'mobile-root'}><Panel instanceId={instanceId} edit /></main>);
+} else {
+  useAppStore.setState({ servers: [], config: { servers: [], subscriptions: [] }, loadConfig: async () => {
+    test.refreshes++;
+    if (test.mode === 'refresh-reject' && test.refreshes === 1) throw new Error('synthetic refresh failed');
+    if (test.mode === 'readback-missing' && test.refreshes === 1) return;
+    useAppStore.setState({ servers: test.nodes });
+  }});
+  const instanceId = useMobileFormStore.getState().open({ kind: 'warp' });
+  test.openForms = () => useMobileFormStore.getState().stack.map(form => form.kind);
+  root.render(<main className="mobile-root"><WarpPanel instanceId={instanceId} /></main>);
+}
 `;
 
 let server: ViteDevServer;
 let browser: Browser;
 let origin: string;
-describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile WARP retained registration', () => {
+describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('WARP forms', () => {
 beforeAll(async () => {
   server = await createServer({ root, server: { host: '127.0.0.1', port: 0, strictPort: false }, plugins: [{
     name: 'warp-registration-browser-fixture',
@@ -62,6 +111,49 @@ beforeAll(async () => {
   browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
 }, 30_000);
 afterAll(async () => { await browser?.close(); await server?.close(); });
+
+  for (const surface of ['desktop', 'mobile'] as const) {
+    for (const outcome of ['automatic', 'manual', 'refused', 'direct', 'license', 'license-save-refused'] as const) {
+      it(`${surface} WARP edit: ${outcome}`, async () => {
+        const page = await browser.newPage({ viewport: { width: surface === 'desktop' ? 1200 : 400, height: 869 }, locale: 'zh-CN' });
+        try {
+          page.setDefaultTimeout(5_000);
+          await page.goto(`${origin}/__warp?mode=edit-${outcome}&surface=${surface}`);
+          const prefix = surface === 'desktop' ? 'warp' : 'mwarp';
+          const submit = page.locator(surface === 'desktop' ? '.entry-form-dlg .btn.flow' : '.m-form-foot .primary');
+          await page.locator(`#${prefix}-name`).fill('Updated WARP');
+          const usesLicense = outcome.startsWith('license');
+          if (usesLicense) {
+            await page.getByRole('button', { name: 'WARP+', exact: true }).click();
+            await page.locator(`#${prefix}-license`).fill('synthetic-license');
+          }
+          await submit.click();
+          const licenseSaveRefused = outcome === 'license-save-refused';
+          if (licenseSaveRefused && surface === 'mobile') await page.locator('.m-form-notice.err').waitFor();
+          const snapshot = () => page.evaluate(() => {
+            const test = (window as unknown as { __warpTest: {
+              isOpen: () => boolean; drafts: () => string[]; writes: string[][]; toasts: string[]; registers: number; adds: number;
+            } }).__warpTest;
+            return { open: test.isOpen(), drafts: test.drafts(), writes: test.writes, toasts: test.toasts, registers: test.registers, adds: test.adds };
+          });
+          const id = 'synthetic-warp-node';
+          const isDirect = outcome === 'direct' || usesLicense;
+          await expect.poll(snapshot).toEqual({
+            open: outcome === 'refused' || licenseSaveRefused,
+            drafts: outcome === 'manual' ? [`server:${id}`] : [],
+            writes: [
+              ...(usesLicense ? [['license', id, 'synthetic-license']] : []),
+              [isDirect ? 'update' : 'config_save', id, 'Updated WARP'],
+            ],
+            toasts: outcome === 'manual' || (licenseSaveRefused && surface === 'mobile')
+              ? [] : [outcome === 'refused' || licenseSaveRefused ? 'error' : 'success'],
+            registers: 0,
+            adds: 0,
+          });
+        } finally { await page.close(); }
+      }, 30_000);
+    }
+  }
 
   for (const mode of ['save-reject', 'refresh-reject', 'readback-missing']) {
     it(`${mode}: one registration, stable id, acknowledged saves only refresh`, async () => {
