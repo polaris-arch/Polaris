@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 use crate::response::ApiResponse;
 use crate::runtime::http::{app_user_agent, HttpRuntime, SystemDnsLookup};
-use crate::runtime::proxy::runtime_config::RuntimeExitIpRoute;
+use crate::runtime::proxy::runtime_config::{ExitIpHttpRoute, RuntimeExitIpRoute};
 use crate::runtime::proxy::{LocalHttpProxy, ProxyRuntime, ProxyStatus};
 use crate::runtime::AppRuntime;
 use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
@@ -765,7 +765,7 @@ where
     (direct, proxy.unwrap_or(Value::Null))
 }
 
-/// 构造出口 IP 快照：direct（经直连传输层单点）+ proxy（经本机混合端口，核未运行 → null）。
+/// 构造出口 IP 快照：direct（经直连传输层单点）+ proxy（经专用探针入口，核未运行 → null）。
 ///
 /// `post_connect` = 本腿是否跑在**隧道热身窗口**里（起核 / 热切，即走选路收敛延迟那些腿）：
 /// 决定 proxy 腿吃哪套重试预算。对照 上游 触发点全表（§10.1 / `main/index.ts`）：
@@ -797,8 +797,7 @@ async fn build_ipinfo_snapshot(
         IPINFO_DIRECT_ATTEMPTS,
         IPINFO_DIRECT_RETRY_MS,
     );
-    // 代理出口经本机 http 代理入站探（桌面 `mixed-in`；Android 没有 mixed 入站，走 `probe-proxy-in`
-    // 并带本次起核的凭据 —— 此前无条件读 `mixed_port`，Android 上连向一个不存在的口，出口 IP 恒空）。
+    // 代理出口经 `probe-proxy-in` 钉到运行核的 selector，移动端沿用本次起核凭据。
     let (direct, proxy) = if let ProxyProbe::Verified { trace, .. } = probe_kind {
         publish_early(trace);
         (direct.await, trace.clone())
@@ -940,8 +939,8 @@ struct IpinfoProbeInputs {
     http: std::sync::Arc<HttpRuntime>,
     /// 探测时刻的核状态（决定是否探 proxy 出口 + 伴测门控）。
     status: ProxyStatus,
-    /// 探测时刻的本机 http 代理入站（端口 + 凭据；与 `status` 同一时点取）。
-    local_proxy: Option<LocalHttpProxy>,
+    /// 探测时刻的专用代理入口和运行核身份。
+    http_route: Option<ExitIpHttpRoute>,
     /// Bootstrap DoH 阻断投影（未阻断 → `None`）。
     doh_blocked: Option<&'static str>,
     /// 运行时 R 配置（伴测取真实出口 `selectedServerId` / 测速 URL）；停核时可读磁盘 D。
@@ -951,6 +950,7 @@ struct IpinfoProbeInputs {
 /// 从 `AppRuntime` 摘出 [`IpinfoProbeInputs`]（同步，无 await —— 借用在本函数内即结束）。
 fn ipinfo_probe_inputs(state: &AppRuntime) -> IpinfoProbeInputs {
     let status = state.proxy().status();
+    let http_route = state.proxy().exit_ip_http_route(status.main_generation);
     // 代理探测走当前运行入口。D 可能已保存新选择但仍待 Apply；以 D 归属 warm RTT
     // 会把经旧 R 隧道量到的时延记到新节点。运行中缺 R 时保守不给任何节点归属。
     let config = ipinfo_probe_config(
@@ -961,7 +961,7 @@ fn ipinfo_probe_inputs(state: &AppRuntime) -> IpinfoProbeInputs {
     IpinfoProbeInputs {
         http: state.http().clone(),
         status,
-        local_proxy: state.proxy().local_http_proxy(),
+        http_route,
         doh_blocked: state.proxy().doh_blocked_notice(),
         config,
     }
@@ -1014,10 +1014,11 @@ async fn probe_publish_ipinfo(
     let IpinfoProbeInputs {
         http,
         status,
-        local_proxy,
+        http_route,
         doh_blocked,
         config,
     } = inputs;
+    let local_proxy = http_route.as_ref().map(|route| &route.proxy);
     let publish = |mut snap: Value, warm_rtt| {
         if let ProxyProbe::Verified { observed_at, .. } = &probe_kind {
             snap["updatedAt"] = json!(observed_at);
@@ -1028,6 +1029,12 @@ async fn probe_publish_ipinfo(
             ProxyProbe::Verified { runtime, route, .. } => {
                 runtime.with_pinned_exit_ip_route(route, commit).flatten()
             }
+            _ if !snap["proxy"].is_null() => http_route.as_ref().and_then(|route| {
+                app.try_state::<AppRuntime>()?
+                    .proxy()
+                    .with_exit_ip_http_route(route, commit)
+                    .flatten()
+            }),
             _ => commit(),
         };
         let Some(snap) = committed else {
@@ -1053,7 +1060,7 @@ async fn probe_publish_ipinfo(
                 &config,
                 proxy_probed,
                 status.running,
-                local_proxy.clone(),
+                local_proxy.cloned(),
                 epoch,
                 seq,
             );
@@ -1065,19 +1072,13 @@ async fn probe_publish_ipinfo(
     let snap = build_ipinfo_snapshot(
         http.as_ref(),
         &status,
-        local_proxy.as_ref(),
+        local_proxy,
         doh_blocked,
         &probe_kind,
         (epoch, seq),
         |proxy| {
             // 让代理结果立即可见，直连仍在检测，完整缓存保持不变。
-            let mut early = ipinfo_snapshot(
-                &status,
-                local_proxy.as_ref(),
-                doh_blocked,
-                None,
-                proxy.clone(),
-            );
+            let mut early = ipinfo_snapshot(&status, local_proxy, doh_blocked, None, proxy.clone());
             early["loading"] = json!(true);
             let (early, committed) = publish(early, true);
             if committed {
@@ -1190,7 +1191,7 @@ fn schedule_unreachable_ipinfo_recheck(
                 return;
             };
             if !inputs.status.running
-                || inputs.local_proxy.is_none()
+                || inputs.http_route.is_none()
                 || !ipinfo_config_has_real_exit(&inputs.config)
             {
                 return;
@@ -1215,7 +1216,7 @@ fn schedule_unreachable_ipinfo_recheck(
 /// [`ProxyErrorEmitter::schedule_exit_ip_refresh`](crate::runtime::proxy::ProxyErrorEmitter::schedule_exit_ip_refresh)）。
 ///
 /// `delay_ms > 0` ⇒ 同步落地并广播 pending（UI 立即置空成 `—`），保留原探测时点。
-/// 移动端可在稳定门退场后提前请求已认证内核的精确代理出口。
+/// 稳定门退场后可提前请求已认证内核的精确代理出口。
 /// `delay_ms == 0` ⇒ 同步发布代理出口已消失的终态，防旧出口跨停核/重启窗口回填。
 ///
 /// # 🟠 按开探顺序发号：[`begin_scheduled_probe`] 在各条腿发请求时取票
@@ -1424,15 +1425,15 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
     let app = app.clone();
     tauri::async_runtime::spawn(run_automatic_ipinfo_probe(ticket, async move {
         let post_connect = delay_ms == IPINFO_SETTLE_DELAY_MS;
-        let (already_published, first_attempt) =
-            if cfg!(any(target_os = "android", target_os = "ios"))
-                && post_connect
-                && !recheck_unlock_on_recovery
-            {
-                try_first_proxy_probe(&app, ticket, fallback_at).await
-            } else {
-                (false, FirstProxyAttempt::NotAttempted)
-            };
+        let (already_published, first_attempt) = if post_connect && !recheck_unlock_on_recovery {
+            try_first_proxy_probe(&app, ticket, fallback_at).await
+        } else {
+            (false, FirstProxyAttempt::NotAttempted)
+        };
+        let mut rejected_partial = match first_attempt {
+            FirstProxyAttempt::Completed(partial) if !already_published => partial,
+            _ => None,
+        };
         if !already_published && delay_ms > 0 {
             tokio::time::sleep_until(fallback_at).await;
         }
@@ -1453,8 +1454,11 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
                 } else {
                     ProxyProbe::Standard
                 };
-                let (snapshot, committed, _) =
+                let (snapshot, committed, partial) =
                     probe_publish_ipinfo(&app, inputs, epoch, seq, probe_kind).await;
+                if !committed && partial.is_some() {
+                    rejected_partial = partial;
+                }
                 if committed && ipinfo_probe_is_current(epoch, seq) {
                     if recheck_unlock_on_recovery {
                         maybe_recheck_unlock_after_exit_recovery(
@@ -1467,13 +1471,8 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
                 }
             }
         }
-        // A failed guarded completion can leave its earlier fast frame
-        // visible. Finalize a newer legacy partial normally, but do not
-        // promote the old fast frame after its route proof was rejected.
-        let rejected_partial = match first_attempt {
-            FirstProxyAttempt::Completed(partial) if !already_published => partial,
-            _ => None,
-        };
+        // A route can change while the direct leg finishes. Do not promote a
+        // previously published proxy partial after its route proof was rejected.
         if let Some(frame) = finish_scheduled_probe(ticket, rejected_partial) {
             crate::events::broadcast(&app, crate::events::channel::EVENT_IP_INFO_UPDATED, frame);
         }

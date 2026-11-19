@@ -2187,7 +2187,7 @@ impl ProxyRuntime {
 
     /// 进程内「经本机 **http** 代理入站走当前代理出口」的目标（端口 + 该入站要求的凭据）。
     ///
-    /// 解锁检测 / 出口 IP / 测速回退腿 / warm RTT 伴测四条腿的**唯一**取址处。判据在纯函数
+    /// 解锁检测 / 测速回退腿 / warm RTT 伴测的取址处。判据在纯函数
     /// [`select_local_http_proxy`]：有 `mixed-in` 用它，没有（Android / iOS）用 `probe-proxy-in`。
     /// 核未运行 → `None`。
     #[must_use]

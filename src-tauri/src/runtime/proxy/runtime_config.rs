@@ -6,7 +6,7 @@ use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::hot_switch::SwitchOutcome;
-use super::ProxyRuntime;
+use super::{select_local_http_proxy, LocalHttpProxy, ProxyRuntime};
 use crate::runtime::config::{PreparedConfigEdit, SavedCommitError};
 use crate::runtime::route_binding::{
     plan_protected_runtime_bindings, protected_generated_policy_compatible, ProtectedBindingPlan,
@@ -58,6 +58,15 @@ pub(crate) struct RuntimeExitIpRoute {
     control: Arc<SingBoxApiClient>,
     baseline_active: daemon::RuntimeIdentity,
     baseline_control_revision: u64,
+}
+
+#[derive(PartialEq)]
+pub(crate) struct ExitIpHttpRoute {
+    pub(crate) proxy: LocalHttpProxy,
+    generation: u64,
+    intent: u64,
+    active: Option<daemon::RuntimeIdentity>,
+    control_revision: u64,
 }
 
 #[derive(Debug)]
@@ -555,6 +564,69 @@ async fn paired_runtime_capabilities(
 }
 
 impl ProxyRuntime {
+    pub(crate) fn exit_ip_http_route(&self, generation: u64) -> Option<ExitIpHttpRoute> {
+        let _switch = self.switch_serial.try_lock().ok()?;
+        let intent = self.selector_reconcile.intent_generation();
+        self.with_runtime_candidate_claim(false, generation, intent, || {
+            self.snapshot_exit_ip_http_route(generation, intent)
+        })
+        .ok()?
+    }
+
+    pub(crate) fn with_exit_ip_http_route<T>(
+        &self,
+        route: &ExitIpHttpRoute,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _switch = self.switch_serial.try_lock().ok()?;
+        self.with_runtime_candidate_claim(false, route.generation, route.intent, || {
+            (self
+                .snapshot_exit_ip_http_route(route.generation, route.intent)
+                .as_ref()
+                == Some(route))
+            .then(commit)
+        })
+        .ok()?
+    }
+
+    fn snapshot_exit_ip_http_route(&self, generation: u64, intent: u64) -> Option<ExitIpHttpRoute> {
+        if !self.core_running()
+            || self.selector_reconcile.is_required()
+            || self.login_fallback_engaged()
+            || !self.exit_ip_graph_is_published(generation)
+        {
+            return None;
+        }
+        let snapshot = self.switch_snapshot.read().ok()?;
+        let snapshot = snapshot.as_ref()?;
+        // The mixed listener follows user routing rules. The probe listener is
+        // pinned to the selected egress before those rules can match.
+        let proxy =
+            select_local_http_proxy(0, snapshot.probe_proxy_port, snapshot.loopback_auth.clone())?;
+        let baseline = self.runtime_config_baseline.read().ok()?;
+        let baseline = baseline
+            .as_ref()
+            .filter(|baseline| baseline.generation == generation)?;
+        Some(ExitIpHttpRoute {
+            proxy,
+            generation,
+            intent,
+            active: baseline.observed_active.clone(),
+            control_revision: baseline.observed_control_revision,
+        })
+    }
+
+    fn exit_ip_graph_is_published(&self, generation: u64) -> bool {
+        // Core can advance the graph before App publishes its receipt. Guard
+        // this gap as well as changes to the last published graph identity.
+        self.runtime_config_apply.try_lock().is_ok_and(|state| {
+            state
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.generation != generation || pending.published)
+        })
+    }
+
     pub(crate) fn pinned_exit_ip_route(&self) -> Option<RuntimeExitIpRoute> {
         let generation = self.gate.try_idle_generation()?;
         let intent = self.selector_reconcile.intent_generation();
@@ -602,6 +674,7 @@ impl ProxyRuntime {
                 || self.gate.try_idle_generation() != Some(route.generation)
                 || !self.core_running()
                 || self.selector_reconcile.is_required()
+                || !self.exit_ip_graph_is_published(route.generation)
                 || route.api_epoch.is_closed()
                 || !route.control.captured_transport_live()
                 || self.current_exit_ip_leaf().as_ref() != Some(&route.leaf)
