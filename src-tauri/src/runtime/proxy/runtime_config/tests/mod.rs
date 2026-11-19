@@ -137,10 +137,14 @@ async fn exit_ip_routes_reject_active_switch_and_stale_graphs() {
     assert!(futures::poll!(&mut wait).is_pending());
     drop(switch);
     let updated_route = wait.await.unwrap();
-    assert_eq!(runtime.with_exit_ip_http_route(&route, || ()), None);
+    let failed_snapshot = json!({"proxy": null, "proxyReachability": "unreachable"});
     assert_eq!(
-        runtime.with_exit_ip_http_route(&updated_route, || ()),
-        Some(())
+        runtime.with_exit_ip_http_route(&route, || &failed_snapshot),
+        None
+    );
+    assert_eq!(
+        runtime.with_exit_ip_http_route(&updated_route, || &failed_snapshot),
+        Some(&failed_snapshot)
     );
     let route = updated_route;
     let pinned = runtime.pinned_exit_ip_route().unwrap();

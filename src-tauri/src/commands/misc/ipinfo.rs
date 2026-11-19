@@ -1080,13 +1080,16 @@ async fn probe_publish_ipinfo(
             ProxyProbe::Verified { runtime, route, .. } => {
                 runtime.with_pinned_exit_ip_route(route, commit).flatten()
             }
-            _ if !snap["proxy"].is_null() => tested_route.get().and_then(|(route, _)| {
-                app.try_state::<AppRuntime>()?
-                    .proxy()
-                    .with_exit_ip_http_route(route, commit)
-                    .flatten()
-            }),
-            _ => commit(),
+            _ => match tested_route.get() {
+                Some((route, _)) => app.try_state::<AppRuntime>().and_then(|state| {
+                    state
+                        .proxy()
+                        .with_exit_ip_http_route(route, commit)
+                        .flatten()
+                }),
+                None if snap["proxy"].is_null() => commit(),
+                None => None,
+            },
         };
         let Some(snap) = committed else {
             return (peek_ipinfo_snapshot(), false);

@@ -156,6 +156,14 @@ fn stale_result_cannot_broadcast_or_start_warm_probe() {
     let gate = publish
         .find("commit_ipinfo_snapshot(epoch, seq, &snap)")
         .unwrap();
+    let http = publish.split_once("match tested_route.get() {").unwrap().1;
+    let route_check = http
+        .find(".with_exit_ip_http_route(route, commit)")
+        .unwrap();
+    let no_attempt = http
+        .find("None if snap[\"proxy\"].is_null() => commit()")
+        .unwrap();
+    assert!(route_check < no_attempt);
     let stale = publish
         .find("return (peek_ipinfo_snapshot(), false)")
         .unwrap();
