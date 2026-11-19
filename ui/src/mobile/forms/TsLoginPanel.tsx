@@ -12,6 +12,7 @@ import {
   supportsTsAccountActions,
   executeTsLogin,
   nextTsNodeName,
+  persistTsLoginServer,
   planTsLoginSubmit,
   supportsTsLoginActions,
   tsAccountActionsUseNormalMain,
@@ -415,10 +416,7 @@ export function TsLoginPanel({
           return states[server.id];
         } : undefined,
         logout: () => api.server.tailscaleLogout(server.id, request.attemptId),
-        save: async () => {
-          if (persist === 'add') await api.server.add(server);
-          else if (persist === 'update') await api.server.update(server);
-        },
+        save: () => persistTsLoginServer(server, persist),
         onSaved: () => recordSaved(server),
         refresh: async () => {
           if (!backendOwned && persist === 'none') return;

@@ -228,6 +228,47 @@ fn server_add_core_persists_node_with_minted_id() {
 }
 
 #[test]
+fn prepared_tailscale_add_keeps_stable_id_and_exact_saved_revision() {
+    let dir = temp_dir("prepared_ts_add");
+    let config = ConfigManager::new(dir.clone());
+    let node = normalized_add_server(json!({
+        "id": "ts-fresh",
+        "name": "Tailscale",
+        "protocol": "tailscale",
+        "tailscaleSettings": {},
+    }))
+    .unwrap();
+    let prepare = || {
+        let (result, edit) = config
+            .prepare_config_edit(|cfg| append_normalized_server(cfg, &node))
+            .unwrap();
+        result.unwrap();
+        edit
+    };
+    let stale = prepare().unwrap();
+    assert_eq!(config.load_full().unwrap()["servers"], json!([]));
+    server_add_core(
+        &config,
+        json!({"id": "other", "name": "Other", "protocol": "trojan",
+               "address": "other.invalid", "port": 443, "password": "pw"}),
+    )
+    .unwrap();
+    assert_eq!(
+        config
+            .commit_prepared_config_edit(&stale, || true, |_| {})
+            .unwrap(),
+        None
+    );
+    let current = prepare().unwrap();
+    assert!(config
+        .commit_prepared_config_edit(&current, || true, |_| {})
+        .unwrap()
+        .is_some());
+    assert_eq!(config.load_full().unwrap()["servers"][1]["id"], "ts-fresh");
+    assert!(prepare().is_none());
+}
+
+#[test]
 fn warp_draft_wire_contract_persists_through_the_real_add_command_core() {
     let dir = temp_dir("warp-draft");
     let mgr = ConfigManager::new(dir.clone());

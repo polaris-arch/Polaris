@@ -100,7 +100,7 @@ const PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   // W-d：专用 IPC 写腿 —— 前端发的是「加一个节点」而不是「写 servers 键」，但落盘的是同一份 config。
   [
     'W-d',
-    /\b(?:api\.(?:server|rules|subscription|ruleResources)|(?:server|rules|subscription|ruleResources)Api)\s*\.\s*(?:add|addBulk|createStart|update|updateServers|delete|deleteBatch|reorder|switch|registerWarp|applyWarpLicense|download|redownload|cancel|resetBuiltin|setAutoUpdate|updateAll|tailscaleLogin|tailscaleLogout|tailscaleLoginCancel|autoSelectEnable|autoSelectSwitchNow)\s*\(/g,
+    /\b(?:api\.(?:server|rules|subscription|ruleResources)|(?:server|rules|subscription|ruleResources)Api)\s*\.\s*(?:add|addTailscaleLoginProfile|addBulk|createStart|update|updateServers|delete|deleteBatch|reorder|switch|registerWarp|applyWarpLicense|download|redownload|cancel|resetBuiltin|setAutoUpdate|updateAll|tailscaleLogin|tailscaleLogout|tailscaleLoginCancel|autoSelectEnable|autoSelectSwitchNow)\s*\(/g,
   ],
 ];
 
@@ -542,13 +542,13 @@ const SITES: readonly Site[] = [
     why: 'servers Class B（克隆 = 造一个新节点，无副作用）',
   },
   {
-    file: 'components/dialogs/TsLoginDialog.tsx',
-    callee: 'api.server.add(',
+    file: 'components/dialogs/ts-login-server.ts',
+    callee: 'api.server.addTailscaleLoginProfile(',
     route: 'direct',
     why: 'W-3：紧接着的 tailscaleLogin 是有远端效应的登录流程，且它按节点 id 寻址 —— 节点必须先真落盘',
   },
   {
-    file: 'components/dialogs/TsLoginDialog.tsx',
+    file: 'components/dialogs/ts-login-server.ts',
     callee: 'api.server.update(',
     route: 'direct',
     why: 'W-3：登录流程按节点 id 寻址，编辑态同样要求节点已经在磁盘上',
@@ -709,18 +709,6 @@ const SITES: readonly Site[] = [
     callee: 'api.server.update(',
     route: 'direct',
     why: 'W-3：applyWarpLicense 已改过远端账户绑定（同 WarpDialog）',
-  },
-  {
-    file: 'mobile/forms/TsLoginPanel.tsx',
-    callee: 'api.server.add(',
-    route: 'direct',
-    why: 'W-3：紧接着的 tailscaleLogin 是有远端效应的登录流程，且它按节点 id 寻址 —— 节点必须先真落盘（同 TsLoginDialog）',
-  },
-  {
-    file: 'mobile/forms/TsLoginPanel.tsx',
-    callee: 'api.server.update(',
-    route: 'direct',
-    why: 'W-3：登录流程按节点 id 寻址，编辑态同样要求节点已经在磁盘上',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
@@ -1281,12 +1269,14 @@ describe('T4：`enabled=false` 时的行为契约（关闭态必须等价于暂�
 describe('T5：TS / WARP 的远端注册/登录写腿恒 direct', () => {
   const MESH_SINGLETON_FILES = [
     'components/dialogs/TsLoginDialog.tsx',
+    'components/dialogs/ts-login-server.ts',
+    'mobile/forms/TsLoginPanel.tsx',
     'components/dialogs/WarpDialog.tsx',
   ] as const;
 
   const rows = SITES.filter((s) => (MESH_SINGLETON_FILES as readonly string[]).includes(s.file));
 
-  it('两个弹窗都真的有写腿被登记（扫空 ⇒ 下面那条恒真）', () => {
+  it('组网入口及共享保存流程都有写腿被登记', () => {
     for (const f of MESH_SINGLETON_FILES) {
       expect(
         rows.filter((s) => s.file === f).length,
@@ -1295,7 +1285,7 @@ describe('T5：TS / WARP 的远端注册/登录写腿恒 direct', () => {
     }
   });
 
-  it('这两个文件里没有任何一条写腿走 staged', () => {
+  it('所有组网入口的注册或登录操作都走 direct', () => {
     const staged = rows.filter((s) => s.route !== 'direct').map((s) => `${s.file} | ${s.callee} → ${s.route}`);
     expect(
       staged,

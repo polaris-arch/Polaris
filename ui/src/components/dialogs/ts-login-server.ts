@@ -1,18 +1,16 @@
 /**
- * TsLoginDialog 提交前的「节点落盘决策」纯逻辑（与组件分离，走 node 环境单测）。
+ * 桌面和移动的 Tailscale 节点保存与授权流程。
  *
  * 为何登录前必须先落盘节点：后端把登录产物按 `server.id` 分键存——登录配置写
  * `tailscale-login-<id>.json`（runtime/tailscale_login_core.rs:348），state 目录同样按 id 分
  * （crates/mesh/src/tailscale_login.rs）。拿 `id: ''` 直接发起登录，登录成果会落在空串键下，与日后
  * 任何真实节点 id 永不匹配 = 成果孤儿化；且 config 里从头到尾不会出现 Tailscale 节点。
  *
- * 为何 id 由渲染端 mint 而不是取 `add` 的返回值：`server_add`（commands/server.rs:65）返回
- * `ApiResponse<()>`，**不回传新建节点**（api-client 的 `Promise<ServerConfig>` 签名与后端不符，见
- * 交付说明）；而 `ensure_server_id`（同文件 :40）只在 id 缺失/空串时才 mint，非空 id 原样保留 →
- * 「渲染端自带 id 落盘」是后端明确支持的契约（其单测名即 `..._keeps_existing`）。
+ * 登录前预订的 attempt 已绑定到渲染端生成的 id，新增节点时后端保留此 id。
  */
 import type { ServerConfig, TailscaleSettings, TailscaleCredentialMetadata } from '@/contracts/types';
 import { hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
+import { api } from '@/ipc';
 
 /** Only call with a new editable copy: retained secrets and view metadata never enter candidates. */
 export function stripTsCredentialMetadata(copy: {
@@ -228,7 +226,7 @@ export interface TsLoginExecution {
   prepare: () => Promise<void>;
   verifyState?: () => Promise<boolean>;
   logout: () => Promise<unknown>;
-  save: () => Promise<void>;
+  save: () => Promise<'saved' | 'runtimePending' | void>;
   onSaved: () => void;
   refresh: () => Promise<unknown>;
   start: () => Promise<{ started: boolean; reason?: string }>;
@@ -255,6 +253,11 @@ export function tsLoginErrorReason(error: unknown): string | undefined {
   return undefined;
 }
 
+export async function persistTsLoginServer(server: ServerConfig, persist: 'add' | 'update' | 'none') {
+  if (persist === 'add') return api.server.addTailscaleLoginProfile(server);
+  if (persist === 'update') await api.server.update(server);
+}
+
 /** Empty-credential login saves first; backend-owned actions refresh once after their request settles. */
 export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 'handedOff' | 'cancelled' | 'failed'; reason?: string; refreshFailed?: boolean }> {
   const backendOwned = input.backendReplacement || input.backendCredentials;
@@ -278,12 +281,13 @@ export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 
       }
       if (!backendOwned) {
         stage = 'saveFailed';
-        await input.save();
+        const disposition = await input.save();
         input.onSaved();
         if (!input.isActive()) return { phase: 'cancelled' };
         stage = 'configurationRefreshFailed';
         await input.refresh();
         if (!input.isActive()) return { phase: 'cancelled' };
+        if (disposition === 'runtimePending') return { phase: 'failed', reason: 'readyUnknown' };
       }
       stage = 'authorizationRequestFailed';
       invoked = true;

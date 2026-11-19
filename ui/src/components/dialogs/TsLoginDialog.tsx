@@ -11,7 +11,7 @@ import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
-import { executeTsLogin, nextTsNodeName, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
+import { executeTsLogin, nextTsNodeName, persistTsLoginServer, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
 import { captureMainCoreOwner, stopOwnedCore } from './ts-logout-flow';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import { TsLoginModeSwitch } from './TsLoginModeSwitch';
@@ -311,10 +311,7 @@ export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }:
         return states[server.id];
       } : undefined,
       logout: () => api.server.tailscaleLogout(server.id, request.attemptId),
-      save: async () => {
-        if (persist === 'add') await api.server.add(server);
-        else if (persist === 'update') await api.server.update(server);
-      },
+      save: () => persistTsLoginServer(server, persist),
       onSaved: () => {
         savedServer.current = server;
         if (stillActive()) { setSaved(true); if (editRevision.current === submissionRevision) setDirty(false); }

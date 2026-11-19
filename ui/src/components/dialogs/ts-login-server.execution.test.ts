@@ -87,6 +87,19 @@ describe('save followed by authorization', () => {
     expect(mint).toHaveBeenCalledOnce();
   });
 
+  it('preserves an already-saved profile but does not start independent auth on an unconfirmed hot apply', async () => {
+    const order: string[] = [];
+    const input = execution({
+      save: async () => 'runtimePending',
+      onSaved: () => { order.push('saved'); },
+      refresh: async () => { order.push('refresh'); },
+      cancel: async () => { order.push('cancel'); },
+    });
+    expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'readyUnknown' });
+    expect(order).toEqual(['saved', 'refresh', 'cancel']);
+    expect(input.start).not.toHaveBeenCalled();
+  });
+
   it('close before prepare resolves prevents save/start and awaits cancellation', async () => {
     let active = true;
     let finishPrepare!: () => void;

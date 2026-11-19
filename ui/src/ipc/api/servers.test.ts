@@ -18,6 +18,15 @@ afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 describe('Tailscale IPC intent and presence', () => {
   beforeEach(() => invoke.mockClear());
 
+  it('opts fresh login into exact hot save without changing ordinary node add', async () => {
+    const server = { id: 'ts-1', protocol: 'tailscale' } as ServerConfig;
+    invoke.mockResolvedValueOnce(null).mockResolvedValueOnce('runtimePending');
+    await serverApi.add(server);
+    expect(await serverApi.addTailscaleLoginProfile(server)).toBe('runtimePending');
+    expect(invoke).toHaveBeenNthCalledWith(1, IPC_CHANNELS.SERVER_ADD, { server });
+    expect(invoke).toHaveBeenNthCalledWith(2, IPC_CHANNELS.SERVER_ADD, { server, forTailscaleLogin: true });
+  });
+
   it('keeps the default presence query in directory mode', async () => {
     await serverApi.tailscaleStateExists(['ts-1']);
     expect(invoke).toHaveBeenCalledWith(IPC_CHANNELS.TAILSCALE_STATE_EXISTS, {

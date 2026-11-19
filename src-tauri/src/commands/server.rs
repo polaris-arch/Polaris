@@ -35,6 +35,7 @@ use crate::response::{ok_void, ApiResponse};
 #[cfg(test)]
 use crate::runtime::auto_select::{self, Cause, Decision, Gate, Leg, SwitchRecord};
 use crate::runtime::config::{ConfigManager, Decision as ConfigDecision};
+use crate::runtime::proxy::runtime_config::HotConfigEditOutcome;
 #[cfg(test)]
 use crate::runtime::proxy::ProxyRuntime;
 use crate::runtime::proxy::{code, SwitchOutcome};
@@ -83,38 +84,147 @@ fn normalized_add_server(server: Value) -> Result<Value, String> {
 /// 补 id + 校验 + 原子落盘。同 id 同规范化内容重试不再写入；冲突不覆盖既有节点。
 fn server_add_core(config: &ConfigManager, server: Value) -> Result<Value, String> {
     let server = normalized_add_server(ensure_server_id(server))?;
-    let id = server["id"].as_str().expect("sanitize 保证非空 id");
     let (result, saved) = config
-        .update(|cfg| {
-            let Some(servers) = cfg.get("servers").and_then(Value::as_array) else {
-                return ConfigDecision::Skip(Err("节点列表不可用".to_string()));
-            };
-            if let Some(existing) = servers.iter().find(|node| node["id"].as_str() == Some(id)) {
-                return if normalized_add_server(existing.clone()).as_ref() == Ok(&server) {
-                    ConfigDecision::Skip(Ok(cfg.clone()))
-                } else {
-                    ConfigDecision::Skip(Err("节点标识已存在且内容不同".to_string()))
-                };
-            }
-            // 检查集合级清洗约束；仅在副本上验证，不把清洗后的集合写回旧节点。
-            let mut proposed = servers.clone();
-            proposed.push(server.clone());
-            let cleaned =
-                match polaris_store::sanitize_config(&json!({"servers": proposed}).to_string()) {
-                    Ok(cleaned) => cleaned,
-                    Err(_) => return ConfigDecision::Skip(Err("新增节点校验失败".to_string())),
-                };
-            if !cleaned["servers"]
-                .as_array()
-                .is_some_and(|nodes| nodes.iter().any(|node| node["id"].as_str() == Some(id)))
-            {
-                return ConfigDecision::Skip(Err("新增节点与现有节点配置冲突".to_string()));
-            }
-            cfg["servers"].as_array_mut().unwrap().push(server.clone());
-            ConfigDecision::Write(Ok(Value::Null))
-        })
+        .update(|cfg| append_normalized_server(cfg, &server))
         .map_err(|e| format!("{e}"))?;
     result.map(|unchanged| saved.unwrap_or(unchanged))
+}
+
+fn append_normalized_server(
+    cfg: &mut Value,
+    server: &Value,
+) -> ConfigDecision<Result<Value, String>> {
+    let id = server["id"].as_str().expect("sanitize 保证非空 id");
+    let Some(servers) = cfg.get("servers").and_then(Value::as_array) else {
+        return ConfigDecision::Skip(Err("节点列表不可用".to_string()));
+    };
+    if let Some(existing) = servers.iter().find(|node| node["id"].as_str() == Some(id)) {
+        return if normalized_add_server(existing.clone()).as_ref() == Ok(server) {
+            ConfigDecision::Skip(Ok(cfg.clone()))
+        } else {
+            ConfigDecision::Skip(Err("节点标识已存在且内容不同".to_string()))
+        };
+    }
+    // 检查集合级清洗约束；仅在副本上验证，不把清洗后的集合写回旧节点。
+    let mut proposed = servers.clone();
+    proposed.push(server.clone());
+    let cleaned = match polaris_store::sanitize_config(&json!({"servers": proposed}).to_string()) {
+        Ok(cleaned) => cleaned,
+        Err(_) => return ConfigDecision::Skip(Err("新增节点校验失败".to_string())),
+    };
+    if !cleaned["servers"]
+        .as_array()
+        .is_some_and(|nodes| nodes.iter().any(|node| node["id"].as_str() == Some(id)))
+    {
+        return ConfigDecision::Skip(Err("新增节点与现有节点配置冲突".to_string()));
+    }
+    cfg["servers"].as_array_mut().unwrap().push(server.clone());
+    ConfigDecision::Write(Ok(Value::Null))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TailscaleProfileSave {
+    Saved,
+    RuntimePending,
+}
+
+async fn save_tailscale_login_profile(
+    app: &AppHandle,
+    state: &AppRuntime,
+    server: Value,
+) -> ApiResponse<Option<TailscaleProfileSave>> {
+    use TailscaleProfileSave::{RuntimePending, Saved};
+
+    let server = match normalized_add_server(ensure_server_id(server)) {
+        Ok(server) if server["protocol"] == "tailscale" => server,
+        Ok(_) => return ApiResponse::err("Expected a Tailscale profile"),
+        Err(error) => return ApiResponse::err(error),
+    };
+    let config = state.config();
+    let proxy = &state.proxy;
+    let (result, edit) =
+        match config.prepare_config_edit(|cfg| append_normalized_server(cfg, &server)) {
+            Ok(prepared) => prepared,
+            Err(error) => return ApiResponse::err(error.to_string()),
+        };
+    if let Err(error) = result {
+        return ApiResponse::err(error);
+    }
+    let stopped = || !proxy.tailscale_writer_alive() && !proxy.core_lifecycle_busy();
+    let Some(edit) = edit else {
+        // The exact profile already exists. An idempotent retry cannot apply an
+        // earlier writer's pending graph or infer its terminal from D.
+        return ApiResponse::ok(Some(if stopped() { Saved } else { RuntimePending }));
+    };
+    let save_only = || {
+        // Only this exact append may be written. The native login path
+        // still owns independent or main-Core authorization admission.
+        config
+            .commit_prepared_config_edit(&edit, || true, |_| {})
+            .map(|committed| committed.map(|revision| (revision, Saved)))
+    };
+    let result = match Box::pin(proxy.apply_hot_config_edit(&edit)).await {
+        Ok(HotConfigEditOutcome::Saved {
+            runtime_apply,
+            revision,
+        }) => {
+            let ready = match runtime_apply {
+                Some(receipt) => {
+                    receipt.status == "hotApplied" && receipt.configuration_durable == Some(true)
+                }
+                None => stopped(),
+            };
+            Ok(Some((revision, if ready { Saved } else { RuntimePending })))
+        }
+        Ok(HotConfigEditOutcome::NeedsManual { .. }) => save_only(),
+        Ok(HotConfigEditOutcome::BlockedByPending) if !cfg!(target_os = "ios") => save_only(),
+        Ok(HotConfigEditOutcome::BlockedByPending) => {
+            return ApiResponse::err_with_code(
+                "A saved change needs to be applied first",
+                "configurationPending",
+            );
+        }
+        Ok(HotConfigEditOutcome::Retryable | HotConfigEditOutcome::Conflict) => {
+            return ApiResponse::err_with_code(
+                "Tailscale profile save can be retried",
+                "readyUnknown",
+            );
+        }
+        Ok(HotConfigEditOutcome::Rejected) => {
+            return ApiResponse::err("Tailscale profile was rejected")
+        }
+        Err(error) => Err(error),
+    };
+    let (revision, disposition) = match result {
+        Ok(Some(saved)) => saved,
+        Ok(None) => {
+            return ApiResponse::err_with_code(
+                "Tailscale profile save was superseded",
+                "readyUnknown",
+            );
+        }
+        Err(error) => {
+            if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
+                proxy.push_pending_changes();
+                emit_config_changed_signal(app);
+                if config
+                    .with_current(|saved| saved == &edit.candidate)
+                    .unwrap_or(false)
+                {
+                    return ApiResponse::ok(Some(RuntimePending));
+                }
+            }
+            return ApiResponse::err(error.to_string());
+        }
+    };
+    proxy.push_pending_changes();
+    emit_config_changed_signal(app);
+    ApiResponse::ok(Some(if config.saved_revision() == revision {
+        disposition
+    } else {
+        RuntimePending
+    }))
 }
 
 /// 上游 `SERVER_ADD`：新增节点（id 缺失/空则 mint，防 sanitize 丢弃）。
@@ -137,14 +247,22 @@ fn server_add_core(config: &ConfigManager, server: Value) -> Result<Value, Strin
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn server_add(app: AppHandle, state: State<'_, AppRuntime>, server: Value) -> ApiResponse<()> {
-    match server_add_core(state.config(), server) {
+pub async fn server_add(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    server: Value,
+    for_tailscale_login: Option<bool>,
+) -> Result<ApiResponse<Option<TailscaleProfileSave>>, ()> {
+    if for_tailscale_login.unwrap_or(false) {
+        return Ok(Box::pin(save_tailscale_login_profile(&app, &state, server)).await);
+    }
+    Ok(match server_add_core(state.config(), server) {
         Ok(cfg) => {
             broadcast_config_changed(&app, &cfg);
-            ok_void()
+            ApiResponse::ok(None)
         }
         Err(e) => ApiResponse::err(e),
-    }
+    })
 }
 
 /// Batch import is atomic: validate every record before touching stored nodes.

@@ -90,7 +90,7 @@ const RENDERS_EFFECTIVE = /useEffectiveServers|useEffectiveRules|use-node-deleti
  *  use-node-deletion/use-node-subscription-actions/use-node-speed-test 是既有三家；
  *  use-node-actions.ts（5B）、rule-submit.ts（5C）与移动窗口 use-mobile-speed-test（2026-09-27）同样接 caller 的实体投影，同一条判据。 */
 const EXTRACTED_OWNER_PATH =
-  /components[\\/](?:screens[\\/]nodes[\\/]use-node-(?:deletion|subscription-actions|speed-test|actions)|dialogs[\\/]rule-submit)\.ts$|mobile[\\/]use-mobile-speed-test\.ts$/;
+  /components[\\/](?:screens[\\/]nodes[\\/]use-node-(?:deletion|subscription-actions|speed-test|actions)|dialogs[\\/](?:rule-submit|ts-login-server))\.ts$|mobile[\\/]use-mobile-speed-test\.ts$/;
 
 interface Call {
   readonly file: string;
@@ -269,14 +269,14 @@ const SITES: readonly ActionSite[] = [
   // TS 登录只用 effective 组网集合收集名称；既有身份来自磁盘 servers.find，
   // 新建身份由 planTsLoginSubmit mint 并先保存。下列调用不会收到 staged-only id。
   {
-    file: 'components/dialogs/TsLoginDialog.tsx',
-    callee: 'api.server.add',
+    file: 'components/dialogs/ts-login-server.ts',
+    callee: 'api.server.addTailscaleLoginProfile',
     count: 1,
     route: 'no-staged-only-id',
     why: '仅取磁盘镜像或本次新建的 id：add 只接收 planTsLoginSubmit 新建的节点，effective 仅用于名称候选',
   },
   {
-    file: 'components/dialogs/TsLoginDialog.tsx',
+    file: 'components/dialogs/ts-login-server.ts',
     callee: 'api.server.update',
     count: 1,
     route: 'no-staged-only-id',
@@ -325,20 +325,6 @@ const SITES: readonly ActionSite[] = [
     why: '仅取磁盘镜像或本次新建的 id：焦点回读只使用提交前登记的 serverId+attemptId；节点已保存并通过刷新对账，不取 effective 暂存身份，旧请求回执不能覆盖新请求。',
   },
   // 移动端登录与桌面共用提交计划；既有身份从磁盘 servers 寻址，新身份先 mint 再保存。
-  {
-    file: 'mobile/forms/TsLoginPanel.tsx',
-    callee: 'api.server.add',
-    count: 1,
-    route: 'no-staged-only-id',
-    why: '不传实体 id：各平台共用真实登录 save 腿，只保存 planTsLoginSubmit 新建的节点；effective 集合只用于名称候选，不再有 iOS 仅保存配置的分支。',
-  },
-  {
-    file: 'mobile/forms/TsLoginPanel.tsx',
-    callee: 'api.server.update',
-    count: 1,
-    route: 'no-staged-only-id',
-    why: '仅取磁盘镜像或本次新建的 id：各平台共用真实登录 save 腿，既有节点从磁盘 servers.find(serverId) 取得并交给提交计划；请求授权仅使用 bound progress，不再轮询全局 TS STATUS。',
-  },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
     callee: 'api.server.tailscaleLoginPrepare',

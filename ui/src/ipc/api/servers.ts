@@ -44,18 +44,13 @@ function isIdentityConflicts(value: unknown): value is IdentityConflicts {
 // ============================================================================
 
 export const serverApi = {
-  /**
-   * 新增节点。**返回 void，不回传新建节点** —— 后端 `server_add`（`commands/server.rs:69`）返
-   * `ApiResponse<()>`。
-   *
-   * 此前这里声明 `Promise<ServerConfig>` 是**类型谎言**：运行期拿到的恒是 undefined，任何
-   * 「add 完取回 id」的写法都会静默拿到 undefined（TsLoginDialog 就踩过，改走渲染端自带 id）。
-   * 要新建节点的 id → 渲染端自己 mint（`crypto.randomUUID()`）后放进 server：后端 `ensure_server_id`
-   * 只在 id 缺失/空串时才 mint，**非空 id 原样保留**（其单测名即 `..._keeps_existing`）。
-   */
+  /** 新增节点。调用方需要新节点的 id 时，应在提交前生成并传入。 */
   async add(server: Omit<ServerConfig, 'id'> | ServerConfig): Promise<void> {
-    // Rust server_add(server: Value) —— 参数袋 key = `server`。
     return invoke(IPC_CHANNELS.SERVER_ADD, { server });
+  },
+
+  async addTailscaleLoginProfile(server: ServerConfig): Promise<'saved' | 'runtimePending'> {
+    return invoke(IPC_CHANNELS.SERVER_ADD, { server, forTailscaleLogin: true });
   },
 
   /** 批量添加自建节点（本地导入，一次写盘） */
