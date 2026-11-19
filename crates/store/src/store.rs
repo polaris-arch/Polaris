@@ -120,11 +120,16 @@ impl ConfigStore {
             Err(e) => return fallback_corrupt(e, managed),
         };
         // 迁移链（全量，幂等，绝不抛）
-        let migration_delta = migrate_all(&mut value);
+        let mut migration_delta = migrate_all(&mut value);
         // validate（语义校验：必填/枚举/范围）+ 填默认
         if let Err(e) = finalize_config(&mut value) {
             // 校验失败 → 备份损坏文件 + 回落默认，不覆盖磁盘。
             return fallback_corrupt(e, managed);
+        }
+        // Later authoritative projections can undo temporary legacy rewrites.
+        // Only a net document change should trigger the caller's durable write.
+        if migration_delta.changed {
+            migration_delta.changed = value != raw;
         }
         LoadResult {
             config: value,

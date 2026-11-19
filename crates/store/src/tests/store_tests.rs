@@ -70,6 +70,25 @@ fn legacy_real_query_fallback_loads_domestic_and_persists_idempotently() {
 }
 
 #[test]
+fn v4_legacy_route_mirrors_need_no_rewrite_when_load_returns_the_saved_document() {
+    let mut config = default_config();
+    let rules = serde_json::json!([{
+        "id": "legacy-source", "type": "ruleSet", "values": ["res:fixture"],
+        "action": "block", "enabled": true,
+    }]);
+    for key in ["trafficRules", "policyRules", "customRules"] {
+        config[key] = rules.clone();
+    }
+    let fs = MockFs::default();
+    ConfigStore::save(&fs, Path::new(CFG), &config, "abcdef012345").unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs.snapshot(Path::new(CFG)).unwrap()).unwrap();
+    let loaded = ConfigStore::load(&fs, Path::new(CFG));
+    assert_eq!(loaded.config, saved);
+    assert!(!loaded.migration_delta.changed);
+}
+
+#[test]
 fn invalid_real_query_fallback_actions_are_rejected_before_any_write() {
     for action in [
         serde_json::json!({"type":"fakeIp"}),
