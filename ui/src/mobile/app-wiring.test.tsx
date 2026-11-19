@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 import type { TailscaleStatusEvent } from '@/contracts/tailscale-status';
 import type { TailscaleLoginProgress } from '@/domain/tailscale-login-progress';
 import type { OpenConnectStatusEvent, OpenVpnStatusEvent, VpnStatusSnapshot } from '@/contracts/vpn-status';
-import type { InvalidNodeInfo, IpInfoSnapshot, ProxyStatus, UserConfig } from '@/contracts/types';
+import type { InvalidNodeInfo, IpInfoSnapshot, NativeRetirementDebt, ProxyStatus, UserConfig } from '@/contracts/types';
 import type { UnlockSnapshot } from '@/contracts/unlock-detection';
 import type { SubscriptionUpdateProgress } from '@/contracts/subscription-progress';
 import type { SubscriptionCreateSnapshot } from '@/contracts/subscription-create-operation';
@@ -456,6 +456,50 @@ describe('② 连接态：三条事件腿都把 proxyStatus 重拉到真值', ()
     await settle();
     expect(getPendingMock.mock.calls.length).toBeGreaterThan(before);
     expect(useAppStore.getState().pendingChanges.modified).toEqual([]);
+    off();
+  });
+
+  it('keeps the hot-apply push when an older pending read finishes afterward', async () => {
+    const off = startMobileAppWiring(t);
+    await settle();
+    let finishRead!: (value: unknown) => void;
+    getPendingMock.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+    emit('subAuto', { success: true });
+
+    const pending = { added: [], modified: [], removed: [], restartDeferred: true };
+    emit('pending', pending);
+    const applied = { ...pending, restartDeferred: false };
+    emit('pending', applied);
+    const native: NativeRetirementDebt = { transactionId: 'native-A', runtimeGeneration: 7, selectionIntentGeneration: 9,
+      retirementState: 'UNKNOWN', reason: { code: 'LISTENER_RETIREMENT_FAILED', path: 'inbounds' } };
+    finishRead({ ...pending, nativeRetirements: [native] });
+    await settle();
+
+    expect(useAppStore.getState().pendingChanges).toEqual({ ...applied, nativeRetirements: [native] });
+    off();
+  });
+
+  it('keeps the stop read when the old Core pending read finishes afterward', async () => {
+    proxyStatus = { running: true, mainGeneration: 7 } as ProxyStatus;
+    const off = startMobileAppWiring(t);
+    await settle();
+    const pending = { added: ['old'], modified: [], removed: [], restartDeferred: false };
+    let finishRead!: (value: unknown) => void;
+    getPendingMock.mockImplementationOnce(() => new Promise((resolve) => { finishRead = resolve; }));
+    emit('subAuto', { success: true });
+
+    let finishStopRead!: (value: unknown) => void;
+    getPendingMock.mockImplementationOnce(() => new Promise((resolve) => { finishStopRead = resolve; }));
+    proxyStatus = { running: false, mainGeneration: 8 } as ProxyStatus;
+    emit('stopped', undefined);
+    await settle();
+    finishRead(pending);
+    await settle();
+
+    expect(useAppStore.getState().proxyStatus?.mainGeneration).toBe(8);
+    expect(useAppStore.getState().pendingChanges).toEqual(pendingRaw);
+    finishStopRead(pendingRaw);
+    await settle();
     off();
   });
 });

@@ -142,6 +142,8 @@ let requestedEpoch = 0;
 let publicationSerial = 0;
 let proxyStatusRead = 0;
 let appliedProxyStatusRead = 0;
+let pendingChangesRead = 0;
+let appliedPendingChangesRead = 0;
 let refreshReason = 'mount';
 let refreshNeeded = false;
 // Keep the native flight even after disposal: JS invalidation cannot cancel Rust I/O.
@@ -430,6 +432,7 @@ export interface AppState {
   applyUnlockSnapshot: (snap: UnlockSnapshot) => void;
   beginUnlockCheck: () => void;
   resetUnlock: () => void;
+  refreshPendingChanges: (ownerIsCurrent?: () => boolean) => Promise<void>;
   setPendingChanges: (changes: PendingChangesState) => void;
   nativeRetirementEndedBeforeGeneration: number;
   /** Shared proof check; ordinary status snapshots and intent changes cannot clear native debt. */
@@ -455,6 +458,16 @@ const EMPTY_PENDING: PendingChangesState = {
   removed: [],
   restartDeferred: false,
 };
+
+function pendingChangesUpdate(state: AppState, changes: PendingChangesState, current: boolean) {
+  const native = mergeNativeRetirementDebts(state.pendingChanges.nativeRetirements, changes.nativeRetirements,
+    state.nativeRetirementEndedBeforeGeneration);
+  if (!current && native === state.pendingChanges.nativeRetirements) return state;
+  const pendingChanges = { ...(current ? changes : state.pendingChanges) };
+  if (native === undefined) delete pendingChanges.nativeRetirements;
+  else pendingChanges.nativeRetirements = native;
+  return { pendingChanges };
+}
 
 const freshUnlock = (): UnlockDisplayState => ({
   results: {},
@@ -720,14 +733,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   /** 复位 idle（停代理 / IPC 失败兜底）：连 lastRunAt 一并清，重连后不被陈旧冷却误锁刷新钮。 */
   resetUnlock: () => set({ unlock: freshUnlock() }),
   nativeRetirementEndedBeforeGeneration: 0,
-  setPendingChanges: (changes) => set((state) => {
-    const native = mergeNativeRetirementDebts(state.pendingChanges.nativeRetirements, changes.nativeRetirements,
-      state.nativeRetirementEndedBeforeGeneration);
-    const pendingChanges = { ...changes };
-    if (native === undefined) delete pendingChanges.nativeRetirements;
-    else pendingChanges.nativeRetirements = native;
-    return { pendingChanges };
-  }),
+  refreshPendingChanges: async (ownerIsCurrent) => {
+    const read = ++pendingChangesRead;
+    const generation = get().proxyStatus?.mainGeneration;
+    try {
+      const pending = await api.proxy.getPendingChanges();
+      const latestGeneration = get().proxyStatus?.mainGeneration;
+      // A push or an accepted later pull owns the visible configuration diff.
+      // Native retirement evidence is merged independently using its process-end floor.
+      const generationAdvanced = generation !== undefined && latestGeneration !== undefined
+        && latestGeneration > generation;
+      const current = read > appliedPendingChangesRead && !generationAdvanced && ownerIsCurrent?.() !== false;
+      if (current) appliedPendingChangesRead = read;
+      set((state) => pendingChangesUpdate(state, normalizePendingChanges(pending), current));
+    } catch { /* A later push or pull can refresh the pending state. */ }
+  },
+  setPendingChanges: (changes) => {
+    appliedPendingChangesRead = ++pendingChangesRead;
+    set((state) => pendingChangesUpdate(state, changes, true));
+  },
   confirmNativeRetirementEnd: (event, live) => {
     const generation = nativeRetirementEndGeneration(event, live);
     if (generation === undefined) return;
@@ -884,6 +908,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   reset: () => {
     invalidateLoadConfig('reset');
     appliedProxyStatusRead = proxyStatusRead;
+    appliedPendingChangesRead = pendingChangesRead;
     set({
       config: null,
       configPublication: null,

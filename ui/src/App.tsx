@@ -93,10 +93,7 @@ function ensureVpnAuthDialog(protocol: 'openconnect' | 'openvpn', serverId: stri
  * 失败静默（差集是锦上添花，不该因拉取失败弹错）。
  */
 function pullPendingChanges(): void {
-  void api.proxy
-    .getPendingChanges()
-    .then((p) => useAppStore.getState().setPendingChanges(normalizePendingChanges(p)))
-    .catch(() => {});
+  void useAppStore.getState().refreshPendingChanges();
 }
 
 /**
@@ -370,15 +367,13 @@ export default function App() {
   // 托盘浮层发起的不会。走事件则三个来源（Home 按钮 / 托盘 / 后端自愈重启）统一收敛。
   useEffect(() => {
     const offStarted = api.proxy.onStarted(() => {
-      void refreshProxyStatus();
       // R2 pull 兜底：重启落地 → 起核快照刷新 → 待应用差集清空/更新（PUSH 的重启腿留下的 added 由此清）。
-      pullPendingChanges();
+      void refreshProxyStatus().then(pullPendingChanges);
     });
     const offStopped = api.proxy.onStopped(() => {
       useAppStore.getState().resetUnlock();
-      void refreshProxyStatus();
       // R2 pull 兜底：停核 → 无起核快照 → 差集恒空（操作条自然卸载）。
-      pullPendingChanges();
+      void refreshProxyStatus().then(pullPendingChanges);
     });
     return () => {
       offStarted();

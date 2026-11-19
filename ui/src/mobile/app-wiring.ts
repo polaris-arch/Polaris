@@ -127,10 +127,7 @@ export const MOBILE_STATUS_POLL_MS = 30_000;
  * 两个入口共四条腿读同一口径）。失败静默 —— 差集是锦上添花，不该因拉取失败弹错。
  */
 function pullPendingChanges(): void {
-  void api.proxy
-    .getPendingChanges()
-    .then((p) => useAppStore.getState().setPendingChanges(normalizePendingChanges(p)))
-    .catch(() => {});
+  void useAppStore.getState().refreshPendingChanges();
 }
 
 /** Share the existing endpoint status store; only the presentation stack is mobile-specific. */
@@ -265,16 +262,18 @@ export function startMobileAppWiring(t: WiringT): () => void {
      起核快照刷新，PUSH 的重启腿留下的 `added` 由这一拍清掉。 */
   offs.push(
     api.proxy.onStarted(() => {
-      void store().refreshProxyStatus();
-          pullPendingChanges();
+      void store().refreshProxyStatus().then(() => {
+        if (live) pullPendingChanges();
+      });
     }),
   );
   offs.push(
     api.proxy.onStopped(() => {
       unlockFeedRevision += 1;
       store().resetUnlock();
-      void store().refreshProxyStatus();
-      pullPendingChanges();
+      void store().refreshProxyStatus().then(() => {
+        if (live) pullPendingChanges();
+      });
     }),
   );
 

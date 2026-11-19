@@ -37,7 +37,7 @@ const h = vi.hoisted(() => ({
       ownedStopContext: undefined as { selectionIntentGeneration: number } | undefined },
     nativeRetirementEndedBeforeGeneration: 0, confirmNativeRetirementEnd: vi.fn(),
     config: null as Record<string, unknown> | null,
-    setPendingChanges: vi.fn(),
+    refreshPendingChanges: vi.fn(),
   },
 }));
 
@@ -180,7 +180,10 @@ beforeEach(() => {
   h.app.pendingChanges = { added: ['node-1'], modified: [], removed: [], restartDeferred: false };
   h.realReconciliation = false;
   h.app.proxyStatus = { running: true, mainGeneration: 7, ownedStopContext: undefined };
-  h.app.setPendingChanges.mockImplementation((pending) => { h.app.pendingChanges = pending; });
+  h.app.refreshPendingChanges.mockImplementation(async (ownerIsCurrent: () => boolean) => {
+    const pending = await h.pendingRead();
+    if (ownerIsCurrent()) h.app.pendingChanges = pending;
+  });
   h.pendingRead.mockImplementation(async () => h.app.pendingChanges);
   h.hostRead.mockRejectedValue(new Error('no host status reply'));
   h.coreRead.mockRejectedValue(new Error('no Core status reply'));

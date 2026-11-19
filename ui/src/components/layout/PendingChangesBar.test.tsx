@@ -19,7 +19,7 @@ const h = vi.hoisted(() => ({
     pendingChanges: { added: ['node'], modified: [] as string[], removed: [] as string[], restartDeferred: false } as PendingNodeChanges,
     proxyStatus: { running: true, mainGeneration: 7 }, config: null as Record<string, unknown> | null,
     nativeRetirementEndedBeforeGeneration: 0, confirmNativeRetirementEnd: vi.fn(),
-    servers: [] as Array<{ id: string; name: string }>, setPendingChanges: vi.fn(),
+    servers: [] as Array<{ id: string; name: string }>, refreshPendingChanges: vi.fn(),
     applyRequested: false, setApplyRequested: vi.fn(),
   },
 }));
@@ -144,7 +144,10 @@ beforeEach(() => {
   h.app.pendingChanges = { added: ['node'], modified: [], removed: [], restartDeferred: false };
   h.app.proxyStatus = { running: true, mainGeneration: 7 };
   h.app.applyRequested = false;
-  h.app.setPendingChanges.mockImplementation(pending => { h.app.pendingChanges = pending; });
+  h.app.refreshPendingChanges.mockImplementation(async (ownerIsCurrent: () => boolean) => {
+    const pending = await h.pendingRead();
+    if (ownerIsCurrent()) h.app.pendingChanges = pending;
+  });
   h.pendingRead.mockImplementation(async () => h.app.pendingChanges);
   h.lifecycleReady.mockResolvedValue(h.offLifecycle);
   h.statusRead.mockImplementation(async () => h.app.proxyStatus);
@@ -648,6 +651,7 @@ describe('desktop native listener cleanup stays independent', () => {
     check.props.onClick!(); check.props.onClick!();
     await microtasks();
     expect(h.nativeRead).toHaveBeenCalledExactlyOnceWith('native-A');
+    expect(h.app.refreshPendingChanges).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
     expect(h.coreRead).not.toHaveBeenCalled();
     expect((h.states[0] as ApplyState).nativeRetirements).toEqual([native]);
     expect((h.states[0] as ApplyState).host?.phase).toBe('settled');
@@ -656,6 +660,22 @@ describe('desktop native listener cleanup stays independent', () => {
     expect(h.retryPersistence).not.toHaveBeenCalled();
     expect(h.freshApply).not.toHaveBeenCalled();
     expect(h.applyNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops the pending read from an unmounted native observation', async () => {
+    await start();
+    h.nativeRead.mockResolvedValueOnce(receipt());
+    let finish!: (pending: PendingNodeChanges) => void;
+    h.pendingRead.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    click('home.pendingCheckNativeBtn');
+    await microtasks();
+    expect(h.pendingRead).toHaveBeenCalledOnce();
+
+    unmount();
+    finish({ ...empty(), restartDeferred: true });
+    await microtasks();
+
+    expect(h.app.pendingChanges).toEqual(empty());
   });
 
   it.each(['wrong transaction', 'wrong generation', 'wrong intent', 'missing owner'] as const)(

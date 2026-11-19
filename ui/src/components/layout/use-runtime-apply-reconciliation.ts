@@ -1,6 +1,6 @@
 import { useEffect, useRef, type Dispatch, type RefObject, type SetStateAction } from 'react';
 import { api } from '@/ipc';
-import { normalizePendingChanges, useAppStore } from '@/store/app-store';
+import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { toast } from '@/lib/error-handler';
 import type { PendingApplyResult } from '@/contracts/types';
@@ -154,13 +154,11 @@ export function useRuntimeApplyReconciliation(
         const ended = acceptCore(owner, result);
         if (ended && result.status === 'hotApplied') {
           const request = attemptRef.current;
-          void api.proxy.getPendingChanges().then((pending) => {
+          void useAppStore.getState().refreshPendingChanges(() => {
             const live = useAppStore.getState().proxyStatus;
-            if (attemptRef.current === request && request?.cancelled !== true && live?.running === true
-                && live.mainGeneration === owner.runtimeGeneration && latest.current.transactionId === owner.transactionId) {
-              useAppStore.getState().setPendingChanges(normalizePendingChanges(pending));
-            }
-          }).catch(() => undefined);
+            return attemptRef.current === request && request?.cancelled !== true && live?.running === true
+                && live.mainGeneration === owner.runtimeGeneration && latest.current.transactionId === owner.transactionId;
+          });
         }
         return ended;
       },
@@ -197,9 +195,7 @@ export function useRuntimeApplyReconciliation(
         const ended = ['hostEffectsFailed', 'conflict', 'rejected', 'skipped', 'cancelled'].includes(result.status) || (result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'nativeCleanupUnknown')
           && hostEffectsAccepted(result.hostEffects);
         if (ended) {
-          void api.proxy.getPendingChanges().then((pending) => {
-            if (current()) useAppStore.getState().setPendingChanges(normalizePendingChanges(pending));
-          }).catch(() => undefined);
+          void useAppStore.getState().refreshPendingChanges(current);
         }
         return ended;
       },
@@ -224,8 +220,7 @@ export function useRuntimeApplyReconciliation(
             setApply((state) => mergeNativeRetirements(state, result.nativeRetirements));
           } catch { /* An unavailable observation preserves the original UNKNOWN; no Apply or close retry. */ }
         }));
-        const pending = await api.proxy.getPendingChanges().catch(() => null);
-        if (mounted.current && pending) useAppStore.getState().setPendingChanges(normalizePendingChanges(pending));
+        await useAppStore.getState().refreshPendingChanges(() => mounted.current);
       } finally {
         checkingNative.current = false;
         if (mounted.current) setApply((state) => ({ ...state, nativeChecking: false }));

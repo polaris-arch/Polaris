@@ -1,5 +1,6 @@
-import { beforeEach, expect, it } from 'vitest';
+import { beforeEach, expect, it, vi } from 'vitest';
 import type { NativeRetirementDebt, PendingNodeChanges } from '@/contracts/types';
+import { api } from '@/ipc';
 import { normalizePendingChanges, useAppStore } from './app-store';
 import { applyReceiptState, composeBarView, mergeNativeRetirements } from '@/components/layout/pending-bar-logic';
 
@@ -48,4 +49,25 @@ it('only verified process completion clears global debt, fences late pushes, and
   store().confirmNativeRetirementEnd(stop, { running: true, mainGeneration: 9 });
   feed([native]);
   expect(store().pendingChanges.nativeRetirements).toEqual([successor]);
+});
+
+it('keeps only live native evidence when the read owner is superseded', async () => {
+  const store = useAppStore.getState();
+  const ended = { ...native, transactionId: 'native-ended', runtimeGeneration: 6 };
+  store.confirmNativeRetirementEnd({ kind: 'stop', phase: 'stopped', terminal: true, mainGeneration: 7 },
+    { running: false, mainGeneration: 7 });
+  let finish!: (pending: PendingNodeChanges) => void;
+  const read = vi.spyOn(api.proxy, 'getPendingChanges')
+    .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  let current = true;
+  try {
+    const refresh = store.refreshPendingChanges(() => current);
+    current = false;
+    finish({ ...empty, restartDeferred: true, nativeRetirements: [ended, native] });
+    await refresh;
+
+    expect(useAppStore.getState().pendingChanges).toEqual({ ...empty, nativeRetirements: [native] });
+  } finally {
+    read.mockRestore();
+  }
 });
