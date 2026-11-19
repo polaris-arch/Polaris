@@ -539,6 +539,7 @@ export function LogsScreen() {
       }
       try {
         await saveConfig({ logLevel: v });
+        toast.success(`${t('logs.currentLevel')} ${v.toUpperCase()} · ${t('common.saved')}`);
       } catch (err) {
         console.error('[logs] set level failed:', err);
         toast.error(t('common.saveFailed'));

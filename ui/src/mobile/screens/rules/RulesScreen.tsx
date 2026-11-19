@@ -632,9 +632,11 @@ export function MobileRulesScreen(): ReactElement {
   );
 
   const handleBackToSmart = useCallback(async () => {
+    const { config: savedConfig, updateProxyMode } = useAppStore.getState();
+    if (!savedConfig) return;
     clearWriteError('proxyMode');
     try {
-      await useAppStore.getState().updateProxyMode('smart');
+      await updateProxyMode('smart');
       toast.success(tr('rules.backToSmartOk'));
     } catch (err) {
       // 失败时那条模式警告仍留在原地 —— 不报的话与「按钮失灵」同形。
@@ -784,12 +786,13 @@ export function MobileRulesScreen(): ReactElement {
   const appMasterEnabled = config?.appRoutingEnabled !== false;
   const toggleAppMaster = useCallback(async () => {
     const next = !appMasterEnabled;
+    const label = tr(next ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff');
     clearWriteError('appRoutingEnabled');
     if (editRoute('appRoutingEnabled', stagingEnabled) === 'staged') {
       stage({
         id: 'setting:appRoutingEnabled',
         kind: 'setting',
-        label: tr(next ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff'),
+        label,
         entityPath: ['appRoutingEnabled'],
         nextValue: next,
       });
@@ -797,6 +800,7 @@ export function MobileRulesScreen(): ReactElement {
     }
     try {
       await useAppStore.getState().saveConfig({ appRoutingEnabled: next });
+      toast.success(`${label} · ${tr('common.saved')}`);
     } catch (err) {
       console.error('[MobileRulesScreen] appRoutingEnabled save failed:', err);
       toast.error(tr('appPolicy.masterToggleFail'));
@@ -859,8 +863,7 @@ export function MobileRulesScreen(): ReactElement {
    * UI 端（`inbounds.rs:717` 是另一端），拼在这里就只剩「正则去认一段对象字面量」这一种判法。
    * 两处刻意的差别（`follow` 写成 proxy+无节点、`enabled` 恒 true）连同理由都写在那个模块里。
    *
-   * 失败走**行内**回显而不是 toast：移动端没有 toast 宿主（见 `writeErrors` 那段头注），
-   * 且 `half-truth-facts.test.ts` 的静音 toast 棘轮正是为了不让这批回声继续增长。
+   * 写入失败在对应应用行保留错误，写入成功使用全局 toast。
    */
   const handleAppPolicyPick = useCallback(
     async (appId: string, pick: AppPolicyWritablePick, targetServerId?: string | AutoSelectTarget) => {
@@ -872,12 +875,13 @@ export function MobileRulesScreen(): ReactElement {
         preset != null
           ? appPresetLabel(t, preset.labelKey, preset.id, !builtinPresetIds.has(preset.id))
           : appId;
+      const label = `${tr('home.stagedAppPolicy', { name })} · ${appPolicyOf(next).text}`;
       /* 配置暂存闸门：`appRules` 是 UserConfig 字段（Class B），条目按 **appId** 寻址。 */
       if (editRoute('appRules', stagingEnabled) === 'staged') {
         stage({
           id: `appRule:${appId}`,
           kind: 'appRule',
-          label: `${tr('home.stagedAppPolicy', { name })} · ${appPolicyOf(next).text}`,
+          label,
           entityPath: ['appRules', appId],
           nextValue: next,
         });
@@ -887,6 +891,7 @@ export function MobileRulesScreen(): ReactElement {
         await useAppStore
           .getState()
           .mutateConfigEntities([{ collection: 'appRules', entityId: appId, value: next }]);
+        toast.success(`${label} · ${tr('common.saved')}`);
       } catch (err) {
         // 写失败时 store 未 patch ⇒ 触发器停在旧档，与「面板点了没反应」同形，必须报。
         console.error('[MobileRulesScreen] appRule save failed:', err);
@@ -922,12 +927,13 @@ export function MobileRulesScreen(): ReactElement {
           ? appPresetLabel(t, preset.labelKey, preset.id, !builtinPresetIds.has(preset.id))
           : appId;
       const hasRule = appRuleById.has(appId);
+      const label = tr('home.stagedAppRemove', { name });
       confirmTwice(`${APP_REMOVE_PREFIX}${appId}`, () => {
         if (editRoute('customAppPresets', stagingEnabled) === 'staged') {
           stage({
             id: `appPreset:${appId}`,
             kind: 'appPreset',
-            label: tr('home.stagedAppRemove', { name }),
+            label,
             entityPath: ['customAppPresets', appId],
             nextValue: null,
           });
@@ -950,6 +956,7 @@ export function MobileRulesScreen(): ReactElement {
                 ? [{ collection: 'appRules' as const, entityId: appId, value: null }]
                 : []),
             ]);
+            toast.info(`${label} · ${tr('common.saved')}`);
           } catch (err) {
             console.error('[MobileRulesScreen] remove custom app failed:', err);
             reportWriteError(`appRule:${appId}`, tr('appPolicy.removeFail'));

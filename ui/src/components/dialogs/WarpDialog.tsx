@@ -258,6 +258,7 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
         await doEdit(ep!);
         void loadConfig(true);
         close();
+        toast.success(`${t('warp.editTitle')} ${name.trim()} · ${t('common.saved')}`);
       } else {
         const registered = await doRegister(ep);
         if (registered) {

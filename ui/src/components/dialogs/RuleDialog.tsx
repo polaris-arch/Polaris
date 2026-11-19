@@ -342,7 +342,13 @@ function RuleForm({ instanceId, base: openingBase, isEdit, preset, initialPlane 
       initialPlane,
       stagingEnabled,
       stage,
-      close,
+      close: (outcome) => {
+        close();
+        if (outcome === 'saved') {
+          const operation = t(isEdit ? 'rules.editTitle' : 'rules.newTitle');
+          toast.success(`${operation} ${name.trim()} · ${t('common.saved')}`);
+        }
+      },
       loadConfig,
       setSubmitting,
     });

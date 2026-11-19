@@ -232,6 +232,7 @@ function WgForm({ instanceId, base }: { instanceId: string; base?: ServerConfig 
       }
       void loadConfig(true);
       close();
+      toast.success(`${t(isEdit ? 'wg.editTitle' : 'wg.addTitle')} ${server.name} · ${t('common.saved')}`);
     } catch (e) {
       console.error('[WgDialog] save failed:', e);
       toast.error(t('common.saveFailed'));

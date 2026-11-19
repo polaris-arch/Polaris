@@ -92,7 +92,7 @@ export function useNodeActions({
         await api.server.add({ ...rest, name: cloneName });
         // 原型 :4514 克隆成功即 notify('已克隆节点','ok')。副本落在**自建**分组（上方剥了 subscriptionId），
         // 当前若停在订阅 tab，新卡不在本 tab 可见 → 无 toast 时点了完全没反应，比原型更需要这条反馈。
-        toast.success(t('nodes.cloneSuccess'));
+        toast.success(`${t('nodes.cloneSuccess')} · ${cloneName}`);
       } catch (err) {
         console.error('[NodesScreen] clone failed:', err);
         toast.error(t('nodes.cloneFail'));

@@ -390,6 +390,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       // loadConfig/saveConfig 写，不刷则节点网格、规则弹窗「目标出站」下拉、detour 下拉都看不到本次改动。
       await loadConfig(true);
       closeInstance(instanceId);
+      toast.success(`${t(isEdit ? 'node.editTitle' : 'node.addTitle')} ${full.name} · ${t('common.saved')}`);
     } catch (e) {
       console.error('[NodeDialog] save failed:', e);
       const codecGroup = e instanceof ProtoCodecError && e.field ? nodeFieldGroup(proto, e.field) : null;

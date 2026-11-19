@@ -308,7 +308,7 @@ export function WarpPanel({
         await api.server.update(next);
         await loadConfig(true);
         closeInstance(instanceId);
-        toast.success(t('common.saved'));
+        toast.success(`${t('warp.editTitle')} ${next.name} · ${t('common.saved')}`);
         return;
       }
 

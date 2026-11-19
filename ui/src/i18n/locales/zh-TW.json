@@ -1679,7 +1679,7 @@
     "regionPicked": "{{region}} · 該地區流量直連",
     "reverseOn": "回國/反向已開 · 本地走代理、海外直連",
     "reverseOff": "回國/反向已關 · 本地直連、海外走代理",
-    "backToSmartOk": "已切回智慧分流",
+    "backToSmartOk": "智慧分流已儲存",
     "backToSmartFail": "切回智慧分流失敗",
     "errName": "請填寫規則名稱",
     "priorityTip": "拖曳或用列內按鈕排序：越靠上優先級越高，首個命中生效",
@@ -1993,9 +1993,7 @@
       "direct": "直連",
       "block": "阻斷"
     },
-    "policyUpdated": "策略已更新",
     "policyUpdateFail": "策略更新失敗",
-    "removed": "已移除",
     "removeFail": "移除失敗",
     "masterToggleFail": "應用分流開關儲存失敗"
   },

@@ -484,7 +484,7 @@ export function MobileNodesScreen(): ReactElement {
           }
           /* 副本落在自建分组；直接写入完成后给短回执，暂存由底部待应用条持续说明。 */
           setNotice(undefined);
-          if (!staged) toast.success(t('nodes.cloneSuccess'));
+          if (!staged) toast.success(`${t('nodes.cloneSuccess')} · ${cloneName}`);
         },
         () => t('nodes.cloneFail'),
       );
@@ -668,8 +668,7 @@ export function MobileNodesScreen(): ReactElement {
    * 组网隧道落 `'mesh'`（:56）、新订阅落它自己的 id（:62）。当前 tab 停在别处时，新行不在
    * `visibleServers` 里 ⇒ 表单一关屏上**零变化、零文字**，用户读作「点了没反应」——
    * 那正是本屏立项要修的那件事。桌面四条逐条如此（`NodesHeader.tsx:81/:111/:125`、
-   * `NodesScreen.tsx:491`），本仓自己也认过这条：`cloneNode` 里那句 `nodes.cloneSuccess`
-   * 的理由逐字就是「当前若停在订阅 tab，新行不在本 tab 可见 ⇒ 点了完全没反应」。
+   * `NodesScreen.tsx:491`）。`cloneNode` 提示副本已保存，也是因为副本可能不在当前订阅 tab。
    *
    * 切的**时机**与桌面逐条对齐，不统一：手动添加 / 组网接入是**开表之前**就切（用户在填表时
    * 背后那一屏已经是产物会出现的地方）；导入与订阅是**成功之后**才切（那两条都可能什么都没导进来，

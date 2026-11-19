@@ -229,16 +229,17 @@ export function AppPolicyScreen() {
 
   const applyRule = async (appId: string, patch: Omit<AppRule, 'appId'>) => {
     const newRule: AppRule = { appId, ...patch };
+    const destination = newRule.targetAutoSelect ? autoSelectTargetLabel(config, newRule.targetAutoSelect, t)
+      : appPolicyView(newRule.action, newRule.targetServerId, servers, t).label;
+    const label = `${t('home.stagedAppPolicy', { name: appLabel(appId) })} · ${destination}`;
     // 配置暂存闸门：`appRules` 是 UserConfig 字段（Class B），改策略无远端/不可逆副作用 ⇒ 默认腿。
     // 条目按 **appId** 寻址 —— `AppRule` 里根本没有 `id` 字段，这一族此前表达不了正是因为
     // 模型把主键写死成了 `id`（现由 `ID_ADDRESSED_COLLECTIONS` 的集合→主键映射给出）。
     if (editRoute('appRules', stagingEnabled) === 'staged') {
-      const destination = newRule.targetAutoSelect ? autoSelectTargetLabel(config, newRule.targetAutoSelect, t)
-        : appPolicyView(newRule.action, newRule.targetServerId, servers, t).label;
       stage({
         id: `appRule:${appId}`,
         kind: 'appRule',
-        label: `${t('home.stagedAppPolicy', { name: appLabel(appId) })} · ${destination}`,
+        label,
         entityPath: ['appRules', appId],
         nextValue: newRule,
       });
@@ -248,9 +249,7 @@ export function AppPolicyScreen() {
       await useAppStore.getState().mutateConfigEntities([
         { collection: 'appRules', entityId: appId, value: newRule },
       ]);
-      // 原型 nodeSelMenu onPick :4635 → notify('策略已更新','ok')。本函数只此一个调用点（setAppPolicy），
-      // 故 toast 挂这里即等价于挂在策略提交点上。
-      toast.success(t('appPolicy.policyUpdated'));
+      toast.success(`${label} · ${t('common.saved')}`);
     } catch (err) {
       // 写失败时 store 未 patch → pill 停在旧策略，与「菜单点了没反应」同形；且用户会以为该应用已按新策略走。
       console.error('[AppPolicyScreen] applyRule failed:', err);
@@ -269,6 +268,7 @@ export function AppPolicyScreen() {
    * 分流规则（若有），避免 config 里留下指向已删预设的孤儿规则。 */
   const removeCustomApp = async (appId: string) => {
     const hasRule = (config?.appRules ?? []).some((r) => r.appId === appId);
+    const label = t('home.stagedAppRemove', { name: appLabel(appId) });
     // 配置暂存闸门：`customAppPresets` / `appRules` 都是 UserConfig 字段（Class B）。自定义应用还带
     // 一份本地图标缓存；运行中仍只暂存配置，保存写删除 journal，Apply 后端统一驱逐缓存。
     //
@@ -284,7 +284,7 @@ export function AppPolicyScreen() {
       stage({
         id: `appPreset:${appId}`,
         kind: 'appPreset',
-        label: t('home.stagedAppRemove', { name: appLabel(appId) }),
+        label,
         entityPath: ['customAppPresets', appId],
         nextValue: null,
         groupId: removeGroup,
@@ -321,8 +321,7 @@ export function AppPolicyScreen() {
       );
       return;
     }
-    // 原型 app-remove :4173 → notify('已移除')（中性 kind）。此时卡片已消失，这条是「确实删了」的落定确认。
-    toast.info(t('appPolicy.removed'));
+    toast.info(`${label} · ${t('common.saved')}`);
   };
 
   /** 原地二次点击（原型 :4173）。key 带 appId ⇒ 武装 B 应用会自动解除 A 应用。 */
@@ -373,12 +372,13 @@ export function AppPolicyScreen() {
             data-tip={t('appPolicy.masterTip')}
             onClick={async () => {
               const nextEnabled = !enabled;
+              const label = t(nextEnabled ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff');
               // appRules / customAppPresets / appRoutingEnabled 都是 Class B，三个入口都得过闸门。
               if (editRoute('appRoutingEnabled', stagingEnabled) === 'staged') {
                 stage({
                   id: 'setting:appRoutingEnabled',
                   kind: 'setting',
-                  label: t(nextEnabled ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff'),
+                  label,
                   entityPath: ['appRoutingEnabled'],
                   nextValue: nextEnabled,
                 });
@@ -386,8 +386,8 @@ export function AppPolicyScreen() {
               }
               try {
                 await useAppStore.getState().saveConfig({ appRoutingEnabled: nextEnabled });
+                toast.success(`${label} · ${t('common.saved')}`);
               } catch (err) {
-                // 原型总开关（.swt）成功态不 notify——开关自身跳位即反馈，故这里只补失败分支：
                 // 写失败时 store 未 patch → 开关弹回原位，用户读作「开关坏了」而非「没存上」。
                 console.error('[AppPolicyScreen] toggle master:', err);
                 toast.error(
@@ -438,8 +438,16 @@ export function AppPolicyScreen() {
           <button
             type="button"
             className="btn ghost sm"
-            onClick={() => {
-              void useAppStore.getState().updateProxyMode('smart');
+            onClick={async () => {
+              const { config: savedConfig, updateProxyMode } = useAppStore.getState();
+              if (!savedConfig) return;
+              try {
+                await updateProxyMode('smart');
+                toast.success(t('rules.backToSmartOk'));
+              } catch (err) {
+                console.error('[AppPolicyScreen] backToSmart failed:', err);
+                toast.error(t('rules.backToSmartFail'));
+              }
             }}
           >
             {t('appPolicy.backToSmart')}

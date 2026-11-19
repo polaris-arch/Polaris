@@ -502,11 +502,12 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
     [t, stagingEnabled, stage],
   );
 
-  // 原型 L1875 data-act="seg-to-smart"：mode-warn 内「切回智能」按钮，热切换回智能分流（不重启）。
+  // mode-warn 内的「切回智能」按钮确认分流设置已写盘。
   const handleBackToSmart = useCallback(async () => {
+    const { config: savedConfig, updateProxyMode } = useAppStore.getState();
+    if (!savedConfig) return;
     try {
-      await useAppStore.getState().updateProxyMode('smart');
-      // 原型 setStrategySmart :4347 → notify('已切回智能分流','ok')。
+      await updateProxyMode('smart');
       toast.success(t('rules.backToSmartOk'));
     } catch (err) {
       // 失败时 mode-warn 仍留在原地；同时报出真实原因，避免按钮看似无响应。

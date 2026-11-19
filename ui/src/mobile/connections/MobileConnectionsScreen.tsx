@@ -1040,6 +1040,7 @@ export function MobileConnectionsScreen(): ReactElement {
       }
       void runWrite('screen', 'mobileConnections.logs.levelSaveFailed', async () => {
         await saveConfig({ logLevel: next });
+        toast.success(`${trRef.current('logs.currentLevel')} ${next.toUpperCase()} · ${trRef.current('common.saved')}`);
         return true;
       });
     },

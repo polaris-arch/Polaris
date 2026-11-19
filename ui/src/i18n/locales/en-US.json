@@ -1679,7 +1679,7 @@
     "regionPicked": "{{region}} · traffic for this region goes direct",
     "reverseOn": "Reverse on · local via proxy, overseas direct",
     "reverseOff": "Reverse off · local direct, overseas via proxy",
-    "backToSmartOk": "Back to Smart routing",
+    "backToSmartOk": "Smart routing saved",
     "backToSmartFail": "Failed to switch back to Smart routing",
     "errName": "Please enter a rule name",
     "priorityTip": "Drag or use the row buttons to reorder: higher means higher priority; the first match wins.",
@@ -1993,9 +1993,7 @@
       "direct": "Direct",
       "block": "Block"
     },
-    "policyUpdated": "Policy updated",
     "policyUpdateFail": "Failed to update policy",
-    "removed": "Removed",
     "removeFail": "Failed to remove",
     "masterToggleFail": "Failed to save the app-routing switch"
   },

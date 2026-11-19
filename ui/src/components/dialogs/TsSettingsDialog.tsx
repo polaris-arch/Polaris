@@ -319,6 +319,7 @@ function TsSettingsForm({ instanceId, node }: { instanceId: string; node?: Serve
       await api.server.update(next);
       await loadConfig(true);
       close();
+      toast.success(`${t('ts.settingsTitle')} ${next.name} · ${t('common.saved')}`);
     } catch (e) {
       console.error('[TsSettingsDialog] save failed');
       toast.error(t(tsCredentialSaveErrorKey(e)));

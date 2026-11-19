@@ -294,7 +294,7 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
             { collection: 'customAppPresets', entityId: preset.id, value: preset },
           ]);
         closeInstance(instanceId);
-        toast.success(tr('common.saved'));
+        toast.success(`${tr('appAdd.title')} ${preset.name} · ${tr('common.saved')}`);
       } catch (err) {
         console.error('[mobile-app-add] save failed:', err);
         if (hasInstance(instanceId)) setNotice({ tone: 'err', text: tr('common.saveFailed') });

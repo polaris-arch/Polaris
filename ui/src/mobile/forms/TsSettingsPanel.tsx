@@ -294,7 +294,7 @@ export function TsSettingsPanel({
       await api.server.update(next);
       await loadConfig(true);
       closeInstance(instanceId);
-      toast.success(t('common.saved'));
+      toast.success(`${t('ts.settingsTitle')} ${next.name} · ${t('common.saved')}`);
     } catch (e) {
       console.error('[mobile-ts-settings] save failed');
       setNotice({ tone: 'err', text: t(tsCredentialSaveErrorKey(e)) });

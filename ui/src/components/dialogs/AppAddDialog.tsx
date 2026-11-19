@@ -316,6 +316,7 @@ export function AppAddDialog({ instanceId }: { instanceId: string }) {
         { collection: 'customAppPresets', entityId: preset.id, value: preset },
       ]);
       close();
+      toast.success(`${t('appAdd.title')} ${preset.name} · ${t('common.saved')}`);
     } catch (e) {
       console.error('[AppAddDialog] save failed:', e);
       toast.error(t('common.saveFailed'));

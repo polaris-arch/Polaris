@@ -449,7 +449,7 @@ export function NodeFormPanel({
          不刷则本屏列表看不到这次改动 —— 后端广播是慢路径，表单已经关了。 */
       await loadConfig(true);
       closeInstance(instanceId);
-      toast.success(t('common.saved'));
+      toast.success(`${t(isEdit ? 'node.editTitle' : 'node.addTitle')} ${full.name} · ${t('common.saved')}`);
     } catch (e) {
       console.error('[mobile-node-form] save failed:', e);
       /* 编解码被拒（证书固定值 / DERP 行 / 扩展 JSON 非法…）⇒ 展开出错字段所在的那一组（同桌面）。 */
