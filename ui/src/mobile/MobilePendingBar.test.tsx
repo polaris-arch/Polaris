@@ -84,7 +84,7 @@ vi.mock('@/components/layout/use-runtime-apply-reconciliation', async (original)
   const actual = await original<typeof import('@/components/layout/use-runtime-apply-reconciliation')>();
   return { useRuntimeApplyReconciliation: (...args: Parameters<typeof actual.useRuntimeApplyReconciliation>) =>
     h.realReconciliation ? actual.useRuntimeApplyReconciliation(...args)
-      : { retryPersistence: async () => undefined, checkHost: () => undefined, checkNative: async () => undefined } };
+      : { hasSaveRecovery: false, retryPersistence: async () => undefined, checkHost: () => undefined, checkNative: async () => undefined } };
 });
 vi.mock('@/ipc', () => ({ api: { proxy: {
   onLifecycleReady: h.lifecycleReady,

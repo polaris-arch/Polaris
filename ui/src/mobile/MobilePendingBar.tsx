@@ -466,7 +466,7 @@ export function MobilePendingBar(): ReactElement | null {
         void onApply();
         return;
       case 'retryPersistence':
-        if (apply.host && (apply.coreRecovery || apply.host.phase !== 'settled')) void reconciliation.retryPersistence();
+        if (reconciliation.hasSaveRecovery || apply.host && (apply.coreRecovery || apply.host.phase !== 'settled')) void reconciliation.retryPersistence();
         else if (apply.transactionId) void onApply(undefined, apply.transactionId);
         return;
       case 'retryHost':

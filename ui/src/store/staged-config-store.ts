@@ -59,7 +59,11 @@ import {
 
 /** 直接从 IPC 契约取，避免与 `pending-bar-logic.ts` 的同名联合各写一份（store 不该反向依赖组件层）。 */
 type ApplyReceipt = Awaited<ReturnType<typeof api.proxy.applyPendingChanges>>;
-export type SavedRuntimeApply = ApplyReceipt & { changes?: readonly { label: string; logLevel?: string }[] };
+export type SavedRuntimeApply = ApplyReceipt & {
+  changes?: readonly { label: string; logLevel?: string }[];
+  saveRevision?: number;
+  configVersion?: string;
+};
 type ApplyDispatch = (precedingSave: ApplyReceipt | null) => boolean;
 
 /** Order the renderer's explicit IPC dispatch after any Save already in flight. */
@@ -210,6 +214,8 @@ export interface StagedConfigState {
    * `clean` / `staged` **不入此字段**——那两个由 `entries.length` 派生，多存一份就多一处会分叉的真值。
    */
   saveStatus: 'idle' | 'saving' | 'saveFailed';
+  /** Includes completed staged saves that received no runtime receipt. */
+  completedSaveRevision: number;
   /** Owned receipt for the shared desktop/mobile apply observer. */
   savedRuntimeApply: SavedRuntimeApply | null;
   /**
@@ -269,6 +275,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   baseline: null,
   hydrated: false,
   saveStatus: 'idle',
+  completedSaveRevision: 0,
   savedRuntimeApply: null,
   conflict: null,
   conflictBaseline: null,
@@ -536,8 +543,11 @@ async function performSaveLocked(
   // New/revised intents have not approved changes found on disk by this save.
   // Keep their original comparison base; the next save rechecks them conservatively.
   const remainingBaseline = remaining.length > 0 ? get().baseline : outcome.config;
+  const saveRevision = get().completedSaveRevision + 1;
   const savedRuntimeApply = outcome.runtimeApply === undefined ? undefined : {
     ...outcome.runtimeApply,
+    saveRevision,
+    configVersion: outcome.version,
     changes: entries.flatMap(({ entityPath, label }) => {
       const before = entitySnapshot(disk, entityPath);
       const changed = before !== entitySnapshot(merged, entityPath)
@@ -550,6 +560,7 @@ async function performSaveLocked(
   set({
     entries: remaining,
     saveStatus: 'idle',
+    completedSaveRevision: saveRevision,
     ...(savedRuntimeApply === undefined ? {} : { savedRuntimeApply }),
     conflict: null,
     conflictBaseline: null,

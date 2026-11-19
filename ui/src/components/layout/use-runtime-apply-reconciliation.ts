@@ -1,8 +1,9 @@
 import { useEffect, useRef, type Dispatch, type RefObject, type SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { api } from '@/ipc';
 import { useAppStore } from '@/store/app-store';
-import { useStagedConfigStore } from '@/store/staged-config-store';
+import { dispatchSavedApply, useStagedConfigStore, type SavedRuntimeApply } from '@/store/staged-config-store';
 import { toast } from '@/lib/error-handler';
 import type { PendingApplyResult } from '@/contracts/types';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
@@ -29,13 +30,42 @@ function sameCore(state: ApplyState, owner: RuntimeCoreRecovery): boolean {
       && state.mainGeneration === owner.runtimeGeneration;
 }
 
+function ownsSaveRecovery(save: SavedRuntimeApply | null, owner: RuntimeCoreRecovery): save is SavedRuntimeApply {
+  return save?.transactionId === owner.transactionId && save.runtimeGeneration === owner.runtimeGeneration
+    && save.selectionIntentGeneration === owner.selectionIntentGeneration;
+}
+
+function showSavedChanges(save: SavedRuntimeApply, result: PendingApplyResult, apply: ApplyState, text: TFunction): void {
+  const staged = useStagedConfigStore.getState();
+  const { pendingChanges, proxyStatus } = useAppStore.getState();
+  const intent = proxyStatus?.ownedStopContext?.selectionIntentGeneration;
+  const changes = save.changes;
+  if (!changes?.length || !result.ok || result.status !== 'hotApplied'
+      || result.coreState !== 'committed' || result.configurationDurable !== true
+      || staged.savedRuntimeApply || staged.saveStatus === 'saving'
+      || save.saveRevision !== staged.completedSaveRevision || save.configVersion !== staged.baseVersion
+      || (intent ?? -1) > (save.selectionIntentGeneration ?? -1)
+      || result.nativeRetirements?.length || pendingChanges.nativeRetirements?.length || apply.nativeRetirements?.length
+      || apply.host && apply.host.phase !== 'settled') return;
+  if (changes.length === 1 && changes[0].logLevel) {
+    toast.info(text('home.pendingSavedLogLevelApplied', { level: changes[0].logLevel }));
+    return;
+  }
+  const labels = changes.slice(0, 3).map((change) => change.logLevel
+    ? `${text('logs.currentLevel')} ${change.logLevel}` : change.label);
+  const summary = labels.join(' · ');
+  const remaining = changes.length - labels.length;
+  toast.info(remaining > 0 ? text('home.pendingSavedMoreChangesApplied', { changes: summary, count: remaining })
+    : text('home.pendingSavedChangesApplied', { changes: summary }));
+}
+
 /** Shared observers; a host id is never passed to the Core transaction status API. */
 export function useRuntimeApplyReconciliation(
   apply: ApplyState,
   setApply: Dispatch<SetStateAction<ApplyState>>,
   attemptRef: RefObject<Attempt | null>,
   translate: ProxyErrorTranslate,
-): { retryPersistence: () => Promise<void>; checkHost: () => void; checkNative: () => Promise<void> } {
+) {
   const status = useAppStore((state) => state.proxyStatus);
   const { t: text } = useTranslation();
   const savedRuntimeApply = useStagedConfigStore((state) => state.savedRuntimeApply);
@@ -45,6 +75,7 @@ export function useRuntimeApplyReconciliation(
   t.current = translate;
   const latest = useRef(apply);
   latest.current = apply;
+  const savedRecovery = useRef<SavedRuntimeApply | null>(null);
   const retrying = useRef(false);
   const checkingNative = useRef(false);
   const mounted = useRef(true);
@@ -70,6 +101,7 @@ export function useRuntimeApplyReconciliation(
     if (attempt?.awaitingReply || apply.phase === 'applying') return;
     if (useStagedConfigStore.getState().savedRuntimeApply !== savedRuntimeApply) return;
     useStagedConfigStore.setState({ savedRuntimeApply: null });
+    savedRecovery.current = null;
     const savedIntent = savedRuntimeApply.selectionIntentGeneration ?? -1;
     const newerIntent = ((attempt?.runtimeGeneration ?? apply.mainGeneration) === generation
         && ((attempt?.intentGeneration ?? -1) > savedIntent
@@ -83,6 +115,12 @@ export function useRuntimeApplyReconciliation(
     // This Save has its own runtime owner. A prior explicit Apply's terminal or
     // cancelled attempt cannot decide this recovery.
     attemptRef.current = null;
+    if ((savedRuntimeApply.status === 'hotDurabilityPending' || savedRuntimeApply.status === 'unconfirmed')
+        && savedRuntimeApply.transactionId && savedRuntimeApply.changes?.length
+        && (savedRuntimeApply.persistenceTransactionId ?? savedRuntimeApply.transactionId) === savedRuntimeApply.transactionId
+        && Number.isSafeInteger(savedIntent) && savedIntent >= 0) {
+      savedRecovery.current = savedRuntimeApply;
+    }
     setApply((state) => {
       const initial = preserveNativeRetirements(state, { phase: 'idle', reason: null, mainGeneration: generation,
         ...(state.host && state.host.phase !== 'settled' ? { host: state.host, hostReconciling: state.hostReconciling } : {}) });
@@ -97,22 +135,8 @@ export function useRuntimeApplyReconciliation(
       }
       return next;
     });
-    if (!savedRuntimeApply.ok || savedRuntimeApply.coreState !== 'committed'
-        || savedRuntimeApply.nativeRetirements?.length || pendingNative?.length || apply.nativeRetirements?.length
-        || apply.host && apply.host.phase !== 'settled') return;
-    const changes = savedRuntimeApply.changes;
-    if (savedRuntimeApply.status !== 'hotApplied' || savedRuntimeApply.configurationDurable !== true || !changes?.length) return;
-    if (changes.length === 1 && changes[0].logLevel) {
-      toast.info(text('home.pendingSavedLogLevelApplied', { level: changes[0].logLevel }));
-      return;
-    }
-    const labels = changes.slice(0, 3).map((change) => change.logLevel
-      ? `${text('logs.currentLevel')} ${change.logLevel}` : change.label);
-    const summary = labels.join(' · ');
-    const remaining = changes.length - labels.length;
-    toast.info(remaining > 0 ? text('home.pendingSavedMoreChangesApplied', { changes: summary, count: remaining })
-      : text('home.pendingSavedChangesApplied', { changes: summary }));
-  }, [apply, attemptRef, pendingNative, savedRuntimeApply, setApply, status, text]);
+    showSavedChanges(savedRuntimeApply, savedRuntimeApply, apply, text);
+  }, [apply, attemptRef, savedRuntimeApply, setApply, status, text]);
   const core = apply.coreRecovery ?? (apply.reconciling && apply.transactionId
     && apply.mainGeneration !== undefined && attemptRef.current?.intentGeneration !== undefined
     ? { transactionId: apply.transactionId, runtimeGeneration: apply.mainGeneration,
@@ -124,6 +148,16 @@ export function useRuntimeApplyReconciliation(
     const disposition = owner.selectionIntentGeneration === undefined && originalOwner ? 'owned'
         : runtimeApplyPollDisposition(result, owner.transactionId, owner.runtimeGeneration, owner.selectionIntentGeneration);
     if (disposition === 'ignore') return false;
+    const ended = disposition === 'failure' || result.status === 'hotApplied' && result.configurationDurable !== false
+      || result.configurationDurable === true;
+    const save = savedRecovery.current;
+    if (ended && ownsSaveRecovery(save, owner)) {
+      // A retry and a poll can complete together. Consume the original Save notice once.
+      savedRecovery.current = null;
+      if (disposition === 'owned' && !attemptRef.current && mounted.current && sameCore(latest.current, owner)) {
+        showSavedChanges(save, result, latest.current, text);
+      }
+    }
     setApply((state) => {
       if (!sameCore(state, owner)) return state;
       if (disposition === 'failure') return { ...mergeNativeRetirements(state, result.nativeRetirements), phase: 'failed', reconciling: false,
@@ -142,8 +176,16 @@ export function useRuntimeApplyReconciliation(
       return observed.configurationDurable === true
         ? { ...next, phase: 'idle', reason: null, reconciling: false } : next;
     });
-    return disposition === 'failure' || result.status === 'hotApplied' && result.configurationDurable !== false
-      || result.configurationDurable === true;
+    return ended;
+  };
+
+  const refreshCorePending = (owner: RuntimeCoreRecovery) => {
+    const request = attemptRef.current;
+    return useAppStore.getState().refreshPendingChanges(() => {
+      const live = useAppStore.getState().proxyStatus;
+      return attemptRef.current === request && request?.cancelled !== true && live?.running === true
+        && live.mainGeneration === owner.runtimeGeneration && latest.current.transactionId === owner.transactionId;
+    });
   };
 
   useEffect(() => {
@@ -163,19 +205,12 @@ export function useRuntimeApplyReconciliation(
       read: () => api.proxy.runtimeApplyStatus(owner.transactionId),
       accept: (result) => {
         const ended = acceptCore(owner, result);
-        if (ended && result.status === 'hotApplied') {
-          const request = attemptRef.current;
-          void useAppStore.getState().refreshPendingChanges(() => {
-            const live = useAppStore.getState().proxyStatus;
-            return attemptRef.current === request && request?.cancelled !== true && live?.running === true
-                && live.mainGeneration === owner.runtimeGeneration && latest.current.transactionId === owner.transactionId;
-          });
-        }
+        if (ended && result.status === 'hotApplied') void refreshCorePending(owner);
         return ended;
       },
     });
   }, [apply.reconciling, core?.transactionId, core?.runtimeGeneration, core?.selectionIntentGeneration,
-    status?.running, status?.mainGeneration, attemptRef, setApply]);
+    status?.running, status?.mainGeneration, attemptRef, setApply, text]);
 
   useEffect(() => {
     const host = apply.host;
@@ -216,6 +251,7 @@ export function useRuntimeApplyReconciliation(
     status?.ownedStopContext?.selectionIntentGeneration, attemptRef, setApply]);
 
   return {
+    hasSaveRecovery: !!core && ownsSaveRecovery(savedRecovery.current, core),
     checkNative: async () => {
       if (checkingNative.current) return;
       const owners = nativeRetirementDebts(latest.current.nativeRetirements);
@@ -243,13 +279,20 @@ export function useRuntimeApplyReconciliation(
       const live = useAppStore.getState().proxyStatus;
       if (!owner || owner.selectionIntentGeneration === undefined || latest.current.coreRecovery?.persistenceRetryable === false
           || retrying.current || live?.running !== true || live.mainGeneration !== owner.runtimeGeneration) return;
+      const saved = ownsSaveRecovery(savedRecovery.current, owner);
       retrying.current = true;
       setApply((state) => sameCore(state, owner) ? { ...state, persistenceRetrying: true } : state);
       try {
-        const result = await api.proxy.retryRuntimePersistence(owner.transactionId);
-        const current = useAppStore.getState().proxyStatus;
-        if (attemptRef.current === request && request?.cancelled !== true
-            && current?.running === true && current.mainGeneration === owner.runtimeGeneration) acceptCore(owner, result);
+        const retry = () => api.proxy.retryRuntimePersistence(owner.transactionId);
+        const current = () => {
+          const status = useAppStore.getState().proxyStatus;
+          return mounted.current && attemptRef.current === request && request?.cancelled !== true
+            && status?.running === true && status.mainGeneration === owner.runtimeGeneration;
+        };
+        const result = saved ? await dispatchSavedApply(retry, () => current() && sameCore(latest.current, owner)) : await retry();
+        if (result && current() && acceptCore(owner, result) && saved && result.status === 'hotApplied') {
+          void refreshCorePending(owner);
+        }
       } catch { /* keep original Core recovery and host debt; no Apply replay */ }
       finally {
         retrying.current = false;

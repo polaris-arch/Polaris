@@ -14,6 +14,8 @@ const h = vi.hoisted(() => ({
   applyNow: vi.fn(), freshApply: vi.fn(), hostRead: vi.fn(), coreRead: vi.fn(), nativeRead: vi.fn(),
   retryPersistence: vi.fn(), pendingRead: vi.fn(), cancelImpact: vi.fn(),
   savedRuntimeApply: null as SavedRuntimeApply | null,
+  completedSaveRevision: undefined as number | undefined,
+  baseVersion: undefined as string | undefined,
   armed: null as string | null, revertSaved: vi.fn(),
   lifecycleReady: vi.fn(), offLifecycle: vi.fn(), statusRead: vi.fn(),
   app: {
@@ -82,7 +84,9 @@ vi.mock('@/store/app-store', () => ({
 vi.mock('@/store/staged-config-store', async () => {
   const { withConfigWriteLock } = await import('@/lib/config-write-lock');
   const state = { entries: [], saveStatus: 'idle', conflict: null, applyNow: h.applyNow,
-    get savedRuntimeApply() { return h.savedRuntimeApply; } };
+    get savedRuntimeApply() { return h.savedRuntimeApply; },
+    get completedSaveRevision() { return h.completedSaveRevision; },
+    get baseVersion() { return h.baseVersion; } };
   return { dispatchSavedApply: async <T,>(invoke: () => Promise<T>, onDispatch: (value: PendingApplyResult | null) => boolean) => {
     const admitted = await withConfigWriteLock(async () => onDispatch(h.savedRuntimeApply) ? { reply: invoke() } : undefined);
     return admitted?.reply;
@@ -151,6 +155,8 @@ beforeEach(() => {
   unmount(); vi.resetAllMocks(); h.states = []; h.refs = [];
   h.armed = null;
   h.savedRuntimeApply = null;
+  h.completedSaveRevision = undefined;
+  h.baseVersion = undefined;
   h.app.config = null;
   h.app.nativeRetirementEndedBeforeGeneration = 0;
   h.app.pendingChanges = { added: ['node'], modified: [], removed: [], restartDeferred: false };
@@ -256,6 +262,55 @@ it('keeps polling a superseded Save owner without offering a persistence replay'
   expect(h.coreRead.mock.calls).toEqual([['save-core'], ['save-core']]);
   expect(h.retryPersistence).not.toHaveBeenCalled();
   expect(toast.info).not.toHaveBeenCalled();
+});
+
+it.each(['hotDurabilityPending', 'unconfirmed', 'newer disk-only Save', 'external edit'] as const)(
+  'attributes a delayed Core commit only to the still-current Save (%s)', async (initial) => {
+    vi.useFakeTimers();
+    h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: true };
+    h.completedSaveRevision = 1;
+    h.baseVersion = 'saved-config';
+    const owner = { transactionId: 'save-A', runtimeGeneration: 7, selectionIntentGeneration: 9 };
+    h.savedRuntimeApply = { ...owner, ok: false, configurationDurable: false,
+      status: initial === 'unconfirmed' ? initial : 'hotDurabilityPending',
+      saveRevision: 1, configVersion: 'saved-config', changes: [{ label: 'Log level draft', logLevel: 'DEBUG' }] };
+    const terminal: PendingApplyResult = { ...owner, ok: true, status: 'hotApplied', coreState: 'committed', configurationDurable: true };
+    h.coreRead.mockResolvedValueOnce({ ...terminal, selectionIntentGeneration: 10 }).mockResolvedValue(terminal);
+    renderBar();
+    renderBar();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(toast.info).not.toHaveBeenCalled();
+    if (initial === 'newer disk-only Save') h.completedSaveRevision = 3; // A → B → A keeps the canonical config version.
+    if (initial === 'external edit') h.baseVersion = 'external-config';
+    await vi.advanceTimersByTimeAsync(2000);
+    renderBar();
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(h.coreRead.mock.calls).toEqual([['save-A'], ['save-A']]);
+    if (initial === 'hotDurabilityPending' || initial === 'unconfirmed') {
+      expect(toast.info).toHaveBeenCalledExactlyOnceWith('Log level changed to DEBUG.');
+    } else expect(toast.info).not.toHaveBeenCalled();
+  },
+);
+
+it('shows the original named Save once when persistence retry and polling both confirm it', async () => {
+  vi.useFakeTimers();
+  h.app.pendingChanges = { added: [], modified: [], removed: [], restartDeferred: true };
+  const owner = { transactionId: 'save-retry', runtimeGeneration: 7, selectionIntentGeneration: 9 };
+  h.savedRuntimeApply = { ...owner, ok: true, status: 'hotDurabilityPending', coreState: 'committed', configurationDurable: false,
+    changes: [{ label: 'Delete rule Example' }] };
+  let finishRetry!: (result: PendingApplyResult) => void;
+  h.retryPersistence.mockImplementationOnce(() => new Promise(resolve => { finishRetry = resolve; }));
+  const terminal: PendingApplyResult = { ...owner, ok: true, status: 'hotApplied', coreState: 'committed', configurationDurable: true };
+  h.coreRead.mockResolvedValueOnce(terminal);
+  renderBar();
+  click('home.pendingRetryPersistenceBtn');
+  await microtasks();
+  expect(h.retryPersistence).toHaveBeenCalledExactlyOnceWith('save-retry');
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(h.coreRead).toHaveBeenCalledExactlyOnceWith('save-retry');
+  finishRetry(terminal);
+  await microtasks();
+  expect(toast.info).toHaveBeenCalledExactlyOnceWith('Delete rule Example took effect.');
 });
 
 it('keeps explicit ownership over a previously queued Save with the same selector intent', async () => {

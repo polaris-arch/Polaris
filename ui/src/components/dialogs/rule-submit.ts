@@ -57,7 +57,7 @@ export interface RuleSubmitArgs {
   initialPlane: 'route' | 'dns';
   stagingEnabled: boolean;
   stage: (entry: StagedEntry) => void;
-  close: () => void;
+  close: (outcome: 'staged' | 'saved') => void;
   loadConfig: (force: boolean) => Promise<unknown> | void;
   setSubmitting: (v: boolean) => void;
   /** Exact mounted input revision owns asynchronous pre-submit admission. */
@@ -274,7 +274,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
           entityPath: [collectionKey, full.id],
           nextValue: full,
         });
-        if (isCurrent()) close();
+        if (isCurrent()) close('staged');
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
       dispatched = true;
@@ -317,7 +317,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
             nextValue: order,
           });
         }
-        if (isCurrent()) close();
+        if (isCurrent()) close('staged');
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
       dispatched = true;
@@ -334,7 +334,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
       }
     }
     void loadConfig(true); // 同上：不刷则列表看不到新增/编辑结果
-    if (isCurrent()) close();
+    if (isCurrent()) close('saved');
   } catch (e) {
     if (!dispatched && !isCurrent()) return;
     console.error('[RuleDialog] save failed:', e);

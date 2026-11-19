@@ -330,7 +330,8 @@ it.each(['stopping', 'entries'] as const)('rechecks staging after %s changes dur
   ipc.add.mockClear();
   useStagedConfigStore.setState({ enabled: true, entries: [] });
   useAppStore.setState({ proxyStarting: false, proxyStopping: false, proxyStatus: undefined });
-  const request = args({ stagingEnabled: false, conds: [{ t: 'domainRegex', v: 'example' }] });
+  const close = vi.fn();
+  const request = args({ stagingEnabled: false, conds: [{ t: 'domainRegex', v: 'example' }], close });
   const operation = submitRule(request.a);
   if (change === 'stopping') useAppStore.setState({ proxyStopping: true });
   else useStagedConfigStore.setState({ entries: [{ id: 'other', kind: 'rule', label: 'other', entityPath: ['trafficRules', 'other'], nextValue: base }] });
@@ -338,6 +339,7 @@ it.each(['stopping', 'entries'] as const)('rechecks staging after %s changes dur
   await operation;
   expect(ipc.add).not.toHaveBeenCalled();
   expect(request.staged).toHaveLength(1);
+  expect(close).toHaveBeenCalledExactlyOnceWith('staged');
 });
 it('unavailable syntax is actionable and distinct from invalid', async () => {
   const { toast } = await import('@/lib/error-handler');

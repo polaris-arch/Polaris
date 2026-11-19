@@ -31,6 +31,7 @@ import type { Rule, UserConfig } from '@/contracts/types';
 import i18n, { i18nReady } from '@/i18n';
 import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
+import { toast } from '@/lib/error-handler';
 import { useMobileFormStore } from './form-store';
 
 /** 探针的落点。`vi.hoisted` —— `vi.mock` 的工厂是提升的，引用普通模块变量会拿到 TDZ。 */
@@ -136,6 +137,20 @@ describe('⓪ 自检：两枚探针都是活的（否则下面每条都是空跑
     /* 新建态也要有个可提交的袋子：`isEdit` 假、`base` 缺席，其余格照样齐。 */
     expect(args.isEdit).toBe(false);
     expect(args.base).toBeUndefined();
+  });
+
+  it('reports the named disk save only when the actual submit outcome says saved', () => {
+    const notify = vi.spyOn(toast, 'success').mockImplementation(() => undefined);
+    try {
+      const args = mountAndSubmit(<RuleFormPanel instanceId="outcome" ruleId="r1" initialPlane="route" />, { rules: [ruleOf({})] });
+      const close = args.close as (outcome: 'saved' | 'staged') => void;
+      close('staged');
+      expect(notify).not.toHaveBeenCalled();
+      close('saved');
+      expect(notify).toHaveBeenCalledExactlyOnceWith(`${i18n.t('rules.editTitle')} 存量规则 · ${i18n.t('common.saved')}`);
+    } finally {
+      notify.mockRestore();
+    }
   });
 });
 

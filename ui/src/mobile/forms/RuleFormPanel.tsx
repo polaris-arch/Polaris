@@ -88,7 +88,6 @@ import {
 } from '@/components/dialogs/rule-effect-state';
 import { submitRule } from '@/components/dialogs/rule-submit';
 import { toast } from '@/lib/error-handler';
-import { editRoute } from '@/lib/staged-config';
 import { NEW_PROFILE_CHOICE, networkProfileOptions } from '@/components/dialogs/network-profile-options';
 import { BUILTIN_NETENV_DHCP_ID } from '@/domain/network-profile';
 import { mobileReasonKey } from '../screens/rules/network-profile-copy';
@@ -442,10 +441,12 @@ export function RuleFormPanel({
       initialPlane: plane,
       stagingEnabled,
       stage,
-      close: () => {
+      close: (outcome) => {
         closeInstance(instanceId);
-        if (editRoute(plane === 'dns' ? 'dnsRules' : 'trafficRules', stagingEnabled) !== 'staged')
-          toast.success(tr('common.saved'));
+        if (outcome === 'saved') {
+          const operation = tr(isEdit ? 'rules.editTitle' : 'rules.newTitle');
+          toast.success(`${operation} ${name.trim()} · ${tr('common.saved')}`);
+        }
       },
       loadConfig,
       setSubmitting,

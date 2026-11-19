@@ -108,6 +108,7 @@ function resetStore(enabled: boolean): void {
     baseline: null,
     hydrated: false,
     saveStatus: 'idle',
+    completedSaveRevision: 0,
     savedRuntimeApply: null,
     conflict: null,
     conflictBaseline: null,
@@ -420,6 +421,7 @@ describe('save —— 落盘但不排重启（FR-5）', () => {
     await expect(useStagedConfigStore.getState().save()).resolves.toBe(true);
     expect(saveMock).toHaveBeenCalledExactlyOnceWith(expect.anything(), true, configBaseVersion(CONFIG), true);
     expect(applyMock).not.toHaveBeenCalled();
+    expect(useStagedConfigStore.getState()).toMatchObject({ completedSaveRevision: 1, savedRuntimeApply: null });
   });
 
   /**
@@ -725,7 +727,7 @@ describe('并发保存（withConfigWriteLock）', () => {
     finishSave({ status: 'saved', version: 'v-save', config: CONFIG, runtimeApply: receipt });
     await expect(saved).resolves.toBe(true);
     await expect(applied).resolves.toMatchObject({ saved: true });
-    expect(capture).toHaveBeenCalledExactlyOnceWith({ ...receipt, changes: [] });
+    expect(capture).toHaveBeenCalledExactlyOnceWith({ ...receipt, saveRevision: 1, configVersion: 'v-save', changes: [] });
     expect(applyMock).toHaveBeenCalledExactlyOnceWith('already-reviewed-restart');
   });
 
@@ -1142,7 +1144,7 @@ describe('save snapshot ownership across awaited reads/writes', () => {
     finishSave({ status: 'saved', config: canonical, version: 'committed', runtimeApply: receipt });
 
     await expect(saving).resolves.toBe(true);
-    expect(useStagedConfigStore.getState().savedRuntimeApply).toEqual({ ...receipt, changes: [
+    expect(useStagedConfigStore.getState().savedRuntimeApply).toEqual({ ...receipt, saveRevision: 1, configVersion: 'committed', changes: [
       { label: 'Clone node n2' }, { label: 'Log level draft label', logLevel: 'DEBUG' },
     ] });
     expect(useStagedConfigStore.getState().entries.map(({ label }) => label)).toEqual(['Log level WARN']);
