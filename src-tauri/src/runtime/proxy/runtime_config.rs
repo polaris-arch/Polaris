@@ -13,10 +13,9 @@ use crate::runtime::route_binding::{
     ProtectedPhysicalRoot,
 };
 use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
+use polaris_config_engine::builder::generate::generate_running_candidate;
 use polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG;
-use polaris_config_engine::builder::{
-    generate_sing_box_config_with_report_and_runtime_bindings, GenerateConfigDeps,
-};
+use polaris_config_engine::builder::GenerateConfigDeps;
 use polaris_config_engine::singbox::SingBoxConfig;
 use polaris_config_engine::user_config::UserConfig;
 use polaris_helper_proto::Platform;
@@ -259,6 +258,24 @@ fn tailnet_tun_projection_changed(accepted: &SingBoxConfig, candidate: &SingBoxC
             .collect::<Vec<_>>()
     };
     projection(accepted) != projection(candidate)
+}
+
+fn introduces_tailscale_state_scope(accepted: &SingBoxConfig, candidate: &SingBoxConfig) -> bool {
+    let owned = accepted.endpoints.as_deref().unwrap_or_default();
+    candidate
+        .endpoints
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|endpoint| endpoint.type_field == "tailscale")
+        .any(|endpoint| {
+            !owned.iter().any(|old| {
+                old.type_field == "tailscale"
+                    && old.tag == endpoint.tag
+                    && old.state_directory == endpoint.state_directory
+                    && old.taildrop_directory == endpoint.taildrop_directory
+            })
+        })
 }
 
 #[derive(Clone)]
@@ -2302,11 +2319,11 @@ impl ProxyRuntime {
             );
             return decline(result);
         }
-        let outcome = match generate_sing_box_config_with_report_and_runtime_bindings(
+        let outcome = match generate_running_candidate(
             &typed,
-            &BTreeMap::new(),
             &deps,
             &bindings,
+            &baseline.generated,
         ) {
             Ok(value)
                 if value.invalid_nodes.iter().all(|node| node.reason == polaris_config_engine::builder::outbounds::INVALID_REASON_VISION_TRANSPORT)
@@ -2338,6 +2355,19 @@ impl ProxyRuntime {
         }
         let network_canary = outcome.network_canary;
         let mut generated = outcome.config;
+        // Android's original VPN owns state paths admitted at native Start.
+        // A new physical writer needs the same birth's native admission first.
+        if self.helper.platform() == Platform::Android
+            && introduces_tailscale_state_scope(&baseline.generated, &generated)
+        {
+            return decline(restart_choice(
+                &candidate,
+                "tailscaleStateScopeRequiresRestart",
+                vec!["endpoints.tailscale.state_directory".into()],
+                generation,
+                intent,
+            ));
+        }
         generated.polaris_windows_directory = baseline.generated.polaris_windows_directory.clone();
         if protected_binding_plan.is_some()
             && !protected_generated_policy_compatible(&baseline.generated, &generated)
@@ -2370,11 +2400,11 @@ impl ProxyRuntime {
             Some(value) => value,
             None => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
-        let previous = match generate_sing_box_config_with_report_and_runtime_bindings(
+        let previous = match generate_running_candidate(
             &previous,
-            &BTreeMap::new(),
             &baseline.deps,
             &previous_bindings,
+            &baseline.generated,
         )
         .ok()
         .and_then(|value| serde_json::to_value(value.config).ok())

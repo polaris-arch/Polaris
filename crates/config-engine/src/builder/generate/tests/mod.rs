@@ -75,6 +75,12 @@ fn base_config() -> UserConfig {
 #[test]
 fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
     let mut config = base_config();
+    config.singbox_dashboard = Some(true);
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let running = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+
     config.servers.push(ServerConfig {
         id: "ts".into(),
         name: "Tailnet".into(),
@@ -82,14 +88,25 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
         tailscale_settings: Some(Box::default()),
         ..Default::default()
     });
-    config.singbox_dashboard = Some(true);
-    let mut deps = deps_default();
-    deps.platform = "android".into();
-    deps.has_management_api = true;
     let ordinary = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
     let ordinary_base = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
         .unwrap()
         .config;
+    let candidate = generate_running_candidate(&config, &deps, &BTreeMap::new(), &running)
+        .unwrap()
+        .config;
+    assert_eq!(candidate, ordinary_base);
+    assert_eq!(candidate.experimental, running.experimental);
+    assert_eq!(candidate.services, running.services);
+    assert!(candidate.endpoints.as_ref().is_some_and(|endpoints| {
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.type_field == "tailscale")
+    }));
+    let existing_dual = generate_running_candidate(&config, &deps, &BTreeMap::new(), &ordinary)
+        .unwrap()
+        .config;
+    assert_eq!(existing_dual, ordinary);
     assert_eq!(
         ordinary
             .experimental

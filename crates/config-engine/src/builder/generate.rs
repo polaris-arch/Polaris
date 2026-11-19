@@ -324,6 +324,33 @@ pub fn generate_sing_box_config_with_report_and_runtime_bindings(
     Ok(outcome)
 }
 
+/// Keep the running Android layout when its start did not provision dual mesh
+/// mode. A routine graph edit must not also introduce a Clash API service and
+/// replace the Dashboard's HTTP client. A normal start can compile both modes
+/// from the latest config.
+pub fn generate_running_candidate(
+    config: &UserConfig,
+    deps: &GenerateConfigDeps,
+    runtime_bind_interfaces: &BTreeMap<String, String>,
+    running: &SingBoxConfig,
+) -> Result<GenerateOutcome, String> {
+    let resolved_ips = BTreeMap::new();
+    if deps.platform == "android"
+        && running
+            .experimental
+            .as_ref()
+            .is_none_or(|experimental| experimental.clash_api.is_none())
+    {
+        return generate_base_config(config, &resolved_ips, deps, runtime_bind_interfaces);
+    }
+    generate_sing_box_config_with_report_and_runtime_bindings(
+        config,
+        &resolved_ips,
+        deps,
+        runtime_bind_interfaces,
+    )
+}
+
 fn generate_base_config(
     config: &UserConfig,
     resolved_ips: &BTreeMap<String, String>,
