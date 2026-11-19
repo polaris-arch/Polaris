@@ -22,6 +22,14 @@ describe('subscriptionErrorDetail', () => {
       subscriptionErrorDetail({ errorKind: 'unknown', error: 'tls handshake failed' }, t)
     ).toBe('sub.preview.unknownDetail:');
     expect(subscriptionErrorDetail({ message: 'legacy sanitized detail' }, t)).toBe('nodes.subRefreshFail');
+    expect(subscriptionErrorDetail({ code: 'UNKNOWN_REFRESH_FAILURE', error: 'backend diagnostic' }, t)).toBe('nodes.subRefreshFail');
+  });
+
+  it('localizes the exact refresh blocker without rendering the diagnostic', () => {
+    expect(subscriptionErrorDetail({
+      code: 'SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING',
+      error: 'backend diagnostic',
+    }, t)).toBe('nodes.subRefreshBlockedByPending');
   });
 
   it.each([

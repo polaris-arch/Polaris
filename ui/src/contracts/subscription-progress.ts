@@ -1,5 +1,7 @@
 import type { SubscriptionErrorKind } from './subscription-preview';
 
+export type SubscriptionRefreshErrorCode = 'SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING';
+
 /**
  * 订阅更新进度 —— `event:subscriptionUpdateProgress` 载荷的跨语言类型镜像。
  *
@@ -60,6 +62,8 @@ export interface SubscriptionUpdateProgress {
   error?: string;
   /** `failed`：后端在抛出点确定的分类；渲染端优先据此取 i18n 详情，不按文案反猜。 */
   errorKind?: SubscriptionErrorKind;
+  /** Stable refresh disposition for localized failure detail. */
+  code?: SubscriptionRefreshErrorCode;
   /** `errorKind='http'` 时的状态码。 */
   httpStatus?: number;
 }

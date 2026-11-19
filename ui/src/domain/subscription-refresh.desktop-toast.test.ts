@@ -89,6 +89,22 @@ beforeEach(() => {
 });
 
 describe('① 桌面侧三态 toast —— 逐条钉住（这几条变了 = 桌面行为变了）', () => {
+  it('shows the localized pending reason in the existing failure toast and mobile detail', async () => {
+    nextResult = {
+      success: false,
+      addedServers: 0,
+      updatedServers: 0,
+      deletedServers: 0,
+      code: 'SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING',
+      error: 'backend diagnostic',
+    };
+    expect(await refreshSubscriptionWithToast('sub-1', t)).toEqual({
+      ok: false,
+      detail: 'nodes.subRefreshBlockedByPending',
+    });
+    expect(calls).toEqual([{ channel: 'error', msg: 'nodes.subRefreshFail', desc: 'nodes.subRefreshBlockedByPending' }]);
+  });
+
   it('自检：函数真的调了后端，假 toast 真的被驱动过（扫 0 次会让下面全部恒绿）', async () => {
     nextResult = { success: true, addedServers: 1, updatedServers: 0, deletedServers: 0 };
     await refreshSubscriptionWithToast('sub-1', t);

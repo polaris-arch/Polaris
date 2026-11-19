@@ -23,6 +23,13 @@ fn failure_frame_carries_the_real_backend_message() {
     assert_eq!(frame["phase"], "failed");
     // 变异锁：换成「订阅更新失败」这类笼统兜底 → 订阅栏上那个 tooltip 就再也说不出是哪一步坏了。
     assert_eq!(frame["error"], "订阅缺少 URL");
+    assert!(frame.get("code").is_none());
+    let blocked = update_blocked_by_pending();
+    assert_eq!(blocked["success"], false);
+    assert_eq!(blocked["addedServers"], 0);
+    let frame = terminal_progress_frame(&blocked);
+    assert_eq!(frame["phase"], "failed");
+    assert_eq!(frame["code"], "SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING");
 }
 
 #[test]

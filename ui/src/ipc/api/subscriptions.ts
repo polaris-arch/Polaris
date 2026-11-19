@@ -3,7 +3,7 @@ import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { SubscriptionConfig, ImportParseResult } from '../../contracts/types';
 import type { SubscriptionUserAgentInfo } from '../../contracts/subscription-user-agent';
 import type { SubscriptionErrorKind, SubscriptionPreviewResult } from '../../contracts/subscription-preview';
-import type { SubscriptionUpdateProgress } from '../../contracts/subscription-progress';
+import type { SubscriptionRefreshErrorCode, SubscriptionUpdateProgress } from '../../contracts/subscription-progress';
 import type { BackupCategory } from '../../domain/backup-categories';
 import type {
   SubscriptionCreateInput,
@@ -36,6 +36,7 @@ export interface SubscriptionRefreshResult {
   updatedServers: number;
   deletedServers: number;
   errorKind?: SubscriptionErrorKind;
+  code?: SubscriptionRefreshErrorCode;
   httpStatus?: number;
   error?: string;
   unchanged?: boolean;
@@ -124,6 +125,7 @@ export const subscriptionApi = {
       success: boolean;
       error?: string;
       errorKind?: SubscriptionErrorKind;
+      code?: SubscriptionRefreshErrorCode;
       httpStatus?: number;
       addedServers?: number;
       updatedServers?: number;

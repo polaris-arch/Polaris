@@ -2444,6 +2444,7 @@
     "subMenuHeader": "订阅",
     "subRefresh": "刷新",
     "subRefreshFail": "订阅更新失败",
+    "subRefreshBlockedByPending": "已有配置操作尚未完成。请等待处理结束后重试订阅更新。",
     "subRefreshOk": "订阅已刷新 · {{count}} 项节点变动",
     "subRefreshUnchanged": "订阅未变化",
     "subRename": "重命名",

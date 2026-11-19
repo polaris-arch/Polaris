@@ -455,11 +455,22 @@ fn update_failure(error: impl Into<String>) -> Value {
     })
 }
 
-/// 把订阅拉取层已经判定好的结构化错误字段复制到更新结果/事件帧。
+const REFRESH_BLOCKED_BY_PENDING: &str = "SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING";
+
+fn update_blocked_by_pending() -> Value {
+    let mut result = update_failure("已有配置操作尚未完成，请稍后重试订阅刷新");
+    result["code"] = json!(REFRESH_BLOCKED_BY_PENDING);
+    result
+}
+
+/// 把已确认的订阅刷新错误字段复制到更新结果和事件帧。
 ///
 /// `message` 只承担脱敏诊断；渲染端应优先按 `errorKind` 取 i18n 文案，`httpStatus` 只给 HTTP 类
 /// 插值。字段复制收在一处，避免手动更新终态与后台调度事件再次出现「一条有分类、一条只剩字符串」的漂移。
 pub(crate) fn copy_subscription_error_metadata(source: &Value, target: &mut Value) {
+    if source.get("code").and_then(Value::as_str) == Some(REFRESH_BLOCKED_BY_PENDING) {
+        target["code"] = json!(REFRESH_BLOCKED_BY_PENDING);
+    }
     if let Some(kind) = source.get("errorKind").and_then(Value::as_str) {
         target["errorKind"] = json!(kind);
     }
@@ -1110,7 +1121,7 @@ async fn perform_subscription_update_inner(
         Ok(None) => {
             return json!({"success":false,"superseded":true,"addedServers":0,"updatedServers":0,"deletedServers":0})
         }
-        Err(error) => return update_failure(error),
+        Err(result) => return result,
     };
 
     // 7) 节点内容未变时只刷新元数据。部分拉取仍保留自己的终态。
@@ -1160,7 +1171,7 @@ async fn commit_subscription_refresh(
     token: &SubscriptionRefreshToken,
     edit: &PreparedConfigEdit,
     content_changed: bool,
-) -> Result<Option<(u64, Option<RuntimeApplyResult>)>, String> {
+) -> Result<Option<(u64, Option<RuntimeApplyResult>)>, Value> {
     if !token.is_current() {
         return Ok(None);
     }
@@ -1169,7 +1180,7 @@ async fn commit_subscription_refresh(
             state.proxy().push_pending_changes();
             super::config::emit_config_changed_signal(app);
         }
-        error.to_string()
+        update_failure(error.to_string())
     };
     if !content_changed {
         return Ok(state
@@ -1198,10 +1209,10 @@ async fn commit_subscription_refresh(
                 .map_err(&store_error)?;
             Ok(revision.map(|revision| (revision, None)))
         }
-        HotConfigEditOutcome::BlockedByPending => Err("有待应用的配置变更，请先处理后重试".into()),
+        HotConfigEditOutcome::BlockedByPending => Err(update_blocked_by_pending()),
         HotConfigEditOutcome::Conflict => Ok(None),
-        HotConfigEditOutcome::Retryable => Err("内核暂时无法应用订阅更新，请重试".into()),
-        HotConfigEditOutcome::Rejected => Err("内核拒绝了订阅更新".into()),
+        HotConfigEditOutcome::Retryable => Err(update_failure("内核暂时无法应用订阅更新，请重试")),
+        HotConfigEditOutcome::Rejected => Err(update_failure("内核拒绝了订阅更新")),
     }
 }
 

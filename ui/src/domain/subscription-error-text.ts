@@ -34,6 +34,7 @@ export function subscriptionErrorDetail(
       status: data.httpStatus ?? '',
     });
   }
+  if (data.code === 'SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING') return t('nodes.subRefreshBlockedByPending');
   if (data.code === 'SUBSCRIPTION_CREATE_PROXY_REQUIRED') return t('sub.createProxyRequired');
   if (data.code === 'SUBSCRIPTION_CREATE_EMPTY') return t('sub.preview.emptyDetail');
   if (data.code === 'SUBSCRIPTION_CREATE_CONFIG_CHANGED' || data.code === 'SUBSCRIPTION_CREATE_PROXY_CHANGED') {

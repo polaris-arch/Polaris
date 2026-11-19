@@ -108,11 +108,25 @@ fn autoupdate_payload_failure_keeps_structured_error_metadata() {
         "error": "sanitized transport diagnostic",
         "errorKind": "http",
         "httpStatus": 429,
+        "code": "UNTRUSTED_DIAGNOSTIC",
     });
     let p = build_autoupdate_payload("sub-1", "provider", &result);
     assert_eq!(p["errorKind"], "http");
     assert_eq!(p["httpStatus"], 429);
     assert_eq!(p["error"], "sanitized transport diagnostic");
+    assert!(p.get("code").is_none());
+
+    let pending = build_autoupdate_payload(
+        "sub-1",
+        "provider",
+        &json!({
+            "success": false,
+            "code": "SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING",
+        }),
+    );
+    assert_eq!(pending["success"], false);
+    assert_eq!(pending["code"], "SUBSCRIPTION_REFRESH_BLOCKED_BY_PENDING");
+    assert!(pending.get("errorKind").is_none());
 }
 
 #[test]

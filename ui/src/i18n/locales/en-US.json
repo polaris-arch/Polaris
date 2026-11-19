@@ -2444,6 +2444,7 @@
     "subMenuHeader": "Subscription",
     "subRefresh": "Refresh",
     "subRefreshFail": "Subscription update failed",
+    "subRefreshBlockedByPending": "Another configuration operation is still pending. Retry the subscription update after it finishes.",
     "subRefreshOk": "Subscription refreshed · {{count}} node change(s)",
     "subRefreshUnchanged": "Subscription unchanged",
     "subRename": "Rename",

@@ -2125,6 +2125,7 @@
     "subMenuHeader": "اشتراک",
     "subRefresh": "تازه‌سازی",
     "subRefreshFail": "به‌روزرسانی اشتراک ناموفق بود",
+    "subRefreshBlockedByPending": "یک عملیات پیکربندی دیگر هنوز کامل نشده است. پس از پایان آن، به‌روزرسانی اشتراک را دوباره امتحان کنید.",
     "subRefreshOk": "اشتراک تازه شد · {{count}} تغییر نود",
     "subRefreshUnchanged": "اشتراک تغییری نکرد",
     "subRename": "تغییر نام",

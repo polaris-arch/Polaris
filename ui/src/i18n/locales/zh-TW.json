@@ -2444,6 +2444,7 @@
     "subMenuHeader": "訂閱",
     "subRefresh": "重新整理",
     "subRefreshFail": "訂閱更新失敗",
+    "subRefreshBlockedByPending": "已有設定操作尚未完成。請待處理完成後再試一次更新訂閱。",
     "subRefreshOk": "訂閱已重新整理 · {{count}} 項節點變動",
     "subRefreshUnchanged": "訂閱未變化",
     "subRename": "重新命名",
