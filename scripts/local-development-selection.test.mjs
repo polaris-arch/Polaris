@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  appendFileSync, existsSync, fstatSync, linkSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync,
+  appendFileSync, existsSync, fstatSync, linkSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync,
   symlinkSync, truncateSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +9,9 @@ import { dirname, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { crc32 } from 'node:zlib';
-import { buildPortableZip, inspectFormalArtifact, inspectPortableZip, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
+import { buildPortableZip, inspectFormalArtifact, inspectPortableZip, nsisMembers, verifyFormalArtifactBytes } from './lib/formal-package-selection.mjs';
+import { expectedWindowsApp, releaseArguments, selectTauriEntry } from './windows-package-integrity.mjs';
+import { now, parse, startCustody, streamChild, wire } from './lib/windows-package-custody.mjs';
 import { fixtureTar, fixtureZip, writeFormalAssets, writeLinuxFixture } from './lib/formal-package-fixtures.mjs';
 import {
   LOCAL_MARKER, collectLocalSelection, compilerSelectionSource, localDirectory, localReceipt, prepareLocalInstallation,
@@ -580,4 +582,123 @@ test('formal DMG and NSIS selection reads executable bytes through the carrier r
   } finally {
     process.env.PATH = originalPath;
   }
+}));
+
+test('Windows package producer preserves the exact bundle transform, argv, and full file identity', () => {
+  const token = '__TAURI_BUNDLE_TYPE_VAR_UNK';
+  const source = Buffer.from('compiled App ' + token + ' with embedded source');
+  assert.deepEqual(expectedWindowsApp(source, 'zip', '2.12.5'), source);
+  assert.deepEqual(expectedWindowsApp(source, 'nsis', '2.12.5'), Buffer.from(source.toString().replace('_UNK', '_NSS')));
+  for (const invalid of [Buffer.from('no token'), Buffer.concat([source, source])]) {
+    assert.throws(() => expectedWindowsApp(invalid, 'nsis', '2.12.5'), /unique unpatched bundle token/);
+  }
+  assert.throws(() => expectedWindowsApp(source, 'zip', '2.11.4'), /unreviewed Tauri CLI/);
+  const target = 'x86_64-pc-windows-msvc', state = { cargo: { target } };
+  const argv = ['build', '--locked', '--offline', '--bins', '--release', '--message-format=json',
+    '--features', 'tauri/custom-protocol', '--target', target];
+  releaseArguments(state, argv);
+  for (const invalid of [argv.slice(0, -1), [...argv, '--release'], [...argv, '--target', target], [...argv, '--frozen']]) {
+    assert.throws(() => releaseArguments(state, invalid), /Cargo/);
+  }
+  const raw = '{"file":[340282366920938463463374607431768211455,1700000000000000100],"path":"\u901a\u77e5"}';
+  assert.equal(wire(parse(raw)), raw.replace('通知', '\\u901a\\u77e5'));
+});
+
+test('Windows package NSIS listing rejects aliases and retains unlisted byte counts for literal reads', () => {
+  const listing = (...rows) => ['Type = Nsis', '----------', rows.join('\r\n\r\n'), ''].join('\r\n');
+  const row = (name, size = '1', additional = '') => 'Path = ' + name + '\r\nSize = ' + size + additional;
+  const records = nsisMembers(listing(row('$R6\\polaris.exe'), row('uninstall.exe', '')));
+  assert.deepEqual([...records], [['$R6/polaris.exe', { kind: 'file', bytes: 1 }], ['uninstall.exe', { kind: 'file', bytes: null }]]);
+  for (const invalid of [
+    listing(row('CON.exe')), listing(row('$R6\\file'), row('$r6/File')),
+    listing(row('app'), row('app/child')), listing(row('extra ', '2')), listing('Path = extra '),
+    listing(row('bad', '1', '\r\nSymbolic Link = target')), listing(row('too-large', '536870913')),
+  ]) assert.throws(() => nsisMembers(invalid));
+});
+
+test('Windows package Tauri lookup selects the first admissible executable after npm shims', () => fixture(root => {
+  const shim = join(root, 'tauri'), powershell = join(root, 'tauri.ps1');
+  const command = join(root, 'tauri.cmd'), executable = join(root, 'TAURI.EXE');
+  const directory = join(root, 'not-a-file.cmd'), missing = join(root, 'missing.exe');
+  for (const path of [shim, powershell, command, executable]) writeFileSync(path, 'fixture');
+  mkdirSync(directory);
+  const rejected = [shim, powershell, directory, missing];
+  assert.equal(selectTauriEntry([...rejected, command, executable]), command);
+  assert.equal(selectTauriEntry([...rejected, executable, command]), executable);
+  assert.equal(selectTauriEntry(rejected), undefined);
+}));
+
+test('Windows package child transport requires guarded primary exit and bounds pending callbacks', () => fixture(async root => {
+  const marker = join(root, 'after-eof');
+  const child = [process.execPath, '-e', [
+    'const fs = require("node:fs");',
+    'fs.writeSync(1, "actual stdout"); fs.writeSync(2, "actual stderr");',
+    'fs.closeSync(1); fs.closeSync(2);',
+    'setTimeout(() => fs.writeFileSync(process.argv[1], "named output after EOF"), 150);',
+    'setTimeout(() => {}, 1500);',
+  ].join('\n'), marker];
+  const output = [];
+  await assert.rejects(streamChild(child, chunk => output.push(chunk), 1024, {
+    deadline: now() + 5000, diagnostics: false, guard() {
+      if (existsSync(marker)) throw new Error('named write after EOF refused');
+    },
+  }), /named write after EOF refused/);
+  assert.equal(Buffer.concat(output).toString(), 'actual stdout');
+  const normal = await streamChild([process.execPath, '-e', 'process.stdout.write("receipt")'], () => {}, 1024,
+    { deadline: now() + 5000 });
+  assert.deepEqual(normal.pipeEOF, ['stderr', 'stdout']);
+  assert.equal(normal.stdoutSha256, hash('receipt'));
+
+  for (const stalled of ['consumer', 'guard']) {
+    const pending = Promise.withResolvers();
+    let observed, pid, timer;
+    const pause = signal => { observed = signal; return pending.promise; };
+    const child = [process.execPath, '-e', 'process.stdout.write("receipt"); setTimeout(() => {}, 2500)'];
+    const result = streamChild(child, (_block, signal) => stalled === 'consumer' && pause(signal), 1024, {
+      deadline: now() + 1000, diagnostics: false, birth: childPid => { pid = childPid; },
+      guard: stalled === 'guard' ? pause : undefined,
+    });
+    try {
+      const idleLimit = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('stalled callback held the child join')), 4000);
+      });
+      await assert.rejects(Promise.race([result, idleLimit]), /owned child deadline exceeded/);
+      assert.equal(observed?.aborted, true);
+      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+    } finally {
+      clearTimeout(timer);
+      if (observed) pending.reject(new Error('late ' + stalled + ' failure'));
+    }
+  }
+}));
+
+test('Windows package native custody retains the exact App across capture exit', {
+  skip: process.platform !== 'win32' || process.env.POLARIS_WINDOWS_PACKAGE_PREVIEW !== '1',
+}, () => fixture(async root => {
+  const executable = fileURLToPath(new URL('../target/x86_64-pc-windows-msvc/release/polaris-package-custody.exe', import.meta.url));
+  const owner = startCustody(executable);
+  const source = join(root, 'polaris.exe'), renamed = join(root, 'renamed.exe');
+  const app = { path: source, kind: 'app' }, resource = { path: join(root, 'resource'), kind: 'file' };
+  try {
+    writeFileSync(source, 'compiled App');
+    writeFileSync(resource.path, 'frozen resource');
+    const [frozen] = await owner.hold([resource]);
+    assert.throws(() => writeFileSync(resource.path, 'unbound bytes'));
+    await owner.release([frozen]);
+    assert.equal(readFileSync(resource.path, 'utf8'), 'frozen resource');
+
+    const capture = startCustody(executable);
+    let held, retained;
+    try {
+      [held] = await capture.hold([app]);
+      const birth = await owner.birth(capture.pid);
+      await assert.rejects(owner.transfer(capture.pid, birth + 1n, held.handle, app), /changed before handle transfer/);
+      retained = await owner.transfer(capture.pid, birth, held.handle, app);
+    } finally { await capture.close(); }
+    assert.deepEqual(await owner.check(retained, app), held.identity);
+    assert.throws(() => renameSync(source, renamed));
+    await owner.release([retained]);
+    renameSync(source, renamed);
+    assert.equal(readFileSync(renamed, 'utf8'), 'compiled App');
+  } finally { await owner.close(); }
 }));

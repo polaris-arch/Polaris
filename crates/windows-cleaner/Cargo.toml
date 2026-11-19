@@ -12,6 +12,9 @@ serde_json = "1"
 sha2 = "0.11"
 hex = "0.4"
 
+[features]
+packaging = []
+
 [target.'cfg(windows)'.dependencies]
 log = "0.4"
 # Existing workspace dependency; all privileged IO stays in one native module.
@@ -27,6 +30,11 @@ windows-sys = { version = "0.61", features = [
 [[bin]]
 name = "polaris-helper-setup"
 path = "src/main.rs"
+
+[[bin]]
+name = "polaris-package-custody"
+path = "src/package_main.rs"
+required-features = ["packaging"]
 
 [dev-dependencies]
 polaris-source-probe = { path = "../source-probe" }

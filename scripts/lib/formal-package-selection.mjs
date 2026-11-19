@@ -1,9 +1,9 @@
 // Prove App and Helper identities from actual carrier members without executing them.
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  closeSync, constants, existsSync, fstatSync, lstatSync, mkdtempSync, openSync,
-  readFileSync, readSync, rmSync, writeSync,
+  closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync,
+  readFileSync, readSync, readdirSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,7 @@ import { LOCAL_MARKER } from '../desktop-core/local-development.mjs';
 import { requireGraph as demand } from '../desktop-core/source-graph.mjs';
 import { appImageFilesystems } from '../postprocess-appimage.mjs';
 import { readZipEntries } from './zip-archive.mjs';
+import { now, streamChild, withHolds } from './windows-package-custody.mjs';
 
 const require = createRequire(new URL('../../ui/package.json', import.meta.url));
 const MAX_FILE = 512 * 1024 ** 2;
@@ -128,51 +129,13 @@ function snapshot(read, path, size, remaining) {
 
 // Each read uses literal argv, bounded concurrent pipes and one shared
 // absolute deadline. Resolve only when the owned primary child has closed.
-function readChild(tool, args, limit, remaining, consume) {
-  const time = remaining();
-  return new Promise((complete, fail) => {
-    const child = spawn(tool, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    let error, bytes = 0, stderrBytes = 0;
-    const stderr = [];
-    function stop(cause) {
-      if (error) return;
-      error = cause;
-      try { child.kill('SIGKILL'); }
-      finally { child.stdout.destroy(); child.stderr.destroy(); }
-    }
-    const timeout = setTimeout(() => stop(new Error('formal archive child deadline exceeded')), time);
-    const interrupted = () => stop(new DOMException('formal archive reader interrupted', 'AbortError'));
-    process.once('SIGINT', interrupted);
-    process.once('SIGTERM', interrupted);
-    child.once('error', (cause) => { error ??= cause; });
-    child.stdout.once('error', stop);
-    child.stderr.once('error', stop);
-    child.stdout.on('data', (block) => {
-      if (error) return;
-      try {
-        remaining();
-        bytes += block.length;
-        demand(bytes <= limit, 'formal archive child output budget exceeded');
-        consume(block);
-      } catch (cause) { stop(cause); }
-    });
-    child.stderr.on('data', (block) => {
-      if (error) return;
-      stderrBytes += block.length;
-      if (stderrBytes > MAX_STDERR) stop(new Error('formal archive child stderr budget exceeded'));
-      else stderr.push(block);
-    });
-    child.once('close', (status) => {
-      clearTimeout(timeout);
-      process.removeListener('SIGINT', interrupted);
-      process.removeListener('SIGTERM', interrupted);
-      if (!error && status !== 0) error = new Error(`formal archive reader ${tool} exited ${status}: ${Buffer.concat(stderr).toString('utf8').trim()}`);
-      if (error) fail(error);
-      else {
-        try { remaining(); complete(bytes); } catch (cause) { fail(cause); }
-      }
-    });
-  });
+async function readChild(tool, args, limit, remaining, consume) {
+  const { stdoutBytes } = await streamChild([tool, ...args], block => {
+    remaining();
+    consume(block);
+  }, limit, { deadline: now() + remaining(), diagnostics: false });
+  remaining();
+  return stdoutBytes;
 }
 
 async function textChild(tool, args, limit, remaining) {
@@ -196,7 +159,7 @@ function caseFold(name) {
   }).join('');
 }
 
-function memberKey(name, caseSensitive) {
+export function memberKey(name, caseSensitive = false) {
   demand(name && !/[\\:]/.test(name) && !name.startsWith('/'), 'unsafe ZIP member');
   const parts = name.split('/');
   demand(parts.every(part => part && part !== '.' && part !== '..'), 'non-canonical ZIP path');
@@ -532,6 +495,130 @@ function sevenZipBytes(size, optional, limit = MAX_TOTAL) {
   return Number(size);
 }
 
+export function nsisMembers(listing) {
+  const boundary = listing.indexOf('----------');
+  demand(boundary >= 0 && /^Type = Nsis\r?$/m.test(listing.slice(0, boundary)), 'actual artifact is not readable NSIS');
+  const newline = listing.slice(0, boundary).includes('\r\n') ? '\r\n' : '\n';
+  const records = new Map();
+  for (const row of sevenZipProperties(listing.slice(boundary + 10), newline, true)) {
+    const name = row.get('Path'), attributes = row.get('Attributes') ?? '';
+    demand(name && !row.has('Symbolic Link') && !row.has('Hard Link')
+      && (row.get('Folder') ?? '-') === '-' && !attributes.startsWith('D')
+      && !/\b[lrwx-]{10}\b/.test(attributes), 'invalid NSIS member record');
+    insertRecord(records, name.replaceAll('\\', '/'), { kind: 'file', bytes: sevenZipBytes(row.get('Size'), true, MAX_FILE) });
+  }
+  demand(records.size > 0, 'empty NSIS member listing');
+  validateRecords(records);
+  return records;
+}
+
+// The current Windows distribution has all payload/plugin bytes frozen. Only
+// the generated uninstaller needs its own literal extraction before the batch.
+export async function inspectBoundNsis(tool, archive, destination, allowed, expected, {
+  custody, budget, facts, tree, timeout = DEADLINE_MS,
+}) {
+  const deadline = now() + timeout;
+  const file = path => ({ path, kind: 'file' });
+  const directory = path => ({ path, kind: 'directory' });
+  return withHolds(custody, [file(archive)], async ([archiveFile]) => {
+    const original = await facts(archive);
+    const command = (args, consume, limit = MAX_LISTING, guard) =>
+      streamChild([tool, ...args], consume, limit, { deadline, guard });
+    const chunks = [];
+    await command(['l', '-slt', '-sccUTF-8', archive], block => chunks.push(block));
+    const listing = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)).replaceAll('\r\n', '\n');
+    const records = nsisMembers(listing);
+    let expanded = 0;
+    for (const [name, { bytes }] of records) {
+      demand(Object.hasOwn(allowed, name), 'unregistered NSIS listed member');
+      const limit = allowed[name], row = expected[name];
+      demand(Number.isSafeInteger(limit) && limit >= 0 && limit <= MAX_FILE
+        && (bytes === null || bytes <= limit), 'NSIS member exceeds registered size');
+      demand(!row || Number.isSafeInteger(row.bytes) && row.bytes >= 0 && row.bytes <= limit
+        && /^[a-f0-9]{64}$/.test(row.sha256) && Object.keys(row).length === 2
+        && (bytes === null || bytes === row.bytes), 'listed NSIS size differs from bound member');
+      expanded += bytes ?? limit;
+    }
+    demand(expanded <= MAX_TOTAL, 'NSIS expanded budget exceeded');
+    mkdirSync(toNamespacedPath(destination));
+    const exact = { ...expected }, captured = new Set();
+    for (const [name, { bytes }] of records) {
+      if (Object.hasOwn(expected, name)) continue;
+      const limit = Math.min(allowed[name], MAX_TOTAL - budget.bytes);
+      demand(limit >= 0, 'NSIS aggregate byte limit exceeded');
+      const path = join(destination, name);
+      mkdirSync(toNamespacedPath(dirname(path)), { recursive: true });
+      const output = observer(name, null, count => { budget.bytes += count; });
+      await putFile(toNamespacedPath(path), write => command(['x', '-so', '-bd', '-y', '-spd', '--', archive, name], block => {
+        output.consume(block);
+        write(block);
+      }, limit));
+      exact[name] = output.finish();
+      demand(bytes === null || bytes === exact[name].bytes, 'extracted NSIS size differs');
+      captured.add(name);
+    }
+    const selected = [...records.keys()].filter(name => !captured.has(name));
+    demand(selected.reduce((sum, name) => sum + exact[name].bytes, 0) <= MAX_TOTAL - budget.bytes,
+      'NSIS aggregate byte limit exceeded');
+    const directories = new Set();
+    for (const name of records.keys()) {
+      for (let parent = posix.dirname(name); parent !== '.'; parent = posix.dirname(parent)) directories.add(parent);
+    }
+    demand(records.size + directories.size <= MAX_MEMBERS, 'NSIS extracted entry limit exceeded');
+    if (selected.length) {
+      const scratch = mkdtempSync(toNamespacedPath(join(dirname(destination), 'nsis-list-')));
+      const selector = join(scratch, 'members.txt');
+      const maxima = new Map();
+      let charged = 0;
+      const guard = async signal => {
+        const pending = [destination], observed = [];
+        while (pending.length) {
+          const parent = pending.pop();
+          for (const entry of readdirSync(toNamespacedPath(parent), { withFileTypes: true })) {
+            const path = join(parent, entry.name);
+            const name = path.slice(destination.length + 1).replaceAll('\\', '/');
+            const stat = lstatSync(toNamespacedPath(path));
+            demand(!stat.isSymbolicLink(), 'NSIS extracted reparse or link');
+            if (stat.isDirectory()) {
+              demand(directories.has(name), 'unregistered NSIS extracted directory');
+              pending.push(path); observed.push(directory(path));
+            } else {
+              demand(stat.isFile() && records.has(name) && stat.size <= exact[name].bytes,
+                'unregistered or oversized NSIS extracted member');
+              if (!captured.has(name)) maxima.set(name, Math.max(maxima.get(name) ?? 0, stat.size));
+              observed.push(file(path));
+            }
+            demand(observed.length <= MAX_MEMBERS, 'NSIS extracted entry limit exceeded');
+          }
+        }
+        await custody.inspect(observed);
+        signal.throwIfAborted();
+        const bytes = [...maxima.values()].reduce((sum, size) => sum + size, 0);
+        demand(bytes - charged <= MAX_TOTAL - budget.bytes, 'NSIS aggregate byte limit exceeded');
+        budget.bytes += bytes - charged; charged = bytes;
+      };
+      try {
+        writeFileSync(selector, selected.join('\n') + '\n', { flag: 'wx', flush: true });
+        await withHolds(custody, [file(selector), directory(destination), ...[...captured].map(name => file(join(destination, name)))],
+          () => command(['x', '-bd', '-y', '-spd', '-scsUTF-8', '-o' + toNamespacedPath(destination),
+            '-i@' + selector, '--', archive], () => {}, MAX_LISTING, guard));
+      } finally { rmSync(scratch, { recursive: true }); }
+    }
+    const members = await withHolds(custody, [...records.keys()].map(name => file(join(destination, name))), () => tree(destination));
+    demand(Object.keys(members).length === records.size, 'final NSIS member set differs');
+    for (const name of records.keys()) {
+      demand(members[name]?.bytes === exact[name].bytes && members[name]?.sha256 === exact[name].sha256,
+        'final member SHA/size differs: ' + name);
+    }
+    const [identity] = await custody.inspect([file(archive)]);
+    const final = await facts(archive);
+    demand(identity.every((value, index) => value === archiveFile.identity[index])
+      && final.bytes === original.bytes && final.sha256 === original.sha256, 'held NSIS archive changed');
+    demand(now() < deadline, 'NSIS shared extraction deadline exceeded');
+    return { members, listing };
+  });
+}
+
 async function scanSevenZip(tool, retained, temporary, remaining, suffix, charge, depth = 0) {
   const listing = await textChild(tool, ['l', '-slt', '-sccUTF-8', '--', retained], MAX_LISTING, remaining);
   const boundary = listing.indexOf('----------');
@@ -539,8 +626,8 @@ async function scanSevenZip(tool, retained, temporary, remaining, suffix, charge
   const header = listing.slice(0, boundary), nsis = /^Type = Nsis\r?$/m.test(header);
   demand(nsis || /^Type = (Dmg|HFS|APFS)\r?$/m.test(header), 'formal archive type is not supported');
   const newline = header.includes('\r\n') ? '\r\n' : '\n';
-  const list = sevenZipProperties(listing.slice(boundary + 10), newline, nsis);
-  const records = new Map();
+  const list = nsis ? [] : sevenZipProperties(listing.slice(boundary + 10), newline, false);
+  const records = nsis ? nsisMembers(listing) : new Map();
   // HFS/APFS -so otherwise appends extended attribute streams to the data fork.
   const args = ['x', '-so', '-spd', ...(nsis ? [] : ['-sns-']), '--', retained];
   for (const row of list) {
@@ -549,13 +636,6 @@ async function scanSevenZip(tool, retained, temporary, remaining, suffix, charge
     const mode = row.get('Mode') ?? '', folder = row.get('Folder'), attributes = row.get('Attributes') ?? '';
     const hasLink = row.has('Symbolic Link') || row.has('Hard Link');
     const size = row.get('Size');
-    if (nsis) {
-      demand(!hasLink && (folder ?? '-') === '-' && !attributes.startsWith('D')
-        && !/\b[lrwx-]{10}\b/.test(attributes), 'invalid NSIS member record');
-      name = name.replaceAll('\\', '/');
-      insertRecord(records, name, { kind: 'file', bytes: sevenZipBytes(size, true, MAX_FILE) });
-      continue;
-    }
     const directory = folder === '+' || mode.startsWith('d') || attributes.startsWith('D');
     let target = row.get('Symbolic Link') || row.get('Hard Link') || '';
     const linked = Boolean(target) || mode.startsWith('l');
@@ -580,7 +660,6 @@ async function scanSevenZip(tool, retained, temporary, remaining, suffix, charge
     demand(!records.has(name), 'formal archive duplicate member');
     insertRecord(records, name, { kind, bytes: bytes ?? 0, target });
   }
-  demand(!nsis || records.size > 0, 'empty NSIS member listing');
   const selected = selectedMembers(records, suffix);
   if (selected.length === 0) {
     const volumes = [...records].filter(([, row]) => row.kind === 'file');

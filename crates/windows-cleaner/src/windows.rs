@@ -34,6 +34,8 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 pub(crate) mod install;
+#[cfg(feature = "packaging")]
+pub mod package_custody;
 mod sweep;
 pub use install::{launch_install, run_install_worker};
 pub use sweep::sweep_installed_cores;
@@ -198,12 +200,16 @@ struct Identity {
     high: u32,
     low: u32,
 }
-fn info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+fn file_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info = unsafe { zeroed() };
     bool_ok(unsafe { GetFileInformationByHandle(handle(file), &mut info) })?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(error("reparse point"));
     }
+    Ok(info)
+}
+fn info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    let info = file_info(file)?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 && info.nNumberOfLinks != 1 {
         return Err(error("hard-linked file"));
     }

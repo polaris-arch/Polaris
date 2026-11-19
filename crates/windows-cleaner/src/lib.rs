@@ -164,6 +164,8 @@ pub fn trusted_security(
 mod service;
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, feature = "packaging"))]
+pub use windows::package_custody;
 #[cfg(windows)]
 pub use windows::{launch_bundle, launch_current, run_worker};
 #[cfg(windows)]
