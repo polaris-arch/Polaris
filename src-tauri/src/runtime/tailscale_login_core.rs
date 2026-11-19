@@ -4916,8 +4916,9 @@ impl LoginCoreRegistry {
             #[cfg(any(target_os = "android", test))]
             if let Some(start) = &android_start {
                 start.0.send_replace(true);
-                // Before dispatch, Cancel either sees this handoff or we see its cancellation.
-                if attempt.cancelled() {
+                // The producer guard already holds the cancellation lock. For a start
+                // without that guard, check cancellation after publishing the handoff.
+                if producer_origin.is_none() && attempt.cancelled() {
                     return false;
                 }
             }

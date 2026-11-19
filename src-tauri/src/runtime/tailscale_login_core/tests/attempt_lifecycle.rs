@@ -2928,6 +2928,10 @@ struct PendingCredentialSpawner {
 #[async_trait]
 #[cfg(not(target_os = "ios"))]
 impl LoginCoreSpawner for PendingCredentialSpawner {
+    fn uses_android_start_bridge(&self) -> bool {
+        true
+    }
+
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
         let child = self.base.spawn(request).await?;
         self.entered.add_permits(1);
@@ -2961,6 +2965,10 @@ async fn stop_after_pending_birth_joins_exact_child_and_failed_close_retains_cus
         })
     };
     acquire(&entered).await;
+    let attempt = fixture
+        .registry()
+        .prepared_attempt_for_test("ts1", "pending-generation");
+    assert!(*attempt.android_start_pending.borrow());
     let child = fixture.spawner.spawned.lock().unwrap()[0].clone();
     let close = Arc::new(tokio::sync::Notify::new());
     *child.close_gate.lock().unwrap() = Some(close.clone());
@@ -2978,6 +2986,7 @@ async fn stop_after_pending_birth_joins_exact_child_and_failed_close_retains_cus
     assert!(!child.terminated.load(Ordering::SeqCst));
     release.add_permits(1);
     wait_until(|| child.close_started.load(Ordering::SeqCst) > 0).await;
+    assert!(!*attempt.android_start_pending.borrow());
     assert!(fixture.registry().shared.contains("ts1"));
     assert_eq!(fixture.spawner.count.load(Ordering::SeqCst), 1);
     assert!(
