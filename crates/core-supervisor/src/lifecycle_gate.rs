@@ -132,6 +132,11 @@ impl LifecycleGate {
             .expect("lifecycle publication lock poisoned")
     }
 
+    /// A saved writer must not wait for publication while it owns the config mutex.
+    pub fn try_lock_generation_publication(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.publication.try_lock().ok()
+    }
+
     /// Recheck a generation and execute one synchronous commit under the same
     /// lock as Stop/Start claims. The closure may take the config write lock
     /// and durably rename its document, but must not await or reenter this gate.
@@ -272,6 +277,14 @@ impl LifecycleGate {
     /// Contention or poison is unknown and must not authorize a stale mutation.
     pub fn try_generation(&self) -> Option<u64> {
         self.inner.try_lock().ok().map(|inner| inner.generation)
+    }
+
+    /// Observe a stable idle generation without waiting under a saved writer.
+    pub fn try_idle_generation(&self) -> Option<u64> {
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|inner| (inner.depth == 0).then_some(inner.generation))
     }
 
     /// 世代与最后认领者须同锁读取，供异步选择回执判断是否被主动停止接管。

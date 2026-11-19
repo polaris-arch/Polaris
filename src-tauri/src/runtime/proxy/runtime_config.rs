@@ -1671,6 +1671,12 @@ impl ProxyRuntime {
         if !idle() || !self.saved_revision_matches(Some(edit.revision)) {
             return Ok(not_committed(HotConfigEditOutcome::Retryable));
         }
+        // A credential writer can hold the lifecycle mutex while waiting
+        // for ConfigManager. Under the saved writer, observe it without waiting.
+        let same_idle_owner = || {
+            self.gate.try_idle_generation() == Some(owner.generation)
+                && self.selector_intent_is_current(owner.intent)
+        };
         // Android's transport may be temporarily unavailable while an owned
         // Core is still running. Only an already stopped lifecycle is offline.
         let stopped = || self.status.read().is_ok_and(|status| !status.running);
@@ -1678,7 +1684,10 @@ impl ProxyRuntime {
             let unchanged = edit.previous == edit.candidate;
             let committed = self.config.commit_prepared_config_edit(
                 edit,
-                || idle() && (unchanged || stopped()),
+                || {
+                    same_idle_owner()
+                        && (unchanged || self.status.try_read().is_ok_and(|status| !status.running))
+                },
                 |_| {},
             )?;
             return Ok(match committed {
@@ -1721,27 +1730,28 @@ impl ProxyRuntime {
             return Ok(not_committed(HotConfigEditOutcome::Retryable));
         }
 
+        // Recheck the full runtime admission outside the disk writer. The
+        // writer itself fences the exact D revision and only reads live facts
+        // without waiting for lifecycle, selector, or publication locks.
+        if let Some(blocker) = self.hot_config_edit_blocker(&edit.previous, owner) {
+            return Ok(not_committed(blocker));
+        }
         let mut publication = AutomaticConfigEdit {
             runtime: self,
             owner: None,
         };
-        let mut commit_blocker = HotConfigEditOutcome::Retryable;
         let Some(revision) = self.config.commit_prepared_config_edit(
             edit,
             || {
-                if !idle() || !self.core_running() {
-                    return false;
-                }
-                if let Some(blocker) = self.hot_config_edit_blocker(&edit.previous, owner) {
-                    commit_blocker = blocker;
-                    return false;
-                }
-                runtime_plan_ticket_is_live(pending.plan.expires_at_unix_milli)
+                same_idle_owner()
+                    && self.status.try_read().is_ok_and(|status| status.running)
+                    && !self.selector_reconcile.is_required()
+                    && runtime_plan_ticket_is_live(pending.plan.expires_at_unix_milli)
             },
             |revision| publication.publish(StagedSaveOwner { revision, ..owner }),
         )?
         else {
-            return Ok(not_committed(commit_blocker));
+            return Ok(not_committed(HotConfigEditOutcome::Retryable));
         };
 
         pending.desired = edit.candidate.clone();
@@ -1824,13 +1834,17 @@ impl ProxyRuntime {
         &self,
         published_revision: Option<u64>,
     ) -> (bool, bool) {
+        let generation = self.gate.generation();
+        let intent = self.selector_reconcile.intent_generation();
+        let running_idle = self.core_running() && !self.gate.is_busy();
         self.runtime_config_apply
             .lock()
             .map_or((false, true), |state| {
                 let executing = state.automatic_edit.filter(|owner| {
                     Some(owner.revision) == published_revision
-                        && self.selector_operation_is_current(owner.generation, owner.intent)
-                        && !self.gate.is_busy()
+                        && owner.generation == generation
+                        && owner.intent == intent
+                        && running_idle
                 });
                 let recovery = state
                     .pending
@@ -2643,6 +2657,36 @@ impl ProxyRuntime {
         Ok((client, pending))
     }
 
+    /// Saved writer callbacks cannot wait for a lifecycle or selector owner:
+    /// other native controllers can hold those owners while claiming saved D.
+    fn with_runtime_candidate_claim<T>(
+        &self,
+        saved_fenced: bool,
+        generation: u64,
+        intent: u64,
+        claim: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let claim_intent = |current_intent| {
+            if current_intent != intent {
+                return None;
+            }
+            if saved_fenced {
+                let _publication = self.gate.try_lock_generation_publication()?;
+                (self.gate.try_idle_generation() == Some(generation)).then(claim)
+            } else {
+                let _publication = self.gate.lock_generation_publication();
+                (self.gate.generation() == generation && !self.gate.is_busy()).then(claim)
+            }
+        };
+        if saved_fenced {
+            self.selector_reconcile
+                .try_with_intent_claim(claim_intent)
+                .flatten()
+        } else {
+            self.selector_reconcile.with_intent_claim(claim_intent)
+        }
+    }
+
     fn automatic_edit_owner(&self, pending: &PendingOperation) -> Option<StagedSaveOwner> {
         let owner = pending.staged_save_owner()?;
         self.runtime_config_apply
@@ -2749,12 +2793,8 @@ impl ProxyRuntime {
             if desired != &pending.desired || !self.saved_revision_matches(saved_revision) {
                 return false;
             }
-            self.selector_reconcile.with_intent_claim(|current_intent| {
-                let _publication = self.gate.lock_generation_publication();
-                if current_intent != intent
-                    || self.gate.generation() != generation
-                    || self.gate.is_busy()
-                    || (automatic.is_some() && !runtime_plan_ticket_is_live(plan_expiry))
+            self.with_runtime_candidate_claim(saved_revision.is_some(), generation, intent, || {
+                if (automatic.is_some() && !runtime_plan_ticket_is_live(plan_expiry))
                     || !self.protected_runtime_publication_current(&pending)
                     || expected_confirmation.as_ref().is_some_and(|(running, _)| {
                         self.current_config_snapshot().as_ref() != Some(running)
@@ -2794,6 +2834,7 @@ impl ProxyRuntime {
                 state.impact = None;
                 true
             })
+            .unwrap_or(false)
         };
         let admitted = if saved_revision.is_some() {
             self.try_runtime_saved_commit(automatic, plan_expiry, admit)
@@ -3039,13 +3080,8 @@ impl ProxyRuntime {
         let mut committed_tailnet_token = None;
         let mut tailnet_context_changed = false;
         let mut host_execution = None;
-        let published = self.selector_reconcile.with_intent_claim(|intent| {
-            let _publication = self.gate.lock_generation_publication();
-            if intent != pending.intent
-                || self.gate.generation() != pending.generation
-                || self.gate.is_busy()
-                || !self.protected_runtime_publication_current(pending)
-            {
+        let publish = || {
+            if !self.protected_runtime_publication_current(pending) {
                 return false;
             }
             let Ok(mut current) = self.current_config.write() else {
@@ -3181,7 +3217,15 @@ impl ProxyRuntime {
                 self.activate_tailnet_context(pending.generation, pending.tailnet_bindings.clone());
             committed_tailnet_token = self.tailnet_context().map(|context| context.token);
             true
-        });
+        };
+        let published = self
+            .with_runtime_candidate_claim(
+                pending.saved_revision.is_some() || confirmation.is_some(),
+                pending.generation,
+                pending.intent,
+                publish,
+            )
+            .unwrap_or(false);
         if !published {
             return None;
         }

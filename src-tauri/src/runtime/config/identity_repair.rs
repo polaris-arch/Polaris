@@ -252,9 +252,7 @@ impl ConfigManager {
                 // Readers see the usual normalized view, while the repair preserves
                 // the disk's unrelated legacy fields byte-for-value. The next ordinary
                 // config transaction retains its existing migration semantics.
-                if let Ok(mut cache) = self.cache.write() {
-                    *cache = Some(canonical);
-                }
+                self.publish_config_cache(Some(canonical));
                 Ok(incoming)
             }
             Err(error @ StoreError::CommitUncertain(_)) => {

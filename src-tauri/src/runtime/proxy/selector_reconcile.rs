@@ -66,6 +66,11 @@ impl SelectorReconcileOwner {
         claim(self.intent_generation())
     }
 
+    pub(super) fn try_with_intent_claim<T>(&self, claim: impl FnOnce(u64) -> T) -> Option<T> {
+        let _guard = self.intent_claim.try_lock().ok()?;
+        Some(claim(self.intent_generation()))
+    }
+
     pub(super) fn intent_generation(&self) -> u64 {
         self.intent_generation.load(Ordering::SeqCst)
     }

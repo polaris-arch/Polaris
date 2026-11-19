@@ -234,7 +234,7 @@ fn malformed_typed_fields_in_either_repaired_record_never_write() {
             )
             .unwrap();
             let before = std::fs::read(directory.join("config.json")).unwrap();
-            let cached_before = manager.cache.read().unwrap().clone();
+            let cached_before = manager.published_config();
             let error = manager
                 .repair_server_identities(&request(&manager, 0), || "new".into())
                 .unwrap_err();
@@ -245,7 +245,7 @@ fn malformed_typed_fields_in_either_repaired_record_never_write() {
                 std::fs::read(directory.join("config.json")).unwrap(),
                 before
             );
-            assert_eq!(*manager.cache.read().unwrap(), cached_before);
+            assert_eq!(manager.published_config(), cached_before);
         }
     }
 }
