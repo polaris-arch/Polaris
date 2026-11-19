@@ -248,7 +248,7 @@ test('native BuildInfo keeps ordinary and remote replacement identity and exact 
     const wrongCore = input();
     wrongCore.facts.modules[wrongCore.source.goModule].replacement += '/elsewhere';
     assert.throws(() => verifyMobileBuildFixture(wrongCore), /exact verified source module/);
-    const replacement = input();
+    const replacement = input('ios');
     replacement.graph[0].Replace = { Path: 'example.org/replaced', Version: 'v1.4.5', Sum: 'h1:replaced' };
     const original = { replacement: 'example.org/replaced', replacementVersion: 'v1.4.5', replacementSum: 'h1:replaced' };
     Object.assign(replacement.facts.modules[name], original);
@@ -259,6 +259,9 @@ test('native BuildInfo keeps ordinary and remote replacement identity and exact 
       changed.facts.modules[name][field] = value;
       assert.throws(() => verifyMobileBuildFixture(changed));
     }
+    delete replacement.graph[0].Replace.Path;
+    delete replacement.facts.modules[name].replacement;
+    assert.throws(() => verifyMobileBuildFixture(replacement), /native replacement differs/);
   } finally {
     rmSync(folder, { recursive: true, force: true });
   }

@@ -475,7 +475,8 @@ export function checkMobileBuildInfo({ source: declaration, graph, target, expec
       const diagnostic = 'native replacement differs: ' + name + '; observed=' + JSON.stringify(linked)
         + '; declaredPath=' + JSON.stringify(replacement.Path) + '; declaredDir=' + JSON.stringify(replacement.Dir);
       const versioned = present(replacement.Version);
-      demand(linked.replacement === replacement.Path || (!versioned && linked.replacement === replacement.Dir), diagnostic);
+      demand(typeof replacement.Path === 'string' && (linked.replacement === replacement.Path
+        || (!versioned && linked.replacement === replacement.Dir)), diagnostic);
       // Go can emit (devel) for a versionless replacement in a linked binary.
       demand((versioned ? [replacement.Version] : ['', '(devel)']).includes(field(linked, 'replacementVersion')),
         'replacement version differs; ' + diagnostic);
