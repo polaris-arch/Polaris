@@ -1065,17 +1065,18 @@ export function LogsScreen() {
       </div>
 
       <div className="log-foot">
-        {/* 底栏只承载“流状态”：直播状态、当前行数与暂停后的恢复入口作为一个左侧簇，
-            避开应用统一占用的右下 toast 区域。 */}
+        {/* 多页时由分页器统一显示当前范围和总数，单页时行数就是滚动框中的记录数。 */}
         <span className="log-stream-state">
           {logStreamReady && <span className="log-live">
             <span className="log-live-dot" />
             <span>{t('logs.liveStream')}</span>
           </span>}
-          <span className="log-count">
-            <b id="log-count">{visible.length}</b>{' '}
-            <span>{t('logs.linesUnit')}</span>
-          </span>
+          {logPagination.pageCount === 1 && (
+            <span className="log-count">
+              <b id="log-count">{visible.length}</b>{' '}
+              <span>{t('logs.linesUnit')}</span>
+            </span>
+          )}
           {/* 回到底部：follow 暂停时才出现（手动按暂停 或 上滚脱离底部）。点它＝回填 pending + 吸回底部
               + 恢复跟随，是「恢复直播」的唯一显式入口。 */}
           {!follow && (

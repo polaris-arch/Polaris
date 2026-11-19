@@ -934,9 +934,11 @@ export function ConnectionsView(props: ConnectionsViewProps): ReactElement {
               <span className={`mc-live-dot ${props.follow ? 'on' : 'off'}`} />
               <span>{t('logs.liveStream')}</span>
             </span>}
-            <span className="mc-log-count">
-              {t('mobileConnections.logs.lines', { n: props.logTotal })}
-            </span>
+            {props.logWindow.pageCount === 1 && (
+              <span className="mc-log-count">
+                {t('mobileConnections.logs.lines', { n: props.logTotal })}
+              </span>
+            )}
           </div>
           <Pager t={t} window={props.logWindow} total={props.logTotal} onPage={props.onLogPage} />
         </div>

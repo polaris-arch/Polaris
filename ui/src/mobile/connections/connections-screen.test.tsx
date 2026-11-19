@@ -422,7 +422,7 @@ describe('① IA §2.3 内容序：四个分段，默认概览，每段的块按
     expect([...at].sort((x, y) => x - y)).toEqual(at);
   });
 
-  it('日志：搜索 → 日志视图 → 页脚（实时指示 + 结果计数 + 分页器）', () => {
+  it('日志：搜索 → 日志视图 → 页脚（实时指示与当前范围）', () => {
     const logRows = Array.from({ length: 20 }, (_, i) => ({
       key: `l${i}`,
       ts: '00:00:00',
@@ -436,7 +436,12 @@ describe('① IA §2.3 内容序：四个分段，默认概览，每段的块按
     expect(at.every((i) => i >= 0), `缺块：${at.join(',')}`).toBe(true);
     expect([...at].sort((x, y) => x - y)).toEqual(at);
     expect(html).toContain('logs.liveStream');
-    expect(html).toContain('mobileConnections.logs.lines(n=44)');
+    expect(html).toContain('common.pageStatus');
+    expect(html).not.toContain('mc-log-count');
+
+    const singlePage = render({ segment: 'logs', logRows, logTotal: 20, logWindow: win(20) });
+    expect(singlePage).toContain('mobileConnections.logs.lines(n=20)');
+    expect(singlePage).not.toContain('data-pager');
   });
 
   it('级别与来源筛选进 sheet，不在页面上占一行（IA §2.3「in a sheet」）', () => {
