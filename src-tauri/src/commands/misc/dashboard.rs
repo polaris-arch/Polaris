@@ -24,6 +24,7 @@ struct DashboardBinding {
     preload_digest: String,
     language: &'static str,
     close_revision: u64,
+    replacement_pending: bool,
 }
 
 impl DashboardBinding {
@@ -38,6 +39,7 @@ impl DashboardBinding {
             preload_digest: polaris_updater::sha256_hex(script.as_bytes()),
             language,
             close_revision,
+            replacement_pending: false,
         }
     }
 
@@ -45,8 +47,8 @@ impl DashboardBinding {
         Arc::ptr_eq(&self.epoch, &current.epoch) && self.preload_digest == current.preload_digest
     }
 
-    fn allows_refresh(&self, close_revision: u64) -> bool {
-        self.close_revision == close_revision
+    fn allows_refresh(&self, close_revision: u64, window_is_open: bool) -> bool {
+        self.close_revision == close_revision && (window_is_open || self.replacement_pending)
     }
 }
 
@@ -113,16 +115,15 @@ async fn reconcile_dashboard_window(
         return ApiResponse::ok(json!({ "ok": false }));
     };
     let opening = requested_language.is_some();
-    let mut replacing = false;
     let (parsed, api_url, script, binding) = loop {
         let window = app.get_webview_window(DASHBOARD_WINDOW_LABEL);
         let close_revision = DASHBOARD_CLOSE_REVISION.load(Ordering::Acquire);
         if !opening
-            && (!active
+            && !active
                 .as_ref()
-                .is_some_and(|b| b.allows_refresh(close_revision))
-                || (window.is_none() && !replacing))
+                .is_some_and(|b| b.allows_refresh(close_revision, window.is_some()))
         {
+            *active = None;
             return ApiResponse::ok(json!({ "ok": false }));
         }
         let Some((epoch, port, secret)) = app
@@ -152,7 +153,10 @@ async fn reconcile_dashboard_window(
         if let Err(e) = win.destroy() {
             return ApiResponse::err(format!("关闭旧面板窗失败：{e}"));
         }
-        replacing = true;
+        // Keep the user's open intent if a new Core transition delays the replacement.
+        if let Some(current) = active.as_mut() {
+            current.replacement_pending = true;
+        }
         // destroy queues the close. Wait until Tauri releases the label, then
         // recheck native CloseRequested and the current Core endpoint.
         if tokio::time::timeout(Duration::from_secs(2), async {
@@ -197,11 +201,14 @@ async fn reconcile_dashboard_window(
     if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
         builder = builder.additional_browser_args(args);
     }
-    if (!opening && !binding.allows_refresh(DASHBOARD_CLOSE_REVISION.load(Ordering::Acquire)))
-        || !app
-            .state::<AppRuntime>()
-            .proxy()
-            .dashboard_epoch_is_current(&binding.epoch)
+    if !opening && binding.close_revision != DASHBOARD_CLOSE_REVISION.load(Ordering::Acquire) {
+        *active = None;
+        return ApiResponse::ok(json!({ "ok": false }));
+    }
+    if !app
+        .state::<AppRuntime>()
+        .proxy()
+        .dashboard_epoch_is_current(&binding.epoch)
     {
         return ApiResponse::ok(json!({ "ok": false }));
     }

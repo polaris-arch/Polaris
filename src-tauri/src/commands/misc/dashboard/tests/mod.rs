@@ -76,9 +76,13 @@ fn dashboard_preload_script_injects_keys_and_escapes_secret() {
         "含引号/反斜杠的 secret 须原样无损（双重序列化防注入）"
     );
     let epoch = Arc::new(ApiRelayEpoch::default());
-    let current = DashboardBinding::new(epoch.clone(), &s, "zh-Hans", 1);
-    assert!(current.allows_refresh(1));
-    assert!(!current.allows_refresh(2));
+    let mut current = DashboardBinding::new(epoch.clone(), &s, "zh-Hans", 1);
+    assert!(current.allows_refresh(1, true));
+    assert!(!current.allows_refresh(1, false));
+    current.replacement_pending = true;
+    assert!(current.allows_refresh(1, false));
+    assert!(!current.allows_refresh(2, false));
+    assert!(!current.allows_refresh(2, true));
     assert!(current.matches_preload(&DashboardBinding::new(epoch.clone(), &s, "zh-Hans", 1)));
     assert!(!current.matches_preload(&DashboardBinding::new(Arc::default(), &s, "zh-Hans", 1)));
     for next in [
