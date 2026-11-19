@@ -1,19 +1,15 @@
 // Verify the original same-run Apple summaries without running build tools.
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import {
-  closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync,
-  readSync, realpathSync, renameSync, rmSync, writeSync,
-} from 'node:fs';
+import { closeSync, constants, fsyncSync, openSync, readdirSync, realpathSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { devNull } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { digest, requireGraph as demand } from '../desktop-core/source-graph.mjs';
-import { validateMobileSource } from './source-admission.mjs';
+import { requireGraph as demand } from '../desktop-core/source-graph.mjs';
+import { characters, decode, pinned, readMobileSource, ReceiptFloat, receiptPolicy as policy } from './source-admission.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
-const policy = JSON.parse(readFileSync(new URL('receipt-policy.json', import.meta.url)));
 const limits = policy.receipt;
 const readLimit = limits.appleComponentBytes;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
@@ -23,137 +19,12 @@ const targets = {
   'sim-arm64': { rust: 'aarch64-apple-ios-sim', carrier: 'ios-arm64-simulator' },
 };
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-const statOptions = { bigint: true };
-
-class ReceiptFloat {
-  constructor(value) {
-    demand(Number.isFinite(value), 'nonfinite receipt JSON');
-    this.value = value;
-  }
-}
 
 function receiptLimit(value) {
   demand(object(value) && !(value instanceof ReceiptFloat), 'receipt must be an object');
   if (value.schema === 'polaris-mobile-component-v1' && value.platform === 'apple') return limits.appleComponentBytes;
   if (value.schema === 'polaris-mobile-apple-link-input-v1') return limits.appleLinkBytes;
   return limits.controlBytes;
-}
-
-function lexicalBudget(raw) {
-  let quoted = false, escaped = false, depth = 0, tokens = 0, stringBytes = 0;
-  for (const byte of raw) {
-    if (quoted) {
-      demand(++stringBytes <= 6 * limits.stringChars + 2, 'receipt JSON encoded string budget');
-      if (escaped) escaped = false;
-      else if (byte === 92) escaped = true;
-      else if (byte === 34) quoted = false;
-    } else if (byte === 34) {
-      quoted = true;
-      stringBytes = 0;
-      tokens++;
-    } else if (byte === 123 || byte === 91) {
-      demand(++depth <= limits.depth, 'receipt JSON depth budget');
-      tokens++;
-    } else if (byte === 125 || byte === 93) depth--;
-    else if (byte === 44 || byte === 58) tokens++;
-    demand(tokens <= 3 * limits.nodes, 'receipt JSON lexical node budget');
-  }
-}
-
-function text(raw) {
-  // Python's byte decoder also admits UTF-16/32 receipts, with or without BOM.
-  const utf32be = raw[0] === 0 && raw[1] === 0 && (raw[2] === 0 || (raw[2] === 0xfe && raw[3] === 0xff));
-  const utf32le = raw[2] === 0 && raw[3] === 0 && (raw[1] === 0 || (raw[0] === 0xff && raw[1] === 0xfe));
-  if (utf32be || utf32le) {
-    demand(raw.length % 4 === 0, 'invalid UTF-32 receipt JSON');
-    const decode = utf32be ? raw.readUInt32BE.bind(raw) : raw.readUInt32LE.bind(raw);
-    const chunks = [];
-    for (let at = decode(0) === 0xfeff ? 4 : 0; at < raw.length;) {
-      const end = Math.min(at + 4096 * 4, raw.length), points = [];
-      for (; at < end; at += 4) points.push(decode(at));
-      chunks.push(String.fromCodePoint(...points));
-    }
-    return chunks.join('');
-  }
-  if ((raw[0] === 0xff && raw[1] === 0xfe) || (raw.length >= 2 && raw[0] !== 0 && raw[1] === 0)) {
-    return new TextDecoder('utf-16le', { fatal: true }).decode(raw);
-  }
-  if ((raw[0] === 0xfe && raw[1] === 0xff) || (raw.length >= 2 && raw[0] === 0 && raw[1] !== 0)) {
-    return new TextDecoder('utf-16be', { fatal: true }).decode(raw);
-  }
-  return utf8.decode(raw);
-}
-
-const characters = value => value.length === 0 ? 0 : value.length - (value.match(/[\ud800-\udbff][\udc00-\udfff]/g)?.length ?? 0);
-
-// State is local to the original receipt. Object keys are compared after
-// unescaping, and numeric types survive parsing for CPython fingerprint parity.
-function decode(raw, maximum, receipt = true) {
-  demand(raw.length <= maximum, 'original receipt exceeds its byte budget');
-  if (receipt) lexicalBudget(raw);
-  const source = text(raw), whitespace = /[ \t\r\n]*/y;
-  const scalar = /(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/y;
-  let at = 0, nodes = 0, stringChars = 0;
-  const skip = () => { whitespace.lastIndex = at; whitespace.exec(source); at = whitespace.lastIndex; };
-  const count = depth => demand(++nodes <= limits.nodes && depth <= limits.depth, 'receipt JSON node/depth budget');
-  const fails = () => { throw new Error('invalid receipt JSON'); };
-  function string(isKey = false) {
-    const start = at++;
-    for (; at < source.length; at++) {
-      if (source[at] === '\\') at++;
-      else if (source[at] === '"') {
-        const value = JSON.parse(source.slice(start, ++at));
-        const length = characters(value);
-        stringChars += length;
-        demand(length <= (isKey ? limits.keyChars : limits.stringChars) && stringChars <= maximum, 'receipt JSON string budget');
-        return value;
-      }
-    }
-    return fails();
-  }
-  function value(depth) {
-    skip();
-    count(depth);
-    if (source[at] === '"') return string();
-    if (source[at] === '{' || source[at] === '[') {
-      const isObject = source[at++] === '{', end = isObject ? '}' : ']';
-      const properties = isObject ? Object.create(null) : [];
-      skip();
-      if (source[at] === end) { at++; return properties; }
-      while (at < source.length) {
-        if (isObject) {
-          if (source[at] !== '"') return fails();
-          count(depth + 1);
-          const key = string(true);
-          demand(!Object.hasOwn(properties, key), 'duplicate mobile contract key');
-          skip();
-          if (source[at++] !== ':') return fails();
-          properties[key] = value(depth + 1);
-        } else properties.push(value(depth + 1));
-        skip();
-        if (source[at] === end) { at++; return properties; }
-        if (source[at++] !== ',') return fails();
-        skip();
-      }
-      return fails();
-    }
-    scalar.lastIndex = at;
-    const token = scalar.exec(source)?.[0];
-    if (!token) return fails();
-    at = scalar.lastIndex;
-    if (token === 'null' || token === 'true' || token === 'false') return JSON.parse(token);
-    if (/[.eE]/.test(token)) return new ReceiptFloat(Number(token));
-    demand(token.length <= Math.ceil(limits.integerBits * Math.log10(2)) + 1, 'receipt JSON integer budget');
-    const integer = BigInt(token);
-    demand((integer < 0 ? -integer : integer).toString(2).length <= limits.integerBits, 'receipt JSON integer budget');
-    const small = Number(integer);
-    return Number.isSafeInteger(small) ? small : integer;
-  }
-  const result = value(0);
-  skip();
-  if (at !== source.length) return fails();
-  if (receipt) demand(raw.length <= receiptLimit(result) && stringChars <= receiptLimit(result), 'original receipt exceeds its schema budget');
-  return result;
 }
 
 function floatText(n) {
@@ -254,33 +125,9 @@ function same(left, right) {
   return names.length === Object.keys(right).length && names.every(name => Object.hasOwn(right, name) && same(left[name], right[name]));
 }
 
-function pinned(path, maximum, observation = false) {
-  const before = lstatSync(path, { ...statOptions, throwIfNoEntry: false });
-  if (observation) console.error(JSON.stringify({
-    schema: 'polaris-receipt-size-observation-v1', phase: 'read', path,
-    bytes: Number(before?.size ?? 0n), symlink: before?.isSymbolicLink() ?? false, maximumReadBytes: maximum,
-    scope: 'actual lstat size; not receipt or carrier acceptance',
-  }));
-  demand(before?.isFile() && before.size > 0n && before.size <= BigInt(maximum), 'bounded regular original receipt or artifact required');
-  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-  try {
-    const identity = info => info.isFile() && ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every(key => info[key] === before[key]);
-    demand(identity(fstatSync(fd, statOptions)), 'original file changed before bounded read');
-    const bytes = Buffer.allocUnsafe(Number(before.size));
-    let at = 0;
-    while (at < bytes.length) {
-      const length = readSync(fd, bytes, at, bytes.length - at, at);
-      demand(length > 0, 'original file changed during bounded read');
-      at += length;
-    }
-    demand(identity(fstatSync(fd, statOptions)) && identity(lstatSync(path, statOptions)), 'original file changed during bounded read');
-    return { bytes, pin: { bytes: bytes.length, sha256: digest(bytes) } };
-  } finally { closeSync(fd); }
-}
-
 function readReceipt(path) {
   const { bytes, pin } = pinned(path, readLimit, true);
-  return { value: decode(bytes, readLimit), pin };
+  return { value: decode(bytes, readLimit, receiptLimit), pin };
 }
 
 function writeReceipt(path, facts) {
@@ -379,13 +226,6 @@ function cleanGit(args) {
   });
 }
 
-function sourceDeclaration(value, key) {
-  if (value instanceof ReceiptFloat) return ['sourceOverlay', 'replacementFileCount'].includes(key) ? undefined : value.value;
-  if (Array.isArray(value)) return value.map(item => sourceDeclaration(item));
-  if (object(value)) return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sourceDeclaration(item, name)]));
-  return value;
-}
-
 async function currentSource() {
   const actualRoot = utf8.decode(await cleanGit(['rev-parse', '--show-toplevel'])).trim();
   demand(realpathSync(actualRoot) === realpathSync(root), 'Git worktree differs from actual source root');
@@ -402,8 +242,7 @@ async function currentSource() {
     if (!pins.has(name)) pins.set(name, pinned(join(root, name), limits.artifactBytes).pin);
     return [name, pins.get(name)];
   }));
-  const source = decode(pinned(join(root, 'scripts/mobile-core/source-contract.json'), 65536).bytes, 65536, false);
-  validateMobileSource(sourceDeclaration(source));
+  const source = readMobileSource();
   return {
     context: { candidate, runId: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT, repository: env.GITHUB_REPOSITORY },
     producer: { candidate, files: roster('producer') },

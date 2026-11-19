@@ -51,19 +51,19 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
       - name: Select the validated mobile Go toolchain
         id: mobile-go
         run: |
           set -euo pipefail
-          version="$(python3 -B scripts/mobile-core/fork_input.py --go-version)"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          pins="$(node scripts/mobile-core/source-admission.mjs --versions)"
+          printf 'version=%s\n' "${pins%% *}" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ steps.mobile-go.outputs.version }}
           cache: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '26'
       - name: Install pinned Rust toolchain
         env:
           RUST_TARGETS: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}

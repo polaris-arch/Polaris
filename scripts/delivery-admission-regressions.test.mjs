@@ -126,7 +126,9 @@ test('D02 bounded attempts, retry window and child; caller cannot expand hard ti
 });
 
 test('formal mobile declaration admits the fixed source and rejects platform, policy and acceptance drift', () => {
-  const value = JSON.parse(readFileSync(new URL('./mobile-core/source-contract.json', import.meta.url)));
+  const module = new URL('./mobile-core/', import.meta.url);
+  const raw = readFileSync(new URL('source-contract.json', module), 'utf8');
+  const value = JSON.parse(raw);
   assert.equal(validateMobileSource(value), value);
   const meta = 'github.com/metacubex/utls';
   const mutations = [
@@ -146,6 +148,43 @@ test('formal mobile declaration admits the fixed source and rejects platform, po
     mutate(changed);
     assert.throws(() => validateMobileSource(changed), expected);
   }
+
+  const root = mkdtempSync(join(tmpdir(), 'polaris-mobile-source-'));
+  try {
+    const directory = join(root, 'mobile-core');
+    mkdirSync(directory);
+    mkdirSync(join(root, 'lib'));
+    for (const name of ['source-admission.mjs', 'receipt-policy.json']) {
+      copyFileSync(new URL(name, module), join(directory, name));
+    }
+    copyFileSync(new URL('./lib/polaris-version.json', import.meta.url), join(root, 'lib', 'polaris-version.json'));
+    const contract = join(directory, 'source-contract.json');
+    const versions = (contents) => {
+      writeFileSync(contract, contents);
+      return spawnSync(process.execPath, [join(directory, 'source-admission.mjs'), '--versions'], { cwd: root, encoding: 'utf8' });
+    };
+    const limit = raw + ' '.repeat(65536 - Buffer.byteLength(raw));
+    const valid = versions(limit);
+    assert.equal(valid.status, 0, valid.stderr);
+    assert.equal(valid.stdout, `${value.goVersion} ${value.version}\n`);
+    const invalid = [
+      [raw.replace('{', String.raw`{"\u0067oVersion":"overridden",`), /duplicate mobile contract key/],
+      [raw.replace('"sourcePolicy": {', '"sourcePolicy": {"goDirective":"overridden",'), /duplicate mobile contract key/],
+      [limit + ' ', /bounded regular original/],
+      [raw.replace('{', '{"extra":1e309,'), /nonfinite/],
+      [raw.replace('{', String.raw`{"extra":"\ud800",`), /invalid Unicode/],
+      [raw.replace('"sourceOverlay": 0', '"sourceOverlay": 0.0'), /zero-overlay/],
+      [raw.replace('"replacementFileCount": 355', '"replacementFileCount": 355.0'), /exact Meta source declaration/],
+      [raw.replace(`"goVersion": "${value.goVersion}"`, '"goVersion": "1.0.0"'), /formal generator/],
+      [raw.replace('"sourceTag": "v', '"sourceTag": "unmatched-v'), /source tag\/version differs/],
+    ];
+    for (const [contents, reason] of invalid) {
+      const result = versions(contents);
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, reason);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('Apple architecture admission rechecks the explicit extension and retains sanitized observations', () => {

@@ -198,11 +198,3 @@ def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None
         env.pop('PKG_CONFIG_PATH', None)
         env['DEVELOPER_DIR'] = str(developer)
     return env
-
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Select the validated formal mobile Go toolchain only.')
-    parser.add_argument('--go-version', action='store_true', required=True)
-    parser.parse_args()
-    print(load()['goVersion'])

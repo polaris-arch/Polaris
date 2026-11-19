@@ -324,9 +324,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; load()"
-          version="$(node -p 'require("./scripts/mobile-core/source-contract.json").goVersion')"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          pins="$(node scripts/mobile-core/source-admission.mjs --versions)"
+          read -r go_version core_version <<< "$pins"
+          echo "已验证移动 source-contract 选中版本：v$core_version"
+          printf 'version=%s\n' "$go_version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:
@@ -390,16 +391,6 @@ jobs:
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
 
           echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
-
-      - name: Resolve bundled core version
-        id: core
-        shell: bash
-        run: |
-          set -euo pipefail
-          v="$(python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; print(load()['version'])")"
-          [ -n "$v" ] || { echo "::error::verified mobile source-contract version missing"; exit 1; }
-          echo "已验证移动 source-contract 选中版本：v$v"
-          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
       #
@@ -812,9 +803,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; load()"
-          version="$(node -p 'require("./scripts/mobile-core/source-contract.json").goVersion')"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          pins="$(node scripts/mobile-core/source-admission.mjs --versions)"
+          read -r go_version core_version <<< "$pins"
+          echo "已验证移动 source-contract 选中版本：v$core_version"
+          printf 'version=%s\n' "$go_version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:
@@ -878,16 +870,6 @@ jobs:
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
 
           echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
-
-      - name: Resolve bundled core version
-        id: core
-        shell: bash
-        run: |
-          set -euo pipefail
-          v="$(python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; print(load()['version'])")"
-          [ -n "$v" ] || { echo "::error::verified mobile source-contract version missing"; exit 1; }
-          echo "已验证移动 source-contract 选中版本：v$v"
-          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       # ══ libbox.aar：117 MiB、gitignored，CI 上必须现来一份 ══
       #
