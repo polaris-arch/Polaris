@@ -813,7 +813,12 @@ impl ProxyRuntime {
             };
             owner.stop_target = target.map(|target| {
                 if let Some(token) = &owner.main_token {
+                    let initial_managed_scope = owner
+                        .ready
+                        .as_ref()
+                        .is_some_and(|ready| ready.matches_managed_cold_stop(&target));
                     if target.cleanup_proof_eligible()
+                        && !initial_managed_scope
                         && self
                             .mesh
                             .bind_tailscale_main_actual_scope(
@@ -910,12 +915,20 @@ impl ProxyRuntime {
                             {
                                 return Err("nativeRetirementUnknown".into());
                             }
-                            verify_writer_census(
-                                &native_writer_scopes(ready.original_instances()),
-                                &retired,
-                                &owner.config_digest,
-                                &expected,
-                            )?;
+                            if let Some(cold) = owner
+                                .ready
+                                .as_ref()
+                                .filter(|cold| cold.matches_managed_cold_stop(ready))
+                            {
+                                cold.verify_managed_cold_retirement(ready, receipt)?;
+                            } else {
+                                verify_writer_census(
+                                    &native_writer_scopes(ready.original_instances()),
+                                    &retired,
+                                    &owner.config_digest,
+                                    &expected,
+                                )?;
+                            }
                         } else {
                             verify_pre_ready_writer_census(
                                 &retired,

@@ -3446,9 +3446,6 @@ impl LoginCoreRegistry {
         runs: &[tauri_plugin_polaris_ios::TailscaleStoreRetirementInstance],
     ) -> Result<(), String> {
         use tauri_plugin_polaris_ios::TailscaleWriterState;
-        if !self.valid_main_gate(gate) || !Arc::ptr_eq(&token.registry, &self.identity) {
-            return Err("nativeRetirementUnknown".into());
-        }
         let active: Vec<_> = runs
             .iter()
             .filter(|run| {
@@ -3458,6 +3455,31 @@ impl LoginCoreRegistry {
         let [active] = active.as_slice() else {
             return Err("nativeRetirementUnknown".into());
         };
+        self.bind_main_actual_nodes(token, gate, root, &active.nodes)
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn bind_main_managed_cold_scope(
+        &self,
+        token: &MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        root: &Path,
+        scope: &tauri_plugin_polaris_ios::ManagedColdStoreScope,
+    ) -> Result<(), String> {
+        self.bind_main_actual_nodes(token, gate, root, scope.nodes())
+    }
+
+    #[cfg(target_os = "ios")]
+    fn bind_main_actual_nodes(
+        &self,
+        token: &MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        root: &Path,
+        nodes: &[tauri_plugin_polaris_ios::TailscaleStoreRetirementNode],
+    ) -> Result<(), String> {
+        if !self.valid_main_gate(gate) || !Arc::ptr_eq(&token.registry, &self.identity) {
+            return Err("nativeRetirementUnknown".into());
+        }
         let mut main = self
             .shared
             .main
@@ -3467,7 +3489,7 @@ impl LoginCoreRegistry {
             .as_mut()
             .filter(|claim| claim.token.same(token))
             .ok_or("nativeRetirementUnknown")?;
-        if active.nodes.len() != claim.directories.len() {
+        if nodes.len() != claim.directories.len() {
             return Err("nativeRetirementUnknown".into());
         }
         let mut actual = HashMap::new();
@@ -3478,8 +3500,8 @@ impl LoginCoreRegistry {
                 .and_then(|ep| ep.get("tag"))
                 .and_then(serde_json::Value::as_str)
                 .ok_or("nativeRetirementUnknown")?;
-            let nodes: Vec<_> = active.nodes.iter().filter(|node| node.tag == tag).collect();
-            let [node] = nodes.as_slice() else {
+            let matches: Vec<_> = nodes.iter().filter(|node| node.tag == tag).collect();
+            let [node] = matches.as_slice() else {
                 return Err("nativeRetirementUnknown".into());
             };
             let logical = canonical_tailscale_claim_directory(&root.join("tailscale").join(id))?;

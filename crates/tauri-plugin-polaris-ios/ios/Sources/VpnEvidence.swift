@@ -100,6 +100,9 @@ func vpnLiveEvidence(profileIdentity: [String: Any]?, expectedIdentity: [String:
     if let scope = vpnTailscaleStoreExport(report: report, configDigest: expectedIdentity["configDigest"] as? String, terminal: false) {
         result["tailscaleStoreScope"] = scope
     }
+    if let cohort = report["managedColdStoreCohort"] {
+        result["managedColdStoreCohort"] = cohort
+    }
     return result
 }
 

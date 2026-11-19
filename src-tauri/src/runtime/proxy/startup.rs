@@ -2110,12 +2110,7 @@ impl ProxyRuntime {
                         Ok(receipt) => {
                             if let Some(token) = &main_claim_token {
                                 self.mesh
-                                    .bind_tailscale_main_actual_scope(
-                                        token,
-                                        ts_gate,
-                                        receipt.config_digest(),
-                                        receipt.original_instances(),
-                                    )
+                                    .bind_tailscale_main_ready_scope(token, ts_gate, &receipt)
                                     .map_err(StartError::from)?;
                             }
                             self.gate.with_current_generation(my_gen, |_live| {

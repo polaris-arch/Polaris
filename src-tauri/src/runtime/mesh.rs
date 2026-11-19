@@ -1090,6 +1090,29 @@ impl MeshRuntime {
             .bind_main_actual_scope(token, gate, &self.config_dir, digest, runs)
     }
 
+    #[cfg(target_os = "ios")]
+    pub(crate) fn bind_tailscale_main_ready_scope(
+        &self,
+        token: &crate::runtime::tailscale_login_core::MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        ready: &tauri_plugin_polaris_ios::ReadySessionReceipt,
+    ) -> Result<(), String> {
+        if let Some(scope) = ready.managed_cold_store_scope() {
+            return self.login_registry.bind_main_managed_cold_scope(
+                token,
+                gate,
+                &self.config_dir,
+                scope,
+            );
+        }
+        self.bind_tailscale_main_actual_scope(
+            token,
+            gate,
+            ready.config_digest(),
+            ready.original_instances(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn poison_tailscale_main_claim_lock_for_test(&self) {
         self.login_registry.poison_main_claim_lock_for_test();

@@ -1090,10 +1090,9 @@ impl ProxyRuntime {
                 .as_ref()
                 .filter(|ready| ready.request_id() == ticket.core.ios_receipt.request_id())
                 .ok_or("nativeRetirementUnknown")?;
-            let receipt = owner
-                .stopped
-                .as_ref()
-                .and_then(|stopped| stopped.retirement())
+            let stopped = owner.stopped.as_ref().ok_or("nativeRetirementUnknown")?;
+            let receipt = stopped
+                .retirement()
                 .filter(|receipt| {
                     receipt.start_request_id() == ready.request_id()
                         && receipt.session_id() == ready.session_id()
@@ -1101,29 +1100,38 @@ impl ProxyRuntime {
                         && receipt.source_extension_generation() == ready.extension_generation()
                 })
                 .ok_or("nativeRetirementUnknown")?;
-            let original: Vec<_> = ready
-                .original_instances()
-                .iter()
-                .filter(|run| {
-                    run.config_digest == owner.config_digest
-                        && run.terminal == TailscaleWriterState::Unknown
-                        && run.nodes.iter().any(|node| node.tag == tag)
-                })
-                .collect();
-            let [original] = original.as_slice() else {
-                return Err("profileBindingUnknown".into());
-            };
-            let run = receipt
-                .instances()
-                .iter()
-                .find(|run| {
-                    run.run_nonce == original.run_nonce
-                        && run.config_digest == original.config_digest
-                })
-                .ok_or("nativeRetirementUnknown")?;
-            let nodes: Vec<_> = run.nodes.iter().filter(|node| node.tag == tag).collect();
-            let [node] = nodes.as_slice() else {
-                return Err("profileBindingUnknown".into());
+            let node = if let Some(node) = ticket
+                .core
+                .ios_receipt
+                .managed_cold_retired_node(ready, stopped, tag)?
+            {
+                node
+            } else {
+                let original: Vec<_> = ready
+                    .original_instances()
+                    .iter()
+                    .filter(|run| {
+                        run.config_digest == owner.config_digest
+                            && run.terminal == TailscaleWriterState::Unknown
+                            && run.nodes.iter().any(|node| node.tag == tag)
+                    })
+                    .collect();
+                let [original] = original.as_slice() else {
+                    return Err("profileBindingUnknown".into());
+                };
+                let run = receipt
+                    .instances()
+                    .iter()
+                    .find(|run| {
+                        run.run_nonce == original.run_nonce
+                            && run.config_digest == original.config_digest
+                    })
+                    .ok_or("nativeRetirementUnknown")?;
+                let nodes: Vec<_> = run.nodes.iter().filter(|node| node.tag == tag).collect();
+                let [node] = nodes.as_slice() else {
+                    return Err("profileBindingUnknown".into());
+                };
+                *node
             };
             if node.writer_state != TailscaleWriterState::SealedDrained
                 || node.state_file_state != TailscaleStateFileState::Regular

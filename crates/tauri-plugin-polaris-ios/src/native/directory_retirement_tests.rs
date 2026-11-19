@@ -151,6 +151,186 @@ fn live_auth(generation: u64, run_count: usize) -> Value {
         "tailscaleStoreScope":{"contractVersion":"polaris-ts-auth-writer-retirement-v1",
         "globalCleanupEvidence":"CleanupUnknown","instances":runs}})
 }
+
+fn managed_cold_auth() -> Value {
+    let mut live = live_auth(1, 3);
+    for (index, store) in live["tailscaleStoreScope"]["instances"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        if index == 0 {
+            store["nodes"] = json!([]);
+        } else {
+            let path = format!("/managed/ts-{index}");
+            store["configDigest"] = json!("c".repeat(64));
+            store["nodes"][0]["tag"] = json!(format!("ts-{index}"));
+            store["nodes"][0]["stateDirectory"] = json!(path);
+            store["nodes"][0]["stateFile"] = json!(format!("{path}/tailscaled.state"));
+        }
+    }
+    attach_startup_cohort(&mut live);
+    live
+}
+
+fn attach_startup_cohort(live: &mut Value) {
+    let runs = live["tailscaleStoreScope"]["instances"].as_array().unwrap();
+    let cohort = json!({"contractVersion":"polaris-ts-startup-cohort-v1", "censusComplete":true,
+        "parent":runs[0], "initialChildren":runs[1..]});
+    live["managedColdStoreCohort"] = json!(cohort.to_string());
+}
+
+#[test]
+fn managed_cold_ready_binds_empty_parent_and_exact_physical_births() {
+    let ready = |value| {
+        ReadySessionReceipt::from_start(&serde_json::from_value(value).unwrap(), 7, 9, "start-a")
+    };
+    let live = managed_cold_auth();
+    let original = ready(live.clone()).unwrap();
+    assert!(original.original_instances()[0].nodes.is_empty());
+    let nodes = original.managed_cold_store_scope().unwrap().nodes();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.tag.as_str())
+            .collect::<Vec<_>>(),
+        ["ts-1", "ts-2"]
+    );
+
+    for (path, replacement) in [
+        ("/contractVersion", json!("unknown")),
+        ("/censusComplete", json!(false)),
+        ("/parent/configDigest", json!("b".repeat(64))),
+        ("/initialChildren/0/runNonce", json!("f".repeat(64))),
+        ("/initialChildren/0/nodes", json!([])),
+        (
+            "/initialChildren/1/nodes/0/stateDirectory",
+            json!("/managed/unrelated"),
+        ),
+        ("/initialChildren/1/terminal", json!("SealedDrained")),
+    ] {
+        let mut mismatched = live.clone();
+        let mut cohort: Value =
+            serde_json::from_str(live["managedColdStoreCohort"].as_str().unwrap()).unwrap();
+        *cohort.pointer_mut(path).unwrap() = replacement;
+        mismatched["managedColdStoreCohort"] = json!(cohort.to_string());
+        assert!(ready(mismatched).is_err(), "accepted {path}");
+    }
+
+    let mut raced = live.clone();
+    let mut foreign = live["tailscaleStoreScope"]["instances"][2].clone();
+    foreign["runNonce"] = json!("f".repeat(64));
+    raced["tailscaleStoreScope"]["instances"]
+        .as_array_mut()
+        .unwrap()
+        .push(foreign);
+    assert!(ready(raced).is_err());
+
+    let mut unattested = live;
+    unattested
+        .as_object_mut()
+        .unwrap()
+        .remove("managedColdStoreCohort");
+    assert!(ready(unattested)
+        .unwrap()
+        .managed_cold_store_scope()
+        .is_none());
+
+    let mut legacy = live_auth(1, 1);
+    attach_startup_cohort(&mut legacy);
+    let ready = ready(legacy).unwrap();
+    assert!(ready.managed_cold_store_scope().is_none());
+    assert_eq!(ready.original_instances()[0].nodes[0].tag, "ts-a");
+}
+
+#[test]
+fn managed_cold_stop_requires_terminal_proof_for_every_original_birth() {
+    let live = managed_cold_auth();
+    let snapshot = serde_json::from_value(live.clone()).unwrap();
+    let ready = ReadySessionReceipt::from_start(&snapshot, 7, 9, "start-a").unwrap();
+    let target = StopSessionTarget {
+        host_generation: Arc::new(std::sync::atomic::AtomicU64::new(7)),
+        cleanup_proof_eligible: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        session_id: ready.session_id.clone(),
+        request_id: ready.request_id.clone(),
+        config_digest: ready.config_digest.clone(),
+        extension_generation: ready.extension_generation,
+        original_instances: ready.original_instances.clone(),
+    };
+    let mut export = live["tailscaleStoreScope"].clone();
+    for instance in export["instances"].as_array_mut().unwrap() {
+        let nodes = instance["nodes"].as_array_mut().unwrap();
+        let terminal = if nodes.is_empty() {
+            "NoStoreConstruction"
+        } else {
+            "SealedDrained"
+        };
+        for node in nodes {
+            node["writerState"] = json!("SealedDrained");
+        }
+        instance["terminal"] = json!(terminal);
+        instance["censusComplete"] = json!(true);
+    }
+    let mut stopped = stopped();
+    stopped["tailscaleStoreRetirement"] = json!({"contractVersion":"polaris-ios-ts-store-retirement-v1",
+        "sessionID":"session-a", "startRequestID":"start-a", "configDigest":ready.config_digest,
+        "sourceExtensionGeneration":1, "stopExtensionGeneration":2, "stopRequestID":"stop-a",
+        "observationNonce":"nonce-a", "globalCleanupEvidence":"CleanupUnknown", "storeRetirement":export});
+    assert!(ready
+        .verify_managed_cold_retirement(&target, receipt(stopped.clone()).retirement().unwrap())
+        .is_ok());
+    assert!(ready
+        .managed_cold_retired_node(&target, &receipt(stopped.clone()), "ts-2")
+        .is_err());
+
+    for (field, terminal) in [("originalScope", false), ("directoryRetirement", true)] {
+        let mut export = scope(terminal);
+        let template = export["instances"][0]["nodes"][0].clone();
+        let runs: Vec<_> = ready
+            .original_instances()
+            .iter()
+            .map(|run| {
+                let nodes: Vec<_> = run
+                    .nodes
+                    .iter()
+                    .map(|store| {
+                        let mut node = template.clone();
+                        node["tag"] = json!(store.tag);
+                        node["stateDirectory"] = json!(store.state_directory);
+                        node
+                    })
+                    .collect();
+                let state = if !terminal {
+                    "Unknown"
+                } else if nodes.is_empty() {
+                    "NoDirectoryConstruction"
+                } else {
+                    "SealedDrained"
+                };
+                json!({"runNonce": run.run_nonce, "configDigest": run.config_digest,
+                "terminal": state, "censusComplete": true, "nodes": nodes})
+            })
+            .collect();
+        export["instances"] = json!(runs);
+        stopped["tailscaleDirectoryRetirement"][field] = export;
+    }
+    let terminal = receipt(stopped.clone());
+    let node = ready
+        .managed_cold_retired_node(&target, &terminal, "ts-2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.state_directory, "/managed/ts-2");
+    assert!(ready
+        .managed_cold_retired_node(&target, &terminal, "other")
+        .is_err());
+
+    stopped["tailscaleStoreRetirement"]["storeRetirement"]["instances"][2]["runNonce"] =
+        json!("f".repeat(64));
+    assert!(ready
+        .verify_managed_cold_retirement(&target, receipt(stopped).retirement().unwrap())
+        .is_err());
+}
 #[test]
 fn original_start_reload_stop_keeps_owner_and_complete_auth_census() {
     let start: TunnelStatus = serde_json::from_value(live_auth(1, 1)).unwrap();

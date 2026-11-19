@@ -65,6 +65,7 @@ pub struct TunnelStatus {
     pub extension_generation: Option<u64>,
     pub uncertain_settings_generation: Option<u64>,
     pub tailscale_store_scope: Option<TailscaleStoreExport>,
+    managed_cold_store_cohort: Option<String>,
     tailscale_store_retirement: Option<NativeScopedRetirement>,
     tailscale_directory_retirement: Option<NativeDirectoryRetirement>,
 }
@@ -383,6 +384,87 @@ pub struct ReadySessionReceipt {
     config_digest: String,
     extension_generation: u64,
     original_instances: Vec<TailscaleStoreRetirementInstance>,
+    managed_cold_store_scope: Option<ManagedColdStoreScope>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeTailscaleStartupCohort {
+    contract_version: String,
+    census_complete: bool,
+    parent: TailscaleStoreRetirementInstance,
+    initial_children: Vec<TailscaleStoreRetirementInstance>,
+}
+
+/// Initial scopes attested by the original managed CommandServer's Start call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedColdStoreScope(Vec<TailscaleStoreRetirementNode>);
+
+impl ManagedColdStoreScope {
+    fn from_start(
+        raw_digest: &str,
+        stores: &TailscaleStoreExport,
+        document: &str,
+    ) -> Result<Option<Self>, String> {
+        let mismatch = || "ReadyUnknown: Managed cold Tailscale census differs".to_owned();
+        if document.len() > 256 * 1024 {
+            return Err(mismatch());
+        }
+        let cohort: NativeTailscaleStartupCohort =
+            serde_json::from_str(document).map_err(|_| mismatch())?;
+        let parent = &cohort.parent;
+        let children = &cohort.initial_children;
+        if cohort.contract_version != "polaris-ts-startup-cohort-v1"
+            || !cohort.census_complete
+            || parent.config_digest != raw_digest
+            || (!children.is_empty() && !parent.nodes.is_empty())
+            || stores.instances().len() != children.len() + 1
+        {
+            return Err(mismatch());
+        }
+        // The physical birth digest is computed from the constructed graph;
+        // it can differ from both the raw Start digest and the effective source.
+        let child_digest = children.first().map(|run| run.config_digest.as_str());
+        if children.iter().any(|child| {
+            Some(child.config_digest.as_str()) != child_digest || child.nodes.len() != 1
+        }) {
+            return Err(mismatch());
+        }
+        let mut observed: std::collections::BTreeMap<_, _> = stores
+            .instances()
+            .iter()
+            .map(|run| (run.run_nonce.as_str(), run))
+            .collect();
+        let mut tags = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
+        let mut nodes = Vec::with_capacity(parent.nodes.len() + children.len());
+        for member in std::iter::once(parent).chain(children) {
+            let store = observed
+                .remove(member.run_nonce.as_str())
+                .ok_or_else(mismatch)?;
+            if member.config_digest != store.config_digest
+                || member.terminal != TailscaleWriterState::Unknown
+                || member.terminal != store.terminal
+                || member.nodes != store.nodes
+            {
+                return Err(mismatch());
+            }
+            for node in &store.nodes {
+                if node.writer_state != TailscaleWriterState::Unknown
+                    || !tags.insert(&node.tag)
+                    || !paths.insert(&node.state_directory)
+                {
+                    return Err(mismatch());
+                }
+                nodes.push(node.clone());
+            }
+        }
+        Ok((!children.is_empty()).then_some(Self(nodes)))
+    }
+
+    pub fn nodes(&self) -> &[TailscaleStoreRetirementNode] {
+        &self.0
+    }
 }
 
 // Shared validation does not construct either kind of native custody.
@@ -475,7 +557,14 @@ impl ReadySessionReceipt {
             .tailscale_store_scope
             .as_ref()
             .ok_or("ReadyUnknown: Original Go instance scope is absent")?;
-        scope.validate_history(snapshot.config_digest.as_deref().unwrap_or(""), false)?;
+        let digest = snapshot.config_digest.as_deref().unwrap_or("");
+        scope.validate_history(digest, false)?;
+        let managed_cold_store_scope = snapshot
+            .managed_cold_store_cohort
+            .as_deref()
+            .map(|document| ManagedColdStoreScope::from_start(digest, scope, document))
+            .transpose()?
+            .flatten();
         Ok(Self {
             native_generation,
             shared_generation,
@@ -492,6 +581,7 @@ impl ReadySessionReceipt {
                 .extension_generation
                 .ok_or("ReadyUnknown: missing extension generation")?,
             original_instances: scope.instances().to_vec(),
+            managed_cold_store_scope,
         })
     }
 
@@ -505,6 +595,9 @@ impl ReadySessionReceipt {
             snapshot,
         )?;
         let mut updated = self.clone();
+        if generation != self.extension_generation {
+            updated.managed_cold_store_scope = None;
+        }
         updated.extension_generation = generation;
         updated.original_instances = instances;
         Ok(updated)
@@ -524,6 +617,100 @@ impl ReadySessionReceipt {
     }
     pub fn original_instances(&self) -> &[TailscaleStoreRetirementInstance] {
         &self.original_instances
+    }
+
+    pub fn managed_cold_store_scope(&self) -> Option<&ManagedColdStoreScope> {
+        self.managed_cold_store_scope.as_ref()
+    }
+
+    pub fn matches_managed_cold_stop(&self, target: &StopSessionTarget) -> bool {
+        self.managed_cold_store_scope.is_some()
+            && self.session_id == target.session_id
+            && self.request_id == target.request_id
+            && self.config_digest == target.config_digest
+            && self.extension_generation == target.extension_generation
+            && self.original_instances == target.original_instances
+    }
+
+    pub fn verify_managed_cold_retirement(
+        &self,
+        target: &StopSessionTarget,
+        retired: &TailscaleStoreRetirementReceipt,
+    ) -> Result<(), String> {
+        use polaris_mesh::tailscale_state::retirement::{
+            ObservedTailscaleStoreRun, ObservedTailscaleStoreScope,
+        };
+        if !self.matches_managed_cold_stop(target)
+            || retired.session_id() != self.session_id
+            || retired.start_request_id() != self.request_id
+            || retired.config_digest() != self.config_digest
+            || retired.source_extension_generation() != self.extension_generation
+        {
+            return Err("nativeRetirementUnknown".into());
+        }
+        let originals: Vec<_> = self
+            .original_instances
+            .iter()
+            .map(|run| ObservedTailscaleStoreRun {
+                run_nonce: run.run_nonce.clone(),
+                config_digest: run.config_digest.clone(),
+                scopes: run
+                    .nodes
+                    .iter()
+                    .map(|node| ObservedTailscaleStoreScope {
+                        tag: node.tag.clone(),
+                        state_directory: node.state_directory.clone(),
+                        state_file: node.state_file.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        retired
+            .0
+            .store_retirement
+            .validate_observed_runs(&originals, true)
+            .map_err(|_| "nativeRetirementUnknown".into())
+    }
+
+    pub fn managed_cold_retired_node<'a>(
+        &self,
+        target: &StopSessionTarget,
+        stopped: &'a StoppedSessionReceipt,
+        tag: &str,
+    ) -> Result<Option<&'a TailscaleStoreRetirementNode>, String> {
+        if self.managed_cold_store_scope.is_none() {
+            return Ok(None);
+        }
+        let retired = stopped.retirement().ok_or("nativeRetirementUnknown")?;
+        self.verify_managed_cold_retirement(target, retired)?;
+        let original = self
+            .original_instances
+            .iter()
+            .find(|run| run.nodes.iter().any(|node| node.tag == tag))
+            .ok_or("profileBindingUnknown")?;
+        let node = retired
+            .instances()
+            .iter()
+            .find(|run| {
+                run.run_nonce == original.run_nonce && run.config_digest == original.config_digest
+            })
+            .and_then(|run| run.nodes.iter().find(|node| node.tag == tag))
+            .ok_or("profileBindingUnknown")?;
+        // Both receipts came from the same original Stop response. The
+        // independently sealed directory has to cover this physical writer.
+        let exact_directory = stopped.directory_retirement().is_some_and(|directory| {
+            directory.instances().iter().any(|run| {
+                run.run_nonce == original.run_nonce
+                    && run.config_digest == original.config_digest
+                    && run.nodes.iter().any(|scope| {
+                        scope.tag == tag && scope.state_directory == node.state_directory
+                    })
+            })
+        });
+        if !exact_directory {
+            return Err("profileBindingUnknown".into());
+        }
+        Ok(Some(node))
     }
 
     fn payload(&self, nonce: &str) -> serde_json::Value {

@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import Libbox
 import NetworkExtension
+import ObjectiveC
 import os
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
@@ -311,8 +312,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         do {
             try server.activateTailscaleDirectoryDomain(pending.ownerNonce, expectedSourceIdentity: expectedSource)
             guard lifecycle.accepts(pending.token) else { throw tunnelError("Managed activation was superseded") }
-            try startRuntimeOwnedService(server, config: config, token: pending.token)
+            let cohort = try startRuntimeOwnedService(server, config: config, token: pending.token, managedCold: true)
             guard lifecycle.accepts(pending.token) else { throw tunnelError("Managed activation returned after timeout/Stop") }
+            if let cohort, !lifecycle.retainManagedColdStoreCohort(cohort, identity: identity, token: pending.token) {
+                throw tunnelError("Managed cold census lost its start generation")
+            }
             lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: identity)
             lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: identity)
             guard lifecycle.complete(pending.token, phase: "running", stopped: false),
@@ -353,12 +357,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// One callback owner per native instance. Never dispatch-sync a Go callback
     /// onto worker: Close on worker joins that same persistence callback.
-    private func startRuntimeOwnedService(_ server: LibboxCommandServer, config: String, token: UInt64) throws {
+    @discardableResult
+    private func startRuntimeOwnedService(_ server: LibboxCommandServer, config: String, token: UInt64,
+                                          managedCold: Bool = false) throws -> String? {
         runtimeRestartOwner?.revoke()
         let owner = TunnelRuntimeRestartOwner(config: config, lifecycle: lifecycle, token: token)
         runtimeRestartOwner = owner
         do {
-            try server.startOrReloadService(withRetryableRuntimePersistence: config, options: LibboxOverrideOptions(), handler: owner)
+            let cohort: String?
+            let options = LibboxOverrideOptions()
+            let startSelector = NSSelectorFromString("startOrReloadServiceWithTailscaleStartup:options:handler:error:")
+            if managedCold && server.responds(to: startSelector) {
+                // The optional gomobile method returns an autoreleased NSString
+                // and takes an NSError out pointer (see the generated ObjC ABI).
+                // A present method is invoked once, even when it fails.
+                guard let method = class_getInstanceMethod(type(of: server), startSelector),
+                      method_getNumberOfArguments(method) == 6 else {
+                    throw tunnelError("Managed cold start ABI differs")
+                }
+                typealias Start = @convention(c) (AnyObject, Selector, NSString, AnyObject, AnyObject,
+                    AutoreleasingUnsafeMutablePointer<NSError?>?) -> Unmanaged<NSString>?
+                let start = unsafeBitCast(method_getImplementation(method), to: Start.self)
+                var error: NSError?
+                let document = start(server, startSelector, config as NSString, options, owner, &error)
+                if let error { throw error }
+                guard let document else { throw tunnelError("Managed cold start did not return its census") }
+                cohort = document.takeUnretainedValue() as String
+            } else {
+                try server.startOrReloadService(withRetryableRuntimePersistence: config, options: options, handler: owner)
+                cohort = nil
+            }
             guard lifecycle.accepts(token), commandServer === server, runtimeRestartOwner === owner else {
                 throw tunnelError("Runtime protocol query lost its native owner")
             }
@@ -382,6 +410,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard lifecycle.admitRuntimeProtocol(token, admission: admission) else {
                 throw tunnelError("Runtime protocol admission was superseded")
             }
+            return cohort
         } catch {
             owner.revoke()
             throw error

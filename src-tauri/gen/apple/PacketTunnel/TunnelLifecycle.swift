@@ -21,6 +21,7 @@ struct TunnelReport: Encodable {
     let stopSourceGeneration: UInt64?
     let tailscaleStoreScope: String?
     let tailscaleDirectoryScope: String?
+    let managedColdStoreCohort: String?
     let stopOriginalDirectoryScope: String?
     let uncertainSettingsGeneration: UInt64?
     // Neither a nil Go instance nor NE disconnected proves resource disposal.
@@ -51,6 +52,7 @@ final class TunnelLifecycle {
     private var stopSourceGeneration: UInt64?
     private var tailscaleStoreScope: String?
     private var tailscaleDirectoryScope: String?
+    private var managedColdStoreCohort: (generation: UInt64, document: String)?
     private var stopOriginalDirectoryScope: String?
     private var directoryTerminalRetained = false
     private var stopObservation: (nonce: String, callback: (TunnelObservation) -> Void)?
@@ -69,6 +71,7 @@ final class TunnelLifecycle {
         stopSourceGeneration = nil
         tailscaleStoreScope = nil
         tailscaleDirectoryScope = nil
+        managedColdStoreCohort = nil
         stopOriginalDirectoryScope = nil
         directoryTerminalRetained = false
         lastError = nil
@@ -119,6 +122,15 @@ final class TunnelLifecycle {
         lock.lock(); defer { lock.unlock() }
         guard self.identity == identity, value.utf8.count <= 256 * 1024 else { return }
         tailscaleStoreScope = value
+    }
+
+    func retainManagedColdStoreCohort(_ document: String, identity: TunnelIdentity, token: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard generation == token, self.identity == identity, phase == "starting",
+              !quarantined, !stopPending, managedColdStoreCohort == nil, runtimeAdmission != nil,
+              (1...256 * 1024).contains(document.utf8.count) else { return false }
+        managedColdStoreCohort = (token, document)
+        return true
     }
 
     /// The original worker owns this export. Terminal data is write-once for
@@ -229,6 +241,7 @@ final class TunnelLifecycle {
                             runtimeStopped: runtimeStopped, operationRequestID: operationRequestID,
                             stopSourceGeneration: stopSourceGeneration, tailscaleStoreScope: tailscaleStoreScope,
                             tailscaleDirectoryScope: tailscaleDirectoryScope,
+                            managedColdStoreCohort: managedColdStoreCohort?.generation == generation ? managedColdStoreCohort?.document : nil,
                             stopOriginalDirectoryScope: directoryTerminalRetained ? stopOriginalDirectoryScope : nil,
                             uncertainSettingsGeneration: uncertainSettingsGeneration,
                             cleanupError: cleanupError, lastError: lastError)
