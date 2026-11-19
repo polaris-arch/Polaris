@@ -3507,7 +3507,11 @@ impl ProxyRuntime {
             .flatten()
     }
 
-    pub(crate) async fn revert_saved_proxy_settings(&self, token: &str) -> bool {
+    pub(crate) async fn revert_saved_proxy_settings(
+        &self,
+        token: &str,
+        on_log_level_restored: impl FnOnce(&str) + Send,
+    ) -> bool {
         use crate::runtime::config::Decision;
 
         let _serial = self.switch_serial.lock().await;
@@ -3525,26 +3529,34 @@ impl ProxyRuntime {
                 let Some(running) = self.current_config_snapshot() else {
                     return false;
                 };
-                let result =
-                    self.config
-                        .try_update_saved(&running, |desired, removed_resources| {
-                            let Some(restored) = restored_proxy_settings(
-                                desired,
-                                &running,
-                                removed_resources,
-                                self.config.dir(),
-                            ) else {
-                                return Decision::Skip(());
-                            };
-                            if saved_settings_receipt(generation, desired, &running, &restored)
-                                != token
-                            {
-                                return Decision::Skip(());
+                let result = self.config.try_update_saved(
+                    &running,
+                    |desired, removed_resources| {
+                        let Some(restored) = restored_proxy_settings(
+                            desired,
+                            &running,
+                            removed_resources,
+                            self.config.dir(),
+                        ) else {
+                            return Decision::Skip(false);
+                        };
+                        if saved_settings_receipt(generation, desired, &running, &restored) != token
+                        {
+                            return Decision::Skip(false);
+                        }
+                        let log_level_changed = desired.get("logLevel") != restored.get("logLevel");
+                        *desired = restored;
+                        Decision::Write(log_level_changed)
+                    },
+                    |log_level_changed, saved| {
+                        if *log_level_changed {
+                            if let Some(level) = saved.get("logLevel").and_then(Value::as_str) {
+                                on_log_level_restored(level);
                             }
-                            *desired = restored;
-                            Decision::Write(())
-                        });
-                matches!(result, Ok(((), Some(_))))
+                        }
+                    },
+                );
+                matches!(result, Ok((_, Some(_))))
             })
             .unwrap_or(false)
     }
@@ -3962,6 +3974,20 @@ const REVERTIBLE_PROXY_SETTINGS: &[&str] = &[
     "allowLan",
     "tunConfig",
     "dnsConfig",
+    "logLevel",
+    "disableLogFile",
+    "fakeIpFilter",
+    "fakeIpFilterList",
+    "blockBrowserDoh",
+    "browserDohList",
+    "blockQuic",
+    "webrtcLeakProtection",
+    "bypassLAN",
+    "bypassLANList",
+    "enableIPv6",
+    "networkInterfaces",
+    "tlsFragment",
+    "utlsPolicy",
 ];
 
 // Restore both rule planes and their shared dependencies in the same write.

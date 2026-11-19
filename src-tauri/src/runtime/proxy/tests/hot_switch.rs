@@ -2003,10 +2003,13 @@ async fn revert_saved_proxy_settings_requires_the_current_receipt_and_preserves_
     saved["servers"][1]["name"] = "New name".into();
     rt.config.save_full(&saved).unwrap();
 
-    assert!(!rt.revert_saved_proxy_settings(&original).await);
+    assert!(!rt.revert_saved_proxy_settings(&original, |_| {}).await);
     let old_generation = rt.pending_changes().saved_settings_revert_token.unwrap();
     rt.gate.bump_generation();
-    assert!(!rt.revert_saved_proxy_settings(&old_generation).await);
+    assert!(
+        !rt.revert_saved_proxy_settings(&old_generation, |_| {})
+            .await
+    );
     let token = rt.pending_changes().saved_settings_revert_token.unwrap();
 
     let before_external_edit = std::fs::read(rt.config.path()).unwrap();
@@ -2016,13 +2019,13 @@ async fn revert_saved_proxy_settings_requires_the_current_receipt_and_preserves_
     let external_bytes = serde_json::to_vec(&externally_edited).unwrap();
     std::fs::write(rt.config.path(), &external_bytes).unwrap();
     assert!(rt.pending_changes().saved_settings_revert_token.is_none());
-    assert!(!rt.revert_saved_proxy_settings(&token).await);
+    assert!(!rt.revert_saved_proxy_settings(&token, |_| {}).await);
     assert_eq!(std::fs::read(rt.config.path()).unwrap(), external_bytes);
     assert_eq!(rt.config.current().unwrap(), cached);
     std::fs::write(rt.config.path(), before_external_edit).unwrap();
 
-    assert!(rt.revert_saved_proxy_settings(&token).await);
-    assert!(!rt.revert_saved_proxy_settings(&token).await);
+    assert!(rt.revert_saved_proxy_settings(&token, |_| {}).await);
+    assert!(!rt.revert_saved_proxy_settings(&token, |_| {}).await);
     let desired = rt.config.current().unwrap();
     assert_eq!(desired["selectedServerId"], "node-a");
     assert_eq!(desired["mixedPort"], running["mixedPort"]);
@@ -2048,8 +2051,79 @@ async fn revert_saved_proxy_settings_requires_the_current_receipt_and_preserves_
     running_with_removed_resolver["dnsDefaults"]["unmatchedAction"] =
         serde_json::json!({"type": "server", "serverId": "removed-resolver"});
     mark_running_with_snapshot(&rt, &running_with_removed_resolver);
-    assert!(!rt.revert_saved_proxy_settings(&token).await);
+    assert!(!rt.revert_saved_proxy_settings(&token, |_| {}).await);
     assert_eq!(rt.config.current().unwrap(), saved);
+    assert!(rt.pending_changes().saved_settings_revert_token.is_none());
+}
+
+#[tokio::test]
+async fn revert_saved_proxy_settings_restores_pending_settings_against_latest_runtime() {
+    let (rt, _dir, sink, mut running) = explicit_selection_fixture();
+    running["configSchemaVersion"] = 4.into();
+    running["logLevel"] = "info".into();
+    running["dnsDefaults"]["connectionResolution"] = "preserveDomain".into();
+    running["clashApiSecret"] = "running-test-secret".into();
+    rt.config.save_full(&running).unwrap();
+    let mut running = rt.config.current().unwrap();
+    mark_running_with_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+
+    let mut saved = running.clone();
+    saved.as_object_mut().unwrap().extend(
+        serde_json::json!({
+            "logLevel": "debug",
+            "disableLogFile": true,
+            "fakeIpFilter": false,
+            "fakeIpFilterList": ["local.test"],
+            "blockBrowserDoh": true,
+            "browserDohList": ["dns.test"],
+            "blockQuic": true,
+            "webrtcLeakProtection": "block",
+            "bypassLAN": false,
+            "bypassLANList": ["192.168.0.0/16", "private.test"],
+            "enableIPv6": true,
+            "networkInterfaces": {"direct": "en-test"},
+            "tlsFragment": true,
+            "utlsPolicy": "default",
+            "clashApiSecret": "new-saved-test-secret",
+            "language": "ru"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    saved["dnsDefaults"]["connectionResolution"] = "dnsRules".into();
+    saved["selectedServerId"] = "node-b".into();
+    saved["servers"][1]["name"] = "New name".into();
+    rt.config.save_full(&saved).unwrap();
+    let saved = rt.config.current().unwrap();
+    assert_eq!(saved["dnsDefaults"]["connectionResolution"], "dnsRules");
+    let stale = rt.pending_changes().saved_settings_revert_token.unwrap();
+
+    // A hot apply can publish a newer applied value without replacing startup R.
+    running["logLevel"] = "warn".into();
+    running["selectedServerId"] = "node-b".into();
+    *rt.current_config.write().unwrap() = Some(running.clone());
+    assert!(
+        !rt.revert_saved_proxy_settings(&stale, |_| panic!("stale receipt projected"))
+            .await
+    );
+    assert_eq!(rt.config.current().unwrap(), saved);
+
+    let token = rt.pending_changes().saved_settings_revert_token.unwrap();
+    let mut projected = None;
+    assert!(
+        rt.revert_saved_proxy_settings(&token, |level| projected = Some(level.to_owned()))
+            .await
+    );
+    assert_eq!(projected.as_deref(), Some("warn"));
+    let mut expected = running.clone();
+    for key in ["clashApiSecret", "language", "servers"] {
+        expected[key] = saved[key].clone();
+    }
+    assert_eq!(rt.config.current().unwrap(), expected);
+    assert_eq!(rt.current_config_snapshot(), Some(running));
+    assert!(sink.calls().is_empty());
     assert!(rt.pending_changes().saved_settings_revert_token.is_none());
 }
 
@@ -2162,7 +2236,7 @@ async fn revert_saved_proxy_settings_restores_policy_dependencies_and_preserves_
         })
         .unwrap();
     assert_eq!(rt.config.current().unwrap(), before_refresh);
-    assert!(!rt.revert_saved_proxy_settings(&stale).await);
+    assert!(!rt.revert_saved_proxy_settings(&stale, |_| {}).await);
     let stale = rt.pending_changes().saved_settings_revert_token.unwrap();
 
     saved["ruleResources"][0]["downloadedAt"] = "after".into();
@@ -2173,14 +2247,14 @@ async fn revert_saved_proxy_settings_restores_policy_dependencies_and_preserves_
     saved["language"] = "ru".into();
     rt.config.save_full(&saved).unwrap();
     let saved = rt.config.current().unwrap();
-    assert!(!rt.revert_saved_proxy_settings(&stale).await);
+    assert!(!rt.revert_saved_proxy_settings(&stale, |_| {}).await);
     let token = rt.pending_changes().saved_settings_revert_token.unwrap();
     std::fs::remove_file(rule_dir.join("removed.srs")).unwrap();
-    assert!(!rt.revert_saved_proxy_settings(&token).await);
+    assert!(!rt.revert_saved_proxy_settings(&token, |_| {}).await);
     assert!(rt.pending_changes().saved_settings_revert_token.is_none());
     assert_eq!(rt.config.current().unwrap(), saved);
     std::fs::write(rule_dir.join("removed.srs"), refreshed_bytes).unwrap();
-    assert!(rt.revert_saved_proxy_settings(&token).await);
+    assert!(rt.revert_saved_proxy_settings(&token, |_| {}).await);
     let mut expected = running.clone();
     for key in ["subscriptions", "language"] {
         expected[key] = saved[key].clone();
@@ -2231,12 +2305,15 @@ async fn revert_saved_proxy_settings_keeps_rule_remarks_edited_after_pending_por
         .unwrap()
         .remove("remarks");
     rt.config.save_full(&saved).unwrap();
-    assert!(!rt.revert_saved_proxy_settings(&before_remarks).await);
+    assert!(
+        !rt.revert_saved_proxy_settings(&before_remarks, |_| {})
+            .await
+    );
     let token = rt.pending_changes().saved_settings_revert_token.unwrap();
     let mut expected = rt.config.current().unwrap();
     expected["mixedPort"] = running["mixedPort"].clone();
 
-    assert!(rt.revert_saved_proxy_settings(&token).await);
+    assert!(rt.revert_saved_proxy_settings(&token, |_| {}).await);
     assert_eq!(rt.config.current().unwrap(), expected);
     let pending = rt.pending_changes();
     assert!(!pending.pending_apply);
@@ -2280,13 +2357,16 @@ async fn revert_saved_proxy_settings_keeps_unavailable_unreferenced_resources_de
 
     // Losing the file changes the approved candidate, but still permits port revert.
     std::fs::remove_file(&file).unwrap();
-    assert!(!rt.revert_saved_proxy_settings(&with_resource).await);
+    assert!(!rt.revert_saved_proxy_settings(&with_resource, |_| {}).await);
     // A damaged seed makes the downloaded registration a required fallback.
     std::fs::write(&seeded, b"BAD").unwrap();
     assert!(rt.pending_changes().saved_settings_revert_token.is_none());
     std::fs::write(&seeded, b"SRS").unwrap();
     let without_resource = rt.pending_changes().saved_settings_revert_token.unwrap();
-    assert!(rt.revert_saved_proxy_settings(&without_resource).await);
+    assert!(
+        rt.revert_saved_proxy_settings(&without_resource, |_| {})
+            .await
+    );
     let mut expected = running.clone();
     expected["ruleResources"] = serde_json::json!([]);
     assert_eq!(rt.config.current().unwrap(), expected);
@@ -2313,7 +2393,10 @@ async fn revert_saved_proxy_settings_keeps_unavailable_unreferenced_resources_de
     mark_running_with_snapshot(&rt, &running);
 
     let without_resource = rt.pending_changes().saved_settings_revert_token.unwrap();
-    assert!(rt.revert_saved_proxy_settings(&without_resource).await);
+    assert!(
+        rt.revert_saved_proxy_settings(&without_resource, |_| {})
+            .await
+    );
     assert_eq!(rt.config.current().unwrap(), expected);
     assert!(file.is_file());
     assert!(rt.pending_changes().saved_settings_revert_token.is_none());
@@ -2338,7 +2421,7 @@ async fn revert_saved_proxy_settings_rejects_missing_route_targets() {
     rt.config.save_full(&saved).unwrap();
     let saved = rt.config.current().unwrap();
     assert!(rt.pending_changes().saved_settings_revert_token.is_none());
-    assert!(!rt.revert_saved_proxy_settings(&token).await);
+    assert!(!rt.revert_saved_proxy_settings(&token, |_| {}).await);
     assert_eq!(rt.config.current().unwrap(), saved);
 }
 

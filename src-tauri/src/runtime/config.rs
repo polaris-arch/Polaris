@@ -1717,10 +1717,13 @@ impl ConfigManager {
     /// An approved replacement targets the exact saved document and must
     /// skip load-time migration. A writer may be waiting for the caller's
     /// runtime claim, so refuse a contended write lock immediately.
+    /// The App projection runs after a successful write while the writer is still
+    /// held. It must not reenter the store.
     pub(crate) fn try_update_saved<R>(
         &self,
         running: &Value,
         f: impl FnOnce(&mut Value, &[(&str, Option<Value>)]) -> Decision<R>,
+        on_saved: impl FnOnce(&R, &Value),
     ) -> Result<(R, Option<Value>), StoreError> {
         deny_inside_projection("try_update_saved");
         let _guard = self
@@ -1731,9 +1734,11 @@ impl ConfigManager {
         let removed = self.removed_rule_resources_under_write_lock(&saved, running)?;
         match f(&mut saved, &removed) {
             Decision::Skip(result) => Ok((result, None)),
-            Decision::Write(result) => self
-                .save_full_under_write_lock(&saved)
-                .map(|value| (result, Some(value))),
+            Decision::Write(result) => {
+                let value = self.save_full_under_write_lock(&saved)?;
+                on_saved(&result, &value);
+                Ok((result, Some(value)))
+            }
         }
     }
 

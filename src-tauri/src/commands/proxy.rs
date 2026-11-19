@@ -380,7 +380,10 @@ pub async fn proxy_revert_saved_settings(
     state: State<'_, AppRuntime>,
     token: String,
 ) -> Result<ApiResponse<bool>, ()> {
-    let reverted = state.proxy().revert_saved_proxy_settings(&token).await;
+    let reverted = state
+        .proxy()
+        .revert_saved_proxy_settings(&token, crate::logging::set_level)
+        .await;
     if reverted {
         crate::commands::config::emit_config_changed_signal(&app);
     }
