@@ -774,10 +774,33 @@ export function checkMobileBuildInfo({ source: declaration, graph, target, expec
   return observed;
 }
 
+export function aarGoInvocationIdentity(raw, version, basename) {
+  demand(typeof raw === 'string' && typeof version === 'string' && /^\p{Nd}+\.\p{Nd}+\.\p{Nd}+$/u.test(version),
+    'raw AAR Go BuildInfo observation differs');
+  const end = raw.indexOf('\n'), header = raw.slice(0, end), body = raw.slice(end + 1);
+  const suffix = ': go' + version;
+  demand(end >= 0 && body.startsWith('\t') && header.endsWith(suffix), 'raw AAR Go BuildInfo header/body differs');
+  const filename = header.slice(0, -suffix.length);
+  // Ignore redundant slash and dot components without resolving parent components.
+  demand(filename.startsWith('/') && !filename.includes('\0') &&
+    filename.split('/').findLast(part => part && part !== '.') === basename, 'raw AAR Go BuildInfo filename differs');
+  return 'go' + version + '\n' + body;
+}
+
 function nativeBuildInfoReport(evidence) {
-  if (closed(evidence, ['source', 'graph', 'target', 'expectedId', 'actualId', 'raw'])
-    && evidence.target?.osName === 'android') {
-    return checkMobileBuildInfo(evidence);
+  const androidFields = ['source', 'graph', 'target', 'expectedId', 'actualId', 'raw'];
+  const aarReinspection = closed(evidence, [...androidFields, 'originalAarGoBuildInfo']);
+  if ((aarReinspection || closed(evidence, androidFields)) && evidence.target?.osName === 'android') {
+    const facts = checkMobileBuildInfo(evidence);
+    if (aarReinspection) {
+      const { targets, abis } = evidence.source.android;
+      const abi = abis[targets.indexOf('android/' + evidence.target.arch)];
+      const basename = 'jni_' + abi + '_libbox.so';
+      demand(aarGoInvocationIdentity(evidence.raw, facts.goVersion, basename) ===
+        aarGoInvocationIdentity(evidence.originalAarGoBuildInfo, facts.goVersion, basename),
+      'original AAR Go BuildInfo body differs');
+    }
+    return facts;
   }
   const bound = closed(evidence, ['source', 'graph', 'appleObservations']);
   demand((bound || closed(evidence, ['appleObservations'])) && Array.isArray(evidence.appleObservations)

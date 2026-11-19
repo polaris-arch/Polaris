@@ -220,41 +220,6 @@ def zip_entries(archive):
     return infos
 
 
-def component_output_identity(output):
-    """Compare content while retaining the original verifier stdout observation.
-
-    Go1.25.5 version.scanFile prints its invocation filename in the first
-    line. A consumer uses its own scratch directory for the same pinned ELF.
-    Only that absolute filename is observational; the version, entire module
-    body, parsed facts, native bytes, BuildID, JNI/API and all other output
-    fields still participate in equality. Neither original output is mutated.
-    Non-AAR outputs need no normalization and are returned as borrowed, read-only
-    comparison values; callers still re-inspect the current original bytes.
-    """
-    if output.get('format') != 'AAR':
-        return output
-    result = json.loads(json.dumps(output))
-    require(isinstance(result.get('nativeLibraries'), dict), 'AAR native observation inventory missing')
-    for name, row in result['nativeLibraries'].items():
-        require(isinstance(row, dict), 'AAR native observation row differs')
-        if 'goBuildInfo' not in row:
-            continue
-        require(name.endswith('/libbox.so') and isinstance(row['goBuildInfo'], str),
-                'raw Go observation must describe the bound libbox member')
-        version = row.get('parsedBuildInfo', {}).get('goVersion')
-        require(isinstance(version, str) and re.fullmatch(r'\d+\.\d+\.\d+', version),
-                'raw Go observation version missing')
-        header, separator, body = row['goBuildInfo'].partition('\n')
-        suffix = ': go' + version
-        require(separator and body.startswith('\t') and header.endswith(suffix),
-                'raw Go observation header/body differs')
-        filename = header[:-len(suffix)]
-        require('\0' not in filename and Path(filename).is_absolute() and
-                Path(filename).name == name.replace('/', '_'), 'raw Go observation filename differs')
-        row['goBuildInfo'] = 'go' + version + '\n' + body
-    return result
-
-
 def local_replacement_aliases(replacement, source_dir, observed, name):
     literal, directory = replacement.get('Path'), replacement.get('Dir')
     diagnostic = ('native replacement differs: ' + name + '; observed=' + repr(observed) +
@@ -289,9 +254,11 @@ def _read_native_buildinfo(evidence, run, scratch):
 
 
 def verify_native_buildinfo(observation, value, graph, *, os_name, arch, mode, expected_id, actual_id,
-                            run, scratch, simulator=False):
+                            run, scratch, simulator=False, original=None):
     evidence = {'raw': observation, 'source': value, 'graph': graph, 'expectedId': expected_id, 'actualId': actual_id,
                 'target': {'osName': os_name, 'arch': arch, 'mode': mode, 'simulator': simulator}}
+    if original is not None:
+        evidence['originalAarGoBuildInfo'] = original['goBuildInfo']
     return _read_native_buildinfo(evidence, run, scratch)
 
 
@@ -327,7 +294,7 @@ class AppleBuildInfoBatch:
                                                           ensure_ascii=True).encode())
 
 
-def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
+def inspect_aar(aar, value, graph, tools, run, scratch, expected_id, *, original_output=None):
     validate(value)
     verifier = ROOT / 'scripts/verify-apk.mjs'
     native, scratch = {}, Path(scratch)
@@ -360,10 +327,14 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
             if libbox:
                 info = run([tools['go'], 'version', '-m', str(path)])
                 actual_id = run([tools['go'], 'tool', 'buildid', str(path)]).strip()
+                original = original_output['nativeLibraries'][name] if original_output is not None else None
                 facts = verify_native_buildinfo(info, value, graph, os_name='android', arch=ABI[abi], mode='c-shared',
-                                                expected_id=expected_id, actual_id=actual_id, run=run, scratch=scratch)
+                                                expected_id=expected_id, actual_id=actual_id, run=run, scratch=scratch,
+                                                original=original)
                 jni[abi] = run([tools['readelf'], '--dyn-syms', '--wide', str(path)])
-                row.update(goBuildInfo=info, parsedBuildInfo=facts, buildID=actual_id, androidAPI=elf['androidAPI'])
+                # Reinspection projects the original text only after Node proves that just its invocation path differs.
+                row.update(goBuildInfo=info if original is None else original['goBuildInfo'],
+                           parsedBuildInfo=facts, buildID=actual_id, androidAPI=elf['androidAPI'])
             native[name] = row
         classes = scratch / 'classes.jar'
         classes.write_bytes(archive.read('classes.jar'))

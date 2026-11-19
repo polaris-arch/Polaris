@@ -325,6 +325,16 @@ test('native mobile BuildInfo admits each exact platform and preserves original 
         { goVersion: frozen.facts.goVersion, modules: {}, settings: { text: '樹' }, path: null }, frozen.facts,
       ];
       assert.deepEqual(JSON.parse(result.stdout), expected);
+      if (android) {
+        const index = target.source.android.targets.indexOf('android/' + target.target.arch);
+        const basename = 'jni_' + target.source.android.abis[index] + '_libbox.so';
+        const relocated = verify(target, undefined, evidence => {
+          evidence.raw = buildInfoText(frozen.facts, '/consumer/樹/' + basename) + '\n';
+          evidence.originalAarGoBuildInfo = buildInfoText(frozen.facts, '/producer/' + basename + '/.') + '\n';
+        });
+        assert.equal(relocated.status, 0, relocated.stderr);
+        assert.deepEqual(JSON.parse(relocated.stdout), expected);
+      }
       if (target.target.arch === 'arm64') {
         const python = execFileSync('python3', ['-B', '-c', `
 import json
@@ -365,6 +375,27 @@ print(json.dumps(observed))
       }
       for (const name of vendors.filter(name => !requiredNative.includes(name))) delete target.facts.modules[name];
       verifyMobileBuildFixture(target);
+    }
+    const android = input();
+    const basename = 'jni_arm64-v8a_libbox.so';
+    const producerRaw = buildInfoText(android.facts, '/producer/' + basename);
+    for (const [original, error] of [
+      [null, /observation differs/],
+      [producerRaw.replace('/producer/', 'relative/'), /filename differs/],
+      [producerRaw.replace('/producer/', '/\0producer/'), /filename differs/],
+      [producerRaw.replace(basename, 'other.so'), /filename differs/],
+      [producerRaw.replace(android.facts.goVersion, '1.27.3'), /header\/body differs/],
+      [producerRaw.replace('\n\t', '\r\n\t'), /header\/body differs/],
+      [producerRaw + '\n', /body differs/],
+      [producerRaw.replace('gobind', '樹'), /body differs/],
+    ]) {
+      const refusal = verify(android, undefined, evidence => {
+        evidence.raw = buildInfoText(android.facts, '/consumer/' + basename);
+        evidence.originalAarGoBuildInfo = original;
+      });
+      assert.equal(refusal.status, 1);
+      assert.equal(refusal.stdout, '');
+      assert.match(refusal.stderr, error);
     }
     const mixed = verify(input('ios'), undefined, evidence => {
       evidence.appleObservations[0].raw += '\n\tbuild\ttext=duplicate';

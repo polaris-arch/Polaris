@@ -552,12 +552,11 @@ def verify_receipt(component, receipt, value, binding, tools, run_tool, scratch)
     verify(receipt['nativeInputs'], log=Path(component).parent / 'original-bind.log', output=receipt['output'])
     expected = 'polaris-mobile-' + receipt_digest(binding)
     if binding['platform'] == 'android':
-        observed = inspect_aar(component, value, binding['moduleGraph'], tools, run_tool, scratch, expected)
+        observed = inspect_aar(component, value, binding['moduleGraph'], tools, run_tool, scratch, expected,
+                               original_output=receipt['output'])
     else:
         observed = inspect_framework(component, value, binding['moduleGraph'], expected, run=run_tool, scratch=scratch)
-    from artifacts import component_output_identity
-    require(component_output_identity(observed) == component_output_identity(receipt['output']),
-            'cached component native/content predicate differs')
+    require(observed == receipt['output'], 'cached component native/content predicate differs')
     return receipt
 
 

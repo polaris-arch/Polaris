@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import component_output_identity, module, tree_inventory, zip_entries
+from artifacts import module, tree_inventory, zip_entries
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare
 from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
@@ -592,7 +592,7 @@ class FormalOutputs(unittest.TestCase):
             with self.assertRaises(OSError):
                 executable_driver_identity(driver)
 
-    def relocated_android_observations(self):
+    def android_observations(self):
         name = 'jni/arm64-v8a/libbox.so'
         body = '\tpath\tgobind\n\tdep\texample.org/module\tv1.2.3\th1:fixed\n'
         build_info = ': go' + self.value['goVersion'] + '\n' + body
@@ -603,53 +603,7 @@ class FormalOutputs(unittest.TestCase):
                         'jniExports': ['JNI_OnLoad'], 'needed': ['libc.so']}},
                     'javaInterfaces': {'Libbox': 'original API'}}
         observed = deepcopy(original)
-        observed['nativeLibraries'][name]['goBuildInfo'] = '/consumer/work/jni_arm64-v8a_libbox.so' + build_info
         return name, original, observed
-
-    def test_component_identity_ignores_only_the_exact_go_invocation_filename_and_preserves_raw(self):
-        name, original, observed = self.relocated_android_observations()
-        frozen = deepcopy(original), deepcopy(observed)
-        self.assertNotEqual(original, observed)
-        self.assertEqual(component_output_identity(original), component_output_identity(observed))
-        self.assertEqual((original, observed), frozen, 'original stdout and receipt observations must stay intact')
-        for mutate in [
-            lambda v: v['artifact'].update(sha256='c' * 64),
-            lambda v: v['nativeLibraries'][name].update(bytes=43),
-            lambda v: v['nativeLibraries'][name].update(buildID='other-build-id'),
-            lambda v: v['nativeLibraries'][name].update(jniExports=[]),
-            lambda v: v['nativeLibraries'][name].update(needed=['libother.so']),
-            lambda v: v['nativeLibraries'][name]['parsedBuildInfo']['settings'].update(GOARCH='amd64'),
-            lambda v: v['nativeLibraries'][name]['parsedBuildInfo']['modules']['example.org/module'].update(sum='h1:other'),
-            lambda v: v['nativeLibraries'][name].update(goBuildInfo=v['nativeLibraries'][name]['goBuildInfo'].replace('h1:fixed', 'h1:other')),
-            lambda v: v['javaInterfaces'].update(Libbox='changed API'),
-            lambda v: v.update(unboundNull=None),
-        ]:
-            wrong = deepcopy(observed); mutate(wrong)
-            self.assertNotEqual(component_output_identity(original), component_output_identity(wrong))
-        version = ': go' + self.value['goVersion']
-        for header in ['relative/jni_arm64-v8a_libbox.so' + version,
-                       '/consumer/work/other.so' + version,
-                       '/consumer/work/jni_arm64-v8a_libbox.so: go1.25.6']:
-            wrong = deepcopy(observed)
-            wrong['nativeLibraries'][name]['goBuildInfo'] = header + '\n\tpath\tgobind\n'
-            with self.subTest(header=header), self.assertRaises(RuntimeError):
-                component_output_identity(wrong)
-        bad = deepcopy(observed); bad['nativeLibraries'][name]['goBuildInfo'] += '\t=>\t./other-source\t(devel)\n'
-        self.assertNotEqual(component_output_identity(original), component_output_identity(bad))
-
-    def test_non_aar_identity_borrows_unmodified_output_without_json_roundtrips(self):
-        framework = {'format': 'static-XCFramework', 'goBuildInfo': {'moduleRaw': 'raw original'},
-                     'slices': {'ios-arm64': {'members': [{'name': 'go.o', 'sha256': 'a' * 64}]}}}
-        frozen = deepcopy(framework)
-        with patch.object(artifacts.json, 'dumps', side_effect=AssertionError('redundant JSON serialization')), \
-                patch.object(artifacts.json, 'loads', side_effect=AssertionError('redundant JSON parsing')):
-            self.assertIs(component_output_identity(framework), framework)
-            self.assertEqual(component_output_identity(framework), frozen)
-            for field in ('goBuildInfo', 'slices'):
-                changed = deepcopy(framework)
-                changed[field] = {'changed': True}
-                self.assertNotEqual(component_output_identity(framework), component_output_identity(changed))
-        self.assertEqual(framework, frozen)
 
     def test_apple_identity_reuse_keeps_each_consumer_and_producer_reinspection(self):
         from consume import verify_original
@@ -686,7 +640,7 @@ class FormalOutputs(unittest.TestCase):
     def test_consumer_and_producer_reinspection_keep_the_original_receipt_identity(self):
         from consume import verify_original
         from producer import verify_receipt
-        name, original, observed = self.relocated_android_observations()
+        name, original, observed = self.android_observations()
         binding = {'platform': 'android', 'sourceContract': self.value, 'sourceOverlay': 0,
                    'sourceObservation': {'sourceCommit': self.value['sourceCommit'], 'sourceTree': self.value['sourceTree']},
                    'moduleGraph': []}
@@ -696,16 +650,25 @@ class FormalOutputs(unittest.TestCase):
         frozen = deepcopy(receipt)
         tools = {'go': 'actual-go', 'javap': 'actual-javap', 'readelf': 'actual-readelf'}
         with patch('consume.load', return_value=self.value), patch('consume.read_receipt', return_value=receipt), \
-                patch('consume.inspect_aar', return_value=observed), patch('native_inputs.verify'), \
-                patch('producer.inspect_aar', return_value=observed):
+                patch('consume.inspect_aar', return_value=observed) as consumer_inspection, patch('native_inputs.verify'), \
+                patch('producer.inspect_aar', return_value=observed) as producer_inspection:
             self.assertIs(verify_original('/component.aar', '/receipt.json', 'android', tools, Path('/consumer/work')), receipt)
             self.assertIs(verify_receipt('/component.aar', receipt, self.value, binding, tools, None, Path('/consumer/work')), receipt)
             self.assertEqual(receipt, frozen)
-            observed['nativeLibraries'][name]['buildID'] = 'changed-native-id'
-            with self.assertRaisesRegex(RuntimeError, 'native identity differ; fields=.*nativeLibraries.*originalRawHeaders='):
-                verify_original('/component.aar', '/receipt.json', 'android', tools, Path('/consumer/work'))
-            with self.assertRaisesRegex(RuntimeError, 'cached component native/content'):
-                verify_receipt('/component.aar', receipt, self.value, binding, tools, None, Path('/consumer/work'))
+            self.assertIs(consumer_inspection.call_args.kwargs['original_output'], original)
+            self.assertIs(producer_inspection.call_args.kwargs['original_output'], original)
+            for field, updates in [
+                ('artifact', {'sha256': 'c' * 64}),
+                ('nativeLibraries', {name: {**observed['nativeLibraries'][name], 'buildID': 'changed-native-id'}}),
+                ('javaInterfaces', {'Libbox': 'changed API'}),
+                ('unboundNull', None),
+            ]:
+                changed = {**observed, field: updates}
+                consumer_inspection.return_value = producer_inspection.return_value = changed
+                with self.assertRaisesRegex(RuntimeError, 'native identity differ; fields=.*' + field):
+                    verify_original('/component.aar', '/receipt.json', 'android', tools, Path('/consumer/work'))
+                with self.assertRaisesRegex(RuntimeError, 'cached component native/content'):
+                    verify_receipt('/component.aar', receipt, self.value, binding, tools, None, Path('/consumer/work'))
 
 if __name__ == '__main__':
     unittest.main()
