@@ -1842,7 +1842,10 @@ impl ProxyRuntime {
         owner: StagedSaveOwner,
     ) -> Result<Option<u64>, polaris_store::StoreError> {
         let _serial = self.switch_serial.lock().await;
-        if self.hot_config_edit_blocker(&edit.previous, owner).is_some() {
+        if self
+            .hot_config_edit_blocker(&edit.previous, owner)
+            .is_some()
+        {
             return Ok(None);
         }
         self.config.commit_prepared_config_edit(

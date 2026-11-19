@@ -219,9 +219,7 @@ fn manual_all_wires_real_builtin_registry_and_one_deferred_batch_broadcast() {
     );
     assert_eq!(catalog.matches("batch.finish(").count(), 1);
     assert!(!catalog.contains("broadcast_config_changed("));
-    assert!(
-        catalog.find(".fetch(").unwrap() < catalog.find("batch.finish(").unwrap()
-    );
+    assert!(catalog.find(".fetch(").unwrap() < catalog.find("batch.finish(").unwrap());
 }
 
 #[test]
