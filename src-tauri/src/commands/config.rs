@@ -624,15 +624,60 @@ fn config_patch_core(
     config: &ConfigManager,
     patch: serde_json::Map<String, Value>,
 ) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
+    config_patch_with_previous(config, patch, None)
+}
+
+fn config_patch_with_previous(
+    config: &ConfigManager,
+    patch: serde_json::Map<String, Value>,
+    previous: Option<&mut Value>,
+) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
     config_edit_core(config, move |next| {
         if patch.is_empty() {
             return false;
+        }
+        if let Some(previous) = previous {
+            *previous = next.clone();
         }
         next.as_object_mut()
             .expect("validated UserConfig root must be an object")
             .extend(patch);
         true
     })
+}
+
+// This boundary is local to CONFIG_PATCH. Unknown fields and settings observed
+// by the runtime keep the existing path, including legacy controls outside UserConfig.
+fn is_app_patch_key(key: &str) -> bool {
+    matches!(
+        key,
+        "language"
+            | "uiTheme"
+            | "periodicSpeedTestEnabled"
+            | "desktopNotifications"
+            | "silentStart"
+            | "autoConnect"
+            | "minimizeToTray"
+            | "autoLightweightMode"
+            | "keepTrayMenuWarm"
+            | "rememberWindowSize"
+            | "hardwareAcceleration"
+            | "windowEffects"
+            | "autoCheckUpdate"
+            | "autoDownloadUpdate"
+            | "appUpdateChannel"
+            | "autoPrivacyMode"
+    )
+}
+
+fn app_only_config_patch(previous: &Value, saved: &Value) -> bool {
+    let (Some(previous), Some(saved)) = (previous.as_object(), saved.as_object()) else {
+        return false;
+    };
+    previous
+        .keys()
+        .chain(saved.keys())
+        .all(|key| is_app_patch_key(key) || previous.get(key) == saved.get(key))
 }
 
 fn config_takeover_core(
@@ -741,8 +786,29 @@ pub fn config_patch(
             crate::i18n::key::NATIVE_UNKNOWN_ERROR,
         ));
     };
-    let result = config_patch_core(state.config(), patch);
-    config_edit_response(&app, &state, result)
+    let mut previous = Value::Null;
+    let capture_previous = patch.keys().any(|key| is_app_patch_key(key));
+    let result = config_patch_with_previous(
+        state.config(),
+        patch,
+        capture_previous.then_some(&mut previous),
+    );
+    config_edit_response_with(&app, &state, result, |saved| {
+        if app_only_config_patch(&previous, saved) {
+            emit_config_changed_signal(&app);
+            let proxy = state.proxy.clone();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                proxy
+                    .project_latest_saved_config(|current| {
+                        apply_process_config_projections(&app, current)
+                    })
+                    .await;
+            });
+        } else {
+            broadcast_config_changed(&app, saved);
+        }
+    })
 }
 
 pub(crate) fn config_takeover(
@@ -825,10 +891,21 @@ fn config_edit_response(
     state: &AppRuntime,
     result: Result<(Option<String>, Value, bool), polaris_store::StoreError>,
 ) -> ApiResponse<Value> {
+    config_edit_response_with(app, state, result, |saved| {
+        broadcast_config_changed(app, saved)
+    })
+}
+
+fn config_edit_response_with(
+    app: &AppHandle,
+    state: &AppRuntime,
+    result: Result<(Option<String>, Value, bool), polaris_store::StoreError>,
+    on_changed: impl FnOnce(&Value),
+) -> ApiResponse<Value> {
     match result {
         Ok((old_selected, cfg, changed)) => {
             if changed {
-                broadcast_config_changed(app, &cfg);
+                on_changed(&cfg);
             }
             invalidate_unlock_on_exit_change(
                 state.unlock(),
@@ -2061,8 +2138,7 @@ pub(crate) fn emit_config_changed_signal(app: &AppHandle) {
     let _ = app.emit(EVENT_CONFIG_CHANGED, json!({}));
 }
 
-/// 配置落盘后立即生效的 App/窗口投影。由运行时的“候选仍是最新磁盘版本”闸门回调，
-/// 与入核共享乱序作废语义；不得在闸门之前单独执行。
+/// 配置落盘后立即生效的 App/窗口投影，调用方在共享的运行时串行门内使用最新配置。
 fn apply_process_config_projections(app: &AppHandle, cfg: &Value) {
     if let Some(level) = cfg.get("logLevel").and_then(Value::as_str) {
         crate::logging::set_level(level);

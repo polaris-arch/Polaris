@@ -237,6 +237,53 @@ fn config_broadcast_routes_through_the_persisted_stale_guard() {
     );
 }
 
+#[test]
+fn config_patch_app_metadata_cannot_authorize_an_older_saved_core_change() {
+    let dir = temp_dir("config-patch-metadata-scope");
+    let config = ConfigManager::new(dir.clone());
+    let mut running = config.load_full().unwrap();
+    running["logLevel"] = json!("info");
+    config.save_full(&running).unwrap();
+    let mut desired = config.current().unwrap();
+    desired["logLevel"] = json!("debug");
+    config.save_full(&desired).unwrap();
+
+    let patch = json!({
+        "language": "zh-CN",
+        "uiTheme": "dark",
+        "periodicSpeedTestEnabled": false,
+        "logLevel": "debug",
+    });
+    let mut previous = Value::Null;
+    let (_, saved, changed) = config_patch_with_previous(
+        &config,
+        patch.as_object().unwrap().clone(),
+        Some(&mut previous),
+    )
+    .unwrap();
+    assert!(changed);
+    assert_eq!(previous["logLevel"], "debug");
+    assert_eq!(saved["logLevel"], "debug");
+    assert_ne!(running["logLevel"], saved["logLevel"]);
+    assert!(app_only_config_patch(&previous, &saved));
+
+    // Both typed configuration and a raw live-control key must still dispatch
+    // the existing broadcast when the canonical edit actually changes them.
+    for patch in [
+        json!({"language": "en-US", "logLevel": "warn"}),
+        json!({"uiTheme": "light", "meshLoginFallbackDirect": false}),
+    ] {
+        let (_, saved, changed) = config_patch_with_previous(
+            &config,
+            patch.as_object().unwrap().clone(),
+            Some(&mut previous),
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(!app_only_config_patch(&previous, &saved));
+    }
+}
+
 fn valid_node(id: &str) -> Value {
     json!({
         "id": id,

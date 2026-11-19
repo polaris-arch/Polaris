@@ -1308,6 +1308,15 @@ impl ProxyRuntime {
         }
     }
 
+    /// App-only writes refresh process projections in publication order without
+    /// acquiring a selector intent or offering any persisted graph to the Core.
+    pub(crate) async fn project_latest_saved_config(&self, on_current: impl FnOnce(&Value) + Send) {
+        let _serial = self.switch_serial.lock().await;
+        if let Ok(current) = self.config.current() {
+            on_current(&current);
+        }
+    }
+
     /// 持久配置广播的专用入口。后端 writer 虽已串行落盘，解锁后各自 spawn 的 `switchMode`
     /// task 仍可能乱序。候选在取得 `switch_serial` 后已不是当前磁盘真值时必须作废；否则
     /// “新配置先入核、旧广播后入核”会让运行态最终退回旧版，而前端/磁盘都显示新版。
