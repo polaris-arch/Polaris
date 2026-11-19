@@ -54,19 +54,25 @@ async fn ask_android_path(
     default_name: Option<&str>,
     operation: &BackupOperation,
 ) -> Option<FilePath> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BackupPickerArgs {
+        default_name: Option<String>,
+    }
+
     #[derive(serde::Deserialize)]
     struct Picked {
         file: Option<FilePath>,
     }
 
     let picker = app.try_state::<AndroidBackupPicker>()?.0.clone();
-    let payload = json!({ "defaultName": default_name });
+    let default_name = default_name.map(str::to_owned);
     let operation = Arc::clone(operation);
     // Keep the slot through the exact native reply even if the command stops awaiting it.
     let picked = tauri::async_runtime::spawn(async move {
         let _operation = operation;
         picker
-            .run_mobile_plugin_async::<Picked>("pickFile", payload)
+            .run_mobile_plugin_async::<Picked>("pickFile", BackupPickerArgs { default_name })
             .await
     })
     .await

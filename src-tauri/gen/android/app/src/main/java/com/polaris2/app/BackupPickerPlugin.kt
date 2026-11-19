@@ -6,12 +6,18 @@ import androidx.activity.result.ActivityResult
 import androidx.activity.result.ActivityResultLauncher
 import androidx.lifecycle.ViewModel
 import app.tauri.annotation.Command
+import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import app.tauri.plugin.PluginManager
 import java.util.UUID
+
+@InvokeArg
+internal class BackupPickerArgs {
+    var defaultName: String? = null
+}
 
 @TauriPlugin
 class BackupPickerPlugin(activity: Activity) : Plugin(activity) {
@@ -22,7 +28,8 @@ class BackupPickerPlugin(activity: Activity) : Plugin(activity) {
             invoke.reject("The backup picker needs an active Polaris window")
             return
         }
-        host.pickBackupFile(invoke.getArgs().getString("defaultName", null), invoke)
+        val args = invoke.parseArgs(BackupPickerArgs::class.java)
+        host.pickBackupFile(args.defaultName, invoke)
     }
 }
 

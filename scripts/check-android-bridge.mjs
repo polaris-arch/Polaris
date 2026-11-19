@@ -27,7 +27,7 @@
  * | A12 | **回包元素**字段面：Kotlin 的 JSObject 工厂（函数名 ⇄ 同名 Rust 结构体，不维护映射表）的 `put(` 键集 ⇄ 该结构体 serde 字段（多发/少必填都红）+ FLOOR ≥ 1 | A10 只看回包顶层。回包里装数组时，元素的键在别处造 —— 改名两侧都编得过、A1/A3/A10 全绿，真机上「那一列整列是空的」 |
  * | A13 | **不经桥的起核**有配置来源：`startKernel` 交给内核的是「桥配置 ?: SystemStart.load(…)」；读的路径两段与 Rust 落盘逐字对拍；准入摘要住 noBackupFilesDir；三个用户断开入口都撤准入；开机接收器先判准入再起服务 | 系统（always-on / 开机 / 重拉）起服务时配置为 null ⇒ 自停；A1–A12 全绿 |
  * | A14 | **系统自动备份**默认关、用户可开：manifest 挂 backupAgent + fullBackupOnly + allowBackup="true"；`onFullBackup` 在开关为关/缺失时不调 super（super 恰好一处且排在闸门后）；开关住 noBackupFilesDir；缺省 = 关；插件读写的是 agent 那一份 | 不写 allowBackup ⇒ 凭据默认随 Google 云备份上传、随换机迁移带走；A1–A13 全绿 |
- * | A11 | **插件身份**三向对拍：Rust `PLUGIN_IDENTIFIER` / `PLUGIN_CLASS` ⇄ Kotlin `@TauriPlugin` 类的 package/类名 ⇄ 该文件路径；外加「常量真的被 `register_android_plugin` / `Builder::new` 用上」「`@Command` 全在插件类文件里」两条 | 改一侧不改另一侧 ⇒ 编译器与 CI 全绿（A1–A10 一条都不红、APK 打得出、verify-apk 六条判据全绿），**只在真机 setup 反射那一刻炸** |
+ * | A11 | **插件身份**三向对拍：Rust 注册 ⇄ Kotlin `@TauriPlugin` 类的 package/类名 ⇄ 该文件路径；起停核与备份选择器的 `@Command` 各归自己的插件 | 改一侧不改另一侧 ⇒ 编译器与 CI 全绿（A1–A10 一条都不红、APK 打得出、verify-apk 六条判据全绿），**只在真机 setup 反射那一刻炸** |
  *
  * 数据面（K5，连接列表 + 流量统计）：
  *
@@ -719,16 +719,16 @@ if (!/Builder::new\s*\(\s*PLUGIN_NAME\s*\)/.test(rustSrcAll)) {
   );
 }
 
-// A11b：Kotlin 侧被反射到的那个类。取材是 `@TauriPlugin` 注解本身（Tauri 的插件入口标记），
-// 不是按 PLUGIN_CLASS 去搜 —— 按名字搜就成了「找得到同名类」，找不到时还分不清是改名还是没了。
+// A11b：从注解收集全部应用插件，只允许起停核与独立的备份选择器。
 const tauriPluginClasses = [];
 for (const file of kotlinFiles) {
   const src = stripComments(readFileSync(file, 'utf8'));
-  if (!/@TauriPlugin\b/.test(src)) continue;
-  const m = /@TauriPlugin(?:\s*\([^)]*\))?\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:(?:public|internal|open|final|abstract)\s+)*class\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(
-    src
-  );
-  if (!m) {
+  const annotationCount = [...src.matchAll(/@TauriPlugin\b/g)].length;
+  if (annotationCount === 0) continue;
+  const classes = [...src.matchAll(
+    /@TauriPlugin\b(?:\s*\([^)]*\))?\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:(?:public|internal|open|final|abstract)\s+)*class\s+([A-Za-z_][A-Za-z0-9_]*)/g
+  )];
+  if (classes.length !== annotationCount) {
     hardFail(
       `A11b：${file.slice(ROOT.length + 1)} 里有 @TauriPlugin 注解，却解析不到它标注的类名 —— 判据塌了。`
     );
@@ -737,16 +737,20 @@ for (const file of kotlinFiles) {
   if (!pkg) {
     hardFail(`A11b：${file.slice(ROOT.length + 1)} 解析不到 \`package\` 声明 —— 判据塌了。`);
   }
-  tauriPluginClasses.push({ file, className: m[1], pkg: pkg[1] });
+  for (const [, className] of classes) {
+    tauriPluginClasses.push({ file, className, pkg: pkg[1] });
+  }
 }
-if (tauriPluginClasses.length !== 1) {
+const backupKtPath = join(KOTLIN_SRC, 'com/polaris2/app/BackupPickerPlugin.kt');
+const backupPlugins = tauriPluginClasses.filter(({ file }) => file === backupKtPath);
+if (tauriPluginClasses.length !== 2 || backupPlugins.length !== 1) {
   hardFail(
-    `A11b FLOOR：Kotlin 树里 @TauriPlugin 标注的类有 ${tauriPluginClasses.length} 个（期望恰好 1）。` +
-      `0 个 = 插件入口没了（真机 register_android_plugin 反射直接失败）；多于 1 个 = 本门无从判断 Rust ` +
-      `那对常量指的是哪一个，得有人来重判。（找到：${tauriPluginClasses.map((c) => `${c.pkg}.${c.className}`).join(', ') || '无'}）`
+    `A11b FLOOR：Kotlin 树应恰有起停核与备份选择器两个 @TauriPlugin 类。` +
+      `（找到：${tauriPluginClasses.map((c) => `${c.pkg}.${c.className}`).join(', ') || '无'}）`
   );
 }
-const pluginKt = tauriPluginClasses[0];
+const [backupKt] = backupPlugins;
+const pluginKt = tauriPluginClasses.find((plugin) => plugin !== backupKt);
 const pluginKtRel = pluginKt.file.slice(KOTLIN_SRC.length + 1).split(sep).join('/');
 
 // A11c：类名 / package / 文件路径三样都必须与 Rust 常量逐字一致。
@@ -771,17 +775,26 @@ if (pluginKtRel !== expectedKtPath) {
       `本仓的既有布局都按它走 —— 路径与 package 漂开之后，下一个人按路径找类会找错文件。`
   );
 }
+const backupRust = stripComments(readFileSync(join(RUST_SRC, 'commands/misc/backup.rs'), 'utf8'));
+if (backupKt.pkg !== 'com.polaris2.app' || backupKt.className !== 'BackupPickerPlugin' ||
+    !/register_android_plugin\s*\(\s*"com\.polaris2\.app"\s*,\s*"BackupPickerPlugin"\s*\)/.test(backupRust) ||
+    !/Builder::new\s*\(\s*"polaris-backup-picker"\s*\)/.test(backupRust) ||
+    !/\.plugin\s*\(\s*commands::misc::android_backup_picker_plugin\(\s*\)\s*\)/.test(rustSrcAll)) {
+  fail('A11 备份选择器的 Kotlin 插件身份与 Rust 注册不一致。');
+}
 
-// A11d：`@Command` 必须全部住在那个被反射到的类的文件里。A1/A3 扫的是整棵 Kotlin 树 ——
-// 把一个 `@Command` 搬到别的类里，A1/A3 照常绿，而 PluginManager 只在插件类上查方法 ⇒
-// 真机 InvalidPluginMethodException。这是把 PLUGIN_CLASS 与命令面绑在一起的那条腿。
-const strayCommands = [...kotlinCommands.entries()].filter(([, kt]) => kt.file !== pluginKt.file);
+// A11d：插件只反射自己的命令。pickFile 归备份插件，其余命令仍由起停核插件持有。
+if (kotlinCommands.get('pickFile')?.file !== backupKtPath) {
+  fail('A11 备份选择器插件缺少所属的 pickFile 命令。');
+}
+const strayCommands = [...kotlinCommands.entries()].filter(([name, kt]) =>
+  kt.file !== (name === 'pickFile' ? backupKtPath : pluginKt.file)
+);
 if (strayCommands.length > 0) {
   fail(
-    `A11 这些 @Command 不在插件类 \`${PLUGIN_CLASS}\` 的文件里：` +
+    'A11 这些 @Command 不在所属的插件类文件里：' +
       strayCommands.map(([name, kt]) => `${name} @ ${kt.file.slice(ROOT.length + 1)}`).join('、') +
-      ` —— PluginManager 只在 ${PLUGIN_IDENTIFIER}.${PLUGIN_CLASS} 上按名字查方法，别处的 @Command ` +
-      `永远调不到（A1/A3 扫整棵树，看不出这个形态）。`
+      ' —— PluginManager 只在所属的类上查方法。'
   );
 }
 
@@ -809,8 +822,7 @@ if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(PLUGIN_NAME)) {
 //
 // # 射程（如实登记）
 //
-// 取材面只有**插件类那个文件**（A11b 认领的那一份）。别处的 `.kt` 里写一个同名工厂不在面内 ——
-// 那与 A10 的射程（`@Command` 方法体）是同一条边界：A11d 已经钉死 `@Command` 必须住在插件类文件里。
+// 取材面只有 A11b 认领的**起停核插件文件**。别处的同名工厂不在面内；A11d 也要求相关命令由起停核插件持有。
 // 本条也只覆盖「工厂函数体里就地 `put(`」的形态；用 `JSObject(jsonString)` 之类拼出来的元素看不见。
 // ════════════════════════════════════════════════════════════════════════════
 
