@@ -165,6 +165,9 @@ jobs:
         run: node scripts/desktop-core/native-dns-gates.mjs verify-formal --platform="$CORE_PLATFORM"
       - name: Collect every mandatory ordinary gate independently
         run: node scripts/desktop-core/native-dns-gates.mjs run --platform="$CORE_PLATFORM"
+      - name: Compare the Rust Cronet proof with the current native receipt
+        if: runner.os == 'Linux' || runner.os == 'Windows'
+        run: node scripts/desktop-core/native-dns-gates.mjs verify-native-cronet --platform="$CORE_PLATFORM"
       - name: Finalize honest runtime summary
         if: always()
         run: node scripts/desktop-core/native-dns-gates.mjs finalize --platform="$CORE_PLATFORM"

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[example]]
+name = "native_cronet_proof"
+test = true
+
 [build-dependencies]
 polaris-helper-proto = { path = "../helper-proto" }
 serde_json.workspace = true
@@ -50,7 +54,10 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+libloading = "0.8.9"
 polaris-source-probe = { version = "1.0.0", path = "../source-probe" }
+same-file = "1.0.6"
+tempfile = "3.27"
 tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "net", "sync", "time", "macros", "io-util", "test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
@@ -58,6 +65,10 @@ nix = { version = "0.31.3", features = ["process"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 find-msvc-tools = "=0.1.9"
+windows-sys = { version = "0.61", features = [
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+] }
 
 [features]
 default = ["formal-selection"]

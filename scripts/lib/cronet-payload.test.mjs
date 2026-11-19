@@ -6,6 +6,41 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CRONET_REQUIRED_EXPORTS, inspectCronetBytes, verifyCronetPayload } from './cronet-payload.mjs';
+import { compareCronetProofs } from '../desktop-core/native-dns-gates.mjs';
+
+test('Cronet migration compares the admitted identity, complete native evidence and signatures', () => {
+  const digest = '1'.repeat(64);
+  const path = 'C:\\payload with spaces\\libcronet.dll';
+  const signature = { status: 'NotSigned', signerThumbprint: null };
+  const proof = {
+    schema: 'polaris-native-payload-proof-v1',
+    transport: { candidate: 'f'.repeat(40), runId: '123', attempt: '1' },
+    input: { platform: 'win', library: { sha256: digest } },
+    signatureBeforeNative: { core: signature, library: signature },
+    signatureAfterNative: { core: signature, library: signature },
+    capi: { schema: 'polaris-cronet-capi-smoke-v1', librarySha256: digest, engineInitialized: true,
+      version: '1.0', symbols: Object.fromEntries(CRONET_REQUIRED_EXPORTS
+        .map((name, index) => [name, { address: `0x${index + 1}`, owner: path }])) },
+    actualCore: { started: true, pid: 12, mappedLibrary: { path, sha256: digest },
+      configurationSha256: '2'.repeat(64), log: 'INFO sing-box started' },
+  };
+  const rust = structuredClone(proof);
+  rust.actualCore.pid = 13;
+  rust.capi.symbols.Cronet_Engine_Create.address = '0x123';
+  rust.signatureAfterNative.core = { signerThumbprint: null, status: 'NotSigned' };
+  compareCronetProofs(rust, proof);
+  for (const [mutate, error] of [
+    [value => value.transport.attempt = '2', /context differs/],
+    [value => delete value.capi.symbols.Cronet_UrlRequest_Start, /C ABI receipt/],
+    [value => value.actualCore.mappedLibrary.sha256 = '3'.repeat(64), /mapping receipt/],
+    [value => value.capi.version = '2.0', /version or observed signature/],
+    [value => value.signatureAfterNative.core = { status: 'Valid', signerThumbprint: 'F' }, /observed signature/],
+  ]) {
+    const changed = structuredClone(rust);
+    mutate(changed);
+    assert.throws(() => compareCronetProofs(changed, proof), error);
+  }
+});
 
 // Inert, structured file fixtures shared by the CLI/SquashFS tests. Never executed.
 export function cronetFixture(platform, options = {}) {
