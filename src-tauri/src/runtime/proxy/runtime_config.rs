@@ -3980,16 +3980,22 @@ impl ProxyRuntime {
                 if live.is_busy() || !self.saved_settings_revert_ready() {
                     return None;
                 }
+                let endpoints = self.saved_revert_endpoint_ids();
                 self.config
                     .try_preview_saved_revert(desired, running, |removed_resources| {
                         let restored = restored_proxy_settings(
                             desired,
                             running,
+                            &endpoints,
                             removed_resources,
                             self.config.dir(),
                         )?;
                         Some(saved_settings_receipt(
-                            generation, desired, running, &restored,
+                            generation,
+                            self.config.saved_revision(),
+                            desired,
+                            running,
+                            &restored,
                         ))
                     })
                     .ok()
@@ -4020,18 +4026,26 @@ impl ProxyRuntime {
                 let Some(running) = self.current_config_snapshot() else {
                     return false;
                 };
+                let endpoints = self.saved_revert_endpoint_ids();
                 let result = self.config.try_update_saved(
                     &running,
                     |desired, removed_resources| {
                         let Some(restored) = restored_proxy_settings(
                             desired,
                             &running,
+                            &endpoints,
                             removed_resources,
                             self.config.dir(),
                         ) else {
                             return Decision::Skip(false);
                         };
-                        if saved_settings_receipt(generation, desired, &running, &restored) != token
+                        if saved_settings_receipt(
+                            generation,
+                            self.config.saved_revision(),
+                            desired,
+                            &running,
+                            &restored,
+                        ) != token
                         {
                             return Decision::Skip(false);
                         }
@@ -4062,6 +4076,24 @@ impl ProxyRuntime {
                 .runtime_config_apply
                 .try_lock()
                 .is_ok_and(|state| state.pending.is_none())
+    }
+
+    fn saved_revert_endpoint_ids(&self) -> BTreeSet<String> {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|snapshot| {
+                let snapshot = snapshot.as_ref()?;
+                Some(
+                    snapshot
+                        .id_to_tag
+                        .iter()
+                        .filter(|(_, tag)| snapshot.endpoint_tags.contains(*tag))
+                        .map(|(id, _)| id.clone())
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn takeover_preview(&self) -> Option<(TakeoverApplyOwner, bool)> {
@@ -4704,9 +4736,93 @@ fn rule_resource_required(config: &UserConfig, id: &str, config_dir: &Path) -> b
         })
 }
 
+fn tailscale_runtime_reverts<'a>(
+    desired: &Value,
+    running: &'a Value,
+    endpoints: &BTreeSet<String>,
+) -> Vec<(usize, &'static str, Option<&'a Value>)> {
+    use crate::runtime::tailscale_login_core::saved_tailscale_identity_epoch;
+
+    let Some(saved_nodes) = desired.get("servers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(running_nodes) = running.get("servers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if endpoints.is_empty() || saved_nodes == running_nodes {
+        return Vec::new();
+    }
+
+    let local_tailscale = |node: &Value| {
+        node.get("protocol").and_then(Value::as_str) == Some("tailscale")
+            && node
+                .get("subscriptionId")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+    };
+    let mut patches = Vec::new();
+    for (index, saved) in saved_nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| local_tailscale(node))
+    {
+        let Some(id) = saved
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| endpoints.contains(*id))
+        else {
+            continue;
+        };
+        let same_id = |node: &&Value| node.get("id").and_then(Value::as_str) == Some(id);
+        let mut matches = running_nodes.iter().filter(same_id);
+        let Some(before) = matches.next().filter(|node| local_tailscale(node)) else {
+            continue;
+        };
+        let on_demand = |node: &Value| {
+            node.get("onDemand")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let revert_demand = on_demand(saved) != on_demand(before);
+        // Prior grants may target an account that a newly saved key will replace.
+        let revert_policy = saved.get("meshInboundPolicy") != before.get("meshInboundPolicy")
+            && [
+                "/tailscaleSettings/authKey",
+                "/tailscaleSettings/retainedAuthKey",
+            ]
+            .iter()
+            .all(|path| saved.pointer(path) == before.pointer(path));
+        if (!revert_demand && !revert_policy)
+            || matches.next().is_some()
+            || saved_nodes.iter().filter(same_id).take(2).count() != 1
+            || [
+                "/tailscaleSettings/controlUrl",
+                "/tailscaleSettings/sourceTag",
+                "/tailscaleSettings/ephemeral",
+            ]
+            .iter()
+            .any(|path| saved.pointer(path) != before.pointer(path))
+            || !matches!(
+                (saved_tailscale_identity_epoch(desired, id), saved_tailscale_identity_epoch(running, id)),
+                (Ok(desired), Ok(running)) if desired == running
+            )
+        {
+            continue;
+        }
+        if revert_demand {
+            patches.push((index, "onDemand", before.get("onDemand")));
+        }
+        if revert_policy {
+            patches.push((index, "meshInboundPolicy", before.get("meshInboundPolicy")));
+        }
+    }
+    patches
+}
+
 fn restored_proxy_settings(
     desired: &Value,
     running: &Value,
+    endpoints: &BTreeSet<String>,
     removed_resources: &[(&str, Option<Value>)],
     config_dir: &Path,
 ) -> Option<Value> {
@@ -4720,12 +4836,20 @@ fn restored_proxy_settings(
         .copied()
         .filter(|key| desired.get(key) != running.get(key))
         .peekable();
-    if !restore_selection && removed_resources.is_empty() && settings.peek().is_none() {
+    let tailscale = tailscale_runtime_reverts(desired, running, endpoints);
+    if !restore_selection
+        && removed_resources.is_empty()
+        && settings.peek().is_none()
+        && tailscale.is_empty()
+    {
         return None;
     }
     let mut candidate = desired.clone();
     if restore_selection {
         super::hot_switch::copy_selection_projection(&mut candidate, running);
+    }
+    for (index, key, value) in tailscale {
+        restore_value(candidate["servers"][index].as_object_mut()?, key, value);
     }
     let output = candidate.as_object_mut()?;
     for key in settings {
@@ -4761,8 +4885,8 @@ fn restored_proxy_settings(
     if candidate == *desired {
         return None;
     }
-    // Servers and subscriptions retain their latest contents. Refuse to undo
-    // policy edits if that would bring back an explicit target since deleted.
+    // Node membership and subscriptions stay current. Refuse to undo policy
+    // edits if that would bring back an explicit target since deleted.
     let restore_policy = REVERTIBLE_POLICIES
         .iter()
         .any(|key| desired.get(key) != candidate.get(key));
@@ -4843,13 +4967,20 @@ fn missing_policy_targets<'a>(
 
 fn saved_settings_receipt(
     generation: u64,
+    saved_revision: u64,
     desired: &Value,
     running: &Value,
     restored: &Value,
 ) -> String {
     use polaris_config_engine::builder::orchestration::stable_stringify;
 
-    let input = stable_stringify(&serde_json::json!([generation, desired, running, restored]));
+    let input = stable_stringify(&serde_json::json!([
+        generation,
+        saved_revision,
+        desired,
+        running,
+        restored
+    ]));
     polaris_updater::sha256_hex(input.as_bytes())
 }
 

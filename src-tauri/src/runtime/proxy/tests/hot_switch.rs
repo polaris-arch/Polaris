@@ -2190,6 +2190,141 @@ async fn revert_saved_proxy_settings_requires_the_current_receipt_and_preserves_
 }
 
 #[tokio::test]
+async fn revert_saved_tailscale_runtime_fields_only_for_the_current_owned_revision() {
+    let (rt, _dir, sink, mut running) = explicit_selection_fixture();
+    running["servers"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "mesh-node", "name": "Mesh", "protocol": "tailscale", "address": "", "port": 0,
+            "tailscaleSettings": {
+                "hostname": "mesh",
+                "retainedAuthKey": {
+                    "authKey": "old-test-key",
+                    "controlAuthority": "https://controlplane.tailscale.com"
+                }
+            }
+        }));
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+
+    let mut saved = running.clone();
+    saved["servers"][2]["onDemand"] = true.into();
+    saved["servers"][2]["meshInboundPolicy"] = serde_json::json!({"mode":"block"});
+    saved["servers"][2]["name"] = "Renamed mesh".into();
+    rt.config.save_full(&saved).unwrap();
+    let saved = rt.config.current().unwrap();
+
+    let pending = rt.pending_changes();
+    assert_eq!(pending.modified, ["mesh-node"]);
+    assert!(
+        pending.saved_settings_revert_token.is_none(),
+        "no emitted endpoint"
+    );
+    {
+        let mut snapshot = rt.switch_snapshot.write().unwrap();
+        let snapshot = snapshot.as_mut().unwrap();
+        snapshot.id_to_tag.insert("mesh-node".into(), "Mesh".into());
+        snapshot.endpoint_tags.insert("Mesh".into());
+    }
+    let mut different_login = saved.clone();
+    different_login["servers"][2]["tailscaleSettings"]["controlUrl"] =
+        "https://new-control.example".into();
+    rt.config.save_full(&different_login).unwrap();
+    assert!(rt.pending_changes().saved_settings_revert_token.is_none());
+    rt.config.save_full(&saved).unwrap();
+
+    let stale = rt.pending_changes().saved_settings_revert_token.unwrap();
+    let mut interim = saved.clone();
+    interim["servers"][2]["onDemand"] = false.into();
+    rt.config.save_full(&interim).unwrap();
+    rt.config.save_full(&saved).unwrap();
+    assert_eq!(rt.config.current().unwrap(), saved);
+    assert!(!rt.revert_saved_proxy_settings(&stale, |_| {}).await);
+
+    let current = rt.pending_changes().saved_settings_revert_token.unwrap();
+    assert!(rt.revert_saved_proxy_settings(&current, |_| {}).await);
+    let mut expected = saved;
+    let node = expected["servers"][2].as_object_mut().unwrap();
+    node.remove("onDemand");
+    node.remove("meshInboundPolicy");
+    assert_eq!(rt.config.current().unwrap(), expected);
+    assert!(rt.pending_changes().saved_settings_revert_token.is_none());
+
+    expected["servers"][2]["onDemand"] = true.into();
+    expected["servers"][2]["meshInboundPolicy"] = serde_json::json!({"mode":"block"});
+    expected["servers"][2]["tailscaleSettings"]["authKey"] = "new-test-key".into();
+    rt.config.save_full(&expected).unwrap();
+    let mut expected = rt.config.current().unwrap();
+    assert_eq!(
+        expected["servers"][2]["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "new-test-key"
+    );
+    let current = rt.pending_changes().saved_settings_revert_token.unwrap();
+    assert!(rt.revert_saved_proxy_settings(&current, |_| {}).await);
+    expected["servers"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("onDemand");
+    assert_eq!(rt.config.current().unwrap(), expected);
+    assert_eq!(rt.current_config_snapshot(), Some(running));
+    assert!(rt.pending_changes().saved_settings_revert_token.is_none());
+    assert!(sink.calls().is_empty());
+}
+
+#[tokio::test]
+async fn revert_saved_tailscale_default_has_no_debt_and_an_addition_has_no_undo() {
+    let (rt, _dir, _, mut running) = explicit_selection_fixture();
+    running["servers"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "mesh-node", "name": "Mesh", "protocol": "tailscale", "address": "", "port": 0,
+            "tailscaleSettings": {"hostname": "mesh"}
+        }));
+    rt.config.save_full(&running).unwrap();
+    let running = rt.config.current().unwrap();
+    mark_running_with_snapshot(&rt, &running);
+    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
+    {
+        let mut snapshot = rt.switch_snapshot.write().unwrap();
+        let snapshot = snapshot.as_mut().unwrap();
+        snapshot.id_to_tag.insert("mesh-node".into(), "Mesh".into());
+        snapshot.endpoint_tags.insert("Mesh".into());
+    }
+
+    let mut saved = running;
+    saved["servers"][2]["onDemand"] = false.into();
+    rt.config.save_full(&saved).unwrap();
+    let pending = rt.pending_changes();
+    assert!(!pending.pending_apply);
+    assert!(pending.saved_settings_revert_token.is_none());
+
+    saved["servers"][2]["onDemand"] = true.into();
+    rt.config.save_full(&saved).unwrap();
+    let pending = rt.pending_changes();
+    assert_eq!(pending.modified, ["mesh-node"]);
+    assert!(
+        rt.revert_saved_proxy_settings(&pending.saved_settings_revert_token.unwrap(), |_| {})
+            .await
+    );
+    assert!(!rt.pending_changes().pending_apply);
+
+    let mut saved = rt.config.current().unwrap();
+    let mut added = saved["servers"][2].clone();
+    added["id"] = "new-mesh".into();
+    added["name"] = "New Mesh".into();
+    saved["servers"].as_array_mut().unwrap().push(added);
+    rt.config.save_full(&saved).unwrap();
+    let pending = rt.pending_changes();
+    assert_eq!(pending.added, ["new-mesh"]);
+    assert!(pending.pending_apply);
+    assert!(pending.saved_settings_revert_token.is_none());
+}
+
+#[tokio::test]
 async fn revert_saved_proxy_settings_restores_pending_settings_against_latest_runtime() {
     let (rt, _dir, sink, mut running) = explicit_selection_fixture();
     running["configSchemaVersion"] = 4.into();

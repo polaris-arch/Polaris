@@ -24,8 +24,8 @@
 //! 为什么成立（逐字段核过，非假设）：5 维读的是 `protocol` / `address` / `port` / `network`
 //! 与 `cred`（= `uuid` → `password` → `shadowsocksSettings.password` → `username` →
 //! `sshSettings.password` → `wireguardSettings.peerPublicKey` 的首个非空值）。全维投影 =
-//! `ServerConfig` 整份序列化**仅剔** `updatedAt` / `createdAt` / `providerName` —— 这 3 个键
-//! 与上述任何一个 5 维输入都不重合，且那些字段全部无 `#[serde(skip)]`
+//! `ServerConfig` 整份序列化，剔除 `updatedAt` / `createdAt` / `providerName`，归一 Tailscale 的
+//! 默认按需连接值。五维输入不读这些字段，且五个输入均无 `#[serde(skip)]`
 //! （`crates/config-engine/src/user_config/server_config.rs` 逐字段核过）。
 //! ⇒ 全维投影**逐字保留**了 5 维的全部输入 ⇒ 全维相等 ⇒ 5 维的每个输入都相等 ⇒ 5 维相等。
 //! 取逆否即 `5 维不等 ⇒ 全维不等`，也就是 `dirty ⊆ modified`。

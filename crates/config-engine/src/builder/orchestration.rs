@@ -61,6 +61,13 @@ pub fn server_fingerprint(server: &crate::user_config::server_config::ServerConf
         obj.remove("updatedAt");
         obj.remove("createdAt");
         obj.remove("providerName");
+        // Tailscale's Core option defaults to false and omits false in its
+        // canonical graph. Saving the default should not create runtime debt.
+        if server.protocol == crate::user_config::server_config::Protocol::Tailscale
+            && server.on_demand == Some(false)
+        {
+            obj.remove("onDemand");
+        }
     }
     stable_stringify(&value)
 }
