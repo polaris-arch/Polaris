@@ -22,6 +22,8 @@ import {
   REQUIRED_ELF_SECTIONS,
   SRS_DIR,
   ZIP,
+  aapt2Path,
+  apkPermissions,
   apkViolations,
   countOccurrences,
   elfSectionNames,
@@ -1173,6 +1175,79 @@ const AAPT2_DUMP = [
   "uses-permission: name='com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'",
   '',
 ].join('\n');
+
+test('NA05 acquisition uses both AAPT2 commands and checks the compiled signature value', () => {
+  const uri = 'http://schemas.android.com/apk/res/android';
+  const name = APK_DECLARED_PERMISSIONS[0].name;
+  const xml = (level = '0x00000002', extra = '') => `N: android=${uri} (line=1)
+  E: manifest (line=1)
+      E: permission (line=2)
+        A: ${uri}:name(0x01010003)="${name}" (Raw: "${name}")
+        A: ${uri}:protectionLevel(0x01010009)=${level}
+${extra}      E: application (line=3)`;
+
+  function acquire(text) {
+    const calls = [];
+    const result = apkPermissions('fixture.apk', {
+      bin: 'aapt2-interface',
+      run(_bin, args) {
+        calls.push(args);
+        return Buffer.from(args[1] === 'permissions' ? AAPT2_DUMP : text);
+      },
+    });
+    assert.deepEqual(calls, [
+      ['dump', 'permissions', 'fixture.apk'],
+      ['dump', 'xmltree', '--file', 'AndroidManifest.xml', 'fixture.apk'],
+    ]);
+    return result;
+  }
+
+  for (const value of ['0x00000002', '2', '0x00000002 (Raw: "signature")']) {
+    assert.deepEqual(permissionViolations(acquire(xml(value))), []);
+  }
+  for (const value of ['0', '1', '0x00000012', '0x100000002', '4294967298', '-1',
+    '2.0', '@0x01010002', 'true', '"signature"', '(type 0x11)0x2', '2 junk']) {
+    assert.ok(permissionViolations(acquire(xml(value))).length > 0, value);
+  }
+  assert.ok(permissionViolations(acquire(xml().replace(/.*:protectionLevel.*\n/, ''))).length > 0);
+  assert.ok(permissionViolations(acquire(xml('2', `        A: ${uri}:protectionLevel(0x01010009)=2\n`))).length > 0);
+  assert.ok(permissionViolations(acquire(xml().replace('(0x01010009)', '(0x01010003)'))).length > 0);
+});
+
+test('NA05 real SDK AAPT2 reads original compiled manifest and permission-only byte mutations', (t) => {
+  const bin = aapt2Path();
+  assert.ok(bin, 'Real acquisition requires Android SDK AAPT2; no skipped pass');
+  const version = spawnSync(bin, ['version'], { encoding: 'utf8' });
+  assert.ifError(version.error);
+  assert.equal(version.status, 0, version.stderr);
+  const versionText = version.stdout.trim() || version.stderr.trim();
+  assert.ok(versionText, 'AAPT2 must identify the SDK tool used for acquisition');
+  t.diagnostic(`AAPT2 version: ${versionText}`);
+
+  const dir = new URL('./fixtures/aapt2/', import.meta.url);
+  const meta = JSON.parse(readFileSync(new URL('provenance.json', dir)));
+  const raw = Buffer.from(readFileSync(new URL('sfa-46eb-AndroidManifest.axml.base64', dir), 'utf8').trim(), 'base64');
+  assert.equal(createHash('sha256').update(raw).digest('hex'), meta.manifestSha256);
+  const declaration = meta.permissions[0];
+  const level = declaration.find((attribute) => attribute.name === 'protectionLevel');
+  const originalName = declaration.find((attribute) => attribute.name === 'name').string;
+  assert.equal(raw[level.dataOffset - 1], 0x11);
+  assert.equal(raw.readUInt32LE(level.dataOffset), 2);
+
+  using fixture = mkdtempDisposableSync(join(tmpdir(), 'aapt2-acquisition-'));
+  const apk = join(fixture.path, 'manifest-only.apk');
+  for (const value of [2, 0, 1, 0x12]) {
+    const bytes = Buffer.from(raw);
+    bytes.writeUInt32LE(value, level.dataOffset);
+    writeFileSync(apk, fixtureZip([{ name: 'AndroidManifest.xml', data: bytes }]));
+    const result = apkPermissions(apk, { bin });
+    assert.ok(result);
+    assert.equal(result.packageName, meta.packageName);
+    assert.equal(result.declaredProtectionLevels[originalName], value);
+    assert.deepEqual(result.declared, [originalName]);
+    assert.ok(permissionViolations(result).some((violation) => violation.includes('applicationId')));
+  }
+});
 
 test('反向对照：真 aapt2 输出解析出 11 条请求 + 1 条声明，且判据全绿', () => {
   const parsed = parseAapt2Permissions(AAPT2_DUMP);
