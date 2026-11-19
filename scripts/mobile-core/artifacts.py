@@ -399,15 +399,12 @@ def tree_inventory(root, *, pinned=None, observations=None, metadata_only=False)
     return sorted(rows, key=lambda row: row['path'])
 
 
-def framework_entry_targets(entry):
-    require(entry.get('SupportedPlatform') == 'ios' and
-            entry.get('SupportedPlatformVariant') in (None, 'simulator'), 'framework must contain only device/simulator iOS')
-    architectures = entry.get('SupportedArchitectures')
-    expected = ['arm64']
-    require(isinstance(architectures, list) and all(isinstance(arch, str) for arch in architectures) and
-            len(architectures) == len(expected) and set(architectures) == set(expected),
-            'framework declared architecture inventory differs')
-    return ({'ios-arm64-simulator'} if entry.get('SupportedPlatformVariant') == 'simulator' else {'ios-arm64'})
+def _inspect_apple_sdk(mode, observation, run, scratch):
+    with tempfile.TemporaryDirectory(prefix='apple-sdk-', dir=scratch) as folder:
+        report = Path(folder) / 'observation'
+        report.write_bytes(observation)
+        return json.loads(run(['node', ROOT / 'scripts/mobile-core/apple-admission.mjs',
+                               mode, report.resolve(), len(observation), sha(observation)]))
 
 
 def inspect_framework(framework, value, graph, expected_id, *, run, scratch):
@@ -428,19 +425,15 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
     pinned = {}
     raw_info, info_pin = read_pinned(framework / 'Info.plist', observations=reads)
     pinned[(framework / 'Info.plist').resolve(strict=True)] = info_pin
-    info = plistlib.loads(raw_info)
-    libraries, observed = info['AvailableLibraries'], {}
-    require(isinstance(libraries, list) and len(libraries) == 2 and
-            len({r['LibraryIdentifier'] for r in libraries}) == len(libraries), 'framework device/simulator library inventory differs')
-    require({r.get('SupportedPlatformVariant') for r in libraries} == {None, 'simulator'},
-            'framework must contain one device and one simulator library')
-    for entry in libraries:
-        expected_targets = framework_entry_targets(entry)
-        entry_targets = set()
-        identifier, path = entry['LibraryIdentifier'], entry['LibraryPath']
-        require(PurePosixPath(identifier).name == identifier and PurePosixPath(path).name == path and
-                entry['SupportedPlatform'] == 'ios' and entry.get('SupportedPlatformVariant') in (None, 'simulator'),
-                'framework must contain only device/simulator iOS')
+    libraries = plistlib.loads(raw_info)['AvailableLibraries']
+    if isinstance(libraries, list):
+        fields = ('LibraryIdentifier', 'LibraryPath', 'SupportedPlatform', 'SupportedPlatformVariant', 'SupportedArchitectures')
+        libraries = [{key: entry.get(key) for key in fields} if isinstance(entry, dict) else None for entry in libraries]
+    declared = _inspect_apple_sdk('--sdk-framework-libraries', b''.join(_receipt_chunks(libraries, MAX_RECEIPT)), run, scratch)
+    observed = {}
+    for entry in declared:
+        identifier, path, target = entry['identifier'], entry['path'], entry['target']
+        spec = APPLE[target]
         lib = framework / identifier / path
         require(lib.is_dir() and lib.suffix == '.framework', 'expected a framework component')
         # The pinned generator writes an empty Resources/Info.plist and a
@@ -461,9 +454,9 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
             count = struct.unpack_from('>I', raw, 4)[0] if len(raw) >= 8 and raw.startswith(carrier.FAT) else None
             raise RuntimeError('actual framework input refused: path=' + str(binary) +
                 '; header=' + raw[:16].hex() + '; fatCount=' + str(count) +
-                '; declaredArchitectures=' + repr(entry['SupportedArchitectures']) + '; ' + str(error)) from error
+                '; declaredArchitectures=' + repr(entry['architectures']) + '; ' + str(error)) from error
         slices = parsed['slices'] if parsed['kind'] == 'fat-ar' else [{'ordinal': 0, 'archive': parsed}]
-        require(len(slices) == len(expected_targets) and all(s['archive']['kind'] == 'bsd-ar' for s in slices),
+        require(len(slices) == 1 and slices[0]['archive']['kind'] == 'bsd-ar',
                 'Libbox static slice inventory differs from framework declaration')
         headers = {}
         for header_path in (lib / 'Headers').glob('*.h'):
@@ -476,20 +469,12 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
         # Keep the exact text observed from the pinned framework files, in
         # their original order and normalized as in the receipt.
         header = '\n'.join(headers.values()).encode()
-        with tempfile.TemporaryDirectory(prefix='apple-sdk-headers-', dir=scratch) as folder:
-            report = Path(folder) / 'header.h'
-            report.write_bytes(header)
-            contracts = json.loads(run(['node', ROOT / 'scripts/mobile-core/apple-admission.mjs',
-                                        '--sdk-header-contract', report.resolve(), len(header), sha(header)]))
+        contracts = _inspect_apple_sdk('--sdk-header-contract', header, run, scratch)
         for slice_row in slices:
             members = [m for m in slice_row['archive']['members'] if m['classification'] == 'code']
             require(members, 'static archive has no code')
             cpu = members[0]['machO']['cpu']
-            target = next((key for key, spec in APPLE.items() if spec[0] == cpu and spec[3] == entry.get('SupportedPlatformVariant')), None)
-            require(target in expected_targets and target not in entry_targets and target not in observed,
-                    'unknown/duplicate Apple architecture slice')
-            entry_targets.add(target)
-            spec = APPLE[target]
+            require(cpu == spec[0] and target not in observed, 'unknown/duplicate Apple architecture slice')
             require(all(m['machO']['cpu'] == cpu for m in members), 'mixed archive CPU')
             infos, ids = [], []
             for member in members:
@@ -518,7 +503,6 @@ def _inspect_framework(framework, value, graph, expected_id, reads, run, scratch
                                  if command['command'] == 0x2d],
                 'members': [{**{k: v for k, v in m.items() if k != 'machO'},
                              'goCarrier': any('buildInfo' in s for s in m['machO']['sections'])} for m in members]}
-        require(entry_targets == expected_targets, 'actual framework target inventory differs')
     require(set(observed) == set(APPLE), 'formal Apple inventory must contain exactly two arm64 platform slices')
     inventory = tree_inventory(framework, pinned=pinned, observations=reads)
     require([{k: v for k, v in row.items() if k not in ('bytes', 'sha256')} for row in inventory] == layout,

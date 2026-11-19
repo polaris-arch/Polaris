@@ -129,6 +129,62 @@ test('Apple SDK validation result requires exact immutable getters on its own re
   ]) assert.throws(() => inspect(changed), /generated Objective-C/);
 });
 
+test('Apple SDK plist inventory binds separate device and simulator declarations to one arm64 slice each', () => {
+  const root = mkdtempSync(join(tmpdir(), 'apple-framework-libraries-'));
+  try {
+    const script = fileURLToPath(new URL('./mobile-core/apple-admission.mjs', import.meta.url));
+    const report = join(root, 'libraries.json');
+    const device = { LibraryIdentifier: 'device', LibraryPath: 'Libbox.framework', SupportedPlatform: 'ios',
+      SupportedArchitectures: ['arm64'] };
+    const sim = { ...device, LibraryIdentifier: 'simulator', SupportedPlatformVariant: 'simulator' };
+    const projected = [
+      { identifier: 'device', path: 'Libbox.framework', architectures: ['arm64'], target: 'ios-arm64' },
+      { identifier: 'simulator', path: 'Libbox.framework', architectures: ['arm64'], target: 'ios-arm64-simulator' },
+    ];
+    const verify = (rows, pinnedRows = rows) => {
+      const bytes = Buffer.from(JSON.stringify(pinnedRows));
+      writeFileSync(report, JSON.stringify(rows));
+      return spawnSync(process.execPath, [script, '--sdk-framework-libraries', report, bytes.length,
+        createHash('sha256').update(bytes).digest('hex')], { encoding: 'utf8' });
+    };
+    for (const [rows, expected] of [
+      [[device, sim], projected],
+      [[sim, { ...device, SupportedPlatformVariant: null }], [...projected].reverse()],
+    ]) {
+      const result = verify(rows);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), expected);
+    }
+    const invalid = [
+      [null, /device\/simulator library inventory/],
+      [[device], /device\/simulator library inventory/],
+      [[device, sim, sim], /device\/simulator library inventory/],
+      [[device, { ...sim, LibraryIdentifier: 'device' }], /device\/simulator library inventory/],
+      [[device, { ...sim, SupportedPlatformVariant: null }], /one device and one simulator/],
+      [[device, { ...sim, SupportedPlatformVariant: 'maccatalyst' }], /one device and one simulator/],
+      [[{ ...device, SupportedPlatform: 'macos' }, sim], /only device\/simulator iOS/],
+      [[{ ...device, LibraryIdentifier: '/device' }, sim], /only device\/simulator iOS/],
+      [[device, { ...sim, LibraryPath: '../Libbox.framework' }], /only device\/simulator iOS/],
+      [[device, { ...sim, LibraryPath: 'Libbox.framework/' }], /only device\/simulator iOS/],
+      ...[[], ['arm64', 'x86_64']].map(architectures =>
+        [[{ ...device, SupportedArchitectures: architectures }, sim], /declared architecture inventory/]),
+      ...[['arm64', 'x86_64'], ['x86_64'], ['arm64', 'arm64'], ['arm64', 'x86_64', 'armv7']].map(architectures =>
+        [[device, { ...sim, SupportedArchitectures: architectures }], /declared architecture inventory/]),
+    ];
+    for (const [rows, reason] of invalid) {
+      const refused = verify(rows);
+      assert.equal(refused.status, 1, refused.stderr);
+      assert.match(refused.stderr, reason);
+      assert.equal(refused.stdout, '');
+    }
+    const tampered = verify([device, { ...sim, LibraryIdentifier: 'simulatof' }], [device, sim]);
+    assert.equal(tampered.status, 1);
+    assert.match(tampered.stderr, /Apple SDK library inventory pin differs/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('Apple SDK header command admits exact original observations and fails closed on mutations', () => {
   const root = mkdtempSync(join(tmpdir(), 'apple-sdk-bindings-'));
   try {

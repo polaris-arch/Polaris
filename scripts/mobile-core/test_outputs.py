@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import component_output_identity, framework_entry_targets, module, module_stream, tree_inventory, zip_entries
+from artifacts import component_output_identity, module, module_stream, tree_inventory, zip_entries
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
 from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
@@ -567,21 +567,6 @@ class FormalOutputs(unittest.TestCase):
                 self.assertFalse(output.exists())
                 self.assertFalse(environment.exists())
                 self.assertFalse((root / 'tools.json').exists())
-
-    def test_framework_declares_exact_device_and_simulator_architectures(self):
-        device = {'SupportedPlatform': 'ios', 'SupportedArchitectures': ['arm64']}
-        simulator = {**device, 'SupportedPlatformVariant': 'simulator'}
-        self.assertEqual(framework_entry_targets(device), {'ios-arm64'})
-        self.assertEqual(framework_entry_targets(simulator), {'ios-arm64-simulator'})
-        for bad in [{**device, 'SupportedArchitectures': []}, {**device, 'SupportedArchitectures': ['arm64', 'x86_64']},
-                    {**simulator, 'SupportedArchitectures': ['arm64', 'x86_64']},
-                    {**simulator, 'SupportedArchitectures': ['x86_64']},
-                    {**simulator, 'SupportedArchitectures': ['arm64', 'arm64']},
-                    {**simulator, 'SupportedArchitectures': ['arm64', 'x86_64', 'armv7']},
-                    {**device, 'SupportedPlatform': 'macos'},
-                    {**simulator, 'SupportedPlatformVariant': 'maccatalyst'}]:
-            with self.subTest(entry=bad), self.assertRaises(RuntimeError):
-                framework_entry_targets(bad)
 
     def test_llvm_symlink_drivers_keep_invocation_name_and_bind_actual_physical_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:

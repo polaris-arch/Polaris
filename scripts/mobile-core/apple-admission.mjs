@@ -5,7 +5,7 @@ import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFi
 import { loadavg } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { characters, decode, pinned, readBoundedInput, ReceiptFloat, receiptLimit, receiptPolicy } from './source-admission.mjs';
@@ -688,6 +688,23 @@ function tlsCapabilityPresent(headers, defined) {
   return defined;
 }
 
+function sdkFrameworkLibraries(libraries) {
+  requireSetting(Array.isArray(libraries) && libraries.length === 2 && libraries.every(isObject)
+    && new Set(libraries.map(row => row.LibraryIdentifier)).size === 2, 'framework device/simulator library inventory differs');
+  const variants = new Set(libraries.map(row => row.SupportedPlatformVariant ?? null));
+  requireSetting(variants.has(null) && variants.has('simulator'), 'framework must contain one device and one simulator library');
+  const leaf = name => typeof name === 'string' && name !== '.' && posix.basename(name) === name;
+  return libraries.map(row => {
+    requireSetting(row.SupportedPlatform === 'ios' && leaf(row.LibraryIdentifier) && leaf(row.LibraryPath),
+      'framework must contain only device/simulator iOS');
+    const architectures = row.SupportedArchitectures;
+    requireSetting(Array.isArray(architectures) && architectures.length === 1 && architectures[0] === 'arm64',
+      'framework declared architecture inventory differs');
+    return { identifier: row.LibraryIdentifier, path: row.LibraryPath, architectures,
+      target: row.SupportedPlatformVariant === 'simulator' ? 'ios-arm64-simulator' : 'ios-arm64' };
+  });
+}
+
 function matchesPin(expected, actual) {
   return isObject(expected) && Object.keys(expected).length === 2
     && expected.bytes === actual.bytes && expected.sha256 === actual.sha256;
@@ -811,11 +828,16 @@ if (entry && basename(entry) === 'apple-admission.mjs' && realpathSync(entry) ==
     if (mode === '--tls-link') {
       const result = tlsCompilerResponse(action, process.env);
       if (result !== undefined) console.log(JSON.stringify(result));
-    } else if (mode === '--sdk-header-contract') {
-      requireSetting(isAbsolute(action ?? '') && extra.length === 2, 'pinned Apple SDK header observation required');
-      const { bytes, pin } = pinned(action, limits.artifactBytes);
-      requireSetting(matchesPin({ bytes: Number(extra[0]), sha256: extra[1] }, pin), 'Apple SDK header observation pin differs');
-      console.log(JSON.stringify(sdkHeaderContracts(headerDecoder.decode(bytes))));
+    } else if (mode === '--sdk-header-contract' || mode === '--sdk-framework-libraries') {
+      const header = mode === '--sdk-header-contract';
+      const subject = header ? 'Apple SDK header observation' : 'Apple SDK library inventory';
+      requireSetting(isAbsolute(action ?? '') && extra.length === 2, 'pinned ' + subject + ' required');
+      const maximum = header ? limits.artifactBytes : limits.controlBytes;
+      const { bytes, pin } = pinned(action, maximum);
+      requireSetting(matchesPin({ bytes: Number(extra[0]), sha256: extra[1] }, pin), subject + ' pin differs');
+      const result = header ? sdkHeaderContracts(headerDecoder.decode(bytes))
+        : sdkFrameworkLibraries(decode(bytes, maximum, () => maximum));
+      console.log(JSON.stringify(result));
     } else {
       requireSetting(mode === '--build-settings' && isAbsolute(action ?? '') && extra.length === 0,
         'Apple build-settings requires one absolute output directory');
