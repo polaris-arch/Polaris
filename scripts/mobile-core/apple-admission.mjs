@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { constants, lstatSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { pinned, readBoundedInput } from './source-admission.mjs';
 
 const SDKS = new Map([['device-arm64', 'iphoneos'], ['sim-arm64', 'iphonesimulator']]);
 const APP = 'polaris_iOS';
@@ -140,8 +143,171 @@ export function inspectAppleArchitecture(raw, { slot, query, minimum, scheme }) 
   }
 }
 
+const NATIVE_TUN_ARGS = 'PolarisNativeTunCompiler.args';
+const NATIVE_TUN_CONTRACT = 'polaris-native-tun-v1';
+const NATIVE_TUN_DEFINE = Buffer.from('-D\nPOLARIS_NATIVE_TUN_V1\n');
+const HEADER_BYTES = 2 * 1024 ** 2;
+const ARG_BYTES = 128;
+
+// Match the Python parser's whitespace, word boundaries, and LF-only multiline anchors.
+const TUN_SPACE = '\\u0009-\\u000d\\u001c-\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000';
+const TUN_WS = `[${TUN_SPACE}]`;
+const TUN_WORD = '[\\p{L}\\p{N}_]';
+const TUN_WORD_END = `(?!${TUN_WORD})`;
+const TUN_LINE_START = '(?:^|(?<=\\n))';
+const TUN_TRIM = new RegExp(`^${TUN_WS}+|${TUN_WS}+$`, 'g');
+const TUN_NAMES = new RegExp(`(?<!${TUN_WORD})(?:LibboxRuntimeTun(?:Platform|Session|Receipt)|setRuntimeTunPlatform|newTunSession)${TUN_WORD_END}`, 'u');
+const trimTunSpace = text => text.replace(TUN_TRIM, '');
+
+// Exact selectors from the pinned sagernet/gomobile v0.1.13 generator.
+const TUN_PLATFORM = {
+  runtimeTunVersion: '- (int32_t)runtimeTunVersion;',
+  newTunSession: '- (id<LibboxRuntimeTunSession> _Nullable)newTunSession:'
+    + '(id<LibboxTunOptions> _Nullable)options previous:'
+    + '(id<LibboxRuntimeTunSession> _Nullable)previous receipt:'
+    + '(LibboxRuntimeTunReceipt* _Nullable)receipt error:'
+    + '(NSError* _Nullable* _Nullable)error;',
+};
+const OWNER_ID = '- (NSString* _Nonnull)ownerID;';
+const TUN_SESSION = {
+  ownerID: OWNER_ID,
+  fileDescriptor: '- (int32_t)fileDescriptor;',
+  ...Object.fromEntries(['prepare', 'validate', 'abort', 'retire'].map(name =>
+    [name, '- (BOOL)' + name + ':(NSError* _Nullable* _Nullable)error;'])),
+};
+
+function tunDeclaration(text, kind, name, protocols) {
+  const bodies = [];
+  const declaration = new RegExp(`@${kind}${TUN_WS}+${name}${TUN_WORD_END}([^\\n]*)`, 'gu');
+  for (const match of text.matchAll(declaration)) {
+    const tail = trimTunSpace(match[1]);
+    if (tail.startsWith(';')) continue; // A forward declaration supplies no methods.
+    const remainder = text.slice(match.index + match[0].length);
+    const end = remainder.search(new RegExp(`@end${TUN_WORD_END}`, 'u'));
+    requireSetting(end >= 0, 'native TUN declaration is unterminated: ' + name);
+    const body = remainder.slice(0, end);
+    requireSetting(!new RegExp(`@(?:protocol|interface)${TUN_WORD_END}`, 'u').test(body),
+      'native TUN declaration overlaps another block: ' + name);
+    if (kind === 'protocol') {
+      requireSetting(new RegExp(`^<${TUN_WS}*NSObject${TUN_WS}*>$`).test(tail),
+        'native TUN protocol inheritance differs: ' + name);
+    } else {
+      const inheritance = new RegExp(`^:${TUN_WS}*NSObject${TUN_WS}*<([^>]+)>${TUN_WS}*\\{?$`).exec(tail);
+      requireSetting(inheritance, 'native TUN class inheritance differs: ' + name);
+      const actual = inheritance[1].split(',').map(trimTunSpace);
+      requireSetting(new Set(actual).size === actual.length && protocols.every(item => actual.includes(item)),
+        'native TUN class protocol identity differs: ' + name);
+    }
+    bodies.push(body);
+  }
+  requireSetting(bodies.length === 1, 'native TUN declaration missing or duplicated: ' + name);
+  return bodies[0];
+}
+
+function tunMethods(body, expected) {
+  const declarations = body.match(new RegExp(`[-+]${TUN_WS}*\\([^;]*?;`, 'g')) ?? [];
+  const token = new RegExp(`@?[A-Za-z_]${TUN_WORD}*|[^${TUN_SPACE}]`, 'gu');
+  const tokens = value => value.match(token).join(' ');
+  for (const [name, declaration] of Object.entries(expected)) {
+    const selector = new RegExp(`^[-+]${TUN_WS}*\\([^)]*\\)${TUN_WS}*${name}${TUN_WORD_END}`, 'u');
+    const candidates = declarations.filter(part => selector.test(part));
+    requireSetting(candidates.length === 1 && tokens(candidates[0]) === tokens(declaration),
+      'native TUN selector/return ABI differs: ' + name);
+  }
+}
+
+function nativeTunABI(headers) {
+  const texts = headers.map(text => text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, ' '));
+  const relevant = texts.filter(text => TUN_NAMES.test(text));
+  if (relevant.length === 0) return false;
+  const conditional = new RegExp(`${TUN_LINE_START}${TUN_WS}*#${TUN_WS}*(if|ifdef|ifndef|elif|else|endif)${TUN_WORD_END}([^\\n]*)`, 'gu');
+  for (const text of relevant) {
+    const conditions = [...text.matchAll(conditional)];
+    if (!conditions.length) continue;
+    const guard = trimTunSpace(conditions[0][2]);
+    // Only the generated include guard may condition these declarations.
+    requireSetting(conditions.length === 2 && conditions[0][1] === 'ifndef' && /^__[A-Za-z0-9_]+_H__$/.test(guard)
+      && conditions[1][1] === 'endif' && !trimTunSpace(conditions[1][2])
+      && new RegExp(`${TUN_LINE_START}${TUN_WS}*#${TUN_WS}*define${TUN_WS}+${guard}${TUN_WS}*(?=\\n|$)`).test(text),
+    'native TUN declarations use unsupported preprocessor conditions');
+  }
+  const text = texts.map(part => part.replaceAll('\\\n', '').replace(/(?:^|(?<=\n))[ \t]*#[^\n]*/g, '')).join('\n');
+  for (const [name, methods] of [['LibboxRuntimeTunPlatform', TUN_PLATFORM], ['LibboxRuntimeTunSession', TUN_SESSION]]) {
+    tunMethods(tunDeclaration(text, 'protocol', name), methods);
+    tunMethods(tunDeclaration(text, 'interface', name, ['goSeqRefInterface', name]), methods);
+  }
+  tunMethods(tunDeclaration(text, 'interface', 'LibboxRuntimeTunReceipt', ['goSeqRefInterface']),
+    { ownerID: OWNER_ID, published: '- (BOOL)published;' });
+  tunMethods(tunDeclaration(text, 'interface', 'LibboxCommandServer', ['goSeqRefInterface']),
+    { setRuntimeTunPlatform: '- (BOOL)setRuntimeTunPlatform:'
+      + '(id<LibboxRuntimeTunPlatform> _Nullable)platform error:(NSError* _Nullable* _Nullable)error;' });
+  return true;
+}
+
+function writeCompilerArgs(path, bytes) {
+  const info = lstatSync(path, { throwIfNoEntry: false });
+  requireSetting(!info || info.isFile(), 'TLS/native compiler output redirected or is nonregular');
+  const flag = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+  writeFileSync(path, bytes, { flag });
+}
+
+function readCompilerArgs(path) {
+  return pinned(path, ARG_BYTES, false, { allowEmpty: true });
+}
+
+// Receive the exact selected header contents already pinned by the caller.
+// Own only the native response file; the caller retains TLS and Xcode custody.
+export function nativeTunCompilerResponse(action, { headers, prepared, derived, receipt }) {
+  requireSetting(['prepare', 'verify-parent', 'install', 'verify-installed'].includes(action)
+    && typeof prepared === 'string' && prepared.length > 0, 'closed native TUN compiler action required');
+  requireSetting(Array.isArray(headers) && headers.length > 0 && headers.length <= 64
+    && headers.every(text => typeof text === 'string' && text.isWellFormed())
+    && headers.reduce((total, text) => total + Buffer.byteLength(text), 0) <= HEADER_BYTES,
+  'libbox generated header inventory exceeds budget');
+  const present = nativeTunABI(headers);
+  const args = present ? NATIVE_TUN_DEFINE : Buffer.alloc(0);
+  const compilerArgs = pin(args);
+  const result = { contractVersion: NATIVE_TUN_CONTRACT, present, compilerArgs };
+  const original = join(prepared, NATIVE_TUN_ARGS);
+  if (action === 'prepare') {
+    writeCompilerArgs(original, args);
+    requireSetting(readCompilerArgs(original).bytes.equals(args), 'prepared native TUN compiler response file changed');
+    return result;
+  }
+  requireSetting(isObject(receipt) && Object.keys(receipt).length === 3
+    && receipt.contractVersion === NATIVE_TUN_CONTRACT && receipt.present === present && Object.hasOwn(receipt, 'compilerArgs'),
+  'prepared native TUN ABI decision differs from actual headers');
+  const parent = readCompilerArgs(original);
+  requireSetting(isObject(receipt.compilerArgs) && Object.keys(receipt.compilerArgs).length === 2
+    && receipt.compilerArgs.bytes === parent.pin.bytes && receipt.compilerArgs.sha256 === parent.pin.sha256,
+  'parent native TUN compiler response file changed');
+  requireSetting(parent.bytes.equals(args), 'unexpected native TUN compiler arguments');
+  if (action === 'verify-parent') return result;
+
+  requireSetting(typeof derived === 'string' && derived.length > 0, 'derived native TUN response directory required');
+  const output = join(derived, NATIVE_TUN_ARGS);
+  if (action === 'install') {
+    writeCompilerArgs(output, parent.bytes);
+  } else {
+    requireSetting(readCompilerArgs(output).bytes.equals(parent.bytes),
+      'installed native TUN compiler input changed');
+  }
+  return result;
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [, , slot, query, minimum, scheme] = process.argv;
-  const result = inspectAppleArchitecture(readFileSync(0), { slot, query, minimum, scheme: JSON.parse(scheme) });
-  process.stdout.write(JSON.stringify(result));
+  if (slot === '--native-tun') {
+    try {
+      // A JSON escape can expand one header byte to six; paths are separate argv.
+      const { headers, receipt } = JSON.parse(readBoundedInput(6 * HEADER_BYTES + 4096).toString('utf8'));
+      process.stdout.write(JSON.stringify(nativeTunCompilerResponse(query, { headers, receipt, prepared: minimum, derived: scheme })));
+    } catch (error) {
+      console.error(error.message);
+      process.exitCode = 1;
+    }
+  } else {
+    const result = inspectAppleArchitecture(readFileSync(0), { slot, query, minimum, scheme: JSON.parse(scheme) });
+    process.stdout.write(JSON.stringify(result));
+  }
 }

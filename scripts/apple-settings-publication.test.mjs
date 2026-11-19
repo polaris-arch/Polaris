@@ -1,7 +1,14 @@
-// Source contracts only. These checks do not run Swift, NE, or an Apple device.
+// Source contracts and an inert Apple build fixture. No Apple SDK is needed.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { nativeTunCompilerResponse } from './mobile-core/apple-admission.mjs';
+
 const read = name => readFileSync(new URL(`../src-tauri/gen/apple/PacketTunnel/${name}.swift`, import.meta.url), 'utf8');
 const platform = read('TunnelPlatform');
 const lifecycle = read('TunnelLifecycle');
@@ -148,7 +155,7 @@ test('native protojson uint64 parsing preserves exact strings and omitted zero',
 });
 
 
-test('native bridge retains real NE callbacks and conditionally registers actual V1 bindings', () => {
+test('native bridge retains real NE callbacks and PacketTunnel consumes the compiler response before Sources', () => {
   const apply = section(platform, '    private func apply(', '    func revokeNativeTun()');
   assert.match(apply, /let owner = provider/);
   assert.match(apply, /settingsCallbacks\[requestID\] = \(token, result\)/);
@@ -156,14 +163,264 @@ test('native bridge retains real NE callbacks and conditionally registers actual
   assert.match(apply, /withExtendedLifetime\(\(owner, network, result\)\)/);
   assert.ok(apply.indexOf('settingsCallbacks.removeValue') < apply.indexOf('result.finish(error)'));
   assert.doesNotMatch(apply, /guard self\.provider\.acceptsSettings/);
-  assert.match(provider, /#if POLARIS_NATIVE_TUN_V1[\s\S]*try server\.setRuntimeTunPlatform\(self\.platform\)/);
-  assert.ok(provider.indexOf('try server.setRuntimeTunPlatform') < provider.indexOf('try server.start()'));
-  assert.match(platform, /#if POLARIS_NATIVE_TUN_V1[\s\S]*extension TunnelPlatform: LibboxRuntimeTunPlatformProtocol/);
+  assert.match(section(provider, '#if POLARIS_NATIVE_TUN_V1', '#endif'), /try server\.setRuntimeTunPlatform\(self\.platform\)/);
+  assert.ok(provider.indexOf('#endif', provider.indexOf('#if POLARIS_NATIVE_TUN_V1')) < provider.indexOf('try server.start()'));
+  assert.match(section(platform, '#if POLARIS_NATIVE_TUN_V1', '#endif'), /extension TunnelPlatform: LibboxRuntimeTunPlatformProtocol/);
   assert.match(platform, /previous: old\?\.state, published: \{ receipt\.published\(\) \}/);
   assert.match(platform, /private let provider: PacketTunnelProvider/);
   assert.match(platform, /let custody = Darwin\.dup\(original\)/);
   assert.match(platform, /Darwin\.close\(custody\)/);
   assert.doesNotMatch(platform, /Darwin\.close\(original\)/);
+
+  const project = readFileSync(new URL('../src-tauri/gen/apple/project.yml', import.meta.url), 'utf8');
+  const pbx = readFileSync(new URL('../src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj', import.meta.url), 'utf8');
+  for (const text of [project, pbx]) {
+    assert.match(text, /OTHER_SWIFT_FLAGS/);
+    assert.ok(text.includes('@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args'));
+    assert.doesNotMatch(text, /-D POLARIS_NATIVE_TUN_V1/);
+  }
+  const target = section(pbx, '78552A5C57D5DDA9797F1E67 /* polaris_PacketTunnel */ =', 'buildRules');
+  assert.match(target, /Verify iOS Core[\s\S]*Sources/);
+  const phase = section(pbx, 'B395AB4CF19394B13456AAB7 /* Verify iOS Core */ =', '6BA4F5A019704F91829A51D3');
+  assert.match(phase, /alwaysOutOfDate = 1/);
+  assert.ok(phase.includes('$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args'));
+  assert.equal(pbx.split('OTHER_SWIFT_FLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);').length - 1, 2);
+});
+
+// Inert declarations from the pinned gomobile ABI fixture, including the
+// nullable direct return. These sources never import or execute Libbox.
+const tunPlatform = '- (int32_t)runtimeTunVersion;\n'
+  + '- (id<LibboxRuntimeTunSession> _Nullable)newTunSession:(id<LibboxTunOptions> _Nullable)options previous:(id<LibboxRuntimeTunSession> _Nullable)previous receipt:(LibboxRuntimeTunReceipt* _Nullable)receipt error:(NSError* _Nullable* _Nullable)error;\n';
+const tunSession = '- (NSString* _Nonnull)ownerID;\n'
+  + '- (BOOL)prepare:(NSError* _Nullable* _Nullable)error;\n'
+  + '- (int32_t)fileDescriptor;\n'
+  + '- (BOOL)validate:(NSError* _Nullable* _Nullable)error;\n'
+  + '- (BOOL)abort:(NSError* _Nullable* _Nullable)error;\n'
+  + '- (BOOL)retire:(NSError* _Nullable* _Nullable)error;\n';
+const oldHeader = 'NSString* LibboxVersion(void);';
+const tunHeader = '@protocol LibboxRuntimeTunPlatform;\n'
+  + '@protocol LibboxRuntimeTunSession;\n'
+  + '@class LibboxRuntimeTunReceipt;\n'
+  + '@protocol LibboxRuntimeTunPlatform <NSObject>\n' + tunPlatform + '@end\n'
+  + '@protocol LibboxRuntimeTunSession <NSObject>\n' + tunSession + '@end\n'
+  + '@interface LibboxRuntimeTunPlatform : NSObject <goSeqRefInterface, LibboxRuntimeTunPlatform> {\n}\n'
+  + tunPlatform + '@end\n'
+  + '@interface LibboxRuntimeTunSession : NSObject <goSeqRefInterface, LibboxRuntimeTunSession> {\n}\n'
+  + tunSession + '@end\n'
+  + '@interface LibboxRuntimeTunReceipt : NSObject <goSeqRefInterface> {\n}\n'
+  + '- (NSString* _Nonnull)ownerID;\n- (BOOL)published;\n@end\n'
+  + '@interface LibboxCommandServer : NSObject <goSeqRefInterface> {\n}\n'
+  + '- (BOOL)setRuntimeTunPlatform:(id<LibboxRuntimeTunPlatform> _Nullable)platform error:(NSError* _Nullable* _Nullable)error;\n@end\n';
+const tunDefine = '-D\nPOLARIS_NATIVE_TUN_V1\n';
+const responseName = 'PolarisNativeTunCompiler.args';
+
+function tunDirectories(t) {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'polaris-native-tun-args-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const prepared = join(root, 'parent-prepared'), derived = join(root, 'derived');
+  mkdirSync(prepared);
+  mkdirSync(derived);
+  return { root, prepared, derived };
+}
+
+test('complete native TUN declarations produce the exact compiler response and an old ABI produces empty bytes', t => {
+  const input = tunDirectories(t);
+  const cases = [[oldHeader, false], ['/*' + tunHeader + '*/', false], [tunHeader, true],
+    ['#ifndef __Libbox_H__\n#define __Libbox_H__\n' + tunHeader + '#endif\n', true],
+    ['#ifndef __Libbox_H__\u0085\n#define __Libbox_H__\u0085\n' + tunHeader + '#endif\u0085\n', true],
+    [tunHeader.replaceAll('fileDescriptor;', 'fileDescriptor\u0085;'), true]];
+  for (const [header, present] of cases) {
+    const expected = present ? tunDefine : '';
+    const receipt = nativeTunCompilerResponse('prepare', { ...input, headers: [header] });
+    assert.equal(readFileSync(join(input.prepared, responseName), 'utf8'), expected);
+    assert.deepEqual(receipt, {
+      contractVersion: 'polaris-native-tun-v1',
+      present,
+      compilerArgs: { bytes: Buffer.byteLength(expected), sha256: createHash('sha256').update(expected).digest('hex') },
+    });
+  }
+});
+
+test('partial, wrong, duplicate or disabled native TUN declarations fail closed', t => {
+  const cases = [
+    '@protocol LibboxRuntimeTunPlatform;',
+    tunHeader.replace('- (BOOL)published;', ''),
+    tunHeader.replace('newTunSession:', 'newTunSessionWrong:'),
+    tunHeader.replace('id<LibboxRuntimeTunSession> _Nullable)newTunSession:', 'BOOL)newTunSession:'),
+    tunHeader.replace('- (int32_t)fileDescriptor;', '- (int64_t)fileDescriptor;'),
+    tunHeader.replace('fileDescriptor;', 'fileDescriptor\uFEFF;'),
+    tunHeader.replace('@end', '@endé'),
+    tunHeader.replace('- (BOOL)prepare:(NSError* _Nullable* _Nullable)error;',
+      '- (BOOL)prepare:(NSError* _Nullable* _Nullable)error;\n- (void)prepare:(NSError* _Nullable* _Nullable)error;'),
+    tunHeader + '@protocol LibboxRuntimeTunSession <NSObject>\n' + tunSession + '@end\n',
+    '#if 0\n' + tunHeader + '#endif\n',
+    '#ifdef POLARIS_NATIVE_TUN_V1\n' + tunHeader + '#endif\n',
+    '#ifndef __Libbox_H__\uFEFF\n#define __Libbox_H__\n' + tunHeader + '#endif\n',
+  ];
+  const input = tunDirectories(t);
+  for (const header of cases) {
+    assert.throws(() => nativeTunCompilerResponse('prepare', { ...input, headers: [header] }), /native TUN/);
+  }
+  assert.throws(() => readFileSync(join(input.prepared, responseName)), { code: 'ENOENT' });
+});
+
+test('the Apple build CLI binds the native TUN response to each selected device and simulator slice', async t => {
+  const sdks = [['iphoneos', 'ios-arm64'], ['iphonesimulator', 'ios-arm64-simulator']];
+  const mobileCore = fileURLToPath(new URL('./mobile-core/', import.meta.url));
+  const source = JSON.parse(readFileSync(new URL('./mobile-core/source-contract.json', import.meta.url)));
+  const receiptName = 'PolarisTLSFingerprintLinker.json';
+  const linkerName = 'PolarisTLSFingerprintLinker.args';
+  const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+  for (const [platform, selected] of sdks) {
+    for (const present of [true, false]) {
+      await t.test(`${platform} ${present ? 'native TUN V1' : 'legacy'}`, t => {
+        const { root, prepared, derived } = tunDirectories(t);
+        const linkedScripts = join(root, 'mobile-core');
+        symlinkSync(mobileCore, linkedScripts);
+        const script = join(linkedScripts, 'apple_tls_fingerprint.py');
+        const framework = join(root, 'Libbox.xcframework');
+        const slices = {};
+        for (const [, identifier] of sdks) {
+          const folder = join(framework, identifier, 'Libbox.framework');
+          const version = join(folder, 'Versions', 'A');
+          const binary = Buffer.from(`inert selected static archive ${identifier}`);
+          mkdirSync(join(version, 'Headers'), { recursive: true });
+          writeFileSync(join(version, 'Libbox'), binary);
+          writeFileSync(join(version, 'Headers', 'Libbox.h'), (identifier === selected) === present ? tunHeader : oldHeader);
+          symlinkSync('A', join(folder, 'Versions', 'Current'));
+          symlinkSync('Versions/Current/Libbox', join(folder, 'Libbox'));
+          symlinkSync('Versions/Current/Headers', join(folder, 'Headers'));
+          slices[identifier] = { libraryIdentifier: identifier, binary: { bytes: binary.length, sha256: sha256(binary) } };
+        }
+        const link = join(root, 'link.json');
+        writeFileSync(link, JSON.stringify({ framework, componentOutput: { slices } }));
+        const executable = Buffer.from('inert final PacketTunnel executable');
+        writeFileSync(join(root, 'extension'), executable);
+        // Substitute only xcrun. The fixture's nm accepts the selected archive and never invokes native tools.
+        writeFileSync(join(root, 'xcrun'), '#!/bin/sh\n'
+          + 'test "$#" -eq 4 && test "$1 $2 $3" = "nm --no-llvm-bc -gU" && test "$4" = "$FIXTURE_BINARY" || exit 97\n'
+          + 'printf "T _LibboxVersion\\n"\n', { mode: 0o700 });
+
+        const budget = join(root, 'budget');
+        mkdirSync(budget, { mode: 0o700 });
+        const slot = sha256(root) + '.reservation';
+        const ledger = join(budget, slot);
+        // The native CLI checks and locks this inherited descriptor without allocating a build's disk reserve.
+        writeFileSync(ledger, JSON.stringify({ schema: 'polaris-mobile-filesystem-reservation-v1', slot, work: root,
+          filesystem: statSync(root).dev, reserveBytes: source.budget.buildPeakReserveBytes, groups: [] }), { mode: 0o600 });
+        const fd = openSync(ledger, 'r+');
+        t.after(() => closeSync(fd));
+        const env = { ...process.env, PATH: `${root}:${process.env.PATH}`, PLATFORM_NAME: platform, ARCHS: 'arm64',
+          POLARIS_MOBILE_LINK_INPUT: link, POLARIS_MOBILE_LINK_INPUT_SHA256: sha256(readFileSync(link)),
+          POLARIS_APP_WORK: root, POLARIS_BUILD_BUDGET_ROOT: budget, POLARIS_FORMAL_APP_BUILD: '1',
+          FIXTURE_BINARY: join(framework, selected, 'Libbox.framework', 'Versions', 'A', 'Libbox'),
+          TARGET_BUILD_DIR: root, EXECUTABLE_PATH: 'extension' };
+        const invoke = (action, env, parent = false) => {
+          const result = spawnSync('python3', ['-B', script, action], { encoding: 'utf8', timeout: 30_000,
+            env: { ...env, POLARIS_BUILD_RESERVATION_FD: parent ? '3' : '999999' },
+            stdio: ['ignore', 'pipe', 'pipe', parent ? fd : 'ignore'] });
+          assert.ifError(result.error);
+          return result;
+        };
+
+        const parentEnv = { ...env, DERIVED_FILE_DIR: prepared };
+        const preparation = invoke('prepare', parentEnv, true);
+        assert.equal(preparation.status, 0, preparation.stderr);
+        const expected = Buffer.from(present ? tunDefine : '');
+        const receipt = readFileSync(join(prepared, receiptName));
+        assert.deepEqual(JSON.parse(receipt).nativeTun, { contractVersion: 'polaris-native-tun-v1', present,
+          compilerArgs: { bytes: expected.length, sha256: sha256(expected) } });
+        assert.deepEqual(readFileSync(join(prepared, responseName)), expected);
+        const pins = { POLARIS_TLS_PREPARED_ROOT: prepared, POLARIS_TLS_PREPARED_SHA256: sha256(receipt) };
+        const hookEnv = { ...env, ...pins, DERIVED_FILE_DIR: derived, FIXTURE_BINARY: '' };
+        const installed = join(derived, responseName);
+        writeFileSync(installed, present ? '' : tunDefine);
+        const installation = invoke('install', hookEnv);
+        assert.equal(installation.status, 0, installation.stderr);
+        assert.deepEqual(readFileSync(installed), expected);
+        assert.deepEqual(readFileSync(join(derived, receiptName)), receipt);
+        assert.deepEqual(readFileSync(join(derived, linkerName)), readFileSync(join(prepared, linkerName)));
+        const installedVerification = invoke('verify-installed', hookEnv);
+        assert.equal(installedVerification.status, 0, installedVerification.stderr);
+        const finalVerification = invoke('verify', { ...parentEnv, ...pins }, true);
+        assert.equal(finalVerification.status, 0, finalVerification.stderr);
+        assert.equal(JSON.parse(finalVerification.stdout).nativeTunHeaderABIAvailable, present);
+
+        writeFileSync(installed, present ? tunDefine.replace('_V1', '_XX') : tunDefine);
+        const tamperedInstallation = invoke('verify-installed', hookEnv);
+        assert.equal(tamperedInstallation.status, 1, tamperedInstallation.stderr);
+        assert.match(tamperedInstallation.stderr, /installed native TUN compiler input changed/);
+
+        const alteredReceipt = JSON.parse(receipt);
+        alteredReceipt.nativeTun.present = !present;
+        const alteredBytes = JSON.stringify(alteredReceipt);
+        const preparedReceipt = join(prepared, receiptName);
+        writeFileSync(preparedReceipt, alteredBytes);
+        const alteredPin = { POLARIS_TLS_PREPARED_SHA256: sha256(alteredBytes) };
+        const tamperedFinal = invoke('verify', { ...parentEnv, ...pins, ...alteredPin }, true);
+        assert.equal(tamperedFinal.status, 1, tamperedFinal.stderr);
+        const abiMismatch = /prepared native TUN ABI decision differs from actual headers/;
+        assert.match(tamperedFinal.stderr, abiMismatch);
+
+        if (!present) return;
+        const prior = Buffer.from('prior installed bytes');
+        const derivedFiles = [installed, join(derived, linkerName), join(derived, receiptName)];
+        for (const path of derivedFiles) writeFileSync(path, prior);
+        const rejectsInstall = (reason, inputs = hookEnv) => {
+          const result = invoke('install', inputs);
+          assert.equal(result.status, 1, result.stderr);
+          assert.match(result.stderr, reason);
+          for (const path of derivedFiles) assert.deepEqual(readFileSync(path), prior);
+        };
+
+        rejectsInstall(abiMismatch, { ...hookEnv, ...alteredPin });
+        alteredReceipt.nativeTun.present = present;
+        alteredReceipt.nativeTun.unrecognized = true;
+        const extraField = JSON.stringify(alteredReceipt);
+        writeFileSync(preparedReceipt, extraField);
+        rejectsInstall(abiMismatch, { ...hookEnv, POLARIS_TLS_PREPARED_SHA256: sha256(extraField) });
+        writeFileSync(preparedReceipt, receipt);
+
+        const parentArgs = join(prepared, responseName);
+        writeFileSync(parentArgs, '');
+        rejectsInstall(/parent native TUN compiler response file changed/);
+        writeFileSync(parentArgs, expected);
+
+        const foreign = join(root, 'foreign-args');
+        writeFileSync(foreign, prior);
+        unlinkSync(installed);
+        symlinkSync(foreign, installed);
+        rejectsInstall(/native compiler output redirected/);
+        assert.equal(readlinkSync(installed), foreign);
+        assert.deepEqual(readFileSync(foreign), prior);
+      });
+    }
+  }
+});
+
+test('native TUN input drift or redirected output leaves derived and foreign bytes intact', t => {
+  const faults = [
+    [input => writeFileSync(join(input.prepared, responseName), ''), /parent native TUN compiler response file changed/],
+    [input => { input.headers = [tunHeader.replace('- (BOOL)published;', '')]; }, /native TUN selector/],
+    [input => { input.receipt.present = false; }, /prepared native TUN ABI decision differs/],
+    [input => { input.receipt.unrecognized = true; }, /prepared native TUN ABI decision differs/],
+  ];
+  for (const [fault, reason] of faults) {
+    const input = { ...tunDirectories(t), headers: [tunHeader] };
+    input.receipt = nativeTunCompilerResponse('prepare', input);
+    const installed = join(input.derived, responseName);
+    writeFileSync(installed, 'prior response');
+    fault(input);
+    assert.throws(() => nativeTunCompilerResponse('install', input), reason);
+    assert.equal(readFileSync(installed, 'utf8'), 'prior response');
+  }
+  const input = { ...tunDirectories(t), headers: [tunHeader] };
+  input.receipt = nativeTunCompilerResponse('prepare', input);
+  const foreign = join(input.derived, 'foreign-args');
+  writeFileSync(foreign, 'untouched');
+  symlinkSync(foreign, join(input.derived, responseName));
+  assert.throws(() => nativeTunCompilerResponse('install', input), /compiler output redirected/);
+  assert.equal(readFileSync(foreign, 'utf8'), 'untouched');
 });
 
 test('native transaction keeps exact custody, publication lease and sticky failed restoration', () => {

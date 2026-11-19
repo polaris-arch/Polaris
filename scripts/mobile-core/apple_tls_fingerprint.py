@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 sys.dont_write_bytecode = True
@@ -34,101 +35,18 @@ def capability_present(headers, symbols):
     return defined
 
 
-# Exact selectors come from the pinned sagernet/gomobile v0.1.13 generator.
-# This data authorizes a source binding variant, never a device operation.
-NATIVE_TUN_CONTRACT = 'polaris-native-tun-v1'
-NATIVE_TUN_CONDITION = 'POLARIS_NATIVE_TUN_V1'
 NATIVE_TUN_ARGS = 'PolarisNativeTunCompiler.args'
 
 
-def native_tun_abi_present(headers):
-    texts = [re.sub(r'/\*.*?\*/|//[^\n]*', ' ', text, flags=re.DOTALL)
-             for text in headers]
-    names = r'\b(?:LibboxRuntimeTun(?:Platform|Session|Receipt)|setRuntimeTunPlatform|newTunSession)\b'
-    if not any(re.search(names, text) for text in texts):
-        return False
-    for text in texts:
-        if not re.search(names, text):
-            continue
-        # Generated include guards are the only supported conditional here.
-        # A disabled declaration or handwritten feature macro cannot attest ABI.
-        conditions = re.findall(r'(?m)^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b([^\n]*)', text)
-        guards = [tail.strip() for directive, tail in conditions if directive == 'ifndef']
-        require(not conditions or
-                (len(conditions) == 2 and len(guards) == 1 and
-                 re.fullmatch(r'__[A-Za-z0-9_]+_H__', guards[0]) and
-                 conditions[0][0] == 'ifndef' and conditions[1][0] == 'endif' and
-                 not conditions[1][1].strip() and
-                 re.search(r'(?m)^\s*#\s*define\s+' + re.escape(guards[0]) + r'\s*$', text)),
-                'native TUN declarations use unsupported preprocessor conditions')
-    text = '\n'.join(re.sub(r'(?m)^[ \t]*#[^\n]*', '', part.replace('\\\n', ''))
-                     for part in texts)
-
-    def block(kind, name, protocols):
-        blocks = []
-        for match in re.finditer(r'@' + kind + r'\s+' + name + r'\b([^\n]*)', text):
-            tail = match.group(1).strip()
-            if tail.startswith(';'):
-                continue  # A forward declaration supplies no methods.
-            end = re.search(r'@end\b', text[match.end():])
-            require(end is not None, 'native TUN declaration is unterminated: ' + name)
-            body = text[match.end():match.end() + end.start()]
-            require(not re.search(r'@(?:protocol|interface)\b', body),
-                    'native TUN declaration overlaps another block: ' + name)
-            if kind == 'protocol':
-                require(re.fullmatch(r'<\s*NSObject\s*>', tail),
-                        'native TUN protocol inheritance differs: ' + name)
-            else:
-                inheritance = re.fullmatch(r':\s*NSObject\s*<([^>]+)>\s*(?:\{)?', tail)
-                require(inheritance is not None, 'native TUN class inheritance differs: ' + name)
-                actual = [part.strip() for part in inheritance.group(1).split(',')]
-                require(len(actual) == len(set(actual)) and all(p in actual for p in protocols),
-                        'native TUN class protocol identity differs: ' + name)
-            blocks.append(body)
-        require(len(blocks) == 1, 'native TUN declaration missing or duplicated: ' + name)
-        return blocks[0]
-
-    def tokens(value):
-        return re.findall(r'@[A-Za-z_]\w*|[A-Za-z_]\w*|[^\s]', value)
-
-    def methods(body, expected):
-        declarations = re.findall(r'[-+]\s*\([^;]*?;', body)
-        for name, declaration in expected.items():
-            candidates = [part for part in declarations
-                          if re.match(r'[-+]\s*\([^)]*\)\s*' + name + r'\b', part)]
-            require(len(candidates) == 1 and tokens(candidates[0]) == tokens(declaration),
-                    'native TUN selector/return ABI differs: ' + name)
-
-    platform = {
-        'runtimeTunVersion': '- (int32_t)runtimeTunVersion;',
-        'newTunSession': '- (id<LibboxRuntimeTunSession> _Nullable)newTunSession:'
-            '(id<LibboxTunOptions> _Nullable)options previous:'
-            '(id<LibboxRuntimeTunSession> _Nullable)previous receipt:'
-            '(LibboxRuntimeTunReceipt* _Nullable)receipt error:'
-            '(NSError* _Nullable* _Nullable)error;',
-    }
-    session = {'ownerID': '- (NSString* _Nonnull)ownerID;',
-               'fileDescriptor': '- (int32_t)fileDescriptor;'}
-    session.update({name: '- (BOOL)' + name + ':(NSError* _Nullable* _Nullable)error;'
-                    for name in ('prepare', 'validate', 'abort', 'retire')})
-    for name, expected in (('RuntimeTunPlatform', platform), ('RuntimeTunSession', session)):
-        methods(block('protocol', 'Libbox' + name, ()), expected)
-        methods(block('interface', 'Libbox' + name, ('goSeqRefInterface', 'Libbox' + name)), expected)
-    methods(block('interface', 'LibboxRuntimeTunReceipt', ('goSeqRefInterface',)),
-            {'ownerID': '- (NSString* _Nonnull)ownerID;', 'published': '- (BOOL)published;'})
-    methods(block('interface', 'LibboxCommandServer', ('goSeqRefInterface',)),
-            {'setRuntimeTunPlatform': '- (BOOL)setRuntimeTunPlatform:'
-                '(id<LibboxRuntimeTunPlatform> _Nullable)platform error:'
-                '(NSError* _Nullable* _Nullable)error;'})
-    return True
-
-
-def compiler_args_path():
-    return paths()[0].with_name(NATIVE_TUN_ARGS)
-
-
-def compiler_args(present):
-    return ('-D\n' + NATIVE_TUN_CONDITION + '\n').encode() if present else b''
+def native_tun_response(action, headers, prepared, *, derived=None, receipt=None):
+    command = ['node', Path(__file__).resolve().with_name('apple-admission.mjs'), '--native-tun', action, prepared]
+    if derived is not None:
+        command.append(derived)
+    payload = json.dumps({'headers': headers, 'receipt': receipt}, ensure_ascii=False).encode()
+    result = subprocess.run(command, input=payload, capture_output=True, timeout=30)
+    require(result.returncode == 0,
+            result.stderr.decode(errors='replace').strip() or 'native TUN compiler response rejected')
+    return decode(result.stdout)
 
 
 def paths():
@@ -177,18 +95,14 @@ def prepare():
     symbols = run(['xcrun', 'nm', '--no-llvm-bc', '-gU', binary])
     headers = [raw.decode() for raw, _ in header_inputs.values()]
     present = capability_present(headers, symbols)
-    native_tun = native_tun_abi_present(headers)
     flags, receipt = paths()
-    swift_args = compiler_args_path()
-    swift_args.write_bytes(compiler_args(native_tun))
+    native_tun = native_tun_response('prepare', headers, flags.parent)
     # Explicitly root this one optional function; do not change the global export policy.
     flags.write_text('-Xlinker\n-u\n-Xlinker\n' + SYMBOL + '\n' if present else '')
     receipt.write_text(json.dumps({'capabilityPresent': present, 'binary': selected['binary'],
                                   'headers': {name: pin for name, (_, pin) in header_inputs.items()},
                                   'flags': file_pin(flags, allow_empty=True), 'devicePassed': False,
-                                  'nativeTun': {'contractVersion': NATIVE_TUN_CONTRACT,
-                                                'present': native_tun,
-                                                'compilerArgs': file_pin(swift_args, allow_empty=True)}}) + '\n')
+                                  'nativeTun': native_tun}) + '\n')
 
 
 def verify(receipt=None):
@@ -196,7 +110,7 @@ def verify(receipt=None):
     if receipt is None:
         receipt = read_receipt(receipt_path)
     require(file_pin(flags, allow_empty=True) == receipt['flags'], 'TLS capability linker flags changed')
-    require(file_pin(compiler_args_path(), allow_empty=True) == receipt['nativeTun']['compilerArgs'],
+    require(file_pin(flags.with_name(NATIVE_TUN_ARGS), allow_empty=True) == receipt['nativeTun']['compilerArgs'],
             'native TUN compiler response file changed')
     executable = Path(os.environ['TARGET_BUILD_DIR']) / os.environ['EXECUTABLE_PATH']
     if receipt['capabilityPresent']:
@@ -228,46 +142,36 @@ def prepared_inputs():
             'prepared TLS capability receipt structure differs')
     flag_raw, flag_pin = read_pinned(flags, allow_empty=True)
     require(flag_pin == value['flags'], 'parent TLS capability flags changed')
-    binary, selected, headers = selected_inputs()
+    _, selected, headers = selected_inputs()
     require(selected['binary'] == value['binary'] and
             {name: pin for name, (_, pin) in headers.items()} == value['headers'],
             'prepared TLS capability inputs differ from selected framework')
     expected = ('-Xlinker\n-u\n-Xlinker\n' + SYMBOL + '\n' if value['capabilityPresent'] else '').encode()
     require(flag_raw == expected, 'unexpected TLS capability linker flags')
-    present = native_tun_abi_present([content.decode() for content, _ in headers.values()])
-    swift_args = root / NATIVE_TUN_ARGS
-    native = value['nativeTun']
-    require(type(native) is dict and set(native) == {'contractVersion', 'present', 'compilerArgs'} and
-            native['contractVersion'] == NATIVE_TUN_CONTRACT and type(native['present']) is bool and
-            native['present'] == present, 'prepared native TUN ABI decision differs from actual headers')
-    require(swift_args.stat().st_size <= 128, 'prepared native TUN compiler arguments exceed budget')
-    swift_raw, swift_pin = read_pinned(swift_args, allow_empty=True)
-    require(swift_pin == native['compilerArgs'], 'parent native TUN compiler response file changed')
-    require(swift_raw == compiler_args(present), 'unexpected native TUN compiler arguments')
-    return flag_raw, swift_raw, raw
+    header_text = [content.decode() for content, _ in headers.values()]
+    return flag_raw, raw, value, header_text
 
 
 def install():
     # Xcode's service can preserve an FD number in env after closing/reusing its
     # descriptor. This hook only checks/copies bytes; native tools run in the
     # admitted parent before archive and again against the final archived image.
-    flag_raw, swift_raw, receipt_raw = prepared_inputs()
+    flag_raw, receipt_raw, value, headers = prepared_inputs()
     flags, receipt = paths()
-    swift_args = compiler_args_path()
-    require(not flags.is_symlink() and not receipt.is_symlink() and not swift_args.is_symlink(),
-            'TLS/native compiler output redirected')
+    require(not flags.is_symlink() and not receipt.is_symlink(), 'TLS/native compiler output redirected')
+    native_tun_response('install', headers, os.environ['POLARIS_TLS_PREPARED_ROOT'],
+                        derived=flags.parent, receipt=value['nativeTun'])
     flags.write_bytes(flag_raw)
-    swift_args.write_bytes(swift_raw)
     receipt.write_bytes(receipt_raw)
 
 
 def verify_installed():
-    flag_raw, swift_raw, receipt_raw = prepared_inputs()
+    flag_raw, receipt_raw, value, headers = prepared_inputs()
     flags, receipt = paths()
+    native_tun_response('verify-installed', headers, os.environ['POLARIS_TLS_PREPARED_ROOT'],
+                        derived=flags.parent, receipt=value['nativeTun'])
     require(read_pinned(flags, allow_empty=True)[0] == flag_raw and
             read_pinned(receipt)[0] == receipt_raw, 'installed TLS linker inputs changed')
-    require(read_pinned(compiler_args_path(), allow_empty=True)[0] == swift_raw,
-            'installed native TUN compiler input changed')
     print(json.dumps({'scope': 'installed TLS linker input bytes only; final native verification belongs to parent',
                       'loadedQueryExecuted': False, 'devicePassed': False}))
 
@@ -282,11 +186,13 @@ def native_action(action):
     with reservation(private_dir(Path(os.environ['POLARIS_APP_WORK'])), load(), ACTIVE_FDS):
         if action == 'verify':
             # Bind final tools to the immutable pre-archive capability decision.
-            _, _, receipt_raw = prepared_inputs()
+            _, _, value, headers = prepared_inputs()
+            native_tun_response('verify-parent', headers, os.environ['POLARIS_TLS_PREPARED_ROOT'],
+                                receipt=value['nativeTun'])
             require(Path(os.environ['DERIVED_FILE_DIR']).resolve(strict=True) ==
                     Path(os.environ['POLARIS_TLS_PREPARED_ROOT']).resolve(strict=True),
                     'final TLS verifier must use parent prepared inputs')
-            verify(decode(receipt_raw))
+            verify(value)
         else:
             prepare()
 

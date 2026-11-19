@@ -253,14 +253,14 @@ export function decode(raw, maximum, receiptLimit) {
   return result;
 }
 
-export function pinned(path, maximum, observation = false) {
+export function pinned(path, maximum, observation = false, { allowEmpty = false } = {}) {
   const before = lstatSync(path, { ...statOptions, throwIfNoEntry: false });
   if (observation) console.error(JSON.stringify({
     schema: 'polaris-receipt-size-observation-v1', phase: 'read', path,
     bytes: Number(before?.size ?? 0n), symlink: before?.isSymbolicLink() ?? false, maximumReadBytes: maximum,
     scope: 'actual lstat size; not receipt or carrier acceptance',
   }));
-  demand(before?.isFile() && before.size > 0n && before.size <= BigInt(maximum), 'bounded regular original receipt or artifact required');
+  demand(before?.isFile() && (allowEmpty || before.size > 0n) && before.size <= BigInt(maximum), 'bounded regular original receipt or artifact required');
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const identity = info => info.isFile() && ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every(key => info[key] === before[key]);
@@ -322,6 +322,18 @@ function bindingPlans(source) {
   return { linkerFlagsPrefix, platforms };
 }
 
+export function readBoundedInput(maximum) {
+  const bytes = Buffer.allocUnsafe(maximum + 1);
+  let received = 0;
+  while (received < bytes.length) {
+    const count = readSync(0, bytes, received, bytes.length - received, null);
+    if (count === 0) break;
+    received += count;
+  }
+  demand(received <= maximum, 'mobile input contract is too large');
+  return bytes.subarray(0, received);
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const args = process.argv.slice(2);
@@ -331,14 +343,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     } else {
       // The producer sends its full declaration once and reuses these plans.
       demand(args.length === 0, 'usage: source-admission.mjs [--versions]');
-      const bytes = Buffer.allocUnsafe(sourceContractBytes + 1);
-      let received = 0;
-      while (received < bytes.length) {
-        const count = readSync(0, bytes, received, bytes.length - received, null);
-        if (count === 0) break;
-        received += count;
-      }
-      console.log(JSON.stringify(bindingPlans(validateSourceBytes(bytes.subarray(0, received)))));
+      console.log(JSON.stringify(bindingPlans(validateSourceBytes(readBoundedInput(sourceContractBytes)))));
     }
   } catch (error) {
     console.error(error instanceof SyntaxError ? 'invalid mobile source declaration JSON' : error.message);
