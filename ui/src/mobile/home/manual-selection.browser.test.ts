@@ -182,12 +182,14 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile explicit manua
   });
 
   for (const route of routes) {
-    it(`${route}: Auto + current exit switches once and adopts the complete readback`, async () => {
+    it(`${route}: unpinned Auto + same saved exit switches once and adopts the complete readback`, async () => {
       const page = await open(route);
       try {
+        if (route === 'home-node') await page.locator('[data-group-id="manual"]').click();
         const button = target(page, route);
         expect(await button.isEnabled()).toBe(true);
-        expect(await button.getAttribute('aria-current')).toBe('true');
+        expect((await snapshot(page)).selected).toBe(selectedFor(route));
+        expect(await button.getAttribute('aria-current')).toBeNull();
         await button.click();
         await expect.poll(async () => (await snapshot(page)).trace).toEqual([['switch', selectedFor(route)], ['get']]);
         await settled(page, route);
