@@ -1260,18 +1260,24 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     }
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
     // 留存 SDK 与原观察不分发 APK/SO；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
-    const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation and admission unit tests'));
+    const s5Step = stepBlock(releaseCheck, 'Verify S5 Android network observation and admission unit tests');
+    const s5Units = executable(s5Step);
+    const s5Verifier = readFileSync(join(REPO_ROOT, 'scripts/VerifyAndroidS5.java'), 'utf8');
+    const jdk = stepBlock(releaseCheck, 'Resolve JDK / Android SDK / NDK');
+    expect(executable(jdk)).toContain('echo "JAVA_HOME=$JAVA_HOME_21_X64"');
+    expect(releaseCheck.indexOf(jdk)).toBeLessThan(releaseCheck.indexOf(s5Step));
     expect(s5Units).toContain('bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android');
     expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');
     for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest']) {
       expect(s5Units).toContain(`--tests com.polaris2.app.vpn.${name}`);
+      expect(s5Verifier).toContain(JSON.stringify(name));
     }
-    expect(s5Units).toContain('python3 -I -');
-    expect(s5Units).toContain("for k in ('failures', 'errors', 'skipped')");
-    expect(s5Units).toContain('len(cases) == len(methods)');
-    expect(s5Units).toContain("sourceSha256");
-    expect(s5Units).toContain("reportSha256");
-    expect(s5Units).not.toMatch(/continue-on-error|kotlinc|\|\| true/);
+    expect(s5Units).toContain('"$JAVA_HOME/bin/java" scripts/VerifyAndroidS5.java "$RUNNER_TEMP/s5-android-unit-results.json"');
+    expect(s5Verifier).toContain('List.of("failure", "error", "skipped")');
+    expect(s5Verifier).toContain('cases.size() == methods.size() && cases.size() == count(suite, "tests")');
+    expect(s5Verifier).toContain('sourceSha256');
+    expect(s5Verifier).toContain('reportSha256');
+    expect(s5Units).not.toMatch(/continue-on-error|kotlinc|python3|\|\| true/);
 
 
     // 传 true 的调用点全仓恰两处，都在 release-risk：打包腿（与「不上传」成对）与 Android 腿（不传发布）。
