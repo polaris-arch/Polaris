@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use polaris_config_engine::builder::build_id_to_tag_map;
 use polaris_config_engine::builder::helpers::ServerLike;
+use polaris_config_engine::singbox::InboundUser;
 use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_singbox_grpc::{ClientError, Endpoint, SingBoxApiClient};
 use serde_json::Value;
