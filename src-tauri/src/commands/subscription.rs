@@ -11,6 +11,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -22,6 +23,7 @@ use polaris_config_engine::builder::endpoint_routes::{
     is_mesh_node_unroutable, mesh_node_carries_full_tunnel,
 };
 use polaris_config_engine::builder::route::subscription_update_route_uses_proxy;
+use polaris_config_engine::user_config::app_config::SubscriptionInterfacePolicy;
 use polaris_config_engine::user_config::dns_constants::{is_sentinel_selection, DIRECT_SERVER_ID};
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_config_engine::user_config::UserConfig;
@@ -47,7 +49,7 @@ use crate::runtime::proxy::runtime_config::{
 };
 use crate::runtime::proxy::{ProxyRuntime, SwitchOutcome};
 use crate::runtime::subscription_parse::SubscriptionParseExecutor;
-use crate::runtime::subscription_refresh::SubscriptionRefreshToken;
+use crate::runtime::subscription_refresh::{SubscriptionRefreshOwner, SubscriptionRefreshToken};
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
 use crate::runtime::AppRuntime;
 
@@ -195,28 +197,24 @@ pub async fn subscription_update(
     let started = std::time::Instant::now();
     Ok(
         match subscription_update_core(state.config(), subscription, &state.subscription_refresh) {
-            Ok((cfg, owner)) => {
+            Ok(saved) => {
                 let save_ms = started.elapsed().as_millis();
-                let publication = match prepare_subscription_publication(
+                let publication = publish_subscription_edit(
                     state.config(),
                     state.proxy(),
-                    &cfg,
-                    owner.as_ref().map(|o| o.token()).as_ref(),
-                ) {
-                    Ok(Some(intent)) => {
+                    &saved,
+                    || super::config::emit_config_changed_signal(&app),
+                    |intent| {
                         super::config::broadcast_config_changed_with_registered_intent(
                             &app,
                             &state.proxy,
-                            &cfg,
+                            &saved.config,
                             intent,
                             |_, _| {},
                         );
-                        "scheduled"
-                    }
-                    Ok(None) => "superseded",
-                    Err(_) => "failed",
-                };
-                let refresh = if let Some(owner) = owner {
+                    },
+                );
+                let refresh = if let Some(owner) = saved.refresh_owner {
                     Some(
                         perform_owned_subscription_update(
                             &app,
@@ -248,17 +246,17 @@ fn valid_edit_request_id(id: &str) -> bool {
         && uuid::Uuid::parse_str(id).is_ok_and(|value| value.hyphenated().to_string() == id)
 }
 
+struct SavedSubscriptionEdit {
+    config: Value,
+    runtime_policy_changed: bool,
+    refresh_owner: Option<SubscriptionRefreshOwner>,
+}
+
 fn subscription_update_core(
     config: &crate::runtime::config::ConfigManager,
     subscription: Value,
     admission: &crate::runtime::subscription_refresh::SubscriptionRefreshAdmission,
-) -> Result<
-    (
-        Value,
-        Option<crate::runtime::subscription_refresh::SubscriptionRefreshOwner>,
-    ),
-    String,
-> {
+) -> Result<SavedSubscriptionEdit, String> {
     let subscription = normalized_subscription_update(subscription)?;
     let id = subscription
         .get("id")
@@ -287,6 +285,15 @@ fn subscription_update_core(
             .get_mut("subscriptions")
             .and_then(Value::as_array_mut)
             .expect("subscription index came from the same array");
+        // This is the engine's entire subscription input. Keep potential binding and
+        // URLTest policy changes eligible for runtime application even if currently inactive.
+        let runtime_policy_changed = match (
+            SubscriptionInterfacePolicy::deserialize(&arr[idx]),
+            SubscriptionInterfacePolicy::deserialize(&subscription),
+        ) {
+            (Ok(previous), Ok(next)) => previous != next,
+            _ => true,
+        };
         if ua_changed(&arr[idx], &subscription)
             || subscription_url_changed(&arr[idx], &subscription)
         {
@@ -295,12 +302,48 @@ fn subscription_update_core(
             set_or_remove(&mut subscription, "lastModified", None);
         }
         arr[idx] = subscription;
-        Decision::Write((Ok(()), refresh_needed.then(|| id.clone())))
+        Decision::Write((
+            Ok(runtime_policy_changed),
+            refresh_needed.then(|| id.clone()),
+        ))
     }) {
-        Ok((Ok(()), Some(cfg), owner)) => Ok((cfg, owner)),
+        Ok((Ok(runtime_policy_changed), Some(config), refresh_owner)) => {
+            Ok(SavedSubscriptionEdit {
+                config,
+                runtime_policy_changed,
+                refresh_owner,
+            })
+        }
         Ok((Err(error), None, None)) => Err(error),
         Ok(_) => unreachable!("subscription_update decision and persistence must agree"),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+fn publish_subscription_edit(
+    config: &crate::runtime::config::ConfigManager,
+    proxy: &ProxyRuntime,
+    saved: &SavedSubscriptionEdit,
+    signal: impl FnOnce(),
+    apply: impl FnOnce(u64),
+) -> &'static str {
+    if !saved.runtime_policy_changed {
+        // This signal rereads current disk state. A newer commit needs no snapshot or intent
+        // fence here because the signal never publishes the older value to a consumer.
+        signal();
+        return "scheduled";
+    }
+    let refresh_token = saved
+        .refresh_owner
+        .as_ref()
+        .map(SubscriptionRefreshOwner::token);
+    match prepare_subscription_publication(config, proxy, &saved.config, refresh_token.as_ref()) {
+        Ok(Some(intent)) => {
+            apply(intent);
+            "scheduled"
+        }
+        Ok(None) => "superseded",
+        Err(_) => "failed",
     }
 }
 

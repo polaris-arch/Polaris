@@ -138,7 +138,7 @@ fn malformed_metadata_edit_preserves_persisted_record_and_owned_nodes() {
         &crate::runtime::subscription_refresh::SubscriptionRefreshAdmission::default(),
     )
     .unwrap()
-    .0;
+    .config;
     assert_eq!(saved["subscriptions"][0]["name"], "Renamed");
     assert_eq!(saved["servers"], before["servers"]);
 }
@@ -275,14 +275,48 @@ async fn late_refresh_publication_cannot_invalidate_new_saved_edit_intent() {
             .unwrap()
             .unwrap();
     // Barrier: old refresh has committed, but has not dispatched its broadcast yet.
+    let mut rename = old_cfg["subscriptions"][0].clone();
+    rename["name"] = json!("Renamed");
+    let renamed = subscription_update_core(&config, rename, &admission).unwrap();
+    let signal_count = std::cell::Cell::new(0);
+    assert_eq!(
+        publish_subscription_edit(
+            &config,
+            &proxy,
+            &renamed,
+            || {
+                assert_eq!(
+                    config.load_full().unwrap()["subscriptions"][0]["name"],
+                    "Renamed"
+                );
+                signal_count.set(signal_count.get() + 1);
+            },
+            |_| panic!("metadata edit cannot pass saved config to Core"),
+        ),
+        "scheduled"
+    );
+    assert_eq!(signal_count.get(), 1);
+    assert!(proxy.selector_intent_is_current(old_intent));
+    assert!(old_owner.token().is_current());
+
+    // A new graph-affecting edit still gets its own runtime publication.
     let mut edit = old_cfg["subscriptions"][0].clone();
     edit["url"] = json!("https://example.invalid/b");
-    let (latest, new_owner) = subscription_update_core(&config, edit, &admission).unwrap();
-    let new_owner = new_owner.unwrap();
-    let new_intent =
-        prepare_subscription_publication(&config, &proxy, &latest, Some(&new_owner.token()))
-            .unwrap()
-            .unwrap();
+    edit["proxyBindInterface"] = json!("en0");
+    let latest = subscription_update_core(&config, edit, &admission).unwrap();
+    assert!(latest.refresh_owner.as_ref().unwrap().token().is_current());
+    let new_intent = std::cell::Cell::new(None);
+    assert_eq!(
+        publish_subscription_edit(
+            &config,
+            &proxy,
+            &latest,
+            || panic!("changed bind interface is a runtime policy change"),
+            |intent| new_intent.set(Some(intent)),
+        ),
+        "scheduled"
+    );
+    let new_intent = new_intent.get().unwrap();
     assert!(proxy.selector_intent_is_current(new_intent));
     assert_eq!(
         prepare_subscription_publication(&config, &proxy, &old_cfg, Some(&old_owner.token()))
@@ -308,7 +342,7 @@ async fn late_refresh_publication_cannot_invalidate_new_saved_edit_intent() {
     let new_projection = std::sync::atomic::AtomicBool::new(false);
     crate::commands::config::apply_config_broadcast_core(
         &proxy,
-        latest,
+        latest.config,
         false,
         new_intent,
         |_| new_projection.store(true, std::sync::atomic::Ordering::SeqCst),
@@ -380,17 +414,20 @@ fn edit_refresh_uses_effective_request_identity_not_metadata_or_requested_ua_tex
     let config = crate::runtime::config::ConfigManager::new(dir.clone());
     let mut initial = config.load_full().unwrap();
     initial["subscriptionUserAgent"] = json!("custom/1");
-    initial["subscriptions"] =
-        json!([{"id":"s","name":"Old","url":"https://example.invalid/a","etag":"old"}]);
+    initial["subscriptions"] = json!([{"id":"s","name":"Old","url":"https://example.invalid/a","etag":"old","proxyBindInterface":"en0"}]);
     config.save_full(&initial).unwrap();
     let admission = crate::runtime::subscription_refresh::SubscriptionRefreshAdmission::default();
-    for patch in [json!({"name":"Renamed"}), json!({"userAgent":"custom/1"})] {
+    for patch in [
+        json!({"name":"Renamed","autoUpdate":false,"periodicSpeedTest":true}),
+        json!({"userAgent":"custom/1","proxyBindInterface":" en0 "}),
+    ] {
         let mut edit = config.load_full().unwrap()["subscriptions"][0].clone();
         for (key, value) in patch.as_object().unwrap() {
             edit[key] = value.clone();
         }
-        let (_, owner) = subscription_update_core(&config, edit, &admission).unwrap();
-        assert!(owner.is_none());
+        let saved = subscription_update_core(&config, edit, &admission).unwrap();
+        assert!(saved.refresh_owner.is_none());
+        assert!(!saved.runtime_policy_changed);
     }
     for patch in [
         json!({"url":"https://example.invalid/b"}),
@@ -400,10 +437,19 @@ fn edit_refresh_uses_effective_request_identity_not_metadata_or_requested_ua_tex
         for (key, value) in patch.as_object().unwrap() {
             edit[key] = value.clone();
         }
-        let (saved, owner) = subscription_update_core(&config, edit, &admission).unwrap();
-        assert!(owner.unwrap().token().is_current());
-        assert!(saved["subscriptions"][0].get("etag").is_none());
+        let saved = subscription_update_core(&config, edit, &admission).unwrap();
+        assert!(saved.refresh_owner.unwrap().token().is_current());
+        assert!(!saved.runtime_policy_changed);
+        assert!(saved.config["subscriptions"][0].get("etag").is_none());
     }
+    let mut interval_edit = config.load_full().unwrap()["subscriptions"][0].clone();
+    interval_edit["speedTestIntervalMinutes"] = json!(10);
+    let saved = subscription_update_core(&config, interval_edit, &admission).unwrap();
+    assert!(saved.refresh_owner.is_none());
+    assert!(
+        saved.runtime_policy_changed,
+        "native Auto uses the interval"
+    );
 }
 
 #[test]
@@ -546,9 +592,12 @@ fn metadata_signal_releases_lock_and_late_signal_reads_newer_edit() {
     publish_subscription_metadata(&owner.token(), || {
         let mut edited = config.load_full().unwrap()["subscriptions"][0].clone();
         edited["url"] = json!("https://example.com/new");
-        let (saved, replacement) = subscription_update_core(&config, edited, &admission).unwrap();
-        next = replacement;
-        assert_eq!(saved["subscriptions"][0]["url"], "https://example.com/new");
+        let saved = subscription_update_core(&config, edited, &admission).unwrap();
+        next = saved.refresh_owner;
+        assert_eq!(
+            saved.config["subscriptions"][0]["url"],
+            "https://example.com/new"
+        );
         let latest = config.load_full().unwrap();
         assert_eq!(latest["subscriptions"][0]["url"], "https://example.com/new");
         assert!(latest["subscriptions"][0].get("etag").is_none());
