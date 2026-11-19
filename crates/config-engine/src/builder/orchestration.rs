@@ -12,7 +12,7 @@
 use crate::user_config::app_config::UserConfig;
 use crate::user_config::rule::RuleType;
 use crate::user_config::rules::rule_conditions;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 递归按 key 排序后序列化——使深比较对对象属性插入顺序不敏感。
 ///
@@ -101,7 +101,7 @@ pub fn config_generation_norm(
         for cond in rule_conditions(r) {
             if cond.type_field == RuleType::RuleSet {
                 for v in &cond.values {
-                    if let Some(rest) = v.strip_prefix("res:") {
+                    if let Some(rest) = v.trim().strip_prefix("res:") {
                         ids.insert(rest.to_string());
                     }
                 }
@@ -370,16 +370,17 @@ pub fn config_generation_norm(
     };
     proj.insert("appRules".into(), app_rules_proj);
 
-    // ruleResources 投影：仅被启用 ruleSet 引用的资源 id，排序。
-    let rule_resources_proj: Vec<serde_json::Value> = config
-        .rule_resources
-        .iter()
-        .filter(|rr| ids.contains(&rr.id))
-        .map(|rr| serde_json::Value::String(rr.id.clone()))
-        .collect();
-    let mut sorted_rr = rule_resources_proj;
-    sorted_rr.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
-    proj.insert("ruleResources".into(), serde_json::Value::Array(sorted_rr));
+    // Core 的本地 rule_set 使用被引用资源的路径和格式。重复 id 与生成器一样取首项。
+    let mut rule_resources_proj = BTreeMap::new();
+    for resource in config.rule_resources.iter().filter(|r| ids.contains(&r.id)) {
+        rule_resources_proj
+            .entry(resource.id.as_str())
+            .or_insert((resource.file_name.as_str(), resource.format));
+    }
+    proj.insert(
+        "ruleResources".into(),
+        serde_json::json!(rule_resources_proj),
+    );
 
     // servers 投影：过滤后按 id 稳定排序，每个节点只计算一次指纹。
     let mut servers_with_id: Vec<(&str, String)> = config

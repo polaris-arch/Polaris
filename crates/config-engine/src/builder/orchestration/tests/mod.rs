@@ -150,6 +150,81 @@ fn config_generation_norm_global_ignores_user_routing() {
 }
 
 #[test]
+fn norm_compares_referenced_rule_resource_path_and_format() {
+    use crate::user_config::proxy_mode::ProxyMode;
+    use crate::user_config::rule::{
+        Rule, RuleAction, RuleEffects, RuleResource, RuleResourceFormat,
+    };
+
+    let resource = RuleResource {
+        id: "local".into(),
+        name: "Original".into(),
+        category: "custom".into(),
+        source_url: "https://example.invalid/local".into(),
+        file_name: "previous.srs".into(),
+        format: RuleResourceFormat::Binary,
+        size: 128,
+        downloaded_at: "previous".into(),
+    };
+    let traffic_rule = Rule {
+        id: "route".into(),
+        type_field: RuleType::RuleSet,
+        values: vec!["res:local".into()],
+        action: RuleAction::Direct,
+        enabled: true,
+        ..Default::default()
+    };
+    let dns_rule = Rule {
+        id: "dns".into(),
+        values: vec![" res:local ".into()],
+        effects: Some(RuleEffects {
+            dns: Some(serde_json::from_value(serde_json::json!({})).unwrap()),
+            ..Default::default()
+        }),
+        ..traffic_rule.clone()
+    };
+
+    for config in [
+        UserConfig {
+            proxy_mode: ProxyMode::Smart,
+            traffic_rules: Some(vec![traffic_rule]),
+            rule_resources: vec![resource.clone()],
+            ..Default::default()
+        },
+        UserConfig {
+            proxy_mode: ProxyMode::Direct,
+            dns_rules: Some(vec![dns_rule]),
+            rule_resources: vec![resource.clone()],
+            ..Default::default()
+        },
+    ] {
+        let before = config_generation_norm(&config, None);
+        let mut next = config.clone();
+        next.rule_resources[0].file_name = "next.srs".into();
+        assert_ne!(before, config_generation_norm(&next, None));
+        next.rule_resources[0] = RuleResource {
+            format: RuleResourceFormat::Source,
+            ..resource.clone()
+        };
+        assert_ne!(before, config_generation_norm(&next, None));
+        next.rule_resources[0] = RuleResource {
+            name: "Renamed".into(),
+            source_url: "https://example.invalid/different".into(),
+            size: 256,
+            downloaded_at: "next".into(),
+            ..resource.clone()
+        };
+        assert_eq!(before, config_generation_norm(&next, None));
+        next.rule_resources.push(RuleResource {
+            id: "unreferenced".into(),
+            file_name: "unreferenced.srs".into(),
+            ..resource.clone()
+        });
+        assert_eq!(before, config_generation_norm(&next, None));
+    }
+}
+
+#[test]
 fn traffic_rules_target_is_hot_switch_axis_and_legacy_mirror_is_ignored() {
     use crate::user_config::proxy_mode::ProxyMode;
     use crate::user_config::rule::{Rule, RuleAction, RuleEffects, RuleRouteEffect, RuleType};
