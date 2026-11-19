@@ -804,7 +804,7 @@ export const STAGED_SETTING_LABELS: Readonly<Record<string, string>> = {
   networkProfiles: 'rules.networkProfile.title',
   ruleResources: 'settings.section.ruleResources',
   regionRouting: 'settings.section.regionRouting',
-  singboxDashboard: 'settings.network.mgmtEnable',
+  singboxDashboard: 'settings.section.singboxDashboard',
   clashApiSecret: 'settings.network.mgmtSecret',
   allowLan: 'settings.network.allowLan',
   bypassLAN: 'settings.advanced.bypassLAN',
