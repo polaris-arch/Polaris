@@ -61,8 +61,13 @@ if (platform === 'win') {
 run('node', ['scripts/prepare-core-identity.mjs', `--platform=${platform}`]);
 env.POLARIS_CORE_IDENTITY_FILE = join(root, res, 'core-manifest.json');
 const cli = `@tauri-apps/cli@${readFileSync(join(root, 'scripts/tauri-cli.version'), 'utf8').trim()}`;
+// cargo-xwin and Tauri's Windows build scripts suppress opposite default UCRT libraries.
+// Pass the static archive explicitly and let cargo-xwin resolve it in the selected SDK.
+const windowsCargoArgs = platform === 'win'
+  ? ['--', '--config', `target.${leg.target}.rustflags=["-C","link-arg=libucrt.lib"]`]
+  : [];
 run('npm', ['exec', '--yes', `--package=${cli}`, '--', 'tauri', 'build', ...(platform === 'win' ? ['--runner', 'cargo-xwin'] : []), ...target,
-  '--config', `src-tauri/tauri.${leg.conf}.conf.json`, '--bundles', leg.bundle]);
+  '--config', `src-tauri/tauri.${leg.conf}.conf.json`, '--bundles', leg.bundle, ...windowsCargoArgs]);
 run('node', ['scripts/prepare-core-identity.mjs', `--platform=${platform}`, '--mode=verify']);
 
 const bundle = `${out}/bundle/${leg.output}`;
