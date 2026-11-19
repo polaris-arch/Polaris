@@ -261,6 +261,7 @@ fn config_patch_app_metadata_cannot_authorize_an_older_saved_core_change() {
         ("autoUpdateSubscriptionOnStart", json!(false)),
         ("subscriptionUpdateIntervalHours", json!(24)),
         ("subscriptionProxyPolicy", json!("proxy")),
+        ("mainSessionViaProxy", json!(false)),
         ("ghProxyPrefix", json!("https://downloads.example.test")),
     ] {
         let patch = json!({ (key): value, "logLevel": "debug" });
