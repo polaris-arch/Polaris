@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
-import { constants, lstatSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { constants, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { pinned, readBoundedInput } from './source-admission.mjs';
+import { decode, pinned, readBoundedInput, receiptLimit, receiptPolicy } from './source-admission.mjs';
 
 const SDKS = new Map([['device-arm64', 'iphoneos'], ['sim-arm64', 'iphonesimulator']]);
 const APP = 'polaris_iOS';
@@ -158,6 +158,8 @@ const TUN_LINE_START = '(?:^|(?<=\\n))';
 const TUN_TRIM = new RegExp(`^${TUN_WS}+|${TUN_WS}+$`, 'g');
 const TUN_NAMES = new RegExp(`(?<!${TUN_WORD})(?:LibboxRuntimeTun(?:Platform|Session|Receipt)|setRuntimeTunPlatform|newTunSession)${TUN_WORD_END}`, 'u');
 const trimTunSpace = text => text.replace(TUN_TRIM, '');
+const stripHeaderComments = text => text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, ' ');
+const stripHeaderDirectives = text => text.replaceAll('\\\n', '').replace(/(?:^|(?<=\n))[ \t]*#[^\n]*/g, '');
 
 // Exact selectors from the pinned sagernet/gomobile v0.1.13 generator.
 const TUN_PLATFORM = {
@@ -217,7 +219,7 @@ function tunMethods(body, expected) {
 }
 
 function nativeTunABI(headers) {
-  const texts = headers.map(text => text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, ' '));
+  const texts = headers.map(stripHeaderComments);
   const relevant = texts.filter(text => TUN_NAMES.test(text));
   if (relevant.length === 0) return false;
   const conditional = new RegExp(`${TUN_LINE_START}${TUN_WS}*#${TUN_WS}*(if|ifdef|ifndef|elif|else|endif)${TUN_WORD_END}([^\\n]*)`, 'gu');
@@ -231,7 +233,7 @@ function nativeTunABI(headers) {
       && new RegExp(`${TUN_LINE_START}${TUN_WS}*#${TUN_WS}*define${TUN_WS}+${guard}${TUN_WS}*(?=\\n|$)`).test(text),
     'native TUN declarations use unsupported preprocessor conditions');
   }
-  const text = texts.map(part => part.replaceAll('\\\n', '').replace(/(?:^|(?<=\n))[ \t]*#[^\n]*/g, '')).join('\n');
+  const text = texts.map(stripHeaderDirectives).join('\n');
   for (const [name, methods] of [['LibboxRuntimeTunPlatform', TUN_PLATFORM], ['LibboxRuntimeTunSession', TUN_SESSION]]) {
     tunMethods(tunDeclaration(text, 'protocol', name), methods);
     tunMethods(tunDeclaration(text, 'interface', name, ['goSeqRefInterface', name]), methods);
@@ -244,9 +246,13 @@ function nativeTunABI(headers) {
   return true;
 }
 
-function writeCompilerArgs(path, bytes) {
+function checkCompilerOutput(path) {
   const info = lstatSync(path, { throwIfNoEntry: false });
   requireSetting(!info || info.isFile(), 'TLS/native compiler output redirected or is nonregular');
+}
+
+function writeCompilerArgs(path, bytes) {
+  checkCompilerOutput(path);
   const flag = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK;
   writeFileSync(path, bytes, { flag });
 }
@@ -256,7 +262,6 @@ function readCompilerArgs(path) {
 }
 
 // Receive the exact selected header contents already pinned by the caller.
-// Own only the native response file; the caller retains TLS and Xcode custody.
 export function nativeTunCompilerResponse(action, { headers, prepared, derived, receipt }) {
   requireSetting(['prepare', 'verify-parent', 'install', 'verify-installed'].includes(action)
     && typeof prepared === 'string' && prepared.length > 0, 'closed native TUN compiler action required');
@@ -278,9 +283,7 @@ export function nativeTunCompilerResponse(action, { headers, prepared, derived, 
     && receipt.contractVersion === NATIVE_TUN_CONTRACT && receipt.present === present && Object.hasOwn(receipt, 'compilerArgs'),
   'prepared native TUN ABI decision differs from actual headers');
   const parent = readCompilerArgs(original);
-  requireSetting(isObject(receipt.compilerArgs) && Object.keys(receipt.compilerArgs).length === 2
-    && receipt.compilerArgs.bytes === parent.pin.bytes && receipt.compilerArgs.sha256 === parent.pin.sha256,
-  'parent native TUN compiler response file changed');
+  requireSetting(matchesPin(receipt.compilerArgs, parent.pin), 'parent native TUN compiler response file changed');
   requireSetting(parent.bytes.equals(args), 'unexpected native TUN compiler arguments');
   if (action === 'verify-parent') return result;
 
@@ -295,13 +298,153 @@ export function nativeTunCompilerResponse(action, { headers, prepared, derived, 
   return result;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+const TLS_FLAGS = 'PolarisTLSFingerprintLinker.args';
+const TLS_RECEIPT = 'PolarisTLSFingerprintLinker.json';
+const TLS_RECEIPT_BYTES = 65536;
+const TLS_FLAGS_BYTES = 256;
+const TLS_FUNCTION = 'LibboxTLSFingerprintCapabilities';
+const TLS_FLAG_CONTENT = Buffer.from(`-Xlinker\n-u\n-Xlinker\n_${TLS_FUNCTION}\n`);
+const RECEIPT_LIMITS = receiptPolicy.receipt;
+const headerDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+function tlsCapabilityPresent(headers, defined) {
+  const nullableRegions = new RegExp(`(?<!${TUN_WORD})NS_ASSUME_NONNULL_(?:BEGIN|END)${TUN_WORD_END}`, 'gu');
+  const functionMarker = new RegExp(`(?<!${TUN_WORD})${TLS_FUNCTION}${TUN_WORD_END}${TUN_WS}*\\(`, 'u');
+  const declarations = headers.flatMap(header => stripHeaderDirectives(stripHeaderComments(header))
+    .replace(nullableRegions, '').split(/[;{}]/).filter(part => functionMarker.test(part)).map(trimTunSpace));
+  requireSetting((declarations.length > 0) === defined, 'libbox TLS capability declaration/definition mismatch');
+  if (defined) {
+    const abi = new RegExp(`^(?:FOUNDATION_EXPORT${TUN_WS}+)?NSString${TUN_WS}*\\*${TUN_WS}*_Nonnull${TUN_WS}+${TLS_FUNCTION}`
+      + `${TUN_WS}*\\(${TUN_WS}*NSError${TUN_WS}*\\*${TUN_WS}*_Nullable${TUN_WS}*\\*${TUN_WS}*_Nullable${TUN_WS}+${TUN_WORD}+${TUN_WS}*\\)$`, 'u');
+    requireSetting(declarations.length === 1, 'libbox TLS capability declaration is not unique');
+    requireSetting(abi.test(declarations[0]), 'libbox TLS capability C ABI differs from the optional Swift bridge');
+  }
+  return defined;
+}
+
+function matchesPin(expected, actual) {
+  return isObject(expected) && Object.keys(expected).length === 2
+    && expected.bytes === actual.bytes && expected.sha256 === actual.sha256;
+}
+
+function frameworkInput(boundary, path) {
+  let physical;
+  try { physical = realpathSync(path); } catch { throw new Error('libbox framework input missing or unresolvable'); }
+  const subpath = relative(boundary, physical);
+  requireSetting(!isAbsolute(subpath) && subpath !== '..' && !subpath.startsWith(`..${sep}`),
+    'libbox input escaped selected framework');
+  return physical;
+}
+
+function selectedTLSInputs(env) {
+  const root = env.POLARIS_MOBILE_LINK_INPUT;
+  const context = pinned(root, RECEIPT_LIMITS.appleLinkBytes, true);
+  requireSetting(context.pin.sha256 === env.POLARIS_MOBILE_LINK_INPUT_SHA256,
+    'actual mobile link context changed before TLS capability preparation');
+  const link = decode(context.bytes, RECEIPT_LIMITS.appleLinkBytes, receiptLimit);
+  const device = env.PLATFORM_NAME === SDKS.get('device-arm64');
+  requireSetting((device || env.PLATFORM_NAME === SDKS.get('sim-arm64')) && env.ARCHS === 'arm64',
+    'unrequested PacketTunnel TLS capability target');
+  const identifier = device ? 'ios-arm64' : 'ios-arm64-simulator';
+  const selected = link.componentOutput?.slices?.[identifier];
+  requireSetting(selected?.libraryIdentifier === identifier, 'selected libbox slice differs from PacketTunnel target');
+  const framework = resolve(link.framework, identifier, 'Libbox.framework');
+  requireSetting(lstatSync(framework, { throwIfNoEntry: false })?.isDirectory(), 'libbox framework root redirected/missing');
+  const boundary = realpathSync(framework);
+  const binaryPath = frameworkInput(boundary, join(framework, 'Libbox'));
+  const { pin: binary } = pinned(binaryPath, RECEIPT_LIMITS.artifactBytes);
+  requireSetting(matchesPin(selected.binary, binary), 'actual libbox link bytes differ');
+  const headerRoot = frameworkInput(boundary, join(framework, 'Headers'));
+  const files = readdirSync(headerRoot).filter(name => name.endsWith('.h')).sort();
+  requireSetting(files.length > 0 && files.length <= 64, 'libbox generated header inventory exceeds budget');
+  let remaining = HEADER_BYTES;
+  const headers = Object.create(null);
+  for (const name of files) {
+    const path = frameworkInput(boundary, join(headerRoot, name));
+    requireSetting(statSync(path).size <= remaining, 'libbox generated header inventory exceeds budget');
+    const { bytes, pin } = pinned(path, remaining);
+    remaining -= bytes.length;
+    headers[basename(path)] = { text: headerDecoder.decode(bytes), pin };
+  }
+  return { binaryPath, binary, headers };
+}
+
+// Native tool output is observed under the existing Python parent lease. Xcode
+// consumes only the prepared bytes and never observes or uses its stale fd.
+function tlsCompilerResponse(action, env) {
+  if (action === 'select') return selectedTLSInputs(env);
+  const derived = env.DERIVED_FILE_DIR;
+  requireSetting(typeof derived === 'string' && derived.length > 0, 'TLS compiler response directory required');
+  if (action === 'prepare') {
+    // Only the admitted parent sends this pinned snapshot and its nm decision.
+    const { input, defined } = JSON.parse(readBoundedInput(6 * HEADER_BYTES + TLS_RECEIPT_BYTES).toString('utf8'));
+    requireSetting(typeof defined === 'boolean', 'TLS native symbol observation required');
+    const headers = Object.entries(input.headers);
+    const texts = headers.map(([, header]) => header.text);
+    const capabilityPresent = tlsCapabilityPresent(texts, defined);
+    mkdirSync(derived, { recursive: true });
+    const flagsPath = join(derived, TLS_FLAGS), receiptPath = join(derived, TLS_RECEIPT);
+    checkCompilerOutput(flagsPath);
+    checkCompilerOutput(receiptPath);
+    const nativeTun = nativeTunCompilerResponse('prepare', { headers: texts, prepared: derived });
+    const flags = capabilityPresent ? TLS_FLAG_CONTENT : Buffer.alloc(0);
+    const receipt = { capabilityPresent, binary: input.binary, headers: Object.fromEntries(headers.map(([name, row]) => [name, row.pin])),
+      flags: pin(flags), devicePassed: false, nativeTun };
+    writeCompilerArgs(flagsPath, flags);
+    writeCompilerArgs(receiptPath, `${JSON.stringify(receipt)}\n`);
+    return;
+  }
+
+  requireSetting(['install', 'verify-installed', 'verify-parent'].includes(action), 'closed TLS compiler response action required');
+  const prepared = env.POLARIS_TLS_PREPARED_ROOT;
+  const receipt = pinned(join(prepared, TLS_RECEIPT), TLS_RECEIPT_BYTES);
+  requireSetting(receipt.pin.sha256 === env.POLARIS_TLS_PREPARED_SHA256, 'parent TLS capability receipt changed');
+  const value = decode(receipt.bytes, TLS_RECEIPT_BYTES);
+  requireSetting(isObject(value) && Object.keys(value).length === 6
+    && ['binary', 'headers', 'flags', 'nativeTun'].every(key => Object.hasOwn(value, key))
+    && typeof value.capabilityPresent === 'boolean' && value.devicePassed === false,
+  'prepared TLS capability receipt structure differs');
+  const flags = pinned(join(prepared, TLS_FLAGS), TLS_FLAGS_BYTES, false, { allowEmpty: true });
+  requireSetting(matchesPin(value.flags, flags.pin), 'parent TLS capability flags changed');
+  const { binary, headers } = selectedTLSInputs(env);
+  const headerEntries = Object.entries(headers);
+  requireSetting(matchesPin(value.binary, binary) && isObject(value.headers)
+    && Object.keys(value.headers).length === headerEntries.length
+    && headerEntries.every(([name, row]) => matchesPin(value.headers[name], row.pin)),
+  'prepared TLS capability inputs differ from selected framework');
+  requireSetting(flags.bytes.equals(value.capabilityPresent ? TLS_FLAG_CONTENT : Buffer.alloc(0)),
+    'unexpected TLS capability linker flags');
+
+  if (action !== 'verify-parent') mkdirSync(derived, { recursive: true });
+  const derivedFlags = join(derived, TLS_FLAGS), derivedReceipt = join(derived, TLS_RECEIPT);
+  if (action === 'install') {
+    checkCompilerOutput(derivedFlags);
+    checkCompilerOutput(derivedReceipt);
+  }
+  const nativeTun = nativeTunCompilerResponse(action, {
+    headers: headerEntries.map(([, row]) => row.text), prepared, derived, receipt: value.nativeTun,
+  });
+  if (action === 'install') {
+    writeCompilerArgs(derivedFlags, flags.bytes);
+    writeCompilerArgs(derivedReceipt, receipt.bytes);
+  } else if (action === 'verify-parent') {
+    requireSetting(realpathSync(derived) === realpathSync(prepared), 'final TLS verifier must use parent prepared inputs');
+    return { capabilityPresent: value.capabilityPresent, nativeTunHeaderABIAvailable: nativeTun.present };
+  } else {
+    requireSetting(pinned(derivedFlags, TLS_FLAGS_BYTES, false, { allowEmpty: true }).bytes.equals(flags.bytes)
+      && pinned(derivedReceipt, TLS_RECEIPT_BYTES).bytes.equals(receipt.bytes), 'installed TLS linker inputs changed');
+    return { scope: 'installed TLS linker input bytes only; final native verification belongs to parent',
+      loadedQueryExecuted: false, devicePassed: false };
+  }
+}
+
+const entry = process.argv[1];
+if (entry && basename(entry) === 'apple-admission.mjs' && realpathSync(entry) === fileURLToPath(import.meta.url)) {
   const [, , slot, query, minimum, scheme] = process.argv;
-  if (slot === '--native-tun') {
+  if (slot === '--tls-link') {
     try {
-      // A JSON escape can expand one header byte to six; paths are separate argv.
-      const { headers, receipt } = JSON.parse(readBoundedInput(6 * HEADER_BYTES + 4096).toString('utf8'));
-      process.stdout.write(JSON.stringify(nativeTunCompilerResponse(query, { headers, receipt, prepared: minimum, derived: scheme })));
+      const result = tlsCompilerResponse(query, process.env);
+      if (result !== undefined) console.log(JSON.stringify(result));
     } catch (error) {
       console.error(error.message);
       process.exitCode = 1;

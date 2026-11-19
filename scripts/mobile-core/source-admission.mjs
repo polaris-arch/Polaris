@@ -134,6 +134,13 @@ export class ReceiptFloat {
   }
 }
 
+export function receiptLimit(value) {
+  demand(object(value) && !(value instanceof ReceiptFloat), 'receipt must be an object');
+  if (value.schema === 'polaris-mobile-component-v1' && value.platform === 'apple') return limits.appleComponentBytes;
+  if (value.schema === 'polaris-mobile-apple-link-input-v1') return limits.appleLinkBytes;
+  return limits.controlBytes;
+}
+
 function lexicalBudget(raw) {
   let quoted = false, escaped = false, depth = 0, tokens = 0, stringBytes = 0;
   for (const byte of raw) {

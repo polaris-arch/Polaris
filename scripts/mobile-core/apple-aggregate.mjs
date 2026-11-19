@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { requireGraph as demand } from '../desktop-core/source-graph.mjs';
-import { characters, decode, pinned, readMobileSource, ReceiptFloat, receiptPolicy as policy } from './source-admission.mjs';
+import { characters, decode, pinned, readMobileSource, ReceiptFloat, receiptLimit, receiptPolicy as policy } from './source-admission.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const limits = policy.receipt;
@@ -19,13 +19,6 @@ const targets = {
   'sim-arm64': { rust: 'aarch64-apple-ios-sim', carrier: 'ios-arm64-simulator' },
 };
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-
-function receiptLimit(value) {
-  demand(object(value) && !(value instanceof ReceiptFloat), 'receipt must be an object');
-  if (value.schema === 'polaris-mobile-component-v1' && value.platform === 'apple') return limits.appleComponentBytes;
-  if (value.schema === 'polaris-mobile-apple-link-input-v1') return limits.appleLinkBytes;
-  return limits.controlBytes;
-}
 
 function floatText(n) {
   if (Object.is(n, -0)) return '-0.0';

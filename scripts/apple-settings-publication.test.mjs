@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -264,20 +264,25 @@ test('partial, wrong, duplicate or disabled native TUN declarations fail closed'
   assert.throws(() => readFileSync(join(input.prepared, responseName)), { code: 'ENOENT' });
 });
 
-test('the Apple build CLI binds the native TUN response to each selected device and simulator slice', async t => {
+test('the Apple build CLI binds TLS and native TUN inputs to each selected device and simulator slice', async t => {
   const sdks = [['iphoneos', 'ios-arm64'], ['iphonesimulator', 'ios-arm64-simulator']];
   const mobileCore = fileURLToPath(new URL('./mobile-core/', import.meta.url));
   const source = JSON.parse(readFileSync(new URL('./mobile-core/source-contract.json', import.meta.url)));
   const receiptName = 'PolarisTLSFingerprintLinker.json';
   const linkerName = 'PolarisTLSFingerprintLinker.args';
   const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+  const tlsSymbol = '_LibboxTLSFingerprintCapabilities';
+  const tlsHeader = `NSString* _Nonnull ${tlsSymbol.slice(1)}(NSError* _Nullable* _Nullable error);`;
+  const wrongTlsHeader = `void ${tlsSymbol.slice(1)}(void);`;
   for (const [platform, selected] of sdks) {
     for (const present of [true, false]) {
       await t.test(`${platform} ${present ? 'native TUN V1' : 'legacy'}`, t => {
+        const tlsPresent = (platform === 'iphoneos') === present;
         const { root, prepared, derived } = tunDirectories(t);
         const linkedScripts = join(root, 'mobile-core');
         symlinkSync(mobileCore, linkedScripts);
         const script = join(linkedScripts, 'apple_tls_fingerprint.py');
+        const hook = join(linkedScripts, 'apple-admission.mjs');
         const framework = join(root, 'Libbox.xcframework');
         const slices = {};
         for (const [, identifier] of sdks) {
@@ -286,7 +291,9 @@ test('the Apple build CLI binds the native TUN response to each selected device 
           const binary = Buffer.from(`inert selected static archive ${identifier}`);
           mkdirSync(join(version, 'Headers'), { recursive: true });
           writeFileSync(join(version, 'Libbox'), binary);
-          writeFileSync(join(version, 'Headers', 'Libbox.h'), (identifier === selected) === present ? tunHeader : oldHeader);
+          const nativeHeader = (identifier === selected) === present ? tunHeader : oldHeader;
+          const header = (identifier === selected) === tlsPresent ? `${tlsHeader}\n${nativeHeader}` : nativeHeader;
+          writeFileSync(join(version, 'Headers', 'Libbox.h'), header);
           symlinkSync('A', join(folder, 'Versions', 'Current'));
           symlinkSync('Versions/Current/Libbox', join(folder, 'Libbox'));
           symlinkSync('Versions/Current/Headers', join(folder, 'Headers'));
@@ -296,10 +303,22 @@ test('the Apple build CLI binds the native TUN response to each selected device 
         writeFileSync(link, JSON.stringify({ framework, componentOutput: { slices } }));
         const executable = Buffer.from('inert final PacketTunnel executable');
         writeFileSync(join(root, 'extension'), executable);
-        // Substitute only xcrun. The fixture's nm accepts the selected archive and never invokes native tools.
-        writeFileSync(join(root, 'xcrun'), '#!/bin/sh\n'
-          + 'test "$#" -eq 4 && test "$1 $2 $3" = "nm --no-llvm-bc -gU" && test "$4" = "$FIXTURE_BINARY" || exit 97\n'
-          + 'printf "T _LibboxVersion\\n"\n', { mode: 0o700 });
+        const nativeTrace = join(root, 'native-tools.log');
+        // Substitute only the native observations, checking their exact source and final paths.
+        writeFileSync(join(root, 'xcrun'), `#!/bin/sh
+printf '%s\\n' "$1" >> "$FIXTURE_NATIVE_TRACE"
+test -n "$FIXTURE_BINARY" || exit 97
+if [ "$#" -eq 4 ] && [ "$1 $2 $3" = "nm --no-llvm-bc -gU" ]; then
+  if [ "$4" = "$FIXTURE_BINARY" ]; then printf 'T %s\\n' "$FIXTURE_SYMBOL"; exit; fi
+  if [ "$4" = "$TARGET_BUILD_DIR/$EXECUTABLE_PATH" ]; then
+    printf 'T %s\\n' "\${FIXTURE_FINAL_NM-$FIXTURE_SYMBOL}"; exit
+  fi
+fi
+if [ "$#" -eq 3 ] && [ "$1 $2" = "dyld_info -exports" ] && [ "$3" = "$TARGET_BUILD_DIR/$EXECUTABLE_PATH" ]; then
+  printf '%s\\n' "\${FIXTURE_FINAL_EXPORT-$FIXTURE_SYMBOL}"; exit
+fi
+exit 97
+`, { mode: 0o700 });
 
         const budget = join(root, 'budget');
         mkdirSync(budget, { mode: 0o700 });
@@ -314,9 +333,12 @@ test('the Apple build CLI binds the native TUN response to each selected device 
           POLARIS_MOBILE_LINK_INPUT: link, POLARIS_MOBILE_LINK_INPUT_SHA256: sha256(readFileSync(link)),
           POLARIS_APP_WORK: root, POLARIS_BUILD_BUDGET_ROOT: budget, POLARIS_FORMAL_APP_BUILD: '1',
           FIXTURE_BINARY: join(framework, selected, 'Libbox.framework', 'Versions', 'A', 'Libbox'),
+          FIXTURE_SYMBOL: tlsPresent ? tlsSymbol : '_LibboxVersion',
+          FIXTURE_NATIVE_TRACE: nativeTrace,
           TARGET_BUILD_DIR: root, EXECUTABLE_PATH: 'extension' };
         const invoke = (action, env, parent = false) => {
-          const result = spawnSync('python3', ['-B', script, action], { encoding: 'utf8', timeout: 30_000,
+          const result = spawnSync(parent ? 'python3' : process.execPath,
+            parent ? ['-B', script, action] : [hook, '--tls-link', action], { encoding: 'utf8', timeout: 30_000,
             env: { ...env, POLARIS_BUILD_RESERVATION_FD: parent ? '3' : '999999' },
             stdio: ['ignore', 'pipe', 'pipe', parent ? fd : 'ignore'] });
           assert.ifError(result.error);
@@ -324,13 +346,98 @@ test('the Apple build CLI binds the native TUN response to each selected device 
         };
 
         const parentEnv = { ...env, DERIVED_FILE_DIR: prepared };
+        const frameworkPath = join(framework, selected, 'Libbox.framework');
+        const chosenHeader = join(frameworkPath, 'Headers', 'Libbox.h');
+        const headerBytes = readFileSync(chosenHeader);
+        if (platform === 'iphoneos' && present) {
+          const rejectsPreparation = (reason, inputs = parentEnv) => {
+            const result = invoke('prepare', inputs, true);
+            assert.equal(result.status, 1, result.stderr);
+            assert.match(result.stderr, reason);
+            assert.throws(() => readFileSync(join(prepared, receiptName)), { code: 'ENOENT' });
+          };
+          rejectsPreparation(/declaration\/definition mismatch/, { ...parentEnv, FIXTURE_SYMBOL: '_LibboxVersion' });
+          for (const [prefix, reason] of [
+            [`/* ${tlsHeader} */\n`, /declaration\/definition mismatch/],
+            [`${wrongTlsHeader} // ${tlsHeader}\n`, /capability C ABI differs/],
+            [`${tlsHeader}\n${tlsHeader}\n`, /capability declaration is not unique/],
+            [`${tlsHeader}\n${wrongTlsHeader}\n`, /capability declaration is not unique/],
+            [`${tlsHeader.slice(0, -1)}${wrongTlsHeader}\n`, /capability C ABI differs/],
+          ]) {
+            writeFileSync(chosenHeader, prefix + tunHeader);
+            rejectsPreparation(reason);
+          }
+          writeFileSync(chosenHeader, '');
+          rejectsPreparation(/bounded regular original receipt or artifact required/);
+          writeFileSync(chosenHeader, headerBytes);
+
+          const linkBytes = readFileSync(link);
+          const wrongSlice = JSON.parse(linkBytes);
+          wrongSlice.componentOutput.slices[selected].libraryIdentifier = 'ios-arm64-simulator';
+          const wrongLink = JSON.stringify(wrongSlice);
+          writeFileSync(link, wrongLink);
+          rejectsPreparation(/selected libbox slice differs/, { ...parentEnv, POLARIS_MOBILE_LINK_INPUT_SHA256: sha256(wrongLink) });
+          writeFileSync(link, linkBytes);
+
+          const binary = readFileSync(env.FIXTURE_BINARY);
+          writeFileSync(env.FIXTURE_BINARY, '');
+          rejectsPreparation(/bounded regular original receipt or artifact required/);
+          writeFileSync(env.FIXTURE_BINARY, 'different');
+          rejectsPreparation(/actual libbox link bytes differ/);
+          writeFileSync(env.FIXTURE_BINARY, binary);
+          const outside = join(root, 'foreign-binary');
+          const binaryAlias = join(frameworkPath, 'Libbox');
+          const currentAlias = join(frameworkPath, 'Versions', 'Current');
+          writeFileSync(outside, binary);
+          unlinkSync(binaryAlias);
+          for (const [target, reason] of [['../../../foreign-binary', /escaped selected framework/],
+            [outside, /escaped selected framework/], ['Libbox', /input missing or unresolvable/]]) {
+            symlinkSync(target, binaryAlias);
+            rejectsPreparation(reason);
+            unlinkSync(binaryAlias);
+          }
+          symlinkSync('Versions/Current/Libbox', binaryAlias);
+          unlinkSync(currentAlias);
+          symlinkSync('missing', currentAlias);
+          rejectsPreparation(/input missing or unresolvable/);
+          unlinkSync(currentAlias);
+          symlinkSync('A', currentAlias);
+
+          const outsideHeaders = join(root, 'foreign-headers');
+          const headersAlias = join(frameworkPath, 'Headers');
+          mkdirSync(outsideHeaders);
+          writeFileSync(join(outsideHeaders, 'Libbox.h'), headerBytes);
+          unlinkSync(headersAlias);
+          symlinkSync(outsideHeaders, headersAlias);
+          rejectsPreparation(/escaped selected framework/);
+          unlinkSync(headersAlias);
+          symlinkSync('Versions/Current/Headers', headersAlias);
+          const movedFramework = join(framework, selected, 'moved.framework');
+          renameSync(frameworkPath, movedFramework);
+          symlinkSync(movedFramework, frameworkPath);
+          rejectsPreparation(/framework root redirected\/missing/);
+          unlinkSync(frameworkPath);
+          renameSync(movedFramework, frameworkPath);
+        }
+        writeFileSync(nativeTrace, '');
         const preparation = invoke('prepare', parentEnv, true);
         assert.equal(preparation.status, 0, preparation.stderr);
         const expected = Buffer.from(present ? tunDefine : '');
-        const receipt = readFileSync(join(prepared, receiptName));
-        assert.deepEqual(JSON.parse(receipt).nativeTun, { contractVersion: 'polaris-native-tun-v1', present,
+        const preparedReceipt = join(prepared, receiptName);
+        const generatedReceipt = readFileSync(preparedReceipt);
+        const parsed = JSON.parse(generatedReceipt);
+        // A retained receipt's pinned formatting survives byte-for-byte installation.
+        const receipt = platform === 'iphoneos' && present ? Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`) : generatedReceipt;
+        if (receipt !== generatedReceipt) writeFileSync(preparedReceipt, receipt);
+        const expectedLinker = Buffer.from(tlsPresent ? `-Xlinker\n-u\n-Xlinker\n${tlsSymbol}\n` : '');
+        assert.equal(parsed.capabilityPresent, tlsPresent);
+        assert.deepEqual(parsed.binary, slices[selected].binary);
+        assert.deepEqual(parsed.headers, { 'Libbox.h': { bytes: headerBytes.length, sha256: sha256(headerBytes) } });
+        assert.deepEqual(parsed.flags, { bytes: expectedLinker.length, sha256: sha256(expectedLinker) });
+        assert.deepEqual(parsed.nativeTun, { contractVersion: 'polaris-native-tun-v1', present,
           compilerArgs: { bytes: expected.length, sha256: sha256(expected) } });
         assert.deepEqual(readFileSync(join(prepared, responseName)), expected);
+        assert.deepEqual(readFileSync(join(prepared, linkerName)), expectedLinker);
         const pins = { POLARIS_TLS_PREPARED_ROOT: prepared, POLARIS_TLS_PREPARED_SHA256: sha256(receipt) };
         const hookEnv = { ...env, ...pins, DERIVED_FILE_DIR: derived, FIXTURE_BINARY: '' };
         const installed = join(derived, responseName);
@@ -344,7 +451,42 @@ test('the Apple build CLI binds the native TUN response to each selected device 
         assert.equal(installedVerification.status, 0, installedVerification.stderr);
         const finalVerification = invoke('verify', { ...parentEnv, ...pins }, true);
         assert.equal(finalVerification.status, 0, finalVerification.stderr);
-        assert.equal(JSON.parse(finalVerification.stdout).nativeTunHeaderABIAvailable, present);
+        assert.deepEqual(JSON.parse(finalVerification.stdout), {
+          scope: 'actual-final-PacketTunnel-static-link', capabilityPresent: tlsPresent, nativeTunHeaderABIAvailable: present,
+          executable: { bytes: executable.length, sha256: sha256(executable) }, loadedQueryExecuted: false, devicePassed: false,
+        });
+        assert.equal(readFileSync(nativeTrace, 'utf8'), tlsPresent ? 'nm\nnm\ndyld_info\n' : 'nm\n');
+        if (platform === 'iphoneos' && present) {
+          for (const [changes, reason] of [
+            [{ FIXTURE_FINAL_NM: '_LibboxVersion', FIXTURE_FINAL_EXPORT: tlsSymbol }, /final PacketTunnel stripped/],
+            [{ FIXTURE_FINAL_EXPORT: `${tlsSymbol}_extra` }, /not dynamically discoverable/],
+            [{ DERIVED_FILE_DIR: derived }, /final TLS verifier must use parent prepared inputs/],
+          ]) {
+            const result = invoke('verify', { ...parentEnv, ...pins, ...changes }, true);
+            assert.equal(result.status, 1, result.stderr);
+            assert.match(result.stderr, reason);
+          }
+          const installedFlags = join(derived, linkerName);
+          writeFileSync(installedFlags, 'tampered linker flags');
+          const result = invoke('verify-installed', hookEnv);
+          assert.equal(result.status, 1, result.stderr);
+          assert.match(result.stderr, /installed TLS linker inputs changed/);
+          writeFileSync(installedFlags, expectedLinker);
+          const flags = join(prepared, linkerName);
+          unlinkSync(flags);
+          symlinkSync(installedFlags, flags);
+          const redirected = invoke('verify', { ...parentEnv, ...pins }, true);
+          assert.equal(redirected.status, 1, redirected.stderr);
+          assert.match(redirected.stderr, /bounded regular original receipt or artifact required/);
+          unlinkSync(flags);
+          writeFileSync(flags, expectedLinker);
+          const finalExecutable = join(root, 'extension');
+          writeFileSync(finalExecutable, '');
+          const empty = invoke('verify', { ...parentEnv, ...pins }, true);
+          assert.equal(empty.status, 1, empty.stderr);
+          assert.match(empty.stderr, /bounded regular artifact required/);
+          writeFileSync(finalExecutable, executable);
+        }
 
         writeFileSync(installed, present ? tunDefine.replace('_V1', '_XX') : tunDefine);
         const tamperedInstallation = invoke('verify-installed', hookEnv);
@@ -354,7 +496,6 @@ test('the Apple build CLI binds the native TUN response to each selected device 
         const alteredReceipt = JSON.parse(receipt);
         alteredReceipt.nativeTun.present = !present;
         const alteredBytes = JSON.stringify(alteredReceipt);
-        const preparedReceipt = join(prepared, receiptName);
         writeFileSync(preparedReceipt, alteredBytes);
         const alteredPin = { POLARIS_TLS_PREPARED_SHA256: sha256(alteredBytes) };
         const tamperedFinal = invoke('verify', { ...parentEnv, ...pins, ...alteredPin }, true);
@@ -385,6 +526,21 @@ test('the Apple build CLI binds the native TUN response to each selected device 
         writeFileSync(parentArgs, '');
         rejectsInstall(/parent native TUN compiler response file changed/);
         writeFileSync(parentArgs, expected);
+
+        if (platform === 'iphoneos') {
+          for (const [path, reason] of [
+            [preparedReceipt, /parent TLS capability receipt changed/],
+            [join(prepared, linkerName), /parent TLS capability flags changed/],
+            [env.FIXTURE_BINARY, /actual libbox link bytes differ/],
+            [chosenHeader, /prepared TLS capability inputs differ from selected framework/],
+            [link, /actual mobile link context changed/],
+          ]) {
+            const bytes = readFileSync(path);
+            writeFileSync(path, Buffer.concat([bytes, Buffer.from('changed')]));
+            rejectsInstall(reason);
+            writeFileSync(path, bytes);
+          }
+        }
 
         const foreign = join(root, 'foreign-args');
         writeFileSync(foreign, prior);
