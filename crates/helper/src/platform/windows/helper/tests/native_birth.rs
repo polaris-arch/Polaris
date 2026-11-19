@@ -287,6 +287,26 @@ fn bounded_terminal_cache_eviction_and_helper_restart_are_unknown() {
 }
 
 #[test]
+fn native_status_reports_the_verified_core_of_the_original_birth() {
+    let h = make_helper_defaults();
+    let target = start(&h, false);
+    let expected = &h.test_context.as_ref().unwrap().core.manifest.id;
+    assert!(matches!(
+        handle_selected(&h, "real-token", Request::NativeStatusBirth),
+        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Running { target: running, core: Some(core), .. },
+        ))) if running == target && core.as_str() == expected
+    ));
+    assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });
+    assert_eq!(
+        handle_selected(&h, "real-token", Request::NativeStatusBirth),
+        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Empty,
+        )))
+    );
+}
+
+#[test]
 fn native_status_is_read_only_capability_and_never_mints_a_birth_for_legacy_state() {
     let h = make_helper_defaults();
     h.child_mu.lock().unwrap().pid = Some(42);

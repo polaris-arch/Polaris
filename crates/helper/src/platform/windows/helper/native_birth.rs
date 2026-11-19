@@ -184,11 +184,15 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                         NativeBirthStatus::Stopping { target }
                     } else {
                         let identity = self.proc.managed_identity(target.pid.get());
+                        let core = native.core.as_ref().and_then(|core| {
+                            polaris_helper_proto::core_manifest::CoreId::parse(&core.manifest.id)
+                                .ok()
+                        });
                         NativeBirthStatus::Running {
                             target,
                             created: identity.created,
                             image: identity.image,
-                            core: None,
+                            core,
                         }
                     }
                 }
