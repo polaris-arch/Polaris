@@ -108,12 +108,28 @@ fn scheduler_publishes_before_sleep_then_finishes_its_own_ticket() {
     );
     let fast = body("async fn try_first_proxy_probe(");
     let settle = fast
-        .find("runtime.wait_for_network_settled().await")
+        .find("timeout_at(fallback_at, runtime.wait_for_network_settled())")
+        .unwrap();
+    let route = fast.find("runtime.pinned_exit_ip_route()").unwrap();
+    let caps = fast
+        .find("runtime.prepare_pinned_exit_ip(&route, fallback_at)")
+        .unwrap();
+    let confirm = fast
+        .find("runtime.with_pinned_exit_ip_route(&route, || ())")
         .unwrap();
     let claim = fast.find("begin_scheduled_probe(ticket, true)").unwrap();
-    let probe = fast.find("runtime.probe_pinned_exit_ip(").unwrap();
+    let probe = fast
+        .find("runtime.probe_pinned_exit_ip(&route, request, fallback_at)")
+        .unwrap();
     let publish = fast.find("probe_publish_ipinfo(").unwrap();
-    assert!(settle < claim && claim < probe && probe < publish);
+    assert!(
+        settle < route
+            && route < caps
+            && caps < confirm
+            && confirm < claim
+            && claim < probe
+            && probe < publish
+    );
 }
 
 #[test]
