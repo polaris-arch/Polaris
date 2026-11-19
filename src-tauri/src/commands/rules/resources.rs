@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -241,6 +242,8 @@ const CATALOG_TIMEOUT_MS: u64 = 20_000;
 /// 清单 JSON 体积上限（16 MiB）。= 上游 `MAX_GITHUB_JSON_BYTES`：两个 `?recursive=1` 并发各持一份，
 /// 被劫持/WAF 回灌 GB 级 JSON 会直接 OOM，实际 tree 只有数 MB。
 const CATALOG_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// 磁盘缓存合并两棵子树，单独限制其编码体积。
+const CATALOG_CACHE_MAX_BYTES: usize = 2 * CATALOG_MAX_BYTES;
 /// 清单最小条目数（= 上游 `if (items.length < 50) throw new Error('catalog too small')`）。
 /// 远端结构变了（目录改名 / 返回错误页）会让 collect 收到寥寥几条，此闸挡住「用半份清单覆盖好缓存」。
 const CATALOG_MIN_ITEMS: usize = 50;
@@ -476,7 +479,20 @@ fn parse_cached_catalog_item(v: &Value) -> Option<RuleResourceCatalogItem> {
 /// 再加逐条自洽）：文件可读 → JSON 合法 → schemaVersion 对上 → fetchedAt 为正整数 → items 是数组
 /// → 每条自洽 → 条数够。**畸形不污染**：读不出来只是少一层兜底，绝不把半份清单当真。
 fn read_catalog_cache(res_dir: &Path) -> Option<(Vec<RuleResourceCatalogItem>, i64)> {
-    let raw = std::fs::read(catalog_cache_path(res_dir)).ok()?;
+    let path = catalog_cache_path(res_dir);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > CATALOG_CACHE_MAX_BYTES as u64 {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)
+        .ok()?
+        .take(CATALOG_CACHE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() > CATALOG_CACHE_MAX_BYTES {
+        return None;
+    }
     let v: Value = serde_json::from_slice(&raw).ok()?;
     if v.get("schemaVersion").and_then(Value::as_u64) != Some(CATALOG_CACHE_SCHEMA_VERSION) {
         return None;
@@ -510,6 +526,9 @@ fn write_catalog_cache(
         "items": items,
     }))
     .map_err(|e| format!("序列化失败: {e}"))?;
+    if body.len() > CATALOG_CACHE_MAX_BYTES {
+        return Err("规则清单缓存超过体积上限".to_string());
+    }
     let tmp = res_dir.join(format!(
         "{CATALOG_CACHE_FILE}.{}.{}.tmp",
         std::process::id(),

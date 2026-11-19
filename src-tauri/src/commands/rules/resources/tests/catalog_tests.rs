@@ -362,6 +362,17 @@ fn malformed_cache_file_is_rejected_wholesale() {
     assert_eq!(items.len(), 60);
     assert_eq!(at, 1_700_000_000_000i64);
 
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(catalog_cache_path(&dir))
+        .unwrap();
+    let padding = CATALOG_CACHE_MAX_BYTES as u64 - file.metadata().unwrap().len();
+    std::io::copy(&mut std::io::repeat(b' ').take(padding), &mut file).unwrap();
+    assert_eq!(read_catalog_cache(&dir).unwrap().0.len(), 60);
+    std::io::copy(&mut std::io::repeat(b' ').take(1), &mut file).unwrap();
+    drop(file);
+    assert_eq!(cached_or_builtin_catalog(&dir).source, "builtin");
+
     // schemaVersion 不符 → 整份作废（不做迁移）。
     write(&json!({ "schemaVersion": 2, "fetchedAt": 1i64, "items": ok_items }));
     assert!(read_catalog_cache(&dir).is_none());
