@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -509,6 +510,93 @@ class TransientLoginHostStateTest {
         assertEquals("login-A", f.cache.readText())
         assertEquals(1, failed.count.get())
         assertEquals(1, next.count.get())
+    }
+
+    @Test fun runtimeClaimRejectsPendingAndUnclosedLoginAndNeverPreemptsIt() {
+        val f = Fixture()
+        val main = MainKernelAttempt<Any>()
+        val directories = setOf(File(f.directory, "taildrop").canonicalPath)
+        val login = start(f, "login-A")
+        assertFalse(f.host.validateRuntimeDirectories(main, directories) { true })
+        assertFalse(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        f.queue.runNext()
+        assertNull(login.value.get())
+        assertEquals(0, f.engine("login-A").closes.get())
+
+        f.engine("login-A").closeFailure = IllegalStateException("native close failed")
+        close(f, "login-A")
+        f.queue.runNext()
+        assertFalse(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        assertEquals(1, f.engine("login-A").closes.get())
+        f.engine("login-A").closeFailure = null
+        f.clock.take(5_000).invoke()
+        f.queue.runNext()
+
+        assertTrue(f.host.validateRuntimeDirectories(main, directories) { true })
+        assertFalse(f.host.claimRuntimeDirectories(main, "resource-A", directories) { false })
+        assertTrue(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        val blocked = start(f, "login-B")
+        f.queue.runNext()
+        assertTrue(blocked.value.get() is TransientLoginHost.GeneralFailure)
+        assertFalse(f.engines.containsKey("login-B"))
+        assertTrue(f.host.releaseRuntimeDirectories(main, "resource-A"))
+        val next = start(f, "login-C")
+        f.queue.runNext()
+        assertNull(next.value.get())
+        assertTrue(f.host.running("login-C"))
+    }
+
+    @Test fun runtimeReleaseRetainsTheOriginalScopeAcrossMainCloseAndLateCallbacks() {
+        val f = Fixture()
+        val original = MainKernelAttempt<Any>()
+        val successor = MainKernelAttempt<Any>()
+        val directories = setOf(f.directory.canonicalPath)
+        f.host.withMainConfig(original, "same-state-directory") {
+            assertTrue(f.host.claimRuntimeDirectories(original, "resource-A", directories) { true })
+        }
+        assertFalse(f.host.claimRuntimeDirectories(original, "resource-B", directories) { true })
+        val adjacent = setOf(File(f.directory.parentFile, f.directory.name + "-sibling").canonicalPath)
+        assertTrue(f.host.claimRuntimeDirectories(original, "resource-B", adjacent) { true })
+
+        original.revokeAndDetachTun()
+        assertFalse(f.host.claimRuntimeDirectories(original, "resource-C", setOf(f.cache.path)) { true })
+        f.host.closeMain(original) { }
+        assertFalse(f.host.releaseRuntimeDirectories(successor, "resource-A"))
+        assertTrue(f.host.releaseRuntimeDirectories(original, "resource-B"))
+        assertFalse(f.host.validateRuntimeDirectories(successor, directories) { true })
+        assertTrue(runCatching { f.host.withMainConfig(successor, "same-state-directory") { } }.isFailure)
+
+        assertTrue(f.host.releaseRuntimeDirectories(original, "resource-A"))
+        assertTrue(f.host.claimRuntimeDirectories(successor, "resource-A", directories) { true })
+        assertFalse(f.host.releaseRuntimeDirectories(original, "resource-A"))
+        assertFalse(f.host.validateRuntimeDirectories(successor, directories) { true })
+        assertTrue(f.host.releaseRuntimeDirectories(successor, "resource-A"))
+        assertTrue(f.host.validateRuntimeDirectories(successor, directories) { true })
+    }
+
+    @Test fun runtimeCallbacksDoNotWaitForTransientNativeStartup() {
+        val f = Fixture()
+        val main = MainKernelAttempt<Any>()
+        val directories = setOf(File(f.directory.parentFile, f.directory.name + "-sibling").canonicalPath)
+        assertTrue(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        val entered = CountDownLatch(1)
+        val finishStart = CountDownLatch(1)
+        f.configure = { it.startAction = { entered.countDown(); await(finishStart) } }
+        val login = start(f, "login-A")
+        val worker = Thread(f.queue.take()).also { it.start() }
+        try {
+            await(entered)
+            assertFalse(f.host.validateRuntimeDirectories(main, directories) { error("must fail at the lock") })
+            assertFalse(f.host.claimRuntimeDirectories(main, "resource-B", directories) { error("must fail at the lock") })
+            assertTrue(f.host.releaseRuntimeDirectories(main, "resource-A"))
+            assertEquals(1L, finishStart.count)
+        } finally {
+            finishStart.countDown()
+        }
+        await(login.done)
+        worker.join(2_000)
+        assertNull(login.value.get())
+        assertTrue(f.host.claimRuntimeDirectories(main, "resource-B", directories) { true })
     }
 
     @Test fun mainClaimIsVisibleWhileMainJniBlocksAndStopCannotRestoreOldClaim() {
