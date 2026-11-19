@@ -511,6 +511,12 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
     }
   });
 
+  it('S5 Gradle 报告校验器单独变化也触发 Android 验证腿', () => {
+    const path = 'scripts/VerifyAndroidS5.java';
+    expect(androidRegistrationOf(path)).toEqual({ key: path, table: 'ANDROID_IMPACT_SCOPES' });
+    expect(classifyImpact([path]).android).toBe(true);
+  });
+
   it('C：枚举面与剥离器自检 —— 空跑 / 被注释喂饱都必须红', () => {
     // 已知生产入口必须进入枚举面。
     expect(jniFace.length, 'JNI 导出面为空').toBeGreaterThan(0);

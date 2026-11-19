@@ -712,6 +712,9 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'scripts/verify-apk.test.mjs': {
     why: '判据本体的变异测试：判据有没有牙由它守，改判据而不改它 = 那些否定用例可能已经不成立。',
   },
+  'scripts/VerifyAndroidS5.java': {
+    why: '核对同一候选的 Gradle 测试报告与 Kotlin 测试源码。Android 验证腿是唯一生成这些原始报告并运行此校验的入口。',
+  },
   'scripts/verify-wry-keep-rules.mjs': {
     why:
       'RustWebView 那条 keep 规则与它事实源的对拍判据。事实源是 `tauri android build` 现场生成、'
