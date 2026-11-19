@@ -93,7 +93,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
   });
 
   // 变异对照：把任一处的 `withConfigWriteLock(...)` 拆掉、只留裸调用 → 对应断言转红。
-  it('六处都真的裹在 withConfigWriteLock 里', () => {
+  it('serializes every renderer configuration transaction', () => {
     const appStore = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
     expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.patch\(patch\);\s*\}\)/);
     expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.mutateEntities\(mutations\);\s*\}\)/);
@@ -103,6 +103,9 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     expect(switchTransaction).toContain('await api.config.get()');
     // performSave 是薄壳：整个函数体（**含开头读 entries**）都在临界区内。
     const stagedStore = stripComments(readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8'));
+    const submit = stagedStore.slice(stagedStore.indexOf('function submitEdit('), stagedStore.indexOf('function performSave('));
+    expect(submit).toContain('return withConfigWriteLock(async () => {');
+    expect(submit).toContain('await api.config.save(merged, true, diskVersion, true, true)');
     expect(stagedStore).toContain(
       'withConfigWriteLock(() => performSaveLocked(set, get, autoApply))'
     );
@@ -113,12 +116,12 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
   });
 
   // 不可嵌套（临界区内再入队 = 自锁）。当前使用点互不调用；新增使用点必须先读头注那条。
-  it('闸门只有六个主窗生产使用点', () => {
+  it('keeps renderer write owners explicit and delegates tray mode edits to native', () => {
     const appStore = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
     const stagedStore = readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8');
     const settings = readFileSync(join(SRC, 'components/screens/settings/use-config.ts'), 'utf8');
     expect((appStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(3);
-    expect((stagedStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(2);
+    expect((stagedStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(3);
     expect((settings.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
     expect(filesWith('withConfigWriteLock(', ['config-write-lock.ts'])).toEqual([
       'components/screens/settings/use-config.ts',
@@ -127,7 +130,7 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
       'store/staged-config-store.ts',
     ]);
     const tray = stripComments(readFileSync(join(SRC, 'tray/TrayMenu.tsx'), 'utf8'));
-    expect(tray).toContain('useAppStore.getState().saveConfig({ proxyMode: mode })');
+    expect(tray).toContain('await api.config.updateMode(mode)');
     // Takeover uses one backend latest-config transaction. Restoring a tray-owned
     // patch would overwrite concurrent DNS edits; wrapping it in saveConfig would
     // also split the atomic correction from the chosen mode.

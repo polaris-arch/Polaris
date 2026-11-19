@@ -42,6 +42,7 @@ vi.mock('@/ipc', () => ({
 }));
 
 import { STAGED_CONFIG_ENABLED, STAGED_STORAGE_KEY, configBaseVersion, type StagedEntry } from '@/lib/staged-config';
+import { setToastImpl } from '@/lib/error-handler';
 import type { SaveOutcome, UserConfig } from '@/contracts/types';
 import {
   flushStagedPendingSync,
@@ -456,6 +457,29 @@ describe('edit admission before creating a manual draft', () => {
     expect(applyMock).not.toHaveBeenCalled();
     store.getState().reset();
     expect(store.getState().entries).toEqual([]);
+  });
+
+  it('uses the existing retry toast without adding a manual draft when native admission is temporarily unavailable', async () => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    const change = entry('n1', 8443);
+    const report = vi.fn<typeof import('@/lib/error-handler').toast.error>();
+    setToastImpl({ error: report });
+    try {
+      saveMock.mockResolvedValueOnce({ status: 'retryable' });
+      expect(await store.getState().submit(change)).toBe('ignored');
+      expect(store.getState()).toMatchObject({ entries: [], saveStatus: 'idle' });
+      expect(fake.getItem(STAGED_STORAGE_KEY)).toBeNull();
+      expect(report).toHaveBeenCalledOnce();
+      expect(report.mock.calls[0][0]).toBe(change.label);
+      report.mock.calls[0][2]?.actions?.[0]?.onClick();
+      await vi.waitFor(() => expect(store.getState().completedSaveRevision).toBe(1));
+      expect(saveMock).toHaveBeenCalledTimes(2);
+      expect(store.getState().entries).toEqual([]);
+      expect(applyMock).not.toHaveBeenCalled();
+    } finally {
+      setToastImpl({});
+    }
   });
 
   it('keeps earlier manual drafts outside an independent native candidate', async () => {

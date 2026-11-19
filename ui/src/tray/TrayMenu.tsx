@@ -559,7 +559,16 @@ export default function TrayMenu() {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
     if (mode === config?.proxyMode) return;
     try {
-      await useAppStore.getState().saveConfig({ proxyMode: mode });
+      const result = await api.config.updateMode(mode);
+      if (!mounted.current || !interactionActive.current || life !== trayLifecycle.current || operation !== interactionEpoch.current) return;
+      if (result.status === 'needsManual') {
+        setNotice(t('tray.manageInMain'));
+      } else if (result.status !== 'saved') {
+        noticeActionFailure(t('tray.groupMode'), new Error('routing configuration changed'));
+      } else if (result.runtimeApply?.status === 'hotApplied' && result.runtimeApply.configurationDurable === true) {
+        const label = MODES.find((option) => option.v === mode);
+        if (label) setNotice(t(label.k));
+      }
     } catch (err) {
       if (mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current) noticeActionFailure(t('tray.groupMode'), err);
       return; // 失败保持浮层开着（W14），成功才落到下面的正常路径

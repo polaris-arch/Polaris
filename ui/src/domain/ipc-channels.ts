@@ -30,6 +30,7 @@ export const IPC_CHANNELS = {
   CONFIG_GET: 'config_get',
   CONFIG_SAVE: 'config_save',
   CONFIG_PATCH: 'config_patch',
+  CONFIG_UPDATE_MODE: 'config_update_mode',
   CONFIG_SET_TAKEOVER: 'config_set_takeover',
   CONFIG_MUTATE_ENTITIES: 'config_mutate_entities',
   CONFIG_CLASSIFY_STAGED: 'config_classify_staged',

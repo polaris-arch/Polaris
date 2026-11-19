@@ -337,6 +337,21 @@ describe('配置保存与下一次启动的事务边界', () => {
     ]);
   });
 
+  it('allows the next explicit routing value after its own queued write', async () => {
+    let disk = CONFIG;
+    getMock.mockImplementation(async () => disk);
+    saveMock.mockImplementation(async (candidate) => {
+      disk = candidate;
+      return { status: 'saved', config: disk, version: configBaseVersion(disk) };
+    });
+    const { updateProxyMode } = useAppStore.getState();
+    expect(await Promise.all([updateProxyMode('global'), updateProxyMode('direct')]))
+      .toEqual(['automatic', 'automatic']);
+    expect(saveMock.mock.calls.map(([candidate]) => candidate.proxyMode)).toEqual(['global', 'direct']);
+    expect(useStagedConfigStore.getState().entries).toEqual([]);
+    expect(disk.proxyMode).toBe('direct');
+  });
+
   it('节点切换采用后端事务后的整份配置，不用旧前端快照乐观覆盖', async () => {
     const backendMerged = {
       ...CONFIG,

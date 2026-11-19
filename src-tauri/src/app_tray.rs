@@ -1066,25 +1066,44 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
                 }
             });
         }
-        // Routing / Takeover 都要**落盘 + 触发配置评估**（可能连带重启内核）。菜单事件回调跑在
-        // **主线程**（Linux 上就是 GTK 主线程）⇒ 同步跑完整条链会把 UI 卡一拍：菜单项按下去不弹回、
-        // 托盘图标不重绘。同文件的 ToggleProxy / CheckUpdate 早就 spawn 了，这两条是漏网的
-        // （2026-07-28 复审 LOW）。
-        //
-        // 用 `spawn_blocking` 而非 `spawn`：这两个 command 是**同步阻塞**函数（文件写 + 规则评估），
-        // 丢进异步 worker 会占着 tokio 的协作式线程不还。reviewer 写的是 `spawn`——这里的出入只在
-        // 「丢到哪个池」，「离开主线程」这个根因两者相同，而 blocking 池才是同步阻塞工作的正确去处。
+        // Routing uses the same native hot admission as the custom tray.
         MenuAction::Routing(mode) => {
+            use crate::commands::config::SaveOutcome;
+            let Ok(mode) = serde_json::from_value(serde_json::json!(mode)) else {
+                return;
+            };
             let app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            tauri::async_runtime::spawn(async move {
                 let lang = i18n::app_lang(&app);
                 let state = app.state::<AppRuntime>();
-                let response = commands::config::config_update_mode(
-                    app.clone(),
-                    state,
-                    serde_json::Value::String(mode.to_string()),
-                );
-                notify_menu_response_failure(&app, lang, i18n::key::TRAY_GROUP_MODE, &response);
+                match commands::config::config_update_mode(app.clone(), state, mode).await {
+                    Ok(response) => {
+                        if notify_menu_response_failure(
+                            &app,
+                            lang,
+                            i18n::key::TRAY_GROUP_MODE,
+                            &response,
+                        ) {
+                            return;
+                        }
+                        match response.data {
+                            Some(SaveOutcome::NeedsManual) => show_main_window(&app),
+                            Some(SaveOutcome::Conflict { .. }) => notify_menu_action_error(
+                                &app,
+                                lang,
+                                i18n::key::TRAY_GROUP_MODE,
+                                &i18n::t(lang, i18n::key::TRAY_OPEN_MAIN),
+                            ),
+                            _ => {}
+                        }
+                    }
+                    Err(()) => notify_menu_action_error(
+                        &app,
+                        lang,
+                        i18n::key::TRAY_GROUP_MODE,
+                        &i18n::t(lang, i18n::key::NATIVE_UNKNOWN_ERROR),
+                    ),
+                }
             });
         }
         MenuAction::Takeover(kind) => {

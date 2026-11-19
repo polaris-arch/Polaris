@@ -37,8 +37,11 @@
 import { create } from 'zustand';
 
 import type { SaveOutcome, UserConfig } from '@/contracts/types';
+import { configSaveErrorText } from '@/domain/action-error-text';
+import i18n from '@/i18n';
 import { api } from '@/ipc';
 import { withConfigWriteLock } from '@/lib/config-write-lock';
+import { toast } from '@/lib/error-handler';
 import {
   STAGED_CONFIG_ENABLED,
   STAGED_STORAGE_KEY,
@@ -75,6 +78,14 @@ export async function dispatchSavedApply<T>(invoke: () => Promise<T>, onDispatch
   return admitted?.reply;
 }
 type ApplyStatus = ApplyReceipt['status'];
+type EditSubmission = 'automatic' | 'manual' | 'ignored';
+
+type QueuedEdit = {
+  baseline: UserConfig;
+  fields: ReadonlySet<string>;
+  committedVersion?: string;
+};
+let latestQueuedEdit: QueuedEdit | undefined;
 
 /**
  * 冲突弹窗的一行：这条条目要改的实体，磁盘侧也被别人改过（Q8-b 第 4 步）。
@@ -226,7 +237,7 @@ export interface StagedConfigState {
   /** 暂存一条编辑意图。同 id 覆盖。 */
   stage: (entry: StagedEntry) => void;
   /** Submit one edit, with any related entries, for native hot admission. */
-  submit: (first: StagedEntry, ...related: StagedEntry[]) => Promise<'automatic' | 'manual' | 'ignored'>;
+  submit: (first: StagedEntry, ...related: StagedEntry[]) => Promise<EditSubmission>;
   /** 撤销单条（明细 popover 的红叉）。 */
   revert: (id: string) => void;
   /** 「重置」：丢弃全部草稿，从最近一次读到的已保存配置开始下一批。 */
@@ -293,42 +304,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
     const entries = [first, ...related];
     const { enabled, latestSavedConfig: authoredAgainst } = get();
     if (!enabled || !entries.every(isValidStagedEntry)) return Promise.resolve('ignored');
-    return withConfigWriteLock(async () => {
-      const useManualDraft = (failed = false): 'manual' | 'ignored' => {
-        const current = get();
-        if (!current.enabled) return 'ignored';
-        const baseline = current.entries.length > 0
-          ? current.baseline
-          : authoredAgainst ?? current.latestSavedConfig;
-        const next = entries.reduce(stageEntry, current.entries);
-        set({
-          entries: next,
-          baseline,
-          conflict: null,
-          conflictBaseline: null,
-          ...(failed ? { saveStatus: 'saveFailed' } : {}),
-        });
-        persist(baseline, next);
-        return 'manual';
-      };
-      if (!get().enabled) return 'ignored';
-      if (!authoredAgainst) return useManualDraft();
-      try {
-        const disk = await api.config.get();
-        if (!get().enabled) return 'ignored';
-        if (dependsOnDraft(disk, get().entries, entries)) return useManualDraft();
-        const merged = replay(disk, entries);
-        if (changedOnDisk(authoredAgainst, disk, merged, entries).length > 0) return useManualDraft();
-        const observedAtDispatch = get().latestSavedConfig;
-        const outcome = await api.config.save(merged, true, configBaseVersion(disk), true, true);
-        if (outcome.status !== 'saved') return useManualDraft();
-        completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, false);
-        return 'automatic';
-      } catch (error) {
-        console.error('[staged-config] automatic edit failed:', error);
-        return useManualDraft(true);
-      }
-    });
+    return submitEdit(set, get, entries, authoredAgainst);
   },
 
   revert: (id) => {
@@ -465,6 +441,68 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
 type SetState = (partial: Partial<StagedConfigState>) => void;
 type GetState = () => StagedConfigState;
 
+function submitEdit(
+  set: SetState, get: GetState, entries: StagedEntry[], authoredAgainst: UserConfig | null
+): Promise<EditSubmission> {
+  const preceding = latestQueuedEdit;
+  const queued: QueuedEdit | undefined = authoredAgainst ? {
+    baseline: authoredAgainst,
+    fields: new Set(entries.filter(isScalarAssignment).map(({ entityPath }) => entityPath[0])),
+  } : undefined;
+  latestQueuedEdit = queued;
+  const manualDraft = () => {
+    const current = get();
+    const baseline = current.entries.length > 0
+      ? current.baseline
+      : authoredAgainst ?? current.latestSavedConfig;
+    const next = entries.reduce(stageEntry, current.entries);
+    set({ entries: next, baseline, conflict: null, conflictBaseline: null });
+    persist(baseline, next);
+    return 'manual' as const;
+  };
+  const failed = (description: string, retryable: boolean) => {
+    const label = entries[0].label.trim() || i18n.t('common.saveFailed');
+    toast.error(label, description, retryable ? {
+      key: `config-edit:${entries[0].id}`,
+      sticky: true,
+      dismiss: { label: i18n.t('common.close') },
+      actions: [{ label: i18n.t('common.retry'), onClick: () => {
+        void submitEdit(set, get, entries, authoredAgainst);
+      } }],
+    } : undefined);
+    return 'ignored' as const;
+  };
+  return withConfigWriteLock(async () => {
+    if (!get().enabled) return 'ignored' as const;
+    if (!authoredAgainst) return manualDraft();
+    try {
+      const disk = await api.config.get();
+      if (!get().enabled) return 'ignored' as const;
+      if (dependsOnDraft(disk, get().entries, entries)) return manualDraft();
+      const merged = replay(disk, entries);
+      const diskVersion = configBaseVersion(disk);
+      const ownPrecedingEdit = preceding?.baseline === authoredAgainst
+        && preceding.committedVersion === diskVersion ? preceding : undefined;
+      const clashes = changedOnDisk(authoredAgainst, disk, merged, entries);
+      if (clashes.some((entry) => !isScalarAssignment(entry) || !ownPrecedingEdit?.fields.has(entry.entityPath[0]))) {
+        return manualDraft();
+      }
+      const observedAtDispatch = get().latestSavedConfig;
+      const outcome = await api.config.save(merged, true, diskVersion, true, true);
+      if (outcome.status === 'needsManual' || outcome.status === 'conflict') return manualDraft();
+      if (outcome.status !== 'saved') return failed(i18n.t('common.saveFailed'), outcome.status === 'retryable');
+      if (queued) queued.committedVersion = outcome.version;
+      completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, false);
+      return 'automatic' as const;
+    } catch (error) {
+      console.error('[staged-config] automatic edit failed:', error);
+      return failed(configSaveErrorText(error, i18n.t), true);
+    }
+  }).finally(() => {
+    if (latestQueuedEdit === queued) latestQueuedEdit = undefined;
+  });
+}
+
 /**
  * 「保存」的本体（Q8-b 四步）。`save` 与 `resolveConflict` 共用 —— 两条腿只差
  * 裁决后 baseline 已更新到用户看过的那份磁盘；若磁盘再次变化，仍需重新询问。
@@ -589,6 +627,12 @@ function changedOnDisk(
 ): StagedEntry[] {
   return conflictingEntries(baseline, disk, entries).filter(({ entityPath }) =>
     entitySnapshot(disk, entityPath) !== entitySnapshot(merged, entityPath));
+}
+
+function isScalarAssignment({ entityPath, nextValue }: StagedEntry): boolean {
+  // A later explicit value may follow our own queued write. Structured edits can
+  // carry unedited stale fields copied from a form and still need the conflict check.
+  return entityPath.length === 1 && (nextValue === null || typeof nextValue !== 'object');
 }
 
 function dependsOnDraft(disk: UserConfig, drafts: StagedEntry[], entries: StagedEntry[]): boolean {

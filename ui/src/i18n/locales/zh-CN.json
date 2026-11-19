@@ -2474,7 +2474,6 @@
     "importSingletonAllSkipped": "识别到的节点都撞上了已占用的 WARP / Tailscale 单例槽，未导入任何节点",
     "importSingletonSkipped": "已导入 {{count}} 个；{{skipped}} 个因 WARP / Tailscale 单例槽已占用被跳过",
     "importOk": "已导入 {{count}} 个节点",
-    "importStagedOk": "{{count}} 个节点已加入待保存",
     "shadowed": "网段被覆盖",
     "shadowedHint": "{{cidrs}} 已被「{{by}}」先声明——同一网段只能指向一个出站，本节点上的这些段不会生效。请去重、调整节点顺序，或用自定义规则显式覆盖。",
     "meshRouteBlocked": "本层网段重叠",

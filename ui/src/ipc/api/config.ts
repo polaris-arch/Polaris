@@ -81,6 +81,11 @@ export const configApi = {
     return invoke(IPC_CHANNELS.CONFIG_PATCH, { patch });
   },
 
+  /** The tray can hot-apply a routing mode or defer it to the main editor. */
+  async updateMode(mode: UserConfig['proxyMode']): Promise<SaveOutcome> {
+    return invoke(IPC_CHANNELS.CONFIG_UPDATE_MODE, { mode });
+  },
+
   /** 在后端最新配置写事务内切换接管并消费 FakeIP-TUN 一次性标志。 */
   async previewTakeover(mode: NonNullable<UserConfig['proxyModeType']>): Promise<{ owner: TakeoverApplyOwner; pendingApply: boolean }> {
     return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode, preview: true });

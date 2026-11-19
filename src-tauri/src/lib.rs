@@ -1137,8 +1137,7 @@ pub fn run() {
             config_mutate_entities,
             config_classify_staged,
             config_set_staged_pending,
-            // D14：IPC 通道 config:updateMode 已随 D12 从前端退役，但本命令仍被
-            // app_tray.rs 的 MenuAction::Routing 分支直接 Rust 内部调用 → 不删，保留注册。
+            // Both tray surfaces use the same authoritatively planned mode edit.
             config_update_mode,
             config_set_value,
             config_get_privacy_mode,

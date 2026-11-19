@@ -348,7 +348,8 @@ describe('O07 shared config with fenced ancillary hydration', () => {
     expect(body).not.toContain('api.config.get(');
   });
   it('ordinary writes and selection reuse their shared settlement owners', () => {
-    expect(MENU).toContain('useAppStore.getState().saveConfig({ proxyMode: mode })');
+    expect(MENU).toContain('await api.config.updateMode(mode)');
+    expect(MENU).toContain("result.status === 'needsManual'");
     expect(MENU).toContain('api.config.setTakeover(modeType)');
     expect(MENU).toContain('await useAppStore.getState().switchServer(id)');
     expect(MENU).not.toContain('configReadGeneration');

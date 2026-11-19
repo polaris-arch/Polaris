@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use polaris_config_engine::user_config::ProxyModeType;
+use polaris_config_engine::user_config::{ProxyMode, ProxyModeType};
 use polaris_store::backup::{
     merge_categories, sanitize_cross_platform_rules, sanitize_unavailable_interface_bindings,
     BackupCategory, SHARED_DEPENDENCY_CONFLICT,
@@ -1198,26 +1198,30 @@ fn set_value_with_ua_invalidation(
     config_patch_core(config, patch)
 }
 
-/// 上游 `CONFIG_UPDATE_MODE`：更新 proxyMode 字段。
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "Tauri IPC command owns its deserialized payload across the call"
-)]
+/// The tray has no configuration draft editor. Return `needsManual` before
+/// writing a mode that must instead be reviewed in the main window.
 #[tauri::command]
-pub fn config_update_mode(
+pub async fn config_update_mode(
     app: AppHandle,
     state: State<'_, AppRuntime>,
-    mode: Value,
-) -> ApiResponse<()> {
-    match set_value_with_ua_invalidation(state.config(), "proxyMode", mode) {
-        Ok((_old_selected, cfg, changed)) => {
-            if changed {
-                broadcast_config_changed(&app, &cfg);
-            }
-            ok_void()
-        }
-        Err(e) => config_store_error(e),
-    }
+    mode: ProxyMode,
+) -> Result<ApiResponse<SaveOutcome>, ()> {
+    let mut candidate = match state.config().current() {
+        Ok(current) => current,
+        Err(error) => return Ok(config_store_error(error)),
+    };
+    let base = config_version(&candidate);
+    candidate["proxyMode"] = json!(mode);
+    Box::pin(config_save(
+        app,
+        state,
+        candidate,
+        Some(true),
+        Some(base),
+        Some(true),
+        Some(true),
+    ))
+    .await
 }
 
 /// 上游 `CONFIG_SET_VALUE`：置单键 + 广播 event:configChanged。

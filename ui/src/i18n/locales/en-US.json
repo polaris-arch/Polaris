@@ -2474,7 +2474,6 @@
     "importSingletonAllSkipped": "Every detected node hit an occupied WARP / Tailscale singleton slot — nothing was imported",
     "importSingletonSkipped": "Imported {{count}}; skipped {{skipped}} because the WARP / Tailscale singleton slot is taken",
     "importOk": "Imported {{count}} node(s)",
-    "importStagedOk": "{{count}} node(s) added as unsaved changes",
     "shadowed": "Subnet shadowed",
     "shadowedHint": "{{cidrs}} is already claimed by \"{{by}}\" — a subnet can only point at one outbound, so these ranges have no effect on this node. Remove the duplicate, reorder the nodes, or override it explicitly with a custom rule.",
     "meshRouteBlocked": "Mesh ranges overlap",
