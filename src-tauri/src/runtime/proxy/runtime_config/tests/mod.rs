@@ -825,6 +825,72 @@ fn hot_config_edit_pending_projection_does_not_consume_independent_or_failed_wor
 }
 
 #[tokio::test]
+async fn pending_projection_while_subscription_refresh_waits_for_core_admission() {
+    use crate::runtime::config::Decision;
+
+    let (rt, _dir, running, _) = host_dns_restart_fixture();
+    rt.config.save_full(&running).unwrap();
+    let baseline = ts_pending_raw_fixture(&rt, running.clone());
+    *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+        &baseline.typed,
+        &baseline.generated,
+        &baseline.deps,
+    ));
+    let (_, edit) = rt
+        .config
+        .prepare_config_edit(|candidate| {
+            candidate["servers"].as_array_mut().unwrap().push(json!({
+                "id": "refreshed-node",
+                "name": "Refreshed node",
+                "protocol": "socks",
+                "address": "192.0.2.18",
+                "port": 1080
+            }));
+            Decision::Write(())
+        })
+        .unwrap();
+    let edit = edit.unwrap();
+    assert!(edit.candidate["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|node| node["id"] == "refreshed-node"));
+    let admission = rt.switch_serial.lock().await;
+    let mut prospective = Box::pin(rt.apply_hot_config_edit(&edit));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(prospective.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(rt.config.current().unwrap(), running);
+    assert!(!rt.pending_changes().pending_apply);
+    drop(prospective);
+
+    // The old post-save path exposed this diff while waiting on the very same gate.
+    assert!(rt
+        .config
+        .commit_prepared_config_edit(&edit, || true, |_| {})
+        .unwrap()
+        .is_some());
+    let mut post_save = Box::pin(rt.apply_staged_save_if_current(
+        edit.previous,
+        edit.candidate,
+        StagedSaveOwner::capture(&rt, rt.config.saved_revision()),
+        |_| {},
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(post_save.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let pending = rt.pending_changes();
+    assert!(pending.pending_apply);
+    assert_eq!(pending.added, ["refreshed-node"]);
+    drop(post_save);
+    drop(admission);
+}
+
+#[tokio::test]
 async fn staged_save_preserves_earlier_saved_debt_and_rejects_superseded_candidates() {
     let (rt, _dir, running, prior_saved) = host_dns_restart_fixture();
     let baseline = ts_pending_raw_fixture(&rt, running.clone());

@@ -85,23 +85,47 @@ fn update_forwards_failed_provider_names_into_reconcile() {
 #[test]
 fn update_defers_removed_node_assets_until_the_restart_boundary() {
     let body = fn_body("async fn perform_subscription_update_inner(");
-    let journal = body
-        .find("state.config().update_deferred_cleanup(|cfg|")
-        .expect("订阅对账必须在延迟删除事务中原子完成");
-    let broadcast = body
-        .find("broadcast_config_changed_with_registered_intent(")
-        .expect("内容变化后的热切换广播仍须存在");
     assert!(
-        journal < broadcast,
-        "删除意图须先持久化，随后广播才能触发旧核退出与安全消费"
+        !body.contains("broadcast_config_changed_with_registered_intent("),
+        "refresh's legacy full-D broadcast can activate unrelated saved edits"
+    );
+    assert!(
+        !body.contains(".update_with_cleanup_revision("),
+        "an unowned refresh save exposes a transient pending difference before Core Plan"
+    );
+    let prepare = body.find(".prepare_config_edit(|cfg|").unwrap();
+    let commit = body.find("commit_subscription_refresh(").unwrap();
+    let broadcast = body
+        .find("publish_saved_subscription_refresh(")
+        .expect("changed content requires exact saved-revision publication");
+    assert!(
+        prepare < commit && commit < broadcast,
+        "refresh must prepare, settle the prospective transaction, then publish"
     );
     assert!(body.contains("reconcile_subscription_servers("));
-    assert!(
-        body.split_whitespace().collect::<String>().contains(
-            "record_auto_exit_after_removal(proxy,&record_config,record_from.as_deref(),outcome,)"
-        ),
-        "refresh bookkeeping must consume the completed broadcast receipt"
-    );
+    let commit = fn_body("async fn commit_subscription_refresh(");
+    let metadata = commit.find("if !content_changed {").unwrap();
+    let plan = commit.find("apply_hot_config_edit(edit)").unwrap();
+    assert!(commit[metadata..plan]
+        .split_whitespace()
+        .collect::<String>()
+        .contains("commit_prepared_config_edit(edit,||token.is_current(),|_|{})"));
+    assert_eq!(commit.matches("commit_prepared_config_edit(").count(), 1);
+    let manual = commit.find("HotConfigEditOutcome::NeedsManual").unwrap();
+    let blocked = commit
+        .find("HotConfigEditOutcome::BlockedByPending")
+        .unwrap();
+    assert!(commit[manual..blocked].contains("commit_manual_resource_edit(edit, owner)"));
+    assert!(commit[blocked..].contains("=> Err("));
+    let publication = fn_body("fn publish_saved_subscription_refresh(");
+    assert!(!publication.contains("apply_staged_save_if_current"));
+    let confirmed = publication
+        .find("receipt.core_state == Some(\"committed\")")
+        .expect("disk save alone cannot confirm the live exit");
+    let record = publication.find("record_auto_exit_after_removal(").unwrap();
+    let invalidate = publication.find(".invalidate(").unwrap();
+    assert!(confirmed < record && record < invalidate);
+    assert!(publication[record..invalidate].contains("if outcome.is_some()"));
 }
 
 #[test]
@@ -417,7 +441,7 @@ fn metadata_only_success_paths_emit_signal_without_runtime_publication() {
         .split("if !content_changed {")
         .nth(1)
         .unwrap()
-        .split("let token = owner.token();")
+        .split("publish_saved_subscription_refresh(")
         .next()
         .unwrap();
     assert_eq!(
@@ -447,9 +471,7 @@ fn metadata_only_success_paths_emit_signal_without_runtime_publication() {
         }
     }
     assert_eq!(
-        inner
-            .matches("broadcast_config_changed_with_registered_intent(")
-            .count(),
+        inner.matches("publish_saved_subscription_refresh(").count(),
         1
     );
     let saved = inner.find("match transaction {").unwrap();

@@ -4,7 +4,7 @@
 //! - 新增只允许 backend-owned 原子 `subscription_create_start`；旧 `subscription:add` 不注册 invoke。
 //! - `subscription:update` → [`subscription_update`]
 //! - `subscription:delete` → [`subscription_delete`]
-//! - `subscription:updateServers` → [`subscription_update_servers`]（net-stack 拉取 + 对账 + force-restart）
+//! - `subscription:updateServers` → [`subscription_update_servers`]（net-stack 拉取 + 对账 + 可证热应用）
 //! - `subscription:preview` → [`subscription_preview`]（net-stack 预检，不写 config）
 //! - `localImport:parse` → [`local_import_parse`]（net-stack 离线解析）
 //! - `localImport:pickFile` → [`local_import_pick_file`]（Tauri dialog 插件）
@@ -40,10 +40,14 @@ use crate::events::{broadcast, channel::EVENT_SUBSCRIPTION_UPDATE_PROGRESS};
 use crate::i18n::{key, t};
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::auto_select::{Cause, Leg, SwitchRecord};
-use crate::runtime::config::Decision;
+use crate::runtime::config::{Decision, PreparedConfigEdit};
 use crate::runtime::http::{HttpRuntime, SystemDnsLookup};
+use crate::runtime::proxy::runtime_config::{
+    HotConfigEditOutcome, RuntimeApplyResult, StagedSaveOwner,
+};
 use crate::runtime::proxy::{ProxyRuntime, SwitchOutcome};
 use crate::runtime::subscription_parse::SubscriptionParseExecutor;
+use crate::runtime::subscription_refresh::SubscriptionRefreshToken;
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
 use crate::runtime::AppRuntime;
 
@@ -1033,15 +1037,15 @@ async fn perform_subscription_update_inner(
 
     // 5) reconcile（最新 config；partial → merge_only 防穿仓）。
     //
-    // 网络腿到此为止，余下是对账 + 落盘 + 广播（广播可能触发内核热切换/重启）。单独报一个阶段是因为
+    // 网络腿到此为止，余下是对账 + 落盘 + 热应用判定。单独报一个阶段是因为
     // 它与「拉取中」的失败含义完全不同：卡在这里是本地磁盘/配置问题，不是机场不通。
     sink.emit(json!({ "phase": "reconciling" }));
     let apply_started = std::time::Instant::now();
     let transaction_started = std::time::Instant::now();
-    // 拉取期间可能已有别的写入落盘；对账、删除 journal 与保存必须在同一写临界区，以最新配置为基准。
-    // 这里统一走 deferred-cleanup 形态：无删除时不会生成 journal，有删除时则保证旧核退出前不清理资产。
-    let transaction = state.config().update_deferred_cleanup(|cfg| {
-        if !owner.token().is_current() {
+    // 对账以当前落盘版本为基准。后续提交在同一版本上记录延迟清理，直到原持有者安全退出。
+    let token = owner.token();
+    let transaction = state.config().prepare_config_edit(|cfg| {
+        if !token.is_current() {
             return Decision::Skip(Err("subscription refresh superseded".to_owned()));
         }
         if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
@@ -1087,23 +1091,31 @@ async fn perform_subscription_update_inner(
         )))
     });
     let transaction_ms = transaction_started.elapsed().as_millis();
-    let (recon, old_selected, user_info, content_changed, partial, cfg) = match transaction {
-        Ok((Ok((recon, old_selected, user_info, content_changed, partial)), Some(cfg))) => (
-            recon,
-            old_selected,
-            user_info,
-            content_changed,
-            partial,
-            cfg,
-        ),
+    let ((recon, old_selected, user_info, content_changed, partial), edit) = match transaction {
+        Ok((Ok(result), Some(edit))) => (result, edit),
         Ok((Err(error), None)) => return update_failure(error),
-        Ok(_) => unreachable!("subscription reconcile decision and persistence must agree"),
+        Ok(_) => unreachable!("subscription reconcile decision and candidate must agree"),
         Err(e) => return update_failure(format!("{e}")),
+    };
+    let (revision, receipt) = match commit_subscription_refresh(
+        app,
+        state,
+        &token,
+        &edit,
+        content_changed,
+    )
+    .await
+    {
+        Ok(Some(saved)) => saved,
+        Ok(None) => {
+            return json!({"success":false,"superseded":true,"addedServers":0,"updatedServers":0,"deletedServers":0})
+        }
+        Err(error) => return update_failure(error),
     };
 
     // 7) 节点内容未变时只刷新元数据。部分拉取仍保留自己的终态。
     if !content_changed {
-        publish_subscription_metadata(&owner.token(), || {
+        publish_subscription_metadata(&token, || {
             super::config::emit_config_changed_signal(app);
         });
         let outcome = if partial {
@@ -1119,51 +1131,15 @@ async fn perform_subscription_update_inner(
         return update_ok(0, 0, 0, !partial, user_info.as_ref());
     }
 
-    // 8) 节点内容变更 → 广播（汇流点自动热切换）+ 出口变则作废解锁缓存。
-    let token = owner.token();
-    let intent = match prepare_subscription_publication(
-        state.config(),
-        state.proxy(),
-        &cfg,
-        Some(&token),
-    ) {
-        Ok(Some(intent)) => intent,
-        Ok(None) => {
-            return json!({"success":false,"superseded":true,"addedServers":0,"updatedServers":0,"deletedServers":0})
-        }
-        Err(_) => return update_failure("subscription publication unavailable"),
-    };
-    let record_config = cfg.clone();
-    let record_from = old_selected.clone();
-    let unlock = Arc::clone(&state.unlock);
-    let completion_app = app.clone();
-    let exit_changed = selected_exit_changed(
-        old_selected.as_deref(),
-        cfg.get("selectedServerId").and_then(Value::as_str),
-    );
-    super::config::broadcast_config_changed_with_registered_intent(
+    // 8) Publish the completed operation. Live-exit bookkeeping consumes the exact Core receipt.
+    publish_saved_subscription_refresh(
         app,
-        &state.proxy,
-        &cfg,
-        intent,
-        move |proxy, outcome| {
-            // The runtime's generation fence has already rejected a superseded application.
-            if outcome.is_some() && proxy.selector_intent_is_current(intent) {
-                record_auto_exit_after_removal(
-                    proxy,
-                    &record_config,
-                    record_from.as_deref(),
-                    outcome,
-                );
-                if exit_changed {
-                    let sink = BroadcastSink::new(&completion_app);
-                    unlock.invalidate(&sink, proxy.status().running, false);
-                }
-            }
-        },
+        state,
+        &edit.candidate,
+        old_selected.as_deref(),
+        revision,
+        receipt.as_ref(),
     );
-    // Unlock-cache invalidation is tied to this exact saved publication, not an old task's
-    // local selected-ID comparison. The registered runtime apply remains the authority.
     log::info!(
         "subscription reconcile timing: outcome=changed initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
         apply_started.elapsed().as_millis(),
@@ -1176,6 +1152,94 @@ async fn perform_subscription_update_inner(
         false,
         user_info.as_ref(),
     )
+}
+
+async fn commit_subscription_refresh(
+    app: &AppHandle,
+    state: &AppRuntime,
+    token: &SubscriptionRefreshToken,
+    edit: &PreparedConfigEdit,
+    content_changed: bool,
+) -> Result<Option<(u64, Option<RuntimeApplyResult>)>, String> {
+    if !token.is_current() {
+        return Ok(None);
+    }
+    let store_error = |error: polaris_store::StoreError| {
+        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
+            state.proxy().push_pending_changes();
+            super::config::emit_config_changed_signal(app);
+        }
+        error.to_string()
+    };
+    if !content_changed {
+        return Ok(state
+            .config()
+            .commit_prepared_config_edit(edit, || token.is_current(), |_| {})
+            .map_err(&store_error)?
+            .map(|revision| (revision, None)));
+    }
+    let owner = StagedSaveOwner::capture(state.proxy(), edit.revision);
+    // The sole producer of refresh supersession commits a new configuration revision
+    // under the same writer, so the shared prospective Apply CAS also fences the token.
+    match Box::pin(state.proxy.apply_hot_config_edit(edit))
+        .await
+        .map_err(&store_error)?
+    {
+        HotConfigEditOutcome::Saved {
+            revision,
+            runtime_apply,
+            ..
+        } => Ok(Some((revision, runtime_apply))),
+        HotConfigEditOutcome::NeedsManual { .. } => {
+            let revision = state
+                .proxy()
+                .commit_manual_resource_edit(edit, owner)
+                .await
+                .map_err(&store_error)?;
+            Ok(revision.map(|revision| (revision, None)))
+        }
+        HotConfigEditOutcome::BlockedByPending => Err("有待应用的配置变更，请先处理后重试".into()),
+        HotConfigEditOutcome::Conflict => Ok(None),
+        HotConfigEditOutcome::Retryable => Err("内核暂时无法应用订阅更新，请重试".into()),
+        HotConfigEditOutcome::Rejected => Err("内核拒绝了订阅更新".into()),
+    }
+}
+
+fn publish_saved_subscription_refresh(
+    app: &AppHandle,
+    state: &AppRuntime,
+    candidate: &Value,
+    old_selected: Option<&str>,
+    revision: u64,
+    receipt: Option<&RuntimeApplyResult>,
+) {
+    super::config::emit_config_changed_signal(app);
+    let proxy = state.proxy();
+    proxy.push_pending_changes();
+    if state.config().saved_revision() != revision {
+        return;
+    }
+    let outcome = receipt
+        .filter(|receipt| {
+            receipt.core_state == Some("committed")
+                && matches!(receipt.status, "hotApplied" | "hotDurabilityPending")
+                && receipt.runtime_generation == Some(proxy.core_generation())
+                && receipt
+                    .selection_intent_generation
+                    .is_some_and(|intent| proxy.selector_intent_is_current(intent))
+        })
+        .map(|_| SwitchOutcome::HotSwitched);
+    record_auto_exit_after_removal(proxy, candidate, old_selected, outcome);
+    if outcome.is_some()
+        && selected_exit_changed(
+            old_selected,
+            candidate.get("selectedServerId").and_then(Value::as_str),
+        )
+    {
+        state
+            .unlock()
+            .invalidate(&BroadcastSink::new(app), proxy.status().running, false);
+    }
 }
 
 /// Dropping the pipeline abandons network/provider futures and queued parser ownership.
