@@ -3302,9 +3302,9 @@ impl ProxyRuntime {
         if pending.api_handoff.as_ref().is_some_and(|h| !h.confirmed()) {
             return RuntimeApplyResult::status("unconfirmed");
         }
-        let Some(active) = pending.committed_identity(&operation) else {
+        if pending.committed_identity(&operation).is_none() {
             return RuntimeApplyResult::status("unconfirmed");
-        };
+        }
         // Record the verified Core fact even when a later App owner prevents R
         // publication. This does not grant the old intent any new rights.
         let mut observe_retirement = false;

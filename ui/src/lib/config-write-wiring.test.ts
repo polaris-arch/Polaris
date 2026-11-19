@@ -96,7 +96,7 @@ const PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   // W-a：设置页漏斗。只认对象字面量实参 —— `update(idx, next)` 那种同名的列表编辑器局部函数不是写 config。
   ['W-a', /(?<![.\w$])update\s*\(\s*\{/g],
   // W-b：config 写（版本化整份 save / 原子 patch / 实体事务 / 原子 takeover / store 包装）。
-  ['W-b', /(?:\b(?:api\.config|configApi)\s*\.\s*(?:save|patch|mutateEntities|setTakeover)|\b(?:saveConfig|mutateConfigEntities))\s*\(/g],
+  ['W-b', /(?:\b(?:api\.config|configApi)\s*\.\s*(?:save|patch|mutateEntities|setTakeover|updateMode)|\b(?:saveConfig|mutateConfigEntities))\s*\(/g],
   // W-d：专用 IPC 写腿 —— 前端发的是「加一个节点」而不是「写 servers 键」，但落盘的是同一份 config。
   [
     'W-d',
@@ -463,9 +463,9 @@ const SITES: readonly Site[] = [
   },
   {
     file: 'tray/TrayMenu.tsx',
-    callee: 'saveConfig(',
+    callee: 'api.config.updateMode(',
     route: 'direct',
-    why: 'W-1 模式切换：只提交 proxyMode；托盘虽是独立 webview，未提交字段仍由后端锁内保留。接管方式另走专用 setTakeover 原子事务',
+    why: '托盘只提交分流模式，复用原生热应用准入。需要手动处理时由主窗口负责',
   },
   {
     file: 'tray/TrayMenu.tsx',

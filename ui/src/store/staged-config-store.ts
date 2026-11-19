@@ -62,11 +62,23 @@ import {
 
 /** 直接从 IPC 契约取，避免与 `pending-bar-logic.ts` 的同名联合各写一份（store 不该反向依赖组件层）。 */
 type ApplyReceipt = Awaited<ReturnType<typeof api.proxy.applyPendingChanges>>;
+type SavedEditChange = { label: string; logLevel?: string };
 export type SavedRuntimeApply = ApplyReceipt & {
-  changes?: readonly { label: string; logLevel?: string }[];
+  changes?: readonly SavedEditChange[];
   saveRevision?: number;
   configVersion?: string;
 };
+
+export function notifySavedEdit(changes: readonly SavedEditChange[]): void {
+  if (!changes.length) return;
+  const labels = changes.slice(0, 3).map(({ label, logLevel }) => logLevel
+    ? `${i18n.t('logs.currentLevel')} ${logLevel}` : label);
+  const summary = labels.join(' · ');
+  const remaining = changes.length - labels.length;
+  toast.success(i18n.t(remaining > 0 ? 'home.pendingSavedMoreChanges' : 'home.pendingSavedChanges',
+    { changes: summary, count: remaining }));
+}
+
 type ApplyDispatch = (precedingSave: ApplyReceipt | null) => boolean;
 
 /** Order the renderer's explicit IPC dispatch after any Save already in flight. */
@@ -676,18 +688,19 @@ function completeSave(
   // Keep their original comparison base; the next save rechecks them conservatively.
   const remainingBaseline = remaining.length > 0 ? current.baseline : latestSaved;
   const saveRevision = current.completedSaveRevision + 1;
+  const changes = entries.flatMap(({ entityPath, label }) => {
+    const before = entitySnapshot(disk, entityPath);
+    const changed = before !== entitySnapshot(merged, entityPath)
+      && before !== entitySnapshot(outcome.config, entityPath);
+    if (!changed || !label.trim()) return [];
+    const level = entityPath.length === 1 && entityPath[0] === 'logLevel' ? outcome.config.logLevel : undefined;
+    return [{ label: label.trim(), ...(typeof level === 'string' ? { logLevel: level.toUpperCase() } : {}) }];
+  });
   const savedRuntimeApply = outcome.runtimeApply === undefined ? undefined : {
     ...outcome.runtimeApply,
     saveRevision,
     configVersion: outcome.version,
-    changes: entries.flatMap(({ entityPath, label }) => {
-      const before = entitySnapshot(disk, entityPath);
-      const changed = before !== entitySnapshot(merged, entityPath)
-        && before !== entitySnapshot(outcome.config, entityPath);
-      if (!changed || !label.trim()) return [];
-      const level = entityPath.length === 1 && entityPath[0] === 'logLevel' ? outcome.config.logLevel : undefined;
-      return [{ label: label.trim(), ...(typeof level === 'string' ? { logLevel: level.toUpperCase() } : {}) }];
-    }),
+    changes,
   };
   set({
     entries: remaining,
@@ -699,6 +712,9 @@ function completeSave(
     baseline: remainingBaseline,
   });
   if (manualSave) persist(remainingBaseline, remaining);
+  else if (savedRuntimeApply === undefined && (!observedDuringSave || current.baseVersion === outcome.version)) {
+    notifySavedEdit(changes);
+  }
 }
 
 /**

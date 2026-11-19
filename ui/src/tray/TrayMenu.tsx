@@ -564,7 +564,7 @@ export default function TrayMenu() {
       if (result.status === 'needsManual') {
         setNotice(t('tray.manageInMain'));
       } else if (result.status !== 'saved') {
-        noticeActionFailure(t('tray.groupMode'), new Error('routing configuration changed'));
+        noticeActionFailure(t('tray.groupMode'), result.status);
       } else if (result.runtimeApply?.status === 'hotApplied' && result.runtimeApply.configurationDurable === true) {
         const label = MODES.find((option) => option.v === mode);
         if (label) setNotice(t(label.k));
