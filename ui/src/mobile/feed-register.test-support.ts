@@ -227,6 +227,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
 
   /* ── 暂存（待应用条）─────────────────────────────────────────────────── */
   { id: 'useStagedConfigStore.entries', role: 'state', disposition: fed({ file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'submitEdit({' }), note: '共享提交保留下来的未保存条目。' },
+  { id: 'useStagedConfigStore.latestSavedConfig', role: 'state', disposition: fed({ file: 'ui/src/store/staged-config-store.ts', mustContain: 'latestSavedConfig: latestSaved' }), note: '节点表单提交前核对最新保存快照，防止配置列表尚未收到广播时用旧表单覆盖更新。' },
   { id: 'useStagedConfigStore.saveStatus', role: 'state', disposition: fed(STAGED_FED), note: '保存态（保存失败时条上要说话，静默失败是本仓修过的形态）。' },
   { id: 'useStagedConfigStore.savedRuntimeApply', role: 'state', disposition: fed(STAGED_FED), note: '保存时收到的运行核回执，由共用待应用逻辑按原事务消费。' },
   { id: 'useStagedConfigStore.conflict', role: 'state', disposition: fed(STAGED_FED), note: '保存冲突（盘上被别处改过）。冲突时 save 把 saveStatus 退回 idle 并 return false —— 不报冲突就等于「什么都没发生」。' },
