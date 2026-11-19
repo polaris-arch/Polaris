@@ -2235,6 +2235,10 @@ impl ProxyRuntime {
                 // spawn and bind it to the opaque identity returned for that Child.
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let launch_tls = startup_cli_proof.clone();
+                // The seal and the returned Child share this original birth,
+                // including a direct launch that owns no Tailscale directory yet.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let main_claim_token = Some(main_reservation.claim_direct_birth()?);
                 let direct_proof_rejected = std::cell::Cell::new(false);
                 let direct_spawn = self.spawn_direct_native(
                     native_producer.as_ref(),

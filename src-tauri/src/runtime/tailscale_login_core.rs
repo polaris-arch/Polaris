@@ -1863,6 +1863,31 @@ impl MainReservation<'_, '_> {
         self.registered.then(|| self.token.clone())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn claim_direct_birth(&mut self) -> Result<MainBirthToken, String> {
+        if self.external_possible {
+            return Err("Tailscale direct birth must be registered before spawn".into());
+        }
+        if !self.registered {
+            let mut main = self
+                .registry
+                .shared
+                .main
+                .lock()
+                .map_err(|_| "Tailscale main ownership is unknown".to_owned())?;
+            if main.is_some() {
+                return Err("Tailscale main reservation already owns a physical attempt".into());
+            }
+            *main = Some(MainClaim {
+                token: self.token.clone(),
+                directories: HashMap::new(),
+                endpoints: HashMap::new(),
+            });
+            self.registered = true;
+        }
+        Ok(self.token.clone())
+    }
+
     pub(crate) fn arm_external_start(&mut self) {
         self.external_possible = true;
     }

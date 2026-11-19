@@ -162,6 +162,19 @@ async fn protected_main_run(
     crate::runtime::tailscale_login_core::MainBirthToken,
     u32,
 ) {
+    protected_main_birth(rt, dir, Some(server_id)).await
+}
+
+#[cfg(unix)]
+async fn protected_main_birth(
+    rt: &Arc<ProxyRuntime>,
+    dir: &TestDir,
+    server_id: Option<&str>,
+) -> (
+    RunIdentity,
+    crate::runtime::tailscale_login_core::MainBirthToken,
+    u32,
+) {
     use super::super::super::prerequisite::NormalStartCompletion;
     let gate = rt.mesh.tailscale_state_gate().await;
     let mut completion = rt
@@ -182,17 +195,24 @@ async fn protected_main_run(
         matches!(&*completion.borrow(), NormalStartCompletion::Starting(owner) if *owner == generation)
     );
     let producer = rt.admitted_native_producer(generation).unwrap().unwrap();
-    let state = rt.mesh.tailscale_state_dir(server_id).unwrap();
+    let endpoints: Vec<_> = server_id
+        .map(|id| {
+            serde_json::json!({"type": "tailscale", "state_directory": rt.mesh.tailscale_state_dir(id).unwrap()})
+        })
+        .into_iter()
+        .collect();
     let token = rt.mesh.mint_tailscale_main_birth();
     let mut reservation = rt
         .mesh
         .reserve_tailscale_main_states(
-            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &serde_json::json!({"endpoints": endpoints}),
             &gate,
             token.clone(),
         )
         .await
         .unwrap();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(reservation.claim_direct_birth().unwrap().same(&token));
     let (pid, identity) = rt
         .spawn_direct_native(
             Some(&producer),
@@ -230,6 +250,23 @@ async fn protected_main_run(
         "attached Child remains a responsibility after observer failure"
     );
     (identity, token, pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn empty_direct_birth_seal_releases_the_original_token_on_stop() {
+    let (rt, dir) = test_runtime();
+    let (_identity, original, _pid) = protected_main_birth(&rt, &dir, None).await;
+    let gate = rt.mesh.tailscale_state_gate().await;
+    assert!(rt.mesh.assert_tailscale_main_claims_drained(&gate).is_err());
+    assert!(!rt.mesh.main_owns_tailscale("unsaved-node", true));
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    assert!(rt.child.lock().unwrap().is_empty());
+    assert!(rt.mesh.assert_tailscale_main_claims_drained(&gate).is_ok());
+    assert!(!rt
+        .mesh
+        .release_tailscale_main_states_if_token(&original, &gate)
+        .unwrap());
 }
 
 fn assert_retained_main(rt: &ProxyRuntime, server_id: &str, pid: u32) {

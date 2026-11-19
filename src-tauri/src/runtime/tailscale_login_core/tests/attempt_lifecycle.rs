@@ -303,6 +303,50 @@ async fn pre_spawn_drop_rolls_back_only_its_token_but_armed_drop_retains_it() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn empty_direct_birth_reserves_original_token_before_spawn() {
+    let registry = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let gate = registry.state_gate().await;
+    let empty = json!({"endpoints": []});
+
+    for spawned in [false, true] {
+        let original = registry.mint_main_birth();
+        let mut reservation = registry
+            .reserve_main_states(&empty, &root, &gate, original.clone())
+            .await
+            .unwrap();
+        assert!(reservation.claim_token().is_none());
+        assert!(reservation.claim_direct_birth().unwrap().same(&original));
+        assert!(reservation.claim_token().unwrap().same(&original));
+        assert!(registry.assert_main_claims_drained(&gate).is_err());
+        assert!(!registry.main_owns("unsaved-node", true));
+        if spawned {
+            reservation.arm_external_start();
+            assert!(reservation.claim_direct_birth().is_err());
+        }
+        drop(reservation);
+        let wrong = registry.mint_main_birth();
+        assert!(!registry
+            .release_main_states_if_token(&wrong, &gate)
+            .unwrap());
+        assert_eq!(
+            registry
+                .release_main_states_if_token(&original, &gate)
+                .unwrap(),
+            spawned
+        );
+        assert!(registry.assert_main_claims_drained(&gate).is_ok());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn unknown_main_claim_blocks_logout_even_when_alive_probe_is_false() {
     let reg = reg_with(
