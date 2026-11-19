@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { devNull, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -100,6 +100,7 @@ test('reviewed source observes every vendor object and enforces the independent 
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const args = process.argv.slice(2), fetch = args.indexOf('fetch');
+if (args[1] === 'init' && (fs.statSync(args[3]).mode & 0o777) !== 0o700) process.exit(95);
 if (fetch >= 0) {
   if (args[fetch + 3] !== ${JSON.stringify(source.sourceURL)}) process.exit(93);
   fs.appendFileSync(${JSON.stringify(fetchLog)}, JSON.stringify(args.slice(fetch)) + '\\n');
@@ -157,6 +158,18 @@ process.exit(result.status ?? 94);
       writeFileSync(join(android, 'build', 'artifact'), 'generator output');
       refuse(verify(android), /zero-overlay/);
       assert.equal(verify(android, '--generator-outputs').status, 0);
+      const quotedNames = ['back\\slash', 'double"quote', 'café'];
+      for (const name of quotedNames) {
+        const path = join(android, 'build', name);
+        writeFileSync(path, 'quoted generator name');
+        refuse(verify(android, '--generator-outputs'), /zero-overlay/);
+        unlinkSync(path);
+      }
+      execFileSync(actualGit, ['-C', android, 'config', 'core.quotePath', 'false'], { env });
+      const unicodePath = join(android, 'build', quotedNames[2]);
+      writeFileSync(unicodePath, 'unquoted non-ASCII generator name');
+      assert.equal(verify(android, '--generator-outputs').status, 0);
+      unlinkSync(unicodePath);
       writeFileSync(join(android, 'ignored.overlay'), 'foreign build input');
       refuse(verify(android, '--generator-outputs'), /zero-overlay/);
 

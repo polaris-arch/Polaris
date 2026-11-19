@@ -1,7 +1,7 @@
 // Mobile declaration, exact source checkout, reviewed source observation, and receipt decoding.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
 import { devNull } from 'node:os';
 import { dirname, join, posix, resolve, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -417,10 +417,15 @@ function verifyCheckout(root, source, raw, generatorOutputs) {
     pinned(declaration, sourceControlBytes).pin.sha256 === source.declaredTagsSource.sha256,
     'source-owned tags declaration differs');
   // Zero overlay includes ignored compiler/embed inputs. Only the producer's
-  // verified generator output has the existing fixed build/ exception.
+  // verified generator output has the existing fixed build/ exception. Use
+  // Git's quoted listing, including its local core.quotePath setting, because
+  // historically only a rendered path starting with build/ was admitted.
+  const inventoryText = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   for (const args of [['--others', '--ignored', '--exclude-standard'], ['--others', '--exclude-standard']]) {
-    const names = utf8.decode(git('ls-files', '-z', ...args)).split('\0');
-    demand(names.pop() === '' && names.every(name => generatorOutputs && name.startsWith('build/') && !(/[\x00-\x1f\x7f]/.test(name))),
+    const listing = inventoryText.decode(git('ls-files', ...args))
+      .replace(/^[\p{White_Space}\x1c-\x1f]+|[\p{White_Space}\x1c-\x1f]+$/gu, '');
+    const names = listing ? listing.split(/\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]/) : [];
+    demand(names.every(name => generatorOutputs && name.startsWith('build/')),
       'untracked ignored compiler/embed input is not a zero-overlay source');
   }
   return {
@@ -443,6 +448,9 @@ function sourceCheckout(root, raw, prepare, generatorOutputs = false) {
     const slot = lstatSync(root, { throwIfNoEntry: false });
     demand(!slot || slot.isDirectory(), 'mobile source slot is redirected or not a directory');
     if (!slot) {
+      // Reserve the leaf exclusively before Git. An EEXIST race refuses here
+      // rather than initializing a source directory owned by another producer.
+      mkdirSync(root, { mode: 0o700 });
       sourceGit(['init', '--quiet', root], 'initialization', 3_600_000);
       const ref = 'refs/tags/' + source.sourceTag;
       sourceGit(['-C', root, 'fetch', '--depth=1', '--no-tags', source.sourceURL, source.sourceTagObject + ':' + ref],
