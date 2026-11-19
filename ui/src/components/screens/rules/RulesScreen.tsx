@@ -20,6 +20,7 @@ import { configCanonicalText } from '@/lib/staged-config';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  getEffectiveConfig,
   useAppStore,
   useEffectiveConfig,
   useEffectiveRules,
@@ -504,10 +505,9 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
 
   // mode-warn 内的「切回智能」按钮确认分流设置已写盘。
   const handleBackToSmart = useCallback(async () => {
-    const { config: savedConfig, updateProxyMode } = useAppStore.getState();
-    if (!savedConfig) return;
+    if (!getEffectiveConfig()) return;
     try {
-      await updateProxyMode('smart');
+      await useAppStore.getState().updateProxyMode('smart');
       toast.success(t('rules.backToSmartOk'));
     } catch (err) {
       // 失败时 mode-warn 仍留在原地；同时报出真实原因，避免按钮看似无响应。

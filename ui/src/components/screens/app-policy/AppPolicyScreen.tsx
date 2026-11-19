@@ -57,6 +57,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import {
+  getEffectiveConfig,
   useAppStore,
   useEffectiveConfig,
   useEffectiveServers,
@@ -439,10 +440,9 @@ export function AppPolicyScreen() {
             type="button"
             className="btn ghost sm"
             onClick={async () => {
-              const { config: savedConfig, updateProxyMode } = useAppStore.getState();
-              if (!savedConfig) return;
+              if (!getEffectiveConfig()) return;
               try {
-                await updateProxyMode('smart');
+                await useAppStore.getState().updateProxyMode('smart');
                 toast.success(t('rules.backToSmartOk'));
               } catch (err) {
                 console.error('[AppPolicyScreen] backToSmart failed:', err);

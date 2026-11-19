@@ -229,14 +229,14 @@ export const RULES_PARITY: ScreenParityRegister = {
 
     /* ── 应用分流段（桌面 `components/screens/app-policy/` 整屏折进本屏）────────── */
     {
-      id: 'AppPolicyScreen.tsx|k:appPolicy.masterTip+appPolicy.masterToggleFail',
+      id: 'AppPolicyScreen.tsx|k:appPolicy.masterTip+appPolicy.masterToggleFail+common.saved',
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/AppsSegment.tsx', mustContain: "t('appPolicy.masterTip')" } },
-      note: '应用分流总开关（`role="switch"` 的 `<span>`）。移动端在应用段顶部同名一颗，失败回显走本屏统一的行内错误位。',
+      note: '应用分流总开关。移动端在应用段顶部同名一颗，直接写盘成功后显示已保存的开关状态，失败通过本屏的行内错误位回显。',
     },
     {
-      id: 'AppPolicyScreen.tsx|k:appPolicy.backToSmart',
+      id: 'AppPolicyScreen.tsx|k:appPolicy.backToSmart+rules.backToSmartFail+rules.backToSmartOk',
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/AppsSegment.tsx', mustContain: "t('appPolicy.backToSmart')" } },
-      note: '「切回智能分流」（非智能模式下应用策略不生效时出现的补救键）。移动端同名一颗，写腿同源。',
+      note: '「切回智能分流」在移动端复用流量分段的保存处理，写盘成功后提示已保存，写入失败时显示错误。',
     },
     {
       id: 'AppPolicyScreen.tsx|k:appPolicy.view.cards',

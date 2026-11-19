@@ -75,7 +75,7 @@ import { categoryLabel } from '@/domain/rule-resource-catalog';
 import { resourceUpdateFeedback, resourceUpdateOutcome } from '@/domain/resource-update-outcome';
 import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
 import type { CselGroup } from '@/components/dialogs/csel-logic';
-import { useAppStore, useEffectiveConfig, useEffectiveRules, useEffectiveServers } from '@/store/app-store';
+import { getEffectiveConfig, useAppStore, useEffectiveConfig, useEffectiveRules, useEffectiveServers } from '@/store/app-store';
 import { useAppPresetsStore } from '@/store/use-app-presets-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
@@ -632,11 +632,10 @@ export function MobileRulesScreen(): ReactElement {
   );
 
   const handleBackToSmart = useCallback(async () => {
-    const { config: savedConfig, updateProxyMode } = useAppStore.getState();
-    if (!savedConfig) return;
+    if (!getEffectiveConfig()) return;
     clearWriteError('proxyMode');
     try {
-      await updateProxyMode('smart');
+      await useAppStore.getState().updateProxyMode('smart');
       toast.success(tr('rules.backToSmartOk'));
     } catch (err) {
       // 失败时那条模式警告仍留在原地 —— 不报的话与「按钮失灵」同形。
