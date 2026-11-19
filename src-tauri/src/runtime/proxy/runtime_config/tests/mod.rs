@@ -540,8 +540,7 @@ async fn staged_save_preserves_earlier_rule_auto_target_swaps() {
     for collection in ["trafficRules", "appRules"] {
         let (rt, _dir, mut running, _) = host_dns_restart_fixture();
         running["autoSelectEnabled"] = json!(true);
-        running["servers"] =
-            json!([{"id":"node","name":"node","protocol":"socks","address":"127.0.0.1","port":1080}]);
+        running["servers"] = json!([{"id":"node","name":"node","protocol":"socks","address":"127.0.0.1","port":1080}]);
         running["proxyMode"] = json!("smart");
         running["appRoutingEnabled"] = json!(true);
         running[collection] = if collection == "trafficRules" {
