@@ -1070,4 +1070,39 @@ async fn stale_probe_leg_must_not_overwrite_newer_leg() {
     })
     .await;
     assert_eq!(peek_ipinfo_snapshot(), blocked);
+
+    // If the response itself is still pending, invalidation drops it too.
+    let (ticket, _) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
+    let in_request = std::cell::Cell::new(false);
+    dropped.set(false);
+    let (_, replacement) = tokio::join!(
+        run_automatic_ipinfo_probe(ticket, async {
+            let _drop = MarkDropped(&dropped);
+            in_request.set(true);
+            std::future::pending::<()>().await;
+        }),
+        async {
+            tokio::task::yield_now().await;
+            assert!(in_request.get());
+            declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS).1
+        },
+    );
+    assert!(dropped.get());
+    assert_eq!(peek_ipinfo_snapshot(), replacement);
+
+    // Manual detection supersedes publication, while the route and its already
+    // observed proxy are still current. The superseded direct result cannot fill in.
+    let (ticket, _) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
+    let (epoch, seq) = begin_scheduled_probe(ticket, true).unwrap();
+    let retained = commit_ipinfo_snapshot(epoch, seq, &early).unwrap();
+    let (manual_epoch, manual_seq) = begin_manual_probe();
+    assert!(commit_ipinfo_snapshot(epoch, seq, &complete).is_none());
+    let terminal = finish_scheduled_probe(ticket).expect("retired ticket closes its partial");
+    assert_eq!(terminal["proxy"], retained["proxy"]);
+    assert_eq!(terminal["updatedAt"], retained["updatedAt"]);
+    assert_eq!(terminal["loading"], json!(false));
+    assert!(terminal["direct"].is_null());
+    assert_eq!(fresh_cached_snapshot(), Some(terminal.clone()));
+    assert_eq!(peek_ipinfo_snapshot(), terminal);
+    assert!(commit_ipinfo_snapshot(manual_epoch, manual_seq, &complete).is_some());
 }

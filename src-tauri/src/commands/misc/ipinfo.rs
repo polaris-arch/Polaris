@@ -77,7 +77,7 @@ macro_rules! ipinfo_stage {
 static IPINFO_STATE: OnceLock<Mutex<IpinfoState>> = OnceLock::new();
 
 struct IpinfoState {
-    /// 仅存完整探测结果，供非 force 的 TTL 短路；部分结果只更新可见帧。
+    /// Most recent terminal result for TTL reads. A live partial only updates the visible frame.
     cache: Option<Value>,
     /// 最近一次权威发布帧。事件、peek 与手动响应复用其中的 revision。
     visible: Value,
@@ -253,6 +253,17 @@ fn finish_scheduled_probe(ticket: u64) -> Option<Value> {
     if state.pending_seq == Some(ticket) {
         state.pending_seq = None;
         if state.visible.get("loading") == Some(&json!(true)) {
+            // Every newer route event replaces this frame under the same lock.
+            // A manual probe only advances the publication fence and cannot have
+            // produced a loading frame. Keep this ticket's committed proxy result
+            // when the old automatic direct leg loses its right to publish.
+            if proxy_ip(&state.visible).is_some()
+                && snapshot_has_proxy_reachability(&state.visible, "reachable")
+            {
+                let mut terminal = state.visible.clone();
+                terminal["loading"] = json!(false);
+                return Some(state.publish(terminal, true));
+            }
             let mut empty = empty_ipinfo_snapshot();
             empty["updatedAt"] = json!(u64::try_from(now_epoch_ms()).unwrap_or(u64::MAX));
             if let Some(notice) = state.visible.get("dohBlocked") {
@@ -743,7 +754,7 @@ async fn build_ipinfo_snapshot(
     local_proxy: Option<&LocalHttpProxy>,
     doh_blocked: Option<&'static str>,
     post_connect: bool,
-    _seq: u64,
+    _probe: (u64, u64),
     publish_early: impl FnOnce(&Value),
 ) -> Value {
     let direct = with_ipinfo_retry(
@@ -757,12 +768,18 @@ async fn build_ipinfo_snapshot(
         match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
             Ok(p) => {
                 let proxy = || async {
-                    ipinfo_stage!("stage=proxy_request_begin seq={_seq}");
+                    ipinfo_stage!(
+                        "stage=proxy_request_begin epoch={} seq={}",
+                        _probe.0,
+                        _probe.1
+                    );
                     #[cfg(debug_assertions)]
                     let at = std::time::Instant::now();
                     let result = fetch_trace_ipinfo(&p).await;
                     ipinfo_stage!(
-                        "stage=proxy_request_end seq={_seq} elapsed_ms={} success={}",
+                        "stage=proxy_request_end epoch={} seq={} elapsed_ms={} success={}",
+                        _probe.0,
+                        _probe.1,
                         at.elapsed().as_millis(),
                         result.is_ok()
                     );
@@ -960,7 +977,7 @@ async fn probe_publish_ipinfo(
             return (peek_ipinfo_snapshot(), false);
         };
         ipinfo_stage!(
-            "stage=publish seq={seq} revision={} proxy={} partial={}",
+            "stage=publish epoch={epoch} seq={seq} revision={} proxy={} partial={}",
             snap["revision"].as_u64().unwrap_or_default(),
             !snap["proxy"].is_null(),
             snap["loading"].as_bool().unwrap_or_default()
@@ -994,7 +1011,7 @@ async fn probe_publish_ipinfo(
         local_proxy.as_ref(),
         doh_blocked,
         post_connect,
-        seq,
+        (epoch, seq),
         |proxy| {
             // 让代理结果立即可见，直连仍在检测，完整缓存保持不变。
             let mut early = ipinfo_snapshot(
@@ -1201,7 +1218,7 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
         // 旧起停/热切排程不得在新 pending 之后开探；手动腿不取代 ticket，
         // 因而收敛窗口内手点检测之后，这条自动长热身仍会醒来。
         if let Some((epoch, seq)) = begin_scheduled_probe(ticket, delay_ms > 0) {
-            ipinfo_stage!("stage=probe_begin ticket={ticket} seq={seq}");
+            ipinfo_stage!("stage=probe_begin ticket={ticket} epoch={epoch} seq={seq}");
             if let Some(inputs) = app
                 .try_state::<AppRuntime>()
                 .map(|state| ipinfo_probe_inputs(&state))
