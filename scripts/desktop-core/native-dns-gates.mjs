@@ -336,6 +336,21 @@ async function verifyNativeCronet(root, key, target, directory) {
   writeFileSync(join(directory, 'native-cronet-rust.json'), `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
 }
 
+function reportCronetComparison(directory, summary) {
+  try {
+    const receipt = readFileSync(join(directory, 'native-cronet-rust.json'));
+    const proof = JSON.parse(receipt);
+    const legacy = JSON.parse(readFileSync(join(directory, 'native-cronet.json'), 'utf8'));
+    requireGate(isDeepStrictEqual(proof.transport, {
+      candidate: summary.candidate, runId: summary.runId, attempt: summary.attempt,
+    }), 'Rust proof belongs to another run or attempt');
+    compareCronetProofs(proof, legacy);
+    return { state: 'passed', receiptSha256: sha256(receipt) };
+  } catch {
+    return { state: 'failed-or-incomplete' };
+  }
+}
+
 export function summaryFor(key, env, plan, results = [], failure = null) {
   const complete = results.length === plan.length && plan.every((gate, index) =>
     results[index]?.id === gate.id && results[index].state === 'passed');
@@ -372,8 +387,13 @@ async function main() {
       && summary.candidate === process.env.CORE_CANDIDATE && summary.runId === process.env.GITHUB_RUN_ID
       && summary.attempt === process.env.GITHUB_RUN_ATTEMPT
       && summary.selection === 'formal-default', 'Summary belongs to another candidate/run/attempt');
+    if (target.library) {
+      summary.cronetProofComparison = reportCronetComparison(directory, summary);
+      save(summary);
+    }
     if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY,
       `### Native DNS candidate: ${key}\n\nMandatory ordinary gates: ${summary.mandatoryGatesPassed ? 'passed' : 'failed or incomplete'}. App/package acceptance: false. Sealed B609 path: unvalidated.\n\n`
+      + (summary.cronetProofComparison ? `Rust Cronet proof comparison: ${summary.cronetProofComparison.state}.\n\n` : '')
       + summary.gates.map((gate) => `- ${gate.id}: ${gate.state}\n`).join('') + (summary.failure ? `\n${summary.failure}\n` : ''));
     return;
   }
