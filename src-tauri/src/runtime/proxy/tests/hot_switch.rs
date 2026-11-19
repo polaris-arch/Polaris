@@ -4962,11 +4962,24 @@ async fn real_core_hot_switch_keeps_pid() {
 async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
     let _real_core_guard = lock_real_core_tests().await;
     let (rt, _dir, _core, _cleanup) = real_core_runtime();
+    let pending_events = Arc::new(Mutex::new(Vec::new()));
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        pending_changes: Arc::clone(&pending_events),
+        ..Default::default()
+    }));
     let mut config = two_node_config_ports(free_port(), "node-a", free_port(), free_port());
     config["singboxDashboard"] = false.into();
     rt.config.save_full(&config).unwrap();
     let before = rt.config.current().unwrap();
     let started = rt.start(before.clone()).await.expect("start paired Core");
+    assert!(
+        pending_events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| !frame.pending_apply),
+        "ready must emit its pending snapshot through the real emitter path"
+    );
     let generation = rt.core_generation();
     let startup_intent = rt.selector_reconcile.intent_generation();
     let mut candidate = before.clone();
@@ -5067,6 +5080,11 @@ async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
     assert!(!rt.selector_reconcile.is_required());
     assert!(!rt.pending_changes().pending_apply);
     rt.stop().await.expect("stop paired Core");
+    assert!(pending_events
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|frame| !frame.pending_apply));
 }
 
 /// 真核回归：自动故障治理走它自己的零重启事务，真实 gRPC PUT + groups 首帧回读均成功；同时
