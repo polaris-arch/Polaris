@@ -3531,7 +3531,6 @@ fn already_peeled_node_named_again_stalls_the_loop() {
 }
 
 /// 两节点配置（选中 keep-me），供 `generate_and_gate` 的整环门用。
-#[cfg(unix)]
 fn gate_two_node_config() -> Value {
     serde_json::json!({
         "servers": [

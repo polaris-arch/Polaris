@@ -4707,7 +4707,7 @@ impl ProxyRuntime {
     }
 
     /// 单测保持既有调用面；生产必须显式给出本次会话的运行时绑定，防止新增调用点悄悄漏接。
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(super) async fn generate_and_gate(
         &self,
         user_config: &UserConfig,

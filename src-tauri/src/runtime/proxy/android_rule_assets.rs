@@ -31,12 +31,14 @@ impl AndroidRuleAssets {
             ));
         }
         let generations = config_dir.join(GENERATIONS_DIR);
-        let mut mkdir = fs::DirBuilder::new();
+        let mkdir = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let mkdir = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut mkdir = mkdir;
             mkdir.mode(0o700);
-        }
+            mkdir
+        };
         match mkdir.create(&generations) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
