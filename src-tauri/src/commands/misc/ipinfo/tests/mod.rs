@@ -696,8 +696,8 @@ fn probe_start() -> (u64, u64) {
 ///
 /// **变异锁**：删掉 [`commit_ipinfo_snapshot`] 里的世代比对 → 段 (a)–(d) 转红；删掉排程线比对
 /// → 段 (f) 转红（段 (a)–(d) **全绿**，这正是第三轮复审逮到的那一半）。
-#[test]
-fn stale_probe_leg_must_not_overwrite_newer_leg() {
+#[tokio::test(start_paused = true)]
+async fn stale_probe_leg_must_not_overwrite_newer_leg() {
     assert_eq!(
         peek_ipinfo_snapshot()["revision"],
         json!(0),
@@ -1017,4 +1017,57 @@ fn stale_probe_leg_must_not_overwrite_newer_leg() {
         &snap_with_proxy("8.8.8.8", "HK")
     ));
     assert!(claim_unreachable_retry_probe(retry_seq).is_none());
+
+    // The single shared-state fixture also exercises the real cancellation path.
+    let (ticket, _) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
+    let (epoch, seq) = begin_scheduled_probe(ticket, true).unwrap();
+    let started = tokio::time::Instant::now();
+    let attempts = std::cell::Cell::new(0);
+    let dropped = std::cell::Cell::new(false);
+    struct MarkDropped<'a>(&'a std::cell::Cell<bool>);
+    impl Drop for MarkDropped<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let (_, stopped) = tokio::join!(
+        run_automatic_ipinfo_probe(ticket, async {
+            let _drop = MarkDropped(&dropped);
+            let _ = with_ipinfo_retry(
+                || async {
+                    attempts.set(attempts.get() + 1);
+                    Err("test response".to_owned())
+                },
+                IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
+                IPINFO_PROXY_POST_CONNECT_RETRY_MS,
+            )
+            .await;
+            panic!("a superseded task completed its retry budget");
+        }),
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = begin_manual_probe();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                !dropped.get(),
+                "manual detection must preserve the background schedule"
+            );
+            declare_scheduled_refresh(0).1
+        },
+    );
+    assert!(dropped.get());
+    assert_eq!(attempts.get(), 1);
+    assert!(started.elapsed() < Duration::from_millis(IPINFO_PROXY_POST_CONNECT_RETRY_MS));
+    assert!(!ipinfo_probe_is_current(epoch, seq));
+    assert!(finish_scheduled_probe(ticket).is_none());
+    assert_eq!(peek_ipinfo_snapshot(), stopped);
+
+    // A blocked verdict cancels even a task that has not first been polled.
+    let (ticket, _) = declare_scheduled_refresh(IPINFO_SETTLE_DELAY_MS);
+    let blocked = commit_proxy_blocked_snapshot("ts-exit-device-offline");
+    run_automatic_ipinfo_probe(ticket, async {
+        panic!("a previously revoked probe opened");
+    })
+    .await;
+    assert_eq!(peek_ipinfo_snapshot(), blocked);
 }

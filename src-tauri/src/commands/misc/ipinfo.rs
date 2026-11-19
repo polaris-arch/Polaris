@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
+use tokio::sync::watch;
 
 use crate::response::ApiResponse;
 use crate::runtime::http::{app_user_agent, HttpRuntime, SystemDnsLookup};
@@ -63,6 +64,14 @@ pub const IPINFO_SETTLE_DELAY_MS: u64 = 4_000;
 const IPINFO_UNREACHABLE_RETRY_INITIAL_MS: u64 = 15_000;
 const IPINFO_UNREACHABLE_RETRY_MAX_MS: u64 = 60_000;
 
+// Keep QA timings in Debug builds without requiring the user to change the log level.
+macro_rules! ipinfo_stage {
+    ($($arg:tt)*) => {{
+        #[cfg(debug_assertions)]
+        log::info!(target: "polaris::exit_ip_stage", $($arg)*);
+    }};
+}
+
 /// 缓存、可见快照和排程票据共用一把锁。序列宣告与结果落地也在此锁内，避免
 /// “旧腿过闸 → 新 pending 落地 → 旧腿覆写”的 check-then-act 窗口。
 static IPINFO_STATE: OnceLock<Mutex<IpinfoState>> = OnceLock::new();
@@ -75,6 +84,8 @@ struct IpinfoState {
     revision: u64,
     /// 延迟排程的归属。手动探测不取消它；更新的起停/热切事件会替换它。
     pending_seq: Option<u64>,
+    /// Latest route-driven schedule or blocked verdict. A manual request does not revoke it.
+    automatic_revocation: watch::Sender<u64>,
 }
 
 impl Default for IpinfoState {
@@ -84,6 +95,7 @@ impl Default for IpinfoState {
             visible: empty_ipinfo_snapshot(),
             revision: 0,
             pending_seq: None,
+            automatic_revocation: watch::channel(0).0,
         }
     }
 }
@@ -198,7 +210,26 @@ fn declare_scheduled_refresh(delay_ms: u64) -> (u64, Value) {
         }
         state.publish(stopped, true)
     };
+    state.automatic_revocation.send_replace(seq);
     (seq, snapshot)
+}
+
+/// Cancel the sleep, requests and retry budget of a superseded background owner.
+/// The epoch and sequence checks still guard publication when a future completes
+/// concurrently with invalidation.
+async fn run_automatic_ipinfo_probe(ticket: u64, task: impl std::future::Future<Output = ()>) {
+    let mut revocation = ipinfo_state()
+        .lock()
+        .unwrap()
+        .automatic_revocation
+        .subscribe();
+    tokio::select! {
+        biased;
+        _ = revocation.wait_for(|seq| *seq > ticket) => {
+            ipinfo_stage!("stage=superseded ticket={ticket}");
+        }
+        () = task => {}
+    }
 }
 
 /// 旧排程醒来时不得抢新起停事件的 pending；手动检测不替换排程票据，
@@ -514,10 +545,12 @@ pub(crate) fn mark_ipinfo_proxy_blocked(app: &AppHandle, reason: &str) {
 /// 需要 `AppHandle` 的动作。
 fn commit_proxy_blocked_snapshot(reason: &str) -> Value {
     let mut state = ipinfo_state().lock().unwrap();
-    declare_schedule_locked();
+    let seq = declare_schedule_locked();
     state.pending_seq = None;
     let snap = fold_proxy_blocked(state.cache.clone(), reason);
-    state.publish(snap, true)
+    let snap = state.publish(snap, true);
+    state.automatic_revocation.send_replace(seq);
+    snap
 }
 
 /// 空快照（无缓存时 peek 的回退：direct/proxy 均 null）。
@@ -710,6 +743,7 @@ async fn build_ipinfo_snapshot(
     local_proxy: Option<&LocalHttpProxy>,
     doh_blocked: Option<&'static str>,
     post_connect: bool,
+    _seq: u64,
     publish_early: impl FnOnce(&Value),
 ) -> Value {
     let direct = with_ipinfo_retry(
@@ -721,19 +755,29 @@ async fn build_ipinfo_snapshot(
     // 并带本次起核的凭据 —— 此前无条件读 `mixed_port`，Android 上连向一个不存在的口，出口 IP 恒空）。
     let (direct, proxy) = if let Some(lp) = local_proxy.filter(|_| status.running) {
         match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
-            Ok(p) if post_connect => {
-                probe_post_connect_ipinfo(direct, || fetch_trace_ipinfo(&p), publish_early).await
-            }
             Ok(p) => {
-                let direct = direct.await;
-                let proxy = with_ipinfo_retry(
-                    || fetch_trace_ipinfo(&p),
-                    IPINFO_PROXY_ATTEMPTS,
-                    IPINFO_PROXY_RETRY_MS,
-                )
-                .await
-                .unwrap_or(Value::Null);
-                (direct, proxy)
+                let proxy = || async {
+                    ipinfo_stage!("stage=proxy_request_begin seq={_seq}");
+                    #[cfg(debug_assertions)]
+                    let at = std::time::Instant::now();
+                    let result = fetch_trace_ipinfo(&p).await;
+                    ipinfo_stage!(
+                        "stage=proxy_request_end seq={_seq} elapsed_ms={} success={}",
+                        at.elapsed().as_millis(),
+                        result.is_ok()
+                    );
+                    result
+                };
+                if post_connect {
+                    probe_post_connect_ipinfo(direct, proxy, publish_early).await
+                } else {
+                    let direct = direct.await;
+                    let proxy =
+                        with_ipinfo_retry(proxy, IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS)
+                            .await
+                            .unwrap_or(Value::Null);
+                    (direct, proxy)
+                }
             }
             Err(_) => (direct.await, Value::Null),
         }
@@ -915,6 +959,12 @@ async fn probe_publish_ipinfo(
         let Some(snap) = commit_ipinfo_snapshot(epoch, seq, &snap) else {
             return (peek_ipinfo_snapshot(), false);
         };
+        ipinfo_stage!(
+            "stage=publish seq={seq} revision={} proxy={} partial={}",
+            snap["revision"].as_u64().unwrap_or_default(),
+            !snap["proxy"].is_null(),
+            snap["loading"].as_bool().unwrap_or_default()
+        );
         crate::events::broadcast(
             app,
             crate::events::channel::EVENT_IP_INFO_UPDATED,
@@ -944,6 +994,7 @@ async fn probe_publish_ipinfo(
         local_proxy.as_ref(),
         doh_blocked,
         post_connect,
+        seq,
         |proxy| {
             // 让代理结果立即可见，直连仍在检测，完整缓存保持不变。
             let mut early = ipinfo_snapshot(
@@ -1045,7 +1096,7 @@ fn schedule_unreachable_ipinfo_recheck(
         return;
     }
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    tauri::async_runtime::spawn(run_automatic_ipinfo_probe(expected_seq, async move {
         let mut expected_seq = expected_seq;
         let mut delay_ms = IPINFO_UNREACHABLE_RETRY_INITIAL_MS;
         loop {
@@ -1077,7 +1128,7 @@ fn schedule_unreachable_ipinfo_recheck(
             expected_seq = seq;
             delay_ms = next_unreachable_retry_delay_ms(delay_ms);
         }
-    });
+    }));
 }
 
 /// **出口 IP 自动重探排程**（事件驱动）——移植 上游 `IpInfoService` 的触发表：
@@ -1137,15 +1188,20 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
         None
     };
     let (ticket, frame) = declare_scheduled_refresh(delay_ms);
+    ipinfo_stage!(
+        "stage=schedule ticket={ticket} revision={} delay_ms={delay_ms} recovery={recheck_unlock_on_recovery}",
+        frame["revision"].as_u64().unwrap_or_default()
+    );
     crate::events::broadcast(app, crate::events::channel::EVENT_IP_INFO_UPDATED, frame);
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    tauri::async_runtime::spawn(run_automatic_ipinfo_probe(ticket, async move {
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         // 旧起停/热切排程不得在新 pending 之后开探；手动腿不取代 ticket，
         // 因而收敛窗口内手点检测之后，这条自动长热身仍会醒来。
         if let Some((epoch, seq)) = begin_scheduled_probe(ticket, delay_ms > 0) {
+            ipinfo_stage!("stage=probe_begin ticket={ticket} seq={seq}");
             if let Some(inputs) = app
                 .try_state::<AppRuntime>()
                 .map(|state| ipinfo_probe_inputs(&state))
@@ -1169,7 +1225,7 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
         if let Some(frame) = finish_scheduled_probe(ticket) {
             crate::events::broadcast(&app, crate::events::channel::EVENT_IP_INFO_UPDATED, frame);
         }
-    });
+    }));
 }
 
 #[cfg(test)]
