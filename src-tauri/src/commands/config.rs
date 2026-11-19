@@ -33,7 +33,7 @@ use crate::events::channel::{
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
 use crate::runtime::proxy::runtime_config::{
-    HotConfigEditOutcome, StagedSaveOwner, TakeoverApplyOwner,
+    HotConfigEditOutcome, RuntimeApplyReason, StagedSaveOwner, TakeoverApplyOwner,
 };
 use crate::runtime::proxy::{ProxyRuntime, StagedClassification, SwitchOutcome};
 use crate::runtime::unlock::{
@@ -382,7 +382,11 @@ pub enum SaveOutcome {
     #[serde(rename_all = "camelCase")]
     Conflict { disk_version: String },
     /// No write occurred. Render or keep the explicit draft for this edit.
-    NeedsManual,
+    #[serde(rename_all = "camelCase")]
+    NeedsManual {
+        restart_required: bool,
+        reasons: Vec<RuntimeApplyReason>,
+    },
     /// Earlier work is awaiting confirmation. This edit has not been classified.
     BlockedByPending,
     /// Authority was temporarily unavailable before any write.
@@ -532,7 +536,13 @@ async fn config_save_hot_only(
         return ApiResponse::ok(SaveOutcome::Conflict { disk_version });
     };
     match Box::pin(state.proxy.apply_hot_config_edit(&edit)).await {
-        Ok(HotConfigEditOutcome::NeedsManual) => ApiResponse::ok(SaveOutcome::NeedsManual),
+        Ok(HotConfigEditOutcome::NeedsManual {
+            restart_required,
+            reasons,
+        }) => ApiResponse::ok(SaveOutcome::NeedsManual {
+            restart_required,
+            reasons,
+        }),
         Ok(HotConfigEditOutcome::BlockedByPending) => {
             ApiResponse::ok(SaveOutcome::BlockedByPending)
         }

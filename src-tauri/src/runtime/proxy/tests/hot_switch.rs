@@ -5084,7 +5084,8 @@ async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
     let edit = edit.unwrap();
     assert!(matches!(
         rt.apply_hot_config_edit(&edit).await.unwrap(),
-        HotConfigEditOutcome::NeedsManual,
+        HotConfigEditOutcome::NeedsManual { reasons, .. }
+            if !reasons.is_empty(),
     ));
     assert_eq!(rt.config.saved_revision(), edit.revision);
     assert_eq!(rt.config.current().unwrap(), candidate);

@@ -1087,9 +1087,9 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
                             return;
                         }
                         match response.data {
-                            Some(SaveOutcome::NeedsManual | SaveOutcome::BlockedByPending) => {
-                                show_main_window(&app)
-                            }
+                            Some(
+                                SaveOutcome::NeedsManual { .. } | SaveOutcome::BlockedByPending,
+                            ) => show_main_window(&app),
                             Some(
                                 SaveOutcome::Conflict { .. }
                                 | SaveOutcome::Retryable

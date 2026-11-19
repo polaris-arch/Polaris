@@ -410,6 +410,18 @@ impl RuntimeApplyResult {
             restart_required: status == "restartRequired",
         }
     }
+
+    fn restart_required(code: &'static str, mut paths: Vec<String>) -> Self {
+        if paths.is_empty() {
+            paths.push(String::new());
+        }
+        let mut result = Self::status("restartRequired");
+        result.reasons = paths
+            .into_iter()
+            .map(|path| RuntimeApplyReason { code, path })
+            .collect();
+        result
+    }
 }
 
 fn runtime_pairing_mismatch() -> RuntimeApplyResult {
@@ -479,7 +491,10 @@ pub(crate) enum HotConfigEditOutcome {
         runtime_apply: Option<RuntimeApplyResult>,
         revision: u64,
     },
-    NeedsManual,
+    NeedsManual {
+        restart_required: bool,
+        reasons: Vec<RuntimeApplyReason>,
+    },
     BlockedByPending,
     Retryable,
     Rejected,
@@ -1554,18 +1569,8 @@ impl ProxyRuntime {
             intent,
             running,
         };
-        let mut result = RuntimeApplyResult::status("restartRequired");
+        let mut result = RuntimeApplyResult::restart_required(code, paths);
         result.restart_confirmation = Some(token);
-        result.reasons = paths
-            .into_iter()
-            .map(|path| RuntimeApplyReason { code, path })
-            .collect();
-        if result.reasons.is_empty() {
-            result.reasons.push(RuntimeApplyReason {
-                code,
-                path: String::new(),
-            });
-        }
         if let Ok(mut state) = self.runtime_config_apply.lock() {
             state.restart = Some(choice);
             state.impact = None;
@@ -1725,7 +1730,10 @@ impl ProxyRuntime {
             Err(result) => {
                 let outcome = match result.status {
                     "restartRequired" | "impactConfirmationRequired" => {
-                        HotConfigEditOutcome::NeedsManual
+                        HotConfigEditOutcome::NeedsManual {
+                            restart_required: result.restart_required,
+                            reasons: result.reasons,
+                        }
                     }
                     "rejected" => HotConfigEditOutcome::Rejected,
                     _ => HotConfigEditOutcome::Retryable,
@@ -1968,7 +1976,7 @@ impl ProxyRuntime {
                     saved_revision,
                 )
             } else {
-                RuntimeApplyResult::status("restartRequired")
+                RuntimeApplyResult::restart_required(code, paths)
             }
         };
         if saved_owner.is_some_and(|owner| {
@@ -2504,7 +2512,12 @@ impl ProxyRuntime {
             });
         let api_handoff = if target_api != baseline.management || api_generation_handoff {
             if prospective {
-                return decline(RuntimeApplyResult::status("impactConfirmationRequired"));
+                let mut result = RuntimeApplyResult::status("impactConfirmationRequired");
+                result.reasons.push(RuntimeApplyReason {
+                    code: "impactConfirmationRequired",
+                    path: "services.api".into(),
+                });
+                return decline(result);
             }
             if baseline
                 .control
@@ -2612,7 +2625,7 @@ impl ProxyRuntime {
                     saved_revision,
                 )
             } else {
-                RuntimeApplyResult::status("restartRequired")
+                RuntimeApplyResult::restart_required("hostEffectsRequireRestart", vec![])
             });
         }
         let pending = PendingOperation {
@@ -2643,21 +2656,34 @@ impl ProxyRuntime {
             tailnet_suspended_token: None,
             tailnet_bindings,
         };
-        if runtime_plan_needs_local_confirmation(&pending.plan)
-            || pending.host_plan.as_ref().is_some_and(|plan| {
-                if offer_confirmation {
-                    plan.effects
-                        .iter()
-                        .any(|effect| effect.before_digest != effect.target_digest)
-                } else {
-                    // Even matching physical facts can carry a host controller
-                    // recipe. Save authorizes the Core graph only.
-                    !plan.effects.is_empty()
-                }
-            })
-        {
+        let core_confirmation = runtime_plan_needs_local_confirmation(&pending.plan);
+        let host_confirmation = pending.host_plan.as_ref().is_some_and(|plan| {
+            if offer_confirmation {
+                plan.effects
+                    .iter()
+                    .any(|effect| effect.before_digest != effect.target_digest)
+            } else {
+                // Even matching physical facts can carry a host controller
+                // recipe. Save authorizes the Core graph only.
+                !plan.effects.is_empty()
+            }
+        });
+        if core_confirmation || host_confirmation {
             if !offer_confirmation {
-                return decline(RuntimeApplyResult::status("impactConfirmationRequired"));
+                let mut result = RuntimeApplyResult::status("impactConfirmationRequired");
+                result.reasons.extend(
+                    [
+                        (core_confirmation, "runtime.impacts"),
+                        (host_confirmation, "host.effects"),
+                    ]
+                    .into_iter()
+                    .filter(|(required, _)| *required)
+                    .map(|(_, path)| RuntimeApplyReason {
+                        code: "impactConfirmationRequired",
+                        path: path.into(),
+                    }),
+                );
+                return decline(result);
             }
             return decline(self.prepare_runtime_impact_choice(pending));
         }

@@ -608,7 +608,7 @@ export interface StagedClassification {
  */
 export type SaveOutcome =
   | { status: 'saved'; version: string; config: UserConfig; runtimeApply?: PendingApplyResult }
-  | { status: 'needsManual' }
+  | { status: 'needsManual'; restartRequired?: boolean; reasons?: PendingApplyResult['reasons'] }
   | { status: 'blockedByPending' | 'retryable' | 'rejected' }
   | { status: 'conflict'; diskVersion: string };
 
