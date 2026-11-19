@@ -14,7 +14,9 @@ import { MobileSettingsScreen } from '/src/mobile/settings/MobileSettingsScreen'
 import { AppAddPanel } from '/src/mobile/forms/AppAddPanel';
 import { MobileRulesScreen } from '/src/mobile/screens/rules/RulesScreen';
 import { useAppStore } from '/src/store/app-store';
+import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { useAppPresetsStore } from '/src/store/use-app-presets-store';
+import { configBaseVersion } from '/src/lib/staged-config';
 import { createCommit, WriteErrorsContext } from '/src/mobile/settings/write-feedback';
 import { runAppUpdateCheck } from '/src/mobile/settings/app-update-check';
 import { api, autoStartApi, privacyApi, updateApi, versionApi } from '/src/ipc/api-client';
@@ -26,7 +28,7 @@ await i18nReady; await i18n.changeLanguage('en-US');
 const query = new URLSearchParams(location.search);
 document.documentElement.dataset.mobileOs = query.get('os') ?? 'ios';
 const control = window.__platformSettings = { bootReads: 0, bootWrites: [], backupReads: 0,
-  passwordReads: [], skipCalls: [], writes: [], boot: true, authReads: 0, installedReads: 0, mutations: [] };
+  passwordReads: [], skipCalls: [], writes: [], boot: true, authReads: 0, installedReads: 0, saves: [] };
 autoStartApi.getStatus = async () => { control.bootReads++; return control.boot; };
 autoStartApi.set = async enabled => { control.bootWrites.push(enabled); control.boot = enabled; };
 api.systemBackup.getStatus = async () => { control.backupReads++; return false; };
@@ -39,7 +41,15 @@ versionApi.getInfo = async () => ({ appVersion: '1.0.0', platform: document.docu
 const initial = { autoPrivacyMode: true, autoConnect: true, autoStart: false, autoCheckUpdate: false,
   servers: [], subscriptions: [], trafficRules: [], dnsRules: [], customAppPresets: [],
   appRules: [{ appId: 'youtube', action: 'direct', enabled: true }] };
-api.config.get = async () => initial;
+let saved = initial;
+api.config.get = async () => saved;
+api.config.save = async (candidate, deferRestart, baseVersion, autoApply, hotOnly) => {
+  if (baseVersion !== configBaseVersion(saved)) return { status: 'conflict' };
+  if (!deferRestart || !autoApply || !hotOnly) throw new Error('Fixture requires native hot admission');
+  saved = candidate;
+  control.saves.push(candidate);
+  return { status: 'saved', config: saved, version: configBaseVersion(saved) };
+};
 api.config.onChangedReady = async () => () => {};
 api.config.meshRouteReport = async () => null;
 api.vpn.getAuthStatus = async () => { control.authReads++; return 'authorized'; };
@@ -47,8 +57,8 @@ api.system.listInstalledApps = async () => { control.installedReads++; return [{
 api.ruleResources.getCatalog = async () => ({ items: [{ name: 'youtube', category: 'geosite' }] });
 api.ruleResources.list = async () => [{ id: 'youtube-resource', name: 'geosite-youtube' }];
 api.ruleResources.onProgress = () => () => {};
-useAppStore.setState({ config: initial, servers: [], subscriptions: [],
-  mutateConfigEntities: async mutations => { control.mutations.push(...mutations); } });
+useAppStore.setState({ config: initial, servers: [], subscriptions: [] });
+useStagedConfigStore.getState().hydrate(initial);
 // Built-in labelKey is a suffix; appPresetLabel supplies the rules.apps. prefix.
 useAppPresetsStore.setState({ loaded: true, loading: false, failed: false,
   presets: [{ id: 'youtube', labelKey: 'youtube', emoji: '▶', category: 'video',
@@ -205,10 +215,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile platform setti
       await form.locator('#maa-name').fill('iOS video');
       await form.getByText('youtube', { exact: true }).click();
       await form.getByRole('button', { name: 'Add Custom App', exact: true }).click();
-      await page.waitForFunction(() => (window as any).__platformSettings.mutations.length === 1);
-      const mutation = await page.evaluate(() => (window as any).__platformSettings.mutations[0]);
-      expect(mutation.value.geositeTags).toEqual(['youtube']);
-      expect(mutation.value.packageNames).toBeUndefined();
+      await page.waitForFunction(() => (window as any).__platformSettings.saves.length === 1);
+      const presets = await page.evaluate(() => (window as any).__platformSettings.saves[0].customAppPresets);
+      expect(presets).toHaveLength(1);
+      expect(presets[0].geositeTags).toEqual(['youtube']);
+      expect(presets[0].packageNames).toBeUndefined();
     } finally { await page.close(); }
   });
 
@@ -227,8 +238,10 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile platform setti
       await form.locator('#maa-name').fill('Android video');
       await form.getByText('youtube', { exact: true }).click();
       await form.getByRole('button', { name: 'Add Custom App', exact: true }).click();
-      await page.waitForFunction(() => (window as any).__platformSettings.mutations.length === 1);
-      expect(await page.evaluate(() => (window as any).__platformSettings.mutations[0].value.packageNames)).toEqual(['fixture.app']);
+      await page.waitForFunction(() => (window as any).__platformSettings.saves.length === 1);
+      const presets = await page.evaluate(() => (window as any).__platformSettings.saves[0].customAppPresets);
+      expect(presets).toHaveLength(1);
+      expect(presets[0].packageNames).toEqual(['fixture.app']);
     } finally { await page.close(); }
   });
 

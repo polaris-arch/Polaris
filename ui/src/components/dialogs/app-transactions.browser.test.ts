@@ -509,7 +509,7 @@ import { useVpnStatusStore } from '/src/store/use-vpn-status-store';
 import { useSubscriptionCreateOperationStore } from '/src/store/subscription-create-operation-store';
 import { useAppStore } from '/src/store/app-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
-import { configContentDigest } from '/src/lib/staged-config';
+import { configBaseVersion, configContentDigest } from '/src/lib/staged-config';
 import type { IdentityConflicts } from '/src/domain/identity-repair/model';
 import '/src/mobile/screens/rules/rules-screen.css';
 import { useAppPresetsStore } from '/src/store/use-app-presets-store';
@@ -649,9 +649,18 @@ const ruleMode = ['route', 'dns', 'mobile-route', 'mobile-dns'].includes(mode);
 const plane = mode?.endsWith('dns') ? 'dns' : 'route';
 if (ruleMode) {
   const rule = { id: 'r', type: 'domain', values: ['example.com'], enabled: true, remarks: 'Rule under test', action: 'direct', effects: { [plane]: plane === 'dns' ? { enabled: true, resolver: 'inherit', answerMode: 'real', action: { type: 'reject' } } : { enabled: true, action: 'direct' } } };
-  config[plane === 'dns' ? 'dnsRules' : 'trafficRules'] = [rule];
+  const field = plane === 'dns' ? 'dnsRules' : 'trafficRules';
+  config[field] = [rule];
   useAppStore.setState({ config: { ...config }, rules: plane === 'route' ? [rule] : [], dnsRules: plane === 'dns' ? [rule] : [] });
-  useStagedConfigStore.setState({ baseline: { ...config } });
+  useStagedConfigStore.getState().hydrate(config);
+  test.ruleCandidates = [];
+  api.config.save = async (candidate, deferRestart, baseVersion, autoApply, hotOnly) => {
+    if (baseVersion !== configBaseVersion(config)) return { status: 'conflict' };
+    if (!deferRestart || !autoApply || !hotOnly) throw new Error('Fixture requires native hot admission');
+    test.ruleCandidates.push(candidate[field][0].effects[plane].enabled);
+    // Model a running generation whose rule change requires impact confirmation.
+    return { status: 'needsManual' };
+  };
   test.disk = () => (plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules)[0].effects[plane].enabled;
   test.revert = () => useStagedConfigStore.getState().revert('rule:r');
   test.reset = () => useStagedConfigStore.getState().reset();
@@ -1966,13 +1975,16 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     if (mode === 'mobile-dns') await page.locator('.mr-seg [role="tab"]').nth(1).click();
     const toggle = page.locator(mode.startsWith('mobile-') ? '#mr-rule-' + (mode.endsWith('dns') ? 'dns' : 'route') + '-r' : '#rule-list [role="switch"]');
     await toggle.click();
+    await page.waitForFunction('window.__transactions.draftCount() === 1');
     expect(await page.evaluate('window.__transactions.disk()')).toBe(true);
     expect(await toggle.getAttribute('aria-checked')).toBe('false');
     await page.evaluate('window.__transactions.revert()');
     expect(await toggle.getAttribute('aria-checked')).toBe('true');
     await toggle.click();
+    await page.waitForFunction('window.__transactions.draftCount() === 1');
     await page.evaluate('window.__transactions.reset()');
     expect(await toggle.getAttribute('aria-checked')).toBe('true');
+    expect(await page.evaluate('window.__transactions.ruleCandidates')).toEqual([false, false]);
     expect(await page.evaluate('window.__transactions.writes')).toBe(0);
     await page.close();
   }));
