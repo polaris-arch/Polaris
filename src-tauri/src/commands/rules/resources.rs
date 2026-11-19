@@ -12,7 +12,7 @@ use crate::events::{broadcast, channel::EVENT_RULE_RESOURCE_PROGRESS};
 use crate::response::ApiResponse;
 use crate::runtime::config::{Decision, DeferredConfigDeletion};
 use crate::runtime::http::{app_user_agent, SystemDnsLookup};
-use crate::runtime::proxy::runtime_config::StagedSaveOwner;
+use crate::runtime::proxy::runtime_config::{HotConfigEditOutcome, StagedSaveOwner};
 use crate::runtime::subscription_scheduler::now_ms;
 use crate::runtime::AppRuntime;
 use polaris_config_engine::user_config::builtin_geo_rulesets::{
@@ -660,19 +660,15 @@ pub async fn rule_resources_redownload(
     state: State<'_, AppRuntime>,
     id: String,
 ) -> Result<ApiResponse<Value>, ()> {
-    redownload_with_mode(
-        &app,
-        &state,
-        id,
-        ProgressMode::Live,
-        BroadcastMode::Immediate,
-    )
-    .await
+    let mut batch = RegisteredResourceBatch::default();
+    redownload_with_mode(&app, &state, id, ProgressMode::Live, &mut batch).await;
+    let result = batch.finish(&app, &state, ProgressMode::Live).await;
+    Ok(ApiResponse::ok(
+        result.into_iter().next().expect("one refresh result"),
+    ))
 }
 
-/// 后台调度腿专用入口：与 [`rule_resources_redownload`] 同一条下载/落盘/入册路径，两处差别是
-/// **一帧进度都不发**（`ProgressMode::Silent`）+ **不逐条广播**（`BroadcastMode::Deferred`，
-/// 由批次拥有者 `RuleResourceScheduler::run_due_updates` 收尾统一广播一次）。
+/// 后台调度复用手动刷新的下载与暂存路径，进度恒静默，由调度器收尾一次提交。
 ///
 /// 为什么另开一个函数而不是给命令加个 `silent: bool` 形参：`#[tauri::command]` 的形参会成为
 /// 前端可传的参数袋键——渲染端就能把自己的手动更新也调成静默（或反之），静默语义不再由后端说了算。
@@ -681,29 +677,30 @@ pub async fn rule_resources_redownload_silent(
     app: &AppHandle,
     state: &AppRuntime,
     id: String,
-    changes: &mut ResourceChanges,
-) -> Result<ApiResponse<Value>, ()> {
-    redownload_with_mode(
-        app,
-        state,
-        id,
-        ProgressMode::Silent,
-        BroadcastMode::Deferred(changes),
-    )
-    .await
+    batch: &mut RegisteredResourceBatch,
+) {
+    redownload_with_mode(app, state, id, ProgressMode::Silent, batch).await;
 }
 
-/// redownload 的共用核心（手动腿 / 后台腿只差 [`ProgressMode`] + [`BroadcastMode`]）。
+/// 手动和后台重下载共用的暂存入口。
 async fn redownload_with_mode(
     app: &AppHandle,
     state: &AppRuntime,
     id: String,
     mode: ProgressMode,
-    broadcast: BroadcastMode<'_>,
-) -> Result<ApiResponse<Value>, ()> {
+    batch: &mut RegisteredResourceBatch,
+) {
     let cfg = match state.config().current() {
         Ok(c) => c,
-        Err(e) => return Ok(ApiResponse::err(format!("{e}"))),
+        Err(e) => {
+            batch.report(err_result(
+                Some(&id),
+                None,
+                &e.to_string(),
+                ERR_RESOURCE_WRITE_FAILED,
+            ));
+            return;
+        }
     };
     // 先按 id 找原始项再反序列化：不在册 → NOT_FOUND；在册但 malformed → BAD_ITEM（P8：不再误报 NOT_FOUND）。
     let empty = Vec::new();
@@ -713,24 +710,19 @@ async fn redownload_with_mode(
         .unwrap_or(&empty);
     let existing = match resolve_registered_resource(resources, &id) {
         Ok(r) => r,
-        Err(err_value) => return Ok(ApiResponse::ok(err_value)),
+        Err(err_value) => {
+            batch.report(err_value);
+            return;
+        }
     };
     let plan = plan_from_resource(&existing).with_gh_proxy(&gh_proxy_prefix(state));
     let res_dir = state.config().dir().join("rule-resource");
     let http = state.http().clone();
     let sink = BroadcastSink { app, mode };
-    let result = download_registered_resource(
-        &sink,
-        http.as_ref(),
-        &SystemDnsLookup,
-        &plan,
-        &res_dir,
-        |resource, staged| {
-            persist_registered_resource(app, state, &existing, resource, staged, broadcast)
-        },
-    )
-    .await;
-    Ok(ApiResponse::ok(result.into_value(&plan)))
+    let expected = resource_record(&cfg, &id).cloned();
+    batch
+        .fetch(&sink, http.as_ref(), plan, &res_dir, expected)
+        .await;
 }
 
 /// 上游 `RULE_RESOURCES_UPDATE_ALL`：更新已登记资源与随包内置 geo（**真下载**）。
@@ -755,14 +747,13 @@ pub async fn rule_resources_update_all(
     let gh_prefix = gh_proxy_prefix(&state);
 
     let (raw_entries, builtins) = manual_update_targets(raw_entries);
-    let mut results: Vec<Value> = Vec::with_capacity(raw_entries.len() + builtins.len());
-    let mut changes = ResourceChanges::default();
+    let mut batch = RegisteredResourceBatch::default();
     for entry in &raw_entries {
         // Preserve a truthful per-item failure for malformed entries.
         let existing = match parse_resource_entry(entry) {
             Ok(r) => r,
             Err(err_value) => {
-                results.push(err_value);
+                batch.report(err_value);
                 continue;
             }
         };
@@ -771,26 +762,12 @@ pub async fn rule_resources_update_all(
             app: &app,
             mode: ProgressMode::Live,
         };
-        let outcome = download_registered_resource(
-            &sink,
-            http.as_ref(),
-            &SystemDnsLookup,
-            &plan,
-            &res_dir,
-            |resource, staged| {
-                persist_registered_resource(
-                    &app,
-                    &state,
-                    &existing,
-                    resource,
-                    staged,
-                    BroadcastMode::Deferred(&mut changes),
-                )
-            },
-        )
-        .await;
-        results.push(outcome.into_value(&plan));
+        batch
+            .fetch(&sink, http.as_ref(), plan, &res_dir, Some(entry.clone()))
+            .await;
     }
+    let mut results = batch.finish(&app, &state, ProgressMode::Live).await;
+    let mut changes = ResourceChanges::default();
     for builtin in builtins {
         let tag = builtin.tag;
         let result = match update_builtin_with_mode(
@@ -858,8 +835,7 @@ pub async fn rule_resources_download(
     // 逐项都会 `资源库无此条目`（见 [`resolve_catalog_item`]）。无缓存 → 空切片，行为不变。
     let refreshed_catalog = read_catalog_cache(&res_dir).map_or_else(Vec::new, |(items, _)| items);
 
-    let mut results: Vec<Value> = Vec::with_capacity(items.len());
-    let mut changes = ResourceChanges::default();
+    let mut batch = RegisteredResourceBatch::default();
     let initial = match state.config().current() {
         Ok(config) => config,
         Err(error) => return Ok(ApiResponse::err(format!("读取资源初始状态失败: {error}"))),
@@ -868,7 +844,7 @@ pub async fn rule_resources_download(
         let plan = match plan_from_item(item, &refreshed_catalog) {
             Ok(p) => p.with_gh_proxy(&gh_prefix),
             Err(e) => {
-                results.push(err_result(
+                batch.report(err_result(
                     item.get("id").and_then(Value::as_str),
                     item.get("name").and_then(Value::as_str),
                     &e,
@@ -882,24 +858,11 @@ pub async fn rule_resources_download(
             mode: ProgressMode::Live,
         };
         let expected = resource_record(&initial, &plan.id).cloned();
-        let outcome = download_registered_resource(
-            &sink,
-            http.as_ref(),
-            &SystemDnsLookup,
-            &plan,
-            &res_dir,
-            |resource, staged| {
-                let saved = save_resource_change(&state, |config| {
-                    commit_download_resource(config, expected.as_ref(), resource, staged, &res_dir)
-                })?;
-                changes.record(saved);
-                Ok(())
-            },
-        )
-        .await;
-        results.push(outcome.into_value(&plan));
+        batch
+            .fetch(&sink, http.as_ref(), plan, &res_dir, expected)
+            .await;
     }
-    changes.publish(&app);
+    let results = batch.finish(&app, &state, ProgressMode::Live).await;
     Ok(ApiResponse::ok(results))
 }
 
@@ -1391,12 +1354,27 @@ fn resource_affects_runtime(config: &Value, downloaded: &RuleResource) -> bool {
 
 /// Existing and initially absent identities are checked before publishing staged bytes.
 /// Caller holds ConfigRuntime's writer throughout this check and publication.
+#[cfg(test)]
 fn commit_download_resource(
     config: &mut Value,
     expected: Option<&Value>,
     downloaded: &mut RuleResource,
     staged: &Path,
     res_dir: &Path,
+) -> Result<bool, String> {
+    if resource_record(config, &downloaded.id) != expected {
+        return Err("资源在下载期间已变化，旧下载已丢弃，请重试".into());
+    }
+    let old =
+        expected.and_then(|record| serde_json::from_value::<RuleResource>(record.clone()).ok());
+    publish_download_file(old.as_ref(), downloaded, staged, res_dir)?;
+    register_staged_download(config, expected, downloaded)
+}
+
+fn register_staged_download(
+    config: &mut Value,
+    expected: Option<&Value>,
+    downloaded: &RuleResource,
 ) -> Result<bool, String> {
     if resource_record(config, &downloaded.id) != expected {
         return Err("资源在下载期间已变化，旧下载已丢弃，请重试".into());
@@ -1409,20 +1387,21 @@ fn commit_download_resource(
     {
         return Err("规则资源列表无效".into());
     }
-    let old =
-        expected.and_then(|record| serde_json::from_value::<RuleResource>(record.clone()).ok());
-    let apply = publish_download_file(config, old.as_ref(), downloaded, staged, res_dir)?;
+    let same_identity = expected.is_some_and(|old| {
+        old.get("fileName").and_then(Value::as_str) == Some(downloaded.file_name.as_str())
+            && old.get("format") == Some(&json!(downloaded.format))
+    });
+    let apply = !same_identity && resource_affects_runtime(config, downloaded);
     upsert_rule_resources(config, std::slice::from_ref(downloaded));
     Ok(apply)
 }
 
 fn publish_download_file(
-    config: &Value,
     expected: Option<&RuleResource>,
     downloaded: &mut RuleResource,
     staged: &Path,
     res_dir: &Path,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     if let Some(old) = expected.filter(|old| {
         old.format == downloaded.format
             && sanitize_file_stem(&old.file_name) == old.file_name
@@ -1430,16 +1409,20 @@ fn publish_download_file(
             && same_resource_bytes(staged, &res_dir.join(&old.file_name))
     }) {
         downloaded.file_name.clone_from(&old.file_name);
-        return Ok(false);
+        return Ok(());
     }
 
-    let apply = resource_affects_runtime(config, downloaded);
     // Publish an already complete file without replacing an older path. A running
     // Core can watch that path even after its registration has changed in D.
     let mut file_name = downloaded.file_name.clone();
     if expected.is_some() {
         file_name = versioned_resource_file_name(downloaded.format);
     }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(staged)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("同步规则资源失败: {error}"))?;
     loop {
         match publish_resource_at_unused_path(staged, &res_dir.join(&file_name)) {
             Ok(()) => break,
@@ -1449,11 +1432,21 @@ fn publish_download_file(
             Err(error) => return Err(format!("发布规则资源失败: {error}")),
         }
     }
+    polaris_store::fs::sync_parent_after_publish(res_dir)
+        .map_err(|error| format!("同步规则资源目录失败: {error}"))?;
+    if let Some(parent) = res_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        polaris_store::fs::sync_parent_after_publish(parent)
+            .map_err(|error| format!("同步规则资源目录失败: {error}"))?;
+    }
     let _ = std::fs::remove_file(staged);
     downloaded.file_name = file_name;
-    Ok(apply)
+    Ok(())
 }
 
+#[cfg(not(windows))]
 fn publish_resource_at_unused_path(staged: &Path, target: &Path) -> std::io::Result<()> {
     match std::fs::hard_link(staged, target) {
         Err(error)
@@ -1480,6 +1473,26 @@ fn publish_resource_at_unused_path(staged: &Path, target: &Path) -> std::io::Res
     }
 }
 
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "same-volume write-through resource publication without replacement"
+)]
+fn publish_resource_at_unused_path(staged: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let staged: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both paths are NUL-terminated and live across the call. No
+    // replace, copy across volumes, or delayed operation flags are used.
+    if unsafe { MoveFileExW(staged.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn versioned_resource_file_name(format: RuleResourceFormat) -> String {
     format!("rule-{}.{}", new_uuid(), ext_for(format))
 }
@@ -1487,6 +1500,7 @@ fn versioned_resource_file_name(format: RuleResourceFormat) -> String {
 /// Called only inside ConfigManager::update. An absent or changed record is never upserted,
 /// and rejection leaves the currently published file intact. Comparing the full record also
 /// rejects an older response after a newer refresh has committed.
+#[cfg(test)]
 fn commit_registered_resource(
     config: &mut Value,
     expected: &RuleResource,
@@ -1509,26 +1523,9 @@ fn commit_registered_resource(
     {
         return Err("资源在下载期间已变化，旧下载已丢弃，请重试".to_owned());
     }
-    let apply = publish_download_file(config, Some(expected), downloaded, staged, res_dir)?;
-    let replacement = serde_json::to_value(downloaded).map_err(|error| error.to_string())?;
-    config["ruleResources"][index] = replacement;
-    Ok(apply)
-}
-
-fn persist_registered_resource(
-    app: &AppHandle,
-    state: &AppRuntime,
-    expected: &RuleResource,
-    downloaded: &mut RuleResource,
-    staged: &Path,
-    broadcast: BroadcastMode<'_>,
-) -> Result<(), String> {
-    let res_dir = state.config().dir().join("rule-resource");
-    let saved = save_resource_change(state, |config| {
-        commit_registered_resource(config, expected, downloaded, staged, &res_dir)
-    })?;
-    broadcast.record(app, saved);
-    Ok(())
+    let previous = resources[index].clone();
+    publish_download_file(Some(expected), downloaded, staged, res_dir)?;
+    register_staged_download(config, Some(&previous), downloaded)
 }
 
 /// 同 tag 的手动、后台和 all 更新共用这把锁，覆盖下载、替换与元数据保存。
@@ -2343,6 +2340,182 @@ struct ResourceSave {
     candidate: Value,
     owner: StagedSaveOwner,
     apply: bool,
+}
+
+enum RegisteredBatchItem {
+    Report(Value),
+    Download {
+        plan: ResourcePlan,
+        expected: Option<Value>,
+        outcome: DownloadOutcome,
+    },
+}
+
+/// Downloads own immutable files, but only the completed batch can update D.
+#[derive(Default)]
+pub(crate) struct RegisteredResourceBatch {
+    items: Vec<RegisteredBatchItem>,
+}
+
+impl RegisteredResourceBatch {
+    fn report(&mut self, value: Value) {
+        self.items.push(RegisteredBatchItem::Report(value));
+    }
+
+    async fn fetch<H: HttpClient>(
+        &mut self,
+        sink: &dyn ProgressSink,
+        http: &H,
+        plan: ResourcePlan,
+        res_dir: &Path,
+        expected: Option<Value>,
+    ) {
+        let old = expected
+            .as_ref()
+            .and_then(|record| serde_json::from_value::<RuleResource>(record.clone()).ok());
+        let outcome = download_registered_resource(
+            &PendingResourceCommit(sink),
+            http,
+            &SystemDnsLookup,
+            &plan,
+            res_dir,
+            |resource, staged| publish_download_file(old.as_ref(), resource, staged, res_dir),
+        )
+        .await;
+        self.items.push(RegisteredBatchItem::Download {
+            plan,
+            expected,
+            outcome,
+        });
+    }
+
+    pub(crate) async fn finish(
+        self,
+        app: &AppHandle,
+        state: &AppRuntime,
+        mode: ProgressMode,
+    ) -> Vec<Value> {
+        let mut rejections = vec![None; self.items.len()];
+        let prepared = state.config().prepare_config_edit(|config| {
+            let mut accepted = false;
+            let mut affects_runtime = false;
+            for (index, item) in self.items.iter().enumerate() {
+                let RegisteredBatchItem::Download {
+                    expected,
+                    outcome: DownloadOutcome::Stored { resource, .. },
+                    ..
+                } = item
+                else {
+                    continue;
+                };
+                match register_staged_download(config, expected.as_ref(), resource) {
+                    Ok(affects) => {
+                        accepted = true;
+                        affects_runtime |= affects;
+                    }
+                    Err(error) => rejections[index] = Some(error),
+                }
+            }
+            if accepted {
+                Decision::Write(affects_runtime)
+            } else {
+                Decision::Skip(false)
+            }
+        });
+        let publication = match prepared {
+            Ok((affects_runtime, Some(edit))) => {
+                commit_registered_batch(app, state, &edit, affects_runtime).await
+            }
+            Ok((_, None)) => Ok(()),
+            Err(error) => Err(format!("准备规则资源配置失败: {error}")),
+        };
+        let sink = BroadcastSink { app, mode };
+        self.items
+            .into_iter()
+            .zip(rejections)
+            .map(|(item, rejection)| match item {
+                RegisteredBatchItem::Report(value) => value,
+                RegisteredBatchItem::Download { plan, outcome, .. } => {
+                    let outcome = if let DownloadOutcome::Stored { resource, .. } = &outcome {
+                        if let Some(message) = rejection.or_else(|| publication.as_ref().err().cloned()) {
+                            emit_resource_progress(
+                                &sink,
+                                &plan,
+                                json!({
+                                    "received": 0, "total": null, "percent": null, "status": "error",
+                                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
+                                }),
+                            );
+                            DownloadOutcome::Failed { message, code: ERR_RESOURCE_WRITE_FAILED }
+                        } else {
+                            emit_resource_progress(
+                                &sink,
+                                &plan,
+                                json!({
+                                    "received": resource.size, "total": resource.size,
+                                    "percent": 100.0, "status": "done",
+                                }),
+                            );
+                            outcome
+                        }
+                    } else {
+                        outcome
+                    };
+                    outcome.into_value(&plan)
+                }
+            })
+            .collect()
+    }
+}
+
+async fn commit_registered_batch(
+    app: &AppHandle,
+    state: &AppRuntime,
+    edit: &crate::runtime::config::PreparedConfigEdit,
+    affects_runtime: bool,
+) -> Result<(), String> {
+    let conflict = || "规则资源配置已变化，请重试".to_owned();
+    let store_error = |error: polaris_store::StoreError| {
+        if matches!(error, polaris_store::StoreError::CommitUncertain(_)) {
+            state.proxy().push_pending_changes();
+            emit_config_changed_signal(app);
+        }
+        error.to_string()
+    };
+    if affects_runtime {
+        let owner = StagedSaveOwner::capture(state.proxy(), edit.revision);
+        match Box::pin(state.proxy.apply_hot_config_edit(edit))
+            .await
+            .map_err(&store_error)?
+        {
+            HotConfigEditOutcome::Saved { .. } => {}
+            HotConfigEditOutcome::NeedsManual { .. } => {
+                state
+                    .proxy()
+                    .commit_manual_resource_edit(edit, owner)
+                    .await
+                    .map_err(&store_error)?
+                    .ok_or_else(conflict)?;
+                state.proxy().push_pending_changes();
+            }
+            HotConfigEditOutcome::BlockedByPending => {
+                return Err("有待应用的配置变更，请先处理后重试".into());
+            }
+            HotConfigEditOutcome::Retryable => {
+                return Err("内核暂时无法更新规则资源，请重试".into())
+            }
+            HotConfigEditOutcome::Rejected => return Err("内核拒绝了规则资源更新".into()),
+            HotConfigEditOutcome::Conflict => return Err(conflict()),
+        }
+    } else {
+        state
+            .config()
+            .commit_prepared_config_edit(edit, || true, |_| {})
+            .map_err(store_error)?
+            .ok_or_else(conflict)?;
+    }
+    emit_config_changed_signal(app);
+    Ok(())
 }
 
 fn save_resource_change(

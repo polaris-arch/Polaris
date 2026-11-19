@@ -1836,6 +1836,26 @@ impl ProxyRuntime {
         })
     }
 
+    pub(crate) async fn commit_manual_resource_edit(
+        &self,
+        edit: &PreparedConfigEdit,
+        owner: StagedSaveOwner,
+    ) -> Result<Option<u64>, polaris_store::StoreError> {
+        let _serial = self.switch_serial.lock().await;
+        if self.hot_config_edit_blocker(&edit.previous, owner).is_some() {
+            return Ok(None);
+        }
+        self.config.commit_prepared_config_edit(
+            edit,
+            || {
+                self.gate.try_idle_generation() == Some(owner.generation)
+                    && self.selector_intent_is_current(owner.intent)
+                    && self.status.try_read().is_ok_and(|status| status.running)
+            },
+            |_| {},
+        )
+    }
+
     fn hot_config_edit_blocker(
         &self,
         before: &Value,

@@ -145,7 +145,10 @@ pub fn durable_remove(path: &Path) -> Result<DurableWriteGuarantee, crate::Store
     sync_parent_after_publish(parent)
 }
 
-fn sync_parent_after_publish(parent: &Path) -> Result<DurableWriteGuarantee, crate::StoreError> {
+/// Sync the containing directory after a namespace change where supported.
+pub fn sync_parent_after_publish(
+    parent: &Path,
+) -> Result<DurableWriteGuarantee, crate::StoreError> {
     #[cfg(unix)]
     {
         std::fs::File::open(parent)

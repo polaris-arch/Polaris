@@ -5329,6 +5329,8 @@ async fn real_core_registered_resource_replacement_requires_its_hot_receipt() {
             "action": "proxy", "enabled": true, "targetServerId": "node-b",
         },
     ]);
+    initial["policyRules"] = initial["trafficRules"].clone();
+    initial["customRules"] = initial["trafficRules"].clone();
     rt.config.save_full(&initial).unwrap();
     let before = rt.config.current().unwrap();
     let started = rt.start(before.clone()).await.expect("start paired Core");
@@ -5348,29 +5350,50 @@ async fn real_core_registered_resource_replacement_requires_its_hot_receipt() {
         .ends_with("old-source"));
 
     std::fs::write(res_dir.join("next.json"), new).unwrap();
-    let mut candidate = before.clone();
-    candidate["ruleResources"][0]["fileName"] = "next.json".into();
-    rt.config.save_full(&candidate).unwrap();
-    let candidate = rt.config.current().unwrap();
-    assert!(rt.pending_changes().pending_apply);
+    let saved_revision = rt.config.saved_revision();
+    let (_, edit) = rt
+        .config
+        .prepare_config_edit(|candidate| {
+            candidate["ruleResources"][0]["fileName"] = "next.json".into();
+            ConfigDecision::Write(())
+        })
+        .unwrap();
+    let edit = edit.unwrap();
+    assert_eq!(edit.revision, saved_revision);
+    assert_eq!(rt.config.current().unwrap(), before);
+    assert_eq!(rt.current_config_snapshot(), Some(before));
+    assert!(!rt.pending_changes().pending_apply);
     assert_eq!(status().await, observed_before);
-    assert!(controlled_http_request(mixed, "saved")
+    assert!(controlled_http_request(mixed, "prepared")
         .await
         .ends_with("old-source"));
-    let owner = crate::runtime::proxy::runtime_config::StagedSaveOwner::capture(
-        &rt,
-        rt.config.saved_revision(),
-    );
-    let receipt = rt
-        .apply_staged_save_if_current(before, candidate.clone(), owner, |_| {})
-        .await
-        .expect("Core must receipt the exact source replacement");
+    use runtime_config::HotConfigEditOutcome;
+    let receipt = match rt.apply_hot_config_edit(&edit).await.unwrap() {
+        HotConfigEditOutcome::Saved {
+            runtime_apply: Some(receipt),
+            ..
+        } => receipt,
+        HotConfigEditOutcome::Saved { .. } => panic!("saved without the Core receipt"),
+        HotConfigEditOutcome::NeedsManual {
+            restart_required,
+            reasons,
+        } => {
+            panic!(
+                "resource unexpectedly needs manual apply, restart={restart_required}: {reasons:?}"
+            )
+        }
+        HotConfigEditOutcome::BlockedByPending => panic!("resource was blocked by pending D"),
+        HotConfigEditOutcome::Retryable => panic!("resource received a retryable native result"),
+        HotConfigEditOutcome::Rejected => panic!("Core rejected prospective resource Plan"),
+        HotConfigEditOutcome::Conflict => panic!("prospective resource D changed concurrently"),
+    };
     assert_eq!(receipt.status, "hotApplied");
     assert_eq!(receipt.core_state, Some("committed"));
     assert_eq!(receipt.configuration_durable, Some(true));
     assert_eq!(receipt.runtime_generation, Some(generation));
     assert_eq!(rt.status().pid, started.pid);
-    assert_eq!(rt.current_config_snapshot(), Some(candidate));
+    assert_eq!(rt.config.current().unwrap(), edit.candidate);
+    assert_eq!(rt.current_config_snapshot(), Some(edit.candidate));
     assert!(!rt.pending_changes().pending_apply);
     assert_eq!(status().await.watcher_state, "inline");
     assert_eq!(std::fs::read(res_dir.join("previous.json")).unwrap(), old);

@@ -303,7 +303,7 @@ fn round_plan_keeps_builtin_updates_when_external_leg_has_no_work() {
     // 调用点也必须消费共同计划的两腿；重新插入 external 空早退会抓红这条编排守卫。
     let body = fn_body("async fn run_due_updates(");
     assert!(body.contains("plan_due_updates("));
-    assert!(body.contains("for id in plan.external_ids"));
+    assert!(body.contains("for id in &plan.external_ids"));
     assert!(body.contains("run_builtin_geo(app, plan.builtin_tags"));
     let planned = body.find("plan_due_updates(").unwrap();
     let builtin = body.find("run_builtin_geo(").unwrap();
@@ -487,18 +487,13 @@ fn scheduler_actually_wires_the_catalog_refresh_leg() {
 /// ① 两条后台静默腿必须传 `BroadcastMode::Deferred`（改回 `Immediate` 或删掉参数 → 转红）；
 /// ② 只在批次收尾发布已提交资源的通知。
 #[test]
-fn one_refresh_round_broadcasts_exactly_once() {
+fn one_refresh_round_finalizes_each_resource_lane_exactly_once() {
     let rules = crate_code("commands/rules/resources.rs");
-    for silent_fn in [
-        "pub async fn rule_resources_redownload_silent(",
+    let builtin = crate::commands::guard_scan::top_level_fn_body(
+        &rules,
         "pub async fn rule_resources_update_builtin_silent(",
-    ] {
-        let body = crate::commands::guard_scan::top_level_fn_body(&rules, silent_fn);
-        assert!(
-            body.contains("BroadcastMode::Deferred"),
-            "{silent_fn} 是后台批量腿，必须延后广播，否则一轮 33 次 switch_mode"
-        );
-    }
+    );
+    assert!(builtin.contains("BroadcastMode::Deferred"));
 
     let body = fn_body("async fn run_due_updates(");
     assert_eq!(
@@ -507,6 +502,8 @@ fn one_refresh_round_broadcasts_exactly_once() {
         "整批只准广播一次（多于一次 = 风暴回归；零次 = 变更永远进不了运行中的核）"
     );
     assert!(!body.contains("broadcast_config_changed("));
+    assert_eq!(body.matches("batch.finish(").count(), 1);
+    assert!(body.find("batch.finish(").unwrap() < body.find(".run_builtin_geo(").unwrap());
     assert!(body.find(".run_builtin_geo(").unwrap() < body.find("changes.publish(").unwrap());
 }
 
@@ -592,9 +589,8 @@ fn background_external_refresh_uses_the_same_guarded_core_as_manual_refresh() {
     assert!(silent.contains("redownload_with_mode("));
     let shared =
         crate::commands::guard_scan::top_level_fn_body(&commands, "async fn redownload_with_mode(");
-    assert!(shared.contains("download_registered_resource("));
-    assert!(shared.contains("persist_registered_resource("));
-    assert!(!shared.contains("persist_resources("));
+    assert!(shared.contains(".fetch("));
+    assert!(!shared.contains("state.config().update("));
 }
 
 #[test]

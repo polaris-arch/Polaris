@@ -360,25 +360,24 @@ async fn registered_refresh_cancellation_drops_network_and_staging_without_commi
 }
 
 #[test]
-fn registered_refresh_paths_share_staged_transaction_commit_instead_of_upsert() {
-    use crate::commands::guard_scan::top_level_fn_body;
+fn registered_refresh_paths_share_prospective_batch_transaction() {
+    use crate::commands::guard_scan::{impl_method_body, top_level_fn_body};
     let code = crate::test_support::crate_code("commands/rules/resources.rs");
     for signature in [
         "async fn redownload_with_mode(",
         "pub async fn rule_resources_update_all(",
     ] {
         let body = top_level_fn_body(&code, signature);
-        assert!(body.contains("download_registered_resource("));
-        assert!(body.contains("persist_registered_resource("));
-        assert!(!body.contains("persist_resources("));
+        assert!(body.contains(".fetch("));
+        assert!(!body.contains("state.config().update("));
     }
-    let persist = top_level_fn_body(&code, "fn persist_registered_resource(");
-    assert!(
-        persist.find("save_resource_change(").unwrap()
-            < persist.find("commit_registered_resource(").unwrap()
-    );
-    let save = top_level_fn_body(&code, "fn save_resource_change(");
-    assert!(save.contains(".update_with_cleanup_revision("));
+    let batch = impl_method_body(&code, "    pub(crate) async fn finish(");
+    assert!(batch.contains("prepare_config_edit("));
+    assert!(batch.contains("register_staged_download("));
+    let commit = top_level_fn_body(&code, "async fn commit_registered_batch(");
+    assert!(commit.contains("apply_hot_config_edit("));
+    assert!(commit.contains("HotConfigEditOutcome::NeedsManual"));
+    assert!(!commit.contains("apply_staged_save_if_current("));
     let delete = top_level_fn_body(&code, "pub fn rule_resources_delete(");
     assert!(
         delete.find("return Decision::Skip(plan)").unwrap()

@@ -33,7 +33,7 @@ use polaris_config_engine::user_config::builtin_geo_rulesets::{
     builtin_geo_rulesets, builtin_id_for,
 };
 
-use crate::commands::rules::ResourceChanges;
+use crate::commands::rules::{ProgressMode, RegisteredResourceBatch, ResourceChanges};
 use crate::runtime::subscription_scheduler::{
     elapsed_or_clock_rollback, now_ms, rfc3339_to_epoch_ms, BackoffTracker,
 };
@@ -346,8 +346,8 @@ impl RuleResourceScheduler {
         };
 
         let (mut ok_count, mut failures) = (0usize, Vec::new());
-        let mut changes = ResourceChanges::default();
-        for id in plan.external_ids {
+        let mut batch = RegisteredResourceBatch::default();
+        for id in &plan.external_ids {
             // 走既有下载核心而非直接调下载函数：命令层已收口「条目解析 / 落盘 / persist + 广播」，
             // 绕过它就得在这里复刻一份必然漂移的副本。
             //
@@ -358,14 +358,17 @@ impl RuleResourceScheduler {
             let state = app.state::<AppRuntime>();
             // The shared core stages bytes and verifies the original record in its config
             // commit; a delete/source edit during await cannot resurrect or overwrite it.
-            let resp = crate::commands::rules::rule_resources_redownload_silent(
+            crate::commands::rules::rule_resources_redownload_silent(
                 app,
                 &state,
                 id.clone(),
-                &mut changes,
+                &mut batch,
             )
             .await;
-            let data = resp.ok().and_then(|r| r.data).unwrap_or(Value::Null);
+        }
+        let state = app.state::<AppRuntime>();
+        let results = batch.finish(app, &state, ProgressMode::Silent).await;
+        for (id, data) in plan.external_ids.into_iter().zip(results) {
             let ok = data.get("ok").and_then(Value::as_bool) == Some(true);
             let mut inner = lock_inner(&self.inner);
             if ok {
@@ -383,6 +386,7 @@ impl RuleResourceScheduler {
                 inner.backoff.record_failure(&id, now);
             }
         }
+        let mut changes = ResourceChanges::default();
         // ── 随包内置 geo 也纳入自动更新射程 ──
         //
         // 此前只遍历 `config.ruleResources`，而内置 geo **从不入册** ⇒ 注册表里的随包 `.srs`
@@ -396,16 +400,7 @@ impl RuleResourceScheduler {
         self.run_builtin_geo(app, plan.builtin_tags, now, reason, &mut changes)
             .await;
 
-        // ── 整批收尾：广播一次（而不是批内每条各广播一次）──
-        //
-        // `broadcast_config_changed` 不只是 emit 给渲染端，它同时 `spawn(switch_mode)` 把变更送进
-        // **运行中的核**。批内逐条广播时，一轮启动补更 = 8 条已登记 + 25 个内置 geo = 33 次
-        // `switch_mode`（真机 2026-08-02：11 秒内 35 条 `switchMode：核未运行 → 仅更新配置`）。
-        // 核未跑时只是刷屏，核在跑时是**连砸 33 次热切/去抖重启判定** —— 而这一轮语义上就是一批，
-        // 批内中间态没有任何消费者需要看见。故两条静默腿传 `BroadcastMode::Deferred`（只落盘），
-        // 收口在此处广播一次。
-        //
-        // **一条都没成功就不广播**：配置没变，广播等于凭空给核一次无谓的 switch_mode 判定。
+        // 外置源已完成批量原生提交。内置 Geo 仍共用一次收尾通知，逐项更新不广播。
         changes.publish(app);
 
         if !failures.is_empty() {
