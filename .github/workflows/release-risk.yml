@@ -16,10 +16,6 @@ on:
         description: 固定源码审计不被后续 tip 取消
         type: boolean
         default: false
-      windows_package_preview:
-        description: 'Exercise the Node/Rust owner in the selected Windows package leg on a work branch'
-        type: boolean
-        default: false
       apple_include_simulator:
         description: 'ordinary 验证额外编译 sim-arm64 App/PacketTunnel；不能与 defer_apple 同用'
         type: boolean
@@ -135,7 +131,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B -m unittest discover -s scripts/mobile-core -p 'test_*.py'
-          python3 -B -X utf8 scripts/windows-package-integrity.test.py
 
       - name: Classify changed paths
         id: impact
@@ -150,7 +145,6 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_SHA: ${{ github.sha }}
-          POLARIS_WINDOWS_PACKAGE_PREVIEW: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_package_preview && 'true' || 'false' }}
           POLARIS_APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
         run: |
           set -euo pipefail
@@ -186,13 +180,6 @@ jobs:
             echo "无法取得可靠 diff，故障关闭为内核门 + 四平台。"
             node scripts/classify-ci-impact.mjs --full > "$result"
             node scripts/apple-ci-impact.mjs --full < /dev/null > "$apple_result"
-          fi
-
-          if [ "${POLARIS_WINDOWS_PACKAGE_PREVIEW:-false}" = true ]; then
-            if [ "$DISPATCH_REF" = refs/heads/main ] || ! jq -e '.platforms | index("windows") != null' "$result" >/dev/null; then
-              echo '::error::Windows packaging preview requires a work branch with a selected Windows package leg'
-              exit 1
-            fi
           fi
 
           # Explicit simulator opt-in selects the Apple leg even for an empty
@@ -330,7 +317,6 @@ jobs:
     with:
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       platforms: ${{ needs.classify.outputs.platforms }}
-      windows_package_preview: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_package_preview }}
       skip_quality_gates: true
       run_kernel_gates: false
       upload_artifacts: false

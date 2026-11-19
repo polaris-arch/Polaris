@@ -118,7 +118,7 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
   'scripts/windows-package-integrity.mjs': {
     kernel: false,
     platforms: ['windows'],
-    why: 'Windows 打包预览使用该入口冻结输入、生成安装包并核对载荷。',
+    why: 'Windows 打包使用该入口冻结输入、生成安装包并核对载荷。',
   },
   'crates/config-engine/': {
     kernel: true,
@@ -1203,8 +1203,6 @@ const SHARED_PACKAGE_PATHS = new Set([
   // 它挂了整条打包链就编不出 singbox-grpc。2026-08-30 前它不在任何表里 = 同一 fail-open。
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
-  'scripts/windows-package-integrity.py',
-  'scripts/windows-package-integrity.test.py',
   // package.yml 的 macOS 腿真跑它（封印前与最终 dmg 开箱各一次，逐个验包内内核与 helper 的签名）；
   // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.sh 执行。
   'scripts/macos-bundler-diagnostics.sh',

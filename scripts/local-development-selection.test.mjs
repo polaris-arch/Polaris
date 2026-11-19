@@ -21,7 +21,7 @@ import { selectedCoreManifest, writeSelectedCoreManifest } from './lib/core-iden
 import { createHash } from 'node:crypto';
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const windowsCustody = fileURLToPath(new URL('../target/x86_64-pc-windows-msvc/release/polaris-package-custody.exe', import.meta.url));
-const requiresWindowsCustody = { skip: process.platform !== 'win32' || process.env.POLARIS_WINDOWS_PACKAGE_PREVIEW !== '1' };
+const requiresWindowsCustody = { skip: process.platform !== 'win32' || process.env.POLARIS_TEST_WINDOWS_PACKAGE_CUSTODY !== '1' };
 async function fixture(action) {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'polaris-local-selection-'));
   try { await action(root); } finally { rmSync(root, { recursive: true, force: true }); }

@@ -880,7 +880,7 @@ async function assemble(custody, api) {
   await withHolds(custody, [file(portable)], async () => requireSame(
     await inspectPortableZip(portable, carrierExpected(state, app.raw, 'zip')), receipt.portableObserved,
     'completed portable ZIP observations differ'));
-  console.log('POLARIS_WINDOWS_PACKAGE_PREVIEW_READBACK ' + wire({ candidate: state.candidate, receipt: readback.facts,
+  console.log('POLARIS_WINDOWS_PACKAGE_READBACK ' + wire({ candidate: state.candidate, receipt: readback.facts,
     carriers: receipt.carriers, nsisPayloadMembers: Object.keys(receipt.nsisExpected).length,
     nsisMembers: Object.keys(receipt.nsisObserved.members).length,
     uninstallerMembers: Object.keys(receipt.nsisObserved.uninstallerMembers).length,

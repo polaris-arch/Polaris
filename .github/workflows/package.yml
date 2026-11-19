@@ -91,9 +91,6 @@ on:
         type: boolean
         required: false
         default: true
-      windows_package_preview:
-        type: boolean
-        default: false
       core_candidate:
         type: string
         required: false
@@ -352,7 +349,6 @@ jobs:
       # 轻量构建只认调用方显式传入的 true；tag push / 本 workflow 手动 dispatch 没有该输入 ⇒ '0'。
       # 它与上面两个开关的组合由 `Select installer build weight` 步 fail-closed 校验。
       POLARIS_LIGHT_BUILD: ${{ inputs.light_build && '1' || '0' }}
-      POLARIS_WINDOWS_PACKAGE_PREVIEW: ${{ inputs.windows_package_preview && '1' || '0' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -1042,22 +1038,14 @@ jobs:
       - name: Freeze Windows package inputs and isolate outputs
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          POLARIS_TEST_WINDOWS_PACKAGE_CUSTODY: '1'
         run: |
-          if ($env:POLARIS_WINDOWS_PACKAGE_PREVIEW -eq '1') {
-            if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REF -notlike 'refs/heads/?*' -or
-                $env:GITHUB_REF -ceq 'refs/heads/main' -or
-                $env:GITHUB_WORKFLOW_REF -cne "$env:GITHUB_REPOSITORY/.github/workflows/release-risk.yml@$env:GITHUB_REF" -or
-                $env:POLARIS_LIGHT_BUILD -ne '1' -or $env:POLARIS_UPLOAD_ARTIFACTS -ne '0') {
-              throw 'Windows packaging preview requires explicit work-branch Release Risk without package upload'
-            }
-            & $env:CARGO build --locked --offline --release --target x86_64-pc-windows-msvc --target-dir target -p polaris-windows-cleaner --features packaging --bin polaris-package-custody
-            if ($LASTEXITCODE -ne 0) { throw 'Windows packaging custody build failed' }
-            node --test --test-concurrency=1 --test-name-pattern '^Windows package' scripts/local-development-selection.test.mjs
-            if ($LASTEXITCODE -ne 0) { throw 'Windows package custody fixtures failed' }
-            node scripts/windows-package-integrity.mjs prepare
-          } else {
-            python scripts/windows-package-integrity.py prepare
-          }
+          & $env:CARGO build --locked --offline --release --target x86_64-pc-windows-msvc --target-dir target -p polaris-windows-cleaner --features packaging --bin polaris-package-custody
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging custody build failed' }
+          node --test --test-concurrency=1 --test-name-pattern '^Windows package' scripts/local-development-selection.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows package custody fixtures failed' }
+          node scripts/windows-package-integrity.mjs prepare
           if ($LASTEXITCODE -ne 0) { throw 'Windows package input freeze failed' }
 
       - name: Build installers
@@ -1079,11 +1067,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if ($env:POLARIS_WINDOWS_PACKAGE_PREVIEW -eq '1') {
-            node scripts/windows-package-integrity.mjs produce
-          } else {
-            python scripts/windows-package-integrity.py produce
-          }
+          node scripts/windows-package-integrity.mjs produce
           if ($LASTEXITCODE -ne 0) { throw 'Windows first release producer failed' }
 
       # Save the original attempt's full output even when compilation/bundling
@@ -1553,23 +1537,16 @@ jobs:
       #
       # 仅发布一个 downloadBootstrapper 安装器；Polaris 不内嵌 WebView2 Runtime。
       # 缺 Runtime 的精简 / LTSC 系统需联网获取微软官方 Runtime。
-      - name: Verify final NSIS payload and build exact Windows portable zip
+      - name: Verify final Windows installer and portable archive
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $preview = $env:POLARIS_WINDOWS_PACKAGE_PREVIEW -eq '1'
-          if ($preview) {
-            $previewReadback = node scripts/windows-package-integrity.mjs assemble
-            if ($LASTEXITCODE -ne 0) { throw 'Windows package preview readback failed' }
-          }
-          # The original read-only assembler independently checks the same output.
-          python scripts/windows-package-integrity.py assemble
+          node scripts/windows-package-integrity.mjs assemble
           if ($LASTEXITCODE -ne 0) { throw 'complete Windows carrier integrity failed' }
-          if ($preview) { Write-Output $previewReadback }
 
       - name: Preserve static Windows carrier inventories
-        if: always() && runner.os == 'Windows' && env.POLARIS_WINDOWS_PACKAGE_PREVIEW != '1'
+        if: always() && runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
           name: windows-static-carriers-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
