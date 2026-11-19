@@ -96,7 +96,7 @@ function TsSettingsForm({ instanceId, node }: { instanceId: string; node?: Serve
   const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   /** staged-only 差集的两个入参（展示面 effective + 操作面磁盘镜像），判据与节点卡同一函数。 */
   const effectiveServers = useEffectiveServers();
@@ -306,15 +306,16 @@ function TsSettingsForm({ instanceId, node }: { instanceId: string; node?: Serve
       // `servers` 键上、无远端副作用 ⇒ 走默认腿。（弹窗里从活态回读的只有出口候选列表，不是被写的字段，
       // 故 W-2 不成立；真正有远端效应的是下面的 `handleLogout`，它另走绕过腿。）
       if (editRoute('servers', stagingEnabled) === 'staged') {
-        stage({
+        const result = await submitEdit({
           id: `server:${node.id}`,
           kind: 'server',
           label: `${t('ts.settingsTitle')} ${node.name}`,
           entityPath: ['servers', node.id],
           nextValue: next,
         });
+        if (result === 'ignored') return;
         close();
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        return;
       }
       await api.server.update(next);
       await loadConfig(true);

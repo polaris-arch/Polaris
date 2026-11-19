@@ -33,7 +33,7 @@ interface Args {
   stagedEntries: readonly StagedEntry[];
   nodeDeletePolicy: NodeDeleteRoutePolicy;
   revertStaged: (id: string) => void;
-  stageServerDeletions: (
+  submitServerDeletions: (
     targets: readonly ServerConfig[],
     removedIds: ReadonlySet<string>,
     groupId?: string
@@ -63,7 +63,7 @@ export function useNodeDeletion({
   stagedEntries,
   nodeDeletePolicy,
   revertStaged,
-  stageServerDeletions,
+  submitServerDeletions,
   selectedIds,
   visibleServers,
   exitBatch,
@@ -95,8 +95,7 @@ export function useNodeDeletion({
         );
         if (routes.staged.length > 0) {
           split.revertEntryIds.forEach(revertStaged);
-          stageServerDeletions(routes.staged, new Set([server.id]));
-          toast.info(t('nodes.deleteSuccess'));
+          submitServerDeletions(routes.staged, new Set([server.id]));
           return;
         }
 
@@ -127,7 +126,7 @@ export function useNodeDeletion({
       stagedDeleted,
       stagedEntries,
       stagedOnly,
-      stageServerDeletions,
+      submitServerDeletions,
       t,
     ]
   );
@@ -163,8 +162,7 @@ export function useNodeDeletion({
               nodeDeletePolicy
             );
             if (routes.staged.length > 0) {
-              stageServerDeletions(routes.staged, new Set([node.id]));
-              toast.info(t('nodes.deleteSuccess'));
+              submitServerDeletions(routes.staged, new Set([node.id]));
               return;
             }
 
@@ -201,7 +199,7 @@ export function useNodeDeletion({
       stagedDeleted,
       stagedEntries,
       stagedOnly,
-      stageServerDeletions,
+      submitServerDeletions,
       t,
     ]
   );
@@ -246,10 +244,11 @@ export function useNodeDeletion({
               routes.staged.length > 1
                 ? `serverDeleteBatch:${crypto.randomUUID()}`
                 : undefined;
-            stageServerDeletions(routes.staged, ids, groupId);
+            submitServerDeletions(routes.staged, ids, groupId);
           }
           exitBatch();
-          toast.info(t('nodes.batchDeleteOk', { count: ids.size }));
+          const completed = routes.directIds.length + split.revertEntryIds.length;
+          if (completed > 0) toast.info(t('nodes.batchDeleteOk', { count: completed }));
         } catch (err) {
           console.error('[NodesScreen] batch delete failed:', err);
           toast.error(t('nodes.deleteFail'));
@@ -267,7 +266,7 @@ export function useNodeDeletion({
     stagedDeleted,
     stagedEntries,
     stagedOnly,
-    stageServerDeletions,
+    submitServerDeletions,
     t,
     visibleServers,
   ]);

@@ -43,7 +43,7 @@ import { DIRECT_SERVER_ID } from '@/domain/direct-selection';
 import { useNodeViewStore } from '@/store/use-node-view-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
-import { editRoute, splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
+import { editRoute, splitStagedOnly, stagedOnlyIds, type StagedEntry } from '@/lib/staged-config';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { useSwitchNode } from '@/components/screens/shared/use-switch-node';
 import { needsApplyOnSelect } from '@/components/screens/home/pending-select-hint';
@@ -106,7 +106,7 @@ export function NodesScreen() {
     () => ({ all: editRoute('servers', stagingEnabled) }),
     [stagingEnabled]
   );
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   /** 撤销腿的两个入参（`ENTITY_ACTION_TABLE` 的 `revert` 策略）。总开关关着时 entries 恒空、
    *  `stagedOnly` 恒空 ⇒ 下面三条动作腿都走今天那条路径。 */
   const stagedEntries = useStagedConfigStore((s) => s.entries);
@@ -117,12 +117,12 @@ export function NodesScreen() {
    * `replay` 负责在连续删除/逐条撤销时重新归一 `selectedServerId`，不另造一条可分离的 W-1 编辑。
    * TS state / WARP 注销由后端在 Apply 时消费持久删除意图，因此节点类型不再改变这里的路由。
    */
-  const stageServerDeletions = useCallback(
+  const buildServerDeletionEntries = useCallback(
     (
       targets: readonly ServerConfig[],
       removedIds: ReadonlySet<string>,
       groupId?: string
-    ) => {
+    ): StagedEntry[] => {
       const effectiveSelected = config?.selectedServerId;
       const fallback =
         fallbackExitAfterDelete(
@@ -131,27 +131,32 @@ export function NodesScreen() {
           removedIds,
           useLatencyStore.getState().latencyMap
         ) ?? DIRECT_SERVER_ID;
-      for (const server of targets) {
-        stage({
-          id: `server:${server.id}`,
-          kind: 'server',
-          label: `${t('common.delete')} ${server.name}`,
-          entityPath: ['servers', server.id],
-          nextValue: null,
-          groupId,
-          selectedServerFallback:
-            effectiveSelected === server.id ? fallback : undefined,
-        });
-      }
+      return targets.map(server => ({
+        id: `server:${server.id}`,
+        kind: 'server',
+        label: `${t('common.delete')} ${server.name}`,
+        entityPath: ['servers', server.id],
+        nextValue: null,
+        groupId,
+        selectedServerFallback:
+          effectiveSelected === server.id ? fallback : undefined,
+      }));
     },
-    [config?.selectedServerId, servers, stage, t]
+    [config?.selectedServerId, servers, t]
+  );
+  const submitServerDeletions = useCallback(
+    (targets: readonly ServerConfig[], removedIds: ReadonlySet<string>, groupId?: string) => {
+      const [first, ...related] = buildServerDeletionEntries(targets, removedIds, groupId);
+      if (first) void submitEdit(first, ...related);
+    },
+    [buildServerDeletionEntries, submitEdit],
   );
 
   const subscriptions = config?.subscriptions ?? [];
 
   const subscriptionActions = useNodeSubscriptionActions({
     diskServers,
-    stageServerDeletions,
+    buildServerDeletionEntries,
     openDialog,
     closeDialog,
     t,
@@ -493,7 +498,7 @@ export function NodesScreen() {
     servers,
     t,
     stagingEnabled,
-    stage,
+    submitEdit,
     openDialog,
     selectedIds,
     setSelectedIds,
@@ -540,7 +545,7 @@ export function NodesScreen() {
 
   const nodeDeletion = useNodeDeletion({
     diskServers, selectedServerId, stagedDeleted, stagedOnly, stagedEntries,
-    nodeDeletePolicy, revertStaged, stageServerDeletions, selectedIds, visibleServers, exitBatch,
+    nodeDeletePolicy, revertStaged, submitServerDeletions, selectedIds, visibleServers, exitBatch,
     confirmTwice, t, openDialog, closeDialog,
   });
   const deleteNode = nodeDeletion.deleteNode;

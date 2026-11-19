@@ -90,7 +90,7 @@ export function WgPanel({
   const servers = useEffectiveServers();
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const interfaces = useNetworkInterfaces();
 
   const base = serverId === undefined ? undefined : servers.find((s) => s.id === serverId);
@@ -231,15 +231,16 @@ export function WgPanel({
         /* 新增时前端自铸 id：后端 `ensure_server_id` 只在落盘那一刻补 id，而暂存条目现在就需要
            一个稳定的实体寻址键（同一节点重复编辑要覆盖同一条）。 */
         const entityId = server.id !== '' ? server.id : crypto.randomUUID();
-        stage({
+        const result = await submitEdit({
           id: `server:${entityId}`,
           kind: 'server',
           label: `${isEdit ? t('wg.editTitle') : t('wg.addTitle')} ${server.name}`,
           entityPath: ['servers', entityId],
           nextValue: { ...server, id: entityId },
         });
+        if (result === 'ignored') return;
         closeInstance(instanceId);
-        return; // 零 IPC 写、零磁盘写
+        return;
       }
       if (isEdit) {
         await api.server.update(server);

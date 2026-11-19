@@ -143,8 +143,8 @@ describe('⓪ 自检：两枚探针都是活的（否则下面每条都是空跑
     const notify = vi.spyOn(toast, 'success').mockImplementation(() => undefined);
     try {
       const args = mountAndSubmit(<RuleFormPanel instanceId="outcome" ruleId="r1" initialPlane="route" />, { rules: [ruleOf({})] });
-      const close = args.close as (outcome: 'saved' | 'staged') => void;
-      close('staged');
+      const close = args.close as (outcome: 'saved' | 'submitted') => void;
+      close('submitted');
       expect(notify).not.toHaveBeenCalled();
       close('saved');
       expect(notify).toHaveBeenCalledExactlyOnceWith(`${i18n.t('rules.editTitle')} 存量规则 · ${i18n.t('common.saved')}`);
@@ -323,7 +323,7 @@ describe('① 装袋：实参袋逐格等于表单当下的取值', () => {
       'isEdit',
       'initialPlane',
       'stagingEnabled',
-      'stage',
+      'submitEdit',
       'close',
       'loadConfig',
       'setSubmitting',

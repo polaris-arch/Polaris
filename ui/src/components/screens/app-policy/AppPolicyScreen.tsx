@@ -72,7 +72,7 @@ import { brandIcon } from '@/components/brand-icons';
 import { cn } from '@/lib/utils';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { toast } from '@/lib/error-handler';
-import { editRoute } from '@/lib/staged-config';
+import { editRoute, type StagedEntry } from '@/lib/staged-config';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
@@ -117,7 +117,7 @@ export function AppPolicyScreen() {
   /** 移除自定义应用的原地二次确认（原型 :4173 `app-remove`）。 */
   const { armed, confirmTwice } = useConfirmTwice();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   const enabled = config?.appRoutingEnabled !== false; // undefined=true 兼容老配置
   const proxyMode = config?.proxyMode ?? 'smart';
@@ -237,14 +237,14 @@ export function AppPolicyScreen() {
     // 条目按 **appId** 寻址 —— `AppRule` 里根本没有 `id` 字段，这一族此前表达不了正是因为
     // 模型把主键写死成了 `id`（现由 `ID_ADDRESSED_COLLECTIONS` 的集合→主键映射给出）。
     if (editRoute('appRules', stagingEnabled) === 'staged') {
-      stage({
+      void submitEdit({
         id: `appRule:${appId}`,
         kind: 'appRule',
         label,
         entityPath: ['appRules', appId],
         nextValue: newRule,
       });
-      return; // 零 IPC 写、零磁盘写（FR-1）
+      return;
     }
     try {
       await useAppStore.getState().mutateConfigEntities([
@@ -282,16 +282,16 @@ export function AppPolicyScreen() {
     // 遗留：明细 popover 仍显示成两行，点一行两行齐消，观感突兀；合并显示属 UI 打磨，本轮不做。
     if (editRoute('customAppPresets', stagingEnabled) === 'staged') {
       const removeGroup = `appRemove:${appId}`;
-      stage({
+      const first: StagedEntry = {
         id: `appPreset:${appId}`,
         kind: 'appPreset',
         label,
         entityPath: ['customAppPresets', appId],
         nextValue: null,
         groupId: removeGroup,
-      });
-      if (hasRule) {
-        stage({
+      };
+      const related: StagedEntry[] = hasRule
+        ? [{
           id: `appRule:${appId}`,
           kind: 'appRule',
           label: t('home.stagedAppRuleRemove', {
@@ -300,9 +300,10 @@ export function AppPolicyScreen() {
           entityPath: ['appRules', appId],
           nextValue: null,
           groupId: removeGroup,
-        });
-      }
-      return; // 零 IPC 写、零磁盘写（FR-1）
+        }]
+        : [];
+      void submitEdit(first, ...related);
+      return;
     }
     try {
       const mutations: ConfigEntityMutation[] = [
@@ -376,14 +377,14 @@ export function AppPolicyScreen() {
               const label = t(nextEnabled ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff');
               // appRules / customAppPresets / appRoutingEnabled 都是 Class B，三个入口都得过闸门。
               if (editRoute('appRoutingEnabled', stagingEnabled) === 'staged') {
-                stage({
+                void submitEdit({
                   id: 'setting:appRoutingEnabled',
                   kind: 'setting',
                   label,
                   entityPath: ['appRoutingEnabled'],
                   nextValue: nextEnabled,
                 });
-                return; // 零 IPC 写、零磁盘写（FR-1）
+                return;
               }
               try {
                 await useAppStore.getState().saveConfig({ appRoutingEnabled: nextEnabled });
@@ -442,8 +443,8 @@ export function AppPolicyScreen() {
             onClick={async () => {
               if (!getEffectiveConfig()) return;
               try {
-                await useAppStore.getState().updateProxyMode('smart');
-                toast.success(t('rules.backToSmartOk'));
+                const label = t('rules.backToSmartOk');
+                if (await useAppStore.getState().updateProxyMode('smart', label) === 'saved') toast.success(label);
               } catch (err) {
                 console.error('[AppPolicyScreen] backToSmart failed:', err);
                 toast.error(t('rules.backToSmartFail'));

@@ -63,7 +63,7 @@ export function AppAddDialog({ instanceId }: { instanceId: string }) {
   const closeAll = useDialogStore((s) => s.closeAll);
   const navigate = useNavStore((s) => s.navigate);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   // ── 基础字段 ──
   const [name, setName] = useState('');
@@ -302,15 +302,16 @@ export function AppAddDialog({ instanceId }: { instanceId: string }) {
       // 上面那次图标缓存不构成 W-3：它落的是本地图标缓存文件、不是配置的一部分，
       // 「重置」后至多留一个没人引用的缓存文件（不改变任何配置语义、也无远端效应）。
       if (editRoute('customAppPresets', stagingEnabled) === 'staged') {
-        stage({
+        const result = await submitEdit({
           id: `appPreset:${preset.id}`,
           kind: 'appPreset',
           label: `${t('appAdd.title')} ${preset.name}`,
           entityPath: ['customAppPresets', preset.id],
           nextValue: preset,
         });
+        if (result === 'ignored') return;
         close();
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        return;
       }
       await useAppStore.getState().mutateConfigEntities([
         { collection: 'customAppPresets', entityId: preset.id, value: preset },

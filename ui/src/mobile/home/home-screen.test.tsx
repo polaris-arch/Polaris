@@ -1185,7 +1185,7 @@ describe('⑨ 接管方式：整颗缺席，而分流策略照旧可切', () => 
     expect(
       WIRING_RAW,
       '分流策略的写腿不见了 —— 这一屏就只剩两颗印着字的芯片，点了什么也不会发生',
-    ).toMatch(/runWrite\(\s*'routing'\s*,\s*async\s*\(\)\s*=>\s*\{\s*try\s*\{\s*await updateProxyMode\(v\)/);
+    ).toMatch(/runWrite\(\s*'routing'\s*,\s*async\s*\(\)\s*=>\s*\{\s*try\s*\{[^}]*await updateProxyMode\(v, label\)/);
     // 反面：不许有任何一处写回 `proxyModeType`（那正是被移除的那条腿）。
     expect(WIRING_TEXT).not.toMatch(/update\(\{\s*proxyModeType/);
   });
@@ -1561,7 +1561,7 @@ describe('⑬ 哨兵出口 / 空态入口 / 主机行规则面板：能力真的
       expect(body, `${leg} 没过暂存闸门 —— 同一次编辑在两个客户端上会落成两种形状`).toContain(
         "editRoute('trafficRules', stagingEnabled)",
       );
-      expect(body, `${leg} 没有暂存那一半的 stage() 调用`).toContain('stage({');
+      expect(body, `${leg} 未经共享提交`).toContain('submitEdit({');
     }
     // 追加腿的失败必须如实报，不许把「目标漂移」静默当成功。
     const append = WIRING_RAW.slice(WIRING_RAW.indexOf('const onAppendToRule'));

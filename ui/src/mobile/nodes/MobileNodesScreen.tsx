@@ -423,7 +423,7 @@ export function MobileNodesScreen(): ReactElement {
 
   // ── 删除腿 + 克隆（W-02 / W-03）─────────────────────────────────────────────
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   /** 叠一层确认面板；返回那一层的身份，供 `onConfirm` 关掉自己（不按栈顶猜）。 */
   const confirmLayer = useCallback(
@@ -471,7 +471,7 @@ export function MobileNodesScreen(): ReactElement {
           const staged = editRoute('servers', stagingEnabled) === 'staged';
           if (staged) {
             const entityId = crypto.randomUUID();
-            stage({
+            void submitEdit({
               id: `server:${entityId}`,
               kind: 'server',
               label: t('home.stagedNodeClone', { name: cloneName }),
@@ -489,7 +489,7 @@ export function MobileNodesScreen(): ReactElement {
         () => t('nodes.cloneFail'),
       );
     },
-    [servers, t, runWrite, stagingEnabled, stage],
+    [servers, t, runWrite, stagingEnabled, submitEdit],
   );
 
   // ── 纯本地状态动作（不写盘，故不经 runWrite）────────────────────────────────

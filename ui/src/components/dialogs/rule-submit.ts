@@ -9,7 +9,7 @@ import type {
   RuleDnsResolver,
 } from '@/contracts/types';
 import { api, IpcError } from '@/ipc';
-import { configCanonicalText, editRoute, type StagedEntry } from '@/lib/staged-config';
+import { configCanonicalText, editRoute, type StagedEntry, type SubmitStagedEdit } from '@/lib/staged-config';
 import { effectiveCollection, useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { toast } from '@/lib/error-handler';
@@ -56,8 +56,8 @@ export interface RuleSubmitArgs {
    */
   initialPlane: 'route' | 'dns';
   stagingEnabled: boolean;
-  stage: (entry: StagedEntry) => void;
-  close: (outcome: 'staged' | 'saved') => void;
+  submitEdit: SubmitStagedEdit;
+  close: (outcome: 'submitted' | 'saved') => void;
   loadConfig: (force: boolean) => Promise<unknown> | void;
   setSubmitting: (v: boolean) => void;
   /** Exact mounted input revision owns asynchronous pre-submit admission. */
@@ -93,7 +93,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
     base,
     initialPlane,
     stagingEnabled,
-    stage,
+    submitEdit,
     close,
     loadConfig,
     setSubmitting,
@@ -267,15 +267,15 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
         networkProfileId: networkProfileId || undefined,
       };
       if (stageRule) {
-        stage({
+        const result = await submitEdit({
           id: `rule:${full.id}`,
           kind: 'rule',
           label: `${t('rules.editTitle')} ${remarks}`,
           entityPath: [collectionKey, full.id],
           nextValue: full,
         });
-        if (isCurrent()) close('staged');
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        if (result !== 'ignored' && isCurrent()) close('submitted');
+        return;
       }
       dispatched = true;
       await api.rules.update(full, initialPlane, base);
@@ -298,27 +298,28 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
       // 实体寻址键（同一条规则改两次要覆盖同一条条目，否则计数虚高）。
       if (stageRule) {
         const entityId = crypto.randomUUID();
-        stage({
+        const first: StagedEntry = {
           id: `rule:${entityId}`,
           kind: 'rule',
           label: `${t('rules.newTitle')} ${remarks}`,
           entityPath: [collectionKey, entityId],
           nextValue: { ...rest, id: entityId },
-        });
+        };
         // 顺序条目与 RulesScreen.commitOrder 同形（整序列、同一个条目 id ⇒ 覆盖而不叠加）；
         // replay 里实体在前、顺序在后，新规则的 id 在重放顺序时已存在。
         const order = firstOrder(entityId);
-        if (order && editRoute(orderKey, stagingNow) === 'staged') {
-          stage({
-            id: `order:${orderKey}`,
-            kind: 'rule',
-            label: t('home.stagedRuleOrder'),
-            entityPath: [orderKey],
-            nextValue: order,
-          });
-        }
-        if (isCurrent()) close('staged');
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        const related: StagedEntry[] = order && editRoute(orderKey, stagingNow) === 'staged'
+          ? [{
+              id: `order:${orderKey}`,
+              kind: 'rule',
+              label: t('home.stagedRuleOrder'),
+              entityPath: [orderKey],
+              nextValue: order,
+            }]
+          : [];
+        const result = await submitEdit(first, ...related);
+        if (result !== 'ignored' && isCurrent()) close('submitted');
+        return;
       }
       dispatched = true;
       const created = await api.rules.add(rest, initialPlane);

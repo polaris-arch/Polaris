@@ -195,7 +195,7 @@ export function MobileHomeScreen(): ReactElement {
      有效规则表（含暂存重放）、暂存总开关、入条目。两端对「这次写该不该进暂存」必须同一个答案。 */
   const rules = useEffectiveRules();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const loadConfig = useAppStore((s) => s.loadConfig);
 
   const proxyRunning = proxyStatus?.running === true;
@@ -669,14 +669,16 @@ export function MobileHomeScreen(): ReactElement {
 
   const onSetRouting = useCallback(
     (v: ProxyMode) => {
-      const { config: savedConfig, updateProxyMode } = useAppStore.getState();
-      if (!savedConfig || (routingIntent.current?.mode ?? savedConfig.proxyMode) === v) return;
+      const current = getEffectiveConfig();
+      const { updateProxyMode } = useAppStore.getState();
+      if (!current || (routingIntent.current?.mode ?? current.proxyMode) === v) return;
       const intent = { mode: v };
       routingIntent.current = intent;
       void runWrite('routing', async () => {
         try {
-          await updateProxyMode(v);
-          if (mounted.current) toast.success(`${t('common.saved')} · ${t(ROUTING_KEY[v])}`);
+          const label = t(ROUTING_KEY[v]);
+          const result = await updateProxyMode(v, label);
+          if (mounted.current && result === 'saved') toast.success(`${t('common.saved')} · ${label}`);
         } catch (error) {
           if (mounted.current) toast.error(configSaveErrorText(error, t));
           throw error;
@@ -745,7 +747,7 @@ export function MobileHomeScreen(): ReactElement {
         };
         if (editRoute('trafficRules', stagingEnabled) === 'staged') {
           const entityId = crypto.randomUUID();
-          stage({
+          void submitEdit({
             id: `rule:${entityId}`,
             kind: 'rule',
             label: `${t('rules.newTitle')} ${subject.value}`,
@@ -762,7 +764,7 @@ export function MobileHomeScreen(): ReactElement {
         if (ruleSession.current === session) setRuleSubject(null);
       });
     },
-    [ruleSubject, runWrite, stagingEnabled, stage, t, loadConfig],
+    [ruleSubject, runWrite, stagingEnabled, submitEdit, t, loadConfig],
   );
 
   const onQuickRule = useCallback(
@@ -800,7 +802,7 @@ export function MobileHomeScreen(): ReactElement {
         if (next === null) throw new Error(t('rules.appendFail'));
         const label = next.remarks?.trim() || t(ruleTypeNameKey(next.type));
         if (editRoute('trafficRules', stagingEnabled) === 'staged') {
-          stage({
+          void submitEdit({
             id: `rule:${next.id}`,
             kind: 'rule',
             label: `${t('rules.editTitle')} ${label}`,
@@ -816,7 +818,7 @@ export function MobileHomeScreen(): ReactElement {
         if (ruleSession.current === session) setRuleSubject(null);
       });
     },
-    [ruleSubject, runWrite, rules, t, stagingEnabled, stage, loadConfig],
+    [ruleSubject, runWrite, rules, t, stagingEnabled, submitEdit, loadConfig],
   );
 
   return (

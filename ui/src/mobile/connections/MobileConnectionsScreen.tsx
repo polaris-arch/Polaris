@@ -209,7 +209,7 @@ export function MobileConnectionsScreen(): ReactElement {
   const saveConfig = useAppStore((s) => s.saveConfig);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const redactLogs = useLogRedactStore((s) => s.redactLogs);
   const toggleRedactLogs = useLogRedactStore((s) => s.toggleRedactLogs);
   const { armed, confirmTwice } = useConfirmTwice();
@@ -1029,7 +1029,7 @@ export function MobileConnectionsScreen(): ReactElement {
       if (!diskConfig) return;
       // 连接中先暂存；保存后由共用热应用流程同步运行核。
       if (editRoute('logLevel', stagingEnabled) === 'staged') {
-        stage({
+        void submitEdit({
           id: 'setting:logLevel',
           kind: 'setting',
           label: `${trRef.current('logs.currentLevel')} ${next}`,
@@ -1044,7 +1044,7 @@ export function MobileConnectionsScreen(): ReactElement {
         return true;
       });
     },
-    [diskConfig, stagingEnabled, stage, saveConfig, runWrite],
+    [diskConfig, stagingEnabled, submitEdit, saveConfig, runWrite],
   );
 
   /* ═══════════ 把连接对象写进规则（桌面 `RuleSubjectMenuItems.tsx` 那两颗）═══════════ */
@@ -1075,14 +1075,14 @@ export function MobileConnectionsScreen(): ReactElement {
       const label = next.remarks?.trim() || trRef.current(ruleTypeNameKey(next.type));
       // 暂存灰度的**唯一**闸门（与桌面 `RuleSubjectMenuItems` 同一个 `editRoute` + 同一个集合键）。
       if (editRoute('trafficRules', stagingEnabled) === 'staged') {
-        stage({
+        void submitEdit({
           id: `rule:${next.id}`,
           kind: 'rule',
           label: `${trRef.current('rules.editTitle')} ${label}`,
           entityPath: ['trafficRules', next.id],
           nextValue: next,
         });
-        return; // 零 IPC 写、零磁盘写
+        return;
       }
       void runWrite('screen', 'rules.appendFail', async () => {
         await api.rules.update(next, 'route', base);
@@ -1092,7 +1092,7 @@ export function MobileConnectionsScreen(): ReactElement {
         return true;
       });
     },
-    [rules, stagingEnabled, stage, runWrite, loadConfig],
+    [rules, stagingEnabled, submitEdit, runWrite, loadConfig],
   );
 
   /* ═══════════ 面板（屏头溢出 / 行菜单 / 排序 / 日志筛选 / 导出 / 规则）═══════════ */

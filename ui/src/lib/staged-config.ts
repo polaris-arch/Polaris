@@ -802,6 +802,11 @@ export function isBypassedConfigKey(key: string): boolean {
 
 export type EditRoute = 'direct' | 'staged';
 
+export type SubmitStagedEdit = (
+  first: StagedEntry,
+  ...related: StagedEntry[]
+) => Promise<'automatic' | 'manual' | 'ignored'>;
+
 /**
  * 编辑入口的落地路径判定 —— **所有编辑入口只经这一个函数**。
  *

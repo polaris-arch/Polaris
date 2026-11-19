@@ -112,7 +112,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
   const loadConfig = useAppStore((s) => s.loadConfig);
   const openDialog = useDialogStore((s) => s.open);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   /** 行内删除的原地二次确认（单槽，见 RULE_DEL_PREFIX 头注）。 */
   const { armed, confirmTwice } = useConfirmTwice();
   /** 删除腿：与规则弹窗 footer 那颗**同一个** hook（暂存分流只此一份，不在本屏复制）。 */
@@ -241,14 +241,14 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
           ? editRoute('dnsRuleOrder', stagingEnabled)
           : editRoute('routeRuleOrder', stagingEnabled);
       if (orderEditRoute === 'staged') {
-        stage({
+        void submitEdit({
           id: `order:${orderKey}`,
           kind: 'rule',
           label: t('home.stagedRuleOrder'),
           entityPath: [orderKey],
           nextValue: ordered.map((r) => r.id),
         });
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        return;
       }
       try {
         await api.rules.reorder(ordered.map((r) => r.id), plane);
@@ -267,7 +267,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         );
       }
     },
-    [t, stagingEnabled, stage, visibleRules, orderKey, plane],
+    [t, stagingEnabled, submitEdit, visibleRules, orderKey, plane],
   );
 
   const handleDrop = useCallback(
@@ -332,14 +332,14 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
           ? editRoute('dnsRules', stagingEnabled) === 'staged'
           : editRoute('trafficRules', stagingEnabled) === 'staged';
       if (stageRule) {
-        stage({
+        void submitEdit({
           id: `rule:${next.id}`,
           kind: 'rule',
           label: `${t('rules.editTitle')} ${next.remarks || next.type}`,
           entityPath: [collectionKey, next.id],
           nextValue: next,
         });
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        return;
       }
       const prev = plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules;
       const optimistic = prev.map((r) => (r.id === next.id ? next : r));
@@ -360,7 +360,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         );
       }
     },
-    [t, plane, stagingEnabled, stage, collectionKey],
+    [t, plane, stagingEnabled, submitEdit, collectionKey],
   );
 
   /**
@@ -384,14 +384,14 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
             : editRoute('trafficRules', stagingEnabled) === 'staged';
         if (stageRule) {
           const entityId = crypto.randomUUID();
-          stage({
+          void submitEdit({
             id: `rule:${entityId}`,
             kind: 'rule',
             label: `${t('rules.duplicate')} ${payload.remarks ?? payload.type}`,
             entityPath: [collectionKey, entityId],
             nextValue: { ...payload, id: entityId },
           });
-          return; // 零 IPC 写、零磁盘写（FR-1）
+          return;
         }
         await api.rules.add(payload, plane);
         // 与 RuleDialog 同款：直写成功后重拉当前平面磁盘镜像。
@@ -404,7 +404,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         );
       }
     },
-    [t, loadConfig, stagingEnabled, stage, collectionKey, plane],
+    [t, loadConfig, stagingEnabled, submitEdit, collectionKey, plane],
   );
 
   /**
@@ -453,7 +453,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
       // 且这三个控件都不是运行期状态 / 活态回读 / 不可逆副作用 ⇒ 默认腿。
       // 走键路径寻址（不是集合实体），`nextValue` 是整份 `RegionRoutingConfig` —— 幂等整体替换。
       if (editRoute('regionRouting', stagingEnabled) === 'staged') {
-        stage({
+        void submitEdit({
           id: 'setting:regionRouting',
           kind: 'setting',
           label: next.enabled ? t(next.reverse ? 'home.stagedRegionProxy' : 'home.stagedRegionDirect', {
@@ -500,15 +500,15 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         }
       }
     },
-    [t, stagingEnabled, stage],
+    [t, stagingEnabled, submitEdit],
   );
 
   // mode-warn 内的「切回智能」按钮确认分流设置已写盘。
   const handleBackToSmart = useCallback(async () => {
     if (!getEffectiveConfig()) return;
     try {
-      await useAppStore.getState().updateProxyMode('smart');
-      toast.success(t('rules.backToSmartOk'));
+      const label = t('rules.backToSmartOk');
+      if (await useAppStore.getState().updateProxyMode('smart', label) === 'saved') toast.success(label);
     } catch (err) {
       // 失败时 mode-warn 仍留在原地；同时报出真实原因，避免按钮看似无响应。
       console.error('[RulesScreen] backToSmart failed:', err);

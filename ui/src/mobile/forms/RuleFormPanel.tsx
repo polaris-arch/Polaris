@@ -146,7 +146,7 @@ export function RuleFormPanel({
   const config = useEffectiveConfig();
   const servers = useEffectiveServers();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const deleteRule = useRuleDelete(plane);
 
@@ -440,7 +440,7 @@ export function RuleFormPanel({
       base,
       initialPlane: plane,
       stagingEnabled,
-      stage,
+      submitEdit,
       close: (outcome) => {
         closeInstance(instanceId);
         if (outcome === 'saved') {

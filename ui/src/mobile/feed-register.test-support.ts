@@ -226,11 +226,11 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useLatencyStore.retainServerIds', role: 'action', disposition: act(STORE_LATENCY), note: '延迟表的对账驱逐（节点删了它的延迟也要跟着走）。' },
 
   /* ── 暂存（待应用条）─────────────────────────────────────────────────── */
-  { id: 'useStagedConfigStore.entries', role: 'state', disposition: fed({ file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'stage({' }), note: '暂存条目。写入方是各屏那些 `stage({ … })` 调用。' },
+  { id: 'useStagedConfigStore.entries', role: 'state', disposition: fed({ file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'submitEdit({' }), note: '共享提交保留下来的未保存条目。' },
   { id: 'useStagedConfigStore.saveStatus', role: 'state', disposition: fed(STAGED_FED), note: '保存态（保存失败时条上要说话，静默失败是本仓修过的形态）。' },
   { id: 'useStagedConfigStore.savedRuntimeApply', role: 'state', disposition: fed(STAGED_FED), note: '保存时收到的运行核回执，由共用待应用逻辑按原事务消费。' },
   { id: 'useStagedConfigStore.conflict', role: 'state', disposition: fed(STAGED_FED), note: '保存冲突（盘上被别处改过）。冲突时 save 把 saveStatus 退回 idle 并 return false —— 不报冲突就等于「什么都没发生」。' },
-  { id: 'useStagedConfigStore.stage', role: 'action', disposition: act(STORE_STAGED), note: '压一条暂存（Class B 配置命中暂存腿时只记意图，真正生效留到 Apply）。' },
+  { id: 'useStagedConfigStore.submit', role: 'action', disposition: act(STORE_STAGED), note: '提交普通编辑，由统一事务决定自动保存或保留未保存草稿。' },
   { id: 'useStagedConfigStore.save', role: 'action', disposition: act(STORE_STAGED), note: '保存暂存但不重启核（冲突时把 saveStatus 退回 idle 并返回 false）。' },
   { id: 'useStagedConfigStore.applyNow', role: 'action', disposition: act(STORE_STAGED), note: '保存并立即应用，可能连带重启核 —— 待应用条上那颗主动作。' },
   { id: 'useStagedConfigStore.reset', role: 'action', disposition: act(STORE_STAGED), note: '丢弃全部暂存（二次确认，条上那颗「重置」）。' },

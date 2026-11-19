@@ -26,7 +26,7 @@ import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useAppStore, useEffectiveConfig } from '@/store/app-store';
+import { getEffectiveConfig, useAppStore, useEffectiveConfig } from '@/store/app-store';
 import { useNavStore } from '@/store/nav-store';
 import { api } from '@/ipc';
 import { IpcError } from '@/ipc/ipc-client';
@@ -909,12 +909,13 @@ export function HomeScreen() {
   /* 分流策略的写入回包确认配置已保存。 */
   const onRoutingChange = useCallback(
     async ({ v, labelKey }: (typeof ROUTING_OPTS)[number]) => {
-      const { config: savedConfig, updateProxyMode } = useAppStore.getState();
-      if (routingBusy || !savedConfig || savedConfig.proxyMode === v) return;
+      const current = getEffectiveConfig();
+      const { updateProxyMode } = useAppStore.getState();
+      if (routingBusy || !current || current.proxyMode === v) return;
       setRoutingBusy(true);
       try {
-        await updateProxyMode(v);
-        toast.success(`${t('common.saved')} · ${t(labelKey)}`);
+        const label = t(labelKey);
+        if (await updateProxyMode(v, label) === 'saved') toast.success(`${t('common.saved')} · ${label}`);
       } catch (err) {
         // seg2 是受控的（跟 config 走）：写失败即按钮弹回原档，用户读作「点不动」而非「没存上」。
         console.error('[home] set routing failed:', err);

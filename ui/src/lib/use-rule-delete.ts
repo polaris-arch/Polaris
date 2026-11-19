@@ -42,7 +42,7 @@ export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
   const { t } = useTranslation();
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   /** 撤销腿的入参（`ENTITY_ACTION_TABLE` 的 `revert` 策略）。总开关关着时两者恒空 ⇒ 走直落盘那条路径。 */
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const revertStaged = useStagedConfigStore((s) => s.revert);
@@ -89,19 +89,19 @@ export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
           ? editRoute('dnsRules', stagingEnabled) === 'staged'
           : editRoute('trafficRules', stagingEnabled) === 'staged';
       if (stageRule) {
-        stage({
+        await submitEdit({
           id: `rule:${rule.id}`,
           kind: 'rule',
           label: `${t('rules.deleteRule')} ${rule.remarks || rule.type}`,
           entityPath: [collectionKey, rule.id],
           nextValue: null,
         });
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        return;
       }
       await api.rules.delete(rule.id, plane, rule);
       // 写后端即刷 store，否则列表里被删的那条还在（store.rules 只由 loadConfig/saveConfig 写）。
       void loadConfig(true);
     },
-    [t, loadConfig, stagingEnabled, stage, stagedEntries, revertStaged, stagedOnlyRuleIds, collectionKey, plane]
+    [t, loadConfig, stagingEnabled, submitEdit, stagedEntries, revertStaged, stagedOnlyRuleIds, collectionKey, plane]
   );
 }

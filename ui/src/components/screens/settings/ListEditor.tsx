@@ -85,7 +85,7 @@ export function ListEditor({
 
   /* ── 本地草稿 + onBlur 提交（**照 `SettingsDns.tsx:235-265` 那套既有做法，不另发明**）──
    *
-   * 此前每个字符都直接调父级 `onChange` ⇒ 经 `useConfig().update` 漏斗 → `editRoute` → `stage()`，
+   * 此前每个字符都直接调父级 `onChange` ⇒ 经 `useConfig().update` 漏斗 → `editRoute` → 共享配置提交，
    * 于是**每敲一个字符**跑一遍 sanitize+validate、一次落盘（原子写 tmp+rename）、一次
    * `broadcast_config_changed` → 一次 `spawn(switch_mode)`。DNS 那三个文本框当初正是这个毛病、
    * 已改成 draft+onBlur（见那里的头注），只有本组件没跟上 —— 它是 7 个挂点的共同源头

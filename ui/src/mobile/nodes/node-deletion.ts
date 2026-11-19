@@ -36,7 +36,7 @@ import {
   partitionNodeDeleteRoutes,
 } from '@/components/screens/nodes/node-delete-fallback';
 import { selectedDeletableIds, subDeleteNodeCount } from '@/components/screens/nodes/nodes-logic';
-import { editRoute, splitStagedOnly } from '@/lib/staged-config';
+import { editRoute, splitStagedOnly, type StagedEntry } from '@/lib/staged-config';
 import { useAppStore, getEffectiveConfig, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useLatencyStore } from '@/store/use-latency-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -104,7 +104,7 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
   const selectedServerId = useAppStore((s) => s.selectedServerId);
   const config = useEffectiveConfig();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const revertStaged = useStagedConfigStore((s) => s.revert);
 
@@ -120,8 +120,8 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
   const policy = { all: editRoute('servers', stagingEnabled) };
 
   /** 把一批节点删除暂存成完整实体删除意图，兜底 id 附着在同一条意图上（逐字同桌面）。 */
-  const stageServerDeletions = useCallback(
-    (targets: readonly ServerConfig[], removedIds: ReadonlySet<string>, groupId?: string): void => {
+  const buildServerDeletionEntries = useCallback(
+    (targets: readonly ServerConfig[], removedIds: ReadonlySet<string>, groupId?: string): StagedEntry[] => {
       const effectiveSelected = config?.selectedServerId;
       const fallback =
         fallbackExitAfterDelete(
@@ -130,19 +130,24 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
           removedIds,
           useLatencyStore.getState().latencyMap,
         ) ?? DIRECT_SERVER_ID;
-      for (const server of targets) {
-        stage({
-          id: `server:${server.id}`,
-          kind: 'server',
-          label: `${t('common.delete')} ${server.name}`,
-          entityPath: ['servers', server.id],
-          nextValue: null,
-          groupId,
-          selectedServerFallback: effectiveSelected === server.id ? fallback : undefined,
-        });
-      }
+      return targets.map(server => ({
+        id: `server:${server.id}`,
+        kind: 'server',
+        label: `${t('common.delete')} ${server.name}`,
+        entityPath: ['servers', server.id],
+        nextValue: null,
+        groupId,
+        selectedServerFallback: effectiveSelected === server.id ? fallback : undefined,
+      }));
     },
-    [config?.selectedServerId, servers, stage, t],
+    [config?.selectedServerId, servers, t],
+  );
+  const submitServerDeletions = useCallback(
+    (targets: readonly ServerConfig[], removedIds: ReadonlySet<string>, groupId?: string) => {
+      const [first, ...related] = buildServerDeletionEntries(targets, removedIds, groupId);
+      if (first) void submitEdit(first, ...related);
+    },
+    [buildServerDeletionEntries, submitEdit],
   );
 
   /**
@@ -172,7 +177,7 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
       const routes = partitionNodeDeleteRoutes(diskServers, split.backend, policy);
       if (routes.staged.length > 0) {
         split.revertEntryIds.forEach(revertStaged);
-        stageServerDeletions(routes.staged, new Set([server.id]));
+        submitServerDeletions(routes.staged, new Set([server.id]));
         done(false);
         return;
       }
@@ -201,7 +206,7 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
       runWrite,
       revertStaged,
       selectedServerId,
-      stageServerDeletions,
+      submitServerDeletions,
       stagedDeleted,
       stagedEntries,
       stagedOnly,
@@ -288,7 +293,7 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
               if (routes.staged.length > 0) {
                 const groupId =
                   routes.staged.length > 1 ? `serverDeleteBatch:${crypto.randomUUID()}` : undefined;
-                stageServerDeletions(routes.staged, ids, groupId);
+                submitServerDeletions(routes.staged, ids, groupId);
               }
               exitBatch();
               clearNotice();
@@ -310,7 +315,7 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
       runWrite,
       revertStaged,
       selectedServerId,
-      stageServerDeletions,
+      submitServerDeletions,
       stagedDeleted,
       stagedEntries,
       stagedOnly,
@@ -334,15 +339,14 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
             const targets = diskServers.filter((s) => s.subscriptionId === sub.id);
             const removedIds = new Set(targets.map((s) => s.id));
             const groupId = `subscriptionDelete:${crypto.randomUUID()}`;
-            stage({
+            void submitEdit({
               id: `subscription:${sub.id}`,
               kind: 'subscription',
               label: `${t('common.delete')} ${sub.name}`,
               entityPath: ['subscriptions', sub.id],
               nextValue: null,
               groupId,
-            });
-            stageServerDeletions(targets, removedIds, groupId);
+            }, ...buildServerDeletionEntries(targets, removedIds, groupId));
             clearNotice();
             return;
           }
@@ -357,7 +361,7 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
         },
       });
     },
-    [confirm, clearNotice, diskServers, dismiss, runWrite, stage, stageServerDeletions, stagingEnabled, t],
+    [confirm, clearNotice, diskServers, dismiss, runWrite, submitEdit, buildServerDeletionEntries, stagingEnabled, t],
   );
 
   return { deleteNode, deleteBatch, deleteSubscription, removeWarpNode };

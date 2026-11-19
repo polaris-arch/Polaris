@@ -75,7 +75,7 @@ export function ResourcesScreen() {
   const rules = useEffectiveRules() ?? [];
   const config = useEffectiveConfig();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const effectiveResourceIds = useMemo(
     () =>
       config === null
@@ -233,14 +233,13 @@ export function ResourcesScreen() {
     (item: RuleResourceListItem) => {
       confirmTwice(`${RES_DEL_PREFIX}${item.id}`, () => {
         if (editRoute('ruleResources', stagingEnabled) === 'staged') {
-          stage({
+          void submitEdit({
             id: `resource:${item.id}`,
             kind: 'resource',
             label: `${t('common.delete')} ${item.name}`,
             entityPath: ['ruleResources', item.id],
             nextValue: null,
           });
-          toast.info(t('resources.deleteDone'));
           return;
         }
         void (async () => {
@@ -257,7 +256,7 @@ export function ResourcesScreen() {
         })();
       });
     },
-    [confirmTwice, reload, stage, stagingEnabled, t],
+    [confirmTwice, reload, submitEdit, stagingEnabled, t],
   );
 
   /**

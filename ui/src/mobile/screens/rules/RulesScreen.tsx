@@ -79,7 +79,7 @@ import { getEffectiveConfig, useAppStore, useEffectiveConfig, useEffectiveRules,
 import { useAppPresetsStore } from '@/store/use-app-presets-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
-import { editRoute, stagedOnlyIds } from '@/lib/staged-config';
+import { editRoute, stagedOnlyIds, type StagedEntry } from '@/lib/staged-config';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { useRuleDelete } from '@/lib/use-rule-delete';
 import { toast } from '@/lib/error-handler';
@@ -174,7 +174,7 @@ export function MobileRulesScreen(): ReactElement {
   const config = useEffectiveConfig();
   const servers = useEffectiveServers();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const loadConfig = useAppStore((s) => s.loadConfig);
   /* 核起停会改变引擎算出来的 force-route 段集（未运行时报告是空的），故列进下面那条拉取的依赖。 */
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
@@ -413,7 +413,7 @@ export function MobileRulesScreen(): ReactElement {
           ? editRoute('dnsRuleOrder', stagingEnabled) === 'staged'
           : editRoute('routeRuleOrder', stagingEnabled) === 'staged';
       if (orderStaged) {
-        stage({
+        void submitEdit({
           id: `order:${orderKey}`,
           kind: 'rule',
           label: tr('home.stagedRuleOrder'),
@@ -437,7 +437,7 @@ export function MobileRulesScreen(): ReactElement {
         reportWriteError(`order:${plane}`, tr('rules.reorderFail'));
       }
     },
-    [stagingEnabled, stage, tr, clearWriteError, reportWriteError],
+    [stagingEnabled, submitEdit, tr, clearWriteError, reportWriteError],
   );
 
   const handleMove = useCallback(
@@ -495,7 +495,7 @@ export function MobileRulesScreen(): ReactElement {
           ? editRoute('dnsRules', stagingEnabled) === 'staged'
           : editRoute('trafficRules', stagingEnabled) === 'staged';
       if (stageRule) {
-        stage({
+        void submitEdit({
           id: `rule:${next.id}`,
           kind: 'rule',
           label: `${tr('rules.editTitle')} ${next.remarks || next.type}`,
@@ -523,7 +523,7 @@ export function MobileRulesScreen(): ReactElement {
         reportWriteError(`rule:${rule.id}`, tr('rules.saveFailed'));
       }
     },
-    [stagingEnabled, stage, tr, clearWriteError, reportWriteError],
+    [stagingEnabled, submitEdit, tr, clearWriteError, reportWriteError],
   );
 
   const handleDuplicate = useCallback(
@@ -540,7 +540,7 @@ export function MobileRulesScreen(): ReactElement {
         if (stageRule) {
           // 前端自铸 id（后端只在落盘那一刻发 id，而条目现在就要一个稳定的实体寻址键）。
           const entityId = crypto.randomUUID();
-          stage({
+          void submitEdit({
             id: `rule:${entityId}`,
             kind: 'rule',
             label: `${tr('rules.duplicate')} ${payload.remarks ?? payload.type}`,
@@ -558,7 +558,7 @@ export function MobileRulesScreen(): ReactElement {
         reportWriteError(`rule:${rule.id}`, tr('rules.saveFailed'));
       }
     },
-    [stagingEnabled, stage, loadConfig, tr, clearWriteError, reportWriteError],
+    [stagingEnabled, submitEdit, loadConfig, tr, clearWriteError, reportWriteError],
   );
 
   const requestDeleteRule = useCallback(
@@ -593,7 +593,7 @@ export function MobileRulesScreen(): ReactElement {
       const regionChanged = prevRouting.region !== next.region;
       const reverseChanged = prevRouting.reverse !== next.reverse;
       if (editRoute('regionRouting', stagingEnabled) === 'staged') {
-        stage({
+        void submitEdit({
           id: 'setting:regionRouting',
           kind: 'setting',
           label: next.enabled ? tr(next.reverse ? 'home.stagedRegionProxy' : 'home.stagedRegionDirect', {
@@ -628,15 +628,15 @@ export function MobileRulesScreen(): ReactElement {
         else toast.info(tr('rules.reverseOff'));
       }
     },
-    [stagingEnabled, stage, tr, clearWriteError, reportWriteError],
+    [stagingEnabled, submitEdit, tr, clearWriteError, reportWriteError],
   );
 
   const handleBackToSmart = useCallback(async () => {
     if (!getEffectiveConfig()) return;
     clearWriteError('proxyMode');
     try {
-      await useAppStore.getState().updateProxyMode('smart');
-      toast.success(tr('rules.backToSmartOk'));
+      const label = tr('rules.backToSmartOk');
+      if (await useAppStore.getState().updateProxyMode('smart', label) === 'saved') toast.success(label);
     } catch (err) {
       // 失败时那条模式警告仍留在原地 —— 不报的话与「按钮失灵」同形。
       console.error('[MobileRulesScreen] backToSmart failed:', err);
@@ -788,7 +788,7 @@ export function MobileRulesScreen(): ReactElement {
     const label = tr(next ? 'home.stagedAppRoutingOn' : 'home.stagedAppRoutingOff');
     clearWriteError('appRoutingEnabled');
     if (editRoute('appRoutingEnabled', stagingEnabled) === 'staged') {
-      stage({
+      void submitEdit({
         id: 'setting:appRoutingEnabled',
         kind: 'setting',
         label,
@@ -805,7 +805,7 @@ export function MobileRulesScreen(): ReactElement {
       toast.error(tr('appPolicy.masterToggleFail'));
       reportWriteError('appRoutingEnabled', tr('appPolicy.masterToggleFail'));
     }
-  }, [appMasterEnabled, stagingEnabled, stage, tr, clearWriteError, reportWriteError]);
+  }, [appMasterEnabled, stagingEnabled, submitEdit, tr, clearWriteError, reportWriteError]);
 
   /**
    * 策略选择器的候选：**一组策略 + 若干组按订阅折叠的节点**，与桌面 `PolicySelector` 同形
@@ -877,7 +877,7 @@ export function MobileRulesScreen(): ReactElement {
       const label = `${tr('home.stagedAppPolicy', { name })} · ${appPolicyOf(next).text}`;
       /* 配置暂存闸门：`appRules` 是 UserConfig 字段（Class B），条目按 **appId** 寻址。 */
       if (editRoute('appRules', stagingEnabled) === 'staged') {
-        stage({
+        void submitEdit({
           id: `appRule:${appId}`,
           kind: 'appRule',
           label,
@@ -902,7 +902,7 @@ export function MobileRulesScreen(): ReactElement {
       builtinPresetIds,
       appPolicyOf,
       stagingEnabled,
-      stage,
+      submitEdit,
       t,
       tr,
       clearWriteError,
@@ -929,22 +929,26 @@ export function MobileRulesScreen(): ReactElement {
       const label = tr('home.stagedAppRemove', { name });
       confirmTwice(`${APP_REMOVE_PREFIX}${appId}`, () => {
         if (editRoute('customAppPresets', stagingEnabled) === 'staged') {
-          stage({
+          const groupId = `appRemove:${appId}`;
+          const first: StagedEntry = {
             id: `appPreset:${appId}`,
             kind: 'appPreset',
             label,
             entityPath: ['customAppPresets', appId],
             nextValue: null,
-          });
-          if (hasRule) {
-            stage({
+            groupId,
+          };
+          const related: StagedEntry[] = hasRule
+            ? [{
               id: `appRule:${appId}`,
               kind: 'appRule',
               label: tr('home.stagedAppRuleRemove', { name }),
               entityPath: ['appRules', appId],
               nextValue: null,
-            });
-          }
+              groupId,
+            }]
+            : [];
+          void submitEdit(first, ...related);
           return;
         }
         void (async () => {
@@ -969,7 +973,7 @@ export function MobileRulesScreen(): ReactElement {
       builtinPresetIds,
       confirmTwice,
       stagingEnabled,
-      stage,
+      submitEdit,
       t,
       tr,
       clearWriteError,
@@ -1120,14 +1124,13 @@ export function MobileRulesScreen(): ReactElement {
          */
         const item = resItems.find((r) => r.id === id);
         if (editRoute('ruleResources', stagingEnabled) === 'staged') {
-          stage({
+          void submitEdit({
             id: `resource:${id}`,
             kind: 'resource',
             label: `${tr('common.delete')} ${item?.name ?? id}`,
             entityPath: ['ruleResources', id],
             nextValue: null,
           });
-          toast.info(tr('resources.deleteDone'));
           setSheetResId(null);
           return;
         }
@@ -1154,7 +1157,7 @@ export function MobileRulesScreen(): ReactElement {
       reportWriteError,
       resItems,
       stagingEnabled,
-      stage,
+      submitEdit,
     ],
   );
 

@@ -45,7 +45,7 @@ import {
   canPublishLocalImportParse,
   localImportPrimaryActionDisabled,
 } from '@/components/dialogs/local-import-parse-state';
-import { editRoute } from '@/lib/staged-config';
+import { editRoute, type StagedEntry } from '@/lib/staged-config';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -68,7 +68,7 @@ export function ImportFormPanel({
   const servers = useEffectiveServers();
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   const [content, setContent] = useState('');
   const [parsing, setParsing] = useState(false);
@@ -194,45 +194,34 @@ export function ImportFormPanel({
         return;
       }
       const staged = editRoute('servers', stagingEnabled) === 'staged';
+      let imported = admitted.length;
       if (staged) {
-        for (const node of admitted) {
+        const [first, ...related] = admitted.map((node): StagedEntry => {
           const entityId = node.id !== '' ? node.id : crypto.randomUUID();
-          stage({
+          return {
             id: `server:${entityId}`,
             kind: 'server',
             label: `${t('import.title')} ${node.name}`,
             entityPath: ['servers', entityId],
             nextValue: { ...node, id: entityId },
-          });
-        }
+          };
+        });
+        if (!first) return;
+        const result = await submitEdit(first, ...related);
+        if (result === 'ignored') return;
+        if (result === 'manual') imported = 0;
       } else {
         await api.server.addBulk(admitted);
         // 写后端即刷 store（快路径；广播是慢路径，表单已经关了而列表还空着）。
         await loadConfig(true);
       }
-      /*
-       * 🔴 成功回执走**全局 toast**，不走面板自持的 `notice`（2026-09-06 三条复审同时点名）。
-       *
-       * `setNotice` 与下一行的 `closeInstance` 在同一个 async 续段里，React 18 自动批处理 ⇒
-       * `MobileFormHost` 下一次提交时本实例已不在栈上、面板当帧卸载，那条回执**一帧都没画过**。
-       * 丢掉的不是客套话：`nodes.importSingletonSkipped` 里「跳过了 M 条」是**只有这里说得出**
-       * 的事实（撞组网单例槽被拒收），静默丢掉等于让用户以为 M 条也进来了。
-       * 桌面 `ImportDialog.tsx:299-316` 走的就是 toast，且那段注释逐字记着它当初修的正是
-       * 「导入完全静默」这个形态 —— 换成面板本地 notice 等于原样复发。
-       * 通道在批 1 已经真注入（`MobileApp` 挂了 `MobileToaster`，`setToastImpl` 有实现）。
-       * **失败仍留在面板内**（下面的 catch）：表还开着，错误该跟着表活着。
-       * staged 与直落盘分开说：前者一个字节都没落盘，说「已导入」会让用户跳过待应用条上的「保存」。
-       */
+      // Keep the skipped-node diagnostic visible after the form closes.
       if (rejected.length > 0) {
         toast.info(
-          t('nodes.importSingletonSkipped', { count: admitted.length, skipped: rejected.length }),
+          t('nodes.importSingletonSkipped', { count: imported, skipped: rejected.length }),
         );
-      } else {
-        toast.success(
-          staged
-            ? t('nodes.importStagedOk', { count: admitted.length })
-            : t('nodes.importOk', { count: admitted.length }),
-        );
+      } else if (!staged) {
+        toast.success(t('nodes.importOk', { count: imported }));
       }
       generation.current += 1;
       /* 产物一律落**自建**分组：当前 tab 停在某条订阅上时，不切过去屏上零变化（同桌面

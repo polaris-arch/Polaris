@@ -132,7 +132,7 @@ function RuleForm({ instanceId, base: openingBase, isEdit, preset, initialPlane 
   );
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   /** 删除腿：与规则列表的行内垃圾桶**同一个** hook（暂存分流/撤销/直落盘三条腿都在那里）。 */
   const deleteRule = useRuleDelete(initialPlane);
   // 平台判定用的值：AppShell 已把权威平台（tauri-plugin-os）落在 <html data-os> 上，这里读它即可，
@@ -341,7 +341,7 @@ function RuleForm({ instanceId, base: openingBase, isEdit, preset, initialPlane 
       base,
       initialPlane,
       stagingEnabled,
-      stage,
+      submitEdit,
       close: (outcome) => {
         close();
         if (outcome === 'saved') {

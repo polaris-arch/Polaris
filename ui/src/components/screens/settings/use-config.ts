@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { configApi, windowApi } from '@/ipc/api-client';
 import { toast } from '@/lib/error-handler';
+import type { StagedEntry } from '@/lib/staged-config';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
 import { useAppStore, effectiveConfigOf, acquireConfigSync, refreshConfig, beginConfigMutation, reconcileConfigMutation } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -135,7 +136,7 @@ function claimRestartKeys(serial: number, keys: AppRestartRequiredKey[]): AppRes
 export function useConfig(): UseConfigResult {
   const { t } = useTranslation();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const [seed] = useState(() => configFirstFrame(useAppStore.getState().config));
   const [config, setConfig] = useState<UserConfig | null>(seed.config);
@@ -215,12 +216,13 @@ export function useConfig(): UseConfigResult {
     const life = lifecycle.current;
     const isAlive = () => alive.current && lifecycle.current === life;
     const { staged, direct } = splitPatchByRoute(patch, stagingEnabled);
-    for (const [key, value] of staged) {
+    const [first, ...related] = staged.map(([key, value]): StagedEntry => {
       const labelKey = STAGED_SETTING_LABELS[key];
-      stage({ id: `setting:${key}`, kind: 'setting',
+      return { id: `setting:${key}`, kind: 'setting',
         label: t('home.stagedSetting', { key: labelKey ? t(labelKey) : key }),
-        entityPath: [key], nextValue: value });
-    }
+        entityPath: [key], nextValue: value };
+    });
+    if (first) await submitEdit(first, ...related);
     if (Object.keys(direct).length === 0) return;
     const id = ++operationId.current;
     const startSerial = edits.current.serial;
@@ -270,7 +272,7 @@ export function useConfig(): UseConfigResult {
       const keys = confirmedSerial === null ? pendingRestartKeys : claimRestartKeys(confirmedSerial, pendingRestartKeys);
       if (keys.length) promptAppRestart(keys, tRef.current);
     }
-  }, [apply, stage, stagingEnabled, t]);
+  }, [apply, submitEdit, stagingEnabled, t]);
 
   return { config: effectiveConfigOf(config, stagedEntries), loading, error, update, reload };
 }

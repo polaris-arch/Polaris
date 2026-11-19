@@ -339,7 +339,7 @@ describe('门 2 · 非延迟排序时选择器返回稳定引用', () => {
   it('四条删除/回退腿在**点击当刻**取最新快照，不吃闭包里的陈旧表', () => {
     // 父层不再常订整表 ⇒ 闭包里捕获的会是上一次渲染时的旧值：用户刚测完速就删节点，
     // 兜底出口会选到过期的「最快」。故暂存删除回退与三条即时腿一律 getState() 现取。
-    for (const [source, leg] of [[NODES, 'stageServerDeletions'], [DELETION, 'deleteNode'], [DELETION, 'deleteBatch']] as const) {
+    for (const [source, leg] of [[NODES, 'buildServerDeletionEntries'], [DELETION, 'deleteNode'], [DELETION, 'deleteBatch']] as const) {
       expect(source.includes('useLatencyStore.getState().latencyMap'), `${leg} 没有现取延迟快照`).toBe(true);
     }
   });
@@ -360,7 +360,7 @@ function nodeActionHarness(visibleServers: ServerConfig[], initial: Set<string>)
       servers: visibleServers, visibleServers, selectedIds: initial,
       setSelectedIds: update => { selected = typeof update === 'function' ? update(selected) : update; },
       t: ((key: string) => key) as TFunction,
-      stagingEnabled: false, stage: () => {}, openDialog: () => {},
+      stagingEnabled: false, submitEdit: async () => 'ignored', openDialog: () => {},
     });
     return null;
   }

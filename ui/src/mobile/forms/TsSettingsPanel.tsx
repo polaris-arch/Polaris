@@ -98,7 +98,7 @@ export function TsSettingsPanel({
   const loadConfig = useAppStore((s) => s.loadConfig);
   const tailscaleStatuses = useAppStore((s) => s.tailscaleStatuses);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const interfaces = useNetworkInterfaces();
 
@@ -281,15 +281,16 @@ export function TsSettingsPanel({
       applyOnDemand(next, draft.onDemand);
       // 暂存灰度的**唯一**闸门（与桌面同一个 `editRoute`）。
       if (editRoute('servers', stagingEnabled) === 'staged') {
-        stage({
+        const result = await submitEdit({
           id: `server:${node.id}`,
           kind: 'server',
           label: `${t('ts.settingsTitle')} ${next.name}`,
           entityPath: ['servers', node.id],
           nextValue: next,
         });
+        if (result === 'ignored') return;
         closeInstance(instanceId);
-        return; // 零 IPC 写、零磁盘写
+        return;
       }
       await api.server.update(next);
       await loadConfig(true);

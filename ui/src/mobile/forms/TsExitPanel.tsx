@@ -57,7 +57,7 @@ export function TsExitPanel({
   const servers = useEffectiveServers();
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   const node = servers.find((s) => s.id === serverId);
   const savedExit = node?.tailscaleSettings?.exitNode ?? '';
@@ -105,13 +105,14 @@ export function TsExitPanel({
       const draft: FormValues = { ...initTsDraft(node), exitNode: exit, exitNodeCustom: custom };
       const next = { ...node, tailscaleSettings: buildTsSettings(node.tailscaleSettings, draft) };
       if (editRoute('servers', stagingEnabled) === 'staged') {
-        stage({
+        const result = await submitEdit({
           id: `server:${node.id}`,
           kind: 'server',
           label: `${t('ts.exitNode')} ${node.name}`,
           entityPath: ['servers', node.id],
           nextValue: next,
         });
+        if (result === 'ignored') return;
         closeInstance(instanceId);
         return;
       }

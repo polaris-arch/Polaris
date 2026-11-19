@@ -133,7 +133,7 @@ export function LogsScreen() {
   const diskConfig = useAppStore((s) => s.config);
   const saveConfig = useAppStore((s) => s.saveConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const privacyMode = useAppStore((s) => s.privacyMode);
   // C18 实时日志脱敏偏好（localStorage，与隐私锁正交）：开 → 常态对域名/IP 打码；隐私锁开时恒脱敏。
   const redactLogs = useLogRedactStore((s) => s.redactLogs);
@@ -528,14 +528,14 @@ export function LogsScreen() {
       if (!diskConfig) return;
       // 连接中先暂存；保存时由共用热应用流程判定核是否已接收级别。
       if (editRoute('logLevel', stagingEnabled) === 'staged') {
-        stage({
+        void submitEdit({
           id: 'setting:logLevel',
           kind: 'setting',
           label: `${t('logs.currentLevel')} ${v}`,
           entityPath: ['logLevel'],
           nextValue: v,
         });
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        return;
       }
       try {
         await saveConfig({ logLevel: v });
@@ -545,7 +545,7 @@ export function LogsScreen() {
         toast.error(t('common.saveFailed'));
       }
     },
-    [diskConfig, saveConfig, stagingEnabled, stage, t]
+    [diskConfig, saveConfig, stagingEnabled, submitEdit, t]
   );
 
   /** 会话级诊断：只改本次 Rust 进程的有效门槛，绝不走 saveConfig / staged config。 */

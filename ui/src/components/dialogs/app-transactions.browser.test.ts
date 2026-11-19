@@ -856,7 +856,7 @@ function MobileSubscriptionEdit() {
 function Selection() {
   const [selectedIds, setSelectedIds] = useState(new Set(['a', 'b']));
   const [visible, setVisible] = useState([{ id: 'c' }, { id: 'd' }]);
-  const actions = useNodeActions({ servers: visible, visibleServers: visible, selectedIds, setSelectedIds, t: (key) => key, stagingEnabled: true, stage: () => {}, openDialog: () => {} });
+  const actions = useNodeActions({ servers: visible, visibleServers: visible, selectedIds, setSelectedIds, t: (key) => key, stagingEnabled: true, submitEdit: async () => 'ignored', openDialog: () => {} });
   test.selected = () => [...selectedIds].sort();
   test.visible = (ids) => setVisible(ids.map(id => ({ id })));
   return <><button id="select-all" onClick={actions.selectAll}>Select all</button><NodesBatchBar t={key => key} selectedIds={selectedIds} visibleServers={visible} selectAll={actions.selectAll} testSelected={() => {}} testing={false} isSubTab copyLinksBatch={() => {}} confirmArmed={null} nodeDeletion={{ deleteBatch: () => {} }} exitBatch={() => {}} /></>;

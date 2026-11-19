@@ -30,7 +30,7 @@ import { admitMeshSingletons } from '@/domain/endpoint-routes';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
-import { editRoute } from '@/lib/staged-config';
+import { editRoute, type StagedEntry } from '@/lib/staged-config';
 import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
@@ -85,7 +85,7 @@ export function ImportDialog({ instanceId, onAdded }: { instanceId: string; onAd
   // 展示面：单例槽判据必须含暂存节点 —— 否则暂存了一个 WARP 还能再导入第二个，重放后配置非法。
   const servers = useEffectiveServers();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
   const loadConfig = useAppStore((s) => s.loadConfig);
 
   const [source, setSource] = useState<Source>('share');
@@ -270,18 +270,23 @@ export function ImportDialog({ instanceId, onAdded }: { instanceId: string; onAd
       // 是**纯 `servers` 写**、无副作用 ⇒ 走默认腿。批量导入 ⇒ 逐节点一条条目：整批一条的话
       // 「逐条撤销」就退化成「要么全留要么全撤」，而这正是导入最需要挑挑拣拣的场景。
       const staged = editRoute('servers', stagingEnabled) === 'staged';
+      let imported = admitted.length;
       if (staged) {
-        for (const node of admitted) {
+        const [first, ...related] = admitted.map((node): StagedEntry => {
           // 同 NodeDialog：后端只在落盘那一刻补 id，而条目现在就需要稳定的实体寻址键。
           const entityId = node.id ? node.id : crypto.randomUUID();
-          stage({
+          return {
             id: `server:${entityId}`,
             kind: 'server',
             label: `${t('import.title')} ${node.name}`,
             entityPath: ['servers', entityId],
             nextValue: { ...node, id: entityId },
-          });
-        }
+          };
+        });
+        if (!first) return;
+        const result = await submitEdit(first, ...related);
+        if (result === 'ignored') return;
+        if (result === 'manual') imported = 0;
       } else {
         await api.server.addBulk(admitted);
         // 写后端即刷 store（同 NodeDialog/WgDialog/SubDialog/TsSettingsDialog）：`store.servers`
@@ -290,27 +295,15 @@ export function ImportDialog({ instanceId, onAdded }: { instanceId: string; onAd
         // 弹出，节点网格却还空着。快路径与其余四个写节点的弹窗对齐，不在这里单开一种时序。
         await loadConfig(true);
       }
-      // 回执。此前**只有**撞单例槽那一条腿会说话，而那条腿今天恒不命中（三个解析器都跳过
-      // wireguard，见上方闸门注释）⇒ 实际形态是「导入完全静默」：弹窗一关，用户手上唯一的
-      // 计数是刚刚消失的那颗按钮。
-      // staged 与直落盘必须分开说：前者一个字节都没落盘，说「已导入」会让用户跳过条上的「保存」。
-      // `rejected>0 && staged` 这一格今天不可达（闸门恒不命中），不为它再铺一对键；`endpoints[]`
-      // 那条解析腿一旦接通，这里要连同上面的闸门一起改。
       if (rejected.length > 0) {
         toast.info(
           t('nodes.importSingletonSkipped', {
-            count: admitted.length,
+            count: imported,
             skipped: rejected.length,
           })
         );
-      } else {
-        toast.success(
-          staged
-            ? t('nodes.importStagedOk', {
-                count: admitted.length,
-              })
-            : t('nodes.importOk', { count: admitted.length })
-        );
+      } else if (!staged) {
+        toast.success(t('nodes.importOk', { count: imported }));
       }
       onAdded?.();
       closeImportDialog();

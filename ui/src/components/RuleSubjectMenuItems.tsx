@@ -44,7 +44,7 @@ export function RuleSubjectMenuItems({
   const openDialog = useDialogStore((state) => state.open);
   const loadConfig = useAppStore((state) => state.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((state) => state.stage);
+  const submitEdit = useStagedConfigStore((state) => state.submit);
   const rules = useEffectiveRules();
 
   const coverage = useMemo(() => analyzeRuleCoverage(rules, subject), [rules, subject]);
@@ -71,7 +71,7 @@ export function RuleSubjectMenuItems({
       const label = next.remarks?.trim() || t(ruleTypeNameKey(next.type));
       try {
         if (editRoute('trafficRules', stagingEnabled) === 'staged') {
-          stage({
+          void submitEdit({
             id: `rule:${next.id}`,
             kind: 'rule',
             label: `${t('rules.editTitle')} ${label}`,
@@ -81,13 +81,13 @@ export function RuleSubjectMenuItems({
         } else {
           await api.rules.update(next, 'route', base);
           void loadConfig(true);
+          toast.success(t('rules.appendDone', { value: subject.value, rule: label }));
         }
-        toast.success(t('rules.appendDone', { value: subject.value, rule: label }));
       } catch {
         toast.error(t('rules.appendFail'));
       }
     },
-    [subject, t, stagingEnabled, stage, loadConfig],
+    [subject, t, stagingEnabled, submitEdit, loadConfig],
   );
 
   const pickExisting = (

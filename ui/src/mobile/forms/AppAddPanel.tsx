@@ -82,7 +82,7 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   const [name, setName] = useState('');
   const [emoji, setEmoji] = useState<string>(DEFAULT_EMOJI);
@@ -271,23 +271,23 @@ export function AppAddPanel({ instanceId }: { instanceId: string }): ReactElemen
       ...(pkgSel.size > 0 ? { packageNames: [...pkgSel] } : {}),
     };
 
-    /* 暂存闸门：`customAppPresets` 是 UserConfig 字段（Class B），条目按预设 id 寻址。 */
-    if (editRoute('customAppPresets', stagingEnabled) === 'staged') {
-      stage({
-        id: `appPreset:${preset.id}`,
-        kind: 'appPreset',
-        label: `${tr('appAdd.title')} ${preset.name}`,
-        entityPath: ['customAppPresets', preset.id],
-        nextValue: preset,
-      });
-      closeInstance(instanceId);
-      return;
-    }
-
     setSubmitting(true);
     setNotice(undefined);
     void (async () => {
       try {
+        /* 暂存闸门：`customAppPresets` 是 UserConfig 字段（Class B），条目按预设 id 寻址。 */
+        if (editRoute('customAppPresets', stagingEnabled) === 'staged') {
+          const result = await submitEdit({
+            id: `appPreset:${preset.id}`,
+            kind: 'appPreset',
+            label: `${tr('appAdd.title')} ${preset.name}`,
+            entityPath: ['customAppPresets', preset.id],
+            nextValue: preset,
+          });
+          if (result === 'ignored') return;
+          closeInstance(instanceId);
+          return;
+        }
         await useAppStore
           .getState()
           .mutateConfigEntities([

@@ -4,7 +4,7 @@ import type { DialogDesc } from '@/components/dialogs/dialog-store';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import { refreshSubscriptionWithToast } from '@/domain/subscription-refresh';
 import { api } from '@/ipc';
-import { editRoute } from '@/lib/staged-config';
+import { editRoute, type StagedEntry } from '@/lib/staged-config';
 import { toast } from '@/lib/error-handler';
 import { useNavStore } from '@/store/nav-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -13,11 +13,11 @@ import { subDeleteNodeCount, type SubMenuItem } from './nodes-logic';
 
 interface Args {
   diskServers: ServerConfig[];
-  stageServerDeletions: (
+  buildServerDeletionEntries: (
     targets: readonly ServerConfig[],
     removedIds: ReadonlySet<string>,
     groupId?: string
-  ) => void;
+  ) => StagedEntry[];
   openDialog: (dialog: DialogDesc) => void;
   closeDialog: () => void;
   t: TFunction;
@@ -25,13 +25,13 @@ interface Args {
 
 export function useNodeSubscriptionActions({
   diskServers,
-  stageServerDeletions,
+  buildServerDeletionEntries,
   openDialog,
   closeDialog,
   t,
 }: Args) {
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((state) => state.stage);
+  const submitEdit = useStagedConfigStore((state) => state.submit);
   const enterSettings = useNavStore((state) => state.enterSettings);
 
   const refreshSub = useCallback(
@@ -59,16 +59,14 @@ export function useNodeSubscriptionActions({
               );
               const removedIds = new Set(targets.map((server) => server.id));
               const groupId = `subscriptionDelete:${crypto.randomUUID()}`;
-              stage({
+              void submitEdit({
                 id: `subscription:${sub.id}`,
                 kind: 'subscription',
                 label: `${t('common.delete')} ${sub.name}`,
                 entityPath: ['subscriptions', sub.id],
                 nextValue: null,
                 groupId,
-              });
-              stageServerDeletions(targets, removedIds, groupId);
-              toast.info(t('nodes.subDeleteOk', { count }));
+              }, ...buildServerDeletionEntries(targets, removedIds, groupId));
               return;
             }
             void api.subscription
@@ -86,8 +84,8 @@ export function useNodeSubscriptionActions({
       closeDialog,
       diskServers,
       openDialog,
-      stage,
-      stageServerDeletions,
+      submitEdit,
+      buildServerDeletionEntries,
       stagingEnabled,
       t,
     ]

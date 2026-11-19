@@ -26,8 +26,12 @@ import { formatConditionValues } from './rule-cond';
  */
 const t = ((key: string) => key) as TFunction;
 
-function args(over: Partial<RuleSubmitArgs>): { a: RuleSubmitArgs; staged: StagedEntry[] } {
+function args(over: Partial<RuleSubmitArgs>): { a: RuleSubmitArgs; staged: StagedEntry[]; submitEdit: ReturnType<typeof vi.fn<RuleSubmitArgs["submitEdit"]>> } {
   const staged: StagedEntry[] = [];
+  const submitEdit = vi.fn<RuleSubmitArgs["submitEdit"]>(async (first, ...related) => {
+    staged.push(first, ...related);
+    return 'manual';
+  });
   const a: RuleSubmitArgs = {
     t,
     conds: [{ t: 'domainSuffix', v: 'corp.example' }],
@@ -47,13 +51,13 @@ function args(over: Partial<RuleSubmitArgs>): { a: RuleSubmitArgs; staged: Stage
     isEdit: false,
     initialPlane: 'route',
     stagingEnabled: true,
-    stage: (entry) => staged.push(entry),
+    submitEdit,
     close: () => {},
     loadConfig: () => {},
     setSubmitting: () => {},
     ...over,
   };
-  return { a, staged };
+  return { a, staged, submitEdit };
 }
 
 const base: Rule = {
@@ -145,6 +149,7 @@ describe('新建带场景的规则插到最前（spec §3.4-4，不改排序协�
     const x = args({ networkProfileId: 'np-corp', planeOrder });
     await submitRule(x.a);
     expect(x.staged).toHaveLength(2);
+    expect(x.submitEdit).toHaveBeenCalledExactlyOnceWith(...x.staged);
     const newId = (x.staged[0].nextValue as Rule).id;
     expect(x.staged[1]).toMatchObject({ id: 'order:routeRuleOrder', entityPath: ['routeRuleOrder'] });
     expect(x.staged[1].nextValue).toEqual([newId, 'c', 'a', 'b']);
@@ -339,7 +344,7 @@ it.each(['stopping', 'entries'] as const)('rechecks staging after %s changes dur
   await operation;
   expect(ipc.add).not.toHaveBeenCalled();
   expect(request.staged).toHaveLength(1);
-  expect(close).toHaveBeenCalledExactlyOnceWith('staged');
+  expect(close).toHaveBeenCalledExactlyOnceWith('submitted');
 });
 it('unavailable syntax is actionable and distinct from invalid', async () => {
   const { toast } = await import('@/lib/error-handler');

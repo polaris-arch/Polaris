@@ -381,9 +381,11 @@ function P() {
 
   it('🔴 正面腿：导入成功路径上真的有一条走全局通道的回执（否则①会被「回执删光」骗过）', () => {
     const src = strip(read('./ImportFormPanel.tsx'));
-    for (const key of ['nodes.importSingletonSkipped', 'nodes.importOk', 'nodes.importStagedOk']) {
+    for (const key of ['nodes.importSingletonSkipped', 'nodes.importOk']) {
       expect(src, `导入回执少了 ${key} —— 那不是修通道，是把话删了`).toContain(key);
     }
+    expect(src).toContain('await submitEdit(first, ...related)');
+    expect(src).not.toContain('nodes.importStagedOk');
     expect(src, '导入成功没有落到全局 toast（面板马上就卸载了，本地 notice 画不出来）').toMatch(
       /toast\.(?:success|info)\(/,
     );

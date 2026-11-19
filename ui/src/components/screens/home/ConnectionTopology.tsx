@@ -61,7 +61,7 @@ interface ConnectionTopologyProps {
 function ConnectionTopologyView({ disconnected }: ConnectionTopologyProps) {
   const { t } = useTranslation();
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -264,7 +264,7 @@ function ConnectionTopologyView({ disconnected }: ConnectionTopologyProps) {
         // 新增时前端自铸 id（后端只在落盘那一刻发 id，而条目现在就要一个稳定的实体寻址键）。
         if (editRoute('trafficRules', stagingEnabled) === 'staged') {
           const entityId = crypto.randomUUID();
-          stage({
+          void submitEdit({
             id: `rule:${entityId}`,
             kind: 'rule',
             label: `${t('rules.newTitle')} ${subject.value}`,
@@ -273,13 +273,13 @@ function ConnectionTopologyView({ disconnected }: ConnectionTopologyProps) {
           });
         } else {
           await api.rules.add(rule, 'route');
+          toast.success(t('home.ruleAdded', { value: subject.value, action: actionLabel }));
         }
-        toast.success(t('home.ruleAdded', { value: subject.value, action: actionLabel }));
       } catch {
         toast.error(t('home.ruleAddFail'));
       }
     },
-    [t, stagingEnabled, stage]
+    [t, stagingEnabled, submitEdit]
   );
 
   const hosts = displayAggregate?.hosts ?? [];

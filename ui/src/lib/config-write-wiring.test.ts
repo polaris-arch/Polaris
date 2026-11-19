@@ -1189,7 +1189,7 @@ describe('T3：每一处 staged 调用点都必须在暂存闸门辖区内（按
     expect(noStore, '「stage 由调用方注入」的豁免表与实况对不上').toEqual([...STAGE_INJECTED_FILES]);
     // 正面断言：豁免的前提是它**确实还在造暂存条目**，只是不持有 store。
     for (const f of STAGE_INJECTED_FILES) {
-      expect(SOURCE.get(f)!, `${f} 不再引 StagedEntry —— 豁免的前提没了`).toMatch(/\bStagedEntry\b/);
+      expect(SOURCE.get(f)!, `${f} 不再引 StagedEntry —— 豁免的前提没了`).toMatch(/\b(?:StagedEntry|SubmitStagedEdit)\b/);
     }
   });
 

@@ -18,7 +18,7 @@ import { realityUtlsError } from '@/domain/utls';
  * 提交走真后端：新增 `api.server.add` / 编辑 `api.server.update`（src-tauri/src/commands/server.rs）。
  *
  * **配置暂存灰度入口（P3）**：`handleSubmit` 里经 `editRoute('servers', …)` 分流——总开关开且未命中
- * 豁免/绕过时，提交只产生一条 staged 条目（零 IPC 写、零磁盘写）；否则走上面那条今天的直落盘腿。
+ * 豁免/绕过时，交共享配置事务处理；否则走直落盘腿。
  * 开关默认关，故当前行为与接入前逐字节相同。判定只此一处，不得在别处再写第二个 if。
  * 脏态取消 → 嵌套 confirm（放弃更改，复用 D1 ConfirmDialog）。
  */
@@ -99,7 +99,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
   const closeInstance = useDialogStore((s) => s.closeInstance);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
-  const stage = useStagedConfigStore((s) => s.stage);
+  const submitEdit = useStagedConfigStore((s) => s.submit);
 
   // 同步初始化（R1）：挂载即带正确值，绝不挂载后 reset。
   const initProto: NodeProto =
@@ -369,15 +369,16 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
         // 稳定的实体寻址键（同一节点重复编辑要覆盖同一条）。带 id 提交后端照收（`ensure_server_id`
         // 见 id 非空即放行）。
         const entityId = full.id !== '' ? full.id : crypto.randomUUID();
-        stage({
+        const result = await submitEdit({
           id: `server:${entityId}`,
           kind: 'server',
           label: `${isEdit ? t('node.editTitle') : t('node.addTitle')} ${meta.name}`,
           entityPath: ['servers', entityId],
           nextValue: { ...full, id: entityId },
         });
+        if (result === 'ignored') return;
         closeInstance(instanceId);
-        return; // 零 IPC 写、零磁盘写（FR-1）
+        return;
       }
 
       if (isEdit && base) {

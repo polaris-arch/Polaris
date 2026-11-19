@@ -5,7 +5,7 @@ import type { DialogDesc } from '@/components/dialogs/dialog-store';
 import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { editRoute } from '@/lib/staged-config';
-import type { StagedEntry } from '@/lib/staged-config';
+import type { SubmitStagedEdit } from '@/lib/staged-config';
 import { canCloneServer, meshSingletonConflict } from '@/domain/endpoint-routes';
 import { editDialogFor } from './node-edit-routing';
 
@@ -13,7 +13,7 @@ interface Args {
   servers: ServerConfig[];
   t: TFunction;
   stagingEnabled: boolean;
-  stage: (entry: StagedEntry) => void;
+  submitEdit: SubmitStagedEdit;
   openDialog: (dialog: DialogDesc) => void;
   selectedIds: ReadonlySet<string>;
   setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>;
@@ -25,7 +25,7 @@ export function useNodeActions({
   servers,
   t,
   stagingEnabled,
-  stage,
+  submitEdit,
   openDialog,
   selectedIds,
   setSelectedIds,
@@ -80,7 +80,7 @@ export function useNodeActions({
         // 删除不再按节点类型分流：TS state / WARP 注销也由 Apply 的持久删除事务延迟执行。
         if (editRoute('servers', stagingEnabled) === 'staged') {
           const entityId = crypto.randomUUID();
-          stage({
+          void submitEdit({
             id: `server:${entityId}`,
             kind: 'server',
             label: t('home.stagedNodeClone', { name: cloneName }),
@@ -98,7 +98,7 @@ export function useNodeActions({
         toast.error(t('nodes.cloneFail'));
       }
     },
-    [servers, t, stagingEnabled, stage]
+    [servers, t, stagingEnabled, submitEdit]
   );
 
   /* 卡上「编辑」。此前是调用点的内联箭头 —— 那一个箭头就足以让**每张**卡的 `memo` 恒失效

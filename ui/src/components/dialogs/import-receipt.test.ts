@@ -7,9 +7,7 @@
  * 把三选一的判断抽成纯函数再单测，测到的是**方法体**；而缺陷长在**调用点**上 ——
  * 纯函数留着不调用，单测照样全绿。故本门直接读 `ImportDialog.tsx` 的 AST 断言接线。
  *
- * 第二条不变量是**诚实**：`editRoute('servers') === 'staged'` 时一个字节都没落盘，
- * 回执说「已导入」会让用户跳过待应用条上的「保存」。故三元的两臂与 staged 的对应关系
- * 必须锁死方向 —— 只断言「两个键都出现过」是不够的，把两臂对调它照样绿。
+ * 一批节点只能交一次共享提交，旧直写路径仍只在落盘后发自己的成功回执。
  */
 
 import { describe, expect, it } from 'vitest';
@@ -66,26 +64,17 @@ function callsTo(root: ts.Node, name: string): ts.CallExpression[] {
 }
 
 describe('导入回执接线', () => {
-  it('成功腿必须发一条 toast.success，且是 staged 三元', () => {
-    const successCalls = callsTo(HANDLE_IMPORT, 'toast.success');
-    expect(successCalls.length, 'handleImport 成功后必须给回执（此前直接 close，用户零反馈）').toBe(
-      1
-    );
+  it('routes a node batch through one shared submission and reserves the local success toast for direct saves', () => {
+    const receipts = callsTo(HANDLE_IMPORT, 'toast.success');
+    expect(receipts).toHaveLength(1);
+    expect(textOf(receipts[0])).toContain('nodes.importOk');
+    const direct = collect(HANDLE_IMPORT, ts.isIfStatement)
+      .find(node => textOf(node.expression) === '!staged');
+    expect(direct && callsTo(direct.thenStatement, 'toast.success')).toEqual(receipts);
 
-    const arg = successCalls[0].arguments[0];
-    expect(
-      arg && ts.isConditionalExpression(arg),
-      '回执必须按 staged 分叉：直落盘与暂存是两件事'
-    ).toBe(true);
-
-    const cond = arg as ts.ConditionalExpression;
-    expect(textOf(cond.condition), '分叉判据必须是 staged 本身').toBe('staged');
-    // 方向锁死：两臂对调 → 本断言转红。
-    expect(textOf(cond.whenTrue), 'staged 腿必须用 importStagedOk（不能说「已导入」）').toContain(
-      'nodes.importStagedOk'
-    );
-    expect(textOf(cond.whenFalse), '直落盘腿必须用 importOk').toContain('nodes.importOk');
-    expect(textOf(cond.whenTrue), 'staged 腿不得混入 importOk').not.toContain("'nodes.importOk'");
+    const submissions = callsTo(HANDLE_IMPORT, 'submitEdit');
+    expect(submissions.map(textOf)).toEqual(['submitEdit(first, ...related)']);
+    expect(textOf(HANDLE_IMPORT)).not.toContain('nodes.importStagedOk');
   });
 
   it('staged 判据只算一次，两处消费同一个值', () => {
