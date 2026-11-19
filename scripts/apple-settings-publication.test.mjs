@@ -178,6 +178,10 @@ test('native bridge retains real NE callbacks and PacketTunnel consumes the comp
     assert.match(text, /OTHER_SWIFT_FLAGS/);
     assert.ok(text.includes('@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args'));
     assert.doesNotMatch(text, /-D POLARIS_NATIVE_TUN_V1/);
+    assert.match(text, /apple-admission\.mjs/);
+    assert.match(text, /--tls-link verify-installed/);
+    assert.match(text, /--tls-link install/);
+    assert.doesNotMatch(text, / prepare/);
   }
   const target = section(pbx, '78552A5C57D5DDA9797F1E67 /* polaris_PacketTunnel */ =', 'buildRules');
   assert.match(target, /Verify iOS Core[\s\S]*Sources/);
@@ -185,6 +189,16 @@ test('native bridge retains real NE callbacks and PacketTunnel consumes the comp
   assert.match(phase, /alwaysOutOfDate = 1/);
   assert.ok(phase.includes('$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args'));
   assert.equal(pbx.split('OTHER_SWIFT_FLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisNativeTunCompiler.args",);').length - 1, 2);
+
+  const builder = readFileSync(new URL('./mobile-core/build_apple_app.py', import.meta.url), 'utf8');
+  const phases = ["'original-tls-prepare.log'", "timed_phase('app-extension-archive'",
+    "'original-tls-final-verify.log'", "timed_phase('final-carrier-inspection'"];
+  let previous = -1;
+  for (const name of phases) {
+    const position = builder.indexOf(name);
+    assert.ok(position > previous, `Apple parent phase is absent or out of order: ${name}`);
+    previous = position;
+  }
 });
 
 // Inert declarations from the pinned gomobile ABI fixture, including the
@@ -309,6 +323,9 @@ test('the Apple build CLI binds TLS and native TUN inputs to each selected devic
 printf '%s\\n' "$1" >> "$FIXTURE_NATIVE_TRACE"
 test -n "$FIXTURE_BINARY" || exit 97
 if [ "$#" -eq 4 ] && [ "$1 $2 $3" = "nm --no-llvm-bc -gU" ]; then
+  if [ "$4" = "$FIXTURE_BINARY" ] && [ -n "$FIXTURE_RESERVATION_PROBE" ]; then
+    exec "$FIXTURE_NODE" "$FIXTURE_RESERVATION_PROBE"
+  fi
   if [ "$4" = "$FIXTURE_BINARY" ]; then printf 'T %s\\n' "$FIXTURE_SYMBOL"; exit; fi
   if [ "$4" = "$TARGET_BUILD_DIR/$EXECUTABLE_PATH" ]; then
     printf 'T %s\\n' "\${FIXTURE_FINAL_NM-$FIXTURE_SYMBOL}"; exit
@@ -335,12 +352,13 @@ exit 97
           FIXTURE_BINARY: join(framework, selected, 'Libbox.framework', 'Versions', 'A', 'Libbox'),
           FIXTURE_SYMBOL: tlsPresent ? tlsSymbol : '_LibboxVersion',
           FIXTURE_NATIVE_TRACE: nativeTrace,
+          FIXTURE_RESERVATION_PROBE: '',
           TARGET_BUILD_DIR: root, EXECUTABLE_PATH: 'extension' };
-        const invoke = (action, env, parent = false) => {
+        const invoke = (action, env, parent = false, reservation = parent ? '3' : '999999') => {
           const result = spawnSync(parent ? 'python3' : process.execPath,
             parent ? ['-B', script, action] : [hook, '--tls-link', action], { encoding: 'utf8', timeout: 30_000,
-            env: { ...env, POLARIS_BUILD_RESERVATION_FD: parent ? '3' : '999999' },
-            stdio: ['ignore', 'pipe', 'pipe', parent ? fd : 'ignore'] });
+            env: { ...env, POLARIS_BUILD_RESERVATION_FD: reservation ?? undefined },
+            stdio: ['ignore', 'pipe', 'pipe', parent && reservation === '3' ? fd : 'ignore'] });
           assert.ifError(result.error);
           return result;
         };
@@ -420,8 +438,43 @@ exit 97
           renameSync(movedFramework, frameworkPath);
         }
         writeFileSync(nativeTrace, '');
-        const preparation = invoke('prepare', parentEnv, true);
+        const reservationProbe = platform === 'iphoneos' && present;
+        const prepareEnv = { ...parentEnv };
+        if (reservationProbe) {
+          for (const [reservation, reason] of [[null, /admitted parent reservation/], ['999999', /OSError: \[Errno 9\]/]]) {
+            const result = invoke('prepare', parentEnv, true, reservation);
+            assert.equal(result.status, 1, result.stderr);
+            assert.match(result.stderr, reason);
+            assert.equal(readFileSync(nativeTrace, 'utf8'), '');
+            assert.throws(() => readFileSync(join(prepared, receiptName)), { code: 'ENOENT' });
+          }
+          const probe = join(root, 'reservation-probe.mjs');
+          writeFileSync(probe, `import assert from 'node:assert/strict';
+import { appendFileSync, fstatSync, readSync, statSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
+const fd = Number(process.env.POLARIS_BUILD_RESERVATION_FD);
+assert.equal(fd, 3);
+const inherited = fstatSync(fd), ledger = statSync(process.env.FIXTURE_RESERVATION_LEDGER);
+assert.deepEqual([inherited.dev, inherited.ino], [ledger.dev, ledger.ino]);
+const raw = Buffer.alloc(8192), deadline = performance.now() + 3000;
+for (;;) {
+  assert.ok(performance.now() < deadline, 'native child group was never registered in the inherited ledger');
+  const observed = raw.toString('utf8', 0, readSync(fd, raw, 0, raw.length, 0));
+  let groups;
+  try { ({ groups } = JSON.parse(observed)); }
+  catch (cause) { if (!(cause instanceof SyntaxError)) throw cause; }
+  if (groups?.includes(process.pid)) break;
+  await delay(10);
+}
+appendFileSync(process.env.FIXTURE_NATIVE_TRACE, 'reservation group seen\\n');
+console.log('T ' + process.env.FIXTURE_SYMBOL);
+`);
+          Object.assign(prepareEnv, { FIXTURE_NODE: process.execPath, FIXTURE_RESERVATION_PROBE: probe,
+            FIXTURE_RESERVATION_LEDGER: ledger });
+        }
+        const preparation = invoke('prepare', prepareEnv, true);
         assert.equal(preparation.status, 0, preparation.stderr);
+        if (reservationProbe) assert.deepEqual(JSON.parse(readFileSync(ledger)).groups, []);
         const expected = Buffer.from(present ? tunDefine : '');
         const preparedReceipt = join(prepared, receiptName);
         const generatedReceipt = readFileSync(preparedReceipt);
@@ -455,7 +508,9 @@ exit 97
           scope: 'actual-final-PacketTunnel-static-link', capabilityPresent: tlsPresent, nativeTunHeaderABIAvailable: present,
           executable: { bytes: executable.length, sha256: sha256(executable) }, loadedQueryExecuted: false, devicePassed: false,
         });
-        assert.equal(readFileSync(nativeTrace, 'utf8'), tlsPresent ? 'nm\nnm\ndyld_info\n' : 'nm\n');
+        assert.equal(readFileSync(nativeTrace, 'utf8'), tlsPresent
+          ? `nm\n${reservationProbe ? 'reservation group seen\n' : ''}nm\ndyld_info\n`
+          : 'nm\n');
         if (platform === 'iphoneos' && present) {
           for (const [changes, reason] of [
             [{ FIXTURE_FINAL_NM: '_LibboxVersion', FIXTURE_FINAL_EXPORT: tlsSymbol }, /final PacketTunnel stripped/],
