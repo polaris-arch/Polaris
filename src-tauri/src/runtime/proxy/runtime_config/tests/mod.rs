@@ -526,12 +526,15 @@ async fn hot_config_edit_without_pairing_never_writes_or_publishes_the_candidate
     let edit = prepare_log_edit(&rt);
     let owner = StagedSaveOwner::capture(&rt, edit.revision);
     assert!(rt.runtime_config_apply.lock().unwrap().restart.is_some());
-    assert!(rt.hot_config_edit_isolated(&edit.previous, owner));
-    assert!(!rt.hot_config_edit_isolated(&edit.previous, prior_owner));
+    assert!(rt.hot_config_edit_blocker(&edit.previous, owner).is_none());
+    assert!(matches!(
+        rt.hot_config_edit_blocker(&edit.previous, prior_owner),
+        Some(HotConfigEditOutcome::NeedsManual),
+    ));
     assert_ne!(edit.candidate, edit.previous);
     assert!(matches!(
         rt.apply_hot_config_edit(&edit).await.unwrap(),
-        HotConfigEditOutcome::NeedsManual,
+        HotConfigEditOutcome::Retryable,
     ));
     assert_eq!(rt.config.saved_revision(), edit.revision);
     assert_eq!(rt.config.current().unwrap(), running);

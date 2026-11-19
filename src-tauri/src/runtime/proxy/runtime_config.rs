@@ -469,6 +469,8 @@ pub(crate) enum HotConfigEditOutcome {
         revision: u64,
     },
     NeedsManual,
+    Retryable,
+    Rejected,
     Conflict,
 }
 
@@ -1618,9 +1620,9 @@ impl ProxyRuntime {
     ) -> Result<HotConfigEditOutcome, polaris_store::StoreError> {
         let _serial = self.switch_serial.lock().await;
         let owner = StagedSaveOwner::capture(self, edit.revision);
-        let not_committed = || {
+        let not_committed = |outcome| {
             if self.saved_revision_matches(Some(edit.revision)) {
-                HotConfigEditOutcome::NeedsManual
+                outcome
             } else {
                 HotConfigEditOutcome::Conflict
             }
@@ -1631,7 +1633,7 @@ impl ProxyRuntime {
                 && !self.gate.is_busy()
         };
         if !idle() || !self.saved_revision_matches(Some(edit.revision)) {
-            return Ok(not_committed());
+            return Ok(not_committed(HotConfigEditOutcome::Retryable));
         }
         // Android's transport may be temporarily unavailable while an owned
         // Core is still running. Only an already stopped lifecycle is offline.
@@ -1648,14 +1650,17 @@ impl ProxyRuntime {
                     runtime_apply: None,
                     revision,
                 },
-                None => not_committed(),
+                None => not_committed(HotConfigEditOutcome::Retryable),
             });
         }
 
-        if !self.core_running() || !self.hot_config_edit_isolated(&edit.previous, owner) {
-            return Ok(not_committed());
+        if !self.core_running() {
+            return Ok(not_committed(HotConfigEditOutcome::Retryable));
         }
-        let Ok((client, mut pending)) = Box::pin(self.prepare_runtime_candidate(
+        if let Some(blocker) = self.hot_config_edit_blocker(&edit.previous, owner) {
+            return Ok(not_committed(blocker));
+        }
+        let (client, mut pending) = match Box::pin(self.prepare_runtime_candidate(
             edit.candidate.clone(),
             Some(&edit.previous),
             Some(owner),
@@ -1663,28 +1668,44 @@ impl ProxyRuntime {
             true,
         ))
         .await
-        else {
-            return Ok(not_committed());
+        {
+            Ok(prepared) => prepared,
+            Err(result) => {
+                let outcome = match result.status {
+                    "restartRequired" | "impactConfirmationRequired" => {
+                        HotConfigEditOutcome::NeedsManual
+                    }
+                    "rejected" => HotConfigEditOutcome::Rejected,
+                    _ => HotConfigEditOutcome::Retryable,
+                };
+                return Ok(not_committed(outcome));
+            }
         };
         if !self.verify_prepared_physical_bindings(&pending).await {
-            return Ok(not_committed());
+            return Ok(not_committed(HotConfigEditOutcome::Retryable));
         }
 
         let mut publication = AutomaticConfigEdit {
             runtime: self,
             owner: None,
         };
+        let mut commit_blocker = HotConfigEditOutcome::Retryable;
         let Some(revision) = self.config.commit_prepared_config_edit(
             edit,
             || {
-                idle()
-                    && self.core_running()
-                    && self.hot_config_edit_isolated(&edit.previous, owner)
+                if !idle() || !self.core_running() {
+                    return false;
+                }
+                if let Some(blocker) = self.hot_config_edit_blocker(&edit.previous, owner) {
+                    commit_blocker = blocker;
+                    return false;
+                }
+                true
             },
             |revision| publication.publish(StagedSaveOwner { revision, ..owner }),
         )?
         else {
-            return Ok(not_committed());
+            return Ok(not_committed(commit_blocker));
         };
 
         pending.desired = edit.candidate.clone();
@@ -1718,33 +1739,45 @@ impl ProxyRuntime {
         })
     }
 
-    fn hot_config_edit_isolated(&self, before: &Value, owner: StagedSaveOwner) -> bool {
-        self.pending_force_restart
+    fn hot_config_edit_blocker(
+        &self,
+        before: &Value,
+        owner: StagedSaveOwner,
+    ) -> Option<HotConfigEditOutcome> {
+        if !self
+            .pending_force_restart
             .read()
             .is_ok_and(|choice| choice.is_none())
-            && !self.selector_reconcile.is_required()
-            && self.switch_snapshot.read().is_ok_and(|s| s.is_some())
-            && self.startup_snapshot.read().is_ok_and(|s| s.is_some())
-            && self.current_config.read().is_ok_and(|s| s.is_some())
-            && !self.pending_changes_against(Some(before)).pending_apply
-            && self.runtime_config_apply.lock().is_ok_and(|s| {
-                let same_owner = |generation, intent, revision| {
-                    (generation, intent, revision)
-                        == (owner.generation, owner.intent, owner.revision)
-                };
-                s.pending.is_none()
-                    && s.automatic_edit.is_none()
-                    && !s.restart.as_ref().is_some_and(|choice| {
-                        same_owner(choice.generation, choice.intent, choice.saved_revision)
-                    })
-                    && !s.impact.as_ref().is_some_and(|choice| {
-                        same_owner(
-                            choice.pending.generation,
-                            choice.pending.intent,
-                            choice.saved_revision,
-                        )
-                    })
+            || self.selector_reconcile.is_required()
+            || !self.switch_snapshot.read().is_ok_and(|s| s.is_some())
+            || !self.startup_snapshot.read().is_ok_and(|s| s.is_some())
+            || !self.current_config.read().is_ok_and(|s| s.is_some())
+        {
+            return Some(HotConfigEditOutcome::Retryable);
+        }
+        let Ok(state) = self.runtime_config_apply.lock() else {
+            return Some(HotConfigEditOutcome::Retryable);
+        };
+        let same_owner = |generation, intent, revision| {
+            (generation, intent, revision) == (owner.generation, owner.intent, owner.revision)
+        };
+        let awaiting_user = state.pending.is_some()
+            || state.restart.as_ref().is_some_and(|choice| {
+                same_owner(choice.generation, choice.intent, choice.saved_revision)
             })
+            || state.impact.as_ref().is_some_and(|choice| {
+                same_owner(
+                    choice.pending.generation,
+                    choice.pending.intent,
+                    choice.saved_revision,
+                )
+            });
+        let active = state.automatic_edit.is_some();
+        drop(state);
+        if awaiting_user || self.pending_changes_against(Some(before)).pending_apply {
+            return Some(HotConfigEditOutcome::NeedsManual);
+        }
+        active.then_some(HotConfigEditOutcome::Retryable)
     }
 
     pub(super) fn executing_config_edit(&self, revision: u64) -> bool {

@@ -383,6 +383,10 @@ pub enum SaveOutcome {
     Conflict { disk_version: String },
     /// No write occurred. Render or keep the explicit draft for this edit.
     NeedsManual,
+    /// Authority was temporarily unavailable before any write.
+    Retryable,
+    /// The authenticated planner or a native validation rejected the edit.
+    Rejected,
 }
 
 const CONFIG_BASE_VERSION_REQUIRED: &str = "CONFIG_BASE_VERSION_REQUIRED";
@@ -526,6 +530,8 @@ async fn config_save_hot_only(
     };
     match Box::pin(state.proxy.apply_hot_config_edit(&edit)).await {
         Ok(HotConfigEditOutcome::NeedsManual) => ApiResponse::ok(SaveOutcome::NeedsManual),
+        Ok(HotConfigEditOutcome::Retryable) => ApiResponse::ok(SaveOutcome::Retryable),
+        Ok(HotConfigEditOutcome::Rejected) => ApiResponse::ok(SaveOutcome::Rejected),
         Ok(HotConfigEditOutcome::Conflict) => match config.with_current(config_version) {
             Ok(disk_version) => ApiResponse::ok(SaveOutcome::Conflict { disk_version }),
             Err(error) => config_store_error(error),
