@@ -1457,7 +1457,11 @@ fn the_single_explicit_write_has_three_callers_that_each_settle_the_intent() {
         4,
         "一处定义加三处调用；新增调用方须先说明它如何处置选择意图"
     );
-    let manual = body_of("fn server_switch_core<F>(");
+    let manual = body_of("fn server_switch_core_with_owner<F, O>(");
+    assert!(
+        body_of("pub async fn server_switch(").contains("server_switch_core_with_owner("),
+        "手动选择的 IPC 必须通过登记的落盘入口"
+    );
     assert!(manual.contains("select_in_place("));
     assert!(
         manual.contains("obj.remove(polaris_store::SELECTION_INTENT_KEY)"),
