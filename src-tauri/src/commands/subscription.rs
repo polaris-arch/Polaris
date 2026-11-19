@@ -1200,7 +1200,7 @@ async fn commit_subscription_refresh(
             revision,
             runtime_apply,
             ..
-        } => Ok(Some((revision, runtime_apply))),
+        } => Ok(Some((revision, runtime_apply.map(|receipt| *receipt)))),
         HotConfigEditOutcome::NeedsManual { .. } => {
             let revision = state
                 .proxy()

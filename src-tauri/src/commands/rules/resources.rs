@@ -2350,7 +2350,7 @@ struct ResourceSave {
 enum RegisteredBatchItem {
     Report(Value),
     Download {
-        plan: ResourcePlan,
+        plan: Box<ResourcePlan>,
         expected: Option<Value>,
         outcome: DownloadOutcome,
     },
@@ -2388,7 +2388,7 @@ impl RegisteredResourceBatch {
         )
         .await;
         self.items.push(RegisteredBatchItem::Download {
-            plan,
+            plan: Box::new(plan),
             expected,
             outcome,
         });

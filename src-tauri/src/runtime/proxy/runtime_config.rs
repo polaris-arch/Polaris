@@ -721,7 +721,7 @@ impl StagedSaveOwner {
 
 pub(crate) enum HotConfigEditOutcome {
     Saved {
-        runtime_apply: Option<RuntimeApplyResult>,
+        runtime_apply: Option<Box<RuntimeApplyResult>>,
         revision: u64,
         saved_offline: bool,
     },
@@ -2054,7 +2054,7 @@ impl ProxyRuntime {
         let owner_current = owner.is_current(self);
         let runtime_apply =
             if owner_current || self.retain_staged_save_recovery_receipt(owner, &mut result) {
-                Some(result)
+                Some(Box::new(result))
             } else {
                 None
             };
