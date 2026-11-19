@@ -600,10 +600,10 @@ async fn hot_config_edit_retries_only_before_local_apply_admission() {
         Err(SavedCommitError::WriterBusy),
     );
     let calls = std::sync::atomic::AtomicUsize::new(0);
-    let attempt = rt.try_runtime_saved_commit(Some(owner), expires, |config| {
+    let attempt = rt.try_runtime_saved_commit(Some(owner), Some(expires), |config| {
         calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(config, &saved);
-        true
+        Ok(true)
     });
     let release = async move {
         tokio::time::sleep(HOT_EDIT_WRITER_RETRY_INTERVAL * 2).await;
@@ -616,18 +616,87 @@ async fn hot_config_edit_retries_only_before_local_apply_admission() {
     assert!(rt.runtime_config_apply.lock().unwrap().pending.is_none());
 
     let expired = rt
-        .try_runtime_saved_commit(Some(owner), 0, |_| {
+        .try_runtime_saved_commit(Some(owner), Some(0), |_| {
             panic!("expired ticket cannot claim local admission")
         })
         .await;
     assert_eq!(expired, None::<()>);
     rt.register_selector_intent();
     let superseded = rt
-        .try_runtime_saved_commit(Some(owner), expires, |_| {
+        .try_runtime_saved_commit(Some(owner), Some(expires), |_| {
             panic!("superseded ticket cannot claim local admission")
         })
         .await;
     assert_eq!(superseded, None::<()>);
+}
+
+#[tokio::test]
+async fn hot_config_edit_retries_a_contended_publication_claim_for_its_exact_owner() {
+    let (rt, _dir, running, saved) = host_dns_restart_fixture();
+    let mut pending = ts_pending_raw_fixture(&rt, saved);
+    pending.saved_revision = Some(rt.config.saved_revision());
+    let owner = pending.staged_save_owner().unwrap();
+    let expiry = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 5000) as i64;
+    let publication = rt.gate.lock_generation_publication();
+    let admitted = std::cell::Cell::new(0);
+    assert_eq!(
+        rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || ()),
+        Err(RuntimeClaimError::Contended)
+    );
+    let attempt = rt.try_runtime_saved_commit(Some(owner), Some(expiry), |_| {
+        rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || {
+            admitted.set(admitted.get() + 1);
+        })
+    });
+    let release = async {
+        tokio::time::sleep(HOT_EDIT_WRITER_RETRY_INTERVAL * 2).await;
+        assert_eq!(admitted.get(), 0);
+        drop(publication);
+    };
+    assert_eq!(tokio::join!(attempt, release).0, Some(()));
+    assert_eq!(admitted.get(), 1);
+
+    // Exercise the R publisher used after a verified Core commit. The Plan
+    // ticket can expire now, because no Core Apply is sent by this retry.
+    pending.plan.expires_at_unix_milli = 0;
+    rt.capture_runtime_config_baseline(
+        pending.generation,
+        pending.deps.clone(),
+        pending.generated.clone(),
+        pending.typed.clone(),
+        pending.pairing.clone(),
+    );
+    let receipt = committed_ts_receipt(&pending);
+    let publication = rt.gate.lock_generation_publication();
+    let attempt = rt.publish_committed_runtime_candidate(&pending, &receipt);
+    let release = async {
+        tokio::time::sleep(HOT_EDIT_WRITER_RETRY_INTERVAL * 2).await;
+        assert_eq!(rt.current_config_snapshot().as_ref(), Some(&running));
+        drop(publication);
+    };
+    assert!(tokio::join!(attempt, release).0.is_some());
+    assert_eq!(
+        rt.current_config_snapshot().as_ref(),
+        Some(&pending.candidate)
+    );
+
+    // A selector change during contention is terminal for the old owner.
+    let publication = rt.gate.lock_generation_publication();
+    let attempt = rt.try_runtime_saved_commit(Some(owner), Some(expiry), |_| {
+        rt.with_runtime_candidate_claim(true, owner.generation, owner.intent, || {
+            panic!("superseded work must not enter its saved authority")
+        })
+    });
+    let supersede = async {
+        tokio::time::sleep(HOT_EDIT_WRITER_RETRY_INTERVAL * 2).await;
+        rt.register_selector_intent();
+        drop(publication);
+    };
+    assert_eq!(tokio::join!(attempt, supersede).0, None::<()>);
 }
 
 #[test]
@@ -1423,8 +1492,8 @@ fn verified_kernel_receipt_survives_unrelated_last_request_and_keeps_its_owner()
     assert!(!state.requires_regeneration_owner_restart(7, &plan));
 }
 
-#[test]
-fn stale_intent_keeps_verified_core_fact_without_publishing_or_rebinding() {
+#[tokio::test]
+async fn stale_intent_keeps_verified_core_fact_without_publishing_or_rebinding() {
     let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
     let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     let running = json!({"oldRunningSnapshot": true});
@@ -1447,7 +1516,7 @@ fn stale_intent_keeps_verified_core_fact_without_publishing_or_rebinding() {
         ..Default::default()
     };
     assert_ne!(runtime.selector_reconcile.register_intent(), pending.intent);
-    let result = runtime.settle_runtime_operation(&pending, operation);
+    let result = runtime.settle_runtime_operation(&pending, operation).await;
     assert_eq!(result.status, "conflict");
     assert_eq!(runtime.current_config_snapshot(), Some(running));
     let state = runtime.runtime_config_apply.lock().unwrap();
@@ -1583,25 +1652,27 @@ async fn ts_apply_unknown_stays_paused_only_proven_unapplied_resumes() {
     };
     let mut aborting = receipt.clone();
     aborting.state = daemon::RuntimeOperationState::AbortingUnapplied as i32;
-    let unconfirmed = rt.settle_runtime_operation(&pending, aborting);
+    let unconfirmed = rt.settle_runtime_operation(&pending, aborting).await;
     assert_eq!(unconfirmed.status, "unconfirmed");
     assert!(unconfirmed.reasons.is_empty());
     assert!(rt.tailnet_context().unwrap().suspended);
     let mut unknown = receipt.clone();
     unknown.candidate_digest = "wrong".into();
     assert_eq!(
-        rt.settle_runtime_operation(&pending, unknown).status,
+        rt.settle_runtime_operation(&pending, unknown).await.status,
         "unconfirmed"
     );
     assert!(rt.tailnet_context().unwrap().suspended);
     let mut contradictory = receipt.clone();
     contradictory.active.as_mut().unwrap().effective_digest = "changed".into();
     assert_eq!(
-        rt.settle_runtime_operation(&pending, contradictory).status,
+        rt.settle_runtime_operation(&pending, contradictory)
+            .await
+            .status,
         "unconfirmed"
     );
     assert!(rt.tailnet_context().unwrap().suspended);
-    let rejected = rt.settle_runtime_operation(&pending, receipt);
+    let rejected = rt.settle_runtime_operation(&pending, receipt).await;
     assert_eq!(rejected.status, "rejected");
     assert_eq!(
         rejected.reasons,
@@ -1656,7 +1727,7 @@ async fn confirmed_ts_binding_commit_replaces_token_in_same_main_generation() {
         ..Default::default()
     };
     assert_eq!(
-        rt.settle_runtime_operation(&pending, receipt).status,
+        rt.settle_runtime_operation(&pending, receipt).await.status,
         "hotApplied"
     );
     let current = rt.tailnet_context().unwrap();
@@ -1722,7 +1793,7 @@ async fn confirmed_non_ts_graph_change_preserves_ts_token_and_known_hosts() {
         ..Default::default()
     };
     assert_eq!(
-        rt.settle_runtime_operation(&pending, receipt).status,
+        rt.settle_runtime_operation(&pending, receipt).await.status,
         "hotApplied"
     );
     assert_eq!(rt.tailnet_context().unwrap().token, context.token);
@@ -2102,6 +2173,7 @@ async fn weak_legacy_held_context_filters_preview_candidate_and_confirmed_source
         );
         assert_eq!(
             rt.settle_runtime_operation(&pending, committed_ts_receipt(&pending))
+                .await
                 .status,
             "hotApplied"
         );
@@ -2182,6 +2254,7 @@ async fn weak_legacy_context_filter_applies_before_capacity_and_real_confirmed_a
     }
     assert_eq!(
         rt.settle_runtime_operation(&next, committed_ts_receipt(&next))
+            .await
             .status,
         "hotApplied"
     );
@@ -2372,7 +2445,7 @@ fn blocked_noop_publication_preserves_original_kernel_persistence_owner() {
         // machine. Its memory proof gate must reject before host reservation.
         assert!(runtime
             .publish_prepared_runtime_candidate(&retry, None, Some(active), control_revision, None,)
-            .is_none());
+            .is_err());
         assert_eq!(
             *runtime.current_config.read().unwrap(),
             Some(original.candidate.clone())
@@ -2519,7 +2592,8 @@ async fn real_settlement_preserves_native_unknown_with_empty_scope_and_no_host_w
     *runtime.startup_snapshot.write().unwrap() = Some(pending.desired.clone());
     runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
     let result = runtime
-        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"))
+        .await;
     let result = runtime.remember_runtime_result(result);
     assert_original_native_debt(&result, &pending);
     assert!(
@@ -2570,7 +2644,7 @@ async fn accepted_carrier_pending_remains_success_and_durability_keeps_its_own_t
             if !durable {
                 operation.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
             }
-            let result = runtime.settle_runtime_operation(&pending, operation);
+            let result = runtime.settle_runtime_operation(&pending, operation).await;
             assert_eq!(
                 result.status,
                 if durable {
@@ -2722,7 +2796,8 @@ async fn stale_verified_commit_still_observes_native_failure_without_publishing_
     *runtime.current_config.write().unwrap() = Some(newer.clone());
     runtime.selector_reconcile.register_intent();
     let result = runtime
-        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"))
+        .await;
     assert_eq!(runtime.current_config_snapshot(), Some(newer));
     let remembered = runtime.remember_runtime_result(result);
     assert_original_native_debt(&remembered, &pending);
@@ -2745,7 +2820,9 @@ async fn native_unknown_survives_same_generation_baseline_recapture_until_teardo
     let mut pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     pending.published = true;
     *runtime.startup_snapshot.write().unwrap() = Some(pending.desired.clone());
-    runtime.settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+    runtime
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"))
+        .await;
     runtime.capture_runtime_config_baseline(
         pending.generation,
         pending.deps.clone(),
@@ -2809,7 +2886,9 @@ async fn native_unknown_survives_same_generation_baseline_recapture_until_teardo
         .native_retirements
         .is_empty());
     runtime.gate.bump_generation();
-    runtime.settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+    runtime
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"))
+        .await;
     assert!(
         runtime
             .runtime_config_apply
@@ -2994,7 +3073,10 @@ async fn actual_status_refreshes_original_pending_without_deletion_scope_and_kee
         let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation.clone()).await;
         runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
         assert_eq!(
-            runtime.settle_runtime_operation(&pending, operation).status,
+            runtime
+                .settle_runtime_operation(&pending, operation)
+                .await
+                .status,
             "hotApplied"
         );
         assert!(runtime
@@ -3073,7 +3155,7 @@ async fn actual_status_rejects_replacement_pairing_but_gate_bump_keeps_original_
         pending.published = true;
         let operation = listener_retirement_receipt(&pending, "PENDING");
         let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation.clone()).await;
-        runtime.settle_runtime_operation(&pending, operation);
+        runtime.settle_runtime_operation(&pending, operation).await;
         *rpc.status.lock().unwrap() =
             native_retirement_status(listener_retirement_receipt(&pending, "UNKNOWN"));
         if wrong_generation {
@@ -3142,7 +3224,9 @@ async fn accepted_host_only_and_late_host_callbacks_cannot_discharge_native_unkn
         pending.pairing.clone(),
     );
     let operation = listener_retirement_receipt(&pending, "UNKNOWN");
-    runtime.settle_runtime_operation(&pending, operation.clone());
+    runtime
+        .settle_runtime_operation(&pending, operation.clone())
+        .await;
     let execution = HostEffectExecution {
         execution_id: "accepted-host-only-B".into(),
         transaction_id: None,
@@ -3215,7 +3299,7 @@ async fn accepted_host_only_and_late_host_callbacks_cannot_discharge_native_unkn
     noop.active = next.plan.expected.clone();
     noop.retirement_state = "DRAINED".into();
     noop.errors.clear();
-    let noop_result = runtime.settle_runtime_operation(&next, noop);
+    let noop_result = runtime.settle_runtime_operation(&next, noop).await;
     assert_original_native_debt(&noop_result, &pending);
     assert_eq!(noop_result.status, "nativeCleanupUnknown");
     assert_eq!(
@@ -3293,7 +3377,7 @@ async fn superseded_regeneration_owner_still_retains_original_native_failure() {
     operation.persistence_mode = "app_authoritative_regeneration".into();
     operation.owner_reload_acknowledged = true;
     assert!(runtime.regeneration_owner_superseded(&pending, &operation));
-    let result = runtime.settle_runtime_operation(&pending, operation);
+    let result = runtime.settle_runtime_operation(&pending, operation).await;
     let result = runtime.remember_runtime_result(result);
     assert_eq!(result.status, "conflict");
     assert!(result
@@ -3365,11 +3449,13 @@ async fn late_same_owner_drained_settlement_cannot_launder_cached_first_unknown(
     pending.published = true;
     let first = listener_retirement_receipt(&pending, "UNKNOWN");
     assert_original_native_debt(
-        &runtime.settle_runtime_operation(&pending, first.clone()),
+        &runtime
+            .settle_runtime_operation(&pending, first.clone())
+            .await,
         &pending,
     );
     let late = listener_retirement_receipt(&pending, "DRAINED");
-    let result = runtime.settle_runtime_operation(&pending, late);
+    let result = runtime.settle_runtime_operation(&pending, late).await;
     assert_original_native_debt(&result, &pending);
     assert_eq!(result.core_state, Some("committed"));
     assert_eq!(result.configuration_durable, Some(true));
@@ -3397,7 +3483,9 @@ async fn verified_later_durability_updates_d_without_discharging_first_native_un
     let mut first = listener_retirement_receipt(&pending, "UNKNOWN");
     first.durable = false;
     first.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
-    let result = runtime.settle_runtime_operation(&pending, first.clone());
+    let result = runtime
+        .settle_runtime_operation(&pending, first.clone())
+        .await;
     assert_original_native_debt(&result, &pending);
     assert_eq!(result.configuration_durable, Some(false));
     assert!(runtime
@@ -3407,7 +3495,8 @@ async fn verified_later_durability_updates_d_without_discharging_first_native_un
         .pending
         .is_some());
     let result = runtime
-        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "DRAINED"));
+        .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "DRAINED"))
+        .await;
     assert_original_native_debt(&result, &pending);
     assert_eq!(result.configuration_durable, Some(true));
     let state = runtime.runtime_config_apply.lock().unwrap();
@@ -3435,7 +3524,9 @@ async fn successor_saved_desired_and_committed_kernel_keep_the_original_native_o
     let mut original = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
     original.published = true;
     let first = listener_retirement_receipt(&original, "UNKNOWN");
-    runtime.settle_runtime_operation(&original, first.clone());
+    runtime
+        .settle_runtime_operation(&original, first.clone())
+        .await;
     let mut desired = original.desired.clone();
     desired["logLevel"] = json!("debug");
     runtime.config.save_full(&desired).unwrap();
@@ -3445,10 +3536,12 @@ async fn successor_saved_desired_and_committed_kernel_keep_the_original_native_o
     successor.plan.transaction_id = "successor-durable-core-owner".into();
     successor.plan.expected = first.active.clone();
     successor.plan.expected_control_revision = first.control_revision;
-    let result = runtime.settle_runtime_operation(
-        &successor,
-        listener_retirement_receipt(&successor, "DRAINED"),
-    );
+    let result = runtime
+        .settle_runtime_operation(
+            &successor,
+            listener_retirement_receipt(&successor, "DRAINED"),
+        )
+        .await;
     let result = runtime.remember_runtime_result(result);
     assert_original_native_debt(&result, &original);
     assert_eq!(result.core_state, Some("committed"));
@@ -3492,7 +3585,7 @@ async fn native_unknown_status_with_independent_d_pending_never_acknowledges_per
     operation.persistence_mode = "app_authoritative_regeneration".into();
     operation.owner_reload_acknowledged = true;
     let (rpc, server) = native_retirement_rpc_peer(&runtime, &pending, operation.clone()).await;
-    runtime.settle_runtime_operation(&pending, operation);
+    runtime.settle_runtime_operation(&pending, operation).await;
     assert!(runtime
         .runtime_config_apply
         .lock()
@@ -3706,7 +3799,8 @@ async fn native_unknown_does_not_authorize_publication_without_its_exact_baselin
         }
         runtime.runtime_config_apply.lock().unwrap().pending = Some(pending.clone());
         let result = runtime
-            .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"));
+            .settle_runtime_operation(&pending, listener_retirement_receipt(&pending, "UNKNOWN"))
+            .await;
         let result = runtime.remember_runtime_result(result);
         assert_original_native_debt(&result, &pending);
         assert_eq!(result.status, "unconfirmed", "{mismatch}");

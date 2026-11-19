@@ -485,6 +485,12 @@ pub(crate) enum HotConfigEditOutcome {
     Conflict,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeClaimError {
+    Contended,
+    Rejected,
+}
+
 struct AutomaticConfigEdit<'a> {
     runtime: &'a ProxyRuntime,
     owner: Option<StagedSaveOwner>,
@@ -2665,23 +2671,35 @@ impl ProxyRuntime {
         generation: u64,
         intent: u64,
         claim: impl FnOnce() -> T,
-    ) -> Option<T> {
+    ) -> Result<T, RuntimeClaimError> {
+        if !self.selector_intent_is_current(intent) {
+            return Err(RuntimeClaimError::Rejected);
+        }
         let claim_intent = |current_intent| {
             if current_intent != intent {
-                return None;
+                return Err(RuntimeClaimError::Rejected);
             }
             if saved_fenced {
-                let _publication = self.gate.try_lock_generation_publication()?;
-                (self.gate.try_idle_generation() == Some(generation)).then(claim)
+                let _publication = self
+                    .gate
+                    .try_lock_generation_publication()
+                    .ok_or(RuntimeClaimError::Contended)?;
+                match self.gate.try_generation_activity() {
+                    Some((actual, false)) if actual == generation => Ok(claim()),
+                    Some(_) => Err(RuntimeClaimError::Rejected),
+                    None => Err(RuntimeClaimError::Contended),
+                }
             } else {
                 let _publication = self.gate.lock_generation_publication();
-                (self.gate.generation() == generation && !self.gate.is_busy()).then(claim)
+                (self.gate.generation() == generation && !self.gate.is_busy())
+                    .then(claim)
+                    .ok_or(RuntimeClaimError::Rejected)
             }
         };
         if saved_fenced {
             self.selector_reconcile
                 .try_with_intent_claim(claim_intent)
-                .flatten()
+                .ok_or(RuntimeClaimError::Contended)?
         } else {
             self.selector_reconcile.with_intent_claim(claim_intent)
         }
@@ -2697,26 +2715,31 @@ impl ProxyRuntime {
 
     async fn try_runtime_saved_commit<T>(
         &self,
-        automatic: Option<StagedSaveOwner>,
-        plan_expiry: i64,
-        mut commit: impl FnMut(&Value) -> T,
+        retry_owner: Option<StagedSaveOwner>,
+        plan_expiry: Option<i64>,
+        mut commit: impl FnMut(&Value) -> Result<T, RuntimeClaimError>,
     ) -> Option<T> {
-        let Some(owner) = automatic else {
-            return self.config.try_with_saved_commit(commit).ok();
+        let Some(owner) = retry_owner else {
+            return self.config.try_with_saved_commit(commit).ok()?.ok();
         };
         let deadline = tokio::time::Instant::now() + HOT_EDIT_WRITER_RETRY_LIMIT;
         loop {
-            if !owner.is_current(self)
-                || self.gate.is_busy()
-                || !runtime_plan_ticket_is_live(plan_expiry)
+            if !self.saved_revision_matches(Some(owner.revision))
+                || !self.selector_intent_is_current(owner.intent)
+                || !self.core_running()
+                || self
+                    .gate
+                    .try_generation_activity()
+                    .is_some_and(|state| state != (owner.generation, false))
+                || plan_expiry.is_some_and(|expiry| !runtime_plan_ticket_is_live(expiry))
             {
                 return None;
             }
             match self.config.try_with_saved_commit_classified(&mut commit) {
-                Ok(result) => return Some(result),
-                Err(SavedCommitError::WriterBusy) => {
-                    // This error occurs before the admission callback. No
-                    // state was changed and no Apply RPC was sent.
+                Ok(Ok(result)) => return Some(result),
+                Ok(Err(RuntimeClaimError::Contended)) | Err(SavedCommitError::WriterBusy) => {
+                    // Neither contention path ran the protected action. In
+                    // particular, admission has not sent Apply to Core.
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
                         return None;
@@ -2724,7 +2747,7 @@ impl ProxyRuntime {
                     tokio::time::sleep_until((now + HOT_EDIT_WRITER_RETRY_INTERVAL).min(deadline))
                         .await;
                 }
-                Err(_) => return None,
+                Ok(Err(RuntimeClaimError::Rejected)) | Err(_) => return None,
             }
         }
     }
@@ -2791,7 +2814,7 @@ impl ProxyRuntime {
         let plan_expiry = pending.plan.expires_at_unix_milli;
         let admit = |desired: &Value| {
             if desired != &pending.desired || !self.saved_revision_matches(saved_revision) {
-                return false;
+                return Err(RuntimeClaimError::Rejected);
             }
             self.with_runtime_candidate_claim(saved_revision.is_some(), generation, intent, || {
                 if (automatic.is_some() && !runtime_plan_ticket_is_live(plan_expiry))
@@ -2834,13 +2857,12 @@ impl ProxyRuntime {
                 state.impact = None;
                 true
             })
-            .unwrap_or(false)
         };
         let admitted = if saved_revision.is_some() {
-            self.try_runtime_saved_commit(automatic, plan_expiry, admit)
+            self.try_runtime_saved_commit(automatic, Some(plan_expiry), admit)
                 .await
         } else {
-            self.config.with_current(admit).ok()
+            self.config.with_current(admit).ok().and_then(Result::ok)
         }
         .unwrap_or(false);
         if !admitted {
@@ -3077,7 +3099,8 @@ impl ProxyRuntime {
         active: Option<daemon::RuntimeIdentity>,
         control_revision: u64,
         confirmation: Option<&str>,
-    ) -> Option<(bool, Option<u64>, Option<host_effects::HostEffectExecution>)> {
+    ) -> Result<(bool, Option<u64>, Option<host_effects::HostEffectExecution>), RuntimeClaimError>
+    {
         let mut committed_tailnet_token = None;
         let mut tailnet_context_changed = false;
         let mut host_execution = None;
@@ -3219,18 +3242,16 @@ impl ProxyRuntime {
             committed_tailnet_token = self.tailnet_context().map(|context| context.token);
             true
         };
-        let published = self
-            .with_runtime_candidate_claim(
-                pending.saved_revision.is_some() || confirmation.is_some(),
-                pending.generation,
-                pending.intent,
-                publish,
-            )
-            .unwrap_or(false);
+        let published = self.with_runtime_candidate_claim(
+            pending.saved_revision.is_some() || confirmation.is_some(),
+            pending.generation,
+            pending.intent,
+            publish,
+        )?;
         if !published {
-            return None;
+            return Err(RuntimeClaimError::Rejected);
         }
-        Some((
+        Ok((
             tailnet_context_changed,
             committed_tailnet_token,
             host_execution,
@@ -3259,7 +3280,7 @@ impl ProxyRuntime {
         }
         // The original settlement records the verified Core fact even when
         // current physical facts no longer permit App R publication.
-        self.settle_runtime_operation(pending, operation)
+        Box::pin(self.settle_runtime_operation(pending, operation)).await
     }
 
     fn committed_runtime_without_publication(
@@ -3290,7 +3311,7 @@ impl ProxyRuntime {
         result
     }
 
-    fn settle_runtime_operation(
+    async fn settle_runtime_operation(
         self: &Arc<Self>,
         pending: &PendingOperation,
         operation: daemon::RuntimeConfigOperation,
@@ -3402,11 +3423,27 @@ impl ProxyRuntime {
         if observe_retirement {
             self.spawn_runtime_retirement_reconcile(pending, &operation);
         }
-        // The receipt proves kernel state, but obsolete local intent cannot publish R
-        // over a newer owner. Consume terminal state without claiming local publication.
-        if !self.selector_operation_is_current(pending.generation, pending.intent)
-            || !self.saved_revision_matches(pending.saved_revision)
-        {
+        let still_current = || {
+            self.selector_operation_is_current(pending.generation, pending.intent)
+                && self.saved_revision_matches(pending.saved_revision)
+        };
+        let publication = if pending.published {
+            Some((false, None, None))
+        } else if !still_current() {
+            None
+        } else if !self.protected_runtime_publication_current(pending) {
+            return self.committed_runtime_without_publication(
+                pending,
+                &operation,
+                "PHYSICAL_ROUTE_FACTS_CHANGED",
+            );
+        } else {
+            self.publish_committed_runtime_candidate(pending, &operation)
+                .await
+        };
+        // Check again after local publication contention. A newer owner must
+        // take the same stale-receipt path as one observed before the wait.
+        if !still_current() {
             // A terminal receipt must not publish over a newer owner. Preserve
             // nondurable generic debt; only verified regeneration supersession
             // permits a corrective latest-D transaction. Invalidate stale cheap
@@ -3471,48 +3508,14 @@ impl ProxyRuntime {
             }
             return result;
         }
-        if !pending.published && !self.protected_runtime_publication_current(pending) {
+        let Some((tailnet_context_changed, committed_tailnet_token, host_execution)) = publication
+        else {
             return self.committed_runtime_without_publication(
                 pending,
                 &operation,
-                "PHYSICAL_ROUTE_FACTS_CHANGED",
+                "RUNTIME_PUBLICATION_UNCONFIRMED",
             );
-        }
-        let (tailnet_context_changed, committed_tailnet_token, host_execution) =
-            if pending.published {
-                (false, None, None)
-            } else {
-                let publish = || {
-                    self.publish_prepared_runtime_candidate(
-                        pending,
-                        Some(&pending.plan.transaction_id),
-                        operation.active.clone(),
-                        operation.control_revision,
-                        None,
-                    )
-                };
-                let publication = if pending.saved_revision.is_some() {
-                    self.config
-                        .try_with_saved_commit(|desired| {
-                            (desired == &pending.desired
-                                && self.saved_revision_matches(pending.saved_revision))
-                            .then(publish)
-                            .flatten()
-                        })
-                        .ok()
-                        .flatten()
-                } else {
-                    publish()
-                };
-                let Some(publication) = publication else {
-                    return self.committed_runtime_without_publication(
-                        pending,
-                        &operation,
-                        "RUNTIME_PUBLICATION_UNCONFIRMED",
-                    );
-                };
-                publication
-            };
+        };
         if let Some(execution) = host_execution {
             self.spawn_runtime_host_effects(execution);
         }
@@ -3580,6 +3583,34 @@ impl ProxyRuntime {
         result.retirement_state = Some(operation.retirement_state);
         self.annotate_runtime_native_result(&mut result);
         result
+    }
+
+    async fn publish_committed_runtime_candidate(
+        &self,
+        pending: &PendingOperation,
+        operation: &daemon::RuntimeConfigOperation,
+    ) -> Option<(bool, Option<u64>, Option<host_effects::HostEffectExecution>)> {
+        let publish = || {
+            self.publish_prepared_runtime_candidate(
+                pending,
+                Some(&pending.plan.transaction_id),
+                operation.active.clone(),
+                operation.control_revision,
+                None,
+            )
+        };
+        let Some(owner) = pending.staged_save_owner() else {
+            return publish().ok();
+        };
+        // A verified receipt already consumed the Plan. Only local publication
+        // may retry here, even if the original Plan ticket has since expired.
+        self.try_runtime_saved_commit(Some(owner), None, |desired| {
+            if desired != &pending.desired || !self.saved_revision_matches(Some(owner.revision)) {
+                return Err(RuntimeClaimError::Rejected);
+            }
+            publish()
+        })
+        .await
     }
 
     async fn execute_runtime_host_only(
@@ -3652,24 +3683,23 @@ impl ProxyRuntime {
         let publication = self
             .try_runtime_saved_commit(
                 self.automatic_edit_owner(&pending),
-                pending.plan.expires_at_unix_milli,
+                Some(pending.plan.expires_at_unix_milli),
                 |desired| {
-                    (desired == &pending.desired
-                        && self.saved_revision_matches(pending.saved_revision))
-                    .then(|| {
-                        self.publish_prepared_runtime_candidate(
-                            &pending,
-                            None,
-                            capabilities.active.clone(),
-                            capabilities.control_revision,
-                            confirmation,
-                        )
-                    })
-                    .flatten()
+                    if desired != &pending.desired
+                        || !self.saved_revision_matches(pending.saved_revision)
+                    {
+                        return Err(RuntimeClaimError::Rejected);
+                    }
+                    self.publish_prepared_runtime_candidate(
+                        &pending,
+                        None,
+                        capabilities.active.clone(),
+                        capabilities.control_revision,
+                        confirmation,
+                    )
                 },
             )
-            .await
-            .flatten();
+            .await;
         let Some((tailnet_changed, tailnet_token, execution)) = publication else {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
         };

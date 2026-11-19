@@ -279,12 +279,16 @@ impl LifecycleGate {
         self.inner.try_lock().ok().map(|inner| inner.generation)
     }
 
+    /// Observe generation and activity under the same nonblocking claim.
+    pub fn try_generation_activity(&self) -> Option<(u64, bool)> {
+        let inner = self.inner.try_lock().ok()?;
+        Some((inner.generation, inner.depth > 0))
+    }
+
     /// Observe a stable idle generation without waiting under a saved writer.
     pub fn try_idle_generation(&self) -> Option<u64> {
-        self.inner
-            .try_lock()
-            .ok()
-            .and_then(|inner| (inner.depth == 0).then_some(inner.generation))
+        self.try_generation_activity()
+            .and_then(|(generation, busy)| (!busy).then_some(generation))
     }
 
     /// 世代与最后认领者须同锁读取，供异步选择回执判断是否被主动停止接管。
