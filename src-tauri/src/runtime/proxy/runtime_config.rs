@@ -1652,7 +1652,7 @@ impl ProxyRuntime {
             });
         }
 
-        if !self.core_running() || !self.hot_config_edit_isolated(&edit.previous) {
+        if !self.core_running() || !self.hot_config_edit_isolated(&edit.previous, owner) {
             return Ok(not_committed());
         }
         let Ok((client, mut pending)) = Box::pin(self.prepare_runtime_candidate(
@@ -1676,7 +1676,11 @@ impl ProxyRuntime {
         };
         let Some(revision) = self.config.commit_prepared_config_edit(
             edit,
-            || idle() && self.core_running() && self.hot_config_edit_isolated(&edit.previous),
+            || {
+                idle()
+                    && self.core_running()
+                    && self.hot_config_edit_isolated(&edit.previous, owner)
+            },
             |revision| publication.publish(StagedSaveOwner { revision, ..owner }),
         )?
         else {
@@ -1714,7 +1718,7 @@ impl ProxyRuntime {
         })
     }
 
-    fn hot_config_edit_isolated(&self, before: &Value) -> bool {
+    fn hot_config_edit_isolated(&self, before: &Value, owner: StagedSaveOwner) -> bool {
         self.pending_force_restart
             .read()
             .is_ok_and(|choice| choice.is_none())
@@ -1724,10 +1728,22 @@ impl ProxyRuntime {
             && self.current_config.read().is_ok_and(|s| s.is_some())
             && !self.pending_changes_against(Some(before)).pending_apply
             && self.runtime_config_apply.lock().is_ok_and(|s| {
+                let same_owner = |generation, intent, revision| {
+                    (generation, intent, revision)
+                        == (owner.generation, owner.intent, owner.revision)
+                };
                 s.pending.is_none()
-                    && s.restart.is_none()
-                    && s.impact.is_none()
                     && s.automatic_edit.is_none()
+                    && !s.restart.as_ref().is_some_and(|choice| {
+                        same_owner(choice.generation, choice.intent, choice.saved_revision)
+                    })
+                    && !s.impact.as_ref().is_some_and(|choice| {
+                        same_owner(
+                            choice.pending.generation,
+                            choice.pending.intent,
+                            choice.saved_revision,
+                        )
+                    })
             })
     }
 

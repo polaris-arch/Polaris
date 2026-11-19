@@ -505,7 +505,16 @@ fn prepare_log_edit(rt: &ProxyRuntime) -> PreparedConfigEdit {
 
 #[tokio::test]
 async fn hot_config_edit_without_pairing_never_writes_or_publishes_the_candidate() {
-    let (rt, _dir, running, _) = host_dns_restart_fixture();
+    let (rt, _dir, running, prior_saved) = host_dns_restart_fixture();
+    let prior_owner = StagedSaveOwner::capture(&rt, rt.config.saved_revision());
+    let prior_choice = rt.restart_choice(
+        &prior_saved,
+        "hostEffectsRequireRestart",
+        vec![],
+        prior_owner.generation,
+        prior_owner.intent,
+    );
+    assert_eq!(prior_choice.status, "restartRequired");
     rt.config.save_full(&running).unwrap();
     let baseline = ts_pending_raw_fixture(&rt, running.clone());
     *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
@@ -515,7 +524,10 @@ async fn hot_config_edit_without_pairing_never_writes_or_publishes_the_candidate
     ));
     rt.config.set_staged_pending(true);
     let edit = prepare_log_edit(&rt);
-    assert!(rt.hot_config_edit_isolated(&edit.previous));
+    let owner = StagedSaveOwner::capture(&rt, edit.revision);
+    assert!(rt.runtime_config_apply.lock().unwrap().restart.is_some());
+    assert!(rt.hot_config_edit_isolated(&edit.previous, owner));
+    assert!(!rt.hot_config_edit_isolated(&edit.previous, prior_owner));
     assert_ne!(edit.candidate, edit.previous);
     assert!(matches!(
         rt.apply_hot_config_edit(&edit).await.unwrap(),
