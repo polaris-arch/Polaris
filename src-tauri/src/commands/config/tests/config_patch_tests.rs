@@ -248,24 +248,38 @@ fn config_patch_app_metadata_cannot_authorize_an_older_saved_core_change() {
     desired["logLevel"] = json!("debug");
     config.save_full(&desired).unwrap();
 
-    let patch = json!({
-        "language": "zh-CN",
-        "uiTheme": "dark",
-        "periodicSpeedTestEnabled": false,
-        "logLevel": "debug",
-    });
     let mut previous = Value::Null;
-    let (_, saved, changed) = config_patch_with_previous(
-        &config,
-        patch.as_object().unwrap().clone(),
-        Some(&mut previous),
-    )
-    .unwrap();
-    assert!(changed);
-    assert_eq!(previous["logLevel"], "debug");
-    assert_eq!(saved["logLevel"], "debug");
-    assert_ne!(running["logLevel"], saved["logLevel"]);
-    assert!(app_only_config_patch(&previous, &saved));
+    for (key, value) in [
+        ("language", json!("zh-CN")),
+        ("uiTheme", json!("dark")),
+        ("autoStart", json!(true)),
+        ("periodicSpeedTestEnabled", json!(false)),
+        ("speedTestConcurrency", json!(4)),
+        ("speedTestMeteredPolicy", json!("pause")),
+        ("ruleResourceAutoUpdate", json!(false)),
+        ("ruleResourceUpdateIntervalHours", json!(24)),
+        ("autoUpdateSubscriptionOnStart", json!(false)),
+        ("subscriptionUpdateIntervalHours", json!(24)),
+        ("subscriptionProxyPolicy", json!("proxy")),
+        ("ghProxyPrefix", json!("https://downloads.example.test")),
+    ] {
+        let patch = json!({ (key): value, "logLevel": "debug" });
+        let (_, saved, changed) = config_patch_with_previous(
+            &config,
+            patch.as_object().unwrap().clone(),
+            Some(&mut previous),
+        )
+        .unwrap();
+        assert!(changed, "{key} must be saved");
+        assert_eq!(saved[key], value, "{key}");
+        assert_eq!(previous["logLevel"], "debug");
+        assert_eq!(saved["logLevel"], "debug");
+        assert_ne!(running["logLevel"], saved["logLevel"]);
+        assert!(
+            app_only_config_patch(&previous, &saved),
+            "{key} must not authorize applying the already-saved logLevel"
+        );
+    }
 
     // Both typed configuration and a raw live-control key must still dispatch
     // the existing broadcast when the canonical edit actually changes them.

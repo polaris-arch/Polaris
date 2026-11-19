@@ -670,7 +670,15 @@ fn is_app_patch_key(key: &str) -> bool {
         "language"
             | "uiTheme"
             | "periodicSpeedTestEnabled"
+            | "speedTestConcurrency"
+            | "speedTestMeteredPolicy"
+            | "ruleResourceAutoUpdate"
+            | "ruleResourceUpdateIntervalHours"
+            | "autoUpdateSubscriptionOnStart"
+            | "subscriptionUpdateIntervalHours"
+            | "subscriptionProxyPolicy"
             | "desktopNotifications"
+            | "autoStart"
             | "silentStart"
             | "autoConnect"
             | "minimizeToTray"
@@ -682,6 +690,7 @@ fn is_app_patch_key(key: &str) -> bool {
             | "autoCheckUpdate"
             | "autoDownloadUpdate"
             | "appUpdateChannel"
+            | "ghProxyPrefix"
             | "autoPrivacyMode"
     )
 }
