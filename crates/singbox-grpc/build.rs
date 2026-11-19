@@ -89,8 +89,12 @@ fn assert_proto_matches_bundled_core() {
         return;
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
-        let aar = proto_wire_check::repo_root().join("src-tauri/gen/android/app/libs/libbox.aar");
+        let root = proto_wire_check::repo_root();
+        let aar = root.join("src-tauri/gen/android/app/libs/libbox.aar");
         println!("cargo:rerun-if-changed={}", aar.display());
+        for script in ["scripts/verify-apk.mjs", "scripts/lib/zip-archive.mjs"] {
+            println!("cargo:rerun-if-changed={}", root.join(script).display());
+        }
         if std::env::var("PROFILE").as_deref() == Ok("release") {
             let arch = std::env::var("CARGO_CFG_TARGET_ARCH")
                 .expect("Android Release wire guard requires Cargo target architecture");

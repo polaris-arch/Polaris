@@ -76,8 +76,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readdirSync, readSync, statSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { crc32, inflateRawSync } from 'node:zlib';
-import { parseZipEntries, readZipEntries } from './lib/zip-archive.mjs';
+import { parseZipEntries, readZipEntry, withIndexedZip } from './lib/zip-archive.mjs';
 import { verifyAbiNames } from './release-assets.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -1271,16 +1270,7 @@ function readMemberUncached(apk, name) {
 
 // The source consumer supplies pins from its revalidated original AAR receipt.
 export function verifySdkPayload(apk, flavor, nativePins) {
-  const fd = openSync(apk, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const file = fstatSync(fd);
-    if (!file.isFile() || file.size === 0 || file.size > 1024 ** 3) throw new Error('bounded regular APK required');
-    const read = (offset, length) => {
-      const bytes = Buffer.allocUnsafe(length);
-      if (readSync(fd, bytes, 0, length, offset) !== length) throw new Error('truncated APK ZIP bytes');
-      return bytes;
-    };
-    const entries = readZipEntries(file.size, read, { zip64: true, maxEntries: 65536 });
+  return withIndexedZip(apk, { maximum: 1024 ** 3, subject: 'APK' }, (entries, read) => {
     const selectedABIs = verifyAbiNames([...entries.keys()], flavor);
     let expandedBytes = 0;
     for (const [name, entry] of entries) {
@@ -1302,11 +1292,7 @@ export function verifySdkPayload(apk, flavor, nativePins) {
       const entry = entries.get(name);
       if (!entry || ![0, 8].includes(entry.method)) throw new Error(`missing or unsupported APK SDK member: ${name}`);
       if (entry.uncompressedSize !== expected.bytes) throw new Error(`APK SDK member size differs: ${name}`);
-      const packed = read(entry.dataOffset, entry.compressedSize);
-      const bytes = entry.method === 0 ? packed : inflateRawSync(packed, { maxOutputLength: expected.bytes + 1 });
-      if (bytes.length !== expected.bytes || crc32(bytes) !== entry.crc32) {
-        throw new Error(`APK SDK member size or CRC differs: ${name}`);
-      }
+      const bytes = readZipEntry(entry, read, { name, maximum: expected.bytes });
       const actual = createHash('sha256').update(bytes).digest('hex');
       if (actual !== expected.sha256) throw new Error(`APK native bytes differ from verified original AAR: ${name}`);
       embeddedRuntimeSha256[name] = actual;
@@ -1317,12 +1303,31 @@ export function verifySdkPayload(apk, flavor, nativePins) {
       return [abi, digest];
     }));
     return { selectedABIs, embeddedLibboxSha256, embeddedRuntimeSha256 };
-  } finally {
-    closeSync(fd);
-  }
+  });
 }
 
 function main() {
+  if (process.argv[2] === '--aar-wire-member') {
+    const [, , , path, abi] = process.argv;
+    if (process.argv.length !== 5 || !Object.hasOwn(ABIS, abi)) {
+      throw new Error('usage: verify-apk.mjs --aar-wire-member <path> <abi>');
+    }
+    const name = `jni/${abi}/libbox.so`;
+    try {
+      const bytes = withIndexedZip(path, { maximum: 1024 ** 3, subject: 'AAR' }, (entries, read) => {
+        const entry = entries.get(name);
+        if (!entry) throw new Error(`selected JNI entry must exist exactly once: ${name}`);
+        if (!entry.uncompressedSize || (entry.mode & 0o170000) === 0o040000) {
+          throw new Error('selected JNI library size/type is invalid');
+        }
+        return readZipEntry(entry, read, { name, maximum: 256 * 1024 ** 2 });
+      });
+      process.stdout.write(bytes);
+    } catch (error) {
+      throw new Error(`AAR JNI read failed: ${error.message}`, { cause: error });
+    }
+    return;
+  }
   if (process.argv[2] === '--aar-elf') {
     const [, , , path, abi, bytes, sha, library] = process.argv;
     if (process.argv.length !== 8) throw new Error('usage: verify-apk.mjs --aar-elf <path> <abi> <bytes> <sha256> <libbox|dependency>');

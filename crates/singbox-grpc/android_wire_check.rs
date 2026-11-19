@@ -3,30 +3,9 @@
 // APK consumption binds the packaged library to that verified AAR's bytes.
 #[allow(dead_code)]
 mod android_wire_check {
-    use super::proto_wire_check::{verdict_for_core_bytes, WireVerdict};
+    use super::proto_wire_check::{repo_root, verdict_for_core_bytes, WireVerdict};
     use std::path::Path;
     use std::process::Command;
-
-    // Python3 is already required by the Android component verifier. Only the
-    // fixed archive entry is read; stdout contains library bytes exclusively.
-    const READ_LIBRARY: &str = r#"
-import sys, zipfile
-try:
-    with zipfile.ZipFile(sys.argv[1]) as archive:
-        entries = [item for item in archive.infolist() if item.filename == sys.argv[2]]
-        if len(entries) != 1:
-            raise ValueError('selected JNI entry must exist exactly once')
-        entry = entries[0]
-        if entry.is_dir() or not 0 < entry.file_size <= 256 * 1024 * 1024:
-            raise ValueError('selected JNI library size/type is invalid')
-        data = archive.read(entry)  # Complete read also validates the ZIP CRC.
-        if len(data) != entry.file_size:
-            raise ValueError('selected JNI library length differs')
-    sys.stdout.buffer.write(data)
-except Exception as error:
-    print('AAR JNI read failed: ' + str(error), file=sys.stderr)
-    sys.exit(1)
-"#;
 
     /// Check the exact target ABI library. Neither descriptor absence nor a
     /// different wire layout permits falling back to a desktop binary.
@@ -43,14 +22,12 @@ except Exception as error:
             }
         };
         let entry = format!("jni/{abi}/libbox.so");
-        // This cfg selects the host interpreter executable only. ABI selection
-        // above always uses the explicit Cargo target architecture.
-        let interpreter = if cfg!(windows) { "python" } else { "python3" };
-        let output = Command::new(interpreter)
-            .arg("-c")
-            .arg(READ_LIBRARY)
+        // The shared Android ZIP reader returns only the checked JNI bytes.
+        let output = Command::new("node")
+            .arg(repo_root().join("scripts/verify-apk.mjs"))
+            .arg("--aar-wire-member")
             .arg(aar)
-            .arg(&entry)
+            .arg(abi)
             .output()
             .map_err(|error| format!("cannot read {} {entry}: {error}", aar.display()))?;
         if !output.status.success() || !output.stderr.is_empty() {

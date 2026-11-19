@@ -1,4 +1,32 @@
-import { crc32 } from 'node:zlib';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { crc32, inflateRawSync } from 'node:zlib';
+
+export function withIndexedZip(path, { maximum, subject }, inspect) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const file = fstatSync(fd);
+    if (!file.isFile() || file.size === 0 || file.size > maximum) throw new Error(`bounded regular ${subject} required`);
+    const read = (offset, length) => {
+      const bytes = Buffer.allocUnsafe(length);
+      if (readSync(fd, bytes, 0, length, offset) !== length) throw new Error(`truncated ${subject} ZIP bytes`);
+      return bytes;
+    };
+    return inspect(readZipEntries(file.size, read, { zip64: true, maxEntries: 65536 }), read);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function readZipEntry(entry, read, { name, maximum }) {
+  if (!entry || (entry.flags & 1) || ![0, 8].includes(entry.method)
+    || entry.uncompressedSize > maximum) throw new Error(`missing or unsupported ZIP member: ${name}`);
+  const packed = read(entry.dataOffset, entry.compressedSize);
+  const bytes = entry.method === 0 ? packed : inflateRawSync(packed, { maxOutputLength: entry.uncompressedSize + 1 });
+  if (bytes.length !== entry.uncompressedSize || crc32(bytes) !== entry.crc32) {
+    throw new Error(`ZIP member size or CRC differs: ${name}`);
+  }
+  return bytes;
+}
 
 export function parseZipEntries(buf, options) {
   return readZipEntries(buf.length, (start, length) => buf.subarray(start, start + length), options);

@@ -30,18 +30,17 @@ impl Drop for Scratch {
 fn archive(path: &Path, bytes: &[u8], entry: &str, duplicate: bool, deflate: bool) {
     let payload = path.with_extension("bytes");
     std::fs::write(&payload, bytes).unwrap();
-    let result = Command::new(if cfg!(windows) { "python" } else { "python3" })
+    let result = Command::new("node")
+        .current_dir(proto_wire_check::repo_root())
         .args([
-            "-c",
+            "--input-type=module",
+            "-e",
             r#"
-import sys, warnings, zipfile
-warnings.simplefilter('ignore', UserWarning)
-compression = zipfile.ZIP_DEFLATED if sys.argv[5] == 'deflate' else zipfile.ZIP_STORED
-with zipfile.ZipFile(sys.argv[1], 'w', compression=compression) as archive:
-    data = open(sys.argv[2], 'rb').read()
-    archive.writestr(sys.argv[3], data)
-    if sys.argv[4] == 'duplicate':
-        archive.writestr(sys.argv[3], data)
+import { readFileSync, writeFileSync } from 'node:fs';
+import { fixtureZip } from './scripts/lib/formal-package-fixtures.mjs';
+const [output, payload, name, count, compression] = process.argv.slice(1);
+const entry = { name, data: readFileSync(payload), method: compression === 'deflate' ? 8 : 0 };
+writeFileSync(output, fixtureZip(count === 'duplicate' ? [entry, entry] : [entry]));
 "#,
         ])
         .arg(path)
@@ -97,7 +96,7 @@ fn selected_entry_is_required_and_duplicates_are_rejected() {
     );
     assert!(android_wire_check::check_android_aar(&path, "aarch64")
         .unwrap_err()
-        .contains("exist exactly once"));
+        .contains("duplicate entry"));
 }
 
 #[test]
@@ -115,7 +114,7 @@ fn corrupt_zip_crc_is_rejected_before_elf_or_descriptor_validation() {
     std::fs::write(&path, bytes).unwrap();
     assert!(android_wire_check::check_android_aar(&path, "aarch64")
         .unwrap_err()
-        .contains("Bad CRC"));
+        .contains("size or CRC differs"));
 }
 
 #[test]
