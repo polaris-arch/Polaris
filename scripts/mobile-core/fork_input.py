@@ -11,7 +11,6 @@ from functools import lru_cache
 from pathlib import Path
 import re
 import subprocess
-from source_policy import verify_source_policy_files, verify_vendor_sources
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(__file__).with_name('source-contract.json')
@@ -95,15 +94,6 @@ def verify_source(source, value, *, generator_outputs=False):
     require(git(source, 'rev-parse', 'HEAD') == value['sourceCommit'] and
             not git(source, 'status', '--porcelain=v1', '--untracked-files=no'),
             'source checkout must be exact and clean before mobile bind')
-    for name, key in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
-        require(sha((source / name).read_bytes()) == value[key], 'source module bytes differ')
-    policy = value['sourcePolicy']
-    module = (source / 'go.mod').read_text()
-    directive = policy['goDirective']
-    require(re.search(r'^module\s+' + re.escape(value['goModule']) + r'\s*$', module, re.M) and
-            re.search(r'^go\s+' + re.escape(directive) + r'\s*$', module, re.M) and
-            re.search(r'^\s*github\.com/sagernet/gomobile\s+' + re.escape(value['gomobileVersion']) + r'\s*$', module, re.M),
-            'actual source Go/module/generator declaration differs')
     declared = value['declaredTagsSource']
     require(declared['path'] == 'cmd/internal/build_libbox/main.go' and
             sha((source / declared['path']).read_bytes()) == declared['sha256'], 'source-owned tags declaration differs')
@@ -117,24 +107,16 @@ def verify_source(source, value, *, generator_outputs=False):
     unexpected = [name for name in ignored + untracked
                   if not (generator_outputs and name.startswith('build/'))]
     require(not unexpected, 'untracked ignored compiler/embed input is not a zero-overlay source')
-    meta = policy['metacubex']
-    prefix = meta['replacementPath'][2:]
-    total_bytes = 0
-    _, files, modes, trees = verify_vendor_sources(source, policy['vendors'], git)
-    for name in ['go.mod', 'go.sum', meta['bindingPath'], meta['patchPath']]:
-        path = source / name
-        require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(source),
-                'reviewed source input redirected/missing')
-        require(path.stat().st_size <= 2 * 1024 * 1024, 'reviewed source input exceeds bound')
-        total_bytes += path.stat().st_size
-        require(total_bytes <= 32 * 1024 * 1024, 'reviewed source proof exceeds bound')
-        files[name] = path.read_bytes()
+    declaration = canonical(value)
+    result = subprocess.run(['node', Path(__file__).with_name('source-admission.mjs'), '--reviewed-source', source],
+                            input=declaration, env=git_environment(), capture_output=True, timeout=60)
+    require(result.returncode == 0,
+            result.stderr.decode(errors='replace').strip() or 'reviewed mobile source rejected')
     return {'schema': 'polaris-mobile-source-observation-v1', 'sourceCommit': value['sourceCommit'],
             'sourceTree': value['sourceTree'], 'sourceTag': value['sourceTag'],
             'sourceTagObject': value['sourceTagObject'], 'sourceOverlay': 0,
-            'inputContractSha256': sha(canonical(value)), 'artifactAcceptance': False,
-            'reviewedSource': verify_source_policy_files(policy, files, git(source, 'rev-parse', 'HEAD:' + prefix),
-                                                         vendor_modes=modes, vendor_trees=trees)}
+            'inputContractSha256': sha(declaration), 'artifactAcceptance': False,
+            'reviewedSource': json.loads(result.stdout)}
 
 
 def binding_flags(authority, input_fingerprint):

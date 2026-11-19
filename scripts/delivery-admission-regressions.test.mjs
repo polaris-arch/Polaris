@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { devNull, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
@@ -14,6 +14,104 @@ import { inspectAppleArchitecture } from './mobile-core/apple-admission.mjs';
 import { checkMobileBuildInfo, parseMobileBuildInfo, validateMobileSource } from './mobile-core/source-admission.mjs';
 const nativeId = 'polaris-mobile-' + 'a'.repeat(64);
 const requiredNative = ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun'];
+
+test('reviewed source observes every vendor object and enforces the independent Meta binding', { skip: process.platform === 'win32' }, () => {
+  const folder = realpathSync(mkdtempSync(join(tmpdir(), 'reviewed-mobile-source-')));
+  try {
+    const root = join(folder, 'source');
+    mkdirSync(root);
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+    Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull, GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' });
+    const git = (...args) => execFileSync('git', args, { cwd: root, env, encoding: 'utf8' }).trim();
+    const write = (path, bytes) => {
+      const target = join(root, path);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, bytes);
+    };
+    const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+    const source = JSON.parse(readFileSync(new URL('mobile-core/source-contract.json', import.meta.url)));
+    const policy = source.sourcePolicy, { metacubex: meta } = policy;
+    const vendors = Object.entries(policy.vendors);
+    const changedFiles = ['conn.go', 'reality.go'];
+    const metaFiles = [...changedFiles, 'nested.txt', ...Array.from({ length: 352 }, (_, n) => 'nested/' + n)];
+    for (const [name, pin] of vendors) {
+      const files = name === meta.module ? metaFiles : ['package.txt'];
+      for (const file of files) write(join(pin.replacementPath, file), 'original\n');
+      pin.replacementFileCount = files.length;
+    }
+    symlinkSync('.gitignore', join(root, 'third_party/tailscale/.stignore'));
+    write('third_party/tailscale/.gitignore', '');
+    policy.vendors['github.com/sagernet/tailscale'].replacementFileCount += 2;
+    write('go.mod', [`module ${source.goModule}`, `go ${policy.goDirective}`, `toolchain ${policy.toolchain}`, 'require (',
+      '\tgithub.com/sagernet/gomobile ' + source.gomobileVersion, ...vendors.map(([name, pin]) => `\t${name} ${pin.version}`),
+      ')', 'replace (', ...vendors.map(([name, pin]) => `\t${name} => ${pin.replacementPath}`), ')', ''].join('\n'));
+    write('go.sum', 'reviewed sum\n');
+    for (const [file, key] of [['go.mod', 'goModSha256'], ['go.sum', 'goSumSha256']]) {
+      policy[key] = source[key] = sha(readFileSync(join(root, file)));
+    }
+    const patch = 'reviewed patch\n';
+    write(meta.patchPath, patch);
+    meta.patchSha256 = sha(patch);
+    const binding = { schema: 'polaris-repository-module-replacement-v1', module: meta.module,
+      upstreamRepository: 'https://github.com/MetaCubeX/utls', upstreamCommit: meta.upstreamCommit,
+      upstreamVersion: meta.version, upstreamH1: meta.upstreamH1, upstreamModuleZipSHA256: meta.upstreamZipSha256,
+      replacementPath: meta.replacementPath, patch: meta.patchPath, patchSHA256: meta.patchSha256, changedFiles,
+      files: Object.fromEntries(metaFiles.map(name => [name, { bytes: 9,
+        beforeSHA256: sha(changedFiles.includes(name) ? 'upstream\n' : 'original\n'), afterSHA256: sha('original\n') }])) };
+    function writeBinding() {
+      const bytes = JSON.stringify(binding);
+      write(meta.bindingPath, bytes);
+      meta.bindingSha256 = sha(bytes);
+    }
+    writeBinding();
+    git('init', '-q', '--object-format=sha1');
+    git('add', '-f', '.');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'reviewed source fixture');
+    policy.sourceCommit = source.sourceCommit = git('rev-parse', 'HEAD');
+    policy.sourceTree = source.sourceTree = git('rev-parse', 'HEAD^{tree}');
+    for (const [, pin] of vendors) pin.replacementTree = git('rev-parse', 'HEAD:' + pin.replacementPath.slice(2));
+    meta.replacementTree = policy.vendors[meta.module].replacementTree;
+
+    const script = fileURLToPath(new URL('mobile-core/source-admission.mjs', import.meta.url));
+    const observe = () => spawnSync(process.execPath, [script, '--reviewed-source', root],
+      { env, input: JSON.stringify(source), encoding: 'utf8' });
+    const good = observe();
+    assert.equal(good.status, 0, good.stderr);
+    const observation = JSON.parse(good.stdout);
+    assert.equal(observation.schema, 'polaris-reviewed-source-observation-v2');
+    assert.equal(observation.replacementFileCount, 355);
+    assert.deepEqual(observation.vendors, Object.fromEntries(vendors.map(([name, pin]) =>
+      [name, { path: pin.replacementPath, tree: pin.replacementTree, files: pin.replacementFileCount }])));
+    const refuse = reason => {
+      const result = observe();
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, reason);
+    };
+    const target = 'third_party/sing/package.txt';
+    write(target, 'different');
+    refuse(/vendor bytes differ/);
+    write(target, 'original\n');
+    chmodSync(join(root, target), 0o755);
+    refuse(/vendor mode differs/);
+    chmodSync(join(root, target), 0o644);
+    const redirected = dirname(join(root, target)), outside = join(folder, 'redirected');
+    renameSync(redirected, outside);
+    symlinkSync(outside, redirected, 'dir');
+    refuse(/source directory redirected/);
+    rmSync(redirected);
+    renameSync(outside, redirected);
+    binding.files['conn.go'].afterSHA256 = sha('different');
+    writeBinding();
+    refuse(/actual Meta bytes differ: conn\.go/);
+    binding.files['conn.go'].afterSHA256 = sha('original\n');
+    writeBinding();
+    write('go.sum', 'another sum\n');
+    refuse(/actual go\.sum differs/);
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
 function mobileBuildFixture(folder) {
   const root = realpathSync(folder);
   const source = JSON.parse(readFileSync(new URL('mobile-core/source-contract.json', import.meta.url)));

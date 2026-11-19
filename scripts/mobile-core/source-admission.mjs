@@ -1,13 +1,16 @@
-// Mobile declaration and receipt decoding. The producer independently observes
-// Git, source bytes and tool execution.
+// Mobile declaration, reviewed source observation, and receipt decoding.
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
-import { posix, resolve, win32 } from 'node:path';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
+import { dirname, join, posix, resolve, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const versionPattern = new RegExp(JSON.parse(readFileSync(new URL('../lib/polaris-version.json', import.meta.url))).pattern);
 const goVersion = '1.27.4';
 const sourceContractBytes = 65536;
+const sourceControlBytes = 2 * 1024 * 1024;
+const vendorFileBytes = 32 * 1024 * 1024;
+const vendorTotalBytes = 512 * 1024 * 1024;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 const statOptions = { bigint: true };
 export const receiptPolicy = JSON.parse(readFileSync(new URL('receipt-policy.json', import.meta.url)));
@@ -30,6 +33,7 @@ const vendorDirectories = {
 function demand(condition, reason) {
   if (!condition) throw new Error(reason);
 }
+const review = (condition, reason) => demand(condition, 'reviewed source policy: ' + reason);
 const object = (value) => value != null && typeof value === 'object' && !Array.isArray(value);
 const closed = (value, keys) => object(value) && Object.keys(value).length === keys.length &&
   keys.every((key) => Object.hasOwn(value, key));
@@ -38,7 +42,6 @@ const exactList = (value, expected) => Array.isArray(value) && value.length === 
 const hex = (value, width) => typeof value === 'string' && value.length === width && /^[0-9a-f]+$/.test(value);
 
 function validateSourcePolicy(policy, source) {
-  const review = (condition, reason) => demand(condition, 'reviewed source policy: ' + reason);
   review(closed(policy, ['schema', 'sourceCommit', 'sourceTree', 'goDirective', 'goVersion', 'toolchain',
     'goModSha256', 'goSumSha256', 'metacubex', 'vendors']) &&
     policy.schema === 'polaris-reviewed-kernel-source-v4', 'complete explicit declaration required');
@@ -260,7 +263,7 @@ export function decode(raw, maximum, receiptLimit) {
   return result;
 }
 
-export function pinned(path, maximum, observation = false, { allowEmpty = false } = {}) {
+function readPinnedBytes(path, maximum, observation, { allowEmpty = false, executable } = {}) {
   const before = lstatSync(path, { ...statOptions, throwIfNoEntry: false });
   if (observation) console.error(JSON.stringify({
     schema: 'polaris-receipt-size-observation-v1', phase: 'read', path,
@@ -268,9 +271,10 @@ export function pinned(path, maximum, observation = false, { allowEmpty = false 
     scope: 'actual lstat size; not receipt or carrier acceptance',
   }));
   demand(before?.isFile() && (allowEmpty || before.size > 0n) && before.size <= BigInt(maximum), 'bounded regular original receipt or artifact required');
+  if (executable !== undefined) review(((before.mode & 0o111n) !== 0n) === executable, 'vendor mode differs');
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
-    const identity = info => info.isFile() && ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every(key => info[key] === before[key]);
+    const identity = info => info.isFile() && ['dev', 'ino', 'mode', 'size', 'mtimeNs', 'ctimeNs'].every(key => info[key] === before[key]);
     demand(identity(fstatSync(fd, statOptions)), 'original file changed before bounded read');
     const bytes = Buffer.allocUnsafe(Number(before.size));
     let at = 0;
@@ -280,8 +284,13 @@ export function pinned(path, maximum, observation = false, { allowEmpty = false 
       at += length;
     }
     demand(identity(fstatSync(fd, statOptions)) && identity(lstatSync(path, statOptions)), 'original file changed during bounded read');
-    return { bytes, pin: { bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') } };
+    return bytes;
   } finally { closeSync(fd); }
+}
+
+export function pinned(path, maximum, observation = false, options) {
+  const bytes = readPinnedBytes(path, maximum, observation, options);
+  return { bytes, pin: { bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') } };
 }
 
 function sourceDeclaration(value, key) {
@@ -300,6 +309,181 @@ function validateSourceBytes(raw) {
 export function readMobileSource() {
   const path = fileURLToPath(new URL('source-contract.json', import.meta.url));
   return validateSourceBytes(pinned(path, sourceContractBytes).bytes);
+}
+
+function verifySourceModule(raw, source) {
+  const { goDirective, toolchain, vendors } = source.sourcePolicy;
+  const text = utf8.decode(raw);
+  review(!text.includes('/*') && !text.includes('\0'), 'unsupported source module syntax');
+  const directives = new Map(), dependencies = new Map(), replacements = new Map();
+  let block, generatorDeclared = false;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.split('//', 1)[0].trim();
+    if (!line) continue;
+    if (line === ')') {
+      review(block !== undefined, 'unmatched source module block');
+      block = undefined;
+      continue;
+    }
+    const tokens = line.split(/\s+/);
+    const directive = block ?? tokens.shift();
+    if (exactList(tokens, ['('])) {
+      review(block === undefined && ['require', 'replace', 'exclude', 'retract'].includes(directive),
+        'unsupported source module block');
+      block = directive;
+      continue;
+    }
+    review(!/["`]/.test(line), 'quoted source module declaration refused');
+    const [name, version] = tokens;
+    if (['module', 'go', 'toolchain'].includes(directive)) {
+      review(block === undefined && !directives.has(directive) && tokens.length === 1,
+        'duplicate or malformed source module directive');
+      if (directive !== 'toolchain') review(line === rawLine.trim(), 'actual Go/module directives differ');
+      directives.set(directive, name);
+    } else if (directive === 'require') {
+      review(tokens.length === 2 && !dependencies.has(name), 'duplicate or malformed source dependency');
+      dependencies.set(name, version);
+      if (name === 'github.com/sagernet/gomobile') generatorDeclared = block === 'require' && line === rawLine.trim();
+    } else if (directive === 'replace') {
+      const marker = tokens.indexOf('=>'), right = tokens.length - marker - 1;
+      review((marker === 1 || marker === 2) && (right === 1 || right === 2) &&
+        marker === tokens.lastIndexOf('=>') && !replacements.has(name),
+      'duplicate or malformed source replacement');
+      review(right === 2 || marker === 1, 'version-scoped local replacement refused');
+      replacements.set(name, right === 1 ? tokens[marker + 1] : null);
+    }
+  }
+  review(block === undefined, 'unterminated source module block');
+  review(directives.get('module') === source.goModule && directives.get('go') === goDirective &&
+    directives.get('toolchain') === toolchain, 'actual Go/module directives differ');
+  review([...replacements.values()].filter(path => path !== null).length === Object.keys(vendors).length,
+    'exact reviewed local replacements required');
+  for (const [name, pin] of Object.entries(vendors)) {
+    review(replacements.get(name) === pin.replacementPath, 'exact reviewed local replacements required');
+    review(dependencies.get(name) === pin.version, 'actual vendor dependency version differs: ' + name);
+  }
+  review(generatorDeclared && dependencies.get('github.com/sagernet/gomobile') === source.gomobileVersion,
+    'actual Meta/generator dependency version differs');
+}
+
+function gitObject(kind, raw) {
+  return createHash('sha1').update(kind + ' ' + raw.length + '\0').update(raw).digest();
+}
+
+function vendorTree(entries) {
+  const rows = [...entries].map(([name, value]) => {
+    const directory = value instanceof Map;
+    const mode = directory ? '40000' : value.mode;
+    const digest = directory ? vendorTree(value) : value.digest;
+    return {
+      sort: Buffer.from(name + (directory ? '/' : '')),
+      row: Buffer.concat([Buffer.from(mode + ' ' + name + '\0'), digest]),
+    };
+  });
+  rows.sort((left, right) => Buffer.compare(left.sort, right.sort));
+  return gitObject('tree', Buffer.concat(rows.map(({ row }) => row)));
+}
+
+function reviewedSource(root, source) {
+  root = realpathSync(root);
+  // The caller owns exact checkout/tag and zero-overlay guards and passes its
+  // sanitized Git environment. The observation below binds actual bytes to Git.
+  const git = (...args) => utf8.decode(execFileSync('git', ['--no-replace-objects', '-C', root, ...args], {
+    timeout: 30000, maxBuffer: limits.controlBytes, stdio: ['ignore', 'pipe', 'pipe'],
+  }));
+  review(realpathSync(git('rev-parse', '--show-toplevel').trim()) === root, 'Git worktree differs from actual source root');
+  const policy = source.sourcePolicy, { metacubex: meta, vendors } = policy;
+  const readInsideSource = (name, read) => {
+    const path = join(root, name), parent = dirname(path);
+    const checkParent = () => review(realpathSync(parent) === parent, 'reviewed source directory redirected: ' + name);
+    checkParent();
+    const result = read(path);
+    checkParent();
+    return result;
+  };
+  const control = (name, sha256, allowEmpty = false) => {
+    const { bytes, pin } = readInsideSource(name, path => pinned(path, sourceControlBytes, false, { allowEmpty }));
+    review(pin.sha256 === sha256, 'actual ' + name + ' differs');
+    return bytes;
+  };
+  verifySourceModule(control('go.mod', policy.goModSha256), source);
+  control('go.sum', policy.goSumSha256, true);
+  control(meta.patchPath, meta.patchSha256);
+  const binding = decode(control(meta.bindingPath, meta.bindingSha256), sourceControlBytes);
+  const changed = ['conn.go', 'reality.go'];
+  const expected = { schema: 'polaris-repository-module-replacement-v1', module: meta.module,
+    upstreamRepository: 'https://github.com/MetaCubeX/utls', upstreamCommit: meta.upstreamCommit,
+    upstreamVersion: meta.version, upstreamH1: meta.upstreamH1, upstreamModuleZipSHA256: meta.upstreamZipSha256,
+    replacementPath: meta.replacementPath, patch: meta.patchPath, patchSHA256: meta.patchSha256 };
+  review(object(binding) && Object.entries(expected).every(([key, value]) => binding[key] === value) &&
+    exactList(binding.changedFiles, changed), 'Meta baseline/patch binding differs');
+  const inventory = binding.files;
+  review(object(inventory) && Object.keys(inventory).length === meta.replacementFileCount,
+    'complete 355-file Meta inventory required');
+  for (const [name, pin] of Object.entries(inventory)) {
+    review(closed(pin, ['beforeSHA256', 'afterSHA256', 'bytes']) && hex(pin.beforeSHA256, 64) &&
+      hex(pin.afterSHA256, 64) && Number.isSafeInteger(pin.bytes) && pin.bytes >= 0, 'Meta file pin differs: ' + name);
+  }
+  review(exactList(Object.keys(inventory).filter(name => inventory[name].beforeSHA256 !== inventory[name].afterSHA256).sort(), changed),
+    'Meta changed-file inventory differs');
+
+  let totalBytes = 0;
+  const observed = {};
+  for (const [module, pin] of Object.entries(vendors)) {
+    const prefix = pin.replacementPath.slice(2);
+    const tree = git('rev-parse', source.sourceCommit + ':' + prefix).trim();
+    review(tree === pin.replacementTree, 'vendor subtree differs: ' + module);
+    const rows = git('ls-tree', '-r', '-z', tree).split('\0');
+    review(rows.pop() === '' && rows.length === pin.replacementFileCount, 'vendor inventory differs: ' + module);
+    const entries = new Map();
+    for (const row of rows) {
+      const match = /^(100644|100755|120000) blob ([a-f0-9]{40})\t([^\\\x00-\x1f\x7f]+)$/.exec(row);
+      review(match, 'vendor path or mode differs');
+      const [, mode, blob, name] = match;
+      const parts = name.split('/');
+      review(parts.every(part => part && part !== '.' && part !== '..'), 'vendor path differs');
+      const path = prefix + '/' + name;
+      let bytes;
+      if (mode === '120000') {
+        review(path === 'third_party/tailscale/.stignore', 'unexpected vendor symlink');
+        bytes = readInsideSource(path, file => readlinkSync(file, { encoding: 'buffer' }));
+        review(bytes.equals(Buffer.from('.gitignore')), 'unexpected vendor symlink');
+      } else {
+        bytes = readInsideSource(path, file => readPinnedBytes(file, vendorFileBytes, false,
+          { allowEmpty: true, executable: mode === '100755' }));
+      }
+      totalBytes += bytes.length;
+      review(totalBytes <= vendorTotalBytes, 'vendor inventory exceeds byte budget');
+      const digest = gitObject('blob', bytes);
+      review(digest.toString('hex') === blob, 'vendor bytes differ: ' + path);
+      if (module === meta.module) {
+        const metaPin = inventory[name];
+        review(metaPin && metaPin.bytes === bytes.length &&
+          metaPin.afterSHA256 === createHash('sha256').update(bytes).digest('hex'), 'actual Meta bytes differ: ' + name);
+      }
+      const leaf = parts.pop();
+      let parent = entries;
+      for (const part of parts) {
+        if (!parent.has(part)) parent.set(part, new Map());
+        parent = parent.get(part);
+        review(parent instanceof Map, 'vendor file/directory collision');
+      }
+      review(!parent.has(leaf), 'duplicate vendor tree entry');
+      parent.set(leaf, { mode, digest });
+    }
+    review(vendorTree(entries).toString('hex') === tree, 'actual vendor subtree differs: ' + module);
+    observed[module] = { path: pin.replacementPath, tree, files: rows.length };
+  }
+  // The closed source policy contains only ASCII keys and scalar string/integer values.
+  const canonical = value => JSON.stringify(value, (_, item) => object(item)
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+  return {
+    schema: 'polaris-reviewed-source-observation-v2',
+    sourcePolicySha256: createHash('sha256').update(canonical(policy)).digest('hex'),
+    replacementTree: meta.replacementTree, replacementFileCount: meta.replacementFileCount,
+    bindingSha256: meta.bindingSha256, patchSha256: meta.patchSha256, vendors: observed,
+    baselineH1Role: 'upstream provenance only; local replacement has no h1',
+  };
 }
 
 function mobileLinkerFlagsPrefix(source) {
@@ -507,6 +691,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (args.length === 1 && args[0] === '--versions') {
       const source = readMobileSource();
       console.log(`${source.goVersion} ${source.version}`);
+    } else if (args.length === 2 && args[0] === '--reviewed-source') {
+      console.log(JSON.stringify(reviewedSource(args[1], validateSourceBytes(readBoundedInput(sourceContractBytes)))));
     } else if (args.length === 4 && args[0] === '--native-buildinfo') {
       const [, path, size, digest] = args;
       const { bytes, pin } = pinned(path, limits.controlBytes);
@@ -516,7 +702,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       if (Object.hasOwn(evidence, 'raw')) console.log(JSON.stringify(observed));
     } else {
       // The producer sends its full declaration once and reuses these plans.
-      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --native-buildinfo PATH BYTES SHA256]');
+      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --reviewed-source ROOT | --native-buildinfo PATH BYTES SHA256]');
       console.log(JSON.stringify(bindingPlans(validateSourceBytes(readBoundedInput(sourceContractBytes)))));
     }
   } catch (error) {
