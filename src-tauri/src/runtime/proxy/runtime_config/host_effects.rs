@@ -1592,7 +1592,7 @@ impl ProxyRuntime {
             return;
         };
         let Some(current) = state.host.current.as_ref().filter(|current| {
-            current.execution.generation == self.gate.generation()
+            self.gate.try_generation() == Some(current.execution.generation)
                 && result
                     .host_execution_id
                     .as_ref()
