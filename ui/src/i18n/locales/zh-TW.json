@@ -250,6 +250,8 @@
     "levelAria": "記錄顯示層級",
     "sourceAria": "記錄來源",
     "diagnosticMode": "診斷模式",
+    "diagnosticEnabled": "已開啟診斷模式。",
+    "diagnosticDisabled": "已關閉診斷模式。",
     "diagnosticTipOff": "本次執行暫時啟用 DEBUG；重啟應用程式後恢復。",
     "diagnosticTipOn": "診斷模式已開啟；再次點擊或重啟應用程式後恢復。",
     "diagnosticFailed": "切換診斷模式失敗",

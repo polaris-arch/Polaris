@@ -9,6 +9,7 @@ const entry = `
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { MobileConnectionsScreen } from '/src/mobile/connections/MobileConnectionsScreen';
+import { MobileToaster } from '/src/mobile/MobileToaster';
 import { api } from '/src/ipc/api-client';
 import { useAppStore } from '/src/store/app-store';
 import i18n, { i18nReady } from '/src/i18n';
@@ -16,7 +17,7 @@ import '/src/styles/tokens.resolved.css';
 import '/src/mobile/mobile.css';
 import '/src/mobile/forms/forms.css';
 await i18nReady; await i18n.changeLanguage('en-US');
-const state = window.__mobileLogRecovery = { listeners: [], reads: [], searches: [], unsubscribed: [],
+const state = window.__mobileLogRecovery = { listeners: [], reads: [], searches: [], unsubscribed: [], diagnosticWrites: [],
   immediateReady: false, immediateReconnectRows: null };
 api.logs.onReceivedBatchReady = callback => new Promise((resolve, reject) => {
   const listener = { callback, off: 0, resolve: () => resolve(() => listener.off++), reject };
@@ -30,6 +31,7 @@ api.logs.get = id => new Promise((resolve, reject) => {
 api.logs.search = (query, level, source) => new Promise((resolve, reject) => state.searches.push({ query, level, source, resolve, reject }));
 api.logs.unsubscribe = async id => { state.unsubscribed.push(id); };
 api.logs.diagnosticState = async () => false;
+api.logs.setDiagnostic = enabled => new Promise(resolve => state.diagnosticWrites.push({ enabled, resolve }));
 api.logs.runtimeLevel = async () => ({ level: null, reason: 'notRunning' });
 api.logs.legacyInfo = async () => ({ exists: false, bytes: 0, path: '' });
 api.proxy.onLifecycle = () => () => {};
@@ -42,7 +44,7 @@ useAppStore.setState({ config: { logLevel: 'info', servers: [], subscriptions: [
 function App() {
   const [visible, setVisible] = useState(true);
   state.hide = () => setVisible(false); state.show = () => setVisible(true);
-  return visible ? <MobileConnectionsScreen /> : <p>Fixture hidden</p>;
+  return visible ? <><MobileConnectionsScreen /><MobileToaster /></> : <p>Fixture hidden</p>;
 }
 createRoot(document.getElementById('root')).render(<App />);
 `;
@@ -89,6 +91,27 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile log ownership 
     await page.evaluate(({ index, rows }) => (window as any).__mobileLogRecovery.reads[index].resolve(rows), { index, rows });
     await page.locator('.mc-live').waitFor();
   }
+
+  it('shows the specific diagnostic toggle result only after the session reply', async () => {
+    const page = await fixture();
+    try {
+      await page.getByRole('button', { name: 'More', exact: true }).click();
+      const toggle = page.getByRole('button', { name: /Diagnostic mode/ });
+      const toast = page.locator('.m-toast-msg');
+      for (const [index, enabled] of [true, false].entries()) {
+        await toggle.click();
+        await page.waitForFunction(index => (window as any).__mobileLogRecovery.diagnosticWrites.length > index, index);
+        const message = enabled ? 'Diagnostic mode enabled.' : 'Diagnostic mode disabled.';
+        expect(await toast.filter({ hasText: message }).count()).toBe(0);
+        expect(await toggle.isDisabled()).toBe(true);
+        expect(await page.evaluate(index => (window as any).__mobileLogRecovery.diagnosticWrites[index].enabled, index)).toBe(enabled);
+        await page.evaluate(({ index, enabled }) => (window as any).__mobileLogRecovery.diagnosticWrites[index].resolve(enabled), { index, enabled });
+        await toast.filter({ hasText: message }).waitFor();
+      }
+    } finally {
+      await page.close();
+    }
+  });
 
   it('makes listener failure visible, retries with a new owner, and becomes live only after valid hydration', async () => {
     const page = await fixture();

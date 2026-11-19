@@ -250,6 +250,8 @@
     "levelAria": "Log display level",
     "sourceAria": "Log source",
     "diagnosticMode": "Diagnostic mode",
+    "diagnosticEnabled": "Diagnostic mode enabled.",
+    "diagnosticDisabled": "Diagnostic mode disabled.",
     "diagnosticTipOff": "Temporarily enable DEBUG for this run; restarting the app restores the configured level.",
     "diagnosticTipOn": "Diagnostic mode is on; click again or restart the app to restore the configured level.",
     "diagnosticFailed": "Failed to toggle diagnostic mode",

@@ -250,6 +250,8 @@
     "levelAria": "日志显示级别",
     "sourceAria": "日志来源",
     "diagnosticMode": "诊断模式",
+    "diagnosticEnabled": "已开启诊断模式。",
+    "diagnosticDisabled": "已关闭诊断模式。",
     "diagnosticTipOff": "本次运行临时启用 DEBUG；重启应用后恢复。",
     "diagnosticTipOn": "诊断模式已开启；再次点击或重启应用后恢复。",
     "diagnosticFailed": "切换诊断模式失败",

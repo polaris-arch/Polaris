@@ -16,5 +16,7 @@ describe('会话诊断模式接线', () => {
     const body = SCREEN.slice(start, end);
     expect(body).not.toContain('saveConfig');
     expect(body).not.toContain('stage(');
+    expect(body).toContain("toast.info(t(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'))");
+    expect(body.indexOf('await api.logs.setDiagnostic')).toBeLessThan(body.indexOf('toast.info'));
   });
 });

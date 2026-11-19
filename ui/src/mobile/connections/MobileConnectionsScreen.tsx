@@ -415,6 +415,7 @@ export function MobileConnectionsScreen(): ReactElement {
   const [logPage, setLogPage] = useState(0);
   const [runtimeLevel, setRuntimeLevel] = useState<RuntimeLogLevel | null>(null);
   const [diagnosticMode, setDiagnosticMode] = useState<boolean | null>(null);
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false);
 
   const followRef = useRef(follow);
   followRef.current = follow;
@@ -852,12 +853,15 @@ export function MobileConnectionsScreen(): ReactElement {
   }, [runWrite]);
 
   const onToggleDiagnostic = useCallback(() => {
+    if (diagnosticBusy) return;
+    setDiagnosticBusy(true);
     void runWrite('screen', 'logs.diagnosticFailed', async () => {
       const enabled = await api.logs.setDiagnostic(!(diagnosticMode ?? false));
       setDiagnosticMode(enabled);
+      toast.info(trRef.current(enabled ? 'logs.diagnosticEnabled' : 'logs.diagnosticDisabled'));
       return true;
-    });
-  }, [diagnosticMode, runWrite]);
+    }).finally(() => setDiagnosticBusy(false));
+  }, [diagnosticBusy, diagnosticMode, runWrite]);
 
   /* ═══════════ W26 前遗留的无界 `singbox.log`（归档 / 删除）═══════════ */
 
@@ -1173,7 +1177,7 @@ export function MobileConnectionsScreen(): ReactElement {
         description:
           diagnosticMode === true ? tr('logs.diagnosticTipOn') : tr('logs.diagnosticTipOff'),
         selected: diagnosticMode === true,
-        disabled: diagnosticMode === null,
+        disabled: diagnosticMode === null || diagnosticBusy,
         onSelect: onToggleDiagnostic,
       },
       {
@@ -1257,6 +1261,7 @@ export function MobileConnectionsScreen(): ReactElement {
     filteredRows.length,
     activeRows.length,
     closedRows.length,
+    diagnosticBusy,
     diagnosticMode,
     privacyMode,
     redactLogs,
