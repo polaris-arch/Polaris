@@ -111,18 +111,18 @@ async fn failed_pinned_proxy_never_falls_back_to_the_direct_result() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn android_post_connect_reuses_an_early_success_and_keeps_the_late_retry() {
-    for (early_delay, early_success, expected_starts) in [
-        (1, true, vec![0]),
-        (1, false, vec![0, 5]),
-        (8, true, vec![0, 5]),
+async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
+    for (direct_delay, first_delay, first_success, expected_starts, expected_early, expected_end) in [
+        (5, 1, true, vec![0], Some(1), 5),
+        (8, 1, false, vec![0, 5], Some(5), 8),
+        (5, 8, true, vec![0], None, 8),
     ] {
         let started = tokio::time::Instant::now();
         let mut starts = Vec::new();
         let mut published = Vec::new();
         let (direct, proxy) = probe_post_connect_ipinfo(
             async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(direct_delay)).await;
                 Ok(json!({ "ip": "192.0.2.1" }))
             },
             || {
@@ -130,8 +130,8 @@ async fn android_post_connect_reuses_an_early_success_and_keeps_the_late_retry()
                 starts.push(started.elapsed().as_secs());
                 async move {
                     if first {
-                        tokio::time::sleep(Duration::from_secs(early_delay)).await;
-                        if !early_success {
+                        tokio::time::sleep(Duration::from_secs(first_delay)).await;
+                        if !first_success {
                             return Err("tunnel still warming".to_string());
                         }
                     }
@@ -144,12 +144,14 @@ async fn android_post_connect_reuses_an_early_success_and_keeps_the_late_retry()
         assert_eq!(direct.unwrap()["ip"], "192.0.2.1");
         assert_eq!(proxy["ip"], "192.0.2.2");
         assert_eq!(starts, expected_starts);
-        if early_success && early_delay < 5 {
-            assert_eq!(published, vec![(Duration::from_secs(early_delay), proxy)]);
-        } else {
-            assert!(published.is_empty());
-        }
-        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(
+            published,
+            expected_early
+                .map(|seconds| (Duration::from_secs(seconds), proxy))
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(expected_end));
     }
 }
 

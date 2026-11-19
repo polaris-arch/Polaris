@@ -55,7 +55,9 @@ fn pending_stop_and_commit_are_serialized_under_one_lock() {
     );
     assert!(
         commit.find("ipinfo_probe_is_current(epoch, seq)").unwrap()
-            < commit.find("state.publish(snap.clone(), true)").unwrap()
+            < commit
+                .find("state.publish(snap.clone(), complete)")
+                .unwrap()
     );
     let sequencer = body("fn next_ipinfo_schedule_seq(");
     assert!(

@@ -658,7 +658,7 @@ where
 
 async fn probe_post_connect_ipinfo<D, P, PFut>(
     direct: D,
-    mut proxy: P,
+    proxy: P,
     on_early_proxy: impl FnOnce(&Value),
 ) -> (Result<Value, String>, Value)
 where
@@ -666,31 +666,24 @@ where
     P: FnMut() -> PFut,
     PFut: std::future::Future<Output = Result<Value, String>>,
 {
-    tokio::pin!(direct);
-    // Reuse a successful early answer. If direct finishes first, cancel the
-    // pending early attempt and start the normal proxy retry window.
-    let (direct, early_proxy) = tokio::select! {
+    let proxy = with_ipinfo_retry(
+        proxy,
+        IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
+        IPINFO_PROXY_POST_CONNECT_RETRY_MS,
+    );
+    // Keep the same proxy future running even when the direct leg finishes first.
+    tokio::pin!(direct, proxy);
+    let (direct, proxy) = tokio::select! {
         biased;
-        direct = &mut direct => (direct, None),
-        proxy = proxy() => {
-            let proxy = proxy.ok();
-            if let Some(value) = &proxy {
+        direct = &mut direct => (direct, proxy.await),
+        proxy = &mut proxy => {
+            if let Ok(value) = &proxy {
                 on_early_proxy(value);
             }
             (direct.await, proxy)
         },
     };
-    let proxy = match early_proxy {
-        Some(value) => value,
-        None => with_ipinfo_retry(
-            proxy,
-            IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
-            IPINFO_PROXY_POST_CONNECT_RETRY_MS,
-        )
-        .await
-        .unwrap_or(Value::Null),
-    };
-    (direct, proxy)
+    (direct, proxy.unwrap_or(Value::Null))
 }
 
 /// 构造出口 IP 快照：direct（经直连传输层单点）+ proxy（经本机混合端口，核未运行 → null）。
@@ -728,22 +721,18 @@ async fn build_ipinfo_snapshot(
     // 并带本次起核的凭据 —— 此前无条件读 `mixed_port`，Android 上连向一个不存在的口，出口 IP 恒空）。
     let (direct, proxy) = if let Some(lp) = local_proxy.filter(|_| status.running) {
         match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
-            Ok(p) if post_connect && cfg!(target_os = "android") => {
+            Ok(p) if post_connect => {
                 probe_post_connect_ipinfo(direct, || fetch_trace_ipinfo(&p), publish_early).await
             }
             Ok(p) => {
-                let (attempts, retry_ms) = if post_connect {
-                    (
-                        IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
-                        IPINFO_PROXY_POST_CONNECT_RETRY_MS,
-                    )
-                } else {
-                    (IPINFO_PROXY_ATTEMPTS, IPINFO_PROXY_RETRY_MS)
-                };
                 let direct = direct.await;
-                let proxy = with_ipinfo_retry(|| fetch_trace_ipinfo(&p), attempts, retry_ms)
-                    .await
-                    .unwrap_or(Value::Null);
+                let proxy = with_ipinfo_retry(
+                    || fetch_trace_ipinfo(&p),
+                    IPINFO_PROXY_ATTEMPTS,
+                    IPINFO_PROXY_RETRY_MS,
+                )
+                .await
+                .unwrap_or(Value::Null);
                 (direct, proxy)
             }
             Err(_) => (direct.await, Value::Null),
