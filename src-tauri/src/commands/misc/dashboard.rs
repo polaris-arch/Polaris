@@ -8,9 +8,26 @@ use crate::runtime::AppRuntime;
 
 /// sing-box 官方面板内窗口 label（单例：已存在则聚焦复用，对齐 上游 `dashboardWindow`）。
 const DASHBOARD_WINDOW_LABEL: &str = "singbox-dashboard";
-// The preload (including the credential) and the navigation boundary are fixed
-// at creation. Serialize opening and remember only a digest of the preload.
-static DASHBOARD_PRELOAD: tokio::sync::Mutex<Option<String>> = tokio::sync::Mutex::const_new(None);
+// The preload and navigation boundary are fixed at construction. Store no raw credential.
+static DASHBOARD_BINDING: tokio::sync::Mutex<Option<DashboardBinding>> =
+    tokio::sync::Mutex::const_new(None);
+
+#[derive(PartialEq, Eq)]
+struct DashboardBinding {
+    generation: u64,
+    preload_digest: String,
+    language: &'static str,
+}
+
+impl DashboardBinding {
+    fn new(generation: u64, script: &str, language: &'static str) -> Self {
+        Self {
+            generation,
+            preload_digest: polaris_updater::sha256_hex(script.as_bytes()),
+            language,
+        }
+    }
+}
 
 /// 上游 `OPEN_SINGBOX_DASHBOARD`：打开 sing-box 官方面板（应用内 webview 窗，dashboard #55）。
 ///
@@ -52,42 +69,59 @@ static DASHBOARD_PRELOAD: tokio::sync::Mutex<Option<String>> = tokio::sync::Mute
 )]
 #[tauri::command]
 pub async fn open_singbox_dashboard(app: AppHandle, locale: Option<String>) -> ApiResponse<Value> {
-    let mut active_preload = DASHBOARD_PRELOAD.lock().await;
-    let (parsed, api_url, script, preload) = loop {
-        let info = app.state::<AppRuntime>().proxy().dashboard_connection();
-        if info["ok"] != true {
+    reconcile_dashboard_window(&app, Some(map_locale_to_dashboard_lang(locale.as_deref()))).await
+}
+
+pub(crate) fn refresh_open_singbox_dashboard(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = reconcile_dashboard_window(&app, None).await;
+    });
+}
+
+async fn reconcile_dashboard_window(
+    app: &AppHandle,
+    requested_language: Option<&'static str>,
+) -> ApiResponse<Value> {
+    let mut active = DASHBOARD_BINDING.lock().await;
+    let Some(language) = requested_language.or_else(|| active.as_ref().map(|b| b.language)) else {
+        return ApiResponse::ok(json!({ "ok": false }));
+    };
+    let opening = requested_language.is_some();
+    let mut replacing = false;
+    let (parsed, api_url, script, binding) = loop {
+        let window = app.get_webview_window(DASHBOARD_WINDOW_LABEL);
+        if window.is_none() && !opening && !replacing {
             return ApiResponse::ok(json!({ "ok": false }));
         }
-        let url = info["url"].as_str().unwrap_or_default();
-        let api_url = info["apiUrl"].as_str().unwrap_or_default();
-        let secret = info["secret"].as_str().unwrap_or_default();
-        if url.is_empty() || api_url.is_empty() {
+        let Some((generation, port, secret)) = app
+            .state::<AppRuntime>()
+            .proxy()
+            .verified_dashboard_endpoint()
+        else {
             return ApiResponse::ok(json!({ "ok": false }));
-        }
-        let parsed = match url.parse::<tauri::Url>() {
+        };
+        let bare = format!("127.0.0.1:{port}");
+        let api_url = format!("http://{bare}");
+        let parsed = match format!("{api_url}/dashboard/").parse::<tauri::Url>() {
             Ok(u) => u,
             Err(e) => return ApiResponse::err(format!("面板 URL 非法：{e}")),
         };
-        // 面板存储用 host:port。
-        let bare = api_url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        let script = build_dashboard_preload_script(
-            bare,
-            secret,
-            map_locale_to_dashboard_lang(locale.as_deref()),
-        );
-        let preload = polaris_updater::sha256_hex(script.as_bytes());
-        let Some(win) = app.get_webview_window(DASHBOARD_WINDOW_LABEL) else {
-            break (parsed, api_url.to_owned(), script, preload);
+        let script = build_dashboard_preload_script(&bare, &secret, language);
+        let binding = DashboardBinding::new(generation, &script, language);
+        let Some(win) = window else {
+            break (parsed, api_url, script, binding);
         };
-        if active_preload.as_ref() == Some(&preload) {
-            let _ = win.set_focus();
+        if active.as_ref() == Some(&binding) {
+            if opening {
+                let _ = win.set_focus();
+            }
             return ApiResponse::ok(json!({ "ok": true }));
         }
         if let Err(e) = win.destroy() {
             return ApiResponse::err(format!("关闭旧面板窗失败：{e}"));
         }
+        replacing = true;
         // destroy queues the close. Wait until Tauri releases the label, then
         // read the current Core endpoint again before building its replacement.
         if tokio::time::timeout(Duration::from_secs(2), async {
@@ -104,10 +138,11 @@ pub async fn open_singbox_dashboard(app: AppHandle, locale: Option<String>) -> A
     // 仅允许停留在本地 api service 源（`http://127.0.0.1:<port>/…`）；跨源 http(s) 拦下。内部 scheme 放行。
     let allowed_prefix = format!("{api_url}/");
     let mut builder =
-        WebviewWindowBuilder::new(&app, DASHBOARD_WINDOW_LABEL, WebviewUrl::External(parsed))
+        WebviewWindowBuilder::new(app, DASHBOARD_WINDOW_LABEL, WebviewUrl::External(parsed))
             .title("sing-box Dashboard")
             .inner_size(1100.0, 760.0)
             .min_inner_size(800.0, 600.0)
+            .focused(opening)
             // preload 等价：document-start 于面板同源预写 localStorage（读前已写）。
             .initialization_script(&script)
             // 同一条 preload 通道再挂一次系统右键菜单禁用（面板是第三方产物，改不了它的 JS）。
@@ -127,7 +162,7 @@ pub async fn open_singbox_dashboard(app: AppHandle, locale: Option<String>) -> A
     }
     match builder.build() {
         Ok(_) => {
-            *active_preload = Some(preload);
+            *active = Some(binding);
             ApiResponse::ok(json!({ "ok": true }))
         }
         Err(e) => ApiResponse::err(format!("建面板窗失败：{e}")),

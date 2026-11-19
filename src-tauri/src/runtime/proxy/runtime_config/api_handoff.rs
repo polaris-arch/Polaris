@@ -1088,6 +1088,9 @@ impl ProxyRuntime {
         if let Some(control) = control {
             self.bind_runtime_api_control(pending.generation, control);
         }
+        if let Some(emitter) = self.error_emitter.get() {
+            emitter.refresh_dashboard_endpoint();
+        }
         self.gen_changed.notify_waiters();
         // Only the former borrower set was sealed; no unrelated App generation,
         // helper lifecycle or physical route authority is changed.

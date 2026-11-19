@@ -71,6 +71,15 @@ fn dashboard_preload_script_injects_keys_and_escapes_secret() {
         payload["servers"][0]["secret"], evil_secret,
         "含引号/反斜杠的 secret 须原样无损（双重序列化防注入）"
     );
+    let current = DashboardBinding::new(1, &s, "zh-Hans");
+    assert!(current == DashboardBinding::new(1, &s, "zh-Hans"));
+    assert!(current != DashboardBinding::new(2, &s, "zh-Hans"));
+    for next in [
+        build_dashboard_preload_script("127.0.0.1:9091", evil_secret, "zh-Hans"),
+        build_dashboard_preload_script("127.0.0.1:9090", "replacement", "zh-Hans"),
+    ] {
+        assert!(current != DashboardBinding::new(1, &next, "zh-Hans"));
+    }
 }
 
 // ── 日志直播流：`_id` 出境 + UI 不活跃期的单批截断 ──

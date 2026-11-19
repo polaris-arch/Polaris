@@ -14,6 +14,7 @@ pub use autostart::{auto_start_get_status, auto_start_set};
 #[cfg(target_os = "android")]
 pub(crate) use backup::android_backup_picker_plugin;
 pub use backup::{backup_export, backup_get_info, backup_import_apply, backup_import_pick};
+pub(crate) use dashboard::refresh_open_singbox_dashboard;
 pub use dashboard::{
     get_singbox_dashboard_connection, open_singbox_dashboard, refresh_singbox_dashboard,
 };

@@ -108,9 +108,12 @@ const REGISTRY: [BuildSite; 4] = [
     BuildSite {
         file: "commands/misc/dashboard.rs",
         needle: "WebviewWindowBuilder::new(",
-        enclosing: "pub async fn open_singbox_dashboard(",
-        callers: &[],
-        discipline: "`#[tauri::command]` 必须是 `pub async fn`（issue #2）",
+        enclosing: "async fn reconcile_dashboard_window(",
+        callers: &[
+            "pub async fn open_singbox_dashboard(",
+            "pub(crate) fn refresh_open_singbox_dashboard(",
+        ],
+        discipline: "IPC 使用 async command，运行核端点换代通知使用 async_runtime::spawn（issue #2）",
     },
 ];
 
@@ -247,6 +250,12 @@ fn every_registered_build_site_keeps_its_entry_discipline() {
         "`open_singbox_dashboard` 签名正上方必须是 `#[tauri::command]`（它是面板窗的 IPC 入口；\
          不再是 command 就换了入口形态，需重新裁定线程纪律）"
     );
+    let refresh = top_level_fn_body(dashboard, "pub(crate) fn refresh_open_singbox_dashboard(");
+    let (_, task) = refresh
+        .split_once("tauri::async_runtime::spawn(async move {")
+        .expect("面板自动刷新必须脱离运行核通知调用帧");
+    let (task, _) = task.split_once("});").expect("spawn 调用须有闭合边界");
+    assert!(task.contains("reconcile_dashboard_window("));
     // ── 更新弹窗：`show_update_popup` 的每个调用点在 async fn 内或 spawn 内 ──
     let popup_calls = call_sites(&files, "show_update_popup");
     assert!(

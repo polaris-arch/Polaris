@@ -807,6 +807,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法无需动 lib.rs。
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent);
 
+    fn refresh_dashboard_endpoint(&self) {}
+
     fn emit_coex_state(&self, _state: serde_json::Value) {}
 
     /// **网络场景命中态变更信号**（`event:networkProfileMatchChanged`，**无载荷** `{}`）。
@@ -1057,12 +1059,17 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
         );
         // All normal Start consumers receive the same complete-transaction notification.
         if event.phase == "ready" {
+            self.refresh_dashboard_endpoint();
             crate::events::broadcast(
                 &self.app,
                 crate::events::channel::EVENT_PROXY_STARTED,
                 serde_json::json!({}),
             );
         }
+    }
+
+    fn refresh_dashboard_endpoint(&self) {
+        crate::commands::misc::refresh_open_singbox_dashboard(&self.app);
     }
 
     fn emit_network_profile_match_changed(&self) {

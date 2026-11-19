@@ -239,6 +239,16 @@ impl ProxyRuntime {
             .collect()
     }
 
+    /// The embedded window uses only a verified endpoint from the running Core.
+    pub(crate) fn verified_dashboard_endpoint(&self) -> Option<(u64, u16, String)> {
+        let _publication = self.gate.lock_generation_publication();
+        if !self.core_running() {
+            return None;
+        }
+        let (_, port, secret) = self.verified_runtime_api_endpoint()?;
+        (port != 0 && !secret.is_empty()).then_some((self.gate.generation(), port, secret))
+    }
+
     /// 取 dashboard 连接信息（上游 `app:getSingboxDashboardConnection`，:2377-2389）。
     ///
     /// 端口取运行期管理 API 端口（动态解析，渲染端构造不出）；secret 取 currentConfig.clashApiSecret。
