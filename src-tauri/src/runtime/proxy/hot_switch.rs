@@ -3016,8 +3016,16 @@ impl ProxyRuntime {
             );
             return;
         }
+        // A Stop may claim while the invalidation callback runs.
         self.invalidate_unlock_cache(true, false);
-        self.schedule_exit_ip_refresh(true);
+        {
+            let _publication = self.gate.lock_generation_publication();
+            if self.gate.generation() == my_gen {
+                self.schedule_exit_ip_refresh(true);
+            } else {
+                return;
+            }
+        }
         self.schedule_connection_flush(mode, my_gen, api_port);
     }
 

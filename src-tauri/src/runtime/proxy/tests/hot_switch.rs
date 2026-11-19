@@ -6189,6 +6189,42 @@ async fn desktop_tun_reassert_settles_without_delayed_flush() {
     assert!(rt.network_settle.is_settled());
 }
 
+#[tokio::test]
+async fn completed_stop_keeps_its_refresh_when_old_reassert_resumes() {
+    let mut cfg = reassert_config("node-a");
+    cfg["proxyModeType"] = serde_json::json!("tun");
+    let (rt, _dir) = test_runtime();
+    mark_running(&rt);
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::new(TestPutSink::default()));
+    *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        id_to_tag: ab_tags(),
+        ..Default::default()
+    });
+    let refreshes: ExitIpRefreshes = Arc::new(Mutex::new(Vec::new()));
+    let saved_generation = rt.gate.generation();
+    let weak = Arc::downgrade(&rt);
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        exit_ip_refreshes: Arc::clone(&refreshes),
+        unlock_invalidation_hook: Some(Arc::new(move |running| {
+            assert!(running);
+            let rt = weak.upgrade().unwrap();
+            // Model a Stop claiming and publishing while old reassert is at
+            // the earlier invalidation callback, before it can schedule IP.
+            rt.bump_generation();
+            let _generation = rt.gate.lock_generation_publication();
+            rt.schedule_exit_ip_refresh(false);
+        })),
+        ..Default::default()
+    }));
+    rt.spawn_reassert_selector_selection(serde_json::from_value(cfg).unwrap(), saved_generation, 0);
+    // The guard is taken before spawn and held through the continuation.
+    tokio::time::timeout(Duration::from_secs(3), rt.wait_for_network_settled())
+        .await
+        .expect("selector continuation finishes without a recursive publication lock");
+    assert!(rt.gate.generation() > saved_generation);
+    assert_eq!(*refreshes.lock().unwrap(), vec![false]);
+}
+
 /// **不变式⑥**：reassert 中途 panic → 续延**仍必须跑**（= 上游 `.finally()` 的语义）。
 ///
 /// 丢了续延的后果是静默的：解锁缓存永不失效，boot 窗口那轮经旧出口探到的脏结果永久留在缓存里，

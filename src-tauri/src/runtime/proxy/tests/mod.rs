@@ -963,6 +963,7 @@ struct RecordingErrorEmitter {
     auto_select_status: Arc<Mutex<Vec<Value>>>,
     config_changed: Arc<std::sync::atomic::AtomicUsize>,
     unlock_invalidations: UnlockInvalidations,
+    unlock_invalidation_hook: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     exit_ip_refreshes: ExitIpRefreshes,
     network_recovery_refreshes: NetworkRecoveryRefreshes,
     exit_blocked_marks: ExitBlockedMarks,
@@ -1041,6 +1042,9 @@ impl ProxyErrorEmitter for RecordingErrorEmitter {
             .lock()
             .unwrap()
             .push((running, exit_blocked));
+        if let Some(hook) = &self.unlock_invalidation_hook {
+            hook(running);
+        }
     }
     fn schedule_exit_ip_refresh(&self, running: bool) {
         self.exit_ip_refreshes.lock().unwrap().push(running);

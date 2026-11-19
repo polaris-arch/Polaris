@@ -1687,7 +1687,12 @@ impl ProxyRuntime {
         self.invalidate_unlock_cache(false, false);
         // 核停（出口隧道下线）→ 重探出口 IP：代理出口已消失，直连出口是新的真值。无收敛可等（出口是
         // 确定性消失，不是切换）⇒ 零延迟直接探。
-        self.schedule_exit_ip_refresh(false);
+        {
+            let _publication = self.gate.lock_generation_publication();
+            if self.gate.generation() == my_gen {
+                self.schedule_exit_ip_refresh(false);
+            }
+        }
         self.clear_runtime_config_baseline();
         if let Ok(mut ready) = self.ready_main.write() {
             *ready = None;

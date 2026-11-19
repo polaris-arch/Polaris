@@ -637,6 +637,28 @@ async fn deliberate_stop_invokes_system_proxy_clearer() {
     );
 }
 
+#[tokio::test]
+async fn replacement_start_keeps_its_refresh_when_old_stop_resumes() {
+    let (rt, _dir, _clears) = test_runtime_recording();
+    let refreshes: ExitIpRefreshes = Arc::new(Mutex::new(Vec::new()));
+    let weak = Arc::downgrade(&rt);
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        exit_ip_refreshes: Arc::clone(&refreshes),
+        unlock_invalidation_hook: Some(Arc::new(move |running| {
+            assert!(!running);
+            let rt = weak.upgrade().unwrap();
+            rt.bump_generation();
+            let _publication = rt.gate.lock_generation_publication();
+            rt.schedule_exit_ip_refresh(true);
+        })),
+        ..Default::default()
+    }));
+    rt.stop()
+        .await
+        .expect("test Stop retires its own generation");
+    assert_eq!(*refreshes.lock().unwrap(), vec![true]);
+}
+
 /// 🔴 **超预算残 stop 的晚落地换代毒性**：拆除途中被新会话接管 → 余下步骤整段让位。
 ///
 /// # 复现的真机形态
