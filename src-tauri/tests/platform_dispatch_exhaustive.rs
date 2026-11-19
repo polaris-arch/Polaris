@@ -2525,6 +2525,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "Both mobile capabilities-only IPC branches call the runtime native capability method. Android uses its libbox bridge and iOS uses PacketTunnel; neither substitutes the desktop selected-support directory for loaded-container evidence.",
     ),
     (
+        "src-tauri/src/commands/misc/dashboard.rs",
+        "desktop",
+        1,
+        IosSide::WithAndroid,
+        "Tauri exposes the dashboard window builder's initial-focus option on desktop. Android and iOS both omit that option.",
+    ),
+    (
         "src-tauri/src/commands/misc/ipinfo.rs",
         "any(target_os = \"android\", target_os = \"ios\")",
         1,
@@ -4728,7 +4735,7 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // Deleting the core self-attestation stub retires its desktop spawn and
     // mobile no-op pair in startup (2 same-side sites). No debt changed.
     // The authenticated first exit-IP attempt has the same mobile dispatch on Android and iOS.
-    ("WithAndroid", 140),
+    ("WithAndroid", 141),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
