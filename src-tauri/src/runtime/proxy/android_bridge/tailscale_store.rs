@@ -39,6 +39,100 @@ fn native_id(value: &str, max: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::runtime::proxy) struct RuntimeMainWriter {
+    contract_version: String,
+    process_nonce: String,
+    native_ticket_id: String,
+    run_id: String,
+    birth_nonce: String,
+    scope: RuntimeWriterScope,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RuntimeWriterScope {
+    incarnation: String,
+    resource_sequence: String,
+    generation: String,
+    run_nonce: String,
+    config_digest: String,
+    tag: String,
+    state_directory: String,
+    taildrop_directory: String,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl RuntimeMainWriter {
+    pub(in crate::runtime::proxy) fn matches(
+        &self,
+        incarnation: &str,
+        endpoint: &polaris_config_engine::singbox::Endpoint,
+    ) -> bool {
+        self.scope.incarnation == incarnation
+            && endpoint.type_field == "tailscale"
+            && self.scope.tag == endpoint.tag
+            && endpoint.state_directory.as_deref() == Some(self.scope.state_directory.as_str())
+            && endpoint.taildrop_directory.as_deref()
+                == Some(self.scope.taildrop_directory.as_str())
+    }
+
+    #[cfg(target_os = "android")]
+    pub(in crate::runtime::proxy) async fn require_closed(&self) -> Result<(), String> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Terminal {
+            original: RuntimeMainWriter,
+            outcome: String,
+        }
+        let mut request = args("readRuntimeMainHistory");
+        request.binding = Some(serde_json::to_string(self).map_err(|_| UNKNOWN)?);
+        let raw = call(request).await?;
+        if raw.len() > MAX_BYTES {
+            return Err(UNKNOWN.into());
+        }
+        let observed: Terminal = serde_json::from_str(&raw).map_err(|_| UNKNOWN)?;
+        (observed.original == *self && observed.outcome == "ClosedConfirmed")
+            .then_some(())
+            .ok_or_else(|| UNKNOWN.into())
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(super) fn decode_runtime_main_writer(
+    raw: &str,
+    target: &super::AndroidExactTarget,
+    digest: &str,
+) -> Result<RuntimeMainWriter, String> {
+    if raw.len() > MAX_BYTES || !target.is_valid() || !hex64(digest) {
+        return Err(UNKNOWN.into());
+    }
+    let writer: RuntimeMainWriter = serde_json::from_str(raw).map_err(|_| UNKNOWN)?;
+    let scope = &writer.scope;
+    if writer.contract_version != "polaris-android-runtime-ts-writer-v1"
+        || writer.run_id != target.run_id
+        || writer.birth_nonce != target.birth_nonce
+        || !native_id(&writer.process_nonce, 128)
+        || !native_id(&writer.native_ticket_id, 128)
+        || !native_id(&scope.incarnation, 128)
+        || !hex64(&scope.run_nonce)
+        || scope.config_digest != digest
+        || [&scope.resource_sequence, &scope.generation]
+            .into_iter()
+            .any(|value| {
+                !value
+                    .parse::<i64>()
+                    .is_ok_and(|n| n > 0 && n.to_string() == *value)
+            })
+    {
+        return Err(UNKNOWN.into());
+    }
+    Ok(writer)
+}
+
 impl StoreData {
     fn export(&self, terminal: bool) -> Result<TailscaleStoreExport, String> {
         if self.contract_version != "polaris-android-ts-store-custody-v1"
@@ -785,6 +879,62 @@ pub(crate) async fn observe_main(
         return Err(UNKNOWN.into());
     }
     Ok(observed)
+}
+
+#[cfg(target_os = "android")]
+pub(in crate::runtime::proxy) async fn check_runtime_main_admission(
+    target: &super::AndroidExactTarget,
+    original: &AndroidStoreCustody,
+) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Admission {
+        contract_version: String,
+        process_nonce: String,
+        native_ticket_id: String,
+        run_id: String,
+        birth_nonce: String,
+    }
+    if !target.is_valid() {
+        return Err(UNKNOWN.into());
+    }
+    let mut request = args("checkRuntimeMainAdmission");
+    request.run_id = Some(target.run_id.clone());
+    request.birth_nonce = Some(target.birth_nonce.clone());
+    let raw = call(request).await?;
+    if raw.len() > MAX_BYTES {
+        return Err(UNKNOWN.into());
+    }
+    let admission: Admission = serde_json::from_str(&raw).map_err(|_| UNKNOWN)?;
+    (admission.contract_version == "polaris-android-runtime-ts-admission-v1"
+        && admission.process_nonce == original.original.process_nonce
+        && admission.native_ticket_id == original.original.native_ticket_id
+        && admission.run_id == target.run_id
+        && admission.birth_nonce == target.birth_nonce)
+        .then_some(())
+        .ok_or_else(|| UNKNOWN.into())
+}
+
+#[cfg(target_os = "android")]
+pub(in crate::runtime::proxy) async fn observe_runtime_main(
+    target: &super::AndroidExactTarget,
+    digest: &str,
+    original: &AndroidStoreCustody,
+) -> Result<RuntimeMainWriter, String> {
+    let mut request = args("observeRuntimeMain");
+    request.run_id = Some(target.run_id.clone());
+    request.birth_nonce = Some(target.birth_nonce.clone());
+    request.expected_actual_config_digest = Some(digest.into());
+    let writer = decode_runtime_main_writer(&call(request).await?, target, digest)?;
+    if original.original.producer_kind != "Main"
+        || writer.run_id != original.original.logical_instance_id
+        || writer.birth_nonce != original.original.main_birth_nonce
+        || writer.process_nonce != original.original.process_nonce
+        || writer.native_ticket_id != original.original.native_ticket_id
+    {
+        return Err(UNKNOWN.into());
+    }
+    Ok(writer)
 }
 
 #[cfg(target_os = "android")]

@@ -1791,6 +1791,14 @@ struct AndroidGlobalCustody {
     /// Monotone until this entire birth is removed after a certain ACK.
     historic_unknown: bool,
     stop_inflight: Option<Arc<()>>,
+    #[cfg(target_os = "android")]
+    runtime_tailscale: Option<AndroidRuntimeTailscaleCustody>,
+}
+
+#[cfg(target_os = "android")]
+struct AndroidRuntimeTailscaleCustody {
+    original: android_bridge::tailscale_store::AndroidStoreCustody,
+    writers: Vec<Arc<android_bridge::tailscale_store::RuntimeMainWriter>>,
 }
 
 /// `RecordingErrorEmitter` 的解锁失效记录句柄（与 tests 模块的 `UnlockInvalidations` 同型）。

@@ -106,6 +106,16 @@ async fn main_birth_token_only_retires_its_own_complete_claim() {
     let second = json!({"endpoints":[{"type":"tailscale", "tag":"second", "state_directory":root.join("tailscale/ts2")}]});
     let old = claim_main_for_test(&reg, &first, &root, &gate).await;
     assert!(reg.main_owns("ts1", true));
+    let other_birth = reg.mint_main_birth();
+    assert!(reg
+        .bind_android_runtime_main_writer(&gate, &other_birth, &root, &second["endpoints"][0])
+        .is_err());
+    assert!(!reg.main_owns("ts2", true));
+    for _ in 0..2 {
+        reg.bind_android_runtime_main_writer(&gate, &old, &root, &second["endpoints"][0])
+            .unwrap();
+    }
+    assert!(reg.main_owns("ts2", true));
     assert!(
         reg.reserve_main_states(&second, &root, &gate, reg.mint_main_birth())
             .await
@@ -118,6 +128,13 @@ async fn main_birth_token_only_retires_its_own_complete_claim() {
     assert!(!reg.main_owns("ts1", true));
     assert!(reg.main_owns("ts2", true));
     assert!(reg.release_main_states_if_token(&new, &gate).unwrap());
+    reg.bind_android_runtime_main_writer(&gate, &other_birth, &root, &first["endpoints"][0])
+        .unwrap();
+    assert!(!reg.release_main_states_if_token(&new, &gate).unwrap());
+    assert!(reg.main_owns("ts1", true));
+    assert!(reg
+        .release_main_states_if_token(&other_birth, &gate)
+        .unwrap());
     std::fs::remove_dir_all(root).unwrap();
 }
 

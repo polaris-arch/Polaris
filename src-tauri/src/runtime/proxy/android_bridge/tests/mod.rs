@@ -187,6 +187,63 @@ fn android_receipt_requires_exact_run_config_and_claim() {
 }
 
 #[test]
+fn android_runtime_tailscale_writer_must_match_the_original_birth_and_candidate() {
+    let target = AndroidExactTarget {
+        run_id: "candidate-7".into(),
+        birth_nonce: "birth-7".into(),
+    };
+    let digest = "a".repeat(64);
+    let raw = serde_json::json!({
+        "contractVersion": "polaris-android-runtime-ts-writer-v1",
+        "processNonce": "process-2",
+        "nativeTicketId": "ticket-7",
+        "runId": target.run_id,
+        "birthNonce": target.birth_nonce,
+        "scope": {
+            "incarnation": "original-core",
+            "resourceSequence": "17",
+            "generation": "1",
+            "runNonce": "f".repeat(64),
+            "configDigest": digest,
+            "tag": "Tailnet",
+            "stateDirectory": "/files/tailscale/ts",
+            "taildropDirectory": "/files/tailscale/ts/Taildrop"
+        }
+    });
+    let mut endpoint: polaris_config_engine::singbox::Endpoint =
+        serde_json::from_value(serde_json::json!({
+            "type": "tailscale",
+            "tag": "Tailnet",
+            "state_directory": "/files/tailscale/ts",
+            "taildrop_directory": "/files/tailscale/ts/Taildrop"
+        }))
+        .unwrap();
+    let writer = tailscale_store::decode_runtime_main_writer(&raw.to_string(), &target, &digest)
+        .expect("current native writer");
+    assert!(writer.matches("original-core", &endpoint));
+    assert!(!writer.matches("successor-core", &endpoint));
+    endpoint.taildrop_directory = Some("/files/tailscale/other/Taildrop".into());
+    assert!(!writer.matches("original-core", &endpoint));
+
+    for (path, invalid) in [
+        ("/birthNonce", serde_json::json!("birth-8")),
+        ("/scope/configDigest", serde_json::json!("b".repeat(64))),
+        ("/scope/resourceSequence", serde_json::json!("017")),
+        ("/scope/generation", serde_json::json!("0")),
+        ("/scope/runNonce", serde_json::json!("unbound-writer")),
+    ] {
+        let mut foreign = raw.clone();
+        *foreign.pointer_mut(path).unwrap() = invalid;
+        assert!(tailscale_store::decode_runtime_main_writer(
+            &foreign.to_string(),
+            &target,
+            &digest
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn exact_stop_requires_the_birth_nonce_and_confirmed_release_state() {
     let target = AndroidExactTarget {
         run_id: "same-run".into(),

@@ -759,6 +759,11 @@ impl ProxyRuntime {
             return Err("nativeRetirementUnknown".into());
         }
         if !core.targets.contains_key(id) {
+            if self.mesh.main_owns_tailscale(id, true) {
+                // A warm writer joined after this Ready seed. Credential
+                // retirement still needs its exact composed terminal export.
+                return Err("nativeRetirementUnknown".into());
+            }
             // A completed unrelated main is not this account's identity source.
             // Its writer membership must still pass the native family begin census.
             return Ok(None);

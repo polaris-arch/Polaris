@@ -260,7 +260,10 @@ fn tailnet_tun_projection_changed(accepted: &SingBoxConfig, candidate: &SingBoxC
     projection(accepted) != projection(candidate)
 }
 
-fn introduces_tailscale_state_scope(accepted: &SingBoxConfig, candidate: &SingBoxConfig) -> bool {
+fn new_tailscale_state_scopes<'a>(
+    accepted: &'a SingBoxConfig,
+    candidate: &'a SingBoxConfig,
+) -> impl Iterator<Item = &'a polaris_config_engine::singbox::Endpoint> {
     let owned = accepted.endpoints.as_deref().unwrap_or_default();
     candidate
         .endpoints
@@ -268,7 +271,7 @@ fn introduces_tailscale_state_scope(accepted: &SingBoxConfig, candidate: &SingBo
         .unwrap_or_default()
         .iter()
         .filter(|endpoint| endpoint.type_field == "tailscale")
-        .any(|endpoint| {
+        .filter(|endpoint| {
             !owned.iter().any(|old| {
                 old.type_field == "tailscale"
                     && old.tag == endpoint.tag
@@ -561,6 +564,8 @@ struct PendingOperation {
     physical_route_config: UserConfig,
     protected_physical_root: Option<Arc<ProtectedPhysicalRoot>>,
     protected_binding_plan: Option<ProtectedBindingPlan>,
+    #[cfg(target_os = "android")]
+    android_runtime_writer: Option<AndroidRuntimeWriterAdmission>,
     generation: u64,
     intent: u64,
     candidate: Value,
@@ -575,6 +580,15 @@ struct PendingOperation {
     mesh_evidence: super::mesh_route_report::MeshRouteRunEvidence,
     tailnet_suspended_token: Option<u64>,
     tailnet_bindings: BTreeMap<String, super::tailnet_rules::TailnetRouteBinding>,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Clone)]
+struct AndroidRuntimeWriterAdmission {
+    birth: super::android_bridge::AndroidRequestBirth,
+    target: super::android_bridge::AndroidExactTarget,
+    original: super::android_bridge::tailscale_store::AndroidStoreCustody,
+    endpoint: polaris_config_engine::singbox::Endpoint,
 }
 
 impl PendingOperation {
@@ -1971,6 +1985,115 @@ impl ProxyRuntime {
         }
     }
 
+    #[cfg(target_os = "android")]
+    async fn prepare_android_runtime_writer(
+        &self,
+        endpoint: &polaris_config_engine::singbox::Endpoint,
+    ) -> Option<AndroidRuntimeWriterAdmission> {
+        use super::android_bridge::tailscale_store;
+        let (birth, target, original) = {
+            let custody = self.android_main_token.lock().ok()?;
+            let owner = custody.as_ref().filter(|owner| {
+                owner.start_confirmed
+                    && !owner.stop_only
+                    && !owner.historic_unknown
+                    && owner.stop_inflight.is_none()
+            })?;
+            (
+                owner.birth.clone(),
+                owner.exact_target.clone()?,
+                owner
+                    .runtime_tailscale
+                    .as_ref()
+                    .map(|history| history.original.clone()),
+            )
+        };
+        let original = match original {
+            Some(original) => original,
+            None => tailscale_store::observe_main(Some(&target)).await.ok()?,
+        };
+        tailscale_store::check_runtime_main_admission(&target, &original)
+            .await
+            .ok()?;
+        Some(AndroidRuntimeWriterAdmission {
+            birth,
+            target,
+            original,
+            endpoint: endpoint.clone(),
+        })
+    }
+
+    #[cfg(target_os = "android")]
+    async fn bind_committed_android_runtime_writer(
+        &self,
+        pending: &PendingOperation,
+        operation: &daemon::RuntimeConfigOperation,
+    ) -> Result<(), &'static str> {
+        use super::android_bridge::tailscale_store;
+        let Some(admission) = pending.android_runtime_writer.as_ref() else {
+            return Ok(());
+        };
+        let unknown = "ANDROID_TAILSCALE_WRITER_UNCONFIRMED";
+        let active = pending.committed_identity(operation).ok_or(unknown)?;
+        let writer = tailscale_store::observe_runtime_main(
+            &admission.target,
+            &pending.plan.candidate_digest,
+            &admission.original,
+        )
+        .await
+        .map_err(|_| unknown)?;
+        if pending.plan.no_op || !writer.matches(&active.incarnation, &admission.endpoint) {
+            return Err(unknown);
+        }
+        // Settlement holds switch_serial and cannot wait on another Tailscale
+        // operation that might need lifecycle or selection serialization.
+        let gate = self.mesh.try_tailscale_state_gate().ok_or(unknown)?;
+        let mut slot = self.android_main_token.lock().map_err(|_| unknown)?;
+        let owner = slot
+            .as_mut()
+            .filter(|owner| {
+                owner.birth.same(&admission.birth)
+                    && owner.exact_target.as_ref() == Some(&admission.target)
+                    && owner.start_confirmed
+                    && !owner.stop_only
+                    && !owner.historic_unknown
+                    && owner.stop_inflight.is_none()
+                    && self.gate.try_idle_generation() == Some(pending.generation)
+            })
+            .ok_or(unknown)?;
+        let token = owner
+            .birth
+            .main_token
+            .clone()
+            .unwrap_or_else(|| self.mesh.mint_tailscale_main_birth());
+        self.mesh
+            .bind_android_runtime_main_writer(
+                &gate,
+                &token,
+                &serde_json::to_value(&admission.endpoint).map_err(|_| unknown)?,
+            )
+            .map_err(|_| unknown)?;
+        owner.birth.main_token = Some(token);
+        let history =
+            owner
+                .runtime_tailscale
+                .get_or_insert_with(|| super::AndroidRuntimeTailscaleCustody {
+                    original: admission.original.clone(),
+                    writers: Vec::new(),
+                });
+        if !history
+            .writers
+            .iter()
+            .any(|existing| existing.as_ref() == &writer)
+        {
+            history.writers.push(Arc::new(writer));
+        }
+        if !operation.durable {
+            return Err("ANDROID_TAILSCALE_WRITER_DURABILITY_PENDING");
+        }
+        Ok(())
+    }
+
     async fn prepare_runtime_candidate(
         self: &Arc<Self>,
         candidate: Value,
@@ -2356,18 +2479,33 @@ impl ProxyRuntime {
         }
         let network_canary = outcome.network_canary;
         let mut generated = outcome.config;
-        // Android's original VPN owns state paths admitted at native Start.
-        // A new physical writer needs the same birth's native admission first.
-        if self.helper.platform() == Platform::Android
-            && introduces_tailscale_state_scope(&baseline.generated, &generated)
+        // A new writer must join the original Core's stop and login custody.
+        // An authenticated Core Plan alone cannot update the App registry.
+        #[cfg(target_os = "android")]
+        let mut android_runtime_writer = None;
         {
-            return decline(restart_choice(
-                &candidate,
-                "tailscaleStateScopeRequiresRestart",
-                vec!["endpoints.tailscale.state_directory".into()],
-                generation,
-                intent,
-            ));
+            let mut new_scopes = new_tailscale_state_scopes(&baseline.generated, &generated);
+            if let Some(endpoint) = new_scopes.next() {
+                #[cfg(target_os = "android")]
+                if self.helper.platform() == Platform::Android && new_scopes.next().is_none() {
+                    android_runtime_writer = self.prepare_android_runtime_writer(endpoint).await;
+                }
+                #[cfg(not(target_os = "android"))]
+                let _ = endpoint;
+                #[cfg(target_os = "android")]
+                let native_admitted = android_runtime_writer.is_some();
+                #[cfg(not(target_os = "android"))]
+                let native_admitted = false;
+                if !native_admitted {
+                    return decline(restart_choice(
+                        &candidate,
+                        "tailscaleStateScopeRequiresRestart",
+                        vec!["endpoints.tailscale.state_directory".into()],
+                        generation,
+                        intent,
+                    ));
+                }
+            }
         }
         generated.polaris_windows_directory = baseline.generated.polaris_windows_directory.clone();
         if protected_binding_plan.is_some()
@@ -2518,6 +2656,10 @@ impl ProxyRuntime {
                 restart_choice(&candidate, "structuralChange", paths, generation, intent)
             };
             return decline(result);
+        }
+        #[cfg(target_os = "android")]
+        if android_runtime_writer.is_some() && plan.no_op {
+            return decline(RuntimeApplyResult::status("unconfirmed"));
         }
         if plan.plan_id.is_empty()
             || plan.transaction_id.is_empty()
@@ -2677,6 +2819,8 @@ impl ProxyRuntime {
             },
             protected_physical_root: baseline.protected_physical_root.clone(),
             protected_binding_plan,
+            #[cfg(target_os = "android")]
+            android_runtime_writer,
             generation,
             intent,
             candidate,
@@ -3484,6 +3628,15 @@ impl ProxyRuntime {
         }
         if observe_retirement {
             self.spawn_runtime_retirement_reconcile(pending, &operation);
+        }
+        #[cfg(target_os = "android")]
+        if !pending.published {
+            if let Err(reason) = self
+                .bind_committed_android_runtime_writer(pending, &operation)
+                .await
+            {
+                return self.committed_runtime_without_publication(pending, &operation, reason);
+            }
         }
         let still_current = || {
             self.selector_operation_is_current(pending.generation, pending.intent)

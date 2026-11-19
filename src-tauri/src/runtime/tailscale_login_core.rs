@@ -1834,6 +1834,19 @@ struct MainClaim {
     endpoints: HashMap<String, serde_json::Value>,
 }
 
+fn main_endpoint_request_identity(endpoint: &serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Object(
+        ["tag", "auth_key", "control_url", "hostname", "ephemeral"]
+            .into_iter()
+            .filter_map(|key| {
+                endpoint
+                    .get(key)
+                    .map(|value| (key.to_owned(), value.clone()))
+            })
+            .collect(),
+    )
+}
+
 /// Before an external start can occur, cancellation may roll back the exact
 /// reservation while the real TS gate remains held by the caller. Once armed,
 /// Drop deliberately retains the claim even if the waiter disappears.
@@ -3184,6 +3197,11 @@ impl LoginCoreRegistry {
         }
     }
 
+    #[cfg(target_os = "android")]
+    pub(crate) fn try_state_gate(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.start_gate.try_lock().ok()
+    }
+
     fn valid_main_gate(&self, gate: &tokio::sync::MutexGuard<'_, ()>) -> bool {
         std::ptr::eq(tokio::sync::MutexGuard::mutex(gate), &self.start_gate)
     }
@@ -3309,11 +3327,7 @@ impl LoginCoreRegistry {
             if directories.insert(id.clone(), actual).is_some() {
                 return Err("Tailscale endpoint state_directory is duplicated".into());
             }
-            let relevant = ["tag", "auth_key", "control_url", "hostname", "ephemeral"]
-                .into_iter()
-                .filter_map(|key| ep.get(key).map(|value| (key.to_owned(), value.clone())))
-                .collect::<serde_json::Map<_, _>>();
-            endpoints.insert(id, serde_json::Value::Object(relevant));
+            endpoints.insert(id, main_endpoint_request_identity(ep));
         }
         if self
             .shared
@@ -3358,6 +3372,63 @@ impl LoginCoreRegistry {
             registered: true,
             external_possible: false,
         })
+    }
+
+    /// Mirror a confirmed native Android writer in the original main birth's
+    /// login registry. The caller must bind the native writer receipt first.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn bind_android_runtime_main_writer(
+        &self,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        token: &MainBirthToken,
+        root: &Path,
+        endpoint: &serde_json::Value,
+    ) -> Result<(), String> {
+        let unknown = || "nativeRetirementUnknown".to_owned();
+        if !self.valid_main_gate(gate)
+            || !Arc::ptr_eq(&token.registry, &self.identity)
+            || endpoint["type"].as_str() != Some("tailscale")
+            || endpoint["tag"].as_str().is_none_or(str::is_empty)
+        {
+            return Err(unknown());
+        }
+        let state = Path::new(endpoint["state_directory"].as_str().ok_or_else(unknown)?);
+        let id = state
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(unknown)?;
+        if state != root.join("tailscale").join(id) || self.shared.contains(id) {
+            return Err(unknown());
+        }
+        let directory = canonical_tailscale_claim_directory(state)?;
+        let identity = main_endpoint_request_identity(endpoint);
+        let mut main = self.shared.main.lock().map_err(|_| unknown())?;
+        if let Some(claim) = main.as_ref() {
+            if !claim.token.same(token) {
+                return Err(unknown());
+            }
+            if let Some(owned) = claim.directories.get(id) {
+                return (owned == &directory && claim.endpoints.get(id) == Some(&identity))
+                    .then_some(())
+                    .ok_or_else(unknown);
+            }
+            if claim
+                .directories
+                .values()
+                .any(|old| old.starts_with(&directory) || directory.starts_with(old))
+            {
+                return Err(unknown());
+            }
+        }
+        let claim = main.get_or_insert_with(|| MainClaim {
+            token: token.clone(),
+            directories: HashMap::new(),
+            endpoints: HashMap::new(),
+        });
+        claim.directories.insert(id.into(), directory);
+        claim.endpoints.insert(id.into(), identity);
+        Ok(())
     }
 
     /// Bind reservation paths to the actual original constructor census after

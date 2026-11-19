@@ -1332,6 +1332,8 @@ pub(super) fn ts_pending_raw_fixture(rt: &Arc<ProxyRuntime>, raw: Value) -> Pend
         physical_route_config: typed.clone(),
         protected_physical_root: None,
         protected_binding_plan: None,
+        #[cfg(target_os = "android")]
+        android_runtime_writer: None,
         generation,
         intent: rt.selector_reconcile.intent_generation(),
         candidate: raw,

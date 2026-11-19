@@ -1016,6 +1016,11 @@ impl MeshRuntime {
         self.login_registry.state_gate().await
     }
 
+    #[cfg(target_os = "android")]
+    pub(crate) fn try_tailscale_state_gate(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.login_registry.try_state_gate()
+    }
+
     pub(crate) fn mint_tailscale_main_birth(
         &self,
     ) -> crate::runtime::tailscale_login_core::MainBirthToken {
@@ -1040,6 +1045,21 @@ impl MeshRuntime {
     ) -> Result<bool, String> {
         self.login_registry
             .release_main_states_if_token(token, gate)
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn bind_android_runtime_main_writer(
+        &self,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        token: &crate::runtime::tailscale_login_core::MainBirthToken,
+        endpoint: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.login_registry.bind_android_runtime_main_writer(
+            gate,
+            token,
+            &self.config_dir,
+            endpoint,
+        )
     }
 
     pub(crate) fn assert_tailscale_main_claims_drained(
@@ -1075,7 +1095,7 @@ impl MeshRuntime {
         self.login_registry.poison_main_claim_lock_for_test();
     }
 
-    #[cfg(test)]
+    #[cfg(any(target_os = "android", test))]
     pub fn main_owns_tailscale(&self, id: &str, alive: bool) -> bool {
         self.login_registry.main_owns(id, alive)
     }

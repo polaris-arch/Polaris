@@ -200,6 +200,8 @@ pub(super) struct AndroidStopBooking<'a> {
     nonce: Arc<()>,
     was_certain: bool,
     completed: bool,
+    #[cfg(target_os = "android")]
+    runtime_tailscale: Vec<Arc<super::android_bridge::tailscale_store::RuntimeMainWriter>>,
 }
 
 impl AndroidStopBooking<'_> {
@@ -567,6 +569,8 @@ impl ProxyRuntime {
             start_confirmed: false,
             historic_unknown: false,
             stop_inflight: None,
+            #[cfg(target_os = "android")]
+            runtime_tailscale: None,
         });
         Ok(birth)
     }
@@ -679,6 +683,12 @@ impl ProxyRuntime {
                     nonce,
                     was_certain,
                     completed: false,
+                    #[cfg(target_os = "android")]
+                    runtime_tailscale: attempt
+                        .runtime_tailscale
+                        .as_ref()
+                        .map(|history| history.writers.clone())
+                        .unwrap_or_default(),
                 })
             }
             Some(_) => Err(
@@ -698,6 +708,8 @@ impl ProxyRuntime {
                     start_confirmed: false,
                     historic_unknown: false,
                     stop_inflight: Some(Arc::clone(&nonce)),
+                    #[cfg(target_os = "android")]
+                    runtime_tailscale: None,
                 });
                 Ok(AndroidStopBooking {
                     custody: &self.android_main_token,
@@ -705,6 +717,8 @@ impl ProxyRuntime {
                     nonce,
                     was_certain: true,
                     completed: false,
+                    #[cfg(target_os = "android")]
+                    runtime_tailscale: Vec::new(),
                 })
             }
         }
@@ -723,6 +737,18 @@ impl ProxyRuntime {
             super::android_bridge::main_start_dispatch_available().map_err(|(msg, _)| msg)?;
             let booking = self.begin_android_stop_booking(true)?;
             let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
+            #[cfg(target_os = "android")]
+            let result = match result {
+                Ok(()) => tokio::time::timeout(Duration::from_secs(5), async {
+                    for writer in &booking.runtime_tailscale {
+                        writer.require_closed().await?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap_or_else(|_| Err("nativeRetirementUnknown".into())),
+                error => error,
+            };
             return booking.finish_with_gate(result, &self.mesh, ts_gate);
         }
         #[cfg(target_os = "ios")]
