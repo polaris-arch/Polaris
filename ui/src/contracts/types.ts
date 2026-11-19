@@ -594,7 +594,7 @@ export interface StagedClassification {
   decision: StagedDecision;
   /** Saved desired state still differs from the accepted running state. */
   pendingApply: boolean;
-  /** A restart is actually required; independent of pendingApply. */
+  /** The local preview identified a structural restart boundary. */
   restartRequired: boolean;
 }
 

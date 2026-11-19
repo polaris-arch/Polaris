@@ -5216,7 +5216,6 @@ fn saved_settings_receipt(
 pub(super) fn structural_runtime_change(old: &Value, new: &Value, platform: Platform) -> bool {
     [
         "proxyModeType",
-        "tunConfig",
         "mixedPort",
         "httpPort",
         "allowLan",
@@ -5224,7 +5223,22 @@ pub(super) fn structural_runtime_change(old: &Value, new: &Value, platform: Plat
     ]
     .iter()
     .any(|key| old.get(*key) != new.get(*key))
+        || structural_tun_change(old.get("tunConfig"), new.get("tunConfig"))
         || super::dns_takeover::host_dns_takeover_changed(platform, old, new)
+}
+
+fn structural_tun_change(old: Option<&Value>, new: Option<&Value>) -> bool {
+    if old == new {
+        return false;
+    }
+    let effective = |tun: Option<&Value>| {
+        let mut config = serde_json::json!({ "tunConfig": tun });
+        polaris_config_engine::user_config::effective_view::ensure_effective_tun_config(
+            &mut config,
+        );
+        config["tunConfig"].take()
+    };
+    effective(old) != effective(new)
 }
 
 #[cfg(test)]

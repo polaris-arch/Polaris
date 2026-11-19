@@ -53,9 +53,14 @@ pub const INJECTED_FIELD_PATHS: &[&str] = &[
 /// 把配置补成**渲染端可直接消费的生效形**。幂等；已是具体值的字段一律不覆盖。
 pub fn ensure_effective_config(cfg: &mut Value) {
     ensure_bypass_lan_list(cfg);
+    ensure_effective_tun_config(cfg);
+    project_tailscale_credentials(cfg);
+}
+
+/// Apply the effective TUN values used by settings and runtime previews.
+pub fn ensure_effective_tun_config(cfg: &mut Value) {
     ensure_tun_config(cfg);
     ensure_inbound_exclude_cidrs(cfg);
-    project_tailscale_credentials(cfg);
 }
 
 /// The same authority comparison as mesh identity reconciliation, with the existing official

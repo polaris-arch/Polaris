@@ -598,8 +598,7 @@ async fn config_save_hot_only(
 /// **只读、零副作用**：不落盘、不碰核、不 emit。用于暂存层在保存**之前**逐条标注
 /// 「已生效 / 保存后待应用」（FR-9），从而解释「5 项待保存 → 保存 → 2 项待应用」这个转移。
 ///
-/// 判定本体在 [`ProxyRuntime::classify_staged`](crate::runtime::proxy::ProxyRuntime::classify_staged)，与真正的 `switch_mode` 共用同一个
-/// [`classify_switch`](crate::runtime::proxy::ProxyRuntime) —— 预告与实际在构造上不可能分歧。
+/// 本地预览复用选择器和结构变更判定。需要运行核协商的变更由保存时的 Core Plan 确认。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"

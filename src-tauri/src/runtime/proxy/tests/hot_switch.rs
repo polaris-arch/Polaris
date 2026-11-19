@@ -4403,6 +4403,18 @@ async fn classify_staged_agrees_with_the_leg_switch_mode_actually_takes() {
         "daily HOT debt is distinct from a structural restart boundary"
     );
 
+    // The frontend fills effective TUN defaults before returning the document.
+    // A log-only edit still needs Core planning, with no local restart reason.
+    let mut log_edit = cfg.clone();
+    crate::commands::config::apply_frontend_view(&mut log_edit);
+    assert_ne!(log_edit.get("tunConfig"), cfg.get("tunConfig"));
+    log_edit["logLevel"] = serde_json::json!("debug");
+    let preview = rt.classify_staged(&log_edit);
+    assert_eq!(preview.decision, "defer");
+    assert!(preview.pending_apply && !preview.restart_required);
+    log_edit["tunConfig"]["mtu"] = serde_json::json!(1400);
+    assert!(rt.classify_staged(&log_edit).restart_required);
+
     // ③ norm 内字段（端口）变 → restart、需重启。随后真跑一次 switch_mode 验证结论一致。
     let structural = two_node_config(7899, "node-a");
     let predicted = rt.classify_staged(&structural);

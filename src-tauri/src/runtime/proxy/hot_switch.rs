@@ -2437,12 +2437,7 @@ impl ProxyRuntime {
 
     /// [`Self::switch_mode_with`] 的**纯判定半边**：候选配置会落哪条腿，不产生任何副作用。
     ///
-    /// # 为什么抽出来
-    ///
-    /// `config:classifyStaged`（spec §2.3.4）要在**保存之前**告诉用户「这批改动保存后是否仍待应用」。
-    /// 若它自己再实现一遍判定，那么「核未起 / 无基准 / 解析失败 / 逐字节全等」这四条兜底腿就有了
-    /// 第二份实现 —— 它们的分歧只会在真机上以「预告说不重启、实际断了流」的形态暴露，
-    /// 而这恰恰是最难归因的一类。共用同一函数后，预告与实际**在构造上**不可能分歧。
+    /// `config:classifyStaged` 与选择器切换共用本地判据。涉及 Core 配置的改动继续由 Core Plan 确认。
     ///
     /// # 不含 lifecycle 在飞那一腿（腿 0）
     ///
@@ -2579,14 +2574,13 @@ impl ProxyRuntime {
 
     /// `config:classifyStaged`（spec §2.3.4）的运行时半边：候选配置**若现在落盘**会走哪条腿。
     ///
-    /// 判定复用 [`Self::classify_switch`]，`defer_restart` 恒传 `false` —— 本接口回答的是
-    /// 「这批改动**本性上**走哪条入核腿」。`deferRestart` 是保存动作的执行政策，
-    /// 不是配置分类；若在分类时传 `true`，除 NoOp 外全部都会变成 Defer，便无法诊断原生热切/重启路径。
+    /// 判定使用 [`Self::classify_switch`] 的本地结果，`defer_restart` 恒传 `false`，
+    /// 以识别已有选择器路径与已知的结构差异。保存时的 Core Plan 给出实际结果。
     ///
-    /// 三条兜底腿的映射（与执行侧同源，不另立判据）：
+    /// 本地预览映射：
     /// - 核未运行 → `noOp` / 不需重启：落盘不触发任何核动作，改动在下次起核时自然生效；
     /// - 逐字节全等 → `noOp`；
-    /// - 无基准 / 解析失败 → `restart`：执行侧此时正是保守重启，预告不得比实际乐观。
+    /// - 无基准 / 解析失败 / 需要 Core Plan → `defer`，留给运行时事务确认。
     pub fn classify_staged(&self, candidate: &Value) -> StagedClassification {
         let decision = match self.classify_switch(candidate, false) {
             ClassifiedSwitch::NotRunning | ClassifiedSwitch::Unchanged => "noOp",
