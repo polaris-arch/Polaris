@@ -283,6 +283,9 @@ class BoxService(
                         synchronized(this) { if (mainAttempt === attempt) commandServer = server }
                         // Optional setter is discovered from the real selected binding, before platform Initialize.
                         nativeTun.register(server)
+                        AndroidRuntimeTailscaleBridge.register(server, attempt, service.dataDir) {
+                            mainAttempt === attempt && commandServer === server && state == ServiceState.Started
+                        }
                         check(isStarting(attempt)) { "起核已被停核接管" }
                         server.start()
                         // No login instance may hold this Tailscale state directory during main startup.
