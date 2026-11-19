@@ -24,3 +24,29 @@ describe('UIP03 stale tray snapshot cannot roll back concurrent DNS edits', () =
     expect(hide).toHaveBeenCalledTimes(corrected?0:1);expect(fail).not.toHaveBeenCalled();
   });
 });
+
+describe('tray proxy mode feedback', () => {
+  it.each([
+    [{ status: 'saved' }, 'tray.modeGlobal'],
+    [{ status: 'saved', runtimeApply: { status: 'hotApplied', configurationDurable: true } }, 'tray.modeGlobal'],
+    [{ status: 'saved', runtimeApply: { status: 'pending', pendingApply: true } }, 'tray.manageInMain'],
+    [{ status: 'needsManual' }, 'tray.manageInMain'],
+  ])('shows the result for %o', async (outcome, expected) => {
+    const modeStart = source.indexOf('  const setMode = async (mode: ProxyMode) => {');
+    const modeEnd = source.indexOf('\n  };', modeStart);
+    if (modeStart < 0 || modeEnd < 0) throw new Error('Tray mode handler extraction failed');
+    const modeHandler = source.slice(modeStart, modeEnd + '\n  };'.length).replace('(mode: ProxyMode)', '(mode)');
+    const api = { config: { updateMode: vi.fn(async () => outcome) } };
+    const setNotice = vi.fn();
+    const make = new Function(
+      'api', 'config', 'trayLifecycle', 'interactionEpoch', 'mounted', 'interactionActive',
+      'setNotice', 'MODES', 'noticeActionFailure', 't', `${modeHandler}\nreturn setMode;`,
+    );
+    const change = make(
+      api, { proxyMode: 'smart' }, { current: 1 }, { current: 1 }, { current: true }, { current: true },
+      setNotice, [{ v: 'global', k: 'tray.modeGlobal' }], vi.fn(), (key: string) => key,
+    );
+    await change('global');
+    expect(setNotice.mock.calls).toEqual([[expected]]);
+  });
+});

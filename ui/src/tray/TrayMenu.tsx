@@ -565,11 +565,14 @@ export default function TrayMenu() {
         setNotice(t('tray.manageInMain'));
       } else if (result.status !== 'saved') {
         noticeActionFailure(t('tray.groupMode'), result.status);
-      } else if (result.runtimeApply?.status === 'hotApplied' && result.runtimeApply.configurationDurable === true) {
-        const label = MODES.find((option) => option.v === mode);
-        if (label) setNotice(t(label.k));
       } else if (result.runtimeApply?.pendingApply) {
         setNotice(t('tray.manageInMain'));
+      } else if (
+        !result.runtimeApply
+        || (result.runtimeApply.status === 'hotApplied' && result.runtimeApply.configurationDurable === true)
+      ) {
+        const label = MODES.find((option) => option.v === mode);
+        if (label) setNotice(t(label.k));
       }
     } catch (err) {
       if (mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current) noticeActionFailure(t('tray.groupMode'), err);
