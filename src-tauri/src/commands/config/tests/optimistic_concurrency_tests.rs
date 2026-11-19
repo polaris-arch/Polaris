@@ -82,7 +82,7 @@ fn matching_base_version_saves_and_returns_the_post_write_version() {
             assert_eq!(version, after, "返回的版本须与落盘后磁盘现值同源");
             assert_eq!(config["logLevel"], "debug", "成功响应须携事务终态投影");
         }
-        SaveOutcome::Conflict { .. } => panic!("基准相符不该判冲突"),
+        other => panic!("基准相符不该判冲突: {other:?}"),
     }
 }
 
@@ -123,7 +123,7 @@ fn optimistic_conflict_touches_nothing() {
                 "回传的 diskVersion 须是磁盘现值的版本"
             );
         }
-        SaveOutcome::Saved { .. } => panic!("基准不符必须判冲突"),
+        other => panic!("基准不符必须判冲突: {other:?}"),
     }
 
     assert_eq!(

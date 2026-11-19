@@ -4923,7 +4923,73 @@ async fn real_core_staged_save_hot_applies_safe_graph_in_the_same_generation() {
     assert_eq!(receipt.runtime_generation, Some(generation));
     assert_eq!(rt.status().pid, started.pid);
     assert_eq!(rt.core_generation(), generation);
-    assert_eq!(rt.current_config_snapshot(), Some(candidate));
+    assert_eq!(rt.current_config_snapshot(), Some(candidate.clone()));
+
+    use crate::runtime::config::Decision;
+    use crate::runtime::proxy::runtime_config::HotConfigEditOutcome;
+
+    let (_, edit) = rt
+        .config
+        .prepare_config_edit(|next| {
+            next["mixedPort"] = serde_json::json!(free_port());
+            Decision::Write(())
+        })
+        .unwrap();
+    let edit = edit.unwrap();
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit).await.unwrap(),
+        HotConfigEditOutcome::NeedsManual,
+    ));
+    assert_eq!(rt.config.saved_revision(), edit.revision);
+    assert_eq!(rt.config.current().unwrap(), candidate);
+    assert!(!rt.pending_changes().pending_apply);
+
+    // An unrelated unsaved renderer draft is no authority over this exact D.
+    rt.config.set_staged_pending(true);
+    let (_, edit) = rt
+        .config
+        .prepare_config_edit(|next| {
+            next["logLevel"] = "warn".into();
+            Decision::Write(())
+        })
+        .unwrap();
+    let edit = edit.unwrap();
+    let HotConfigEditOutcome::Saved {
+        runtime_apply: Some(receipt),
+        ..
+    } = rt.apply_hot_config_edit(&edit).await.unwrap()
+    else {
+        panic!("isolated hot edit must save and return its Core receipt");
+    };
+    assert_eq!(receipt.status, "hotApplied");
+    assert_eq!(receipt.core_state, Some("committed"));
+    assert_eq!(receipt.configuration_durable, Some(true));
+    assert_eq!(receipt.runtime_generation, Some(generation));
+    assert_eq!(rt.status().pid, started.pid);
+    assert_eq!(rt.config.current().unwrap(), edit.candidate);
+    assert_eq!(rt.current_config_snapshot(), Some(edit.candidate));
+    assert!(!rt.pending_changes().pending_apply);
+
+    let (_, edit) = rt
+        .config
+        .prepare_config_edit(|next| {
+            next["uiTheme"] = "dark".into();
+            Decision::Write(())
+        })
+        .unwrap();
+    let edit = edit.unwrap();
+    assert_ne!(edit.candidate, edit.previous);
+    let HotConfigEditOutcome::Saved {
+        runtime_apply: Some(no_op),
+        ..
+    } = rt.apply_hot_config_edit(&edit).await.unwrap()
+    else {
+        panic!("NoOp Plan must prove the graph is already current");
+    };
+    assert_eq!(no_op.status, "hotApplied");
+    assert_eq!(no_op.core_state, Some("unchanged"));
+    assert_eq!(no_op.configuration_durable, Some(true));
+    assert_eq!(no_op.runtime_generation, Some(generation));
     let groups = rt
         .management_api()
         .await

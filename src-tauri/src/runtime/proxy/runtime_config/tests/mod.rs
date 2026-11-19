@@ -253,7 +253,7 @@ fn unverified_peers_never_receive_a_compatibility_restart_choice() {
     let source = crate::test_support::crate_code("runtime/proxy/runtime_config.rs");
     let body = crate::commands::guard_scan::impl_method_body(
         &source,
-        "    async fn apply_runtime_candidate_with_policy(",
+        "    async fn prepare_runtime_candidate(",
     );
     assert!(body.contains("paired_runtime_capabilities(&client, &baseline.pairing)"));
     assert!(!body.contains("unsupportedCore"));
@@ -490,6 +490,119 @@ async fn host_dns_consent_and_failed_admission_do_not_accept_the_saved_host_effe
     assert_eq!(rt.config.current().unwrap(), candidate);
     assert!(rt.pending_changes().pending_apply);
     assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+fn prepare_log_edit(rt: &ProxyRuntime) -> PreparedConfigEdit {
+    let (_, edit) = rt
+        .config
+        .prepare_config_edit(|candidate| {
+            candidate["logLevel"] = json!("debug");
+            crate::runtime::config::Decision::Write(())
+        })
+        .unwrap();
+    edit.unwrap()
+}
+
+#[tokio::test]
+async fn hot_config_edit_without_pairing_never_writes_or_publishes_the_candidate() {
+    let (rt, _dir, running, _) = host_dns_restart_fixture();
+    rt.config.save_full(&running).unwrap();
+    let baseline = ts_pending_raw_fixture(&rt, running.clone());
+    *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+        &baseline.typed,
+        &baseline.generated,
+        &baseline.deps,
+    ));
+    rt.config.set_staged_pending(true);
+    let edit = prepare_log_edit(&rt);
+    assert!(rt.hot_config_edit_isolated(&edit.previous));
+    assert_ne!(edit.candidate, edit.previous);
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit).await.unwrap(),
+        HotConfigEditOutcome::NeedsManual,
+    ));
+    assert_eq!(rt.config.saved_revision(), edit.revision);
+    assert_eq!(rt.config.current().unwrap(), running);
+    assert_eq!(rt.current_config_snapshot(), Some(running.clone()));
+    assert!(!rt.pending_changes().pending_apply);
+    assert!(rt.runtime_config_apply.lock().unwrap().last.is_none());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+
+    let mut changed = running.clone();
+    changed["logLevel"] = json!("warn");
+    rt.config.save_full(&changed).unwrap();
+    rt.config.save_full(&running).unwrap();
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit).await.unwrap(),
+        HotConfigEditOutcome::Conflict,
+    ));
+    assert_eq!(rt.config.current().unwrap(), running);
+}
+
+#[tokio::test]
+async fn hot_config_edit_while_stopped_saves_for_next_start_without_a_runtime_receipt() {
+    let (rt, _dir) = crate::runtime::proxy::tests::test_runtime_on(Platform::Mac);
+    rt.config.save_full(&runnable_config_fixture()).unwrap();
+    let edit = prepare_log_edit(&rt);
+    assert!(matches!(
+        rt.apply_hot_config_edit(&edit).await.unwrap(),
+        HotConfigEditOutcome::Saved {
+            runtime_apply: None,
+            ..
+        },
+    ));
+    assert_eq!(rt.config.current().unwrap(), edit.candidate);
+    assert_eq!(rt.current_config_snapshot(), None);
+    assert!(!rt.pending_changes().pending_apply);
+}
+
+#[test]
+fn hot_config_edit_pending_projection_does_not_consume_independent_or_failed_work() {
+    let (rt, _dir, running, _) = host_dns_restart_fixture();
+    rt.config.save_full(&running).unwrap();
+    let baseline = ts_pending_raw_fixture(&rt, running.clone());
+    *rt.switch_snapshot.write().unwrap() = Some(ProxyRuntime::build_switch_snapshot(
+        &baseline.typed,
+        &baseline.generated,
+        &baseline.deps,
+    ));
+    let edit = prepare_log_edit(&rt);
+    let mut executing = AutomaticConfigEdit {
+        runtime: &rt,
+        owner: None,
+    };
+    let owner = StagedSaveOwner::capture(&rt, edit.revision);
+    let revision = rt
+        .config
+        .commit_prepared_config_edit(
+            &edit,
+            || true,
+            |revision| executing.publish(StagedSaveOwner { revision, ..owner }),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(rt.config.current().unwrap(), edit.candidate);
+    let mut pending = ts_pending_raw_fixture(&rt, edit.candidate.clone());
+    pending.saved_revision = Some(revision);
+    rt.runtime_config_apply.lock().unwrap().pending = Some(pending);
+    assert!(!rt.pending_changes().pending_apply);
+    assert!(!rt.staged_save_recovery_pending());
+
+    // Once dispatch returns without definitive success, its exact debt is real.
+    drop(executing);
+    assert!(rt.pending_changes().pending_apply);
+    assert!(rt.staged_save_recovery_pending());
+
+    // Equal bytes from a later writer cannot inherit the executing owner.
+    let mut executing = AutomaticConfigEdit {
+        runtime: &rt,
+        owner: None,
+    };
+    executing.publish(StagedSaveOwner { revision, ..owner });
+    rt.config.save_full(&running).unwrap();
+    rt.config.save_full(&edit.candidate).unwrap();
+    assert!(rt.pending_changes().pending_apply);
+    assert!(rt.staged_save_recovery_pending());
 }
 
 #[tokio::test]

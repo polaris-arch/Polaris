@@ -257,9 +257,15 @@ fn invalidation_happens_before_the_write() {
     let transaction = body
         .find("config.update_with_cleanup_revision(defer_cleanup, |current|")
         .expect("全量保存必须走原子配置事务");
+    let candidate =
+        crate::commands::guard_scan::top_level_fn_body(&src, "fn prepare_full_save_candidate(");
+    assert!(
+        candidate.contains("invalidate_validators_on_global_ua_change(current, next)"),
+        "普通提交和预检共用的候选必须清理旧验证器"
+    );
     let at = body
-        .find("invalidate_validators_on_global_ua_change(")
-        .expect("变异锁：全量保存腿的验证器作废被删了");
+        .find("prepare_full_save_candidate(current, &mut next)")
+        .expect("全量保存腿必须使用清理验证器的候选");
     let write = body
         .find("std::mem::replace(current, next)")
         .expect("事务提交腿仍在");

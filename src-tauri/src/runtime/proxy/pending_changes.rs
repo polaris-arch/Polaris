@@ -201,43 +201,49 @@ impl ProxyRuntime {
             return empty();
         };
         let saved;
-        let current = if let Some(desired) = desired {
-            desired
+        let (current, executing_exact_edit) = if let Some(desired) = desired {
+            (desired, false)
         } else {
-            saved = self.config.current().unwrap_or_else(|_| snap.clone());
-            &saved
+            saved = self
+                .config
+                .with_current(|saved| (saved.clone(), self.config.saved_revision()))
+                .unwrap_or_else(|_| (snap.clone(), 0));
+            (&saved.0, self.executing_config_edit(saved.1))
         };
-        let old_ids: std::collections::HashSet<String> = server_ids(&snap);
-        let new_ids: std::collections::HashSet<String> = server_ids(current);
-
-        let mut added: Vec<_> = new_ids.difference(&old_ids).cloned().collect();
-        let mut removed: Vec<_> = old_ids.difference(&new_ids).cloned().collect();
-
-        // `modified` ⊂ old ∩ new：只在一侧存在的 id 属 added/removed，不属 modified。
         let snap_fps = self
             .switch_snapshot
             .read()
             .ok()
             .and_then(|g| g.as_ref().map(|s| s.fingerprints.clone()));
-        let current_fps = node_fingerprints::modified_table_json(current);
-        let mut modified: Vec<_> = old_ids
-            .intersection(&new_ids)
-            .filter(|id| {
-                match (
-                    snap_fps.as_ref().and_then(|snapshot| snapshot.get(*id)),
-                    current_fps.get(*id),
-                ) {
-                    (Some(old), Some(new)) => old != new,
-                    // 任一侧取不到指纹（快照缺失 / 节点解析不出）⇒ 没有比对基准 ⇒ 不判 modified。
-                    _ => false,
-                }
-            })
-            .cloned()
-            .collect();
-
-        added.sort();
-        modified.sort();
-        removed.sort();
+        // Only unresolved differences require the user's action. The
+        // admitted edit owns this exact revision until its native result.
+        let (added, modified, removed) = if executing_exact_edit {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let old_ids = server_ids(&snap);
+            let new_ids = server_ids(current);
+            let current_fps = node_fingerprints::modified_table_json(current);
+            let mut added: Vec<_> = new_ids.difference(&old_ids).cloned().collect();
+            let mut removed: Vec<_> = old_ids.difference(&new_ids).cloned().collect();
+            let mut modified: Vec<_> = old_ids
+                .intersection(&new_ids)
+                .filter(|id| {
+                    match (
+                        snap_fps.as_ref().and_then(|snapshot| snapshot.get(*id)),
+                        current_fps.get(*id),
+                    ) {
+                        (Some(old), Some(new)) => old != new,
+                        // Missing effective fingerprints cannot prove a change.
+                        _ => false,
+                    }
+                })
+                .cloned()
+                .collect();
+            added.sort();
+            modified.sort();
+            removed.sort();
+            (added, modified, removed)
+        };
         // 显式选择只改磁盘 D 而目标不在当前核时，没有节点增/改/删也可能留下
         // selectedServerId 债。直接比 D/R 真值，切回运行出口后自然清掉，不污染“保存未应用”
         // 的独立 restart_deferred 标记。
@@ -246,13 +252,15 @@ impl ProxyRuntime {
             .read()
             .ok()
             .and_then(|g| g.as_ref().cloned());
-        let selected_pending = applied.as_ref().is_some_and(|runtime| {
-            runtime.get("selectedServerId") != current.get("selectedServerId")
-        });
-        let non_node_pending = applied
-            .as_ref()
-            .and_then(|runtime| non_node_runtime_debt(runtime, current, self.helper.platform()))
-            .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
+        let selected_pending = !executing_exact_edit
+            && applied.as_ref().is_some_and(|runtime| {
+                runtime.get("selectedServerId") != current.get("selectedServerId")
+            });
+        let non_node_pending = !executing_exact_edit
+            && applied
+                .as_ref()
+                .and_then(|runtime| non_node_runtime_debt(runtime, current, self.helper.platform()))
+                .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
         // A lost graph baseline can conceal saved work. Selector reconciliation
         // alone keeps the Save admission fence and its own attestation path.
         let baseline_pending =
@@ -268,13 +276,14 @@ impl ProxyRuntime {
             || recovery_pending
             || baseline_pending
             || native_pending;
-        let restart_required = applied.as_ref().is_some_and(|runtime| {
-            super::runtime_config::structural_runtime_change(
-                runtime,
-                current,
-                self.helper.platform(),
-            )
-        });
+        let restart_required = !executing_exact_edit
+            && applied.as_ref().is_some_and(|runtime| {
+                super::runtime_config::structural_runtime_change(
+                    runtime,
+                    current,
+                    self.helper.platform(),
+                )
+            });
         PendingChangesSummary {
             pending_apply,
             restart_required,
@@ -284,7 +293,7 @@ impl ProxyRuntime {
             removed,
             saved_settings_revert_token: applied
                 .as_ref()
-                .filter(|_| desired.is_none())
+                .filter(|_| desired.is_none() && !executing_exact_edit)
                 .and_then(|running| self.saved_settings_revert_token(current, running)),
             restart_deferred: non_node_pending
                 || selected_pending

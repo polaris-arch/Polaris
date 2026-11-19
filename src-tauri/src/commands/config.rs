@@ -32,7 +32,9 @@ use crate::events::channel::{
 };
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
-use crate::runtime::proxy::runtime_config::{StagedSaveOwner, TakeoverApplyOwner};
+use crate::runtime::proxy::runtime_config::{
+    HotConfigEditOutcome, StagedSaveOwner, TakeoverApplyOwner,
+};
 use crate::runtime::proxy::{ProxyRuntime, StagedClassification, SwitchOutcome};
 use crate::runtime::unlock::{
     selected_exit_changed, BroadcastSink, UnlockEventSink, UnlockRuntime,
@@ -379,6 +381,8 @@ pub enum SaveOutcome {
     /// 磁盘现值 ≠ `base_version` ⇒ **一个字节都没写**。`diskVersion` 供前端定位它该基于哪一版重放。
     #[serde(rename_all = "camelCase")]
     Conflict { disk_version: String },
+    /// No write occurred. Render or keep the explicit draft for this edit.
+    NeedsManual,
 }
 
 const CONFIG_BASE_VERSION_REQUIRED: &str = "CONFIG_BASE_VERSION_REQUIRED";
@@ -402,6 +406,7 @@ pub async fn config_save(
     defer_restart: Option<bool>,
     base_version: Option<String>,
     auto_apply: Option<bool>,
+    hot_only: Option<bool>,
 ) -> Result<ApiResponse<SaveOutcome>, ()> {
     if base_version.is_none() {
         log::warn!("config:save 缺少 baseVersion，拒绝无版本整份覆盖");
@@ -412,6 +417,12 @@ pub async fn config_save(
             ),
             CONFIG_BASE_VERSION_REQUIRED,
         ));
+    }
+    if let Some(base) = base_version
+        .as_deref()
+        .filter(|_| hot_only.unwrap_or(false))
+    {
+        return Ok(config_save_hot_only(&app, &state, config, base).await);
     }
     // 本地转 mut 而非参数上写 `mut config`：check-ipc-args.mjs 的 Rust 形参解析不 strip `mut`，会把
     // 参数名误读成 `mut config` 从而要求前端多传该键（运行期 Tauri 其实 strip 了、无害，但 CI 门会红）。
@@ -479,6 +490,85 @@ pub async fn config_save(
         }
     }
     Ok(ApiResponse::ok(outcome))
+}
+
+fn prepare_full_save_candidate(current: &Value, next: &mut Value) -> usize {
+    preserve_server_owned_secrets_from(current, next);
+    enforce_backend_authoritative_fields_from(current, next);
+    crate::commands::server::prune_recent_server_ids_to_existing(next);
+    sync_traffic_rules_projection(next);
+    invalidate_validators_on_global_ua_change(current, next)
+}
+
+async fn config_save_hot_only(
+    app: &AppHandle,
+    state: &AppRuntime,
+    submitted: Value,
+    base_version: &str,
+) -> ApiResponse<SaveOutcome> {
+    let config = state.config();
+    let ((conflict, invalidated), edit) = match config.prepare_config_edit(|current| {
+        let disk_version = config_version(current);
+        if base_version != disk_version {
+            return Decision::Skip((Some(disk_version), 0));
+        }
+        let mut next = submitted;
+        let invalidated = prepare_full_save_candidate(current, &mut next);
+        *current = next;
+        Decision::Write((None, invalidated))
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => return config_store_error(error),
+    };
+    let Some(edit) = edit else {
+        let disk_version = conflict.expect("skipped prospective edit has a conflict version");
+        return ApiResponse::ok(SaveOutcome::Conflict { disk_version });
+    };
+    match Box::pin(state.proxy.apply_hot_config_edit(&edit)).await {
+        Ok(HotConfigEditOutcome::NeedsManual) => ApiResponse::ok(SaveOutcome::NeedsManual),
+        Ok(HotConfigEditOutcome::Conflict) => match config.with_current(config_version) {
+            Ok(disk_version) => ApiResponse::ok(SaveOutcome::Conflict { disk_version }),
+            Err(error) => config_store_error(error),
+        },
+        Ok(HotConfigEditOutcome::Saved {
+            runtime_apply,
+            revision,
+        }) => {
+            if edit.previous != edit.candidate {
+                log_invalidated_validators(invalidated);
+                if config.saved_revision() == revision {
+                    apply_process_config_projections(app, &edit.candidate);
+                    invalidate_unlock_on_exit_change(
+                        state.unlock(),
+                        &BroadcastSink::new(app),
+                        state.proxy().status().running,
+                        edit.previous
+                            .get("selectedServerId")
+                            .and_then(Value::as_str),
+                        edit.candidate
+                            .get("selectedServerId")
+                            .and_then(Value::as_str),
+                    );
+                }
+                emit_config_changed_signal(app);
+            }
+            let mut frontend = edit.candidate;
+            apply_frontend_view(&mut frontend);
+            ApiResponse::ok(SaveOutcome::Saved {
+                version: config_content_hash(&frontend),
+                config: frontend,
+                runtime_apply: runtime_apply.and_then(|receipt| serde_json::to_value(receipt).ok()),
+            })
+        }
+        Err(error @ polaris_store::StoreError::CommitUncertain(_)) => {
+            // A post-rename storage failure may already have changed D. Publish
+            // the actual cache/pending state without authorizing an Apply.
+            state.proxy().push_pending_changes();
+            emit_config_changed_signal(app);
+            config_store_error(error)
+        }
+        Err(error) => config_store_error(error),
+    }
 }
 
 /// `CONFIG_CLASSIFY_STAGED`（spec §2.3.4）：候选配置**若现在落盘**会走哪条腿。
@@ -923,13 +1013,7 @@ fn config_save_core(
             let mut next = submitted;
             // 三条基于磁盘真值的策略与版本校验、最终写入处在同一个 ConfigManager 写临界区：
             // 后台订阅/MRU 写不再能插进“校验通过 → 覆盖落盘”的窗口。
-            preserve_server_owned_secrets_from(current, &mut next);
-            enforce_backend_authoritative_fields_from(current, &mut next);
-            crate::commands::server::prune_recent_server_ids_to_existing(&mut next);
-            sync_traffic_rules_projection(&mut next);
-            log_invalidated_validators(invalidate_validators_on_global_ua_change(
-                current, &mut next,
-            ));
+            log_invalidated_validators(prepare_full_save_candidate(current, &mut next));
             let previous = std::mem::replace(current, next);
             crate::runtime::config::Decision::Write(Attempt::Save { previous })
         })?;

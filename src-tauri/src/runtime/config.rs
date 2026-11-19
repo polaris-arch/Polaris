@@ -510,6 +510,13 @@ pub(crate) struct DeferredDeletionSummary {
     pub retrying: usize,
 }
 
+/// Canonical candidate and the exact writer revision it was prepared against.
+pub(crate) struct PreparedConfigEdit {
+    pub(crate) previous: Value,
+    pub(crate) candidate: Value,
+    pub(crate) revision: u64,
+}
+
 /// 配置运行时（`State`-managed，单实例）。
 ///
 /// 持有配置目录路径 + currentConfig 缓存（`RwLock<Value>`，读多写少）。
@@ -1128,6 +1135,16 @@ impl ConfigManager {
         // 删除意图必须按**实际会写盘**的规范形求差集。若 sanitize 会剔除一个坏实体，而这里仍拿
         // 清洗前入参求差集，就会出现“磁盘实体没了、删除 journal 却从未记录”的永久资产泄漏。
         let canonical = self.canonicalize_untrusted_under_write_lock(config)?;
+        self.save_canonical_deferred_cleanup_locked(current, canonical, explicit, |_| {})
+    }
+
+    fn save_canonical_deferred_cleanup_locked(
+        &self,
+        current: &Value,
+        canonical: Value,
+        explicit: &[DeferredConfigDeletion],
+        before_cache_publication: impl FnOnce(u64),
+    ) -> Result<Value, StoreError> {
         let mut additions = derive_deferred_deletions(current, &canonical);
         additions.entries.extend_from_slice(explicit);
         if mesh_guard::has_managed_fields(&canonical) {
@@ -1144,7 +1161,7 @@ impl ConfigManager {
             });
         }
         self.stage_deferred_deletion_entries_locked(additions)?;
-        self.save_canonical_with_icon_reconcile(canonical, false)
+        self.save_canonical_with_publication(canonical, false, before_cache_publication)
     }
 
     fn save_full_with_icon_reconcile(
@@ -1228,6 +1245,15 @@ impl ConfigManager {
         canonical: Value,
         reconcile_icons: bool,
     ) -> Result<Value, StoreError> {
+        self.save_canonical_with_publication(canonical, reconcile_icons, |_| {})
+    }
+
+    fn save_canonical_with_publication(
+        &self,
+        canonical: Value,
+        reconcile_icons: bool,
+        before_cache_publication: impl FnOnce(u64),
+    ) -> Result<Value, StoreError> {
         // 旧 id 集须在刷缓存前从当前缓存取（此刻仍持旧配置）；缓存未暖则无旧态可 diff（冷启无删除发生）。
         let old_ids = self
             .cache
@@ -1237,6 +1263,8 @@ impl ConfigManager {
         // 同上：第 4 参是随机 12hex tmp 后缀，非品牌名。每次保存都须取新值——
         // 恒定后缀会让并发 saveConfig 撞同一个 tmp 路径，原子写的隔离性即失效。
         self.persist_canonical_under_write_lock(&canonical)?;
+        // Register the exact owner before any reader can observe the new cache.
+        before_cache_publication(self.saved_revision());
         // LOW-4：只有 `customAppPresets` 的 id 集**实际变化**才跑 read_dir + unlink reconcile。
         // `set_value` 走此汇流点保存**任何**键（mixedPort / 开关 / 规则…），绝大多数与自定义应用无关；
         // 无条件 reconcile 会让每次保存都白遍历一遍 `<userData>/icons/`。先比 id 集，未变即跳过整个
@@ -1865,6 +1893,67 @@ impl ConfigManager {
                 Ok((r, Some(saved), self.saved_revision()))
             }
         }
+    }
+
+    /// Prepare the same normalized document that an ordinary save would write.
+    /// Release the writer before RPC. The caller only retains an exact CAS recipe.
+    pub(crate) fn prepare_config_edit<R>(
+        &self,
+        edit: impl FnOnce(&mut Value) -> Decision<R>,
+    ) -> Result<(R, Option<PreparedConfigEdit>), StoreError> {
+        deny_inside_projection("prepare_config_edit");
+        let _writer = self
+            .write_lock
+            .lock()
+            .map_err(|_| StoreError::validation("config edit writer unavailable"))?;
+        let previous = self.load_full_under_write_lock()?;
+        let mut candidate = previous.clone();
+        match edit(&mut candidate) {
+            Decision::Skip(result) => Ok((result, None)),
+            Decision::Write(result) => Ok((
+                result,
+                Some(PreparedConfigEdit {
+                    previous,
+                    candidate: self.canonicalize_untrusted_under_write_lock(&candidate)?,
+                    revision: self.saved_revision(),
+                }),
+            )),
+        }
+    }
+
+    /// Persist only the bytes authorized by Plan against the same writer revision.
+    pub(crate) fn commit_prepared_config_edit(
+        &self,
+        edit: &PreparedConfigEdit,
+        admit: impl FnOnce() -> bool,
+        before_cache_publication: impl FnOnce(u64),
+    ) -> Result<Option<u64>, StoreError> {
+        deny_inside_projection("commit_prepared_config_edit");
+        let _writer = self
+            .write_lock
+            .lock()
+            .map_err(|_| StoreError::validation("config edit writer unavailable"))?;
+        if self.saved_revision() != edit.revision
+            || self.load_full_under_write_lock()? != edit.previous
+            || self.saved_revision() != edit.revision
+            || !admit()
+        {
+            return Ok(None);
+        }
+        if edit.previous == edit.candidate {
+            return Ok(Some(edit.revision));
+        }
+        let _deletions = self
+            .deferred_delete_lock
+            .lock()
+            .map_err(|_| StoreError::validation("config edit deletion journal unavailable"))?;
+        self.save_canonical_deferred_cleanup_locked(
+            &edit.previous,
+            edit.candidate.clone(),
+            &[],
+            before_cache_publication,
+        )?;
+        Ok(Some(self.saved_revision()))
     }
 
     /// 取单键（currentConfig 投影）。上游 `configManager.get(key)`。

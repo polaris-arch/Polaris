@@ -6,6 +6,7 @@ use std::sync::{atomic::Ordering, Arc};
 
 use super::hot_switch::SwitchOutcome;
 use super::ProxyRuntime;
+use crate::runtime::config::PreparedConfigEdit;
 use crate::runtime::route_binding::{
     plan_protected_runtime_bindings, protected_generated_policy_compatible, ProtectedBindingPlan,
     ProtectedPhysicalRoot,
@@ -430,7 +431,7 @@ struct RestartChoice {
     running: Value,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StagedSaveOwner {
     pub(crate) generation: u64,
     pub(crate) intent: u64,
@@ -454,6 +455,47 @@ impl StagedSaveOwner {
             intent: runtime.selector_reconcile.intent_generation(),
             revision,
         }
+    }
+
+    fn is_current(self, runtime: &ProxyRuntime) -> bool {
+        runtime.selector_operation_is_current(self.generation, self.intent)
+            && runtime.saved_revision_matches(Some(self.revision))
+    }
+}
+
+pub(crate) enum HotConfigEditOutcome {
+    Saved {
+        runtime_apply: Option<RuntimeApplyResult>,
+        revision: u64,
+    },
+    NeedsManual,
+    Conflict,
+}
+
+struct AutomaticConfigEdit<'a> {
+    runtime: &'a ProxyRuntime,
+    owner: Option<StagedSaveOwner>,
+}
+
+impl AutomaticConfigEdit<'_> {
+    fn publish(&mut self, owner: StagedSaveOwner) {
+        if let Ok(mut state) = self.runtime.runtime_config_apply.lock() {
+            state.automatic_edit = Some(owner);
+            self.owner = Some(owner);
+        }
+    }
+}
+
+impl Drop for AutomaticConfigEdit<'_> {
+    fn drop(&mut self) {
+        let Some(owner) = self.owner else { return };
+        if let Ok(mut state) = self.runtime.runtime_config_apply.lock() {
+            if state.automatic_edit == Some(owner) {
+                state.automatic_edit = None;
+            }
+        }
+        // Drop also handles cancellation after a successful disk write.
+        self.runtime.push_pending_changes();
     }
 }
 
@@ -501,6 +543,7 @@ pub(super) struct RuntimeConfigApplyState {
     impact: Option<PreparedImpactChoice>,
     restart: Option<RestartChoice>,
     pending: Option<PendingOperation>,
+    automatic_edit: Option<StagedSaveOwner>,
     last: Option<RuntimeApplyResult>,
 }
 
@@ -1567,6 +1610,135 @@ impl ProxyRuntime {
             .then_some(result)
     }
 
+    /// Plan a single edit while D still belongs to the preceding revision.
+    /// Only the exact canonical candidate may claim the admitted transaction.
+    pub(crate) async fn apply_hot_config_edit(
+        self: &Arc<Self>,
+        edit: &PreparedConfigEdit,
+    ) -> Result<HotConfigEditOutcome, polaris_store::StoreError> {
+        let _serial = self.switch_serial.lock().await;
+        let owner = StagedSaveOwner::capture(self, edit.revision);
+        let not_committed = || {
+            if self.saved_revision_matches(Some(edit.revision)) {
+                HotConfigEditOutcome::NeedsManual
+            } else {
+                HotConfigEditOutcome::Conflict
+            }
+        };
+        let idle = || {
+            self.core_generation() == owner.generation
+                && self.selector_intent_is_current(owner.intent)
+                && !self.gate.is_busy()
+        };
+        if !idle() || !self.saved_revision_matches(Some(edit.revision)) {
+            return Ok(not_committed());
+        }
+        // Android's transport may be temporarily unavailable while an owned
+        // Core is still running. Only an already stopped lifecycle is offline.
+        let stopped = || self.status.read().is_ok_and(|status| !status.running);
+        if edit.previous == edit.candidate || stopped() {
+            let unchanged = edit.previous == edit.candidate;
+            let committed = self.config.commit_prepared_config_edit(
+                edit,
+                || idle() && (unchanged || stopped()),
+                |_| {},
+            )?;
+            return Ok(match committed {
+                Some(revision) => HotConfigEditOutcome::Saved {
+                    runtime_apply: None,
+                    revision,
+                },
+                None => not_committed(),
+            });
+        }
+
+        if !self.core_running() || !self.hot_config_edit_isolated(&edit.previous) {
+            return Ok(not_committed());
+        }
+        let Ok((client, mut pending)) = Box::pin(self.prepare_runtime_candidate(
+            edit.candidate.clone(),
+            Some(&edit.previous),
+            Some(owner),
+            false,
+            true,
+        ))
+        .await
+        else {
+            return Ok(not_committed());
+        };
+        if !self.verify_prepared_physical_bindings(&pending).await {
+            return Ok(not_committed());
+        }
+
+        let mut publication = AutomaticConfigEdit {
+            runtime: self,
+            owner: None,
+        };
+        let Some(revision) = self.config.commit_prepared_config_edit(
+            edit,
+            || idle() && self.core_running() && self.hot_config_edit_isolated(&edit.previous),
+            |revision| publication.publish(StagedSaveOwner { revision, ..owner }),
+        )?
+        else {
+            return Ok(not_committed());
+        };
+
+        pending.desired = edit.candidate.clone();
+        pending.saved_revision = Some(revision);
+        let scope = self.config.runtime_deletion_scope(
+            &edit.candidate,
+            &self.current_config_snapshot().unwrap_or(Value::Null),
+            &edit.candidate,
+        );
+        let mut result = match scope {
+            Ok(scope) => {
+                pending.deletion_scope = scope;
+                Box::pin(self.execute_prepared_runtime_candidate(client, pending, None, false))
+                    .await
+            }
+            Err(_) => self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
+        };
+        let owner = StagedSaveOwner { revision, ..owner };
+        // Execution can return an unconfirmed result after admitting Apply.
+        // Carry its exact same-Core recovery independently of a later intent.
+        let owner_current = owner.is_current(self);
+        let runtime_apply =
+            if owner_current || self.retain_staged_save_recovery_receipt(owner, &mut result) {
+                Some(result)
+            } else {
+                None
+            };
+        Ok(HotConfigEditOutcome::Saved {
+            runtime_apply,
+            revision,
+        })
+    }
+
+    fn hot_config_edit_isolated(&self, before: &Value) -> bool {
+        self.pending_force_restart
+            .read()
+            .is_ok_and(|choice| choice.is_none())
+            && !self.selector_reconcile.is_required()
+            && self.switch_snapshot.read().is_ok_and(|s| s.is_some())
+            && self.startup_snapshot.read().is_ok_and(|s| s.is_some())
+            && self.current_config.read().is_ok_and(|s| s.is_some())
+            && !self.pending_changes_against(Some(before)).pending_apply
+            && self.runtime_config_apply.lock().is_ok_and(|s| {
+                s.pending.is_none()
+                    && s.restart.is_none()
+                    && s.impact.is_none()
+                    && s.automatic_edit.is_none()
+            })
+    }
+
+    pub(super) fn executing_config_edit(&self, revision: u64) -> bool {
+        self.runtime_config_apply.lock().is_ok_and(|state| {
+            state.automatic_edit.is_some_and(|owner| {
+                owner.revision == revision && owner.is_current(self) && !self.gate.is_busy()
+            })
+        })
+    }
+
     fn retain_staged_save_recovery_receipt(
         &self,
         owner: StagedSaveOwner,
@@ -1604,7 +1776,12 @@ impl ProxyRuntime {
             state
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.saved_revision.is_some())
+                .and_then(PendingOperation::staged_save_owner)
+                .is_some_and(|owner| {
+                    state.automatic_edit != Some(owner)
+                        || !owner.is_current(self)
+                        || self.gate.is_busy()
+                })
         })
     }
 
@@ -1629,9 +1806,41 @@ impl ProxyRuntime {
         saved_owner: Option<StagedSaveOwner>,
         staged_save: bool,
     ) -> RuntimeApplyResult {
+        let offer_confirmation = !staged_save;
+        let prepared = Box::pin(self.prepare_runtime_candidate(
+            candidate,
+            expected_desired,
+            saved_owner,
+            offer_confirmation,
+            false,
+        ))
+        .await;
+        match prepared {
+            Ok((client, pending)) => {
+                Box::pin(self.execute_prepared_runtime_candidate(
+                    client,
+                    pending,
+                    None,
+                    offer_confirmation,
+                ))
+                .await
+            }
+            Err(result) if result.status == "skipped" => *result,
+            Err(result) => self.remember_runtime_result(*result),
+        }
+    }
+
+    async fn prepare_runtime_candidate(
+        self: &Arc<Self>,
+        candidate: Value,
+        expected_desired: Option<&Value>,
+        saved_owner: Option<StagedSaveOwner>,
+        offer_confirmation: bool,
+        prospective: bool,
+    ) -> Result<(Arc<SingBoxApiClient>, PendingOperation), Box<RuntimeApplyResult>> {
+        let decline = |result| Err(Box::new(result));
         let generation = self.gate.generation();
         let intent = self.selector_reconcile.intent_generation();
-        let offer_confirmation = !staged_save;
         let saved_revision = saved_owner.map(|owner| owner.revision);
         let restart_choice = |candidate: &Value, code, paths, generation, intent| {
             if offer_confirmation {
@@ -1652,25 +1861,23 @@ impl ProxyRuntime {
                 || !self.saved_revision_matches(Some(owner.revision))
         }) || self.gate.is_busy()
         {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            return decline(RuntimeApplyResult::status("conflict"));
         }
         if !self.core_running() {
             if saved_owner.is_some() {
-                return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+                return decline(RuntimeApplyResult::status("conflict"));
             }
             if offer_confirmation {
                 self.process_deferred_config_deletions().await;
             }
-            return RuntimeApplyResult::status("skipped");
+            return decline(RuntimeApplyResult::status("skipped"));
         }
         let desired = match self.config.current() {
             Ok(value) => value,
-            Err(_) => {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-            }
+            Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
         if expected_desired.is_some_and(|expected| expected != &desired) {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            return decline(RuntimeApplyResult::status("conflict"));
         }
         let baseline = self
             .runtime_config_baseline
@@ -1678,12 +1885,12 @@ impl ProxyRuntime {
             .ok()
             .and_then(|s| s.clone());
         let Some(mut baseline) = baseline.filter(|s| s.generation == generation) else {
-            return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            return decline(RuntimeApplyResult::status("unconfirmed"));
         };
         // The pinned management endpoint can advance independently from R after
         // a committed but locally superseded candidate; only HMAC proof updates it.
         let Some(endpoint) = baseline.management.as_ref() else {
-            return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            return decline(RuntimeApplyResult::status("unconfirmed"));
         };
         let pending_before_client = self
             .runtime_config_apply
@@ -1698,15 +1905,13 @@ impl ProxyRuntime {
             h.origin.clone()
         } else if let Some(control) = baseline.control.clone() {
             if !control.captured_transport_live() {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+                return decline(RuntimeApplyResult::status("unconfirmed"));
             }
             control
         } else {
             match endpoint.connect().await {
                 Ok(client) => Arc::new(client),
-                Err(_) => {
-                    return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-                }
+                Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
             }
         };
         // An ambiguous previous Apply is reconciled by its original transaction ID.
@@ -1718,6 +1923,9 @@ impl ProxyRuntime {
             .and_then(|s| s.pending.clone());
         let mut host_retry_only = false;
         if let Some(pending) = pending {
+            if prospective {
+                return decline(RuntimeApplyResult::status("conflict"));
+            }
             let result = Box::pin(self.reconcile_runtime_operation(&client, pending)).await;
             let superseded = result
                 .reasons
@@ -1737,7 +1945,7 @@ impl ProxyRuntime {
             if (!superseded && !host_retry_only)
                 || self.config.current().ok().as_ref() != Some(&candidate)
             {
-                return self.remember_runtime_result(result);
+                return decline(result);
             }
             // Generic Core persistence remains owned by its original transaction.
             // A same-candidate host retry may proceed only through a fresh NoOp
@@ -1749,17 +1957,13 @@ impl ProxyRuntime {
                 .and_then(|value| value.clone())
             {
                 Some(value) if value.generation == generation => value,
-                _ => {
-                    return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-                }
+                _ => return decline(RuntimeApplyResult::status("unconfirmed")),
             };
         }
         if baseline.management.is_some() {
             match self.runtime_management_client(generation).await {
                 Ok(fresh) => client = fresh,
-                Err(_) => {
-                    return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-                }
+                Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
             }
         }
 
@@ -1768,18 +1972,20 @@ impl ProxyRuntime {
             // Missing RPC/authentication/protocol/manifest/incarnation never grants
             // a same-core restart token. The old baseline must not adopt this peer.
             Err(result) => {
-                if let Ok(mut state) = self.runtime_config_apply.lock() {
-                    state.restart = None;
+                if !prospective {
+                    if let Ok(mut state) = self.runtime_config_apply.lock() {
+                        state.restart = None;
+                    }
                 }
-                return self.remember_runtime_result(*result);
+                return decline(*result);
             }
         };
         if self.gate.is_busy() || !self.selector_operation_is_current(generation, intent) {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            return decline(RuntimeApplyResult::status("conflict"));
         }
         if !capabilities.connected_hot_enabled {
             if self.current_config_snapshot().as_ref() == Some(&candidate) {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+                return decline(RuntimeApplyResult::status("unconfirmed"));
             }
             let result = restart_choice(
                 &candidate,
@@ -1788,14 +1994,14 @@ impl ProxyRuntime {
                 generation,
                 intent,
             );
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         if !self.selector_operation_is_current(generation, intent) {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            return decline(RuntimeApplyResult::status("conflict"));
         }
         let typed: UserConfig = match serde_json::from_value(candidate.clone()) {
             Ok(value) => value,
-            Err(_) => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
+            Err(_) => return decline(RuntimeApplyResult::status("rejected")),
         };
         if !polaris_config_engine::builder::outbounds::vision_route_targets_valid(&typed) {
             let mut result = RuntimeApplyResult::status("rejected");
@@ -1803,7 +2009,7 @@ impl ProxyRuntime {
                 code: super::code::VISION_TRANSPORT_UNSUPPORTED,
                 path: "outbounds.vision.transport".into(),
             });
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         if !runtime_route_targets_valid(&typed) {
             let mut result = RuntimeApplyResult::status("rejected");
@@ -1811,18 +2017,18 @@ impl ProxyRuntime {
                 code: "INVALID_ROUTE_TARGET",
                 path: "route.targetServerId".into(),
             });
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         if self
             .validate_required_bind_interfaces(&typed)
             .await
             .is_err()
         {
-            return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
+            return decline(RuntimeApplyResult::status("rejected"));
         }
         let previous_raw = match self.current_config_snapshot() {
             Some(value) => value,
-            None => return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
+            None => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
         if baseline.pairing.client_impact_policy_version == 0
             && super::dns_takeover::host_dns_takeover_changed(
@@ -1831,7 +2037,7 @@ impl ProxyRuntime {
                 &candidate,
             )
         {
-            return self.remember_runtime_result(restart_choice(
+            return decline(restart_choice(
                 &candidate,
                 "structuralChange",
                 vec!["dnsConfig.takeoverSystemDns".into()],
@@ -1841,7 +2047,7 @@ impl ProxyRuntime {
         }
         let Some(mut deps) = self.runtime_host_dns_generation_deps(generation, &baseline.deps)
         else {
-            return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            return decline(RuntimeApplyResult::status("unconfirmed"));
         };
         if baseline.pairing.client_impact_policy_version == CLIENT_IMPACT_POLICY_VERSION {
             // Calculation input only. The physical controller snapshot and its
@@ -1886,7 +2092,7 @@ impl ProxyRuntime {
             .ok()
             .map(|state| state.plan.clone())
         else {
-            return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            return decline(RuntimeApplyResult::status("unconfirmed"));
         };
         let previous_bindings = binding_plan.bindings.clone();
         let mut protected_binding_plan = None;
@@ -1934,13 +2140,13 @@ impl ProxyRuntime {
                     generation,
                     intent,
                 );
-                return self.remember_runtime_result(result);
+                return decline(result);
             };
             binding_plan = proof.binding_plan().clone();
             protected_binding_plan = Some(proof);
         }
         if !self.selector_operation_is_current(generation, intent) {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            return decline(RuntimeApplyResult::status("conflict"));
         }
         let bindings = binding_plan.bindings.clone();
         if baseline.pairing.client_impact_policy_version == CLIENT_IMPACT_POLICY_VERSION
@@ -1971,7 +2177,7 @@ impl ProxyRuntime {
                 generation,
                 intent,
             );
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         let outcome = match generate_sing_box_config_with_report_and_runtime_bindings(
             &typed,
@@ -1986,7 +2192,7 @@ impl ProxyRuntime {
             {
                 value
             }
-            _ => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
+            _ => return decline(RuntimeApplyResult::status("rejected")),
         };
         if let Err(code) = super::lan_gateway::check(&outcome.config, &deps.platform) {
             let mut result = RuntimeApplyResult::status("rejected");
@@ -1994,12 +2200,12 @@ impl ProxyRuntime {
                 code,
                 path: "inbounds.tun.gateway.forwarding".into(),
             });
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         if deps.observed_tailnet_addresses != baseline.deps.observed_tailnet_addresses
             && tailnet_tun_projection_changed(&baseline.generated, &outcome.config)
         {
-            return self.remember_runtime_result(restart_choice(
+            return decline(restart_choice(
                 &candidate,
                 "structuralChange",
                 vec!["inbounds.tun.route_exclude_address".into()],
@@ -2013,7 +2219,7 @@ impl ProxyRuntime {
         if protected_binding_plan.is_some()
             && !protected_generated_policy_compatible(&baseline.generated, &generated)
         {
-            return self.remember_runtime_result(restart_choice(
+            return decline(restart_choice(
                 &candidate,
                 "structuralChange",
                 vec!["outbounds.physical_route_binding".into()],
@@ -2023,7 +2229,7 @@ impl ProxyRuntime {
         }
         let mut content = match serde_json::to_value(&generated) {
             Ok(value) => value,
-            Err(_) => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
+            Err(_) => return decline(RuntimeApplyResult::status("rejected")),
         };
         // Native directory custody is host-issued, not recreated by the graph builder.
         if let Ok(previous) = serde_json::to_value(&baseline.generated) {
@@ -2032,14 +2238,14 @@ impl ProxyRuntime {
             }
         }
         if inline_custom_rules(&mut content, &typed, &deps.custom_rules_dir).is_err() {
-            return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
+            return decline(RuntimeApplyResult::status("rejected"));
         }
         // Compare with the current R projection, not startup defaults, which may
         // have diverged after explicit live selection. Snapshot paths are CAS-bound
         // by the kernel, including automatic URLTest winners.
         let previous: UserConfig = match serde_json::from_value(previous_raw).ok() {
             Some(value) => value,
-            None => return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed")),
+            None => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
         let previous = match generate_sing_box_config_with_report_and_runtime_bindings(
             &previous,
@@ -2051,13 +2257,11 @@ impl ProxyRuntime {
         .and_then(|value| serde_json::to_value(value.config).ok())
         {
             Some(value) => value,
-            None => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
+            None => return decline(RuntimeApplyResult::status("rejected")),
         };
         let groups = match client.first_groups_snapshot().await {
             Ok(groups) => groups,
-            Err(_) => {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-            }
+            Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
         let selector_intents = match selector_intents(
             &previous,
@@ -2068,11 +2272,11 @@ impl ProxyRuntime {
                 && !typed.auto_select_enabled,
         ) {
             Ok(intents) => intents,
-            Err(_) => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
+            Err(_) => return decline(RuntimeApplyResult::status("rejected")),
         };
         let config_content = match serde_json::to_string(&content) {
             Ok(value) => value,
-            Err(_) => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
+            Err(_) => return decline(RuntimeApplyResult::status("rejected")),
         };
         let mesh_evidence = self.prepare_mesh_route_run_with_receipt(
             outcome.mesh_route_candidates,
@@ -2094,18 +2298,23 @@ impl ProxyRuntime {
                 code: "RESOURCE_LIMIT_EXCEEDED",
                 path: "route.tailnet_source".into(),
             });
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         // Omission inherits the kernel's immutable startup override snapshot.
         // Explicit empty options would erase platform projection on newer hosts.
         let overrides = None;
-        let deletion_scope = match self.config.runtime_deletion_scope(
-            &desired,
-            &self.current_config_snapshot().unwrap_or(Value::Null),
-            &candidate,
-        ) {
-            Ok(scope) => scope,
-            Err(_) => return self.remember_runtime_result(RuntimeApplyResult::status("conflict")),
+        let deletion_scope = if prospective {
+            // The candidate has no deferred journal entries until its exact CAS.
+            Vec::new()
+        } else {
+            match self.config.runtime_deletion_scope(
+                &desired,
+                &self.current_config_snapshot().unwrap_or(Value::Null),
+                &candidate,
+            ) {
+                Ok(scope) => scope,
+                Err(_) => return decline(RuntimeApplyResult::status("conflict")),
+            }
         };
         let plan = match client
             .plan_runtime_config(daemon::PlanRuntimeConfigRequest {
@@ -2120,9 +2329,7 @@ impl ProxyRuntime {
             .await
         {
             Ok(value) => value,
-            Err(_) => {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-            }
+            Err(_) => return decline(RuntimeApplyResult::status("unconfirmed")),
         };
         if plan.contract_version != 1
             || plan.client_impact_policy_version != baseline.pairing.client_impact_policy_version
@@ -2133,7 +2340,7 @@ impl ProxyRuntime {
             || !self.selector_operation_is_current(generation, intent)
             || !self.saved_revision_matches(saved_revision)
         {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            return decline(RuntimeApplyResult::status("conflict"));
         }
         if !runtime_plan_impacts_supported(&plan) {
             let mut result = RuntimeApplyResult::status("unconfirmed");
@@ -2141,7 +2348,7 @@ impl ProxyRuntime {
                 code: "UNSUPPORTED_RUNTIME_IMPACT",
                 path: "runtime.impacts".into(),
             });
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         if !plan.applicable {
             let paths: Vec<String> = plan
@@ -2155,7 +2362,7 @@ impl ProxyRuntime {
             } else {
                 restart_choice(&candidate, "structuralChange", paths, generation, intent)
             };
-            return self.remember_runtime_result(result);
+            return decline(result);
         }
         if plan.plan_id.is_empty()
             || plan.transaction_id.is_empty()
@@ -2163,10 +2370,10 @@ impl ProxyRuntime {
             || plan.impact_digest.is_empty()
             || !plan.errors.is_empty()
         {
-            return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
+            return decline(RuntimeApplyResult::status("rejected"));
         }
         if host_retry_only && !plan.no_op {
-            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            return decline(RuntimeApplyResult::status("conflict"));
         }
         let target_api = ApiEndpoint::from_generated(&generated);
         let api_generation_handoff = plan.client_impact_policy_version
@@ -2186,7 +2393,7 @@ impl ProxyRuntime {
                 .as_ref()
                 .is_none_or(|client| !client.captured_transport_live())
             {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+                return decline(RuntimeApplyResult::status("unconfirmed"));
             }
             if !capabilities.fields.iter().any(|f| {
                 f.variant == "api-loopback-handoff-v1"
@@ -2199,10 +2406,10 @@ impl ProxyRuntime {
                     generation,
                     intent,
                 );
-                return self.remember_runtime_result(result);
+                return decline(result);
             }
             let Some(target) = target_api else {
-                return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
+                return decline(RuntimeApplyResult::status("rejected"));
             };
             if target.host != "127.0.0.1" {
                 let result = restart_choice(
@@ -2212,7 +2419,7 @@ impl ProxyRuntime {
                     generation,
                     intent,
                 );
-                return self.remember_runtime_result(result);
+                return decline(result);
             }
             let Some(projection) = self.api_saved_projection_for(&candidate, &baseline) else {
                 let result = restart_choice(
@@ -2222,7 +2429,7 @@ impl ProxyRuntime {
                     generation,
                     intent,
                 );
-                return self.remember_runtime_result(result);
+                return decline(result);
             };
             Some(Arc::new(ApiChannelHandoff::new(
                 client.clone(),
@@ -2240,7 +2447,7 @@ impl ProxyRuntime {
         {
             // A NoOp ticket has no persistence tail of its own and cannot borrow
             // the superseded original owner's reload/namespace acknowledgement.
-            return self.remember_runtime_result(restart_choice(
+            return decline(restart_choice(
                 &candidate,
                 "regenerationOwnerRequiresRestart",
                 vec!["runtime.persistence.owner".into()],
@@ -2270,15 +2477,15 @@ impl ProxyRuntime {
                     intent,
                 );
                 choice.reasons = result.reasons;
-                return self.remember_runtime_result(choice);
+                return decline(choice);
             }
-            Err(result) => return self.remember_runtime_result(*result),
+            Err(result) => return decline(*result),
         };
         if matches!(
             host_plan.strategy,
             host_effects::HostEffectStrategy::NeedsSnapshotBeforeCore
         ) {
-            return self.remember_runtime_result(if offer_confirmation {
+            return decline(if offer_confirmation {
                 self.host_effect_restart_choice(
                     &candidate,
                     &host_plan,
@@ -2332,14 +2539,11 @@ impl ProxyRuntime {
             })
         {
             if !offer_confirmation {
-                return self.remember_runtime_result(RuntimeApplyResult::status(
-                    "impactConfirmationRequired",
-                ));
+                return decline(RuntimeApplyResult::status("impactConfirmationRequired"));
             }
-            return self.remember_runtime_result(self.prepare_runtime_impact_choice(pending));
+            return decline(self.prepare_runtime_impact_choice(pending));
         }
-        Box::pin(self.execute_prepared_runtime_candidate(client, pending, None, offer_confirmation))
-            .await
+        Ok((client, pending))
     }
 
     async fn execute_prepared_runtime_candidate(
