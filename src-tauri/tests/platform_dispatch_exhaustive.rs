@@ -4037,6 +4037,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersRight,
+        "A fresh Android browser login can use the native reservation's config check. The Android spawn path reports a rejected config as configurationCheckFailed.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
         "target_os = \"ios\"",
         2,
         IosSide::DiffersRight,
@@ -4695,7 +4702,7 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     // in pending_changes (1 Right); its object no longer exists.
     // Mobile native custody, rule asset directories and SAF add 110 measured sites.
     // The old iOS-only config-file guard is now a runtime Platform match covering both mobile targets.
-    ("DiffersRight", 443),
+    ("DiffersRight", 445),
     ("DiffersUndecided", 26),
     // Saved temporary-core concurrency adds three group members; no old debt is repaid.
     ("DiffersWrongToday", 140),
