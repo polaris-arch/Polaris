@@ -1294,6 +1294,7 @@ impl ProxyRuntime {
         ts_gate: &tokio::sync::MutexGuard<'_, ()>,
         passive_android: bool,
         android_preparation: &mut Option<super::android_bridge::AndroidMainPreparation>,
+        restore_applied: bool,
     ) -> Result<ProxyStatus, StartError> {
         // 早退让位（#176）：入口即被更新的 start/stop 接管 → 别白做 config 生成/写盘/端口解析。
         // 这只是省功，**不是**孤儿防线——真正的防线是下方 spawn 临界区内的持锁判世代。
@@ -2694,9 +2695,9 @@ impl ProxyRuntime {
             if let Ok(mut snap) = self.startup_snapshot.write() {
                 *snap = Some(config.clone());
             }
-            // 核刚按磁盘配置生成并起来 ⇒ 一切「保存但没进核」的欠账在这一刻结清。
-            // 清点必须与 `startup_snapshot` 同刻：这两者一起定义了「运行核吃进去的是什么」。
-            self.restart_deferred.store(false, Ordering::SeqCst);
+            if !restore_applied {
+                self.restart_deferred.store(false, Ordering::SeqCst);
+            }
             if let Ok(mut g) = self.status.write() {
                 *g = new_status.clone();
             }
@@ -2830,7 +2831,11 @@ impl ProxyRuntime {
         // **出口自证**：核已就绪 → 校验「实际生效出口 == 选中节点」，不一致即告警，绝不静默显示「已连接」。
         // 放在 A1 之后：二者是正交的两条降级轴（A1 = OS 没把流量导进核；本检查 = 核内部出口指错了），
         // 各自独立 emit，互不遮蔽。纯静态、零 I/O、微秒级 → 不给已经偏慢的起核路径增加任何延迟。
-        self.attest_selected_exit(&user_config, &singbox_config);
+        self.attest_selected_exit(
+            &user_config,
+            &singbox_config,
+            restore_applied.then_some(&config),
+        );
         // TUN 起来了 → 后台查一次「别人设的系统代理」并提示（只读不动手，见下方方法文档）。
         // 这只是 advisory、不是起核成立条件；Windows 真机首次 `reg query` 曾因系统冷态/安全软件扫描
         // 阻塞约 12s，把它 await 在主链会让网卡与路由早已就绪却仍显示「连接中」。后台腿带世代 +
@@ -2991,7 +2996,7 @@ impl ProxyRuntime {
         );
         if inferred_binding_changed_while_starting {
             log::warn!("起核就绪前推断绑定接口事实发生变化 → 调度一次受控重启重新规划");
-            self.schedule_restart();
+            self.schedule_restart_for_generation(my_gen);
         }
         let dns_ms = t_dns.elapsed().as_millis();
         log::info!("起核耗时：DNS接管={dns_ms}ms");
@@ -3420,15 +3425,17 @@ impl ProxyRuntime {
         &self,
         user_config: &UserConfig,
         singbox_config: &SingBoxConfig,
+        recovery_source: Option<&Value>,
     ) {
-        // 落盘的用户意图（单一真值）。读不到（首启/损坏）→ None → 退化为「只做配置内部自洽对账」，
-        // 而**不是**跳过整个自证：拿不到意图不等于出口没问题。
-        let persisted = self.config.current().ok().and_then(|c| {
-            c.get("selectedServerId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        match attest_effective_exit(user_config, singbox_config, persisted.as_deref()) {
+        let saved = recovery_source
+            .is_none()
+            .then(|| self.config.current().ok())
+            .flatten();
+        let expected = recovery_source
+            .or(saved.as_ref())
+            .and_then(|config| config.get("selectedServerId"))
+            .and_then(Value::as_str);
+        match attest_effective_exit(user_config, singbox_config, expected) {
             ExitAttestation::Match => {
                 log::info!("出口自证通过：实际生效出口 == 选中节点");
             }

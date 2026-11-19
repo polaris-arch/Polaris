@@ -1716,6 +1716,12 @@ impl ProxyRuntime {
         })
     }
 
+    pub(super) fn runtime_configuration_unsettled_for_recovery(&self) -> bool {
+        self.runtime_config_apply.lock().map_or(true, |state| {
+            state.pending.is_some() || state.automatic_edit.is_some() || state.host.has_pending()
+        })
+    }
+
     pub(super) fn annotate_runtime_native_result(&self, result: &mut RuntimeApplyResult) {
         annotate_native_retirement_debts(result, self.native_retirement_debts());
     }

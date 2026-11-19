@@ -1686,7 +1686,7 @@ async fn start_yields_without_spawning_when_superseded_before_spawn() {
     let cfg = serde_json::json!({ "servers": [], "selectedServerId": "__direct__" });
     let ts_gate = rt.mesh.tailscale_state_gate().await;
     let r = rt
-        .start_inner(cfg, stale_gen, &ts_gate, false, &mut None)
+        .start_inner(cfg, stale_gen, &ts_gate, false, &mut None, false)
         .await;
     assert!(r.is_ok(), "让位是正常返回，不是错误");
     assert!(!rt.status().running, "让位腿不得置 running");
@@ -3237,6 +3237,7 @@ async fn attest_selected_exit_emits_and_keeps_running() {
     rt.attest_selected_exit(
         &exit_user_config("n-hk"),
         &singbox_fixture(PROXY_SELECTOR_TAG, Some(DIRECT_TAG)),
+        None,
     );
     let got = events.lock().unwrap().clone();
     assert_eq!(
@@ -3260,6 +3261,7 @@ async fn attest_selected_exit_silent_when_consistent() {
     rt.attest_selected_exit(
         &exit_user_config("n-hk"),
         &singbox_fixture(PROXY_SELECTOR_TAG, Some("HK01")),
+        None,
     );
     assert!(
         events.lock().unwrap().is_empty(),

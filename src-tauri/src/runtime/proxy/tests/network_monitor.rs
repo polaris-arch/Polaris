@@ -223,7 +223,7 @@ fn network_change_reconciles_dns_then_replans_tun_or_schedules_recovery() {
     // 取材器**必须**是 `method_body` 而不是 `top_level_fn_body`：后者按**列 0** 的 `}` 封顶，
     // 而 `handle_network_change` 是 `impl` 块里的方法（缩进 4 空格）—— 那个列 0 的 `}` 封的是
     // 整个 impl 块。实测：真方法体 75 行（`proxy.rs:2871-2945`），旧取材器切到 **7358 行**
-    // （`:2871-10228`），98 倍。后果不是「多扫一点」，是**这条门半瞎**：`self.schedule_restart()`
+    // （`:2871-10228`），98 倍。后果不是「多扫一点」，是**这条门半瞎**：`self.schedule_restart_for_generation`
     // 在超宽切片里有 7 处命中，把真方法体里那一处删掉（= 「需要重规划时不再重启」这条真缺陷），
     // `find` 顺延到 `proxy.rs:4400`，而 4400 > replan 的位置 ⇒ 顺序断言**仍然全绿**。
     // `top_level_fn_body` 现在会对缩进锚点直接 panic，这条注释解释的是当时为什么会写错。
@@ -244,7 +244,7 @@ fn network_change_reconciles_dns_then_replans_tun_or_schedules_recovery() {
         .find("&& needs_runtime_binding_plan(&config)")
         .expect("TUN 网络变化必须复用运行时绑定判据");
     let restart = body
-        .find("self.schedule_restart()")
+        .find("self.schedule_restart_for_generation(generation)")
         .expect("需要重算 TUN 物理接口时必须走现有去抖重启");
     assert!(
         observe < dns && dns < replan && replan < restart && dns < recovery,

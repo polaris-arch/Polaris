@@ -1758,18 +1758,6 @@ impl ProxyRuntime {
         Ok(starts.book_restart(Arc::clone(&self.stop_domain), base, claimed))
     }
 
-    pub(super) fn finish_preclaimed_restart(&self, generation: u64) {
-        if let Ok(starts) = self.normal_start.lock() {
-            for start in &starts.retained {
-                if start.digest == "restart-dispatch"
-                    && matches!(&*start.completion.borrow(), NormalStartCompletion::Starting(g) if *g == generation)
-                {
-                    start.identity.finish_dispatch();
-                }
-            }
-        }
-    }
-
     pub(super) fn admitted_native_producer(
         &self,
         generation: u64,

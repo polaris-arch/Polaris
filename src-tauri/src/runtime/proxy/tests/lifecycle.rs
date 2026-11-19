@@ -102,6 +102,129 @@ async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sw
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn automatic_network_recovery_keeps_pending_resource() {
+    let (rt, dir, _errors, events) = test_runtime_recording_lifecycle();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+
+    let mut applied = two_node_config(7890, "node-a");
+    applied["ruleResources"] = serde_json::json!([
+        {"id": "recovery-fixture", "fileName": "recovery-fixture.srs"}
+    ]);
+    rt.config.save_full(&applied).unwrap();
+    let applied = rt.config.current().unwrap();
+    *rt.current_config.write().unwrap() = Some(applied.clone());
+    *rt.startup_snapshot.write().unwrap() = Some(applied.clone());
+    mark_running(&rt);
+    let generation = rt.bump_generation();
+
+    let resource = dir.join("rule-resource/recovery-fixture.srs");
+    std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
+    std::fs::write(&resource, b"running resource").unwrap();
+    let journal = dir.join("pending-config-deletions.json");
+    let mut saved = applied.clone();
+    saved["selectedServerId"] = serde_json::json!("node-b");
+    saved["ruleResources"] = serde_json::json!([]);
+    // Saved-only resolver reaches a distinct startup error before any Core spawn.
+    saved["dnsConfig"]["resolveNodeDomainsAhead"] = serde_json::json!(true);
+    saved["dnsConfig"]["nodeResolverPool"] = serde_json::json!(["unsupported-fixture"]);
+    rt.config
+        .save_full_deferred_cleanup(&applied, &saved)
+        .unwrap();
+    let saved = rt.config.current().unwrap();
+    assert_eq!(saved["selectedServerId"], "node-b");
+    let pending_delete = std::fs::read(&journal).unwrap();
+
+    let (send, fired) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |outcome, ticket| {
+            let _ = send.send((outcome, ticket));
+        });
+    let (outcome, ticket) = fired.await.unwrap();
+    assert!(matches!(
+        outcome,
+        polaris_switch_engine::DebouncedOutcome::Proceed(None)
+    ));
+    assert!(rt
+        .claim_debounced_restart(None, generation, ticket)
+        .is_none());
+
+    assert_eq!(rt.core_generation(), generation);
+    assert!(rt.status().running);
+    assert!(!rt.gate.is_busy());
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(rt.config.current().unwrap(), saved);
+    assert_eq!(std::fs::read(resource).unwrap(), b"running resource");
+    assert_eq!(std::fs::read(journal).unwrap(), pending_delete);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn automatic_network_recovery_restores_r_without_consuming_saved_journal() {
+    let (rt, dir, _errors, events) = test_runtime_recording_lifecycle();
+    rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
+    let mut applied = two_node_config(7890, "node-a");
+    let bootstrap = applied["dnsServers"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|server| server["id"] == "builtin-bootstrap")
+        .unwrap();
+    bootstrap["type"] = serde_json::json!("local");
+    bootstrap.as_object_mut().unwrap().remove("endpoint");
+    applied["customAppPresets"] =
+        serde_json::json!([{"id": "recovery-icon", "name": "Fixture", "emoji": "F"}]);
+    rt.config.save_full(&applied).unwrap();
+    let applied = rt.config.current().unwrap();
+    *rt.current_config.write().unwrap() = Some(applied.clone());
+    *rt.startup_snapshot.write().unwrap() = Some(applied.clone());
+    mark_running(&rt);
+    let generation = rt.bump_generation();
+    rt.restart_deferred.store(true, Ordering::SeqCst);
+
+    let icons = crate::icon_cache::icons_dir(&dir);
+    crate::icon_cache::write_icon(&icons, "recovery-icon", "png", b"PNG").unwrap();
+    let journal = dir.join("pending-config-deletions.json");
+    let mut saved = applied.clone();
+    saved["selectedServerId"] = serde_json::json!("node-b");
+    saved["customAppPresets"] = serde_json::json!([]);
+    saved["dnsConfig"]["nodeResolverPool"] = serde_json::json!(["unsupported-fixture"]);
+    rt.config
+        .save_full_deferred_cleanup(&applied, &saved)
+        .unwrap();
+    let saved = rt.config.current().unwrap();
+    let pending_delete = std::fs::read(&journal).unwrap();
+
+    rt.schedule_restart_for_generation(generation);
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !rt.gate.is_busy() {
+                if let Some(event) = events.lock().unwrap().iter().find(|event| event.terminal) {
+                    break event.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("network recovery must reach its own terminal lifecycle event");
+
+    assert_eq!(terminal.apply_id, None);
+    assert!(terminal.main_generation > generation);
+    assert!(
+        terminal
+            .message
+            .as_deref()
+            .is_some_and(|message| { message.contains(TEST_CORE_NOT_INJECTED) }),
+        "frozen R must pass configuration startup and reach the fixture's native binary boundary"
+    );
+    assert_eq!(rt.config.current().unwrap(), saved);
+    assert_eq!(std::fs::read(journal).unwrap(), pending_delete);
+    assert!(icons.join("recovery-icon.png").exists());
+    assert!(rt.restart_deferred.load(Ordering::SeqCst));
+}
+
 /// 停止终态必须丢弃暂存的 switch（停止优先：不得停后又被 switch 拉起）。
 #[tokio::test]
 async fn stop_terminal_discards_pending_switch() {
@@ -2116,7 +2239,7 @@ fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
         .find("self.gate.generation()!=requested_generation")
         .unwrap();
     let inner = compact
-        .find("Box::pin(self.start_inner(config,my_gen,&_tailscale_gate,passive_android,&mutandroid_preparation,)).await")
+        .find("Box::pin(self.start_inner(config,my_gen,&_tailscale_gate,passive_android,&mutandroid_preparation,attribution.restore_applied,)).await")
         .unwrap();
     assert!(
         gate < early_fence && early_fence < sweep && sweep < inner,

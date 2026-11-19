@@ -929,10 +929,9 @@ async fn saved_full_config_with_mesh_control_drift_waits_for_explicit_apply() {
             outcome,
             polaris_switch_engine::DebouncedOutcome::Proceed(Some(force_id)) if force_id == id
         ));
-        let (claimed, _, _lease) = rt
+        let (landed, _, _lease) = rt
             .claim_debounced_restart(Some(id), generation, ticket)
             .expect("explicit Apply must claim the saved full snapshot");
-        let landed = claimed.expect("Apply carries D into the replacement core");
         assert_eq!(landed, saved);
         install_startup_snapshot(&rt, &landed);
         *rt.current_config.write().unwrap() = Some(landed);
@@ -4824,10 +4823,9 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
         outcome,
         polaris_switch_engine::DebouncedOutcome::Proceed(Some(force_id)) if force_id == id
     ));
-    let (snapshot, _claimed_generation, _legacy_lease) = rt
+    let (landed, _claimed_generation, _legacy_lease) = rt
         .claim_debounced_restart(Some(id), scheduled_generation, ticket)
         .expect("去抖回调必须按同一 id/世代认领 Apply 配置");
-    let landed = snapshot.expect("Apply 必须带完整快照");
     install_startup_snapshot(&rt, &landed);
     *rt.current_config.write().unwrap() = Some(landed);
     rt.restart_deferred.store(false, Ordering::SeqCst);

@@ -1072,6 +1072,7 @@ async fn newly_claimed_start_supersedes_an_old_direct_spawn() {
             &held_gate,
             false,
             &mut None,
+            false,
         )
         .await
         .expect("superseded start yields without a Child");

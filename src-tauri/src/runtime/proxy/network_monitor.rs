@@ -90,7 +90,10 @@ impl ProxyRuntime {
     /// 一次去抖后的网络变化：DNS 重灌先走独立门控，再处理绑定状态与出口恢复。
     /// 显式绑定失效 fail-closed（保留当前核、告警、不改默认出口）；推断绑定失效或路由变化则重启
     /// TUN，在接口撤销后重新读取真实物理路由。
-    async fn handle_network_change(self: &Arc<Self>, impact: NetworkChangeImpact) {
+    async fn handle_network_change(self: &Arc<Self>, impact: NetworkChangeImpact, generation: u64) {
+        if self.gate.generation() != generation {
+            return;
+        }
         self.revoke_protected_physical_root();
         // 网络场景命中态：旧网络的结果先作废（未知），canary 探测任务被唤醒立即重探。放在最前：
         // 下面几条腿可能 await 很久或调度重启，命中态不该在这期间继续显示旧网络的判定。
@@ -118,6 +121,9 @@ impl ProxyRuntime {
             state.interface_fingerprint = Some(fingerprint);
         }
         self.reconcile_system_dns_best_effort().await;
+        if self.gate.generation() != generation {
+            return;
+        }
         let Some(config) = self
             .current_config
             .read()
@@ -184,7 +190,7 @@ impl ProxyRuntime {
                 inferred_binding_changed,
                 explicit_recovered
             );
-            self.schedule_restart();
+            self.schedule_restart_for_generation(generation);
         } else {
             self.schedule_network_recovery_refresh();
         }
@@ -275,7 +281,7 @@ impl ProxyRuntime {
                             route_prefixes: pending.route_prefixes,
                             route_unknown: pending.route_unknown,
                         }) {
-                            self.handle_network_change(impact).await;
+                            self.handle_network_change(impact, generation).await;
                         }
                     }
                 }
@@ -376,7 +382,7 @@ impl ProxyRuntime {
                     }
                     let impact = std::mem::take(&mut pending_impact);
                     if let Some(impact) = debounced_network_change(impact) {
-                        self.handle_network_change(impact).await;
+                        self.handle_network_change(impact, generation).await;
                     }
                 }
             }

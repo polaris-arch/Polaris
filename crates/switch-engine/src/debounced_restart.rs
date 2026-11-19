@@ -191,6 +191,27 @@ impl DebouncedRestart {
         self.schedule_epoch.load(Ordering::SeqCst) == ticket
     }
 
+    /// Wait for replacement of an already-fired timer while its callback waits to claim.
+    /// The same cancellation wakes a sleeping timer or its callback, never both.
+    pub async fn wait_for_ticket_invalidation(&self, ticket: u64) {
+        let cancellation = {
+            let _decision = self
+                .decision_guard
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !self.is_current_ticket(ticket) {
+                return;
+            }
+            self.active_timer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+        if let Some(cancellation) = cancellation {
+            cancellation.notified().await;
+        }
+    }
+
     /// Cancel a pending timer and invalidate a callback that already fired but has not claimed
     /// its lifecycle. The caller must remove the corresponding force snapshot under its own lock.
     pub fn invalidate_pending(&self) {

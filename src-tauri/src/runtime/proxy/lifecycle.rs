@@ -209,20 +209,31 @@ pub(super) type TestRestartAfterClaim = Arc<dyn Fn(u64) + Send + Sync>;
 pub(super) struct LifecycleAttribution {
     kind: &'static str,
     apply_id: Option<u64>,
+    restore_applied: bool,
 }
 impl LifecycleAttribution {
     const START: Self = Self {
         kind: "start",
         apply_id: None,
+        restore_applied: false,
     };
     pub(super) const STOP: Self = Self {
         kind: "stop",
         apply_id: None,
+        restore_applied: false,
     };
     pub(super) const fn restart(apply_id: Option<u64>) -> Self {
         Self {
             kind: "restart",
             apply_id,
+            restore_applied: false,
+        }
+    }
+
+    fn debounced_restart(apply_id: Option<u64>) -> Self {
+        Self {
+            restore_applied: apply_id.is_none(),
+            ..Self::restart(apply_id)
         }
     }
 }
@@ -1115,7 +1126,7 @@ impl ProxyRuntime {
         coex_attempt.generation.set(my_gen);
         // Android keeps the cleanup journal for a confirmed Stop or Apply.
         // A passive start can race a system VPN still using the old sources.
-        if !cfg!(target_os = "android") && !self.core_running() {
+        if !cfg!(target_os = "android") && !attribution.restore_applied && !self.core_running() {
             self.process_deferred_config_deletions_under_gate(&_tailscale_gate);
         }
         self.gate.begin();
@@ -1127,6 +1138,7 @@ impl ProxyRuntime {
             &_tailscale_gate,
             passive_android,
             &mut android_preparation,
+            attribution.restore_applied,
         ))
         .await;
         if let Some(preparation) = android_preparation {
@@ -1672,7 +1684,9 @@ impl ProxyRuntime {
                 if let Ok(mut selector) = self.switch_snapshot.write() {
                     *selector = None;
                 }
-                self.restart_deferred.store(false, Ordering::SeqCst);
+                if !attribution.restore_applied {
+                    self.restart_deferred.store(false, Ordering::SeqCst);
+                }
                 true
             } else {
                 false
@@ -1837,10 +1851,10 @@ impl ProxyRuntime {
         apply_id: Option<u64>,
     ) -> Result<ProxyStatus, StartError> {
         let result = match self
-            .restart_with_apply(
+            .restart_with_attribution(
                 config,
                 StopClaim::AlreadyClaimed(claimed_generation),
-                apply_id,
+                LifecycleAttribution::debounced_restart(apply_id),
             )
             .await
         {
@@ -1856,16 +1870,16 @@ impl ProxyRuntime {
         config: Value,
         claim: StopClaim<'_>,
     ) -> RestartLeg {
-        self.restart_with_apply(config, claim, None).await
+        self.restart_with_attribution(config, claim, LifecycleAttribution::restart(None))
+            .await
     }
 
-    async fn restart_with_apply(
+    async fn restart_with_attribution(
         self: &Arc<Self>,
         config: Value,
         claim: StopClaim<'_>,
-        apply_id: Option<u64>,
+        attribution: LifecycleAttribution,
     ) -> RestartLeg {
-        let attribution = LifecycleAttribution::restart(apply_id);
         let claimed = match &claim {
             StopClaim::AlreadyClaimed(generation)
             | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
@@ -2016,7 +2030,7 @@ impl ProxyRuntime {
             }
         };
         // 旧接管模式以就绪时的 startup_snapshot 为准，须在 stop_inner 清快照之前取。
-        // 去抖重启的目标配置由调用方传入（timer 从最新 D/显式 force 快照取），不是旧核快照。
+        // The timer has already captured the authorized restart input.
         let old_mode = self
             .startup_snapshot
             .read()
@@ -2173,16 +2187,21 @@ impl ProxyRuntime {
                     match outcome {
                         DebouncedOutcome::Proceed(force_id) => {
                             tokio::spawn(async move {
-                                // Claim the exact snapshot, selector intent, lifecycle generation,
-                                // and outer depth before any await. An obsolete force id must never
-                                // fall back to the full disk config.
-                                let Some((snapshot, claimed_generation, legacy_lease)) = me
-                                    .claim_debounced_restart(
-                                        force_id,
-                                        scheduled_generation,
-                                        ticket,
-                                    )
-                                else {
+                                let claim = {
+                                    // Automatic recovery freezes applied state after a live edit
+                                    // settles. A replacement timer cancels this wait.
+                                    let _switch = if force_id.is_none() {
+                                        Some(tokio::select! {
+                                            biased;
+                                            _ = me.debounced.wait_for_ticket_invalidation(ticket) => return,
+                                            guard = me.switch_serial.lock() => guard,
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    me.claim_debounced_restart(force_id, scheduled_generation, ticket)
+                                };
+                                let Some((config, claimed_generation, legacy_lease)) = claim else {
                                     return;
                                 };
                                 #[cfg(test)]
@@ -2192,26 +2211,9 @@ impl ProxyRuntime {
                                         hook(claimed_generation);
                                     }
                                 }
-                                let cfg = match snapshot.or_else(|| me.config.current().ok()) {
-                                    Some(c) => c,
-                                    None => {
-                                        log::warn!("去抖重启：无可用配置 → 放弃");
-                                        me.publish_owned_restart_failure(
-                                            &StartError::from("去抖重启缺少配置".to_owned()),
-                                            LifecycleAttribution::restart(force_id),
-                                            claimed_generation,
-                                        );
-                                        me.finish_preclaimed_restart(claimed_generation);
-                                        me.apply_lifecycle_end(
-                                            me.gate.end_restart_after(Some(claimed_generation)),
-                                            LifecycleKind::Restart,
-                                        );
-                                        return;
-                                    }
-                                };
                                 if let Err(e) = me
                                     .restart_claimed(
-                                        cfg,
+                                        config,
                                         claimed_generation,
                                         legacy_lease,
                                         force_id,
@@ -2236,7 +2238,7 @@ impl ProxyRuntime {
         force_id: Option<u64>,
         scheduled_generation: u64,
         ticket: u64,
-    ) -> Option<(Option<Value>, u64, Option<LegacyStartLease>)> {
+    ) -> Option<(Value, u64, Option<LegacyStartLease>)> {
         let mut starts = self.normal_start.lock().ok()?;
         polaris_core_supervisor::config_gate::assert_check_producer_registration().ok()?;
         // Keep exit admission and the generation claim indivisible. A late timer must
@@ -2295,18 +2297,16 @@ impl ProxyRuntime {
                                     return None;
                                 }
                             }
-                            Some(value.clone())
+                            value.clone()
                         }
-                        (None, None) => None,
+                        (None, None) => self.network_recovery_config(desired)?,
                         // A newer Apply replaced the snapshot after the timer decided, or a force
                         // snapshot appeared after a plain timer decided. Leave the new owner intact.
                         _ => return None,
                     };
                     // Reject the exact selected snapshot before claiming a generation or
                     // stopping the existing child; final generation checks again at Start.
-                    if let Err(error) =
-                        gateway_start_preflight(snapshot.as_ref().unwrap_or(desired))
-                    {
+                    if let Err(error) = gateway_start_preflight(&snapshot) {
                         self.publish_owned_restart_failure(
                             &error,
                             LifecycleAttribution::restart(force_id),
@@ -2333,6 +2333,29 @@ impl ProxyRuntime {
             })
             .ok()
             .flatten()
+    }
+
+    fn network_recovery_config(&self, desired: &Value) -> Option<Value> {
+        if !self.core_running()
+            || self.has_uncommitted_rule_content()
+            || self.runtime_configuration_unsettled_for_recovery()
+        {
+            return None;
+        }
+        let applied = self.current_config_snapshot()?;
+        // External rule payloads are live paths. With a saved/runtime split
+        // we cannot attest their original bytes from either JSON snapshot.
+        if &applied != desired
+            && applied.get("ruleResources").is_some_and(|resources| {
+                resources
+                    .as_array()
+                    .is_none_or(|resources| !resources.is_empty())
+            })
+        {
+            log::info!("Network recovery held: applied external rule inputs are unverified");
+            return None;
+        }
+        Some(applied)
     }
 
     /// 置错误态（起核失败）。
