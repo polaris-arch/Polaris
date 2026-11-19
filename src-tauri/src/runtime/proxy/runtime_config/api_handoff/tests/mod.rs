@@ -167,6 +167,18 @@ struct ReadyApiFixture {
 }
 #[polaris_singbox_grpc::tonic::async_trait]
 impl daemon::runtime_config_service_server::RuntimeConfigService for ReadyApiFixture {
+    async fn probe_exit_ip(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<daemon::ProbeExitIpRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::ProbeExitIpResponse>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Err(polaris_singbox_grpc::tonic::Status::unimplemented(
+            "exit IP probe",
+        ))
+    }
+
     async fn get_runtime_capabilities(
         &self,
         _: polaris_singbox_grpc::tonic::Request<()>,

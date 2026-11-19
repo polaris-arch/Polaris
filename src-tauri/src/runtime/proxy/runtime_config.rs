@@ -17,9 +17,12 @@ use polaris_config_engine::builder::generate::generate_running_candidate;
 use polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG;
 use polaris_config_engine::builder::GenerateConfigDeps;
 use polaris_config_engine::singbox::SingBoxConfig;
+use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
 use polaris_config_engine::user_config::UserConfig;
 use polaris_helper_proto::Platform;
-use polaris_singbox_grpc::{daemon, Endpoint, RuntimeConfigError, SingBoxApiClient};
+use polaris_singbox_grpc::{
+    daemon, Endpoint, ExitIpProbeError, RuntimeConfigError, SingBoxApiClient,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub(crate) mod api_handoff;
@@ -36,6 +39,71 @@ const NATIVE_RETIREMENT_OBSERVATION_LIMIT: usize = 256;
 
 const HOT_EDIT_WRITER_RETRY_LIMIT: Duration = Duration::from_millis(150);
 const HOT_EDIT_WRITER_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const EXIT_IP_PROBE_VERSION: u32 = 1;
+
+#[derive(PartialEq, Eq)]
+struct ExitIpLeaf {
+    server_id: String,
+    tag: String,
+}
+
+pub(crate) struct RuntimeExitIpRoute {
+    generation: u64,
+    intent: u64,
+    leaf: ExitIpLeaf,
+    pairing: RuntimePairing,
+    api_epoch: Arc<ApiRelayEpoch>,
+    control: Arc<SingBoxApiClient>,
+    baseline_active: Option<daemon::RuntimeIdentity>,
+    baseline_control_revision: u64,
+}
+
+fn pinned_exit_ip_leaf(
+    config: &Value,
+    snapshot: &super::hot_switch::SwitchSnapshot,
+) -> Option<ExitIpLeaf> {
+    if config
+        .get("selectionIntent")
+        .is_some_and(|intent| !intent.is_null())
+        || matches!(
+            config.get("proxyMode").and_then(Value::as_str),
+            Some("direct" | "block")
+        )
+    {
+        return None;
+    }
+    let id = config.get("selectedServerId")?.as_str()?;
+    if is_sentinel_selection(Some(id)) {
+        return None;
+    }
+    let mut nodes = config
+        .get("servers")?
+        .as_array()?
+        .iter()
+        .filter(|node| node.get("id").and_then(Value::as_str) == Some(id));
+    nodes.next()?;
+    if nodes.next().is_some() {
+        return None;
+    }
+    let tag = snapshot.id_to_tag.get(id)?;
+    (!snapshot.endpoint_tags.contains(tag) && !snapshot.static_detours.contains_key(tag)).then(
+        || ExitIpLeaf {
+            server_id: id.to_owned(),
+            tag: tag.clone(),
+        },
+    )
+}
+
+fn verified_exit_ip_trace(
+    request: &daemon::ProbeExitIpRequest,
+    response: daemon::ProbeExitIpResponse,
+) -> Option<Vec<u8>> {
+    (request.expected.is_some()
+        && response.active == request.expected
+        && response.control_revision == request.expected_control_revision
+        && response.leaf_tag == request.leaf_tag)
+        .then_some(response.trace_body)
+}
 
 fn runtime_plan_ticket_is_live(expires_at_unix_milli: i64) -> bool {
     let now = SystemTime::now()
@@ -461,6 +529,108 @@ async fn paired_runtime_capabilities(
         Ok(value) if runtime_pairing_matches(pairing, &value) => Ok(value),
         Ok(_) => Err(Box::new(runtime_pairing_mismatch())),
         Err(_) => Err(Box::new(RuntimeApplyResult::status("unconfirmed"))),
+    }
+}
+
+impl ProxyRuntime {
+    pub(crate) fn pinned_exit_ip_route(&self) -> Option<RuntimeExitIpRoute> {
+        let generation = self.gate.try_idle_generation()?;
+        let intent = self.selector_reconcile.intent_generation();
+        let leaf = self.current_exit_ip_leaf()?;
+        let route = {
+            let baseline = self.runtime_config_baseline.try_read().ok()?;
+            let baseline = baseline
+                .as_ref()
+                .filter(|baseline| baseline.generation == generation)?;
+            let control = baseline.control.as_ref()?;
+            if baseline.management.as_ref()?.secret.is_empty() {
+                return None;
+            }
+            RuntimeExitIpRoute {
+                generation,
+                intent,
+                leaf,
+                pairing: baseline.pairing.clone(),
+                api_epoch: baseline.api_epoch.clone(),
+                control: control.clone(),
+                baseline_active: baseline.observed_active.clone(),
+                baseline_control_revision: baseline.observed_control_revision,
+            }
+        };
+        self.with_pinned_exit_ip_route(&route, || ())?;
+        Some(route)
+    }
+
+    fn current_exit_ip_leaf(&self) -> Option<ExitIpLeaf> {
+        let config = self.current_config.try_read().ok()?;
+        let snapshot = self.switch_snapshot.try_read().ok()?;
+        pinned_exit_ip_leaf(config.as_ref()?, snapshot.as_ref()?)
+    }
+
+    pub(crate) fn with_pinned_exit_ip_route<T>(
+        &self,
+        route: &RuntimeExitIpRoute,
+        claim: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.selector_reconcile.try_with_intent_claim(|intent| {
+            let _publication = self.gate.try_lock_generation_publication()?;
+            if intent != route.intent
+                || self.gate.try_idle_generation() != Some(route.generation)
+                || !self.core_running()
+                || self.selector_reconcile.is_required()
+                || self.network_settle_pending() != 0
+                || route.api_epoch.is_closed()
+                || !route.control.captured_transport_live()
+                || self.current_exit_ip_leaf().as_ref() != Some(&route.leaf)
+            {
+                return None;
+            }
+            let baseline = self.runtime_config_baseline.try_read().ok()?;
+            let baseline = baseline.as_ref()?;
+            (baseline.generation == route.generation
+                && Arc::ptr_eq(&baseline.api_epoch, &route.api_epoch)
+                && baseline
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| Arc::ptr_eq(control, &route.control))
+                && baseline.observed_active == route.baseline_active
+                && baseline.observed_control_revision == route.baseline_control_revision)
+                .then(claim)
+        })?
+    }
+
+    pub(crate) async fn prepare_pinned_exit_ip(
+        &self,
+        route: &RuntimeExitIpRoute,
+    ) -> Option<daemon::ProbeExitIpRequest> {
+        let caps = paired_runtime_capabilities(&route.control, &route.pairing)
+            .await
+            .ok()?;
+        if caps.exit_ip_probe_version != EXIT_IP_PROBE_VERSION {
+            return None;
+        }
+        let identity = caps.active?;
+        self.with_pinned_exit_ip_route(route, || daemon::ProbeExitIpRequest {
+            version: EXIT_IP_PROBE_VERSION,
+            expected: Some(identity),
+            expected_control_revision: caps.control_revision,
+            leaf_tag: route.leaf.tag.clone(),
+        })
+    }
+
+    pub(crate) async fn probe_pinned_exit_ip(
+        &self,
+        route: &RuntimeExitIpRoute,
+        request: daemon::ProbeExitIpRequest,
+        budget: Duration,
+    ) -> Result<Vec<u8>, ExitIpProbeError> {
+        if request.leaf_tag != route.leaf.tag
+            || self.with_pinned_exit_ip_route(route, || ()).is_none()
+        {
+            return Err(ExitIpProbeError::NotAttempted);
+        }
+        let response = route.control.probe_exit_ip(request.clone(), budget).await?;
+        verified_exit_ip_trace(&request, response).ok_or(ExitIpProbeError::Unknown)
     }
 }
 

@@ -72,18 +72,26 @@ fn scheduler_publishes_before_sleep_then_finishes_its_own_ticket() {
     let declare = scheduler
         .find("declare_scheduled_refresh(delay_ms)")
         .unwrap();
+    let deadline = scheduler.find("let fallback_at =").unwrap();
     let broadcast = scheduler.find("crate::events::broadcast(").unwrap();
     let spawn = scheduler.find("tauri::async_runtime::spawn").unwrap();
-    let sleep = scheduler.find("tokio::time::sleep(").unwrap();
+    let fast = scheduler
+        .find("try_first_proxy_probe(&app, ticket, fallback_at).await")
+        .unwrap();
+    let sleep = scheduler
+        .find("tokio::time::sleep_until(fallback_at).await")
+        .unwrap();
     let begin = scheduler
         .find("begin_scheduled_probe(ticket, delay_ms > 0)")
         .unwrap();
     let probe = scheduler.find("probe_publish_ipinfo(").unwrap();
     let finish = scheduler.find("finish_scheduled_probe(ticket)").unwrap();
     assert!(
-        declare < broadcast
+        declare < deadline
+            && deadline < broadcast
             && broadcast < spawn
-            && spawn < sleep
+            && spawn < fast
+            && fast < sleep
             && sleep < begin
             && begin < probe
             && probe < finish
@@ -96,6 +104,14 @@ fn scheduler_publishes_before_sleep_then_finishes_its_own_ticket() {
         scheduler.contains("maybe_recheck_unlock_after_exit_recovery(")
             && scheduler.contains("schedule_unreachable_ipinfo_recheck(")
     );
+    let fast = body("async fn try_first_proxy_probe(");
+    let settle = fast
+        .find("runtime.wait_for_network_settled().await")
+        .unwrap();
+    let claim = fast.find("begin_scheduled_probe(ticket, true)").unwrap();
+    let probe = fast.find("runtime.probe_pinned_exit_ip(").unwrap();
+    let publish = fast.find("probe_publish_ipinfo(").unwrap();
+    assert!(settle < claim && claim < probe && probe < publish);
 }
 
 #[test]

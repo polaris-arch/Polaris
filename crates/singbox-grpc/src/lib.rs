@@ -41,7 +41,8 @@ mod h2c;
 mod reconnect;
 mod runtime_config;
 pub use runtime_config::{
-    ApiHandoffMetadata, RuntimeConfigError, RuntimeStatusEnvelope, RUNTIME_CONFIG_MAX_MESSAGE_BYTES,
+    ApiHandoffMetadata, ExitIpProbeError, RuntimeConfigError, RuntimeStatusEnvelope,
+    RUNTIME_CONFIG_MAX_MESSAGE_BYTES,
 };
 
 // vendored proto ⇄ 真核 wire 契约对拍器。**同一份文件被多处 `include!`**：

@@ -25,6 +25,13 @@ pub enum RuntimeConfigError {
     Call(#[from] ClientError),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExitIpProbeError {
+    NotAttempted,
+    CompletedFailure,
+    Unknown,
+}
+
 fn classify(error: ClientError) -> RuntimeConfigError {
     match error {
         ClientError::Status(status) if status.code() == tonic::Code::Unimplemented => {
@@ -57,6 +64,36 @@ impl SingBoxApiClient {
             .await
             .map_err(classify)?
             .into_inner())
+    }
+
+    pub async fn probe_exit_ip(
+        &self,
+        request: daemon::ProbeExitIpRequest,
+        budget: Duration,
+    ) -> Result<daemon::ProbeExitIpResponse, ExitIpProbeError> {
+        let mut client = self.runtime_config_client();
+        let request = self.runtime_config_request(request, budget);
+        match self
+            .unary_with_deadline(budget, client.probe_exit_ip(request))
+            .await
+        {
+            Ok(value) => Ok(value.into_inner()),
+            Err(ClientError::Status(status)) => match status.code() {
+                tonic::Code::Unimplemented | tonic::Code::FailedPrecondition => {
+                    Err(ExitIpProbeError::NotAttempted)
+                }
+                tonic::Code::Unavailable | tonic::Code::Aborted
+                    if status
+                        .metadata()
+                        .get("polaris-exit-ip-result")
+                        .is_some_and(|v| v == "drained") =>
+                {
+                    Err(ExitIpProbeError::CompletedFailure)
+                }
+                _ => Err(ExitIpProbeError::Unknown),
+            },
+            Err(_) => Err(ExitIpProbeError::Unknown),
+        }
     }
 
     /// Forward the exact effective configuration, overrides and optimistic identity.

@@ -1,6 +1,68 @@
 use super::*;
 use polaris_config_engine::user_config::dns_constants::DIRECT_SERVER_ID;
 use serde_json::json;
+
+#[test]
+fn exit_ip_probe_requires_unique_manual_leaf_and_the_exact_core_receipt() {
+    let mut snapshot = super::super::hot_switch::SwitchSnapshot::default();
+    snapshot.id_to_tag.insert("p".into(), "leaf".into());
+    let config = json!({
+        "proxyMode": "smart",
+        "selectedServerId": "p",
+        "servers": [{"id": "p"}, {"id": "other"}],
+    });
+    let leaf = pinned_exit_ip_leaf(&config, &snapshot).unwrap();
+    assert_eq!(leaf.server_id, "p");
+    assert_eq!(leaf.tag, "leaf");
+    for (field, incompatible) in [
+        ("selectionIntent", json!({"mode":"auto","scope":"global"})),
+        ("proxyMode", json!("direct")),
+        ("selectedServerId", json!(DIRECT_SERVER_ID)),
+        ("selectedServerId", json!("other")),
+        ("servers", json!([{"id":"p"}, {"id":"p"}])),
+    ] {
+        let mut changed = config.clone();
+        changed[field] = incompatible;
+        assert!(pinned_exit_ip_leaf(&changed, &snapshot).is_none());
+    }
+    snapshot.endpoint_tags.insert("leaf".into());
+    assert!(pinned_exit_ip_leaf(&config, &snapshot).is_none());
+    snapshot.endpoint_tags.clear();
+    snapshot.static_detours.insert("leaf".into(), "hop".into());
+    assert!(pinned_exit_ip_leaf(&config, &snapshot).is_none());
+
+    let request = daemon::ProbeExitIpRequest {
+        version: EXIT_IP_PROBE_VERSION,
+        expected: paired_capabilities().active,
+        expected_control_revision: 8,
+        leaf_tag: "leaf".into(),
+    };
+    let trace = b"ip=192.0.2.8\nloc=US\n".to_vec();
+    let receipt = daemon::ProbeExitIpResponse {
+        active: request.expected.clone(),
+        control_revision: request.expected_control_revision,
+        leaf_tag: request.leaf_tag.clone(),
+        trace_body: trace.clone(),
+    };
+    assert_eq!(
+        verified_exit_ip_trace(&request, receipt.clone()),
+        Some(trace)
+    );
+    for mutate in 0..6 {
+        let mut changed = receipt.clone();
+        match mutate {
+            0 => changed.control_revision += 1,
+            1 => changed.leaf_tag = "other".to_string(),
+            2 => changed.active.as_mut().unwrap().incarnation.push('x'),
+            3 => changed.active.as_mut().unwrap().applied_revision += 1,
+            4 => changed.active.as_mut().unwrap().effective_digest.push('x'),
+            5 => changed.active = None,
+            _ => unreachable!(),
+        }
+        assert!(verified_exit_ip_trace(&request, changed).is_none());
+    }
+}
+
 pub(super) fn paired_capabilities() -> daemon::RuntimeCapabilities {
     daemon::RuntimeCapabilities {
         contract_version: 1,
@@ -2993,6 +3055,18 @@ impl NativeRetirementRpcFixture {
 
 #[polaris_singbox_grpc::tonic::async_trait]
 impl daemon::runtime_config_service_server::RuntimeConfigService for NativeRetirementRpcFixture {
+    async fn probe_exit_ip(
+        &self,
+        _: polaris_singbox_grpc::tonic::Request<daemon::ProbeExitIpRequest>,
+    ) -> Result<
+        polaris_singbox_grpc::tonic::Response<daemon::ProbeExitIpResponse>,
+        polaris_singbox_grpc::tonic::Status,
+    > {
+        Err(polaris_singbox_grpc::tonic::Status::unimplemented(
+            "exit IP probe",
+        ))
+    }
+
     async fn get_runtime_capabilities(
         &self,
         _: polaris_singbox_grpc::tonic::Request<()>,

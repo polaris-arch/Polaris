@@ -12,6 +12,7 @@ service RuntimeConfigService {
   rpc GetRuntimeConfigStatus(RuntimeConfigStatusRequest) returns (RuntimeConfigStatus);
   rpc RetryRuntimePersistence(RuntimePersistenceRetryRequest) returns (RuntimeConfigOperation);
   rpc AcknowledgeRuntimePersistence(RuntimePersistenceAcknowledgementRequest) returns (RuntimeConfigOperation);
+  rpc ProbeExitIP(ProbeExitIPRequest) returns (ProbeExitIPResponse);
 }
 message RuntimeIdentity { string incarnation = 1; uint64 applied_revision = 2; string effective_digest = 3; }
 enum RuntimeUpdateClass { RUNTIME_UPDATE_UNSPECIFIED = 0; IN_PLACE = 1; LOCAL_REPLACE = 2; AFFECTED_RECONNECT = 3; PENDING_ADAPTER = 4; RESTART_REQUIRED = 5; }
@@ -28,6 +29,22 @@ message RuntimeCapabilities {
   string tls_fingerprint_capabilities_json = 10;
   // Recognition of a consumer's explicit-confirmation protocol, never consent.
   repeated uint32 supported_client_impact_policy_versions = 11;
+  // Zero means there is no connected exit IP probe contract.
+  uint32 exit_ip_probe_version = 12;
+}
+// The method has a fixed HTTPS destination. The request names the exact
+// concrete leaf already selected by this runtime and cannot change it.
+message ProbeExitIPRequest {
+  uint32 version = 1;
+  RuntimeIdentity expected = 2;
+  uint64 expected_control_revision = 3;
+  string leaf_tag = 4;
+}
+message ProbeExitIPResponse {
+  RuntimeIdentity active = 1;
+  uint64 control_revision = 2;
+  string leaf_tag = 3;
+  bytes trace_body = 4;
 }
 // Explicit snapshot; absent and empty package lists retain their protobuf
 // semantics. Native directory custody is never accepted through this message.

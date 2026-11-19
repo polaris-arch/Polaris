@@ -8,12 +8,14 @@ use tokio::sync::watch;
 
 use crate::response::ApiResponse;
 use crate::runtime::http::{app_user_agent, HttpRuntime, SystemDnsLookup};
-use crate::runtime::proxy::{LocalHttpProxy, ProxyStatus};
+use crate::runtime::proxy::runtime_config::RuntimeExitIpRoute;
+use crate::runtime::proxy::{LocalHttpProxy, ProxyRuntime, ProxyStatus};
 use crate::runtime::AppRuntime;
 use polaris_config_engine::user_config::dns_constants::is_sentinel_selection;
 #[cfg(test)]
 use polaris_config_engine::user_config::dns_constants::{BLOCK_SERVER_ID, DIRECT_SERVER_ID};
 use polaris_net_stack::safe_redirect::{safe_redirect_fetch, HttpClient, SafeRedirectFetchOptions};
+use polaris_singbox_grpc::ExitIpProbeError;
 
 use crate::commands::manual_network::{GuardedHttp, ManualBindingGuard, ManualCheckFailure};
 
@@ -618,7 +620,14 @@ async fn fetch_trace_ipinfo<H: HttpClient>(client: &H) -> Result<Value, String> 
     if !(200..300).contains(&resp.status) {
         return Err(format!("ipinfo trace HTTP {}", resp.status));
     }
-    let body = String::from_utf8_lossy(&resp.body);
+    trace_ipinfo(&resp.body)
+}
+
+fn trace_ipinfo(bytes: &[u8]) -> Result<Value, String> {
+    if bytes.len() > IPINFO_MAX_BODY {
+        return Err("ipinfo: trace 响应超出上限".into());
+    }
+    let body = String::from_utf8_lossy(bytes);
     let info = polaris_unlock::parse_trace(&body).ok_or_else(|| "trace 解析失败".to_string())?;
     let mut out = json!({ "ip": info.ip });
     if let Some(cc) = info.country_code {
@@ -700,9 +709,27 @@ where
     .unwrap_or_else(|_| Err(format!("ipinfo: 探测预算 {IPINFO_PROBE_BUDGET_MS}ms 耗尽")))
 }
 
+#[derive(Clone, Copy)]
+enum FirstProxyAttempt {
+    NotAttempted,
+    Completed,
+    Unconfirmed,
+}
+
+enum ProxyProbe<'a> {
+    Standard,
+    PostConnect(FirstProxyAttempt),
+    Verified {
+        runtime: &'a ProxyRuntime,
+        route: &'a RuntimeExitIpRoute,
+        trace: Value,
+    },
+}
+
 async fn probe_post_connect_ipinfo<D, P, PFut>(
     direct: D,
-    proxy: P,
+    mut proxy: P,
+    first: FirstProxyAttempt,
     on_early_proxy: impl FnOnce(&Value),
 ) -> (Result<Value, String>, Value)
 where
@@ -710,9 +737,22 @@ where
     P: FnMut() -> PFut,
     PFut: std::future::Future<Output = Result<Value, String>>,
 {
+    let mut defer_first = matches!(first, FirstProxyAttempt::Unconfirmed);
+    let attempts = IPINFO_PROXY_POST_CONNECT_ATTEMPTS
+        - u32::from(matches!(first, FirstProxyAttempt::Completed));
     let proxy = with_ipinfo_retry(
-        proxy,
-        IPINFO_PROXY_POST_CONNECT_ATTEMPTS,
+        || {
+            // The client timed out or lost the transport without a drain receipt.
+            // Spend this slot on the original backoff before a loopback request.
+            let attempt = (!std::mem::take(&mut defer_first)).then(&mut proxy);
+            async move {
+                match attempt {
+                    Some(attempt) => attempt.await,
+                    None => Err("ipinfo: 探测结束未获确认".into()),
+                }
+            }
+        },
+        attempts,
         IPINFO_PROXY_POST_CONNECT_RETRY_MS,
     );
     // Keep the same proxy future running even when the direct leg finishes first.
@@ -753,7 +793,7 @@ async fn build_ipinfo_snapshot(
     status: &ProxyStatus,
     local_proxy: Option<&LocalHttpProxy>,
     doh_blocked: Option<&'static str>,
-    post_connect: bool,
+    probe_kind: &ProxyProbe<'_>,
     _probe: (u64, u64),
     publish_early: impl FnOnce(&Value),
 ) -> Value {
@@ -764,7 +804,10 @@ async fn build_ipinfo_snapshot(
     );
     // 代理出口经本机 http 代理入站探（桌面 `mixed-in`；Android 没有 mixed 入站，走 `probe-proxy-in`
     // 并带本次起核的凭据 —— 此前无条件读 `mixed_port`，Android 上连向一个不存在的口，出口 IP 恒空）。
-    let (direct, proxy) = if let Some(lp) = local_proxy.filter(|_| status.running) {
+    let (direct, proxy) = if let ProxyProbe::Verified { trace, .. } = probe_kind {
+        publish_early(trace);
+        (direct.await, trace.clone())
+    } else if let Some(lp) = local_proxy.filter(|_| status.running) {
         match HttpRuntime::via_local_proxy(lp.port, lp.auth.as_ref()) {
             Ok(p) => {
                 let proxy = || async {
@@ -785,8 +828,8 @@ async fn build_ipinfo_snapshot(
                     );
                     result
                 };
-                if post_connect {
-                    probe_post_connect_ipinfo(direct, proxy, publish_early).await
+                if let ProxyProbe::PostConnect(first) = probe_kind {
+                    probe_post_connect_ipinfo(direct, proxy, *first, publish_early).await
                 } else {
                     let direct = direct.await;
                     let proxy =
@@ -839,12 +882,14 @@ fn proxy_reachability(
     local_proxy: Option<&LocalHttpProxy>,
     proxy: &Value,
 ) -> &'static str {
-    if !status.running || local_proxy.is_none() {
+    if !status.running {
         "unknown"
-    } else if proxy.is_null() {
+    } else if !proxy.is_null() {
+        "reachable"
+    } else if local_proxy.is_some() {
         "unreachable"
     } else {
-        "reachable"
+        "unknown"
     }
 }
 
@@ -880,7 +925,8 @@ pub async fn ipinfo_get(
     let has_real_exit = ipinfo_config_has_real_exit(&inputs.config);
     // 手点腿吃**常规**重试预算：用户已在等一个即时答复，隧道热身那套 4×4s 会让按钮看起来卡住。
     // 与 上游 一致（手点走 `refresh(true, true)` → 常规腿，非 post-connect）。
-    let (snapshot, committed) = probe_publish_ipinfo(&app, inputs, epoch, seq, false).await;
+    let (snapshot, committed) =
+        probe_publish_ipinfo(&app, inputs, epoch, seq, ProxyProbe::Standard).await;
     if committed && ipinfo_probe_is_current(epoch, seq) {
         schedule_unreachable_ipinfo_recheck(&app, &snapshot, seq, has_real_exit);
     }
@@ -962,7 +1008,7 @@ async fn probe_publish_ipinfo(
     inputs: IpinfoProbeInputs,
     epoch: u64,
     seq: u64,
-    post_connect: bool,
+    probe_kind: ProxyProbe<'_>,
 ) -> (Value, bool) {
     let IpinfoProbeInputs {
         http,
@@ -973,7 +1019,14 @@ async fn probe_publish_ipinfo(
     } = inputs;
     let publish = |snap, warm_rtt| {
         // 早到的代理帧和最终双腿帧走同一道闸；旧腿只读当前权威帧。
-        let Some(snap) = commit_ipinfo_snapshot(epoch, seq, &snap) else {
+        let commit = || commit_ipinfo_snapshot(epoch, seq, &snap);
+        let committed = match &probe_kind {
+            ProxyProbe::Verified { runtime, route, .. } => {
+                runtime.with_pinned_exit_ip_route(route, commit).flatten()
+            }
+            _ => commit(),
+        };
+        let Some(snap) = committed else {
             return (peek_ipinfo_snapshot(), false);
         };
         ipinfo_stage!(
@@ -1010,7 +1063,7 @@ async fn probe_publish_ipinfo(
         &status,
         local_proxy.as_ref(),
         doh_blocked,
-        post_connect,
+        &probe_kind,
         (epoch, seq),
         |proxy| {
             // 让代理结果立即可见，直连仍在检测，完整缓存保持不变。
@@ -1031,7 +1084,7 @@ async fn probe_publish_ipinfo(
 
 /// 收敛窗口占位快照：direct/proxy 双 null + `loading:true`。
 ///
-/// 延迟腿在**睡之前**先发它，对齐 上游「started 瞬间清空 → `whenSelectorSettled` 后才真探」。
+/// 延迟腿在稳定等待之前先发它，对齐 上游「started 瞬间清空 → `whenSelectorSettled` 后才真探」。
 /// 不发的话，起核 / 热切后的收敛窗口里状态栏会继续显示**上一个出口**的 IP 与旗面 —— 把旧出口冒充成
 /// 新出口，比留空更糟（与「不得用入口域名派生出口位置」是同一条纪律）。
 ///
@@ -1134,7 +1187,8 @@ fn schedule_unreachable_ipinfo_recheck(
             {
                 return;
             }
-            let (snapshot, committed) = probe_publish_ipinfo(&app, inputs, epoch, seq, false).await;
+            let (snapshot, committed) =
+                probe_publish_ipinfo(&app, inputs, epoch, seq, ProxyProbe::Standard).await;
             if !committed || !ipinfo_probe_is_current(epoch, seq) {
                 return;
             }
@@ -1152,10 +1206,11 @@ fn schedule_unreachable_ipinfo_recheck(
 /// 启动 +2s（`runtime::startup_tasks`）· 起核就绪 · 节点热切换 · 停核（后三点经
 /// [`ProxyErrorEmitter::schedule_exit_ip_refresh`](crate::runtime::proxy::ProxyErrorEmitter::schedule_exit_ip_refresh)）。
 ///
-/// `delay_ms > 0` ⇒ 同步落地并广播 pending（UI 立即置空成 `—`），睡满再探。
+/// `delay_ms > 0` ⇒ 同步落地并广播 pending（UI 立即置空成 `—`），保留原探测时点。
+/// 移动端可在稳定门退场后提前请求已认证内核的精确代理出口。
 /// `delay_ms == 0` ⇒ 同步发布代理出口已消失的终态，防旧出口跨停核/重启窗口回填。
 ///
-/// # 🟠 按开探顺序发号：[`begin_scheduled_probe`] 必须在 `sleep` **之后**
+/// # 🟠 按开探顺序发号：[`begin_scheduled_probe`] 在各条腿发请求时取票
 ///
 /// 世代号是「谁更新」的唯一判据，而排程时刻与开探时刻之间隔着整整 [`IPINFO_SETTLE_DELAY_MS`]。
 /// 在**排程时**领号 ⇒ 号的顺序是「谁先被排上」，与「谁的结果更新」差一个维度，收敛窗口内会静默丢腿：
@@ -1196,6 +1251,82 @@ pub fn schedule_network_recovery_refresh(app: &AppHandle) {
     schedule_ipinfo_refresh_inner(app, IPINFO_SETTLE_DELAY_MS, true);
 }
 
+async fn try_first_proxy_probe(
+    app: &AppHandle,
+    ticket: u64,
+    fallback_at: tokio::time::Instant,
+) -> (bool, FirstProxyAttempt) {
+    let Some(runtime) = app
+        .try_state::<AppRuntime>()
+        .map(|state| state.proxy.clone())
+    else {
+        return (false, FirstProxyAttempt::NotAttempted);
+    };
+    let prepared = tokio::time::timeout_at(fallback_at, async {
+        runtime.wait_for_network_settled().await;
+        let route = runtime.pinned_exit_ip_route()?;
+        let request = runtime.prepare_pinned_exit_ip(&route).await?;
+        Some((route, request))
+    })
+    .await;
+    let Ok(Some((route, request))) = prepared else {
+        return (false, FirstProxyAttempt::NotAttempted);
+    };
+    let budget = fallback_at.saturating_duration_since(tokio::time::Instant::now());
+    if budget.is_zero() {
+        return (false, FirstProxyAttempt::NotAttempted);
+    }
+    let Some((epoch, seq)) = begin_scheduled_probe(ticket, true) else {
+        return (false, FirstProxyAttempt::NotAttempted);
+    };
+    ipinfo_stage!("stage=first_proxy_request_begin ticket={ticket} epoch={epoch} seq={seq}");
+    #[cfg(debug_assertions)]
+    let at = std::time::Instant::now();
+    let result = tokio::time::timeout_at(
+        fallback_at,
+        runtime.probe_pinned_exit_ip(&route, request, budget),
+    )
+    .await
+    .unwrap_or(Err(ExitIpProbeError::Unknown))
+    .and_then(|body| trace_ipinfo(&body).map_err(|_| ExitIpProbeError::CompletedFailure));
+    ipinfo_stage!(
+        "stage=first_proxy_request_end ticket={ticket} elapsed_ms={} success={}",
+        at.elapsed().as_millis(),
+        result.is_ok()
+    );
+    let trace = match result {
+        Ok(trace) => trace,
+        Err(ExitIpProbeError::NotAttempted) => return (false, FirstProxyAttempt::NotAttempted),
+        Err(ExitIpProbeError::CompletedFailure) => return (false, FirstProxyAttempt::Completed),
+        Err(ExitIpProbeError::Unknown) => return (false, FirstProxyAttempt::Unconfirmed),
+    };
+    let Some(inputs) = app
+        .try_state::<AppRuntime>()
+        .map(|state| ipinfo_probe_inputs(&state))
+    else {
+        return (false, FirstProxyAttempt::Completed);
+    };
+    if !inputs.status.running
+        || !ipinfo_probe_is_current(epoch, seq)
+        || runtime.with_pinned_exit_ip_route(&route, || ()).is_none()
+    {
+        return (false, FirstProxyAttempt::Completed);
+    }
+    let (_, committed) = probe_publish_ipinfo(
+        app,
+        inputs,
+        epoch,
+        seq,
+        ProxyProbe::Verified {
+            runtime: &runtime,
+            route: &route,
+            trace,
+        },
+    )
+    .await;
+    (committed, FirstProxyAttempt::Completed)
+}
+
 fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_on_recovery: bool) {
     // 宣告与可见帧落地同步完成：停核调用返回前，任何 peek 都已看不到旧代理出口。
     // 广播携带同一份 revision；若事件晚于下一帧抵达，渲染端可按 revision 丢弃。
@@ -1205,6 +1336,7 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
         None
     };
     let (ticket, frame) = declare_scheduled_refresh(delay_ms);
+    let fallback_at = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
     ipinfo_stage!(
         "stage=schedule ticket={ticket} revision={} delay_ms={delay_ms} recovery={recheck_unlock_on_recovery}",
         frame["revision"].as_u64().unwrap_or_default()
@@ -1212,21 +1344,38 @@ fn schedule_ipinfo_refresh_inner(app: &AppHandle, delay_ms: u64, recheck_unlock_
     crate::events::broadcast(app, crate::events::channel::EVENT_IP_INFO_UPDATED, frame);
     let app = app.clone();
     tauri::async_runtime::spawn(run_automatic_ipinfo_probe(ticket, async move {
-        if delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let post_connect = delay_ms == IPINFO_SETTLE_DELAY_MS;
+        let (already_published, first_attempt) =
+            if cfg!(any(target_os = "android", target_os = "ios"))
+                && post_connect
+                && !recheck_unlock_on_recovery
+            {
+                try_first_proxy_probe(&app, ticket, fallback_at).await
+            } else {
+                (false, FirstProxyAttempt::NotAttempted)
+            };
+        if !already_published && delay_ms > 0 {
+            tokio::time::sleep_until(fallback_at).await;
         }
         // 旧起停/热切排程不得在新 pending 之后开探；手动腿不取代 ticket，
         // 因而收敛窗口内手点检测之后，这条自动长热身仍会醒来。
-        if let Some((epoch, seq)) = begin_scheduled_probe(ticket, delay_ms > 0) {
+        if let Some((epoch, seq)) = (!already_published)
+            .then(|| begin_scheduled_probe(ticket, delay_ms > 0))
+            .flatten()
+        {
             ipinfo_stage!("stage=probe_begin ticket={ticket} epoch={epoch} seq={seq}");
             if let Some(inputs) = app
                 .try_state::<AppRuntime>()
                 .map(|state| ipinfo_probe_inputs(&state))
             {
                 let has_real_exit = ipinfo_config_has_real_exit(&inputs.config);
-                let post_connect = delay_ms == IPINFO_SETTLE_DELAY_MS;
+                let probe_kind = if post_connect {
+                    ProxyProbe::PostConnect(first_attempt)
+                } else {
+                    ProxyProbe::Standard
+                };
                 let (snapshot, committed) =
-                    probe_publish_ipinfo(&app, inputs, epoch, seq, post_connect).await;
+                    probe_publish_ipinfo(&app, inputs, epoch, seq, probe_kind).await;
                 if committed && ipinfo_probe_is_current(epoch, seq) {
                     if recheck_unlock_on_recovery {
                         maybe_recheck_unlock_after_exit_recovery(

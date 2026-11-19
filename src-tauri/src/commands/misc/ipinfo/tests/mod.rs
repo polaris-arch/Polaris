@@ -112,10 +112,60 @@ async fn failed_pinned_proxy_never_falls_back_to_the_direct_result() {
 
 #[tokio::test(start_paused = true)]
 async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
-    for (direct_delay, first_delay, first_success, expected_starts, expected_early, expected_end) in [
-        (5, 1, true, vec![0], Some(1), 5),
-        (8, 1, false, vec![0, 5], Some(5), 8),
-        (5, 8, true, vec![0], None, 8),
+    for (
+        prior,
+        direct_delay,
+        first_delay,
+        first_success,
+        expected_starts,
+        expected_early,
+        expected_end,
+    ) in [
+        (
+            FirstProxyAttempt::NotAttempted,
+            5,
+            1,
+            true,
+            vec![0],
+            Some(1),
+            5,
+        ),
+        (
+            FirstProxyAttempt::NotAttempted,
+            8,
+            1,
+            false,
+            vec![0, 5],
+            Some(5),
+            8,
+        ),
+        (
+            FirstProxyAttempt::NotAttempted,
+            5,
+            8,
+            true,
+            vec![0],
+            None,
+            8,
+        ),
+        (
+            FirstProxyAttempt::Completed,
+            5,
+            1,
+            true,
+            vec![0],
+            Some(1),
+            5,
+        ),
+        (
+            FirstProxyAttempt::Unconfirmed,
+            8,
+            1,
+            false,
+            vec![4, 9],
+            None,
+            9,
+        ),
     ] {
         let started = tokio::time::Instant::now();
         let mut starts = Vec::new();
@@ -138,6 +188,7 @@ async fn post_connect_proxy_request_and_retries_do_not_wait_for_direct() {
                     Ok(json!({ "ip": "192.0.2.2" }))
                 }
             },
+            prior,
             |proxy| published.push((started.elapsed(), proxy.clone())),
         )
         .await;
@@ -396,6 +447,10 @@ fn proxy_reachability_reports_only_observed_probe_state() {
     );
     // 核在跑但本机没有可用的 http 代理入站（端口分配失败）→ 没探过，不许报「不可达」。
     assert_eq!(proxy_reachability(&running, None, &Value::Null), "unknown");
+    let verified = trace_ipinfo(b"ip=192.0.2.8\nloc=US\n").unwrap();
+    assert_eq!(proxy_reachability(&running, None, &verified), "reachable");
+    assert_eq!(verified["countryCode"], "US");
+    assert!(trace_ipinfo(&vec![b'x'; IPINFO_MAX_BODY + 1]).is_err());
 }
 
 /// **α 批回归**：Android 形态（`mixed_port == 0`、有 `probe-proxy-in`）下代理出口**照样探**。

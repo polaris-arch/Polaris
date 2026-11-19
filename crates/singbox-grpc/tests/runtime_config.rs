@@ -4,8 +4,8 @@ use polaris_singbox_grpc::{
         self,
         runtime_config_service_server::{RuntimeConfigService, RuntimeConfigServiceServer},
     },
-    ClientError, Endpoint, RuntimeConfigError, SingBoxApiClient, RUNTIME_CONFIG_MAX_MESSAGE_BYTES,
-    UNARY_DEADLINE,
+    ClientError, Endpoint, ExitIpProbeError, RuntimeConfigError, SingBoxApiClient,
+    RUNTIME_CONFIG_MAX_MESSAGE_BYTES, UNARY_DEADLINE,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -21,6 +21,8 @@ struct Mock {
     stall_apply: bool,
     stall_retry: bool,
     no_op: bool,
+    probe_drained: bool,
+    stall_probe: bool,
     calls: Arc<AtomicUsize>,
 }
 impl Mock {
@@ -46,6 +48,15 @@ fn identity() -> daemon::RuntimeIdentity {
         incarnation: "instance-1".into(),
         applied_revision: 12,
         effective_digest: "before".into(),
+    }
+}
+
+fn exit_ip_request() -> daemon::ProbeExitIpRequest {
+    daemon::ProbeExitIpRequest {
+        version: 1,
+        expected: Some(identity()),
+        expected_control_revision: 7,
+        leaf_tag: "physical-tcp-winner".into(),
     }
 }
 fn plan_request() -> daemon::PlanRuntimeConfigRequest {
@@ -158,6 +169,30 @@ fn acknowledgement_request() -> daemon::RuntimePersistenceAcknowledgementRequest
 }
 #[tonic::async_trait]
 impl RuntimeConfigService for Mock {
+    async fn probe_exit_ip(
+        &self,
+        request: Request<daemon::ProbeExitIpRequest>,
+    ) -> Result<Response<daemon::ProbeExitIpResponse>, Status> {
+        if let Err(mut status) = self.check(&request) {
+            if self.probe_drained {
+                status
+                    .metadata_mut()
+                    .insert("polaris-exit-ip-result", "drained".parse().unwrap());
+            }
+            return Err(status);
+        }
+        assert_eq!(request.into_inner(), exit_ip_request());
+        if self.stall_probe {
+            std::future::pending::<()>().await;
+        }
+        Ok(Response::new(daemon::ProbeExitIpResponse {
+            active: Some(identity()),
+            control_revision: 7,
+            leaf_tag: "physical-tcp-winner".into(),
+            trace_body: b"ip=192.0.2.8\nloc=US\n".to_vec(),
+        }))
+    }
+
     async fn get_runtime_capabilities(
         &self,
         request: Request<()>,
@@ -302,6 +337,61 @@ async fn start(mock: Mock, secret: &str) -> (SingBoxApiClient, Running) {
             .unwrap(),
         Running(task),
     )
+}
+
+#[tokio::test]
+async fn exit_ip_authentication_identity_and_terminal_drain_are_preserved() {
+    let budget = Duration::from_secs(1);
+    let (client, _server) = start(Mock::default(), "secret").await;
+    let reply = client
+        .probe_exit_ip(exit_ip_request(), budget)
+        .await
+        .unwrap();
+    assert_eq!(reply.active, Some(identity()));
+    assert_eq!(reply.control_revision, 7);
+    assert_eq!(reply.leaf_tag, "physical-tcp-winner");
+    assert_eq!(reply.trace_body, b"ip=192.0.2.8\nloc=US\n");
+
+    for (code, probe_drained, expected) in [
+        (Code::Unimplemented, false, ExitIpProbeError::NotAttempted),
+        (
+            Code::FailedPrecondition,
+            false,
+            ExitIpProbeError::NotAttempted,
+        ),
+        (Code::Unavailable, true, ExitIpProbeError::CompletedFailure),
+        (Code::Aborted, true, ExitIpProbeError::CompletedFailure),
+        (Code::Unavailable, false, ExitIpProbeError::Unknown),
+        (Code::ResourceExhausted, false, ExitIpProbeError::Unknown),
+    ] {
+        let (client, _server) = start(
+            Mock {
+                code: Some(code),
+                probe_drained,
+                ..Mock::default()
+            },
+            "secret",
+        )
+        .await;
+        assert_eq!(
+            client.probe_exit_ip(exit_ip_request(), budget).await,
+            Err(expected)
+        );
+    }
+    let (client, _server) = start(
+        Mock {
+            stall_probe: true,
+            ..Mock::default()
+        },
+        "secret",
+    )
+    .await;
+    assert_eq!(
+        client
+            .probe_exit_ip(exit_ip_request(), Duration::from_millis(30))
+            .await,
+        Err(ExitIpProbeError::Unknown)
+    );
 }
 #[tokio::test]
 async fn authenticated_round_trip_preserves_partial_support_and_operation_states() {
