@@ -546,6 +546,31 @@ impl PendingOperation {
             revision: self.saved_revision?,
         })
     }
+
+    fn matches_receipt(&self, receipt: &daemon::RuntimeConfigOperation) -> bool {
+        receipt.contract_version == 1
+            && receipt.transaction_id == self.plan.transaction_id
+            && receipt.candidate_digest == self.plan.candidate_digest
+            && receipt.impact_digest == self.plan.impact_digest
+            && identity_equal(receipt.before.as_ref(), self.plan.expected.as_ref())
+    }
+
+    fn committed_identity<'a>(
+        &self,
+        receipt: &'a daemon::RuntimeConfigOperation,
+    ) -> Option<&'a daemon::RuntimeIdentity> {
+        let active = receipt.active.as_ref()?;
+        let before = receipt.before.as_ref()?;
+        (self.pairing.incarnation.as_deref() == Some(active.incarnation.as_str())
+            && active.incarnation == before.incarnation
+            && active.effective_digest == self.plan.candidate_digest
+            && active.applied_revision >= before.applied_revision
+            && receipt.control_revision >= self.plan.expected_control_revision
+            && (!self.plan.no_op
+                || (identity_equal(Some(active), Some(before))
+                    && receipt.control_revision == self.plan.expected_control_revision)))
+            .then_some(active)
+    }
 }
 
 #[derive(Default)]
@@ -2918,29 +2943,31 @@ impl ProxyRuntime {
         pending: &PendingOperation,
         operation: daemon::RuntimeConfigOperation,
     ) -> Result<daemon::RuntimeConfigOperation, Box<RuntimeApplyResult>> {
+        let unconfirmed = || Box::new(RuntimeApplyResult::status("unconfirmed"));
+        if !pending.matches_receipt(&operation) {
+            return Err(unconfirmed());
+        }
         if matches!(
             daemon::RuntimeOperationState::try_from(operation.state),
             Ok(daemon::RuntimeOperationState::Committed
                 | daemon::RuntimeOperationState::CommittedDurabilityPending)
         ) {
+            if pending.committed_identity(&operation).is_none() {
+                return Err(unconfirmed());
+            }
             self.confirm_runtime_api_handoff(pending).await?;
         }
         if operation.persistence_mode != "app_authoritative_regeneration"
             || !operation.owner_reload_acknowledged
             || operation.durable
             || operation.state != daemon::RuntimeOperationState::CommittedDurabilityPending as i32
-            || operation.transaction_id != pending.plan.transaction_id
-            || operation.candidate_digest != pending.plan.candidate_digest
-            || !identity_equal(operation.before.as_ref(), pending.plan.expected.as_ref())
         {
             return Ok(operation);
         }
-        let Some(active) = operation.active.clone().filter(|active| {
-            active.effective_digest == pending.plan.candidate_digest
-                && pending.pairing.incarnation.as_deref() == Some(active.incarnation.as_str())
-        }) else {
-            return Ok(operation);
-        };
+        let active = pending
+            .committed_identity(&operation)
+            .ok_or_else(unconfirmed)?
+            .clone();
         let control = match self.runtime_management_client(pending.generation).await {
             Ok(control) => control,
             Err(_) => return Err(Box::new(RuntimeApplyResult::status("unconfirmed"))),
@@ -3223,12 +3250,7 @@ impl ProxyRuntime {
         pending: &PendingOperation,
         operation: daemon::RuntimeConfigOperation,
     ) -> RuntimeApplyResult {
-        if operation.contract_version != 1
-            || operation.transaction_id != pending.plan.transaction_id
-            || operation.candidate_digest != pending.plan.candidate_digest
-            || operation.impact_digest != pending.plan.impact_digest
-            || !identity_equal(operation.before.as_ref(), pending.plan.expected.as_ref())
-        {
+        if !pending.matches_receipt(&operation) {
             return RuntimeApplyResult::status("unconfirmed");
         }
         let committed = operation.state == daemon::RuntimeOperationState::Committed as i32
@@ -3280,26 +3302,9 @@ impl ProxyRuntime {
         if pending.api_handoff.as_ref().is_some_and(|h| !h.confirmed()) {
             return RuntimeApplyResult::status("unconfirmed");
         }
-        let Some(active) = operation.active.as_ref() else {
+        let Some(active) = pending.committed_identity(&operation) else {
             return RuntimeApplyResult::status("unconfirmed");
         };
-        let Some(before) = operation.before.as_ref() else {
-            return RuntimeApplyResult::status("unconfirmed");
-        };
-        if pending.pairing.incarnation.as_deref() != Some(active.incarnation.as_str())
-            || active.incarnation != before.incarnation
-            || active.effective_digest != pending.plan.candidate_digest
-            || active.applied_revision < before.applied_revision
-            || operation.control_revision < pending.plan.expected_control_revision
-        {
-            return RuntimeApplyResult::status("unconfirmed");
-        }
-        if pending.plan.no_op
-            && (!identity_equal(operation.active.as_ref(), operation.before.as_ref())
-                || operation.control_revision != pending.plan.expected_control_revision)
-        {
-            return RuntimeApplyResult::status("unconfirmed");
-        }
         // Record the verified Core fact even when a later App owner prevents R
         // publication. This does not grant the old intent any new rights.
         let mut observe_retirement = false;

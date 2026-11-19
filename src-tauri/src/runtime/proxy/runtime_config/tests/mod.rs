@@ -1980,6 +1980,33 @@ fn committed_ts_receipt(pending: &PendingOperation) -> daemon::RuntimeConfigOper
     }
 }
 
+#[tokio::test]
+async fn regeneration_ack_rejects_receipts_outside_the_original_plan() {
+    let (runtime, _dir, _calls) = crate::runtime::proxy::tests::test_runtime_recording();
+    let pending = ts_pending_raw_fixture(&runtime, runnable_config_fixture());
+    let mut original = committed_ts_receipt(&pending);
+    original.durable = false;
+    original.state = daemon::RuntimeOperationState::CommittedDurabilityPending as i32;
+    original.persistence_mode = "app_authoritative_regeneration".into();
+    original.owner_reload_acknowledged = true;
+    assert!(pending.matches_receipt(&original));
+    assert!(pending.committed_identity(&original).is_some());
+    for axis in ["contract", "impact", "control", "active"] {
+        let mut operation = original.clone();
+        match axis {
+            "contract" => operation.contract_version = 0,
+            "impact" => operation.impact_digest.push('x'),
+            "control" => operation.control_revision = 0,
+            "active" => operation.active.as_mut().unwrap().applied_revision = 0,
+            _ => unreachable!(),
+        }
+        let result = runtime
+            .acknowledge_regeneration_owner(&pending, operation)
+            .await;
+        assert_eq!(result.unwrap_err().status, "unconfirmed", "{axis}");
+    }
+}
+
 // Begin with actual legacy bytes and an admitted C1, deliberately without any
 // STATUS. Only production confirmed settlement may install C2 and rewrite files.
 #[tokio::test]
