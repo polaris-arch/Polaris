@@ -561,7 +561,7 @@ export default function TrayMenu() {
     try {
       const result = await api.config.updateMode(mode);
       if (!mounted.current || !interactionActive.current || life !== trayLifecycle.current || operation !== interactionEpoch.current) return;
-      if (result.status === 'needsManual') {
+      if (result.status === 'needsManual' || result.status === 'blockedByPending') {
         setNotice(t('tray.manageInMain'));
       } else if (result.status !== 'saved') {
         noticeActionFailure(t('tray.groupMode'), result.status);

@@ -81,9 +81,9 @@ import { applyDetour } from '@/components/dialogs/detour-options';
 import { blockedByMeshSingleton } from '@/domain/mesh-singleton-guard';
 import { isAddresslessProtocol, tailcatSettingsError } from '@/domain/server-completeness';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
-import { editRoute } from '@/lib/staged-config';
+import { configCanonicalText, editRoute } from '@/lib/staged-config';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
-import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
+import { effectiveCollection, useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
 import { MobileFields } from './FormFields';
@@ -119,7 +119,8 @@ export function NodeFormPanel({
   const interfaces = useNetworkInterfaces();
 
   const base = serverId === undefined ? undefined : servers.find((s) => s.id === serverId);
-  const isEdit = base !== undefined;
+  const isEdit = serverId !== undefined;
+  const [openedWith] = useState(base);
 
   const initProto: NodeProto =
     base !== undefined && isNodeProto(base.protocol) ? base.protocol : (initialProto ?? 'vless');
@@ -331,6 +332,14 @@ export function NodeFormPanel({
   };
 
   const submit = async (): Promise<void> => {
+    if (isEdit) {
+      const current = effectiveCollection('servers', useAppStore.getState().servers, useStagedConfigStore.getState().entries)
+        .find((node) => node.id === serverId);
+      if (!current || !openedWith || configCanonicalText(current) !== configCanonicalText(openedWith)) {
+        toast.warning(t('home.stagedConflictTitle'), { description: t('home.pendingHotConflict') });
+        return;
+      }
+    }
     const nameEmpty = name.trim() === '';
     const port = parseNumberField(portStr);
     /* 无地址协议（Tor / Tailcat）不收地址行，也就不校验它；落盘写空地址 + 0 端口（同桌面 D8）。 */

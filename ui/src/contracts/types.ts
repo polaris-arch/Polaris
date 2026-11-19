@@ -609,7 +609,7 @@ export interface StagedClassification {
 export type SaveOutcome =
   | { status: 'saved'; version: string; config: UserConfig; runtimeApply?: PendingApplyResult }
   | { status: 'needsManual' }
-  | { status: 'retryable' | 'rejected' }
+  | { status: 'blockedByPending' | 'retryable' | 'rejected' }
   | { status: 'conflict'; diskVersion: string };
 
 export interface UserConfig {

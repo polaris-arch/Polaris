@@ -480,6 +480,7 @@ pub(crate) enum HotConfigEditOutcome {
         revision: u64,
     },
     NeedsManual,
+    BlockedByPending,
     Retryable,
     Rejected,
     Conflict,
@@ -1831,7 +1832,7 @@ impl ProxyRuntime {
         let active = state.automatic_edit.is_some();
         drop(state);
         if awaiting_user || self.pending_changes_against(Some(before)).pending_apply {
-            return Some(HotConfigEditOutcome::NeedsManual);
+            return Some(HotConfigEditOutcome::BlockedByPending);
         }
         active.then_some(HotConfigEditOutcome::Retryable)
     }

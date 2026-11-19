@@ -418,6 +418,21 @@ describe('⑥ 提交：抓住真的提交闭包，看写出去的 ServerConfig',
   const torOut = (): Record<string, unknown> =>
     probe.save.mock.calls[0][0].servers[0].torSettings as unknown as Record<string, unknown>;
 
+  it.each(['changed', 'removed'])('keeps a stale form open when its node was %s on disk', async (event) => {
+    renderEdit(TOR_BASE);
+    const servers = event === 'changed' ? [{ ...TOR_BASE, name: 'edited elsewhere' }] : [];
+    probe.backend = { ...probe.backend!, servers };
+    useAppStore.setState({ config: probe.backend });
+    useStagedConfigStore.setState({ latestSavedConfig: probe.backend });
+    mirror();
+    expect(probe.onSubmit).not.toBeNull();
+    await probe.onSubmit?.();
+    expect(useStagedConfigStore.getState().entries).toEqual([]);
+    expect(probe.save).not.toHaveBeenCalled();
+    expect(probe.update).toEqual([]);
+    expect(probe.add).toEqual([]);
+  });
+
   it('b. 正面对照：不动扩展 JSON 时，袋键原样保留（证明下一条的补丁是唯一变量）', async () => {
     await submitEdit(TOR_BASE);
     expect(probe.save).toHaveBeenCalledTimes(1);

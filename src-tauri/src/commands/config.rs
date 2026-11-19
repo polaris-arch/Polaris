@@ -383,6 +383,8 @@ pub enum SaveOutcome {
     Conflict { disk_version: String },
     /// No write occurred. Render or keep the explicit draft for this edit.
     NeedsManual,
+    /// Earlier work is awaiting confirmation. This edit has not been classified.
+    BlockedByPending,
     /// Authority was temporarily unavailable before any write.
     Retryable,
     /// The authenticated planner or a native validation rejected the edit.
@@ -531,6 +533,9 @@ async fn config_save_hot_only(
     };
     match Box::pin(state.proxy.apply_hot_config_edit(&edit)).await {
         Ok(HotConfigEditOutcome::NeedsManual) => ApiResponse::ok(SaveOutcome::NeedsManual),
+        Ok(HotConfigEditOutcome::BlockedByPending) => {
+            ApiResponse::ok(SaveOutcome::BlockedByPending)
+        }
         Ok(HotConfigEditOutcome::Retryable) => ApiResponse::ok(SaveOutcome::Retryable),
         Ok(HotConfigEditOutcome::Rejected) => ApiResponse::ok(SaveOutcome::Rejected),
         Ok(HotConfigEditOutcome::Conflict) => match config.with_current(config_version) {

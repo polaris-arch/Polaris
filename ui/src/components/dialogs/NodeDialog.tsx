@@ -26,10 +26,10 @@ import { realityUtlsError } from '@/domain/utls';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
-import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
+import { effectiveCollection, useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
-import { editRoute } from '@/lib/staged-config';
+import { configCanonicalText, editRoute } from '@/lib/staged-config';
 import { api } from '@/ipc';
 import type { MeshInboundPolicy, ServerConfig } from '@/contracts/types';
 import { Modal } from './Modal';
@@ -88,18 +88,20 @@ function NodeIcon() {
 interface NodeFormProps {
   instanceId: string;
   base?: ServerConfig;
-  isEdit: boolean;
+  serverId?: string;
   servers: ServerConfig[];
   initialProto?: NodeProto;
 }
 
-function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormProps) {
+function NodeForm({ instanceId, base, serverId, servers, initialProto }: NodeFormProps) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
   const closeInstance = useDialogStore((s) => s.closeInstance);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
   const submitEdit = useStagedConfigStore((s) => s.submit);
+  const isEdit = serverId !== undefined;
+  const [openedWith] = useState(base);
 
   // 同步初始化（R1）：挂载即带正确值，绝不挂载后 reset。
   const initProto: NodeProto =
@@ -272,6 +274,14 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
   };
 
   const handleSubmit = async () => {
+    if (isEdit) {
+      const current = effectiveCollection('servers', useAppStore.getState().servers, useStagedConfigStore.getState().entries)
+        .find((node) => node.id === serverId);
+      if (!current || !openedWith || configCanonicalText(current) !== configCanonicalText(openedWith)) {
+        toast.warning(t('home.stagedConflictTitle'), { description: t('home.pendingHotConflict') });
+        return;
+      }
+    }
     const nameEmpty = !name.trim();
     const port = parseNumberField(portStr);
     // 无地址协议（Tor / Tailcat，D8）不收地址行，也就不校验它；落盘写空地址 + 0 端口（同 TS 登录建节点）。
@@ -724,7 +734,7 @@ export function NodeDialog({ instanceId, serverId, initialProto }: { instanceId:
       key={`${serverId ?? 'new'}:${initialProto ?? ''}`}
       instanceId={instanceId}
       base={base}
-      isEdit={base != null}
+      serverId={serverId}
       servers={servers}
       initialProto={initialProto}
     />

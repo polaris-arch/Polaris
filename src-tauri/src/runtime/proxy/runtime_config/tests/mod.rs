@@ -529,7 +529,7 @@ async fn hot_config_edit_without_pairing_never_writes_or_publishes_the_candidate
     assert!(rt.hot_config_edit_blocker(&edit.previous, owner).is_none());
     assert!(matches!(
         rt.hot_config_edit_blocker(&edit.previous, prior_owner),
-        Some(HotConfigEditOutcome::NeedsManual),
+        Some(HotConfigEditOutcome::BlockedByPending),
     ));
     assert_ne!(edit.candidate, edit.previous);
     assert!(matches!(

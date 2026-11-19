@@ -43,6 +43,7 @@ vi.mock('@/ipc', () => ({
 
 import { STAGED_CONFIG_ENABLED, STAGED_STORAGE_KEY, configBaseVersion, type StagedEntry } from '@/lib/staged-config';
 import { setToastImpl } from '@/lib/error-handler';
+import i18n, { i18nReady } from '@/i18n';
 import type { SaveOutcome, UserConfig } from '@/contracts/types';
 import {
   flushStagedPendingSync,
@@ -506,31 +507,58 @@ describe('edit admission before creating a manual draft', () => {
     expect(saveMock.mock.calls[0][0]).toMatchObject({ servers: [next.nextValue] });
   });
 
-  it('keeps a rule referring to a node that has not been saved in the same workflow', async () => {
+  it('keeps a dependency on an unsaved node out of its existing draft', async () => {
     const store = useStagedConfigStore;
     await hydrateStagedConfig(CONFIG);
     const node = entry('n2');
     store.getState().stage(node);
     const rule = { id: 'rule:1', kind: 'rule', label: 'new rule', entityPath: ['trafficRules', '1'],
       nextValue: { id: '1', outboundServerId: 'n2' } } as const;
-    expect(await store.getState().submit(rule)).toBe('manual');
-    expect(store.getState().entries).toEqual([node, rule]);
+    expect(await store.getState().submit(rule)).toBe('ignored');
+    expect(store.getState().entries).toEqual([node]);
     expect(saveMock).not.toHaveBeenCalled();
   });
 
-  it('keeps edits authored before an unrelated writer changed the same entity', async () => {
+  it('keeps an unclassified edit separate from earlier saved changes awaiting apply', async () => {
+    const store = useStagedConfigStore;
+    await hydrateStagedConfig(CONFIG);
+    saveMock.mockResolvedValueOnce({ status: 'blockedByPending' });
+    expect(await store.getState().submit(entry('n1', 8443))).toBe('ignored');
+    expect(store.getState()).toMatchObject({ entries: [], saveStatus: 'idle', conflict: null });
+    expect(fake.getItem(STAGED_STORAGE_KEY)).toBeNull();
+    expect(applyMock).not.toHaveBeenCalled();
+  });
+
+  it('warns without staging when another writer changed the same entity', async () => {
+    await i18nReady;
     const store = useStagedConfigStore;
     await hydrateStagedConfig(CONFIG);
     const disk = { ...CONFIG, servers: [{ ...CONFIG.servers[0], port: 10443 }] };
     getMock.mockResolvedValueOnce(CONFIG).mockResolvedValueOnce(disk);
     saveMock.mockResolvedValueOnce({ status: 'conflict', diskVersion: configBaseVersion(disk) });
     const change = entry('n1', 8443);
-    expect(await store.getState().submit(change)).toBe('manual');
-    expect(store.getState()).toMatchObject({ entries: [change], baseline: CONFIG });
-    expect(saveMock).toHaveBeenCalledOnce();
-    getMock.mockResolvedValueOnce(disk);
-    expect(await store.getState().save()).toBe(false);
-    expect(store.getState().conflict?.map(({ entryId }) => entryId)).toEqual([change.id]);
+    const warning = vi.fn<typeof import('@/lib/error-handler').toast.warning>();
+    setToastImpl({ warning });
+    try {
+      expect(await store.getState().submit(change)).toBe('ignored');
+      expect(store.getState()).toMatchObject({ entries: [], baseline: CONFIG, saveStatus: 'idle', conflict: null });
+      expect(fake.getItem(STAGED_STORAGE_KEY)).toBeNull();
+      expect(saveMock).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledExactlyOnceWith(change.label, {
+        description: i18n.t('home.pendingHotConflict'),
+      });
+    } finally {
+      setToastImpl({});
+    }
+  });
+
+  it('does not turn an edit without a saved baseline into a manual draft', async () => {
+    const store = useStagedConfigStore;
+    const change = entry('n1', 8443);
+    expect(await store.getState().submit(change)).toBe('ignored');
+    expect(store.getState()).toMatchObject({ entries: [], saveStatus: 'idle', conflict: null });
+    expect(fake.getItem(STAGED_STORAGE_KEY)).toBeNull();
+    expect(saveMock).not.toHaveBeenCalled();
   });
 });
 

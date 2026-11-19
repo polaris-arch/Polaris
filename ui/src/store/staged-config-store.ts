@@ -463,6 +463,10 @@ function submitEdit(
     persist(baseline, next);
     return 'manual' as const;
   };
+  const warn = (description: string) => {
+    toast.warning(entries[0].label, { description });
+    return 'ignored' as const;
+  };
   const failed = (description: string, retryable: boolean) => {
     const label = entries[0].label.trim() || i18n.t('common.saveFailed');
     toast.error(label, description, retryable ? {
@@ -477,28 +481,30 @@ function submitEdit(
   };
   return withConfigWriteLock(async () => {
     if (!get().enabled) return 'ignored' as const;
-    if (!authoredAgainst) return manualDraft();
+    if (!authoredAgainst) return warn(i18n.t('home.pendingHotConflict'));
     try {
       let retryOnConflict = true;
       for (;;) {
         const disk = await api.config.get();
         if (!get().enabled) return 'ignored' as const;
-        if (dependsOnDraft(disk, get().entries, entries)) return manualDraft();
+        if (dependsOnDraft(disk, get().entries, entries)) return warn(i18n.t('home.stagedOnlyBlocked'));
         const merged = replay(disk, entries);
         const diskVersion = configBaseVersion(disk);
         const ownPrecedingEdit = preceding?.baseline === authoredAgainst
           && preceding.committedVersion === diskVersion ? preceding : undefined;
         const clashes = changedOnDisk(authoredAgainst, disk, merged, entries);
         if (clashes.some((entry) => !isScalarAssignment(entry) || !ownPrecedingEdit?.fields.has(entry.entityPath[0]))) {
-          return manualDraft();
+          return warn(i18n.t('home.pendingHotConflict'));
         }
         const observedAtDispatch = get().latestSavedConfig;
         const outcome = await api.config.save(merged, true, diskVersion, true, true);
-        if (outcome.status === 'conflict' && retryOnConflict) {
+        if (outcome.status === 'conflict') {
+          if (!retryOnConflict) return warn(i18n.t('home.pendingHotConflict'));
           retryOnConflict = false;
           continue;
         }
         if (outcome.status === 'needsManual') return manualDraft();
+        if (outcome.status === 'blockedByPending') return warn(i18n.t('home.pendingSavedStillNeedsApply'));
         if (outcome.status !== 'saved') return failed(i18n.t('common.saveFailed'), outcome.status !== 'rejected');
         if (queued) queued.committedVersion = outcome.version;
         completeSave(set, get, disk, merged, entries, observedAtDispatch, outcome, false);
