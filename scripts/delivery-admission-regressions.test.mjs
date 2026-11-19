@@ -4,18 +4,18 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { devNull, tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { boundedDownload, DOWNLOAD_TIMEOUT_MS } from './lib/bounded-download.mjs';
 import { verifyDashboardArchive, dashboardInventory, dashboardFresh } from './fetch-dashboard.mjs';
 import { inspectAppleArchitecture } from './mobile-core/apple-admission.mjs';
-import { checkMobileBuildInfo, parseMobileBuildInfo, validateMobileSource } from './mobile-core/source-admission.mjs';
+import { checkMobileBuildInfo, parseMobileBuildInfo, reviewedSource, validateMobileSource } from './mobile-core/source-admission.mjs';
 const nativeId = 'polaris-mobile-' + 'a'.repeat(64);
 const requiredNative = ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun'];
 
-test('reviewed source observes every vendor object and enforces the independent Meta binding', { skip: process.platform === 'win32' }, () => {
+test('reviewed source observes every vendor object and enforces the independent Meta binding', { skip: process.platform === 'win32' }, async t => {
   const folder = realpathSync(mkdtempSync(join(tmpdir(), 'reviewed-mobile-source-')));
   try {
     const root = join(folder, 'source');
@@ -30,6 +30,9 @@ test('reviewed source observes every vendor object and enforces the independent 
     };
     const sha = bytes => createHash('sha256').update(bytes).digest('hex');
     const source = JSON.parse(readFileSync(new URL('mobile-core/source-contract.json', import.meta.url)));
+    write('.gitignore', '/build/\n*.overlay\n');
+    write(source.declaredTagsSource.path, 'package main\n');
+    source.declaredTagsSource.sha256 = sha('package main\n');
     const policy = source.sourcePolicy, { metacubex: meta } = policy;
     const vendors = Object.entries(policy.vendors);
     const changedFiles = ['conn.go', 'reality.go'];
@@ -67,26 +70,116 @@ test('reviewed source observes every vendor object and enforces the independent 
     git('init', '-q', '--object-format=sha1');
     git('add', '-f', '.');
     git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'reviewed source fixture');
+    const tag = (...args) => git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'tag', '-a', source.sourceTag, ...args);
+    const ref = 'refs/tags/' + source.sourceTag;
+    tag('-m', 'immutable source object');
+    source.sourceTagObject = git('rev-parse', ref);
     policy.sourceCommit = source.sourceCommit = git('rev-parse', 'HEAD');
     policy.sourceTree = source.sourceTree = git('rev-parse', 'HEAD^{tree}');
     for (const [, pin] of vendors) pin.replacementTree = git('rev-parse', 'HEAD:' + pin.replacementPath.slice(2));
     meta.replacementTree = policy.vendors[meta.module].replacementTree;
 
-    const script = fileURLToPath(new URL('mobile-core/source-admission.mjs', import.meta.url));
-    const observe = () => spawnSync(process.execPath, [script, '--reviewed-source', root],
-      { env, input: JSON.stringify(source), encoding: 'utf8' });
-    const good = observe();
-    assert.equal(good.status, 0, good.stderr);
-    const observation = JSON.parse(good.stdout);
+    const observe = () => reviewedSource(root, validateMobileSource(source));
+    const observation = observe();
     assert.equal(observation.schema, 'polaris-reviewed-source-observation-v2');
     assert.equal(observation.replacementFileCount, 355);
     assert.deepEqual(observation.vendors, Object.fromEntries(vendors.map(([name, pin]) =>
       [name, { path: pin.replacementPath, tree: pin.replacementTree, files: pin.replacementFileCount }])));
-    const refuse = reason => {
-      const result = observe();
-      assert.equal(result.status, 1, result.stderr);
-      assert.match(result.stderr, reason);
-    };
+    await t.test('both live hosted adapters admit the same annotated checkout and canonical receipt', () => {
+      // The origin retains the pinned object but advertises a different tag.
+      // Remap only this fixture's fetch to local Git while recording exact argv.
+      tag('--force', '-m', 'different advertised tag');
+      assert.notEqual(git('rev-parse', ref), source.sourceTagObject);
+      git('config', 'uploadpack.allowAnySHA1InWant', 'true');
+      const wrapperDir = join(folder, 'git-bin');
+      mkdirSync(wrapperDir);
+      const executable = join(wrapperDir, 'git');
+      const fetchLog = join(folder, 'fetches.jsonl');
+      const actualGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+      writeFileSync(executable, '#!' + process.execPath + '\n' + `
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2), fetch = args.indexOf('fetch');
+if (fetch >= 0) {
+  if (args[fetch + 3] !== ${JSON.stringify(source.sourceURL)}) process.exit(93);
+  fs.appendFileSync(${JSON.stringify(fetchLog)}, JSON.stringify(args.slice(fetch)) + '\\n');
+  args[fetch + 3] = ${JSON.stringify(pathToFileURL(root).href)};
+}
+const result = spawnSync(${JSON.stringify(actualGit)}, args, { stdio: 'inherit' });
+process.exit(result.status ?? 94);
+`, { mode: 0o700 });
+      const mobileDir = fileURLToPath(new URL('mobile-core/', import.meta.url));
+      const envWithTrap = { ...env, PATH: wrapperDir + delimiter + env.PATH, PYTHONPATH: mobileDir,
+        GIT_DIR: join(folder, 'wrong.git'), GIT_WORK_TREE: join(folder, 'wrong-worktree') };
+      const input = JSON.stringify(source);
+      function adapter(owner, slot, value = source) {
+        return spawnSync('python3', ['-B', '-c',
+          'import importlib,json,sys; from fork_input import canonical,verify_source; ' +
+          'value=json.load(sys.stdin); source=sys.argv[2]; owner=importlib.import_module(sys.argv[1]); ' +
+          'print(json.dumps([owner.prepare_source(source,value), verify_source(source,value), canonical(value).decode()]))',
+          owner, slot], { cwd: folder, env: envWithTrap, input: JSON.stringify(value), encoding: 'utf8', timeout: 30_000 });
+      }
+      const requested = ['fetch', '--depth=1', '--no-tags', source.sourceURL, source.sourceTagObject + ':' + ref];
+      const android = join(folder, 'android-source'), apple = join(folder, 'apple-source');
+      let canonical;
+      for (const [owner, slot] of [['ci_android', android], ['ci_apple', apple]]) {
+        const prepared = adapter(owner, slot);
+        assert.equal(prepared.status, 0, prepared.stderr);
+        const [receipt, verified, bytes] = JSON.parse(prepared.stdout);
+        canonical = bytes;
+        assert.deepEqual(receipt, {
+          schema: 'polaris-mobile-source-observation-v1', sourceCommit: source.sourceCommit,
+          sourceTree: source.sourceTree, sourceTag: source.sourceTag, sourceTagObject: source.sourceTagObject,
+          sourceOverlay: 0, inputContractSha256: sha(bytes), artifactAcceptance: false, reviewedSource: observation,
+        });
+        assert.deepEqual(verified, receipt);
+        assert.equal(execFileSync(actualGit, ['-C', slot, 'rev-parse', ref], { env, encoding: 'utf8' }).trim(), source.sourceTagObject);
+        assert.equal(execFileSync(actualGit, ['-C', slot, 'branch', '--show-current'], { env, encoding: 'utf8' }).trim(), '');
+      }
+      const fetches = () => readFileSync(fetchLog, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      assert.deepEqual(fetches(), [requested, requested]);
+      assert.equal(adapter('ci_android', android).status, 0); // Warm source never refetches the moved tag.
+      assert.deepEqual(fetches(), [requested, requested]);
+
+      const script = fileURLToPath(new URL('mobile-core/source-admission.mjs', import.meta.url));
+      const verify = (slot, ...args) => spawnSync(process.execPath, [script, '--verify-checkout', slot, ...args],
+        { env: envWithTrap, input: canonical, encoding: 'utf8' });
+      const refuse = (result, reason) => {
+        assert.equal(result.status, 1, result.stderr);
+        assert.equal(result.stdout, '');
+        assert.match(result.stderr, reason);
+      };
+      refuse(verify(join(android, 'third_party')), /worktree differs/);
+      writeFileSync(join(android, 'go.sum'), 'dirty tracked bytes');
+      refuse(verify(android, '--generator-outputs'), /exact and clean/);
+      writeFileSync(join(android, 'go.sum'), 'reviewed sum\n');
+      mkdirSync(join(android, 'build'));
+      writeFileSync(join(android, 'build', 'artifact'), 'generator output');
+      refuse(verify(android), /zero-overlay/);
+      assert.equal(verify(android, '--generator-outputs').status, 0);
+      writeFileSync(join(android, 'ignored.overlay'), 'foreign build input');
+      refuse(verify(android, '--generator-outputs'), /zero-overlay/);
+
+      const invalid = { ...source, declaredTagsSource: { ...source.declaredTagsSource, sha256: 'invalid' } };
+      const untouched = join(folder, 'invalid-source');
+      refuse(adapter('ci_apple', untouched, invalid), /tags declaration differs/);
+      assert.equal(existsSync(untouched), false);
+      refuse(adapter('ci_apple', untouched, { ...source, extra: 'x'.repeat(65536) }), /mobile input contract is too large/);
+      assert.equal(existsSync(untouched), false);
+      const redirectedSlot = join(folder, 'redirected-source');
+      symlinkSync(join(folder, 'outside-source-slot'), redirectedSlot, 'dir');
+      refuse(adapter('ci_android', redirectedSlot), /source slot is redirected/);
+      assert.equal(existsSync(join(folder, 'outside-source-slot')), false);
+      const absent = { ...source, sourceTagObject: 'b'.repeat(40) };
+      const rejected = join(folder, 'missing-object-source');
+      refuse(adapter('ci_android', rejected, absent), /immutable tag fetch failed/);
+      assert.deepEqual(fetches(), [requested, requested, [...requested.slice(0, -1), absent.sourceTagObject + ':' + ref]]);
+      refuse(adapter('ci_apple', rejected, absent), /Git verification failed/);
+      assert.equal(fetches().length, 3); // An occupied rejected slot stays rejected; no branch fallback.
+      assert(!readdirSync(folder).some(name => name.startsWith('.mobile-source-declaration-')));
+      assert.notEqual(canonical, input); // The adapter's exact canonical bytes, not input formatting, were hashed.
+    });
+    const refuse = reason => assert.throws(observe, reason);
     const target = 'third_party/sing/package.txt';
     write(target, 'different');
     refuse(/vendor bytes differ/);

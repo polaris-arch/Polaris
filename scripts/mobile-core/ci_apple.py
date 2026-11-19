@@ -19,9 +19,8 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from artifacts import MAX_ARTIFACT, MAX_RECEIPT, file_pin, read_receipt, receipt_chunks
-from ci_android import prepare_source
 from consume import materialize_apple_resources
-from fork_input import ROOT, canonical, decode, load, require, sha
+from fork_input import ROOT, canonical, decode, load, prepare_source, require, sha
 from producer import lease, slot_locks, private_dir, producer_code, run, write_json
 
 from apple_handoff import required_slots, scope_fields

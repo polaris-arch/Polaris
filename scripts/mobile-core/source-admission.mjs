@@ -1,7 +1,8 @@
-// Mobile declaration, reviewed source observation, and receipt decoding.
+// Mobile declaration, exact source checkout, reviewed source observation, and receipt decoding.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
+import { devNull } from 'node:os';
 import { dirname, join, posix, resolve, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -9,6 +10,7 @@ const versionPattern = new RegExp(JSON.parse(readFileSync(new URL('../lib/polari
 const goVersion = '1.27.4';
 const sourceContractBytes = 65536;
 const sourceControlBytes = 2 * 1024 * 1024;
+const sourceTagsPath = 'cmd/internal/build_libbox/main.go';
 const vendorFileBytes = 32 * 1024 * 1024;
 const vendorTotalBytes = 512 * 1024 * 1024;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
@@ -384,13 +386,79 @@ function vendorTree(entries) {
   return gitObject('tree', Buffer.concat(rows.map(({ row }) => row)));
 }
 
-function reviewedSource(root, source) {
+function sourceGit(args, operation, timeout = 30_000) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull, GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0' });
+  try {
+    // Preparation inherits the producer's owned process group. Git never owns
+    // a detached group or reads from the declaration/parent's standard input.
+    return execFileSync('git', ['--no-replace-objects', ...args], {
+      env, timeout, maxBuffer: limits.controlBytes, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    throw new Error('mobile source Git ' + operation + ' failed');
+  }
+}
+
+function verifyCheckout(root, source, raw, generatorOutputs) {
   root = realpathSync(root);
-  // The caller owns exact checkout/tag and zero-overlay guards and passes its
-  // sanitized Git environment. The observation below binds actual bytes to Git.
-  const git = (...args) => utf8.decode(execFileSync('git', ['--no-replace-objects', '-C', root, ...args], {
-    timeout: 30000, maxBuffer: limits.controlBytes, stdio: ['ignore', 'pipe', 'pipe'],
-  }));
+  const git = (...args) => sourceGit(['-C', root, ...args], 'verification');
+  const text = (...args) => utf8.decode(git(...args)).trim();
+  demand(realpathSync(text('rev-parse', '--show-toplevel')) === root, 'Git worktree differs from actual source root');
+  demand(text('cat-file', '-t', source.sourceTagObject) === 'tag', 'annotated source tag required');
+  demand(text('rev-parse', 'refs/tags/' + source.sourceTag + '^{tag}') === source.sourceTagObject &&
+    text('rev-parse', source.sourceTagObject + '^{commit}') === source.sourceCommit &&
+    text('rev-parse', source.sourceCommit + '^{tree}') === source.sourceTree, 'mobile source tag/object/commit/tree differs');
+  demand(text('rev-parse', 'HEAD') === source.sourceCommit &&
+    git('status', '--porcelain=v1', '--untracked-files=no', '-z').length === 0,
+    'source checkout must be exact and clean before mobile bind');
+  const declaration = join(root, sourceTagsPath);
+  demand(realpathSync(dirname(declaration)) === dirname(declaration) &&
+    pinned(declaration, sourceControlBytes).pin.sha256 === source.declaredTagsSource.sha256,
+    'source-owned tags declaration differs');
+  // Zero overlay includes ignored compiler/embed inputs. Only the producer's
+  // verified generator output has the existing fixed build/ exception.
+  for (const args of [['--others', '--ignored', '--exclude-standard'], ['--others', '--exclude-standard']]) {
+    const names = utf8.decode(git('ls-files', '-z', ...args)).split('\0');
+    demand(names.pop() === '' && names.every(name => generatorOutputs && name.startsWith('build/') && !(/[\x00-\x1f\x7f]/.test(name))),
+      'untracked ignored compiler/embed input is not a zero-overlay source');
+  }
+  return {
+    schema: 'polaris-mobile-source-observation-v1', sourceCommit: source.sourceCommit,
+    sourceTree: source.sourceTree, sourceTag: source.sourceTag, sourceTagObject: source.sourceTagObject,
+    sourceOverlay: 0, inputContractSha256: createHash('sha256').update(raw).digest('hex'), artifactAcceptance: false,
+    reviewedSource: reviewedSource(root, source),
+  };
+}
+
+function sourceCheckout(root, raw, prepare, generatorOutputs = false) {
+  const source = validateSourceBytes(raw);
+  demand(source.declaredTagsSource?.path === sourceTagsPath && hex(source.declaredTagsSource.sha256, 64),
+    'source-owned tags declaration differs');
+  if (prepare) {
+    root = resolve(root);
+    // The caller owns the private parent. Never follow an alternate checkout
+    // or create the source through a redirected parent or leaf.
+    demand(realpathSync(dirname(root)) === dirname(root), 'mobile source slot parent is redirected');
+    const slot = lstatSync(root, { throwIfNoEntry: false });
+    demand(!slot || slot.isDirectory(), 'mobile source slot is redirected or not a directory');
+    if (!slot) {
+      sourceGit(['init', '--quiet', root], 'initialization', 3_600_000);
+      const ref = 'refs/tags/' + source.sourceTag;
+      sourceGit(['-C', root, 'fetch', '--depth=1', '--no-tags', source.sourceURL, source.sourceTagObject + ':' + ref],
+        'immutable tag fetch', 3_600_000);
+      sourceGit(['-C', root, 'checkout', '--detach', source.sourceCommit], 'detached checkout', 3_600_000);
+    }
+    demand(realpathSync(root) === root, 'mobile source slot is redirected');
+  }
+  return verifyCheckout(root, source, raw, generatorOutputs);
+}
+
+export function reviewedSource(root, source) {
+  root = realpathSync(root);
+  // Validate actual vendor bytes against the pinned Git inventory. The full
+  // checkout entry additionally checks the tag, HEAD, status and zero overlay.
+  const git = (...args) => utf8.decode(sourceGit(['-C', root, ...args], 'vendor verification'));
   review(realpathSync(git('rev-parse', '--show-toplevel').trim()) === root, 'Git worktree differs from actual source root');
   const policy = source.sourcePolicy, { metacubex: meta, vendors } = policy;
   const readInsideSource = (name, read) => {
@@ -705,8 +773,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (args.length === 1 && args[0] === '--versions') {
       const source = readMobileSource();
       console.log(`${source.goVersion} ${source.version}`);
-    } else if (args.length === 2 && args[0] === '--reviewed-source') {
-      console.log(JSON.stringify(reviewedSource(args[1], validateSourceBytes(readBoundedInput(sourceContractBytes)))));
+    } else if ((args.length === 2 || args.length === 3 && args[2] === '--generator-outputs') && args[0] === '--verify-checkout') {
+      console.log(JSON.stringify(sourceCheckout(args[1], readBoundedInput(sourceContractBytes), false, args.length === 3)));
+    } else if (args.length === 3 && args[0] === '--prepare-checkout') {
+      console.log(JSON.stringify(sourceCheckout(args[1], pinned(args[2], sourceContractBytes).bytes, true)));
     } else if (args.length === 4 && args[0] === '--native-buildinfo') {
       const [, path, size, digest] = args;
       const { bytes, pin } = pinned(path, limits.controlBytes);
@@ -715,7 +785,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       console.log(JSON.stringify(nativeBuildInfoReport(evidence)));
     } else {
       // The producer sends its full declaration once and reuses these plans.
-      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --reviewed-source ROOT | --native-buildinfo PATH BYTES SHA256]');
+      demand(args.length === 0, 'usage: source-admission.mjs [--versions | --verify-checkout ROOT [--generator-outputs] | --prepare-checkout ROOT DECLARATION | --native-buildinfo PATH BYTES SHA256]');
       console.log(JSON.stringify(bindingPlans(validateSourceBytes(readBoundedInput(sourceContractBytes)))));
     }
   } catch (error) {

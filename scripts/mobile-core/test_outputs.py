@@ -13,7 +13,7 @@ import zipfile
 from fork_input import ROOT, canonical, load, sha
 from artifacts import component_output_identity, module, module_stream, tree_inventory, zip_entries
 from budget import capacity_limit, native_capacity, native_environment, reservation
-from ci_android import emit_outputs, prepare_source, prepare
+from ci_android import emit_outputs, prepare
 from producer import PRODUCER_FILES, compiler_fact, equivalent_binding, executable_driver_identity
 from transaction import install, recover
 import artifacts
@@ -442,22 +442,6 @@ class FormalOutputs(unittest.TestCase):
                 install([(stage, root / 'component')], root, lambda: None)
             self.assertEqual(unique.read_bytes(), b'original')
             self.assertEqual(stage.read_bytes(), b'new')
-
-    def test_source_fetch_is_fixed_tag_object_and_checked_before_handoff(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / 'source'
-            calls = []
-            with patch('ci_android.run', side_effect=lambda args, **kwargs: calls.append([str(x) for x in args])), \
-                    patch('ci_android.verify_source', return_value={'sourceOverlay': 0}) as verify:
-                prepare_source(source, self.value)
-            ref = 'refs/tags/' + self.value['sourceTag']
-            self.assertEqual(calls[1], ['git', '-C', str(source), 'fetch', '--depth=1', '--no-tags',
-                                      self.value['sourceURL'], self.value['sourceTagObject'] + ':' + ref])
-            verify.assert_called_once_with(source, self.value)
-            for error in ['tag', 'object', 'commit', 'tree', 'module', 'dirty', 'overlay', 'generator']:
-                with self.subTest(error=error), patch('ci_android.run'), \
-                        patch('ci_android.verify_source', side_effect=RuntimeError(error)), self.assertRaises(RuntimeError):
-                    prepare_source(source, self.value)
 
     def test_cache_output_refuses_invalid_identity_before_any_write(self):
         with tempfile.TemporaryDirectory() as temporary:

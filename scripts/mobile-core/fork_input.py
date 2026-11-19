@@ -11,9 +11,12 @@ from functools import lru_cache
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(__file__).with_name('source-contract.json')
+SOURCE_ADMISSION = Path(__file__).with_name('source-admission.mjs')
+CONTRACT_MAX_BYTES = 65536
 
 
 def require(condition, reason):
@@ -30,7 +33,7 @@ def canonical(value):
                       allow_nan=False).encode()
 
 
-def decode(raw, maximum=65536):
+def decode(raw, maximum=CONTRACT_MAX_BYTES):
     def pairs(rows):
         value = {}
         for key, item in rows:
@@ -44,7 +47,7 @@ def decode(raw, maximum=65536):
 
 @lru_cache(maxsize=8)
 def admit_declaration(raw):
-    result = subprocess.run(['node', Path(__file__).with_name('source-admission.mjs')],
+    result = subprocess.run(['node', SOURCE_ADMISSION],
                             input=raw, capture_output=True, timeout=30)
     require(result.returncode == 0,
             result.stderr.decode(errors='replace').strip() or 'formal mobile source declaration rejected')
@@ -76,47 +79,30 @@ def require_git_root(source):
             'Git worktree differs from actual source root')
 
 
-def git(source, *args):
-    # Read-only source verification. Do not run the upstream build helper: it
-    # chooses extra platforms/legacy variants and a git-describe version.
-    require_git_root(source)
-    return subprocess.check_output(['git', '-C', str(source), *args], env=git_environment(), text=True, timeout=30).strip()
-
-
 def verify_source(source, value, *, generator_outputs=False):
-    value = validate(value)
-    source = Path(source).resolve(strict=True)
-    require(git(source, 'cat-file', '-t', value['sourceTagObject']) == 'tag', 'annotated source tag required')
-    require(git(source, 'rev-parse', value['sourceTag'] + '^{tag}') == value['sourceTagObject'] and
-            git(source, 'rev-parse', value['sourceTagObject'] + '^{commit}') == value['sourceCommit'] and
-            git(source, 'rev-parse', value['sourceCommit'] + '^{tree}') == value['sourceTree'],
-            'mobile source tag/object/commit/tree differs')
-    require(git(source, 'rev-parse', 'HEAD') == value['sourceCommit'] and
-            not git(source, 'status', '--porcelain=v1', '--untracked-files=no'),
-            'source checkout must be exact and clean before mobile bind')
-    declared = value['declaredTagsSource']
-    require(declared['path'] == 'cmd/internal/build_libbox/main.go' and
-            sha((source / declared['path']).read_bytes()) == declared['sha256'], 'source-owned tags declaration differs')
-    # Only the fixed producer view may contain its generator-owned build outputs.
-    # The supplied source has no such exemption. Tracked changes always refuse.
-    ignored = git(source, 'ls-files', '--others', '--ignored', '--exclude-standard').splitlines()
-    # Go accepts Objective-C, C++, assembler, SWIG and Fortran as cgo inputs;
-    # go:embed can consume arbitrary data extensions. No ignored file is an
-    # admissible zero-overlay input in the isolated producer view.
-    untracked = git(source, 'ls-files', '--others', '--exclude-standard').splitlines()
-    unexpected = [name for name in ignored + untracked
-                  if not (generator_outputs and name.startswith('build/'))]
-    require(not unexpected, 'untracked ignored compiler/embed input is not a zero-overlay source')
     declaration = canonical(value)
-    result = subprocess.run(['node', Path(__file__).with_name('source-admission.mjs'), '--reviewed-source', source],
-                            input=declaration, env=git_environment(), capture_output=True, timeout=60)
+    command = ['node', SOURCE_ADMISSION, '--verify-checkout', source]
+    if generator_outputs:
+        command.append('--generator-outputs')
+    result = subprocess.run(command, input=declaration, env=git_environment(), capture_output=True, timeout=60)
     require(result.returncode == 0,
             result.stderr.decode(errors='replace').strip() or 'reviewed mobile source rejected')
-    return {'schema': 'polaris-mobile-source-observation-v1', 'sourceCommit': value['sourceCommit'],
-            'sourceTree': value['sourceTree'], 'sourceTag': value['sourceTag'],
-            'sourceTagObject': value['sourceTagObject'], 'sourceOverlay': 0,
-            'inputContractSha256': sha(declaration), 'artifactAcceptance': False,
-            'reviewedSource': json.loads(result.stdout)}
+    return decode(result.stdout)
+
+
+def prepare_source(source, value):
+    # Keep the production process group and native reservation owner. The
+    # runner has no stdin input; a bounded declaration uses its private slot.
+    from producer import run
+    raw = canonical(value)
+    require(len(raw) <= CONTRACT_MAX_BYTES, 'mobile input contract is too large')
+    parent = Path(source).absolute().parent
+    require(parent.resolve(strict=True) == parent, 'mobile declaration slot parent is redirected')
+    with tempfile.NamedTemporaryFile(dir=parent, prefix='.mobile-source-declaration-') as declaration:
+        declaration.write(raw)
+        declaration.flush()
+        command = ['node', SOURCE_ADMISSION, '--prepare-checkout', source, declaration.name]
+        return decode(run(command, env=git_environment()).encode())
 
 
 def binding_flags(authority, input_fingerprint):
