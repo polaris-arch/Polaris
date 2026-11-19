@@ -3410,7 +3410,7 @@ fn android_cold_uses_one_original_validation_and_exact_config_stem_under_held_wa
         .split("if warm {")
         .last()
         .unwrap()
-        .split("if !warm {")
+        .split("if !warm\n")
         .next()
         .unwrap();
     assert_eq!(warm.matches("check_config_for_tailscale(").count(), 1);

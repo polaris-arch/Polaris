@@ -237,8 +237,9 @@ internal class TransientLoginHostState(
             return
         }
         try {
+            val warm = ledger.isWarmLogin(nativeOwner.ticket)
             val enqueue: ((AndroidNativeAdmission.Ticket) -> Unit) -> Unit = { action ->
-                if (ledger.isWarmLogin(nativeOwner.ticket)) AndroidNativeValidation.enqueueWarm(ledger, nativeOwner.ticket, { queue(it) }, action)
+                if (warm) AndroidNativeValidation.enqueueWarm(ledger, nativeOwner.ticket, { queue(it) }, action)
                 else nativeOwner.enqueue({ queue(it) }) { validationTicket -> action(validationTicket) }
             }
             enqueue { validationTicket ->
@@ -287,7 +288,8 @@ internal class TransientLoginHostState(
                         else -> "FAILED"
                     }
                     report(stage, failure, reason)
-                    reply(startFailure(failure, "Android 独立登录失败 [$stage/$reason]"))
+                    val checkCode = if (stage == "check" && !warm) "TAILSCALE_LOGIN_CONFIG_CHECK_FAILED" else null
+                    reply(startFailure(failure, "Android 独立登录失败 [$stage/$reason]", checkCode))
                 } else reply(null)
             }
         } catch (error: Throwable) {
@@ -318,9 +320,9 @@ internal class TransientLoginHostState(
         close(entry) { reply(it?.let(::AndroidNativeFailure)) }
     }
 
-    private fun startFailure(error: Throwable, fallback: String): TransientLoginHost.GeneralFailure {
+    private fun startFailure(error: Throwable, fallback: String, fallbackCode: String? = null): TransientLoginHost.GeneralFailure {
         val failure = AndroidNativeFailure.from(error, fallback)
-        return TransientLoginHost.GeneralFailure(failure.message, failure.code)
+        return TransientLoginHost.GeneralFailure(failure.message, failure.code ?: fallbackCode)
     }
 
     /** Timers, retries and native callbacks retain this exact entry, never a later ID lookup. */

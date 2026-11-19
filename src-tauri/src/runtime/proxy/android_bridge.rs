@@ -1858,6 +1858,7 @@ pub(crate) enum SpeedtestStartError {
 #[derive(Debug)]
 pub(crate) enum LoginStartError {
     Failed(String),
+    ConfigurationCheckFailed,
     CapacityClosed(CapacityClosed),
     CleanupUnknown { capacity: Option<CapacityClosed> },
 }
@@ -2047,6 +2048,11 @@ pub(crate) async fn start_transient_login(
             return LoginStartError::CapacityClosed(capacity);
         }
         LoginStartError::Failed(match error {
+            BridgeCallError::Invoke(tauri::plugin::mobile::PluginInvokeError::InvokeRejected(
+                ref rejection,
+            )) if rejection.code.as_deref() == Some("TAILSCALE_LOGIN_CONFIG_CHECK_FAILED") => {
+                return LoginStartError::ConfigurationCheckFailed;
+            }
             BridgeCallError::Invoke(error) => {
                 format!("Android 独立登录桥拒绝: {}", invoke_error(&error).0)
             }

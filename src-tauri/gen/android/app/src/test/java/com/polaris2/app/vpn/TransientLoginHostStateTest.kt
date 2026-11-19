@@ -797,6 +797,7 @@ class TransientLoginHostStateTest {
             await(result.done)
             assertEquals(1, result.count.get())
             assertTrue(result.value.get() is TransientLoginHost.GeneralFailure)
+            assertEquals(if (failureAt == "prepare") "TAILSCALE_LOGIN_CONFIG_CHECK_FAILED" else null, result.value.get()?.code)
             assertFalse(f.host.running("login-A"))
             assertFalse(f.cache.exists())
             assertEquals(AndroidNativeAdmission.State.Unknown, f.ledger.state(f.ticket("login-A")))

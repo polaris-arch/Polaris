@@ -934,6 +934,8 @@ impl std::fmt::Display for ConfigCheckFailure {
     }
 }
 
+impl std::error::Error for ConfigCheckFailure {}
+
 /// 登录 URL 事件发射抽象。生产经 [`AppHandle`] 广播 `event:tailscaleAuthUrl`，测试捕获断言。
 pub trait AuthUrlEmitter: Send + Sync {
     /// 发射一条登录 URL 事件（URL 首次出现或发生变更时发）。
@@ -1320,12 +1322,11 @@ impl LoginCoreSpawner for AndroidLoginCoreSpawner {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_owned();
-        let failure = |message: String| SpawnError::Spawn {
+        let failure = |source| SpawnError::Spawn {
             bin: PathBuf::from("android-libbox"),
-            source: std::io::Error::other(message),
+            source,
         };
-        let config =
-            std::fs::read_to_string(&req.config).map_err(|error| failure(error.to_string()))?;
+        let config = std::fs::read_to_string(&req.config).map_err(failure)?;
         let mut child = AndroidLoginCoreChild {
             instance_id,
             config_digest: polaris_updater::sha256_hex(config.as_bytes()),
@@ -1342,7 +1343,13 @@ impl LoginCoreSpawner for AndroidLoginCoreSpawner {
             }
             Err(LoginStartError::Failed(message)) => {
                 child.closed = true;
-                return Err(failure(message));
+                return Err(failure(std::io::Error::other(message)));
+            }
+            Err(LoginStartError::ConfigurationCheckFailed) => {
+                child.closed = true;
+                return Err(failure(std::io::Error::other(
+                    ConfigCheckFailure::Rejected("Android 登录配置未通过内核检查".into()),
+                )));
             }
             Err(LoginStartError::CapacityClosed(error)) => {
                 child.closed = true;
@@ -4925,7 +4932,14 @@ impl LoginCoreRegistry {
                 return StartLoginOutcome::Failed(error);
             }
         }
-        if !warm {
+        // Android validates again under the native start reservation. A fresh browser attempt
+        // can rely on that check. Before replacing a live login, validate before cancelling it.
+        if !warm
+            && (!cfg!(target_os = "android")
+                || request.mode != LoginMode::Browser
+                || request.replace_identity
+                || self.shared.guard().contains_key(&server.id))
+        {
             tokio::select! {
                 () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
                 result = self.checker.check_for_spawn(&binary, &config_path) => match result {
@@ -5126,6 +5140,17 @@ impl LoginCoreRegistry {
                     crate::runtime::proxy::android_capacity::CapacityClosed::from_spawn(&error)
                 {
                     return StartLoginOutcome::AndroidCapacityClosed(capacity);
+                }
+                #[cfg(target_os = "android")]
+                if let SpawnError::Spawn { source, .. } = &error {
+                    if matches!(
+                        source
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<ConfigCheckFailure>()),
+                        Some(ConfigCheckFailure::Rejected(_))
+                    ) {
+                        return StartLoginOutcome::Failed("configurationCheckFailed".into());
+                    }
                 }
                 return StartLoginOutcome::Failed("processStartFailed".into());
             }
