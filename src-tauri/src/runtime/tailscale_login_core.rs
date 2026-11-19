@@ -437,6 +437,10 @@ pub trait LoginCoreSpawner: Send + Sync {
     /// **按值收请求**（与 [`SingBoxSpawner`] 同）：请求里的排空回调是 `FnOnce`，spawner 必须能
     /// 消费掉它。假 spawner 也一样要把自己那两条内存流喂给同一个回调，测试才走的是生产接线。
     async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError>;
+    #[cfg(any(target_os = "android", test))]
+    fn uses_android_start_bridge(&self) -> bool {
+        false
+    }
     /// Preparation has no OS effect and supplies no exit/no-child evidence.
     fn prepare_temp_native_birth(&self) -> Option<PreparedTempNativeBirth> {
         None
@@ -1290,9 +1294,23 @@ struct AndroidLoginCoreChild {
     start_failure: Option<StartLoginOutcome>,
 }
 
+#[cfg(any(target_os = "android", test))]
+struct AndroidLoginStartPending<'a>(&'a watch::Sender<bool>);
+
+#[cfg(any(target_os = "android", test))]
+impl Drop for AndroidLoginStartPending<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
 #[cfg(target_os = "android")]
 #[async_trait]
 impl LoginCoreSpawner for AndroidLoginCoreSpawner {
+    fn uses_android_start_bridge(&self) -> bool {
+        true
+    }
+
     async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
         use crate::runtime::proxy::android_bridge::{start_transient_login, LoginStartError};
 
@@ -2527,10 +2545,11 @@ impl LoginCoreRegistry {
             .cancel_matching_login(server_id, Some(attempt_id))
             .await?;
         #[cfg(any(target_os = "android", test))]
-        let closed = if !closed && attempt.is_some() {
-            // A cancelled Start may still be joining the native bridge. Acquire the
-            // publication gate before concluding that the original has no close owner.
-            drop(self.state_gate().await);
+        let closed = if let Some(original) = attempt.as_ref().filter(|_| !closed) {
+            // Only a dispatched Android Start can still publish an owner for this cancelled
+            // request. Join its handoff without waiting for state-gated credential work.
+            let mut pending = original.android_start_pending.subscribe();
+            let _ = pending.wait_for(|pending| !*pending).await;
             self.cancel_matching_login(server_id, Some(attempt_id))
                 .await?
         } else {
@@ -4888,21 +4907,34 @@ impl LoginCoreRegistry {
             #[cfg(target_os = "android")]
             android_authority: None,
         });
+        #[cfg(any(target_os = "android", test))]
+        let android_start = self
+            .spawner
+            .uses_android_start_bridge()
+            .then(|| AndroidLoginStartPending(&attempt.android_start_pending));
         let mut book_pending = || {
+            #[cfg(any(target_os = "android", test))]
+            if let Some(start) = &android_start {
+                start.0.send_replace(true);
+                // Before dispatch, Cancel either sees this handoff or we see its cancellation.
+                if attempt.cancelled() {
+                    return false;
+                }
+            }
             if let Some(entry) = pending_entry.take() {
                 self.shared.insert(server.id.clone(), entry);
                 config_guard.disarm();
                 attempt.process_owned.store(true, Ordering::SeqCst);
             }
+            true
         };
         let spawned = match producer_origin {
             None => {
                 let mut pending = self.spawner.spawn_with_temp_native_birth(req, prepared);
-                std::future::poll_fn(|context| {
-                    book_pending();
-                    pending.as_mut().poll(context)
-                })
-                .await
+                if !book_pending() {
+                    return StartLoginOutcome::Cancelled;
+                }
+                pending.as_mut().await
             }
             Some((proxy, generation)) => {
                 let mut pending = self.spawner.spawn_with_temp_native_birth(req, prepared);
@@ -4911,14 +4943,16 @@ impl LoginCoreRegistry {
                     if !admitted {
                         let Some(result) =
                             proxy.with_tailscale_credential_birth(generation, attempt, || {
-                                book_pending();
-                                pending.as_mut().poll(context)
+                                if !book_pending() {
+                                    return std::task::Poll::Ready(None);
+                                }
+                                pending.as_mut().poll(context).map(Some)
                             })
                         else {
                             return std::task::Poll::Ready(None);
                         };
                         admitted = true;
-                        return result.map(Some);
+                        return result;
                     }
                     // Pending may already own a desktop/native resource. Join this exact
                     // future; cancellation does not turn dropping it into terminal evidence.
@@ -4943,6 +4977,8 @@ impl LoginCoreRegistry {
         let mut child = match spawned {
             Ok(c) => c,
             Err(error) => {
+                #[cfg(any(target_os = "android", test))]
+                drop(android_start);
                 if let Some(native) = native {
                     let shared = self.shared.clone();
                     let server_id = server.id.clone();
@@ -5065,6 +5101,8 @@ impl LoginCoreRegistry {
         };
         config_guard.disarm();
         attempt.process_owned.store(true, Ordering::SeqCst);
+        #[cfg(any(target_os = "android", test))]
+        drop(android_start);
         #[cfg(any(target_os = "android", test))]
         if let Some(outcome) = start_failure {
             tokio::spawn(cleanup_failed_login_start(ctx, child, cancel_rx));

@@ -56,6 +56,8 @@ pub(crate) struct Attempt {
     pub server_id: String,
     pub claimed: AtomicBool,
     pub process_owned: AtomicBool,
+    #[cfg(any(target_os = "android", test))]
+    pub(super) android_start_pending: watch::Sender<bool>,
     cancel: watch::Sender<bool>,
     done: watch::Sender<bool>,
     progress: Mutex<Option<LoginProgressReceipt>>,
@@ -560,6 +562,8 @@ impl Attempts {
             server_id: server_id.into(),
             claimed: AtomicBool::new(false),
             process_owned: AtomicBool::new(false),
+            #[cfg(any(target_os = "android", test))]
+            android_start_pending: watch::channel(false).0,
             cancel,
             done,
             progress: Mutex::new(None),
@@ -605,6 +609,8 @@ impl Attempts {
                 server_id: server_id.into(),
                 claimed: AtomicBool::new(false),
                 process_owned: AtomicBool::new(false),
+                #[cfg(any(target_os = "android", test))]
+                android_start_pending: watch::channel(false).0,
                 cancel,
                 done,
                 progress: Mutex::new(None),

@@ -330,6 +330,10 @@ struct FailedNativeStart {
 
 #[async_trait]
 impl LoginCoreSpawner for Arc<FailedNativeStart> {
+    fn uses_android_start_bridge(&self) -> bool {
+        true
+    }
+
     async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
         prepared_artifacts(&request.config);
         if let Some((entered, release)) = &self.start_gate {
@@ -464,6 +468,7 @@ async fn cancel_during_failed_native_start_joins_publication_and_checks_close() 
     let config = sole_login_config(&user_data);
     let cache = login_cache_path(&config);
     let original = registry.prepared_attempt_for_test("ts1", "late-start");
+    assert!(*original.android_start_pending.borrow());
     let cancel = {
         let registry = registry.clone();
         tokio::spawn(async move { registry.cancel_attempt("ts1", "late-start").await })
@@ -481,6 +486,7 @@ async fn cancel_during_failed_native_start_joins_publication_and_checks_close() 
         launch.await.unwrap(),
         StartLoginOutcome::Failed(reason) if reason == "processStartFailed"
     ));
+    assert!(!*original.android_start_pending.borrow());
     assert!(registry.shared.contains("ts1"));
     assert!(config.is_file() && cache.is_file());
 
