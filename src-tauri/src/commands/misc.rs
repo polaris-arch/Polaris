@@ -14,9 +14,11 @@ pub use autostart::{auto_start_get_status, auto_start_set};
 #[cfg(target_os = "android")]
 pub(crate) use backup::android_backup_picker_plugin;
 pub use backup::{backup_export, backup_get_info, backup_import_apply, backup_import_pick};
-pub(crate) use dashboard::refresh_open_singbox_dashboard;
 pub use dashboard::{
     get_singbox_dashboard_connection, open_singbox_dashboard, refresh_singbox_dashboard,
+};
+pub(crate) use dashboard::{
+    observe_singbox_dashboard_close, refresh_open_singbox_dashboard, DASHBOARD_WINDOW_LABEL,
 };
 pub use ipinfo::ipinfo_get;
 pub(super) use ipinfo::run_bound_ipinfo;

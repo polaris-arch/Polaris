@@ -854,9 +854,10 @@ impl ProxyRuntime {
             .filter(|b| b.generation == self.gate.generation())
             .map(|b| b.api_epoch.borrow())
     }
-    pub(in crate::runtime::proxy) fn verified_runtime_api_endpoint(
+    fn with_verified_runtime_api_baseline<T>(
         &self,
-    ) -> Option<(String, u16, String)> {
+        read: impl FnOnce(&RuntimeConfigBaseline) -> Option<T>,
+    ) -> Option<T> {
         let baseline = self.runtime_config_baseline.read().ok()?;
         let b = baseline
             .as_ref()
@@ -864,9 +865,35 @@ impl ProxyRuntime {
         if b.api_epoch.is_closed() {
             return None;
         }
-        b.management
-            .as_ref()
-            .map(|e| (e.host.clone(), e.port, e.secret.clone()))
+        read(b)
+    }
+
+    pub(in crate::runtime::proxy) fn verified_runtime_api_endpoint(
+        &self,
+    ) -> Option<(String, u16, String)> {
+        self.with_verified_runtime_api_baseline(|b| {
+            let e = b.management.as_ref()?;
+            Some((e.host.clone(), e.port, e.secret.clone()))
+        })
+    }
+
+    /// The dashboard stays bound to one verified API listener, even across a same-port handoff.
+    pub(crate) fn verified_dashboard_endpoint(&self) -> Option<(Arc<ApiRelayEpoch>, u16, String)> {
+        let _publication = self.gate.lock_generation_publication();
+        if !self.core_running() {
+            return None;
+        }
+        self.with_verified_runtime_api_baseline(|b| {
+            let e = b.management.as_ref().filter(|e| !e.secret.is_empty())?;
+            Some((b.api_epoch.clone(), e.port, e.secret.clone()))
+        })
+    }
+
+    pub(crate) fn dashboard_epoch_is_current(&self, epoch: &Arc<ApiRelayEpoch>) -> bool {
+        let _publication = self.gate.lock_generation_publication();
+        self.core_running()
+            && self.with_verified_runtime_api_baseline(|b| Some(Arc::ptr_eq(&b.api_epoch, epoch)))
+                == Some(true)
     }
     pub(super) async fn confirm_runtime_api_handoff(
         self: &Arc<Self>,

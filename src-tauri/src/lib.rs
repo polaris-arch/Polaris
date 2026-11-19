@@ -1360,9 +1360,15 @@ pub fn run() {
         drop(single_instance_startup_gate);
     }
 
-    // RunEvent 循环：① macOS dock 图标重开 ② C1 退出清理（停核 + 清系统代理）。关窗语义仍由
-    // on_window_event + QuitState 决定，未改动；本回调只在**进程级真实退出**时兜安全清理。
+    // RunEvent 循环：记录面板关闭意图、处理 macOS Dock 图标重开，并在进程退出时清理网络状态。
     app.run(|app_handle, event| match event {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. },
+            ..
+        } if label == commands::misc::DASHBOARD_WINDOW_LABEL => {
+            commands::misc::observe_singbox_dashboard_close();
+        }
         // Android onResume / iOS willEnterForeground；iOS 仅唤醒新鲜 UIKit active 查询，不能据此准入。
         #[cfg(mobile)]
         tauri::RunEvent::WindowEvent {

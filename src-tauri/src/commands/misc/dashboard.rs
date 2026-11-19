@@ -1,32 +1,57 @@
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::response::ApiResponse;
+use crate::runtime::proxy::runtime_config::api_handoff::ApiRelayEpoch;
 use crate::runtime::AppRuntime;
 
 /// sing-box 官方面板内窗口 label（单例：已存在则聚焦复用，对齐 上游 `dashboardWindow`）。
-const DASHBOARD_WINDOW_LABEL: &str = "singbox-dashboard";
+pub(crate) const DASHBOARD_WINDOW_LABEL: &str = "singbox-dashboard";
 // The preload and navigation boundary are fixed at construction. Store no raw credential.
 static DASHBOARD_BINDING: tokio::sync::Mutex<Option<DashboardBinding>> =
     tokio::sync::Mutex::const_new(None);
+// Native CloseRequested advances this before Tauri releases the old window label.
+static DASHBOARD_CLOSE_REVISION: AtomicU64 = AtomicU64::new(0);
 
-#[derive(PartialEq, Eq)]
 struct DashboardBinding {
-    generation: u64,
+    epoch: Arc<ApiRelayEpoch>,
     preload_digest: String,
     language: &'static str,
+    close_revision: u64,
 }
 
 impl DashboardBinding {
-    fn new(generation: u64, script: &str, language: &'static str) -> Self {
+    fn new(
+        epoch: Arc<ApiRelayEpoch>,
+        script: &str,
+        language: &'static str,
+        close_revision: u64,
+    ) -> Self {
         Self {
-            generation,
+            epoch,
             preload_digest: polaris_updater::sha256_hex(script.as_bytes()),
             language,
+            close_revision,
         }
     }
+
+    fn matches_preload(&self, current: &Self) -> bool {
+        Arc::ptr_eq(&self.epoch, &current.epoch) && self.preload_digest == current.preload_digest
+    }
+
+    fn allows_refresh(&self, close_revision: u64) -> bool {
+        self.close_revision == close_revision
+    }
+}
+
+pub(crate) fn observe_singbox_dashboard_close() {
+    DASHBOARD_CLOSE_REVISION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// 上游 `OPEN_SINGBOX_DASHBOARD`：打开 sing-box 官方面板（应用内 webview 窗，dashboard #55）。
@@ -91,10 +116,16 @@ async fn reconcile_dashboard_window(
     let mut replacing = false;
     let (parsed, api_url, script, binding) = loop {
         let window = app.get_webview_window(DASHBOARD_WINDOW_LABEL);
-        if window.is_none() && !opening && !replacing {
+        let close_revision = DASHBOARD_CLOSE_REVISION.load(Ordering::Acquire);
+        if !opening
+            && (!active
+                .as_ref()
+                .is_some_and(|b| b.allows_refresh(close_revision))
+                || (window.is_none() && !replacing))
+        {
             return ApiResponse::ok(json!({ "ok": false }));
         }
-        let Some((generation, port, secret)) = app
+        let Some((epoch, port, secret)) = app
             .state::<AppRuntime>()
             .proxy()
             .verified_dashboard_endpoint()
@@ -108,11 +139,11 @@ async fn reconcile_dashboard_window(
             Err(e) => return ApiResponse::err(format!("面板 URL 非法：{e}")),
         };
         let script = build_dashboard_preload_script(&bare, &secret, language);
-        let binding = DashboardBinding::new(generation, &script, language);
+        let binding = DashboardBinding::new(epoch, &script, language, close_revision);
         let Some(win) = window else {
             break (parsed, api_url, script, binding);
         };
-        if active.as_ref() == Some(&binding) {
+        if active.as_ref().is_some_and(|b| b.matches_preload(&binding)) {
             if opening {
                 let _ = win.set_focus();
             }
@@ -123,7 +154,7 @@ async fn reconcile_dashboard_window(
         }
         replacing = true;
         // destroy queues the close. Wait until Tauri releases the label, then
-        // read the current Core endpoint again before building its replacement.
+        // recheck native CloseRequested and the current Core endpoint.
         if tokio::time::timeout(Duration::from_secs(2), async {
             while app.get_webview_window(DASHBOARD_WINDOW_LABEL).is_some() {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -137,6 +168,8 @@ async fn reconcile_dashboard_window(
     };
     // 仅允许停留在本地 api service 源（`http://127.0.0.1:<port>/…`）；跨源 http(s) 拦下。内部 scheme 放行。
     let allowed_prefix = format!("{api_url}/");
+    let navigation_app = app.clone();
+    let navigation_epoch = binding.epoch.clone();
     let mut builder =
         WebviewWindowBuilder::new(app, DASHBOARD_WINDOW_LABEL, WebviewUrl::External(parsed))
             .title("sing-box Dashboard")
@@ -151,6 +184,10 @@ async fn reconcile_dashboard_window(
                 let scheme = u.scheme();
                 if scheme == "http" || scheme == "https" {
                     u.as_str().starts_with(&allowed_prefix)
+                        && navigation_app
+                            .state::<AppRuntime>()
+                            .proxy()
+                            .dashboard_epoch_is_current(&navigation_epoch)
                 } else {
                     true // tauri:/about:/data: 等内部 scheme 放行
                 }
@@ -159,6 +196,14 @@ async fn reconcile_dashboard_window(
     // 面板加载的是外部 URL，但与主窗共用默认 data directory ⇒ 参数必须一致，否则关硬件加速后面板建不出来。
     if let Some(args) = crate::graphics_compat::webview_additional_browser_args() {
         builder = builder.additional_browser_args(args);
+    }
+    if (!opening && !binding.allows_refresh(DASHBOARD_CLOSE_REVISION.load(Ordering::Acquire)))
+        || !app
+            .state::<AppRuntime>()
+            .proxy()
+            .dashboard_epoch_is_current(&binding.epoch)
+    {
+        return ApiResponse::ok(json!({ "ok": false }));
     }
     match builder.build() {
         Ok(_) => {
@@ -205,8 +250,9 @@ fn build_dashboard_preload_script(bare_url: &str, secret: &str, lang: &str) -> S
     let legacy_lit =
         serde_json::to_string(&legacy_val.to_string()).unwrap_or_else(|_| "\"\"".into());
     let lang_lit = serde_json::to_string(lang).unwrap_or_else(|_| "\"en\"".into());
+    let origin_lit = json!(format!("http://{bare_url}"));
     format!(
-        "(function(){{try{{var ls=window.localStorage;if(!ls)return;\
+        "(function(){{try{{if(window.location.origin!=={origin_lit})return;var ls=window.localStorage;if(!ls)return;\
 ls.setItem('sing-box-dashboard.servers',{servers_lit});\
 ls.setItem('sing-box-dashboard.server',{legacy_lit});\
 if(!ls.getItem('sing-box-dashboard.language')){{ls.setItem('sing-box-dashboard.language',{lang_lit});}}\

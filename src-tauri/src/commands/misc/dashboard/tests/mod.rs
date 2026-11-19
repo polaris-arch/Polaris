@@ -55,6 +55,10 @@ fn dashboard_preload_script_injects_keys_and_escapes_secret() {
     assert!(s.contains("sing-box-dashboard.servers"));
     assert!(s.contains("sing-box-dashboard.server'"), "须写旧版迁移键");
     assert!(s.contains("sing-box-dashboard.language"));
+    let origin_check = s
+        .find("window.location.origin!==\"http://127.0.0.1:9090\"")
+        .unwrap();
+    assert!(origin_check < s.find("window.localStorage").unwrap());
 
     // 提取 servers setItem 的 JS 字面量 → 反序列化两层 → 校验 secret/url 完整无损。
     let marker = "ls.setItem('sing-box-dashboard.servers',";
@@ -71,14 +75,22 @@ fn dashboard_preload_script_injects_keys_and_escapes_secret() {
         payload["servers"][0]["secret"], evil_secret,
         "含引号/反斜杠的 secret 须原样无损（双重序列化防注入）"
     );
-    let current = DashboardBinding::new(1, &s, "zh-Hans");
-    assert!(current == DashboardBinding::new(1, &s, "zh-Hans"));
-    assert!(current != DashboardBinding::new(2, &s, "zh-Hans"));
+    let epoch = Arc::new(ApiRelayEpoch::default());
+    let current = DashboardBinding::new(epoch.clone(), &s, "zh-Hans", 1);
+    assert!(current.allows_refresh(1));
+    assert!(!current.allows_refresh(2));
+    assert!(current.matches_preload(&DashboardBinding::new(epoch.clone(), &s, "zh-Hans", 1)));
+    assert!(!current.matches_preload(&DashboardBinding::new(Arc::default(), &s, "zh-Hans", 1)));
     for next in [
         build_dashboard_preload_script("127.0.0.1:9091", evil_secret, "zh-Hans"),
         build_dashboard_preload_script("127.0.0.1:9090", "replacement", "zh-Hans"),
     ] {
-        assert!(current != DashboardBinding::new(1, &next, "zh-Hans"));
+        assert!(!current.matches_preload(&DashboardBinding::new(
+            epoch.clone(),
+            &next,
+            "zh-Hans",
+            1
+        )));
     }
 }
 
