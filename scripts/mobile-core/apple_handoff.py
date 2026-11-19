@@ -1,8 +1,4 @@
-"""Bounded same-run Apple handoff. Original receipts and paths are never rewritten.
-
-Separate hosted filesystems must expose the same canonical private root. A host
-with a different layout fails admission; this is not arbitrary-path relocation.
-"""
+"""Freeze and revalidate the same-run Apple handoff on the producer host."""
 import hashlib
 import json
 import os
@@ -12,7 +8,7 @@ import shutil
 import zipfile
 
 from artifacts import RECEIPT_POLICY, file_pin, read_receipt, receipt_digest, tree_inventory
-from fork_input import ROOT, decode, load, require
+from fork_input import ROOT, load, require
 from producer import lease, private_dir, producer_code, run, write_json
 
 SLOTS = ('device-arm64', 'sim-arm64')
@@ -190,95 +186,6 @@ def write_payload(archive, inventories, root, checkout):
                         shutil.copyfileobj(incoming, stream, 1024 ** 2)
 
 
-def restore_payload(archive, inventories, root, checkout):
-    """Create each owned parent explicitly; apply original directory modes last."""
-    directories = []
-    for namespace, rows in inventories.items():
-        require(namespace in ('root', 'checkout'), 'unknown handoff namespace')
-        base = root if namespace == 'root' else checkout
-        for name, row in sorted(rows.items(), key=lambda pair: (len(Path(pair[0]).parts), pair[0])):
-            dest = base / checked_relative(name)
-            if namespace == 'checkout':
-                require(checkout_member(name) or any(other.startswith(name + '/') and checkout_member(other)
-                        for other in rows), 'unexpected checkout handoff member')
-            for parent in dest.parents:
-                require(not parent.is_symlink(), 'handoff destination parent redirected')
-                if parent == base:
-                    break
-            if row.get('directory') is not True:
-                continue
-            require(set(row) == {'directory', 'mode'} and type(row['mode']) is int and 0 <= row['mode'] <= 0o777,
-                    'invalid directory row')
-            if namespace == 'root' and name in ('component', 'cache', 'tools', 'component/scratch'):
-                require(row['mode'] == 0o700, 'actual private owned slot mode differs')
-            info = archive.getinfo(namespace + '/' + name)
-            require(info.file_size == 0 and not info.flag_bits & 1 and
-                    stat.S_IFMT(info.external_attr >> 16) == stat.S_IFDIR and
-                    stat.S_IMODE(info.external_attr >> 16) == row['mode'], 'handoff directory member differs')
-            if dest.exists() or dest.is_symlink():
-                require(namespace == 'checkout' and not dest.is_symlink() and selected_row(dest, base) == row,
-                        'handoff directory occupied or original mode changed')
-            else:
-                require(dest.parent.is_dir(), 'handoff directory parent inventory missing')
-                dest.mkdir(mode=0o700)
-                dest.chmod(0o700)  # Explicitly defeat any caller umask.
-                directories.append((dest, row['mode']))
-    pending_links = []
-    for links in (False, True):
-        for namespace, rows in inventories.items():
-            base = root if namespace == 'root' else checkout
-            for name, row in rows.items():
-                if row.get('directory') is True or ('link' in row) != links:
-                    continue
-                dest = base / checked_relative(name)
-                require(dest.parent.is_dir() and not dest.parent.is_symlink(), 'handoff file parent inventory missing')
-                info = archive.getinfo(namespace + '/' + name)
-                require(not info.flag_bits & 1 and stat.S_IMODE(info.external_attr >> 16) == row['mode'] and
-                        stat.S_IFMT(info.external_attr >> 16) == (stat.S_IFLNK if links else stat.S_IFREG),
-                        'handoff member mode/kind differs')
-                if dest.exists() or dest.is_symlink():
-                    require(namespace == 'checkout' and not dest.is_symlink() and selected_row(dest, base) == row,
-                            'handoff destination occupied or original source changed')
-                    continue
-                if links:
-                    require(info.file_size <= 4096, 'handoff symlink target budget')
-                    target = archive.read(info).decode()
-                    require(target == row['link'] and not Path(target).is_absolute(),
-                            'handoff symlink escaped bound root')
-                    pending_links.append((dest, target, base, row['mode']))
-                else:
-                    require(info.file_size == row['bytes'], 'handoff member length differs')
-                    with archive.open(info) as source, dest.open('xb') as output:
-                        shutil.copyfileobj(source, output, 1024 ** 2)
-                    dest.chmod(row['mode'])
-    # Versioned frameworks contain Headers -> Versions/Current/Headers before
-    # Versions/Current -> A in the sorted inventory. Restore only links whose
-    # targets already exist; each pass must remove at least one dependency.
-    # No link is installed before strict containment succeeds. Missing targets
-    # and dependency cycles fail closed rather than becoming dangling links.
-    while pending_links:
-        unresolved = []
-        for dest, target, base, mode in pending_links:
-            try:
-                resolved = (dest.parent / target).resolve(strict=True)
-            except FileNotFoundError:
-                unresolved.append((dest, target, base, mode))
-                continue
-            require(resolved.is_relative_to(base.resolve(strict=True)),
-                    'handoff symlink escaped bound root')
-            dest.symlink_to(target)
-            if stat.S_IMODE(dest.lstat().st_mode) != mode:
-                dest.lchmod(mode)  # The link itself, never its framework target.
-        require(len(unresolved) < len(pending_links), 'handoff symlink dependency missing or cyclic')
-        pending_links = unresolved
-    for path, mode in reversed(directories):
-        path.chmod(mode)
-    for namespace, rows in inventories.items():
-        base = root if namespace == 'root' else checkout
-        for name, row in rows.items():
-            require(selected_row(base / name, base) == row, 'restored directory/file/link inventory differs')
-
-
 def component_members(receipt, component):
     paths = {component / 'component-receipt.json', component / 'original-bind.log'}
     paths.update(Path(p) for p in receipt['nativeInputs']['files'])
@@ -381,44 +288,8 @@ def freeze(root):
         write_json(root / 'component-transport.json', transport)
 
 
-def import_bundle(folder, root):
-    folder, root = Path(folder), private_dir(root)
-    transport = read_receipt(folder / 'component-transport.json')
-    require(transport.get('schema') == 'polaris-apple-handoff-transport-v1' and transport['context'] == context() and
-            transport['fingerprint'] == receipt_digest({k: v for k, v in transport.items() if k != 'fingerprint'}) and
-            transport_pin(folder / 'component-handoff.zip') == transport['archive'], 'handoff transport changed')
-    write_json(root / 'import-observation.json', {'schema': 'polaris-apple-import-observation-v1',
-               'context': context(), 'transport': transport, 'completed': False, 'devicePassed': False})
-    with zipfile.ZipFile(folder / 'component-handoff.zip') as archive:
-        infos = archive.infolist()
-        require(len(infos) <= MAX_FILES + 1 and len({i.filename for i in infos}) == len(infos) and
-                sum(i.file_size for i in infos) <= MAX_BYTES + 16 * 1024 ** 2, 'handoff archive bounds')
-        require(archive.getinfo('component-handoff.json').file_size <= 16 * 1024 ** 2,
-                'handoff manifest byte budget')
-        raw = archive.read('component-handoff.json')
-        require({'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()} == transport['manifest'],
-                'handoff manifest bytes differ')
-        facts = decode(raw, maximum=16 * 1024 ** 2)
-        validate_scope_record(facts, 'component-handoff')
-        require(facts['context'] == context() and facts['root'] == str(root.resolve()) and
-                facts['checkout'] == str(ROOT.resolve()), 'host layout/context differs before extraction')
-        expected = {namespace + '/' + name for namespace, rows in facts['files'].items() for name in rows}
-        require({i.filename for i in infos} == expected | {'component-handoff.json'}, 'extra/missing handoff members')
-        restore_payload(archive, facts['files'], root, ROOT)
-        (root / 'component-handoff.json').write_bytes(raw)
-        write_json(root / 'component-transport.json', transport)
-    validate_manifest(facts, root, ROOT)
-    with lease(private_dir(root / 'import-work'), private_dir(root / 'cache'), load()):
-        imported_paths = read_receipt(root / 'tools.json')['paths']
-        verify_import(Path(imported_paths['component-work']), root / 'cache', *(imported_paths[n]
-                      for n in ('source', 'go', 'gomobile', 'gobind', 'developer')), handoff_root=root)
-    write_json(root / 'import-observation.json', {'schema': 'polaris-apple-import-observation-v1',
-               'context': context(), 'transport': transport, 'completed': True, 'devicePassed': False})
-    return read_receipt(root / 'tools.json')
-
-
-def verify_import(component, cache, source, go, gomobile, gobind, developer, *, handoff_root=None):
-    root = Path(handoff_root or os.environ.get('POLARIS_FORMAL_APPLE_ROOT') or Path(component).parent)
+def verify_import(component, cache, source, go, gomobile, gobind, developer):
+    root = Path(os.environ.get('POLARIS_FORMAL_APPLE_ROOT') or Path(component).parent)
     facts = validate_manifest(read_receipt(root / 'component-handoff.json'), root, ROOT)
     paths = read_receipt(root / 'tools.json')['paths']
     actual = {'component-work': str(Path(component)), 'cache': str(Path(cache)), 'source': str(Path(source)),
@@ -434,8 +305,7 @@ def verify_import(component, cache, source, go, gomobile, gobind, developer, *, 
             receipt['input']['sourceContract'] == value and
             receipt['input']['tools']['executables'] == facts['tools'],
             'original producer receipt differs')
-    # Same source/tool result can be handed off, but this host must supply the
-    # same actual generator, SDK settings and compiler bytes, not merely a label.
+    # Reobserve the exact generator, SDK settings and compiler bytes.
     from producer import tool_facts
     from types import SimpleNamespace
     env = dict(os.environ, DEVELOPER_DIR=str(developer))

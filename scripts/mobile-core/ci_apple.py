@@ -268,23 +268,6 @@ def build():
         freeze(root)
 
 
-def import_carrier(folder):
-    root = location()
-    # Also enforce selection for direct invocation. Import's original-byte
-    # comparison remains authoritative, rather than trusting this admission.
-    selected_apple_tools(load())
-    from apple_handoff import import_bundle
-    with phase_timing('component-handoff-import'):
-        tools = import_bundle(folder, root)
-    paths = tools['paths']
-    private_dir(paths['rust-target'])
-    env = dict(os.environ, DEVELOPER_DIR=paths['developer'])
-    inspect_apple_architecture(root, env)
-    require(run(['rustc', '-vV']) == tools['rustc'], 'actual consumer Rust toolchain differs')
-    with Path(os.environ['GITHUB_ENV']).open('a') as stream:
-        stream.write('POLARIS_FORMAL_APPLE_ROOT=' + str(root) + '\nDEVELOPER_DIR=' + paths['developer'] + '\n')
-
-
 def import_local():
     """Revalidate this job's frozen producer; never extract over its originals."""
     from apple_handoff import verify_import, context
@@ -678,15 +661,11 @@ def retire_slot(slot):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import', 'import-local', 'carrier', 'evidence', 'retire-slot'])
-    parser.add_argument('--handoff', type=Path)
+    parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import-local', 'carrier', 'evidence', 'retire-slot'])
     parser.add_argument('--slot', choices=[slot for slot, _ in CARRIERS])
     args = parser.parse_args()
     required_slots()  # Reject unknown environment scope before work or evidence.
-    if args.action == 'import':
-        require(args.handoff is not None, 'handoff folder required')
-        import_carrier(args.handoff)
-    elif args.action == 'carrier':
+    if args.action == 'carrier':
         require(args.slot is not None, 'exact slot required')
         carrier(args.slot)
     elif args.action == 'evidence':
