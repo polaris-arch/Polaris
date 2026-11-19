@@ -1,6 +1,7 @@
 package com.polaris2.app.vpn
 
 import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Executor
@@ -73,12 +74,18 @@ class TransientLoginHostStateTest {
         var factoryFailure: Throwable? = null
         var parseFailure: Throwable? = null
         var parseAction: () -> Unit = {}
+        var resolved = true
+        var parsedDirectory = directory
         var configure: (FakeEngine) -> Unit = { }
         val host = TransientLoginHostState(
             ledger = ledger,
             queue = queue::submit,
             schedule = clock::schedule,
-            parseDirectories = { parseAction(); parseFailure?.let { throw it }; setOf(directory.canonicalPath) },
+            parseDirectories = {
+                parseAction()
+                parseFailure?.let { throw it }
+                TailscaleDirectoryClaims(setOf(parsedDirectory.canonicalPath), resolved)
+            },
             requireSupported = { },
             createEngine = { id, _, directories, stop ->
                 factoryFailure?.let { throw it }
@@ -516,9 +523,10 @@ class TransientLoginHostStateTest {
         val f = Fixture()
         val main = MainKernelAttempt<Any>()
         val directories = setOf(File(f.directory, "taildrop").canonicalPath)
+        val scope = runtimeScope(f.directory, 1)
         val login = start(f, "login-A")
         assertFalse(f.host.validateRuntimeDirectories(main, directories) { true })
-        assertFalse(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        assertFalse(f.host.claimRuntimeDirectories(main, scope, directories) { true })
         f.queue.runNext()
         assertNull(login.value.get())
         assertEquals(0, f.engine("login-A").closes.get())
@@ -526,24 +534,40 @@ class TransientLoginHostStateTest {
         f.engine("login-A").closeFailure = IllegalStateException("native close failed")
         close(f, "login-A")
         f.queue.runNext()
-        assertFalse(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        assertFalse(f.host.claimRuntimeDirectories(main, scope, directories) { true })
         assertEquals(1, f.engine("login-A").closes.get())
         f.engine("login-A").closeFailure = null
         f.clock.take(5_000).invoke()
         f.queue.runNext()
 
         assertTrue(f.host.validateRuntimeDirectories(main, directories) { true })
-        assertFalse(f.host.claimRuntimeDirectories(main, "resource-A", directories) { false })
-        assertTrue(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        assertFalse(f.host.claimRuntimeDirectories(main, scope, directories) { false })
+        assertFalse(f.host.claimRuntimeDirectories(main, scope, directories, retainScope = { false }) { true })
+        assertTrue(f.host.validateRuntimeDirectories(main, directories) { true })
+        assertTrue(f.host.claimRuntimeDirectories(main, scope, directories) { true })
         val blocked = start(f, "login-B")
         f.queue.runNext()
         assertTrue(blocked.value.get() is TransientLoginHost.GeneralFailure)
         assertFalse(f.engines.containsKey("login-B"))
-        assertTrue(f.host.releaseRuntimeDirectories(main, "resource-A"))
+        assertTrue(f.host.releaseRuntimeDirectories(main, scope))
         val next = start(f, "login-C")
         f.queue.runNext()
         assertNull(next.value.get())
         assertTrue(f.host.running("login-C"))
+    }
+
+    @Test fun unknownRuntimeHistoryRetentionKeepsTheOriginalDirectoryClaim() {
+        val f = Fixture()
+        val main = MainKernelAttempt<Any>()
+        val scope = runtimeScope(f.directory, 1)
+        val paths = setOf(f.directory.canonicalPath)
+        assertTrue(runCatching {
+            f.host.claimRuntimeDirectories(main, scope, paths, retainScope = { error("uncertain") }) { true }
+        }.isFailure)
+        assertFalse(f.host.validateRuntimeDirectories(main, paths) { true })
+        assertFalse(f.host.releaseRuntimeDirectories(main, scope.copy(runNonce = "d".repeat(64))))
+        assertTrue(f.host.releaseRuntimeDirectories(main, scope))
+        assertTrue(f.host.validateRuntimeDirectories(main, paths) { true })
     }
 
     @Test fun runtimeReleaseRetainsTheOriginalScopeAcrossMainCloseAndLateCallbacks() {
@@ -551,34 +575,63 @@ class TransientLoginHostStateTest {
         val original = MainKernelAttempt<Any>()
         val successor = MainKernelAttempt<Any>()
         val directories = setOf(f.directory.canonicalPath)
-        f.host.withMainConfig(original, "same-state-directory") {
-            assertTrue(f.host.claimRuntimeDirectories(original, "resource-A", directories) { true })
+        val scope = runtimeScope(f.directory, 1)
+        f.parsedDirectory = File(f.directory.parentFile, f.directory.name + "-cold")
+        f.host.withMainConfig(original, "separate-cold-directory") {
+            assertTrue(f.host.claimRuntimeDirectories(original, scope, directories) { true })
         }
-        assertFalse(f.host.claimRuntimeDirectories(original, "resource-B", directories) { true })
-        val adjacent = setOf(File(f.directory.parentFile, f.directory.name + "-sibling").canonicalPath)
-        assertTrue(f.host.claimRuntimeDirectories(original, "resource-B", adjacent) { true })
+        f.parsedDirectory = f.directory
+        assertTrue(runCatching { f.host.withMainConfig(original, "overlapping-whole-reload") { } }.isFailure)
+        assertFalse(f.host.claimRuntimeDirectories(original, scope.copy(resourceSequence = 2), directories) { true })
+        val adjacent = File(f.directory.parentFile, f.directory.name + "-sibling").canonicalFile
+        val siblingScope = runtimeScope(adjacent, 2).copy(configDigest = "c".repeat(64))
+        assertTrue(f.host.claimRuntimeDirectories(original, siblingScope, setOf(adjacent.path)) { true })
+        assertEquals(scope, f.host.observeRuntimeScope(original, scope.incarnation, scope.configDigest) { true })
+        assertNull(f.host.observeRuntimeScope(original, "other-incarnation", scope.configDigest) { true })
+        assertNull(f.host.observeRuntimeScope(original, scope.incarnation, scope.configDigest) { false })
+        assertNull(f.host.observeRuntimeScope(successor, scope.incarnation, scope.configDigest) { true })
+        assertFalse(f.host.releaseRuntimeDirectories(original, scope.copy(generation = scope.generation + 1)))
 
         original.revokeAndDetachTun()
-        assertFalse(f.host.claimRuntimeDirectories(original, "resource-C", setOf(f.cache.path)) { true })
+        assertFalse(f.host.claimRuntimeDirectories(original, runtimeScope(f.cache, 3), setOf(f.cache.path)) { true })
+        assertNull(f.host.observeRuntimeScope(original, scope.incarnation, scope.configDigest) { true })
         f.host.closeMain(original) { }
-        assertFalse(f.host.releaseRuntimeDirectories(successor, "resource-A"))
-        assertTrue(f.host.releaseRuntimeDirectories(original, "resource-B"))
+        assertFalse(f.host.releaseRuntimeDirectories(successor, scope))
+        assertTrue(f.host.releaseRuntimeDirectories(original, siblingScope))
         assertFalse(f.host.validateRuntimeDirectories(successor, directories) { true })
         assertTrue(runCatching { f.host.withMainConfig(successor, "same-state-directory") { } }.isFailure)
 
-        assertTrue(f.host.releaseRuntimeDirectories(original, "resource-A"))
-        assertTrue(f.host.claimRuntimeDirectories(successor, "resource-A", directories) { true })
-        assertFalse(f.host.releaseRuntimeDirectories(original, "resource-A"))
+        assertTrue(f.host.releaseRuntimeDirectories(original, scope))
+        assertTrue(f.host.claimRuntimeDirectories(successor, scope, directories) { true })
+        assertFalse(f.host.releaseRuntimeDirectories(original, scope))
         assertFalse(f.host.validateRuntimeDirectories(successor, directories) { true })
-        assertTrue(f.host.releaseRuntimeDirectories(successor, "resource-A"))
+        assertTrue(f.host.releaseRuntimeDirectories(successor, scope))
         assertTrue(f.host.validateRuntimeDirectories(successor, directories) { true })
+    }
+
+    @Test fun runtimeAdditionConflictsWithTheSameAttemptsCanonicalColdDirectory() {
+        val f = Fixture()
+        val main = MainKernelAttempt<Any>()
+        val alias = File(temporary.newFolder("aliases"), "old-state")
+        Files.createSymbolicLink(alias.toPath(), f.directory.toPath())
+        f.parsedDirectory = alias
+        f.host.withMainConfig(main, "cold-alias") {}
+        val scope = runtimeScope(f.directory, 1)
+        val actual = setOf(f.directory.canonicalPath)
+        assertFalse(f.host.validateRuntimeDirectories(main, actual) { true })
+        assertFalse(f.host.claimRuntimeDirectories(main, scope, actual) { true })
+        assertFalse(f.host.releaseRuntimeDirectories(main, scope))
+        f.host.withMainConfig(main, "same-cold-directory-reload") {}
     }
 
     @Test fun runtimeCallbacksDoNotWaitForTransientNativeStartup() {
         val f = Fixture()
         val main = MainKernelAttempt<Any>()
-        val directories = setOf(File(f.directory.parentFile, f.directory.name + "-sibling").canonicalPath)
-        assertTrue(f.host.claimRuntimeDirectories(main, "resource-A", directories) { true })
+        val directory = File(f.directory.parentFile, f.directory.name + "-sibling").canonicalFile
+        val directories = setOf(directory.path)
+        val original = runtimeScope(directory, 1)
+        val another = runtimeScope(directory, 2)
+        assertTrue(f.host.claimRuntimeDirectories(main, original, directories) { true })
         val entered = CountDownLatch(1)
         val finishStart = CountDownLatch(1)
         f.configure = { it.startAction = { entered.countDown(); await(finishStart) } }
@@ -587,8 +640,9 @@ class TransientLoginHostStateTest {
         try {
             await(entered)
             assertFalse(f.host.validateRuntimeDirectories(main, directories) { error("must fail at the lock") })
-            assertFalse(f.host.claimRuntimeDirectories(main, "resource-B", directories) { error("must fail at the lock") })
-            assertTrue(f.host.releaseRuntimeDirectories(main, "resource-A"))
+            assertFalse(f.host.claimRuntimeDirectories(main, another, directories) { error("must fail at the lock") })
+            assertNull(f.host.observeRuntimeScope(main, original.incarnation, original.configDigest) { error("must fail at the lock") })
+            assertTrue(f.host.releaseRuntimeDirectories(main, original))
             assertEquals(1L, finishStart.count)
         } finally {
             finishStart.countDown()
@@ -596,8 +650,58 @@ class TransientLoginHostStateTest {
         await(login.done)
         worker.join(2_000)
         assertNull(login.value.get())
-        assertTrue(f.host.claimRuntimeDirectories(main, "resource-B", directories) { true })
+        assertTrue(f.host.claimRuntimeDirectories(main, another, directories) { true })
     }
+
+    @Test fun unresolvedLegacyPathsCannotRunAlongsideRuntimeClaims() {
+        val f = Fixture()
+        val main = MainKernelAttempt<Any>()
+        val directory = File(f.directory.parentFile, f.directory.name + "-sibling").canonicalFile
+        val directories = setOf(directory.path)
+        val scope = runtimeScope(directory, 1)
+        f.resolved = false
+        f.host.withMainConfig(main, "legacy-config") {
+            assertFalse(f.host.claimRuntimeDirectories(main, scope, directories) { true })
+        }
+        f.host.closeMain(main) {}
+        val legacy = start(f, "legacy")
+        f.queue.runNext()
+        assertNull(legacy.value.get())
+        assertFalse(f.host.validateRuntimeDirectories(main, directories) { true })
+        close(f, "legacy")
+        f.queue.runNext()
+        assertTrue(f.host.claimRuntimeDirectories(main, scope, directories) { true })
+        assertTrue(runCatching { f.host.withMainConfig(main, "legacy-config") {} }.isFailure)
+        val blocked = start(f, "another-legacy")
+        f.queue.runNext()
+        assertTrue(blocked.value.get() is TransientLoginHost.GeneralFailure)
+        assertFalse(f.engines.containsKey("another-legacy"))
+    }
+
+    @Test fun runtimePathsRequireTheAppPrivateStateAndExplicitTaildrop() {
+        val root = temporary.newFolder("app-data").canonicalFile
+        val state = File(root, "polaris/tailscale/node").apply { check(mkdirs()) }
+        val taildrop = File(state, "Taildrop")
+        val paths = setOf(state.path, taildrop.path)
+        assertEquals(paths, AndroidRuntimeTailscaleBridge.controlledDirectories(root, state.path, taildrop.path))
+        val legacy = org.json.JSONObject().put("type", "tailscale").put("state_directory", state.path)
+        val config = org.json.JSONObject().put("endpoints", org.json.JSONArray().put(legacy))
+        assertEquals(TailscaleDirectoryClaims(setOf(state.path), false), TransientLoginHost.tailscaleDirectoryClaims(config.toString()))
+        legacy.put("taildrop_directory", taildrop.path)
+        assertEquals(TailscaleDirectoryClaims(paths), TransientLoginHost.tailscaleDirectoryClaims(config.toString()))
+
+        for (bad in listOf("", "Taildrop", File(root, "Taildrop").path, File(state, "../Taildrop").path)) {
+            assertNull(AndroidRuntimeTailscaleBridge.controlledDirectories(root, state.path, bad))
+        }
+        Files.createSymbolicLink(taildrop.toPath(), root.toPath())
+        assertNull(AndroidRuntimeTailscaleBridge.controlledDirectories(root, state.path, taildrop.path))
+        assertEquals(TailscaleDirectoryClaims(setOf(state.path, root.path)), TransientLoginHost.tailscaleDirectoryClaims(config.toString()))
+    }
+
+    private fun runtimeScope(directory: File, sequence: Long) = RuntimeTailscaleWriterScope(
+        "incarnation", sequence, 7, "a".repeat(64), "b".repeat(64), "ts-node", directory.path,
+        File(directory, "Taildrop").path,
+    )
 
     @Test fun mainClaimIsVisibleWhileMainJniBlocksAndStopCannotRestoreOldClaim() {
         val f = Fixture()

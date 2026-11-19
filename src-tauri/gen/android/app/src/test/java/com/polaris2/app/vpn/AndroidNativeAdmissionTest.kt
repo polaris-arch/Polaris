@@ -3,6 +3,7 @@ package com.polaris2.app.vpn
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -12,6 +13,114 @@ import org.junit.Test
 class AndroidNativeAdmissionTest {
     private fun bounded(limit: Int) = AndroidNativeAdmission("capacity-process", maxMetadataRecords = limit).also {
         it.bootstrap(RequiredMarkerProof.Absent)
+    }
+
+    @Test fun runtimeWriterHistoryRemainsWithItsExactBirthAndOriginalRelease() {
+        val ledger = bounded(20)
+        val main = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        val custody = ledger.bindTailscaleStore(main, "birth")
+        val writer = runtimeWriterScope(1)
+        assertFalse(ledger.retainRuntimeWriter(main, "birth", writer))
+        assertTrue(ledger.enterBirth(main))
+        var native = ScopedNativeFixture.export()
+        val cold = ScopedNativeFixture.run("c", "cold", listOf("cold"))
+        custody.invoke("cold", { native }) { native = ScopedNativeFixture.export(cold) }
+        val oldColdView = custody.wire().toString()
+        assertFalse(ledger.retainRuntimeWriter(main, "other-birth", writer))
+        assertTrue(ledger.retainRuntimeWriter(main, "birth", writer))
+        assertEquals(oldColdView, custody.wire().toString())
+        assertEquals(AndroidNativeAdmission.RuntimeWriterOutcome.Held, ledger.runtimeWriterHistory(main, "birth", writer)?.outcome)
+        assertFalse(ledger.retainRuntimeWriter(main, "birth", writer.copy(runNonce = "d".repeat(64))))
+        assertFalse(ledger.settleRuntimeWriter(main, "birth", writer.copy(generation = 8), true))
+
+        val successor = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "successor")
+        ledger.bindTailscaleStore(successor, "next-birth")
+        assertTrue(ledger.enterBirth(successor))
+        assertTrue(ledger.retainRuntimeWriter(successor, "next-birth", writer))
+        val noAcquisition = runtimeWriterScope(2)
+        assertTrue(ledger.retainRuntimeWriter(main, "birth", noAcquisition))
+        assertTrue(ledger.unknown(main))
+        ledger.seal("stop")
+        assertFalse(ledger.retainRuntimeWriter(main, "birth", runtimeWriterScope(3)))
+        assertTrue(ledger.settleRuntimeWriter(main, "birth", writer, true))
+        assertTrue(ledger.settleRuntimeWriter(main, "birth", noAcquisition, false))
+        assertFalse(ledger.settleRuntimeWriter(main, "birth", writer, false))
+        assertEquals(AndroidNativeAdmission.RuntimeWriterOutcome.ClosedConfirmed, ledger.runtimeWriterHistory(main, "birth", writer)?.outcome)
+        assertEquals(AndroidNativeAdmission.RuntimeWriterOutcome.NoAcquisition, ledger.runtimeWriterHistory(main, "birth", noAcquisition)?.outcome)
+        assertEquals(AndroidNativeAdmission.RuntimeWriterOutcome.Held, ledger.runtimeWriterHistory(successor, "next-birth", writer)?.outcome)
+        assertEquals(null, ledger.runtimeWriterHistory(successor, "birth", writer))
+
+        // A late export that omits the runtime writer cannot upgrade the old cold deletion proof.
+        custody.closed { ScopedNativeFixture.export(ScopedNativeFixture.retired(cold)) }
+        assertTrue(custody.wire().getBoolean("historyUnknown"))
+        assertEquals(null, custody.closedRelation(ScopedNativeFixture.file("cold")))
+        assertEquals(null, custody.closedRelation("${writer.stateDirectory}/tailscaled.state"))
+    }
+
+    @Test fun runtimeWriterHistoryReservesBoundedBytesWithoutEvictingClosedRows() {
+        val ledger = bounded(20)
+        val main = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        val sibling = ledger.reserveOwner(AndroidNativeAdmission.Kind.Login, "login")
+        ledger.bindTailscaleStore(main, "birth")
+        assertTrue(ledger.enterBirth(main))
+        assertTrue(ledger.admitScopedBytes(sibling, AndroidNativeAdmission.MAX_SCOPED_BYTES))
+        assertFalse(ledger.retainRuntimeWriter(main, "birth", runtimeWriterScope(1)))
+        assertEquals(null, ledger.runtimeWriterHistory(main, "birth", runtimeWriterScope(1)))
+        assertTrue(ledger.admitScopedBytes(sibling, 0))
+        for (sequence in 1..AndroidTailscaleStoreCustody.MAX_RUNS) {
+            val writer = runtimeWriterScope(sequence)
+            assertTrue(ledger.retainRuntimeWriter(main, "birth", writer))
+            assertTrue(ledger.settleRuntimeWriter(main, "birth", writer, false))
+        }
+        assertFalse(ledger.retainRuntimeWriter(main, "birth", runtimeWriterScope(AndroidTailscaleStoreCustody.MAX_RUNS + 1)))
+        assertEquals(AndroidNativeAdmission.RuntimeWriterOutcome.NoAcquisition,
+            ledger.runtimeWriterHistory(main, "birth", runtimeWriterScope(1))?.outcome)
+        assertFalse(ledger.admitScopedBytes(sibling, AndroidNativeAdmission.MAX_SCOPED_BYTES))
+    }
+
+    @Test fun terminalRuntimeHistoryReadsOnlyItsCompleteOriginalWireBinding() {
+        val ledger = bounded(20)
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "main")
+        ledger.bindTailscaleStore(ticket, "birth")
+        assertTrue(ledger.enterBirth(ticket))
+        val first = runtimeWriterScope(1).copy(resourceSequence = Long.MIN_VALUE, generation = -1L)
+        val second = runtimeWriterScope(2)
+        fun binding(scope: RuntimeTailscaleWriterScope) = JSONObject()
+            .put("contractVersion", "polaris-android-runtime-ts-writer-v1")
+            .put("processNonce", ledger.processNonce).put("nativeTicketId", ticket.id)
+            .put("runId", ticket.logicalId).put("birthNonce", "birth").put("scope", scope.json())
+        fun read(value: JSONObject) = AndroidRuntimeTailscaleBridge.readHistory(value, ledger)
+        val original = binding(first)
+        assertTrue(runCatching { read(original) }.isFailure)
+        assertTrue(ledger.retainRuntimeWriter(ticket, "birth", first))
+        assertTrue(ledger.retainRuntimeWriter(ticket, "birth", second))
+        assertTrue(runCatching { read(original) }.isFailure)
+        assertTrue(ledger.unknown(ticket))
+        assertTrue(ledger.settleRuntimeWriter(ticket, "birth", first, true))
+        assertTrue(ledger.settleRuntimeWriter(ticket, "birth", second, false))
+
+        val confirmed = read(original)
+        assertEquals("ClosedConfirmed", confirmed.getString("outcome"))
+        assertEquals(original.toString(), confirmed.getJSONObject("original").toString())
+        val scope = confirmed.getJSONObject("original").getJSONObject("scope")
+        assertEquals("9223372036854775808", scope.getString("resourceSequence"))
+        assertEquals("18446744073709551615", scope.getString("generation"))
+        assertEquals("NoAcquisition", read(binding(second)).getString("outcome"))
+
+        for (field in listOf("processNonce", "nativeTicketId", "runId", "birthNonce")) {
+            assertTrue(runCatching { read(binding(first).put(field, "wrong")) }.isFailure)
+        }
+        val wrongDirectory = binding(first.copy(taildropDirectory = "/different/Taildrop"))
+        assertTrue(runCatching { read(wrongDirectory) }.isFailure)
+        val wrongNumber = binding(first).also { it.getJSONObject("scope").put("generation", "018446744073709551615") }
+        assertTrue(runCatching { read(wrongNumber) }.isFailure)
+        assertTrue(runCatching { read(binding(first).put("extra", true)) }.isFailure)
+    }
+
+    private fun runtimeWriterScope(sequence: Int): RuntimeTailscaleWriterScope {
+        val directory = "/data/polaris/tailscale/node-$sequence"
+        return RuntimeTailscaleWriterScope("incarnation", sequence.toLong(), 7, sequence.toString(16).padStart(64, '0'),
+            "b".repeat(64), "ts-node-$sequence", directory, "$directory/Taildrop")
     }
 
     @Test fun metadataCountsOwnerOperationAndUnseenCloseAndClosesAtTheBoundary() {

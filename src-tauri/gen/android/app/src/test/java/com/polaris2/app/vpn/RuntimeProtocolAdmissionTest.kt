@@ -128,7 +128,7 @@ class RuntimeProtocolAdmissionTest {
         val ready = start.indexOf("state = ServiceState.Started")
         assertTrue(birth >= 0 && birth < admission && admission < ready)
         assertTrue(ready < start.indexOf("VpnBridge.finishStart(null"))
-        assertTrue(start.contains("check(runtimeAdmission != null)"))
+        assertTrue(start.contains("check(attempt.runtimeAdmission != null)"))
         assertTrue(start.contains("if (current) stopService(attempt)"))
         val reload = box.substringAfter("nativeReload = { server, config ->").substringBefore("setError =")
         assertTrue(reload.indexOf("startOrReloadServiceWithRetryableRuntimePersistence(") < reload.indexOf("admitRuntimeProtocol(attempt, server)"))
@@ -139,6 +139,6 @@ class RuntimeProtocolAdmissionTest {
             "MainKernelAttemptRegistry.isCurrent(attempt)", "server.runtimeCapabilities()")) assertTrue(guard, gate.contains(guard))
         assertFalse(gate.contains("BuildConfig.DEBUG"))
         assertFalse(gate.contains("stopService()"))
-        assertTrue(box.contains("runtimeAdmission?.identity?.incarnation == runtimeIncarnation"))
+        assertTrue(box.contains("attempt.runtimeAdmission?.identity?.incarnation == runtimeIncarnation"))
     }
 }

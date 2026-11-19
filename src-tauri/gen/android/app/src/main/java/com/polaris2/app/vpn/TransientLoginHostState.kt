@@ -5,6 +5,26 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import org.json.JSONObject
+
+internal data class TailscaleDirectoryClaims(val paths: Set<String>, val resolved: Boolean = true)
+
+internal data class RuntimeTailscaleWriterScope(
+    val incarnation: String,
+    val resourceSequence: Long,
+    val generation: Long,
+    val runNonce: String,
+    val configDigest: String,
+    val tag: String,
+    val stateDirectory: String,
+    val taildropDirectory: String,
+) {
+    fun json(): JSONObject = JSONObject().put("incarnation", incarnation)
+        .put("resourceSequence", resourceSequence.toULong().toString())
+        .put("generation", generation.toULong().toString()).put("runNonce", runNonce)
+        .put("configDigest", configDigest).put("tag", tag)
+        .put("stateDirectory", stateDirectory).put("taildropDirectory", taildropDirectory)
+}
 
 /** Shared production close stages. No lock or supplemental proof wait is added here. */
 internal class TransientHostCleanup(
@@ -41,7 +61,7 @@ internal class TransientLoginHostState(
     private val ledger: AndroidNativeAdmission,
     private val queue: (() -> Unit) -> Unit,
     private val schedule: (Long, () -> Unit) -> Unit,
-    private val parseDirectories: (String) -> Set<String>,
+    private val parseDirectories: (String) -> TailscaleDirectoryClaims,
     private val requireSupported: (String) -> Unit,
     private val createEngine: (String, String, Set<String>, () -> Unit) -> Engine,
     private val logFailure: (String, Throwable, String) -> Unit = { _, _, _ -> },
@@ -54,7 +74,7 @@ internal class TransientLoginHostState(
         /** Same operational native/network/cache cleanup as the production adapter. */
         fun close()
     }
-    private class Entry(val id: String, val stateDirectories: Set<String>, val nativeOwner: TransientLoginNativeOwner) {
+    private class Entry(val id: String, val directories: TailscaleDirectoryClaims, val nativeOwner: TransientLoginNativeOwner) {
         val cancelled: Boolean get() = nativeOwner.cancelled
         @Volatile var running = false
         var engine: Engine? = null
@@ -62,9 +82,9 @@ internal class TransientLoginHostState(
     }
     private val entries = mutableMapOf<String, Entry>()
     private val ownershipLock = ReentrantLock()
-    private val mainClaims = mutableMapOf<Any, Set<String>>()
+    private val mainClaims = mutableMapOf<Any, TailscaleDirectoryClaims>()
     private val mainClaimRevisions = mutableMapOf<Any, Long>()
-    private val runtimeClaims = ConcurrentHashMap<Pair<MainKernelAttempt<*>, String>, Set<String>>()
+    private val runtimeClaims = ConcurrentHashMap<Pair<MainKernelAttempt<*>, RuntimeTailscaleWriterScope>, Set<String>>()
 
     private fun overlaps(left: Set<String>, right: Set<String>): Boolean = left.any { first ->
         right.any { second ->
@@ -75,21 +95,36 @@ internal class TransientLoginHostState(
 
     /** The caller supplies canonical directories and a local check of the bound attempt and ticket. */
     fun validateRuntimeDirectories(owner: MainKernelAttempt<*>, directories: Set<String>, allowed: () -> Boolean): Boolean =
-        tryRuntimeClaim { canClaimRuntimeDirectories(owner, directories, allowed) }
+        tryRuntimeClaim { canClaimRuntimeDirectories(owner, directories, allowed) } == true
 
     fun claimRuntimeDirectories(
-        owner: MainKernelAttempt<*>, scopeId: String, directories: Set<String>, allowed: () -> Boolean,
+        owner: MainKernelAttempt<*>, scope: RuntimeTailscaleWriterScope, directories: Set<String>,
+        retainScope: () -> Boolean = { true }, allowed: () -> Boolean,
     ): Boolean = tryRuntimeClaim {
-        val key = owner to scopeId
+        val key = owner to scope
         check(!runtimeClaims.containsKey(key)) { "Android runtime Tailscale scope is already claimed" }
         if (!canClaimRuntimeDirectories(owner, directories, allowed)) return@tryRuntimeClaim false
         runtimeClaims[key] = directories.toSet()
+        // A definite admission refusal has no claim effect. An exception keeps this exact claim.
+        if (!retainScope()) {
+            runtimeClaims.remove(key)
+            return@tryRuntimeClaim false
+        }
         true
+    } == true
+
+    fun observeRuntimeScope(
+        owner: MainKernelAttempt<*>, incarnation: String, digest: String, allowed: (RuntimeTailscaleWriterScope) -> Boolean,
+    ): RuntimeTailscaleWriterScope? = tryRuntimeClaim {
+        val key = runtimeClaims.keys.singleOrNull { (attempt, scope) ->
+            attempt === owner && scope.incarnation == incarnation && scope.configDigest == digest
+        }
+        key?.second?.takeIf { !owner.revoked && allowed(it) && runtimeClaims.containsKey(key) }
     }
 
-    private inline fun tryRuntimeClaim(action: () -> Boolean): Boolean {
+    private inline fun <T> tryRuntimeClaim(action: () -> T): T? {
         // Transient startup and cleanup may hold this lock across JNI.
-        if (ownershipLock.isHeldByCurrentThread || !ownershipLock.tryLock()) return false
+        if (ownershipLock.isHeldByCurrentThread || !ownershipLock.tryLock()) return null
         try {
             return action()
         } finally {
@@ -99,27 +134,30 @@ internal class TransientLoginHostState(
 
     private fun canClaimRuntimeDirectories(
         owner: MainKernelAttempt<*>, directories: Set<String>, allowed: () -> Boolean,
-    ): Boolean = directories.isNotEmpty() && !owner.revoked && allowed() &&
-        mainClaims.none { (attempt, claim) -> attempt !== owner && overlaps(claim, directories) } &&
+    ): Boolean = directories.isNotEmpty() &&
+        mainClaims.values.none { !it.resolved || overlaps(it.paths, directories) } &&
         runtimeClaims.values.none { overlaps(it, directories) } &&
-        synchronized(entries) { entries.values.none { !it.disposed && overlaps(it.stateDirectories, directories) } }
+        synchronized(entries) { entries.values.none { !it.disposed && (!it.directories.resolved || overlaps(it.directories.paths, directories)) } } &&
+        !owner.revoked && allowed()
 
     /** A terminal release belongs to the original scope even after its attempt is revoked. */
-    fun releaseRuntimeDirectories(owner: MainKernelAttempt<*>, scopeId: String): Boolean =
-        runtimeClaims.remove(owner to scopeId) != null
+    fun releaseRuntimeDirectories(owner: MainKernelAttempt<*>, scope: RuntimeTailscaleWriterScope): Boolean =
+        runtimeClaims.remove(owner to scope) != null
 
     /** Claims precede core startup and survive failures until its actual close succeeds. */
     fun <T> withMainConfig(owner: MainKernelAttempt<*>, config: String, allowed: () -> Boolean = { true }, action: () -> T): T = synchronized(owner.operationLock) {
         val directories = parseDirectories(config)
         val revision = ownershipLock.withLock {
             check(allowed()) { "Android 主核生命周期已变化" }
-            check(runtimeClaims.none { (key, claim) -> key.first !== owner && overlaps(claim, directories) }) {
-                "Android Tailscale 端点已被旧主核持有"
+            check(runtimeClaims.values.none { !directories.resolved || overlaps(it, directories.paths) }) {
+                "Android Tailscale 端点已被运行时主核持有"
             }
             val next = (mainClaimRevisions[owner] ?: 0L) + 1L
             mainClaimRevisions[owner] = next
-            mainClaims[owner] = mainClaims[owner].orEmpty() + directories
-            val conflicts = synchronized(entries) { entries.values.filter { overlaps(it.stateDirectories, directories) } }
+            val previous = mainClaims[owner]
+            mainClaims[owner] = TailscaleDirectoryClaims(previous?.paths.orEmpty() + directories.paths,
+                (previous?.resolved ?: true) && directories.resolved)
+            val conflicts = synchronized(entries) { entries.values.filter { overlaps(it.directories.paths, directories.paths) } }
             for (entry in conflicts) {
                 entry.nativeOwner.cancel()
                 check(dispose(entry) == null) { "Android 旧登录实例尚未关闭" }
@@ -187,12 +225,12 @@ internal class TransientLoginHostState(
                 val failure = ownershipLock.withLock { runCatching {
                     if (!ledger.birthAllowed(entry.nativeOwner.ticket)) throw ledger.admissionRejection()
                     check(!entry.cancelled) { "Android 登录请求已取消" }
-                    check(mainClaims.values.none { overlaps(it, entry.stateDirectories) } &&
-                        runtimeClaims.values.none { overlaps(it, entry.stateDirectories) }) {
+                    check(mainClaims.values.none { overlaps(it.paths, entry.directories.paths) } &&
+                        runtimeClaims.values.none { !entry.directories.resolved || overlaps(it, entry.directories.paths) }) {
                         "Android Tailscale 端点已被主核持有"
                     }
                     val predecessors = synchronized(entries) {
-                        entries.values.filter { it !== entry && !it.disposed && overlaps(it.stateDirectories, entry.stateDirectories) }
+                        entries.values.filter { it !== entry && !it.disposed && overlaps(it.directories.paths, entry.directories.paths) }
                     }
                     for (previous in predecessors) {
                         previous.nativeOwner.cancel()
@@ -200,7 +238,7 @@ internal class TransientLoginHostState(
                         synchronized(entries) { if (entries[previous.id] === previous) entries.remove(previous.id) }
                     }
                     entry.nativeOwner.construct {
-                        val engine = createEngine(id, config, entry.stateDirectories) { close(entry) {} }
+                        val engine = createEngine(id, config, entry.directories.paths) { close(entry) {} }
                         entry.engine = engine
                         engine.bindTailscaleStore(entry.nativeOwner.bindTailscaleStore())
                         engine.prepare(validationTicket, { stage = it }, { entry.cancelled })

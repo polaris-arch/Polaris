@@ -22,7 +22,7 @@ internal object TransientLoginHost {
         ledger = AndroidNativeAdmissionGate.ledger,
         queue = { worker.execute(it) },
         schedule = { delay, action -> timer.schedule(action, delay, TimeUnit.MILLISECONDS); Unit },
-        parseDirectories = ::stateDirectories,
+        parseDirectories = ::tailscaleDirectoryClaims,
         requireSupported = SystemEndpointGuard::requireSupported,
         createEngine = { id, config, _, close -> LibboxEngine(id, config, close) },
         logFailure = { stage, failure, reason ->
@@ -39,15 +39,38 @@ internal object TransientLoginHost {
     fun running(id: String): Boolean = state.running(id)
     fun closeTailscale(binding: JSONObject, done: (AndroidNativeFailure?) -> Unit) = state.closeTailscale(binding, done)
 
-    private fun stateDirectories(config: String): Set<String> {
-        val endpoints = JSONObject(config).optJSONArray("endpoints") ?: return emptySet()
-        return (0 until endpoints.length()).mapNotNull { index ->
-            val endpoint = endpoints.optJSONObject(index) ?: return@mapNotNull null
-            if (endpoint.optString("type") != "tailscale") return@mapNotNull null
+    fun validateRuntimeDirectories(owner: MainKernelAttempt<*>, directories: Set<String>, allowed: () -> Boolean): Boolean =
+        state.validateRuntimeDirectories(owner, directories, allowed)
+    fun claimRuntimeDirectories(
+        owner: MainKernelAttempt<*>, scope: RuntimeTailscaleWriterScope, directories: Set<String>,
+        retainScope: () -> Boolean, allowed: () -> Boolean,
+    ): Boolean = state.claimRuntimeDirectories(owner, scope, directories, retainScope, allowed)
+    fun releaseRuntimeDirectories(owner: MainKernelAttempt<*>, scope: RuntimeTailscaleWriterScope): Boolean =
+        state.releaseRuntimeDirectories(owner, scope)
+    fun observeRuntimeScope(
+        owner: MainKernelAttempt<*>, incarnation: String, digest: String, allowed: (RuntimeTailscaleWriterScope) -> Boolean,
+    ): RuntimeTailscaleWriterScope? = state.observeRuntimeScope(owner, incarnation, digest, allowed)
+
+    internal fun tailscaleDirectoryClaims(config: String): TailscaleDirectoryClaims {
+        val endpoints = JSONObject(config).optJSONArray("endpoints")
+            ?: return TailscaleDirectoryClaims(emptySet())
+        val directories = mutableSetOf<String>()
+        var resolved = true
+        for (index in 0 until endpoints.length()) {
+            val endpoint = endpoints.optJSONObject(index) ?: continue
+            if (endpoint.optString("type") != "tailscale") continue
             val path = endpoint.optString("state_directory")
             check(path.isNotBlank()) { "Android Tailscale 状态目录不可为空" }
-            File(path).canonicalPath
-        }.toSet()
+            directories += File(path).canonicalPath
+            val taildrop = endpoint.optString("taildrop_directory")
+            // Core resolves its default and relative paths in its own working directory and expands variables.
+            if (!File(path).isAbsolute || '$' in path || !File(taildrop).isAbsolute || '$' in taildrop) {
+                resolved = false
+            } else {
+                directories += File(taildrop).canonicalPath
+            }
+        }
+        return TailscaleDirectoryClaims(directories, resolved)
     }
 
     private class LibboxEngine(private val id: String, config: String,

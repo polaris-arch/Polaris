@@ -73,6 +73,8 @@ internal class AndroidNativeAdmission(
     }
     enum class Kind { Main, Login, Speedtest, CheckConfig, TargetlessStop, TargetlessReload }
     enum class State { Reserved, BirthEntered, CancelledBeforeBirth, ClosedExact, Completed, Unknown, ValidationCleanupUnknown }
+    internal enum class RuntimeWriterOutcome { Held, ClosedConfirmed, NoAcquisition }
+    internal data class RuntimeWriterHistory(val scope: RuntimeTailscaleWriterScope, val outcome: RuntimeWriterOutcome)
     data class Ticket(val id: String, val kind: Kind, val logicalId: String)
     data class Entry(val ticket: Ticket, val state: State,
         internal val store: AndroidTailscaleStoreCustody? = null,
@@ -81,7 +83,9 @@ internal class AndroidNativeAdmission(
         internal val targetAction: Pair<String, String>? = null,
         internal val scopedCloseRequest: String? = null,
         internal val scopedBytes: Int = 0,
-        internal val warm: Warm? = null)
+        internal val warm: Warm? = null,
+        internal val runtimeWriters: Map<String, RuntimeWriterHistory> = emptyMap(),
+        internal val runtimeWriterBytes: Int = 0)
     internal class Warm(val tuple: JSONObject, val bytes: Int) {
         var claimed = false
         var registrationOpen = false
@@ -257,12 +261,72 @@ internal class AndroidNativeAdmission(
         revision++
     }
 
+    internal fun retainRuntimeWriter(ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope): Boolean {
+        val bytes = JSONObject().put("scope", scope.json()).put("outcome", RuntimeWriterOutcome.ClosedConfirmed.name)
+            .toString().toByteArray(Charsets.UTF_8).size
+        return synchronized(lock) {
+            val entry = runtimeMainEntryLocked(ticket, birthNonce) ?: return@synchronized false
+            if (entry.state != State.BirthEntered || fenceId != null || capacityClosed ||
+                entries.values.any { it.targetAction != null } ||
+                entry.runtimeWriters.size >= AndroidTailscaleStoreCustody.MAX_RUNS ||
+                entry.runtimeWriters.containsKey(scope.runNonce) ||
+                entry.runtimeWriters.values.any {
+                    it.scope.incarnation == scope.incarnation && it.scope.resourceSequence == scope.resourceSequence
+                } || bytes > MAX_SCOPED_BYTES - scopedBytesLocked()) return@synchronized false
+            val original = RuntimeWriterHistory(scope, RuntimeWriterOutcome.Held)
+            entries[ticket.id] = entry.copy(
+                runtimeWriters = entry.runtimeWriters + (scope.runNonce to original),
+                runtimeWriterBytes = entry.runtimeWriterBytes + bytes,
+            )
+            revision++
+            true
+        }
+    }
+
+    /** Retained by the original bound Entry even after the main attempt has stopped or been fenced. */
+    internal fun settleRuntimeWriter(
+        ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope, acquired: Boolean,
+    ): Boolean = synchronized(lock) {
+        val entry = runtimeMainEntryLocked(ticket, birthNonce) ?: return@synchronized false
+        val original = entry.runtimeWriters[scope.runNonce] ?: return@synchronized false
+        if (original.scope != scope || original.outcome != RuntimeWriterOutcome.Held) return@synchronized false
+        val outcome = if (acquired) RuntimeWriterOutcome.ClosedConfirmed else RuntimeWriterOutcome.NoAcquisition
+        entries[ticket.id] = entry.copy(runtimeWriters = entry.runtimeWriters + (scope.runNonce to original.copy(outcome = outcome)))
+        revision++
+        true
+    }
+
+    internal fun runtimeWriterHistory(
+        ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope,
+    ): RuntimeWriterHistory? = synchronized(lock) {
+        runtimeWriterHistoryLocked(ticket, birthNonce, scope)
+    }
+
+    internal fun terminalRuntimeWriterHistory(
+        ticketId: String, runId: String, birthNonce: String, scope: RuntimeTailscaleWriterScope,
+    ): RuntimeWriterHistory? = synchronized(lock) {
+        val ticket = entries[ticketId]?.ticket?.takeIf { it.logicalId == runId } ?: return@synchronized null
+        runtimeWriterHistoryLocked(ticket, birthNonce, scope)?.takeIf { it.outcome != RuntimeWriterOutcome.Held }
+    }
+
+    internal fun hasRuntimeStoreHistory(ticket: Ticket, birthNonce: String): Boolean = synchronized(lock) {
+        runtimeMainEntryLocked(ticket, birthNonce)?.runtimeWriters?.values?.any { it.outcome != RuntimeWriterOutcome.NoAcquisition } == true
+    }
+
+    private fun runtimeMainEntryLocked(ticket: Ticket, birthNonce: String): Entry? =
+        entries[ticket.id]?.takeIf { it.ticket === ticket && ticket.kind == Kind.Main && it.store?.birthNonce == birthNonce }
+
+    private fun runtimeWriterHistoryLocked(ticket: Ticket, birthNonce: String, scope: RuntimeTailscaleWriterScope): RuntimeWriterHistory? =
+        runtimeMainEntryLocked(ticket, birthNonce)?.runtimeWriters?.get(scope.runNonce)?.takeIf { it.scope == scope }
+
+    private fun scopedBytesLocked() = entries.values.sumOf { it.scopedBytes + it.runtimeWriterBytes }
+
     /** A bounded attachment may stay Unknown; existing owner/census records are never evicted. */
     internal fun admitScopedBytes(ticket: Ticket, bytes: Int): Boolean = synchronized(lock) {
         val entry = checkNotNull(entries[ticket.id])
         check(entry.ticket == ticket)
         val total = bytes.toLong() + (entry.warm?.bytes ?: 0)
-        if (bytes < 0 || total > MAX_SCOPED_BYTES - entries.values.sumOf { it.scopedBytes } + entry.scopedBytes) return@synchronized false
+        if (bytes < 0 || total > MAX_SCOPED_BYTES - scopedBytesLocked() + entry.scopedBytes) return@synchronized false
         entries[ticket.id] = entry.copy(scopedBytes = total.toInt())
         true
     }
@@ -408,7 +472,7 @@ internal class AndroidNativeAdmission(
         val rows = targetRowsLocked(file)
         check(rows.toString().toByteArray(Charsets.UTF_8).size <= AndroidTailscaleStoreCustody.MAX_BYTES)
         val bytes = tuple.toString().toByteArray(Charsets.UTF_8).size
-        check(bytes <= AndroidTailscaleStoreCustody.MAX_BYTES && bytes <= MAX_SCOPED_BYTES - entries.values.sumOf { it.scopedBytes })
+        check(bytes <= AndroidTailscaleStoreCustody.MAX_BYTES && bytes <= MAX_SCOPED_BYTES - scopedBytesLocked())
         requireCapacityLocked(3)
         val ticket = reserve(Kind.Login, id, owner = true)
         val warm = Warm(JSONObject(tuple.toString()), bytes)
@@ -676,11 +740,13 @@ internal class AndroidTailscaleStoreCustody internal constructor(
         val parsed = raw?.let { runCatching { parseRuns(it) }.getOrNull() }
         val nativeComplete = raw?.let { runCatching { terminalComplete(it) }.getOrDefault(false) } == true
         val censusComplete = raw?.let { runCatching { censusComplete(it) }.getOrDefault(false) } == true
+        val runtimeStoreHistory = ledger.hasRuntimeStoreHistory(ticket, birthNonce)
         val originalRuns = synchronized(this) { runs }
         val admitted = raw != null && raw.toByteArray(Charsets.UTF_8).size <= MAX_BYTES &&
             snapshotBytes(raw, originalRuns, synchronized(this) { currentDigest }, true)?.let { ledger.admitScopedBytes(ticket, it) } == true
         synchronized(this) {
-            if (parsed == null || runs.isEmpty() || !sameRuns(parsed, runs)) unknown = true
+            // A runtime child is a separate immutable scope, not a replacement whole-configuration run.
+            if (runtimeStoreHistory || parsed == null || runs.isEmpty() || !sameRuns(parsed, runs)) unknown = true
             if (admitted) payload = checkNotNull(raw)
             else unknown = true
             terminal = true
@@ -727,6 +793,7 @@ internal class AndroidTailscaleStoreCustody internal constructor(
 
     companion object {
         const val MAX_BYTES = 1_048_576
+        internal const val MAX_RUNS = 256
         internal val KNOWN_WRITERS = setOf("SealedDrained", "NoStoreConstruction")
         fun digest(config: String): String = MessageDigest.getInstance("SHA-256")
             .digest(config.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
@@ -754,7 +821,7 @@ internal class AndroidTailscaleStoreCustody internal constructor(
             val root = JSONObject(raw)
             check(root.getString("contractVersion") == "polaris-ts-auth-writer-retirement-v1" && root.getString("globalCleanupEvidence") == "CleanupUnknown")
             val instances = root.getJSONArray("instances")
-            check(instances.length() <= 256)
+            check(instances.length() <= MAX_RUNS)
             return (0 until instances.length()).map { index ->
                 val instance = instances.getJSONObject(index)
                 Run(instance.getString("runNonce"), instance.getString("configDigest"), scopes(instance.getJSONArray("nodes")))

@@ -1,0 +1,178 @@
+package com.polaris2.app.vpn
+
+import io.nekohasekai.libbox.CommandServer
+import java.io.File
+import java.io.IOException
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
+import java.lang.reflect.Proxy
+import org.json.JSONObject
+
+/** Typed Go V1 registration. An older selected libbox keeps its cold-only Tailscale path. */
+internal object AndroidRuntimeTailscaleBridge {
+    private const val CONTRACT = "polaris-android-runtime-ts-writer-v1"
+    private const val LIBBOX = "io.nekohasekai.libbox"
+    private val hex64 = Regex("[0-9a-f]{64}")
+
+    fun register(server: CommandServer, owner: MainKernelAttempt<CommandServer>, dataDir: File, current: () -> Boolean) {
+        val setter = server.javaClass.methods.singleOrNull {
+            it.name == "setRuntimeTailscalePlatform" && it.parameterTypes.size == 1
+        } ?: return
+        val platform = setter.parameterTypes.single()
+        check(platform.isInterface && platform.name == "$LIBBOX.RuntimeTailscalePlatform")
+        val claim = platform.methods.single { it.name == "claimRuntimeTailscale" }
+        val scopeType = claim.parameterTypes.single()
+        check(scopeType.name == "$LIBBOX.RuntimeTailscaleScope" && claim.returnType == Boolean::class.javaPrimitiveType)
+        val release = platform.getMethod("releaseRuntimeTailscale", scopeType, Boolean::class.javaPrimitiveType)
+        val validate = platform.getMethod("validateRuntimeTailscale", String::class.java, String::class.java, String::class.java)
+        val version = platform.getMethod("runtimeTailscaleVersion")
+        check(release.returnType == Void.TYPE && validate.returnType == Boolean::class.javaPrimitiveType &&
+            version.returnType == Int::class.javaPrimitiveType)
+        val readScope = scopeReader(scopeType)
+        val ticket = checkNotNull(owner.nativeTicket)
+        val ledger = AndroidNativeAdmissionGate.ledger
+        fun currentIncarnation(): String? = if (current() && isCurrent(owner, ticket, ledger)) {
+            owner.runtimeAdmission?.identity?.incarnation
+        } else null
+
+        val proxy = Proxy.newProxyInstance(platform.classLoader, arrayOf(platform)) { receiver, method, arguments ->
+            val args = arguments.orEmpty()
+            when (method) {
+                version -> 1
+                validate -> runCatching {
+                    val tag = args[0] as String
+                    val incarnation = currentIncarnation() ?: return@runCatching false
+                    if (!validTag(tag)) return@runCatching false
+                    val paths = controlledDirectories(dataDir, args[1] as String, args[2] as String) ?: return@runCatching false
+                    TransientLoginHost.validateRuntimeDirectories(owner, paths) { currentIncarnation() == incarnation }
+                }.getOrDefault(false)
+                claim -> {
+                    val scope = readScope(checkNotNull(args[0]))
+                    val paths = if (validScope(scope)) controlledDirectories(dataDir, scope.stateDirectory, scope.taildropDirectory)
+                        else null
+                    paths != null && TransientLoginHost.claimRuntimeDirectories(owner, scope, paths,
+                        retainScope = { ledger.retainRuntimeWriter(ticket, owner.birthNonce, scope) },
+                        allowed = { currentIncarnation() == scope.incarnation })
+                }
+                release -> {
+                    // Both certified no-acquisition and joined original Close release only their exact claim.
+                    val scope = readScope(checkNotNull(args[0]))
+                    val acquired = args[1] as Boolean
+                    check(TransientLoginHost.releaseRuntimeDirectories(owner, scope)) {
+                        "Android runtime Tailscale release did not match its original claim"
+                    }
+                    check(ledger.settleRuntimeWriter(ticket, owner.birthNonce, scope, acquired)) {
+                        "Android runtime Tailscale release did not match its original history"
+                    }
+                    null
+                }
+                else -> when (method.name) {
+                    "equals" -> receiver === args[0]
+                    "hashCode" -> System.identityHashCode(receiver)
+                    "toString" -> "PolarisRuntimeTailscaleV1"
+                    else -> error("Android runtime Tailscale method is unknown")
+                }
+            }
+        }
+        invoke(server, setter, proxy)
+    }
+
+    fun observe(attempt: MainKernelAttempt<*>, digest: String): JSONObject {
+        val ledger = AndroidNativeAdmissionGate.ledger
+        val ticket = checkNotNull(attempt.nativeTicket)
+        val identity = checkNotNull(attempt.runtimeAdmission?.identity)
+        check(hex64.matches(digest))
+        val scope = checkNotNull(TransientLoginHost.observeRuntimeScope(attempt, identity.incarnation, digest) { original ->
+            isCurrent(attempt, ticket, ledger) && attempt.runtimeAdmission?.identity?.incarnation == identity.incarnation &&
+                ledger.runtimeWriterHistory(ticket, attempt.birthNonce, original)?.outcome == AndroidNativeAdmission.RuntimeWriterOutcome.Held
+        })
+        return receipt(ledger.processNonce, ticket.id, attempt.runId, attempt.birthNonce, scope)
+    }
+
+    /** Reads only a retained terminal callback on the original Entry, including after registry release. */
+    fun readHistory(binding: JSONObject, ledger: AndroidNativeAdmission): JSONObject {
+        check(binding.keys().asSequence().toSet() == setOf("contractVersion", "processNonce", "nativeTicketId", "runId", "birthNonce", "scope"))
+        check(binding.get("contractVersion") == CONTRACT && binding.get("processNonce") == ledger.processNonce)
+        val ticketId = binding.get("nativeTicketId") as String
+        val runId = binding.get("runId") as String
+        val birthNonce = binding.get("birthNonce") as String
+        val scope = decodeScope(binding.getJSONObject("scope"))
+        val original = checkNotNull(ledger.terminalRuntimeWriterHistory(ticketId, runId, birthNonce, scope))
+        return JSONObject().put("original", receipt(ledger.processNonce, ticketId, runId, birthNonce, original.scope))
+            .put("outcome", original.outcome.name)
+    }
+
+    private fun receipt(processNonce: String, ticketId: String, runId: String, birthNonce: String, scope: RuntimeTailscaleWriterScope): JSONObject =
+        JSONObject().put("contractVersion", CONTRACT).put("processNonce", processNonce).put("nativeTicketId", ticketId)
+            .put("runId", runId).put("birthNonce", birthNonce).put("scope", scope.json())
+
+    private fun isCurrent(attempt: MainKernelAttempt<*>, ticket: AndroidNativeAdmission.Ticket, ledger: AndroidNativeAdmission): Boolean =
+        !attempt.revoked && attempt.nativeTicket === ticket && attempt.tailscaleStore?.ticket === ticket &&
+            MainKernelAttemptRegistry.isCurrent(attempt) && ledger.state(ticket) == AndroidNativeAdmission.State.BirthEntered
+
+    private fun validScope(scope: RuntimeTailscaleWriterScope): Boolean =
+        scope.incarnation.isNotBlank() && scope.incarnation.length <= 256 && scope.resourceSequence != 0L &&
+            scope.generation != 0L && hex64.matches(scope.runNonce) && hex64.matches(scope.configDigest) && validTag(scope.tag)
+
+    private fun validTag(tag: String) = tag.isNotBlank() && tag.length <= 512 && tag.none(Char::isISOControl)
+
+    private fun decodeScope(value: JSONObject): RuntimeTailscaleWriterScope {
+        check(value.keys().asSequence().toSet() == setOf("incarnation", "resourceSequence", "generation",
+            "runNonce", "configDigest", "tag", "stateDirectory", "taildropDirectory"))
+        fun text(key: String) = value.get(key) as String
+        fun unsigned(key: String): Long {
+            val wire = text(key)
+            val parsed = checkNotNull(wire.toULongOrNull())
+            check(parsed.toString() == wire)
+            return parsed.toLong()
+        }
+        return RuntimeTailscaleWriterScope(text("incarnation"), unsigned("resourceSequence"), unsigned("generation"),
+            text("runNonce"), text("configDigest"), text("tag"), text("stateDirectory"), text("taildropDirectory"))
+            .also { check(validScope(it)) }
+    }
+
+    internal fun controlledDirectories(dataDir: File, stateDirectory: String, taildropDirectory: String): Set<String>? {
+        if (stateDirectory.length > 4096 || taildropDirectory.length > 4096 ||
+            '$' in stateDirectory || '$' in taildropDirectory) return null
+        val state = File(stateDirectory)
+        val taildrop = File(taildropDirectory)
+        val id = state.name
+        if (id.isEmpty() || id in setOf(".", "..") || id.toByteArray(Charsets.UTF_8).size > 255 ||
+            id.any { it.isISOControl() || it == '\\' || it == ':' }) return null
+        val relative = "polaris/tailscale/$id"
+        return try {
+            val canonical = File(dataDir.canonicalFile, relative)
+            val canonicalTaildrop = File(canonical, "Taildrop")
+            if ((state != File(dataDir, relative) && state != canonical) || taildrop != File(state, "Taildrop") ||
+                state.canonicalFile != canonical || taildrop.canonicalFile != canonicalTaildrop) null
+            else setOf(canonical.path, canonicalTaildrop.path)
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    /** Snapshot immutable Go getters into exact Kotlin value equality; never retain the generated proxy as a key. */
+    private fun scopeReader(type: Class<*>): (Any) -> RuntimeTailscaleWriterScope {
+        val incarnation = type.getMethod("incarnation")
+        val sequence = type.getMethod("resourceSequence")
+        val generation = type.getMethod("generation")
+        val nonce = type.getMethod("runNonce")
+        val digest = type.getMethod("configDigest")
+        val tag = type.getMethod("tag")
+        val state = type.getMethod("stateDirectory")
+        val taildrop = type.getMethod("taildropDirectory")
+        return { raw ->
+            RuntimeTailscaleWriterScope(
+                invoke(raw, incarnation) as String, invoke(raw, sequence) as Long, invoke(raw, generation) as Long,
+                invoke(raw, nonce) as String, invoke(raw, digest) as String, invoke(raw, tag) as String,
+                invoke(raw, state) as String, invoke(raw, taildrop) as String,
+            )
+        }
+    }
+
+    private fun invoke(receiver: Any, method: Method, vararg args: Any?): Any? = try {
+        method.invoke(receiver, *args)
+    } catch (failure: InvocationTargetException) {
+        throw failure.targetException
+    }
+}

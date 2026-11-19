@@ -228,6 +228,12 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
                             checkNotNull(attempt.tailscaleStore).wire()
                         }
                     }
+                    "observeRuntimeMain" -> {
+                        val attempt = checkNotNull(MainKernelAttemptRegistry.ownerForDrain()).attempt
+                        check(args.runId == attempt.runId && args.birthNonce == attempt.birthNonce)
+                        AndroidRuntimeTailscaleBridge.observe(attempt, checkNotNull(args.expectedActualConfigDigest))
+                    }
+                    "readRuntimeMainHistory" -> AndroidRuntimeTailscaleBridge.readHistory(originalNativeBinding(), ledger)
                     "readMain", "readLogin" -> checkNotNull(ledger.readTailscaleOwner(originalNativeBinding())).also {
                         check(it.getString("producerKind") == if (args.operation == "readMain") "Main" else "Login")
                     }

@@ -28,6 +28,8 @@ internal class MainKernelAttempt<Server>(
     val birthNonce: String = UUID.randomUUID().toString()
     @Volatile var tailscaleStore: AndroidTailscaleStoreCustody? = null
         private set
+    /** Published only after this attempt's current native incarnation passes protocol admission. */
+    @Volatile var runtimeAdmission: RuntimeProtocolAdmission? = null
 
     fun bindTailscaleStore(ledger: AndroidNativeAdmission): AndroidTailscaleStoreCustody = synchronized(operationLock) {
         tailscaleStore ?: ledger.bindTailscaleStore(checkNotNull(nativeTicket), birthNonce).also { tailscaleStore = it }

@@ -107,8 +107,6 @@ class BoxService(
     @Volatile private var nativeTunBridge: AndroidNativeTunBridge? = null
     private var receiverRegistered = false
     private var runtimePersistenceEpoch = 0L
-    // Replaced only after this exact server/epoch passes the post-Start protocol gate.
-    private var runtimeAdmission: RuntimeProtocolAdmission? = null
 
     private val stopReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -302,7 +300,7 @@ class BoxService(
             val acknowledged = synchronized(this) {
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
                 check(mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting) { "起核已被停核接管" }
-                check(runtimeAdmission != null) { "runtime protocol was not admitted" }
+                check(attempt.runtimeAdmission != null) { "runtime protocol was not admitted" }
                 fun acknowledge(): Boolean {
                     attempt.acknowledgeStart()
                     if (bridgeConfig != null) NativeReconnectNotice.clear(service)
@@ -471,7 +469,7 @@ class BoxService(
             check(current() && mainAttempt === attempt && commandServer === server &&
                 runtimePersistenceEpoch == epoch && !attempt.revoked &&
                 MainKernelAttemptRegistry.isCurrent(attempt)) { "runtime admission receipt was superseded" }
-            runtimeAdmission = admission
+            attempt.runtimeAdmission = admission
         }
     }
 
@@ -487,7 +485,7 @@ class BoxService(
                 val currentConfig = VpnBridge.currentConfig() ?: SystemStart.load(service)
                 check(currentConfig == expectedReloadConfig) { "runtime reload source superseded by committed configuration" }
             }
-            runtimeAdmission = null
+            attempt.runtimeAdmission = null
             ++runtimePersistenceEpoch
         }
         return object : RuntimePersistenceHandler {
@@ -504,7 +502,7 @@ class BoxService(
                         MainKernelAttemptRegistry.isCurrent(attempt)
                     check(current()) { "runtime persistence owner expired" }
                     check(runtimeIncarnation.isNotEmpty() && revision >= 0 &&
-                        runtimeAdmission?.identity?.incarnation == runtimeIncarnation &&
+                        attempt.runtimeAdmission?.identity?.incarnation == runtimeIncarnation &&
                         (incarnation == null || incarnation == runtimeIncarnation) &&
                         revision >= lastRevision && (revision != lastRevision || lastDigest == effectiveDigest)) {
                         "runtime persistence receipt is stale"
@@ -697,6 +695,7 @@ class BoxService(
         val firstStop = state != ServiceState.Stopping
         closeFailed = false
         state = ServiceState.Stopping
+        attempt.runtimeAdmission = null
         VpnBridge.publishLifecycle(attempt, "unavailable")
         if (BuildConfig.DEBUG) runCatching {
             DebugAppliedInputs.witness.seal(attempt)
@@ -784,7 +783,6 @@ class BoxService(
                 deliverStop = VpnBridge.takeFinishStop(attempt = attempt)
                 commandServer = null
                 nativeTunBridge = null
-                runtimeAdmission = null
                 mainAttempt = null
                 state = ServiceState.Stopped
                 closeFailed = false
