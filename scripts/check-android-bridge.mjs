@@ -1089,8 +1089,8 @@ for (const c of FRAME_CONTRACTS) {
 // 缺陷形态（2026-09-25 盘点）：配置只在进程内存里，`BoxService.startKernel` 在没有桥调用时拿到 null
 // ⇒ 抛错自停 ⇒ 设置页引导用户去开的「始终开启的 VPN」**一定**起不来。两侧都编得过，A1–A12 全绿。
 //
-//  A13a 正面：`startKernel` 交给 `startOrReloadService` 的那个配置变量，必须是
-//       「桥配置 ?: SystemStart.load(…)」—— 桥那一侧取自 `VpnBridge.currentConfig()`。
+//  A13a 正面：`startKernel` 交给共享 native Start 的配置变量，必须是「桥配置 ?: SystemStart.load(…)」。
+//       共享入口在同一 server 上调用 typed Start，只有找不到该方法时才调用旧入口。
 //  A13b 同一份字节：`SystemStart` 读的路径 = `context.dataDir` / <子目录> / <文件名>，两段字面量与
 //       Rust `lib.rs` 的 `app_config_dir()…join("<子目录>")`、`ProxyRuntime::runtime_config_path` 的
 //       `join("<文件名>")` 逐字相等（Tauri Android 的 app_config_dir 就是 dataDir）。
@@ -1127,12 +1127,22 @@ function blankStrings(src) {
   return out.join('');
 }
 
+/** 找唯一的共享 Start。两侧 marker 和配置来源都绑定这次调用。 */
+function a13StartCall(startKernelBody) {
+  const body = startKernelBody ?? '';
+  const calls = [...body.matchAll(/\bAndroidRuntimeTailscaleBridge\s*\.\s*startMain\s*\(/g)];
+  if (calls.length !== 1 || /\bstartOrReloadService\w*\s*\(/.test(body)) return null;
+  const [call] = calls;
+  const args = /^\s*server\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*OverrideOptions\s*\(\s*\)\s*,\s*runtimePersistenceHandler\s*\(\s*attempt\s*,\s*server\s*\)\s*\)/
+    .exec(body.slice(call.index + call[0].length));
+  return args ? { at: call.index, config: args[1] } : null;
+}
+
 /** A13a 的判定本体（抽出来给自检复用）。返回 null = 通过，否则是失败原因。 */
-function a13aVerdict(startKernelBody) {
+function a13aVerdict(startKernelBody, nativeStart) {
   if (!startKernelBody) return '切不出 BoxService.startKernel 的函数体';
-  const passed = /startOrReloadService(?:With(?:Retryable)?RuntimePersistence)?\(\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(startKernelBody);
-  if (!passed) return 'startKernel 里没有 startOrReloadService(<变量>, …) 调用';
-  const v = passed[1];
+  if (!nativeStart) return 'startKernel 必须恰好一次经 AndroidRuntimeTailscaleBridge.startMain 传入原 server、配置和持久化 handler';
+  const v = nativeStart.config;
   const decl = new RegExp(`val\\s+${v}\\s*=\\s*([^\\n]+)`).exec(startKernelBody);
   if (!decl) return `交给内核的变量 ${v} 没有在 startKernel 里声明`;
   const m = /^([A-Za-z_][A-Za-z0-9_.()]*)\s*\?:\s*SystemStart\.load\(/.exec(decl[1].trim());
@@ -1143,28 +1153,86 @@ function a13aVerdict(startKernelBody) {
   return leftDecl ? null : `「?:」左侧 ${left} 不是取自 VpnBridge.currentConfig()`;
 }
 
-/** 切点自检：注释/字符串里的同形物不许喂饱 A13a；代码里的真形态必须被认出来。 */
-function a13SelfCheck() {
-  const code = (t) => blankStrings(stripComments(t));
-  const good = kotlinFnBody(
-    code('private fun startKernel() {\n val b = VpnBridge.currentConfig()\n val config = b ?: SystemStart.load(service)\n server.startOrReloadService(config, o)\n}'),
-    'startKernel'
-  );
-  const goodPersistence = good.replace('startOrReloadService(', 'startOrReloadServiceWithRetryableRuntimePersistence(');
-  const inComment = kotlinFnBody(
-    code('private fun startKernel() {\n // val config = b ?: SystemStart.load(service)\n val config = VpnBridge.currentConfig() ?: error("x")\n server.startOrReloadService(config, o)\n}'),
-    'startKernel'
-  );
-  const inString = kotlinFnBody(
-    code('private fun startKernel() {\n val config = VpnBridge.currentConfig() ?: error("?: SystemStart.load(")\n server.startOrReloadService(config, o)\n}'),
-    'startKernel'
-  );
-  if (a13aVerdict(good) !== null) hardFail(`A13 自检：合成的正确形态没被认出来（${a13aVerdict(good)}）—— 判据塌了`);
-  if (a13aVerdict(goodPersistence) !== null) hardFail('A13 self-check: authoritative persistence start lost its original config source guard');
-  if (a13aVerdict(inComment) === null) hardFail('A13 自检：注释里的 `?: SystemStart.load(` 喂饱了判据 —— 剥注释失效');
-  if (a13aVerdict(inString) === null) hardFail('A13 自检：字符串里的 `?: SystemStart.load(` 喂饱了判据 —— 抹字符串失效');
+function a13StartBracketed(body, nativeStart) {
+  if (!nativeStart) return false;
+  const gates = [...body.matchAll(/^[ \t]*SystemStart\.requireLegacyAllowed\(\s*service\s*\)[ \t]*$/gm)];
+  return gates.some((gate) => gate.index < nativeStart.at) && gates.some((gate) => gate.index > nativeStart.at);
 }
-a13SelfCheck();
+
+/** 校验固定的分支与调用参数。逐 token 比较保留方法名字符串，允许 Kotlin 排版变化。 */
+function a13NativeBridgeVerdict(bridge) {
+  const tokens = (source) => (source?.match(/"(?:[^"\\]|\\.)*"|[A-Za-z0-9_]+|[^\s]/g) ?? []).join(' ');
+  const start = kotlinFnBody(bridge, 'startMain');
+  if (tokens(start) !== tokens(`{
+    val methods = server.javaClass.methods.filter { it.name == "startOrReloadServiceWithTailscaleStartup" }
+    if (methods.isEmpty()) {
+      server.startOrReloadServiceWithRetryableRuntimePersistence(config, options, handler)
+      return null
+    }
+    val method = methods.single()
+    check(method.returnType == String::class.java &&
+      method.parameterTypes.contentEquals(arrayOf(String::class.java, OverrideOptions::class.java, RuntimePersistenceHandler::class.java)))
+    return invoke(server, method, config, options, handler) as String
+  }`)) return 'startMain 必须在原 server 上择一调用 typed Start 或因缺少符号调用旧入口';
+
+  const invoke = tokens(bridge.slice(bridge.indexOf('fun invoke(')));
+  const expected = tokens(`fun invoke(receiver: Any, method: Method, vararg args: Any?): Any? = try {
+    method.invoke(receiver, *args)
+  } catch (failure: InvocationTargetException) {
+    throw failure.targetException
+  }`);
+  if (!invoke.startsWith(expected) || /^(?:catch|finally)\b/.test(invoke.slice(expected.length).trimStart())) {
+    return '反射调用必须只向原接收方传原参数一次，并传播原生错误';
+  }
+  return null;
+}
+
+/** 切点自检：必须同时识别配置来源、唯一实际调用和两侧 marker。 */
+function a13SelfCheck(bridge) {
+  const code = (t) => blankStrings(stripComments(t));
+  const guard = 'SystemStart.requireLegacyAllowed(service)';
+  const call = 'AndroidRuntimeTailscaleBridge.startMain(server, config, OverrideOptions(), runtimePersistenceHandler(attempt, server))';
+  const body = (config, before = guard, after = guard, start = call) => kotlinFnBody(code(`
+    private fun startKernel() {
+      val bridge = VpnBridge.currentConfig()
+      ${config}
+      ${before}
+      ${start}
+      ${after}
+    }
+  `), 'startKernel');
+  const config = 'val config = bridge ?: SystemStart.load(service)';
+  const valid = (start) => a13aVerdict(start, a13StartCall(start)) === null;
+  const guarded = (start) => a13StartBracketed(start, a13StartCall(start));
+  const good = body(config);
+  if (!valid(good) || !guarded(good)) hardFail('A13 自检：正确的共享启动入口或前后 marker 未被识别');
+  for (const bad of [
+    body('// val config = bridge ?: SystemStart.load(service)\nval config = bridge ?: error("x")'),
+    body('val config = bridge ?: error("?: SystemStart.load(")'),
+    body(config, guard, guard, `val fake = "${call}"`),
+    body(config, guard, guard, `${call}\n${call}`),
+    body(config, guard, guard, call.replace('Handler(attempt, server)', 'Handler(attempt, other)')),
+  ]) {
+    if (valid(bad)) hardFail('A13 自检：未拒绝伪造、重复或断开原身份的共享启动入口');
+  }
+  if (guarded(body(config, `// ${guard}`)) || guarded(body(config, guard, `val fake = "${guard}"`))) {
+    hardFail('A13 自检：注释或字符串冒充了 native Start 前后 marker');
+  }
+
+  for (const [from, to] of [
+    [/methods\s*\.\s*isEmpty\s*\(\s*\)/, 'methods.size != 1'],
+    [/\breturn\s+null\b/, ''],
+    [/\(\s*config\s*,\s*options\s*,\s*handler\s*\)/, '(otherConfig, options, handler)'],
+    [/invoke\s*\(\s*server\s*,\s*method\s*,\s*config\s*,\s*options\s*,\s*handler\s*\)/, 'invoke(server, method, config, options, otherHandler)'],
+    [/method\s*\.\s*invoke\s*\(\s*receiver\s*,\s*\*\s*args\s*\)/, 'method.invoke(otherServer, *args)'],
+    [/throw\s+failure\s*\.\s*targetException\b/, 'return null'],
+  ]) {
+    const changed = bridge.replace(from, to);
+    if (changed === bridge || a13NativeBridgeVerdict(changed) === null) {
+      hardFail(`A13 自检：未拒绝启动入口中的 ${from} 变动`);
+    }
+  }
+}
 
 {
   const VPN_DIR = join(KOTLIN_SRC, 'com', 'polaris2', 'app', 'vpn');
@@ -1175,14 +1243,19 @@ a13SelfCheck();
     return { noComments, code: blankStrings(noComments) };
   };
   const box = readKt('BoxService.kt');
+  const bridge = readKt('AndroidRuntimeTailscaleBridge.kt');
   const sys = readKt('SystemStart.kt');
   const boot = readKt('BootReceiver.kt');
   const plugin = { code: blankStrings(pluginKtSrc) };
 
   // A13a
   const startKernel = kotlinFnBody(box.code, 'startKernel');
-  const a = a13aVerdict(startKernel);
+  const nativeStart = a13StartCall(startKernel);
+  const a = a13aVerdict(startKernel, nativeStart);
   if (a !== null) fail(`A13a BoxService.startKernel：${a}（系统发起的起核会以「桥没有交来配置」自停）`);
+  const bridgeProblem = a13NativeBridgeVerdict(bridge.noComments);
+  if (bridgeProblem !== null) fail(`A13a AndroidRuntimeTailscaleBridge：${bridgeProblem}`);
+  else a13SelfCheck(bridge.noComments);
 
   // A13b
   const ktConst = (name) =>
@@ -1257,10 +1330,7 @@ a13SelfCheck();
       fail(`A13f SystemStart.${name} 缺少从 Preparing 起的旧摘要阻断`);
     }
   }
-  const startCalls = [...(startKernel ?? '').matchAll(/SystemStart\.requireLegacyAllowed\(/g)].map((m) => m.index);
-  const nativeStartAt = /server\.startOrReloadService(?:With(?:Retryable)?RuntimePersistence)?\(/.exec(startKernel ?? '')?.index ?? -1;
-  if (startCalls.length < 2 || nativeStartAt < 0 || !startCalls.some((at) => at < nativeStartAt) ||
-      !startCalls.some((at) => at > nativeStartAt)) {
+  if (!a13StartBracketed(startKernel, nativeStart)) {
     fail('A13f BoxService 系统/legacy 起核没有在 native Start 前后复查 marker');
   }
 
