@@ -133,12 +133,12 @@ const WRITES: &[(&str, &[Site])] = &[
         &[
             (
                 Class::Projection,
-                "generate_sing_box_config_with_report_and_runtime_bindings",
+                "compile_android_mesh_modes",
                 "双态核生成：给内存里的普通态副本设出口，不落盘",
             ),
             (
                 Class::Projection,
-                "generate_sing_box_config_with_report_and_runtime_bindings",
+                "compile_android_mesh_modes",
                 "双态核生成：给内存里的组网态副本设出口，不落盘",
             ),
         ],
@@ -313,6 +313,7 @@ const GENERIC: &[(&str, &str, &str)] = &[
 /// 原生源码目录而这里不动即红。
 const NATIVE_ROOTS: &[&str] = &[
     "crates/tauri-plugin-polaris-ios/ios",
+    "scripts",
     "src-tauri/gen/android",
     "src-tauri/gen/apple",
 ];
@@ -1653,7 +1654,7 @@ fn the_shape_classifier_tells_reads_writes_and_unknowns_apart() {
     assert!(!scan(read_helper).0[0].touches_intent);
 }
 
-/// 原生侧（Kotlin / Swift）不读不写这个键：出口的选择只经 Rust 的命令。取材面是全仓枚举出来的
+/// 原生侧（Kotlin / Swift / Java）不读不写这个键：出口的选择只经 Rust 的命令。取材面是全仓枚举出来的
 /// 原生源码 —— 不在 [`NATIVE_ROOTS`] 登记的目录下出现原生源码即红，登记了而已不存在的也红。
 #[test]
 fn native_code_never_touches_the_selected_server() {

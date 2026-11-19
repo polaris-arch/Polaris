@@ -626,7 +626,7 @@ impl std::fmt::Display for ServerSwitchError {
 /// 把出口选到 `server_id`：校验目标 → 改 `selectedServerId` → 取得 selector 所有权。在调用方的
 /// 配置写事务里对 `cfg` 就地操作；返回 `Err` 时调用方须放弃这次写（`cfg` 可能已被改了一半）。
 ///
-/// 用户点节点经 [`server_switch_core`] 调用，随后清选择意图。测试侧保留旧显式自动落点
+/// 用户点节点经 [`server_switch_core_with_owner`] 调用，随后清选择意图。测试侧保留旧显式自动落点
 /// 的事务不变量；生产自动选择只走原生 URLTest。返回（出口是否真变, selector 意图代次）。
 fn select_in_place(
     cfg: &mut Value,
