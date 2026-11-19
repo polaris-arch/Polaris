@@ -1,4 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
+import { fileURLToPath } from 'node:url';
+import { preview, type PreviewServer } from 'vite';
 
 // Existing browser-only App harness and real production CSS/components. No native processes.
 declare global {
@@ -200,4 +202,81 @@ test('locate uses the actual running identity and keeps unknown/Auto exits disab
   await page.evaluate(() => window.__uiLayoutHarness.exitIdentity(false, null, 'layout-180', true));
   await expect(locate).toBeDisabled();
   expect(await page.evaluate(() => window.__uiLayoutHarness.selection())).toBe('layout-180');
+});
+
+async function expectMobileViewport(page: Page, width: number, fontScale: number, selectors: string[]) {
+  const geometry = await page.locator('html').evaluate(root => ({
+    width: innerWidth,
+    font: getComputedStyle(root).fontSize,
+    documentOverflow: root.scrollWidth - root.clientWidth,
+    bodyOverflow: document.body.scrollWidth - document.body.clientWidth,
+  }));
+  expect(geometry).toMatchObject({ width, font: `${16 * fontScale}px` });
+  expect(geometry.documentOverflow, 'document overflow').toBeLessThanOrEqual(1);
+  expect(geometry.bodyOverflow, 'body overflow').toBeLessThanOrEqual(1);
+  for (const selector of selectors) {
+    const region = await page.locator(selector).first().evaluate(el => {
+      const { left, right } = el.getBoundingClientRect();
+      return { left, right, overflow: el.scrollWidth - el.clientWidth, overflowX: getComputedStyle(el).overflowX };
+    });
+    expect(region.left, selector).toBeGreaterThanOrEqual(-1);
+    expect(region.right, selector).toBeLessThanOrEqual(width + 1);
+    if (selector === '.mn-segs') expect(region.overflowX, selector).toBe('auto');
+    else expect(region.overflow, selector).toBeLessThanOrEqual(1);
+  }
+}
+
+test.describe('built mobile layout', () => {
+  test.use({ isMobile: true, hasTouch: true, deviceScaleFactor: 2, locale: 'zh-CN' });
+  let server: PreviewServer;
+  test.beforeAll(async () => {
+    // The existing UI CI build supplies dist/mobile.html. Preview keeps its production CSP and assets.
+    server = await preview({ root: fileURLToPath(new URL('..', import.meta.url)), preview: { host: '127.0.0.1', port: 0 } });
+  });
+  test.afterAll(async () => { await server?.close(); });
+
+  for (const [width, height, fontScale] of [
+    [320, 740, 1], [390, 844, 1], [768, 1024, 1], [768, 440, 1],
+    [320, 480, 2], [390, 844, 2], [768, 600, 2],
+  ]) {
+    test(`mobile viewport and overflow at ${width}×${height} with ${fontScale}× text`, async ({ page }) => {
+      const origin = server.resolvedUrls?.local[0];
+      if (!origin) throw new Error('Mobile Vite preview did not bind');
+      await page.setViewportSize({ width, height });
+      await page.goto(new URL('mobile.html', origin).href);
+      const nav = page.locator('.m-nav-item');
+      await expect(nav.first()).toBeVisible();
+      await expect(page.locator('meta[name="viewport"]')).toHaveAttribute('content', /maximum-scale=1\.0.*user-scalable=no.*viewport-fit=cover/);
+      await page.evaluate(scale => document.documentElement.style.setProperty('--font-scale', String(scale)), fontScale);
+      await expectMobileViewport(page, width, fontScale, ['.m-scroll']);
+
+      for (const label of ['节点', '分流', '活动', '设置']) {
+        await test.step(label, async () => {
+          const tab = nav.filter({ hasText: label });
+          await tab.click();
+          await expect(tab).toHaveAttribute('aria-current', 'page');
+          const selectors = label === '节点' ? ['.m-scroll', '.mn-segs'] : ['.m-scroll'];
+          await expectMobileViewport(page, width, fontScale, selectors);
+          if (label === '节点') {
+            await page.locator('.mn-seg-label').first().evaluate(el => { el.textContent = 'very_long_subscription_name_without_breaks_'.repeat(30); });
+            expect(await page.locator('.mn-segs').evaluate(el => el.scrollWidth - el.clientWidth)).toBeGreaterThan(1);
+            await expectMobileViewport(page, width, fontScale, selectors);
+          }
+        });
+      }
+
+      await nav.filter({ hasText: '节点' }).click();
+      await page.locator('.mn-act.primary').click();
+      await page.locator('.mn-sheet-btn').filter({ hasText: '添加组网接入' }).click();
+      await page.locator('.m-info-summary').first().evaluate(el => { el.textContent = '一个很长且没有空格的提示示例'.repeat(12); });
+      const form = ['.m-form-panel', '.m-form-body'];
+      await expectMobileViewport(page, width, fontScale, form);
+      await page.locator('.m-form-choice-btn').filter({ hasText: 'Tailscale' }).click();
+      await page.locator('.m-form-hint').first().evaluate(el => { el.textContent = 'long_unbroken_translation_or_host_name_'.repeat(12); });
+      const input = page.locator('.m-form-panel input').first();
+      await input.fill('long-input-value.example.test'.repeat(8));
+      await expect(input).toBeFocused();
+      await expectMobileViewport(page, width, fontScale, form);
+    });
+  }
 });
