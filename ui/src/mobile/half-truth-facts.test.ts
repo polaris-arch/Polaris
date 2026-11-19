@@ -22,13 +22,13 @@
  * # 三组事实（每组都带**谓词自检**：合成一段反例，证明谓词分得清「在」与「不在」）
  *
  *  A. **导出腿**（日志 / 诊断 / 备份）：`tauri-plugin-dialog` 在 `lib.rs` 上是**无平台门控**注册的；
- *     `logs.rs` 的导出腿没有平台门控；`backup.rs` 仅在**导入选择器的扩展过滤**上用
- *     `cfg(not(android))`，让 Android SAF 能看见 .polaris-backup，导出保存腿不受它影响；
+ *     `logs.rs` 保留导出的平台分支；`backup.rs` 在 Android 使用独立 SAF 选择器，
+ *     保留打开、保存和不按扩展名过滤；
  *     五条命令都在 `generate_handler!` 里、那一整块也没有平台 `#[cfg]`；
  *     两个模块都**真的处理了 content URI**（不再有 `into_path().ok()` 那个吞掉 SAF 目标的形态）。
  *     ⚠️ 插件的 Android 实现本身（`tauri-plugin-dialog` 的 `DialogPlugin.kt` 里那个
  *       `ACTION_CREATE_DOCUMENT`）**不在本门射程内** —— 它住在 crate registry，不在本仓，
- *       本门够不着。本组证明的是「本仓这一侧没有把这条腿从移动端门控掉」，不是「插件真的实现了」。
+ *       本组核对日志导出的本仓接线及备份选择器的 Intent，真实设备行为由验收确认。
  *     ⇒ **2026-09-06（W-18）起本组不再是「半真」那一类，而是保鲜断言**：那两句文案原来说
  *       「这条腿在移动端尚未接线」，当时只对**前端**成立（后端注册是通的、但 Rust 侧
  *       `into_path().ok()` 会把 SAF 的 `content://` 吃成「用户取消」）。现在前后端两侧都接上了，
@@ -115,6 +115,7 @@ function walkTypeScript(dir: string, out: string[] = []): string[] {
 const LIB_RS = 'src-tauri/src/lib.rs';
 const LOGS_RS = 'src-tauri/src/commands/misc/logs.rs';
 const BACKUP_RS = 'src-tauri/src/commands/misc/backup.rs';
+const BACKUP_PICKER_KT = 'src-tauri/gen/android/app/src/main/java/com/polaris2/app/BackupPickerPlugin.kt';
 
 type Gating = 'gated' | 'ungated' | 'absent';
 
@@ -371,24 +372,25 @@ describe('半真文案的事实门', () => {
       ).toBe('ungated');
     });
 
-    it('导出腿保留文件保存；Android 备份导入只跳过扩展过滤', () => {
-      for (const path of [LOGS_RS, BACKUP_RS] as const) {
-        const source = readRepoFile(path);
-        expect(
-          platformGates(source),
-          `${path} 出现了未登记的平台分支`,
-        ).toEqual(path === LOGS_RS ? [
-          '#[cfg(all(target_os = "android", debug_assertions))]',
-          '#[cfg(all(target_os = "android", debug_assertions))]',
-          '#[cfg(not(all(target_os = "android", debug_assertions)))]',
-        ] : ['#[cfg(not(target_os = "android"))]']);
-        if (path === BACKUP_RS) {
-          expect(source).toMatch(
-            /#\[cfg\(not\(target_os = "android"\)\)\]\s*let picker = picker\s*\.add_filter\(/,
-          );
-          expect(source).toContain('picker.pick_file(move |p| {');
-        }
-      }
+    it('日志保留文件导出；Android 备份启用独立 SAF 打开与保存', () => {
+      expect(platformGates(readRepoFile(LOGS_RS))).toEqual([
+        '#[cfg(all(target_os = "android", debug_assertions))]',
+        '#[cfg(all(target_os = "android", debug_assertions))]',
+        '#[cfg(not(all(target_os = "android", debug_assertions)))]',
+      ]);
+      expect(stripComments(libRs)).toMatch(
+        /#\[cfg\(target_os = "android"\)\]\s*let builder = builder\.plugin\(commands::misc::android_backup_picker_plugin\(\)\);/,
+      );
+      const backup = stripComments(readRepoFile(BACKUP_RS));
+      expect(backup).toMatch(
+        /#\[cfg\(target_os = "android"\)\]\s*async fn ask_save_path\b[^{]+\{\s*ask_android_path\(app, Some\(default_name\), operation\)\.await/,
+      );
+      expect(backup).toMatch(
+        /#\[cfg\(target_os = "android"\)\]\s*async fn ask_open_path\b[^{]+\{\s*ask_android_path\(app, None, operation\)\.await/,
+      );
+      const picker = readRepoFile(BACKUP_PICKER_KT);
+      expect(picker).toContain('if (save) Intent.ACTION_CREATE_DOCUMENT else Intent.ACTION_GET_CONTENT');
+      expect(picker).toContain('.addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")');
     });
 
     it('谓词自检：剥注释这一步真的在起作用（否则下面那条只是被注释喂饱）', () => {

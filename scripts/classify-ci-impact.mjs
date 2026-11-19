@@ -605,6 +605,10 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
     why: 'Android 独有的连接后出口 IP 探测分支进入 APK 的 Rust cdylib；'
       + '改动须触发 Android 编译和打包，自动探测时序由设备验收确认。',
   },
+  'src-tauri/src/commands/misc/backup.rs': {
+    why: 'Android 备份的原生选择器注册、命令载荷和文件回执进入 APK 的 Rust cdylib；'
+      + '改动须触发 Android 编译和打包，SAF 回执和所有者生命周期由设备验收确认。',
+  },
   'src-tauri/src/events.rs': {
     why: 'Android 代理启停期间的状态重读事件由 APK 中的 Rust 运行时发出；改动须触发 Android 编译和打包。',
   },
@@ -911,10 +915,9 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     + 'ci.yml 的 host cargo test --workspace 实际执行这些桌面回归；'
     + 'Android cargo check -p polaris 不带 --all-targets，未编译本测试目标的 Android 构型。'
     + 'APK 构建同样不构建测试目标，点亮 APK 腿不能补成 Android 测试覆盖。',
-  'src-tauri/src/commands/misc/backup.rs':
-    'Android 导入选择器不带扩展过滤，以便 SAF 显示 .polaris-backup；导出仍走保存对话框。'
-    + '`cargo check --target aarch64-linux-android -p polaris` 覆盖 cfg 编译，'
-    + '`half-truth-facts.test.ts` 守住本仓接线；APK 构建不执行系统选择器，真实 SAF 回执需设备验证。',
+  'src-tauri/src/commands/misc.rs':
+    'Android 专属备份选择器在此处只经 cfg 重新导出。Android cargo check 覆盖符号接线；'
+    + '注册、载荷和回执实现由 commands/misc/backup.rs 点亮 APK 腿。',
   'src-tauri/src/commands/subscription.rs':
     'Android 本地订阅导入选择器不带扩展过滤，由正文解析继续校验格式和大小；'
     + 'Android 目标 cargo check 覆盖条件编译，APK 构建不执行选择器或验证 SAF 可见性。',
@@ -944,11 +947,11 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     '桌面自动连接在起核前复核 legacy admission，Android 走独立启动接管腿；'
     + '桌面测试覆盖 marker 拒绝，Android 目标 cargo check 覆盖 cfg 编译，APK 构建不执行自动连接。',
   'src-tauri/src/lib.rs':
-    'app crate 装配根，三处 android cfg：`mod android_tls;`、`android_tls::assert_ready_before_any_https()` '
-    + '调用点、`builder.plugin(runtime::proxy::android_bridge::init())`。前两处都有更早更便宜的门 ——'
+    'app crate 的 Android 装配包含 `mod android_tls;`、`android_tls::assert_ready_before_any_https()` '
+    + '和两个插件注册入口。备份插件的 builder 接线由 `half-truth-facts.test.ts` 核验。TLS 两处由现有编译和源码门覆盖 ——'
     + '删 `mod` ⇒ 调用点编不过 ⇒ `cargo check --target aarch64-linux-android -p polaris` 当场红；'
     + '删调用点 ⇒ 接线门 `src-tauri/tests/android_platform_verifier_wiring.rs` 在 Linux `cargo test` 上红。'
-    + '🔴 第三处（插件注册行）**今天没有任何门**，但 APK 腿同样抓不到它：本腿只打包、不运行 APK，'
+    + '🔴 起停核桥的 builder 注册还缺直接断言，APK 腿同样抓不到它：本腿只打包、不运行 APK，'
     + '`register_android_plugin` 是运行期反射。把本文件塞进 ANDROID_IMPACT_SCOPES 不会让那条缝被量到，'
     + '补法是往 check-android-bridge.mjs 加一条「`init()` 必须出现在 `run()` 的 builder 链上」的断言。',
   'src-tauri/src/commands/misc/autostart.rs':

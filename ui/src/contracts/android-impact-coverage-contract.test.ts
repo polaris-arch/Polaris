@@ -497,6 +497,7 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
     // Registering this host-only test cannot suppress the actual Android assets.
     expect(classifyImpact(['src-tauri/gen/android/app/src/main/java/com/polaris2/app/vpn/BundledRules.kt']).android).toBe(true);
     expect(classifyImpact(['resources/data/geosite-cn.srs']).android).toBe(true);
+    expect(classifyImpact(['src-tauri/src/commands/misc/backup.rs']).android).toBe(true);
 
     // 正面断言：面里的每一条都真的解析到了一条登记（上面那条只说「没有漏网」，
     // 面若为空它同样成立）。
