@@ -30,7 +30,8 @@ test('mobile module list admits exact Go rows and rejects ambiguous or incomplet
   assert.equal(good.status, 0, good.stderr);
   assert.equal(good.stdout, '[' + firstRow + ',' + secondRow + ']\n');
   for (const bad of ['', firstRow + firstRow, '[]', '{"Version":"v1"}', firstRow + '{"Path":',
-    firstRow + 'incomplete', '{"Path":"a","\\u0050ath":"b"}']) {
+    firstRow + 'incomplete', '{"Path":"a","\\u0050ath":"b"}',
+    '\uFEFF' + firstRow, Buffer.from(firstRow, 'utf16le')]) {
     const rejected = read(bad);
     assert.equal(rejected.status, 1, rejected.stderr);
     assert.equal(rejected.stdout, '');

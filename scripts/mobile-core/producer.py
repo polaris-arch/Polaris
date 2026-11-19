@@ -143,7 +143,8 @@ def _project_run_logs(sink, raw_sinks, starts, counts, encoding, errors):
 
 
 def run(args, *, cwd=None, env=None, log=None, capture='full', progress_fd=None,
-        observation_fd=None, observation_phase=None, observation_slot=None):
+        observation_fd=None, observation_phase=None, observation_slot=None,
+        timeout_seconds=RUN_SECONDS):
     if args and str(args[0]) == 'git':
         env = git_environment(env)
         if cwd is not None:
@@ -210,7 +211,7 @@ def run(args, *, cwd=None, env=None, log=None, capture='full', progress_fd=None,
             while selected.get_map() or process.poll() is None:
                 now = time.monotonic()
                 if now >= deadline:
-                    raise subprocess.TimeoutExpired(str(args[0]), RUN_SECONDS)
+                    raise subprocess.TimeoutExpired(str(args[0]), timeout_seconds)
                 if not cleanup and now >= next_observation:
                     observe('waiting')
                     next_observation = now + RUN_HEARTBEAT_SECONDS
@@ -247,7 +248,7 @@ def run(args, *, cwd=None, env=None, log=None, capture='full', progress_fd=None,
             selected.register(process.stderr, selectors.EVENT_READ, 'stderr')
             register_group(process.pid)
             observe('start')
-            drain(started + RUN_SECONDS)
+            drain(started + timeout_seconds)
             require(not group_alive(process.pid),
                     'native session still owns descendants; original reservation retained')
             register_group(process.pid, finished=True)
@@ -758,13 +759,10 @@ def actual_module_list(source, go, env, scratch):
     with tempfile.TemporaryDirectory(prefix='module-list-', dir=scratch) as folder:
         log = Path(folder) / 'go-list.log'
         run([go, 'list', '-m', '-json', 'all'], cwd=source, env=env, log=log, capture='none')
-        stdout = log.with_suffix('.log.stdout.raw')
-        with (Path(folder) / 'graph.json').open('xb+') as graph:
-            result = subprocess.run(['node', SOURCE_ADMISSION, '--module-list', stdout],
-                                    stdout=graph, stderr=subprocess.PIPE, timeout=30)
-            require(result.returncode == 0,
-                    result.stderr.decode(errors='replace').strip() or 'actual module graph rejected')
-            graph.seek(0)
+        graph_log = Path(folder) / 'graph.log'
+        run(['node', SOURCE_ADMISSION, '--module-list', log.with_suffix('.log.stdout.raw')],
+            log=graph_log, capture='none', timeout_seconds=30)
+        with graph_log.with_suffix('.log.stdout.raw').open(encoding='utf-8') as graph:
             return json.load(graph)
 
 

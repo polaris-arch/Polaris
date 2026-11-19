@@ -195,10 +195,10 @@ export const characters = value => value.length === 0 ? 0 : value.length - (valu
 
 // State is local to the original receipt. Object keys are compared after
 // unescaping, and numeric types survive parsing for CPython fingerprint parity.
-function decodeJSON(raw, maximum, receiptLimit, acceptDocument) {
+function decodeJSON(raw, maximum, receiptLimit, acceptDocument, decodeText = text) {
   demand(raw.length <= maximum, receiptLimit ? 'original receipt exceeds its byte budget' : 'mobile input contract is too large');
   if (receiptLimit) lexicalBudget(raw);
-  const source = text(raw), whitespace = /[ \t\r\n]*/y;
+  const source = decodeText(raw), whitespace = /[ \t\r\n]*/y;
   const scalar = /(?:true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/y;
   let at = 0, nodes = 0, stringChars = 0;
   const skip = () => { whitespace.lastIndex = at; whitespace.exec(source); at = whitespace.lastIndex; };
@@ -286,7 +286,7 @@ function moduleList(raw) {
     demand(!paths.has(row.Path), 'empty/duplicate module graph');
     paths.add(row.Path);
     rows.push(document);
-  });
+  }, bytes => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes));
   demand(rows.length > 0, 'empty/duplicate module graph');
   // Preserve original nested values and numeric spellings in the producer's receipt.
   return '[' + rows.join(',') + ']';
