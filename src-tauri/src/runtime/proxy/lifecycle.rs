@@ -1660,8 +1660,27 @@ impl ProxyRuntime {
         }
         // C7：停核尾刷 OS DNS 缓存（fire-and-forget，对齐 上游 `flushOsDnsCacheBestEffort('stop')`）。
         self.flush_os_dns_cache_best_effort("stop");
-        if let Ok(mut g) = self.status.write() {
-            *g = ProxyStatus::default();
+        let retired = {
+            let _publication = self.gate.lock_generation_publication();
+            if self.gate.generation() == my_gen {
+                if let Ok(mut status) = self.status.write() {
+                    *status = ProxyStatus::default();
+                }
+                if let Ok(mut startup) = self.startup_snapshot.write() {
+                    *startup = None;
+                }
+                if let Ok(mut selector) = self.switch_snapshot.write() {
+                    *selector = None;
+                }
+                self.restart_deferred.store(false, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        };
+        if !retired {
+            self.finish_lifecycle(LifecycleKind::Stop);
+            return Ok(None);
         }
         // 核停（出口隧道下线）→ 失效解锁缓存：清缓存 + 广播 `{running:false}`，让渲染端复位 idle（不再 serve
         // 停核前的陈旧解锁快照）。`unlock_get` 的停核短路是自证腿，此处显式失效并广播使 UI 即时复位、不等下次挂载。
@@ -1669,9 +1688,6 @@ impl ProxyRuntime {
         // 核停（出口隧道下线）→ 重探出口 IP：代理出口已消失，直连出口是新的真值。无收敛可等（出口是
         // 确定性消失，不是切换）⇒ 零延迟直接探。
         self.schedule_exit_ip_refresh(false);
-        if let Ok(mut snap) = self.startup_snapshot.write() {
-            *snap = None;
-        }
         self.clear_runtime_config_baseline();
         if let Ok(mut ready) = self.ready_main.write() {
             *ready = None;
@@ -1681,9 +1697,6 @@ impl ProxyRuntime {
         if let Ok(mut route) = self.mesh_route_run.write() {
             *route = None;
         }
-        // 核停 ⇒ 没有「运行核」这个分母，待应用差集恒空（见 `pending_changes`）→ 欠账标记一并复位，
-        // 否则停核期间条上会挂着一条谈不上「待应用」的提示，且下次起核前无人清。
-        self.restart_deferred.store(false, Ordering::SeqCst);
         // 分母侧刚被清空 ⇒ 同上刻推一次（与起核就绪腿严格对偶）。停核由命令层发 `proxyStopped`，
         // 前端确有 pull 兜底；但**重启内嵌的这次停核不经命令层**，只靠那条 pull 就是漏的一半。
         // `push_lifecycle(stopped)` 同上必须相邻：核停了就谈不上「正在应用」，条该离开转圈态。
@@ -1691,11 +1704,6 @@ impl ProxyRuntime {
         self.push_lifecycle(&ProxyLifecycleEvent::stopped().attributed(attribution, my_gen));
         // A restart's stop leg may await while a newer Apply queues its own full snapshot.
         // Only the terminal Stop outcome discards pending work; clearing here loses that Apply.
-        // 核停 → 热切换基准失效（上游 :1386-1388）。留着会让下次 switch_mode 拿「上一个核」的
-        // id→tag 去 PUT 新核里不存在的成员。current_config 保留（上游 :1758 未运行腿仍读写它）。
-        if let Ok(mut g) = self.switch_snapshot.write() {
-            *g = None;
-        }
         self.finish_lifecycle(LifecycleKind::Stop);
         match (mesh_cleanup_confirmed, dns_cleanup_confirmed) {
             (true, true) => Ok(Some(my_gen)),

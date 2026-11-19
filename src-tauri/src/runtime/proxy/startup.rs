@@ -2639,20 +2639,17 @@ impl ProxyRuntime {
         if let Ok(mut identity) = self.captured_core_sha256.lock() {
             *identity = ready_tls.binary_sha256.map(|digest| (my_gen, digest));
         }
-        // 热切换基准：**与 running 状态同生共死**（此处置、stop 清）→「快照在 ⟺ 核在跑」。
-        // 上游 在生成期就回填，但那样起核失败时会留下描述「不存在的核」的快照；此处收紧到就绪后。
-        if let Ok(mut g) = self.switch_snapshot.write() {
-            *g = Some(Self::build_switch_snapshot(
-                &user_config,
-                &singbox_config,
-                &deps,
-            ));
-        }
+        // Build the selector baseline outside the publication fence, then
+        // publish it with the matching running config and startup node set.
+        let switch_snapshot = Self::build_switch_snapshot(&user_config, &singbox_config, &deps);
         {
             let tailnet_bindings = self.tailnet_bindings(&config, &singbox_config);
             let _publication = self.gate.lock_generation_publication();
             if self.gate.generation() != my_gen {
                 return Ok(self.status());
+            }
+            if let Ok(mut snapshot) = self.switch_snapshot.write() {
+                *snapshot = Some(switch_snapshot);
             }
             self.capture_runtime_config_baseline(
                 my_gen,

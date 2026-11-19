@@ -517,6 +517,11 @@ pub(crate) struct PreparedConfigEdit {
     pub(crate) revision: u64,
 }
 
+struct PublishedConfig {
+    value: Value,
+    revision: u64,
+}
+
 /// 配置运行时（`State`-managed，单实例）。
 ///
 /// 持有配置目录路径 + currentConfig 缓存（`RwLock<Value>`，读多写少）。
@@ -527,7 +532,7 @@ pub struct ConfigManager {
     /// config.json 绝对路径。
     path: PathBuf,
     /// currentConfig 缓存（Polaris ConfigManager.currentConfig；首次 load 填充）。
-    cache: RwLock<Option<Value>>,
+    cache: RwLock<Option<PublishedConfig>>,
     /// **配置文件事务锁** —— 读取时可能发生的首装/迁移落盘、普通保存、原子读改写与删除日志消费
     /// 全部按这把锁串行。这样不只避免两个 writer 丢更新，也避免 `load_full` 的迁移落盘从旁路覆盖
     /// 一次已完成的更新。
@@ -857,9 +862,7 @@ impl ConfigManager {
             }
         }
         // 刷缓存（持有写锁）。
-        if let Ok(mut guard) = self.cache.write() {
-            *guard = Some(config.clone());
-        }
+        self.publish_config_cache(Some(config.clone()));
         Ok(config)
     }
 
@@ -886,9 +889,24 @@ impl ConfigManager {
     }
 
     fn clear_cached_config(&self) {
+        self.publish_config_cache(None);
+    }
+
+    fn publish_config_cache(&self, value: Option<Value>) {
         if let Ok(mut guard) = self.cache.write() {
-            *guard = None;
+            *guard = value.map(|value| PublishedConfig {
+                value,
+                revision: self.saved_revision(),
+            });
         }
+    }
+
+    /// Observe one published D revision without I/O or acquiring the writer.
+    pub(crate) fn published_config(&self) -> Option<(Value, u64)> {
+        deny_inside_projection("published_config");
+        let cache = self.cache.read().ok()?;
+        let saved = cache.as_ref()?;
+        Some((saved.value.clone(), saved.revision))
     }
 
     fn mesh_marker_path(&self) -> PathBuf {
@@ -952,7 +970,7 @@ impl ConfigManager {
         deny_inside_projection("current");
         if let Ok(guard) = self.cache.read() {
             if let Some(c) = guard.as_ref() {
-                return Ok(c.clone());
+                return Ok(c.value.clone());
             }
         }
         self.load_full()
@@ -988,7 +1006,7 @@ impl ConfigManager {
         if let Ok(guard) = self.cache.read() {
             if let Some(c) = guard.as_ref() {
                 let _probe = ReentrancyProbe::enter();
-                return Ok(f(c));
+                return Ok(f(&c.value));
             }
         }
         // 缓存未暖 / 锁中毒 → 读盘一次。注意读锁已随上面的 `if let` 作用域释放（`load_full` 要写锁）。
@@ -1016,7 +1034,7 @@ impl ConfigManager {
             .cache
             .read()
             .map_err(|_| StoreError::validation("runtime owner cache unavailable"))?;
-        if cache.as_ref() != Some(expected) {
+        if cache.as_ref().map(|c| &c.value) != Some(expected) {
             return Err(StoreError::validation("runtime desired owner superseded"));
         }
         let (persisted, bytes) = self.read_saved_document()?;
@@ -1067,7 +1085,7 @@ impl ConfigManager {
         })?;
         let saved = cache.as_ref().ok_or(SavedCommitError::Cold)?;
         let _probe = ReentrancyProbe::enter();
-        Ok(commit(saved))
+        Ok(commit(&saved.value))
     }
 
     /// 保存配置（再跑 sanitize+validate + 原子写）+ 刷缓存。上游 `saveConfig`。
@@ -1255,11 +1273,10 @@ impl ConfigManager {
         before_cache_publication: impl FnOnce(u64),
     ) -> Result<Value, StoreError> {
         // 旧 id 集须在刷缓存前从当前缓存取（此刻仍持旧配置）；缓存未暖则无旧态可 diff（冷启无删除发生）。
-        let old_ids = self
-            .cache
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().map(crate::icon_cache::custom_app_ids));
+        let old_ids = self.cache.read().ok().and_then(|g| {
+            g.as_ref()
+                .map(|saved| crate::icon_cache::custom_app_ids(&saved.value))
+        });
         // 同上：第 4 参是随机 12hex tmp 后缀，非品牌名。每次保存都须取新值——
         // 恒定后缀会让并发 saveConfig 撞同一个 tmp 路径，原子写的隔离性即失效。
         self.persist_canonical_under_write_lock(&canonical)?;
@@ -1281,9 +1298,7 @@ impl ConfigManager {
                 }
             }
         }
-        if let Ok(mut guard) = self.cache.write() {
-            *guard = Some(canonical.clone());
-        }
+        self.publish_config_cache(Some(canonical.clone()));
         Ok(canonical)
     }
 
@@ -1329,9 +1344,7 @@ impl ConfigManager {
                     .raw_disk_for_mesh_under_write_lock()
                     .ok()
                     .filter(|raw| matches!(mesh_guard::validate_raw(raw), Ok(true)));
-                if let Ok(mut guard) = self.cache.write() {
-                    *guard = actual;
-                }
+                self.publish_config_cache(actual);
                 Err(error)
             }
             Err(error) => Err(error),
@@ -1485,13 +1498,10 @@ impl ConfigManager {
             .deferred_delete_lock
             .lock()
             .map_err(|_| StoreError::validation("deletion scope unavailable"))?;
-        if self
+        if !self
             .cache
             .read()
-            .ok()
-            .and_then(|value| value.clone())
-            .as_ref()
-            != Some(desired)
+            .is_ok_and(|cache| cache.as_ref().is_some_and(|saved| &saved.value == desired))
         {
             return Err(StoreError::validation(
                 "deletion scope desired owner changed",

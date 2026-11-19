@@ -1780,12 +1780,25 @@ impl ProxyRuntime {
         active.then_some(HotConfigEditOutcome::Retryable)
     }
 
-    pub(super) fn executing_config_edit(&self, revision: u64) -> bool {
-        self.runtime_config_apply.lock().is_ok_and(|state| {
-            state.automatic_edit.is_some_and(|owner| {
-                owner.revision == revision && owner.is_current(self) && !self.gate.is_busy()
+    pub(super) fn config_edit_pending_observation(
+        &self,
+        published_revision: Option<u64>,
+    ) -> (bool, bool) {
+        self.runtime_config_apply
+            .lock()
+            .map_or((false, true), |state| {
+                let executing = state.automatic_edit.filter(|owner| {
+                    Some(owner.revision) == published_revision
+                        && self.selector_operation_is_current(owner.generation, owner.intent)
+                        && !self.gate.is_busy()
+                });
+                let recovery = state
+                    .pending
+                    .as_ref()
+                    .and_then(PendingOperation::staged_save_owner)
+                    .is_some_and(|owner| executing != Some(owner));
+                (executing.is_some(), recovery)
             })
-        })
     }
 
     fn retain_staged_save_recovery_receipt(
@@ -1820,18 +1833,10 @@ impl ProxyRuntime {
         true
     }
 
-    pub(super) fn staged_save_recovery_pending(&self) -> bool {
-        self.runtime_config_apply.lock().is_ok_and(|state| {
-            state
-                .pending
-                .as_ref()
-                .and_then(PendingOperation::staged_save_owner)
-                .is_some_and(|owner| {
-                    state.automatic_edit != Some(owner)
-                        || !owner.is_current(self)
-                        || self.gate.is_busy()
-                })
-        })
+    #[cfg(test)]
+    fn staged_save_recovery_pending(&self) -> bool {
+        let published = self.config.published_config().map(|(_, revision)| revision);
+        self.config_edit_pending_observation(published).1
     }
 
     fn saved_revision_matches(&self, revision: Option<u64>) -> bool {

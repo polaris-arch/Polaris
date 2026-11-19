@@ -197,24 +197,54 @@ impl ProxyRuntime {
             saved_settings_revert_token: None,
             native_retirements: native_retirements.clone(),
         };
-        let Some(snap) = self.startup_snapshot.read().ok().and_then(|g| g.clone()) else {
-            return empty();
+        // The runtime writer publishes accepted R and both node baselines
+        // under this fence. D's cache value and revision were published together.
+        // Sample the exact automatic owner before an accepted R can advance.
+        let (
+            snap,
+            saved,
+            snap_fps,
+            applied,
+            executing_exact_edit,
+            recovery_pending,
+            baseline_pending,
+            deferred,
+        ) = {
+            let _publication = self.gate.lock_generation_publication();
+            let Some(snap) = self.startup_snapshot.read().ok().and_then(|g| g.clone()) else {
+                return empty();
+            };
+            let saved = desired
+                .is_none()
+                .then(|| self.config.published_config())
+                .flatten();
+            let (executing, recovery) =
+                self.config_edit_pending_observation(saved.as_ref().map(|(_, revision)| *revision));
+            let fingerprints = self
+                .switch_snapshot
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().map(|s| s.fingerprints.clone()));
+            let applied = self.current_config.read().ok().and_then(|g| g.clone());
+            // A missing baseline with unresolved selector ownership can hide real saved work.
+            let baseline_pending = desired.is_none()
+                && fingerprints.is_none()
+                && self.selector_reconcile.is_required();
+            let deferred = self.restart_deferred.load(Ordering::SeqCst);
+            (
+                snap,
+                saved,
+                fingerprints,
+                applied,
+                executing,
+                recovery,
+                baseline_pending,
+                deferred,
+            )
         };
-        let saved;
-        let (current, executing_exact_edit) = if let Some(desired) = desired {
-            (desired, false)
-        } else {
-            saved = self
-                .config
-                .with_current(|saved| (saved.clone(), self.config.saved_revision()))
-                .unwrap_or_else(|_| (snap.clone(), 0));
-            (&saved.0, self.executing_config_edit(saved.1))
-        };
-        let snap_fps = self
-            .switch_snapshot
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().map(|s| s.fingerprints.clone()));
+        let current = desired
+            .or_else(|| saved.as_ref().map(|(value, _)| value))
+            .unwrap_or(&snap);
         // Only unresolved differences require the user's action. The
         // admitted edit owns this exact revision until its native result.
         let (added, modified, removed) = if executing_exact_edit {
@@ -247,11 +277,6 @@ impl ProxyRuntime {
         // 显式选择只改磁盘 D 而目标不在当前核时，没有节点增/改/删也可能留下
         // selectedServerId 债。直接比 D/R 真值，切回运行出口后自然清掉，不污染“保存未应用”
         // 的独立 restart_deferred 标记。
-        let applied = self
-            .current_config
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().cloned());
         let selected_pending = !executing_exact_edit
             && applied.as_ref().is_some_and(|runtime| {
                 runtime.get("selectedServerId") != current.get("selectedServerId")
@@ -260,19 +285,16 @@ impl ProxyRuntime {
             && applied
                 .as_ref()
                 .and_then(|runtime| non_node_runtime_debt(runtime, current, self.helper.platform()))
-                .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
-        // A lost graph baseline can conceal saved work. Selector reconciliation
-        // alone keeps the Save admission fence and its own attestation path.
-        let baseline_pending =
-            desired.is_none() && snap_fps.is_none() && self.selector_reconcile.is_required();
-        let recovery_pending = self.staged_save_recovery_pending();
+                .unwrap_or(deferred);
+        let host_pending = self.host_effect_pending();
+        let rule_content_pending = self.has_uncommitted_rule_content();
         let pending_apply = !added.is_empty()
             || !modified.is_empty()
             || !removed.is_empty()
             || non_node_pending
             || selected_pending
-            || self.host_effect_pending()
-            || self.has_uncommitted_rule_content()
+            || host_pending
+            || rule_content_pending
             || recovery_pending
             || baseline_pending
             || native_pending;
@@ -297,8 +319,8 @@ impl ProxyRuntime {
                 .and_then(|running| self.saved_settings_revert_token(current, running)),
             restart_deferred: non_node_pending
                 || selected_pending
-                || self.host_effect_pending()
-                || self.has_uncommitted_rule_content()
+                || host_pending
+                || rule_content_pending
                 || baseline_pending
                 || recovery_pending,
         }
