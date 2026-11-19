@@ -685,6 +685,7 @@ pub fn settle_force_route_claims(
 ///
 /// `tailnet_rules_dir` 必须是落盘侧写 tailnet rule-set 的那个目录（见 [`TAILNET_RULES_DIR_NAME`]）——
 /// 传错目录不会报错，只会让每个 TS 节点都被读成 inline 腿，报告与内核吃的那一份从此系统性分叉。
+/// 空路径表示预览，没有已生效的外置规则目录。
 ///
 /// # 与块 0c 的一处**已知差异**（如实登记，方向是报多不报少）
 ///
@@ -710,6 +711,7 @@ pub fn endpoint_force_route_report(
         })
         .map(|s| {
             let file_exists = s.protocol == Protocol::Tailscale
+                && !tailnet_rules_dir.is_empty()
                 && crate::builder::custom_rule_files::ext_rule_file_exists(&format!(
                     "{tailnet_rules_dir}/{}.json",
                     tailnet_rule_file_base(&s.id)

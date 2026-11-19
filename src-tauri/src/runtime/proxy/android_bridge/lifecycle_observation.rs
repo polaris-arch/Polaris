@@ -16,6 +16,19 @@ pub(super) struct TerminalEvent {
     pub state: TerminalState,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum SystemStatusEvent {
+    SystemStartChanged,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+pub(super) enum LifecycleEvent {
+    SystemStatus(SystemStatusEvent),
+    Terminal(TerminalEvent),
+}
+
 #[derive(Default)]
 pub(super) struct Observation {
     current: Option<Run>,

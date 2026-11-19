@@ -22,9 +22,7 @@
 //! 起停核的**桥调用**今天仍只从 WebView 里的 IPC 发起（activity 必在）。但隧道本身已不止这一个
 //! 入口（2026-09-25）：always-on VPN 与开机自动连接（Kotlin `BootReceiver`）会在**没有 Rust** 的
 //! 时候由系统直接拉起 `PolarisVpnService`，配置读 Rust 上次落盘的同一份文件（Kotlin `SystemStart`）。
-//! 那种核 Rust 不认识，由 [`system_started_core_running`] 对账后走标准起核收编。
-//! 管理 API 认证缝（§8④）：系统拉起的核用的是上次落盘配置里的端口与密钥，与 Rust 上次起核时
-//! 暴露面相同（回环 + 同一密钥），不新增面；Rust 收编时会按新配置重起。
+//! Rust 读取该进程的阶段供界面显示。用户显式重新连接时才经既有停核和起核链路接手。
 
 #[cfg(target_os = "android")]
 use std::time::Duration;
@@ -756,6 +754,7 @@ fn map_rejected_code(code: Option<&str>) -> &'static str {
             code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED
         }
         Some(c) if c == ENDPOINT_RETIRED_NO_BIRTH => ENDPOINT_RETIRED_NO_BIRTH,
+        Some(c) if c == MAIN_BUSY_NO_BIRTH => MAIN_BUSY_NO_BIRTH,
         _ => code::STARTUP_FAILED,
     }
 }
@@ -763,13 +762,14 @@ fn map_rejected_code(code: Option<&str>) -> &'static str {
 /// Kotlin emits this only before VpnBridge.beginStart/native attempt creation.
 /// It is an internal retry receipt, never exposed as a ProxyStatus error code.
 pub(super) const ENDPOINT_RETIRED_NO_BIRTH: &str = "API_ENDPOINT_RETIRED";
+pub(super) const MAIN_BUSY_NO_BIRTH: &str = "ANDROID_MAIN_BUSY_NO_BIRTH";
 
 #[cfg(any(target_os = "android", test))]
 mod lifecycle_observation;
 
 #[cfg(target_os = "android")]
 mod handle {
-    use super::lifecycle_observation::{Observation, TerminalEvent};
+    use super::lifecycle_observation::{LifecycleEvent, Observation, SystemStatusEvent};
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use tauri::plugin::PluginHandle;
@@ -793,13 +793,17 @@ mod handle {
             .get_or_init(|| {
                 tauri::ipc::Channel::new(|body| {
                     if let tauri::ipc::InvokeResponseBody::Json(json) = body {
-                        if let Ok(event) = serde_json::from_str::<TerminalEvent>(&json) {
-                            let advanced = observation()
+                        let changed = match serde_json::from_str::<LifecycleEvent>(&json) {
+                            Ok(LifecycleEvent::SystemStatus(
+                                SystemStatusEvent::SystemStartChanged,
+                            )) => true,
+                            Ok(LifecycleEvent::Terminal(event)) => observation()
                                 .lock()
-                                .is_ok_and(|mut state| state.observe(event));
-                            if advanced {
-                                super::publish_status_invalidation();
-                            }
+                                .is_ok_and(|mut state| state.observe(event)),
+                            Err(_) => false,
+                        };
+                        if changed {
+                            super::publish_status_invalidation();
                         }
                     }
                     Ok(())
@@ -989,6 +993,101 @@ pub(super) fn main_start_dispatch_available() -> Result<(), BridgeError> {
     }
 }
 
+pub(super) struct AndroidMainPreparation {
+    run_id: Option<String>,
+}
+
+impl AndroidMainPreparation {
+    pub(super) fn run_id(&self) -> &str {
+        self.run_id
+            .as_deref()
+            .expect("held Android Start reservation")
+    }
+
+    pub(super) async fn release(mut self) {
+        if let Some(run_id) = self.run_id.take() {
+            release_main_start(run_id).await;
+        }
+    }
+
+    pub(super) fn confirm_consumed(mut self) {
+        self.run_id = None;
+    }
+}
+
+impl Drop for AndroidMainPreparation {
+    fn drop(&mut self) {
+        if let Some(run_id) = self.run_id.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(release_main_start(run_id));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MainReservationKey {
+    run_id: String,
+}
+
+async fn release_main_start(run_id: String) {
+    #[cfg(target_os = "android")]
+    if let Ok(plugin) = plugin_handle() {
+        if call_with_budget::<(), _>(
+            plugin,
+            "releaseMainStart",
+            MainReservationKey { run_id },
+            LOCAL_STATE_TIMEOUT,
+            None,
+        )
+        .await
+        .is_err()
+        {
+            log::warn!("Android 未启动的主核准入未确认释放");
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = run_id;
+}
+
+#[cfg(target_os = "android")]
+pub(super) async fn reserve_main_start() -> Result<AndroidMainPreparation, BridgeError> {
+    let plugin = plugin_handle()?;
+    let run_id = format!(
+        "legacy-{}{}",
+        polaris_store::fs::random_tmp_suffix(),
+        polaris_store::fs::random_tmp_suffix()
+    );
+    let reservation = AndroidMainPreparation {
+        run_id: Some(run_id.clone()),
+    };
+    // The detached delivery owns release until the caller accepts the exact reply.
+    // If its waiter times out, a late response drops the guard rather than stranding it.
+    let task = tokio::spawn(async move {
+        match plugin
+            .run_mobile_plugin_async::<MainReservationKey>(
+                "reserveMainStart",
+                MainReservationKey { run_id },
+            )
+            .await
+        {
+            Ok(reply) if reply.run_id == reservation.run_id() => Ok(reservation),
+            Ok(_) => Err(("Android 起核准入身份不符".into(), code::STARTUP_FAILED)),
+            Err(error) => Err(invoke_error(&error)),
+        }
+    });
+    match tokio::time::timeout(LOCAL_STATE_TIMEOUT, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err((
+            format!("Android 起核准入投递失败：{error}"),
+            code::STARTUP_FAILED,
+        )),
+        Err(_) => Err(("Android 起核准入无回应".into(), code::STARTUP_FAILED)),
+    }
+}
+
 #[cfg(test)]
 pub(super) async fn start_core(config_json: &str) -> Result<AndroidStartReceipt, BridgeError> {
     let run_id = format!(
@@ -1002,13 +1101,10 @@ pub(super) async fn start_core(config_json: &str) -> Result<AndroidStartReceipt,
 pub(super) async fn start_core_with_birth(
     config_json: &str,
     request_birth: super::AndroidRequestBirth,
+    reservation: &AndroidMainPreparation,
 ) -> Result<AndroidStartReceipt, BridgeError> {
-    let run_id = format!(
-        "legacy-{}{}",
-        polaris_store::fs::random_tmp_suffix(),
-        polaris_store::fs::random_tmp_suffix()
-    );
-    start_core_with_claim_and_birth(config_json, &run_id, None, Some(request_birth)).await
+    start_core_with_claim_and_birth(config_json, reservation.run_id(), None, Some(request_birth))
+        .await
 }
 
 async fn start_core_with_claim_and_birth(
@@ -1313,60 +1409,59 @@ pub(crate) async fn auth_status() -> VpnAuthState {
     }
 }
 
-/// 此刻是否有一个**不是本进程 Rust 起的**核在跑（系统经 always-on / 开机自动连接拉起的）。
-///
-/// 这种核的配置来自 Rust 上一次落盘的 `singbox-runtime.json`（Kotlin `SystemStart`），而本进程的
-/// `ProxyRuntime` 对它一无所知（进程被回收后系统重拉 ⇒ Rust 是全新的）。消费方是两条**既有**路径：
-///  · 启动期自动连接腿（`startup_tasks::decide_auto_connect`）：有这种核 ⇒ 走一次标准 `proxy_start`
-///    把它收编，界面才会显示「已连接」而不是停在「未连接」；
-///  · 起核前的孤儿清扫（`cleanup_stale_cores` 的 Android 腿）：先停掉它，再按当前配置起 ——
-///    与桌面「上次会话遗留的孤儿核」同一个处置。
-///
-/// 读不到一律 `false`（记日志）：误判成「没有」的代价是界面仍显示未连接、下一次用户点连接时由清扫腿
-/// 兜住；误判成「有」的代价是无端重起一次隧道。前者更便宜。
 pub(crate) async fn system_started_core_running() -> bool {
+    system_start_phase().await == Some(super::AndroidSystemVpnPhase::Ready)
+}
+
+/// Read-only observation of Kotlin's exact system-start attempt. This carries no Rust ownership.
+pub(crate) async fn system_start_phase() -> Option<super::AndroidSystemVpnPhase> {
     #[cfg(target_os = "android")]
     {
-        /// 字段名与 Kotlin `systemStartStatus` 的 `put("systemStarted", …)` 由 A10 双向对拍。
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
+        struct SystemStartStatusArgs {
+            lifecycle_events: tauri::ipc::Channel,
+        }
+        #[derive(serde::Deserialize)]
         struct SystemStartStatus {
-            system_started: bool,
+            phase: Option<super::AndroidSystemVpnPhase>,
         }
         let Ok(plugin) = plugin_handle() else {
-            log::warn!("系统起核对账：桥未接线，按「没有」处理");
-            return false;
+            log::warn!("系统起核状态未知：桥未接线");
+            return None;
         };
         match call_with_budget::<SystemStartStatus, _>(
             plugin,
             "systemStartStatus",
-            (),
+            SystemStartStatusArgs {
+                lifecycle_events: handle::events(),
+            },
             LOCAL_STATE_TIMEOUT,
             None,
         )
         .await
         {
-            Ok(r) => r.system_started,
+            Ok(r) => r.phase,
             Err(BridgeCallError::Invoke(e)) => {
                 log::warn!("系统起核对账读不到（Kotlin 侧拒绝）：{e}");
-                false
+                None
             }
             Err(BridgeCallError::TimedOut) => {
                 log::warn!(
                     "系统起核对账读不到（{}s 无回应）",
                     LOCAL_STATE_TIMEOUT.as_secs()
                 );
-                false
+                None
             }
             Err(BridgeCallError::TaskFailed(e)) => {
                 log::warn!("系统起核对账读不到（投递腿异常）：{e}");
-                false
+                None
             }
         }
     }
     #[cfg(not(target_os = "android"))]
     {
-        false
+        None
     }
 }
 

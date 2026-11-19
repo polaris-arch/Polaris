@@ -46,6 +46,21 @@ fn old_event_and_late_stop_ack_cannot_clear_successor() {
     wrong.birth_nonce = "foreign".into();
     assert!(!s.observe(wrong));
     assert!(s.running());
+    let hint = serde_json::from_str::<LifecycleEvent>(r#""systemStartChanged""#).unwrap();
+    assert!(matches!(
+        hint,
+        LifecycleEvent::SystemStatus(SystemStatusEvent::SystemStartChanged)
+    ));
+    assert!(serde_json::from_str::<LifecycleEvent>("{}").is_err());
+    let terminal = serde_json::from_str::<LifecycleEvent>(
+        r#"{"runId":"b","birthNonce":"birth-b","state":"closed"}"#,
+    )
+    .unwrap();
+    let LifecycleEvent::Terminal(terminal) = terminal else {
+        panic!("exact terminal is a separate frame")
+    };
+    assert!(s.observe(terminal));
+    assert!(!s.running());
 }
 #[test]
 fn rejected_start_does_not_clear_current_and_closed_never_downgrades() {

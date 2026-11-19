@@ -62,37 +62,18 @@ fn auto_connect_disabled_by_default_and_on_bad_types() {
     );
 }
 
-/// 系统拉起的核在跑（Android always-on / 开机自动连接）⇒ 不论 `autoConnect`，都收编。
-/// 反向对照：同一份配置、`system_core_running=false` 时 `autoConnect:false` 仍是 `Disabled` ——
-/// 证明是这一位、而不是配置本身把决策翻过来的。
 #[test]
-fn system_started_core_is_adopted_regardless_of_auto_connect() {
-    let off = json!({ "autoConnect": false, "selectedServerId": "srv-1" });
-    assert_eq!(
-        decide_auto_connect(&off, true),
-        AutoConnectDecision::AdoptSystemCore {
-            server_id: "srv-1".to_string()
-        }
-    );
-    assert_eq!(
-        decide_auto_connect(&off, false),
-        AutoConnectDecision::Disabled
-    );
-    assert_eq!(
-        decide_auto_connect(&json!({ "selectedServerId": "srv-1" }), true),
-        AutoConnectDecision::AdoptSystemCore {
-            server_id: "srv-1".to_string()
-        },
-        "缺 autoConnect 字段同样收编"
-    );
-    assert_eq!(
-        decide_auto_connect(
-            &json!({ "autoConnect": false, "selectedServerId": "" }),
-            true
-        ),
-        AutoConnectDecision::NoServerSelected,
-        "没有选中节点就无从按当前配置起核 —— 落 warn 分支，不静默"
-    );
+fn opening_app_preserves_system_started_core_with_either_auto_connect_setting() {
+    for config in [
+        json!({ "autoConnect": true, "selectedServerId": "srv-1" }),
+        json!({ "autoConnect": false, "selectedServerId": "srv-1" }),
+        json!({ "autoConnect": true }),
+    ] {
+        assert_eq!(
+            decide_auto_connect(&config, true),
+            AutoConnectDecision::Disabled
+        );
+    }
 }
 
 // ── should_auto_check_update ──────────────────────────────────────────────

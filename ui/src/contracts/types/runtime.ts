@@ -48,6 +48,8 @@ export interface ProxyStatus {
   starting?: boolean;
   /** Android native dual-mode reload was refused; connect again through Polaris. */
   reconnectRequired?: boolean;
+  /** Live Android system VPN observation without App-owned route or runtime custody. */
+  androidSystemVpn?: 'starting' | 'ready' | 'closing' | 'unavailable';
 }
 
 // ============================================================================

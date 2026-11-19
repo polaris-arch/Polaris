@@ -1685,7 +1685,9 @@ async fn start_yields_without_spawning_when_superseded_before_spawn() {
     // 直接调 start_inner 并传入已过期的世代 → 应让位返回、不 spawn。
     let cfg = serde_json::json!({ "servers": [], "selectedServerId": "__direct__" });
     let ts_gate = rt.mesh.tailscale_state_gate().await;
-    let r = rt.start_inner(cfg, stale_gen, &ts_gate).await;
+    let r = rt
+        .start_inner(cfg, stale_gen, &ts_gate, false, &mut None)
+        .await;
     assert!(r.is_ok(), "让位是正常返回，不是错误");
     assert!(!rt.status().running, "让位腿不得置 running");
     assert!(
@@ -3707,6 +3709,112 @@ async fn accepted_kernel_config_cache_survives_runtime_restart_and_misses_on_str
         .unwrap();
     assert_eq!(changed.checks_run, 1, "用户端口等结构变化必须重验");
     assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "3");
+}
+
+#[tokio::test]
+async fn android_preflight_keeps_system_restart_source_intact() {
+    let (runtime, _dir) = test_runtime();
+    let path = runtime.runtime_config_path();
+    let last_good = br#"{"outbounds":[{"type":"direct","tag":"last-good"}]}"#;
+    std::fs::write(&path, last_good).unwrap();
+    let cfg = gate_two_node_config();
+    let user_config = serde_json::from_value(cfg.clone()).unwrap();
+    let mut deps = runtime.generate_deps(0, 0, 0, None, &[], &cfg, false);
+    deps.platform = "android".into();
+    let outcome = runtime
+        .generate_and_gate(&user_config, &deps, &path, None, &mut BTreeMap::new())
+        .await
+        .unwrap();
+    assert_ne!(outcome.config_json.as_bytes(), last_good);
+    assert_eq!(std::fs::read(path).unwrap().as_slice(), last_good);
+}
+
+#[test]
+fn android_rule_generation_retains_previous_assets_until_known_ready() {
+    use crate::runtime::proxy::android_rule_assets::AndroidRuleAssets;
+    use crate::runtime::proxy::startup::write_private_runtime_config;
+
+    let (runtime, dir) = test_runtime();
+    let saved = runtime.runtime_config_path();
+    let mut old = AndroidRuleAssets::new(&dir, &saved, "legacy-000000000000000000000001").unwrap();
+    let old_custom = old.custom.join("custom-rule-old.json");
+    let old_tailnet = old.tailnet.join("tailnet-old.json");
+    let old_unreferenced = old.tailnet.join("tailnet-unreferenced.json");
+    write_private_runtime_config(&old_custom, "old custom rules").unwrap();
+    write_private_runtime_config(&old_tailnet, "old observed hosts").unwrap();
+    write_private_runtime_config(&old_unreferenced, "unreferenced old observed hosts").unwrap();
+    let legacy_tailnet = dir.join("tailnet-rules").join("tailnet-legacy.json");
+    write_private_runtime_config(&legacy_tailnet, "legacy observed hosts").unwrap();
+    for (config, history) in [
+        ("{\"route\":{\"rule_set\":[]}}".to_owned(), None),
+        ("invalid runtime JSON".to_owned(), None),
+        (
+            serde_json::json!({"route":{"rule_set":[{"type":"local","path":legacy_tailnet}]}})
+                .to_string(),
+            Some(legacy_tailnet.clone()),
+        ),
+    ] {
+        write_private_runtime_config(&saved, &config).unwrap();
+        let migration =
+            AndroidRuleAssets::new(&dir, &saved, "legacy-000000000000000000000005").unwrap();
+        assert_eq!(
+            migration.tailnet_history_file("tailnet-legacy.json"),
+            history
+        );
+    }
+    old.sync_directories().unwrap();
+    old.set_dispatched(true);
+    let last_good = serde_json::json!({"route":{"rule_set":[
+        {"type":"local","path":old_custom}, {"type":"local","path":old_tailnet}
+    ]}})
+    .to_string();
+    write_private_runtime_config(&saved, &last_good).unwrap();
+    let rejected = AndroidRuleAssets::new(&dir, &saved, "legacy-000000000000000000000004").unwrap();
+    let unlaunched = rejected.custom.join("custom-rule-old.json");
+    write_private_runtime_config(&unlaunched, "abandoned preflight").unwrap();
+    drop(rejected);
+    assert!(!unlaunched.exists());
+    assert!(old_custom.is_file());
+
+    let mut uncertain =
+        AndroidRuleAssets::new(&dir, &saved, "legacy-000000000000000000000002").unwrap();
+    assert_eq!(
+        uncertain.tailnet_history_file("tailnet-old.json"),
+        Some(old_tailnet)
+    );
+    assert_eq!(
+        uncertain.tailnet_history_file("tailnet-unreferenced.json"),
+        None
+    );
+    assert_eq!(uncertain.tailnet_history_file("tailnet-legacy.json"), None);
+    let candidate = uncertain.custom.join("custom-rule-old.json");
+    write_private_runtime_config(&candidate, "changed desired rules").unwrap();
+    uncertain.set_dispatched(true);
+    drop(uncertain);
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), last_good);
+    assert_eq!(
+        std::fs::read_to_string(&old_custom).unwrap(),
+        "old custom rules"
+    );
+    assert!(AndroidRuleAssets::new(&dir, &saved, "legacy-000000000000000000000002").is_err());
+
+    let mut active =
+        AndroidRuleAssets::new(&dir, &saved, "legacy-000000000000000000000003").unwrap();
+    active.set_dispatched(true);
+    let active_tailnet = active.tailnet.join("tailnet-active.json");
+    write_private_runtime_config(&active_tailnet, "new observed hosts").unwrap();
+    write_private_runtime_config(&saved, "not a verified runtime config").unwrap();
+    active.reclaim_retired(&saved).unwrap();
+    assert!(candidate.exists());
+    let ready = serde_json::json!({"route":{"rule_set":[
+        {"type":"local","path":old_custom}, {"type":"local","path":active_tailnet}
+    ]}})
+    .to_string();
+    write_private_runtime_config(&saved, &ready).unwrap();
+    active.reclaim_retired(&saved).unwrap();
+    assert!(!candidate.exists());
+    assert!(old_custom.is_file());
+    assert!(active_tailnet.is_file());
 }
 
 /// 🔴 **整环门：内核点名 → 真的重新生成 → 坏节点从落盘配置里消失 → 走既有通道上报**。

@@ -37,9 +37,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use polaris_config_engine::builder::custom_rule_files::{
-    build_custom_rule_files, is_custom_rule_orphan_file,
-};
+use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
+#[cfg(any(not(target_os = "android"), test))]
+use polaris_config_engine::builder::custom_rule_files::is_custom_rule_orphan_file;
 use polaris_config_engine::builder::endpoint_routes::{
     mesh_system_supported_on_platform, mesh_uses_system_interface,
 };
@@ -1278,6 +1278,8 @@ impl ProxyRuntime {
         config: Value,
         my_gen: u64,
         ts_gate: &tokio::sync::MutexGuard<'_, ()>,
+        passive_android: bool,
+        android_preparation: &mut Option<super::android_bridge::AndroidMainPreparation>,
     ) -> Result<ProxyStatus, StartError> {
         // 早退让位（#176）：入口即被更新的 start/stop 接管 → 别白做 config 生成/写盘/端口解析。
         // 这只是省功，**不是**孤儿防线——真正的防线是下方 spawn 临界区内的持锁判世代。
@@ -1448,6 +1450,28 @@ impl ProxyRuntime {
                 self.set_error(&message, code);
                 return Err(StartError::coded(message, code));
             }
+            let reservation = super::android_bridge::reserve_main_start().await;
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
+            }
+            match reservation {
+                Ok(reservation) => *android_preparation = Some(reservation),
+                Err((_, super::android_bridge::MAIN_BUSY_NO_BIRTH)) if passive_android => {
+                    return Ok(self.status());
+                }
+                Err((message, error_code)) => {
+                    let error_code = if error_code == super::android_bridge::MAIN_BUSY_NO_BIRTH {
+                        code::STARTUP_FAILED
+                    } else {
+                        error_code
+                    };
+                    self.set_error(&message, error_code);
+                    return Err(StartError::coded(message, error_code));
+                }
+            }
+            if self.gate.generation() != my_gen {
+                return Ok(self.status());
+            }
         }
 
         // ── 端口两轴常量（单一真值复用 config-engine::proxy_ports）。mixed/control 由 config 决定、
@@ -1459,6 +1483,7 @@ impl ProxyRuntime {
         //     ext 分支按文件真存在性 `ext_rule_file_exists` 决定走 ext 引用还是 inline 降级；文件不在 →
         //     ext 分支 100% 不可达）。移植 上游 start :750 `writeCustomRuleFiles`。一次（重试腿不重清孤儿）。
         let t_rules_prep = std::time::Instant::now();
+        #[cfg(not(target_os = "android"))]
         self.write_custom_rule_files(&user_config).await;
 
         // 3.2 起核前落盘 tailnet rule-set 文件（**同样必须在 generate 前**：块 0c 按
@@ -1466,9 +1491,22 @@ impl ProxyRuntime {
         //     观测集（盘上文件即持久层）+ 配置期已知段；首次运行无观测 ⇒ 官方默认两段，
         //     **不写空文件**（空 rule-set 会让该节点整段 tailnet 不可路由）。见 `tailnet_rules`。
         //     这一趟同时把盘上的观测面读回内存，供下面 `generate_deps` 注入 TUN 排除面。
+        #[cfg(not(target_os = "android"))]
         self.write_tailnet_rule_files_for_generation(&user_config, &config, my_gen)
             .await
             .map_err(StartError::from)?;
+
+        let config_path = self.runtime_config_path();
+        #[cfg(target_os = "android")]
+        let mut android_rule_assets = self.stage_android_rule_assets(
+            &user_config,
+            &config,
+            my_gen,
+            &config_path,
+            android_preparation
+                .as_ref()
+                .expect("reserved before preparing Android rules"),
+        )?;
 
         // ── 内置 geo 规则集播种（调用点 2/2：**每次起核前**；对齐 上游 `ProxyManager.ts:6375`）──
         // 与上面的 writeCustomRuleFiles 同理，**必须在 generate 之前**：route builder 按
@@ -1482,7 +1520,6 @@ impl ProxyRuntime {
             &crate::runtime::geo_seed::SeedOptions::default(),
         );
 
-        let config_path = self.runtime_config_path();
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("创建配置目录失败 {}: {e}", parent.display()))?;
@@ -1616,6 +1653,33 @@ impl ProxyRuntime {
                 return Ok(self.status());
             }
 
+            #[cfg(target_os = "android")]
+            if android_preparation.is_none() {
+                // Returning to this loop after native Ready requires a confirmed exact
+                // Stop. A pre-birth retired endpoint leaves the original permit here.
+                let result = super::android_bridge::reserve_main_start().await;
+                if self.gate.generation() != my_gen {
+                    return Ok(self.status());
+                }
+                let reservation = result.map_err(|(message, error_code)| {
+                    let error_code = if error_code == super::android_bridge::MAIN_BUSY_NO_BIRTH {
+                        code::STARTUP_FAILED
+                    } else {
+                        error_code
+                    };
+                    self.set_error(&message, error_code);
+                    StartError::coded(message, error_code)
+                })?;
+                *android_preparation = Some(reservation);
+                android_rule_assets = self.stage_android_rule_assets(
+                    &user_config,
+                    &config,
+                    my_gen,
+                    &config_path,
+                    android_preparation.as_ref().expect("new reservation"),
+                )?;
+            }
+
             // 每次尝试重解析空闲端口（端口重分配自愈）+ 重生成配置（端口嵌入 config，必须同刷写盘）。
             let t_config_gen = std::time::Instant::now();
             let StartPorts {
@@ -1636,6 +1700,11 @@ impl ProxyRuntime {
                 &config,
                 takeover_active,
             );
+            #[cfg(target_os = "android")]
+            {
+                deps.custom_rules_dir = android_rule_assets.custom.to_string_lossy().into_owned();
+                deps.tailnet_rules_dir = android_rule_assets.tailnet.to_string_lossy().into_owned();
+            }
             // Reuse the validated startup mode instead of decoding the full config again.
             deps.linux_resolved_external =
                 linux_helper_resolved_owner(self.helper.platform(), user_config.proxy_mode_type);
@@ -1933,6 +2002,9 @@ impl ProxyRuntime {
                 // the unarmed reservation guard may roll it back under TS gate.
                 super::android_bridge::main_start_dispatch_available()
                     .map_err(|(message, error_code)| StartError::coded(message, error_code))?;
+                let preparation = android_preparation
+                    .as_ref()
+                    .ok_or_else(|| StartError::from("Android 起核缺少原生准备准入".to_owned()))?;
                 let Some(android_birth) = self
                     .book_android_global_start_for_generation(my_gen, main_claim_token.clone())?
                 else {
@@ -1940,21 +2012,38 @@ impl ProxyRuntime {
                     return Ok(self.status());
                 };
                 main_reservation.arm_external_start();
+                #[cfg(target_os = "android")]
+                android_rule_assets.set_dispatched(true);
                 match super::android_bridge::start_core_with_birth(
                     &gate_config_json,
                     android_birth.clone(),
+                    preparation,
                 )
                 .await
                 {
                     Ok(receipt) => {
                         self.confirm_android_global_start(&android_birth, receipt.exact_target())?;
+                        android_preparation
+                            .take()
+                            .expect("native Ready consumed its Start reservation")
+                            .confirm_consumed();
                         0
                     }
                     Err((msg, error_code)) => {
-                        if error_code == super::android_bridge::ENDPOINT_RETIRED_NO_BIRTH {
+                        let busy = error_code == super::android_bridge::MAIN_BUSY_NO_BIRTH;
+                        if busy || error_code == super::android_bridge::ENDPOINT_RETIRED_NO_BIRTH {
                             self.abandon_android_global_start_without_birth(&android_birth)
                                 .map_err(|e| StartError::coded(e, code::STARTUP_FAILED))?;
                             main_reservation.confirmed_no_external_writer();
+                            #[cfg(target_os = "android")]
+                            android_rule_assets.set_dispatched(false);
+                            if busy {
+                                if passive_android {
+                                    return Ok(self.status());
+                                }
+                                self.set_error(&msg, code::STARTUP_FAILED);
+                                return Err(StartError::coded(msg, code::STARTUP_FAILED));
+                            }
                             retired_endpoint_retries += 1;
                             if retired_endpoint_retries <= 8 {
                                 log::warn!(
@@ -2512,6 +2601,8 @@ impl ProxyRuntime {
             // 读时投影字段，存储态恒 false（真值 = `start_inflight` 计数，见字段文档）。
             starting: false,
             reconnect_required: false,
+            #[cfg(target_os = "android")]
+            android_system_vpn: None,
             pid,
             // 起核就绪时刻 = 运行时长的零点。**取就绪后而非 spawn 时**：就绪前核还没在服务，
             // 把 12s 就绪门算进「已运行」是虚报。与 running 同生共死（stop/set_error 经 Default 清回 None）。
@@ -2595,6 +2686,12 @@ impl ProxyRuntime {
             self.activate_tailnet_context(my_gen, tailnet_bindings);
             if let Some(ready_at_ms) = new_status.start_time {
                 self.publish_mesh_route_run(mesh_route_prepared, ready_at_ms);
+            }
+        }
+        #[cfg(target_os = "android")]
+        if self.gate.generation() == my_gen && super::android_bridge::core_started() {
+            if let Err(error) = android_rule_assets.reclaim_retired(&config_path) {
+                log::warn!("Android 旧规则目录清理失败：{error}");
             }
         }
         // A1：systemProxy 模式把 OS 系统代理指向本地 mixed 入站（127.0.0.1:mixedPort），否则流量不经核
@@ -3583,12 +3680,47 @@ impl ProxyRuntime {
 
     /// sing-box 临时配置文件路径（写 generate_sing_box_config 输出，供 spawner 读）。
     #[must_use]
+    #[cfg(target_os = "android")]
+    fn stage_android_rule_assets(
+        &self,
+        user_config: &UserConfig,
+        raw: &Value,
+        generation: u64,
+        config_path: &Path,
+        reservation: &super::android_bridge::AndroidMainPreparation,
+    ) -> Result<super::android_rule_assets::AndroidRuleAssets, StartError> {
+        let assets = super::android_rule_assets::AndroidRuleAssets::new(
+            self.config.dir(),
+            config_path,
+            reservation.run_id(),
+        )
+        .map_err(|error| StartError::from(error.to_string()))?;
+        self.custom_rule_files_degraded
+            .store(false, Ordering::SeqCst);
+        for (name, content) in build_custom_rule_files(user_config) {
+            write_private_runtime_config(&assets.custom.join(name), &content)?;
+        }
+        self.prepare_tailnet_rule_files(
+            user_config,
+            raw,
+            generation,
+            &assets.tailnet,
+            |name| assets.tailnet_history_file(name),
+            true,
+        )?;
+        assets
+            .sync_directories()
+            .map_err(|error| StartError::from(error.to_string()))?;
+        Ok(assets)
+    }
+
     pub fn runtime_config_path(&self) -> PathBuf {
         self.config.join("singbox-runtime.json")
     }
 
     /// 外化规则目录（`<configDir>/custom-rules`）——与 `generate_deps` 的 `custom_rules_dir` 及
     /// config-engine route/DNS ext 分支 `ext_rule_file_exists` 探测路径同源（单一真值）。
+    #[cfg(any(not(target_os = "android"), test))]
     pub(super) fn custom_rules_dir(&self) -> PathBuf {
         self.config.dir().join("custom-rules")
     }
@@ -3780,6 +3912,7 @@ impl ProxyRuntime {
     /// **必须在 generate 前**：generate 的 route/DNS ext 分支按文件真存在性（`ext_rule_file_exists`）决定走
     /// ext 引用还是 inline 降级；文件不在则 ext 分支 100% 不可达。非 smart 模式 `build_custom_rule_files` 返
     /// 空集 → 已存在的外化文件被当孤儿全清（route 侧无消费者）。
+    #[cfg(any(not(target_os = "android"), test))]
     pub(super) async fn write_custom_rule_files(&self, config: &UserConfig) {
         let dir = self.custom_rules_dir();
         let expected = build_custom_rule_files(config); // fileName → JSON
@@ -3926,6 +4059,12 @@ impl ProxyRuntime {
         let Some(tag) = custom_rule_file_tag(&name) else {
             return false;
         };
+        #[cfg(target_os = "android")]
+        let Some((directory, _)) = self.live_rule_directories(generation) else {
+            return false;
+        };
+        #[cfg(not(target_os = "android"))]
+        let directory = self.custom_rules_dir();
         let Ok(before) = api.status(vec![tag.clone()]).await else {
             return false;
         };
@@ -3958,7 +4097,7 @@ impl ProxyRuntime {
                 content: content.clone(),
                 acknowledged_instance: None,
             });
-            atomic_write_custom_rule(&self.custom_rules_dir().join(&name), &content).is_ok()
+            atomic_write_custom_rule(&directory.join(&name), &content).is_ok()
         });
         self.push_pending_changes();
         if !wrote {
@@ -4317,12 +4456,16 @@ impl ProxyRuntime {
             validate_startup_cli_proof(binary, capabilities, cli_observation.as_ref().ok())?;
             let json = serde_json::to_string_pretty(&gen_out.config)
                 .map_err(|e| format!("sing-box 配置序列化失败: {e}"))?;
-            // The iOS managed Start keeps logical bytes in memory until the
-            // fresh original provider proves its bundled source/owner capability.
-            // No runtime-config file is exposed to an older shared-profile reader.
-            #[cfg(not(target_os = "ios"))]
-            write_private_runtime_config(config_path, &json)
-                .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
+            // Android publishes the restart source only after the exact bridge
+            // attempt reaches native readiness. Preflight can lose to SystemStart.
+            // iOS likewise stages the logical bytes until provider admission.
+            if !matches!(
+                Platform::parse(&deps.platform),
+                Platform::Android | Platform::Ios
+            ) {
+                write_private_runtime_config(config_path, &json)
+                    .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
+            }
 
             // 核解析不到（首启未落核 / 单测未注入）→ 闸门无从判定，照原样下发（failOpen）。
             //
@@ -4611,7 +4754,7 @@ pub(super) fn validate_startup_cli_proof(
     Ok(())
 }
 
-/// `ProxyRuntime::generate_and_gate` 的产物：**已落盘**的那份配置 + 本次全部剔除报告。
+/// `ProxyRuntime::generate_and_gate` 的产物：候选内核配置和本次全部剔除报告。
 pub(super) struct GateOutcome {
     pub(super) config: SingBoxConfig,
     pub(super) mesh_route_candidates:
@@ -4619,15 +4762,7 @@ pub(super) struct GateOutcome {
     pub(super) mesh_route_total_candidate_count: usize,
     pub(super) mesh_route_diagnostics_limited: bool,
     pub(super) mesh_route_dns_owner_server_id: Option<String>,
-    /// 🔴 **已落盘的那一份配置的字节，逐字**（不是把 `config` 再序列化一次）。
-    ///
-    /// 存在的唯一理由是 Android：核是进程内 `.so`，起核 = 把这串交给 `libbox`。它与
-    /// `write_private_runtime_config(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
-    /// `runtime_config_path()` 与内核实际吃的那份不可能漂。
-    ///
-    /// **不可改成「从盘上读回来再交给 libbox」**：那样诊断与内核就有了两条路径，而这条链上唯一
-    /// 值得信的性质恰恰是「两者同源」。桌面侧不消费本字段（核自己去读盘），保留它是为了让
-    /// 「同源」这件事写在类型里，而不是靠每个后来者都记得。
+    /// Android 直接把这些字节交给 libbox。只有原生就绪的应用会话才能提交重启源。
     pub(super) config_json: String,
     pub(super) pruned_rule_set_tags: Vec<String>,
     /// 网络场景规则报告（`GenerateOutcome::pruned_env_rules` 原样带出）。
@@ -5691,7 +5826,7 @@ fn rule_content_acknowledged(
                 && s.watcher_state == "watching"
         })
 }
-fn write_private_runtime_config(path: &Path, text: &str) -> Result<(), String> {
+pub(super) fn write_private_runtime_config(path: &Path, text: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("runtime config has no parent")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let metadata = std::fs::symlink_metadata(parent).map_err(|e| e.to_string())?;

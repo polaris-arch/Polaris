@@ -18,22 +18,19 @@ import java.security.MessageDigest
  * 系统以 `android.net.VpnService` 意图拉起服务时根本没有桥调用 ⇒ `BoxService.startKernel` 拿到
  * `null` ⇒ 抛错自停。设置页却在引导用户去开「始终开启的 VPN」—— 那条路**一定**失败。
  *
- * # 真值单一：配置字节只有 Rust 落的那一份
+ * # 真值单一：只保存实际交给内核并通过就绪门的配置字节
  *
- * Rust 起核时 `std::fs::write(config_path, &json)` 与交给桥的 `configContent` 是**同一个 `json`
- * 变量**（`runtime/proxy/startup.rs` 的 `generate_and_gate_with_runtime_bindings`）。`config_path` =
+ * Rust 生成的 `configContent` 由获得原生归属的 [BoxService] 验证并提交。`config_path` =
  * `app_config_dir()/polaris/singbox-runtime.json`，而 Tauri Android 的 `app_config_dir()` 就是
  * `Context.getDataDir()`（`tauri-2.11.5/mobile/android/.../PathPlugin.kt` 的 `getConfigDir`）。
- * 故本类**不另存配置**，只读那一份；两段路径字面量由 `scripts/check-android-bridge.mjs` 的 A13
- * 与 Rust 侧逐字对拍。
+ * 等待原生准入期间，App 的候选配置保留在内存里，系统仍能用同一份已保存的配置起核。
  *
  * # 本类自己只存一样东西：「最近一次**经桥成功**起核的配置摘要」（sha256）
  *
  * 放 `noBackupFilesDir`（不进自动备份、不在外部存储）。它回答两个问题：
  *  · **准入**：它在 ⇔ 用户最后一次的意图是「连着」。用户主动断开（应用内断开 / 通知栏「断开」/
  *    系统里撤销授权）即删 ⇒ 之后系统再拉起服务也只会留一行日志然后自停，不会违背用户意图重连。
- *  · **身份**：Rust 之后可能为一次**没起成功**的尝试覆盖了盘上文件（生成成功、闸门拒收 / 起核失败）。
- *    摘要对不上 ⇒ 盘上已不是「最近一次成功起核的那份」⇒ 拒绝，而不是拿一份没人验证过的配置起核。
+ *  · **身份**：重启必须验证保存配置的摘要。两文件提交期间或提交中断后，缺失或不匹配都拒绝起核。
  *
  * # 开机自动连接开关（`autoStart` 的 Android 腿）
  *
@@ -91,47 +88,10 @@ internal object SystemStart {
     internal fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
-    /**
-     * 经桥起核**成功之后**调：记下这份配置的摘要。
-     *
-     * 摘要取自**盘上那份**，且先与桥交来的字符串比一次：两者不等 ⇒ Kotlin 与 Rust 对「配置文件在哪」
-     * 的理解已经分叉（路径漂移），此时写摘要只会让将来的系统起核拿到错的东西。故不写、删旧的、
-     * 并**当场**报错日志 —— 这一形在「用户主动连接」这条最常走的路上就会自曝，不必等到开机那一刻。
-     */
-    @Synchronized
-    fun remember(context: Context, bridgeConfig: String, expectedGeneration: Long, allowed: () -> Boolean) {
-        // This check shares forget's monitor with the write. A late success from an
-        // attempt that predates user disconnect can never restore auto-start admission.
-        if (disconnectGeneration != expectedGeneration || !allowed()) return
-        requireLegacyAllowed(context)
-        val file = runtimeConfig(context)
-        val onDisk = runCatching { file.readBytes() }.getOrNull()
-        val expected = sha256(bridgeConfig.toByteArray(Charsets.UTF_8))
-        if (onDisk == null || sha256(onDisk) != expected) {
-            digestFile(context).delete()
-            Log.e(
-                TAG,
-                "盘上配置 ${file.path} 与桥交来的不是同一份（" +
-                    (if (onDisk == null) "文件不存在" else "摘要不等") +
-                    "）—— 系统发起的起核将不可用",
-            )
-            return
-        }
-        writeAtomically(digestFile(context), expected)
-        // A marker published while the digest was being written cannot leave old admission behind.
-        try {
-            requireLegacyAllowed(context)
-        } catch (error: Throwable) {
-            digestFile(context).delete()
-            throw error
-        }
-        Log.i(TAG, "已记下本次起核配置，系统发起的起核可用")
-    }
-
     /** Commit the actual restart source, never a diagnostic snapshot. Caller owns BoxService. */
     @Synchronized
     fun persistRuntime(context: Context, config: String, expectedDigest: String,
-                       expectedGeneration: Long, allowed: () -> Boolean, publish: () -> Unit) {
+                       expectedGeneration: Long, allowed: () -> Boolean, publish: () -> Boolean): Boolean {
         check(disconnectGeneration == expectedGeneration && allowed()) { "runtime persistence owner expired" }
         requireLegacyAllowed(context)
         check(config.isNotEmpty() && sha256(config.toByteArray(Charsets.UTF_8)) == expectedDigest) {
@@ -146,13 +106,17 @@ internal object SystemStart {
         }
         invalidate()
         try {
-            writeDurably(runtimeConfig(context), config)
+            val runtime = runtimeConfig(context)
+            val parent = checkNotNull(runtime.parentFile)
+            check(OsConstants.S_ISDIR(Os.lstat(parent.path).st_mode)) { "runtime persistence path is not a directory" }
+            Os.chmod(parent.path, 0b111000000)
+            writeDurably(runtime, config)
             check(disconnectGeneration == expectedGeneration && allowed()) { "runtime persistence owner expired" }
             requireLegacyAllowed(context)
             writeDurably(admission, expectedDigest)
             requireLegacyAllowed(context)
             check(disconnectGeneration == expectedGeneration && allowed()) { "runtime persistence owner expired" }
-            publish()
+            return publish().also { if (!it) invalidate() }
         } catch (failure: Throwable) {
             // Never roll a published graph back, or restore stale restart permission.
             try { invalidate() } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
@@ -186,7 +150,9 @@ internal object SystemStart {
         val parent = checkNotNull(target.parentFile)
         check(parent.isDirectory) { "runtime persistence directory missing" }
         val tmp = File(parent, ".${target.name}.${java.util.UUID.randomUUID()}.tmp")
+        check(tmp.createNewFile()) { "runtime persistence temporary already exists" }
         try {
+            Os.chmod(tmp.path, 0b110000000)
             java.io.FileOutputStream(tmp).use { output ->
                 output.write(content.toByteArray(Charsets.UTF_8))
                 output.fd.sync()

@@ -253,10 +253,17 @@ pub fn endpoint_force_route_report(state: State<'_, AppRuntime>) -> ApiResponse<
                 )
             }
         };
-    // tailnet rule-set 目录：走 config-engine 的目录名常量，**不在此另写一个字面量** ——
-    // 传错目录不会报错，只会让每个 TS 节点都被读成 inline 腿，而内核吃的是 rule-set 腿，
-    // 报告从此系统性说反。落盘侧（`ProxyRuntime::tailnet_rules_dir`）今天仍各拼一次同名字面量，
-    // 已登记为待收口项（那个方法是 `pub(super)`，收口要动 runtime 层）。
+    #[cfg(target_os = "android")]
+    let tailnet_rules_dir = {
+        let status = state.proxy().status();
+        status
+            .running
+            .then(|| state.proxy().live_rule_directories(status.main_generation))
+            .flatten()
+            .map(|(_, tailnet)| tailnet)
+            .unwrap_or_default()
+    };
+    #[cfg(not(target_os = "android"))]
     let tailnet_rules_dir = state
         .config()
         .dir()

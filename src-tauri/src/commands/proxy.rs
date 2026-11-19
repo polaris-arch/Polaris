@@ -286,6 +286,17 @@ pub async fn proxy_get_status(
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             response = proxy_status_response(state.proxy());
         }
+        #[cfg(target_os = "android")]
+        if let Some(status) = response
+            .data
+            .as_mut()
+            .filter(|status| !status.running && !status.starting)
+        {
+            let phase = crate::runtime::proxy::android_bridge::system_start_phase().await;
+            if state.proxy().core_generation() == status.main_generation {
+                status.android_system_vpn = phase;
+            }
+        }
         response
     }
     .await)

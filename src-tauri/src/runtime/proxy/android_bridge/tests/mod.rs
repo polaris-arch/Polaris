@@ -118,14 +118,14 @@ async fn non_android_legs_fail_honestly() {
 
 /// 🔴 **变异锁：非 Android 上「系统拉起的核」恒不存在。**
 ///
-/// 这一位在桌面上也被读（启动期自动连接腿不分平台地问它）。变异：非 Android 腿改成 `true` ⇒
-/// 本条断；而生产后果是桌面每次冷启动都无视 `autoConnect:false` 去起核（`AdoptSystemCore` 优先于开关）。
+/// 桌面启动不会收到 Android 系统 VPN 观察。
 #[tokio::test]
 async fn non_android_never_reports_a_system_started_core() {
     if cfg!(target_os = "android") {
         return;
     }
     assert!(!system_started_core_running().await);
+    assert_eq!(system_start_phase().await, None);
 }
 
 #[test]

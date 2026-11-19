@@ -1066,7 +1066,13 @@ async fn newly_claimed_start_supersedes_an_old_direct_spawn() {
         assert_ne!(rt.gate.generation(), old_generation);
     }
     let old_result = rt
-        .start_inner(local_only_config(free_port()), old_generation, &held_gate)
+        .start_inner(
+            local_only_config(free_port()),
+            old_generation,
+            &held_gate,
+            false,
+            &mut None,
+        )
         .await
         .expect("superseded start yields without a Child");
     assert!(!old_result.running);

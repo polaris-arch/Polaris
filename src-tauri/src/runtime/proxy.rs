@@ -26,6 +26,8 @@
 
 pub(crate) mod android_bridge;
 pub(crate) mod android_capacity;
+#[cfg(any(target_os = "android", test))]
+mod android_rule_assets;
 // Read-only proof shape for a future Android managed handoff. It cannot release
 // legacy custody or publish NoOldCore until every native owner is wired.
 #[allow(dead_code)]
@@ -299,6 +301,10 @@ pub struct ProxyStatus {
     /// but the user must reconnect through the app for a fresh API endpoint.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reconnect_required: bool,
+    /// Read-time Android system VPN observation, separate from App-owned readiness.
+    #[cfg(target_os = "android")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android_system_vpn: Option<AndroidSystemVpnPhase>,
     /// sing-box 进程 pid（未运行=0）。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub pid: u32,
@@ -343,6 +349,15 @@ pub struct ProxyStatus {
     /// 绝不靠猜 message/退出码反推（本仓尚无核错误分类器，猜=伪造分类）。
     #[serde(rename = "errorCode", default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AndroidSystemVpnPhase {
+    Starting,
+    Ready,
+    Closing,
+    Unavailable,
 }
 
 /// 代理错误码（前端 `ui/src/contracts/types/runtime.ts` 的 `ProxyErrorCode` string enum 子集镜像）。

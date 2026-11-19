@@ -1,5 +1,7 @@
 package com.polaris2.app.vpn
 
+import app.tauri.plugin.Invoke
+import com.fasterxml.jackson.databind.ObjectMapper
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -282,10 +284,49 @@ class LegacyAdmissionFenceTest {
         assertEquals("native-in-flight", gate.status("fence-native").closedRunId)
     }
 
-    @Test fun beginSystemStartReentersAdmissionMonitorWithoutReversingLocks() {
-        val admitted = LegacySystemStartFence.admit { VpnBridge.beginSystemStart() }
-        assertEquals(true, admitted)
-        VpnBridge.finishStop()
+    @Test fun openingAppObservesSystemStartAndExactCloseWithoutChangingTheAttempt() {
+        val original = MainKernelAttempt<Any>(runId = "system-before-app")
+        val stale = MainKernelAttempt<Any>(runId = original.runId)
+        val ticket = AndroidNativeAdmission.Ticket("unused", AndroidNativeAdmission.Kind.Main, "app-open")
+        val candidate = """{"outbounds":[{"type":"direct","tag":"app"}]}"""
+        val appRequest = MainStartRequest(candidate, "app-open", SystemStart.sha256(candidate.toByteArray()), null, ticket)
+        val cancelledRunId = "cancelled-before-start"
+        val cancelledTicket = AndroidNativeAdmission.Ticket("unused-cancelled", AndroidNativeAdmission.Kind.Main, cancelledRunId)
+        var booked = 0
+        val reserve = { booked++; ticket }
+        val appInvoke = Invoke(0L, "start", 1L, 2L, { _, _ -> error("no bridge callback expected") }, "{}", ObjectMapper())
+        try {
+            assertEquals(true, LegacySystemStartFence.admit { VpnBridge.beginSystemStart(original) })
+            assertEquals("starting", VpnBridge.systemStartPhase())
+            assertTrue(VpnBridge.finishStart(null, attempt = original))
+            assertEquals("ready", VpnBridge.systemStartPhase())
+            assertFalse(VpnBridge.reserveStart(appRequest.runId, reserve))
+            assertEquals(0, booked)
+            assertFalse(VpnBridge.beginStart(appRequest, appInvoke))
+            assertNull(VpnBridge.currentStartRequest())
+            assertFalse(VpnBridge.beginSystemStart(stale))
+            VpnBridge.finishStop(attempt = stale)
+            assertEquals("ready", VpnBridge.systemStartPhase())
+            original.revokeAndDetachTun()
+            assertEquals("closing", VpnBridge.systemStartPhase())
+            VpnBridge.finishStop(attempt = original)
+            assertNull(VpnBridge.systemStartPhase())
+            assertTrue(VpnBridge.reserveStart(appRequest.runId, reserve))
+            assertEquals(1, booked)
+            VpnBridge.releaseStart("stale-run")
+            assertEquals(ticket, VpnBridge.reservedTicket(appRequest.runId))
+            VpnBridge.releaseStart(appRequest.runId)
+            assertTrue(VpnBridge.reserveStart(cancelledRunId) { cancelledTicket })
+            assertEquals(VpnBridge.StopAdmission.AlreadyStopped, VpnBridge.beginStop(appInvoke))
+            assertNull(VpnBridge.reservedTicket(cancelledRunId))
+            assertFalse(VpnBridge.beginSystemStart(stale))
+            VpnBridge.releaseStart(cancelledRunId)
+            assertTrue(VpnBridge.idleForFence())
+        } finally {
+            VpnBridge.releaseStart(appRequest.runId)
+            VpnBridge.releaseStart(cancelledRunId)
+            VpnBridge.finishStop(attempt = original)
+        }
     }
 
     private fun Thread.joinWithin(timeoutMs: Long): Boolean {

@@ -23,7 +23,6 @@ class RuntimePersistenceSourceTest {
         // Repeat-safe entry retains the same revision/digest and owner fences.
         assertFalse(box.contains("server.startOrReloadServiceWithRuntimePersistence("))
         assertTrue(handler.contains("revision != lastRevision || lastDigest == effectiveDigest"))
-        assertTrue(box.contains("VpnBridge.currentConfig() ?: bridgeConfig"))
     }
 
     @Test fun reloadSourceCompareAndEpochClaimShareCallbackMonitor() {
@@ -44,8 +43,8 @@ class RuntimePersistenceSourceTest {
     @Test fun restartSourceUsesFailClosedDigestAndDurableRenames() {
         val system = source("SystemStart")
         val commit = system.substringAfter("fun persistRuntime(").substringBefore("private fun syncDirectory")
-        assertTrue(commit.indexOf("invalidate()\n        try") < commit.indexOf("writeDurably(runtimeConfig(context), config)"))
-        assertTrue(commit.indexOf("writeDurably(runtimeConfig(context), config)") < commit.indexOf("writeDurably(admission, expectedDigest)"))
+        assertTrue(commit.indexOf("invalidate()\n        try") < commit.indexOf("writeDurably(runtime, config)"))
+        assertTrue(commit.indexOf("writeDurably(runtime, config)") < commit.indexOf("writeDurably(admission, expectedDigest)"))
         assertTrue(commit.indexOf("writeDurably(admission, expectedDigest)") < commit.indexOf("publish()"))
         assertTrue(commit.contains("disconnectGeneration == expectedGeneration && allowed()"))
         assertTrue(commit.contains("requireLegacyAllowed(context)"))
@@ -86,6 +85,6 @@ class RuntimePersistenceSourceTest {
         assertTrue(bridge.contains("running && !starting && !stopping"))
         assertTrue(bridge.contains("current.runId == attempt.runId && current.nativeTicket == attempt.nativeTicket"))
         assertTrue(bridge.contains("current.copy(configContent = config, configDigest = digest)"))
-        assertTrue(bridge.contains("check(systemStarted)"))
+        assertTrue(bridge.contains("check(systemAttempt === attempt)"))
     }
 }

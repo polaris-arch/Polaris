@@ -1235,6 +1235,21 @@ describe('⑨–⑫ 出口控制、检测与规则统计的当前呈现契约', 
     }
   });
 
+  it('系统 VPN 就绪时只观察连接，显式动作如实标为重连', () => {
+    const ownerless = { core: 'stopped', connState: 'disconnected', node: { kind: 'none' } } as const;
+    const html = render({ ...ownerless, systemVpn: 'ready' });
+    const header = headerOf(html);
+    expect(header).toContain('mobileHome.systemVpnReady');
+    expect(header).toContain('mobileHome.reconnectInApp');
+    expect(header).not.toContain('mobileHome.disconnect');
+    expect(html).toContain('mobileHome.systemVpnExitUnknown');
+    for (const systemVpn of ['starting', 'closing'] as const) {
+      const busy = headerOf(render({ ...ownerless, systemVpn }));
+      expect(busy).toContain('aria-busy="true"');
+      expect(busy).toContain('disabled');
+    }
+  });
+
   it('三种路由在同一互斥组，选中状态与动作标签均可读', () => {
     const html = render({ routing: 'global' });
     const route = html.slice(html.indexOf('class="h-routing"'), html.indexOf('</div>', html.indexOf('class="h-routing"')));

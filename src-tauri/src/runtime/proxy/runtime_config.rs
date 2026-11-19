@@ -1196,6 +1196,21 @@ impl ProxyRuntime {
             state.host.seed(generation, accepted_host_deps);
         }
     }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn live_rule_directories(
+        &self,
+        generation: u64,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let baseline = self.runtime_config_baseline.read().ok()?;
+        let current = baseline
+            .as_ref()
+            .filter(|entry| entry.generation == generation)?;
+        Some((
+            std::path::PathBuf::from(&current.deps.custom_rules_dir),
+            std::path::PathBuf::from(&current.deps.tailnet_rules_dir),
+        ))
+    }
     pub(super) fn clear_runtime_config_baseline(&self) {
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
             if let Some(previous) = baseline.take() {

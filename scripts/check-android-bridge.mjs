@@ -1096,7 +1096,7 @@ for (const c of FRAME_CONTRACTS) {
 //       `join("<文件名>")` 逐字相等（Tauri Android 的 app_config_dir 就是 dataDir）。
 //  A13c 存放面：准入摘要住 `noBackupFilesDir`；`SystemStart.kt` 里不许出现外部存储 / 可备份目录 API。
 //  A13d 用户意图：`SystemStart.forget(` 必须出现在三个「用户要断开」的入口（插件 `stop` 命令且排在
-//       幂等早退 `beginStop` 之前、BoxService 的停机广播接收器、`onRevoke`）；`SystemStart.remember(`
+//       幂等早退 `beginStop` 之前、BoxService 的停机广播接收器、`onRevoke`）；`SystemStart.persistRuntime(`
 //       必须出现在 `startKernel` 里。
 //  A13e 开机接收器：manifest 注册 `.vpn.BootReceiver` 收 BOOT_COMPLETED；`onReceive` 里
 //       开关 / VPN 授权 / 准入三道判定都排在 `startForegroundService(` 之前。
@@ -1237,8 +1237,8 @@ a13SelfCheck();
   if (!(kotlinFnBody(box.code, 'onRevoke') ?? '').includes('SystemStart.forget(')) {
     fail('A13d BoxService.onRevoke 里没有 SystemStart.forget(');
   }
-  if (!(startKernel ?? '').includes('SystemStart.remember(')) {
-    fail('A13d BoxService.startKernel 里没有 SystemStart.remember( —— 经桥起核成功后从不记下，系统起核恒被拒');
+  if (!(startKernel ?? '').includes('SystemStart.persistRuntime(')) {
+    fail('A13d BoxService.startKernel 里没有 SystemStart.persistRuntime( —— 经桥起核成功后从不记下，系统起核恒被拒');
   }
 
   // A13f: managed marker exists from Preparing; an old digest cannot bypass it.
@@ -1252,7 +1252,7 @@ a13SelfCheck();
   if (!markerGate.includes('Os.stat(') || !markerGate.includes('OsConstants.ENOENT')) {
     fail('A13f SystemStart 不能证明 marker 不存在（仅 ENOENT 可放行）');
   }
-  for (const name of ['load', 'remember']) {
+  for (const name of ['load', 'persistRuntime']) {
     if (!(kotlinFnBody(sys.code, name) ?? '').includes('requireLegacyAllowed(')) {
       fail(`A13f SystemStart.${name} 缺少从 Preparing 起的旧摘要阻断`);
     }

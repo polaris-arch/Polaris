@@ -50,39 +50,26 @@ const HELPER_UPGRADEABLE_DELAY_MS: u64 = 7_000;
 pub enum AutoConnectDecision {
     /// 开关开 + 有选中节点 → 连。
     Connect { server_id: String },
-    /// 有一个**系统拉起、本运行时不认识**的核在跑（Android always-on / 开机自动连接，进程被回收后
-    /// 重拉时 Rust 是全新的）→ 不论 `autoConnect` 开没开，都走一次标准 `proxy_start` 把它收编：
-    /// 起核前的孤儿清扫腿先停掉它，再按当前配置起。不收编的话界面停在「未连接」而隧道其实在跑，
-    /// 且用户点「连接」前那段时间 Rust 的一切运行态（状态 / 数据面 / 崩溃监测）都是空的。
-    AdoptSystemCore { server_id: String },
     /// 开关开但没选节点 → 只 warn（对齐 上游「已启用，但未选择服务器」分支），不静默。
     NoServerSelected,
-    /// 开关关（含缺省）→ 什么都不做。
+    /// 开关关闭或系统已启动 VPN → 保持现状。
     Disabled,
 }
 
 /// 纯决策：`autoConnect` 显式为 true 才连（缺省 = 关，对齐 上游 `if (config.autoConnect && ...)`
 /// 的 truthy 判定）；空串 `selectedServerId` 视同未选（上游 里 `''` 也是 falsy）。
 ///
-/// `system_core_running`：此刻是否有系统拉起、本运行时不认识的核（仅 Android 可能为真，见
-/// [`AutoConnectDecision::AdoptSystemCore`]）。它**优先于** `autoConnect`：用户的意图（连着）已经由
-/// 那个在跑的核表达了，开关只管「冷启动要不要主动连」。
+/// 系统已经启动 VPN 时，打开 App 只观察现有连接。
 #[must_use]
-pub fn decide_auto_connect(config: &Value, system_core_running: bool) -> AutoConnectDecision {
+pub fn decide_auto_connect(config: &Value, system_vpn_active: bool) -> AutoConnectDecision {
+    if system_vpn_active || config.get("autoConnect").and_then(Value::as_bool) != Some(true) {
+        return AutoConnectDecision::Disabled;
+    }
     let selected = config
         .get("selectedServerId")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_string);
-    if system_core_running {
-        return match selected {
-            Some(server_id) => AutoConnectDecision::AdoptSystemCore { server_id },
-            None => AutoConnectDecision::NoServerSelected,
-        };
-    }
-    if config.get("autoConnect").and_then(Value::as_bool) != Some(true) {
-        return AutoConnectDecision::Disabled;
-    }
     match selected {
         Some(server_id) => AutoConnectDecision::Connect { server_id },
         None => AutoConnectDecision::NoServerSelected,
@@ -119,9 +106,7 @@ fn spawn_exit_ip_probe(app: AppHandle) {
 /// 带 helper-missing 闸门 + 发 `EVENT_PROXY_STARTED`（托盘图标 / 前端连接态的同一真值源），
 /// 绕过它就得在这里重造两份逻辑且必然漂移。
 fn spawn_auto_connect(app: AppHandle) {
-    // Capture before the delay, never when the timer wakes. Adoption uses the
-    // same fence but remains its own policy decision below; Rust absence does
-    // not authorize native cleanup.
+    // Capture before the delay so a newer explicit Start or Stop supersedes this request.
     let admission = match app.state::<AppRuntime>().proxy().startup_admission() {
         Ok(admission) => admission,
         Err(error) => {
@@ -140,30 +125,21 @@ fn spawn_auto_connect(app: AppHandle) {
             return;
         };
         // 非 Android 恒 false（桥那一侧的非 Android 腿），不必在这里再分平台。
-        let system_core_running =
-            crate::runtime::proxy::android_bridge::system_started_core_running().await;
-        match decide_auto_connect(&config, system_core_running) {
+        let system_vpn_active = crate::runtime::proxy::android_bridge::system_start_phase()
+            .await
+            .is_some();
+        match decide_auto_connect(&config, system_vpn_active) {
             AutoConnectDecision::Disabled => {}
             AutoConnectDecision::NoServerSelected => {
-                log::warn!(
-                    "启动时自动连接已启用（或系统拉起的核在跑={system_core_running}），但未选择服务器"
-                );
+                log::warn!("启动时自动连接已启用，但未选择服务器");
             }
-            AutoConnectDecision::Connect { server_id }
-            | AutoConnectDecision::AdoptSystemCore { server_id } => {
+            AutoConnectDecision::Connect { server_id } => {
                 #[cfg(not(target_os = "android"))]
                 if let Err(error) = app.state::<AppRuntime>().config().admit_legacy_start() {
                     log::warn!("启动时自动连接准入拒绝: {error}");
                     return;
                 }
-                log::info!(
-                    "启动时{}（节点 {server_id}），正在连接...",
-                    if system_core_running {
-                        "收编系统拉起的核"
-                    } else {
-                        "自动连接已启用"
-                    }
-                );
+                log::info!("启动时自动连接（节点 {server_id}）");
                 // State 借的是本 async block 里 owned 的 `app`，不跨 spawn 边界外泄。
                 let state = app.state::<AppRuntime>();
                 // 不再把 `config` 传进去：命令层自己读盘（见 `proxy_start` 头注）。上面那份
@@ -171,7 +147,7 @@ fn spawn_auto_connect(app: AppHandle) {
                 match crate::commands::proxy::proxy_start_automatic(app.clone(), state, admission)
                     .await
                 {
-                    Ok(resp) if resp.success => log::info!("启动时自动连接成功"),
+                    Ok(resp) if resp.success => {}
                     Ok(resp) => log::error!(
                         "启动时自动连接失败: {}",
                         resp.error.as_deref().unwrap_or("未知错误")

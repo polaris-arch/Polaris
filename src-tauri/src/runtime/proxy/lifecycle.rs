@@ -1036,8 +1036,12 @@ impl ProxyRuntime {
         // 故不能只清一次（见 `stale_sweep_disabled` 字段文档：那个门闩正是本次事故的放大器）。
         // 清不掉的 root 孤儿会独占 cache.db 致任何模式都起不来 → 阻断起核并落 ROOT_ORPHAN_BLOCKED，
         // 不放行到 start_inner 去撞一串无从归因的 `initialize cache-file: timeout`（T3）。
+        // On Android, opening the App never authorizes a global Stop or deletion
+        // of files still used by a system VPN. Native Start arbitrates the race.
+        let passive_android =
+            cfg!(target_os = "android") && completion.is_some_and(|claim| claim.startup);
         let t_stale_sweep = std::time::Instant::now();
-        if !self.stale_sweep_disabled.load(Ordering::SeqCst) {
+        if !passive_android && !self.stale_sweep_disabled.load(Ordering::SeqCst) {
             if let Err(error) = self.cleanup_stale_cores().await {
                 log::info!(
                     "代理启动请求耗时：孤儿核清扫失败于{}ms，端到端={}ms",
@@ -1109,12 +1113,25 @@ impl ProxyRuntime {
             generation
         };
         coex_attempt.generation.set(my_gen);
-        if !self.core_running() {
+        // Android keeps the cleanup journal for a confirmed Stop or Apply.
+        // A passive start can race a system VPN still using the old sources.
+        if !cfg!(target_os = "android") && !self.core_running() {
             self.process_deferred_config_deletions_under_gate(&_tailscale_gate);
         }
         self.gate.begin();
         let t_start_inner = std::time::Instant::now();
-        let r = Box::pin(self.start_inner(config, my_gen, &_tailscale_gate)).await;
+        let mut android_preparation = None;
+        let r = Box::pin(self.start_inner(
+            config,
+            my_gen,
+            &_tailscale_gate,
+            passive_android,
+            &mut android_preparation,
+        ))
+        .await;
+        if let Some(preparation) = android_preparation {
+            preparation.release().await;
+        }
         let start_inner_ms = t_start_inner.elapsed().as_millis();
         let t_terminal_settle = std::time::Instant::now();
         // end 恒执行（成功/失败/让位三路），否则 depth 永不归零 → 后续 apply 全被误判 deferred。

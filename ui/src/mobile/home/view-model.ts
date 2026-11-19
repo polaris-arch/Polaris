@@ -9,7 +9,7 @@ import type { SubscriptionConfig } from '@/contracts/types';
  *
  * 屏级呈现以移动端能力保全重设计为准；本契约仍保持纯视图边界。
  */
-import type { ProxyMode, RuleAction, ServerConfig } from '@/contracts/types';
+import type { ProxyMode, ProxyStatus, RuleAction, ServerConfig } from '@/contracts/types';
 import type { UnlockResult, ServiceId } from '@/contracts/unlock-detection';
 import type { TsExitWarning } from '@/domain/tailscale-exit-warning';
 import type { ExitRegionDisplay } from '@/domain/exit-flag';
@@ -178,6 +178,7 @@ export interface HomeScreenViewProps {
 
   /* ── ① 节点状态卡 ──────────────────────────────────────────────────────── */
   readonly core: CoreLifecycle;
+  readonly systemVpn?: ProxyStatus['androidSystemVpn'];
   readonly connState: TakeoverConnState;
   readonly node: NodeIdentity;
   readonly onToggleConnect: () => void;

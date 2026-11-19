@@ -199,6 +199,7 @@ export function MobileHomeScreen(): ReactElement {
   const loadConfig = useAppStore((s) => s.loadConfig);
 
   const proxyRunning = proxyStatus?.running === true;
+  const systemVpn = proxyStatus?.androidSystemVpn;
   const unlockCooldown = useUnlockCooldown(proxyRunning ? unlock.lastRunAt : null);
   const routing = (config?.proxyMode ?? 'smart') as ProxyMode;
   const latencyCheck = useHomeSpeedTest({
@@ -277,7 +278,7 @@ export function MobileHomeScreen(): ReactElement {
   }, [proxyRunning]);
 
   /* ── 派生 ────────────────────────────────────────────────────────────────── */
-  const displayServerId = configuredExitId(proxyStatus, config);
+  const displayServerId = systemVpn === undefined ? configuredExitId(proxyStatus, config) : undefined;
   const currentServer = useMemo(
     () => servers.find((s) => s.id === displayServerId),
     [servers, displayServerId],
@@ -369,7 +370,9 @@ export function MobileHomeScreen(): ReactElement {
    * `US` 直接呈现给用户，而不是「美国」。
    */
   const directRoute = routing === 'direct' || isDirectSelection(displayServerId);
-  const exitRegionRaw = resolveExitRegion(proxyRunning && !directRoute, ipInfo?.proxy, ipInfo?.direct);
+  const exitRegionRaw = systemVpn === undefined
+    ? resolveExitRegion(proxyRunning && !directRoute, ipInfo?.proxy, ipInfo?.direct)
+    : { kind: 'none' as const };
   const exitRegion =
     exitRegionRaw.kind === 'text'
       ? {
@@ -807,6 +810,7 @@ export function MobileHomeScreen(): ReactElement {
       t={t}
       writeErrors={writeErrorsFromProxyStatus(writeErrors, proxyStatus, t)}
       core={core}
+      systemVpn={systemVpn}
       connState={connState}
       node={node}
       onToggleConnect={onToggleConnect}
@@ -844,9 +848,9 @@ export function MobileHomeScreen(): ReactElement {
       exitFlagSrc={
         exitRegion.kind === 'flag' ? (countryCodeToFlagAsset(exitRegion.code)?.src ?? null) : null
       }
-      exitIsDirect={!proxyRunning || directRoute}
-      exitProbing={ipInfo?.loading === true}
-      exitIp={privacyMode ? '••••' : (proxyRunning && !directRoute ? ipInfo?.proxy?.ip : ipInfo?.direct?.ip) ?? null}
+      exitIsDirect={systemVpn === undefined && (!proxyRunning || directRoute)}
+      exitProbing={systemVpn === undefined && ipInfo?.loading === true}
+      exitIp={systemVpn !== undefined ? null : privacyMode ? '••••' : (proxyRunning && !directRoute ? ipInfo?.proxy?.ip : ipInfo?.direct?.ip) ?? null}
       onSetRouting={onSetRouting}
       unlock={visibleUnlockVms}
       unlockCheckedLabel={checkedLabel(t, unlock.checkedAt)}

@@ -88,14 +88,35 @@ class MainExactTargetArgs {
     internal fun target() = MainKernelExactTarget(runId, birthNonce)
 }
 
+@InvokeArg
+class MainStartReservationArgs {
+    lateinit var runId: String
+}
+
+@InvokeArg
+class SystemStartStatusArgs {
+    lateinit var lifecycleEvents: Channel
+}
+
+internal sealed interface MainStartSlot {
+    val runId: String
+    val nativeTicket: AndroidNativeAdmission.Ticket
+}
+
+internal data class MainStartReservation(
+    override val runId: String,
+    override val nativeTicket: AndroidNativeAdmission.Ticket,
+    val revoked: Boolean = false,
+) : MainStartSlot
+
 internal data class MainStartRequest(
     val configContent: String,
-    val runId: String,
+    override val runId: String,
     val configDigest: String,
     val claim: String?,
-    val nativeTicket: AndroidNativeAdmission.Ticket,
+    override val nativeTicket: AndroidNativeAdmission.Ticket,
     val lifecycleEvents: Channel? = null,
-)
+) : MainStartSlot
 
 @InvokeArg
 class CheckArgs {
@@ -458,6 +479,44 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         super.onDestroy(activity)
     }
 
+    @Command
+    fun reserveMainStart(invoke: Invoke) {
+        val runId = invoke.parseArgs(MainStartReservationArgs::class.java).runId
+        if (runId.isBlank() || runId.length > 128 || runId != runId.trim()) {
+            invoke.reject("android: 起核身份无效", ERR_STARTUP_FAILED)
+            return
+        }
+        val reserved = try {
+            VpnBridge.reserveStart(runId) { AndroidNativeMain.reserveBridge(runId) }
+        } catch (error: AndroidNativeAdmission.AdmissionClosed) {
+            invoke.reject(error.message, if (error is AndroidNativeAdmission.CapacityClosed) AndroidNativeAdmission.CAPACITY_CODE else ERR_NATIVE_ADMISSION_CLOSED)
+            return
+        } catch (_: IllegalArgumentException) {
+            invoke.reject("android: 主核身份不在原生准入域", ERR_STARTUP_FAILED)
+            return
+        } catch (_: IllegalStateException) {
+            invoke.reject("android: 主核身份已被使用", ERR_STARTUP_FAILED)
+            return
+        }
+        if (!reserved) {
+            invoke.reject("Android 隧道已在运行或正在起停中", ERR_MAIN_BUSY_NO_BIRTH)
+            return
+        }
+        try {
+            invoke.resolve(JSObject().put("runId", runId))
+        } catch (error: Throwable) {
+            VpnBridge.releaseStart(runId)
+            throw error
+        }
+    }
+
+    @Command
+    fun releaseMainStart(invoke: Invoke) {
+        val runId = invoke.parseArgs(MainStartReservationArgs::class.java).runId
+        VpnBridge.releaseStart(runId)
+        invoke.resolve()
+    }
+
     override fun onPause() {
         apkInstallFlow.paused()
         super.onPause()
@@ -504,21 +563,13 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject(error.message, ERR_STARTUP_FAILED)
             return
         }
-        val nativeTicket = try {
-            AndroidNativeMain.reserveBridge(args.runId)
-        } catch (error: AndroidNativeAdmission.AdmissionClosed) {
-            invoke.reject(error.message, if (error is AndroidNativeAdmission.CapacityClosed) AndroidNativeAdmission.CAPACITY_CODE else ERR_NATIVE_ADMISSION_CLOSED)
-            return
-        } catch (_: IllegalArgumentException) {
-            invoke.reject("android: 主核身份不在原生准入域", ERR_STARTUP_FAILED)
-            return
-        } catch (_: IllegalStateException) {
-            invoke.reject("android: 主核身份已被使用", ERR_STARTUP_FAILED)
+        val nativeTicket = VpnBridge.reservedTicket(args.runId)
+        if (nativeTicket == null) {
+            invoke.reject("Android 起核准入已结束", ERR_MAIN_BUSY_NO_BIRTH)
             return
         }
         if (!VpnBridge.beginStart(MainStartRequest(cfg, args.runId, args.configDigest, args.claim, nativeTicket, args.lifecycleEvents), invoke)) {
-            AndroidNativeMain.cancelBeforeBirth(nativeTicket)
-            invoke.reject("Android 隧道已在运行或正在起停中", ERR_STARTUP_FAILED)
+            invoke.reject("Android 起核准入已结束", ERR_MAIN_BUSY_NO_BIRTH)
             return
         }
         try {
@@ -541,7 +592,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      * Rust 请求停核 = 应用的意图是「隧道应当断开」（用户点断开 / 重启前先停 / 退出收尾）⇒ 撤销
      * 系统发起起核的准入（[SystemStart.forget]），且**放在幂等早退之前**：本就没在跑时也要撤，
      * 否则一次「核已自己死掉 → 用户点断开」之后，系统下次拉起服务仍会把它连回去。
-     * 重启腿随后的 `start` 成功会重新记下（[SystemStart.remember]），不丢自启能力。
+     * 重启腿随后的 `start` 成功会重新记下（[SystemStart.persistRuntime]），不丢自启能力。
      */
     @Command
     fun stop(invoke: Invoke) {
@@ -689,19 +740,12 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     // ── 不经桥起核（always-on / 开机 / 系统重拉）的对账与开机自启开关 ─────────────────────
 
-    /**
-     * 此刻是否有一个**不是本桥起的**内核在跑（系统经 always-on / 开机接收器拉起的）。
-     *
-     * 消费方是 Rust 的两处既有路径：启动期自动连接腿（有这种核 ⇒ 走一次标准起核把它收编，界面
-     * 才不会停在「未连接」）与起核前的孤儿清扫（先把它停掉，再由 Rust 按当前配置重起）。
-     * 只读桥内存里的两位，无 binder、无 I/O ⇒ 就地回包，不开线程。
-     *
-     * 回包：`{"systemStarted": true|false}`，键名与 Rust `SystemStartStatus` 由 A10 双向对拍。
-     */
+    /** Observe the current ownerless VPN and register to reread on phase changes. */
     @Command
     fun systemStartStatus(invoke: Invoke) {
+        val args = invoke.parseArgs(SystemStartStatusArgs::class.java)
         val result = JSObject()
-        result.put("systemStarted", VpnBridge.systemStartedRunning())
+        VpnBridge.systemStartPhase(args.lifecycleEvents)?.let { result.put("phase", it) }
         invoke.resolve(result)
     }
 
@@ -1235,6 +1279,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         /** 与 Rust `runtime/proxy::code::STARTUP_FAILED` 逐字对齐。 */
         const val ERR_STARTUP_FAILED = "STARTUP_FAILED"
         const val ERR_ENDPOINT_RETIRED = "API_ENDPOINT_RETIRED"
+        const val ERR_MAIN_BUSY_NO_BIRTH = "ANDROID_MAIN_BUSY_NO_BIRTH"
         const val ERR_NATIVE_ADMISSION_CLOSED = "ANDROID_NATIVE_ADMISSION_CLOSED"
 
         /**
@@ -1374,30 +1419,52 @@ internal object VpnBridge {
      * 不可能漂。Kotlin 侧不解析、不改写、不兜底 —— 一旦这里出现任何硬编码配置，就又有了第二份
      * 真值（`scripts/check-android-bridge.mjs` 的 A4 断言正是守这件事）。
      *
-     * `null` 且服务被拉起 ⇒ 那是**不经桥**的起核（系统发起），配置改由 [SystemStart.load] 从 Rust
-     * 落的**同一个文件**读 —— 仍是同一份字节，不是 Kotlin 自存的第二份（见 [SystemStart] 类文档）。
+     * 系统起核使用 [SystemStart.load] 读取上次通过原生就绪检查的配置。
      */
     @Volatile
-    private var request: MainStartRequest? = null
+    private var request: MainStartSlot? = null
 
     /** 起核是否已经成功过一次（`is_alive` 的桥侧真值；见 Rust `android_bridge::core_started`）。 */
     @Volatile
     var running: Boolean = false
         private set
 
-    /**
-     * 当前（在起或在跑的）这个核是**不经桥**起的（系统拉起服务、配置来自 [SystemStart.load]）。
-     * Rust 据此判「有一个我不认识的核在跑」—— 见 `systemStartStatus` 命令。
-     */
-    private var systemStarted = false
+    /** System-owned attempt, retained until its exact close completes. */
+    private var systemAttempt: MainKernelAttempt<*>? = null
+    private var systemStatusEvents: Channel? = null
+
+    fun reserveStart(runId: String, reserveNative: () -> AndroidNativeAdmission.Ticket): Boolean =
+        LegacySystemStartFence.admit {
+            if (!MainKernelAttemptRegistry.isVacant() || !idleForFence()) false
+            else {
+                // A serializes Start admission; R and B are free while the ledger books the ticket.
+                val ticket = reserveNative()
+                synchronized(this) {
+                    starting = true
+                    request = MainStartReservation(runId, ticket)
+                }
+                true
+            }
+        } ?: false
+
+    @Synchronized
+    fun reservedTicket(runId: String): AndroidNativeAdmission.Ticket? =
+        (request as? MainStartReservation)?.takeIf { it.runId == runId && !it.revoked }?.nativeTicket
+
+    @Synchronized
+    fun releaseStart(runId: String) {
+        val reservation = request as? MainStartReservation ?: return
+        if (reservation.runId != runId) return
+        AndroidNativeMain.cancelBeforeBirth(reservation.nativeTicket)
+        request = null
+        starting = false
+    }
 
     fun beginStart(startRequest: MainStartRequest, invoke: Invoke): Boolean =
         LegacySystemStartFence.admit {
             synchronized(this) {
-                if (running || starting || stopping) false
+                if (stopping || reservedTicket(startRequest.runId) != startRequest.nativeTicket) false
                 else {
-                    starting = true
-                    systemStarted = false
                     request = startRequest
                     pendingStart = invoke
                     true
@@ -1409,12 +1476,12 @@ internal object VpnBridge {
      * 服务在**没有桥调用**的情况下被拉起（always-on / 开机接收器 / 系统重拉）。只做记账：让桥知道
      * 此刻有一个起核在飞（挡住并发的 `start`），且这个核不是本桥起的。`false` = 桥此刻不空闲。
      */
-    fun beginSystemStart(): Boolean = LegacySystemStartFence.admit {
+    fun beginSystemStart(attempt: MainKernelAttempt<*>): Boolean = LegacySystemStartFence.admit {
         synchronized(this) {
-            if (running || starting || stopping) false
+            if (running || starting || stopping || systemAttempt != null) false
             else {
                 starting = true
-                systemStarted = true
+                systemAttempt = attempt
                 true
             }
         }
@@ -1423,6 +1490,7 @@ internal object VpnBridge {
     /** Called only under the fence's A lock. The Invoke is delivered after A is released. */
     @Synchronized
     fun detachPendingForFence(): Invoke? {
+        (request as? MainStartReservation)?.let { request = it.copy(revoked = true) }
         val pending = pendingStart
         if (pending != null) {
             request?.nativeTicket?.let(AndroidNativeMain::cancelBeforeBirth)
@@ -1434,10 +1502,19 @@ internal object VpnBridge {
     }
 
     @Synchronized
-    fun idleForFence(): Boolean = !starting && !stopping && !running && pendingStart == null
+    fun idleForFence(): Boolean = !starting && !stopping && !running && pendingStart == null && systemAttempt == null
 
     @Synchronized
-    fun systemStartedRunning(): Boolean = running && systemStarted
+    fun systemStartPhase(events: Channel? = null): String? {
+        if (events != null) systemStatusEvents = events
+        val attempt = systemAttempt ?: return null
+        return when {
+            attempt.closeFailure() != null -> "unavailable"
+            stopping || attempt.revoked || (!starting && !running) -> "closing"
+            running -> "ready"
+            else -> "starting"
+        }
+    }
 
     /**
      * 服务不在 `Stopped`、这一次起核意图走不下去时的结账：**只**结掉待决的桥回执（若有）。
@@ -1465,7 +1542,7 @@ internal object VpnBridge {
 
     /** `BoxService` 起核线程读走本次配置。 */
     @Synchronized
-    fun currentConfig(): String? = request?.configContent
+    fun currentConfig(): String? = (request as? MainStartRequest)?.configContent
 
     /** Called only after durable bytes and digest commit under the original Service owner. */
     @Synchronized
@@ -1473,9 +1550,9 @@ internal object VpnBridge {
         check(running && !starting && !stopping && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt)) {
             "runtime bridge owner expired"
         }
-        val current = request
+        val current = request as? MainStartRequest
         if (current == null) {
-            check(systemStarted) { "runtime bridge request missing" }
+            check(systemAttempt === attempt) { "runtime bridge request missing" }
             return // System-start reload reads the durable SystemStart source.
         }
         check(current.runId == attempt.runId && current.nativeTicket == attempt.nativeTicket) {
@@ -1485,7 +1562,7 @@ internal object VpnBridge {
     }
 
     @Synchronized
-    fun currentStartRequest(): MainStartRequest? = request
+    fun currentStartRequest(): MainStartRequest? = request as? MainStartRequest
 
     @Synchronized
     fun isStopping(): Boolean = stopping
@@ -1497,8 +1574,11 @@ internal object VpnBridge {
         attempt: MainKernelAttempt<*>? = null,
     ): Boolean {
         val settlement = synchronized(this) {
+            if (systemAttempt != null && systemAttempt !== attempt) return false
             val pending = pendingStart
-            val currentRequest = request
+            val currentRequest = request as? MainStartRequest
+            if (attempt != null && systemAttempt == null &&
+                (currentRequest?.runId != attempt.runId || currentRequest.nativeTicket != attempt.nativeTicket)) return false
             val receiptError = if (error == null && pending != null &&
                 (attempt == null || currentRequest == null || attempt.runId != currentRequest.runId)) {
                 "android: 起核回执与当前主核身份不一致"
@@ -1507,14 +1587,14 @@ internal object VpnBridge {
             pendingStart = null
             starting = false
             running = failed == null
-            if (failed != null) systemStarted = false
             if (failed != null) currentRequest?.nativeTicket?.let(AndroidNativeMain::cancelBeforeBirth)
-            StartSettlement(pending, currentRequest, failed, systemStarted)
+            if (failed != null && attempt == null) request = null
+            StartSettlement(pending, currentRequest, failed, systemAttempt != null)
         }
         val (invoke, startRequest, failure, wasSystemStarted) = settlement
         if (invoke == null) {
-            // 系统发起的起核本就没有人欠回执（error=null 时属正常）；桥发起的起核走到这里才是异常。
-            Log.i(TAG, "起核结账时没有待决的 Invoke（systemStarted=$wasSystemStarted, error=$failure）")
+            if (wasSystemStarted && attempt != null) publishSystemStatusChange(attempt)
+            if (!wasSystemStarted) Log.i(TAG, "起核结账时没有待决的 Invoke（error=$failure）")
             return failure == null
         }
         if (failure == null) {
@@ -1538,7 +1618,7 @@ internal object VpnBridge {
                 invoke.resolve(response)
             }
             if (delivered.isFailure) {
-                synchronized(this) { running = false }
+                synchronized(this) { if (request === startRequest) running = false }
                 Log.e(TAG, "主核回执投递失败，关闭该 attempt", delivered.exceptionOrNull())
             }
             return delivered.isSuccess
@@ -1556,11 +1636,28 @@ internal object VpnBridge {
         deliver?.invoke()
     }
 
+    fun publishSystemStatusChange(attempt: MainKernelAttempt<*>) {
+        val deliver = synchronized(this) { systemStatusDeliveryLocked(attempt) }
+        deliver?.invoke()
+    }
+
+    private fun systemStatusDeliveryLocked(attempt: MainKernelAttempt<*>?): (() -> Unit)? {
+        if (attempt == null || systemAttempt !== attempt) return null
+        val channel = systemStatusEvents ?: return null
+        return {
+            Handler(Looper.getMainLooper()).post {
+                runCatching { channel.sendObject("systemStartChanged") }
+                    .onFailure { Log.e(TAG, "系统主核状态通知投递失败", it) }
+            }
+            Unit
+        }
+    }
+
     private fun lifecycleDeliveryLocked(attempt: MainKernelAttempt<*>?, state: String): (() -> Unit)? {
         check(state == "unavailable" || state == "closed")
-        val current = request ?: return null
+        val current = request as? MainStartRequest ?: return null
         if (attempt == null || current.runId != attempt.runId || current.nativeTicket != attempt.nativeTicket) return null
-        val channel = current.lifecycleEvents ?: return null // System-start has no Rust observer.
+        val channel = current.lifecycleEvents ?: return null
         val event = JSObject().put("runId", attempt.runId)
             .put("birthNonce", attempt.birthNonce).put("state", state)
         return {
@@ -1578,6 +1675,12 @@ internal object VpnBridge {
     @Synchronized
     fun beginStop(invoke: Invoke): StopAdmission {
         if (stopping) return StopAdmission.Busy
+        (request as? MainStartReservation)?.let {
+            // Rust can still be writing resources. Keep this exact reservation
+            // until its producer exits, but forbid consuming it to start a service.
+            request = it.copy(revoked = true)
+            return StopAdmission.AlreadyStopped
+        }
         if (!running && !starting) return StopAdmission.AlreadyStopped
         stopping = true
         pendingStop = invoke
@@ -1586,7 +1689,16 @@ internal object VpnBridge {
 
     /** Take all bridge callbacks under B, then deliver them outside B and registry R. */
     fun takeFinishStop(error: String? = null, attempt: MainKernelAttempt<*>? = null): () -> Unit = synchronized(this) {
-        val terminal = lifecycleDeliveryLocked(attempt, if (error == null) "closed" else "unavailable")
+        val current = request as? MainStartRequest
+        val owns = if (systemAttempt != null) {
+            systemAttempt === attempt
+        } else {
+            current != null && attempt != null &&
+                current.runId == attempt.runId && current.nativeTicket == attempt.nativeTicket
+        }
+        if (!owns) return@synchronized {}
+        val terminal = if (systemAttempt != null) systemStatusDeliveryLocked(attempt)
+            else lifecycleDeliveryLocked(attempt, if (error == null) "closed" else "unavailable")
         val stopInvoke = pendingStop
         pendingStop = null
         stopping = false
@@ -1607,7 +1719,7 @@ internal object VpnBridge {
             }
         }
         running = false
-        systemStarted = false
+        systemAttempt = null
         request = null
         // 服务在起核途中被停掉：起核那条 Invoke 也要有回执，否则 Rust 侧只能等超时。
         return@synchronized {

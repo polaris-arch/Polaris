@@ -322,7 +322,11 @@ impl ProxyRuntime {
         #[cfg(any(target_os = "ios", windows))]
         let mut directory_leases = Vec::new();
         let config_dir = self.config.dir().to_path_buf();
-        // 节点删除收口时一并删掉它的 tailnet rule-set 文件（只由已删节点的 id 派生，无物可删即完成）。
+        // Android's ready generation reclaims its own retired rule directories.
+        #[cfg(target_os = "android")]
+        let remove_tailnet_rule_file = |_server_id: &str| {};
+        // On desktop the node owns its own derived tailnet rule file.
+        #[cfg(not(target_os = "android"))]
         let remove_tailnet_rule_file = |server_id: &str| {
             let path = self.tailnet_rules_dir().join(format!(
                 "{}.json",

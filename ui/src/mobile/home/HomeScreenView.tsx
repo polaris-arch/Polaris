@@ -510,6 +510,8 @@ const CORE_KEY = {
   error: 'home.statusProxyUnavailable',
 } as const;
 
+const SYSTEM_VPN_CORE = { starting: 'starting', ready: 'running', closing: 'stopping', unavailable: 'error' } as const;
+
 const TS_EXIT_KEY: Record<string, string> = {
   'needs-auth': 'home.tsExitNeedsAuthWarn',
   'no-exit-device': 'home.tsExitNoDeviceWarn',
@@ -567,7 +569,9 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
     };
   }, [ruleHitIdentity]);
   const connected = props.connState === 'connected';
-  const coreBusy = props.core === 'starting' || props.core === 'stopping';
+  const systemVpn = props.core === 'stopped' || props.core === 'error' ? props.systemVpn : undefined;
+  const visibleCore = systemVpn === undefined ? props.core : SYSTEM_VPN_CORE[systemVpn];
+  const coreBusy = visibleCore === 'starting' || visibleCore === 'stopping';
   const willDisconnect = connected || props.core === 'running';
   const currentLatencyLevel = props.node.kind !== 'node' || props.node.latencyStale ||
     props.latencyCheck?.busyKind === 'current'
@@ -588,20 +592,20 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
         </div>
         {/* 状态用**颜色 + 文字**，绝不只用颜色（`app-header.md`「States」）。 */}
         <div className="h-header-actions">
-          <span className={`h-runchip s-${props.core}`}>
+          <span className={`h-runchip s-${visibleCore}`}>
             <i className="h-dot" aria-hidden="true" />
-            {t(CORE_KEY[props.core])}
+            {t(systemVpn === 'ready' ? 'mobileHome.systemVpnReady' : CORE_KEY[visibleCore])}
           </span>
           <button
             type="button"
             className={`h-connect-action ${willDisconnect ? 'is-disconnect' : 'is-connect'}`}
             data-write-control="connect"
             onClick={props.onToggleConnect}
-            disabled={coreBusy}
+            disabled={coreBusy || systemVpn === 'unavailable'}
             aria-busy={coreBusy}
           >
             {coreBusy ? <ActionBusy /> : <ActionGlyph shape="power" />}
-            <span>{willDisconnect ? t('mobileHome.disconnect') : t('mobileHome.connect')}</span>
+            <span>{t(systemVpn === 'ready' ? 'mobileHome.reconnectInApp' : willDisconnect ? 'mobileHome.disconnect' : 'mobileHome.connect')}</span>
           </button>
         </div>
         <WriteError id="connect" errors={err} />
@@ -641,14 +645,14 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                       ? t('home.routingDirect')
                       : props.node.kind === 'block'
                         ? t('home.routingBlock')
-                        : t(props.node.pending ? 'autoSelect.pendingNode' : 'home.plsConfigServer')}
+                        : t(props.systemVpn !== undefined ? 'mobileHome.systemVpnExitUnknown' : props.node.pending ? 'autoSelect.pendingNode' : 'home.plsConfigServer')}
                 </span>
                 <span className="h-nodemeta">
                   {props.node.kind === 'node' ? (
                     <>
                       <span className="h-pill">{props.node.protocolLabel}</span>
                     </>
-                  ) : (
+                  ) : props.systemVpn === undefined && (
                     /* 直连 / 阻断 / 未选：**不渲染协议与旗**，换成如实的路由语义
                        （哨兵选择没有 ServerConfig，硬渲染只会得到一个空名字）。 */
                     <span className="h-pill muted">

@@ -17,7 +17,9 @@ class MainNativeAdmissionWiringTest {
 
     @Test fun productionBridgeAndSystemBirthKeepTheSameTicketThroughTheService() {
         val bridgeStart = plugin.substringAfter("fun start(invoke: Invoke)").substringBefore("fun stop(invoke: Invoke)")
-        val reserve = bridgeStart.indexOf("AndroidNativeMain.reserveBridge(args.runId)")
+        val reservation = plugin.substringAfter("fun reserveMainStart(invoke: Invoke)").substringBefore("fun releaseMainStart(invoke: Invoke)")
+        assertTrue(reservation.contains("VpnBridge.reserveStart(runId) { AndroidNativeMain.reserveBridge(runId) }"))
+        val reserve = bridgeStart.indexOf("VpnBridge.reservedTicket(args.runId)")
         val begin = bridgeStart.indexOf("VpnBridge.beginStart(MainStartRequest(")
         assertTrue(reserve >= 0 && reserve < begin)
         val serviceStart = service.substringAfter("fun onStartCommand(startId: Int)").substringBefore("fun onBind()")

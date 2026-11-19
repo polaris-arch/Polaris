@@ -457,7 +457,7 @@ impl ProxyRuntime {
                 .get(id)
                 .map(|history| history.hosts.clone())
                 .unwrap_or_default();
-            match self.prepare_tailnet_binding(binding, &hosts) {
+            match self.prepare_tailnet_binding(binding, &hosts, context.generation) {
                 Ok(Some(write)) => writes.push(write),
                 Ok(None) => {}
                 Err(error) => {
@@ -724,11 +724,32 @@ impl ProxyRuntime {
 
     /// Preparation before generate; the captured generation is checked at every
     /// synchronous disk/history commit. Legacy hosts remain unqualified history.
+    #[cfg(any(not(target_os = "android"), test))]
     pub(super) async fn write_tailnet_rule_files_for_generation(
         &self,
         config: &UserConfig,
         raw: &Value,
         generation: u64,
+    ) -> Result<(), String> {
+        let directory = self.tailnet_rules_dir();
+        self.prepare_tailnet_rule_files(
+            config,
+            raw,
+            generation,
+            &directory,
+            |name| Some(directory.join(name)),
+            false,
+        )
+    }
+
+    pub(super) fn prepare_tailnet_rule_files(
+        &self,
+        config: &UserConfig,
+        raw: &Value,
+        generation: u64,
+        directory: &std::path::Path,
+        history_file: impl Fn(&str) -> Option<PathBuf>,
+        private_stage: bool,
     ) -> Result<(), String> {
         if !config
             .servers
@@ -746,7 +767,6 @@ impl ProxyRuntime {
         let result = self
             .gate
             .with_current_generation(generation, |_live| {
-                let dir = self.tailnet_rules_dir();
                 let mut next = state.clone();
                 let mut writes = Vec::new();
                 for server in config
@@ -763,9 +783,11 @@ impl ProxyRuntime {
                     if incompatible {
                         next.history.remove(&server.id);
                     }
-                    let path = dir.join(format!("{}.json", tailnet_rule_file_base(&server.id)));
+                    let file = format!("{}.json", tailnet_rule_file_base(&server.id));
+                    let path = directory.join(&file);
                     if !incompatible && !next.history.contains_key(&server.id) {
-                        if let Some(cidrs) = read_tailnet_file(&path)
+                        if let Some(cidrs) = history_file(&file)
+                            .and_then(|path| read_tailnet_file(&path))
                             .and_then(|text| parse_tailnet_rule_file_cidrs(&text))
                         {
                             let hosts = valid_hosts(
@@ -813,7 +835,15 @@ impl ProxyRuntime {
                     }
                 }
                 // All sources fit before any file or retained-history commit.
-                if std::fs::create_dir_all(&dir).is_err() {
+                if private_stage {
+                    for (path, content, _) in writes {
+                        super::startup::write_private_runtime_config(&path, &content)?;
+                    }
+                    next.limited = false;
+                    *state = next;
+                    return Ok(());
+                }
+                if std::fs::create_dir_all(directory).is_err() {
                     if writes
                         .iter()
                         .any(|(path, _, incompatible)| *incompatible && path.exists())
@@ -854,9 +884,19 @@ impl ProxyRuntime {
         &self,
         binding: &TailnetRouteBinding,
         hosts: &[String],
+        generation: u64,
     ) -> Result<Option<(PathBuf, String)>, String> {
         let content = canonical_content(&binding.server, hosts)?;
-        let path = self.tailnet_rules_dir().join(format!(
+        #[cfg(target_os = "android")]
+        let Some((_, directory)) = self.live_rule_directories(generation) else {
+            return Ok(None);
+        };
+        #[cfg(not(target_os = "android"))]
+        let directory = {
+            let _ = generation;
+            self.tailnet_rules_dir()
+        };
+        let path = directory.join(format!(
             "{}.json",
             tailnet_rule_file_base(&binding.server.id)
         ));
@@ -975,7 +1015,9 @@ impl ProxyRuntime {
             history.last_binding_identity = Some(binding.identity.clone());
             history.identity = Some(identity);
             history.fresh_token = Some(context.token);
-            if let Some(write) = self.prepare_tailnet_binding(binding, &history.hosts)? {
+            if let Some(write) =
+                self.prepare_tailnet_binding(binding, &history.hosts, context.generation)?
+            {
                 writes.push(write);
             }
         }

@@ -149,7 +149,7 @@ class BoxService(
                             network,
                         )
                         if (!MainKernelAttemptRegistry.isVacant() ||
-                            (request == null && !VpnBridge.beginSystemStart())) null
+                            (request == null && !VpnBridge.beginSystemStart(next))) null
                         else {
                             check(MainKernelAttemptRegistry.claim(next) { stopService(next) }) {
                                 "主核准入锁内 registry 归属发生变化"
@@ -188,6 +188,7 @@ class BoxService(
             Log.i(TAG, "忽略重复起核意图，服务处于 $state 状态")
             return Service.START_NOT_STICKY
         }
+        VpnBridge.publishSystemStatusChange(attempt)
         // 先立前台通知：startForeground 的 5 秒窗口从 onStartCommand 起算，而内核起来要秒级。
         try {
             synchronized(this) {
@@ -215,7 +216,7 @@ class BoxService(
         } catch (error: Throwable) {
             attempt.skipPreparation()
             synchronized(this) {
-                if (mainAttempt === attempt) VpnBridge.finishStart(error.message ?: "Android 起核线程创建失败")
+                if (mainAttempt === attempt) VpnBridge.finishStart(error.message ?: "Android 起核线程创建失败", attempt = attempt)
             }
             stopService(attempt)
         }
@@ -244,13 +245,14 @@ class BoxService(
         try {
             check(isStarting(attempt)) { "旧起核尝试已撤销" }
             val config = bridgeConfig ?: SystemStart.load(service)
-            if (bridgeConfig != null) {
+            val bridgeDigest = if (bridgeConfig != null) {
                 val request = VpnBridge.currentStartRequest()
                 check(request != null && request.runId == attempt.runId &&
                     SystemStart.sha256(config.toByteArray(Charsets.UTF_8)) == request.configDigest) {
                     "android: 起核配置摘要或 runId 与主核 attempt 不一致"
                 }
-            }
+                request.configDigest
+            } else null
             // This slice has no managed Start admission yet. A marker blocks every legacy bridge start.
             if (bridgeConfig != null) SystemStart.requireLegacyAllowed(service)
             SystemEndpointGuard.requireSupported(config)
@@ -301,12 +303,25 @@ class BoxService(
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
                 check(mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting) { "起核已被停核接管" }
                 check(runtimeAdmission != null) { "runtime protocol was not admitted" }
-                attempt.acknowledgeStart()
-                if (bridgeConfig != null) NativeReconnectNotice.clear(service)
-                state = ServiceState.Started
-                StatsBridge.activateAll()
-                // The token check and bridge acknowledgement share Stop's lock.
-                val accepted = VpnBridge.finishStart(null, attempt = attempt)
+                fun acknowledge(): Boolean {
+                    attempt.acknowledgeStart()
+                    if (bridgeConfig != null) NativeReconnectNotice.clear(service)
+                    state = ServiceState.Started
+                    try {
+                        StatsBridge.activateAll()
+                        val accepted = VpnBridge.finishStart(null, attempt = attempt)
+                        if (!accepted) state = ServiceState.Starting
+                        return accepted
+                    } catch (failure: Throwable) {
+                        state = ServiceState.Starting
+                        throw failure
+                    }
+                }
+                val accepted = if (bridgeDigest != null) {
+                    SystemStart.persistRuntime(service, config, bridgeDigest, attempt.systemStartGeneration,
+                        allowed = { isStarting(attempt) && !VpnBridge.isStopping() && MainKernelAttemptRegistry.isCurrent(attempt) },
+                        publish = ::acknowledge)
+                } else acknowledge()
                 if (BuildConfig.DEBUG) runCatching {
                     commandServer?.let { DebugAppliedInputs.witness.acknowledge(attempt, it, accepted) }
                 }
@@ -327,30 +342,17 @@ class BoxService(
                 }
             }
             Log.i(TAG, "内核已启动")
-            // 经桥起核成功 ⇒ 记下这一份，此后系统发起的起核才有配置可用。排在结账之后：它要读一次
-            // 盘并算摘要，不该拖慢 Rust 侧的就绪门。失败只影响「系统起核可用性」，不影响本次连接。
-            if (bridgeConfig != null) {
-                runCatching { synchronized(this) {
-                    // A HOT callback may have committed after ready; never replace its digest with startup bytes.
-                    SystemStart.remember(service, VpnBridge.currentConfig() ?: bridgeConfig, attempt.systemStartGeneration) {
-                        mainAttempt === attempt && MainKernelAttemptRegistry.isCurrent(attempt) &&
-                            !attempt.revoked && state == ServiceState.Started
-                    }
-                } }
-                    .onFailure { Log.e(TAG, "记录起核配置失败，系统发起的起核将不可用", it) }
-            }
         } catch (e: Throwable) {
             if (BuildConfig.DEBUG) runCatching { DebugAppliedInputs.witness.seal(attempt) }
             attempt.skipPreparation()
             // 🔴 这条 catch 此前只 Log.e + stopService()，Rust 侧什么都收不到 —— 那正是
             // 「静默没起来」的现场。先结账（把内核原话带回去），再拆自己。
             Log.e(TAG, "内核启动失败", e)
-            // 经桥起核失败：盘上那份已是这次失败的尝试，旧摘要作废。系统起核失败**不撤**准入：
-            // 用户的意图没变（仍是「连着」），下一次系统重试 / 用户手动连接自然会覆盖。
+            // Failed candidates leave the last admitted configuration in place.
+            // persistRuntime invalidates the digest itself if its commit fails partway.
             val current = synchronized(this) {
                 if (mainAttempt !== attempt || attempt.revoked || state != ServiceState.Starting) false
                 else {
-                    if (bridgeConfig != null) SystemStart.forget(service, "经桥起核失败")
                     VpnBridge.finishStart(
                         e.message ?: e.toString(),
                         when (e) {
@@ -359,6 +361,7 @@ class BoxService(
                             is AndroidNativeAdmission.AdmissionClosed -> PolarisVpnPlugin.ERR_NATIVE_ADMISSION_CLOSED
                             else -> PolarisVpnPlugin.ERR_STARTUP_FAILED
                         },
+                        attempt = attempt,
                     )
                     true
                 }
@@ -511,7 +514,10 @@ class BoxService(
                     lastRevision = revision
                     lastDigest = effectiveDigest
                     SystemStart.persistRuntime(service, configContent, effectiveDigest, attempt.systemStartGeneration,
-                        ::current) { VpnBridge.publishRuntimeConfig(attempt, configContent, effectiveDigest) }
+                        ::current) {
+                        VpnBridge.publishRuntimeConfig(attempt, configContent, effectiveDigest)
+                        true
+                    }
                 }
             }
         }
@@ -696,6 +702,7 @@ class BoxService(
             DebugAppliedInputs.witness.seal(attempt)
         }
         val detachedTun = attempt.revokeAndDetachTun()
+        VpnBridge.publishSystemStatusChange(attempt)
         StatsBridge.closeAll()
         unregisterStopReceiver()
         if (firstStop) {

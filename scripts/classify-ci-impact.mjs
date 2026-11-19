@@ -560,6 +560,22 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       + 'The actual Android-minus-host dep-info confirms this exact source; changes require the Android compile/package leg. '
       + 'This registration covers build impact, not device execution or native retirement/custody proof.',
   },
+  'src-tauri/src/runtime/proxy/android_rule_assets.rs': {
+    why: 'Android 启动按代准备和回收规则文件，目录所有权随 APK 的 Rust cdylib 发布。'
+      + '改动须触发 Android 编译和打包，系统自启与实际文件回读由设备验收确认。',
+  },
+  'src-tauri/src/runtime/proxy/pending_changes.rs': {
+    why: 'Android 待应用清理保留旧 Tailnet 规则来源，已发布的运行代负责回收退役目录。',
+  },
+  'src-tauri/src/runtime/proxy/runtime_config.rs': {
+    why: 'Android 热应用通过当前内核运行基线保留按代规则目录，进入 APK 的 Rust cdylib。',
+  },
+  'src-tauri/src/runtime/proxy/tailnet_rules.rs': {
+    why: 'Android Tailnet 冷启动读取已发布观测，热写使用当前运行基线的目录；改动须触发 Android 编译和打包。',
+  },
+  'src-tauri/src/commands/config.rs': {
+    why: 'Android 分流报告通过已接受的运行基线和内核规则目录计算实际来源，进入 APK 的 Rust cdylib。',
+  },
   'src-tauri/src/runtime/proxy/android_bridge/tailscale_store.rs': {
     why: '原 android_bridge.rs 的 scoped store 模块外移后，父声明 cfg(any(android,test)) 使本文件在 '
       + 'production 中只参与 Android 编译；原实际 dep-info 的 Android − host 差集已确认该精确文件。'

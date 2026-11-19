@@ -318,6 +318,7 @@ impl NormalStarts {
 pub(super) struct NormalStartClaim {
     pub(super) completion: watch::Sender<NormalStartCompletion>,
     pub(super) expected: u64,
+    pub(super) startup: bool,
     identity: Arc<ProducerCell>,
     attempt: Option<Arc<crate::runtime::tailscale_login_core::Attempt>>,
 }
@@ -1424,6 +1425,7 @@ impl ProxyRuntime {
             Some(NormalStartClaim {
                 completion,
                 expected: base,
+                startup: false,
                 identity,
                 attempt: None,
             }),
@@ -1587,6 +1589,7 @@ impl ProxyRuntime {
         {
             return Err(StartError::from("superseded".to_owned()));
         }
+        let startup = startup.is_some();
         let attempt = scope.as_ref().map(|(_, attempt)| Arc::clone(attempt));
         let register = || {
             // Capture under the same short lock held by admission/claim/Starting publication.
@@ -1626,6 +1629,7 @@ impl ProxyRuntime {
                 let claim = NormalStartClaim {
                     completion: completion.clone(),
                     expected: base,
+                    startup,
                     identity,
                     attempt,
                 };
